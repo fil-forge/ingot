@@ -31,13 +31,17 @@ type Config struct {
 	// ReadCacheBytes bounds the in-memory block cache fronting the
 	// network-backed read tier. 0 -> default (256 MiB); negative -> disabled.
 	ReadCacheBytes int64 `mapstructure:"read_cache_bytes" yaml:"read_cache_bytes"`
-	// HomeProviderDID / HomeProviderURL, when both set, let the fx module build a
-	// default single-home-piri uploader.ProviderSelector from config, so the
-	// common co-located / standalone-client deployment needs no provider-selector
-	// wiring. Leave them empty to supply a uploader.ProviderSelector yourself
-	// (e.g. a routing-backed one); do not set both at once.
-	HomeProviderDID string `mapstructure:"home_provider_did" yaml:"home_provider_did"`
-	HomeProviderURL string `mapstructure:"home_provider_url" yaml:"home_provider_url"`
+	// UploadServiceURL / UploadServiceDID address the Forge upload service
+	// (sprue): the control-plane peer ingot invokes /blob/add, /ucan/conclude,
+	// and /index/add against as a guppy-style edge client.
+	UploadServiceURL string `mapstructure:"upload_service_url" yaml:"upload_service_url"`
+	UploadServiceDID string `mapstructure:"upload_service_did" yaml:"upload_service_did"`
+	// UploadReceiptsURL is the receipts-polling base URL. Optional; defaults to
+	// UploadServiceURL + "/receipt/".
+	UploadReceiptsURL string `mapstructure:"upload_receipts_url" yaml:"upload_receipts_url"`
+	// TokenStoreDir is where login-derived delegations persist (tokens.cbor).
+	// Optional; defaults to DataDir.
+	TokenStoreDir string `mapstructure:"token_store_dir" yaml:"token_store_dir"`
 }
 
 // defaultReadCacheBytes is the block cache budget when ReadCacheBytes is 0.
@@ -74,6 +78,11 @@ func (c Config) ServerConfig() (ServerConfig, error) {
 		ChunkSize:  c.ChunkSize,
 		SealBytes:  c.SealBytes,
 		SealAge:    sealAge,
-		Retain:     c.Retain,
+		// Production ships both planes to Forge (Phase 2 adds per-plane
+		// host config); Retain applies to each plane's local read tier.
+		ShipData:      true,
+		ShipCatalog:   true,
+		RetainData:    c.Retain,
+		RetainCatalog: c.Retain,
 	}, nil
 }

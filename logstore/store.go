@@ -16,50 +16,47 @@ import (
 )
 
 // Compile-time assertion that *Store satisfies blockstore.Log.
-// blockstore.Log is the consumer-facing contract (AppendBatch /
-// Get / Close); *Store is the production LSM implementation that
-// backs it.
 var _ blockstore.Log = (*Store)(nil)
 
-// Store is the LSM-style log: one open segment accepting appends,
-// plus N sealed segments (some flushed, some pending flush) that
-// serve reads in front of the network blockstore.
+// Store is the LSM-style log: one open segment accepting appends, plus
+// N sealed segments (some shipped, some pending) that serve reads in
+// front of the network blockstore.
+//
+// Each segment splits into a data CAR and a catalog CAR that ship
+// through INDEPENDENT pipelines: the store runs one flush worker per
+// plane configured to ship, and a plane configured never to ship is
+// retained on local disk indefinitely.
 //
 // Concurrency:
-//   - catMu (RWMutex) guards open + sealed slice + nextSeq. Writers
-//     hold Lock briefly during seal/retire/new-open swaps. Readers
-//     hold RLock to take a stable snapshot of the segment list, then
-//     do file I/O outside the lock.
-//   - appMu (Mutex) serializes appenders against each other so the
-//     open-segment append fd has a single writer.
+//   - catMu (RWMutex) guards open + sealed slice + nextSeq.
+//   - appMu (Mutex) serializes appenders so the open-segment append fds
+//     have a single writer.
 type Store struct {
 	cfg    Config
 	logger *zap.Logger
 
 	catMu   sync.RWMutex
 	open    *Segment
-	sealed  []*Segment // newest-first; includes flushed-and-retained
+	sealed  []*Segment // newest-first; includes shipped-and-retained
 	nextSeq uint64
 
 	appMu sync.Mutex
 
-	flushQ  chan *Segment
+	// flushQ holds one queue per plane that is configured to ship. A
+	// non-shipping plane has no entry (and no worker).
+	flushQ  map[blockstore.Plane]chan *Segment
 	closing chan struct{}
 	wg      sync.WaitGroup
 
 	openedAt time.Time
 
 	// sealReq is a coalesced "seal the open segment now" channel.
-	// AppendBatch sends after exceeding SealBytes; the seal-ticker
-	// sends on every tick if the open segment has been open longer
-	// than SealAge.
 	sealReq chan struct{}
 }
 
 // Open initializes a Store: scans Dir, reconciles with cfg.Meta,
-// re-enqueues unflushed segments for the flusher, force-seals any
-// previously-open segment, and starts a fresh open segment ready to
-// accept appends.
+// re-enqueues unshipped segments per plane, force-seals any
+// previously-open segment, and starts a fresh open segment.
 func Open(ctx context.Context, cfg Config) (*Store, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, err
@@ -73,50 +70,49 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 	s := &Store{
 		cfg:     cfg,
 		logger:  cfg.Logger,
-		flushQ:  make(chan *Segment, 64),
+		flushQ:  map[blockstore.Plane]chan *Segment{},
 		closing: make(chan struct{}),
 		sealReq: make(chan struct{}, 1),
+	}
+	for _, p := range blockstore.Planes {
+		if cfg.plane(p).Ship {
+			s.flushQ[p] = make(chan *Segment, 64)
+		}
 	}
 
 	if err := s.recover(ctx); err != nil {
 		return nil, err
 	}
 
-	// Force-seal a recovered open segment (if any) so a fresh open is
-	// always brand-new on each process startup. This avoids the
-	// complications of resuming append into a partially-written file.
+	// Force-seal a recovered open segment so a fresh open is always
+	// brand-new on each process startup.
 	if s.open != nil {
 		if err := s.open.seal(ctx, cfg.Meta); err != nil {
 			return nil, fmt.Errorf("logstore: force-seal recovered open segment: %w", err)
 		}
 		s.sealed = append([]*Segment{s.open}, s.sealed...)
-		select {
-		case s.flushQ <- s.open:
-		default:
-			s.logger.Warn("logstore: flush queue full at recovery; segment will retry on next tick")
-		}
+		s.enqueueFlush(s.open)
 		s.open = nil
 	}
 
-	s.wg.Add(2)
-	go s.flushLoop()
+	// One flush worker per shipping plane, plus the seal ticker.
+	for _, p := range blockstore.Planes {
+		if cfg.plane(p).Ship {
+			s.wg.Add(1)
+			go s.flushLoop(p)
+		}
+	}
+	s.wg.Add(1)
 	go s.sealTickerLoop()
 
 	return s, nil
 }
 
-// AppendBatch persists `blocks` to the open segment along with an
-// op-root record identifying the (bucket, root) this batch's S3
-// op produced. fsyncs CAR + ops sidecar before returning. After
-// AppendBatch returns nil, both blocks and op-root are durable; the
-// caller may safely advance the bucket's published Root.
-//
-// An empty blocks slice is legal — an MST mutation can produce a
-// new root that points at a node already materialized in a prior
-// segment (e.g., trimTop after Delete unwraps to an existing
-// subtree). In that case only the OpRoot record is written;
-// nothing new lands in the CAR.
-func (s *Store) AppendBatch(ctx context.Context, blocks []block.Block, opRoot blockstore.OpRoot) error {
+// AppendBatch persists the data + catalog blocks of one S3 op's batch
+// to the open segment, along with an op-root record identifying the
+// (bucket, root) it produced. Both CARs + the ops record are fsynced
+// before returning. Either block slice may be empty.
+func (s *Store) AppendBatch(ctx context.Context, dataBlocks, catalogBlocks []block.Block, opRoot blockstore.OpRoot) error {
 	if !opRoot.Root.Defined() {
 		return errors.New("logstore: AppendBatch: opRoot.Root must be defined")
 	}
@@ -128,21 +124,18 @@ func (s *Store) AppendBatch(ctx context.Context, blocks []block.Block, opRoot bl
 	if err != nil {
 		return err
 	}
-	if err := open.append(blocks, opRoot); err != nil {
+	if err := open.append(dataBlocks, catalogBlocks, opRoot); err != nil {
 		return err
 	}
 
-	// Trigger seal if size threshold hit. Non-blocking signal — the
-	// actual seal happens off this goroutine to keep AppendBatch
-	// latency bounded by fsync.
 	if open.Size() >= s.cfg.SealBytes {
 		s.requestSeal()
 	}
 	return nil
 }
 
-// Get returns the block from the local log if any segment contains
-// it, or ErrNotFound otherwise. Searches open first, then sealed
+// Get returns the block from the local log if any segment contains it,
+// or ErrNotFound otherwise. Searches open first, then sealed
 // newest-first.
 func (s *Store) Get(ctx context.Context, c cid.Cid) (block.Block, error) {
 	s.catMu.RLock()
@@ -170,7 +163,7 @@ func (s *Store) Get(ctx context.Context, c cid.Cid) (block.Block, error) {
 	return nil, blockstore.ErrNotFound
 }
 
-// Close seals the open segment, drains the flush queue, and stops
+// Close seals the open segment, drains the flush queues, and stops
 // background goroutines. Safe to call once.
 func (s *Store) Close(ctx context.Context) error {
 	s.catMu.Lock()
@@ -190,8 +183,9 @@ func (s *Store) Close(ctx context.Context) error {
 		return nil
 	}
 
-	// Force-seal the open segment so anything still buffered makes it
-	// into the flush queue.
+	// Force-seal the open segment so anything still buffered is durable
+	// (sealed state persists; recovery re-enqueues it for ship next
+	// start).
 	s.appMu.Lock()
 	s.catMu.Lock()
 	open := s.open
@@ -204,22 +198,19 @@ func (s *Store) Close(ctx context.Context) error {
 			s.catMu.Lock()
 			s.sealed = append([]*Segment{open}, s.sealed...)
 			s.catMu.Unlock()
-			select {
-			case s.flushQ <- open:
-			case <-ctx.Done():
-			}
+			s.enqueueFlush(open)
 		}
 	}
 	s.appMu.Unlock()
 
-	close(s.flushQ)
+	for _, q := range s.flushQ {
+		close(q)
+	}
 	s.wg.Wait()
 	return nil
 }
 
-// requestSeal coalesces seal triggers — the channel has buffer 1 so
-// repeated triggers between two ticks of the seal goroutine are
-// folded into one.
+// requestSeal coalesces seal triggers.
 func (s *Store) requestSeal() {
 	select {
 	case s.sealReq <- struct{}{}:
@@ -227,9 +218,25 @@ func (s *Store) requestSeal() {
 	}
 }
 
+// enqueueFlush hands a sealed segment to each shipping plane's worker.
+// Non-blocking: a full queue is logged and retried on the next restart.
+func (s *Store) enqueueFlush(seg *Segment) {
+	for _, p := range blockstore.Planes {
+		q, ok := s.flushQ[p]
+		if !ok {
+			continue
+		}
+		select {
+		case q <- seg:
+		default:
+			s.logger.Warn("logstore: flush queue full; segment will retry on restart",
+				zap.Stringer("plane", p), zap.Uint64("seq", seg.Seq()))
+		}
+	}
+}
+
 // ensureOpenLockedAppMu returns the current open segment, creating a
-// fresh one if none exists. Caller must hold appMu (so concurrent
-// AppendBatches don't race on segment creation).
+// fresh one if none exists. Caller must hold appMu.
 func (s *Store) ensureOpenLockedAppMu(ctx context.Context) (*Segment, error) {
 	s.catMu.RLock()
 	open := s.open
@@ -257,9 +264,8 @@ func (s *Store) ensureOpenLockedAppMu(ctx context.Context) (*Segment, error) {
 		s.catMu.Unlock()
 		return seg, nil
 	}
-	// Lost a race; another caller created an open segment first.
 	s.catMu.Unlock()
-	if err := seg.retire(); err != nil {
+	if err := seg.retireOpen(); err != nil {
 		s.logger.Warn("logstore: retire raced new segment", zap.Error(err))
 	}
 	if err := s.cfg.Meta.DeleteSegment(ctx, seq); err != nil {
@@ -271,8 +277,8 @@ func (s *Store) ensureOpenLockedAppMu(ctx context.Context) (*Segment, error) {
 	return open, nil
 }
 
-// sealOpenIfDue seals the current open segment if one exists. Sends
-// to flushQ. Idempotent: returns nil if there's nothing to seal.
+// sealOpenIfDue seals the current open segment if one exists and is due
+// (or force is set). Enqueues to each shipping plane.
 func (s *Store) sealOpenIfDue(ctx context.Context, force bool) error {
 	s.appMu.Lock()
 	defer s.appMu.Unlock()
@@ -301,54 +307,57 @@ func (s *Store) sealOpenIfDue(ctx context.Context, force bool) error {
 	}
 	s.catMu.Unlock()
 
-	select {
-	case s.flushQ <- open:
-	case <-s.closing:
-		return nil
-	}
+	s.enqueueFlush(open)
 	return nil
 }
 
-// flushLoop drains flushQ, calling cfg.Flush for each sealed segment.
-// On success, transitions the segment to StateFlushed and runs the
-// retention sweep. On failure, requeues with backoff so transient
-// errors (network blips) don't permanently stall the pipeline.
-//
-// Exits when either the closing signal fires or flushQ is closed
-// (whichever comes first).
-func (s *Store) flushLoop() {
+// flushLoop drains one plane's queue, shipping each sealed segment's
+// shard of that plane. Exits on close.
+func (s *Store) flushLoop(plane blockstore.Plane) {
 	defer s.wg.Done()
+	q := s.flushQ[plane]
 	for {
 		select {
 		case <-s.closing:
 			return
-		case seg, ok := <-s.flushQ:
+		case seg, ok := <-q:
 			if !ok {
 				return
 			}
-			s.flushOne(seg)
+			s.flushOne(plane, seg)
 		}
 	}
 }
 
-func (s *Store) flushOne(seg *Segment) {
+// flushOne ships one plane's shard of a sealed segment, retrying with
+// backoff. On success it stamps the plane's ship state (in memory + in
+// Meta — which advances forge_root_cid for the catalog plane) and runs
+// the retention sweep.
+func (s *Store) flushOne(plane blockstore.Plane, seg *Segment) {
 	ctx := context.Background()
+	flush := s.cfg.plane(plane).Flush
 	const maxAttempts = 5
 	backoff := time.Second
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		err := s.cfg.Flush(ctx, seg)
+		err := flush(ctx, seg)
 		if err == nil {
-			seg.stateMu.Lock()
-			seg.state = StateFlushed
-			seg.stateMu.Unlock()
+			now := time.Now().Unix()
+			seg.markShipped(plane, now)
+			var opRoots []blockstore.OpRoot
+			if plane == blockstore.PlaneCatalog {
+				opRoots = seg.OpRoots()
+			}
+			if merr := s.cfg.Meta.MarkSegmentShipped(ctx, seg.Seq(), plane, now, opRoots); merr != nil {
+				s.logger.Error("logstore: mark shipped",
+					zap.Stringer("plane", plane), zap.Uint64("seq", seg.Seq()), zap.Error(merr))
+			}
 			s.runRetention(ctx)
 			return
 		}
-		s.logger.Warn("logstore: flush attempt failed",
-			zap.Uint64("seq", seg.Seq()),
-			zap.Int("attempt", attempt),
-			zap.Error(err))
+		s.logger.Warn("logstore: ship attempt failed",
+			zap.Stringer("plane", plane), zap.Uint64("seq", seg.Seq()),
+			zap.Int("attempt", attempt), zap.Error(err))
 		select {
 		case <-s.closing:
 			return
@@ -358,42 +367,65 @@ func (s *Store) flushOne(seg *Segment) {
 			backoff *= 2
 		}
 	}
-	s.logger.Error("logstore: flush exhausted retries; segment remains sealed",
-		zap.Uint64("seq", seg.Seq()))
-	// Leaving the segment in sealed state; recovery will pick it up
-	// at next process restart, or operators can intervene.
+	s.logger.Error("logstore: ship exhausted retries; plane remains unshipped",
+		zap.Stringer("plane", plane), zap.Uint64("seq", seg.Seq()))
 }
 
-// runRetention removes flushed segments older than cfg.Retain from
-// disk and the catalog.
+// runRetention retires, per shipping plane, the CARs of shipped
+// segments beyond that plane's Retain window, then drops any segment
+// whose both planes have fully retired off disk. Never-ship planes are
+// never retired.
 func (s *Store) runRetention(ctx context.Context) {
+	type retireReq struct {
+		seg   *Segment
+		plane blockstore.Plane
+	}
+
+	s.catMu.RLock()
+	sealed := make([]*Segment, len(s.sealed))
+	copy(sealed, s.sealed)
+	s.catMu.RUnlock()
+
+	var toRetire []retireReq
+	for _, p := range blockstore.Planes {
+		pc := s.cfg.plane(p)
+		if !pc.Ship {
+			continue
+		}
+		shippedSeen := 0
+		for _, seg := range sealed {
+			if !seg.IsShipped(p) || seg.IsRetired(p) {
+				continue
+			}
+			shippedSeen++
+			if shippedSeen <= pc.Retain {
+				continue
+			}
+			toRetire = append(toRetire, retireReq{seg: seg, plane: p})
+		}
+	}
+
+	for _, tr := range toRetire {
+		if err := tr.seg.retirePlane(tr.plane); err != nil {
+			s.logger.Warn("logstore: retire plane",
+				zap.Stringer("plane", tr.plane), zap.Uint64("seq", tr.seg.Seq()), zap.Error(err))
+		}
+	}
+
+	// Drop fully-retired segments from the read tier + DB.
 	s.catMu.Lock()
-	// Walk newest-first, count flushed segments. Once we exceed
-	// Retain flushed segments, the rest are retire candidates.
-	var (
-		flushedSeen int
-		keep        []*Segment
-		retire      []*Segment
-	)
+	var keep, remove []*Segment
 	for _, seg := range s.sealed {
-		if seg.State() != StateFlushed {
+		if seg.FullyRetired() {
+			remove = append(remove, seg)
+		} else {
 			keep = append(keep, seg)
-			continue
 		}
-		flushedSeen++
-		if flushedSeen <= s.cfg.Retain {
-			keep = append(keep, seg)
-			continue
-		}
-		retire = append(retire, seg)
 	}
 	s.sealed = keep
 	s.catMu.Unlock()
 
-	for _, seg := range retire {
-		if err := seg.retire(); err != nil {
-			s.logger.Warn("logstore: retire", zap.Uint64("seq", seg.Seq()), zap.Error(err))
-		}
+	for _, seg := range remove {
 		if err := s.cfg.Meta.DeleteSegment(ctx, seg.Seq()); err != nil {
 			s.logger.Warn("logstore: delete segment row",
 				zap.Uint64("seq", seg.Seq()), zap.Error(err))
@@ -401,10 +433,9 @@ func (s *Store) runRetention(ctx context.Context) {
 	}
 }
 
-// sealTickerLoop wakes periodically (every SealAge / 4) and seals
-// the open segment if it has been open longer than SealAge or its
-// size is over SealBytes (the latter is also signaled directly via
-// requestSeal but we double-check defensively).
+// sealTickerLoop wakes periodically and seals the open segment if it is
+// due (over SealAge or SealBytes), and also services explicit seal
+// requests.
 func (s *Store) sealTickerLoop() {
 	defer s.wg.Done()
 	interval := s.cfg.SealAge / 4

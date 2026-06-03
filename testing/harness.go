@@ -5,18 +5,15 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"sort"
-	"sync"
 	"time"
 
-	block "github.com/ipfs/go-block-format"
-	"github.com/ipfs/go-cid"
 	"go.uber.org/fx"
 	"go.uber.org/fx/fxevent"
 	"go.uber.org/zap"
 
 	"github.com/fil-forge/ingot"
 	"github.com/fil-forge/ingot/blockstore"
+	"github.com/fil-forge/ingot/inmem"
 	"github.com/fil-forge/ingot/logstore"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/uploader"
@@ -134,7 +131,7 @@ func StartHarness(ctx context.Context, opts ...HarnessOption) (*Harness, error) 
 		return nil, fmt.Errorf("ingot harness: tempdir: %w", err)
 	}
 
-	mem := newMemStore()
+	mem := inmem.NewMemStore()
 
 	// Build the server through ingot's exported ServerModule, exactly as a
 	// production host would, but supplying the in-memory fakes for the four
@@ -155,15 +152,20 @@ func StartHarness(ctx context.Context, opts ...HarnessOption) (*Harness, error) 
 			ChunkSize:  options.chunkSize,
 			SealBytes:  options.sealBytes,
 			SealAge:    options.sealAge,
-			Retain:     options.retain,
+			// Ship both planes to the nop uploader so the seal → ship →
+			// retire path stays exercised by the in-memory suite.
+			ShipData:      true,
+			ShipCatalog:   true,
+			RetainData:    options.retain,
+			RetainCatalog: options.retain,
 		}),
-		// memStore satisfies both registry.Registry and logstore.Meta; expose
+		// MemStore satisfies both registry.Registry and logstore.Meta; expose
 		// it under each interface the module consumes.
 		fx.Provide(
-			fx.Annotate(func() *memStore { return mem }, fx.As(new(registry.Registry))),
-			fx.Annotate(func() *memStore { return mem }, fx.As(new(logstore.Meta))),
-			fx.Annotate(func() nopBaseReader { return nopBaseReader{} }, fx.As(new(blockstore.BlockReader))),
-			fx.Annotate(func() nopUploader { return nopUploader{} }, fx.As(new(uploader.Uploader))),
+			fx.Annotate(func() *inmem.MemStore { return mem }, fx.As(new(registry.Registry))),
+			fx.Annotate(func() *inmem.MemStore { return mem }, fx.As(new(logstore.Meta))),
+			fx.Annotate(func() inmem.NopBaseReader { return inmem.NopBaseReader{} }, fx.As(new(blockstore.BlockReader))),
+			fx.Annotate(func() inmem.NopUploader { return inmem.NopUploader{} }, fx.As(new(uploader.Uploader))),
 		),
 		ingot.ServerModule,
 	)
@@ -274,195 +276,3 @@ func waitListening(ctx context.Context, addr string, timeout time.Duration) erro
 		}
 	}
 }
-
-// memStore is an in-memory implementation of registry.Registry +
-// logstore.Meta. The two interfaces overlap on bucket state because
-// MarkSegmentFlushed advances forge_root_cid; production wires a
-// single *registry.Postgres for both seams, and this fake follows
-// suit so flush behavior matches.
-type memStore struct {
-	mu       sync.Mutex
-	buckets  map[string]*registry.State
-	segments map[uint64]*logstore.SegmentMeta
-	nextSeq  uint64
-}
-
-func newMemStore() *memStore {
-	return &memStore{
-		buckets:  map[string]*registry.State{},
-		segments: map[uint64]*logstore.SegmentMeta{},
-	}
-}
-
-// Registry methods ===========================================================
-
-func (m *memStore) Create(_ context.Context, name string, createdAt int64) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if _, ok := m.buckets[name]; ok {
-		return registry.ErrExists
-	}
-	m.buckets[name] = &registry.State{Name: name, CreatedAt: createdAt}
-	return nil
-}
-
-func (m *memStore) Get(_ context.Context, name string) (*registry.State, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	s, ok := m.buckets[name]
-	if !ok {
-		return nil, registry.ErrNotFound
-	}
-	cp := *s
-	return &cp, nil
-}
-
-func (m *memStore) List(_ context.Context) ([]*registry.State, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	out := make([]*registry.State, 0, len(m.buckets))
-	for _, s := range m.buckets {
-		cp := *s
-		out = append(out, &cp)
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
-	return out, nil
-}
-
-func (m *memStore) Delete(_ context.Context, name string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if _, ok := m.buckets[name]; !ok {
-		return registry.ErrNotFound
-	}
-	delete(m.buckets, name)
-	return nil
-}
-
-func (m *memStore) CASRoot(_ context.Context, name string, expect, next cid.Cid) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	s, ok := m.buckets[name]
-	if !ok {
-		return registry.ErrNotFound
-	}
-	if !s.Root.Equals(expect) {
-		return registry.ErrConflict
-	}
-	s.Root = next
-	return nil
-}
-
-func (m *memStore) SetForgeRoot(_ context.Context, name string, root cid.Cid) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	s, ok := m.buckets[name]
-	if !ok {
-		return registry.ErrNotFound
-	}
-	s.ForgeRoot = root
-	return nil
-}
-
-// Meta methods ===============================================================
-
-func (m *memStore) NextSegmentSeq(_ context.Context) (uint64, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.nextSeq++
-	return m.nextSeq, nil
-}
-
-func (m *memStore) InsertSegmentOpen(_ context.Context, seq uint64) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if _, ok := m.segments[seq]; ok {
-		return nil
-	}
-	m.segments[seq] = &logstore.SegmentMeta{Seq: seq, State: logstore.StateOpen}
-	return nil
-}
-
-func (m *memStore) MarkSegmentSealed(_ context.Context, seq uint64, sealedAt int64, sizeBytes int64, sha256 []byte, opRoots []blockstore.OpRoot) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	r, ok := m.segments[seq]
-	if !ok || r.State != logstore.StateOpen {
-		return nil
-	}
-	r.State = logstore.StateSealed
-	r.SealedAt = sealedAt
-	r.SizeBytes = sizeBytes
-	r.SHA256 = append([]byte(nil), sha256...)
-	r.OpRoots = append([]blockstore.OpRoot(nil), opRoots...)
-	return nil
-}
-
-func (m *memStore) MarkSegmentFlushed(_ context.Context, seq uint64, flushedAt int64, opRoots []blockstore.OpRoot) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if r, ok := m.segments[seq]; ok {
-		r.State = logstore.StateFlushed
-		r.FlushedAt = flushedAt
-	}
-	for _, opr := range opRoots {
-		if b, ok := m.buckets[opr.Bucket]; ok {
-			b.ForgeRoot = opr.Root
-		}
-	}
-	return nil
-}
-
-func (m *memStore) DeleteSegment(_ context.Context, seq uint64) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	delete(m.segments, seq)
-	return nil
-}
-
-func (m *memStore) ListUnflushedSegments(_ context.Context) ([]logstore.SegmentMeta, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	var out []logstore.SegmentMeta
-	for _, r := range m.segments {
-		if r.State == logstore.StateOpen || r.State == logstore.StateSealed {
-			out = append(out, *r)
-		}
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Seq < out[j].Seq })
-	return out, nil
-}
-
-func (m *memStore) RehydrateSegment(_ context.Context, sm logstore.SegmentMeta) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	cp := sm
-	m.segments[sm.Seq] = &cp
-	return nil
-}
-
-// nopBaseReader is the base tier of the layered read path for the
-// harness: every miss past the log returns ErrNotFound. Production
-// wires *blockstore.Forge here; tests don't have piri to talk to.
-type nopBaseReader struct{}
-
-func (nopBaseReader) GetBlock(_ context.Context, _ cid.Cid) (block.Block, error) {
-	return nil, blockstore.ErrNotFound
-}
-
-// nopUploader is the flush sink for the harness: SubmitCAR returns
-// nil so the segment is marked flushed without touching the network.
-type nopUploader struct{}
-
-func (nopUploader) SubmitCAR(_ context.Context, _ []cid.Cid, _ uploader.CARSource) error {
-	return nil
-}
-
-// Compile-time guarantees the fakes still match the contracts after
-// upstream interface drift.
-var (
-	_ registry.Registry      = (*memStore)(nil)
-	_ logstore.Meta          = (*memStore)(nil)
-	_ blockstore.BlockReader = nopBaseReader{}
-	_ uploader.Uploader      = nopUploader{}
-)

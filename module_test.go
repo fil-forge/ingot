@@ -1,7 +1,6 @@
 package ingot_test
 
 import (
-	"net/url"
 	"testing"
 
 	"github.com/fil-forge/ucantone/principal/ed25519"
@@ -10,31 +9,30 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/fil-forge/ingot"
-	"github.com/fil-forge/ingot/uploader"
 )
 
 // TestModuleValidate_Enabled asserts that an enabled ingot.Module, given the
-// dependencies a host is expected to provide, forms a complete and acyclic fx
-// graph. fx.ValidateApp checks wireability without running constructors,
-// lifecycle hooks, or touching the (nil) pool.
+// dependencies a host is expected to provide (logger, pool, service identity),
+// forms a complete and acyclic fx graph. fx.ValidateApp checks wireability
+// without running constructors, lifecycle hooks, or touching the (nil) pool.
+// The module itself provides the token store, the sprue edge-client, and the
+// per-plane uploader.
 func TestModuleValidate_Enabled(t *testing.T) {
 	signer, err := ed25519.Generate()
 	if err != nil {
 		t.Fatalf("generate signer: %v", err)
 	}
-	endpoint, err := url.Parse("http://127.0.0.1:9000")
-	if err != nil {
-		t.Fatalf("parse endpoint: %v", err)
-	}
 
 	cfg := ingot.Config{
-		Enabled:         true,
-		Addr:            "127.0.0.1:0",
-		DataDir:         t.TempDir(),
-		RootAccess:      "key",
-		RootSecret:      "secret",
-		IndexerEndpoint: "http://127.0.0.1:9000",
-		IndexerDID:      "did:web:indexer.example",
+		Enabled:          true,
+		Addr:             "127.0.0.1:0",
+		DataDir:          t.TempDir(),
+		RootAccess:       "key",
+		RootSecret:       "secret",
+		IndexerEndpoint:  "http://127.0.0.1:9000",
+		IndexerDID:       "did:web:indexer.example",
+		UploadServiceURL: "http://127.0.0.1:8000",
+		UploadServiceDID: "did:web:upload.example",
 	}
 
 	err = fx.ValidateApp(
@@ -44,9 +42,6 @@ func TestModuleValidate_Enabled(t *testing.T) {
 		fx.Supply(zap.NewNop()),
 		fx.Supply((*pgxpool.Pool)(nil)),
 		fx.Supply(ingot.ServiceIdentity{Signer: signer}),
-		fx.Provide(func() uploader.ProviderSelector {
-			return uploader.NewStaticProviderSelector(signer.DID(), *endpoint)
-		}),
 	)
 	if err != nil {
 		t.Fatalf("ingot.Module graph does not validate: %v", err)
@@ -58,38 +53,5 @@ func TestModuleValidate_Enabled(t *testing.T) {
 func TestModuleValidate_Disabled(t *testing.T) {
 	if err := fx.ValidateApp(fx.NopLogger, ingot.Module(ingot.Config{})); err != nil {
 		t.Fatalf("disabled ingot.Module should validate as a no-op: %v", err)
-	}
-}
-
-// TestModuleValidate_HomeSelector asserts that, with the HomeProvider config
-// set, the module builds its own ProviderSelector and the host does NOT need to
-// supply one — the single-home-piri convenience path.
-func TestModuleValidate_HomeSelector(t *testing.T) {
-	signer, err := ed25519.Generate()
-	if err != nil {
-		t.Fatalf("generate signer: %v", err)
-	}
-	cfg := ingot.Config{
-		Enabled:         true,
-		Addr:            "127.0.0.1:0",
-		DataDir:         t.TempDir(),
-		RootAccess:      "key",
-		RootSecret:      "secret",
-		IndexerEndpoint: "http://127.0.0.1:9000",
-		IndexerDID:      "did:web:indexer.example",
-		HomeProviderDID: signer.DID().String(),
-		HomeProviderURL: "http://127.0.0.1:8000",
-	}
-
-	// No uploader.ProviderSelector supplied — the module provides one from cfg.
-	err = fx.ValidateApp(
-		fx.NopLogger,
-		ingot.Module(cfg),
-		fx.Supply(zap.NewNop()),
-		fx.Supply((*pgxpool.Pool)(nil)),
-		fx.Supply(ingot.ServiceIdentity{Signer: signer}),
-	)
-	if err != nil {
-		t.Fatalf("home-selector ingot.Module graph does not validate: %v", err)
 	}
 }

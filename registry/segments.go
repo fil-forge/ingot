@@ -26,7 +26,8 @@ func (r *Postgres) NextSegmentSeq(ctx context.Context) (uint64, error) {
 
 func (r *Postgres) InsertSegmentOpen(ctx context.Context, seq uint64) error {
 	_, err := r.pool.Exec(ctx,
-		`INSERT INTO ingot.segments (seq, state, size_bytes) VALUES ($1, 'open', 0)
+		`INSERT INTO ingot.segments (seq, state, data_size_bytes, cat_size_bytes)
+		 VALUES ($1, 'open', 0, 0)
 		 ON CONFLICT (seq) DO NOTHING`,
 		int64(seq))
 	if err != nil {
@@ -35,7 +36,9 @@ func (r *Postgres) InsertSegmentOpen(ctx context.Context, seq uint64) error {
 	return nil
 }
 
-func (r *Postgres) MarkSegmentSealed(ctx context.Context, seq uint64, sealedAt int64, sizeBytes int64, sha256 []byte, opRoots []blockstore.OpRoot) error {
+func (r *Postgres) MarkSegmentSealed(ctx context.Context, seq uint64, sealedAt int64,
+	dataSize int64, dataSHA []byte, catSize int64, catSHA []byte,
+	opRoots []blockstore.OpRoot) error {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("registry: begin seal %d: %w", seq, err)
@@ -44,16 +47,16 @@ func (r *Postgres) MarkSegmentSealed(ctx context.Context, seq uint64, sealedAt i
 
 	tag, err := tx.Exec(ctx,
 		`UPDATE ingot.segments
-		   SET state = 'sealed', sealed_at = $2, size_bytes = $3, car_sha256 = $4
+		   SET state = 'sealed', sealed_at = $2,
+		       data_size_bytes = $3, data_sha256 = $4,
+		       cat_size_bytes = $5, cat_sha256 = $6
 		 WHERE seq = $1 AND state = 'open'`,
-		int64(seq), sealedAt, sizeBytes, sha256)
+		int64(seq), sealedAt, dataSize, dataSHA, catSize, catSHA)
 	if err != nil {
 		return fmt.Errorf("registry: seal %d: %w", seq, err)
 	}
 	if tag.RowsAffected() == 0 {
-		// Either the segment is missing or it has already advanced past
-		// 'open'. Treat as a no-op so seal is idempotent against
-		// crashes between disk seal and DB update.
+		// Missing or already past 'open' — idempotent no-op.
 		return nil
 	}
 
@@ -66,51 +69,47 @@ func (r *Postgres) MarkSegmentSealed(ctx context.Context, seq uint64, sealedAt i
 	return nil
 }
 
-func (r *Postgres) MarkSegmentFlushed(ctx context.Context, seq uint64, flushedAt int64, opRoots []blockstore.OpRoot) error {
+func (r *Postgres) MarkSegmentShipped(ctx context.Context, seq uint64, plane blockstore.Plane, shippedAt int64, opRoots []blockstore.OpRoot) error {
+	if plane == blockstore.PlaneData {
+		_, err := r.pool.Exec(ctx,
+			`UPDATE ingot.segments SET data_shipped_at = $2
+			 WHERE seq = $1 AND data_shipped_at IS NULL`,
+			int64(seq), shippedAt)
+		if err != nil {
+			return fmt.Errorf("registry: mark data shipped %d: %w", seq, err)
+		}
+		return nil
+	}
+
+	// Catalog plane: stamp cat_shipped_at AND advance forge_root_cid for
+	// every op-root in this segment, atomically.
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("registry: begin flush %d: %w", seq, err)
+		return fmt.Errorf("registry: begin ship catalog %d: %w", seq, err)
 	}
 	defer tx.Rollback(ctx)
 
 	tag, err := tx.Exec(ctx,
-		`UPDATE ingot.segments SET state = 'flushed', flushed_at = $2 WHERE seq = $1 AND state = 'sealed'`,
-		int64(seq), flushedAt)
+		`UPDATE ingot.segments SET cat_shipped_at = $2
+		 WHERE seq = $1 AND cat_shipped_at IS NULL`,
+		int64(seq), shippedAt)
 	if err != nil {
-		return fmt.Errorf("registry: flush %d: %w", seq, err)
+		return fmt.Errorf("registry: mark catalog shipped %d: %w", seq, err)
 	}
 	if tag.RowsAffected() == 0 {
-		// Already flushed (or somehow rolled back to open). Idempotent.
+		// Already shipped — idempotent.
 		return nil
 	}
 
-	// Apply forge_root advances in slice order. Segments flush in seq
-	// order, and within a segment the slice order is the order of
-	// commits, so the last write for each bucket wins.
+	// Apply forge_root advances in slice order. Segments ship in seq
+	// order, and within a segment the slice order is commit order, so
+	// the last write for each bucket wins.
 	//
-	// TODO(frrist/ingot): the UPDATE below is unconditional on
-	// root_cid, which is incorrect when a writer's logstore.Commit
-	// succeeds but its subsequent registry.CASRoot fails (transient
-	// Postgres error, context cancellation between the two calls).
-	// In that case, the op_root for newRoot is durable in the log
-	// even though the bucket's published root_cid never advanced.
-	// When this segment flushes, the loop below blindly sets
-	// forge_root_cid = newRoot — even though root_cid is still
-	// oldRoot — breaking the invariant "forge_root_cid is a Root the
-	// bucket has actually published, with its full DAG in Forge."
-	//
-	// Fix: gate the UPDATE on root_cid, e.g.
-	//
-	//   UPDATE ingot.buckets
-	//      SET forge_root_cid = $1
-	//    WHERE name = $2 AND root_cid = $1
-	//
-	// With segments flushing in seq order, this naturally lets a
-	// later segment's flush advance forge_root_cid for the bucket
-	// once root_cid has caught up via a successful CASRoot, and
-	// silently skips orphan op_roots from failed commits.
-	//
-	// Out of scope for the bucketop refactor; track separately.
+	// TODO(frrist/ingot): the UPDATE below is unconditional on root_cid,
+	// which is incorrect when a writer's logstore.Commit succeeds but
+	// its subsequent registry.CASRoot fails. Gate on root_cid (see the
+	// note that previously lived in MarkSegmentFlushed). Tracked
+	// separately.
 	for _, opr := range opRoots {
 		if !opr.Root.Defined() {
 			continue
@@ -122,7 +121,7 @@ func (r *Postgres) MarkSegmentFlushed(ctx context.Context, seq uint64, flushedAt
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("registry: commit flush %d: %w", seq, err)
+		return fmt.Errorf("registry: commit ship catalog %d: %w", seq, err)
 	}
 	return nil
 }
@@ -134,28 +133,33 @@ func (r *Postgres) DeleteSegment(ctx context.Context, seq uint64) error {
 	return nil
 }
 
-func (r *Postgres) ListUnflushedSegments(ctx context.Context) ([]logstore.SegmentMeta, error) {
+func (r *Postgres) ListSegments(ctx context.Context) ([]logstore.SegmentMeta, error) {
 	rows, err := r.pool.Query(ctx,
-		`SELECT seq, state, COALESCE(sealed_at, 0), COALESCE(flushed_at, 0), size_bytes, car_sha256
+		`SELECT seq, state, COALESCE(sealed_at, 0),
+		        data_size_bytes, data_sha256, cat_size_bytes, cat_sha256,
+		        COALESCE(data_shipped_at, 0), COALESCE(cat_shipped_at, 0)
 		   FROM ingot.segments
 		  WHERE state IN ('open', 'sealed')
 		  ORDER BY seq ASC`)
 	if err != nil {
-		return nil, fmt.Errorf("registry: list unflushed segments: %w", err)
+		return nil, fmt.Errorf("registry: list segments: %w", err)
 	}
 	defer rows.Close()
 
 	var out []logstore.SegmentMeta
 	for rows.Next() {
 		var (
-			seqInt  int64
-			stateS  string
-			sealed  int64
-			flushed int64
-			size    int64
-			sha     []byte
+			seqInt        int64
+			stateS        string
+			sealed        int64
+			dataSize      int64
+			dataSHA       []byte
+			catSize       int64
+			catSHA        []byte
+			dataShippedAt int64
+			catShippedAt  int64
 		)
-		if err := rows.Scan(&seqInt, &stateS, &sealed, &flushed, &size, &sha); err != nil {
+		if err := rows.Scan(&seqInt, &stateS, &sealed, &dataSize, &dataSHA, &catSize, &catSHA, &dataShippedAt, &catShippedAt); err != nil {
 			return nil, fmt.Errorf("registry: scan segment: %w", err)
 		}
 		state, ok := logstore.ParseState(stateS)
@@ -163,20 +167,22 @@ func (r *Postgres) ListUnflushedSegments(ctx context.Context) ([]logstore.Segmen
 			return nil, fmt.Errorf("registry: bad segment state %q for seq %d", stateS, seqInt)
 		}
 		out = append(out, logstore.SegmentMeta{
-			Seq:       uint64(seqInt),
-			State:     state,
-			SealedAt:  sealed,
-			FlushedAt: flushed,
-			SizeBytes: size,
-			SHA256:    sha,
+			Seq:           uint64(seqInt),
+			State:         state,
+			SealedAt:      sealed,
+			DataSize:      dataSize,
+			DataSHA256:    dataSHA,
+			CatSize:       catSize,
+			CatSHA256:     catSHA,
+			DataShippedAt: dataShippedAt,
+			CatShippedAt:  catShippedAt,
 		})
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("registry: list segments rows: %w", err)
 	}
 
-	// Hydrate op_roots for sealed segments only (open segments have
-	// none). Done in a second pass to keep the query simple.
+	// Hydrate op_roots for sealed segments (open segments have none).
 	for i := range out {
 		if out[i].State != logstore.StateSealed {
 			continue
@@ -197,24 +203,17 @@ func (r *Postgres) RehydrateSegment(ctx context.Context, m logstore.SegmentMeta)
 	}
 	defer tx.Rollback(ctx)
 
-	// Replace any existing rows for this seq.
 	if _, err := tx.Exec(ctx, `DELETE FROM ingot.segments WHERE seq = $1`, int64(m.Seq)); err != nil {
 		return fmt.Errorf("registry: rehydrate clear %d: %w", m.Seq, err)
 	}
 
-	var sealedAt, flushedAt *int64
-	if m.SealedAt != 0 {
-		v := m.SealedAt
-		sealedAt = &v
-	}
-	if m.FlushedAt != 0 {
-		v := m.FlushedAt
-		flushedAt = &v
-	}
 	if _, err := tx.Exec(ctx,
-		`INSERT INTO ingot.segments (seq, state, sealed_at, flushed_at, size_bytes, car_sha256)
-		 VALUES ($1, $2, $3, $4, $5, $6)`,
-		int64(m.Seq), m.State.String(), sealedAt, flushedAt, m.SizeBytes, m.SHA256); err != nil {
+		`INSERT INTO ingot.segments
+		   (seq, state, sealed_at, data_size_bytes, data_sha256, cat_size_bytes, cat_sha256, data_shipped_at, cat_shipped_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+		int64(m.Seq), m.State.String(), nullableInt(m.SealedAt),
+		m.DataSize, m.DataSHA256, m.CatSize, m.CatSHA256,
+		nullableInt(m.DataShippedAt), nullableInt(m.CatShippedAt)); err != nil {
 		return fmt.Errorf("registry: rehydrate insert %d: %w", m.Seq, err)
 	}
 
@@ -225,6 +224,14 @@ func (r *Postgres) RehydrateSegment(ctx context.Context, m logstore.SegmentMeta)
 		return fmt.Errorf("registry: rehydrate commit %d: %w", m.Seq, err)
 	}
 	return nil
+}
+
+// nullableInt maps a zero timestamp to SQL NULL.
+func nullableInt(v int64) *int64 {
+	if v == 0 {
+		return nil
+	}
+	return &v
 }
 
 func (r *Postgres) fetchOpRoots(ctx context.Context, seq uint64) ([]blockstore.OpRoot, error) {

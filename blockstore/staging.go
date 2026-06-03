@@ -48,11 +48,31 @@ type OpStaging struct {
 	bucket     string
 
 	mu sync.RWMutex
-	// blocks holds every Put for the lifetime of the transaction.
-	// See the TODO(perf) on OpStaging — this is the field a
-	// file-backed implementation would replace.
+	// blocks holds every Put for the lifetime of the transaction,
+	// across BOTH planes, so read-your-writes (MST.GetPointer
+	// re-reading a freshly-put node; a ranged GET re-reading a
+	// freshly-put chunk) works regardless of plane. See the
+	// TODO(perf) on OpStaging — this is the field a file-backed
+	// implementation would replace.
 	blocks map[string]block.Block // keyed by string(cid.Bytes())
-	order  []cid.Cid
+	// dataOrder / catOrder preserve Put order within each plane.
+	// On Commit they become the two block slices handed to
+	// Log.AppendBatch. Classification is by CID codec — see
+	// isDataBlock and the plane-split invariant below.
+	dataOrder []cid.Cid
+	catOrder  []cid.Cid
+}
+
+// isDataBlock reports whether a block belongs to the data plane.
+//
+// INVARIANT: the data plane is exactly the raw-codec leaf blocks the
+// body codec emits (bucket.FixedChunker.putRawBlock uses cid.Raw);
+// everything else — ObjectManifests, FixedChunkerIndex docs, MST
+// nodes — is dag-cbor and belongs to the catalog plane. If a future
+// body codec emits non-raw body DAG nodes, this seam must be replaced
+// with an explicit per-write kind rather than a codec sniff.
+func isDataBlock(c cid.Cid) bool {
+	return c.Prefix().Codec == cid.Raw
 }
 
 // NewOpStaging constructs a per-op staging buffer. underlying is the
@@ -81,9 +101,14 @@ func (b *OpStaging) Put(_ context.Context, blk block.Block) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	key := string(blk.Cid().Bytes())
-	if _, exists := b.blocks[key]; !exists {
-		b.blocks[key] = blk
-		b.order = append(b.order, blk.Cid())
+	if _, exists := b.blocks[key]; exists {
+		return nil
+	}
+	b.blocks[key] = blk
+	if isDataBlock(blk.Cid()) {
+		b.dataOrder = append(b.dataOrder, blk.Cid())
+	} else {
+		b.catOrder = append(b.catOrder, blk.Cid())
 	}
 	return nil
 }
@@ -106,16 +131,21 @@ func (b *OpStaging) Commit(ctx context.Context, root cid.Cid) error {
 		return errors.New("opstaging: commit with undefined root")
 	}
 
-	blks := make([]block.Block, len(b.order))
-	for i, c := range b.order {
-		blks[i] = b.blocks[string(c.Bytes())]
+	data := make([]block.Block, len(b.dataOrder))
+	for i, c := range b.dataOrder {
+		data[i] = b.blocks[string(c.Bytes())]
 	}
-	if err := b.log.AppendBatch(ctx, blks, OpRoot{Bucket: b.bucket, Root: root}); err != nil {
+	cat := make([]block.Block, len(b.catOrder))
+	for i, c := range b.catOrder {
+		cat[i] = b.blocks[string(c.Bytes())]
+	}
+	if err := b.log.AppendBatch(ctx, data, cat, OpRoot{Bucket: b.bucket, Root: root}); err != nil {
 		return fmt.Errorf("opstaging: append: %w", err)
 	}
 
 	b.blocks = map[string]block.Block{}
-	b.order = nil
+	b.dataOrder = nil
+	b.catOrder = nil
 	return nil
 }
 
@@ -126,7 +156,8 @@ func (b *OpStaging) Discard() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.blocks = map[string]block.Block{}
-	b.order = nil
+	b.dataOrder = nil
+	b.catOrder = nil
 }
 
 // OpStaging is passed to CborStore in bucketop.Tx construction, so

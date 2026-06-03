@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
 	"github.com/versity/versitygw/auth"
 	"github.com/versity/versitygw/metrics"
@@ -51,11 +50,21 @@ type ServerConfig struct {
 	// 0 → bucket.DefaultChunkSize.
 	ChunkSize int64
 
-	// SealBytes / SealAge / Retain are passed through to logstore.Open.
-	// Zero values pick logstore defaults (64 MiB / 5 s / 6 segments).
+	// SealBytes / SealAge are passed through to logstore.Open. Zero
+	// values pick logstore defaults (64 MiB / 5 s).
 	SealBytes int64
 	SealAge   time.Duration
-	Retain    int
+
+	// ShipData / ShipCatalog gate each plane's independent upload
+	// pipeline. When false, that plane's CARs are retained on local disk
+	// and never shipped to Forge. RetainData / RetainCatalog bound how
+	// many shipped CARs of each plane are kept locally (0 → logstore
+	// default of 6; ignored for a non-shipping plane, which is retained
+	// indefinitely).
+	ShipData      bool
+	ShipCatalog   bool
+	RetainData    int
+	RetainCatalog int
 
 	// MaxConnections / MaxRequests configure versitygw's hard
 	// concurrency limit. Zero is unsafe (yields 503 SlowDown on every
@@ -116,16 +125,22 @@ func New(ctx context.Context, cfg ServerConfig, deps ServerDeps) (*Server, error
 		logger = zap.NewNop()
 	}
 
-	flush := newFlushFunc(deps.Uploader, deps.Meta)
-
 	log, err := logstore.Open(ctx, logstore.Config{
 		Dir:       filepath.Join(cfg.DataDir, "segments"),
 		Meta:      deps.Meta,
 		SealBytes: cfg.SealBytes,
 		SealAge:   cfg.SealAge,
-		Retain:    cfg.Retain,
-		Flush:     flush,
-		Logger:    logger,
+		Data: logstore.PlaneConfig{
+			Ship:   cfg.ShipData,
+			Flush:  newPlaneFlushFunc(deps.Uploader, blockstore.PlaneData),
+			Retain: cfg.RetainData,
+		},
+		Catalog: logstore.PlaneConfig{
+			Ship:   cfg.ShipCatalog,
+			Flush:  newPlaneFlushFunc(deps.Uploader, blockstore.PlaneCatalog),
+			Retain: cfg.RetainCatalog,
+		},
+		Logger: logger,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("ingot: logstore: %w", err)
@@ -192,48 +207,40 @@ func (s *Server) Stop(ctx context.Context) error {
 	return nil
 }
 
-// newFlushFunc captures uploader + meta into the closure passed to
-// logstore.Open. Each sealed segment becomes one Forge round trip
-// (CAR + index + indexer claim) plus one Postgres tx that flips the
-// segment row to flushed and advances each affected bucket's
-// forge_root_cid.
+// newPlaneFlushFunc builds the logstore flush callback for ONE plane:
+// it ships that plane's sealed CAR to Forge via uploader.SubmitShard.
+// The store owns the ship-state transition (it stamps the per-plane
+// shipped timestamp and, for the catalog plane, advances each affected
+// bucket's forge_root_cid) once this returns nil — so the closure is
+// purely the network ship.
 //
-// The sealed CAR file is the wire payload — uploader.SubmitCAR
-// streams it directly into the HTTP PUT, and the segment's
-// already-computed digest and append-time position table feed
-// allocate/accept and the index view without rescanning the file.
-func newFlushFunc(up uploader.Uploader, meta logstore.Meta) logstore.FlushFunc {
+// A header-only CAR (e.g. an MST-only op writes no data blocks; a
+// trimTop-to-existing-subtree writes neither) has no positions: nothing
+// to ship, so the closure returns nil and the store still marks the
+// plane shipped, letting retention reclaim the tiny CAR and (for the
+// catalog plane) advancing forge_root_cid for the recorded op-roots.
+func newPlaneFlushFunc(up uploader.Uploader, plane blockstore.Plane) logstore.FlushFunc {
 	return func(ctx context.Context, seg *logstore.Segment) error {
-		opRoots := seg.OpRoots()
-		positions := seg.BlockPositions()
-		if len(positions) == 0 || len(opRoots) == 0 {
-			// Empty or no-op segment (e.g., force-sealed during a
-			// quiet startup). Mark flushed so retention can sweep
-			// it; no Forge ship and no forge_root advance are
-			// needed.
-			return meta.MarkSegmentFlushed(ctx, seg.Seq(), time.Now().Unix(), nil)
+		positions := seg.Positions(plane)
+		if len(positions) == 0 {
+			return nil
 		}
-		// Segment stores the raw 32-byte SHA-256 of the CAR file;
-		// the uploader and ShardedDagIndexView want the multihash
-		// form (varint code + length + digest).
-		sha, err := multihash.Encode(seg.SHA256(), multihash.SHA2_256)
+		// Segment stores the raw 32-byte SHA-256 of the CAR file; the
+		// uploader and ShardedDagIndexView want the multihash form.
+		sha, err := multihash.Encode(seg.SHA256(plane), multihash.SHA2_256)
 		if err != nil {
-			return fmt.Errorf("encode segment %d sha: %w", seg.Seq(), err)
+			return fmt.Errorf("encode segment %d %s sha: %w", seg.Seq(), plane, err)
 		}
-		rootCids := make([]cid.Cid, len(opRoots))
-		for i, opr := range opRoots {
-			rootCids[i] = opr.Root
-		}
-		src := uploader.CARSource{
-			Path:      seg.CARPath(),
-			Size:      seg.Size(),
+		shard := uploader.CARShard{
+			Path:      seg.PlaneCARPath(plane),
+			Size:      seg.PlaneSize(plane),
 			SHA256:    sha,
 			Positions: positions,
 		}
-		if err := up.SubmitCAR(ctx, rootCids, src); err != nil {
-			return fmt.Errorf("submit segment %d: %w", seg.Seq(), err)
+		if err := up.SubmitShard(ctx, plane, shard); err != nil {
+			return fmt.Errorf("submit segment %d %s: %w", seg.Seq(), plane, err)
 		}
-		return meta.MarkSegmentFlushed(ctx, seg.Seq(), time.Now().Unix(), opRoots)
+		return nil
 	}
 }
 

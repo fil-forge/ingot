@@ -25,7 +25,12 @@ type fakeMeta struct {
 	mu       sync.Mutex
 	nextSeq  uint64
 	segments map[uint64]*SegmentMeta
-	flushed  []uint64 // order of MarkSegmentFlushed calls
+	shipped  []shipEvent // order of MarkSegmentShipped calls
+}
+
+type shipEvent struct {
+	seq   uint64
+	plane blockstore.Plane
 }
 
 func newFakeMeta() *fakeMeta {
@@ -49,7 +54,9 @@ func (f *fakeMeta) InsertSegmentOpen(_ context.Context, seq uint64) error {
 	return nil
 }
 
-func (f *fakeMeta) MarkSegmentSealed(_ context.Context, seq uint64, sealedAt int64, sizeBytes int64, sha256 []byte, opRoots []blockstore.OpRoot) error {
+func (f *fakeMeta) MarkSegmentSealed(_ context.Context, seq uint64, sealedAt int64,
+	dataSize int64, dataSHA []byte, catSize int64, catSHA []byte,
+	opRoots []blockstore.OpRoot) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	m, ok := f.segments[seq]
@@ -62,28 +69,33 @@ func (f *fakeMeta) MarkSegmentSealed(_ context.Context, seq uint64, sealedAt int
 	}
 	m.State = StateSealed
 	m.SealedAt = sealedAt
-	m.SizeBytes = sizeBytes
-	m.SHA256 = append([]byte(nil), sha256...)
+	m.DataSize = dataSize
+	m.DataSHA256 = append([]byte(nil), dataSHA...)
+	m.CatSize = catSize
+	m.CatSHA256 = append([]byte(nil), catSHA...)
 	m.OpRoots = append([]blockstore.OpRoot(nil), opRoots...)
 	return nil
 }
 
-func (f *fakeMeta) MarkSegmentFlushed(_ context.Context, seq uint64, flushedAt int64, opRoots []blockstore.OpRoot) error {
+func (f *fakeMeta) MarkSegmentShipped(_ context.Context, seq uint64, plane blockstore.Plane, shippedAt int64, opRoots []blockstore.OpRoot) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	m, ok := f.segments[seq]
 	if !ok {
-		return fmt.Errorf("fake: flush missing seq %d", seq)
+		return fmt.Errorf("fake: ship missing seq %d", seq)
 	}
-	if m.State == StateFlushed {
-		return nil
+	if plane == blockstore.PlaneData {
+		if m.DataShippedAt != 0 {
+			return nil
+		}
+		m.DataShippedAt = shippedAt
+	} else {
+		if m.CatShippedAt != 0 {
+			return nil
+		}
+		m.CatShippedAt = shippedAt
 	}
-	m.State = StateFlushed
-	m.FlushedAt = flushedAt
-	if len(opRoots) > 0 {
-		m.OpRoots = append([]blockstore.OpRoot(nil), opRoots...)
-	}
-	f.flushed = append(f.flushed, seq)
+	f.shipped = append(f.shipped, shipEvent{seq: seq, plane: plane})
 	return nil
 }
 
@@ -94,14 +106,12 @@ func (f *fakeMeta) DeleteSegment(_ context.Context, seq uint64) error {
 	return nil
 }
 
-func (f *fakeMeta) ListUnflushedSegments(_ context.Context) ([]SegmentMeta, error) {
+func (f *fakeMeta) ListSegments(_ context.Context) ([]SegmentMeta, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var out []SegmentMeta
 	for _, m := range f.segments {
-		if m.State == StateOpen || m.State == StateSealed {
-			out = append(out, *m)
-		}
+		out = append(out, *m)
 	}
 	return out, nil
 }
@@ -131,6 +141,23 @@ func makeBlock(t *testing.T, payload []byte) block.Block {
 	return blk
 }
 
+// makeCatBlock returns a dag-cbor-codec block (the catalog plane). The
+// payload need not be valid CBOR — logstore stores opaque bytes keyed
+// by CID and never decodes them.
+func makeCatBlock(t *testing.T, payload []byte) block.Block {
+	t.Helper()
+	mh, err := multihash.Sum(payload, multihash.SHA2_256, -1)
+	if err != nil {
+		t.Fatalf("multihash: %v", err)
+	}
+	c := cid.NewCidV1(cid.DagCBOR, mh)
+	blk, err := block.NewBlockWithCid(payload, c)
+	if err != nil {
+		t.Fatalf("block: %v", err)
+	}
+	return blk
+}
+
 // makeRoot returns a deterministic CID derived from name; used as
 // the OpRoot.Root in tests.
 func makeRoot(t *testing.T, name string) cid.Cid {
@@ -148,17 +175,18 @@ func newTestStore(t *testing.T, sealBytes int64, sealAge time.Duration, retain i
 	meta := newFakeMeta()
 	flushCalls := &atomicCounter{}
 	logger := zaptest.NewLogger(t)
+	flush := func(_ context.Context, _ *Segment) error {
+		flushCalls.add(1)
+		return nil
+	}
 	cfg := Config{
 		Dir:       dir,
 		Meta:      meta,
 		SealBytes: sealBytes,
 		SealAge:   sealAge,
-		Retain:    retain,
-		Flush: func(ctx context.Context, seg *Segment) error {
-			flushCalls.add(1)
-			return meta.MarkSegmentFlushed(ctx, seg.Seq(), time.Now().Unix(), seg.OpRoots())
-		},
-		Logger: logger,
+		Data:      PlaneConfig{Ship: true, Flush: flush, Retain: retain},
+		Catalog:   PlaneConfig{Ship: true, Flush: flush, Retain: retain},
+		Logger:    logger,
 	}
 	s, err := Open(context.Background(), cfg)
 	if err != nil {
@@ -178,7 +206,7 @@ func TestAppendThenGetSameProcess(t *testing.T) {
 
 	blk := makeBlock(t, []byte("hello world"))
 	root := makeRoot(t, "alpha")
-	if err := s.AppendBatch(context.Background(), []block.Block{blk}, blockstore.OpRoot{Bucket: "bk", Root: root}); err != nil {
+	if err := s.AppendBatch(context.Background(), []block.Block{blk}, nil, blockstore.OpRoot{Bucket: "bk", Root: root}); err != nil {
 		t.Fatalf("AppendBatch: %v", err)
 	}
 
@@ -202,7 +230,7 @@ func TestSealBySize(t *testing.T) {
 	}
 	for i := 0; i < 6; i++ {
 		blk := makeBlock(t, append([]byte(fmt.Sprintf("rec-%02d-", i)), payload...))
-		if err := s.AppendBatch(context.Background(), []block.Block{blk}, blockstore.OpRoot{
+		if err := s.AppendBatch(context.Background(), []block.Block{blk}, nil, blockstore.OpRoot{
 			Bucket: "bk",
 			Root:   makeRoot(t, fmt.Sprintf("size-%d", i)),
 		}); err != nil {
@@ -222,17 +250,17 @@ func TestSealBySize(t *testing.T) {
 		t.Fatalf("expected at least one flush after size threshold; got 0")
 	}
 
-	// At least one segment row should now be flushed.
+	// At least one segment should now have both planes shipped.
 	meta.mu.Lock()
-	var flushed int
+	var shipped int
 	for _, m := range meta.segments {
-		if m.State == StateFlushed {
-			flushed++
+		if m.DataShippedAt != 0 && m.CatShippedAt != 0 {
+			shipped++
 		}
 	}
 	meta.mu.Unlock()
-	if flushed == 0 {
-		t.Fatalf("expected at least one segment in flushed state")
+	if shipped == 0 {
+		t.Fatalf("expected at least one fully-shipped segment")
 	}
 }
 
@@ -240,7 +268,7 @@ func TestSealByAge(t *testing.T) {
 	s, _, flushes := newTestStore(t, 1<<30, 80*time.Millisecond, 6)
 
 	blk := makeBlock(t, []byte("age-trigger"))
-	if err := s.AppendBatch(context.Background(), []block.Block{blk}, blockstore.OpRoot{
+	if err := s.AppendBatch(context.Background(), []block.Block{blk}, nil, blockstore.OpRoot{
 		Bucket: "bk",
 		Root:   makeRoot(t, "age"),
 	}); err != nil {
@@ -271,7 +299,7 @@ func TestRetentionDropsOldFlushed(t *testing.T) {
 			payload[j] = byte(i)
 		}
 		blk := makeBlock(t, append([]byte(fmt.Sprintf("retain-%02d-", i)), payload...))
-		if err := s.AppendBatch(context.Background(), []block.Block{blk}, blockstore.OpRoot{
+		if err := s.AppendBatch(context.Background(), []block.Block{blk}, nil, blockstore.OpRoot{
 			Bucket: "bk",
 			Root:   makeRoot(t, fmt.Sprintf("ret-%d", i)),
 		}); err != nil {
@@ -298,7 +326,7 @@ func TestRetentionDropsOldFlushed(t *testing.T) {
 		t.Fatalf("readDir: %v", err)
 	}
 	if len(entries) > 3 {
-		t.Fatalf("retain=2 should leave at most 3 .car files (open + retained); got %d (%v)",
+		t.Fatalf("retain=2 should leave at most 3 segments (open + retained); got %d (%v)",
 			len(entries), entries)
 	}
 }
@@ -313,11 +341,9 @@ func TestForceSealRecoveredOpenOnRestart(t *testing.T) {
 			Meta:      meta,
 			SealBytes: 1 << 30, // never seals on size during this test
 			SealAge:   1 * time.Hour,
-			Retain:    6,
-			Flush: func(ctx context.Context, seg *Segment) error {
-				return meta.MarkSegmentFlushed(ctx, seg.Seq(), time.Now().Unix(), seg.OpRoots())
-			},
-			Logger: logger,
+			Data:      PlaneConfig{Ship: true, Flush: func(context.Context, *Segment) error { return nil }, Retain: 6},
+			Catalog:   PlaneConfig{Ship: true, Flush: func(context.Context, *Segment) error { return nil }, Retain: 6},
+			Logger:    logger,
 		}
 		s, err := Open(context.Background(), cfg)
 		if err != nil {
@@ -328,7 +354,7 @@ func TestForceSealRecoveredOpenOnRestart(t *testing.T) {
 
 	s := openStore()
 	blk := makeBlock(t, []byte("survives-restart"))
-	if err := s.AppendBatch(context.Background(), []block.Block{blk}, blockstore.OpRoot{
+	if err := s.AppendBatch(context.Background(), []block.Block{blk}, nil, blockstore.OpRoot{
 		Bucket: "bk",
 		Root:   makeRoot(t, "survive"),
 	}); err != nil {
@@ -360,10 +386,10 @@ func TestForceSealRecoveredOpenOnRestart(t *testing.T) {
 func TestAppendBatchEmptyBlocksAccepted(t *testing.T) {
 	s, _, _ := newTestStore(t, 64<<20, 5*time.Second, 6)
 	root := makeRoot(t, "x")
-	if err := s.AppendBatch(context.Background(), nil, blockstore.OpRoot{Bucket: "bk", Root: root}); err != nil {
+	if err := s.AppendBatch(context.Background(), nil, nil, blockstore.OpRoot{Bucket: "bk", Root: root}); err != nil {
 		t.Fatalf("empty blocks with defined root should succeed, got %v", err)
 	}
-	if err := s.AppendBatch(context.Background(), []block.Block{makeBlock(t, []byte("x"))}, blockstore.OpRoot{Bucket: "bk"}); err == nil {
+	if err := s.AppendBatch(context.Background(), []block.Block{makeBlock(t, []byte("x"))}, nil, blockstore.OpRoot{Bucket: "bk"}); err == nil {
 		t.Fatalf("expected error on undefined root")
 	}
 }
@@ -392,6 +418,7 @@ func TestAppendBatchDedupesAcrossOps(t *testing.T) {
 	// First batch: shared + uniqA.
 	if err := s.AppendBatch(context.Background(),
 		[]block.Block{shared, uniqA},
+		nil,
 		blockstore.OpRoot{Bucket: "bk", Root: makeRoot(t, "op-a")},
 	); err != nil {
 		t.Fatalf("append A: %v", err)
@@ -405,6 +432,7 @@ func TestAppendBatchDedupesAcrossOps(t *testing.T) {
 	// Second batch: shared (duplicate of first batch) + uniqB.
 	if err := s.AppendBatch(context.Background(),
 		[]block.Block{shared, uniqB},
+		nil,
 		blockstore.OpRoot{Bucket: "bk", Root: makeRoot(t, "op-b")},
 	); err != nil {
 		t.Fatalf("append B: %v", err)
@@ -450,7 +478,7 @@ func TestAppendBatchAllDuplicatesStillRecordsOpRoot(t *testing.T) {
 
 	blk := makeBlock(t, []byte("only-block"))
 
-	if err := s.AppendBatch(context.Background(), []block.Block{blk}, blockstore.OpRoot{
+	if err := s.AppendBatch(context.Background(), []block.Block{blk}, nil, blockstore.OpRoot{
 		Bucket: "bk", Root: makeRoot(t, "first"),
 	}); err != nil {
 		t.Fatalf("first append: %v", err)
@@ -460,7 +488,7 @@ func TestAppendBatchAllDuplicatesStillRecordsOpRoot(t *testing.T) {
 	opRootsBefore := len(s.open.OpRoots())
 	s.catMu.RUnlock()
 
-	if err := s.AppendBatch(context.Background(), []block.Block{blk}, blockstore.OpRoot{
+	if err := s.AppendBatch(context.Background(), []block.Block{blk}, nil, blockstore.OpRoot{
 		Bucket: "bk", Root: makeRoot(t, "second"),
 	}); err != nil {
 		t.Fatalf("dup append: %v", err)
@@ -478,8 +506,107 @@ func TestAppendBatchAllDuplicatesStillRecordsOpRoot(t *testing.T) {
 	}
 }
 
+// readSegmentSeqs counts distinct segments on disk by their catalog
+// CAR (one per segment; the data CAR may retire independently).
+// TestPerPlaneShipping_CatalogNeverShips is the headline permutation:
+// the data plane ships (and retires past its Retain window) while the
+// catalog plane is configured never to ship, so its CARs stay on local
+// disk indefinitely. No catalog flush worker runs, so cat_shipped_at
+// never advances (and, by extension, forge_root_cid never advances).
+func TestPerPlaneShipping_CatalogNeverShips(t *testing.T) {
+	dir := t.TempDir()
+	meta := newFakeMeta()
+	logger := zaptest.NewLogger(t)
+
+	var dataShips atomicCounter
+	cfg := Config{
+		Dir:       dir,
+		Meta:      meta,
+		SealBytes: 1, // seal each batch into its own segment
+		SealAge:   20 * time.Millisecond,
+		Data: PlaneConfig{
+			Ship:   true,
+			Flush:  func(context.Context, *Segment) error { dataShips.add(1); return nil },
+			Retain: 1,
+		},
+		Catalog: PlaneConfig{Ship: false}, // never ships → retained forever
+		Logger:  logger,
+	}
+	s, err := Open(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close(context.Background()) })
+
+	const n = 4
+	var catBlocks []block.Block
+	for i := 0; i < n; i++ {
+		d := makeBlock(t, []byte(fmt.Sprintf("data-%02d", i)))
+		c := makeCatBlock(t, []byte(fmt.Sprintf("cat-%02d", i)))
+		catBlocks = append(catBlocks, c)
+		if err := s.AppendBatch(context.Background(),
+			[]block.Block{d}, []block.Block{c},
+			blockstore.OpRoot{Bucket: "bk", Root: c.Cid()},
+		); err != nil {
+			t.Fatalf("append %d: %v", i, err)
+		}
+		time.Sleep(30 * time.Millisecond) // let each batch seal separately
+	}
+
+	// Wait for the data pipeline to ship every segment.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if dataShips.load() >= n {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if dataShips.load() == 0 {
+		t.Fatalf("expected the data plane to ship; got 0")
+	}
+
+	// Every sealed segment: data shipped, catalog never shipped.
+	meta.mu.Lock()
+	sealed := 0
+	for seq, m := range meta.segments {
+		if m.State != StateSealed {
+			continue
+		}
+		sealed++
+		if m.CatShippedAt != 0 {
+			t.Fatalf("seg %d: catalog shipped (%d) but Ship=false", seq, m.CatShippedAt)
+		}
+		if m.DataShippedAt == 0 {
+			t.Fatalf("seg %d: data plane never shipped", seq)
+		}
+	}
+	meta.mu.Unlock()
+	if sealed == 0 {
+		t.Fatalf("expected sealed segments; got none")
+	}
+
+	// Catalog blocks stay readable from local disk (CARs retained); a
+	// fully-retired segment would have its row deleted, but the retained
+	// catalog keeps every segment alive.
+	for _, c := range catBlocks {
+		if _, err := s.Get(context.Background(), c.Cid()); err != nil {
+			t.Fatalf("catalog block %s should be retained locally: %v", c.Cid(), err)
+		}
+	}
+
+	// All catalog CARs retained; data CARs retired toward Retain=1.
+	cats, _ := filepath.Glob(filepath.Join(dir, "seg-*.cat.car"))
+	datas, _ := filepath.Glob(filepath.Join(dir, "seg-*.data.car"))
+	if len(cats) < n {
+		t.Fatalf("expected >= %d catalog CARs retained; got %d", n, len(cats))
+	}
+	if len(datas) >= len(cats) {
+		t.Fatalf("expected fewer data CARs than catalog CARs after retire; data=%d cat=%d", len(datas), len(cats))
+	}
+}
+
 func readSegmentSeqs(dir string) ([]string, error) {
-	matches, err := filepath.Glob(filepath.Join(dir, "seg-*.car"))
+	matches, err := filepath.Glob(filepath.Join(dir, "seg-*.cat.car"))
 	if err != nil {
 		return nil, err
 	}
