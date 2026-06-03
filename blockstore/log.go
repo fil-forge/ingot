@@ -23,6 +23,8 @@ type OpRoot struct {
 // populate one entry per block at append time; consumers (most
 // notably the flush path that builds a ShardedDagIndexView) read
 // the entries to avoid rescanning the file.
+// TODO(forrest): replace Offset and Length with Start and End to
+// align with libforge semantics
 type BlockLoc struct {
 	Offset uint64
 	Length uint64
