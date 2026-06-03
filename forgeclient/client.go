@@ -1,6 +1,7 @@
 // Package forgeclient is ingot's Forge edge-client: it invokes
-// /blob/add, /ucan/conclude, /index/add (and the /access login flow)
-// against the upload service (sprue), behaving like a guppy node.
+// /blob/add, /ucan/conclude, /index/add, /provider/add, /access/delegate
+// (and the /access login flow) against the upload service (sprue),
+// behaving like a guppy node.
 //
 // It is a carried, trimmed copy of github.com/fil-forge/guppy/pkg/client
 // (ingot cannot import guppy: guppy embeds ingot → import cycle). The
