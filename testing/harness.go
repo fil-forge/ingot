@@ -150,14 +150,17 @@ func StartHarness(ctx context.Context, opts ...HarnessOption) (*Harness, error) 
 			RootAccess: options.accessKey,
 			RootSecret: options.secretKey,
 			ChunkSize:  options.chunkSize,
-			SealBytes:  options.sealBytes,
-			SealAge:    options.sealAge,
 			// Ship both planes to the nop uploader so the seal → ship →
-			// retire path stays exercised by the in-memory suite.
-			ShipData:      true,
-			ShipCatalog:   true,
-			RetainData:    options.retain,
-			RetainCatalog: options.retain,
+			// retire path stays exercised by the in-memory suite. The same
+			// seal thresholds are applied to each plane.
+			SealBytesData:    options.sealBytes,
+			SealAgeData:      options.sealAge,
+			ShipData:         true,
+			RetainData:       options.retain,
+			SealBytesCatalog: options.sealBytes,
+			SealAgeCatalog:   options.sealAge,
+			ShipCatalog:      true,
+			RetainCatalog:    options.retain,
 		}),
 		// MemStore satisfies both registry.Registry and logstore.Meta; expose
 		// it under each interface the module consumes.

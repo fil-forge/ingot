@@ -10,30 +10,18 @@ import (
 	"github.com/fil-forge/ingot/blockstore"
 )
 
-// Config wires a Store to its dependencies. Defaults are applied by
-// (*Config).defaults() before Open returns.
+// Config wires a Store (the two-plane coordinator) to its dependencies.
+// Defaults are applied by (*Config).defaults() before Open returns.
 type Config struct {
-	// Dir is the on-disk directory for segment files. Created if
-	// missing.
+	// Dir is the on-disk root for segment files. Each plane gets a
+	// subdirectory (<Dir>/data, <Dir>/catalog). Created if missing.
 	Dir string
 
 	// Meta is the persistence backing for segment metadata. Required.
 	Meta Meta
 
-	// SealBytes is the open-segment size threshold (data CAR + catalog
-	// CAR, combined) at which the segment is sealed and queued for
-	// flush. 0 → 64 MiB. Sealing is shared across planes — both CARs
-	// seal together as one segment.
-	SealBytes int64
-
-	// SealAge is the maximum time a segment may remain open before it
-	// is sealed even if SealBytes has not been reached. 0 → 5s.
-	SealAge time.Duration
-
-	// Data / Catalog configure the two independent upload pipelines. A
-	// plane with Ship=false never ships to Forge and is retained on
-	// local disk forever; a plane with Ship=true ships each sealed CAR
-	// via its Flush callback and retires shipped CARs beyond Retain.
+	// Data / Catalog configure the two independent pipelines. Each plane
+	// seals, ships, and retains on its own — there is no shared seal.
 	Data    PlaneConfig
 	Catalog PlaneConfig
 
@@ -41,18 +29,26 @@ type Config struct {
 	Logger *zap.Logger
 }
 
-// PlaneConfig tunes one plane's (data or catalog) upload pipeline.
+// PlaneConfig tunes one plane's (data or catalog) independent pipeline:
+// its seal trigger, whether/how it ships, and how much it retains.
 type PlaneConfig struct {
+	// SealBytes is the open-segment CAR size threshold at which this
+	// plane's segment seals and is queued for flush. 0 → 64 MiB.
+	SealBytes int64
+
+	// SealAge is the maximum time this plane's segment may stay open
+	// before it seals even under SealBytes. 0 → 5s.
+	SealAge time.Duration
+
 	// Ship enables this plane's upload pipeline. When false the plane's
-	// CAR is never shipped and is retained on local disk indefinitely —
-	// it is the only durable copy and the sole source for local reads of
-	// that plane.
+	// CARs are never shipped and are retained on local disk indefinitely —
+	// the only durable copy and the sole source for local reads of that
+	// plane.
 	Ship bool
 
-	// Flush ships one sealed segment's CAR of THIS plane to Forge. It is
-	// bound to the plane it serves (the host builds one closure per
-	// plane). Required when Ship is true; ignored otherwise. Returning a
-	// non-nil error keeps the plane unshipped and triggers retry.
+	// Flush ships one sealed segment's CAR of this plane to Forge.
+	// Required when Ship is true; ignored otherwise. A non-nil error
+	// keeps the segment unshipped and triggers retry.
 	Flush FlushFunc
 
 	// Retain is the number of most-recent SHIPPED CARs of this plane to
@@ -61,8 +57,8 @@ type PlaneConfig struct {
 	Retain int
 }
 
-// FlushFunc is the contract for shipping one plane's CAR of a sealed
-// segment to Forge.
+// FlushFunc is the contract for shipping one sealed segment's CAR to
+// Forge. The segment is single-plane, so no plane argument is needed.
 type FlushFunc func(ctx context.Context, seg *Segment) error
 
 // plane returns the PlaneConfig for p.
@@ -90,19 +86,23 @@ func (c *Config) validate() error {
 }
 
 func (c *Config) defaults() {
-	if c.SealBytes <= 0 {
-		c.SealBytes = 64 << 20
-	}
-	if c.SealAge <= 0 {
-		c.SealAge = 5 * time.Second
-	}
-	if c.Data.Retain <= 0 {
-		c.Data.Retain = 6
-	}
-	if c.Catalog.Retain <= 0 {
-		c.Catalog.Retain = 6
-	}
+	c.Data = c.Data.withDefaults()
+	c.Catalog = c.Catalog.withDefaults()
 	if c.Logger == nil {
 		c.Logger = zap.NewNop()
 	}
+}
+
+// withDefaults returns pc with zero-valued seal/retain knobs filled in.
+func (pc PlaneConfig) withDefaults() PlaneConfig {
+	if pc.SealBytes <= 0 {
+		pc.SealBytes = 64 << 20
+	}
+	if pc.SealAge <= 0 {
+		pc.SealAge = 5 * time.Second
+	}
+	if pc.Retain <= 0 {
+		pc.Retain = 6
+	}
+	return pc
 }
