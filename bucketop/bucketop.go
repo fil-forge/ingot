@@ -168,6 +168,9 @@ func (c *Coordinator) WithTx(ctx context.Context, bucket string, fn MutateFn) er
 		return fnErr
 	}
 	if !newRoot.Defined() {
+		// NB(forrest): at present, this case only happens on delete for a
+		// bucket object that doesn't exist, since delete is idempotent
+		// meaning there isn't a new root derived.
 		tx.Discard()
 		return nil
 	}

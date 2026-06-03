@@ -49,8 +49,8 @@ type CARShard struct {
 // for each shard it invokes /blob/add against the upload service
 // (sprue), PUTs the CAR locally, concludes the put receipt, awaits
 // accept, then publishes the shard's sharded-dag-index via /index/add.
-// ingot is no longer the orchestrator — sprue routes the allocate to the
-// home provider's piri and witnesses the control plane.
+// Sprue routes the allocate to the home provider's piri and witnesses
+// the control plane.
 type Forge struct {
 	client    *forgeclient.Client
 	space     did.DID

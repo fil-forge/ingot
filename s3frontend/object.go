@@ -75,6 +75,11 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 		t := tx.LoadTree()
 		t2, err := t.Add(ctx, key, mfCid, -1)
 		if errors.Is(err, mst.ErrAlreadyExists) {
+			// TODO(forrest): we will need to revisit this case since it will require special handling for:
+			// 1. versioned objects, may require changes to the msbucket.ObjectManifest model,
+			//versions could be a linked list referenced by CID for example.
+			// 2. non-version objects, this operation becomes a "delete & put" from the perspective of piri
+			// if the old object body is large we'll need to GC it from the Forge network.
 			t2, err = t.Update(ctx, key, mfCid)
 		}
 		if err != nil {
