@@ -124,16 +124,6 @@ func (f *fakeMeta) RehydrateSegment(_ context.Context, m SegmentMeta) error {
 	return nil
 }
 
-func (f *fakeMeta) snapshot(seq uint64) (SegmentMeta, bool) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	m, ok := f.segments[seq]
-	if !ok {
-		return SegmentMeta{}, false
-	}
-	return *m, true
-}
-
 // makeBlock returns a raw-codec block whose CID is the sha256 of
 // payload. We construct the CID explicitly rather than relying on
 // block.NewBlock because the latter uses a v0 CID we don't want.
