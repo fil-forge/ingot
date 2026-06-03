@@ -1,37 +1,47 @@
 -- +goose Up
--- ingot log segments (LSM-style write log) and the per-segment
--- record of bucket-root advances that landed in each segment.
+-- ingot log segments (LSM-style write log) and the per-segment record
+-- of bucket-root advances that landed in each segment.
+--
+-- Each segment splits into TWO CAR files on disk — a data plane (raw
+-- object-body chunks) and a catalog plane (dag-cbor MST nodes,
+-- manifests, indexes) — that ship to Forge through independent
+-- pipelines and may retire independently. The row tracks per-plane
+-- size/sha and a per-plane ship high-water timestamp.
 --
 -- segments
---   seq         — monotonic segment id (matches the on-disk filename
---                 stem `seg-<seq>.car`)
---   state       — one of 'open', 'sealed', 'flushed'
---   sealed_at   — unix seconds when seal was completed; NULL while open
---   flushed_at  — unix seconds when the Forge ship completed; NULL otherwise
---   size_bytes  — final size of the CAR file at seal
---   car_sha256  — sha256 of the CAR file at seal (used to detect torn
---                 sidecars during recovery)
+--   seq             — monotonic segment id (filename stem `seg-<seq>`)
+--   state           — 'open' or 'sealed' (shipping is per-plane, below)
+--   sealed_at       — unix seconds when seal completed; NULL while open
+--   data_size_bytes — data CAR size at seal
+--   data_sha256     — sha256 of the data CAR at seal
+--   cat_size_bytes  — catalog CAR size at seal
+--   cat_sha256      — sha256 of the catalog CAR at seal
+--   data_shipped_at — unix seconds the data CAR shipped; NULL otherwise
+--   cat_shipped_at  — unix seconds the catalog CAR shipped; NULL otherwise
 --
 -- segment_op_roots
 --   seq, seq_within — composite ordering of S3 ops within a segment
 --   bucket          — the bucket whose root advanced for this op
 --   root_cid        — the new MST root the op produced
 --
--- The on-disk `seg-<seq>.idx` sidecar is the source of truth at
--- recovery time; these tables are rehydrated from sidecars when rows
--- are missing. The flusher uses `segment_op_roots` (joined with
--- `segments.state = 'flushed'`) to advance per-bucket forge_root_cid
--- in `ingot.buckets` atomically with the state transition.
+-- The on-disk `seg-<seq>.{data,cat}.idx` sidecars are the source of
+-- truth at recovery; these tables are rehydrated from them when rows
+-- are missing. Shipping the CATALOG plane advances per-bucket
+-- forge_root_cid in `ingot.buckets` (catalog roots are the MST roots
+-- durable on Forge); shipping the data plane does not.
 
 CREATE SEQUENCE ingot.segment_seq;
 
 CREATE TABLE ingot.segments (
-    seq         BIGINT PRIMARY KEY,
-    state       TEXT   NOT NULL CHECK (state IN ('open', 'sealed', 'flushed')),
-    sealed_at   BIGINT,
-    flushed_at  BIGINT,
-    size_bytes  BIGINT NOT NULL DEFAULT 0,
-    car_sha256  BYTEA
+    seq             BIGINT PRIMARY KEY,
+    state           TEXT   NOT NULL CHECK (state IN ('open', 'sealed')),
+    sealed_at       BIGINT,
+    data_size_bytes BIGINT NOT NULL DEFAULT 0,
+    data_sha256     BYTEA,
+    cat_size_bytes  BIGINT NOT NULL DEFAULT 0,
+    cat_sha256      BYTEA,
+    data_shipped_at BIGINT,
+    cat_shipped_at  BIGINT
 );
 
 CREATE TABLE ingot.segment_op_roots (

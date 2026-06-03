@@ -1,0 +1,222 @@
+// Package inmem provides in-memory implementations of ingot's
+// collaborator interfaces (registry.Registry + logstore.Meta as one
+// MemStore, plus a no-op block reader and a no-op uploader). They back
+// both the test harness and the daemon's standalone (no-Forge) mode, so
+// the two paths construct the server through identical wiring.
+//
+// MemStore keeps bucket + segment metadata in memory only — it resets on
+// restart. Segment CARs still persist on local disk via logstore; in
+// standalone mode both planes are configured never to ship, so those
+// CARs are retained and serve all reads.
+package inmem
+
+import (
+	"context"
+	"sort"
+	"sync"
+
+	block "github.com/ipfs/go-block-format"
+	"github.com/ipfs/go-cid"
+
+	"github.com/fil-forge/ingot/blockstore"
+	"github.com/fil-forge/ingot/logstore"
+	"github.com/fil-forge/ingot/registry"
+	"github.com/fil-forge/ingot/uploader"
+)
+
+// MemStore is an in-memory registry.Registry + logstore.Meta. The two
+// interfaces overlap on bucket state because shipping the catalog plane
+// advances forge_root_cid; production wires a single *registry.Postgres
+// for both seams, and this fake follows suit.
+type MemStore struct {
+	mu       sync.Mutex
+	buckets  map[string]*registry.State
+	segments map[uint64]*logstore.SegmentMeta
+	nextSeq  uint64
+}
+
+// NewMemStore returns an empty MemStore.
+func NewMemStore() *MemStore {
+	return &MemStore{
+		buckets:  map[string]*registry.State{},
+		segments: map[uint64]*logstore.SegmentMeta{},
+	}
+}
+
+// Registry methods ===========================================================
+
+func (m *MemStore) Create(_ context.Context, name string, createdAt int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.buckets[name]; ok {
+		return registry.ErrExists
+	}
+	m.buckets[name] = &registry.State{Name: name, CreatedAt: createdAt}
+	return nil
+}
+
+func (m *MemStore) Get(_ context.Context, name string) (*registry.State, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.buckets[name]
+	if !ok {
+		return nil, registry.ErrNotFound
+	}
+	cp := *s
+	return &cp, nil
+}
+
+func (m *MemStore) List(_ context.Context) ([]*registry.State, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]*registry.State, 0, len(m.buckets))
+	for _, s := range m.buckets {
+		cp := *s
+		out = append(out, &cp)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
+}
+
+func (m *MemStore) Delete(_ context.Context, name string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.buckets[name]; !ok {
+		return registry.ErrNotFound
+	}
+	delete(m.buckets, name)
+	return nil
+}
+
+func (m *MemStore) CASRoot(_ context.Context, name string, expect, next cid.Cid) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.buckets[name]
+	if !ok {
+		return registry.ErrNotFound
+	}
+	if !s.Root.Equals(expect) {
+		return registry.ErrConflict
+	}
+	s.Root = next
+	return nil
+}
+
+func (m *MemStore) SetForgeRoot(_ context.Context, name string, root cid.Cid) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.buckets[name]
+	if !ok {
+		return registry.ErrNotFound
+	}
+	s.ForgeRoot = root
+	return nil
+}
+
+// Meta methods ===============================================================
+
+func (m *MemStore) NextSegmentSeq(_ context.Context) (uint64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.nextSeq++
+	return m.nextSeq, nil
+}
+
+func (m *MemStore) InsertSegmentOpen(_ context.Context, seq uint64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.segments[seq]; ok {
+		return nil
+	}
+	m.segments[seq] = &logstore.SegmentMeta{Seq: seq, State: logstore.StateOpen}
+	return nil
+}
+
+func (m *MemStore) MarkSegmentSealed(_ context.Context, seq uint64, sealedAt int64,
+	dataSize int64, dataSHA []byte, catSize int64, catSHA []byte,
+	opRoots []blockstore.OpRoot) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.segments[seq]
+	if !ok || r.State != logstore.StateOpen {
+		return nil
+	}
+	r.State = logstore.StateSealed
+	r.SealedAt = sealedAt
+	r.DataSize = dataSize
+	r.DataSHA256 = append([]byte(nil), dataSHA...)
+	r.CatSize = catSize
+	r.CatSHA256 = append([]byte(nil), catSHA...)
+	r.OpRoots = append([]blockstore.OpRoot(nil), opRoots...)
+	return nil
+}
+
+func (m *MemStore) MarkSegmentShipped(_ context.Context, seq uint64, plane blockstore.Plane, shippedAt int64, opRoots []blockstore.OpRoot) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if r, ok := m.segments[seq]; ok {
+		if plane == blockstore.PlaneData {
+			r.DataShippedAt = shippedAt
+		} else {
+			r.CatShippedAt = shippedAt
+		}
+	}
+	if plane == blockstore.PlaneCatalog {
+		for _, opr := range opRoots {
+			if b, ok := m.buckets[opr.Bucket]; ok {
+				b.ForgeRoot = opr.Root
+			}
+		}
+	}
+	return nil
+}
+
+func (m *MemStore) DeleteSegment(_ context.Context, seq uint64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.segments, seq)
+	return nil
+}
+
+func (m *MemStore) ListSegments(_ context.Context) ([]logstore.SegmentMeta, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []logstore.SegmentMeta
+	for _, r := range m.segments {
+		out = append(out, *r)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Seq < out[j].Seq })
+	return out, nil
+}
+
+func (m *MemStore) RehydrateSegment(_ context.Context, sm logstore.SegmentMeta) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cp := sm
+	m.segments[sm.Seq] = &cp
+	return nil
+}
+
+// NopBaseReader is the base tier of the layered read path when there is
+// no network: every miss past the local log returns ErrNotFound.
+type NopBaseReader struct{}
+
+func (NopBaseReader) GetBlock(_ context.Context, _ cid.Cid) (block.Block, error) {
+	return nil, blockstore.ErrNotFound
+}
+
+// NopUploader is a flush sink that ships nothing: SubmitShard returns
+// nil so a plane is marked shipped without touching the network.
+type NopUploader struct{}
+
+func (NopUploader) SubmitShard(_ context.Context, _ blockstore.Plane, _ uploader.CARShard) error {
+	return nil
+}
+
+// Compile-time guarantees.
+var (
+	_ registry.Registry      = (*MemStore)(nil)
+	_ logstore.Meta          = (*MemStore)(nil)
+	_ blockstore.BlockReader = NopBaseReader{}
+	_ uploader.Uploader      = NopUploader{}
+)

@@ -21,56 +21,90 @@ import (
 	"github.com/fil-forge/ingot/cars"
 )
 
-// placeholderRoot is the placeholder CAR header root. Each segment
-// is multi-rooted by intent; the per-op roots live in the .ops
-// sidecar (and in-memory OpRoots), not the CAR header.
+// placeholderRoot is the placeholder CAR header root. Each CAR is
+// multi-rooted by intent; the per-op roots live in the .ops sidecar
+// (and the catalog .idx), not the CAR header.
 var placeholderRoot = cid.NewCidV1(cid.Raw, []byte{0x00, 0x00})
 
-// Segment is one log file. Open segments accept appends; sealed
-// segments are read-only.
+// segPlane is one plane's on-disk state within a segment: its CAR file,
+// its .idx sidecar, the in-memory block index, the dedup gate, the
+// running size, the seal-time sha256, and the ship/retire bookkeeping.
+// A Segment owns two of these (data + catalog); they append, seal,
+// ship, and retire independently.
+type segPlane struct {
+	kind    blockstore.Plane
+	carPath string
+	idxPath string
+
+	// fdRW is the append/read fd for an open segment (closed at seal).
+	// fdRO is the read-only fd opened at seal time.
+	fdRW *os.File
+	fdRO *os.File
+
+	// index maps each block's CID to its on-disk byte position in this
+	// plane's CAR; seen is the dedup gate kept in sync with index's key
+	// set.
+	index map[cid.Cid]blockstore.BlockLoc
+	seen  *cid.Set
+
+	size int64  // current CAR byte size
+	sha  []byte // seal-time sha256 of the CAR
+
+	shippedAt int64 // unix seconds when this plane shipped; 0 = not shipped
+	retired   bool  // CAR + idx unlinked off local disk
+}
+
+func newSegPlane(dir string, seq uint64, kind blockstore.Plane) segPlane {
+	var carName, idxName string
+	if kind == blockstore.PlaneData {
+		carName, idxName = dataCARName(seq), dataIdxName(seq)
+	} else {
+		carName, idxName = catCARName(seq), catIdxName(seq)
+	}
+	return segPlane{
+		kind:    kind,
+		carPath: filepath.Join(dir, carName),
+		idxPath: filepath.Join(dir, idxName),
+		index:   map[cid.Cid]blockstore.BlockLoc{},
+		seen:    cid.NewSet(),
+	}
+}
+
+// Segment is one log entry split across two CAR files — the data plane
+// (raw object-body chunks) and the catalog plane (dag-cbor MST nodes,
+// manifests, indexes) — plus a shared .ops sidecar recording the
+// (bucket, root) of each batch. Open segments accept appends; sealed
+// segments are read-only and ship/retire per plane.
 //
-// Concurrency model: Append is serialized by Store.appMu. Reads
-// (Lookup + ReadAt against fdRO) and seal/finalize use Segment-level
-// locks so they don't block appenders unnecessarily.
+// Concurrency: append is serialized by Store.appMu. stateMu guards
+// every mutable field below; readers RLock for lookups, writers Lock
+// for append/seal/retire/ship.
 type Segment struct {
 	seq    uint64
 	dir    string
 	logger *zap.Logger
 
-	// stateMu guards state, sealedAt, sha256, opRoots, sizeBytes,
-	// index, seen, fdRW, and fdRO. RLock for reads (lookups, opRoots
-	// access); Lock for mutating any of the above.
 	stateMu sync.RWMutex
 
 	state    State
 	sealedAt int64
-	sha256   []byte
 
-	sizeBytes int64
-	// index maps each block's CID to its on-disk byte position
-	// inside the segment's CAR. Updated on append (after a successful
-	// fsync) and rebuilt on recovery from either the .idx sidecar or
-	// a fresh CAR scan.
-	index map[cid.Cid]blockstore.BlockLoc
-	// seen is the dedup gate consulted by append. CIDs that have
-	// already landed in this segment are skipped before
-	// cars.WriteBlocksAt is called, so duplicate bytes are never
-	// written to disk and never shipped to Forge. Always kept in
-	// sync with index's key set.
-	seen    *cid.Set
+	data segPlane
+	cat  segPlane
+
+	// opRoots is the ordered per-batch (bucket, root) record. Roots are
+	// MST nodes → a catalog-plane concept; opsFD is the append-only
+	// sidecar (open segment only, closed at seal).
 	opRoots []blockstore.OpRoot
+	opsFD   *os.File
+}
 
-	// fdRW is the append/read file descriptor for an open segment.
-	// Closed at seal.
-	fdRW *os.File
-	// opsFD is the append-only ops sidecar (open segment only).
-	// Closed at seal.
-	opsFD *os.File
-	// fdRO is the read-only descriptor used to serve Get after seal
-	// (and before, when the open fdRW exists). For open segments we
-	// use fdRW for reads via ReadAt; fdRO is opened lazily at seal
-	// time so reads after seal don't need to reopen on every Get.
-	fdRO *os.File
+// planeRef returns the segPlane for p.
+func (s *Segment) planeRef(p blockstore.Plane) *segPlane {
+	if p == blockstore.PlaneData {
+		return &s.data
+	}
+	return &s.cat
 }
 
 // Seq returns the segment's identifier.
@@ -83,33 +117,67 @@ func (s *Segment) State() State {
 	return s.state
 }
 
-// Size reports the current on-disk byte size of the CAR file.
+// Size reports the combined on-disk byte size of both CARs. Drives the
+// shared seal-on-size trigger.
 func (s *Segment) Size() int64 {
 	s.stateMu.RLock()
 	defer s.stateMu.RUnlock()
-	return s.sizeBytes
+	return s.data.size + s.cat.size
 }
 
-// SHA256 returns the seal-time sha256 of the CAR file. Empty for
-// open segments.
-func (s *Segment) SHA256() []byte {
+// PlaneSize reports the on-disk byte size of plane p's CAR.
+func (s *Segment) PlaneSize(p blockstore.Plane) int64 {
 	s.stateMu.RLock()
 	defer s.stateMu.RUnlock()
-	out := make([]byte, len(s.sha256))
-	copy(out, s.sha256)
+	return s.planeRef(p).size
+}
+
+// SHA256 returns the seal-time sha256 of plane p's CAR file. Empty for
+// open segments.
+func (s *Segment) SHA256(p blockstore.Plane) []byte {
+	s.stateMu.RLock()
+	defer s.stateMu.RUnlock()
+	src := s.planeRef(p).sha
+	out := make([]byte, len(src))
+	copy(out, src)
 	return out
 }
 
-// SealedAt returns the seal-time unix-seconds timestamp. Zero for
-// open segments.
+// SealedAt returns the seal-time unix-seconds timestamp. Zero for open
+// segments.
 func (s *Segment) SealedAt() int64 {
 	s.stateMu.RLock()
 	defer s.stateMu.RUnlock()
 	return s.sealedAt
 }
 
+// ShippedAt returns the unix-seconds ship timestamp of plane p, or 0.
+func (s *Segment) ShippedAt(p blockstore.Plane) int64 {
+	s.stateMu.RLock()
+	defer s.stateMu.RUnlock()
+	return s.planeRef(p).shippedAt
+}
+
+// IsShipped reports whether plane p has shipped to Forge.
+func (s *Segment) IsShipped(p blockstore.Plane) bool {
+	return s.ShippedAt(p) != 0
+}
+
+// IsRetired reports whether plane p's CAR has been unlinked.
+func (s *Segment) IsRetired(p blockstore.Plane) bool {
+	s.stateMu.RLock()
+	defer s.stateMu.RUnlock()
+	return s.planeRef(p).retired
+}
+
+// FullyRetired reports whether both planes have retired off local disk.
+func (s *Segment) FullyRetired() bool {
+	s.stateMu.RLock()
+	defer s.stateMu.RUnlock()
+	return s.data.retired && s.cat.retired
+}
+
 // OpRoots returns a copy of the per-batch (bucket, root) records.
-// Safe to call from any goroutine.
 func (s *Segment) OpRoots() []blockstore.OpRoot {
 	s.stateMu.RLock()
 	defer s.stateMu.RUnlock()
@@ -118,126 +186,178 @@ func (s *Segment) OpRoots() []blockstore.OpRoot {
 	return out
 }
 
-// BlockPositions returns a copy of the cid → on-disk-position
-// table for the segment's CAR. Populated at append time and
-// rebuilt on recovery from either the .idx sidecar or a fresh CAR
-// scan. Used by the flush path to build a ShardedDagIndexView
-// without rescanning the file. Safe to call from any goroutine.
-func (s *Segment) BlockPositions() map[cid.Cid]blockstore.BlockLoc {
+// Positions returns a copy of plane p's cid → on-disk-position table.
+// Used by the flush path to build a sharded-dag-index without
+// rescanning the file.
+func (s *Segment) Positions(p blockstore.Plane) map[cid.Cid]blockstore.BlockLoc {
 	s.stateMu.RLock()
 	defer s.stateMu.RUnlock()
-	out := make(map[cid.Cid]blockstore.BlockLoc, len(s.index))
-	for c, loc := range s.index {
+	src := s.planeRef(p).index
+	out := make(map[cid.Cid]blockstore.BlockLoc, len(src))
+	for c, loc := range src {
 		out[c] = loc
 	}
 	return out
 }
 
-// CARPath returns the absolute path to the segment's CAR file.
-func (s *Segment) CARPath() string { return filepath.Join(s.dir, carName(s.seq)) }
+// DataCARPath / CatCARPath return the absolute paths to the two CARs.
+func (s *Segment) DataCARPath() string { return s.data.carPath }
+func (s *Segment) CatCARPath() string  { return s.cat.carPath }
 
-// OpsPath returns the absolute path to the segment's ops sidecar.
-func (s *Segment) OpsPath() string { return filepath.Join(s.dir, opsName(s.seq)) }
+// PlaneCARPath returns the absolute path to plane p's CAR file.
+func (s *Segment) PlaneCARPath(p blockstore.Plane) string { return s.planeRef(p).carPath }
 
-// IdxPath returns the absolute path to the segment's idx sidecar.
-func (s *Segment) IdxPath() string { return filepath.Join(s.dir, idxName(s.seq)) }
+// OpsPath returns the absolute path to the shared ops sidecar.
+func (s *Segment) OpsPath() string { return s.opsPath() }
 
-func carName(seq uint64) string { return fmt.Sprintf("seg-%020d.car", seq) }
-func opsName(seq uint64) string { return fmt.Sprintf("seg-%020d.ops", seq) }
-func idxName(seq uint64) string { return fmt.Sprintf("seg-%020d.idx", seq) }
+func (s *Segment) opsPath() string { return filepath.Join(s.dir, opsName(s.seq)) }
+
+func dataCARName(seq uint64) string { return fmt.Sprintf("seg-%020d.data.car", seq) }
+func catCARName(seq uint64) string  { return fmt.Sprintf("seg-%020d.cat.car", seq) }
+func dataIdxName(seq uint64) string { return fmt.Sprintf("seg-%020d.data.idx", seq) }
+func catIdxName(seq uint64) string  { return fmt.Sprintf("seg-%020d.cat.idx", seq) }
+func opsName(seq uint64) string     { return fmt.Sprintf("seg-%020d.ops", seq) }
+
+// createPlaneCAR creates a fresh CAR file with a placeholder header,
+// fsyncs it, and returns the open fd + header length.
+func createPlaneCAR(path string) (*os.File, int64, error) {
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return nil, 0, err
+	}
+	hdrLen, err := cars.WriteHeader(f, []cid.Cid{placeholderRoot})
+	if err != nil {
+		_ = f.Close()
+		_ = os.Remove(path)
+		return nil, 0, err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(path)
+		return nil, 0, err
+	}
+	return f, hdrLen, nil
+}
 
 // createOpenSegment creates a brand-new segment in the open state:
-// initializes the CAR file with a header, opens the ops sidecar,
-// and records the row in Meta.
+// initializes both CAR files with headers, opens the shared ops
+// sidecar, and records the row in Meta.
 func createOpenSegment(ctx context.Context, dir string, seq uint64, meta Meta, logger *zap.Logger) (*Segment, error) {
-	carPath := filepath.Join(dir, carName(seq))
-	opsPath := filepath.Join(dir, opsName(seq))
-
-	carFile, err := os.OpenFile(carPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
-	if err != nil {
-		return nil, fmt.Errorf("logstore: open car %d: %w", seq, err)
-	}
-	hdrLen, err := cars.WriteHeader(carFile, []cid.Cid{placeholderRoot})
-	if err != nil {
-		_ = carFile.Close()
-		_ = os.Remove(carPath)
-		return nil, fmt.Errorf("logstore: write header %d: %w", seq, err)
-	}
-	if err := carFile.Sync(); err != nil {
-		_ = carFile.Close()
-		_ = os.Remove(carPath)
-		return nil, fmt.Errorf("logstore: sync header %d: %w", seq, err)
+	s := &Segment{
+		seq:    seq,
+		dir:    dir,
+		logger: logger,
+		state:  StateOpen,
+		data:   newSegPlane(dir, seq, blockstore.PlaneData),
+		cat:    newSegPlane(dir, seq, blockstore.PlaneCatalog),
 	}
 
-	opsFile, err := os.OpenFile(opsPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
+	df, dsz, err := createPlaneCAR(s.data.carPath)
 	if err != nil {
-		_ = carFile.Close()
-		_ = os.Remove(carPath)
+		return nil, fmt.Errorf("logstore: open data car %d: %w", seq, err)
+	}
+	s.data.fdRW = df
+	s.data.size = dsz
+
+	cf, csz, err := createPlaneCAR(s.cat.carPath)
+	if err != nil {
+		_ = df.Close()
+		_ = os.Remove(s.data.carPath)
+		return nil, fmt.Errorf("logstore: open catalog car %d: %w", seq, err)
+	}
+	s.cat.fdRW = cf
+	s.cat.size = csz
+
+	opsFile, err := os.OpenFile(s.opsPath(), os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		_ = df.Close()
+		_ = cf.Close()
+		_ = os.Remove(s.data.carPath)
+		_ = os.Remove(s.cat.carPath)
 		return nil, fmt.Errorf("logstore: open ops %d: %w", seq, err)
 	}
+	s.opsFD = opsFile
 
 	if err := meta.InsertSegmentOpen(ctx, seq); err != nil {
-		_ = carFile.Close()
+		_ = df.Close()
+		_ = cf.Close()
 		_ = opsFile.Close()
-		_ = os.Remove(carPath)
-		_ = os.Remove(opsPath)
+		_ = os.Remove(s.data.carPath)
+		_ = os.Remove(s.cat.carPath)
+		_ = os.Remove(s.opsPath())
 		return nil, err
 	}
 
-	return &Segment{
-		seq:       seq,
-		dir:       dir,
-		logger:    logger,
-		state:     StateOpen,
-		sizeBytes: hdrLen,
-		index:     map[cid.Cid]blockstore.BlockLoc{},
-		seen:      cid.NewSet(),
-		fdRW:      carFile,
-		opsFD:     opsFile,
-	}, nil
+	return s, nil
 }
 
-// append writes the given blocks + opRoot to disk and updates the
-// in-memory index. fsyncs both files before returning. Caller must
-// hold Store.appMu.
-//
-// Block-level dedup: every block is checked against s.seen before
-// writing. CIDs already present in this segment are skipped, so a
-// duplicate body chunk or MST node landing across two PUTs in the
-// same segment never hits the CAR file twice and never ships to
-// Forge twice. The op-root record is appended unconditionally —
-// even an all-duplicate batch still represents a real bucket-Root
-// advance and must be replayed by the flusher.
-func (s *Segment) append(blocks []block.Block, opRoot blockstore.OpRoot) error {
-	s.stateMu.Lock()
-	defer s.stateMu.Unlock()
-
-	if s.state != StateOpen || s.fdRW == nil {
-		return errors.New("logstore: segment not open for append")
-	}
-
-	// Filter out CIDs we've already written into this segment. We
-	// don't mutate s.seen yet — only after the file write succeeds —
-	// so a fsync error doesn't poison the dedup state.
+// writeFresh writes the not-yet-seen blocks to this plane's CAR at the
+// current size and returns the fresh blocks + their on-disk positions.
+// It does NOT mutate seen/index/size — the caller commits those only
+// after a successful fsync (so a fsync error doesn't poison dedup
+// state). Caller holds the segment write lock.
+func (p *segPlane) writeFresh(blocks []block.Block) ([]block.Block, []cars.BlockPosition, error) {
 	fresh := make([]block.Block, 0, len(blocks))
 	for _, blk := range blocks {
-		if s.seen.Has(blk.Cid()) {
+		if p.seen.Has(blk.Cid()) {
 			continue
 		}
 		fresh = append(fresh, blk)
 	}
+	if len(fresh) == 0 {
+		return nil, nil, nil
+	}
+	positions, err := cars.WriteBlocksAt(p.fdRW, p.size, fresh)
+	if err != nil {
+		return nil, nil, err
+	}
+	return fresh, positions, nil
+}
 
-	var positions []cars.BlockPosition
-	if len(fresh) > 0 {
-		var err error
-		positions, err = cars.WriteBlocksAt(s.fdRW, s.sizeBytes, fresh)
-		if err != nil {
-			return fmt.Errorf("logstore: append blocks seg %d: %w", s.seq, err)
+// commitFresh updates the dedup set, position table, and running size
+// after a successful fsync.
+func (p *segPlane) commitFresh(fresh []block.Block, positions []cars.BlockPosition) {
+	for i, blk := range fresh {
+		p.seen.Add(blk.Cid())
+		p.index[blk.Cid()] = blockstore.BlockLoc{Offset: positions[i].Offset, Length: positions[i].Length}
+	}
+	if n := len(positions); n > 0 {
+		end := int64(positions[n-1].Offset) + int64(positions[n-1].Length)
+		if end > p.size {
+			p.size = end
 		}
 	}
+}
 
-	// Append the op-root record to the ops sidecar regardless of
-	// whether any new bytes were written to the CAR.
+// append writes the data + catalog blocks of one batch to their CARs,
+// records the op-root, fsyncs both CARs and the ops sidecar together,
+// then commits the in-memory index. Caller must hold Store.appMu.
+//
+// Cross-plane durability: AppendBatch returns success only after the
+// data CAR, the catalog CAR, and the ops record are all fsynced — so
+// the bucket Root may advance once and have both planes durable. Either
+// block slice may be empty (an MST-only mutation writes no data blocks;
+// a trimTop-to-existing-subtree writes neither).
+func (s *Segment) append(dataBlocks, catBlocks []block.Block, opRoot blockstore.OpRoot) error {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+
+	if s.state != StateOpen || s.data.fdRW == nil || s.cat.fdRW == nil {
+		return errors.New("logstore: segment not open for append")
+	}
+
+	dataFresh, dataPos, err := s.data.writeFresh(dataBlocks)
+	if err != nil {
+		return fmt.Errorf("logstore: append data seg %d: %w", s.seq, err)
+	}
+	catFresh, catPos, err := s.cat.writeFresh(catBlocks)
+	if err != nil {
+		return fmt.Errorf("logstore: append catalog seg %d: %w", s.seq, err)
+	}
+
+	// Append the op-root record unconditionally — even an all-duplicate
+	// batch still represents a real bucket-Root advance the flusher must
+	// replay.
 	opsRec, err := encodeOpRecord(opRoot)
 	if err != nil {
 		return fmt.Errorf("logstore: encode oprec seg %d: %w", s.seq, err)
@@ -246,46 +366,19 @@ func (s *Segment) append(blocks []block.Block, opRoot blockstore.OpRoot) error {
 		return fmt.Errorf("logstore: write ops seg %d: %w", s.seq, err)
 	}
 
-	// fsync both files in parallel. The CAR fsync is a fast no-op
-	// when len(fresh) == 0 (nothing written since the last sync) but
-	// we issue it anyway to keep the durability contract uniform.
-	var wg sync.WaitGroup
-	var carErr, opsErr error
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		carErr = s.fdRW.Sync()
-	}()
-	go func() {
-		defer wg.Done()
-		opsErr = s.opsFD.Sync()
-	}()
-	wg.Wait()
-	if carErr != nil {
-		return fmt.Errorf("logstore: fsync car seg %d: %w", s.seq, carErr)
-	}
-	if opsErr != nil {
-		return fmt.Errorf("logstore: fsync ops seg %d: %w", s.seq, opsErr)
+	if err := syncAll(s.data.fdRW, s.cat.fdRW, s.opsFD); err != nil {
+		return fmt.Errorf("logstore: fsync seg %d: %w", s.seq, err)
 	}
 
-	// Commit the dedup state and the position table together.
-	for i, blk := range fresh {
-		s.seen.Add(blk.Cid())
-		s.index[blk.Cid()] = blockstore.BlockLoc{Offset: positions[i].Offset, Length: positions[i].Length}
-	}
-	if n := len(positions); n > 0 {
-		end := int64(positions[n-1].Offset) + int64(positions[n-1].Length)
-		if end > s.sizeBytes {
-			s.sizeBytes = end
-		}
-	}
+	s.data.commitFresh(dataFresh, dataPos)
+	s.cat.commitFresh(catFresh, catPos)
 	s.opRoots = append(s.opRoots, opRoot)
 	return nil
 }
 
-// seal closes the open fds, hashes the CAR, writes the .idx sidecar,
-// and updates Meta. After this returns, the segment is in
-// StateSealed and safe to be flushed.
+// seal closes both open CAR fds + the ops fd, hashes both CARs, writes
+// both .idx sidecars, and records the sealed state in Meta. After this
+// returns the segment is StateSealed and each plane is ready to ship.
 func (s *Segment) seal(ctx context.Context, meta Meta) error {
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
@@ -295,72 +388,126 @@ func (s *Segment) seal(ctx context.Context, meta Meta) error {
 		return nil
 	}
 
-	// Final fsync before close (defensive — append already fsyncs).
-	if err := s.fdRW.Sync(); err != nil {
-		return fmt.Errorf("logstore: pre-seal fsync car %d: %w", s.seq, err)
+	if err := syncAll(s.data.fdRW, s.cat.fdRW, s.opsFD); err != nil {
+		return fmt.Errorf("logstore: pre-seal fsync %d: %w", s.seq, err)
 	}
-	if err := s.opsFD.Sync(); err != nil {
-		return fmt.Errorf("logstore: pre-seal fsync ops %d: %w", s.seq, err)
+	for _, p := range []*segPlane{&s.data, &s.cat} {
+		if err := p.fdRW.Close(); err != nil {
+			return fmt.Errorf("logstore: close %s car %d: %w", p.kind, s.seq, err)
+		}
+		p.fdRW = nil
 	}
-	if err := s.fdRW.Close(); err != nil {
-		return fmt.Errorf("logstore: close car %d: %w", s.seq, err)
-	}
-	s.fdRW = nil
 	if err := s.opsFD.Close(); err != nil {
 		return fmt.Errorf("logstore: close ops %d: %w", s.seq, err)
 	}
 	s.opsFD = nil
 
-	// Compute CAR sha256 by streaming the file.
-	sum, err := hashFile(s.CARPath())
-	if err != nil {
-		return fmt.Errorf("logstore: hash %d: %w", s.seq, err)
+	for _, p := range []*segPlane{&s.data, &s.cat} {
+		sum, err := hashFile(p.carPath)
+		if err != nil {
+			return fmt.Errorf("logstore: hash %s %d: %w", p.kind, s.seq, err)
+		}
+		p.sha = sum
 	}
-	s.sha256 = sum
 	s.sealedAt = time.Now().Unix()
 	s.state = StateSealed
 
-	// Write idx sidecar (atomic via tmp+rename).
-	if err := s.writeIdxLocked(); err != nil {
-		return fmt.Errorf("logstore: write idx %d: %w", s.seq, err)
+	// Write idx sidecars (op-roots live in the catalog idx — roots are
+	// catalog nodes).
+	if err := writePlaneIdx(&s.data, s.seq, s.sealedAt, nil); err != nil {
+		return fmt.Errorf("logstore: write data idx %d: %w", s.seq, err)
+	}
+	if err := writePlaneIdx(&s.cat, s.seq, s.sealedAt, s.opRoots); err != nil {
+		return fmt.Errorf("logstore: write catalog idx %d: %w", s.seq, err)
 	}
 
-	// Persist sealed state in Postgres.
-	if err := meta.MarkSegmentSealed(ctx, s.seq, s.sealedAt, s.sizeBytes, s.sha256, s.opRoots); err != nil {
+	if err := meta.MarkSegmentSealed(ctx, s.seq, s.sealedAt,
+		s.data.size, s.data.sha, s.cat.size, s.cat.sha, s.opRoots); err != nil {
 		return fmt.Errorf("logstore: mark sealed %d: %w", s.seq, err)
 	}
 
-	// Open the read-only fd that will serve Get from now on.
-	roFD, err := os.Open(s.CARPath())
-	if err != nil {
-		return fmt.Errorf("logstore: open ro car %d: %w", s.seq, err)
+	for _, p := range []*segPlane{&s.data, &s.cat} {
+		ro, err := os.Open(p.carPath)
+		if err != nil {
+			return fmt.Errorf("logstore: open ro %s car %d: %w", p.kind, s.seq, err)
+		}
+		p.fdRO = ro
 	}
-	s.fdRO = roFD
-
 	return nil
 }
 
-// retire closes any open fd and unlinks the segment's files. Safe to
-// call after MarkFlushed; the caller must guarantee no other
-// goroutine still holds a reference for reads.
-func (s *Segment) retire() error {
+// markShipped stamps plane p's ship timestamp. Called by the flusher
+// after the plane's CAR has shipped (or was trivially empty).
+func (s *Segment) markShipped(p blockstore.Plane, shippedAt int64) {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	s.planeRef(p).shippedAt = shippedAt
+}
+
+// retirePlane closes plane p's read/write fds and unlinks its CAR + idx
+// sidecar. When both planes are retired it also drops the shared ops
+// sidecar. Safe to call after the plane has shipped (or, for a
+// never-ship plane, never called).
+func (s *Segment) retirePlane(p blockstore.Plane) error {
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
 
-	if s.fdRO != nil {
-		_ = s.fdRO.Close()
-		s.fdRO = nil
+	pf := s.planeRef(p)
+	if pf.retired {
+		return nil
 	}
-	if s.fdRW != nil {
-		_ = s.fdRW.Close()
-		s.fdRW = nil
+	if pf.fdRO != nil {
+		_ = pf.fdRO.Close()
+		pf.fdRO = nil
+	}
+	if pf.fdRW != nil {
+		_ = pf.fdRW.Close()
+		pf.fdRW = nil
+	}
+	for _, name := range []string{pf.carPath, pf.idxPath} {
+		if err := os.Remove(name); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("logstore: unlink %s: %w", name, err)
+		}
+	}
+	pf.retired = true
+	// Drop the in-memory index/dedup set: the blocks are no longer local,
+	// so reads must fall through to the network tier.
+	pf.index = nil
+	pf.seen = nil
+
+	if s.data.retired && s.cat.retired {
+		if s.opsFD != nil {
+			_ = s.opsFD.Close()
+			s.opsFD = nil
+		}
+		if err := os.Remove(s.opsPath()); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("logstore: unlink %s: %w", s.opsPath(), err)
+		}
+	}
+	return nil
+}
+
+// retireOpen closes an open (never-sealed) segment's fds and unlinks
+// its files. Used to clean up a segment that lost the open-segment
+// creation race.
+func (s *Segment) retireOpen() error {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	for _, p := range []*segPlane{&s.data, &s.cat} {
+		if p.fdRW != nil {
+			_ = p.fdRW.Close()
+			p.fdRW = nil
+		}
+		if p.fdRO != nil {
+			_ = p.fdRO.Close()
+			p.fdRO = nil
+		}
 	}
 	if s.opsFD != nil {
 		_ = s.opsFD.Close()
 		s.opsFD = nil
 	}
-
-	for _, name := range []string{s.CARPath(), s.OpsPath(), s.IdxPath()} {
+	for _, name := range []string{s.data.carPath, s.data.idxPath, s.cat.carPath, s.cat.idxPath, s.opsPath()} {
 		if err := os.Remove(name); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("logstore: unlink %s: %w", name, err)
 		}
@@ -368,197 +515,255 @@ func (s *Segment) retire() error {
 	return nil
 }
 
-// get returns the block at the given CID, or blockstore.ErrNotFound. Safe for
-// concurrent callers.
+// get returns the block at the given CID from whichever plane holds it,
+// or blockstore.ErrNotFound (including when the holding plane has been
+// retired off local disk, so the layered reader falls through to the
+// network tier). The read lock is held through ReadAt so a concurrent
+// retire/seal cannot close the fd mid-read.
 func (s *Segment) get(_ context.Context, c cid.Cid) (block.Block, error) {
 	s.stateMu.RLock()
-	loc, ok := s.index[c]
-	fd := s.fdRO
-	if fd == nil {
-		fd = s.fdRW
+	defer s.stateMu.RUnlock()
+	for _, p := range []*segPlane{&s.data, &s.cat} {
+		if p.retired {
+			continue
+		}
+		loc, ok := p.index[c]
+		if !ok {
+			continue
+		}
+		fd := p.fdRO
+		if fd == nil {
+			fd = p.fdRW
+		}
+		if fd == nil {
+			return nil, fmt.Errorf("logstore: segment %d has no read fd", s.seq)
+		}
+		buf := make([]byte, loc.Length)
+		if _, err := fd.ReadAt(buf, int64(loc.Offset)); err != nil {
+			return nil, fmt.Errorf("logstore: read seg %d offset %d: %w", s.seq, loc.Offset, err)
+		}
+		return block.NewBlockWithCid(buf, c)
 	}
-	s.stateMu.RUnlock()
-	if !ok {
-		return nil, blockstore.ErrNotFound
-	}
-	if fd == nil {
-		return nil, fmt.Errorf("logstore: segment %d has no read fd", s.seq)
-	}
-	buf := make([]byte, loc.Length)
-	if _, err := fd.ReadAt(buf, int64(loc.Offset)); err != nil {
-		return nil, fmt.Errorf("logstore: read seg %d offset %d: %w", s.seq, loc.Offset, err)
-	}
-	return block.NewBlockWithCid(buf, c)
+	return nil, blockstore.ErrNotFound
 }
 
-// writeIdxLocked persists the idx sidecar. Caller must hold stateMu
-// in write mode and have already populated sha256/sealedAt.
-func (s *Segment) writeIdxLocked() error {
-	type idxBlock struct {
-		CID    string `json:"cid"`
-		Offset uint64 `json:"offset"`
-		Length uint64 `json:"length"`
+// syncAll fsyncs the given files in parallel and joins any errors.
+func syncAll(files ...*os.File) error {
+	var wg sync.WaitGroup
+	errs := make([]error, len(files))
+	for i, f := range files {
+		wg.Add(1)
+		go func(i int, f *os.File) {
+			defer wg.Done()
+			errs[i] = f.Sync()
+		}(i, f)
 	}
-	type idxOpRoot struct {
-		Bucket string `json:"bucket"`
-		Root   string `json:"root"`
-	}
-	type idxFile struct {
-		Seq       uint64      `json:"seq"`
-		SizeBytes int64       `json:"size_bytes"`
-		SHA256    string      `json:"sha256_hex"`
-		SealedAt  int64       `json:"sealed_at"`
-		Blocks    []idxBlock  `json:"blocks"`
-		OpRoots   []idxOpRoot `json:"op_roots"`
-	}
+	wg.Wait()
+	return errors.Join(errs...)
+}
 
-	blocks := make([]idxBlock, 0, len(s.index))
-	for c, loc := range s.index {
-		blocks = append(blocks, idxBlock{
-			CID:    c.String(),
-			Offset: loc.Offset,
-			Length: loc.Length,
-		})
-	}
-	opRoots := make([]idxOpRoot, len(s.opRoots))
-	for i, opr := range s.opRoots {
-		opRoots[i] = idxOpRoot{Bucket: opr.Bucket, Root: opr.Root.String()}
-	}
+// === idx sidecar (one per plane) ===
 
-	body := idxFile{
-		Seq:       s.seq,
-		SizeBytes: s.sizeBytes,
-		SHA256:    fmt.Sprintf("%x", s.sha256),
-		SealedAt:  s.sealedAt,
-		Blocks:    blocks,
-		OpRoots:   opRoots,
+type idxBlockJSON struct {
+	CID    string `json:"cid"`
+	Offset uint64 `json:"offset"`
+	Length uint64 `json:"length"`
+}
+
+type idxOpRootJSON struct {
+	Bucket string `json:"bucket"`
+	Root   string `json:"root"`
+}
+
+type idxFileJSON struct {
+	Seq      uint64          `json:"seq"`
+	Plane    string          `json:"plane"`
+	SizeByte int64           `json:"size_bytes"`
+	SHA256   string          `json:"sha256_hex"`
+	SealedAt int64           `json:"sealed_at"`
+	Blocks   []idxBlockJSON  `json:"blocks"`
+	OpRoots  []idxOpRootJSON `json:"op_roots,omitempty"`
+}
+
+// writePlaneIdx persists plane p's idx sidecar. opRoots is non-nil only
+// for the catalog plane. Caller holds the segment write lock and has
+// populated p.sha + s.sealedAt.
+func writePlaneIdx(p *segPlane, seq uint64, sealedAt int64, opRoots []blockstore.OpRoot) error {
+	blocks := make([]idxBlockJSON, 0, len(p.index))
+	for c, loc := range p.index {
+		blocks = append(blocks, idxBlockJSON{CID: c.String(), Offset: loc.Offset, Length: loc.Length})
+	}
+	ops := make([]idxOpRootJSON, len(opRoots))
+	for i, opr := range opRoots {
+		ops[i] = idxOpRootJSON{Bucket: opr.Bucket, Root: opr.Root.String()}
+	}
+	body := idxFileJSON{
+		Seq:      seq,
+		Plane:    p.kind.String(),
+		SizeByte: p.size,
+		SHA256:   fmt.Sprintf("%x", p.sha),
+		SealedAt: sealedAt,
+		Blocks:   blocks,
+		OpRoots:  ops,
 	}
 	data, err := json.MarshalIndent(body, "", "  ")
 	if err != nil {
 		return err
 	}
-	tmp := s.IdxPath() + ".tmp"
+	tmp := p.idxPath + ".tmp"
 	if err := os.WriteFile(tmp, data, 0o644); err != nil {
 		return err
 	}
-	return os.Rename(tmp, s.IdxPath())
+	return os.Rename(tmp, p.idxPath)
 }
 
-// loadSealedFromIdx hydrates a Segment in the StateSealed state from
-// its on-disk .idx sidecar. Used at startup. Returns (nil, error) on
-// any malformed sidecar; the caller can fall back to a CAR scan.
-func loadSealedFromIdx(dir string, seq uint64, logger *zap.Logger) (*Segment, error) {
-	idxPath := filepath.Join(dir, idxName(seq))
-	data, err := os.ReadFile(idxPath)
+// loadSealedPlaneFromIdx hydrates one plane in the sealed state from its
+// .idx sidecar and opens its read fd. Returns the plane's op-roots
+// (catalog plane only).
+func loadSealedPlaneFromIdx(dir string, seq uint64, kind blockstore.Plane) (*segPlane, []blockstore.OpRoot, error) {
+	p := newSegPlane(dir, seq, kind)
+	data, err := os.ReadFile(p.idxPath)
 	if err != nil {
-		return nil, fmt.Errorf("logstore: read idx %d: %w", seq, err)
+		return nil, nil, fmt.Errorf("logstore: read %s idx %d: %w", kind, seq, err)
 	}
-	var raw struct {
-		Seq       uint64 `json:"seq"`
-		SizeBytes int64  `json:"size_bytes"`
-		SHA256    string `json:"sha256_hex"`
-		SealedAt  int64  `json:"sealed_at"`
-		Blocks    []struct {
-			CID    string `json:"cid"`
-			Offset uint64 `json:"offset"`
-			Length uint64 `json:"length"`
-		} `json:"blocks"`
-		OpRoots []struct {
-			Bucket string `json:"bucket"`
-			Root   string `json:"root"`
-		} `json:"op_roots"`
-	}
+	var raw idxFileJSON
 	if err := json.Unmarshal(data, &raw); err != nil {
-		return nil, fmt.Errorf("logstore: parse idx %d: %w", seq, err)
+		return nil, nil, fmt.Errorf("logstore: parse %s idx %d: %w", kind, seq, err)
 	}
 	if raw.Seq != seq {
-		return nil, fmt.Errorf("logstore: idx seq %d does not match filename %d", raw.Seq, seq)
+		return nil, nil, fmt.Errorf("logstore: %s idx seq %d != filename %d", kind, raw.Seq, seq)
 	}
-	idx := make(map[cid.Cid]blockstore.BlockLoc, len(raw.Blocks))
-	seen := cid.NewSet()
 	for _, b := range raw.Blocks {
 		c, err := cid.Decode(b.CID)
 		if err != nil {
-			return nil, fmt.Errorf("logstore: idx bad cid %q: %w", b.CID, err)
+			return nil, nil, fmt.Errorf("logstore: %s idx bad cid %q: %w", kind, b.CID, err)
 		}
-		idx[c] = blockstore.BlockLoc{Offset: b.Offset, Length: b.Length}
-		seen.Add(c)
+		p.index[c] = blockstore.BlockLoc{Offset: b.Offset, Length: b.Length}
+		p.seen.Add(c)
 	}
+	sha, err := hexDecode(raw.SHA256)
+	if err != nil {
+		return nil, nil, fmt.Errorf("logstore: %s idx bad sha %q: %w", kind, raw.SHA256, err)
+	}
+	p.sha = sha
+	p.size = raw.SizeByte
+
 	ops := make([]blockstore.OpRoot, len(raw.OpRoots))
 	for i, o := range raw.OpRoots {
 		c, err := cid.Decode(o.Root)
 		if err != nil {
-			return nil, fmt.Errorf("logstore: idx bad root %q: %w", o.Root, err)
+			return nil, nil, fmt.Errorf("logstore: %s idx bad root %q: %w", kind, o.Root, err)
 		}
 		ops[i] = blockstore.OpRoot{Bucket: o.Bucket, Root: c}
 	}
-	sha, err := hexDecode(raw.SHA256)
-	if err != nil {
-		return nil, fmt.Errorf("logstore: idx bad sha %q: %w", raw.SHA256, err)
-	}
 
-	carFD, err := os.Open(filepath.Join(dir, carName(seq)))
+	ro, err := os.Open(p.carPath)
 	if err != nil {
-		return nil, fmt.Errorf("logstore: open sealed car %d: %w", seq, err)
+		return nil, nil, fmt.Errorf("logstore: open sealed %s car %d: %w", kind, seq, err)
 	}
-	return &Segment{
-		seq:       seq,
-		dir:       dir,
-		logger:    logger,
-		state:     StateSealed,
-		sealedAt:  raw.SealedAt,
-		sha256:    sha,
-		sizeBytes: raw.SizeBytes,
-		index:     idx,
-		seen:      seen,
-		opRoots:   ops,
-		fdRO:      carFD,
-	}, nil
+	p.fdRO = ro
+	return &p, ops, nil
 }
 
-// loadFlushedFromIdx is loadSealedFromIdx but yields StateFlushed.
-// Used to pick up retained segments at startup.
-func loadFlushedFromIdx(dir string, seq uint64, flushedAt int64, logger *zap.Logger) (*Segment, error) {
-	seg, err := loadSealedFromIdx(dir, seq, logger)
+// loadOrRetiredPlane loads a plane from its .idx sidecar, or — when the
+// sidecar is absent because the plane already shipped and retired off
+// disk while the other plane stayed local — returns a retired
+// placeholder (empty index, no fd) so reads of that plane fall through
+// to the network.
+func loadOrRetiredPlane(dir string, seq uint64, kind blockstore.Plane) (*segPlane, []blockstore.OpRoot, error) {
+	p := newSegPlane(dir, seq, kind)
+	if _, err := os.Stat(p.idxPath); errors.Is(err, os.ErrNotExist) {
+		p.retired = true
+		p.index = nil
+		p.seen = nil
+		return &p, nil, nil
+	}
+	return loadSealedPlaneFromIdx(dir, seq, kind)
+}
+
+// loadSealedFromIdx hydrates a sealed Segment from its two .idx
+// sidecars. sealedAt and the per-plane ship timestamps come from the DB
+// row (0 when unknown, e.g. rehydration without a row). A plane whose
+// sidecar is gone is treated as already-retired.
+func loadSealedFromIdx(dir string, seq uint64, sealedAt, dataShippedAt, catShippedAt int64, logger *zap.Logger) (*Segment, error) {
+	dataP, _, err := loadOrRetiredPlane(dir, seq, blockstore.PlaneData)
 	if err != nil {
 		return nil, err
 	}
-	seg.state = StateFlushed
-	_ = flushedAt // kept for future use; not stored on Segment today.
-	return seg, nil
+	catP, opRoots, err := loadOrRetiredPlane(dir, seq, blockstore.PlaneCatalog)
+	if err != nil {
+		if dataP.fdRO != nil {
+			_ = dataP.fdRO.Close()
+		}
+		return nil, err
+	}
+	dataP.shippedAt = dataShippedAt
+	catP.shippedAt = catShippedAt
+	return &Segment{
+		seq:      seq,
+		dir:      dir,
+		logger:   logger,
+		state:    StateSealed,
+		sealedAt: sealedAt,
+		data:     *dataP,
+		cat:      *catP,
+		opRoots:  opRoots,
+	}, nil
 }
 
-// rebuildOpenFromDisk takes a torn or sidecar-less open segment on
-// disk (the segment was open at crash time) and reconstructs an
-// in-memory Segment ready to be sealed. It scans the CAR (truncating
-// any torn last frame) and replays the .ops file.
-//
-// The returned segment is in StateOpen with its fds repositioned at
-// EOF; the caller is expected to immediately call seal() to retire
-// it cleanly. We do not resume appending to a recovered open
-// segment — every restart starts a fresh segment for the next ops.
-func rebuildOpenFromDisk(dir string, seq uint64, logger *zap.Logger) (*Segment, error) {
-	carPath := filepath.Join(dir, carName(seq))
-	scan, err := cars.ScanFile(carPath)
+// rebuildOpenPlane reconstructs one plane of a torn/sidecar-less open
+// segment by scanning its CAR (truncating any torn last frame) and
+// reopening the fd at EOF.
+func rebuildOpenPlane(dir string, seq uint64, kind blockstore.Plane, logger *zap.Logger) (*segPlane, error) {
+	p := newSegPlane(dir, seq, kind)
+	scan, err := cars.ScanFile(p.carPath)
 	if err != nil && !errors.Is(err, cars.ErrTorn) {
-		return nil, fmt.Errorf("logstore: scan recovered car %d: %w", seq, err)
+		return nil, fmt.Errorf("logstore: scan recovered %s car %d: %w", kind, seq, err)
 	}
 	if errors.Is(err, cars.ErrTorn) {
-		if terr := os.Truncate(carPath, scan.LastGoodEnd); terr != nil {
-			return nil, fmt.Errorf("logstore: truncate torn car %d: %w", seq, terr)
+		if terr := os.Truncate(p.carPath, scan.LastGoodEnd); terr != nil {
+			return nil, fmt.Errorf("logstore: truncate torn %s car %d: %w", kind, seq, terr)
 		}
-		logger.Warn("logstore: truncated torn trailing frame in segment",
+		logger.Warn("logstore: truncated torn trailing frame",
+			zap.Stringer("plane", kind),
 			zap.Uint64("seq", seq),
 			zap.Int64("truncated_at", scan.LastGoodEnd))
 	}
-
-	idx := make(map[cid.Cid]blockstore.BlockLoc, len(scan.Frames))
-	seen := cid.NewSet()
-	var size int64 = scan.LastGoodEnd
+	p.size = scan.LastGoodEnd
 	for _, f := range scan.Frames {
 		c := f.Block.Cid()
-		idx[c] = blockstore.BlockLoc{Offset: f.Offset, Length: f.Length}
-		seen.Add(c)
+		p.index[c] = blockstore.BlockLoc{Offset: f.Offset, Length: f.Length}
+		p.seen.Add(c)
+	}
+	fd, err := os.OpenFile(p.carPath, os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("logstore: reopen %s car %d: %w", kind, seq, err)
+	}
+	if _, err := fd.Seek(p.size, io.SeekStart); err != nil {
+		_ = fd.Close()
+		return nil, fmt.Errorf("logstore: seek %s car %d: %w", kind, seq, err)
+	}
+	p.fdRW = fd
+	return &p, nil
+}
+
+// rebuildOpenFromDisk reconstructs an in-memory open Segment from a
+// segment that was open at crash time (both CARs scanned + truncated
+// independently, ops replayed). The returned segment is in StateOpen
+// with fds repositioned at EOF; the caller is expected to immediately
+// seal() it — recovery never resumes appending to a recovered open
+// segment.
+func rebuildOpenFromDisk(dir string, seq uint64, logger *zap.Logger) (*Segment, error) {
+	dataP, err := rebuildOpenPlane(dir, seq, blockstore.PlaneData, logger)
+	if err != nil {
+		return nil, err
+	}
+	catP, err := rebuildOpenPlane(dir, seq, blockstore.PlaneCatalog, logger)
+	if err != nil {
+		if dataP.fdRW != nil {
+			_ = dataP.fdRW.Close()
+		}
+		return nil, err
 	}
 
 	opsPath := filepath.Join(dir, opsName(seq))
@@ -566,36 +771,24 @@ func rebuildOpenFromDisk(dir string, seq uint64, logger *zap.Logger) (*Segment, 
 	if err != nil {
 		return nil, fmt.Errorf("logstore: read ops %d: %w", seq, err)
 	}
-
-	carFD, err := os.OpenFile(carPath, os.O_RDWR, 0o644)
-	if err != nil {
-		return nil, fmt.Errorf("logstore: reopen car %d: %w", seq, err)
-	}
-	if _, err := carFD.Seek(size, io.SeekStart); err != nil {
-		_ = carFD.Close()
-		return nil, fmt.Errorf("logstore: seek car %d: %w", seq, err)
-	}
 	opsFD, err := os.OpenFile(opsPath, os.O_RDWR|os.O_CREATE, 0o644)
 	if err != nil {
-		_ = carFD.Close()
 		return nil, fmt.Errorf("logstore: reopen ops %d: %w", seq, err)
 	}
 	if _, err := opsFD.Seek(0, io.SeekEnd); err != nil {
-		_ = carFD.Close()
 		_ = opsFD.Close()
 		return nil, fmt.Errorf("logstore: seek ops %d: %w", seq, err)
 	}
+
 	return &Segment{
-		seq:       seq,
-		dir:       dir,
-		logger:    logger,
-		state:     StateOpen,
-		sizeBytes: size,
-		index:     idx,
-		seen:      seen,
-		opRoots:   ops,
-		fdRW:      carFD,
-		opsFD:     opsFD,
+		seq:     seq,
+		dir:     dir,
+		logger:  logger,
+		state:   StateOpen,
+		data:    *dataP,
+		cat:     *catP,
+		opRoots: ops,
+		opsFD:   opsFD,
 	}, nil
 }
 
@@ -603,9 +796,7 @@ func rebuildOpenFromDisk(dir string, seq uint64, logger *zap.Logger) (*Segment, 
 //
 // Each record is a 4-byte big-endian length prefix followed by a
 // minimal CBOR-encoded payload: a 2-element array
-// [bucket: text, root: cid bytes]. We use array form rather than a
-// map to keep the encoding compact and order-independent of map
-// iteration.
+// [bucket: text, root: cid bytes].
 
 const opRecMaxSize = 1 << 20 // 1 MiB ceiling per record (defensive)
 

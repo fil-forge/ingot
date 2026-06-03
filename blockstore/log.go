@@ -28,6 +28,42 @@ type BlockLoc struct {
 	Length uint64
 }
 
+// Plane distinguishes the two block planes a segment splits into.
+// Each plane is its own CAR file with an independent ship/retain
+// lifecycle:
+//
+//   - PlaneData: the data plane — raw-codec object-body chunks. The
+//     actual bytes a client GETs.
+//   - PlaneCatalog: the control plane — the dag-cbor MST nodes,
+//     ObjectManifests, and chunk indexes that describe where the body
+//     bytes live and how to reconstruct an object.
+//
+// Block classification is by CID codec: cid.Raw → PlaneData, anything
+// else (dag-cbor) → PlaneCatalog. See OpStaging.Put.
+type Plane int
+
+const (
+	// PlaneData is the object-body (raw chunk) plane.
+	PlaneData Plane = iota
+	// PlaneCatalog is the MST/manifest/index (dag-cbor) plane.
+	PlaneCatalog
+)
+
+// Planes is the canonical iteration order over the two planes.
+var Planes = [...]Plane{PlaneData, PlaneCatalog}
+
+// String renders a Plane for logs and filenames.
+func (p Plane) String() string {
+	switch p {
+	case PlaneData:
+		return "data"
+	case PlaneCatalog:
+		return "catalog"
+	default:
+		return "unknown"
+	}
+}
+
 // Log is the journaling tier — an append-only block store with
 // three levels of durability:
 //
@@ -46,9 +82,15 @@ type BlockLoc struct {
 // when no local segment holds the requested CID. Close drains
 // the flush pipeline at process shutdown.
 //
+// AppendBatch takes the batch split by plane: dataBlocks (raw chunks)
+// land in the segment's data CAR, catalogBlocks (dag-cbor) in its
+// catalog CAR. Both CARs plus the op-root record are fsynced before
+// AppendBatch returns, so a successful append is durable across both
+// planes before the bucket Root is allowed to advance.
+//
 // Implemented by *logstore.Store.
 type Log interface {
-	AppendBatch(ctx context.Context, blocks []block.Block, opRoot OpRoot) error
+	AppendBatch(ctx context.Context, dataBlocks, catalogBlocks []block.Block, opRoot OpRoot) error
 	Get(ctx context.Context, c cid.Cid) (block.Block, error)
 	Close(ctx context.Context) error
 }

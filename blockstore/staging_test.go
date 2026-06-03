@@ -30,7 +30,9 @@ func (f *fakeMeta) InsertSegmentOpen(_ context.Context, seq uint64) error {
 	f.rows[seq] = &logstore.SegmentMeta{Seq: seq, State: logstore.StateOpen}
 	return nil
 }
-func (f *fakeMeta) MarkSegmentSealed(_ context.Context, seq uint64, sealedAt int64, sizeBytes int64, sha256 []byte, opRoots []blockstore.OpRoot) error {
+func (f *fakeMeta) MarkSegmentSealed(_ context.Context, seq uint64, sealedAt int64,
+	dataSize int64, dataSHA []byte, catSize int64, catSHA []byte,
+	opRoots []blockstore.OpRoot) error {
 	r, ok := f.rows[seq]
 	if !ok || r.State != logstore.StateOpen {
 		return nil
@@ -40,9 +42,13 @@ func (f *fakeMeta) MarkSegmentSealed(_ context.Context, seq uint64, sealedAt int
 	f.roots = append(f.roots, opRoots...)
 	return nil
 }
-func (f *fakeMeta) MarkSegmentFlushed(_ context.Context, seq uint64, _ int64, _ []blockstore.OpRoot) error {
+func (f *fakeMeta) MarkSegmentShipped(_ context.Context, seq uint64, plane blockstore.Plane, shippedAt int64, _ []blockstore.OpRoot) error {
 	if r, ok := f.rows[seq]; ok {
-		r.State = logstore.StateFlushed
+		if plane == blockstore.PlaneData {
+			r.DataShippedAt = shippedAt
+		} else {
+			r.CatShippedAt = shippedAt
+		}
 	}
 	return nil
 }
@@ -50,12 +56,10 @@ func (f *fakeMeta) DeleteSegment(_ context.Context, seq uint64) error {
 	delete(f.rows, seq)
 	return nil
 }
-func (f *fakeMeta) ListUnflushedSegments(_ context.Context) ([]logstore.SegmentMeta, error) {
+func (f *fakeMeta) ListSegments(_ context.Context) ([]logstore.SegmentMeta, error) {
 	var out []logstore.SegmentMeta
 	for _, r := range f.rows {
-		if r.State == logstore.StateOpen || r.State == logstore.StateSealed {
-			out = append(out, *r)
-		}
+		out = append(out, *r)
 	}
 	return out, nil
 }
@@ -64,6 +68,10 @@ func (f *fakeMeta) RehydrateSegment(_ context.Context, m logstore.SegmentMeta) e
 	f.rows[m.Seq] = &cp
 	return nil
 }
+
+// nopFlush is the per-plane ship callback for these tests: the store
+// owns the ship-state transition, so the closure is a no-op.
+func nopFlush(_ context.Context, _ *logstore.Segment) error { return nil }
 
 // noopBase satisfies blockstore.BlockReader but always returns
 // errUnknownBase so we can detect when a GetBlock falls through
@@ -109,11 +117,9 @@ func TestLayeredAndStagingHappyPath(t *testing.T) {
 		Meta:      meta,
 		SealBytes: 1 << 30,
 		SealAge:   1 * time.Hour,
-		Retain:    6,
-		Flush: func(ctx context.Context, seg *logstore.Segment) error {
-			return meta.MarkSegmentFlushed(ctx, seg.Seq(), time.Now().Unix(), seg.OpRoots())
-		},
-		Logger: logger,
+		Data:      logstore.PlaneConfig{Ship: true, Flush: nopFlush, Retain: 6},
+		Catalog:   logstore.PlaneConfig{Ship: true, Flush: nopFlush, Retain: 6},
+		Logger:    logger,
 	})
 	if err != nil {
 		t.Fatalf("logstore Open: %v", err)
@@ -157,11 +163,9 @@ func TestLayeredFallsThroughToBaseOnMiss(t *testing.T) {
 		Meta:      meta,
 		SealBytes: 1 << 30,
 		SealAge:   1 * time.Hour,
-		Retain:    6,
-		Flush: func(ctx context.Context, seg *logstore.Segment) error {
-			return meta.MarkSegmentFlushed(ctx, seg.Seq(), time.Now().Unix(), seg.OpRoots())
-		},
-		Logger: logger,
+		Data:      logstore.PlaneConfig{Ship: true, Flush: nopFlush, Retain: 6},
+		Catalog:   logstore.PlaneConfig{Ship: true, Flush: nopFlush, Retain: 6},
+		Logger:    logger,
 	})
 	if err != nil {
 		t.Fatalf("logstore Open: %v", err)
@@ -186,11 +190,9 @@ func TestStagingDiscardLeavesLogUntouched(t *testing.T) {
 		Meta:      meta,
 		SealBytes: 1 << 30,
 		SealAge:   1 * time.Hour,
-		Retain:    6,
-		Flush: func(ctx context.Context, seg *logstore.Segment) error {
-			return meta.MarkSegmentFlushed(ctx, seg.Seq(), time.Now().Unix(), seg.OpRoots())
-		},
-		Logger: logger,
+		Data:      logstore.PlaneConfig{Ship: true, Flush: nopFlush, Retain: 6},
+		Catalog:   logstore.PlaneConfig{Ship: true, Flush: nopFlush, Retain: 6},
+		Logger:    logger,
 	})
 	if err != nil {
 		t.Fatalf("logstore Open: %v", err)

@@ -47,17 +47,24 @@ import (
 	"os"
 	"path/filepath"
 
+	blobcmds "github.com/fil-forge/libforge/commands/blob"
+	contentcmds "github.com/fil-forge/libforge/commands/content"
+	indexcmds "github.com/fil-forge/libforge/commands/index"
+	"github.com/fil-forge/libforge/receipt"
 	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/ucantone/principal"
 	"github.com/fil-forge/ucantone/ucan"
+	"github.com/fil-forge/ucantone/ucan/delegation"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/fx"
 	"go.uber.org/zap"
 
 	"github.com/fil-forge/ingot/blockstore"
+	"github.com/fil-forge/ingot/forgeclient"
 	"github.com/fil-forge/ingot/logstore"
 	"github.com/fil-forge/ingot/migrations"
 	"github.com/fil-forge/ingot/registry"
+	"github.com/fil-forge/ingot/tokenstore"
 	"github.com/fil-forge/ingot/uploader"
 )
 
@@ -94,17 +101,13 @@ func Module(cfg Config) fx.Option {
 			provideSpaceSigner,
 			provideRegistry,
 			provideForgeReader,
-			provideIndexPublisher,
+			provideTokenStore,
+			provideForgeClient,
 			provideUploader,
 			provideMigrationHook,
+			provideTokenSeedHook,
 		),
 		ServerModule,
-	}
-	// When the host configured a single home piri, build the provider selector
-	// from config so it needn't supply one. Otherwise the host provides a
-	// uploader.ProviderSelector in its own graph (e.g. a routing-backed one).
-	if cfg.HomeProviderDID != "" && cfg.HomeProviderURL != "" {
-		opts = append(opts, fx.Provide(provideHomeSelector))
 	}
 	return fx.Module("ingot", opts...)
 }
@@ -178,18 +181,57 @@ func registerServerLifecycle(lc fx.Lifecycle, p serverParams) {
 	})
 }
 
-// provideHomeSelector builds a single-home-piri ProviderSelector from config.
-// Only registered when both HomeProvider fields are set (see Module).
-func provideHomeSelector(cfg Config) (uploader.ProviderSelector, error) {
-	id, err := did.Parse(cfg.HomeProviderDID)
+// provideTokenStore opens the filesystem-backed token store that holds
+// ingot's space→agent delegation chain (login-derived in a real
+// deployment, or self-issued by provideTokenSeedHook for the
+// single-operator case).
+func provideTokenStore(cfg Config) (tokenstore.Store, error) {
+	dir := emptyDefault(cfg.TokenStoreDir, cfg.DataDir)
+	return tokenstore.NewFsStore(dir)
+}
+
+// provideForgeClient builds the edge-client to the upload service (sprue):
+// the agent identity issues invocations, the token store supplies proofs.
+func provideForgeClient(cfg Config, id ServiceIdentity, store tokenstore.Store, logger *zap.Logger) (*forgeclient.Client, error) {
+	sprueURL, err := url.Parse(cfg.UploadServiceURL)
 	if err != nil {
-		return nil, fmt.Errorf("ingot: parse home_provider_did: %w", err)
+		return nil, fmt.Errorf("ingot: parse upload_service_url: %w", err)
 	}
-	endpoint, err := url.Parse(cfg.HomeProviderURL)
+	sprueDID, err := did.Parse(cfg.UploadServiceDID)
 	if err != nil {
-		return nil, fmt.Errorf("ingot: parse home_provider_url: %w", err)
+		return nil, fmt.Errorf("ingot: parse upload_service_did: %w", err)
 	}
-	return uploader.NewStaticProviderSelector(id, *endpoint), nil
+	opts := []forgeclient.Option{
+		forgeclient.WithTokenStore(store),
+		forgeclient.WithLogger(logger),
+	}
+	if cfg.UploadReceiptsURL != "" {
+		rcptURL, err := url.Parse(cfg.UploadReceiptsURL)
+		if err != nil {
+			return nil, fmt.Errorf("ingot: parse upload_receipts_url: %w", err)
+		}
+		opts = append(opts, forgeclient.WithReceiptsClient(receipt.NewClient(rcptURL)))
+	}
+	return forgeclient.New(id.Signer, sprueDID, *sprueURL, opts...)
+}
+
+// tokenSeedHookOut feeds the delegation-seed PreStartHook into the group.
+type tokenSeedHookOut struct {
+	fx.Out
+
+	Hook PreStartHook `group:"ingot_prestart"`
+}
+
+// provideTokenSeedHook seeds the token store with self-issued
+// space→agent delegations for /blob/add, /index/add, and
+// /content/retrieve when it has none, so the single-operator appliance
+// can ship without an interactive login. A real multi-tenant deployment
+// instead populates the store via `ingot login` (sprue-issued proofs);
+// the seed is skipped once any chain exists.
+func provideTokenSeedHook(space spaceSigner, id ServiceIdentity, store tokenstore.Store, logger *zap.Logger) tokenSeedHookOut {
+	return tokenSeedHookOut{Hook: func(ctx context.Context) error {
+		return seedSpaceDelegations(ctx, space.Signer, id.Signer.DID(), store, logger)
+	}}
 }
 
 // spaceSigner is an internal wrapper around the persisted space key so it is a
@@ -272,29 +314,45 @@ func provideForgeReader(cfg Config, id ServiceIdentity, space spaceSigner, logge
 	return blockstore.NewCached(forge, cfg.readCacheBytes()), nil
 }
 
-// provideIndexPublisher builds the /assert/index publisher against the indexer.
-func provideIndexPublisher(cfg Config, id ServiceIdentity, logger *zap.Logger) (uploader.IndexPublisher, error) {
-	endpoint, err := url.Parse(cfg.IndexerEndpoint)
-	if err != nil {
-		return nil, fmt.Errorf("ingot: parse indexer endpoint: %w", err)
-	}
-	indexerDID, err := did.Parse(cfg.IndexerDID)
-	if err != nil {
-		return nil, fmt.Errorf("ingot: parse indexer DID: %w", err)
-	}
-	return uploader.NewIndexPublisher(endpoint, indexerDID, id.Signer, logger)
+// provideUploader builds the per-plane segment-flush uploader: a
+// guppy-style edge client that ships each sealed shard to Forge via the
+// upload service (/blob/add → /ucan/conclude → /blob/accept → /index/add).
+func provideUploader(c *forgeclient.Client, space spaceSigner, logger *zap.Logger) (uploader.Uploader, error) {
+	return uploader.NewForge(uploader.ForgeConfig{
+		Client: c,
+		Space:  space.DID(),
+		Logger: logger,
+	})
 }
 
-// provideUploader builds the segment-flush uploader (allocate/PUT/accept +
-// index publish) over the host-supplied provider selector.
-func provideUploader(id ServiceIdentity, space spaceSigner, sel uploader.ProviderSelector, pub uploader.IndexPublisher, logger *zap.Logger) (uploader.Uploader, error) {
-	return uploader.NewForge(uploader.ForgeConfig{
-		Selector:       sel,
-		IndexPublisher: pub,
-		Signer:         id.Signer,
-		SpaceSigner:    space.Signer,
-		Logger:         logger,
-	})
+// seedSpaceDelegations self-issues no-expiry space→agent delegations for
+// the capabilities the edge client invokes, unless the store already
+// holds a /blob/add chain for the agent (idempotent across restarts).
+func seedSpaceDelegations(ctx context.Context, spaceSigner ucan.Signer, agent did.DID, store tokenstore.Store, logger *zap.Logger) error {
+	space := spaceSigner.DID()
+	if proofs, _, err := store.ProofChain(ctx, agent, blobcmds.Add.Command, space); err == nil && len(proofs) > 0 {
+		return nil // already seeded (or login-provisioned)
+	}
+	add, err := blobcmds.Add.Delegate(spaceSigner, agent, space, delegation.WithNoExpiration())
+	if err != nil {
+		return fmt.Errorf("ingot: delegate /blob/add: %w", err)
+	}
+	idx, err := indexcmds.Add.Delegate(spaceSigner, agent, space, delegation.WithNoExpiration())
+	if err != nil {
+		return fmt.Errorf("ingot: delegate /index/add: %w", err)
+	}
+	ret, err := contentcmds.Retrieve.Delegate(spaceSigner, agent, space, delegation.WithNoExpiration())
+	if err != nil {
+		return fmt.Errorf("ingot: delegate /content/retrieve: %w", err)
+	}
+	if err := store.AddDelegations(ctx, add, idx, ret); err != nil {
+		return fmt.Errorf("ingot: seed delegations: %w", err)
+	}
+	logger.Info("ingot seeded self-issued space delegations",
+		zap.String("space_did", space.String()),
+		zap.String("agent_did", agent.String()),
+	)
+	return nil
 }
 
 // emptyDefault returns def when s is the empty string.
