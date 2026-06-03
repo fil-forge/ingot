@@ -330,22 +330,36 @@ func provideUploader(c *forgeclient.Client, space spaceSigner, logger *zap.Logge
 // holds a /blob/add chain for the agent (idempotent across restarts).
 func seedSpaceDelegations(ctx context.Context, spaceSigner ucan.Signer, agent did.DID, store tokenstore.Store, logger *zap.Logger) error {
 	space := spaceSigner.DID()
-	if proofs, _, err := store.ProofChain(ctx, agent, blobcmds.Add.Command, space); err == nil && len(proofs) > 0 {
+	// Sentinel on /blob/allocate: it is the cap the upload service re-invokes
+	// against piri on the space's behalf, so a store missing it cannot ship.
+	// (An older store seeded before allocate/accept were added re-seeds here.)
+	if proofs, _, err := store.ProofChain(ctx, agent, blobcmds.Allocate.Command, space); err == nil && len(proofs) > 0 {
 		return nil // already seeded (or login-provisioned)
 	}
-	add, err := blobcmds.Add.Delegate(spaceSigner, agent, space, delegation.WithNoExpiration())
-	if err != nil {
-		return fmt.Errorf("ingot: delegate /blob/add: %w", err)
+	// The edge-client flow needs space->agent authority over: /blob/add (the
+	// add invocation), /blob/allocate + /blob/accept (re-delegated to sprue so
+	// it can allocate/accept against piri), /index/add (the index publish), and
+	// /content/retrieve (the read path + the index retrieval-auth).
+	type cap struct {
+		name string
+		dlg  func() (ucan.Delegation, error)
 	}
-	idx, err := indexcmds.Add.Delegate(spaceSigner, agent, space, delegation.WithNoExpiration())
-	if err != nil {
-		return fmt.Errorf("ingot: delegate /index/add: %w", err)
+	caps := []cap{
+		{"/blob/add", func() (ucan.Delegation, error) { return blobcmds.Add.Delegate(spaceSigner, agent, space, delegation.WithNoExpiration()) }},
+		{"/blob/allocate", func() (ucan.Delegation, error) { return blobcmds.Allocate.Delegate(spaceSigner, agent, space, delegation.WithNoExpiration()) }},
+		{"/blob/accept", func() (ucan.Delegation, error) { return blobcmds.Accept.Delegate(spaceSigner, agent, space, delegation.WithNoExpiration()) }},
+		{"/index/add", func() (ucan.Delegation, error) { return indexcmds.Add.Delegate(spaceSigner, agent, space, delegation.WithNoExpiration()) }},
+		{"/content/retrieve", func() (ucan.Delegation, error) { return contentcmds.Retrieve.Delegate(spaceSigner, agent, space, delegation.WithNoExpiration()) }},
 	}
-	ret, err := contentcmds.Retrieve.Delegate(spaceSigner, agent, space, delegation.WithNoExpiration())
-	if err != nil {
-		return fmt.Errorf("ingot: delegate /content/retrieve: %w", err)
+	dlgs := make([]ucan.Delegation, 0, len(caps))
+	for _, c := range caps {
+		d, err := c.dlg()
+		if err != nil {
+			return fmt.Errorf("ingot: delegate %s: %w", c.name, err)
+		}
+		dlgs = append(dlgs, d)
 	}
-	if err := store.AddDelegations(ctx, add, idx, ret); err != nil {
+	if err := store.AddDelegations(ctx, dlgs...); err != nil {
 		return fmt.Errorf("ingot: seed delegations: %w", err)
 	}
 	logger.Info("ingot seeded self-issued space delegations",

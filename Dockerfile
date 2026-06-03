@@ -22,4 +22,6 @@ RUN apk add --no-cache ca-certificates curl
 COPY --from=build /out/ingot /usr/bin/ingot
 # S3 listener (override addr in config; container should bind 0.0.0.0).
 EXPOSE 9000
-ENTRYPOINT ["/usr/bin/ingot", "serve"]
+# The compose `command:` supplies the subcommand (e.g. serve --config ...),
+# matching the smelt house style.
+ENTRYPOINT ["/usr/bin/ingot"]
