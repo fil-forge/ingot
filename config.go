@@ -42,6 +42,24 @@ type Config struct {
 	// TokenStoreDir is where login-derived delegations persist (tokens.cbor).
 	// Optional; defaults to DataDir.
 	TokenStoreDir string `mapstructure:"token_store_dir" yaml:"token_store_dir"`
+
+	// DataPlane / CatalogPlane override the per-plane logstore pipeline
+	// knobs. Any field left zero/unset falls back to the top-level
+	// SealBytes / SealAge / Retain (and Ship defaults to true). This is
+	// what lets, e.g., the catalog plane be configured never to ship.
+	DataPlane    PlaneSettings `mapstructure:"data_plane" yaml:"data_plane"`
+	CatalogPlane PlaneSettings `mapstructure:"catalog_plane" yaml:"catalog_plane"`
+}
+
+// PlaneSettings are the per-plane logstore overrides (data or catalog).
+// Zero-valued fields fall back to the top-level Config defaults; Ship is
+// a pointer so an explicit `ship: false` is distinguishable from unset
+// (which defaults to shipping).
+type PlaneSettings struct {
+	SealBytes int64  `mapstructure:"seal_bytes" yaml:"seal_bytes"`
+	SealAge   string `mapstructure:"seal_age" yaml:"seal_age"`
+	Ship      *bool  `mapstructure:"ship" yaml:"ship"`
+	Retain    int    `mapstructure:"retain" yaml:"retain"`
 }
 
 // defaultReadCacheBytes is the block cache budget when ReadCacheBytes is 0.
@@ -65,9 +83,13 @@ func (c Config) readCacheBytes() int64 {
 // constructor-facing ServerConfig (used by the fx module and available to
 // non-fx callers that want the same defaults).
 func (c Config) ServerConfig() (ServerConfig, error) {
-	sealAge, err := time.ParseDuration(emptyDefault(c.SealAge, "5s"))
+	dataAge, err := planeSealAge(c.DataPlane.SealAge, c.SealAge)
 	if err != nil {
-		return ServerConfig{}, fmt.Errorf("ingot: parse seal_age %q: %w", c.SealAge, err)
+		return ServerConfig{}, err
+	}
+	catAge, err := planeSealAge(c.CatalogPlane.SealAge, c.SealAge)
+	if err != nil {
+		return ServerConfig{}, err
 	}
 	return ServerConfig{
 		Addr:       c.Addr,
@@ -76,13 +98,54 @@ func (c Config) ServerConfig() (ServerConfig, error) {
 		RootAccess: c.RootAccess,
 		RootSecret: c.RootSecret,
 		ChunkSize:  c.ChunkSize,
-		SealBytes:  c.SealBytes,
-		SealAge:    sealAge,
-		// Production ships both planes to Forge (Phase 2 adds per-plane
-		// host config); Retain applies to each plane's local read tier.
-		ShipData:      true,
-		ShipCatalog:   true,
-		RetainData:    c.Retain,
-		RetainCatalog: c.Retain,
+
+		// Per-plane: a per-plane override wins, else the top-level value,
+		// else the logstore default. Ship defaults to true unless a plane
+		// block sets `ship: false`.
+		SealBytesData: firstNonZero64(c.DataPlane.SealBytes, c.SealBytes),
+		SealAgeData:   dataAge,
+		ShipData:      shipDefault(c.DataPlane.Ship),
+		RetainData:    firstNonZeroInt(c.DataPlane.Retain, c.Retain),
+
+		SealBytesCatalog: firstNonZero64(c.CatalogPlane.SealBytes, c.SealBytes),
+		SealAgeCatalog:   catAge,
+		ShipCatalog:      shipDefault(c.CatalogPlane.Ship),
+		RetainCatalog:    firstNonZeroInt(c.CatalogPlane.Retain, c.Retain),
 	}, nil
+}
+
+// planeSealAge resolves a plane's SealAge: the per-plane value if set,
+// else the top-level value, else 0 (logstore applies its own default).
+func planeSealAge(planeStr, topStr string) (time.Duration, error) {
+	s := emptyDefault(planeStr, topStr)
+	if s == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return 0, fmt.Errorf("ingot: parse seal_age %q: %w", s, err)
+	}
+	return d, nil
+}
+
+// shipDefault treats an unset (nil) per-plane Ship flag as true.
+func shipDefault(p *bool) bool {
+	if p == nil {
+		return true
+	}
+	return *p
+}
+
+func firstNonZero64(a, b int64) int64 {
+	if a != 0 {
+		return a
+	}
+	return b
+}
+
+func firstNonZeroInt(a, b int) int {
+	if a != 0 {
+		return a
+	}
+	return b
 }

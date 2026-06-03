@@ -44,19 +44,18 @@ func (f *fakeMeta) NextSegmentSeq(_ context.Context) (uint64, error) {
 	return f.nextSeq, nil
 }
 
-func (f *fakeMeta) InsertSegmentOpen(_ context.Context, seq uint64) error {
+func (f *fakeMeta) InsertSegmentOpen(_ context.Context, plane blockstore.Plane, seq uint64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if _, ok := f.segments[seq]; ok {
 		return nil
 	}
-	f.segments[seq] = &SegmentMeta{Seq: seq, State: StateOpen}
+	f.segments[seq] = &SegmentMeta{Seq: seq, Plane: plane, State: StateOpen}
 	return nil
 }
 
-func (f *fakeMeta) MarkSegmentSealed(_ context.Context, seq uint64, sealedAt int64,
-	dataSize int64, dataSHA []byte, catSize int64, catSHA []byte,
-	opRoots []blockstore.OpRoot) error {
+func (f *fakeMeta) MarkSegmentSealed(_ context.Context, plane blockstore.Plane, seq uint64, sealedAt int64,
+	size int64, sha []byte, opRoots []blockstore.OpRoot) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	m, ok := f.segments[seq]
@@ -69,48 +68,42 @@ func (f *fakeMeta) MarkSegmentSealed(_ context.Context, seq uint64, sealedAt int
 	}
 	m.State = StateSealed
 	m.SealedAt = sealedAt
-	m.DataSize = dataSize
-	m.DataSHA256 = append([]byte(nil), dataSHA...)
-	m.CatSize = catSize
-	m.CatSHA256 = append([]byte(nil), catSHA...)
+	m.Size = size
+	m.SHA256 = append([]byte(nil), sha...)
 	m.OpRoots = append([]blockstore.OpRoot(nil), opRoots...)
 	return nil
 }
 
-func (f *fakeMeta) MarkSegmentShipped(_ context.Context, seq uint64, plane blockstore.Plane, shippedAt int64, opRoots []blockstore.OpRoot) error {
+func (f *fakeMeta) MarkSegmentShipped(_ context.Context, plane blockstore.Plane, seq uint64, shippedAt int64, opRoots []blockstore.OpRoot) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	m, ok := f.segments[seq]
 	if !ok {
 		return fmt.Errorf("fake: ship missing seq %d", seq)
 	}
-	if plane == blockstore.PlaneData {
-		if m.DataShippedAt != 0 {
-			return nil
-		}
-		m.DataShippedAt = shippedAt
-	} else {
-		if m.CatShippedAt != 0 {
-			return nil
-		}
-		m.CatShippedAt = shippedAt
+	if m.ShippedAt != 0 {
+		return nil
 	}
+	m.ShippedAt = shippedAt
 	f.shipped = append(f.shipped, shipEvent{seq: seq, plane: plane})
 	return nil
 }
 
-func (f *fakeMeta) DeleteSegment(_ context.Context, seq uint64) error {
+func (f *fakeMeta) DeleteSegment(_ context.Context, plane blockstore.Plane, seq uint64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	delete(f.segments, seq)
 	return nil
 }
 
-func (f *fakeMeta) ListSegments(_ context.Context) ([]SegmentMeta, error) {
+func (f *fakeMeta) ListSegments(_ context.Context, plane blockstore.Plane) ([]SegmentMeta, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var out []SegmentMeta
 	for _, m := range f.segments {
+		if m.Plane != plane {
+			continue
+		}
 		out = append(out, *m)
 	}
 	return out, nil
@@ -180,13 +173,11 @@ func newTestStore(t *testing.T, sealBytes int64, sealAge time.Duration, retain i
 		return nil
 	}
 	cfg := Config{
-		Dir:       dir,
-		Meta:      meta,
-		SealBytes: sealBytes,
-		SealAge:   sealAge,
-		Data:      PlaneConfig{Ship: true, Flush: flush, Retain: retain},
-		Catalog:   PlaneConfig{Ship: true, Flush: flush, Retain: retain},
-		Logger:    logger,
+		Dir:     dir,
+		Meta:    meta,
+		Data:    PlaneConfig{SealBytes: sealBytes, SealAge: sealAge, Ship: true, Flush: flush, Retain: retain},
+		Catalog: PlaneConfig{SealBytes: sealBytes, SealAge: sealAge, Ship: true, Flush: flush, Retain: retain},
+		Logger:  logger,
 	}
 	s, err := Open(context.Background(), cfg)
 	if err != nil {
@@ -250,17 +241,18 @@ func TestSealBySize(t *testing.T) {
 		t.Fatalf("expected at least one flush after size threshold; got 0")
 	}
 
-	// At least one segment should now have both planes shipped.
+	// At least one segment should now have shipped (each plane ships its
+	// own segments independently).
 	meta.mu.Lock()
 	var shipped int
 	for _, m := range meta.segments {
-		if m.DataShippedAt != 0 && m.CatShippedAt != 0 {
+		if m.ShippedAt != 0 {
 			shipped++
 		}
 	}
 	meta.mu.Unlock()
 	if shipped == 0 {
-		t.Fatalf("expected at least one fully-shipped segment")
+		t.Fatalf("expected at least one shipped segment")
 	}
 }
 
@@ -289,7 +281,7 @@ func TestSealByAge(t *testing.T) {
 
 func TestRetentionDropsOldFlushed(t *testing.T) {
 	s, _, _ := newTestStore(t, 64, 50*time.Millisecond, 2)
-	dir := s.cfg.Dir
+	dir := filepath.Dir(s.data.dir)
 
 	// Issue 5 PUTs; each one large enough to exceed SealBytes=64 in
 	// a single batch, so each becomes its own segment.
@@ -310,7 +302,7 @@ func TestRetentionDropsOldFlushed(t *testing.T) {
 	// Wait for retention to converge.
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		entries, err := readSegmentSeqs(dir)
+		entries, err := readSegmentSeqs(dir, "data")
 		if err != nil {
 			t.Fatalf("readDir: %v", err)
 		}
@@ -321,7 +313,7 @@ func TestRetentionDropsOldFlushed(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 
-	entries, err := readSegmentSeqs(dir)
+	entries, err := readSegmentSeqs(dir, "data")
 	if err != nil {
 		t.Fatalf("readDir: %v", err)
 	}
@@ -336,14 +328,13 @@ func TestForceSealRecoveredOpenOnRestart(t *testing.T) {
 	meta := newFakeMeta()
 	logger := zaptest.NewLogger(t)
 	openStore := func() *Store {
+		// SealBytes 1<<30 + SealAge 1h: never seals during this test.
 		cfg := Config{
-			Dir:       dir,
-			Meta:      meta,
-			SealBytes: 1 << 30, // never seals on size during this test
-			SealAge:   1 * time.Hour,
-			Data:      PlaneConfig{Ship: true, Flush: func(context.Context, *Segment) error { return nil }, Retain: 6},
-			Catalog:   PlaneConfig{Ship: true, Flush: func(context.Context, *Segment) error { return nil }, Retain: 6},
-			Logger:    logger,
+			Dir:     dir,
+			Meta:    meta,
+			Data:    PlaneConfig{SealBytes: 1 << 30, SealAge: time.Hour, Ship: true, Flush: func(context.Context, *Segment) error { return nil }, Retain: 6},
+			Catalog: PlaneConfig{SealBytes: 1 << 30, SealAge: time.Hour, Ship: true, Flush: func(context.Context, *Segment) error { return nil }, Retain: 6},
+			Logger:  logger,
 		}
 		s, err := Open(context.Background(), cfg)
 		if err != nil {
@@ -364,9 +355,11 @@ func TestForceSealRecoveredOpenOnRestart(t *testing.T) {
 	// Simulate process exit without orderly Close (don't seal). Close
 	// the file descriptors via a panic-safe path: we just stop the
 	// goroutines and forget the in-memory state.
-	close(s.closing)
-	s.wg.Wait()
-	// Drop the in-memory ref; on disk the segment is still open.
+	close(s.data.closing)
+	s.data.wg.Wait()
+	close(s.catalog.closing)
+	s.catalog.wg.Wait()
+	// Drop the in-memory ref; on disk both planes' segments are still open.
 
 	// Re-Open from the same dir.
 	s2 := openStore()
@@ -424,10 +417,10 @@ func TestAppendBatchDedupesAcrossOps(t *testing.T) {
 		t.Fatalf("append A: %v", err)
 	}
 
-	// Snapshot the open segment's size after the first append.
-	s.catMu.RLock()
-	sizeAfterA := s.open.Size()
-	s.catMu.RUnlock()
+	// Snapshot the data plane's open-segment size after the first append.
+	s.data.catMu.RLock()
+	sizeAfterA := s.data.open.Size()
+	s.data.catMu.RUnlock()
 
 	// Second batch: shared (duplicate of first batch) + uniqB.
 	if err := s.AppendBatch(context.Background(),
@@ -438,9 +431,9 @@ func TestAppendBatchDedupesAcrossOps(t *testing.T) {
 		t.Fatalf("append B: %v", err)
 	}
 
-	s.catMu.RLock()
-	sizeAfterB := s.open.Size()
-	s.catMu.RUnlock()
+	s.data.catMu.RLock()
+	sizeAfterB := s.data.open.Size()
+	s.data.catMu.RUnlock()
 
 	// Frame for `shared` is one varint(len) + cid + payload. Whatever
 	// that totals, the second batch should NOT have re-written it.
@@ -483,20 +476,26 @@ func TestAppendBatchAllDuplicatesStillRecordsOpRoot(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("first append: %v", err)
 	}
-	s.catMu.RLock()
-	sizeBefore := s.open.Size()
-	opRootsBefore := len(s.open.OpRoots())
-	s.catMu.RUnlock()
+	// Size is the data plane's (the block is raw); op-roots live on the
+	// catalog plane.
+	s.data.catMu.RLock()
+	sizeBefore := s.data.open.Size()
+	s.data.catMu.RUnlock()
+	s.catalog.catMu.RLock()
+	opRootsBefore := len(s.catalog.open.OpRoots())
+	s.catalog.catMu.RUnlock()
 
 	if err := s.AppendBatch(context.Background(), []block.Block{blk}, nil, blockstore.OpRoot{
 		Bucket: "bk", Root: makeRoot(t, "second"),
 	}); err != nil {
 		t.Fatalf("dup append: %v", err)
 	}
-	s.catMu.RLock()
-	sizeAfter := s.open.Size()
-	opRootsAfter := len(s.open.OpRoots())
-	s.catMu.RUnlock()
+	s.data.catMu.RLock()
+	sizeAfter := s.data.open.Size()
+	s.data.catMu.RUnlock()
+	s.catalog.catMu.RLock()
+	opRootsAfter := len(s.catalog.open.OpRoots())
+	s.catalog.catMu.RUnlock()
 
 	if sizeAfter != sizeBefore {
 		t.Fatalf("all-duplicate batch grew CAR by %d bytes; expected 0", sizeAfter-sizeBefore)
@@ -506,13 +505,11 @@ func TestAppendBatchAllDuplicatesStillRecordsOpRoot(t *testing.T) {
 	}
 }
 
-// readSegmentSeqs counts distinct segments on disk by their catalog
-// CAR (one per segment; the data CAR may retire independently).
-// TestPerPlaneShipping_CatalogNeverShips is the headline permutation:
-// the data plane ships (and retires past its Retain window) while the
-// catalog plane is configured never to ship, so its CARs stay on local
-// disk indefinitely. No catalog flush worker runs, so cat_shipped_at
-// never advances (and, by extension, forge_root_cid never advances).
+// TestPerPlaneShipping_CatalogNeverShips is the headline permutation: the
+// data plane ships (and retires past its Retain window) while the catalog
+// plane is configured never to ship, so its CARs stay on local disk
+// indefinitely. No catalog flush worker runs, so its shipped_at never
+// advances (and, by extension, forge_root_cid never advances).
 func TestPerPlaneShipping_CatalogNeverShips(t *testing.T) {
 	dir := t.TempDir()
 	meta := newFakeMeta()
@@ -520,16 +517,18 @@ func TestPerPlaneShipping_CatalogNeverShips(t *testing.T) {
 
 	var dataShips atomicCounter
 	cfg := Config{
-		Dir:       dir,
-		Meta:      meta,
-		SealBytes: 1, // seal each batch into its own segment
-		SealAge:   20 * time.Millisecond,
+		Dir:  dir,
+		Meta: meta,
 		Data: PlaneConfig{
-			Ship:   true,
-			Flush:  func(context.Context, *Segment) error { dataShips.add(1); return nil },
-			Retain: 1,
+			SealBytes: 1, // seal each batch into its own segment
+			SealAge:   20 * time.Millisecond,
+			Ship:      true,
+			Flush:     func(context.Context, *Segment) error { dataShips.add(1); return nil },
+			Retain:    1,
 		},
-		Catalog: PlaneConfig{Ship: false}, // never ships → retained forever
+		// never ships → retained forever; seal fast so each batch becomes
+		// its own retained catalog CAR.
+		Catalog: PlaneConfig{SealBytes: 1, SealAge: 20 * time.Millisecond, Ship: false},
 		Logger:  logger,
 	}
 	s, err := Open(context.Background(), cfg)
@@ -573,11 +572,12 @@ func TestPerPlaneShipping_CatalogNeverShips(t *testing.T) {
 			continue
 		}
 		sealed++
-		if m.CatShippedAt != 0 {
-			t.Fatalf("seg %d: catalog shipped (%d) but Ship=false", seq, m.CatShippedAt)
-		}
-		if m.DataShippedAt == 0 {
-			t.Fatalf("seg %d: data plane never shipped", seq)
+		if m.Plane == blockstore.PlaneCatalog {
+			if m.ShippedAt != 0 {
+				t.Fatalf("catalog seg %d shipped (%d) but Ship=false", seq, m.ShippedAt)
+			}
+		} else if m.ShippedAt == 0 {
+			t.Fatalf("data seg %d never shipped", seq)
 		}
 	}
 	meta.mu.Unlock()
@@ -595,8 +595,8 @@ func TestPerPlaneShipping_CatalogNeverShips(t *testing.T) {
 	}
 
 	// All catalog CARs retained; data CARs retired toward Retain=1.
-	cats, _ := filepath.Glob(filepath.Join(dir, "seg-*.cat.car"))
-	datas, _ := filepath.Glob(filepath.Join(dir, "seg-*.data.car"))
+	cats, _ := filepath.Glob(filepath.Join(dir, "catalog", "seg-*.car"))
+	datas, _ := filepath.Glob(filepath.Join(dir, "data", "seg-*.car"))
 	if len(cats) < n {
 		t.Fatalf("expected >= %d catalog CARs retained; got %d", n, len(cats))
 	}
@@ -605,8 +605,82 @@ func TestPerPlaneShipping_CatalogNeverShips(t *testing.T) {
 	}
 }
 
-func readSegmentSeqs(dir string) ([]string, error) {
-	matches, err := filepath.Glob(filepath.Join(dir, "seg-*.cat.car"))
+// TestPerPlaneSeal_IndependentThresholds proves the two planes seal on
+// their OWN thresholds: the data plane seals/ships almost immediately
+// (SealBytes=1) while the catalog plane, given a huge SealBytes and long
+// SealAge, never seals during the test window. The data plane's cadence
+// is not gated by the catalog's size, and vice versa.
+func TestPerPlaneSeal_IndependentThresholds(t *testing.T) {
+	dir := t.TempDir()
+	meta := newFakeMeta()
+	logger := zaptest.NewLogger(t)
+
+	var dataShips, catShips atomicCounter
+	cfg := Config{
+		Dir:  dir,
+		Meta: meta,
+		Data: PlaneConfig{
+			SealBytes: 1,
+			SealAge:   20 * time.Millisecond,
+			Ship:      true,
+			Flush:     func(context.Context, *Segment) error { dataShips.add(1); return nil },
+			Retain:    6,
+		},
+		Catalog: PlaneConfig{
+			SealBytes: 1 << 30,
+			SealAge:   time.Hour,
+			Ship:      true,
+			Flush:     func(context.Context, *Segment) error { catShips.add(1); return nil },
+			Retain:    6,
+		},
+		Logger: logger,
+	}
+	s, err := Open(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close(context.Background()) })
+
+	for i := 0; i < 3; i++ {
+		d := makeBlock(t, []byte(fmt.Sprintf("data-%02d", i)))
+		c := makeCatBlock(t, []byte(fmt.Sprintf("cat-%02d", i)))
+		if err := s.AppendBatch(context.Background(),
+			[]block.Block{d}, []block.Block{c},
+			blockstore.OpRoot{Bucket: "bk", Root: c.Cid()},
+		); err != nil {
+			t.Fatalf("append %d: %v", i, err)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if dataShips.load() > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if dataShips.load() == 0 {
+		t.Fatalf("data plane should have sealed+shipped under SealBytes=1")
+	}
+	if catShips.load() != 0 {
+		t.Fatalf("catalog plane should not have shipped (huge SealBytes, long SealAge); got %d", catShips.load())
+	}
+
+	// No catalog segment should have sealed — its thresholds were never met.
+	meta.mu.Lock()
+	defer meta.mu.Unlock()
+	for seq, m := range meta.segments {
+		if m.Plane == blockstore.PlaneCatalog && m.State == StateSealed {
+			t.Fatalf("catalog seg %d sealed but its thresholds were never reached", seq)
+		}
+	}
+}
+
+// readSegmentSeqs lists a plane's segment CARs on disk (the
+// <dir>/<plane>/seg-*.car files) — used to assert retention.
+func readSegmentSeqs(dir, plane string) ([]string, error) {
+	matches, err := filepath.Glob(filepath.Join(dir, plane, "seg-*.car"))
 	if err != nil {
 		return nil, err
 	}

@@ -26,13 +26,12 @@ type fakeMeta struct {
 func newFakeMeta() *fakeMeta { return &fakeMeta{rows: map[uint64]*logstore.SegmentMeta{}} }
 
 func (f *fakeMeta) NextSegmentSeq(_ context.Context) (uint64, error) { f.seq++; return f.seq, nil }
-func (f *fakeMeta) InsertSegmentOpen(_ context.Context, seq uint64) error {
-	f.rows[seq] = &logstore.SegmentMeta{Seq: seq, State: logstore.StateOpen}
+func (f *fakeMeta) InsertSegmentOpen(_ context.Context, plane blockstore.Plane, seq uint64) error {
+	f.rows[seq] = &logstore.SegmentMeta{Seq: seq, Plane: plane, State: logstore.StateOpen}
 	return nil
 }
-func (f *fakeMeta) MarkSegmentSealed(_ context.Context, seq uint64, sealedAt int64,
-	dataSize int64, dataSHA []byte, catSize int64, catSHA []byte,
-	opRoots []blockstore.OpRoot) error {
+func (f *fakeMeta) MarkSegmentSealed(_ context.Context, plane blockstore.Plane, seq uint64, sealedAt int64,
+	size int64, sha []byte, opRoots []blockstore.OpRoot) error {
 	r, ok := f.rows[seq]
 	if !ok || r.State != logstore.StateOpen {
 		return nil
@@ -42,23 +41,22 @@ func (f *fakeMeta) MarkSegmentSealed(_ context.Context, seq uint64, sealedAt int
 	f.roots = append(f.roots, opRoots...)
 	return nil
 }
-func (f *fakeMeta) MarkSegmentShipped(_ context.Context, seq uint64, plane blockstore.Plane, shippedAt int64, _ []blockstore.OpRoot) error {
+func (f *fakeMeta) MarkSegmentShipped(_ context.Context, plane blockstore.Plane, seq uint64, shippedAt int64, _ []blockstore.OpRoot) error {
 	if r, ok := f.rows[seq]; ok {
-		if plane == blockstore.PlaneData {
-			r.DataShippedAt = shippedAt
-		} else {
-			r.CatShippedAt = shippedAt
-		}
+		r.ShippedAt = shippedAt
 	}
 	return nil
 }
-func (f *fakeMeta) DeleteSegment(_ context.Context, seq uint64) error {
+func (f *fakeMeta) DeleteSegment(_ context.Context, plane blockstore.Plane, seq uint64) error {
 	delete(f.rows, seq)
 	return nil
 }
-func (f *fakeMeta) ListSegments(_ context.Context) ([]logstore.SegmentMeta, error) {
+func (f *fakeMeta) ListSegments(_ context.Context, plane blockstore.Plane) ([]logstore.SegmentMeta, error) {
 	var out []logstore.SegmentMeta
 	for _, r := range f.rows {
+		if r.Plane != plane {
+			continue
+		}
 		out = append(out, *r)
 	}
 	return out, nil
@@ -113,13 +111,11 @@ func TestLayeredAndStagingHappyPath(t *testing.T) {
 	logger := zaptest.NewLogger(t)
 
 	log, err := logstore.Open(context.Background(), logstore.Config{
-		Dir:       dir,
-		Meta:      meta,
-		SealBytes: 1 << 30,
-		SealAge:   1 * time.Hour,
-		Data:      logstore.PlaneConfig{Ship: true, Flush: nopFlush, Retain: 6},
-		Catalog:   logstore.PlaneConfig{Ship: true, Flush: nopFlush, Retain: 6},
-		Logger:    logger,
+		Dir:     dir,
+		Meta:    meta,
+		Data:    logstore.PlaneConfig{SealBytes: 1 << 30, SealAge: time.Hour, Ship: true, Flush: nopFlush, Retain: 6},
+		Catalog: logstore.PlaneConfig{SealBytes: 1 << 30, SealAge: time.Hour, Ship: true, Flush: nopFlush, Retain: 6},
+		Logger:  logger,
 	})
 	if err != nil {
 		t.Fatalf("logstore Open: %v", err)
@@ -159,13 +155,11 @@ func TestLayeredFallsThroughToBaseOnMiss(t *testing.T) {
 	logger := zaptest.NewLogger(t)
 
 	log, err := logstore.Open(context.Background(), logstore.Config{
-		Dir:       dir,
-		Meta:      meta,
-		SealBytes: 1 << 30,
-		SealAge:   1 * time.Hour,
-		Data:      logstore.PlaneConfig{Ship: true, Flush: nopFlush, Retain: 6},
-		Catalog:   logstore.PlaneConfig{Ship: true, Flush: nopFlush, Retain: 6},
-		Logger:    logger,
+		Dir:     dir,
+		Meta:    meta,
+		Data:    logstore.PlaneConfig{SealBytes: 1 << 30, SealAge: time.Hour, Ship: true, Flush: nopFlush, Retain: 6},
+		Catalog: logstore.PlaneConfig{SealBytes: 1 << 30, SealAge: time.Hour, Ship: true, Flush: nopFlush, Retain: 6},
+		Logger:  logger,
 	})
 	if err != nil {
 		t.Fatalf("logstore Open: %v", err)
@@ -186,13 +180,11 @@ func TestStagingDiscardLeavesLogUntouched(t *testing.T) {
 	logger := zaptest.NewLogger(t)
 
 	log, err := logstore.Open(context.Background(), logstore.Config{
-		Dir:       dir,
-		Meta:      meta,
-		SealBytes: 1 << 30,
-		SealAge:   1 * time.Hour,
-		Data:      logstore.PlaneConfig{Ship: true, Flush: nopFlush, Retain: 6},
-		Catalog:   logstore.PlaneConfig{Ship: true, Flush: nopFlush, Retain: 6},
-		Logger:    logger,
+		Dir:     dir,
+		Meta:    meta,
+		Data:    logstore.PlaneConfig{SealBytes: 1 << 30, SealAge: time.Hour, Ship: true, Flush: nopFlush, Retain: 6},
+		Catalog: logstore.PlaneConfig{SealBytes: 1 << 30, SealAge: time.Hour, Ship: true, Flush: nopFlush, Retain: 6},
+		Logger:  logger,
 	})
 	if err != nil {
 		t.Fatalf("logstore Open: %v", err)

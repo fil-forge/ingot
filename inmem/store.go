@@ -114,6 +114,9 @@ func (m *MemStore) SetForgeRoot(_ context.Context, name string, root cid.Cid) er
 }
 
 // Meta methods ===============================================================
+//
+// Segments are single-plane and keyed by their globally-unique seq; the
+// Plane field discriminates so ListSegments can scope by plane.
 
 func (m *MemStore) NextSegmentSeq(_ context.Context) (uint64, error) {
 	m.mu.Lock()
@@ -122,19 +125,18 @@ func (m *MemStore) NextSegmentSeq(_ context.Context) (uint64, error) {
 	return m.nextSeq, nil
 }
 
-func (m *MemStore) InsertSegmentOpen(_ context.Context, seq uint64) error {
+func (m *MemStore) InsertSegmentOpen(_ context.Context, plane blockstore.Plane, seq uint64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, ok := m.segments[seq]; ok {
 		return nil
 	}
-	m.segments[seq] = &logstore.SegmentMeta{Seq: seq, State: logstore.StateOpen}
+	m.segments[seq] = &logstore.SegmentMeta{Seq: seq, Plane: plane, State: logstore.StateOpen}
 	return nil
 }
 
-func (m *MemStore) MarkSegmentSealed(_ context.Context, seq uint64, sealedAt int64,
-	dataSize int64, dataSHA []byte, catSize int64, catSHA []byte,
-	opRoots []blockstore.OpRoot) error {
+func (m *MemStore) MarkSegmentSealed(_ context.Context, plane blockstore.Plane, seq uint64, sealedAt int64,
+	size int64, sha []byte, opRoots []blockstore.OpRoot) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	r, ok := m.segments[seq]
@@ -143,23 +145,17 @@ func (m *MemStore) MarkSegmentSealed(_ context.Context, seq uint64, sealedAt int
 	}
 	r.State = logstore.StateSealed
 	r.SealedAt = sealedAt
-	r.DataSize = dataSize
-	r.DataSHA256 = append([]byte(nil), dataSHA...)
-	r.CatSize = catSize
-	r.CatSHA256 = append([]byte(nil), catSHA...)
+	r.Size = size
+	r.SHA256 = append([]byte(nil), sha...)
 	r.OpRoots = append([]blockstore.OpRoot(nil), opRoots...)
 	return nil
 }
 
-func (m *MemStore) MarkSegmentShipped(_ context.Context, seq uint64, plane blockstore.Plane, shippedAt int64, opRoots []blockstore.OpRoot) error {
+func (m *MemStore) MarkSegmentShipped(_ context.Context, plane blockstore.Plane, seq uint64, shippedAt int64, opRoots []blockstore.OpRoot) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if r, ok := m.segments[seq]; ok {
-		if plane == blockstore.PlaneData {
-			r.DataShippedAt = shippedAt
-		} else {
-			r.CatShippedAt = shippedAt
-		}
+		r.ShippedAt = shippedAt
 	}
 	if plane == blockstore.PlaneCatalog {
 		for _, opr := range opRoots {
@@ -171,18 +167,21 @@ func (m *MemStore) MarkSegmentShipped(_ context.Context, seq uint64, plane block
 	return nil
 }
 
-func (m *MemStore) DeleteSegment(_ context.Context, seq uint64) error {
+func (m *MemStore) DeleteSegment(_ context.Context, plane blockstore.Plane, seq uint64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.segments, seq)
 	return nil
 }
 
-func (m *MemStore) ListSegments(_ context.Context) ([]logstore.SegmentMeta, error) {
+func (m *MemStore) ListSegments(_ context.Context, plane blockstore.Plane) ([]logstore.SegmentMeta, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var out []logstore.SegmentMeta
 	for _, r := range m.segments {
+		if r.Plane != plane {
+			continue
+		}
 		out = append(out, *r)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Seq < out[j].Seq })

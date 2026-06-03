@@ -7,20 +7,18 @@ import (
 )
 
 // State describes the lifecycle stage of a segment. A segment is open
-// (the single current append target) or sealed (closed for writes).
-// There is no "flushed" state: shipping is tracked per-plane via the
-// DataShippedAt / CatShippedAt timestamps, because the data plane and
-// the catalog plane ship to Forge through independent pipelines and
-// either may be configured never to ship at all.
+// (its plane's current append target) or sealed (closed for writes).
+// There is no "flushed" state: shipping is tracked via the ShippedAt
+// timestamp, and a plane may be configured never to ship at all (its
+// segments stay sealed-and-local forever).
 type State int
 
 const (
-	// StateOpen means the segment is the current append target. Exactly
-	// one segment is in this state at a time.
+	// StateOpen means the segment is its plane's current append target.
+	// Exactly one segment per plane is in this state at a time.
 	StateOpen State = iota
-	// StateSealed means the segment is closed for writes. Its two CARs
-	// may ship and retire independently; a sealed segment stays sealed
-	// until both planes have retired off local disk.
+	// StateSealed means the segment is closed for writes. It may ship and
+	// retire; a sealed segment stays sealed until it retires off disk.
 	StateSealed
 )
 
@@ -49,79 +47,71 @@ func ParseState(s string) (State, bool) {
 	}
 }
 
-// SegmentMeta is the persistence-layer view of a segment. Used by
-// recovery to enumerate segments that need attention. The data and
-// catalog planes carry independent size/sha/shipped state because they
-// ship through separate pipelines.
+// SegmentMeta is the persistence-layer view of a single-plane segment.
+// Recovery uses it to enumerate a plane's segments. Each segment belongs
+// to exactly one plane (data or catalog); the two planes ship through
+// independent pipelines.
 type SegmentMeta struct {
-	Seq      uint64
-	State    State
+	Seq   uint64
+	Plane blockstore.Plane
+	State State
+
 	SealedAt int64
 
-	// Per-plane CAR size + seal-time sha256.
-	DataSize   int64
-	DataSHA256 []byte
-	CatSize    int64
-	CatSHA256  []byte
+	// Size + seal-time sha256 of this segment's CAR.
+	Size   int64
+	SHA256 []byte
 
-	// Per-plane ship high-water: unix seconds when that plane's CAR was
-	// shipped to Forge, or 0 if not (yet) shipped. A plane configured
-	// never to ship stays 0 forever.
-	DataShippedAt int64
-	CatShippedAt  int64
+	// ShippedAt is the unix-seconds high-water mark: when this segment's
+	// CAR shipped to Forge, or 0 if not (yet) shipped. A non-shipping
+	// plane stays 0 forever.
+	ShippedAt int64
 
+	// OpRoots are the per-batch (bucket, root) records. Populated only
+	// for catalog-plane segments — op-roots are MST roots.
 	OpRoots []blockstore.OpRoot
 }
 
-// ShippedAt returns the ship timestamp for the given plane (0 = not
-// shipped).
-func (m SegmentMeta) ShippedAt(p blockstore.Plane) int64 {
-	if p == blockstore.PlaneData {
-		return m.DataShippedAt
-	}
-	return m.CatShippedAt
-}
-
-// Meta is the persistence backing for the segment lifecycle. The
-// production implementation is *registry.Postgres; tests use an
-// in-memory fake. Logstore never touches SQL directly.
+// Meta is the persistence backing for the per-plane segment lifecycle.
+// Every method is plane-scoped except NextSegmentSeq, which draws from a
+// single globally-unique allocator shared by both planes. The production
+// implementation is *registry.Postgres; tests use an in-memory fake.
+// Logstore never touches SQL directly.
 type Meta interface {
-	// NextSegmentSeq returns a fresh monotonic segment id.
+	// NextSegmentSeq returns a fresh, globally-unique, monotonic segment
+	// id. Both planes draw from the same allocator; an id belongs to
+	// whichever plane records it via InsertSegmentOpen.
 	NextSegmentSeq(ctx context.Context) (uint64, error)
 
-	// InsertSegmentOpen records that segment seq has just been opened.
-	// Idempotent: if the row already exists in any state it is left
-	// alone.
-	InsertSegmentOpen(ctx context.Context, seq uint64) error
+	// InsertSegmentOpen records that segment seq has just been opened for
+	// plane. Idempotent: an existing row in any state is left alone.
+	InsertSegmentOpen(ctx context.Context, plane blockstore.Plane, seq uint64) error
 
 	// MarkSegmentSealed transitions a segment from open to sealed in one
-	// transaction: records both planes' size+sha and inserts the
-	// per-segment op-root rows. opRoots are applied in slice order (each
-	// gets seq_within = i).
-	MarkSegmentSealed(ctx context.Context, seq uint64, sealedAt int64,
-		dataSize int64, dataSHA []byte, catSize int64, catSHA []byte,
-		opRoots []blockstore.OpRoot) error
+	// transaction: records the CAR size+sha and inserts the per-segment
+	// op-root rows (catalog plane only; opRoots is empty for data).
+	// opRoots are applied in slice order (each gets seq_within = i).
+	MarkSegmentSealed(ctx context.Context, plane blockstore.Plane, seq uint64, sealedAt int64,
+		size int64, sha []byte, opRoots []blockstore.OpRoot) error
 
-	// MarkSegmentShipped records that the given plane's CAR finished
-	// shipping to Forge, stamping <plane>_shipped_at. For
-	// blockstore.PlaneCatalog it ALSO advances forge_root_cid in
-	// ingot.buckets for every op-root recorded against this segment
-	// (catalog roots are the MST roots durable on Forge), all in one
-	// transaction; for PlaneData opRoots is ignored.
-	MarkSegmentShipped(ctx context.Context, seq uint64, plane blockstore.Plane, shippedAt int64, opRoots []blockstore.OpRoot) error
+	// MarkSegmentShipped records that this segment's CAR finished shipping
+	// to Forge, stamping shipped_at. For blockstore.PlaneCatalog it ALSO
+	// advances forge_root_cid in ingot.buckets for every op-root recorded
+	// against this segment (catalog roots are the MST roots durable on
+	// Forge), all in one transaction; for PlaneData opRoots is ignored.
+	MarkSegmentShipped(ctx context.Context, plane blockstore.Plane, seq uint64, shippedAt int64, opRoots []blockstore.OpRoot) error
 
 	// DeleteSegment removes a segment row (cascades to op-root rows).
-	// Used by retention after both planes' on-disk files are unlinked.
-	DeleteSegment(ctx context.Context, seq uint64) error
+	// Used by retention after the on-disk files are unlinked.
+	DeleteSegment(ctx context.Context, plane blockstore.Plane, seq uint64) error
 
-	// ListSegments returns every segment row (open + sealed) ordered by
-	// seq ascending, with per-plane shipped state and op-roots hydrated.
-	// Recovery uses this to rebuild the read tier and to re-enqueue, per
-	// plane, any sealed segment whose plane has not yet shipped.
-	ListSegments(ctx context.Context) ([]SegmentMeta, error)
+	// ListSegments returns every segment row for plane (open + sealed)
+	// ordered by seq ascending, with op-roots hydrated. Recovery uses it
+	// to rebuild the read tier and re-enqueue unshipped segments.
+	ListSegments(ctx context.Context, plane blockstore.Plane) ([]SegmentMeta, error)
 
 	// RehydrateSegment writes a segment row + its op-root rows from the
-	// on-disk `.idx` sidecars when the DB row is missing or torn.
-	// Idempotent on (seq) — replaces any existing rows for that segment.
+	// on-disk `.idx` sidecar when the DB row is missing or torn.
+	// Idempotent on (seq) — replaces any existing row for that segment.
 	RehydrateSegment(ctx context.Context, m SegmentMeta) error
 }

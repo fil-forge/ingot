@@ -50,21 +50,18 @@ type ServerConfig struct {
 	// 0 → bucket.DefaultChunkSize.
 	ChunkSize int64
 
-	// SealBytes / SealAge are passed through to logstore.Open. Zero
-	// values pick logstore defaults (64 MiB / 5 s).
-	SealBytes int64
-	SealAge   time.Duration
-
-	// ShipData / ShipCatalog gate each plane's independent upload
-	// pipeline. When false, that plane's CARs are retained on local disk
-	// and never shipped to Forge. RetainData / RetainCatalog bound how
-	// many shipped CARs of each plane are kept locally (0 → logstore
-	// default of 6; ignored for a non-shipping plane, which is retained
-	// indefinitely).
-	ShipData      bool
-	ShipCatalog   bool
-	RetainData    int
-	RetainCatalog int
+	// Per-plane seal thresholds, ship gates, and retention. Each plane
+	// seals, ships, and retains independently. Zero SealBytes/SealAge
+	// pick logstore defaults (64 MiB / 5 s); zero Retain → 6 (ignored for
+	// a non-shipping plane, which is retained indefinitely).
+	SealBytesData    int64
+	SealAgeData      time.Duration
+	ShipData         bool
+	RetainData       int
+	SealBytesCatalog int64
+	SealAgeCatalog   time.Duration
+	ShipCatalog      bool
+	RetainCatalog    int
 
 	// MaxConnections / MaxRequests configure versitygw's hard
 	// concurrency limit. Zero is unsafe (yields 503 SlowDown on every
@@ -126,19 +123,21 @@ func New(ctx context.Context, cfg ServerConfig, deps ServerDeps) (*Server, error
 	}
 
 	log, err := logstore.Open(ctx, logstore.Config{
-		Dir:       filepath.Join(cfg.DataDir, "segments"),
-		Meta:      deps.Meta,
-		SealBytes: cfg.SealBytes,
-		SealAge:   cfg.SealAge,
+		Dir:  filepath.Join(cfg.DataDir, "segments"),
+		Meta: deps.Meta,
 		Data: logstore.PlaneConfig{
-			Ship:   cfg.ShipData,
-			Flush:  newPlaneFlushFunc(deps.Uploader, blockstore.PlaneData),
-			Retain: cfg.RetainData,
+			SealBytes: cfg.SealBytesData,
+			SealAge:   cfg.SealAgeData,
+			Ship:      cfg.ShipData,
+			Flush:     newPlaneFlushFunc(deps.Uploader, blockstore.PlaneData),
+			Retain:    cfg.RetainData,
 		},
 		Catalog: logstore.PlaneConfig{
-			Ship:   cfg.ShipCatalog,
-			Flush:  newPlaneFlushFunc(deps.Uploader, blockstore.PlaneCatalog),
-			Retain: cfg.RetainCatalog,
+			SealBytes: cfg.SealBytesCatalog,
+			SealAge:   cfg.SealAgeCatalog,
+			Ship:      cfg.ShipCatalog,
+			Flush:     newPlaneFlushFunc(deps.Uploader, blockstore.PlaneCatalog),
+			Retain:    cfg.RetainCatalog,
 		},
 		Logger: logger,
 	})
@@ -221,19 +220,19 @@ func (s *Server) Stop(ctx context.Context) error {
 // catalog plane) advancing forge_root_cid for the recorded op-roots.
 func newPlaneFlushFunc(up uploader.Uploader, plane blockstore.Plane) logstore.FlushFunc {
 	return func(ctx context.Context, seg *logstore.Segment) error {
-		positions := seg.Positions(plane)
+		positions := seg.Positions()
 		if len(positions) == 0 {
 			return nil
 		}
 		// Segment stores the raw 32-byte SHA-256 of the CAR file; the
 		// uploader and ShardedDagIndexView want the multihash form.
-		sha, err := multihash.Encode(seg.SHA256(plane), multihash.SHA2_256)
+		sha, err := multihash.Encode(seg.SHA256(), multihash.SHA2_256)
 		if err != nil {
 			return fmt.Errorf("encode segment %d %s sha: %w", seg.Seq(), plane, err)
 		}
 		shard := uploader.CARShard{
-			Path:      seg.PlaneCARPath(plane),
-			Size:      seg.PlaneSize(plane),
+			Path:      seg.CARPath(),
+			Size:      seg.Size(),
 			SHA256:    sha,
 			Positions: positions,
 		}
