@@ -345,11 +345,21 @@ func seedSpaceDelegations(ctx context.Context, spaceSigner ucan.Signer, agent di
 		dlg  func() (ucan.Delegation, error)
 	}
 	caps := []cap{
-		{"/blob/add", func() (ucan.Delegation, error) { return blobcmds.Add.Delegate(spaceSigner, agent, space, delegation.WithNoExpiration()) }},
-		{"/blob/allocate", func() (ucan.Delegation, error) { return blobcmds.Allocate.Delegate(spaceSigner, agent, space, delegation.WithNoExpiration()) }},
-		{"/blob/accept", func() (ucan.Delegation, error) { return blobcmds.Accept.Delegate(spaceSigner, agent, space, delegation.WithNoExpiration()) }},
-		{"/index/add", func() (ucan.Delegation, error) { return indexcmds.Add.Delegate(spaceSigner, agent, space, delegation.WithNoExpiration()) }},
-		{"/content/retrieve", func() (ucan.Delegation, error) { return contentcmds.Retrieve.Delegate(spaceSigner, agent, space, delegation.WithNoExpiration()) }},
+		{"/blob/add", func() (ucan.Delegation, error) {
+			return blobcmds.Add.Delegate(spaceSigner, agent, space, delegation.WithNoExpiration())
+		}},
+		{"/blob/allocate", func() (ucan.Delegation, error) {
+			return blobcmds.Allocate.Delegate(spaceSigner, agent, space, delegation.WithNoExpiration())
+		}},
+		{"/blob/accept", func() (ucan.Delegation, error) {
+			return blobcmds.Accept.Delegate(spaceSigner, agent, space, delegation.WithNoExpiration())
+		}},
+		{"/index/add", func() (ucan.Delegation, error) {
+			return indexcmds.Add.Delegate(spaceSigner, agent, space, delegation.WithNoExpiration())
+		}},
+		{"/content/retrieve", func() (ucan.Delegation, error) {
+			return contentcmds.Retrieve.Delegate(spaceSigner, agent, space, delegation.WithNoExpiration())
+		}},
 	}
 	dlgs := make([]ucan.Delegation, 0, len(caps))
 	for _, c := range caps {
