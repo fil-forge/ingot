@@ -11,6 +11,15 @@ the measured PDP gas model behind the size knobs (headline figures inlined in
 [`pdp-cost-calculator.html`](./pdp-cost-calculator.html). The catalog-log internals live in the
 [`logstore`](../logstore) package.
 
+> **Scope & relationship to the appliance release plan.** This is the **target architecture** — the
+> full-vision topology (with the indexing-service, the read-after-write floor, the catalog plane). The
+> staged **R0/R1/R2 appliance release plan** deliberately delivers a reduced topology first: R0/R1 may
+> drop the indexing-service for a local Postgres location table, and layer encryption / Hilt auth /
+> multipart per the FilOne Object Encryption RFC and the appliance plan. Where this doc and that plan
+> diverge (indexer, read cache, encryption, auth), this doc is the north star and the reductions are
+> deliberate, reversible simplifications — not contradictions. This doc deliberately scopes to
+> **storage, delete, and retrieval**; encryption and authorization are owned by their own RFCs.
+
 ---
 
 ## 1. Overview & principles
@@ -70,8 +79,9 @@ The design is shaped by how the Forge upload pipeline works and by a handful of 
   upload-service DID (Sprue). Today Sprue issues it the moment the client concludes the `PUT`
   receipt — so a client controls *when* accept happens by controlling when it concludes.
 - **On-chain cost scales with piece *count*, not size, and nothing is O(live pieces).** Adding a
-  piece costs ~120,700 gas at any size; the only size-dependent term is an O(log) proving cost
-  (measured — see the gas RFC). Many pieces are batched into one on-chain transaction.
+  piece costs ~120,700 gas at any size; the only size-dependent term is an **O(log cumulative-piece-
+  count)** proving cost — i.e. O(log(dataset_bytes / piece_size)), the sumtree depth, monotonic so churn
+  ratchets it up (measured — see the gas RFC). Many pieces are batched into one on-chain transaction.
 - **On-chain deletion is whole-piece and asymmetric.** A standalone piece deletes in ~88,800 gas
   with no off-chain work. Removing one blob from a multi-blob aggregate has no on-chain primitive:
   the whole piece is removed, the survivors are re-hashed off-chain into a new aggregate, and that is
@@ -177,16 +187,23 @@ validates/echoes them, independent of the internal sha256 content address.
 
 The catalog is the per-bucket namespace: the MST plus the object manifests it points at.
 
-**The MST** maps each composite key to a manifest CID. It is the forked, go-cid-only MST.
+**The MST** maps each composite key to a manifest CID. It is the forked, go-cid-only MST. It is the
+**source of truth for bucket state**, not merely a local index: because it is a content-addressed,
+self-verifying Merkle structure shipped to Forge (the catalog plane), a bucket's entire namespace is
+recoverable and portable from the network — the property a plain Postgres table (fast local index, but
+not self-verifying, portable, or Forge-recoverable) cannot offer. That credible-exit/durability argument
+is why the catalog is an MST; Postgres's wins (range/secondary queries, Object-Lock ergonomics, GC) are
+deferred, and a hybrid (relational index *alongside* the MST source-of-truth) is the likely end state.
 
 **The manifest** describes one object version: an envelope — key, version id, created/last-modified,
 the S3 `etag` stored verbatim (a multipart ETag cannot be re-derived from the bytes), content-type,
 system and user headers, and a delete-marker flag for tombstone versions — plus a `Body`. The `Body`
 carries the whole-object `size` and `sha256` (integrity) and an **ordered, contiguous list of body
-blobs** `[{ digest, offset, length }]` that together cover `[0, size)`: one entry for a small object,
-N for a split or multipart object. Each `digest` is the sha256 multihash Piri stores the blob under
-and the indexer resolves to a node URL — so this blob list is what lets a ranged GET map a byte range
-to the covering blob(s) with no external index.
+blobs** — *shards*, in Forge terms — `[{ digest, offset, length }]` that together cover `[0, size)`:
+one entry for a small object, N for a split or multipart object. Each `digest` is the sha256 multihash
+Piri stores the shard under and the indexer resolves to a node URL — so this list is what lets a ranged
+GET map a byte range to the covering shard(s); whether it *also* needs an external sharded-dag-index
+depends on the single- vs multi-shard split in [§8](#8-retrieval-addressing-when-bodies-need-a-sharded-dag-index).
 
 ```shell
 MST (bucket)
@@ -228,7 +245,7 @@ durable. The catalog plane is the per-operation delta.
 
 Because many tiny blocks share a CAR, catalog retrieval uses the indexer's **index-claim /
 sharded-dag-index path** (block CID → byte range within its CAR shard). This two-level lookup is
-retained for the catalog; object bodies do not use it ([§8](#8-retrieval-addressing-why-bodies-need-no-sharded-dag-index)).
+retained for the catalog; object bodies do not use it ([§8](#8-retrieval-addressing-when-bodies-need-a-sharded-dag-index)).
 
 **Superseded MST nodes** (from overwrites and deletes) are recorded in a `gc_candidates` table.
 They are not collected in this iteration — the catalog accumulates on Piri with mutation volume,
@@ -247,20 +264,19 @@ granularity, not fine chunking) for larger ones. Each blob is uploaded to Piri b
 
 **The local store (spool + cache).** Each blob is written locally before upload — both because the
 digest must be known before `allocate`, and because that local copy does double duty:
-- **Read-after-write floor (mandatory):** a just-written object is served from the local copy until
-  the indexer can durably resolve it. The hazard is a gap in the indexer's caching:
-  1. At `accept`, Piri publishes the blob's location to the indexer, which caches it right away — so
-     a normal GET resolves at once. But that cached **hit** has only a ~1 h TTL.
-  2. The durable, long-term resolution comes from an IPNI advertisement that propagates **separately
-     and more slowly**. If the hit expires before IPNI has caught up, there is a window where the
-     indexer can find nothing.
-  3. The catch: a lookup that lands in that window returns *not found*, and the indexer **caches that
-     failure too** — a *negative* cache entry, also ~1 h. So one ill-timed miss makes a
-     fully-stored object look missing for up to an hour, even after IPNI catches up.
-
-  To stay out of that window, a blob's local copy is retained until the object is **published** —
-  confirmed by an independent, cache-cold indexer probe actually resolving the digest (or a fixed
-  margin past the TTL) — not merely until `accept` returns.
+- **Read-after-write (a latency/availability optimization, not a correctness backstop):** a
+  just-written object is served from the local copy until the indexer resolves it network-wide. In the
+  indexing-service's **production** config the cache TTLs are generous — a 30-day providers cache, a
+  7-day claims cache, and a 24 h negative cache (`indexing-service/deploy/.env.production.local.tpl`;
+  the ~1 h values are the local/staging block) — and the SP publishes to IPNI itself, so a location
+  cached at `accept` has ample time for the IPNI advertisement to propagate. There is therefore no
+  realistic expire-before-IPNI window in production, which is why this is an optimization rather than
+  the mandatory backstop an earlier draft described. The one genuine residual race is a *never-published*
+  digest queried in the gap between the accept-time cache write and the SP's first IPNI advertisement,
+  which 24 h negative caching could pin; serving from the local copy until **published** (or wiring the
+  IPNI-sync notifier, `go-libstoracha/ipnipublisher/notifier`) closes it. *(In the R0/R1 appliance
+  topology there is no indexing-service at all — reads resolve from the local Postgres location table —
+  so this race doesn't arise there.)*
 - **Read cache (optional, recommended):** beyond that floor, the local store serves hot reads
   directly, skipping the indexer→Piri round-trip. Read-after-write retains *recently written* data;
   a cache retains *recently read* data, so the two may use distinct eviction policies over a shared,
@@ -314,9 +330,10 @@ small `min` means most objects are their own piece, so most deletes are O(1) (be
 more pieces — more `addPieces` transactions, a one-time registration tax, and an O(log) proving
 ratchet under churn — all bounded, none a per-live-piece cost. The RFC's proposed knee is **8 MiB**
 (with 16–32 MiB as a fallback if transaction count or base-fee spikes bite). The aggregator keeps
-aggregates `≤ max`, and the batch submitter respects the contract's `extraData` cap — the binding
-gate is the PDPVerifier's `EXTRA_DATA_MAX_SIZE` = 2048 B (~13 pieces/tx), not the larger WSS limit
-(gas RFC).
+aggregates `≤ max`, and the batch submitter sizes each `addPieces` to the per-tx limit — which, as of
+FWSS v1.3.0 / PDPVerifier v3.4.0, is **no longer a contract `extraData` cap** (that constant was removed)
+but the FVM `PiecesAdded` event-size + per-tx gas; the production batch size is a measured value, not a
+fixed constant (gas RFC).
 
 > **Design decision (for review).** `min`/`max` are the central knobs: `min` trades on-chain piece
 > count (transactions, the one-time registration tax, the proving ratchet) against deletion
@@ -459,16 +476,29 @@ updates are transactional with the commit.
 
 ---
 
-## 8. Retrieval addressing (why bodies need no sharded-dag-index)
+## 8. Retrieval addressing (when bodies need a sharded-dag-index)
 
-Object bodies resolve straight from a digest: `accept` publishes an `/assert/location` commitment
-keyed by the blob's own digest with a whole-blob range, and the manifest's ordered blob list carries
-the byte-range map for split/multipart objects. So body retrieval needs only a digest → location
-lookup, no per-CAR sharded-dag-index.
+A body shard (blob) resolves straight from its digest: `accept` publishes an `/assert/location`
+commitment keyed by the shard's own digest with a whole-shard range. So the **single-shard** case needs
+no index at all — the object digest *is* the shard digest, and a bare digest → location lookup
+resolves it. This composes with the [Forge S3 sharding RFC](https://github.com/fil-one/RFC/blob/main/rfcs/2026-04-forge-s3-flat-file-sharding-strategy.md):
+its 256 MiB shard threshold is this design's blob ceiling (Piri's `MaxMemtreeSize`), so a shard is a
+body blob and — under no-aggregation — its own on-chain piece.
+
+The **multi-shard** case (an object split at the ceiling, or a multipart object) does need an ordering
+record, and here there is a deliberate choice. Ingot's manifest carries the ordered
+`{digest, offset, length}` list (Ingot-private, lean, no extra index block). The sharding RFC's
+alternative is a UnixFS File root node + a sharded-dag-index `nodes` property, which preserves
+**credible exit**: `guppy retrieve <root-cid>` reassembles *and decrypts* the whole object with no Ingot
+in the loop (guppy can decrypt via the FEE tenant-recipient/recovery path), where the flat manifest
+cannot. So the open call for multi-shard objects is **flat manifest (lean, Ingot-only) vs. UnixFS root +
+index (stock-tooling plaintext recovery)** — a deliberate trade, not settled here. The compromise:
+**skip the index for single-shard objects; build it only for >1 shard.**
 
 The **catalog** is different — many tiny MST/manifest blocks share a CAR — so catalog blocks resolve
-via the indexer's index-claim / sharded-dag-index path (block CID → byte range in its shard). That
-path is retained for the catalog; only the data plane drops it.
+via the indexer's index-claim / sharded-dag-index path (block CID → byte range in its shard). That path
+is retained for the catalog regardless. *(In the R0/R1 appliance topology, catalog-block lookup is
+served from the local Postgres location table rather than the indexing-service.)*
 
 Consuming a bare location commitment is a capability Ingot's locator must gain: today it surfaces a
 location only via the inclusion → shard → commitment path and never returns a stored bare
@@ -490,12 +520,12 @@ negotiations).
 | Ingot-timed accept (PUT a part, defer the conclude until Complete)                             | Ingot + Sprue                   | **partial**  | Accept already fires on the client's conclude; needs the park-vs-conclude split client-side and a separable Sprue conclude. Ingot does **not** issue `accept` (Piri requires the upload-service DID).               |
 | `unallocate(digest)` — drop a parked blob                                                      | Piri + Sprue + libforge         | **to-build** | `blob/remove` arg type exists in libforge; no handler.                                                                                                                                                              |
 | `remove(digest)` — per-space claim release; physical delete/piece-retire at zero global claims | Piri + Sprue + libforge         | **to-build** | Piri keeps per-`(digest,space)` allocation rows to count on.                                                                                                                                                        |
-| Configurable, adaptive size policy (`min`/`max`); batch guard for the `extraData` cap          | Piri                            | **partial**  | `MinAggregateSize` is hardcoded 128 MiB; lower to ~8 MiB and make configurable; the binding `extraData` cap is the PDPVerifier `EXTRA_DATA_MAX_SIZE`=2048 (~13 pieces/tx), so keep `BatchSize` ≤ ~13 (default 10 already complies) with an explicit 2048 guard (gas RFC). No contract change (lifting the cap itself needs a PDPVerifier upgrade). |
+| Configurable, adaptive size policy (`min`/`max`); batch guard for the `extraData` cap          | Piri                            | **partial**  | `MinAggregateSize` is hardcoded 128 MiB; lower to ~8 MiB and make configurable. The `addPieces` batch is no longer contract-capped (FWSS v1.3.0 removed the `extraData` cap); size it to the FVM `PiecesAdded` event-size + per-tx gas — a measured ceiling (default `BatchSize=10` is safely within it) (gas RFC). No contract change. |
 | Compaction (Regime B) + complete the on-chain delete signature                                 | Piri                            | **partial**  | Whole-root delete is wired but its `extraData` signature is incomplete; compaction (remove + re-hash survivors + re-add) is new.                                                                                    |
 | De-dup at accept (don't re-aggregate a digest already a live piece)                            | Piri                            | **to-build** | Backstops one-piece-per-content once accept timing is Ingot-driven.                                                                                                                                                 |
 | Parked-allocation GC + honor `Expires`                                                         | Piri                            | **to-build** | Bounds leakage when an abort never arrives.                                                                                                                                                                         |
 | Indexer delete by `(space, digest)` / location-claim CID                                       | Indexer + Sprue                 | **to-build** | IPNI removal mechanics are the indexer's.                                                                                                                                                                           |
-| Bare location commitment served by blob digest                                                 | Indexer                         | **exists**   | `accept` publishes it; the indexer caches it. Ingot's locator must learn to consume it ([§8](#8-retrieval-addressing-why-bodies-need-no-sharded-dag-index)).                                                        |
+| Bare location commitment served by blob digest                                                 | Indexer                         | **exists**   | `accept` publishes it; the indexer caches it. Ingot's locator must learn to consume it ([§8](#8-retrieval-addressing-when-bodies-need-a-sharded-dag-index)).                                                        |
 | Batch `allocate`/`accept`                                                                      | libforge + Sprue + Piri + Ingot | **to-build** | New batch command shapes; per-element receipts; RPC amortization, still per-blob claims.                                                                                                                            |
 | Lift the 256 MiB blob ceiling (streaming commP)                                                | Piri                            | **optional** | Reduces large-object splitting; not required for the first cut.                                                                                                                                                     |
 | `allocate-by-size` + bind-digest-after (remove the spool, same-rack)                           | Piri + Sprue + Ingot            | **optional** | [§10](#10-deployment-topology--the-digest-before-upload-cost). Needs a size-bounded, possibly authenticated upload route.                                                                                           |

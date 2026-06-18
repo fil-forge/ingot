@@ -5,7 +5,7 @@
 | **Status** | Draft / for discussion |
 | **Author** | forrest |
 | **Date** | 2026-06-17 |
-| **Scope** | Piri aggregation policy + PDP cost/economics model. **No smart-contract changes required** (one optional contract lever noted in §9). |
+| **Scope** | Piri aggregation policy + PDP cost/economics model. **No smart-contract changes required.** (Verified against FWSS v1.3.0 / PDPVerifier v3.4.0; the earlier "raise the extraData cap" lever is moot — that cap was removed upstream.) |
 | **Affected components** | Piri (`pkg/pdp/aggregation/*`, `pkg/pdp/service/*`, `pkg/pdp/tasks/*`), SP gas budget + sender provisioning |
 | **Contracts referenced** | `PDPVerifier.sol`, `FilecoinWarmStorageService.sol`, `FilecoinPayV1.sol` |
 | **Companion tool** | `pdp-cost-calculator.html` — interactive model of all costs/revenue below |
@@ -16,30 +16,40 @@
 
 > **Read this; §1–§10 are the supporting analysis and §3.1–§3.4 + the Appendices are the gas audit (skim for conclusions).**
 
-**The ask.** Lower Piri's `MinAggregateSize` from `128<<20` to a **configurable ~8 MiB floor**
-(`aggregator/jobqueue.go:190`), keeping aggregation adaptive: any blob ≥ floor becomes its **own**
-on-chain piece (O(1) delete); only sub-floor blobs pool up to the floor. **No smart-contract change
-is required** for the floor itself.
+> **Direction note (updated).** Since this RFC was written, the preferred direction shifted to
+> **no cross-object aggregation** — store each object as its own piece(s) (see the *"Should Piri do
+> cross-object aggregation at all?"* note and `aggregation-gate.md`). This RFC now serves two purposes:
+> it documents the **size-floor fallback** (used if FilOZ confirms the contracts *can't* take the
+> object=piece volume), and it carries the **gas/economics analysis that applies either way** (the
+> floor is just object=piece with a minimum batching size for the sub-floor tail).
 
-**Why 8 MiB.** The cost-optimal piece size ≈ the deletion/object granularity, and the target S3
-objects are ~8 MiB (AWS's default multipart threshold). Smaller wastes registration + churn gas for
-no delete benefit; larger re-introduces the off-chain repack on every partial delete.
+**The ask.** Prefer **no cross-object aggregation** (one object = its own piece(s)); pending FilOZ
+confirmation that the contracts can take that piece volume. The documented **fallback** is to lower
+Piri's `MinAggregateSize` from `128<<20` to a **configurable ~8 MiB floor** (`aggregator/jobqueue.go:190`),
+keeping aggregation adaptive: any blob ≥ floor becomes its **own** on-chain piece (O(1) delete); only
+sub-floor blobs pool up to the floor. **No smart-contract change is required** for either.
+
+**Why 8 MiB (for the floor fallback).** The cost-optimal piece size ≈ the deletion/object granularity,
+and the target S3 objects are ~8 MiB (AWS's default multipart threshold). Smaller wastes registration +
+churn gas for no delete benefit; larger re-introduces the off-chain repack on every partial delete.
 
 **The numbers that matter** (1 PiB @ 8 MiB; measured Foundry gas + calibnet anchors):
 
 | Quantity | Value |
 |---|---|
-| Add a piece | **~120,700 EVM gas, size-independent** (5-gas spread across 32 B–256 MiB) |
-| Delete | standalone **~88,800 gas, O(1)**; from an aggregate `gDel + gAdd` **+ off-chain re-hash** |
-| Batch cap | **~13 pieces/tx** — the PDPVerifier `EXTRA_DATA_MAX_SIZE = 2048` gate binds first ⇒ **~11M `addPieces` txns/PiB** |
-| Fleet | **~12 senders** to onboard in 10 months; **~6** for 10%/mo steady-state churn |
-| Margin | on-chain cost is a rounding error vs storage revenue (**~99%** at ~4 USDFC/TiB/mo) |
+| Add a piece | **~120,700 EVM gas, size-independent** (5-gas spread across 32 B–256 MiB) — needs re-measure on v3.4.0 |
+| Delete | standalone **~88,800 gas, O(1)**; from an aggregate `gDel + gAdd` **+ off-chain re-hash** — needs re-measure |
+| Batch cap | **None at the contract level** (v1.3.0 removed `EXTRA_DATA_MAX_SIZE` / `MAX_ADD_PIECES_EXTRA_DATA_SIZE`); batch size is bound by the FVM `PiecesAdded` event-size + gas, so **pieces/tx is an open measurement** (134.2M pieces/PiB @ 8 MiB is fixed; the txn count is not) |
+| Fleet | Sender-fleet sizing scales with the (now uncapped, measurement-bound) pieces/tx — TBD; throughput, not gas, is the wall |
+| Margin | on-chain *gas* cost is a rounding error vs storage revenue (**~99%** at ~4 USDFC/TiB/mo) |
 
 **The crux facts** (non-obvious and load-bearing):
 
-1. **There is no slashing.** No slash/penalty/collateral/bond logic exists in any contract; a missed
-   proof merely forgoes that period's pay. This makes registration and deletes freely **deferrable to
-   cheap-gas windows** (Piri already gas-gates them) — which is what rescues small pieces on cost.
+1. **There is no slashing.** No proof-slashing exists in any contract; a missed proof merely forgoes
+   that period's pay, nothing is taken from the SP. This makes registration and deletes freely
+   **deferrable to cheap-gas windows** (Piri already gas-gates them) — which is what rescues small pieces
+   on cost. *(One non-slash capital item in v1.3.0: a **0.1 FIL refundable cleanup deposit** posted per
+   dataset at create, reclaimed by the SP on its own teardown — a one-time lock, not a fault penalty.)*
 2. **The real case for small pieces is deletion, not gas dollars.** On-chain *dollar* cost always
    favors *bigger* pieces; small pieces win by avoiding the off-chain aggregate re-hash and the
    `gDel + gAdd` pure-delete asymmetry.
@@ -121,15 +131,15 @@ Audited every loop in `PDPVerifier.sol`, `FilecoinWarmStorageService.sol`, `Simp
 | `provePossession` | **O(5)** = `CHALLENGES_PER_PROOF` |
 | `findOnePieceId`, `sumTreeAdd/Remove` | **O(log cumulative pieces)** (`top = 256 − clz(nextPieceId)`) |
 | `nextProvingPeriod` removals / `schedulePieceDeletions` | **O(removals this period ≤ 2000)** |
-| `deleteDataSet` | **O(1)** (abandons per-piece storage) |
-| Listener `piecesAdded` | **O(batch × metadata keys ≤ 5)** |
+| `deleteDataSet` | **O(1)** to enter cleanup mode; teardown is paginated **O(total pieces)** via `cleanupPieces(setId, maxPieces)` (bounded loop, incentivized by the 0.1 FIL cleanup deposit) |
+| Listener `piecesAdded` | **O(batch × metadata keys ≤ 3)** (`MAX_KEYS_PER_PIECE = 3`, `FilecoinWarmStorageService.sol:220`) |
 | Listener `validatePayment` / `_findProvenEpochs` | **O(proving periods settled)**, not pieces |
 
 The only O(cumulative-piece) loops in the surface are two **`view` getters** — `getActivePieceCount` and `getActivePieces` (scan `[0, nextPieceId)` incl. deleted slots), off-chain `eth_call` only (no block gas). See §7 (Piri's repair path calls them).
 
 ### 3.4 Proving cost rises *slightly* with smaller pieces
 
-Per proof of 5 challenges, each challenge does a **sumtree descent** of `log2(cumulative pieces)` **cold SLOADs** (~2,100 gas each) plus a **Merkle path** of `pieceHeight` **SHA-256** hashes (~84 gas each). Going 256 MiB → 8 MiB at fixed dataset bytes: the Merkle path shrinks ~5 hops but piece count rises 32×, deepening the sumtree ~5 levels — and a cold SLOAD ≫ a SHA-256 precompile, so **proving gets modestly more expensive (~+50k EVM gas/proof, logarithmic)**, not flat/cheaper as an earlier draft claimed. Matches calibnet: `ProvePossession` rose ~120M → ~177M Filecoin gas from 39 → 10,000 pieces; `NextProvingPeriod` stayed flat ~54M; proof fee depends only on bytes. **Caveat:** depth is keyed on `nextPieceId`, which is **monotonic** (incremented at `PDPVerifier.sol:477` in `addOnePiece`, never decremented) — churn ratchets proving cost up permanently.
+Per proof of 5 challenges, each challenge does a **sumtree descent** of `log2(cumulative pieces)` **cold SLOADs** (~2,100 gas each) plus a **Merkle path** of `pieceHeight` **SHA-256** hashes (~84 gas each). Going 256 MiB → 8 MiB at fixed dataset bytes: the Merkle path shrinks ~5 hops but piece count rises 32×, deepening the sumtree ~5 levels — and a cold SLOAD ≫ a SHA-256 precompile, so **proving gets modestly more expensive (~+50k EVM gas/proof, logarithmic)**, not flat/cheaper as an earlier draft claimed. Matches calibnet: `ProvePossession` rose ~120M → ~177M Filecoin gas from 39 → 10,000 pieces; `NextProvingPeriod` stayed flat ~54M; proof fee depends only on bytes. **Caveat:** depth is keyed on `nextPieceId`, which is **monotonic** for a live dataset (incremented at `PDPVerifier.sol:800` in `addOnePiece`; reduced only during `cleanupPieces` dataset teardown) — churn ratchets proving cost up permanently.
 
 ### 3.5 The actual case for small pieces: deletion (off-chain + pure-delete)
 
@@ -151,7 +161,7 @@ This is why the cost-optimal piece sits at **≈ the object/deletion granularity
 
 The SP is not a passive gas payer. Two levers materially change the economics, and a third fact removes a feared penalty.
 
-**No slashing (verified).** `FilecoinWarmStorageService.sol`, `FilecoinPayV1.sol`, and `PDPVerifier.sol` contain **zero** slashing / penalty / collateral / bond logic. `FaultRecord` is an event consumed nowhere. `validatePayment` pays `proposedAmount × provenEpochs / totalEpochs`; faulted periods pay 0. **Missing a proof = the payer keeps that period's money; nothing is taken from the SP.**
+**No slashing (verified, v1.3.0).** `FilecoinWarmStorageService.sol`, `FilecoinPayV1.sol`, and `PDPVerifier.sol` contain **no proof-slashing**: `FaultRecord` (decl `FilecoinWarmStorageService.sol:92`, emit `:978`) is an event consumed nowhere, and `validatePayment` pays `proposedAmount × provenEpochs / totalEpochs` (`:1512`); faulted periods pay 0. **Missing a proof = the payer keeps that period's money; nothing is taken from the SP.** *(Wording note: v1.3.0 does add a **0.1 FIL refundable cleanup deposit** per dataset (`lib/pdp/src/Fees.sol`, posted at `createDataSet`, reclaimed on the SP's own teardown) and uses `forfeit` in abandonment paths — so "zero bond logic" is no longer literally true; the accurate claim is "no proof-slashing," and the deposit is refundable capital, not a fault penalty.)*
 
 **Lever 1 — gate registration to cheap gas.** Registration (`addPieces`) and deletes are **deferrable** (no on-chain deadline). Piri already implements this: a per-message **max-fee cap in wei** (`pdp.gas.max_fee.add_roots` etc.; `sender_eth.go`), defer-and-retry every `retry_wait` (default 5 min), **no penalty, no nonce consumed**. So registration can be priced at `min(prevailing, gate) + premium` — near the floor regardless of how congested the network is for proving. **This is what rescues small pieces on cost:** registration is the deferrable, piece-count-heavy cost, so gating it to the floor neutralizes the base-fee-spike risk. (Defaults are 0 = no gating; operators must set caps.)
 
@@ -163,25 +173,14 @@ The SP is not a passive gas payer. Two levers materially change the economics, a
 
 ## 5. The real wall: transaction throughput, not gas dollars
 
-Because per-piece gas is fixed, smaller pieces mean **more transactions**, and that — not dollars — is the binding constraint.
+Because per-piece gas is fixed, smaller pieces mean **more transactions** — and that, not gas dollars, is the binding constraint. The *magnitude* of that wall, however, is now an open measurement (see the batch-cap note).
 
-- **Batch cap (the binding gate):** the PDPVerifier checks `extraData.length ≤ EXTRA_DATA_MAX_SIZE = 2048`
-  (`PDPVerifier.sol:47`, enforced at `:442`) **before** forwarding `extraData` to the listener's larger
-  `MAX_ADD_PIECES_EXTRA_DATA_SIZE = 8 KiB` (`FilecoinWarmStorageService.sol:39`) — so the deployed
-  verifier reverts above **~13 pieces/tx** (empty metadata), not the ~61 the WSS comment advertises.
-  *The two contracts disagree: the WSS comment is unaware of the verifier's 2048 gate. Raising the cap
-  is the highest-leverage throughput lever, but it requires a **PDPVerifier upgrade** (§9), not just a WSS change.*
-- **Registration tx count:** 1 PiB at 8 MiB = 134.2M pieces ⇒ **~10.3M `addPieces` txns** (~11M; ~4.7× the
-  ~2.2M a 61-piece batch would give).
+- **Batch cap — there isn't one at the contract level (changed).** PDPVerifier v3.4.0 removed `EXTRA_DATA_MAX_SIZE` and FWSS v1.3.0 removed `MAX_ADD_PIECES_EXTRA_DATA_SIZE`; `addPieces` does no extraData length check, and the FWSS listener notes (`FilecoinWarmStorageService.sol:760`) that *"PDPVerifier currently hits the FVM PiecesAdded event size limit before FWSS needs a byte cap."* So the binding limit is the **FVM `PiecesAdded` event-size limit + per-tx gas** — a protocol constraint, not a tunable constant — and the **maximum pieces/tx is an open empirical question** (needs an FVM/Foundry measurement against the current per-piece extraData ABI), not a fixed number. *(An earlier draft modeled a 2048-byte verifier cap ⇒ ~13 pieces/tx; that constant no longer exists, so those figures and everything derived from them are withdrawn pending re-measurement.)*
+- **Registration tx count:** 1 PiB at 8 MiB = **134.2M pieces** (pure arithmetic, unchanged). The `addPieces` transaction count = pieces ÷ pieces-per-tx, and since pieces-per-tx is now event-size/gas-bound rather than capped, the txn count is **pending measurement**, not a settled figure.
 - **Submission capacity:** ~1 tx per 30 s block ≈ **120 tx/hr per sender address** (~1.05M txns/yr); parallelize with multiple senders to multiply it.
-- **Onboarding feasibility:** a 10-month onboard of 1 PiB at 8 MiB needs ≥ **~1,400 tx/hr (~12 senders)** for registration alone.
-- **Churn throughput (often missed):** 10%/mo churn on 8 MiB pieces of a PiB ≈ **161M events/yr**. Under
-  the calculator's default **50% replace / 50% delete** mix (deletes enqueued ≤ 2000/period; re-adds at
-  ~13 pieces/tx and dominating) ⇒ **~6.2M txns/yr** (swings ~0.08M all-delete to ~12M all-replace) —
-  roughly **6× one sender's ~1.05M txns/yr**. Real provisioning must cover onboarding **and** churn —
-  on the order of **~12 sender addresses during onboarding, ~6 for steady-state churn**.
+- **Onboarding & churn:** the sender-fleet sizing for a given onboard window — and for steady-state churn (10%/mo on a PiB ≈ **161M events/yr**, re-add-dominated) — both scale with pieces-per-tx. With the cap removed and that count unmeasured, we can't yet size the fleet; what's robust is the *shape* — throughput, not gas dollars, is the wall, and smaller pieces push it harder.
 
-**Onboarding is a revenue ramp.** Onboarding time = how fast data *arrives* (demand), independent of the node. Revenue accrues on the **growing registered base**: `actual onboarding = max(arrival time, capacity-limited time)`. If throughput can't keep up, onboarding stretches and the delayed data forgoes revenue — captured directly as a smaller revenue ramp (see the calculator's time chart), not a bolted-on penalty. Even a *feasible* 10-month / ~12-sender ramp forgoes a meaningful slice of first-year revenue simply because data earns as it lands, not from day 0.
+**Onboarding is a revenue ramp.** Onboarding time = how fast data *arrives* (demand), independent of the node. Revenue accrues on the **growing registered base**: `actual onboarding = max(arrival time, capacity-limited time)`. If throughput can't keep up, onboarding stretches and the delayed data forgoes revenue — captured directly as a smaller revenue ramp (see the calculator's time chart), not a bolted-on penalty.
 
 ---
 
@@ -191,29 +190,29 @@ With capex/power/hardware excluded (marginal on-chain margin):
 
 - **Revenue is identical for every piece size** (it depends only on dataset size × storage price × time). So the profit-optimal piece = the cost-optimal piece = ≈ object size.
 - **Profitability is gated by base fee × storage price, not piece size.** At near-floor base fee, registering a billion pieces costs single-digit dollars; piece size changes profit by *cents* on tens of thousands. At elevated base fee, *ungated* registration of small pieces can exceed revenue — but Lever 1 (gating) neutralizes that.
-- **Worked target** (1 PiB, 8 MiB, base fee 2500, storage ~4 USDFC/TiB/mo, ~12 senders): feasible onboarding, **~99% margin** (on-chain cost rises ~4.7× with the corrected ~13-piece batch but is still low-thousands of dollars against tens of thousands of revenue). The same scenario at **one sender** is badly throughput-bound — registration alone takes **~9.8 years** (~3,600 d) — so onboarding is entirely capacity-limited and most first-year revenue is forgone via the ramp.
+- **Worked target** (1 PiB, 8 MiB, base fee 2500, storage ~4 USDFC/TiB/mo): the on-chain *gas* margin is ~99% at any plausible pieces/tx — gas cost is a rounding error against storage revenue, and registration is gas-gatable. What's no longer quantifiable until pieces/tx is measured is the *throughput*-bound onboarding time and the sender count: a small fleet onboards comfortably and a single sender is throughput-bound, but the exact figures wait on the FVM event-size/gas measurement (the earlier 2048-cap math is withdrawn).
 
-The contract's storage-price default is **2.5 USDFC/TiB/mo** (`FilecoinWarmStorageService.sol:425`, `(5 × 10^dec)/2`); realistic targets are 2–10. Use the calculator to set your point.
+The contract's storage price is **2.5 USDFC/TiB/mo** — now an **immutable** constant `STORAGE_PRICE_PER_TIB_PER_MONTH` (`lib/PriceListUSDFC.sol:19`, `(5 × 10^18)/2`); the owner-mutable pricing API was removed, so changes ship via contract upgrade (read it via `FilecoinWarmStorageServiceStateView.getPriceList()`). Realistic targets are 2–10. Note v1.3.0 also adds a flat **0.024 USDFC/mo per-dataset** fee (Appendix C), so revenue is no longer purely size × price × time. Use the calculator to set your point.
 
 ---
 
 ## 7. Proposal
 
-1. **Set the minimum piece size to the typical deletion/object granularity; default 8 MiB** for the current ~8 MiB-object workload. Change `MinAggregateSize` (`piri/pkg/pdp/aggregation/aggregator/jobqueue.go:190`) from `128<<20` to the floor, and fix the comment block (`:185–190`) that hard-assumes 128/256 MiB.
+1. **Target: no cross-object aggregation** (one object = its own piece(s)), pending FilOZ confirmation the contracts can take the piece volume; add a generational background aggregator as the optional relief valve for root-count. **Fallback: a size floor** — set the minimum piece size to the typical deletion/object granularity, default 8 MiB. Change `MinAggregateSize` (`piri/pkg/pdp/aggregation/aggregator/jobqueue.go:190`) from `128<<20` to the floor, and fix the comment block (`:185–190`) that hard-assumes 128/256 MiB.
 2. **Make aggregation adaptive** (mostly already true): blobs ≥ floor → own piece (O(1) deletion); sub-floor blobs aggregate up to the floor. `jobqueue.go:205` (`AggregatePiece`) already submits a piece standalone when its padded size **exceeds** the floor — note the test is a strict `>`, so a blob *exactly* equal to the floor still aggregates; word the policy accordingly.
 3. **Keep per-piece metadata empty** (`roots_add.go:421–424`) to preserve the `extraData`/batch budget.
-4. **Keep `BatchSize` at/just under the real cap (~13), not ~50.** The binding gate is the PDPVerifier's `EXTRA_DATA_MAX_SIZE = 2048` (~13 pieces/tx, empty metadata) — **not** the WSS 8 KiB. The current default `BatchSize = 10` is already just under it; **raising toward 50 would make `addPieces` revert** at the verifier. Add an explicit guard against the 2048 cap; adding per-piece metadata lowers the limit further. (Lifting the cap requires a PDPVerifier upgrade — §9.)
-5. **Provision sender parallelism for throughput** — size the number of sender addresses to cover onboarding **and** steady-state churn (target ~12 senders during onboarding and ~6 for steady-state 10% churn of 1 PiB @ 8 MiB). This is the binding constraint, not gas dollars.
+4. **Bound `BatchSize` by the FVM event-size + per-tx gas, and measure it.** There is no longer a contract `extraData` cap (PDPVerifier removed `EXTRA_DATA_MAX_SIZE`, FWSS removed `MAX_ADD_PIECES_EXTRA_DATA_SIZE`), so `addPieces` won't revert on batch size — the limit is the FVM `PiecesAdded` event-size + gas. The current default `BatchSize = 10` is safely within that; pick the production value from a measured per-tx ceiling rather than a constant.
+5. **Provision sender parallelism for throughput** — size the number of sender addresses to cover onboarding **and** steady-state churn. This is the binding constraint, not gas dollars; the exact count scales with the (now measurement-bound) pieces-per-tx, so size it once that's measured.
 6. **Configure registration gas-gating** (`pdp.gas.max_fee.add_roots`) so registration/deletes ride cheap-gas windows; leave proving ungated (or capped high enough to always land in-window).
 
-**No contract change required.** (One optional contract lever in §9.)
+**No contract change required.**
 
 ---
 
 ## 8. Caveats, risks, and mitigations
 
-1. **Throughput is the primary constraint.** ~10.3M registration txns for 1 PiB @ 8 MiB (at the real ~13-piece batch cap); gate-induced low duty-cycle further limits the achievable rate. **Mitigation:** sender parallelism (§7 item 5); model it in the calculator's throughput/latency view.
-2. **Churn throughput** (often missed): high churn on small pieces generates large *ongoing* tx volume (≈6.2M txns/yr at 10% churn, 50/50 replace/delete) that exceeds several senders. **Mitigation:** size senders for churn too; batch deletes (up to `MAX_ENQUEUED_REMOVALS = 2000`/period).
+1. **Throughput is the primary constraint.** Registration is one `addPieces` tx per batch; with the contract `extraData` cap removed (v1.3.0), the batch size — and thus the txn count for 1 PiB @ 8 MiB — is bound by the FVM event-size + gas and needs measurement. Gate-induced low duty-cycle further limits the achievable rate. **Mitigation:** sender parallelism (§7 item 5); model it in the calculator once pieces/tx is measured.
+2. **Churn throughput** (often missed): high churn on small pieces generates large *ongoing* tx volume (re-add-dominated; ≈161M events/yr at 10% churn on a PiB) that can exceed several senders. **Mitigation:** size senders for churn too; batch deletes (up to `MAX_ENQUEUED_REMOVALS = 2000`/period).
 3. **Monotonic `nextPieceId` ratchet.** Sumtree depth and view-getter cost grow with cumulative adds and never shrink on deletion; high churn drifts proving up logarithmically. **Mitigation:** periodically rotate to a fresh dataset for extreme-churn sets.
 4. **O(cumulative) view getters** (`getActivePieceCount`/`getActivePieces`): Piri's repair path (`proofset_repair.go`) walks these via `eth_call` and gets ~32× slower. **Mitigation:** use Piri's local DB as the enumeration source of truth.
 5. **Proving cost up slightly** (§3.4), ~+50k EVM gas/proof vs 256 MiB; small but real and persistent.
@@ -232,7 +231,7 @@ None of these is a hidden per-live-piece loop; all are bounded (O(batch), O(remo
 | **Match piece = object size (this RFC)** | Profit-optimal under churn: no repack, minimal registration. 8 MiB for ~8 MiB objects. |
 | **Smaller than object (1–4 MiB for 8 MiB objects)** | Strictly worse: more registration *and* more churn gas, more txns, for no deletion benefit. |
 | **Larger than object (16–256 MiB)** | Cheaper registration/fewer txns, but re-introduces off-chain repack on every sub-piece delete. A fallback if throughput is the dominant pain and deletes are rare. |
-| **Raise the verifier's `EXTRA_DATA_MAX_SIZE`** (2048, the binding gate — and the WSS `MAX_ADD_PIECES_EXTRA_DATA_SIZE` to match) | The one *contract* lever that directly relieves the throughput wall (more pieces/tx → fewer txns; ~13 → higher). Highest-leverage change if small pieces at PiB scale become routine. Requires a **PDPVerifier upgrade**. |
+| **The batch cap is already gone (v1.3.0)** | The contract `extraData` cap that throttled batch size (`EXTRA_DATA_MAX_SIZE` / `MAX_ADD_PIECES_EXTRA_DATA_SIZE`) was removed in PDPVerifier v3.4.0 / FWSS v1.3.0, so "many pieces/tx" is no longer contract-throttled. The remaining throughput ceiling is the FVM `PiecesAdded` event-size + per-tx gas — a protocol-level limit, not a service-contract lever to pull. |
 
 ---
 
@@ -242,7 +241,7 @@ None of these is a hidden per-live-piece loop; all are bounded (O(batch), O(remo
 2. **Sender-parallelism budget** — how many sender addresses ops will run; this, not gas, decides PiB-scale feasibility.
 3. **Churn rate and delete-vs-replace mix** — drives ongoing throughput and the off-chain repack exposure.
 4. **Should the floor be per-SP / per-dataset configurable** rather than one global constant?
-5. **Is the verifier's `EXTRA_DATA_MAX_SIZE`** (2048, the binding ~13-piece/tx gate) **worth raising** to relieve the throughput wall at scale (a PDPVerifier upgrade)?
+5. **What is the measured pieces-per-tx** under the FVM `PiecesAdded` event-size + gas limit (now that the contract `extraData` cap is gone)? This sets the real registration-throughput ceiling and the sender-fleet sizing.
 
 ---
 
@@ -282,13 +281,16 @@ on the proposal does not need to read them.
 
 | Constant | Value | Location |
 |---|---|---|
-| `CHALLENGES_PER_PROOF` | 5 | `FilecoinWarmStorageService.sol:26` |
-| `MAX_ENQUEUED_REMOVALS` | 2000 | `PDPVerifier.sol:45` |
-| `MAX_PIECE_SIZE_LOG2` | 50 | `PDPVerifier.sol:44` |
-| `EXTRA_DATA_MAX_SIZE` (**binding** batch gate) | 2048 B (~13 pieces/tx, empty metadata) | `PDPVerifier.sol:47` (checked in `addPieces` at `:442`) |
-| `MAX_ADD_PIECES_EXTRA_DATA_SIZE` (WSS listener) | 8 KiB (comment claims ~61/tx, but the 2048 verifier gate binds first) | `FilecoinWarmStorageService.sol:39` |
-| `maxProvingPeriod` / `challengeWindowSize` | 2880 epochs (~1 day) / 60 (mainnet, also `SimplePDPService` default), 20 (calibnet), 10 (devnet) | `initialize` / deploy scripts |
-| `storagePricePerTibPerMonth` (default) | 2.5 USDFC (`(5×10^dec)/2`; realistic 2–10) | `FilecoinWarmStorageService.sol:425` |
+| `CHALLENGES_PER_PROOF` | 5 | `FilecoinWarmStorageService.sol:42` |
+| `MAX_ENQUEUED_REMOVALS` | 2000 | `PDPVerifier.sol:48` |
+| `MAX_PIECE_SIZE_LOG2` | 50 | `PDPVerifier.sol:47` |
+| `MAX_KEYS_PER_PIECE` / per-dataset key cap | 3 / 10 | `FilecoinWarmStorageService.sol:220` / `:219` |
+| addPieces batch cap | **removed in v1.3.0** (`EXTRA_DATA_MAX_SIZE` and `MAX_ADD_PIECES_EXTRA_DATA_SIZE` deleted); batch bound by FVM `PiecesAdded` event-size + gas | — |
+| Surviving extraData caps (other ops) | `MAX_CREATE_DATA_SET_EXTRA_DATA_SIZE` 4096 / `MAX_SCHEDULE_PIECE_REMOVALS_EXTRA_DATA_SIZE` 256 / `MAX_TERMINATE_SERVICE_EXTRA_DATA_SIZE` 256 | `FilecoinWarmStorageService.sol:51,:57,:63` |
+| `maxProvingPeriod` / `challengeWindowSize` (per network, init args not constants) | 2880/60 (mainnet), 240/20 (calibnet), 120/10 (devnet) | `tools/warm-storage-deploy-all.sh:56–75`; init `:404–405` |
+| `STORAGE_PRICE_PER_TIB_PER_MONTH` (immutable; upgrade-only) | 2.5 USDFC (`(5×10^18)/2`; realistic 2–10) | `lib/PriceListUSDFC.sol:19` |
+| USDFC fee layer (v1.3.0, new) | per-dataset 0.024/mo; create 0.025; add-pieces 0.0005 + 0.0003/piece; remove 0.002; terminate 0.00112; lifecycle reserve 0.10 | `lib/PriceListUSDFC.sol` |
+| Cleanup deposit (refundable, FIL) | 0.1 FIL per dataset at `createDataSet` | `lib/pdp/src/Fees.sol` |
 | `MinAggregateSize` (Piri, **to change → floor, e.g. 8<<20**) | 128 MiB | `aggregator/jobqueue.go:190` |
 | `MaxMemtreeSize` (Piri, upload max) | 256 MiB | `proof/proof.go:114` |
 | Piri input floor (`PaddedSize`) | 128 B | `aggregate.go:49` |

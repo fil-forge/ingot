@@ -30,43 +30,46 @@ re-index. For a mutate/delete workload — i.e. S3 — that survivor re-hash is 
 tuning of the current target *size* fixes it: the bytes of unrelated objects are entangled in the same
 on-chain piece.
 
-## The model that fixes it: a floor / ceiling band
+## The model that fixes it: one object = one piece (no cross-object aggregation)
 
-Two size knobs replace "size-pool everything" — the same knobs the
-[architecture](./architecture.md) and [RFC](./rfc-pdp-minimum-piece-size.md) describe, just with
-`MinAggregateSize` lowered:
+The proposal is to **stop pooling unrelated objects into shared pieces** and store each S3 object as
+its own content-addressed blob(s): one on-chain piece if it fits under a ceiling, a handful of
+*object-owned* pieces if it's larger (split at the proving-code ceiling — Piri's `MaxMemtreeSize`,
+256 MiB today and liftable; per-part for multipart, which keeps us compatible with the encryption RFC's
+per-part envelopes). **A piece belongs to exactly one object.** Then:
 
-- **`min_aggregate_size` (floor, ~8 MiB).** Any blob **≥ floor** becomes its **own** on-chain piece,
-  so deleting it removes a whole piece (O(1)) with no survivors to re-hash. Any blob **< floor** joins
-  a **cross-object** sub-floor aggregate built up to the floor — but **lazily**: never repacked on
-  delete; dead bytes linger and compact periodically (or never). They are cheap bytes.
-- **`max_blob_size` (ceiling, target several GiB).** The largest blob Piri stores; an object larger
-  than the ceiling is **split** by the data layer into a handful of ≤ ceiling blobs — each, being
-  ≥ floor, its own piece. (A multipart object is likewise stored as its part-blobs, each ≥ floor and
-  thus its own piece — N standalone pieces, not one.)
+- **Deletion is O(1) per object, always** — retire the object's own piece(s); no survivors to re-hash,
+  no compaction, no SLA window to chase. The entire "compact the cross-object tail" problem disappears.
+- The only aggregation left is an **optional, generational** relief valve: a background process that
+  combines *old, cold* pieces (unlikely to be deleted) to keep the proving-root count down — it rarely
+  triggers a repack precisely because it only touches the cold set.
 
-The pivot is **lowering the floor to ≈ object size.** Most S3 objects land **≥ floor**, so an object
-becomes one (or a few) **standalone** piece(s) — deleting it removes whole pieces with no survivors,
-no re-hash, no re-index. The only aggregation that survives is the **cross-object sub-floor tail**, and
-lazy compaction keeps even that off the churn path. Deletion goes from "the dominant cost" to "O(1)
-for the bulk, deferred for the tail." Note this is *not* a new "group an object's parts together"
-primitive — Piri's aggregator is already size-driven; the change is the floor value plus a lazy
-sub-floor compaction path.
+**The catch — and the real reason this is a gate.** Object=piece *maximizes* piece count, so it only
+works if the PDP contracts and proving can take that volume in practice; we have never actually asked
+FilOZ. **If the contracts can take it**, we drop cross-object aggregation and this is dramatically
+simpler. **If they can't**, we fall back to a **size floor** (`min_aggregate_size`, e.g. 8 MiB): blobs
+≥ floor are their own piece, only the sub-floor tail pools — the model the
+[architecture](./architecture.md) and [RFC §7](./rfc-pdp-minimum-piece-size.md) document as the
+fallback. So the floor stays specified, but as the fallback, not the default. (This is not a new
+"group an object's parts" primitive either — Piri's aggregator is already size-driven; object=piece
+mostly means *not* aggregating across objects.)
 
 ## The two asks
 
-**1 — Rethink Piri's aggregation strategy.** Lower `MinAggregateSize` from 128 MiB to a configurable
-~8 MiB floor (per-SP / per-dataset), keeping aggregation adaptive: blobs ≥ floor become their own
-piece, only the sub-floor tail pools — and **lazily** (never repacked on delete). The RFC §7 carries
-the spec. This is mostly a constant change plus a lazy-compaction path — Piri's aggregator is already
-size-driven — not a new grouping primitive.
+**1 — Rethink Piri's aggregation strategy.** The target is **no cross-object aggregation** (object =
+piece), with a generational background aggregator as the optional relief valve for root-count/throughput,
+and the size floor (`MinAggregateSize` lowered to a configurable ~8 MiB) as the **fallback** if the
+contracts can't take the piece volume. RFC §7 carries both. Piri's aggregator is already size-driven,
+so the floor-fallback is a small change; the object=piece target mostly means *not* aggregating across
+objects.
 
 **2 — Prove small pieces are viable in the PDP contracts, at scale.** The RFC's *measured* gas already
 shows the **economics** hold (registration linear, proving logarithmic, proof-fee size-neutral,
 **no slashing**, registration gas-gatable). The remaining proof is **operational** — that Piri can
 *register, prove, and delete* sub-256-MiB pieces routinely at PiB scale:
-- **throughput** — ~11M `addPieces` txns per PiB at 8 MiB (the deployed verifier's ~13-piece/tx cap,
-  not the 61 a naïve reading of the WSS limit suggests) ⇒ a sender fleet (the binding constraint);
+- **throughput** — 1 PiB @ 8 MiB = 134.2M pieces, and the `addPieces` batch is no longer contract-capped
+  (FWSS v1.3.0 removed the `extraData` cap), so the txn count — and the sender fleet it implies — is bound
+  by the FVM `PiecesAdded` event-size + per-tx gas and is an open measurement (the binding constraint);
 - **the delete path is real end-to-end** — the contract accepts pieces down to 32 B, but Piri's
   whole-root delete (`schedulePieceDeletions`) is **wired but unsigned today** — it needs its
   extraData signature finished and exercised;
@@ -100,8 +103,9 @@ become measured, not guessed.
 1. **De-risk Ask 2 first** (a scaled small-piece register→prove→delete proof-of-capability + finish
    the `schedulePieceDeletions` signature). It is the cheapest way to find out if the whole approach
    is dead on arrival.
-2. **Spec + build Ask 1** (configurable ~8 MiB floor + ceiling + lazy sub-floor compaction) in Piri,
-   per a refined RFC §7.
+2. **Spec + build Ask 1** — object=piece (no cross-object aggregation) as the target, generational
+   aggregation as the relief valve, the size floor + ceiling as the fallback — in Piri, per a refined
+   RFC §7.
 3. **Instrument** object-size/lifespan/multipart/churn in Ingot to tune the floor/ceiling and size
    the sender fleet.
 4. Only then is the Ingot S3 architecture executable as written.

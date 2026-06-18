@@ -56,7 +56,7 @@
   <input id="filPrice" type="number" value="1" step="0.1">
   <label>Storage price you charge (USDFC / TiB / month) — revenue<span class="info" data-tip="Revenue side. What the client pays you per TiB per month (USDFC ≈ USD). Revenue = price × data size × proven time, and is IDENTICAL for every piece size. Contract default 2.5 USDFC; realistic targets 2 to 10.">i</span></label>
   <input id="storPrice" type="number" value="4.99" step="0.1">
-  <div class="note">Contract default is 2.5 USDFC/TiB/mo (<code>FilecoinWarmStorageService.sol:425</code>). USDFC ≈ USD. Revenue = this × dataset size × horizon; capex/power/hardware ignored per request.</div>
+  <div class="note">Contract price is 2.5 USDFC/TiB/mo, now an immutable constant <code>lib/PriceListUSDFC.sol:19</code> (upgrade-only). USDFC ≈ USD. Revenue = this × dataset size × horizon; capex/power/hardware ignored. <b>Note (v1.3.0):</b> this model omits the new USDFC fee layer — a flat 0.024/mo per-dataset fee, 0.0003/piece add-fee, and op fees — which slightly reduces margin and makes multi-dataset sharding non-free.</div>
   <label>Prevailing base fee (attoFIL / gas) — used for proving (can't be gated)<span class="info" data-tip="Filecoin per-gas burn price (attoFIL/gas), EIP-1559 style. Applies to PROVING, which runs on schedule and cannot wait for cheap gas. Floor is 100; spikes to 1e9 to 3e10 under PoRep congestion. The dominant gas-cost lever.">i</span></label>
   <input id="baseFee" type="number" value="2500" step="1">
   <div class="grp">
@@ -107,7 +107,7 @@
     <summary>Protocol parameters (contract defaults)</summary>
     <label>Proving period length (hours)</label><input id="periodH" type="number" value="24" step="1">
     <label>Batch size (pieces / addPieces tx)</label><input id="batch" type="number" value="13" step="1">
-    <div class="note">The binding gate is the PDPVerifier <code>EXTRA_DATA_MAX_SIZE=2048</code> (checked before the WSS 8&nbsp;KiB limit) ⇒ ~13 pieces/tx (no metadata). Lifting it needs a PDPVerifier upgrade.</div>
+    <div class="note"><b>Placeholder — needs measurement.</b> FWSS v1.3.0 / PDPVerifier v3.4.0 <b>removed</b> the <code>EXTRA_DATA_MAX_SIZE</code> / <code>MAX_ADD_PIECES_EXTRA_DATA_SIZE</code> batch caps; the limit is now the FVM <code>PiecesAdded</code> event-size + per-tx gas. The real pieces/tx is an empirical (Foundry/FVM) number — set this from a measurement, not a constant. 13 is a leftover placeholder.</div>
     <label>Max pieces per dataset (sharding; proving is per-dataset)</label><input id="maxPerDS" type="number" value="1000000000000" step="1000000">
     <label>Proof fee rate (FIL / TiB / proof)</label><input id="feePerTiB" type="number" value="0.00023" step="0.00001">
     <label>Sybil fee (FIL / dataset, one-time)</label><input id="sybil" type="number" value="0.1" step="0.01">
