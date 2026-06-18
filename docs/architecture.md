@@ -4,11 +4,12 @@ How Ingot stores S3 objects on the Forge network: the layers it is built from, t
 and the flows that move bytes through it. This is the target architecture; it supersedes the
 bootstrap MVP that currently lives in the tree.
 
-Companion docs: [`DESIGN_NOTES.md`](./DESIGN_NOTES.md) (orientation),
-[`logstore/README.md`](./logstore/README.md) (the catalog log internals),
-and `docs/rfc-pdp-minimum-piece-size.md` in the sibling **`fil-forge/filecoin-services`** repo — the
-measured PDP gas model behind the size knobs (its headline figures are inlined in
-[§2](#2-background--forces) / [§6](#6-the-forgechain-layer)).
+Companion docs (this directory): [`aggregation-gate.md`](./aggregation-gate.md) — why this S3 design
+is gated on Piri's aggregation; [`rfc-pdp-minimum-piece-size.md`](./rfc-pdp-minimum-piece-size.md) —
+the measured PDP gas model behind the size knobs (headline figures inlined in
+[§2](#2-background--forces) / [§6](#6-the-forgechain-layer)); and its
+[`pdp-cost-calculator.html`](./pdp-cost-calculator.html). The catalog-log internals live in the
+[`logstore`](../logstore) package.
 
 ---
 
@@ -313,8 +314,9 @@ small `min` means most objects are their own piece, so most deletes are O(1) (be
 more pieces — more `addPieces` transactions, a one-time registration tax, and an O(log) proving
 ratchet under churn — all bounded, none a per-live-piece cost. The RFC's proposed knee is **8 MiB**
 (with 16–32 MiB as a fallback if transaction count or base-fee spikes bite). The aggregator keeps
-aggregates `≤ max`, and the batch submitter respects the contract's ~8 KiB `extraData` cap
-(~61 pieces/tx).
+aggregates `≤ max`, and the batch submitter respects the contract's `extraData` cap — the binding
+gate is the PDPVerifier's `EXTRA_DATA_MAX_SIZE` = 2048 B (~13 pieces/tx), not the larger WSS limit
+(gas RFC).
 
 > **Design decision (for review).** `min`/`max` are the central knobs: `min` trades on-chain piece
 > count (transactions, the one-time registration tax, the proving ratchet) against deletion
@@ -488,7 +490,7 @@ negotiations).
 | Ingot-timed accept (PUT a part, defer the conclude until Complete)                             | Ingot + Sprue                   | **partial**  | Accept already fires on the client's conclude; needs the park-vs-conclude split client-side and a separable Sprue conclude. Ingot does **not** issue `accept` (Piri requires the upload-service DID).               |
 | `unallocate(digest)` — drop a parked blob                                                      | Piri + Sprue + libforge         | **to-build** | `blob/remove` arg type exists in libforge; no handler.                                                                                                                                                              |
 | `remove(digest)` — per-space claim release; physical delete/piece-retire at zero global claims | Piri + Sprue + libforge         | **to-build** | Piri keeps per-`(digest,space)` allocation rows to count on.                                                                                                                                                        |
-| Configurable, adaptive size policy (`min`/`max`); batch guard for the `extraData` cap          | Piri                            | **partial**  | `MinAggregateSize` is hardcoded 128 MiB; lower to ~8 MiB and make configurable; raise `BatchSize`≈50 (a deliberate margin below the ~61-piece `extraData` cap) with the ~8 KiB guard (gas RFC). No contract change. |
+| Configurable, adaptive size policy (`min`/`max`); batch guard for the `extraData` cap          | Piri                            | **partial**  | `MinAggregateSize` is hardcoded 128 MiB; lower to ~8 MiB and make configurable; the binding `extraData` cap is the PDPVerifier `EXTRA_DATA_MAX_SIZE`=2048 (~13 pieces/tx), so keep `BatchSize` ≤ ~13 (default 10 already complies) with an explicit 2048 guard (gas RFC). No contract change (lifting the cap itself needs a PDPVerifier upgrade). |
 | Compaction (Regime B) + complete the on-chain delete signature                                 | Piri                            | **partial**  | Whole-root delete is wired but its `extraData` signature is incomplete; compaction (remove + re-hash survivors + re-add) is new.                                                                                    |
 | De-dup at accept (don't re-aggregate a digest already a live piece)                            | Piri                            | **to-build** | Backstops one-piece-per-content once accept timing is Ingot-driven.                                                                                                                                                 |
 | Parked-allocation GC + honor `Expires`                                                         | Piri                            | **to-build** | Bounds leakage when an abort never arrives.                                                                                                                                                                         |
@@ -599,7 +601,7 @@ The MVP this supersedes had six structural problems; each is resolved by a layer
 The relational tables the design relies on. Object **manifests** and **MST nodes** are not rows here —
 they are content-addressed dag-cbor *blocks* in the catalog plane ([§4](#4-the-catalog-layer)). The catalog plane's CAR
 **segment** metadata and per-operation **op-roots** (which advance `buckets.forge_root_cid` on ship)
-are owned by `logstore` and documented in [`logstore/README.md`](./logstore/README.md); they are not
+are owned by the [`logstore`](../logstore) package; they are not
 redefined here. CIDs and blob digests (sha256 multihashes) are stored as `bytea`, matching today's
 `ingot` schema (`migrations/sql/*.sql`).
 
