@@ -97,7 +97,7 @@ The design is shaped by how the Forge upload pipeline works and by a handful of 
 
 ## 3. The S3 layer
 
-Ingot implements the versitygw `backend.Backend`. It presents standard S3 semantics; the
+Ingot implements the [versitygw](https://github.com/versity/versitygw/) `backend.Backend`. It presents standard S3 semantics; the
 non-obvious parts:
 
 **Versioning.** Buckets carry a versioning state — `Unversioned` (default), `Enabled`, or
