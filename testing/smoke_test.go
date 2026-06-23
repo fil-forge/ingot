@@ -85,12 +85,29 @@ func TestSmoke_HeadBucket(t *testing.T) {
 }
 
 func TestSmoke_ListBuckets(t *testing.T) {
+	// ListBuckets_success, ListBuckets_truncated and ListBuckets_with_prefix
+	// are intentionally omitted: they're non-deterministic against ingot and
+	// belong in neither the known-passing nor the XFail set.
+	//
+	// Each builds its expected slice in bucket-*creation* order and then
+	// compares it positionally (compareBuckets) against the ListBuckets
+	// response. ingot returns buckets in lexicographic order — the correct S3
+	// contract, matching versitygw's own posix backend (os.ReadDir sorts by
+	// name) and AWS's paginated ListBuckets (which the truncated case drives
+	// via MaxBuckets/ContinuationToken). The two orderings agree only while a
+	// case's bucket names stay the same width.
+	//
+	// Upstream names buckets "test-bucket-N" from a process-global counter, so
+	// the offset at which these cases run depends on how many getBucketName()
+	// calls preceded them. Under `go test -shuffle` (enabled by the CI Go-test
+	// workflow) that offset is random, so the names straddle a digit-width
+	// boundary (e.g. ...-9 -> ...-10, sorting as 10,11,6,7,8,9) only on some
+	// runs — which is why the cases passed on some OSes/seeds and failed on
+	// others. They can be restored once the upstream comparison is made
+	// order-independent.
 	tests := []smokeCase{
 		{"empty_success", integration.ListBuckets_empty_success},
 		{"invalid_max_buckets", integration.ListBuckets_invalid_max_buckets},
-		{"success", integration.ListBuckets_success},
-		{"truncated", integration.ListBuckets_truncated},
-		{"with_prefix", integration.ListBuckets_with_prefix},
 	}
 	s3conf := newS3Conf(smokeHarness(t).Config())
 	for _, tt := range tests {
