@@ -65,12 +65,12 @@ type OpStaging struct {
 
 // isDataBlock reports whether a block belongs to the data plane.
 //
-// INVARIANT: the data plane is exactly the raw-codec leaf blocks the
-// body codec emits (bucket.FixedChunker.putRawBlock uses cid.Raw);
-// everything else — ObjectManifests, FixedChunkerIndex docs, MST
-// nodes — is dag-cbor and belongs to the catalog plane. If a future
-// body codec emits non-raw body DAG nodes, this seam must be replaced
-// with an explicit per-write kind rather than a codec sniff.
+// INVARIANT: the data plane is exactly the raw-codec body blobs the
+// body codec emits (bucket.BlobSplitter.putRawBlock uses cid.Raw);
+// everything else — ObjectManifests, MST nodes — is dag-cbor and
+// belongs to the catalog plane. If a future body codec emits non-raw
+// body DAG nodes, this seam must be replaced with an explicit per-write
+// kind rather than a codec sniff.
 func isDataBlock(c cid.Cid) bool {
 	return c.Prefix().Codec == cid.Raw
 }

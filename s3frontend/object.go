@@ -61,6 +61,7 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 			ContentType:        contentType,
 			Created:            time.Now().Unix(),
 			Body:               bodyRec,
+			ETag:               hex.EncodeToString(bodyRec.MD5),
 			ContentEncoding:    backend.GetStringFromPtr(input.ContentEncoding),
 			ContentDisposition: backend.GetStringFromPtr(input.ContentDisposition),
 			ContentLanguage:    backend.GetStringFromPtr(input.ContentLanguage),
@@ -452,17 +453,17 @@ func (b *Backend) lookupManifest(ctx context.Context, bucketName, key string) (*
 	return &mf, nil
 }
 
-// etagOf returns the manifest's single-part S3 ETag: the hex md5 of
-// the body, double-quoted per the wire format. Falls back to the body
-// sha256 for any legacy manifest written before MD5 was tracked.
-// Multipart-style ETags ("<md5>-<N>") are out of scope until multipart
-// is implemented.
+// etagOf returns the manifest's S3 ETag, double-quoted per the wire
+// format. The ETag is stored verbatim on the manifest (hex md5 for a
+// single-part object; "<md5-of-md5s>-<N>" for a multipart object, which
+// cannot be re-derived from the body bytes). Falls back to the body md5
+// for any manifest written without a stored ETag.
 func etagOf(mf *msbucket.ObjectManifest) string {
-	sum := mf.Body.MD5
-	if len(sum) == 0 {
-		sum = mf.Body.SHA256
+	tag := mf.ETag
+	if tag == "" {
+		tag = hex.EncodeToString(mf.Body.MD5)
 	}
-	return `"` + hex.EncodeToString(sum) + `"`
+	return `"` + tag + `"`
 }
 
 // strPtrOrNil returns a pointer to s, or nil when s is empty, so empty

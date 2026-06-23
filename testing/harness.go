@@ -51,15 +51,15 @@ type Harness struct {
 type HarnessOption func(*harnessOptions)
 
 type harnessOptions struct {
-	logger     *zap.Logger
-	region     string
-	accessKey  string
-	secretKey  string
-	chunkSize  int64
-	sealBytes  int64
-	sealAge    time.Duration
-	retain     int
-	readyAfter time.Duration
+	logger      *zap.Logger
+	region      string
+	accessKey   string
+	secretKey   string
+	maxBlobSize int64
+	sealBytes   int64
+	sealAge     time.Duration
+	retain      int
+	readyAfter  time.Duration
 }
 
 // WithLogger sets the zap logger supplied to the ingot fx module (and
@@ -81,10 +81,11 @@ func WithCredentials(access, secret string) HarnessOption {
 	}
 }
 
-// WithChunkSize overrides the per-object body chunk size.
-// 0 means use bucket.DefaultChunkSize.
-func WithChunkSize(n int64) HarnessOption {
-	return func(o *harnessOptions) { o.chunkSize = n }
+// WithMaxBlobSize overrides the per-object blob ceiling. Tests that
+// exercise multi-blob (coarse-split) objects set a small value so a
+// modest payload spans several blobs. 0 means use bucket.DefaultMaxBlobSize.
+func WithMaxBlobSize(n int64) HarnessOption {
+	return func(o *harnessOptions) { o.maxBlobSize = n }
 }
 
 // WithSealConfig forwards SealBytes / SealAge / Retain to logstore.
@@ -144,12 +145,12 @@ func StartHarness(ctx context.Context, opts ...HarnessOption) (*Harness, error) 
 		fx.WithLogger(func() fxevent.Logger { return &fxevent.ZapLogger{Logger: options.logger} }),
 		fx.Supply(options.logger),
 		fx.Supply(ingot.ServerConfig{
-			Addr:       addr,
-			DataDir:    dataDir,
-			Region:     options.region,
-			RootAccess: options.accessKey,
-			RootSecret: options.secretKey,
-			ChunkSize:  options.chunkSize,
+			Addr:        addr,
+			DataDir:     dataDir,
+			Region:      options.region,
+			RootAccess:  options.accessKey,
+			RootSecret:  options.secretKey,
+			MaxBlobSize: options.maxBlobSize,
 			// Ship both planes to the nop uploader so the seal → ship →
 			// retire path stays exercised by the in-memory suite. The same
 			// seal thresholds are applied to each plane.
