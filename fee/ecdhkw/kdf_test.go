@@ -18,7 +18,7 @@ import (
 // anchor for cross-implementation compatibility.
 func TestKDFContextCanonical(t *testing.T) {
 	got := kdfContext(algA256KW, kekLen*8, nil)
-	want, _ := hex.DecodeString("842483f6f6f6" + "83f6f6f6" + "8219010040")
+	want := mustDecode(t, "842483f6f6f6"+"83f6f6f6"+"8219010040")
 	if !bytes.Equal(got, want) {
 		t.Fatalf("kdfContext mismatch:\n got %X\nwant %X", got, want)
 	}
@@ -30,7 +30,7 @@ func TestKDFContextCanonical(t *testing.T) {
 func TestKDFContextProtected(t *testing.T) {
 	got := kdfContext(algA256KW, kekLen*8, []byte{0xa1, 0x01, 0x38, 0x1e})
 	// ...trailing SuppPubInfo: [256, h'a101381e'] -> 82 19 0100 44 a101381e
-	want, _ := hex.DecodeString("842483f6f6f6" + "83f6f6f6" + "821901004" + "4a101381e")
+	want := mustDecode(t, "842483f6f6f6"+"83f6f6f6"+"821901004"+"4a101381e")
 	if !bytes.Equal(got, want) {
 		t.Fatalf("kdfContext(protected) mismatch:\n got %X\nwant %X", got, want)
 	}
