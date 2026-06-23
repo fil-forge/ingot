@@ -43,13 +43,16 @@ type Backend struct {
 	reg       registry.Registry
 	intents   registry.IntentStore
 	locations registry.LocationStore
+	blobRefs  registry.BlobRefStore
+	gc        registry.GCStore
 	txns      *bucketop.Coordinator
 	spool     *blockstore.Spool
 	uploader  uploader.BodyUploader
+	remover   uploader.BlobRemover
 
 	// space is the Forge space this instance owns; the key under which body
-	// blobs' locations (and, later, reference claims) are recorded. Empty in
-	// the in-memory harness, where reads are served from the spool.
+	// blobs' locations and reference claims are recorded. Empty in the
+	// in-memory harness, where reads are served from the spool.
 	space       string
 	maxBlobSize int64
 }
@@ -64,6 +67,11 @@ type Deps struct {
 	Intents   registry.IntentStore
 	Locations registry.LocationStore
 
+	// BlobRefs is the reverse reference index (which versions reference each
+	// blob); GC records superseded MST/manifest CIDs. Same instance as Registry.
+	BlobRefs registry.BlobRefStore
+	GC       registry.GCStore
+
 	// Reads is the layered read tier (spool → log → forge). Log is the catalog
 	// LSM write log driving the per-op staging buffer + commit.
 	Reads blockstore.ReadStore
@@ -74,8 +82,10 @@ type Deps struct {
 	Spool *blockstore.Spool
 
 	// Uploader makes each spooled body blob durable on Forge (allocate→PUT→
-	// accept) synchronously, before the manifest commits.
+	// accept) synchronously, before the manifest commits. Remover releases a
+	// space's claim on a blob when its last reference is dropped.
 	Uploader uploader.BodyUploader
+	Remover  uploader.BlobRemover
 
 	// Space is the Forge space this instance owns (empty in the harness).
 	Space string
@@ -94,9 +104,12 @@ func New(d Deps) *Backend {
 		reg:         d.Registry,
 		intents:     d.Intents,
 		locations:   d.Locations,
+		blobRefs:    d.BlobRefs,
+		gc:          d.GC,
 		txns:        bucketop.NewCoordinator(bucketop.Deps{Reg: d.Registry, Log: d.Log, Reads: d.Reads}),
 		spool:       d.Spool,
 		uploader:    d.Uploader,
+		remover:     d.Remover,
 		space:       d.Space,
 		maxBlobSize: d.MaxBlobSize,
 	}

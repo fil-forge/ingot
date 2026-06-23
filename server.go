@@ -83,9 +83,11 @@ type ServerDeps struct {
 	Uploader uploader.Uploader
 
 	// BodyUploader makes each object-body blob durable on Forge by digest
-	// (allocate→PUT→accept), synchronously during a PUT. In tests this is a
-	// no-op and reads are served from the local spool.
+	// (allocate→PUT→accept), synchronously during a PUT. Remover releases a
+	// space's claim on a blob when its last reference is dropped. In tests both
+	// are no-ops and reads are served from the local spool.
 	BodyUploader uploader.BodyUploader
+	Remover      uploader.BlobRemover
 
 	// Registry tracks per-bucket roots. *registry.Postgres satisfies
 	// both Registry and Meta in production; tests can supply two
@@ -93,10 +95,14 @@ type ServerDeps struct {
 	Registry registry.Registry
 
 	// Intents tracks the local spool's upload_intents lifecycle; Locations
-	// records where each accepted body blob can be retrieved from. Typically
-	// the same instance as Registry (*registry.Postgres / *inmem.MemStore).
+	// records where each accepted body blob can be retrieved from; BlobRefs is
+	// the reverse reference index; GC records superseded MST/manifest CIDs.
+	// Typically all the same instance as Registry (*registry.Postgres /
+	// *inmem.MemStore).
 	Intents   registry.IntentStore
 	Locations registry.LocationStore
+	BlobRefs  registry.BlobRefStore
+	GC        registry.GCStore
 
 	// Space is the Forge space this instance owns — the key body-blob locations
 	// (and, later, reference claims) are recorded under. Empty in standalone /
@@ -160,10 +166,13 @@ func New(ctx context.Context, cfg ServerConfig, deps ServerDeps) (*Server, error
 		Registry:    deps.Registry,
 		Intents:     deps.Intents,
 		Locations:   deps.Locations,
+		BlobRefs:    deps.BlobRefs,
+		GC:          deps.GC,
 		Reads:       bs,
 		Log:         log,
 		Spool:       spool,
 		Uploader:    deps.BodyUploader,
+		Remover:     deps.Remover,
 		Space:       deps.Space,
 		MaxBlobSize: cfg.MaxBlobSize,
 	})
@@ -326,6 +335,15 @@ func validateServerInputs(cfg ServerConfig, deps ServerDeps) error {
 	}
 	if deps.Locations == nil {
 		return errors.New("ingot: ServerDeps.Locations is required")
+	}
+	if deps.BlobRefs == nil {
+		return errors.New("ingot: ServerDeps.BlobRefs is required")
+	}
+	if deps.GC == nil {
+		return errors.New("ingot: ServerDeps.GC is required")
+	}
+	if deps.Remover == nil {
+		return errors.New("ingot: ServerDeps.Remover is required")
 	}
 	if deps.Meta == nil {
 		return errors.New("ingot: ServerDeps.Meta is required")

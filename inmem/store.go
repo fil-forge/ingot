@@ -248,6 +248,8 @@ func (NopUploader) UploadBlob(_ context.Context, _ multihash.Multihash, size int
 	return uploader.BlobLocation{Size: size}, nil
 }
 
+func (NopUploader) RemoveBlob(_ context.Context, _ multihash.Multihash) error { return nil }
+
 // Compile-time guarantees.
 var (
 	_ registry.Registry      = (*MemStore)(nil)
@@ -255,4 +257,5 @@ var (
 	_ blockstore.BlockReader = NopBaseReader{}
 	_ uploader.Uploader      = NopUploader{}
 	_ uploader.BodyUploader  = NopUploader{}
+	_ uploader.BlobRemover   = NopUploader{}
 )
