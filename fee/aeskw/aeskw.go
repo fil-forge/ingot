@@ -80,9 +80,13 @@ func Wrap(kek, keyData []byte) ([]byte, error) {
 	r := make([]byte, len(keyData))
 	copy(r, keyData)
 
-	// RFC 3394 performs 6n block encryptions in total (the spec writes this as
-	// the single index t = 1..s, s = 6n). The nested loop is the equivalent
-	// form: rounds (6) passes over all n blocks, with t = n*j + i.
+	// RFC 3394 wraps in six rounds over all n blocks — 6n block encryptions in
+	// total — XORing the counter t = (n*j) + i into A; this is the RFC's own
+	// two-index form. The spec's equivalent single-index form (t = 1..6n) does
+	// have a nested inner loop, but that loop shifts the R registers down one
+	// slot each step; it is not extra encryptions (still one AES per step). Here
+	// R[i] is addressed in place, so our inner loop just walks the n blocks
+	// instead of shifting them. The §4 known-answer vectors pin the sequence.
 	var buf [16]byte // AES input/output block: A || R[i]
 	for j := 0; j < rounds; j++ {
 		for i := 1; i <= n; i++ {
