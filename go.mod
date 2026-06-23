@@ -7,6 +7,7 @@ require (
 	github.com/fil-forge/indexing-service v1.13.5-0.20260522094121-1edae9728a14
 	github.com/fil-forge/libforge v0.0.0-20260527182359-ebb22552c348
 	github.com/fil-forge/ucantone v0.0.0-20260522152152-eda937bc2684
+	github.com/fxamacker/cbor/v2 v2.9.2
 	github.com/ipfs/go-block-format v0.2.3
 	github.com/ipfs/go-cid v0.6.1
 	github.com/ipfs/go-ipld-cbor v0.2.1
@@ -115,6 +116,7 @@ require (
 	github.com/subosito/gotenv v1.2.0 // indirect
 	github.com/valyala/bytebufferpool v1.0.0 // indirect
 	github.com/valyala/fasthttp v1.70.0 // indirect
+	github.com/x448/float16 v0.8.4 // indirect
 	gitlab.com/yawning/secp256k1-voi v0.0.0-20230925100816-f2616030848b // indirect
 	gitlab.com/yawning/tuplehash v0.0.0-20230713102510-df83abbf9a02 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
