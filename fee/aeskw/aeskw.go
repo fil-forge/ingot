@@ -9,9 +9,18 @@
 //
 // The KEK length selects the COSE/JOSE variant: a 32-byte KEK is "A256KW". RFC
 // 3394 wraps key data that is a whole number of 64-bit blocks, at least two
-// (16 bytes); that range covers AES-128/192/256 content keys. Key data whose
-// length is not a multiple of 8 bytes needs the padded variant (RFC 5649),
-// which this package deliberately does not implement.
+// (16 bytes); that range covers AES-128/192/256 content keys.
+//
+// This package implements only the base RFC 3394 mode, which always uses the
+// single fixed initial value of §2.2.3.1; it does not support the RFC 5649
+// padded variant. RFC 5649 introduces an Alternative Initial Value (AIV) that
+// encodes the key-data byte length — that is what lets it wrap key data of any
+// (non-block-aligned) length. Without it, key data here must be a whole number
+// of 8-byte blocks.
+//
+// References:
+//   - RFC 3394 (AES Key Wrap): https://www.rfc-editor.org/rfc/rfc3394
+//   - RFC 5649 (AES Key Wrap with Padding): https://www.rfc-editor.org/rfc/rfc5649
 //
 // This is a shared primitive. The tenant-recipient wrap (ECDH-ES+A256KW, in
 // the sibling fee/wrap package) derives its KEK ephemerally per message and
@@ -26,11 +35,17 @@ import (
 	"fmt"
 )
 
-// defaultIV is the RFC 3394 §2.2.3.1 default initial value: a 64-bit constant
+// defaultIV is the RFC 3394 §2.2.3.1 default initial value
+// (https://www.rfc-editor.org/rfc/rfc3394#section-2.2.3.1): a 64-bit constant
 // prepended to the key data before wrapping. Unwrap recovers these bytes from
 // the leading block and compares them against this constant to detect an
-// incorrect KEK or a corrupted wrapped key.
+// incorrect KEK or a corrupted wrapped key. It is the only initial value this
+// package supports (see the package doc on the RFC 5649 AIV).
 var defaultIV = [8]byte{0xA6, 0xA6, 0xA6, 0xA6, 0xA6, 0xA6, 0xA6, 0xA6}
+
+// rounds is the fixed number of passes the RFC 3394 algorithm makes over the
+// key data — six, in both the wrap (§2.2.1) and unwrap (§2.2.2) directions.
+const rounds = 6
 
 // ErrIntegrity is returned by Unwrap when the recovered integrity value does
 // not match the RFC 3394 initial value. It signals a wrong KEK or a tampered
@@ -63,7 +78,7 @@ func Wrap(kek, keyData []byte) ([]byte, error) {
 	copy(r, keyData)
 
 	var buf [16]byte // AES input/output block: A || R[i]
-	for j := 0; j < 6; j++ {
+	for j := 0; j < rounds; j++ {
 		for i := 1; i <= n; i++ {
 			copy(buf[:8], a[:])
 			copy(buf[8:], r[(i-1)*8:i*8])
@@ -92,7 +107,7 @@ func Unwrap(kek, wrapped []byte) ([]byte, error) {
 		return nil, fmt.Errorf("aeskw: invalid KEK: %w", err)
 	}
 	if len(wrapped) < 24 || len(wrapped)%8 != 0 {
-		return nil, fmt.Errorf("aeskw: wrapped key must be a multiple of 8 bytes and at least 24, got %d", len(wrapped))
+		return nil, fmt.Errorf("aeskw wrapped key must be a multiple of 8 bytes and at least 24, got %d", len(wrapped))
 	}
 
 	// n counts data blocks; the wrapped key is the integrity block plus n.
@@ -104,7 +119,7 @@ func Unwrap(kek, wrapped []byte) ([]byte, error) {
 	copy(r, wrapped[8:])
 
 	var buf [16]byte
-	for j := 5; j >= 0; j-- {
+	for j := rounds - 1; j >= 0; j-- {
 		for i := n; i >= 1; i-- {
 			// B = AES^-1(K, (A XOR t) || R[i]), where t = n*j + i.
 			copy(buf[:8], a[:])

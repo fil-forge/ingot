@@ -16,8 +16,9 @@ func mustHex(t *testing.T, s string) []byte {
 	return b
 }
 
-// rfc3394Vectors are the known-answer test vectors from RFC 3394 §4. They
-// exercise every KEK length (128/192/256) against 128/192/256-bit key data.
+// rfc3394Vectors are the known-answer test vectors from RFC 3394 §4
+// (https://www.rfc-editor.org/rfc/rfc3394#section-4). They exercise every KEK
+// length (128/192/256) against 128/192/256-bit key data.
 var rfc3394Vectors = []struct {
 	name    string
 	kek     string
