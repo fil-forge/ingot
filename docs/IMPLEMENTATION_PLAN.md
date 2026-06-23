@@ -91,15 +91,32 @@ Deliverable: `make build` + full `go test ./...` green; PUT/GET/HEAD round-trip 
 multi-blob, and zero-byte objects through the in-memory harness. Bytes still live in the data-plane
 CAR path (inverted in Phase 3) — this was purely the model reshape.
 
-### Phase 2 — Schema + fakes *(new surface, no callers)*
+### Phase 2 — Schema + fakes *(new surface, no callers)* — ✅ DONE
 
-- [ ] Migration `00003`: `upload_intents`, `blob_refs`, `blob_locations`, `multipart_sessions`,
-      `multipart_parts`, `gc_candidates`; `buckets.space` (+ reserved `versioning`/`next_version_seq`).
-- [ ] `registry` + `inmem.MemStore`: methods for ref-count, intent state machine, location
-      upsert/lookup, multipart session/part CRUD + the single-winner latch. Unit-tested in isolation.
+- [x] Migration `00003_stores.sql`: `blob_refs`, `upload_intents`, `blob_locations`,
+      `multipart_sessions`, `multipart_parts`, `gc_candidates`; `buckets.space`
+      (DEFAULT '' so existing inserts keep working) + reserved `versioning`/`next_version_seq` +
+      `buckets_space_idx`.
+- [x] `registry/stores.go`: focused interfaces (`BlobRefStore`, `IntentStore`, `LocationStore`,
+      `MultipartStore`, `GCStore`) + row types + state constants + `NullVersionID` sentinel.
+      `registry/stores_postgres.go`: Postgres impls (jsonb metadata, `bytea[]` digests, `ON CONFLICT`
+      upserts, single-winner latch via `RowsAffected`). `State.Space` added (read-only for now).
+- [x] `inmem/stores.go` + struct maps: MemStore mirrors all five stores with deep-copy semantics.
+- [x] `inmem/stores_test.go`: ref-count-to-zero, intent state machine, ordered parts + FK cascade,
+      location round-trip, and the single-winner latch under `-race` (exactly one of 32 racers wins).
+- [x] `migrations/up_live_test.go` + `registry/postgres_live_test.go` (both DSN-gated on
+      `INGOT_TEST_DSN`): validated against a throwaway docker Postgres — migration applies + is
+      idempotent; all store SQL round-trips. (Caught one denormalization invariant: `blob_refs` PK
+      excludes `space`, so a `(bucket,key,version)` belongs to one space.)
 
-Deliverable: migrations apply; both `*registry.Postgres` and `inmem.MemStore` satisfy the expanded
-interface; new methods unit-tested. Smoke suite still green (no production caller yet).
+Deliverable: migrations apply (validated live); both `*registry.Postgres` and `inmem.MemStore`
+satisfy the new interfaces; new methods unit-tested (inmem) and live-tested (Postgres). Smoke suite
+still green — no production path calls the new methods yet.
+
+> **Note — `buckets.space` population deferred.** The column exists and is read into `State.Space`,
+> but `Create` does not yet set it (defaults to ''). It is threaded through bucket creation in
+> Phase 3, when the space DID reaches the write path. `blob_refs.space` is supplied explicitly by
+> callers, so it does not depend on `buckets.space` being populated.
 
 ### Phase 3 — Data-plane inversion *(the hard shift)*
 

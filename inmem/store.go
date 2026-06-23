@@ -33,13 +33,39 @@ type MemStore struct {
 	buckets  map[string]*registry.State
 	segments map[uint64]*logstore.SegmentMeta
 	nextSeq  uint64
+
+	// The architecture's relational surface (docs/architecture.md §5–§7),
+	// mirroring the Postgres tables so the in-process suite exercises the
+	// same code paths. See stores.go for the methods over these.
+	blobRefs  map[claimKey]registry.BlobClaim
+	intents   map[string]registry.UploadIntent          // keyed by string(digest)
+	locations map[locKey]registry.BlobLocation          // keyed by (space, digest)
+	sessions  map[string]registry.MultipartSession      // keyed by uploadID
+	parts     map[string]map[int]registry.MultipartPart // uploadID -> partNumber -> part
+	gcCands   map[string]struct{}                       // keyed by string(cid)
+}
+
+// claimKey / locKey are the composite map keys for the blob_refs and
+// blob_locations tables (digest bytes carried as a string for comparability).
+type claimKey struct {
+	digest, bucket, objectKey, versionID string
+}
+
+type locKey struct {
+	space, digest string
 }
 
 // NewMemStore returns an empty MemStore.
 func NewMemStore() *MemStore {
 	return &MemStore{
-		buckets:  map[string]*registry.State{},
-		segments: map[uint64]*logstore.SegmentMeta{},
+		buckets:   map[string]*registry.State{},
+		segments:  map[uint64]*logstore.SegmentMeta{},
+		blobRefs:  map[claimKey]registry.BlobClaim{},
+		intents:   map[string]registry.UploadIntent{},
+		locations: map[locKey]registry.BlobLocation{},
+		sessions:  map[string]registry.MultipartSession{},
+		parts:     map[string]map[int]registry.MultipartPart{},
+		gcCands:   map[string]struct{}{},
 	}
 }
 
