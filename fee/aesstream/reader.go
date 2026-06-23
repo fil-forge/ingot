@@ -46,10 +46,13 @@ func NewReader(src io.Reader, cfg Config) (*Reader, error) {
 		return nil, err
 	}
 	chunkSize := cfg.effectiveChunkSize()
+	// Copy AAD so the Reader doesn't alias caller-owned memory: it is
+	// authenticated on every chunk, so a later mutation or reuse of the
+	// caller's slice must not change this stream's authentication.
 	r := &Reader{
 		aead:      aead,
 		source:    src,
-		aad:       cfg.AAD,
+		aad:       append([]byte(nil), cfg.AAD...),
 		chunkSize: chunkSize,
 		encChunk:  chunkSize + TagSize,
 		inBuf:     make([]byte, chunkSize+TagSize),

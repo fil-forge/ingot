@@ -48,10 +48,13 @@ func NewWriter(dst io.Writer, cfg Config) (*Writer, error) {
 		return nil, err
 	}
 	chunkSize := cfg.effectiveChunkSize()
+	// Copy AAD so the Writer doesn't alias caller-owned memory: it is
+	// authenticated on every chunk, so a later mutation or reuse of the
+	// caller's slice must not change this stream's authentication.
 	w := &Writer{
 		dst:       dst,
 		aead:      aead,
-		aad:       cfg.AAD,
+		aad:       append([]byte(nil), cfg.AAD...),
 		chunkSize: chunkSize,
 		buf:       make([]byte, 0, chunkSize),
 		sealBuf:   make([]byte, 0, chunkSize+TagSize),
@@ -132,14 +135,20 @@ func (w *Writer) flush(last bool) error {
 	return nil
 }
 
-// writeAll writes all of p, looping over partial writes.
+// writeAll writes all of p, looping over partial writes. A zero-progress
+// write with no error (which a compliant io.Writer never does, but the
+// interface doesn't strictly forbid) is reported as io.ErrShortWrite
+// rather than spun on forever.
 func writeAll(w io.Writer, p []byte) error {
 	for len(p) > 0 {
 		n, err := w.Write(p)
+		p = p[n:]
 		if err != nil {
 			return err
 		}
-		p = p[n:]
+		if n == 0 {
+			return io.ErrShortWrite
+		}
 	}
 	return nil
 }

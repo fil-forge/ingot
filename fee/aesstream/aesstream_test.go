@@ -495,6 +495,83 @@ func TestNewBaseNonce(t *testing.T) {
 	}
 }
 
+// TestAADIsCopiedOnConstruction verifies the Writer and Reader copy the
+// AAD at construction, so mutating the caller's slice afterwards cannot
+// change a stream's authentication.
+func TestAADIsCopiedOnConstruction(t *testing.T) {
+	const cs = aesstream.MinChunkSize
+	pt := pattern(2000)
+	const orig = "original-aad-value"
+	const tampered = "TAMPERED-AAD-VALUE" // same length, so copy fully overwrites
+
+	// Encrypt with an AAD slice we mutate right after constructing the
+	// Writer. A copy means it encrypts under orig despite the mutation.
+	aad := []byte(orig)
+	encCfg := baseConfig(cs)
+	encCfg.AAD = aad
+	var buf bytes.Buffer
+	w, err := aesstream.NewWriter(&buf, encCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	copy(aad, tampered)
+	if _, err := w.Write(pt); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Decrypting with orig only succeeds if the Writer copied the AAD.
+	decCfg := baseConfig(cs)
+	decCfg.AAD = []byte(orig)
+	got, err := aesstream.Open(decCfg, buf.Bytes())
+	if err != nil {
+		t.Fatalf("Open with original AAD failed (Writer did not copy AAD?): %v", err)
+	}
+	if !bytes.Equal(got, pt) {
+		t.Fatal("round-trip mismatch")
+	}
+
+	// The Reader must be immune to the same post-construction mutation.
+	rAAD := []byte(orig)
+	rCfg := baseConfig(cs)
+	rCfg.AAD = rAAD
+	r, err := aesstream.NewReader(bytes.NewReader(buf.Bytes()), rCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	copy(rAAD, tampered)
+	got2, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("Reader failed after AAD mutation (Reader did not copy AAD?): %v", err)
+	}
+	if !bytes.Equal(got2, pt) {
+		t.Fatal("reader round-trip mismatch")
+	}
+}
+
+// stuckWriter reports zero progress with no error on every call, which a
+// compliant io.Writer never does. writeAll must not spin on it.
+type stuckWriter struct{}
+
+func (stuckWriter) Write(p []byte) (int, error) { return 0, nil }
+
+func TestWriteAllShortWriteGuard(t *testing.T) {
+	w, err := aesstream.NewWriter(stuckWriter{}, baseConfig(aesstream.MinChunkSize))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("hello")); err != nil {
+		t.Fatal(err) // buffered; no flush yet
+	}
+	// Close flushes the final chunk, which the stuck writer never accepts;
+	// writeAll must return ErrShortWrite rather than loop forever.
+	if err := w.Close(); !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("Close err = %v, want io.ErrShortWrite", err)
+	}
+}
+
 // patternReader emits an endless deterministic byte stream without
 // allocating, so a huge plaintext can be produced with O(1) memory.
 type patternReader struct{ pos uint64 }
