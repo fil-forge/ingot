@@ -6,10 +6,11 @@
 > aggregation and (2) proving small pieces work in the PDP contracts at scale. Until both land, the
 > architecture is correct on paper but unbuildable in practice.
 
-**Read this first; the depth lives in two companion docs:**
+**Read this first; the depth lives alongside it:**
 - *What we're building* — Ingot architecture: [`architecture.md`](./architecture.md)
-- *Is it viable on-chain + the Piri policy* — [`rfc-pdp-minimum-piece-size.md`](./rfc-pdp-minimum-piece-size.md)
-  (+ its [`pdp-cost-calculator.html`](./pdp-cost-calculator.html)).
+- *Is it viable on-chain* — the [**pdp-sim**](https://github.com/fil-forge/pdp-sim) simulator for
+  gas-usage calculations (top-line analysis in
+  [`analysis/SUMMARY.md`](https://github.com/fil-forge/pdp-sim/blob/main/analysis/SUMMARY.md)).
 
 ---
 
@@ -49,8 +50,8 @@ works if the PDP contracts and proving can take that volume in practice; we have
 FilOZ. **If the contracts can take it**, we drop cross-object aggregation and this is dramatically
 simpler. **If they can't**, we fall back to a **size floor** (`min_aggregate_size`, e.g. 8 MiB): blobs
 ≥ floor are their own piece, only the sub-floor tail pools — the model the
-[architecture](./architecture.md) and [RFC §7](./rfc-pdp-minimum-piece-size.md) document as the
-fallback. So the floor stays specified, but as the fallback, not the default. (This is not a new
+[architecture](./architecture.md) documents as the fallback. So the floor stays specified, but as the
+fallback, not the default. (This is not a new
 "group an object's parts" primitive either — Piri's aggregator is already size-driven; object=piece
 mostly means *not* aggregating across objects.)
 
@@ -59,11 +60,11 @@ mostly means *not* aggregating across objects.)
 **1 — Rethink Piri's aggregation strategy.** The target is **no cross-object aggregation** (object =
 piece), with a generational background aggregator as the optional relief valve for root-count/throughput,
 and the size floor (`MinAggregateSize` lowered to a configurable ~8 MiB) as the **fallback** if the
-contracts can't take the piece volume. RFC §7 carries both. Piri's aggregator is already size-driven,
+contracts can't take the piece volume. Piri's aggregator is already size-driven,
 so the floor-fallback is a small change; the object=piece target mostly means *not* aggregating across
 objects.
 
-**2 — Prove small pieces are viable in the PDP contracts, at scale.** The RFC's *measured* gas already
+**2 — Prove small pieces are viable in the PDP contracts, at scale.** pdp-sim's *measured* gas already
 shows the **economics** hold (registration linear, proving logarithmic, proof-fee size-neutral,
 **no slashing**, registration gas-gatable). The remaining proof is **operational** — that Piri can
 *register, prove, and delete* sub-256-MiB pieces routinely at PiB scale:
@@ -84,7 +85,7 @@ On-chain dollar cost is negligible at **every** piece size — so this is **not*
 it is a **capability gap**. The two real risks are exactly the two asks: (a) the off-chain repack on
 churn — which **one-object-one-piece eliminates** (no survivors to re-hash); and (b) throughput — more
 pieces means a sender fleet. "Piece = object" is simultaneously the cost-optimal *and* the only
-delete-tractable model. (The numbers are in the RFC's §3 and the cost calculator; the "~99% margin"
+delete-tractable model. (The numbers are in pdp-sim's analysis; the "~99% margin"
 there is on-chain margin only — it confirms piece size barely moves dollars, which is precisely why the
 decision rides on *capability and throughput*, not cost.)
 
@@ -104,8 +105,7 @@ become measured, not guessed.
    the `schedulePieceDeletions` signature). It is the cheapest way to find out if the whole approach
    is dead on arrival.
 2. **Spec + build Ask 1** — object=piece (no cross-object aggregation) as the target, generational
-   aggregation as the relief valve, the size floor + ceiling as the fallback — in Piri, per a refined
-   RFC §7.
+   aggregation as the relief valve, the size floor + ceiling as the fallback — in Piri.
 3. **Instrument** object-size/lifespan/multipart/churn in Ingot to tune the floor/ceiling and size
    the sender fleet.
 4. Only then is the Ingot S3 architecture executable as written.
