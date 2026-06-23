@@ -11,12 +11,15 @@
 // 3394 wraps key data that is a whole number of 64-bit blocks, at least two
 // (16 bytes); that range covers AES-128/192/256 content keys.
 //
-// This package implements only the base RFC 3394 mode, which always uses the
-// single fixed initial value of §2.2.3.1; it does not support the RFC 5649
-// padded variant. RFC 5649 introduces an Alternative Initial Value (AIV) that
-// encodes the key-data byte length — that is what lets it wrap key data of any
-// (non-block-aligned) length. Without it, key data here must be a whole number
-// of 8-byte blocks.
+// This package implements only the base RFC 3394 mode, which uses the fixed
+// default initial value of §2.2.3.1 and so requires the key data to be a whole
+// number of 64-bit blocks. RFC 3394 §2.2.3.2 already anticipates "Alternative
+// Initial Values" for cases the default does not cover — explicitly including
+// key data that "may not always be a multiple of 64 bits" — but leaves their
+// concrete definition to future publications. RFC 5649 is one such: it defines
+// an alternative initial value carrying a message-length indicator, yielding a
+// padded key wrap for key data of any length. This package implements neither
+// the alternative initial value nor RFC 5649 padding.
 //
 // References:
 //   - RFC 3394 (AES Key Wrap): https://www.rfc-editor.org/rfc/rfc3394
@@ -40,7 +43,7 @@ import (
 // prepended to the key data before wrapping. Unwrap recovers these bytes from
 // the leading block and compares them against this constant to detect an
 // incorrect KEK or a corrupted wrapped key. It is the only initial value this
-// package supports (see the package doc on the RFC 5649 AIV).
+// package supports (see the package doc on RFC 3394 §2.2.3.2 alternative IVs).
 var defaultIV = [8]byte{0xA6, 0xA6, 0xA6, 0xA6, 0xA6, 0xA6, 0xA6, 0xA6}
 
 // rounds is the fixed number of passes the RFC 3394 algorithm makes over the
@@ -77,6 +80,9 @@ func Wrap(kek, keyData []byte) ([]byte, error) {
 	r := make([]byte, len(keyData))
 	copy(r, keyData)
 
+	// RFC 3394 performs 6n block encryptions in total (the spec writes this as
+	// the single index t = 1..s, s = 6n). The nested loop is the equivalent
+	// form: rounds (6) passes over all n blocks, with t = n*j + i.
 	var buf [16]byte // AES input/output block: A || R[i]
 	for j := 0; j < rounds; j++ {
 		for i := 1; i <= n; i++ {
