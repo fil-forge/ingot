@@ -69,10 +69,14 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 
 	// mf is captured by the closure and read after WithTx commits, so the
 	// response ETag/size come from the same manifest that was committed.
+	// toRemove collects digests whose last reference is dropped by an
+	// overwrite — released after the commit, off the critical section.
 	var mf *msbucket.ObjectManifest
+	var toRemove [][]byte
 
 	// COMMIT (short per-bucket critical section): write the manifest + MST
-	// splice + guarded root swap. No large-body work happens under the lock.
+	// splice + reference index + guarded root swap. No large-body work happens
+	// under the lock.
 	err = b.txns.WithTx(ctx, bucketName, func(ctx context.Context, tx *bucketop.Tx) (cid.Cid, error) {
 		mf = &msbucket.ObjectManifest{
 			Key:                key,
@@ -92,16 +96,41 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 		}
 
 		t := tx.LoadTree()
+
+		// Capture the prior version's body digests (if this is an overwrite)
+		// before replacing the leaf, so the reference index can release any
+		// blobs the new body no longer references.
+		var oldDigests [][]byte
+		oldCid, gerr := t.Get(ctx, key)
+		switch {
+		case gerr == nil:
+			var oldMf msbucket.ObjectManifest
+			if err := tx.Get(ctx, oldCid, &oldMf); err != nil {
+				return cid.Undef, fmt.Errorf("load prior manifest: %w", err)
+			}
+			oldDigests = bodyDigests(oldMf.Body)
+			if err := b.gc.AddGCCandidate(ctx, oldCid.Bytes(), bucketName); err != nil {
+				return cid.Undef, fmt.Errorf("gc candidate: %w", err)
+			}
+		case errors.Is(gerr, mst.ErrNotFound):
+			// new key — no prior version
+		default:
+			return cid.Undef, fmt.Errorf("mst get prior: %w", gerr)
+		}
+
 		t2, err := t.Add(ctx, key, mfCid, -1)
 		if errors.Is(err, mst.ErrAlreadyExists) {
-			// Unversioned overwrite-in-place. Phase 4 drives the superseded
-			// body's digests through the reference index here (blob_refs -=,
-			// remove(digest) at zero claims); for now it just re-points the leaf.
-			t2, err = t.Update(ctx, key, mfCid)
+			t2, err = t.Update(ctx, key, mfCid) // unversioned overwrite-in-place
 		}
 		if err != nil {
 			return cid.Undef, fmt.Errorf("mst write: %w", err)
 		}
+
+		rm, err := b.reconcileClaims(ctx, bucketName, key, oldDigests, bodyDigests(bodyRec))
+		if err != nil {
+			return cid.Undef, err
+		}
+		toRemove = rm
 
 		return t2.GetPointer(ctx, tx)
 	})
@@ -111,6 +140,7 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 		}
 		return s3response.PutObjectOutput{}, fmt.Errorf("s3frontend: put: %w", err)
 	}
+	b.releaseBlobs(ctx, toRemove)
 
 	size := mf.Body.Size
 	return s3response.PutObjectOutput{
@@ -171,6 +201,82 @@ func (b *Backend) ingestBody(ctx context.Context, bucket string, r io.Reader) (m
 		}
 	}
 	return body, nil
+}
+
+// reconcileClaims updates blob_refs for an object version under (bucket, key)
+// whose body changes from oldDigests to newDigests, and returns the digests
+// whose (space, digest) claim reached zero so the caller can release them after
+// the commit. The diff is the crux of safe dedup + delete:
+//
+//   - a digest in new but not old gains a claim (newly referenced);
+//   - a digest in old but not new loses its claim, and when no version anywhere
+//     still references it, is queued for RemoveBlob;
+//   - a digest in BOTH keeps its single claim untouched, so a re-PUT of
+//     identical bytes (or a split object that shares blobs) never churns the row.
+//
+// versionId is the unversioned sentinel for now — one claim row per
+// (digest, bucket, key). When versioning lands, each version carries its own id.
+func (b *Backend) reconcileClaims(ctx context.Context, bucket, key string, oldDigests, newDigests [][]byte) (toRemove [][]byte, err error) {
+	oldSet := digestSet(oldDigests)
+	newSet := digestSet(newDigests)
+
+	for _, d := range newDigests {
+		if _, ok := oldSet[string(d)]; ok {
+			continue // unchanged reference
+		}
+		if err := b.blobRefs.AddBlobClaim(ctx, registry.BlobClaim{
+			Digest: d, Bucket: bucket, ObjectKey: key, VersionID: registry.NullVersionID, Space: b.space,
+		}); err != nil {
+			return nil, fmt.Errorf("add blob claim: %w", err)
+		}
+	}
+	for _, d := range oldDigests {
+		if _, ok := newSet[string(d)]; ok {
+			continue // still referenced by the new body
+		}
+		if err := b.blobRefs.DeleteBlobClaim(ctx, d, bucket, key, registry.NullVersionID); err != nil {
+			return nil, fmt.Errorf("delete blob claim: %w", err)
+		}
+		n, err := b.blobRefs.CountClaims(ctx, b.space, d)
+		if err != nil {
+			return nil, fmt.Errorf("count claims: %w", err)
+		}
+		if n == 0 {
+			toRemove = append(toRemove, d)
+		}
+	}
+	return toRemove, nil
+}
+
+// releaseBlobs calls RemoveBlob for each digest whose last claim was dropped.
+// Run after the commit lands, off the critical section — a 200 is not gated on
+// the (currently no-op) network release. Failures are logged, not fatal: a
+// missed release leaks bytes on Piri but never loses referenced data, and crash
+// recovery reconciles upload_intents × blob_refs (a later phase).
+func (b *Backend) releaseBlobs(ctx context.Context, digests [][]byte) {
+	for _, d := range digests {
+		if err := b.remover.RemoveBlob(ctx, multihash.Multihash(d)); err != nil {
+			// best-effort; see method doc.
+			_ = err
+		}
+	}
+}
+
+// bodyDigests returns the digests of a body's blobs in order.
+func bodyDigests(body msbucket.Body) [][]byte {
+	out := make([][]byte, 0, len(body.Blobs))
+	for _, blob := range body.Blobs {
+		out = append(out, blob.Digest)
+	}
+	return out
+}
+
+func digestSet(ds [][]byte) map[string]struct{} {
+	s := make(map[string]struct{}, len(ds))
+	for _, d := range ds {
+		s[string(d)] = struct{}{}
+	}
+	return s
 }
 
 // HeadObject returns the manifest's metadata. Range, partNumber,
@@ -266,6 +372,7 @@ func (b *Backend) DeleteObject(ctx context.Context, input *s3.DeleteObjectInput)
 	bucketName := *input.Bucket
 	key := *input.Key
 
+	var toRemove [][]byte
 	err := b.txns.WithTx(ctx, bucketName, func(ctx context.Context, tx *bucketop.Tx) (cid.Cid, error) {
 		// Empty bucket: nothing to delete. Returning cid.Undef from
 		// the closure tells WithTx to discard cleanly with no
@@ -274,14 +381,33 @@ func (b *Backend) DeleteObject(ctx context.Context, input *s3.DeleteObjectInput)
 			return cid.Undef, nil
 		}
 		t := tx.LoadTree()
-		t2, err := t.Delete(ctx, key)
-		if errors.Is(err, mst.ErrNotFound) {
-			// Idempotent DELETE: missing key isn't an error.
-			return cid.Undef, nil
+
+		// Load the manifest being removed so its body blobs can be released
+		// through the reference index.
+		oldCid, gerr := t.Get(ctx, key)
+		if errors.Is(gerr, mst.ErrNotFound) {
+			return cid.Undef, nil // idempotent DELETE: missing key isn't an error
 		}
+		if gerr != nil {
+			return cid.Undef, fmt.Errorf("mst get: %w", gerr)
+		}
+		var oldMf msbucket.ObjectManifest
+		if err := tx.Get(ctx, oldCid, &oldMf); err != nil {
+			return cid.Undef, fmt.Errorf("load manifest: %w", err)
+		}
+
+		t2, err := t.Delete(ctx, key)
 		if err != nil {
 			return cid.Undef, fmt.Errorf("mst delete: %w", err)
 		}
+		if err := b.gc.AddGCCandidate(ctx, oldCid.Bytes(), bucketName); err != nil {
+			return cid.Undef, fmt.Errorf("gc candidate: %w", err)
+		}
+		rm, err := b.reconcileClaims(ctx, bucketName, key, bodyDigests(oldMf.Body), nil)
+		if err != nil {
+			return cid.Undef, err
+		}
+		toRemove = rm
 		return t2.GetPointer(ctx, tx)
 	})
 	if err != nil {
@@ -290,6 +416,7 @@ func (b *Backend) DeleteObject(ctx context.Context, input *s3.DeleteObjectInput)
 		}
 		return nil, fmt.Errorf("s3frontend: delete: %w", err)
 	}
+	b.releaseBlobs(ctx, toRemove)
 	return &s3.DeleteObjectOutput{}, nil
 }
 

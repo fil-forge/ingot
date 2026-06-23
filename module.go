@@ -135,9 +135,12 @@ type serverParams struct {
 	Reader       blockstore.BlockReader
 	Uploader     uploader.Uploader
 	BodyUploader uploader.BodyUploader
+	Remover      uploader.BlobRemover
 	Registry     registry.Registry
 	Intents      registry.IntentStore
 	Locations    registry.LocationStore
+	BlobRefs     registry.BlobRefStore
+	GC           registry.GCStore
 	Meta         logstore.Meta
 	// Space is the Forge space this instance owns. Optional: standalone / the
 	// harness don't provide it (reads come from the spool), so it defaults to "".
@@ -175,9 +178,12 @@ func registerServerLifecycle(lc fx.Lifecycle, p serverParams) {
 				BaseBlockReader: p.Reader,
 				Uploader:        p.Uploader,
 				BodyUploader:    p.BodyUploader,
+				Remover:         p.Remover,
 				Registry:        p.Registry,
 				Intents:         p.Intents,
 				Locations:       p.Locations,
+				BlobRefs:        p.BlobRefs,
+				GC:              p.GC,
 				Meta:            p.Meta,
 				Space:           string(p.Space),
 			})
@@ -282,16 +288,19 @@ type registryResult struct {
 	Registry  registry.Registry
 	Intents   registry.IntentStore
 	Locations registry.LocationStore
+	BlobRefs  registry.BlobRefStore
+	GC        registry.GCStore
 	Meta      logstore.Meta
 }
 
 // provideRegistry wraps the host's pool in the postgres-backed registry and
 // exposes it under every interface ServerModule consumes. One *registry.Postgres
 // satisfies bucket state (Registry), the spool's upload_intents (IntentStore),
-// blob locations (LocationStore), and segment metadata (Meta).
+// blob locations (LocationStore), the reference index (BlobRefStore), the GC
+// candidate log (GCStore), and segment metadata (Meta).
 func provideRegistry(pool *pgxpool.Pool) registryResult {
 	pg := registry.NewPostgres(pool)
-	return registryResult{Registry: pg, Intents: pg, Locations: pg, Meta: pg}
+	return registryResult{Registry: pg, Intents: pg, Locations: pg, BlobRefs: pg, GC: pg, Meta: pg}
 }
 
 // provideServerSpace exposes the owned space DID (as a string) to the server.
@@ -345,6 +354,7 @@ type uploaderResult struct {
 
 	Uploader     uploader.Uploader
 	BodyUploader uploader.BodyUploader
+	Remover      uploader.BlobRemover
 }
 
 // provideUploader builds the guppy-style edge client that ships to Forge via
@@ -360,7 +370,7 @@ func provideUploader(c *forgeclient.Client, space spaceSigner, logger *zap.Logge
 	if err != nil {
 		return uploaderResult{}, err
 	}
-	return uploaderResult{Uploader: f, BodyUploader: f}, nil
+	return uploaderResult{Uploader: f, BodyUploader: f, Remover: f}, nil
 }
 
 // seedSpaceDelegations self-issues no-expiry space→agent delegations for

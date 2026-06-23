@@ -7,7 +7,9 @@ import (
 	"os"
 
 	assertcmds "github.com/fil-forge/libforge/commands/assert"
+	"github.com/fil-forge/libforge/digestutil"
 	"github.com/multiformats/go-multihash"
+	"go.uber.org/zap"
 
 	"github.com/fil-forge/ingot/forgeclient"
 )
@@ -73,3 +75,29 @@ func (u *Forge) UploadBlob(ctx context.Context, digest multihash.Multihash, size
 }
 
 var _ BodyUploader = (*Forge)(nil)
+
+// BlobRemover releases this space's claim on an accepted blob. Because dedup is
+// global, Piri deletes the bytes and retires the piece only when no space
+// claims the digest at all (docs/architecture.md §6). The space is owned by the
+// implementation (like UploadBlob).
+type BlobRemover interface {
+	RemoveBlob(ctx context.Context, digest multihash.Multihash) error
+}
+
+// RemoveBlob releases the space's claim on digest.
+//
+// TODO(phase 7 / smelt): wire forgeclient.BlobRemove against the upload service
+// — the libforge blob.Remove binding exists, but the Piri/Sprue handler is
+// to-build (docs/architecture.md §9). Until it lands this is a logged no-op, so
+// the reference-index bookkeeping (blob_refs count → 0 → RemoveBlob) is
+// exercised end-to-end without a working network primitive; bytes accumulate on
+// Piri until the handler exists.
+func (u *Forge) RemoveBlob(_ context.Context, digest multihash.Multihash) error {
+	u.logger.Info("blob remove (no-op; Piri handler to-build)",
+		zap.Stringer("space", u.space),
+		zap.String("digest", digestutil.Format(digest)),
+	)
+	return nil
+}
+
+var _ BlobRemover = (*Forge)(nil)

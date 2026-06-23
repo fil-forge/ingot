@@ -179,15 +179,33 @@ Deliverable (3a–3b, done): PUT spools + uploads each blob synchronously, commi
 manifest, returns 200 only after accept; GET reconstructs across blobs; zero-byte stores no blob;
 full in-memory smoke suite green.
 
-### Phase 4 — Reference index / delete
+### Phase 4 — Reference index / delete — ✅ DONE
 
-- [ ] Populate `blob_refs` on commit; overwrite-in-place dereferences the prior manifest's digests;
-      `remove(digest)` when a `(space,digest)` claim hits zero (flag-gated seam + `pending_removes`
-      drain so commit never blocks).
-- [ ] `DeleteObject`; record superseded MST nodes → `gc_candidates` (write-only).
+- [x] `s3frontend.reconcileClaims` diffs the prior vs new body-digest sets on every commit:
+      a digest newly referenced gains a `blob_refs` claim, one no longer referenced loses its claim
+      and (at zero `(space,digest)` claims) is queued for release; a digest in **both** is untouched
+      (a re-PUT of identical bytes never churns the row). Wired into `PutObject` (overwrite-in-place
+      loads the prior manifest's digests) and `DeleteObject` (releases all of them).
+- [x] `uploader.BlobRemover` seam: `RemoveBlob(digest)` released **after** the commit, off the
+      critical section. `Forge.RemoveBlob` is a logged no-op (libforge has the `blob.Remove` binding;
+      the Piri/Sprue handler is to-build — §9) so the bookkeeping runs end-to-end without the network
+      primitive. A recording remover validates the call sites.
+- [x] Superseded manifest CIDs recorded → `gc_candidates` on overwrite/delete (write-only; precise
+      superseded-MST-internal-node tracking deferred — the table has no collector this iteration).
+- [x] Wired `BlobRefs`/`GC`/`Remover` through `ServerDeps`/fx/harness/standalone.
+- [x] `s3frontend/refindex_test.go` (white-box, in-process): dedup across keys (claim 2), overwrite
+      same content (claim held, no release), overwrite different content (old released exactly once),
+      delete-to-zero (released), delete-one-of-two (held until the last reference drops).
 
-Deliverable: overwrite and delete maintain `blob_refs` and emit `remove(digest)` exactly at the last
-claim; dedup keeps a blob alive while any version references it; smoke asserts ref-count transitions.
+Deliverable: overwrite and delete maintain `blob_refs` and emit `RemoveBlob` exactly at the last
+claim; dedup keeps a blob alive while any version references it; verified in-process. (Real
+`RemoveBlob` network behavior validated in smelt at Phase 7.)
+
+> **Transactionality note.** Claim updates run inside the commit critical section (before the guarded
+> root swap); `RemoveBlob` runs after. A cross-process CASRoot loss (single-writer in-process never
+> hits it) could leave claims out of step with the committed root — reconciled by Phase 7's crash
+> recovery (`upload_intents` × `blob_refs`). Claims-in-closure is the safe-side choice (leak, never
+> data loss).
 
 ### Phase 5 — S3 correctness surface
 
