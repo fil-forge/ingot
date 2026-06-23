@@ -26,7 +26,7 @@
 //   - RFC 5649 (AES Key Wrap with Padding): https://www.rfc-editor.org/rfc/rfc5649
 //
 // This is a shared primitive. The tenant-recipient wrap (ECDH-ES+A256KW, in
-// the sibling fee/wrap package) derives its KEK ephemerally per message and
+// the sibling fee/ecdhkw package) derives its KEK ephemerally per message and
 // feeds it here; the region wrap takes a KEK straight from a key provider.
 // Both paths call Wrap and Unwrap identically.
 package aeskw

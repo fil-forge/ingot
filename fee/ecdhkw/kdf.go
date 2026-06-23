@@ -1,4 +1,4 @@
-package wrap
+package ecdhkw
 
 import (
 	"crypto/sha256"

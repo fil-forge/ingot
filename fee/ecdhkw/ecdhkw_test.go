@@ -1,4 +1,4 @@
-package wrap
+package ecdhkw
 
 import (
 	"bytes"

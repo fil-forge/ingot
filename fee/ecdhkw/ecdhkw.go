@@ -1,6 +1,6 @@
-// Package wrap implements ECDH-ES+A256KW key wrapping over X25519: it encrypts
-// a content-encryption key (CEK) to a recipient's X25519 public key so that
-// only the holder of the matching private key can recover it.
+// Package ecdhkw implements ECDH-ES+A256KW key wrapping over X25519: it
+// encrypts a content-encryption key (CEK) to a recipient's X25519 public key so
+// that only the holder of the matching private key can recover it.
 //
 // This is the tenant-recipient wrap of the FilOne encryption design. A fresh
 // ephemeral X25519 key pair is generated for every Wrap; an ECDH against the
@@ -23,7 +23,7 @@
 // CEK as the recipient ciphertext, keyed by a kid) is the job of the
 // higher-level fee package. Keys are passed as crypto/ecdh values directly; any
 // custody or key-provider abstraction lives above this layer.
-package wrap
+package ecdhkw
 
 import (
 	"crypto/ecdh"
@@ -77,7 +77,7 @@ type Wrapped struct {
 func Wrap(recipientPub *ecdh.PublicKey, cek []byte) (*Wrapped, error) {
 	ephemeral, err := ecdh.X25519().GenerateKey(rand.Reader)
 	if err != nil {
-		return nil, fmt.Errorf("wrap: generating ephemeral key: %w", err)
+		return nil, fmt.Errorf("ecdhkw generating ephemeral key: %w", err)
 	}
 	return wrapWithEphemeral(ephemeral, recipientPub, cek)
 }
@@ -90,13 +90,13 @@ func Wrap(recipientPub *ecdh.PublicKey, cek []byte) (*Wrapped, error) {
 // entropy — see randutil.MaybeReadByte — to defeat fixed-seed reproduction.)
 func wrapWithEphemeral(ephemeral *ecdh.PrivateKey, recipientPub *ecdh.PublicKey, cek []byte) (*Wrapped, error) {
 	if recipientPub == nil {
-		return nil, errors.New("wrap: nil recipient public key")
+		return nil, errors.New("ecdhkw nil recipient public key")
 	}
 	if recipientPub.Curve() != ecdh.X25519() {
-		return nil, errors.New("wrap: recipient public key is not X25519")
+		return nil, errors.New("ecdhkw recipient public key is not X25519")
 	}
 	if len(cek) < 16 || len(cek)%8 != 0 {
-		return nil, fmt.Errorf("wrap: CEK must be a multiple of 8 bytes and at least 16, got %d", len(cek))
+		return nil, fmt.Errorf("ecdhkw CEK must be a multiple of 8 bytes and at least 16, got %d", len(cek))
 	}
 
 	kek, err := deriveKEK(ephemeral, recipientPub)
@@ -107,7 +107,7 @@ func wrapWithEphemeral(ephemeral *ecdh.PrivateKey, recipientPub *ecdh.PublicKey,
 
 	wrappedCEK, err := aeskw.Wrap(kek, cek)
 	if err != nil {
-		return nil, fmt.Errorf("wrap: %w", err)
+		return nil, fmt.Errorf("ecdhkw wrapping CEK: %w", err)
 	}
 	return &Wrapped{
 		EphemeralPublicKey: ephemeral.PublicKey(),
@@ -125,19 +125,19 @@ func wrapWithEphemeral(ephemeral *ecdh.PrivateKey, recipientPub *ecdh.PublicKey,
 // callers may match it with errors.Is.
 func Unwrap(recipientPriv *ecdh.PrivateKey, w *Wrapped) ([]byte, error) {
 	if recipientPriv == nil {
-		return nil, errors.New("wrap: nil recipient private key")
+		return nil, errors.New("ecdhkw nil recipient private key")
 	}
 	if recipientPriv.Curve() != ecdh.X25519() {
-		return nil, errors.New("wrap: recipient private key is not X25519")
+		return nil, errors.New("ecdhkw recipient private key is not X25519")
 	}
 	if w == nil {
-		return nil, errors.New("wrap: nil wrapped value")
+		return nil, errors.New("ecdhkw nil wrapped value")
 	}
 	if w.EphemeralPublicKey == nil {
-		return nil, errors.New("wrap: nil ephemeral public key")
+		return nil, errors.New("ecdhkw nil ephemeral public key")
 	}
 	if w.EphemeralPublicKey.Curve() != ecdh.X25519() {
-		return nil, errors.New("wrap: ephemeral public key is not X25519")
+		return nil, errors.New("ecdhkw ephemeral public key is not X25519")
 	}
 
 	kek, err := deriveKEK(recipientPriv, w.EphemeralPublicKey)
@@ -148,7 +148,7 @@ func Unwrap(recipientPriv *ecdh.PrivateKey, w *Wrapped) ([]byte, error) {
 
 	cek, err := aeskw.Unwrap(kek, w.WrappedCEK)
 	if err != nil {
-		return nil, fmt.Errorf("wrap: %w", err)
+		return nil, fmt.Errorf("ecdhkw unwrapping CEK: %w", err)
 	}
 	return cek, nil
 }
@@ -164,7 +164,7 @@ func Unwrap(recipientPriv *ecdh.PrivateKey, w *Wrapped) ([]byte, error) {
 func deriveKEK(local *ecdh.PrivateKey, remote *ecdh.PublicKey) ([]byte, error) {
 	z, err := local.ECDH(remote)
 	if err != nil {
-		return nil, fmt.Errorf("wrap: ECDH: %w", err)
+		return nil, fmt.Errorf("ecdhkw ECDH: %w", err)
 	}
 	defer zero(z)
 
