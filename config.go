@@ -19,8 +19,9 @@ type Config struct {
 	// RootAccess / RootSecret configure the single-account IAM root user.
 	RootAccess string `mapstructure:"root_access" yaml:"root_access"`
 	RootSecret string `mapstructure:"root_secret" yaml:"root_secret"`
-	// ChunkSize is the body chunk size for new objects, in bytes (0 -> default).
-	ChunkSize int64 `mapstructure:"chunk_size" yaml:"chunk_size"`
+	// MaxBlobSize is the blob ceiling for new objects, in bytes (0 -> default
+	// 256 MiB). An object larger than this is coarsely split into ≤ max blobs.
+	MaxBlobSize int64 `mapstructure:"max_blob_size" yaml:"max_blob_size"`
 	// SealBytes / SealAge / Retain tune the logstore (zero -> logstore defaults).
 	SealBytes int64  `mapstructure:"seal_bytes" yaml:"seal_bytes"`
 	SealAge   string `mapstructure:"seal_age" yaml:"seal_age"`
@@ -92,12 +93,12 @@ func (c Config) ServerConfig() (ServerConfig, error) {
 		return ServerConfig{}, err
 	}
 	return ServerConfig{
-		Addr:       c.Addr,
-		DataDir:    c.DataDir,
-		Region:     c.Region,
-		RootAccess: c.RootAccess,
-		RootSecret: c.RootSecret,
-		ChunkSize:  c.ChunkSize,
+		Addr:        c.Addr,
+		DataDir:     c.DataDir,
+		Region:      c.Region,
+		RootAccess:  c.RootAccess,
+		RootSecret:  c.RootSecret,
+		MaxBlobSize: c.MaxBlobSize,
 
 		// Per-plane: a per-plane override wins, else the top-level value,
 		// else the logstore default. Ship defaults to true unless a plane

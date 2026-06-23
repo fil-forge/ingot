@@ -50,8 +50,8 @@ var _ backend.Backend = (*Backend)(nil)
 
 // New constructs a Backend wired over ingot's domain primitives.
 // rs is the layered read blockstore (log → forge); log is the
-// LSM-style write log; codec is the body-DAG codec used for both
-// chunking on PUT and streaming on GET — typically a *FixedChunker.
+// LSM-style write log; codec splits a body into blobs on PUT and
+// streams them back on GET — typically a *BlobSplitter.
 func New(reg registry.Registry, rs blockstore.ReadStore, log *logstore.Store, codec msbucket.BodyCodec) *Backend {
 	return &Backend{
 		read:  rs,

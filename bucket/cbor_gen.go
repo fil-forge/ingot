@@ -26,7 +26,7 @@ func (t *ObjectManifest) MarshalCBOR(w io.Writer) error {
 
 	cw := cbg.NewCborWriter(w)
 
-	if _, err := cw.Write([]byte{169}); err != nil {
+	if _, err := cw.Write([]byte{171}); err != nil {
 		return err
 	}
 
@@ -43,6 +43,29 @@ func (t *ObjectManifest) MarshalCBOR(w io.Writer) error {
 	}
 
 	if err := t.Body.MarshalCBOR(cw); err != nil {
+		return err
+	}
+
+	// t.ETag (string) (string)
+	if len("e") > 1000000 {
+		return xerrors.Errorf("Value in field \"e\" was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("e"))); err != nil {
+		return err
+	}
+	if _, err := cw.WriteString(string("e")); err != nil {
+		return err
+	}
+
+	if len(t.ETag) > 1000000 {
+		return xerrors.Errorf("Value in field t.ETag was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len(t.ETag))); err != nil {
+		return err
+	}
+	if _, err := cw.WriteString(string(t.ETag)); err != nil {
 		return err
 	}
 
@@ -206,6 +229,22 @@ func (t *ObjectManifest) MarshalCBOR(w io.Writer) error {
 		return err
 	}
 
+	// t.DeleteMarker (bool) (bool)
+	if len("dm") > 1000000 {
+		return xerrors.Errorf("Value in field \"dm\" was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("dm"))); err != nil {
+		return err
+	}
+	if _, err := cw.WriteString(string("dm")); err != nil {
+		return err
+	}
+
+	if err := cbg.WriteBool(w, t.DeleteMarker); err != nil {
+		return err
+	}
+
 	// t.Metadata (map[string]string) (map)
 	if len("md") > 1000000 {
 		return xerrors.Errorf("Value in field \"md\" was too long")
@@ -313,6 +352,17 @@ func (t *ObjectManifest) UnmarshalCBOR(r io.Reader) (err error) {
 				}
 
 			}
+			// t.ETag (string) (string)
+		case "e":
+
+			{
+				sval, err := cbg.ReadStringWithMax(cr, 1000000)
+				if err != nil {
+					return err
+				}
+
+				t.ETag = string(sval)
+			}
 			// t.Key (string) (string)
 		case "k":
 
@@ -405,6 +455,24 @@ func (t *ObjectManifest) UnmarshalCBOR(r io.Reader) (err error) {
 
 				t.ContentType = string(sval)
 			}
+			// t.DeleteMarker (bool) (bool)
+		case "dm":
+
+			maj, extra, err = cr.ReadHeader()
+			if err != nil {
+				return err
+			}
+			if maj != cbg.MajOther {
+				return fmt.Errorf("booleans must be major type 7")
+			}
+			switch extra {
+			case 20:
+				t.DeleteMarker = false
+			case 21:
+				t.DeleteMarker = true
+			default:
+				return fmt.Errorf("booleans are either major type 7, value 20 or 21 (got %d)", extra)
+			}
 			// t.Metadata (map[string]string) (map)
 		case "md":
 
@@ -468,45 +536,6 @@ func (t *Body) MarshalCBOR(w io.Writer) error {
 	cw := cbg.NewCborWriter(w)
 
 	if _, err := cw.Write([]byte{165}); err != nil {
-		return err
-	}
-
-	// t.Content (cid.Cid) (struct)
-	if len("c") > 1000000 {
-		return xerrors.Errorf("Value in field \"c\" was too long")
-	}
-
-	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("c"))); err != nil {
-		return err
-	}
-	if _, err := cw.WriteString(string("c")); err != nil {
-		return err
-	}
-
-	if err := cbg.WriteCid(cw, t.Content); err != nil {
-		return xerrors.Errorf("failed to write cid field t.Content: %w", err)
-	}
-
-	// t.Format (string) (string)
-	if len("f") > 1000000 {
-		return xerrors.Errorf("Value in field \"f\" was too long")
-	}
-
-	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("f"))); err != nil {
-		return err
-	}
-	if _, err := cw.WriteString(string("f")); err != nil {
-		return err
-	}
-
-	if len(t.Format) > 1000000 {
-		return xerrors.Errorf("Value in field t.Format was too long")
-	}
-
-	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len(t.Format))); err != nil {
-		return err
-	}
-	if _, err := cw.WriteString(string(t.Format)); err != nil {
 		return err
 	}
 
@@ -580,6 +609,54 @@ func (t *Body) MarshalCBOR(w io.Writer) error {
 		}
 	}
 
+	// t.Blobs ([]bucket.BlobRef) (slice)
+	if len("bl") > 1000000 {
+		return xerrors.Errorf("Value in field \"bl\" was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("bl"))); err != nil {
+		return err
+	}
+	if _, err := cw.WriteString(string("bl")); err != nil {
+		return err
+	}
+
+	if len(t.Blobs) > 8192 {
+		return xerrors.Errorf("Slice value in field t.Blobs was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajArray, uint64(len(t.Blobs))); err != nil {
+		return err
+	}
+	for _, v := range t.Blobs {
+		if err := v.MarshalCBOR(cw); err != nil {
+			return err
+		}
+
+	}
+
+	// t.IndexRoot (cid.Cid) (struct)
+	if len("ir") > 1000000 {
+		return xerrors.Errorf("Value in field \"ir\" was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("ir"))); err != nil {
+		return err
+	}
+	if _, err := cw.WriteString(string("ir")); err != nil {
+		return err
+	}
+
+	if t.IndexRoot == nil {
+		if _, err := cw.Write(cbg.CborNull); err != nil {
+			return err
+		}
+	} else {
+		if err := cbg.WriteCid(cw, *t.IndexRoot); err != nil {
+			return xerrors.Errorf("failed to write cid field t.IndexRoot: %w", err)
+		}
+	}
+
 	return nil
 }
 
@@ -608,7 +685,7 @@ func (t *Body) UnmarshalCBOR(r io.Reader) (err error) {
 
 	n := extra
 
-	nameBuf := make([]byte, 1)
+	nameBuf := make([]byte, 2)
 	for i := uint64(0); i < n; i++ {
 		nameLen, ok, err := cbg.ReadFullStringIntoBuf(cr, nameBuf, 1000000)
 		if err != nil {
@@ -624,31 +701,7 @@ func (t *Body) UnmarshalCBOR(r io.Reader) (err error) {
 		}
 
 		switch string(nameBuf[:nameLen]) {
-		// t.Content (cid.Cid) (struct)
-		case "c":
-
-			{
-
-				c, err := cbg.ReadCid(cr)
-				if err != nil {
-					return xerrors.Errorf("failed to read cid field t.Content: %w", err)
-				}
-
-				t.Content = c
-
-			}
-			// t.Format (string) (string)
-		case "f":
-
-			{
-				sval, err := cbg.ReadStringWithMax(cr, 1000000)
-				if err != nil {
-					return err
-				}
-
-				t.Format = string(sval)
-			}
-			// t.SHA256 ([]uint8) (slice)
+		// t.SHA256 ([]uint8) (slice)
 		case "h":
 
 			maj, extra, err = cr.ReadHeader()
@@ -720,6 +773,68 @@ func (t *Body) UnmarshalCBOR(r io.Reader) (err error) {
 
 				t.Size = int64(extraI)
 			}
+			// t.Blobs ([]bucket.BlobRef) (slice)
+		case "bl":
+
+			maj, extra, err = cr.ReadHeader()
+			if err != nil {
+				return err
+			}
+
+			if extra > 8192 {
+				return fmt.Errorf("t.Blobs: array too large (%d)", extra)
+			}
+
+			if maj != cbg.MajArray {
+				return fmt.Errorf("expected cbor array")
+			}
+
+			if extra > 0 {
+				t.Blobs = make([]BlobRef, extra)
+			}
+
+			for i := 0; i < int(extra); i++ {
+				{
+					var maj byte
+					var extra uint64
+					var err error
+					_ = maj
+					_ = extra
+					_ = err
+
+					{
+
+						if err := t.Blobs[i].UnmarshalCBOR(cr); err != nil {
+							return xerrors.Errorf("unmarshaling t.Blobs[i]: %w", err)
+						}
+
+					}
+
+				}
+			}
+			// t.IndexRoot (cid.Cid) (struct)
+		case "ir":
+
+			{
+
+				b, err := cr.ReadByte()
+				if err != nil {
+					return err
+				}
+				if b != cbg.CborNull[0] {
+					if err := cr.UnreadByte(); err != nil {
+						return err
+					}
+
+					c, err := cbg.ReadCid(cr)
+					if err != nil {
+						return xerrors.Errorf("failed to read cid field t.IndexRoot: %w", err)
+					}
+
+					t.IndexRoot = &c
+				}
+
+			}
 
 		default:
 			// Field doesn't exist on this type, so ignore it
@@ -731,7 +846,7 @@ func (t *Body) UnmarshalCBOR(r io.Reader) (err error) {
 
 	return nil
 }
-func (t *FixedChunkerIndex) MarshalCBOR(w io.Writer) error {
+func (t *BlobRef) MarshalCBOR(w io.Writer) error {
 	if t == nil {
 		_, err := w.Write(cbg.CborNull)
 		return err
@@ -739,55 +854,74 @@ func (t *FixedChunkerIndex) MarshalCBOR(w io.Writer) error {
 
 	cw := cbg.NewCborWriter(w)
 
-	if _, err := cw.Write([]byte{162}); err != nil {
+	if _, err := cw.Write([]byte{163}); err != nil {
 		return err
 	}
 
-	// t.Chunks ([]cid.Cid) (slice)
-	if len("c") > 1000000 {
-		return xerrors.Errorf("Value in field \"c\" was too long")
+	// t.Digest ([]uint8) (slice)
+	if len("d") > 1000000 {
+		return xerrors.Errorf("Value in field \"d\" was too long")
 	}
 
-	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("c"))); err != nil {
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("d"))); err != nil {
 		return err
 	}
-	if _, err := cw.WriteString(string("c")); err != nil {
-		return err
-	}
-
-	if len(t.Chunks) > 8192 {
-		return xerrors.Errorf("Slice value in field t.Chunks was too long")
-	}
-
-	if err := cw.WriteMajorTypeHeader(cbg.MajArray, uint64(len(t.Chunks))); err != nil {
-		return err
-	}
-	for _, v := range t.Chunks {
-
-		if err := cbg.WriteCid(cw, v); err != nil {
-			return xerrors.Errorf("failed to write cid field v: %w", err)
-		}
-
-	}
-
-	// t.ChunkSize (int64) (int64)
-	if len("cs") > 1000000 {
-		return xerrors.Errorf("Value in field \"cs\" was too long")
-	}
-
-	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("cs"))); err != nil {
-		return err
-	}
-	if _, err := cw.WriteString(string("cs")); err != nil {
+	if _, err := cw.WriteString(string("d")); err != nil {
 		return err
 	}
 
-	if t.ChunkSize >= 0 {
-		if err := cw.WriteMajorTypeHeader(cbg.MajUnsignedInt, uint64(t.ChunkSize)); err != nil {
+	if len(t.Digest) > 2097152 {
+		return xerrors.Errorf("Byte array in field t.Digest was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajByteString, uint64(len(t.Digest))); err != nil {
+		return err
+	}
+
+	if _, err := cw.Write(t.Digest); err != nil {
+		return err
+	}
+
+	// t.Length (int64) (int64)
+	if len("l") > 1000000 {
+		return xerrors.Errorf("Value in field \"l\" was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("l"))); err != nil {
+		return err
+	}
+	if _, err := cw.WriteString(string("l")); err != nil {
+		return err
+	}
+
+	if t.Length >= 0 {
+		if err := cw.WriteMajorTypeHeader(cbg.MajUnsignedInt, uint64(t.Length)); err != nil {
 			return err
 		}
 	} else {
-		if err := cw.WriteMajorTypeHeader(cbg.MajNegativeInt, uint64(-t.ChunkSize-1)); err != nil {
+		if err := cw.WriteMajorTypeHeader(cbg.MajNegativeInt, uint64(-t.Length-1)); err != nil {
+			return err
+		}
+	}
+
+	// t.Offset (int64) (int64)
+	if len("o") > 1000000 {
+		return xerrors.Errorf("Value in field \"o\" was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("o"))); err != nil {
+		return err
+	}
+	if _, err := cw.WriteString(string("o")); err != nil {
+		return err
+	}
+
+	if t.Offset >= 0 {
+		if err := cw.WriteMajorTypeHeader(cbg.MajUnsignedInt, uint64(t.Offset)); err != nil {
+			return err
+		}
+	} else {
+		if err := cw.WriteMajorTypeHeader(cbg.MajNegativeInt, uint64(-t.Offset-1)); err != nil {
 			return err
 		}
 	}
@@ -795,8 +929,8 @@ func (t *FixedChunkerIndex) MarshalCBOR(w io.Writer) error {
 	return nil
 }
 
-func (t *FixedChunkerIndex) UnmarshalCBOR(r io.Reader) (err error) {
-	*t = FixedChunkerIndex{}
+func (t *BlobRef) UnmarshalCBOR(r io.Reader) (err error) {
+	*t = BlobRef{}
 
 	cr := cbg.NewCborReader(r)
 
@@ -815,12 +949,12 @@ func (t *FixedChunkerIndex) UnmarshalCBOR(r io.Reader) (err error) {
 	}
 
 	if extra > cbg.MaxLength {
-		return fmt.Errorf("FixedChunkerIndex: map struct too large (%d)", extra)
+		return fmt.Errorf("BlobRef: map struct too large (%d)", extra)
 	}
 
 	n := extra
 
-	nameBuf := make([]byte, 2)
+	nameBuf := make([]byte, 1)
 	for i := uint64(0); i < n; i++ {
 		nameLen, ok, err := cbg.ReadFullStringIntoBuf(cr, nameBuf, 1000000)
 		if err != nil {
@@ -836,50 +970,31 @@ func (t *FixedChunkerIndex) UnmarshalCBOR(r io.Reader) (err error) {
 		}
 
 		switch string(nameBuf[:nameLen]) {
-		// t.Chunks ([]cid.Cid) (slice)
-		case "c":
+		// t.Digest ([]uint8) (slice)
+		case "d":
 
 			maj, extra, err = cr.ReadHeader()
 			if err != nil {
 				return err
 			}
 
-			if extra > 8192 {
-				return fmt.Errorf("t.Chunks: array too large (%d)", extra)
+			if extra > 2097152 {
+				return fmt.Errorf("t.Digest: byte array too large (%d)", extra)
 			}
-
-			if maj != cbg.MajArray {
-				return fmt.Errorf("expected cbor array")
+			if maj != cbg.MajByteString {
+				return fmt.Errorf("expected byte array")
 			}
 
 			if extra > 0 {
-				t.Chunks = make([]cid.Cid, extra)
+				t.Digest = make([]uint8, extra)
 			}
 
-			for i := 0; i < int(extra); i++ {
-				{
-					var maj byte
-					var extra uint64
-					var err error
-					_ = maj
-					_ = extra
-					_ = err
-
-					{
-
-						c, err := cbg.ReadCid(cr)
-						if err != nil {
-							return xerrors.Errorf("failed to read cid field t.Chunks[i]: %w", err)
-						}
-
-						t.Chunks[i] = c
-
-					}
-
-				}
+			if _, err := io.ReadFull(cr, t.Digest); err != nil {
+				return err
 			}
-			// t.ChunkSize (int64) (int64)
-		case "cs":
+
+			// t.Length (int64) (int64)
+		case "l":
 			{
 				maj, extra, err := cr.ReadHeader()
 				if err != nil {
@@ -902,7 +1017,33 @@ func (t *FixedChunkerIndex) UnmarshalCBOR(r io.Reader) (err error) {
 					return fmt.Errorf("wrong type for int64 field: %d", maj)
 				}
 
-				t.ChunkSize = int64(extraI)
+				t.Length = int64(extraI)
+			}
+			// t.Offset (int64) (int64)
+		case "o":
+			{
+				maj, extra, err := cr.ReadHeader()
+				if err != nil {
+					return err
+				}
+				var extraI int64
+				switch maj {
+				case cbg.MajUnsignedInt:
+					extraI = int64(extra)
+					if extraI < 0 {
+						return fmt.Errorf("int64 positive overflow")
+					}
+				case cbg.MajNegativeInt:
+					extraI = int64(extra)
+					if extraI < 0 {
+						return fmt.Errorf("int64 negative overflow")
+					}
+					extraI = -1 - extraI
+				default:
+					return fmt.Errorf("wrong type for int64 field: %d", maj)
+				}
+
+				t.Offset = int64(extraI)
 			}
 
 		default:

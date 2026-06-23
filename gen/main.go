@@ -16,7 +16,7 @@ func main() {
 	if err := cfg.WriteMapEncodersToFile("../bucket/cbor_gen.go", "bucket",
 		bucket.ObjectManifest{},
 		bucket.Body{},
-		bucket.FixedChunkerIndex{},
+		bucket.BlobRef{},
 	); err != nil {
 		panic(err)
 	}

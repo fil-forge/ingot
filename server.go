@@ -46,9 +46,9 @@ type ServerConfig struct {
 	RootAccess string
 	RootSecret string
 
-	// ChunkSize is the body chunk size for new objects, in bytes.
-	// 0 → bucket.DefaultChunkSize.
-	ChunkSize int64
+	// MaxBlobSize is the blob ceiling for new objects, in bytes.
+	// 0 → bucket.DefaultMaxBlobSize.
+	MaxBlobSize int64
 
 	// Per-plane seal thresholds, ship gates, and retention. Each plane
 	// seals, ships, and retains independently. Zero SealBytes/SealAge
@@ -146,7 +146,7 @@ func New(ctx context.Context, cfg ServerConfig, deps ServerDeps) (*Server, error
 	}
 
 	bs := blockstore.NewLayered(log, deps.BaseBlockReader)
-	codec := &msbucket.FixedChunker{ChunkSize: cfg.ChunkSize}
+	codec := &msbucket.BlobSplitter{MaxBlobSize: cfg.MaxBlobSize}
 	backend := s3frontend.New(deps.Registry, bs, log, codec)
 
 	api, err := buildS3API(ctx, backend, cfg)
@@ -177,7 +177,7 @@ func (s *Server) Start(ctx context.Context) error {
 		zap.String("addr", s.cfg.Addr),
 		zap.String("region", s.cfg.Region),
 		zap.String("data_dir", s.cfg.DataDir),
-		zap.Int64("chunk_size", s.cfg.ChunkSize),
+		zap.Int64("max_blob_size", s.cfg.MaxBlobSize),
 	)
 	go func() {
 		if err := s.api.ServeMultiPort([]string{s.cfg.Addr}); err != nil {
@@ -309,8 +309,8 @@ func applyServerDefaults(cfg ServerConfig) ServerConfig {
 	if cfg.Region == "" {
 		cfg.Region = "us-east-1"
 	}
-	if cfg.ChunkSize <= 0 {
-		cfg.ChunkSize = msbucket.DefaultChunkSize
+	if cfg.MaxBlobSize <= 0 {
+		cfg.MaxBlobSize = msbucket.DefaultMaxBlobSize
 	}
 	// SealBytes / SealAge / Retain pass through to logstore.Open
 	// untouched; logstore.Config.defaults handles its own fallbacks.
