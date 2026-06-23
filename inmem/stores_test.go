@@ -1,0 +1,276 @@
+package inmem
+
+import (
+	"context"
+	"sync"
+	"sync/atomic"
+	"testing"
+
+	"github.com/fil-forge/ingot/registry"
+)
+
+func TestBlobRefs_CountToZero(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+	digest := []byte("digest-A")
+	const space = "did:space:1"
+
+	claim := func(bucket, key, version, sp string) registry.BlobClaim {
+		return registry.BlobClaim{Digest: digest, Bucket: bucket, ObjectKey: key, VersionID: version, Space: sp}
+	}
+
+	// Two versions in the same space reference the same blob → count 2.
+	mustAdd(t, m, claim("b", "k1", registry.NullVersionID, space))
+	mustAdd(t, m, claim("b", "k2", registry.NullVersionID, space))
+	if n := count(t, m, space, digest); n != 2 {
+		t.Fatalf("count = %d, want 2", n)
+	}
+
+	// Idempotent add (same PK) does not inflate the count.
+	mustAdd(t, m, claim("b", "k1", registry.NullVersionID, space))
+	if n := count(t, m, space, digest); n != 2 {
+		t.Fatalf("count after dup add = %d, want 2", n)
+	}
+
+	// A claim from a different space is counted under that space only.
+	mustAdd(t, m, claim("b2", "k1", registry.NullVersionID, "did:space:2"))
+	if n := count(t, m, space, digest); n != 2 {
+		t.Fatalf("count for space 1 = %d, want 2 (space 2 must not leak in)", n)
+	}
+	if n := count(t, m, "did:space:2", digest); n != 1 {
+		t.Fatalf("count for space 2 = %d, want 1", n)
+	}
+
+	// Releasing both space-1 versions drops its claim to zero (the remove gate).
+	if err := m.DeleteBlobClaim(ctx, digest, "b", "k1", registry.NullVersionID); err != nil {
+		t.Fatalf("DeleteBlobClaim: %v", err)
+	}
+	if n := count(t, m, space, digest); n != 1 {
+		t.Fatalf("count after first delete = %d, want 1", n)
+	}
+	if err := m.DeleteBlobClaim(ctx, digest, "b", "k2", registry.NullVersionID); err != nil {
+		t.Fatalf("DeleteBlobClaim: %v", err)
+	}
+	if n := count(t, m, space, digest); n != 0 {
+		t.Fatalf("count after last delete = %d, want 0", n)
+	}
+
+	// Idempotent delete of an already-absent claim is not an error.
+	if err := m.DeleteBlobClaim(ctx, digest, "b", "k1", registry.NullVersionID); err != nil {
+		t.Fatalf("idempotent DeleteBlobClaim: %v", err)
+	}
+}
+
+func TestMultipartLatch_SingleWinner_Sequential(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+	const id = "upl-1"
+
+	if err := m.CreateSession(ctx, registry.MultipartSession{UploadID: id, Bucket: "b", ObjectKey: "k"}); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	// A second create for the same id collides.
+	if err := m.CreateSession(ctx, registry.MultipartSession{UploadID: id, Bucket: "b", ObjectKey: "k"}); err != registry.ErrExists {
+		t.Fatalf("duplicate CreateSession err = %v, want ErrExists", err)
+	}
+
+	// Complete wins the latch; a racing Abort observes the moved row and loses.
+	won, err := m.LatchSession(ctx, id, registry.SessionOpen, registry.SessionCompleting)
+	if err != nil || !won {
+		t.Fatalf("Complete latch: won=%v err=%v, want won=true", won, err)
+	}
+	won, err = m.LatchSession(ctx, id, registry.SessionOpen, registry.SessionAborting)
+	if err != nil || won {
+		t.Fatalf("Abort latch after Complete: won=%v err=%v, want won=false", won, err)
+	}
+
+	s, err := m.GetSession(ctx, id)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if s.State != registry.SessionCompleting {
+		t.Fatalf("session state = %q, want %q", s.State, registry.SessionCompleting)
+	}
+
+	// Latching a missing session is a clean loss, not an error.
+	won, err = m.LatchSession(ctx, "nope", registry.SessionOpen, registry.SessionCompleting)
+	if err != nil || won {
+		t.Fatalf("latch missing: won=%v err=%v, want won=false err=nil", won, err)
+	}
+}
+
+func TestMultipartLatch_SingleWinner_Concurrent(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+	const id = "upl-race"
+	if err := m.CreateSession(ctx, registry.MultipartSession{UploadID: id, Bucket: "b", ObjectKey: "k"}); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+
+	const racers = 32
+	var winners int64
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < racers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			won, err := m.LatchSession(ctx, id, registry.SessionOpen, registry.SessionCompleting)
+			if err != nil {
+				t.Errorf("LatchSession: %v", err)
+			}
+			if won {
+				atomic.AddInt64(&winners, 1)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if winners != 1 {
+		t.Fatalf("latch winners = %d, want exactly 1", winners)
+	}
+}
+
+func TestIntents_StateMachine(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+	digest := []byte("intent-digest")
+
+	if err := m.PutIntent(ctx, registry.UploadIntent{
+		Digest: digest, LocalPath: "/spool/x", Size: 42, State: registry.IntentSpooled, Bucket: "b",
+	}); err != nil {
+		t.Fatalf("PutIntent: %v", err)
+	}
+
+	got, err := m.GetIntent(ctx, digest)
+	if err != nil {
+		t.Fatalf("GetIntent: %v", err)
+	}
+	if got.State != registry.IntentSpooled || got.Size != 42 || got.LocalPath != "/spool/x" {
+		t.Fatalf("GetIntent = %+v", got)
+	}
+
+	if err := m.SetIntentState(ctx, digest, registry.IntentParked); err != nil {
+		t.Fatalf("SetIntentState: %v", err)
+	}
+	parked, err := m.ListIntentsByState(ctx, registry.IntentParked)
+	if err != nil {
+		t.Fatalf("ListIntentsByState: %v", err)
+	}
+	if len(parked) != 1 || string(parked[0].Digest) != string(digest) {
+		t.Fatalf("parked intents = %+v, want one with our digest", parked)
+	}
+	if spooled, _ := m.ListIntentsByState(ctx, registry.IntentSpooled); len(spooled) != 0 {
+		t.Fatalf("spooled intents = %+v, want none after state change", spooled)
+	}
+
+	// SetIntentState on a missing digest is an explicit miss.
+	if err := m.SetIntentState(ctx, []byte("nope"), registry.IntentParked); err != registry.ErrNotFound {
+		t.Fatalf("SetIntentState missing err = %v, want ErrNotFound", err)
+	}
+
+	if err := m.DeleteIntent(ctx, digest); err != nil {
+		t.Fatalf("DeleteIntent: %v", err)
+	}
+	if _, err := m.GetIntent(ctx, digest); err != registry.ErrNotFound {
+		t.Fatalf("GetIntent after delete err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestParts_OrderedAndCascade(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+	const id = "upl-parts"
+	if err := m.CreateSession(ctx, registry.MultipartSession{UploadID: id, Bucket: "b", ObjectKey: "k"}); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+
+	// Insert out of order; ListParts must return ascending part numbers.
+	mustPutPart(t, m, registry.MultipartPart{UploadID: id, PartNumber: 2, ETagMD5: []byte("m2"), Size: 2, BlobDigests: [][]byte{[]byte("d2")}})
+	mustPutPart(t, m, registry.MultipartPart{UploadID: id, PartNumber: 1, ETagMD5: []byte("m1"), Size: 1, BlobDigests: [][]byte{[]byte("d1a"), []byte("d1b")}})
+
+	parts, err := m.ListParts(ctx, id)
+	if err != nil {
+		t.Fatalf("ListParts: %v", err)
+	}
+	if len(parts) != 2 || parts[0].PartNumber != 1 || parts[1].PartNumber != 2 {
+		t.Fatalf("parts order = %+v, want [1,2]", parts)
+	}
+	if len(parts[0].BlobDigests) != 2 {
+		t.Fatalf("part 1 blob digests = %d, want 2", len(parts[0].BlobDigests))
+	}
+
+	// Returned data is a copy: mutating it must not corrupt the store.
+	parts[0].BlobDigests[0][0] = 'X'
+	again, _ := m.ListParts(ctx, id)
+	if string(again[0].BlobDigests[0]) != "d1a" {
+		t.Fatalf("store mutated through returned slice: %q", again[0].BlobDigests[0])
+	}
+
+	// PutPart against a missing session is rejected (FK).
+	if err := m.PutPart(ctx, registry.MultipartPart{UploadID: "missing", PartNumber: 1, ETagMD5: []byte("m"), BlobDigests: [][]byte{[]byte("d")}}); err != registry.ErrNotFound {
+		t.Fatalf("PutPart missing session err = %v, want ErrNotFound", err)
+	}
+
+	// Deleting the session cascades to its parts.
+	if err := m.DeleteSession(ctx, id); err != nil {
+		t.Fatalf("DeleteSession: %v", err)
+	}
+	if after, _ := m.ListParts(ctx, id); len(after) != 0 {
+		t.Fatalf("parts after session delete = %+v, want none (cascade)", after)
+	}
+}
+
+func TestLocations_RoundTrip(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+	const space = "did:space:loc"
+	digest := []byte("loc-digest")
+
+	if err := m.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: digest, Provider: "did:piri:1", URL: "http://piri/blob", Size: 100}); err != nil {
+		t.Fatalf("PutLocation: %v", err)
+	}
+	loc, err := m.GetLocation(ctx, space, digest)
+	if err != nil {
+		t.Fatalf("GetLocation: %v", err)
+	}
+	if loc.URL != "http://piri/blob" || loc.Size != 100 || loc.Provider != "did:piri:1" {
+		t.Fatalf("GetLocation = %+v", loc)
+	}
+	if _, err := m.GetLocation(ctx, "did:other", digest); err != registry.ErrNotFound {
+		t.Fatalf("GetLocation wrong space err = %v, want ErrNotFound", err)
+	}
+	if err := m.DeleteLocation(ctx, space, digest); err != nil {
+		t.Fatalf("DeleteLocation: %v", err)
+	}
+	if _, err := m.GetLocation(ctx, space, digest); err != registry.ErrNotFound {
+		t.Fatalf("GetLocation after delete err = %v, want ErrNotFound", err)
+	}
+}
+
+// helpers
+
+func mustAdd(t *testing.T, m *MemStore, c registry.BlobClaim) {
+	t.Helper()
+	if err := m.AddBlobClaim(context.Background(), c); err != nil {
+		t.Fatalf("AddBlobClaim: %v", err)
+	}
+}
+
+func count(t *testing.T, m *MemStore, space string, digest []byte) int {
+	t.Helper()
+	n, err := m.CountClaims(context.Background(), space, digest)
+	if err != nil {
+		t.Fatalf("CountClaims: %v", err)
+	}
+	return n
+}
+
+func mustPutPart(t *testing.T, m *MemStore, p registry.MultipartPart) {
+	t.Helper()
+	if err := m.PutPart(context.Background(), p); err != nil {
+		t.Fatalf("PutPart: %v", err)
+	}
+}

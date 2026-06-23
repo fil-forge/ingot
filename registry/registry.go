@@ -13,6 +13,7 @@ import (
 // State is the metadata stored per bucket.
 type State struct {
 	Name      string
+	Space     string  // Forge space DID the bucket's data lives in ("" until the write path threads it)
 	Root      cid.Cid // current MST root; cid.Undef for empty bucket
 	ForgeRoot cid.Cid // last MST root whose DAG has been shipped to Forge
 	CreatedAt int64   // unix seconds

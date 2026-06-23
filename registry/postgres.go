@@ -49,9 +49,10 @@ func (r *Postgres) Create(ctx context.Context, name string, createdAt int64) err
 func (r *Postgres) Get(ctx context.Context, name string) (*State, error) {
 	var rootBytes, forgeBytes []byte
 	var createdAt int64
+	var space string
 	err := r.pool.QueryRow(ctx,
-		`SELECT root_cid, forge_root_cid, created_at FROM ingot.buckets WHERE name = $1`, name).
-		Scan(&rootBytes, &forgeBytes, &createdAt)
+		`SELECT root_cid, forge_root_cid, created_at, space FROM ingot.buckets WHERE name = $1`, name).
+		Scan(&rootBytes, &forgeBytes, &createdAt, &space)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -59,7 +60,7 @@ func (r *Postgres) Get(ctx context.Context, name string) (*State, error) {
 		return nil, fmt.Errorf("registry: get %q: %w", name, err)
 	}
 
-	st := &State{Name: name, CreatedAt: createdAt}
+	st := &State{Name: name, Space: space, CreatedAt: createdAt}
 	if err := setCidPg(&st.Root, rootBytes, name, "root_cid"); err != nil {
 		return nil, err
 	}
@@ -71,7 +72,7 @@ func (r *Postgres) Get(ctx context.Context, name string) (*State, error) {
 
 func (r *Postgres) List(ctx context.Context) ([]*State, error) {
 	rows, err := r.pool.Query(ctx,
-		`SELECT name, root_cid, forge_root_cid, created_at FROM ingot.buckets ORDER BY name ASC`)
+		`SELECT name, root_cid, forge_root_cid, created_at, space FROM ingot.buckets ORDER BY name ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("registry: list: %w", err)
 	}
@@ -82,10 +83,11 @@ func (r *Postgres) List(ctx context.Context) ([]*State, error) {
 		var name string
 		var rootBytes, forgeBytes []byte
 		var createdAt int64
-		if err := rows.Scan(&name, &rootBytes, &forgeBytes, &createdAt); err != nil {
+		var space string
+		if err := rows.Scan(&name, &rootBytes, &forgeBytes, &createdAt, &space); err != nil {
 			return nil, fmt.Errorf("registry: list scan: %w", err)
 		}
-		st := &State{Name: name, CreatedAt: createdAt}
+		st := &State{Name: name, Space: space, CreatedAt: createdAt}
 		if err := setCidPg(&st.Root, rootBytes, name, "root_cid"); err != nil {
 			return nil, err
 		}
