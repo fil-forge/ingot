@@ -19,9 +19,10 @@ func hexDec(t *testing.T, s string) []byte {
 }
 
 // cborBstr returns the canonical CBOR encoding of a byte string (header +
-// payload), for byte strings up to 65535 bytes — enough for the test vectors.
-// It is an independent re-implementation used to cross-check the encoder, so
-// the tests don't validate cose against itself.
+// payload). cborHead emits the 8/16/32-bit length forms, so this handles byte
+// strings far larger than the test vectors need. It is an independent
+// re-implementation used to cross-check the encoder, so the tests don't
+// validate cose against itself.
 func cborBstr(b []byte) []byte {
 	return append(cborHead(2, uint64(len(b))), b...)
 }

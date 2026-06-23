@@ -77,8 +77,10 @@ const (
 	HeaderLabelEphemeralKey int64 = -1 // ephemeral key, in a recipient header
 )
 
-// Sentinel errors. Every error returned by this package wraps one of these,
-// so callers can classify failures with errors.Is.
+// Sentinel errors. Decode and header-validation failures wrap one of these, so
+// callers can classify malformed input with errors.Is. (Encode may also fail
+// with a non-sentinel error for a programming mistake — a nil recipient, or a
+// header value that CBOR cannot marshal.)
 var (
 	// ErrNotEncrypt means the input is not a COSE_Encrypt (tag 96) item.
 	ErrNotEncrypt = errors.New("cose: not a COSE_Encrypt (tag 96) structure")

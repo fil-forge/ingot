@@ -89,8 +89,8 @@ func (e *Encrypt) ProtectedBytes() ([]byte, error) {
 // protectedBytes returns the protected header byte-string content for this
 // Headers value: the on-wire RawProtected when present (set by Decode),
 // otherwise a fresh deterministic serialization of Protected. An empty
-// protected header serializes to an empty byte string (h”), per COSE's
-// empty_or_serialized_map rule, rather than to an encoded empty map.
+// protected header serializes to an empty (zero-length) byte string, per
+// COSE's empty_or_serialized_map rule, rather than to an encoded empty map.
 func (h Headers) protectedBytes() ([]byte, error) {
 	if h.RawProtected != nil {
 		return h.RawProtected, nil
