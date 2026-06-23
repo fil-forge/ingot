@@ -85,29 +85,20 @@ func TestSmoke_HeadBucket(t *testing.T) {
 }
 
 func TestSmoke_ListBuckets(t *testing.T) {
-	// ListBuckets_success, ListBuckets_truncated and ListBuckets_with_prefix
-	// are intentionally omitted: they're non-deterministic against ingot and
-	// belong in neither the known-passing nor the XFail set.
-	//
-	// Each builds its expected slice in bucket-*creation* order and then
-	// compares it positionally (compareBuckets) against the ListBuckets
-	// response. ingot returns buckets in lexicographic order — the correct S3
-	// contract, matching versitygw's own posix backend (os.ReadDir sorts by
-	// name) and AWS's paginated ListBuckets (which the truncated case drives
-	// via MaxBuckets/ContinuationToken). The two orderings agree only while a
-	// case's bucket names stay the same width.
-	//
-	// Upstream names buckets "test-bucket-N" from a process-global counter, so
-	// the offset at which these cases run depends on how many getBucketName()
-	// calls preceded them. Under `go test -shuffle` (enabled by the CI Go-test
-	// workflow) that offset is random, so the names straddle a digit-width
-	// boundary (e.g. ...-9 -> ...-10, sorting as 10,11,6,7,8,9) only on some
-	// runs — which is why the cases passed on some OSes/seeds and failed on
-	// others. They can be restored once the upstream comparison is made
-	// order-independent.
+	// success, truncated and with_prefix are served by order-independent local
+	// equivalents (see listbuckets_smoke_test.go), not the upstream versitygw
+	// cases. Upstream compares ListBuckets output positionally against
+	// bucket-creation order, which flakes against ingot's (correct)
+	// lexicographic ordering: the process-global "test-bucket-N" counter,
+	// randomized by `go test -shuffle`, intermittently makes a case's names
+	// straddle a digit-width boundary (...-9 -> ...-10, sorting as 10,11,...).
+	// The local versions keep the same coverage deterministically.
 	tests := []smokeCase{
 		{"empty_success", integration.ListBuckets_empty_success},
 		{"invalid_max_buckets", integration.ListBuckets_invalid_max_buckets},
+		{"success", smokeListBucketsSuccess},
+		{"truncated", smokeListBucketsTruncated},
+		{"with_prefix", smokeListBucketsWithPrefix},
 	}
 	s3conf := newS3Conf(smokeHarness(t).Config())
 	for _, tt := range tests {
