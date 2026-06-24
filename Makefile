@@ -11,7 +11,7 @@ GO ?= go
 
 .DEFAULT_GOAL := build
 
-.PHONY: build test gen clean help
+.PHONY: build test gen gen-check clean help
 
 ## build: compile all packages
 build:
@@ -24,6 +24,13 @@ test:
 ## gen: regenerate CBOR marshalers (idempotent)
 gen:
 	$(GO) generate ./...
+
+## gen-check: regenerate, then fail if the committed generated files are stale
+gen-check: gen
+	@git diff --exit-code -- bucket/cbor_gen.go || { \
+		echo "bucket/cbor_gen.go is stale; run 'make gen' and commit the result"; \
+		exit 1; \
+	}
 
 ## clean: remove the go build/test cache
 clean:

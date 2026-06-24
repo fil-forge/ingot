@@ -1,0 +1,28 @@
+name: Codegen
+
+on:
+  pull_request:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event_name == 'push' && github.sha || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  codegen:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      # Run `go generate` and fail if the committed generated files (e.g.
+      # bucket/cbor_gen.go) are stale. Unlike libforge, ingot's generator is a
+      # plain package built by the standard go-check/go-test workflows, so no
+      # separate generator-compile step is needed here.
+      - run: make gen-check
