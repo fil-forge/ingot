@@ -7,6 +7,7 @@ import (
 	"io"
 	"runtime"
 	"testing"
+	"testing/iotest"
 
 	"github.com/fil-forge/ingot/fee/aesstream"
 	"github.com/stretchr/testify/require"
@@ -35,17 +36,12 @@ func pattern(n int) []byte {
 	return b
 }
 
-func mustSeal(t *testing.T, cfg aesstream.Config, pt []byte) []byte {
-	t.Helper()
-	ct, err := aesstream.Seal(cfg, pt)
-	require.NoError(t, err)
-	return ct
-}
-
 func TestRoundTrip(t *testing.T) {
 	// Each case round-trips plaintext sizes chosen around its own chunk
-	// boundaries: empty, sub-tag, tag-sized, just under/over one chunk,
-	// exact multiples, and odd remainders.
+	// boundaries: empty (encodes as a single empty chunk, TagSize bytes),
+	// sub-tag, tag-sized, just under/over one chunk, exact multiples (a
+	// full-size final chunk, which forces the decrypt-side last-chunk
+	// retry), and odd remainders.
 	cases := []struct {
 		name      string
 		chunkSize int     // Config.ChunkSize; 0 selects DefaultChunkSize
@@ -77,6 +73,7 @@ func TestRoundTrip(t *testing.T) {
 				1,
 				aesstream.DefaultChunkSize,
 				aesstream.DefaultChunkSize + 1,
+				2 * aesstream.DefaultChunkSize,
 				3*aesstream.DefaultChunkSize + 99,
 			},
 		},
@@ -88,7 +85,8 @@ func TestRoundTrip(t *testing.T) {
 			for _, n := range tc.sizes {
 				pt := pattern(int(n))
 
-				ct := mustSeal(t, cfg, pt)
+				ct, err := aesstream.Seal(cfg, pt)
+				require.NoErrorf(t, err, "n=%d: Seal", n)
 				require.Equalf(t, aesstream.EncryptedSize(n, tc.chunkSize), int64(len(ct)),
 					"n=%d: ciphertext length", n)
 
@@ -123,162 +121,152 @@ func TestStreamingOddBoundaries(t *testing.T) {
 			r, err := aesstream.NewReader(bytes.NewReader(ctBuf.Bytes()), cfg)
 			require.NoError(t, err)
 			var out bytes.Buffer
-			rbuf := make([]byte, rstep)
-			_, err = io.CopyBuffer(&out, r, rbuf)
+			n, err := io.CopyBuffer(&out, r, make([]byte, rstep))
 			require.NoErrorf(t, err, "wstep=%d rstep=%d: copy", wstep, rstep)
+			require.Equalf(t, int64(len(pt)), n, "wstep=%d rstep=%d: copied byte count", wstep, rstep)
 			require.Equalf(t, pt, out.Bytes(), "wstep=%d rstep=%d: mismatch", wstep, rstep)
 		}
 	}
-}
 
-// TestFullSizeLastChunk covers the decrypt-retry path: when the plaintext
-// is an exact multiple of the chunk size, the final chunk is full-size and
-// the reader must discover it is the last one by retrying with the flag.
-func TestFullSizeLastChunk(t *testing.T) {
-	const cs = aesstream.MinChunkSize
-	for _, mult := range []int{1, 2, 5} {
-		cfg := baseConfig(cs)
-		pt := pattern(mult * cs)
-		got, err := aesstream.Open(cfg, mustSeal(t, cfg, pt))
-		require.NoErrorf(t, err, "mult=%d: Open", mult)
-		require.Equalf(t, pt, got, "mult=%d: mismatch", mult)
-	}
-}
-
-func TestEmptyPlaintextIsOneChunk(t *testing.T) {
-	cfg := baseConfig(aesstream.MinChunkSize)
-	ct := mustSeal(t, cfg, nil)
-	require.Len(t, ct, aesstream.TagSize, "empty plaintext should encode as one empty chunk")
-	got, err := aesstream.Open(cfg, ct)
+	// Decrypt once more as a true read-side stream: feed the ciphertext one
+	// byte at a time, forcing the Reader to assemble each chunk from many
+	// short underlying reads (the matrix above only varies the caller's read
+	// sizes, never the underlying reader's).
+	ct, err := aesstream.Seal(cfg, pt)
 	require.NoError(t, err)
-	require.Empty(t, got)
+	r, err := aesstream.NewReader(iotest.OneByteReader(bytes.NewReader(ct)), cfg)
+	require.NoError(t, err)
+	got, err := io.ReadAll(r)
+	require.NoError(t, err)
+	require.Equal(t, pt, got, "one-byte-read decrypt mismatch")
 }
 
-func TestTruncationFails(t *testing.T) {
+// TestDecryptFailures gathers every way Open must reject a ciphertext:
+// truncation, mid-stream cuts, reordering, bit flips, trailing data, and
+// decryption under the wrong key, nonce or AAD. Each case either corrupts a
+// good ciphertext or decrypts it with an altered config; every case also
+// checks the streaming-safety invariant that whatever plaintext was released
+// before the error is a genuine prefix — never fabricated bytes.
+func TestDecryptFailures(t *testing.T) {
 	const cs = aesstream.MinChunkSize
 	cfg := baseConfig(cs)
-	pt := pattern(2*cs + 1000) // chunks: [cs] [cs] [1000] → 3 chunks
-	ct := mustSeal(t, cfg, pt)
-	enc := cs + aesstream.TagSize // a full ciphertext chunk
+	enc := cs + aesstream.TagSize // one full ciphertext chunk
+
+	// Base ciphertext: three chunks with a short final chunk, [cs][cs][1000].
+	pt := pattern(2*cs + 1000)
+	ct, err := aesstream.Seal(cfg, pt)
+	require.NoError(t, err)
+
+	// A ciphertext whose final chunk is full-size, so appended bytes land
+	// past the boundary and must be caught as trailing data rather than
+	// pulled into the final chunk.
+	fullPT := pattern(2 * cs)
+	fullCT, err := aesstream.Seal(cfg, fullPT)
+	require.NoError(t, err)
+
+	// reordered swaps the first two (full) chunks.
+	reordered := append([]byte(nil), ct...)
+	copy(reordered[0:enc], ct[enc:2*enc])
+	copy(reordered[enc:2*enc], ct[0:enc])
+
+	// flip returns a copy of the base ciphertext with one bit toggled.
+	flip := func(pos int) []byte {
+		c := append([]byte(nil), ct...)
+		c[pos] ^= 0x01
+		return c
+	}
 
 	cases := []struct {
 		name    string
-		ct      []byte
-		wantErr error // nil → just require some error
+		in      []byte                                  // ciphertext fed to Open
+		plain   []byte                                  // genuine plaintext for the prefix check; nil → pt
+		decfg   func(aesstream.Config) aesstream.Config // decrypt-config override; nil → cfg
+		wantErr error                                   // nil → just require some error
 	}{
-		{"drop final chunk", ct[:2*enc], aesstream.ErrTruncated},
-		{"cut final chunk tag", ct[:len(ct)-4], aesstream.ErrCorrupted},
-		{"cut mid non-final chunk", ct[:enc+50], aesstream.ErrCorrupted},
-		{"empty ciphertext", ct[:0], aesstream.ErrTruncated},
-		{"single byte", ct[:1], aesstream.ErrCorrupted},
+		// Truncated or cut ciphertext.
+		{name: "drop final chunk", in: ct[:2*enc], wantErr: aesstream.ErrTruncated},
+		{name: "cut final chunk tag", in: ct[:len(ct)-4], wantErr: aesstream.ErrCorrupted},
+		{name: "cut mid non-final chunk", in: ct[:enc+50], wantErr: aesstream.ErrCorrupted},
+		{name: "empty ciphertext", in: ct[:0], wantErr: aesstream.ErrTruncated},
+		{name: "single byte", in: ct[:1], wantErr: aesstream.ErrCorrupted},
+
+		// Reordered chunks.
+		{name: "swapped chunks", in: reordered, wantErr: aesstream.ErrCorrupted},
+
+		// Single-bit flips at representative offsets.
+		{name: "flip first chunk body", in: flip(0), wantErr: aesstream.ErrCorrupted},
+		{name: "flip first chunk tag", in: flip(cs + 4), wantErr: aesstream.ErrCorrupted},
+		{name: "flip second chunk", in: flip(enc + 10), wantErr: aesstream.ErrCorrupted},
+		{name: "flip final chunk", in: flip(len(ct) - 1), wantErr: aesstream.ErrCorrupted},
+
+		// Trailing data after the final chunk.
+		{
+			name:    "trailing after full-size final chunk",
+			in:      append(append([]byte(nil), fullCT...), 0xde, 0xad),
+			plain:   fullPT,
+			wantErr: aesstream.ErrTrailingData,
+		},
+		{
+			// Bytes after a short final chunk are pulled into it and break
+			// authentication, so this is reported as corruption rather than
+			// trailing data — still an error.
+			name: "trailing after short final chunk",
+			in:   append(append([]byte(nil), ct...), 0xde, 0xad),
+		},
+
+		// Correct ciphertext, wrong decryption parameters.
+		{
+			name: "wrong key",
+			in:   ct,
+			decfg: func(c aesstream.Config) aesstream.Config {
+				c.Key = bytes.Repeat([]byte{0x99}, aesstream.KeySize)
+				return c
+			},
+			wantErr: aesstream.ErrCorrupted,
+		},
+		{
+			name:    "wrong base nonce",
+			in:      ct,
+			decfg:   func(c aesstream.Config) aesstream.Config { c.BaseNonce = []byte{9, 9, 9, 9, 9, 9, 9}; return c },
+			wantErr: aesstream.ErrCorrupted,
+		},
+		{
+			name:    "wrong AAD",
+			in:      ct,
+			decfg:   func(c aesstream.Config) aesstream.Config { c.AAD = []byte("different"); return c },
+			wantErr: aesstream.ErrCorrupted,
+		},
 	}
+
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := aesstream.Open(cfg, tc.ct)
+			dcfg := cfg
+			if tc.decfg != nil {
+				dcfg = tc.decfg(cfg)
+			}
+			plain := pt
+			if tc.plain != nil {
+				plain = tc.plain
+			}
+			got, err := aesstream.Open(dcfg, tc.in)
 			require.Error(t, err)
 			if tc.wantErr != nil {
 				require.ErrorIs(t, err, tc.wantErr)
 			}
-			// Whatever bytes were released before the error must be a
-			// genuine prefix of the plaintext — never fabricated data.
-			require.True(t, bytes.HasPrefix(pt, got), "released bytes are not a plaintext prefix")
+			// Any bytes released before the error must be a genuine prefix
+			// of the plaintext — the Reader never fabricates output.
+			require.True(t, bytes.HasPrefix(plain, got), "released bytes are not a plaintext prefix")
 		})
 	}
-}
-
-func TestReorderFails(t *testing.T) {
-	const cs = aesstream.MinChunkSize
-	cfg := baseConfig(cs)
-	pt := pattern(2*cs + 500) // 3 chunks
-	ct := mustSeal(t, cfg, pt)
-	enc := cs + aesstream.TagSize
-
-	// Swap the first two full chunks.
-	swapped := make([]byte, len(ct))
-	copy(swapped, ct)
-	copy(swapped[0:enc], ct[enc:2*enc])
-	copy(swapped[enc:2*enc], ct[0:enc])
-
-	_, err := aesstream.Open(cfg, swapped)
-	require.ErrorIs(t, err, aesstream.ErrCorrupted)
-}
-
-func TestBitFlipFails(t *testing.T) {
-	const cs = aesstream.MinChunkSize
-	cfg := baseConfig(cs)
-	pt := pattern(2*cs + 500)
-	ct := mustSeal(t, cfg, pt)
-	enc := cs + aesstream.TagSize
-
-	positions := map[string]int{
-		"first chunk body": 0,
-		"first chunk tag":  cs + 4,      // inside chunk 0's tag
-		"second chunk":     enc + 10,    // inside chunk 1
-		"final chunk":      len(ct) - 1, // last byte (tag of final chunk)
-	}
-	for name, pos := range positions {
-		t.Run(name, func(t *testing.T) {
-			tampered := make([]byte, len(ct))
-			copy(tampered, ct)
-			tampered[pos] ^= 0x01
-			_, err := aesstream.Open(cfg, tampered)
-			require.ErrorIsf(t, err, aesstream.ErrCorrupted, "flip at %d", pos)
-		})
-	}
-}
-
-func TestTrailingDataFails(t *testing.T) {
-	const cs = aesstream.MinChunkSize
-	cfg := baseConfig(cs)
-
-	// After a full-size final chunk the reader stops on the chunk boundary
-	// and the look-ahead detects the extra bytes as trailing data.
-	t.Run("after full-size final chunk", func(t *testing.T) {
-		ct := append(mustSeal(t, cfg, pattern(2*cs)), 0xde, 0xad)
-		_, err := aesstream.Open(cfg, ct)
-		require.ErrorIs(t, err, aesstream.ErrTrailingData)
-	})
-
-	// After a short final chunk the trailing bytes are pulled into the
-	// final chunk read, so they break authentication instead — still an
-	// error, just reported as corruption.
-	t.Run("after short final chunk", func(t *testing.T) {
-		ct := append(mustSeal(t, cfg, pattern(1000)), 0xde, 0xad)
-		_, err := aesstream.Open(cfg, ct)
-		require.Error(t, err)
-	})
-}
-
-func TestWrongKeyOrNonceOrAADFails(t *testing.T) {
-	cfg := baseConfig(aesstream.MinChunkSize)
-	pt := pattern(3000)
-	ct := mustSeal(t, cfg, pt)
-
-	t.Run("wrong key", func(t *testing.T) {
-		bad := cfg
-		bad.Key = bytes.Repeat([]byte{0x99}, aesstream.KeySize)
-		_, err := aesstream.Open(bad, ct)
-		require.ErrorIs(t, err, aesstream.ErrCorrupted)
-	})
-	t.Run("wrong base nonce", func(t *testing.T) {
-		bad := cfg
-		bad.BaseNonce = []byte{9, 9, 9, 9, 9, 9, 9}
-		_, err := aesstream.Open(bad, ct)
-		require.ErrorIs(t, err, aesstream.ErrCorrupted)
-	})
-	t.Run("wrong AAD", func(t *testing.T) {
-		bad := cfg
-		bad.AAD = []byte("different")
-		_, err := aesstream.Open(bad, ct)
-		require.ErrorIs(t, err, aesstream.ErrCorrupted)
-	})
 }
 
 func TestNilAADRoundTrips(t *testing.T) {
 	cfg := baseConfig(aesstream.MinChunkSize)
 	cfg.AAD = nil
 	pt := pattern(9000)
-	got, err := aesstream.Open(cfg, mustSeal(t, cfg, pt))
+	ct, err := aesstream.Seal(cfg, pt)
+	require.NoError(t, err)
+	got, err := aesstream.Open(cfg, ct)
 	require.NoError(t, err)
 	require.Equal(t, pt, got, "nil-AAD round-trip mismatch")
 }
@@ -286,8 +274,10 @@ func TestNilAADRoundTrips(t *testing.T) {
 func TestDeterministic(t *testing.T) {
 	cfg := baseConfig(aesstream.MinChunkSize)
 	pt := pattern(10000)
-	a := mustSeal(t, cfg, pt)
-	b := mustSeal(t, cfg, pt)
+	a, err := aesstream.Seal(cfg, pt)
+	require.NoError(t, err)
+	b, err := aesstream.Seal(cfg, pt)
+	require.NoError(t, err)
 	require.Equal(t, a, b, "Seal is not deterministic for fixed key/nonce/AAD")
 }
 
@@ -417,7 +407,8 @@ func TestEncryptedSize(t *testing.T) {
 		// Cross-check against an actual Seal for small cases.
 		if tc.chunk != 0 {
 			cfg := baseConfig(tc.chunk)
-			ct := mustSeal(t, cfg, pattern(tc.pt))
+			ct, err := aesstream.Seal(cfg, pattern(tc.pt))
+			require.NoError(t, err)
 			require.Equalf(t, tc.want, int64(len(ct)), "Seal len for pt=%d chunk=%d", tc.pt, tc.chunk)
 		}
 	}
