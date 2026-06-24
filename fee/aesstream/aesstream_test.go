@@ -47,15 +47,15 @@ func TestRoundTrip(t *testing.T) {
 	// Sizes chosen around chunk boundaries: empty, sub-tag, tag-sized,
 	// just under/over one chunk, exact multiples, and odd remainders.
 	const cs = aesstream.MinChunkSize // 4 KiB, the smallest legal chunk
-	sizes := []int{0, 1, 15, 16, 17, cs - 1, cs, cs + 1, 2 * cs, 2*cs + 1, 3 * cs, 3*cs + 123}
+	sizes := []int64{0, 1, 15, 16, 17, cs - 1, cs, cs + 1, 2 * cs, 2*cs + 1, 3 * cs, 3*cs + 123}
 
 	for _, n := range sizes {
-		pt := pattern(n)
-		cfg := baseConfig(cs)
+		pt := pattern(int(n))
+		cfg := baseConfig(int(cs))
 
 		ct := mustSeal(t, cfg, pt)
-		if got := int64(len(ct)); got != aesstream.EncryptedSize(int64(n), cs) {
-			t.Errorf("n=%d: ciphertext len %d, EncryptedSize says %d", n, got, aesstream.EncryptedSize(int64(n), cs))
+		if int64(len(ct)) != aesstream.EncryptedSize(n, cs) {
+			t.Errorf("n=%d: ciphertext len %d, EncryptedSize says %d", n, len(ct), aesstream.EncryptedSize(n, cs))
 		}
 
 		got, err := aesstream.Open(cfg, ct)
