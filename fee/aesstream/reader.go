@@ -101,15 +101,15 @@ func (r *Reader) nextChunk() error {
 	}
 
 	n, rerr := io.ReadFull(r.source, r.inBuf[:r.encChunk])
-	last := false
+	mustBeLast := false
 	switch rerr {
 	case nil:
 		// A full-size chunk. It is tentatively not the last; if the tag
-		// fails below we retry as the last chunk (see openChunk).
+		// fails below openChunk retries it as the last chunk.
 	case io.ErrUnexpectedEOF:
 		// A short read: only the final chunk may be shorter than a full
 		// chunk, so this must be the last one.
-		last = true
+		mustBeLast = true
 	case io.EOF:
 		// End of stream on a chunk boundary. A well-formed stream always
 		// terminates inside a chunk flagged last (after which we stop
@@ -123,7 +123,7 @@ func (r *Reader) nextChunk() error {
 		return r.fail(ErrCorrupted)
 	}
 
-	plaintext, last, err := r.openChunk(r.inBuf[:n], last)
+	plaintext, wasLast, err := r.openChunk(r.index, r.inBuf[:n], mustBeLast)
 	if err != nil {
 		return r.fail(err)
 	}
@@ -131,7 +131,7 @@ func (r *Reader) nextChunk() error {
 	r.unread = plaintext
 	r.index++
 
-	if last {
+	if wasLast {
 		// The stream should end exactly here; any further byte is trailing
 		// data and makes the whole stream invalid.
 		r.err = io.EOF
@@ -148,23 +148,29 @@ func (r *Reader) nextChunk() error {
 	return nil
 }
 
-// openChunk authenticates and decrypts one chunk's ciphertext at the
-// current index. last is the caller's initial guess; for a full-size
-// chunk that fails as a non-last chunk, openChunk retries it as the last
-// chunk (the writer marks a full-size final chunk the same way it marks a
-// short one). It returns the plaintext and whether the chunk was the last.
-func (r *Reader) openChunk(ciphertext []byte, last bool) ([]byte, bool, error) {
-	nonce := streamNonce(r.base, uint32(r.index), last)
+// openChunk authenticates and decrypts the ciphertext of the chunk at the
+// given index. mustBeLast is set when the caller already knows this is the
+// final chunk (it came from a short read): the chunk is opened only with
+// the last flag. Otherwise the chunk could be a middle chunk or a full-size
+// final chunk, so it is tried as non-last first and retried as last on
+// failure (the writer marks a full-size final chunk the same way it marks a
+// short one). It returns the plaintext and whether the chunk was in fact the
+// last.
+func (r *Reader) openChunk(index uint64, ciphertext []byte, mustBeLast bool) ([]byte, bool, error) {
+	wasLast := mustBeLast
+	nonce := streamNonce(r.base, uint32(index), wasLast)
 	out, err := r.aead.Open(r.outBuf[:0], nonce[:], ciphertext, r.aad)
-	if err != nil && !last {
-		last = true
-		nonce = streamNonce(r.base, uint32(r.index), last)
+	if err != nil && !mustBeLast {
+		// A full-size chunk that fails as non-last must be the full-size
+		// final chunk; retry with the last flag set.
+		wasLast = true
+		nonce = streamNonce(r.base, uint32(index), wasLast)
 		out, err = r.aead.Open(r.outBuf[:0], nonce[:], ciphertext, r.aad)
 	}
 	if err != nil {
 		return nil, false, ErrCorrupted
 	}
-	return out, last, nil
+	return out, wasLast, nil
 }
 
 // ChunkSize returns the plaintext chunk size in effect.
