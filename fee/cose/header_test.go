@@ -1,9 +1,10 @@
 package cose
 
 import (
-	"bytes"
 	"math"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestHeaderAccessors(t *testing.T) {
@@ -13,60 +14,51 @@ func TestHeaderAccessors(t *testing.T) {
 		Set(HeaderLabelKID, []byte("kid")).
 		Set("flag", true)
 
-	if v, ok := h.Int(HeaderLabelAlg); !ok || v != 3 {
-		t.Errorf("Int(alg) = %d, %v; want 3, true", v, ok)
-	}
-	if v, ok := h.Uint(HeaderLabelAlg); !ok || v != 3 {
-		t.Errorf("Uint(alg) = %d, %v; want 3, true", v, ok)
-	}
-	if v, ok := h.Text(HeaderLabelType); !ok || v != "application/x" {
-		t.Errorf("Text(typ) = %q, %v; want application/x, true", v, ok)
-	}
-	if v, ok := h.Bytes(HeaderLabelKID); !ok || !bytes.Equal(v, []byte("kid")) {
-		t.Errorf("Bytes(kid) = %x, %v; want 'kid', true", v, ok)
-	}
-	if !h.Has("flag") {
-		t.Error("Has(flag) = false; want true")
-	}
-	if v, ok := h.Get("flag"); !ok || v != true {
-		t.Errorf("Get(flag) = %v, %v; want true, true", v, ok)
-	}
+	iv, ok := h.Int(HeaderLabelAlg)
+	require.True(t, ok)
+	require.Equal(t, int64(3), iv)
+	uv, ok := h.Uint(HeaderLabelAlg)
+	require.True(t, ok)
+	require.Equal(t, uint64(3), uv)
+	tv, ok := h.Text(HeaderLabelType)
+	require.True(t, ok)
+	require.Equal(t, "application/x", tv)
+	bv, ok := h.Bytes(HeaderLabelKID)
+	require.True(t, ok)
+	require.Equal(t, []byte("kid"), bv)
+	require.True(t, h.Has("flag"))
+	gv, ok := h.Get("flag")
+	require.True(t, ok)
+	require.Equal(t, true, gv)
 
 	// Absent label.
-	if _, ok := h.Int(HeaderLabelIV); ok {
-		t.Error("Int(absent) ok = true; want false")
-	}
+	_, ok = h.Int(HeaderLabelIV)
+	require.False(t, ok)
 	// Type mismatches.
-	if _, ok := h.Int(HeaderLabelType); ok {
-		t.Error("Int on a text value ok = true; want false")
-	}
-	if _, ok := h.Text(HeaderLabelAlg); ok {
-		t.Error("Text on an int value ok = true; want false")
-	}
-	if _, ok := h.Bytes(HeaderLabelType); ok {
-		t.Error("Bytes on a text value ok = true; want false")
-	}
+	_, ok = h.Int(HeaderLabelType)
+	require.False(t, ok)
+	_, ok = h.Text(HeaderLabelAlg)
+	require.False(t, ok)
+	_, ok = h.Bytes(HeaderLabelType)
+	require.False(t, ok)
 }
 
 func TestHeaderLabelNormalization(t *testing.T) {
 	// A label Set as an untyped int must be retrievable as int64, and vice
 	// versa: int(1), int64(1) and uint(1) name the same COSE label.
 	h := Header{}.Set(1, "a")
-	if v, ok := h.Text(int64(1)); !ok || v != "a" {
-		t.Errorf("Text(int64(1)) = %q, %v; want a, true", v, ok)
-	}
-	if v, ok := h.Text(uint(1)); !ok || v != "a" {
-		t.Errorf("Text(uint(1)) = %q, %v; want a, true", v, ok)
-	}
+	v, ok := h.Text(int64(1))
+	require.True(t, ok)
+	require.Equal(t, "a", v)
+	v, ok = h.Text(uint(1))
+	require.True(t, ok)
+	require.Equal(t, "a", v)
 
 	// Overwriting via a differently-typed-but-equal label updates in place.
 	h.Set(int64(1), "b")
-	if v, _ := h.Text(1); v != "b" {
-		t.Errorf("after overwrite Text(1) = %q; want b", v)
-	}
-	if len(h) != 1 {
-		t.Errorf("len = %d; want 1 (no duplicate key created)", len(h))
-	}
+	v, _ = h.Text(1)
+	require.Equal(t, "b", v)
+	require.Len(t, h, 1)
 }
 
 func TestHeaderIntUintBoundaries(t *testing.T) {
@@ -74,20 +66,18 @@ func TestHeaderIntUintBoundaries(t *testing.T) {
 		Set("neg", int64(-5)).
 		Set("big", uint64(math.MaxUint64))
 
-	if v, ok := h.Int("neg"); !ok || v != -5 {
-		t.Errorf("Int(neg) = %d, %v; want -5, true", v, ok)
-	}
+	v, ok := h.Int("neg")
+	require.True(t, ok)
+	require.Equal(t, int64(-5), v)
 	// A negative value is not a valid Uint.
-	if _, ok := h.Uint("neg"); ok {
-		t.Error("Uint(neg) ok = true; want false")
-	}
+	_, ok = h.Uint("neg")
+	require.False(t, ok)
 	// A uint64 too large for int64 is preserved and only readable as Uint.
-	if v, ok := h.Uint("big"); !ok || v != math.MaxUint64 {
-		t.Errorf("Uint(big) = %d, %v; want MaxUint64, true", v, ok)
-	}
-	if _, ok := h.Int("big"); ok {
-		t.Error("Int(big) ok = true; want false (overflows int64)")
-	}
+	uv, ok := h.Uint("big")
+	require.True(t, ok)
+	require.Equal(t, uint64(math.MaxUint64), uv)
+	_, ok = h.Int("big")
+	require.False(t, ok)
 }
 
 func TestHeaderIntegerWidthNormalization(t *testing.T) {
@@ -110,37 +100,31 @@ func TestHeaderIntegerWidthNormalization(t *testing.T) {
 		"u8": 6, "u16": 7, "u32": 8, "u": 9, "u64": 10,
 	}
 	for k, v := range want {
-		if got, ok := h.Int(k); !ok || got != v {
-			t.Errorf("Int(%q) = %d, %v; want %d, true", k, got, ok, v)
-		}
+		got, ok := h.Int(k)
+		require.True(t, ok)
+		require.Equal(t, v, got)
 	}
 
 	// Every integer width is also accepted as a label and addresses the same
 	// entry as its int64 form.
 	for i, label := range []any{int8(20), int16(20), int32(20), int(20), int64(20), uint8(20), uint16(20), uint32(20), uint(20), uint64(20)} {
 		hh := Header{}.Set(label, i)
-		if got, ok := hh.Int(int64(20)); !ok || got != int64(i) {
-			t.Errorf("label %T: Int(20) = %d, %v; want %d", label, got, ok, i)
-		}
+		got, ok := hh.Int(int64(20))
+		require.True(t, ok)
+		require.Equal(t, int64(i), got)
 	}
 }
 
 func TestHeaderSetPanicsOnOverflowLabel(t *testing.T) {
-	defer func() {
-		if r := recover(); r == nil {
-			t.Fatal("Set with a label overflowing int64 did not panic")
-		}
-	}()
-	Header{}.Set(uint64(math.MaxUint64), "value")
+	require.Panics(t, func() {
+		Header{}.Set(uint64(math.MaxUint64), "value")
+	})
 }
 
 func TestHeaderSetPanicsOnInvalidLabel(t *testing.T) {
-	defer func() {
-		if r := recover(); r == nil {
-			t.Fatal("Set with a non-int/string label did not panic")
-		}
-	}()
-	Header{}.Set([]byte{0x01}, "value")
+	require.Panics(t, func() {
+		Header{}.Set([]byte{0x01}, "value")
+	})
 }
 
 func TestEncodeRejectsInvalidLabel(t *testing.T) {
@@ -150,7 +134,6 @@ func TestEncodeRejectsInvalidLabel(t *testing.T) {
 		Headers:    Headers{Protected: Header{float64(1.5): "x"}},
 		Recipients: []*Recipient{{Ciphertext: []byte{0xAA}}},
 	}
-	if _, err := env.Encode(); err == nil {
-		t.Fatal("Encode with invalid label: want error, got nil")
-	}
+	_, err := env.Encode()
+	require.Error(t, err)
 }

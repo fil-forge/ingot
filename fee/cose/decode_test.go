@@ -1,8 +1,9 @@
 package cose
 
 import (
-	"errors"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestDecodeMalformed(t *testing.T) {
@@ -38,18 +39,9 @@ func TestDecodeMalformed(t *testing.T) {
 			// Tolerate spaces in the hex literals above for readability.
 			raw := hexDec(t, removeSpaces(tc.hex))
 			env, rest, err := Decode(raw)
-			if err == nil {
-				t.Fatalf("Decode(%s): want error, got nil", tc.name)
-			}
-			if !errors.Is(err, tc.want) {
-				t.Fatalf("Decode(%s): error = %v, want errors.Is %v", tc.name, err, tc.want)
-			}
-			if env != nil {
-				t.Errorf("Decode(%s): env = %#v, want nil on error", tc.name, env)
-			}
-			if rest != nil {
-				t.Errorf("Decode(%s): rest = %x, want nil on error", tc.name, rest)
-			}
+			require.ErrorIs(t, err, tc.want)
+			require.Nil(t, env)
+			require.Nil(t, rest)
 		})
 	}
 }
@@ -72,9 +64,7 @@ func TestDecodeExpectedType(t *testing.T) {
 			Recipients: []*Recipient{{Ciphertext: []byte{0xAA}}},
 		}
 		b, err := env.Encode()
-		if err != nil {
-			t.Fatalf("Encode: %v", err)
-		}
+		require.NoError(t, err)
 		return b
 	}
 	withoutType := func() []byte {
@@ -84,42 +74,32 @@ func TestDecodeExpectedType(t *testing.T) {
 			Recipients: []*Recipient{{Ciphertext: []byte{0xAA}}},
 		}
 		b, err := env.Encode()
-		if err != nil {
-			t.Fatalf("Encode: %v", err)
-		}
+		require.NoError(t, err)
 		return b
 	}
 
 	t.Run("matching type", func(t *testing.T) {
-		if _, _, err := Decode(withType(feeTypeExample), WithExpectedType(feeTypeExample)); err != nil {
-			t.Fatalf("Decode: %v", err)
-		}
+		_, _, err := Decode(withType(feeTypeExample), WithExpectedType(feeTypeExample))
+		require.NoError(t, err)
 	})
 
 	t.Run("wrong type", func(t *testing.T) {
 		_, _, err := Decode(withType("application/other"), WithExpectedType(feeTypeExample))
-		if !errors.Is(err, ErrUnexpectedType) {
-			t.Fatalf("error = %v, want ErrUnexpectedType", err)
-		}
+		require.ErrorIs(t, err, ErrUnexpectedType)
 	})
 
 	t.Run("missing type", func(t *testing.T) {
 		_, _, err := Decode(withoutType(), WithExpectedType(feeTypeExample))
-		if !errors.Is(err, ErrUnexpectedType) {
-			t.Fatalf("error = %v, want ErrUnexpectedType", err)
-		}
+		require.ErrorIs(t, err, ErrUnexpectedType)
 	})
 
 	t.Run("type present but not a string", func(t *testing.T) {
 		_, _, err := Decode(withType(int64(7)), WithExpectedType(feeTypeExample))
-		if !errors.Is(err, ErrUnexpectedType) {
-			t.Fatalf("error = %v, want ErrUnexpectedType", err)
-		}
+		require.ErrorIs(t, err, ErrUnexpectedType)
 	})
 
 	t.Run("no check when option omitted", func(t *testing.T) {
-		if _, _, err := Decode(withoutType()); err != nil {
-			t.Fatalf("Decode without type check: %v", err)
-		}
+		_, _, err := Decode(withoutType())
+		require.NoError(t, err)
 	})
 }

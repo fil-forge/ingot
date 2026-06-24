@@ -3,8 +3,9 @@ package cose
 import (
 	"bytes"
 	"math"
-	"reflect"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 // feeTypeExample is a stand-in for the FEE envelope type. cose itself is
@@ -64,17 +65,11 @@ func TestRoundTripPreservesAllFields(t *testing.T) {
 	orig := sampleEnvelope()
 
 	encoded, err := orig.Encode()
-	if err != nil {
-		t.Fatalf("Encode: %v", err)
-	}
+	require.NoError(t, err)
 
 	env, rest, err := Decode(encoded, WithExpectedType(feeTypeExample))
-	if err != nil {
-		t.Fatalf("Decode: %v", err)
-	}
-	if len(rest) != 0 {
-		t.Fatalf("rest = %x, want empty", rest)
-	}
+	require.NoError(t, err)
+	require.Len(t, rest, 0)
 
 	// Whole-map equality is the strongest "intact" check: every protected and
 	// unprotected entry, including the nested map and custom label, must
@@ -87,77 +82,51 @@ func TestRoundTripPreservesAllFields(t *testing.T) {
 		labelAppMetadata:       map[any]any{"owner": "tenant-a", "parts": int64(3)},
 		"x-custom":             []byte{0x01, 0x02, 0x03},
 	}
-	if !reflect.DeepEqual(env.Headers.Protected, wantProtected) {
-		t.Fatalf("protected mismatch:\n got %#v\nwant %#v", env.Headers.Protected, wantProtected)
-	}
+	require.Equal(t, wantProtected, env.Headers.Protected)
 
 	wantUnprotected := Header{
 		HeaderLabelIV: bytes.Repeat([]byte{0xAB}, 7),
 		int64(100):    "unauthenticated",
 	}
-	if !reflect.DeepEqual(env.Headers.Unprotected, wantUnprotected) {
-		t.Fatalf("unprotected mismatch:\n got %#v\nwant %#v", env.Headers.Unprotected, wantUnprotected)
-	}
+	require.Equal(t, wantUnprotected, env.Headers.Unprotected)
 
 	// Re-encoding a decoded envelope reproduces the original bytes exactly
 	// (deterministic, lossless).
 	reencoded, err := env.Encode()
-	if err != nil {
-		t.Fatalf("re-Encode: %v", err)
-	}
-	if !bytes.Equal(reencoded, encoded) {
-		t.Fatalf("re-encode not byte-identical:\n got %x\nwant %x", reencoded, encoded)
-	}
+	require.NoError(t, err)
+	require.Equal(t, encoded, reencoded)
 }
 
 func TestRoundTripMultiRecipient(t *testing.T) {
 	orig := sampleEnvelope()
 	encoded, err := orig.Encode()
-	if err != nil {
-		t.Fatalf("Encode: %v", err)
-	}
+	require.NoError(t, err)
 	env, _, err := Decode(encoded)
-	if err != nil {
-		t.Fatalf("Decode: %v", err)
-	}
+	require.NoError(t, err)
 
-	if len(env.Recipients) != len(orig.Recipients) {
-		t.Fatalf("recipients = %d, want %d", len(env.Recipients), len(orig.Recipients))
-	}
+	require.Len(t, env.Recipients, len(orig.Recipients))
 	// Order and per-recipient fields must be preserved.
 	for i, want := range orig.Recipients {
 		got := env.Recipients[i]
 		wantKID, _ := want.Headers.Unprotected.Bytes(HeaderLabelKID)
 		gotKID, ok := got.Headers.Unprotected.Bytes(HeaderLabelKID)
-		if !ok || !bytes.Equal(gotKID, wantKID) {
-			t.Errorf("recipient %d kid = %x (ok=%v), want %x", i, gotKID, ok, wantKID)
-		}
-		if alg, ok := got.Headers.Protected.Int(HeaderLabelAlg); !ok || alg != -31 {
-			t.Errorf("recipient %d alg = %d (ok=%v), want -31", i, alg, ok)
-		}
-		if !bytes.Equal(got.Ciphertext, want.Ciphertext) {
-			t.Errorf("recipient %d ciphertext = %x, want %x", i, got.Ciphertext, want.Ciphertext)
-		}
-		if !reflect.DeepEqual(got.Headers.Unprotected, want.Headers.Unprotected) {
-			t.Errorf("recipient %d unprotected mismatch:\n got %#v\nwant %#v",
-				i, got.Headers.Unprotected, want.Headers.Unprotected)
-		}
+		require.True(t, ok)
+		require.Equal(t, wantKID, gotKID)
+		alg, ok := got.Headers.Protected.Int(HeaderLabelAlg)
+		require.True(t, ok)
+		require.Equal(t, int64(-31), alg)
+		require.Equal(t, want.Ciphertext, got.Ciphertext)
+		require.Equal(t, want.Headers.Unprotected, got.Headers.Unprotected)
 	}
 }
 
 func TestEncodeIsDeterministic(t *testing.T) {
 	env := sampleEnvelope()
 	a, err := env.Encode()
-	if err != nil {
-		t.Fatalf("Encode: %v", err)
-	}
+	require.NoError(t, err)
 	b, err := env.Encode()
-	if err != nil {
-		t.Fatalf("Encode: %v", err)
-	}
-	if !bytes.Equal(a, b) {
-		t.Fatalf("Encode not deterministic:\n a=%x\n b=%x", a, b)
-	}
+	require.NoError(t, err)
+	require.Equal(t, a, b)
 
 	// Header map-key insertion order must not affect the bytes: a protected
 	// header built in a different order encodes identically (canonical sort).
@@ -174,41 +143,28 @@ func TestEncodeIsDeterministic(t *testing.T) {
 		Recipients: env.Recipients,
 	}
 	c, err := reordered.Encode()
-	if err != nil {
-		t.Fatalf("Encode reordered: %v", err)
-	}
-	if !bytes.Equal(a, c) {
-		t.Fatalf("encoding depends on insertion order:\n a=%x\n c=%x", a, c)
-	}
+	require.NoError(t, err)
+	require.Equal(t, a, c)
 }
 
 func TestEncodeRequiresRecipient(t *testing.T) {
 	env := &Encrypt{Headers: Headers{Protected: Header{}.Set(HeaderLabelAlg, 3)}}
-	if _, err := env.Encode(); err == nil {
-		t.Fatal("Encode with no recipients: want error, got nil")
-	}
+	_, err := env.Encode()
+	require.Error(t, err)
 }
 
 func TestDetachedPayloadRoundTrip(t *testing.T) {
 	env := sampleEnvelope()
 	envelope, err := env.Encode()
-	if err != nil {
-		t.Fatalf("Encode: %v", err)
-	}
+	require.NoError(t, err)
 
 	ciphertext := []byte("the detached ciphertext bytes, opaque to cose")
 	blob := append(append([]byte{}, envelope...), ciphertext...)
 
 	decoded, rest, err := Decode(blob)
-	if err != nil {
-		t.Fatalf("Decode: %v", err)
-	}
-	if !bytes.Equal(rest, ciphertext) {
-		t.Fatalf("rest = %q, want %q", rest, ciphertext)
-	}
-	if len(decoded.Recipients) != len(env.Recipients) {
-		t.Fatalf("recipients = %d, want %d", len(decoded.Recipients), len(env.Recipients))
-	}
+	require.NoError(t, err)
+	require.Equal(t, ciphertext, rest)
+	require.Len(t, decoded.Recipients, len(env.Recipients))
 }
 
 func TestEmptyProtectedHeader(t *testing.T) {
@@ -217,30 +173,19 @@ func TestEmptyProtectedHeader(t *testing.T) {
 		Recipients: []*Recipient{{Ciphertext: []byte{0xAA}}},
 	}
 	encoded, err := env.Encode()
-	if err != nil {
-		t.Fatalf("Encode: %v", err)
-	}
+	require.NoError(t, err)
 	// An empty protected header must serialize as an empty byte string (0x40),
 	// not as an encoded empty map. The protected element follows the tag (d860)
 	// and array head (84).
-	if encoded[2] != 0x84 || encoded[3] != 0x40 {
-		t.Fatalf("empty protected not encoded as h'': bytes = %x", encoded[:6])
-	}
+	require.Equal(t, byte(0x84), encoded[2], "empty protected not encoded as h'': bytes = %x", encoded[:6])
+	require.Equal(t, byte(0x40), encoded[3], "empty protected not encoded as h'': bytes = %x", encoded[:6])
 
 	decoded, _, err := Decode(encoded)
-	if err != nil {
-		t.Fatalf("Decode: %v", err)
-	}
-	if len(decoded.Headers.Protected) != 0 {
-		t.Fatalf("protected = %#v, want empty", decoded.Headers.Protected)
-	}
+	require.NoError(t, err)
+	require.Len(t, decoded.Headers.Protected, 0)
 	pb, err := decoded.ProtectedBytes()
-	if err != nil {
-		t.Fatalf("ProtectedBytes: %v", err)
-	}
-	if len(pb) != 0 {
-		t.Fatalf("ProtectedBytes = %x, want empty", pb)
-	}
+	require.NoError(t, err)
+	require.Len(t, pb, 0)
 }
 
 func TestEncStructureBindsProtectedNotUnprotected(t *testing.T) {
@@ -257,9 +202,7 @@ func TestEncStructureBindsProtectedNotUnprotected(t *testing.T) {
 	aad := func(e *Encrypt) []byte {
 		t.Helper()
 		b, err := e.EncStructure(nil)
-		if err != nil {
-			t.Fatalf("EncStructure: %v", err)
-		}
+		require.NoError(t, err)
 		return b
 	}
 
@@ -268,50 +211,32 @@ func TestEncStructureBindsProtectedNotUnprotected(t *testing.T) {
 	// Changing the unprotected header must NOT change the AAD.
 	sameAAD := base()
 	sameAAD.Headers.Unprotected.Set(HeaderLabelIV, []byte{0x02})
-	if !bytes.Equal(ref, aad(sameAAD)) {
-		t.Error("AAD changed when only the unprotected header changed")
-	}
+	require.Equal(t, ref, aad(sameAAD), "AAD changed when only the unprotected header changed")
 
 	// Changing the protected header MUST change the AAD.
 	diffAAD := base()
 	diffAAD.Headers.Protected.Set(HeaderLabelAlg, -65793)
-	if bytes.Equal(ref, aad(diffAAD)) {
-		t.Error("AAD unchanged when the protected header changed")
-	}
+	require.NotEqual(t, ref, aad(diffAAD), "AAD unchanged when the protected header changed")
 
 	// external_aad must be incorporated.
 	withExt := aad(base())
 	withExtBytes, err := base().EncStructure([]byte("aad"))
-	if err != nil {
-		t.Fatalf("EncStructure(ext): %v", err)
-	}
-	if bytes.Equal(withExt, withExtBytes) {
-		t.Error("external_aad not incorporated into Enc_structure")
-	}
+	require.NoError(t, err)
+	require.NotEqual(t, withExt, withExtBytes, "external_aad not incorporated into Enc_structure")
 }
 
 func TestEncStructureStableAcrossRoundTrip(t *testing.T) {
 	orig := sampleEnvelope()
 	want, err := orig.EncStructure([]byte("ext"))
-	if err != nil {
-		t.Fatalf("EncStructure: %v", err)
-	}
+	require.NoError(t, err)
 
 	encoded, err := orig.Encode()
-	if err != nil {
-		t.Fatalf("Encode: %v", err)
-	}
+	require.NoError(t, err)
 	decoded, _, err := Decode(encoded)
-	if err != nil {
-		t.Fatalf("Decode: %v", err)
-	}
+	require.NoError(t, err)
 	got, err := decoded.EncStructure([]byte("ext"))
-	if err != nil {
-		t.Fatalf("EncStructure (decoded): %v", err)
-	}
-	if !bytes.Equal(got, want) {
-		t.Fatalf("AAD not stable across round trip:\n got %x\nwant %x", got, want)
-	}
+	require.NoError(t, err)
+	require.Equal(t, want, got)
 }
 
 func TestRoundTripLargeUnsignedValue(t *testing.T) {
@@ -331,27 +256,18 @@ func TestRoundTripLargeUnsignedValue(t *testing.T) {
 	}
 
 	encoded, err := env.Encode()
-	if err != nil {
-		t.Fatalf("Encode: %v", err)
-	}
+	require.NoError(t, err)
 	decoded, _, err := Decode(encoded)
-	if err != nil {
-		t.Fatalf("Decode: %v", err)
-	}
+	require.NoError(t, err)
 
 	// The top-level value comes back as the same uint64.
 	got, ok := decoded.Headers.Protected.Uint("big")
-	if !ok || got != big {
-		t.Fatalf("top-level big = %d (ok=%v), want %d", got, ok, big)
-	}
+	require.True(t, ok)
+	require.Equal(t, big, got)
 	// Recursion: a large unsigned stays uint64 inside a nested map, while a
 	// value that fits is normalized back to int64.
 	nested, ok := decoded.Headers.Protected.Get("nested")
-	if !ok {
-		t.Fatal("nested map missing after round trip")
-	}
+	require.True(t, ok)
 	want := map[any]any{"n": big, "small": int64(7)}
-	if !reflect.DeepEqual(nested, want) {
-		t.Fatalf("nested map mismatch:\n got %#v\nwant %#v", nested, want)
-	}
+	require.Equal(t, want, nested)
 }

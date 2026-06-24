@@ -1,9 +1,10 @@
 package cose
 
 import (
-	"bytes"
 	"encoding/hex"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 // --- shared test helpers ---------------------------------------------------
@@ -12,9 +13,7 @@ import (
 func hexDec(t *testing.T, s string) []byte {
 	t.Helper()
 	b, err := hex.DecodeString(s)
-	if err != nil {
-		t.Fatalf("bad hex %q: %v", s, err)
-	}
+	require.NoError(t, err)
 	return b
 }
 
@@ -78,99 +77,62 @@ const richEnvelopeHex = "d8608443a10103a1054c00112233445566778899aabbf6818344a10
 func TestEncodeMinimalVector(t *testing.T) {
 	env := &Encrypt{Recipients: []*Recipient{{Ciphertext: []byte{0xAA}}}}
 	got, err := env.Encode()
-	if err != nil {
-		t.Fatalf("Encode: %v", err)
-	}
+	require.NoError(t, err)
 	want := hexDec(t, minimalEnvelopeHex)
-	if !bytes.Equal(got, want) {
-		t.Fatalf("Encode minimal:\n got %x\nwant %x", got, want)
-	}
+	require.Equal(t, want, got)
 }
 
 func TestDecodeMinimalVector(t *testing.T) {
 	env, rest, err := Decode(hexDec(t, minimalEnvelopeHex))
-	if err != nil {
-		t.Fatalf("Decode: %v", err)
-	}
-	if len(rest) != 0 {
-		t.Fatalf("rest = %x, want empty", rest)
-	}
-	if len(env.Headers.Protected) != 0 || len(env.Headers.Unprotected) != 0 {
-		t.Fatalf("expected empty body headers, got %+v", env.Headers)
-	}
-	if len(env.Recipients) != 1 {
-		t.Fatalf("recipients = %d, want 1", len(env.Recipients))
-	}
-	if got := env.Recipients[0].Ciphertext; !bytes.Equal(got, []byte{0xAA}) {
-		t.Fatalf("recipient ciphertext = %x, want AA", got)
-	}
+	require.NoError(t, err)
+	require.Len(t, rest, 0)
+	require.Len(t, env.Headers.Protected, 0)
+	require.Len(t, env.Headers.Unprotected, 0)
+	require.Len(t, env.Recipients, 1)
+	require.Equal(t, []byte{0xAA}, env.Recipients[0].Ciphertext)
 }
 
 func TestDecodeRichVector(t *testing.T) {
 	data := hexDec(t, richEnvelopeHex)
 	env, rest, err := Decode(data)
-	if err != nil {
-		t.Fatalf("Decode: %v", err)
-	}
-	if len(rest) != 0 {
-		t.Fatalf("rest = %x, want empty", rest)
-	}
+	require.NoError(t, err)
+	require.Len(t, rest, 0)
 
-	if alg, ok := env.Headers.Protected.Int(HeaderLabelAlg); !ok || alg != 3 {
-		t.Fatalf("protected alg = %d (ok=%v), want 3", alg, ok)
-	}
+	alg, ok := env.Headers.Protected.Int(HeaderLabelAlg)
+	require.True(t, ok)
+	require.Equal(t, int64(3), alg)
 	wantIV := hexDec(t, "00112233445566778899aabb")
-	if iv, ok := env.Headers.Unprotected.Bytes(HeaderLabelIV); !ok || !bytes.Equal(iv, wantIV) {
-		t.Fatalf("unprotected iv = %x (ok=%v), want %x", iv, ok, wantIV)
-	}
-	if len(env.Recipients) != 1 {
-		t.Fatalf("recipients = %d, want 1", len(env.Recipients))
-	}
+	iv, ok := env.Headers.Unprotected.Bytes(HeaderLabelIV)
+	require.True(t, ok)
+	require.Equal(t, wantIV, iv)
+	require.Len(t, env.Recipients, 1)
 	r := env.Recipients[0]
-	if alg, ok := r.Headers.Protected.Int(HeaderLabelAlg); !ok || alg != -31 {
-		t.Fatalf("recipient alg = %d (ok=%v), want -31", alg, ok)
-	}
-	if kid, ok := r.Headers.Unprotected.Bytes(HeaderLabelKID); !ok || !bytes.Equal(kid, []byte{0x01}) {
-		t.Fatalf("recipient kid = %x (ok=%v), want 01", kid, ok)
-	}
-	if !bytes.Equal(r.Ciphertext, hexDec(t, "deadbeef")) {
-		t.Fatalf("recipient ciphertext = %x, want deadbeef", r.Ciphertext)
-	}
+	ralg, ok := r.Headers.Protected.Int(HeaderLabelAlg)
+	require.True(t, ok)
+	require.Equal(t, int64(-31), ralg)
+	kid, ok := r.Headers.Unprotected.Bytes(HeaderLabelKID)
+	require.True(t, ok)
+	require.Equal(t, []byte{0x01}, kid)
+	require.Equal(t, hexDec(t, "deadbeef"), r.Ciphertext)
 
 	// RawProtected must preserve the on-wire protected bytes, and the
 	// Enc_structure must be built from them.
-	if !bytes.Equal(env.Headers.RawProtected, hexDec(t, "a10103")) {
-		t.Fatalf("RawProtected = %x, want a10103", env.Headers.RawProtected)
-	}
+	require.Equal(t, hexDec(t, "a10103"), env.Headers.RawProtected)
 	aad, err := env.EncStructure(nil)
-	if err != nil {
-		t.Fatalf("EncStructure: %v", err)
-	}
-	if want := expectedEncStructure(hexDec(t, "a10103"), nil); !bytes.Equal(aad, want) {
-		t.Fatalf("EncStructure:\n got %x\nwant %x", aad, want)
-	}
+	require.NoError(t, err)
+	require.Equal(t, expectedEncStructure(hexDec(t, "a10103"), nil), aad)
 }
 
 func TestEncStructureEmptyProtectedGolden(t *testing.T) {
 	env := &Encrypt{Recipients: []*Recipient{{Ciphertext: []byte{0xAA}}}}
 	aad, err := env.EncStructure(nil)
-	if err != nil {
-		t.Fatalf("EncStructure: %v", err)
-	}
+	require.NoError(t, err)
 	// [ "Encrypt", h'', h'' ] = 83 67 "Encrypt" 40 40
 	want := hexDec(t, "8367456e63727970744040")
-	if !bytes.Equal(aad, want) {
-		t.Fatalf("EncStructure(nil):\n got %x\nwant %x", aad, want)
-	}
-	if want := expectedEncStructure(nil, nil); !bytes.Equal(aad, want) {
-		t.Fatalf("EncStructure(nil) vs helper:\n got %x\nwant %x", aad, want)
-	}
+	require.Equal(t, want, aad)
+	require.Equal(t, expectedEncStructure(nil, nil), aad)
 
 	withAAD, err := env.EncStructure([]byte{0x01, 0x02})
-	if err != nil {
-		t.Fatalf("EncStructure(aad): %v", err)
-	}
-	if want := expectedEncStructure(nil, []byte{0x01, 0x02}); !bytes.Equal(withAAD, want) {
-		t.Fatalf("EncStructure(aad):\n got %x\nwant %x", withAAD, want)
-	}
+	require.NoError(t, err)
+	require.Equal(t, expectedEncStructure(nil, []byte{0x01, 0x02}), withAAD)
 }
