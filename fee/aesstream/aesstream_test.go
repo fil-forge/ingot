@@ -44,10 +44,6 @@ func mustSeal(t *testing.T, cfg aesstream.Config, pt []byte) []byte {
 }
 
 func TestRoundTrip(t *testing.T) {
-	const (
-		cs = aesstream.MinChunkSize     // 4 KiB, the smallest legal chunk
-		ds = aesstream.DefaultChunkSize // 256 KiB, selected when ChunkSize is 0
-	)
 	// Each case round-trips plaintext sizes chosen around its own chunk
 	// boundaries: empty, sub-tag, tag-sized, just under/over one chunk,
 	// exact multiples, and odd remainders.
@@ -58,13 +54,32 @@ func TestRoundTrip(t *testing.T) {
 	}{
 		{
 			name:      "min chunk size",
-			chunkSize: cs,
-			sizes:     []int64{0, 1, 15, 16, 17, cs - 1, cs, cs + 1, 2 * cs, 2*cs + 1, 3 * cs, 3*cs + 123},
+			chunkSize: aesstream.MinChunkSize,
+			sizes: []int64{
+				0,
+				1,
+				15,
+				16,
+				17,
+				aesstream.MinChunkSize - 1,
+				aesstream.MinChunkSize,
+				aesstream.MinChunkSize + 1,
+				2 * aesstream.MinChunkSize,
+				2*aesstream.MinChunkSize + 1,
+				3 * aesstream.MinChunkSize,
+				3*aesstream.MinChunkSize + 123,
+			},
 		},
 		{
 			name:      "default chunk size",
 			chunkSize: 0, // exercises the 0 → DefaultChunkSize resolution
-			sizes:     []int64{0, 1, ds, ds + 1, 3*ds + 99},
+			sizes: []int64{
+				0,
+				1,
+				aesstream.DefaultChunkSize,
+				aesstream.DefaultChunkSize + 1,
+				3*aesstream.DefaultChunkSize + 99,
+			},
 		},
 	}
 
