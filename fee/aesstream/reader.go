@@ -111,9 +111,10 @@ func (r *Reader) nextChunk() error {
 		// chunk, so this must be the last one.
 		mustBeLast = true
 	case io.EOF:
-		// End of stream on a chunk boundary. A well-formed stream always
-		// terminates inside a chunk flagged last (after which we stop
-		// reading), so reaching here means the stream was cut short.
+		// EOF means the source was at the end already and read zero bytes. If the
+		// previous chunk was marked as a final chunk, we wouldn't have kept
+		// reading, so it must not have been. So if we're here, we ran out of input
+		// before we saw a chunk marked final, which means the input was truncated.
 		return r.fail(ErrTruncated)
 	default:
 		return r.fail(fmt.Errorf("aesstream: read chunk %d: %w", r.index, rerr))
