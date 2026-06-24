@@ -62,6 +62,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 )
 
 const (
@@ -233,7 +234,13 @@ func EncryptedSize(plaintextLen int64, chunkSize int) int64 {
 // should use NewWriter to keep memory bounded.
 func Seal(cfg Config, plaintext []byte) ([]byte, error) {
 	var buf bytes.Buffer
-	buf.Grow(int(EncryptedSize(int64(len(plaintext)), cfg.effectiveChunkSize())))
+	// Pre-grow to the exact ciphertext size. Grow is only an optimization, so
+	// skip it when the size would not fit in int — on a 32-bit platform a
+	// near-2 GiB plaintext can overflow the conversion and make Grow panic on
+	// a negative count.
+	if sz := EncryptedSize(int64(len(plaintext)), cfg.effectiveChunkSize()); sz <= math.MaxInt {
+		buf.Grow(int(sz))
+	}
 	w, err := NewWriter(&buf, cfg)
 	if err != nil {
 		return nil, err
