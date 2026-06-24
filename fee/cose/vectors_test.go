@@ -74,65 +74,70 @@ const minimalEnvelopeHex = "d8608440a0f6818340a041aa"
 //	recipients  = [ [ {1:-31}, {4:h'01'}, h'deadbeef' ] ]
 const richEnvelopeHex = "d8608443a10103a1054c00112233445566778899aabbf6818344a101381ea104410144deadbeef"
 
-func TestEncodeMinimalVector(t *testing.T) {
-	env := &Encrypt{Recipients: []*Recipient{{Ciphertext: []byte{0xAA}}}}
-	got, err := env.Encode()
-	require.NoError(t, err)
-	want := hexDec(t, minimalEnvelopeHex)
-	require.Equal(t, want, got)
-}
+// TestVectors checks the encoder and decoder against hand-encoded golden byte
+// sequences, cross-checked by the independent CBOR re-implementation above so
+// the tests don't validate cose against itself.
+func TestVectors(t *testing.T) {
+	t.Run("encode minimal", func(t *testing.T) {
+		env := &Encrypt{Recipients: []*Recipient{{Ciphertext: []byte{0xAA}}}}
+		got, err := env.Encode()
+		require.NoError(t, err)
+		want := hexDec(t, minimalEnvelopeHex)
+		require.Equal(t, want, got)
+	})
 
-func TestDecodeMinimalVector(t *testing.T) {
-	env, rest, err := Decode(hexDec(t, minimalEnvelopeHex))
-	require.NoError(t, err)
-	require.Len(t, rest, 0)
-	require.Len(t, env.Headers.Protected, 0)
-	require.Len(t, env.Headers.Unprotected, 0)
-	require.Len(t, env.Recipients, 1)
-	require.Equal(t, []byte{0xAA}, env.Recipients[0].Ciphertext)
-}
+	t.Run("decode minimal", func(t *testing.T) {
+		env, rest, err := Decode(hexDec(t, minimalEnvelopeHex))
+		require.NoError(t, err)
+		require.Len(t, rest, 0)
+		require.Len(t, env.Headers.Protected, 0)
+		require.Len(t, env.Headers.Unprotected, 0)
+		require.Len(t, env.Recipients, 1)
+		require.Equal(t, []byte{0xAA}, env.Recipients[0].Ciphertext)
+	})
 
-func TestDecodeRichVector(t *testing.T) {
-	data := hexDec(t, richEnvelopeHex)
-	env, rest, err := Decode(data)
-	require.NoError(t, err)
-	require.Len(t, rest, 0)
+	t.Run("decode rich", func(t *testing.T) {
+		data := hexDec(t, richEnvelopeHex)
+		env, rest, err := Decode(data)
+		require.NoError(t, err)
+		require.Len(t, rest, 0)
 
-	alg, ok := env.Headers.Protected.Int(HeaderLabelAlg)
-	require.True(t, ok)
-	require.Equal(t, int64(3), alg)
-	wantIV := hexDec(t, "00112233445566778899aabb")
-	iv, ok := env.Headers.Unprotected.Bytes(HeaderLabelIV)
-	require.True(t, ok)
-	require.Equal(t, wantIV, iv)
-	require.Len(t, env.Recipients, 1)
-	r := env.Recipients[0]
-	ralg, ok := r.Headers.Protected.Int(HeaderLabelAlg)
-	require.True(t, ok)
-	require.Equal(t, int64(-31), ralg)
-	kid, ok := r.Headers.Unprotected.Bytes(HeaderLabelKID)
-	require.True(t, ok)
-	require.Equal(t, []byte{0x01}, kid)
-	require.Equal(t, hexDec(t, "deadbeef"), r.Ciphertext)
+		alg, ok := env.Headers.Protected.Int(HeaderLabelAlg)
+		require.True(t, ok)
+		require.Equal(t, int64(3), alg)
+		wantIV := hexDec(t, "00112233445566778899aabb")
+		iv, ok := env.Headers.Unprotected.Bytes(HeaderLabelIV)
+		require.True(t, ok)
+		require.Equal(t, wantIV, iv)
+		require.Len(t, env.Recipients, 1)
+		r := env.Recipients[0]
+		ralg, ok := r.Headers.Protected.Int(HeaderLabelAlg)
+		require.True(t, ok)
+		require.Equal(t, int64(-31), ralg)
+		kid, ok := r.Headers.Unprotected.Bytes(HeaderLabelKID)
+		require.True(t, ok)
+		require.Equal(t, []byte{0x01}, kid)
+		require.Equal(t, hexDec(t, "deadbeef"), r.Ciphertext)
 
-	// RawProtected must preserve the on-wire protected bytes, and the
-	// Enc_structure must be built from them.
-	require.Equal(t, hexDec(t, "a10103"), env.Headers.RawProtected)
-	aad, err := env.EncStructure(nil)
-	require.NoError(t, err)
-	require.Equal(t, expectedEncStructure(hexDec(t, "a10103"), nil), aad)
-}
+		// RawProtected must preserve the on-wire protected bytes, and the
+		// Enc_structure must be built from them.
+		require.Equal(t, hexDec(t, "a10103"), env.Headers.RawProtected)
+		aad, err := env.EncStructure(nil)
+		require.NoError(t, err)
+		require.Equal(t, expectedEncStructure(hexDec(t, "a10103"), nil), aad)
+	})
 
-func TestEncStructureEmptyProtectedGolden(t *testing.T) {
-	env := &Encrypt{Recipients: []*Recipient{{Ciphertext: []byte{0xAA}}}}
-	aad, err := env.EncStructure(nil)
-	require.NoError(t, err)
-	// [ "Encrypt", h'', h'' ] = 83 67 "Encrypt" 40 40
-	want := hexDec(t, "8367456e63727970744040")
-	require.Equal(t, want, aad)
-	require.Equal(t, expectedEncStructure(nil, nil), aad)
+	t.Run("enc_structure empty protected", func(t *testing.T) {
+		env := &Encrypt{Recipients: []*Recipient{{Ciphertext: []byte{0xAA}}}}
+		aad, err := env.EncStructure(nil)
+		require.NoError(t, err)
+		// [ "Encrypt", h'', h'' ] = 83 67 "Encrypt" 40 40
+		want := hexDec(t, "8367456e63727970744040")
+		require.Equal(t, want, aad)
+		require.Equal(t, expectedEncStructure(nil, nil), aad)
 
-	withAAD, err := env.EncStructure([]byte{0x01, 0x02})
-	require.NoError(t, err)
-	require.Equal(t, expectedEncStructure(nil, []byte{0x01, 0x02}), withAAD)
+		withAAD, err := env.EncStructure([]byte{0x01, 0x02})
+		require.NoError(t, err)
+		require.Equal(t, expectedEncStructure(nil, []byte{0x01, 0x02}), withAAD)
+	})
 }
