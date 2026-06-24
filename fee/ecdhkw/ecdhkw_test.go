@@ -5,18 +5,16 @@ import (
 	"crypto/ecdh"
 	"crypto/rand"
 	"encoding/hex"
-	"errors"
 	"testing"
 
 	"github.com/fil-forge/ingot/fee/aeskw"
+	"github.com/stretchr/testify/require"
 )
 
 func newRecipient(t *testing.T) *ecdh.PrivateKey {
 	t.Helper()
 	priv, err := ecdh.X25519().GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("generate recipient key: %v", err)
-	}
+	require.NoError(t, err, "generate recipient key")
 	return priv
 }
 
@@ -27,28 +25,17 @@ func TestWrapUnwrapRoundTrip(t *testing.T) {
 	recipient := newRecipient(t)
 	for _, size := range []int{16, 24, 32} {
 		cek := make([]byte, size)
-		if _, err := rand.Read(cek); err != nil {
-			t.Fatalf("rand cek: %v", err)
-		}
+		_, err := rand.Read(cek)
+		require.NoError(t, err, "rand cek")
 
 		w, err := Wrap(recipient.PublicKey(), cek)
-		if err != nil {
-			t.Fatalf("Wrap(%d-byte CEK): %v", size, err)
-		}
-		if w.EphemeralPublicKey.Curve() != ecdh.X25519() {
-			t.Fatalf("ephemeral key is not X25519")
-		}
-		if len(w.WrappedCEK) != size+8 {
-			t.Fatalf("wrapped CEK length = %d, want %d", len(w.WrappedCEK), size+8)
-		}
+		require.NoErrorf(t, err, "Wrap(%d-byte CEK)", size)
+		require.Equal(t, ecdh.X25519(), w.EphemeralPublicKey.Curve(), "ephemeral key is not X25519")
+		require.Lenf(t, w.WrappedCEK, size+8, "wrapped CEK length")
 
 		got, err := Unwrap(recipient, w)
-		if err != nil {
-			t.Fatalf("Unwrap(%d-byte CEK): %v", size, err)
-		}
-		if !bytes.Equal(got, cek) {
-			t.Fatalf("round-trip mismatch for %d-byte CEK:\n got %X\nwant %X", size, got, cek)
-		}
+		require.NoErrorf(t, err, "Unwrap(%d-byte CEK)", size)
+		require.Equalf(t, cek, got, "round-trip mismatch for %d-byte CEK", size)
 	}
 }
 
@@ -61,20 +48,11 @@ func TestUnwrapWrongPrivateKey(t *testing.T) {
 	cek := bytes.Repeat([]byte{0x5A}, 32)
 
 	w, err := Wrap(recipient.PublicKey(), cek)
-	if err != nil {
-		t.Fatalf("Wrap: %v", err)
-	}
+	require.NoError(t, err, "Wrap")
 
 	got, err := Unwrap(wrongKey, w)
-	if err == nil {
-		t.Fatalf("Unwrap with wrong key succeeded, want error")
-	}
-	if !errors.Is(err, aeskw.ErrIntegrity) {
-		t.Fatalf("Unwrap with wrong key: err = %v, want it to wrap aeskw.ErrIntegrity", err)
-	}
-	if got != nil {
-		t.Fatalf("Unwrap with wrong key returned %X, want nil", got)
-	}
+	require.ErrorIs(t, err, aeskw.ErrIntegrity, "Unwrap with wrong key should wrap aeskw.ErrIntegrity")
+	require.Nil(t, got)
 }
 
 // AC: "When I wrap the same CEK twice to the same public key, the two wrapped
@@ -86,30 +64,20 @@ func TestWrapFreshEphemeralPerCall(t *testing.T) {
 	cek := bytes.Repeat([]byte{0xC3}, 32)
 
 	first, err := Wrap(recipient.PublicKey(), cek)
-	if err != nil {
-		t.Fatalf("first Wrap: %v", err)
-	}
+	require.NoError(t, err, "first Wrap")
 	second, err := Wrap(recipient.PublicKey(), cek)
-	if err != nil {
-		t.Fatalf("second Wrap: %v", err)
-	}
+	require.NoError(t, err, "second Wrap")
 
-	if bytes.Equal(first.EphemeralPublicKey.Bytes(), second.EphemeralPublicKey.Bytes()) {
-		t.Fatalf("ephemeral public keys are identical across wraps; expected fresh key each time")
-	}
-	if bytes.Equal(first.WrappedCEK, second.WrappedCEK) {
-		t.Fatalf("wrapped CEKs are identical across wraps; expected different output")
-	}
+	require.NotEqual(t, first.EphemeralPublicKey.Bytes(), second.EphemeralPublicKey.Bytes(),
+		"ephemeral public keys are identical across wraps; expected a fresh key each time")
+	require.NotEqual(t, first.WrappedCEK, second.WrappedCEK,
+		"wrapped CEKs are identical across wraps; expected different output")
 
 	// Both independently recover the same plaintext CEK.
 	for i, w := range []*Wrapped{first, second} {
 		got, err := Unwrap(recipient, w)
-		if err != nil {
-			t.Fatalf("Unwrap copy %d: %v", i, err)
-		}
-		if !bytes.Equal(got, cek) {
-			t.Fatalf("Unwrap copy %d mismatch: got %X want %X", i, got, cek)
-		}
+		require.NoErrorf(t, err, "Unwrap copy %d", i)
+		require.Equalf(t, cek, got, "Unwrap copy %d mismatch", i)
 	}
 }
 
@@ -120,18 +88,13 @@ func TestUnwrapTamperedEphemeral(t *testing.T) {
 	cek := bytes.Repeat([]byte{0x11}, 32)
 
 	w, err := Wrap(recipient.PublicKey(), cek)
-	if err != nil {
-		t.Fatalf("Wrap: %v", err)
-	}
+	require.NoError(t, err, "Wrap")
 	other, err := ecdh.X25519().GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("generate other key: %v", err)
-	}
+	require.NoError(t, err, "generate other key")
 	w.EphemeralPublicKey = other.PublicKey()
 
-	if _, err := Unwrap(recipient, w); !errors.Is(err, aeskw.ErrIntegrity) {
-		t.Fatalf("Unwrap with swapped ephemeral key: err = %v, want aeskw.ErrIntegrity", err)
-	}
+	_, err = Unwrap(recipient, w)
+	require.ErrorIs(t, err, aeskw.ErrIntegrity, "Unwrap with swapped ephemeral key")
 }
 
 // A low-order ephemeral point would force the ECDH shared secret into a small
@@ -142,13 +105,10 @@ func TestUnwrapLowOrderEphemeral(t *testing.T) {
 	// The all-zero u-coordinate is a classic X25519 low-order point. It is a
 	// valid 32-byte public key to construct, but ECDH against it fails.
 	lowOrder, err := ecdh.X25519().NewPublicKey(make([]byte, 32))
-	if err != nil {
-		t.Fatalf("construct low-order point: %v", err)
-	}
+	require.NoError(t, err, "construct low-order point")
 	w := &Wrapped{EphemeralPublicKey: lowOrder, WrappedCEK: make([]byte, 40)}
-	if _, err := Unwrap(recipient, w); err == nil {
-		t.Fatalf("Unwrap with low-order ephemeral point succeeded, want error")
-	}
+	_, err = Unwrap(recipient, w)
+	require.Error(t, err, "Unwrap with low-order ephemeral point should fail")
 }
 
 // A wrap is bound to its wrapped bytes: flipping any bit fails the unwrap.
@@ -157,27 +117,22 @@ func TestUnwrapTamperedCEK(t *testing.T) {
 	cek := bytes.Repeat([]byte{0x22}, 32)
 
 	w, err := Wrap(recipient.PublicKey(), cek)
-	if err != nil {
-		t.Fatalf("Wrap: %v", err)
-	}
+	require.NoError(t, err, "Wrap")
 	for i := range w.WrappedCEK {
 		tampered := &Wrapped{
 			EphemeralPublicKey: w.EphemeralPublicKey,
 			WrappedCEK:         bytes.Clone(w.WrappedCEK),
 		}
 		tampered.WrappedCEK[i] ^= 0x01
-		if _, err := Unwrap(recipient, tampered); !errors.Is(err, aeskw.ErrIntegrity) {
-			t.Fatalf("tampering wrapped byte %d not detected: err = %v", i, err)
-		}
+		_, err = Unwrap(recipient, tampered)
+		require.ErrorIsf(t, err, aeskw.ErrIntegrity, "tampering wrapped byte %d not detected", i)
 	}
 }
 
 func TestWrapInputValidation(t *testing.T) {
 	recipient := newRecipient(t)
 	p256, err := ecdh.P256().GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("generate P256 key: %v", err)
-	}
+	require.NoError(t, err, "generate P256 key")
 
 	tests := []struct {
 		name string
@@ -192,9 +147,8 @@ func TestWrapInputValidation(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := Wrap(tc.pub, tc.cek); err == nil {
-				t.Fatalf("Wrap = nil error, want error")
-			}
+			_, err := Wrap(tc.pub, tc.cek)
+			require.Error(t, err)
 		})
 	}
 }
@@ -202,34 +156,26 @@ func TestWrapInputValidation(t *testing.T) {
 func TestUnwrapInputValidation(t *testing.T) {
 	recipient := newRecipient(t)
 	p256, err := ecdh.P256().GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("generate P256 key: %v", err)
-	}
+	require.NoError(t, err, "generate P256 key")
 	valid, err := Wrap(recipient.PublicKey(), make([]byte, 32))
-	if err != nil {
-		t.Fatalf("Wrap: %v", err)
-	}
+	require.NoError(t, err, "Wrap")
 
 	t.Run("nil private key", func(t *testing.T) {
-		if _, err := Unwrap(nil, valid); err == nil {
-			t.Fatalf("want error")
-		}
+		_, err := Unwrap(nil, valid)
+		require.Error(t, err)
 	})
 	t.Run("nil wrapped", func(t *testing.T) {
-		if _, err := Unwrap(recipient, nil); err == nil {
-			t.Fatalf("want error")
-		}
+		_, err := Unwrap(recipient, nil)
+		require.Error(t, err)
 	})
 	t.Run("nil ephemeral key", func(t *testing.T) {
-		if _, err := Unwrap(recipient, &Wrapped{WrappedCEK: valid.WrappedCEK}); err == nil {
-			t.Fatalf("want error")
-		}
+		_, err := Unwrap(recipient, &Wrapped{WrappedCEK: valid.WrappedCEK})
+		require.Error(t, err)
 	})
 	t.Run("ephemeral wrong curve", func(t *testing.T) {
 		w := &Wrapped{EphemeralPublicKey: p256.PublicKey(), WrappedCEK: valid.WrappedCEK}
-		if _, err := Unwrap(recipient, w); err == nil {
-			t.Fatalf("want error")
-		}
+		_, err := Unwrap(recipient, w)
+		require.Error(t, err)
 	})
 }
 
@@ -259,56 +205,34 @@ func TestKnownAnswerVector(t *testing.T) {
 	cek := mustDecode(t, cekHex)
 
 	priv, err := ecdh.X25519().NewPrivateKey(recipPrivBytes)
-	if err != nil {
-		t.Fatalf("recipient private key: %v", err)
-	}
+	require.NoError(t, err, "recipient private key")
 	ephemeral, err := ecdh.X25519().NewPrivateKey(ephPrivBytes)
-	if err != nil {
-		t.Fatalf("ephemeral private key: %v", err)
-	}
+	require.NoError(t, err, "ephemeral private key")
 
 	// The recipient public key derived from the fixed scalar is itself part of
 	// the vector — record it so a cross-impl test starts from the same key.
-	if got := hex.EncodeToString(priv.PublicKey().Bytes()); got != wantRecipientPubHex {
-		t.Fatalf("recipient public key:\n got %s\nwant %s", got, wantRecipientPubHex)
-	}
+	require.Equal(t, wantRecipientPubHex, hex.EncodeToString(priv.PublicKey().Bytes()), "recipient public key")
 
 	w, err := wrapWithEphemeral(ephemeral, priv.PublicKey(), cek)
-	if err != nil {
-		t.Fatalf("wrap: %v", err)
-	}
-	if got := hex.EncodeToString(w.EphemeralPublicKey.Bytes()); got != wantEphemeralPubHex {
-		t.Fatalf("ephemeral public key:\n got %s\nwant %s", got, wantEphemeralPubHex)
-	}
-	if got := hex.EncodeToString(w.WrappedCEK); got != wantWrappedCEKHex {
-		t.Fatalf("wrapped CEK:\n got %s\nwant %s", got, wantWrappedCEKHex)
-	}
+	require.NoError(t, err, "wrap")
+	require.Equal(t, wantEphemeralPubHex, hex.EncodeToString(w.EphemeralPublicKey.Bytes()), "ephemeral public key")
+	require.Equal(t, wantWrappedCEKHex, hex.EncodeToString(w.WrappedCEK), "wrapped CEK")
 
 	// The vector must also round-trip back to the original CEK.
 	back, err := Unwrap(priv, w)
-	if err != nil {
-		t.Fatalf("unwrap: %v", err)
-	}
-	if !bytes.Equal(back, cek) {
-		t.Fatalf("round-trip:\n got %X\nwant %X", back, cek)
-	}
+	require.NoError(t, err, "unwrap")
+	require.Equal(t, cek, back, "round-trip")
 
 	// A fixed ephemeral key makes the wrap deterministic — wrapping again with
 	// the same ephemeral key yields byte-identical output.
 	again, err := wrapWithEphemeral(ephemeral, priv.PublicKey(), cek)
-	if err != nil {
-		t.Fatalf("second wrap: %v", err)
-	}
-	if !bytes.Equal(again.WrappedCEK, w.WrappedCEK) {
-		t.Fatalf("wrap not deterministic for a fixed ephemeral key")
-	}
+	require.NoError(t, err, "second wrap")
+	require.Equal(t, w.WrappedCEK, again.WrappedCEK, "wrap not deterministic for a fixed ephemeral key")
 }
 
 func mustDecode(t *testing.T, s string) []byte {
 	t.Helper()
 	b, err := hex.DecodeString(s)
-	if err != nil {
-		t.Fatalf("bad hex %q: %v", s, err)
-	}
+	require.NoErrorf(t, err, "bad hex %q", s)
 	return b
 }

@@ -5,6 +5,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 // TestKDFContextCanonical pins the exact CBOR encoding of the COSE_KDF_Context
@@ -19,9 +21,7 @@ import (
 func TestKDFContextCanonical(t *testing.T) {
 	got := kdfContext(algA256KW, kekLen*8, nil)
 	want := mustDecode(t, "842483f6f6f6"+"83f6f6f6"+"8219010040")
-	if !bytes.Equal(got, want) {
-		t.Fatalf("kdfContext mismatch:\n got %X\nwant %X", got, want)
-	}
+	require.Equal(t, want, got, "kdfContext mismatch")
 }
 
 // TestKDFContextProtected confirms a non-empty protected header is embedded as
@@ -31,9 +31,7 @@ func TestKDFContextProtected(t *testing.T) {
 	got := kdfContext(algA256KW, kekLen*8, []byte{0xa1, 0x01, 0x38, 0x1e})
 	// ...trailing SuppPubInfo: [256, h'a101381e'] -> 82 19 0100 44 a101381e
 	want := mustDecode(t, "842483f6f6f6"+"83f6f6f6"+"821901004"+"4a101381e")
-	if !bytes.Equal(got, want) {
-		t.Fatalf("kdfContext(protected) mismatch:\n got %X\nwant %X", got, want)
-	}
+	require.Equal(t, want, got, "kdfContext(protected) mismatch")
 }
 
 // TestConcatKDFSingleBlock checks the one-round case (the A256KW case: 32-byte
@@ -51,9 +49,7 @@ func TestConcatKDFSingleBlock(t *testing.T) {
 	h.Write(other)
 	want := h.Sum(nil)
 
-	if !bytes.Equal(got, want) {
-		t.Fatalf("concatKDF single block mismatch:\n got %X\nwant %X", got, want)
-	}
+	require.Equal(t, want, got, "concatKDF single block mismatch")
 }
 
 // TestConcatKDFMultiBlock checks the multi-round case: two SHA-256 blocks
@@ -64,9 +60,7 @@ func TestConcatKDFMultiBlock(t *testing.T) {
 	other := []byte("ctx")
 
 	got := concatKDF(z, other, 48)
-	if len(got) != 48 {
-		t.Fatalf("length = %d, want 48", len(got))
-	}
+	require.Len(t, got, 48)
 
 	block := func(counter byte) []byte {
 		h := sha256.New()
@@ -77,9 +71,7 @@ func TestConcatKDFMultiBlock(t *testing.T) {
 	}
 	want := append(block(1), block(2)...)[:48]
 
-	if !bytes.Equal(got, want) {
-		t.Fatalf("concatKDF multi block mismatch:\n got %X\nwant %X", got, want)
-	}
+	require.Equal(t, want, got, "concatKDF multi block mismatch")
 }
 
 // TestConcatKDFContextSensitivity confirms the derived key depends on the
@@ -88,9 +80,7 @@ func TestConcatKDFContextSensitivity(t *testing.T) {
 	z := bytes.Repeat([]byte{0x42}, 32)
 	a := concatKDF(z, kdfContext(algA256KW, 256, nil), 32)
 	b := concatKDF(z, kdfContext(algA256KW, 128, nil), 32)
-	if bytes.Equal(a, b) {
-		t.Fatalf("derivations under different keyDataLength contexts collided")
-	}
+	require.NotEqual(t, a, b, "derivations under different keyDataLength contexts collided")
 }
 
 // TestCBORHeadEncoding pins the shortest-form (canonical) CBOR head encoding
@@ -117,9 +107,8 @@ func TestCBORHeadEncoding(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := hex.EncodeToString(cborHead(nil, tc.major, tc.arg)); got != tc.want {
-				t.Fatalf("cborHead(%d, %d) = %s, want %s", tc.major, tc.arg, got, tc.want)
-			}
+			got := hex.EncodeToString(cborHead(nil, tc.major, tc.arg))
+			require.Equalf(t, tc.want, got, "cborHead(%d, %d)", tc.major, tc.arg)
 		})
 	}
 }
@@ -142,8 +131,7 @@ func TestCBORIntEncoding(t *testing.T) {
 		{-257, "390100"},
 	}
 	for _, tc := range tests {
-		if got := hex.EncodeToString(cborInt(nil, tc.n)); got != tc.want {
-			t.Errorf("cborInt(%d) = %s, want %s", tc.n, got, tc.want)
-		}
+		got := hex.EncodeToString(cborInt(nil, tc.n))
+		require.Equalf(t, tc.want, got, "cborInt(%d)", tc.n)
 	}
 }

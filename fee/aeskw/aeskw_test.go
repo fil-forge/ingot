@@ -3,16 +3,15 @@ package aeskw
 import (
 	"bytes"
 	"encoding/hex"
-	"errors"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 func mustHex(t *testing.T, s string) []byte {
 	t.Helper()
 	b, err := hex.DecodeString(s)
-	if err != nil {
-		t.Fatalf("bad hex %q: %v", s, err)
-	}
+	require.NoErrorf(t, err, "bad hex %q", s)
 	return b
 }
 
@@ -71,20 +70,12 @@ func TestRFC3394Vectors(t *testing.T) {
 			want := mustHex(t, v.wrapped)
 
 			got, err := Wrap(kek, keyData)
-			if err != nil {
-				t.Fatalf("Wrap: %v", err)
-			}
-			if !bytes.Equal(got, want) {
-				t.Fatalf("Wrap mismatch:\n got %X\nwant %X", got, want)
-			}
+			require.NoError(t, err, "Wrap")
+			require.Equal(t, want, got, "Wrap mismatch")
 
 			back, err := Unwrap(kek, want)
-			if err != nil {
-				t.Fatalf("Unwrap: %v", err)
-			}
-			if !bytes.Equal(back, keyData) {
-				t.Fatalf("Unwrap mismatch:\n got %X\nwant %X", back, keyData)
-			}
+			require.NoError(t, err, "Unwrap")
+			require.Equal(t, keyData, back, "Unwrap mismatch")
 		})
 	}
 }
@@ -94,19 +85,12 @@ func TestRoundTrip256(t *testing.T) {
 	cek := mustHex(t, "fedcba98765432100123456789abcdeffedcba98765432100123456789abcdef")
 
 	wrapped, err := Wrap(kek, cek)
-	if err != nil {
-		t.Fatalf("Wrap: %v", err)
-	}
-	if len(wrapped) != len(cek)+8 {
-		t.Fatalf("wrapped length = %d, want %d", len(wrapped), len(cek)+8)
-	}
+	require.NoError(t, err, "Wrap")
+	require.Len(t, wrapped, len(cek)+8)
+
 	back, err := Unwrap(kek, wrapped)
-	if err != nil {
-		t.Fatalf("Unwrap: %v", err)
-	}
-	if !bytes.Equal(back, cek) {
-		t.Fatalf("round-trip mismatch: got %X want %X", back, cek)
-	}
+	require.NoError(t, err, "Unwrap")
+	require.Equal(t, cek, back, "round-trip mismatch")
 }
 
 func TestUnwrapWrongKEK(t *testing.T) {
@@ -115,16 +99,11 @@ func TestUnwrapWrongKEK(t *testing.T) {
 	cek := mustHex(t, "00112233445566778899AABBCCDDEEFF000102030405060708090A0B0C0D0E0F")
 
 	wrapped, err := Wrap(kek, cek)
-	if err != nil {
-		t.Fatalf("Wrap: %v", err)
-	}
+	require.NoError(t, err, "Wrap")
+
 	got, err := Unwrap(wrongKEK, wrapped)
-	if !errors.Is(err, ErrIntegrity) {
-		t.Fatalf("Unwrap with wrong KEK: err = %v, want ErrIntegrity", err)
-	}
-	if got != nil {
-		t.Fatalf("Unwrap with wrong KEK returned %X, want nil", got)
-	}
+	require.ErrorIs(t, err, ErrIntegrity, "Unwrap with wrong KEK")
+	require.Nil(t, got)
 }
 
 func TestUnwrapTampered(t *testing.T) {
@@ -132,16 +111,13 @@ func TestUnwrapTampered(t *testing.T) {
 	cek := mustHex(t, "00112233445566778899AABBCCDDEEFF000102030405060708090A0B0C0D0E0F")
 
 	wrapped, err := Wrap(kek, cek)
-	if err != nil {
-		t.Fatalf("Wrap: %v", err)
-	}
+	require.NoError(t, err, "Wrap")
 	// Flip a bit in each byte position in turn; every mutation must be caught.
 	for i := range wrapped {
 		tampered := bytes.Clone(wrapped)
 		tampered[i] ^= 0x01
-		if _, err := Unwrap(kek, tampered); !errors.Is(err, ErrIntegrity) {
-			t.Fatalf("tampering byte %d not detected: err = %v", i, err)
-		}
+		_, err = Unwrap(kek, tampered)
+		require.ErrorIsf(t, err, ErrIntegrity, "tampering byte %d not detected", i)
 	}
 }
 
@@ -160,9 +136,8 @@ func TestWrapInputValidation(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := Wrap(tc.kek, tc.keyData); err == nil {
-				t.Fatalf("Wrap(%d-byte KEK, %d-byte data) = nil error, want error", len(tc.kek), len(tc.keyData))
-			}
+			_, err := Wrap(tc.kek, tc.keyData)
+			require.Errorf(t, err, "Wrap(%d-byte KEK, %d-byte data)", len(tc.kek), len(tc.keyData))
 		})
 	}
 }
@@ -180,9 +155,8 @@ func TestUnwrapInputValidation(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := Unwrap(tc.kek, tc.wrapped); err == nil {
-				t.Fatalf("Unwrap = nil error, want error")
-			}
+			_, err := Unwrap(tc.kek, tc.wrapped)
+			require.Error(t, err)
 		})
 	}
 }
@@ -195,18 +169,11 @@ func TestInputsNotMutated(t *testing.T) {
 	cekCopy := bytes.Clone(cek)
 
 	wrapped, err := Wrap(kek, cek)
-	if err != nil {
-		t.Fatalf("Wrap: %v", err)
-	}
-	if !bytes.Equal(cek, cekCopy) {
-		t.Fatalf("Wrap mutated its keyData argument")
-	}
+	require.NoError(t, err, "Wrap")
+	require.Equal(t, cekCopy, cek, "Wrap mutated its keyData argument")
 
 	wrappedCopy := bytes.Clone(wrapped)
-	if _, err := Unwrap(kek, wrapped); err != nil {
-		t.Fatalf("Unwrap: %v", err)
-	}
-	if !bytes.Equal(wrapped, wrappedCopy) {
-		t.Fatalf("Unwrap mutated its wrapped argument")
-	}
+	_, err = Unwrap(kek, wrapped)
+	require.NoError(t, err, "Unwrap")
+	require.Equal(t, wrappedCopy, wrapped, "Unwrap mutated its wrapped argument")
 }
