@@ -115,9 +115,13 @@ const (
 // shortest integers, canonical map-key ordering). Deterministic encoding is
 // what keeps the protected header — and therefore the AAD — byte-stable.
 //
-// decMode rejects duplicate map keys (which COSE forbids) and decodes every
-// CBOR integer to a Go int64 (erroring only if one overflows int64) so that
-// header labels and values have a single, predictable representation.
+// decMode rejects duplicate map keys (which COSE forbids) and decodes CBOR
+// integers leniently — unsigned to uint64, negative to int64. Decoded header
+// values then pass through normalizeValue, which folds every integer that fits
+// into an int64 and keeps only an unsigned value exceeding int64 as a uint64.
+// This mirrors the encode-side normalization, so any header this package can
+// Encode it can also Decode: an unsigned value above MaxInt64 round-trips as a
+// uint64 instead of failing to decode.
 var (
 	encMode cbor.EncMode
 	decMode cbor.DecMode
@@ -132,7 +136,7 @@ func init() {
 
 	dm, err := cbor.DecOptions{
 		DupMapKey: cbor.DupMapKeyEnforcedAPF,
-		IntDec:    cbor.IntDecConvertSignedOrFail,
+		IntDec:    cbor.IntDecConvertNone,
 	}.DecMode()
 	if err != nil {
 		panic(fmt.Sprintf("cose: building CBOR decode mode: %v", err))

@@ -2,6 +2,7 @@ package cose
 
 import (
 	"bytes"
+	"math"
 	"reflect"
 	"testing"
 )
@@ -310,5 +311,47 @@ func TestEncStructureStableAcrossRoundTrip(t *testing.T) {
 	}
 	if !bytes.Equal(got, want) {
 		t.Fatalf("AAD not stable across round trip:\n got %x\nwant %x", got, want)
+	}
+}
+
+func TestRoundTripLargeUnsignedValue(t *testing.T) {
+	// A header value that exceeds MaxInt64 is preserved as uint64 and must
+	// survive a round trip: a value this package can Encode it must also be
+	// able to Decode. Regression for the previously strict decode mode, which
+	// rejected any unsigned integer above MaxInt64.
+	const big = uint64(math.MaxUint64)
+	env := &Encrypt{
+		Headers: Headers{Protected: Header{}.
+			Set("big", big).
+			Set("nested", map[any]any{"n": big, "small": int64(7)})},
+		Recipients: []*Recipient{{
+			Headers:    Headers{Protected: Header{}.Set(HeaderLabelAlg, -31)},
+			Ciphertext: []byte{0x01},
+		}},
+	}
+
+	encoded, err := env.Encode()
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	decoded, _, err := Decode(encoded)
+	if err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+
+	// The top-level value comes back as the same uint64.
+	got, ok := decoded.Headers.Protected.Uint("big")
+	if !ok || got != big {
+		t.Fatalf("top-level big = %d (ok=%v), want %d", got, ok, big)
+	}
+	// Recursion: a large unsigned stays uint64 inside a nested map, while a
+	// value that fits is normalized back to int64.
+	nested, ok := decoded.Headers.Protected.Get("nested")
+	if !ok {
+		t.Fatal("nested map missing after round trip")
+	}
+	want := map[any]any{"n": big, "small": int64(7)}
+	if !reflect.DeepEqual(nested, want) {
+		t.Fatalf("nested map mismatch:\n got %#v\nwant %#v", nested, want)
 	}
 }

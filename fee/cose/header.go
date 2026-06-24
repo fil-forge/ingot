@@ -170,8 +170,11 @@ func uintToLabel(v uint64) (any, error) {
 }
 
 // normalizeValue normalizes integral values to int64 (or uint64 when too
-// large to fit) so that values set in Go match the form produced by decode.
-// Non-integer values are returned unchanged.
+// large to fit int64) so that a value set in Go matches the form produced by
+// decode. It recurses into []any and map[any]any — including map keys — so
+// nested integers, such as those inside a COSE_Key or an application metadata
+// map, are normalized at every depth. Non-integer scalars are returned
+// unchanged.
 func normalizeValue(value any) any {
 	switch v := value.(type) {
 	case int:
@@ -194,6 +197,18 @@ func normalizeValue(value any) any {
 		return int64(v)
 	case uint64:
 		return uintToValue(v)
+	case []any:
+		out := make([]any, len(v))
+		for i, e := range v {
+			out[i] = normalizeValue(e)
+		}
+		return out
+	case map[any]any:
+		out := make(map[any]any, len(v))
+		for k, e := range v {
+			out[normalizeValue(k)] = normalizeValue(e)
+		}
+		return out
 	default:
 		return value
 	}
@@ -235,7 +250,7 @@ func decodeHeaderMap(raw cbor.RawMessage) (Header, error) {
 		if _, dup := h[nl]; dup {
 			return nil, fmt.Errorf("%w: %v", errDuplicateLabel, nl)
 		}
-		h[nl] = v
+		h[nl] = normalizeValue(v)
 	}
 	return h, nil
 }
