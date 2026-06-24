@@ -44,44 +44,51 @@ func mustSeal(t *testing.T, cfg aesstream.Config, pt []byte) []byte {
 }
 
 func TestRoundTrip(t *testing.T) {
-	// Sizes chosen around chunk boundaries: empty, sub-tag, tag-sized,
-	// just under/over one chunk, exact multiples, and odd remainders.
-	const cs = aesstream.MinChunkSize // 4 KiB, the smallest legal chunk
-	sizes := []int64{0, 1, 15, 16, 17, cs - 1, cs, cs + 1, 2 * cs, 2*cs + 1, 3 * cs, 3*cs + 123}
-
-	for _, n := range sizes {
-		pt := pattern(int(n))
-		cfg := baseConfig(int(cs))
-
-		ct := mustSeal(t, cfg, pt)
-		if int64(len(ct)) != aesstream.EncryptedSize(n, cs) {
-			t.Errorf("n=%d: ciphertext len %d, EncryptedSize says %d", n, len(ct), aesstream.EncryptedSize(n, cs))
-		}
-
-		got, err := aesstream.Open(cfg, ct)
-		if err != nil {
-			t.Fatalf("n=%d: Open: %v", n, err)
-		}
-		if !bytes.Equal(got, pt) {
-			t.Errorf("n=%d: round-trip mismatch (got %d bytes)", n, len(got))
-		}
+	const (
+		cs = aesstream.MinChunkSize     // 4 KiB, the smallest legal chunk
+		ds = aesstream.DefaultChunkSize // 256 KiB, selected when ChunkSize is 0
+	)
+	// Each case round-trips plaintext sizes chosen around its own chunk
+	// boundaries: empty, sub-tag, tag-sized, just under/over one chunk,
+	// exact multiples, and odd remainders.
+	cases := []struct {
+		name      string
+		chunkSize int     // Config.ChunkSize; 0 selects DefaultChunkSize
+		sizes     []int64 // plaintext lengths to seal and reopen
+	}{
+		{
+			name:      "min chunk size",
+			chunkSize: cs,
+			sizes:     []int64{0, 1, 15, 16, 17, cs - 1, cs, cs + 1, 2 * cs, 2*cs + 1, 3 * cs, 3*cs + 123},
+		},
+		{
+			name:      "default chunk size",
+			chunkSize: 0, // exercises the 0 → DefaultChunkSize resolution
+			sizes:     []int64{0, 1, ds, ds + 1, 3*ds + 99},
+		},
 	}
-}
 
-func TestRoundTripDefaultChunkSize(t *testing.T) {
-	cfg := baseConfig(0) // default 256 KiB
-	if cfg.ChunkSize != 0 {
-		t.Fatal("expected zero chunk size in config")
-	}
-	for _, n := range []int{0, 1, aesstream.DefaultChunkSize, aesstream.DefaultChunkSize + 1, 3*aesstream.DefaultChunkSize + 99} {
-		pt := pattern(n)
-		got, err := aesstream.Open(cfg, mustSeal(t, cfg, pt))
-		if err != nil {
-			t.Fatalf("n=%d: Open: %v", n, err)
-		}
-		if !bytes.Equal(got, pt) {
-			t.Errorf("n=%d: round-trip mismatch", n)
-		}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := baseConfig(tc.chunkSize)
+			for _, n := range tc.sizes {
+				pt := pattern(int(n))
+
+				ct := mustSeal(t, cfg, pt)
+				if int64(len(ct)) != aesstream.EncryptedSize(n, tc.chunkSize) {
+					t.Errorf("n=%d: ciphertext len %d, EncryptedSize says %d",
+						n, len(ct), aesstream.EncryptedSize(n, tc.chunkSize))
+				}
+
+				got, err := aesstream.Open(cfg, ct)
+				if err != nil {
+					t.Fatalf("n=%d: Open: %v", n, err)
+				}
+				if !bytes.Equal(got, pt) {
+					t.Errorf("n=%d: round-trip mismatch (got %d bytes)", n, len(got))
+				}
+			}
+		})
 	}
 }
 
