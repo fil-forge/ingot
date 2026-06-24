@@ -60,7 +60,7 @@ func expectedEncStructure(protected, externalAAD []byte) []byte {
 // --- golden vectors --------------------------------------------------------
 
 // The minimal detached COSE_Encrypt: empty body headers, a null payload, and a
-// single recipient with empty headers and a one-byte wrapped CEK (0xAA).
+// single recipient with empty headers and a one-byte wrapped key (0xAA).
 //
 //	96([ h'', {}, null, [ [ h'', {}, h'AA' ] ] ])
 //	d8 60 84 40 a0 f6 81 83 40 a0 41 aa

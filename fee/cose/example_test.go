@@ -13,22 +13,22 @@ import (
 // encryption and key wrap are the caller's responsibility — cose only handles
 // the envelope and the Enc_structure.
 func Example() {
-	const feeType = "application/vnd.filecoin-encryption+cose"
+	const exampleType = "application/example"
 
 	env := &cose.Encrypt{
 		Headers: cose.Headers{
 			Protected: cose.Header{}.
 				Set(cose.HeaderLabelAlg, 3). // AES-256-GCM
-				Set(cose.HeaderLabelType, feeType),
+				Set(cose.HeaderLabelType, exampleType),
 			Unprotected: cose.Header{}.
 				Set(cose.HeaderLabelIV, bytes.Repeat([]byte{0x00}, 12)),
 		},
 		Recipients: []*cose.Recipient{{
 			Headers: cose.Headers{
 				Protected:   cose.Header{}.Set(cose.HeaderLabelAlg, -31), // ECDH-ES+A256KW
-				Unprotected: cose.Header{}.Set(cose.HeaderLabelKID, []byte("wrap-1")),
+				Unprotected: cose.Header{}.Set(cose.HeaderLabelKID, []byte("key-1")),
 			},
-			Ciphertext: []byte("wrapped-cek-bytes"),
+			Ciphertext: []byte("wrapped-key-bytes"),
 		}},
 	}
 
@@ -46,8 +46,8 @@ func Example() {
 	}
 	blob := append(envelope, []byte("...detached ciphertext...")...)
 
-	// Decode, pinning the FEE envelope type, and recover the trailing payload.
-	decoded, ciphertext, err := cose.Decode(blob, cose.WithExpectedType(feeType))
+	// Decode, pinning the expected type, and recover the trailing payload.
+	decoded, ciphertext, err := cose.Decode(blob, cose.WithExpectedType(exampleType))
 	if err != nil {
 		panic(err)
 	}
@@ -55,11 +55,11 @@ func Example() {
 
 	fmt.Printf("recipients: %d\n", len(decoded.Recipients))
 	fmt.Printf("kid: %s\n", kid)
-	fmt.Printf("wrapped cek: %s\n", decoded.Recipients[0].Ciphertext)
+	fmt.Printf("wrapped key: %s\n", decoded.Recipients[0].Ciphertext)
 	fmt.Printf("detached ciphertext: %s\n", ciphertext)
 	// Output:
 	// recipients: 1
-	// kid: wrap-1
-	// wrapped cek: wrapped-cek-bytes
+	// kid: key-1
+	// wrapped key: wrapped-key-bytes
 	// detached ciphertext: ...detached ciphertext...
 }

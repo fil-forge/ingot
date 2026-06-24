@@ -8,34 +8,37 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// feeTypeExample is a stand-in for the FEE envelope type. cose itself is
-// FEE-agnostic; the value is supplied by the caller via WithExpectedType.
-const feeTypeExample = "application/vnd.filecoin-encryption+cose"
+// exampleType is an arbitrary explicit type (the COSE "typ" header, RFC 9596).
+// cose ascribes no meaning to it; the value is supplied by the caller and only
+// checked when WithExpectedType is passed to Decode.
+const exampleType = "application/example"
 
-// FEE private-use labels live in the higher-level fee package; the integers
-// here are used only to prove that arbitrary integer labels round-trip.
+// Two arbitrary private-use integer labels — one small-negative, one
+// large-negative — used only to show that integer labels round-trip regardless
+// of sign or magnitude. cose ascribes no meaning to them.
 const (
-	labelChunkSize   int64 = -1
-	labelAppMetadata int64 = -65792
+	labelNegSmall int64 = -1
+	labelNegLarge int64 = -70000
 )
 
 // sampleEnvelope builds a fully-populated multi-recipient envelope that
 // exercises every header value kind: positive and negative integer labels, a
 // text-string label, byte strings, a nested map, and a custom string label.
+// The specific labels and values are arbitrary — cose is header-agnostic.
 func sampleEnvelope() *Encrypt {
 	protected := Header{}.
-		Set(HeaderLabelAlg, -65793).
-		Set(HeaderLabelType, feeTypeExample).
+		Set(HeaderLabelAlg, 3). // A256GCM (a registered COSE algorithm)
+		Set(HeaderLabelType, exampleType).
 		Set(HeaderLabelContentType, "text/plain").
-		Set(labelChunkSize, 262144).
-		Set(labelAppMetadata, map[any]any{"owner": "tenant-a", "parts": int64(3)}).
+		Set(labelNegSmall, 262144).
+		Set(labelNegLarge, map[any]any{"name": "example", "count": int64(3)}).
 		Set("x-custom", []byte{0x01, 0x02, 0x03})
 
 	unprotected := Header{}.
 		Set(HeaderLabelIV, bytes.Repeat([]byte{0xAB}, 7)).
 		Set(int64(100), "unauthenticated")
 
-	mkRecipient := func(kid string, cek []byte) *Recipient {
+	mkRecipient := func(kid string, wrappedKey []byte) *Recipient {
 		return &Recipient{
 			Headers: Headers{
 				Protected: Header{}.Set(HeaderLabelAlg, -31), // ECDH-ES+A256KW
@@ -47,16 +50,16 @@ func sampleEnvelope() *Encrypt {
 						int64(-2): bytes.Repeat([]byte{0x09}, 32), // x
 					}),
 			},
-			Ciphertext: cek,
+			Ciphertext: wrappedKey,
 		}
 	}
 
 	return &Encrypt{
 		Headers: Headers{Protected: protected, Unprotected: unprotected},
 		Recipients: []*Recipient{
-			mkRecipient("did:web:hilt.example:wrap:tenant-a#wrap-1", bytes.Repeat([]byte{0x11}, 40)),
-			mkRecipient("did:web:hilt.example:wrap:tenant-a#wrap-2", bytes.Repeat([]byte{0x22}, 40)),
-			mkRecipient("did:web:hilt.example:region#region-1", bytes.Repeat([]byte{0x33}, 40)),
+			mkRecipient("key-1", bytes.Repeat([]byte{0x11}, 40)),
+			mkRecipient("key-2", bytes.Repeat([]byte{0x22}, 40)),
+			mkRecipient("key-3", bytes.Repeat([]byte{0x33}, 40)),
 		},
 	}
 }
@@ -71,7 +74,7 @@ func TestRoundTrip(t *testing.T) {
 		encoded, err := orig.Encode()
 		require.NoError(t, err)
 
-		env, rest, err := Decode(encoded, WithExpectedType(feeTypeExample))
+		env, rest, err := Decode(encoded, WithExpectedType(exampleType))
 		require.NoError(t, err)
 		require.Len(t, rest, 0)
 
@@ -79,11 +82,11 @@ func TestRoundTrip(t *testing.T) {
 		// unprotected entry, including the nested map and custom label, must
 		// survive. Expected values use the normalized (int64) integer form.
 		wantProtected := Header{
-			HeaderLabelAlg:         int64(-65793),
-			HeaderLabelType:        feeTypeExample,
+			HeaderLabelAlg:         int64(3),
+			HeaderLabelType:        exampleType,
 			HeaderLabelContentType: "text/plain",
-			labelChunkSize:         int64(262144),
-			labelAppMetadata:       map[any]any{"owner": "tenant-a", "parts": int64(3)},
+			labelNegSmall:          int64(262144),
+			labelNegLarge:          map[any]any{"name": "example", "count": int64(3)},
 			"x-custom":             []byte{0x01, 0x02, 0x03},
 		}
 		require.Equal(t, wantProtected, env.Headers.Protected)
@@ -184,15 +187,16 @@ func TestEncode(t *testing.T) {
 		require.Equal(t, a, b)
 
 		// Header map-key insertion order must not affect the bytes: a protected
-		// header built in a different order encodes identically (canonical sort).
+		// header built in a different order — including the nested map's keys —
+		// encodes identically (canonical sort).
 		reordered := &Encrypt{
 			Headers: Headers{Protected: Header{}.
-				Set(labelAppMetadata, map[any]any{"parts": int64(3), "owner": "tenant-a"}).
+				Set(labelNegLarge, map[any]any{"count": int64(3), "name": "example"}).
 				Set("x-custom", []byte{0x01, 0x02, 0x03}).
-				Set(labelChunkSize, 262144).
+				Set(labelNegSmall, 262144).
 				Set(HeaderLabelContentType, "text/plain").
-				Set(HeaderLabelType, feeTypeExample).
-				Set(HeaderLabelAlg, -65793),
+				Set(HeaderLabelType, exampleType).
+				Set(HeaderLabelAlg, 3),
 				Unprotected: Header{}.Set(int64(100), "unauthenticated").Set(HeaderLabelIV, bytes.Repeat([]byte{0xAB}, 7)),
 			},
 			Recipients: env.Recipients,
@@ -261,7 +265,7 @@ func TestEncStructure(t *testing.T) {
 
 		// Changing the protected header MUST change the AAD.
 		diffAAD := base()
-		diffAAD.Headers.Protected.Set(HeaderLabelAlg, -65793)
+		diffAAD.Headers.Protected.Set(HeaderLabelAlg, 5)
 		require.NotEqual(t, ref, aad(diffAAD), "AAD unchanged when the protected header changed")
 
 		// external_aad must be incorporated.

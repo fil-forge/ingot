@@ -79,22 +79,22 @@ func TestDecodeExpectedType(t *testing.T) {
 	}
 
 	t.Run("matching type", func(t *testing.T) {
-		_, _, err := Decode(withType(feeTypeExample), WithExpectedType(feeTypeExample))
+		_, _, err := Decode(withType(exampleType), WithExpectedType(exampleType))
 		require.NoError(t, err)
 	})
 
 	t.Run("wrong type", func(t *testing.T) {
-		_, _, err := Decode(withType("application/other"), WithExpectedType(feeTypeExample))
+		_, _, err := Decode(withType("application/other"), WithExpectedType(exampleType))
 		require.ErrorIs(t, err, ErrUnexpectedType)
 	})
 
 	t.Run("missing type", func(t *testing.T) {
-		_, _, err := Decode(withoutType(), WithExpectedType(feeTypeExample))
+		_, _, err := Decode(withoutType(), WithExpectedType(exampleType))
 		require.ErrorIs(t, err, ErrUnexpectedType)
 	})
 
 	t.Run("type present but not a string", func(t *testing.T) {
-		_, _, err := Decode(withType(int64(7)), WithExpectedType(feeTypeExample))
+		_, _, err := Decode(withType(int64(7)), WithExpectedType(exampleType))
 		require.ErrorIs(t, err, ErrUnexpectedType)
 	})
 
