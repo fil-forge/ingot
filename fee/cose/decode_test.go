@@ -70,7 +70,7 @@ func TestDecodeExpectedType(t *testing.T) {
 	withoutType := func() []byte {
 		t.Helper()
 		env := &Encrypt{
-			Headers:    Headers{Protected: Header{}.Set(HeaderLabelAlg, 3)},
+			Headers:    Headers{Protected: Header{}.Set(HeaderLabelAlg, AlgA256GCM)},
 			Recipients: []*Recipient{{Ciphertext: []byte{0xAA}}},
 		}
 		b, err := env.Encode()

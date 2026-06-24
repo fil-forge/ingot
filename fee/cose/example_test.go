@@ -18,14 +18,14 @@ func Example() {
 	env := &cose.Encrypt{
 		Headers: cose.Headers{
 			Protected: cose.Header{}.
-				Set(cose.HeaderLabelAlg, 3). // AES-256-GCM
+				Set(cose.HeaderLabelAlg, cose.AlgA256GCM).
 				Set(cose.HeaderLabelType, exampleType),
 			Unprotected: cose.Header{}.
 				Set(cose.HeaderLabelIV, bytes.Repeat([]byte{0x00}, 12)),
 		},
 		Recipients: []*cose.Recipient{{
 			Headers: cose.Headers{
-				Protected:   cose.Header{}.Set(cose.HeaderLabelAlg, -31), // ECDH-ES+A256KW
+				Protected:   cose.Header{}.Set(cose.HeaderLabelAlg, cose.AlgECDHESA256KW),
 				Unprotected: cose.Header{}.Set(cose.HeaderLabelKID, []byte("key-1")),
 			},
 			Ciphertext: []byte("wrapped-key-bytes"),

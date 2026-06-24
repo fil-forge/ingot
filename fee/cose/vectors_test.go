@@ -104,7 +104,7 @@ func TestVectors(t *testing.T) {
 
 		alg, ok := env.Headers.Protected.Int(HeaderLabelAlg)
 		require.True(t, ok)
-		require.Equal(t, int64(3), alg)
+		require.Equal(t, AlgA256GCM, alg)
 		wantIV := hexDec(t, "00112233445566778899aabb")
 		iv, ok := env.Headers.Unprotected.Bytes(HeaderLabelIV)
 		require.True(t, ok)
@@ -113,7 +113,7 @@ func TestVectors(t *testing.T) {
 		r := env.Recipients[0]
 		ralg, ok := r.Headers.Protected.Int(HeaderLabelAlg)
 		require.True(t, ok)
-		require.Equal(t, int64(-31), ralg)
+		require.Equal(t, AlgECDHESA256KW, ralg)
 		kid, ok := r.Headers.Unprotected.Bytes(HeaderLabelKID)
 		require.True(t, ok)
 		require.Equal(t, []byte{0x01}, kid)

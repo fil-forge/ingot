@@ -27,7 +27,7 @@ const (
 // The specific labels and values are arbitrary — cose is header-agnostic.
 func sampleEnvelope() *Encrypt {
 	protected := Header{}.
-		Set(HeaderLabelAlg, 3). // A256GCM (a registered COSE algorithm)
+		Set(HeaderLabelAlg, AlgA256GCM).
 		Set(HeaderLabelType, exampleType).
 		Set(HeaderLabelContentType, "text/plain").
 		Set(labelNegSmall, 262144).
@@ -41,7 +41,7 @@ func sampleEnvelope() *Encrypt {
 	mkRecipient := func(kid string, wrappedKey []byte) *Recipient {
 		return &Recipient{
 			Headers: Headers{
-				Protected: Header{}.Set(HeaderLabelAlg, -31), // ECDH-ES+A256KW
+				Protected: Header{}.Set(HeaderLabelAlg, AlgECDHESA256KW),
 				Unprotected: Header{}.
 					Set(HeaderLabelKID, []byte(kid)).
 					Set(HeaderLabelEphemeralKey, map[any]any{
@@ -82,7 +82,7 @@ func TestRoundTrip(t *testing.T) {
 		// unprotected entry, including the nested map and custom label, must
 		// survive. Expected values use the normalized (int64) integer form.
 		wantProtected := Header{
-			HeaderLabelAlg:         int64(3),
+			HeaderLabelAlg:         AlgA256GCM,
 			HeaderLabelType:        exampleType,
 			HeaderLabelContentType: "text/plain",
 			labelNegSmall:          int64(262144),
@@ -121,7 +121,7 @@ func TestRoundTrip(t *testing.T) {
 			require.Equal(t, wantKID, gotKID)
 			alg, ok := got.Headers.Protected.Int(HeaderLabelAlg)
 			require.True(t, ok)
-			require.Equal(t, int64(-31), alg)
+			require.Equal(t, AlgECDHESA256KW, alg)
 			require.Equal(t, want.Ciphertext, got.Ciphertext)
 			require.Equal(t, want.Headers.Unprotected, got.Headers.Unprotected)
 		}
@@ -152,7 +152,7 @@ func TestRoundTrip(t *testing.T) {
 				Set("big", big).
 				Set("nested", map[any]any{"n": big, "small": int64(7)})},
 			Recipients: []*Recipient{{
-				Headers:    Headers{Protected: Header{}.Set(HeaderLabelAlg, -31)},
+				Headers:    Headers{Protected: Header{}.Set(HeaderLabelAlg, AlgECDHESA256KW)},
 				Ciphertext: []byte{0x01},
 			}},
 		}
@@ -196,7 +196,7 @@ func TestEncode(t *testing.T) {
 				Set(labelNegSmall, 262144).
 				Set(HeaderLabelContentType, "text/plain").
 				Set(HeaderLabelType, exampleType).
-				Set(HeaderLabelAlg, 3),
+				Set(HeaderLabelAlg, AlgA256GCM),
 				Unprotected: Header{}.Set(int64(100), "unauthenticated").Set(HeaderLabelIV, bytes.Repeat([]byte{0xAB}, 7)),
 			},
 			Recipients: env.Recipients,
@@ -207,7 +207,7 @@ func TestEncode(t *testing.T) {
 	})
 
 	t.Run("requires recipient", func(t *testing.T) {
-		env := &Encrypt{Headers: Headers{Protected: Header{}.Set(HeaderLabelAlg, 3)}}
+		env := &Encrypt{Headers: Headers{Protected: Header{}.Set(HeaderLabelAlg, AlgA256GCM)}}
 		_, err := env.Encode()
 		require.Error(t, err)
 	})
@@ -242,7 +242,7 @@ func TestEncStructure(t *testing.T) {
 		base := func() *Encrypt {
 			return &Encrypt{
 				Headers: Headers{
-					Protected:   Header{}.Set(HeaderLabelAlg, 3),
+					Protected:   Header{}.Set(HeaderLabelAlg, AlgA256GCM),
 					Unprotected: Header{}.Set(HeaderLabelIV, []byte{0x01}),
 				},
 				Recipients: []*Recipient{{Ciphertext: []byte{0xAA}}},
@@ -263,9 +263,10 @@ func TestEncStructure(t *testing.T) {
 		sameAAD.Headers.Unprotected.Set(HeaderLabelIV, []byte{0x02})
 		require.Equal(t, ref, aad(sameAAD), "AAD changed when only the unprotected header changed")
 
-		// Changing the protected header MUST change the AAD.
+		// Changing the protected header (here, to a different algorithm) MUST
+		// change the AAD.
 		diffAAD := base()
-		diffAAD.Headers.Protected.Set(HeaderLabelAlg, 5)
+		diffAAD.Headers.Protected.Set(HeaderLabelAlg, AlgA256KW)
 		require.NotEqual(t, ref, aad(diffAAD), "AAD unchanged when the protected header changed")
 
 		// external_aad must be incorporated.

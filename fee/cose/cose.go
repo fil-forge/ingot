@@ -77,6 +77,17 @@ const (
 	HeaderLabelEphemeralKey int64 = -1 // ephemeral key, in a recipient header
 )
 
+// Standard COSE algorithm identifiers: values stored under HeaderLabelAlg, from
+// the IANA "COSE Algorithms" registry (RFC 9053). Like the HeaderLabel*
+// constants these are conveniences — a caller may store any integer algorithm
+// id. FEE-specific private-use algorithms (e.g. Chunked-AES-256-GCM-STREAM,
+// -65793) belong to the higher-level fee package, not here.
+const (
+	AlgA256GCM      int64 = 3   // AES-256-GCM content encryption
+	AlgA256KW       int64 = -5  // AES Key Wrap with a 256-bit key
+	AlgECDHESA256KW int64 = -31 // ECDH-ES + AES-256 Key Wrap (key agreement + key wrap)
+)
+
 // Sentinel errors. Decode and header-validation failures wrap one of these, so
 // callers can classify malformed input with errors.Is. (Encode may also fail
 // with a non-sentinel error for a programming mistake — a nil recipient, or a
