@@ -5,6 +5,8 @@ import (
 	"errors"
 	"io"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 func internalConfig(chunkSize int) Config {
@@ -32,9 +34,7 @@ func TestStreamNonceLayout(t *testing.T) {
 	}
 	for _, tc := range cases {
 		got := streamNonce(base, tc.index, tc.last)
-		if !bytes.Equal(got[:], tc.want) {
-			t.Errorf("streamNonce(%#x, %v) = % x, want % x", tc.index, tc.last, got[:], tc.want)
-		}
+		require.Equalf(t, tc.want, got[:], "streamNonce(index=%#x, last=%v)", tc.index, tc.last)
 	}
 }
 
@@ -44,17 +44,14 @@ func TestWriterChunkCountGuard(t *testing.T) {
 	const cs = MinChunkSize
 	var buf bytes.Buffer
 	w, err := NewWriter(&buf, internalConfig(cs))
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	w.maxChunks = 2 // pretend a uint32 can only hold two chunks
 
 	// 3 chunks' worth forces a third flush, which must be rejected.
 	_, werr := w.Write(make([]byte, 3*cs))
 	cerr := w.Close()
-	if !errors.Is(werr, ErrTooManyChunks) && !errors.Is(cerr, ErrTooManyChunks) {
-		t.Fatalf("write/close errors = %v / %v, want ErrTooManyChunks", werr, cerr)
-	}
+	require.Truef(t, errors.Is(werr, ErrTooManyChunks) || errors.Is(cerr, ErrTooManyChunks),
+		"write/close errors = %v / %v, want ErrTooManyChunks", werr, cerr)
 }
 
 // TestReaderChunkCountGuard verifies the Reader stops at the counter limit.
@@ -62,39 +59,31 @@ func TestReaderChunkCountGuard(t *testing.T) {
 	const cs = MinChunkSize
 	cfg := internalConfig(cs)
 	ct, err := Seal(cfg, make([]byte, 3*cs)) // a valid 3-chunk stream
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	r, err := NewReader(bytes.NewReader(ct), cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	r.maxChunks = 2
-	if _, err := io.ReadAll(r); !errors.Is(err, ErrTooManyChunks) {
-		t.Fatalf("ReadAll err = %v, want ErrTooManyChunks", err)
-	}
+	_, err = io.ReadAll(r)
+	require.ErrorIs(t, err, ErrTooManyChunks)
 }
 
 // TestWriterSteadyStateAllocs shows the Writer's per-chunk work does not
 // allocate, so memory stays O(chunk size) regardless of stream length.
 func TestWriterSteadyStateAllocs(t *testing.T) {
 	w, err := NewWriter(io.Discard, internalConfig(DefaultChunkSize))
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	data := make([]byte, DefaultChunkSize)
 	w.Write(data) // warm up: leaves exactly one full chunk buffered
 
 	allocs := testing.AllocsPerRun(50, func() {
 		// Each call flushes the previously-buffered full chunk and buffers
 		// this one — one Seal into the reused scratch buffer, no allocation.
+		// Kept as a plain check so the measured path stays allocation-free.
 		if _, err := w.Write(data); err != nil {
 			t.Fatal(err)
 		}
 	})
-	if allocs > 1 {
-		t.Fatalf("Writer.Write allocated %.1f times per chunk; want O(1)", allocs)
-	}
+	require.LessOrEqualf(t, allocs, 1.0, "Writer.Write allocated %.1f times per chunk; want O(1)", allocs)
 }
 
 // TestReaderSteadyStateAllocs shows the Reader's per-chunk work does not
@@ -104,23 +93,17 @@ func TestReaderSteadyStateAllocs(t *testing.T) {
 	const runs = 50
 	cfg := internalConfig(cs)
 	ct, err := Seal(cfg, make([]byte, (runs+5)*cs))
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	r, err := NewReader(bytes.NewReader(ct), cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	rbuf := make([]byte, cs)
-	if _, err := io.ReadFull(r, rbuf); err != nil { // warm up one chunk
-		t.Fatal(err)
-	}
+	_, err = io.ReadFull(r, rbuf) // warm up one chunk
+	require.NoError(t, err)
 	allocs := testing.AllocsPerRun(runs, func() {
+		// Kept as a plain check so the measured path stays allocation-free.
 		if _, err := io.ReadFull(r, rbuf); err != nil {
 			t.Fatal(err)
 		}
 	})
-	if allocs > 1 {
-		t.Fatalf("Reader.Read allocated %.1f times per chunk; want O(1)", allocs)
-	}
+	require.LessOrEqualf(t, allocs, 1.0, "Reader.Read allocated %.1f times per chunk; want O(1)", allocs)
 }

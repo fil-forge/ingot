@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/fil-forge/ingot/fee/aesstream"
+	"github.com/stretchr/testify/require"
 )
 
 // testKey is an obviously-synthetic, fixed test CEK — never a real key.
@@ -37,9 +38,7 @@ func pattern(n int) []byte {
 func mustSeal(t *testing.T, cfg aesstream.Config, pt []byte) []byte {
 	t.Helper()
 	ct, err := aesstream.Seal(cfg, pt)
-	if err != nil {
-		t.Fatalf("Seal: %v", err)
-	}
+	require.NoError(t, err)
 	return ct
 }
 
@@ -90,18 +89,12 @@ func TestRoundTrip(t *testing.T) {
 				pt := pattern(int(n))
 
 				ct := mustSeal(t, cfg, pt)
-				if int64(len(ct)) != aesstream.EncryptedSize(n, tc.chunkSize) {
-					t.Errorf("n=%d: ciphertext len %d, EncryptedSize says %d",
-						n, len(ct), aesstream.EncryptedSize(n, tc.chunkSize))
-				}
+				require.Equalf(t, aesstream.EncryptedSize(n, tc.chunkSize), int64(len(ct)),
+					"n=%d: ciphertext length", n)
 
 				got, err := aesstream.Open(cfg, ct)
-				if err != nil {
-					t.Fatalf("n=%d: Open: %v", n, err)
-				}
-				if !bytes.Equal(got, pt) {
-					t.Errorf("n=%d: round-trip mismatch (got %d bytes)", n, len(got))
-				}
+				require.NoErrorf(t, err, "n=%d: Open", n)
+				require.Equalf(t, pt, got, "n=%d: round-trip mismatch", n)
 			}
 		})
 	}
@@ -119,31 +112,21 @@ func TestStreamingOddBoundaries(t *testing.T) {
 		for _, rstep := range []int{1, 3, 500, cs - 1, 4 * cs} {
 			var ctBuf bytes.Buffer
 			w, err := aesstream.NewWriter(&ctBuf, cfg)
-			if err != nil {
-				t.Fatal(err)
-			}
+			require.NoError(t, err)
 			for off := 0; off < len(pt); off += wstep {
 				end := min(off+wstep, len(pt))
-				if _, err := w.Write(pt[off:end]); err != nil {
-					t.Fatalf("write: %v", err)
-				}
+				_, werr := w.Write(pt[off:end])
+				require.NoError(t, werr)
 			}
-			if err := w.Close(); err != nil {
-				t.Fatalf("close: %v", err)
-			}
+			require.NoError(t, w.Close())
 
 			r, err := aesstream.NewReader(bytes.NewReader(ctBuf.Bytes()), cfg)
-			if err != nil {
-				t.Fatal(err)
-			}
+			require.NoError(t, err)
 			var out bytes.Buffer
 			rbuf := make([]byte, rstep)
-			if _, err := io.CopyBuffer(&out, r, rbuf); err != nil {
-				t.Fatalf("wstep=%d rstep=%d: copy: %v", wstep, rstep, err)
-			}
-			if !bytes.Equal(out.Bytes(), pt) {
-				t.Errorf("wstep=%d rstep=%d: mismatch", wstep, rstep)
-			}
+			_, err = io.CopyBuffer(&out, r, rbuf)
+			require.NoErrorf(t, err, "wstep=%d rstep=%d: copy", wstep, rstep)
+			require.Equalf(t, pt, out.Bytes(), "wstep=%d rstep=%d: mismatch", wstep, rstep)
 		}
 	}
 }
@@ -157,28 +140,18 @@ func TestFullSizeLastChunk(t *testing.T) {
 		cfg := baseConfig(cs)
 		pt := pattern(mult * cs)
 		got, err := aesstream.Open(cfg, mustSeal(t, cfg, pt))
-		if err != nil {
-			t.Fatalf("mult=%d: Open: %v", mult, err)
-		}
-		if !bytes.Equal(got, pt) {
-			t.Errorf("mult=%d: mismatch", mult)
-		}
+		require.NoErrorf(t, err, "mult=%d: Open", mult)
+		require.Equalf(t, pt, got, "mult=%d: mismatch", mult)
 	}
 }
 
 func TestEmptyPlaintextIsOneChunk(t *testing.T) {
 	cfg := baseConfig(aesstream.MinChunkSize)
 	ct := mustSeal(t, cfg, nil)
-	if len(ct) != aesstream.TagSize {
-		t.Fatalf("empty plaintext: ciphertext len = %d, want %d (one empty chunk)", len(ct), aesstream.TagSize)
-	}
+	require.Len(t, ct, aesstream.TagSize, "empty plaintext should encode as one empty chunk")
 	got, err := aesstream.Open(cfg, ct)
-	if err != nil {
-		t.Fatalf("Open empty: %v", err)
-	}
-	if len(got) != 0 {
-		t.Fatalf("empty plaintext: decrypted %d bytes, want 0", len(got))
-	}
+	require.NoError(t, err)
+	require.Empty(t, got)
 }
 
 func TestTruncationFails(t *testing.T) {
@@ -202,17 +175,13 @@ func TestTruncationFails(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := aesstream.Open(cfg, tc.ct)
-			if err == nil {
-				t.Fatalf("expected error, got %d bytes of plaintext", len(got))
-			}
-			if tc.wantErr != nil && !errors.Is(err, tc.wantErr) {
-				t.Fatalf("error = %v, want %v", err, tc.wantErr)
+			require.Error(t, err)
+			if tc.wantErr != nil {
+				require.ErrorIs(t, err, tc.wantErr)
 			}
 			// Whatever bytes were released before the error must be a
 			// genuine prefix of the plaintext — never fabricated data.
-			if !bytes.HasPrefix(pt, got) {
-				t.Fatalf("released bytes are not a plaintext prefix")
-			}
+			require.True(t, bytes.HasPrefix(pt, got), "released bytes are not a plaintext prefix")
 		})
 	}
 }
@@ -230,9 +199,8 @@ func TestReorderFails(t *testing.T) {
 	copy(swapped[0:enc], ct[enc:2*enc])
 	copy(swapped[enc:2*enc], ct[0:enc])
 
-	if _, err := aesstream.Open(cfg, swapped); !errors.Is(err, aesstream.ErrCorrupted) {
-		t.Fatalf("reordered chunks: err = %v, want ErrCorrupted", err)
-	}
+	_, err := aesstream.Open(cfg, swapped)
+	require.ErrorIs(t, err, aesstream.ErrCorrupted)
 }
 
 func TestBitFlipFails(t *testing.T) {
@@ -253,9 +221,8 @@ func TestBitFlipFails(t *testing.T) {
 			tampered := make([]byte, len(ct))
 			copy(tampered, ct)
 			tampered[pos] ^= 0x01
-			if _, err := aesstream.Open(cfg, tampered); !errors.Is(err, aesstream.ErrCorrupted) {
-				t.Fatalf("flip at %d: err = %v, want ErrCorrupted", pos, err)
-			}
+			_, err := aesstream.Open(cfg, tampered)
+			require.ErrorIsf(t, err, aesstream.ErrCorrupted, "flip at %d", pos)
 		})
 	}
 }
@@ -268,9 +235,8 @@ func TestTrailingDataFails(t *testing.T) {
 	// and the look-ahead detects the extra bytes as trailing data.
 	t.Run("after full-size final chunk", func(t *testing.T) {
 		ct := append(mustSeal(t, cfg, pattern(2*cs)), 0xde, 0xad)
-		if _, err := aesstream.Open(cfg, ct); !errors.Is(err, aesstream.ErrTrailingData) {
-			t.Fatalf("err = %v, want ErrTrailingData", err)
-		}
+		_, err := aesstream.Open(cfg, ct)
+		require.ErrorIs(t, err, aesstream.ErrTrailingData)
 	})
 
 	// After a short final chunk the trailing bytes are pulled into the
@@ -278,9 +244,8 @@ func TestTrailingDataFails(t *testing.T) {
 	// error, just reported as corruption.
 	t.Run("after short final chunk", func(t *testing.T) {
 		ct := append(mustSeal(t, cfg, pattern(1000)), 0xde, 0xad)
-		if _, err := aesstream.Open(cfg, ct); err == nil {
-			t.Fatal("expected an error, got nil")
-		}
+		_, err := aesstream.Open(cfg, ct)
+		require.Error(t, err)
 	})
 }
 
@@ -292,23 +257,20 @@ func TestWrongKeyOrNonceOrAADFails(t *testing.T) {
 	t.Run("wrong key", func(t *testing.T) {
 		bad := cfg
 		bad.Key = bytes.Repeat([]byte{0x99}, aesstream.KeySize)
-		if _, err := aesstream.Open(bad, ct); !errors.Is(err, aesstream.ErrCorrupted) {
-			t.Fatalf("err = %v, want ErrCorrupted", err)
-		}
+		_, err := aesstream.Open(bad, ct)
+		require.ErrorIs(t, err, aesstream.ErrCorrupted)
 	})
 	t.Run("wrong base nonce", func(t *testing.T) {
 		bad := cfg
 		bad.BaseNonce = []byte{9, 9, 9, 9, 9, 9, 9}
-		if _, err := aesstream.Open(bad, ct); !errors.Is(err, aesstream.ErrCorrupted) {
-			t.Fatalf("err = %v, want ErrCorrupted", err)
-		}
+		_, err := aesstream.Open(bad, ct)
+		require.ErrorIs(t, err, aesstream.ErrCorrupted)
 	})
 	t.Run("wrong AAD", func(t *testing.T) {
 		bad := cfg
 		bad.AAD = []byte("different")
-		if _, err := aesstream.Open(bad, ct); !errors.Is(err, aesstream.ErrCorrupted) {
-			t.Fatalf("err = %v, want ErrCorrupted", err)
-		}
+		_, err := aesstream.Open(bad, ct)
+		require.ErrorIs(t, err, aesstream.ErrCorrupted)
 	})
 }
 
@@ -317,12 +279,8 @@ func TestNilAADRoundTrips(t *testing.T) {
 	cfg.AAD = nil
 	pt := pattern(9000)
 	got, err := aesstream.Open(cfg, mustSeal(t, cfg, pt))
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	if !bytes.Equal(got, pt) {
-		t.Fatal("nil-AAD round-trip mismatch")
-	}
+	require.NoError(t, err)
+	require.Equal(t, pt, got, "nil-AAD round-trip mismatch")
 }
 
 func TestDeterministic(t *testing.T) {
@@ -330,9 +288,7 @@ func TestDeterministic(t *testing.T) {
 	pt := pattern(10000)
 	a := mustSeal(t, cfg, pt)
 	b := mustSeal(t, cfg, pt)
-	if !bytes.Equal(a, b) {
-		t.Fatal("Seal is not deterministic for fixed key/nonce/AAD")
-	}
+	require.Equal(t, a, b, "Seal is not deterministic for fixed key/nonce/AAD")
 }
 
 func TestConfigValidation(t *testing.T) {
@@ -352,39 +308,26 @@ func TestConfigValidation(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := baseConfig(aesstream.MinChunkSize)
 			tc.mutate(&cfg)
-			if _, err := aesstream.NewWriter(io.Discard, cfg); !errors.Is(err, tc.wantErr) {
-				t.Errorf("NewWriter err = %v, want %v", err, tc.wantErr)
-			}
-			if _, err := aesstream.NewReader(bytes.NewReader(nil), cfg); !errors.Is(err, tc.wantErr) {
-				t.Errorf("NewReader err = %v, want %v", err, tc.wantErr)
-			}
+			_, werr := aesstream.NewWriter(io.Discard, cfg)
+			require.ErrorIs(t, werr, tc.wantErr)
+			_, rerr := aesstream.NewReader(bytes.NewReader(nil), cfg)
+			require.ErrorIs(t, rerr, tc.wantErr)
 		})
 	}
 }
 
 func TestChunkSizeAccessorAndDefault(t *testing.T) {
 	w, err := aesstream.NewWriter(io.Discard, baseConfig(0))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if w.ChunkSize() != aesstream.DefaultChunkSize {
-		t.Errorf("default ChunkSize = %d, want %d", w.ChunkSize(), aesstream.DefaultChunkSize)
-	}
+	require.NoError(t, err)
+	require.Equal(t, aesstream.DefaultChunkSize, w.ChunkSize())
+
 	w2, err := aesstream.NewWriter(io.Discard, baseConfig(aesstream.MinChunkSize))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if w2.ChunkSize() != aesstream.MinChunkSize {
-		t.Errorf("ChunkSize = %d, want %d", w2.ChunkSize(), aesstream.MinChunkSize)
-	}
+	require.NoError(t, err)
+	require.Equal(t, aesstream.MinChunkSize, w2.ChunkSize())
 
 	r, err := aesstream.NewReader(bytes.NewReader(nil), baseConfig(aesstream.MinChunkSize))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if r.ChunkSize() != aesstream.MinChunkSize {
-		t.Errorf("Reader.ChunkSize = %d, want %d", r.ChunkSize(), aesstream.MinChunkSize)
-	}
+	require.NoError(t, err)
+	require.Equal(t, aesstream.MinChunkSize, r.ChunkSize())
 }
 
 // errWriter accepts bytes until failAfter, then fails (with a partial
@@ -410,19 +353,13 @@ func (w *errWriter) Write(p []byte) (int, error) {
 func TestWriteErrorPropagates(t *testing.T) {
 	const cs = aesstream.MinChunkSize
 	w, err := aesstream.NewWriter(&errWriter{failAfter: 100}, baseConfig(cs))
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	// Two chunks' worth forces a flush mid-Write, which hits the failure.
-	if _, err := w.Write(make([]byte, 2*cs)); !errors.Is(err, errWriteBoom) {
-		t.Fatalf("Write err = %v, want errWriteBoom", err)
-	}
-	if _, err := w.Write([]byte("x")); !errors.Is(err, errWriteBoom) {
-		t.Fatalf("sticky Write err = %v, want errWriteBoom", err)
-	}
-	if err := w.Close(); !errors.Is(err, errWriteBoom) {
-		t.Fatalf("sticky Close err = %v, want errWriteBoom", err)
-	}
+	_, err = w.Write(make([]byte, 2*cs))
+	require.ErrorIs(t, err, errWriteBoom)
+	_, err = w.Write([]byte("x"))
+	require.ErrorIs(t, err, errWriteBoom)
+	require.ErrorIs(t, w.Close(), errWriteBoom)
 }
 
 // errReader yields data then fails with a non-EOF error.
@@ -446,31 +383,20 @@ func (r *errReader) Read(p []byte) (int, error) {
 // reader is surfaced (not mistaken for truncation or corruption).
 func TestReadErrorPropagates(t *testing.T) {
 	r, err := aesstream.NewReader(&errReader{data: []byte("partial chunk bytes")}, baseConfig(aesstream.MinChunkSize))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := io.ReadAll(r); !errors.Is(err, errReadBoom) {
-		t.Fatalf("Read err = %v, want errReadBoom", err)
-	}
+	require.NoError(t, err)
+	_, err = io.ReadAll(r)
+	require.ErrorIs(t, err, errReadBoom)
 }
 
 func TestWriteAfterCloseFails(t *testing.T) {
 	w, err := aesstream.NewWriter(io.Discard, baseConfig(aesstream.MinChunkSize))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := w.Write([]byte("hello")); err != nil {
-		t.Fatal(err)
-	}
-	if err := w.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := w.Close(); err != nil {
-		t.Fatalf("second Close should be a no-op, got %v", err)
-	}
-	if _, err := w.Write([]byte("more")); err == nil {
-		t.Fatal("Write after Close should fail")
-	}
+	require.NoError(t, err)
+	_, err = w.Write([]byte("hello"))
+	require.NoError(t, err)
+	require.NoError(t, w.Close())
+	require.NoError(t, w.Close(), "second Close should be a no-op")
+	_, err = w.Write([]byte("more"))
+	require.Error(t, err, "Write after Close should fail")
 }
 
 func TestEncryptedSize(t *testing.T) {
@@ -486,35 +412,24 @@ func TestEncryptedSize(t *testing.T) {
 		{0, 0, 16},                // default chunk size, empty
 	}
 	for _, tc := range cases {
-		if got := aesstream.EncryptedSize(int64(tc.pt), tc.chunk); got != tc.want {
-			t.Errorf("EncryptedSize(%d, %d) = %d, want %d", tc.pt, tc.chunk, got, tc.want)
-		}
+		require.Equalf(t, tc.want, aesstream.EncryptedSize(int64(tc.pt), tc.chunk),
+			"EncryptedSize(%d, %d)", tc.pt, tc.chunk)
 		// Cross-check against an actual Seal for small cases.
 		if tc.chunk != 0 {
 			cfg := baseConfig(tc.chunk)
 			ct := mustSeal(t, cfg, pattern(tc.pt))
-			if int64(len(ct)) != tc.want {
-				t.Errorf("Seal len for pt=%d chunk=%d = %d, want %d", tc.pt, tc.chunk, len(ct), tc.want)
-			}
+			require.Equalf(t, tc.want, int64(len(ct)), "Seal len for pt=%d chunk=%d", tc.pt, tc.chunk)
 		}
 	}
 }
 
 func TestNewBaseNonce(t *testing.T) {
 	a, err := aesstream.NewBaseNonce()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(a) != aesstream.BaseNonceSize {
-		t.Fatalf("len = %d, want %d", len(a), aesstream.BaseNonceSize)
-	}
+	require.NoError(t, err)
+	require.Len(t, a, aesstream.BaseNonceSize)
 	b, err := aesstream.NewBaseNonce()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if bytes.Equal(a, b) {
-		t.Fatal("two base nonces were identical")
-	}
+	require.NoError(t, err)
+	require.NotEqual(t, a, b, "two base nonces were identical")
 }
 
 // TestAADIsCopiedOnConstruction verifies the Writer and Reader copy the
@@ -533,44 +448,29 @@ func TestAADIsCopiedOnConstruction(t *testing.T) {
 	encCfg.AAD = aad
 	var buf bytes.Buffer
 	w, err := aesstream.NewWriter(&buf, encCfg)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	copy(aad, tampered)
-	if _, err := w.Write(pt); err != nil {
-		t.Fatal(err)
-	}
-	if err := w.Close(); err != nil {
-		t.Fatal(err)
-	}
+	_, err = w.Write(pt)
+	require.NoError(t, err)
+	require.NoError(t, w.Close())
 
 	// Decrypting with orig only succeeds if the Writer copied the AAD.
 	decCfg := baseConfig(cs)
 	decCfg.AAD = []byte(orig)
 	got, err := aesstream.Open(decCfg, buf.Bytes())
-	if err != nil {
-		t.Fatalf("Open with original AAD failed (Writer did not copy AAD?): %v", err)
-	}
-	if !bytes.Equal(got, pt) {
-		t.Fatal("round-trip mismatch")
-	}
+	require.NoError(t, err, "Open with original AAD failed (Writer did not copy AAD?)")
+	require.Equal(t, pt, got)
 
 	// The Reader must be immune to the same post-construction mutation.
 	rAAD := []byte(orig)
 	rCfg := baseConfig(cs)
 	rCfg.AAD = rAAD
 	r, err := aesstream.NewReader(bytes.NewReader(buf.Bytes()), rCfg)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	copy(rAAD, tampered)
 	got2, err := io.ReadAll(r)
-	if err != nil {
-		t.Fatalf("Reader failed after AAD mutation (Reader did not copy AAD?): %v", err)
-	}
-	if !bytes.Equal(got2, pt) {
-		t.Fatal("reader round-trip mismatch")
-	}
+	require.NoError(t, err, "Reader failed after AAD mutation (Reader did not copy AAD?)")
+	require.Equal(t, pt, got2)
 }
 
 // stuckWriter reports zero progress with no error on every call, which a
@@ -581,17 +481,12 @@ func (stuckWriter) Write(p []byte) (int, error) { return 0, nil }
 
 func TestWriteAllShortWriteGuard(t *testing.T) {
 	w, err := aesstream.NewWriter(stuckWriter{}, baseConfig(aesstream.MinChunkSize))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := w.Write([]byte("hello")); err != nil {
-		t.Fatal(err) // buffered; no flush yet
-	}
+	require.NoError(t, err)
+	_, err = w.Write([]byte("hello"))
+	require.NoError(t, err) // buffered; no flush yet
 	// Close flushes the final chunk, which the stuck writer never accepts;
 	// writeAll must return ErrShortWrite rather than loop forever.
-	if err := w.Close(); !errors.Is(err, io.ErrShortWrite) {
-		t.Fatalf("Close err = %v, want io.ErrShortWrite", err)
-	}
+	require.ErrorIs(t, w.Close(), io.ErrShortWrite)
 }
 
 // patternReader emits an endless deterministic byte stream without
@@ -650,9 +545,7 @@ func TestBoundedMemory(t *testing.T) {
 	}()
 
 	r, err := aesstream.NewReader(pr, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
 	runtime.GC()
 	baseline := heapInuse()
@@ -673,22 +566,15 @@ func TestBoundedMemory(t *testing.T) {
 		if rerr == io.EOF {
 			break
 		}
-		if rerr != nil {
-			t.Fatalf("decrypt: %v", rerr)
-		}
+		require.NoError(t, rerr, "decrypt")
 	}
 
 	res := <-done
-	if res.err != nil {
-		t.Fatalf("encrypt: %v", res.err)
-	}
-	if total != streamSize {
-		t.Fatalf("decrypted %d bytes, want %d", total, streamSize)
-	}
-	if !bytes.Equal(outHash.Sum(nil), res.sum) {
-		t.Fatal("decrypted stream hash != plaintext hash")
-	}
-	if delta := int64(maxHeap) - int64(baseline); delta > budget {
-		t.Fatalf("heap grew by %d bytes (> %d budget) streaming %d bytes: not O(chunk)", delta, budget, streamSize)
-	}
+	require.NoError(t, res.err, "encrypt")
+	require.Equal(t, int64(streamSize), total, "decrypted byte count")
+	require.Equal(t, res.sum, outHash.Sum(nil), "decrypted stream hash != plaintext hash")
+
+	delta := int64(maxHeap) - int64(baseline)
+	require.LessOrEqualf(t, delta, int64(budget),
+		"heap grew by %d bytes (> %d budget) streaming %d bytes: not O(chunk)", delta, budget, streamSize)
 }
