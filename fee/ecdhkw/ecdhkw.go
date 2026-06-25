@@ -75,20 +75,6 @@ type Wrapped struct {
 // of 8 bytes, at least 16 (so 16, 24, or 32 bytes; FilOne CEKs are 32). The cek
 // slice is not retained or modified.
 func Wrap(recipientPub *ecdh.PublicKey, cek []byte) (*Wrapped, error) {
-	ephemeral, err := ecdh.X25519().GenerateKey(rand.Reader)
-	if err != nil {
-		return nil, fmt.Errorf("ecdhkw generating ephemeral key: %w", err)
-	}
-	return wrapWithEphemeral(ephemeral, recipientPub, cek)
-}
-
-// wrapWithEphemeral is the shared core of Wrap with the ephemeral key supplied
-// by the caller. Production code uses Wrap, which draws a fresh ephemeral key
-// from crypto/rand; tests call this directly with a fixed ephemeral key to
-// assert exact, reproducible output. (Seeding the RNG can't pin the output:
-// crypto/ecdh key generation deliberately consumes a nondeterministic amount of
-// entropy — see randutil.MaybeReadByte — to defeat fixed-seed reproduction.)
-func wrapWithEphemeral(ephemeral *ecdh.PrivateKey, recipientPub *ecdh.PublicKey, cek []byte) (*Wrapped, error) {
 	if recipientPub == nil {
 		return nil, errors.New("ecdhkw nil recipient public key")
 	}
@@ -97,6 +83,16 @@ func wrapWithEphemeral(ephemeral *ecdh.PrivateKey, recipientPub *ecdh.PublicKey,
 	}
 	if len(cek) < 16 || len(cek)%8 != 0 {
 		return nil, fmt.Errorf("ecdhkw CEK must be a multiple of 8 bytes and at least 16, got %d", len(cek))
+	}
+
+	// A fresh ephemeral key pair per wrap is what makes the output unlinkable.
+	// The output can't be pinned by seeding crypto/rand: crypto/ecdh key
+	// generation deliberately consumes a nondeterministic amount of entropy
+	// (see randutil.MaybeReadByte). Tests pin the scheme with a decryption
+	// vector (a fixed Wrapped that must Unwrap to a known CEK) instead.
+	ephemeral, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf("ecdhkw generating ephemeral key: %w", err)
 	}
 
 	kek, err := deriveKEK(ephemeral, recipientPub)

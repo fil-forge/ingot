@@ -1,10 +1,11 @@
-package aeskw
+package aeskw_test
 
 import (
 	"bytes"
 	"encoding/hex"
 	"testing"
 
+	"github.com/fil-forge/ingot/fee/aeskw"
 	"github.com/stretchr/testify/require"
 )
 
@@ -69,11 +70,11 @@ func TestRFC3394Vectors(t *testing.T) {
 			keyData := mustHex(t, v.keyData)
 			want := mustHex(t, v.wrapped)
 
-			got, err := Wrap(kek, keyData)
+			got, err := aeskw.Wrap(kek, keyData)
 			require.NoError(t, err, "Wrap")
 			require.Equal(t, want, got, "Wrap mismatch")
 
-			back, err := Unwrap(kek, want)
+			back, err := aeskw.Unwrap(kek, want)
 			require.NoError(t, err, "Unwrap")
 			require.Equal(t, keyData, back, "Unwrap mismatch")
 		})
@@ -84,11 +85,11 @@ func TestRoundTrip256(t *testing.T) {
 	kek := mustHex(t, "000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F")
 	cek := mustHex(t, "fedcba98765432100123456789abcdeffedcba98765432100123456789abcdef")
 
-	wrapped, err := Wrap(kek, cek)
+	wrapped, err := aeskw.Wrap(kek, cek)
 	require.NoError(t, err, "Wrap")
 	require.Len(t, wrapped, len(cek)+8)
 
-	back, err := Unwrap(kek, wrapped)
+	back, err := aeskw.Unwrap(kek, wrapped)
 	require.NoError(t, err, "Unwrap")
 	require.Equal(t, cek, back, "round-trip mismatch")
 }
@@ -98,11 +99,11 @@ func TestUnwrapWrongKEK(t *testing.T) {
 	wrongKEK := mustHex(t, "ff0102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F")
 	cek := mustHex(t, "00112233445566778899AABBCCDDEEFF000102030405060708090A0B0C0D0E0F")
 
-	wrapped, err := Wrap(kek, cek)
+	wrapped, err := aeskw.Wrap(kek, cek)
 	require.NoError(t, err, "Wrap")
 
-	got, err := Unwrap(wrongKEK, wrapped)
-	require.ErrorIs(t, err, ErrIntegrity, "Unwrap with wrong KEK")
+	got, err := aeskw.Unwrap(wrongKEK, wrapped)
+	require.ErrorIs(t, err, aeskw.ErrIntegrity, "Unwrap with wrong KEK")
 	require.Nil(t, got)
 }
 
@@ -110,14 +111,14 @@ func TestUnwrapTampered(t *testing.T) {
 	kek := mustHex(t, "000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F")
 	cek := mustHex(t, "00112233445566778899AABBCCDDEEFF000102030405060708090A0B0C0D0E0F")
 
-	wrapped, err := Wrap(kek, cek)
+	wrapped, err := aeskw.Wrap(kek, cek)
 	require.NoError(t, err, "Wrap")
 	// Flip a bit in each byte position in turn; every mutation must be caught.
 	for i := range wrapped {
 		tampered := bytes.Clone(wrapped)
 		tampered[i] ^= 0x01
-		_, err = Unwrap(kek, tampered)
-		require.ErrorIsf(t, err, ErrIntegrity, "tampering byte %d not detected", i)
+		_, err = aeskw.Unwrap(kek, tampered)
+		require.ErrorIsf(t, err, aeskw.ErrIntegrity, "tampering byte %d not detected", i)
 	}
 }
 
@@ -136,7 +137,7 @@ func TestWrapInputValidation(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := Wrap(tc.kek, tc.keyData)
+			_, err := aeskw.Wrap(tc.kek, tc.keyData)
 			require.Errorf(t, err, "Wrap(%d-byte KEK, %d-byte data)", len(tc.kek), len(tc.keyData))
 		})
 	}
@@ -155,7 +156,7 @@ func TestUnwrapInputValidation(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := Unwrap(tc.kek, tc.wrapped)
+			_, err := aeskw.Unwrap(tc.kek, tc.wrapped)
 			require.Error(t, err)
 		})
 	}
@@ -168,12 +169,12 @@ func TestInputsNotMutated(t *testing.T) {
 	cek := mustHex(t, "00112233445566778899AABBCCDDEEFF000102030405060708090A0B0C0D0E0F")
 	cekCopy := bytes.Clone(cek)
 
-	wrapped, err := Wrap(kek, cek)
+	wrapped, err := aeskw.Wrap(kek, cek)
 	require.NoError(t, err, "Wrap")
 	require.Equal(t, cekCopy, cek, "Wrap mutated its keyData argument")
 
 	wrappedCopy := bytes.Clone(wrapped)
-	_, err = Unwrap(kek, wrapped)
+	_, err = aeskw.Unwrap(kek, wrapped)
 	require.NoError(t, err, "Unwrap")
 	require.Equal(t, wrappedCopy, wrapped, "Unwrap mutated its wrapped argument")
 }

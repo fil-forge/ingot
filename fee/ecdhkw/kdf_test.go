@@ -9,6 +9,13 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func mustDecode(t *testing.T, s string) []byte {
+	t.Helper()
+	b, err := hex.DecodeString(s)
+	require.NoErrorf(t, err, "bad hex %q", s)
+	return b
+}
+
 // TestKDFContextCanonical pins the exact CBOR encoding of the COSE_KDF_Context
 // for the parameters this package uses (AlgorithmID = A256KW = -5, 256-bit
 // derived key, empty protected header). The bytes are the canonical, shortest-
