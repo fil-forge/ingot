@@ -8,6 +8,7 @@ require (
 	github.com/fil-forge/libforge v0.0.0-20260527182359-ebb22552c348
 	github.com/fil-forge/ucantone v0.0.0-20260522152152-eda937bc2684
 	github.com/fxamacker/cbor/v2 v2.9.2
+	github.com/go-jose/go-jose/v4 v4.1.4
 	github.com/ipfs/go-block-format v0.2.3
 	github.com/ipfs/go-cid v0.6.1
 	github.com/ipfs/go-ipld-cbor v0.2.1
