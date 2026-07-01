@@ -58,14 +58,49 @@ type UploadIntent struct {
 	Bucket    string
 }
 
-// BlobLocation is one row of ingot.blob_locations: where a blob can be
-// retrieved from, captured at accept. Keyed by (Space, Digest).
+// BlobLocation is one row of ingot.blob_locations: the full per-blob record
+// keyed by (Space, Digest) — where the blob can be retrieved from (captured at
+// accept) and, when the blob is an encrypted FEE envelope, the wrap material
+// the read path needs to decrypt it.
+//
+// The FEE fields are populated only for encrypted blobs; they are the cached
+// inputs a (range) GET's aesstream decryptor needs, so a read unwraps the CEK
+// and goes straight to a body-range fetch with no COSE envelope-header
+// round-trip. They are all-or-nothing: an unencrypted blob leaves them zero
+// (stored as SQL NULL). A fresh CEK per encryption event makes every ciphertext
+// digest unique to one encryption, so this wrap material is a 1:1 fact about the
+// row. Raw CEK bytes are never stored — only the region-KEK-wrapped CEK and the
+// identifiers needed to unwrap it. See docs/architecture.md §8 and FIL-480.
 type BlobLocation struct {
 	Space    string
 	Digest   []byte
 	Provider string
 	URL      string
 	Size     int64
+
+	// RegionWrappedCEK is the content-encryption key wrapped under the region
+	// KEK (A256KW). Nil for an unencrypted blob; its presence marks the blob as
+	// an encrypted FEE envelope. Never the raw CEK.
+	RegionWrappedCEK []byte
+	// RegionKeyVersion identifies which version of the region KEK wrapped the
+	// CEK, so a rotation can re-wrap in place. Opaque, so it is agnostic to the
+	// region-key cardinality decision (FIL-572). Empty for an unencrypted blob.
+	RegionKeyVersion string
+	// TenantRecipientKID identifies the Hilt wrap key used for insurance-recovery
+	// unwrap. Opaque, so it is agnostic to the tenant-vs-bucket granularity
+	// decision (FIL-574). Empty for an unencrypted blob.
+	TenantRecipientKID string
+	// BaseNonce is the COSE iv: the STREAM nonce seed for this blob's ciphertext.
+	// Nil for an unencrypted blob.
+	BaseNonce []byte
+	// ChunkSize is the FEE chunk size written into the COSE protected header,
+	// cached so the read path need not fetch and decode the envelope header.
+	// Zero for an unencrypted blob.
+	ChunkSize int64
+	// ProtectedHeader is the raw COSE protected header bytes, cached to
+	// reconstruct the Enc_structure (AAD) without an envelope round-trip. Nil for
+	// an unencrypted blob.
+	ProtectedHeader []byte
 }
 
 // MultipartSession is one row of ingot.multipart_sessions.
@@ -112,9 +147,14 @@ type IntentStore interface {
 	DeleteIntent(ctx context.Context, digest []byte) error
 }
 
-// LocationStore is the local blob-location table (§8, appliance topology):
-// the (space, digest) → provider/URL mapping captured at accept, resolved
-// on read in place of the indexing-service.
+// LocationStore is the local blob-location table (§8, appliance topology): the
+// per-blob record keyed by (space, digest), captured at accept and resolved on
+// read in place of the indexing-service. Besides the provider/URL/size that
+// locate the bytes, a row also carries the FEE wrap material for an encrypted
+// blob (see BlobLocation) — PutLocation writes it, GetLocation reads it back.
+// Per-blob crypto-shred is nulling that material (write a row with the FEE
+// fields zero) or DeleteLocation; a rotation re-wrap is a PutLocation with a new
+// RegionWrappedCEK/RegionKeyVersion.
 type LocationStore interface {
 	PutLocation(ctx context.Context, loc BlobLocation) error
 	GetLocation(ctx context.Context, space string, digest []byte) (*BlobLocation, error)

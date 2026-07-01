@@ -1,6 +1,7 @@
 package registry_test
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"testing"
@@ -127,6 +128,7 @@ func TestPostgresStores_Live(t *testing.T) {
 	})
 
 	t.Run("location round trip", func(t *testing.T) {
+		// Unencrypted blob: the FEE wrap columns store as NULL and read back zero.
 		if err := r.PutLocation(ctx, registry.BlobLocation{Space: "s", Digest: digest, Provider: "did:piri", URL: "http://piri/b", Size: 100}); err != nil {
 			t.Fatalf("PutLocation: %v", err)
 		}
@@ -134,11 +136,61 @@ func TestPostgresStores_Live(t *testing.T) {
 		if err != nil || loc.URL != "http://piri/b" || loc.Size != 100 {
 			t.Fatalf("GetLocation = %+v, err %v", loc, err)
 		}
+		if loc.RegionWrappedCEK != nil || loc.BaseNonce != nil || loc.ProtectedHeader != nil ||
+			loc.RegionKeyVersion != "" || loc.TenantRecipientKID != "" || loc.ChunkSize != 0 {
+			t.Fatalf("unencrypted location read back wrap material (NULL round-trip): %+v", loc)
+		}
 		if err := r.DeleteLocation(ctx, "s", digest); err != nil {
 			t.Fatalf("DeleteLocation: %v", err)
 		}
 		if _, err := r.GetLocation(ctx, "s", digest); err != registry.ErrNotFound {
 			t.Fatalf("GetLocation after delete = %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("location FEE wrap material", func(t *testing.T) {
+		// Binary bytea (with an embedded NUL) exercises real byte round-trips.
+		encDigest := []byte{0x00, 0x01, 0x02, 0xff}
+		enc := registry.BlobLocation{
+			Space: "s", Digest: encDigest, Provider: "did:piri", URL: "http://piri/enc", Size: 4096,
+			RegionWrappedCEK:   []byte{0x00, 0xde, 0xad, 0xbe, 0xef},
+			RegionKeyVersion:   "region-v1",
+			TenantRecipientKID: "did:key:tenant#wrap",
+			BaseNonce:          []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07},
+			ChunkSize:          65536,
+			ProtectedHeader:    []byte{0xa1, 0x00, 0x18, 0x20},
+		}
+		if err := r.PutLocation(ctx, enc); err != nil {
+			t.Fatalf("PutLocation (encrypted): %v", err)
+		}
+		got, err := r.GetLocation(ctx, "s", encDigest)
+		if err != nil {
+			t.Fatalf("GetLocation (encrypted): %v", err)
+		}
+		if !bytes.Equal(got.RegionWrappedCEK, enc.RegionWrappedCEK) ||
+			!bytes.Equal(got.BaseNonce, enc.BaseNonce) ||
+			!bytes.Equal(got.ProtectedHeader, enc.ProtectedHeader) {
+			t.Fatalf("bytea wrap material round-trip mismatch: %+v", got)
+		}
+		if got.RegionKeyVersion != "region-v1" || got.TenantRecipientKID != "did:key:tenant#wrap" || got.ChunkSize != 65536 {
+			t.Fatalf("wrap scalar round-trip mismatch: %+v", got)
+		}
+
+		// Re-wrap in place: a PutLocation upsert swaps the CEK + key version.
+		got.RegionWrappedCEK = []byte{0x11, 0x22, 0x33}
+		got.RegionKeyVersion = "region-v2"
+		if err := r.PutLocation(ctx, *got); err != nil {
+			t.Fatalf("PutLocation (re-wrap): %v", err)
+		}
+		after, err := r.GetLocation(ctx, "s", encDigest)
+		if err != nil || !bytes.Equal(after.RegionWrappedCEK, []byte{0x11, 0x22, 0x33}) || after.RegionKeyVersion != "region-v2" {
+			t.Fatalf("re-wrap round-trip = %+v, err %v", after, err)
+		}
+		if after.ChunkSize != 65536 || !bytes.Equal(after.BaseNonce, enc.BaseNonce) {
+			t.Fatalf("re-wrap disturbed non-wrap fields: %+v", after)
+		}
+		if err := r.DeleteLocation(ctx, "s", encDigest); err != nil {
+			t.Fatalf("DeleteLocation: %v", err)
 		}
 	})
 

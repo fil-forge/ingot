@@ -143,12 +143,26 @@ func (r *Postgres) DeleteIntent(ctx context.Context, digest []byte) error {
 // LocationStore ==============================================================
 
 func (r *Postgres) PutLocation(ctx context.Context, loc BlobLocation) error {
+	// The FEE wrap columns are nullable: an unencrypted blob writes them NULL
+	// (nil bytea / nullString / nullInt64). The upsert overwrites the whole row
+	// state, so a rotation re-wrap is a read-modify-write of the full record.
 	_, err := r.pool.Exec(ctx,
-		`INSERT INTO ingot.blob_locations (space, digest, provider, url, size)
-		 VALUES ($1, $2, $3, $4, $5)
+		`INSERT INTO ingot.blob_locations
+		   (space, digest, provider, url, size,
+		    region_wrapped_cek, region_key_version, tenant_recipient_kid,
+		    base_nonce, chunk_size, protected_header)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 		 ON CONFLICT (space, digest) DO UPDATE
-		   SET provider = EXCLUDED.provider, url = EXCLUDED.url, size = EXCLUDED.size`,
-		loc.Space, loc.Digest, loc.Provider, loc.URL, loc.Size)
+		   SET provider = EXCLUDED.provider, url = EXCLUDED.url, size = EXCLUDED.size,
+		       region_wrapped_cek   = EXCLUDED.region_wrapped_cek,
+		       region_key_version   = EXCLUDED.region_key_version,
+		       tenant_recipient_kid = EXCLUDED.tenant_recipient_kid,
+		       base_nonce           = EXCLUDED.base_nonce,
+		       chunk_size           = EXCLUDED.chunk_size,
+		       protected_header     = EXCLUDED.protected_header`,
+		loc.Space, loc.Digest, loc.Provider, loc.URL, loc.Size,
+		loc.RegionWrappedCEK, nullString(loc.RegionKeyVersion), nullString(loc.TenantRecipientKID),
+		loc.BaseNonce, nullInt64(loc.ChunkSize), loc.ProtectedHeader)
 	if err != nil {
 		return fmt.Errorf("registry: put location: %w", err)
 	}
@@ -157,14 +171,30 @@ func (r *Postgres) PutLocation(ctx context.Context, loc BlobLocation) error {
 
 func (r *Postgres) GetLocation(ctx context.Context, space string, digest []byte) (*BlobLocation, error) {
 	loc := &BlobLocation{Space: space, Digest: digest}
+	var regionKeyVersion, tenantRecipientKID *string
+	var chunkSize *int64
 	err := r.pool.QueryRow(ctx,
-		`SELECT provider, url, size FROM ingot.blob_locations WHERE space = $1 AND digest = $2`,
-		space, digest).Scan(&loc.Provider, &loc.URL, &loc.Size)
+		`SELECT provider, url, size,
+		        region_wrapped_cek, region_key_version, tenant_recipient_kid,
+		        base_nonce, chunk_size, protected_header
+		 FROM ingot.blob_locations WHERE space = $1 AND digest = $2`,
+		space, digest).Scan(&loc.Provider, &loc.URL, &loc.Size,
+		&loc.RegionWrappedCEK, &regionKeyVersion, &tenantRecipientKID,
+		&loc.BaseNonce, &chunkSize, &loc.ProtectedHeader)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
 		return nil, fmt.Errorf("registry: get location: %w", err)
+	}
+	if regionKeyVersion != nil {
+		loc.RegionKeyVersion = *regionKeyVersion
+	}
+	if tenantRecipientKID != nil {
+		loc.TenantRecipientKID = *tenantRecipientKID
+	}
+	if chunkSize != nil {
+		loc.ChunkSize = *chunkSize
 	}
 	return loc, nil
 }
@@ -308,6 +338,16 @@ func nullString(s string) *string {
 		return nil
 	}
 	return &s
+}
+
+// nullInt64 maps 0 to a SQL NULL so an optional bigint column stays NULL rather
+// than storing 0. Used for blob_locations.chunk_size, which is 0 (absent) for an
+// unencrypted blob and always positive for a FEE envelope.
+func nullInt64(n int64) *int64 {
+	if n == 0 {
+		return nil
+	}
+	return &n
 }
 
 func marshalMetadata(m map[string]string) ([]byte, error) {

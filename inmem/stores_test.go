@@ -239,6 +239,11 @@ func TestLocations_RoundTrip(t *testing.T) {
 	if loc.URL != "http://piri/blob" || loc.Size != 100 || loc.Provider != "did:piri:1" {
 		t.Fatalf("GetLocation = %+v", loc)
 	}
+	// An unencrypted blob carries no FEE wrap material.
+	if loc.RegionWrappedCEK != nil || loc.BaseNonce != nil || loc.ProtectedHeader != nil ||
+		loc.RegionKeyVersion != "" || loc.TenantRecipientKID != "" || loc.ChunkSize != 0 {
+		t.Fatalf("unencrypted location carries wrap material: %+v", loc)
+	}
 	if _, err := m.GetLocation(ctx, "did:other", digest); err != registry.ErrNotFound {
 		t.Fatalf("GetLocation wrong space err = %v, want ErrNotFound", err)
 	}
@@ -247,6 +252,72 @@ func TestLocations_RoundTrip(t *testing.T) {
 	}
 	if _, err := m.GetLocation(ctx, space, digest); err != registry.ErrNotFound {
 		t.Fatalf("GetLocation after delete err = %v, want ErrNotFound", err)
+	}
+}
+
+// TestLocations_FEEWrapMaterial round-trips the FEE wrap columns and verifies
+// that (a) the stored copy does not alias the caller's byte slices, (b) a
+// returned copy does not either, and (c) a re-wrap in place (a PutLocation with
+// a new RegionWrappedCEK/RegionKeyVersion) updates only the wrap material.
+func TestLocations_FEEWrapMaterial(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+	const space = "did:space:enc"
+	digest := []byte("enc-digest")
+
+	enc := registry.BlobLocation{
+		Space: space, Digest: digest, Provider: "did:piri:1", URL: "http://piri/enc", Size: 4096,
+		RegionWrappedCEK:   []byte("wrapped-cek"),
+		RegionKeyVersion:   "region-v1",
+		TenantRecipientKID: "did:key:tenant#wrap",
+		BaseNonce:          []byte("nonce07"),
+		ChunkSize:          65536,
+		ProtectedHeader:    []byte("cose-protected"),
+	}
+	if err := m.PutLocation(ctx, enc); err != nil {
+		t.Fatalf("PutLocation: %v", err)
+	}
+
+	// Mutating the caller's slices after Put must not corrupt the store.
+	enc.RegionWrappedCEK[0] = 'X'
+	enc.BaseNonce[0] = 'X'
+	enc.ProtectedHeader[0] = 'X'
+
+	got, err := m.GetLocation(ctx, space, digest)
+	if err != nil {
+		t.Fatalf("GetLocation: %v", err)
+	}
+	if string(got.RegionWrappedCEK) != "wrapped-cek" || string(got.BaseNonce) != "nonce07" ||
+		string(got.ProtectedHeader) != "cose-protected" {
+		t.Fatalf("store aliased caller slices: %+v", got)
+	}
+	if got.RegionKeyVersion != "region-v1" || got.TenantRecipientKID != "did:key:tenant#wrap" || got.ChunkSize != 65536 {
+		t.Fatalf("GetLocation wrap scalars = %+v", got)
+	}
+
+	// Mutating a returned copy must not corrupt the store either.
+	got.RegionWrappedCEK[0] = 'Y'
+	again, _ := m.GetLocation(ctx, space, digest)
+	if string(again.RegionWrappedCEK) != "wrapped-cek" {
+		t.Fatalf("store mutated through returned slice: %q", again.RegionWrappedCEK)
+	}
+
+	// Re-wrap in place: new CEK + key version, same location, other fields kept.
+	rewrapped := *again
+	rewrapped.RegionWrappedCEK = []byte("wrapped-cek-v2")
+	rewrapped.RegionKeyVersion = "region-v2"
+	if err := m.PutLocation(ctx, rewrapped); err != nil {
+		t.Fatalf("PutLocation (re-wrap): %v", err)
+	}
+	after, err := m.GetLocation(ctx, space, digest)
+	if err != nil {
+		t.Fatalf("GetLocation after re-wrap: %v", err)
+	}
+	if string(after.RegionWrappedCEK) != "wrapped-cek-v2" || after.RegionKeyVersion != "region-v2" {
+		t.Fatalf("re-wrap did not take: %+v", after)
+	}
+	if after.URL != "http://piri/enc" || string(after.BaseNonce) != "nonce07" || after.ChunkSize != 65536 {
+		t.Fatalf("re-wrap disturbed non-wrap fields: %+v", after)
 	}
 }
 

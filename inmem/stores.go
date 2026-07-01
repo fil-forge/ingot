@@ -121,9 +121,7 @@ func (m *MemStore) DeleteIntent(_ context.Context, digest []byte) error {
 func (m *MemStore) PutLocation(_ context.Context, loc registry.BlobLocation) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	cp := loc
-	cp.Digest = cloneBytes(loc.Digest)
-	m.locations[locKey{loc.Space, string(loc.Digest)}] = cp
+	m.locations[locKey{loc.Space, string(loc.Digest)}] = cloneLocation(loc)
 	return nil
 }
 
@@ -134,8 +132,7 @@ func (m *MemStore) GetLocation(_ context.Context, space string, digest []byte) (
 	if !ok {
 		return nil, registry.ErrNotFound
 	}
-	cp := loc
-	cp.Digest = cloneBytes(loc.Digest)
+	cp := cloneLocation(loc)
 	return &cp, nil
 }
 
@@ -257,6 +254,17 @@ func cloneSession(s registry.MultipartSession) registry.MultipartSession {
 		s.Metadata = md
 	}
 	return s
+}
+
+// cloneLocation deep-copies a BlobLocation's byte-slice fields (the digest and
+// the FEE wrap material) so the stored copy and any returned copy never alias
+// the caller's slices. Nil slices stay nil, preserving "unencrypted blob".
+func cloneLocation(loc registry.BlobLocation) registry.BlobLocation {
+	loc.Digest = cloneBytes(loc.Digest)
+	loc.RegionWrappedCEK = cloneBytes(loc.RegionWrappedCEK)
+	loc.BaseNonce = cloneBytes(loc.BaseNonce)
+	loc.ProtectedHeader = cloneBytes(loc.ProtectedHeader)
+	return loc
 }
 
 func clonePart(p registry.MultipartPart) registry.MultipartPart {

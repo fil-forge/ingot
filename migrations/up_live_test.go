@@ -71,4 +71,22 @@ func TestUp_Live(t *testing.T) {
 			t.Errorf("column ingot.buckets.%s does not exist after migration", col)
 		}
 	}
+
+	// The FEE wrap columns added to blob_locations (00004) exist and are nullable.
+	for _, col := range []string{
+		"region_wrapped_cek", "region_key_version", "tenant_recipient_kid",
+		"base_nonce", "chunk_size", "protected_header",
+	} {
+		var nullable string
+		err := pool.QueryRow(ctx,
+			`SELECT is_nullable FROM information_schema.columns
+			 WHERE table_schema = 'ingot' AND table_name = 'blob_locations' AND column_name = $1`, col).Scan(&nullable)
+		if err != nil {
+			t.Errorf("column ingot.blob_locations.%s missing after migration: %v", col, err)
+			continue
+		}
+		if nullable != "YES" {
+			t.Errorf("column ingot.blob_locations.%s is_nullable = %q, want YES", col, nullable)
+		}
+	}
 }
