@@ -158,6 +158,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 	// Validate the requested parts (ascending, each matching a recorded part by
 	// number + ETag) and assemble the ordered body + the multipart ETag.
 	var blobs []msbucket.BlobRef
+	var partSizes []int64
 	var offset int64
 	etagHasher := md5.New()
 	prev := 0
@@ -178,6 +179,9 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 			return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrInvalidPart)
 		}
 		etagHasher.Write(sp.ETagMD5)
+		// Record this part's byte span (it may span several blobs) so a later
+		// GET/HEAD ?partNumber=N can address it (§7.2).
+		partStart := offset
 		for _, d := range sp.BlobDigests {
 			in, err := b.intents.GetIntent(ctx, d)
 			if err != nil {
@@ -186,6 +190,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 			blobs = append(blobs, msbucket.BlobRef{Digest: d, Offset: offset, Length: in.Size})
 			offset += in.Size
 		}
+		partSizes = append(partSizes, offset-partStart)
 	}
 
 	// Accept every part's blobs on Forge (no-op in the harness), then commit.
@@ -198,7 +203,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 		Key:         key,
 		ContentType: sess.ContentType,
 		Created:     time.Now().Unix(),
-		Body:        msbucket.Body{Size: offset, Blobs: blobs},
+		Body:        msbucket.Body{Size: offset, Blobs: blobs, PartSizes: partSizes},
 		ETag:        etag,
 		Metadata:    sess.Metadata,
 	}

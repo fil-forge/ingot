@@ -19,7 +19,11 @@ type checksumSpec struct {
 // checksumFromInput derives the checksum to compute from a PutObject request.
 // An explicit x-amz-checksum-<alg> value takes precedence (and is validated);
 // otherwise x-amz-checksum-algorithm selects the algorithm to compute and echo.
-// Returns nil when the request carries no additional checksum.
+// When the request names no checksum at all, the server falls back to a
+// full-object CRC64NVME — S3's default-checksum-on-store behavior, which clients
+// (and the SDK) expect to read back even when they sent nothing. That fallback
+// is computed, not validated, since there is no client value. So this never
+// returns a nil spec: every stored object carries at least a CRC64NVME.
 func checksumFromInput(in s3response.PutObjectInput) (*checksumSpec, error) {
 	switch {
 	case in.ChecksumSHA256 != nil:
@@ -39,7 +43,8 @@ func checksumFromInput(in s3response.PutObjectInput) (*checksumSpec, error) {
 		}
 		return &checksumSpec{in.ChecksumAlgorithm, ht, ""}, nil
 	default:
-		return nil, nil
+		// No client checksum named → server-computed full-object CRC64NVME.
+		return &checksumSpec{types.ChecksumAlgorithmCrc64nvme, utils.HashTypeCRC64NVME, ""}, nil
 	}
 }
 

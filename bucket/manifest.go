@@ -39,6 +39,13 @@ type ObjectManifest struct {
 	ContentLanguage    string `cborgen:"cl"`
 	CacheControl       string `cborgen:"cc"`
 
+	// Expires is the HTTP `Expires` caching header (RFC 7234) carried through
+	// PUT and replayed verbatim on GET/HEAD. Despite the name it is NOT object
+	// lifecycle/TTL — it never deletes the object; it is a passthrough system
+	// header like CacheControl. (Real S3 Lifecycle expiration is a separate,
+	// unimplemented feature — see docs/architecture.md §12.)
+	Expires string `cborgen:"ex"`
+
 	// Metadata is the user metadata map (the x-amz-meta-* headers, with
 	// the prefix stripped and keys lower-cased by the S3 layer). Nil when
 	// the object carries no user metadata.
@@ -59,6 +66,15 @@ type Body struct {
 	SHA256 []byte    `cborgen:"h"`
 	MD5    []byte    `cborgen:"m"`
 	Blobs  []BlobRef `cborgen:"bl"`
+
+	// PartSizes records the byte length of each multipart part, in upload order,
+	// segmenting [0, Size) into the parts the client completed. It lets a GET/HEAD
+	// with ?partNumber=N return part N's byte span and the x-amz-mp-parts-count
+	// header (the Blobs list alone cannot, since a part may span several blobs or
+	// share a blob boundary). Nil for a single-PUT object, which has no parts — a
+	// ?partNumber=1 there addresses the whole object and omits the parts count.
+	// The sum of PartSizes equals Size. See docs/architecture.md §7.2.
+	PartSizes []int64 `cborgen:"ps"`
 
 	// IndexRoot is reserved (nullable) for a future UnixFS + sharded-dag-index
 	// record that would make a multi-shard object reassemblable without Ingot

@@ -135,6 +135,7 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 			ContentDisposition: backend.GetStringFromPtr(input.ContentDisposition),
 			ContentLanguage:    backend.GetStringFromPtr(input.ContentLanguage),
 			CacheControl:       backend.GetStringFromPtr(input.CacheControl),
+			Expires:            backend.GetStringFromPtr(input.Expires),
 			Metadata:           input.Metadata,
 		}
 		mfCid, err := tx.Put(ctx, mf)
@@ -368,8 +369,56 @@ func digestSet(ds [][]byte) map[string][]byte {
 	return s
 }
 
-// HeadObject returns the manifest's metadata. Range, partNumber,
-// preconditions, versioning, and checksums are not implemented.
+// selectBytes resolves which bytes a GET/HEAD addresses and the parts-count to
+// report. A ?partNumber=N request (partNumber != nil) selects a part via
+// partRange; otherwise the Range header is parsed (with a nil parts-count).
+// versitygw rejects supplying both upstream, so at most one applies here.
+func selectBytes(body msbucket.Body, partNumber *int32, rangeHeader string) (start, length int64, isRange bool, partsCount *int32, err error) {
+	if partNumber != nil {
+		return partRange(body, *partNumber)
+	}
+	start, length, isRange, err = backend.ParseObjectRange(body.Size, rangeHeader)
+	return start, length, isRange, nil, err
+}
+
+// partRange maps a ?partNumber=N request to its byte span and the
+// x-amz-mp-parts-count to report. For a multipart object (Body.PartSizes set)
+// part N is the N-th recorded part and the parts-count is the number of parts.
+// A single-PUT object has no parts: the whole object is the one addressable part
+// (N must be 1, parts-count nil — S3 omits x-amz-mp-parts-count for non-multipart
+// objects), and a zero-byte object yields no Content-Range at all. A partNumber
+// beyond the part count is ErrInvalidPartNumberRange (HTTP 416). partNumber < 1
+// is rejected by versitygw before reaching the backend.
+func partRange(body msbucket.Body, partNumber int32) (start, length int64, isRange bool, partsCount *int32, err error) {
+	if parts := body.PartSizes; len(parts) > 0 {
+		if partNumber < 1 || int(partNumber) > len(parts) {
+			return 0, 0, false, nil, s3err.GetAPIError(s3err.ErrInvalidPartNumberRange)
+		}
+		for _, sz := range parts[:partNumber-1] {
+			start += sz
+		}
+		n := int32(len(parts))
+		length := parts[partNumber-1]
+		// A zero-length part has no byte span: omit Content-Range (as for a
+		// zero-byte object) rather than emit a malformed "bytes start-(start-1)".
+		// The parts-count is still reported.
+		return start, length, length > 0, &n, nil
+	}
+	// Non-multipart object: a single logical part covering the whole body.
+	if partNumber != 1 {
+		return 0, 0, false, nil, s3err.GetAPIError(s3err.ErrInvalidPartNumberRange)
+	}
+	if body.Size == 0 {
+		// A zero-byte object has no range; S3 omits Content-Range and returns 200.
+		return 0, 0, false, nil, nil
+	}
+	return 0, body.Size, true, nil, nil
+}
+
+// HeadObject returns an object's metadata, honoring the conditional-request
+// preconditions and the same byte-selection as GetObject (?partNumber=N or a
+// Range header → a 206 with Content-Range, plus x-amz-mp-parts-count for a
+// multipart part). Versioning and tagging are not implemented.
 func (b *Backend) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s3.HeadObjectOutput, error) {
 	if input.Bucket == nil {
 		return nil, s3err.GetAPIError(s3err.ErrInvalidBucketName)
@@ -391,22 +440,41 @@ func (b *Backend) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s
 		return nil, err
 	}
 	etag := etagOf(mf)
-	size := mf.Body.Size
+	objSize := mf.Body.Size
+
+	// A request selects bytes either by ?partNumber=N or by Range (versitygw
+	// rejects both together upstream). Both yield a 206 with Content-Range; a
+	// partNumber also carries x-amz-mp-parts-count for a multipart object.
+	startOffset, length, isRange, partsCount, err := selectBytes(mf.Body, input.PartNumber, backend.GetStringFromPtr(input.Range))
+	if err != nil {
+		return nil, err
+	}
+	var contentRange *string
+	if isRange {
+		cr := fmt.Sprintf("bytes %d-%d/%d", startOffset, startOffset+length-1, objSize)
+		contentRange = &cr
+	}
+
 	contentType := mf.ContentType
 	out := &s3.HeadObjectOutput{
 		AcceptRanges:       backend.GetPtrFromString("bytes"),
-		ContentLength:      &size,
+		ContentLength:      &length,
 		ContentType:        &contentType,
 		ContentEncoding:    strPtrOrNil(mf.ContentEncoding),
 		ContentDisposition: strPtrOrNil(mf.ContentDisposition),
 		ContentLanguage:    strPtrOrNil(mf.ContentLanguage),
 		CacheControl:       strPtrOrNil(mf.CacheControl),
+		ExpiresString:      strPtrOrNil(mf.Expires),
 		Metadata:           mf.Metadata,
+		ContentRange:       contentRange,
+		PartsCount:         partsCount,
 		ETag:               &etag,
 		LastModified:       &lastModified,
 		StorageClass:       types.StorageClassStandard,
 	}
-	if input.ChecksumMode == types.ChecksumModeEnabled {
+	// Echo the stored checksum only for a whole-object HEAD with checksum mode on
+	// (a ranged HEAD's checksum would not match the full object).
+	if input.ChecksumMode == types.ChecksumModeEnabled && !isRange {
 		out.ChecksumCRC32, out.ChecksumCRC32C, out.ChecksumSHA1, out.ChecksumSHA256, out.ChecksumCRC64NVME, out.ChecksumType = checksumFields(mf.ChecksumAlgorithm, mf.Checksum)
 	}
 	return out, nil
@@ -436,7 +504,9 @@ func (b *Backend) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.
 	}
 
 	objSize := mf.Body.Size
-	startOffset, length, isRange, err := backend.ParseObjectRange(objSize, backend.GetStringFromPtr(input.Range))
+	// Select bytes by ?partNumber=N or by Range (versitygw rejects both together);
+	// partsCount is non-nil only for a multipart object addressed by part number.
+	startOffset, length, isRange, partsCount, err := selectBytes(mf.Body, input.PartNumber, backend.GetStringFromPtr(input.Range))
 	if err != nil {
 		return nil, err
 	}
@@ -461,8 +531,10 @@ func (b *Backend) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.
 		ContentDisposition: strPtrOrNil(mf.ContentDisposition),
 		ContentLanguage:    strPtrOrNil(mf.ContentLanguage),
 		CacheControl:       strPtrOrNil(mf.CacheControl),
+		ExpiresString:      strPtrOrNil(mf.Expires),
 		Metadata:           mf.Metadata,
 		ContentRange:       contentRange,
+		PartsCount:         partsCount,
 		ETag:               &etag,
 		LastModified:       &lastModified,
 		StorageClass:       types.StorageClassStandard,
