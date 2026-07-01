@@ -141,6 +141,7 @@ type serverParams struct {
 	Locations    registry.LocationStore
 	BlobRefs     registry.BlobRefStore
 	GC           registry.GCStore
+	Multipart    registry.MultipartStore
 	Meta         logstore.Meta
 	// Space is the Forge space this instance owns. Optional: standalone / the
 	// harness don't provide it (reads come from the spool), so it defaults to "".
@@ -184,6 +185,7 @@ func registerServerLifecycle(lc fx.Lifecycle, p serverParams) {
 				Locations:       p.Locations,
 				BlobRefs:        p.BlobRefs,
 				GC:              p.GC,
+				Multipart:       p.Multipart,
 				Meta:            p.Meta,
 				Space:           string(p.Space),
 			})
@@ -290,6 +292,7 @@ type registryResult struct {
 	Locations registry.LocationStore
 	BlobRefs  registry.BlobRefStore
 	GC        registry.GCStore
+	Multipart registry.MultipartStore
 	Meta      logstore.Meta
 }
 
@@ -300,7 +303,7 @@ type registryResult struct {
 // candidate log (GCStore), and segment metadata (Meta).
 func provideRegistry(pool *pgxpool.Pool) registryResult {
 	pg := registry.NewPostgres(pool)
-	return registryResult{Registry: pg, Intents: pg, Locations: pg, BlobRefs: pg, GC: pg, Meta: pg}
+	return registryResult{Registry: pg, Intents: pg, Locations: pg, BlobRefs: pg, GC: pg, Multipart: pg, Meta: pg}
 }
 
 // provideServerSpace exposes the owned space DID (as a string) to the server.

@@ -46,8 +46,12 @@ func (r *recordingRemover) removedDigests() map[string]int {
 // newRefTestBackend builds a Backend over real in-process collaborators (a
 // MemStore, an on-disk spool, a catalog log) plus a recording remover, so a
 // test can drive PutObject/DeleteObject and inspect blob_refs + releases.
-func newRefTestBackend(t *testing.T) (*Backend, *inmem.MemStore, *recordingRemover) {
+func newRefTestBackend(t *testing.T, maxBlob ...int64) (*Backend, *inmem.MemStore, *recordingRemover) {
 	t.Helper()
+	var mbs int64
+	if len(maxBlob) > 0 {
+		mbs = maxBlob[0]
+	}
 	ctx := context.Background()
 	dir := t.TempDir()
 	mem := inmem.NewMemStore()
@@ -68,17 +72,18 @@ func newRefTestBackend(t *testing.T) (*Backend, *inmem.MemStore, *recordingRemov
 
 	rm := &recordingRemover{}
 	b := New(Deps{
-		Registry:  mem,
-		Intents:   mem,
-		Locations: mem,
-		BlobRefs:  mem,
-		GC:        mem,
-		Reads:     blockstore.NewLayered(spool, log, inmem.NopBaseReader{}),
-		Log:       log,
-		Spool:     spool,
-		Uploader:  inmem.NopUploader{},
-		Remover:   rm,
-		Space:     testSpace,
+		Registry:    mem,
+		Intents:     mem,
+		Locations:   mem,
+		BlobRefs:    mem,
+		GC:          mem,
+		Reads:       blockstore.NewLayered(spool, log, inmem.NopBaseReader{}),
+		Log:         log,
+		Spool:       spool,
+		Uploader:    inmem.NopUploader{},
+		Remover:     rm,
+		Space:       testSpace,
+		MaxBlobSize: mbs,
 	})
 	if err := mem.Create(ctx, "bk", 0); err != nil {
 		t.Fatalf("create bucket: %v", err)
@@ -192,6 +197,29 @@ func TestRefIndex_DeleteReleasesAtZero(t *testing.T) {
 	}
 	if rm.removedDigests()[string(d)] != 1 {
 		t.Fatalf("expected one RemoveBlob; got %v", rm.removedDigests())
+	}
+}
+
+// TestRefIndex_DuplicateBlobInManifestReleasedOnce is the regression for the
+// duplicate-digest double-remove bug: a body whose blobs share a digest (here
+// two identical 1 KiB halves) holds exactly one claim and is released exactly
+// once on delete, not once per duplicate BlobRef.
+func TestRefIndex_DuplicateBlobInManifestReleasedOnce(t *testing.T) {
+	b, mem, rm := newRefTestBackend(t, 1024) // 1 KiB blob ceiling
+	data := bytes.Repeat([]byte{0x7}, 2048)  // → two identical 1 KiB blobs
+	d := digestOf(t, data[:1024])
+
+	putObj(t, b, "k1", data)
+	if got := claims(t, mem, d); got != 1 {
+		t.Fatalf("claims = %d, want 1 (duplicate blobs share one claim row)", got)
+	}
+
+	deleteObj(t, b, "k1")
+	if got := claims(t, mem, d); got != 0 {
+		t.Fatalf("claims after delete = %d, want 0", got)
+	}
+	if n := rm.removedDigests()[string(d)]; n != 1 {
+		t.Fatalf("RemoveBlob called %d times for the shared blob, want exactly 1", n)
 	}
 }
 
