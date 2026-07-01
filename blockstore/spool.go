@@ -2,9 +2,11 @@ package blockstore
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 
@@ -19,10 +21,11 @@ import (
 // floor and the read cache — a just-written or hot blob is served straight from
 // disk, skipping the network read tier.
 //
-// Spool is deliberately pure file I/O: it is a blockstore.BlockReader +
-// BlockWriter and nothing more. The lifecycle of a blob (the upload_intents
-// state machine, eviction policy) is owned by the caller that has the registry
-// handle — blockstore cannot import registry without a cycle (registry imports
+// Spool is deliberately pure file I/O: a blockstore.BlockReader plus the
+// streaming BlobReader/BlobWriter, and nothing more. The lifecycle of a blob
+// (the upload_intents state machine, eviction policy) is owned by the caller
+// that has the registry handle — blockstore cannot import registry without a
+// cycle (registry imports
 // blockstore for the segment-metadata types).
 type Spool struct {
 	dir string
@@ -46,30 +49,58 @@ func (s *Spool) Path(digest mh.Multihash) string {
 	return filepath.Join(s.dir, hex.EncodeToString(digest))
 }
 
-// PutBlock writes a raw block to the spool, keyed by its multihash. Writing is
-// atomic (write to a temp file, then rename) so a crash mid-write never leaves a
-// partial blob readable under its digest.
-func (s *Spool) PutBlock(_ context.Context, blk block.Block) error {
-	final := s.Path(blk.Cid().Hash())
+// WriteBlob streams r to the spool, computing its sha256 digest as it writes so
+// the blob is never held whole in memory (object-body blobs run up to
+// max_blob_size = 256 MiB; buffering them would put that × concurrency in RAM).
+// The write is atomic (temp file → rename to the digest path), so a crash leaves
+// no partial blob readable under its digest. An empty r writes nothing and
+// returns a nil digest with n == 0 (a zero-byte object has no blob). Re-writing
+// an identical blob is idempotent (same digest, rename overwrites in place).
+func (s *Spool) WriteBlob(_ context.Context, r io.Reader) (mh.Multihash, int64, error) {
 	tmp, err := os.CreateTemp(s.dir, ".tmp-*")
 	if err != nil {
-		return fmt.Errorf("blockstore: spool tempfile: %w", err)
+		return nil, 0, fmt.Errorf("blockstore: spool tempfile: %w", err)
 	}
 	tmpName := tmp.Name()
-	if _, err := tmp.Write(blk.RawData()); err != nil {
-		_ = tmp.Close()
-		_ = os.Remove(tmpName)
-		return fmt.Errorf("blockstore: spool write: %w", err)
+	hasher := sha256.New()
+	n, copyErr := io.Copy(io.MultiWriter(tmp, hasher), r)
+	if closeErr := tmp.Close(); closeErr != nil && copyErr == nil {
+		copyErr = closeErr
 	}
-	if err := tmp.Close(); err != nil {
+	if copyErr != nil {
 		_ = os.Remove(tmpName)
-		return fmt.Errorf("blockstore: spool close: %w", err)
+		return nil, n, fmt.Errorf("blockstore: spool write: %w", copyErr)
 	}
-	if err := os.Rename(tmpName, final); err != nil {
+	if n == 0 {
 		_ = os.Remove(tmpName)
-		return fmt.Errorf("blockstore: spool rename: %w", err)
+		return nil, 0, nil
 	}
-	return nil
+	digest, err := mh.Encode(hasher.Sum(nil), mh.SHA2_256)
+	if err != nil {
+		_ = os.Remove(tmpName)
+		return nil, n, fmt.Errorf("blockstore: spool digest: %w", err)
+	}
+	if err := os.Rename(tmpName, s.Path(digest)); err != nil {
+		_ = os.Remove(tmpName)
+		return nil, n, fmt.Errorf("blockstore: spool rename: %w", err)
+	}
+	return digest, n, nil
+}
+
+// OpenBlob returns a streaming reader over the spooled blob with the given
+// digest, or ErrNotFound. Unlike GetBlock it does not read the blob into memory —
+// the body read path serves bytes straight off disk. The caller owns the reader
+// and must Close it. The returned *os.File is seekable, which the body reader
+// uses to start a ranged read mid-blob without reading-and-discarding.
+func (s *Spool) OpenBlob(_ context.Context, digest mh.Multihash) (io.ReadCloser, error) {
+	f, err := os.Open(s.Path(digest))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("blockstore: spool open %s: %w", digest.B58String(), err)
+	}
+	return f, nil
 }
 
 // GetBlock returns the blob stored under c's multihash, or ErrNotFound. A miss
@@ -87,23 +118,10 @@ func (s *Spool) GetBlock(_ context.Context, c cid.Cid) (block.Block, error) {
 	return block.NewBlockWithCid(data, c)
 }
 
-// Has reports whether a blob with the given digest is on disk.
-func (s *Spool) Has(digest mh.Multihash) bool {
-	_, err := os.Stat(s.Path(digest))
-	return err == nil
-}
-
-// Remove deletes a spooled blob (eviction / cleanup). Absent files are not an
-// error.
-func (s *Spool) Remove(digest mh.Multihash) error {
-	if err := os.Remove(s.Path(digest)); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("blockstore: spool remove: %w", err)
-	}
-	return nil
-}
-
-// Compile-time assertions: Spool is a read+write block tier.
+// Compile-time assertions: Spool is a raw-block read tier and the streaming
+// blob tier for object bodies.
 var (
 	_ BlockReader = (*Spool)(nil)
-	_ BlockWriter = (*Spool)(nil)
+	_ BlobReader  = (*Spool)(nil)
+	_ BlobWriter  = (*Spool)(nil)
 )

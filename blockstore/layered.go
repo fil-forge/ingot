@@ -3,9 +3,11 @@ package blockstore
 import (
 	"context"
 	"errors"
+	"io"
 
 	block "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
+	mh "github.com/multiformats/go-multihash"
 )
 
 // Layered is the production ReadStore: a read-only seam that consults the local
@@ -74,6 +76,27 @@ func (l *Layered) GetBlock(ctx context.Context, c cid.Cid) (blk block.Block, ret
 		}
 	}
 	return l.base.GetBlock(ctx, c)
+}
+
+// OpenBlob streams an object-body blob by digest: the local spool first (the
+// read-after-write floor), then the network base (after eviction). The log is
+// skipped — it only ever holds catalog blocks, never body blobs. Tiers that
+// don't implement BlobReader are treated as a miss. Returns ErrNotFound if no
+// tier has the blob.
+func (l *Layered) OpenBlob(ctx context.Context, digest mh.Multihash) (io.ReadCloser, error) {
+	if br, ok := l.spool.(BlobReader); ok {
+		rc, err := br.OpenBlob(ctx, digest)
+		if err == nil {
+			return rc, nil
+		}
+		if !errors.Is(err, ErrNotFound) {
+			return nil, err
+		}
+	}
+	if br, ok := l.base.(BlobReader); ok {
+		return br.OpenBlob(ctx, digest)
+	}
+	return nil, ErrNotFound
 }
 
 // layeredAsBlockstore lifts Layered into a BaseStore for the

@@ -1,15 +1,12 @@
 package bucket
 
 import (
-	"bytes"
 	"context"
 	"crypto/md5"
 	"crypto/sha256"
 	"fmt"
 	"io"
 
-	block "github.com/ipfs/go-block-format"
-	"github.com/ipfs/go-cid"
 	mh "github.com/multiformats/go-multihash"
 
 	"github.com/fil-forge/ingot/blockstore"
@@ -20,27 +17,17 @@ import (
 // larger than this are coarsely split into ≤ max blobs.
 const DefaultMaxBlobSize int64 = 256 << 20
 
-// rawBlockPrefix produces CIDs for body blobs: CIDv1, raw codec (0x55),
-// sha256 multihash. Blobs are opaque bytes — no IPLD links — so the raw codec
-// is the natural fit, and the multihash is exactly the digest Piri stores the
-// blob under.
-var rawBlockPrefix = cid.Prefix{
-	Version:  1,
-	Codec:    cid.Raw,
-	MhType:   mh.SHA2_256,
-	MhLength: -1,
-}
-
 // SplitBody reads body bytes from r, splits them into blobs of at most
-// maxBlobSize bytes, writes each blob as a raw block to w, and returns a Body
-// whose Blobs list covers [0, Size) contiguously. sha256 and md5 are computed
-// over the whole body in a single streaming pass. A zero-byte body yields a Body
-// with no blobs (and the well-known empty digests).
+// maxBlobSize bytes, and streams each blob to w — which hashes it and writes it
+// to local storage as it goes, so no blob is ever held whole in memory (a 256 MiB
+// blob buffered in RAM × concurrent PUTs would sink a memory-constrained
+// appliance). It returns a Body whose Blobs list covers [0, Size) contiguously;
+// the whole-body sha256 and md5 are computed in the same streaming pass. A
+// zero-byte body yields a Body with no blobs (and the well-known empty digests).
 //
-// w is the local spool in production (blockstore.Spool): the blobs are written
-// to disk before being uploaded to Forge by digest. SplitBody itself is
-// storage-agnostic — it only needs somewhere to put the raw blocks.
-func SplitBody(ctx context.Context, w blockstore.BlockWriter, r io.Reader, maxBlobSize int64) (Body, error) {
+// w is the local spool in production (blockstore.Spool): the blobs land on disk
+// before being uploaded to Forge by digest. SplitBody itself is storage-agnostic.
+func SplitBody(ctx context.Context, w blockstore.BlobWriter, r io.Reader, maxBlobSize int64) (Body, error) {
 	max := maxBlobSize
 	if max <= 0 {
 		max = DefaultMaxBlobSize
@@ -55,29 +42,22 @@ func SplitBody(ctx context.Context, w blockstore.BlockWriter, r io.Reader, maxBl
 	var blobs []BlobRef
 	var total int64
 	for {
-		// CopyN grows buf only to the actual blob size, so a small object never
-		// allocates a full max-sized buffer. Each iteration uses a fresh buffer,
-		// so the block we hand to the store keeps its own backing array (reusing
-		// one buffer would corrupt earlier blobs the store holds by reference).
-		var buf bytes.Buffer
-		n, err := io.CopyN(&buf, src, max)
-		if n > 0 {
-			data := buf.Bytes()
-			cidv, perr := putRawBlock(ctx, w, data)
-			if perr != nil {
-				return Body{}, fmt.Errorf("put blob: %w", perr)
-			}
-			blobs = append(blobs, BlobRef{Digest: cidv.Hash(), Offset: total, Length: n})
-			total += n
+		// Stream up to max bytes for this blob straight through w (digest +
+		// disk write happen there); nothing is buffered whole here. A full max
+		// blob may be followed by more; a short read is the last blob; zero
+		// bytes means the body is exhausted.
+		digest, n, err := w.WriteBlob(ctx, io.LimitReader(src, max))
+		if err != nil {
+			return Body{}, fmt.Errorf("put blob: %w", err)
 		}
-		if err == nil {
-			// Read a full max-sized blob; more bytes may follow.
-			continue
-		}
-		if err == io.EOF {
+		if n == 0 {
 			break
 		}
-		return Body{}, fmt.Errorf("read body: %w", err)
+		blobs = append(blobs, BlobRef{Digest: digest, Offset: total, Length: n})
+		total += n
+		if n < max {
+			break
+		}
 	}
 
 	return Body{
@@ -88,47 +68,34 @@ func SplitBody(ctx context.Context, w blockstore.BlockWriter, r io.Reader, maxBl
 	}, nil
 }
 
-// OpenBody returns a reader over the full body, fetching each blob from bs by
+// OpenBody returns a reader over the full body, streaming each blob from bs by
 // its digest in order.
-func OpenBody(ctx context.Context, bs blockstore.BlockReader, body Body) io.ReadCloser {
+func OpenBody(ctx context.Context, bs blockstore.BlobReader, body Body) io.ReadCloser {
 	return &blobBodyReader{ctx: ctx, bs: bs, blobs: body.Blobs, pos: 0, end: body.Size - 1}
 }
 
 // OpenBodyRange returns a reader over [start, end] inclusive of the body.
 // Caller must ensure 0 <= start <= end <= Size-1.
-func OpenBodyRange(ctx context.Context, bs blockstore.BlockReader, body Body, start, end int64) io.ReadCloser {
+func OpenBodyRange(ctx context.Context, bs blockstore.BlobReader, body Body, start, end int64) io.ReadCloser {
 	return &blobBodyReader{ctx: ctx, bs: bs, blobs: body.Blobs, pos: start, end: end}
 }
 
-func putRawBlock(ctx context.Context, w blockstore.BlockWriter, data []byte) (cid.Cid, error) {
-	c, err := rawBlockPrefix.Sum(data)
-	if err != nil {
-		return cid.Undef, err
-	}
-	blk, err := block.NewBlockWithCid(data, c)
-	if err != nil {
-		return cid.Undef, err
-	}
-	if err := w.PutBlock(ctx, blk); err != nil {
-		return cid.Undef, err
-	}
-	return c, nil
-}
-
-// blobBodyReader streams a Body's blobs lazily. It walks the ordered BlobRef
-// list, fetching the raw block for the blob that covers the current position,
-// and serves bytes from it until the inclusive end position. Whole-body and
-// ranged reads share the same loop — only the initial pos and the end differ.
+// blobBodyReader streams a Body's blobs lazily, keeping at most one open blob
+// reader at a time so a read never materializes a whole blob (up to
+// max_blob_size) in memory. It walks the ordered BlobRef list, opening the blob
+// that covers the current position, seeking/skipping into it for a ranged read,
+// and serving bytes until the inclusive end. Whole-body and ranged reads share
+// the loop — only the initial pos and the end differ.
 type blobBodyReader struct {
 	ctx   context.Context
-	bs    blockstore.BlockReader
+	bs    blockstore.BlobReader
 	blobs []BlobRef
 
 	pos int64 // current absolute byte position (next byte to return)
 	end int64 // last byte to return (inclusive)
 
-	cur    []byte // bytes of the currently-loaded blob
-	curOff int    // read position within cur
+	cur    io.ReadCloser // currently-open blob stream, positioned at pos; nil between blobs
+	curEnd int64         // last absolute byte to serve from cur
 	err    error
 }
 
@@ -141,40 +108,84 @@ func (br *blobBodyReader) Read(p []byte) (int, error) {
 		return 0, io.EOF
 	}
 
-	if br.cur == nil || br.curOff >= len(br.cur) {
-		b, ok := blobAt(br.blobs, br.pos)
-		if !ok {
-			// The Blobs list does not cover pos — a malformed manifest.
-			br.err = io.ErrUnexpectedEOF
-			return 0, br.err
+	if br.cur == nil {
+		if err := br.openCurrent(); err != nil {
+			br.err = err
+			return 0, err
 		}
-		blk, err := br.bs.GetBlock(br.ctx, cid.NewCidV1(cid.Raw, mh.Multihash(b.Digest)))
-		if err != nil {
-			br.err = fmt.Errorf("read blob @%d: %w", b.Offset, err)
-			return 0, br.err
-		}
-		br.cur = blk.RawData()
-		br.curOff = int(br.pos - b.Offset)
 	}
 
-	// Don't read past the inclusive end position or the current blob.
-	remaining := br.end - br.pos + 1
-	available := int64(len(br.cur) - br.curOff)
+	// Don't read past this blob's end-within-range or the caller's buffer.
+	remaining := br.curEnd - br.pos + 1
 	want := int64(len(p))
-	if want > available {
-		want = available
-	}
 	if want > remaining {
 		want = remaining
 	}
-
-	n := copy(p[:want], br.cur[br.curOff:br.curOff+int(want)])
-	br.curOff += n
+	n, rerr := br.cur.Read(p[:want])
 	br.pos += int64(n)
+	if br.pos > br.curEnd { // served this blob's range — next Read opens the next blob
+		_ = br.cur.Close()
+		br.cur = nil
+	}
+	if rerr != nil && rerr != io.EOF {
+		br.err = rerr
+		return n, rerr
+	}
+	if rerr == io.EOF && br.pos <= br.curEnd {
+		// The blob stream ended before its declared range — a short/corrupt blob.
+		if br.cur != nil {
+			_ = br.cur.Close()
+			br.cur = nil
+		}
+		br.err = io.ErrUnexpectedEOF
+		return n, br.err
+	}
 	return n, nil
 }
 
-func (br *blobBodyReader) Close() error { return nil }
+// openCurrent opens the blob covering br.pos and positions it at br.pos.
+func (br *blobBodyReader) openCurrent() error {
+	b, ok := blobAt(br.blobs, br.pos)
+	if !ok {
+		// The Blobs list does not cover pos — a malformed manifest.
+		return io.ErrUnexpectedEOF
+	}
+	rc, err := br.bs.OpenBlob(br.ctx, mh.Multihash(b.Digest))
+	if err != nil {
+		return fmt.Errorf("read blob @%d: %w", b.Offset, err)
+	}
+	// Position at pos within the blob — a ranged read may start mid-blob. Prefer
+	// a seek (local spool files are seekable); fall back to read-and-discard for
+	// a non-seekable network stream.
+	if skip := br.pos - b.Offset; skip > 0 {
+		if seeker, ok := rc.(io.Seeker); ok {
+			if _, err := seeker.Seek(skip, io.SeekStart); err != nil {
+				_ = rc.Close()
+				return fmt.Errorf("seek blob @%d: %w", b.Offset, err)
+			}
+		} else if _, err := io.CopyN(io.Discard, rc, skip); err != nil {
+			_ = rc.Close()
+			return fmt.Errorf("skip into blob @%d: %w", b.Offset, err)
+		}
+	}
+	br.cur = rc
+	br.curEnd = b.Offset + b.Length - 1
+	if br.curEnd > br.end {
+		br.curEnd = br.end
+	}
+	return nil
+}
+
+// Close releases the currently-open blob stream (a partial read that didn't run
+// to EOF leaves one open).
+func (br *blobBodyReader) Close() error {
+	if br.cur != nil {
+		err := br.cur.Close()
+		br.cur = nil
+		return err
+	}
+	return nil
+}
 
 // blobAt returns the BlobRef whose [Offset, Offset+Length) span contains pos.
 // The list is ordered and contiguous, so a forward scan suffices.
