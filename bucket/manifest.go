@@ -24,6 +24,14 @@ type ObjectManifest struct {
 	// function of the MST key, not stored here. See docs/architecture.md §3.
 	DeleteMarker bool `cborgen:"dm"`
 
+	// ChecksumAlgorithm / Checksum carry the S3 additional checksum the client
+	// requested at PUT (x-amz-checksum-*), if any: the algorithm name (e.g.
+	// "SHA256", "CRC32") and the base64 value computed over the body. Stored so
+	// GET/HEAD can echo it under x-amz-checksum-mode. Empty when no additional
+	// checksum was requested. Independent of the internal sha256 content address.
+	ChecksumAlgorithm string `cborgen:"ca"`
+	Checksum          string `cborgen:"ck"`
+
 	// HTTP/S3 system headers carried through PUT and replayed on
 	// HEAD/GET. Empty strings are omitted from responses.
 	ContentEncoding    string `cborgen:"ce"`

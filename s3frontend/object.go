@@ -15,6 +15,7 @@ import (
 	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
 	"github.com/versity/versitygw/backend"
+	"github.com/versity/versitygw/s3api/utils"
 	"github.com/versity/versitygw/s3err"
 	"github.com/versity/versitygw/s3response"
 
@@ -58,13 +59,56 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 		return s3response.PutObjectOutput{}, fmt.Errorf("s3frontend: put: %w", err)
 	}
 
+	// PRECONDITIONS (no lock): If-Match / If-None-Match. Evaluated here to fail
+	// fast before ingest, then RE-CHECKED under the per-bucket lock at commit so
+	// a concurrent writer can't slip between this read and the swap (§3).
+	if input.IfMatch != nil || input.IfNoneMatch != nil {
+		etag, exists, err := b.currentObjectETag(ctx, bucketName, key)
+		if err != nil {
+			return s3response.PutObjectOutput{}, err
+		}
+		if err := backend.EvaluateObjectPutPreconditions(etag, input.IfMatch, input.IfNoneMatch, exists); err != nil {
+			return s3response.PutObjectOutput{}, err
+		}
+	}
+
+	// Additional checksum (x-amz-checksum-*): wrap the body so the requested
+	// algorithm is computed — and validated against a client-supplied value —
+	// during the single ingest pass.
+	spec, err := checksumFromInput(input)
+	if err != nil {
+		return s3response.PutObjectOutput{}, err
+	}
+	bodyReader := input.Body
+	var hr *utils.HashReader
+	if spec != nil {
+		src := input.Body
+		if src == nil {
+			src = bytes.NewReader(nil)
+		}
+		hr, err = utils.NewHashReader(src, spec.expected, spec.hashType)
+		if err != nil {
+			return s3response.PutObjectOutput{}, err
+		}
+		bodyReader = hr
+	}
+
 	// INGEST (no lock): stream the body → coarse-split into blobs → spool each
 	// to local disk → upload each to Forge by digest (allocate→PUT→accept). A
 	// 200 means every body blob is durable and accepted before the manifest
 	// that references it is committed (docs/architecture.md §7.1).
-	bodyRec, err := b.ingestBody(ctx, bucketName, input.Body)
+	bodyRec, err := b.ingestBody(ctx, bucketName, bodyReader)
 	if err != nil {
+		// A checksum mismatch surfaces as an API error from the HashReader.
+		var apiErr s3err.APIError
+		if errors.As(err, &apiErr) {
+			return s3response.PutObjectOutput{}, apiErr
+		}
 		return s3response.PutObjectOutput{}, fmt.Errorf("s3frontend: put ingest: %w", err)
+	}
+	var ckAlgo, ckVal string
+	if hr != nil {
+		ckAlgo, ckVal = string(spec.algo), hr.Sum()
 	}
 
 	// mf is captured by the closure and read after WithTx commits, so the
@@ -84,6 +128,8 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 			Created:            time.Now().Unix(),
 			Body:               bodyRec,
 			ETag:               hex.EncodeToString(bodyRec.MD5),
+			ChecksumAlgorithm:  ckAlgo,
+			Checksum:           ckVal,
 			ContentEncoding:    backend.GetStringFromPtr(input.ContentEncoding),
 			ContentDisposition: backend.GetStringFromPtr(input.ContentDisposition),
 			ContentLanguage:    backend.GetStringFromPtr(input.ContentLanguage),
@@ -97,11 +143,14 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 
 		t := tx.LoadTree()
 
-		// Capture the prior version's body digests (if this is an overwrite)
-		// before replacing the leaf, so the reference index can release any
-		// blobs the new body no longer references.
+		// Capture the prior version's body digests + ETag (if this is an
+		// overwrite) before replacing the leaf, so the reference index can
+		// release blobs the new body no longer references and the precondition
+		// re-check sees the current state.
 		var oldDigests [][]byte
+		var oldETag string
 		oldCid, gerr := t.Get(ctx, key)
+		oldExists := gerr == nil
 		switch {
 		case gerr == nil:
 			var oldMf msbucket.ObjectManifest
@@ -109,6 +158,7 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 				return cid.Undef, fmt.Errorf("load prior manifest: %w", err)
 			}
 			oldDigests = bodyDigests(oldMf.Body)
+			oldETag = etagOf(&oldMf)
 			if err := b.gc.AddGCCandidate(ctx, oldCid.Bytes(), bucketName); err != nil {
 				return cid.Undef, fmt.Errorf("gc candidate: %w", err)
 			}
@@ -116,6 +166,12 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 			// new key — no prior version
 		default:
 			return cid.Undef, fmt.Errorf("mst get prior: %w", gerr)
+		}
+
+		// Race-safe re-check of If-Match / If-None-Match against the current
+		// state under the lock (no-ops when neither header is set).
+		if err := backend.EvaluateObjectPutPreconditions(oldETag, input.IfMatch, input.IfNoneMatch, oldExists); err != nil {
+			return cid.Undef, err
 		}
 
 		t2, err := t.Add(ctx, key, mfCid, -1)
@@ -135,18 +191,17 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 		return t2.GetPointer(ctx, tx)
 	})
 	if err != nil {
-		if errors.Is(err, bucketop.ErrBucketNotFound) {
-			return s3response.PutObjectOutput{}, s3err.GetAPIError(s3err.ErrNoSuchBucket)
-		}
-		return s3response.PutObjectOutput{}, fmt.Errorf("s3frontend: put: %w", err)
+		return s3response.PutObjectOutput{}, mapCommitError(err, "put")
 	}
 	b.releaseBlobs(ctx, toRemove)
 
 	size := mf.Body.Size
-	return s3response.PutObjectOutput{
+	out := s3response.PutObjectOutput{
 		ETag: etagOf(mf),
 		Size: &size,
-	}, nil
+	}
+	out.ChecksumCRC32, out.ChecksumCRC32C, out.ChecksumSHA1, out.ChecksumSHA256, out.ChecksumCRC64NVME, out.ChecksumType = checksumFields(ckAlgo, ckVal)
+	return out, nil
 }
 
 // ingestBody streams an object body off-lock: it coarse-splits into blobs and
@@ -292,11 +347,19 @@ func (b *Backend) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s
 	if err != nil {
 		return nil, err
 	}
+	lastModified := time.Unix(mf.Created, 0)
+	if err := backend.EvaluatePreconditions(etagOf(mf), lastModified, backend.PreConditions{
+		IfMatch:       input.IfMatch,
+		IfNoneMatch:   input.IfNoneMatch,
+		IfModSince:    input.IfModifiedSince,
+		IfUnmodeSince: input.IfUnmodifiedSince,
+	}); err != nil {
+		return nil, err
+	}
 	etag := etagOf(mf)
 	size := mf.Body.Size
-	lastModified := time.Unix(mf.Created, 0)
 	contentType := mf.ContentType
-	return &s3.HeadObjectOutput{
+	out := &s3.HeadObjectOutput{
 		AcceptRanges:       backend.GetPtrFromString("bytes"),
 		ContentLength:      &size,
 		ContentType:        &contentType,
@@ -308,7 +371,11 @@ func (b *Backend) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s
 		ETag:               &etag,
 		LastModified:       &lastModified,
 		StorageClass:       types.StorageClassStandard,
-	}, nil
+	}
+	if input.ChecksumMode == types.ChecksumModeEnabled {
+		out.ChecksumCRC32, out.ChecksumCRC32C, out.ChecksumSHA1, out.ChecksumSHA256, out.ChecksumCRC64NVME, out.ChecksumType = checksumFields(mf.ChecksumAlgorithm, mf.Checksum)
+	}
+	return out, nil
 }
 
 // GetObject returns an object body, optionally restricted to a byte
@@ -323,6 +390,14 @@ func (b *Backend) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.
 	}
 	mf, err := b.lookupManifest(ctx, *input.Bucket, *input.Key)
 	if err != nil {
+		return nil, err
+	}
+	if err := backend.EvaluatePreconditions(etagOf(mf), time.Unix(mf.Created, 0), backend.PreConditions{
+		IfMatch:       input.IfMatch,
+		IfNoneMatch:   input.IfNoneMatch,
+		IfModSince:    input.IfModifiedSince,
+		IfUnmodeSince: input.IfUnmodifiedSince,
+	}); err != nil {
 		return nil, err
 	}
 
@@ -343,7 +418,7 @@ func (b *Backend) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.
 	etag := etagOf(mf)
 	lastModified := time.Unix(mf.Created, 0)
 	contentType := mf.ContentType
-	return &s3.GetObjectOutput{
+	out := &s3.GetObjectOutput{
 		AcceptRanges:       backend.GetPtrFromString("bytes"),
 		Body:               body,
 		ContentLength:      &length,
@@ -357,7 +432,13 @@ func (b *Backend) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.
 		ETag:               &etag,
 		LastModified:       &lastModified,
 		StorageClass:       types.StorageClassStandard,
-	}, nil
+	}
+	// Echo the stored checksum only for a whole-object GET with checksum mode on
+	// (a ranged GET's checksum would not match the full object).
+	if input.ChecksumMode == types.ChecksumModeEnabled && !isRange {
+		out.ChecksumCRC32, out.ChecksumCRC32C, out.ChecksumSHA1, out.ChecksumSHA256, out.ChecksumCRC64NVME, out.ChecksumType = checksumFields(mf.ChecksumAlgorithm, mf.Checksum)
+	}
+	return out, nil
 }
 
 // DeleteObject removes an object. Missing keys are no-ops (matching
@@ -369,14 +450,26 @@ func (b *Backend) DeleteObject(ctx context.Context, input *s3.DeleteObjectInput)
 	if input.Key == nil {
 		return nil, s3err.GetAPIError(s3err.ErrNoSuchKey)
 	}
-	bucketName := *input.Bucket
-	key := *input.Key
+	preconds := &backend.ObjectDeletePreconditions{
+		IfMatch:            input.IfMatch,
+		IfMatchLastModTime: input.IfMatchLastModifiedTime,
+		IfMatchSize:        input.IfMatchSize,
+	}
+	if err := b.deleteObjectKey(ctx, *input.Bucket, *input.Key, preconds); err != nil {
+		return nil, err
+	}
+	return &s3.DeleteObjectOutput{}, nil
+}
 
+// deleteObjectKey removes one key, releasing its body blobs through the
+// reference index. Missing keys (and an empty bucket) are idempotent no-ops.
+// preconds, when non-nil, gates the delete on If-Match / size / mod-time under
+// the lock. Shared by DeleteObject and DeleteObjects.
+func (b *Backend) deleteObjectKey(ctx context.Context, bucketName, key string, preconds *backend.ObjectDeletePreconditions) error {
 	var toRemove [][]byte
 	err := b.txns.WithTx(ctx, bucketName, func(ctx context.Context, tx *bucketop.Tx) (cid.Cid, error) {
-		// Empty bucket: nothing to delete. Returning cid.Undef from
-		// the closure tells WithTx to discard cleanly with no
-		// commit — the equivalent of "no-op success."
+		// Empty bucket: nothing to delete. Returning cid.Undef tells WithTx to
+		// discard with no commit — the equivalent of "no-op success."
 		if !tx.State().Root.Defined() {
 			return cid.Undef, nil
 		}
@@ -396,6 +489,14 @@ func (b *Backend) DeleteObject(ctx context.Context, input *s3.DeleteObjectInput)
 			return cid.Undef, fmt.Errorf("load manifest: %w", err)
 		}
 
+		// Preconditions (If-Match / size / mod-time) under the lock against the
+		// version being removed.
+		if preconds != nil {
+			if err := backend.EvaluateObjectDeletePreconditions(etagOf(&oldMf), time.Unix(oldMf.Created, 0), oldMf.Body.Size, *preconds); err != nil {
+				return cid.Undef, err
+			}
+		}
+
 		t2, err := t.Delete(ctx, key)
 		if err != nil {
 			return cid.Undef, fmt.Errorf("mst delete: %w", err)
@@ -411,13 +512,64 @@ func (b *Backend) DeleteObject(ctx context.Context, input *s3.DeleteObjectInput)
 		return t2.GetPointer(ctx, tx)
 	})
 	if err != nil {
-		if errors.Is(err, bucketop.ErrBucketNotFound) {
-			return nil, s3err.GetAPIError(s3err.ErrNoSuchBucket)
-		}
-		return nil, fmt.Errorf("s3frontend: delete: %w", err)
+		return mapCommitError(err, "delete")
 	}
 	b.releaseBlobs(ctx, toRemove)
-	return &s3.DeleteObjectOutput{}, nil
+	return nil
+}
+
+// DeleteObjects deletes up to 1000 keys in one request, best-effort (not
+// atomic): each key is deleted independently and reported in the per-key result
+// (Deleted, or Error on failure). Quiet mode omits the successful entries.
+func (b *Backend) DeleteObjects(ctx context.Context, input *s3.DeleteObjectsInput) (s3response.DeleteResult, error) {
+	if input.Bucket == nil {
+		return s3response.DeleteResult{}, s3err.GetAPIError(s3err.ErrInvalidBucketName)
+	}
+	if input.Delete == nil {
+		return s3response.DeleteResult{}, nil
+	}
+	if len(input.Delete.Objects) > defaultMaxKeys {
+		return s3response.DeleteResult{}, s3err.GetAPIError(s3err.ErrMalformedXML)
+	}
+	bucketName := *input.Bucket
+
+	// A missing bucket fails the whole request (matches S3).
+	if _, err := b.reg.Get(ctx, bucketName); err != nil {
+		if errors.Is(err, registry.ErrNotFound) {
+			return s3response.DeleteResult{}, s3err.GetAPIError(s3err.ErrNoSuchBucket)
+		}
+		return s3response.DeleteResult{}, fmt.Errorf("s3frontend: delete objects: %w", err)
+	}
+
+	quiet := input.Delete.Quiet != nil && *input.Delete.Quiet
+	var res s3response.DeleteResult
+	for _, obj := range input.Delete.Objects {
+		if obj.Key == nil {
+			continue
+		}
+		key := *obj.Key
+		if err := b.deleteObjectKey(ctx, bucketName, key, nil); err != nil {
+			k := key
+			code, msg := deleteErrorFields(err)
+			res.Error = append(res.Error, types.Error{Key: &k, Code: &code, Message: &msg})
+			continue
+		}
+		if !quiet {
+			k := key
+			res.Deleted = append(res.Deleted, types.DeletedObject{Key: &k})
+		}
+	}
+	return res, nil
+}
+
+// deleteErrorFields maps a per-key delete failure to an S3 error code +
+// message for the DeleteObjects per-entry result.
+func deleteErrorFields(err error) (code, msg string) {
+	var apiErr s3err.APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.Code, apiErr.Description
+	}
+	return "InternalError", err.Error()
 }
 
 // ListObjects (V1) walks the MST in lexicographic order, applying
