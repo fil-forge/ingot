@@ -89,16 +89,15 @@ type Meta interface {
 
 	// MarkSegmentSealed transitions a segment from open to sealed in one
 	// transaction: records the CAR size+sha and inserts the per-segment
-	// op-root rows (catalog plane only; opRoots is empty for data).
-	// opRoots are applied in slice order (each gets seq_within = i).
+	// op-root rows. opRoots are applied in slice order (each gets
+	// seq_within = i).
 	MarkSegmentSealed(ctx context.Context, plane blockstore.Plane, seq uint64, sealedAt int64,
 		size int64, sha []byte, opRoots []blockstore.OpRoot) error
 
 	// MarkSegmentShipped records that this segment's CAR finished shipping
-	// to Forge, stamping shipped_at. For blockstore.PlaneCatalog it ALSO
-	// advances forge_root_cid in ingot.buckets for every op-root recorded
-	// against this segment (catalog roots are the MST roots durable on
-	// Forge), all in one transaction; for PlaneData opRoots is ignored.
+	// to Forge, stamping shipped_at, and advances forge_root_cid in
+	// ingot.buckets for every op-root recorded against this segment (catalog
+	// roots are the MST roots durable on Forge), all in one transaction.
 	MarkSegmentShipped(ctx context.Context, plane blockstore.Plane, seq uint64, shippedAt int64, opRoots []blockstore.OpRoot) error
 
 	// DeleteSegment removes a segment row (cascades to op-root rows).

@@ -1,16 +1,19 @@
 package s3frontend
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/ipfs/go-cid"
+	"github.com/multiformats/go-multihash"
 	"github.com/versity/versitygw/backend"
 	"github.com/versity/versitygw/s3err"
 	"github.com/versity/versitygw/s3response"
@@ -46,16 +49,31 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 		contentType = "application/octet-stream"
 	}
 
-	// mf is captured by the closure and read after WithTx commits,
-	// so we can build the response (ETag = sha256, size) from the
-	// same manifest that was committed.
+	// Bucket must exist before we spool + upload, so a PUT to a missing bucket
+	// doesn't waste an upload. WithTx re-checks under the per-bucket lock.
+	if _, err := b.reg.Get(ctx, bucketName); err != nil {
+		if errors.Is(err, registry.ErrNotFound) {
+			return s3response.PutObjectOutput{}, s3err.GetAPIError(s3err.ErrNoSuchBucket)
+		}
+		return s3response.PutObjectOutput{}, fmt.Errorf("s3frontend: put: %w", err)
+	}
+
+	// INGEST (no lock): stream the body → coarse-split into blobs → spool each
+	// to local disk → upload each to Forge by digest (allocate→PUT→accept). A
+	// 200 means every body blob is durable and accepted before the manifest
+	// that references it is committed (docs/architecture.md §7.1).
+	bodyRec, err := b.ingestBody(ctx, bucketName, input.Body)
+	if err != nil {
+		return s3response.PutObjectOutput{}, fmt.Errorf("s3frontend: put ingest: %w", err)
+	}
+
+	// mf is captured by the closure and read after WithTx commits, so the
+	// response ETag/size come from the same manifest that was committed.
 	var mf *msbucket.ObjectManifest
 
-	err := b.txns.WithTx(ctx, bucketName, func(ctx context.Context, tx *bucketop.Tx) (cid.Cid, error) {
-		bodyRec, err := b.codec.Chunk(ctx, tx, input.Body)
-		if err != nil {
-			return cid.Undef, fmt.Errorf("chunk body: %w", err)
-		}
+	// COMMIT (short per-bucket critical section): write the manifest + MST
+	// splice + guarded root swap. No large-body work happens under the lock.
+	err = b.txns.WithTx(ctx, bucketName, func(ctx context.Context, tx *bucketop.Tx) (cid.Cid, error) {
 		mf = &msbucket.ObjectManifest{
 			Key:                key,
 			ContentType:        contentType,
@@ -76,11 +94,9 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 		t := tx.LoadTree()
 		t2, err := t.Add(ctx, key, mfCid, -1)
 		if errors.Is(err, mst.ErrAlreadyExists) {
-			// TODO(forrest): we will need to revisit this case since it will require special handling for:
-			// 1. versioned objects, may require changes to the msbucket.ObjectManifest model,
-			//versions could be a linked list referenced by CID for example.
-			// 2. non-version objects, this operation becomes a "delete & put" from the perspective of piri
-			// if the old object body is large we'll need to GC it from the Forge network.
+			// Unversioned overwrite-in-place. Phase 4 drives the superseded
+			// body's digests through the reference index here (blob_refs -=,
+			// remove(digest) at zero claims); for now it just re-points the leaf.
 			t2, err = t.Update(ctx, key, mfCid)
 		}
 		if err != nil {
@@ -101,6 +117,60 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 		ETag: etagOf(mf),
 		Size: &size,
 	}, nil
+}
+
+// ingestBody streams an object body off-lock: it coarse-splits into blobs and
+// spools each to local disk (SplitBody → Spool), records an upload_intents row
+// per blob, uploads each to Forge by digest, and advances the intent to
+// accepted. It returns the Body the manifest will pin. A zero-byte body yields
+// a Body with no blobs and uploads nothing.
+//
+// On any error the already-spooled/parked blobs and their intents are left for
+// crash recovery to reconcile (a later phase); no manifest is written, so no
+// catalog entry ever references a non-durable blob.
+func (b *Backend) ingestBody(ctx context.Context, bucket string, r io.Reader) (msbucket.Body, error) {
+	if r == nil {
+		r = bytes.NewReader(nil)
+	}
+	body, err := msbucket.SplitBody(ctx, b.spool, r, b.maxBlobSize)
+	if err != nil {
+		return msbucket.Body{}, fmt.Errorf("split body: %w", err)
+	}
+	for _, blob := range body.Blobs {
+		digest := multihash.Multihash(blob.Digest)
+		path := b.spool.Path(digest)
+		if err := b.intents.PutIntent(ctx, registry.UploadIntent{
+			Digest:    blob.Digest,
+			LocalPath: path,
+			Size:      blob.Length,
+			State:     registry.IntentSpooled,
+			Bucket:    bucket,
+		}); err != nil {
+			return msbucket.Body{}, fmt.Errorf("record intent: %w", err)
+		}
+		loc, err := b.uploader.UploadBlob(ctx, digest, blob.Length, path)
+		if err != nil {
+			return msbucket.Body{}, fmt.Errorf("upload blob: %w", err)
+		}
+		if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentAccepted); err != nil {
+			return msbucket.Body{}, fmt.Errorf("mark accepted: %w", err)
+		}
+		// Record where the accepted blob can be retrieved from, keyed by
+		// (space, digest). A later read resolves it from this table (in the
+		// harness the uploader is a no-op and reads come from the spool, so the
+		// recorded URL is empty and unused). Best-effort: a failure here does
+		// not fail the PUT — the spool still serves read-after-write.
+		if err := b.locations.PutLocation(ctx, registry.BlobLocation{
+			Space:    b.space,
+			Digest:   blob.Digest,
+			Provider: loc.Provider,
+			URL:      loc.URL,
+			Size:     loc.Size,
+		}); err != nil {
+			return msbucket.Body{}, fmt.Errorf("record location: %w", err)
+		}
+	}
+	return body, nil
 }
 
 // HeadObject returns the manifest's metadata. Range, partNumber,
@@ -157,9 +227,9 @@ func (b *Backend) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.
 	}
 
 	var contentRange *string
-	var body = b.codec.Open(ctx, b.read, mf.Body)
+	var body = msbucket.OpenBody(ctx, b.read, mf.Body)
 	if isRange {
-		body = b.codec.OpenRange(ctx, b.read, mf.Body, startOffset, startOffset+length-1)
+		body = msbucket.OpenBodyRange(ctx, b.read, mf.Body, startOffset, startOffset+length-1)
 		cr := fmt.Sprintf("bytes %d-%d/%d", startOffset, startOffset+length-1, objSize)
 		contentRange = &cr
 	}

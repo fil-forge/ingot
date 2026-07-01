@@ -113,7 +113,6 @@ func TestLayeredAndStagingHappyPath(t *testing.T) {
 	log, err := logstore.Open(context.Background(), logstore.Config{
 		Dir:     dir,
 		Meta:    meta,
-		Data:    logstore.PlaneConfig{SealBytes: 1 << 30, SealAge: time.Hour, Ship: true, Flush: nopFlush, Retain: 6},
 		Catalog: logstore.PlaneConfig{SealBytes: 1 << 30, SealAge: time.Hour, Ship: true, Flush: nopFlush, Retain: 6},
 		Logger:  logger,
 	})
@@ -122,7 +121,7 @@ func TestLayeredAndStagingHappyPath(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = log.Close(context.Background()) })
 
-	bs := blockstore.NewLayered(log, noopBase{})
+	bs := blockstore.NewLayered(nil, log, noopBase{})
 
 	// Stage two blocks for bucket "alpha", commit, then Get them back
 	// via the layered store.
@@ -157,7 +156,6 @@ func TestLayeredFallsThroughToBaseOnMiss(t *testing.T) {
 	log, err := logstore.Open(context.Background(), logstore.Config{
 		Dir:     dir,
 		Meta:    meta,
-		Data:    logstore.PlaneConfig{SealBytes: 1 << 30, SealAge: time.Hour, Ship: true, Flush: nopFlush, Retain: 6},
 		Catalog: logstore.PlaneConfig{SealBytes: 1 << 30, SealAge: time.Hour, Ship: true, Flush: nopFlush, Retain: 6},
 		Logger:  logger,
 	})
@@ -166,7 +164,7 @@ func TestLayeredFallsThroughToBaseOnMiss(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = log.Close(context.Background()) })
 
-	bs := blockstore.NewLayered(log, noopBase{})
+	bs := blockstore.NewLayered(nil, log, noopBase{})
 	missing := makeBlock(t, []byte("nope")).Cid()
 	_, err = bs.GetBlock(context.Background(), missing)
 	if !errors.Is(err, errUnknownBase) {
@@ -182,7 +180,6 @@ func TestStagingDiscardLeavesLogUntouched(t *testing.T) {
 	log, err := logstore.Open(context.Background(), logstore.Config{
 		Dir:     dir,
 		Meta:    meta,
-		Data:    logstore.PlaneConfig{SealBytes: 1 << 30, SealAge: time.Hour, Ship: true, Flush: nopFlush, Retain: 6},
 		Catalog: logstore.PlaneConfig{SealBytes: 1 << 30, SealAge: time.Hour, Ship: true, Flush: nopFlush, Retain: 6},
 		Logger:  logger,
 	})
@@ -191,7 +188,7 @@ func TestStagingDiscardLeavesLogUntouched(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = log.Close(context.Background()) })
 
-	bs := blockstore.NewLayered(log, noopBase{})
+	bs := blockstore.NewLayered(nil, log, noopBase{})
 	stage := blockstore.NewOpStaging(bs, log, "alpha")
 	blk := makeBlock(t, []byte("never-committed"))
 	if err := stage.Put(context.Background(), blk); err != nil {

@@ -17,6 +17,7 @@ import (
 
 	block "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
+	"github.com/multiformats/go-multihash"
 
 	"github.com/fil-forge/ingot/blockstore"
 	"github.com/fil-forge/ingot/logstore"
@@ -185,7 +186,10 @@ func (m *MemStore) MarkSegmentShipped(_ context.Context, plane blockstore.Plane,
 	}
 	if plane == blockstore.PlaneCatalog {
 		for _, opr := range opRoots {
-			if b, ok := m.buckets[opr.Bucket]; ok {
+			// Guard the advance on the bucket's committed root (see the Postgres
+			// MarkSegmentShipped): a durable op-root the bucket never adopted
+			// (CASRoot lost the race) must not advance forge_root.
+			if b, ok := m.buckets[opr.Bucket]; ok && b.Root.Equals(opr.Root) {
 				b.ForgeRoot = opr.Root
 			}
 		}
@@ -230,12 +234,18 @@ func (NopBaseReader) GetBlock(_ context.Context, _ cid.Cid) (block.Block, error)
 	return nil, blockstore.ErrNotFound
 }
 
-// NopUploader is a flush sink that ships nothing: SubmitShard returns
-// nil so a plane is marked shipped without touching the network.
+// NopUploader is a no-op upload sink for the in-memory suite and standalone
+// mode. SubmitShard ships nothing (a catalog plane is marked shipped without
+// touching the network); UploadBlob accepts a body blob without touching the
+// network, so the spool's local copy serves all reads.
 type NopUploader struct{}
 
 func (NopUploader) SubmitShard(_ context.Context, _ blockstore.Plane, _ uploader.CARShard) error {
 	return nil
+}
+
+func (NopUploader) UploadBlob(_ context.Context, _ multihash.Multihash, size int64, _ string) (uploader.BlobLocation, error) {
+	return uploader.BlobLocation{Size: size}, nil
 }
 
 // Compile-time guarantees.
@@ -244,4 +254,5 @@ var (
 	_ logstore.Meta          = (*MemStore)(nil)
 	_ blockstore.BlockReader = NopBaseReader{}
 	_ uploader.Uploader      = NopUploader{}
+	_ uploader.BodyUploader  = NopUploader{}
 )

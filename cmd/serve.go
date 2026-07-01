@@ -84,7 +84,6 @@ func standaloneApp(cfg *DaemonConfig, logger *zap.Logger) (*fx.App, error) {
 	if err != nil {
 		return nil, err
 	}
-	sc.ShipData = false
 	sc.ShipCatalog = false
 
 	mem := inmem.NewMemStore()
@@ -94,9 +93,12 @@ func standaloneApp(cfg *DaemonConfig, logger *zap.Logger) (*fx.App, error) {
 		fx.Supply(sc),
 		fx.Provide(
 			fx.Annotate(func() *inmem.MemStore { return mem }, fx.As(new(registry.Registry))),
+			fx.Annotate(func() *inmem.MemStore { return mem }, fx.As(new(registry.IntentStore))),
+			fx.Annotate(func() *inmem.MemStore { return mem }, fx.As(new(registry.LocationStore))),
 			fx.Annotate(func() *inmem.MemStore { return mem }, fx.As(new(logstore.Meta))),
 			fx.Annotate(func() inmem.NopBaseReader { return inmem.NopBaseReader{} }, fx.As(new(blockstore.BlockReader))),
 			fx.Annotate(func() inmem.NopUploader { return inmem.NopUploader{} }, fx.As(new(uploader.Uploader))),
+			fx.Annotate(func() inmem.NopUploader { return inmem.NopUploader{} }, fx.As(new(uploader.BodyUploader))),
 		),
 		ingot.ServerModule,
 	)

@@ -151,25 +151,24 @@ func StartHarness(ctx context.Context, opts ...HarnessOption) (*Harness, error) 
 			RootAccess:  options.accessKey,
 			RootSecret:  options.secretKey,
 			MaxBlobSize: options.maxBlobSize,
-			// Ship both planes to the nop uploader so the seal → ship →
-			// retire path stays exercised by the in-memory suite. The same
-			// seal thresholds are applied to each plane.
-			SealBytesData:    options.sealBytes,
-			SealAgeData:      options.sealAge,
-			ShipData:         true,
-			RetainData:       options.retain,
+			// Ship the catalog plane to the nop uploader so the seal → ship →
+			// retire path stays exercised by the in-memory suite.
 			SealBytesCatalog: options.sealBytes,
 			SealAgeCatalog:   options.sealAge,
 			ShipCatalog:      true,
 			RetainCatalog:    options.retain,
 		}),
-		// MemStore satisfies both registry.Registry and logstore.Meta; expose
-		// it under each interface the module consumes.
+		// MemStore satisfies registry.Registry, registry.IntentStore, and
+		// logstore.Meta; NopUploader satisfies both upload seams. Expose each
+		// under every interface the module consumes.
 		fx.Provide(
 			fx.Annotate(func() *inmem.MemStore { return mem }, fx.As(new(registry.Registry))),
+			fx.Annotate(func() *inmem.MemStore { return mem }, fx.As(new(registry.IntentStore))),
+			fx.Annotate(func() *inmem.MemStore { return mem }, fx.As(new(registry.LocationStore))),
 			fx.Annotate(func() *inmem.MemStore { return mem }, fx.As(new(logstore.Meta))),
 			fx.Annotate(func() inmem.NopBaseReader { return inmem.NopBaseReader{} }, fx.As(new(blockstore.BlockReader))),
 			fx.Annotate(func() inmem.NopUploader { return inmem.NopUploader{} }, fx.As(new(uploader.Uploader))),
+			fx.Annotate(func() inmem.NopUploader { return inmem.NopUploader{} }, fx.As(new(uploader.BodyUploader))),
 		),
 		ingot.ServerModule,
 	)
@@ -229,6 +228,11 @@ func (h *Harness) Stop(ctx context.Context) error {
 	}
 	return nil
 }
+
+// DataDir returns the harness's scratch data directory (where the spool and
+// log segments live). Exposed so tests can assert on-disk layout — e.g. that
+// object bodies are spooled rather than journaled into the log.
+func (h *Harness) DataDir() string { return h.dataDir }
 
 // Config returns a Config wired against the harness's listener,
 // suitable for passing to Run.

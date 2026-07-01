@@ -7,6 +7,9 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -35,12 +38,15 @@ func quotedMD5(b []byte) string {
 	return `"` + hex.EncodeToString(sum[:]) + `"`
 }
 
-// patternBytes returns n deterministic bytes — a cheap way to make a
-// payload whose every byte position is verifiable after a round trip.
+// patternBytes returns n deterministic bytes — a cheap way to make a payload
+// whose every byte position is verifiable after a round trip. The (i>>16) term
+// mixes in the 64 KiB-blob index so each coarse-split blob has distinct content
+// (a purely position-linear pattern would make equal-length blobs identical and
+// dedup them in the spool).
 func patternBytes(n int) []byte {
 	b := make([]byte, n)
 	for i := range b {
-		b[i] = byte(i*31 + 7)
+		b[i] = byte(i*31 + 7 + (i>>16)*101)
 	}
 	return b
 }
@@ -84,6 +90,12 @@ func TestBlobSplit_MultiBlobRoundTrip(t *testing.T) {
 	}
 	if want := quotedMD5(data); aws.ToString(put.ETag) != want {
 		t.Fatalf("PUT ETag = %s, want %s", aws.ToString(put.ETag), want)
+	}
+
+	// The bodies must be spooled to local disk by digest (the data-plane
+	// inversion), not journaled into the log. A 3.5-blob object spools 4 files.
+	if got := spoolBlobCount(t, h); got != 4 {
+		t.Fatalf("spool holds %d blobs, want 4 — bodies must be spooled, not logged", got)
 	}
 
 	// Whole-object GET.
@@ -165,6 +177,23 @@ func TestBlobSplit_ZeroByteObject(t *testing.T) {
 	if aws.ToString(head.ETag) != emptyMD5 {
 		t.Fatalf("HEAD ETag = %s, want %s", aws.ToString(head.ETag), emptyMD5)
 	}
+}
+
+// spoolBlobCount counts the body blobs on disk in the harness spool, ignoring
+// in-progress temp files. Used to prove object bodies are spooled by digest.
+func spoolBlobCount(t *testing.T, h *mstesting.Harness) int {
+	t.Helper()
+	entries, err := os.ReadDir(filepath.Join(h.DataDir(), "spool"))
+	if err != nil {
+		t.Fatalf("read spool dir: %v", err)
+	}
+	n := 0
+	for _, e := range entries {
+		if !e.IsDir() && !strings.HasPrefix(e.Name(), ".tmp") {
+			n++
+		}
+	}
+	return n
 }
 
 func getBody(t *testing.T, ctx context.Context, cl *s3.Client, bucket, key, rangeHdr string) []byte {

@@ -50,14 +50,9 @@ type ServerConfig struct {
 	// 0 → bucket.DefaultMaxBlobSize.
 	MaxBlobSize int64
 
-	// Per-plane seal thresholds, ship gates, and retention. Each plane
-	// seals, ships, and retains independently. Zero SealBytes/SealAge
-	// pick logstore defaults (64 MiB / 5 s); zero Retain → 6 (ignored for
-	// a non-shipping plane, which is retained indefinitely).
-	SealBytesData    int64
-	SealAgeData      time.Duration
-	ShipData         bool
-	RetainData       int
+	// Catalog plane seal threshold, ship gate, and retention. Zero
+	// SealBytes/SealAge pick logstore defaults (64 MiB / 5 s); zero Retain → 6
+	// (ignored for a non-shipping plane, which is retained indefinitely).
 	SealBytesCatalog int64
 	SealAgeCatalog   time.Duration
 	ShipCatalog      bool
@@ -84,13 +79,29 @@ type ServerDeps struct {
 	// it can be any IpldBlockstore.
 	BaseBlockReader blockstore.BlockReader
 
-	// Uploader is the destination for sealed segments.
+	// Uploader is the destination for sealed catalog CAR segments.
 	Uploader uploader.Uploader
+
+	// BodyUploader makes each object-body blob durable on Forge by digest
+	// (allocate→PUT→accept), synchronously during a PUT. In tests this is a
+	// no-op and reads are served from the local spool.
+	BodyUploader uploader.BodyUploader
 
 	// Registry tracks per-bucket roots. *registry.Postgres satisfies
 	// both Registry and Meta in production; tests can supply two
 	// separate implementations or one that does both.
 	Registry registry.Registry
+
+	// Intents tracks the local spool's upload_intents lifecycle; Locations
+	// records where each accepted body blob can be retrieved from. Typically
+	// the same instance as Registry (*registry.Postgres / *inmem.MemStore).
+	Intents   registry.IntentStore
+	Locations registry.LocationStore
+
+	// Space is the Forge space this instance owns — the key body-blob locations
+	// (and, later, reference claims) are recorded under. Empty in standalone /
+	// the in-memory harness, where reads are served from the spool.
+	Space string
 
 	// Meta is the persistence backing for log-segment metadata.
 	// Typically the same instance as Registry.
@@ -125,13 +136,6 @@ func New(ctx context.Context, cfg ServerConfig, deps ServerDeps) (*Server, error
 	log, err := logstore.Open(ctx, logstore.Config{
 		Dir:  filepath.Join(cfg.DataDir, "segments"),
 		Meta: deps.Meta,
-		Data: logstore.PlaneConfig{
-			SealBytes: cfg.SealBytesData,
-			SealAge:   cfg.SealAgeData,
-			Ship:      cfg.ShipData,
-			Flush:     newPlaneFlushFunc(deps.Uploader, blockstore.PlaneData),
-			Retain:    cfg.RetainData,
-		},
 		Catalog: logstore.PlaneConfig{
 			SealBytes: cfg.SealBytesCatalog,
 			SealAge:   cfg.SealAgeCatalog,
@@ -145,9 +149,24 @@ func New(ctx context.Context, cfg ServerConfig, deps ServerDeps) (*Server, error
 		return nil, fmt.Errorf("ingot: logstore: %w", err)
 	}
 
-	bs := blockstore.NewLayered(log, deps.BaseBlockReader)
-	codec := &msbucket.BlobSplitter{MaxBlobSize: cfg.MaxBlobSize}
-	backend := s3frontend.New(deps.Registry, bs, log, codec)
+	spool, err := blockstore.NewSpool(filepath.Join(cfg.DataDir, "spool"))
+	if err != nil {
+		_ = log.Close(ctx)
+		return nil, fmt.Errorf("ingot: spool: %w", err)
+	}
+
+	bs := blockstore.NewLayered(spool, log, deps.BaseBlockReader)
+	backend := s3frontend.New(s3frontend.Deps{
+		Registry:    deps.Registry,
+		Intents:     deps.Intents,
+		Locations:   deps.Locations,
+		Reads:       bs,
+		Log:         log,
+		Spool:       spool,
+		Uploader:    deps.BodyUploader,
+		Space:       deps.Space,
+		MaxBlobSize: cfg.MaxBlobSize,
+	})
 
 	api, err := buildS3API(ctx, backend, cfg)
 	if err != nil {
@@ -296,8 +315,17 @@ func validateServerInputs(cfg ServerConfig, deps ServerDeps) error {
 	if deps.Uploader == nil {
 		return errors.New("ingot: ServerDeps.Uploader is required")
 	}
+	if deps.BodyUploader == nil {
+		return errors.New("ingot: ServerDeps.BodyUploader is required")
+	}
 	if deps.Registry == nil {
 		return errors.New("ingot: ServerDeps.Registry is required")
+	}
+	if deps.Intents == nil {
+		return errors.New("ingot: ServerDeps.Intents is required")
+	}
+	if deps.Locations == nil {
+		return errors.New("ingot: ServerDeps.Locations is required")
 	}
 	if deps.Meta == nil {
 		return errors.New("ingot: ServerDeps.Meta is required")

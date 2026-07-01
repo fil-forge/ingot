@@ -99,6 +99,7 @@ func Module(cfg Config) fx.Option {
 		fx.Provide(Config.ServerConfig),
 		fx.Provide(
 			provideSpaceSigner,
+			provideServerSpace,
 			provideRegistry,
 			provideForgeReader,
 			provideTokenStore,
@@ -129,14 +130,24 @@ var ServerModule = fx.Module("ingot-server",
 type serverParams struct {
 	fx.In
 
-	Config    ServerConfig
-	Logger    *zap.Logger
-	Reader    blockstore.BlockReader
-	Uploader  uploader.Uploader
-	Registry  registry.Registry
-	Meta      logstore.Meta
+	Config       ServerConfig
+	Logger       *zap.Logger
+	Reader       blockstore.BlockReader
+	Uploader     uploader.Uploader
+	BodyUploader uploader.BodyUploader
+	Registry     registry.Registry
+	Intents      registry.IntentStore
+	Locations    registry.LocationStore
+	Meta         logstore.Meta
+	// Space is the Forge space this instance owns. Optional: standalone / the
+	// harness don't provide it (reads come from the spool), so it defaults to "".
+	Space     ServerSpace    `optional:"true"`
 	PreStarts []PreStartHook `group:"ingot_prestart"`
 }
+
+// ServerSpace is the Forge space DID (as a string) the embedded server records
+// body-blob locations under. A named type so it is unambiguous in the fx graph.
+type ServerSpace string
 
 // registerServerLifecycle hooks the embedded server into the fx lifecycle. All
 // side-effecting startup work — the pre-start hooks (e.g. migrations), then log
@@ -163,8 +174,12 @@ func registerServerLifecycle(lc fx.Lifecycle, p serverParams) {
 				Logger:          logger,
 				BaseBlockReader: p.Reader,
 				Uploader:        p.Uploader,
+				BodyUploader:    p.BodyUploader,
 				Registry:        p.Registry,
+				Intents:         p.Intents,
+				Locations:       p.Locations,
 				Meta:            p.Meta,
+				Space:           string(p.Space),
 			})
 			if err != nil {
 				return err
@@ -264,15 +279,24 @@ func provideSpaceSigner(cfg Config, logger *zap.Logger) (spaceSigner, error) {
 type registryResult struct {
 	fx.Out
 
-	Registry registry.Registry
-	Meta     logstore.Meta
+	Registry  registry.Registry
+	Intents   registry.IntentStore
+	Locations registry.LocationStore
+	Meta      logstore.Meta
 }
 
 // provideRegistry wraps the host's pool in the postgres-backed registry and
-// exposes it under both interfaces ServerModule consumes.
+// exposes it under every interface ServerModule consumes. One *registry.Postgres
+// satisfies bucket state (Registry), the spool's upload_intents (IntentStore),
+// blob locations (LocationStore), and segment metadata (Meta).
 func provideRegistry(pool *pgxpool.Pool) registryResult {
 	pg := registry.NewPostgres(pool)
-	return registryResult{Registry: pg, Meta: pg}
+	return registryResult{Registry: pg, Intents: pg, Locations: pg, Meta: pg}
+}
+
+// provideServerSpace exposes the owned space DID (as a string) to the server.
+func provideServerSpace(space spaceSigner) ServerSpace {
+	return ServerSpace(space.DID().String())
 }
 
 // migrationHookOut feeds the migration PreStartHook into the "ingot_prestart"
@@ -314,15 +338,29 @@ func provideForgeReader(cfg Config, id ServiceIdentity, space spaceSigner, logge
 	return blockstore.NewCached(forge, cfg.readCacheBytes()), nil
 }
 
-// provideUploader builds the per-plane segment-flush uploader: a
-// guppy-style edge client that ships each sealed shard to Forge via the
-// upload service (/blob/add → /ucan/conclude → /blob/accept → /index/add).
-func provideUploader(c *forgeclient.Client, space spaceSigner, logger *zap.Logger) (uploader.Uploader, error) {
-	return uploader.NewForge(uploader.ForgeConfig{
+// uploaderResult exposes the one *uploader.Forge under both upload seams:
+// Uploader (catalog CAR segments) and BodyUploader (per-blob body uploads).
+type uploaderResult struct {
+	fx.Out
+
+	Uploader     uploader.Uploader
+	BodyUploader uploader.BodyUploader
+}
+
+// provideUploader builds the guppy-style edge client that ships to Forge via
+// the upload service (/blob/add → /ucan/conclude → /blob/accept → /index/add).
+// The same client both ships sealed catalog shards (Uploader) and uploads
+// individual body blobs by digest (BodyUploader).
+func provideUploader(c *forgeclient.Client, space spaceSigner, logger *zap.Logger) (uploaderResult, error) {
+	f, err := uploader.NewForge(uploader.ForgeConfig{
 		Client: c,
 		Space:  space.DID(),
 		Logger: logger,
 	})
+	if err != nil {
+		return uploaderResult{}, err
+	}
+	return uploaderResult{Uploader: f, BodyUploader: f}, nil
 }
 
 // seedSpaceDelegations self-issues no-expiry space→agent delegations for
