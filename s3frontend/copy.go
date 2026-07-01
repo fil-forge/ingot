@@ -85,6 +85,7 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 		dstMf.ContentDisposition = backend.GetStringFromPtr(input.ContentDisposition)
 		dstMf.ContentLanguage = backend.GetStringFromPtr(input.ContentLanguage)
 		dstMf.CacheControl = backend.GetStringFromPtr(input.CacheControl)
+		dstMf.Expires = backend.GetStringFromPtr(input.Expires)
 		dstMf.Metadata = input.Metadata
 	} else {
 		dstMf.ContentType = srcMf.ContentType
@@ -92,6 +93,7 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 		dstMf.ContentDisposition = srcMf.ContentDisposition
 		dstMf.ContentLanguage = srcMf.ContentLanguage
 		dstMf.CacheControl = srcMf.CacheControl
+		dstMf.Expires = srcMf.Expires
 		dstMf.Metadata = srcMf.Metadata
 	}
 

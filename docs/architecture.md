@@ -429,7 +429,9 @@ AbortMultipartUpload
 ```
 
 A completed multipart object is the ordered union of its parts' blobs plus a manifest of byte ranges;
-parts are not restitched.
+parts are not restitched. The commit also records each part's byte length (`Body.PartSizes`), so a
+later `GET`/`HEAD ?partNumber=N` can resolve part `N` to its byte span and report
+`x-amz-mp-parts-count` without re-deriving boundaries from the blob list.
 
 ### 7.3 The session latch (the Abort/Complete race)
 
@@ -750,9 +752,17 @@ The storage / delete / retrieval core is built and tested:
 - **Dedup + reference-counted delete** ([§5](#5-the-data-layer)–[§6](#6-the-forgechain-layer)) — `blob_refs`, overwrite-in-place, `DeleteObject`,
   `remove(digest)` at zero claims, `gc_candidates` (write-only).
 - **S3 correctness** ([§3](#3-the-s3-layer)) — conditional requests (`If-Match`/`If-None-Match`/`If-(Un)Modified-Since`,
-  re-checked at commit), additional checksums (`x-amz-checksum-*` validate + echo), `DeleteObjects`,
+  re-checked at commit), additional checksums (`x-amz-checksum-*` validate + echo, with a
+  server-computed full-object `CRC64NVME` default when the client names none — S3's
+  default-checksum-on-store), `DeleteObjects`,
   metadata-only `CopyObject`, multipart (`Create`/`UploadPart`/`Complete`/`Abort` with the
-  single-winner latch and the `-N` ETag), zero-byte objects.
+  single-winner latch and the `-N` ETag), zero-byte objects. Ranged reads return `206`/`Content-Range`
+  on **both** `GetObject` and `HeadObject` (`416` on an unsatisfiable range); the system headers
+  carried through PUT and replayed on GET/HEAD include `Content-Encoding`/`Disposition`/`Language`,
+  `Cache-Control`, and the `Expires` caching header. GET/HEAD also accept `?partNumber=N`: a completed
+  multipart object records each part's byte length on the manifest (`Body.PartSizes`), so part `N`
+  resolves to its byte span (`206` + `Content-Range` + `x-amz-mp-parts-count`); a single-PUT object
+  exposes the whole body as part 1 (no parts-count), and `N` past the part count is `416`.
 
 ### Deferred by deliberate scope decision
 
@@ -773,6 +783,15 @@ These are intentional simplifications of the target topology, not bugs:
 - **Local location table instead of the indexer (R0/R1 appliance reduction).** Body-blob locations
   are recorded in a local Postgres `blob_locations` table behind a `Locator` seam, rather than read
   back through the indexing-service ([§5](#5-the-data-layer), [§8](#8-retrieval-addressing-when-bodies-need-a-sharded-dag-index)). The indexer-backed `Locator` is an `indexer-ready` swap-in.
+
+### Object lifecycle (not implemented)
+
+The `Expires` HTTP header *is* implemented — it is a passthrough caching header (RFC 7234) stored on
+the manifest and replayed on GET/HEAD, not a lifecycle control. True S3 **Lifecycle** management
+(`PutBucketLifecycleConfiguration` expiration/transition rules that actually delete or tier objects
+after N days, surfaced via the `x-amz-expiration` response header) is a separate, unimplemented
+feature. It would be its own subsystem — a per-bucket rule store plus a background sweeper driving the
+reference index — and is out of scope for this iteration.
 
 ### Deferred as forge-mode glue (validated live in smelt, not the in-process harness)
 

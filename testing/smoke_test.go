@@ -124,7 +124,9 @@ func TestSmoke_PutObject(t *testing.T) {
 		{"checksum_algorithm_and_header_mismatch", integration.PutObject_checksum_algorithm_and_header_mismatch},
 		{"checksums_success", integration.PutObject_checksums_success},
 		{"conditional_writes", integration.PutObject_conditional_writes},
+		{"default_checksum", integration.PutObject_default_checksum},
 		{"default_content_type", integration.PutObject_default_content_type},
+		{"dir_object_default_checksum", integration.PutObject_dir_object_default_checksum},
 		{"dir_object_checksums_success", integration.PutObject_dir_object_checksums_success},
 		{"incorrect_checksums", integration.PutObject_incorrect_checksums},
 		{"invalid_credentials", integration.PutObject_invalid_credentials},
@@ -166,6 +168,10 @@ func TestSmoke_GetObject(t *testing.T) {
 		{"empty_object_part_number_1", integration.GetObject_empty_object_part_number_1},
 		{"invalid_parent", integration.GetObject_invalid_parent},
 		{"invalid_part_number", integration.GetObject_invalid_part_number},
+		{"mp_part_number_exceeds_parts_count", integration.GetObject_mp_part_number_exceeds_parts_count},
+		{"mp_part_number_resp_status", integration.GetObject_mp_part_number_resp_status},
+		{"mp_part_number_success", integration.GetObject_mp_part_number_success},
+		{"non_mp_part_number_1_success", integration.GetObject_non_mp_part_number_1_success},
 		{"large_object", integration.GetObject_large_object},
 		{"non_existing_dir_object", integration.GetObject_non_existing_dir_object},
 		{"non_existing_key", integration.GetObject_non_existing_key},
@@ -196,12 +202,20 @@ func TestSmoke_HeadObject(t *testing.T) {
 		{"invalid_parent_dir", integration.HeadObject_invalid_parent_dir},
 		{"invalid_part_number", integration.HeadObject_invalid_part_number},
 		{"mp_part_number_exceeds_parts_count", integration.HeadObject_mp_part_number_exceeds_parts_count},
+		{"mp_part_number_resp_status", integration.HeadObject_mp_part_number_resp_status},
+		{"mp_part_number_success", integration.HeadObject_mp_part_number_success},
+		{"non_mp_part_number_1_success", integration.HeadObject_non_mp_part_number_1_success},
 		{"non_existing_dir_object", integration.HeadObject_non_existing_dir_object},
 		{"non_existing_object", integration.HeadObject_non_existing_object},
 		{"not_enabled_checksum_mode", integration.HeadObject_not_enabled_checksum_mode},
 		{"overrides_presign_success", integration.HeadObject_overrides_presign_success},
 		{"overrides_success", integration.HeadObject_overrides_success},
 		{"range_and_part_number", integration.HeadObject_range_and_part_number},
+		{"by_range_resp_status", integration.HeadObject_by_range_resp_status},
+		{"dir_with_range", integration.HeadObject_dir_with_range},
+		{"ranged_with_checksum_mode", integration.HeadObject_ranged_with_checksum_mode},
+		{"with_range", integration.HeadObject_with_range},
+		{"zero_len_with_range", integration.HeadObject_zero_len_with_range},
 	}
 	s3conf := newS3Conf(smokeHarness(t).Config())
 	for _, tt := range tests {
@@ -288,8 +302,6 @@ func TestSmokeXFail_ListBuckets(t *testing.T) {
 
 func TestSmokeXFail_PutObject(t *testing.T) {
 	tests := []smokeCase{
-		{"default_checksum", integration.PutObject_default_checksum},
-		{"dir_object_default_checksum", integration.PutObject_dir_object_default_checksum},
 		{"missing_bucket_lock", integration.PutObject_missing_bucket_lock},
 		{"object_acl_not_supported", integration.PutObject_object_acl_not_supported},
 		{"tagging", integration.PutObject_tagging},
@@ -311,10 +323,6 @@ func TestSmokeXFail_PutObject(t *testing.T) {
 func TestSmokeXFail_GetObject(t *testing.T) {
 	tests := []smokeCase{
 		{"directory_success", integration.GetObject_directory_success},
-		{"mp_part_number_exceeds_parts_count", integration.GetObject_mp_part_number_exceeds_parts_count},
-		{"mp_part_number_resp_status", integration.GetObject_mp_part_number_resp_status},
-		{"mp_part_number_success", integration.GetObject_mp_part_number_success},
-		{"non_mp_part_number_1_success", integration.GetObject_non_mp_part_number_1_success},
 		{"overrides_fail_public", integration.GetObject_overrides_fail_public},
 		{"success", integration.GetObject_success},
 	}
@@ -333,16 +341,8 @@ func TestSmokeXFail_GetObject(t *testing.T) {
 
 func TestSmokeXFail_HeadObject(t *testing.T) {
 	tests := []smokeCase{
-		{"by_range_resp_status", integration.HeadObject_by_range_resp_status},
-		{"dir_with_range", integration.HeadObject_dir_with_range},
-		{"mp_part_number_resp_status", integration.HeadObject_mp_part_number_resp_status},
-		{"mp_part_number_success", integration.HeadObject_mp_part_number_success},
-		{"non_mp_part_number_1_success", integration.HeadObject_non_mp_part_number_1_success},
 		{"overrides_fail_public", integration.HeadObject_overrides_fail_public},
-		{"ranged_with_checksum_mode", integration.HeadObject_ranged_with_checksum_mode},
-		{"with_range", integration.HeadObject_with_range},
 		{"success", integration.HeadObject_success},
-		{"zero_len_with_range", integration.HeadObject_zero_len_with_range},
 	}
 	s3conf := newS3Conf(smokeHarness(t).Config())
 	for _, tt := range tests {
@@ -387,6 +387,8 @@ func TestSmoke_CopyObject(t *testing.T) {
 		{"conditional_reads", integration.CopyObject_conditional_reads},
 		{"with_special_characters", integration.CopyObject_with_special_characters},
 		{"long_metadata", integration.CopyObject_long_metadata},
+		{"should_copy_meta_props", integration.CopyObject_should_copy_meta_props},
+		{"should_replace_meta_props", integration.CopyObject_should_replace_meta_props},
 	}
 	s3conf := newS3Conf(smokeHarness(t).Config())
 	for _, tt := range tests {
@@ -414,14 +416,10 @@ func TestSmoke_DeleteObjects(t *testing.T) {
 	}
 }
 
-// TestSmokeXFail_CopyObject: cases ingot fails today. should_copy/replace_meta_props
-// assert the Expires header, which the manifest schema doesn't store yet;
-// overwrite_same_file_object expects a posix filesystem error that doesn't apply
-// to ingot's flat keyspace.
+// TestSmokeXFail_CopyObject: cases ingot fails today. overwrite_same_file_object
+// expects a posix filesystem error that doesn't apply to ingot's flat keyspace.
 func TestSmokeXFail_CopyObject(t *testing.T) {
 	tests := []smokeCase{
-		{"should_copy_meta_props", integration.CopyObject_should_copy_meta_props},
-		{"should_replace_meta_props", integration.CopyObject_should_replace_meta_props},
 		{"overwrite_same_file_object", integration.CopyObject_overwrite_same_file_object},
 	}
 	s3conf := newS3Conf(smokeHarness(t).Config())
