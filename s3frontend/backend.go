@@ -45,6 +45,7 @@ type Backend struct {
 	locations registry.LocationStore
 	blobRefs  registry.BlobRefStore
 	gc        registry.GCStore
+	multipart registry.MultipartStore
 	txns      *bucketop.Coordinator
 	spool     *blockstore.Spool
 	uploader  uploader.BodyUploader
@@ -69,8 +70,9 @@ type Deps struct {
 
 	// BlobRefs is the reverse reference index (which versions reference each
 	// blob); GC records superseded MST/manifest CIDs. Same instance as Registry.
-	BlobRefs registry.BlobRefStore
-	GC       registry.GCStore
+	BlobRefs  registry.BlobRefStore
+	GC        registry.GCStore
+	Multipart registry.MultipartStore
 
 	// Reads is the layered read tier (spool → log → forge). Log is the catalog
 	// LSM write log driving the per-op staging buffer + commit.
@@ -106,6 +108,7 @@ func New(d Deps) *Backend {
 		locations:   d.Locations,
 		blobRefs:    d.BlobRefs,
 		gc:          d.GC,
+		multipart:   d.Multipart,
 		txns:        bucketop.NewCoordinator(bucketop.Deps{Reg: d.Registry, Log: d.Log, Reads: d.Reads}),
 		spool:       d.Spool,
 		uploader:    d.Uploader,

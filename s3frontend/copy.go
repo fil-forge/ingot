@@ -7,13 +7,11 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
-	"github.com/ipfs/go-cid"
 	"github.com/versity/versitygw/backend"
 	"github.com/versity/versitygw/s3err"
 	"github.com/versity/versitygw/s3response"
 
 	msbucket "github.com/fil-forge/ingot/bucket"
-	"github.com/fil-forge/ingot/bucketop"
 	"github.com/fil-forge/ingot/mst"
 	"github.com/fil-forge/ingot/registry"
 )
@@ -99,50 +97,9 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 
 	// Commit to the destination: splice + reference index. The new claims use
 	// the DESTINATION bucket/space; the same digests gain another reference.
-	var toRemove [][]byte
-	err = b.txns.WithTx(ctx, dstBucket, func(ctx context.Context, tx *bucketop.Tx) (cid.Cid, error) {
-		mfCid, err := tx.Put(ctx, dstMf)
-		if err != nil {
-			return cid.Undef, fmt.Errorf("manifest put: %w", err)
-		}
-		t := tx.LoadTree()
-
-		var oldDigests [][]byte
-		oldCid, gerr := t.Get(ctx, dstKey)
-		switch {
-		case gerr == nil:
-			var oldMf msbucket.ObjectManifest
-			if err := tx.Get(ctx, oldCid, &oldMf); err != nil {
-				return cid.Undef, fmt.Errorf("load prior manifest: %w", err)
-			}
-			oldDigests = bodyDigests(oldMf.Body)
-			if err := b.gc.AddGCCandidate(ctx, oldCid.Bytes(), dstBucket); err != nil {
-				return cid.Undef, fmt.Errorf("gc candidate: %w", err)
-			}
-		case errors.Is(gerr, mst.ErrNotFound):
-		default:
-			return cid.Undef, fmt.Errorf("mst get prior: %w", gerr)
-		}
-
-		t2, err := t.Add(ctx, dstKey, mfCid, -1)
-		if errors.Is(err, mst.ErrAlreadyExists) {
-			t2, err = t.Update(ctx, dstKey, mfCid)
-		}
-		if err != nil {
-			return cid.Undef, fmt.Errorf("mst write: %w", err)
-		}
-
-		rm, err := b.reconcileClaims(ctx, dstBucket, dstKey, oldDigests, bodyDigests(dstMf.Body))
-		if err != nil {
-			return cid.Undef, err
-		}
-		toRemove = rm
-		return t2.GetPointer(ctx, tx)
-	})
-	if err != nil {
-		return s3response.CopyObjectOutput{}, mapCommitError(err, "copy")
+	if err := b.commitManifest(ctx, dstBucket, dstKey, dstMf, bodyDigests(dstMf.Body)); err != nil {
+		return s3response.CopyObjectOutput{}, err
 	}
-	b.releaseBlobs(ctx, toRemove)
 
 	lastMod := time.Unix(dstMf.Created, 0)
 	etag := etagOf(dstMf)

@@ -243,14 +243,25 @@ Deliverable: correct 412/304 race-safe at commit; checksums validate + echo; bat
 metadata-only copy work; conditional + checksum xfail rows flipped, CopyObject/DeleteObjects coverage
 added. **Phase 5 complete.**
 
-### Phase 6 — Multipart *(fast-follow)*
+### Phase 6 — Multipart ✅ DONE (`1ef6fd5`)
 
-- [ ] `CreateMultipartUpload`/`UploadPart`/`CompleteMultipartUpload`/`AbortMultipartUpload`;
-      parked parts; single-winner Complete/Abort latch; accept-at-Complete; `-N` ETag
-      (`hex(md5(concat part md5s))`). Tables exist from Phase 2.
+- [x] `CreateMultipartUpload` (session open), `UploadPart` (coarse-split → spool + record part;
+      deferred upload), `CompleteMultipartUpload` (single-winner latch, part validation, blob lengths
+      reconstructed from `upload_intents`, accept-at-Complete, ordered-union Body, `-N` ETag =
+      `hex(md5(concat part md5s))`), `AbortMultipartUpload` (single-winner latch; drop session).
+      Refactored `ingestBody` → `splitSpool` + `uploadBlobs`; extracted `commitManifest` (shared by
+      CopyObject + Complete). Wired `MultipartStore`; set `s3api.WithMpMaxParts(10000)` (the
+      part-number ceiling defaulted to 0, rejecting every UploadPart).
+- [x] `testing/multipart_test.go`: Create→UploadPart×3→Complete byte-exact round-trip (incl. a
+      boundary-crossing ranged GET + the `-N` ETag); Abort leaves no object + invalidates the id.
+      Promoted `GetObject/ranged_with_checksum_mode`, `HeadObject/mp_part_number_exceeds_parts_count`.
 
-Deliverable: full multipart lifecycle in the harness; latch serializes Complete vs Abort; Abort
-reclaims parked/deduped blobs. Multipart xfail rows flip to pass.
+Deliverable: full multipart lifecycle in the harness; latch serializes Complete vs Abort.
+
+> **Deferred to Phase 7 (forge glue, smelt-validated):** true forge *parking* (upload at UploadPart)
+> + accept-at-Complete and `unallocate`-on-abort — the in-process flow spools at UploadPart and
+> uploads/accepts at Complete (the harness uploader is a no-op). `UploadPartCopy`,
+> `ListParts`/`ListMultipartUploads` are also still unimplemented (return `ErrNotImplemented`).
 
 ### Phase 7 — Forge wiring hardening
 

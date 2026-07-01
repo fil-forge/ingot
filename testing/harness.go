@@ -167,6 +167,7 @@ func StartHarness(ctx context.Context, opts ...HarnessOption) (*Harness, error) 
 			fx.Annotate(func() *inmem.MemStore { return mem }, fx.As(new(registry.LocationStore))),
 			fx.Annotate(func() *inmem.MemStore { return mem }, fx.As(new(registry.BlobRefStore))),
 			fx.Annotate(func() *inmem.MemStore { return mem }, fx.As(new(registry.GCStore))),
+			fx.Annotate(func() *inmem.MemStore { return mem }, fx.As(new(registry.MultipartStore))),
 			fx.Annotate(func() *inmem.MemStore { return mem }, fx.As(new(logstore.Meta))),
 			fx.Annotate(func() inmem.NopBaseReader { return inmem.NopBaseReader{} }, fx.As(new(blockstore.BlockReader))),
 			fx.Annotate(func() inmem.NopUploader { return inmem.NopUploader{} }, fx.As(new(uploader.Uploader))),

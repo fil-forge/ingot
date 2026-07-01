@@ -103,6 +103,7 @@ type ServerDeps struct {
 	Locations registry.LocationStore
 	BlobRefs  registry.BlobRefStore
 	GC        registry.GCStore
+	Multipart registry.MultipartStore
 
 	// Space is the Forge space this instance owns — the key body-blob locations
 	// (and, later, reference claims) are recorded under. Empty in standalone /
@@ -168,6 +169,7 @@ func New(ctx context.Context, cfg ServerConfig, deps ServerDeps) (*Server, error
 		Locations:   deps.Locations,
 		BlobRefs:    deps.BlobRefs,
 		GC:          deps.GC,
+		Multipart:   deps.Multipart,
 		Reads:       bs,
 		Log:         log,
 		Spool:       spool,
@@ -301,6 +303,9 @@ func buildS3API(ctx context.Context, backend *s3frontend.Backend, cfg ServerConf
 		s3api.WithQuiet(),
 		s3api.WithHealth("/health"),
 		s3api.WithConcurrencyLimiter(cfg.MaxConnections, cfg.MaxRequests),
+		// Without this the part-number ceiling defaults to 0 and every
+		// UploadPart is rejected. 10000 is the S3 maximum.
+		s3api.WithMpMaxParts(10000),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("ingot: s3api: %w", err)
@@ -341,6 +346,9 @@ func validateServerInputs(cfg ServerConfig, deps ServerDeps) error {
 	}
 	if deps.GC == nil {
 		return errors.New("ingot: ServerDeps.GC is required")
+	}
+	if deps.Multipart == nil {
+		return errors.New("ingot: ServerDeps.Multipart is required")
 	}
 	if deps.Remover == nil {
 		return errors.New("ingot: ServerDeps.Remover is required")

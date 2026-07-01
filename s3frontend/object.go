@@ -113,14 +113,15 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 
 	// mf is captured by the closure and read after WithTx commits, so the
 	// response ETag/size come from the same manifest that was committed.
-	// toRemove collects digests whose last reference is dropped by an
-	// overwrite — released after the commit, off the critical section.
+	// oldDigests captures the superseded version's body digests (an overwrite),
+	// so the reference index can be reconciled AFTER the commit is durable.
 	var mf *msbucket.ObjectManifest
-	var toRemove [][]byte
+	var oldDigests [][]byte
 
 	// COMMIT (short per-bucket critical section): write the manifest + MST
-	// splice + reference index + guarded root swap. No large-body work happens
-	// under the lock.
+	// splice + guarded root swap. No large-body work happens under the lock; the
+	// reference-index reconcile runs after, so a failed commit can't diverge
+	// blob_refs from the committed catalog.
 	err = b.txns.WithTx(ctx, bucketName, func(ctx context.Context, tx *bucketop.Tx) (cid.Cid, error) {
 		mf = &msbucket.ObjectManifest{
 			Key:                key,
@@ -147,7 +148,6 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 		// overwrite) before replacing the leaf, so the reference index can
 		// release blobs the new body no longer references and the precondition
 		// re-check sees the current state.
-		var oldDigests [][]byte
 		var oldETag string
 		oldCid, gerr := t.Get(ctx, key)
 		oldExists := gerr == nil
@@ -182,16 +182,18 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 			return cid.Undef, fmt.Errorf("mst write: %w", err)
 		}
 
-		rm, err := b.reconcileClaims(ctx, bucketName, key, oldDigests, bodyDigests(bodyRec))
-		if err != nil {
-			return cid.Undef, err
-		}
-		toRemove = rm
-
 		return t2.GetPointer(ctx, tx)
 	})
 	if err != nil {
 		return s3response.PutObjectOutput{}, mapCommitError(err, "put")
+	}
+
+	// Reference index, after the commit is durable: claim the new body's blobs
+	// and release the superseded ones (overwrite). Done post-commit so a commit
+	// failure can never leave blob_refs out of step with the catalog.
+	toRemove, err := b.reconcileClaims(ctx, bucketName, key, oldDigests, bodyDigests(bodyRec))
+	if err != nil {
+		return s3response.PutObjectOutput{}, fmt.Errorf("s3frontend: put reconcile: %w", err)
 	}
 	b.releaseBlobs(ctx, toRemove)
 
@@ -214,6 +216,22 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 // crash recovery to reconcile (a later phase); no manifest is written, so no
 // catalog entry ever references a non-durable blob.
 func (b *Backend) ingestBody(ctx context.Context, bucket string, r io.Reader) (msbucket.Body, error) {
+	body, err := b.splitSpool(ctx, bucket, r)
+	if err != nil {
+		return msbucket.Body{}, err
+	}
+	if err := b.uploadBlobs(ctx, body.Blobs); err != nil {
+		return msbucket.Body{}, err
+	}
+	return body, nil
+}
+
+// splitSpool coarse-splits a body into blobs, writes each to the local spool,
+// and records a spooled upload_intents row per blob — WITHOUT uploading. It is
+// the shared first half of ingest: a single-shot PUT follows it with
+// uploadBlobs immediately; a multipart UploadPart spools here and defers the
+// upload to Complete.
+func (b *Backend) splitSpool(ctx context.Context, bucket string, r io.Reader) (msbucket.Body, error) {
 	if r == nil {
 		r = bytes.NewReader(nil)
 	}
@@ -222,29 +240,35 @@ func (b *Backend) ingestBody(ctx context.Context, bucket string, r io.Reader) (m
 		return msbucket.Body{}, fmt.Errorf("split body: %w", err)
 	}
 	for _, blob := range body.Blobs {
-		digest := multihash.Multihash(blob.Digest)
-		path := b.spool.Path(digest)
 		if err := b.intents.PutIntent(ctx, registry.UploadIntent{
 			Digest:    blob.Digest,
-			LocalPath: path,
+			LocalPath: b.spool.Path(multihash.Multihash(blob.Digest)),
 			Size:      blob.Length,
 			State:     registry.IntentSpooled,
 			Bucket:    bucket,
 		}); err != nil {
 			return msbucket.Body{}, fmt.Errorf("record intent: %w", err)
 		}
-		loc, err := b.uploader.UploadBlob(ctx, digest, blob.Length, path)
+	}
+	return body, nil
+}
+
+// uploadBlobs uploads each spooled blob to Forge by digest (allocate→PUT→
+// accept), advances its intent to accepted, and records its location. A no-op
+// in the in-memory harness (the spool serves reads). Idempotent across blobs a
+// prior object already accepted — dedup means the upload short-circuits.
+func (b *Backend) uploadBlobs(ctx context.Context, blobs []msbucket.BlobRef) error {
+	for _, blob := range blobs {
+		digest := multihash.Multihash(blob.Digest)
+		loc, err := b.uploader.UploadBlob(ctx, digest, blob.Length, b.spool.Path(digest))
 		if err != nil {
-			return msbucket.Body{}, fmt.Errorf("upload blob: %w", err)
+			return fmt.Errorf("upload blob: %w", err)
 		}
 		if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentAccepted); err != nil {
-			return msbucket.Body{}, fmt.Errorf("mark accepted: %w", err)
+			return fmt.Errorf("mark accepted: %w", err)
 		}
-		// Record where the accepted blob can be retrieved from, keyed by
-		// (space, digest). A later read resolves it from this table (in the
-		// harness the uploader is a no-op and reads come from the spool, so the
-		// recorded URL is empty and unused). Best-effort: a failure here does
-		// not fail the PUT — the spool still serves read-after-write.
+		// Best-effort location record (unused in the harness, where reads come
+		// from the spool); keyed by (space, digest).
 		if err := b.locations.PutLocation(ctx, registry.BlobLocation{
 			Space:    b.space,
 			Digest:   blob.Digest,
@@ -252,10 +276,10 @@ func (b *Backend) ingestBody(ctx context.Context, bucket string, r io.Reader) (m
 			URL:      loc.URL,
 			Size:     loc.Size,
 		}); err != nil {
-			return msbucket.Body{}, fmt.Errorf("record location: %w", err)
+			return fmt.Errorf("record location: %w", err)
 		}
 	}
-	return body, nil
+	return nil
 }
 
 // reconcileClaims updates blob_refs for an object version under (bucket, key)
@@ -271,12 +295,19 @@ func (b *Backend) ingestBody(ctx context.Context, bucket string, r io.Reader) (m
 //
 // versionId is the unversioned sentinel for now — one claim row per
 // (digest, bucket, key). When versioning lands, each version carries its own id.
+//
+// It MUST run only after the catalog/root commit succeeds: it mutates blob_refs
+// in its own (non-transactional) store, so applying it before a commit that then
+// fails would diverge blob_refs from the committed catalog (and a later delete
+// of a shared blob could drop a still-referenced one). Iterates over the
+// DEDUPLICATED digest sets, so a manifest carrying the same digest in two blobs
+// adds/deletes one claim and releases the blob at most once.
 func (b *Backend) reconcileClaims(ctx context.Context, bucket, key string, oldDigests, newDigests [][]byte) (toRemove [][]byte, err error) {
 	oldSet := digestSet(oldDigests)
 	newSet := digestSet(newDigests)
 
-	for _, d := range newDigests {
-		if _, ok := oldSet[string(d)]; ok {
+	for k, d := range newSet {
+		if _, ok := oldSet[k]; ok {
 			continue // unchanged reference
 		}
 		if err := b.blobRefs.AddBlobClaim(ctx, registry.BlobClaim{
@@ -285,8 +316,8 @@ func (b *Backend) reconcileClaims(ctx context.Context, bucket, key string, oldDi
 			return nil, fmt.Errorf("add blob claim: %w", err)
 		}
 	}
-	for _, d := range oldDigests {
-		if _, ok := newSet[string(d)]; ok {
+	for k, d := range oldSet {
+		if _, ok := newSet[k]; ok {
 			continue // still referenced by the new body
 		}
 		if err := b.blobRefs.DeleteBlobClaim(ctx, d, bucket, key, registry.NullVersionID); err != nil {
@@ -326,10 +357,13 @@ func bodyDigests(body msbucket.Body) [][]byte {
 	return out
 }
 
-func digestSet(ds [][]byte) map[string]struct{} {
-	s := make(map[string]struct{}, len(ds))
+// digestSet maps each distinct digest (by its bytes) to one representative
+// []byte, so callers can both test membership and recover the digest while
+// processing every digest exactly once.
+func digestSet(ds [][]byte) map[string][]byte {
+	s := make(map[string][]byte, len(ds))
 	for _, d := range ds {
-		s[string(d)] = struct{}{}
+		s[string(d)] = d
 	}
 	return s
 }
@@ -466,7 +500,7 @@ func (b *Backend) DeleteObject(ctx context.Context, input *s3.DeleteObjectInput)
 // preconds, when non-nil, gates the delete on If-Match / size / mod-time under
 // the lock. Shared by DeleteObject and DeleteObjects.
 func (b *Backend) deleteObjectKey(ctx context.Context, bucketName, key string, preconds *backend.ObjectDeletePreconditions) error {
-	var toRemove [][]byte
+	var oldDigests [][]byte
 	err := b.txns.WithTx(ctx, bucketName, func(ctx context.Context, tx *bucketop.Tx) (cid.Cid, error) {
 		// Empty bucket: nothing to delete. Returning cid.Undef tells WithTx to
 		// discard with no commit — the equivalent of "no-op success."
@@ -504,15 +538,18 @@ func (b *Backend) deleteObjectKey(ctx context.Context, bucketName, key string, p
 		if err := b.gc.AddGCCandidate(ctx, oldCid.Bytes(), bucketName); err != nil {
 			return cid.Undef, fmt.Errorf("gc candidate: %w", err)
 		}
-		rm, err := b.reconcileClaims(ctx, bucketName, key, bodyDigests(oldMf.Body), nil)
-		if err != nil {
-			return cid.Undef, err
-		}
-		toRemove = rm
+		oldDigests = bodyDigests(oldMf.Body)
 		return t2.GetPointer(ctx, tx)
 	})
 	if err != nil {
 		return mapCommitError(err, "delete")
+	}
+	// Release the removed version's blobs through the reference index AFTER the
+	// commit is durable (so a commit failure can't diverge blob_refs). When the
+	// key was absent, oldDigests is nil and this is a no-op.
+	toRemove, err := b.reconcileClaims(ctx, bucketName, key, oldDigests, nil)
+	if err != nil {
+		return fmt.Errorf("s3frontend: delete reconcile: %w", err)
 	}
 	b.releaseBlobs(ctx, toRemove)
 	return nil

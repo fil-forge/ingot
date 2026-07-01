@@ -173,6 +173,7 @@ func TestSmoke_GetObject(t *testing.T) {
 		{"overrides_presign_success", integration.GetObject_overrides_presign_success},
 		{"overrides_success", integration.GetObject_overrides_success},
 		{"range_and_part_number", integration.GetObject_range_and_part_number},
+		{"ranged_with_checksum_mode", integration.GetObject_ranged_with_checksum_mode},
 		{"with_range", integration.GetObject_with_range},
 		{"zero_len_with_range", integration.GetObject_zero_len_with_range},
 	}
@@ -194,6 +195,7 @@ func TestSmoke_HeadObject(t *testing.T) {
 		{"empty_object_part_number_1", integration.HeadObject_empty_object_part_number_1},
 		{"invalid_parent_dir", integration.HeadObject_invalid_parent_dir},
 		{"invalid_part_number", integration.HeadObject_invalid_part_number},
+		{"mp_part_number_exceeds_parts_count", integration.HeadObject_mp_part_number_exceeds_parts_count},
 		{"non_existing_dir_object", integration.HeadObject_non_existing_dir_object},
 		{"non_existing_object", integration.HeadObject_non_existing_object},
 		{"not_enabled_checksum_mode", integration.HeadObject_not_enabled_checksum_mode},
@@ -314,7 +316,6 @@ func TestSmokeXFail_GetObject(t *testing.T) {
 		{"mp_part_number_success", integration.GetObject_mp_part_number_success},
 		{"non_mp_part_number_1_success", integration.GetObject_non_mp_part_number_1_success},
 		{"overrides_fail_public", integration.GetObject_overrides_fail_public},
-		{"ranged_with_checksum_mode", integration.GetObject_ranged_with_checksum_mode},
 		{"success", integration.GetObject_success},
 	}
 	s3conf := newS3Conf(smokeHarness(t).Config())
@@ -334,7 +335,6 @@ func TestSmokeXFail_HeadObject(t *testing.T) {
 	tests := []smokeCase{
 		{"by_range_resp_status", integration.HeadObject_by_range_resp_status},
 		{"dir_with_range", integration.HeadObject_dir_with_range},
-		{"mp_part_number_exceeds_parts_count", integration.HeadObject_mp_part_number_exceeds_parts_count},
 		{"mp_part_number_resp_status", integration.HeadObject_mp_part_number_resp_status},
 		{"mp_part_number_success", integration.HeadObject_mp_part_number_success},
 		{"non_mp_part_number_1_success", integration.HeadObject_non_mp_part_number_1_success},
