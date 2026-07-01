@@ -9,8 +9,13 @@
 package testing
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
+	"os"
+	"regexp"
+	"strings"
 	"sync"
 	"testing"
 
@@ -66,6 +71,15 @@ type Result struct {
 	Passed uint32
 	// Failed is the number that ended in failF.
 	Failed uint32
+
+	// PassedCases / FailedCases name the individual cases by their versitygw
+	// test name (e.g. "PutObject_conditional_writes"), recovered by capturing the
+	// suite's stdout — the upstream counters expose only totals. They let a caller
+	// gate per-case (e.g. assert the forge-mode failures are a subset of the
+	// in-process baseline's, catching forge-specific regressions a count
+	// comparison would miss). Empty if stdout capture failed.
+	PassedCases []string
+	FailedCases []string
 }
 
 // Err returns a non-nil error if any case failed. Use this when the
@@ -95,17 +109,70 @@ func Run(ctx context.Context, c Config, suite Suite) Result {
 	passedBefore := integration.PassCount.Load()
 	failedBefore := integration.FailCount.Load()
 
+	// The upstream group functions print each case's RUN/PASS/FAIL line to
+	// os.Stdout and bump package atomics — they expose no structured per-case
+	// result. Tee os.Stdout through a pipe for the duration of the run so we can
+	// recover the case names (live output is preserved via the MultiWriter).
+	// runMu already serializes Run calls, so the global os.Stdout swap is safe.
+	var captured bytes.Buffer
+	orig := os.Stdout
+	pr, pw, pipeErr := os.Pipe()
+	copyDone := make(chan struct{})
+	if pipeErr == nil {
+		os.Stdout = pw
+		go func() {
+			_, _ = io.Copy(io.MultiWriter(orig, &captured), pr)
+			close(copyDone)
+		}()
+	}
+
 	ts := integration.NewTestState(ctx, newS3Conf(c), c.Parallel)
 	for _, group := range suite {
 		group(ts)
 	}
 	ts.Wait()
 
-	return Result{
-		Ran:    integration.RunCount.Load() - ranBefore,
-		Passed: integration.PassCount.Load() - passedBefore,
-		Failed: integration.FailCount.Load() - failedBefore,
+	if pipeErr == nil {
+		os.Stdout = orig
+		_ = pw.Close()
+		<-copyDone
+		_ = pr.Close()
 	}
+
+	passed, failed := parseCaseLines(captured.String())
+	return Result{
+		Ran:         integration.RunCount.Load() - ranBefore,
+		Passed:      integration.PassCount.Load() - passedBefore,
+		Failed:      integration.FailCount.Load() - failedBefore,
+		PassedCases: passed,
+		FailedCases: failed,
+	}
+}
+
+var ansiRe = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+
+// parseCaseLines recovers per-case names from captured suite output. The upstream
+// printers emit "PASS <name>" and "FAIL <name>: <error>" (wrapped in ANSI color);
+// the name is the token up to the first colon. Teardown-failure lines lack the
+// "FAIL " prefix and are ignored (they don't increment the fail counter).
+func parseCaseLines(output string) (passed, failed []string) {
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(ansiRe.ReplaceAllString(line, ""))
+		switch {
+		case strings.HasPrefix(line, "FAIL "):
+			failed = append(failed, caseName(line[len("FAIL "):]))
+		case strings.HasPrefix(line, "PASS "):
+			passed = append(passed, caseName(line[len("PASS "):]))
+		}
+	}
+	return passed, failed
+}
+
+func caseName(s string) string {
+	if i := strings.IndexByte(s, ':'); i >= 0 {
+		s = s[:i]
+	}
+	return strings.TrimSpace(s)
 }
 
 // RunT is the Go-test-friendly form of Run. On any failure the

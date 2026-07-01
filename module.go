@@ -333,16 +333,18 @@ func provideMigrationHook(pool *pgxpool.Pool, logger *zap.Logger) migrationHookO
 	}}
 }
 
-// provideForgeReader builds the network-backed read tier (indexer + piri),
-// fronted by a bounded in-memory block cache (see Config.ReadCacheBytes).
-func provideForgeReader(cfg Config, id ServiceIdentity, space spaceSigner, logger *zap.Logger) (blockstore.BlockReader, error) {
+// provideForgeReader builds the network-backed read tier (piri retrieval),
+// fronted by a bounded in-memory block cache (see Config.ReadCacheBytes). Blob
+// locations resolve from the local blob_locations table (the appliance read
+// tier, registry.LocalLocator) rather than the indexing-service — same retrieval
+// path, no indexer dependency for reads (docs/architecture.md §8).
+func provideForgeReader(cfg Config, id ServiceIdentity, space spaceSigner, locations registry.LocationStore, logger *zap.Logger) (blockstore.BlockReader, error) {
 	forge, err := blockstore.NewForge(blockstore.ForgeConfig{
-		IndexerEndpoint: cfg.IndexerEndpoint,
-		IndexerDID:      cfg.IndexerDID,
-		Spaces:          []did.DID{space.DID()},
-		Signer:          id.Signer,
-		SpaceSigner:     space.Signer,
-		Logger:          logger,
+		Locator:     registry.NewLocalLocator(locations),
+		Spaces:      []did.DID{space.DID()},
+		Signer:      id.Signer,
+		SpaceSigner: space.Signer,
+		Logger:      logger,
 	})
 	if err != nil {
 		return nil, err

@@ -256,11 +256,29 @@ func (b *Backend) splitSpool(ctx context.Context, bucket string, r io.Reader) (m
 
 // uploadBlobs uploads each spooled blob to Forge by digest (allocate→PUT→
 // accept), advances its intent to accepted, and records its location. A no-op
-// in the in-memory harness (the spool serves reads). Idempotent across blobs a
-// prior object already accepted — dedup means the upload short-circuits.
+// in the in-memory harness (the spool serves reads).
+//
+// A blob already durably stored for this space (a re-PUT of identical content,
+// an overwrite-in-place, or a blob shared with an earlier object) is skipped:
+// its bytes are already on Forge, so re-uploading is pure waste — and worse,
+// re-adding an already-stored blob makes the upload service return an accept
+// receipt with no fresh location commitment, which the edge client (correctly)
+// rejects. We detect this via the recorded location and short-circuit, matching
+// guppy's "blob already has location; skip /blob/add". (A crash between accept
+// and the location record could still re-add; that window closes with the
+// deferred upload_intents × blob_locations crash recovery — see §12.)
 func (b *Backend) uploadBlobs(ctx context.Context, blobs []msbucket.BlobRef) error {
 	for _, blob := range blobs {
 		digest := multihash.Multihash(blob.Digest)
+		if existing, err := b.locations.GetLocation(ctx, b.space, blob.Digest); err == nil && existing != nil {
+			// Already durable for this space — advance the intent and move on.
+			if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentAccepted); err != nil {
+				return fmt.Errorf("mark accepted (dedup): %w", err)
+			}
+			continue
+		} else if err != nil && !errors.Is(err, registry.ErrNotFound) {
+			return fmt.Errorf("lookup location: %w", err)
+		}
 		loc, err := b.uploader.UploadBlob(ctx, digest, blob.Length, b.spool.Path(digest))
 		if err != nil {
 			return fmt.Errorf("upload blob: %w", err)

@@ -18,6 +18,7 @@ import (
 	"github.com/fil-forge/ucantone/ucan/invocation"
 	block "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
+	mh "github.com/multiformats/go-multihash"
 	"go.uber.org/zap"
 
 	"github.com/fil-forge/ingot/blockstore/locator"
@@ -47,13 +48,21 @@ type Forge struct {
 	logger      *zap.Logger
 }
 
-var _ BlockReader = (*Forge)(nil)
+var (
+	_ BlockReader = (*Forge)(nil)
+	_ BlobReader  = (*Forge)(nil)
+)
 
 // ForgeConfig wires a read-only Forge block reader.
 type ForgeConfig struct {
-	// IndexerEndpoint is the indexing-service URL.
+	// Locator, when set, resolves blob locations instead of the indexing-service
+	// — the appliance read tier (e.g. registry.LocalLocator over blob_locations).
+	// When nil, an indexing-service-backed locator is built from
+	// IndexerEndpoint/IndexerDID. Either way the retrieval path is identical.
+	Locator locator.Locator
+	// IndexerEndpoint is the indexing-service URL. Required only when Locator is nil.
 	IndexerEndpoint string
-	// IndexerDID is the indexing-service principal.
+	// IndexerDID is the indexing-service principal. Required only when Locator is nil.
 	IndexerDID string
 	// Spaces scopes the locator queries; for ingot this is the single space it owns.
 	Spaces []did.DID
@@ -69,15 +78,10 @@ type ForgeConfig struct {
 	Logger *zap.Logger
 }
 
-// NewForge constructs a Forge block reader, building an indexing-service client
-// wrapped by the index locator.
+// NewForge constructs a Forge block reader. It uses cfg.Locator when set (the
+// appliance read tier); otherwise it builds an indexing-service-backed locator
+// from IndexerEndpoint/IndexerDID.
 func NewForge(cfg ForgeConfig) (*Forge, error) {
-	if cfg.IndexerEndpoint == "" {
-		return nil, errors.New("forge blockstore: indexer endpoint is required")
-	}
-	if cfg.IndexerDID == "" {
-		return nil, errors.New("forge blockstore: indexer DID is required")
-	}
 	if len(cfg.Spaces) == 0 {
 		return nil, errors.New("forge blockstore: at least one space is required")
 	}
@@ -86,15 +90,6 @@ func NewForge(cfg ForgeConfig) (*Forge, error) {
 	}
 	if cfg.SpaceSigner == nil {
 		return nil, errors.New("forge blockstore: space signer is required")
-	}
-
-	endpointURL, err := url.Parse(cfg.IndexerEndpoint)
-	if err != nil {
-		return nil, fmt.Errorf("forge blockstore: parse indexer endpoint: %w", err)
-	}
-	indexerDID, err := did.Parse(cfg.IndexerDID)
-	if err != nil {
-		return nil, fmt.Errorf("forge blockstore: parse indexer DID: %w", err)
 	}
 
 	httpc := cfg.HTTPClient
@@ -106,13 +101,29 @@ func NewForge(cfg ForgeConfig) (*Forge, error) {
 		logger = zap.NewNop()
 	}
 
-	idxClient, err := indexclient.New(indexerDID, *endpointURL, indexclient.WithHTTPClient(httpc))
-	if err != nil {
-		return nil, fmt.Errorf("forge blockstore: build indexing-service client: %w", err)
+	loc := cfg.Locator
+	if loc == nil {
+		// No locator injected: resolve through the indexing-service.
+		if cfg.IndexerEndpoint == "" {
+			return nil, errors.New("forge blockstore: indexer endpoint is required (no locator injected)")
+		}
+		if cfg.IndexerDID == "" {
+			return nil, errors.New("forge blockstore: indexer DID is required (no locator injected)")
+		}
+		endpointURL, err := url.Parse(cfg.IndexerEndpoint)
+		if err != nil {
+			return nil, fmt.Errorf("forge blockstore: parse indexer endpoint: %w", err)
+		}
+		indexerDID, err := did.Parse(cfg.IndexerDID)
+		if err != nil {
+			return nil, fmt.Errorf("forge blockstore: parse indexer DID: %w", err)
+		}
+		idxClient, err := indexclient.New(indexerDID, *endpointURL, indexclient.WithHTTPClient(httpc))
+		if err != nil {
+			return nil, fmt.Errorf("forge blockstore: build indexing-service client: %w", err)
+		}
+		loc = locator.NewIndexLocator(idxClient, newAuthorizeRetrieval(cfg.SpaceSigner, indexerDID))
 	}
-
-	authFn := newAuthorizeRetrieval(cfg.SpaceSigner, indexerDID)
-	loc := locator.NewIndexLocator(idxClient, authFn)
 
 	return &Forge{
 		locator:     loc,
@@ -124,26 +135,29 @@ func NewForge(cfg ForgeConfig) (*Forge, error) {
 	}, nil
 }
 
-// GetBlock resolves the CID through the indexer and retrieves the underlying
-// bytes from piri via a UCAN-authorized /content/retrieve invocation, scoped to
-// the inner block's byte range within the containing CAR shard.
-func (f *Forge) GetBlock(ctx context.Context, c cid.Cid) (block.Block, error) {
+// retrieve resolves c through the locator and issues a UCAN-authorized
+// /content/retrieve to the piri node that holds it, returning the response body
+// stream and the expected byte length (the location Range is inclusive, so
+// End-Start+1). The caller owns the returned reader and must Close it. Shared by
+// GetBlock (which buffers small catalog blocks) and OpenBlob (which streams large
+// body blobs straight through).
+func (f *Forge) retrieve(ctx context.Context, c cid.Cid) (io.ReadCloser, int64, error) {
 	locations, err := f.locator.Locate(ctx, f.spaces, c.Hash())
 	if err != nil {
 		var nf locator.NotFoundError
 		if errors.As(err, &nf) {
-			return nil, ErrNotFound
+			return nil, 0, ErrNotFound
 		}
-		return nil, fmt.Errorf("forge: locate %s: %w", c, err)
+		return nil, 0, fmt.Errorf("forge: locate %s: %w", c, err)
 	}
 	if len(locations) == 0 {
-		return nil, ErrNotFound
+		return nil, 0, ErrNotFound
 	}
 
 	loc := locations[0]
 	cm := loc.Commitment
 	if len(cm.Location) == 0 {
-		return nil, fmt.Errorf("forge: empty location URL set for %s", c)
+		return nil, 0, fmt.Errorf("forge: empty location URL set for %s", c)
 	}
 	target := cm.Location[0]
 
@@ -166,7 +180,7 @@ func (f *Forge) GetBlock(ctx context.Context, c cid.Cid) (block.Block, error) {
 		delegation.WithExpiration(ucan.Now()+retrievalAuthTTL),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("forge: build retrieval proof: %w", err)
+		return nil, 0, fmt.Errorf("forge: build retrieval proof: %w", err)
 	}
 
 	inv, err := contentcmds.Retrieve.Invoke(
@@ -180,12 +194,12 @@ func (f *Forge) GetBlock(ctx context.Context, c cid.Cid) (block.Block, error) {
 		invocation.WithProofs(retrievalProof.Link()),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("forge: build retrieve invocation: %w", err)
+		return nil, 0, fmt.Errorf("forge: build retrieve invocation: %w", err)
 	}
 
 	rclient, err := retrieval.NewClient(target.URL(), retrieval.WithHTTPClient(f.httpClient))
 	if err != nil {
-		return nil, fmt.Errorf("forge: build retrieval client: %w", err)
+		return nil, 0, fmt.Errorf("forge: build retrieval client: %w", err)
 	}
 
 	_, _, meta, err := ucanexec.Execute[*contentcmds.RetrieveOK](
@@ -193,26 +207,44 @@ func (f *Forge) GetBlock(ctx context.Context, c cid.Cid) (block.Block, error) {
 		execution.WithDelegations(retrievalProof),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("forge: retrieve %s: %w", c, err)
+		return nil, 0, fmt.Errorf("forge: retrieve %s: %w", c, err)
 	}
 
 	hcRes, ok := meta.(*retrieval.HTTPHeaderResponseContainer)
 	if !ok {
-		return nil, fmt.Errorf("forge: unexpected retrieval metadata type %T", meta)
+		return nil, 0, fmt.Errorf("forge: unexpected retrieval metadata type %T", meta)
 	}
-	defer hcRes.Body.Close()
+	// Range is inclusive, so the expected length is End - Start + 1.
+	return hcRes.Body, loc.Range.End - loc.Range.Start + 1, nil
+}
 
-	body, err := io.ReadAll(hcRes.Body)
+// GetBlock resolves the CID through the locator and retrieves the bytes from piri
+// via a UCAN-authorized /content/retrieve. It buffers the whole block, so it is
+// for small catalog blocks; object-body blobs use the streaming OpenBlob.
+func (f *Forge) GetBlock(ctx context.Context, c cid.Cid) (block.Block, error) {
+	rc, wantLen, err := f.retrieve(ctx, c)
+	if err != nil {
+		return nil, err
+	}
+	defer rc.Close()
+
+	body, err := io.ReadAll(rc)
 	if err != nil {
 		return nil, fmt.Errorf("forge: read retrieve body for %s: %w", c, err)
 	}
-	// Range is inclusive, so the expected length is End - Start + 1.
-	wantLen := loc.Range.End - loc.Range.Start + 1
 	if int64(len(body)) != wantLen {
 		return nil, fmt.Errorf("forge: %s short read: got %d bytes, want %d", c, len(body), wantLen)
 	}
-
 	return block.NewBlockWithCid(body, c)
+}
+
+// OpenBlob streams an object-body blob from piri by digest, without buffering it
+// in memory — the network counterpart of Spool.OpenBlob. Bytes are served
+// straight off the /content/retrieve response; the caller owns the reader and
+// must Close it.
+func (f *Forge) OpenBlob(ctx context.Context, digest mh.Multihash) (io.ReadCloser, error) {
+	rc, _, err := f.retrieve(ctx, cid.NewCidV1(cid.Raw, digest))
+	return rc, err
 }
 
 // newAuthorizeRetrieval returns the AuthorizeRetrievalFunc the IndexLocator

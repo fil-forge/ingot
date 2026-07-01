@@ -12,6 +12,7 @@ package inmem
 
 import (
 	"context"
+	"io"
 	"sort"
 	"sync"
 
@@ -234,6 +235,13 @@ func (NopBaseReader) GetBlock(_ context.Context, _ cid.Cid) (block.Block, error)
 	return nil, blockstore.ErrNotFound
 }
 
+// OpenBlob is the streaming-read counterpart: with no network tier, an evicted
+// body blob is unrecoverable. (The harness never evicts, so reads come from the
+// spool.)
+func (NopBaseReader) OpenBlob(_ context.Context, _ multihash.Multihash) (io.ReadCloser, error) {
+	return nil, blockstore.ErrNotFound
+}
+
 // NopUploader is a no-op upload sink for the in-memory suite and standalone
 // mode. SubmitShard ships nothing (a catalog plane is marked shipped without
 // touching the network); UploadBlob accepts a body blob without touching the
@@ -255,6 +263,7 @@ var (
 	_ registry.Registry      = (*MemStore)(nil)
 	_ logstore.Meta          = (*MemStore)(nil)
 	_ blockstore.BlockReader = NopBaseReader{}
+	_ blockstore.BlobReader  = NopBaseReader{}
 	_ uploader.Uploader      = NopUploader{}
 	_ uploader.BodyUploader  = NopUploader{}
 	_ uploader.BlobRemover   = NopUploader{}

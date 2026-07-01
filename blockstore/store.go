@@ -43,6 +43,7 @@ package blockstore
 
 import (
 	"context"
+	"io"
 
 	block "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
@@ -87,12 +88,32 @@ type BlockWriter interface {
 	PutBlock(ctx context.Context, blk block.Block) error
 }
 
+// BlobReader streams a stored object-body blob by its digest, without holding
+// the whole blob in memory — the read counterpart to BlobWriter. Body blobs run
+// up to max_blob_size (256 MiB), so the body read path (chunker.OpenBody) streams
+// them rather than materializing each as a block.Block the way GetBlock would.
+// Returns ErrNotFound if the blob is not present in this tier. The caller owns
+// the returned reader and must Close it.
+type BlobReader interface {
+	OpenBlob(ctx context.Context, digest mh.Multihash) (io.ReadCloser, error)
+}
+
+// BlobWriter streams an object-body blob to local storage, computing its sha256
+// digest as it writes (never buffering the whole blob), and returns that digest
+// and the byte count. It copies r to EOF; an empty r stores nothing and returns
+// a nil digest with n == 0. Used by chunker.SplitBody on the PUT path.
+type BlobWriter interface {
+	WriteBlob(ctx context.Context, r io.Reader) (digest mh.Multihash, n int64, err error)
+}
+
 // ReadStore is the read-only seam the s3frontend.Backend uses for
-// both CBOR-decoded reads (manifest, MST nodes) and raw block reads
-// (body chunks). Layered is the production implementation.
+// CBOR-decoded reads (manifest, MST nodes), raw block reads (small
+// catalog blocks), and streaming body-blob reads (OpenBlob). Layered
+// is the production implementation.
 type ReadStore interface {
 	Reader
 	BlockReader
+	BlobReader
 }
 
 // WriteStore is the write seam a body codec uses: CBOR-typed Put
