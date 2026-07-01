@@ -26,7 +26,7 @@ func (t *ObjectManifest) MarshalCBOR(w io.Writer) error {
 
 	cw := cbg.NewCborWriter(w)
 
-	if _, err := cw.Write([]byte{171}); err != nil {
+	if _, err := cw.Write([]byte{173}); err != nil {
 		return err
 	}
 
@@ -114,6 +114,29 @@ func (t *ObjectManifest) MarshalCBOR(w io.Writer) error {
 		}
 	}
 
+	// t.ChecksumAlgorithm (string) (string)
+	if len("ca") > 1000000 {
+		return xerrors.Errorf("Value in field \"ca\" was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("ca"))); err != nil {
+		return err
+	}
+	if _, err := cw.WriteString(string("ca")); err != nil {
+		return err
+	}
+
+	if len(t.ChecksumAlgorithm) > 1000000 {
+		return xerrors.Errorf("Value in field t.ChecksumAlgorithm was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len(t.ChecksumAlgorithm))); err != nil {
+		return err
+	}
+	if _, err := cw.WriteString(string(t.ChecksumAlgorithm)); err != nil {
+		return err
+	}
+
 	// t.CacheControl (string) (string)
 	if len("cc") > 1000000 {
 		return xerrors.Errorf("Value in field \"cc\" was too long")
@@ -180,6 +203,29 @@ func (t *ObjectManifest) MarshalCBOR(w io.Writer) error {
 		return err
 	}
 	if _, err := cw.WriteString(string(t.ContentEncoding)); err != nil {
+		return err
+	}
+
+	// t.Checksum (string) (string)
+	if len("ck") > 1000000 {
+		return xerrors.Errorf("Value in field \"ck\" was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("ck"))); err != nil {
+		return err
+	}
+	if _, err := cw.WriteString(string("ck")); err != nil {
+		return err
+	}
+
+	if len(t.Checksum) > 1000000 {
+		return xerrors.Errorf("Value in field t.Checksum was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len(t.Checksum))); err != nil {
+		return err
+	}
+	if _, err := cw.WriteString(string(t.Checksum)); err != nil {
 		return err
 	}
 
@@ -400,6 +446,17 @@ func (t *ObjectManifest) UnmarshalCBOR(r io.Reader) (err error) {
 
 				t.Created = int64(extraI)
 			}
+			// t.ChecksumAlgorithm (string) (string)
+		case "ca":
+
+			{
+				sval, err := cbg.ReadStringWithMax(cr, 1000000)
+				if err != nil {
+					return err
+				}
+
+				t.ChecksumAlgorithm = string(sval)
+			}
 			// t.CacheControl (string) (string)
 		case "cc":
 
@@ -432,6 +489,17 @@ func (t *ObjectManifest) UnmarshalCBOR(r io.Reader) (err error) {
 				}
 
 				t.ContentEncoding = string(sval)
+			}
+			// t.Checksum (string) (string)
+		case "ck":
+
+			{
+				sval, err := cbg.ReadStringWithMax(cr, 1000000)
+				if err != nil {
+					return err
+				}
+
+				t.Checksum = string(sval)
 			}
 			// t.ContentLanguage (string) (string)
 		case "cl":

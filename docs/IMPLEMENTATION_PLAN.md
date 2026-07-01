@@ -209,12 +209,39 @@ claim; dedup keeps a blob alive while any version references it; verified in-pro
 
 ### Phase 5 — S3 correctness surface
 
-- [ ] Conditional requests (read-time + re-checked under the MST critical section via a `Tx`
-      precondition callback); `x-amz-checksum-*` validate/echo; `DeleteObjects` (≤1000, best-effort,
-      Quiet); `CopyObject`/`UploadPartCopy` (metadata-only under dedup).
+**5a — Conditional requests** ✅ DONE (`24cd922`)
+- [x] GET/HEAD/PUT/DELETE evaluate `If-Match`/`If-None-Match`/`If-(Un)Modified-Since` via versitygw's
+      `backend.Evaluate*Preconditions` (same evaluators its posix backend uses). PUT checks once
+      before ingest (fail fast) and RE-CHECKS under the per-bucket lock at commit (race-safe).
+      `mapCommitError` surfaces a precondition error from inside a `WithTx` closure with its status
+      intact. Flipped: PutObject/conditional_writes, GetObject/conditional_reads,
+      DeleteObject/conditional_writes (HeadObject/conditional_reads now genuinely evaluated).
 
-Deliverable: correct 412/304, race-safe at commit; checksums validate+echo; batch delete + copy work;
-corresponding xfail smoke rows flip to pass.
+**5b — DeleteObjects (batch)** ✅ DONE (`f99d49b`)
+- [x] Best-effort batch delete ≤1000 keys via a shared `deleteObjectKey` helper (reusing the Phase-4
+      release path); Quiet mode; per-key Deleted/Error result. New `TestSmoke_DeleteObjects` (3 cases).
+
+**5c — CopyObject (metadata-only dedup)** ✅ DONE (`f99d49b`)
+- [x] Resolve source manifest → write a dest manifest pinning the SAME body digests + a reference
+      claim per digest (no bytes move, no upload). MetadataDirective COPY/REPLACE,
+      `x-amz-copy-source-if-*`, cross-bucket sources, copy-to-self rules. New `TestSmoke_CopyObject`
+      (13 cases); `TestSmokeXFail_CopyObject` holds 3 out-of-scope cases (Expires header not stored;
+      a posix-filesystem error that doesn't apply to ingot's flat keyspace). `UploadPartCopy` lands
+      with multipart (Phase 6).
+
+**5d — Checksums (`x-amz-checksum-*` validate/echo)** ✅ DONE (`a8c01f6`)
+- [x] `ObjectManifest` gains `ChecksumAlgorithm` + `Checksum` (base64), `cbor_gen` regenerated.
+      `PutObject` wraps the body with versitygw's `utils.HashReader` (computes + validates as it
+      streams; mismatch → the right BadDigest API error), stores it, and echoes it. GET/HEAD echo the
+      stored checksum under `ChecksumMode` (whole-object GET only). CopyObject carries it. Promoted 7
+      xfail rows (PutObject checksums_success/dir_object_checksums_success/incorrect_checksums/
+      invalid_credentials, GetObject checksums/dir_object_checksum, HeadObject checksums); verified
+      stable across repeated full-package runs (the versitygw integration suite has test-ordering
+      global state — always validate xfail flips in the full `./testing/` package run, not via `-run`).
+
+Deliverable: correct 412/304 race-safe at commit; checksums validate + echo; batch delete +
+metadata-only copy work; conditional + checksum xfail rows flipped, CopyObject/DeleteObjects coverage
+added. **Phase 5 complete.**
 
 ### Phase 6 — Multipart *(fast-follow)*
 
