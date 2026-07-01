@@ -6,23 +6,20 @@ import (
 	"time"
 
 	"go.uber.org/zap"
-
-	"github.com/fil-forge/ingot/blockstore"
 )
 
-// Config wires a Store (the two-plane coordinator) to its dependencies.
-// Defaults are applied by (*Config).defaults() before Open returns.
+// Config wires a Store (the catalog log) to its dependencies. Defaults are
+// applied by (*Config).defaults() before Open returns.
 type Config struct {
-	// Dir is the on-disk root for segment files. Each plane gets a
-	// subdirectory (<Dir>/data, <Dir>/catalog). Created if missing.
+	// Dir is the on-disk root for segment files. The catalog plane lives under
+	// <Dir>/catalog. Created if missing.
 	Dir string
 
 	// Meta is the persistence backing for segment metadata. Required.
 	Meta Meta
 
-	// Data / Catalog configure the two independent pipelines. Each plane
-	// seals, ships, and retains on its own — there is no shared seal.
-	Data    PlaneConfig
+	// Catalog configures the catalog pipeline (seal trigger, ship gate,
+	// retention).
 	Catalog PlaneConfig
 
 	// Logger is optional; defaults to zap.NewNop().
@@ -61,14 +58,6 @@ type PlaneConfig struct {
 // Forge. The segment is single-plane, so no plane argument is needed.
 type FlushFunc func(ctx context.Context, seg *Segment) error
 
-// plane returns the PlaneConfig for p.
-func (c *Config) plane(p blockstore.Plane) PlaneConfig {
-	if p == blockstore.PlaneData {
-		return c.Data
-	}
-	return c.Catalog
-}
-
 func (c *Config) validate() error {
 	if c.Dir == "" {
 		return errors.New("logstore: Dir is required")
@@ -76,17 +65,13 @@ func (c *Config) validate() error {
 	if c.Meta == nil {
 		return errors.New("logstore: Meta is required")
 	}
-	for _, p := range blockstore.Planes {
-		pc := c.plane(p)
-		if pc.Ship && pc.Flush == nil {
-			return errors.New("logstore: " + p.String() + " plane: Flush is required when Ship is true")
-		}
+	if c.Catalog.Ship && c.Catalog.Flush == nil {
+		return errors.New("logstore: catalog plane: Flush is required when Ship is true")
 	}
 	return nil
 }
 
 func (c *Config) defaults() {
-	c.Data = c.Data.withDefaults()
 	c.Catalog = c.Catalog.withDefaults()
 	if c.Logger == nil {
 		c.Logger = zap.NewNop()

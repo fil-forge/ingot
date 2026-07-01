@@ -15,15 +15,15 @@ import (
 	"github.com/fil-forge/ingot/blockstore"
 )
 
-// DefaultMaxBlobSize is the blob ceiling used when callers don't supply
-// one. 256 MiB matches Piri's current single-blob limit (MaxMemtreeSize);
-// objects larger than this are coarsely split into ≤ max blobs.
+// DefaultMaxBlobSize is the blob ceiling used when callers don't supply one.
+// 256 MiB matches Piri's current single-blob limit (MaxMemtreeSize); objects
+// larger than this are coarsely split into ≤ max blobs.
 const DefaultMaxBlobSize int64 = 256 << 20
 
 // rawBlockPrefix produces CIDs for body blobs: CIDv1, raw codec (0x55),
-// sha256 multihash. Blobs are opaque bytes — no IPLD links — so the raw
-// codec is the natural fit, and the multihash is exactly the digest Piri
-// stores the blob under.
+// sha256 multihash. Blobs are opaque bytes — no IPLD links — so the raw codec
+// is the natural fit, and the multihash is exactly the digest Piri stores the
+// blob under.
 var rawBlockPrefix = cid.Prefix{
 	Version:  1,
 	Codec:    cid.Raw,
@@ -31,51 +31,17 @@ var rawBlockPrefix = cid.Prefix{
 	MhLength: -1,
 }
 
-// BodyWriter splits the bytes from r into ordered, content-addressed
-// blobs (each ≤ max_blob_size), writes each blob to w as a raw block,
-// and returns a Body describing the ordered blob list plus the
-// whole-object size/sha256/md5.
+// SplitBody reads body bytes from r, splits them into blobs of at most
+// maxBlobSize bytes, writes each blob as a raw block to w, and returns a Body
+// whose Blobs list covers [0, Size) contiguously. sha256 and md5 are computed
+// over the whole body in a single streaming pass. A zero-byte body yields a Body
+// with no blobs (and the well-known empty digests).
 //
-// bucketop.Tx satisfies the blockstore.WriteStore argument.
-type BodyWriter interface {
-	Chunk(ctx context.Context, w blockstore.WriteStore, r io.Reader) (Body, error)
-}
-
-// BodyReader streams bytes back out of a Body by reading its blobs in
-// order. blockstore.Layered satisfies the blockstore.ReadStore argument.
-type BodyReader interface {
-	// Open returns a stream over the full body.
-	Open(ctx context.Context, bs blockstore.ReadStore, body Body) io.ReadCloser
-	// OpenRange returns a stream over [start, end] inclusive.
-	OpenRange(ctx context.Context, bs blockstore.ReadStore, body Body, start, end int64) io.ReadCloser
-}
-
-// BodyCodec is the canonical pair: a single concrete impl satisfies
-// both halves so a Body produced by Chunk can always be read back via
-// Open / OpenRange of the same codec instance.
-type BodyCodec interface {
-	BodyWriter
-	BodyReader
-}
-
-// BlobSplitter is the default codec: it coarsely splits a body into
-// raw blocks of at most MaxBlobSize bytes and records them as an ordered
-// BlobRef list in the Body. Implements BodyCodec.
-type BlobSplitter struct {
-	// MaxBlobSize is the blob ceiling in bytes. 0 → DefaultMaxBlobSize.
-	MaxBlobSize int64
-}
-
-// Compile-time assertion: BlobSplitter is the canonical BodyCodec.
-var _ BodyCodec = (*BlobSplitter)(nil)
-
-// Chunk reads body bytes from r, splits them into blobs of at most
-// MaxBlobSize bytes, writes each blob as a raw block, and returns a Body
-// whose Blobs list covers [0, Size) contiguously. sha256 and md5 are
-// computed over the whole body in a single streaming pass. A zero-byte
-// body yields a Body with no blobs (and the well-known empty digests).
-func (c *BlobSplitter) Chunk(ctx context.Context, w blockstore.WriteStore, r io.Reader) (Body, error) {
-	max := c.MaxBlobSize
+// w is the local spool in production (blockstore.Spool): the blobs are written
+// to disk before being uploaded to Forge by digest. SplitBody itself is
+// storage-agnostic — it only needs somewhere to put the raw blocks.
+func SplitBody(ctx context.Context, w blockstore.BlockWriter, r io.Reader, maxBlobSize int64) (Body, error) {
+	max := maxBlobSize
 	if max <= 0 {
 		max = DefaultMaxBlobSize
 	}
@@ -89,11 +55,10 @@ func (c *BlobSplitter) Chunk(ctx context.Context, w blockstore.WriteStore, r io.
 	var blobs []BlobRef
 	var total int64
 	for {
-		// CopyN grows buf only to the actual blob size, so a small object
-		// never allocates a full max-sized buffer. Each iteration uses a
-		// fresh buffer, so the block we hand to the staging store keeps its
-		// own backing array (reusing one buffer would corrupt earlier blobs,
-		// which the staging store holds by reference until commit).
+		// CopyN grows buf only to the actual blob size, so a small object never
+		// allocates a full max-sized buffer. Each iteration uses a fresh buffer,
+		// so the block we hand to the store keeps its own backing array (reusing
+		// one buffer would corrupt earlier blobs the store holds by reference).
 		var buf bytes.Buffer
 		n, err := io.CopyN(&buf, src, max)
 		if n > 0 {
@@ -123,14 +88,15 @@ func (c *BlobSplitter) Chunk(ctx context.Context, w blockstore.WriteStore, r io.
 	}, nil
 }
 
-// Open returns a reader over the full body.
-func (c *BlobSplitter) Open(ctx context.Context, bs blockstore.ReadStore, body Body) io.ReadCloser {
+// OpenBody returns a reader over the full body, fetching each blob from bs by
+// its digest in order.
+func OpenBody(ctx context.Context, bs blockstore.BlockReader, body Body) io.ReadCloser {
 	return &blobBodyReader{ctx: ctx, bs: bs, blobs: body.Blobs, pos: 0, end: body.Size - 1}
 }
 
-// OpenRange returns a reader over [start, end] inclusive of the body.
+// OpenBodyRange returns a reader over [start, end] inclusive of the body.
 // Caller must ensure 0 <= start <= end <= Size-1.
-func (c *BlobSplitter) OpenRange(ctx context.Context, bs blockstore.ReadStore, body Body, start, end int64) io.ReadCloser {
+func OpenBodyRange(ctx context.Context, bs blockstore.BlockReader, body Body, start, end int64) io.ReadCloser {
 	return &blobBodyReader{ctx: ctx, bs: bs, blobs: body.Blobs, pos: start, end: end}
 }
 
@@ -149,14 +115,13 @@ func putRawBlock(ctx context.Context, w blockstore.BlockWriter, data []byte) (ci
 	return c, nil
 }
 
-// blobBodyReader streams a Body's blobs lazily. It walks the ordered
-// BlobRef list, fetching the raw block for the blob that covers the
-// current position, and serves bytes from it until the inclusive end
-// position. Whole-body and ranged reads share the same loop — only the
-// initial pos and the end differ.
+// blobBodyReader streams a Body's blobs lazily. It walks the ordered BlobRef
+// list, fetching the raw block for the blob that covers the current position,
+// and serves bytes from it until the inclusive end position. Whole-body and
+// ranged reads share the same loop — only the initial pos and the end differ.
 type blobBodyReader struct {
 	ctx   context.Context
-	bs    blockstore.ReadStore
+	bs    blockstore.BlockReader
 	blobs []BlobRef
 
 	pos int64 // current absolute byte position (next byte to return)
@@ -211,8 +176,8 @@ func (br *blobBodyReader) Read(p []byte) (int, error) {
 
 func (br *blobBodyReader) Close() error { return nil }
 
-// blobAt returns the BlobRef whose [Offset, Offset+Length) span contains
-// pos. The list is ordered and contiguous, so a forward scan suffices.
+// blobAt returns the BlobRef whose [Offset, Offset+Length) span contains pos.
+// The list is ordered and contiguous, so a forward scan suffices.
 func blobAt(blobs []BlobRef, pos int64) (BlobRef, bool) {
 	for _, b := range blobs {
 		if pos >= b.Offset && pos < b.Offset+b.Length {

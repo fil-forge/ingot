@@ -44,11 +44,9 @@ type Config struct {
 	// Optional; defaults to DataDir.
 	TokenStoreDir string `mapstructure:"token_store_dir" yaml:"token_store_dir"`
 
-	// DataPlane / CatalogPlane override the per-plane logstore pipeline
-	// knobs. Any field left zero/unset falls back to the top-level
-	// SealBytes / SealAge / Retain (and Ship defaults to true). This is
-	// what lets, e.g., the catalog plane be configured never to ship.
-	DataPlane    PlaneSettings `mapstructure:"data_plane" yaml:"data_plane"`
+	// CatalogPlane overrides the catalog logstore pipeline knobs. Any field
+	// left zero/unset falls back to the top-level SealBytes / SealAge / Retain
+	// (and Ship defaults to true) — e.g. to configure the catalog never to ship.
 	CatalogPlane PlaneSettings `mapstructure:"catalog_plane" yaml:"catalog_plane"`
 }
 
@@ -84,10 +82,6 @@ func (c Config) readCacheBytes() int64 {
 // constructor-facing ServerConfig (used by the fx module and available to
 // non-fx callers that want the same defaults).
 func (c Config) ServerConfig() (ServerConfig, error) {
-	dataAge, err := planeSealAge(c.DataPlane.SealAge, c.SealAge)
-	if err != nil {
-		return ServerConfig{}, err
-	}
 	catAge, err := planeSealAge(c.CatalogPlane.SealAge, c.SealAge)
 	if err != nil {
 		return ServerConfig{}, err
@@ -100,14 +94,9 @@ func (c Config) ServerConfig() (ServerConfig, error) {
 		RootSecret:  c.RootSecret,
 		MaxBlobSize: c.MaxBlobSize,
 
-		// Per-plane: a per-plane override wins, else the top-level value,
-		// else the logstore default. Ship defaults to true unless a plane
-		// block sets `ship: false`.
-		SealBytesData: firstNonZero64(c.DataPlane.SealBytes, c.SealBytes),
-		SealAgeData:   dataAge,
-		ShipData:      shipDefault(c.DataPlane.Ship),
-		RetainData:    firstNonZeroInt(c.DataPlane.Retain, c.Retain),
-
+		// A per-plane override wins, else the top-level value, else the logstore
+		// default. Ship defaults to true unless the catalog block sets
+		// `ship: false`.
 		SealBytesCatalog: firstNonZero64(c.CatalogPlane.SealBytes, c.SealBytes),
 		SealAgeCatalog:   catAge,
 		ShipCatalog:      shipDefault(c.CatalogPlane.Ship),

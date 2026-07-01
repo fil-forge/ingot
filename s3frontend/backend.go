@@ -26,10 +26,10 @@ import (
 	"github.com/versity/versitygw/backend"
 
 	"github.com/fil-forge/ingot/blockstore"
-	msbucket "github.com/fil-forge/ingot/bucket"
 	"github.com/fil-forge/ingot/bucketop"
 	"github.com/fil-forge/ingot/logstore"
 	"github.com/fil-forge/ingot/registry"
+	"github.com/fil-forge/ingot/uploader"
 )
 
 // Backend implements versitygw's backend.Backend directly over the
@@ -39,25 +39,66 @@ import (
 type Backend struct {
 	backend.BackendUnsupported
 
-	read  blockstore.ReadStore
-	reg   registry.Registry
-	txns  *bucketop.Coordinator
-	codec msbucket.BodyCodec
+	read      blockstore.ReadStore
+	reg       registry.Registry
+	intents   registry.IntentStore
+	locations registry.LocationStore
+	txns      *bucketop.Coordinator
+	spool     *blockstore.Spool
+	uploader  uploader.BodyUploader
+
+	// space is the Forge space this instance owns; the key under which body
+	// blobs' locations (and, later, reference claims) are recorded. Empty in
+	// the in-memory harness, where reads are served from the spool.
+	space       string
+	maxBlobSize int64
+}
+
+// Deps wires a Backend over ingot's domain primitives.
+type Deps struct {
+	// Registry tracks per-bucket roots; IntentStore tracks the local spool's
+	// upload_intents lifecycle; LocationStore records where each accepted body
+	// blob can be retrieved from. Production passes one *registry.Postgres for
+	// all three; the harness one *inmem.MemStore.
+	Registry  registry.Registry
+	Intents   registry.IntentStore
+	Locations registry.LocationStore
+
+	// Reads is the layered read tier (spool → log → forge). Log is the catalog
+	// LSM write log driving the per-op staging buffer + commit.
+	Reads blockstore.ReadStore
+	Log   *logstore.Store
+
+	// Spool is the local blob store: SplitBody writes body blobs here on PUT,
+	// and they are served back from here on GET (read-after-write / cache).
+	Spool *blockstore.Spool
+
+	// Uploader makes each spooled body blob durable on Forge (allocate→PUT→
+	// accept) synchronously, before the manifest commits.
+	Uploader uploader.BodyUploader
+
+	// Space is the Forge space this instance owns (empty in the harness).
+	Space string
+
+	// MaxBlobSize is the coarse-split blob ceiling (0 → bucket default).
+	MaxBlobSize int64
 }
 
 // Compile-time assertion that Backend satisfies versitygw's interface.
 var _ backend.Backend = (*Backend)(nil)
 
 // New constructs a Backend wired over ingot's domain primitives.
-// rs is the layered read blockstore (log → forge); log is the
-// LSM-style write log; codec splits a body into blobs on PUT and
-// streams them back on GET — typically a *BlobSplitter.
-func New(reg registry.Registry, rs blockstore.ReadStore, log *logstore.Store, codec msbucket.BodyCodec) *Backend {
+func New(d Deps) *Backend {
 	return &Backend{
-		read:  rs,
-		reg:   reg,
-		txns:  bucketop.NewCoordinator(bucketop.Deps{Reg: reg, Log: log, Reads: rs}),
-		codec: codec,
+		read:        d.Reads,
+		reg:         d.Registry,
+		intents:     d.Intents,
+		locations:   d.Locations,
+		txns:        bucketop.NewCoordinator(bucketop.Deps{Reg: d.Registry, Log: d.Log, Reads: d.Reads}),
+		spool:       d.Spool,
+		uploader:    d.Uploader,
+		space:       d.Space,
+		maxBlobSize: d.MaxBlobSize,
 	}
 }
 

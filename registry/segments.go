@@ -68,19 +68,8 @@ func (r *Postgres) MarkSegmentSealed(ctx context.Context, plane blockstore.Plane
 }
 
 func (r *Postgres) MarkSegmentShipped(ctx context.Context, plane blockstore.Plane, seq uint64, shippedAt int64, opRoots []blockstore.OpRoot) error {
-	if plane == blockstore.PlaneData {
-		_, err := r.pool.Exec(ctx,
-			`UPDATE ingot.segments SET shipped_at = $2
-			 WHERE seq = $1 AND plane = 'data' AND shipped_at IS NULL`,
-			int64(seq), shippedAt)
-		if err != nil {
-			return fmt.Errorf("registry: mark data shipped %d: %w", seq, err)
-		}
-		return nil
-	}
-
-	// Catalog plane: stamp shipped_at AND advance forge_root_cid for every
-	// op-root in this segment, atomically.
+	// Only the catalog plane ships: stamp shipped_at AND advance forge_root_cid
+	// for every op-root in this segment, atomically.
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("registry: begin ship catalog %d: %w", seq, err)
@@ -103,16 +92,18 @@ func (r *Postgres) MarkSegmentShipped(ctx context.Context, plane blockstore.Plan
 	// order, and within a segment the slice order is commit order, so the
 	// last write for each bucket wins.
 	//
-	// TODO(frrist/ingot): the UPDATE below is unconditional on root_cid,
-	// which is incorrect when a writer's logstore.Commit succeeds but its
-	// subsequent registry.CASRoot fails. Gate on root_cid. Tracked
-	// separately.
+	// The advance is GUARDED on root_cid: forge_root_cid moves to opr.Root only
+	// if the bucket's committed root still equals opr.Root. This closes the
+	// orphan-root hole — a writer whose logstore.Commit landed an op-root but
+	// whose subsequent CASRoot failed (cross-process race) leaves a durable
+	// op-root the bucket never adopted; without the guard, shipping that
+	// segment would advance forge_root past the bucket's real root.
 	for _, opr := range opRoots {
 		if !opr.Root.Defined() {
 			continue
 		}
 		if _, err := tx.Exec(ctx,
-			`UPDATE ingot.buckets SET forge_root_cid = $1 WHERE name = $2`,
+			`UPDATE ingot.buckets SET forge_root_cid = $1 WHERE name = $2 AND root_cid = $1`,
 			opr.Root.Bytes(), opr.Bucket); err != nil {
 			return fmt.Errorf("registry: advance forge_root for %q: %w", opr.Bucket, err)
 		}

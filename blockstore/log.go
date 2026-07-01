@@ -30,35 +30,29 @@ type BlockLoc struct {
 	Length uint64
 }
 
-// Plane distinguishes the two block planes a segment splits into.
-// Each plane is its own CAR file with an independent ship/retain
-// lifecycle:
+// Plane identifies a segment's block plane. The log is now a single-plane
+// pipeline: object bodies are spooled and uploaded per-blob (see Spool), so the
+// only journaled plane is the catalog.
 //
-//   - PlaneData: the data plane — raw-codec object-body chunks. The
-//     actual bytes a client GETs.
-//   - PlaneCatalog: the control plane — the dag-cbor MST nodes,
-//     ObjectManifests, and chunk indexes that describe where the body
-//     bytes live and how to reconstruct an object.
+//   - PlaneCatalog: the dag-cbor MST nodes and ObjectManifests that describe a
+//     bucket's namespace and how to reconstruct each object.
 //
-// Block classification is by CID codec: cid.Raw → PlaneData, anything
-// else (dag-cbor) → PlaneCatalog. See OpStaging.Put.
+// The Plane type and its parameter on the Meta/uploader seams are retained so
+// segment metadata stays self-describing and a second plane could be
+// reintroduced without reshaping those interfaces.
 type Plane int
 
 const (
-	// PlaneData is the object-body (raw chunk) plane.
-	PlaneData Plane = iota
-	// PlaneCatalog is the MST/manifest/index (dag-cbor) plane.
-	PlaneCatalog
+	// PlaneCatalog is the MST/manifest (dag-cbor) plane.
+	PlaneCatalog Plane = iota
 )
 
-// Planes is the canonical iteration order over the two planes.
-var Planes = [...]Plane{PlaneData, PlaneCatalog}
+// Planes is the canonical iteration order over the planes.
+var Planes = [...]Plane{PlaneCatalog}
 
 // String renders a Plane for logs and filenames.
 func (p Plane) String() string {
 	switch p {
-	case PlaneData:
-		return "data"
 	case PlaneCatalog:
 		return "catalog"
 	default:
@@ -84,15 +78,15 @@ func (p Plane) String() string {
 // when no local segment holds the requested CID. Close drains
 // the flush pipeline at process shutdown.
 //
-// AppendBatch takes the batch split by plane: dataBlocks (raw chunks)
-// land in the segment's data CAR, catalogBlocks (dag-cbor) in its
-// catalog CAR. Both CARs plus the op-root record are fsynced before
-// AppendBatch returns, so a successful append is durable across both
-// planes before the bucket Root is allowed to advance.
+// AppendBatch fsyncs one S3 op's catalog blocks (dag-cbor MST nodes +
+// ObjectManifest) plus the op-root record into the open segment before
+// returning, so a successful append is locally durable before the bucket Root
+// is allowed to advance. Object-body blobs do not flow through the log — they
+// are spooled and uploaded per-blob (see Spool) before the manifest commits.
 //
 // Implemented by *logstore.Store.
 type Log interface {
-	AppendBatch(ctx context.Context, dataBlocks, catalogBlocks []block.Block, opRoot OpRoot) error
+	AppendBatch(ctx context.Context, catalogBlocks []block.Block, opRoot OpRoot) error
 	Get(ctx context.Context, c cid.Cid) (block.Block, error)
 	Close(ctx context.Context) error
 }

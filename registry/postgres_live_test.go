@@ -6,12 +6,24 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ipfs/go-cid"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/multiformats/go-multihash"
 	"go.uber.org/zap/zaptest"
 
+	"github.com/fil-forge/ingot/blockstore"
 	"github.com/fil-forge/ingot/migrations"
 	"github.com/fil-forge/ingot/registry"
 )
+
+func liveCid(t *testing.T, s string) cid.Cid {
+	t.Helper()
+	mh, err := multihash.Sum([]byte(s), multihash.SHA2_256, -1)
+	if err != nil {
+		t.Fatalf("multihash: %v", err)
+	}
+	return cid.NewCidV1(cid.DagCBOR, mh)
+}
 
 // TestPostgresStores_Live exercises the SQL-backed store methods against a
 // real Postgres (jsonb, bytea[], ON CONFLICT, the latch's RowsAffected
@@ -181,6 +193,37 @@ func TestPostgresStores_Live(t *testing.T) {
 		}
 		if err := r.AddGCCandidate(ctx, digest, "b"); err != nil {
 			t.Fatalf("AddGCCandidate (dup): %v", err)
+		}
+	})
+
+	t.Run("forge_root advance guarded on root", func(t *testing.T) {
+		committed := liveCid(t, "fg-committed")
+		stale := liveCid(t, "fg-stale")
+		if err := r.Create(ctx, "fg", time.Now().Unix()); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		if err := r.CASRoot(ctx, "fg", cid.Undef, committed); err != nil {
+			t.Fatalf("CASRoot: %v", err)
+		}
+		seq, err := r.NextSegmentSeq(ctx)
+		if err != nil {
+			t.Fatalf("NextSegmentSeq: %v", err)
+		}
+		if err := r.InsertSegmentOpen(ctx, blockstore.PlaneCatalog, seq); err != nil {
+			t.Fatalf("InsertSegmentOpen: %v", err)
+		}
+		// Ship a segment whose op-roots include a stale root the bucket never
+		// adopted; only the committed root may advance forge_root.
+		if err := r.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seq, time.Now().Unix(),
+			[]blockstore.OpRoot{{Bucket: "fg", Root: stale}, {Bucket: "fg", Root: committed}}); err != nil {
+			t.Fatalf("MarkSegmentShipped: %v", err)
+		}
+		st, err := r.Get(ctx, "fg")
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		if !st.ForgeRoot.Equals(committed) {
+			t.Fatalf("forge_root = %v, want committed root (stale op-root must be skipped)", st.ForgeRoot)
 		}
 	})
 }

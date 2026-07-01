@@ -118,22 +118,66 @@ still green — no production path calls the new methods yet.
 > Phase 3, when the space DID reaches the write path. `blob_refs.space` is supplied explicitly by
 > callers, so it does not depend on `buckets.space` being populated.
 
-### Phase 3 — Data-plane inversion *(the hard shift)*
+### Phase 3 — Data-plane inversion *(the hard shift, sub-stepped)*
 
-- [ ] Spool (`$DataDir/spool/<digest>`, global-by-digest, backed by `upload_intents`).
-- [ ] Body uploader seam: `uploader.Forge` decomposed from `BlobAdd` into per-blob
-      `allocate → PUT (skip on dedup) → conclude → accept`; write the `blob_locations` row at accept;
-      `inmem.NopUploader` fakes allocate/accept in-memory so reads work.
-- [ ] `OpStaging` becomes catalog-only; **delete the data `PlaneLog`**; `logstore.Open` builds one
-      (catalog) pipeline; data-plane recovery removed; add `upload_intents`-driven recovery.
-- [ ] Read path: spool → cache → `Locator.Locate(space,digest)` (local-table impl) → ranged Piri GET,
-      iterating `Body.Blobs`; catalog reads unchanged.
-- [ ] Commit ordering: blobs accepted before catalog `AppendBatch` + guarded root swap; guarded swap
-      before op-root durability.
+**3a — Spool + body-uploader seams** ✅ DONE (`4aee491`)
+- [x] `blockstore/spool.go`: `Spool` — local on-disk blob store keyed by digest (atomic
+      write+rename), a `BlockReader`+`BlockWriter`. Pure file I/O (blockstore can't import registry —
+      registry imports blockstore — so the `upload_intents` lifecycle is owned by `s3frontend`).
+- [x] `uploader/blob.go`: `BodyUploader` seam + `Forge.UploadBlob` (reuses `forgeclient.BlobAdd`,
+      which already drives allocate→PUT→accept for single-shot). `inmem.NopUploader` gains a no-op.
+- [x] Deleted the `BodyCodec` seam → `bucket.SplitBody`/`OpenBody`/`OpenBodyRange` package funcs.
 
-Deliverable: PUT spools + uploads each blob synchronously, commits a catalog-only manifest, returns
-200 only after accept; GET reconstructs across blobs; zero-byte stores no blob. Data PlaneLog gone;
-catalog plane still ships in the background. Full in-memory smoke suite green.
+**3b — Rewire write/read path; data PlaneLog goes dormant** ✅ DONE (`4aee491`)
+- [x] `s3frontend.PutObject` is two-phase: off-lock ingest (split → spool → record `upload_intents`
+      → upload each blob → mark accepted), then a short manifest-only commit. 200 ⇒ all blobs
+      durable+accepted before commit.
+- [x] `blockstore/layered.go`: read path is `spool → log → base`. Bodies resolve from the spool
+      (read-after-write/cache); catalog blocks miss the spool and resolve from the log.
+- [x] Wiring: `ServerDeps`/`serverParams`/module/harness gain `Intents` + `BodyUploader`.
+- [x] Proven green: a new assertion confirms bodies are spooled by digest (and dedup'd), not logged.
+      The data `PlaneLog` still exists but is dormant (no raw blocks reach it).
+
+**3c — Delete the dead data PlaneLog** ✅ DONE
+- [x] `logstore.Store` collapsed to one catalog `PlaneLog`; `Config.Data` / `ServerConfig.*Data` /
+      `Config.DataPlane` knobs removed; `Log.AppendBatch(dataBlocks, …)` → catalog-only
+      `AppendBatch(catalogBlocks, opRoot)`; `OpStaging` dropped the raw/cbor split (`isDataBlock`,
+      `dataOrder`); `PlaneData` retired from the enum / `Planes`; `registry.MarkSegmentShipped`'s dead
+      data branch removed. `logstore/store_test.go` reworked to single-plane (the two
+      plane-independence tests removed, a `TestCatalogNeverShips` kept for standalone mode).
+- [x] **Fixed a latent 3b bug:** `cmd/serve.go`'s `standaloneApp` was missing the `IntentStore` +
+      `BodyUploader` providers (a build can't catch a missing fx provider). Added them + a
+      `TestStandaloneApp_GraphValidates` guard (verified it fails when a provider is dropped).
+
+**3d — Real forge location glue + commit-ordering fix** *(forge-mode behavior validated in smelt at Phase 7)*
+
+**3d-1 — Conditional `forge_root_cid` advance (orphan-root fix)** ✅ DONE
+- [x] `registry.MarkSegmentShipped` (Postgres + inmem) advances `forge_root_cid` to an op-root only
+      `WHERE root_cid = $root` — a durable op-root the bucket never adopted (lost CASRoot race) no
+      longer advances `forge_root` past the real root. Unit-tested (inmem) + live-tested (Postgres).
+
+**3d-2 — Record `blob_locations` on upload** ✅ DONE *(build + harness green; URL/provider validated in smelt)*
+- [x] `Forge.UploadBlob` parses the accept commitment (`added.Location`, an `/assert/location`
+      invocation) for the provider DID + retrieval URL (same decode the index locator uses).
+- [x] `s3frontend.ingestBody` records `blob_locations{space,digest,provider,url,size}` per accepted
+      blob. Backend gains `Space` + `LocationStore`; wired through `ServerDeps`/fx (`ServerSpace`,
+      optional so standalone/harness default to "")/harness/standalone.
+
+**3d-3 — Local-table `Locator` read tier** ⏳ DEFERRED to Phase 7 *(forge-mode read; needs live validation)*
+- [ ] A `LocationStore`-backed `locator.Locator` (local-first, indexer fall-through for catalog
+      blocks) so forge-mode body reads resolve from `blob_locations`. Deferred because: it is not
+      harness-testable (the spool serves all in-process reads), it is only exercised **after** spool
+      eviction (not yet built), and the body-vs-catalog base-reader split + the `blockstore`↛`registry`
+      cycle-avoiding package placement are best designed against the live smelt stack. The location
+      **data** is already recorded (3d-2); Phase 7 wires the **consumer** and validates end-to-end.
+
+> **Validate 3d in smelt at Phase 7:** real `UploadBlob` location parsing, the `blob_locations`
+> contents, and the 3d-3 read tier are all forge-mode paths the in-process harness can't exercise —
+> confirm them against the live sprue+piri+indexer round-trip when Phase 7's e2e lands.
+
+Deliverable (3a–3b, done): PUT spools + uploads each blob synchronously, commits a catalog-only
+manifest, returns 200 only after accept; GET reconstructs across blobs; zero-byte stores no blob;
+full in-memory smoke suite green.
 
 ### Phase 4 — Reference index / delete
 
