@@ -79,9 +79,9 @@ func (e *Encrypt) EncStructure(externalAAD []byte) ([]byte, error) {
 //
 //	Enc_structure = [ context, protected : bstr, external_aad : bstr ]
 //
-// It is the builder shared by [Encrypt.EncStructure] (context "Encrypt") and
-// [Encrypt0.EncStructure] (context "Encrypt0"). A nil externalAAD encodes as an
-// empty byte string.
+// encStructureBytes is the builder shared by [Encrypt.EncStructure] (context
+// "Encrypt") and [Encrypt0.EncStructure] (context "Encrypt0"). A nil externalAAD
+// encodes as an empty byte string.
 func encStructureBytes(context string, protected, externalAAD []byte) ([]byte, error) {
 	out, err := encMode.Marshal([]any{context, bstr(protected), bstr(externalAAD)})
 	if err != nil {
