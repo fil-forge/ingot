@@ -52,7 +52,6 @@ import (
 	indexcmds "github.com/fil-forge/libforge/commands/index"
 	"github.com/fil-forge/libforge/receipt"
 	"github.com/fil-forge/ucantone/did"
-	"github.com/fil-forge/ucantone/principal"
 	"github.com/fil-forge/ucantone/ucan"
 	"github.com/fil-forge/ucantone/ucan/delegation"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -68,11 +67,12 @@ import (
 	"github.com/fil-forge/ingot/uploader"
 )
 
-// ServiceIdentity carries the host's upload-service signer into the module. It
-// is a named wrapper rather than a bare ucan.Signer so it can't be confused
-// with any other signer the host has in its fx graph.
+// ServiceIdentity carries the host's upload-service agent into the module. It
+// is a named wrapper rather than a bare ucan.Issuer so it can't be confused
+// with any other issuer the host has in its fx graph. The agent is a
+// [ucan.Issuer] (a signer tied to a DID): it issues every invocation to sprue.
 type ServiceIdentity struct {
-	Signer ucan.Signer
+	Signer ucan.Issuer
 }
 
 // PreStartHook runs once during the server's OnStart, before the listener is
@@ -253,13 +253,14 @@ type tokenSeedHookOut struct {
 // the seed is skipped once any chain exists.
 func provideTokenSeedHook(space spaceSigner, id ServiceIdentity, store tokenstore.Store, logger *zap.Logger) tokenSeedHookOut {
 	return tokenSeedHookOut{Hook: func(ctx context.Context) error {
-		return seedSpaceDelegations(ctx, space.Signer, id.Signer.DID(), store, logger)
+		return seedSpaceDelegations(ctx, space.Issuer, id.Signer.DID(), store, logger)
 	}}
 }
 
 // spaceSigner is an internal wrapper around the persisted space key so it is a
-// distinct type in the fx graph from the host-provided ServiceIdentity.
-type spaceSigner struct{ principal.Signer }
+// distinct type in the fx graph from the host-provided ServiceIdentity. The
+// space is a [ucan.Issuer] (its did:key is the root authority over the space).
+type spaceSigner struct{ ucan.Issuer }
 
 // provideSpaceSigner loads or creates the space key under cfg.DataDir. ingot IS
 // the space owner (root UCAN authority); the key is generated on first run and
@@ -277,7 +278,7 @@ func provideSpaceSigner(cfg Config, logger *zap.Logger) (spaceSigner, error) {
 		zap.String("space_did", s.DID().String()),
 		zap.String("key_file", keyPath),
 	)
-	return spaceSigner{Signer: s}, nil
+	return spaceSigner{Issuer: s}, nil
 }
 
 // registryResult exposes the one *registry.Postgres as both collaborator
@@ -343,7 +344,7 @@ func provideForgeReader(cfg Config, id ServiceIdentity, space spaceSigner, locat
 		Locator:     registry.NewLocalLocator(locations),
 		Spaces:      []did.DID{space.DID()},
 		Signer:      id.Signer,
-		SpaceSigner: space.Signer,
+		SpaceSigner: space.Issuer,
 		Logger:      logger,
 	})
 	if err != nil {
@@ -381,7 +382,7 @@ func provideUploader(c *forgeclient.Client, space spaceSigner, logger *zap.Logge
 // seedSpaceDelegations self-issues no-expiry space→agent delegations for
 // the capabilities the edge client invokes, unless the store already
 // holds a /blob/add chain for the agent (idempotent across restarts).
-func seedSpaceDelegations(ctx context.Context, spaceSigner ucan.Signer, agent did.DID, store tokenstore.Store, logger *zap.Logger) error {
+func seedSpaceDelegations(ctx context.Context, spaceSigner ucan.Issuer, agent did.DID, store tokenstore.Store, logger *zap.Logger) error {
 	space := spaceSigner.DID()
 	// Sentinel on /blob/allocate: it is the cap the upload service re-invokes
 	// against piri on the space's behalf, so a store missing it cannot ship.

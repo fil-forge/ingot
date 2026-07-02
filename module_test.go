@@ -3,7 +3,7 @@ package ingot_test
 import (
 	"testing"
 
-	"github.com/fil-forge/ucantone/principal/ed25519"
+	"github.com/fil-forge/ucantone/multikey/ed25519"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/fx"
 	"go.uber.org/zap"
@@ -18,7 +18,7 @@ import (
 // The module itself provides the token store, the sprue edge-client, and the
 // per-plane uploader.
 func TestModuleValidate_Enabled(t *testing.T) {
-	signer, err := ed25519.Generate()
+	signer, err := ed25519.GenerateIssuer()
 	if err != nil {
 		t.Fatalf("generate signer: %v", err)
 	}

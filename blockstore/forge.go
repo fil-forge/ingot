@@ -41,8 +41,8 @@ var ErrNotFound = errors.New("blockstore: not found")
 // location commitment), which resets on process restart.
 type Forge struct {
 	locator     locator.Locator
-	signer      ucan.Signer // service identity (issuer of /content/retrieve invocations)
-	spaceSigner ucan.Signer // space root authority (self-issues retrieval delegations)
+	signer      ucan.Issuer // service identity (issuer of /content/retrieve invocations)
+	spaceSigner ucan.Issuer // space root authority (self-issues retrieval delegations)
 	spaces      []did.DID
 	httpClient  *http.Client
 	logger      *zap.Logger
@@ -67,10 +67,10 @@ type ForgeConfig struct {
 	// Spaces scopes the locator queries; for ingot this is the single space it owns.
 	Spaces []did.DID
 	// Signer is the upload-service identity; issuer of /content/retrieve invocations.
-	Signer ucan.Signer
+	Signer ucan.Issuer
 	// SpaceSigner is the keypair of the space ingot owns; root authority for the
 	// self-issued space -> service /content/retrieve delegations.
-	SpaceSigner ucan.Signer
+	SpaceSigner ucan.Issuer
 	// HTTPClient is used for indexer queries and piri retrievals. Optional;
 	// defaults to http.DefaultClient.
 	HTTPClient *http.Client
@@ -251,7 +251,7 @@ func (f *Forge) OpenBlob(ctx context.Context, digest mh.Multihash) (io.ReadClose
 // calls before each indexer query. The space signer (root authority) directly
 // authorizes the indexer to retrieve any blob in the space — the proof chain is
 // one hop (space -> indexer) because ingot's "user" is itself.
-func newAuthorizeRetrieval(spaceSigner ucan.Signer, indexerDID did.DID) locator.AuthorizeRetrievalFunc {
+func newAuthorizeRetrieval(spaceSigner ucan.Issuer, indexerDID did.DID) locator.AuthorizeRetrievalFunc {
 	return func(ctx context.Context, spaces []did.DID) ([]ucan.Delegation, error) {
 		dlgs := make([]ucan.Delegation, 0, len(spaces))
 		for _, space := range spaces {

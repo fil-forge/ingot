@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"net/url"
 
-	"github.com/fil-forge/libforge/didmailto"
+	"github.com/fil-forge/libforge/attestation/didmailto"
 	"github.com/fil-forge/ucantone/did"
 	"github.com/spf13/cobra"
 

@@ -15,7 +15,7 @@ import (
 	"github.com/fil-forge/ingot"
 	"github.com/fil-forge/ingot/forgeclient"
 	"github.com/fil-forge/ingot/tokenstore"
-	"github.com/fil-forge/libforge/didmailto"
+	"github.com/fil-forge/libforge/attestation/didmailto"
 	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/ucantone/ucan"
 	"github.com/fil-forge/ucantone/ucan/command"
@@ -202,7 +202,7 @@ func parseAccount(input string) (did.DID, error) {
 // grant mirrors guppy's space-grant: it issues no-expiry space→agent and
 // space→account Top delegations, stores both locally so the agent can act, then
 // registers the account's grant with sprue via /access/delegate.
-func grant(ctx context.Context, c *forgeclient.Client, space ucan.Signer, account did.DID, name string) error {
+func grant(ctx context.Context, c *forgeclient.Client, space ucan.Issuer, account did.DID, name string) error {
 	opts := []delegation.Option{delegation.WithNoExpiration()}
 	if name != "" {
 		opts = append(opts, delegation.WithMetadata(forgeclient.SpaceNameMetadata(name)))
