@@ -331,9 +331,9 @@ func TestLocations_PartialFEE_Rejected(t *testing.T) {
 	base := registry.BlobLocation{Space: "s", Digest: []byte("d"), Provider: "did:piri", URL: "u", Size: 10}
 
 	partials := map[string]func(*registry.BlobLocation){
-		"only wrapped CEK":  func(l *registry.BlobLocation) { l.RegionWrappedCEK = []byte("cek") },
-		"only key version":  func(l *registry.BlobLocation) { l.RegionKeyVersion = "v1" },
-		"only chunk size":   func(l *registry.BlobLocation) { l.ChunkSize = 4096 },
+		"only wrapped CEK": func(l *registry.BlobLocation) { l.RegionWrappedCEK = []byte("cek") },
+		"only key version": func(l *registry.BlobLocation) { l.RegionKeyVersion = "v1" },
+		"only chunk size":  func(l *registry.BlobLocation) { l.ChunkSize = 4096 },
 		"missing protected": func(l *registry.BlobLocation) {
 			l.RegionWrappedCEK, l.RegionKeyVersion, l.TenantRecipientKID = []byte("cek"), "v1", "kid"
 			l.BaseNonce, l.ChunkSize = []byte("nonce07"), 4096 // ProtectedHeader left empty
