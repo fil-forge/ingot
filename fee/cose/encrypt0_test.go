@@ -34,7 +34,7 @@ func sampleEncrypt0() *Encrypt0 {
 //	[ "Encrypt0", protected : bstr, external_aad : bstr ]
 func expectedEncStructure0(protected, externalAAD []byte) []byte {
 	out := []byte{0x83} // array(3)
-	out = append(out, cborText(ContextEncrypt0)...)
+	out = append(out, cborText(contextEncrypt0)...)
 	out = append(out, cborBstr(protected)...)
 	out = append(out, cborBstr(externalAAD)...)
 	return out
