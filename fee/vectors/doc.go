@@ -5,8 +5,11 @@
 // foc-encryption (github.com/Kubuxu/foc-encryption-demo, packages/
 // foc-encryption), pinned in pull-foc-encryption.sh.
 //
-// The reference is the source of truth for the wire format. Its shape, verified
-// against the pinned commit, is:
+// The reference is the source of truth for the wire format. It is pinned (see
+// pull-foc-encryption.sh) to the head of foc-encryption-demo PR #2 — the fix
+// that makes the body AAD context follow the envelope structure per RFC 9052
+// §5.3 — rather than master, which still seals tag-96 bodies under "Encrypt0".
+// The shape, verified against the pinned commit, is:
 //
 //	blob        = envelope || ciphertext          (detached payload)
 //	envelope    = 16([protected, unprotected, null])                for no recipients
@@ -14,8 +17,8 @@
 //	protected   = {1: alg, 16: "application/vnd.foc-envelope+cose"}
 //	unprotected = {5: baseNonce, -65790: chunkSize, -65791: chunkCount}
 //	alg         = -65793  (chunked AES-256-GCM-STREAM)
-//	body AAD    = [ "Encrypt0", protected, "" ]   -- always the Encrypt0
-//	              context, even for a tag-96 multi-recipient envelope
+//	body AAD    = [ context, protected, "" ]      context per RFC 9052 §5.3:
+//	              "Encrypt" for a tag-96 envelope, "Encrypt0" for tag-16
 //	chunk nonce = baseNonce[7] || chunkIndex[4 BE] || lastFlag[1]
 //
 // A recipient entry is [ {1: alg}, {4: kid, ...}, wrappedKey ]. The reference

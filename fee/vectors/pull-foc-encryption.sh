@@ -4,8 +4,8 @@
 # implementation and (re)generate + verify the FEE cross-implementation
 # fixtures against it.
 #
-# The reference is github.com/Kubuxu/foc-encryption-demo, packages/
-# foc-encryption, pinned to a fixed commit for reproducibility. The vendored
+# The reference is github.com/Kubuxu/foc-encryption-demo, packages/foc-encryption,
+# pinned to a fixed commit (see REF_SHA below) for reproducibility. The vendored
 # source is written under ts/vendor/ (gitignored) and never committed; only this
 # script, the ts/ driver, and the generated testdata/ fixtures are.
 #
@@ -18,7 +18,11 @@
 set -euo pipefail
 
 REF_REPO="https://github.com/Kubuxu/foc-encryption-demo"
-REF_SHA="f0eac6ea1f54bd9100c9d328f39e7509b5bcfdf4"   # pinned for reproducibility
+# Pinned to the head of PR #2 (the RFC 9052 §5.3 Encrypt-context fix), NOT master:
+# master still seals tag-96 (multi-recipient) bodies under the buggy "Encrypt0"
+# context. Re-pin to the merge commit once the PR lands upstream.
+REF_SHA="158571aed08239d6b08b41d390d8ff9d915fd145"   # foc-encryption-demo PR #2 head
+REF_FETCH="refs/pull/2/head"                          # ref that reaches REF_SHA
 PKG_SUBDIR="packages/foc-encryption"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -45,6 +49,7 @@ fetch_via_git() {
   local tmp
   tmp="$(mktemp -d)"
   if git clone --quiet "$REF_REPO" "$tmp" 2>/dev/null &&
+    git -C "$tmp" fetch --quiet origin "$REF_FETCH" 2>/dev/null &&
     git -C "$tmp" checkout --quiet "$REF_SHA" 2>/dev/null; then
     rm -rf "$VENDOR"
     mkdir -p "$VENDOR"
