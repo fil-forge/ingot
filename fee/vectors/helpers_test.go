@@ -98,7 +98,14 @@ func composeFEE(plaintext, cek, baseNonce []byte, chunkSize int, recipients []*c
 	if err != nil {
 		return nil, 0, fmt.Errorf("protected bytes: %w", err)
 	}
-	aad, err := cose.EncStructureBytes(cose.ContextEncrypt0, protBytes, nil)
+	// The body AAD context follows the envelope structure (RFC 9052 §5.3),
+	// matching the fixed reference (foc-encryption PR #2): "Encrypt" for a
+	// tag-96 multi-recipient envelope, "Encrypt0" for a tag-16 envelope.
+	ctx := cose.ContextEncrypt0
+	if len(recipients) > 0 {
+		ctx = cose.ContextEncrypt
+	}
+	aad, err := cose.EncStructureBytes(ctx, protBytes, nil)
 	if err != nil {
 		return nil, 0, fmt.Errorf("enc_structure: %w", err)
 	}
@@ -245,7 +252,12 @@ func decryptFEE(blob, cek []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	aad, err := cose.EncStructureBytes(cose.ContextEncrypt0, p.headers.RawProtected, nil)
+	// Context follows the envelope structure, as on the encrypt side.
+	ctx := cose.ContextEncrypt0
+	if p.tag == cose.TagCOSEEncrypt {
+		ctx = cose.ContextEncrypt
+	}
+	aad, err := cose.EncStructureBytes(ctx, p.headers.RawProtected, nil)
 	if err != nil {
 		return nil, fmt.Errorf("enc_structure: %w", err)
 	}
