@@ -9,6 +9,8 @@ import (
 	"os"
 
 	"github.com/spf13/cobra"
+
+	"github.com/fil-forge/ingot/internal/build"
 )
 
 // cfgFile is bound to the persistent --config flag.
@@ -18,6 +20,7 @@ func newRootCmd() *cobra.Command {
 	root := &cobra.Command{
 		Use:           "ingot",
 		Short:         "ingot — an embeddable S3 gateway over the Forge network",
+		Version:       build.Version,
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
@@ -28,6 +31,7 @@ func newRootCmd() *cobra.Command {
 		newSpaceCmd(),
 		newLoginCmd(),
 		newWhoamiCmd(),
+		newVersionCmd(),
 	)
 	return root
 }

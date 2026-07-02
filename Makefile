@@ -13,9 +13,9 @@ GO ?= go
 
 .PHONY: build test gen clean help
 
-## build: compile all packages
+## build: compile the daemon binary (-> ./ingot)
 build:
-	$(GO) build ./...
+	$(GO) build -o ingot ./cmd/ingot
 
 ## test: run the full test suite (uncached)
 test:
