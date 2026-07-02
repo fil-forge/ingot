@@ -3,6 +3,7 @@ package registry_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"testing"
 	"time"
@@ -191,6 +192,21 @@ func TestPostgresStores_Live(t *testing.T) {
 		}
 		if err := r.DeleteLocation(ctx, "s", encDigest); err != nil {
 			t.Fatalf("DeleteLocation: %v", err)
+		}
+	})
+
+	t.Run("location partial FEE rejected", func(t *testing.T) {
+		// A partial wrap set is rejected before it reaches SQL and leaves no row.
+		d := []byte{0x77}
+		partial := registry.BlobLocation{
+			Space: "s", Digest: d, Provider: "did:piri", URL: "u", Size: 10,
+			RegionWrappedCEK: []byte{0x01}, // the rest deliberately absent
+		}
+		if err := r.PutLocation(ctx, partial); !errors.Is(err, registry.ErrPartialFEE) {
+			t.Fatalf("PutLocation(partial) = %v, want ErrPartialFEE", err)
+		}
+		if _, err := r.GetLocation(ctx, "s", d); !errors.Is(err, registry.ErrNotFound) {
+			t.Fatalf("partial FEE leaked a row: %v", err)
 		}
 	})
 

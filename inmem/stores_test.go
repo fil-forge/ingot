@@ -2,6 +2,7 @@ package inmem
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -318,6 +319,41 @@ func TestLocations_FEEWrapMaterial(t *testing.T) {
 	}
 	if after.URL != "http://piri/enc" || string(after.BaseNonce) != "nonce07" || after.ChunkSize != 65536 {
 		t.Fatalf("re-wrap disturbed non-wrap fields: %+v", after)
+	}
+}
+
+// TestLocations_PartialFEE_Rejected verifies the all-or-nothing FEE invariant:
+// a location with some but not all wrap material is rejected with ErrPartialFEE
+// and never persisted, while a fully-absent (unencrypted) row is accepted.
+func TestLocations_PartialFEE_Rejected(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+	base := registry.BlobLocation{Space: "s", Digest: []byte("d"), Provider: "did:piri", URL: "u", Size: 10}
+
+	partials := map[string]func(*registry.BlobLocation){
+		"only wrapped CEK":  func(l *registry.BlobLocation) { l.RegionWrappedCEK = []byte("cek") },
+		"only key version":  func(l *registry.BlobLocation) { l.RegionKeyVersion = "v1" },
+		"only chunk size":   func(l *registry.BlobLocation) { l.ChunkSize = 4096 },
+		"missing protected": func(l *registry.BlobLocation) {
+			l.RegionWrappedCEK, l.RegionKeyVersion, l.TenantRecipientKID = []byte("cek"), "v1", "kid"
+			l.BaseNonce, l.ChunkSize = []byte("nonce07"), 4096 // ProtectedHeader left empty
+		},
+	}
+	for name, mutate := range partials {
+		loc := base
+		mutate(&loc)
+		if err := m.PutLocation(ctx, loc); !errors.Is(err, registry.ErrPartialFEE) {
+			t.Fatalf("PutLocation(%s) err = %v, want ErrPartialFEE", name, err)
+		}
+		// Nothing should have been stored.
+		if _, err := m.GetLocation(ctx, "s", []byte("d")); !errors.Is(err, registry.ErrNotFound) {
+			t.Fatalf("partial FEE (%s) leaked a row", name)
+		}
+	}
+
+	// Fully absent (unencrypted) is accepted.
+	if err := m.PutLocation(ctx, base); err != nil {
+		t.Fatalf("PutLocation(unencrypted): %v", err)
 	}
 }
 

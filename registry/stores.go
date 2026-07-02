@@ -1,6 +1,10 @@
 package registry
 
-import "context"
+import (
+	"context"
+	"errors"
+	"fmt"
+)
 
 // This file defines the relational surface the upload/storage/delete
 // architecture relies on (docs/architecture.md §5–§7, Appendix C):
@@ -67,10 +71,12 @@ type UploadIntent struct {
 // inputs a (range) GET's aesstream decryptor needs, so a read unwraps the CEK
 // and goes straight to a body-range fetch with no COSE envelope-header
 // round-trip. They are all-or-nothing: an unencrypted blob leaves them zero
-// (stored as SQL NULL). A fresh CEK per encryption event makes every ciphertext
-// digest unique to one encryption, so this wrap material is a 1:1 fact about the
-// row. Raw CEK bytes are never stored — only the region-KEK-wrapped CEK and the
-// identifiers needed to unwrap it. See docs/architecture.md §8 and FIL-480.
+// (stored as SQL NULL), and PutLocation rejects a partial set via ValidateFEE
+// so no row is ever persisted that the decrypt path cannot use. A fresh CEK per
+// encryption event makes every ciphertext digest unique to one encryption, so
+// this wrap material is a 1:1 fact about the row. Raw CEK bytes are never
+// stored — only the region-KEK-wrapped CEK and the identifiers needed to unwrap
+// it. See docs/architecture.md §8 and FIL-480.
 type BlobLocation struct {
 	Space    string
 	Digest   []byte
@@ -101,6 +107,35 @@ type BlobLocation struct {
 	// reconstruct the Enc_structure (AAD) without an envelope round-trip. Nil for
 	// an unencrypted blob.
 	ProtectedHeader []byte
+}
+
+// ErrPartialFEE is returned by PutLocation when a BlobLocation carries some but
+// not all of the FEE wrap material — a row the decrypt path could not use.
+var ErrPartialFEE = errors.New("registry: partial FEE wrap material")
+
+// ValidateFEE enforces the all-or-nothing FEE invariant that BlobLocation
+// documents: either every wrap field is present (non-empty byte slices, non-empty
+// identifiers, and ChunkSize > 0) or none is. A partial set — e.g. a wrapped CEK
+// with no nonce, or an empty (non-nil) byte slice standing in for real material —
+// would persist a row a later GET cannot decrypt, so PutLocation rejects it.
+func (loc BlobLocation) ValidateFEE() error {
+	present := 0
+	for _, ok := range []bool{
+		len(loc.RegionWrappedCEK) > 0,
+		loc.RegionKeyVersion != "",
+		loc.TenantRecipientKID != "",
+		len(loc.BaseNonce) > 0,
+		loc.ChunkSize > 0,
+		len(loc.ProtectedHeader) > 0,
+	} {
+		if ok {
+			present++
+		}
+	}
+	if present != 0 && present != 6 {
+		return fmt.Errorf("%w: %d of 6 fields set", ErrPartialFEE, present)
+	}
+	return nil
 }
 
 // MultipartSession is one row of ingot.multipart_sessions.

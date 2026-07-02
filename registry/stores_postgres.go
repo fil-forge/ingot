@@ -143,9 +143,14 @@ func (r *Postgres) DeleteIntent(ctx context.Context, digest []byte) error {
 // LocationStore ==============================================================
 
 func (r *Postgres) PutLocation(ctx context.Context, loc BlobLocation) error {
-	// The FEE wrap columns are nullable: an unencrypted blob writes them NULL
-	// (nil bytea / nullString / nullInt64). The upsert overwrites the whole row
-	// state, so a rotation re-wrap is a read-modify-write of the full record.
+	// Reject a partial FEE set before it reaches storage (see ValidateFEE).
+	if err := loc.ValidateFEE(); err != nil {
+		return err
+	}
+	// The FEE columns are nullable: an unencrypted blob writes them NULL (nullBytes
+	// / nullString / nullInt64 map empty/zero to NULL, so an empty-but-non-nil
+	// slice never lands as a non-NULL empty bytea). The upsert overwrites the whole
+	// row state, so a rotation re-wrap is a read-modify-write of the full record.
 	_, err := r.pool.Exec(ctx,
 		`INSERT INTO ingot.blob_locations
 		   (space, digest, provider, url, size,
@@ -161,8 +166,8 @@ func (r *Postgres) PutLocation(ctx context.Context, loc BlobLocation) error {
 		       chunk_size           = EXCLUDED.chunk_size,
 		       protected_header     = EXCLUDED.protected_header`,
 		loc.Space, loc.Digest, loc.Provider, loc.URL, loc.Size,
-		loc.RegionWrappedCEK, nullString(loc.RegionKeyVersion), nullString(loc.TenantRecipientKID),
-		loc.BaseNonce, nullInt64(loc.ChunkSize), loc.ProtectedHeader)
+		nullBytes(loc.RegionWrappedCEK), nullString(loc.RegionKeyVersion), nullString(loc.TenantRecipientKID),
+		nullBytes(loc.BaseNonce), nullInt64(loc.ChunkSize), nullBytes(loc.ProtectedHeader))
 	if err != nil {
 		return fmt.Errorf("registry: put location: %w", err)
 	}
@@ -348,6 +353,16 @@ func nullInt64(n int64) *int64 {
 		return nil
 	}
 	return &n
+}
+
+// nullBytes maps an empty (nil or zero-length) slice to a SQL NULL so an
+// optional bytea column stays NULL rather than storing a non-NULL empty value.
+// Used for the FEE wrap columns, whose absence must read back as nil.
+func nullBytes(b []byte) []byte {
+	if len(b) == 0 {
+		return nil
+	}
+	return b
 }
 
 func marshalMetadata(m map[string]string) ([]byte, error) {

@@ -119,6 +119,10 @@ func (m *MemStore) DeleteIntent(_ context.Context, digest []byte) error {
 // LocationStore ==============================================================
 
 func (m *MemStore) PutLocation(_ context.Context, loc registry.BlobLocation) error {
+	// Match the Postgres store: reject a partial FEE set (see ValidateFEE).
+	if err := loc.ValidateFEE(); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.locations[locKey{loc.Space, string(loc.Digest)}] = cloneLocation(loc)
