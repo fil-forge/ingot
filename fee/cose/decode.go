@@ -100,6 +100,87 @@ func Decode(data []byte, opts ...DecodeOption) (env *Encrypt, rest []byte, err e
 	return env, rest, nil
 }
 
+// DecodeEncrypt0 parses a detached COSE_Encrypt0 (CBOR tag 16) from the front
+// of data and returns the envelope together with rest: the bytes that follow
+// the self-delimited envelope item, i.e. the detached ciphertext. rest is empty
+// when nothing follows the envelope.
+//
+// It is strict: it requires tag 16 wrapping a 3-element array, a byte-string
+// protected header, map headers without duplicate labels, and a null body
+// ciphertext (the payload is detached). Any deviation returns an error
+// (wrapping one of the package sentinels) and a nil envelope — never a
+// partially populated one. It is the recipient-less counterpart of [Decode].
+func DecodeEncrypt0(data []byte, opts ...DecodeOption) (env *Encrypt0, rest []byte, err error) {
+	var cfg decodeConfig
+	for _, o := range opts {
+		o(&cfg)
+	}
+
+	// Read exactly one CBOR item; the remainder is the detached payload.
+	dec := decMode.NewDecoder(bytes.NewReader(data))
+	var first cbor.RawMessage
+	if err := dec.Decode(&first); err != nil {
+		return nil, nil, fmt.Errorf("%w: %v", ErrMalformed, err)
+	}
+	rest = data[dec.NumBytesRead():]
+
+	// The item must be a tag-16 wrapper.
+	var tag cbor.RawTag
+	if err := decMode.Unmarshal(first, &tag); err != nil {
+		return nil, nil, fmt.Errorf("%w: %v", ErrNotEncrypt, err)
+	}
+	if tag.Number != TagCOSEEncrypt0 {
+		return nil, nil, fmt.Errorf("%w: got tag %d, want %d", ErrNotEncrypt, tag.Number, TagCOSEEncrypt0)
+	}
+
+	// The tag content must be a 3-element array (no recipients).
+	if cborMajor(tag.Content) != majorArray {
+		return nil, nil, fmt.Errorf("%w: tag content is not an array", ErrMalformed)
+	}
+	var arr []cbor.RawMessage
+	if err := decMode.Unmarshal(tag.Content, &arr); err != nil {
+		return nil, nil, fmt.Errorf("%w: %v", ErrMalformed, err)
+	}
+	if len(arr) != 3 {
+		return nil, nil, fmt.Errorf("%w: array has %d elements, want 3", ErrMalformed, len(arr))
+	}
+
+	headers, err := decodeHeaders(arr[0], arr[1])
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Detached payload: the body ciphertext must be null.
+	if !isNull(arr[2]) {
+		return nil, nil, ErrDetachedPayload
+	}
+
+	env = &Encrypt0{Headers: headers}
+
+	if cfg.checkType {
+		got, ok := env.Headers.Protected.Text(HeaderLabelType)
+		if !ok || got != cfg.expectedType {
+			return nil, nil, fmt.Errorf("%w: got %q, want %q", ErrUnexpectedType, got, cfg.expectedType)
+		}
+	}
+
+	return env, rest, nil
+}
+
+// PeekTag reads the CBOR tag number of the item at the front of data without
+// otherwise decoding it. It lets a caller dispatch between [Decode] (tag 96,
+// [TagCOSEEncrypt]) and [DecodeEncrypt0] (tag 16, [TagCOSEEncrypt0]) for an
+// envelope whose form is not known in advance. It returns ErrMalformed if data
+// does not begin with a CBOR tag.
+func PeekTag(data []byte) (uint64, error) {
+	dec := decMode.NewDecoder(bytes.NewReader(data))
+	var tag cbor.RawTag
+	if err := dec.Decode(&tag); err != nil {
+		return 0, fmt.Errorf("%w: %v", ErrMalformed, err)
+	}
+	return tag.Number, nil
+}
+
 // decodeHeaders decodes a [protected, unprotected] pair. The protected element
 // is a byte string whose content (when non-empty) is itself a CBOR map; its
 // raw bytes are preserved on RawProtected for AAD stability.
