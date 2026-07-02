@@ -53,14 +53,13 @@ func (e *Encrypt0) Encode() ([]byte, error) {
 //
 // The protected element is the exact serialized protected header (RawProtected
 // for a decoded envelope, otherwise the deterministic serialization of
-// Headers.Protected). See [Encrypt.EncStructure] for the tag-96 counterpart and
-// [EncStructureBytes] for the shared builder.
+// Headers.Protected). See [Encrypt.EncStructure] for the tag-96 counterpart.
 func (e *Encrypt0) EncStructure(externalAAD []byte) ([]byte, error) {
 	prot, err := e.Headers.protectedBytes()
 	if err != nil {
 		return nil, fmt.Errorf("cose: building Enc_structure: %w", err)
 	}
-	return EncStructureBytes(ContextEncrypt0, prot, externalAAD)
+	return encStructureBytes(contextEncrypt0, prot, externalAAD)
 }
 
 // ProtectedBytes returns the serialized content of the body protected header —

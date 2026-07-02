@@ -84,28 +84,39 @@ func chunkCountFor(nPlain, chunkSize int) int {
 	return (nPlain + chunkSize - 1) / chunkSize
 }
 
+// feeEnvelope is the subset of a COSE envelope (Encrypt or Encrypt0) that FEE
+// composition needs. Taking the AAD from the envelope's own EncStructure gives
+// the RFC 9052 §5.3 context that matches its tag — "Encrypt" for tag-96,
+// "Encrypt0" for tag-16 — with no separate context selection.
+type feeEnvelope interface {
+	EncStructure(externalAAD []byte) ([]byte, error)
+	Encode() ([]byte, error)
+}
+
 // composeFEE seals plaintext into a FEE blob (envelope || ciphertext) using the
 // chunked AES-256-GCM-STREAM body cipher. recipients==nil yields a COSE_Encrypt0
 // (tag 16); a non-empty recipients slice yields a COSE_Encrypt (tag 96). The
-// body AAD is the Encrypt0-context Enc_structure over the protected header in
-// both cases, matching the reference.
+// body AAD is the envelope's Enc_structure, so its context tracks the tag.
 func composeFEE(plaintext, cek, baseNonce []byte, chunkSize int, recipients []*cose.Recipient) ([]byte, int, error) {
-	prot := cose.Header{}.
-		Set(cose.HeaderLabelAlg, algChunkedStream).
-		Set(cose.HeaderLabelType, feeTyp)
+	chunkCount := chunkCountFor(len(plaintext), chunkSize)
+	headers := cose.Headers{
+		Protected: cose.Header{}.
+			Set(cose.HeaderLabelAlg, algChunkedStream).
+			Set(cose.HeaderLabelType, feeTyp),
+		Unprotected: cose.Header{}.
+			Set(cose.HeaderLabelIV, baseNonce).
+			Set(labelChunkSize, int64(chunkSize)).
+			Set(labelChunkCount, int64(chunkCount)),
+	}
 
-	protBytes, err := (&cose.Encrypt0{Headers: cose.Headers{Protected: prot}}).ProtectedBytes()
-	if err != nil {
-		return nil, 0, fmt.Errorf("protected bytes: %w", err)
+	var env feeEnvelope
+	if len(recipients) == 0 {
+		env = &cose.Encrypt0{Headers: headers}
+	} else {
+		env = &cose.Encrypt{Headers: headers, Recipients: recipients}
 	}
-	// The body AAD context follows the envelope structure (RFC 9052 §5.3),
-	// matching the fixed reference (foc-encryption PR #2): "Encrypt" for a
-	// tag-96 multi-recipient envelope, "Encrypt0" for a tag-16 envelope.
-	ctx := cose.ContextEncrypt0
-	if len(recipients) > 0 {
-		ctx = cose.ContextEncrypt
-	}
-	aad, err := cose.EncStructureBytes(ctx, protBytes, nil)
+
+	aad, err := env.EncStructure(nil)
 	if err != nil {
 		return nil, 0, fmt.Errorf("enc_structure: %w", err)
 	}
@@ -121,19 +132,8 @@ func composeFEE(plaintext, cek, baseNonce []byte, chunkSize int, recipients []*c
 	if err := w.Close(); err != nil {
 		return nil, 0, fmt.Errorf("close body: %w", err)
 	}
-	chunkCount := chunkCountFor(len(plaintext), chunkSize)
 
-	unprot := cose.Header{}.
-		Set(cose.HeaderLabelIV, baseNonce).
-		Set(labelChunkSize, int64(chunkSize)).
-		Set(labelChunkCount, int64(chunkCount))
-
-	var envBytes []byte
-	if len(recipients) == 0 {
-		envBytes, err = (&cose.Encrypt0{Headers: cose.Headers{Protected: prot, Unprotected: unprot}}).Encode()
-	} else {
-		envBytes, err = (&cose.Encrypt{Headers: cose.Headers{Protected: prot, Unprotected: unprot}, Recipients: recipients}).Encode()
-	}
+	envBytes, err := env.Encode()
 	if err != nil {
 		return nil, 0, fmt.Errorf("encode envelope: %w", err)
 	}
@@ -190,7 +190,8 @@ func a256kwRecipient(cek []byte) (*cose.Recipient, error) {
 // --- envelope parsing + body decryption (Go consuming any FEE blob) --------
 
 // parsedFEE is what decodeFEE recovers from a blob: the header pair, the
-// detached ciphertext, and the resolved geometry.
+// detached ciphertext, the resolved geometry, and the body AAD (the decoded
+// envelope's Enc_structure, whose context already matches the tag).
 type parsedFEE struct {
 	tag        uint64
 	headers    cose.Headers
@@ -198,6 +199,7 @@ type parsedFEE struct {
 	ciphertext []byte
 	baseNonce  []byte
 	chunkSize  int
+	aad        []byte
 }
 
 // decodeFEE parses a FEE blob (tag 16 or tag 96), enforcing the FEE typ, and
@@ -217,12 +219,18 @@ func decodeFEE(blob []byte) (*parsedFEE, error) {
 			return nil, err
 		}
 		out.headers, out.ciphertext = env.Headers, rest
+		if out.aad, err = env.EncStructure(nil); err != nil {
+			return nil, fmt.Errorf("enc_structure: %w", err)
+		}
 	case cose.TagCOSEEncrypt:
 		env, rest, err := cose.Decode(blob, cose.WithExpectedType(feeTyp))
 		if err != nil {
 			return nil, err
 		}
 		out.headers, out.recipients, out.ciphertext = env.Headers, env.Recipients, rest
+		if out.aad, err = env.EncStructure(nil); err != nil {
+			return nil, fmt.Errorf("enc_structure: %w", err)
+		}
 	default:
 		return nil, fmt.Errorf("unexpected COSE tag %d", tag)
 	}
@@ -252,17 +260,8 @@ func decryptFEE(blob, cek []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Context follows the envelope structure, as on the encrypt side.
-	ctx := cose.ContextEncrypt0
-	if p.tag == cose.TagCOSEEncrypt {
-		ctx = cose.ContextEncrypt
-	}
-	aad, err := cose.EncStructureBytes(ctx, p.headers.RawProtected, nil)
-	if err != nil {
-		return nil, fmt.Errorf("enc_structure: %w", err)
-	}
 	r, err := aesstream.NewReader(bytes.NewReader(p.ciphertext), aesstream.Config{
-		Key: cek, BaseNonce: p.baseNonce, AAD: aad, ChunkSize: p.chunkSize,
+		Key: cek, BaseNonce: p.baseNonce, AAD: p.aad, ChunkSize: p.chunkSize,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("new reader: %w", err)

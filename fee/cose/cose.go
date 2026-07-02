@@ -29,7 +29,7 @@
 //
 // The bytes that authenticate the protected header are produced by
 // [Encrypt.EncStructure] (context "Encrypt") or [Encrypt0.EncStructure]
-// (context "Encrypt0"), over the shared low-level builder [EncStructureBytes]:
+// (context "Encrypt0"):
 //
 //	Enc_structure = [ context, protected : bstr, external_aad : bstr ]
 //
@@ -63,15 +63,13 @@ const TagCOSEEncrypt uint64 = 96
 // (RFC 9052 §2), the recipient-less form.
 const TagCOSEEncrypt0 uint64 = 16
 
-// ContextEncrypt and ContextEncrypt0 are the context strings used in the
-// Enc_structure for a COSE_Encrypt and COSE_Encrypt0 body respectively
-// (RFC 9052 §5.3). They are exported for callers that build an Enc_structure
-// directly via [EncStructureBytes] — for example a profile whose body AEAD
-// authenticates the same protected header regardless of which envelope tag
-// (16 or 96) carries it.
+// contextEncrypt and contextEncrypt0 are the context strings used in the
+// Enc_structure for a COSE_Encrypt (tag 96) and COSE_Encrypt0 (tag 16) body
+// respectively (RFC 9052 §5.3). Callers obtain an Enc_structure from
+// [Encrypt.EncStructure] / [Encrypt0.EncStructure]; these back those methods.
 const (
-	ContextEncrypt  = "Encrypt"
-	ContextEncrypt0 = "Encrypt0"
+	contextEncrypt  = "Encrypt"
+	contextEncrypt0 = "Encrypt0"
 )
 
 // Standard COSE header parameter labels (RFC 9052 §3.1 and the IANA "COSE
