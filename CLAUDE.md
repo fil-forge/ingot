@@ -150,6 +150,17 @@ The `testing/` package exercises ingot end-to-end without Postgres/piri/indexer:
 - **`smoke_test.go`** — `TestSmoke_<Group>` (passing) + `TestSmokeXFail_<Group>`
   (known-failing; per-case failures are Skipped and the test FAILs only on an
   *unexpected pass* — the cue to promote the row). ~66 pass / ~53 xfail.
+- **Shuffle-brittle upstream cases** — CI runs `go test -shuffle=on ./...` (the
+  ipdxco unified `go-test` workflow enables shuffle unless `go-test-config.json`
+  sets `shuffle: false`; the `-race` job runs in fixed order). A few versitygw
+  cases name buckets from a process-global counter and assert *creation-order*
+  pagination, while ingot returns buckets lexicographically (matching
+  versitygw's own backend) — so shuffle can straddle a digit boundary
+  (…98,99,100) and flip them (see `ListBuckets_truncated`). Such a case is gated
+  behind `shuffleEnabled()`: it runs and must pass in fixed order, but is
+  `Skip`ped under `-shuffle`, keeping coverage everywhere except the one
+  nondeterministic environment. Don't add these to the XFail group — that group
+  fails on an *unexpected pass*, so a shuffle-dependent case would flip there too.
 - **`module_test.go`** (root), **`logstore/store_test.go`**,
   **`blockstore/{cache,staging}_test.go`**, **`forgeclient/accounts_test.go`**,
   **`cmd/space_test.go`** — unit tests.
