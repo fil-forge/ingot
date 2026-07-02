@@ -28,9 +28,10 @@
 // # Enc_structure (AAD)
 //
 // The bytes that authenticate the protected header are produced by
-// [Encrypt.EncStructure]:
+// [Encrypt.EncStructure] (context "Encrypt") or [Encrypt0.EncStructure]
+// (context "Encrypt0"), over the shared low-level builder [EncStructureBytes]:
 //
-//	Enc_structure = [ "Encrypt", protected : bstr, external_aad : bstr ]
+//	Enc_structure = [ context, protected : bstr, external_aad : bstr ]
 //
 // The protected element is the exact serialized protected-header byte string
 // — the same bytes that appear on the wire — so AAD is stable across an
@@ -40,11 +41,11 @@
 // # Scope
 //
 // This package implements COSE_Encrypt (tag 96, the multi-recipient form,
-// which also covers the single-recipient case) with a detached payload. It
-// does not implement COSE_Encrypt0 (tag 16), nested recipients, or
-// non-detached (inline) ciphertext; encountering a nested recipient or a
-// non-null body ciphertext during [Decode] is reported as an error rather
-// than silently dropped.
+// which also covers the single-recipient case) and COSE_Encrypt0 (tag 16, the
+// recipient-less form), both with a detached payload. It does not implement
+// nested recipients or non-detached (inline) ciphertext; encountering a nested
+// recipient or a non-null body ciphertext during decode is reported as an
+// error rather than silently dropped.
 package cose
 
 import (
@@ -58,9 +59,26 @@ import (
 // (RFC 9052 §2).
 const TagCOSEEncrypt uint64 = 96
 
-// contextEncrypt is the context string used in the Enc_structure for a
-// COSE_Encrypt body (RFC 9052 §5.3).
-const contextEncrypt = "Encrypt"
+// TagCOSEEncrypt0 is the CBOR tag number for a COSE_Encrypt0 structure
+// (RFC 9052 §2), the recipient-less form.
+const TagCOSEEncrypt0 uint64 = 16
+
+// contextEncrypt and contextEncrypt0 are the context strings used in the
+// Enc_structure for a COSE_Encrypt and COSE_Encrypt0 body respectively
+// (RFC 9052 §5.3).
+const (
+	contextEncrypt  = "Encrypt"
+	contextEncrypt0 = "Encrypt0"
+)
+
+// ContextEncrypt and ContextEncrypt0 export the two Enc_structure context
+// strings for callers that build an Enc_structure directly via
+// [EncStructureBytes] — for example a profile whose body AEAD authenticates the
+// same protected header regardless of which envelope tag (16 or 96) carries it.
+const (
+	ContextEncrypt  = contextEncrypt
+	ContextEncrypt0 = contextEncrypt0
+)
 
 // Standard COSE header parameter labels (RFC 9052 §3.1 and the IANA "COSE
 // Header Parameters" registry; HeaderLabelType is from RFC 9596). These are
