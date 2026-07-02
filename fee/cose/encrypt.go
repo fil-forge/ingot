@@ -70,7 +70,7 @@ func (e *Encrypt) EncStructure(externalAAD []byte) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cose: building Enc_structure: %w", err)
 	}
-	return EncStructureBytes(contextEncrypt, prot, externalAAD)
+	return EncStructureBytes(ContextEncrypt, prot, externalAAD)
 }
 
 // EncStructureBytes builds the CBOR-encoded COSE Enc_structure (RFC 9052 §5.3)
