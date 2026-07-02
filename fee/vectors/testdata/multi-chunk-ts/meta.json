@@ -1,0 +1,11 @@
+{
+  "name": "multi-chunk-ts",
+  "producer": "ts",
+  "description": "AC2: multi-chunk file encrypted in foc-encryption (TS); decrypts in Go.",
+  "tag": 16,
+  "algorithm": -65793,
+  "typ": "application/vnd.foc-envelope+cose",
+  "chunk_size": 4096,
+  "chunk_count": 4,
+  "cek_hex": "a0eb0f91b2e66b07322f83ddda47cba08cfa14e0fda746e89157678c1a93f214"
+}

@@ -1,0 +1,9 @@
+{
+  "name": "fee-vectors-ts-harness",
+  "private": true,
+  "type": "module",
+  "description": "Drives the pinned foc-encryption reference (TypeScript) to (re)generate and verify FEE cross-implementation fixtures. Run via ../pull-foc-encryption.sh; see ../README.md.",
+  "dependencies": {
+    "cborg": "^5.1.0"
+  }
+}
