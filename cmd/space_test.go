@@ -3,7 +3,7 @@ package cmd
 import (
 	"testing"
 
-	"github.com/fil-forge/libforge/didmailto"
+	"github.com/fil-forge/libforge/attestation/didmailto"
 	"github.com/fil-forge/ucantone/did"
 )
 

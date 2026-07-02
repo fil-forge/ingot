@@ -20,10 +20,6 @@ func (c *Client) ProviderAdd(ctx context.Context, customerAccount did.DID, provi
 	if err != nil {
 		return nil, fmt.Errorf("building proof chain: %w", err)
 	}
-	attestations, err := c.ProofAttestations(ctx, proofs, c.serviceID)
-	if err != nil {
-		return nil, fmt.Errorf("fetching proof attestations: %w", err)
-	}
 
 	inv, err := providercmds.Add.Invoke(
 		c.signer,
@@ -44,7 +40,6 @@ func (c *Client) ProviderAdd(ctx context.Context, customerAccount did.DID, provi
 		c.ucanClient,
 		inv,
 		execution.WithDelegations(proofs...),
-		execution.WithInvocations(attestations...),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("executing provider add invocation: %w", err)

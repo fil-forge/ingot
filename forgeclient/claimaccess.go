@@ -21,16 +21,11 @@ import (
 func (c *Client) ClaimAccess(ctx context.Context, sub did.DID) ([]ucan.Delegation, []ucan.Invocation, error) {
 	var proofs []ucan.Delegation
 	var proofLinks []cid.Cid
-	var proofAttestations []ucan.Invocation
 	var err error
 	if c.signer.DID() != sub {
 		proofs, proofLinks, err = c.ProofChain(ctx, c.signer.DID(), accesscmds.Claim.Command, sub)
 		if err != nil {
 			return nil, nil, fmt.Errorf("building proof chain: %w", err)
-		}
-		proofAttestations, err = c.ProofAttestations(ctx, proofs, c.serviceID)
-		if err != nil {
-			return nil, nil, fmt.Errorf("fetching attestations for proof chain: %w", err)
 		}
 	}
 
@@ -50,7 +45,6 @@ func (c *Client) ClaimAccess(ctx context.Context, sub did.DID) ([]ucan.Delegatio
 		c.ucanClient,
 		inv,
 		execution.WithDelegations(proofs...),
-		execution.WithInvocations(proofAttestations...),
 	)
 	if err != nil {
 		return nil, nil, fmt.Errorf("executing claim invocation: %w", err)

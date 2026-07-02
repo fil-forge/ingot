@@ -36,18 +36,10 @@ func (c *Client) IndexAdd(ctx context.Context, indexCID cid.Cid, space did.DID) 
 	if err != nil {
 		return fmt.Errorf("building proof chain: %w", err)
 	}
-	retrievalAttestations, err := c.ProofAttestations(ctx, retrievalProofs, c.serviceID)
-	if err != nil {
-		return fmt.Errorf("fetching proof attestations: %w", err)
-	}
 
 	proofs, proofLinks, err := c.ProofChain(ctx, c.signer.DID(), indexcmds.Add.Command, space)
 	if err != nil {
 		return fmt.Errorf("building proof chain: %w", err)
-	}
-	attestations, err := c.ProofAttestations(ctx, proofs, c.serviceID)
-	if err != nil {
-		return fmt.Errorf("fetching proof attestations: %w", err)
 	}
 	inv, err := indexcmds.Add.Invoke(
 		c.signer,
@@ -68,13 +60,11 @@ func (c *Client) IndexAdd(ctx context.Context, indexCID cid.Cid, space did.DID) 
 		c.ucanClient,
 		inv,
 		execution.WithDelegations(proofs...),
-		execution.WithInvocations(attestations...),
 		execution.WithDelegations(retrievalProofs...),
 		// The leaf delegation (agent → sprue) granting /content/retrieve
 		// on this space must travel with the request — metadata only
 		// carries CID links.
 		execution.WithDelegations(retrievalAuth),
-		execution.WithInvocations(retrievalAttestations...),
 	)
 	if err != nil {
 		return fmt.Errorf("executing invocation: %w", err)

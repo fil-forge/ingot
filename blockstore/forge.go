@@ -41,8 +41,8 @@ var ErrNotFound = errors.New("blockstore: not found")
 // location commitment), which resets on process restart.
 type Forge struct {
 	locator     locator.Locator
-	signer      ucan.Signer // service identity (issuer of /content/retrieve invocations)
-	spaceSigner ucan.Signer // space root authority (self-issues retrieval delegations)
+	signer      ucan.Issuer // service identity (issuer of /content/retrieve invocations)
+	spaceIssuer ucan.Issuer // space root authority (self-issues retrieval delegations)
 	spaces      []did.DID
 	httpClient  *http.Client
 	logger      *zap.Logger
@@ -67,10 +67,10 @@ type ForgeConfig struct {
 	// Spaces scopes the locator queries; for ingot this is the single space it owns.
 	Spaces []did.DID
 	// Signer is the upload-service identity; issuer of /content/retrieve invocations.
-	Signer ucan.Signer
-	// SpaceSigner is the keypair of the space ingot owns; root authority for the
+	Signer ucan.Issuer
+	// SpaceIssuer is the keypair of the space ingot owns; root authority for the
 	// self-issued space -> service /content/retrieve delegations.
-	SpaceSigner ucan.Signer
+	SpaceIssuer ucan.Issuer
 	// HTTPClient is used for indexer queries and piri retrievals. Optional;
 	// defaults to http.DefaultClient.
 	HTTPClient *http.Client
@@ -88,7 +88,7 @@ func NewForge(cfg ForgeConfig) (*Forge, error) {
 	if cfg.Signer == nil {
 		return nil, errors.New("forge blockstore: signer is required")
 	}
-	if cfg.SpaceSigner == nil {
+	if cfg.SpaceIssuer == nil {
 		return nil, errors.New("forge blockstore: space signer is required")
 	}
 
@@ -122,13 +122,13 @@ func NewForge(cfg ForgeConfig) (*Forge, error) {
 		if err != nil {
 			return nil, fmt.Errorf("forge blockstore: build indexing-service client: %w", err)
 		}
-		loc = locator.NewIndexLocator(idxClient, newAuthorizeRetrieval(cfg.SpaceSigner, indexerDID))
+		loc = locator.NewIndexLocator(idxClient, newAuthorizeRetrieval(cfg.SpaceIssuer, indexerDID))
 	}
 
 	return &Forge{
 		locator:     loc,
 		signer:      cfg.Signer,
-		spaceSigner: cfg.SpaceSigner,
+		spaceIssuer: cfg.SpaceIssuer,
 		spaces:      cfg.Spaces,
 		httpClient:  httpc,
 		logger:      logger,
@@ -174,7 +174,7 @@ func (f *Forge) retrieve(ctx context.Context, c cid.Cid) (io.ReadCloser, int64, 
 
 	// Self-issued retrieval proof: space -> service. Short-lived, per call.
 	retrievalProof, err := contentcmds.Retrieve.Delegate(
-		f.spaceSigner,
+		f.spaceIssuer,
 		f.signer.DID(),
 		space,
 		delegation.WithExpiration(ucan.Now()+retrievalAuthTTL),
@@ -251,12 +251,12 @@ func (f *Forge) OpenBlob(ctx context.Context, digest mh.Multihash) (io.ReadClose
 // calls before each indexer query. The space signer (root authority) directly
 // authorizes the indexer to retrieve any blob in the space — the proof chain is
 // one hop (space -> indexer) because ingot's "user" is itself.
-func newAuthorizeRetrieval(spaceSigner ucan.Signer, indexerDID did.DID) locator.AuthorizeRetrievalFunc {
+func newAuthorizeRetrieval(spaceIssuer ucan.Issuer, indexerDID did.DID) locator.AuthorizeRetrievalFunc {
 	return func(ctx context.Context, spaces []did.DID) ([]ucan.Delegation, error) {
 		dlgs := make([]ucan.Delegation, 0, len(spaces))
 		for _, space := range spaces {
 			dlg, err := contentcmds.Retrieve.Delegate(
-				spaceSigner,
+				spaceIssuer,
 				indexerDID,
 				space,
 				delegation.WithExpiration(ucan.Now()+retrievalAuthTTL),
