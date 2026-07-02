@@ -2,6 +2,7 @@ package testing
 
 import (
 	"context"
+	"flag"
 	"testing"
 
 	"github.com/versity/versitygw/tests/integration"
@@ -44,6 +45,16 @@ func smokeHarness(t *testing.T) *Harness {
 	}
 	t.Cleanup(func() { _ = h.Stop(context.Background()) })
 	return h
+}
+
+// shuffleEnabled reports whether `go test -shuffle` is active. Shuffle is a
+// runtime flag (there is no build tag for it), so we inspect it directly. A
+// couple of order-sensitive upstream cases key off this to skip only when the
+// run order — and thus their process-global bucket-name counter — is
+// randomized; in fixed order they are deterministic and run normally.
+func shuffleEnabled() bool {
+	f := flag.Lookup("test.shuffle")
+	return f != nil && f.Value.String() != "off"
 }
 
 // =============================================================
@@ -89,7 +100,6 @@ func TestSmoke_ListBuckets(t *testing.T) {
 		{"empty_success", integration.ListBuckets_empty_success},
 		{"invalid_max_buckets", integration.ListBuckets_invalid_max_buckets},
 		{"success", integration.ListBuckets_success},
-		{"truncated", integration.ListBuckets_truncated},
 		{"with_prefix", integration.ListBuckets_with_prefix},
 	}
 	s3conf := newS3Conf(smokeHarness(t).Config())
@@ -100,6 +110,26 @@ func TestSmoke_ListBuckets(t *testing.T) {
 			}
 		})
 	}
+
+	// truncated exercises paginated ListBuckets and ingot passes it in
+	// deterministic (fixed) order — so it runs in the normal test run, the
+	// -race job, IDE runs, etc. But it is brittle under `go test -shuffle`:
+	// the upstream case names buckets from a process-global counter
+	// (test-bucket-<N>) and compares pages position-by-position, expecting
+	// creation order, while ingot returns buckets lexicographically (matching
+	// versitygw's own backend). Shuffle randomizes how far that counter has
+	// advanced, and when a page straddles a digit boundary (…98, 99, 100)
+	// lexical order ("100" < "98") diverges from the expected numeric order.
+	// So we run it whenever order is deterministic and skip only under
+	// shuffle. See CLAUDE.md "Testing".
+	t.Run("truncated", func(t *testing.T) {
+		if shuffleEnabled() {
+			t.Skip("ListBuckets_truncated assumes creation-order pagination; brittle under -shuffle (see comment above)")
+		}
+		if err := integration.ListBuckets_truncated(s3conf); err != nil {
+			t.Fatalf("%v", err)
+		}
+	})
 }
 
 func TestSmoke_DeleteBucket(t *testing.T) {
