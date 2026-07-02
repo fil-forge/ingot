@@ -70,22 +70,19 @@ func (e *Encrypt) EncStructure(externalAAD []byte) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cose: building Enc_structure: %w", err)
 	}
-	return EncStructureBytes(ContextEncrypt, prot, externalAAD)
+	return encStructureBytes(contextEncrypt, prot, externalAAD)
 }
 
-// EncStructureBytes builds the CBOR-encoded COSE Enc_structure (RFC 9052 §5.3)
-// for the given context ("Encrypt" or "Encrypt0" — see [ContextEncrypt] and
-// [ContextEncrypt0]), serialized protected-header bytes, and external AAD:
+// encStructureBytes builds the CBOR-encoded COSE Enc_structure (RFC 9052 §5.3)
+// from a context string, the serialized protected-header bytes, and external
+// AAD:
 //
 //	Enc_structure = [ context, protected : bstr, external_aad : bstr ]
 //
-// It is the low-level builder shared by [Encrypt.EncStructure] and
-// [Encrypt0.EncStructure]. A profile whose body AEAD authenticates the same
-// protected header regardless of the envelope tag — as FEE does, always using
-// the "Encrypt0" context even for a tag-96 multi-recipient envelope — can call
-// this directly with the bytes from [Encrypt.ProtectedBytes] or
-// [Encrypt0.ProtectedBytes]. A nil externalAAD encodes as an empty byte string.
-func EncStructureBytes(context string, protected, externalAAD []byte) ([]byte, error) {
+// It is the builder shared by [Encrypt.EncStructure] (context "Encrypt") and
+// [Encrypt0.EncStructure] (context "Encrypt0"). A nil externalAAD encodes as an
+// empty byte string.
+func encStructureBytes(context string, protected, externalAAD []byte) ([]byte, error) {
 	out, err := encMode.Marshal([]any{context, bstr(protected), bstr(externalAAD)})
 	if err != nil {
 		return nil, fmt.Errorf("cose: encoding Enc_structure: %w", err)

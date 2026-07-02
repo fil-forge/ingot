@@ -51,7 +51,7 @@ func cborHead(major byte, arg uint64) []byte {
 //	[ "Encrypt", protected : bstr, external_aad : bstr ]
 func expectedEncStructure(protected, externalAAD []byte) []byte {
 	out := []byte{0x83} // array(3)
-	out = append(out, cborText(ContextEncrypt)...)
+	out = append(out, cborText(contextEncrypt)...)
 	out = append(out, cborBstr(protected)...)
 	out = append(out, cborBstr(externalAAD)...)
 	return out

@@ -13,11 +13,8 @@ across two implementations:
   still seals tag-96 bodies under the buggy `"Encrypt0"` context. Re-pin to the
   merge commit once the PR lands.
 
-The reference is the **source of truth** for the wire format. Reconciling the two
-surfaced a reference bug — the body AAD context (RFC 9052 §5.3) — that was fixed
-upstream in PR #2; the Go side matches that fixed reference (see
-[Wire format](#wire-format) and
-[Divergences reconciled](#divergences-reconciled)).
+The reference is the **source of truth** for the wire format; these vectors pin
+to it and this repo's `fee/*` matches it (see [Wire format](#wire-format)).
 
 ## What's covered (acceptance criteria)
 
@@ -64,36 +61,6 @@ recipient   = [ {1: alg}, {4: kid, ...}, wrappedKey ]           # alg -31 or -5
 - **Recipients** — `wrappedKey` is carried opaquely; the reference never unwraps
   it (decryption takes the CEK directly). The Go side does real
   ECDH-ES+A256KW / A256KW wrap and unwrap.
-
-## Divergences reconciled
-
-Reconciling `fee/*` with the reference (FIL-473) took changes on **both** sides.
-
-In `fee/cose`:
-
-- **COSE_Encrypt0 (tag 16)** — added `Encrypt0` (encode + decode + `PeekTag`);
-  it's the reference's envelope for a no-recipient file. Previously `cose` only
-  did tag 96.
-- **Selectable Enc_structure context** — added `EncStructureBytes` +
-  `Encrypt0.EncStructure` and exported `ContextEncrypt`/`ContextEncrypt0`, so the
-  body AAD context can follow the envelope structure.
-
-In the reference (upstream **PR #2**):
-
-- The reference hardcoded the `"Encrypt0"` AAD context for *every* envelope, even
-  tag-96 — a deviation from RFC 9052 §5.3. PR #2 threads the context down so a
-  tag-96 body authenticates under `"Encrypt"`. These vectors pin to that fix, and
-  the Go side (`helpers_test.go`) selects the context the same way.
-
-The FEE profile values — `typ` (`application/vnd.foc-envelope+cose`), body alg
-(`-65793`), and the private-use unprotected labels (`chunkSize -65790`,
-`chunkCount -65791`) — live in `helpers_test.go` (the caller), matching the
-reference's `src/cose/headers.ts`. `fee/aesstream`'s STREAM framing already
-matched byte-for-byte and was unchanged.
-
-> The top-level `fee` composer (PR #14 / FIL-569) is still open and currently
-> encodes some of these differently (`typ`, chunk-size label/location, AAD
-> context). It should adopt the values pinned here.
 
 ## Regenerating
 
