@@ -60,7 +60,7 @@ func (e *Encrypt0) EncStructure(externalAAD []byte) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cose: building Enc_structure: %w", err)
 	}
-	return EncStructureBytes(contextEncrypt0, prot, externalAAD)
+	return EncStructureBytes(ContextEncrypt0, prot, externalAAD)
 }
 
 // ProtectedBytes returns the serialized content of the body protected header —

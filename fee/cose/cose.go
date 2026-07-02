@@ -45,7 +45,7 @@
 // recipient-less form), both with a detached payload. It does not implement
 // nested recipients or non-detached (inline) ciphertext; encountering a nested
 // recipient or a non-null body ciphertext during decode is reported as an
-// error rather than silently dropped.
+// error.
 package cose
 
 import (
@@ -63,21 +63,15 @@ const TagCOSEEncrypt uint64 = 96
 // (RFC 9052 §2), the recipient-less form.
 const TagCOSEEncrypt0 uint64 = 16
 
-// contextEncrypt and contextEncrypt0 are the context strings used in the
+// ContextEncrypt and ContextEncrypt0 are the context strings used in the
 // Enc_structure for a COSE_Encrypt and COSE_Encrypt0 body respectively
-// (RFC 9052 §5.3).
+// (RFC 9052 §5.3). They are exported for callers that build an Enc_structure
+// directly via [EncStructureBytes] — for example a profile whose body AEAD
+// authenticates the same protected header regardless of which envelope tag
+// (16 or 96) carries it.
 const (
-	contextEncrypt  = "Encrypt"
-	contextEncrypt0 = "Encrypt0"
-)
-
-// ContextEncrypt and ContextEncrypt0 export the two Enc_structure context
-// strings for callers that build an Enc_structure directly via
-// [EncStructureBytes] — for example a profile whose body AEAD authenticates the
-// same protected header regardless of which envelope tag (16 or 96) carries it.
-const (
-	ContextEncrypt  = contextEncrypt
-	ContextEncrypt0 = contextEncrypt0
+	ContextEncrypt  = "Encrypt"
+	ContextEncrypt0 = "Encrypt0"
 )
 
 // Standard COSE header parameter labels (RFC 9052 §3.1 and the IANA "COSE
