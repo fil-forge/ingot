@@ -10,7 +10,7 @@ import "errors"
 // exposure-hygiene guarantee is never silently dropped. Region custody is a
 // server-side concern and the supported deployment targets (Linux, macOS) are
 // all unix; this fallback exists so the package still builds elsewhere.
-var errLockUnsupported = errors.New("region: locking memory is not supported on this platform")
+var errLockUnsupported = errors.New("regionkey: locking memory is not supported on this platform")
 
 func lock(b []byte) error {
 	if len(b) == 0 {

@@ -64,7 +64,7 @@ import (
 // A wrong-key unwrap where the source *does* hold the named version instead
 // fails the A256KW integrity check and surfaces as fee/aeskw.ErrIntegrity
 // (wrapped); the two cases are distinct.
-var ErrUnknownVersion = errors.New("region: unknown key version")
+var ErrUnknownVersion = errors.New("regionkey: unknown key version")
 
 // Scope identifies which region key protects a CEK. It carries the dimensions a
 // Provider might key on if the region-key-cardinality decision (FIL-572) later

@@ -242,6 +242,42 @@ func TestWrapRejectsEmptyVersionFromSource(t *testing.T) {
 	require.Error(t, err, "a source advertising an empty version must be rejected")
 }
 
+// A StaticKEKSource is nil-safe to Close and, once closed, refuses to hand out
+// its (now-wiped) key rather than silently wrapping under zeroes.
+func TestStaticKEKSourceCloseSafety(t *testing.T) {
+	ctx := context.Background()
+
+	// Zero-value source Closes without panicking.
+	require.NotPanics(t, func() { _ = (&regionkey.StaticKEKSource{}).Close() })
+
+	src, err := regionkey.NewStaticKEKSource("region#1", randKey(t, regionkey.KEKLen))
+	require.NoError(t, err)
+
+	require.NoError(t, src.Close())
+	require.NotPanics(t, func() { _ = src.Close() }, "Close must be idempotent")
+
+	_, _, err = src.CurrentKEK(ctx, regionkey.Scope{})
+	require.Error(t, err, "using a closed source must error, not hand out a wiped key")
+	_, err = src.KEKAt(ctx, regionkey.Scope{}, "region#1")
+	require.Error(t, err, "using a closed source must error")
+}
+
+// A misbehaving KEKSource that returns a nil KEK with no error must surface an
+// error, not nil-panic the provider's deferred Destroy.
+func TestProviderRejectsNilKEKFromSource(t *testing.T) {
+	ctx := context.Background()
+	p := regionkey.NewSoftwareProvider(nilKEKSource{})
+
+	require.NotPanics(t, func() {
+		_, err := p.Wrap(ctx, regionkey.Scope{}, randKey(t, 32))
+		require.Error(t, err, "Wrap must reject a nil KEK from the source")
+	})
+	require.NotPanics(t, func() {
+		_, err := p.Unwrap(ctx, regionkey.Scope{}, regionkey.WrappedKey{Version: "region#1", Ciphertext: make([]byte, 40)})
+		require.Error(t, err, "Unwrap must reject a nil KEK from the source")
+	})
+}
+
 // --- test doubles ---
 
 // mapKEKSource is a KEKSource holding multiple key versions in memory, used to
@@ -311,4 +347,17 @@ func (echoProvider) Wrap(ctx context.Context, scope regionkey.Scope, cek []byte)
 
 func (echoProvider) Unwrap(ctx context.Context, scope regionkey.Scope, wrapped regionkey.WrappedKey) ([]byte, error) {
 	return bytes.Clone(wrapped.Ciphertext), nil
+}
+
+// nilKEKSource is a deliberately misbehaving KEKSource: it reports no error but
+// returns a nil *KEK, the contract violation the provider's nil guards defend
+// against.
+type nilKEKSource struct{}
+
+func (nilKEKSource) CurrentKEK(ctx context.Context, scope regionkey.Scope) (regionkey.KeyVersion, *regionkey.KEK, error) {
+	return "region#1", nil, nil
+}
+
+func (nilKEKSource) KEKAt(ctx context.Context, scope regionkey.Scope, version regionkey.KeyVersion) (*regionkey.KEK, error) {
+	return nil, nil
 }

@@ -60,7 +60,7 @@ func NewKEK(key []byte) (*KEK, error) {
 // weakening the exposure guarantee.
 func newKEK(size int) (*KEK, error) {
 	if size <= 0 {
-		return nil, fmt.Errorf("region: KEK size must be positive, got %d", size)
+		return nil, fmt.Errorf("regionkey: KEK size must be positive, got %d", size)
 	}
 
 	pageSize := os.Getpagesize()
@@ -77,7 +77,7 @@ func newKEK(size int) (*KEK, error) {
 
 	if err := lock(page); err != nil {
 		zero(backing)
-		return nil, fmt.Errorf("region: locking KEK memory: %w", err)
+		return nil, fmt.Errorf("regionkey: locking KEK memory: %w", err)
 	}
 	return &KEK{backing: backing, page: page, key: page[:size]}, nil
 }

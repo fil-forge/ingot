@@ -34,21 +34,30 @@ func NewSoftwareProvider(source KEKSource) *SoftwareProvider {
 // The KEK is held in a locked buffer only for this call and zeroed before Wrap
 // returns, on both the success and error paths.
 func (p *SoftwareProvider) Wrap(ctx context.Context, scope Scope, cek []byte) (WrappedKey, error) {
+	if p.source == nil {
+		return WrappedKey{}, fmt.Errorf("regionkey: provider has no KEK source")
+	}
 	version, kek, err := p.source.CurrentKEK(ctx, scope)
 	if err != nil {
-		return WrappedKey{}, fmt.Errorf("region: fetching current KEK: %w", err)
+		return WrappedKey{}, fmt.Errorf("regionkey: fetching current KEK: %w", err)
+	}
+	// A well-behaved source returns a non-nil KEK on the no-error path; guard
+	// against a misbehaving custom KEKSource so the deferred Destroy below
+	// cannot nil-panic.
+	if kek == nil {
+		return WrappedKey{}, fmt.Errorf("regionkey: KEK source returned a nil KEK")
 	}
 	// Zero and unlock the imported KEK the instant this call returns, whatever
 	// the outcome below.
 	defer kek.Destroy()
 
 	if version == "" {
-		return WrappedKey{}, fmt.Errorf("region: KEK source returned an empty key version")
+		return WrappedKey{}, fmt.Errorf("regionkey: KEK source returned an empty key version")
 	}
 
 	wrapped, err := aeskw.Wrap(kek.Bytes(), cek)
 	if err != nil {
-		return WrappedKey{}, fmt.Errorf("region: wrapping CEK: %w", err)
+		return WrappedKey{}, fmt.Errorf("regionkey: wrapping CEK: %w", err)
 	}
 	return WrappedKey{Version: version, Ciphertext: wrapped}, nil
 }
@@ -59,15 +68,21 @@ func (p *SoftwareProvider) Wrap(ctx context.Context, scope Scope, cek []byte) (W
 // tampered wrap surfaces as an error wrapping fee/aeskw.ErrIntegrity; a missing
 // version surfaces as [ErrUnknownVersion].
 func (p *SoftwareProvider) Unwrap(ctx context.Context, scope Scope, wrapped WrappedKey) ([]byte, error) {
+	if p.source == nil {
+		return nil, fmt.Errorf("regionkey: provider has no KEK source")
+	}
 	kek, err := p.source.KEKAt(ctx, scope, wrapped.Version)
 	if err != nil {
-		return nil, fmt.Errorf("region: fetching KEK version %q: %w", wrapped.Version, err)
+		return nil, fmt.Errorf("regionkey: fetching KEK version %q: %w", wrapped.Version, err)
+	}
+	if kek == nil {
+		return nil, fmt.Errorf("regionkey: KEK source returned a nil KEK for version %q", wrapped.Version)
 	}
 	defer kek.Destroy()
 
 	cek, err := aeskw.Unwrap(kek.Bytes(), wrapped.Ciphertext)
 	if err != nil {
-		return nil, fmt.Errorf("region: unwrapping CEK: %w", err)
+		return nil, fmt.Errorf("regionkey: unwrapping CEK: %w", err)
 	}
 	return cek, nil
 }

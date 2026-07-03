@@ -33,10 +33,10 @@ var _ KEKSource = (*StaticKEKSource)(nil)
 // caller afterward.
 func NewStaticKEKSource(version KeyVersion, kek []byte) (*StaticKEKSource, error) {
 	if version == "" {
-		return nil, errors.New("region: key version must not be empty")
+		return nil, errors.New("regionkey: key version must not be empty")
 	}
 	if len(kek) != KEKLen {
-		return nil, fmt.Errorf("region: region KEK must be %d bytes (A256KW), got %d", KEKLen, len(kek))
+		return nil, fmt.Errorf("regionkey: region KEK must be %d bytes (A256KW), got %d", KEKLen, len(kek))
 	}
 	locked, err := NewKEK(kek)
 	if err != nil {
@@ -68,15 +68,24 @@ func (s *StaticKEKSource) KEKAt(ctx context.Context, scope Scope, version KeyVer
 	return s.copyKEK()
 }
 
-// Close zeroes and unlocks the retained KEK. The source must not be used after
-// Close. It is idempotent.
+// Close zeroes and unlocks the retained KEK and marks the source unusable; a
+// subsequent CurrentKEK or KEKAt returns an error rather than handing out a
+// wiped key. It is idempotent and nil-safe (a zero-value source Closes cleanly).
 func (s *StaticKEKSource) Close() error {
-	s.kek.Destroy()
+	if s.kek != nil {
+		s.kek.Destroy()
+		s.kek = nil
+	}
 	return nil
 }
 
 // copyKEK returns a fresh locked KEK holding a copy of the retained key, for a
-// caller to use in a single operation and then Destroy.
+// caller to use in a single operation and then Destroy. It errors if the source
+// has been closed (or was never initialized), so a use-after-Close cannot
+// silently wrap under a zeroed key.
 func (s *StaticKEKSource) copyKEK() (*KEK, error) {
+	if s.kek == nil {
+		return nil, errors.New("regionkey: KEK source is closed")
+	}
 	return NewKEK(s.kek.Bytes())
 }
