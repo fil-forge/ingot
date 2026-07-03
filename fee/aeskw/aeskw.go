@@ -30,9 +30,9 @@
 // default IV. This package contributes the input validation, the ErrIntegrity
 // sentinel, and a stable API over it.
 //
-// This is a shared primitive. The tenant-recipient wrap (ECDH-ES+A256KW, in
-// the sibling fee/ecdhkw package) derives its KEK ephemerally per message and
-// feeds it here; the region wrap takes a KEK straight from a key provider.
+// This is a shared primitive. The ECDH-ES+A256KW wrap (in the sibling
+// fee/ecdhkw package) derives its KEK ephemerally per message and feeds it
+// here; a direct A256KW recipient takes a KEK straight from a key provider.
 // Both paths call Wrap and Unwrap identically.
 package aeskw
 

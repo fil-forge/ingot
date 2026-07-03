@@ -2,7 +2,9 @@
 // encrypts a content-encryption key (CEK) to a recipient's X25519 public key so
 // that only the holder of the matching private key can recover it.
 //
-// This is the tenant-recipient wrap of the FilOne encryption design. A fresh
+// This is one of FEE's two CEK wraps: it delivers the CEK to a recipient
+// identified by an X25519 public key (the sibling fee/aeskw package is the
+// other, wrapping directly under a symmetric KEK). A fresh
 // ephemeral X25519 key pair is generated for every Wrap; an ECDH against the
 // recipient's static public key yields a shared secret, the COSE Concat-KDF
 // (RFC 9053 §5.1, see kdf.go) turns that secret into a 256-bit key-encryption
