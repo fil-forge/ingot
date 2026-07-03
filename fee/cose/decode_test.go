@@ -17,8 +17,9 @@ func TestDecodeMalformed(t *testing.T) {
 		{"truncated mid-item", "d8608443a101", ErrMalformed},
 		{"not a tag (bare array)", "8440a0f6818340a041aa", ErrNotEncrypt},
 		{"bare integer, not a tag", "01", ErrNotEncrypt},
-		{"wrong tag (16, Encrypt0)", "d08440a0f6818340a041aa", ErrNotEncrypt},
-		{"array too short (3 elems)", "d8608340a0f6", ErrMalformed},
+		{"unsupported tag (55799)", "d9d9f78440a0f6818340a041aa", ErrNotEncrypt},
+		{"tag 16 with 4 elems (Encrypt0 shape violated)", "d08440a0f6818340a041aa", ErrMalformed},
+		{"tag 96 array too short (3 elems)", "d8608340a0f6", ErrMalformed},
 		{"array too long (5 elems)", "d8608540a0f6818340a041aa40", ErrMalformed},
 		{"protected not a byte string", "d86084a0a0f6818340a041aa", ErrMalformed},
 		{"protected content not a map", "d860844103a0f6818340a041aa", ErrMalformed},
@@ -38,7 +39,7 @@ func TestDecodeMalformed(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			// Tolerate spaces in the hex literals above for readability.
 			raw := hexDec(t, removeSpaces(tc.hex))
-			env, rest, err := DecodeEncrypt(raw)
+			env, rest, err := Decode(raw)
 			require.ErrorIs(t, err, tc.want)
 			require.Nil(t, env)
 			require.Nil(t, rest)
@@ -59,7 +60,7 @@ func removeSpaces(s string) string {
 func TestDecodeExpectedType(t *testing.T) {
 	withType := func(typ any) []byte {
 		t.Helper()
-		env := &Encrypt{
+		env := &Envelope{
 			Headers:    Headers{Protected: Header{}.Set(HeaderLabelType, typ)},
 			Recipients: []*Recipient{{Ciphertext: []byte{0xAA}}},
 		}
@@ -69,7 +70,7 @@ func TestDecodeExpectedType(t *testing.T) {
 	}
 	withoutType := func() []byte {
 		t.Helper()
-		env := &Encrypt{
+		env := &Envelope{
 			Headers:    Headers{Protected: Header{}.Set(HeaderLabelAlg, AlgA256GCM)},
 			Recipients: []*Recipient{{Ciphertext: []byte{0xAA}}},
 		}
@@ -79,27 +80,27 @@ func TestDecodeExpectedType(t *testing.T) {
 	}
 
 	t.Run("matching type", func(t *testing.T) {
-		_, _, err := DecodeEncrypt(withType(exampleType), WithExpectedType(exampleType))
+		_, _, err := Decode(withType(exampleType), WithExpectedType(exampleType))
 		require.NoError(t, err)
 	})
 
 	t.Run("wrong type", func(t *testing.T) {
-		_, _, err := DecodeEncrypt(withType("application/other"), WithExpectedType(exampleType))
+		_, _, err := Decode(withType("application/other"), WithExpectedType(exampleType))
 		require.ErrorIs(t, err, ErrUnexpectedType)
 	})
 
 	t.Run("missing type", func(t *testing.T) {
-		_, _, err := DecodeEncrypt(withoutType(), WithExpectedType(exampleType))
+		_, _, err := Decode(withoutType(), WithExpectedType(exampleType))
 		require.ErrorIs(t, err, ErrUnexpectedType)
 	})
 
 	t.Run("type present but not a string", func(t *testing.T) {
-		_, _, err := DecodeEncrypt(withType(int64(7)), WithExpectedType(exampleType))
+		_, _, err := Decode(withType(int64(7)), WithExpectedType(exampleType))
 		require.ErrorIs(t, err, ErrUnexpectedType)
 	})
 
 	t.Run("no check when option omitted", func(t *testing.T) {
-		_, _, err := DecodeEncrypt(withoutType())
+		_, _, err := Decode(withoutType())
 		require.NoError(t, err)
 	})
 }

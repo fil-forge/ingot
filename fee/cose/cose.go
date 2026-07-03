@@ -21,16 +21,15 @@
 //
 // In a detached envelope the ciphertext field is always CBOR null; the real
 // ciphertext travels separately, conventionally appended directly after the
-// envelope bytes (envelope || ciphertext). [DecodeEncrypt] and
-// [DecodeEncrypt0] decode the single, self-delimited envelope item and return
-// whatever bytes follow it, so a caller can recover that trailing ciphertext in
-// one pass.
+// envelope bytes (envelope || ciphertext). [Decode] decodes the single,
+// self-delimited envelope item and returns whatever bytes follow it, so a caller
+// can recover that trailing ciphertext in one pass.
 //
 // # Enc_structure (AAD)
 //
 // The bytes that authenticate the protected header are produced by
-// [Encrypt.EncStructure] (context "Encrypt") or [Encrypt0.EncStructure]
-// (context "Encrypt0"):
+// [Envelope.EncStructure], whose context is "Encrypt" for a COSE_Encrypt
+// (recipients present) or "Encrypt0" for a COSE_Encrypt0 (none):
 //
 //	Enc_structure = [ context, protected : bstr, external_aad : bstr ]
 //
@@ -66,8 +65,8 @@ const TagCOSEEncrypt0 uint64 = 16
 
 // contextEncrypt and contextEncrypt0 are the context strings used in the
 // Enc_structure for a COSE_Encrypt (tag 96) and COSE_Encrypt0 (tag 16) body
-// respectively (RFC 9052 §5.3). Callers obtain an Enc_structure from
-// [Encrypt.EncStructure] / [Encrypt0.EncStructure]; these back those methods.
+// respectively (RFC 9052 §5.3). [Envelope.EncStructure] selects between them by
+// recipient presence; these back that method.
 const (
 	contextEncrypt  = "Encrypt"
 	contextEncrypt0 = "Encrypt0"
@@ -200,15 +199,4 @@ type Recipient struct {
 	// key-agreement schemes that wrap no key); a non-nil value, including an
 	// empty slice, is encoded as a byte string.
 	Ciphertext []byte
-}
-
-// Encrypt is a COSE_Encrypt structure (RFC 9052 §5.1) with a detached
-// payload. The body ciphertext is always null on the wire; the actual
-// ciphertext is carried separately.
-type Encrypt struct {
-	// Headers is the body protected/unprotected header pair.
-	Headers Headers
-	// Recipients are the per-recipient wrapped-key entries. At least one is
-	// required to Encode or to be produced by DecodeEncrypt.
-	Recipients []*Recipient
 }

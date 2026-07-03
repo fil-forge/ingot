@@ -25,7 +25,7 @@ const (
 // exercises every header value kind: positive and negative integer labels, a
 // text-string label, byte strings, a nested map, and a custom string label.
 // The specific labels and values are arbitrary — cose is header-agnostic.
-func sampleEnvelope() *Encrypt {
+func sampleEnvelope() *Envelope {
 	protected := Header{}.
 		Set(HeaderLabelAlg, AlgA256GCM).
 		Set(HeaderLabelType, exampleType).
@@ -54,7 +54,7 @@ func sampleEnvelope() *Encrypt {
 		}
 	}
 
-	return &Encrypt{
+	return &Envelope{
 		Headers: Headers{Protected: protected, Unprotected: unprotected},
 		Recipients: []*Recipient{
 			mkRecipient("key-1", bytes.Repeat([]byte{0x11}, 40)),
@@ -74,7 +74,7 @@ func TestRoundTrip(t *testing.T) {
 		encoded, err := orig.Encode()
 		require.NoError(t, err)
 
-		env, rest, err := DecodeEncrypt(encoded, WithExpectedType(exampleType))
+		env, rest, err := Decode(encoded, WithExpectedType(exampleType))
 		require.NoError(t, err)
 		require.Len(t, rest, 0)
 
@@ -108,7 +108,7 @@ func TestRoundTrip(t *testing.T) {
 		orig := sampleEnvelope()
 		encoded, err := orig.Encode()
 		require.NoError(t, err)
-		env, _, err := DecodeEncrypt(encoded)
+		env, _, err := Decode(encoded)
 		require.NoError(t, err)
 
 		require.Len(t, env.Recipients, len(orig.Recipients))
@@ -135,7 +135,7 @@ func TestRoundTrip(t *testing.T) {
 		ciphertext := []byte("the detached ciphertext bytes, opaque to cose")
 		blob := append(append([]byte{}, envelope...), ciphertext...)
 
-		decoded, rest, err := DecodeEncrypt(blob)
+		decoded, rest, err := Decode(blob)
 		require.NoError(t, err)
 		require.Equal(t, ciphertext, rest)
 		require.Len(t, decoded.Recipients, len(env.Recipients))
@@ -147,7 +147,7 @@ func TestRoundTrip(t *testing.T) {
 		// able to Decode. Regression for the previously strict decode mode, which
 		// rejected any unsigned integer above MaxInt64.
 		const big = uint64(math.MaxUint64)
-		env := &Encrypt{
+		env := &Envelope{
 			Headers: Headers{Protected: Header{}.
 				Set("big", big).
 				Set("nested", map[any]any{"n": big, "small": int64(7)})},
@@ -159,7 +159,7 @@ func TestRoundTrip(t *testing.T) {
 
 		encoded, err := env.Encode()
 		require.NoError(t, err)
-		decoded, _, err := DecodeEncrypt(encoded)
+		decoded, _, err := Decode(encoded)
 		require.NoError(t, err)
 
 		// The top-level value comes back as the same uint64.
@@ -189,7 +189,7 @@ func TestEncode(t *testing.T) {
 		// Header map-key insertion order must not affect the bytes: a protected
 		// header built in a different order — including the nested map's keys —
 		// encodes identically (canonical sort).
-		reordered := &Encrypt{
+		reordered := &Envelope{
 			Headers: Headers{Protected: Header{}.
 				Set(labelNegLarge, map[any]any{"count": int64(3), "name": "example"}).
 				Set("x-custom", []byte{0x01, 0x02, 0x03}).
@@ -206,14 +206,21 @@ func TestEncode(t *testing.T) {
 		require.Equal(t, a, c)
 	})
 
-	t.Run("requires recipient", func(t *testing.T) {
-		env := &Encrypt{Headers: Headers{Protected: Header{}.Set(HeaderLabelAlg, AlgA256GCM)}}
-		_, err := env.Encode()
-		require.Error(t, err)
+	t.Run("recipient-less encodes as COSE_Encrypt0", func(t *testing.T) {
+		// With no recipients an Envelope is a COSE_Encrypt0 (tag 16), not an
+		// error: recipient presence is what selects the form.
+		env := &Envelope{Headers: Headers{Protected: Header{}.Set(HeaderLabelAlg, AlgA256GCM)}}
+		encoded, err := env.Encode()
+		require.NoError(t, err)
+		require.Equal(t, byte(0xd0), encoded[0], "recipient-less envelope must encode as tag 16")
+
+		decoded, _, err := Decode(encoded)
+		require.NoError(t, err)
+		require.Len(t, decoded.Recipients, 0)
 	})
 
 	t.Run("empty protected header", func(t *testing.T) {
-		env := &Encrypt{
+		env := &Envelope{
 			Headers:    Headers{Unprotected: Header{}.Set(HeaderLabelIV, []byte{0x01})},
 			Recipients: []*Recipient{{Ciphertext: []byte{0xAA}}},
 		}
@@ -225,7 +232,7 @@ func TestEncode(t *testing.T) {
 		require.Equal(t, byte(0x84), encoded[2], "empty protected not encoded as h'': bytes = %x", encoded[:6])
 		require.Equal(t, byte(0x40), encoded[3], "empty protected not encoded as h'': bytes = %x", encoded[:6])
 
-		decoded, _, err := DecodeEncrypt(encoded)
+		decoded, _, err := Decode(encoded)
 		require.NoError(t, err)
 		require.Len(t, decoded.Headers.Protected, 0)
 		pb, err := decoded.ProtectedBytes()
@@ -239,8 +246,8 @@ func TestEncode(t *testing.T) {
 // stay stable across an encode→decode round trip.
 func TestEncStructure(t *testing.T) {
 	t.Run("binds protected not unprotected", func(t *testing.T) {
-		base := func() *Encrypt {
-			return &Encrypt{
+		base := func() *Envelope {
+			return &Envelope{
 				Headers: Headers{
 					Protected:   Header{}.Set(HeaderLabelAlg, AlgA256GCM),
 					Unprotected: Header{}.Set(HeaderLabelIV, []byte{0x01}),
@@ -249,7 +256,7 @@ func TestEncStructure(t *testing.T) {
 			}
 		}
 
-		aad := func(e *Encrypt) []byte {
+		aad := func(e *Envelope) []byte {
 			t.Helper()
 			b, err := e.EncStructure(nil)
 			require.NoError(t, err)
@@ -283,7 +290,7 @@ func TestEncStructure(t *testing.T) {
 
 		encoded, err := orig.Encode()
 		require.NoError(t, err)
-		decoded, _, err := DecodeEncrypt(encoded)
+		decoded, _, err := Decode(encoded)
 		require.NoError(t, err)
 		got, err := decoded.EncStructure([]byte("ext"))
 		require.NoError(t, err)

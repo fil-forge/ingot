@@ -79,7 +79,7 @@ const richEnvelopeHex = "d8608443a10103a1054c00112233445566778899aabbf6818344a10
 // the tests don't validate cose against itself.
 func TestVectors(t *testing.T) {
 	t.Run("encode minimal", func(t *testing.T) {
-		env := &Encrypt{Recipients: []*Recipient{{Ciphertext: []byte{0xAA}}}}
+		env := &Envelope{Recipients: []*Recipient{{Ciphertext: []byte{0xAA}}}}
 		got, err := env.Encode()
 		require.NoError(t, err)
 		want := hexDec(t, minimalEnvelopeHex)
@@ -87,7 +87,7 @@ func TestVectors(t *testing.T) {
 	})
 
 	t.Run("decode minimal", func(t *testing.T) {
-		env, rest, err := DecodeEncrypt(hexDec(t, minimalEnvelopeHex))
+		env, rest, err := Decode(hexDec(t, minimalEnvelopeHex))
 		require.NoError(t, err)
 		require.Len(t, rest, 0)
 		require.Len(t, env.Headers.Protected, 0)
@@ -98,7 +98,7 @@ func TestVectors(t *testing.T) {
 
 	t.Run("decode rich", func(t *testing.T) {
 		data := hexDec(t, richEnvelopeHex)
-		env, rest, err := DecodeEncrypt(data)
+		env, rest, err := Decode(data)
 		require.NoError(t, err)
 		require.Len(t, rest, 0)
 
@@ -128,7 +128,7 @@ func TestVectors(t *testing.T) {
 	})
 
 	t.Run("enc_structure empty protected", func(t *testing.T) {
-		env := &Encrypt{Recipients: []*Recipient{{Ciphertext: []byte{0xAA}}}}
+		env := &Envelope{Recipients: []*Recipient{{Ciphertext: []byte{0xAA}}}}
 		aad, err := env.EncStructure(nil)
 		require.NoError(t, err)
 		// [ "Encrypt", h'', h'' ] = 83 67 "Encrypt" 40 40
