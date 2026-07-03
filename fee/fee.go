@@ -231,7 +231,14 @@ func EncryptWithCEK(plaintext io.Reader, cek []byte, recipients []Recipient, opt
 // encryptStream is the shared core of Encrypt and EncryptWithCEK: it seals
 // plaintext under cek and returns a streaming reader over envelope||ciphertext.
 // With no recipients it emits a COSE_Encrypt0 (tag 16); otherwise a COSE_Encrypt
-// (tag 96). It does not retain, modify, or wipe cek.
+// (tag 96). It does not modify or wipe cek.
+//
+// It also does not retain cek past its own return: the recipient wraps and the
+// aesstream.NewWriter that internalizes the CEK (into a GCM AEAD) both run
+// synchronously before encryptStream returns, so a caller may wipe cek as soon
+// as it returns — even though the returned reader has not been read and its
+// background encryption goroutine is still running. That goroutine works from
+// the writer's internalized key, never from the cek slice.
 func encryptStream(plaintext io.Reader, cek []byte, recipients []Recipient, opts ...EncryptOption) (io.ReadCloser, error) {
 	if plaintext == nil {
 		return nil, errors.New("fee: nil plaintext reader")
@@ -437,8 +444,13 @@ func DecryptWithCEK(src io.Reader, cek []byte) (io.Reader, error) {
 
 // openStream is the shared core of Decrypt and DecryptWithCEK: given a decoded
 // envelope, its detached ciphertext stream, and the content-encryption key, it
-// validates the body parameters and returns the streaming plaintext reader. It
-// copies cek into the body cipher and does not retain it.
+// validates the body parameters and returns the streaming plaintext reader.
+//
+// It does not retain cek past its own return: aesstream.NewReader internalizes
+// the CEK (into a GCM AEAD) synchronously before openStream returns, so a caller
+// may wipe cek as soon as it returns — even though the returned reader decrypts
+// lazily on later reads, which work from the internalized key, never the cek
+// slice.
 func openStream(env *cose.Envelope, ciphertext io.Reader, cek []byte) (io.Reader, error) {
 	alg, ok := env.Headers.Protected.Int(cose.HeaderLabelAlg)
 	if !ok {
