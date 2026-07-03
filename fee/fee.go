@@ -288,19 +288,10 @@ func encryptStream(plaintext io.Reader, cek []byte, recipients []Recipient, opts
 		return nil, fmt.Errorf("fee: building envelope AAD: %w", err)
 	}
 
-	pr, pw := io.Pipe()
-	w, err := aesstream.NewWriter(pw, aesstream.Config{
-		Key:       cek,
-		BaseNonce: baseNonce,
-		AAD:       aad,
-		ChunkSize: cfg.chunkSize,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("fee: initializing body cipher: %w", err)
-	}
-
-	// Encode the envelope header: a COSE_Encrypt0 (no recipients) or a
-	// COSE_Encrypt whose recipients each wrap the CEK.
+	// Encode the envelope header before creating the pipe: a COSE_Encrypt0 (no
+	// recipients) or a COSE_Encrypt whose recipients each wrap the CEK. All the
+	// fallible header work happens up front, so an error here returns before the
+	// pipe exists and can never orphan a PipeReader/PipeWriter pair.
 	var header []byte
 	if len(recipients) == 0 {
 		header, err = (&cose.Encrypt0{Headers: headers}).Encode()
@@ -317,6 +308,23 @@ func encryptStream(plaintext io.Reader, cek []byte, recipients []Recipient, opts
 	}
 	if err != nil {
 		return nil, fmt.Errorf("fee: encoding envelope: %w", err)
+	}
+
+	// The body cipher streams into a pipe that the returned reader drains. Create
+	// it only now that every fallible step above has succeeded; the one remaining
+	// fallible call (NewWriter) closes both ends on error, so no pipe is left
+	// dangling on any error path.
+	pr, pw := io.Pipe()
+	w, err := aesstream.NewWriter(pw, aesstream.Config{
+		Key:       cek,
+		BaseNonce: baseNonce,
+		AAD:       aad,
+		ChunkSize: cfg.chunkSize,
+	})
+	if err != nil {
+		_ = pw.Close()
+		_ = pr.Close()
+		return nil, fmt.Errorf("fee: initializing body cipher: %w", err)
 	}
 
 	declaredLen := cfg.contentLength
