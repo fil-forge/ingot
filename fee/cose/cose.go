@@ -21,9 +21,10 @@
 //
 // In a detached envelope the ciphertext field is always CBOR null; the real
 // ciphertext travels separately, conventionally appended directly after the
-// envelope bytes (envelope || ciphertext). [Decode] decodes the single,
-// self-delimited envelope item and returns whatever bytes follow it, so a
-// caller can recover that trailing ciphertext in one pass.
+// envelope bytes (envelope || ciphertext). [DecodeEncrypt] and
+// [DecodeEncrypt0] decode the single, self-delimited envelope item and return
+// whatever bytes follow it, so a caller can recover that trailing ciphertext in
+// one pass.
 //
 // # Enc_structure (AAD)
 //
@@ -98,7 +99,7 @@ const (
 	AlgECDHESA256KW int64 = -31 // ECDH-ES + AES-256 Key Wrap (key agreement + key wrap)
 )
 
-// Sentinel errors. Decode and header-validation failures wrap one of these, so
+// Sentinel errors. Decoding and header-validation failures wrap one of these, so
 // callers can classify malformed input with errors.Is. (Encode may also fail
 // with a non-sentinel error for a programming mistake — a nil recipient, or a
 // header value that CBOR cannot marshal.)
@@ -175,13 +176,13 @@ type Headers struct {
 	// authenticated. May be empty.
 	Unprotected Header
 	// RawProtected is the exact serialized content of the protected header
-	// byte string as it appeared on the wire. It is set by Decode and is the
+	// byte string as it appeared on the wire. It is set by decode and is the
 	// source of truth for the Enc_structure of a decoded envelope, so AAD
 	// verification uses the encoder's original bytes rather than a
 	// re-serialization. It is nil for an in-memory envelope that has not been
 	// decoded; in that case the protected bytes are derived from Protected.
 	//
-	// Mutating Protected after Decode does not update RawProtected; rebuild
+	// Mutating Protected after decode does not update RawProtected; rebuild
 	// the envelope instead of mutating a decoded one in place.
 	RawProtected []byte
 }
@@ -208,6 +209,6 @@ type Encrypt struct {
 	// Headers is the body protected/unprotected header pair.
 	Headers Headers
 	// Recipients are the per-recipient wrapped-key entries. At least one is
-	// required to Encode or to be produced by Decode.
+	// required to Encode or to be produced by DecodeEncrypt.
 	Recipients []*Recipient
 }
