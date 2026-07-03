@@ -71,19 +71,11 @@ func Decode(data []byte, opts ...DecodeOption) (env *Envelope, rest []byte, err 
 	}
 	rest = data[dec.NumBytesRead():]
 
-	var tag cbor.RawTag
-	if err := decMode.Unmarshal(first, &tag); err != nil {
-		return nil, nil, fmt.Errorf("%w: %v", ErrNotEncrypt, err)
+	tag, arr, err := decodeTagArray(first)
+	if err != nil {
+		return nil, nil, err
 	}
-	if cborMajor(tag.Content) != majorArray {
-		return nil, nil, fmt.Errorf("%w: tag content is not an array", ErrMalformed)
-	}
-	var arr []cbor.RawMessage
-	if err := decMode.Unmarshal(tag.Content, &arr); err != nil {
-		return nil, nil, fmt.Errorf("%w: %v", ErrMalformed, err)
-	}
-
-	env, err = decodeEnvelope(tag.Number, arr)
+	env, err = decodeEnvelope(tag, arr)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -91,6 +83,25 @@ func Decode(data []byte, opts ...DecodeOption) (env *Envelope, rest []byte, err 
 		return nil, nil, err
 	}
 	return env, rest, nil
+}
+
+// decodeTagArray unmarshals one already-read CBOR item into the tag number and
+// element array it wraps: the item must be a tag whose content is an array. It
+// is the shared preamble of [Decode] — element-count and per-element validation
+// is left to [decodeEnvelope] — factored out so a streaming decoder can reuse
+// the same tag/array extraction without duplicating it.
+func decodeTagArray(first cbor.RawMessage) (tag uint64, arr []cbor.RawMessage, err error) {
+	var t cbor.RawTag
+	if err := decMode.Unmarshal(first, &t); err != nil {
+		return 0, nil, fmt.Errorf("%w: %v", ErrNotEncrypt, err)
+	}
+	if cborMajor(t.Content) != majorArray {
+		return 0, nil, fmt.Errorf("%w: tag content is not an array", ErrMalformed)
+	}
+	if err := decMode.Unmarshal(t.Content, &arr); err != nil {
+		return 0, nil, fmt.Errorf("%w: %v", ErrMalformed, err)
+	}
+	return t.Number, arr, nil
 }
 
 // decodeEnvelope validates an already-decoded (tag, element-array) pair into an
