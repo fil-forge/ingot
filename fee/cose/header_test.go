@@ -139,7 +139,7 @@ func TestHeaderSetPanics(t *testing.T) {
 func TestEncodeRejectsInvalidLabel(t *testing.T) {
 	// Bypass Set to plant an invalid label, then confirm Encode reports it
 	// rather than producing bad CBOR.
-	env := &Encrypt{
+	env := &Envelope{
 		Headers:    Headers{Protected: Header{float64(1.5): "x"}},
 		Recipients: []*Recipient{{Ciphertext: []byte{0xAA}}},
 	}

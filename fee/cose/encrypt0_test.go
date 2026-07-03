@@ -13,10 +13,11 @@ import (
 // any text string works here.
 const encrypt0TestType = "application/test+cose"
 
-// sampleEncrypt0 builds a populated COSE_Encrypt0 (no recipients) with a
-// protected {alg, typ} header and an unprotected {iv, custom} header.
-func sampleEncrypt0() *Encrypt0 {
-	return &Encrypt0{
+// sampleEncrypt0 builds a populated recipient-less envelope — a COSE_Encrypt0
+// (tag 16) — with a protected {alg, typ} header and an unprotected {iv, custom}
+// header. Recipient absence is what makes it the tag-16 form.
+func sampleEncrypt0() *Envelope {
+	return &Envelope{
 		Headers: Headers{
 			Protected: Header{}.
 				Set(HeaderLabelAlg, int64(-65793)). // FEE chunked-STREAM private-use alg
@@ -51,9 +52,10 @@ func TestEncrypt0RoundTrip(t *testing.T) {
 	ciphertext := []byte{0xDE, 0xAD, 0xBE, 0xEF}
 	blob := append(append([]byte(nil), encoded...), ciphertext...)
 
-	env, rest, err := DecodeEncrypt0(blob)
+	env, rest, err := Decode(blob)
 	require.NoError(t, err)
 	require.Equal(t, ciphertext, rest)
+	require.Len(t, env.Recipients, 0, "recipient-less envelope decodes with no recipients")
 
 	alg, ok := env.Headers.Protected.Int(HeaderLabelAlg)
 	require.True(t, ok)
@@ -82,7 +84,7 @@ func TestEncrypt0EncodeShape(t *testing.T) {
 	require.NoError(t, err)
 
 	// Outer item is CBOR tag 16 (0xd0).
-	require.Equal(t, byte(0xd0), encoded[0], "outer tag must be 16 (COSE_Encrypt0)")
+	require.Equal(t, byte(0xd0), encoded[0], "recipient-less envelope must encode as tag 16 (COSE_Encrypt0)")
 
 	var tag cbor.RawTag
 	require.NoError(t, decMode.Unmarshal(encoded, &tag))
@@ -109,8 +111,9 @@ func TestEncrypt0EncStructure(t *testing.T) {
 	require.Equal(t, expectedEncStructure0(prot, nil), aad)
 
 	// The context string is "Encrypt0", distinguishing it from the tag-96
-	// "Encrypt" context even for an identical protected header.
-	enc := &Encrypt{Headers: env.Headers, Recipients: []*Recipient{{
+	// "Encrypt" context even for an identical protected header. The only
+	// difference between the two envelopes is recipient presence.
+	enc := &Envelope{Headers: env.Headers, Recipients: []*Recipient{{
 		Headers:    Headers{Protected: Header{}.Set(HeaderLabelAlg, AlgA256KW)},
 		Ciphertext: bytes.Repeat([]byte{0x01}, 40),
 	}}}
@@ -132,23 +135,20 @@ func TestEncrypt0EncStructureUsesRawProtected(t *testing.T) {
 	want, err := orig.EncStructure([]byte("ext"))
 	require.NoError(t, err)
 
-	decoded, _, err := DecodeEncrypt0(encoded)
+	decoded, _, err := Decode(encoded)
 	require.NoError(t, err)
 	got, err := decoded.EncStructure([]byte("ext"))
 	require.NoError(t, err)
 	require.Equal(t, want, got)
 }
 
-func TestDecodeEncrypt0Errors(t *testing.T) {
-	t.Run("rejects tag 96", func(t *testing.T) {
-		enc, err := sampleEnvelope().Encode()
-		require.NoError(t, err)
-		_, _, err = DecodeEncrypt0(enc)
-		require.ErrorIs(t, err, ErrNotEncrypt)
-	})
-
+// TestDecodeEncrypt0Shape covers decoding the recipient-less (tag 16) form:
+// malformed CBOR, a non-null (inline) body, the wrong element count, and the typ
+// check. (Unified Decode also accepts tag 96, so there is no "rejects tag 96"
+// case — a tag-96 envelope decodes as an Envelope carrying recipients.)
+func TestDecodeEncrypt0Shape(t *testing.T) {
 	t.Run("rejects malformed CBOR", func(t *testing.T) {
-		_, _, err := DecodeEncrypt0([]byte{0xff, 0xff, 0xff})
+		_, _, err := Decode([]byte{0xff, 0xff, 0xff})
 		require.ErrorIs(t, err, ErrMalformed)
 	})
 
@@ -157,16 +157,16 @@ func TestDecodeEncrypt0Errors(t *testing.T) {
 		body := []any{[]byte{}, Header{}, []byte{0x01}}
 		bad, err := encMode.Marshal(cbor.Tag{Number: TagCOSEEncrypt0, Content: body})
 		require.NoError(t, err)
-		_, _, err = DecodeEncrypt0(bad)
+		_, _, err = Decode(bad)
 		require.ErrorIs(t, err, ErrDetachedPayload)
 	})
 
 	t.Run("rejects wrong element count", func(t *testing.T) {
-		// A 4-element array is COSE_Encrypt shape, not COSE_Encrypt0.
+		// A 4-element array under tag 16 violates the COSE_Encrypt0 shape.
 		body := []any{[]byte{}, Header{}, nil, []any{}}
 		bad, err := encMode.Marshal(cbor.Tag{Number: TagCOSEEncrypt0, Content: body})
 		require.NoError(t, err)
-		_, _, err = DecodeEncrypt0(bad)
+		_, _, err = Decode(bad)
 		require.ErrorIs(t, err, ErrMalformed)
 	})
 
@@ -174,10 +174,10 @@ func TestDecodeEncrypt0Errors(t *testing.T) {
 		enc, err := sampleEncrypt0().Encode()
 		require.NoError(t, err)
 
-		_, _, err = DecodeEncrypt0(enc, WithExpectedType(encrypt0TestType))
+		_, _, err = Decode(enc, WithExpectedType(encrypt0TestType))
 		require.NoError(t, err)
 
-		_, _, err = DecodeEncrypt0(enc, WithExpectedType("application/other"))
+		_, _, err = Decode(enc, WithExpectedType("application/other"))
 		require.ErrorIs(t, err, ErrUnexpectedType)
 	})
 }
