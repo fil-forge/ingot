@@ -1,7 +1,8 @@
 // Package cose implements just enough of COSE (CBOR Object Signing and
-// Encryption, RFC 9052) to encode and decode a COSE_Encrypt structure
-// (CBOR tag 96) with a detached payload, and to build the Enc_structure
-// that COSE feeds to an AEAD as Additional Authenticated Data (AAD).
+// Encryption, RFC 9052) to encode and decode a COSE_Encrypt (CBOR tag 96) or
+// COSE_Encrypt0 (CBOR tag 16) structure with a detached payload, and to build
+// the Enc_structure that COSE feeds to an AEAD as Additional Authenticated Data
+// (AAD).
 //
 // It is the low-level envelope layer beneath the FEE (Filecoin Encryption
 // Envelope) package: cose carries opaque header parameters and wrapped
@@ -103,12 +104,13 @@ const (
 // with a non-sentinel error for a programming mistake — a nil recipient, or a
 // header value that CBOR cannot marshal.)
 var (
-	// ErrNotEncrypt means the input is not a COSE_Encrypt (tag 96) item.
-	ErrNotEncrypt = errors.New("cose: not a COSE_Encrypt (tag 96) structure")
+	// ErrNotEncrypt means the input is neither a COSE_Encrypt (tag 96) nor a
+	// COSE_Encrypt0 (tag 16) item.
+	ErrNotEncrypt = errors.New("cose: not a COSE_Encrypt (tag 96) or COSE_Encrypt0 (tag 16) structure")
 	// ErrMalformed means the CBOR could not be parsed into a well-formed
-	// COSE_Encrypt structure. A decode that returns ErrMalformed returns no
-	// partial structure.
-	ErrMalformed = errors.New("cose: malformed COSE_Encrypt structure")
+	// COSE_Encrypt or COSE_Encrypt0 structure. A decode that returns ErrMalformed
+	// returns no partial structure.
+	ErrMalformed = errors.New("cose: malformed COSE envelope")
 	// ErrDetachedPayload means the body ciphertext field was not CBOR null;
 	// this package only handles detached payloads.
 	ErrDetachedPayload = errors.New("cose: body ciphertext must be null (detached payload)")

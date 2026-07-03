@@ -94,11 +94,10 @@ func Decode(data []byte, opts ...DecodeOption) (env *Envelope, rest []byte, err 
 }
 
 // decodeEnvelope validates an already-decoded (tag, element-array) pair into an
-// [Envelope]. It is the shared core of the byte-based [Decode] and the streaming
-// [DecodeReader]: tag 96 requires a 4-element array with a non-empty recipients
-// array; tag 16 requires a 3-element array and yields a recipient-less envelope;
-// both require a byte-string protected header and a null body. Any other tag is
-// ErrNotEncrypt.
+// [Envelope]. It is the tag-dispatch core of [Decode]: tag 96 requires a
+// 4-element array with a non-empty recipients array; tag 16 requires a 3-element
+// array and yields a recipient-less envelope; both require a byte-string
+// protected header and a null body. Any other tag is ErrNotEncrypt.
 func decodeEnvelope(tag uint64, arr []cbor.RawMessage) (*Envelope, error) {
 	switch tag {
 	case TagCOSEEncrypt:
