@@ -74,7 +74,7 @@ func TestRoundTrip(t *testing.T) {
 		encoded, err := orig.Encode()
 		require.NoError(t, err)
 
-		env, rest, err := Decode(encoded, WithExpectedType(exampleType))
+		env, rest, err := DecodeEncrypt(encoded, WithExpectedType(exampleType))
 		require.NoError(t, err)
 		require.Len(t, rest, 0)
 
@@ -108,7 +108,7 @@ func TestRoundTrip(t *testing.T) {
 		orig := sampleEnvelope()
 		encoded, err := orig.Encode()
 		require.NoError(t, err)
-		env, _, err := Decode(encoded)
+		env, _, err := DecodeEncrypt(encoded)
 		require.NoError(t, err)
 
 		require.Len(t, env.Recipients, len(orig.Recipients))
@@ -135,7 +135,7 @@ func TestRoundTrip(t *testing.T) {
 		ciphertext := []byte("the detached ciphertext bytes, opaque to cose")
 		blob := append(append([]byte{}, envelope...), ciphertext...)
 
-		decoded, rest, err := Decode(blob)
+		decoded, rest, err := DecodeEncrypt(blob)
 		require.NoError(t, err)
 		require.Equal(t, ciphertext, rest)
 		require.Len(t, decoded.Recipients, len(env.Recipients))
@@ -159,7 +159,7 @@ func TestRoundTrip(t *testing.T) {
 
 		encoded, err := env.Encode()
 		require.NoError(t, err)
-		decoded, _, err := Decode(encoded)
+		decoded, _, err := DecodeEncrypt(encoded)
 		require.NoError(t, err)
 
 		// The top-level value comes back as the same uint64.
@@ -225,7 +225,7 @@ func TestEncode(t *testing.T) {
 		require.Equal(t, byte(0x84), encoded[2], "empty protected not encoded as h'': bytes = %x", encoded[:6])
 		require.Equal(t, byte(0x40), encoded[3], "empty protected not encoded as h'': bytes = %x", encoded[:6])
 
-		decoded, _, err := Decode(encoded)
+		decoded, _, err := DecodeEncrypt(encoded)
 		require.NoError(t, err)
 		require.Len(t, decoded.Headers.Protected, 0)
 		pb, err := decoded.ProtectedBytes()
@@ -283,7 +283,7 @@ func TestEncStructure(t *testing.T) {
 
 		encoded, err := orig.Encode()
 		require.NoError(t, err)
-		decoded, _, err := Decode(encoded)
+		decoded, _, err := DecodeEncrypt(encoded)
 		require.NoError(t, err)
 		got, err := decoded.EncStructure([]byte("ext"))
 		require.NoError(t, err)

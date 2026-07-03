@@ -38,7 +38,7 @@ func TestDecodeMalformed(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			// Tolerate spaces in the hex literals above for readability.
 			raw := hexDec(t, removeSpaces(tc.hex))
-			env, rest, err := Decode(raw)
+			env, rest, err := DecodeEncrypt(raw)
 			require.ErrorIs(t, err, tc.want)
 			require.Nil(t, env)
 			require.Nil(t, rest)
@@ -79,27 +79,27 @@ func TestDecodeExpectedType(t *testing.T) {
 	}
 
 	t.Run("matching type", func(t *testing.T) {
-		_, _, err := Decode(withType(exampleType), WithExpectedType(exampleType))
+		_, _, err := DecodeEncrypt(withType(exampleType), WithExpectedType(exampleType))
 		require.NoError(t, err)
 	})
 
 	t.Run("wrong type", func(t *testing.T) {
-		_, _, err := Decode(withType("application/other"), WithExpectedType(exampleType))
+		_, _, err := DecodeEncrypt(withType("application/other"), WithExpectedType(exampleType))
 		require.ErrorIs(t, err, ErrUnexpectedType)
 	})
 
 	t.Run("missing type", func(t *testing.T) {
-		_, _, err := Decode(withoutType(), WithExpectedType(exampleType))
+		_, _, err := DecodeEncrypt(withoutType(), WithExpectedType(exampleType))
 		require.ErrorIs(t, err, ErrUnexpectedType)
 	})
 
 	t.Run("type present but not a string", func(t *testing.T) {
-		_, _, err := Decode(withType(int64(7)), WithExpectedType(exampleType))
+		_, _, err := DecodeEncrypt(withType(int64(7)), WithExpectedType(exampleType))
 		require.ErrorIs(t, err, ErrUnexpectedType)
 	})
 
 	t.Run("no check when option omitted", func(t *testing.T) {
-		_, _, err := Decode(withoutType())
+		_, _, err := DecodeEncrypt(withoutType())
 		require.NoError(t, err)
 	})
 }
