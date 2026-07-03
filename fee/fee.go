@@ -279,33 +279,30 @@ func encryptStream(plaintext io.Reader, cek []byte, recipients []Recipient, opts
 		Unprotected: unprotected,
 	}
 
-	// The AAD binds the protected header into every STREAM chunk via the
-	// Enc_structure whose context matches the envelope tag ("Encrypt0" for a
-	// recipient-less envelope, "Encrypt" otherwise). It depends only on the
-	// (now-fixed) protected header, so it can be derived before the CEK is wrapped.
-	aad, err := (&cose.DecodedEnvelope{Tag: envelopeTag(len(recipients)), Headers: headers}).EncStructure(nil)
+	// Wrap the CEK to each recipient (none → a recipient-less envelope). All the
+	// fallible header work happens here, before the pipe is created, so an error
+	// returns before the pipe exists and can never orphan a PipeReader/PipeWriter
+	// pair.
+	entries := make([]*cose.Recipient, len(recipients))
+	for i, r := range recipients {
+		entry, werr := r.wrap(cek)
+		if werr != nil {
+			return nil, werr
+		}
+		entries[i] = entry
+	}
+
+	// One envelope drives both the AAD and the encoded header. Recipient presence
+	// alone selects the form — a COSE_Encrypt (tag 96) when present, a
+	// recipient-less COSE_Encrypt0 (tag 16) when not — and the Enc_structure
+	// context tracks it. The AAD binds the protected header into every STREAM
+	// chunk.
+	env := &cose.Envelope{Headers: headers, Recipients: entries}
+	aad, err := env.EncStructure(nil)
 	if err != nil {
 		return nil, fmt.Errorf("fee: building envelope AAD: %w", err)
 	}
-
-	// Encode the envelope header before creating the pipe: a COSE_Encrypt0 (no
-	// recipients) or a COSE_Encrypt whose recipients each wrap the CEK. All the
-	// fallible header work happens up front, so an error here returns before the
-	// pipe exists and can never orphan a PipeReader/PipeWriter pair.
-	var header []byte
-	if len(recipients) == 0 {
-		header, err = (&cose.Encrypt0{Headers: headers}).Encode()
-	} else {
-		entries := make([]*cose.Recipient, len(recipients))
-		for i, r := range recipients {
-			entry, werr := r.wrap(cek)
-			if werr != nil {
-				return nil, werr
-			}
-			entries[i] = entry
-		}
-		header, err = (&cose.Encrypt{Headers: headers, Recipients: entries}).Encode()
-	}
+	header, err := env.Encode()
 	if err != nil {
 		return nil, fmt.Errorf("fee: encoding envelope: %w", err)
 	}
@@ -345,15 +342,6 @@ func encryptStream(plaintext io.Reader, cek []byte, recipients []Recipient, opts
 		body: io.MultiReader(bytes.NewReader(header), pr),
 		pr:   pr,
 	}, nil
-}
-
-// envelopeTag reports the COSE tag for an envelope with the given recipient
-// count: tag 16 (COSE_Encrypt0) for none, tag 96 (COSE_Encrypt) otherwise.
-func envelopeTag(nRecipients int) uint64 {
-	if nRecipients == 0 {
-		return cose.TagCOSEEncrypt0
-	}
-	return cose.TagCOSEEncrypt
 }
 
 // chunkCountFor reports how many STREAM chunks a plaintext of nPlain bytes
@@ -406,7 +394,7 @@ func Decrypt(src io.Reader, unwrap RecipientUnwrapper) (io.Reader, error) {
 	if err != nil {
 		return nil, fmt.Errorf("fee: decoding envelope: %w", err)
 	}
-	if env.Tag != cose.TagCOSEEncrypt {
+	if len(env.Recipients) == 0 {
 		return nil, ErrNoRecipientsInEnvelope
 	}
 
@@ -451,7 +439,7 @@ func DecryptWithCEK(src io.Reader, cek []byte) (io.Reader, error) {
 // envelope, its detached ciphertext stream, and the content-encryption key, it
 // validates the body parameters and returns the streaming plaintext reader. It
 // copies cek into the body cipher and does not retain it.
-func openStream(env *cose.DecodedEnvelope, ciphertext io.Reader, cek []byte) (io.Reader, error) {
+func openStream(env *cose.Envelope, ciphertext io.Reader, cek []byte) (io.Reader, error) {
 	alg, ok := env.Headers.Protected.Int(cose.HeaderLabelAlg)
 	if !ok {
 		return nil, fmt.Errorf("%w: body algorithm header missing or not an integer", ErrUnsupportedBodyAlg)

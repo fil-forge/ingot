@@ -436,7 +436,7 @@ func TestDecryptCorruptedProtectedHeader(t *testing.T) {
 
 	// Locate the protected-header bytes via a clean decode, then flip the first
 	// byte (the CBOR map head) so the protected bytes are no longer a map.
-	env, _, err := cose.DecodeEncrypt(blob, cose.WithExpectedType(fee.EnvelopeType))
+	env, _, err := cose.Decode(blob, cose.WithExpectedType(fee.EnvelopeType))
 	require.NoError(t, err)
 	require.NotEmpty(t, env.Headers.RawProtected)
 	off := bytes.Index(blob, env.Headers.RawProtected)
@@ -477,7 +477,7 @@ func TestDecryptTamperedCiphertext(t *testing.T) {
 // COSE typ) is refused before any key material is used.
 func TestDecryptWrongEnvelopeType(t *testing.T) {
 	// A well-formed COSE_Encrypt with a non-FEE typ and a single recipient.
-	other := &cose.Encrypt{
+	other := &cose.Envelope{
 		Headers: cose.Headers{
 			Protected: cose.Header{}.Set(cose.HeaderLabelType, "application/not-fee"),
 		},
@@ -550,7 +550,7 @@ func TestEnvelopeWireConventions(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	env, ciphertext, err := cose.DecodeEncrypt(blob, cose.WithExpectedType(fee.EnvelopeType))
+	env, ciphertext, err := cose.Decode(blob, cose.WithExpectedType(fee.EnvelopeType))
 	require.NoError(t, err)
 
 	// Protected header: typ and body algorithm are authenticated via the AAD.
@@ -610,7 +610,7 @@ func TestContentLengthChunkCount(t *testing.T) {
 		)
 		require.NoError(t, err)
 
-		env, _, err := cose.DecodeEncrypt(blob, cose.WithExpectedType(fee.EnvelopeType))
+		env, _, err := cose.Decode(blob, cose.WithExpectedType(fee.EnvelopeType))
 		require.NoError(t, err)
 		cc, ok := env.Headers.Unprotected.Int(labelChunkCount)
 		require.True(t, ok, "chunk count present when content length declared")
@@ -626,7 +626,7 @@ func TestContentLengthChunkCount(t *testing.T) {
 		)
 		require.NoError(t, err)
 
-		env, _, err := cose.DecodeEncrypt(blob, cose.WithExpectedType(fee.EnvelopeType))
+		env, _, err := cose.Decode(blob, cose.WithExpectedType(fee.EnvelopeType))
 		require.NoError(t, err)
 		require.False(t, env.Headers.Unprotected.Has(labelChunkCount),
 			"chunk count omitted when content length unknown")
@@ -737,7 +737,7 @@ func TestDecryptMalformedChunkSizeHeader(t *testing.T) {
 
 	// Hand-build an envelope whose chunk-size header (FEE private-use label, in
 	// the unprotected header) is present but holds a string instead of an integer.
-	env := &cose.Encrypt{
+	env := &cose.Envelope{
 		Headers: cose.Headers{
 			Protected: cose.Header{}.
 				Set(cose.HeaderLabelAlg, algChunkedStream).
@@ -785,7 +785,7 @@ func TestDecryptMalformedEphemeralKey(t *testing.T) {
 	for _, tc := range cases {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			env := &cose.Encrypt{
+			env := &cose.Envelope{
 				Headers: cose.Headers{
 					Protected: cose.Header{}.
 						Set(cose.HeaderLabelAlg, algChunkedStream).

@@ -9,16 +9,16 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestDecodeReader exercises the streaming, tag-dispatching decoder: it decodes
-// both envelope shapes off a reader, streams back the detached ciphertext that
-// follows the header, and — critically — produces the same Enc_structure (AAD)
-// and the same trailing bytes as the byte-based Decode / DecodeEncrypt0, so a
-// caller can decrypt an envelope read either way.
+// TestDecodeReader exercises the streaming decoder: it decodes both envelope
+// forms off a reader, streams back the detached ciphertext that follows the
+// header, and — critically — produces the same Enc_structure (AAD) and the same
+// trailing bytes as the byte-based Decode, so a caller can decrypt an envelope
+// read either way.
 func TestDecodeReader(t *testing.T) {
 	ciphertext := []byte("detached-stream-ciphertext-bytes-0123456789")
 
-	t.Run("tag 96 COSE_Encrypt", func(t *testing.T) {
-		enc := &Encrypt{
+	t.Run("with recipients (COSE_Encrypt, tag 96)", func(t *testing.T) {
+		enc := &Envelope{
 			Headers: Headers{
 				Protected: Header{}.
 					Set(HeaderLabelType, exampleType).
@@ -39,15 +39,14 @@ func TestDecodeReader(t *testing.T) {
 
 		env, rest, err := DecodeReader(bytes.NewReader(blob))
 		require.NoError(t, err)
-		require.Equal(t, TagCOSEEncrypt, env.Tag)
-		require.Len(t, env.Recipients, 1)
+		require.Len(t, env.Recipients, 1, "recipient presence marks the tag-96 form")
 		gotRest, err := io.ReadAll(rest)
 		require.NoError(t, err)
 		require.Equal(t, ciphertext, gotRest)
 
-		// The streaming decode agrees with the byte-based DecodeEncrypt on both
-		// the trailing ciphertext and the AAD (context "Encrypt").
-		byteEnv, byteRest, err := DecodeEncrypt(blob)
+		// The streaming decode agrees with the byte-based Decode on both the
+		// trailing ciphertext and the AAD (context "Encrypt").
+		byteEnv, byteRest, err := Decode(blob)
 		require.NoError(t, err)
 		require.Equal(t, ciphertext, byteRest)
 		want, err := byteEnv.EncStructure(nil)
@@ -57,8 +56,8 @@ func TestDecodeReader(t *testing.T) {
 		require.Equal(t, want, got)
 	})
 
-	t.Run("tag 16 COSE_Encrypt0", func(t *testing.T) {
-		enc0 := &Encrypt0{
+	t.Run("recipient-less (COSE_Encrypt0, tag 16)", func(t *testing.T) {
+		enc0 := &Envelope{
 			Headers: Headers{
 				Protected: Header{}.
 					Set(HeaderLabelType, exampleType).
@@ -72,14 +71,13 @@ func TestDecodeReader(t *testing.T) {
 
 		env, rest, err := DecodeReader(bytes.NewReader(blob))
 		require.NoError(t, err)
-		require.Equal(t, TagCOSEEncrypt0, env.Tag)
-		require.Nil(t, env.Recipients)
+		require.Empty(t, env.Recipients, "recipient absence marks the tag-16 form")
 		gotRest, err := io.ReadAll(rest)
 		require.NoError(t, err)
 		require.Equal(t, ciphertext, gotRest)
 
-		// Agrees with the byte-based DecodeEncrypt0 (context "Encrypt0").
-		byteEnv, byteRest, err := DecodeEncrypt0(blob)
+		// Agrees with the byte-based Decode (context "Encrypt0").
+		byteEnv, byteRest, err := Decode(blob)
 		require.NoError(t, err)
 		require.Equal(t, ciphertext, byteRest)
 		want, err := byteEnv.EncStructure(nil)
@@ -90,7 +88,7 @@ func TestDecodeReader(t *testing.T) {
 	})
 
 	t.Run("ciphertext split across the decoder buffer and the reader", func(t *testing.T) {
-		enc0 := &Encrypt0{
+		enc0 := &Envelope{
 			Headers: Headers{Protected: Header{}.Set(HeaderLabelType, exampleType)},
 		}
 		header, err := enc0.Encode()
@@ -101,14 +99,14 @@ func TestDecodeReader(t *testing.T) {
 		// and the ciphertext to straddle the decoder's read-ahead and the source.
 		env, rest, err := DecodeReader(iotest.OneByteReader(bytes.NewReader(blob)))
 		require.NoError(t, err)
-		require.Equal(t, TagCOSEEncrypt0, env.Tag)
+		require.Empty(t, env.Recipients)
 		gotRest, err := io.ReadAll(rest)
 		require.NoError(t, err)
 		require.Equal(t, ciphertext, gotRest)
 	})
 
 	t.Run("expected type mismatch", func(t *testing.T) {
-		enc0 := &Encrypt0{
+		enc0 := &Envelope{
 			Headers: Headers{Protected: Header{}.Set(HeaderLabelType, "application/other")},
 		}
 		header, err := enc0.Encode()

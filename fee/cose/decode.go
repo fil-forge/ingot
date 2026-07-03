@@ -14,7 +14,7 @@ type decodeConfig struct {
 	expectedType string
 }
 
-// DecodeOption configures [Decode].
+// DecodeOption configures [Decode] and [DecodeReader].
 type DecodeOption func(*decodeConfig)
 
 // WithExpectedType requires the decoded protected header to carry a "typ"
@@ -88,9 +88,10 @@ func Decode(data []byte, opts ...DecodeOption) (env *Envelope, rest []byte, err 
 
 // decodeTagArray unmarshals one already-read CBOR item into the tag number and
 // element array it wraps: the item must be a tag whose content is an array. It
-// is the shared preamble of [Decode] — element-count and per-element validation
-// is left to [decodeEnvelope] — factored out so a streaming decoder can reuse
-// the same tag/array extraction without duplicating it.
+// is the shared preamble of [Decode] and [DecodeReader] — which differ only in
+// how they recover the trailing detached payload — so neither duplicates the
+// tag/array extraction; element-count and per-element validation is left to
+// [decodeEnvelope].
 func decodeTagArray(first cbor.RawMessage) (tag uint64, arr []cbor.RawMessage, err error) {
 	var t cbor.RawTag
 	if err := decMode.Unmarshal(first, &t); err != nil {
@@ -106,10 +107,10 @@ func decodeTagArray(first cbor.RawMessage) (tag uint64, arr []cbor.RawMessage, e
 }
 
 // decodeEnvelope validates an already-decoded (tag, element-array) pair into an
-// [Envelope]. It is the tag-dispatch core of [Decode]: tag 96 requires a
-// 4-element array with a non-empty recipients array; tag 16 requires a 3-element
-// array and yields a recipient-less envelope; both require a byte-string
-// protected header and a null body. Any other tag is ErrNotEncrypt.
+// [Envelope]. It is the tag-dispatch core shared by [Decode] and [DecodeReader]:
+// tag 96 requires a 4-element array with a non-empty recipients array; tag 16
+// requires a 3-element array and yields a recipient-less envelope; both require a
+// byte-string protected header and a null body. Any other tag is ErrNotEncrypt.
 func decodeEnvelope(tag uint64, arr []cbor.RawMessage) (*Envelope, error) {
 	switch tag {
 	case TagCOSEEncrypt:
@@ -159,52 +160,19 @@ func PeekTag(data []byte) (uint64, error) {
 	return tag.Number, nil
 }
 
-// DecodedEnvelope is a decoded detached COSE envelope header returned by
-// [DecodeReader]: either a COSE_Encrypt (tag 96, carrying Recipients) or a
-// COSE_Encrypt0 (tag 16, no recipients), distinguished by Tag.
-type DecodedEnvelope struct {
-	// Tag is [TagCOSEEncrypt] (96) or [TagCOSEEncrypt0] (16).
-	Tag uint64
-	// Headers is the body protected/unprotected header pair.
-	Headers Headers
-	// Recipients are the per-recipient wrapped-key entries; nil for a
-	// COSE_Encrypt0 (tag 16).
-	Recipients []*Recipient
-}
-
-// EncStructure returns the body AAD Enc_structure for this envelope, using the
-// context that matches its tag: "Encrypt" for a COSE_Encrypt (tag 96),
-// "Encrypt0" for a COSE_Encrypt0 (tag 16). See [Encrypt.EncStructure].
-func (e *DecodedEnvelope) EncStructure(externalAAD []byte) ([]byte, error) {
-	ctx := contextEncrypt
-	if e.Tag == TagCOSEEncrypt0 {
-		ctx = contextEncrypt0
-	}
-	prot, err := e.Headers.protectedBytes()
-	if err != nil {
-		return nil, fmt.Errorf("cose: building Enc_structure: %w", err)
-	}
-	return encStructureBytes(ctx, prot, externalAAD)
-}
-
 // DecodeReader reads one detached COSE_Encrypt (tag 96) or COSE_Encrypt0 (tag
-// 16) from the front of r and returns the decoded envelope header together with
-// rest: a reader over the bytes that follow the self-delimited envelope item —
-// the detached ciphertext. rest draws first from whatever the decoder buffered
-// past the envelope, then from r, so only the (small) header is held in memory
-// and an arbitrarily large ciphertext can be streamed.
+// 16) from the front of r and returns the decoded [Envelope] together with rest:
+// a reader over the bytes that follow the self-delimited envelope item — the
+// detached ciphertext. rest draws first from whatever the decoder buffered past
+// the envelope, then from r, so only the (small) header is held in memory and an
+// arbitrarily large ciphertext can be streamed.
 //
-// It is the streaming, tag-dispatching counterpart to [DecodeEncrypt] and
-// [DecodeEncrypt0], and is as strict as they are: a byte-string protected
-// header, map headers without duplicate labels, a null detached body, and — for
-// tag 96 — at least one well-formed 3-element recipient. Any deviation returns
-// an error (wrapping a package sentinel) and a nil envelope.
-func DecodeReader(r io.Reader, opts ...DecodeOption) (env *DecodedEnvelope, rest io.Reader, err error) {
-	var cfg decodeConfig
-	for _, o := range opts {
-		o(&cfg)
-	}
-
+// It is the streaming counterpart to [Decode], dispatching on the same tags and
+// as strict — both share the decodeEnvelope validation core: a byte-string
+// protected header, map headers without duplicate labels, a null detached body,
+// and, for tag 96, at least one well-formed 3-element recipient. Any deviation
+// returns an error (wrapping a package sentinel) and a nil envelope.
+func DecodeReader(r io.Reader, opts ...DecodeOption) (env *Envelope, rest io.Reader, err error) {
 	// Read exactly one CBOR item. Whatever the decoder buffered past that item,
 	// followed by the unread remainder of r, is the detached payload.
 	dec := decMode.NewDecoder(r)
@@ -214,58 +182,17 @@ func DecodeReader(r io.Reader, opts ...DecodeOption) (env *DecodedEnvelope, rest
 	}
 	rest = io.MultiReader(dec.Buffered(), r)
 
-	var tag cbor.RawTag
-	if err := decMode.Unmarshal(first, &tag); err != nil {
-		return nil, nil, fmt.Errorf("%w: %v", ErrNotEncrypt, err)
-	}
-	if tag.Number != TagCOSEEncrypt && tag.Number != TagCOSEEncrypt0 {
-		return nil, nil, fmt.Errorf("%w: got tag %d", ErrNotEncrypt, tag.Number)
-	}
-
-	if cborMajor(tag.Content) != majorArray {
-		return nil, nil, fmt.Errorf("%w: tag content is not an array", ErrMalformed)
-	}
-	var arr []cbor.RawMessage
-	if err := decMode.Unmarshal(tag.Content, &arr); err != nil {
-		return nil, nil, fmt.Errorf("%w: %v", ErrMalformed, err)
-	}
-
-	// A COSE_Encrypt is a 4-element array (with recipients); a COSE_Encrypt0 is
-	// a 3-element array (no recipients).
-	wantLen := 3
-	if tag.Number == TagCOSEEncrypt {
-		wantLen = 4
-	}
-	if len(arr) != wantLen {
-		return nil, nil, fmt.Errorf("%w: array has %d elements, want %d", ErrMalformed, len(arr), wantLen)
-	}
-
-	headers, err := decodeHeaders(arr[0], arr[1])
+	tag, arr, err := decodeTagArray(first)
 	if err != nil {
 		return nil, nil, err
 	}
-
-	// Detached payload: the body ciphertext must be null.
-	if !isNull(arr[2]) {
-		return nil, nil, ErrDetachedPayload
+	env, err = decodeEnvelope(tag, arr)
+	if err != nil {
+		return nil, nil, err
 	}
-
-	env = &DecodedEnvelope{Tag: tag.Number, Headers: headers}
-	if tag.Number == TagCOSEEncrypt {
-		recipients, err := decodeRecipients(arr[3])
-		if err != nil {
-			return nil, nil, err
-		}
-		env.Recipients = recipients
+	if err := newDecodeConfig(opts).checkTyp(env.Headers.Protected); err != nil {
+		return nil, nil, err
 	}
-
-	if cfg.checkType {
-		got, ok := env.Headers.Protected.Text(HeaderLabelType)
-		if !ok || got != cfg.expectedType {
-			return nil, nil, fmt.Errorf("%w: got %q, want %q", ErrUnexpectedType, got, cfg.expectedType)
-		}
-	}
-
 	return env, rest, nil
 }
 
