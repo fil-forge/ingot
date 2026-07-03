@@ -47,7 +47,7 @@ func Example() {
 	blob := append(envelope, []byte("...detached ciphertext...")...)
 
 	// Decode, pinning the expected type, and recover the trailing payload.
-	decoded, ciphertext, err := cose.Decode(blob, cose.WithExpectedType(exampleType))
+	decoded, ciphertext, err := cose.DecodeEncrypt(blob, cose.WithExpectedType(exampleType))
 	if err != nil {
 		panic(err)
 	}

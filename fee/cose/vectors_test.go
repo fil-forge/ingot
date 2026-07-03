@@ -87,7 +87,7 @@ func TestVectors(t *testing.T) {
 	})
 
 	t.Run("decode minimal", func(t *testing.T) {
-		env, rest, err := Decode(hexDec(t, minimalEnvelopeHex))
+		env, rest, err := DecodeEncrypt(hexDec(t, minimalEnvelopeHex))
 		require.NoError(t, err)
 		require.Len(t, rest, 0)
 		require.Len(t, env.Headers.Protected, 0)
@@ -98,7 +98,7 @@ func TestVectors(t *testing.T) {
 
 	t.Run("decode rich", func(t *testing.T) {
 		data := hexDec(t, richEnvelopeHex)
-		env, rest, err := Decode(data)
+		env, rest, err := DecodeEncrypt(data)
 		require.NoError(t, err)
 		require.Len(t, rest, 0)
 

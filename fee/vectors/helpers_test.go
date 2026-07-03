@@ -223,7 +223,7 @@ func decodeFEE(blob []byte) (*parsedFEE, error) {
 			return nil, fmt.Errorf("enc_structure: %w", err)
 		}
 	case cose.TagCOSEEncrypt:
-		env, rest, err := cose.Decode(blob, cose.WithExpectedType(feeTyp))
+		env, rest, err := cose.DecodeEncrypt(blob, cose.WithExpectedType(feeTyp))
 		if err != nil {
 			return nil, err
 		}
