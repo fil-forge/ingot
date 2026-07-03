@@ -194,7 +194,7 @@ func (e *DecodedEnvelope) EncStructure(externalAAD []byte) ([]byte, error) {
 // past the envelope, then from r, so only the (small) header is held in memory
 // and an arbitrarily large ciphertext can be streamed.
 //
-// It is the streaming, tag-dispatching counterpart to [Decode] and
+// It is the streaming, tag-dispatching counterpart to [DecodeEncrypt] and
 // [DecodeEncrypt0], and is as strict as they are: a byte-string protected
 // header, map headers without duplicate labels, a null detached body, and — for
 // tag 96 — at least one well-formed 3-element recipient. Any deviation returns
