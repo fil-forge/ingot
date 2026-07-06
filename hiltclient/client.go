@@ -51,11 +51,11 @@ func New(serviceID did.DID, serviceURL url.URL, issuer ucan.Issuer, proofs ucanl
 		httpExecutor, err = client.NewHTTP(&serviceURL)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("creating HTTP executor: %w", err)
+		return nil, fmt.Errorf("hiltclient: creating HTTP executor: %w", err)
 	}
 
 	if issuer == nil {
-		return nil, fmt.Errorf("issuer is required")
+		return nil, fmt.Errorf("hiltclient: issuer is required")
 	}
 	if proofs == nil {
 		proofs = ucanlib.NewContainerProofStore(container.New())
@@ -113,25 +113,25 @@ func invoke[A, O binding.CBORValue](ctx context.Context, c *Client, cmd binding.
 
 	proofs, links, err := cfg.proofs.ProofChain(ctx, cfg.issuer.DID(), cmd.Command, c.ServiceID)
 	if err != nil {
-		return zero, nil, fmt.Errorf("getting proof chain: %w", err)
+		return zero, nil, fmt.Errorf("hiltclient: getting proof chain: %w", err)
 	}
 	inv, err := cmd.Invoke(cfg.issuer, c.ServiceID, args,
 		invocation.WithAudience(c.ServiceID),
 		invocation.WithProofs(links...),
 	)
 	if err != nil {
-		return zero, nil, fmt.Errorf("invoking %s: %w", cmd.Command, err)
+		return zero, nil, fmt.Errorf("hiltclient: invoking %s: %w", cmd.Command, err)
 	}
 	log := zapucan.WithInvocation(c.Logger, inv)
 	log.Debug("executing invocation")
 	res, err := c.Executor.Execute(execution.NewRequest(ctx, inv, execution.WithDelegations(proofs...)))
 	if err != nil {
 		log.Error("failed to execute invocation", zap.Error(err))
-		return zero, nil, fmt.Errorf("executing %s invocation: %w", cmd.Command, err)
+		return zero, nil, fmt.Errorf("hiltclient: executing %s invocation: %w", cmd.Command, err)
 	}
 	ok, err := cmd.Unpack(res.Receipt())
 	if err != nil {
-		return zero, nil, fmt.Errorf("unpacking %s result: %w", cmd.Command, err)
+		return zero, nil, fmt.Errorf("hiltclient: unpacking %s result: %w", cmd.Command, err)
 	}
 	return ok, res.Metadata(), nil
 }

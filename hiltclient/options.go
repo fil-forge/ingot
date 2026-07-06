@@ -4,7 +4,6 @@ import (
 	"net/http"
 
 	ucanlib "github.com/fil-forge/libforge/ucan"
-	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/ucantone/ucan"
 	"go.uber.org/zap"
 )
@@ -14,20 +13,11 @@ type Option func(*clientConfig)
 type clientConfig struct {
 	httpClient *http.Client
 	logger     *zap.Logger
-	product    did.DID
 }
 
 func WithHTTPClient(httpClient *http.Client) Option {
 	return func(cfg *clientConfig) {
 		cfg.httpClient = httpClient
-	}
-}
-
-// WithProduct sets the default product/plan DID used when registering customers
-// (see [UploadClient.RegisterCustomer]).
-func WithProduct(product did.DID) Option {
-	return func(cfg *clientConfig) {
-		cfg.product = product
 	}
 }
 
