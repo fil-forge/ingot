@@ -43,6 +43,17 @@ type Config struct {
 	// TokenStoreDir is where login-derived delegations persist (tokens.cbor).
 	// Optional; defaults to DataDir.
 	TokenStoreDir string `mapstructure:"token_store_dir" yaml:"token_store_dir"`
+	// HiltURL / HiltDID address the Hilt tenant-management service: the UCAN
+	// RPC peer ingot invokes /s3/request/authorize and /s3/bucket/* against
+	// (see the Forge S3 tenant-management RFC).
+	HiltURL string `mapstructure:"hilt_url" yaml:"hilt_url"`
+	HiltDID string `mapstructure:"hilt_did" yaml:"hilt_did"`
+	// HiltProofs supplies the Hilt→agent delegation chains the hilt client
+	// attaches to its invocations: either a path to a file containing a UCAN
+	// container of proofs, or the string-encoded UCAN container itself.
+	// Optional; when empty the client sends invocations with no proofs (Hilt
+	// may authorize registered provider DIDs directly).
+	HiltProofs string `mapstructure:"hilt_proofs" yaml:"hilt_proofs"`
 
 	// CatalogPlane overrides the catalog logstore pipeline knobs. Any field
 	// left zero/unset falls back to the top-level SealBytes / SealAge / Retain

@@ -137,7 +137,9 @@ Viper/yaml-bindable. Key fields: `Enabled`, `Addr`, `DataDir`, `Region`,
 `DataPlane`/`CatalogPlane` `{SealBytes, SealAge, Ship, Retain}` overrides,
 `IndexerEndpoint`/`IndexerDID`, `ReadCacheBytes` (0 → 256 MiB, <0 → off),
 `UploadServiceURL`/`UploadServiceDID`/`UploadReceiptsURL`, `TokenStoreDir`
-(→ `DataDir`). `Config.ServerConfig()` is the single mapping site. The daemon's
+(→ `DataDir`), `HiltURL`/`HiltDID`/`HiltProofs` (tenant-management service;
+proofs = file path or string-encoded UCAN container, optional).
+`Config.ServerConfig()` is the single mapping site. The daemon's
 `DaemonConfig` (cmd/config.go) embeds `Config` + `Mode`/`PostgresDSN`/`Identity`.
 
 ## Testing

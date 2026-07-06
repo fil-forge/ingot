@@ -125,6 +125,19 @@ func (c *DaemonConfig) Validate() error {
 		}
 	}
 
+	// Hilt is optional, but a partial configuration is a mistake: proofs are
+	// useless without the service address, and the address needs the DID.
+	if (c.HiltURL != "" || c.HiltDID != "" || c.HiltProofs != "") && (c.HiltURL == "" || c.HiltDID == "") {
+		errs = append(errs, "hilt_url and hilt_did must both be set to enable hilt")
+	}
+	if c.HiltProofs != "" {
+		// Load eagerly so a bad path or encoding fails at startup rather than
+		// on the first authorized request.
+		if _, err := ingot.LoadProofsContainer(c.HiltProofs); err != nil {
+			errs = append(errs, fmt.Sprintf("hilt_proofs: %v", err))
+		}
+	}
+
 	if len(errs) > 0 {
 		return fmt.Errorf("invalid config:\n  - %s", strings.Join(errs, "\n  - "))
 	}

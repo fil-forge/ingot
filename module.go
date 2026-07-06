@@ -51,6 +51,7 @@ import (
 	contentcmds "github.com/fil-forge/libforge/commands/content"
 	indexcmds "github.com/fil-forge/libforge/commands/index"
 	"github.com/fil-forge/libforge/receipt"
+	ucanlib "github.com/fil-forge/libforge/ucan"
 	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/ucantone/ucan"
 	"github.com/fil-forge/ucantone/ucan/delegation"
@@ -60,6 +61,7 @@ import (
 
 	"github.com/fil-forge/ingot/blockstore"
 	"github.com/fil-forge/ingot/forgeclient"
+	"github.com/fil-forge/ingot/hiltclient"
 	"github.com/fil-forge/ingot/logstore"
 	"github.com/fil-forge/ingot/migrations"
 	"github.com/fil-forge/ingot/registry"
@@ -104,6 +106,7 @@ func Module(cfg Config) fx.Option {
 			provideForgeReader,
 			provideTokenStore,
 			provideForgeClient,
+			provideHiltClient,
 			provideUploader,
 			provideMigrationHook,
 			provideTokenSeedHook,
@@ -236,6 +239,34 @@ func provideForgeClient(cfg Config, id ServiceIdentity, store tokenstore.Store, 
 		opts = append(opts, forgeclient.WithReceiptsClient(receipt.NewClient(rcptURL)))
 	}
 	return forgeclient.New(id.Signer, sprueDID, *sprueURL, opts...)
+}
+
+// provideHiltClient builds the UCAN RPC client to the Hilt tenant-management
+// service (/s3/request/authorize, /s3/bucket/*). The agent identity issues
+// invocations; HiltProofs (optional) supplies the Hilt→agent proof chains.
+// The provider is lazy, so an unconfigured Hilt only errors if a consumer
+// actually needs the client.
+func provideHiltClient(cfg Config, id ServiceIdentity, logger *zap.Logger) (*hiltclient.Client, error) {
+	if cfg.HiltURL == "" || cfg.HiltDID == "" {
+		return nil, fmt.Errorf("ingot: hilt_url and hilt_did are required for the hilt client")
+	}
+	hiltURL, err := url.Parse(cfg.HiltURL)
+	if err != nil {
+		return nil, fmt.Errorf("ingot: parse hilt_url: %w", err)
+	}
+	hiltDID, err := did.Parse(cfg.HiltDID)
+	if err != nil {
+		return nil, fmt.Errorf("ingot: parse hilt_did: %w", err)
+	}
+	var proofs ucanlib.ProofStore
+	if cfg.HiltProofs != "" {
+		ct, err := LoadProofsContainer(cfg.HiltProofs)
+		if err != nil {
+			return nil, fmt.Errorf("ingot: hilt_proofs: %w", err)
+		}
+		proofs = ucanlib.NewContainerProofStore(ct)
+	}
+	return hiltclient.New(hiltDID, *hiltURL, id.Signer, proofs, hiltclient.WithLogger(logger))
 }
 
 // tokenSeedHookOut feeds the delegation-seed PreStartHook into the group.
