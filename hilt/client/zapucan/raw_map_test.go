@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"testing"
 
-	"github.com/fil-forge/ingot/hiltclient/zapucan"
+	"github.com/fil-forge/ingot/hilt/client/zapucan"
 	"github.com/fil-forge/libforge/testutil"
 	"github.com/fil-forge/ucantone/ipld/datamodel"
 	"go.uber.org/zap"

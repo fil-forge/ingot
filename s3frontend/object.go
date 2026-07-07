@@ -12,12 +12,12 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/fil-forge/versitygw/backend"
+	"github.com/fil-forge/versitygw/s3api/utils"
+	"github.com/fil-forge/versitygw/s3err"
+	"github.com/fil-forge/versitygw/s3response"
 	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
-	"github.com/versity/versitygw/backend"
-	"github.com/versity/versitygw/s3api/utils"
-	"github.com/versity/versitygw/s3err"
-	"github.com/versity/versitygw/s3response"
 
 	msbucket "github.com/fil-forge/ingot/bucket"
 	"github.com/fil-forge/ingot/bucketop"
@@ -42,7 +42,7 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 	bucketName := *input.Bucket
 	key := *input.Key
 	if !mst.IsValidKey(key) {
-		return s3response.PutObjectOutput{}, s3err.GetAPIError(s3err.ErrInvalidArgument)
+		return s3response.PutObjectOutput{}, s3err.GetAPIError(s3err.ErrNoSuchKey)
 	}
 
 	contentType := backend.GetStringFromPtr(input.ContentType)

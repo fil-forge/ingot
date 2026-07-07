@@ -12,10 +12,10 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/fil-forge/versitygw/backend"
+	"github.com/fil-forge/versitygw/s3err"
+	"github.com/fil-forge/versitygw/s3response"
 	"github.com/ipfs/go-cid"
-	"github.com/versity/versitygw/backend"
-	"github.com/versity/versitygw/s3err"
-	"github.com/versity/versitygw/s3response"
 
 	msbucket "github.com/fil-forge/ingot/bucket"
 	"github.com/fil-forge/ingot/bucketop"
@@ -41,7 +41,7 @@ func (b *Backend) CreateMultipartUpload(ctx context.Context, input s3response.Cr
 	}
 	bucket, key := *input.Bucket, *input.Key
 	if !mst.IsValidKey(key) {
-		return s3response.InitiateMultipartUploadResult{}, s3err.GetAPIError(s3err.ErrInvalidArgument)
+		return s3response.InitiateMultipartUploadResult{}, s3err.GetAPIError(s3err.ErrNoSuchKey)
 	}
 	if _, err := b.reg.Get(ctx, bucket); err != nil {
 		if errors.Is(err, registry.ErrNotFound) {

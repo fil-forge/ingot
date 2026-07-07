@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/versity/versitygw/tests/integration"
+	"github.com/fil-forge/versitygw/tests/integration"
 )
 
 // TestRun_CapturesCaseNames validates end-to-end that Run recovers per-case

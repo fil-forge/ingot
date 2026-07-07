@@ -7,13 +7,13 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/fil-forge/versitygw/auth"
+	"github.com/fil-forge/versitygw/metrics"
+	"github.com/fil-forge/versitygw/s3api"
+	"github.com/fil-forge/versitygw/s3api/middlewares"
+	"github.com/fil-forge/versitygw/s3event"
+	"github.com/fil-forge/versitygw/s3log"
 	"github.com/multiformats/go-multihash"
-	"github.com/versity/versitygw/auth"
-	"github.com/versity/versitygw/metrics"
-	"github.com/versity/versitygw/s3api"
-	"github.com/versity/versitygw/s3api/middlewares"
-	"github.com/versity/versitygw/s3event"
-	"github.com/versity/versitygw/s3log"
 	"go.uber.org/zap"
 
 	"github.com/fil-forge/ingot/blockstore"
@@ -113,6 +113,12 @@ type ServerDeps struct {
 	// Meta is the persistence backing for log-segment metadata.
 	// Typically the same instance as Registry.
 	Meta logstore.Meta
+
+	// IAM authenticates non-root access keys (e.g. hilt/iam, which
+	// authorizes each request against the Hilt tenant service). Optional:
+	// nil leaves the gateway with only the single root account, as in
+	// standalone mode and the test harness.
+	IAM auth.IAMService
 }
 
 // Server is a fully-wired ingot S3 listener. Use Start/Stop for
@@ -179,7 +185,7 @@ func New(ctx context.Context, cfg ServerConfig, deps ServerDeps) (*Server, error
 		MaxBlobSize: cfg.MaxBlobSize,
 	})
 
-	api, err := buildS3API(ctx, backend, cfg)
+	api, err := buildS3API(ctx, backend, cfg, deps.IAM)
 	if err != nil {
 		// Best-effort cleanup if we got past the log open: the caller
 		// has no Server handle to call Stop on.
@@ -273,16 +279,20 @@ func newPlaneFlushFunc(up uploader.Uploader, plane blockstore.Plane) logstore.Fl
 	}
 }
 
-// buildS3API constructs the versitygw S3ApiServer with the wiring
-// ingot needs: single-account IAM, no audit / event sinks, generous
-// concurrency limits.
-func buildS3API(ctx context.Context, backend *s3frontend.Backend, cfg ServerConfig) (*s3api.S3ApiServer, error) {
+// buildS3API constructs the versitygw S3ApiServer with the wiring ingot
+// needs: no audit / event sinks, generous concurrency limits. Non-root
+// access keys authenticate through iam when provided (the root account is
+// checked before the IAM lookup either way); with a nil iam the gateway
+// only knows the single root account.
+func buildS3API(ctx context.Context, backend *s3frontend.Backend, cfg ServerConfig, iam auth.IAMService) (*s3api.S3ApiServer, error) {
 	rootAcc := auth.Account{
 		Access: cfg.RootAccess,
 		Secret: cfg.RootSecret,
 		Role:   auth.RoleAdmin,
 	}
-	iam := auth.NewIAMServiceSingle(rootAcc)
+	if iam == nil {
+		iam = auth.NewIAMServiceSingle(rootAcc)
+	}
 
 	loggers, err := s3log.InitLogger(&s3log.LogConfig{})
 	if err != nil {

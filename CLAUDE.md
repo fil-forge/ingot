@@ -48,7 +48,10 @@ ingot depends only on these — it must **never** import `fil-forge/sprue` or
   `commands/{blob,content,http,assert,ucan,index,provider,access}`, `blobindex`
   (sharded-dag-index), `ucan` (ProofStore), `ucan/retrieval`, `didmailto`, `receipt`.
 - **`indexing-service/pkg/{client,types}`** — indexer query client.
-- **`versity/versitygw`** — the S3 REST front end (we implement `backend.Backend`).
+- **`fil-forge/versitygw`** — our fork of versity/versitygw, the S3 REST front
+  end (we implement `backend.Backend`). The fork adds externally derived SigV4
+  signing keys (`auth.Account.SigningKey`, `middlewares.RequestIAMService`) for
+  the Hilt flow.
 - Plumbing: `go-cid`, `go-block-format`, `whyrusleeping/cbor-gen` (**not**
   go-ipld-prime), `multiformats/*`, `pgx/v5`, `goose/v3`, `spf13/{cobra,viper}`,
   `uber-go/fx`, `zap`.
@@ -92,6 +95,11 @@ Internal:
 - **`forgeclient/`** — carried-from-guppy edge client: `/blob/add`,
   `/ucan/conclude`, `/index/add`, `/provider/add`, `/access/delegate`, and the
   `/access` login flow.
+- **`hilt/`** — the Hilt tenant-service integration (RFC: forge-s3-tenant-
+  management). `client/` (UCAN RPC client for `/s3/request/authorize` +
+  `/s3/bucket/*`, `RequestFromHTTP` capture helper), `iam/` (versitygw
+  `IAMService`/`RequestIAMService` that authorizes each non-root request via
+  Hilt and returns the derived signing key).
 - **`tokenstore/`** — carried-from-guppy delegation store (`tokens.cbor`).
 - **`bucket/`** — per-object model: `manifest.go` (`ObjectManifest`, `Body`),
   `chunker.go` (`BodyCodec`/`FixedChunker`), `cbor_gen.go`.

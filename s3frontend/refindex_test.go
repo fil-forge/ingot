@@ -8,8 +8,8 @@ import (
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/fil-forge/versitygw/s3response"
 	"github.com/multiformats/go-multihash"
-	"github.com/versity/versitygw/s3response"
 	"go.uber.org/zap/zaptest"
 
 	"github.com/fil-forge/ingot/blockstore"

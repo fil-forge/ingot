@@ -55,13 +55,15 @@ import (
 	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/ucantone/ucan"
 	"github.com/fil-forge/ucantone/ucan/delegation"
+	"github.com/fil-forge/versitygw/auth"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/fx"
 	"go.uber.org/zap"
 
 	"github.com/fil-forge/ingot/blockstore"
 	"github.com/fil-forge/ingot/forgeclient"
-	"github.com/fil-forge/ingot/hiltclient"
+	hiltclient "github.com/fil-forge/ingot/hilt/client"
+	hiltiam "github.com/fil-forge/ingot/hilt/iam"
 	"github.com/fil-forge/ingot/logstore"
 	"github.com/fil-forge/ingot/migrations"
 	"github.com/fil-forge/ingot/registry"
@@ -113,6 +115,13 @@ func Module(cfg Config) fx.Option {
 		),
 		ServerModule,
 	}
+	// The Hilt-backed IAM service is wired only when Hilt is configured, so
+	// unconfigured deployments never construct the hilt client (whose
+	// provider errors without hilt_url/hilt_did) and serverParams' optional
+	// IAM stays absent.
+	if cfg.HiltURL != "" {
+		opts = append(opts, fx.Provide(provideHiltIAM))
+	}
 	return fx.Module("ingot", opts...)
 }
 
@@ -148,8 +157,12 @@ type serverParams struct {
 	Meta         logstore.Meta
 	// Space is the Forge space this instance owns. Optional: standalone / the
 	// harness don't provide it (reads come from the spool), so it defaults to "".
-	Space     ServerSpace    `optional:"true"`
-	PreStarts []PreStartHook `group:"ingot_prestart"`
+	Space ServerSpace `optional:"true"`
+	// IAM authenticates non-root access keys. Optional: only provided when
+	// Hilt is configured (see Module); absent, the server runs with the
+	// single root account.
+	IAM       auth.IAMService `optional:"true"`
+	PreStarts []PreStartHook  `group:"ingot_prestart"`
 }
 
 // ServerSpace is the Forge space DID (as a string) the embedded server records
@@ -191,6 +204,7 @@ func registerServerLifecycle(lc fx.Lifecycle, p serverParams) {
 				Multipart:       p.Multipart,
 				Meta:            p.Meta,
 				Space:           string(p.Space),
+				IAM:             p.IAM,
 			})
 			if err != nil {
 				return err
@@ -267,6 +281,15 @@ func provideHiltClient(cfg Config, id ServiceIdentity, logger *zap.Logger) (*hil
 		proofs = ucanlib.NewContainerProofStore(ct)
 	}
 	return hiltclient.New(hiltDID, *hiltURL, id.Signer, proofs, hiltclient.WithLogger(logger))
+}
+
+// provideHiltIAM adapts the hilt client to versitygw's IAM seam: every
+// request signed with a non-root access key is authorized by Hilt's
+// /s3/request/authorize, and the gateway verifies the signature locally with
+// the derived key Hilt returns. Only wired when Hilt is configured (see
+// Module).
+func provideHiltIAM(c *hiltclient.Client, logger *zap.Logger) auth.IAMService {
+	return hiltiam.New(c, hiltiam.WithLogger(logger))
 }
 
 // tokenSeedHookOut feeds the delegation-seed PreStartHook into the group.

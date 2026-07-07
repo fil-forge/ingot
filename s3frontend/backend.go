@@ -23,7 +23,7 @@ package s3frontend
 import (
 	"context"
 
-	"github.com/versity/versitygw/backend"
+	"github.com/fil-forge/versitygw/backend"
 
 	"github.com/fil-forge/ingot/blockstore"
 	"github.com/fil-forge/ingot/bucketop"

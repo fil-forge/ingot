@@ -1,4 +1,4 @@
-package hiltclient_test
+package client_test
 
 import (
 	"context"
@@ -7,7 +7,7 @@ import (
 	"net/url"
 	"testing"
 
-	"github.com/fil-forge/ingot/hiltclient"
+	hiltclient "github.com/fil-forge/ingot/hilt/client"
 	s3 "github.com/fil-forge/libforge/commands/s3"
 	s3bkt "github.com/fil-forge/libforge/commands/s3/bucket"
 	s3req "github.com/fil-forge/libforge/commands/s3/request"
