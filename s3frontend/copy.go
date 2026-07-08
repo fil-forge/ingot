@@ -43,7 +43,8 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 	}
 
 	// Destination bucket must exist.
-	if _, err := b.reg.Get(ctx, dstBucket); err != nil {
+	bucketState, err := b.reg.Get(ctx, dstBucket)
+	if err != nil {
 		if errors.Is(err, registry.ErrNotFound) {
 			return s3response.CopyObjectOutput{}, s3err.GetAPIError(s3err.ErrNoSuchBucket)
 		}
@@ -51,7 +52,7 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 	}
 
 	// Resolve the source manifest (NoSuchBucket / NoSuchKey map from lookup).
-	srcMf, err := b.lookupManifest(ctx, srcBucket, srcKey)
+	srcMf, _, err := b.lookupManifest(ctx, srcBucket, srcKey)
 	if err != nil {
 		return s3response.CopyObjectOutput{}, err
 	}
@@ -99,7 +100,7 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 
 	// Commit to the destination: splice + reference index. The new claims use
 	// the DESTINATION bucket/space; the same digests gain another reference.
-	if err := b.commitManifest(ctx, dstBucket, dstKey, dstMf, bodyDigests(dstMf.Body)); err != nil {
+	if err := b.commitManifest(ctx, bucketState, dstKey, dstMf, bodyDigests(dstMf.Body)); err != nil {
 		return s3response.CopyObjectOutput{}, err
 	}
 

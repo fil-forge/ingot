@@ -3,6 +3,7 @@ package ingot_test
 import (
 	"testing"
 
+	"github.com/fil-forge/ingot/config"
 	"github.com/fil-forge/ucantone/multikey/ed25519"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/fx"
@@ -23,14 +24,10 @@ func TestModuleValidate_Enabled(t *testing.T) {
 		t.Fatalf("generate signer: %v", err)
 	}
 
-	cfg := ingot.Config{
+	cfg := config.Config{
 		Enabled:          true,
 		Addr:             "127.0.0.1:0",
 		DataDir:          t.TempDir(),
-		RootAccess:       "key",
-		RootSecret:       "secret",
-		IndexerEndpoint:  "http://127.0.0.1:9000",
-		IndexerDID:       "did:web:indexer.example",
 		UploadServiceURL: "http://127.0.0.1:8000",
 		UploadServiceDID: "did:web:upload.example",
 	}
@@ -57,18 +54,14 @@ func TestModuleValidate_HiltEnabled(t *testing.T) {
 		t.Fatalf("generate signer: %v", err)
 	}
 
-	cfg := ingot.Config{
+	cfg := config.Config{
 		Enabled:          true,
 		Addr:             "127.0.0.1:0",
 		DataDir:          t.TempDir(),
-		RootAccess:       "key",
-		RootSecret:       "secret",
-		IndexerEndpoint:  "http://127.0.0.1:9000",
-		IndexerDID:       "did:web:indexer.example",
 		UploadServiceURL: "http://127.0.0.1:8000",
 		UploadServiceDID: "did:web:upload.example",
-		HiltURL:          "http://127.0.0.1:7000",
-		HiltDID:          "did:web:hilt.example",
+		AuthServiceURL:   "http://127.0.0.1:7000",
+		AuthServiceDID:   "did:web:auth.example",
 	}
 
 	err = fx.ValidateApp(
@@ -86,7 +79,7 @@ func TestModuleValidate_HiltEnabled(t *testing.T) {
 // TestModuleValidate_Disabled asserts that a disabled module is an inert empty
 // option that needs no host inputs, so a host can always include it.
 func TestModuleValidate_Disabled(t *testing.T) {
-	if err := fx.ValidateApp(fx.NopLogger, ingot.Module(ingot.Config{})); err != nil {
+	if err := fx.ValidateApp(fx.NopLogger, ingot.Module(config.Config{})); err != nil {
 		t.Fatalf("disabled ingot.Module should validate as a no-op: %v", err)
 	}
 }

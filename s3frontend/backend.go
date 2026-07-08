@@ -24,10 +24,10 @@ import (
 	"context"
 
 	"github.com/fil-forge/versitygw/backend"
+	"go.uber.org/zap"
 
 	"github.com/fil-forge/ingot/blockstore"
 	"github.com/fil-forge/ingot/bucketop"
-	"github.com/fil-forge/ingot/logstore"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/uploader"
 )
@@ -47,14 +47,12 @@ type Backend struct {
 	gc        registry.GCStore
 	multipart registry.MultipartStore
 	txns      *bucketop.Coordinator
+	log       blockstore.Log
 	spool     *blockstore.Spool
 	uploader  uploader.BodyUploader
 	remover   uploader.BlobRemover
+	logger    *zap.Logger
 
-	// space is the Forge space this instance owns; the key under which body
-	// blobs' locations and reference claims are recorded. Empty in the
-	// in-memory harness, where reads are served from the spool.
-	space       string
 	maxBlobSize int64
 }
 
@@ -75,9 +73,11 @@ type Deps struct {
 	Multipart registry.MultipartStore
 
 	// Reads is the layered read tier (spool → log → forge). Log is the catalog
-	// LSM write log driving the per-op staging buffer + commit.
+	// LSM write log driving the per-op staging buffer + commit — in production
+	// the per-bucket *logstore.Manager, which routes each append to the
+	// bucket's own log.
 	Reads blockstore.ReadStore
-	Log   *logstore.Store
+	Log   blockstore.Log
 
 	// Spool is the local blob store: SplitBody writes body blobs here on PUT,
 	// and they are served back from here on GET (read-after-write / cache).
@@ -89,11 +89,11 @@ type Deps struct {
 	Uploader uploader.BodyUploader
 	Remover  uploader.BlobRemover
 
-	// Space is the Forge space this instance owns (empty in the harness).
-	Space string
-
 	// MaxBlobSize is the coarse-split blob ceiling (0 → bucket default).
 	MaxBlobSize int64
+
+	// Logger is optional; defaults to zap.NewNop().
+	Logger *zap.Logger
 }
 
 // Compile-time assertion that Backend satisfies versitygw's interface.
@@ -101,6 +101,10 @@ var _ backend.Backend = (*Backend)(nil)
 
 // New constructs a Backend wired over ingot's domain primitives.
 func New(d Deps) *Backend {
+	logger := d.Logger
+	if logger == nil {
+		logger = zap.NewNop()
+	}
 	return &Backend{
 		read:        d.Reads,
 		reg:         d.Registry,
@@ -110,10 +114,11 @@ func New(d Deps) *Backend {
 		gc:          d.GC,
 		multipart:   d.Multipart,
 		txns:        bucketop.NewCoordinator(bucketop.Deps{Reg: d.Registry, Log: d.Log, Reads: d.Reads}),
+		log:         d.Log,
 		spool:       d.Spool,
 		uploader:    d.Uploader,
 		remover:     d.Remover,
-		space:       d.Space,
+		logger:      logger,
 		maxBlobSize: d.MaxBlobSize,
 	}
 }

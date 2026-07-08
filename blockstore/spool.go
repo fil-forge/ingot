@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/fil-forge/ucantone/did"
 	block "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
 	mh "github.com/multiformats/go-multihash"
@@ -92,7 +93,7 @@ func (s *Spool) WriteBlob(_ context.Context, r io.Reader) (mh.Multihash, int64, 
 // the body read path serves bytes straight off disk. The caller owns the reader
 // and must Close it. The returned *os.File is seekable, which the body reader
 // uses to start a ranged read mid-blob without reading-and-discarding.
-func (s *Spool) OpenBlob(_ context.Context, digest mh.Multihash) (io.ReadCloser, error) {
+func (s *Spool) OpenBlob(_ context.Context, _ did.DID, digest mh.Multihash) (io.ReadCloser, error) {
 	f, err := os.Open(s.Path(digest))
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, ErrNotFound
@@ -107,7 +108,7 @@ func (s *Spool) OpenBlob(_ context.Context, digest mh.Multihash) (io.ReadCloser,
 // is expected and cheap: it lets the layered read path fall through to the log
 // (for catalog blocks, which are never spooled) or the network tier (for a body
 // blob that has been evicted).
-func (s *Spool) GetBlock(_ context.Context, c cid.Cid) (block.Block, error) {
+func (s *Spool) GetBlock(_ context.Context, _ did.DID, c cid.Cid) (block.Block, error) {
 	data, err := os.ReadFile(s.Path(c.Hash()))
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, ErrNotFound

@@ -15,7 +15,7 @@ import (
 // imports registry).
 type fakeLocStore struct{ loc *BlobLocation }
 
-func (f fakeLocStore) GetLocation(_ context.Context, _ string, _ []byte) (*BlobLocation, error) {
+func (f fakeLocStore) GetLocation(_ context.Context, _ did.DID, _ []byte) (*BlobLocation, error) {
 	if f.loc == nil {
 		return nil, ErrNotFound
 	}
@@ -37,7 +37,7 @@ func TestLocalLocator_Locate(t *testing.T) {
 	const url = "http://piri:80/blob/z6abc"
 
 	ll := NewLocalLocator(fakeLocStore{loc: &BlobLocation{
-		Space: space.String(), Digest: digest, Provider: testProviderDID, URL: url, Size: 1234,
+		Space: space, Digest: digest, Provider: testProviderDID, URL: url, Size: 1234,
 	}})
 
 	locs, err := ll.Locate(ctx, []did.DID{space}, digest)

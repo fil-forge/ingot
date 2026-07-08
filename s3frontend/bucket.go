@@ -3,42 +3,36 @@ package s3frontend
 import (
 	"context"
 	"errors"
-	"sort"
 	"strings"
-	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/fil-forge/versitygw/s3err"
 	"github.com/fil-forge/versitygw/s3response"
 	"github.com/ipfs/go-cid"
+	"go.uber.org/zap"
 
 	"github.com/fil-forge/ingot/mst"
 	"github.com/fil-forge/ingot/registry"
 )
 
 func (b *Backend) ListBuckets(ctx context.Context, input s3response.ListBucketsInput) (s3response.ListAllMyBucketsResult, error) {
-	states, err := b.reg.List(ctx)
+	// Pagination lives in the registry: applied locally by the in-memory
+	// store, or by Hilt (which parses the same parameters from the signed
+	// request in ctx) for the postgres store.
+	page, err := b.reg.List(ctx, registry.ListOptions{
+		Prefix:            input.Prefix,
+		ContinuationToken: input.ContinuationToken,
+		Max:               int(input.MaxBuckets),
+	})
 	if err != nil {
 		return s3response.ListAllMyBucketsResult{}, err
 	}
-	sort.Slice(states, func(i, j int) bool { return states[i].Name < states[j].Name })
 
-	var entries []s3response.ListAllMyBucketsEntry
-	var cToken string
-	for _, st := range states {
-		if input.Prefix != "" && !strings.HasPrefix(st.Name, input.Prefix) {
-			continue
-		}
-		if st.Name <= input.ContinuationToken {
-			continue
-		}
-		if input.MaxBuckets > 0 && int32(len(entries)) == input.MaxBuckets {
-			cToken = entries[len(entries)-1].Name
-			break
-		}
+	entries := make([]s3response.ListAllMyBucketsEntry, 0, len(page.Buckets))
+	for _, st := range page.Buckets {
 		entries = append(entries, s3response.ListAllMyBucketsEntry{
 			Name:         st.Name,
-			CreationDate: time.Unix(st.CreatedAt, 0),
+			CreationDate: st.CreatedAt,
 		})
 	}
 
@@ -46,7 +40,7 @@ func (b *Backend) ListBuckets(ctx context.Context, input s3response.ListBucketsI
 		Buckets:           s3response.ListAllMyBucketsList{Bucket: entries},
 		Owner:             s3response.CanonicalUser{ID: input.Owner},
 		Prefix:            input.Prefix,
-		ContinuationToken: cToken,
+		ContinuationToken: page.ContinuationToken,
 	}, nil
 }
 
@@ -142,7 +136,7 @@ func (b *Backend) CreateBucket(ctx context.Context, input *s3.CreateBucketInput,
 	if !validBucketName(name) {
 		return s3err.GetAPIError(s3err.ErrInvalidBucketName)
 	}
-	if err := b.reg.Create(ctx, name, time.Now().Unix()); err != nil {
+	if err := b.reg.Create(ctx, name); err != nil {
 		if errors.Is(err, registry.ErrExists) {
 			return s3err.GetAPIError(s3err.ErrBucketAlreadyExists)
 		}
@@ -164,7 +158,7 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 		// S3 forbids deleting non-empty buckets. Walk the MST until
 		// we see any leaf, then bail.
 		if st.Root.Defined() {
-			t := mst.LoadMST(b.read, st.Root)
+			t := mst.LoadMST(b.read, st.Space, st.Root)
 			var seen bool
 			walkErr := t.WalkLeavesFromNocache(ctx, "", func(string, cid.Cid) error {
 				seen = true
@@ -181,8 +175,22 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 		if err := b.reg.Delete(ctx, name); err != nil {
 			if errors.Is(err, registry.ErrNotFound) {
 				return s3err.GetAPIError(s3err.ErrNoSuchBucket)
+			} else if errors.Is(err, registry.ErrNotEmpty) {
+				return s3err.GetAPIError(s3err.ErrBucketNotEmpty)
 			}
 			return err
+		}
+
+		// The bucket's segment history dies with it. Best-effort: the
+		// bucket is already deleted, so a cleanup failure must not fail
+		// the API call.
+		if remover, ok := b.log.(interface {
+			RemoveBucketLog(ctx context.Context, bucket string) error
+		}); ok {
+			if rerr := remover.RemoveBucketLog(ctx, name); rerr != nil {
+				b.logger.Warn("bucket log cleanup failed",
+					zap.String("bucket", name), zap.Error(rerr))
+			}
 		}
 		return nil
 	})

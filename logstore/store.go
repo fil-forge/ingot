@@ -30,7 +30,7 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 	}
 	cfg.defaults()
 
-	catalog, err := openPlaneLog(ctx, blockstore.PlaneCatalog, filepath.Join(cfg.Dir, "catalog"), cfg.Catalog, cfg.Meta, cfg.Logger)
+	catalog, err := openPlaneLog(ctx, blockstore.PlaneCatalog, cfg.Bucket, filepath.Join(cfg.Dir, "catalog"), cfg.Catalog, cfg.Meta, cfg.Logger)
 	if err != nil {
 		return nil, err
 	}

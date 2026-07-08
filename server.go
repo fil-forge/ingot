@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
-	"time"
 
 	"github.com/fil-forge/versitygw/auth"
 	"github.com/fil-forge/versitygw/metrics"
@@ -18,52 +17,12 @@ import (
 
 	"github.com/fil-forge/ingot/blockstore"
 	msbucket "github.com/fil-forge/ingot/bucket"
+	"github.com/fil-forge/ingot/config"
 	"github.com/fil-forge/ingot/logstore"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/s3frontend"
 	"github.com/fil-forge/ingot/uploader"
 )
-
-// ServerConfig captures the user-facing knobs of an ingot S3 listener.
-// New() applies defaults for any zero-valued knobs. SealAge is in
-// time.Duration form because callers parse the string config field
-// once before constructing the server.
-type ServerConfig struct {
-	// Addr is the host:port to bind the S3 listener to. Required.
-	Addr string
-
-	// DataDir is where the log writes its segments dir; the caller
-	// is responsible for creating this directory before calling New.
-	// Required.
-	DataDir string
-
-	// Region is the AWS region advertised over sigv4. Defaults to
-	// "us-east-1".
-	Region string
-
-	// RootAccess / RootSecret configure the single-account IAM root
-	// user for the embedded S3 listener. Both required.
-	RootAccess string
-	RootSecret string
-
-	// MaxBlobSize is the blob ceiling for new objects, in bytes.
-	// 0 → bucket.DefaultMaxBlobSize.
-	MaxBlobSize int64
-
-	// Catalog plane seal threshold, ship gate, and retention. Zero
-	// SealBytes/SealAge pick logstore defaults (64 MiB / 5 s); zero Retain → 6
-	// (ignored for a non-shipping plane, which is retained indefinitely).
-	SealBytesCatalog int64
-	SealAgeCatalog   time.Duration
-	ShipCatalog      bool
-	RetainCatalog    int
-
-	// MaxConnections / MaxRequests configure versitygw's hard
-	// concurrency limit. Zero is unsafe (yields 503 SlowDown on every
-	// request), so New substitutes a sensible default.
-	MaxConnections int
-	MaxRequests    int
-}
 
 // ServerDeps bundles the runtime collaborators of an ingot Server
 // behind interfaces. Production wiring uses Forge / Internal /
@@ -105,11 +64,6 @@ type ServerDeps struct {
 	GC        registry.GCStore
 	Multipart registry.MultipartStore
 
-	// Space is the Forge space this instance owns — the key body-blob locations
-	// (and, later, reference claims) are recorded under. Empty in standalone /
-	// the in-memory harness, where reads are served from the spool.
-	Space string
-
 	// Meta is the persistence backing for log-segment metadata.
 	// Typically the same instance as Registry.
 	Meta logstore.Meta
@@ -125,7 +79,7 @@ type ServerDeps struct {
 // lifecycle. fx callers wrap these in OnStart/OnStop hooks; tests
 // call them directly.
 type Server struct {
-	cfg     ServerConfig
+	cfg     config.ServerConfig
 	logger  *zap.Logger
 	log     blockstore.Log
 	backend *s3frontend.Backend
@@ -135,7 +89,7 @@ type Server struct {
 // New wires a ServerDeps + ServerConfig into a runnable Server. The
 // caller is responsible for ensuring cfg.DataDir exists before
 // calling.
-func New(ctx context.Context, cfg ServerConfig, deps ServerDeps) (*Server, error) {
+func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server, error) {
 	if err := validateServerInputs(cfg, deps); err != nil {
 		return nil, err
 	}
@@ -146,15 +100,20 @@ func New(ctx context.Context, cfg ServerConfig, deps ServerDeps) (*Server, error
 		logger = zap.NewNop()
 	}
 
-	log, err := logstore.Open(ctx, logstore.Config{
+	// The log is segregated per bucket (each bucket's segments live under
+	// segments/<bucket>/ and ship to that bucket's Forge space); the manager
+	// stands in wherever the single global log stood.
+	log, err := logstore.OpenManager(ctx, logstore.ManagerConfig{
 		Dir:  filepath.Join(cfg.DataDir, "segments"),
 		Meta: deps.Meta,
 		Catalog: logstore.PlaneConfig{
 			SealBytes: cfg.SealBytesCatalog,
 			SealAge:   cfg.SealAgeCatalog,
 			Ship:      cfg.ShipCatalog,
-			Flush:     newPlaneFlushFunc(deps.Uploader, blockstore.PlaneCatalog),
 			Retain:    cfg.RetainCatalog,
+		},
+		FlushFor: func(bucket string) logstore.FlushFunc {
+			return newBucketFlushFunc(deps.Uploader, deps.Registry, bucket, logger)
 		},
 		Logger: logger,
 	})
@@ -181,8 +140,8 @@ func New(ctx context.Context, cfg ServerConfig, deps ServerDeps) (*Server, error
 		Spool:       spool,
 		Uploader:    deps.BodyUploader,
 		Remover:     deps.Remover,
-		Space:       deps.Space,
 		MaxBlobSize: cfg.MaxBlobSize,
+		Logger:      logger,
 	})
 
 	api, err := buildS3API(ctx, backend, cfg, deps.IAM)
@@ -254,11 +213,27 @@ func (s *Server) Stop(ctx context.Context) error {
 // to ship, so the closure returns nil and the store still marks the
 // plane shipped, letting retention reclaim the tiny CAR and (for the
 // catalog plane) advancing forge_root_cid for the recorded op-roots.
-func newPlaneFlushFunc(up uploader.Uploader, plane blockstore.Plane) logstore.FlushFunc {
+//
+// The destination space is the bucket's, resolved from the registry at
+// ship time (the log is segregated per bucket, so every segment this
+// closure sees belongs to exactly this bucket). A bucket deleted while
+// segments were still queued has nothing to ship to: the closure returns
+// nil so the segment marks shipped and retires.
+func newBucketFlushFunc(up uploader.Uploader, reg registry.Registry, bucket string, logger *zap.Logger) logstore.FlushFunc {
+	plane := blockstore.PlaneCatalog
 	return func(ctx context.Context, seg *logstore.Segment) error {
 		positions := seg.Positions()
 		if len(positions) == 0 {
 			return nil
+		}
+		st, err := reg.Get(ctx, bucket)
+		if errors.Is(err, registry.ErrNotFound) {
+			logger.Info("dropping segment for deleted bucket",
+				zap.String("bucket", bucket), zap.Uint64("seq", seg.Seq()))
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("resolve space for %q: %w", bucket, err)
 		}
 		// Segment stores the raw 32-byte SHA-256 of the CAR file; the
 		// uploader and ShardedDagIndexView want the multihash form.
@@ -272,8 +247,8 @@ func newPlaneFlushFunc(up uploader.Uploader, plane blockstore.Plane) logstore.Fl
 			SHA256:    sha,
 			Positions: positions,
 		}
-		if err := up.SubmitShard(ctx, plane, shard); err != nil {
-			return fmt.Errorf("submit segment %d %s: %w", seg.Seq(), plane, err)
+		if err := up.SubmitShard(ctx, plane, st.Space, shard); err != nil {
+			return fmt.Errorf("submit segment %d %s for %q: %w", seg.Seq(), plane, bucket, err)
 		}
 		return nil
 	}
@@ -284,16 +259,10 @@ func newPlaneFlushFunc(up uploader.Uploader, plane blockstore.Plane) logstore.Fl
 // access keys authenticate through iam when provided (the root account is
 // checked before the IAM lookup either way); with a nil iam the gateway
 // only knows the single root account.
-func buildS3API(ctx context.Context, backend *s3frontend.Backend, cfg ServerConfig, iam auth.IAMService) (*s3api.S3ApiServer, error) {
-	rootAcc := auth.Account{
-		Access: cfg.RootAccess,
-		Secret: cfg.RootSecret,
-		Role:   auth.RoleAdmin,
-	}
+func buildS3API(ctx context.Context, backend *s3frontend.Backend, cfg config.ServerConfig, iam auth.IAMService) (*s3api.S3ApiServer, error) {
 	if iam == nil {
-		iam = auth.NewIAMServiceSingle(rootAcc)
+		return nil, fmt.Errorf("ingot: buildS3API: IAMService is required")
 	}
-
 	loggers, err := s3log.InitLogger(&s3log.LogConfig{})
 	if err != nil {
 		return nil, fmt.Errorf("ingot: loggers: %w", err)
@@ -308,7 +277,7 @@ func buildS3API(ctx context.Context, backend *s3frontend.Backend, cfg ServerConf
 	}
 
 	api, err := s3api.New(backend,
-		middlewares.RootUserConfig{Access: rootAcc.Access, Secret: rootAcc.Secret},
+		middlewares.RootUserConfig{Access: cfg.RootAccess, Secret: cfg.RootSecret},
 		cfg.Region, iam, loggers.S3Logger, loggers.AdminLogger, evSender, mm,
 		s3api.WithQuiet(),
 		s3api.WithHealth("/health"),
@@ -323,12 +292,15 @@ func buildS3API(ctx context.Context, backend *s3frontend.Backend, cfg ServerConf
 	return api, nil
 }
 
-func validateServerInputs(cfg ServerConfig, deps ServerDeps) error {
+func validateServerInputs(cfg config.ServerConfig, deps ServerDeps) error {
 	if cfg.Addr == "" {
 		return errors.New("ingot: ServerConfig.Addr is required")
 	}
 	if cfg.DataDir == "" {
 		return errors.New("ingot: ServerConfig.DataDir is required")
+	}
+	if cfg.RootAccess == "" || cfg.RootSecret == "" {
+		return errors.New("ingot: ServerConfig.RootAccess and ServerConfig.RootSecret are required")
 	}
 	if cfg.RootAccess == "" || cfg.RootSecret == "" {
 		return errors.New("ingot: ServerConfig.RootAccess and ServerConfig.RootSecret are required")
@@ -369,7 +341,7 @@ func validateServerInputs(cfg ServerConfig, deps ServerDeps) error {
 	return nil
 }
 
-func applyServerDefaults(cfg ServerConfig) ServerConfig {
+func applyServerDefaults(cfg config.ServerConfig) config.ServerConfig {
 	if cfg.Region == "" {
 		cfg.Region = "us-east-1"
 	}

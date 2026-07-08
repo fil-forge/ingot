@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/fil-forge/ucantone/did"
 	block "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
 )
@@ -31,6 +32,10 @@ type OpStaging struct {
 	underlying ReadStore
 	log        Log
 	bucket     string
+	// space is the bucket's Forge space, bound in so the cbor-gen-shaped
+	// Get below (fixed, space-less signature) can reach the network tier
+	// with the right space on fallthrough.
+	space did.DID
 
 	mu sync.RWMutex
 	// blocks holds every Put for the lifetime of the transaction so
@@ -43,12 +48,14 @@ type OpStaging struct {
 
 // NewOpStaging constructs a per-op staging buffer. underlying is the
 // read fallback (typically *Layered); log is the durable write
-// target; bucket is the bucket whose root this op will advance.
-func NewOpStaging(underlying ReadStore, log Log, bucket string) *OpStaging {
+// target; bucket is the bucket whose root this op will advance and
+// space its Forge space (for network fallthrough on reads).
+func NewOpStaging(underlying ReadStore, log Log, bucket string, space did.DID) *OpStaging {
 	return &OpStaging{
 		underlying: underlying,
 		log:        log,
 		bucket:     bucket,
+		space:      space,
 		blocks:     map[string]block.Block{},
 	}
 }
@@ -60,7 +67,7 @@ func (b *OpStaging) Get(ctx context.Context, c cid.Cid) (block.Block, error) {
 	if ok {
 		return blk, nil
 	}
-	return b.underlying.GetBlock(ctx, c)
+	return b.underlying.GetBlock(ctx, b.space, c)
 }
 
 func (b *OpStaging) Put(_ context.Context, blk block.Block) error {

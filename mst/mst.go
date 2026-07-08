@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"reflect"
 
+	"github.com/fil-forge/ucantone/did"
 	"github.com/ipfs/go-cid"
 
 	"github.com/fil-forge/ingot/blockstore"
@@ -98,7 +99,11 @@ type TreeEntry struct {
 // persisting anything. The only write site is GetPointer, which
 // takes its writer as an explicit argument.
 type MerkleSearchTree struct {
-	cst      blockstore.Reader
+	cst blockstore.Reader
+	// space is the Forge space the tree's blocks belong to (the owning
+	// bucket's), passed to every cst.Get so misses can resolve from the
+	// network. did.Undef where reads are purely local.
+	space    did.DID
 	entries  []nodeEntry // non-nil when "hydrated"
 	layer    int
 	pointer  cid.Cid
@@ -106,13 +111,14 @@ type MerkleSearchTree struct {
 }
 
 // NewEmptyMST returns a new empty MST using cst as its storage.
-func NewEmptyMST(cst blockstore.Reader) *MerkleSearchTree {
-	return createMST(cst, cid.Undef, []nodeEntry{}, 0)
+func NewEmptyMST(cst blockstore.Reader, space did.DID) *MerkleSearchTree {
+	return createMST(cst, space, cid.Undef, []nodeEntry{}, 0)
 }
 
-func createMST(cst blockstore.Reader, ptr cid.Cid, entries []nodeEntry, layer int) *MerkleSearchTree {
+func createMST(cst blockstore.Reader, space did.DID, ptr cid.Cid, entries []nodeEntry, layer int) *MerkleSearchTree {
 	mst := &MerkleSearchTree{
 		cst:      cst,
+		space:    space,
 		pointer:  ptr,
 		layer:    layer,
 		entries:  entries,
@@ -123,8 +129,8 @@ func createMST(cst blockstore.Reader, ptr cid.Cid, entries []nodeEntry, layer in
 
 // LoadMST returns a lazy reference to an MST rooted at the given CID. Entries
 // are not loaded until needed.
-func LoadMST(cst blockstore.Reader, root cid.Cid) *MerkleSearchTree {
-	return createMST(cst, root, nil, -1)
+func LoadMST(cst blockstore.Reader, space did.DID, root cid.Cid) *MerkleSearchTree {
+	return createMST(cst, space, root, nil, -1)
 }
 
 // === Immutability ===
@@ -133,7 +139,7 @@ func (mst *MerkleSearchTree) newTree(entries []nodeEntry) *MerkleSearchTree {
 	if entries == nil {
 		panic("nil entries passed to newTree")
 	}
-	return createMST(mst.cst, cid.Undef, entries, mst.layer)
+	return createMST(mst.cst, mst.space, cid.Undef, entries, mst.layer)
 }
 
 // === Lazy getters ===
@@ -145,10 +151,10 @@ func (mst *MerkleSearchTree) getEntries(ctx context.Context) ([]nodeEntry, error
 
 	if mst.pointer != cid.Undef {
 		var nd NodeData
-		if err := mst.cst.Get(ctx, mst.pointer, &nd); err != nil {
+		if err := mst.cst.Get(ctx, mst.space, mst.pointer, &nd); err != nil {
 			return nil, err
 		}
-		entries, err := entriesFromNodeData(ctx, &nd, mst.cst)
+		entries, err := entriesFromNodeData(ctx, &nd, mst.cst, mst.space)
 		if err != nil {
 			return nil, err
 		}
@@ -162,7 +168,7 @@ func (mst *MerkleSearchTree) getEntries(ctx context.Context) ([]nodeEntry, error
 	return nil, fmt.Errorf("no entries or self-pointer (CID) on MerkleSearchTree")
 }
 
-func entriesFromNodeData(ctx context.Context, nd *NodeData, cst blockstore.Reader) ([]nodeEntry, error) {
+func entriesFromNodeData(ctx context.Context, nd *NodeData, cst blockstore.Reader, space did.DID) ([]nodeEntry, error) {
 	layer := -1
 	if len(nd.Entries) > 0 {
 		// the first entry's KeySuffix is a complete key (PrefixLen=0)
@@ -170,7 +176,7 @@ func entriesFromNodeData(ctx context.Context, nd *NodeData, cst blockstore.Reade
 		layer = leadingZerosOnHashBytes(firstLeaf.KeySuffix)
 	}
 
-	entries, err := deserializeNodeData(ctx, cst, nd, layer)
+	entries, err := deserializeNodeData(ctx, cst, space, nd, layer)
 	if err != nil {
 		return nil, err
 	}
@@ -396,7 +402,7 @@ func (mst *MerkleSearchTree) Add(ctx context.Context, key string, val cid.Cid, k
 	}
 
 	checkTreeInvariant(updated)
-	newRoot := createMST(mst.cst, cid.Undef, updated, keyZeros)
+	newRoot := createMST(mst.cst, mst.space, cid.Undef, updated, keyZeros)
 	newRoot.validPtr = false
 
 	return newRoot, nil
@@ -789,7 +795,7 @@ func (mst *MerkleSearchTree) createChild(ctx context.Context) (*MerkleSearchTree
 	if err != nil {
 		return nil, err
 	}
-	return createMST(mst.cst, cid.Undef, []nodeEntry{}, layer-1), nil
+	return createMST(mst.cst, mst.space, cid.Undef, []nodeEntry{}, layer-1), nil
 }
 
 func (mst *MerkleSearchTree) createParent(ctx context.Context) (*MerkleSearchTree, error) {
@@ -797,7 +803,7 @@ func (mst *MerkleSearchTree) createParent(ctx context.Context) (*MerkleSearchTre
 	if err != nil {
 		return nil, err
 	}
-	return createMST(mst.cst, cid.Undef, []nodeEntry{mkTreeEntry(mst)}, layer+1), nil
+	return createMST(mst.cst, mst.space, cid.Undef, []nodeEntry{mkTreeEntry(mst)}, layer+1), nil
 }
 
 // === Finding insertion points ===

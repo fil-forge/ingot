@@ -116,6 +116,13 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 		return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrInvalidRequest)
 	}
 	bucket, key, uploadID := *input.Bucket, *input.Key, *input.UploadId
+	bucketState, err := b.reg.Get(ctx, bucket)
+	if err != nil {
+		if errors.Is(err, registry.ErrNotFound) {
+			return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrNoSuchBucket)
+		}
+		return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: complete mpu: %w", err)
+	}
 	sess, err := b.multipart.GetSession(ctx, uploadID)
 	if err != nil {
 		if errors.Is(err, registry.ErrNotFound) {
@@ -194,7 +201,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 	}
 
 	// Accept every part's blobs on Forge (no-op in the harness), then commit.
-	if err := b.uploadBlobs(ctx, blobs); err != nil {
+	if err := b.uploadBlobs(ctx, bucketState.Space, blobs); err != nil {
 		return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: accept parts: %w", err)
 	}
 
@@ -208,7 +215,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 		Metadata:    sess.Metadata,
 	}
 
-	if err := b.commitManifest(ctx, bucket, key, mf, bodyDigests(mf.Body)); err != nil {
+	if err := b.commitManifest(ctx, bucketState, key, mf, bodyDigests(mf.Body)); err != nil {
 		return s3response.CompleteMultipartUploadResult{}, "", err
 	}
 	committed = true
@@ -254,9 +261,9 @@ func (b *Backend) AbortMultipartUpload(ctx context.Context, input *s3.AbortMulti
 // index against the prior version's digests, releasing dropped blobs after the
 // commit. Shared by CopyObject and CompleteMultipartUpload (a plain commit with
 // no precondition callback).
-func (b *Backend) commitManifest(ctx context.Context, bucket, key string, mf *msbucket.ObjectManifest, newDigests [][]byte) error {
+func (b *Backend) commitManifest(ctx context.Context, bucketState *registry.State, key string, mf *msbucket.ObjectManifest, newDigests [][]byte) error {
 	var oldDigests [][]byte
-	err := b.txns.WithTx(ctx, bucket, func(ctx context.Context, tx *bucketop.Tx) (cid.Cid, error) {
+	err := b.txns.WithTx(ctx, bucketState.Name, func(ctx context.Context, tx *bucketop.Tx) (cid.Cid, error) {
 		mfCid, err := tx.Put(ctx, mf)
 		if err != nil {
 			return cid.Undef, fmt.Errorf("manifest put: %w", err)
@@ -267,11 +274,11 @@ func (b *Backend) commitManifest(ctx context.Context, bucket, key string, mf *ms
 		switch {
 		case gerr == nil:
 			var oldMf msbucket.ObjectManifest
-			if err := tx.Get(ctx, oldCid, &oldMf); err != nil {
+			if err := tx.Get(ctx, tx.State().Space, oldCid, &oldMf); err != nil {
 				return cid.Undef, fmt.Errorf("load prior manifest: %w", err)
 			}
 			oldDigests = bodyDigests(oldMf.Body)
-			if err := b.gc.AddGCCandidate(ctx, oldCid.Bytes(), bucket); err != nil {
+			if err := b.gc.AddGCCandidate(ctx, oldCid.Bytes(), bucketState.Name); err != nil {
 				return cid.Undef, fmt.Errorf("gc candidate: %w", err)
 			}
 		case errors.Is(gerr, mst.ErrNotFound):
@@ -294,11 +301,11 @@ func (b *Backend) commitManifest(ctx context.Context, bucket, key string, mf *ms
 	}
 	// Reconcile the reference index AFTER the commit is durable (so a commit
 	// failure can't diverge blob_refs from the catalog).
-	toRemove, err := b.reconcileClaims(ctx, bucket, key, oldDigests, newDigests)
+	toRemove, err := b.reconcileClaims(ctx, bucketState, key, oldDigests, newDigests)
 	if err != nil {
 		return fmt.Errorf("s3frontend: commit reconcile: %w", err)
 	}
-	b.releaseBlobs(ctx, toRemove)
+	b.releaseBlobs(ctx, bucketState.Space, toRemove)
 	return nil
 }
 

@@ -95,15 +95,21 @@ Internal:
 - **`forgeclient/`** — carried-from-guppy edge client: `/blob/add`,
   `/ucan/conclude`, `/index/add`, `/provider/add`, `/access/delegate`, and the
   `/access` login flow.
-- **`hilt/`** — the Hilt tenant-service integration (RFC: forge-s3-tenant-
-  management). `client/` (UCAN RPC client for `/s3/request/authorize` +
-  `/s3/bucket/*`, `RequestFromHTTP` capture helper), `iam/` (versitygw
-  `IAMService`/`RequestIAMService` that authorizes each non-root request via
-  Hilt and returns the derived signing key).
+- **`iam/`** — the Hilt (auth-service) integration over the external
+  `github.com/fil-forge/hilt/pkg/client` (RFC: forge-s3-tenant-management):
+  versitygw `IAMService`/`RequestIAMService` authorizing each non-root
+  request via `/s3/request/authorize` (derived SigV4 key), plus
+  `DelegationCache` — a TTL cache (go-cache) of Hilt-issued delegations
+  (authorize re-delegations + `/s3/bucket/info` chains) that the network
+  read tier consumes as its per-space `/content/retrieve` proof store.
+  **Forge mode requires Hilt** (`auth_service_url`/`auth_service_did`): the
+  postgres registry forwards bucket create/delete/list to it, recovering
+  the signed S3 request from the method's ctx.
 - **`tokenstore/`** — carried-from-guppy delegation store (`tokens.cbor`).
 - **`bucket/`** — per-object model: `manifest.go` (`ObjectManifest`, `Body`),
   `chunker.go` (`BodyCodec`/`FixedChunker`), `cbor_gen.go`.
-- **`mst/`** — the forked MST (only dep: go-cid).
+- **`mst/`** — the forked MST (deps: go-cid, blockstore, ucantone/did — trees
+  carry their bucket's space for network-backed reads).
 - **`inmem/`** — `MemStore` (Registry+Meta), `NopBaseReader`, `NopUploader`; backs
   the test harness and standalone mode.
 - **`cars/`**, **`migrations/`**, **`internal/ucanexec/`**, **`gen/`**,

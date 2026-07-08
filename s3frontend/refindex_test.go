@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/versitygw/s3response"
 	"github.com/multiformats/go-multihash"
 	"go.uber.org/zap/zaptest"
@@ -17,8 +18,6 @@ import (
 	"github.com/fil-forge/ingot/logstore"
 )
 
-const testSpace = "did:space:test"
-
 // recordingRemover captures the digests RemoveBlob is called with so the
 // reference-index tests can assert exactly when a blob's last claim is released.
 type recordingRemover struct {
@@ -26,7 +25,7 @@ type recordingRemover struct {
 	removed [][]byte
 }
 
-func (r *recordingRemover) RemoveBlob(_ context.Context, d multihash.Multihash) error {
+func (r *recordingRemover) RemoveBlob(_ context.Context, _ did.DID, d multihash.Multihash) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.removed = append(r.removed, append([]byte(nil), d...))
@@ -82,10 +81,9 @@ func newRefTestBackend(t *testing.T, maxBlob ...int64) (*Backend, *inmem.MemStor
 		Spool:       spool,
 		Uploader:    inmem.NopUploader{},
 		Remover:     rm,
-		Space:       testSpace,
 		MaxBlobSize: mbs,
 	})
-	if err := mem.Create(ctx, "bk", 0); err != nil {
+	if err := mem.Create(ctx, "bk"); err != nil {
 		t.Fatalf("create bucket: %v", err)
 	}
 	return b, mem, rm
@@ -122,7 +120,10 @@ func deleteObj(t *testing.T, b *Backend, key string) {
 
 func claims(t *testing.T, mem *inmem.MemStore, digest []byte) int {
 	t.Helper()
-	n, err := mem.CountClaims(context.Background(), testSpace, digest)
+	// MemStore buckets carry no space (did.Undef), so claims recorded via
+	// the backend are keyed under did.Undef; count under the same key.
+	// Space-keyed claim counting is covered by the live Postgres test.
+	n, err := mem.CountClaims(context.Background(), did.Undef, digest)
 	if err != nil {
 		t.Fatalf("CountClaims: %v", err)
 	}

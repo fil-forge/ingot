@@ -1,6 +1,10 @@
 package registry
 
-import "context"
+import (
+	"context"
+
+	"github.com/fil-forge/ucantone/did"
+)
 
 // This file defines the relational surface the upload/storage/delete
 // architecture relies on (docs/architecture.md §5–§7, Appendix C):
@@ -45,7 +49,7 @@ type BlobClaim struct {
 	Bucket    string
 	ObjectKey string
 	VersionID string
-	Space     string
+	Space     did.DID
 }
 
 // UploadIntent is one row of ingot.upload_intents: a blob Ingot holds on
@@ -61,7 +65,7 @@ type UploadIntent struct {
 // BlobLocation is one row of ingot.blob_locations: where a blob can be
 // retrieved from, captured at accept. Keyed by (Space, Digest).
 type BlobLocation struct {
-	Space    string
+	Space    did.DID
 	Digest   []byte
 	Provider string
 	URL      string
@@ -98,7 +102,7 @@ type BlobRefStore interface {
 	DeleteBlobClaim(ctx context.Context, digest []byte, bucket, objectKey, versionID string) error
 	// CountClaims returns how many object versions in space still reference
 	// digest. Zero means the space's claim may be released.
-	CountClaims(ctx context.Context, space string, digest []byte) (int, error)
+	CountClaims(ctx context.Context, space did.DID, digest []byte) (int, error)
 }
 
 // IntentStore is the local-store index (§5): the on-disk blobs Ingot holds
@@ -117,8 +121,8 @@ type IntentStore interface {
 // on read in place of the indexing-service.
 type LocationStore interface {
 	PutLocation(ctx context.Context, loc BlobLocation) error
-	GetLocation(ctx context.Context, space string, digest []byte) (*BlobLocation, error)
-	DeleteLocation(ctx context.Context, space string, digest []byte) error
+	GetLocation(ctx context.Context, space did.DID, digest []byte) (*BlobLocation, error)
+	DeleteLocation(ctx context.Context, space did.DID, digest []byte) error
 }
 
 // MultipartStore tracks in-flight multipart uploads (§7.2). LatchSession is

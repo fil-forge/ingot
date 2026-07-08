@@ -14,7 +14,9 @@ import (
 	"context"
 	"io"
 	"sort"
+	"strings"
 	"sync"
+	"time"
 
 	block "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
@@ -24,6 +26,7 @@ import (
 	"github.com/fil-forge/ingot/logstore"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/uploader"
+	"github.com/fil-forge/ucantone/did"
 )
 
 // MemStore is an in-memory registry.Registry + logstore.Meta. The two
@@ -54,7 +57,8 @@ type claimKey struct {
 }
 
 type locKey struct {
-	space, digest string
+	space  did.DID
+	digest string
 }
 
 // NewMemStore returns an empty MemStore.
@@ -73,13 +77,14 @@ func NewMemStore() *MemStore {
 
 // Registry methods ===========================================================
 
-func (m *MemStore) Create(_ context.Context, name string, createdAt int64) error {
+func (m *MemStore) Create(_ context.Context, name string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, ok := m.buckets[name]; ok {
 		return registry.ErrExists
 	}
-	m.buckets[name] = &registry.State{Name: name, CreatedAt: createdAt}
+	// Stamped here for parity with the buckets.created_at column default.
+	m.buckets[name] = &registry.State{Name: name, CreatedAt: time.Now().UTC()}
 	return nil
 }
 
@@ -94,16 +99,34 @@ func (m *MemStore) Get(_ context.Context, name string) (*registry.State, error) 
 	return &cp, nil
 }
 
-func (m *MemStore) List(_ context.Context) ([]*registry.State, error) {
+// List paginates locally: lexicographic order, prefix-filtered, resuming
+// strictly after the continuation token, truncated at opts.Max (the token
+// of a truncated page is the last name it includes).
+func (m *MemStore) List(_ context.Context, opts registry.ListOptions) (*registry.Page, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	out := make([]*registry.State, 0, len(m.buckets))
+	all := make([]*registry.State, 0, len(m.buckets))
 	for _, s := range m.buckets {
 		cp := *s
-		out = append(out, &cp)
+		all = append(all, &cp)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
-	return out, nil
+	sort.Slice(all, func(i, j int) bool { return all[i].Name < all[j].Name })
+
+	page := &registry.Page{}
+	for _, st := range all {
+		if opts.Prefix != "" && !strings.HasPrefix(st.Name, opts.Prefix) {
+			continue
+		}
+		if st.Name <= opts.ContinuationToken {
+			continue
+		}
+		if opts.Max > 0 && len(page.Buckets) == opts.Max {
+			page.ContinuationToken = page.Buckets[len(page.Buckets)-1].Name
+			break
+		}
+		page.Buckets = append(page.Buckets, st)
+	}
+	return page, nil
 }
 
 func (m *MemStore) Delete(_ context.Context, name string) error {
@@ -153,13 +176,13 @@ func (m *MemStore) NextSegmentSeq(_ context.Context) (uint64, error) {
 	return m.nextSeq, nil
 }
 
-func (m *MemStore) InsertSegmentOpen(_ context.Context, plane blockstore.Plane, seq uint64) error {
+func (m *MemStore) InsertSegmentOpen(_ context.Context, plane blockstore.Plane, seq uint64, bucket string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, ok := m.segments[seq]; ok {
 		return nil
 	}
-	m.segments[seq] = &logstore.SegmentMeta{Seq: seq, Plane: plane, State: logstore.StateOpen}
+	m.segments[seq] = &logstore.SegmentMeta{Seq: seq, Plane: plane, Bucket: bucket, State: logstore.StateOpen}
 	return nil
 }
 
@@ -198,6 +221,25 @@ func (m *MemStore) MarkSegmentShipped(_ context.Context, plane blockstore.Plane,
 	return nil
 }
 
+func (m *MemStore) ListSegmentBuckets(_ context.Context, plane blockstore.Plane) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	seen := map[string]struct{}{}
+	var out []string
+	for _, r := range m.segments {
+		if r.Plane != plane {
+			continue
+		}
+		if _, ok := seen[r.Bucket]; ok {
+			continue
+		}
+		seen[r.Bucket] = struct{}{}
+		out = append(out, r.Bucket)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
 func (m *MemStore) DeleteSegment(_ context.Context, plane blockstore.Plane, seq uint64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -205,12 +247,12 @@ func (m *MemStore) DeleteSegment(_ context.Context, plane blockstore.Plane, seq 
 	return nil
 }
 
-func (m *MemStore) ListSegments(_ context.Context, plane blockstore.Plane) ([]logstore.SegmentMeta, error) {
+func (m *MemStore) ListSegments(_ context.Context, plane blockstore.Plane, bucket string) ([]logstore.SegmentMeta, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var out []logstore.SegmentMeta
 	for _, r := range m.segments {
-		if r.Plane != plane {
+		if r.Plane != plane || r.Bucket != bucket {
 			continue
 		}
 		out = append(out, *r)
@@ -231,14 +273,14 @@ func (m *MemStore) RehydrateSegment(_ context.Context, sm logstore.SegmentMeta) 
 // no network: every miss past the local log returns ErrNotFound.
 type NopBaseReader struct{}
 
-func (NopBaseReader) GetBlock(_ context.Context, _ cid.Cid) (block.Block, error) {
+func (NopBaseReader) GetBlock(_ context.Context, _ did.DID, _ cid.Cid) (block.Block, error) {
 	return nil, blockstore.ErrNotFound
 }
 
 // OpenBlob is the streaming-read counterpart: with no network tier, an evicted
 // body blob is unrecoverable. (The harness never evicts, so reads come from the
 // spool.)
-func (NopBaseReader) OpenBlob(_ context.Context, _ multihash.Multihash) (io.ReadCloser, error) {
+func (NopBaseReader) OpenBlob(_ context.Context, _ did.DID, _ multihash.Multihash) (io.ReadCloser, error) {
 	return nil, blockstore.ErrNotFound
 }
 
@@ -248,15 +290,15 @@ func (NopBaseReader) OpenBlob(_ context.Context, _ multihash.Multihash) (io.Read
 // network, so the spool's local copy serves all reads.
 type NopUploader struct{}
 
-func (NopUploader) SubmitShard(_ context.Context, _ blockstore.Plane, _ uploader.CARShard) error {
+func (NopUploader) SubmitShard(_ context.Context, _ blockstore.Plane, _ did.DID, _ uploader.CARShard) error {
 	return nil
 }
 
-func (NopUploader) UploadBlob(_ context.Context, _ multihash.Multihash, size int64, _ string) (uploader.BlobLocation, error) {
+func (NopUploader) UploadBlob(_ context.Context, _ did.DID, _ multihash.Multihash, size int64, _ string) (uploader.BlobLocation, error) {
 	return uploader.BlobLocation{Size: size}, nil
 }
 
-func (NopUploader) RemoveBlob(_ context.Context, _ multihash.Multihash) error { return nil }
+func (NopUploader) RemoveBlob(_ context.Context, _ did.DID, _ multihash.Multihash) error { return nil }
 
 // Compile-time guarantees.
 var (

@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/md5"
 	"crypto/sha256"
+	"github.com/fil-forge/ucantone/did"
 	"io"
 	"path/filepath"
 	"testing"
@@ -73,7 +74,7 @@ func TestSplitBody_StreamingRoundTrip(t *testing.T) {
 		}
 	}
 
-	got, err := io.ReadAll(OpenBody(ctx, sp, body))
+	got, err := io.ReadAll(OpenBody(ctx, sp, did.Undef, body))
 	if err != nil {
 		t.Fatalf("OpenBody read: %v", err)
 	}
@@ -104,7 +105,7 @@ func TestOpenBodyRange(t *testing.T) {
 		{100, 8500},  // spans all three blobs, mid-blob start
 	}
 	for _, c := range cases {
-		got, err := io.ReadAll(OpenBodyRange(ctx, sp, body, c.start, c.end))
+		got, err := io.ReadAll(OpenBodyRange(ctx, sp, did.Undef, body, c.start, c.end))
 		if err != nil {
 			t.Fatalf("range [%d,%d]: %v", c.start, c.end, err)
 		}

@@ -14,7 +14,7 @@ import (
 // put/copy preconditions before ingest. It distinguishes "no such key" (exists
 // = false, no error) from real errors.
 func (b *Backend) currentObjectETag(ctx context.Context, bucket, key string) (etag string, exists bool, err error) {
-	mf, err := b.lookupManifest(ctx, bucket, key)
+	mf, _, err := b.lookupManifest(ctx, bucket, key)
 	if err != nil {
 		if isNoSuchKey(err) {
 			return "", false, nil
