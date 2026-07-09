@@ -7,7 +7,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/config v1.32.26
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.25
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.104.1
-	github.com/fil-forge/hilt v0.0.0-20260708170444-d4ef78611efe
+	github.com/fil-forge/hilt v0.0.0-20260709102258-082decf79672
 	github.com/fil-forge/indexing-service v1.13.5-0.20260619142411-efe3f5fab717
 	github.com/fil-forge/libforge v0.0.0-20260701162346-f0706e1641a3
 	github.com/fil-forge/ucantone v0.0.0-20260706102443-79141c5cc52e
