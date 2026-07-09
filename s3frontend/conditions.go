@@ -39,6 +39,15 @@ func mapCommitError(err error, op string) error {
 	if errors.Is(err, bucketop.ErrBucketNotFound) {
 		return s3err.GetAPIError(s3err.ErrNoSuchBucket)
 	}
+	// PreconditionFailedError embeds APIError but is a distinct concrete type, so
+	// errors.As against APIError below won't match it. Surface it verbatim so its
+	// 412 status and <Condition> XML body reach the versitygw error renderer
+	// (which type-asserts s3err.S3Error without unwrapping — a generic %w wrap
+	// would degrade it to InternalError).
+	var pf s3err.PreconditionFailedError
+	if errors.As(err, &pf) {
+		return pf
+	}
 	var apiErr s3err.APIError
 	if errors.As(err, &apiErr) {
 		return apiErr

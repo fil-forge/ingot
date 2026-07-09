@@ -87,6 +87,7 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 		dstMf.ContentLanguage = backend.GetStringFromPtr(input.ContentLanguage)
 		dstMf.CacheControl = backend.GetStringFromPtr(input.CacheControl)
 		dstMf.Expires = backend.GetStringFromPtr(input.Expires)
+		dstMf.WebsiteRedirectLocation = backend.GetStringFromPtr(input.WebsiteRedirectLocation)
 		dstMf.Metadata = input.Metadata
 	} else {
 		dstMf.ContentType = srcMf.ContentType
@@ -95,6 +96,9 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 		dstMf.ContentLanguage = srcMf.ContentLanguage
 		dstMf.CacheControl = srcMf.CacheControl
 		dstMf.Expires = srcMf.Expires
+		// WebsiteRedirectLocation is intentionally NOT inherited on a
+		// metadata-COPY: S3 drops it unless the copy uses MetadataDirective=REPLACE
+		// and supplies a new value (see the REPLACE branch above).
 		dstMf.Metadata = srcMf.Metadata
 	}
 

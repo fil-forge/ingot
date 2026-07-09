@@ -36,6 +36,16 @@ func checksumFromInput(in s3response.PutObjectInput) (*checksumSpec, error) {
 		return &checksumSpec{types.ChecksumAlgorithmSha1, utils.HashTypeSha1, *in.ChecksumSHA1}, nil
 	case in.ChecksumCRC64NVME != nil:
 		return &checksumSpec{types.ChecksumAlgorithmCrc64nvme, utils.HashTypeCRC64NVME, *in.ChecksumCRC64NVME}, nil
+	case in.ChecksumSHA512 != nil:
+		return &checksumSpec{types.ChecksumAlgorithmSha512, utils.HashTypeSha512, *in.ChecksumSHA512}, nil
+	case in.ChecksumMD5 != nil:
+		return &checksumSpec{types.ChecksumAlgorithmMd5, utils.HashTypeMd5, *in.ChecksumMD5}, nil
+	case in.ChecksumXXHASH64 != nil:
+		return &checksumSpec{types.ChecksumAlgorithmXxhash64, utils.HashTypeXXHASH64, *in.ChecksumXXHASH64}, nil
+	case in.ChecksumXXHASH3 != nil:
+		return &checksumSpec{types.ChecksumAlgorithmXxhash3, utils.HashTypeXXHASH3, *in.ChecksumXXHASH3}, nil
+	case in.ChecksumXXHASH128 != nil:
+		return &checksumSpec{types.ChecksumAlgorithmXxhash128, utils.HashTypeXXHASH128, *in.ChecksumXXHASH128}, nil
 	case in.ChecksumAlgorithm != "":
 		ht, err := hashTypeForAlgo(in.ChecksumAlgorithm)
 		if err != nil {
@@ -60,6 +70,16 @@ func hashTypeForAlgo(algo types.ChecksumAlgorithm) (utils.HashType, error) {
 		return utils.HashTypeSha256, nil
 	case types.ChecksumAlgorithmCrc64nvme:
 		return utils.HashTypeCRC64NVME, nil
+	case types.ChecksumAlgorithmSha512:
+		return utils.HashTypeSha512, nil
+	case types.ChecksumAlgorithmMd5:
+		return utils.HashTypeMd5, nil
+	case types.ChecksumAlgorithmXxhash64:
+		return utils.HashTypeXXHASH64, nil
+	case types.ChecksumAlgorithmXxhash3:
+		return utils.HashTypeXXHASH3, nil
+	case types.ChecksumAlgorithmXxhash128:
+		return utils.HashTypeXXHASH128, nil
 	default:
 		return utils.HashTypeNone, utils.IsChecksumAlgorithmValid(algo)
 	}
@@ -69,9 +89,9 @@ func hashTypeForAlgo(algo types.ChecksumAlgorithm) (utils.HashType, error) {
 // response pointers + the checksum type. All nil / empty type when there is no
 // checksum, so callers can assign the result unconditionally. Single-part
 // objects are always full-object checksums.
-func checksumFields(algo, val string) (crc32, crc32c, sha1, sha256, crc64 *string, ctype types.ChecksumType) {
+func checksumFields(algo, val string) (crc32, crc32c, sha1, sha256, crc64, sha512, md5, xxh64, xxh3, xxh128 *string, ctype types.ChecksumType) {
 	if algo == "" || val == "" {
-		return nil, nil, nil, nil, nil, ""
+		return nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, ""
 	}
 	v := val
 	switch types.ChecksumAlgorithm(algo) {
@@ -85,6 +105,16 @@ func checksumFields(algo, val string) (crc32, crc32c, sha1, sha256, crc64 *strin
 		sha256 = &v
 	case types.ChecksumAlgorithmCrc64nvme:
 		crc64 = &v
+	case types.ChecksumAlgorithmSha512:
+		sha512 = &v
+	case types.ChecksumAlgorithmMd5:
+		md5 = &v
+	case types.ChecksumAlgorithmXxhash64:
+		xxh64 = &v
+	case types.ChecksumAlgorithmXxhash3:
+		xxh3 = &v
+	case types.ChecksumAlgorithmXxhash128:
+		xxh128 = &v
 	}
-	return crc32, crc32c, sha1, sha256, crc64, types.ChecksumTypeFullObject
+	return crc32, crc32c, sha1, sha256, crc64, sha512, md5, xxh64, xxh3, xxh128, types.ChecksumTypeFullObject
 }

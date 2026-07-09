@@ -126,19 +126,20 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 	// blob_refs from the committed catalog.
 	err = b.txns.WithTx(ctx, bucketName, func(ctx context.Context, tx *bucketop.Tx) (cid.Cid, error) {
 		mf = &msbucket.ObjectManifest{
-			Key:                key,
-			ContentType:        contentType,
-			Created:            time.Now().Unix(),
-			Body:               bodyRec,
-			ETag:               hex.EncodeToString(bodyRec.MD5),
-			ChecksumAlgorithm:  ckAlgo,
-			Checksum:           ckVal,
-			ContentEncoding:    backend.GetStringFromPtr(input.ContentEncoding),
-			ContentDisposition: backend.GetStringFromPtr(input.ContentDisposition),
-			ContentLanguage:    backend.GetStringFromPtr(input.ContentLanguage),
-			CacheControl:       backend.GetStringFromPtr(input.CacheControl),
-			Expires:            backend.GetStringFromPtr(input.Expires),
-			Metadata:           input.Metadata,
+			Key:                     key,
+			ContentType:             contentType,
+			Created:                 time.Now().Unix(),
+			Body:                    bodyRec,
+			ETag:                    hex.EncodeToString(bodyRec.MD5),
+			ChecksumAlgorithm:       ckAlgo,
+			Checksum:                ckVal,
+			ContentEncoding:         backend.GetStringFromPtr(input.ContentEncoding),
+			ContentDisposition:      backend.GetStringFromPtr(input.ContentDisposition),
+			ContentLanguage:         backend.GetStringFromPtr(input.ContentLanguage),
+			CacheControl:            backend.GetStringFromPtr(input.CacheControl),
+			Expires:                 backend.GetStringFromPtr(input.Expires),
+			WebsiteRedirectLocation: backend.GetStringFromPtr(input.WebsiteRedirectLocation),
+			Metadata:                input.Metadata,
 		}
 		mfCid, err := tx.Put(ctx, mf)
 		if err != nil {
@@ -205,7 +206,7 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 		ETag: etagOf(mf),
 		Size: &size,
 	}
-	out.ChecksumCRC32, out.ChecksumCRC32C, out.ChecksumSHA1, out.ChecksumSHA256, out.ChecksumCRC64NVME, out.ChecksumType = checksumFields(ckAlgo, ckVal)
+	out.ChecksumCRC32, out.ChecksumCRC32C, out.ChecksumSHA1, out.ChecksumSHA256, out.ChecksumCRC64NVME, out.ChecksumSHA512, out.ChecksumMD5, out.ChecksumXXHASH64, out.ChecksumXXHASH3, out.ChecksumXXHASH128, out.ChecksumType = checksumFields(ckAlgo, ckVal)
 	return out, nil
 }
 
@@ -485,17 +486,19 @@ func (b *Backend) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s
 		ContentLanguage:    strPtrOrNil(mf.ContentLanguage),
 		CacheControl:       strPtrOrNil(mf.CacheControl),
 		ExpiresString:      strPtrOrNil(mf.Expires),
-		Metadata:           mf.Metadata,
-		ContentRange:       contentRange,
-		PartsCount:         partsCount,
-		ETag:               &etag,
-		LastModified:       &lastModified,
-		StorageClass:       types.StorageClassStandard,
+
+		WebsiteRedirectLocation: strPtrOrNil(mf.WebsiteRedirectLocation),
+		Metadata:                mf.Metadata,
+		ContentRange:            contentRange,
+		PartsCount:              partsCount,
+		ETag:                    &etag,
+		LastModified:            &lastModified,
+		StorageClass:            types.StorageClassStandard,
 	}
 	// Echo the stored checksum only for a whole-object HEAD with checksum mode on
 	// (a ranged HEAD's checksum would not match the full object).
 	if input.ChecksumMode == types.ChecksumModeEnabled && !isRange {
-		out.ChecksumCRC32, out.ChecksumCRC32C, out.ChecksumSHA1, out.ChecksumSHA256, out.ChecksumCRC64NVME, out.ChecksumType = checksumFields(mf.ChecksumAlgorithm, mf.Checksum)
+		out.ChecksumCRC32, out.ChecksumCRC32C, out.ChecksumSHA1, out.ChecksumSHA256, out.ChecksumCRC64NVME, out.ChecksumSHA512, out.ChecksumMD5, out.ChecksumXXHASH64, out.ChecksumXXHASH3, out.ChecksumXXHASH128, out.ChecksumType = checksumFields(mf.ChecksumAlgorithm, mf.Checksum)
 	}
 	return out, nil
 }
@@ -552,17 +555,19 @@ func (b *Backend) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.
 		ContentLanguage:    strPtrOrNil(mf.ContentLanguage),
 		CacheControl:       strPtrOrNil(mf.CacheControl),
 		ExpiresString:      strPtrOrNil(mf.Expires),
-		Metadata:           mf.Metadata,
-		ContentRange:       contentRange,
-		PartsCount:         partsCount,
-		ETag:               &etag,
-		LastModified:       &lastModified,
-		StorageClass:       types.StorageClassStandard,
+
+		WebsiteRedirectLocation: strPtrOrNil(mf.WebsiteRedirectLocation),
+		Metadata:                mf.Metadata,
+		ContentRange:            contentRange,
+		PartsCount:              partsCount,
+		ETag:                    &etag,
+		LastModified:            &lastModified,
+		StorageClass:            types.StorageClassStandard,
 	}
 	// Echo the stored checksum only for a whole-object GET with checksum mode on
 	// (a ranged GET's checksum would not match the full object).
 	if input.ChecksumMode == types.ChecksumModeEnabled && !isRange {
-		out.ChecksumCRC32, out.ChecksumCRC32C, out.ChecksumSHA1, out.ChecksumSHA256, out.ChecksumCRC64NVME, out.ChecksumType = checksumFields(mf.ChecksumAlgorithm, mf.Checksum)
+		out.ChecksumCRC32, out.ChecksumCRC32C, out.ChecksumSHA1, out.ChecksumSHA256, out.ChecksumCRC64NVME, out.ChecksumSHA512, out.ChecksumMD5, out.ChecksumXXHASH64, out.ChecksumXXHASH3, out.ChecksumXXHASH128, out.ChecksumType = checksumFields(mf.ChecksumAlgorithm, mf.Checksum)
 	}
 	return out, nil
 }

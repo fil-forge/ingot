@@ -26,7 +26,7 @@ func (t *ObjectManifest) MarshalCBOR(w io.Writer) error {
 
 	cw := cbg.NewCborWriter(w)
 
-	if _, err := cw.Write([]byte{174}); err != nil {
+	if _, err := cw.Write([]byte{175}); err != nil {
 		return err
 	}
 
@@ -367,6 +367,29 @@ func (t *ObjectManifest) MarshalCBOR(w io.Writer) error {
 
 		}
 	}
+
+	// t.WebsiteRedirectLocation (string) (string)
+	if len("wr") > 1000000 {
+		return xerrors.Errorf("Value in field \"wr\" was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("wr"))); err != nil {
+		return err
+	}
+	if _, err := cw.WriteString(string("wr")); err != nil {
+		return err
+	}
+
+	if len(t.WebsiteRedirectLocation) > 1000000 {
+		return xerrors.Errorf("Value in field t.WebsiteRedirectLocation was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len(t.WebsiteRedirectLocation))); err != nil {
+		return err
+	}
+	if _, err := cw.WriteString(string(t.WebsiteRedirectLocation)); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -617,6 +640,17 @@ func (t *ObjectManifest) UnmarshalCBOR(r io.Reader) (err error) {
 
 				t.Metadata[k] = v
 
+			}
+			// t.WebsiteRedirectLocation (string) (string)
+		case "wr":
+
+			{
+				sval, err := cbg.ReadStringWithMax(cr, 1000000)
+				if err != nil {
+					return err
+				}
+
+				t.WebsiteRedirectLocation = string(sval)
 			}
 
 		default:
