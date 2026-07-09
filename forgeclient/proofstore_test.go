@@ -7,10 +7,10 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/fil-forge/ingot/tokenstore"
 	blobcmds "github.com/fil-forge/libforge/commands/blob"
 	contentcmds "github.com/fil-forge/libforge/commands/content"
 	indexcmds "github.com/fil-forge/libforge/commands/index"
-	"github.com/fil-forge/ingot/tokenstore"
 	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/ucantone/multikey/ed25519"
 	"github.com/fil-forge/ucantone/ucan"
