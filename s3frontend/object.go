@@ -43,7 +43,7 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 	bucketName := *input.Bucket
 	key := *input.Key
 	if !mst.IsValidKey(key) {
-		return s3response.PutObjectOutput{}, s3err.GetAPIError(s3err.ErrNoSuchKey)
+		return s3response.PutObjectOutput{}, s3err.GetAPIError(s3err.ErrInvalidRequest)
 	}
 
 	contentType := backend.GetStringFromPtr(input.ContentType)

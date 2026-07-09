@@ -41,7 +41,7 @@ func (b *Backend) CreateMultipartUpload(ctx context.Context, input s3response.Cr
 	}
 	bucket, key := *input.Bucket, *input.Key
 	if !mst.IsValidKey(key) {
-		return s3response.InitiateMultipartUploadResult{}, s3err.GetAPIError(s3err.ErrNoSuchKey)
+		return s3response.InitiateMultipartUploadResult{}, s3err.GetAPIError(s3err.ErrInvalidRequest)
 	}
 	if _, err := b.reg.Get(ctx, bucket); err != nil {
 		if errors.Is(err, registry.ErrNotFound) {

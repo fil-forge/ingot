@@ -33,7 +33,7 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 	}
 	dstBucket, dstKey := *input.Bucket, *input.Key
 	if !mst.IsValidKey(dstKey) {
-		return s3response.CopyObjectOutput{}, s3err.GetAPIError(s3err.ErrNoSuchKey)
+		return s3response.CopyObjectOutput{}, s3err.GetAPIError(s3err.ErrInvalidRequest)
 	}
 
 	replace := input.MetadataDirective == types.MetadataDirectiveReplace
