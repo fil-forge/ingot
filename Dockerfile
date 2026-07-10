@@ -4,7 +4,7 @@
 # curl (smelt's healthcheck uses curl) + ca-certificates (TLS to sprue /
 # the indexer). ingot is a standalone module — build with GOWORK=off.
 
-FROM --platform=$BUILDPLATFORM golang:1.25-bookworm AS build
+FROM --platform=$BUILDPLATFORM golang:1.26-bookworm AS build
 ARG TARGETOS=linux
 ARG TARGETARCH
 ENV GOWORK=off

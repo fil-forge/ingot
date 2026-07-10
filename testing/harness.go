@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"time"
 
@@ -277,20 +278,34 @@ func pickFreeAddr() (string, error) {
 	return addr, nil
 }
 
-// waitListening polls TCP connect to addr until it succeeds, ctx
-// is canceled, or the timeout fires.
+// waitListening polls the listener's HTTP /health endpoint until it returns a
+// response, ctx is canceled, or the timeout fires.
+//
+// It must be an application-level request, NOT a raw TCP dial: the socket is in
+// LISTEN state the moment net.Listen returns, so a TCP connect succeeds before
+// Fiber's startup path runs — and that path (App.Listener → printMessages →
+// startupMessage) reads the global os.Stdout to build its banner writer,
+// regardless of DisableStartupMessage (gofiber/fiber listen.go). A completed
+// HTTP round-trip proves fasthttp has reached server.Serve, which happens
+// strictly after that os.Stdout read. Gating on it guarantees the read is done
+// before StartHarness returns, so it can't race Run's os.Stdout capture swap
+// (testing/integration.go). Any status counts — a served response, not a
+// healthy one, is the ordering signal.
 func waitListening(ctx context.Context, addr string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
-	var d net.Dialer
+	url := "http://" + addr + "/health"
+	client := &http.Client{Timeout: 100 * time.Millisecond}
 	for {
 		if !time.Now().Before(deadline) {
 			return fmt.Errorf("listener not ready at %s after %s", addr, timeout)
 		}
-		dialCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
-		conn, err := d.DialContext(dialCtx, "tcp", addr)
-		cancel()
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return err
+		}
+		resp, err := client.Do(req)
 		if err == nil {
-			_ = conn.Close()
+			_ = resp.Body.Close()
 			return nil
 		}
 		select {
