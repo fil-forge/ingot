@@ -20,6 +20,10 @@ type Config struct {
 	DataDir string `mapstructure:"data_dir" yaml:"data_dir"`
 	// Region is the AWS region advertised over sigv4 (default "us-east-1").
 	Region string `mapstructure:"region" yaml:"region"`
+	// RootAccess / RootSecret are the S3 root-account credentials the embedded
+	// S3 listener (versitygw) requires. Both required.
+	RootAccess string `mapstructure:"root_access" yaml:"root_access"`
+	RootSecret string `mapstructure:"root_secret" yaml:"root_secret"`
 	// MaxBlobSize is the blob ceiling for new objects, in bytes (0 -> default
 	// 256 MiB). An object larger than this is coarsely split into ≤ max blobs.
 	MaxBlobSize int64 `mapstructure:"max_blob_size" yaml:"max_blob_size"`
@@ -106,6 +110,8 @@ func (c Config) ServerConfig() (ServerConfig, error) {
 		Addr:        c.Addr,
 		DataDir:     c.DataDir,
 		Region:      c.Region,
+		RootAccess:  c.RootAccess,
+		RootSecret:  c.RootSecret,
 		MaxBlobSize: c.MaxBlobSize,
 
 		// A per-plane override wins, else the top-level value, else the logstore
@@ -221,6 +227,9 @@ func (c *Config) Validate() error {
 	}
 	if c.DataDir == "" {
 		errs = append(errs, "data_dir is required")
+	}
+	if c.RootAccess == "" || c.RootSecret == "" {
+		errs = append(errs, "root_access and root_secret (S3 root credentials) are required")
 	}
 	if _, err := c.ServerConfig(); err != nil {
 		errs = append(errs, err.Error())

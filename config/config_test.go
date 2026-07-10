@@ -19,6 +19,8 @@ func validConfig(t *testing.T) Config {
 	return Config{
 		Addr:             "127.0.0.1:9000",
 		DataDir:          "/data",
+		RootAccess:       "root-access",
+		RootSecret:       "root-secret",
 		PostgresDSN:      "postgres://ingot@127.0.0.1:5432/ingot",
 		Identity:         IdentityConfig{KeyFile: keyFile},
 		UploadServiceURL: "http://127.0.0.1:8000",
