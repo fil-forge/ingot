@@ -199,8 +199,12 @@ func (s *Service) GetUserAccountForRequest(ctx fiber.Ctx, access string) (auth.A
 
 	// Cache the verification keys until Hilt's own expiry horizon: SigV4
 	// derived keys die at the next UTC midnight (credential-scope date
-	// rollover), which is also when Hilt expires its re-delegations.
-	s.keys.Put(access, untilNextUTCMidnight(time.Now()), ok.Keys.Entries[keyDID]...)
+	// rollover), which is also when Hilt expires its re-delegations. Extend
+	// by MaxClockSkew: a client with a lagging clock can sign a request with
+	// today's scope date at a wall-clock instant just after midnight, and Hilt
+	// accepts it within ±MaxClockSkew — keep the date's key cached that much
+	// longer so those stragglers still hit the fast path instead of Hilt.
+	s.keys.Put(access, untilNextUTCMidnight(time.Now())+sigv4.MaxClockSkew, ok.Keys.Entries[keyDID]...)
 
 	s.logger.Debug("hilt/iam: request authorized",
 		zap.String("access", access),
