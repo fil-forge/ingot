@@ -2,6 +2,8 @@ package iam
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net/http"
 	"testing"
 	"time"
@@ -9,12 +11,15 @@ import (
 	awsv4 "github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/fil-forge/versitygw/auth"
 	v4 "github.com/fil-forge/versitygw/aws/signer/v4"
+	"github.com/fil-forge/versitygw/s3err"
 
+	hiltauth "github.com/fil-forge/hilt/pkg/rpc/service/auth"
 	"github.com/fil-forge/hilt/pkg/sigv4"
 	"github.com/fil-forge/ingot/registry"
 	contentcmds "github.com/fil-forge/libforge/commands/content"
 	s3 "github.com/fil-forge/libforge/commands/s3"
 	"github.com/fil-forge/ucantone/did"
+	ucanerrors "github.com/fil-forge/ucantone/errors"
 	"github.com/fil-forge/ucantone/multikey/ed25519"
 	"github.com/fil-forge/ucantone/ucan"
 	"github.com/fil-forge/ucantone/ucan/delegation"
@@ -165,4 +170,74 @@ func TestAuthorizeLocal(t *testing.T) {
 		_, ok := authLocal(s)
 		require.False(t, ok, "must not see another key's store")
 	})
+}
+
+// hiltErr reproduces the wrapping depth a real authorize failure arrives with:
+// binding.Unpack wraps the decoded ErrorModel, the Hilt client wraps that, and
+// GetUserAccountForRequest wraps once more — mapAuthError must see through all
+// of it via errors.As.
+func hiltErr(name string) error {
+	base := ucanerrors.New(name, "rejected by hilt")
+	return fmt.Errorf("hilt/iam: authorize request: %w",
+		fmt.Errorf("unpacking result: %w",
+			fmt.Errorf("executing invocation: %w", base)))
+}
+
+func TestMapAuthError(t *testing.T) {
+	t.Run("non-named error is not mapped (500-class)", func(t *testing.T) {
+		// Transport/internal failures are not ucantone Named errors; the caller
+		// wraps them into an InternalError rather than a misleading auth code.
+		_, ok := mapAuthError(fmt.Errorf("dial: %w", errors.New("connection refused")))
+		require.False(t, ok)
+	})
+
+	t.Run("named non-auth error is not mapped", func(t *testing.T) {
+		// Being a ucantone Named error does not make it an authorization
+		// rejection — an unrecognized name is left 500-class, not forced to a
+		// misleading auth code.
+		_, ok := mapAuthError(hiltErr("SomeUnrelatedNamedError"))
+		require.False(t, ok)
+	})
+
+	// These collapse onto auth.ErrNoSuchUser, which versitygw special-cases
+	// into InvalidAccessKeyId(access).
+	for _, name := range []string{
+		hiltauth.UnknownAccessKeyErrorName,
+		hiltauth.InvalidAccessKeyIDErrorName,
+		hiltauth.AccessKeyExpiredErrorName,
+	} {
+		t.Run(name+"_to_NoSuchUser", func(t *testing.T) {
+			got, ok := mapAuthError(hiltErr(name))
+			require.True(t, ok)
+			require.ErrorIs(t, got, auth.ErrNoSuchUser)
+		})
+	}
+
+	// Named rejections mapped to a concrete S3 error: assert both the wire code
+	// and HTTP status.
+	apiCases := map[string]struct {
+		code   string
+		status int
+	}{
+		hiltauth.MalformedSignatureErrorName:    {"AuthorizationHeaderMalformed", 400},
+		hiltauth.SignatureMismatchErrorName:     {"SignatureDoesNotMatch", 403},
+		hiltauth.SignatureExpiredErrorName:      {"AccessDenied", 403},
+		hiltauth.UnsupportedOperationErrorName:  {"NotImplemented", 501},
+		hiltauth.UnknownBucketErrorName:         {"NoSuchBucket", 404},
+		hiltauth.TenantDisabledErrorName:        {"AccessDenied", 403},
+		hiltauth.IssuerForbiddenErrorName:       {"AccessDenied", 403},
+		hiltauth.RegionNotServedErrorName:       {"AccessDenied", 403},
+		hiltauth.OperationNotPermittedErrorName: {"AccessDenied", 403},
+		hiltauth.BucketNotPermittedErrorName:    {"AccessDenied", 403},
+	}
+	for name, want := range apiCases {
+		t.Run(name, func(t *testing.T) {
+			got, ok := mapAuthError(hiltErr(name))
+			require.True(t, ok)
+			var s3e s3err.S3Error
+			require.ErrorAs(t, got, &s3e)
+			require.Equal(t, want.code, s3e.BaseError().Code)
+			require.Equal(t, want.status, s3e.StatusCode())
+		})
+	}
 }

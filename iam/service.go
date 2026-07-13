@@ -55,6 +55,7 @@ import (
 	s3req "github.com/fil-forge/libforge/commands/s3/request"
 	ucanlib "github.com/fil-forge/libforge/ucan"
 	"github.com/fil-forge/ucantone/did"
+	ucanerrors "github.com/fil-forge/ucantone/errors"
 	"github.com/fil-forge/ucantone/ucan"
 	"github.com/fil-forge/versitygw/auth"
 	"github.com/fil-forge/versitygw/s3api/middlewares"
@@ -155,8 +156,8 @@ func (s *Service) GetUserAccountForRequest(ctx fiber.Ctx, access string) (auth.A
 
 	// The *fasthttp.RequestCtx doubles as the invocation's context.Context,
 	// so the Hilt round-trip is bounded by the request's lifetime.
-	rc := ctx.RequestCtx()
-	req := fasthttputil.RequestFromHTTPContext(rc)
+	reqCtx := ctx.RequestCtx()
+	req := fasthttputil.RequestFromHTTPContext(reqCtx)
 
 	// Scope this key's proof store onto the request so an onward Forge
 	// retrieval (blockstore.Forge, which has only ctx + space) uses THIS
@@ -168,16 +169,20 @@ func (s *Service) GetUserAccountForRequest(ctx fiber.Ctx, access string) (auth.A
 
 	// Local fast path: with a cached verification key and cached delegation
 	// chains covering the request's Forge commands, Hilt is not consulted.
-	if acct, ok := s.authroizeLocal(rc, req, access, store); ok {
-		return acct, nil
+	if account, ok := s.authroizeLocal(reqCtx, req, access, store); ok {
+		return account, nil
 	}
 
-	ok, ctr, err := s.authorizer.AuthorizeRequest(rc, req)
+	ok, ctr, err := s.authorizer.AuthorizeRequest(reqCtx, req)
 	if err != nil {
-		// TODO(hilt): map Hilt's unknown-access-key failure to
-		// auth.ErrNoSuchUser (-> InvalidAccessKeyId) once the receipt
-		// failure model is structured enough to distinguish it from
-		// transport or service errors.
+		// A recognized Hilt auth rejection maps to the closest S3 error;
+		// anything else (transport, service, internal, or an unrecognized
+		// named error) is 500-class and wrapped generically.
+		if mapped, matched := mapAuthError(err); matched {
+			s.logger.Debug("hilt/iam: authorize rejected",
+				zap.String("access", access), zap.Error(err))
+			return auth.Account{}, mapped
+		}
 		return auth.Account{}, fmt.Errorf("hilt/iam: authorize request: %w", err)
 	}
 
@@ -190,7 +195,7 @@ func (s *Service) GetUserAccountForRequest(ctx fiber.Ctx, access string) (auth.A
 	// ≤24h TTL) into THIS key's store and complete their chains if needed —
 	// best-effort: the request IS authorized; a gap here only affects onward
 	// Forge invocations, which will surface it as missing retrieval authority.
-	s.cacheProofs(rc, store, ctr, req, keyDID)
+	s.cacheProofs(reqCtx, store, ctr, req, keyDID)
 
 	// Cache the verification keys until Hilt's own expiry horizon: SigV4
 	// derived keys die at the next UTC midnight (credential-scope date
@@ -207,6 +212,50 @@ func (s *Service) GetUserAccountForRequest(ctx fiber.Ctx, access string) (auth.A
 		SigningKey: key,
 		Role:       auth.RoleUser,
 	}, nil
+}
+
+// mapAuthError translates an /s3/request/authorize failure into the closest S3
+// error, reporting ok=false when it recognizes none. Hilt returns its
+// authorization rejections as ucantone Named errors (hilt/pkg/rpc/service/auth)
+// with stable names; a recognized name maps to an S3 error returned VERBATIM
+// (not %w-wrapped) so versitygw's renderer type-asserts it. Everything else is
+// left to the caller as 500-class: a non-Named error, but ALSO a Named error
+// whose name we don't recognize — being Named does not make an error an
+// authorization rejection. The mapping is best-effort: several Hilt reasons
+// collapse onto AccessDenied where S3 has no finer-grained public code at the
+// authentication layer.
+func mapAuthError(err error) (error, bool) {
+	var named ucanerrors.Named
+	if !ucanerrors.As(err, &named) {
+		return nil, false
+	}
+	switch named.Name() {
+	case hiltauth.UnknownAccessKeyErrorName,
+		hiltauth.InvalidAccessKeyIDErrorName,
+		hiltauth.AccessKeyExpiredErrorName:
+		// versitygw special-cases auth.ErrNoSuchUser into
+		// InvalidAccessKeyId(access), which embeds the offending key id.
+		return auth.ErrNoSuchUser, true
+	case hiltauth.MalformedSignatureErrorName:
+		return s3err.MalformedAuth.MissingSignature(), true
+	case hiltauth.SignatureMismatchErrorName:
+		return s3err.GetAPIError(s3err.ErrSignatureDoesNotMatch), true
+	case hiltauth.SignatureExpiredErrorName:
+		return s3err.GetAPIError(s3err.ErrExpiredPresignRequest), true
+	case hiltauth.UnsupportedOperationErrorName:
+		return s3err.GetAPIError(s3err.ErrNotImplemented), true
+	case hiltauth.UnknownBucketErrorName:
+		return s3err.GetAPIError(s3err.ErrNoSuchBucket), true
+	case hiltauth.TenantDisabledErrorName,
+		hiltauth.IssuerForbiddenErrorName,
+		hiltauth.RegionNotServedErrorName,
+		hiltauth.OperationNotPermittedErrorName,
+		hiltauth.BucketNotPermittedErrorName:
+		return s3err.GetAPIError(s3err.ErrAccessDenied), true
+	default:
+		// Named, but not a Hilt auth rejection we know — not ours to map.
+		return nil, false
+	}
 }
 
 // authroizeLocal is the fast path, mirroring Hilt's own verification
