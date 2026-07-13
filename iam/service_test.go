@@ -66,8 +66,9 @@ func authorizeOK(t *testing.T, keyDID did.DID, keys ...s3.VerificationKey) *s3re
 	t.Helper()
 	bucket, err := ed25519.GenerateIssuer()
 	require.NoError(t, err)
+	bucketID := bucket.DID()
 	return &s3req.AuthorizeOK{
-		Bucket:      bucket.DID(),
+		Bucket:      &bucketID,
 		Permissions: s3.PermissionSet{Entries: map[did.DID][]string{keyDID: {"s3:GetObject"}}},
 		Keys:        s3.KeySet{Entries: map[did.DID][]s3.VerificationKey{keyDID: keys}},
 	}
@@ -106,7 +107,7 @@ func TestGetUserAccountForRequest(t *testing.T) {
 
 		acct, err := resolveForRequest(t, svc, access, req)
 		require.NoError(t, err)
-		require.Equal(t, auth.Account{Access: access, SigningKey: derivedKey, Role: auth.RoleUser}, acct)
+		require.Equal(t, auth.Account{Access: access, SigningKey: derivedKey, Role: auth.RoleAdmin}, acct)
 
 		// The forwarded request must be what the client signed: raw
 		// request-line URL (still percent-encoded) and the signed headers,

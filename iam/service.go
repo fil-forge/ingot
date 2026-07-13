@@ -144,13 +144,13 @@ func New(authorizer Authorizer, proofs *KeyProofs, keys *VerificationKeyCache, o
 // invoking /s3/request/authorize on Hilt. On success the returned account
 // carries the SigV4 signing key Hilt derived for the request's credential
 // scope; versitygw verifies the request signature against it locally.
-func (s *Service) GetUserAccountForRequest(ctx fiber.Ctx, access string) (auth.Account, error) {
+func (s *Service) GetUserAccountForRequest(ctx fiber.Ctx, accessKeyStr string) (auth.Account, error) {
 	// The accessKeyId is the access key's did:key identifier (the DID with
 	// the prefix stripped). Reject malformed keys before calling out.
-	keyDID, err := did.Parse(did.KeyPrefix + access)
+	accessKeyID, err := did.Parse(did.KeyPrefix + accessKeyStr)
 	if err != nil {
 		s.logger.Debug("hilt/iam: access key is not a did:key identifier",
-			zap.String("access", access), zap.Error(err))
+			zap.String("access", accessKeyStr), zap.Error(err))
 		return auth.Account{}, auth.ErrNoSuchUser
 	}
 
@@ -164,12 +164,12 @@ func (s *Service) GetUserAccountForRequest(ctx fiber.Ctx, access string) (auth.A
 	// access key's delegations, never another's. Set for every request
 	// regardless of authorization outcome — harmless if the request later
 	// fails, and needed whichever path authorizes.
-	store := s.proofs.For(keyDID)
+	store := s.proofs.For(accessKeyID)
 	ctx.Locals(reqscope.Key, ucanlib.ProofStore(store))
 
 	// Local fast path: with a cached verification key and cached delegation
 	// chains covering the request's Forge commands, Hilt is not consulted.
-	if account, ok := s.authroizeLocal(reqCtx, req, access, store); ok {
+	if account, ok := s.authorizeLocal(reqCtx, req, accessKeyStr, store); ok {
 		return account, nil
 	}
 
@@ -180,22 +180,22 @@ func (s *Service) GetUserAccountForRequest(ctx fiber.Ctx, access string) (auth.A
 		// named error) is 500-class and wrapped generically.
 		if mapped, matched := mapAuthError(err); matched {
 			s.logger.Debug("hilt/iam: authorize rejected",
-				zap.String("access", access), zap.Error(err))
+				zap.String("access", accessKeyStr), zap.Error(err))
 			return auth.Account{}, mapped
 		}
 		return auth.Account{}, fmt.Errorf("hilt/iam: authorize request: %w", err)
 	}
 
-	key, found := sigV4Key(ok.Keys, keyDID)
+	key, found := sigV4Key(ok.Keys, accessKeyID)
 	if !found {
-		return auth.Account{}, fmt.Errorf("hilt/iam: no sigv4 signing key for %s in authorize result", keyDID)
+		return auth.Account{}, fmt.Errorf("hilt/iam: no sigv4 signing key for %s in authorize result", accessKeyID)
 	}
 
 	// Deposit the returned delegations (access-key→ingot re-delegations,
 	// ≤24h TTL) into THIS key's store and complete their chains if needed —
 	// best-effort: the request IS authorized; a gap here only affects onward
 	// Forge invocations, which will surface it as missing retrieval authority.
-	s.cacheProofs(reqCtx, store, ctr, req, keyDID)
+	s.cacheProofs(reqCtx, store, ctr, req, accessKeyID)
 
 	// Cache the verification keys until Hilt's own expiry horizon: SigV4
 	// derived keys die at the next UTC midnight (credential-scope date
@@ -204,17 +204,28 @@ func (s *Service) GetUserAccountForRequest(ctx fiber.Ctx, access string) (auth.A
 	// today's scope date at a wall-clock instant just after midnight, and Hilt
 	// accepts it within ±MaxClockSkew — keep the date's key cached that much
 	// longer so those stragglers still hit the fast path instead of Hilt.
-	s.keys.Put(access, untilNextUTCMidnight(time.Now())+sigv4.MaxClockSkew, ok.Keys.Entries[keyDID]...)
+	s.keys.Put(accessKeyStr, untilNextUTCMidnight(time.Now())+sigv4.MaxClockSkew, ok.Keys.Entries[accessKeyID]...)
 
+	// Bucket is nil for bucket-level operations (CreateBucket, ListBuckets),
+	// which authorize without addressing an existing bucket.
+	bucketStr := ""
+	if ok.Bucket != nil {
+		bucketStr = ok.Bucket.String()
+	}
 	s.logger.Debug("hilt/iam: request authorized",
-		zap.String("access", access),
-		zap.String("bucket", ok.Bucket.String()),
+		zap.String("access", accessKeyStr),
+		zap.String("bucket", bucketStr),
 	)
 
 	return auth.Account{
-		Access:     access,
+		Access:     accessKeyStr,
 		SigningKey: key,
-		Role:       auth.RoleUser,
+		// Admin so the gateway's role/ACL layers defer entirely: authorization
+		// is per-request via Hilt (or the local fast path), which enforces the
+		// key's permissions and bucket scope. The gateway doesn't model
+		// ownership for hilt-managed keys (buckets default to root-owned) and
+		// its admin APIs are not mounted.
+		Role: auth.RoleAdmin,
 	}, nil
 }
 
@@ -262,11 +273,11 @@ func mapAuthError(err error) (error, bool) {
 	}
 }
 
-// authroizeLocal is the fast path, mirroring Hilt's own verification
+// authorizeLocal is the fast path, mirroring Hilt's own verification
 // order over THIS key's proof store. It reports ok=false whenever anything
 // needed isn't cached or doesn't check out; the caller then takes the Hilt
 // path, whose response replenishes the caches.
-func (s *Service) authroizeLocal(ctx context.Context, req s3.Request, access string, store *DelegationCache) (auth.Account, bool) {
+func (s *Service) authorizeLocal(ctx context.Context, req s3.Request, access string, store *DelegationCache) (auth.Account, bool) {
 	if s.buckets == nil || !s.agent.Defined() {
 		return auth.Account{}, false
 	}
@@ -278,7 +289,7 @@ func (s *Service) authroizeLocal(ctx context.Context, req s3.Request, access str
 		return auth.Account{}, false
 	}
 
-	// 2-4. Cached key verifies the signature and the request is in time
+	// 2. Cached key verifies the signature and the request is in time
 	// bounds. A scope-rolled or rotated key simply fails here.
 	key, ok := s.keys.Get(access, s3.KeyKindSigV4)
 	if !ok {
@@ -291,7 +302,7 @@ func (s *Service) authroizeLocal(ctx context.Context, req s3.Request, access str
 		return auth.Account{}, false
 	}
 
-	// 5. The S3 action must map to Forge commands. Bucket-level operations
+	// 3. The S3 action must map to Forge commands. Bucket-level operations
 	// (create/delete/list-buckets) map to none — they go to Hilt regardless.
 	op, err := hiltauth.OperationFor(req)
 	if err != nil {
@@ -302,13 +313,13 @@ func (s *Service) authroizeLocal(ctx context.Context, req s3.Request, access str
 		return auth.Account{}, false
 	}
 
-	// 6. The delegation subject is the bucket's space.
+	// 4. The delegation subject is the bucket's space.
 	st, err := s.buckets.Get(ctx, bucketFromURL(req.URL))
 	if err != nil || !st.Space.Defined() {
 		return auth.Account{}, false
 	}
 
-	// 7. Every command must be covered by a chain to this instance's agent
+	// 5. Every command must be covered by a chain to this instance's agent
 	// in THIS key's store. Because the store holds only keyDID's delegations,
 	// a resolving agent chain is necessarily space→…→keyDID→agent — it
 	// carries both keyDID's own grant (Hilt's permission + bucket scoping)
@@ -327,7 +338,12 @@ func (s *Service) authroizeLocal(ctx context.Context, req s3.Request, access str
 	return auth.Account{
 		Access:     access,
 		SigningKey: key,
-		Role:       auth.RoleUser,
+		// Admin so the gateway's role/ACL layers defer entirely: authorization
+		// is per-request via Hilt (or the local fast path), which enforces the
+		// key's permissions and bucket scope. The gateway doesn't model
+		// ownership for hilt-managed keys (buckets default to root-owned) and
+		// its admin APIs are not mounted.
+		Role: auth.RoleAdmin,
 	}, true
 }
 

@@ -165,12 +165,12 @@ github.com/fil-forge/go-ipni-tools v0.0.0-20260519194815-545b9421aec0 h1:HAfXUPv
 github.com/fil-forge/go-ipni-tools v0.0.0-20260519194815-545b9421aec0/go.mod h1:3NRV/7wc4/0uzzrGdI7NoN/yeF1UvqKRwMyjBqGc5s0=
 github.com/fil-forge/go-ucanto v0.0.0-20260507172450-5cb5d073f8ab h1:2J2cDThqTKP6/0k3SfdlSxfyPa3aLqjTYnmvbEcryfg=
 github.com/fil-forge/go-ucanto v0.0.0-20260507172450-5cb5d073f8ab/go.mod h1:lZF3UXZ2hGLKYmXdquG50JqI9pRlUrV6lubGtgOYfwc=
-github.com/fil-forge/hilt v0.0.1-0.20260713093035-4241c7d56a02 h1:SucI0iVleFi4p+mAzbdNZColrGiPzckkFw2+jx4RK7w=
-github.com/fil-forge/hilt v0.0.1-0.20260713093035-4241c7d56a02/go.mod h1:qCI6R7ScpGFpKFQUKswH5Ac/O7i8p+v+B4CnnJdVvR8=
+github.com/fil-forge/hilt v0.0.1-0.20260713102236-c3e8ad4ca841 h1:qgr12VfHRg8Mev2w7Y7EL9qejawlTGgA5ngg1W2Y1tc=
+github.com/fil-forge/hilt v0.0.1-0.20260713102236-c3e8ad4ca841/go.mod h1:zzPrQQ/VhgShDIi9IsfeFdiNXJftACRXxUaJI6opW9s=
 github.com/fil-forge/indexing-service v1.13.5-0.20260619142411-efe3f5fab717 h1:Wke8qgaDgy7DGaIS28VpHip+YHSdQP1hGNEZTrXXzb4=
 github.com/fil-forge/indexing-service v1.13.5-0.20260619142411-efe3f5fab717/go.mod h1:wFcakLohOqpMRkJzWRdGFGHRFpGB+PpEMCm9wkt2cqU=
-github.com/fil-forge/libforge v0.0.0-20260701162346-f0706e1641a3 h1:/EDxpbuVeSXH3FLF7MK4G4wrDUFmCO9fLQHL23RZ2uU=
-github.com/fil-forge/libforge v0.0.0-20260701162346-f0706e1641a3/go.mod h1:0kXihIQ4L2uZ00nR5XrZ/Y8Db7Ht/qQNuiWslwMJ95M=
+github.com/fil-forge/libforge v0.0.0-20260713100115-a3aa293b990c h1:ElgAxd+08QifEpnhO1vH58A/CD+i/Hdic6B+k3W/QPY=
+github.com/fil-forge/libforge v0.0.0-20260713100115-a3aa293b990c/go.mod h1:0kXihIQ4L2uZ00nR5XrZ/Y8Db7Ht/qQNuiWslwMJ95M=
 github.com/fil-forge/ucantone v0.0.0-20260706102443-79141c5cc52e h1:di/SseJVEO6bznSH/UEnAE2nSwwp/gqgnPLgE9/x2Zg=
 github.com/fil-forge/ucantone v0.0.0-20260706102443-79141c5cc52e/go.mod h1:oFY5BfD0bDeodGlbBHh3/nK99MAS93rGXjoQz7s5qgE=
 github.com/fil-forge/versitygw v0.0.0-20260707081002-05ded0296fd1 h1:SCDYWkNVYg9Qt8DeSyLKL8DJWTS4HkFcU2qTBoWPSWE=

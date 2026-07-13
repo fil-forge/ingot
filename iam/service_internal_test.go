@@ -111,7 +111,7 @@ func TestAuthorizeLocal(t *testing.T) {
 	// key's own store and hand it to the fast path.
 	authLocal := func(s *Service) (auth.Account, bool) {
 		store := s.proofs.For(accessKey.DID())
-		return s.authroizeLocal(context.Background(), req, accessKeyID, store)
+		return s.authorizeLocal(context.Background(), req, accessKeyID, store)
 	}
 
 	t.Run("all cached: authorized locally", func(t *testing.T) {
