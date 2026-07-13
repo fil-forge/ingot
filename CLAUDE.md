@@ -22,20 +22,24 @@ toolchain) and exists for cross-repo work; ingot is a standalone module:
 
 ```bash
 make build      # GOWORK=off go build ./...
-make test       # GOWORK=off go test ./...
+make test       # unit tests: GOWORK=off go test ./... (fast, no Docker)
+make itest      # integration tests: boots the Forge stack in Docker (~6 min)
 make gen        # regenerate bucket/cbor_gen.go after changing bucket types
 GOWORK=off go vet ./...
-GOWORK=off go test ./testing/ -run TestSmoke_PutObject -v   # one smoke test
+GOWORK=off go test -tags itest ./itest -run 'TestForgeVersity/PutObject' -v  # one S3 category
 GOWORK=off go build -o /tmp/ingot ./cmd/ingot               # the daemon binary
 ```
 
 **go directive: 1.25.7** (the indexing-service dep requires ≥ 1.25.7).
 
-Forge mode is verified live in **smelt** (the local-dev stack): from `smelt/`,
-with the parent `go.work` listing `./ingot ./smelt` + the genproto replace,
-`SMELT_WORKSPACE=1 go test -tags e2e ./tests/e2e -run TestIngotNativeProvision`
-rebuilds ingot from source and round-trips a PUT/GET through a real
-sprue+piri+indexer. See `smelt/docs/DEVELOPING.md`.
+**The test pattern — unit first, integration when you're ready to wait.**
+`make test` runs library/unit tests in seconds with no Docker. `make itest`
+runs `itest/` (build tag `itest`): it boots the full smelt Forge stack in
+Docker, mounts THIS working tree's binary over the published ingot image, and
+validates the real network path — including the curated S3 conformance
+partition (`itest/versity_*_test.go`); see `itest/README.md`. CI mirrors the
+same ordering: the `itest` job only runs after the unit job passes
+(`.github/workflows/go-test.yml`).
 
 ## Dependency stack
 
@@ -97,10 +101,10 @@ Internal:
   `chunker.go` (`BodyCodec`/`FixedChunker`), `cbor_gen.go`.
 - **`mst/`** — the forked MST (only dep: go-cid).
 - **`inmem/`** — `MemStore` (Registry+Meta), `NopBaseReader`, `NopUploader`; backs
-  the test harness and standalone mode.
+  standalone mode (slated for removal).
 - **`cars/`**, **`migrations/`**, **`internal/ucanexec/`**, **`gen/`**,
   **`testing/`** — CAR codec, goose SQL (`ingot` schema), generic `Execute[T]`,
-  cborgen driver, in-process test harness + versitygw suite.
+  cborgen driver, S3-client test glue (Config/NewS3Conf + roundtrip helpers).
 
 ## Interface seams
 
@@ -142,31 +146,38 @@ Viper/yaml-bindable. Key fields: `Enabled`, `Addr`, `DataDir`, `Region`,
 
 ## Testing
 
-The `testing/` package exercises ingot end-to-end without Postgres/piri/indexer:
+There is no in-memory ingot: the deployment under test is always the real
+forge-mode daemon. Two tiers:
 
-- **`harness.go`** — `StartHarness` boots a real in-process listener through
-  `ingot.ServerModule` with `inmem` fakes (`MemStore`, `NopBaseReader`,
-  `NopUploader`).
-- **`smoke_test.go`** — `TestSmoke_<Group>` (passing) + `TestSmokeXFail_<Group>`
-  (known-failing; per-case failures are Skipped and the test FAILs only on an
-  *unexpected pass* — the cue to promote the row). ~66 pass / ~53 xfail.
-- **Shuffle-brittle upstream cases** — CI runs `go test -shuffle=on ./...` (the
-  ipdxco unified `go-test` workflow enables shuffle unless `go-test-config.json`
-  sets `shuffle: false`; the `-race` job runs in fixed order). A few versitygw
-  cases name buckets from a process-global counter and assert *creation-order*
-  pagination, while ingot returns buckets lexicographically (matching
-  versitygw's own backend) — so shuffle can straddle a digit boundary
-  (…98,99,100) and flip them (see `ListBuckets_truncated`). Such a case is gated
-  behind `shuffleEnabled()`: it runs and must pass in fixed order, but is
-  `Skip`ped under `-shuffle`, keeping coverage everywhere except the one
-  nondeterministic environment. Don't add these to the XFail group — that group
-  fails on an *unexpected pass*, so a shuffle-dependent case would flip there too.
-- **`module_test.go`** (root), **`logstore/store_test.go`**,
-  **`blockstore/{cache,staging}_test.go`**, **`forgeclient/accounts_test.go`**,
-  **`cmd/space_test.go`** — unit tests.
-
-The in-memory suite covers S3 → MST → LSM; the **forge** glue (`uploader.Forge`,
-`blockstore.Forge`, `forgeclient`) is verified live by smelt's e2e (above).
+- **`make test` — unit** (seconds, no Docker): `module_test.go` (root),
+  `logstore/store_test.go`, `blockstore/{cache,staging}_test.go`,
+  `forgeclient/accounts_test.go`, `cmd/space_test.go`, plus library helpers in
+  `testing/` (thin S3-client glue: `Config`/`NewS3Conf`, roundtrip helpers).
+- **`make itest` — integration** (`itest/`, build tag `itest`, Docker):
+  boots the smelt Forge stack with THIS working tree's binary mounted over
+  the published image.
+  - **`versity_{bucket,object,multipart}_test.go`** — the S3 conformance
+    partition: per upstream versitygw group, a curated pass table (every case
+    must pass) and an XFail table (known-failing, reported as SKIP; an
+    *unexpected pass* fails the test — the cue to promote the row). One
+    shared stack serves all categories (`TestForgeVersity`).
+  - **`scenarios_test.go`** — ingot-unique behaviors upstream can't assert
+    (blob-split/spool-by-digest, zero-byte objects, part-spans-blobs
+    multipart, failed-Complete session recovery), on a small-`max_blob_size`
+    config (`testdata/config-smallblob.yaml` via smelt's WithServiceConfig).
+  - **`forge_native_test.go` / `forge_eviction_test.go`** — provisioning and
+    the read-after-eviction network tier, each on its own stack.
+- **Suite-composition-sensitive upstream cases** — a few versitygw cases
+  depend on run position rather than S3 semantics: `ListBuckets_truncated`
+  names buckets from a process-global counter and asserts *creation-order*
+  pagination (ingot lists lexicographically; whether they diverge depends on
+  the counter's digit boundary), and the CompleteMultipartUpload racey cases
+  depend on host load. Such cases carry a `skip` hook in their table row with
+  the reason. Don't move them to the XFail table — that table fails on an
+  *unexpected pass*, so a position-dependent case would flip there.
+- **When bumping versitygw:** new upstream cases are not picked up
+  automatically — diff `group-tests.go` dispatch lists against the itest
+  tables and curate the additions (see `itest/README.md`).
 
 ## Code generation & migrations
 

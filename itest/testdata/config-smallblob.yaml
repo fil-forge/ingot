@@ -1,0 +1,30 @@
+# Ingot daemon config for the blob-split scenario itests — smelt's default
+# forge-mode config (systems/ingot/config/config.yaml) with max_blob_size
+# lowered to 64 KiB so small objects coarse-split into multiple body blobs.
+# Mounted over /etc/ingot/config.yaml via stack.WithServiceConfig.
+
+mode: forge
+
+addr: "0.0.0.0:9000"
+region: us-east-1
+data_dir: /data
+
+root_access: ingot
+root_secret: ingotsecret
+
+identity:
+  key_file: /keys/ingot.pem
+
+postgres_dsn: "postgres://ingot:ingot@ingot-postgres:5432/ingot?sslmode=disable"
+
+upload_service_url: "http://upload:80"
+upload_service_did: "did:web:upload"
+upload_receipts_url: "http://upload:80/receipt"
+
+indexer_endpoint: "http://indexer:80"
+indexer_did: "did:web:indexer"
+
+token_store_dir: /data
+
+# The point of this config: force coarse blob-splitting at 64 KiB.
+max_blob_size: 65536

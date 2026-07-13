@@ -116,13 +116,15 @@ standalone client — not inside the central upload-service.
 
 ```bash
 make build   # GOWORK=off go build ./...
-make test    # GOWORK=off go test ./...
+make test    # unit tests (seconds, no Docker)
+make itest   # integration tests (boots the Forge stack in Docker, ~6 min)
 make gen     # regenerate CBOR marshalers after changing bucket types
 ```
 
-The `testing/` package boots a full in-process S3 listener backed by in-memory
-fakes — the way to exercise the S3 → MST → LSM core without Postgres, piri, or
-the indexing-service.
+The `itest/` package boots the real Forge stack via smelt's Go SDK and runs
+this working tree's binary against it — including the curated S3 conformance
+partition (per-group expected-pass and known-fail tables of versitygw cases).
+CI runs it after unit tests pass. See `itest/README.md`.
 
 ## Dependencies
 
