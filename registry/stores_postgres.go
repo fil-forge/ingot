@@ -179,6 +179,46 @@ func (r *Postgres) DeleteLocation(ctx context.Context, space string, digest []by
 	return nil
 }
 
+// ParkStore ==================================================================
+
+func (r *Postgres) PutPark(ctx context.Context, p BlobPark) error {
+	_, err := r.pool.Exec(ctx,
+		`INSERT INTO ingot.blob_parks (digest, add_task, accept_task, put_invocation, size)
+		 VALUES ($1, $2, $3, $4, $5)
+		 ON CONFLICT (digest) DO UPDATE
+		   SET add_task = EXCLUDED.add_task, accept_task = EXCLUDED.accept_task,
+		       put_invocation = EXCLUDED.put_invocation, size = EXCLUDED.size`,
+		p.Digest, p.AddTask, p.AcceptTask, p.PutInvocation, p.Size)
+	if err != nil {
+		return fmt.Errorf("registry: put park: %w", err)
+	}
+	return nil
+}
+
+func (r *Postgres) GetPark(ctx context.Context, digest []byte) (*BlobPark, error) {
+	park := &BlobPark{Digest: digest}
+	err := r.pool.QueryRow(ctx,
+		`SELECT add_task, accept_task, put_invocation, size, created_at
+		 FROM ingot.blob_parks WHERE digest = $1`,
+		digest).Scan(&park.AddTask, &park.AcceptTask, &park.PutInvocation, &park.Size, &park.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("registry: get park: %w", err)
+	}
+	return park, nil
+}
+
+func (r *Postgres) DeletePark(ctx context.Context, digest []byte) error {
+	_, err := r.pool.Exec(ctx,
+		`DELETE FROM ingot.blob_parks WHERE digest = $1`, digest)
+	if err != nil {
+		return fmt.Errorf("registry: delete park: %w", err)
+	}
+	return nil
+}
+
 // MultipartStore =============================================================
 
 func (r *Postgres) CreateSession(ctx context.Context, s MultipartSession) error {

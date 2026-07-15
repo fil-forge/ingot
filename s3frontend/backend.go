@@ -49,6 +49,8 @@ type Backend struct {
 	txns      *bucketop.Coordinator
 	spool     *blockstore.Spool
 	uploader  uploader.BodyUploader
+	deferred  uploader.DeferredBodyUploader
+	parks     registry.ParkStore
 	remover   uploader.BlobRemover
 
 	// space is the Forge space this instance owns; the key under which body
@@ -87,6 +89,10 @@ type Deps struct {
 	// accept) synchronously, before the manifest commits. Remover releases a
 	// space's claim on a blob when its last reference is dropped.
 	Uploader uploader.BodyUploader
+	// Deferred decomposes Uploader for multipart's deferred accept; Parks
+	// persists park state between UploadPart and Complete/Abort.
+	Deferred uploader.DeferredBodyUploader
+	Parks    registry.ParkStore
 	Remover  uploader.BlobRemover
 
 	// Space is the Forge space this instance owns (empty in the harness).
@@ -112,6 +118,8 @@ func New(d Deps) *Backend {
 		txns:        bucketop.NewCoordinator(bucketop.Deps{Reg: d.Registry, Log: d.Log, Reads: d.Reads}),
 		spool:       d.Spool,
 		uploader:    d.Uploader,
+		deferred:    d.Deferred,
+		parks:       d.Parks,
 		remover:     d.Remover,
 		space:       d.Space,
 		maxBlobSize: d.MaxBlobSize,

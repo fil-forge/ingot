@@ -94,7 +94,10 @@ type ServerDeps struct {
 	// space's claim on a blob when its last reference is dropped. In tests both
 	// are no-ops and reads are served from the local spool.
 	BodyUploader uploader.BodyUploader
-	Remover      uploader.BlobRemover
+	// Deferred is BodyUploader decomposed for multipart's deferred accept:
+	// park at UploadPart, conclude at Complete, unallocate at Abort.
+	Deferred uploader.DeferredBodyUploader
+	Remover  uploader.BlobRemover
 
 	// Registry tracks per-bucket roots. *registry.Postgres satisfies
 	// both Registry and Meta in production; tests can supply two
@@ -111,6 +114,9 @@ type ServerDeps struct {
 	BlobRefs  registry.BlobRefStore
 	GC        registry.GCStore
 	Multipart registry.MultipartStore
+	// Parks persists deferred-accept park state between UploadPart and
+	// Complete/Abort.
+	Parks registry.ParkStore
 
 	// Space is the Forge space this instance owns — the key body-blob locations
 	// (and, later, reference claims) are recorded under. Empty in standalone /
@@ -178,10 +184,12 @@ func New(ctx context.Context, cfg ServerConfig, deps ServerDeps) (*Server, error
 		BlobRefs:    deps.BlobRefs,
 		GC:          deps.GC,
 		Multipart:   deps.Multipart,
+		Parks:       deps.Parks,
 		Reads:       bs,
 		Log:         log,
 		Spool:       spool,
 		Uploader:    deps.BodyUploader,
+		Deferred:    deps.Deferred,
 		Remover:     deps.Remover,
 		Space:       deps.Space,
 		MaxBlobSize: cfg.MaxBlobSize,
@@ -382,6 +390,12 @@ func validateServerInputs(cfg ServerConfig, deps ServerDeps) error {
 	}
 	if deps.BodyUploader == nil {
 		return errors.New("ingot: ServerDeps.BodyUploader is required")
+	}
+	if deps.Deferred == nil {
+		return errors.New("ingot: ServerDeps.Deferred is required")
+	}
+	if deps.Parks == nil {
+		return errors.New("ingot: ServerDeps.Parks is required")
 	}
 	if deps.Registry == nil {
 		return errors.New("ingot: ServerDeps.Registry is required")

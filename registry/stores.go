@@ -79,11 +79,11 @@ type BlobLocation struct {
 // headers (ContentEncoding..Expires) are captured at CreateMultipartUpload so
 // Complete can write them into the manifest exactly like a single-shot PUT.
 type MultipartSession struct {
-	UploadID           string
-	Bucket             string
-	ObjectKey          string
-	State              string
-	ContentType        string
+	UploadID                string
+	Bucket                  string
+	ObjectKey               string
+	State                   string
+	ContentType             string
 	ContentEncoding         string
 	ContentDisposition      string
 	ContentLanguage         string
@@ -141,6 +141,31 @@ type LocationStore interface {
 	PutLocation(ctx context.Context, loc BlobLocation) error
 	GetLocation(ctx context.Context, space string, digest []byte) (*BlobLocation, error)
 	DeleteLocation(ctx context.Context, space string, digest []byte) error
+}
+
+// BlobPark is one row of ingot.blob_parks: the persistable state of a blob
+// that is durable on its provider but not yet accepted (multipart's deferred
+// conclude, §7.2). AddTask/AcceptTask are the /space/blob/add and
+// /blob/accept task CIDs; PutInvocation is the sealed /http/put invocation
+// whose metadata carries the derived signer keys needed to conclude —
+// sensitive, deleted at conclude/unallocate. Keyed globally by Digest (like
+// upload_intents: content-addressed dedup shares parks across sessions).
+type BlobPark struct {
+	Digest        []byte
+	AddTask       []byte // cid bytes
+	AcceptTask    []byte // cid bytes
+	PutInvocation []byte
+	Size          int64
+	CreatedAt     time.Time
+}
+
+// ParkStore persists deferred-accept park state between UploadPart and
+// Complete/Abort (§7.2).
+type ParkStore interface {
+	PutPark(ctx context.Context, p BlobPark) error
+	// GetPark returns ErrNotFound when digest has no park row.
+	GetPark(ctx context.Context, digest []byte) (*BlobPark, error)
+	DeletePark(ctx context.Context, digest []byte) error
 }
 
 // MultipartStore tracks in-flight multipart uploads (§7.2). LatchSession is

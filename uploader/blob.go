@@ -8,6 +8,7 @@ import (
 
 	assertcmds "github.com/fil-forge/libforge/commands/assert"
 	"github.com/fil-forge/libforge/digestutil"
+	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
 	"go.uber.org/zap"
 
@@ -40,7 +41,7 @@ type BodyUploader interface {
 // UploadBlob uploads one spooled blob to Forge. For a single-shot PutObject the
 // allocate→PUT→accept happens in one call (forgeclient.BlobAdd already drives
 // the whole flow and returns the location commitment); multipart's deferred
-// accept will need a decomposed path (a later phase).
+// accept uses the decomposed UploadBlobParked/ConcludeBlob pair instead.
 func (u *Forge) UploadBlob(ctx context.Context, digest multihash.Multihash, size int64, localPath string) (BlobLocation, error) {
 	f, err := os.Open(localPath)
 	if err != nil {
@@ -55,7 +56,12 @@ func (u *Forge) UploadBlob(ctx context.Context, digest multihash.Multihash, size
 	if err != nil {
 		return BlobLocation{}, fmt.Errorf("uploader: upload blob: %w", err)
 	}
+	return locationOf(added)
+}
 
+// locationOf extracts the local blob-location record from a completed add's
+// /assert/location commitment.
+func locationOf(added forgeclient.AddedBlob) (BlobLocation, error) {
 	loc := BlobLocation{Size: int64(added.Size)}
 	// added.Location is the /assert/location commitment piri issued at accept;
 	// parse its arguments for the provider DID + retrieval URL so a later read
@@ -75,6 +81,84 @@ func (u *Forge) UploadBlob(ctx context.Context, digest multihash.Multihash, size
 }
 
 var _ BodyUploader = (*Forge)(nil)
+
+// ParkedBlobState is the persistable state of a blob that is durable on the
+// provider but not yet accepted (the /http/put conclude is deferred). It is
+// stored in the blob_parks table between UploadPart and Complete/Abort.
+type ParkedBlobState = forgeclient.ParkedBlob
+
+// DeferredBodyUploader is the decomposed BodyUploader for multipart's
+// deferred accept: UploadBlobParked makes the bytes durable (parked) at
+// UploadPart; ConcludeBlob triggers accept at Complete; UnallocateBlob
+// abandons a parked blob at Abort. Exactly one of UploadBlobParked's returns
+// is non-nil — an already-accepted (deduped) blob completes immediately.
+type DeferredBodyUploader interface {
+	UploadBlobParked(ctx context.Context, digest multihash.Multihash, size int64, localPath string) (*ParkedBlobState, *BlobLocation, error)
+	ConcludeBlob(ctx context.Context, parked ParkedBlobState) (BlobLocation, error)
+	UnallocateBlob(ctx context.Context, digest multihash.Multihash, cause cid.Cid) error
+}
+
+// UploadBlobParked makes one spooled blob durable on the provider WITHOUT
+// accepting it: /blob/add + PUT, conclude deferred. Returns the persistable
+// park state, or the completed location when the provider already held
+// accepted bytes for this content (dedup).
+func (u *Forge) UploadBlobParked(ctx context.Context, digest multihash.Multihash, size int64, localPath string) (*ParkedBlobState, *BlobLocation, error) {
+	f, err := os.Open(localPath)
+	if err != nil {
+		return nil, nil, fmt.Errorf("uploader: open spooled blob %s: %w", localPath, err)
+	}
+	defer f.Close()
+
+	parked, added, err := u.client.BlobAddParked(ctx, f, u.space,
+		forgeclient.WithPrecomputedDigest(digest, uint64(size)),
+		forgeclient.WithPutClient(u.putClient),
+	)
+	if err != nil {
+		return nil, nil, fmt.Errorf("uploader: park blob: %w", err)
+	}
+	if added != nil {
+		loc, err := locationOf(*added)
+		if err != nil {
+			return nil, nil, err
+		}
+		return nil, &loc, nil
+	}
+	return parked, nil, nil
+}
+
+// ConcludeBlob finishes a parked upload: it concludes the deferred /http/put
+// receipt (triggering /blob/accept on the provider) and returns the published
+// location. Safe to retry.
+func (u *Forge) ConcludeBlob(ctx context.Context, parked ParkedBlobState) (BlobLocation, error) {
+	added, err := u.client.BlobConclude(ctx, parked, u.space)
+	if err != nil {
+		return BlobLocation{}, fmt.Errorf("uploader: conclude blob: %w", err)
+	}
+	return locationOf(added)
+}
+
+// UnallocateBlob abandons a parked blob via /blob/unallocate on the upload
+// service: sprue recovers the provider from the cause receipt chain and the
+// node releases the allocation + parked bytes. cause is the parked blob's
+// AddTask. Errors are logged here (callers treat abort cleanup as
+// best-effort and may discard them).
+func (u *Forge) UnallocateBlob(ctx context.Context, digest multihash.Multihash, cause cid.Cid) error {
+	u.logger.Info("blob unallocate",
+		zap.Stringer("space", u.space),
+		zap.String("digest", digestutil.Format(digest)),
+	)
+	if err := u.client.BlobUnallocate(ctx, digest, u.space, cause); err != nil {
+		u.logger.Error("blob unallocate failed",
+			zap.Stringer("space", u.space),
+			zap.String("digest", digestutil.Format(digest)),
+			zap.Error(err),
+		)
+		return fmt.Errorf("uploader: unallocating blob: %w", err)
+	}
+	return nil
+}
+
+var _ DeferredBodyUploader = (*Forge)(nil)
 
 // BlobRemover releases this space's claim on an accepted blob. Because dedup is
 // global, Piri deletes the bytes and retires the piece only when no space

@@ -149,6 +149,42 @@ func (m *MemStore) DeleteLocation(_ context.Context, space string, digest []byte
 	return nil
 }
 
+// ParkStore ==================================================================
+
+func (m *MemStore) PutPark(_ context.Context, p registry.BlobPark) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cp := p
+	cp.Digest = cloneBytes(p.Digest)
+	cp.AddTask = cloneBytes(p.AddTask)
+	cp.AcceptTask = cloneBytes(p.AcceptTask)
+	cp.PutInvocation = cloneBytes(p.PutInvocation)
+	m.parks[string(p.Digest)] = cp
+	return nil
+}
+
+func (m *MemStore) GetPark(_ context.Context, digest []byte) (*registry.BlobPark, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	park, ok := m.parks[string(digest)]
+	if !ok {
+		return nil, registry.ErrNotFound
+	}
+	cp := park
+	cp.Digest = cloneBytes(park.Digest)
+	cp.AddTask = cloneBytes(park.AddTask)
+	cp.AcceptTask = cloneBytes(park.AcceptTask)
+	cp.PutInvocation = cloneBytes(park.PutInvocation)
+	return &cp, nil
+}
+
+func (m *MemStore) DeletePark(_ context.Context, digest []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.parks, string(digest))
+	return nil
+}
+
 // MultipartStore =============================================================
 
 func (m *MemStore) CreateSession(_ context.Context, s registry.MultipartSession) error {

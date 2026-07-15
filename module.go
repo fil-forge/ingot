@@ -135,6 +135,7 @@ type serverParams struct {
 	Reader       blockstore.BlockReader
 	Uploader     uploader.Uploader
 	BodyUploader uploader.BodyUploader
+	Deferred     uploader.DeferredBodyUploader
 	Remover      uploader.BlobRemover
 	Registry     registry.Registry
 	Intents      registry.IntentStore
@@ -142,6 +143,7 @@ type serverParams struct {
 	BlobRefs     registry.BlobRefStore
 	GC           registry.GCStore
 	Multipart    registry.MultipartStore
+	Parks        registry.ParkStore
 	Meta         logstore.Meta
 	// Space is the Forge space this instance owns. Optional: standalone / the
 	// harness don't provide it (reads come from the spool), so it defaults to "".
@@ -179,6 +181,7 @@ func registerServerLifecycle(lc fx.Lifecycle, p serverParams) {
 				BaseBlockReader: p.Reader,
 				Uploader:        p.Uploader,
 				BodyUploader:    p.BodyUploader,
+				Deferred:        p.Deferred,
 				Remover:         p.Remover,
 				Registry:        p.Registry,
 				Intents:         p.Intents,
@@ -186,6 +189,7 @@ func registerServerLifecycle(lc fx.Lifecycle, p serverParams) {
 				BlobRefs:        p.BlobRefs,
 				GC:              p.GC,
 				Multipart:       p.Multipart,
+				Parks:           p.Parks,
 				Meta:            p.Meta,
 				Space:           string(p.Space),
 			})
@@ -294,6 +298,7 @@ type registryResult struct {
 	BlobRefs  registry.BlobRefStore
 	GC        registry.GCStore
 	Multipart registry.MultipartStore
+	Parks     registry.ParkStore
 	Meta      logstore.Meta
 }
 
@@ -304,7 +309,7 @@ type registryResult struct {
 // candidate log (GCStore), and segment metadata (Meta).
 func provideRegistry(pool *pgxpool.Pool) registryResult {
 	pg := registry.NewPostgres(pool)
-	return registryResult{Registry: pg, Intents: pg, Locations: pg, BlobRefs: pg, GC: pg, Multipart: pg, Meta: pg}
+	return registryResult{Registry: pg, Intents: pg, Locations: pg, BlobRefs: pg, GC: pg, Multipart: pg, Parks: pg, Meta: pg}
 }
 
 // provideServerSpace exposes the owned space DID (as a string) to the server.
@@ -360,6 +365,7 @@ type uploaderResult struct {
 
 	Uploader     uploader.Uploader
 	BodyUploader uploader.BodyUploader
+	Deferred     uploader.DeferredBodyUploader
 	Remover      uploader.BlobRemover
 }
 
@@ -376,7 +382,7 @@ func provideUploader(c *forgeclient.Client, space spaceIssuer, logger *zap.Logge
 	if err != nil {
 		return uploaderResult{}, err
 	}
-	return uploaderResult{Uploader: f, BodyUploader: f, Remover: f}, nil
+	return uploaderResult{Uploader: f, BodyUploader: f, Deferred: f, Remover: f}, nil
 }
 
 // seedSpaceDelegations self-issues no-expiry space→agent delegations for
@@ -384,10 +390,10 @@ func provideUploader(c *forgeclient.Client, space spaceIssuer, logger *zap.Logge
 // holds a /blob/add chain for the agent (idempotent across restarts).
 func seedSpaceDelegations(ctx context.Context, spaceIssuer ucan.Issuer, agent did.DID, store tokenstore.Store, logger *zap.Logger) error {
 	space := spaceIssuer.DID()
-	// Sentinel on /blob/remove: the newest cap in the list — a store missing
-	// it was seeded by an older build and re-seeds here (AddDelegations is
-	// additive, so re-seeding the earlier caps is harmless).
-	if proofs, _, err := store.ProofChain(ctx, agent, blobcmds.Remove.Command, space); err == nil && len(proofs) > 0 {
+	// Sentinel on /blob/unallocate: the newest cap in the list — a store
+	// missing it was seeded by an older build and re-seeds here
+	// (AddDelegations is additive, so re-seeding the earlier caps is harmless).
+	if proofs, _, err := store.ProofChain(ctx, agent, blobcmds.Unallocate.Command, space); err == nil && len(proofs) > 0 {
 		return nil // already seeded (or login-provisioned)
 	}
 	// The edge-client flow needs space->agent authority over: /blob/add (the
@@ -405,6 +411,9 @@ func seedSpaceDelegations(ctx context.Context, spaceIssuer ucan.Issuer, agent di
 		}},
 		{"/blob/remove", func() (ucan.Delegation, error) {
 			return blobcmds.Remove.Delegate(spaceIssuer, agent, space, delegation.WithNoExpiration())
+		}},
+		{"/blob/unallocate", func() (ucan.Delegation, error) {
+			return blobcmds.Unallocate.Delegate(spaceIssuer, agent, space, delegation.WithNoExpiration())
 		}},
 		{"/blob/allocate", func() (ucan.Delegation, error) {
 			return blobcmds.Allocate.Delegate(spaceIssuer, agent, space, delegation.WithNoExpiration())

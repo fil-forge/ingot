@@ -23,6 +23,7 @@ import (
 	"github.com/fil-forge/ingot/bucketop"
 	"github.com/fil-forge/ingot/mst"
 	"github.com/fil-forge/ingot/registry"
+	"github.com/fil-forge/ingot/uploader"
 )
 
 // minPartSize is S3's minimum size for every part except the last one,
@@ -115,13 +116,15 @@ func (b *Backend) openSession(ctx context.Context, uploadID string, key *string)
 	return sess, nil
 }
 
-// UploadPart ingests one part: it coarse-splits the part body into blobs and
-// spools each to local disk (recording upload_intents), then records the part
-// (its ordered blob digests, md5, size). The part's blobs are NOT uploaded to
-// Forge yet — that is deferred to Complete (so an Abort only ever cleans up
-// local state). Re-uploading a part number supersedes the prior part; the
-// superseded part's now-unreferenced blobs are dropped from the spool. The
-// part ETag is the hex md5 of the part bytes.
+// UploadPart ingests one part: it coarse-splits the part body into blobs,
+// spools each to local disk (recording upload_intents), records the part
+// (its ordered blob digests, md5, size), and uploads each blob to its
+// provider — PARKED, not accepted: the /http/put conclude that triggers
+// /blob/accept is deferred to Complete, so the bytes are durable but stay
+// out of the PDP pipeline, and an Abort unwinds them with /blob/unallocate
+// (§7.2). Re-uploading a part number supersedes the prior part; the
+// superseded part's now-unreferenced blobs are dropped from the spool and
+// unallocated. The part ETag is the hex md5 of the part bytes.
 func (b *Backend) UploadPart(ctx context.Context, input *s3.UploadPartInput) (*s3.UploadPartOutput, error) {
 	if input.Bucket == nil || input.Key == nil || input.UploadId == nil || input.PartNumber == nil {
 		return nil, s3err.GetAPIError(s3err.ErrInvalidRequest)
@@ -157,6 +160,13 @@ func (b *Backend) UploadPart(ctx context.Context, input *s3.UploadPartInput) (*s
 		State:       registry.PartParked,
 	}); err != nil {
 		return nil, fmt.Errorf("s3frontend: record part: %w", err)
+	}
+	// Park the part's blobs on their providers before returning 200 — the
+	// part is durable on the network as soon as the client sees success.
+	// The part row is recorded first so a crash mid-park leaves re-drivable
+	// spooled intents.
+	if err := b.parkBlobs(ctx, body.Blobs); err != nil {
+		return nil, fmt.Errorf("s3frontend: park part blobs: %w", err)
 	}
 	if len(superseded) > 0 {
 		b.cleanupPartBlobs(ctx, uploadID, superseded)
@@ -317,8 +327,11 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 		partSizes = append(partSizes, offset-partStart)
 	}
 
-	// Accept every part's blobs on Forge (no-op in standalone), then commit.
-	if err := b.uploadBlobs(ctx, blobs); err != nil {
+	// Accept every part's blobs on Forge: parked blobs conclude (the deferred
+	// /http/put receipt fires /blob/accept), stragglers that never parked
+	// (crash between spool and park) fall back to the whole synchronous
+	// upload. No-op in standalone. Then commit.
+	if err := b.concludeBlobs(ctx, blobs); err != nil {
 		return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: accept parts: %w", err)
 	}
 
@@ -353,8 +366,10 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 
 // AbortMultipartUpload cancels a multipart upload: it latches the session
 // (single-winner vs Complete), drops it (cascading its parts), and removes the
-// parts' now-unreferenced blobs from the spool. No reference claims were taken
-// (those happen only at Complete), so nothing network-side needs unwinding.
+// parts' now-unreferenced blobs from the spool — unallocating any that were
+// parked on a provider (an upload ends in exactly one of accept or
+// unallocate). No reference claims were taken (those happen only at
+// Complete).
 func (b *Backend) AbortMultipartUpload(ctx context.Context, input *s3.AbortMultipartUploadInput) error {
 	if input.UploadId == nil {
 		return s3err.GetAPIError(s3err.ErrInvalidRequest)
@@ -427,13 +442,159 @@ func (b *Backend) cleanupPartBlobs(ctx context.Context, uploadID string, digests
 		if n, err := b.blobRefs.CountClaims(ctx, b.space, d); err != nil || n > 0 {
 			continue
 		}
-		if in, err := b.intents.GetIntent(ctx, d); err == nil && in.State != registry.IntentSpooled {
-			// Shipped/accepted blobs are the reference index's to manage.
+		state := registry.IntentSpooled
+		if in, err := b.intents.GetIntent(ctx, d); err == nil {
+			state = in.State
+		}
+		if state != registry.IntentSpooled && state != registry.IntentParked {
+			// Accepted/published blobs are the reference index's to manage.
 			continue
+		}
+		// A parked blob is durable on its provider — release it there too
+		// (best-effort; piri's unallocate is idempotent, a straggler is
+		// FIL-625's to reap). Cause is the /space/blob/add task link the
+		// upload service needs to locate the provider.
+		if state == registry.IntentParked {
+			if park, err := b.parks.GetPark(ctx, d); err == nil {
+				if cause, err := cid.Cast(park.AddTask); err == nil {
+					_ = b.deferred.UnallocateBlob(ctx, mh.Multihash(d), cause)
+				}
+				_ = b.parks.DeletePark(ctx, d)
+			}
 		}
 		_ = b.spool.Remove(mh.Multihash(d))
 		_ = b.intents.DeleteIntent(ctx, d)
 	}
+}
+
+// parkBlobs makes each blob durable on its provider without accepting it:
+// already-located blobs are marked accepted (dedup), already-parked blobs are
+// skipped (another part or session parked the same content), the rest run
+// the parked upload and persist their park state for Complete/Abort.
+func (b *Backend) parkBlobs(ctx context.Context, blobs []msbucket.BlobRef) error {
+	for _, blob := range blobs {
+		digest := mh.Multihash(blob.Digest)
+		if existing, err := b.locations.GetLocation(ctx, b.space, blob.Digest); err == nil && existing != nil {
+			if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentAccepted); err != nil {
+				return fmt.Errorf("mark accepted (dedup): %w", err)
+			}
+			continue
+		} else if err != nil && !errors.Is(err, registry.ErrNotFound) {
+			return fmt.Errorf("lookup location: %w", err)
+		}
+		if _, err := b.parks.GetPark(ctx, blob.Digest); err == nil {
+			continue // already parked by a sibling part or session
+		} else if !errors.Is(err, registry.ErrNotFound) {
+			return fmt.Errorf("lookup park: %w", err)
+		}
+
+		parked, located, err := b.deferred.UploadBlobParked(ctx, digest, blob.Length, b.spool.Path(digest))
+		if err != nil {
+			return fmt.Errorf("park blob: %w", err)
+		}
+		if located != nil {
+			// The provider already held accepted bytes for this content —
+			// accept ran, record the location like the synchronous path.
+			if err := b.locations.PutLocation(ctx, registry.BlobLocation{
+				Space:    b.space,
+				Digest:   blob.Digest,
+				Provider: located.Provider,
+				URL:      located.URL,
+				Size:     located.Size,
+			}); err != nil {
+				return fmt.Errorf("record location: %w", err)
+			}
+			if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentAccepted); err != nil {
+				return fmt.Errorf("mark accepted: %w", err)
+			}
+			continue
+		}
+		if err := b.parks.PutPark(ctx, registry.BlobPark{
+			Digest:        blob.Digest,
+			AddTask:       parked.AddTask.Bytes(),
+			AcceptTask:    parked.AcceptTask.Bytes(),
+			PutInvocation: parked.PutInvocation,
+			Size:          blob.Length,
+		}); err != nil {
+			return fmt.Errorf("record park: %w", err)
+		}
+		if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentParked); err != nil {
+			return fmt.Errorf("mark parked: %w", err)
+		}
+	}
+	return nil
+}
+
+// concludeBlobs is Complete's park-aware counterpart to uploadBlobs: located
+// blobs are already accepted (dedup); parked blobs conclude their deferred
+// /http/put receipt — firing /blob/accept — and record their location;
+// blobs that never parked (crash between spool and park) fall back to the
+// whole synchronous upload.
+func (b *Backend) concludeBlobs(ctx context.Context, blobs []msbucket.BlobRef) error {
+	for _, blob := range blobs {
+		digest := mh.Multihash(blob.Digest)
+		if existing, err := b.locations.GetLocation(ctx, b.space, blob.Digest); err == nil && existing != nil {
+			if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentAccepted); err != nil {
+				return fmt.Errorf("mark accepted (dedup): %w", err)
+			}
+			continue
+		} else if err != nil && !errors.Is(err, registry.ErrNotFound) {
+			return fmt.Errorf("lookup location: %w", err)
+		}
+
+		park, err := b.parks.GetPark(ctx, blob.Digest)
+		if err != nil && !errors.Is(err, registry.ErrNotFound) {
+			return fmt.Errorf("lookup park: %w", err)
+		}
+		var loc uploader.BlobLocation
+		if park != nil {
+			addTask, err := cid.Cast(park.AddTask)
+			if err != nil {
+				return fmt.Errorf("decode park add task: %w", err)
+			}
+			acceptTask, err := cid.Cast(park.AcceptTask)
+			if err != nil {
+				return fmt.Errorf("decode park accept task: %w", err)
+			}
+			loc, err = b.deferred.ConcludeBlob(ctx, uploader.ParkedBlobState{
+				Digest:        digest,
+				Size:          uint64(park.Size),
+				AddTask:       addTask,
+				AcceptTask:    acceptTask,
+				PutInvocation: park.PutInvocation,
+			})
+			if err != nil {
+				return fmt.Errorf("conclude blob: %w", err)
+			}
+		} else {
+			// Never parked (crash between spool and park): the spooled copy
+			// drives the whole synchronous upload.
+			loc, err = b.uploader.UploadBlob(ctx, digest, blob.Length, b.spool.Path(digest))
+			if err != nil {
+				return fmt.Errorf("upload blob: %w", err)
+			}
+		}
+
+		if err := b.locations.PutLocation(ctx, registry.BlobLocation{
+			Space:    b.space,
+			Digest:   blob.Digest,
+			Provider: loc.Provider,
+			URL:      loc.URL,
+			Size:     loc.Size,
+		}); err != nil {
+			return fmt.Errorf("record location: %w", err)
+		}
+		if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentAccepted); err != nil {
+			return fmt.Errorf("mark accepted: %w", err)
+		}
+		if park != nil {
+			// The sealed put invocation is spent — drop it promptly.
+			if err := b.parks.DeletePark(ctx, blob.Digest); err != nil {
+				return fmt.Errorf("drop park: %w", err)
+			}
+		}
+	}
+	return nil
 }
 
 // ListParts returns the recorded parts of an in-flight upload, paginated by

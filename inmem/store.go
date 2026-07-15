@@ -42,6 +42,7 @@ type MemStore struct {
 	blobRefs  map[claimKey]registry.BlobClaim
 	intents   map[string]registry.UploadIntent          // keyed by string(digest)
 	locations map[locKey]registry.BlobLocation          // keyed by (space, digest)
+	parks     map[string]registry.BlobPark              // keyed by string(digest)
 	sessions  map[string]registry.MultipartSession      // keyed by uploadID
 	parts     map[string]map[int]registry.MultipartPart // uploadID -> partNumber -> part
 	gcCands   map[string]struct{}                       // keyed by string(cid)
@@ -65,6 +66,7 @@ func NewMemStore() *MemStore {
 		blobRefs:  map[claimKey]registry.BlobClaim{},
 		intents:   map[string]registry.UploadIntent{},
 		locations: map[locKey]registry.BlobLocation{},
+		parks:     map[string]registry.BlobPark{},
 		sessions:  map[string]registry.MultipartSession{},
 		parts:     map[string]map[int]registry.MultipartPart{},
 		gcCands:   map[string]struct{}{},
@@ -258,13 +260,29 @@ func (NopUploader) UploadBlob(_ context.Context, _ multihash.Multihash, size int
 
 func (NopUploader) RemoveBlob(_ context.Context, _ multihash.Multihash) error { return nil }
 
+// UploadBlobParked accepts immediately in the harness — there is no network
+// to park on, so the deferred flow degenerates to the synchronous one and
+// reads keep coming from the spool.
+func (NopUploader) UploadBlobParked(_ context.Context, _ multihash.Multihash, size int64, _ string) (*uploader.ParkedBlobState, *uploader.BlobLocation, error) {
+	return nil, &uploader.BlobLocation{Size: size}, nil
+}
+
+func (NopUploader) ConcludeBlob(_ context.Context, parked uploader.ParkedBlobState) (uploader.BlobLocation, error) {
+	return uploader.BlobLocation{Size: int64(parked.Size)}, nil
+}
+
+func (NopUploader) UnallocateBlob(_ context.Context, _ multihash.Multihash, _ cid.Cid) error {
+	return nil
+}
+
 // Compile-time guarantees.
 var (
-	_ registry.Registry      = (*MemStore)(nil)
-	_ logstore.Meta          = (*MemStore)(nil)
-	_ blockstore.BlockReader = NopBaseReader{}
-	_ blockstore.BlobReader  = NopBaseReader{}
-	_ uploader.Uploader      = NopUploader{}
-	_ uploader.BodyUploader  = NopUploader{}
-	_ uploader.BlobRemover   = NopUploader{}
+	_ registry.Registry             = (*MemStore)(nil)
+	_ logstore.Meta                 = (*MemStore)(nil)
+	_ blockstore.BlockReader        = NopBaseReader{}
+	_ blockstore.BlobReader         = NopBaseReader{}
+	_ uploader.Uploader             = NopUploader{}
+	_ uploader.BodyUploader         = NopUploader{}
+	_ uploader.DeferredBodyUploader = NopUploader{}
+	_ uploader.BlobRemover          = NopUploader{}
 )

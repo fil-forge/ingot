@@ -90,11 +90,12 @@ The design is shaped by how the Forge upload pipeline works and by a handful of 
 - **The 256 MiB blob ceiling is a knob, not a wall.** Piri currently caps a blob at 256 MiB because
   it builds the commP Merkle tree in RAM; known improvements (streaming commP) lift this. Ingot
   treats it as a tunable maximum and splits larger objects.
-- **Some primitives are not built yet.** `blob/remove` is now handled end-to-end (Sprue
-  deregisters + forwards; Piri releases the space's claim and defers physical deletion until the
-  aggregate root retires on-chain via the signed `schedulePieceDeletions` path), but there is
-  still no `unallocate` for a parked blob and the indexer has no retraction.
-  [§9](#9-the-system-contract-piri--sprue--indexer) enumerates the contract Ingot needs.
+- **The delete primitives are built.** `blob/remove` is handled end-to-end (Sprue deregisters +
+  forwards; Piri releases the space's claim and defers physical deletion until the aggregate root
+  retires on-chain via the signed `schedulePieceDeletions` path), and `blob/unallocate` retires a
+  parked (never-accepted) blob — an upload ends in exactly one of accept or unallocate. The
+  indexer still has no retraction. [§9](#9-the-system-contract-piri--sprue--indexer) enumerates
+  the contract Ingot needs.
 
 ---
 
@@ -523,8 +524,8 @@ negotiations).
 | Capability                                                                                     | Service                         | Status       | Notes                                                                                                                                                                                                               |
 |------------------------------------------------------------------------------------------------|---------------------------------|--------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `allocate` / `PUT` / `accept` blob lifecycle                                                   | Piri/Sprue                      | **exists**   | The storage primitive Ingot builds on.                                                                                                                                                                              |
-| Ingot-timed accept (PUT a part, defer the conclude until Complete)                             | Ingot + Sprue                   | **partial**  | Accept already fires on the client's conclude; needs the park-vs-conclude split client-side and a separable Sprue conclude. Ingot does **not** issue `accept` (Piri requires the upload-service DID).               |
-| `unallocate(digest)` — drop a parked blob                                                      | Piri + Sprue + libforge         | **to-build** | `blob/remove` releases claims on accepted blobs; a dedicated parked-blob unallocate (pre-accept) is still open (allocation expiry is the backstop).                                                                 |
+| Ingot-timed accept (PUT a part, defer the conclude until Complete)                             | Ingot + Sprue                   | **exists**   | `forgeclient.BlobAddParked`/`BlobConclude` split the flow at the conclude seam; UploadPart parks (durable, unaggregated), Complete concludes — Sprue's conclude handler already ran accept standalone. Ingot still does **not** issue `accept` (Piri requires the upload-service DID). |
+| `unallocate(digest)` — drop a parked blob                                                      | Piri + Sprue + libforge         | **exists**   | `/blob/unallocate` on Piri refuses accepted blobs (`BlobAccepted`), deletes the space's allocation, and drops the bytes at zero allocations. Sprue recovers the provider from the `cause` receipt chain (a parked blob has no registration). Abort/TTL/supersede unwind through it.  |
 | `remove(digest)` — per-space claim release; physical delete/piece-retire at zero global claims | Piri + Sprue + libforge         | **exists**   | `/blob/remove` on Piri deletes the space's allocation/acceptance/claim; at zero claims bytes delete immediately (unaggregated) or via the pending-removal sweep once the whole aggregate root is dead (FIL-623/624). Sprue forwards to primary + replicas (FIL-522). |
 | Configurable, adaptive size policy (`min`/`max`); batch guard for the `extraData` cap          | Piri                            | **partial**  | `MinAggregateSize` is hardcoded 128 MiB; lower to ~8 MiB and make configurable. The `addPieces` batch is no longer contract-capped (FWSS v1.3.0 removed the `extraData` cap); size it to the FVM `PiecesAdded` event-size + per-tx gas — a measured ceiling (default `BatchSize=10` is safely within it) (pdp-sim). No contract change. |
 | Compaction (Regime B) + complete the on-chain delete signature                                 | Piri                            | **partial**  | Whole-root delete is signed and wired (`schedulePieceDeletions` with `SignSchedulePieceRemovals` extraData); compaction (remove + re-hash survivors + re-add) is new.                                               |
@@ -800,14 +801,16 @@ reference index — and is out of scope for this iteration.
 The in-memory harness uses a no-op uploader and serves reads from the spool, so these forge-network
 paths are stubbed in-tree and verified against a real sprue+piri+indexer later:
 
-- **`remove(digest)` is live; `unallocate(digest)` is still open.** `RemoveBlob` invokes
-  `/blob/remove` on sprue, which forwards to the storage nodes ([§9](#9-the-system-contract-piri--sprue--indexer)); delete finality means
-  claim-release-now, bytes-at-root-death. A dedicated pre-accept unallocate remains to-build
-  (allocation expiry is the backstop).
+- **`remove(digest)` and `unallocate(digest)` are live.** `RemoveBlob` invokes `/blob/remove` on
+  sprue, which forwards to the storage nodes ([§9](#9-the-system-contract-piri--sprue--indexer)); delete finality means claim-release-now,
+  bytes-at-root-death. `UnallocateBlob` retires parked part-blobs on abort via `/blob/unallocate`
+  (provider recovered from the `cause` receipt chain); allocation-expiry GC (FIL-625) remains the
+  backstop when an abort never arrives.
 - **The local-table `Locator` read tier is not wired.** Body-blob *locations* are recorded at accept,
   but the read path that consumes them ([§7.4](#74-read-getobject), [§8](#8-retrieval-addressing-when-bodies-need-a-sharded-dag-index)) is deferred — it is only exercised after spool
   eviction (also not built) and is best validated live.
-- **Multipart parts upload at Complete, not parked at UploadPart.** The in-process flow spools parts
+- **Multipart parts park at UploadPart, accept at Complete.** (Built: `parkBlobs`/`concludeBlobs`
+  over the `blob_parks` table.) The in-process harness still spools parts
   at `UploadPart` and uploads+accepts them at `Complete`; the true forge *parking* (upload early,
   accept-at-Complete) and `unallocate`-on-abort from [§7.2](#72-multipart)–[7.3](#73-the-session-latch-the-abortcomplete-race) are forge-mode refinements.
 - **Crash recovery for the spool is not built.** The `upload_intents` × `blob_refs` reconciliation

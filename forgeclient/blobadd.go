@@ -80,11 +80,53 @@ type AddedBlob struct {
 	Location ucan.Invocation // the /assert/location commitment
 }
 
+// ParkedBlob is the persistable state of a blob that has been added and
+// uploaded (durable on the provider) but not yet concluded — piri holds the
+// bytes without aggregating them until /blob/accept fires. Persist it and
+// finish the upload later with [Client.BlobConclude], or abandon it with
+// [Client.BlobUnallocate] (AddTask is the unallocate Cause).
+type ParkedBlob struct {
+	Digest multihash.Multihash
+	Size   uint64
+	// AddTask is the /space/blob/add task link — the receipt-chain root the
+	// upload service uses to locate the provider for unallocate.
+	AddTask cid.Cid
+	// AcceptTask is the /blob/accept task link BlobConclude polls.
+	AcceptTask cid.Cid
+	// PutInvocation is the sealed /http/put invocation. Its metadata embeds
+	// the derived signer keys needed to synthesize the put receipt at
+	// conclude time — treat it as sensitive and delete it once concluded or
+	// unallocated.
+	PutInvocation []byte
+}
+
 // BlobAdd adds a blob to the upload service (sprue): invoke /blob/add,
 // PUT the bytes, conclude a synthesized /http/put receipt, then poll the
 // /blob/accept receipt for the location commitment. The issuer needs a
 // /blob/add delegation proof over space.
-func (c *Client) BlobAdd(ctx context.Context, content io.Reader, space did.DID, options ...BlobAddOption) (blob AddedBlob, err error) {
+//
+// It is [Client.BlobAddParked] + [Client.BlobConclude] in one shot.
+func (c *Client) BlobAdd(ctx context.Context, content io.Reader, space did.DID, options ...BlobAddOption) (AddedBlob, error) {
+	parked, added, err := c.BlobAddParked(ctx, content, space, options...)
+	if err != nil {
+		return AddedBlob{}, err
+	}
+	if added != nil {
+		return *added, nil
+	}
+	return c.BlobConclude(ctx, *parked, space)
+}
+
+// BlobAddParked runs the durable half of BlobAdd: /blob/add + PUT the bytes,
+// WITHOUT concluding the /http/put receipt — the conclude is what makes the
+// upload service trigger /blob/accept on the provider, so the blob stays
+// parked (stored, unaggregated) until BlobConclude.
+//
+// Exactly one of the returns is non-nil: a ParkedBlob awaiting conclude, or
+// — when the provider already held accepted bytes for this content (dedup:
+// allocate returned no upload address and the put receipt was pre-issued, so
+// accept already ran) — the completed AddedBlob.
+func (c *Client) BlobAddParked(ctx context.Context, content io.Reader, space did.DID, options ...BlobAddOption) (parked *ParkedBlob, added *AddedBlob, err error) {
 	cfg := NewBlobAddConfig(options...)
 
 	putClient := cfg.PutClient
@@ -96,20 +138,20 @@ func (c *Client) BlobAdd(ctx context.Context, content io.Reader, space did.DID, 
 	start := time.Now()
 	defer func() {
 		if err != nil {
-			c.logger.Error("blob add failed", zap.Stringer("space", space), zap.Error(err), zap.Duration("duration", time.Since(start)))
+			c.logger.Error("blob add (parked) failed", zap.Stringer("space", space), zap.Error(err), zap.Duration("duration", time.Since(start)))
 		} else {
-			c.logger.Debug("blob added", zap.Stringer("space", space), zap.Duration("duration", time.Since(start)))
+			c.logger.Debug("blob added (parked)", zap.Stringer("space", space), zap.Duration("duration", time.Since(start)))
 		}
 	}()
 
 	if needsHash {
 		contentBytes, rerr := io.ReadAll(content)
 		if rerr != nil {
-			return AddedBlob{}, fmt.Errorf("reading content: %w", rerr)
+			return nil, nil, fmt.Errorf("reading content: %w", rerr)
 		}
 		contentHash, err = multihash.Sum(contentBytes, multihash.SHA2_256, -1)
 		if err != nil {
-			return AddedBlob{}, fmt.Errorf("computing content multihash: %w", err)
+			return nil, nil, fmt.Errorf("computing content multihash: %w", err)
 		}
 		contentReader = bytes.NewReader(contentBytes)
 		contentSize := uint64(len(contentBytes))
@@ -118,7 +160,7 @@ func (c *Client) BlobAdd(ctx context.Context, content io.Reader, space did.DID, 
 
 	proofs, proofLinks, err := c.ProofChain(ctx, c.signer.DID(), blobcmds.Add.Command, space)
 	if err != nil {
-		return AddedBlob{}, fmt.Errorf("building proof chain: %w", err)
+		return nil, nil, fmt.Errorf("building proof chain: %w", err)
 	}
 
 	dlgPolicy, err := policy.Build(
@@ -126,19 +168,19 @@ func (c *Client) BlobAdd(ctx context.Context, content io.Reader, space did.DID, 
 		policy.Equal(".blob.size", int64(*contentSizePtr)),
 	)
 	if err != nil {
-		return AddedBlob{}, fmt.Errorf("building delegation policy: %w", err)
+		return nil, nil, fmt.Errorf("building delegation policy: %w", err)
 	}
 
 	allocDlg, allocProofs, err := delegateWithProofs(
 		ctx, c.signer, c.serviceID, space, blobcmds.Allocate.Command, dlgPolicy, c)
 	if err != nil {
-		return AddedBlob{}, fmt.Errorf("delegating /blob/allocate: %w", err)
+		return nil, nil, fmt.Errorf("delegating /blob/allocate: %w", err)
 	}
 
 	accDlg, accProofs, err := delegateWithProofs(
 		ctx, c.signer, c.serviceID, space, blobcmds.Accept.Command, dlgPolicy, c)
 	if err != nil {
-		return AddedBlob{}, fmt.Errorf("delegating /blob/accept: %w", err)
+		return nil, nil, fmt.Errorf("delegating /blob/accept: %w", err)
 	}
 
 	inv, err := blobcmds.Add.Invoke(
@@ -148,7 +190,7 @@ func (c *Client) BlobAdd(ctx context.Context, content io.Reader, space did.DID, 
 		invocation.WithProofs(proofLinks...),
 	)
 	if err != nil {
-		return AddedBlob{}, fmt.Errorf("generating invocation: %w", err)
+		return nil, nil, fmt.Errorf("generating invocation: %w", err)
 	}
 
 	addOK, _, meta, err := Execute[*blobcmds.AddOK](
@@ -159,51 +201,51 @@ func (c *Client) BlobAdd(ctx context.Context, content io.Reader, space did.DID, 
 		execution.WithDelegations(accProofs...),
 	)
 	if err != nil {
-		return AddedBlob{}, fmt.Errorf("executing blob add: %w", err)
+		return nil, nil, fmt.Errorf("executing blob add: %w", err)
 	}
 
 	accInv, err := findInvocation(addOK.Site.Task, meta.Invocations())
 	if err != nil {
-		return AddedBlob{}, fmt.Errorf("finding /blob/accept invocation: %w", err)
+		return nil, nil, fmt.Errorf("finding /blob/accept invocation: %w", err)
 	}
 	var accArgs blobcmds.AcceptArguments
 	if err := accArgs.UnmarshalCBOR(bytes.NewReader(accInv.ArgumentsBytes())); err != nil {
-		return AddedBlob{}, fmt.Errorf("unmarshaling /blob/accept arguments: %w", err)
+		return nil, nil, fmt.Errorf("unmarshaling /blob/accept arguments: %w", err)
 	}
 
 	putInv, err := findInvocation(accArgs.Put.Task, meta.Invocations())
 	if err != nil {
-		return AddedBlob{}, fmt.Errorf("finding /http/put invocation: %w", err)
+		return nil, nil, fmt.Errorf("finding /http/put invocation: %w", err)
 	}
 	var putArgs httpcmds.PutArguments
 	if err := putArgs.UnmarshalCBOR(bytes.NewReader(putInv.ArgumentsBytes())); err != nil {
-		return AddedBlob{}, fmt.Errorf("unmarshaling /http/put arguments: %w", err)
+		return nil, nil, fmt.Errorf("unmarshaling /http/put arguments: %w", err)
 	}
 	putRcpt := maybeFindReceipt(accArgs.Put.Task, meta.Receipts())
 
 	allocInv, err := findInvocation(putArgs.Destination.Task, meta.Invocations())
 	if err != nil {
-		return AddedBlob{}, fmt.Errorf("finding /blob/allocate invocation: %w", err)
+		return nil, nil, fmt.Errorf("finding /blob/allocate invocation: %w", err)
 	}
 	var allocArgs blobcmds.AllocateArguments
 	if err := allocArgs.UnmarshalCBOR(bytes.NewReader(allocInv.ArgumentsBytes())); err != nil {
-		return AddedBlob{}, fmt.Errorf("unmarshaling /blob/allocate arguments: %w", err)
+		return nil, nil, fmt.Errorf("unmarshaling /blob/allocate arguments: %w", err)
 	}
 	allocRcpt, err := findReceipt(putArgs.Destination.Task, meta.Receipts())
 	if err != nil {
-		return AddedBlob{}, fmt.Errorf("finding /blob/allocate receipt: %w", err)
+		return nil, nil, fmt.Errorf("finding /blob/allocate receipt: %w", err)
 	}
 	o, x := allocRcpt.Out().Unpack()
 	if allocRcpt.Out().IsErr() {
 		var model edm.ErrorModel
 		if err := model.UnmarshalCBOR(bytes.NewReader(x)); err != nil {
-			return AddedBlob{}, fmt.Errorf("executing invocation")
+			return nil, nil, fmt.Errorf("executing invocation")
 		}
-		return AddedBlob{}, fmt.Errorf("failure in allocation receipt: %w", model)
+		return nil, nil, fmt.Errorf("failure in allocation receipt: %w", model)
 	}
 	var allocOK blobcmds.AllocateOK
 	if err := allocOK.UnmarshalCBOR(bytes.NewReader(o)); err != nil {
-		return AddedBlob{}, fmt.Errorf("unmarshaling allocation receipt output: %w", err)
+		return nil, nil, fmt.Errorf("unmarshaling allocation receipt output: %w", err)
 	}
 
 	putSuccess := putRcpt != nil && putRcpt.Out().IsOK()
@@ -214,40 +256,98 @@ func (c *Client) BlobAdd(ctx context.Context, content io.Reader, space did.DID, 
 	// piri's PUT endpoint requires it.
 	if allocOK.Address != nil && !putSuccess {
 		if err := putBlob(ctx, putClient, allocOK.Address.URL.URL(), allocOK.Address.Headers, contentReader, int64(*contentSizePtr)); err != nil {
-			return AddedBlob{}, fmt.Errorf("putting blob: %w", err)
+			return nil, nil, fmt.Errorf("putting blob: %w", err)
 		}
 	}
 
-	// Conclude a synthesized /http/put receipt so /blob/accept can resolve.
-	if !putSuccess {
-		accDlg, accProofs, derr := delegateWithProofs(
-			ctx, c.signer, c.serviceID, space, blobcmds.Accept.Command, dlgPolicy, c)
-		if derr != nil {
-			return AddedBlob{}, fmt.Errorf("delegating /blob/accept: %w", derr)
+	// Dedup path: the provider already held accepted bytes for this content,
+	// so the put receipt was pre-issued and the upload service ran accept
+	// synchronously — the blob is not parked. Await the accept receipt and
+	// return the completed AddedBlob.
+	if putSuccess {
+		location, aerr := c.awaitAccept(ctx, accInv.Task().Link())
+		if aerr != nil {
+			err = aerr
+			return nil, nil, err
 		}
-		if err := c.sendPutReceipt(ctx, putInv,
-			execution.WithDelegations(accDlg),
-			execution.WithDelegations(accProofs...),
-		); err != nil {
-			return AddedBlob{}, fmt.Errorf("sending put receipt: %w", err)
-		}
+		return nil, &AddedBlob{Digest: contentHash, Size: *contentSizePtr, Location: location}, nil
 	}
 
-	accRcpt, accMeta, err := c.receiptsClient.Poll(ctx, accInv.Task().Link(), receipt_client.WithRetries(5))
+	// Parked: durable on the provider, conclude deferred to BlobConclude.
+	return &ParkedBlob{
+		Digest:        contentHash,
+		Size:          *contentSizePtr,
+		AddTask:       inv.Task().Link(),
+		AcceptTask:    accInv.Task().Link(),
+		PutInvocation: putInv.Bytes(),
+	}, nil, nil
+}
+
+// BlobConclude finishes a parked upload: it synthesizes and concludes the
+// /http/put receipt (which makes the upload service trigger /blob/accept on
+// the provider) and awaits the accept receipt's location commitment. Safe to
+// retry — re-concluding an already-concluded put is tolerated upstream.
+func (c *Client) BlobConclude(ctx context.Context, parked ParkedBlob, space did.DID) (blob AddedBlob, err error) {
+	start := time.Now()
+	defer func() {
+		if err != nil {
+			c.logger.Error("blob conclude failed", zap.Stringer("space", space), zap.Error(err), zap.Duration("duration", time.Since(start)))
+		} else {
+			c.logger.Debug("blob concluded", zap.Stringer("space", space), zap.Duration("duration", time.Since(start)))
+		}
+	}()
+
+	putInv := new(invocation.Invocation)
+	if err := putInv.UnmarshalCBOR(bytes.NewReader(parked.PutInvocation)); err != nil {
+		return AddedBlob{}, fmt.Errorf("decoding parked /http/put invocation: %w", err)
+	}
+
+	// The accept delegation is re-derived rather than persisted: it is a
+	// function of the signer, space, and the digest/size policy.
+	dlgPolicy, err := policy.Build(
+		policy.Equal(".blob.digest", []byte(parked.Digest)),
+		policy.Equal(".blob.size", int64(parked.Size)),
+	)
 	if err != nil {
-		return AddedBlob{}, fmt.Errorf("polling accept receipt: %w", err)
+		return AddedBlob{}, fmt.Errorf("building delegation policy: %w", err)
 	}
-	o, x = accRcpt.Out().Unpack()
+	accDlg, accProofs, err := delegateWithProofs(
+		ctx, c.signer, c.serviceID, space, blobcmds.Accept.Command, dlgPolicy, c)
+	if err != nil {
+		return AddedBlob{}, fmt.Errorf("delegating /blob/accept: %w", err)
+	}
+	if err := c.sendPutReceipt(ctx, putInv,
+		execution.WithDelegations(accDlg),
+		execution.WithDelegations(accProofs...),
+	); err != nil {
+		return AddedBlob{}, fmt.Errorf("sending put receipt: %w", err)
+	}
+
+	location, err := c.awaitAccept(ctx, parked.AcceptTask)
+	if err != nil {
+		return AddedBlob{}, err
+	}
+	return AddedBlob{Digest: parked.Digest, Size: parked.Size, Location: location}, nil
+}
+
+// awaitAccept polls the /blob/accept receipt and extracts the
+// /assert/location commitment from its metadata.
+func (c *Client) awaitAccept(ctx context.Context, acceptTask cid.Cid) (ucan.Invocation, error) {
+	accRcpt, accMeta, err := c.receiptsClient.Poll(ctx, acceptTask, receipt_client.WithRetries(5))
+	if err != nil {
+		return nil, fmt.Errorf("polling accept receipt: %w", err)
+	}
+	o, x := accRcpt.Out().Unpack()
 	if accRcpt.Out().IsErr() {
 		var model edm.ErrorModel
 		if err := model.UnmarshalCBOR(bytes.NewReader(x)); err != nil {
-			return AddedBlob{}, fmt.Errorf("executing invocation")
+			return nil, fmt.Errorf("executing invocation")
 		}
-		return AddedBlob{}, fmt.Errorf("failure in accept receipt: %w", model)
+		return nil, fmt.Errorf("failure in accept receipt: %w", model)
 	}
 	var accOK blobcmds.AcceptOK
 	if err := accOK.UnmarshalCBOR(bytes.NewReader(o)); err != nil {
-		return AddedBlob{}, fmt.Errorf("unmarshaling accept receipt output: %w", err)
+		return nil, fmt.Errorf("unmarshaling accept receipt output: %w", err)
 	}
 
 	var locationCommitment ucan.Invocation
@@ -257,10 +357,9 @@ func (c *Client) BlobAdd(ctx context.Context, content io.Reader, space did.DID, 
 		}
 	}
 	if locationCommitment == nil {
-		return AddedBlob{}, fmt.Errorf("blob accept receipt missing location commitment invocation")
+		return nil, fmt.Errorf("blob accept receipt missing location commitment invocation")
 	}
-
-	return AddedBlob{Digest: contentHash, Size: *contentSizePtr, Location: locationCommitment}, nil
+	return locationCommitment, nil
 }
 
 func putBlob(ctx context.Context, client *http.Client, url *url.URL, headers map[string]string, body io.Reader, size int64) error {
