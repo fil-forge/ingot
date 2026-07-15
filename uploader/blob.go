@@ -84,19 +84,19 @@ type BlobRemover interface {
 	RemoveBlob(ctx context.Context, digest multihash.Multihash) error
 }
 
-// RemoveBlob releases the space's claim on digest.
-//
-// TODO(phase 7 / smelt): wire forgeclient.BlobRemove against the upload service
-// — the libforge blob.Remove binding exists, but the Piri/Sprue handler is
-// to-build (docs/architecture.md §9). Until it lands this is a logged no-op, so
-// the reference-index bookkeeping (blob_refs count → 0 → RemoveBlob) is
-// exercised end-to-end without a working network primitive; bytes accumulate on
-// Piri until the handler exists.
-func (u *Forge) RemoveBlob(_ context.Context, digest multihash.Multihash) error {
-	u.logger.Info("blob remove (no-op; Piri handler to-build)",
+// RemoveBlob releases the space's claim on digest via /blob/remove on the
+// upload service: sprue deregisters the blob and forwards the removal to the
+// storage nodes holding it; piri deletes the bytes only once no space claims
+// the digest (and, for aggregated pieces, once the PDP root retires
+// on-chain). Idempotent.
+func (u *Forge) RemoveBlob(ctx context.Context, digest multihash.Multihash) error {
+	u.logger.Info("blob remove",
 		zap.Stringer("space", u.space),
 		zap.String("digest", digestutil.Format(digest)),
 	)
+	if err := u.client.BlobRemove(ctx, digest, u.space); err != nil {
+		return fmt.Errorf("uploader: removing blob: %w", err)
+	}
 	return nil
 }
 

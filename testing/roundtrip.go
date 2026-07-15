@@ -60,6 +60,16 @@ func PutBytes(ctx context.Context, c Config, bucket, key string, body []byte) er
 	return err
 }
 
+// DeleteObject deletes object key from bucket.
+func DeleteObject(ctx context.Context, c Config, bucket, key string) error {
+	cl, err := s3Client(ctx, c)
+	if err != nil {
+		return err
+	}
+	_, err = cl.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: &bucket, Key: &key})
+	return err
+}
+
 // GetBytes downloads object key from bucket.
 func GetBytes(ctx context.Context, c Config, bucket, key string) ([]byte, error) {
 	cl, err := s3Client(ctx, c)
