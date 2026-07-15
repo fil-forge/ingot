@@ -250,8 +250,6 @@ github.com/fil-forge/indexing-service v1.13.5-0.20260619142411-efe3f5fab717 h1:W
 github.com/fil-forge/indexing-service v1.13.5-0.20260619142411-efe3f5fab717/go.mod h1:wFcakLohOqpMRkJzWRdGFGHRFpGB+PpEMCm9wkt2cqU=
 github.com/fil-forge/libforge v0.0.0-20260717174550-aac837a730c2 h1:mwb14/aanwFBGdQJ/0WCkNX/AzUXF/iRKMVjhXtYd6Q=
 github.com/fil-forge/libforge v0.0.0-20260717174550-aac837a730c2/go.mod h1:0kXihIQ4L2uZ00nR5XrZ/Y8Db7Ht/qQNuiWslwMJ95M=
-github.com/fil-forge/smelt v0.0.0-20260714201619-f2ecac50394c h1:LqWeuCe44vpkqz/F5kqMjK380FOzvLvYrFlR/I9GVUo=
-github.com/fil-forge/smelt v0.0.0-20260714201619-f2ecac50394c/go.mod h1:W6aiYnuM+n0Q7G6fH3Ok4EE2iMfUSpA6f8r3i/+moBs=
 github.com/fil-forge/ucantone v0.0.0-20260706102443-79141c5cc52e h1:di/SseJVEO6bznSH/UEnAE2nSwwp/gqgnPLgE9/x2Zg=
 github.com/fil-forge/ucantone v0.0.0-20260706102443-79141c5cc52e/go.mod h1:oFY5BfD0bDeodGlbBHh3/nK99MAS93rGXjoQz7s5qgE=
 github.com/filecoin-project/go-data-segment v0.0.1 h1:1wmDxOG4ubWQm3ZC1XI5nCon5qgSq7Ra3Rb6Dbu10Gs=

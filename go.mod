@@ -252,3 +252,5 @@ require (
 	pitr.ca/jsontokenizer v0.3.2 // indirect
 	tags.cncf.io/container-device-interface v1.1.0 // indirect
 )
+
+replace github.com/fil-forge/smelt => ../smelt
