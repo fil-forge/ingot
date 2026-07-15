@@ -384,15 +384,16 @@ func provideUploader(c *forgeclient.Client, space spaceIssuer, logger *zap.Logge
 // holds a /blob/add chain for the agent (idempotent across restarts).
 func seedSpaceDelegations(ctx context.Context, spaceIssuer ucan.Issuer, agent did.DID, store tokenstore.Store, logger *zap.Logger) error {
 	space := spaceIssuer.DID()
-	// Sentinel on /blob/allocate: it is the cap the upload service re-invokes
-	// against piri on the space's behalf, so a store missing it cannot ship.
-	// (An older store seeded before allocate/accept were added re-seeds here.)
-	if proofs, _, err := store.ProofChain(ctx, agent, blobcmds.Allocate.Command, space); err == nil && len(proofs) > 0 {
+	// Sentinel on /blob/remove: the newest cap in the list — a store missing
+	// it was seeded by an older build and re-seeds here (AddDelegations is
+	// additive, so re-seeding the earlier caps is harmless).
+	if proofs, _, err := store.ProofChain(ctx, agent, blobcmds.Remove.Command, space); err == nil && len(proofs) > 0 {
 		return nil // already seeded (or login-provisioned)
 	}
 	// The edge-client flow needs space->agent authority over: /blob/add (the
-	// add invocation), /blob/allocate + /blob/accept (re-delegated to sprue so
-	// it can allocate/accept against piri), /index/add (the index publish), and
+	// add invocation), /blob/remove (the delete-finality release),
+	// /blob/allocate + /blob/accept (re-delegated to sprue so it can
+	// allocate/accept against piri), /index/add (the index publish), and
 	// /content/retrieve (the read path + the index retrieval-auth).
 	type cap struct {
 		name string
@@ -401,6 +402,9 @@ func seedSpaceDelegations(ctx context.Context, spaceIssuer ucan.Issuer, agent di
 	caps := []cap{
 		{"/blob/add", func() (ucan.Delegation, error) {
 			return blobcmds.Add.Delegate(spaceIssuer, agent, space, delegation.WithNoExpiration())
+		}},
+		{"/blob/remove", func() (ucan.Delegation, error) {
+			return blobcmds.Remove.Delegate(spaceIssuer, agent, space, delegation.WithNoExpiration())
 		}},
 		{"/blob/allocate", func() (ucan.Delegation, error) {
 			return blobcmds.Allocate.Delegate(spaceIssuer, agent, space, delegation.WithNoExpiration())

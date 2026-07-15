@@ -95,6 +95,14 @@ func (u *Forge) RemoveBlob(ctx context.Context, digest multihash.Multihash) erro
 		zap.String("digest", digestutil.Format(digest)),
 	)
 	if err := u.client.BlobRemove(ctx, digest, u.space); err != nil {
+		// Callers treat removal as best-effort and may discard the error, so
+		// log it here — a silent failure leaks bytes on the network with no
+		// trace.
+		u.logger.Error("blob remove failed",
+			zap.Stringer("space", u.space),
+			zap.String("digest", digestutil.Format(digest)),
+			zap.Error(err),
+		)
 		return fmt.Errorf("uploader: removing blob: %w", err)
 	}
 	return nil
