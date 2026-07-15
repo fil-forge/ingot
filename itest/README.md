@@ -39,7 +39,7 @@ here and add new cases to the pass table (demote to xfail if they fail).
 
 | Test | Covers | ~time |
 |---|---|---|
-| `TestForgeScenarios` | Ingot-unique behaviors upstream can't assert, on a stack whose ingot config lowers `max_blob_size` to 64 KiB (`testdata/config-smallblob.yaml`): coarse blob-split round-trip with spooled-by-digest proof (spool counted inside the container), zero-byte objects, a multipart part spanning multiple internal blobs, and failed-Complete session recovery. | ~3 min |
+| `TestForgeScenarios` | Ingot-unique behaviors upstream can't assert, on a stack whose ingot config lowers `max_blob_size` to 64 KiB (`testdata/config-smallblob.yaml`): coarse blob-split round-trip with spooled-by-digest proof (spool counted inside the container), zero-byte objects, a multipart part spanning multiple internal blobs, abort deleting the parts' spooled blobs, and failed-Complete session recovery. | ~3 min |
 | `TestForgeNativeProvision` | Guppy-free onboarding: `ingot login` + `space generate --provision-to` in the container, then a PUT/GET round-trip over the real ship path. | ~1.7 min |
 | `TestForgeReadAfterEviction` | The appliance read tier: PUT, wipe `/data/spool`, GET must re-fetch body blobs from piri via the local locator + `/content/retrieve`. | ~1.3 min |
 

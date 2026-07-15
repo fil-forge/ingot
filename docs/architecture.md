@@ -810,8 +810,15 @@ paths are stubbed in-tree and verified against a real sprue+piri+indexer later:
 - **Crash recovery for the spool is not built.** The `upload_intents` × `blob_refs` reconciliation
   the failure-mode table in [§7.5](#75-concurrency-durability-and-failure-modes) describes (resume/`unallocate` parked, `remove` accepted-but-unreferenced)
   is a later phase; a partial post-commit reference-index write currently relies on retry/idempotency.
-- **`UploadPartCopy`, `ListParts`, `ListMultipartUploads`, and indexer retraction on delete** are
-  unimplemented (`ErrNotImplemented` / no-op).
+- **`UploadPartCopy` and indexer retraction on delete** are unimplemented
+  (`ErrNotImplemented` / no-op). `ListParts` and `ListMultipartUploads` are implemented
+  (paginated, prefix/delimiter/marker semantics; in-flight sessions only).
+- **Multipart hygiene (spool-model edition).** Abort and part re-upload delete the
+  now-unreferenced spooled blobs (guarded against content-addressed sharing with other
+  sessions and committed objects), and a background sweeper aborts open sessions older
+  than `multipart_session_ttl` (default 7d) and reaps terminal session rows. A successful
+  Complete retains its session in state `completed` so a duplicate Complete is idempotent
+  per S3. The network-side `unallocate`-on-abort remains a parking-flow concern (above).
 
 ### Known correctness boundary
 

@@ -1,6 +1,9 @@
 package registry
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // This file defines the relational surface the upload/storage/delete
 // architecture relies on (docs/architecture.md §5–§7, Appendix C):
@@ -28,6 +31,10 @@ const (
 	SessionOpen       = "open"
 	SessionCompleting = "completing"
 	SessionAborting   = "aborting"
+	// SessionCompleted: the object committed; the session and its parts are
+	// retained so a duplicate CompleteMultipartUpload with identical parts is
+	// idempotent (S3 semantics). Reaped by the abandoned-session sweeper.
+	SessionCompleted = "completed"
 )
 
 // multipart_parts.state values (§7.2).
@@ -68,14 +75,28 @@ type BlobLocation struct {
 	Size     int64
 }
 
-// MultipartSession is one row of ingot.multipart_sessions.
+// MultipartSession is one row of ingot.multipart_sessions. The HTTP metadata
+// headers (ContentEncoding..Expires) are captured at CreateMultipartUpload so
+// Complete can write them into the manifest exactly like a single-shot PUT.
 type MultipartSession struct {
-	UploadID    string
-	Bucket      string
-	ObjectKey   string
-	State       string
-	ContentType string
-	Metadata    map[string]string
+	UploadID           string
+	Bucket             string
+	ObjectKey          string
+	State              string
+	ContentType        string
+	ContentEncoding         string
+	ContentDisposition      string
+	ContentLanguage         string
+	CacheControl            string
+	Expires                 string
+	WebsiteRedirectLocation string
+	// ChecksumAlgorithm/ChecksumType are the x-amz-checksum-* declarations from
+	// CreateMultipartUpload, echoed by ListMultipartUploads. Per-part checksum
+	// computation is separate (FIL-620).
+	ChecksumAlgorithm string
+	ChecksumType      string
+	Metadata          map[string]string
+	CreatedAt         time.Time
 }
 
 // MultipartPart is one row of ingot.multipart_parts. BlobDigests is the
@@ -88,6 +109,7 @@ type MultipartPart struct {
 	Size        int64
 	BlobDigests [][]byte
 	State       string
+	CreatedAt   time.Time
 }
 
 // BlobRefStore is the reverse reference index (§5, §6). A commit adds a
@@ -133,6 +155,18 @@ type MultipartStore interface {
 	DeleteSession(ctx context.Context, uploadID string) error
 	PutPart(ctx context.Context, p MultipartPart) error
 	ListParts(ctx context.Context, uploadID string) ([]MultipartPart, error)
+	// ListSessions returns bucket's sessions ordered by (object_key, created_at,
+	// upload_id) — the S3 ListMultipartUploads presentation order. Filtering
+	// (prefix/markers/max) happens in the handler; in-flight session counts are
+	// small.
+	ListSessions(ctx context.Context, bucket string) ([]MultipartSession, error)
+	// ListStaleSessions returns sessions in `state` created before cutoff, for
+	// the abandoned-upload sweeper.
+	ListStaleSessions(ctx context.Context, state string, cutoff time.Time) ([]MultipartSession, error)
+	// CountPartRefs returns how many parts OUTSIDE excludeUploadID reference
+	// digest — the shared-blob guard for abort/supersede spool cleanup
+	// (content-addressed part blobs may be deduped across sessions).
+	CountPartRefs(ctx context.Context, digest []byte, excludeUploadID string) (int, error)
 }
 
 // GCStore records superseded MST node CIDs (§4). Write-only this iteration.

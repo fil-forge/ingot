@@ -44,6 +44,12 @@ type Config struct {
 	// Optional; defaults to DataDir.
 	TokenStoreDir string `mapstructure:"token_store_dir" yaml:"token_store_dir"`
 
+	// MultipartSessionTTL bounds abandoned multipart uploads (Go duration
+	// string, e.g. "168h"): open sessions older than this are aborted by a
+	// background sweeper and their spooled parts dropped. Empty → default
+	// 7 days; a negative duration disables the sweeper.
+	MultipartSessionTTL string `mapstructure:"multipart_session_ttl" yaml:"multipart_session_ttl"`
+
 	// CatalogPlane overrides the catalog logstore pipeline knobs. Any field
 	// left zero/unset falls back to the top-level SealBytes / SealAge / Retain
 	// (and Ship defaults to true) — e.g. to configure the catalog never to ship.
@@ -86,6 +92,13 @@ func (c Config) ServerConfig() (ServerConfig, error) {
 	if err != nil {
 		return ServerConfig{}, err
 	}
+	var mpTTL time.Duration
+	if c.MultipartSessionTTL != "" {
+		mpTTL, err = time.ParseDuration(c.MultipartSessionTTL)
+		if err != nil {
+			return ServerConfig{}, fmt.Errorf("ingot: parse multipart_session_ttl %q: %w", c.MultipartSessionTTL, err)
+		}
+	}
 	return ServerConfig{
 		Addr:        c.Addr,
 		DataDir:     c.DataDir,
@@ -101,6 +114,8 @@ func (c Config) ServerConfig() (ServerConfig, error) {
 		SealAgeCatalog:   catAge,
 		ShipCatalog:      shipDefault(c.CatalogPlane.Ship),
 		RetainCatalog:    firstNonZeroInt(c.CatalogPlane.Retain, c.Retain),
+
+		MultipartSessionTTL: mpTTL,
 	}, nil
 }
 

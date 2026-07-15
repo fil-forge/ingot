@@ -63,6 +63,13 @@ type ServerConfig struct {
 	// request), so New substitutes a sensible default.
 	MaxConnections int
 	MaxRequests    int
+
+	// MultipartSessionTTL bounds abandoned multipart uploads: open sessions
+	// older than this are aborted by a background sweeper (dropping their
+	// spooled parts), and completed-session rows retained for Complete
+	// idempotency are reaped past the same age. Zero → default 7 days;
+	// negative → sweeper disabled.
+	MultipartSessionTTL time.Duration
 }
 
 // ServerDeps bundles the runtime collaborators of an ingot Server
@@ -119,11 +126,12 @@ type ServerDeps struct {
 // lifecycle. fx callers wrap these in OnStart/OnStop hooks; tests
 // call them directly.
 type Server struct {
-	cfg     ServerConfig
-	logger  *zap.Logger
-	log     blockstore.Log
-	backend *s3frontend.Backend
-	api     *s3api.S3ApiServer
+	cfg       ServerConfig
+	logger    *zap.Logger
+	log       blockstore.Log
+	backend   *s3frontend.Backend
+	api       *s3api.S3ApiServer
+	sweepStop chan struct{}
 }
 
 // New wires a ServerDeps + ServerConfig into a runnable Server. The
@@ -214,7 +222,46 @@ func (s *Server) Start(ctx context.Context) error {
 			s.logger.Error("ingot listener error", zap.Error(err))
 		}
 	}()
+	s.startMultipartSweeper()
 	return nil
+}
+
+// startMultipartSweeper spawns the abandoned-multipart-session sweeper: open
+// sessions older than MultipartSessionTTL are aborted (their spooled parts
+// dropped) and terminal session rows reaped. Zero TTL → 7-day default;
+// negative → disabled.
+func (s *Server) startMultipartSweeper() {
+	ttl := s.cfg.MultipartSessionTTL
+	if ttl == 0 {
+		ttl = 7 * 24 * time.Hour
+	}
+	if ttl < 0 {
+		return
+	}
+	interval := ttl / 2
+	if interval > 10*time.Minute {
+		interval = 10 * time.Minute
+	}
+	s.sweepStop = make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-s.sweepStop:
+				return
+			case <-ticker.C:
+				ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+				n, err := s.backend.SweepStaleMultipartSessions(ctx, ttl)
+				cancel()
+				if err != nil {
+					s.logger.Warn("multipart sweep", zap.Error(err))
+				} else if n > 0 {
+					s.logger.Info("multipart sweep reaped stale sessions", zap.Int("count", n))
+				}
+			}
+		}
+	}()
 }
 
 // Stop shuts the listener down and drains the log. Always returns
@@ -223,6 +270,10 @@ func (s *Server) Start(ctx context.Context) error {
 func (s *Server) Stop(ctx context.Context) error {
 	s.logger.Info("shutting down ingot S3 listener")
 
+	if s.sweepStop != nil {
+		close(s.sweepStop)
+		s.sweepStop = nil
+	}
 	var errs []error
 	if err := s.api.ShutDown(); err != nil {
 		errs = append(errs, fmt.Errorf("s3api shutdown: %w", err))

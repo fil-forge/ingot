@@ -12,7 +12,9 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/ipfs/go-cid"
+	mh "github.com/multiformats/go-multihash"
 	"github.com/versity/versitygw/backend"
 	"github.com/versity/versitygw/s3err"
 	"github.com/versity/versitygw/s3response"
@@ -22,6 +24,13 @@ import (
 	"github.com/fil-forge/ingot/mst"
 	"github.com/fil-forge/ingot/registry"
 )
+
+// minPartSize is S3's minimum size for every part except the last one,
+// enforced at CompleteMultipartUpload (EntityTooSmall).
+const minPartSize = 5 << 20
+
+// defaultMaxListing is the S3 default and cap for max-parts / max-uploads.
+const defaultMaxListing = 1000
 
 // newUploadID returns a random 128-bit hex upload id.
 func newUploadID() (string, error) {
@@ -33,8 +42,9 @@ func newUploadID() (string, error) {
 }
 
 // CreateMultipartUpload opens a multipart session: it records the destination
-// bucket/key plus the content-type and user metadata so Complete can write the
-// manifest without the client resupplying them, and returns the upload id.
+// bucket/key plus the content-type, the passthrough HTTP metadata headers, and
+// user metadata so Complete can write the manifest without the client
+// resupplying them, and returns the upload id.
 func (b *Backend) CreateMultipartUpload(ctx context.Context, input s3response.CreateMultipartUploadInput) (s3response.InitiateMultipartUploadResult, error) {
 	if input.Bucket == nil || input.Key == nil {
 		return s3response.InitiateMultipartUploadResult{}, s3err.GetAPIError(s3err.ErrInvalidRequest)
@@ -42,6 +52,11 @@ func (b *Backend) CreateMultipartUpload(ctx context.Context, input s3response.Cr
 	bucket, key := *input.Bucket, *input.Key
 	if !mst.IsValidKey(key) {
 		return s3response.InitiateMultipartUploadResult{}, s3err.GetAPIError(s3err.ErrInvalidArgument)
+	}
+	// A directory object (trailing "/") is zero-length by definition; a
+	// multipart upload to one necessarily carries data.
+	if strings.HasSuffix(key, "/") {
+		return s3response.InitiateMultipartUploadResult{}, s3err.GetAPIError(s3err.ErrDirectoryObjectContainsData)
 	}
 	if _, err := b.reg.Get(ctx, bucket); err != nil {
 		if errors.Is(err, registry.ErrNotFound) {
@@ -58,34 +73,75 @@ func (b *Backend) CreateMultipartUpload(ctx context.Context, input s3response.Cr
 		ct = "application/octet-stream"
 	}
 	if err := b.multipart.CreateSession(ctx, registry.MultipartSession{
-		UploadID:    uploadID,
-		Bucket:      bucket,
-		ObjectKey:   key,
-		State:       registry.SessionOpen,
-		ContentType: ct,
-		Metadata:    input.Metadata,
+		UploadID:                uploadID,
+		Bucket:                  bucket,
+		ObjectKey:               key,
+		State:                   registry.SessionOpen,
+		ContentType:             ct,
+		ContentEncoding:         backend.GetStringFromPtr(input.ContentEncoding),
+		ContentDisposition:      backend.GetStringFromPtr(input.ContentDisposition),
+		ContentLanguage:         backend.GetStringFromPtr(input.ContentLanguage),
+		CacheControl:            backend.GetStringFromPtr(input.CacheControl),
+		Expires:                 backend.GetStringFromPtr(input.Expires),
+		WebsiteRedirectLocation: backend.GetStringFromPtr(input.WebsiteRedirectLocation),
+		ChecksumAlgorithm:       string(input.ChecksumAlgorithm),
+		ChecksumType:            string(input.ChecksumType),
+		Metadata:                input.Metadata,
 	}); err != nil {
 		return s3response.InitiateMultipartUploadResult{}, fmt.Errorf("s3frontend: create session: %w", err)
 	}
 	return s3response.InitiateMultipartUploadResult{Bucket: bucket, Key: key, UploadId: uploadID}, nil
 }
 
-// UploadPart ingests one part: it coarse-splits the part body into blobs and
-// spools each to local disk (recording upload_intents), then records the part
-// (its ordered blob digests, md5, size). The part's blobs are NOT uploaded to
-// Forge yet — that is deferred to Complete (so an Abort only ever cleans up
-// local state). The part ETag is the hex md5 of the part bytes.
-func (b *Backend) UploadPart(ctx context.Context, input *s3.UploadPartInput) (*s3.UploadPartOutput, error) {
-	if input.Bucket == nil || input.Key == nil || input.UploadId == nil || input.PartNumber == nil {
-		return nil, s3err.GetAPIError(s3err.ErrInvalidRequest)
-	}
-	uploadID := *input.UploadId
+// openSession fetches uploadID's session and maps anything that is not an
+// in-flight upload for (bucket, key) to NoSuchUpload: unknown id, a key that
+// doesn't match the session's, or a session no longer open (completed uploads
+// are retained for Complete idempotency but are gone as far as the other
+// multipart operations are concerned).
+func (b *Backend) openSession(ctx context.Context, uploadID string, key *string) (*registry.MultipartSession, error) {
 	sess, err := b.multipart.GetSession(ctx, uploadID)
 	if err != nil {
 		if errors.Is(err, registry.ErrNotFound) {
 			return nil, s3err.GetAPIError(s3err.ErrNoSuchUpload)
 		}
-		return nil, fmt.Errorf("s3frontend: upload part: %w", err)
+		return nil, fmt.Errorf("s3frontend: get session: %w", err)
+	}
+	if key != nil && *key != sess.ObjectKey {
+		return nil, s3err.GetAPIError(s3err.ErrNoSuchUpload)
+	}
+	if sess.State != registry.SessionOpen {
+		return nil, s3err.GetAPIError(s3err.ErrNoSuchUpload)
+	}
+	return sess, nil
+}
+
+// UploadPart ingests one part: it coarse-splits the part body into blobs and
+// spools each to local disk (recording upload_intents), then records the part
+// (its ordered blob digests, md5, size). The part's blobs are NOT uploaded to
+// Forge yet — that is deferred to Complete (so an Abort only ever cleans up
+// local state). Re-uploading a part number supersedes the prior part; the
+// superseded part's now-unreferenced blobs are dropped from the spool. The
+// part ETag is the hex md5 of the part bytes.
+func (b *Backend) UploadPart(ctx context.Context, input *s3.UploadPartInput) (*s3.UploadPartOutput, error) {
+	if input.Bucket == nil || input.Key == nil || input.UploadId == nil || input.PartNumber == nil {
+		return nil, s3err.GetAPIError(s3err.ErrInvalidRequest)
+	}
+	uploadID := *input.UploadId
+	sess, err := b.openSession(ctx, uploadID, input.Key)
+	if err != nil {
+		return nil, err
+	}
+
+	// Capture the superseded part's blobs (if any) before overwriting, so
+	// last-write-wins doesn't strand its spool files.
+	var superseded [][]byte
+	if prior, err := b.multipart.ListParts(ctx, uploadID); err == nil {
+		for _, p := range prior {
+			if p.PartNumber == int(*input.PartNumber) {
+				superseded = p.BlobDigests
+				break
+			}
+		}
 	}
 
 	body, err := b.splitSpool(ctx, sess.Bucket, input.Body)
@@ -102,6 +158,9 @@ func (b *Backend) UploadPart(ctx context.Context, input *s3.UploadPartInput) (*s
 	}); err != nil {
 		return nil, fmt.Errorf("s3frontend: record part: %w", err)
 	}
+	if len(superseded) > 0 {
+		b.cleanupPartBlobs(ctx, uploadID, superseded)
+	}
 	etag := `"` + hex.EncodeToString(body.MD5) + `"`
 	return &s3.UploadPartOutput{ETag: &etag}, nil
 }
@@ -111,6 +170,10 @@ func (b *Backend) UploadPart(ctx context.Context, input *s3.UploadPartInput) (*s
 // list against the recorded parts, accepts every part's blobs on Forge, and
 // commits a manifest whose Body is the ordered union of the parts' blobs. The
 // object ETag is hex(md5(concat of part md5s)) + "-N".
+//
+// A successful Complete retains the session in state 'completed' (with its
+// parts), so a duplicate Complete with an identical part list is idempotent
+// per S3; the abandoned-session sweeper reaps the row later.
 func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.CompleteMultipartUploadInput) (s3response.CompleteMultipartUploadResult, string, error) {
 	if input.Bucket == nil || input.Key == nil || input.UploadId == nil {
 		return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrInvalidRequest)
@@ -123,6 +186,99 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 		}
 		return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: complete: %w", err)
 	}
+
+	// Conditional writes: S3 documents only If-None-Match: * (don't overwrite)
+	// and If-Match (require current ETag) for Complete; a concrete If-None-Match
+	// value — or combining If-None-Match with If-Match — is NotImplemented.
+	ifMatch, ifNoneMatch := input.IfMatch, input.IfNoneMatch
+	if ifNoneMatch != nil && (*ifNoneMatch != "*" || ifMatch != nil) {
+		return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrNotImplemented)
+	}
+	if ifMatch != nil || ifNoneMatch != nil {
+		current, lerr := b.lookupManifest(ctx, bucket, key)
+		exists := lerr == nil
+		if lerr != nil && !isNoSuchKey(lerr) {
+			return s3response.CompleteMultipartUploadResult{}, "", lerr
+		}
+		if ifMatch != nil {
+			if !exists {
+				return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrNoSuchKey)
+			}
+			if !etagsEqual(*ifMatch, current.ETag) {
+				return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrPreconditionFailed)
+			}
+		}
+		if ifNoneMatch != nil && exists {
+			return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrPreconditionFailed)
+		}
+	}
+
+	if input.MultipartUpload == nil || len(input.MultipartUpload.Parts) == 0 {
+		return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrInvalidPart)
+	}
+	stored, err := b.multipart.ListParts(ctx, uploadID)
+	if err != nil {
+		return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: list parts: %w", err)
+	}
+	byNum := make(map[int]registry.MultipartPart, len(stored))
+	for _, p := range stored {
+		byNum[p.PartNumber] = p
+	}
+
+	// Validate the requested parts (in-range and ascending, each matching a
+	// recorded part by number + ETag) and compute the multipart ETag.
+	requested := make([]registry.MultipartPart, 0, len(input.MultipartUpload.Parts))
+	etagHasher := md5.New()
+	prev := 0
+	for _, rp := range input.MultipartUpload.Parts {
+		if rp.PartNumber == nil {
+			return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrInvalidPart)
+		}
+		num := int(*rp.PartNumber)
+		if num < 1 || num > 10000 {
+			return s3response.CompleteMultipartUploadResult{}, "",
+				s3err.GetAPIError(s3err.ErrInvalidCompleteMpPartNumber)
+		}
+		if num <= prev {
+			return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrInvalidPartOrder)
+		}
+		prev = num
+		sp, ok := byNum[num]
+		if !ok {
+			return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrInvalidPart)
+		}
+		if rp.ETag != nil && !etagsEqual(*rp.ETag, hex.EncodeToString(sp.ETagMD5)) {
+			return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrInvalidPart)
+		}
+		requested = append(requested, sp)
+		etagHasher.Write(sp.ETagMD5)
+	}
+	// Every part but the last must meet S3's 5 MiB minimum.
+	var total int64
+	for i, sp := range requested {
+		if i < len(requested)-1 && sp.Size < minPartSize {
+			return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrEntityTooSmall)
+		}
+		total += sp.Size
+	}
+	if input.MpuObjectSize != nil {
+		if *input.MpuObjectSize < 0 {
+			return s3response.CompleteMultipartUploadResult{}, "", s3err.GetNegatvieMpObjectSizeErr(*input.MpuObjectSize)
+		}
+		if *input.MpuObjectSize != total {
+			return s3response.CompleteMultipartUploadResult{}, "", s3err.GetIncorrectMpObjectSizeErr(total, *input.MpuObjectSize)
+		}
+	}
+	etag := hex.EncodeToString(etagHasher.Sum(nil)) + "-" + strconv.Itoa(len(requested))
+
+	// Idempotent re-Complete: the prior Complete committed the object; the
+	// validation above already proved the client's part list matches the
+	// retained parts, so return the same result without recommitting.
+	if sess.State == registry.SessionCompleted {
+		etagQ := `"` + etag + `"`
+		return s3response.CompleteMultipartUploadResult{Bucket: &bucket, Key: &key, ETag: &etagQ}, "", nil
+	}
+
 	// Single-winner latch vs a racing Abort: only the writer that moves the
 	// session off 'open' proceeds (§7.3).
 	won, err := b.multipart.LatchSession(ctx, uploadID, registry.SessionOpen, registry.SessionCompleting)
@@ -143,44 +299,12 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 		}
 	}()
 
-	if input.MultipartUpload == nil || len(input.MultipartUpload.Parts) == 0 {
-		return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrInvalidPart)
-	}
-	stored, err := b.multipart.ListParts(ctx, uploadID)
-	if err != nil {
-		return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: list parts: %w", err)
-	}
-	byNum := make(map[int]registry.MultipartPart, len(stored))
-	for _, p := range stored {
-		byNum[p.PartNumber] = p
-	}
-
-	// Validate the requested parts (ascending, each matching a recorded part by
-	// number + ETag) and assemble the ordered body + the multipart ETag.
+	// Assemble the ordered body: each part's byte span (it may span several
+	// blobs) is recorded so a later GET/HEAD ?partNumber=N can address it (§7.2).
 	var blobs []msbucket.BlobRef
 	var partSizes []int64
 	var offset int64
-	etagHasher := md5.New()
-	prev := 0
-	for _, rp := range input.MultipartUpload.Parts {
-		if rp.PartNumber == nil {
-			return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrInvalidPart)
-		}
-		num := int(*rp.PartNumber)
-		if num <= prev {
-			return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrInvalidPartOrder)
-		}
-		prev = num
-		sp, ok := byNum[num]
-		if !ok {
-			return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrInvalidPart)
-		}
-		if rp.ETag != nil && !etagsEqual(*rp.ETag, hex.EncodeToString(sp.ETagMD5)) {
-			return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrInvalidPart)
-		}
-		etagHasher.Write(sp.ETagMD5)
-		// Record this part's byte span (it may span several blobs) so a later
-		// GET/HEAD ?partNumber=N can address it (§7.2).
+	for _, sp := range requested {
 		partStart := offset
 		for _, d := range sp.BlobDigests {
 			in, err := b.intents.GetIntent(ctx, d)
@@ -193,49 +317,59 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 		partSizes = append(partSizes, offset-partStart)
 	}
 
-	// Accept every part's blobs on Forge (no-op in the harness), then commit.
+	// Accept every part's blobs on Forge (no-op in standalone), then commit.
 	if err := b.uploadBlobs(ctx, blobs); err != nil {
 		return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: accept parts: %w", err)
 	}
 
-	etag := hex.EncodeToString(etagHasher.Sum(nil)) + "-" + strconv.Itoa(len(input.MultipartUpload.Parts))
 	mf := &msbucket.ObjectManifest{
-		Key:         key,
-		ContentType: sess.ContentType,
-		Created:     time.Now().Unix(),
-		Body:        msbucket.Body{Size: offset, Blobs: blobs, PartSizes: partSizes},
-		ETag:        etag,
-		Metadata:    sess.Metadata,
+		Key:                     key,
+		ContentType:             sess.ContentType,
+		Created:                 time.Now().Unix(),
+		Body:                    msbucket.Body{Size: offset, Blobs: blobs, PartSizes: partSizes},
+		ETag:                    etag,
+		ContentEncoding:         sess.ContentEncoding,
+		ContentDisposition:      sess.ContentDisposition,
+		ContentLanguage:         sess.ContentLanguage,
+		CacheControl:            sess.CacheControl,
+		Expires:                 sess.Expires,
+		WebsiteRedirectLocation: sess.WebsiteRedirectLocation,
+		Metadata:                sess.Metadata,
 	}
 
 	if err := b.commitManifest(ctx, bucket, key, mf, bodyDigests(mf.Body)); err != nil {
 		return s3response.CompleteMultipartUploadResult{}, "", err
 	}
 	committed = true
-	// The object is durable; session cleanup is best-effort (a lingering session
-	// is harmless and reapable later, and must not fail an otherwise-good
-	// Complete).
-	_ = b.multipart.DeleteSession(ctx, uploadID)
+	// The object is durable. Retain the session (state 'completed') and its
+	// parts so a duplicate Complete is idempotent; the sweeper reaps it later.
+	// Best-effort: a failed latch leaves the row in 'completing', which the
+	// sweeper also treats as terminal after the TTL.
+	_, _ = b.multipart.LatchSession(ctx, uploadID, registry.SessionCompleting, registry.SessionCompleted)
 
 	etagQ := `"` + etag + `"`
 	return s3response.CompleteMultipartUploadResult{Bucket: &bucket, Key: &key, ETag: &etagQ}, "", nil
 }
 
 // AbortMultipartUpload cancels a multipart upload: it latches the session
-// (single-winner vs Complete) and drops it (cascading its parts). The spooled
-// part blobs are content-addressed and may be shared, so they are left for GC
-// rather than deleted here; no reference claims were taken (those happen only at
-// Complete), so nothing else needs unwinding.
+// (single-winner vs Complete), drops it (cascading its parts), and removes the
+// parts' now-unreferenced blobs from the spool. No reference claims were taken
+// (those happen only at Complete), so nothing network-side needs unwinding.
 func (b *Backend) AbortMultipartUpload(ctx context.Context, input *s3.AbortMultipartUploadInput) error {
 	if input.UploadId == nil {
 		return s3err.GetAPIError(s3err.ErrInvalidRequest)
 	}
 	uploadID := *input.UploadId
-	if _, err := b.multipart.GetSession(ctx, uploadID); err != nil {
-		if errors.Is(err, registry.ErrNotFound) {
-			return s3err.GetAPIError(s3err.ErrNoSuchUpload)
-		}
-		return fmt.Errorf("s3frontend: abort: %w", err)
+	sess, err := b.openSession(ctx, uploadID, input.Key)
+	if err != nil {
+		return err
+	}
+	// If-Match-Initiated-Time: reject when the provided timestamp predates the
+	// upload's initiation (compared at second precision — Initiated is
+	// presented via RFC3339); future timestamps are ignored per S3.
+	if input.IfMatchInitiatedTime != nil &&
+		input.IfMatchInitiatedTime.Truncate(time.Second).Before(sess.CreatedAt.Truncate(time.Second)) {
+		return s3err.GetAPIError(s3err.ErrPreconditionFailed)
 	}
 	won, err := b.multipart.LatchSession(ctx, uploadID, registry.SessionOpen, registry.SessionAborting)
 	if err != nil {
@@ -244,10 +378,308 @@ func (b *Backend) AbortMultipartUpload(ctx context.Context, input *s3.AbortMulti
 	if !won {
 		return s3err.GetAPIError(s3err.ErrNoSuchUpload)
 	}
+	// Snapshot the parts' blob digests before the cascade delete, then drop
+	// the session and clean the spool.
+	var digests [][]byte
+	if parts, err := b.multipart.ListParts(ctx, uploadID); err == nil {
+		for _, p := range parts {
+			digests = append(digests, p.BlobDigests...)
+		}
+	}
 	if err := b.multipart.DeleteSession(ctx, uploadID); err != nil {
 		return fmt.Errorf("s3frontend: delete session: %w", err)
 	}
+	b.cleanupPartBlobs(ctx, uploadID, digests)
 	return nil
+}
+
+// cleanupPartBlobs removes spooled blobs that belonged to aborted, expired, or
+// superseded parts of uploadID — unless the blob is still referenced: by a
+// part of another in-flight session (content-addressed dedup), by a part still
+// live in THIS session (a re-uploaded part may share blobs with its
+// replacement or a sibling part), or by a committed object (reference claims /
+// non-spooled intent state). Best-effort: cleanup failure never fails the S3
+// operation; a stranded spool file is reapable later.
+func (b *Backend) cleanupPartBlobs(ctx context.Context, uploadID string, digests [][]byte) {
+	if len(digests) == 0 {
+		return
+	}
+	// Digests still referenced by this session's live parts (after the
+	// abort/supersede that triggered this cleanup).
+	live := map[string]bool{}
+	if parts, err := b.multipart.ListParts(ctx, uploadID); err == nil {
+		for _, p := range parts {
+			for _, d := range p.BlobDigests {
+				live[string(d)] = true
+			}
+		}
+	}
+	seen := map[string]bool{}
+	for _, d := range digests {
+		k := string(d)
+		if seen[k] || live[k] {
+			continue
+		}
+		seen[k] = true
+		if n, err := b.multipart.CountPartRefs(ctx, d, uploadID); err != nil || n > 0 {
+			continue
+		}
+		if n, err := b.blobRefs.CountClaims(ctx, b.space, d); err != nil || n > 0 {
+			continue
+		}
+		if in, err := b.intents.GetIntent(ctx, d); err == nil && in.State != registry.IntentSpooled {
+			// Shipped/accepted blobs are the reference index's to manage.
+			continue
+		}
+		_ = b.spool.Remove(mh.Multihash(d))
+		_ = b.intents.DeleteIntent(ctx, d)
+	}
+}
+
+// ListParts returns the recorded parts of an in-flight upload, paginated by
+// part number.
+func (b *Backend) ListParts(ctx context.Context, input *s3.ListPartsInput) (s3response.ListPartsResult, error) {
+	if input.Bucket == nil || input.Key == nil || input.UploadId == nil {
+		return s3response.ListPartsResult{}, s3err.GetAPIError(s3err.ErrInvalidRequest)
+	}
+	uploadID := *input.UploadId
+	if _, err := b.openSession(ctx, uploadID, input.Key); err != nil {
+		return s3response.ListPartsResult{}, err
+	}
+
+	marker := 0
+	if input.PartNumberMarker != nil && *input.PartNumberMarker != "" {
+		m, err := strconv.Atoi(*input.PartNumberMarker)
+		if err != nil {
+			return s3response.ListPartsResult{}, s3err.GetAPIError(s3err.ErrInvalidArgument)
+		}
+		marker = m
+	}
+	maxParts := defaultMaxListing
+	if input.MaxParts != nil && *input.MaxParts > 0 && int(*input.MaxParts) < defaultMaxListing {
+		maxParts = int(*input.MaxParts)
+	}
+
+	stored, err := b.multipart.ListParts(ctx, uploadID)
+	if err != nil {
+		return s3response.ListPartsResult{}, fmt.Errorf("s3frontend: list parts: %w", err)
+	}
+	var parts []s3response.Part
+	truncated := false
+	next := 0
+	for _, p := range stored {
+		if p.PartNumber <= marker {
+			continue
+		}
+		if len(parts) == maxParts {
+			truncated = true
+			break
+		}
+		parts = append(parts, s3response.Part{
+			PartNumber:   p.PartNumber,
+			ETag:         `"` + hex.EncodeToString(p.ETagMD5) + `"`,
+			Size:         p.Size,
+			LastModified: p.CreatedAt.UTC(),
+		})
+		next = p.PartNumber
+	}
+	res := s3response.ListPartsResult{
+		Bucket:           *input.Bucket,
+		Key:              *input.Key,
+		UploadID:         uploadID,
+		StorageClass:     types.StorageClassStandard,
+		PartNumberMarker: marker,
+		MaxParts:         maxParts,
+		IsTruncated:      truncated,
+		Parts:            parts,
+	}
+	if truncated {
+		res.NextPartNumberMarker = next
+	}
+	return res, nil
+}
+
+// ListMultipartUploads lists the bucket's in-flight (open) multipart uploads
+// in (key, initiation) order, with S3's prefix/delimiter/marker pagination.
+func (b *Backend) ListMultipartUploads(ctx context.Context, input *s3.ListMultipartUploadsInput) (s3response.ListMultipartUploadsResult, error) {
+	if input.Bucket == nil {
+		return s3response.ListMultipartUploadsResult{}, s3err.GetAPIError(s3err.ErrInvalidBucketName)
+	}
+	bucket := *input.Bucket
+	if _, err := b.reg.Get(ctx, bucket); err != nil {
+		if errors.Is(err, registry.ErrNotFound) {
+			return s3response.ListMultipartUploadsResult{}, s3err.GetAPIError(s3err.ErrNoSuchBucket)
+		}
+		return s3response.ListMultipartUploadsResult{}, fmt.Errorf("s3frontend: list mpu: %w", err)
+	}
+
+	prefix := backend.GetStringFromPtr(input.Prefix)
+	delimiter := backend.GetStringFromPtr(input.Delimiter)
+	keyMarker := backend.GetStringFromPtr(input.KeyMarker)
+	uploadIDMarker := backend.GetStringFromPtr(input.UploadIdMarker)
+	maxUploads := defaultMaxListing
+	if input.MaxUploads != nil && *input.MaxUploads > 0 && int(*input.MaxUploads) < defaultMaxListing {
+		maxUploads = int(*input.MaxUploads)
+	}
+
+	all, err := b.multipart.ListSessions(ctx, bucket)
+	if err != nil {
+		return s3response.ListMultipartUploadsResult{}, fmt.Errorf("s3frontend: list sessions: %w", err)
+	}
+	// In-flight uploads only, honoring the prefix.
+	inflight := all[:0]
+	for _, s := range all {
+		if s.State == registry.SessionOpen && strings.HasPrefix(s.ObjectKey, prefix) {
+			inflight = append(inflight, s)
+		}
+	}
+
+	// Marker positioning. An upload-id marker is meaningful only alongside a
+	// key marker: when the key marker names a live key, the id must belong to
+	// one of that key's uploads (else InvalidArgument); when it doesn't (the
+	// marker key was completed/aborted meanwhile), the id positions within the
+	// keys ordered after it.
+	start := 0
+	if keyMarker != "" {
+		if uploadIDMarker != "" {
+			keyLive := false
+			pos := -1
+			for i, s := range inflight {
+				if s.ObjectKey == keyMarker {
+					keyLive = true
+					if s.UploadID == uploadIDMarker {
+						pos = i
+					}
+				}
+			}
+			if keyLive && pos < 0 {
+				return s3response.ListMultipartUploadsResult{},
+					s3err.GetAPIError(s3err.ErrInvalidUploadIdMarker)
+			}
+			if pos < 0 {
+				for i, s := range inflight {
+					if s.ObjectKey >= keyMarker && s.UploadID == uploadIDMarker {
+						pos = i
+						break
+					}
+				}
+			}
+			if pos >= 0 {
+				start = pos + 1
+			} else {
+				for start < len(inflight) && inflight[start].ObjectKey <= keyMarker {
+					start++
+				}
+			}
+		} else {
+			for start < len(inflight) && inflight[start].ObjectKey <= keyMarker {
+				start++
+			}
+		}
+	}
+
+	// Walk the ordered tail, collapsing keys under the delimiter into common
+	// prefixes; uploads and prefixes count toward max-uploads together.
+	var uploads []s3response.Upload
+	var prefixes []s3response.CommonPrefix
+	emittedPrefix := map[string]bool{}
+	count := 0
+	truncated := false
+	nextKeyMarker, nextUploadIDMarker := "", ""
+	for _, s := range inflight[start:] {
+		itemKey := s.ObjectKey
+		isPrefix := false
+		if delimiter != "" {
+			if i := strings.Index(s.ObjectKey[len(prefix):], delimiter); i >= 0 {
+				itemKey = s.ObjectKey[:len(prefix)+i+len(delimiter)]
+				isPrefix = true
+			}
+		}
+		if isPrefix && emittedPrefix[itemKey] {
+			continue
+		}
+		if count == maxUploads {
+			truncated = true
+			break
+		}
+		if isPrefix {
+			emittedPrefix[itemKey] = true
+			prefixes = append(prefixes, s3response.CommonPrefix{Prefix: itemKey})
+		} else {
+			uploads = append(uploads, s3response.Upload{
+				Key:               s.ObjectKey,
+				UploadID:          s.UploadID,
+				StorageClass:      types.StorageClassStandard,
+				Initiated:         s.CreatedAt.UTC(),
+				ChecksumAlgorithm: types.ChecksumAlgorithm(s.ChecksumAlgorithm),
+				ChecksumType:      types.ChecksumType(s.ChecksumType),
+			})
+		}
+		count++
+		nextKeyMarker, nextUploadIDMarker = itemKey, s.UploadID
+	}
+	res := s3response.ListMultipartUploadsResult{
+		Bucket:         bucket,
+		KeyMarker:      keyMarker,
+		UploadIDMarker: uploadIDMarker,
+		Delimiter:      delimiter,
+		Prefix:         prefix,
+		MaxUploads:     maxUploads,
+		IsTruncated:    truncated,
+		Uploads:        uploads,
+		CommonPrefixes: prefixes,
+	}
+	if truncated {
+		res.NextKeyMarker = nextKeyMarker
+		res.NextUploadIDMarker = nextUploadIDMarker
+	}
+	return res, nil
+}
+
+// SweepStaleMultipartSessions aborts in-flight multipart sessions older than
+// ttl (dropping their spooled parts, exactly like a client Abort) and reaps
+// completed/aborting leftovers past the same age. Returns how many sessions
+// were cleaned. Called periodically by the daemon's sweeper loop.
+func (b *Backend) SweepStaleMultipartSessions(ctx context.Context, ttl time.Duration) (int, error) {
+	cutoff := time.Now().Add(-ttl)
+	cleaned := 0
+	// Stale open sessions: latch (losing gracefully to a concurrent
+	// Complete/Abort) and clean up like an abort.
+	stale, err := b.multipart.ListStaleSessions(ctx, registry.SessionOpen, cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("s3frontend: sweep list: %w", err)
+	}
+	for _, s := range stale {
+		won, err := b.multipart.LatchSession(ctx, s.UploadID, registry.SessionOpen, registry.SessionAborting)
+		if err != nil || !won {
+			continue
+		}
+		var digests [][]byte
+		if parts, err := b.multipart.ListParts(ctx, s.UploadID); err == nil {
+			for _, p := range parts {
+				digests = append(digests, p.BlobDigests...)
+			}
+		}
+		if err := b.multipart.DeleteSession(ctx, s.UploadID); err != nil {
+			continue
+		}
+		b.cleanupPartBlobs(ctx, s.UploadID, digests)
+		cleaned++
+	}
+	// Terminal leftovers: completed sessions retained for Complete idempotency,
+	// and any 'completing'/'aborting' rows stranded by a crash mid-transition.
+	for _, state := range []string{registry.SessionCompleted, registry.SessionCompleting, registry.SessionAborting} {
+		leftovers, err := b.multipart.ListStaleSessions(ctx, state, cutoff)
+		if err != nil {
+			continue
+		}
+		for _, s := range leftovers {
+			if err := b.multipart.DeleteSession(ctx, s.UploadID); err == nil {
+				cleaned++
+			}
+		}
+	}
+	return cleaned, nil
 }
 
 // commitManifest splices mf into (bucket, key) and reconciles the reference

@@ -1,7 +1,10 @@
 package inmem
 
 import (
+	"bytes"
 	"context"
+	"sort"
+	"time"
 
 	"github.com/fil-forge/ingot/registry"
 )
@@ -157,6 +160,9 @@ func (m *MemStore) CreateSession(_ context.Context, s registry.MultipartSession)
 	if s.State == "" {
 		s.State = registry.SessionOpen
 	}
+	if s.CreatedAt.IsZero() {
+		s.CreatedAt = time.Now()
+	}
 	m.sessions[s.UploadID] = cloneSession(s)
 	return nil
 }
@@ -204,6 +210,9 @@ func (m *MemStore) PutPart(_ context.Context, p registry.MultipartPart) error {
 	if p.State == "" {
 		p.State = registry.PartParked
 	}
+	if p.CreatedAt.IsZero() {
+		p.CreatedAt = time.Now()
+	}
 	byNum := m.parts[p.UploadID]
 	if byNum == nil {
 		byNum = map[int]registry.MultipartPart{}
@@ -235,6 +244,60 @@ func (m *MemStore) ListParts(_ context.Context, uploadID string) ([]registry.Mul
 		out = append(out, clonePart(byNum[n]))
 	}
 	return out, nil
+}
+
+func (m *MemStore) ListSessions(_ context.Context, bucket string) ([]registry.MultipartSession, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []registry.MultipartSession
+	for _, s := range m.sessions {
+		if s.Bucket == bucket {
+			out = append(out, cloneSession(s))
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].ObjectKey != out[j].ObjectKey {
+			return out[i].ObjectKey < out[j].ObjectKey
+		}
+		if !out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].CreatedAt.Before(out[j].CreatedAt)
+		}
+		return out[i].UploadID < out[j].UploadID
+	})
+	return out, nil
+}
+
+func (m *MemStore) ListStaleSessions(_ context.Context, state string, cutoff time.Time) ([]registry.MultipartSession, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []registry.MultipartSession
+	for _, s := range m.sessions {
+		if s.State == state && s.CreatedAt.Before(cutoff) {
+			out = append(out, cloneSession(s))
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
+	return out, nil
+}
+
+func (m *MemStore) CountPartRefs(_ context.Context, digest []byte, excludeUploadID string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for uploadID, byNum := range m.parts {
+		if uploadID == excludeUploadID {
+			continue
+		}
+		for _, p := range byNum {
+			for _, d := range p.BlobDigests {
+				if bytes.Equal(d, digest) {
+					n++
+					break
+				}
+			}
+		}
+	}
+	return n, nil
 }
 
 // GCStore ====================================================================
