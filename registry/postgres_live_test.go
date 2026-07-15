@@ -142,6 +142,37 @@ func TestPostgresStores_Live(t *testing.T) {
 		}
 	})
 
+	t.Run("park round trip", func(t *testing.T) {
+		park := registry.BlobPark{
+			Digest:        digest,
+			AddTask:       []byte{0x01, 0x02},
+			AcceptTask:    []byte{0x03, 0x04},
+			PutInvocation: []byte("sealed-inv"),
+			Size:          42,
+		}
+		if err := r.PutPark(ctx, park); err != nil {
+			t.Fatalf("PutPark: %v", err)
+		}
+		got, err := r.GetPark(ctx, digest)
+		if err != nil || string(got.PutInvocation) != "sealed-inv" || got.Size != 42 {
+			t.Fatalf("GetPark = %+v, err %v", got, err)
+		}
+		// Upsert replaces in place.
+		park.Size = 43
+		if err := r.PutPark(ctx, park); err != nil {
+			t.Fatalf("PutPark (upsert): %v", err)
+		}
+		if got, err := r.GetPark(ctx, digest); err != nil || got.Size != 43 {
+			t.Fatalf("GetPark after upsert = %+v, err %v", got, err)
+		}
+		if err := r.DeletePark(ctx, digest); err != nil {
+			t.Fatalf("DeletePark: %v", err)
+		}
+		if _, err := r.GetPark(ctx, digest); err != registry.ErrNotFound {
+			t.Fatalf("GetPark after delete = %v, want ErrNotFound", err)
+		}
+	})
+
 	t.Run("multipart session parts latch metadata", func(t *testing.T) {
 		const id = "upl-1"
 		meta := map[string]string{"x-amz-meta-foo": "bar"}
