@@ -12,8 +12,11 @@ package inmem
 
 import (
 	"context"
+	"fmt"
 	"io"
+	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -22,12 +25,21 @@ import (
 	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
 
+	"github.com/fil-forge/hilt/pkg/sigv4"
 	"github.com/fil-forge/ingot/blockstore"
+	"github.com/fil-forge/ingot/bucketauthority"
 	"github.com/fil-forge/ingot/logstore"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/uploader"
+	"github.com/fil-forge/libforge/commands/s3"
+	"github.com/fil-forge/libforge/commands/s3/bucket"
 	"github.com/fil-forge/ucantone/did"
+	"github.com/fil-forge/ucantone/multikey/ed25519"
 )
+
+// maxListBuckets is the S3 ListBuckets max-buckets ceiling, also used as the
+// page size when the parameter is absent.
+const maxListBuckets = 10000
 
 // MemStore is an in-memory registry.Registry + logstore.Meta. The two
 // interfaces overlap on bucket state because shipping the catalog plane
@@ -75,16 +87,83 @@ func NewMemStore() *MemStore {
 	}
 }
 
+// BucketAuthority methods =====================================================
+
+func (m *MemStore) CreateBucket(ctx context.Context, req s3.Request) (did.DID, error) {
+	id, err := ed25519.Generate()
+	if err != nil {
+		return did.Undef, err
+	}
+	return id.KeyDID(), nil
+}
+
+func (m *MemStore) DeleteBucket(ctx context.Context, req s3.Request) error {
+	return nil
+}
+
+func (m *MemStore) ListBuckets(ctx context.Context, req s3.Request) (*bucket.ListOK, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	all := make([]bucket.Bucket, 0, len(m.buckets))
+	for name, state := range m.buckets {
+		all = append(all, bucket.Bucket{
+			Name:         name,
+			CreationDate: state.CreatedAt.Format(time.RFC3339),
+		})
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].Name < all[j].Name })
+
+	// The ListBuckets options ride as query parameters on the signed URL, which
+	// the verified signature covers in full.
+	u, err := url.Parse(req.URL)
+	if err != nil {
+		return nil, fmt.Errorf("parsing request URL: %w", err)
+	}
+	query := u.Query()
+	prefix := query.Get("prefix")
+	token := query.Get("continuation-token")
+	max := maxListBuckets
+	if v := query.Get("max-buckets"); v != "" {
+		max, err = strconv.Atoi(v)
+		if err != nil || max < 1 || max > maxListBuckets {
+			return nil, fmt.Errorf("%w: max-buckets: %q", bucketauthority.ErrInvalidArgument, v)
+		}
+	}
+
+	page := bucket.ListOK{}
+	// Hilt returns the requesting account as the listing owner; mirror that by
+	// deriving it from the signed request's access key. Best-effort: an
+	// unsigned request (e.g. a direct unit-test call) simply leaves it unset.
+	if sr, perr := sigv4.Parse(sigv4.Request{Method: req.Method, Headers: req.Headers, URL: req.URL}); perr == nil {
+		page.Owner = bucket.Owner{ID: sr.AccessKeyID, DisplayName: sr.AccessKeyID}
+	}
+	for _, st := range all {
+		if prefix != "" && !strings.HasPrefix(st.Name, prefix) {
+			continue
+		}
+		if st.Name <= token {
+			continue
+		}
+		if max > 0 && len(page.Buckets) == max {
+			page.ContinuationToken = page.Buckets[len(page.Buckets)-1].Name
+			break
+		}
+		page.Buckets = append(page.Buckets, st)
+	}
+
+	return &page, nil
+}
+
 // Registry methods ===========================================================
 
-func (m *MemStore) Create(_ context.Context, name string) error {
+func (m *MemStore) Create(_ context.Context, name string, space did.DID) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, ok := m.buckets[name]; ok {
 		return registry.ErrExists
 	}
 	// Stamped here for parity with the buckets.created_at column default.
-	m.buckets[name] = &registry.State{Name: name, CreatedAt: time.Now().UTC()}
+	m.buckets[name] = &registry.State{Name: name, Space: space, CreatedAt: time.Now().UTC()}
 	return nil
 }
 
@@ -97,36 +176,6 @@ func (m *MemStore) Get(_ context.Context, name string) (*registry.State, error) 
 	}
 	cp := *s
 	return &cp, nil
-}
-
-// List paginates locally: lexicographic order, prefix-filtered, resuming
-// strictly after the continuation token, truncated at opts.Max (the token
-// of a truncated page is the last name it includes).
-func (m *MemStore) List(_ context.Context, opts registry.ListOptions) (*registry.Page, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	all := make([]*registry.State, 0, len(m.buckets))
-	for _, s := range m.buckets {
-		cp := *s
-		all = append(all, &cp)
-	}
-	sort.Slice(all, func(i, j int) bool { return all[i].Name < all[j].Name })
-
-	page := &registry.Page{}
-	for _, st := range all {
-		if opts.Prefix != "" && !strings.HasPrefix(st.Name, opts.Prefix) {
-			continue
-		}
-		if st.Name <= opts.ContinuationToken {
-			continue
-		}
-		if opts.Max > 0 && len(page.Buckets) == opts.Max {
-			page.ContinuationToken = page.Buckets[len(page.Buckets)-1].Name
-			break
-		}
-		page.Buckets = append(page.Buckets, st)
-	}
-	return page, nil
 }
 
 func (m *MemStore) Delete(_ context.Context, name string) error {
@@ -302,11 +351,12 @@ func (NopUploader) RemoveBlob(_ context.Context, _ did.DID, _ multihash.Multihas
 
 // Compile-time guarantees.
 var (
-	_ registry.Registry      = (*MemStore)(nil)
-	_ logstore.Meta          = (*MemStore)(nil)
-	_ blockstore.BlockReader = NopBaseReader{}
-	_ blockstore.BlobReader  = NopBaseReader{}
-	_ uploader.Uploader      = NopUploader{}
-	_ uploader.BodyUploader  = NopUploader{}
-	_ uploader.BlobRemover   = NopUploader{}
+	_ bucketauthority.BucketAuthority = (*MemStore)(nil)
+	_ registry.Registry               = (*MemStore)(nil)
+	_ logstore.Meta                   = (*MemStore)(nil)
+	_ blockstore.BlockReader          = NopBaseReader{}
+	_ blockstore.BlobReader           = NopBaseReader{}
+	_ uploader.Uploader               = NopUploader{}
+	_ uploader.BodyUploader           = NopUploader{}
+	_ uploader.BlobRemover            = NopUploader{}
 )

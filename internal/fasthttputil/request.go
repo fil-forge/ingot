@@ -1,8 +1,6 @@
 package fasthttputil
 
 import (
-	"context"
-
 	"github.com/fil-forge/libforge/commands/s3"
 	"github.com/valyala/fasthttp"
 )
@@ -27,15 +25,4 @@ func RequestFromHTTPContext(rc *fasthttp.RequestCtx) s3.Request {
 		URL:     string(rc.Request.Header.RequestURI()),
 		Headers: headers,
 	}
-}
-
-// RequestFromContext captures an in-flight request from a context.Context
-// (which must be a *fasthttp.RequestCtx) as the [s3.Request] Hilt's /s3/*
-// commands take.
-func RequestFromContext(ctx context.Context) (s3.Request, bool) {
-	rc, ok := ctx.(*fasthttp.RequestCtx)
-	if !ok {
-		return s3.Request{}, false
-	}
-	return RequestFromHTTPContext(rc), true
 }

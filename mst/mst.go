@@ -299,7 +299,7 @@ func (mst *MerkleSearchTree) Add(ctx context.Context, key string, val cid.Cid, k
 			return nil, err
 		}
 
-		found, err := mst.atIndex(index)
+		found, err := mst.atIndex(ctx, index)
 		if err != nil {
 			return nil, err
 		}
@@ -308,7 +308,7 @@ func (mst *MerkleSearchTree) Add(ctx context.Context, key string, val cid.Cid, k
 			return nil, ErrAlreadyExists
 		}
 
-		prevNode, err := mst.atIndex(index - 1)
+		prevNode, err := mst.atIndex(ctx, index-1)
 		if err != nil {
 			return nil, err
 		}
@@ -329,7 +329,7 @@ func (mst *MerkleSearchTree) Add(ctx context.Context, key string, val cid.Cid, k
 			return nil, err
 		}
 
-		prevNode, err := mst.atIndex(index - 1)
+		prevNode, err := mst.atIndex(ctx, index-1)
 		if err != nil {
 			return nil, err
 		}
@@ -421,7 +421,7 @@ func (mst *MerkleSearchTree) Get(ctx context.Context, k string) (cid.Cid, error)
 		return cid.Undef, err
 	}
 
-	found, err := mst.atIndex(index)
+	found, err := mst.atIndex(ctx, index)
 	if err != nil {
 		return cid.Undef, err
 	}
@@ -430,7 +430,7 @@ func (mst *MerkleSearchTree) Get(ctx context.Context, k string) (cid.Cid, error)
 		return found.Val, nil
 	}
 
-	prev, err := mst.atIndex(index - 1)
+	prev, err := mst.atIndex(ctx, index-1)
 	if err != nil {
 		return cid.Undef, err
 	}
@@ -457,7 +457,7 @@ func (mst *MerkleSearchTree) Update(ctx context.Context, k string, val cid.Cid) 
 		return nil, err
 	}
 
-	found, err := mst.atIndex(index)
+	found, err := mst.atIndex(ctx, index)
 	if err != nil {
 		return nil, err
 	}
@@ -470,7 +470,7 @@ func (mst *MerkleSearchTree) Update(ctx context.Context, k string, val cid.Cid) 
 		})
 	}
 
-	prev, err := mst.atIndex(index - 1)
+	prev, err := mst.atIndex(ctx, index-1)
 	if err != nil {
 		return nil, err
 	}
@@ -501,18 +501,18 @@ func (mst *MerkleSearchTree) deleteRecurse(ctx context.Context, k string) (*Merk
 		return nil, err
 	}
 
-	found, err := mst.atIndex(ix)
+	found, err := mst.atIndex(ctx, ix)
 	if err != nil {
 		return nil, err
 	}
 
 	if found.isLeaf() && found.Key == k {
-		prev, err := mst.atIndex(ix - 1)
+		prev, err := mst.atIndex(ctx, ix-1)
 		if err != nil {
 			return nil, err
 		}
 
-		next, err := mst.atIndex(ix + 1)
+		next, err := mst.atIndex(ctx, ix+1)
 		if err != nil {
 			return nil, err
 		}
@@ -531,7 +531,7 @@ func (mst *MerkleSearchTree) deleteRecurse(ctx context.Context, k string) (*Merk
 		return mst.removeEntry(ctx, ix)
 	}
 
-	prev, err := mst.atIndex(ix - 1)
+	prev, err := mst.atIndex(ctx, ix-1)
 	if err != nil {
 		return nil, err
 	}
@@ -615,8 +615,8 @@ func (mst *MerkleSearchTree) prepend(ctx context.Context, ent nodeEntry) (*Merkl
 	return mst.newTree(nents), nil
 }
 
-func (mst *MerkleSearchTree) atIndex(ix int) (nodeEntry, error) {
-	entries, err := mst.getEntries(context.TODO())
+func (mst *MerkleSearchTree) atIndex(ctx context.Context, ix int) (nodeEntry, error) {
+	entries, err := mst.getEntries(ctx)
 	if err != nil {
 		return nodeEntry{}, err
 	}
@@ -732,18 +732,18 @@ func (mst *MerkleSearchTree) splitAround(ctx context.Context, key string) (*Merk
 		}
 	}
 
-	if left.entryCount() == 0 {
+	if left.entryCount(ctx) == 0 {
 		left = nil
 	}
-	if right.entryCount() == 0 {
+	if right.entryCount(ctx) == 0 {
 		right = nil
 	}
 
 	return left, right, nil
 }
 
-func (mst *MerkleSearchTree) entryCount() int {
-	entries, err := mst.getEntries(context.TODO())
+func (mst *MerkleSearchTree) entryCount(ctx context.Context) int {
+	entries, err := mst.getEntries(ctx)
 	if err != nil {
 		panic(err)
 	}

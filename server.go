@@ -12,12 +12,16 @@ import (
 	"github.com/fil-forge/versitygw/s3api/middlewares"
 	"github.com/fil-forge/versitygw/s3event"
 	"github.com/fil-forge/versitygw/s3log"
+	"github.com/gofiber/fiber/v3"
 	"github.com/multiformats/go-multihash"
 	"go.uber.org/zap"
 
 	"github.com/fil-forge/ingot/blockstore"
 	msbucket "github.com/fil-forge/ingot/bucket"
+	"github.com/fil-forge/ingot/bucketauthority"
 	"github.com/fil-forge/ingot/config"
+	"github.com/fil-forge/ingot/internal/fasthttputil"
+	"github.com/fil-forge/ingot/internal/reqscope"
 	"github.com/fil-forge/ingot/logstore"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/s3frontend"
@@ -47,6 +51,9 @@ type ServerDeps struct {
 	// are no-ops and reads are served from the local spool.
 	BodyUploader uploader.BodyUploader
 	Remover      uploader.BlobRemover
+
+	// Authority is the service that authorizes bucket creation and deletion.
+	Authority bucketauthority.BucketAuthority
 
 	// Registry tracks per-bucket roots. *registry.Postgres satisfies
 	// both Registry and Meta in production; tests can supply two
@@ -129,6 +136,7 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 
 	bs := blockstore.NewLayered(spool, log, deps.BaseBlockReader)
 	backend := s3frontend.New(s3frontend.Deps{
+		Authority:   deps.Authority,
 		Registry:    deps.Registry,
 		Intents:     deps.Intents,
 		Locations:   deps.Locations,
@@ -257,11 +265,10 @@ func newBucketFlushFunc(up uploader.Uploader, reg registry.Registry, bucket stri
 // buildS3API constructs the versitygw S3ApiServer with the wiring ingot
 // needs: no audit / event sinks, generous concurrency limits. Non-root
 // access keys authenticate through iam when provided (the root account is
-// checked before the IAM lookup either way); with a nil iam the gateway
-// only knows the single root account.
+// checked before the IAM lookup either way).
 func buildS3API(ctx context.Context, backend *s3frontend.Backend, cfg config.ServerConfig, iam auth.IAMService) (*s3api.S3ApiServer, error) {
 	if iam == nil {
-		return nil, fmt.Errorf("ingot: buildS3API: IAMService is required")
+		return nil, fmt.Errorf("ingot: IAMService is required")
 	}
 	loggers, err := s3log.InitLogger(&s3log.LogConfig{})
 	if err != nil {
@@ -285,6 +292,15 @@ func buildS3API(ctx context.Context, backend *s3frontend.Backend, cfg config.Ser
 		// Without this the part-number ceiling defaults to 0 and every
 		// UploadPart is rejected. 10000 is the S3 maximum.
 		s3api.WithMpMaxParts(10000),
+		// Stash the signed S3 request on the context for every request. The
+		// bucket-authority seam (Create/Delete/ListBuckets) recovers it to
+		// forward to Hilt; doing it here — ahead of auth — covers all auth
+		// paths (root included), not just the Hilt-backed IAM lookup, so a
+		// root request can still drive bucket operations.
+		s3api.WithMiddleware("/", func(c fiber.Ctx) error {
+			c.Locals(reqscope.RequestKey(), fasthttputil.RequestFromHTTPContext(c.RequestCtx()))
+			return c.Next()
+		}),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("ingot: s3api: %w", err)

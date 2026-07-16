@@ -77,7 +77,7 @@ func TestForgeShipProofsRequestScopeWins(t *testing.T) {
 	// A request-scoped store on the context takes precedence over the
 	// captured fallback (the in-request write path).
 	scoped := ucanlib.ProofStore(tokenstore.NewMemStore())
-	ctx := context.WithValue(context.Background(), reqscope.Key, scoped)
+	ctx := context.WithValue(context.Background(), reqscope.ProofStoreKey(), scoped)
 
 	got, ok := fg.shipProofStore(ctx, space)
 	require.True(t, ok)

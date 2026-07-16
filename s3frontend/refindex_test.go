@@ -71,6 +71,7 @@ func newRefTestBackend(t *testing.T, maxBlob ...int64) (*Backend, *inmem.MemStor
 
 	rm := &recordingRemover{}
 	b := New(Deps{
+		Authority:   mem,
 		Registry:    mem,
 		Intents:     mem,
 		Locations:   mem,
@@ -83,7 +84,7 @@ func newRefTestBackend(t *testing.T, maxBlob ...int64) (*Backend, *inmem.MemStor
 		Remover:     rm,
 		MaxBlobSize: mbs,
 	})
-	if err := mem.Create(ctx, "bk"); err != nil {
+	if err := mem.Create(ctx, "bk", did.Undef); err != nil {
 		t.Fatalf("create bucket: %v", err)
 	}
 	return b, mem, rm

@@ -2,27 +2,33 @@ package inmem
 
 import (
 	"context"
+	"net/http"
 	"testing"
 
-	"github.com/fil-forge/ingot/registry"
+	s3 "github.com/fil-forge/libforge/commands/s3"
+	"github.com/fil-forge/libforge/commands/s3/bucket"
+	"github.com/fil-forge/libforge/testutil"
 )
 
-// TestMemStoreListPagination covers the local pagination semantics: prefix
-// filter, resume-after-token, max truncation (with the token set to the last
-// included name), and the empty token on a complete listing.
-func TestMemStoreListPagination(t *testing.T) {
+// TestMemStoreListBucketsPagination covers the local pagination semantics of
+// the BucketAuthority ListBuckets seam: prefix filter, resume-after-token, max
+// truncation (with the token set to the last included name), and the empty
+// token on a complete listing. The options ride as query parameters on the
+// (signed) request URL, which is what MemStore reads.
+func TestMemStoreListBucketsPagination(t *testing.T) {
 	ctx := context.Background()
 	m := NewMemStore()
 	for _, name := range []string{"apple", "apricot", "banana", "cherry"} {
-		if err := m.Create(ctx, name); err != nil {
+		space := testutil.RandomDID(t)
+		if err := m.Create(ctx, name, space); err != nil {
 			t.Fatalf("Create %q: %v", name, err)
 		}
 	}
 
-	names := func(p *registry.Page) []string {
+	names := func(p *bucket.ListOK) []string {
 		out := make([]string, 0, len(p.Buckets))
-		for _, st := range p.Buckets {
-			out = append(out, st.Name)
+		for _, b := range p.Buckets {
+			out = append(out, b.Name)
 		}
 		return out
 	}
@@ -38,10 +44,16 @@ func TestMemStoreListPagination(t *testing.T) {
 		return true
 	}
 
+	// listReq builds a ListBuckets request whose options ride as query
+	// parameters on the URL (MemStore parses them straight off req.URL).
+	listReq := func(query string) s3.Request {
+		return s3.Request{Method: http.MethodGet, URL: "/" + query}
+	}
+
 	t.Run("full listing, no cap", func(t *testing.T) {
-		page, err := m.List(ctx, registry.ListOptions{})
+		page, err := m.ListBuckets(ctx, listReq(""))
 		if err != nil {
-			t.Fatalf("List: %v", err)
+			t.Fatalf("ListBuckets: %v", err)
 		}
 		if got := names(page); !equal(got, []string{"apple", "apricot", "banana", "cherry"}) {
 			t.Fatalf("buckets = %v", got)
@@ -52,9 +64,9 @@ func TestMemStoreListPagination(t *testing.T) {
 	})
 
 	t.Run("prefix filter", func(t *testing.T) {
-		page, err := m.List(ctx, registry.ListOptions{Prefix: "ap"})
+		page, err := m.ListBuckets(ctx, listReq("?prefix=ap"))
 		if err != nil {
-			t.Fatalf("List: %v", err)
+			t.Fatalf("ListBuckets: %v", err)
 		}
 		if got := names(page); !equal(got, []string{"apple", "apricot"}) {
 			t.Fatalf("buckets = %v", got)
@@ -62,9 +74,9 @@ func TestMemStoreListPagination(t *testing.T) {
 	})
 
 	t.Run("max truncates and sets token", func(t *testing.T) {
-		page, err := m.List(ctx, registry.ListOptions{Max: 2})
+		page, err := m.ListBuckets(ctx, listReq("?max-buckets=2"))
 		if err != nil {
-			t.Fatalf("List: %v", err)
+			t.Fatalf("ListBuckets: %v", err)
 		}
 		if got := names(page); !equal(got, []string{"apple", "apricot"}) {
 			t.Fatalf("buckets = %v", got)
@@ -75,9 +87,9 @@ func TestMemStoreListPagination(t *testing.T) {
 	})
 
 	t.Run("token resumes strictly after", func(t *testing.T) {
-		page, err := m.List(ctx, registry.ListOptions{ContinuationToken: "apricot", Max: 2})
+		page, err := m.ListBuckets(ctx, listReq("?continuation-token=apricot&max-buckets=2"))
 		if err != nil {
-			t.Fatalf("List: %v", err)
+			t.Fatalf("ListBuckets: %v", err)
 		}
 		if got := names(page); !equal(got, []string{"banana", "cherry"}) {
 			t.Fatalf("buckets = %v", got)

@@ -1,6 +1,7 @@
 package iam
 
 import (
+	"path"
 	"time"
 
 	s3 "github.com/fil-forge/libforge/commands/s3"
@@ -36,14 +37,14 @@ func (k *VerificationKeyCache) Put(access string, ttl time.Duration, keys ...s3.
 		if len(key.Data) == 0 {
 			continue
 		}
-		k.data.Set(access+"/"+key.Kind, key.Data, ttl)
+		k.data.Set(path.Join(access, key.Kind), key.Data, ttl)
 	}
 }
 
 // Get returns the cached key bytes for (access, kind), if present and
 // unexpired.
 func (k *VerificationKeyCache) Get(access, kind string) ([]byte, bool) {
-	v, ok := k.data.Get(access + "/" + kind)
+	v, ok := k.data.Get(path.Join(access, kind))
 	if !ok {
 		return nil, false
 	}

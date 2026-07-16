@@ -56,6 +56,7 @@ import (
 
 	hiltclient "github.com/fil-forge/hilt/pkg/client"
 	"github.com/fil-forge/ingot/blockstore"
+	"github.com/fil-forge/ingot/bucketauthority"
 	"github.com/fil-forge/ingot/config"
 	"github.com/fil-forge/ingot/forgeclient"
 	"github.com/fil-forge/ingot/iam"
@@ -106,6 +107,7 @@ func Module(cfg config.Config) fx.Option {
 			provideMigrationHook,
 			provideKeyProofs,
 			provideIAMService,
+			fx.Annotate(bucketauthority.New, fx.As(new(bucketauthority.BucketAuthority))),
 		),
 		ServerModule,
 	}
@@ -129,19 +131,20 @@ var ServerModule = fx.Module("ingot-server",
 type serverParams struct {
 	fx.In
 
-	Config       config.ServerConfig
-	Logger       *zap.Logger
-	Reader       blockstore.BlockReader
-	Uploader     uploader.Uploader
-	BodyUploader uploader.BodyUploader
-	Remover      uploader.BlobRemover
-	Registry     registry.Registry
-	Intents      registry.IntentStore
-	Locations    registry.LocationStore
-	BlobRefs     registry.BlobRefStore
-	GC           registry.GCStore
-	Multipart    registry.MultipartStore
-	Meta         logstore.Meta
+	Config          config.ServerConfig
+	Logger          *zap.Logger
+	Reader          blockstore.BlockReader
+	Uploader        uploader.Uploader
+	BodyUploader    uploader.BodyUploader
+	Remover         uploader.BlobRemover
+	BucketAuthority bucketauthority.BucketAuthority
+	Registry        registry.Registry
+	Intents         registry.IntentStore
+	Locations       registry.LocationStore
+	BlobRefs        registry.BlobRefStore
+	GC              registry.GCStore
+	Multipart       registry.MultipartStore
+	Meta            logstore.Meta
 	// IAM authenticates non-root access keys.
 	IAM       auth.IAMService `optional:"true"`
 	PreStarts []PreStartHook  `group:"ingot_prestart"`
@@ -174,6 +177,7 @@ func registerServerLifecycle(lc fx.Lifecycle, p serverParams) {
 				Uploader:        p.Uploader,
 				BodyUploader:    p.BodyUploader,
 				Remover:         p.Remover,
+				Authority:       p.BucketAuthority,
 				Registry:        p.Registry,
 				Intents:         p.Intents,
 				Locations:       p.Locations,
@@ -304,8 +308,8 @@ type registryResult struct {
 // candidate log (GCStore), and segment metadata (Meta). The hilt client is
 // required: bucket create/delete/list are forwarded to Hilt, so forge mode
 // needs hilt_url/hilt_did configured.
-func provideRegistry(pool *pgxpool.Pool, hilt *hiltclient.Client) registryResult {
-	pg := registry.NewPostgres(pool, hilt)
+func provideRegistry(pool *pgxpool.Pool) registryResult {
+	pg := registry.NewPostgres(pool)
 	return registryResult{Registry: pg, Intents: pg, Locations: pg, BlobRefs: pg, GC: pg, Multipart: pg, Meta: pg}
 }
 

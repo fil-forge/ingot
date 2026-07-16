@@ -1,12 +1,14 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/spf13/viper"
+	"go.uber.org/multierr"
 )
 
 // Config is ingot's own configuration.
@@ -177,7 +179,7 @@ type IdentityConfig struct {
 // Load reads daemon config from configFile (or the default search path)
 // with env override (INGOT_* / nested keys via "_").
 func Load(configFile string) (*Config, error) {
-	v := viper.New()
+	v := viper.GetViper()
 	setDefaults(v)
 	v.SetEnvPrefix("INGOT")
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
@@ -213,52 +215,50 @@ func Load(configFile string) (*Config, error) {
 func setDefaults(v *viper.Viper) {
 	v.SetDefault("log_level", "info")
 	v.SetDefault("addr", "0.0.0.0:9000")
-	v.SetDefault("region", "us-east-1")
-	v.SetDefault("data_dir", "/data")
 }
 
 // Validate checks the config for the selected mode, aggregating every
 // problem into one error.
 func (c *Config) Validate() error {
-	var errs []string
+	var errs error
 
 	if c.Addr == "" {
-		errs = append(errs, "addr is required")
+		errs = multierr.Append(errs, errors.New("addr is required"))
 	}
 	if c.DataDir == "" {
-		errs = append(errs, "data_dir is required")
+		errs = multierr.Append(errs, errors.New("data_dir is required"))
 	}
 	if c.RootAccess == "" || c.RootSecret == "" {
-		errs = append(errs, "root_access and root_secret (S3 root credentials) are required")
+		errs = multierr.Append(errs, errors.New("root_access and root_secret (S3 root credentials) are required"))
 	}
 	if _, err := c.ServerConfig(); err != nil {
-		errs = append(errs, err.Error())
+		errs = multierr.Append(errs, err)
 	}
 
 	if c.PostgresDSN == "" {
-		errs = append(errs, "postgres_dsn is required")
+		errs = multierr.Append(errs, errors.New("postgres_dsn is required"))
 	}
 	if c.Identity.KeyFile == "" {
-		errs = append(errs, "identity.key_file (agent PEM) is required")
+		errs = multierr.Append(errs, errors.New("identity.key_file (agent PEM) is required"))
 	} else if _, err := os.Stat(c.Identity.KeyFile); err != nil {
-		errs = append(errs, fmt.Sprintf("identity.key_file %q: %v", c.Identity.KeyFile, err))
+		errs = multierr.Append(errs, fmt.Errorf("identity.key_file %q: %w", c.Identity.KeyFile, err))
 	}
 	if c.UploadServiceURL == "" || c.UploadServiceDID == "" {
-		errs = append(errs, "upload_service_url and upload_service_did are required")
+		errs = multierr.Append(errs, errors.New("upload_service_url and upload_service_did are required"))
 	}
 	if c.AuthServiceURL == "" || c.AuthServiceDID == "" {
-		errs = append(errs, "auth_service_url and auth_service_did are required")
+		errs = multierr.Append(errs, errors.New("auth_service_url and auth_service_did are required"))
 	}
 	if c.AuthServiceProofs != "" {
 		// Load eagerly so a bad path or encoding fails at startup rather than
 		// on the first authorized request.
 		if _, err := LoadProofsContainer(c.AuthServiceProofs); err != nil {
-			errs = append(errs, fmt.Sprintf("auth_service_proofs: %v", err))
+			errs = multierr.Append(errs, fmt.Errorf("auth_service_proofs: %w", err))
 		}
 	}
 
-	if len(errs) > 0 {
-		return fmt.Errorf("invalid config:\n  - %s", strings.Join(errs, "\n  - "))
+	if errs != nil {
+		return fmt.Errorf("invalid config: %w", errs)
 	}
 	return nil
 }

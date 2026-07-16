@@ -44,17 +44,10 @@ type Page struct {
 type Registry interface {
 	// Create inserts a new bucket, stamping its creation time. Returns
 	// ErrExists if name is taken.
-	Create(ctx context.Context, name string) error
+	Create(ctx context.Context, name string, space did.DID) error
 
 	// Get returns the state of a bucket, or ErrNotFound.
 	Get(ctx context.Context, name string) (*State, error)
-
-	// List returns one page of buckets. A Hilt-backed implementation
-	// derives the pagination parameters from the original signed S3
-	// request in ctx (Hilt is authoritative for which buckets exist); a
-	// local implementation applies opts directly. Both views are parsed
-	// from the same request, so they agree.
-	List(ctx context.Context, opts ListOptions) (*Page, error)
 
 	// Delete removes a bucket. Returns ErrNotFound if absent.
 	Delete(ctx context.Context, name string) error

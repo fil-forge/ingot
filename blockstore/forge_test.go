@@ -84,7 +84,7 @@ func TestForgeRetrieveWithoutAuthority(t *testing.T) {
 	t.Run("empty scoped store", func(t *testing.T) {
 		// A store is present but holds no chain for the space — an auth gap,
 		// distinct from the no-store case above.
-		ctx := context.WithValue(context.Background(), reqscope.Key,
+		ctx := context.WithValue(context.Background(), reqscope.ProofStoreKey(),
 			ucanlib.ProofStore(ucanlib.NewContainerProofStore(container.New())))
 		_, err := f.GetBlock(ctx, space, blk)
 		if err == nil || !strings.Contains(err.Error(), "no retrieval authority") {

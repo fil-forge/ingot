@@ -54,9 +54,7 @@ func TestPostgresStores_Live(t *testing.T) {
 		t.Fatalf("truncate: %v", err)
 	}
 
-	// Create/Delete/List forward to Hilt, so this hilt-less live test seeds
-	// bucket rows with direct INSERTs and exercises only the local methods.
-	r := registry.NewPostgres(pool, nil)
+	r := registry.NewPostgres(pool)
 	seedBucket := func(t *testing.T, name string) {
 		t.Helper()
 		// space has no default (Create always supplies the DID Hilt

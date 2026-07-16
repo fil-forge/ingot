@@ -27,6 +27,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/fil-forge/ingot/blockstore"
+	"github.com/fil-forge/ingot/bucketauthority"
 	"github.com/fil-forge/ingot/bucketop"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/uploader"
@@ -40,6 +41,7 @@ type Backend struct {
 	backend.BackendUnsupported
 
 	read      blockstore.ReadStore
+	authority bucketauthority.BucketAuthority
 	reg       registry.Registry
 	intents   registry.IntentStore
 	locations registry.LocationStore
@@ -58,6 +60,7 @@ type Backend struct {
 
 // Deps wires a Backend over ingot's domain primitives.
 type Deps struct {
+	Authority bucketauthority.BucketAuthority
 	// Registry tracks per-bucket roots; IntentStore tracks the local spool's
 	// upload_intents lifecycle; LocationStore records where each accepted body
 	// blob can be retrieved from. Production passes one *registry.Postgres for
@@ -106,6 +109,7 @@ func New(d Deps) *Backend {
 		logger = zap.NewNop()
 	}
 	return &Backend{
+		authority:   d.Authority,
 		read:        d.Reads,
 		reg:         d.Registry,
 		intents:     d.Intents,

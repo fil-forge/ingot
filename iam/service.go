@@ -22,7 +22,7 @@
 // doesn't yet reach the root.
 //
 // Every request stashes its key's store on the request context
-// ([reqscope.Key]) so an onward Forge retrieval — which sees only ctx +
+// ([reqscope.ProofStoreKey]) so an onward Forge retrieval — which sees only ctx +
 // space — authorizes with THIS access key's chain, never another's.
 //
 // A local fast path (the RFC's "local cache" authorization) avoids the Hilt
@@ -158,6 +158,7 @@ func (s *Service) GetUserAccountForRequest(ctx fiber.Ctx, accessKeyStr string) (
 	// so the Hilt round-trip is bounded by the request's lifetime.
 	reqCtx := ctx.RequestCtx()
 	req := fasthttputil.RequestFromHTTPContext(reqCtx)
+	ctx.Locals(reqscope.RequestKey(), req)
 
 	// Scope this key's proof store onto the request so an onward Forge
 	// retrieval (blockstore.Forge, which has only ctx + space) uses THIS
@@ -165,7 +166,7 @@ func (s *Service) GetUserAccountForRequest(ctx fiber.Ctx, accessKeyStr string) (
 	// regardless of authorization outcome — harmless if the request later
 	// fails, and needed whichever path authorizes.
 	store := s.proofs.For(accessKeyID)
-	ctx.Locals(reqscope.Key, ucanlib.ProofStore(store))
+	ctx.Locals(reqscope.ProofStoreKey(), ucanlib.ProofStore(store))
 
 	// Local fast path: with a cached verification key and cached delegation
 	// chains covering the request's Forge commands, Hilt is not consulted.

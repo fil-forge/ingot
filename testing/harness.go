@@ -15,6 +15,7 @@ import (
 
 	"github.com/fil-forge/ingot"
 	"github.com/fil-forge/ingot/blockstore"
+	"github.com/fil-forge/ingot/bucketauthority"
 	"github.com/fil-forge/ingot/config"
 	"github.com/fil-forge/ingot/inmem"
 	"github.com/fil-forge/ingot/logstore"
@@ -172,13 +173,19 @@ func StartHarness(ctx context.Context, opts ...HarnessOption) (*Harness, error) 
 			fx.Annotate(func() *inmem.MemStore { return mem }, fx.As(new(registry.GCStore))),
 			fx.Annotate(func() *inmem.MemStore { return mem }, fx.As(new(registry.MultipartStore))),
 			fx.Annotate(func() *inmem.MemStore { return mem }, fx.As(new(logstore.Meta))),
+			// MemStore also satisfies bucketauthority.BucketAuthority (its
+			// CreateBucket/DeleteBucket/ListBuckets seam), standing in for the
+			// Hilt-backed *bucketauthority.Service production wires.
+			fx.Annotate(func() *inmem.MemStore { return mem }, fx.As(new(bucketauthority.BucketAuthority))),
 			fx.Annotate(func() inmem.NopBaseReader { return inmem.NopBaseReader{} }, fx.As(new(blockstore.BlockReader))),
 			fx.Annotate(func() inmem.NopUploader { return inmem.NopUploader{} }, fx.As(new(uploader.Uploader))),
 			fx.Annotate(func() inmem.NopUploader { return inmem.NopUploader{} }, fx.As(new(uploader.BodyUploader))),
 			fx.Annotate(func() inmem.NopUploader { return inmem.NopUploader{} }, fx.As(new(uploader.BlobRemover))),
 			// The server requires an IAM service; the harness authenticates
 			// everything as the root account, so the single-account service
-			// (root only, no external authorizer) preserves that behavior.
+			// (root only, no external authorizer) preserves that behavior. The
+			// signed request the bucketauthority seam needs is stashed by a
+			// server-side middleware (buildS3API), independent of this path.
 			func() auth.IAMService {
 				return auth.NewIAMServiceSingle(auth.Account{
 					Access: options.accessKey,
