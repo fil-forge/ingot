@@ -173,8 +173,8 @@ github.com/fil-forge/libforge v0.0.0-20260713100115-a3aa293b990c h1:ElgAxd+08Qif
 github.com/fil-forge/libforge v0.0.0-20260713100115-a3aa293b990c/go.mod h1:0kXihIQ4L2uZ00nR5XrZ/Y8Db7Ht/qQNuiWslwMJ95M=
 github.com/fil-forge/ucantone v0.0.0-20260706102443-79141c5cc52e h1:di/SseJVEO6bznSH/UEnAE2nSwwp/gqgnPLgE9/x2Zg=
 github.com/fil-forge/ucantone v0.0.0-20260706102443-79141c5cc52e/go.mod h1:oFY5BfD0bDeodGlbBHh3/nK99MAS93rGXjoQz7s5qgE=
-github.com/fil-forge/versitygw v0.0.0-20260707081002-05ded0296fd1 h1:SCDYWkNVYg9Qt8DeSyLKL8DJWTS4HkFcU2qTBoWPSWE=
-github.com/fil-forge/versitygw v0.0.0-20260707081002-05ded0296fd1/go.mod h1:t73Wa2xqpT0NdY+SzRZDiO+tQD13b3UEZRoe2wYFiIE=
+github.com/fil-forge/versitygw v0.0.0-20260716095011-7a65883d595a h1:lDwnNmF4LNbevx/YYNCC0CazMiL4eIe38MvfqbRR3RA=
+github.com/fil-forge/versitygw v0.0.0-20260716095011-7a65883d595a/go.mod h1:t73Wa2xqpT0NdY+SzRZDiO+tQD13b3UEZRoe2wYFiIE=
 github.com/frankban/quicktest v1.14.6 h1:7Xjx+VpznH+oBnejlPUj8oUpdxnVs4f8XU8WnHkI4W8=
 github.com/frankban/quicktest v1.14.6/go.mod h1:4ptaffx2x8+WTWXmUCuVU6aPUX1/Mz7zb5vbUoiM6w0=
 github.com/fsnotify/fsnotify v1.4.9/go.mod h1:znqG4EE+3YCdAaPaxE2ZRY/06pZUdp0tY4IgpuI1SZQ=

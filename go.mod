@@ -11,7 +11,7 @@ require (
 	github.com/fil-forge/indexing-service v1.13.5-0.20260619142411-efe3f5fab717
 	github.com/fil-forge/libforge v0.0.0-20260713100115-a3aa293b990c
 	github.com/fil-forge/ucantone v0.0.0-20260706102443-79141c5cc52e
-	github.com/fil-forge/versitygw v0.0.0-20260707081002-05ded0296fd1
+	github.com/fil-forge/versitygw v0.0.0-20260716095011-7a65883d595a
 	github.com/fxamacker/cbor/v2 v2.9.2
 	github.com/go-jose/go-jose/v4 v4.1.4
 	github.com/gofiber/fiber/v3 v3.3.0
