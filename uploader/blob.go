@@ -89,13 +89,13 @@ type ParkedBlobState = forgeclient.ParkedBlob
 
 // DeferredBodyUploader is the decomposed BodyUploader for multipart's
 // deferred accept: UploadBlobParked makes the bytes durable (parked) at
-// UploadPart; ConcludeBlob triggers accept at Complete; UnallocateBlob
+// UploadPart; ConcludeBlob triggers accept at Complete; AbortBlob
 // abandons a parked blob at Abort. Exactly one of UploadBlobParked's returns
 // is non-nil — an already-accepted (deduped) blob completes immediately.
 type DeferredBodyUploader interface {
 	UploadBlobParked(ctx context.Context, digest multihash.Multihash, size int64, localPath string) (*ParkedBlobState, *BlobLocation, error)
 	ConcludeBlob(ctx context.Context, parked ParkedBlobState) (BlobLocation, error)
-	UnallocateBlob(ctx context.Context, digest multihash.Multihash, cause cid.Cid) error
+	AbortBlob(ctx context.Context, digest multihash.Multihash, cause cid.Cid) error
 }
 
 // UploadBlobParked makes one spooled blob durable on the provider WITHOUT
@@ -137,18 +137,18 @@ func (u *Forge) ConcludeBlob(ctx context.Context, parked ParkedBlobState) (BlobL
 	return locationOf(added)
 }
 
-// UnallocateBlob abandons a parked blob via /blob/unallocate on the upload
+// AbortBlob abandons a parked blob via /blob/abort on the upload
 // service: sprue recovers the provider from the cause receipt chain and the
 // node releases the allocation + parked bytes. cause is the parked blob's
 // AddTask. Errors are logged here (callers treat abort cleanup as
 // best-effort and may discard them).
-func (u *Forge) UnallocateBlob(ctx context.Context, digest multihash.Multihash, cause cid.Cid) error {
-	u.logger.Info("blob unallocate",
+func (u *Forge) AbortBlob(ctx context.Context, digest multihash.Multihash, cause cid.Cid) error {
+	u.logger.Info("blob abort",
 		zap.Stringer("space", u.space),
 		zap.String("digest", digestutil.Format(digest)),
 	)
-	if err := u.client.BlobUnallocate(ctx, digest, u.space, cause); err != nil {
-		u.logger.Error("blob unallocate failed",
+	if err := u.client.BlobAbort(ctx, digest, u.space, cause); err != nil {
+		u.logger.Error("blob abort failed",
 			zap.Stringer("space", u.space),
 			zap.String("digest", digestutil.Format(digest)),
 			zap.Error(err),

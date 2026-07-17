@@ -390,10 +390,10 @@ func provideUploader(c *forgeclient.Client, space spaceIssuer, logger *zap.Logge
 // holds a /blob/add chain for the agent (idempotent across restarts).
 func seedSpaceDelegations(ctx context.Context, spaceIssuer ucan.Issuer, agent did.DID, store tokenstore.Store, logger *zap.Logger) error {
 	space := spaceIssuer.DID()
-	// Sentinel on /blob/unallocate: the newest cap in the list — a store
+	// Sentinel on /blob/abort: the newest cap in the list — a store
 	// missing it was seeded by an older build and re-seeds here
 	// (AddDelegations is additive, so re-seeding the earlier caps is harmless).
-	if proofs, _, err := store.ProofChain(ctx, agent, blobcmds.Unallocate.Command, space); err == nil && len(proofs) > 0 {
+	if proofs, _, err := store.ProofChain(ctx, agent, blobcmds.Abort.Command, space); err == nil && len(proofs) > 0 {
 		return nil // already seeded (or login-provisioned)
 	}
 	// The edge-client flow needs space->agent authority over: /blob/add (the
@@ -412,8 +412,8 @@ func seedSpaceDelegations(ctx context.Context, spaceIssuer ucan.Issuer, agent di
 		{"/blob/remove", func() (ucan.Delegation, error) {
 			return blobcmds.Remove.Delegate(spaceIssuer, agent, space, delegation.WithNoExpiration())
 		}},
-		{"/blob/unallocate", func() (ucan.Delegation, error) {
-			return blobcmds.Unallocate.Delegate(spaceIssuer, agent, space, delegation.WithNoExpiration())
+		{"/blob/abort", func() (ucan.Delegation, error) {
+			return blobcmds.Abort.Delegate(spaceIssuer, agent, space, delegation.WithNoExpiration())
 		}},
 		{"/blob/allocate", func() (ucan.Delegation, error) {
 			return blobcmds.Allocate.Delegate(spaceIssuer, agent, space, delegation.WithNoExpiration())

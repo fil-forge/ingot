@@ -21,9 +21,9 @@ import (
 // TestForgeDeferredMultipart is the deferred-accept regression gate (§7.2):
 // UploadPart must make each part blob durable on piri WITHOUT accepting it
 // (parked — outside the PDP pipeline), Complete must conclude (accept) every
-// part, and Abort must unwind parked blobs with /blob/unallocate.
+// part, and Abort must unwind parked blobs with /blob/abort → /blob/reject.
 //
-// Requires piri + sprue builds with /blob/remove + /blob/unallocate; the
+// Requires piri + sprue builds with /blob/remove + /blob/abort/reject; the
 // published images predate them, so inject working-tree binaries and skip
 // otherwise (same gate as TestForgeDeleteReleasesNetworkBlob):
 //
@@ -35,7 +35,7 @@ func TestForgeDeferredMultipart(t *testing.T) {
 	piriBin := os.Getenv("ITEST_PIRI_BIN")
 	sprueBin := os.Getenv("ITEST_SPRUE_BIN")
 	if piriBin == "" || sprueBin == "" {
-		t.Skip("requires piri+sprue builds with the /blob/unallocate chain: set ITEST_PIRI_BIN and ITEST_SPRUE_BIN (see test doc comment)")
+		t.Skip("requires piri+sprue builds with the /blob/abort chain: set ITEST_PIRI_BIN and ITEST_SPRUE_BIN (see test doc comment)")
 	}
 
 	ctx := t.Context()
@@ -110,9 +110,9 @@ func TestForgeDeferredMultipart(t *testing.T) {
 		}
 	})
 
-	// AbortUnallocates: an aborted upload's parked blobs are unwound on piri
-	// via /blob/unallocate — never accepted, bytes released.
-	t.Run("AbortUnallocates", func(t *testing.T) {
+	// AbortRejects: an aborted upload's parked blobs are unwound on piri
+	// via /blob/reject — never accepted, bytes released.
+	t.Run("AbortRejects", func(t *testing.T) {
 		const bucket, key = "mp-abort-unalloc", "obj"
 		if _, err := cl.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
 			t.Fatalf("CreateBucket: %v", err)
@@ -139,13 +139,13 @@ func TestForgeDeferredMultipart(t *testing.T) {
 			t.Fatalf("AbortMultipartUpload: %v", err)
 		}
 
-		// The unallocate traversed ingot → sprue → piri, and the blob was
+		// The abort traversed ingot → sprue → piri (as /blob/reject), and the blob was
 		// never accepted.
-		waitForPiriLogLine(t, ctx, s, 60*time.Second, "/blob/unallocate", digest)
+		waitForPiriLogLine(t, ctx, s, 60*time.Second, "/blob/reject", digest)
 		if piriLogHasLine(t, ctx, s, "/blob/accept", digest) {
 			t.Fatalf("aborted part blob %s was accepted — abort/accept exclusivity is broken", digest)
 		}
-		t.Logf("abort unwound parked blob %s via /blob/unallocate", digest)
+		t.Logf("abort unwound parked blob %s via /blob/reject", digest)
 	})
 }
 

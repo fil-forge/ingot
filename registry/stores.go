@@ -148,7 +148,7 @@ type LocationStore interface {
 // conclude, §7.2). AddTask/AcceptTask are the /space/blob/add and
 // /blob/accept task CIDs; PutInvocation is the sealed /http/put invocation
 // whose metadata carries the derived signer keys needed to conclude —
-// sensitive, deleted at conclude/unallocate. Keyed globally by Digest (like
+// sensitive, deleted at conclude/abort. Keyed globally by Digest (like
 // upload_intents: content-addressed dedup shares parks across sessions).
 type BlobPark struct {
 	Digest        []byte

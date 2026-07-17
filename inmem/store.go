@@ -271,7 +271,7 @@ func (NopUploader) ConcludeBlob(_ context.Context, parked uploader.ParkedBlobSta
 	return uploader.BlobLocation{Size: int64(parked.Size)}, nil
 }
 
-func (NopUploader) UnallocateBlob(_ context.Context, _ multihash.Multihash, _ cid.Cid) error {
+func (NopUploader) AbortBlob(_ context.Context, _ multihash.Multihash, _ cid.Cid) error {
 	return nil
 }
 

@@ -95,7 +95,7 @@ type ServerDeps struct {
 	// are no-ops and reads are served from the local spool.
 	BodyUploader uploader.BodyUploader
 	// Deferred is BodyUploader decomposed for multipart's deferred accept:
-	// park at UploadPart, conclude at Complete, unallocate at Abort.
+	// park at UploadPart, conclude at Complete, abort at Abort.
 	Deferred uploader.DeferredBodyUploader
 	Remover  uploader.BlobRemover
 

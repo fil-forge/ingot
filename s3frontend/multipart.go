@@ -121,10 +121,10 @@ func (b *Backend) openSession(ctx context.Context, uploadID string, key *string)
 // (its ordered blob digests, md5, size), and uploads each blob to its
 // provider — PARKED, not accepted: the /http/put conclude that triggers
 // /blob/accept is deferred to Complete, so the bytes are durable but stay
-// out of the PDP pipeline, and an Abort unwinds them with /blob/unallocate
+// out of the PDP pipeline, and an Abort unwinds them with /blob/abort
 // (§7.2). Re-uploading a part number supersedes the prior part; the
 // superseded part's now-unreferenced blobs are dropped from the spool and
-// unallocated. The part ETag is the hex md5 of the part bytes.
+// rejected. The part ETag is the hex md5 of the part bytes.
 func (b *Backend) UploadPart(ctx context.Context, input *s3.UploadPartInput) (*s3.UploadPartOutput, error) {
 	if input.Bucket == nil || input.Key == nil || input.UploadId == nil || input.PartNumber == nil {
 		return nil, s3err.GetAPIError(s3err.ErrInvalidRequest)
@@ -368,7 +368,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 // (single-winner vs Complete), drops it (cascading its parts), and removes the
 // parts' now-unreferenced blobs from the spool — unallocating any that were
 // parked on a provider (an upload ends in exactly one of accept or
-// unallocate). No reference claims were taken (those happen only at
+// abort). No reference claims were taken (those happen only at
 // Complete).
 func (b *Backend) AbortMultipartUpload(ctx context.Context, input *s3.AbortMultipartUploadInput) error {
 	if input.UploadId == nil {
@@ -451,13 +451,13 @@ func (b *Backend) cleanupPartBlobs(ctx context.Context, uploadID string, digests
 			continue
 		}
 		// A parked blob is durable on its provider — release it there too
-		// (best-effort; piri's unallocate is idempotent, a straggler is
+		// (best-effort; the reject on piri is idempotent, a straggler is
 		// FIL-625's to reap). Cause is the /space/blob/add task link the
 		// upload service needs to locate the provider.
 		if state == registry.IntentParked {
 			if park, err := b.parks.GetPark(ctx, d); err == nil {
 				if cause, err := cid.Cast(park.AddTask); err == nil {
-					_ = b.deferred.UnallocateBlob(ctx, mh.Multihash(d), cause)
+					_ = b.deferred.AbortBlob(ctx, mh.Multihash(d), cause)
 				}
 				_ = b.parks.DeletePark(ctx, d)
 			}

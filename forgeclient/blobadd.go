@@ -84,19 +84,19 @@ type AddedBlob struct {
 // uploaded (durable on the provider) but not yet concluded — piri holds the
 // bytes without aggregating them until /blob/accept fires. Persist it and
 // finish the upload later with [Client.BlobConclude], or abandon it with
-// [Client.BlobUnallocate] (AddTask is the unallocate Cause).
+// [Client.BlobAbort] (AddTask is the abort Cause).
 type ParkedBlob struct {
 	Digest multihash.Multihash
 	Size   uint64
 	// AddTask is the /space/blob/add task link — the receipt-chain root the
-	// upload service uses to locate the provider for unallocate.
+	// upload service uses to locate the provider for abort.
 	AddTask cid.Cid
 	// AcceptTask is the /blob/accept task link BlobConclude polls.
 	AcceptTask cid.Cid
 	// PutInvocation is the sealed /http/put invocation. Its metadata embeds
 	// the derived signer keys needed to synthesize the put receipt at
 	// conclude time — treat it as sensitive and delete it once concluded or
-	// unallocated.
+	// rejected.
 	PutInvocation []byte
 }
 
