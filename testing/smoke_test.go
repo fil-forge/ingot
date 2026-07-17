@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/versity/versitygw/tests/integration"
+	"github.com/fil-forge/versitygw/tests/integration"
 	"go.uber.org/zap/zaptest"
 )
 

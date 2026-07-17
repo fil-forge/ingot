@@ -3,50 +3,56 @@ package s3frontend
 import (
 	"context"
 	"errors"
-	"sort"
+	"fmt"
 	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/fil-forge/versitygw/s3err"
+	"github.com/fil-forge/versitygw/s3response"
 	"github.com/ipfs/go-cid"
-	"github.com/versity/versitygw/s3err"
-	"github.com/versity/versitygw/s3response"
+	"go.uber.org/zap"
 
+	"github.com/fil-forge/ingot/bucketauthority"
+	"github.com/fil-forge/ingot/internal/reqscope"
 	"github.com/fil-forge/ingot/mst"
 	"github.com/fil-forge/ingot/registry"
 )
 
 func (b *Backend) ListBuckets(ctx context.Context, input s3response.ListBucketsInput) (s3response.ListAllMyBucketsResult, error) {
-	states, err := b.reg.List(ctx)
+	req, ok := reqscope.Request(ctx)
+	if !ok {
+		return s3response.ListAllMyBucketsResult{}, errors.New("s3frontend: create bucket: no request in context")
+	}
+	page, err := b.authority.ListBuckets(ctx, req)
 	if err != nil {
+		if errors.Is(err, bucketauthority.ErrInvalidArgument) {
+			return s3response.ListAllMyBucketsResult{}, s3err.GetAPIError(s3err.ErrInvalidRequest)
+		}
 		return s3response.ListAllMyBucketsResult{}, err
 	}
-	sort.Slice(states, func(i, j int) bool { return states[i].Name < states[j].Name })
 
-	var entries []s3response.ListAllMyBucketsEntry
-	var cToken string
-	for _, st := range states {
-		if input.Prefix != "" && !strings.HasPrefix(st.Name, input.Prefix) {
-			continue
-		}
-		if st.Name <= input.ContinuationToken {
-			continue
-		}
-		if input.MaxBuckets > 0 && int32(len(entries)) == input.MaxBuckets {
-			cToken = entries[len(entries)-1].Name
-			break
+	entries := make([]s3response.ListAllMyBucketsEntry, 0, len(page.Buckets))
+	for _, st := range page.Buckets {
+		creationDate, err := time.Parse(time.RFC3339, st.CreationDate)
+		if err != nil {
+			return s3response.ListAllMyBucketsResult{}, fmt.Errorf("parsing creation date: %w", err)
 		}
 		entries = append(entries, s3response.ListAllMyBucketsEntry{
 			Name:         st.Name,
-			CreationDate: time.Unix(st.CreatedAt, 0),
+			BucketRegion: st.Region,
+			CreationDate: creationDate,
 		})
 	}
 
 	return s3response.ListAllMyBucketsResult{
-		Buckets:           s3response.ListAllMyBucketsList{Bucket: entries},
-		Owner:             s3response.CanonicalUser{ID: input.Owner},
+		Buckets: s3response.ListAllMyBucketsList{Bucket: entries},
+		Owner: s3response.CanonicalUser{
+			ID:          page.Owner.ID,
+			DisplayName: page.Owner.DisplayName,
+		},
 		Prefix:            input.Prefix,
-		ContinuationToken: cToken,
+		ContinuationToken: page.ContinuationToken,
 	}, nil
 }
 
@@ -142,7 +148,18 @@ func (b *Backend) CreateBucket(ctx context.Context, input *s3.CreateBucketInput,
 	if !validBucketName(name) {
 		return s3err.GetAPIError(s3err.ErrInvalidBucketName)
 	}
-	if err := b.reg.Create(ctx, name, time.Now().Unix()); err != nil {
+	req, ok := reqscope.Request(ctx)
+	if !ok {
+		return errors.New("s3frontend: create bucket: no request in context")
+	}
+	id, err := b.authority.CreateBucket(ctx, req)
+	if err != nil {
+		if errors.Is(err, bucketauthority.ErrExists) {
+			return s3err.GetAPIError(s3err.ErrBucketAlreadyExists)
+		}
+		return err
+	}
+	if err := b.reg.Create(ctx, name, id); err != nil {
 		if errors.Is(err, registry.ErrExists) {
 			return s3err.GetAPIError(s3err.ErrBucketAlreadyExists)
 		}
@@ -164,7 +181,7 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 		// S3 forbids deleting non-empty buckets. Walk the MST until
 		// we see any leaf, then bail.
 		if st.Root.Defined() {
-			t := mst.LoadMST(b.read, st.Root)
+			t := mst.LoadMST(b.read, st.Space, st.Root)
 			var seen bool
 			walkErr := t.WalkLeavesFromNocache(ctx, "", func(string, cid.Cid) error {
 				seen = true
@@ -178,11 +195,38 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 			}
 		}
 
+		req, ok := reqscope.Request(ctx)
+		if !ok {
+			return errors.New("s3frontend: delete bucket: no request in context")
+		}
+		if err := b.authority.DeleteBucket(ctx, req); err != nil {
+			if errors.Is(err, bucketauthority.ErrNotFound) {
+				return s3err.GetAPIError(s3err.ErrNoSuchBucket)
+			} else if errors.Is(err, bucketauthority.ErrNotEmpty) {
+				return s3err.GetAPIError(s3err.ErrBucketNotEmpty)
+			}
+			return err
+		}
+
 		if err := b.reg.Delete(ctx, name); err != nil {
 			if errors.Is(err, registry.ErrNotFound) {
 				return s3err.GetAPIError(s3err.ErrNoSuchBucket)
+			} else if errors.Is(err, registry.ErrNotEmpty) {
+				return s3err.GetAPIError(s3err.ErrBucketNotEmpty)
 			}
 			return err
+		}
+
+		// The bucket's segment history dies with it. Best-effort: the
+		// bucket is already deleted, so a cleanup failure must not fail
+		// the API call.
+		if remover, ok := b.log.(interface {
+			RemoveBucketLog(ctx context.Context, bucket string) error
+		}); ok {
+			if rerr := remover.RemoveBucketLog(ctx, name); rerr != nil {
+				b.logger.Warn("bucket log cleanup failed",
+					zap.String("bucket", name), zap.Error(rerr))
+			}
 		}
 		return nil
 	})

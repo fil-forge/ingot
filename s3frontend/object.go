@@ -12,12 +12,13 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/fil-forge/ucantone/did"
+	"github.com/fil-forge/versitygw/backend"
+	"github.com/fil-forge/versitygw/s3api/utils"
+	"github.com/fil-forge/versitygw/s3err"
+	"github.com/fil-forge/versitygw/s3response"
 	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
-	"github.com/versity/versitygw/backend"
-	"github.com/versity/versitygw/s3api/utils"
-	"github.com/versity/versitygw/s3err"
-	"github.com/versity/versitygw/s3response"
 
 	msbucket "github.com/fil-forge/ingot/bucket"
 	"github.com/fil-forge/ingot/bucketop"
@@ -42,7 +43,7 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 	bucketName := *input.Bucket
 	key := *input.Key
 	if !mst.IsValidKey(key) {
-		return s3response.PutObjectOutput{}, s3err.GetAPIError(s3err.ErrInvalidArgument)
+		return s3response.PutObjectOutput{}, s3err.GetAPIError(s3err.ErrInvalidRequest)
 	}
 
 	contentType := backend.GetStringFromPtr(input.ContentType)
@@ -52,7 +53,8 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 
 	// Bucket must exist before we spool + upload, so a PUT to a missing bucket
 	// doesn't waste an upload. WithTx re-checks under the per-bucket lock.
-	if _, err := b.reg.Get(ctx, bucketName); err != nil {
+	bucketState, err := b.reg.Get(ctx, bucketName)
+	if err != nil {
 		if errors.Is(err, registry.ErrNotFound) {
 			return s3response.PutObjectOutput{}, s3err.GetAPIError(s3err.ErrNoSuchBucket)
 		}
@@ -97,7 +99,7 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 	// to local disk → upload each to Forge by digest (allocate→PUT→accept). A
 	// 200 means every body blob is durable and accepted before the manifest
 	// that references it is committed (docs/architecture.md §7.1).
-	bodyRec, err := b.ingestBody(ctx, bucketName, bodyReader)
+	bodyRec, err := b.ingestBody(ctx, bucketState, bodyReader)
 	if err != nil {
 		// A checksum mismatch surfaces as an API error from the HashReader.
 		var apiErr s3err.APIError
@@ -124,19 +126,20 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 	// blob_refs from the committed catalog.
 	err = b.txns.WithTx(ctx, bucketName, func(ctx context.Context, tx *bucketop.Tx) (cid.Cid, error) {
 		mf = &msbucket.ObjectManifest{
-			Key:                key,
-			ContentType:        contentType,
-			Created:            time.Now().Unix(),
-			Body:               bodyRec,
-			ETag:               hex.EncodeToString(bodyRec.MD5),
-			ChecksumAlgorithm:  ckAlgo,
-			Checksum:           ckVal,
-			ContentEncoding:    backend.GetStringFromPtr(input.ContentEncoding),
-			ContentDisposition: backend.GetStringFromPtr(input.ContentDisposition),
-			ContentLanguage:    backend.GetStringFromPtr(input.ContentLanguage),
-			CacheControl:       backend.GetStringFromPtr(input.CacheControl),
-			Expires:            backend.GetStringFromPtr(input.Expires),
-			Metadata:           input.Metadata,
+			Key:                     key,
+			ContentType:             contentType,
+			Created:                 time.Now().Unix(),
+			Body:                    bodyRec,
+			ETag:                    hex.EncodeToString(bodyRec.MD5),
+			ChecksumAlgorithm:       ckAlgo,
+			Checksum:                ckVal,
+			ContentEncoding:         backend.GetStringFromPtr(input.ContentEncoding),
+			ContentDisposition:      backend.GetStringFromPtr(input.ContentDisposition),
+			ContentLanguage:         backend.GetStringFromPtr(input.ContentLanguage),
+			CacheControl:            backend.GetStringFromPtr(input.CacheControl),
+			Expires:                 backend.GetStringFromPtr(input.Expires),
+			WebsiteRedirectLocation: backend.GetStringFromPtr(input.WebsiteRedirectLocation),
+			Metadata:                input.Metadata,
 		}
 		mfCid, err := tx.Put(ctx, mf)
 		if err != nil {
@@ -155,7 +158,7 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 		switch {
 		case gerr == nil:
 			var oldMf msbucket.ObjectManifest
-			if err := tx.Get(ctx, oldCid, &oldMf); err != nil {
+			if err := tx.Get(ctx, tx.State().Space, oldCid, &oldMf); err != nil {
 				return cid.Undef, fmt.Errorf("load prior manifest: %w", err)
 			}
 			oldDigests = bodyDigests(oldMf.Body)
@@ -192,18 +195,18 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 	// Reference index, after the commit is durable: claim the new body's blobs
 	// and release the superseded ones (overwrite). Done post-commit so a commit
 	// failure can never leave blob_refs out of step with the catalog.
-	toRemove, err := b.reconcileClaims(ctx, bucketName, key, oldDigests, bodyDigests(bodyRec))
+	toRemove, err := b.reconcileClaims(ctx, bucketState, key, oldDigests, bodyDigests(bodyRec))
 	if err != nil {
 		return s3response.PutObjectOutput{}, fmt.Errorf("s3frontend: put reconcile: %w", err)
 	}
-	b.releaseBlobs(ctx, toRemove)
+	b.releaseBlobs(ctx, bucketState.Space, toRemove)
 
 	size := mf.Body.Size
 	out := s3response.PutObjectOutput{
 		ETag: etagOf(mf),
 		Size: &size,
 	}
-	out.ChecksumCRC32, out.ChecksumCRC32C, out.ChecksumSHA1, out.ChecksumSHA256, out.ChecksumCRC64NVME, out.ChecksumType = checksumFields(ckAlgo, ckVal)
+	out.ChecksumCRC32, out.ChecksumCRC32C, out.ChecksumSHA1, out.ChecksumSHA256, out.ChecksumCRC64NVME, out.ChecksumSHA512, out.ChecksumMD5, out.ChecksumXXHASH64, out.ChecksumXXHASH3, out.ChecksumXXHASH128, out.ChecksumType = checksumFields(ckAlgo, ckVal)
 	return out, nil
 }
 
@@ -216,12 +219,12 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 // On any error the already-spooled/parked blobs and their intents are left for
 // crash recovery to reconcile (a later phase); no manifest is written, so no
 // catalog entry ever references a non-durable blob.
-func (b *Backend) ingestBody(ctx context.Context, bucket string, r io.Reader) (msbucket.Body, error) {
-	body, err := b.splitSpool(ctx, bucket, r)
+func (b *Backend) ingestBody(ctx context.Context, bucket *registry.State, r io.Reader) (msbucket.Body, error) {
+	body, err := b.splitSpool(ctx, bucket.Name, r)
 	if err != nil {
 		return msbucket.Body{}, err
 	}
-	if err := b.uploadBlobs(ctx, body.Blobs); err != nil {
+	if err := b.uploadBlobs(ctx, bucket.Space, body.Blobs); err != nil {
 		return msbucket.Body{}, err
 	}
 	return body, nil
@@ -267,10 +270,10 @@ func (b *Backend) splitSpool(ctx context.Context, bucket string, r io.Reader) (m
 // guppy's "blob already has location; skip /blob/add". (A crash between accept
 // and the location record could still re-add; that window closes with the
 // deferred upload_intents × blob_locations crash recovery — see §12.)
-func (b *Backend) uploadBlobs(ctx context.Context, blobs []msbucket.BlobRef) error {
+func (b *Backend) uploadBlobs(ctx context.Context, space did.DID, blobs []msbucket.BlobRef) error {
 	for _, blob := range blobs {
 		digest := multihash.Multihash(blob.Digest)
-		if existing, err := b.locations.GetLocation(ctx, b.space, blob.Digest); err == nil && existing != nil {
+		if existing, err := b.locations.GetLocation(ctx, space, blob.Digest); err == nil && existing != nil {
 			// Already durable for this space — advance the intent and move on.
 			if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentAccepted); err != nil {
 				return fmt.Errorf("mark accepted (dedup): %w", err)
@@ -279,7 +282,7 @@ func (b *Backend) uploadBlobs(ctx context.Context, blobs []msbucket.BlobRef) err
 		} else if err != nil && !errors.Is(err, registry.ErrNotFound) {
 			return fmt.Errorf("lookup location: %w", err)
 		}
-		loc, err := b.uploader.UploadBlob(ctx, digest, blob.Length, b.spool.Path(digest))
+		loc, err := b.uploader.UploadBlob(ctx, space, digest, blob.Length, b.spool.Path(digest))
 		if err != nil {
 			return fmt.Errorf("upload blob: %w", err)
 		}
@@ -289,7 +292,7 @@ func (b *Backend) uploadBlobs(ctx context.Context, blobs []msbucket.BlobRef) err
 		// Best-effort location record (unused in the harness, where reads come
 		// from the spool); keyed by (space, digest).
 		if err := b.locations.PutLocation(ctx, registry.BlobLocation{
-			Space:    b.space,
+			Space:    space,
 			Digest:   blob.Digest,
 			Provider: loc.Provider,
 			URL:      loc.URL,
@@ -321,7 +324,7 @@ func (b *Backend) uploadBlobs(ctx context.Context, blobs []msbucket.BlobRef) err
 // of a shared blob could drop a still-referenced one). Iterates over the
 // DEDUPLICATED digest sets, so a manifest carrying the same digest in two blobs
 // adds/deletes one claim and releases the blob at most once.
-func (b *Backend) reconcileClaims(ctx context.Context, bucket, key string, oldDigests, newDigests [][]byte) (toRemove [][]byte, err error) {
+func (b *Backend) reconcileClaims(ctx context.Context, bucketState *registry.State, key string, oldDigests, newDigests [][]byte) (toRemove [][]byte, err error) {
 	oldSet := digestSet(oldDigests)
 	newSet := digestSet(newDigests)
 
@@ -330,7 +333,7 @@ func (b *Backend) reconcileClaims(ctx context.Context, bucket, key string, oldDi
 			continue // unchanged reference
 		}
 		if err := b.blobRefs.AddBlobClaim(ctx, registry.BlobClaim{
-			Digest: d, Bucket: bucket, ObjectKey: key, VersionID: registry.NullVersionID, Space: b.space,
+			Digest: d, Bucket: bucketState.Name, ObjectKey: key, VersionID: registry.NullVersionID, Space: bucketState.Space,
 		}); err != nil {
 			return nil, fmt.Errorf("add blob claim: %w", err)
 		}
@@ -339,10 +342,10 @@ func (b *Backend) reconcileClaims(ctx context.Context, bucket, key string, oldDi
 		if _, ok := newSet[k]; ok {
 			continue // still referenced by the new body
 		}
-		if err := b.blobRefs.DeleteBlobClaim(ctx, d, bucket, key, registry.NullVersionID); err != nil {
+		if err := b.blobRefs.DeleteBlobClaim(ctx, d, bucketState.Name, key, registry.NullVersionID); err != nil {
 			return nil, fmt.Errorf("delete blob claim: %w", err)
 		}
-		n, err := b.blobRefs.CountClaims(ctx, b.space, d)
+		n, err := b.blobRefs.CountClaims(ctx, bucketState.Space, d)
 		if err != nil {
 			return nil, fmt.Errorf("count claims: %w", err)
 		}
@@ -358,9 +361,9 @@ func (b *Backend) reconcileClaims(ctx context.Context, bucket, key string, oldDi
 // the (currently no-op) network release. Failures are logged, not fatal: a
 // missed release leaks bytes on Piri but never loses referenced data, and crash
 // recovery reconciles upload_intents × blob_refs (a later phase).
-func (b *Backend) releaseBlobs(ctx context.Context, digests [][]byte) {
+func (b *Backend) releaseBlobs(ctx context.Context, space did.DID, digests [][]byte) {
 	for _, d := range digests {
-		if err := b.remover.RemoveBlob(ctx, multihash.Multihash(d)); err != nil {
+		if err := b.remover.RemoveBlob(ctx, space, multihash.Multihash(d)); err != nil {
 			// best-effort; see method doc.
 			_ = err
 		}
@@ -444,7 +447,7 @@ func (b *Backend) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s
 	if input.Key == nil {
 		return nil, s3err.GetAPIError(s3err.ErrNoSuchKey)
 	}
-	mf, err := b.lookupManifest(ctx, *input.Bucket, *input.Key)
+	mf, _, err := b.lookupManifest(ctx, *input.Bucket, *input.Key)
 	if err != nil {
 		return nil, err
 	}
@@ -483,17 +486,19 @@ func (b *Backend) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s
 		ContentLanguage:    strPtrOrNil(mf.ContentLanguage),
 		CacheControl:       strPtrOrNil(mf.CacheControl),
 		ExpiresString:      strPtrOrNil(mf.Expires),
-		Metadata:           mf.Metadata,
-		ContentRange:       contentRange,
-		PartsCount:         partsCount,
-		ETag:               &etag,
-		LastModified:       &lastModified,
-		StorageClass:       types.StorageClassStandard,
+
+		WebsiteRedirectLocation: strPtrOrNil(mf.WebsiteRedirectLocation),
+		Metadata:                mf.Metadata,
+		ContentRange:            contentRange,
+		PartsCount:              partsCount,
+		ETag:                    &etag,
+		LastModified:            &lastModified,
+		StorageClass:            types.StorageClassStandard,
 	}
 	// Echo the stored checksum only for a whole-object HEAD with checksum mode on
 	// (a ranged HEAD's checksum would not match the full object).
 	if input.ChecksumMode == types.ChecksumModeEnabled && !isRange {
-		out.ChecksumCRC32, out.ChecksumCRC32C, out.ChecksumSHA1, out.ChecksumSHA256, out.ChecksumCRC64NVME, out.ChecksumType = checksumFields(mf.ChecksumAlgorithm, mf.Checksum)
+		out.ChecksumCRC32, out.ChecksumCRC32C, out.ChecksumSHA1, out.ChecksumSHA256, out.ChecksumCRC64NVME, out.ChecksumSHA512, out.ChecksumMD5, out.ChecksumXXHASH64, out.ChecksumXXHASH3, out.ChecksumXXHASH128, out.ChecksumType = checksumFields(mf.ChecksumAlgorithm, mf.Checksum)
 	}
 	return out, nil
 }
@@ -508,7 +513,7 @@ func (b *Backend) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.
 	if input.Key == nil {
 		return nil, s3err.GetAPIError(s3err.ErrNoSuchKey)
 	}
-	mf, err := b.lookupManifest(ctx, *input.Bucket, *input.Key)
+	mf, st, err := b.lookupManifest(ctx, *input.Bucket, *input.Key)
 	if err != nil {
 		return nil, err
 	}
@@ -530,9 +535,9 @@ func (b *Backend) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.
 	}
 
 	var contentRange *string
-	var body = msbucket.OpenBody(ctx, b.read, mf.Body)
+	var body = msbucket.OpenBody(ctx, b.read, st.Space, mf.Body)
 	if isRange {
-		body = msbucket.OpenBodyRange(ctx, b.read, mf.Body, startOffset, startOffset+length-1)
+		body = msbucket.OpenBodyRange(ctx, b.read, st.Space, mf.Body, startOffset, startOffset+length-1)
 		cr := fmt.Sprintf("bytes %d-%d/%d", startOffset, startOffset+length-1, objSize)
 		contentRange = &cr
 	}
@@ -550,17 +555,19 @@ func (b *Backend) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.
 		ContentLanguage:    strPtrOrNil(mf.ContentLanguage),
 		CacheControl:       strPtrOrNil(mf.CacheControl),
 		ExpiresString:      strPtrOrNil(mf.Expires),
-		Metadata:           mf.Metadata,
-		ContentRange:       contentRange,
-		PartsCount:         partsCount,
-		ETag:               &etag,
-		LastModified:       &lastModified,
-		StorageClass:       types.StorageClassStandard,
+
+		WebsiteRedirectLocation: strPtrOrNil(mf.WebsiteRedirectLocation),
+		Metadata:                mf.Metadata,
+		ContentRange:            contentRange,
+		PartsCount:              partsCount,
+		ETag:                    &etag,
+		LastModified:            &lastModified,
+		StorageClass:            types.StorageClassStandard,
 	}
 	// Echo the stored checksum only for a whole-object GET with checksum mode on
 	// (a ranged GET's checksum would not match the full object).
 	if input.ChecksumMode == types.ChecksumModeEnabled && !isRange {
-		out.ChecksumCRC32, out.ChecksumCRC32C, out.ChecksumSHA1, out.ChecksumSHA256, out.ChecksumCRC64NVME, out.ChecksumType = checksumFields(mf.ChecksumAlgorithm, mf.Checksum)
+		out.ChecksumCRC32, out.ChecksumCRC32C, out.ChecksumSHA1, out.ChecksumSHA256, out.ChecksumCRC64NVME, out.ChecksumSHA512, out.ChecksumMD5, out.ChecksumXXHASH64, out.ChecksumXXHASH3, out.ChecksumXXHASH128, out.ChecksumType = checksumFields(mf.ChecksumAlgorithm, mf.Checksum)
 	}
 	return out, nil
 }
@@ -574,12 +581,20 @@ func (b *Backend) DeleteObject(ctx context.Context, input *s3.DeleteObjectInput)
 	if input.Key == nil {
 		return nil, s3err.GetAPIError(s3err.ErrNoSuchKey)
 	}
+	// A missing bucket fails the whole request (matches S3).
+	bucketState, err := b.reg.Get(ctx, *input.Bucket)
+	if err != nil {
+		if errors.Is(err, registry.ErrNotFound) {
+			return nil, s3err.GetAPIError(s3err.ErrNoSuchBucket)
+		}
+		return nil, fmt.Errorf("s3frontend: delete object: %w", err)
+	}
 	preconds := &backend.ObjectDeletePreconditions{
 		IfMatch:            input.IfMatch,
 		IfMatchLastModTime: input.IfMatchLastModifiedTime,
 		IfMatchSize:        input.IfMatchSize,
 	}
-	if err := b.deleteObjectKey(ctx, *input.Bucket, *input.Key, preconds); err != nil {
+	if err := b.deleteObjectKey(ctx, bucketState, *input.Key, preconds); err != nil {
 		return nil, err
 	}
 	return &s3.DeleteObjectOutput{}, nil
@@ -589,9 +604,9 @@ func (b *Backend) DeleteObject(ctx context.Context, input *s3.DeleteObjectInput)
 // reference index. Missing keys (and an empty bucket) are idempotent no-ops.
 // preconds, when non-nil, gates the delete on If-Match / size / mod-time under
 // the lock. Shared by DeleteObject and DeleteObjects.
-func (b *Backend) deleteObjectKey(ctx context.Context, bucketName, key string, preconds *backend.ObjectDeletePreconditions) error {
+func (b *Backend) deleteObjectKey(ctx context.Context, bucketState *registry.State, key string, preconds *backend.ObjectDeletePreconditions) error {
 	var oldDigests [][]byte
-	err := b.txns.WithTx(ctx, bucketName, func(ctx context.Context, tx *bucketop.Tx) (cid.Cid, error) {
+	err := b.txns.WithTx(ctx, bucketState.Name, func(ctx context.Context, tx *bucketop.Tx) (cid.Cid, error) {
 		// Empty bucket: nothing to delete. Returning cid.Undef tells WithTx to
 		// discard with no commit — the equivalent of "no-op success."
 		if !tx.State().Root.Defined() {
@@ -609,7 +624,7 @@ func (b *Backend) deleteObjectKey(ctx context.Context, bucketName, key string, p
 			return cid.Undef, fmt.Errorf("mst get: %w", gerr)
 		}
 		var oldMf msbucket.ObjectManifest
-		if err := tx.Get(ctx, oldCid, &oldMf); err != nil {
+		if err := tx.Get(ctx, tx.State().Space, oldCid, &oldMf); err != nil {
 			return cid.Undef, fmt.Errorf("load manifest: %w", err)
 		}
 
@@ -625,7 +640,7 @@ func (b *Backend) deleteObjectKey(ctx context.Context, bucketName, key string, p
 		if err != nil {
 			return cid.Undef, fmt.Errorf("mst delete: %w", err)
 		}
-		if err := b.gc.AddGCCandidate(ctx, oldCid.Bytes(), bucketName); err != nil {
+		if err := b.gc.AddGCCandidate(ctx, oldCid.Bytes(), bucketState.Name); err != nil {
 			return cid.Undef, fmt.Errorf("gc candidate: %w", err)
 		}
 		oldDigests = bodyDigests(oldMf.Body)
@@ -637,11 +652,11 @@ func (b *Backend) deleteObjectKey(ctx context.Context, bucketName, key string, p
 	// Release the removed version's blobs through the reference index AFTER the
 	// commit is durable (so a commit failure can't diverge blob_refs). When the
 	// key was absent, oldDigests is nil and this is a no-op.
-	toRemove, err := b.reconcileClaims(ctx, bucketName, key, oldDigests, nil)
+	toRemove, err := b.reconcileClaims(ctx, bucketState, key, oldDigests, nil)
 	if err != nil {
 		return fmt.Errorf("s3frontend: delete reconcile: %w", err)
 	}
-	b.releaseBlobs(ctx, toRemove)
+	b.releaseBlobs(ctx, bucketState.Space, toRemove)
 	return nil
 }
 
@@ -661,7 +676,8 @@ func (b *Backend) DeleteObjects(ctx context.Context, input *s3.DeleteObjectsInpu
 	bucketName := *input.Bucket
 
 	// A missing bucket fails the whole request (matches S3).
-	if _, err := b.reg.Get(ctx, bucketName); err != nil {
+	bucketState, err := b.reg.Get(ctx, bucketName)
+	if err != nil {
 		if errors.Is(err, registry.ErrNotFound) {
 			return s3response.DeleteResult{}, s3err.GetAPIError(s3err.ErrNoSuchBucket)
 		}
@@ -675,7 +691,7 @@ func (b *Backend) DeleteObjects(ctx context.Context, input *s3.DeleteObjectsInpu
 			continue
 		}
 		key := *obj.Key
-		if err := b.deleteObjectKey(ctx, bucketName, key, nil); err != nil {
+		if err := b.deleteObjectKey(ctx, bucketState, key, nil); err != nil {
 			k := key
 			code, msg := deleteErrorFields(err)
 			res.Error = append(res.Error, types.Error{Key: &k, Code: &code, Message: &msg})
@@ -847,7 +863,7 @@ func (b *Backend) listWalk(ctx context.Context, bucketName, prefix, delimiter, f
 		return out, nil
 	}
 
-	t := mst.LoadMST(b.read, st.Root)
+	t := mst.LoadMST(b.read, st.Space, st.Root)
 	seenPrefix := map[string]struct{}{}
 	walkErr := t.WalkLeavesFromNocache(ctx, from, func(k string, mfCid cid.Cid) error {
 		if prefix != "" && !strings.HasPrefix(k, prefix) {
@@ -873,7 +889,7 @@ func (b *Backend) listWalk(ctx context.Context, bucketName, prefix, delimiter, f
 		}
 
 		var mf msbucket.ObjectManifest
-		if err := b.read.Get(ctx, mfCid, &mf); err != nil {
+		if err := b.read.Get(ctx, st.Space, mfCid, &mf); err != nil {
 			return fmt.Errorf("manifest get %s: %w", mfCid, err)
 		}
 		key := k
@@ -902,31 +918,33 @@ func (b *Backend) listWalk(ctx context.Context, bucketName, prefix, delimiter, f
 
 // lookupManifest is the shared HEAD/GET path: registry → MST → CBOR
 // decode of the manifest pointed at by the leaf. Maps "missing
-// bucket" / "missing key" to S3 errors.
-func (b *Backend) lookupManifest(ctx context.Context, bucketName, key string) (*msbucket.ObjectManifest, error) {
+// bucket" / "missing key" to S3 errors. The bucket state is returned
+// alongside the manifest so callers can thread st.Space into body
+// reads (blob retrieval is space-scoped).
+func (b *Backend) lookupManifest(ctx context.Context, bucketName, key string) (*msbucket.ObjectManifest, *registry.State, error) {
 	st, err := b.reg.Get(ctx, bucketName)
 	if err != nil {
 		if errors.Is(err, registry.ErrNotFound) {
-			return nil, s3err.GetAPIError(s3err.ErrNoSuchBucket)
+			return nil, nil, s3err.GetAPIError(s3err.ErrNoSuchBucket)
 		}
-		return nil, err
+		return nil, nil, err
 	}
 	if !st.Root.Defined() {
-		return nil, s3err.GetAPIError(s3err.ErrNoSuchKey)
+		return nil, nil, s3err.GetAPIError(s3err.ErrNoSuchKey)
 	}
-	t := mst.LoadMST(b.read, st.Root)
+	t := mst.LoadMST(b.read, st.Space, st.Root)
 	mfCid, err := t.Get(ctx, key)
 	if errors.Is(err, mst.ErrNotFound) {
-		return nil, s3err.GetAPIError(s3err.ErrNoSuchKey)
+		return nil, nil, s3err.GetAPIError(s3err.ErrNoSuchKey)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("s3frontend: mst get: %w", err)
+		return nil, nil, fmt.Errorf("s3frontend: mst get: %w", err)
 	}
 	var mf msbucket.ObjectManifest
-	if err := b.read.Get(ctx, mfCid, &mf); err != nil {
-		return nil, fmt.Errorf("s3frontend: manifest get: %w", err)
+	if err := b.read.Get(ctx, st.Space, mfCid, &mf); err != nil {
+		return nil, nil, fmt.Errorf("s3frontend: manifest get: %w", err)
 	}
-	return &mf, nil
+	return &mf, st, nil
 }
 
 // etagOf returns the manifest's S3 ETag, double-quoted per the wire

@@ -1,4 +1,4 @@
-package ingot_test
+package config_test
 
 import (
 	"os"
@@ -11,7 +11,7 @@ import (
 	"github.com/fil-forge/ucantone/ucan/container"
 	"github.com/fil-forge/ucantone/ucan/delegation"
 
-	"github.com/fil-forge/ingot"
+	"github.com/fil-forge/ingot/config"
 )
 
 // mintProofsContainer builds a container holding one space→agent /blob/add
@@ -68,7 +68,7 @@ func TestLoadProofsContainer(t *testing.T) {
 		if err := os.WriteFile(path, rawBytes, 0o600); err != nil {
 			t.Fatalf("write: %v", err)
 		}
-		got, err := ingot.LoadProofsContainer(path)
+		got, err := config.LoadProofsContainer(path)
 		if err != nil {
 			t.Fatalf("load: %v", err)
 		}
@@ -80,7 +80,7 @@ func TestLoadProofsContainer(t *testing.T) {
 		if err := os.WriteFile(path, append(b64Bytes, '\n'), 0o600); err != nil {
 			t.Fatalf("write: %v", err)
 		}
-		got, err := ingot.LoadProofsContainer(path)
+		got, err := config.LoadProofsContainer(path)
 		if err != nil {
 			t.Fatalf("load: %v", err)
 		}
@@ -88,7 +88,7 @@ func TestLoadProofsContainer(t *testing.T) {
 	})
 
 	t.Run("inline string", func(t *testing.T) {
-		got, err := ingot.LoadProofsContainer(string(b64Bytes))
+		got, err := config.LoadProofsContainer(string(b64Bytes))
 		if err != nil {
 			t.Fatalf("load: %v", err)
 		}
@@ -96,7 +96,7 @@ func TestLoadProofsContainer(t *testing.T) {
 	})
 
 	t.Run("missing file / undecodable value errors", func(t *testing.T) {
-		if _, err := ingot.LoadProofsContainer("/nonexistent/proofs.cbor"); err == nil {
+		if _, err := config.LoadProofsContainer("/nonexistent/proofs.cbor"); err == nil {
 			t.Fatal("expected error for value that is neither a file nor a container")
 		}
 	})

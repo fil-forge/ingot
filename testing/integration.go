@@ -19,7 +19,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/versity/versitygw/tests/integration"
+	"github.com/fil-forge/versitygw/tests/integration"
 )
 
 // Config addresses the ingot S3 listener under test.

@@ -28,6 +28,7 @@ import (
 //     has a single writer.
 type PlaneLog struct {
 	plane  blockstore.Plane
+	bucket string // the bucket this log belongs to; stamps segment rows
 	dir    string
 	pc     PlaneConfig
 	meta   Meta
@@ -55,12 +56,13 @@ type PlaneLog struct {
 // reconciles with Meta, re-enqueues unshipped sealed segments, force-seals
 // any previously-open segment, and starts the flush worker (when shipping)
 // + seal ticker.
-func openPlaneLog(ctx context.Context, plane blockstore.Plane, dir string, pc PlaneConfig, meta Meta, logger *zap.Logger) (*PlaneLog, error) {
+func openPlaneLog(ctx context.Context, plane blockstore.Plane, bucket, dir string, pc PlaneConfig, meta Meta, logger *zap.Logger) (*PlaneLog, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("logstore: mkdir %s: %w", dir, err)
 	}
 	pl := &PlaneLog{
 		plane:   plane,
+		bucket:  bucket,
 		dir:     dir,
 		pc:      pc,
 		meta:    meta,
@@ -228,7 +230,7 @@ func (pl *PlaneLog) ensureOpenLockedAppMu(ctx context.Context) (*Segment, error)
 	if err != nil {
 		return nil, err
 	}
-	seg, err := createOpenSegment(ctx, pl.dir, seq, pl.plane, pl.meta, pl.logger)
+	seg, err := createOpenSegment(ctx, pl.dir, seq, pl.plane, pl.bucket, pl.meta, pl.logger)
 	if err != nil {
 		return nil, err
 	}

@@ -27,7 +27,7 @@ import (
 // LocationReader is the read slice of LocationStore the LocalLocator needs.
 // *Postgres (and any full LocationStore) satisfies it.
 type LocationReader interface {
-	GetLocation(ctx context.Context, space string, digest []byte) (*BlobLocation, error)
+	GetLocation(ctx context.Context, space did.DID, digest []byte) (*BlobLocation, error)
 }
 
 type LocalLocator struct {
@@ -46,7 +46,7 @@ var _ locator.Locator = (*LocalLocator)(nil)
 func (l *LocalLocator) Locate(ctx context.Context, spaces []did.DID, digest mh.Multihash) ([]locator.Location, error) {
 	var out []locator.Location
 	for _, space := range spaces {
-		bl, err := l.store.GetLocation(ctx, space.String(), digest)
+		bl, err := l.store.GetLocation(ctx, space, digest)
 		if errors.Is(err, ErrNotFound) {
 			continue
 		}

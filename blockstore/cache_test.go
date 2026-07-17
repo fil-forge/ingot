@@ -2,6 +2,7 @@ package blockstore
 
 import (
 	"context"
+	"github.com/fil-forge/ucantone/did"
 	"testing"
 
 	block "github.com/ipfs/go-block-format"
@@ -18,7 +19,7 @@ type countingReader struct {
 	calls     map[string]int
 }
 
-func (r *countingReader) GetBlock(_ context.Context, c cid.Cid) (block.Block, error) {
+func (r *countingReader) GetBlock(_ context.Context, _ did.DID, c cid.Cid) (block.Block, error) {
 	if r.calls == nil {
 		r.calls = map[string]int{}
 	}
@@ -50,7 +51,7 @@ func TestCached_Hit(t *testing.T) {
 	k := mkcid(7)
 
 	for i := 0; i < 3; i++ {
-		if _, err := c.GetBlock(context.Background(), k); err != nil {
+		if _, err := c.GetBlock(context.Background(), did.Undef, k); err != nil {
 			t.Fatalf("get: %v", err)
 		}
 	}
@@ -66,20 +67,20 @@ func TestCached_EvictsByBytes(t *testing.T) {
 
 	first, second, third := mkcid(1), mkcid(2), mkcid(3)
 	for _, k := range []cid.Cid{first, second, third} {
-		if _, err := c.GetBlock(context.Background(), k); err != nil {
+		if _, err := c.GetBlock(context.Background(), did.Undef, k); err != nil {
 			t.Fatalf("get: %v", err)
 		}
 	}
 
 	// first was evicted -> refetched (2 base hits).
-	if _, err := c.GetBlock(context.Background(), first); err != nil {
+	if _, err := c.GetBlock(context.Background(), did.Undef, first); err != nil {
 		t.Fatalf("get: %v", err)
 	}
 	if got := base.calls[first.KeyString()]; got != 2 {
 		t.Fatalf("expected first block evicted and refetched (2 base hits), got %d", got)
 	}
 	// third is the most-recently-used and still cached (1 base hit).
-	if _, err := c.GetBlock(context.Background(), third); err != nil {
+	if _, err := c.GetBlock(context.Background(), did.Undef, third); err != nil {
 		t.Fatalf("get: %v", err)
 	}
 	if got := base.calls[third.KeyString()]; got != 1 {

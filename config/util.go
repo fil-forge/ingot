@@ -1,4 +1,4 @@
-package ingot
+package config
 
 import (
 	"bytes"
