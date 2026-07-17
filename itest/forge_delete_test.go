@@ -41,10 +41,18 @@ func TestForgeDeleteReleasesNetworkBlob(t *testing.T) {
 	ctx := t.Context()
 	const email = "test@example.com"
 
-	s, ingotEndpoint := forgeStack(t,
+	// The Curio-based piri requires a Postgres node (harmonydb) and, until
+	// the published localdev image carries the mockrpc Ticket fix, an
+	// overridable blockchain image.
+	stackOpts := []stack.Option{
+		stack.WithPiriNodes(stack.PiriNodeConfig{Postgres: true}),
 		stack.WithServiceBinary("piri", piriBin),
 		stack.WithServiceBinary("upload", sprueBin),
-	)
+	}
+	if img := os.Getenv("ITEST_BLOCKCHAIN_IMAGE"); img != "" {
+		stackOpts = append(stackOpts, stack.WithBlockchainImage(img))
+	}
+	s, ingotEndpoint := forgeStack(t, stackOpts...)
 	ingotSelfProvision(t, ctx, s, email)
 	cfg := forgeConfig(ingotEndpoint)
 
