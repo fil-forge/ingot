@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/md5"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -25,7 +26,6 @@ import (
 	"github.com/fil-forge/versitygw/tests/integration"
 
 	ingottest "github.com/fil-forge/ingot/testing"
-	"github.com/fil-forge/smelt/pkg/clients/guppy"
 	"github.com/fil-forge/smelt/pkg/stack"
 )
 
@@ -37,17 +37,10 @@ import (
 //
 //	make itest
 
-// ingotConfigPath is where smelt's ingot system definition mounts the daemon
-// config inside the container.
-const ingotConfigPath = "/etc/ingot/config.yaml"
-
-// forgeCreds are the root S3 credentials from smelt's
-// systems/ingot/config/config.yaml.
-const (
-	forgeAccessKey = "ingot"
-	forgeSecretKey = "ingotsecret"
-	forgeRegion    = "us-east-1"
-)
+// forgeRegion must match smelt's ingot config (systems/ingot/config/
+// config.yaml) and the provider region hilt's post_start hook registers
+// ingot under (INGOT_REGION) — tenants are provisioned per region.
+const forgeRegion = "us-west-1"
 
 // TestMain sweeps containers/volumes leaked by prior crashed itest runs (same
 // smeltery- project prefix as any smelt-SDK stack). Best-effort: a missing
@@ -103,17 +96,27 @@ func localIngotBinary(t *testing.T) string {
 
 // forgeStack boots the smelt stack with the working tree's ingot injected
 // (plus any extra stack options), waits for ingot's S3 listener, and returns
-// the stack and ingot's host endpoint. Callers that upload must provision
-// first (ingotSelfProvision). The stack lives until the calling test —
+// the stack and ingot's host endpoint. Callers must provision a hilt tenant
+// first (hiltProvisionTenant) and sign with its credentials. The stack lives until the calling test —
 // including all of its subtests — completes; share it across categories by
 // booting in a parent test and passing the conf into t.Run subtests.
 func forgeStack(t *testing.T, extra ...stack.Option) (*stack.Stack, string) {
 	t.Helper()
 	t.Logf("booting the smelt Forge stack (~1-2 min; first run also compiles ingot and pulls images)")
-	opts := append([]stack.Option{
+	opts := []stack.Option{
 		stack.WithPiriNodes(stack.PiriNodeConfig{}),
 		stack.WithServiceBinary("ingot", localIngotBinary(t)),
-	}, extra...)
+	}
+	// Local-dev escape hatch: override the upload-service (sprue) image, e.g.
+	// one built from an unmerged branch. Needed while hilt's did:plc tenant
+	// spaces require sprue's ash/feat/allow-did-plc-accounts branch — the
+	// published sprue:main can't resolve did:plc and bucket creation 500s
+	// ("no resolver found for method: plc"). Unset (CI) uses the default.
+	if img := os.Getenv("INGOT_ITEST_UPLOAD_IMAGE"); img != "" {
+		t.Logf("using upload-service image override: %s", img)
+		opts = append(opts, stack.WithUploadImage(img))
+	}
+	opts = append(opts, extra...)
 	s := stack.MustNewStack(t, opts...)
 	endpoint := s.IngotEndpoint()
 	waitHTTPOK(t, endpoint+"/health", 2*time.Minute)
@@ -128,20 +131,21 @@ func withSmallBlobConfig() stack.Option {
 	return stack.WithServiceConfig("ingot", "testdata/config-smallblob.yaml")
 }
 
-// forgeConfig is the roundtrip-helper config for a stack-deployed ingot.
-func forgeConfig(endpoint string) ingottest.Config {
+// forgeConfig is the roundtrip-helper config for a stack-deployed ingot,
+// signing with the given hilt-issued tenant credentials.
+func forgeConfig(endpoint, accessKey, secretKey string) ingottest.Config {
 	return ingottest.Config{
 		Endpoint:  endpoint,
-		AccessKey: forgeAccessKey,
-		SecretKey: forgeSecretKey,
+		AccessKey: accessKey,
+		SecretKey: secretKey,
 		Region:    forgeRegion,
 	}
 }
 
 // forgeS3Conf is the upstream-suite config for a stack-deployed ingot, for
 // invoking versitygw cases directly.
-func forgeS3Conf(endpoint string) *integration.S3Conf {
-	return ingottest.NewS3Conf(forgeConfig(endpoint))
+func forgeS3Conf(endpoint, accessKey, secretKey string) *integration.S3Conf {
+	return ingottest.NewS3Conf(forgeConfig(endpoint, accessKey, secretKey))
 }
 
 // waitHTTPOK polls url until it returns 2xx or the timeout elapses.
@@ -161,26 +165,74 @@ func waitHTTPOK(t *testing.T, url string, timeout time.Duration) {
 	t.Fatalf("%s not healthy after %s", url, timeout)
 }
 
-// ingotLoginViaEmail logs the ingot agent in as email — guppy-free: the
-// blocking `ingot login` CLI runs in the ingot container and the validation
-// link is clicked from inside that same container.
-func ingotLoginViaEmail(t *testing.T, ctx context.Context, s *stack.Stack, email string) {
-	t.Helper()
-	if err := guppy.LoginViaEmail(ctx, s, "ingot", email,
-		"ingot", "--config", ingotConfigPath, "login", email); err != nil {
-		t.Fatalf("ingot login via email: %v", err)
-	}
+// hiltAllPermissions is every S3 permission hilt recognizes (its pkg/s3perm
+// map). The conformance cases exercise the whole S3 surface, so the test
+// tenant's access key carries them all.
+var hiltAllPermissions = []string{
+	"s3:GetObject",
+	"s3:GetObjectVersion",
+	"s3:GetObjectRetention",
+	"s3:GetObjectLegalHold",
+	"s3:ListBucket",
+	"s3:ListBucketVersions",
+	"s3:PutObject",
+	"s3:PutObjectRetention",
+	"s3:PutObjectLegalHold",
+	"s3:DeleteObject",
+	"s3:DeleteObjectVersion",
+	"s3:CreateBucket",
+	"s3:ListAllMyBuckets",
+	"s3:DeleteBucket",
 }
 
-// ingotSelfProvision has ingot provision its own space to email on sprue
-// (login + `space generate --provision-to`), no guppy involved.
-func ingotSelfProvision(t *testing.T, ctx context.Context, s *stack.Stack, email string) {
+// hiltProvisionTenant provisions tenantID in hilt with an all-permission
+// access key and returns the S3 credentials tests sign with. This is the
+// forge-mode onboarding path: ingot no longer self-provisions a space (the
+// login/space CLI is gone) — hilt owns tenancy, mints the tenant's did:plc
+// space, registers it as a customer with the upload service, and issues the
+// SigV4 keys ingot authorizes against via /s3/request/authorize.
+//
+// The Tenant API is reached with curl inside the hilt container (so no host
+// port mapping is needed), authenticated with smelt's local-dev partner key.
+// The tenant's region must match the provider region hilt's post_start hook
+// registered ingot under (forgeRegion).
+func hiltProvisionTenant(t *testing.T, ctx context.Context, s *stack.Stack, tenantID string) (accessKey, secretKey string) {
 	t.Helper()
-	ingotLoginViaEmail(t, ctx, s, email)
-	if out, errOut, err := s.Exec(ctx, "ingot",
-		"ingot", "--config", ingotConfigPath, "space", "generate", "--provision-to", email); err != nil {
-		t.Fatalf("ingot space generate: %v (stdout=%s stderr=%s)", err, out, errOut)
+	const partnerAuth = "Authorization: Bearer dev-partner-key"
+
+	if out, errOut, err := s.Exec(ctx, "hilt", "curl", "-sS", "-f", "-X", "PUT",
+		"http://localhost:80/tenants/"+tenantID,
+		"-H", partnerAuth, "-H", "Content-Type: application/json",
+		"-d", fmt.Sprintf(`{"region":%q}`, forgeRegion)); err != nil {
+		t.Fatalf("hilt provision tenant %q: %v (stdout=%s stderr=%s)", tenantID, err, out, errOut)
 	}
+
+	keyReq, err := json.Marshal(map[string]any{
+		"name":        "itest",
+		"permissions": hiltAllPermissions,
+	})
+	if err != nil {
+		t.Fatalf("marshal access-key request: %v", err)
+	}
+	out, errOut, err := s.Exec(ctx, "hilt", "curl", "-sS", "-f", "-X", "POST",
+		"http://localhost:80/tenants/"+tenantID+"/access-keys",
+		"-H", partnerAuth, "-H", "Content-Type: application/json",
+		"-d", string(keyReq))
+	if err != nil {
+		t.Fatalf("hilt create access key for %q: %v (stdout=%s stderr=%s)", tenantID, err, out, errOut)
+	}
+	var created struct {
+		AccessKeyID     string `json:"accessKeyId"`
+		SecretAccessKey string `json:"secretAccessKey"`
+	}
+	if err := json.Unmarshal([]byte(out), &created); err != nil {
+		t.Fatalf("parse access-key response %q: %v", out, err)
+	}
+	if created.AccessKeyID == "" || created.SecretAccessKey == "" {
+		t.Fatalf("hilt returned incomplete credentials: %s", out)
+	}
+	t.Logf("hilt tenant %q provisioned; access key %s", tenantID, created.AccessKeyID)
+	return created.AccessKeyID, created.SecretAccessKey
 }
 
 // spoolBlobCount counts the body blobs in the ingot container's spool,

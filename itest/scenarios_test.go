@@ -29,8 +29,8 @@ func TestForgeScenarios(t *testing.T) {
 
 	s, endpoint := forgeStack(t, withSmallBlobConfig())
 	ctx := t.Context()
-	ingotSelfProvision(t, ctx, s, "test@example.com")
-	cl := sdkClient(forgeS3Conf(endpoint))
+	accessKey, secretKey := hiltProvisionTenant(t, ctx, s, "scenarios")
+	cl := sdkClient(forgeS3Conf(endpoint, accessKey, secretKey))
 
 	// BlobSplitMultiBlobRoundTrip: a PUT several times larger than
 	// max_blob_size is coarsely split into multiple BlobRefs; the
