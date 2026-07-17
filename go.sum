@@ -248,8 +248,8 @@ github.com/fil-forge/go-ucanto v0.0.0-20260507172450-5cb5d073f8ab h1:2J2cDThqTKP
 github.com/fil-forge/go-ucanto v0.0.0-20260507172450-5cb5d073f8ab/go.mod h1:lZF3UXZ2hGLKYmXdquG50JqI9pRlUrV6lubGtgOYfwc=
 github.com/fil-forge/indexing-service v1.13.5-0.20260619142411-efe3f5fab717 h1:Wke8qgaDgy7DGaIS28VpHip+YHSdQP1hGNEZTrXXzb4=
 github.com/fil-forge/indexing-service v1.13.5-0.20260619142411-efe3f5fab717/go.mod h1:wFcakLohOqpMRkJzWRdGFGHRFpGB+PpEMCm9wkt2cqU=
-github.com/fil-forge/libforge v0.0.0-20260701162346-f0706e1641a3 h1:/EDxpbuVeSXH3FLF7MK4G4wrDUFmCO9fLQHL23RZ2uU=
-github.com/fil-forge/libforge v0.0.0-20260701162346-f0706e1641a3/go.mod h1:0kXihIQ4L2uZ00nR5XrZ/Y8Db7Ht/qQNuiWslwMJ95M=
+github.com/fil-forge/libforge v0.0.0-20260717174550-aac837a730c2 h1:mwb14/aanwFBGdQJ/0WCkNX/AzUXF/iRKMVjhXtYd6Q=
+github.com/fil-forge/libforge v0.0.0-20260717174550-aac837a730c2/go.mod h1:0kXihIQ4L2uZ00nR5XrZ/Y8Db7Ht/qQNuiWslwMJ95M=
 github.com/fil-forge/smelt v0.0.0-20260714201619-f2ecac50394c h1:LqWeuCe44vpkqz/F5kqMjK380FOzvLvYrFlR/I9GVUo=
 github.com/fil-forge/smelt v0.0.0-20260714201619-f2ecac50394c/go.mod h1:W6aiYnuM+n0Q7G6fH3Ok4EE2iMfUSpA6f8r3i/+moBs=
 github.com/fil-forge/ucantone v0.0.0-20260706102443-79141c5cc52e h1:di/SseJVEO6bznSH/UEnAE2nSwwp/gqgnPLgE9/x2Zg=
