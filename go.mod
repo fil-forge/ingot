@@ -9,7 +9,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.99.1
 	github.com/fil-forge/indexing-service v1.13.5-0.20260619142411-efe3f5fab717
 	github.com/fil-forge/libforge v0.0.0-20260717174550-aac837a730c2
-	github.com/fil-forge/smelt v0.0.0-20260714201619-f2ecac50394c
+	github.com/fil-forge/smelt v0.0.0-20260717195554-271831781c1d
 	github.com/fil-forge/ucantone v0.0.0-20260706102443-79141c5cc52e
 	github.com/fxamacker/cbor/v2 v2.9.2
 	github.com/go-jose/go-jose/v4 v4.1.4
@@ -252,5 +252,3 @@ require (
 	pitr.ca/jsontokenizer v0.3.2 // indirect
 	tags.cncf.io/container-device-interface v1.1.0 // indirect
 )
-
-replace github.com/fil-forge/smelt => ../smelt
