@@ -1,0 +1,20 @@
+name: Releaser
+
+# When version.json changes on main, the unified releaser cuts the git tag
+# and GitHub release for that version. Binaries + containers are then built by
+# the Binaries Releaser workflow (release-binaries.yml) on completion.
+on:
+  push:
+    paths: [ 'version.json' ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  releaser:
+    uses: ipdxco/unified-github-workflows/.github/workflows/releaser.yml@v1.0
