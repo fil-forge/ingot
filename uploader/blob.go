@@ -50,21 +50,26 @@ func (u *Forge) UploadBlob(ctx context.Context, space did.DID, digest multihash.
 	}
 	defer f.Close()
 
-	// This runs on the request ctx, so the requesting key's proof store is
-	// available. Use it for this upload and capture it as the ship authority
-	// for space, so the async catalog ship (SubmitShard, no request ctx) can
-	// reuse it. Absence is not fatal here — BlobAdd falls back to the token
-	// store — but in forge mode reqscope is always populated by the IAM layer.
-	opts := []forgeclient.BlobAddOption{
+	// This runs on the request ctx, so the requesting key's proof store must
+	// be present: it authorizes the /blob/add and is captured as the ship
+	// authority for space, so the async catalog ship (SubmitShard, no request
+	// ctx) can reuse it. In forge mode the IAM layer populates reqscope for
+	// every write, so absence is a wiring bug, not a fallback case — proceeding
+	// without it issues a proofless /blob/add that sprue rejects with an opaque
+	// "not issued by subject and has no proofs" 500 deep in the flow. Fail here
+	// instead, naming the space, so the missing store is immediately
+	// attributable.
+	store, ok := reqscope.ProofStore(ctx)
+	if !ok {
+		return BlobLocation{}, fmt.Errorf("uploader: no request-scoped proof store for space %s (IAM layer did not attach one)", space)
+	}
+	u.captureShipProofs(space, store)
+
+	added, err := u.client.BlobAdd(ctx, space, f,
 		forgeclient.WithPrecomputedDigest(digest, uint64(size)),
 		forgeclient.WithPutClient(u.putClient),
-	}
-	if store, ok := reqscope.ProofStore(ctx); ok {
-		u.captureShipProofs(space, store)
-		opts = append(opts, forgeclient.WithProofStore(store))
-	}
-
-	added, err := u.client.BlobAdd(ctx, space, f, opts...)
+		forgeclient.WithProofStore(store),
+	)
 	if err != nil {
 		return BlobLocation{}, fmt.Errorf("uploader: upload blob: %w", err)
 	}

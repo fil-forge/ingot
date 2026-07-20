@@ -172,9 +172,13 @@ func (u *Forge) SubmitShard(ctx context.Context, plane blockstore.Plane, space d
 	}
 
 	// 3. blob/add the index blob via sprue (small: one entry per CID).
+	//    Same ship authority as the shard CAR above — without the proof
+	//    store this /blob/add is issued proofless and sprue rejects it
+	//    ("not issued by subject and has no proofs").
 	if _, err := u.client.BlobAdd(ctx, space, bytes.NewReader(indexBytes),
 		forgeclient.WithPrecomputedDigest(indexDigest, uint64(len(indexBytes))),
 		forgeclient.WithPutClient(u.putClient),
+		forgeclient.WithProofStore(store),
 	); err != nil {
 		return fmt.Errorf("uploader: ship %s index: %w", plane, err)
 	}

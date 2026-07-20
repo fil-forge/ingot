@@ -134,7 +134,23 @@ func NewForge(cfg ForgeConfig) (*Forge, error) {
 // is inclusive, so End-Start+1). The caller owns the returned reader and must
 // Close it. Shared by GetBlock (which buffers small catalog blocks) and
 // OpenBlob (which streams large body blobs straight through).
+//
+// It logs any error before returning it. OpenBlob hands the returned reader
+// straight to the S3 layer, which streams it as a fixed-length body; a
+// retrieval that fails there (e.g. piri answering a failure receipt in an
+// empty 200 when it can't resolve a did:plc principal in the proof chain)
+// otherwise surfaces only as a bare client-side EOF mid-body, with nothing
+// attributable in ingot's own logs.
 func (f *Forge) retrieve(ctx context.Context, space did.DID, c cid.Cid) (io.ReadCloser, int64, error) {
+	rc, n, err := f.doRetrieve(ctx, space, c)
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		f.logger.Warn("forge: retrieve failed",
+			zap.Stringer("space", space), zap.Stringer("cid", c), zap.Error(err))
+	}
+	return rc, n, err
+}
+
+func (f *Forge) doRetrieve(ctx context.Context, space did.DID, c cid.Cid) (io.ReadCloser, int64, error) {
 	locations, err := f.locator.Locate(ctx, []did.DID{space}, c.Hash())
 	if err != nil {
 		var nf locator.NotFoundError

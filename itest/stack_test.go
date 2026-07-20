@@ -107,14 +107,20 @@ func forgeStack(t *testing.T, extra ...stack.Option) (*stack.Stack, string) {
 		stack.WithPiriNodes(stack.PiriNodeConfig{}),
 		stack.WithServiceBinary("ingot", localIngotBinary(t)),
 	}
-	// Local-dev escape hatch: override the upload-service (sprue) image, e.g.
-	// one built from an unmerged branch. Needed while hilt's did:plc tenant
-	// spaces require sprue's ash/feat/allow-did-plc-accounts branch — the
-	// published sprue:main can't resolve did:plc and bucket creation 500s
-	// ("no resolver found for method: plc"). Unset (CI) uses the default.
+	// Local-dev escape hatches: run against upload-service (sprue) / piri
+	// images the registry doesn't have yet — e.g. built from an unmerged
+	// branch. Unset (CI) uses the published defaults. These exist because the
+	// hilt integration made the forge stack cross-service: hilt mints did:plc
+	// tenant spaces, so both sprue (bucket create / catalog ship) and piri
+	// (the /content/retrieve read tier) must be able to resolve did:plc — a
+	// capability that lands in those services branch-by-branch.
 	if img := os.Getenv("INGOT_ITEST_UPLOAD_IMAGE"); img != "" {
 		t.Logf("using upload-service image override: %s", img)
 		opts = append(opts, stack.WithUploadImage(img))
+	}
+	if img := os.Getenv("INGOT_ITEST_PIRI_IMAGE"); img != "" {
+		t.Logf("using piri image override: %s", img)
+		opts = append(opts, stack.WithPiriImage(img))
 	}
 	opts = append(opts, extra...)
 	s := stack.MustNewStack(t, opts...)

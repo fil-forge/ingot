@@ -252,8 +252,8 @@ github.com/fil-forge/indexing-service v1.13.5-0.20260619142411-efe3f5fab717 h1:W
 github.com/fil-forge/indexing-service v1.13.5-0.20260619142411-efe3f5fab717/go.mod h1:wFcakLohOqpMRkJzWRdGFGHRFpGB+PpEMCm9wkt2cqU=
 github.com/fil-forge/libforge v0.0.0-20260713100115-a3aa293b990c h1:ElgAxd+08QifEpnhO1vH58A/CD+i/Hdic6B+k3W/QPY=
 github.com/fil-forge/libforge v0.0.0-20260713100115-a3aa293b990c/go.mod h1:0kXihIQ4L2uZ00nR5XrZ/Y8Db7Ht/qQNuiWslwMJ95M=
-github.com/fil-forge/smelt v0.0.0-20260716110114-f0c15f700778 h1:nPkyJZ3P7r+SBMmSbRihpyHNICTBc0wRo+v4+iI3k1w=
-github.com/fil-forge/smelt v0.0.0-20260716110114-f0c15f700778/go.mod h1:NM/mk/XiP1Kzsy9HWGQeLsosPUvVY3bIrkUzqswThpU=
+github.com/fil-forge/smelt v0.0.0-20260720130429-63116166a06c h1:WHvsleEU6ZiNYDFgLx6KtorXulD+IuLiorMgmp4Th8s=
+github.com/fil-forge/smelt v0.0.0-20260720130429-63116166a06c/go.mod h1:NM/mk/XiP1Kzsy9HWGQeLsosPUvVY3bIrkUzqswThpU=
 github.com/fil-forge/ucantone v0.0.0-20260706102443-79141c5cc52e h1:di/SseJVEO6bznSH/UEnAE2nSwwp/gqgnPLgE9/x2Zg=
 github.com/fil-forge/ucantone v0.0.0-20260706102443-79141c5cc52e/go.mod h1:oFY5BfD0bDeodGlbBHh3/nK99MAS93rGXjoQz7s5qgE=
 github.com/fil-forge/versitygw v0.0.0-20260716095011-7a65883d595a h1:lDwnNmF4LNbevx/YYNCC0CazMiL4eIe38MvfqbRR3RA=
