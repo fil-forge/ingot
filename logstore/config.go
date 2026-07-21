@@ -15,6 +15,11 @@ type Config struct {
 	// <Dir>/catalog. Created if missing.
 	Dir string
 
+	// Bucket is the bucket this store belongs to. The log is segregated per
+	// bucket (each bucket's segments ship to its own Forge space); segment
+	// rows are stamped with it, and recovery lists only this bucket's rows.
+	Bucket string
+
 	// Meta is the persistence backing for segment metadata. Required.
 	Meta Meta
 

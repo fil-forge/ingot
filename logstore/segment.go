@@ -202,8 +202,9 @@ func createPlaneCAR(path string) (*os.File, int64, error) {
 
 // createOpenSegment creates a brand-new single-plane segment in the open
 // state: initializes the CAR file with a header, opens the .ops sidecar
-// (catalog plane only), and records the row in Meta.
-func createOpenSegment(ctx context.Context, dir string, seq uint64, plane blockstore.Plane, meta Meta, logger *zap.Logger) (*Segment, error) {
+// (catalog plane only), and records the row (stamped with its bucket) in
+// Meta.
+func createOpenSegment(ctx context.Context, dir string, seq uint64, plane blockstore.Plane, bucket string, meta Meta, logger *zap.Logger) (*Segment, error) {
 	s := newSegment(dir, seq, plane, logger)
 	s.state = StateOpen
 
@@ -224,7 +225,7 @@ func createOpenSegment(ctx context.Context, dir string, seq uint64, plane blocks
 		s.opsFD = opsFile
 	}
 
-	if err := meta.InsertSegmentOpen(ctx, plane, seq); err != nil {
+	if err := meta.InsertSegmentOpen(ctx, plane, seq, bucket); err != nil {
 		_ = f.Close()
 		if s.opsFD != nil {
 			_ = s.opsFD.Close()

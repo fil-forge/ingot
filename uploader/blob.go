@@ -8,10 +8,12 @@ import (
 
 	assertcmds "github.com/fil-forge/libforge/commands/assert"
 	"github.com/fil-forge/libforge/digestutil"
+	"github.com/fil-forge/ucantone/did"
 	"github.com/multiformats/go-multihash"
 	"go.uber.org/zap"
 
 	"github.com/fil-forge/ingot/forgeclient"
+	"github.com/fil-forge/ingot/internal/reqscope"
 )
 
 // BlobLocation is where an accepted blob can be retrieved from, as resolved at
@@ -34,23 +36,39 @@ type BlobLocation struct {
 // The space is owned by the implementation (Forge is constructed with one), so
 // callers need not thread it.
 type BodyUploader interface {
-	UploadBlob(ctx context.Context, digest multihash.Multihash, size int64, localPath string) (BlobLocation, error)
+	UploadBlob(ctx context.Context, space did.DID, digest multihash.Multihash, size int64, localPath string) (BlobLocation, error)
 }
 
 // UploadBlob uploads one spooled blob to Forge. For a single-shot PutObject the
 // allocate→PUT→accept happens in one call (forgeclient.BlobAdd already drives
 // the whole flow and returns the location commitment); multipart's deferred
 // accept will need a decomposed path (a later phase).
-func (u *Forge) UploadBlob(ctx context.Context, digest multihash.Multihash, size int64, localPath string) (BlobLocation, error) {
+func (u *Forge) UploadBlob(ctx context.Context, space did.DID, digest multihash.Multihash, size int64, localPath string) (BlobLocation, error) {
 	f, err := os.Open(localPath)
 	if err != nil {
 		return BlobLocation{}, fmt.Errorf("uploader: open spooled blob %s: %w", localPath, err)
 	}
 	defer f.Close()
 
-	added, err := u.client.BlobAdd(ctx, f, u.space,
+	// This runs on the request ctx, so the requesting key's proof store must
+	// be present: it authorizes the /blob/add and is captured as the ship
+	// authority for space, so the async catalog ship (SubmitShard, no request
+	// ctx) can reuse it. In forge mode the IAM layer populates reqscope for
+	// every write, so absence is a wiring bug, not a fallback case — proceeding
+	// without it issues a proofless /blob/add that sprue rejects with an opaque
+	// "not issued by subject and has no proofs" 500 deep in the flow. Fail here
+	// instead, naming the space, so the missing store is immediately
+	// attributable.
+	store, ok := reqscope.ProofStore(ctx)
+	if !ok {
+		return BlobLocation{}, fmt.Errorf("uploader: no request-scoped proof store for space %s (IAM layer did not attach one)", space)
+	}
+	u.captureShipProofs(space, store)
+
+	added, err := u.client.BlobAdd(ctx, space, f,
 		forgeclient.WithPrecomputedDigest(digest, uint64(size)),
 		forgeclient.WithPutClient(u.putClient),
+		forgeclient.WithProofStore(store),
 	)
 	if err != nil {
 		return BlobLocation{}, fmt.Errorf("uploader: upload blob: %w", err)
@@ -81,7 +99,7 @@ var _ BodyUploader = (*Forge)(nil)
 // claims the digest at all (docs/architecture.md §6). The space is owned by the
 // implementation (like UploadBlob).
 type BlobRemover interface {
-	RemoveBlob(ctx context.Context, digest multihash.Multihash) error
+	RemoveBlob(ctx context.Context, space did.DID, digest multihash.Multihash) error
 }
 
 // RemoveBlob releases the space's claim on digest.
@@ -92,9 +110,9 @@ type BlobRemover interface {
 // the reference-index bookkeeping (blob_refs count → 0 → RemoveBlob) is
 // exercised end-to-end without a working network primitive; bytes accumulate on
 // Piri until the handler exists.
-func (u *Forge) RemoveBlob(_ context.Context, digest multihash.Multihash) error {
+func (u *Forge) RemoveBlob(_ context.Context, space did.DID, digest multihash.Multihash) error {
 	u.logger.Info("blob remove (no-op; Piri handler to-build)",
-		zap.Stringer("space", u.space),
+		zap.Stringer("space", space),
 		zap.String("digest", digestutil.Format(digest)),
 	)
 	return nil

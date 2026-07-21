@@ -5,7 +5,7 @@ package itest
 import (
 	"testing"
 
-	"github.com/versity/versitygw/tests/integration"
+	"github.com/fil-forge/versitygw/tests/integration"
 )
 
 // forgeCase pairs an upstream versitygw integration case with its subtest
@@ -40,8 +40,8 @@ type forgeCase struct {
 //	go test -tags itest ./itest -run 'TestForgeVersity/PutObject/success' -v
 func TestForgeVersity(t *testing.T) {
 	s, endpoint := forgeStack(t)
-	ingotSelfProvision(t, t.Context(), s, "test@example.com")
-	conf := forgeS3Conf(endpoint)
+	accessKey, secretKey := hiltProvisionTenant(t, t.Context(), s, "versity")
+	conf := forgeS3Conf(endpoint, accessKey, secretKey)
 
 	categories := []struct {
 		name  string
@@ -60,7 +60,7 @@ func TestForgeVersity(t *testing.T) {
 		{"PutObject", putObjectPass, putObjectXFail},
 		{"GetObject", getObjectPass, getObjectXFail},
 		{"HeadObject", headObjectPass, headObjectXFail},
-		{"DeleteObject", deleteObjectPass, nil},
+		{"DeleteObject", deleteObjectPass, deleteObjectXFail},
 		{"CopyObject", copyObjectPass, copyObjectXFail},
 		{"DeleteObjects", deleteObjectsPass, nil},
 		{"CreateMultipartUpload", createMultipartPass, createMultipartXFail},

@@ -48,13 +48,14 @@ func ParseState(s string) (State, bool) {
 }
 
 // SegmentMeta is the persistence-layer view of a single-plane segment.
-// Recovery uses it to enumerate a plane's segments. Each segment belongs
-// to exactly one plane (data or catalog); the two planes ship through
-// independent pipelines.
+// Recovery uses it to enumerate a bucket's segments. Each segment belongs
+// to exactly one plane and — since the log is segregated per bucket — to
+// exactly one bucket, whose space its CAR ships to.
 type SegmentMeta struct {
-	Seq   uint64
-	Plane blockstore.Plane
-	State State
+	Seq    uint64
+	Plane  blockstore.Plane
+	Bucket string
+	State  State
 
 	SealedAt int64
 
@@ -84,8 +85,9 @@ type Meta interface {
 	NextSegmentSeq(ctx context.Context) (uint64, error)
 
 	// InsertSegmentOpen records that segment seq has just been opened for
-	// plane. Idempotent: an existing row in any state is left alone.
-	InsertSegmentOpen(ctx context.Context, plane blockstore.Plane, seq uint64) error
+	// plane by bucket's log. Idempotent: an existing row in any state is
+	// left alone.
+	InsertSegmentOpen(ctx context.Context, plane blockstore.Plane, seq uint64, bucket string) error
 
 	// MarkSegmentSealed transitions a segment from open to sealed in one
 	// transaction: records the CAR size+sha and inserts the per-segment
@@ -104,10 +106,17 @@ type Meta interface {
 	// Used by retention after the on-disk files are unlinked.
 	DeleteSegment(ctx context.Context, plane blockstore.Plane, seq uint64) error
 
-	// ListSegments returns every segment row for plane (open + sealed)
-	// ordered by seq ascending, with op-roots hydrated. Recovery uses it
-	// to rebuild the read tier and re-enqueue unshipped segments.
-	ListSegments(ctx context.Context, plane blockstore.Plane) ([]SegmentMeta, error)
+	// ListSegments returns every segment row for plane belonging to bucket
+	// (open + sealed) ordered by seq ascending, with op-roots hydrated.
+	// Recovery uses it to rebuild the read tier and re-enqueue unshipped
+	// segments.
+	ListSegments(ctx context.Context, plane blockstore.Plane, bucket string) ([]SegmentMeta, error)
+
+	// ListSegmentBuckets returns the distinct buckets that have at least
+	// one segment row for plane. The log manager's startup sweep uses it
+	// to re-open every bucket log with history, so unshipped segments
+	// re-enqueue without waiting for the bucket's next write.
+	ListSegmentBuckets(ctx context.Context, plane blockstore.Plane) ([]string, error)
 
 	// RehydrateSegment writes a segment row + its op-root rows from the
 	// on-disk `.idx` sidecar when the DB row is missing or torn.

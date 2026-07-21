@@ -20,14 +20,14 @@ import (
 //	go test -tags itest ./itest -run TestForgeReadAfterEviction -v -timeout 900s
 func TestForgeReadAfterEviction(t *testing.T) {
 	ctx := t.Context()
-	const email = "test@example.com"
 
 	s, ingotEndpoint := forgeStack(t)
 
-	// ingot self-provisions its space on sprue (guppy-free) so uploads succeed.
-	ingotSelfProvision(t, ctx, s, email)
+	// Provision a hilt tenant so uploads (and the /content/retrieve read
+	// path) have a space and credentials.
+	accessKey, secretKey := hiltProvisionTenant(t, ctx, s, "eviction")
 
-	cfg := forgeConfig(ingotEndpoint)
+	cfg := forgeConfig(ingotEndpoint, accessKey, secretKey)
 	const bucket, key = "evict-bucket", "obj"
 
 	// A deterministic body large enough to be a real blob shipped to piri.

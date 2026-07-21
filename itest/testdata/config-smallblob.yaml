@@ -3,10 +3,8 @@
 # lowered to 64 KiB so small objects coarse-split into multiple body blobs.
 # Mounted over /etc/ingot/config.yaml via stack.WithServiceConfig.
 
-mode: forge
-
 addr: "0.0.0.0:9000"
-region: us-east-1
+region: us-west-1
 data_dir: /data
 
 root_access: ingot
@@ -24,7 +22,11 @@ upload_receipts_url: "http://upload:80/receipt"
 indexer_endpoint: "http://indexer:80"
 indexer_did: "did:web:indexer"
 
-token_store_dir: /data
+# S3 authorization service (hilt); the DID is used verbatim (no resolution)
+auth_service_url: "http://hilt:80"
+auth_service_did: "did:web:hilt"
+# hilt → ingot delegations for /s3/request/authorize and /s3/bucket/*
+auth_service_proofs: "/proofs/hilt-ingot-s3-proof.txt"
 
 # The point of this config: force coarse blob-splitting at 64 KiB.
 max_blob_size: 65536

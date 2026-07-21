@@ -1,7 +1,7 @@
 package testing
 
 import (
-	"github.com/versity/versitygw/tests/integration"
+	"github.com/fil-forge/versitygw/tests/integration"
 )
 
 // Config carries the connection details for a running ingot S3 listener.

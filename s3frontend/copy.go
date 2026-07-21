@@ -7,9 +7,9 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
-	"github.com/versity/versitygw/backend"
-	"github.com/versity/versitygw/s3err"
-	"github.com/versity/versitygw/s3response"
+	"github.com/fil-forge/versitygw/backend"
+	"github.com/fil-forge/versitygw/s3err"
+	"github.com/fil-forge/versitygw/s3response"
 
 	msbucket "github.com/fil-forge/ingot/bucket"
 	"github.com/fil-forge/ingot/mst"
@@ -33,7 +33,7 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 	}
 	dstBucket, dstKey := *input.Bucket, *input.Key
 	if !mst.IsValidKey(dstKey) {
-		return s3response.CopyObjectOutput{}, s3err.GetAPIError(s3err.ErrInvalidArgument)
+		return s3response.CopyObjectOutput{}, s3err.GetAPIError(s3err.ErrInvalidRequest)
 	}
 
 	replace := input.MetadataDirective == types.MetadataDirectiveReplace
@@ -43,7 +43,8 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 	}
 
 	// Destination bucket must exist.
-	if _, err := b.reg.Get(ctx, dstBucket); err != nil {
+	bucketState, err := b.reg.Get(ctx, dstBucket)
+	if err != nil {
 		if errors.Is(err, registry.ErrNotFound) {
 			return s3response.CopyObjectOutput{}, s3err.GetAPIError(s3err.ErrNoSuchBucket)
 		}
@@ -51,7 +52,7 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 	}
 
 	// Resolve the source manifest (NoSuchBucket / NoSuchKey map from lookup).
-	srcMf, err := b.lookupManifest(ctx, srcBucket, srcKey)
+	srcMf, _, err := b.lookupManifest(ctx, srcBucket, srcKey)
 	if err != nil {
 		return s3response.CopyObjectOutput{}, err
 	}
@@ -86,6 +87,7 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 		dstMf.ContentLanguage = backend.GetStringFromPtr(input.ContentLanguage)
 		dstMf.CacheControl = backend.GetStringFromPtr(input.CacheControl)
 		dstMf.Expires = backend.GetStringFromPtr(input.Expires)
+		dstMf.WebsiteRedirectLocation = backend.GetStringFromPtr(input.WebsiteRedirectLocation)
 		dstMf.Metadata = input.Metadata
 	} else {
 		dstMf.ContentType = srcMf.ContentType
@@ -94,12 +96,15 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 		dstMf.ContentLanguage = srcMf.ContentLanguage
 		dstMf.CacheControl = srcMf.CacheControl
 		dstMf.Expires = srcMf.Expires
+		// WebsiteRedirectLocation is intentionally NOT inherited on a
+		// metadata-COPY: S3 drops it unless the copy uses MetadataDirective=REPLACE
+		// and supplies a new value (see the REPLACE branch above).
 		dstMf.Metadata = srcMf.Metadata
 	}
 
 	// Commit to the destination: splice + reference index. The new claims use
 	// the DESTINATION bucket/space; the same digests gain another reference.
-	if err := b.commitManifest(ctx, dstBucket, dstKey, dstMf, bodyDigests(dstMf.Body)); err != nil {
+	if err := b.commitManifest(ctx, bucketState, dstKey, dstMf, bodyDigests(dstMf.Body)); err != nil {
 		return s3response.CopyObjectOutput{}, err
 	}
 
