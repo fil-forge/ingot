@@ -23,9 +23,10 @@ import (
 // (parked — outside the PDP pipeline), Complete must conclude (accept) every
 // part, and Abort must unwind parked blobs with /blob/abort → /blob/reject.
 //
-// Requires piri + sprue builds with /blob/remove + /blob/abort/reject; the
-// published images predate them, so inject working-tree binaries and skip
-// otherwise (same gate as TestForgeDeleteReleasesNetworkBlob):
+// Requires piri + sprue builds with the blob-removal chain (/blob/remove →
+// /blob/release, /blob/abort → /blob/reject); the published images predate
+// them, so inject working-tree binaries and skip otherwise (same gate as
+// TestForgeDeleteReleasesNetworkBlob):
 //
 //	(cd ../../piri  && CGO_ENABLED=0 GOOS=linux go build -o /tmp/piri  ./cmd)
 //	(cd ../../sprue && CGO_ENABLED=0 GOOS=linux go build -o /tmp/sprue ./cmd/main.go)

@@ -7,7 +7,9 @@ import (
 	"os"
 
 	assertcmds "github.com/fil-forge/libforge/commands/assert"
+	blobcmds "github.com/fil-forge/libforge/commands/blob"
 	"github.com/fil-forge/libforge/digestutil"
+	ucanerrors "github.com/fil-forge/ucantone/errors"
 	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
 	"go.uber.org/zap"
@@ -148,12 +150,24 @@ func (u *Forge) AbortBlob(ctx context.Context, digest multihash.Multihash, cause
 		zap.String("digest", digestutil.Format(digest)),
 	)
 	if err := u.client.BlobAbort(ctx, digest, u.space, cause); err != nil {
-		u.logger.Error("blob abort failed",
-			zap.Stringer("space", u.space),
-			zap.String("digest", digestutil.Format(digest)),
-			zap.Error(err),
-		)
-		return fmt.Errorf("uploader: unallocating blob: %w", err)
+		// A BlobAccepted refusal is final, not a fault: the space accepted
+		// this content (e.g. a concurrent session completed with the same
+		// content-addressed part), so the blob now belongs to the reference
+		// index and is released via /blob/remove when its last claim drops.
+		var named ucanerrors.Named
+		if ucanerrors.As(err, &named) && named.Name() == blobcmds.BlobAcceptedErrorName {
+			u.logger.Info("blob abort refused: blob accepted by the space; reference accounting owns it",
+				zap.Stringer("space", u.space),
+				zap.String("digest", digestutil.Format(digest)),
+			)
+		} else {
+			u.logger.Error("blob abort failed",
+				zap.Stringer("space", u.space),
+				zap.String("digest", digestutil.Format(digest)),
+				zap.Error(err),
+			)
+		}
+		return fmt.Errorf("uploader: aborting blob: %w", err)
 	}
 	return nil
 }

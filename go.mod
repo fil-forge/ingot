@@ -8,7 +8,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.15
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.99.1
 	github.com/fil-forge/indexing-service v1.13.5-0.20260619142411-efe3f5fab717
-	github.com/fil-forge/libforge v0.0.0-20260717174550-aac837a730c2
+	github.com/fil-forge/libforge v0.0.0-20260723212548-3e5e6ba95711
 	github.com/fil-forge/smelt v0.0.0-20260717195554-271831781c1d
 	github.com/fil-forge/ucantone v0.0.0-20260706102443-79141c5cc52e
 	github.com/fxamacker/cbor/v2 v2.9.2

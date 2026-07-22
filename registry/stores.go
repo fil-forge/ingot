@@ -145,7 +145,7 @@ type LocationStore interface {
 
 // BlobPark is one row of ingot.blob_parks: the persistable state of a blob
 // that is durable on its provider but not yet accepted (multipart's deferred
-// conclude, §7.2). AddTask/AcceptTask are the /space/blob/add and
+// conclude, §7.2). AddTask/AcceptTask are the /blob/add and
 // /blob/accept task CIDs; PutInvocation is the sealed /http/put invocation
 // whose metadata carries the derived signer keys needed to conclude —
 // sensitive, deleted at conclude/abort. Keyed globally by Digest (like

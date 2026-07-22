@@ -24,7 +24,9 @@ func (c *Client) BlobRemove(ctx context.Context, digest multihash.Multihash, spa
 	inv, err := blobcmds.Remove.Invoke(
 		c.signer,
 		space,
-		&blobcmds.RemoveArguments{Space: space, Digest: digest},
+		// The space is the invocation subject; it is not repeated in the
+		// arguments.
+		&blobcmds.RemoveArguments{Digest: digest},
 		invocation.WithAudience(c.serviceID),
 		invocation.WithProofs(proofLinks...),
 	)

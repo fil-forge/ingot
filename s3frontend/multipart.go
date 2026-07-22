@@ -452,8 +452,11 @@ func (b *Backend) cleanupPartBlobs(ctx context.Context, uploadID string, digests
 		}
 		// A parked blob is durable on its provider — release it there too
 		// (best-effort; the reject on piri is idempotent, a straggler is
-		// FIL-625's to reap). Cause is the /space/blob/add task link the
-		// upload service needs to locate the provider.
+		// FIL-625's to reap). Cause is the /blob/add task link the
+		// upload service needs to locate the provider. A BlobAccepted
+		// refusal is benign — a concurrent session in this space accepted
+		// the same content, so the reference index owns the blob now — and
+		// the park row is obsolete either way.
 		if state == registry.IntentParked {
 			if park, err := b.parks.GetPark(ctx, d); err == nil {
 				if cause, err := cid.Cast(park.AddTask); err == nil {

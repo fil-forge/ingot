@@ -14,7 +14,7 @@ import (
 
 // BlobAbort invokes /blob/abort against the upload service (sprue),
 // abandoning the space's in-flight upload of a parked (never-accepted)
-// blob. cause is the /space/blob/add task link (ParkedBlob.AddTask) — sprue
+// blob. cause is the /blob/add task link (ParkedBlob.AddTask) — sprue
 // walks its receipt chain to locate the storage node holding the parked
 // bytes (which have no registration or acceptance to look up by) and
 // forwards a /blob/reject there. Idempotent on the node; a blob that has
@@ -28,7 +28,9 @@ func (c *Client) BlobAbort(ctx context.Context, digest multihash.Multihash, spac
 	inv, err := blobcmds.Abort.Invoke(
 		c.signer,
 		space,
-		&blobcmds.AbortArguments{Space: space, Digest: digest, Cause: cause},
+		// The space is the invocation subject; it is not repeated in the
+		// arguments.
+		&blobcmds.AbortArguments{Digest: digest, Cause: cause},
 		invocation.WithAudience(c.serviceID),
 		invocation.WithProofs(proofLinks...),
 	)

@@ -88,7 +88,7 @@ type AddedBlob struct {
 type ParkedBlob struct {
 	Digest multihash.Multihash
 	Size   uint64
-	// AddTask is the /space/blob/add task link — the receipt-chain root the
+	// AddTask is the /blob/add task link — the receipt-chain root the
 	// upload service uses to locate the provider for abort.
 	AddTask cid.Cid
 	// AcceptTask is the /blob/accept task link BlobConclude polls.

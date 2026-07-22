@@ -16,11 +16,11 @@ import (
 // TestForgeDeleteReleasesNetworkBlob is the delete-finality regression gate
 // (FIL-588): DeleteObject must release the blob on the network, not just drop
 // registry rows. The chain under test is ingot's reference index (claims→0 ⇒
-// RemoveBlob) → forgeclient /blob/remove → sprue (deregister + forward) →
-// piri (claim release; deferred physical deletion once the PDP aggregate
-// root retires on-chain).
+// RemoveBlob) → forgeclient /blob/remove → sprue (forward + deregister) →
+// piri /blob/release (claim release; deferred physical deletion once the
+// PDP aggregate root retires on-chain).
 //
-// The published piri/sprue images predate the /blob/remove handlers, so this
+// The published piri/sprue images predate the removal handlers, so this
 // test injects working-tree builds of both and skips when they aren't
 // provided:
 //
@@ -35,7 +35,7 @@ func TestForgeDeleteReleasesNetworkBlob(t *testing.T) {
 	piriBin := os.Getenv("ITEST_PIRI_BIN")
 	sprueBin := os.Getenv("ITEST_SPRUE_BIN")
 	if piriBin == "" || sprueBin == "" {
-		t.Skip("requires piri+sprue builds with the /blob/remove chain: set ITEST_PIRI_BIN and ITEST_SPRUE_BIN (see test doc comment)")
+		t.Skip("requires piri+sprue builds with the blob-removal chain: set ITEST_PIRI_BIN and ITEST_SPRUE_BIN (see test doc comment)")
 	}
 
 	ctx := t.Context()
@@ -89,16 +89,16 @@ func TestForgeDeleteReleasesNetworkBlob(t *testing.T) {
 		t.Fatalf("GET after delete succeeded, want NoSuchKey")
 	}
 
-	// And the release traversed the network: piri's /blob/remove handler ran
+	// And the release traversed the network: piri's /blob/release handler ran
 	// and, with the last claim gone, queued the piece for removal. Byte
 	// release is fully asynchronous — ingot's releaseBlobs is best-effort
 	// post-commit, and piri's removal sweep (PDPRemoveSweep, 30s ticks)
 	// re-verifies claims and pipeline state before finalizing — so poll the
 	// provider's logs through to the finalization line.
-	waitForPiriLog(t, ctx, s, "/blob/remove", 2*time.Minute)
+	waitForPiriLog(t, ctx, s, "/blob/release", 2*time.Minute)
 	waitForPiriLog(t, ctx, s, "queueing piece removal", 2*time.Minute)
 	waitForPiriLog(t, ctx, s, "finalized piece removal", 3*time.Minute)
-	t.Logf("delete finality OK: /blob/remove executed on piri and the sweep finalized the byte release")
+	t.Logf("delete finality OK: /blob/release executed on piri and the sweep finalized the byte release")
 }
 
 // waitForPiriLog polls piri-0's container logs until substr appears.
