@@ -268,7 +268,7 @@ func provideAuthServiceClient(cfg config.Config, id ServiceIdentity, logger *zap
 		}
 		proofs = ucanlib.NewContainerProofStore(ct)
 	}
-	return hiltclient.New(authServiceDID, *authServiceURL, id.Signer, proofs, hiltclient.WithLogger(logger))
+	return hiltclient.New(authServiceDID, *authServiceURL, id.Signer, hiltclient.WithBaseProofs(proofs), hiltclient.WithLogger(logger))
 }
 
 // provideKeyProofs is the per-access-key delegation store registry: the IAM
