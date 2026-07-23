@@ -5,6 +5,7 @@ import (
 	"crypto/md5"
 	"crypto/sha256"
 	"fmt"
+	"github.com/fil-forge/ucantone/did"
 	"io"
 
 	mh "github.com/multiformats/go-multihash"
@@ -69,15 +70,16 @@ func SplitBody(ctx context.Context, w blockstore.BlobWriter, r io.Reader, maxBlo
 }
 
 // OpenBody returns a reader over the full body, streaming each blob from bs by
-// its digest in order.
-func OpenBody(ctx context.Context, bs blockstore.BlobReader, body Body) io.ReadCloser {
-	return &blobBodyReader{ctx: ctx, bs: bs, blobs: body.Blobs, pos: 0, end: body.Size - 1}
+// its digest in order. space is the owning bucket's Forge space (an evicted
+// blob is re-fetched from the network by space + digest).
+func OpenBody(ctx context.Context, bs blockstore.BlobReader, space did.DID, body Body) io.ReadCloser {
+	return &blobBodyReader{ctx: ctx, bs: bs, space: space, blobs: body.Blobs, pos: 0, end: body.Size - 1}
 }
 
 // OpenBodyRange returns a reader over [start, end] inclusive of the body.
 // Caller must ensure 0 <= start <= end <= Size-1.
-func OpenBodyRange(ctx context.Context, bs blockstore.BlobReader, body Body, start, end int64) io.ReadCloser {
-	return &blobBodyReader{ctx: ctx, bs: bs, blobs: body.Blobs, pos: start, end: end}
+func OpenBodyRange(ctx context.Context, bs blockstore.BlobReader, space did.DID, body Body, start, end int64) io.ReadCloser {
+	return &blobBodyReader{ctx: ctx, bs: bs, space: space, blobs: body.Blobs, pos: start, end: end}
 }
 
 // blobBodyReader streams a Body's blobs lazily, keeping at most one open blob
@@ -89,6 +91,7 @@ func OpenBodyRange(ctx context.Context, bs blockstore.BlobReader, body Body, sta
 type blobBodyReader struct {
 	ctx   context.Context
 	bs    blockstore.BlobReader
+	space did.DID
 	blobs []BlobRef
 
 	pos int64 // current absolute byte position (next byte to return)
@@ -150,7 +153,7 @@ func (br *blobBodyReader) openCurrent() error {
 		// The Blobs list does not cover pos — a malformed manifest.
 		return io.ErrUnexpectedEOF
 	}
-	rc, err := br.bs.OpenBlob(br.ctx, mh.Multihash(b.Digest))
+	rc, err := br.bs.OpenBlob(br.ctx, br.space, mh.Multihash(b.Digest))
 	if err != nil {
 		return fmt.Errorf("read blob @%d: %w", b.Offset, err)
 	}

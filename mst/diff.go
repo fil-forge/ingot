@@ -3,6 +3,7 @@ package mst
 import (
 	"context"
 	"fmt"
+	"github.com/fil-forge/ucantone/did"
 
 	cid "github.com/ipfs/go-cid"
 
@@ -21,14 +22,14 @@ type DiffOp struct {
 // DiffTrees enumerates the additions, deletions, and mutations needed to go
 // from the MST rooted at `from` to the MST rooted at `to`.
 func DiffTrees(ctx context.Context, bs blockstore.BaseStore, from, to cid.Cid) ([]*DiffOp, error) {
-	cst := blockstore.CborStore(bs)
+	cst := blockstore.SpacelessReader(bs)
 
 	if from == cid.Undef {
 		return identityDiff(ctx, bs, to)
 	}
 
-	ft := LoadMST(cst, from)
-	tt := LoadMST(cst, to)
+	ft := LoadMST(cst, did.Undef, from)
+	tt := LoadMST(cst, did.Undef, to)
 
 	fents, err := ft.getEntries(ctx)
 	if err != nil {
@@ -175,8 +176,8 @@ func nodeEntriesEqual(a, b *nodeEntry) bool {
 }
 
 func identityDiff(ctx context.Context, bs blockstore.BaseStore, root cid.Cid) ([]*DiffOp, error) {
-	cst := blockstore.CborStore(bs)
-	tt := LoadMST(cst, root)
+	cst := blockstore.SpacelessReader(bs)
+	tt := LoadMST(cst, did.Undef, root)
 
 	var ops []*DiffOp
 	if err := tt.WalkLeavesFrom(ctx, "", func(key string, val cid.Cid) error {

@@ -1,6 +1,5 @@
-// Package cmd is the ingot daemon's cobra/viper CLI: `serve` runs the S3
-// gateway (standalone or forge mode), `login`/`space` manage Forge
-// authorization and the space key.
+// Package cmd is the ingot daemon's cobra/viper CLI:
+//   - `serve` runs the S3 gateway.
 package cmd
 
 import (
@@ -8,6 +7,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/fil-forge/ingot/config"
 	"github.com/spf13/cobra"
 
 	"github.com/fil-forge/ingot/internal/build"
@@ -28,8 +28,6 @@ func newRootCmd() *cobra.Command {
 		"config file (default: ./config.yaml or /etc/ingot/config.yaml)")
 	root.AddCommand(
 		newServeCmd(),
-		newSpaceCmd(),
-		newLoginCmd(),
 		newWhoamiCmd(),
 		newVersionCmd(),
 	)
@@ -42,24 +40,17 @@ func newWhoamiCmd() *cobra.Command {
 		Short: "Print the agent DID and configured endpoints",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, err := Load(cfgFile)
+			cfg, err := config.Load(cfgFile)
 			if err != nil {
 				return err
 			}
-			cmd.Printf("mode:           %s\n", cfg.Mode)
-			if cfg.Identity.KeyFile != "" {
-				if id, err := loadAgentIdentity(cfg.Identity.KeyFile); err == nil {
-					cmd.Printf("agent DID:      %s\n", id.Signer.DID())
-				} else {
-					cmd.Printf("agent DID:      <unreadable: %v>\n", err)
-				}
+			id, err := loadAgentIdentity(cfg.Identity.KeyFile)
+			if err != nil {
+				return err
 			}
-			if cfg.UploadServiceURL != "" {
-				cmd.Printf("upload service: %s (%s)\n", cfg.UploadServiceURL, cfg.UploadServiceDID)
-			}
-			if cfg.IndexerEndpoint != "" {
-				cmd.Printf("indexer:        %s (%s)\n", cfg.IndexerEndpoint, cfg.IndexerDID)
-			}
+			cmd.Printf("agent DID:      %s\n", id.Signer.DID())
+			cmd.Printf("upload service: %s (%s)\n", cfg.UploadServiceURL, cfg.UploadServiceDID)
+			cmd.Printf("auth service:   %s (%s)\n", cfg.AuthServiceURL, cfg.AuthServiceDID)
 			return nil
 		},
 	}

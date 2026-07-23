@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	blobcmds "github.com/fil-forge/libforge/commands/blob"
+	ucanlib "github.com/fil-forge/libforge/ucan"
 	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/ucantone/execution"
 	"github.com/fil-forge/ucantone/ucan/invocation"
@@ -17,11 +18,17 @@ import (
 // blob. cause is the /blob/add task link (ParkedBlob.AddTask) — sprue
 // walks its receipt chain to locate the storage node holding the parked
 // bytes (which have no registration or acceptance to look up by) and
-// forwards a /blob/reject there. Idempotent on the node; a blob that has
-// been accepted is refused (release it via the reference index /
-// /blob/remove instead).
-func (c *Client) BlobAbort(ctx context.Context, digest multihash.Multihash, space did.DID, cause cid.Cid) error {
-	proofs, proofLinks, err := c.ProofChain(ctx, c.signer.DID(), blobcmds.Abort.Command, space)
+// forwards a /blob/reject there. The space is the invocation subject.
+// Idempotent on the node; a blob the space has accepted is refused with
+// BlobAccepted (release it via the reference index / /blob/remove instead).
+func (c *Client) BlobAbort(ctx context.Context, space did.DID, digest multihash.Multihash, cause cid.Cid, options ...BlobAddOption) error {
+	cfg := NewBlobAddConfig(options...)
+	proofStore := ucanlib.ProofStore(c.tokenStore)
+	if cfg.ProofStore != nil {
+		proofStore = cfg.ProofStore
+	}
+
+	proofs, proofLinks, err := proofStore.ProofChain(ctx, c.signer.DID(), blobcmds.Abort.Command, space)
 	if err != nil {
 		return fmt.Errorf("building proof chain: %w", err)
 	}

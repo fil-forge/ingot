@@ -14,6 +14,8 @@ import (
 	"github.com/fil-forge/ingot/blockstore"
 	"github.com/fil-forge/ingot/migrations"
 	"github.com/fil-forge/ingot/registry"
+	"github.com/fil-forge/libforge/testutil"
+	"github.com/fil-forge/ucantone/did"
 )
 
 func liveCid(t *testing.T, s string) cid.Cid {
@@ -53,17 +55,24 @@ func TestPostgresStores_Live(t *testing.T) {
 	}
 
 	r := registry.NewPostgres(pool)
+	seedBucket := func(t *testing.T, name string) {
+		t.Helper()
+		// space has no default (Create always supplies the DID Hilt
+		// returns); the seed uses '' — the pre-space sentinel Get maps
+		// to did.Undef.
+		if _, err := pool.Exec(ctx, `INSERT INTO ingot.buckets (name, space) VALUES ($1, '')`, name); err != nil {
+			t.Fatalf("seed bucket %q: %v", name, err)
+		}
+	}
 	digest := []byte{0x12, 0x20, 0xab, 0xcd} // binary, to exercise bytea round-trips
 
 	t.Run("bucket space defaults empty", func(t *testing.T) {
-		if err := r.Create(ctx, "b", time.Now().Unix()); err != nil {
-			t.Fatalf("Create: %v", err)
-		}
+		seedBucket(t, "b")
 		st, err := r.Get(ctx, "b")
 		if err != nil {
 			t.Fatalf("Get: %v", err)
 		}
-		if st.Space != "" {
+		if st.Space != did.Undef {
 			t.Fatalf("space = %q, want empty default", st.Space)
 		}
 	})
@@ -73,8 +82,8 @@ func TestPostgresStores_Live(t *testing.T) {
 		// denormalized, so a given (bucket, key, version) belongs to one space
 		// (a bucket has one space). A second space therefore implies a second
 		// bucket — bucket "b2" below, not a re-keyed "b".
-		const space = "did:space:1"
-		add := func(bucket, key, sp string) {
+		space := testutil.RandomDID(t)
+		add := func(bucket, key string, sp did.DID) {
 			if err := r.AddBlobClaim(ctx, registry.BlobClaim{Digest: digest, Bucket: bucket, ObjectKey: key, VersionID: registry.NullVersionID, Space: sp}); err != nil {
 				t.Fatalf("AddBlobClaim: %v", err)
 			}
@@ -82,11 +91,11 @@ func TestPostgresStores_Live(t *testing.T) {
 		add("b", "k1", space)
 		add("b", "k2", space)
 		add("b", "k1", space) // ON CONFLICT DO NOTHING — does not inflate the count
-		add("b2", "k1", "did:space:2")
+		add("b2", "k1", testutil.RandomDID(t))
 		if n, _ := r.CountClaims(ctx, space, digest); n != 2 {
 			t.Fatalf("count space1 = %d, want 2", n)
 		}
-		if n, _ := r.CountClaims(ctx, "did:space:2", digest); n != 1 {
+		if n, _ := r.CountClaims(ctx, testutil.RandomDID(t), digest); n != 1 {
 			t.Fatalf("count space2 = %d, want 1", n)
 		}
 		if err := r.DeleteBlobClaim(ctx, digest, "b", "k1", registry.NullVersionID); err != nil {
@@ -127,17 +136,18 @@ func TestPostgresStores_Live(t *testing.T) {
 	})
 
 	t.Run("location round trip", func(t *testing.T) {
-		if err := r.PutLocation(ctx, registry.BlobLocation{Space: "s", Digest: digest, Provider: "did:piri", URL: "http://piri/b", Size: 100}); err != nil {
+		space := testutil.RandomDID(t)
+		if err := r.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: digest, Provider: "did:piri", URL: "http://piri/b", Size: 100}); err != nil {
 			t.Fatalf("PutLocation: %v", err)
 		}
-		loc, err := r.GetLocation(ctx, "s", digest)
+		loc, err := r.GetLocation(ctx, space, digest)
 		if err != nil || loc.URL != "http://piri/b" || loc.Size != 100 {
 			t.Fatalf("GetLocation = %+v, err %v", loc, err)
 		}
-		if err := r.DeleteLocation(ctx, "s", digest); err != nil {
+		if err := r.DeleteLocation(ctx, space, digest); err != nil {
 			t.Fatalf("DeleteLocation: %v", err)
 		}
-		if _, err := r.GetLocation(ctx, "s", digest); err != registry.ErrNotFound {
+		if _, err := r.GetLocation(ctx, space, digest); err != registry.ErrNotFound {
 			t.Fatalf("GetLocation after delete = %v, want ErrNotFound", err)
 		}
 	})
@@ -295,9 +305,7 @@ func TestPostgresStores_Live(t *testing.T) {
 	t.Run("forge_root advance guarded on root", func(t *testing.T) {
 		committed := liveCid(t, "fg-committed")
 		stale := liveCid(t, "fg-stale")
-		if err := r.Create(ctx, "fg", time.Now().Unix()); err != nil {
-			t.Fatalf("Create: %v", err)
-		}
+		seedBucket(t, "fg")
 		if err := r.CASRoot(ctx, "fg", cid.Undef, committed); err != nil {
 			t.Fatalf("CASRoot: %v", err)
 		}
@@ -305,7 +313,7 @@ func TestPostgresStores_Live(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NextSegmentSeq: %v", err)
 		}
-		if err := r.InsertSegmentOpen(ctx, blockstore.PlaneCatalog, seq); err != nil {
+		if err := r.InsertSegmentOpen(ctx, blockstore.PlaneCatalog, seq, "fg"); err != nil {
 			t.Fatalf("InsertSegmentOpen: %v", err)
 		}
 		// Ship a segment whose op-roots include a stale root the bucket never

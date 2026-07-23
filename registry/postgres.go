@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
+	"github.com/fil-forge/ucantone/did"
 	"github.com/ipfs/go-cid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -18,6 +20,13 @@ const uniqueViolation = "23505"
 // Postgres is a *pgxpool.Pool-backed Registry. Schema is owned by
 // pkg/ingot/migrations and lives in the `ingot` Postgres schema. The
 // pool is borrowed, never closed by this type.
+//
+// Bucket operations (Create, Delete, List) are forwarded to the Hilt
+// tenant service — the authority on which buckets exist and who may act
+// on them — with the local table holding only per-bucket root state.
+// Each of those methods recovers the original signed S3 request from
+// ctx (see hiltclient.RequestFromContext), so they must be called on a
+// request-serving path.
 type Postgres struct {
 	pool *pgxpool.Pool
 }
@@ -32,10 +41,11 @@ func NewPostgres(pool *pgxpool.Pool) *Postgres {
 // Compile-time assertion.
 var _ Registry = (*Postgres)(nil)
 
-func (r *Postgres) Create(ctx context.Context, name string, createdAt int64) error {
+func (r *Postgres) Create(ctx context.Context, name string, space did.DID) error {
+	// root_cid stays NULL (empty bucket); created_at from the column default.
 	_, err := r.pool.Exec(ctx,
-		`INSERT INTO ingot.buckets (name, root_cid, created_at) VALUES ($1, NULL, $2)`,
-		name, createdAt)
+		`INSERT INTO ingot.buckets (name, space) VALUES ($1, $2)`,
+		name, space.String())
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == uniqueViolation {
@@ -48,18 +58,21 @@ func (r *Postgres) Create(ctx context.Context, name string, createdAt int64) err
 
 func (r *Postgres) Get(ctx context.Context, name string) (*State, error) {
 	var rootBytes, forgeBytes []byte
-	var createdAt int64
-	var space string
+	var createdAt time.Time
+	var spaceStr string
 	err := r.pool.QueryRow(ctx,
 		`SELECT root_cid, forge_root_cid, created_at, space FROM ingot.buckets WHERE name = $1`, name).
-		Scan(&rootBytes, &forgeBytes, &createdAt, &space)
+		Scan(&rootBytes, &forgeBytes, &createdAt, &spaceStr)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
 		return nil, fmt.Errorf("registry: get %q: %w", name, err)
 	}
-
+	space, err := did.Parse(spaceStr)
+	if err != nil {
+		return nil, fmt.Errorf("registry: parse space %q: %w", spaceStr, err)
+	}
 	st := &State{Name: name, Space: space, CreatedAt: createdAt}
 	if err := setCidPg(&st.Root, rootBytes, name, "root_cid"); err != nil {
 		return nil, err
@@ -70,45 +83,9 @@ func (r *Postgres) Get(ctx context.Context, name string) (*State, error) {
 	return st, nil
 }
 
-func (r *Postgres) List(ctx context.Context) ([]*State, error) {
-	rows, err := r.pool.Query(ctx,
-		`SELECT name, root_cid, forge_root_cid, created_at, space FROM ingot.buckets ORDER BY name ASC`)
-	if err != nil {
-		return nil, fmt.Errorf("registry: list: %w", err)
-	}
-	defer rows.Close()
-
-	var out []*State
-	for rows.Next() {
-		var name string
-		var rootBytes, forgeBytes []byte
-		var createdAt int64
-		var space string
-		if err := rows.Scan(&name, &rootBytes, &forgeBytes, &createdAt, &space); err != nil {
-			return nil, fmt.Errorf("registry: list scan: %w", err)
-		}
-		st := &State{Name: name, Space: space, CreatedAt: createdAt}
-		if err := setCidPg(&st.Root, rootBytes, name, "root_cid"); err != nil {
-			return nil, err
-		}
-		if err := setCidPg(&st.ForgeRoot, forgeBytes, name, "forge_root_cid"); err != nil {
-			return nil, err
-		}
-		out = append(out, st)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("registry: list rows: %w", err)
-	}
-	return out, nil
-}
-
 func (r *Postgres) Delete(ctx context.Context, name string) error {
-	tag, err := r.pool.Exec(ctx, `DELETE FROM ingot.buckets WHERE name = $1`, name)
-	if err != nil {
+	if _, err := r.pool.Exec(ctx, `DELETE FROM ingot.buckets WHERE name = $1`, name); err != nil {
 		return fmt.Errorf("registry: delete %q: %w", name, err)
-	}
-	if tag.RowsAffected() == 0 {
-		return ErrNotFound
 	}
 	return nil
 }

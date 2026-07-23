@@ -8,6 +8,7 @@ import (
 	"github.com/multiformats/go-multihash"
 
 	"github.com/fil-forge/ingot/blockstore"
+	"github.com/fil-forge/libforge/testutil"
 )
 
 func testCid(t *testing.T, s string) cid.Cid {
@@ -27,7 +28,7 @@ func TestMarkSegmentShipped_GuardsForgeRootOnRoot(t *testing.T) {
 	ctx := context.Background()
 	m := NewMemStore()
 
-	if err := m.Create(ctx, "bk", 0); err != nil {
+	if err := m.Create(ctx, "bk", testutil.RandomDID(t)); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	committed := testCid(t, "committed-root")
@@ -37,7 +38,7 @@ func TestMarkSegmentShipped_GuardsForgeRootOnRoot(t *testing.T) {
 	}
 
 	seq, _ := m.NextSegmentSeq(ctx)
-	if err := m.InsertSegmentOpen(ctx, blockstore.PlaneCatalog, seq); err != nil {
+	if err := m.InsertSegmentOpen(ctx, blockstore.PlaneCatalog, seq, "bk"); err != nil {
 		t.Fatalf("InsertSegmentOpen: %v", err)
 	}
 
@@ -60,10 +61,10 @@ func TestMarkSegmentShipped_GuardsForgeRootOnRoot(t *testing.T) {
 
 	// A segment carrying ONLY a stale op-root must not advance forge_root at all.
 	m2 := NewMemStore()
-	_ = m2.Create(ctx, "bk2", 0)
+	_ = m2.Create(ctx, "bk2", testutil.RandomDID(t))
 	_ = m2.CASRoot(ctx, "bk2", cid.Undef, committed)
 	seq2, _ := m2.NextSegmentSeq(ctx)
-	_ = m2.InsertSegmentOpen(ctx, blockstore.PlaneCatalog, seq2)
+	_ = m2.InsertSegmentOpen(ctx, blockstore.PlaneCatalog, seq2, "bk2")
 	if err := m2.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seq2, 100, []blockstore.OpRoot{
 		{Bucket: "bk2", Root: stale},
 	}); err != nil {

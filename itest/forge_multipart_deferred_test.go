@@ -52,8 +52,8 @@ func TestForgeDeferredMultipart(t *testing.T) {
 		stackOpts = append(stackOpts, stack.WithBlockchainImage(img))
 	}
 	s, endpoint := forgeStack(t, stackOpts...)
-	ingotSelfProvision(t, ctx, s, "test@example.com")
-	cl := sdkClient(forgeS3Conf(endpoint))
+	accessKey, secretKey := hiltProvisionTenant(t, ctx, s, "mpdeferred")
+	cl := sdkClient(forgeS3Conf(endpoint, accessKey, secretKey))
 
 	// RoundTrip: parts park at UploadPart (durable on piri, NOT accepted),
 	// Complete concludes them, and the object round-trips.

@@ -52,7 +52,10 @@ ingot depends only on these — it must **never** import `fil-forge/sprue` or
   `commands/{blob,content,http,assert,ucan,index,provider,access}`, `blobindex`
   (sharded-dag-index), `ucan` (ProofStore), `ucan/retrieval`, `didmailto`, `receipt`.
 - **`indexing-service/pkg/{client,types}`** — indexer query client.
-- **`versity/versitygw`** — the S3 REST front end (we implement `backend.Backend`).
+- **`fil-forge/versitygw`** — our fork of versity/versitygw, the S3 REST front
+  end (we implement `backend.Backend`). The fork adds externally derived SigV4
+  signing keys (`auth.Account.SigningKey`, `middlewares.RequestIAMService`) for
+  the Hilt flow.
 - Plumbing: `go-cid`, `go-block-format`, `whyrusleeping/cbor-gen` (**not**
   go-ipld-prime), `multiformats/*`, `pgx/v5`, `goose/v3`, `spf13/{cobra,viper}`,
   `uber-go/fx`, `zap`.
@@ -96,10 +99,21 @@ Internal:
 - **`forgeclient/`** — carried-from-guppy edge client: `/blob/add`,
   `/ucan/conclude`, `/index/add`, `/provider/add`, `/access/delegate`, and the
   `/access` login flow.
+- **`iam/`** — the Hilt (auth-service) integration over the external
+  `github.com/fil-forge/hilt/pkg/client` (RFC: forge-s3-tenant-management):
+  versitygw `IAMService`/`RequestIAMService` authorizing each non-root
+  request via `/s3/request/authorize` (derived SigV4 key), plus
+  `DelegationCache` — a TTL cache (go-cache) of Hilt-issued delegations
+  (authorize re-delegations + `/s3/bucket/info` chains) that the network
+  read tier consumes as its per-space `/content/retrieve` proof store.
+  **Forge mode requires Hilt** (`auth_service_url`/`auth_service_did`): the
+  postgres registry forwards bucket create/delete/list to it, recovering
+  the signed S3 request from the method's ctx.
 - **`tokenstore/`** — carried-from-guppy delegation store (`tokens.cbor`).
 - **`bucket/`** — per-object model: `manifest.go` (`ObjectManifest`, `Body`),
   `chunker.go` (`BodyCodec`/`FixedChunker`), `cbor_gen.go`.
-- **`mst/`** — the forked MST (only dep: go-cid).
+- **`mst/`** — the forked MST (deps: go-cid, blockstore, ucantone/did — trees
+  carry their bucket's space for network-backed reads).
 - **`inmem/`** — `MemStore` (Registry+Meta), `NopBaseReader`, `NopUploader`; backs
   standalone mode (slated for removal).
 - **`cars/`**, **`migrations/`**, **`internal/ucanexec/`**, **`gen/`**,
@@ -141,7 +155,9 @@ Viper/yaml-bindable. Key fields: `Enabled`, `Addr`, `DataDir`, `Region`,
 `DataPlane`/`CatalogPlane` `{SealBytes, SealAge, Ship, Retain}` overrides,
 `IndexerEndpoint`/`IndexerDID`, `ReadCacheBytes` (0 → 256 MiB, <0 → off),
 `UploadServiceURL`/`UploadServiceDID`/`UploadReceiptsURL`, `TokenStoreDir`
-(→ `DataDir`). `Config.ServerConfig()` is the single mapping site. The daemon's
+(→ `DataDir`), `HiltURL`/`HiltDID`/`HiltProofs` (tenant-management service;
+proofs = file path or string-encoded UCAN container, optional).
+`Config.ServerConfig()` is the single mapping site. The daemon's
 `DaemonConfig` (cmd/config.go) embeds `Config` + `Mode`/`PostgresDSN`/`Identity`.
 
 ## Testing

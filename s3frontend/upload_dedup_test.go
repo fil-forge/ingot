@@ -13,6 +13,8 @@ import (
 	"github.com/fil-forge/ingot/inmem"
 	"github.com/fil-forge/ingot/logstore"
 	"github.com/fil-forge/ingot/uploader"
+	"github.com/fil-forge/libforge/testutil"
+	"github.com/fil-forge/ucantone/did"
 )
 
 // countingUploader records how many times each digest is uploaded, so a test can
@@ -24,7 +26,7 @@ type countingUploader struct {
 	calls map[string]int
 }
 
-func (u *countingUploader) UploadBlob(_ context.Context, digest multihash.Multihash, size int64, _ string) (uploader.BlobLocation, error) {
+func (u *countingUploader) UploadBlob(_ context.Context, space did.DID, digest multihash.Multihash, size int64, _ string) (uploader.BlobLocation, error) {
 	u.mu.Lock()
 	u.calls[string(digest)]++
 	u.mu.Unlock()
@@ -64,6 +66,7 @@ func TestUploadDedup_SkipsAlreadyLocatedBlob(t *testing.T) {
 
 	up := &countingUploader{calls: map[string]int{}}
 	b := New(Deps{
+		Authority: mem,
 		Registry:  mem,
 		Intents:   mem,
 		Locations: mem,
@@ -74,9 +77,8 @@ func TestUploadDedup_SkipsAlreadyLocatedBlob(t *testing.T) {
 		Spool:     spool,
 		Uploader:  up,
 		Remover:   &recordingRemover{},
-		Space:     testSpace,
 	})
-	if err := mem.Create(ctx, "bk", 0); err != nil {
+	if err := mem.Create(ctx, "bk", testutil.RandomDID(t)); err != nil {
 		t.Fatalf("create bucket: %v", err)
 	}
 

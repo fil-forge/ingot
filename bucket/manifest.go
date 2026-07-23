@@ -46,9 +46,11 @@ type ObjectManifest struct {
 	// unimplemented feature — see docs/architecture.md §12.)
 	Expires string `cborgen:"ex"`
 
-	// WebsiteRedirectLocation is the x-amz-website-redirect-location system
-	// header, carried through PUT/CreateMultipartUpload and replayed on
-	// HEAD/GET like the other passthrough headers.
+	// WebsiteRedirectLocation is the S3 `x-amz-website-redirect-location`
+	// system header carried through PUT/COPY and replayed on HEAD/GET. It
+	// requests a redirect (or an object-scoped redirect) when the bucket is
+	// configured as a static website; Ingot stores and echoes it but does not
+	// itself serve website redirects. Empty when unset.
 	WebsiteRedirectLocation string `cborgen:"wr"`
 
 	// Metadata is the user metadata map (the x-amz-meta-* headers, with

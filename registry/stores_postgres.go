@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/fil-forge/ucantone/did"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )
@@ -45,7 +46,7 @@ func (r *Postgres) DeleteBlobClaim(ctx context.Context, digest []byte, bucket, o
 	return nil
 }
 
-func (r *Postgres) CountClaims(ctx context.Context, space string, digest []byte) (int, error) {
+func (r *Postgres) CountClaims(ctx context.Context, space did.DID, digest []byte) (int, error) {
 	var n int
 	err := r.pool.QueryRow(ctx,
 		`SELECT count(*) FROM ingot.blob_refs WHERE space = $1 AND digest = $2`,
@@ -156,7 +157,7 @@ func (r *Postgres) PutLocation(ctx context.Context, loc BlobLocation) error {
 	return nil
 }
 
-func (r *Postgres) GetLocation(ctx context.Context, space string, digest []byte) (*BlobLocation, error) {
+func (r *Postgres) GetLocation(ctx context.Context, space did.DID, digest []byte) (*BlobLocation, error) {
 	loc := &BlobLocation{Space: space, Digest: digest}
 	err := r.pool.QueryRow(ctx,
 		`SELECT provider, url, size FROM ingot.blob_locations WHERE space = $1 AND digest = $2`,
@@ -170,7 +171,7 @@ func (r *Postgres) GetLocation(ctx context.Context, space string, digest []byte)
 	return loc, nil
 }
 
-func (r *Postgres) DeleteLocation(ctx context.Context, space string, digest []byte) error {
+func (r *Postgres) DeleteLocation(ctx context.Context, space did.DID, digest []byte) error {
 	_, err := r.pool.Exec(ctx,
 		`DELETE FROM ingot.blob_locations WHERE space = $1 AND digest = $2`, space, digest)
 	if err != nil {

@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	blobcmds "github.com/fil-forge/libforge/commands/blob"
+	ucanlib "github.com/fil-forge/libforge/ucan"
 	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/ucantone/execution"
 	"github.com/fil-forge/ucantone/ucan/invocation"
@@ -13,11 +14,18 @@ import (
 
 // BlobRemove invokes /blob/remove against the upload service (sprue),
 // releasing the space's claim on the blob. Sprue deregisters the blob and
-// forwards the removal to every storage node holding it; piri deletes the
-// bytes only when no space claims the digest at all. Idempotent: removing an
-// unknown or already-removed blob succeeds.
-func (c *Client) BlobRemove(ctx context.Context, digest multihash.Multihash, space did.DID) error {
-	proofs, proofLinks, err := c.ProofChain(ctx, c.signer.DID(), blobcmds.Remove.Command, space)
+// forwards a /blob/release to every storage node holding it; piri deletes
+// the bytes only when no space claims the digest at all. The space is the
+// invocation subject. Idempotent: removing an unknown or already-removed
+// blob succeeds.
+func (c *Client) BlobRemove(ctx context.Context, space did.DID, digest multihash.Multihash, options ...BlobAddOption) error {
+	cfg := NewBlobAddConfig(options...)
+	proofStore := ucanlib.ProofStore(c.tokenStore)
+	if cfg.ProofStore != nil {
+		proofStore = cfg.ProofStore
+	}
+
+	proofs, proofLinks, err := proofStore.ProofChain(ctx, c.signer.DID(), blobcmds.Remove.Command, space)
 	if err != nil {
 		return fmt.Errorf("building proof chain: %w", err)
 	}

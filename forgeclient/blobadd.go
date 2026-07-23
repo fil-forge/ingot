@@ -1,8 +1,15 @@
 // Carried/trimmed from github.com/fil-forge/guppy/pkg/client/blobadd.go.
 //
-// The conclude/put-receipt dance is preserved verbatim — it is the fix
-// for the /blob/accept ↔ /http/put receipt gap (DESIGN_NOTES.md §A).
-// Dropped from upstream: otel spans, go-log, ctxutil, the progress/stall
+// Ingot divergences from upstream:
+//   - Proof chains come from a per-call ProofStore (WithProofStore) so an
+//     invocation can be scoped to a request's per-access-key delegations,
+//     not just the client's token store.
+//   - No /blob/accept re-delegation: sprue owns accept (as it owns
+//     allocate), so the conclude/put-receipt dance carries no space proof.
+//   - BlobAdd decomposes into BlobAddParked + BlobConclude so multipart can
+//     defer the conclude (park at UploadPart, accept at Complete).
+//
+// Also dropped from upstream: otel spans, go-log, ctxutil, the progress/stall
 // readers, and the hard requirement that the accept receipt carry a PDP
 // accept invocation.
 package forgeclient
@@ -31,8 +38,6 @@ import (
 	"github.com/fil-forge/ucantone/multikey"
 	"github.com/fil-forge/ucantone/multikey/ed25519"
 	"github.com/fil-forge/ucantone/ucan"
-	"github.com/fil-forge/ucantone/ucan/delegation"
-	"github.com/fil-forge/ucantone/ucan/delegation/policy"
 	"github.com/fil-forge/ucantone/ucan/invocation"
 	"github.com/fil-forge/ucantone/ucan/receipt"
 	"github.com/ipfs/go-cid"
@@ -48,6 +53,10 @@ type BlobAddConfig struct {
 	PutClient          *http.Client
 	PrecomputedDigest  multihash.Multihash
 	PrecomputedSizePtr *uint64
+	// ProofStore, when set, supplies the delegation proof chain for this
+	// call instead of the client's default token store — used to scope an
+	// invocation to a request's per-access-key proofs.
+	ProofStore ucanlib.ProofStore
 }
 
 // NewBlobAddConfig builds a BlobAddConfig from options.
@@ -71,6 +80,12 @@ func WithPrecomputedDigest(d multihash.Multihash, size uint64) BlobAddOption {
 		cfg.PrecomputedDigest = d
 		cfg.PrecomputedSizePtr = &size
 	}
+}
+
+// WithProofStore overrides the proof store used to build this call's
+// delegation chains (default: the client's token store).
+func WithProofStore(ps ucanlib.ProofStore) BlobAddOption {
+	return func(cfg *BlobAddConfig) { cfg.ProofStore = ps }
 }
 
 // AddedBlob is the result of a successful BlobAdd.
@@ -106,15 +121,15 @@ type ParkedBlob struct {
 // /blob/add delegation proof over space.
 //
 // It is [Client.BlobAddParked] + [Client.BlobConclude] in one shot.
-func (c *Client) BlobAdd(ctx context.Context, content io.Reader, space did.DID, options ...BlobAddOption) (AddedBlob, error) {
-	parked, added, err := c.BlobAddParked(ctx, content, space, options...)
+func (c *Client) BlobAdd(ctx context.Context, space did.DID, content io.Reader, options ...BlobAddOption) (AddedBlob, error) {
+	parked, added, err := c.BlobAddParked(ctx, space, content, options...)
 	if err != nil {
 		return AddedBlob{}, err
 	}
 	if added != nil {
 		return *added, nil
 	}
-	return c.BlobConclude(ctx, *parked, space)
+	return c.BlobConclude(ctx, space, *parked)
 }
 
 // BlobAddParked runs the durable half of BlobAdd: /blob/add + PUT the bytes,
@@ -126,7 +141,7 @@ func (c *Client) BlobAdd(ctx context.Context, content io.Reader, space did.DID, 
 // — when the provider already held accepted bytes for this content (dedup:
 // allocate returned no upload address and the put receipt was pre-issued, so
 // accept already ran) — the completed AddedBlob.
-func (c *Client) BlobAddParked(ctx context.Context, content io.Reader, space did.DID, options ...BlobAddOption) (parked *ParkedBlob, added *AddedBlob, err error) {
+func (c *Client) BlobAddParked(ctx context.Context, space did.DID, content io.Reader, options ...BlobAddOption) (parked *ParkedBlob, added *AddedBlob, err error) {
 	cfg := NewBlobAddConfig(options...)
 
 	putClient := cfg.PutClient
@@ -158,29 +173,14 @@ func (c *Client) BlobAddParked(ctx context.Context, content io.Reader, space did
 		contentSizePtr = &contentSize
 	}
 
-	proofs, proofLinks, err := c.ProofChain(ctx, c.signer.DID(), blobcmds.Add.Command, space)
+	proofStore := ucanlib.ProofStore(c.tokenStore)
+	if cfg.ProofStore != nil {
+		proofStore = cfg.ProofStore
+	}
+
+	proofs, proofLinks, err := proofStore.ProofChain(ctx, c.signer.DID(), blobcmds.Add.Command, space)
 	if err != nil {
 		return nil, nil, fmt.Errorf("building proof chain: %w", err)
-	}
-
-	dlgPolicy, err := policy.Build(
-		policy.Equal(".blob.digest", []byte(contentHash)),
-		policy.Equal(".blob.size", int64(*contentSizePtr)),
-	)
-	if err != nil {
-		return nil, nil, fmt.Errorf("building delegation policy: %w", err)
-	}
-
-	allocDlg, allocProofs, err := delegateWithProofs(
-		ctx, c.signer, c.serviceID, space, blobcmds.Allocate.Command, dlgPolicy, c)
-	if err != nil {
-		return nil, nil, fmt.Errorf("delegating /blob/allocate: %w", err)
-	}
-
-	accDlg, accProofs, err := delegateWithProofs(
-		ctx, c.signer, c.serviceID, space, blobcmds.Accept.Command, dlgPolicy, c)
-	if err != nil {
-		return nil, nil, fmt.Errorf("delegating /blob/accept: %w", err)
 	}
 
 	inv, err := blobcmds.Add.Invoke(
@@ -196,9 +196,6 @@ func (c *Client) BlobAddParked(ctx context.Context, content io.Reader, space did
 	addOK, _, meta, err := Execute[*blobcmds.AddOK](
 		ctx, c.ucanClient, inv,
 		execution.WithDelegations(proofs...),
-		execution.WithDelegations(allocDlg, accDlg),
-		execution.WithDelegations(allocProofs...),
-		execution.WithDelegations(accProofs...),
 	)
 	if err != nil {
 		return nil, nil, fmt.Errorf("executing blob add: %w", err)
@@ -285,9 +282,11 @@ func (c *Client) BlobAddParked(ctx context.Context, content io.Reader, space did
 
 // BlobConclude finishes a parked upload: it synthesizes and concludes the
 // /http/put receipt (which makes the upload service trigger /blob/accept on
-// the provider) and awaits the accept receipt's location commitment. Safe to
-// retry — re-concluding an already-concluded put is tolerated upstream.
-func (c *Client) BlobConclude(ctx context.Context, parked ParkedBlob, space did.DID) (blob AddedBlob, err error) {
+// the provider) and awaits the accept receipt's location commitment. Accept
+// is owned by sprue (like allocate), so the conclude carries no space proof.
+// Safe to retry — re-concluding an already-concluded put is tolerated
+// upstream.
+func (c *Client) BlobConclude(ctx context.Context, space did.DID, parked ParkedBlob) (blob AddedBlob, err error) {
 	start := time.Now()
 	defer func() {
 		if err != nil {
@@ -302,24 +301,7 @@ func (c *Client) BlobConclude(ctx context.Context, parked ParkedBlob, space did.
 		return AddedBlob{}, fmt.Errorf("decoding parked /http/put invocation: %w", err)
 	}
 
-	// The accept delegation is re-derived rather than persisted: it is a
-	// function of the signer, space, and the digest/size policy.
-	dlgPolicy, err := policy.Build(
-		policy.Equal(".blob.digest", []byte(parked.Digest)),
-		policy.Equal(".blob.size", int64(parked.Size)),
-	)
-	if err != nil {
-		return AddedBlob{}, fmt.Errorf("building delegation policy: %w", err)
-	}
-	accDlg, accProofs, err := delegateWithProofs(
-		ctx, c.signer, c.serviceID, space, blobcmds.Accept.Command, dlgPolicy, c)
-	if err != nil {
-		return AddedBlob{}, fmt.Errorf("delegating /blob/accept: %w", err)
-	}
-	if err := c.sendPutReceipt(ctx, putInv,
-		execution.WithDelegations(accDlg),
-		execution.WithDelegations(accProofs...),
-	); err != nil {
+	if err := c.sendPutReceipt(ctx, putInv); err != nil {
 		return AddedBlob{}, fmt.Errorf("sending put receipt: %w", err)
 	}
 
@@ -439,26 +421,6 @@ func (c *Client) sendPutReceipt(ctx context.Context, putInv ucan.Invocation, opt
 		return fmt.Errorf("conclude failed: %w", model)
 	}
 	return nil
-}
-
-func delegateWithProofs(
-	ctx context.Context,
-	issuer ucan.Issuer,
-	audience did.DID,
-	subject did.DID,
-	command ucan.Command,
-	pol ucan.Policy,
-	proofStore ucanlib.ProofStore,
-) (ucan.Delegation, []ucan.Delegation, error) {
-	dlg, err := delegation.Delegate(issuer, audience, subject, command, delegation.WithPolicy(pol))
-	if err != nil {
-		return nil, nil, fmt.Errorf("delegating: %w", err)
-	}
-	proofs, _, err := proofStore.ProofChain(ctx, issuer.DID(), command, subject)
-	if err != nil {
-		return nil, nil, fmt.Errorf("building proof chain: %w", err)
-	}
-	return dlg, proofs, nil
 }
 
 func findInvocation(task cid.Cid, invocations []ucan.Invocation) (ucan.Invocation, error) {

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/fil-forge/ingot/registry"
+	"github.com/fil-forge/ucantone/did"
 )
 
 // In-memory implementations of the architecture's relational stores
@@ -49,7 +50,7 @@ func (m *MemStore) DeleteBlobClaim(_ context.Context, digest []byte, bucket, obj
 	return nil
 }
 
-func (m *MemStore) CountClaims(_ context.Context, space string, digest []byte) (int, error) {
+func (m *MemStore) CountClaims(_ context.Context, space did.DID, digest []byte) (int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	d := string(digest)
@@ -130,7 +131,7 @@ func (m *MemStore) PutLocation(_ context.Context, loc registry.BlobLocation) err
 	return nil
 }
 
-func (m *MemStore) GetLocation(_ context.Context, space string, digest []byte) (*registry.BlobLocation, error) {
+func (m *MemStore) GetLocation(_ context.Context, space did.DID, digest []byte) (*registry.BlobLocation, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	loc, ok := m.locations[locKey{space, string(digest)}]
@@ -142,7 +143,7 @@ func (m *MemStore) GetLocation(_ context.Context, space string, digest []byte) (
 	return &cp, nil
 }
 
-func (m *MemStore) DeleteLocation(_ context.Context, space string, digest []byte) error {
+func (m *MemStore) DeleteLocation(_ context.Context, space did.DID, digest []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.locations, locKey{space, string(digest)})

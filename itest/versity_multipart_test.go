@@ -3,7 +3,7 @@
 package itest
 
 import (
-	"github.com/versity/versitygw/tests/integration"
+	"github.com/fil-forge/versitygw/tests/integration"
 )
 
 // Multipart groups of the S3 conformance partition, partitioned empirically
@@ -20,6 +20,7 @@ var createMultipartPass = []forgeCase{
 	{name: "past_retain_until_date", fn: integration.CreateMultipartUpload_past_retain_until_date},
 	{name: "invalid_legal_hold", fn: integration.CreateMultipartUpload_invalid_legal_hold},
 	{name: "invalid_object_lock_mode", fn: integration.CreateMultipartUpload_invalid_object_lock_mode},
+	{name: "invalid_website_redirect_location", fn: integration.CreateMultipartUpload_invalid_website_redirect_location},
 	{name: "invalid_checksum_algorithm", fn: integration.CreateMultipartUpload_invalid_checksum_algorithm},
 	{name: "empty_checksum_algorithm_with_checksum_type", fn: integration.CreateMultipartUpload_empty_checksum_algorithm_with_checksum_type},
 	{name: "type_algo_mismatch", fn: integration.CreateMultipartUpload_type_algo_mismatch},
@@ -39,6 +40,7 @@ var uploadPartPass = []forgeCase{
 	{name: "non_existing_bucket", fn: integration.UploadPart_non_existing_bucket},
 	{name: "invalid_part_number", fn: integration.UploadPart_invalid_part_number},
 	{name: "non_existing_key", fn: integration.UploadPart_non_existing_key},
+	{name: "etag_quoting_consistency", fn: integration.UploadPart_etag_quoting_consistency},
 	{name: "non_existing_mp_upload", fn: integration.UploadPart_non_existing_mp_upload},
 	{name: "multiple_checksum_headers", fn: integration.UploadPart_multiple_checksum_headers},
 	{name: "invalid_checksum_header", fn: integration.UploadPart_invalid_checksum_header},
@@ -52,7 +54,6 @@ var uploadPartXFail = []forgeCase{
 	{name: "incorrect_checksums", fn: integration.UploadPart_incorrect_checksums},
 	{name: "no_checksum_with_full_object_checksum_type", fn: integration.UploadPart_no_checksum_with_full_object_checksum_type},
 	{name: "no_checksum_with_composite_checksum_type", fn: integration.UploadPart_no_checksum_with_composite_checksum_type},
-	{name: "should_calculate_checksum_if_only_algorithm_is_provided", fn: integration.UploadPart_should_calculate_checksum_if_only_algorithm_is_provided},
 	{name: "with_checksums_success", fn: integration.UploadPart_with_checksums_success},
 }
 
@@ -129,6 +130,7 @@ var completeMultipartPass = []forgeCase{
 	// upstream function name carries a typo (CompletedMultipartUpload_...).
 	{name: "non_existing_bucket", fn: integration.CompletedMultipartUpload_non_existing_bucket},
 	{name: "incorrect_part_number", fn: integration.CompleteMultipartUpload_incorrect_part_number},
+	{name: "missing_part_fields", fn: integration.CompleteMultipartUpload_missing_part_fields},
 	{name: "invalid_part_number", fn: integration.CompleteMultipartUpload_invalid_part_number},
 	{name: "default_content_type", fn: integration.CompleteMultipartUpload_default_content_type},
 	{name: "invalid_ETag", fn: integration.CompleteMultipartUpload_invalid_ETag},

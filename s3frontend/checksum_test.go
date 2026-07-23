@@ -4,8 +4,8 @@ import (
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
-	"github.com/versity/versitygw/s3api/utils"
-	"github.com/versity/versitygw/s3response"
+	"github.com/fil-forge/versitygw/s3api/utils"
+	"github.com/fil-forge/versitygw/s3response"
 )
 
 // TestChecksumFromInput_DefaultsToCRC64NVME locks S3's default-checksum-on-store

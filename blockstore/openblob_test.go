@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"github.com/fil-forge/ucantone/did"
 	"io"
 	"testing"
 
@@ -16,11 +17,11 @@ import (
 // Layered/Cached constructors) and BlobReader. data == nil means a miss.
 type fakeBlobTier struct{ data []byte }
 
-func (f fakeBlobTier) GetBlock(context.Context, cid.Cid) (block.Block, error) {
+func (f fakeBlobTier) GetBlock(context.Context, did.DID, cid.Cid) (block.Block, error) {
 	return nil, ErrNotFound
 }
 
-func (f fakeBlobTier) OpenBlob(context.Context, mh.Multihash) (io.ReadCloser, error) {
+func (f fakeBlobTier) OpenBlob(context.Context, did.DID, mh.Multihash) (io.ReadCloser, error) {
 	if f.data == nil {
 		return nil, ErrNotFound
 	}
@@ -29,7 +30,7 @@ func (f fakeBlobTier) OpenBlob(context.Context, mh.Multihash) (io.ReadCloser, er
 
 func readOpenBlob(t *testing.T, r BlobReader, digest mh.Multihash) (string, error) {
 	t.Helper()
-	rc, err := r.OpenBlob(context.Background(), digest)
+	rc, err := r.OpenBlob(context.Background(), did.Undef, digest)
 	if err != nil {
 		return "", err
 	}
@@ -58,7 +59,7 @@ func TestLayered_OpenBlob_Tiering(t *testing.T) {
 
 	// both miss → ErrNotFound.
 	l = NewLayered(fakeBlobTier{data: nil}, nil, fakeBlobTier{data: nil})
-	if _, err := l.OpenBlob(context.Background(), digest); !errors.Is(err, ErrNotFound) {
+	if _, err := l.OpenBlob(context.Background(), did.Undef, digest); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("both miss: err = %v, want ErrNotFound", err)
 	}
 

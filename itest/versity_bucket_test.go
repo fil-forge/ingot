@@ -3,7 +3,7 @@
 package itest
 
 import (
-	"github.com/versity/versitygw/tests/integration"
+	"github.com/fil-forge/versitygw/tests/integration"
 )
 
 // Bucket-level groups of the S3 conformance partition. Seeded from the
@@ -14,13 +14,17 @@ import (
 var createBucketPass = []forgeCase{
 	{name: "invalid_bucket_name", fn: integration.CreateBucket_invalid_bucket_name},
 	{name: "invalid_canned_acl", fn: integration.CreateBucket_invalid_canned_acl},
-	{name: "invalid_location_constraint", fn: integration.CreateBucket_invalid_location_constraint},
 	{name: "invalid_ownership", fn: integration.CreateBucket_invalid_ownership},
 	{name: "ownership_with_acl", fn: integration.CreateBucket_ownership_with_acl},
 	{name: "success", fn: integration.CreateBucket_success},
 }
 
 var createBucketXFail = []forgeCase{
+	// Since the hilt (tenant-management) integration, bucket creation is
+	// forwarded to hilt, which does not validate the CreateBucket
+	// LocationConstraint against the deployment region — the invalid
+	// constraint is accepted instead of rejected.
+	{name: "invalid_location_constraint", fn: integration.CreateBucket_invalid_location_constraint},
 	{name: "as_user", fn: integration.CreateBucket_as_user},
 	{name: "default_acl", fn: integration.CreateBucket_default_acl},
 	{name: "default_object_lock", fn: integration.CreateBucket_default_object_lock},
@@ -43,8 +47,6 @@ var headBucketPass = []forgeCase{
 var listBucketsPass = []forgeCase{
 	{name: "empty_success", fn: integration.ListBuckets_empty_success},
 	{name: "invalid_max_buckets", fn: integration.ListBuckets_invalid_max_buckets},
-	{name: "success", fn: integration.ListBuckets_success},
-	{name: "with_prefix", fn: integration.ListBuckets_with_prefix},
 	// truncated is counter-position-sensitive, not S3-semantics-sensitive:
 	// the upstream case names buckets from a process-global counter
 	// (test-bucket-<N>) and compares pages position-by-position expecting
@@ -61,6 +63,11 @@ var listBucketsPass = []forgeCase{
 }
 
 var listBucketsXFail = []forgeCase{
+	// success/with_prefix assert the listing's Owner equals the account's
+	// access key; since the hilt integration ListBuckets reports the
+	// tenant's did:plc as owner, not the signing access key.
+	{name: "success", fn: integration.ListBuckets_success},
+	{name: "with_prefix", fn: integration.ListBuckets_with_prefix},
 	{name: "as_admin", fn: integration.ListBuckets_as_admin},
 	{name: "as_user", fn: integration.ListBuckets_as_user},
 }

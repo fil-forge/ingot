@@ -13,11 +13,12 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/fil-forge/ucantone/did"
+	"github.com/fil-forge/versitygw/backend"
+	"github.com/fil-forge/versitygw/s3err"
+	"github.com/fil-forge/versitygw/s3response"
 	"github.com/ipfs/go-cid"
 	mh "github.com/multiformats/go-multihash"
-	"github.com/versity/versitygw/backend"
-	"github.com/versity/versitygw/s3err"
-	"github.com/versity/versitygw/s3response"
 
 	msbucket "github.com/fil-forge/ingot/bucket"
 	"github.com/fil-forge/ingot/bucketop"
@@ -52,7 +53,7 @@ func (b *Backend) CreateMultipartUpload(ctx context.Context, input s3response.Cr
 	}
 	bucket, key := *input.Bucket, *input.Key
 	if !mst.IsValidKey(key) {
-		return s3response.InitiateMultipartUploadResult{}, s3err.GetAPIError(s3err.ErrInvalidArgument)
+		return s3response.InitiateMultipartUploadResult{}, s3err.GetAPIError(s3err.ErrInvalidRequest)
 	}
 	// A directory object (trailing "/") is zero-length by definition; a
 	// multipart upload to one necessarily carries data.
@@ -116,6 +117,20 @@ func (b *Backend) openSession(ctx context.Context, uploadID string, key *string)
 	return sess, nil
 }
 
+// bucketSpace resolves the Forge space owning bucketName. Every network-side
+// blob action is space-scoped (the space is the UCAN subject), so the
+// multipart paths resolve it once per operation from the bucket registry.
+func (b *Backend) bucketSpace(ctx context.Context, bucketName string) (did.DID, error) {
+	st, err := b.reg.Get(ctx, bucketName)
+	if err != nil {
+		if errors.Is(err, registry.ErrNotFound) {
+			return did.Undef, s3err.GetAPIError(s3err.ErrNoSuchBucket)
+		}
+		return did.Undef, fmt.Errorf("s3frontend: resolve bucket space: %w", err)
+	}
+	return st.Space, nil
+}
+
 // UploadPart ingests one part: it coarse-splits the part body into blobs,
 // spools each to local disk (recording upload_intents), records the part
 // (its ordered blob digests, md5, size), and uploads each blob to its
@@ -147,6 +162,10 @@ func (b *Backend) UploadPart(ctx context.Context, input *s3.UploadPartInput) (*s
 		}
 	}
 
+	space, err := b.bucketSpace(ctx, sess.Bucket)
+	if err != nil {
+		return nil, err
+	}
 	body, err := b.splitSpool(ctx, sess.Bucket, input.Body)
 	if err != nil {
 		return nil, fmt.Errorf("s3frontend: upload part ingest: %w", err)
@@ -165,11 +184,11 @@ func (b *Backend) UploadPart(ctx context.Context, input *s3.UploadPartInput) (*s
 	// part is durable on the network as soon as the client sees success.
 	// The part row is recorded first so a crash mid-park leaves re-drivable
 	// spooled intents.
-	if err := b.parkBlobs(ctx, body.Blobs); err != nil {
+	if err := b.parkBlobs(ctx, space, body.Blobs); err != nil {
 		return nil, fmt.Errorf("s3frontend: park part blobs: %w", err)
 	}
 	if len(superseded) > 0 {
-		b.cleanupPartBlobs(ctx, uploadID, superseded)
+		b.cleanupPartBlobs(ctx, space, uploadID, superseded)
 	}
 	etag := `"` + hex.EncodeToString(body.MD5) + `"`
 	return &s3.UploadPartOutput{ETag: &etag}, nil
@@ -189,6 +208,13 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 		return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrInvalidRequest)
 	}
 	bucket, key, uploadID := *input.Bucket, *input.Key, *input.UploadId
+	bucketState, err := b.reg.Get(ctx, bucket)
+	if err != nil {
+		if errors.Is(err, registry.ErrNotFound) {
+			return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrNoSuchBucket)
+		}
+		return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: complete mpu: %w", err)
+	}
 	sess, err := b.multipart.GetSession(ctx, uploadID)
 	if err != nil {
 		if errors.Is(err, registry.ErrNotFound) {
@@ -205,7 +231,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 		return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrNotImplemented)
 	}
 	if ifMatch != nil || ifNoneMatch != nil {
-		current, lerr := b.lookupManifest(ctx, bucket, key)
+		current, _, lerr := b.lookupManifest(ctx, bucket, key)
 		exists := lerr == nil
 		if lerr != nil && !isNoSuchKey(lerr) {
 			return s3response.CompleteMultipartUploadResult{}, "", lerr
@@ -247,7 +273,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 		num := int(*rp.PartNumber)
 		if num < 1 || num > 10000 {
 			return s3response.CompleteMultipartUploadResult{}, "",
-				s3err.GetAPIError(s3err.ErrInvalidCompleteMpPartNumber)
+				s3err.GetAPIError(s3err.ErrInvalidPartNumberRange)
 		}
 		if num <= prev {
 			return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrInvalidPartOrder)
@@ -330,8 +356,8 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 	// Accept every part's blobs on Forge: parked blobs conclude (the deferred
 	// /http/put receipt fires /blob/accept), stragglers that never parked
 	// (crash between spool and park) fall back to the whole synchronous
-	// upload. No-op in standalone. Then commit.
-	if err := b.concludeBlobs(ctx, blobs); err != nil {
+	// upload. Then commit.
+	if err := b.concludeBlobs(ctx, bucketState.Space, blobs); err != nil {
 		return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: accept parts: %w", err)
 	}
 
@@ -350,7 +376,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 		Metadata:                sess.Metadata,
 	}
 
-	if err := b.commitManifest(ctx, bucket, key, mf, bodyDigests(mf.Body)); err != nil {
+	if err := b.commitManifest(ctx, bucketState, key, mf, bodyDigests(mf.Body)); err != nil {
 		return s3response.CompleteMultipartUploadResult{}, "", err
 	}
 	committed = true
@@ -404,7 +430,11 @@ func (b *Backend) AbortMultipartUpload(ctx context.Context, input *s3.AbortMulti
 	if err := b.multipart.DeleteSession(ctx, uploadID); err != nil {
 		return fmt.Errorf("s3frontend: delete session: %w", err)
 	}
-	b.cleanupPartBlobs(ctx, uploadID, digests)
+	space, err := b.bucketSpace(ctx, sess.Bucket)
+	if err != nil {
+		return err
+	}
+	b.cleanupPartBlobs(ctx, space, uploadID, digests)
 	return nil
 }
 
@@ -415,7 +445,7 @@ func (b *Backend) AbortMultipartUpload(ctx context.Context, input *s3.AbortMulti
 // replacement or a sibling part), or by a committed object (reference claims /
 // non-spooled intent state). Best-effort: cleanup failure never fails the S3
 // operation; a stranded spool file is reapable later.
-func (b *Backend) cleanupPartBlobs(ctx context.Context, uploadID string, digests [][]byte) {
+func (b *Backend) cleanupPartBlobs(ctx context.Context, space did.DID, uploadID string, digests [][]byte) {
 	if len(digests) == 0 {
 		return
 	}
@@ -439,7 +469,7 @@ func (b *Backend) cleanupPartBlobs(ctx context.Context, uploadID string, digests
 		if n, err := b.multipart.CountPartRefs(ctx, d, uploadID); err != nil || n > 0 {
 			continue
 		}
-		if n, err := b.blobRefs.CountClaims(ctx, b.space, d); err != nil || n > 0 {
+		if n, err := b.blobRefs.CountClaims(ctx, space, d); err != nil || n > 0 {
 			continue
 		}
 		state := registry.IntentSpooled
@@ -460,7 +490,7 @@ func (b *Backend) cleanupPartBlobs(ctx context.Context, uploadID string, digests
 		if state == registry.IntentParked {
 			if park, err := b.parks.GetPark(ctx, d); err == nil {
 				if cause, err := cid.Cast(park.AddTask); err == nil {
-					_ = b.deferred.AbortBlob(ctx, mh.Multihash(d), cause)
+					_ = b.deferred.AbortBlob(ctx, space, mh.Multihash(d), cause)
 				}
 				_ = b.parks.DeletePark(ctx, d)
 			}
@@ -474,10 +504,10 @@ func (b *Backend) cleanupPartBlobs(ctx context.Context, uploadID string, digests
 // already-located blobs are marked accepted (dedup), already-parked blobs are
 // skipped (another part or session parked the same content), the rest run
 // the parked upload and persist their park state for Complete/Abort.
-func (b *Backend) parkBlobs(ctx context.Context, blobs []msbucket.BlobRef) error {
+func (b *Backend) parkBlobs(ctx context.Context, space did.DID, blobs []msbucket.BlobRef) error {
 	for _, blob := range blobs {
 		digest := mh.Multihash(blob.Digest)
-		if existing, err := b.locations.GetLocation(ctx, b.space, blob.Digest); err == nil && existing != nil {
+		if existing, err := b.locations.GetLocation(ctx, space, blob.Digest); err == nil && existing != nil {
 			if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentAccepted); err != nil {
 				return fmt.Errorf("mark accepted (dedup): %w", err)
 			}
@@ -491,7 +521,7 @@ func (b *Backend) parkBlobs(ctx context.Context, blobs []msbucket.BlobRef) error
 			return fmt.Errorf("lookup park: %w", err)
 		}
 
-		parked, located, err := b.deferred.UploadBlobParked(ctx, digest, blob.Length, b.spool.Path(digest))
+		parked, located, err := b.deferred.UploadBlobParked(ctx, space, digest, blob.Length, b.spool.Path(digest))
 		if err != nil {
 			return fmt.Errorf("park blob: %w", err)
 		}
@@ -499,7 +529,7 @@ func (b *Backend) parkBlobs(ctx context.Context, blobs []msbucket.BlobRef) error
 			// The provider already held accepted bytes for this content —
 			// accept ran, record the location like the synchronous path.
 			if err := b.locations.PutLocation(ctx, registry.BlobLocation{
-				Space:    b.space,
+				Space:    space,
 				Digest:   blob.Digest,
 				Provider: located.Provider,
 				URL:      located.URL,
@@ -533,10 +563,10 @@ func (b *Backend) parkBlobs(ctx context.Context, blobs []msbucket.BlobRef) error
 // /http/put receipt — firing /blob/accept — and record their location;
 // blobs that never parked (crash between spool and park) fall back to the
 // whole synchronous upload.
-func (b *Backend) concludeBlobs(ctx context.Context, blobs []msbucket.BlobRef) error {
+func (b *Backend) concludeBlobs(ctx context.Context, space did.DID, blobs []msbucket.BlobRef) error {
 	for _, blob := range blobs {
 		digest := mh.Multihash(blob.Digest)
-		if existing, err := b.locations.GetLocation(ctx, b.space, blob.Digest); err == nil && existing != nil {
+		if existing, err := b.locations.GetLocation(ctx, space, blob.Digest); err == nil && existing != nil {
 			if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentAccepted); err != nil {
 				return fmt.Errorf("mark accepted (dedup): %w", err)
 			}
@@ -559,7 +589,7 @@ func (b *Backend) concludeBlobs(ctx context.Context, blobs []msbucket.BlobRef) e
 			if err != nil {
 				return fmt.Errorf("decode park accept task: %w", err)
 			}
-			loc, err = b.deferred.ConcludeBlob(ctx, uploader.ParkedBlobState{
+			loc, err = b.deferred.ConcludeBlob(ctx, space, uploader.ParkedBlobState{
 				Digest:        digest,
 				Size:          uint64(park.Size),
 				AddTask:       addTask,
@@ -572,14 +602,14 @@ func (b *Backend) concludeBlobs(ctx context.Context, blobs []msbucket.BlobRef) e
 		} else {
 			// Never parked (crash between spool and park): the spooled copy
 			// drives the whole synchronous upload.
-			loc, err = b.uploader.UploadBlob(ctx, digest, blob.Length, b.spool.Path(digest))
+			loc, err = b.uploader.UploadBlob(ctx, space, digest, blob.Length, b.spool.Path(digest))
 			if err != nil {
 				return fmt.Errorf("upload blob: %w", err)
 			}
 		}
 
 		if err := b.locations.PutLocation(ctx, registry.BlobLocation{
-			Space:    b.space,
+			Space:    space,
 			Digest:   blob.Digest,
 			Provider: loc.Provider,
 			URL:      loc.URL,
@@ -615,7 +645,7 @@ func (b *Backend) ListParts(ctx context.Context, input *s3.ListPartsInput) (s3re
 	if input.PartNumberMarker != nil && *input.PartNumberMarker != "" {
 		m, err := strconv.Atoi(*input.PartNumberMarker)
 		if err != nil {
-			return s3response.ListPartsResult{}, s3err.GetAPIError(s3err.ErrInvalidArgument)
+			return s3response.ListPartsResult{}, s3err.GetAPIError(s3err.ErrInvalidRequest)
 		}
 		marker = m
 	}
@@ -718,7 +748,7 @@ func (b *Backend) ListMultipartUploads(ctx context.Context, input *s3.ListMultip
 			}
 			if keyLive && pos < 0 {
 				return s3response.ListMultipartUploadsResult{},
-					s3err.GetAPIError(s3err.ErrInvalidUploadIdMarker)
+					s3err.GetAPIError(s3err.ErrInvalidRequest)
 			}
 			if pos < 0 {
 				for i, s := range inflight {
@@ -827,7 +857,11 @@ func (b *Backend) SweepStaleMultipartSessions(ctx context.Context, ttl time.Dura
 		if err := b.multipart.DeleteSession(ctx, s.UploadID); err != nil {
 			continue
 		}
-		b.cleanupPartBlobs(ctx, s.UploadID, digests)
+		space, serr := b.bucketSpace(ctx, s.Bucket)
+		if serr != nil {
+			continue // bucket gone; spool rows are reapable later
+		}
+		b.cleanupPartBlobs(ctx, space, s.UploadID, digests)
 		cleaned++
 	}
 	// Terminal leftovers: completed sessions retained for Complete idempotency,
@@ -850,9 +884,9 @@ func (b *Backend) SweepStaleMultipartSessions(ctx context.Context, ttl time.Dura
 // index against the prior version's digests, releasing dropped blobs after the
 // commit. Shared by CopyObject and CompleteMultipartUpload (a plain commit with
 // no precondition callback).
-func (b *Backend) commitManifest(ctx context.Context, bucket, key string, mf *msbucket.ObjectManifest, newDigests [][]byte) error {
+func (b *Backend) commitManifest(ctx context.Context, bucketState *registry.State, key string, mf *msbucket.ObjectManifest, newDigests [][]byte) error {
 	var oldDigests [][]byte
-	err := b.txns.WithTx(ctx, bucket, func(ctx context.Context, tx *bucketop.Tx) (cid.Cid, error) {
+	err := b.txns.WithTx(ctx, bucketState.Name, func(ctx context.Context, tx *bucketop.Tx) (cid.Cid, error) {
 		mfCid, err := tx.Put(ctx, mf)
 		if err != nil {
 			return cid.Undef, fmt.Errorf("manifest put: %w", err)
@@ -863,11 +897,11 @@ func (b *Backend) commitManifest(ctx context.Context, bucket, key string, mf *ms
 		switch {
 		case gerr == nil:
 			var oldMf msbucket.ObjectManifest
-			if err := tx.Get(ctx, oldCid, &oldMf); err != nil {
+			if err := tx.Get(ctx, tx.State().Space, oldCid, &oldMf); err != nil {
 				return cid.Undef, fmt.Errorf("load prior manifest: %w", err)
 			}
 			oldDigests = bodyDigests(oldMf.Body)
-			if err := b.gc.AddGCCandidate(ctx, oldCid.Bytes(), bucket); err != nil {
+			if err := b.gc.AddGCCandidate(ctx, oldCid.Bytes(), bucketState.Name); err != nil {
 				return cid.Undef, fmt.Errorf("gc candidate: %w", err)
 			}
 		case errors.Is(gerr, mst.ErrNotFound):
@@ -890,11 +924,11 @@ func (b *Backend) commitManifest(ctx context.Context, bucket, key string, mf *ms
 	}
 	// Reconcile the reference index AFTER the commit is durable (so a commit
 	// failure can't diverge blob_refs from the catalog).
-	toRemove, err := b.reconcileClaims(ctx, bucket, key, oldDigests, newDigests)
+	toRemove, err := b.reconcileClaims(ctx, bucketState, key, oldDigests, newDigests)
 	if err != nil {
 		return fmt.Errorf("s3frontend: commit reconcile: %w", err)
 	}
-	b.releaseBlobs(ctx, toRemove)
+	b.releaseBlobs(ctx, bucketState.Space, toRemove)
 	return nil
 }
 
