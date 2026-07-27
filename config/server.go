@@ -1,6 +1,10 @@
 package config
 
-import "time"
+import (
+	"time"
+
+	"github.com/fil-forge/versitygw/auth"
+)
 
 // ServerConfig captures the user-facing knobs of an ingot S3 listener.
 // New() applies defaults for any zero-valued knobs. SealAge is in
@@ -41,4 +45,9 @@ type ServerConfig struct {
 	// request), so New substitutes a sensible default.
 	MaxConnections int
 	MaxRequests    int
+
+	// CORSConfig is the S3 CORS configuration the backend reports for
+	// every bucket, rendered from Config.CORSAllowedOrigins by
+	// internal/cors. Nil disables CORS entirely (the default).
+	CORSConfig *auth.CORSConfiguration
 }

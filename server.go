@@ -149,6 +149,7 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		Uploader:    deps.BodyUploader,
 		Remover:     deps.Remover,
 		MaxBlobSize: cfg.MaxBlobSize,
+		CORS:        cfg.CORSConfig,
 		Logger:      logger,
 	})
 

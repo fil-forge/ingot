@@ -9,6 +9,8 @@ import (
 
 	"github.com/spf13/viper"
 	"go.uber.org/multierr"
+
+	"github.com/fil-forge/ingot/internal/cors"
 )
 
 // Config is ingot's own configuration.
@@ -29,6 +31,21 @@ type Config struct {
 	// MaxBlobSize is the blob ceiling for new objects, in bytes (0 -> default
 	// 256 MiB). An object larger than this is coarsely split into ≤ max blobs.
 	MaxBlobSize int64 `mapstructure:"max_blob_size" yaml:"max_blob_size"`
+	// CORSAllowedOrigins lists the browser origins the S3 listener answers
+	// CORS for. Each entry is an exact origin ("https://app.example"), a
+	// wildcard origin ("https://*.dev.example" — one '*' standing for any
+	// run of characters, S3's own matching), or the lone "*" (any origin —
+	// avoid outside development). Empty disables CORS (the default).
+	//
+	// The list is rendered into an S3 CORS configuration document that
+	// every bucket reports, which is what drives versitygw's CORS
+	// middlewares and preflight handler. Two consequences worth knowing:
+	// a matched origin is answered with Access-Control-Allow-Credentials:
+	// true (AWS behaviour — harmless here because ingot authenticates the
+	// Authorization header and presigned URLs, never cookies), and the
+	// service-level routes (ListBuckets, "GET /") are not covered, so
+	// cross-origin bucket listing is unsupported.
+	CORSAllowedOrigins []string `mapstructure:"cors_allowed_origins" yaml:"cors_allowed_origins"`
 	// SealBytes / SealAge / Retain tune the logstore (zero -> logstore defaults).
 	SealBytes int64  `mapstructure:"seal_bytes" yaml:"seal_bytes"`
 	SealAge   string `mapstructure:"seal_age" yaml:"seal_age"`
@@ -108,6 +125,12 @@ func (c Config) ServerConfig() (ServerConfig, error) {
 	if err != nil {
 		return ServerConfig{}, err
 	}
+	// Render the CORS configuration here — the single place it is built —
+	// so a typo fails at startup (via Validate) rather than from New.
+	corsCfg, err := cors.Build(c.CORSAllowedOrigins)
+	if err != nil {
+		return ServerConfig{}, fmt.Errorf("ingot: cors_allowed_origins: %w", err)
+	}
 	return ServerConfig{
 		Addr:        c.Addr,
 		DataDir:     c.DataDir,
@@ -115,6 +138,8 @@ func (c Config) ServerConfig() (ServerConfig, error) {
 		RootAccess:  c.RootAccess,
 		RootSecret:  c.RootSecret,
 		MaxBlobSize: c.MaxBlobSize,
+
+		CORSConfig: corsCfg,
 
 		// A per-plane override wins, else the top-level value, else the logstore
 		// default. Ship defaults to true unless the catalog block sets
