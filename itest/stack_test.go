@@ -124,6 +124,13 @@ func forgeStack(t *testing.T, extra ...stack.Option) (*stack.Stack, string) {
 		t.Logf("using piri image override: %s", img)
 		opts = append(opts, stack.WithPiriImage(img))
 	}
+	// Same idea one step earlier in the pipeline: mount a locally-built piri
+	// binary (linux, static) over the image's /usr/bin/piri — validates an
+	// unreleased piri/ucantone change with no image build at all.
+	if bin := os.Getenv("INGOT_ITEST_PIRI_BINARY"); bin != "" {
+		t.Logf("using piri binary override: %s", bin)
+		opts = append(opts, stack.WithPiriBinary(bin))
+	}
 	opts = append(opts, extra...)
 	s := stack.MustNewStack(t, opts...)
 	endpoint := s.IngotEndpoint()
