@@ -54,12 +54,13 @@ type MemStore struct {
 	// The architecture's relational surface (docs/architecture.md §5–§7),
 	// mirroring the Postgres tables so the in-process suite exercises the
 	// same code paths. See stores.go for the methods over these.
-	blobRefs  map[claimKey]registry.BlobClaim
-	intents   map[string]registry.UploadIntent          // keyed by string(digest)
-	locations map[locKey]registry.BlobLocation          // keyed by (space, digest)
-	sessions  map[string]registry.MultipartSession      // keyed by uploadID
-	parts     map[string]map[int]registry.MultipartPart // uploadID -> partNumber -> part
-	gcCands   map[string]struct{}                       // keyed by string(cid)
+	blobRefs   map[claimKey]registry.BlobClaim
+	intents    map[string]registry.UploadIntent          // keyed by string(digest)
+	locations  map[locKey]registry.BlobLocation          // keyed by (space, digest)
+	inclusions map[locKey]registry.BlobInclusion         // keyed by (space, digest)
+	sessions   map[string]registry.MultipartSession      // keyed by uploadID
+	parts      map[string]map[int]registry.MultipartPart // uploadID -> partNumber -> part
+	gcCands    map[string]struct{}                       // keyed by string(cid)
 }
 
 // claimKey / locKey are the composite map keys for the blob_refs and
@@ -76,14 +77,15 @@ type locKey struct {
 // NewMemStore returns an empty MemStore.
 func NewMemStore() *MemStore {
 	return &MemStore{
-		buckets:   map[string]*registry.State{},
-		segments:  map[uint64]*logstore.SegmentMeta{},
-		blobRefs:  map[claimKey]registry.BlobClaim{},
-		intents:   map[string]registry.UploadIntent{},
-		locations: map[locKey]registry.BlobLocation{},
-		sessions:  map[string]registry.MultipartSession{},
-		parts:     map[string]map[int]registry.MultipartPart{},
-		gcCands:   map[string]struct{}{},
+		buckets:    map[string]*registry.State{},
+		segments:   map[uint64]*logstore.SegmentMeta{},
+		blobRefs:   map[claimKey]registry.BlobClaim{},
+		intents:    map[string]registry.UploadIntent{},
+		locations:  map[locKey]registry.BlobLocation{},
+		inclusions: map[locKey]registry.BlobInclusion{},
+		sessions:   map[string]registry.MultipartSession{},
+		parts:      map[string]map[int]registry.MultipartPart{},
+		gcCands:    map[string]struct{}{},
 	}
 }
 
@@ -339,8 +341,8 @@ func (NopBaseReader) OpenBlob(_ context.Context, _ did.DID, _ multihash.Multihas
 // network, so the spool's local copy serves all reads.
 type NopUploader struct{}
 
-func (NopUploader) SubmitShard(_ context.Context, _ blockstore.Plane, _ did.DID, _ uploader.CARShard) error {
-	return nil
+func (NopUploader) SubmitShard(_ context.Context, _ blockstore.Plane, _ did.DID, _ uploader.CARShard) (uploader.BlobLocation, error) {
+	return uploader.BlobLocation{}, nil
 }
 
 func (NopUploader) UploadBlob(_ context.Context, _ did.DID, _ multihash.Multihash, size int64, _ string) (uploader.BlobLocation, error) {

@@ -502,7 +502,14 @@ index (stock-tooling plaintext recovery)** — a deliberate trade, not settled h
 The **catalog** is different — many tiny MST/manifest blocks share a CAR — so catalog blocks resolve
 via the indexer's index-claim / sharded-dag-index path (block CID → byte range in its shard). That path
 is retained for the catalog regardless. *(In the R0/R1 appliance topology, catalog-block lookup is
-served from the local Postgres location table rather than the indexing-service.)*
+served from the local Postgres mirror of that contract: `shard_inclusions` (block digest → shard
+digest + byte range, recorded by the flush path before a segment is marked shipped) joined to the
+shard's `blob_locations` row. A whole-blob location table alone cannot serve catalog blocks — they
+are interior slices of shipped CARs, not stored blobs — which is exactly what breaks
+retention-retired catalog reads without the inclusion table. Because the local mirror is what
+ingot's own reads depend on, the network index publication (`/index/add` at ship time) is
+best-effort: its failure is logged, not a ship failure — a wedged indexer must not wedge
+retention. A retry queue for failed publications is a TODO.)*
 
 Consuming a bare location commitment is a capability Ingot's locator must gain: today it surfaces a
 location only via the inclusion → shard → commitment path and never returns a stored bare
@@ -780,9 +787,12 @@ These are intentional simplifications of the target topology, not bugs:
   Regime-A/B compaction, and subroots ([§6](#6-the-forgechain-layer)) are Piri-side concerns. From Ingot's side a delete is
   just `remove(digest)`; Piri decides the on-chain regime. `max_blob_size` is the only size knob Ingot
   carries.
-- **Local location table instead of the indexer (R0/R1 appliance reduction).** Body-blob locations
-  are recorded in a local Postgres `blob_locations` table behind a `Locator` seam, rather than read
-  back through the indexing-service ([§5](#5-the-data-layer), [§8](#8-retrieval-addressing-when-bodies-need-a-sharded-dag-index)). The indexer-backed `Locator` is an `indexer-ready` swap-in.
+- **Local location + inclusion tables instead of the indexer (R0/R1 appliance reduction).** Body-blob
+  and shipped-shard locations are recorded in a local Postgres `blob_locations` table, and each
+  shipped catalog shard's inner-block byte ranges in `shard_inclusions`, behind a `Locator` seam,
+  rather than read back through the indexing-service ([§5](#5-the-data-layer), [§8](#8-retrieval-addressing-when-bodies-need-a-sharded-dag-index)). The two tables mirror the
+  indexing-service contract (location commitments + inclusions), so the indexer-backed `Locator`
+  remains an `indexer-ready` swap-in.
 
 ### Object lifecycle (not implemented)
 

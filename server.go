@@ -61,15 +61,17 @@ type ServerDeps struct {
 	Registry registry.Registry
 
 	// Intents tracks the local spool's upload_intents lifecycle; Locations
-	// records where each accepted body blob can be retrieved from; BlobRefs is
-	// the reverse reference index; GC records superseded MST/manifest CIDs.
-	// Typically all the same instance as Registry (*registry.Postgres /
-	// *inmem.MemStore).
-	Intents   registry.IntentStore
-	Locations registry.LocationStore
-	BlobRefs  registry.BlobRefStore
-	GC        registry.GCStore
-	Multipart registry.MultipartStore
+	// records where each accepted body blob (and shipped catalog shard) can be
+	// retrieved from; Inclusions records each shipped shard's inner-block byte
+	// ranges so retired catalog blocks stay resolvable; BlobRefs is the reverse
+	// reference index; GC records superseded MST/manifest CIDs. Typically all
+	// the same instance as Registry (*registry.Postgres / *inmem.MemStore).
+	Intents    registry.IntentStore
+	Locations  registry.LocationStore
+	Inclusions registry.InclusionStore
+	BlobRefs   registry.BlobRefStore
+	GC         registry.GCStore
+	Multipart  registry.MultipartStore
 
 	// Meta is the persistence backing for log-segment metadata.
 	// Typically the same instance as Registry.
@@ -120,7 +122,7 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 			Retain:    cfg.RetainCatalog,
 		},
 		FlushFor: func(bucket string) logstore.FlushFunc {
-			return newBucketFlushFunc(deps.Uploader, deps.Registry, bucket, logger)
+			return newBucketFlushFunc(deps.Uploader, deps.Registry, deps.Locations, deps.Inclusions, bucket, logger)
 		},
 		Logger: logger,
 	})
@@ -211,11 +213,15 @@ func (s *Server) Stop(ctx context.Context) error {
 }
 
 // newPlaneFlushFunc builds the logstore flush callback for ONE plane:
-// it ships that plane's sealed CAR to Forge via uploader.SubmitShard.
-// The store owns the ship-state transition (it stamps the per-plane
-// shipped timestamp and, for the catalog plane, advances each affected
-// bucket's forge_root_cid) once this returns nil — so the closure is
-// purely the network ship.
+// it ships that plane's sealed CAR to Forge via uploader.SubmitShard,
+// then records the shard's location and every inner block's byte range
+// in the local location/inclusion tables (the appliance mirror of the
+// sharded-dag-index SubmitShard publishes). The store owns the
+// ship-state transition (it stamps the per-plane shipped timestamp and,
+// for the catalog plane, advances each affected bucket's forge_root_cid)
+// once this returns nil — so a segment is only ever marked shipped (and
+// thus eligible for retention) after its blocks are resolvable through
+// the fallthrough read tier.
 //
 // A header-only CAR (e.g. an MST-only op writes no data blocks; a
 // trimTop-to-existing-subtree writes neither) has no positions: nothing
@@ -228,7 +234,7 @@ func (s *Server) Stop(ctx context.Context) error {
 // closure sees belongs to exactly this bucket). A bucket deleted while
 // segments were still queued has nothing to ship to: the closure returns
 // nil so the segment marks shipped and retires.
-func newBucketFlushFunc(up uploader.Uploader, reg registry.Registry, bucket string, logger *zap.Logger) logstore.FlushFunc {
+func newBucketFlushFunc(up uploader.Uploader, reg registry.Registry, locations registry.LocationStore, inclusions registry.InclusionStore, bucket string, logger *zap.Logger) logstore.FlushFunc {
 	plane := blockstore.PlaneCatalog
 	return func(ctx context.Context, seg *logstore.Segment) error {
 		positions := seg.Positions()
@@ -256,8 +262,41 @@ func newBucketFlushFunc(up uploader.Uploader, reg registry.Registry, bucket stri
 			SHA256:    sha,
 			Positions: positions,
 		}
-		if err := up.SubmitShard(ctx, plane, st.Space, shard); err != nil {
+		carLoc, err := up.SubmitShard(ctx, plane, st.Space, shard)
+		if err != nil {
 			return fmt.Errorf("submit segment %d %s for %q: %w", seg.Seq(), plane, bucket, err)
+		}
+		// No published location (the no-op uploader): nothing durable to
+		// point reads at, so record nothing.
+		if carLoc.Provider == "" || carLoc.URL == "" {
+			return nil
+		}
+		// Record the shard's location + every inner block's byte range
+		// BEFORE returning: a flush error keeps the segment unshipped (and
+		// retained), so retention can never retire blocks the read tier
+		// can't resolve. Re-runs are idempotent (upserts) and the re-ship's
+		// blob/add dedups on piri.
+		if err := locations.PutLocation(ctx, registry.BlobLocation{
+			Space:    st.Space,
+			Digest:   sha,
+			Provider: carLoc.Provider,
+			URL:      carLoc.URL,
+			Size:     seg.Size(),
+		}); err != nil {
+			return fmt.Errorf("record segment %d %s location for %q: %w", seg.Seq(), plane, bucket, err)
+		}
+		incs := make([]registry.BlobInclusion, 0, len(positions))
+		for c, loc := range positions {
+			incs = append(incs, registry.BlobInclusion{
+				Space:       st.Space,
+				Digest:      c.Hash(),
+				ShardDigest: sha,
+				RangeStart:  int64(loc.Offset),
+				RangeEnd:    int64(loc.Offset + loc.Length - 1),
+			})
+		}
+		if err := inclusions.PutInclusions(ctx, incs); err != nil {
+			return fmt.Errorf("record segment %d %s inclusions for %q: %w", seg.Seq(), plane, bucket, err)
 		}
 		return nil
 	}

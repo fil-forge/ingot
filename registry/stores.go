@@ -72,6 +72,20 @@ type BlobLocation struct {
 	Size     int64
 }
 
+// BlobInclusion is one row of ingot.shard_inclusions: block Digest lives at
+// the inclusive byte range [RangeStart, RangeEnd] inside the shard CAR whose
+// own location is the (Space, ShardDigest) row of blob_locations. It is the
+// local mirror of the sharded-dag-index published at ship time, and the second
+// half of the indexing-service contract the appliance read tier mimics
+// (locations + inclusions).
+type BlobInclusion struct {
+	Space       did.DID
+	Digest      []byte // inner block multihash
+	ShardDigest []byte // enclosing shard CAR multihash
+	RangeStart  int64
+	RangeEnd    int64 // inclusive
+}
+
 // MultipartSession is one row of ingot.multipart_sessions.
 type MultipartSession struct {
 	UploadID    string
@@ -123,6 +137,18 @@ type LocationStore interface {
 	PutLocation(ctx context.Context, loc BlobLocation) error
 	GetLocation(ctx context.Context, space did.DID, digest []byte) (*BlobLocation, error)
 	DeleteLocation(ctx context.Context, space did.DID, digest []byte) error
+}
+
+// InclusionStore is the local shard-inclusion table (§8): block digest →
+// (shard digest, byte range) for every block of a shipped catalog segment,
+// written by the flush path before the segment is marked shipped. Resolved on
+// read (after the local segment is retired) in place of the indexing-service's
+// index claims.
+type InclusionStore interface {
+	// PutInclusions records a batch of inclusions (one shipped shard's worth).
+	// Re-ships of the same blocks are idempotent.
+	PutInclusions(ctx context.Context, incs []BlobInclusion) error
+	GetInclusion(ctx context.Context, space did.DID, digest []byte) (*BlobInclusion, error)
 }
 
 // MultipartStore tracks in-flight multipart uploads (§7.2). LatchSession is
