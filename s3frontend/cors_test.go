@@ -5,9 +5,9 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/versitygw/auth"
 	"github.com/fil-forge/versitygw/s3err"
-	"github.com/fil-forge/ucantone/did"
 
 	"github.com/fil-forge/ingot/inmem"
 	"github.com/fil-forge/ingot/internal/cors"
