@@ -20,7 +20,6 @@ import (
 	msbucket "github.com/fil-forge/ingot/bucket"
 	"github.com/fil-forge/ingot/bucketauthority"
 	"github.com/fil-forge/ingot/config"
-	"github.com/fil-forge/ingot/internal/cors"
 	"github.com/fil-forge/ingot/internal/fasthttputil"
 	"github.com/fil-forge/ingot/internal/reqscope"
 	"github.com/fil-forge/ingot/logstore"
@@ -150,6 +149,7 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		Uploader:    deps.BodyUploader,
 		Remover:     deps.Remover,
 		MaxBlobSize: cfg.MaxBlobSize,
+		CORS:        cfg.CORSConfig,
 		Logger:      logger,
 	})
 
@@ -284,7 +284,9 @@ func buildS3API(ctx context.Context, backend *s3frontend.Backend, cfg config.Ser
 		return nil, fmt.Errorf("ingot: metrics: %w", err)
 	}
 
-	opts := []s3api.Option{
+	api, err := s3api.New(backend,
+		middlewares.RootUserConfig{Access: cfg.RootAccess, Secret: cfg.RootSecret},
+		cfg.Region, iam, loggers.S3Logger, loggers.AdminLogger, evSender, mm,
 		s3api.WithQuiet(),
 		s3api.WithHealth("/health"),
 		s3api.WithConcurrencyLimiter(cfg.MaxConnections, cfg.MaxRequests),
@@ -300,19 +302,6 @@ func buildS3API(ctx context.Context, backend *s3frontend.Backend, cfg config.Ser
 			c.Locals(reqscope.RequestKey(), fasthttputil.RequestFromHTTPContext(c.RequestCtx()))
 			return c.Next()
 		}),
-	}
-	if len(cfg.CORSAllowedOrigins) > 0 {
-		matcher, err := cors.NewMatcher(cfg.CORSAllowedOrigins)
-		if err != nil {
-			return nil, fmt.Errorf("ingot: cors_allowed_origins: %w", err)
-		}
-		opts = append(opts, s3api.WithMiddleware("/", corsMiddleware(matcher)))
-	}
-
-	api, err := s3api.New(backend,
-		middlewares.RootUserConfig{Access: cfg.RootAccess, Secret: cfg.RootSecret},
-		cfg.Region, iam, loggers.S3Logger, loggers.AdminLogger, evSender, mm,
-		opts...,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("ingot: s3api: %w", err)

@@ -30,3 +30,9 @@ auth_service_proofs: "/proofs/hilt-ingot-s3-proof.txt"
 
 # The point of this config: force coarse blob-splitting at 64 KiB.
 max_blob_size: 65536
+
+# Browser origins the S3 listener answers CORS for — an exact origin and a
+# wildcard one, for the CORS scenario (scenarios_test.go).
+cors_allowed_origins:
+  - "https://app.example"
+  - "https://*.dev.example"
