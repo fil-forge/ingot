@@ -50,8 +50,10 @@ func NewMatcher(patterns []string) (*Matcher, error) {
 		if !ok {
 			return nil, fmt.Errorf("cors: origin pattern %q must start with http:// or https://", raw)
 		}
-		if rest == "" || strings.ContainsAny(rest, "/?#") {
-			return nil, fmt.Errorf("cors: origin pattern %q must be a bare origin (scheme://host[:port], no path)", raw)
+		// '@' rejects userinfo (https://user@host): an Origin header is only
+		// scheme+host(+port), so such a pattern could never match a request.
+		if rest == "" || strings.ContainsAny(rest, "/?#@") {
+			return nil, fmt.Errorf("cors: origin pattern %q must be a bare origin (scheme://host[:port], no path or userinfo)", raw)
 		}
 		switch strings.Count(p, "*") {
 		case 0:

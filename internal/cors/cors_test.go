@@ -17,6 +17,8 @@ func TestNewMatcher_RejectsBadPatterns(t *testing.T) {
 		{"trailing slash", "https://app.example/", "bare origin"},
 		{"path", "https://app.example/bucket", "bare origin"},
 		{"bare scheme", "https://", "bare origin"},
+		{"userinfo", "https://user@app.example", "bare origin"},
+		{"userinfo with password", "https://user:pass@app.example", "bare origin"},
 		{"star mid-label", "https://foo*.dev.example", "leftmost host label"},
 		{"star not a label", "https://*dev.example", "leftmost host label"},
 		{"star alone in host", "https://*.", "leftmost host label"},

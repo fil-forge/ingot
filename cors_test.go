@@ -2,6 +2,7 @@ package ingot
 
 import (
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gofiber/fiber/v3"
@@ -44,8 +45,8 @@ func TestCORSMiddleware(t *testing.T) {
 		if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "https://feature-1.dev.example" {
 			t.Errorf("Allow-Origin = %q, want the request origin echoed", got)
 		}
-		if got := resp.Header.Get("Vary"); got == "" {
-			t.Error("Vary header missing on origin-reflected response")
+		if got := resp.Header.Get("Vary"); !strings.Contains(got, "Origin") {
+			t.Errorf("Vary = %q, want it to include Origin on an origin-reflected response", got)
 		}
 		if got := resp.Header.Get("Access-Control-Expose-Headers"); got != corsExposeHeaders {
 			t.Errorf("Expose-Headers = %q, want %q", got, corsExposeHeaders)
