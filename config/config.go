@@ -9,6 +9,8 @@ import (
 
 	"github.com/spf13/viper"
 	"go.uber.org/multierr"
+
+	"github.com/fil-forge/ingot/internal/cors"
 )
 
 // Config is ingot's own configuration.
@@ -29,6 +31,14 @@ type Config struct {
 	// MaxBlobSize is the blob ceiling for new objects, in bytes (0 -> default
 	// 256 MiB). An object larger than this is coarsely split into ≤ max blobs.
 	MaxBlobSize int64 `mapstructure:"max_blob_size" yaml:"max_blob_size"`
+	// CORSAllowedOrigins lists the browser origins the S3 listener answers
+	// CORS for. Each entry is an exact origin ("https://app.example"), a
+	// subdomain wildcard ("https://*.dev.example" — the '*' replaces the
+	// leftmost host label, matching any subdomain depth), or the lone "*"
+	// (any origin — avoid outside development). Allowed origins are echoed
+	// back per-request; credentials (cookies) are never enabled. Empty
+	// disables CORS handling (the default).
+	CORSAllowedOrigins []string `mapstructure:"cors_allowed_origins" yaml:"cors_allowed_origins"`
 	// SealBytes / SealAge / Retain tune the logstore (zero -> logstore defaults).
 	SealBytes int64  `mapstructure:"seal_bytes" yaml:"seal_bytes"`
 	SealAge   string `mapstructure:"seal_age" yaml:"seal_age"`
@@ -108,6 +118,12 @@ func (c Config) ServerConfig() (ServerConfig, error) {
 	if err != nil {
 		return ServerConfig{}, err
 	}
+	// Parse-validate the CORS patterns here so a typo fails at startup
+	// (via Validate) rather than surfacing from New; the server compiles
+	// its own matcher from the raw strings.
+	if _, err := cors.NewMatcher(c.CORSAllowedOrigins); err != nil {
+		return ServerConfig{}, fmt.Errorf("ingot: cors_allowed_origins: %w", err)
+	}
 	return ServerConfig{
 		Addr:        c.Addr,
 		DataDir:     c.DataDir,
@@ -115,6 +131,8 @@ func (c Config) ServerConfig() (ServerConfig, error) {
 		RootAccess:  c.RootAccess,
 		RootSecret:  c.RootSecret,
 		MaxBlobSize: c.MaxBlobSize,
+
+		CORSAllowedOrigins: c.CORSAllowedOrigins,
 
 		// A per-plane override wins, else the top-level value, else the logstore
 		// default. Ship defaults to true unless the catalog block sets

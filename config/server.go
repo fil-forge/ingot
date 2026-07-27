@@ -41,4 +41,10 @@ type ServerConfig struct {
 	// request), so New substitutes a sensible default.
 	MaxConnections int
 	MaxRequests    int
+
+	// CORSAllowedOrigins are the browser origins the listener answers
+	// CORS for: exact origins ("https://app.example"), subdomain
+	// wildcards ("https://*.dev.example"), or "*" for any origin.
+	// Empty disables CORS handling entirely (the default).
+	CORSAllowedOrigins []string
 }
