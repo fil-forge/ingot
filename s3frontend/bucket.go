@@ -77,6 +77,33 @@ func (b *Backend) GetBucketAcl(ctx context.Context, input *s3.GetBucketAclInput)
 	return nil, nil
 }
 
+// GetBucketCors is the single seam versitygw drives all of its CORS
+// behaviour off: ApplyBucketCORS is attached to every bucket/object
+// route (s3api/router.go:188) and ctrl.CORSOptions answers preflights
+// from the same document (s3api/controllers/options.go:29) — both of
+// which fall through untouched while the BackendUnsupported default
+// (ErrNotImplemented) stands, which is why serving a document here is
+// all CORS support takes.
+//
+// The document is gateway-wide, rendered from cors_allowed_origins
+// (internal/cors) and marshalled once in New: ingot doesn't model
+// per-bucket CORS, so every bucket reports the same rules and
+// PutBucketCors/DeleteBucketCors stay unimplemented. The disabled check
+// comes first so the common case — no CORS configured — costs no
+// registry lookup on requests that carry an Origin header.
+func (b *Backend) GetBucketCors(ctx context.Context, bucket string) ([]byte, error) {
+	if len(b.cors) == 0 {
+		return nil, s3err.GetAPIError(s3err.ErrNoSuchCORSConfiguration)
+	}
+	if _, err := b.reg.Get(ctx, bucket); err != nil {
+		if errors.Is(err, registry.ErrNotFound) {
+			return nil, s3err.GetAPIError(s3err.ErrNoSuchBucket)
+		}
+		return nil, err
+	}
+	return b.cors, nil
+}
+
 // GetObjectLockConfiguration is called from auth.CheckObjectAccess
 // (object_lock.go:223) on every object PUT/DELETE. The caller only
 // tolerates ErrObjectLockConfigurationNotFound; ErrNotImplemented
