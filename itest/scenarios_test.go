@@ -254,12 +254,6 @@ func TestForgeScenarios(t *testing.T) {
 	// preflight route and per-route CORS middleware. Asserted on the wire
 	// because none of that behavior lives in ingot code.
 	t.Run("CORS", func(t *testing.T) {
-		// TODO(https://github.com/fil-forge/ingot/issues/45): re-enable once
-		// the versitygw pin carries the CORS preflight route these assertions
-		// require. The test has never passed in any environment — it merged
-		// (#42/#43) while the itest suite couldn't boot a stack, so its
-		// failure was hidden inside the infrastructure red.
-		t.Skip("CORS preflight support is missing from the pinned versitygw — see issue #45")
 		const (
 			bucket   = "cors"
 			key      = "obj"
@@ -297,8 +291,9 @@ func TestForgeScenarios(t *testing.T) {
 		}
 
 		resp := preflight(t, origin)
-		if resp.StatusCode != http.StatusNoContent {
-			t.Errorf("preflight status = %d, want 204", resp.StatusCode)
+		// CORS preflight spec allows any "ok status" (200-299).
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			t.Errorf("preflight status = %d, want 2xx", resp.StatusCode)
 		}
 		if got := resp.Header.Get("Access-Control-Allow-Origin"); got != origin {
 			t.Errorf("preflight Allow-Origin = %q, want the request origin echoed", got)
