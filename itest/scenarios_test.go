@@ -290,11 +290,14 @@ func TestForgeScenarios(t *testing.T) {
 			return resp
 		}
 
-		// A matched preflight is answered 200, matching real S3 (browsers
-		// accept any 2xx); 204 is only versitygw's no-CORS-config fallback.
+		// Any 2xx is a successful preflight per the fetch spec; versitygw
+		// answers a matched rule 200 and only its no-CORS-config fallback
+		// 204. The Max-Age assertion below is what pins the real path — the
+		// fallback sets no Max-Age and mirrors the requested method instead
+		// of the rule's method list.
 		resp := preflight(t, origin)
-		if resp.StatusCode != http.StatusOK {
-			t.Errorf("preflight status = %d, want 200", resp.StatusCode)
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			t.Errorf("preflight status = %d, want 2xx", resp.StatusCode)
 		}
 		if got := resp.Header.Get("Access-Control-Allow-Origin"); got != origin {
 			t.Errorf("preflight Allow-Origin = %q, want the request origin echoed", got)

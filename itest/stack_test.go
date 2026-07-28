@@ -104,7 +104,9 @@ func forgeStack(t *testing.T, extra ...stack.Option) (*stack.Stack, string) {
 	t.Helper()
 	t.Logf("booting the smelt Forge stack (~1-2 min; first run also compiles ingot and pulls images)")
 	opts := []stack.Option{
-		stack.WithPiriNodes(stack.PiriNodeConfig{}),
+		// Postgres-backed piri: piri:main's curio PDP pipeline refuses
+		// sqlite ("curio PDP pipeline requires Postgres") as of 2026-07-24.
+		stack.WithPiriNodes(stack.PiriNodeConfig{Postgres: true}),
 		stack.WithServiceBinary("ingot", localIngotBinary(t)),
 	}
 	// Local-dev escape hatches: run against upload-service (sprue) / piri
