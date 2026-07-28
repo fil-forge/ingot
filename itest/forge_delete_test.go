@@ -4,7 +4,6 @@ package itest
 
 import (
 	"context"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -20,38 +19,14 @@ import (
 // piri /blob/release (claim release; deferred physical deletion once the
 // PDP aggregate root retires on-chain).
 //
-// The published piri/sprue images predate the removal handlers, so this
-// test injects working-tree builds of both and skips when they aren't
-// provided:
-//
-//	(cd ../../piri  && CGO_ENABLED=0 GOOS=linux go build -o /tmp/piri  ./cmd)
-//	(cd ../../sprue && CGO_ENABLED=0 GOOS=linux go build -o /tmp/sprue ./cmd/main.go)
-//	ITEST_PIRI_BIN=/tmp/piri ITEST_SPRUE_BIN=/tmp/sprue \
-//	  go test -tags itest ./itest -run TestForgeDeleteReleasesNetworkBlob -v -timeout 900s
-//
-// Once images with the handlers publish, drop the env gate and the binary
-// injection.
+// Runs on the stock smelt-SDK images like every other itest. It needs
+// piri:main ≥ fil-forge/piri#30 (the /blob/release handler) and sprue:main ≥
+// fil-forge/sprue#33 (the forward); until piri#30 publishes, point
+// INGOT_ITEST_PIRI_IMAGE at a branch image (the forgeStack escape hatch).
 func TestForgeDeleteReleasesNetworkBlob(t *testing.T) {
-	piriBin := os.Getenv("ITEST_PIRI_BIN")
-	sprueBin := os.Getenv("ITEST_SPRUE_BIN")
-	if piriBin == "" || sprueBin == "" {
-		t.Skip("requires piri+sprue builds with the blob-removal chain: set ITEST_PIRI_BIN and ITEST_SPRUE_BIN (see test doc comment)")
-	}
-
 	ctx := t.Context()
 
-	// The Curio-based piri requires a Postgres node (harmonydb) and, until
-	// the published localdev image carries the mockrpc Ticket fix, an
-	// overridable blockchain image.
-	stackOpts := []stack.Option{
-		stack.WithPiriNodes(stack.PiriNodeConfig{Postgres: true}),
-		stack.WithServiceBinary("piri", piriBin),
-		stack.WithServiceBinary("upload", sprueBin),
-	}
-	if img := os.Getenv("ITEST_BLOCKCHAIN_IMAGE"); img != "" {
-		stackOpts = append(stackOpts, stack.WithBlockchainImage(img))
-	}
-	s, ingotEndpoint := forgeStack(t, stackOpts...)
+	s, ingotEndpoint := forgeStack(t)
 	accessKey, secretKey := hiltProvisionTenant(t, ctx, s, "delete")
 	cfg := forgeConfig(ingotEndpoint, accessKey, secretKey)
 

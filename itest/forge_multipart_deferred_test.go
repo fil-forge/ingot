@@ -5,7 +5,6 @@ package itest
 import (
 	"bytes"
 	"context"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -23,35 +22,14 @@ import (
 // (parked — outside the PDP pipeline), Complete must conclude (accept) every
 // part, and Abort must unwind parked blobs with /blob/abort → /blob/reject.
 //
-// Requires piri + sprue builds with the blob-removal chain (/blob/remove →
-// /blob/release, /blob/abort → /blob/reject); the published images predate
-// them, so inject working-tree binaries and skip otherwise (same gate as
-// TestForgeDeleteReleasesNetworkBlob):
-//
-//	(cd ../../piri  && CGO_ENABLED=0 GOOS=linux go build -o /tmp/piri  ./cmd)
-//	(cd ../../sprue && CGO_ENABLED=0 GOOS=linux go build -o /tmp/sprue ./cmd/main.go)
-//	ITEST_PIRI_BIN=/tmp/piri ITEST_SPRUE_BIN=/tmp/sprue \
-//	  go test -tags itest ./itest -run TestForgeDeferredMultipart -v -timeout 1200s
+// Runs on the stock smelt-SDK images like every other itest. It needs
+// piri:main ≥ fil-forge/piri#30 (/blob/reject) and sprue:main ≥
+// fil-forge/sprue#33 (/blob/abort forwarding); until piri#30 publishes,
+// point INGOT_ITEST_PIRI_IMAGE at a branch image (the forgeStack escape
+// hatch).
 func TestForgeDeferredMultipart(t *testing.T) {
-	piriBin := os.Getenv("ITEST_PIRI_BIN")
-	sprueBin := os.Getenv("ITEST_SPRUE_BIN")
-	if piriBin == "" || sprueBin == "" {
-		t.Skip("requires piri+sprue builds with the /blob/abort chain: set ITEST_PIRI_BIN and ITEST_SPRUE_BIN (see test doc comment)")
-	}
-
 	ctx := t.Context()
-	// The Curio-based piri requires a Postgres node (harmonydb) and, until
-	// the published localdev image carries the mockrpc Ticket fix, an
-	// overridable blockchain image.
-	stackOpts := []stack.Option{
-		stack.WithPiriNodes(stack.PiriNodeConfig{Postgres: true}),
-		stack.WithServiceBinary("piri", piriBin),
-		stack.WithServiceBinary("upload", sprueBin),
-	}
-	if img := os.Getenv("ITEST_BLOCKCHAIN_IMAGE"); img != "" {
-		stackOpts = append(stackOpts, stack.WithBlockchainImage(img))
-	}
-	s, endpoint := forgeStack(t, stackOpts...)
+	s, endpoint := forgeStack(t)
 	accessKey, secretKey := hiltProvisionTenant(t, ctx, s, "mpdeferred")
 	cl := sdkClient(forgeS3Conf(endpoint, accessKey, secretKey))
 

@@ -160,10 +160,9 @@ var completeMultipartXFail = []forgeCase{
 	// The conditional matrix itself passes; the case then fails its bucket
 	// teardown: upstream's teardown never aborts in-flight uploads, so
 	// DeleteBucket implicitly aborts them (s3frontend/bucket.go), but the
-	// /blob/abort goes out proofless — hilt's per-operation proof grants
-	// carry blob.Abort for the S3 Abort operation only, not for
-	// DeleteBucket/UploadPart. Promote once hilt's s3perm map grants
-	// blob.Abort on bucket delete.
+	// /blob/abort goes out proofless — hilt's s3perm map delegates no
+	// blob.Abort today. fil-forge/hilt#36 adds it to the write set;
+	// promote once a hilt image with it publishes.
 	{name: "conditional_writes", fn: integration.CompleteMultipartUpload_conditional_writes},
 	{name: "invalid_checksum_part", fn: integration.CompleteMultipartUpload_invalid_checksum_part},
 	{name: "multiple_checksum_part", fn: integration.CompleteMultipartUpload_multiple_checksum_part},

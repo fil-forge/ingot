@@ -37,6 +37,16 @@ func ProofStore(ctx context.Context) (ucanlib.ProofStore, bool) {
 	return ps, ok
 }
 
+// WithoutProofStore returns a context whose request-scoped proof store is
+// masked. Hilt delegates Forge commands per S3 permission, and some
+// permissions (s3:DeleteBucket) carry no blob commands at all — a flow that
+// must invoke blob capabilities from such a request (DeleteBucket's implicit
+// abort of in-flight multipart uploads) hides the request store so the
+// uploader falls back to the space authority captured at UploadPart.
+func WithoutProofStore(ctx context.Context) context.Context {
+	return context.WithValue(ctx, proofStoreKey, nil)
+}
+
 type requestContextKey struct{}
 
 var requestKey any = requestContextKey{}

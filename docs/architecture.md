@@ -840,9 +840,11 @@ paths below are exercised against the real stack by the smelt-based `itest/` har
   than `multipart_session_ttl` (default 7d) and reaps terminal session rows. A successful
   Complete retains its session in state `completed` so a duplicate Complete is idempotent
   per S3. `DeleteBucket` implicitly aborts the bucket's in-flight sessions before the space
-  delete (upstream's conformance teardown never aborts them); its `/blob/abort` leg is gated
-  on hilt granting `blob.Abort` for the bucket-delete operation. The network-side `/blob/abort`
-  unwind remains a parking-flow concern (above).
+  delete (upstream's conformance teardown never aborts them); because `s3:DeleteBucket`
+  delegates no blob commands, the abort runs on the space authority captured at `UploadPart`,
+  and its `/blob/abort` leg is gated on hilt delegating `blob.Abort` with the write set
+  (fil-forge/hilt#36). The network-side `/blob/abort` unwind remains a parking-flow
+  concern (above).
 
 ### Known correctness boundary
 

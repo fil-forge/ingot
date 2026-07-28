@@ -124,6 +124,10 @@ func forgeStack(t *testing.T, extra ...stack.Option) (*stack.Stack, string) {
 		t.Logf("using piri image override: %s", img)
 		opts = append(opts, stack.WithPiriImage(img))
 	}
+	if img := os.Getenv("INGOT_ITEST_HILT_IMAGE"); img != "" {
+		t.Logf("using hilt image override: %s", img)
+		opts = append(opts, stack.WithHiltImage(img))
+	}
 	// Same idea one step earlier in the pipeline: mount a locally-built piri
 	// binary (linux, static) over the image's /usr/bin/piri — validates an
 	// unreleased piri/ucantone change with no image build at all.

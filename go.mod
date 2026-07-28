@@ -10,7 +10,7 @@ require (
 	github.com/fil-forge/hilt v0.0.1-0.20260724134448-ba71f843f6a4
 	github.com/fil-forge/indexing-service v1.13.5-0.20260619142411-efe3f5fab717
 	github.com/fil-forge/libforge v0.0.0-20260727220215-5e299c46f62f
-	github.com/fil-forge/smelt v0.0.0-20260720130429-63116166a06c
+	github.com/fil-forge/smelt v0.0.0-20260728210138-0a0154e6e6d0
 	github.com/fil-forge/ucantone v0.0.0-20260727203046-ccb77059de44
 	github.com/fil-forge/versitygw v0.0.0-20260716095011-7a65883d595a
 	github.com/fxamacker/cbor/v2 v2.9.2

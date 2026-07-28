@@ -24,14 +24,11 @@ import (
 
 	msbucket "github.com/fil-forge/ingot/bucket"
 	"github.com/fil-forge/ingot/bucketop"
+	"github.com/fil-forge/ingot/internal/reqscope"
 	"github.com/fil-forge/ingot/mst"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/uploader"
 )
-
-// minPartSize is S3's minimum size for every part except the last one,
-// enforced at CompleteMultipartUpload (EntityTooSmall).
-const minPartSize = 5 << 20
 
 // defaultMaxListing is the S3 default and cap for max-parts / max-uploads.
 const defaultMaxListing = 1000
@@ -295,10 +292,12 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 		requested = append(requested, sp)
 		etagHasher.Write(sp.ETagMD5)
 	}
-	// Every part but the last must meet S3's 5 MiB minimum.
+	// Every part but the last must meet S3's protocol-level 5 MiB minimum
+	// (backend.MinPartSize — an S3 constant clients and SDKs assume, not an
+	// operator knob).
 	var total int64
 	for i, sp := range requested {
-		if i < len(requested)-1 && sp.Size < minPartSize {
+		if i < len(requested)-1 && sp.Size < backend.MinPartSize {
 			return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrEntityTooSmall)
 		}
 		total += sp.Size
@@ -390,7 +389,10 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 	// parts so a duplicate Complete is idempotent; the sweeper reaps it later.
 	// Best-effort: a failed latch leaves the row in 'completing', which the
 	// sweeper also treats as terminal after the TTL.
-	_, _ = b.multipart.LatchSession(ctx, uploadID, registry.SessionCompleting, registry.SessionCompleted)
+	if _, err := b.multipart.LatchSession(ctx, uploadID, registry.SessionCompleting, registry.SessionCompleted); err != nil {
+		b.logger.Warn("latch session to completed failed; sweeper reaps the completing row after the TTL",
+			zap.String("uploadID", uploadID), zap.Error(err))
+	}
 
 	etagQ := `"` + etag + `"`
 	return s3response.CompleteMultipartUploadResult{Bucket: &bucket, Key: &key, ETag: &etagQ}, "", nil
@@ -449,6 +451,13 @@ func (b *Backend) AbortMultipartUpload(ctx context.Context, input *s3.AbortMulti
 // drop the session, release its parts' now-unreferenced blobs. Used by
 // DeleteBucket's implicit abort of in-flight uploads.
 func (b *Backend) abortOpenSession(ctx context.Context, space did.DID, sess registry.MultipartSession) {
+	// s3:DeleteBucket delegates no blob commands (hilt's s3perm maps it to
+	// nil), so the surrounding request's proofs cannot authorize
+	// /blob/abort; mask them so the uploader falls back to the blob
+	// authority captured at UploadPart — the same resolution the
+	// session-expiry sweeper uses. blob.Abort rides the write set as of
+	// fil-forge/hilt#36.
+	ctx = reqscope.WithoutProofStore(ctx)
 	won, err := b.multipart.LatchSession(ctx, sess.UploadID, registry.SessionOpen, registry.SessionAborting)
 	if err != nil || !won {
 		return
@@ -522,11 +531,20 @@ func (b *Backend) cleanupPartBlobs(ctx context.Context, space did.DID, uploadID 
 							zap.String("digest", hex.EncodeToString(d)), zap.Error(aerr))
 					}
 				}
-				_ = b.parks.DeletePark(ctx, d)
+				if derr := b.parks.DeletePark(ctx, d); derr != nil {
+					b.logger.Warn("delete park row failed",
+						zap.String("digest", hex.EncodeToString(d)), zap.Error(derr))
+				}
 			}
 		}
-		_ = b.spool.Remove(mh.Multihash(d))
-		_ = b.intents.DeleteIntent(ctx, d)
+		if rerr := b.spool.Remove(mh.Multihash(d)); rerr != nil {
+			b.logger.Warn("remove spooled blob failed",
+				zap.String("digest", hex.EncodeToString(d)), zap.Error(rerr))
+		}
+		if derr := b.intents.DeleteIntent(ctx, d); derr != nil {
+			b.logger.Warn("delete upload intent failed",
+				zap.String("digest", hex.EncodeToString(d)), zap.Error(derr))
+		}
 	}
 }
 
