@@ -222,6 +222,27 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 			}
 		}
 
+		// In-flight multipart uploads do not block deletion (the upstream
+		// conformance contract's teardown deletes buckets without aborting
+		// them): abort any open sessions, releasing their parked part blobs
+		// from the space, before asking hilt to delete the space — which
+		// refuses while the space still holds blob registrations.
+		sessions, err := b.multipart.ListSessions(ctx, name)
+		if err != nil {
+			return fmt.Errorf("s3frontend: delete bucket: list mp sessions: %w", err)
+		}
+		aborted := 0
+		for _, s := range sessions {
+			if s.State == registry.SessionOpen {
+				b.abortOpenSession(ctx, st.Space, s)
+				aborted++
+			}
+		}
+		if aborted > 0 {
+			b.logger.Info("delete bucket: aborted in-flight multipart sessions",
+				zap.String("bucket", name), zap.Int("aborted", aborted), zap.Int("total", len(sessions)))
+		}
+
 		req, ok := reqscope.Request(ctx)
 		if !ok {
 			return errors.New("s3frontend: delete bucket: no request in context")

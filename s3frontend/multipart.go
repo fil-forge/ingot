@@ -17,8 +17,10 @@ import (
 	"github.com/fil-forge/versitygw/backend"
 	"github.com/fil-forge/versitygw/s3err"
 	"github.com/fil-forge/versitygw/s3response"
+	"github.com/google/uuid"
 	"github.com/ipfs/go-cid"
 	mh "github.com/multiformats/go-multihash"
+	"go.uber.org/zap"
 
 	msbucket "github.com/fil-forge/ingot/bucket"
 	"github.com/fil-forge/ingot/bucketop"
@@ -267,13 +269,17 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 	etagHasher := md5.New()
 	prev := 0
 	for _, rp := range input.MultipartUpload.Parts {
-		if rp.PartNumber == nil {
-			return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrInvalidPart)
+		// A part entry missing either field is malformed XML; a part number
+		// below 1 is an InvalidArgument (both per the upstream posix
+		// backend). Out-of-range numbers fall through to the membership
+		// check (no stored part can match) and report InvalidPart.
+		if rp.PartNumber == nil || rp.ETag == nil {
+			return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrMalformedXML)
 		}
 		num := int(*rp.PartNumber)
-		if num < 1 || num > 10000 {
+		if num < 1 {
 			return s3response.CompleteMultipartUploadResult{}, "",
-				s3err.GetAPIError(s3err.ErrInvalidPartNumberRange)
+				s3err.GetInvalidArgumentErr(s3err.InvalidArgCompleteMpPartNumber, strconv.Itoa(num))
 		}
 		if num <= prev {
 			return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrInvalidPartOrder)
@@ -283,7 +289,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 		if !ok {
 			return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrInvalidPart)
 		}
-		if rp.ETag != nil && !etagsEqual(*rp.ETag, hex.EncodeToString(sp.ETagMD5)) {
+		if !etagsEqual(*rp.ETag, hex.EncodeToString(sp.ETagMD5)) {
 			return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrInvalidPart)
 		}
 		requested = append(requested, sp)
@@ -438,6 +444,27 @@ func (b *Backend) AbortMultipartUpload(ctx context.Context, input *s3.AbortMulti
 	return nil
 }
 
+// abortOpenSession force-aborts an open multipart session exactly like a
+// client Abort: latch (losing gracefully to a concurrent Complete/Abort),
+// drop the session, release its parts' now-unreferenced blobs. Used by
+// DeleteBucket's implicit abort of in-flight uploads.
+func (b *Backend) abortOpenSession(ctx context.Context, space did.DID, sess registry.MultipartSession) {
+	won, err := b.multipart.LatchSession(ctx, sess.UploadID, registry.SessionOpen, registry.SessionAborting)
+	if err != nil || !won {
+		return
+	}
+	var digests [][]byte
+	if parts, err := b.multipart.ListParts(ctx, sess.UploadID); err == nil {
+		for _, p := range parts {
+			digests = append(digests, p.BlobDigests...)
+		}
+	}
+	if err := b.multipart.DeleteSession(ctx, sess.UploadID); err != nil {
+		return
+	}
+	b.cleanupPartBlobs(ctx, space, sess.UploadID, digests)
+}
+
 // cleanupPartBlobs removes spooled blobs that belonged to aborted, expired, or
 // superseded parts of uploadID — unless the blob is still referenced: by a
 // part of another in-flight session (content-addressed dedup), by a part still
@@ -490,7 +517,10 @@ func (b *Backend) cleanupPartBlobs(ctx context.Context, space did.DID, uploadID 
 		if state == registry.IntentParked {
 			if park, err := b.parks.GetPark(ctx, d); err == nil {
 				if cause, err := cid.Cast(park.AddTask); err == nil {
-					_ = b.deferred.AbortBlob(ctx, space, mh.Multihash(d), cause)
+					if aerr := b.deferred.AbortBlob(ctx, space, mh.Multihash(d), cause); aerr != nil {
+						b.logger.Warn("abort parked blob failed; provider-side release deferred",
+							zap.String("digest", hex.EncodeToString(d)), zap.Error(aerr))
+					}
 				}
 				_ = b.parks.DeletePark(ctx, d)
 			}
@@ -728,43 +758,37 @@ func (b *Backend) ListMultipartUploads(ctx context.Context, input *s3.ListMultip
 		}
 	}
 
-	// Marker positioning. An upload-id marker is meaningful only alongside a
-	// key marker: when the key marker names a live key, the id must belong to
-	// one of that key's uploads (else InvalidArgument); when it doesn't (the
-	// marker key was completed/aborted meanwhile), the id positions within the
-	// keys ordered after it.
+	// Marker positioning, mirroring upstream's MultipartUploadLister: an
+	// upload-id marker is meaningful only alongside a key marker; it must be
+	// a valid UUID and must name an upload of the FIRST key group at or
+	// after the key marker (else InvalidArgument), and the listing resumes
+	// just past it.
 	start := 0
 	if keyMarker != "" {
 		if uploadIDMarker != "" {
-			keyLive := false
-			pos := -1
-			for i, s := range inflight {
-				if s.ObjectKey == keyMarker {
-					keyLive = true
-					if s.UploadID == uploadIDMarker {
-						pos = i
-					}
-				}
-			}
-			if keyLive && pos < 0 {
+			if _, err := uuid.Parse(uploadIDMarker); err != nil {
 				return s3response.ListMultipartUploadsResult{},
-					s3err.GetAPIError(s3err.ErrInvalidRequest)
+					s3err.GetInvalidArgumentErr(s3err.InvalidArgUploadIdMarker, uploadIDMarker)
 			}
-			if pos < 0 {
-				for i, s := range inflight {
-					if s.ObjectKey >= keyMarker && s.UploadID == uploadIDMarker {
-						pos = i
+			i := 0
+			for i < len(inflight) && inflight[i].ObjectKey < keyMarker {
+				i++
+			}
+			pos := -1
+			if i < len(inflight) {
+				firstKey := inflight[i].ObjectKey
+				for j := i; j < len(inflight) && inflight[j].ObjectKey == firstKey; j++ {
+					if inflight[j].UploadID == uploadIDMarker {
+						pos = j
 						break
 					}
 				}
 			}
-			if pos >= 0 {
-				start = pos + 1
-			} else {
-				for start < len(inflight) && inflight[start].ObjectKey <= keyMarker {
-					start++
-				}
+			if pos < 0 {
+				return s3response.ListMultipartUploadsResult{},
+					s3err.GetInvalidArgumentErr(s3err.InvalidArgUploadIdMarker, uploadIDMarker)
 			}
+			start = pos + 1
 		} else {
 			for start < len(inflight) && inflight[start].ObjectKey <= keyMarker {
 				start++
