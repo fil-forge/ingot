@@ -74,11 +74,15 @@ func (u *Forge) UploadBlob(ctx context.Context, space did.DID, digest multihash.
 		return BlobLocation{}, fmt.Errorf("uploader: upload blob: %w", err)
 	}
 
+	return locationFromAdded(added)
+}
+
+// locationFromAdded parses the /assert/location commitment piri issued at
+// accept out of a BlobAdd result: the provider DID + retrieval URL a later
+// read needs to resolve this blob from the local blob-location table (same
+// shape the index locator extracts from indexer results).
+func locationFromAdded(added forgeclient.AddedBlob) (BlobLocation, error) {
 	loc := BlobLocation{Size: int64(added.Size)}
-	// added.Location is the /assert/location commitment piri issued at accept;
-	// parse its arguments for the provider DID + retrieval URL so a later read
-	// can resolve this blob from the local blob-location table (same shape the
-	// index locator extracts from indexer results).
 	if inv := added.Location; inv != nil && inv.Command() == assertcmds.Location.Command {
 		var args assertcmds.LocationArguments
 		if err := args.UnmarshalCBOR(bytes.NewReader(inv.ArgumentsBytes())); err != nil {

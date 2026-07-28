@@ -141,6 +141,7 @@ type serverParams struct {
 	Registry        registry.Registry
 	Intents         registry.IntentStore
 	Locations       registry.LocationStore
+	Inclusions      registry.InclusionStore
 	BlobRefs        registry.BlobRefStore
 	GC              registry.GCStore
 	Multipart       registry.MultipartStore
@@ -181,6 +182,7 @@ func registerServerLifecycle(lc fx.Lifecycle, p serverParams) {
 				Registry:        p.Registry,
 				Intents:         p.Intents,
 				Locations:       p.Locations,
+				Inclusions:      p.Inclusions,
 				BlobRefs:        p.BlobRefs,
 				GC:              p.GC,
 				Multipart:       p.Multipart,
@@ -292,13 +294,14 @@ func provideIAMService(c *hiltclient.Client, proofs *iam.KeyProofs, reg registry
 type registryResult struct {
 	fx.Out
 
-	Registry  registry.Registry
-	Intents   registry.IntentStore
-	Locations registry.LocationStore
-	BlobRefs  registry.BlobRefStore
-	GC        registry.GCStore
-	Multipart registry.MultipartStore
-	Meta      logstore.Meta
+	Registry   registry.Registry
+	Intents    registry.IntentStore
+	Locations  registry.LocationStore
+	Inclusions registry.InclusionStore
+	BlobRefs   registry.BlobRefStore
+	GC         registry.GCStore
+	Multipart  registry.MultipartStore
+	Meta       logstore.Meta
 }
 
 // provideRegistry wraps the host's pool in the postgres-backed registry and
@@ -310,7 +313,7 @@ type registryResult struct {
 // needs hilt_url/hilt_did configured.
 func provideRegistry(pool *pgxpool.Pool) registryResult {
 	pg := registry.NewPostgres(pool)
-	return registryResult{Registry: pg, Intents: pg, Locations: pg, BlobRefs: pg, GC: pg, Multipart: pg, Meta: pg}
+	return registryResult{Registry: pg, Intents: pg, Locations: pg, Inclusions: pg, BlobRefs: pg, GC: pg, Multipart: pg, Meta: pg}
 }
 
 // migrationHookOut feeds the migration PreStartHook into the "ingot_prestart"
@@ -337,15 +340,17 @@ func provideMigrationHook(pool *pgxpool.Pool, logger *zap.Logger) migrationHookO
 
 // provideForgeReader builds the network-backed read tier (piri retrieval),
 // fronted by a bounded in-memory block cache (see Config.ReadCacheBytes). Blob
-// locations resolve from the local blob_locations table (the appliance read
-// tier, registry.LocalLocator) rather than the indexing-service — same retrieval
-// path, no indexer dependency for reads (docs/architecture.md §8). Per-space
-// retrieval authority is the request-scoped proof store the IAM service
-// stashes on the context; Forge reads it from there, so this reader takes no
-// proof dependency.
-func provideForgeReader(cfg config.Config, id ServiceIdentity, locations registry.LocationStore, logger *zap.Logger) (blockstore.BlockReader, error) {
+// locations resolve from the local blob_locations + shard_inclusions tables
+// (the appliance read tier, registry.LocalLocator) rather than the
+// indexing-service — same retrieval path, no indexer dependency for reads
+// (docs/architecture.md §8). Whole blobs resolve directly; catalog blocks in
+// retention-retired segments resolve through their inclusion row to a ranged
+// read of the shipped shard. Per-space retrieval authority is the
+// request-scoped proof store the IAM service stashes on the context; Forge
+// reads it from there, so this reader takes no proof dependency.
+func provideForgeReader(cfg config.Config, id ServiceIdentity, locations registry.LocationStore, inclusions registry.InclusionStore, logger *zap.Logger) (blockstore.BlockReader, error) {
 	forge, err := blockstore.NewForge(blockstore.ForgeConfig{
-		Locator: registry.NewLocalLocator(locations),
+		Locator: registry.NewLocalLocator(locations, inclusions),
 		Signer:  id.Signer,
 		Logger:  logger,
 	})

@@ -17,6 +17,7 @@ var (
 	_ registry.BlobRefStore   = (*MemStore)(nil)
 	_ registry.IntentStore    = (*MemStore)(nil)
 	_ registry.LocationStore  = (*MemStore)(nil)
+	_ registry.InclusionStore = (*MemStore)(nil)
 	_ registry.MultipartStore = (*MemStore)(nil)
 	_ registry.GCStore        = (*MemStore)(nil)
 )
@@ -145,6 +146,33 @@ func (m *MemStore) DeleteLocation(_ context.Context, space did.DID, digest []byt
 	defer m.mu.Unlock()
 	delete(m.locations, locKey{space, string(digest)})
 	return nil
+}
+
+// InclusionStore =============================================================
+
+func (m *MemStore) PutInclusions(_ context.Context, incs []registry.BlobInclusion) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, inc := range incs {
+		cp := inc
+		cp.Digest = cloneBytes(inc.Digest)
+		cp.ShardDigest = cloneBytes(inc.ShardDigest)
+		m.inclusions[locKey{inc.Space, string(inc.Digest)}] = cp
+	}
+	return nil
+}
+
+func (m *MemStore) GetInclusion(_ context.Context, space did.DID, digest []byte) (*registry.BlobInclusion, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	inc, ok := m.inclusions[locKey{space, string(digest)}]
+	if !ok {
+		return nil, registry.ErrNotFound
+	}
+	cp := inc
+	cp.Digest = cloneBytes(inc.Digest)
+	cp.ShardDigest = cloneBytes(inc.ShardDigest)
+	return &cp, nil
 }
 
 // MultipartStore =============================================================

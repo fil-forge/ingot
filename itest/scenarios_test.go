@@ -291,8 +291,9 @@ func TestForgeScenarios(t *testing.T) {
 		}
 
 		resp := preflight(t, origin)
-		if resp.StatusCode != http.StatusNoContent {
-			t.Errorf("preflight status = %d, want 204", resp.StatusCode)
+		// CORS preflight spec allows any "ok status" (200-299).
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			t.Errorf("preflight status = %d, want 2xx", resp.StatusCode)
 		}
 		if got := resp.Header.Get("Access-Control-Allow-Origin"); got != origin {
 			t.Errorf("preflight Allow-Origin = %q, want the request origin echoed", got)
