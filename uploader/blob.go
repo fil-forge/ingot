@@ -73,17 +73,15 @@ func (u *Forge) UploadBlob(ctx context.Context, space did.DID, digest multihash.
 	if err != nil {
 		return BlobLocation{}, fmt.Errorf("uploader: upload blob: %w", err)
 	}
-	return locationOf(added)
+	return locationFromAdded(added)
 }
 
-// locationOf extracts the local blob-location record from a completed add's
-// /assert/location commitment.
-func locationOf(added forgeclient.AddedBlob) (BlobLocation, error) {
+// locationFromAdded parses the /assert/location commitment piri issued at
+// accept out of a BlobAdd result: the provider DID + retrieval URL a later
+// read needs to resolve this blob from the local blob-location table (same
+// shape the index locator extracts from indexer results).
+func locationFromAdded(added forgeclient.AddedBlob) (BlobLocation, error) {
 	loc := BlobLocation{Size: int64(added.Size)}
-	// added.Location is the /assert/location commitment piri issued at accept;
-	// parse its arguments for the provider DID + retrieval URL so a later read
-	// can resolve this blob from the local blob-location table (same shape the
-	// index locator extracts from indexer results).
 	if inv := added.Location; inv != nil && inv.Command() == assertcmds.Location.Command {
 		var args assertcmds.LocationArguments
 		if err := args.UnmarshalCBOR(bytes.NewReader(inv.ArgumentsBytes())); err != nil {
@@ -143,7 +141,7 @@ func (u *Forge) UploadBlobParked(ctx context.Context, space did.DID, digest mult
 		return nil, nil, fmt.Errorf("uploader: park blob: %w", err)
 	}
 	if added != nil {
-		loc, err := locationOf(*added)
+		loc, err := locationFromAdded(*added)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -161,7 +159,7 @@ func (u *Forge) ConcludeBlob(ctx context.Context, space did.DID, parked ParkedBl
 	if err != nil {
 		return BlobLocation{}, fmt.Errorf("uploader: conclude blob: %w", err)
 	}
-	return locationOf(added)
+	return locationFromAdded(added)
 }
 
 // AbortBlob abandons a parked blob via /blob/abort on the upload

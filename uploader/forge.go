@@ -28,8 +28,15 @@ import (
 // their own pipeline, so the contract is "ship ONE plane's CAR of one
 // sealed segment". The implementation streams the file body straight
 // into the HTTP PUT, never materializing it as a []block.Block.
+//
+// SubmitShard returns the shipped CAR's published location (provider DID +
+// retrieval URL from the accept-time commitment) so the flush path can record
+// it — plus each inner block's byte range — in the local location/inclusion
+// tables before the segment is marked shipped. A zero-value location (no
+// Provider/URL) means the implementation shipped nothing durable (e.g. the
+// in-memory no-op uploader).
 type Uploader interface {
-	SubmitShard(ctx context.Context, plane blockstore.Plane, space did.DID, shard CARShard) error
+	SubmitShard(ctx context.Context, plane blockstore.Plane, space did.DID, shard CARShard) (BlobLocation, error)
 }
 
 // CARShard describes one plane's sealed CAR file ready to ship. All
@@ -126,9 +133,9 @@ func (u *Forge) shipProofStore(ctx context.Context, space did.DID) (ucanlib.Proo
 	return nil, false
 }
 
-func (u *Forge) SubmitShard(ctx context.Context, plane blockstore.Plane, space did.DID, shard CARShard) error {
+func (u *Forge) SubmitShard(ctx context.Context, plane blockstore.Plane, space did.DID, shard CARShard) (BlobLocation, error) {
 	if shard.Size <= 0 || len(shard.Positions) == 0 {
-		return nil
+		return BlobLocation{}, nil
 	}
 
 	// The ship runs async (flush goroutine, no request), so its authority is
@@ -136,24 +143,51 @@ func (u *Forge) SubmitShard(ctx context.Context, plane blockstore.Plane, space d
 	// store → fail so the flush retries; a later write repopulates it.
 	store, ok := u.shipProofStore(ctx, space)
 	if !ok {
-		return fmt.Errorf("uploader: no ship authority for space %s (no captured proof store)", space)
+		return BlobLocation{}, fmt.Errorf("uploader: no ship authority for space %s (no captured proof store)", space)
 	}
 
 	// 1. blob/add the shard CAR via sprue, streaming from disk.
 	f, err := os.Open(shard.Path)
 	if err != nil {
-		return fmt.Errorf("uploader: open %s car %s: %w", plane, shard.Path, err)
+		return BlobLocation{}, fmt.Errorf("uploader: open %s car %s: %w", plane, shard.Path, err)
 	}
 	defer f.Close()
-	if _, err := u.client.BlobAdd(ctx, space, f,
+	added, err := u.client.BlobAdd(ctx, space, f,
 		forgeclient.WithPrecomputedDigest(shard.SHA256, uint64(shard.Size)),
 		forgeclient.WithPutClient(u.putClient),
 		forgeclient.WithProofStore(store),
-	); err != nil {
-		return fmt.Errorf("uploader: ship %s car: %w", plane, err)
+	)
+	if err != nil {
+		return BlobLocation{}, fmt.Errorf("uploader: ship %s car: %w", plane, err)
+	}
+	carLoc, err := locationFromAdded(added)
+	if err != nil {
+		return BlobLocation{}, err
 	}
 
-	// 2. Build a 1-shard sharded-dag-index keyed off the CAR multihash.
+	// 2-4. Publish the shard's sharded-dag-index to the indexing service.
+	// Best-effort: the CAR is already durable on piri and the flush path
+	// records block locations locally (blob_locations + shard_inclusions),
+	// so ingot's own reads never depend on the network index. Failing the
+	// ship here would wedge retention behind indexer availability instead —
+	// log loudly and move on. (TODO: queue failed publications for retry so
+	// the network index converges.)
+	if err := u.publishShardIndex(ctx, space, shard, store); err != nil {
+		u.logger.Warn("uploader: index publication failed; segment ships anyway (local inclusions cover reads, network index will lag)",
+			zap.Stringer("plane", plane),
+			zap.Stringer("space", space),
+			zap.Error(err),
+		)
+	}
+	return carLoc, nil
+}
+
+// publishShardIndex builds the 1-shard sharded-dag-index for shard (inner
+// block digest → byte range, keyed off the CAR multihash), blob/adds the
+// index blob, and /index/adds its CID via sprue (which re-publishes to the
+// indexing service). All invocations carry the ship authority — without it
+// they are issued proofless and sprue rejects them.
+func (u *Forge) publishShardIndex(ctx context.Context, space did.DID, shard CARShard, store ucanlib.ProofStore) error {
 	view := blobindex.NewShardedDagIndex(1)
 	for c, loc := range shard.Positions {
 		view.SetSlice(shard.SHA256, c.Hash(), blobindex.Range{
@@ -163,31 +197,27 @@ func (u *Forge) SubmitShard(ctx context.Context, plane blockstore.Plane, space d
 	}
 	var indexBuf bytes.Buffer
 	if err := view.Archive(&indexBuf); err != nil {
-		return fmt.Errorf("uploader: archive %s index: %w", plane, err)
+		return fmt.Errorf("archive index: %w", err)
 	}
 	indexBytes := indexBuf.Bytes()
 	indexDigest, err := multihash.Sum(indexBytes, multihash.SHA2_256, -1)
 	if err != nil {
-		return fmt.Errorf("uploader: hash %s index: %w", plane, err)
+		return fmt.Errorf("hash index: %w", err)
 	}
 
-	// 3. blob/add the index blob via sprue (small: one entry per CID).
-	//    Same ship authority as the shard CAR above — without the proof
-	//    store this /blob/add is issued proofless and sprue rejects it
-	//    ("not issued by subject and has no proofs").
 	if _, err := u.client.BlobAdd(ctx, space, bytes.NewReader(indexBytes),
 		forgeclient.WithPrecomputedDigest(indexDigest, uint64(len(indexBytes))),
 		forgeclient.WithPutClient(u.putClient),
 		forgeclient.WithProofStore(store),
 	); err != nil {
-		return fmt.Errorf("uploader: ship %s index: %w", plane, err)
+		return fmt.Errorf("ship index blob: %w", err)
 	}
 
-	// 4. index/add the index CID via sprue (which re-publishes to the
-	//    indexing service on ingot's behalf).
 	indexCID := cid.NewCidV1(uint64(multicodec.Car), indexDigest)
-	if err := u.client.IndexAdd(ctx, space, indexCID); err != nil {
-		return fmt.Errorf("uploader: publish %s index: %w", plane, err)
+	if err := u.client.IndexAdd(ctx, space, indexCID,
+		forgeclient.WithProofStore(store),
+	); err != nil {
+		return fmt.Errorf("publish index: %w", err)
 	}
 	return nil
 }

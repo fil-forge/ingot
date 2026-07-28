@@ -17,12 +17,14 @@
 // backend.BackendUnsupported. The few unsupported-by-default
 // methods that versitygw nevertheless calls on every request
 // (GetBucketAcl, GetBucketPolicy, GetObjectLockConfiguration,
-// GetBucketVersioning) are stubbed in bucket.go.
+// GetBucketVersioning, GetBucketCors) are stubbed in bucket.go.
 package s3frontend
 
 import (
 	"context"
+	"encoding/xml"
 
+	"github.com/fil-forge/versitygw/auth"
 	"github.com/fil-forge/versitygw/backend"
 	"go.uber.org/zap"
 
@@ -58,6 +60,10 @@ type Backend struct {
 	logger    *zap.Logger
 
 	maxBlobSize int64
+	// cors is Deps.CORS marshalled once at construction — GetBucketCors
+	// is on the per-request path, so the document is built here rather
+	// than per call. Nil when CORS is disabled.
+	cors []byte
 }
 
 // Deps wires a Backend over ingot's domain primitives.
@@ -101,6 +107,11 @@ type Deps struct {
 	// MaxBlobSize is the coarse-split blob ceiling (0 → bucket default).
 	MaxBlobSize int64
 
+	// CORS is the S3 CORS configuration GetBucketCors reports for every
+	// bucket, rendered from config by internal/cors. New marshals it once
+	// into the XML document the S3 API serves. Nil disables CORS.
+	CORS *auth.CORSConfiguration
+
 	// Logger is optional; defaults to zap.NewNop().
 	Logger *zap.Logger
 }
@@ -113,6 +124,18 @@ func New(d Deps) *Backend {
 	logger := d.Logger
 	if logger == nil {
 		logger = zap.NewNop()
+	}
+	// xml.Marshal cannot fail for CORSConfiguration's plain string and
+	// int fields, but a failure must not leave the gateway serving a
+	// half-configured document: log it and fall back to CORS disabled.
+	var corsDoc []byte
+	if d.CORS != nil {
+		doc, err := xml.Marshal(d.CORS)
+		if err != nil {
+			logger.Error("marshalling CORS configuration; CORS disabled", zap.Error(err))
+		} else {
+			corsDoc = doc
+		}
 	}
 	return &Backend{
 		authority:   d.Authority,
@@ -132,6 +155,7 @@ func New(d Deps) *Backend {
 		remover:     d.Remover,
 		logger:      logger,
 		maxBlobSize: d.MaxBlobSize,
+		cors:        corsDoc,
 	}
 }
 

@@ -17,6 +17,7 @@ var (
 	_ BlobRefStore   = (*Postgres)(nil)
 	_ IntentStore    = (*Postgres)(nil)
 	_ LocationStore  = (*Postgres)(nil)
+	_ InclusionStore = (*Postgres)(nil)
 	_ MultipartStore = (*Postgres)(nil)
 	_ GCStore        = (*Postgres)(nil)
 )
@@ -218,6 +219,44 @@ func (r *Postgres) DeletePark(ctx context.Context, digest []byte) error {
 		return fmt.Errorf("registry: delete park: %w", err)
 	}
 	return nil
+}
+
+// InclusionStore =============================================================
+
+func (r *Postgres) PutInclusions(ctx context.Context, incs []BlobInclusion) error {
+	if len(incs) == 0 {
+		return nil
+	}
+	batch := &pgx.Batch{}
+	for _, inc := range incs {
+		batch.Queue(
+			`INSERT INTO ingot.shard_inclusions (space, digest, shard_digest, range_start, range_end)
+			 VALUES ($1, $2, $3, $4, $5)
+			 ON CONFLICT (space, digest) DO UPDATE
+			   SET shard_digest = EXCLUDED.shard_digest,
+			       range_start  = EXCLUDED.range_start,
+			       range_end    = EXCLUDED.range_end`,
+			inc.Space, inc.Digest, inc.ShardDigest, inc.RangeStart, inc.RangeEnd)
+	}
+	if err := r.pool.SendBatch(ctx, batch).Close(); err != nil {
+		return fmt.Errorf("registry: put inclusions: %w", err)
+	}
+	return nil
+}
+
+func (r *Postgres) GetInclusion(ctx context.Context, space did.DID, digest []byte) (*BlobInclusion, error) {
+	inc := &BlobInclusion{Space: space, Digest: digest}
+	err := r.pool.QueryRow(ctx,
+		`SELECT shard_digest, range_start, range_end
+		 FROM ingot.shard_inclusions WHERE space = $1 AND digest = $2`,
+		space, digest).Scan(&inc.ShardDigest, &inc.RangeStart, &inc.RangeEnd)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("registry: get inclusion: %w", err)
+	}
+	return inc, nil
 }
 
 // MultipartStore =============================================================

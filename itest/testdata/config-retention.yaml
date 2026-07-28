@@ -1,6 +1,8 @@
-# Ingot daemon config for the blob-split scenario itests — smelt's default
-# forge-mode config (systems/ingot/config/config.yaml) with max_blob_size
-# lowered to 64 KiB so small objects coarse-split into multiple body blobs.
+# Ingot daemon config for the catalog-retention fallthrough itest — smelt's
+# default forge-mode config (systems/ingot/config/config.yaml) with the
+# catalog plane tuned to seal fast and retain only one shipped segment, and
+# the read cache disabled so every fallthrough read exercises the locator +
+# ranged /content/retrieve path rather than a warm cache.
 # Mounted over /etc/ingot/config.yaml via stack.WithServiceConfig.
 
 addr: "0.0.0.0:9000"
@@ -28,11 +30,11 @@ auth_service_did: "did:web:hilt"
 # hilt → ingot delegations for /s3/request/authorize and /s3/bucket/*
 auth_service_proofs: "/proofs/hilt-ingot-s3-proof.txt"
 
-# The point of this config: force coarse blob-splitting at 64 KiB.
-max_blob_size: 65536
-
-# Browser origins the S3 listener answers CORS for — an exact origin and a
-# wildcard one, for the CORS scenario (scenarios_test.go).
-cors_allowed_origins:
-  - "https://app.example"
-  - "https://*.dev.example"
+# The point of this config: roll catalog segments fast and retire aggressively,
+# with no read cache masking the fallthrough. seal_age is fast but leaves the
+# flusher headroom per ship (a 1s seal outruns the ship pipeline, overflowing
+# the flush queue and forcing re-ships through sprue's dedup path).
+read_cache_bytes: -1
+catalog_plane:
+  seal_age: 2s
+  retain: 1

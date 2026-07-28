@@ -20,6 +20,7 @@ var (
 	_ registry.BlobRefStore   = (*MemStore)(nil)
 	_ registry.IntentStore    = (*MemStore)(nil)
 	_ registry.LocationStore  = (*MemStore)(nil)
+	_ registry.InclusionStore = (*MemStore)(nil)
 	_ registry.MultipartStore = (*MemStore)(nil)
 	_ registry.GCStore        = (*MemStore)(nil)
 )
@@ -32,7 +33,6 @@ func cloneBytes(b []byte) []byte {
 }
 
 // BlobRefStore ===============================================================
-
 func (m *MemStore) AddBlobClaim(_ context.Context, c registry.BlobClaim) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -184,6 +184,33 @@ func (m *MemStore) DeletePark(_ context.Context, digest []byte) error {
 	defer m.mu.Unlock()
 	delete(m.parks, string(digest))
 	return nil
+}
+
+// InclusionStore =============================================================
+
+func (m *MemStore) PutInclusions(_ context.Context, incs []registry.BlobInclusion) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, inc := range incs {
+		cp := inc
+		cp.Digest = cloneBytes(inc.Digest)
+		cp.ShardDigest = cloneBytes(inc.ShardDigest)
+		m.inclusions[locKey{inc.Space, string(inc.Digest)}] = cp
+	}
+	return nil
+}
+
+func (m *MemStore) GetInclusion(_ context.Context, space did.DID, digest []byte) (*registry.BlobInclusion, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	inc, ok := m.inclusions[locKey{space, string(digest)}]
+	if !ok {
+		return nil, registry.ErrNotFound
+	}
+	cp := inc
+	cp.Digest = cloneBytes(inc.Digest)
+	cp.ShardDigest = cloneBytes(inc.ShardDigest)
+	return &cp, nil
 }
 
 // MultipartStore =============================================================

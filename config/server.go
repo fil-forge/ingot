@@ -1,6 +1,10 @@
 package config
 
-import "time"
+import (
+	"time"
+
+	"github.com/fil-forge/versitygw/auth"
+)
 
 // ServerConfig captures the user-facing knobs of an ingot S3 listener.
 // New() applies defaults for any zero-valued knobs. SealAge is in
@@ -48,4 +52,9 @@ type ServerConfig struct {
 	// idempotency are reaped past the same age. Zero → default 7 days;
 	// negative → sweeper disabled.
 	MultipartSessionTTL time.Duration
+
+	// CORSConfig is the S3 CORS configuration the backend reports for
+	// every bucket, rendered from Config.CORSAllowedOrigins by
+	// internal/cors. Nil disables CORS entirely (the default).
+	CORSConfig *auth.CORSConfiguration
 }

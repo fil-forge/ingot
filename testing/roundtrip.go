@@ -70,6 +70,28 @@ func DeleteObject(ctx context.Context, c Config, bucket, key string) error {
 	return err
 }
 
+// ListKeys returns every object key in bucket via undelimited ListObjectsV2
+// pages — the listing shape that fetches every leaf's manifest (no
+// common-prefix collapsing).
+func ListKeys(ctx context.Context, c Config, bucket string) ([]string, error) {
+	cl, err := s3Client(ctx, c)
+	if err != nil {
+		return nil, err
+	}
+	var keys []string
+	p := s3.NewListObjectsV2Paginator(cl, &s3.ListObjectsV2Input{Bucket: &bucket})
+	for p.HasMorePages() {
+		page, err := p.NextPage(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for _, obj := range page.Contents {
+			keys = append(keys, *obj.Key)
+		}
+	}
+	return keys, nil
+}
+
 // GetBytes downloads object key from bucket.
 func GetBytes(ctx context.Context, c Config, bucket, key string) ([]byte, error) {
 	cl, err := s3Client(ctx, c)

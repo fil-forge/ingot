@@ -5,6 +5,7 @@ package itest
 import (
 	"bytes"
 	"fmt"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -287,6 +288,96 @@ func TestForgeScenarios(t *testing.T) {
 		}
 		if got := getBody(t, ctx, cl, bucket, key, ""); !bytes.Equal(got, data) {
 			t.Fatalf("retried multipart object mismatch: %d bytes", len(got))
+		}
+	})
+
+	// CORS: the gateway answers browser CORS from cors_allowed_origins
+	// (testdata/config-smallblob.yaml) — a document s3frontend reports as
+	// every bucket's CORS configuration, which is what drives versitygw's
+	// preflight route and per-route CORS middleware. Asserted on the wire
+	// because none of that behavior lives in ingot code.
+	t.Run("CORS", func(t *testing.T) {
+		const (
+			bucket   = "cors"
+			key      = "obj"
+			origin   = "https://feature-1.dev.example" // matches https://*.dev.example
+			maxAge   = "600"
+			disallow = "https://evil.example"
+		)
+		if _, err := cl.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
+			t.Fatalf("CreateBucket: %v", err)
+		}
+		data := []byte("cors body")
+		if _, err := cl.PutObject(ctx, &s3.PutObjectInput{
+			Bucket: aws.String(bucket), Key: aws.String(key), Body: bytes.NewReader(data),
+		}); err != nil {
+			t.Fatalf("PutObject: %v", err)
+		}
+
+		// Preflight. Browsers send these unsigned, so this also pins that
+		// the OPTIONS route sits ahead of SigV4.
+		preflight := func(t *testing.T, origin string) *http.Response {
+			t.Helper()
+			req, err := http.NewRequestWithContext(ctx, http.MethodOptions, fmt.Sprintf("%s/%s/%s", endpoint, bucket, key), nil)
+			if err != nil {
+				t.Fatalf("new request: %v", err)
+			}
+			req.Header.Set("Origin", origin)
+			req.Header.Set("Access-Control-Request-Method", "PUT")
+			req.Header.Set("Access-Control-Request-Headers", "authorization, x-amz-content-sha256, x-amz-date")
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("preflight: %v", err)
+			}
+			t.Cleanup(func() { _ = resp.Body.Close() })
+			return resp
+		}
+
+		resp := preflight(t, origin)
+		// CORS preflight spec allows any "ok status" (200-299).
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			t.Errorf("preflight status = %d, want 2xx", resp.StatusCode)
+		}
+		if got := resp.Header.Get("Access-Control-Allow-Origin"); got != origin {
+			t.Errorf("preflight Allow-Origin = %q, want the request origin echoed", got)
+		}
+		if got := resp.Header.Get("Access-Control-Allow-Methods"); !strings.Contains(got, "PUT") {
+			t.Errorf("preflight Allow-Methods = %q, want it to include PUT", got)
+		}
+		if got := resp.Header.Get("Access-Control-Max-Age"); got != maxAge {
+			t.Errorf("preflight Max-Age = %q, want %s", got, maxAge)
+		}
+
+		if got := preflight(t, disallow).Header.Get("Access-Control-Allow-Origin"); got != "" {
+			t.Errorf("preflight Allow-Origin = %q for a disallowed origin, want unset", got)
+		}
+
+		// A real cross-origin read: a presigned GET is how a browser fetches
+		// an object, and the response must expose ETag to JavaScript.
+		presigned, err := s3.NewPresignClient(cl).PresignGetObject(ctx, &s3.GetObjectInput{
+			Bucket: aws.String(bucket), Key: aws.String(key),
+		})
+		if err != nil {
+			t.Fatalf("PresignGetObject: %v", err)
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, presigned.URL, nil)
+		if err != nil {
+			t.Fatalf("new request: %v", err)
+		}
+		req.Header.Set("Origin", origin)
+		get, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("presigned GET: %v", err)
+		}
+		defer func() { _ = get.Body.Close() }()
+		if get.StatusCode != http.StatusOK {
+			t.Fatalf("presigned GET status = %d, want 200", get.StatusCode)
+		}
+		if got := get.Header.Get("Access-Control-Allow-Origin"); got != origin {
+			t.Errorf("GET Allow-Origin = %q, want the request origin echoed", got)
+		}
+		if got := get.Header.Get("Access-Control-Expose-Headers"); !strings.Contains(got, "ETag") {
+			t.Errorf("GET Expose-Headers = %q, want it to include ETag", got)
 		}
 	})
 }
