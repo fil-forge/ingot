@@ -290,9 +290,11 @@ func TestForgeScenarios(t *testing.T) {
 			return resp
 		}
 
+		// A matched preflight is answered 200, matching real S3 (browsers
+		// accept any 2xx); 204 is only versitygw's no-CORS-config fallback.
 		resp := preflight(t, origin)
-		if resp.StatusCode != http.StatusNoContent {
-			t.Errorf("preflight status = %d, want 204", resp.StatusCode)
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("preflight status = %d, want 200", resp.StatusCode)
 		}
 		if got := resp.Header.Get("Access-Control-Allow-Origin"); got != origin {
 			t.Errorf("preflight Allow-Origin = %q, want the request origin echoed", got)
