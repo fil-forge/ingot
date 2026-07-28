@@ -579,7 +579,7 @@ The first cut keeps digest-before-upload; `allocate-by-size` is a same-rack fast
 - **`min`/`max` final values** — 8 MiB / 256 MiB are the starting proposals; confirm against the
   base-fee and transaction-count budget.
 - **Lifting the 256 MiB ceiling** (streaming commP) versus the simplicity of coarse splitting.
-- **Local cache vs near-stateless** — cache sizing/eviction, or commit to near-stateless.
+- **Local cache vs near-stateless** — cache sizing/eviction, or commit to near-stateless (#48).
 - **Catalog GC** — `gc_candidates` is a write-only log this iteration; the catalog CARs on Piri grow
   with mutation volume until a collector exists.
 - **Monotonic `nextPieceId` ratchet** under heavy churn (pdp-sim) — possibly periodic dataset
@@ -809,17 +809,21 @@ reference index — and is out of scope for this iteration.
 
 ### Deferred as forge-mode glue (validated live in smelt, not the in-process harness)
 
-The in-memory harness uses a no-op uploader and serves reads from the spool, so these forge-network
-paths are stubbed in-tree and verified against a real sprue+piri+indexer later:
+The in-memory harness uses a no-op uploader and serves reads from the spool; the forge-network
+paths below are exercised against the real stack by the smelt-based `itest/` harness in CI:
 
 - **`remove(digest)` and `abort(digest)` are live.** `RemoveBlob` invokes `/blob/remove` on
   sprue, which forwards `/blob/release` to the storage nodes ([§9](#9-the-system-contract-piri--sprue--indexer)); delete finality means claim-release-now,
   bytes-at-root-death. `AbortBlob` retires parked part-blobs via `/blob/abort` — sprue translates
   it into `/blob/reject` on the node (provider recovered from the `cause` receipt chain);
   allocation-expiry GC (FIL-625) remains the backstop when an abort never arrives.
-- **The local-table `Locator` read tier is not wired.** Body-blob *locations* are recorded at accept,
-  but the read path that consumes them ([§7.4](#74-read-getobject), [§8](#8-retrieval-addressing-when-bodies-need-a-sharded-dag-index)) is deferred — it is only exercised after spool
-  eviction (also not built) and is best validated live.
+- **The local-table `Locator` read tier is wired and validated.** Body blobs re-resolve after
+  spool loss from `blob_locations` + `/content/retrieve` (`TestForgeReadAfterEviction`), and
+  retention-retired catalog blocks resolve via `shard_inclusions` (#44) — the read paths of
+  [§7.4](#74-read-getobject) / [§8](#8-retrieval-addressing-when-bodies-need-a-sharded-dag-index).
+  Spool **eviction** itself is still unbuilt: nothing bounds the spool, and `DeleteObject`'s
+  release is network-side only, so local disk grows with every body byte ever written — the
+  bounded-cache policy [§5](#5-the-data-layer) specifies is tracked in #48.
 - **Multipart parts park at UploadPart, accept at Complete.** (Built: `parkBlobs`/`concludeBlobs`
   over the `blob_parks` table.) The in-process harness still spools parts
   at `UploadPart` and uploads+accepts them at `Complete`; the true forge *parking* (upload early,
@@ -835,7 +839,10 @@ paths are stubbed in-tree and verified against a real sprue+piri+indexer later:
   sessions and committed objects), and a background sweeper aborts open sessions older
   than `multipart_session_ttl` (default 7d) and reaps terminal session rows. A successful
   Complete retains its session in state `completed` so a duplicate Complete is idempotent
-  per S3. The network-side `/blob/abort` unwind remains a parking-flow concern (above).
+  per S3. `DeleteBucket` implicitly aborts the bucket's in-flight sessions before the space
+  delete (upstream's conformance teardown never aborts them); its `/blob/abort` leg is gated
+  on hilt granting `blob.Abort` for the bucket-delete operation. The network-side `/blob/abort`
+  unwind remains a parking-flow concern (above).
 
 ### Known correctness boundary
 
