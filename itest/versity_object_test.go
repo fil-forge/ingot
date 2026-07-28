@@ -8,16 +8,13 @@ import (
 
 // Single-object groups of the S3 conformance partition.
 //
-// TEARDOWN-BLOCKED rows: since the hilt (tenant-management) integration, a
-// bucket that ever held a non-empty object body cannot be deleted — object
-// bodies register blobs in the bucket's space at PUT, DeleteObject's blob
-// release is a no-op until sprue/piri implement /blob/remove (see the TODO
-// in uploader/blob.go), and hilt's /s3/bucket/delete refuses non-empty
-// spaces (409 BucketNotEmpty). Upstream cases delete their bucket in
-// teardown, so every case below marked "teardown-blocked" passes its S3
-// assertions and then fails teardown. They sit in the XFail tables so the
-// unexpected-pass ratchet flags them for promotion the moment /blob/remove
-// lands.
+// Historical note: before DeleteObject released network blobs (FIL-588),
+// a bucket that ever held a non-empty object body could not be deleted —
+// hilt's /s3/bucket/delete refuses non-empty spaces (409 BucketNotEmpty) —
+// so every such case failed its bucket-delete teardown and sat in the
+// XFail tables as "teardown-blocked". The unexpected-pass ratchet flagged
+// them all when the release path landed on this branch; they now live in
+// the pass tables.
 
 var putObjectPass = []forgeCase{
 	{name: "checksum_algorithm_and_header_mismatch", fn: integration.PutObject_checksum_algorithm_and_header_mismatch},
@@ -39,17 +36,18 @@ var putObjectPass = []forgeCase{
 	{name: "past_retain_until_date", fn: integration.PutObject_past_retain_until_date},
 	{name: "racey_success", fn: integration.PutObject_racey_success},
 	{name: "special_chars", fn: integration.PutObject_special_chars},
-}
-
-var putObjectXFail = []forgeCase{
-	// Teardown-blocked (see the header comment): S3 assertions pass, the
-	// bucket delete 409s.
-	{name: "checksums_success", fn: integration.PutObject_checksums_success},
 	{name: "conditional_writes", fn: integration.PutObject_conditional_writes},
 	{name: "default_checksum", fn: integration.PutObject_default_checksum},
 	{name: "default_content_type", fn: integration.PutObject_default_content_type},
 	{name: "success", fn: integration.PutObject_success},
 	{name: "with_metadata", fn: integration.PutObject_with_metadata},
+}
+
+var putObjectXFail = []forgeCase{
+	// Still teardown-blocked even with DeleteObject's blob release: the
+	// case's checksummed bodies survive deletion and the bucket delete
+	// 409s (BucketNotEmpty).
+	{name: "checksums_success", fn: integration.PutObject_checksums_success},
 	// The incorrect_md5 subcheck expects 400 InvalidDigest; ingot 500s.
 	{name: "md5", fn: integration.PutObject_md5},
 	// A metadata-combining re-PUT is denied (403) under the hilt authorize
@@ -69,11 +67,6 @@ var getObjectPass = []forgeCase{
 	{name: "invalid_part_number", fn: integration.GetObject_invalid_part_number},
 	{name: "non_existing_key", fn: integration.GetObject_non_existing_key},
 	{name: "zero_len_with_range", fn: integration.GetObject_zero_len_with_range},
-}
-
-var getObjectXFail = []forgeCase{
-	// Teardown-blocked (see the header comment): S3 assertions pass, the
-	// bucket delete 409s.
 	{name: "by_range_resp_status", fn: integration.GetObject_by_range_resp_status},
 	{name: "checksums", fn: integration.GetObject_checksums},
 	{name: "conditional_reads", fn: integration.GetObject_conditional_reads},
@@ -91,8 +84,15 @@ var getObjectXFail = []forgeCase{
 	{name: "range_and_part_number", fn: integration.GetObject_range_and_part_number},
 	{name: "ranged_with_checksum_mode", fn: integration.GetObject_ranged_with_checksum_mode},
 	{name: "with_range", fn: integration.GetObject_with_range},
+}
+
+var getObjectXFail = []forgeCase{
+	// Directory objects are served with binary/octet-stream instead of
+	// application/x-directory.
 	{name: "directory_success", fn: integration.GetObject_directory_success},
+	// Requires PutBucketPolicy, which ingot 501s (NotImplemented).
 	{name: "overrides_fail_public", fn: integration.GetObject_overrides_fail_public},
+	// Asserts object tagging (TagCount), which is unimplemented.
 	{name: "success", fn: integration.GetObject_success},
 }
 
@@ -105,11 +105,6 @@ var headObjectPass = []forgeCase{
 	{name: "overrides_success", fn: integration.HeadObject_overrides_success},
 	{name: "dir_with_range", fn: integration.HeadObject_dir_with_range},
 	{name: "zero_len_with_range", fn: integration.HeadObject_zero_len_with_range},
-}
-
-var headObjectXFail = []forgeCase{
-	// Teardown-blocked (see the header comment): S3 assertions pass, the
-	// bucket delete 409s.
 	{name: "checksums", fn: integration.HeadObject_checksums},
 	{name: "conditional_reads", fn: integration.HeadObject_conditional_reads},
 	{name: "incidental_dir_object", fn: integration.HeadObject_incidental_dir_object},
@@ -124,7 +119,12 @@ var headObjectXFail = []forgeCase{
 	{name: "by_range_resp_status", fn: integration.HeadObject_by_range_resp_status},
 	{name: "ranged_with_checksum_mode", fn: integration.HeadObject_ranged_with_checksum_mode},
 	{name: "with_range", fn: integration.HeadObject_with_range},
+}
+
+var headObjectXFail = []forgeCase{
+	// Requires PutBucketPolicy, which ingot 501s (NotImplemented).
 	{name: "overrides_fail_public", fn: integration.HeadObject_overrides_fail_public},
+	// Asserts object tagging (TagCount), which is unimplemented.
 	{name: "success", fn: integration.HeadObject_success},
 }
 
@@ -137,12 +137,10 @@ var deleteObjectPass = []forgeCase{
 	{name: "non_existing_object", fn: integration.DeleteObject_non_existing_object},
 	{name: "success", fn: integration.DeleteObject_success},
 	{name: "success_status_code", fn: integration.DeleteObject_success_status_code},
+	{name: "conditional_writes", fn: integration.DeleteObject_conditional_writes},
 }
 
 var deleteObjectXFail = []forgeCase{
-	// Teardown-blocked (see the header comment): S3 assertions pass, the
-	// bucket delete 409s.
-	{name: "conditional_writes", fn: integration.DeleteObject_conditional_writes},
 	// The ExpectedBucketOwner-matching delete is denied (403) under the
 	// hilt authorize flow (ownership is the tenant's did:plc, not the
 	// account the case expects).
@@ -162,13 +160,6 @@ var copyObjectPass = []forgeCase{
 	{name: "to_itself_with_new_metadata", fn: integration.CopyObject_to_itself_with_new_metadata},
 	{name: "invalid_tagging_directive", fn: integration.CopyObject_invalid_tagging_directive},
 	{name: "invalid_checksum_algorithm", fn: integration.CopyObject_invalid_checksum_algorithm},
-}
-
-// Observed failing against the forge stack: multi-account semantics, tagging,
-// object-lock, and checksum-on-copy are unimplemented surface.
-var copyObjectXFail = []forgeCase{
-	// Teardown-blocked (see the header comment): S3 assertions pass, the
-	// bucket delete 409s.
 	{name: "success", fn: integration.CopyObject_success},
 	{name: "copy_source_starting_with_slash", fn: integration.CopyObject_copy_source_starting_with_slash},
 	{name: "default_content_type_with_replace_metadata", fn: integration.CopyObject_default_content_type_with_replace_metadata},
@@ -182,6 +173,11 @@ var copyObjectXFail = []forgeCase{
 	{name: "invalid_legal_hold", fn: integration.CopyObject_invalid_legal_hold},
 	{name: "invalid_object_lock_mode", fn: integration.CopyObject_invalid_object_lock_mode},
 	{name: "invalid_website_redirect_location", fn: integration.CopyObject_invalid_website_redirect_location},
+}
+
+// Observed failing against the forge stack: multi-account semantics, tagging,
+// object-lock, and checksum-on-copy are unimplemented surface.
+var copyObjectXFail = []forgeCase{
 	{name: "not_owned_source_bucket", fn: integration.CopyObject_not_owned_source_bucket},
 	{name: "should_replace_tagging", fn: integration.CopyObject_should_replace_tagging},
 	{name: "should_copy_tagging", fn: integration.CopyObject_should_copy_tagging},

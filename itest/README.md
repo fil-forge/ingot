@@ -37,14 +37,13 @@ yet — e.g. one built from an unmerged branch — point the stack at it:
 INGOT_ITEST_UPLOAD_IMAGE=<image> make itest
 ```
 
-**Teardown-blocked XFail rows:** a bucket that ever held a non-empty object
-body cannot currently be deleted — bodies register blobs in the bucket's
-space at PUT, `DeleteObject`'s blob release is a no-op until sprue/piri
-implement `/blob/remove`, and hilt's `/s3/bucket/delete` refuses non-empty
-spaces. Upstream cases delete their bucket in teardown, so such cases pass
-their S3 assertions and fail teardown; they sit in the XFail tables (marked
-"teardown-blocked") so the unexpected-pass ratchet flags them for promotion
-when `/blob/remove` lands.
+**Teardown-blocked XFail rows (historical):** before `DeleteObject` released
+network blobs (FIL-588), a bucket that ever held a non-empty object body
+could not be deleted — hilt's `/s3/bucket/delete` refuses non-empty spaces —
+so dozens of cases passed their S3 assertions and failed their bucket-delete
+teardown, and sat in the XFail tables marked "teardown-blocked". The
+unexpected-pass ratchet flagged them all when the release path landed; they
+now live in the pass tables.
 
 ## The conformance partition — `TestForgeVersity`
 

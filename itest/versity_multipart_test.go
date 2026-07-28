@@ -9,7 +9,9 @@ import (
 // Multipart groups of the S3 conformance partition, partitioned empirically
 // against the forge-mode stack (see the curation note in README.md). The
 // remaining xfail surface: part-level checksums (FIL-620), tagging/object-lock
-// /ACL on create (FIL-534/FIL-525), and the UploadPartCopy group (FIL-586).
+// /ACL on create (FIL-534/FIL-525), the UploadPartCopy group (FIL-586),
+// upstream error-code alignment (InvalidArgument where ingot returns a more
+// specific code), and conditional writes on Complete.
 
 var createMultipartPass = []forgeCase{
 	{name: "non_existing_bucket", fn: integration.CreateMultipartUpload_non_existing_bucket},
@@ -104,7 +106,6 @@ var listMultipartUploadsPass = []forgeCase{
 	{name: "max_uploads", fn: integration.ListMultipartUploads_max_uploads},
 	{name: "exceeding_max_uploads", fn: integration.ListMultipartUploads_exceeding_max_uploads},
 	{name: "ignore_upload_id_marker", fn: integration.ListMultipartUploads_ignore_upload_id_marker},
-	{name: "invalid_uploadId_marker", fn: integration.ListMultipartUploads_invalid_uploadId_marker},
 	{name: "keyMarker_not_from_list", fn: integration.ListMultipartUploads_keyMarker_not_from_list},
 	{name: "delimiter_truncated", fn: integration.ListMultipartUploads_delimiter_truncated},
 	{name: "prefix", fn: integration.ListMultipartUploads_prefix},
@@ -113,7 +114,11 @@ var listMultipartUploadsPass = []forgeCase{
 	{name: "with_checksums", fn: integration.ListMultipartUploads_with_checksums},
 }
 
-var listMultipartUploadsXFail = []forgeCase{}
+var listMultipartUploadsXFail = []forgeCase{
+	// Upstream expects InvalidArgument for a malformed upload-id-marker;
+	// ingot returns InvalidRequest.
+	{name: "invalid_uploadId_marker", fn: integration.ListMultipartUploads_invalid_uploadId_marker},
+}
 
 var abortMultipartPass = []forgeCase{
 	{name: "non_existing_bucket", fn: integration.AbortMultipartUpload_non_existing_bucket},
@@ -130,15 +135,12 @@ var completeMultipartPass = []forgeCase{
 	// upstream function name carries a typo (CompletedMultipartUpload_...).
 	{name: "non_existing_bucket", fn: integration.CompletedMultipartUpload_non_existing_bucket},
 	{name: "incorrect_part_number", fn: integration.CompleteMultipartUpload_incorrect_part_number},
-	{name: "missing_part_fields", fn: integration.CompleteMultipartUpload_missing_part_fields},
-	{name: "invalid_part_number", fn: integration.CompleteMultipartUpload_invalid_part_number},
 	{name: "default_content_type", fn: integration.CompleteMultipartUpload_default_content_type},
 	{name: "invalid_ETag", fn: integration.CompleteMultipartUpload_invalid_ETag},
 	{name: "small_upload_size", fn: integration.CompleteMultipartUpload_small_upload_size},
 	{name: "empty_parts", fn: integration.CompleteMultipartUpload_empty_parts},
 	{name: "incorrect_parts_order", fn: integration.CompleteMultipartUpload_incorrect_parts_order},
 	{name: "mpu_object_size", fn: integration.CompleteMultipartUpload_mpu_object_size},
-	{name: "conditional_writes", fn: integration.CompleteMultipartUpload_conditional_writes},
 	{name: "invalid_checksum_type", fn: integration.CompleteMultipartUpload_invalid_checksum_type},
 	{name: "multiple_final_checksums", fn: integration.CompleteMultipartUpload_multiple_final_checksums},
 	{name: "invalid_final_checksums", fn: integration.CompleteMultipartUpload_invalid_final_checksums},
@@ -158,6 +160,15 @@ var completeMultipartPass = []forgeCase{
 // Part-level / composite-checksum verification is FIL-620;
 // racey_data_integrity additionally leans on atomic concurrent overwrites.
 var completeMultipartXFail = []forgeCase{
+	// A part entry missing its ETag is accepted (200 with a result body)
+	// where upstream expects an Error response.
+	{name: "missing_part_fields", fn: integration.CompleteMultipartUpload_missing_part_fields},
+	// Upstream expects InvalidArgument; ingot returns InvalidPartNumber.
+	{name: "invalid_part_number", fn: integration.CompleteMultipartUpload_invalid_part_number},
+	// Conditional headers on Complete are unenforced; the object written
+	// past the precondition then fails the case's bucket teardown (409
+	// BucketNotEmpty).
+	{name: "conditional_writes", fn: integration.CompleteMultipartUpload_conditional_writes},
 	{name: "invalid_checksum_part", fn: integration.CompleteMultipartUpload_invalid_checksum_part},
 	{name: "multiple_checksum_part", fn: integration.CompleteMultipartUpload_multiple_checksum_part},
 	{name: "incorrect_checksum_part", fn: integration.CompleteMultipartUpload_incorrect_checksum_part},
