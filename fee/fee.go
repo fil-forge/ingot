@@ -168,12 +168,17 @@ func WithChunkSize(n int) EncryptOption {
 	return func(c *encryptConfig) { c.chunkSize = n }
 }
 
-// WithContentLength declares the total plaintext length in bytes. When set, the
-// envelope records the chunk count (advisory metadata that lets a range/seek
-// consumer plan fetches from the header alone), and the returned reader fails
-// with [ErrContentLengthMismatch] if the plaintext turns out to be a different
-// length. When unset, the chunk count is omitted — the object still decrypts,
-// and range decryption derives the geometry from the ciphertext length instead.
+// WithContentLength declares the total plaintext length in bytes. When set to a
+// non-negative value, the envelope records the chunk count (advisory metadata
+// that lets a range/seek consumer plan fetches from the header alone), and the
+// returned reader fails with [ErrContentLengthMismatch] if the plaintext turns
+// out to be a different length.
+//
+// A negative n is treated as "unknown", identical to not calling this option: a
+// caller propagating an unknown HTTP Content-Length as -1 gets the unset
+// behavior (no recorded chunk count, no mismatch check) rather than an error.
+// When unknown, the chunk count is omitted — the object still decrypts, and
+// range decryption derives the geometry from the ciphertext length instead.
 func WithContentLength(n int64) EncryptOption {
 	return func(c *encryptConfig) { c.contentLength = n }
 }
@@ -219,6 +224,17 @@ func Encrypt(plaintext io.Reader, recipients []Recipient, opts ...EncryptOption)
 // COSE_Encrypt0 (tag 16). Pair it with [DecryptWithCEK] to recover without an
 // in-envelope unwrap.
 //
+// The caller MUST use a distinct cek per envelope (or keep reuse far below the
+// birthday bound below). Unlike [Encrypt], which draws a fresh CEK each call,
+// this seals under a caller-supplied key — so the only cross-envelope nonce
+// separation is the random base nonce, which is [aesstream.BaseNonceSize] (7)
+// bytes. Under a reused CEK, two envelopes drawing the same base nonce reuse an
+// AES-GCM (key, nonce) pair, which is catastrophic (keystream reuse + tag
+// forgery). A 7-byte random nonce collides at a ~2^28-envelope birthday bound,
+// so sealing on the order of 2^30 objects under one CEK makes a collision
+// essentially certain. The wire format is fixed by the FEE spec, so this is a
+// caller obligation, not something this package can enforce.
+//
 // The caller retains ownership of cek: it is copied into the body cipher (and
 // wrapped to any recipients) but neither retained nor wiped by this call.
 func EncryptWithCEK(plaintext io.Reader, cek []byte, recipients []Recipient, opts ...EncryptOption) (io.ReadCloser, error) {
@@ -260,8 +276,11 @@ func encryptStream(plaintext io.Reader, cek []byte, recipients []Recipient, opts
 		cfg.chunkSize = aesstream.DefaultChunkSize
 	}
 	if cfg.chunkSize < aesstream.MinChunkSize || cfg.chunkSize > aesstream.MaxChunkSize {
-		return nil, fmt.Errorf("%w: chunk size %d out of range [%d, %d]",
-			ErrMalformedEnvelope, cfg.chunkSize, aesstream.MinChunkSize, aesstream.MaxChunkSize)
+		// An out-of-range WithChunkSize is an invalid argument on the encrypt
+		// path — no envelope exists yet — so it is not ErrMalformedEnvelope (a
+		// decode-side classification). Surface aesstream.ErrChunkSize, the same
+		// sentinel aesstream.NewWriter would return for this size.
+		return nil, fmt.Errorf("fee: chunk size %d: %w", cfg.chunkSize, aesstream.ErrChunkSize)
 	}
 
 	baseNonce, err := aesstream.NewBaseNonce()
@@ -334,11 +353,16 @@ func encryptStream(plaintext io.Reader, cek []byte, recipients []Recipient, opts
 	declaredLen := cfg.contentLength
 	go func() {
 		n, cerr := io.Copy(w, plaintext)
-		if cerr == nil {
-			cerr = w.Close() // emit the final chunk
-		}
 		if cerr == nil && declaredLen >= 0 && n != declaredLen {
 			cerr = fmt.Errorf("%w: declared %d, got %d", ErrContentLengthMismatch, declaredLen, n)
+		}
+		// Emit the final chunk only on a clean, length-matched copy. On a
+		// mismatch we deliberately skip w.Close(), so the stream ends without its
+		// last-flag chunk: a caller that ignores the error and stores the blob
+		// anyway gets a truncated ciphertext that fails to decrypt
+		// (aesstream.ErrTruncated), rather than a valid-but-mislabeled object.
+		if cerr == nil {
+			cerr = w.Close()
 		}
 		// A nil error closes the pipe with io.EOF (clean end); otherwise the
 		// error surfaces from the reader's Read.

@@ -5,6 +5,7 @@ import (
 	"crypto/ecdh"
 	"crypto/rand"
 	"io"
+	"strconv"
 	"testing"
 	"testing/iotest"
 
@@ -508,7 +509,8 @@ func TestEncryptNilRecipient(t *testing.T) {
 }
 
 // TestEncryptChunkSizeOutOfRange confirms an explicit chunk size below the body
-// cipher's minimum is rejected with a fee-level error.
+// cipher's minimum is rejected as an invalid argument — aesstream.ErrChunkSize,
+// the sentinel the body cipher itself uses — not as a malformed envelope.
 func TestEncryptChunkSizeOutOfRange(t *testing.T) {
 	key := newX25519Key(t)
 	_, err := fee.Encrypt(
@@ -516,7 +518,8 @@ func TestEncryptChunkSizeOutOfRange(t *testing.T) {
 		[]fee.Recipient{fee.NewECDHESRecipient(ecdhKID, key.PublicKey())},
 		fee.WithChunkSize(aesstream.MinChunkSize-1),
 	)
-	require.ErrorIs(t, err, fee.ErrMalformedEnvelope)
+	require.ErrorIs(t, err, aesstream.ErrChunkSize)
+	require.NotErrorIs(t, err, fee.ErrMalformedEnvelope)
 }
 
 // TestDecryptNilArgs confirms nil src or nil unwrapper are reported, not
@@ -640,7 +643,9 @@ func TestContentLengthChunkCount(t *testing.T) {
 // ErrContentLengthMismatch (the already-written chunk count cannot be trusted).
 func TestContentLengthMismatch(t *testing.T) {
 	key := newX25519Key(t)
-	plaintext := patternBytes(1000)
+	// Multiple chunks, so some full chunks are emitted before the final chunk is
+	// withheld on the mismatch.
+	plaintext := patternBytes(2*aesstream.MinChunkSize + 7)
 
 	enc, err := fee.Encrypt(bytes.NewReader(plaintext),
 		[]fee.Recipient{fee.NewECDHESRecipient(ecdhKID, key.PublicKey())},
@@ -650,8 +655,19 @@ func TestContentLengthMismatch(t *testing.T) {
 	require.NoError(t, err)
 	defer enc.Close()
 
-	_, err = io.ReadAll(enc)
+	// The mismatch surfaces as a non-EOF error from the reader...
+	blob, err := io.ReadAll(enc)
 	require.ErrorIs(t, err, fee.ErrContentLengthMismatch)
+
+	// ...and because the final chunk was withheld, the bytes produced so far do
+	// not decrypt cleanly: a caller that ignored the error and stored the blob
+	// gets a truncated, unauthenticatable object rather than a valid-but-
+	// mislabeled one. The header still decodes and the CEK still unwraps; the
+	// failure is in the truncated body.
+	r, derr := fee.Decrypt(bytes.NewReader(blob), fee.NewECDHESUnwrapper(ecdhKID, key))
+	require.NoError(t, derr)
+	_, derr = io.ReadAll(r)
+	require.ErrorIs(t, derr, aesstream.ErrTruncated)
 }
 
 // TestChunkSizeIsSelfDescribing confirms an envelope sealed with a non-default
@@ -816,26 +832,8 @@ func TestDecryptMalformedEphemeralKey(t *testing.T) {
 
 // name renders a byte count for a subtest name.
 func name(n int) string {
-	switch n {
-	case 0:
-		return "empty"
-	default:
-		return "n=" + itoa(n)
-	}
-}
-
-// itoa is a tiny non-allocating-on-the-hot-path integer formatter, kept local
-// so the test file needs no strconv import alongside the crypto ones.
-func itoa(n int) string {
 	if n == 0 {
-		return "0"
+		return "empty"
 	}
-	var buf [20]byte
-	i := len(buf)
-	for n > 0 {
-		i--
-		buf[i] = byte('0' + n%10)
-		n /= 10
-	}
-	return string(buf[i:])
+	return "n=" + strconv.Itoa(n)
 }
