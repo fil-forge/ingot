@@ -18,11 +18,9 @@
 set -euo pipefail
 
 REF_REPO="https://github.com/Kubuxu/foc-encryption-demo"
-# Pinned to the head of PR #2 (the RFC 9052 §5.3 Encrypt-context fix), NOT master:
-# master still seals tag-96 (multi-recipient) bodies under the buggy "Encrypt0"
-# context. Re-pin to the merge commit once the PR lands upstream.
-REF_SHA="158571aed08239d6b08b41d390d8ff9d915fd145"   # foc-encryption-demo PR #2 head
-REF_FETCH="refs/pull/2/head"                          # ref that reaches REF_SHA
+REF_SHA="158571aed08239d6b08b41d390d8ff9d915fd145"
+REF_FETCH="refs/heads/master"                         # ref that reaches REF_SHA
+
 PKG_SUBDIR="packages/foc-encryption"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
