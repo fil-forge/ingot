@@ -518,9 +518,10 @@ func matchRecipient(recipients []*cose.Recipient, want []byte) (*cose.Recipient,
 }
 
 // zero overwrites b, a best-effort wipe of the CEK once it has been copied into
-// the body cipher (and, on encrypt, wrapped to every recipient).
+// the body cipher (and, on encrypt, wrapped to every recipient). It wraps the
+// built-in clear so callers can defer it (a bare defer clear(b) is not allowed);
+// like the loop it replaced, it is best-effort — Go does not guarantee the write
+// survives dead-store elimination.
 func zero(b []byte) {
-	for i := range b {
-		b[i] = 0
-	}
+	clear(b)
 }
