@@ -7,6 +7,6 @@
   "typ": "application/vnd.foc-envelope+cose",
   "chunk_size": 4096,
   "chunk_count": 4,
-  "cek_hex": "f2fcf5d0eab0c2592ae20ca51eff5f4b847ee5795d9db801b802b45bcb04686d",
+  "cek_hex": "d3ce4f95acfb99deec601eb606a844cf931b4a2f82ece273a3b91ed2f5acbefd",
   "base_nonce_hex": "baf5c82a5faa4c"
 }

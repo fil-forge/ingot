@@ -59,7 +59,14 @@ func deriveBytes(label string, n int) []byte {
 	return sum[:n]
 }
 
-func testCEK() []byte       { return deriveBytes("fil-473-fee-cek-v1", 32) }
+// testCEK derives the content-encryption key for one fixture. The label
+// includes the fixture name (as the TS side's fil-473-fee-cek-ts-v1 does) so no
+// two fixtures share a CEK: several are single-chunk, so a shared CEK would give
+// them identical chunk-0 nonces (baseNonce ‖ 0 ‖ lastFlag) over different
+// plaintexts — AES-GCM key+nonce reuse. Harmless for public fixtures, but not a
+// pattern to enshrine in reference vectors.
+func testCEK(fixture string) []byte { return deriveBytes("fil-473-fee-cek-go-v1/"+fixture, 32) }
+
 func testBaseNonce() []byte { return deriveBytes("fil-473-fee-base-nonce-v1", aesstream.BaseNonceSize) }
 func testA256KWKEK() []byte { return deriveBytes("fil-473-fee-region-kek-v1", 32) }
 
