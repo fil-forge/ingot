@@ -148,12 +148,14 @@ func decodeEnvelope(tag uint64, arr []cbor.RawMessage) (*Envelope, error) {
 // otherwise decoding it. [Decode] dispatches on the tag itself, so PeekTag is
 // only needed when a caller wants to inspect the on-wire form (tag 96
 // [TagCOSEEncrypt] vs tag 16 [TagCOSEEncrypt0]) without decoding. It returns
-// ErrMalformed if data does not begin with a CBOR tag.
+// ErrNotEncrypt if data does not begin with a CBOR tag — the same sentinel
+// [Decode] returns for those bytes, so callers classifying with errors.Is see
+// one answer regardless of entry point.
 func PeekTag(data []byte) (uint64, error) {
 	dec := decMode.NewDecoder(bytes.NewReader(data))
 	var tag cbor.RawTag
 	if err := dec.Decode(&tag); err != nil {
-		return 0, fmt.Errorf("%w: %v", ErrMalformed, err)
+		return 0, fmt.Errorf("%w: %v", ErrNotEncrypt, err)
 	}
 	return tag.Number, nil
 }

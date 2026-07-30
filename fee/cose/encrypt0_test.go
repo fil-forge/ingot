@@ -195,7 +195,9 @@ func TestPeekTag(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, TagCOSEEncrypt, tag)
 
+	// Same sentinel as Decode for the same bytes: a non-tag item is not a COSE
+	// encrypt structure at all.
 	_, err = PeekTag([]byte{0x01, 0x02}) // a bare integer, not a tag
 	require.Error(t, err)
-	require.True(t, errors.Is(err, ErrMalformed))
+	require.True(t, errors.Is(err, ErrNotEncrypt))
 }
