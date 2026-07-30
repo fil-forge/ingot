@@ -178,32 +178,27 @@ func TestGenerate(t *testing.T) {
 		t.Skip("set FEE_VECTORS_REGEN=1 to regenerate the Go-produced fixtures")
 	}
 
-	cek := testCEK()
-	baseNonce := testBaseNonce()
-
 	// AC1 — single-chunk file sealed in Go (tag 16), for the reference to decrypt.
 	genGoBody(t, "single-chunk-go",
 		"AC1: single-chunk file encrypted in Go; decrypts in foc-encryption (TS).",
-		[]byte("FEE cross-impl vector FIL-473: single chunk, sealed in Go, opened in TS.\n"),
-		cek, baseNonce)
+		[]byte("FEE cross-impl vector FIL-473: single chunk, sealed in Go, opened in TS.\n"))
 
 	// A Go-sealed multi-chunk file too (tag 16), so the reference is exercised
 	// across a chunk boundary in the Go->TS direction as well.
 	genGoBody(t, "multi-chunk-go",
 		"Multi-chunk file encrypted in Go (spans several STREAM chunks); decrypts in foc-encryption (TS).",
-		bytes.Repeat([]byte("multi-chunk-go/FIL-473 "), 700), // ~15 KiB > chunk size
-		cek, baseNonce)
+		bytes.Repeat([]byte("multi-chunk-go/FIL-473 "), 700)) // ~15 KiB > chunk size
 
 	// AC3 — multi-recipient envelope sealed in Go (tag 96) with a real
 	// ECDH-ES+A256KW (X25519) recipient and a real A256KW recipient.
 	genGoMultiRecipient(t, "multi-recipient-go",
 		"AC3: multi-recipient envelope (ECDH-ES+A256KW/X25519 and A256KW) encrypted in Go; foc-encryption parses recipients and decrypts the body from the CEK.",
-		[]byte("FEE cross-impl vector FIL-473: multi-recipient envelope, two wrapped CEKs.\n"),
-		cek, baseNonce)
+		[]byte("FEE cross-impl vector FIL-473: multi-recipient envelope, two wrapped CEKs.\n"))
 }
 
-func genGoBody(t *testing.T, name, desc string, plaintext, cek, baseNonce []byte) {
+func genGoBody(t *testing.T, name, desc string, plaintext []byte) {
 	t.Helper()
+	cek, baseNonce := testCEK(name), testBaseNonce()
 	blob, chunkCount, err := composeFEE(plaintext, cek, baseNonce, vectorChunkSize, nil)
 	require.NoError(t, err)
 	m := vectorMeta{
@@ -220,8 +215,9 @@ func genGoBody(t *testing.T, name, desc string, plaintext, cek, baseNonce []byte
 	t.Logf("wrote %s (%d bytes, %d chunk(s))", name, len(blob), chunkCount)
 }
 
-func genGoMultiRecipient(t *testing.T, name, desc string, plaintext, cek, baseNonce []byte) {
+func genGoMultiRecipient(t *testing.T, name, desc string, plaintext []byte) {
 	t.Helper()
+	cek, baseNonce := testCEK(name), testBaseNonce()
 	ecdhR, err := ecdhESRecipient(cek)
 	require.NoError(t, err)
 	a256R, err := a256kwRecipient(cek)
