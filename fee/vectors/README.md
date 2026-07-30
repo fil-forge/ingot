@@ -7,11 +7,11 @@ across two implementations:
 - **TypeScript** — the reference `foc-encryption`
   ([`Kubuxu/foc-encryption-demo`](https://github.com/Kubuxu/foc-encryption-demo),
   `packages/foc-encryption`), **pinned** in
-  [`pull-foc-encryption.sh`](./pull-foc-encryption.sh) to the head of
-  [PR #2](https://github.com/Kubuxu/foc-encryption-demo/pull/2)
-  (`158571ae…`) — the RFC 9052 §5.3 fix. Master is deliberately *not* used: it
-  still seals tag-96 bodies under the buggy `"Encrypt0"` context. Re-pin to the
-  merge commit once the PR lands.
+  [`pull-foc-encryption.sh`](./pull-foc-encryption.sh) to `158571ae…` on
+  `master` — the RFC 9052 §5.3 fix, which landed upstream in
+  [PR #2](https://github.com/Kubuxu/foc-encryption-demo/pull/2). Before that fix
+  the reference sealed tag-96 bodies under the wrong `"Encrypt0"` context, so
+  vectors are only comparable against this commit or later.
 
 The reference is the **source of truth** for the wire format; these vectors pin
 to it and this repo's `fee/*` matches it (see [Wire format](#wire-format)).
@@ -77,7 +77,7 @@ FEE_VECTORS_REGEN=1 GOWORK=off go test ./fee/vectors -run TestGenerate -v
 ```
 
 `pull-foc-encryption.sh` vendors the pinned reference into `ts/vendor/`
-(gitignored — never committed): `git clone` + `git fetch refs/pull/2/head`,
+(gitignored — never committed): `git clone` + `git fetch refs/heads/master`,
 checking out the pinned SHA, and falling back to fetching the pinned source files
 from `raw.githubusercontent.com` where `git` is unavailable. It requires
 [`bun`](https://bun.sh) to run the TypeScript.
