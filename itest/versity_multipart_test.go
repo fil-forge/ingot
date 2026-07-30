@@ -158,11 +158,11 @@ var completeMultipartPass = []forgeCase{
 // racey_data_integrity additionally leans on atomic concurrent overwrites.
 var completeMultipartXFail = []forgeCase{
 	// The conditional matrix itself passes; the case then fails its bucket
-	// teardown: upstream's teardown never aborts in-flight uploads, so
-	// DeleteBucket implicitly aborts them (s3frontend/bucket.go), but the
-	// /blob/abort goes out proofless — hilt's s3perm map delegates no
-	// blob.Abort today. fil-forge/hilt#36 adds it to the write set;
-	// promote once a hilt image with it publishes.
+	// teardown, now with BucketNotEmpty from DeleteBucket (an object the
+	// upstream teardown's listing misses survives into the delete). The
+	// original blocker — /blob/abort going out proofless — is gone since
+	// fil-forge/hilt#35 granted blob.Abort with the write set; the teardown
+	// residue needs its own diagnosis before this row can promote.
 	{name: "conditional_writes", fn: integration.CompleteMultipartUpload_conditional_writes},
 	{name: "invalid_checksum_part", fn: integration.CompleteMultipartUpload_invalid_checksum_part},
 	{name: "multiple_checksum_part", fn: integration.CompleteMultipartUpload_multiple_checksum_part},

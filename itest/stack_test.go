@@ -202,6 +202,12 @@ var hiltAllPermissions = []string{
 	"s3:CreateBucket",
 	"s3:ListAllMyBuckets",
 	"s3:DeleteBucket",
+	// Multipart operations, first-class in hilt since fil-forge/hilt#35:
+	// AbortMultipartUpload carries the blob.Abort + blob.Remove delegations
+	// the abort leg invokes; the two List ops are catalog reads.
+	"s3:AbortMultipartUpload",
+	"s3:ListMultipartUploadParts",
+	"s3:ListBucketMultipartUploads",
 }
 
 // hiltProvisionTenant provisions tenantID in hilt with an all-permission
