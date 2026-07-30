@@ -282,10 +282,16 @@ func (b *Backend) uploadBlobs(ctx context.Context, space did.DID, blobs []msbuck
 		} else if err != nil && !errors.Is(err, registry.ErrNotFound) {
 			return fmt.Errorf("lookup location: %w", err)
 		}
-		loc, err := b.uploader.UploadBlob(ctx, space, digest, blob.Length, b.spool.Path(digest))
+		res, err := b.uploader.UploadBlob(ctx, space, digest, blob.Length, b.spool.Path(digest))
 		if err != nil {
 			return fmt.Errorf("upload blob: %w", err)
 		}
+		// A concluding UploadBlob (the default) returns an accepted location
+		// or errors; guard the contract rather than deref-panic on a bad impl.
+		if res.Location == nil {
+			return fmt.Errorf("upload blob %x: concluding upload returned no location", blob.Digest)
+		}
+		loc := res.Location
 		if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentAccepted); err != nil {
 			return fmt.Errorf("mark accepted: %w", err)
 		}

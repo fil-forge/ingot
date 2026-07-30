@@ -29,24 +29,72 @@ type BlobLocation struct {
 	Size     int64  // whole-blob byte length
 }
 
+// UploadOption configures BodyUploader.UploadBlob.
+type UploadOption func(*uploadConfig)
+
+type uploadConfig struct {
+	conclude bool
+}
+
+func newUploadConfig(options ...UploadOption) *uploadConfig {
+	cfg := &uploadConfig{conclude: true}
+	for _, opt := range options {
+		opt(cfg)
+	}
+	return cfg
+}
+
+// WithConclude controls whether UploadBlob triggers accept before returning.
+// WithConclude(false) leaves the blob parked — durable on the provider,
+// accept deferred (multipart's UploadPart): the returned UploadedBlob has a
+// nil Location and carries the state ConcludeBlob needs. Moot on dedup —
+// when the provider already held accepted bytes for the content, accept
+// already ran and the upload completes regardless.
+func WithConclude(conclude bool) UploadOption {
+	return func(cfg *uploadConfig) { cfg.conclude = conclude }
+}
+
+// UploadedBlob is the result of UploadBlob. Location == nil ⇔ the blob is
+// parked (uploaded with WithConclude(false), no dedup hit): persist the task
+// links + PutInvocation (the blob_parks row) and finish with ConcludeBlob at
+// Complete, or abandon with AbortBlob (AddTask is the Cause). A concluding
+// upload — the default — always returns a non-nil Location or errors.
+type UploadedBlob struct {
+	Digest multihash.Multihash
+	Size   int64
+	// Location of the accepted blob; nil while parked.
+	Location *BlobLocation
+	// AddTask is the /blob/add task CID (the abort Cause); AcceptTask is the
+	// /blob/accept task CID the conclude polls.
+	AddTask    cid.Cid
+	AcceptTask cid.Cid
+	// PutInvocation is the issued /http/put invocation, populated only while
+	// parked. Its metadata embeds derived signer keys — sensitive; delete it
+	// once concluded or rejected.
+	PutInvocation []byte
+}
+
 // BodyUploader makes one object-body blob durable on Forge by digest: allocate
-// → PUT (skipped on dedup) → accept, returning its published location. It is the
+// → PUT (skipped on dedup) → accept, returning its published location.
+// WithConclude(false) stops before accept (see UploadedBlob). It is the
 // data-plane counterpart to Uploader (which ships catalog CAR segments). Unlike
-// the old data-plane pipeline, this is synchronous: a blob is durable and
-// accepted on Piri before the write path commits the manifest that references
-// it (docs/architecture.md §5, §7.1).
+// the old data-plane pipeline, this is synchronous: a blob is durable — and,
+// when concluding, accepted — on Piri before the write path commits the
+// manifest that references it (docs/architecture.md §5, §7.1).
 type BodyUploader interface {
-	UploadBlob(ctx context.Context, space did.DID, digest multihash.Multihash, size int64, localPath string) (BlobLocation, error)
+	UploadBlob(ctx context.Context, space did.DID, digest multihash.Multihash, size int64, localPath string, opts ...UploadOption) (UploadedBlob, error)
 }
 
 // UploadBlob uploads one spooled blob to Forge. For a single-shot PutObject the
 // allocate→PUT→accept happens in one call (forgeclient.BlobAdd already drives
 // the whole flow and returns the location commitment); multipart's deferred
-// accept uses the decomposed UploadBlobParked/ConcludeBlob pair instead.
-func (u *Forge) UploadBlob(ctx context.Context, space did.DID, digest multihash.Multihash, size int64, localPath string) (BlobLocation, error) {
+// accept passes WithConclude(false) and finishes with ConcludeBlob at
+// Complete (or AbortBlob at Abort).
+func (u *Forge) UploadBlob(ctx context.Context, space did.DID, digest multihash.Multihash, size int64, localPath string, opts ...UploadOption) (UploadedBlob, error) {
+	cfg := newUploadConfig(opts...)
 	f, err := os.Open(localPath)
 	if err != nil {
-		return BlobLocation{}, fmt.Errorf("uploader: open spooled blob %s: %w", localPath, err)
+		return UploadedBlob{}, fmt.Errorf("uploader: open spooled blob %s: %w", localPath, err)
 	}
 	defer f.Close()
 
@@ -61,7 +109,7 @@ func (u *Forge) UploadBlob(ctx context.Context, space did.DID, digest multihash.
 	// attributable.
 	store, ok := reqscope.ProofStore(ctx)
 	if !ok {
-		return BlobLocation{}, fmt.Errorf("uploader: no request-scoped proof store for space %s (IAM layer did not attach one)", space)
+		return UploadedBlob{}, fmt.Errorf("uploader: no request-scoped proof store for space %s (IAM layer did not attach one)", space)
 	}
 	u.captureShipProofs(space, store)
 
@@ -69,11 +117,34 @@ func (u *Forge) UploadBlob(ctx context.Context, space did.DID, digest multihash.
 		forgeclient.WithPrecomputedDigest(digest, uint64(size)),
 		forgeclient.WithPutClient(u.putClient),
 		forgeclient.WithProofStore(store),
+		forgeclient.WithConclude(cfg.conclude),
 	)
 	if err != nil {
-		return BlobLocation{}, fmt.Errorf("uploader: upload blob: %w", err)
+		return UploadedBlob{}, fmt.Errorf("uploader: upload blob: %w", err)
 	}
-	return locationFromAdded(added)
+	return uploadedFromAdded(added)
+}
+
+// uploadedFromAdded maps a forgeclient result into the uploader's shape: an
+// accepted blob's location commitment parses into a BlobLocation; a parked
+// (unconcluded) blob carries its pending-accept state through.
+func uploadedFromAdded(added forgeclient.AddedBlob) (UploadedBlob, error) {
+	ub := UploadedBlob{
+		Digest:     added.Digest,
+		Size:       int64(added.Size),
+		AddTask:    added.AddTask,
+		AcceptTask: added.AcceptTask,
+	}
+	if added.Location == nil {
+		ub.PutInvocation = added.PutInvocation
+		return ub, nil
+	}
+	loc, err := locationFromAdded(added)
+	if err != nil {
+		return UploadedBlob{}, err
+	}
+	ub.Location = &loc
+	return ub, nil
 }
 
 // locationFromAdded parses the /assert/location commitment piri issued at
@@ -97,65 +168,29 @@ func locationFromAdded(added forgeclient.AddedBlob) (BlobLocation, error) {
 
 var _ BodyUploader = (*Forge)(nil)
 
-// ParkedBlobState is the persistable state of a blob that is durable on the
-// provider but not yet accepted (the /http/put conclude is deferred). It is
-// stored in the blob_parks table between UploadPart and Complete/Abort.
-type ParkedBlobState = forgeclient.ParkedBlob
-
-// DeferredBodyUploader is the decomposed BodyUploader for multipart's
-// deferred accept: UploadBlobParked makes the bytes durable (parked) at
-// UploadPart; ConcludeBlob triggers accept at Complete; AbortBlob
-// abandons a parked blob at Abort. Exactly one of UploadBlobParked's returns
-// is non-nil — an already-accepted (deduped) blob completes immediately.
+// DeferredBodyUploader extends BodyUploader for multipart's deferred accept:
+// UploadBlob with WithConclude(false) makes the bytes durable (parked) at
+// UploadPart; ConcludeBlob triggers accept at Complete; AbortBlob abandons a
+// parked blob at Abort.
 type DeferredBodyUploader interface {
-	UploadBlobParked(ctx context.Context, space did.DID, digest multihash.Multihash, size int64, localPath string) (*ParkedBlobState, *BlobLocation, error)
-	ConcludeBlob(ctx context.Context, space did.DID, parked ParkedBlobState) (BlobLocation, error)
+	BodyUploader
+	ConcludeBlob(ctx context.Context, space did.DID, parked UploadedBlob) (BlobLocation, error)
 	AbortBlob(ctx context.Context, space did.DID, digest multihash.Multihash, cause cid.Cid) error
-}
-
-// UploadBlobParked makes one spooled blob durable on the provider WITHOUT
-// accepting it: /blob/add + PUT, conclude deferred. Returns the persistable
-// park state, or the completed location when the provider already held
-// accepted bytes for this content (dedup). Like UploadBlob it runs on the
-// request ctx and requires the request-scoped proof store, which it captures
-// for the off-request abort path (the session-expiry sweeper).
-func (u *Forge) UploadBlobParked(ctx context.Context, space did.DID, digest multihash.Multihash, size int64, localPath string) (*ParkedBlobState, *BlobLocation, error) {
-	f, err := os.Open(localPath)
-	if err != nil {
-		return nil, nil, fmt.Errorf("uploader: open spooled blob %s: %w", localPath, err)
-	}
-	defer f.Close()
-
-	store, ok := reqscope.ProofStore(ctx)
-	if !ok {
-		return nil, nil, fmt.Errorf("uploader: no request-scoped proof store for space %s (IAM layer did not attach one)", space)
-	}
-	u.captureShipProofs(space, store)
-
-	parked, added, err := u.client.BlobAddParked(ctx, space, f,
-		forgeclient.WithPrecomputedDigest(digest, uint64(size)),
-		forgeclient.WithPutClient(u.putClient),
-		forgeclient.WithProofStore(store),
-	)
-	if err != nil {
-		return nil, nil, fmt.Errorf("uploader: park blob: %w", err)
-	}
-	if added != nil {
-		loc, err := locationFromAdded(*added)
-		if err != nil {
-			return nil, nil, err
-		}
-		return nil, &loc, nil
-	}
-	return parked, nil, nil
 }
 
 // ConcludeBlob finishes a parked upload: it concludes the deferred /http/put
 // receipt (triggering /blob/accept on the provider) and returns the published
-// location. The conclude carries no space proof (accept is owned by sprue),
-// so no proof store is required. Safe to retry.
-func (u *Forge) ConcludeBlob(ctx context.Context, space did.DID, parked ParkedBlobState) (BlobLocation, error) {
-	added, err := u.client.BlobConclude(ctx, space, parked)
+// location. parked is the UploadedBlob a WithConclude(false) upload returned
+// (rehydrated from its blob_parks row). The conclude carries no space proof
+// (accept is owned by sprue), so no proof store is required. Safe to retry.
+func (u *Forge) ConcludeBlob(ctx context.Context, space did.DID, parked UploadedBlob) (BlobLocation, error) {
+	added, err := u.client.BlobConclude(ctx, space, forgeclient.AddedBlob{
+		Digest:        parked.Digest,
+		Size:          uint64(parked.Size),
+		AddTask:       parked.AddTask,
+		AcceptTask:    parked.AcceptTask,
+		PutInvocation: parked.PutInvocation,
+	})
 	if err != nil {
 		return BlobLocation{}, fmt.Errorf("uploader: conclude blob: %w", err)
 	}

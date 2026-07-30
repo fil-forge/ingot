@@ -15,7 +15,7 @@ import (
 
 // BlobAbort invokes /blob/abort against the upload service (sprue),
 // abandoning the space's in-flight upload of a parked (never-accepted)
-// blob. cause is the /blob/add task link (ParkedBlob.AddTask) — sprue
+// blob. cause is the /blob/add task link (AddedBlob.AddTask) — sprue
 // walks its receipt chain to locate the storage node holding the parked
 // bytes (which have no registration or acceptance to look up by) and
 // forwards a /blob/reject there. The space is the invocation subject.

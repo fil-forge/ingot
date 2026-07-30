@@ -550,8 +550,9 @@ func (b *Backend) cleanupPartBlobs(ctx context.Context, space did.DID, uploadID 
 
 // parkBlobs makes each blob durable on its provider without accepting it:
 // already-located blobs are marked accepted (dedup), already-parked blobs are
-// skipped (another part or session parked the same content), the rest run
-// the parked upload and persist their park state for Complete/Abort.
+// skipped (another part or session parked the same content), the rest upload
+// with the conclude deferred (WithConclude(false)) and persist their park
+// state for Complete/Abort.
 func (b *Backend) parkBlobs(ctx context.Context, space did.DID, blobs []msbucket.BlobRef) error {
 	for _, blob := range blobs {
 		digest := mh.Multihash(blob.Digest)
@@ -569,19 +570,20 @@ func (b *Backend) parkBlobs(ctx context.Context, space did.DID, blobs []msbucket
 			return fmt.Errorf("lookup park: %w", err)
 		}
 
-		parked, located, err := b.deferred.UploadBlobParked(ctx, space, digest, blob.Length, b.spool.Path(digest))
+		res, err := b.deferred.UploadBlob(ctx, space, digest, blob.Length, b.spool.Path(digest), uploader.WithConclude(false))
 		if err != nil {
 			return fmt.Errorf("park blob: %w", err)
 		}
-		if located != nil {
+		if res.Location != nil {
 			// The provider already held accepted bytes for this content —
-			// accept ran, record the location like the synchronous path.
+			// accept ran despite the deferred conclude (dedup), record the
+			// location like the synchronous path.
 			if err := b.locations.PutLocation(ctx, registry.BlobLocation{
 				Space:    space,
 				Digest:   blob.Digest,
-				Provider: located.Provider,
-				URL:      located.URL,
-				Size:     located.Size,
+				Provider: res.Location.Provider,
+				URL:      res.Location.URL,
+				Size:     res.Location.Size,
 			}); err != nil {
 				return fmt.Errorf("record location: %w", err)
 			}
@@ -590,11 +592,13 @@ func (b *Backend) parkBlobs(ctx context.Context, space did.DID, blobs []msbucket
 			}
 			continue
 		}
+		// Location == nil ⇔ parked: durable on the provider with accept
+		// deferred — persist the conclude state for Complete/Abort.
 		if err := b.parks.PutPark(ctx, registry.BlobPark{
 			Digest:        blob.Digest,
-			AddTask:       parked.AddTask.Bytes(),
-			AcceptTask:    parked.AcceptTask.Bytes(),
-			PutInvocation: parked.PutInvocation,
+			AddTask:       res.AddTask.Bytes(),
+			AcceptTask:    res.AcceptTask.Bytes(),
+			PutInvocation: res.PutInvocation,
 			Size:          blob.Length,
 		}); err != nil {
 			return fmt.Errorf("record park: %w", err)
@@ -637,9 +641,9 @@ func (b *Backend) concludeBlobs(ctx context.Context, space did.DID, blobs []msbu
 			if err != nil {
 				return fmt.Errorf("decode park accept task: %w", err)
 			}
-			loc, err = b.deferred.ConcludeBlob(ctx, space, uploader.ParkedBlobState{
+			loc, err = b.deferred.ConcludeBlob(ctx, space, uploader.UploadedBlob{
 				Digest:        digest,
-				Size:          uint64(park.Size),
+				Size:          park.Size,
 				AddTask:       addTask,
 				AcceptTask:    acceptTask,
 				PutInvocation: park.PutInvocation,
@@ -650,10 +654,14 @@ func (b *Backend) concludeBlobs(ctx context.Context, space did.DID, blobs []msbu
 		} else {
 			// Never parked (crash between spool and park): the spooled copy
 			// drives the whole synchronous upload.
-			loc, err = b.uploader.UploadBlob(ctx, space, digest, blob.Length, b.spool.Path(digest))
-			if err != nil {
-				return fmt.Errorf("upload blob: %w", err)
+			res, uerr := b.uploader.UploadBlob(ctx, space, digest, blob.Length, b.spool.Path(digest))
+			if uerr != nil {
+				return fmt.Errorf("upload blob: %w", uerr)
 			}
+			if res.Location == nil {
+				return fmt.Errorf("upload blob %x: concluding upload returned no location", blob.Digest)
+			}
+			loc = *res.Location
 		}
 
 		if err := b.locations.PutLocation(ctx, registry.BlobLocation{

@@ -51,8 +51,9 @@ type ServerDeps struct {
 	// space's claim on a blob when its last reference is dropped. In tests both
 	// are no-ops and reads are served from the local spool.
 	BodyUploader uploader.BodyUploader
-	// Deferred is BodyUploader decomposed for multipart's deferred accept:
-	// park at UploadPart, conclude at Complete, abort at Abort.
+	// Deferred extends BodyUploader for multipart's deferred accept:
+	// park at UploadPart (WithConclude(false)), conclude at Complete,
+	// abort at Abort.
 	Deferred uploader.DeferredBodyUploader
 	Remover  uploader.BlobRemover
 

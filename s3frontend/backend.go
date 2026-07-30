@@ -98,8 +98,9 @@ type Deps struct {
 	// accept) synchronously, before the manifest commits. Remover releases a
 	// space's claim on a blob when its last reference is dropped.
 	Uploader uploader.BodyUploader
-	// Deferred decomposes Uploader for multipart's deferred accept; Parks
-	// persists park state between UploadPart and Complete/Abort.
+	// Deferred extends Uploader for multipart's deferred accept
+	// (WithConclude(false), then ConcludeBlob/AbortBlob); Parks persists
+	// park state between UploadPart and Complete/Abort.
 	Deferred uploader.DeferredBodyUploader
 	Parks    registry.ParkStore
 	Remover  uploader.BlobRemover

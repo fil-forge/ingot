@@ -347,21 +347,17 @@ func (NopUploader) SubmitShard(_ context.Context, _ blockstore.Plane, _ did.DID,
 	return uploader.BlobLocation{}, nil
 }
 
-func (NopUploader) UploadBlob(_ context.Context, _ did.DID, _ multihash.Multihash, size int64, _ string) (uploader.BlobLocation, error) {
-	return uploader.BlobLocation{Size: size}, nil
+// UploadBlob accepts immediately, even with WithConclude(false) — there is
+// no network to park on, so the deferred flow degenerates to the synchronous
+// one and reads keep coming from the spool.
+func (NopUploader) UploadBlob(_ context.Context, _ did.DID, digest multihash.Multihash, size int64, _ string, _ ...uploader.UploadOption) (uploader.UploadedBlob, error) {
+	return uploader.UploadedBlob{Digest: digest, Size: size, Location: &uploader.BlobLocation{Size: size}}, nil
 }
 
 func (NopUploader) RemoveBlob(_ context.Context, _ did.DID, _ multihash.Multihash) error { return nil }
 
-// UploadBlobParked accepts immediately in the harness — there is no network
-// to park on, so the deferred flow degenerates to the synchronous one and
-// reads keep coming from the spool.
-func (NopUploader) UploadBlobParked(_ context.Context, _ did.DID, _ multihash.Multihash, size int64, _ string) (*uploader.ParkedBlobState, *uploader.BlobLocation, error) {
-	return nil, &uploader.BlobLocation{Size: size}, nil
-}
-
-func (NopUploader) ConcludeBlob(_ context.Context, _ did.DID, parked uploader.ParkedBlobState) (uploader.BlobLocation, error) {
-	return uploader.BlobLocation{Size: int64(parked.Size)}, nil
+func (NopUploader) ConcludeBlob(_ context.Context, _ did.DID, parked uploader.UploadedBlob) (uploader.BlobLocation, error) {
+	return uploader.BlobLocation{Size: parked.Size}, nil
 }
 
 func (NopUploader) AbortBlob(_ context.Context, _ did.DID, _ multihash.Multihash, _ cid.Cid) error {
