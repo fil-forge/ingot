@@ -6,10 +6,11 @@
 // foc-encryption), pinned in pull-foc-encryption.sh.
 //
 // The reference is the source of truth for the wire format. It is pinned (see
-// pull-foc-encryption.sh) to the head of foc-encryption-demo PR #2 — the fix
-// that makes the body AAD context follow the envelope structure per RFC 9052
-// §5.3 — rather than master, which still seals tag-96 bodies under "Encrypt0".
-// The shape, verified against the pinned commit, is:
+// pull-foc-encryption.sh) to a fixed commit on foc-encryption-demo master — the
+// merged fix (upstream PR #2) that makes the body AAD context follow the
+// envelope structure per RFC 9052 §5.3. Commits before that fix seal tag-96
+// bodies under "Encrypt0" and are not comparable with these vectors. The shape,
+// verified against the pinned commit, is:
 //
 //	blob        = envelope || ciphertext          (detached payload)
 //	envelope    = 16([protected, unprotected, null])                for no recipients
