@@ -198,6 +198,9 @@ var hiltAllPermissions = []string{
 	"s3:CreateBucket",
 	"s3:ListAllMyBuckets",
 	"s3:DeleteBucket",
+	"s3:AbortMultipartUpload",
+	"s3:ListMultipartUploadParts",
+	"s3:ListBucketMultipartUploads",
 }
 
 // hiltProvisionTenant provisions tenantID in hilt with an all-permission
