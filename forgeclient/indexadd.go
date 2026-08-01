@@ -7,6 +7,7 @@ import (
 
 	contentcmds "github.com/fil-forge/libforge/commands/content"
 	indexcmds "github.com/fil-forge/libforge/commands/index"
+	ucanlib "github.com/fil-forge/libforge/ucan"
 	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/ucantone/execution"
 	"github.com/fil-forge/ucantone/ipld/datamodel"
@@ -20,7 +21,16 @@ import (
 // service. It carries a /content/retrieve delegation (restricted to the
 // index digest) in metadata so sprue can re-delegate retrieval of the
 // index blob to the indexing service.
-func (c *Client) IndexAdd(ctx context.Context, indexCID cid.Cid, space did.DID) error {
+//
+// It needs /index/add and /content/retrieve proof chains over space;
+// WithProofStore overrides where they come from (default: the token store).
+func (c *Client) IndexAdd(ctx context.Context, space did.DID, indexCID cid.Cid, options ...BlobAddOption) error {
+	cfg := NewBlobAddConfig(options...)
+	proofStore := ucanlib.ProofStore(c.tokenStore)
+	if cfg.ProofStore != nil {
+		proofStore = cfg.ProofStore
+	}
+
 	retrievalAuth, err := contentcmds.Retrieve.Delegate(
 		c.signer,
 		c.serviceID,
@@ -32,22 +42,14 @@ func (c *Client) IndexAdd(ctx context.Context, indexCID cid.Cid, space did.DID) 
 	if err != nil {
 		return fmt.Errorf("creating retrieval auth delegation: %w", err)
 	}
-	retrievalProofs, retrievalProofLinks, err := c.ProofChain(ctx, c.signer.DID(), contentcmds.Retrieve.Command, space)
+	retrievalProofs, retrievalProofLinks, err := proofStore.ProofChain(ctx, c.signer.DID(), contentcmds.Retrieve.Command, space)
 	if err != nil {
 		return fmt.Errorf("building proof chain: %w", err)
-	}
-	retrievalAttestations, err := c.ProofAttestations(ctx, retrievalProofs, c.serviceID)
-	if err != nil {
-		return fmt.Errorf("fetching proof attestations: %w", err)
 	}
 
-	proofs, proofLinks, err := c.ProofChain(ctx, c.signer.DID(), indexcmds.Add.Command, space)
+	proofs, proofLinks, err := proofStore.ProofChain(ctx, c.signer.DID(), indexcmds.Add.Command, space)
 	if err != nil {
 		return fmt.Errorf("building proof chain: %w", err)
-	}
-	attestations, err := c.ProofAttestations(ctx, proofs, c.serviceID)
-	if err != nil {
-		return fmt.Errorf("fetching proof attestations: %w", err)
 	}
 	inv, err := indexcmds.Add.Invoke(
 		c.signer,
@@ -68,13 +70,11 @@ func (c *Client) IndexAdd(ctx context.Context, indexCID cid.Cid, space did.DID) 
 		c.ucanClient,
 		inv,
 		execution.WithDelegations(proofs...),
-		execution.WithInvocations(attestations...),
 		execution.WithDelegations(retrievalProofs...),
 		// The leaf delegation (agent → sprue) granting /content/retrieve
 		// on this space must travel with the request — metadata only
 		// carries CID links.
 		execution.WithDelegations(retrievalAuth),
-		execution.WithInvocations(retrievalAttestations...),
 	)
 	if err != nil {
 		return fmt.Errorf("executing invocation: %w", err)

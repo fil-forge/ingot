@@ -1,0 +1,40 @@
+# Ingot daemon config for the catalog-retention fallthrough itest — smelt's
+# default forge-mode config (systems/ingot/config/config.yaml) with the
+# catalog plane tuned to seal fast and retain only one shipped segment, and
+# the read cache disabled so every fallthrough read exercises the locator +
+# ranged /content/retrieve path rather than a warm cache.
+# Mounted over /etc/ingot/config.yaml via stack.WithServiceConfig.
+
+addr: "0.0.0.0:9000"
+region: us-west-1
+data_dir: /data
+
+root_access: ingot
+root_secret: ingotsecret
+
+identity:
+  key_file: /keys/ingot.pem
+
+postgres_dsn: "postgres://ingot:ingot@ingot-postgres:5432/ingot?sslmode=disable"
+
+upload_service_url: "http://upload:80"
+upload_service_did: "did:web:upload"
+upload_receipts_url: "http://upload:80/receipt"
+
+indexer_endpoint: "http://indexer:80"
+indexer_did: "did:web:indexer"
+
+# S3 authorization service (hilt); the DID is used verbatim (no resolution)
+auth_service_url: "http://hilt:80"
+auth_service_did: "did:web:hilt"
+# hilt → ingot delegations for /s3/request/authorize and /s3/bucket/*
+auth_service_proofs: "/proofs/hilt-ingot-s3-proof.txt"
+
+# The point of this config: roll catalog segments fast and retire aggressively,
+# with no read cache masking the fallthrough. seal_age is fast but leaves the
+# flusher headroom per ship (a 1s seal outruns the ship pipeline, overflowing
+# the flush queue and forcing re-ships through sprue's dedup path).
+read_cache_bytes: -1
+catalog_plane:
+  seal_age: 2s
+  retain: 1

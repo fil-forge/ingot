@@ -1,8 +1,9 @@
 # Ingot — upload, storage & delete architecture
 
 How Ingot stores S3 objects on the Forge network: the layers it is built from, the data it keeps,
-and the flows that move bytes through it. This is the target architecture; it supersedes the
-bootstrap MVP that currently lives in the tree.
+and the flows that move bytes through it. This is the target architecture. Its storage/delete/
+retrieval core is now **implemented in the tree** (it superseded the bootstrap MVP); the parts that
+remain deferred or stubbed are enumerated in [§12 — Implementation status](#12-implementation-status--postponed-items).
 
 Companion docs: [`aggregation-gate.md`](./aggregation-gate.md) — why this S3 design is gated on
 Piri's aggregation; and the [**pdp-sim**](https://github.com/fil-forge/pdp-sim) simulator — the
@@ -233,9 +234,10 @@ MST (bucket)
    each blob: its own on-chain PIECE if ≥ min, else a subroot in an aggregate
 ```
 
-*Example: a 600 MiB object split at `max_blob_size` = 256 MiB into three blobs. This is the **target**
-manifest shape — today's `bucket/manifest.go` (single `Body.Content` DAG, MD5-derived ETag, no inline
-`versionId`/`deleteMarker`) is the MVP it supersedes.*
+*Example: a 600 MiB object split at `max_blob_size` = 256 MiB into three blobs. This is the manifest
+shape `bucket/manifest.go` now implements (`Body.Blobs[]`, a stored S3 `etag`, an additional-checksum
+field, and a reserved nullable `IndexRoot`); a `deleteMarker` field is reserved for versioning, which
+is deferred ([§12](#12-implementation-status--postponed-items)).*
 
 **The catalog plane.** MST nodes and manifests are dag-cbor blocks. They are batched into CAR
 segments and shipped to Piri so the catalog is recoverable, following the existing log-structured
@@ -427,7 +429,9 @@ AbortMultipartUpload
 ```
 
 A completed multipart object is the ordered union of its parts' blobs plus a manifest of byte ranges;
-parts are not restitched.
+parts are not restitched. The commit also records each part's byte length (`Body.PartSizes`), so a
+later `GET`/`HEAD ?partNumber=N` can resolve part `N` to its byte span and report
+`x-amz-mp-parts-count` without re-deriving boundaries from the blob list.
 
 ### 7.3 The session latch (the Abort/Complete race)
 
@@ -498,7 +502,14 @@ index (stock-tooling plaintext recovery)** — a deliberate trade, not settled h
 The **catalog** is different — many tiny MST/manifest blocks share a CAR — so catalog blocks resolve
 via the indexer's index-claim / sharded-dag-index path (block CID → byte range in its shard). That path
 is retained for the catalog regardless. *(In the R0/R1 appliance topology, catalog-block lookup is
-served from the local Postgres location table rather than the indexing-service.)*
+served from the local Postgres mirror of that contract: `shard_inclusions` (block digest → shard
+digest + byte range, recorded by the flush path before a segment is marked shipped) joined to the
+shard's `blob_locations` row. A whole-blob location table alone cannot serve catalog blocks — they
+are interior slices of shipped CARs, not stored blobs — which is exactly what breaks
+retention-retired catalog reads without the inclusion table. Because the local mirror is what
+ingot's own reads depend on, the network index publication (`/index/add` at ship time) is
+best-effort: its failure is logged, not a ship failure — a wedged indexer must not wedge
+retention. A retry queue for failed publications is a TODO.)*
 
 Consuming a bare location commitment is a capability Ingot's locator must gain: today it surfaces a
 location only via the inclusion → shard → commitment path and never returns a stored bare
@@ -724,3 +735,99 @@ all reference a `buckets.name`; `multipart_parts` cascades from `multipart_sessi
 count for a blob is `count(*) from blob_refs where space = ? and digest = ?`; reaching zero triggers
 `remove(digest)` ([§6](#6-the-forgechain-layer)). `upload_intents` is keyed by the blob digest and is independent of bucket
 namespace — it is the disk-side index, shared across whatever objects reference the same bytes.
+
+---
+
+## 12. Implementation status & postponed items
+
+The body of this document is the **north-star target**. This section records what is **built today**
+versus what is deliberately **deferred** — the body above is unchanged so the target stays legible;
+the reductions live here.
+
+### What is implemented (in-process, exercised by the `testing/` harness)
+
+The storage / delete / retrieval core is built and tested:
+
+- **Object-aligned blobs + manifest** ([§4](#4-the-catalog-layer)–[§5](#5-the-data-layer)) — `Body.Blobs[{digest,offset,length}]`, coarse split at
+  `max_blob_size`, the local **spool** (`blockstore.Spool`) + `upload_intents`, stored S3 `etag`.
+- **Synchronous durability write path** ([§7.1](#71-write-single-shot-putobject)) — off-lock ingest → spool → per-blob upload, then a
+  short locked commit (manifest + MST splice + guarded root swap); reference-index reconcile runs
+  **after** the commit is durable so a commit failure can't diverge `blob_refs`.
+- **Single-plane catalog log** — the data plane is gone; `logstore` journals only the catalog
+  (manifests + MST nodes) as CAR segments. `forge_root_cid` advances only when the catalog ships, and
+  only `WHERE root_cid` still matches the op-root (the orphan-root guard from [§9](#9-the-system-contract-piri--sprue--indexer)).
+- **Dedup + reference-counted delete** ([§5](#5-the-data-layer)–[§6](#6-the-forgechain-layer)) — `blob_refs`, overwrite-in-place, `DeleteObject`,
+  `remove(digest)` at zero claims, `gc_candidates` (write-only).
+- **S3 correctness** ([§3](#3-the-s3-layer)) — conditional requests (`If-Match`/`If-None-Match`/`If-(Un)Modified-Since`,
+  re-checked at commit), additional checksums (`x-amz-checksum-*` validate + echo, with a
+  server-computed full-object `CRC64NVME` default when the client names none — S3's
+  default-checksum-on-store), `DeleteObjects`,
+  metadata-only `CopyObject`, multipart (`Create`/`UploadPart`/`Complete`/`Abort` with the
+  single-winner latch and the `-N` ETag), zero-byte objects. Ranged reads return `206`/`Content-Range`
+  on **both** `GetObject` and `HeadObject` (`416` on an unsatisfiable range); the system headers
+  carried through PUT and replayed on GET/HEAD include `Content-Encoding`/`Disposition`/`Language`,
+  `Cache-Control`, and the `Expires` caching header. GET/HEAD also accept `?partNumber=N`: a completed
+  multipart object records each part's byte length on the manifest (`Body.PartSizes`), so part `N`
+  resolves to its byte span (`206` + `Content-Range` + `x-amz-mp-parts-count`); a single-PUT object
+  exposes the whole body as part 1 (no parts-count), and `N` past the part count is `416`.
+
+### Deferred by deliberate scope decision
+
+These are intentional simplifications of the target topology, not bugs:
+
+- **S3 versioning is not implemented.** Buckets are effectively `Unversioned`: an overwrite replaces
+  in place and drives the prior data through the reference index. The `versionId` machinery in
+  [§3](#3-the-s3-layer) (composite key, `invertedVersionId`, `ListObjectVersions`, delete markers, `next_version_seq`)
+  is **not** built. The schema is designed toward it — `blob_refs.version_id` carries the constant
+  `"null"` sentinel, `buckets.versioning`/`next_version_seq` and `ObjectManifest.deleteMarker` are
+  reserved — so adding versioning later needs no manifest/MST-key migration.
+- **Deployed next to Piri.** The same-rack topology of [§10](#10-deployment-topology--the-digest-before-upload-cost) is assumed; digest-before-upload is
+  kept and `allocate-by-size` is out of scope.
+- **No Ingot-side aggregation.** Ingot ships each body blob to Piri as-is; `min_aggregate_size`,
+  Regime-A/B compaction, and subroots ([§6](#6-the-forgechain-layer)) are Piri-side concerns. From Ingot's side a delete is
+  just `remove(digest)`; Piri decides the on-chain regime. `max_blob_size` is the only size knob Ingot
+  carries.
+- **Local location + inclusion tables instead of the indexer (R0/R1 appliance reduction).** Body-blob
+  and shipped-shard locations are recorded in a local Postgres `blob_locations` table, and each
+  shipped catalog shard's inner-block byte ranges in `shard_inclusions`, behind a `Locator` seam,
+  rather than read back through the indexing-service ([§5](#5-the-data-layer), [§8](#8-retrieval-addressing-when-bodies-need-a-sharded-dag-index)). The two tables mirror the
+  indexing-service contract (location commitments + inclusions), so the indexer-backed `Locator`
+  remains an `indexer-ready` swap-in.
+
+### Object lifecycle (not implemented)
+
+The `Expires` HTTP header *is* implemented — it is a passthrough caching header (RFC 7234) stored on
+the manifest and replayed on GET/HEAD, not a lifecycle control. True S3 **Lifecycle** management
+(`PutBucketLifecycleConfiguration` expiration/transition rules that actually delete or tier objects
+after N days, surfaced via the `x-amz-expiration` response header) is a separate, unimplemented
+feature. It would be its own subsystem — a per-bucket rule store plus a background sweeper driving the
+reference index — and is out of scope for this iteration.
+
+### Deferred as forge-mode glue (validated live in smelt, not the in-process harness)
+
+The in-memory harness uses a no-op uploader and serves reads from the spool, so these forge-network
+paths are stubbed in-tree and verified against a real sprue+piri+indexer later:
+
+- **`remove(digest)` / `unallocate(digest)` are logged no-ops.** libforge has the `blob.Remove`
+  binding; the Piri/Sprue handler is to-build ([§9](#9-the-system-contract-piri--sprue--indexer)). The reference-index bookkeeping (count→0 ⇒
+  `RemoveBlob` call site) is fully built and tested; only the network release is stubbed.
+- **The local-table `Locator` read tier is not wired.** Body-blob *locations* are recorded at accept,
+  but the read path that consumes them ([§7.4](#74-read-getobject), [§8](#8-retrieval-addressing-when-bodies-need-a-sharded-dag-index)) is deferred — it is only exercised after spool
+  eviction (also not built) and is best validated live.
+- **Multipart parts upload at Complete, not parked at UploadPart.** The in-process flow spools parts
+  at `UploadPart` and uploads+accepts them at `Complete`; the true forge *parking* (upload early,
+  accept-at-Complete) and `unallocate`-on-abort from [§7.2](#72-multipart)–[7.3](#73-the-session-latch-the-abortcomplete-race) are forge-mode refinements.
+- **Crash recovery for the spool is not built.** The `upload_intents` × `blob_refs` reconciliation
+  the failure-mode table in [§7.5](#75-concurrency-durability-and-failure-modes) describes (resume/`unallocate` parked, `remove` accepted-but-unreferenced)
+  is a later phase; a partial post-commit reference-index write currently relies on retry/idempotency.
+- **`UploadPartCopy`, `ListParts`, `ListMultipartUploads`, and indexer retraction on delete** are
+  unimplemented (`ErrNotImplemented` / no-op).
+
+### Known correctness boundary
+
+Reference-index mutations (`blob_refs`) and the catalog/root commit are **not yet one atomic
+transaction**: the reconcile runs immediately *after* a successful commit. A commit failure can no
+longer corrupt `blob_refs` (the reconcile is skipped), but a crash *between* the commit and the
+reconcile, or a partial reconcile, can leave `blob_refs` momentarily under/over-counted until the
+deferred crash-recovery reconciliation lands. The safe-side ordering (catalog first, then claims)
+means such a window leaks rather than loses referenced data.

@@ -27,10 +27,6 @@ func (c *Client) AccessDelegate(ctx context.Context, space did.DID, delegations 
 	if err != nil {
 		return nil, fmt.Errorf("building proof chain: %w", err)
 	}
-	attestations, err := c.ProofAttestations(ctx, proofs, c.serviceID)
-	if err != nil {
-		return nil, fmt.Errorf("fetching proof attestations: %w", err)
-	}
 
 	inv, err := access.Delegate.Invoke(
 		c.signer,
@@ -49,7 +45,6 @@ func (c *Client) AccessDelegate(ctx context.Context, space did.DID, delegations 
 		inv,
 		execution.WithDelegations(proofs...),
 		execution.WithDelegations(delegations...),
-		execution.WithInvocations(attestations...),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("executing delegate invocation: %w", err)

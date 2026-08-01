@@ -3,6 +3,7 @@ package blockstore_test
 import (
 	"context"
 	"errors"
+	"github.com/fil-forge/ucantone/did"
 	"testing"
 	"time"
 
@@ -26,8 +27,8 @@ type fakeMeta struct {
 func newFakeMeta() *fakeMeta { return &fakeMeta{rows: map[uint64]*logstore.SegmentMeta{}} }
 
 func (f *fakeMeta) NextSegmentSeq(_ context.Context) (uint64, error) { f.seq++; return f.seq, nil }
-func (f *fakeMeta) InsertSegmentOpen(_ context.Context, plane blockstore.Plane, seq uint64) error {
-	f.rows[seq] = &logstore.SegmentMeta{Seq: seq, Plane: plane, State: logstore.StateOpen}
+func (f *fakeMeta) InsertSegmentOpen(_ context.Context, plane blockstore.Plane, seq uint64, bucket string) error {
+	f.rows[seq] = &logstore.SegmentMeta{Seq: seq, Plane: plane, Bucket: bucket, State: logstore.StateOpen}
 	return nil
 }
 func (f *fakeMeta) MarkSegmentSealed(_ context.Context, plane blockstore.Plane, seq uint64, sealedAt int64,
@@ -51,13 +52,29 @@ func (f *fakeMeta) DeleteSegment(_ context.Context, plane blockstore.Plane, seq 
 	delete(f.rows, seq)
 	return nil
 }
-func (f *fakeMeta) ListSegments(_ context.Context, plane blockstore.Plane) ([]logstore.SegmentMeta, error) {
+func (f *fakeMeta) ListSegments(_ context.Context, plane blockstore.Plane, bucket string) ([]logstore.SegmentMeta, error) {
 	var out []logstore.SegmentMeta
+	for _, r := range f.rows {
+		if r.Plane != plane || r.Bucket != bucket {
+			continue
+		}
+		out = append(out, *r)
+	}
+	return out, nil
+}
+
+func (f *fakeMeta) ListSegmentBuckets(_ context.Context, plane blockstore.Plane) ([]string, error) {
+	seen := map[string]struct{}{}
+	var out []string
 	for _, r := range f.rows {
 		if r.Plane != plane {
 			continue
 		}
-		out = append(out, *r)
+		if _, ok := seen[r.Bucket]; ok {
+			continue
+		}
+		seen[r.Bucket] = struct{}{}
+		out = append(out, r.Bucket)
 	}
 	return out, nil
 }
@@ -78,7 +95,7 @@ type noopBase struct{}
 
 var errUnknownBase = errors.New("base: unknown")
 
-func (noopBase) GetBlock(_ context.Context, _ cid.Cid) (block.Block, error) {
+func (noopBase) GetBlock(_ context.Context, _ did.DID, _ cid.Cid) (block.Block, error) {
 	return nil, errUnknownBase
 }
 
@@ -113,7 +130,6 @@ func TestLayeredAndStagingHappyPath(t *testing.T) {
 	log, err := logstore.Open(context.Background(), logstore.Config{
 		Dir:     dir,
 		Meta:    meta,
-		Data:    logstore.PlaneConfig{SealBytes: 1 << 30, SealAge: time.Hour, Ship: true, Flush: nopFlush, Retain: 6},
 		Catalog: logstore.PlaneConfig{SealBytes: 1 << 30, SealAge: time.Hour, Ship: true, Flush: nopFlush, Retain: 6},
 		Logger:  logger,
 	})
@@ -122,11 +138,11 @@ func TestLayeredAndStagingHappyPath(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = log.Close(context.Background()) })
 
-	bs := blockstore.NewLayered(log, noopBase{})
+	bs := blockstore.NewLayered(nil, log, noopBase{})
 
 	// Stage two blocks for bucket "alpha", commit, then Get them back
 	// via the layered store.
-	stage := blockstore.NewOpStaging(bs, log, "alpha")
+	stage := blockstore.NewOpStaging(bs, log, "alpha", did.Undef)
 	a := makeBlock(t, []byte("alpha-1"))
 	b := makeBlock(t, []byte("alpha-2"))
 	for _, blk := range []block.Block{a, b} {
@@ -139,7 +155,7 @@ func TestLayeredAndStagingHappyPath(t *testing.T) {
 	}
 
 	for _, blk := range []block.Block{a, b} {
-		got, err := bs.GetBlock(context.Background(), blk.Cid())
+		got, err := bs.GetBlock(context.Background(), did.Undef, blk.Cid())
 		if err != nil {
 			t.Fatalf("layered.Get %s: %v", blk.Cid(), err)
 		}
@@ -157,7 +173,6 @@ func TestLayeredFallsThroughToBaseOnMiss(t *testing.T) {
 	log, err := logstore.Open(context.Background(), logstore.Config{
 		Dir:     dir,
 		Meta:    meta,
-		Data:    logstore.PlaneConfig{SealBytes: 1 << 30, SealAge: time.Hour, Ship: true, Flush: nopFlush, Retain: 6},
 		Catalog: logstore.PlaneConfig{SealBytes: 1 << 30, SealAge: time.Hour, Ship: true, Flush: nopFlush, Retain: 6},
 		Logger:  logger,
 	})
@@ -166,9 +181,9 @@ func TestLayeredFallsThroughToBaseOnMiss(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = log.Close(context.Background()) })
 
-	bs := blockstore.NewLayered(log, noopBase{})
+	bs := blockstore.NewLayered(nil, log, noopBase{})
 	missing := makeBlock(t, []byte("nope")).Cid()
-	_, err = bs.GetBlock(context.Background(), missing)
+	_, err = bs.GetBlock(context.Background(), did.Undef, missing)
 	if !errors.Is(err, errUnknownBase) {
 		t.Fatalf("expected base sentinel, got %v", err)
 	}
@@ -182,7 +197,6 @@ func TestStagingDiscardLeavesLogUntouched(t *testing.T) {
 	log, err := logstore.Open(context.Background(), logstore.Config{
 		Dir:     dir,
 		Meta:    meta,
-		Data:    logstore.PlaneConfig{SealBytes: 1 << 30, SealAge: time.Hour, Ship: true, Flush: nopFlush, Retain: 6},
 		Catalog: logstore.PlaneConfig{SealBytes: 1 << 30, SealAge: time.Hour, Ship: true, Flush: nopFlush, Retain: 6},
 		Logger:  logger,
 	})
@@ -191,8 +205,8 @@ func TestStagingDiscardLeavesLogUntouched(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = log.Close(context.Background()) })
 
-	bs := blockstore.NewLayered(log, noopBase{})
-	stage := blockstore.NewOpStaging(bs, log, "alpha")
+	bs := blockstore.NewLayered(nil, log, noopBase{})
+	stage := blockstore.NewOpStaging(bs, log, "alpha", did.Undef)
 	blk := makeBlock(t, []byte("never-committed"))
 	if err := stage.Put(context.Background(), blk); err != nil {
 		t.Fatalf("Put: %v", err)

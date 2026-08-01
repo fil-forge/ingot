@@ -5,70 +5,28 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
-	"time"
 
+	"github.com/fil-forge/versitygw/auth"
+	"github.com/fil-forge/versitygw/metrics"
+	"github.com/fil-forge/versitygw/s3api"
+	"github.com/fil-forge/versitygw/s3api/middlewares"
+	"github.com/fil-forge/versitygw/s3event"
+	"github.com/fil-forge/versitygw/s3log"
+	"github.com/gofiber/fiber/v3"
 	"github.com/multiformats/go-multihash"
-	"github.com/versity/versitygw/auth"
-	"github.com/versity/versitygw/metrics"
-	"github.com/versity/versitygw/s3api"
-	"github.com/versity/versitygw/s3api/middlewares"
-	"github.com/versity/versitygw/s3event"
-	"github.com/versity/versitygw/s3log"
 	"go.uber.org/zap"
 
 	"github.com/fil-forge/ingot/blockstore"
 	msbucket "github.com/fil-forge/ingot/bucket"
+	"github.com/fil-forge/ingot/bucketauthority"
+	"github.com/fil-forge/ingot/config"
+	"github.com/fil-forge/ingot/internal/fasthttputil"
+	"github.com/fil-forge/ingot/internal/reqscope"
 	"github.com/fil-forge/ingot/logstore"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/s3frontend"
 	"github.com/fil-forge/ingot/uploader"
 )
-
-// ServerConfig captures the user-facing knobs of an ingot S3 listener.
-// New() applies defaults for any zero-valued knobs. SealAge is in
-// time.Duration form because callers parse the string config field
-// once before constructing the server.
-type ServerConfig struct {
-	// Addr is the host:port to bind the S3 listener to. Required.
-	Addr string
-
-	// DataDir is where the log writes its segments dir; the caller
-	// is responsible for creating this directory before calling New.
-	// Required.
-	DataDir string
-
-	// Region is the AWS region advertised over sigv4. Defaults to
-	// "us-east-1".
-	Region string
-
-	// RootAccess / RootSecret configure the single-account IAM root
-	// user for the embedded S3 listener. Both required.
-	RootAccess string
-	RootSecret string
-
-	// ChunkSize is the body chunk size for new objects, in bytes.
-	// 0 → bucket.DefaultChunkSize.
-	ChunkSize int64
-
-	// Per-plane seal thresholds, ship gates, and retention. Each plane
-	// seals, ships, and retains independently. Zero SealBytes/SealAge
-	// pick logstore defaults (64 MiB / 5 s); zero Retain → 6 (ignored for
-	// a non-shipping plane, which is retained indefinitely).
-	SealBytesData    int64
-	SealAgeData      time.Duration
-	ShipData         bool
-	RetainData       int
-	SealBytesCatalog int64
-	SealAgeCatalog   time.Duration
-	ShipCatalog      bool
-	RetainCatalog    int
-
-	// MaxConnections / MaxRequests configure versitygw's hard
-	// concurrency limit. Zero is unsafe (yields 503 SlowDown on every
-	// request), so New substitutes a sensible default.
-	MaxConnections int
-	MaxRequests    int
-}
 
 // ServerDeps bundles the runtime collaborators of an ingot Server
 // behind interfaces. Production wiring uses Forge / Internal /
@@ -84,24 +42,53 @@ type ServerDeps struct {
 	// it can be any IpldBlockstore.
 	BaseBlockReader blockstore.BlockReader
 
-	// Uploader is the destination for sealed segments.
+	// Uploader is the destination for sealed catalog CAR segments.
 	Uploader uploader.Uploader
+
+	// BodyUploader makes each object-body blob durable on Forge by digest
+	// (allocate→PUT→accept), synchronously during a PUT. Remover releases a
+	// space's claim on a blob when its last reference is dropped. In tests both
+	// are no-ops and reads are served from the local spool.
+	BodyUploader uploader.BodyUploader
+	Remover      uploader.BlobRemover
+
+	// Authority is the service that authorizes bucket creation and deletion.
+	Authority bucketauthority.BucketAuthority
 
 	// Registry tracks per-bucket roots. *registry.Postgres satisfies
 	// both Registry and Meta in production; tests can supply two
 	// separate implementations or one that does both.
 	Registry registry.Registry
 
+	// Intents tracks the local spool's upload_intents lifecycle; Locations
+	// records where each accepted body blob (and shipped catalog shard) can be
+	// retrieved from; Inclusions records each shipped shard's inner-block byte
+	// ranges so retired catalog blocks stay resolvable; BlobRefs is the reverse
+	// reference index; GC records superseded MST/manifest CIDs. Typically all
+	// the same instance as Registry (*registry.Postgres / *inmem.MemStore).
+	Intents    registry.IntentStore
+	Locations  registry.LocationStore
+	Inclusions registry.InclusionStore
+	BlobRefs   registry.BlobRefStore
+	GC         registry.GCStore
+	Multipart  registry.MultipartStore
+
 	// Meta is the persistence backing for log-segment metadata.
 	// Typically the same instance as Registry.
 	Meta logstore.Meta
+
+	// IAM authenticates non-root access keys (e.g. hilt/iam, which
+	// authorizes each request against the Hilt tenant service). Optional:
+	// nil leaves the gateway with only the single root account, as in
+	// standalone mode and the test harness.
+	IAM auth.IAMService
 }
 
 // Server is a fully-wired ingot S3 listener. Use Start/Stop for
 // lifecycle. fx callers wrap these in OnStart/OnStop hooks; tests
 // call them directly.
 type Server struct {
-	cfg     ServerConfig
+	cfg     config.ServerConfig
 	logger  *zap.Logger
 	log     blockstore.Log
 	backend *s3frontend.Backend
@@ -111,7 +98,7 @@ type Server struct {
 // New wires a ServerDeps + ServerConfig into a runnable Server. The
 // caller is responsible for ensuring cfg.DataDir exists before
 // calling.
-func New(ctx context.Context, cfg ServerConfig, deps ServerDeps) (*Server, error) {
+func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server, error) {
 	if err := validateServerInputs(cfg, deps); err != nil {
 		return nil, err
 	}
@@ -122,22 +109,20 @@ func New(ctx context.Context, cfg ServerConfig, deps ServerDeps) (*Server, error
 		logger = zap.NewNop()
 	}
 
-	log, err := logstore.Open(ctx, logstore.Config{
+	// The log is segregated per bucket (each bucket's segments live under
+	// segments/<bucket>/ and ship to that bucket's Forge space); the manager
+	// stands in wherever the single global log stood.
+	log, err := logstore.OpenManager(ctx, logstore.ManagerConfig{
 		Dir:  filepath.Join(cfg.DataDir, "segments"),
 		Meta: deps.Meta,
-		Data: logstore.PlaneConfig{
-			SealBytes: cfg.SealBytesData,
-			SealAge:   cfg.SealAgeData,
-			Ship:      cfg.ShipData,
-			Flush:     newPlaneFlushFunc(deps.Uploader, blockstore.PlaneData),
-			Retain:    cfg.RetainData,
-		},
 		Catalog: logstore.PlaneConfig{
 			SealBytes: cfg.SealBytesCatalog,
 			SealAge:   cfg.SealAgeCatalog,
 			Ship:      cfg.ShipCatalog,
-			Flush:     newPlaneFlushFunc(deps.Uploader, blockstore.PlaneCatalog),
 			Retain:    cfg.RetainCatalog,
+		},
+		FlushFor: func(bucket string) logstore.FlushFunc {
+			return newBucketFlushFunc(deps.Uploader, deps.Registry, deps.Locations, deps.Inclusions, bucket, logger)
 		},
 		Logger: logger,
 	})
@@ -145,11 +130,32 @@ func New(ctx context.Context, cfg ServerConfig, deps ServerDeps) (*Server, error
 		return nil, fmt.Errorf("ingot: logstore: %w", err)
 	}
 
-	bs := blockstore.NewLayered(log, deps.BaseBlockReader)
-	codec := &msbucket.FixedChunker{ChunkSize: cfg.ChunkSize}
-	backend := s3frontend.New(deps.Registry, bs, log, codec)
+	spool, err := blockstore.NewSpool(filepath.Join(cfg.DataDir, "spool"))
+	if err != nil {
+		_ = log.Close(ctx)
+		return nil, fmt.Errorf("ingot: spool: %w", err)
+	}
 
-	api, err := buildS3API(ctx, backend, cfg)
+	bs := blockstore.NewLayered(spool, log, deps.BaseBlockReader)
+	backend := s3frontend.New(s3frontend.Deps{
+		Authority:   deps.Authority,
+		Registry:    deps.Registry,
+		Intents:     deps.Intents,
+		Locations:   deps.Locations,
+		BlobRefs:    deps.BlobRefs,
+		GC:          deps.GC,
+		Multipart:   deps.Multipart,
+		Reads:       bs,
+		Log:         log,
+		Spool:       spool,
+		Uploader:    deps.BodyUploader,
+		Remover:     deps.Remover,
+		MaxBlobSize: cfg.MaxBlobSize,
+		CORS:        cfg.CORSConfig,
+		Logger:      logger,
+	})
+
+	api, err := buildS3API(ctx, backend, cfg, deps.IAM)
 	if err != nil {
 		// Best-effort cleanup if we got past the log open: the caller
 		// has no Server handle to call Stop on.
@@ -177,7 +183,7 @@ func (s *Server) Start(ctx context.Context) error {
 		zap.String("addr", s.cfg.Addr),
 		zap.String("region", s.cfg.Region),
 		zap.String("data_dir", s.cfg.DataDir),
-		zap.Int64("chunk_size", s.cfg.ChunkSize),
+		zap.Int64("max_blob_size", s.cfg.MaxBlobSize),
 	)
 	go func() {
 		if err := s.api.ServeMultiPort([]string{s.cfg.Addr}); err != nil {
@@ -207,22 +213,42 @@ func (s *Server) Stop(ctx context.Context) error {
 }
 
 // newPlaneFlushFunc builds the logstore flush callback for ONE plane:
-// it ships that plane's sealed CAR to Forge via uploader.SubmitShard.
-// The store owns the ship-state transition (it stamps the per-plane
-// shipped timestamp and, for the catalog plane, advances each affected
-// bucket's forge_root_cid) once this returns nil — so the closure is
-// purely the network ship.
+// it ships that plane's sealed CAR to Forge via uploader.SubmitShard,
+// then records the shard's location and every inner block's byte range
+// in the local location/inclusion tables (the appliance mirror of the
+// sharded-dag-index SubmitShard publishes). The store owns the
+// ship-state transition (it stamps the per-plane shipped timestamp and,
+// for the catalog plane, advances each affected bucket's forge_root_cid)
+// once this returns nil — so a segment is only ever marked shipped (and
+// thus eligible for retention) after its blocks are resolvable through
+// the fallthrough read tier.
 //
 // A header-only CAR (e.g. an MST-only op writes no data blocks; a
 // trimTop-to-existing-subtree writes neither) has no positions: nothing
 // to ship, so the closure returns nil and the store still marks the
 // plane shipped, letting retention reclaim the tiny CAR and (for the
 // catalog plane) advancing forge_root_cid for the recorded op-roots.
-func newPlaneFlushFunc(up uploader.Uploader, plane blockstore.Plane) logstore.FlushFunc {
+//
+// The destination space is the bucket's, resolved from the registry at
+// ship time (the log is segregated per bucket, so every segment this
+// closure sees belongs to exactly this bucket). A bucket deleted while
+// segments were still queued has nothing to ship to: the closure returns
+// nil so the segment marks shipped and retires.
+func newBucketFlushFunc(up uploader.Uploader, reg registry.Registry, locations registry.LocationStore, inclusions registry.InclusionStore, bucket string, logger *zap.Logger) logstore.FlushFunc {
+	plane := blockstore.PlaneCatalog
 	return func(ctx context.Context, seg *logstore.Segment) error {
 		positions := seg.Positions()
 		if len(positions) == 0 {
 			return nil
+		}
+		st, err := reg.Get(ctx, bucket)
+		if errors.Is(err, registry.ErrNotFound) {
+			logger.Info("dropping segment for deleted bucket",
+				zap.String("bucket", bucket), zap.Uint64("seq", seg.Seq()))
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("resolve space for %q: %w", bucket, err)
 		}
 		// Segment stores the raw 32-byte SHA-256 of the CAR file; the
 		// uploader and ShardedDagIndexView want the multihash form.
@@ -236,24 +262,54 @@ func newPlaneFlushFunc(up uploader.Uploader, plane blockstore.Plane) logstore.Fl
 			SHA256:    sha,
 			Positions: positions,
 		}
-		if err := up.SubmitShard(ctx, plane, shard); err != nil {
-			return fmt.Errorf("submit segment %d %s: %w", seg.Seq(), plane, err)
+		carLoc, err := up.SubmitShard(ctx, plane, st.Space, shard)
+		if err != nil {
+			return fmt.Errorf("submit segment %d %s for %q: %w", seg.Seq(), plane, bucket, err)
+		}
+		// No published location (the no-op uploader): nothing durable to
+		// point reads at, so record nothing.
+		if carLoc.Provider == "" || carLoc.URL == "" {
+			return nil
+		}
+		// Record the shard's location + every inner block's byte range
+		// BEFORE returning: a flush error keeps the segment unshipped (and
+		// retained), so retention can never retire blocks the read tier
+		// can't resolve. Re-runs are idempotent (upserts) and the re-ship's
+		// blob/add dedups on piri.
+		if err := locations.PutLocation(ctx, registry.BlobLocation{
+			Space:    st.Space,
+			Digest:   sha,
+			Provider: carLoc.Provider,
+			URL:      carLoc.URL,
+			Size:     seg.Size(),
+		}); err != nil {
+			return fmt.Errorf("record segment %d %s location for %q: %w", seg.Seq(), plane, bucket, err)
+		}
+		incs := make([]registry.BlobInclusion, 0, len(positions))
+		for c, loc := range positions {
+			incs = append(incs, registry.BlobInclusion{
+				Space:       st.Space,
+				Digest:      c.Hash(),
+				ShardDigest: sha,
+				RangeStart:  int64(loc.Offset),
+				RangeEnd:    int64(loc.Offset + loc.Length - 1),
+			})
+		}
+		if err := inclusions.PutInclusions(ctx, incs); err != nil {
+			return fmt.Errorf("record segment %d %s inclusions for %q: %w", seg.Seq(), plane, bucket, err)
 		}
 		return nil
 	}
 }
 
-// buildS3API constructs the versitygw S3ApiServer with the wiring
-// ingot needs: single-account IAM, no audit / event sinks, generous
-// concurrency limits.
-func buildS3API(ctx context.Context, backend *s3frontend.Backend, cfg ServerConfig) (*s3api.S3ApiServer, error) {
-	rootAcc := auth.Account{
-		Access: cfg.RootAccess,
-		Secret: cfg.RootSecret,
-		Role:   auth.RoleAdmin,
+// buildS3API constructs the versitygw S3ApiServer with the wiring ingot
+// needs: no audit / event sinks, generous concurrency limits. Non-root
+// access keys authenticate through iam when provided (the root account is
+// checked before the IAM lookup either way).
+func buildS3API(ctx context.Context, backend *s3frontend.Backend, cfg config.ServerConfig, iam auth.IAMService) (*s3api.S3ApiServer, error) {
+	if iam == nil {
+		return nil, fmt.Errorf("ingot: IAMService is required")
 	}
-	iam := auth.NewIAMServiceSingle(rootAcc)
-
 	loggers, err := s3log.InitLogger(&s3log.LogConfig{})
 	if err != nil {
 		return nil, fmt.Errorf("ingot: loggers: %w", err)
@@ -268,11 +324,23 @@ func buildS3API(ctx context.Context, backend *s3frontend.Backend, cfg ServerConf
 	}
 
 	api, err := s3api.New(backend,
-		middlewares.RootUserConfig{Access: rootAcc.Access, Secret: rootAcc.Secret},
+		middlewares.RootUserConfig{Access: cfg.RootAccess, Secret: cfg.RootSecret},
 		cfg.Region, iam, loggers.S3Logger, loggers.AdminLogger, evSender, mm,
 		s3api.WithQuiet(),
 		s3api.WithHealth("/health"),
 		s3api.WithConcurrencyLimiter(cfg.MaxConnections, cfg.MaxRequests),
+		// Without this the part-number ceiling defaults to 0 and every
+		// UploadPart is rejected. 10000 is the S3 maximum.
+		s3api.WithMpMaxParts(10000),
+		// Stash the signed S3 request on the context for every request. The
+		// bucket-authority seam (Create/Delete/ListBuckets) recovers it to
+		// forward to Hilt; doing it here — ahead of auth — covers all auth
+		// paths (root included), not just the Hilt-backed IAM lookup, so a
+		// root request can still drive bucket operations.
+		s3api.WithMiddleware("/", func(c fiber.Ctx) error {
+			c.Locals(reqscope.RequestKey(), fasthttputil.RequestFromHTTPContext(c.RequestCtx()))
+			return c.Next()
+		}),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("ingot: s3api: %w", err)
@@ -280,12 +348,15 @@ func buildS3API(ctx context.Context, backend *s3frontend.Backend, cfg ServerConf
 	return api, nil
 }
 
-func validateServerInputs(cfg ServerConfig, deps ServerDeps) error {
+func validateServerInputs(cfg config.ServerConfig, deps ServerDeps) error {
 	if cfg.Addr == "" {
 		return errors.New("ingot: ServerConfig.Addr is required")
 	}
 	if cfg.DataDir == "" {
 		return errors.New("ingot: ServerConfig.DataDir is required")
+	}
+	if cfg.RootAccess == "" || cfg.RootSecret == "" {
+		return errors.New("ingot: ServerConfig.RootAccess and ServerConfig.RootSecret are required")
 	}
 	if cfg.RootAccess == "" || cfg.RootSecret == "" {
 		return errors.New("ingot: ServerConfig.RootAccess and ServerConfig.RootSecret are required")
@@ -296,8 +367,29 @@ func validateServerInputs(cfg ServerConfig, deps ServerDeps) error {
 	if deps.Uploader == nil {
 		return errors.New("ingot: ServerDeps.Uploader is required")
 	}
+	if deps.BodyUploader == nil {
+		return errors.New("ingot: ServerDeps.BodyUploader is required")
+	}
 	if deps.Registry == nil {
 		return errors.New("ingot: ServerDeps.Registry is required")
+	}
+	if deps.Intents == nil {
+		return errors.New("ingot: ServerDeps.Intents is required")
+	}
+	if deps.Locations == nil {
+		return errors.New("ingot: ServerDeps.Locations is required")
+	}
+	if deps.BlobRefs == nil {
+		return errors.New("ingot: ServerDeps.BlobRefs is required")
+	}
+	if deps.GC == nil {
+		return errors.New("ingot: ServerDeps.GC is required")
+	}
+	if deps.Multipart == nil {
+		return errors.New("ingot: ServerDeps.Multipart is required")
+	}
+	if deps.Remover == nil {
+		return errors.New("ingot: ServerDeps.Remover is required")
 	}
 	if deps.Meta == nil {
 		return errors.New("ingot: ServerDeps.Meta is required")
@@ -305,12 +397,12 @@ func validateServerInputs(cfg ServerConfig, deps ServerDeps) error {
 	return nil
 }
 
-func applyServerDefaults(cfg ServerConfig) ServerConfig {
+func applyServerDefaults(cfg config.ServerConfig) config.ServerConfig {
 	if cfg.Region == "" {
 		cfg.Region = "us-east-1"
 	}
-	if cfg.ChunkSize <= 0 {
-		cfg.ChunkSize = msbucket.DefaultChunkSize
+	if cfg.MaxBlobSize <= 0 {
+		cfg.MaxBlobSize = msbucket.DefaultMaxBlobSize
 	}
 	// SealBytes / SealAge / Retain pass through to logstore.Open
 	// untouched; logstore.Config.defaults handles its own fallbacks.

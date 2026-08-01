@@ -1,0 +1,12 @@
+{
+  "name": "single-chunk-go",
+  "producer": "go",
+  "description": "AC1: single-chunk file encrypted in Go; decrypts in foc-encryption (TS).",
+  "tag": 16,
+  "algorithm": -65793,
+  "typ": "application/vnd.foc-envelope+cose",
+  "chunk_size": 4096,
+  "chunk_count": 1,
+  "cek_hex": "512a9e74aef629e7fa75f331b9d0e6dd432d9a24f97eeaace04bee49b72e653d",
+  "base_nonce_hex": "baf5c82a5faa4c"
+}

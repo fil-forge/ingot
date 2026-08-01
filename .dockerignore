@@ -1,0 +1,12 @@
+# dirs
+.git
+.github
+.claude
+.idea
+
+# files
+.env*
+*.md
+docker-compose*.yml
+compose*.yml
+LICENSE

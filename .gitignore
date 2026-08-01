@@ -8,6 +8,9 @@
 *.so
 *.dylib
 
+# The daemon binary from `make build` (leading slash: root only, not cmd/ingot/)
+/ingot
+
 # Test binary, built with `go test -c`
 *.test
 

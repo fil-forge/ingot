@@ -6,15 +6,19 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/fil-forge/ucantone/did"
 	block "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
 )
 
-// OpStaging is a per-S3-op IpldBlockstore that captures every Put —
-// body chunks, MST nodes, ObjectManifests — in memory. On Commit it
-// hands the entire ordered batch to the log store in one
-// fsynced AppendBatch call, after which the new bucket Root may be
-// safely advanced via the registry CAS.
+// OpStaging is a per-S3-op IpldBlockstore that captures every Put — MST nodes
+// and ObjectManifests — in memory. On Commit it hands the entire ordered batch
+// to the log store in one fsynced AppendBatch call, after which the new bucket
+// Root may be safely advanced via the registry CAS.
+//
+// Only catalog (dag-cbor) blocks reach OpStaging: object-body blobs are spooled
+// and uploaded per-blob before the commit, so they never pass through the
+// per-op staging buffer or the log.
 //
 // Reads check the in-memory buffer first and fall through to the
 // underlying read store on miss. This lets MST.GetPointer recompute
@@ -24,65 +28,34 @@ import (
 // number of blocks, then call Commit(root) on success or Discard on
 // failure. Failed ops never touch the log because nothing is written
 // until Commit.
-//
-// TODO(perf): the in-memory `blocks` map bounds the transaction's
-// memory footprint at the size of the entire payload until Commit.
-// For a multi-GB PutObject this means the full body — every chunk,
-// every MST node, the manifest — sits in process memory until the
-// log accepts the batch.
-//
-// An alternative OpStaging implementation could spool to a temp
-// file (CAR-shaped, with an in-memory cid → (offset, length) index
-// for read-your-writes) instead of an unbounded map, capping the
-// per-transaction footprint to roughly one chunk plus the index.
-// The interface (Get / Put / Commit / Discard) does not need to
-// change — only the storage backend behind these methods.
-//
-// Discard would unlink the temp file; Commit could hand the file
-// off to Log.AppendBatch (or a future SubmitCAR-style entry point
-// that takes the path directly) to avoid materializing the batch
-// as a Go slice in the hot path.
 type OpStaging struct {
 	underlying ReadStore
 	log        Log
 	bucket     string
+	// space is the bucket's Forge space, bound in so the cbor-gen-shaped
+	// Get below (fixed, space-less signature) can reach the network tier
+	// with the right space on fallthrough.
+	space did.DID
 
 	mu sync.RWMutex
-	// blocks holds every Put for the lifetime of the transaction,
-	// across BOTH planes, so read-your-writes (MST.GetPointer
-	// re-reading a freshly-put node; a ranged GET re-reading a
-	// freshly-put chunk) works regardless of plane. See the
-	// TODO(perf) on OpStaging — this is the field a file-backed
-	// implementation would replace.
+	// blocks holds every Put for the lifetime of the transaction so
+	// read-your-writes (MST.GetPointer re-reading a freshly-put node) works.
 	blocks map[string]block.Block // keyed by string(cid.Bytes())
-	// dataOrder / catOrder preserve Put order within each plane.
-	// On Commit they become the two block slices handed to
-	// Log.AppendBatch. Classification is by CID codec — see
-	// isDataBlock and the plane-split invariant below.
-	dataOrder []cid.Cid
-	catOrder  []cid.Cid
-}
-
-// isDataBlock reports whether a block belongs to the data plane.
-//
-// INVARIANT: the data plane is exactly the raw-codec leaf blocks the
-// body codec emits (bucket.FixedChunker.putRawBlock uses cid.Raw);
-// everything else — ObjectManifests, FixedChunkerIndex docs, MST
-// nodes — is dag-cbor and belongs to the catalog plane. If a future
-// body codec emits non-raw body DAG nodes, this seam must be replaced
-// with an explicit per-write kind rather than a codec sniff.
-func isDataBlock(c cid.Cid) bool {
-	return c.Prefix().Codec == cid.Raw
+	// order preserves Put order; on Commit it becomes the block slice handed to
+	// Log.AppendBatch (the catalog plane).
+	order []cid.Cid
 }
 
 // NewOpStaging constructs a per-op staging buffer. underlying is the
 // read fallback (typically *Layered); log is the durable write
-// target; bucket is the bucket whose root this op will advance.
-func NewOpStaging(underlying ReadStore, log Log, bucket string) *OpStaging {
+// target; bucket is the bucket whose root this op will advance and
+// space its Forge space (for network fallthrough on reads).
+func NewOpStaging(underlying ReadStore, log Log, bucket string, space did.DID) *OpStaging {
 	return &OpStaging{
 		underlying: underlying,
 		log:        log,
 		bucket:     bucket,
+		space:      space,
 		blocks:     map[string]block.Block{},
 	}
 }
@@ -94,7 +67,7 @@ func (b *OpStaging) Get(ctx context.Context, c cid.Cid) (block.Block, error) {
 	if ok {
 		return blk, nil
 	}
-	return b.underlying.GetBlock(ctx, c)
+	return b.underlying.GetBlock(ctx, b.space, c)
 }
 
 func (b *OpStaging) Put(_ context.Context, blk block.Block) error {
@@ -105,11 +78,7 @@ func (b *OpStaging) Put(_ context.Context, blk block.Block) error {
 		return nil
 	}
 	b.blocks[key] = blk
-	if isDataBlock(blk.Cid()) {
-		b.dataOrder = append(b.dataOrder, blk.Cid())
-	} else {
-		b.catOrder = append(b.catOrder, blk.Cid())
-	}
+	b.order = append(b.order, blk.Cid())
 	return nil
 }
 
@@ -131,21 +100,16 @@ func (b *OpStaging) Commit(ctx context.Context, root cid.Cid) error {
 		return errors.New("opstaging: commit with undefined root")
 	}
 
-	data := make([]block.Block, len(b.dataOrder))
-	for i, c := range b.dataOrder {
-		data[i] = b.blocks[string(c.Bytes())]
-	}
-	cat := make([]block.Block, len(b.catOrder))
-	for i, c := range b.catOrder {
+	cat := make([]block.Block, len(b.order))
+	for i, c := range b.order {
 		cat[i] = b.blocks[string(c.Bytes())]
 	}
-	if err := b.log.AppendBatch(ctx, data, cat, OpRoot{Bucket: b.bucket, Root: root}); err != nil {
+	if err := b.log.AppendBatch(ctx, cat, OpRoot{Bucket: b.bucket, Root: root}); err != nil {
 		return fmt.Errorf("opstaging: append: %w", err)
 	}
 
 	b.blocks = map[string]block.Block{}
-	b.dataOrder = nil
-	b.catOrder = nil
+	b.order = nil
 	return nil
 }
 
@@ -156,8 +120,7 @@ func (b *OpStaging) Discard() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.blocks = map[string]block.Block{}
-	b.dataOrder = nil
-	b.catOrder = nil
+	b.order = nil
 }
 
 // OpStaging is passed to CborStore in bucketop.Tx construction, so

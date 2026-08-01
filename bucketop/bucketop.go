@@ -27,6 +27,9 @@ import (
 	block "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
 
+	"github.com/fil-forge/ucantone/did"
+	cbor "github.com/ipfs/go-ipld-cbor"
+
 	"github.com/fil-forge/ingot/blockstore"
 	"github.com/fil-forge/ingot/mst"
 	"github.com/fil-forge/ingot/registry"
@@ -47,7 +50,10 @@ type Deps struct {
 
 	// Log is the durability boundary. Tx.Commit calls
 	// log.AppendBatch with the per-tx blocks plus an op-root
-	// record of (bucket, newRoot).
+	// record of (bucket, newRoot). In production this is the
+	// per-bucket *logstore.Manager: the op-root's bucket routes
+	// each batch to that bucket's own log, whose sealed segments
+	// ship to the bucket's Forge space.
 	Log blockstore.Log
 
 	// Reads is the read tier the staging buffer falls through to
@@ -102,7 +108,7 @@ func (c *Coordinator) Begin(ctx context.Context, bucket string) (*Tx, error) {
 		return nil, fmt.Errorf("bucketop: get bucket %q: %w", bucket, err)
 	}
 
-	staging := blockstore.NewOpStaging(c.deps.Reads, c.deps.Log, bucket)
+	staging := blockstore.NewOpStaging(c.deps.Reads, c.deps.Log, bucket, state.Space)
 	return &Tx{
 		deps:    c.deps,
 		bucket:  bucket,
@@ -203,8 +209,9 @@ func (c *Coordinator) lockFor(bucket string) *sync.Mutex {
 	return m
 }
 
-// Close shuts down the underlying log: seals the open segment,
-// drains the flush queue, and updates per-bucket forge_root_cid
+// Close shuts down the underlying log — with the per-bucket
+// manager, every bucket's log: each seals its open segment,
+// drains its flush queue, and updates its bucket's forge_root_cid
 // for every op_root contained in flushed segments. After Close
 // returns cleanly, every acked write is durable in Forge or
 // scheduled to ship. Close is one-shot at process shutdown;
@@ -223,7 +230,7 @@ type Tx struct {
 	bucket  string
 	state   *registry.State
 	staging *blockstore.OpStaging
-	cst     blockstore.Store
+	cst     cbor.IpldStore
 
 	// release is the bucket-lock release closure. Set by Begin;
 	// nil-ed by finalize() so Commit and Discard mutually agree
@@ -248,8 +255,10 @@ func (tx *Tx) State() *registry.State { return tx.state }
 // Get fetches a CBOR-encoded value at c into out. Tx satisfies
 // blockstore.Store (Get + Put) and blockstore.Reader (Get) so it
 // can be passed directly to mst.LoadMST and
-// MerkleSearchTree.GetPointer.
-func (tx *Tx) Get(ctx context.Context, c cid.Cid, out any) error {
+// MerkleSearchTree.GetPointer. The space parameter is accepted for
+// interface conformance; the Tx's own bucket space (bound into the
+// staging buffer at Begin) is what reaches the network tier.
+func (tx *Tx) Get(ctx context.Context, _ did.DID, c cid.Cid, out any) error {
 	return tx.cst.Get(ctx, c, out)
 }
 
@@ -263,7 +272,7 @@ func (tx *Tx) Put(ctx context.Context, v any) (cid.Cid, error) {
 // buffer first, then the layered read store. Satisfies
 // bucket.BlockReader so OpenBody / OpenBodyRange can read from
 // freshly-staged chunks during the same op (rare but consistent).
-func (tx *Tx) GetBlock(ctx context.Context, c cid.Cid) (block.Block, error) {
+func (tx *Tx) GetBlock(ctx context.Context, _ did.DID, c cid.Cid) (block.Block, error) {
 	return tx.staging.Get(ctx, c)
 }
 
@@ -283,9 +292,9 @@ func (tx *Tx) PutBlock(ctx context.Context, blk block.Block) error {
 // writer as an explicit argument).
 func (tx *Tx) LoadTree() *mst.MerkleSearchTree {
 	if tx.state.Root.Defined() {
-		return mst.LoadMST(tx, tx.state.Root)
+		return mst.LoadMST(tx, tx.state.Space, tx.state.Root)
 	}
-	return mst.NewEmptyMST(tx)
+	return mst.NewEmptyMST(tx, tx.state.Space)
 }
 
 // Commit finalizes the transaction:

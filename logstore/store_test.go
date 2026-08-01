@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -44,13 +45,13 @@ func (f *fakeMeta) NextSegmentSeq(_ context.Context) (uint64, error) {
 	return f.nextSeq, nil
 }
 
-func (f *fakeMeta) InsertSegmentOpen(_ context.Context, plane blockstore.Plane, seq uint64) error {
+func (f *fakeMeta) InsertSegmentOpen(_ context.Context, plane blockstore.Plane, seq uint64, bucket string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if _, ok := f.segments[seq]; ok {
 		return nil
 	}
-	f.segments[seq] = &SegmentMeta{Seq: seq, Plane: plane, State: StateOpen}
+	f.segments[seq] = &SegmentMeta{Seq: seq, Plane: plane, Bucket: bucket, State: StateOpen}
 	return nil
 }
 
@@ -96,16 +97,35 @@ func (f *fakeMeta) DeleteSegment(_ context.Context, plane blockstore.Plane, seq 
 	return nil
 }
 
-func (f *fakeMeta) ListSegments(_ context.Context, plane blockstore.Plane) ([]SegmentMeta, error) {
+func (f *fakeMeta) ListSegments(_ context.Context, plane blockstore.Plane, bucket string) ([]SegmentMeta, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var out []SegmentMeta
 	for _, m := range f.segments {
-		if m.Plane != plane {
+		if m.Plane != plane || m.Bucket != bucket {
 			continue
 		}
 		out = append(out, *m)
 	}
+	return out, nil
+}
+
+func (f *fakeMeta) ListSegmentBuckets(_ context.Context, plane blockstore.Plane) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	seen := map[string]struct{}{}
+	var out []string
+	for _, m := range f.segments {
+		if m.Plane != plane {
+			continue
+		}
+		if _, ok := seen[m.Bucket]; ok {
+			continue
+		}
+		seen[m.Bucket] = struct{}{}
+		out = append(out, m.Bucket)
+	}
+	sort.Strings(out)
 	return out, nil
 }
 
@@ -117,27 +137,12 @@ func (f *fakeMeta) RehydrateSegment(_ context.Context, m SegmentMeta) error {
 	return nil
 }
 
-// makeBlock returns a raw-codec block whose CID is the sha256 of
-// payload. We construct the CID explicitly rather than relying on
-// block.NewBlock because the latter uses a v0 CID we don't want.
+// makeBlock returns a block whose CID is the sha256 of payload. We
+// construct the CID explicitly rather than relying on block.NewBlock
+// because the latter uses a v0 CID we don't want. The catalog log stores
+// opaque bytes keyed by CID and never decodes them, so the codec is
+// irrelevant to these tests.
 func makeBlock(t *testing.T, payload []byte) block.Block {
-	t.Helper()
-	mh, err := multihash.Sum(payload, multihash.SHA2_256, -1)
-	if err != nil {
-		t.Fatalf("multihash: %v", err)
-	}
-	c := cid.NewCidV1(cid.Raw, mh)
-	blk, err := block.NewBlockWithCid(payload, c)
-	if err != nil {
-		t.Fatalf("block: %v", err)
-	}
-	return blk
-}
-
-// makeCatBlock returns a dag-cbor-codec block (the catalog plane). The
-// payload need not be valid CBOR — logstore stores opaque bytes keyed
-// by CID and never decodes them.
-func makeCatBlock(t *testing.T, payload []byte) block.Block {
 	t.Helper()
 	mh, err := multihash.Sum(payload, multihash.SHA2_256, -1)
 	if err != nil {
@@ -175,7 +180,6 @@ func newTestStore(t *testing.T, sealBytes int64, sealAge time.Duration, retain i
 	cfg := Config{
 		Dir:     dir,
 		Meta:    meta,
-		Data:    PlaneConfig{SealBytes: sealBytes, SealAge: sealAge, Ship: true, Flush: flush, Retain: retain},
 		Catalog: PlaneConfig{SealBytes: sealBytes, SealAge: sealAge, Ship: true, Flush: flush, Retain: retain},
 		Logger:  logger,
 	}
@@ -197,7 +201,7 @@ func TestAppendThenGetSameProcess(t *testing.T) {
 
 	blk := makeBlock(t, []byte("hello world"))
 	root := makeRoot(t, "alpha")
-	if err := s.AppendBatch(context.Background(), []block.Block{blk}, nil, blockstore.OpRoot{Bucket: "bk", Root: root}); err != nil {
+	if err := s.AppendBatch(context.Background(), []block.Block{blk}, blockstore.OpRoot{Bucket: "bk", Root: root}); err != nil {
 		t.Fatalf("AppendBatch: %v", err)
 	}
 
@@ -221,7 +225,7 @@ func TestSealBySize(t *testing.T) {
 	}
 	for i := 0; i < 6; i++ {
 		blk := makeBlock(t, append([]byte(fmt.Sprintf("rec-%02d-", i)), payload...))
-		if err := s.AppendBatch(context.Background(), []block.Block{blk}, nil, blockstore.OpRoot{
+		if err := s.AppendBatch(context.Background(), []block.Block{blk}, blockstore.OpRoot{
 			Bucket: "bk",
 			Root:   makeRoot(t, fmt.Sprintf("size-%d", i)),
 		}); err != nil {
@@ -241,8 +245,7 @@ func TestSealBySize(t *testing.T) {
 		t.Fatalf("expected at least one flush after size threshold; got 0")
 	}
 
-	// At least one segment should now have shipped (each plane ships its
-	// own segments independently).
+	// At least one segment should now have shipped.
 	meta.mu.Lock()
 	var shipped int
 	for _, m := range meta.segments {
@@ -260,7 +263,7 @@ func TestSealByAge(t *testing.T) {
 	s, _, flushes := newTestStore(t, 1<<30, 80*time.Millisecond, 6)
 
 	blk := makeBlock(t, []byte("age-trigger"))
-	if err := s.AppendBatch(context.Background(), []block.Block{blk}, nil, blockstore.OpRoot{
+	if err := s.AppendBatch(context.Background(), []block.Block{blk}, blockstore.OpRoot{
 		Bucket: "bk",
 		Root:   makeRoot(t, "age"),
 	}); err != nil {
@@ -281,7 +284,7 @@ func TestSealByAge(t *testing.T) {
 
 func TestRetentionDropsOldFlushed(t *testing.T) {
 	s, _, _ := newTestStore(t, 64, 50*time.Millisecond, 2)
-	dir := filepath.Dir(s.data.dir)
+	dir := filepath.Dir(s.catalog.dir)
 
 	// Issue 5 PUTs; each one large enough to exceed SealBytes=64 in
 	// a single batch, so each becomes its own segment.
@@ -291,7 +294,7 @@ func TestRetentionDropsOldFlushed(t *testing.T) {
 			payload[j] = byte(i)
 		}
 		blk := makeBlock(t, append([]byte(fmt.Sprintf("retain-%02d-", i)), payload...))
-		if err := s.AppendBatch(context.Background(), []block.Block{blk}, nil, blockstore.OpRoot{
+		if err := s.AppendBatch(context.Background(), []block.Block{blk}, blockstore.OpRoot{
 			Bucket: "bk",
 			Root:   makeRoot(t, fmt.Sprintf("ret-%d", i)),
 		}); err != nil {
@@ -302,7 +305,7 @@ func TestRetentionDropsOldFlushed(t *testing.T) {
 	// Wait for retention to converge.
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		entries, err := readSegmentSeqs(dir, "data")
+		entries, err := readSegmentSeqs(dir, "catalog")
 		if err != nil {
 			t.Fatalf("readDir: %v", err)
 		}
@@ -313,7 +316,7 @@ func TestRetentionDropsOldFlushed(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 
-	entries, err := readSegmentSeqs(dir, "data")
+	entries, err := readSegmentSeqs(dir, "catalog")
 	if err != nil {
 		t.Fatalf("readDir: %v", err)
 	}
@@ -332,7 +335,6 @@ func TestForceSealRecoveredOpenOnRestart(t *testing.T) {
 		cfg := Config{
 			Dir:     dir,
 			Meta:    meta,
-			Data:    PlaneConfig{SealBytes: 1 << 30, SealAge: time.Hour, Ship: true, Flush: func(context.Context, *Segment) error { return nil }, Retain: 6},
 			Catalog: PlaneConfig{SealBytes: 1 << 30, SealAge: time.Hour, Ship: true, Flush: func(context.Context, *Segment) error { return nil }, Retain: 6},
 			Logger:  logger,
 		}
@@ -345,21 +347,18 @@ func TestForceSealRecoveredOpenOnRestart(t *testing.T) {
 
 	s := openStore()
 	blk := makeBlock(t, []byte("survives-restart"))
-	if err := s.AppendBatch(context.Background(), []block.Block{blk}, nil, blockstore.OpRoot{
+	if err := s.AppendBatch(context.Background(), []block.Block{blk}, blockstore.OpRoot{
 		Bucket: "bk",
 		Root:   makeRoot(t, "survive"),
 	}); err != nil {
 		t.Fatalf("append: %v", err)
 	}
 
-	// Simulate process exit without orderly Close (don't seal). Close
-	// the file descriptors via a panic-safe path: we just stop the
-	// goroutines and forget the in-memory state.
-	close(s.data.closing)
-	s.data.wg.Wait()
+	// Simulate process exit without orderly Close (don't seal): stop the
+	// goroutines and forget the in-memory state. On disk the segment is
+	// still open.
 	close(s.catalog.closing)
 	s.catalog.wg.Wait()
-	// Drop the in-memory ref; on disk both planes' segments are still open.
 
 	// Re-Open from the same dir.
 	s2 := openStore()
@@ -379,10 +378,10 @@ func TestForceSealRecoveredOpenOnRestart(t *testing.T) {
 func TestAppendBatchEmptyBlocksAccepted(t *testing.T) {
 	s, _, _ := newTestStore(t, 64<<20, 5*time.Second, 6)
 	root := makeRoot(t, "x")
-	if err := s.AppendBatch(context.Background(), nil, nil, blockstore.OpRoot{Bucket: "bk", Root: root}); err != nil {
+	if err := s.AppendBatch(context.Background(), nil, blockstore.OpRoot{Bucket: "bk", Root: root}); err != nil {
 		t.Fatalf("empty blocks with defined root should succeed, got %v", err)
 	}
-	if err := s.AppendBatch(context.Background(), []block.Block{makeBlock(t, []byte("x"))}, nil, blockstore.OpRoot{Bucket: "bk"}); err == nil {
+	if err := s.AppendBatch(context.Background(), []block.Block{makeBlock(t, []byte("x"))}, blockstore.OpRoot{Bucket: "bk"}); err == nil {
 		t.Fatalf("expected error on undefined root")
 	}
 }
@@ -390,8 +389,8 @@ func TestAppendBatchEmptyBlocksAccepted(t *testing.T) {
 func TestGetMissReturnsErrNotFound(t *testing.T) {
 	s, _, _ := newTestStore(t, 64<<20, 5*time.Second, 6)
 
-	want, err := makeRoot(t, "absent"), error(nil)
-	_, err = s.Get(context.Background(), want)
+	want := makeRoot(t, "absent")
+	_, err := s.Get(context.Background(), want)
 	if !errors.Is(err, blockstore.ErrNotFound) {
 		t.Fatalf("expected ErrNotFound, got %v", err)
 	}
@@ -411,36 +410,31 @@ func TestAppendBatchDedupesAcrossOps(t *testing.T) {
 	// First batch: shared + uniqA.
 	if err := s.AppendBatch(context.Background(),
 		[]block.Block{shared, uniqA},
-		nil,
 		blockstore.OpRoot{Bucket: "bk", Root: makeRoot(t, "op-a")},
 	); err != nil {
 		t.Fatalf("append A: %v", err)
 	}
 
-	// Snapshot the data plane's open-segment size after the first append.
-	s.data.catMu.RLock()
-	sizeAfterA := s.data.open.Size()
-	s.data.catMu.RUnlock()
+	// Snapshot the open-segment size after the first append.
+	s.catalog.catMu.RLock()
+	sizeAfterA := s.catalog.open.Size()
+	s.catalog.catMu.RUnlock()
 
 	// Second batch: shared (duplicate of first batch) + uniqB.
 	if err := s.AppendBatch(context.Background(),
 		[]block.Block{shared, uniqB},
-		nil,
 		blockstore.OpRoot{Bucket: "bk", Root: makeRoot(t, "op-b")},
 	); err != nil {
 		t.Fatalf("append B: %v", err)
 	}
 
-	s.data.catMu.RLock()
-	sizeAfterB := s.data.open.Size()
-	s.data.catMu.RUnlock()
+	s.catalog.catMu.RLock()
+	sizeAfterB := s.catalog.open.Size()
+	s.catalog.catMu.RUnlock()
 
-	// Frame for `shared` is one varint(len) + cid + payload. Whatever
-	// that totals, the second batch should NOT have re-written it.
-	// `uniqA` has ~the same payload size as `uniqB`, so growth-from-A
-	// and growth-from-B (had we written `shared` twice) would be
-	// nearly identical. Instead we expect growth-from-B ≈ uniqB-frame
-	// only. Simplest assertion: only one frame's worth of growth.
+	// Frame for `shared` is one varint(len) + cid + payload. The second
+	// batch should NOT have re-written it, so growth-from-B ≈ uniqB-frame
+	// only — strictly less than the first batch's header + two frames.
 	growthB := sizeAfterB - sizeAfterA
 	growthFirstBatch := sizeAfterA // includes header + 2 frames; can't isolate
 
@@ -471,29 +465,23 @@ func TestAppendBatchAllDuplicatesStillRecordsOpRoot(t *testing.T) {
 
 	blk := makeBlock(t, []byte("only-block"))
 
-	if err := s.AppendBatch(context.Background(), []block.Block{blk}, nil, blockstore.OpRoot{
+	if err := s.AppendBatch(context.Background(), []block.Block{blk}, blockstore.OpRoot{
 		Bucket: "bk", Root: makeRoot(t, "first"),
 	}); err != nil {
 		t.Fatalf("first append: %v", err)
 	}
-	// Size is the data plane's (the block is raw); op-roots live on the
-	// catalog plane.
-	s.data.catMu.RLock()
-	sizeBefore := s.data.open.Size()
-	s.data.catMu.RUnlock()
 	s.catalog.catMu.RLock()
+	sizeBefore := s.catalog.open.Size()
 	opRootsBefore := len(s.catalog.open.OpRoots())
 	s.catalog.catMu.RUnlock()
 
-	if err := s.AppendBatch(context.Background(), []block.Block{blk}, nil, blockstore.OpRoot{
+	if err := s.AppendBatch(context.Background(), []block.Block{blk}, blockstore.OpRoot{
 		Bucket: "bk", Root: makeRoot(t, "second"),
 	}); err != nil {
 		t.Fatalf("dup append: %v", err)
 	}
-	s.data.catMu.RLock()
-	sizeAfter := s.data.open.Size()
-	s.data.catMu.RUnlock()
 	s.catalog.catMu.RLock()
+	sizeAfter := s.catalog.open.Size()
 	opRootsAfter := len(s.catalog.open.OpRoots())
 	s.catalog.catMu.RUnlock()
 
@@ -505,133 +493,26 @@ func TestAppendBatchAllDuplicatesStillRecordsOpRoot(t *testing.T) {
 	}
 }
 
-// TestPerPlaneShipping_CatalogNeverShips is the headline permutation: the
-// data plane ships (and retires past its Retain window) while the catalog
-// plane is configured never to ship, so its CARs stay on local disk
-// indefinitely. No catalog flush worker runs, so its shipped_at never
-// advances (and, by extension, forge_root_cid never advances).
-func TestPerPlaneShipping_CatalogNeverShips(t *testing.T) {
+// TestCatalogNeverShips covers the standalone-mode permutation: a catalog
+// plane configured never to ship keeps its CARs on local disk indefinitely
+// (the sole durable copy and the source for every read), and its shipped_at
+// never advances (so forge_root_cid never advances).
+func TestCatalogNeverShips(t *testing.T) {
 	dir := t.TempDir()
 	meta := newFakeMeta()
 	logger := zaptest.NewLogger(t)
 
-	var dataShips atomicCounter
+	var ships atomicCounter
 	cfg := Config{
 		Dir:  dir,
 		Meta: meta,
-		Data: PlaneConfig{
-			SealBytes: 1, // seal each batch into its own segment
-			SealAge:   20 * time.Millisecond,
-			Ship:      true,
-			Flush:     func(context.Context, *Segment) error { dataShips.add(1); return nil },
-			Retain:    1,
-		},
 		// never ships → retained forever; seal fast so each batch becomes
-		// its own retained catalog CAR.
-		Catalog: PlaneConfig{SealBytes: 1, SealAge: 20 * time.Millisecond, Ship: false},
-		Logger:  logger,
-	}
-	s, err := Open(context.Background(), cfg)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	t.Cleanup(func() { _ = s.Close(context.Background()) })
-
-	const n = 4
-	var catBlocks []block.Block
-	for i := 0; i < n; i++ {
-		d := makeBlock(t, []byte(fmt.Sprintf("data-%02d", i)))
-		c := makeCatBlock(t, []byte(fmt.Sprintf("cat-%02d", i)))
-		catBlocks = append(catBlocks, c)
-		if err := s.AppendBatch(context.Background(),
-			[]block.Block{d}, []block.Block{c},
-			blockstore.OpRoot{Bucket: "bk", Root: c.Cid()},
-		); err != nil {
-			t.Fatalf("append %d: %v", i, err)
-		}
-		time.Sleep(30 * time.Millisecond) // let each batch seal separately
-	}
-
-	// Wait for the data pipeline to ship every segment.
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		if dataShips.load() >= n {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	if dataShips.load() == 0 {
-		t.Fatalf("expected the data plane to ship; got 0")
-	}
-
-	// Every sealed segment: data shipped, catalog never shipped.
-	meta.mu.Lock()
-	sealed := 0
-	for seq, m := range meta.segments {
-		if m.State != StateSealed {
-			continue
-		}
-		sealed++
-		if m.Plane == blockstore.PlaneCatalog {
-			if m.ShippedAt != 0 {
-				t.Fatalf("catalog seg %d shipped (%d) but Ship=false", seq, m.ShippedAt)
-			}
-		} else if m.ShippedAt == 0 {
-			t.Fatalf("data seg %d never shipped", seq)
-		}
-	}
-	meta.mu.Unlock()
-	if sealed == 0 {
-		t.Fatalf("expected sealed segments; got none")
-	}
-
-	// Catalog blocks stay readable from local disk (CARs retained); a
-	// fully-retired segment would have its row deleted, but the retained
-	// catalog keeps every segment alive.
-	for _, c := range catBlocks {
-		if _, err := s.Get(context.Background(), c.Cid()); err != nil {
-			t.Fatalf("catalog block %s should be retained locally: %v", c.Cid(), err)
-		}
-	}
-
-	// All catalog CARs retained; data CARs retired toward Retain=1.
-	cats, _ := filepath.Glob(filepath.Join(dir, "catalog", "seg-*.car"))
-	datas, _ := filepath.Glob(filepath.Join(dir, "data", "seg-*.car"))
-	if len(cats) < n {
-		t.Fatalf("expected >= %d catalog CARs retained; got %d", n, len(cats))
-	}
-	if len(datas) >= len(cats) {
-		t.Fatalf("expected fewer data CARs than catalog CARs after retire; data=%d cat=%d", len(datas), len(cats))
-	}
-}
-
-// TestPerPlaneSeal_IndependentThresholds proves the two planes seal on
-// their OWN thresholds: the data plane seals/ships almost immediately
-// (SealBytes=1) while the catalog plane, given a huge SealBytes and long
-// SealAge, never seals during the test window. The data plane's cadence
-// is not gated by the catalog's size, and vice versa.
-func TestPerPlaneSeal_IndependentThresholds(t *testing.T) {
-	dir := t.TempDir()
-	meta := newFakeMeta()
-	logger := zaptest.NewLogger(t)
-
-	var dataShips, catShips atomicCounter
-	cfg := Config{
-		Dir:  dir,
-		Meta: meta,
-		Data: PlaneConfig{
+		// its own retained CAR.
+		Catalog: PlaneConfig{
 			SealBytes: 1,
 			SealAge:   20 * time.Millisecond,
-			Ship:      true,
-			Flush:     func(context.Context, *Segment) error { dataShips.add(1); return nil },
-			Retain:    6,
-		},
-		Catalog: PlaneConfig{
-			SealBytes: 1 << 30,
-			SealAge:   time.Hour,
-			Ship:      true,
-			Flush:     func(context.Context, *Segment) error { catShips.add(1); return nil },
-			Retain:    6,
+			Ship:      false,
+			Flush:     func(context.Context, *Segment) error { ships.add(1); return nil },
 		},
 		Logger: logger,
 	}
@@ -641,39 +522,51 @@ func TestPerPlaneSeal_IndependentThresholds(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = s.Close(context.Background()) })
 
-	for i := 0; i < 3; i++ {
-		d := makeBlock(t, []byte(fmt.Sprintf("data-%02d", i)))
-		c := makeCatBlock(t, []byte(fmt.Sprintf("cat-%02d", i)))
-		if err := s.AppendBatch(context.Background(),
-			[]block.Block{d}, []block.Block{c},
+	const n = 4
+	var blocks []block.Block
+	for i := 0; i < n; i++ {
+		c := makeBlock(t, []byte(fmt.Sprintf("cat-%02d", i)))
+		blocks = append(blocks, c)
+		if err := s.AppendBatch(context.Background(), []block.Block{c},
 			blockstore.OpRoot{Bucket: "bk", Root: c.Cid()},
 		); err != nil {
 			t.Fatalf("append %d: %v", i, err)
 		}
-		time.Sleep(25 * time.Millisecond)
+		time.Sleep(30 * time.Millisecond) // let each batch seal separately
 	}
 
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if dataShips.load() > 0 {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if dataShips.load() == 0 {
-		t.Fatalf("data plane should have sealed+shipped under SealBytes=1")
-	}
-	if catShips.load() != 0 {
-		t.Fatalf("catalog plane should not have shipped (huge SealBytes, long SealAge); got %d", catShips.load())
+	// Give the (absent) ship pipeline time to NOT run.
+	time.Sleep(200 * time.Millisecond)
+	if ships.load() != 0 {
+		t.Fatalf("catalog Ship=false should never flush; got %d", ships.load())
 	}
 
-	// No catalog segment should have sealed — its thresholds were never met.
+	// No sealed segment ever ships.
 	meta.mu.Lock()
-	defer meta.mu.Unlock()
+	sealed := 0
 	for seq, m := range meta.segments {
-		if m.Plane == blockstore.PlaneCatalog && m.State == StateSealed {
-			t.Fatalf("catalog seg %d sealed but its thresholds were never reached", seq)
+		if m.State != StateSealed {
+			continue
 		}
+		sealed++
+		if m.ShippedAt != 0 {
+			t.Fatalf("catalog seg %d shipped (%d) but Ship=false", seq, m.ShippedAt)
+		}
+	}
+	meta.mu.Unlock()
+	if sealed == 0 {
+		t.Fatalf("expected sealed segments; got none")
+	}
+
+	// Every block stays readable from local disk (CARs retained).
+	for _, c := range blocks {
+		if _, err := s.Get(context.Background(), c.Cid()); err != nil {
+			t.Fatalf("catalog block %s should be retained locally: %v", c.Cid(), err)
+		}
+	}
+	cars, _ := filepath.Glob(filepath.Join(dir, "catalog", "seg-*.car"))
+	if len(cars) < n {
+		t.Fatalf("expected >= %d catalog CARs retained; got %d", n, len(cars))
 	}
 }
 
