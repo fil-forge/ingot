@@ -18,7 +18,7 @@ require (
 	github.com/gofiber/fiber/v3 v3.3.0
 	github.com/ipfs/go-block-format v0.2.3
 	github.com/ipfs/go-cid v0.6.1
-	github.com/ipfs/go-ipld-cbor v0.2.1
+	github.com/ipfs/go-ipld-cbor v0.3.0
 	github.com/ipfs/go-log/v2 v2.9.1
 	github.com/jackc/pgx/v5 v5.8.0
 	github.com/multiformats/go-multicodec v0.10.0
@@ -180,7 +180,7 @@ require (
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/planetscale/vtprotobuf v0.6.1-0.20240319094008-0393e58bdf10 // indirect
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
-	github.com/polydawn/refmt v0.89.1-0.20231129105047-37766d95467a // indirect
+	github.com/polydawn/refmt v0.90.0 // indirect
 	github.com/power-devops/perfstat v0.0.0-20240221224432-82ca36839d55 // indirect
 	github.com/rabbitmq/amqp091-go v1.12.0 // indirect
 	github.com/ryanuber/go-glob v1.0.0 // indirect
