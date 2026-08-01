@@ -1,0 +1,26 @@
+{
+  "name": "multi-recipient-go",
+  "producer": "go",
+  "description": "AC3: multi-recipient envelope (ECDH-ES+A256KW/X25519 and A256KW) encrypted in Go; foc-encryption parses recipients and decrypts the body from the CEK.",
+  "tag": 96,
+  "algorithm": -65793,
+  "typ": "application/vnd.foc-envelope+cose",
+  "chunk_size": 4096,
+  "chunk_count": 1,
+  "cek_hex": "1ff775e8c78ac4280a755d3d74c0858cac54bbb8b14d702b15ec60c87aa81e14",
+  "base_nonce_hex": "baf5c82a5faa4c",
+  "recipients": [
+    {
+      "algorithm": -31,
+      "kind": "ecdh-es-a256kw",
+      "kid_hex": "a26d1d0289f9c15f334b3631c2a483ee418d69a0d5f465adba994402ca20a22d",
+      "tenant_x25519_priv_hex": "104eabc3e778aebf1ea037a7fea015ffad4ec7c3d4991a6a2972ebfcd199bb47"
+    },
+    {
+      "algorithm": -5,
+      "kind": "a256kw",
+      "kid_hex": "726567696f6e2d6b65792d31",
+      "a256kw_kek_hex": "6dce8af0793c3db3a251fbcf8a63a24a396da70a4c33f0684f50ef0d95fa1271"
+    }
+  ]
+}

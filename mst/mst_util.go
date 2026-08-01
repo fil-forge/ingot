@@ -8,6 +8,7 @@ import (
 	"unicode/utf8"
 	"unsafe"
 
+	"github.com/fil-forge/ucantone/did"
 	"github.com/ipfs/go-cid"
 
 	"github.com/fil-forge/ingot/blockstore"
@@ -64,12 +65,12 @@ func layerForEntries(entries []nodeEntry) int {
 	return leadingZerosOnHash(firstLeaf.Key)
 }
 
-func deserializeNodeData(ctx context.Context, cst blockstore.Reader, nd *NodeData, layer int) ([]nodeEntry, error) {
+func deserializeNodeData(ctx context.Context, cst blockstore.Reader, space did.DID, nd *NodeData, layer int) ([]nodeEntry, error) {
 	entries := []nodeEntry{}
 	if nd.Left != nil {
 		entries = append(entries, nodeEntry{
 			Kind: entryTree,
-			Tree: createMST(cst, *nd.Left, nil, layer-1),
+			Tree: createMST(cst, space, *nd.Left, nil, layer-1),
 		})
 	}
 
@@ -96,7 +97,7 @@ func deserializeNodeData(ctx context.Context, cst blockstore.Reader, nd *NodeDat
 		if e.Tree != nil {
 			entries = append(entries, nodeEntry{
 				Kind: entryTree,
-				Tree: createMST(cst, *e.Tree, nil, layer-1),
+				Tree: createMST(cst, space, *e.Tree, nil, layer-1),
 				Key:  keyStr,
 			})
 		}

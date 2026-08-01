@@ -6,20 +6,20 @@ import (
 	"testing"
 
 	"github.com/fil-forge/ingot/tokenstore"
-	"github.com/fil-forge/libforge/didmailto"
+	"github.com/fil-forge/libforge/attestation/didmailto"
+	"github.com/fil-forge/ucantone/absentee"
 	"github.com/fil-forge/ucantone/did"
-	"github.com/fil-forge/ucantone/principal/absentee"
-	"github.com/fil-forge/ucantone/principal/ed25519"
+	"github.com/fil-forge/ucantone/multikey/ed25519"
 	"github.com/fil-forge/ucantone/ucan"
 	"github.com/fil-forge/ucantone/ucan/command"
 	"github.com/fil-forge/ucantone/ucan/delegation"
 )
 
-func newAccountsTestClient(t *testing.T, agent ucan.Signer, store tokenstore.Store) *Client {
+func newAccountsTestClient(t *testing.T, agent ucan.Issuer, store tokenstore.Store) *Client {
 	t.Helper()
-	svc, err := ed25519.Generate()
+	svc, err := ed25519.GenerateIssuer()
 	if err != nil {
-		t.Fatalf("generate service signer: %v", err)
+		t.Fatalf("generate service issuer: %v", err)
 	}
 	u, err := url.Parse("http://127.0.0.1:1")
 	if err != nil {
@@ -35,7 +35,7 @@ func newAccountsTestClient(t *testing.T, agent ucan.Signer, store tokenstore.Sto
 // accountGrant builds an account→agent delegation issued by an absentee
 // (did:mailto) signer, shaped like the delegations login stores (audience =
 // agent, subject = did.Undef, command = Top).
-func accountGrant(t *testing.T, account did.DID, agent ucan.Signer) ucan.Delegation {
+func accountGrant(t *testing.T, account did.DID, agent ucan.Issuer) ucan.Delegation {
 	t.Helper()
 	dlg, err := delegation.Delegate(absentee.From(account), agent.DID(), did.Undef, command.Top(), delegation.WithNoExpiration())
 	if err != nil {
@@ -46,7 +46,7 @@ func accountGrant(t *testing.T, account did.DID, agent ucan.Signer) ucan.Delegat
 
 func TestAccounts(t *testing.T) {
 	ctx := context.Background()
-	agent, err := ed25519.Generate()
+	agent, err := ed25519.GenerateIssuer()
 	if err != nil {
 		t.Fatalf("generate agent: %v", err)
 	}
@@ -72,7 +72,7 @@ func TestAccounts(t *testing.T) {
 	})
 
 	t.Run("non-mailto issuer is filtered out", func(t *testing.T) {
-		other, err := ed25519.Generate()
+		other, err := ed25519.GenerateIssuer()
 		if err != nil {
 			t.Fatalf("generate other: %v", err)
 		}

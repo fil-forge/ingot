@@ -1,5 +1,11 @@
 name: Go Test
 
+# Two-stage test pipeline mirroring the local `make test` / `make itest`
+# split: fast unit tests run first (the shared unified workflow), and the
+# Docker-backed integration suite (itest/) only runs once they pass — a
+# broken unit test fails the PR in ~2 minutes instead of tying up a runner
+# booting the Forge stack.
+
 on:
   pull_request:
   push:
@@ -14,9 +20,71 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  go-test:
+  unit:
     uses: ipdxco/unified-github-workflows/.github/workflows/go-test.yml@63392e900bbe802fb1a826ba763f6f543773dc36 # v1.0
     with:
       go-versions: '["this"]'
     secrets:
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  itest:
+    needs: unit
+    # Pin to 24.04 rather than -latest so the Docker version doesn't drift
+    # from under us. The runner's preinstalled Docker is 28.x, well past
+    # smelt's 25+ requirement.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Docker info
+        run: |
+          docker version
+          docker compose version
+
+      - name: Run integration tests
+        # GOWORK=off matches the Makefile convention (a parent go.work may
+        # declare a newer Go than the toolchain). The harness builds the
+        # working-tree binary itself (itest/stack_test.go).
+        env:
+          GOWORK: off
+        run: go test -tags itest -v -timeout 20m ./itest
+
+      - name: Dump container state on failure
+        if: failure()
+        run: |
+          mkdir -p /tmp/container-logs
+
+          {
+            echo "=== docker ps -a ==="
+            docker ps -a
+            echo
+            echo "=== docker network ls ==="
+            docker network ls
+            echo
+            echo "=== docker volume ls ==="
+            docker volume ls
+          } | tee /tmp/container-logs/_overview.txt
+
+          for c in $(docker ps -a --format '{{.Names}}'); do
+            docker logs "$c" > "/tmp/container-logs/$c.log" 2>&1 || true
+            echo "::group::$c"
+            tail -200 "/tmp/container-logs/$c.log"
+            echo "::endgroup::"
+          done
+
+      - name: Upload container logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: container-logs
+          path: /tmp/container-logs/
+          if-no-files-found: ignore
+          retention-days: 7

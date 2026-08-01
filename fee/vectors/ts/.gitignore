@@ -1,0 +1,6 @@
+# The pinned foc-encryption source is fetched on demand by
+# ../pull-foc-encryption.sh, never committed.
+vendor/
+node_modules/
+bun.lock
+bun.lockb

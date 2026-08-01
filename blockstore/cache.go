@@ -3,10 +3,13 @@ package blockstore
 import (
 	"container/list"
 	"context"
+	"io"
 	"sync"
 
+	"github.com/fil-forge/ucantone/did"
 	block "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
+	mh "github.com/multiformats/go-multihash"
 )
 
 // Cached wraps a BlockReader with a bounded, in-memory LRU keyed by CID. Blocks
@@ -50,16 +53,32 @@ func NewCached(base BlockReader, maxBytes int64) BlockReader {
 	}
 }
 
-var _ BlockReader = (*Cached)(nil)
+var (
+	_ BlockReader = (*Cached)(nil)
+	_ BlobReader  = (*Cached)(nil)
+)
+
+// OpenBlob streams a body blob straight from the base reader, bypassing the LRU.
+// Body blobs are large and streamed; caching one whole would defeat streaming
+// (and a single blob can exceed the whole budget). Small catalog blocks still
+// cache through GetBlock.
+func (c *Cached) OpenBlob(ctx context.Context, space did.DID, digest mh.Multihash) (io.ReadCloser, error) {
+	if br, ok := c.base.(BlobReader); ok {
+		return br.OpenBlob(ctx, space, digest)
+	}
+	return nil, ErrNotFound
+}
 
 // GetBlock returns the cached block if present, otherwise fetches it from the
-// base reader and caches it (subject to the byte budget).
-func (c *Cached) GetBlock(ctx context.Context, k cid.Cid) (block.Block, error) {
+// base reader and caches it (subject to the byte budget). The LRU is keyed by
+// CID only — blocks are content-addressed, so a hit is valid whatever space
+// originally fetched it.
+func (c *Cached) GetBlock(ctx context.Context, space did.DID, k cid.Cid) (block.Block, error) {
 	key := k.KeyString()
 	if blk, ok := c.get(key); ok {
 		return blk, nil
 	}
-	blk, err := c.base.GetBlock(ctx, k)
+	blk, err := c.base.GetBlock(ctx, space, k)
 	if err != nil {
 		return nil, err
 	}

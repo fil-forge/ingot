@@ -25,12 +25,12 @@ func (r *Postgres) NextSegmentSeq(ctx context.Context) (uint64, error) {
 	return seq, nil
 }
 
-func (r *Postgres) InsertSegmentOpen(ctx context.Context, plane blockstore.Plane, seq uint64) error {
+func (r *Postgres) InsertSegmentOpen(ctx context.Context, plane blockstore.Plane, seq uint64, bucket string) error {
 	_, err := r.pool.Exec(ctx,
-		`INSERT INTO ingot.segments (seq, plane, state, size_bytes)
-		 VALUES ($1, $2, 'open', 0)
+		`INSERT INTO ingot.segments (seq, plane, bucket, state, size_bytes)
+		 VALUES ($1, $2, $3, 'open', 0)
 		 ON CONFLICT (seq) DO NOTHING`,
-		int64(seq), plane.String())
+		int64(seq), plane.String(), bucket)
 	if err != nil {
 		return fmt.Errorf("registry: insert %s segment %d: %w", plane, seq, err)
 	}
@@ -68,19 +68,8 @@ func (r *Postgres) MarkSegmentSealed(ctx context.Context, plane blockstore.Plane
 }
 
 func (r *Postgres) MarkSegmentShipped(ctx context.Context, plane blockstore.Plane, seq uint64, shippedAt int64, opRoots []blockstore.OpRoot) error {
-	if plane == blockstore.PlaneData {
-		_, err := r.pool.Exec(ctx,
-			`UPDATE ingot.segments SET shipped_at = $2
-			 WHERE seq = $1 AND plane = 'data' AND shipped_at IS NULL`,
-			int64(seq), shippedAt)
-		if err != nil {
-			return fmt.Errorf("registry: mark data shipped %d: %w", seq, err)
-		}
-		return nil
-	}
-
-	// Catalog plane: stamp shipped_at AND advance forge_root_cid for every
-	// op-root in this segment, atomically.
+	// Only the catalog plane ships: stamp shipped_at AND advance forge_root_cid
+	// for every op-root in this segment, atomically.
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("registry: begin ship catalog %d: %w", seq, err)
@@ -103,16 +92,18 @@ func (r *Postgres) MarkSegmentShipped(ctx context.Context, plane blockstore.Plan
 	// order, and within a segment the slice order is commit order, so the
 	// last write for each bucket wins.
 	//
-	// TODO(frrist/ingot): the UPDATE below is unconditional on root_cid,
-	// which is incorrect when a writer's logstore.Commit succeeds but its
-	// subsequent registry.CASRoot fails. Gate on root_cid. Tracked
-	// separately.
+	// The advance is GUARDED on root_cid: forge_root_cid moves to opr.Root only
+	// if the bucket's committed root still equals opr.Root. This closes the
+	// orphan-root hole — a writer whose logstore.Commit landed an op-root but
+	// whose subsequent CASRoot failed (cross-process race) leaves a durable
+	// op-root the bucket never adopted; without the guard, shipping that
+	// segment would advance forge_root past the bucket's real root.
 	for _, opr := range opRoots {
 		if !opr.Root.Defined() {
 			continue
 		}
 		if _, err := tx.Exec(ctx,
-			`UPDATE ingot.buckets SET forge_root_cid = $1 WHERE name = $2`,
+			`UPDATE ingot.buckets SET forge_root_cid = $1 WHERE name = $2 AND root_cid = $1`,
 			opr.Root.Bytes(), opr.Bucket); err != nil {
 			return fmt.Errorf("registry: advance forge_root for %q: %w", opr.Bucket, err)
 		}
@@ -132,15 +123,15 @@ func (r *Postgres) DeleteSegment(ctx context.Context, plane blockstore.Plane, se
 	return nil
 }
 
-func (r *Postgres) ListSegments(ctx context.Context, plane blockstore.Plane) ([]logstore.SegmentMeta, error) {
+func (r *Postgres) ListSegments(ctx context.Context, plane blockstore.Plane, bucket string) ([]logstore.SegmentMeta, error) {
 	rows, err := r.pool.Query(ctx,
 		`SELECT seq, state, COALESCE(sealed_at, 0), size_bytes, sha256, COALESCE(shipped_at, 0)
 		   FROM ingot.segments
-		  WHERE plane = $1 AND state IN ('open', 'sealed')
+		  WHERE plane = $1 AND bucket = $2 AND state IN ('open', 'sealed')
 		  ORDER BY seq ASC`,
-		plane.String())
+		plane.String(), bucket)
 	if err != nil {
-		return nil, fmt.Errorf("registry: list %s segments: %w", plane, err)
+		return nil, fmt.Errorf("registry: list %s segments for %q: %w", plane, bucket, err)
 	}
 	defer rows.Close()
 
@@ -164,6 +155,7 @@ func (r *Postgres) ListSegments(ctx context.Context, plane blockstore.Plane) ([]
 		out = append(out, logstore.SegmentMeta{
 			Seq:       uint64(seqInt),
 			Plane:     plane,
+			Bucket:    bucket,
 			State:     state,
 			SealedAt:  sealed,
 			Size:      size,
@@ -190,6 +182,29 @@ func (r *Postgres) ListSegments(ctx context.Context, plane blockstore.Plane) ([]
 	return out, nil
 }
 
+func (r *Postgres) ListSegmentBuckets(ctx context.Context, plane blockstore.Plane) ([]string, error) {
+	rows, err := r.pool.Query(ctx,
+		`SELECT DISTINCT bucket FROM ingot.segments WHERE plane = $1 ORDER BY bucket ASC`,
+		plane.String())
+	if err != nil {
+		return nil, fmt.Errorf("registry: list %s segment buckets: %w", plane, err)
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var bucket string
+		if err := rows.Scan(&bucket); err != nil {
+			return nil, fmt.Errorf("registry: scan segment bucket: %w", err)
+		}
+		out = append(out, bucket)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("registry: list segment buckets rows: %w", err)
+	}
+	return out, nil
+}
+
 func (r *Postgres) RehydrateSegment(ctx context.Context, m logstore.SegmentMeta) error {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
@@ -203,9 +218,9 @@ func (r *Postgres) RehydrateSegment(ctx context.Context, m logstore.SegmentMeta)
 
 	if _, err := tx.Exec(ctx,
 		`INSERT INTO ingot.segments
-		   (seq, plane, state, sealed_at, size_bytes, sha256, shipped_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-		int64(m.Seq), m.Plane.String(), m.State.String(), nullableInt(m.SealedAt),
+		   (seq, plane, bucket, state, sealed_at, size_bytes, sha256, shipped_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		int64(m.Seq), m.Plane.String(), m.Bucket, m.State.String(), nullableInt(m.SealedAt),
 		m.Size, m.SHA256, nullableInt(m.ShippedAt)); err != nil {
 		return fmt.Errorf("registry: rehydrate insert %d: %w", m.Seq, err)
 	}

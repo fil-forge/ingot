@@ -43,18 +43,26 @@ package blockstore
 
 import (
 	"context"
+	"io"
 
+	"github.com/fil-forge/ucantone/did"
 	block "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
 	cbor "github.com/ipfs/go-ipld-cbor"
 	mh "github.com/multiformats/go-multihash"
 )
 
-// Reader fetches a CBOR-encoded value at c into out. Same shape as
-// cbor.IpldStore.Get; mst.LoadMST and any code path that walks the
-// MST without materializing it accept a Reader.
+// Reader fetches a CBOR-encoded value at c into out. mst.LoadMST and any
+// code path that walks the MST without materializing it accept a Reader.
+//
+// The read interfaces carry the Forge space the block belongs to (the
+// owning bucket's space DID), because the bottom read tier is the network:
+// blob locations are keyed by space and retrieval is authorized per space.
+// Local tiers (spool, log, staging) are content-addressed and ignore it;
+// did.Undef is acceptable where no network fallthrough can occur (harness,
+// standalone reads served locally).
 type Reader interface {
-	Get(ctx context.Context, c cid.Cid, out any) error
+	Get(ctx context.Context, space did.DID, c cid.Cid, out any) error
 }
 
 // Writer writes a CBOR-encoded value, returning its CID. Same shape
@@ -71,13 +79,12 @@ type Store interface {
 	Writer
 }
 
-// BlockReader fetches a raw block. Used by chunker.OpenBody for
-// streaming body chunks. Same shape as cbor.IpldBlockstore.Get but
-// renamed to GetBlock so a single type can expose both a CBOR-typed
-// Get (Reader) and a raw-block GetBlock without method-name
-// collision.
+// BlockReader fetches a raw block from the space's read tier. Renamed from
+// cbor.IpldBlockstore.Get to GetBlock so a single type can expose both a
+// CBOR-typed Get (Reader) and a raw-block GetBlock without method-name
+// collision. See Reader for the space parameter's semantics.
 type BlockReader interface {
-	GetBlock(ctx context.Context, c cid.Cid) (block.Block, error)
+	GetBlock(ctx context.Context, space did.DID, c cid.Cid) (block.Block, error)
 }
 
 // BlockWriter writes a raw block. Used by chunker.PutBody for body
@@ -87,12 +94,32 @@ type BlockWriter interface {
 	PutBlock(ctx context.Context, blk block.Block) error
 }
 
+// BlobReader streams a stored object-body blob by its digest, without holding
+// the whole blob in memory — the read counterpart to BlobWriter. Body blobs run
+// up to max_blob_size (256 MiB), so the body read path (chunker.OpenBody) streams
+// them rather than materializing each as a block.Block the way GetBlock would.
+// Returns ErrNotFound if the blob is not present in this tier. The caller owns
+// the returned reader and must Close it.
+type BlobReader interface {
+	OpenBlob(ctx context.Context, space did.DID, digest mh.Multihash) (io.ReadCloser, error)
+}
+
+// BlobWriter streams an object-body blob to local storage, computing its sha256
+// digest as it writes (never buffering the whole blob), and returns that digest
+// and the byte count. It copies r to EOF; an empty r stores nothing and returns
+// a nil digest with n == 0. Used by chunker.SplitBody on the PUT path.
+type BlobWriter interface {
+	WriteBlob(ctx context.Context, r io.Reader) (digest mh.Multihash, n int64, err error)
+}
+
 // ReadStore is the read-only seam the s3frontend.Backend uses for
-// both CBOR-decoded reads (manifest, MST nodes) and raw block reads
-// (body chunks). Layered is the production implementation.
+// CBOR-decoded reads (manifest, MST nodes), raw block reads (small
+// catalog blocks), and streaming body-blob reads (OpenBlob). Layered
+// is the production implementation.
 type ReadStore interface {
 	Reader
 	BlockReader
+	BlobReader
 }
 
 // WriteStore is the write seam a body codec uses: CBOR-typed Put
@@ -112,12 +139,30 @@ type WriteStore interface {
 // convention.
 type BaseStore = cbor.IpldBlockstore
 
-// CborStore wraps a BaseStore in a Store, fixing the multihash to
-// SHA2_256 so encoded blocks address-equal across the codebase.
-// Used by Layered to expose itself as a CBOR view, and by bucketop
-// to wrap an OpStaging into the per-tx CBOR view.
-func CborStore(bs BaseStore) Store {
+// CborStore wraps a BaseStore in a cbor.IpldStore, fixing the multihash to
+// SHA2_256 so encoded blocks address-equal across the codebase. Used by
+// Layered to expose itself as a CBOR view, and by bucketop to wrap an
+// OpStaging into the per-tx CBOR view.
+//
+// Note it returns the external cbor.IpldStore (space-less Get/Put), not this
+// package's Store: cbor-gen's interface is fixed, so the space is bound into
+// the BaseStore adapter handed in, not threaded per call. This is the one
+// boundary where the space rides on the value instead of the signature.
+func CborStore(bs BaseStore) cbor.IpldStore {
 	cst := cbor.NewCborStore(bs)
 	cst.DefaultMultihash = mh.SHA2_256
 	return cst
+}
+
+// SpacelessReader adapts a BaseStore into a Reader that ignores the space
+// parameter — for contexts where every block is already local and no network
+// fallthrough exists (CAR diffing, recovery over sealed segments, tests).
+func SpacelessReader(bs BaseStore) Reader {
+	return spacelessReader{CborStore(bs)}
+}
+
+type spacelessReader struct{ cst cbor.IpldStore }
+
+func (r spacelessReader) Get(ctx context.Context, _ did.DID, c cid.Cid, out any) error {
+	return r.cst.Get(ctx, c, out)
 }
