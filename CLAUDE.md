@@ -23,6 +23,7 @@ toolchain) and exists for cross-repo work; ingot is a standalone module:
 ```bash
 make build      # GOWORK=off go build ./...
 make test       # unit tests: GOWORK=off go test ./... (fast, no Docker)
+make dbtest     # live migration + registry SQL tests against a throwaway Postgres (Docker)
 make itest      # integration tests: boots the Forge stack in Docker (~6 min)
 make gen        # regenerate bucket/cbor_gen.go after changing bucket types
 GOWORK=off go vet ./...
@@ -33,13 +34,17 @@ GOWORK=off go build -o /tmp/ingot ./cmd/ingot               # the daemon binary
 **go directive: 1.25.7** (the indexing-service dep requires ≥ 1.25.7).
 
 **The test pattern — unit first, integration when you're ready to wait.**
-`make test` runs library/unit tests in seconds with no Docker. `make itest`
-runs `itest/` (build tag `itest`): it boots the full smelt Forge stack in
-Docker, mounts THIS working tree's binary over the published ingot image, and
-validates the real network path — including the curated S3 conformance
-partition (`itest/versity_*_test.go`); see `itest/README.md`. CI mirrors the
-same ordering: the `itest` job only runs after the unit job passes
-(`.github/workflows/go-test.yml`).
+`make test` runs library/unit tests in seconds with no Docker. `make dbtest`
+runs the DSN-gated live-Postgres tests (`migrations/up_live_test.go`,
+`registry/postgres_live_test.go`) against a throwaway `postgres:17` container:
+they skip silently under `make test`, so this is what catches a DDL error in a
+new migration before forge-mode startup. `make itest` runs `itest/` (build tag
+`itest`): it boots the full smelt Forge stack in Docker, mounts THIS working
+tree's binary over the published ingot image, and validates the real network
+path — including the curated S3 conformance partition
+(`itest/versity_*_test.go`); see `itest/README.md`. CI mirrors the same
+ordering: the `unit` and `dbtest` jobs run in parallel, and `itest` only runs
+after both pass (`.github/workflows/go-test.yml`).
 
 ## Dependency stack
 
@@ -163,12 +168,19 @@ proofs = file path or string-encoded UCAN container, optional).
 ## Testing
 
 There is no in-memory ingot: the deployment under test is always the real
-forge-mode daemon. Two tiers:
+forge-mode daemon. Three tiers:
 
 - **`make test` — unit** (seconds, no Docker): `module_test.go` (root),
   `logstore/store_test.go`, `blockstore/{cache,staging}_test.go`,
   `forgeclient/accounts_test.go`, `cmd/space_test.go`, plus library helpers in
   `testing/` (thin S3-client glue: `Config`/`NewS3Conf`, roundtrip helpers).
+- **`make dbtest` — live Postgres** (~1 min, Docker): the `-run Live` tests in
+  `migrations/` (Up applies + is idempotent, expected tables exist) and
+  `registry/` (the SQL-backed stores: jsonb, `bytea[]`, `ON CONFLICT`, the
+  latch's `RowsAffected` semantics). Gated on `INGOT_TEST_DSN`, so they *skip*
+  under `make test` — run `make dbtest` (or the CI `dbtest` job) after touching
+  `migrations/sql/` or `registry/`'s SQL. `cmd/serve_test.go`'s
+  `TestApp_GraphValidates` shares the same gate but is not part of `-run Live`.
 - **`make itest` — integration** (`itest/`, build tag `itest`, Docker):
   boots the smelt Forge stack with THIS working tree's binary mounted over
   the published image.

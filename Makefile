@@ -11,7 +11,12 @@ GO ?= go
 
 .DEFAULT_GOAL := build
 
-.PHONY: build test itest gen gen-check clean help
+.PHONY: build test dbtest itest gen gen-check clean help
+
+# DSN for the live Postgres suite (`make dbtest`). Override to point at an
+# existing database; the default matches the throwaway container below and the
+# DSN the CI dbtest job uses (.github/workflows/go-test.yml).
+INGOT_TEST_DSN ?= postgres://postgres:pw@127.0.0.1:55432/ingot
 
 ## build: compile the daemon binary (-> ./ingot)
 build:
@@ -20,6 +25,22 @@ build:
 ## test: run the unit test suite (fast, no Docker)
 test:
 	$(GO) test ./...
+
+## dbtest: run the live migration + registry tests against a throwaway Postgres (Docker)
+dbtest:
+	@docker rm -f ingot-dbtest >/dev/null 2>&1 || true
+	docker run -d --name ingot-dbtest \
+		-e POSTGRES_PASSWORD=pw -e POSTGRES_DB=ingot \
+		-p 55432:5432 postgres:17 >/dev/null
+	@echo "waiting for postgres…"
+	@for i in $$(seq 1 30); do \
+		docker exec ingot-dbtest pg_isready -U postgres >/dev/null 2>&1 && break; \
+		sleep 1; \
+	done
+	@INGOT_TEST_DSN="$(INGOT_TEST_DSN)" $(GO) test -count=1 -v -run Live ./registry/ ./migrations/; \
+	status=$$?; \
+	docker rm -f ingot-dbtest >/dev/null; \
+	exit $$status
 
 ## itest: run the integration test suite (boots the Forge stack in Docker; ~6 min)
 itest:
