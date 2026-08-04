@@ -13,7 +13,7 @@ require (
 	github.com/fil-forge/smelt v0.0.0-20260720130429-63116166a06c
 	github.com/fil-forge/ucantone v0.0.0-20260727203046-ccb77059de44
 	github.com/fil-forge/versitygw v0.0.0-20260716095011-7a65883d595a
-	github.com/gofiber/fiber/v3 v3.3.0
+	github.com/gofiber/fiber/v3 v3.4.0
 	github.com/ipfs/go-block-format v0.2.4
 	github.com/ipfs/go-cid v0.6.2
 	github.com/ipfs/go-ipld-cbor v0.3.0
