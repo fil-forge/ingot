@@ -21,7 +21,7 @@ architecture.
 toolchain) and exists for cross-repo work; ingot is a standalone module:
 
 ```bash
-make build      # GOWORK=off go build ./...
+make build      # the daemon binary: GOWORK=off go build -o ingot ./cmd/ingot
 make test       # unit tests: GOWORK=off go test ./... (fast, no Docker)
 make dbtest     # live migration + registry SQL tests against a throwaway Postgres (Docker)
 make itest      # integration tests: boots the Forge stack in Docker (~6 min)

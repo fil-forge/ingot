@@ -33,11 +33,21 @@ dbtest:
 		-e POSTGRES_PASSWORD=pw -e POSTGRES_DB=ingot \
 		-p 55432:5432 postgres:17 >/dev/null
 	@echo "waiting for postgres…"
-	@for i in $$(seq 1 30); do \
-		docker exec ingot-dbtest pg_isready -U postgres >/dev/null 2>&1 && break; \
+	@ready=0; \
+	for i in $$(seq 1 30); do \
+		if docker exec ingot-dbtest pg_isready -U postgres >/dev/null 2>&1; then ready=1; break; fi; \
 		sleep 1; \
-	done
-	@INGOT_TEST_DSN="$(INGOT_TEST_DSN)" $(GO) test -count=1 -v -run Live ./registry/ ./migrations/; \
+	done; \
+	if [ "$$ready" -ne 1 ]; then \
+		echo "postgres did not become ready within 30s; container logs:"; \
+		docker logs ingot-dbtest 2>&1 | tail -50; \
+		docker rm -f ingot-dbtest >/dev/null; \
+		exit 1; \
+	fi
+	@# -p 1: both packages run migrations.Up against the same database, so their
+	@# test binaries must not run concurrently (goose's goose_db_version bootstrap
+	@# races itself). Same reason as the CI dbtest job.
+	@INGOT_TEST_DSN="$(INGOT_TEST_DSN)" $(GO) test -count=1 -p 1 -v -run Live ./registry/ ./migrations/; \
 	status=$$?; \
 	docker rm -f ingot-dbtest >/dev/null; \
 	exit $$status

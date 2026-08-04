@@ -63,10 +63,14 @@ jobs:
           go-version-file: go.mod
 
       - name: Run the live migration + registry tests
+        # -p 1: both packages call migrations.Up against the same database, and
+        # go test would otherwise run their binaries concurrently — goose's
+        # bootstrap of ingot.goose_db_version then races itself and one side
+        # fails on pg_type_typname_nsp_index. Serialize the packages.
         env:
           GOWORK: off
           INGOT_TEST_DSN: postgres://postgres:pw@127.0.0.1:55432/ingot
-        run: go test -count=1 -v -run Live ./registry/ ./migrations/
+        run: go test -count=1 -p 1 -v -run Live ./registry/ ./migrations/
 
   itest:
     needs: [unit, dbtest]
