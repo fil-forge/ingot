@@ -13,8 +13,6 @@ require (
 	github.com/fil-forge/smelt v0.0.0-20260720130429-63116166a06c
 	github.com/fil-forge/ucantone v0.0.0-20260727203046-ccb77059de44
 	github.com/fil-forge/versitygw v0.0.0-20260716095011-7a65883d595a
-	github.com/fxamacker/cbor/v2 v2.9.2
-	github.com/go-jose/go-jose/v4 v4.1.4
 	github.com/gofiber/fiber/v3 v3.3.0
 	github.com/ipfs/go-block-format v0.2.4
 	github.com/ipfs/go-cid v0.6.2
@@ -215,7 +213,6 @@ require (
 	github.com/tonistiigi/units v0.0.0-20180711220420-6950e57a87ea // indirect
 	github.com/tonistiigi/vt100 v0.0.0-20240514184818-90bafcd6abab // indirect
 	github.com/valyala/bytebufferpool v1.0.0 // indirect
-	github.com/x448/float16 v0.8.4 // indirect
 	github.com/xhit/go-str2duration/v2 v2.1.0 // indirect
 	github.com/yusufpapurcu/wmi v1.2.4 // indirect
 	github.com/zeebo/xxh3 v1.1.0 // indirect
