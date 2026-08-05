@@ -1,57 +1,48 @@
-# S3 versioning — the per-key version-tree design
+# S3 versioning in Ingot
 
-Implementation spec for S3 bucket versioning in Ingot. It supersedes the *versioned key
-encoding (`invertedVersionId`)* section of [`architecture.md` §3](./architecture.md#3-the-s3-layer):
-the composite-key scheme (escape + `TERM` + inverted hex ordinal) is **dropped** in favor of the
-per-key version-tree leaf proposed in review
-([PR #2, r3440362078](https://github.com/fil-forge/ingot/pull/2/changes#r3440362078), Hannah
-building on Peeja's leaf idea). Everything else in `architecture.md` — the write path, the
-reference index, the catalog plane — stands and is extended, not replaced, by this doc.
+Implementation spec for S3 bucket versioning: version identity, the storage layout, writes,
+reads, deletes, lists, and reference counting. It builds on
+[`architecture.md`](./architecture.md), which specifies the write path, the reference index,
+and the catalog plane this doc uses.
 
 ---
 
-## 1. Why the composite key lost
+## 1. How versioning works
 
-The composite-key design derived the client `versionId` from the per-bucket ordinal
-(`invertedVersionId`) — one value doing two jobs. S3 keeps those jobs separate, and the **null
-version** is where collapsing them breaks:
+Each bucket is one MST mapping **plain S3 object keys** to values; the value stored under a key
+is its **`ObjectLeaf`** (§2.1), a small block that carries the key's current version inline
+and, once the key has noncurrent versions, the root of a second per-key MST (the **prev tree**,
+§2.2) that stores them. Both trees use the same forked `mst` package, the same space, and the
+same blockstore; every node is an ordinary catalog-plane block, and nesting stops at two
+levels. A key with a single version has no prev tree, so a bucket that never versions stores
+one leaf per key and nothing more.
 
-- **`seq`** — a per-bucket monotonic ordinal. Its only job is *ordering* (recency). Internal;
-  never leaves the server.
-- **`version_id`** — a string, the S3 client handle (`x-amz-version-id`). Its job is *identity*.
-  It is opaque, and for suspended/unversioned writes it is the literal string `"null"`.
+Every version carries two identifiers with separate jobs:
 
-For numbered versions the two can coincide. They diverge for the null version: its `version_id`
-is frozen at `"null"` by S3, but it still has a real position in the ordering (a `seq`). There is
-only ever **one** null version per key, replaced in place — and it can sit anywhere in the
-version stack (a bucket that was written unversioned, then Enabled, holds its null version *under*
-newer numbered versions). An encoding that derives the id from the ordinal has to special-case all
-of that; keeping `seq` and `version_id` as separate fields makes it fall out.
+- **`seq`** — a per-bucket ordinal, allocated once per write inside the bucket's commit
+  critical section (§5.1). It orders a key's versions by recency and never leaves the server.
+- **`version_id`** — the client handle (`x-amz-version-id`). On an Enabled bucket it is a ULID
+  token whose low 64 entropy bits hold the seq (§3), so the id itself says where the version
+  sits. On a Suspended or unversioned bucket, S3 fixes the id to the literal string `"null"`.
 
-Dropping the composite key also deletes its costs: no `0x01` escaping, no terminator, no
-key-budget pressure — **`mst.MaxKeyBytes` stays 1024** and the top-level MST keys remain plain S3
-object keys.
+A key holds at most one **null version**; later null writes replace it in place. It can sit
+anywhere in the version stack: a bucket written unversioned and then Enabled keeps its null
+version where it is while numbered versions stack above it. Because the id `"null"` carries no
+seq, the leaf records a noncurrent null version's position in its `NullSeq` field.
 
----
+**Writes** (§5). Every version-creating request (PUT, CopyObject, CompleteMultipartUpload,
+delete-marker insertion) allocates the next seq and installs the new version as the leaf's
+current. On an Enabled bucket the displaced current version moves into the prev tree under its
+seq; the move transfers the manifest's CID, and the manifest itself is never rewritten. On a
+Suspended or unversioned bucket the write is a null write and replaces the existing null
+version. A DELETE without a version id writes a **delete marker**: a version with no body that
+makes the key read as absent. A DELETE naming a version id permanently removes that one
+version, wherever it sits (§7).
 
-## 2. Data model
-
-### 2.0 How a lookup works
-
-Three facts carry the design:
-
-1. **The top-level bucket MST still maps plain object keys.** The value now points at a small
-   per-key `ObjectLeaf` block (§2.1) instead of pointing straight at an `ObjectManifest`.
-2. **The leaf holds the current version inline.** A plain GET, HEAD, or list reads the leaf and
-   is done: one block more than today, and history is never touched. Only when a key has
-   noncurrent versions does the leaf also carry the root of a second, per-key MST that holds
-   them (§2.2, the prev tree).
-3. **A numbered version id carries its own position.** The id is a ULID token whose low 64
-   entropy bits hold the version's `seq` (§3). Parsing the token recovers the seq, and the seq
-   is the lookup key in the prev tree.
-
-Take one read end to end: `GET photos/cat.jpg?versionId=<token>`, against a key holding
-versions with seqs 9 (current), 7, 4, and 2, where the token names seq 7:
+**Reads** (§6). A GET or HEAD without a version id reads the leaf and serves the inline
+current version; the prev tree is never touched. A version-scoped read composes these pieces.
+Take `GET photos/cat.jpg?versionId=<token>` against a key holding versions with seqs 9
+(current), 7, 4, and 2, where the token names seq 7:
 
 1. Read the key's leaf from the top MST.
 2. Parse the token; its low 64 bits give 7.
@@ -66,15 +57,27 @@ versions with seqs 9 (current), 7, 4, and 2, where the token names seq 7:
    read returns `NoSuchVersion` instead of serving a version the caller never asked for.
 5. Serve the body through the same manifest-to-blobs path a current read uses.
 
-`versionId=null` is the one token that carries no position, because S3 fixes the null version's
-id to the literal string `"null"` (§1). The leaf's `NullSeq` field answers exactly that lookup:
-it names the null version's prev-tree slot while the null version is noncurrent (§6.1 has the
-full resolution rules).
+`versionId=null` resolves from the leaf alone: the current version when its id is `"null"`,
+else the prev entry named by `NullSeq` (§6.1).
+
+**Lists** (§9). `ListObjects`/`ListObjectsV2` read each key's current version off its leaf and
+skip keys whose current version is a delete marker. `ListObjectVersions` walks keys in
+lexicographic order and, within a key, emits the current version and then the prev tree, which
+iterates newest-first because its keys are inverted seqs.
+
+**Space** (§8). Each version claims its body digests in `blob_refs`. Removing a version
+releases only that version's claims, and the physical bytes go only when the last claim goes,
+so deduplicated data survives partial deletes by construction.
+
+---
+
+## 2. Data model
 
 ### 2.1 The leaf
 
-The top-level (per-bucket) MST continues to map **plain object keys** to CIDs. The value changes:
-it now points at an **`ObjectLeaf`** block instead of directly at an `ObjectManifest`.
+The top-level (per-bucket) MST maps **plain object keys** to CIDs; the value under a key is its
+**`ObjectLeaf`** block. S3 caps object-key names at 1024 bytes, which is exactly
+`mst.MaxKeyBytes`, so keys are stored as-is.
 
 ```go
 // bucket/leaf.go (new; cborgen via gen/main.go, same style as ObjectManifest)
@@ -126,8 +129,7 @@ blockstore — its nodes are ordinary catalog-plane blocks):
 - **key** — `revSeqKey(seq)`: fixed-width 16-char lowercase hex of `math.MaxUint64 − seq`.
   Because the MST iterates forward-only (`mst.go:835 WalkLeavesFrom`), the inversion makes
   iteration **newest-first**. Scoped to one object key, the key is *just an integer rendered
-  order-preservingly* — no composite-string escaping. Valid under `mst.IsValidKey` (hex is
-  UTF-8, NUL-free, short).
+  order-preservingly*, valid under `mst.IsValidKey` (hex is UTF-8, NUL-free, short).
 - **value** — the version's `ObjectManifest` CID and nothing else: a prev entry stores no
   `VersionNode`. For these entries the seq is recoverable from the MST key, and the version id
   lives only in the manifest (§2.3). That costs nothing in practice, because every consumer of
@@ -169,7 +171,7 @@ must also register `ObjectLeaf` and `VersionNode`).
 3. **`Prev` holds exactly the noncurrent versions**, keyed newest-first.
 4. **`seq` is strictly increasing in commit order per bucket.** Allocation happens inside the
    per-bucket critical section (§5.1); in-process the `bucketop` mutex serializes it, and the
-   existing `CASRoot` conflict behavior covers cross-process races exactly as it does today.
+   `CASRoot` conflict behavior covers cross-process races.
    `seq` starts at 1; 0 is reserved to mean "none" (`NullSeq`).
 5. **A version's identity never changes.** `Seq`/`VersionID` are minted once at commit; promotion
    moves a `VersionNode` between `Prev` and `Current` without rewriting its manifest.
@@ -201,8 +203,9 @@ This matches the versitygw conformance grammar exactly: `"invalid_version_id"` /
 `"../../secret.txt"` → `InvalidArgument`; well-formed-but-unknown `"01G65Z755AFWAKHE12NY0CQ9FH"` →
 `404 NoSuchVersion`.
 
-The direct-locator trade-off (ids leak ordering/write volume) was already accepted in
-`architecture.md` §3 and carries over unchanged.
+Embedding the seq makes tokens readable: anyone holding a bucket's version ids can recover
+write order and estimate write volume. S3 defines version ids as opaque, so no client contract
+depends on hiding this; the exposure is operational and accepted.
 
 ---
 
@@ -306,7 +309,7 @@ write leaf block; splice top MST at objectKey; return new root
 | Enabled | numbered or null | push to prev (a re-Enabled bucket keeps its null as a noncurrent `"null"`) |
 | Suspended | numbered | push to prev |
 | Suspended | null | discard — replace the null in place |
-| Unversioned | null | discard (today's overwrite-in-place, now via the same rule) |
+| Unversioned | null | discard — replace the null in place |
 
 `prev` is written only when history is retained — never for a purely-unversioned bucket (its
 leaves stay `{Current, nil, 0}`), always for Enabled, and only across the numbered→null boundary
@@ -317,15 +320,16 @@ New-key writes skip displacement entirely: `leaf = {Current: new, Prev: nil, Nul
 ### 5.3 Cost
 
 An Enabled overwrite adds a prev-tree insert (O(log versions-of-key) new nodes) plus the leaf
-block on top of today's splice — more catalog blocks per write, but scoped to keys actually
-accumulating versions. Reads are one extra block (the leaf) over today. All new blocks flow
+block on top of the top-MST splice every write performs: more catalog blocks per write, scoped
+to keys actually accumulating versions. A read costs one extra block (the leaf) between the
+top MST and the manifest. All new blocks flow
 through the existing `OpStaging` → catalog plane; a mutation still ships only the blocks it
 created. Superseded leaf/prev/MST nodes join `gc_candidates` under the existing (write-only)
 policy.
 
-One rebuild note from review, confirmed against the tree: recovery does not depend on walking
-history via `forge_root_cid` alone — `logstore` journals per-op roots and every created block, so
-prev-tree state is recoverable the same way the top MST is today.
+Recovery does not depend on walking history via `forge_root_cid` alone: `logstore` journals
+per-op roots and every created block, so prev-tree state is recoverable the same way the top
+MST is.
 
 ---
 
@@ -382,7 +386,7 @@ rows stay out of scope with it.
 
 | state | behavior |
 |---|---|
-| unversioned | today's permanent delete (object.go:607 `deleteObjectKey`): drop the leaf, release claims. No marker, no version headers. |
+| unversioned | permanent delete (object.go:607 `deleteObjectKey`): drop the leaf, release claims. No marker, no version headers. |
 | enabled | insert a **numbered delete marker** via the write rule (§5). This happens **even if the key does not exist** (S3 semantics; `Versioning_DeleteObject_non_existing_object` deletes a nonexistent key and succeeds) — the leaf is created with the marker as `Current`. Response: `DeleteMarker: true`, `VersionId: <marker token>`. |
 | suspended | insert a **null delete marker** via the write rule — as a null write it replaces the existing null (current) or evicts a prev null, per §5.2; repeatable idempotently (`Versioning_DeleteObject_suspended` runs it five times). Response: `DeleteMarker: true`, `VersionId: "null"`. |
 
@@ -420,9 +424,9 @@ at object.go:689-704 currently drops it). Per-entry results populate `types.Dele
 
 ## 8. The reference index
 
-`blob_refs` rows finally carry real version ids — the `registry.NullVersionID` sentinel at
-object.go:336/:345 is replaced by each version's `VersionID` (`"null"` remains the id of null
-versions, so unversioned buckets produce today's rows unchanged). The interfaces already carry
+`blob_refs` rows carry each version's id: the `registry.NullVersionID` sentinel at
+object.go:336/:345 is replaced by each version's `VersionID` (null versions carry the id
+`"null"`, so rows for unversioned buckets keep that id). The interfaces already carry
 `versionID` everywhere (`registry.BlobRefStore`, stores.go:114-120); no schema or interface
 change.
 
@@ -433,12 +437,11 @@ Rules, preserving the commit-then-reconcile ordering (reconcile strictly after a
   displaced versions keep their rows untouched — under Enabled, an overwrite **releases nothing**.
 - **Discarded versions** (§5.2 discards, §7.2 removals, unversioned overwrite/delete) →
   `DeleteBlobClaim` per digest with the *discarded* version's id; `CountClaims == 0` →
-  `RemoveBlob`, exactly as today. The evicted-prev-null case fetches the evicted manifest during
+  `RemoveBlob`. The evicted-prev-null case fetches the evicted manifest during
   the commit to learn its digests.
 - **Same-id replacement** (null replacing null — the only case where new and discarded share a
   `(bucket, key, version_id)` row key) → the existing set-diff `reconcileClaims`
-  (object.go:327) so unchanged digests are never dropped-then-re-added. This is today's
-  unversioned overwrite path, unchanged.
+  (object.go:327) so unchanged digests are never dropped-then-re-added.
 - **Delete markers** have no digests: no claims in, none out.
 
 Dedup interactions stay safe by construction: N versions referencing one digest are N rows; the
@@ -466,8 +469,8 @@ The walk composes the top-MST key walk with the per-key newest-first version seq
   LastModified}`. Both land in one interleaved logical stream (newest-first per key, keys in
   lexicographic order) and are split into the `Versions` / `DeleteMarkers` arrays for the
   response. `IsLatest` is true exactly for `Current` nodes. Rendering fetches each version's
-  manifest; the review's optional "lift ETag/size/mtime into the leaf" denormalization is
-  deliberately deferred to keep the base shape minimal.
+  manifest. Copying ETag/size/mtime into the leaf would save those fetches; the leaf stays
+  minimal until list volume justifies the extra bytes.
 - **Pagination.** `MaxKeys` (default 1000) counts versions + markers combined. On truncation:
   `NextKeyMarker`/`NextVersionIdMarker` = the last emitted entry's key/id, `IsTruncated: true`
   (pinned by `ListObjectVersions_multiple_object_versions_truncated`). Resumption: with both
@@ -484,19 +487,14 @@ The walk composes the top-MST key walk with the per-key newest-first version seq
 
 ## 10. Compatibility & migration
 
-**This is a catalog format break**: top-MST values become `ObjectLeaf` CIDs where they were
-`ObjectManifest` CIDs. Per the repo's dev-only data posture (CLAUDE.md: "reshape migrations in
-place and reset any persistent dev DB"), there is **no migration**: existing dev buckets are
-reset. Implementations must **not** attempt to type-sniff old values at read time — cbor-gen's
-map decoders skip unknown fields and zero-fill missing ones, so decoding an old manifest block as
-an `ObjectLeaf` *succeeds* with garbage. The format change is declared, not detected.
+Buckets written before versioning store `ObjectManifest` CIDs as top-MST values; this design
+stores `ObjectLeaf` CIDs. Per the repo's dev-only data posture (CLAUDE.md: "reshape migrations
+in place and reset any persistent dev DB"), there is **no migration**: existing dev buckets are
+reset. Readers must **not** type-sniff values: cbor-gen's map decoders skip unknown fields and
+zero-fill missing ones, so decoding a manifest block as an `ObjectLeaf` *succeeds* and yields
+garbage. The deployment declares the format; nothing detects it from bytes.
 
-Also explicitly retired from `architecture.md` §3: the escape/`TERM` encoding, the
-`invertedVersionId` hex token, the "raise `MaxKeyBytes` to ~1056" question (moot — top-level keys
-are unchanged), and the "composite key vs per-key index" open decision (resolved: per-key index,
-this design). A follow-up architecture.md edit should point §3 at this doc.
-
-Out of scope, unchanged: object tagging, object lock / retention / legal hold, `UploadPartCopy`,
+Out of scope: object tagging, object lock / retention / legal hold, `UploadPartCopy`,
 `ListParts`/`ListMultipartUploads`, `GetObjectAttributes`, MFA delete, lifecycle expiration, and
 multi-instance seq arbitration beyond the existing `CASRoot` conflict surface.
 
@@ -516,4 +514,4 @@ multi-instance seq arbitration beyond the existing `CASRoot` conflict surface.
 | `s3frontend/conditions.go` | `currentObjectETag` via the leaf's current |
 | unit tests | token codec + classification; write-rule table tests (all four displacement rows + null eviction + non-existent-key marker); promotion; per-version claim add/release on the `refindex_test.go` harness; list pagination |
 | `itest/versity_versioning_test.go` (new) + `versity_test.go` categories | curate upstream `TestVersioning` / `ListObjectVersions_*` / `GetBucketVersioning_*` / `PutBucketVersioning_*` rows into pass/xfail tables (tagging, object-lock, `GetObjectAttributes`, `UploadPartCopy` rows → xfail/omitted; note the teardown-blocked caveat, itest/README.md:40-47) |
-| `docs/architecture.md` | §3 versioned-key-encoding block → superseded pointer to this doc |
+| `docs/architecture.md` | point §3 at this doc for versioning |
