@@ -186,7 +186,8 @@ in the module graph through versitygw):
 - **mint** — `timestamp` = commit wall-clock (ms, ULID's 48-bit field); `entropy` (80 bits) =
   16 zero bits ++ big-endian 64-bit `seq`. Uniqueness within a bucket is guaranteed by `seq`
   alone; the timestamp is cosmetic (AWS-shaped ids, mtime hints for operators).
-- **parse** — `ulid.Parse(token)`; candidate `seq` = the low 64 bits of the entropy field. The
+- **parse** — `ulid.ParseStrict(token)` (strict, so near-ULID garbage outside the Crockford
+  character set is malformed, never a lookup); candidate `seq` = the low 64 bits of the entropy field. The
   candidate is only a *locator hint*: resolution (§6.1) must confirm the stored
   `VersionID == token` before treating the version as found (a foreign ULID whose low bits
   collide must not resolve).
@@ -196,7 +197,7 @@ in the module graph through versitygw):
 |---|---|
 | absent / `""` | current version |
 | `"null"` | the null version (§6.1) |
-| `ulid.Parse` succeeds | numbered version; resolve by seq + verify token |
+| `ulid.ParseStrict` succeeds | numbered version; resolve by seq + verify token |
 | anything else | `400` — `s3err.GetInvalidArgumentErr(s3err.InvalidArgVersionId, input)` |
 
 This matches the versitygw conformance grammar exactly: `"invalid_version_id"` /
@@ -324,8 +325,9 @@ block on top of the top-MST splice every write performs: more catalog blocks per
 to keys actually accumulating versions. A read costs one extra block (the leaf) between the
 top MST and the manifest. All new blocks flow
 through the existing `OpStaging` → catalog plane; a mutation still ships only the blocks it
-created. Superseded leaf/prev/MST nodes join `gc_candidates` under the existing (write-only)
-policy.
+created. Discarded and evicted manifests and superseded leaf blocks join `gc_candidates` under
+the existing (write-only) policy; superseded MST interior nodes (top tree and prev tree alike)
+are not tracked, matching the top MST's practice.
 
 Recovery does not depend on walking history via `forge_root_cid` alone: `logstore` journals
 per-op roots and every created block, so prev-tree state is recoverable the same way the top
@@ -337,7 +339,7 @@ MST is.
 
 ### 6.1 Resolution
 
-`lookupManifest` (object.go:924) becomes version-aware — `resolveVersion(ctx, state, key,
+Every versionId-taking read resolves through one helper, `resolveVersion(ctx, state, key,
 versionId)` → `(leaf, VersionNode, *ObjectManifest, error)`:
 
 ```
@@ -372,8 +374,8 @@ current reads — noncurrent manifests still pin their digests, and `blob_refs` 
 `CopyObject` source resolution goes through the same helper (the copy-source versionId comes from
 the parsed `CopySource`); `CopySourceVersionId` is set on the output for versioned source buckets.
 Copying *from* a marker: without a versionId the current-marker case is `404 NoSuchKey`; naming a
-marker's versionId is `400 InvalidRequest`. Conditional requests (`If-Match` etc.) keep evaluating
-against the resolved **current** version, including the at-commit re-check — unchanged.
+marker's versionId is `400 InvalidRequest`. Conditional requests (`If-Match` etc.) evaluate
+against the resolved **current** version, including the at-commit re-check.
 
 `GetObjectAttributes` remains unimplemented (`ErrNotImplemented`); its versioning conformance
 rows stay out of scope with it.
@@ -395,7 +397,10 @@ rows stay out of scope with it.
 Permanent removal of one specific version (any state):
 
 ```
-classify (§3): malformed → InvalidArgument; resolve (§6.1): miss → NoSuchVersion
+classify (§3): malformed → InvalidArgument
+resolve (§6.1): miss (unknown key, or no such version) → success no-op — S3 deletes are
+                idempotent (Versioning_DeleteObject_non_existing_objects); the response
+                echoes the requested id. (GET/HEAD keep returning NoSuchVersion, §6.2.)
 
 if target == leaf.Current:
     if prev empty: delete the leaf from the top MST
@@ -411,14 +416,21 @@ else:
 
 After commit: release the removed version's claims (§8) — unless it was a marker (no digests).
 Response: `VersionId` = the requested id; `DeleteMarker: true` iff the removed version was a
-marker (`Versioning_DeleteObject_delete_a_delete_marker` asserts both fields).
+marker (`Versioning_DeleteObject_delete_a_delete_marker` asserts both fields); a no-op miss
+echoes the id with no marker flag.
 
 ### 7.3 `DeleteObjects`
 
 Each entry dispatches to §7.1 or §7.2 by the presence of `ObjectIdentifier.VersionId` (the loop
 at object.go:689-704 currently drops it). Per-entry results populate `types.DeletedObject`
 (`DeleteMarker`, `DeleteMarkerVersionId`, `VersionId`); per-entry errors (e.g.
-`InvalidArgVersionId`) go to the error list. Batch cap and Quiet mode unchanged; still not atomic.
+`InvalidArgVersionId`) go to the error list. Batch cap and Quiet mode follow the plain-delete
+semantics; the batch is not atomic.
+
+`DeleteBucket` on a versioned bucket that still holds versions or markers fails with
+`VersionedBucketNotEmpty` (`Versioning_DeleteBucket_not_empty`). Delete preconditions (the
+`If-Match` family) apply to marker insertion, evaluated against the displaced current version,
+and to version-scoped deletes, evaluated against the target version.
 
 ---
 
@@ -453,10 +465,12 @@ physical `RemoveBlob` fires only when the last row for `(space, digest)` goes.
 
 ### 9.1 `ListObjects` / `ListObjectsV2`
 
-`listWalk` (object.go:849) reads each leaf's `Current`, fetches its manifest (it already fetches
-manifests for ETag/size), and **skips keys whose current version is a delete marker** — they
-don't count toward `MaxKeys` and don't produce entries. Everything else (prefix, delimiter,
-markers, truncation) is unchanged; one head per key, no descent into `Prev`.
+`listWalk` (object.go:849) reads each leaf's `Current`, fetches its manifest (needed anyway for
+ETag/size), and **skips keys whose current version is a delete marker** — they don't count
+toward `MaxKeys`, don't produce entries, and don't seed a `CommonPrefix`. Prefix, delimiter,
+markers, and truncation keep their usual semantics; the walk costs one leaf and one manifest
+per key, with no descent into `Prev`. The manifest fetch applies even to keys a delimiter rolls
+into a `CommonPrefix`: a prefix whose keys all sit under delete markers must not appear.
 
 ### 9.2 `ListObjectVersions` (new; interface at versitygw backend.go:78)
 
@@ -476,7 +490,8 @@ The walk composes the top-MST key walk with the per-key newest-first version seq
   (pinned by `ListObjectVersions_multiple_object_versions_truncated`). Resumption: with both
   markers, seek the top MST to `KeyMarker`, seek within its version sequence strictly past
   `VersionIdMarker` (its seq gives a direct prev-tree seek), then continue; with only
-  `KeyMarker`, start at the first key strictly greater.
+  `KeyMarker`, start at the first key strictly greater. A `version-id-marker` needs a
+  `key-marker` and must classify (§3); violations → `InvalidArgument`.
 - **Prefix / delimiter** — same grouping semantics as `listWalk` V1; all versions of keys rolled
   into a `CommonPrefix` are subsumed by it.
 - **Unversioned buckets** list every key's single null version (`VersionId: "null"`,
@@ -508,10 +523,11 @@ multi-instance seq arbitration beyond the existing `CASRoot` conflict surface.
 | `bucket/manifest.go` | `Seq`, `VersionID` fields (§2.3) |
 | `registry/registry.go`, `postgres.go`, `inmem/store.go` | `State.Versioning`, `VersioningState`, `SetVersioning`, `AllocVersionSeq` (§4.1) |
 | `s3frontend/version.go` (new) | token mint/parse/classify (§3), `revSeqKey`, `resolveVersion` (§6.1), the write rule (§5.2), prev-tree helpers |
-| `s3frontend/object.go` | `PutObject` splice → write rule; `lookupManifest` → `resolveVersion`; `GetObject`/`HeadObject` versionId + marker semantics + output ids; `DeleteObject`/`deleteObjectKey`/`DeleteObjects` (§7); `reconcileClaims` call sites carry real version ids (§8); `listWalk` marker skip (§9.1) |
+| `s3frontend/object.go` | `PutObject` splice → write rule; reads resolve via `resolveVersion`; `GetObject`/`HeadObject` versionId + marker semantics + output ids; `DeleteObject`/`deleteObjectKey`/`DeleteObjects` (§7); `reconcileClaims` call sites carry real version ids (§8); `listWalk` marker skip (§9.1) |
 | `s3frontend/copy.go`, `multipart.go` | `commitManifest` → write rule; source-version resolution; `CopySourceVersionId`; Complete's `versionid` return |
-| `s3frontend/bucket.go` | `PutBucketVersioning` (new), `GetBucketVersioning` (real states), `ListObjectVersions` (§9.2) |
-| `s3frontend/conditions.go` | `currentObjectETag` via the leaf's current |
+| `s3frontend/bucket.go` | `PutBucketVersioning` (new), `GetBucketVersioning` (real states), versioned `DeleteBucket` guard (§7) |
+| `s3frontend/listversions.go` (new) | `ListObjectVersions` (§9.2) |
+| `s3frontend/conditions.go` | `currentObjectETag` resolves the current version via `resolveVersion` |
 | unit tests | token codec + classification; write-rule table tests (all four displacement rows + null eviction + non-existent-key marker); promotion; per-version claim add/release on the `refindex_test.go` harness; list pagination |
 | `itest/versity_versioning_test.go` (new) + `versity_test.go` categories | curate upstream `TestVersioning` / `ListObjectVersions_*` / `GetBucketVersioning_*` / `PutBucketVersioning_*` rows into pass/xfail tables (tagging, object-lock, `GetObjectAttributes`, `UploadPartCopy` rows → xfail/omitted; note the teardown-blocked caveat, itest/README.md:40-47) |
 | `docs/architecture.md` | point §3 at this doc for versioning |
