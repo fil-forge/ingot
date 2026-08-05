@@ -36,6 +36,41 @@ object keys.
 
 ## 2. Data model
 
+### 2.0 How a lookup works
+
+Three facts carry the design:
+
+1. **The top-level bucket MST still maps plain object keys.** The value now points at a small
+   per-key `ObjectLeaf` block (§2.1) instead of pointing straight at an `ObjectManifest`.
+2. **The leaf holds the current version inline.** A plain GET, HEAD, or list reads the leaf and
+   is done: one block more than today, and history is never touched. Only when a key has
+   noncurrent versions does the leaf also carry the root of a second, per-key MST that holds
+   them (§2.2, the prev tree).
+3. **A numbered version id carries its own position.** The id is a ULID token whose low 64
+   entropy bits hold the version's `seq` (§3). Parsing the token recovers the seq, and the seq
+   is the lookup key in the prev tree.
+
+Take one read end to end: `GET photos/cat.jpg?versionId=<token>`, against a key holding
+versions with seqs 9 (current), 7, 4, and 2, where the token names seq 7:
+
+1. Read the key's leaf from the top MST.
+2. Parse the token; its low 64 bits give 7.
+3. `Current.Seq` is 9, so seek the prev tree directly: `prev.Get(revSeqKey(7))`. The seek is
+   O(log n); nothing is scanned.
+4. Fetch the manifest that entry points at and confirm its stored `VersionID` equals the token
+   (§6.1). This guard exists because step 2 trusts nothing: any well-formed ULID parses, so a
+   client can send a token this bucket never minted (an id copied from another bucket, or
+   fabricated) whose low 64 bits nonetheless equal the seq of a real version of this key. Step
+   3 would then land on that version even though the token does not name it. Comparing the full
+   26-character token against the manifest's stored `VersionID` catches the mismatch, and the
+   read returns `NoSuchVersion` instead of serving a version the caller never asked for.
+5. Serve the body through the same manifest-to-blobs path a current read uses.
+
+`versionId=null` is the one token that carries no position, because S3 fixes the null version's
+id to the literal string `"null"` (§1). The leaf's `NullSeq` field answers exactly that lookup:
+it names the null version's prev-tree slot while the null version is noncurrent (§6.1 has the
+full resolution rules).
+
 ### 2.1 The leaf
 
 The top-level (per-bucket) MST continues to map **plain object keys** to CIDs. The value changes:
@@ -69,6 +104,20 @@ type ObjectLeaf struct {
 }
 ```
 
+**Why `VersionNode` repeats `Seq` and `VersionID` when the manifest also stores them (§2.3):**
+the copies let the leaf answer questions without fetching a manifest. The write rule decides
+whether a displaced current version is retained or discarded by reading `displaced.VersionID`
+(§5.2), and resolution short-circuits on `Current.Seq` / `Current.VersionID` (§6.1); both work
+from the leaf alone. Manifests are immutable, so the copies cannot drift: the manifest stays
+the authoritative record, and the `VersionNode` fields are a two-field cache of it.
+
+**Why `Manifest` is a pointer rather than an inlined manifest:** the manifest CID is the
+version's stable identity (invariant 5, §2.4). Displacement pushes that same CID into the prev
+tree and promotion pulls it back; nothing is rewritten, and the reference index (§8) counts
+claims per version on the strength of that stability. An inlined manifest would have to be
+re-serialized as a standalone block when displaced, which mints a new CID, and it would put the
+full blob list on a block that every read and list fetches.
+
 ### 2.2 The prev tree
 
 Noncurrent versions live in a **per-key sub-MST** (the same forked `mst` package, same space, same
@@ -79,9 +128,11 @@ blockstore — its nodes are ordinary catalog-plane blocks):
   iteration **newest-first**. Scoped to one object key, the key is *just an integer rendered
   order-preservingly* — no composite-string escaping. Valid under `mst.IsValidKey` (hex is
   UTF-8, NUL-free, short).
-- **value** — the version's `ObjectManifest` CID. `Seq` is recoverable from the key;
-  `VersionID` comes from the manifest (§2.3), which every consumer of a prev entry fetches
-  anyway (list rendering needs ETag/size/mtime; version-scoped reads need the body).
+- **value** — the version's `ObjectManifest` CID and nothing else: a prev entry stores no
+  `VersionNode`. For these entries the seq is recoverable from the MST key, and the version id
+  lives only in the manifest (§2.3). That costs nothing in practice, because every consumer of
+  a prev entry fetches the manifest anyway (list rendering needs ETag/size/mtime;
+  version-scoped reads need the body).
 
 A direct version-scoped seek is `prev.Get(revSeqKey(seq))` — O(log n), no scan.
 
@@ -94,6 +145,12 @@ already exists (manifest.go:25) and finally gets read:
 Seq       uint64 `cborgen:"sq"` // the version's ordinal (== leaf/prev position)
 VersionID string `cborgen:"vi"` // "null" or the ULID token; "" only in pre-versioning blocks
 ```
+
+Both fields also exist on the leaf's `VersionNode` (§2.1 explains the split). The manifest is
+the self-contained record: a prev entry stores only the manifest CID (§2.2), so for noncurrent
+versions the manifest is the only place the id is stored. List rendering reads it there, the
+token check in §6.1 verifies against it, and promotion (§7.2) rebuilds the leaf's `Current`
+node from these two fields.
 
 A **delete marker** is an `ObjectManifest` with `DeleteMarker: true`, a zero `Body` (no blobs, no
 digests — it contributes nothing to `blob_refs`), no ETag, and `Created` = marker time. Markers
