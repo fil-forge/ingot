@@ -21,7 +21,7 @@ concurrency:
 
 jobs:
   unit:
-    uses: ipdxco/unified-github-workflows/.github/workflows/go-test.yml@v1.0
+    uses: ipdxco/unified-github-workflows/.github/workflows/go-test.yml@1822b44541e3ad073b8f9109e346ba0ddd4ce96e # v1.0
     with:
       go-versions: '["this"]'
     secrets:
@@ -37,10 +37,10 @@ jobs:
 
     steps:
       - name: Check out the repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
 
@@ -82,7 +82,7 @@ jobs:
 
       - name: Upload container logs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: container-logs
           path: /tmp/container-logs/
