@@ -18,6 +18,10 @@ import (
 
 var putObjectPass = []forgeCase{
 	{name: "checksum_algorithm_and_header_mismatch", fn: integration.PutObject_checksum_algorithm_and_header_mismatch},
+	// Overwrites superseding checksummed bodies release their blobs: needs
+	// hilt ≥ #37 (blob.Remove in the write set) and smelt ≥ #19 (the piri
+	// blob/release delegation).
+	{name: "checksums_success", fn: integration.PutObject_checksums_success},
 	{name: "dir_object_default_checksum", fn: integration.PutObject_dir_object_default_checksum},
 	{name: "dir_object_checksums_success", fn: integration.PutObject_dir_object_checksums_success},
 	{name: "incorrect_checksums", fn: integration.PutObject_incorrect_checksums},
@@ -44,10 +48,6 @@ var putObjectPass = []forgeCase{
 }
 
 var putObjectXFail = []forgeCase{
-	// Still teardown-blocked even with DeleteObject's blob release: the
-	// case's checksummed bodies survive deletion and the bucket delete
-	// 409s (BucketNotEmpty).
-	{name: "checksums_success", fn: integration.PutObject_checksums_success},
 	// The incorrect_md5 subcheck expects 400 InvalidDigest; ingot 500s.
 	{name: "md5", fn: integration.PutObject_md5},
 	// A metadata-combining re-PUT is denied (403) under the hilt authorize

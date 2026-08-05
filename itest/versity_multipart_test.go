@@ -145,6 +145,10 @@ var completeMultipartPass = []forgeCase{
 	{name: "with_metadata", fn: integration.CompleteMultipartUpload_with_metadata},
 	{name: "success", fn: integration.CompleteMultipartUpload_success},
 	{name: "already_completed", fn: integration.CompleteMultipartUpload_already_completed},
+	// The conditional matrix's overwrite chains release superseded blobs:
+	// needs hilt ≥ #37 (blob.Remove in the write set) and smelt ≥ #19 (the
+	// piri blob/release delegation) so the releases carry proofs end-to-end.
+	{name: "conditional_writes", fn: integration.CompleteMultipartUpload_conditional_writes},
 	// racey_success races ten concurrent 25 MiB multipart uploads of one key
 	// under a 30s client deadline — on a host simultaneously running the
 	// smelt stack its outcome depends on load, not S3 semantics, so it is
@@ -157,13 +161,6 @@ var completeMultipartPass = []forgeCase{
 // Part-level / composite-checksum verification is FIL-620;
 // racey_data_integrity additionally leans on atomic concurrent overwrites.
 var completeMultipartXFail = []forgeCase{
-	// The conditional matrix itself passes; the case then fails its bucket
-	// teardown, now with BucketNotEmpty from DeleteBucket (an object the
-	// upstream teardown's listing misses survives into the delete). The
-	// original blocker — /blob/abort going out proofless — is gone since
-	// fil-forge/hilt#35 granted blob.Abort with the write set; the teardown
-	// residue needs its own diagnosis before this row can promote.
-	{name: "conditional_writes", fn: integration.CompleteMultipartUpload_conditional_writes},
 	{name: "invalid_checksum_part", fn: integration.CompleteMultipartUpload_invalid_checksum_part},
 	{name: "multiple_checksum_part", fn: integration.CompleteMultipartUpload_multiple_checksum_part},
 	{name: "incorrect_checksum_part", fn: integration.CompleteMultipartUpload_incorrect_checksum_part},
