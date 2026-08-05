@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/fil-forge/versitygw/s3err"
 	"github.com/fil-forge/versitygw/s3response"
 	"github.com/ipfs/go-cid"
@@ -135,19 +136,56 @@ func (b *Backend) GetBucketPolicy(ctx context.Context, bucket string) ([]byte, e
 	return nil, s3err.GetAPIError(s3err.ErrNoSuchBucketPolicy)
 }
 
-// GetBucketVersioning is called from auth.CheckObjectAccess
-// (object_lock.go:220, 257). Both call sites tolerate any error by
-// treating versioning as disabled, so we could leave the default
-// ErrNotImplemented — but returning a clean "Suspended" status is
-// less noisy in logs and makes the no-op intent explicit.
+// GetBucketVersioning reports the bucket's versioning configuration. A bucket
+// that has never been configured returns an empty <VersioningConfiguration/>
+// (nil Status); once configured, the status is Enabled or Suspended. Also
+// called from auth.CheckObjectAccess (object_lock.go:220, 257).
 func (b *Backend) GetBucketVersioning(ctx context.Context, bucket string) (s3response.GetBucketVersioningOutput, error) {
-	if _, err := b.reg.Get(ctx, bucket); err != nil {
+	st, err := b.reg.Get(ctx, bucket)
+	if err != nil {
 		if errors.Is(err, registry.ErrNotFound) {
 			return s3response.GetBucketVersioningOutput{}, s3err.GetAPIError(s3err.ErrNoSuchBucket)
 		}
 		return s3response.GetBucketVersioningOutput{}, err
 	}
-	return s3response.GetBucketVersioningOutput{}, nil
+	out := s3response.GetBucketVersioningOutput{}
+	switch st.Versioning {
+	case registry.VersioningEnabled:
+		status := types.BucketVersioningStatusEnabled
+		out.Status = &status
+	case registry.VersioningSuspended:
+		status := types.BucketVersioningStatusSuspended
+		out.Status = &status
+	}
+	return out, nil
+}
+
+// PutBucketVersioning sets the bucket's versioning state. The controller
+// rejects anything but Enabled/Suspended before we're called; there is no way
+// back to unversioned (matching S3).
+func (b *Backend) PutBucketVersioning(ctx context.Context, bucket string, status types.BucketVersioningStatus) error {
+	if _, err := b.reg.Get(ctx, bucket); err != nil {
+		if errors.Is(err, registry.ErrNotFound) {
+			return s3err.GetAPIError(s3err.ErrNoSuchBucket)
+		}
+		return err
+	}
+	var v registry.VersioningState
+	switch status {
+	case types.BucketVersioningStatusEnabled:
+		v = registry.VersioningEnabled
+	case types.BucketVersioningStatusSuspended:
+		v = registry.VersioningSuspended
+	default:
+		return s3err.GetAPIError(s3err.ErrMalformedXML)
+	}
+	if err := b.reg.SetVersioning(ctx, bucket, v); err != nil {
+		if errors.Is(err, registry.ErrNotFound) {
+			return s3err.GetAPIError(s3err.ErrNoSuchBucket)
+		}
+		return fmt.Errorf("s3frontend: put bucket versioning: %w", err)
+	}
+	return nil
 }
 
 func (b *Backend) HeadBucket(ctx context.Context, input *s3.HeadBucketInput) (*s3.HeadBucketOutput, error) {
@@ -205,8 +243,10 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 			return err
 		}
 
-		// S3 forbids deleting non-empty buckets. Walk the MST until
-		// we see any leaf, then bail.
+		// S3 forbids deleting non-empty buckets. Walk the MST until we see any
+		// leaf, then bail. Any leaf counts — a versioned bucket holding only
+		// delete markers is still non-empty, and reports the versioned error
+		// ("you must delete all versions").
 		if st.Root.Defined() {
 			t := mst.LoadMST(b.read, st.Space, st.Root)
 			var seen bool
@@ -218,6 +258,9 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 				return walkErr
 			}
 			if seen {
+				if st.Versioning.Configured() {
+					return s3err.GetAPIError(s3err.ErrVersionedBucketNotEmpty)
+				}
 				return s3err.GetAPIError(s3err.ErrBucketNotEmpty)
 			}
 		}

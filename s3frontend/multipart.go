@@ -23,7 +23,6 @@ import (
 	"go.uber.org/zap"
 
 	msbucket "github.com/fil-forge/ingot/bucket"
-	"github.com/fil-forge/ingot/bucketop"
 	"github.com/fil-forge/ingot/internal/reqscope"
 	"github.com/fil-forge/ingot/mst"
 	"github.com/fil-forge/ingot/registry"
@@ -230,16 +229,15 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 		return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrNotImplemented)
 	}
 	if ifMatch != nil || ifNoneMatch != nil {
-		current, _, lerr := b.lookupManifest(ctx, bucket, key)
-		exists := lerr == nil
-		if lerr != nil && !isNoSuchKey(lerr) {
+		curETag, exists, lerr := b.currentObjectETag(ctx, bucket, key)
+		if lerr != nil {
 			return s3response.CompleteMultipartUploadResult{}, "", lerr
 		}
 		if ifMatch != nil {
 			if !exists {
 				return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrNoSuchKey)
 			}
-			if !etagsEqual(*ifMatch, current.ETag) {
+			if !etagsEqual(*ifMatch, curETag) {
 				return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrPreconditionFailed)
 			}
 		}
@@ -381,7 +379,34 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 		Metadata:                sess.Metadata,
 	}
 
-	if err := b.commitManifest(ctx, bucketState, key, mf, bodyDigests(mf.Body)); err != nil {
+	// Commit through the §5 write rule (docs/s3-versioning.md): seq allocation,
+	// displacement per the bucket's versioning state, and the post-commit
+	// reference-index reconcile. The conditional-write preconditions re-check
+	// under the lock so a racing writer can't slip between the pre-check above
+	// and the swap.
+	node, effState, err := b.commitVersion(ctx, bucketState, key, mf, func(displaced *msbucket.ObjectManifest) error {
+		if ifMatch == nil && ifNoneMatch == nil {
+			return nil
+		}
+		// A delete-marker current means "no object" for precondition purposes.
+		oldETag, oldExists := "", false
+		if displaced != nil && !displaced.DeleteMarker {
+			oldETag, oldExists = etagOf(displaced), true
+		}
+		if ifMatch != nil {
+			if !oldExists {
+				return s3err.GetAPIError(s3err.ErrNoSuchKey)
+			}
+			if !etagsEqual(*ifMatch, oldETag) {
+				return s3err.GetAPIError(s3err.ErrPreconditionFailed)
+			}
+		}
+		if ifNoneMatch != nil && oldExists {
+			return s3err.GetAPIError(s3err.ErrPreconditionFailed)
+		}
+		return nil
+	})
+	if err != nil {
 		return s3response.CompleteMultipartUploadResult{}, "", err
 	}
 	committed = true
@@ -394,8 +419,14 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 			zap.String("uploadID", uploadID), zap.Error(err))
 	}
 
+	// The x-amz-version-id of the new version, omitted for unversioned buckets
+	// (docs/s3-versioning.md §4.3).
+	versionid := ""
+	if effState.Configured() {
+		versionid = node.VersionID
+	}
 	etagQ := `"` + etag + `"`
-	return s3response.CompleteMultipartUploadResult{Bucket: &bucket, Key: &key, ETag: &etagQ}, "", nil
+	return s3response.CompleteMultipartUploadResult{Bucket: &bucket, Key: &key, ETag: &etagQ}, versionid, nil
 }
 
 // AbortMultipartUpload cancels a multipart upload: it latches the session
@@ -928,58 +959,6 @@ func (b *Backend) SweepStaleMultipartSessions(ctx context.Context, ttl time.Dura
 		}
 	}
 	return cleaned, nil
-}
-
-// commitManifest splices mf into (bucket, key) and reconciles the reference
-// index against the prior version's digests, releasing dropped blobs after the
-// commit. Shared by CopyObject and CompleteMultipartUpload (a plain commit with
-// no precondition callback).
-func (b *Backend) commitManifest(ctx context.Context, bucketState *registry.State, key string, mf *msbucket.ObjectManifest, newDigests [][]byte) error {
-	var oldDigests [][]byte
-	err := b.txns.WithTx(ctx, bucketState.Name, func(ctx context.Context, tx *bucketop.Tx) (cid.Cid, error) {
-		mfCid, err := tx.Put(ctx, mf)
-		if err != nil {
-			return cid.Undef, fmt.Errorf("manifest put: %w", err)
-		}
-		t := tx.LoadTree()
-
-		oldCid, gerr := t.Get(ctx, key)
-		switch {
-		case gerr == nil:
-			var oldMf msbucket.ObjectManifest
-			if err := tx.Get(ctx, tx.State().Space, oldCid, &oldMf); err != nil {
-				return cid.Undef, fmt.Errorf("load prior manifest: %w", err)
-			}
-			oldDigests = bodyDigests(oldMf.Body)
-			if err := b.gc.AddGCCandidate(ctx, oldCid.Bytes(), bucketState.Name); err != nil {
-				return cid.Undef, fmt.Errorf("gc candidate: %w", err)
-			}
-		case errors.Is(gerr, mst.ErrNotFound):
-		default:
-			return cid.Undef, fmt.Errorf("mst get prior: %w", gerr)
-		}
-
-		t2, err := t.Add(ctx, key, mfCid, -1)
-		if errors.Is(err, mst.ErrAlreadyExists) {
-			t2, err = t.Update(ctx, key, mfCid)
-		}
-		if err != nil {
-			return cid.Undef, fmt.Errorf("mst write: %w", err)
-		}
-
-		return t2.GetPointer(ctx, tx)
-	})
-	if err != nil {
-		return mapCommitError(err, "commit")
-	}
-	// Reconcile the reference index AFTER the commit is durable (so a commit
-	// failure can't diverge blob_refs from the catalog).
-	toRemove, err := b.reconcileClaims(ctx, bucketState, key, oldDigests, newDigests)
-	if err != nil {
-		return fmt.Errorf("s3frontend: commit reconcile: %w", err)
-	}
-	b.releaseBlobs(ctx, bucketState.Space, toRemove)
-	return nil
 }
 
 // etagsEqual compares two ETags ignoring surrounding quotes.

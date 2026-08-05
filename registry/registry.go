@@ -12,13 +12,32 @@ import (
 	"github.com/ipfs/go-cid"
 )
 
+// VersioningState is a bucket's S3 versioning configuration. Buckets start
+// Unversioned; once configured they only ever move between Enabled and
+// Suspended (S3 has no way back to unversioned).
+type VersioningState string
+
+const (
+	VersioningUnversioned VersioningState = "unversioned"
+	VersioningEnabled     VersioningState = "enabled"
+	VersioningSuspended   VersioningState = "suspended"
+)
+
+// Configured reports whether the bucket carries a versioning configuration
+// (Enabled or Suspended) — the states in which version ids appear in S3
+// responses (docs/s3-versioning.md §4.3).
+func (s VersioningState) Configured() bool {
+	return s == VersioningEnabled || s == VersioningSuspended
+}
+
 // State is the metadata stored per bucket.
 type State struct {
-	Name      string
-	Space     did.DID   // Forge space DID the bucket's data lives in
-	Root      cid.Cid   // current MST root; cid.Undef for empty bucket
-	ForgeRoot cid.Cid   // last MST root whose DAG has been shipped to Forge
-	CreatedAt time.Time // set by the implementation at create time
+	Name       string
+	Space      did.DID         // Forge space DID the bucket's data lives in
+	Root       cid.Cid         // current MST root; cid.Undef for empty bucket
+	ForgeRoot  cid.Cid         // last MST root whose DAG has been shipped to Forge
+	Versioning VersioningState // S3 versioning configuration
+	CreatedAt  time.Time       // set by the implementation at create time
 }
 
 // ListOptions selects a page of buckets.
@@ -61,6 +80,16 @@ type Registry interface {
 	// the recovery loop: anything reachable from Root but not from
 	// ForgeRoot needs to be re-submitted on startup.
 	SetForgeRoot(ctx context.Context, name string, root cid.Cid) error
+
+	// SetVersioning updates the bucket's versioning state. Only Enabled and
+	// Suspended are settable. Returns ErrNotFound if the bucket is absent.
+	SetVersioning(ctx context.Context, name string, v VersioningState) error
+
+	// AllocVersionSeq atomically advances and returns the bucket's version
+	// ordinal (the first call returns 1; 0 is reserved to mean "none").
+	// Gaps from failed commits are harmless — the ordinal only orders
+	// versions of a key relative to each other.
+	AllocVersionSeq(ctx context.Context, name string) (uint64, error)
 }
 
 // Common errors.

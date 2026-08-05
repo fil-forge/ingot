@@ -22,6 +22,7 @@ require (
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/multiformats/go-multicodec v0.10.0
 	github.com/multiformats/go-multihash v0.2.3
+	github.com/oklog/ulid/v2 v2.1.2
 	github.com/patrickmn/go-cache v2.1.0+incompatible
 	github.com/pressly/goose/v3 v3.27.0
 	github.com/spf13/cobra v1.10.2
