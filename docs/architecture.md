@@ -107,9 +107,10 @@ non-obvious parts:
 
 **Versioning.** Buckets carry a versioning state — `Unversioned` (default), `Enabled`, or
 `Suspended`.
-- Versions of a key are grouped under its `ObjectLeaf`: the current version inline (single-seek
-  reads), noncurrent versions in a per-key sub-MST ordered **newest-first**, version-scoped reads
-  direct seeks — see *Versioned storage* below.
+- A key with a single version stores its manifest directly (one-block reads); once superseded it
+  gains an `ObjectLeaf` grouping its versions: the current version inline, noncurrent versions in
+  a per-key sub-MST ordered **newest-first**, version-scoped reads direct seeks — see *Versioned
+  storage* below.
 - `ListObjects` (V1/V2) returns only the current, non-delete-marked version per key (one head per
   key, skip to the next). `ListObjectVersions` walks all leaves. Delete markers are skipped by the
   former, surfaced by the latter (with the `x-amz-delete-marker` response header).
@@ -119,9 +120,11 @@ non-obvious parts:
 
 **Versioned storage (the per-key version tree).** The full design is
 **[`s3-versioning.md`](./s3-versioning.md)**. In brief: the top MST is keyed by the **plain object
-key**; each leaf is an `ObjectLeaf` `{current, prev, nullSeq}` where `current` is the head version
-(single-seek reads) and `prev` is a per-key sub-MST of noncurrent versions keyed newest-first by
-the inverted per-bucket ordinal (`seq`, from `buckets.next_version_seq`). `seq` (ordering,
+key**. A single-version key's value is its bare `ObjectManifest` CID; a superseded key's value is
+an `ObjectLeaf` `{current, prev, nullSeq}`, wrapped in a `"/objectleaf/0"` keyed envelope so the
+two forms are told apart exactly, where `current` is the head version (single-seek reads) and
+`prev` is a per-key sub-MST of noncurrent versions keyed newest-first by the inverted per-bucket
+ordinal (`seq`, from `buckets.next_version_seq`). `seq` (ordering,
 internal) and `version_id` (identity, the client handle — a ULID token, or `"null"`) are
 **separate fields**, so the null version's replace-in-place semantics fall out instead of needing
 a sentinel. Object keys need no escaping and no terminator, and fit `MaxKeyBytes` as-is; the
@@ -163,7 +166,9 @@ validates/echoes them, independent of the internal sha256 content address.
 
 The catalog is the per-bucket namespace: the MST plus the object manifests it points at.
 
-**The MST** maps each composite key to a manifest CID. It is the forked, go-cid-only MST. It is the
+**The MST** maps each plain object key to its value block — the bare manifest for a
+single-version key, an `ObjectLeaf` once superseded ([§3](#3-the-s3-layer)). It is the forked,
+go-cid-only MST. It is the
 **source of truth for bucket state**, not merely a local index: because it is a content-addressed,
 self-verifying Merkle structure shipped to Forge (the catalog plane), a bucket's entire namespace is
 recoverable and portable from the network — the property a plain Postgres table (fast local index, but
@@ -185,7 +190,9 @@ depends on the single- vs multi-shard split in [§8](#8-retrieval-addressing-whe
 MST (bucket)
   leaf key = "photos/cat.jpg"           (plain object key)
      │
-     └──▶ CID ──▶ ObjectLeaf            ← per-key version group (s3-versioning.md §2)
+     └──▶ CID ──▶ single version: the bare ObjectManifest (below) — one block, one fetch
+              ──▶ superseded key: ObjectLeaf   ← per-key version group, under the
+                    │                            "/objectleaf/0" envelope (s3-versioning.md §2)
                     ├ current  { seq, versionId, manifest CID }   (the head version, inline)
                     ├ prev     CID of the per-key sub-MST of noncurrent versions (nil if none)
                     └ nullSeq  a noncurrent null version's seq (0 = none)
