@@ -26,11 +26,15 @@ type countingUploader struct {
 	calls map[string]int
 }
 
-func (u *countingUploader) UploadBlob(_ context.Context, space did.DID, digest multihash.Multihash, size int64, _ string) (uploader.BlobLocation, error) {
+func (u *countingUploader) UploadBlob(_ context.Context, _ did.DID, digest multihash.Multihash, size int64, _ string, _ ...uploader.UploadOption) (uploader.UploadedBlob, error) {
 	u.mu.Lock()
 	u.calls[string(digest)]++
 	u.mu.Unlock()
-	return uploader.BlobLocation{Provider: "did:test:piri", URL: "http://piri/blob", Size: size}, nil
+	return uploader.UploadedBlob{
+		Digest:   digest,
+		Size:     size,
+		Location: &uploader.BlobLocation{Provider: "did:test:piri", URL: "http://piri/blob", Size: size},
+	}, nil
 }
 
 func (u *countingUploader) count(digest []byte) int {

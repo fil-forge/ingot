@@ -58,6 +58,7 @@ type MemStore struct {
 	intents    map[string]registry.UploadIntent          // keyed by string(digest)
 	locations  map[locKey]registry.BlobLocation          // keyed by (space, digest)
 	inclusions map[locKey]registry.BlobInclusion         // keyed by (space, digest)
+	parks      map[string]registry.BlobPark              // keyed by string(digest)
 	sessions   map[string]registry.MultipartSession      // keyed by uploadID
 	parts      map[string]map[int]registry.MultipartPart // uploadID -> partNumber -> part
 	gcCands    map[string]struct{}                       // keyed by string(cid)
@@ -83,6 +84,7 @@ func NewMemStore() *MemStore {
 		intents:    map[string]registry.UploadIntent{},
 		locations:  map[locKey]registry.BlobLocation{},
 		inclusions: map[locKey]registry.BlobInclusion{},
+		parks:      map[string]registry.BlobPark{},
 		sessions:   map[string]registry.MultipartSession{},
 		parts:      map[string]map[int]registry.MultipartPart{},
 		gcCands:    map[string]struct{}{},
@@ -345,11 +347,22 @@ func (NopUploader) SubmitShard(_ context.Context, _ blockstore.Plane, _ did.DID,
 	return uploader.BlobLocation{}, nil
 }
 
-func (NopUploader) UploadBlob(_ context.Context, _ did.DID, _ multihash.Multihash, size int64, _ string) (uploader.BlobLocation, error) {
-	return uploader.BlobLocation{Size: size}, nil
+// UploadBlob accepts immediately, even with WithConclude(false) — there is
+// no network to park on, so the deferred flow degenerates to the synchronous
+// one and reads keep coming from the spool.
+func (NopUploader) UploadBlob(_ context.Context, _ did.DID, digest multihash.Multihash, size int64, _ string, _ ...uploader.UploadOption) (uploader.UploadedBlob, error) {
+	return uploader.UploadedBlob{Digest: digest, Size: size, Location: &uploader.BlobLocation{Size: size}}, nil
 }
 
 func (NopUploader) RemoveBlob(_ context.Context, _ did.DID, _ multihash.Multihash) error { return nil }
+
+func (NopUploader) ConcludeBlob(_ context.Context, _ did.DID, parked uploader.UploadedBlob) (uploader.BlobLocation, error) {
+	return uploader.BlobLocation{Size: parked.Size}, nil
+}
+
+func (NopUploader) AbortBlob(_ context.Context, _ did.DID, _ multihash.Multihash, _ cid.Cid) error {
+	return nil
+}
 
 // Compile-time guarantees.
 var (
@@ -360,5 +373,6 @@ var (
 	_ blockstore.BlobReader           = NopBaseReader{}
 	_ uploader.Uploader               = NopUploader{}
 	_ uploader.BodyUploader           = NopUploader{}
+	_ uploader.DeferredBodyUploader   = NopUploader{}
 	_ uploader.BlobRemover            = NopUploader{}
 )

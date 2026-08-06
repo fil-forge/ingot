@@ -152,6 +152,37 @@ func TestPostgresStores_Live(t *testing.T) {
 		}
 	})
 
+	t.Run("park round trip", func(t *testing.T) {
+		park := registry.BlobPark{
+			Digest:        digest,
+			AddTask:       []byte{0x01, 0x02},
+			AcceptTask:    []byte{0x03, 0x04},
+			PutInvocation: []byte("sealed-inv"),
+			Size:          42,
+		}
+		if err := r.PutPark(ctx, park); err != nil {
+			t.Fatalf("PutPark: %v", err)
+		}
+		got, err := r.GetPark(ctx, digest)
+		if err != nil || string(got.PutInvocation) != "sealed-inv" || got.Size != 42 {
+			t.Fatalf("GetPark = %+v, err %v", got, err)
+		}
+		// Upsert replaces in place.
+		park.Size = 43
+		if err := r.PutPark(ctx, park); err != nil {
+			t.Fatalf("PutPark (upsert): %v", err)
+		}
+		if got, err := r.GetPark(ctx, digest); err != nil || got.Size != 43 {
+			t.Fatalf("GetPark after upsert = %+v, err %v", got, err)
+		}
+		if err := r.DeletePark(ctx, digest); err != nil {
+			t.Fatalf("DeletePark: %v", err)
+		}
+		if _, err := r.GetPark(ctx, digest); err != registry.ErrNotFound {
+			t.Fatalf("GetPark after delete = %v, want ErrNotFound", err)
+		}
+	})
+
 	t.Run("multipart session parts latch metadata", func(t *testing.T) {
 		const id = "upl-1"
 		meta := map[string]string{"x-amz-meta-foo": "bar"}
@@ -194,6 +225,71 @@ func TestPostgresStores_Live(t *testing.T) {
 		}
 		if after, _ := r.ListParts(ctx, id); len(after) != 0 {
 			t.Fatalf("parts after session delete = %d, want 0 (cascade)", len(after))
+		}
+	})
+
+	t.Run("multipart listing sweeper and part refs", func(t *testing.T) {
+		mk := func(id, key string) {
+			t.Helper()
+			if err := r.CreateSession(ctx, registry.MultipartSession{
+				UploadID: id, Bucket: "b", ObjectKey: key,
+				ContentEncoding: "testenc", ChecksumAlgorithm: "CRC32", ChecksumType: "FULL_OBJECT",
+			}); err != nil {
+				t.Fatalf("CreateSession %s: %v", id, err)
+			}
+		}
+		mk("ls-2", "zeta")
+		mk("ls-1", "alpha")
+		mk("ls-3", "alpha") // same key, created after ls-1
+
+		// New session columns round-trip.
+		s, err := r.GetSession(ctx, "ls-1")
+		if err != nil || s.ContentEncoding != "testenc" || s.ChecksumAlgorithm != "CRC32" ||
+			s.ChecksumType != "FULL_OBJECT" || s.CreatedAt.IsZero() {
+			t.Fatalf("GetSession new columns = %+v, err %v", s, err)
+		}
+
+		// ListSessions: (object_key, created_at, upload_id) order.
+		sessions, err := r.ListSessions(ctx, "b")
+		if err != nil || len(sessions) != 3 ||
+			sessions[0].UploadID != "ls-1" || sessions[1].UploadID != "ls-3" || sessions[2].UploadID != "ls-2" {
+			ids := make([]string, len(sessions))
+			for i, x := range sessions {
+				ids[i] = x.UploadID
+			}
+			t.Fatalf("ListSessions order = %v, err %v (want [ls-1 ls-3 ls-2])", ids, err)
+		}
+
+		// ListStaleSessions: cutoff in the past excludes them, future includes.
+		if stale, err := r.ListStaleSessions(ctx, registry.SessionOpen, time.Now().Add(-time.Hour)); err != nil || len(stale) != 0 {
+			t.Fatalf("ListStaleSessions past cutoff = %d, err %v (want 0)", len(stale), err)
+		}
+		if stale, err := r.ListStaleSessions(ctx, registry.SessionOpen, time.Now().Add(time.Hour)); err != nil || len(stale) != 3 {
+			t.Fatalf("ListStaleSessions future cutoff = %d, err %v (want 3)", len(stale), err)
+		}
+
+		// CountPartRefs: bytea[] ANY-match across sessions, excluding one.
+		shared := []byte{0xee, 0x01}
+		if err := r.PutPart(ctx, registry.MultipartPart{UploadID: "ls-1", PartNumber: 1, ETagMD5: []byte{1}, Size: 1, BlobDigests: [][]byte{shared}}); err != nil {
+			t.Fatalf("PutPart ls-1: %v", err)
+		}
+		if err := r.PutPart(ctx, registry.MultipartPart{UploadID: "ls-2", PartNumber: 1, ETagMD5: []byte{2}, Size: 1, BlobDigests: [][]byte{shared, {0xee, 0x02}}}); err != nil {
+			t.Fatalf("PutPart ls-2: %v", err)
+		}
+		if n, err := r.CountPartRefs(ctx, shared, "ls-1"); err != nil || n != 1 {
+			t.Fatalf("CountPartRefs(shared, exclude ls-1) = %d, err %v (want 1)", n, err)
+		}
+		if n, err := r.CountPartRefs(ctx, []byte{0xee, 0x02}, "ls-2"); err != nil || n != 0 {
+			t.Fatalf("CountPartRefs(unique, exclude owner) = %d, err %v (want 0)", n, err)
+		}
+
+		// 'completed' passes the widened state CHECK constraint.
+		if won, err := r.LatchSession(ctx, "ls-1", registry.SessionOpen, registry.SessionCompleted); err != nil || !won {
+			t.Fatalf("latch to completed won=%v err=%v", won, err)
+		}
+
+		for _, id := range []string{"ls-1", "ls-2", "ls-3"} {
+			_ = r.DeleteSession(ctx, id)
 		}
 	})
 

@@ -54,6 +54,8 @@ type Backend struct {
 	log       blockstore.Log
 	spool     *blockstore.Spool
 	uploader  uploader.BodyUploader
+	deferred  uploader.DeferredBodyUploader
+	parks     registry.ParkStore
 	remover   uploader.BlobRemover
 	logger    *zap.Logger
 
@@ -96,6 +98,11 @@ type Deps struct {
 	// accept) synchronously, before the manifest commits. Remover releases a
 	// space's claim on a blob when its last reference is dropped.
 	Uploader uploader.BodyUploader
+	// Deferred extends Uploader for multipart's deferred accept
+	// (WithConclude(false), then ConcludeBlob/AbortBlob); Parks persists
+	// park state between UploadPart and Complete/Abort.
+	Deferred uploader.DeferredBodyUploader
+	Parks    registry.ParkStore
 	Remover  uploader.BlobRemover
 
 	// MaxBlobSize is the coarse-split blob ceiling (0 → bucket default).
@@ -144,6 +151,8 @@ func New(d Deps) *Backend {
 		log:         d.Log,
 		spool:       d.Spool,
 		uploader:    d.Uploader,
+		deferred:    d.Deferred,
+		parks:       d.Parks,
 		remover:     d.Remover,
 		logger:      logger,
 		maxBlobSize: d.MaxBlobSize,

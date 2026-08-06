@@ -282,10 +282,16 @@ func (b *Backend) uploadBlobs(ctx context.Context, space did.DID, blobs []msbuck
 		} else if err != nil && !errors.Is(err, registry.ErrNotFound) {
 			return fmt.Errorf("lookup location: %w", err)
 		}
-		loc, err := b.uploader.UploadBlob(ctx, space, digest, blob.Length, b.spool.Path(digest))
+		res, err := b.uploader.UploadBlob(ctx, space, digest, blob.Length, b.spool.Path(digest))
 		if err != nil {
 			return fmt.Errorf("upload blob: %w", err)
 		}
+		// A concluding UploadBlob (the default) returns an accepted location
+		// or errors; guard the contract rather than deref-panic on a bad impl.
+		if res.Location == nil {
+			return fmt.Errorf("upload blob %x: concluding upload returned no location", blob.Digest)
+		}
+		loc := res.Location
 		if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentAccepted); err != nil {
 			return fmt.Errorf("mark accepted: %w", err)
 		}
@@ -478,15 +484,14 @@ func (b *Backend) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s
 
 	contentType := mf.ContentType
 	out := &s3.HeadObjectOutput{
-		AcceptRanges:       backend.GetPtrFromString("bytes"),
-		ContentLength:      &length,
-		ContentType:        &contentType,
-		ContentEncoding:    strPtrOrNil(mf.ContentEncoding),
-		ContentDisposition: strPtrOrNil(mf.ContentDisposition),
-		ContentLanguage:    strPtrOrNil(mf.ContentLanguage),
-		CacheControl:       strPtrOrNil(mf.CacheControl),
-		ExpiresString:      strPtrOrNil(mf.Expires),
-
+		AcceptRanges:            backend.GetPtrFromString("bytes"),
+		ContentLength:           &length,
+		ContentType:             &contentType,
+		ContentEncoding:         strPtrOrNil(mf.ContentEncoding),
+		ContentDisposition:      strPtrOrNil(mf.ContentDisposition),
+		ContentLanguage:         strPtrOrNil(mf.ContentLanguage),
+		CacheControl:            strPtrOrNil(mf.CacheControl),
+		ExpiresString:           strPtrOrNil(mf.Expires),
 		WebsiteRedirectLocation: strPtrOrNil(mf.WebsiteRedirectLocation),
 		Metadata:                mf.Metadata,
 		ContentRange:            contentRange,
@@ -546,16 +551,15 @@ func (b *Backend) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.
 	lastModified := time.Unix(mf.Created, 0)
 	contentType := mf.ContentType
 	out := &s3.GetObjectOutput{
-		AcceptRanges:       backend.GetPtrFromString("bytes"),
-		Body:               body,
-		ContentLength:      &length,
-		ContentType:        &contentType,
-		ContentEncoding:    strPtrOrNil(mf.ContentEncoding),
-		ContentDisposition: strPtrOrNil(mf.ContentDisposition),
-		ContentLanguage:    strPtrOrNil(mf.ContentLanguage),
-		CacheControl:       strPtrOrNil(mf.CacheControl),
-		ExpiresString:      strPtrOrNil(mf.Expires),
-
+		AcceptRanges:            backend.GetPtrFromString("bytes"),
+		Body:                    body,
+		ContentLength:           &length,
+		ContentType:             &contentType,
+		ContentEncoding:         strPtrOrNil(mf.ContentEncoding),
+		ContentDisposition:      strPtrOrNil(mf.ContentDisposition),
+		ContentLanguage:         strPtrOrNil(mf.ContentLanguage),
+		CacheControl:            strPtrOrNil(mf.CacheControl),
+		ExpiresString:           strPtrOrNil(mf.Expires),
 		WebsiteRedirectLocation: strPtrOrNil(mf.WebsiteRedirectLocation),
 		Metadata:                mf.Metadata,
 		ContentRange:            contentRange,

@@ -136,6 +136,7 @@ type serverParams struct {
 	Reader          blockstore.BlockReader
 	Uploader        uploader.Uploader
 	BodyUploader    uploader.BodyUploader
+	Deferred        uploader.DeferredBodyUploader
 	Remover         uploader.BlobRemover
 	BucketAuthority bucketauthority.BucketAuthority
 	Registry        registry.Registry
@@ -145,6 +146,7 @@ type serverParams struct {
 	BlobRefs        registry.BlobRefStore
 	GC              registry.GCStore
 	Multipart       registry.MultipartStore
+	Parks           registry.ParkStore
 	Meta            logstore.Meta
 	// IAM authenticates non-root access keys.
 	IAM       auth.IAMService `optional:"true"`
@@ -177,6 +179,7 @@ func registerServerLifecycle(lc fx.Lifecycle, p serverParams) {
 				BaseBlockReader: p.Reader,
 				Uploader:        p.Uploader,
 				BodyUploader:    p.BodyUploader,
+				Deferred:        p.Deferred,
 				Remover:         p.Remover,
 				Authority:       p.BucketAuthority,
 				Registry:        p.Registry,
@@ -186,6 +189,7 @@ func registerServerLifecycle(lc fx.Lifecycle, p serverParams) {
 				BlobRefs:        p.BlobRefs,
 				GC:              p.GC,
 				Multipart:       p.Multipart,
+				Parks:           p.Parks,
 				Meta:            p.Meta,
 				IAM:             p.IAM,
 			})
@@ -301,6 +305,7 @@ type registryResult struct {
 	BlobRefs   registry.BlobRefStore
 	GC         registry.GCStore
 	Multipart  registry.MultipartStore
+	Parks      registry.ParkStore
 	Meta       logstore.Meta
 }
 
@@ -313,7 +318,7 @@ type registryResult struct {
 // needs hilt_url/hilt_did configured.
 func provideRegistry(pool *pgxpool.Pool) registryResult {
 	pg := registry.NewPostgres(pool)
-	return registryResult{Registry: pg, Intents: pg, Locations: pg, Inclusions: pg, BlobRefs: pg, GC: pg, Multipart: pg, Meta: pg}
+	return registryResult{Registry: pg, Intents: pg, Locations: pg, Inclusions: pg, BlobRefs: pg, GC: pg, Multipart: pg, Parks: pg, Meta: pg}
 }
 
 // migrationHookOut feeds the migration PreStartHook into the "ingot_prestart"
@@ -367,6 +372,7 @@ type uploaderResult struct {
 
 	Uploader     uploader.Uploader
 	BodyUploader uploader.BodyUploader
+	Deferred     uploader.DeferredBodyUploader
 	Remover      uploader.BlobRemover
 }
 
@@ -379,5 +385,5 @@ func provideUploader(c *forgeclient.Client, logger *zap.Logger) (uploaderResult,
 	if err != nil {
 		return uploaderResult{}, err
 	}
-	return uploaderResult{Uploader: f, BodyUploader: f, Remover: f}, nil
+	return uploaderResult{Uploader: f, BodyUploader: f, Deferred: f, Remover: f}, nil
 }

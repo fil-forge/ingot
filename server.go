@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"time"
 
 	"github.com/fil-forge/versitygw/auth"
 	"github.com/fil-forge/versitygw/metrics"
@@ -50,7 +51,11 @@ type ServerDeps struct {
 	// space's claim on a blob when its last reference is dropped. In tests both
 	// are no-ops and reads are served from the local spool.
 	BodyUploader uploader.BodyUploader
-	Remover      uploader.BlobRemover
+	// Deferred extends BodyUploader for multipart's deferred accept:
+	// park at UploadPart (WithConclude(false)), conclude at Complete,
+	// abort at Abort.
+	Deferred uploader.DeferredBodyUploader
+	Remover  uploader.BlobRemover
 
 	// Authority is the service that authorizes bucket creation and deletion.
 	Authority bucketauthority.BucketAuthority
@@ -72,6 +77,9 @@ type ServerDeps struct {
 	BlobRefs   registry.BlobRefStore
 	GC         registry.GCStore
 	Multipart  registry.MultipartStore
+	// Parks persists deferred-accept park state between UploadPart and
+	// Complete/Abort.
+	Parks registry.ParkStore
 
 	// Meta is the persistence backing for log-segment metadata.
 	// Typically the same instance as Registry.
@@ -88,11 +96,12 @@ type ServerDeps struct {
 // lifecycle. fx callers wrap these in OnStart/OnStop hooks; tests
 // call them directly.
 type Server struct {
-	cfg     config.ServerConfig
-	logger  *zap.Logger
-	log     blockstore.Log
-	backend *s3frontend.Backend
-	api     *s3api.S3ApiServer
+	cfg       config.ServerConfig
+	logger    *zap.Logger
+	log       blockstore.Log
+	backend   *s3frontend.Backend
+	api       *s3api.S3ApiServer
+	sweepStop chan struct{}
 }
 
 // New wires a ServerDeps + ServerConfig into a runnable Server. The
@@ -145,10 +154,12 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		BlobRefs:    deps.BlobRefs,
 		GC:          deps.GC,
 		Multipart:   deps.Multipart,
+		Parks:       deps.Parks,
 		Reads:       bs,
 		Log:         log,
 		Spool:       spool,
 		Uploader:    deps.BodyUploader,
+		Deferred:    deps.Deferred,
 		Remover:     deps.Remover,
 		MaxBlobSize: cfg.MaxBlobSize,
 		CORS:        cfg.CORSConfig,
@@ -190,7 +201,46 @@ func (s *Server) Start(ctx context.Context) error {
 			s.logger.Error("ingot listener error", zap.Error(err))
 		}
 	}()
+	s.startMultipartSweeper()
 	return nil
+}
+
+// startMultipartSweeper spawns the abandoned-multipart-session sweeper: open
+// sessions older than MultipartSessionTTL are aborted (their spooled parts
+// dropped) and terminal session rows reaped. Zero TTL → 7-day default;
+// negative → disabled.
+func (s *Server) startMultipartSweeper() {
+	ttl := s.cfg.MultipartSessionTTL
+	if ttl == 0 {
+		ttl = 7 * 24 * time.Hour
+	}
+	if ttl < 0 {
+		return
+	}
+	interval := ttl / 2
+	if interval > 10*time.Minute {
+		interval = 10 * time.Minute
+	}
+	s.sweepStop = make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-s.sweepStop:
+				return
+			case <-ticker.C:
+				ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+				n, err := s.backend.SweepStaleMultipartSessions(ctx, ttl)
+				cancel()
+				if err != nil {
+					s.logger.Warn("multipart sweep", zap.Error(err))
+				} else if n > 0 {
+					s.logger.Info("multipart sweep reaped stale sessions", zap.Int("count", n))
+				}
+			}
+		}
+	}()
 }
 
 // Stop shuts the listener down and drains the log. Always returns
@@ -199,6 +249,10 @@ func (s *Server) Start(ctx context.Context) error {
 func (s *Server) Stop(ctx context.Context) error {
 	s.logger.Info("shutting down ingot S3 listener")
 
+	if s.sweepStop != nil {
+		close(s.sweepStop)
+		s.sweepStop = nil
+	}
 	var errs []error
 	if err := s.api.ShutDown(); err != nil {
 		errs = append(errs, fmt.Errorf("s3api shutdown: %w", err))
@@ -369,6 +423,12 @@ func validateServerInputs(cfg config.ServerConfig, deps ServerDeps) error {
 	}
 	if deps.BodyUploader == nil {
 		return errors.New("ingot: ServerDeps.BodyUploader is required")
+	}
+	if deps.Deferred == nil {
+		return errors.New("ingot: ServerDeps.Deferred is required")
+	}
+	if deps.Parks == nil {
+		return errors.New("ingot: ServerDeps.Parks is required")
 	}
 	if deps.Registry == nil {
 		return errors.New("ingot: ServerDeps.Registry is required")

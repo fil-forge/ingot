@@ -46,6 +46,13 @@ type ServerConfig struct {
 	MaxConnections int
 	MaxRequests    int
 
+	// MultipartSessionTTL bounds abandoned multipart uploads: open sessions
+	// older than this are aborted by a background sweeper (dropping their
+	// spooled parts), and completed-session rows retained for Complete
+	// idempotency are reaped past the same age. Zero → default 7 days;
+	// negative → sweeper disabled.
+	MultipartSessionTTL time.Duration
+
 	// CORSConfig is the S3 CORS configuration the backend reports for
 	// every bucket, rendered from Config.CORSAllowedOrigins by
 	// internal/cors. Nil disables CORS entirely (the default).

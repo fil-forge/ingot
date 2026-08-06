@@ -6,16 +6,16 @@ import (
 	"github.com/fil-forge/versitygw/tests/integration"
 )
 
-// Multipart groups of the S3 conformance partition. These had no prior
-// curated lists — the partition below was created empirically against the
-// forge-mode stack (see the curation note in README.md). The broad strokes:
-// the Create/UploadPart/Complete/Abort happy paths and most input validation
-// pass; part-level checksums, tagging/object-lock/ACL surfaces, and the
-// ListParts / ListMultipartUploads / UploadPartCopy groups are unimplemented.
+// Multipart groups of the S3 conformance partition, partitioned empirically
+// against the forge-mode stack (see the curation note in README.md). The
+// remaining xfail surface: part-level checksums (FIL-620), tagging/object-lock
+// /ACL on create (FIL-534/FIL-525), and the UploadPartCopy group (FIL-586).
 
 var createMultipartPass = []forgeCase{
 	{name: "non_existing_bucket", fn: integration.CreateMultipartUpload_non_existing_bucket},
+	{name: "dir_obj", fn: integration.CreateMultipartUpload_dir_obj},
 	{name: "long_metadata", fn: integration.CreateMultipartUpload_long_metadata},
+	{name: "with_metadata", fn: integration.CreateMultipartUpload_with_metadata},
 	{name: "with_object_lock_invalid_retention", fn: integration.CreateMultipartUpload_with_object_lock_invalid_retention},
 	{name: "past_retain_until_date", fn: integration.CreateMultipartUpload_past_retain_until_date},
 	{name: "invalid_legal_hold", fn: integration.CreateMultipartUpload_invalid_legal_hold},
@@ -30,8 +30,6 @@ var createMultipartPass = []forgeCase{
 }
 
 var createMultipartXFail = []forgeCase{
-	{name: "dir_obj", fn: integration.CreateMultipartUpload_dir_obj},
-	{name: "with_metadata", fn: integration.CreateMultipartUpload_with_metadata},
 	{name: "with_tagging", fn: integration.CreateMultipartUpload_with_tagging},
 	{name: "with_object_lock", fn: integration.CreateMultipartUpload_with_object_lock},
 	{name: "with_object_lock_not_enabled", fn: integration.CreateMultipartUpload_with_object_lock_not_enabled},
@@ -41,6 +39,8 @@ var createMultipartXFail = []forgeCase{
 var uploadPartPass = []forgeCase{
 	{name: "non_existing_bucket", fn: integration.UploadPart_non_existing_bucket},
 	{name: "invalid_part_number", fn: integration.UploadPart_invalid_part_number},
+	{name: "non_existing_key", fn: integration.UploadPart_non_existing_key},
+	{name: "etag_quoting_consistency", fn: integration.UploadPart_etag_quoting_consistency},
 	{name: "non_existing_mp_upload", fn: integration.UploadPart_non_existing_mp_upload},
 	{name: "multiple_checksum_headers", fn: integration.UploadPart_multiple_checksum_headers},
 	{name: "invalid_checksum_header", fn: integration.UploadPart_invalid_checksum_header},
@@ -49,9 +49,6 @@ var uploadPartPass = []forgeCase{
 }
 
 var uploadPartXFail = []forgeCase{
-	// Verifies part ETags via ListParts, which ingot 501s (NotImplemented).
-	{name: "etag_quoting_consistency", fn: integration.UploadPart_etag_quoting_consistency},
-	{name: "non_existing_key", fn: integration.UploadPart_non_existing_key},
 	{name: "checksum_algorithm_mistmatch_on_initialization", fn: integration.UploadPart_checksum_algorithm_mistmatch_on_initialization},
 	{name: "checksum_algorithm_mistmatch_on_initialization_with_value", fn: integration.UploadPart_checksum_algorithm_mistmatch_on_initialization_with_value},
 	{name: "incorrect_checksums", fn: integration.UploadPart_incorrect_checksums},
@@ -84,28 +81,26 @@ var uploadPartCopyXFail = []forgeCase{
 }
 
 var listPartsPass = []forgeCase{
-	{name: "invalid_max_parts", fn: integration.ListParts_invalid_max_parts},
-	{name: "invalid_part_number_marker", fn: integration.ListParts_invalid_part_number_marker},
-}
-
-var listPartsXFail = []forgeCase{
 	{name: "incorrect_uploadId", fn: integration.ListParts_incorrect_uploadId},
 	{name: "incorrect_object_key", fn: integration.ListParts_incorrect_object_key},
+	{name: "invalid_max_parts", fn: integration.ListParts_invalid_max_parts},
+	{name: "invalid_part_number_marker", fn: integration.ListParts_invalid_part_number_marker},
 	{name: "default_max_parts", fn: integration.ListParts_default_max_parts},
 	{name: "exceeding_max_parts", fn: integration.ListParts_exceeding_max_parts},
 	{name: "truncated", fn: integration.ListParts_truncated},
-	{name: "with_checksums", fn: integration.ListParts_with_checksums},
-	{name: "null_checksums", fn: integration.ListParts_null_checksums},
 	{name: "success", fn: integration.ListParts_success},
+	{name: "with_checksums", fn: integration.ListParts_with_checksums},
+}
+
+// Explicit null-checksum-type echo is FIL-620.
+var listPartsXFail = []forgeCase{
+	{name: "null_checksums", fn: integration.ListParts_null_checksums},
 }
 
 var listMultipartUploadsPass = []forgeCase{
 	{name: "non_existing_bucket", fn: integration.ListMultipartUploads_non_existing_bucket},
-	{name: "invalid_max_uploads", fn: integration.ListMultipartUploads_invalid_max_uploads},
-}
-
-var listMultipartUploadsXFail = []forgeCase{
 	{name: "empty_result", fn: integration.ListMultipartUploads_empty_result},
+	{name: "invalid_max_uploads", fn: integration.ListMultipartUploads_invalid_max_uploads},
 	{name: "max_uploads", fn: integration.ListMultipartUploads_max_uploads},
 	{name: "exceeding_max_uploads", fn: integration.ListMultipartUploads_exceeding_max_uploads},
 	{name: "ignore_upload_id_marker", fn: integration.ListMultipartUploads_ignore_upload_id_marker},
@@ -118,53 +113,42 @@ var listMultipartUploadsXFail = []forgeCase{
 	{name: "with_checksums", fn: integration.ListMultipartUploads_with_checksums},
 }
 
+var listMultipartUploadsXFail = []forgeCase{}
+
 var abortMultipartPass = []forgeCase{
 	{name: "non_existing_bucket", fn: integration.AbortMultipartUpload_non_existing_bucket},
 	{name: "incorrect_uploadId", fn: integration.AbortMultipartUpload_incorrect_uploadId},
 	{name: "incorrect_object_key", fn: integration.AbortMultipartUpload_incorrect_object_key},
-	{name: "success_status_code", fn: integration.AbortMultipartUpload_success_status_code},
-}
-
-var abortMultipartXFail = []forgeCase{
-	// success asserts the aborted upload disappears from ListMultipartUploads,
-	// which is unimplemented (see listMultipartUploadsXFail); the abort
-	// lifecycle itself is proven by TestForgeScenarios.
 	{name: "success", fn: integration.AbortMultipartUpload_success},
+	{name: "success_status_code", fn: integration.AbortMultipartUpload_success_status_code},
 	{name: "if_match_initiated_time", fn: integration.AbortMultipartUpload_if_match_initiated_time},
 }
+
+var abortMultipartXFail = []forgeCase{}
 
 var completeMultipartPass = []forgeCase{
 	// upstream function name carries a typo (CompletedMultipartUpload_...).
 	{name: "non_existing_bucket", fn: integration.CompletedMultipartUpload_non_existing_bucket},
 	{name: "incorrect_part_number", fn: integration.CompleteMultipartUpload_incorrect_part_number},
-	{name: "default_content_type", fn: integration.CompleteMultipartUpload_default_content_type, skip: func() string {
-		return "timing-flaky under hilt: sporadic missing-proofs 500 on part accept, or teardown 409 pending /blob/remove"
-	}},
+	{name: "missing_part_fields", fn: integration.CompleteMultipartUpload_missing_part_fields},
+	{name: "invalid_part_number", fn: integration.CompleteMultipartUpload_invalid_part_number},
+	{name: "default_content_type", fn: integration.CompleteMultipartUpload_default_content_type},
 	{name: "invalid_ETag", fn: integration.CompleteMultipartUpload_invalid_ETag},
+	{name: "small_upload_size", fn: integration.CompleteMultipartUpload_small_upload_size},
 	{name: "empty_parts", fn: integration.CompleteMultipartUpload_empty_parts},
 	{name: "incorrect_parts_order", fn: integration.CompleteMultipartUpload_incorrect_parts_order},
+	{name: "mpu_object_size", fn: integration.CompleteMultipartUpload_mpu_object_size},
 	{name: "invalid_checksum_type", fn: integration.CompleteMultipartUpload_invalid_checksum_type},
 	{name: "multiple_final_checksums", fn: integration.CompleteMultipartUpload_multiple_final_checksums},
 	{name: "invalid_final_checksums", fn: integration.CompleteMultipartUpload_invalid_final_checksums},
 	{name: "invalid_final_composite_checksum", fn: integration.CompleteMultipartUpload_invalid_final_composite_checksum},
-	// The happy-path Complete cases are timing-flaky under the hilt/forge
-	// stack, failing two independent ways run-to-run: (1) the in-request
-	// part-blob upload sporadically goes out with no proofs for the bucket
-	// space and 500s ("is not issued by subject and has no proofs" — the
-	// same missing-proofs symptom the async catalog ship logs), and (2)
-	// when it succeeds, teardown's DeleteBucket may 409 (accepted part
-	// blobs register in the space; /blob/remove is unimplemented — see
-	// versity_object_test.go's teardown-blocked note). Skip hooks (not
-	// XFail: an XFail row errors on an unexpected pass, so a flaky case
-	// cannot live there) until the proof plumbing stabilizes and
-	// /blob/remove lands. The Complete happy path itself is exercised by
-	// TestForgeScenarios.
-	{name: "with_metadata", fn: integration.CompleteMultipartUpload_with_metadata, skip: func() string {
-		return "timing-flaky under hilt: sporadic missing-proofs 500 on part accept, or teardown 409 pending /blob/remove"
-	}},
-	{name: "success", fn: integration.CompleteMultipartUpload_success, skip: func() string {
-		return "timing-flaky under hilt: sporadic missing-proofs 500 on part accept, or teardown 409 pending /blob/remove"
-	}},
+	{name: "with_metadata", fn: integration.CompleteMultipartUpload_with_metadata},
+	{name: "success", fn: integration.CompleteMultipartUpload_success},
+	{name: "already_completed", fn: integration.CompleteMultipartUpload_already_completed},
+	// The conditional matrix's overwrite chains release superseded blobs:
+	// needs hilt ≥ #37 (blob.Remove in the write set) and smelt ≥ #19 (the
+	// piri blob/release delegation) so the releases carry proofs end-to-end.
+	{name: "conditional_writes", fn: integration.CompleteMultipartUpload_conditional_writes},
 	// racey_success races ten concurrent 25 MiB multipart uploads of one key
 	// under a 30s client deadline — on a host simultaneously running the
 	// smelt stack its outcome depends on load, not S3 semantics, so it is
@@ -174,13 +158,9 @@ var completeMultipartPass = []forgeCase{
 	}},
 }
 
+// Part-level / composite-checksum verification is FIL-620;
+// racey_data_integrity additionally leans on atomic concurrent overwrites.
 var completeMultipartXFail = []forgeCase{
-	// The missing-ETag part-field subcheck expects 400; ingot 500s.
-	{name: "missing_part_fields", fn: integration.CompleteMultipartUpload_missing_part_fields},
-	{name: "invalid_part_number", fn: integration.CompleteMultipartUpload_invalid_part_number},
-	{name: "small_upload_size", fn: integration.CompleteMultipartUpload_small_upload_size},
-	{name: "mpu_object_size", fn: integration.CompleteMultipartUpload_mpu_object_size},
-	{name: "conditional_writes", fn: integration.CompleteMultipartUpload_conditional_writes},
 	{name: "invalid_checksum_part", fn: integration.CompleteMultipartUpload_invalid_checksum_part},
 	{name: "multiple_checksum_part", fn: integration.CompleteMultipartUpload_multiple_checksum_part},
 	{name: "incorrect_checksum_part", fn: integration.CompleteMultipartUpload_incorrect_checksum_part},
@@ -193,6 +173,5 @@ var completeMultipartXFail = []forgeCase{
 	{name: "checksum_type_mismatch", fn: integration.CompleteMultipartUpload_checksum_type_mismatch},
 	{name: "should_ignore_the_final_checksum", fn: integration.CompleteMultipartUpload_should_ignore_the_final_checksum},
 	{name: "should_succeed_without_final_checksum_type", fn: integration.CompleteMultipartUpload_should_succeed_without_final_checksum_type},
-	{name: "already_completed", fn: integration.CompleteMultipartUpload_already_completed},
 	{name: "racey_data_integrity", fn: integration.CompleteMultipartUpload_racey_data_integrity},
 }

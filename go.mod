@@ -9,11 +9,12 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.104.1
 	github.com/fil-forge/hilt v0.0.1-0.20260724134448-ba71f843f6a4
 	github.com/fil-forge/indexing-service v1.13.5-0.20260619142411-efe3f5fab717
-	github.com/fil-forge/libforge v0.0.0-20260724113901-7fc3b2cec1ef
-	github.com/fil-forge/smelt v0.0.0-20260720130429-63116166a06c
+	github.com/fil-forge/libforge v0.0.0-20260727220215-5e299c46f62f
+	github.com/fil-forge/smelt v0.0.0-20260805233620-f0b69e68aad1
 	github.com/fil-forge/ucantone v0.0.0-20260727203046-ccb77059de44
 	github.com/fil-forge/versitygw v0.0.0-20260716095011-7a65883d595a
 	github.com/gofiber/fiber/v3 v3.4.0
+	github.com/google/uuid v1.6.0
 	github.com/ipfs/go-block-format v0.2.4
 	github.com/ipfs/go-cid v0.6.2
 	github.com/ipfs/go-ipld-cbor v0.3.0
@@ -109,7 +110,6 @@ require (
 	github.com/golang/protobuf v1.5.4 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
 	github.com/google/shlex v0.0.0-20191202100458-e7afc7fbc510 // indirect
-	github.com/google/uuid v1.6.0 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.29.0 // indirect
 	github.com/hashicorp/errwrap v1.1.0 // indirect
 	github.com/hashicorp/go-cleanhttp v0.5.2 // indirect

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/fil-forge/ucantone/did"
 	"github.com/jackc/pgx/v5"
@@ -180,6 +181,46 @@ func (r *Postgres) DeleteLocation(ctx context.Context, space did.DID, digest []b
 	return nil
 }
 
+// ParkStore ==================================================================
+
+func (r *Postgres) PutPark(ctx context.Context, p BlobPark) error {
+	_, err := r.pool.Exec(ctx,
+		`INSERT INTO ingot.blob_parks (digest, add_task, accept_task, put_invocation, size)
+		 VALUES ($1, $2, $3, $4, $5)
+		 ON CONFLICT (digest) DO UPDATE
+		   SET add_task = EXCLUDED.add_task, accept_task = EXCLUDED.accept_task,
+		       put_invocation = EXCLUDED.put_invocation, size = EXCLUDED.size`,
+		p.Digest, p.AddTask, p.AcceptTask, p.PutInvocation, p.Size)
+	if err != nil {
+		return fmt.Errorf("registry: put park: %w", err)
+	}
+	return nil
+}
+
+func (r *Postgres) GetPark(ctx context.Context, digest []byte) (*BlobPark, error) {
+	park := &BlobPark{Digest: digest}
+	err := r.pool.QueryRow(ctx,
+		`SELECT add_task, accept_task, put_invocation, size, created_at
+		 FROM ingot.blob_parks WHERE digest = $1`,
+		digest).Scan(&park.AddTask, &park.AcceptTask, &park.PutInvocation, &park.Size, &park.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("registry: get park: %w", err)
+	}
+	return park, nil
+}
+
+func (r *Postgres) DeletePark(ctx context.Context, digest []byte) error {
+	_, err := r.pool.Exec(ctx,
+		`DELETE FROM ingot.blob_parks WHERE digest = $1`, digest)
+	if err != nil {
+		return fmt.Errorf("registry: delete park: %w", err)
+	}
+	return nil
+}
+
 // InclusionStore =============================================================
 
 func (r *Postgres) PutInclusions(ctx context.Context, incs []BlobInclusion) error {
@@ -230,9 +271,15 @@ func (r *Postgres) CreateSession(ctx context.Context, s MultipartSession) error 
 		return err
 	}
 	_, err = r.pool.Exec(ctx,
-		`INSERT INTO ingot.multipart_sessions (upload_id, bucket, object_key, state, content_type, metadata)
-		 VALUES ($1, $2, $3, $4, $5, $6)`,
-		s.UploadID, s.Bucket, s.ObjectKey, state, nullString(s.ContentType), meta)
+		`INSERT INTO ingot.multipart_sessions
+		   (upload_id, bucket, object_key, state, content_type, metadata,
+		    content_encoding, content_disposition, content_language, cache_control, expires,
+		    website_redirect_location, checksum_algorithm, checksum_type)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+		s.UploadID, s.Bucket, s.ObjectKey, state, nullString(s.ContentType), meta,
+		nullString(s.ContentEncoding), nullString(s.ContentDisposition),
+		nullString(s.ContentLanguage), nullString(s.CacheControl), nullString(s.Expires),
+		nullString(s.WebsiteRedirectLocation), nullString(s.ChecksumAlgorithm), nullString(s.ChecksumType))
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == uniqueViolation {
@@ -244,22 +291,47 @@ func (r *Postgres) CreateSession(ctx context.Context, s MultipartSession) error 
 }
 
 func (r *Postgres) GetSession(ctx context.Context, uploadID string) (*MultipartSession, error) {
-	s := &MultipartSession{UploadID: uploadID}
-	var contentType *string
-	var meta []byte
-	err := r.pool.QueryRow(ctx,
-		`SELECT bucket, object_key, state, content_type, metadata
+	row := r.pool.QueryRow(ctx,
+		`SELECT upload_id, bucket, object_key, state, content_type, metadata, created_at,
+		        content_encoding, content_disposition, content_language, cache_control, expires,
+		        website_redirect_location, checksum_algorithm, checksum_type
 		 FROM ingot.multipart_sessions WHERE upload_id = $1`,
-		uploadID).Scan(&s.Bucket, &s.ObjectKey, &s.State, &contentType, &meta)
+		uploadID)
+	s, err := scanSession(row)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
 		return nil, fmt.Errorf("registry: get session: %w", err)
 	}
-	if contentType != nil {
-		s.ContentType = *contentType
+	return s, nil
+}
+
+// scanSession scans one multipart_sessions row in the canonical column order
+// (see GetSession/ListSessions selects).
+func scanSession(row pgx.Row) (*MultipartSession, error) {
+	s := &MultipartSession{}
+	var contentType, ce, cd, cl, cc, exp, wrl, ckAlgo, ckType *string
+	var meta []byte
+	err := row.Scan(&s.UploadID, &s.Bucket, &s.ObjectKey, &s.State, &contentType, &meta, &s.CreatedAt,
+		&ce, &cd, &cl, &cc, &exp, &wrl, &ckAlgo, &ckType)
+	if err != nil {
+		return nil, err
 	}
+	setIfNotNil := func(dst *string, src *string) {
+		if src != nil {
+			*dst = *src
+		}
+	}
+	setIfNotNil(&s.ContentType, contentType)
+	setIfNotNil(&s.ContentEncoding, ce)
+	setIfNotNil(&s.ContentDisposition, cd)
+	setIfNotNil(&s.ContentLanguage, cl)
+	setIfNotNil(&s.CacheControl, cc)
+	setIfNotNil(&s.Expires, exp)
+	setIfNotNil(&s.WebsiteRedirectLocation, wrl)
+	setIfNotNil(&s.ChecksumAlgorithm, ckAlgo)
+	setIfNotNil(&s.ChecksumType, ckType)
 	if s.Metadata, err = unmarshalMetadata(meta); err != nil {
 		return nil, err
 	}
@@ -304,7 +376,7 @@ func (r *Postgres) PutPart(ctx context.Context, p MultipartPart) error {
 
 func (r *Postgres) ListParts(ctx context.Context, uploadID string) ([]MultipartPart, error) {
 	rows, err := r.pool.Query(ctx,
-		`SELECT part_number, etag_md5, size, blob_digests, state
+		`SELECT part_number, etag_md5, size, blob_digests, state, created_at
 		 FROM ingot.multipart_parts WHERE upload_id = $1 ORDER BY part_number ASC`,
 		uploadID)
 	if err != nil {
@@ -315,7 +387,7 @@ func (r *Postgres) ListParts(ctx context.Context, uploadID string) ([]MultipartP
 	var out []MultipartPart
 	for rows.Next() {
 		p := MultipartPart{UploadID: uploadID}
-		if err := rows.Scan(&p.PartNumber, &p.ETagMD5, &p.Size, &p.BlobDigests, &p.State); err != nil {
+		if err := rows.Scan(&p.PartNumber, &p.ETagMD5, &p.Size, &p.BlobDigests, &p.State, &p.CreatedAt); err != nil {
 			return nil, fmt.Errorf("registry: list parts scan: %w", err)
 		}
 		out = append(out, p)
@@ -324,6 +396,72 @@ func (r *Postgres) ListParts(ctx context.Context, uploadID string) ([]MultipartP
 		return nil, fmt.Errorf("registry: list parts rows: %w", err)
 	}
 	return out, nil
+}
+
+func (r *Postgres) ListSessions(ctx context.Context, bucket string) ([]MultipartSession, error) {
+	rows, err := r.pool.Query(ctx,
+		`SELECT upload_id, bucket, object_key, state, content_type, metadata, created_at,
+		        content_encoding, content_disposition, content_language, cache_control, expires,
+		        website_redirect_location, checksum_algorithm, checksum_type
+		 FROM ingot.multipart_sessions WHERE bucket = $1
+		 ORDER BY object_key ASC, created_at ASC, upload_id ASC`,
+		bucket)
+	if err != nil {
+		return nil, fmt.Errorf("registry: list sessions: %w", err)
+	}
+	defer rows.Close()
+
+	var out []MultipartSession
+	for rows.Next() {
+		s, err := scanSession(rows)
+		if err != nil {
+			return nil, fmt.Errorf("registry: list sessions scan: %w", err)
+		}
+		out = append(out, *s)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("registry: list sessions rows: %w", err)
+	}
+	return out, nil
+}
+
+func (r *Postgres) ListStaleSessions(ctx context.Context, state string, cutoff time.Time) ([]MultipartSession, error) {
+	rows, err := r.pool.Query(ctx,
+		`SELECT upload_id, bucket, object_key, state, content_type, metadata, created_at,
+		        content_encoding, content_disposition, content_language, cache_control, expires,
+		        website_redirect_location, checksum_algorithm, checksum_type
+		 FROM ingot.multipart_sessions WHERE state = $1 AND created_at < $2
+		 ORDER BY created_at ASC`,
+		state, cutoff)
+	if err != nil {
+		return nil, fmt.Errorf("registry: list stale sessions: %w", err)
+	}
+	defer rows.Close()
+
+	var out []MultipartSession
+	for rows.Next() {
+		s, err := scanSession(rows)
+		if err != nil {
+			return nil, fmt.Errorf("registry: list stale sessions scan: %w", err)
+		}
+		out = append(out, *s)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("registry: list stale sessions rows: %w", err)
+	}
+	return out, nil
+}
+
+func (r *Postgres) CountPartRefs(ctx context.Context, digest []byte, excludeUploadID string) (int, error) {
+	var n int
+	err := r.pool.QueryRow(ctx,
+		`SELECT count(*) FROM ingot.multipart_parts
+		 WHERE $1 = ANY(blob_digests) AND upload_id <> $2`,
+		digest, excludeUploadID).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("registry: count part refs: %w", err)
+	}
+	return n, nil
 }
 
 // GCStore ====================================================================

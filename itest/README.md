@@ -37,14 +37,13 @@ yet — e.g. one built from an unmerged branch — point the stack at it:
 INGOT_ITEST_UPLOAD_IMAGE=<image> make itest
 ```
 
-**Teardown-blocked XFail rows:** a bucket that ever held a non-empty object
-body cannot currently be deleted — bodies register blobs in the bucket's
-space at PUT, `DeleteObject`'s blob release is a no-op until sprue/piri
-implement `/blob/remove`, and hilt's `/s3/bucket/delete` refuses non-empty
-spaces. Upstream cases delete their bucket in teardown, so such cases pass
-their S3 assertions and fail teardown; they sit in the XFail tables (marked
-"teardown-blocked") so the unexpected-pass ratchet flags them for promotion
-when `/blob/remove` lands.
+**Teardown-blocked XFail rows (historical):** before `DeleteObject` released
+network blobs (FIL-588), a bucket that ever held a non-empty object body
+could not be deleted — hilt's `/s3/bucket/delete` refuses non-empty spaces —
+so dozens of cases passed their S3 assertions and failed their bucket-delete
+teardown, and sat in the XFail tables marked "teardown-blocked". The
+unexpected-pass ratchet flagged them all when the release path landed; they
+now live in the pass tables.
 
 ## The conformance partition — `TestForgeVersity`
 
@@ -68,7 +67,7 @@ here and add new cases to the pass table (demote to xfail if they fail).
 
 | Test | Covers | ~time |
 |---|---|---|
-| `TestForgeScenarios` | Ingot-unique behaviors upstream can't assert, on a stack whose ingot config lowers `max_blob_size` to 64 KiB (`testdata/config-smallblob.yaml`): coarse blob-split round-trip with spooled-by-digest proof (spool counted inside the container), zero-byte objects, a multipart part spanning multiple internal blobs, and failed-Complete session recovery. | ~3 min |
+| `TestForgeScenarios` | Ingot-unique behaviors upstream can't assert, on a stack whose ingot config lowers `max_blob_size` to 64 KiB (`testdata/config-smallblob.yaml`): coarse blob-split round-trip with spooled-by-digest proof (spool counted inside the container), zero-byte objects, a multipart part spanning multiple internal blobs, abort deleting the parts' spooled blobs, and failed-Complete session recovery. | ~3 min |
 | `TestForgeNativeProvision` | Hilt onboarding end-to-end on a fresh stack: tenant + access key via hilt's Tenant API, then a PUT/GET round-trip over the real ship path. | ~1.7 min |
 | `TestForgeReadAfterEviction` | The appliance read tier: PUT, wipe `/data/spool`, GET must re-fetch body blobs from piri via the local locator + `/content/retrieve`. | ~1.3 min |
 

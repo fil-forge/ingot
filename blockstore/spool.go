@@ -50,6 +50,18 @@ func (s *Spool) Path(digest mh.Multihash) string {
 	return filepath.Join(s.dir, hex.EncodeToString(digest))
 }
 
+// Remove deletes the blob with the given digest from the spool. Idempotent:
+// removing a blob that isn't spooled is not an error. Callers own the
+// is-it-safe-to-delete question (shared, content-addressed blobs may be
+// referenced by other parts or committed objects).
+func (s *Spool) Remove(digest mh.Multihash) error {
+	err := os.Remove(s.Path(digest))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("blockstore: spool remove: %w", err)
+	}
+	return nil
+}
+
 // WriteBlob streams r to the spool, computing its sha256 digest as it writes so
 // the blob is never held whole in memory (object-body blobs run up to
 // max_blob_size = 256 MiB; buffering them would put that × concurrency in RAM).

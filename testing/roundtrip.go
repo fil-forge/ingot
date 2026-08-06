@@ -60,6 +60,16 @@ func PutBytes(ctx context.Context, c Config, bucket, key string, body []byte) er
 	return err
 }
 
+// DeleteObject deletes object key from bucket.
+func DeleteObject(ctx context.Context, c Config, bucket, key string) error {
+	cl, err := s3Client(ctx, c)
+	if err != nil {
+		return err
+	}
+	_, err = cl.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: &bucket, Key: &key})
+	return err
+}
+
 // ListKeys returns every object key in bucket via undelimited ListObjectsV2
 // pages — the listing shape that fetches every leaf's manifest (no
 // common-prefix collapsing).
