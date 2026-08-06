@@ -430,3 +430,81 @@ func TestListParts_Checksums(t *testing.T) {
 		t.Fatalf("internal CRC64NVME leaked into ListParts: %s", *res.Parts[0].ChecksumCRC64NVME)
 	}
 }
+
+// TestCopyObject_Checksums: a copy without a checksum request propagates the
+// source's checksum verbatim; a copy naming a different algorithm replaces it
+// with a recomputed full-object value (the old algorithm's field goes nil),
+// and the result agrees with a subsequent HEAD.
+func TestCopyObject_Checksums(t *testing.T) {
+	b, _, _ := newRefTestBackend(t)
+	bucket := "bk"
+	data := []byte("copy-source-bytes")
+	crcSum := crc32cB64(data)
+
+	srcKey := "cp-src"
+	if _, err := b.PutObject(context.Background(), s3response.PutObjectInput{
+		Bucket:         &bucket,
+		Key:            &srcKey,
+		Body:           bytes.NewReader(data),
+		ChecksumCRC32C: &crcSum,
+	}); err != nil {
+		t.Fatalf("PutObject: %v", err)
+	}
+
+	// No checksum request → the source's CRC32C carries over.
+	dstKey, src := "cp-propagate", bucket+"/"+srcKey
+	out, err := b.CopyObject(context.Background(), s3response.CopyObjectInput{
+		Bucket: &bucket, Key: &dstKey, CopySource: &src,
+	})
+	if err != nil {
+		t.Fatalf("CopyObject: %v", err)
+	}
+	if out.CopyObjectResult.ChecksumCRC32C == nil || *out.CopyObjectResult.ChecksumCRC32C != crcSum {
+		t.Fatalf("propagate: result CRC32C = %v, want %s", out.CopyObjectResult.ChecksumCRC32C, crcSum)
+	}
+	if out.CopyObjectResult.ChecksumType != types.ChecksumTypeFullObject {
+		t.Fatalf("propagate: type = %v, want FULL_OBJECT", out.CopyObjectResult.ChecksumType)
+	}
+	hCrc32c, _, _, _ := headChecksum(t, b, dstKey)
+	if hCrc32c == nil || *hCrc32c != crcSum {
+		t.Fatalf("propagate: HEAD CRC32C = %v, want %s", hCrc32c, crcSum)
+	}
+
+	// A different requested algorithm replaces the checksum: SHA256 set to the
+	// recomputed body digest, the source's CRC32C dropped.
+	dstKey = "cp-replace"
+	out, err = b.CopyObject(context.Background(), s3response.CopyObjectInput{
+		Bucket: &bucket, Key: &dstKey, CopySource: &src,
+		ChecksumAlgorithm: types.ChecksumAlgorithmSha256,
+	})
+	if err != nil {
+		t.Fatalf("CopyObject: %v", err)
+	}
+	if out.CopyObjectResult.ChecksumSHA256 == nil || *out.CopyObjectResult.ChecksumSHA256 != sha256B64(data) {
+		t.Fatalf("replace: result SHA256 = %v, want %s", out.CopyObjectResult.ChecksumSHA256, sha256B64(data))
+	}
+	if out.CopyObjectResult.ChecksumCRC32C != nil {
+		t.Fatalf("replace: source CRC32C survived: %s", *out.CopyObjectResult.ChecksumCRC32C)
+	}
+	_, _, hSha, hType := headChecksum(t, b, dstKey)
+	if hSha == nil || *hSha != sha256B64(data) || hType != types.ChecksumTypeFullObject {
+		t.Fatalf("replace: HEAD = %v/%v, want %s/FULL_OBJECT", hSha, hType, sha256B64(data))
+	}
+
+	// Self-copy with REPLACE swapping the algorithm again.
+	selfSrc := bucket + "/" + dstKey
+	out, err = b.CopyObject(context.Background(), s3response.CopyObjectInput{
+		Bucket: &bucket, Key: &dstKey, CopySource: &selfSrc,
+		MetadataDirective: types.MetadataDirectiveReplace,
+		ChecksumAlgorithm: types.ChecksumAlgorithmCrc32c,
+	})
+	if err != nil {
+		t.Fatalf("self-copy: %v", err)
+	}
+	if out.CopyObjectResult.ChecksumCRC32C == nil || *out.CopyObjectResult.ChecksumCRC32C != crcSum {
+		t.Fatalf("self-copy: result CRC32C = %v, want %s", out.CopyObjectResult.ChecksumCRC32C, crcSum)
+	}
+	if out.CopyObjectResult.ChecksumSHA256 != nil {
+		t.Fatalf("self-copy: SHA256 survived: %s", *out.CopyObjectResult.ChecksumSHA256)
+	}
+}

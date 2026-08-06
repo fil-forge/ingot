@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/fil-forge/versitygw/backend"
+	"github.com/fil-forge/versitygw/s3api/utils"
 	"github.com/fil-forge/versitygw/s3err"
 	"github.com/fil-forge/versitygw/s3response"
 
@@ -83,16 +85,42 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 		return s3response.CopyObjectOutput{}, err
 	}
 
+	// Destination checksum: same bytes → the source's checksum (and type)
+	// carries over. A request naming a DIFFERENT x-amz-checksum-algorithm
+	// replaces it: the shared body streams through the new algorithm once and
+	// the result is a full-object value — the sole per-object checksum, never
+	// accumulated alongside the source's.
+	ckAlgo, ckVal, ckType := srcMf.ChecksumAlgorithm, srcMf.Checksum, srcMf.ChecksumType
+	if ckVal != "" && ckType == "" {
+		ckType = string(types.ChecksumTypeFullObject)
+	}
+	if reqAlgo := input.ChecksumAlgorithm; reqAlgo != "" && string(reqAlgo) != srcMf.ChecksumAlgorithm {
+		ht, err := hashTypeForAlgo(reqAlgo)
+		if err != nil {
+			return s3response.CopyObjectOutput{}, err
+		}
+		rc := msbucket.OpenBody(ctx, b.read, srcRv.st.Space, srcMf.Body)
+		defer rc.Close()
+		hr, err := utils.NewHashReader(rc, "", ht)
+		if err != nil {
+			return s3response.CopyObjectOutput{}, fmt.Errorf("s3frontend: copy checksum reader: %w", err)
+		}
+		if _, err := io.Copy(io.Discard, hr); err != nil {
+			return s3response.CopyObjectOutput{}, fmt.Errorf("s3frontend: copy checksum: %w", err)
+		}
+		ckAlgo, ckVal, ckType = string(reqAlgo), hr.Sum(), string(types.ChecksumTypeFullObject)
+	}
+
 	// Destination manifest: the SAME body (size/sha/md5/blobs) and ETag, since
 	// the content is identical. Metadata per the directive.
 	dstMf := &msbucket.ObjectManifest{
-		Key:     dstKey,
-		Created: time.Now().Unix(),
-		Body:    srcMf.Body,
-		ETag:    srcMf.ETag,
-		// Same content → same additional checksum, regardless of directive.
-		ChecksumAlgorithm: srcMf.ChecksumAlgorithm,
-		Checksum:          srcMf.Checksum,
+		Key:               dstKey,
+		Created:           time.Now().Unix(),
+		Body:              srcMf.Body,
+		ETag:              srcMf.ETag,
+		ChecksumAlgorithm: ckAlgo,
+		Checksum:          ckVal,
+		ChecksumType:      ckType,
 	}
 	if replace {
 		ct := backend.GetStringFromPtr(input.ContentType)
@@ -130,11 +158,13 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 
 	lastMod := time.Unix(dstMf.Created, 0)
 	etag := etagOf(dstMf)
+	result := &s3response.CopyObjectResult{
+		ETag:         &etag,
+		LastModified: &lastMod,
+	}
+	result.ChecksumCRC32, result.ChecksumCRC32C, result.ChecksumSHA1, result.ChecksumSHA256, result.ChecksumCRC64NVME, result.ChecksumSHA512, result.ChecksumMD5, result.ChecksumXXHASH64, result.ChecksumXXHASH3, result.ChecksumXXHASH128, result.ChecksumType = checksumFields(dstMf.ChecksumAlgorithm, dstMf.Checksum, dstMf.ChecksumType)
 	out := s3response.CopyObjectOutput{
-		CopyObjectResult: &s3response.CopyObjectResult{
-			ETag:         &etag,
-			LastModified: &lastMod,
-		},
+		CopyObjectResult: result,
 	}
 	// Version ids in the response, per each side's bucket state (§4.3).
 	if srcRv.versioned() {
