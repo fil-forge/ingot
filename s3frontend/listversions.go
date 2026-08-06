@@ -192,6 +192,9 @@ func (b *Backend) ListObjectVersions(ctx context.Context, input *s3.ListObjectVe
 				if mf.ChecksumAlgorithm != "" && mf.Checksum != "" {
 					ov.ChecksumAlgorithm = []types.ChecksumAlgorithm{types.ChecksumAlgorithm(mf.ChecksumAlgorithm)}
 					ov.ChecksumType = types.ChecksumTypeFullObject
+					if mf.ChecksumType != "" {
+						ov.ChecksumType = types.ChecksumType(mf.ChecksumType)
+					}
 				}
 				res.Versions = append(res.Versions, ov)
 			}

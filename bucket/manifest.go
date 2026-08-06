@@ -35,8 +35,13 @@ type ObjectManifest struct {
 	// "SHA256", "CRC32") and the base64 value computed over the body. Stored so
 	// GET/HEAD can echo it under x-amz-checksum-mode. Empty when no additional
 	// checksum was requested. Independent of the internal sha256 content address.
+	// ChecksumType is the S3 checksum type of Checksum: "FULL_OBJECT" (computed
+	// over the whole body) or "COMPOSITE" (a multipart checksum-of-checksums
+	// with a "-N" part-count suffix). Empty in blocks written before the type
+	// was recorded, which are all full-object.
 	ChecksumAlgorithm string `cborgen:"ca"`
 	Checksum          string `cborgen:"ck"`
+	ChecksumType      string `cborgen:"cy"`
 
 	// HTTP/S3 system headers carried through PUT and replayed on
 	// HEAD/GET. Empty strings are omitted from responses.
