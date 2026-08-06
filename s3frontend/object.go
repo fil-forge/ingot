@@ -132,12 +132,12 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 		WebsiteRedirectLocation: backend.GetStringFromPtr(input.WebsiteRedirectLocation),
 		Metadata:                input.Metadata,
 	}
-	node, effState, err := b.commitVersion(ctx, bucketState, key, mf, func(displaced *msbucket.ObjectManifest) error {
+	node, effState, err := b.commitVersion(ctx, bucketState, key, mf, func(superseded *msbucket.ObjectManifest) error {
 		// Race-safe re-check of If-Match / If-None-Match under the lock. A
 		// delete-marker current means "no object" for precondition purposes.
 		oldETag, oldExists := "", false
-		if displaced != nil && !displaced.DeleteMarker {
-			oldETag, oldExists = etagOf(displaced), true
+		if superseded != nil && !superseded.DeleteMarker {
+			oldETag, oldExists = etagOf(superseded), true
 		}
 		return backend.EvaluateObjectPutPreconditions(oldETag, input.IfMatch, input.IfNoneMatch, oldExists)
 	})
@@ -639,20 +639,22 @@ func (b *Backend) insertDeleteMarker(ctx context.Context, bucketState *registry.
 		Created:      time.Now().Unix(),
 		DeleteMarker: true,
 	}
-	node, _, err := b.commitVersion(ctx, bucketState, key, mf, func(displaced *msbucket.ObjectManifest) error {
-		if preconds == nil || displaced == nil || displaced.DeleteMarker {
+	node, _, err := b.commitVersion(ctx, bucketState, key, mf, func(superseded *msbucket.ObjectManifest) error {
+		if preconds == nil || superseded == nil || superseded.DeleteMarker {
 			return nil
 		}
-		return backend.EvaluateObjectDeletePreconditions(etagOf(displaced), time.Unix(displaced.Created, 0), displaced.Body.Size, *preconds)
+		return backend.EvaluateObjectDeletePreconditions(etagOf(superseded), time.Unix(superseded.Created, 0), superseded.Body.Size, *preconds)
 	})
 	return node, err
 }
 
 // deleteObjectKey permanently removes one key — the unversioned bucket's
-// delete: it drops the whole leaf and releases the (single, null) version's
-// body blobs through the reference index. Missing keys (and an empty bucket)
-// are idempotent no-ops. preconds, when non-nil, gates the delete on If-Match /
-// size / mod-time under the lock. Shared by DeleteObject and DeleteObjects.
+// delete: it drops the key's value (the bare manifest; a leaf never occurs
+// on a purely-unversioned bucket, but is handled for completeness) and
+// releases the (single, null) version's body blobs through the reference
+// index. Missing keys (and an empty bucket) are idempotent no-ops. preconds,
+// when non-nil, gates the delete on If-Match / size / mod-time under the
+// lock. Shared by DeleteObject and DeleteObjects.
 func (b *Backend) deleteObjectKey(ctx context.Context, bucketState *registry.State, key string, preconds *backend.ObjectDeletePreconditions) error {
 	var oldDigests [][]byte
 	var oldVersionID string
@@ -664,28 +666,31 @@ func (b *Backend) deleteObjectKey(ctx context.Context, bucketState *registry.Sta
 		}
 		t := tx.LoadTree()
 
-		// Load the leaf + manifest being removed so the body blobs can be
+		// Load the value + manifest being removed so the body blobs can be
 		// released through the reference index.
-		leafCid, gerr := t.Get(ctx, key)
+		valCid, gerr := t.Get(ctx, key)
 		if errors.Is(gerr, mst.ErrNotFound) {
 			return cid.Undef, nil // idempotent DELETE: missing key isn't an error
 		}
 		if gerr != nil {
 			return cid.Undef, fmt.Errorf("mst get: %w", gerr)
 		}
-		var leaf msbucket.ObjectLeaf
-		if err := tx.Get(ctx, tx.State().Space, leafCid, &leaf); err != nil {
-			return cid.Undef, fmt.Errorf("load leaf: %w", err)
+		var val msbucket.ObjectValue
+		if err := tx.Get(ctx, tx.State().Space, valCid, &val); err != nil {
+			return cid.Undef, fmt.Errorf("load value: %w", err)
 		}
-		var oldMf msbucket.ObjectManifest
-		if err := tx.Get(ctx, tx.State().Space, leaf.Current.Manifest, &oldMf); err != nil {
-			return cid.Undef, fmt.Errorf("load manifest: %w", err)
+		oldMf := val.Manifest
+		if val.Leaf != nil {
+			oldMf = new(msbucket.ObjectManifest)
+			if err := tx.Get(ctx, tx.State().Space, val.Leaf.Current.Manifest, oldMf); err != nil {
+				return cid.Undef, fmt.Errorf("load manifest: %w", err)
+			}
 		}
 
 		// Preconditions (If-Match / size / mod-time) under the lock against the
 		// version being removed.
 		if preconds != nil {
-			if err := backend.EvaluateObjectDeletePreconditions(etagOf(&oldMf), time.Unix(oldMf.Created, 0), oldMf.Body.Size, *preconds); err != nil {
+			if err := backend.EvaluateObjectDeletePreconditions(etagOf(oldMf), time.Unix(oldMf.Created, 0), oldMf.Body.Size, *preconds); err != nil {
 				return cid.Undef, err
 			}
 		}
@@ -694,14 +699,19 @@ func (b *Backend) deleteObjectKey(ctx context.Context, bucketState *registry.Sta
 		if err != nil {
 			return cid.Undef, fmt.Errorf("mst delete: %w", err)
 		}
-		if err := b.gc.AddGCCandidate(ctx, leaf.Current.Manifest.Bytes(), bucketState.Name); err != nil {
-			return cid.Undef, fmt.Errorf("gc candidate: %w", err)
+		// A bare key's value block is the manifest itself — one candidate
+		// covers it; a leaf key contributes the leaf block and its current
+		// manifest.
+		if val.Leaf != nil {
+			if err := b.gc.AddGCCandidate(ctx, val.Leaf.Current.Manifest.Bytes(), bucketState.Name); err != nil {
+				return cid.Undef, fmt.Errorf("gc candidate: %w", err)
+			}
 		}
-		if err := b.gc.AddGCCandidate(ctx, leafCid.Bytes(), bucketState.Name); err != nil {
+		if err := b.gc.AddGCCandidate(ctx, valCid.Bytes(), bucketState.Name); err != nil {
 			return cid.Undef, fmt.Errorf("gc candidate: %w", err)
 		}
 		oldDigests = bodyDigests(oldMf.Body)
-		oldVersionID = leaf.Current.VersionID
+		oldVersionID = oldMf.VersionID
 		return t2.GetPointer(ctx, tx)
 	})
 	if err != nil {
@@ -962,7 +972,7 @@ func (b *Backend) listWalk(ctx context.Context, bucketName, prefix, delimiter, f
 
 	t := mst.LoadMST(b.read, st.Space, st.Root)
 	seenPrefix := map[string]struct{}{}
-	walkErr := t.WalkLeavesFromNocache(ctx, from, func(k string, leafCid cid.Cid) error {
+	walkErr := t.WalkLeavesFromNocache(ctx, from, func(k string, valCid cid.Cid) error {
 		if prefix != "" && !strings.HasPrefix(k, prefix) {
 			return mst.ErrStopWalk
 		}
@@ -970,14 +980,20 @@ func (b *Backend) listWalk(ctx context.Context, bucketName, prefix, delimiter, f
 		// Resolve the key's current version first: a key whose current version
 		// is a delete marker is invisible to ListObjects — it produces neither
 		// a Contents entry nor a CommonPrefix (docs/s3-versioning.md §9.1).
-		var leaf msbucket.ObjectLeaf
-		if err := b.read.Get(ctx, st.Space, leafCid, &leaf); err != nil {
-			return fmt.Errorf("leaf get %s: %w", leafCid, err)
+		// A bare key's value block is the manifest itself (§2.1); a leaf key
+		// costs one more fetch.
+		var val msbucket.ObjectValue
+		if err := b.read.Get(ctx, st.Space, valCid, &val); err != nil {
+			return fmt.Errorf("value get %s: %w", valCid, err)
 		}
-		var mf msbucket.ObjectManifest
-		if err := b.read.Get(ctx, st.Space, leaf.Current.Manifest, &mf); err != nil {
-			return fmt.Errorf("manifest get %s: %w", leaf.Current.Manifest, err)
+		mfp := val.Manifest
+		if val.Leaf != nil {
+			mfp = new(msbucket.ObjectManifest)
+			if err := b.read.Get(ctx, st.Space, val.Leaf.Current.Manifest, mfp); err != nil {
+				return fmt.Errorf("manifest get %s: %w", val.Leaf.Current.Manifest, err)
+			}
 		}
+		mf := *mfp
 		if mf.DeleteMarker {
 			return nil
 		}

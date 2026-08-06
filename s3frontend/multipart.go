@@ -380,18 +380,18 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 	}
 
 	// Commit through the §5 write rule (docs/s3-versioning.md): seq allocation,
-	// displacement per the bucket's versioning state, and the post-commit
+	// supersession per the bucket's versioning state, and the post-commit
 	// reference-index reconcile. The conditional-write preconditions re-check
 	// under the lock so a racing writer can't slip between the pre-check above
 	// and the swap.
-	node, effState, err := b.commitVersion(ctx, bucketState, key, mf, func(displaced *msbucket.ObjectManifest) error {
+	node, effState, err := b.commitVersion(ctx, bucketState, key, mf, func(superseded *msbucket.ObjectManifest) error {
 		if ifMatch == nil && ifNoneMatch == nil {
 			return nil
 		}
 		// A delete-marker current means "no object" for precondition purposes.
 		oldETag, oldExists := "", false
-		if displaced != nil && !displaced.DeleteMarker {
-			oldETag, oldExists = etagOf(displaced), true
+		if superseded != nil && !superseded.DeleteMarker {
+			oldETag, oldExists = etagOf(superseded), true
 		}
 		if ifMatch != nil {
 			if !oldExists {

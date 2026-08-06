@@ -19,8 +19,9 @@ import (
 )
 
 // This file implements the per-key version-tree design of
-// docs/s3-versioning.md: the version_id token (§3), the ObjectLeaf/prev-tree
-// helpers (§2), version resolution for reads (§6.1), the write rule (§5), and
+// docs/s3-versioning.md: the version_id token (§3), the two-form value
+// (bare manifest vs enveloped ObjectLeaf, §2.1) and prev-tree helpers,
+// version resolution for reads (§6.1), the write rule (§5), and
 // version-scoped delete (§7.2).
 
 // mintVersionID renders a numbered version's client id: a ULID whose 48-bit
@@ -106,14 +107,25 @@ func prevHead(ctx context.Context, t *mst.MerkleSearchTree) (mfCid cid.Cid, ok b
 }
 
 // resolvedVersion is the outcome of resolving (bucket, key, versionId) through
-// the leaf: the version's node identity, its manifest, and whether it is the
-// key's current version.
+// the key's value block: the version's node identity, its manifest, and
+// whether it is the key's current version. leaf is nil for a bare
+// (single-version) key (§2.1).
 type resolvedVersion struct {
 	st       *registry.State
-	leaf     msbucket.ObjectLeaf
+	leaf     *msbucket.ObjectLeaf
 	node     msbucket.VersionNode
 	mf       *msbucket.ObjectManifest
 	isLatest bool
+}
+
+// bareVersionID returns a bare manifest's version id for matching and
+// blob_refs rows: the null sentinel when the block predates versioning
+// (VersionID "", which §10 rules out but the fallback keeps harmless).
+func bareVersionID(mf *msbucket.ObjectManifest) string {
+	if mf.VersionID == "" {
+		return registry.NullVersionID
+	}
+	return mf.VersionID
 }
 
 // versioned reports whether the bucket has a versioning configuration, i.e.
@@ -122,11 +134,13 @@ func (rv *resolvedVersion) versioned() bool {
 	return rv.st.Versioning.Configured()
 }
 
-// resolveVersion implements §6.1: registry → top MST → leaf → (current | null |
-// prev-tree seek). Maps missing bucket/key to the S3 errors; a versionId that
-// is well-formed but names no live version is ErrNoSuchVersion; a malformed one
-// is 400 InvalidArgument. Delete-marker semantics (404 vs 405) are the
-// caller's — the marker's manifest is returned like any other version's.
+// resolveVersion implements §6.1: registry → top MST → value block → for a
+// bare key the single manifest answers every versionId class; for a leaf key,
+// (current | null | prev-tree seek). Maps missing bucket/key to the S3
+// errors; a versionId that is well-formed but names no live version is
+// ErrNoSuchVersion; a malformed one is 400 InvalidArgument. Delete-marker
+// semantics (404 vs 405) are the caller's — the marker's manifest is
+// returned like any other version's.
 func (b *Backend) resolveVersion(ctx context.Context, bucketName, key, versionID string) (*resolvedVersion, error) {
 	st, err := b.reg.Get(ctx, bucketName)
 	if err != nil {
@@ -145,7 +159,7 @@ func (b *Backend) resolveVersion(ctx context.Context, bucketName, key, versionID
 		return nil, s3err.GetAPIError(s3err.ErrNoSuchKey)
 	}
 	t := mst.LoadMST(b.read, st.Space, st.Root)
-	leafCid, err := t.Get(ctx, key)
+	valCid, err := t.Get(ctx, key)
 	if errors.Is(err, mst.ErrNotFound) {
 		return nil, s3err.GetAPIError(s3err.ErrNoSuchKey)
 	}
@@ -153,9 +167,29 @@ func (b *Backend) resolveVersion(ctx context.Context, bucketName, key, versionID
 		return nil, fmt.Errorf("s3frontend: mst get: %w", err)
 	}
 	rv := &resolvedVersion{st: st}
-	if err := b.read.Get(ctx, st.Space, leafCid, &rv.leaf); err != nil {
-		return nil, fmt.Errorf("s3frontend: leaf get: %w", err)
+	var val msbucket.ObjectValue
+	if err := b.read.Get(ctx, st.Space, valCid, &val); err != nil {
+		return nil, fmt.Errorf("s3frontend: value get: %w", err)
 	}
+
+	if val.Manifest != nil {
+		// Bare key (§2.1): the single manifest answers every versionId class.
+		rv.mf = val.Manifest
+		rv.node = msbucket.VersionNode{Seq: val.Manifest.Seq, VersionID: bareVersionID(val.Manifest), Manifest: valCid}
+		rv.isLatest = true
+		switch kind {
+		case versionKindNull:
+			if rv.node.VersionID != registry.NullVersionID {
+				return nil, s3err.GetNoSuchVersionErr(key, versionID)
+			}
+		case versionKindToken:
+			if val.Manifest.VersionID != versionID {
+				return nil, s3err.GetNoSuchVersionErr(key, versionID)
+			}
+		}
+		return rv, nil
+	}
+	rv.leaf = val.Leaf
 
 	// Locate the requested version: the current node, or a prev-tree seek.
 	switch kind {
@@ -218,18 +252,19 @@ type discardedVersion struct {
 // commitVersion runs the §5 write rule for one new version (a PutObject /
 // CopyObject / CompleteMultipartUpload manifest, or a delete marker): it
 // allocates the seq under the per-bucket critical section, stamps mf with
-// Seq/VersionID, displaces the current version per the bucket's versioning
-// state, splices the rebuilt leaf, and — after the commit is durable —
-// reconciles the reference index (claims for the new version; releases for
-// discarded ones). preCheck, when non-nil, runs under the lock against the
-// displaced current manifest (nil when the key is new) before anything is
-// written, so conditional mutations are race-safe.
+// Seq/VersionID, supersedes the current version per the bucket's versioning
+// state, splices the rebuilt value (a bare manifest CID until the key's
+// first retained supersession creates its leaf, §2.1/§5.2), and — after the
+// commit is durable — reconciles the reference index (claims for the new
+// version; releases for discarded ones). preCheck, when non-nil, runs under
+// the lock against the superseded current manifest (nil when the key is new)
+// before anything is written, so conditional mutations are race-safe.
 //
 // The returned VersioningState is the bucket state read UNDER the lock — the
 // state that actually decided the version's id. Response shaping must gate on
 // it, not on the caller's pre-lock snapshot, so a racing PutBucketVersioning
 // can't mint an id the response then omits.
-func (b *Backend) commitVersion(ctx context.Context, bucketState *registry.State, key string, mf *msbucket.ObjectManifest, preCheck func(displaced *msbucket.ObjectManifest) error) (msbucket.VersionNode, registry.VersioningState, error) {
+func (b *Backend) commitVersion(ctx context.Context, bucketState *registry.State, key string, mf *msbucket.ObjectManifest, preCheck func(superseded *msbucket.ObjectManifest) error) (msbucket.VersionNode, registry.VersioningState, error) {
 	var node msbucket.VersionNode
 	var discards []discardedVersion
 	var effState registry.VersioningState
@@ -256,20 +291,33 @@ func (b *Backend) commitVersion(ctx context.Context, bucketState *registry.State
 
 		t := tx.LoadTree()
 		var oldLeaf *msbucket.ObjectLeaf
-		var displacedMf *msbucket.ObjectManifest
-		oldLeafCid, gerr := t.Get(ctx, key)
+		var superseded *msbucket.VersionNode // nil when the key is new
+		var supersededMf *msbucket.ObjectManifest
+		oldValCid, gerr := t.Get(ctx, key)
 		switch {
 		case gerr == nil:
-			oldLeaf = new(msbucket.ObjectLeaf)
-			if err := tx.Get(ctx, st.Space, oldLeafCid, oldLeaf); err != nil {
-				return cid.Undef, fmt.Errorf("load prior leaf: %w", err)
+			var val msbucket.ObjectValue
+			if err := tx.Get(ctx, st.Space, oldValCid, &val); err != nil {
+				return cid.Undef, fmt.Errorf("load prior value: %w", err)
 			}
-			displacedMf = new(msbucket.ObjectManifest)
-			if err := tx.Get(ctx, st.Space, oldLeaf.Current.Manifest, displacedMf); err != nil {
-				return cid.Undef, fmt.Errorf("load prior manifest: %w", err)
+			if val.Leaf != nil {
+				oldLeaf = val.Leaf
+				supersededMf = new(msbucket.ObjectManifest)
+				if err := tx.Get(ctx, st.Space, oldLeaf.Current.Manifest, supersededMf); err != nil {
+					return cid.Undef, fmt.Errorf("load prior manifest: %w", err)
+				}
+				superseded = &oldLeaf.Current
+			} else {
+				// Bare key (§2.1): the value block is the manifest itself.
+				supersededMf = val.Manifest
+				superseded = &msbucket.VersionNode{
+					Seq:       val.Manifest.Seq,
+					VersionID: bareVersionID(val.Manifest),
+					Manifest:  oldValCid,
+				}
 			}
 		case errors.Is(gerr, mst.ErrNotFound):
-			// new key — no displacement
+			// new key — no supersession
 		default:
 			return cid.Undef, fmt.Errorf("mst get prior: %w", gerr)
 		}
@@ -277,49 +325,58 @@ func (b *Backend) commitVersion(ctx context.Context, bucketState *registry.State
 		// Race-safe re-check of the caller's preconditions against the current
 		// state under the lock.
 		if preCheck != nil {
-			if err := preCheck(displacedMf); err != nil {
+			if err := preCheck(supersededMf); err != nil {
 				return cid.Undef, err
 			}
 		}
 
-		newLeaf := msbucket.ObjectLeaf{Current: msbucket.VersionNode{Seq: seq, VersionID: vid, Manifest: mfCid}}
+		newNode := msbucket.VersionNode{Seq: seq, VersionID: vid, Manifest: mfCid}
+		var newLeaf *msbucket.ObjectLeaf // nil → the value stays a bare manifest
+		if oldLeaf != nil {
+			newLeaf = &msbucket.ObjectLeaf{Current: newNode, NullSeq: oldLeaf.NullSeq}
+		}
 		var prevTree *mst.MerkleSearchTree
 		retained, evictedNull := false, false
-		if oldLeaf != nil {
-			newLeaf.NullSeq = oldLeaf.NullSeq
-			if oldLeaf.Prev != nil {
+		if superseded != nil {
+			if oldLeaf != nil && oldLeaf.Prev != nil {
 				prevTree = mst.LoadMST(tx, st.Space, *oldLeaf.Prev)
 			}
-			displaced := oldLeaf.Current
 
-			// Displacement (§5.2): Enabled retains everything; Suspended and
+			// Supersession (§5.2): Enabled retains everything; Suspended and
 			// Unversioned replace a null current in place.
 			retain := st.Versioning == registry.VersioningEnabled ||
-				displaced.VersionID != registry.NullVersionID
+				superseded.VersionID != registry.NullVersionID
 			retained = retain
 			if retain {
+				if newLeaf == nil {
+					// First supersession: the bare key gains its leaf (§5.2)
+					// and keeps it from now on (invariant 6).
+					newLeaf = &msbucket.ObjectLeaf{Current: newNode}
+				}
 				if prevTree == nil {
 					prevTree = mst.NewEmptyMST(tx, st.Space)
 				}
-				prevTree, err = prevTree.Add(ctx, revSeqKey(displaced.Seq), displaced.Manifest, -1)
+				prevTree, err = prevTree.Add(ctx, revSeqKey(superseded.Seq), superseded.Manifest, -1)
 				if err != nil {
 					return cid.Undef, fmt.Errorf("prev add: %w", err)
 				}
-				if displaced.VersionID == registry.NullVersionID {
-					newLeaf.NullSeq = displaced.Seq
+				if superseded.VersionID == registry.NullVersionID {
+					newLeaf.NullSeq = superseded.Seq
 				}
 			} else {
-				discards = append(discards, discardedVersion{displaced.VersionID, bodyDigests(displacedMf.Body)})
-				if err := b.gc.AddGCCandidate(ctx, displaced.Manifest.Bytes(), st.Name); err != nil {
+				// Discard (null over null). A bare key stays bare; its value
+				// block is the manifest queued for GC just below.
+				discards = append(discards, discardedVersion{superseded.VersionID, bodyDigests(supersededMf.Body)})
+				if err := b.gc.AddGCCandidate(ctx, superseded.Manifest.Bytes(), st.Name); err != nil {
 					return cid.Undef, fmt.Errorf("gc candidate: %w", err)
 				}
 			}
 
 			// Only one null per key: a new null evicts a noncurrent null (§2.4).
-			// NullSeq is cleared unconditionally — a stale NullSeq (missing
-			// prev entry, or no prev tree at all) self-heals here instead of
-			// propagating beside a null Current.
-			if vid == registry.NullVersionID && newLeaf.NullSeq != 0 {
+			// Only a leaf key can hold one. NullSeq is cleared unconditionally —
+			// a stale NullSeq (missing prev entry, or no prev tree at all)
+			// self-heals here instead of propagating beside a null Current.
+			if newLeaf != nil && vid == registry.NullVersionID && newLeaf.NullSeq != 0 {
 				if prevTree != nil {
 					nullKey := revSeqKey(newLeaf.NullSeq)
 					nullCid, nerr := prevTree.Get(ctx, nullKey)
@@ -346,9 +403,13 @@ func (b *Backend) commitVersion(ctx context.Context, bucketState *registry.State
 				newLeaf.NullSeq = 0
 			}
 
-			// The replaced leaf block is superseded.
-			if err := b.gc.AddGCCandidate(ctx, oldLeafCid.Bytes(), st.Name); err != nil {
-				return cid.Undef, fmt.Errorf("gc candidate: %w", err)
+			// The replaced leaf block is superseded; a bare key's old value
+			// block is its manifest, which either lives on as a prev entry or
+			// was queued for GC on the discard path above.
+			if oldLeaf != nil {
+				if err := b.gc.AddGCCandidate(ctx, oldValCid.Bytes(), st.Name); err != nil {
+					return cid.Undef, fmt.Errorf("gc candidate: %w", err)
+				}
 			}
 		}
 
@@ -373,20 +434,25 @@ func (b *Backend) commitVersion(ctx context.Context, bucketState *registry.State
 			}
 		}
 
-		newLeafCid, err := tx.Put(ctx, &newLeaf)
-		if err != nil {
-			return cid.Undef, fmt.Errorf("leaf put: %w", err)
+		// The new value: the enveloped leaf when the key has (or now gains)
+		// one, else the bare manifest CID (§2.1).
+		newValCid := mfCid
+		if newLeaf != nil {
+			newValCid, err = tx.Put(ctx, &msbucket.EnvelopedLeaf{Leaf: newLeaf})
+			if err != nil {
+				return cid.Undef, fmt.Errorf("leaf put: %w", err)
+			}
 		}
 		var t2 *mst.MerkleSearchTree
-		if oldLeaf != nil {
-			t2, err = t.Update(ctx, key, newLeafCid)
+		if superseded != nil {
+			t2, err = t.Update(ctx, key, newValCid)
 		} else {
-			t2, err = t.Add(ctx, key, newLeafCid, -1)
+			t2, err = t.Add(ctx, key, newValCid, -1)
 		}
 		if err != nil {
 			return cid.Undef, fmt.Errorf("mst write: %w", err)
 		}
-		node = newLeaf.Current
+		node = newNode
 		return t2.GetPointer(ctx, tx)
 	})
 	if err != nil {
@@ -452,19 +518,53 @@ func (b *Backend) deleteVersionScoped(ctx context.Context, bucketState *registry
 			return cid.Undef, nil // no-op success: nothing to delete
 		}
 		t := tx.LoadTree()
-		leafCid, gerr := t.Get(ctx, key)
+		valCid, gerr := t.Get(ctx, key)
 		if errors.Is(gerr, mst.ErrNotFound) {
 			return cid.Undef, nil // no-op success
 		}
 		if gerr != nil {
 			return cid.Undef, fmt.Errorf("mst get: %w", gerr)
 		}
-		var leaf msbucket.ObjectLeaf
-		if err := tx.Get(ctx, st.Space, leafCid, &leaf); err != nil {
-			return cid.Undef, fmt.Errorf("load leaf: %w", err)
+		var val msbucket.ObjectValue
+		if err := tx.Get(ctx, st.Space, valCid, &val); err != nil {
+			return cid.Undef, fmt.Errorf("load value: %w", err)
 		}
 
-		// Locate the target: the current node or a prev-tree entry.
+		if val.Manifest != nil {
+			// Bare key (§2.1): the single version either matches or the
+			// delete is a no-op.
+			mf := val.Manifest
+			switch kind {
+			case versionKindNull:
+				if bareVersionID(mf) != registry.NullVersionID {
+					return cid.Undef, nil // no null version: no-op success
+				}
+			case versionKindToken:
+				if mf.VersionID != versionID {
+					return cid.Undef, nil // no-op success
+				}
+			}
+			if preconds != nil && !mf.DeleteMarker {
+				if err := backend.EvaluateObjectDeletePreconditions(etagOf(mf), time.Unix(mf.Created, 0), mf.Body.Size, *preconds); err != nil {
+					return cid.Undef, err
+				}
+			}
+			removed = discardedVersion{versionID: targetVersionID(kind, mf), digests: bodyDigests(mf.Body)}
+			res.found, res.wasMarker = true, mf.DeleteMarker
+			// The value block is the manifest — one GC candidate covers it.
+			if err := b.gc.AddGCCandidate(ctx, valCid.Bytes(), st.Name); err != nil {
+				return cid.Undef, fmt.Errorf("gc candidate: %w", err)
+			}
+			t2, err := t.Delete(ctx, key)
+			if err != nil {
+				return cid.Undef, fmt.Errorf("mst delete: %w", err)
+			}
+			return t2.GetPointer(ctx, tx)
+		}
+		leaf := val.Leaf
+
+		// Locate the target: the current node or a prev-tree entry. A leaf
+		// stays a leaf even when this delete leaves one version (invariant 6).
 		targetSeq := seq
 		isCurrent := false
 		switch kind {
@@ -526,7 +626,7 @@ func (b *Backend) deleteVersionScoped(ctx context.Context, bucketState *registry
 		if err := b.gc.AddGCCandidate(ctx, targetCid.Bytes(), st.Name); err != nil {
 			return cid.Undef, fmt.Errorf("gc candidate: %w", err)
 		}
-		if err := b.gc.AddGCCandidate(ctx, leafCid.Bytes(), st.Name); err != nil {
+		if err := b.gc.AddGCCandidate(ctx, valCid.Bytes(), st.Name); err != nil {
 			return cid.Undef, fmt.Errorf("gc candidate: %w", err)
 		}
 
@@ -606,7 +706,7 @@ func (b *Backend) spliceLeaf(ctx context.Context, tx *bucketop.Tx, t *mst.Merkle
 			leaf.Prev = &proot
 		}
 	}
-	leafCid, err := tx.Put(ctx, &leaf)
+	leafCid, err := tx.Put(ctx, &msbucket.EnvelopedLeaf{Leaf: &leaf})
 	if err != nil {
 		return cid.Undef, fmt.Errorf("leaf put: %w", err)
 	}

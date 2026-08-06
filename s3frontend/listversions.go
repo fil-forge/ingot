@@ -96,7 +96,7 @@ func (b *Backend) ListObjectVersions(ctx context.Context, input *s3.ListObjectVe
 
 	t := mst.LoadMST(b.read, st.Space, st.Root)
 	seenPrefix := map[string]struct{}{}
-	walkErr := t.WalkLeavesFromNocache(ctx, from, func(k string, leafCid cid.Cid) error {
+	walkErr := t.WalkLeavesFromNocache(ctx, from, func(k string, valCid cid.Cid) error {
 		if prefix != "" && !strings.HasPrefix(k, prefix) {
 			return mst.ErrStopWalk
 		}
@@ -126,9 +126,19 @@ func (b *Backend) ListObjectVersions(ctx context.Context, input *s3.ListObjectVe
 			}
 		}
 
-		var leaf msbucket.ObjectLeaf
-		if err := b.read.Get(ctx, st.Space, leafCid, &leaf); err != nil {
-			return fmt.Errorf("leaf get %s: %w", leafCid, err)
+		var val msbucket.ObjectValue
+		if err := b.read.Get(ctx, st.Space, valCid, &val); err != nil {
+			return fmt.Errorf("value get %s: %w", valCid, err)
+		}
+		var leaf *msbucket.ObjectLeaf
+		var current msbucket.VersionNode
+		if val.Leaf != nil {
+			leaf = val.Leaf
+			current = leaf.Current
+		} else {
+			// Bare key (§2.1): its single version is the current one, and the
+			// value block is already the manifest.
+			current = msbucket.VersionNode{Seq: val.Manifest.Seq, VersionID: bareVersionID(val.Manifest), Manifest: valCid}
 		}
 
 		// Versions of the marker key resume strictly after the marker version:
@@ -141,9 +151,9 @@ func (b *Backend) ListObjectVersions(ctx context.Context, input *s3.ListObjectVe
 		if k == keyMarker && versionIDMarker != "" {
 			switch kind, seq := classifyVersionID(versionIDMarker); kind {
 			case versionKindNull:
-				if leaf.Current.VersionID == registry.NullVersionID {
-					seqBelow = leaf.Current.Seq
-				} else if leaf.NullSeq != 0 {
+				if current.VersionID == registry.NullVersionID {
+					seqBelow = current.Seq
+				} else if leaf != nil && leaf.NullSeq != 0 {
 					seqBelow = leaf.NullSeq
 				}
 			case versionKindToken:
@@ -185,19 +195,22 @@ func (b *Backend) ListObjectVersions(ctx context.Context, input *s3.ListObjectVe
 			lastKey, lastVersionID = k, vid
 		}
 
-		if leaf.Current.Seq < seqBelow {
-			var mf msbucket.ObjectManifest
-			if err := b.read.Get(ctx, st.Space, leaf.Current.Manifest, &mf); err != nil {
-				return fmt.Errorf("manifest get %s: %w", leaf.Current.Manifest, err)
+		if current.Seq < seqBelow {
+			mf := val.Manifest
+			if mf == nil {
+				mf = new(msbucket.ObjectManifest)
+				if err := b.read.Get(ctx, st.Space, current.Manifest, mf); err != nil {
+					return fmt.Errorf("manifest get %s: %w", current.Manifest, err)
+				}
 			}
-			emit(leaf.Current, &mf, true)
+			emit(current, mf, true)
 			if full() {
 				truncated = true
 				return mst.ErrStopWalk
 			}
 		}
 
-		if leaf.Prev == nil {
+		if leaf == nil || leaf.Prev == nil {
 			return nil
 		}
 		pt := mst.LoadMST(b.read, st.Space, *leaf.Prev)

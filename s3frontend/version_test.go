@@ -654,10 +654,30 @@ func TestVersioning_NullEvictionFromPrev(t *testing.T) {
 	}
 }
 
-// TestVersioning_UnversionedLeafStaysBare pins §5.2's structural claim for
-// buckets that never version: overwrites replace in place and the leaf stays
-// {Current, nil, 0} — no prev tree is ever written.
-func TestVersioning_UnversionedLeafStaysBare(t *testing.T) {
+// getValue decodes the top-MST value block for key: a bare manifest or an
+// enveloped leaf (docs/s3-versioning.md §2.1).
+func getValue(t *testing.T, b *Backend, key string) msbucket.ObjectValue {
+	t.Helper()
+	ctx := context.Background()
+	st, err := b.reg.Get(ctx, "bk")
+	if err != nil {
+		t.Fatalf("registry get: %v", err)
+	}
+	valCid, err := mst.LoadMST(b.read, st.Space, st.Root).Get(ctx, key)
+	if err != nil {
+		t.Fatalf("mst get %s: %v", key, err)
+	}
+	var val msbucket.ObjectValue
+	if err := b.read.Get(ctx, st.Space, valCid, &val); err != nil {
+		t.Fatalf("value get %s: %v", key, err)
+	}
+	return val
+}
+
+// TestVersioning_UnversionedKeyStaysBare pins §2.1/§5.2's structural claim for
+// buckets that never version: overwrites replace in place and the key's value
+// stays a bare manifest — no leaf, no prev tree, ever.
+func TestVersioning_UnversionedKeyStaysBare(t *testing.T) {
 	b, _, _ := newRefTestBackend(t)
 	putObjV(t, b, "k1", []byte("one"))
 	putObjV(t, b, "k1", []byte("two"))
@@ -668,22 +688,53 @@ func TestVersioning_UnversionedLeafStaysBare(t *testing.T) {
 	if len(res.Versions) != 1 || *res.Versions[0].VersionId != "null" {
 		t.Fatalf("versions = %+v, want one null version", res.Versions)
 	}
-	// Structurally: the leaf carries no prev tree and no NullSeq.
-	ctx := context.Background()
-	st, err := b.reg.Get(ctx, "bk")
-	if err != nil {
-		t.Fatalf("registry get: %v", err)
+	// Structurally: the value block is the manifest itself.
+	val := getValue(t, b, "k1")
+	if val.Manifest == nil || val.Leaf != nil {
+		t.Fatalf("value = {Manifest:%v Leaf:%v}, want bare manifest", val.Manifest, val.Leaf)
 	}
-	leafCid, err := mst.LoadMST(b.read, st.Space, st.Root).Get(ctx, "k1")
-	if err != nil {
-		t.Fatalf("mst get: %v", err)
+	if val.Manifest.VersionID != "null" {
+		t.Fatalf("manifest VersionID = %q, want null", val.Manifest.VersionID)
 	}
-	var leaf msbucket.ObjectLeaf
-	if err := b.read.Get(ctx, st.Space, leafCid, &leaf); err != nil {
-		t.Fatalf("leaf get: %v", err)
+}
+
+// TestVersioning_FirstSupersessionCreatesLeaf pins the §5.2 upgrade rule on an
+// Enabled bucket: a new key's value is a bare manifest; the first overwrite
+// creates the leaf (with the superseded version as its one prev entry); and a
+// leaf is never downgraded, even when deletes shrink the key back to one
+// version (invariant 6).
+func TestVersioning_FirstSupersessionCreatesLeaf(t *testing.T) {
+	b, _, _ := newRefTestBackend(t)
+	setVersioning(t, b, types.BucketVersioningStatusEnabled)
+
+	putObjV(t, b, "k1", []byte("one"))
+	if val := getValue(t, b, "k1"); val.Manifest == nil {
+		t.Fatalf("single-version Enabled key: value = {Leaf:%v}, want bare manifest", val.Leaf)
 	}
-	if leaf.Prev != nil || leaf.NullSeq != 0 {
-		t.Fatalf("leaf = {Prev:%v NullSeq:%d}, want {nil, 0}", leaf.Prev, leaf.NullSeq)
+
+	out2 := putObjV(t, b, "k1", []byte("two"))
+	val := getValue(t, b, "k1")
+	if val.Leaf == nil {
+		t.Fatalf("superseded key: value is still a bare manifest, want leaf")
+	}
+	if val.Leaf.Current.VersionID != out2.VersionID || val.Leaf.Prev == nil {
+		t.Fatalf("leaf = {Current:%q Prev:%v}, want current %q with a prev tree", val.Leaf.Current.VersionID, val.Leaf.Prev, out2.VersionID)
+	}
+
+	// Delete the current version: the old one promotes, and the key keeps its
+	// leaf even though only one version remains.
+	if _, err := deleteObjV(t, b, "k1", out2.VersionID); err != nil {
+		t.Fatalf("delete version: %v", err)
+	}
+	val = getValue(t, b, "k1")
+	if val.Leaf == nil {
+		t.Fatalf("post-delete key: value downgraded to a bare manifest, want leaf (invariant 6)")
+	}
+	if val.Leaf.Prev != nil {
+		t.Fatalf("post-delete leaf.Prev = %v, want nil (single version)", val.Leaf.Prev)
+	}
+	if _, data, err := getObjV(t, b, "k1", ""); err != nil || !bytes.Equal(data, []byte("one")) {
+		t.Fatalf("GET after promotion = %q, %v; want \"one\"", data, err)
 	}
 }
 
