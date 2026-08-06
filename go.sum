@@ -179,8 +179,8 @@ github.com/fil-forge/go-ipni-tools v0.0.0-20260519194815-545b9421aec0 h1:HAfXUPv
 github.com/fil-forge/go-ipni-tools v0.0.0-20260519194815-545b9421aec0/go.mod h1:3NRV/7wc4/0uzzrGdI7NoN/yeF1UvqKRwMyjBqGc5s0=
 github.com/fil-forge/go-ucanto v0.0.0-20260507172450-5cb5d073f8ab h1:2J2cDThqTKP6/0k3SfdlSxfyPa3aLqjTYnmvbEcryfg=
 github.com/fil-forge/go-ucanto v0.0.0-20260507172450-5cb5d073f8ab/go.mod h1:lZF3UXZ2hGLKYmXdquG50JqI9pRlUrV6lubGtgOYfwc=
-github.com/fil-forge/hilt v0.0.1-0.20260724134448-ba71f843f6a4 h1:pDDN87a4dMuH8mqqEZZOnrCZ+Myc1ArEjJxg0ZNpQzA=
-github.com/fil-forge/hilt v0.0.1-0.20260724134448-ba71f843f6a4/go.mod h1:AO/+NYsz//BoqdHjVfik0fbxjiq+H+86qzGBt2/2uxQ=
+github.com/fil-forge/hilt v0.0.1-0.20260806121322-c6afc4fedeab h1:/tNOQ35Ben4zUg0T+HeTGd+iAUnXYc14TXX8oanLvyY=
+github.com/fil-forge/hilt v0.0.1-0.20260806121322-c6afc4fedeab/go.mod h1:AO/+NYsz//BoqdHjVfik0fbxjiq+H+86qzGBt2/2uxQ=
 github.com/fil-forge/indexing-service v1.13.5-0.20260619142411-efe3f5fab717 h1:Wke8qgaDgy7DGaIS28VpHip+YHSdQP1hGNEZTrXXzb4=
 github.com/fil-forge/indexing-service v1.13.5-0.20260619142411-efe3f5fab717/go.mod h1:wFcakLohOqpMRkJzWRdGFGHRFpGB+PpEMCm9wkt2cqU=
 github.com/fil-forge/libforge v0.0.0-20260727220215-5e299c46f62f h1:QzgMg8GIE4IhgOE/7DBHFU/4T5oU7J4vAKxbUPKJPGA=
