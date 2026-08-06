@@ -44,7 +44,7 @@ func TestMarkSegmentShipped_GuardsForgeRootOnRoot(t *testing.T) {
 
 	// Ship with the stale op-root LAST: unconditionally (the old behavior) it
 	// would win as the last write; the guard must skip it and keep `committed`.
-	if err := m.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seq, 100, []blockstore.OpRoot{
+	if err := m.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seq, 100, nil, []blockstore.OpRoot{
 		{Bucket: "bk", Root: committed},
 		{Bucket: "bk", Root: stale},
 	}); err != nil {
@@ -65,7 +65,7 @@ func TestMarkSegmentShipped_GuardsForgeRootOnRoot(t *testing.T) {
 	_ = m2.CASRoot(ctx, "bk2", cid.Undef, committed)
 	seq2, _ := m2.NextSegmentSeq(ctx)
 	_ = m2.InsertSegmentOpen(ctx, blockstore.PlaneCatalog, seq2, "bk2")
-	if err := m2.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seq2, 100, []blockstore.OpRoot{
+	if err := m2.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seq2, 100, nil, []blockstore.OpRoot{
 		{Bucket: "bk2", Root: stale},
 	}); err != nil {
 		t.Fatalf("MarkSegmentShipped(stale only): %v", err)

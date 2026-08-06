@@ -318,7 +318,7 @@ func TestPostgresStores_Live(t *testing.T) {
 		}
 		// Ship a segment whose op-roots include a stale root the bucket never
 		// adopted; only the committed root may advance forge_root.
-		if err := r.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seq, time.Now().Unix(),
+		if err := r.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seq, time.Now().Unix(), nil,
 			[]blockstore.OpRoot{{Bucket: "fg", Root: stale}, {Bucket: "fg", Root: committed}}); err != nil {
 			t.Fatalf("MarkSegmentShipped: %v", err)
 		}

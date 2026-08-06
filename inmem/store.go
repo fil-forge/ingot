@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -287,11 +288,12 @@ func (m *MemStore) MarkSegmentSealed(_ context.Context, plane blockstore.Plane, 
 	return nil
 }
 
-func (m *MemStore) MarkSegmentShipped(_ context.Context, plane blockstore.Plane, seq uint64, shippedAt int64, opRoots []blockstore.OpRoot) error {
+func (m *MemStore) MarkSegmentShipped(_ context.Context, plane blockstore.Plane, seq uint64, shippedAt int64, indexDigest []byte, opRoots []blockstore.OpRoot) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if r, ok := m.segments[seq]; ok {
 		r.ShippedAt = shippedAt
+		r.IndexDigest = slices.Clone(indexDigest)
 	}
 	if plane == blockstore.PlaneCatalog {
 		for _, opr := range opRoots {
@@ -375,8 +377,8 @@ func (NopBaseReader) OpenBlob(_ context.Context, _ did.DID, _ multihash.Multihas
 // network, so the spool's local copy serves all reads.
 type NopUploader struct{}
 
-func (NopUploader) SubmitShard(_ context.Context, _ blockstore.Plane, _ did.DID, _ uploader.CARShard) (uploader.BlobLocation, error) {
-	return uploader.BlobLocation{}, nil
+func (NopUploader) SubmitShard(_ context.Context, _ blockstore.Plane, _ did.DID, _ uploader.CARShard) (uploader.BlobLocation, multihash.Multihash, error) {
+	return uploader.BlobLocation{}, nil, nil
 }
 
 // UploadBlob accepts immediately, even with WithConclude(false) — there is
