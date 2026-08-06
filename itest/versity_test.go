@@ -76,11 +76,11 @@ func TestForgeVersity(t *testing.T) {
 		// versioned conf so upstream teardown empties buckets per-version.
 		{"PutBucketVersioning", putBucketVersioningPass, nil, true},
 		{"GetBucketVersioning", getBucketVersioningPass, nil, true},
-		{"ListObjectVersions", listObjectVersionsPass, listObjectVersionsXFail, true},
+		{"ListObjectVersions", listObjectVersionsPass, nil, true},
 		{"Versioning", versioningPass, versioningXFail, true},
 		// TestListObjectVersions_VD: listing a never-versioned bucket; runs
 		// with the plain conf (the bucket stays unversioned).
-		{"ListObjectVersionsVD", nil, listObjectVersionsVDXFail, false},
+		{"ListObjectVersionsVD", listObjectVersionsVDPass, nil, false},
 	}
 
 	for _, cat := range categories {

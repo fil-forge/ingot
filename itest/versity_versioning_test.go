@@ -14,11 +14,10 @@ import (
 // deletes rather than plain DeleteObject (which would only stack up delete
 // markers).
 //
-// TEARDOWN-BLOCKED rows: same as the object tables — a bucket that ever held
-// a non-empty object body cannot be deleted until sprue/piri implement
-// /blob/remove, so every case below that stores a body passes its S3
-// assertions and then fails teardown. Only config-only and delete-marker-only
-// cases (markers store no blobs) can fully pass today.
+// Body-storing rows pass end-to-end: releasing a version's blobs traverses
+// the whole delete chain (ingot /blob/remove → sprue forward → piri
+// /blob/release), which needs hilt ≥ #37 (blob.Remove in the write set) and
+// smelt ≥ #19 (the piri blob/release + blob/reject seed delegations).
 //
 // Excluded entirely (feature not modeled, mirroring the absent Tagging /
 // ObjectLock categories): the Versioning_* object-tagging, object-lock /
@@ -45,10 +44,6 @@ var getBucketVersioningPass = []forgeCase{
 var listObjectVersionsPass = []forgeCase{
 	{name: "non_existing_bucket", fn: integration.ListObjectVersions_non_existing_bucket},
 	{name: "negative_max_keys", fn: integration.ListObjectVersions_negative_max_keys},
-}
-
-// All teardown-blocked: bodies are stored, /blob/remove is a no-op.
-var listObjectVersionsXFail = []forgeCase{
 	{name: "list_single_object_versions", fn: integration.ListObjectVersions_list_single_object_versions},
 	{name: "list_multiple_object_versions", fn: integration.ListObjectVersions_list_multiple_object_versions},
 	{name: "multiple_object_versions_truncated", fn: integration.ListObjectVersions_multiple_object_versions_truncated},
@@ -60,23 +55,14 @@ var listObjectVersionsXFail = []forgeCase{
 
 // Upstream group TestListObjectVersions_VD: ListObjectVersions against a
 // bucket that never configured versioning (plain conf — the bucket stays
-// unversioned, so the plain teardown applies). Teardown-blocked like the
-// other body-storing rows.
-var listObjectVersionsVDXFail = []forgeCase{
+// unversioned, so the plain teardown applies).
+var listObjectVersionsVDPass = []forgeCase{
 	{name: "VD_success", fn: integration.ListObjectVersions_VD_success},
 }
 
 var versioningPass = []forgeCase{
-	// Marker-only: DeleteObject on a missing key stores no blobs, so the
-	// versioned teardown can empty the bucket and hilt can delete the space.
-	{name: "DeleteObject_non_existing_object", fn: integration.Versioning_DeleteObject_non_existing_object},
-	// Zero-byte object: no blobs stored, so teardown isn't blocked.
-	{name: "PutObject_success", fn: integration.Versioning_PutObject_success},
-}
-
-// All teardown-blocked: every case stores at least one non-empty body.
-var versioningXFail = []forgeCase{
 	// PutObject
+	{name: "PutObject_success", fn: integration.Versioning_PutObject_success},
 	{name: "PutObject_suspended_null_versionId_obj", fn: integration.Versioning_PutObject_suspended_null_versionId_obj},
 	{name: "PutObject_null_versionId_obj", fn: integration.Versioning_PutObject_null_versionId_obj},
 	{name: "PutObject_overwrite_null_versionId_obj", fn: integration.Versioning_PutObject_overwrite_null_versionId_obj},
@@ -102,15 +88,12 @@ var versioningXFail = []forgeCase{
 	{name: "GetObject_delete_marker", fn: integration.Versioning_GetObject_delete_marker},
 	{name: "GetObject_null_versionId_obj", fn: integration.Versioning_GetObject_null_versionId_obj},
 	// DeleteObject / DeleteObjects
+	{name: "DeleteObject_non_existing_object", fn: integration.Versioning_DeleteObject_non_existing_object},
 	{name: "DeleteObject_invalid_versionId", fn: integration.Versioning_DeleteObject_invalid_versionId},
 	{name: "DeleteObject_delete_object_version", fn: integration.Versioning_DeleteObject_delete_object_version},
 	{name: "DeleteObject_delete_a_delete_marker", fn: integration.Versioning_DeleteObject_delete_a_delete_marker},
 	{name: "Delete_null_versionId_object", fn: integration.Versioning_Delete_null_versionId_object},
 	{name: "DeleteObject_nested_dir_object", fn: integration.Versioning_DeleteObject_nested_dir_object},
-	// Blocked before teardown too: upstream creates its bucket withLock(),
-	// and ingot does not model object-lock creation (which on AWS
-	// auto-enables versioning), so the versionId echo assertions fail first.
-	{name: "DeleteObject_non_existing_objects", fn: integration.Versioning_DeleteObject_non_existing_objects},
 	{name: "DeleteObject_suspended", fn: integration.Versioning_DeleteObject_suspended},
 	{name: "DeleteObjects_success", fn: integration.Versioning_DeleteObjects_success},
 	{name: "DeleteObjects_delete_deleteMarkers", fn: integration.Versioning_DeleteObjects_delete_deleteMarkers},
@@ -119,4 +102,11 @@ var versioningXFail = []forgeCase{
 	// Multipart
 	{name: "Multipart_Upload_success", fn: integration.Versioning_Multipart_Upload_success},
 	{name: "Multipart_Upload_overwrite_an_object", fn: integration.Versioning_Multipart_Upload_overwrite_an_object},
+}
+
+var versioningXFail = []forgeCase{
+	// Upstream creates its bucket withLock(), and ingot does not model
+	// object-lock creation (which on AWS auto-enables versioning), so the
+	// versionId echo assertions fail before teardown.
+	{name: "DeleteObject_non_existing_objects", fn: integration.Versioning_DeleteObject_non_existing_objects},
 }
