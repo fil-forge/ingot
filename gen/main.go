@@ -19,6 +19,7 @@ func main() {
 		bucket.BlobRef{},
 		bucket.ObjectLeaf{},
 		bucket.VersionNode{},
+		bucket.ValueUnion{},
 	); err != nil {
 		panic(err)
 	}

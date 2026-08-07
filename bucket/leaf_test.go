@@ -19,8 +19,9 @@ func testCid(t *testing.T, s string) cid.Cid {
 	return c
 }
 
-// TestObjectValue_LeafRoundTrip pins the §2.1 envelope: a leaf written through
-// EnvelopedLeaf decodes back as ObjectValue.Leaf with its fields intact.
+// TestObjectValue_LeafRoundTrip pins the §2.1 union: a leaf written through
+// LeafValue/EnvelopedLeaf is a single-entry map keyed "/objectleaf/0" and
+// decodes back with its fields intact.
 func TestObjectValue_LeafRoundTrip(t *testing.T) {
 	prev := testCid(t, "prev-root")
 	leaf := &ObjectLeaf{
@@ -29,8 +30,11 @@ func TestObjectValue_LeafRoundTrip(t *testing.T) {
 		NullSeq: 4,
 	}
 	var buf bytes.Buffer
-	if err := (&EnvelopedLeaf{Leaf: leaf}).MarshalCBOR(&buf); err != nil {
+	if err := LeafValue(leaf).MarshalCBOR(&buf); err != nil {
 		t.Fatalf("marshal: %v", err)
+	}
+	if buf.Bytes()[0] != 0xa1 {
+		t.Fatalf("header = %#x, want 0xa1 (single-entry map)", buf.Bytes()[0])
 	}
 
 	var val ObjectValue
@@ -55,36 +59,57 @@ func TestObjectValue_LeafRoundTrip(t *testing.T) {
 	}
 }
 
-// TestObjectValue_BareManifest pins the other half of the union: a manifest
-// block decodes as ObjectValue.Manifest, never as a leaf.
-func TestObjectValue_BareManifest(t *testing.T) {
+// TestObjectValue_ManifestRoundTrip pins the other arm: a manifest written
+// through ManifestValue/EnvelopedManifest round-trips, and the two strict
+// single-arm decoders reject each other's blocks.
+func TestObjectValue_ManifestRoundTrip(t *testing.T) {
 	mf := &ObjectManifest{Key: "photos/cat.jpg", Seq: 7, VersionID: "null", ETag: "abc"}
 	var buf bytes.Buffer
-	if err := mf.MarshalCBOR(&buf); err != nil {
+	if err := (&EnvelopedManifest{Manifest: mf}).MarshalCBOR(&buf); err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
+	if buf.Bytes()[0] != 0xa1 {
+		t.Fatalf("header = %#x, want 0xa1 (single-entry map)", buf.Bytes()[0])
+	}
+
 	var val ObjectValue
 	if err := val.UnmarshalCBOR(bytes.NewReader(buf.Bytes())); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
 	if val.Leaf != nil || val.Manifest == nil {
-		t.Fatalf("value = {Manifest:%v Leaf:%v}, want bare manifest", val.Manifest, val.Leaf)
+		t.Fatalf("value = {Manifest:%v Leaf:%v}, want manifest", val.Manifest, val.Leaf)
 	}
 	if val.Manifest.Key != mf.Key || val.Manifest.Seq != mf.Seq || val.Manifest.VersionID != mf.VersionID {
 		t.Fatalf("manifest round-trip = %+v, want %+v", val.Manifest, mf)
 	}
 
-	// A manifest is not an enveloped leaf.
-	var env EnvelopedLeaf
-	if err := env.UnmarshalCBOR(bytes.NewReader(buf.Bytes())); err == nil {
-		t.Fatal("EnvelopedLeaf.UnmarshalCBOR(manifest) = nil error, want rejection")
+	var em EnvelopedManifest
+	if err := em.UnmarshalCBOR(bytes.NewReader(buf.Bytes())); err != nil {
+		t.Fatalf("enveloped manifest unmarshal: %v", err)
+	}
+	if em.Manifest.Key != mf.Key {
+		t.Fatalf("EnvelopedManifest round-trip = %+v, want %+v", em.Manifest, mf)
+	}
+
+	// The strict single-arm decoders reject the other arm.
+	var el EnvelopedLeaf
+	if err := el.UnmarshalCBOR(bytes.NewReader(buf.Bytes())); err == nil {
+		t.Fatal("EnvelopedLeaf.UnmarshalCBOR(manifest block) = nil error, want rejection")
+	}
+	var lbuf bytes.Buffer
+	if err := LeafValue(&ObjectLeaf{Current: VersionNode{Manifest: testCid(t, "m")}}).MarshalCBOR(&lbuf); err != nil {
+		t.Fatalf("leaf marshal: %v", err)
+	}
+	if err := em.UnmarshalCBOR(bytes.NewReader(lbuf.Bytes())); err == nil {
+		t.Fatal("EnvelopedManifest.UnmarshalCBOR(leaf block) = nil error, want rejection")
 	}
 }
 
-// TestObjectValue_UnknownEnvelope pins §10's upgrade safety: an envelope key
-// the reader does not know is an error, never a garbage decode.
-func TestObjectValue_UnknownEnvelope(t *testing.T) {
-	encodeEnvelope := func(key string) []byte {
+// TestObjectValue_RejectsNonUnionBlocks pins §10's upgrade safety: a block
+// carrying no known union key — a future format's key, or a pre-union bare
+// manifest — is an error, never a zero-filled decode.
+func TestObjectValue_RejectsNonUnionBlocks(t *testing.T) {
+	encodeUnknown := func(key string) []byte {
 		var buf bytes.Buffer
 		cw := cbg.NewCborWriter(&buf)
 		if err := cw.WriteMajorTypeHeader(cbg.MajMap, 1); err != nil {
@@ -96,21 +121,30 @@ func TestObjectValue_UnknownEnvelope(t *testing.T) {
 		if _, err := cw.WriteString(key); err != nil {
 			t.Fatalf("key: %v", err)
 		}
-		if err := (&ObjectLeaf{Current: VersionNode{Manifest: testCid(t, "payload")}}).MarshalCBOR(cw); err != nil {
+		if err := (&ObjectManifest{Key: "k"}).MarshalCBOR(cw); err != nil {
 			t.Fatalf("payload: %v", err)
 		}
 		return buf.Bytes()
 	}
 
 	var val ObjectValue
-	err := val.UnmarshalCBOR(bytes.NewReader(encodeEnvelope("/objectleaf/1")))
-	if err == nil || !strings.Contains(err.Error(), "unknown value envelope") {
-		t.Fatalf("future envelope: err = %v, want unknown-envelope rejection", err)
+	err := val.UnmarshalCBOR(bytes.NewReader(encodeUnknown("/objectmanifest/1")))
+	if err == nil || !strings.Contains(err.Error(), "no known value-union key") {
+		t.Fatalf("future union key: err = %v, want no-known-key rejection", err)
 	}
 
-	// A single-entry map that is not an envelope is malformed, not a manifest.
-	err = val.UnmarshalCBOR(bytes.NewReader(encodeEnvelope("oops")))
-	if err == nil {
-		t.Fatal("non-envelope single-entry map: err = nil, want rejection")
+	// A pre-union bare manifest block is not a value block.
+	var mbuf bytes.Buffer
+	if err := (&ObjectManifest{Key: "k"}).MarshalCBOR(&mbuf); err != nil {
+		t.Fatalf("bare manifest marshal: %v", err)
+	}
+	if err := val.UnmarshalCBOR(bytes.NewReader(mbuf.Bytes())); err == nil {
+		t.Fatal("bare manifest block: err = nil, want rejection")
+	}
+
+	// Marshalling zero or two arms is refused.
+	var empty ObjectValue
+	if err := empty.MarshalCBOR(&bytes.Buffer{}); err == nil {
+		t.Fatal("marshal of zero-arm value: err = nil, want rejection")
 	}
 }

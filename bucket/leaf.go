@@ -1,12 +1,10 @@
 package bucket
 
 import (
-	"bytes"
 	"fmt"
 	"io"
 
 	"github.com/ipfs/go-cid"
-	cbg "github.com/whyrusleeping/cbor-gen"
 )
 
 // VersionNode identifies one object version: its per-bucket ordinal (Seq,
@@ -19,10 +17,10 @@ type VersionNode struct {
 	Manifest  cid.Cid `cborgen:"m"`
 }
 
-// ObjectLeaf is the per-key version group, stored under the LeafEnvelopeKey
-// envelope (docs/s3-versioning.md §2.1). A key's top-MST value points at one
-// once the key has been superseded; until then the value is the bare
-// ObjectManifest.
+// ObjectLeaf is the per-key version group, stored under the "/objectleaf/0"
+// union key (docs/s3-versioning.md §2.1). A key's top-MST value points at one
+// once the key has been superseded; until then the value is its manifest
+// (under "/objectmanifest/0").
 type ObjectLeaf struct {
 	// Current is the head version — what GET/HEAD/ListObjects resolve with
 	// a single leaf read, no descent into Prev.
@@ -40,39 +38,99 @@ type ObjectLeaf struct {
 	NullSeq uint64 `cborgen:"n"`
 }
 
-// LeafEnvelopeKey is the keyed-union discriminator under which ObjectLeaf
-// blocks are serialized (docs/s3-versioning.md §2.1). A revised leaf format
-// takes a new key ("/objectleaf/1"); readers reject keys they do not know
-// instead of decoding garbage.
-const LeafEnvelopeKey = "/objectleaf/0"
+// ValueUnion is the keyed union every catalog value block is encoded as
+// (docs/s3-versioning.md §2.1): a single-entry map whose key names the
+// payload's format. cbor-gen generates its codec (the omitempty arms encode
+// only the one that is set), but the generated decoder skips unknown keys
+// silently — zero arms set — so raw ValueUnion use is a bug: decode through
+// ObjectValue (either form), EnvelopedManifest, or EnvelopedLeaf, which turn
+// that into the loud failure the format requires. A format revision adds an
+// arm under a new key ("/objectmanifest/1") and old blocks keep decoding.
+type ValueUnion struct {
+	Manifest *ObjectManifest `cborgen:"/objectmanifest/0,omitempty"`
+	Leaf     *ObjectLeaf     `cborgen:"/objectleaf/0,omitempty"`
+}
 
-// maxEnvelopeKeyLen bounds a value block's envelope key; real discriminators
-// are short, so anything longer is malformed rather than a huge alloc.
-const maxEnvelopeKeyLen = 128
+// arms counts the set arms; a well-formed block has exactly one.
+func (u *ValueUnion) arms() int {
+	n := 0
+	if u.Manifest != nil {
+		n++
+	}
+	if u.Leaf != nil {
+		n++
+	}
+	return n
+}
 
-// EnvelopedLeaf serializes its Leaf under the LeafEnvelopeKey envelope:
-// {"/objectleaf/0": <leaf>}. Leaves must be written through it — a bare
-// ObjectLeaf block would decode as an ObjectManifest at read time.
+// ObjectValue decodes a top-MST value block, which is either a manifest (a
+// single-version key) or a leaf (docs/s3-versioning.md §2.1). Exactly one of
+// Manifest/Leaf is non-nil after a successful decode; a block carrying no
+// known union key — a newer format, or not a value block at all — is an
+// error, never a zero-filled decode.
+type ObjectValue struct {
+	ValueUnion
+}
+
+// ManifestValue wraps a manifest for storage as a value block.
+func ManifestValue(mf *ObjectManifest) *ObjectValue {
+	return &ObjectValue{ValueUnion{Manifest: mf}}
+}
+
+// LeafValue wraps a leaf for storage as a value block.
+func LeafValue(l *ObjectLeaf) *ObjectValue {
+	return &ObjectValue{ValueUnion{Leaf: l}}
+}
+
+func (v *ObjectValue) MarshalCBOR(w io.Writer) error {
+	if v.arms() != 1 {
+		return fmt.Errorf("bucket: value block must carry exactly one union arm")
+	}
+	return v.ValueUnion.MarshalCBOR(w)
+}
+
+func (v *ObjectValue) UnmarshalCBOR(r io.Reader) error {
+	if err := v.ValueUnion.UnmarshalCBOR(r); err != nil {
+		return err
+	}
+	if v.arms() != 1 {
+		return fmt.Errorf("bucket: block carries no known value-union key (written by a newer format?)")
+	}
+	return nil
+}
+
+// EnvelopedManifest reads/writes one manifest block under its
+// "/objectmanifest/0" union key — the form every manifest is stored in
+// (§2.3), as a value block and as a prev-tree entry alike. Decoding a leaf
+// block through it is an error.
+type EnvelopedManifest struct {
+	Manifest *ObjectManifest
+}
+
+func (e *EnvelopedManifest) MarshalCBOR(w io.Writer) error {
+	return ManifestValue(e.Manifest).MarshalCBOR(w)
+}
+
+func (e *EnvelopedManifest) UnmarshalCBOR(r io.Reader) error {
+	var v ObjectValue
+	if err := v.UnmarshalCBOR(r); err != nil {
+		return err
+	}
+	if v.Manifest == nil {
+		return fmt.Errorf("bucket: block is not an enveloped manifest")
+	}
+	e.Manifest = v.Manifest
+	return nil
+}
+
+// EnvelopedLeaf reads/writes one leaf block under its "/objectleaf/0" union
+// key. Decoding a manifest block through it is an error.
 type EnvelopedLeaf struct {
 	Leaf *ObjectLeaf
 }
 
 func (e *EnvelopedLeaf) MarshalCBOR(w io.Writer) error {
-	if e == nil || e.Leaf == nil {
-		_, err := w.Write(cbg.CborNull)
-		return err
-	}
-	cw := cbg.NewCborWriter(w)
-	if err := cw.WriteMajorTypeHeader(cbg.MajMap, 1); err != nil {
-		return err
-	}
-	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len(LeafEnvelopeKey))); err != nil {
-		return err
-	}
-	if _, err := cw.WriteString(LeafEnvelopeKey); err != nil {
-		return err
-	}
-	return e.Leaf.MarshalCBOR(cw)
+	return LeafValue(e.Leaf).MarshalCBOR(w)
 }
 
 func (e *EnvelopedLeaf) UnmarshalCBOR(r io.Reader) error {
@@ -81,59 +139,8 @@ func (e *EnvelopedLeaf) UnmarshalCBOR(r io.Reader) error {
 		return err
 	}
 	if v.Leaf == nil {
-		return fmt.Errorf("bucket: value block is not an enveloped leaf")
+		return fmt.Errorf("bucket: block is not an enveloped leaf")
 	}
 	e.Leaf = v.Leaf
 	return nil
-}
-
-// ObjectValue decodes a top-MST value block, which is either a bare
-// ObjectManifest (a single-version key) or an enveloped ObjectLeaf
-// (docs/s3-versioning.md §2.1). Exactly one of Manifest/Leaf is non-nil
-// after a successful decode.
-//
-// The discrimination is exact, not duck typing: a manifest always encodes as
-// a multi-entry map, so only envelopes present as a single-entry map with a
-// "/"-prefixed key — and an unknown envelope key is an error (a block
-// written by a newer format), never a zero-filled garbage decode.
-type ObjectValue struct {
-	Manifest *ObjectManifest
-	Leaf     *ObjectLeaf
-}
-
-func (v *ObjectValue) UnmarshalCBOR(r io.Reader) error {
-	*v = ObjectValue{}
-	data, err := io.ReadAll(r)
-	if err != nil {
-		return err
-	}
-	cr := cbg.NewCborReader(bytes.NewReader(data))
-	maj, extra, err := cr.ReadHeader()
-	if err != nil {
-		return err
-	}
-	if maj == cbg.MajMap && extra == 1 {
-		kmaj, klen, err := cr.ReadHeader()
-		if err != nil {
-			return err
-		}
-		if kmaj != cbg.MajTextString || klen > maxEnvelopeKeyLen {
-			return fmt.Errorf("bucket: malformed value block: single-entry map without a short text key")
-		}
-		key := make([]byte, klen)
-		if _, err := io.ReadFull(cr, key); err != nil {
-			return err
-		}
-		switch {
-		case string(key) == LeafEnvelopeKey:
-			v.Leaf = new(ObjectLeaf)
-			return v.Leaf.UnmarshalCBOR(cr)
-		case len(key) > 0 && key[0] == '/':
-			return fmt.Errorf("bucket: unknown value envelope %q (written by a newer format?)", key)
-		default:
-			return fmt.Errorf("bucket: malformed value block: unexpected single-entry map key %q", key)
-		}
-	}
-	v.Manifest = new(ObjectManifest)
-	return v.Manifest.UnmarshalCBOR(bytes.NewReader(data))
 }

@@ -649,7 +649,7 @@ func (b *Backend) insertDeleteMarker(ctx context.Context, bucketState *registry.
 }
 
 // deleteObjectKey permanently removes one key — the unversioned bucket's
-// delete: it drops the key's value (the bare manifest; a leaf never occurs
+// delete: it drops the key's value (its manifest; a leaf never occurs
 // on a purely-unversioned bucket, but is handled for completeness) and
 // releases the (single, null) version's body blobs through the reference
 // index. Missing keys (and an empty bucket) are idempotent no-ops. preconds,
@@ -681,10 +681,11 @@ func (b *Backend) deleteObjectKey(ctx context.Context, bucketState *registry.Sta
 		}
 		oldMf := val.Manifest
 		if val.Leaf != nil {
-			oldMf = new(msbucket.ObjectManifest)
-			if err := tx.Get(ctx, tx.State().Space, val.Leaf.Current.Manifest, oldMf); err != nil {
+			var em msbucket.EnvelopedManifest
+			if err := tx.Get(ctx, tx.State().Space, val.Leaf.Current.Manifest, &em); err != nil {
 				return cid.Undef, fmt.Errorf("load manifest: %w", err)
 			}
+			oldMf = em.Manifest
 		}
 
 		// Preconditions (If-Match / size / mod-time) under the lock against the
@@ -699,7 +700,7 @@ func (b *Backend) deleteObjectKey(ctx context.Context, bucketState *registry.Sta
 		if err != nil {
 			return cid.Undef, fmt.Errorf("mst delete: %w", err)
 		}
-		// A bare key's value block is the manifest itself — one candidate
+		// A manifest-valued key's block is the manifest itself — one candidate
 		// covers it; a leaf key contributes the leaf block and its current
 		// manifest.
 		if val.Leaf != nil {
@@ -980,7 +981,7 @@ func (b *Backend) listWalk(ctx context.Context, bucketName, prefix, delimiter, f
 		// Resolve the key's current version first: a key whose current version
 		// is a delete marker is invisible to ListObjects — it produces neither
 		// a Contents entry nor a CommonPrefix (docs/s3-versioning.md §9.1).
-		// A bare key's value block is the manifest itself (§2.1); a leaf key
+		// A manifest-valued key's block is the manifest itself (§2.1); a leaf key
 		// costs one more fetch.
 		var val msbucket.ObjectValue
 		if err := b.read.Get(ctx, st.Space, valCid, &val); err != nil {
@@ -988,10 +989,11 @@ func (b *Backend) listWalk(ctx context.Context, bucketName, prefix, delimiter, f
 		}
 		mfp := val.Manifest
 		if val.Leaf != nil {
-			mfp = new(msbucket.ObjectManifest)
-			if err := b.read.Get(ctx, st.Space, val.Leaf.Current.Manifest, mfp); err != nil {
+			var em msbucket.EnvelopedManifest
+			if err := b.read.Get(ctx, st.Space, val.Leaf.Current.Manifest, &em); err != nil {
 				return fmt.Errorf("manifest get %s: %w", val.Leaf.Current.Manifest, err)
 			}
+			mfp = em.Manifest
 		}
 		mf := *mfp
 		if mf.DeleteMarker {

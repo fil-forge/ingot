@@ -136,17 +136,21 @@ func (b *Backend) ListObjectVersions(ctx context.Context, input *s3.ListObjectVe
 			leaf = val.Leaf
 			current = leaf.Current
 		} else {
-			// Bare key (§2.1): its single version is the current one, and the
+			// Manifest-valued key (§2.1): its single version is the current one, and the
 			// value block is already the manifest.
-			current = msbucket.VersionNode{Seq: val.Manifest.Seq, VersionID: bareVersionID(val.Manifest), Manifest: valCid}
+			current = msbucket.VersionNode{Seq: val.Manifest.Seq, VersionID: manifestVersionID(val.Manifest), Manifest: valCid}
 		}
 
 		// Versions of the marker key resume strictly after the marker version:
-		// only entries with seq below the marker's are emitted. A null marker
-		// that no longer resolves (its version was deleted between pages)
-		// leaves seqBelow at MaxUint64, so the key's versions are re-emitted:
-		// a duplicate page is possible, data loss is not, and pagination still
-		// advances.
+		// only entries with seq below the marker's are emitted. A token marker
+		// needs no existence check: its seq is a *position* in the newest-first
+		// order, and a position survives its version's deletion — everything at
+		// or above it was emitted on earlier pages, so seeking below it is
+		// exact continuation, never data loss. Only a null marker, whose id
+		// encodes no position, falls back when it no longer resolves (its
+		// version was deleted between pages): seqBelow stays MaxUint64 and the
+		// key's versions are re-emitted — a duplicate page is possible, data
+		// loss is not, and pagination still advances.
 		seqBelow := uint64(math.MaxUint64)
 		if k == keyMarker && versionIDMarker != "" {
 			switch kind, seq := classifyVersionID(versionIDMarker); kind {
@@ -198,10 +202,11 @@ func (b *Backend) ListObjectVersions(ctx context.Context, input *s3.ListObjectVe
 		if current.Seq < seqBelow {
 			mf := val.Manifest
 			if mf == nil {
-				mf = new(msbucket.ObjectManifest)
-				if err := b.read.Get(ctx, st.Space, current.Manifest, mf); err != nil {
+				var em msbucket.EnvelopedManifest
+				if err := b.read.Get(ctx, st.Space, current.Manifest, &em); err != nil {
 					return fmt.Errorf("manifest get %s: %w", current.Manifest, err)
 				}
+				mf = em.Manifest
 			}
 			emit(current, mf, true)
 			if full() {
@@ -224,11 +229,12 @@ func (b *Backend) ListObjectVersions(ctx context.Context, input *s3.ListObjectVe
 		}
 		stopped := false
 		perr := pt.WalkLeavesFrom(ctx, prevFrom, func(_ string, mfCid cid.Cid) error {
-			var mf msbucket.ObjectManifest
-			if err := b.read.Get(ctx, st.Space, mfCid, &mf); err != nil {
+			var em msbucket.EnvelopedManifest
+			if err := b.read.Get(ctx, st.Space, mfCid, &em); err != nil {
 				return fmt.Errorf("manifest get %s: %w", mfCid, err)
 			}
-			emit(msbucket.VersionNode{Seq: mf.Seq, VersionID: mf.VersionID, Manifest: mfCid}, &mf, false)
+			mf := em.Manifest
+			emit(msbucket.VersionNode{Seq: mf.Seq, VersionID: mf.VersionID, Manifest: mfCid}, mf, false)
 			if full() {
 				stopped = true
 				return mst.ErrStopWalk
