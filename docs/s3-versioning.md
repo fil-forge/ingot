@@ -14,11 +14,11 @@ takes one of two forms (§2.1). A key holding a single version stores its **`Obj
 CID directly — one block, one fetch, the layout an unversioned store would use. A key gains an
 **`ObjectLeaf`** with its second version (§5.2) and keeps it from then on: a small block that
 carries the key's current version inline plus the root of a second per-key MST (the **prev
-tree**, §2.2) holding the noncurrent ones. The two forms are told apart by a keyed envelope on
-the leaf block (§2.1), never by guessing at field shapes. Both trees use the same forked `mst`
-package, the same space, and the same blockstore; every node is an ordinary catalog-plane
-block, and nesting stops at two levels. A bucket that never versions therefore stores one
-manifest per key and nothing more.
+tree**, §2.2) holding the noncurrent ones. Every value block is a keyed union naming its own
+format (§2.1), so the forms are told apart exactly, never by guessing at field shapes. Both
+trees use the same forked `mst` package, the same space, and the same blockstore; every node is
+an ordinary catalog-plane block, and nesting stops at two levels. A bucket that never versions
+therefore stores one manifest per key and nothing more.
 
 Every version carries two identifiers with separate jobs:
 
@@ -79,50 +79,51 @@ so deduplicated data survives partial deletes by construction.
 
 ## 2. Data model
 
-### 2.1 The value: bare manifest or leaf
+### 2.1 The value union
 
 The top-level (per-bucket) MST maps **plain object keys** to CIDs. S3 caps object-key names at
-1024 bytes, which is exactly `mst.MaxKeyBytes`, so keys are stored as-is. The block a key's
-value CID points at is one of two things:
+1024 bytes, which is exactly `mst.MaxKeyBytes`, so keys are stored as-is. Every block a key's
+value CID points at is a **keyed union**: a single-entry CBOR map whose key names the payload's
+format, with one arm per value kind:
 
-- **A bare `ObjectManifest`** — the key holds exactly one version. One block serves the whole
-  read (the manifest carries `Seq`/`VersionID`, §2.3, so even version-scoped requests resolve
-  against it directly), and most keys never leave this form.
-- **An enveloped `ObjectLeaf`** — the key has been superseded at least once (§5.2). The leaf
-  block is a single-entry CBOR map keyed by a format discriminator:
+```ipldsch
+type ObjectValue union {
+  | ObjectManifest "/objectmanifest/0"   # the key's single version (§2.3)
+  | ObjectLeaf     "/objectleaf/0"       # the per-key version group, once superseded (§5.2)
+} representation keyed
+```
 
-  ```
-  { "/objectleaf/0": <ObjectLeaf fields> }
-  ```
+A key holding exactly one version stores its manifest arm — one block serves the whole read
+(the manifest carries `Seq`/`VersionID`, §2.3, so even version-scoped requests resolve against
+it directly), and most keys never leave this form. The key gains the leaf arm at its first
+retained supersession (§5.2).
 
-Telling the forms apart is exact, not duck typing: a block whose top level is a one-entry map
-with a `/`-prefixed key is an envelope, and anything else is a manifest (cbor-gen always
-encodes every `ObjectManifest` field, so a manifest can never present as a one-entry map). An
-envelope key the reader does not know is an **error** — "written by a newer format" — never a
-zero-filled garbage decode. A future leaf revision takes a new key (`"/objectleaf/1"`), and a
-new value kind takes a new name; old and new blocks coexist under one reader with no rewrite
-pass. cbor-gen does not generate keyed unions, so `bucket/leaf.go` carries a small hand-written
-envelope codec that emits the map header and key, then delegates to the generated `ObjectLeaf`
-marshaller.
+Decoding dispatches on the union key, so telling the forms apart is exact, not duck typing —
+and a key the reader does not know is an **error** ("written by a newer format"), never a
+zero-filled garbage decode. Either arm's format can be revised: a new leaf takes
+`"/objectleaf/1"`, a new manifest takes `"/objectmanifest/1"`, a new value kind takes a new
+name, and old and new blocks coexist under one reader with no rewrite pass. The union costs
+each block its key string (~19 bytes) and buys the self-description.
 
-Manifest blocks stay bare — no envelope — because the manifest CID doubles as the version's
-identity (invariant 5, §2.4): prev entries and `blob_refs` claims hang off it, and wrapping it
-at the value position would fork that identity.
+cbor-gen generates the union codec directly — a two-arm struct of `omitempty` pointers whose
+map keys are the union keys — but its generated decoder *skips* unknown map keys silently, so
+`bucket/leaf.go` wraps it in strict types that require exactly one arm: `ObjectValue` (either
+arm; the read-dispatch sites), and `EnvelopedManifest` / `EnvelopedLeaf` (one specific arm;
+every site that knows which block it is reading or writing).
 
 ```go
-// bucket/leaf.go (new; cborgen via gen/main.go, same style as ObjectManifest)
+// bucket/leaf.go (cborgen via gen/main.go; ValueUnion is generated, the
+// strict wrappers are hand-written)
 
 // VersionNode identifies one object version: its ordinal, its client id, and
 // its manifest.
 type VersionNode struct {
     Seq       uint64  `cborgen:"s"` // per-bucket ordinal; ordering only, never exposed
     VersionID string  `cborgen:"v"` // client handle: "null" or a ULID token (§3)
-    Manifest  cid.Cid `cborgen:"m"` // ObjectManifest CID
+    Manifest  cid.Cid `cborgen:"m"` // the manifest block's CID
 }
 
-// ObjectLeaf is the per-key version group, stored under the "/objectleaf/0"
-// envelope (§2.1). A key's top-MST value points at it once the key has been
-// superseded; until then the value is the bare ObjectManifest.
+// ObjectLeaf is the per-key version group — the "/objectleaf/0" arm.
 type ObjectLeaf struct {
     // Current is the head version — what GET/HEAD/ListObjects resolve with a
     // single leaf read, no descent.
@@ -136,12 +137,23 @@ type ObjectLeaf struct {
     // its seq.
     NullSeq uint64 `cborgen:"n"`
 }
+
+// ValueUnion is the union as cbor-gen encodes it; the strict wrappers above
+// it are what call sites use.
+type ValueUnion struct {
+    Manifest *ObjectManifest `cborgen:"/objectmanifest/0,omitempty"`
+    Leaf     *ObjectLeaf     `cborgen:"/objectleaf/0,omitempty"`
+}
 ```
 
-**Why two forms:** most keys are written once and never versioned; the bare form keeps their
-reads at one block and their storage at one manifest — the cost of versioning lands only on
-keys that use it. A versioned read needs the extra block anyway: the leaf routes the seq lookup
-(§6.1), then the manifest serves the body.
+**Every manifest block is stored under its union key** — as a value block and as a prev-tree
+entry (§2.2) alike — so a version's identity CID (invariant 5, §2.4) names one encoding
+everywhere it appears.
+
+**Why a union with a one-version fast path:** most keys are written once and never versioned;
+the manifest arm keeps their reads at one block and their storage at one manifest — the cost of
+versioning lands only on keys that use it. A versioned read needs the extra block anyway: the
+leaf routes the seq lookup (§6.1), then the manifest serves the body.
 
 **Why `VersionNode` repeats `Seq` and `VersionID` when the manifest also stores them (§2.3):**
 the copies let the leaf answer questions without fetching a manifest. The write rule decides
@@ -151,10 +163,10 @@ from the leaf alone. Manifests are immutable, so the copies cannot drift: the ma
 the authoritative record, and the `VersionNode` fields are a two-field cache of it.
 
 **Why the leaf points at the manifest rather than inlining it:** every version's manifest is
-written as a standalone block at version creation — for a bare key it *is* the value — and its
-CID is the version's stable identity (invariant 5, §2.4): prev entries store it, supersession
-pushes it down and promotion (§7.2) pulls it back, and the reference index (§8) counts claims
-on the strength of it. Inlining a copy of the current manifest into the leaf would save the
+written as a standalone block at version creation — for a single-version key it *is* the
+value — and its CID is the version's stable identity (invariant 5, §2.4): prev entries store
+it, supersession pushes it down and promotion (§7.2) pulls it back, and the reference index
+(§8) counts claims on the strength of it. Inlining a copy of the current manifest into the leaf would save the
 second fetch on leaf-key reads, but it would put each object's blob list — which scales with
 object size — on the block every list walk reads, and leaf keys are exactly the keys whose
 lists carry many versions. The leaf stays a small pointer block; the extra fetch is a hot
@@ -169,7 +181,8 @@ blockstore — its nodes are ordinary catalog-plane blocks):
   Because the MST iterates forward-only (`mst.go:835 WalkLeavesFrom`), the inversion makes
   iteration **newest-first**. Scoped to one object key, the key is *just an integer rendered
   order-preservingly*, valid under `mst.IsValidKey` (hex is UTF-8, NUL-free, short).
-- **value** — the version's `ObjectManifest` CID and nothing else: a prev entry stores no
+- **value** — the version's manifest CID (its `"/objectmanifest/0"` block, §2.1) and nothing
+  else: a prev entry stores no
   `VersionNode`. For these entries the seq is recoverable from the MST key, and the version id
   lives only in the manifest (§2.3). That costs nothing in practice, because every consumer of
   a prev entry fetches the manifest anyway (list rendering needs ETag/size/mtime;
@@ -189,9 +202,9 @@ VersionID string `cborgen:"vi"` // "null" or the ULID token; "" only in pre-vers
 
 Both fields also exist on the leaf's `VersionNode` (§2.1 explains the split). The manifest is
 the self-contained record: a prev entry stores only the manifest CID (§2.2), so for noncurrent
-versions — and for a bare key's single version (§2.1) — the manifest is the only place the id
+versions — and for a manifest-valued key's single version (§2.1) — the manifest is the only place the id
 is stored. List rendering reads it there, the token check in §6.1 verifies against it,
-supersession of a bare key reads the old version's position from it (§5.2), and promotion
+supersession of a manifest-valued key reads the old version's position from it (§5.2), and promotion
 (§7.2) rebuilds the leaf's `Current` node from these two fields.
 
 A **delete marker** is an `ObjectManifest` with `DeleteMarker: true`, a zero `Body` (no blobs, no
@@ -215,7 +228,7 @@ must also register `ObjectLeaf` and `VersionNode`).
    `seq` starts at 1; 0 is reserved to mean "none" (`NullSeq`).
 5. **A version's identity never changes.** `Seq`/`VersionID` are minted once at commit; promotion
    moves a `VersionNode` between `Prev` and `Current` without rewriting its manifest.
-6. **A bare-manifest value holds exactly one version.** The leaf form appears with the key's
+6. **A manifest-arm value holds exactly one version.** The leaf arm appears with the key's
    second version (§5.2) and persists until the key itself is deleted: version-scoped deletes
    that shrink a key back to one version keep its leaf (§7.2), so a leaf is never downgraded.
 
@@ -326,7 +339,7 @@ commit fails or retries, the seq is a gap; gaps are harmless (`architecture.md` 
 ### 5.2 Supersession
 
 With `superseded` = the key's existing current version (if the key exists) and `new` = the
-incoming version. On a leaf key `superseded` is `leaf.Current`; on a bare key (§2.1) it is the
+incoming version. On a leaf key `superseded` is `leaf.Current`; on a manifest-valued key (§2.1) it is the
 manifest itself, whose `Seq`/`VersionID` fields (§2.3) supply the same information — the write
 path fetches the old manifest in either case that consumes it (retention needs its position,
 discard needs its digests, §8).
@@ -337,11 +350,11 @@ discards := []                                     // versions permanently remov
 if key exists:
     retain := (state == Enabled) || (superseded.VersionID != "null")
     if retain:
-        if value is bare: leaf = {Prev: empty}     // first supersession: create the leaf
+        if value is a manifest: leaf = {Prev: empty}  // first supersession: create the leaf
         prev.Put(revSeqKey(superseded.Seq), superseded.Manifest)
         if superseded.VersionID == "null": leaf.NullSeq = superseded.Seq
     else:
-        discards += superseded                     // replace the null in place; a bare key stays bare
+        discards += superseded                     // replace the null in place; the value stays a manifest
 
 if leaf exists:
     if new.VersionID == "null" && leaf.NullSeq != 0:  // only one null per key: evict prev null
@@ -349,9 +362,9 @@ if leaf exists:
         prev.Delete(revSeqKey(leaf.NullSeq))
         leaf.NullSeq = 0
     leaf.Current = {seq, vid, manifestCID}
-    write leaf block; value = CID(leaf envelope)
+    write leaf block; value = CID(leaf arm)
 else:
-    value = manifestCID                            // new key, or null over null: stays bare
+    value = manifestCID                            // new key, or null over null: the manifest arm
 
 splice top MST at objectKey; return new root
 ```
@@ -364,11 +377,11 @@ splice top MST at objectKey; return new root
 | Unversioned | null | discard — replace the null in place |
 
 `prev` is written only when history is retained — never for a purely-unversioned bucket (its
-keys stay bare manifests), always for Enabled, and only across the numbered→null boundary for
+keys stay manifest-valued), always for Enabled, and only across the numbered→null boundary for
 Suspended. The leaf appears exactly at a key's first retained supersession and persists from
 then on (invariant 6).
 
-New-key writes skip supersession entirely: the value is the new manifest CID, bare.
+New-key writes skip supersession entirely: the value is the new manifest CID.
 
 ### 5.3 Cost
 
@@ -393,13 +406,13 @@ MST is.
 ### 6.1 Resolution
 
 Every versionId-taking read resolves through one helper, `resolveVersion(ctx, state, key,
-versionId)` → `(leaf, VersionNode, *ObjectManifest, error)` (`leaf` is nil for a bare key):
+versionId)` → `(leaf, VersionNode, *ObjectManifest, error)` (`leaf` is nil for a manifest-valued key):
 
 ```
 val := topMST.Get(key)                   → miss: NoSuchKey
 classify(versionId)                      // §3; invalid → InvalidArgument (InvalidArgVersionId)
 
-value is a bare manifest (§2.1):         // single-version key: the manifest answers everything
+value is a manifest (§2.1):              // single-version key: the manifest answers everything
     case current:   → it
     case "null":    manifest.VersionID == "null" → it, else NoSuchVersion
     case ULID(_):   manifest.VersionID == token  → it, else NoSuchVersion
@@ -446,8 +459,8 @@ rows stay out of scope with it.
 
 | state | behavior |
 |---|---|
-| unversioned | permanent delete (object.go:607 `deleteObjectKey`): drop the key and its bare manifest, release claims. No marker, no version headers. |
-| enabled | insert a **numbered delete marker** via the write rule (§5). This happens **even if the key does not exist** (S3 semantics; `Versioning_DeleteObject_non_existing_object` deletes a nonexistent key and succeeds) — the key is created with the marker's manifest as its bare value. Response: `DeleteMarker: true`, `VersionId: <marker token>`. |
+| unversioned | permanent delete (object.go:607 `deleteObjectKey`): drop the key and its manifest, release claims. No marker, no version headers. |
+| enabled | insert a **numbered delete marker** via the write rule (§5). This happens **even if the key does not exist** (S3 semantics; `Versioning_DeleteObject_non_existing_object` deletes a nonexistent key and succeeds) — the key is created with the marker's manifest as its value. Response: `DeleteMarker: true`, `VersionId: <marker token>`. |
 | suspended | insert a **null delete marker** via the write rule — as a null write it replaces the existing null (current) or evicts a prev null, per §5.2; repeatable idempotently (`Versioning_DeleteObject_suspended` runs it five times). Response: `DeleteMarker: true`, `VersionId: "null"`. |
 
 ### 7.2 `DeleteObject` with versionId
@@ -460,7 +473,7 @@ resolve (§6.1): miss (unknown key, or no such version) → success no-op — S3
                 idempotent (Versioning_DeleteObject_non_existing_objects); the response
                 echoes the requested id. (GET/HEAD keep returning NoSuchVersion, §6.2.)
 
-if value is bare (§2.1):                             // the match was the key's only version
+if value is a manifest (§2.1):                       // the match was the key's only version
     delete the key from the top MST
 else if target == leaf.Current:
     if prev empty: delete the key (leaf and all) from the top MST
@@ -474,7 +487,7 @@ else:
     if target.Seq == leaf.NullSeq: leaf.NullSeq = 0
 ```
 
-A delete never converts a leaf back to the bare form: a key left holding one version keeps its
+A delete never converts a leaf back to the manifest arm: a key left holding one version keeps its
 leaf (invariant 6), so the upgrade happens once per key and the write path never re-derives
 form from count.
 
@@ -533,18 +546,18 @@ ingot's index answers only "does any version in this bucket still need the diges
 
 ### 9.1 `ListObjects` / `ListObjectsV2`
 
-`listWalk` (object.go:849) reads each key's current version — the bare manifest itself, or the
+`listWalk` (object.go:849) reads each key's current version — the manifest arm itself, or the
 leaf's `Current` manifest (fetched anyway for ETag/size) — and **skips keys whose current
 version is a delete marker**: they don't count toward `MaxKeys`, don't produce entries, and
 don't seed a `CommonPrefix`. Prefix, delimiter, markers, and truncation keep their usual
-semantics; the walk costs one manifest per bare key, or a leaf and a manifest per superseded
+semantics; the walk costs one manifest per manifest-valued key, or a leaf and a manifest per superseded
 key, with no descent into `Prev`. The manifest fetch applies even to keys a delimiter rolls
 into a `CommonPrefix`: a prefix whose keys all sit under delete markers must not appear.
 
 ### 9.2 `ListObjectVersions` (new; interface at versitygw backend.go:78)
 
-The walk composes the top-MST key walk with the per-key newest-first version sequence — a bare
-key's single version, or `Current` then the `Prev` walk:
+The walk composes the top-MST key walk with the per-key newest-first version sequence — a
+manifest-valued key's single version, or `Current` then the `Prev` walk:
 
 - **Entries.** Non-marker versions → `s3response.ObjectVersion{Key, VersionId, IsLatest,
   ETag, Size, LastModified, StorageClass: STANDARD}` plus checksum fields mapped from the
@@ -571,19 +584,17 @@ key's single version, or `Current` then the `Prev` walk:
 
 ## 10. Compatibility & migration
 
-The value envelope (§2.1) makes the format self-describing. Bare blocks are manifests;
-enveloped blocks name their own format in the envelope key; a reader that meets an envelope key
-it does not know fails loudly instead of decoding garbage (cbor-gen's map decoders skip unknown
-fields and zero-fill missing ones, so *unguarded* cross-type decodes would succeed silently —
-the envelope is what rules them out). Format revisions from here — a changed leaf, a new value
-kind — take a new envelope key and coexist with old blocks under one reader, with no rewrite
-pass.
+The value union (§2.1) makes the format self-describing. Every value block names its own
+format in its union key, and a reader that meets a key it does not know fails loudly instead of
+decoding garbage (cbor-gen's map decoders skip unknown fields and zero-fill missing ones, so
+*unguarded* cross-type decodes would succeed silently — the strict union wrappers are what rule
+them out). Format revisions from here — a changed manifest, a changed leaf, a new value kind —
+take a new union key and coexist with old blocks under one reader, with no rewrite pass.
 
-Buckets written before versioning store bare `ObjectManifest` CIDs — the same shape as the
-single-version form — but their manifests predate `Seq`/`VersionID` (§2.3) and decode with
-`Seq: 0`, `VersionID: ""`. Per the repo's dev-only data posture (CLAUDE.md: "reshape migrations
-in place and reset any persistent dev DB"), there is **no migration**: existing dev buckets are
-reset rather than taught to resolve the zero values.
+Buckets written before versioning store manifests as bare blocks with no union key (and no
+`Seq`/`VersionID`, §2.3); the union readers reject them. Per the repo's dev-only data posture
+(CLAUDE.md: "reshape migrations in place and reset any persistent dev DB"), there is **no
+migration**: existing dev buckets are reset rather than taught to read the pre-union form.
 
 Out of scope: object tagging, object lock / retention / legal hold, `UploadPartCopy`,
 `ListParts`/`ListMultipartUploads`, `GetObjectAttributes`, MFA delete, lifecycle expiration, and
@@ -595,15 +606,15 @@ multi-instance seq arbitration beyond the existing `CASRoot` conflict surface.
 
 | Where | Change |
 |---|---|
-| `bucket/leaf.go` (new) + `gen/main.go` + `make gen` | `ObjectLeaf`, `VersionNode`; register with cborgen; the hand-written `"/objectleaf/0"` envelope codec (§2.1) |
+| `bucket/leaf.go` (new) + `gen/main.go` + `make gen` | `ObjectLeaf`, `VersionNode`, `ValueUnion` (cborgen-registered); the strict `ObjectValue` / `EnvelopedManifest` / `EnvelopedLeaf` wrappers (§2.1) |
 | `bucket/manifest.go` | `Seq`, `VersionID` fields (§2.3) |
 | `registry/registry.go`, `postgres.go`, `inmem/store.go` | `State.Versioning`, `VersioningState`, `SetVersioning`, `AllocVersionSeq` (§4.1) |
-| `s3frontend/version.go` (new) | token mint/parse/classify (§3), `revSeqKey`, the bare-vs-leaf value decode (§2.1), `resolveVersion` (§6.1), the write rule (§5.2), prev-tree helpers |
+| `s3frontend/version.go` (new) | token mint/parse/classify (§3), `revSeqKey`, the value-union dispatch (§2.1), `resolveVersion` (§6.1), the write rule (§5.2), prev-tree helpers |
 | `s3frontend/object.go` | `PutObject` splice → write rule; reads resolve via `resolveVersion`; `GetObject`/`HeadObject` versionId + marker semantics + output ids; `DeleteObject`/`deleteObjectKey`/`DeleteObjects` (§7); `reconcileClaims` call sites carry real version ids (§8); `listWalk` marker skip (§9.1) |
 | `s3frontend/copy.go`, `multipart.go` | `commitManifest` → write rule; source-version resolution; `CopySourceVersionId`; Complete's `versionid` return |
 | `s3frontend/bucket.go` | `PutBucketVersioning` (new), `GetBucketVersioning` (real states), versioned `DeleteBucket` guard (§7) |
 | `s3frontend/listversions.go` (new) | `ListObjectVersions` (§9.2) |
 | `s3frontend/conditions.go` | `currentObjectETag` resolves the current version via `resolveVersion` |
-| unit tests | token codec + classification; envelope codec round-trip + unknown-key rejection; write-rule table tests (all four supersession rows + first-supersession leaf creation + null eviction + non-existent-key marker); promotion; per-version claim add/release on the `refindex_test.go` harness; list pagination |
+| unit tests | token codec + classification; union codec round-trip + unknown-key and pre-union-block rejection; write-rule table tests (all four supersession rows + first-supersession leaf creation + null eviction + non-existent-key marker); promotion; per-version claim add/release on the `refindex_test.go` harness; list pagination |
 | `itest/versity_versioning_test.go` (new) + `versity_test.go` categories | curate upstream `TestVersioning` / `ListObjectVersions_*` / `GetBucketVersioning_*` / `PutBucketVersioning_*` rows into pass/xfail tables (tagging, object-lock, `GetObjectAttributes`, `UploadPartCopy` rows → xfail/omitted; note the teardown-blocked caveat, itest/README.md:40-47) |
 | `docs/architecture.md` | point §3 at this doc for versioning |
