@@ -6,6 +6,7 @@ import (
 	"errors"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -158,13 +159,16 @@ func TestCompleteDuringAbortIsNoSuchUpload(t *testing.T) {
 	}
 }
 
-// parkingDeferred parks every blob at UploadPart and, at conclude, holds each
-// call until a second one is in flight: a serial conclude loop would never
-// have two calls open at once and fails by timeout, so a passing run proves
-// Complete's conclude fan-out overlaps.
+// parkingDeferred parks every blob at UploadPart and records each
+// ConcludeBlobBatch call, so a test can assert Complete concludes its parked
+// blobs together in batches rather than blob-by-blob. failDigests marks
+// digests whose first conclude attempt reports a per-blob failure (cleared
+// once used, so a retry succeeds).
 type parkingDeferred struct {
 	inmem.NopUploader
-	entered chan struct{} // capacity 2; records the first two concurrent entries
+	mu          sync.Mutex
+	calls       [][]uploader.UploadedBlob
+	failDigests map[string]struct{}
 }
 
 func (d *parkingDeferred) UploadBlob(_ context.Context, _ did.DID, digest multihash.Multihash, size int64, _ string, _ ...uploader.UploadOption) (uploader.UploadedBlob, error) {
@@ -178,26 +182,32 @@ func (d *parkingDeferred) UploadBlob(_ context.Context, _ did.DID, digest multih
 	}, nil
 }
 
-func (d *parkingDeferred) ConcludeBlob(_ context.Context, _ did.DID, parked uploader.UploadedBlob) (uploader.BlobLocation, error) {
-	select {
-	case d.entered <- struct{}{}:
-	default:
-	}
-	deadline := time.Now().Add(5 * time.Second)
-	for len(d.entered) < 2 {
-		if time.Now().After(deadline) {
-			return uploader.BlobLocation{}, errors.New("conclude ran serially: no concurrent peer within 5s")
+func (d *parkingDeferred) ConcludeBlobBatch(_ context.Context, _ did.DID, parked []uploader.UploadedBlob) ([]uploader.ConcludeBlobResult, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.calls = append(d.calls, append([]uploader.UploadedBlob(nil), parked...))
+	results := make([]uploader.ConcludeBlobResult, len(parked))
+	for i, p := range parked {
+		if _, ok := d.failDigests[string(p.Digest)]; ok {
+			delete(d.failDigests, string(p.Digest))
+			results[i] = uploader.ConcludeBlobResult{Err: errors.New("injected conclude failure")}
+			continue
 		}
-		time.Sleep(time.Millisecond)
+		results[i] = uploader.ConcludeBlobResult{Location: uploader.BlobLocation{Provider: "did:test:piri", URL: "http://piri/blob", Size: p.Size}}
 	}
-	return uploader.BlobLocation{Provider: "did:test:piri", URL: "http://piri/blob", Size: parked.Size}, nil
+	return results, nil
 }
 
-// TestConcludeBlobsRunConcurrently: Complete's accept phase concludes distinct
-// parked blobs in parallel — sequentially it cost one round trip + receipt
-// fetch per part, holding the connection past client read timeouts at a few
-// hundred parts.
-func TestConcludeBlobsRunConcurrently(t *testing.T) {
+func (d *parkingDeferred) batchCalls() [][]uploader.UploadedBlob {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return append([][]uploader.UploadedBlob(nil), d.calls...)
+}
+
+// newParkingTestBackend is newRefTestBackend with a parking deferred uploader
+// wired in, so Complete exercises the real park → batch-conclude path.
+func newParkingTestBackend(t *testing.T, def *parkingDeferred) (*Backend, *inmem.MemStore) {
+	t.Helper()
 	ctx := context.Background()
 	dir := t.TempDir()
 	mem := inmem.NewMemStore()
@@ -216,7 +226,6 @@ func TestConcludeBlobsRunConcurrently(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = log.Close(ctx) })
 
-	def := &parkingDeferred{entered: make(chan struct{}, 2)}
 	b := New(Deps{
 		Authority: mem,
 		Registry:  mem,
@@ -233,13 +242,23 @@ func TestConcludeBlobsRunConcurrently(t *testing.T) {
 		Deferred:  def,
 		Remover:   &recordingRemover{},
 	})
-	if err := mem.Create(ctx, "bk", did.Undef); err != nil {
+	if err := mem.Create(ctx, "bk", did.Undef, registry.CreateState{}); err != nil {
 		t.Fatalf("create bucket: %v", err)
 	}
+	return b, mem
+}
 
-	// Two parts with distinct content → two parked digests → two concludes
-	// that must be in flight together.
-	key := "parallel-conclude"
+// TestCompleteConcludesParkedBlobsInOneBatch: Complete's accept phase sends
+// distinct parked digests to the deferred uploader as ONE batch — blob-by-blob
+// concludes cost one round trip + receipt fetch per part, holding the
+// connection past client read timeouts at a few hundred parts (issue #69).
+func TestCompleteConcludesParkedBlobsInOneBatch(t *testing.T) {
+	def := &parkingDeferred{}
+	b, _ := newParkingTestBackend(t, def)
+
+	// Two parts with distinct content → two parked digests → one batch call
+	// carrying both.
+	key := "batch-conclude"
 	uploadID := mpCreate(t, b, key, "", "")
 	var parts []types.CompletedPart
 	for i, data := range [][]byte{bytes.Repeat([]byte("a"), int(backend.MinPartSize)), bytes.Repeat([]byte("b"), 16)} {
@@ -252,5 +271,55 @@ func TestConcludeBlobsRunConcurrently(t *testing.T) {
 	}
 	if _, err := mpComplete(t, b, key, uploadID, parts, nil); err != nil {
 		t.Fatalf("Complete: %v", err)
+	}
+	calls := def.batchCalls()
+	if len(calls) != 1 || len(calls[0]) != 2 {
+		sizes := make([]int, len(calls))
+		for i, c := range calls {
+			sizes[i] = len(c)
+		}
+		t.Fatalf("ConcludeBlobBatch calls = %v (want one call with both parked blobs)", sizes)
+	}
+}
+
+// TestCompleteResumesAfterPartialConcludeFailure: a per-blob conclude failure
+// fails the Complete but keeps every concluded blob's recorded location, so
+// the retry re-concludes ONLY the failed blob (healing, issue #69).
+func TestCompleteResumesAfterPartialConcludeFailure(t *testing.T) {
+	partA := bytes.Repeat([]byte("a"), int(backend.MinPartSize))
+	partB := bytes.Repeat([]byte("b"), 16)
+	def := &parkingDeferred{failDigests: map[string]struct{}{string(digestOf(t, partB)): {}}}
+	b, mem := newParkingTestBackend(t, def)
+	ctx := context.Background()
+
+	key := "partial-conclude"
+	uploadID := mpCreate(t, b, key, "", "")
+	var parts []types.CompletedPart
+	for i, data := range [][]byte{partA, partB} {
+		out, uerr := mpUploadPart(t, b, key, uploadID, int32(i+1), data, nil)
+		if uerr != nil {
+			t.Fatalf("UploadPart %d: %v", i+1, uerr)
+		}
+		n := int32(i + 1)
+		parts = append(parts, types.CompletedPart{PartNumber: &n, ETag: out.ETag})
+	}
+
+	if _, err := mpComplete(t, b, key, uploadID, parts, nil); err == nil {
+		t.Fatal("Complete with an injected conclude failure: want error, got nil")
+	}
+	// The successful blob's location was recorded despite the batch error...
+	if loc, err := mem.GetLocation(ctx, did.Undef, digestOf(t, partA)); err != nil || loc == nil {
+		t.Fatalf("location for concluded blob after failed Complete: %v, %v (want recorded)", loc, err)
+	}
+	// ...so the retry succeeds and re-concludes only the failed blob.
+	if _, err := mpComplete(t, b, key, uploadID, parts, nil); err != nil {
+		t.Fatalf("Complete retry: %v", err)
+	}
+	calls := def.batchCalls()
+	if len(calls) != 2 {
+		t.Fatalf("ConcludeBlobBatch calls = %d, want 2 (initial + retry)", len(calls))
+	}
+	if len(calls[1]) != 1 || string(calls[1][0].Digest) != string(digestOf(t, partB)) {
+		t.Fatalf("retry batch = %d blobs, want only the failed blob", len(calls[1]))
 	}
 }

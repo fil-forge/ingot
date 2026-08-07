@@ -406,8 +406,12 @@ func (NopUploader) UploadBlob(_ context.Context, _ did.DID, digest multihash.Mul
 
 func (NopUploader) RemoveBlob(_ context.Context, _ did.DID, _ multihash.Multihash) error { return nil }
 
-func (NopUploader) ConcludeBlob(_ context.Context, _ did.DID, parked uploader.UploadedBlob) (uploader.BlobLocation, error) {
-	return uploader.BlobLocation{Size: parked.Size}, nil
+func (NopUploader) ConcludeBlobBatch(_ context.Context, _ did.DID, parked []uploader.UploadedBlob) ([]uploader.ConcludeBlobResult, error) {
+	results := make([]uploader.ConcludeBlobResult, len(parked))
+	for i, p := range parked {
+		results[i] = uploader.ConcludeBlobResult{Location: uploader.BlobLocation{Size: p.Size}}
+	}
+	return results, nil
 }
 
 func (NopUploader) AbortBlob(_ context.Context, _ did.DID, _ multihash.Multihash, _ cid.Cid) error {
