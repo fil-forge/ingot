@@ -17,12 +17,13 @@ import (
 
 // Compile-time assertions: *MemStore satisfies every store interface.
 var (
-	_ registry.BlobRefStore   = (*MemStore)(nil)
-	_ registry.IntentStore    = (*MemStore)(nil)
-	_ registry.LocationStore  = (*MemStore)(nil)
-	_ registry.InclusionStore = (*MemStore)(nil)
-	_ registry.MultipartStore = (*MemStore)(nil)
-	_ registry.GCStore        = (*MemStore)(nil)
+	_ registry.BlobRefStore          = (*MemStore)(nil)
+	_ registry.IntentStore           = (*MemStore)(nil)
+	_ registry.LocationStore         = (*MemStore)(nil)
+	_ registry.InclusionStore        = (*MemStore)(nil)
+	_ registry.MultipartStore        = (*MemStore)(nil)
+	_ registry.GCStore               = (*MemStore)(nil)
+	_ registry.RevocationCursorStore = (*MemStore)(nil)
 )
 
 func cloneBytes(b []byte) []byte {
@@ -370,6 +371,25 @@ func (m *MemStore) AddGCCandidate(_ context.Context, cidBytes []byte, _ string) 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.gcCands[string(cidBytes)] = struct{}{}
+	return nil
+}
+
+// RevocationCursorStore ======================================================
+
+func (m *MemStore) GetRevocationCursor(_ context.Context) (*registry.RevocationCursor, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.revCursor == nil {
+		return nil, registry.ErrNotFound
+	}
+	cur := *m.revCursor
+	return &cur, nil
+}
+
+func (m *MemStore) PutRevocationCursor(_ context.Context, cur registry.RevocationCursor) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.revCursor = &cur
 	return nil
 }
 

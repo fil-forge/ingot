@@ -50,7 +50,8 @@ func TestPostgresStores_Live(t *testing.T) {
 	}
 	if _, err := pool.Exec(ctx,
 		`TRUNCATE ingot.blob_refs, ingot.upload_intents, ingot.blob_locations,
-		 ingot.multipart_sessions, ingot.multipart_parts, ingot.gc_candidates, ingot.buckets CASCADE`); err != nil {
+		 ingot.multipart_sessions, ingot.multipart_parts, ingot.gc_candidates, ingot.buckets,
+		 ingot.revocation_cursor CASCADE`); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
 
@@ -299,6 +300,41 @@ func TestPostgresStores_Live(t *testing.T) {
 		}
 		if err := r.AddGCCandidate(ctx, digest, "b"); err != nil {
 			t.Fatalf("AddGCCandidate (dup): %v", err)
+		}
+	})
+
+	t.Run("revocation cursor upsert round trip", func(t *testing.T) {
+		if _, err := r.GetRevocationCursor(ctx); err != registry.ErrNotFound {
+			t.Fatalf("GetRevocationCursor before put err = %v, want ErrNotFound", err)
+		}
+		first := registry.RevocationCursor{
+			RecordedAt: time.Now().UTC().Truncate(time.Microsecond), // timestamptz is µs-precision
+			Revoke:     liveCid(t, "revoked-1"),
+		}
+		if err := r.PutRevocationCursor(ctx, first); err != nil {
+			t.Fatalf("PutRevocationCursor: %v", err)
+		}
+		got, err := r.GetRevocationCursor(ctx)
+		if err != nil {
+			t.Fatalf("GetRevocationCursor: %v", err)
+		}
+		if !got.RecordedAt.Equal(first.RecordedAt) || !got.Revoke.Equals(first.Revoke) {
+			t.Fatalf("cursor = %+v, want %+v", got, first)
+		}
+		// The row is a single latch: a second put overwrites, never adds.
+		second := registry.RevocationCursor{
+			RecordedAt: first.RecordedAt.Add(time.Hour),
+			Revoke:     liveCid(t, "revoked-2"),
+		}
+		if err := r.PutRevocationCursor(ctx, second); err != nil {
+			t.Fatalf("PutRevocationCursor (upsert): %v", err)
+		}
+		got, err = r.GetRevocationCursor(ctx)
+		if err != nil {
+			t.Fatalf("GetRevocationCursor after upsert: %v", err)
+		}
+		if !got.RecordedAt.Equal(second.RecordedAt) || !got.Revoke.Equals(second.Revoke) {
+			t.Fatalf("cursor after upsert = %+v, want %+v", got, second)
 		}
 	})
 

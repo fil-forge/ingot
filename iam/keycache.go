@@ -51,3 +51,12 @@ func (k *VerificationKeyCache) Get(access, kind string) ([]byte, bool) {
 	data, ok := v.([]byte)
 	return data, ok
 }
+
+// Delete drops every cached verification key for access (both key kinds), so
+// the next request signed with that access key cannot verify locally and
+// falls through to Hilt.
+func (k *VerificationKeyCache) Delete(access string) {
+	for _, kind := range []string{s3.KeyKindSigV4, s3.KeyKindSigV4a} {
+		k.data.Delete(path.Join(access, kind))
+	}
+}

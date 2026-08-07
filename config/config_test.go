@@ -52,6 +52,8 @@ func TestValidate_RequiredFields(t *testing.T) {
 		{"identity key missing", func(c *Config) { c.Identity.KeyFile = "/nonexistent/agent.pem" }, "identity.key_file"},
 		{"upload service", func(c *Config) { c.UploadServiceURL = "" }, "upload_service_url and upload_service_did are required"},
 		{"auth service", func(c *Config) { c.AuthServiceDID = "" }, "auth_service_url and auth_service_did are required"},
+		{"revocation url without did", func(c *Config) { c.RevocationServiceURL = "http://127.0.0.1:6000" }, "revocation_service_url and revocation_service_did must be set together"},
+		{"revocation did without url", func(c *Config) { c.RevocationServiceDID = "did:web:swarf.example" }, "revocation_service_url and revocation_service_did must be set together"},
 		{"bad seal_age", func(c *Config) { c.SealAge = "not-a-duration" }, "parse seal_age"},
 		{"bad cors origin", func(c *Config) { c.CORSAllowedOrigins = []string{"app.example"} }, "cors_allowed_origins"},
 	}
@@ -64,6 +66,17 @@ func TestValidate_RequiredFields(t *testing.T) {
 				t.Fatalf("expected error containing %q, got: %v", tc.wantErr, err)
 			}
 		})
+	}
+}
+
+// TestValidate_RevocationServicePair: the revocation service is optional, but
+// URL and DID come as a pair.
+func TestValidate_RevocationServicePair(t *testing.T) {
+	cfg := validConfig(t)
+	cfg.RevocationServiceURL = "http://127.0.0.1:6000"
+	cfg.RevocationServiceDID = "did:web:swarf.example"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected valid config with revocation pair set, got: %v", err)
 	}
 }
 

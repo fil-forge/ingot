@@ -30,7 +30,7 @@ GOWORK=off go test -tags itest ./itest -run 'TestForgeVersity/PutObject' -v  # o
 GOWORK=off go build -o /tmp/ingot ./cmd/ingot               # the daemon binary
 ```
 
-**go directive: 1.25.7** (the indexing-service dep requires ≥ 1.25.7).
+**go directive: 1.26.4** (matches the swarf dep; indexing-service needs ≥ 1.25.7).
 
 **The test pattern — unit first, integration when you're ready to wait.**
 `make test` runs library/unit tests in seconds with no Docker. `make itest`
@@ -52,6 +52,8 @@ ingot depends only on these — it must **never** import `fil-forge/sprue` or
   `commands/{blob,content,http,assert,ucan,index,provider,access}`, `blobindex`
   (sharded-dag-index), `ucan` (ProofStore), `ucan/retrieval`, `didmailto`, `receipt`.
 - **`indexing-service/pkg/{client,types}`** — indexer query client.
+- **`swarf/pkg/{client,api}`** — the UCAN revocation service client: the SSE
+  revocation firehose the `revocation/` consumer subscribes to.
 - **`fil-forge/versitygw`** — our fork of versity/versitygw, the S3 REST front
   end (we implement `backend.Backend`). The fork adds externally derived SigV4
   signing keys (`auth.Account.SigningKey`, `middlewares.RequestIAMService`) for
@@ -109,6 +111,10 @@ Internal:
   **Forge mode requires Hilt** (`auth_service_url`/`auth_service_did`): the
   postgres registry forwards bucket create/delete/list to it, recovering
   the signed S3 request from the method's ctx.
+- **`revocation/`** — the Swarf firehose consumer (optional,
+  `revocation_service_url`/`_did`): streams UCAN revocations and clears the
+  affected access key's iam caches via `iam.Revoker`; resumes from the
+  `registry.RevocationCursorStore` cursor (no cursor → subscribe from now).
 - **`tokenstore/`** — carried-from-guppy delegation store (`tokens.cbor`).
 - **`bucket/`** — per-object model: `manifest.go` (`ObjectManifest`, `Body`),
   `chunker.go` (`BodyCodec`/`FixedChunker`), `cbor_gen.go`.

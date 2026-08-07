@@ -52,4 +52,19 @@ func TestVerificationKeyCache(t *testing.T) {
 		_, ok := c.Get("access-5", s3.KeyKindSigV4)
 		require.False(t, ok)
 	})
+
+	t.Run("delete drops every kind for the access key", func(t *testing.T) {
+		c.Put("access-6", time.Hour,
+			s3.VerificationKey{Kind: s3.KeyKindSigV4, Data: []byte("hmac")},
+			s3.VerificationKey{Kind: s3.KeyKindSigV4a, Data: []byte("ecdsa")},
+		)
+		c.Delete("access-6")
+		_, ok := c.Get("access-6", s3.KeyKindSigV4)
+		require.False(t, ok)
+		_, ok = c.Get("access-6", s3.KeyKindSigV4a)
+		require.False(t, ok)
+		// Other access keys are untouched.
+		_, ok = c.Get("access-1", s3.KeyKindSigV4)
+		require.True(t, ok)
+	})
 }

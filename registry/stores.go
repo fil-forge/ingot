@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/fil-forge/ucantone/did"
+	"github.com/ipfs/go-cid"
 )
 
 // This file defines the relational surface the upload/storage/delete
@@ -225,4 +226,26 @@ type MultipartStore interface {
 // GCStore records superseded MST node CIDs (§4). Write-only this iteration.
 type GCStore interface {
 	AddGCCandidate(ctx context.Context, cidBytes []byte, bucket string) error
+}
+
+// RevocationCursor is the single row of ingot.revocation_cursor: the resume
+// point in the revocation service's firehose. RecordedAt is the recorded_at
+// of the last processed revocation record — the service's own timeline, so a
+// reconnect's `since` cursor is immune to clock skew between ingot and the
+// service. Revoke is the CID of the delegation that record revoked, kept for
+// observability.
+type RevocationCursor struct {
+	RecordedAt time.Time
+	Revoke     cid.Cid
+}
+
+// RevocationCursorStore persists the firehose cursor across disconnects and
+// restarts. With no cursor stored (GetRevocationCursor → ErrNotFound) the
+// consumer connects from "now": nothing revoked before the process first
+// subscribed can be sitting in its in-memory caches.
+type RevocationCursorStore interface {
+	// GetRevocationCursor returns ErrNotFound when no cursor has been stored.
+	GetRevocationCursor(ctx context.Context) (*RevocationCursor, error)
+	// PutRevocationCursor upserts the cursor (a single logical row).
+	PutRevocationCursor(ctx context.Context, cur RevocationCursor) error
 }
