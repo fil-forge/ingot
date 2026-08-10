@@ -1,12 +1,14 @@
 package s3frontend
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
 	"time"
@@ -15,6 +17,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/versitygw/backend"
+	"github.com/fil-forge/versitygw/s3api/utils"
 	"github.com/fil-forge/versitygw/s3err"
 	"github.com/fil-forge/versitygw/s3response"
 	"github.com/google/uuid"
@@ -131,13 +134,19 @@ func (b *Backend) bucketSpace(ctx context.Context, bucketName string) (did.DID, 
 
 // UploadPart ingests one part: it coarse-splits the part body into blobs,
 // spools each to local disk (recording upload_intents), records the part
-// (its ordered blob digests, md5, size), and uploads each blob to its
-// provider — PARKED, not accepted: the /http/put conclude that triggers
+// (its ordered blob digests, md5, size, checksum), and uploads each blob to
+// its provider — PARKED, not accepted: the /http/put conclude that triggers
 // /blob/accept is deferred to Complete, so the bytes are durable but stay
 // out of the PDP pipeline, and an Abort unwinds them with /blob/abort
 // (§7.2). Re-uploading a part number supersedes the prior part; the
 // superseded part's now-unreferenced blobs are dropped from the spool and
 // rejected. The part ETag is the hex md5 of the part bytes.
+//
+// The part checksum follows the session's CreateMultipartUpload declaration:
+// a declared algorithm is computed (and validated against a client-supplied
+// value) on every part, persisted, and echoed; a session without one persists
+// an internal full-object CRC64NVME — Complete's default final checksum —
+// and echoes a client-requested algorithm without persisting it.
 func (b *Backend) UploadPart(ctx context.Context, input *s3.UploadPartInput) (*s3.UploadPartOutput, error) {
 	if input.Bucket == nil || input.Key == nil || input.UploadId == nil || input.PartNumber == nil {
 		return nil, s3err.GetAPIError(s3err.ErrInvalidRequest)
@@ -146,6 +155,59 @@ func (b *Backend) UploadPart(ctx context.Context, input *s3.UploadPartInput) (*s
 	sess, err := b.openSession(ctx, uploadID, input.Key)
 	if err != nil {
 		return nil, err
+	}
+
+	// Checksum negotiation against the session declaration. A part checksum
+	// for a different algorithm than the declared one is rejected, and a
+	// COMPOSITE session requires one on every part (the composite final
+	// checksum is derived from them).
+	partAlgo, expected := partChecksumFromInput(input)
+	sessAlgo := types.ChecksumAlgorithm(sess.ChecksumAlgorithm)
+	if sessAlgo != "" && partAlgo != "" && partAlgo != sessAlgo {
+		return nil, s3err.GetChecksumTypeMismatchErr(sessAlgo, partAlgo)
+	}
+	if sess.ChecksumType == string(types.ChecksumTypeComposite) && partAlgo == "" {
+		return nil, s3err.GetChecksumTypeMismatchErr(sessAlgo, types.ChecksumAlgorithm("null"))
+	}
+
+	// Reader stack over the body: hr computes the persisted checksum (the
+	// declared algorithm, or the internal CRC64NVME), clientRdr additionally
+	// computes/validates a client-requested algorithm the session didn't
+	// declare (echoed, never persisted). A client-supplied value mismatch
+	// surfaces from the ingest read as a BadDigest API error.
+	src := input.Body
+	if src == nil {
+		src = bytes.NewReader(nil)
+	}
+	var hr, clientRdr *utils.HashReader
+	switch {
+	case sessAlgo != "":
+		ht, err := hashTypeForAlgo(sessAlgo)
+		if err != nil {
+			return nil, err
+		}
+		if hr, err = utils.NewHashReader(src, expected, ht); err != nil {
+			return nil, err
+		}
+	case partAlgo == "" || partAlgo == types.ChecksumAlgorithmCrc64nvme:
+		if hr, err = utils.NewHashReader(src, expected, utils.HashTypeCRC64NVME); err != nil {
+			return nil, err
+		}
+	default:
+		if hr, err = utils.NewHashReader(src, "", utils.HashTypeCRC64NVME); err != nil {
+			return nil, err
+		}
+		ht, err := hashTypeForAlgo(partAlgo)
+		if err != nil {
+			return nil, err
+		}
+		if clientRdr, err = utils.NewHashReader(hr, expected, ht); err != nil {
+			return nil, err
+		}
+	}
+	bodyReader := io.Reader(hr)
+	if clientRdr != nil {
+		bodyReader = clientRdr
 	}
 
 	// Capture the superseded part's blobs (if any) before overwriting, so
@@ -164,8 +226,12 @@ func (b *Backend) UploadPart(ctx context.Context, input *s3.UploadPartInput) (*s
 	if err != nil {
 		return nil, err
 	}
-	body, err := b.splitSpool(ctx, sess.Bucket, input.Body)
+	body, err := b.splitSpool(ctx, sess.Bucket, bodyReader)
 	if err != nil {
+		var apiErr s3err.APIError
+		if errors.As(err, &apiErr) {
+			return nil, apiErr
+		}
 		return nil, fmt.Errorf("s3frontend: upload part ingest: %w", err)
 	}
 	if err := b.multipart.PutPart(ctx, registry.MultipartPart{
@@ -173,6 +239,7 @@ func (b *Backend) UploadPart(ctx context.Context, input *s3.UploadPartInput) (*s
 		PartNumber:  int(*input.PartNumber),
 		ETagMD5:     body.MD5,
 		Size:        body.Size,
+		Checksum:    hr.Sum(),
 		BlobDigests: bodyDigests(body),
 		State:       registry.PartParked,
 	}); err != nil {
@@ -189,7 +256,16 @@ func (b *Backend) UploadPart(ctx context.Context, input *s3.UploadPartInput) (*s
 		b.cleanupPartBlobs(ctx, space, uploadID, superseded)
 	}
 	etag := `"` + hex.EncodeToString(body.MD5) + `"`
-	return &s3.UploadPartOutput{ETag: &etag}, nil
+	out := &s3.UploadPartOutput{ETag: &etag}
+	switch {
+	case sessAlgo != "":
+		setUploadPartChecksum(out, sessAlgo, hr.Sum())
+	case clientRdr != nil:
+		setUploadPartChecksum(out, partAlgo, clientRdr.Sum())
+	case partAlgo != "":
+		setUploadPartChecksum(out, partAlgo, hr.Sum())
+	}
+	return out, nil
 }
 
 // CompleteMultipartUpload assembles the final object from the uploaded parts:
@@ -219,6 +295,16 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 			return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrNoSuchUpload)
 		}
 		return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: complete: %w", err)
+	}
+
+	// A Complete naming a checksum type must match the CreateMultipartUpload
+	// declaration (a session without one reports the literal "null").
+	if input.ChecksumType != "" && types.ChecksumType(sess.ChecksumType) != input.ChecksumType {
+		t := types.ChecksumType(sess.ChecksumType)
+		if t == "" {
+			t = types.ChecksumType("null")
+		}
+		return s3response.CompleteMultipartUploadResult{}, "", s3err.GetChecksumTypeMismatchOnMpErr(t)
 	}
 
 	// Conditional writes: S3 documents only If-None-Match: * (don't overwrite)
@@ -258,8 +344,31 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 		byNum[p.PartNumber] = p
 	}
 
+	// The final checksum: the session's declared algorithm/type, or S3's
+	// default full-object CRC64NVME (derived from the internal per-part
+	// values) when none was declared. COMPOSITE folds the parts' raw digests
+	// through a checksum-of-checksums; FULL_OBJECT combines the parts' CRCs
+	// without re-reading bytes. missingStored disables checksum derivation
+	// for sessions whose parts predate per-part checksum recording.
+	sessAlgo := types.ChecksumAlgorithm(sess.ChecksumAlgorithm)
+	mpHadChecksum := sessAlgo != ""
+	ckAlgo, ckType := sessAlgo, types.ChecksumType(sess.ChecksumType)
+	if !mpHadChecksum {
+		ckAlgo, ckType = types.ChecksumAlgorithmCrc64nvme, types.ChecksumTypeFullObject
+	}
+	var compositeRdr *utils.CompositeChecksumReader
+	if ckType == types.ChecksumTypeComposite {
+		compositeRdr, err = utils.NewCompositeChecksumReader(utils.HashType(strings.ToLower(string(ckAlgo))))
+		if err != nil {
+			return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: composite checksum reader: %w", err)
+		}
+	}
+	var composable string
+	missingStored := false
+
 	// Validate the requested parts (in-range and ascending, each matching a
-	// recorded part by number + ETag) and compute the multipart ETag.
+	// recorded part by number + ETag + checksum) and compute the multipart
+	// ETag while accumulating the final checksum.
 	requested := make([]registry.MultipartPart, 0, len(input.MultipartUpload.Parts))
 	etagHasher := md5.New()
 	prev := 0
@@ -287,8 +396,33 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 		if !etagsEqual(*rp.ETag, hex.EncodeToString(sp.ETagMD5)) {
 			return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrInvalidPart)
 		}
+		stored := ""
+		if mpHadChecksum {
+			stored = sp.Checksum
+		}
+		if err := validatePartChecksum(sessAlgo, stored, rp, uploadID); err != nil {
+			return s3response.CompleteMultipartUploadResult{}, "", err
+		}
 		requested = append(requested, sp)
 		etagHasher.Write(sp.ETagMD5)
+		// Accumulate from the STORED checksum (validation just proved any
+		// client-supplied value equal to it, and it also covers the internal
+		// CRC64NVME and the idempotent re-Complete).
+		switch {
+		case sp.Checksum == "":
+			missingStored = true
+		case compositeRdr != nil:
+			if err := compositeRdr.Process(sp.Checksum); err != nil {
+				return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: process part %d checksum: %w", num, err)
+			}
+		case len(requested) == 1:
+			composable = sp.Checksum
+		default:
+			composable, err = utils.AddCRCChecksum(ckAlgo, composable, sp.Checksum, sp.Size)
+			if err != nil {
+				return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: combine part %d checksum: %w", num, err)
+			}
+		}
 	}
 	// Every part but the last must meet S3's protocol-level 5 MiB minimum
 	// (backend.MinPartSize — an S3 constant clients and SDKs assume, not an
@@ -310,12 +444,37 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 	}
 	etag := hex.EncodeToString(etagHasher.Sum(nil)) + "-" + strconv.Itoa(len(requested))
 
+	// Derive the final checksum and verify a client-supplied value against
+	// it. A composite value may arrive bare (no "-N" part-count suffix); a
+	// session that declared no checksum ignores any client value — the
+	// derived CRC64NVME is authoritative.
+	ckValue := ""
+	if !missingStored {
+		if compositeRdr != nil {
+			ckValue = fmt.Sprintf("%s-%d", compositeRdr.Sum(), len(requested))
+		} else {
+			ckValue = composable
+		}
+		if mpHadChecksum {
+			if got := finalChecksumFromInput(ckAlgo, input); got != "" {
+				if ckType == types.ChecksumTypeComposite && !strings.Contains(got, "-") {
+					got = fmt.Sprintf("%s-%d", got, len(requested))
+				}
+				if got != ckValue {
+					return s3response.CompleteMultipartUploadResult{}, "", s3err.GetChecksumBadDigestErr(ckAlgo)
+				}
+			}
+		}
+	}
+
 	// Idempotent re-Complete: the prior Complete committed the object; the
 	// validation above already proved the client's part list matches the
 	// retained parts, so return the same result without recommitting.
 	if sess.State == registry.SessionCompleted {
 		etagQ := `"` + etag + `"`
-		return s3response.CompleteMultipartUploadResult{Bucket: &bucket, Key: &key, ETag: &etagQ}, "", nil
+		res := s3response.CompleteMultipartUploadResult{Bucket: &bucket, Key: &key, ETag: &etagQ}
+		setCompleteResultChecksum(&res, ckAlgo, ckValue, ckType)
+		return res, "", nil
 	}
 
 	// Single-winner latch vs a racing Abort: only the writer that moves the
@@ -378,6 +537,11 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 		WebsiteRedirectLocation: sess.WebsiteRedirectLocation,
 		Metadata:                sess.Metadata,
 	}
+	// Persist the final checksum so GET/HEAD/ListObjectVersions echo it —
+	// including the derived default of a session that declared none.
+	if ckValue != "" {
+		mf.ChecksumAlgorithm, mf.Checksum, mf.ChecksumType = string(ckAlgo), ckValue, string(ckType)
+	}
 
 	// Commit through the §5 write rule (docs/s3-versioning.md): seq allocation,
 	// supersession per the bucket's versioning state, and the post-commit
@@ -426,7 +590,9 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 		versionid = node.VersionID
 	}
 	etagQ := `"` + etag + `"`
-	return s3response.CompleteMultipartUploadResult{Bucket: &bucket, Key: &key, ETag: &etagQ}, versionid, nil
+	res := s3response.CompleteMultipartUploadResult{Bucket: &bucket, Key: &key, ETag: &etagQ}
+	setCompleteResultChecksum(&res, ckAlgo, ckValue, ckType)
+	return res, versionid, nil
 }
 
 // AbortMultipartUpload cancels a multipart upload: it latches the session
@@ -718,15 +884,19 @@ func (b *Backend) concludeBlobs(ctx context.Context, space did.DID, blobs []msbu
 }
 
 // ListParts returns the recorded parts of an in-flight upload, paginated by
-// part number.
+// part number. Per-part checksums are echoed only for a session that declared
+// a checksum algorithm (the internal CRC64NVME of an undeclared session stays
+// hidden); such a session reports the literal "null" algorithm and type.
 func (b *Backend) ListParts(ctx context.Context, input *s3.ListPartsInput) (s3response.ListPartsResult, error) {
 	if input.Bucket == nil || input.Key == nil || input.UploadId == nil {
 		return s3response.ListPartsResult{}, s3err.GetAPIError(s3err.ErrInvalidRequest)
 	}
 	uploadID := *input.UploadId
-	if _, err := b.openSession(ctx, uploadID, input.Key); err != nil {
+	sess, err := b.openSession(ctx, uploadID, input.Key)
+	if err != nil {
 		return s3response.ListPartsResult{}, err
 	}
+	sessAlgo := types.ChecksumAlgorithm(sess.ChecksumAlgorithm)
 
 	marker := 0
 	if input.PartNumberMarker != nil && *input.PartNumberMarker != "" {
@@ -756,23 +926,33 @@ func (b *Backend) ListParts(ctx context.Context, input *s3.ListPartsInput) (s3re
 			truncated = true
 			break
 		}
-		parts = append(parts, s3response.Part{
+		part := s3response.Part{
 			PartNumber:   p.PartNumber,
 			ETag:         `"` + hex.EncodeToString(p.ETagMD5) + `"`,
 			Size:         p.Size,
 			LastModified: p.CreatedAt.UTC(),
-		})
+		}
+		if sessAlgo != "" {
+			setResponsePartChecksum(&part, sessAlgo, p.Checksum)
+		}
+		parts = append(parts, part)
 		next = p.PartNumber
 	}
 	res := s3response.ListPartsResult{
-		Bucket:           *input.Bucket,
-		Key:              *input.Key,
-		UploadID:         uploadID,
-		StorageClass:     types.StorageClassStandard,
-		PartNumberMarker: marker,
-		MaxParts:         maxParts,
-		IsTruncated:      truncated,
-		Parts:            parts,
+		Bucket:            *input.Bucket,
+		Key:               *input.Key,
+		UploadID:          uploadID,
+		StorageClass:      types.StorageClassStandard,
+		PartNumberMarker:  marker,
+		MaxParts:          maxParts,
+		IsTruncated:       truncated,
+		Parts:             parts,
+		ChecksumAlgorithm: types.ChecksumAlgorithm("null"),
+		ChecksumType:      types.ChecksumType("null"),
+	}
+	if sessAlgo != "" {
+		res.ChecksumAlgorithm = sessAlgo
+		res.ChecksumType = types.ChecksumType(sess.ChecksumType)
 	}
 	if truncated {
 		res.NextPartNumberMarker = next

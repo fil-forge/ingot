@@ -107,8 +107,9 @@ type MultipartSession struct {
 	Expires                 string
 	WebsiteRedirectLocation string
 	// ChecksumAlgorithm/ChecksumType are the x-amz-checksum-* declarations from
-	// CreateMultipartUpload, echoed by ListMultipartUploads. Per-part checksum
-	// computation is separate (FIL-620).
+	// CreateMultipartUpload. They select the per-part checksum algorithm at
+	// UploadPart and the final checksum derivation (COMPOSITE vs FULL_OBJECT)
+	// at Complete, and are echoed by ListParts and ListMultipartUploads.
 	ChecksumAlgorithm string
 	ChecksumType      string
 	Metadata          map[string]string
@@ -119,10 +120,16 @@ type MultipartSession struct {
 // ordered list of blobs the part split into (one entry unless the part
 // exceeded max_blob_size).
 type MultipartPart struct {
-	UploadID    string
-	PartNumber  int
-	ETagMD5     []byte
-	Size        int64
+	UploadID   string
+	PartNumber int
+	ETagMD5    []byte
+	Size       int64
+	// Checksum is the part's base64 checksum. When the session declares a
+	// checksum algorithm it is that algorithm's value (client-validated or
+	// server-computed); when the session declares none it is the internal
+	// full-object CRC64NVME used to derive the default final checksum at
+	// Complete, and is never echoed by ListParts.
+	Checksum    string
 	BlobDigests [][]byte
 	State       string
 	CreatedAt   time.Time

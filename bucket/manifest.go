@@ -37,6 +37,11 @@ type ObjectManifest struct {
 	// checksum was requested. Independent of the internal sha256 content address.
 	ChecksumAlgorithm string `cborgen:"ca"`
 	Checksum          string `cborgen:"ck"`
+	// ChecksumType is the S3 checksum type of Checksum: "FULL_OBJECT" (computed
+	// over the whole body) or "COMPOSITE" (a multipart checksum-of-checksums
+	// with a "-N" part-count suffix). Empty in blocks written before the type
+	// was recorded, which are all full-object.
+	ChecksumType string `cborgen:"cy"`
 
 	// HTTP/S3 system headers carried through PUT and replayed on
 	// HEAD/GET. Empty strings are omitted from responses.

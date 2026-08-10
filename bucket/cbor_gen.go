@@ -26,7 +26,7 @@ func (t *ObjectManifest) MarshalCBOR(w io.Writer) error {
 
 	cw := cbg.NewCborWriter(w)
 
-	if _, err := cw.Write([]byte{177}); err != nil {
+	if _, err := cw.Write([]byte{178}); err != nil {
 		return err
 	}
 
@@ -272,6 +272,29 @@ func (t *ObjectManifest) MarshalCBOR(w io.Writer) error {
 		return err
 	}
 	if _, err := cw.WriteString(string(t.ContentType)); err != nil {
+		return err
+	}
+
+	// t.ChecksumType (string) (string)
+	if len("cy") > 1000000 {
+		return xerrors.Errorf("Value in field \"cy\" was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("cy"))); err != nil {
+		return err
+	}
+	if _, err := cw.WriteString(string("cy")); err != nil {
+		return err
+	}
+
+	if len(t.ChecksumType) > 1000000 {
+		return xerrors.Errorf("Value in field t.ChecksumType was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len(t.ChecksumType))); err != nil {
+		return err
+	}
+	if _, err := cw.WriteString(string(t.ChecksumType)); err != nil {
 		return err
 	}
 
@@ -607,6 +630,17 @@ func (t *ObjectManifest) UnmarshalCBOR(r io.Reader) (err error) {
 				}
 
 				t.ContentType = string(sval)
+			}
+			// t.ChecksumType (string) (string)
+		case "cy":
+
+			{
+				sval, err := cbg.ReadStringWithMax(cr, 1000000)
+				if err != nil {
+					return err
+				}
+
+				t.ChecksumType = string(sval)
 			}
 			// t.DeleteMarker (bool) (bool)
 		case "dm":

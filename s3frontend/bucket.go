@@ -12,6 +12,7 @@ import (
 	"github.com/fil-forge/versitygw/s3err"
 	"github.com/fil-forge/versitygw/s3response"
 	"github.com/ipfs/go-cid"
+	"github.com/multiformats/go-multihash"
 	"go.uber.org/zap"
 
 	"github.com/fil-forge/ingot/bucketauthority"
@@ -284,6 +285,33 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 		if aborted > 0 {
 			b.logger.Info("delete bucket: aborted in-flight multipart sessions",
 				zap.String("bucket", name), zap.Int("aborted", aborted), zap.Int("total", len(sessions)))
+		}
+
+		// Shipped catalog segments registered blobs in the bucket's space
+		// (each sealed CAR plus its sharded-dag-index blob), and hilt
+		// refuses to delete a space that still holds registrations — so
+		// release them first. Quiescing the bucket's log comes before the
+		// enumeration: it joins any in-flight ship, so a segment can't
+		// register its blobs after the release pass has already read the
+		// rows (the delete would race the flush goroutine and be refused).
+		// The release is idempotent (removing an unregistered blob is a
+		// no-op), so a retried DeleteBucket is safe.
+		if log, ok := b.log.(interface {
+			QuiesceBucketLog(ctx context.Context, bucket string) error
+			ShippedSegmentDigests(ctx context.Context, bucket string) ([][]byte, error)
+		}); ok {
+			if err := log.QuiesceBucketLog(ctx, name); err != nil {
+				return fmt.Errorf("s3frontend: delete bucket: %w", err)
+			}
+			digests, err := log.ShippedSegmentDigests(ctx, name)
+			if err != nil {
+				return fmt.Errorf("s3frontend: delete bucket: %w", err)
+			}
+			for _, d := range digests {
+				if err := b.remover.RemoveBlob(ctx, st.Space, multihash.Multihash(d)); err != nil {
+					return fmt.Errorf("s3frontend: delete bucket: release shipped segment: %w", err)
+				}
+			}
 		}
 
 		req, ok := reqscope.Request(ctx)

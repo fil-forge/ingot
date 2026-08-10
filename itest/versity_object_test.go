@@ -173,10 +173,14 @@ var copyObjectPass = []forgeCase{
 	{name: "invalid_legal_hold", fn: integration.CopyObject_invalid_legal_hold},
 	{name: "invalid_object_lock_mode", fn: integration.CopyObject_invalid_object_lock_mode},
 	{name: "invalid_website_redirect_location", fn: integration.CopyObject_invalid_website_redirect_location},
+	{name: "create_checksum_on_copy", fn: integration.CopyObject_create_checksum_on_copy},
+	{name: "should_copy_the_existing_checksum", fn: integration.CopyObject_should_copy_the_existing_checksum},
+	{name: "should_replace_the_existing_checksum", fn: integration.CopyObject_should_replace_the_existing_checksum},
+	{name: "to_itself_by_replacing_the_checksum", fn: integration.CopyObject_to_itself_by_replacing_the_checksum},
 }
 
 // Observed failing against the forge stack: multi-account semantics, tagging,
-// object-lock, and checksum-on-copy are unimplemented surface.
+// and object-lock are unimplemented surface.
 var copyObjectXFail = []forgeCase{
 	{name: "not_owned_source_bucket", fn: integration.CopyObject_not_owned_source_bucket},
 	{name: "should_replace_tagging", fn: integration.CopyObject_should_replace_tagging},
@@ -185,10 +189,6 @@ var copyObjectXFail = []forgeCase{
 	{name: "with_legal_hold", fn: integration.CopyObject_with_legal_hold},
 	{name: "with_retention_lock", fn: integration.CopyObject_with_retention_lock},
 	{name: "object_acl_not_supported", fn: integration.CopyObject_object_acl_not_supported},
-	{name: "create_checksum_on_copy", fn: integration.CopyObject_create_checksum_on_copy},
-	{name: "should_copy_the_existing_checksum", fn: integration.CopyObject_should_copy_the_existing_checksum},
-	{name: "should_replace_the_existing_checksum", fn: integration.CopyObject_should_replace_the_existing_checksum},
-	{name: "to_itself_by_replacing_the_checksum", fn: integration.CopyObject_to_itself_by_replacing_the_checksum},
 	{name: "incorrect_source_bucket_expected_owner", fn: integration.CopyObject_incorrect_source_bucket_expected_owner},
 }
 

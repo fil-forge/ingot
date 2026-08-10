@@ -290,25 +290,25 @@ func (s *Server) Stop(ctx context.Context) error {
 // nil so the segment marks shipped and retires.
 func newBucketFlushFunc(up uploader.Uploader, reg registry.Registry, locations registry.LocationStore, inclusions registry.InclusionStore, bucket string, logger *zap.Logger) logstore.FlushFunc {
 	plane := blockstore.PlaneCatalog
-	return func(ctx context.Context, seg *logstore.Segment) error {
+	return func(ctx context.Context, seg *logstore.Segment) ([]byte, error) {
 		positions := seg.Positions()
 		if len(positions) == 0 {
-			return nil
+			return nil, nil
 		}
 		st, err := reg.Get(ctx, bucket)
 		if errors.Is(err, registry.ErrNotFound) {
 			logger.Info("dropping segment for deleted bucket",
 				zap.String("bucket", bucket), zap.Uint64("seq", seg.Seq()))
-			return nil
+			return nil, nil
 		}
 		if err != nil {
-			return fmt.Errorf("resolve space for %q: %w", bucket, err)
+			return nil, fmt.Errorf("resolve space for %q: %w", bucket, err)
 		}
 		// Segment stores the raw 32-byte SHA-256 of the CAR file; the
 		// uploader and ShardedDagIndexView want the multihash form.
 		sha, err := multihash.Encode(seg.SHA256(), multihash.SHA2_256)
 		if err != nil {
-			return fmt.Errorf("encode segment %d %s sha: %w", seg.Seq(), plane, err)
+			return nil, fmt.Errorf("encode segment %d %s sha: %w", seg.Seq(), plane, err)
 		}
 		shard := uploader.CARShard{
 			Path:      seg.CARPath(),
@@ -316,14 +316,14 @@ func newBucketFlushFunc(up uploader.Uploader, reg registry.Registry, locations r
 			SHA256:    sha,
 			Positions: positions,
 		}
-		carLoc, err := up.SubmitShard(ctx, plane, st.Space, shard)
+		carLoc, indexDigest, err := up.SubmitShard(ctx, plane, st.Space, shard)
 		if err != nil {
-			return fmt.Errorf("submit segment %d %s for %q: %w", seg.Seq(), plane, bucket, err)
+			return nil, fmt.Errorf("submit segment %d %s for %q: %w", seg.Seq(), plane, bucket, err)
 		}
 		// No published location (the no-op uploader): nothing durable to
 		// point reads at, so record nothing.
 		if carLoc.Provider == "" || carLoc.URL == "" {
-			return nil
+			return nil, nil
 		}
 		// Record the shard's location + every inner block's byte range
 		// BEFORE returning: a flush error keeps the segment unshipped (and
@@ -337,7 +337,7 @@ func newBucketFlushFunc(up uploader.Uploader, reg registry.Registry, locations r
 			URL:      carLoc.URL,
 			Size:     seg.Size(),
 		}); err != nil {
-			return fmt.Errorf("record segment %d %s location for %q: %w", seg.Seq(), plane, bucket, err)
+			return nil, fmt.Errorf("record segment %d %s location for %q: %w", seg.Seq(), plane, bucket, err)
 		}
 		incs := make([]registry.BlobInclusion, 0, len(positions))
 		for c, loc := range positions {
@@ -350,9 +350,9 @@ func newBucketFlushFunc(up uploader.Uploader, reg registry.Registry, locations r
 			})
 		}
 		if err := inclusions.PutInclusions(ctx, incs); err != nil {
-			return fmt.Errorf("record segment %d %s inclusions for %q: %w", seg.Seq(), plane, bucket, err)
+			return nil, fmt.Errorf("record segment %d %s inclusions for %q: %w", seg.Seq(), plane, bucket, err)
 		}
-		return nil
+		return indexDigest, nil
 	}
 }
 

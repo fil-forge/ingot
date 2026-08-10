@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -75,7 +76,7 @@ func (f *fakeMeta) MarkSegmentSealed(_ context.Context, plane blockstore.Plane, 
 	return nil
 }
 
-func (f *fakeMeta) MarkSegmentShipped(_ context.Context, plane blockstore.Plane, seq uint64, shippedAt int64, opRoots []blockstore.OpRoot) error {
+func (f *fakeMeta) MarkSegmentShipped(_ context.Context, plane blockstore.Plane, seq uint64, shippedAt int64, indexDigest []byte, opRoots []blockstore.OpRoot) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	m, ok := f.segments[seq]
@@ -86,6 +87,7 @@ func (f *fakeMeta) MarkSegmentShipped(_ context.Context, plane blockstore.Plane,
 		return nil
 	}
 	m.ShippedAt = shippedAt
+	m.IndexDigest = slices.Clone(indexDigest)
 	f.shipped = append(f.shipped, shipEvent{seq: seq, plane: plane})
 	return nil
 }
@@ -173,9 +175,9 @@ func newTestStore(t *testing.T, sealBytes int64, sealAge time.Duration, retain i
 	meta := newFakeMeta()
 	flushCalls := &atomicCounter{}
 	logger := zaptest.NewLogger(t)
-	flush := func(_ context.Context, _ *Segment) error {
+	flush := func(_ context.Context, _ *Segment) ([]byte, error) {
 		flushCalls.add(1)
-		return nil
+		return nil, nil
 	}
 	cfg := Config{
 		Dir:     dir,
@@ -335,7 +337,7 @@ func TestForceSealRecoveredOpenOnRestart(t *testing.T) {
 		cfg := Config{
 			Dir:     dir,
 			Meta:    meta,
-			Catalog: PlaneConfig{SealBytes: 1 << 30, SealAge: time.Hour, Ship: true, Flush: func(context.Context, *Segment) error { return nil }, Retain: 6},
+			Catalog: PlaneConfig{SealBytes: 1 << 30, SealAge: time.Hour, Ship: true, Flush: func(context.Context, *Segment) ([]byte, error) { return nil, nil }, Retain: 6},
 			Logger:  logger,
 		}
 		s, err := Open(context.Background(), cfg)
@@ -512,7 +514,7 @@ func TestCatalogNeverShips(t *testing.T) {
 			SealBytes: 1,
 			SealAge:   20 * time.Millisecond,
 			Ship:      false,
-			Flush:     func(context.Context, *Segment) error { ships.add(1); return nil },
+			Flush:     func(context.Context, *Segment) ([]byte, error) { ships.add(1); return nil, nil },
 		},
 		Logger: logger,
 	}

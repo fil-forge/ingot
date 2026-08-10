@@ -95,6 +95,10 @@ func apiErrCode(t *testing.T, err error) string {
 	if errors.As(err, &nsvErr) {
 		return nsvErr.Code
 	}
+	var ipErr s3err.InvalidPartError
+	if errors.As(err, &ipErr) {
+		return ipErr.Code
+	}
 	var apiErr s3err.APIError
 	if !errors.As(err, &apiErr) {
 		t.Fatalf("not an API error: %v", err)
