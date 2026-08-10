@@ -107,9 +107,10 @@ non-obvious parts:
 
 **Versioning.** Buckets carry a versioning state — `Unversioned` (default), `Enabled`, or
 `Suspended`.
-- Versions of a key are grouped and ordered **newest-first** in the MST by a composite key, so the
-  current version is the head leaf and version-scoped reads are direct seeks — see *Versioned key
-  encoding* below.
+- A key with a single version stores its manifest directly (one-block reads); once superseded it
+  gains an `ObjectLeaf` grouping its versions: the current version inline, noncurrent versions in
+  a per-key sub-MST ordered **newest-first**, version-scoped reads direct seeks — see *Versioned
+  storage* below.
 - `ListObjects` (V1/V2) returns only the current, non-delete-marked version per key (one head per
   key, skip to the next). `ListObjectVersions` walks all leaves. Delete markers are skipped by the
   former, surfaced by the latter (with the `x-amz-delete-marker` response header).
@@ -117,44 +118,17 @@ non-obvious parts:
   `Suspended`/`Unversioned` replaces the `null` version in place and drives the superseded data's
   delete through the reference index ([§5](#5-the-data-layer)).
 
-**Versioned key encoding (`invertedVersionId`).** Because the MST iterates forward only, the current
-version is made the head leaf of a key's group — reachable with a single seek — by storing versions
-under the composite key `escape(objectKey) ++ TERM ++ invertedVersionId`, whose trailing component
-sorts **newest-first**:
-- **ordinal** — each version gets a per-bucket monotonic sequence (`buckets.next_version_seq`,
-  advanced atomically in the commit path; gaps from retried commits are harmless). It is not
-  wall-clock, which avoids clock skew and cross-instance disagreement.
-- **`invertedVersionId`** — the ordinal's numeric inverse (`0xFFFF…FFFF − seq`) rendered as a
-  **fixed-width 16-char lowercase hex** string. Hex is order-preserving, NUL-free, and valid UTF-8;
-  the inverse makes the newest version (largest seq) the lexicographically smallest token, so it
-  sorts first within the key's group.
-- **`escape(objectKey) ++ TERM`** — an order-preserving, self-terminating encoding so a key's version
-  group stays contiguous and is never entered by a prefix-sharing neighbor (`a.png` vs `a.png2`):
-  escape `0x01` inside the key as `0x01 0x02`, then terminate with `TERM = 0x01 0x01`, which sorts
-  below any continuation (both bytes are non-NUL and valid UTF-8).
-- **client `versionId`** — the `x-amz-version-id` is the `invertedVersionId` token itself, so a
-  version-scoped request reconstructs the exact key and resolves in a direct O(log n) seek, no scan.
-
-Reads follow from the layout: current = the first leaf of the group; version-scoped = the
-reconstructed key; `ListObjectVersions` walks the group (already newest-first); `ListObjects` reads
-each head and seeks past the group to the next key. The token + terminator costs ~18 bytes (more if a
-key itself contains `0x01`). `MaxKeyBytes` is currently 1024 to match S3's key limit; it can be
-raised (e.g. to ~1056) so the version overhead does not shrink the usable S3 key length, at the cost
-of a slightly larger maximum leaf.
-
-> **Design decision (for review).** Two choices are baked into this encoding; the defaults below are
-> chosen but flagged for the team to ratify.
->
-> - **Composite key (chosen) vs. per-key version index.** Keying the MST by `(key, version)` keeps all
->   versions in one sorted space and amortizes well for many-versioned keys. The alternative keys the
->   MST by object key alone, with the leaf pointing at an explicit newest-first version index — which
->   removes the inversion, the escaping, and the key-budget pressure, but rewrites and grows that
->   index block on every new version. Revisit if hot keys accumulate very many versions.
-> - **`versionId` as a direct locator (chosen) vs. opaque.** Setting `versionId = invertedVersionId`
->   gives a scan-free, version-scoped lookup, but it **leaks version ordering and approximate write
->   count** (a smaller id is newer). AWS-style opacity would require a random id plus a
->   `versionId → seq` side map (or an HMAC of the seq), losing the direct-locator property. We keep the
->   direct locator; the opacity trade-off is left for the team to weigh.
+**Versioned storage (the per-key version tree).** The full design is
+**[`s3-versioning.md`](./s3-versioning.md)**. In brief: the top MST is keyed by the **plain object
+key**, and every value block is a keyed union naming its own format. A single-version key's value
+is its manifest under `"/objectmanifest/0"`; a superseded key's is an `ObjectLeaf`
+`{current, prev, nullSeq}` under `"/objectleaf/0"`, where `current` is the head version
+(single-seek reads) and `prev` is a per-key sub-MST of noncurrent versions keyed newest-first by
+the inverted per-bucket ordinal (`seq`, from `buckets.next_version_seq`). `seq` (ordering,
+internal) and `version_id` (identity, the client handle — a ULID token, or `"null"`) are
+**separate fields**, so the null version's replace-in-place semantics fall out instead of needing
+a sentinel. Object keys need no escaping and no terminator, and fit `MaxKeyBytes` as-is; the
+seq-derived token reveals write ordering, which is accepted (S3 ids are opaque to clients).
 
 **ETags.** The ETag is MD5-based, never the sha256 content digest. A whole-object ETag is the MD5 of
 the body; a multipart object's ETag is `hex(md5(concat of the N part MD5s)) + "-N"` (matching
@@ -192,7 +166,9 @@ validates/echoes them, independent of the internal sha256 content address.
 
 The catalog is the per-bucket namespace: the MST plus the object manifests it points at.
 
-**The MST** maps each composite key to a manifest CID. It is the forked, go-cid-only MST. It is the
+**The MST** maps each plain object key to its value block, a keyed union — the manifest for a
+single-version key, an `ObjectLeaf` once superseded ([§3](#3-the-s3-layer)). It is the forked,
+go-cid-only MST. It is the
 **source of truth for bucket state**, not merely a local index: because it is a content-addressed,
 self-verifying Merkle structure shipped to Forge (the catalog plane), a bucket's entire namespace is
 recoverable and portable from the network — the property a plain Postgres table (fast local index, but
@@ -212,11 +188,18 @@ depends on the single- vs multi-shard split in [§8](#8-retrieval-addressing-whe
 
 ```shell
 MST (bucket)
-  leaf key = compositeKey("photos/cat.jpg", invertedVersionId)
+  leaf key = "photos/cat.jpg"           (plain object key)
      │
-     └──▶ CID ──▶ ObjectManifest        ← one dag-cbor block, catalog plane
+     └──▶ CID ──▶ single version: {"/objectmanifest/0": ObjectManifest} — one block, one fetch
+              ──▶ superseded key:  {"/objectleaf/0": ObjectLeaf}   ← per-key version group
+                    │                                                (s3-versioning.md §2)
+                    ├ current  { seq, versionId, manifest CID }   (the head version, inline)
+                    ├ prev     CID of the per-key sub-MST of noncurrent versions (nil if none)
+                    └ nullSeq  a noncurrent null version's seq (0 = none)
+
+                  ObjectManifest        ← one dag-cbor block, catalog plane
                     ├ key          "photos/cat.jpg"
-                    ├ versionId    "v_01J8QX…"          (MST key holds an inverted form)
+                    ├ seq/versionId  "01J8QX…"          (identity; cached on the leaf's current)
                     ├ created      "2026-06-17T"…       (last-modified)
                     ├ etag         "9b2cf…-3"           (md5-of-md5s-N if multipart, else md5 hex)
                     ├ contentType + http headers + user metadata
@@ -586,9 +569,6 @@ The first cut keeps digest-before-upload; `allocate-by-size` is a same-rack fast
   rotation.
 - **Compaction trigger policy**, the **`allocate-by-size`** security model, and the **batch**
   allocate/accept wire format.
-- **Versioned key encoding** ([§3](#3-the-s3-layer)) — ratify composite-key vs. per-key version index, and
-  direct-locator vs. opaque `versionId` (the direct locator leaks version ordering / approximate
-  write count); and whether to raise `MaxKeyBytes` so versioning doesn't shrink the usable S3 key.
 
 ---
 
@@ -661,7 +641,7 @@ CREATE TABLE ingot.buckets (
                         CHECK (versioning IN ('unversioned','enabled','suspended')),
     root_cid          bytea,                             -- committed MST root (locally durable)
     forge_root_cid    bytea,                             -- MST root durable on Forge (lags root_cid)
-    next_version_seq  bigint NOT NULL DEFAULT 0,         -- per-bucket version ordinal (§3, invertedVersionId)
+    next_version_seq  bigint NOT NULL DEFAULT 0,         -- per-bucket version ordinal (§3, the version seq)
     created_at        timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX buckets_space_idx ON ingot.buckets (space);
@@ -779,12 +759,6 @@ The storage / delete / retrieval core is built and tested:
 
 These are intentional simplifications of the target topology, not bugs:
 
-- **S3 versioning is not implemented.** Buckets are effectively `Unversioned`: an overwrite replaces
-  in place and drives the prior data through the reference index. The `versionId` machinery in
-  [§3](#3-the-s3-layer) (composite key, `invertedVersionId`, `ListObjectVersions`, delete markers, `next_version_seq`)
-  is **not** built. The schema is designed toward it — `blob_refs.version_id` carries the constant
-  `"null"` sentinel, `buckets.versioning`/`next_version_seq` and `ObjectManifest.deleteMarker` are
-  reserved — so adding versioning later needs no manifest/MST-key migration.
 - **Deployed next to Piri.** The same-rack topology of [§10](#10-deployment-topology--the-digest-before-upload-cost) is assumed; digest-before-upload is
   kept and `allocate-by-size` is out of scope.
 - **No Ingot-side aggregation.** Ingot ships each body blob to Piri as-is; `min_aggregate_size`,
