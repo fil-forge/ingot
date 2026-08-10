@@ -59,10 +59,10 @@ func (r *Postgres) Create(ctx context.Context, name string, space did.DID) error
 func (r *Postgres) Get(ctx context.Context, name string) (*State, error) {
 	var rootBytes, forgeBytes []byte
 	var createdAt time.Time
-	var spaceStr string
+	var spaceStr, versioning string
 	err := r.pool.QueryRow(ctx,
-		`SELECT root_cid, forge_root_cid, created_at, space FROM ingot.buckets WHERE name = $1`, name).
-		Scan(&rootBytes, &forgeBytes, &createdAt, &spaceStr)
+		`SELECT root_cid, forge_root_cid, created_at, space, versioning FROM ingot.buckets WHERE name = $1`, name).
+		Scan(&rootBytes, &forgeBytes, &createdAt, &spaceStr, &versioning)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -73,7 +73,7 @@ func (r *Postgres) Get(ctx context.Context, name string) (*State, error) {
 	if err != nil {
 		return nil, fmt.Errorf("registry: parse space %q: %w", spaceStr, err)
 	}
-	st := &State{Name: name, Space: space, CreatedAt: createdAt}
+	st := &State{Name: name, Space: space, Versioning: VersioningState(versioning), CreatedAt: createdAt}
 	if err := setCidPg(&st.Root, rootBytes, name, "root_cid"); err != nil {
 		return nil, err
 	}
@@ -143,6 +143,36 @@ func (r *Postgres) SetForgeRoot(ctx context.Context, name string, root cid.Cid) 
 		return ErrNotFound
 	}
 	return nil
+}
+
+func (r *Postgres) SetVersioning(ctx context.Context, name string, v VersioningState) error {
+	if v != VersioningEnabled && v != VersioningSuspended {
+		return fmt.Errorf("registry: set versioning %q: invalid state %q", name, v)
+	}
+	tag, err := r.pool.Exec(ctx,
+		`UPDATE ingot.buckets SET versioning = $1 WHERE name = $2`,
+		string(v), name)
+	if err != nil {
+		return fmt.Errorf("registry: set versioning %q: %w", name, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (r *Postgres) AllocVersionSeq(ctx context.Context, name string) (uint64, error) {
+	var seq int64
+	err := r.pool.QueryRow(ctx,
+		`UPDATE ingot.buckets SET next_version_seq = next_version_seq + 1 WHERE name = $1 RETURNING next_version_seq`,
+		name).Scan(&seq)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, ErrNotFound
+	}
+	if err != nil {
+		return 0, fmt.Errorf("registry: alloc version seq %q: %w", name, err)
+	}
+	return uint64(seq), nil
 }
 
 func setCidPg(dst *cid.Cid, raw []byte, name, field string) error {

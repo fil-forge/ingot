@@ -26,7 +26,7 @@ func (t *ObjectManifest) MarshalCBOR(w io.Writer) error {
 
 	cw := cbg.NewCborWriter(w)
 
-	if _, err := cw.Write([]byte{175}); err != nil {
+	if _, err := cw.Write([]byte{177}); err != nil {
 		return err
 	}
 
@@ -368,6 +368,45 @@ func (t *ObjectManifest) MarshalCBOR(w io.Writer) error {
 		}
 	}
 
+	// t.Seq (uint64) (uint64)
+	if len("sq") > 1000000 {
+		return xerrors.Errorf("Value in field \"sq\" was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("sq"))); err != nil {
+		return err
+	}
+	if _, err := cw.WriteString(string("sq")); err != nil {
+		return err
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajUnsignedInt, uint64(t.Seq)); err != nil {
+		return err
+	}
+
+	// t.VersionID (string) (string)
+	if len("vi") > 1000000 {
+		return xerrors.Errorf("Value in field \"vi\" was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("vi"))); err != nil {
+		return err
+	}
+	if _, err := cw.WriteString(string("vi")); err != nil {
+		return err
+	}
+
+	if len(t.VersionID) > 1000000 {
+		return xerrors.Errorf("Value in field t.VersionID was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len(t.VersionID))); err != nil {
+		return err
+	}
+	if _, err := cw.WriteString(string(t.VersionID)); err != nil {
+		return err
+	}
+
 	// t.WebsiteRedirectLocation (string) (string)
 	if len("wr") > 1000000 {
 		return xerrors.Errorf("Value in field \"wr\" was too long")
@@ -640,6 +679,32 @@ func (t *ObjectManifest) UnmarshalCBOR(r io.Reader) (err error) {
 
 				t.Metadata[k] = v
 
+			}
+			// t.Seq (uint64) (uint64)
+		case "sq":
+
+			{
+
+				maj, extra, err = cr.ReadHeader()
+				if err != nil {
+					return err
+				}
+				if maj != cbg.MajUnsignedInt {
+					return fmt.Errorf("wrong type for uint64 field")
+				}
+				t.Seq = uint64(extra)
+
+			}
+			// t.VersionID (string) (string)
+		case "vi":
+
+			{
+				sval, err := cbg.ReadStringWithMax(cr, 1000000)
+				if err != nil {
+					return err
+				}
+
+				t.VersionID = string(sval)
 			}
 			// t.WebsiteRedirectLocation (string) (string)
 		case "wr":
@@ -1266,6 +1331,488 @@ func (t *BlobRef) UnmarshalCBOR(r io.Reader) (err error) {
 				}
 
 				t.Offset = int64(extraI)
+			}
+
+		default:
+			// Field doesn't exist on this type, so ignore it
+			if err := cbg.ScanForLinks(r, func(cid.Cid) {}); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+func (t *ObjectLeaf) MarshalCBOR(w io.Writer) error {
+	if t == nil {
+		_, err := w.Write(cbg.CborNull)
+		return err
+	}
+
+	cw := cbg.NewCborWriter(w)
+
+	if _, err := cw.Write([]byte{163}); err != nil {
+		return err
+	}
+
+	// t.Current (bucket.VersionNode) (struct)
+	if len("c") > 1000000 {
+		return xerrors.Errorf("Value in field \"c\" was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("c"))); err != nil {
+		return err
+	}
+	if _, err := cw.WriteString(string("c")); err != nil {
+		return err
+	}
+
+	if err := t.Current.MarshalCBOR(cw); err != nil {
+		return err
+	}
+
+	// t.NullSeq (uint64) (uint64)
+	if len("n") > 1000000 {
+		return xerrors.Errorf("Value in field \"n\" was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("n"))); err != nil {
+		return err
+	}
+	if _, err := cw.WriteString(string("n")); err != nil {
+		return err
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajUnsignedInt, uint64(t.NullSeq)); err != nil {
+		return err
+	}
+
+	// t.Prev (cid.Cid) (struct)
+	if len("p") > 1000000 {
+		return xerrors.Errorf("Value in field \"p\" was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("p"))); err != nil {
+		return err
+	}
+	if _, err := cw.WriteString(string("p")); err != nil {
+		return err
+	}
+
+	if t.Prev == nil {
+		if _, err := cw.Write(cbg.CborNull); err != nil {
+			return err
+		}
+	} else {
+		if err := cbg.WriteCid(cw, *t.Prev); err != nil {
+			return xerrors.Errorf("failed to write cid field t.Prev: %w", err)
+		}
+	}
+
+	return nil
+}
+
+func (t *ObjectLeaf) UnmarshalCBOR(r io.Reader) (err error) {
+	*t = ObjectLeaf{}
+
+	cr := cbg.NewCborReader(r)
+
+	maj, extra, err := cr.ReadHeader()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err == io.EOF {
+			err = io.ErrUnexpectedEOF
+		}
+	}()
+
+	if maj != cbg.MajMap {
+		return fmt.Errorf("cbor input should be of type map")
+	}
+
+	if extra > cbg.MaxLength {
+		return fmt.Errorf("ObjectLeaf: map struct too large (%d)", extra)
+	}
+
+	n := extra
+
+	nameBuf := make([]byte, 1)
+	for i := uint64(0); i < n; i++ {
+		nameLen, ok, err := cbg.ReadFullStringIntoBuf(cr, nameBuf, 1000000)
+		if err != nil {
+			return err
+		}
+
+		if !ok {
+			// Field doesn't exist on this type, so ignore it
+			if err := cbg.ScanForLinks(cr, func(cid.Cid) {}); err != nil {
+				return err
+			}
+			continue
+		}
+
+		switch string(nameBuf[:nameLen]) {
+		// t.Current (bucket.VersionNode) (struct)
+		case "c":
+
+			{
+
+				if err := t.Current.UnmarshalCBOR(cr); err != nil {
+					return xerrors.Errorf("unmarshaling t.Current: %w", err)
+				}
+
+			}
+			// t.NullSeq (uint64) (uint64)
+		case "n":
+
+			{
+
+				maj, extra, err = cr.ReadHeader()
+				if err != nil {
+					return err
+				}
+				if maj != cbg.MajUnsignedInt {
+					return fmt.Errorf("wrong type for uint64 field")
+				}
+				t.NullSeq = uint64(extra)
+
+			}
+			// t.Prev (cid.Cid) (struct)
+		case "p":
+
+			{
+
+				b, err := cr.ReadByte()
+				if err != nil {
+					return err
+				}
+				if b != cbg.CborNull[0] {
+					if err := cr.UnreadByte(); err != nil {
+						return err
+					}
+
+					c, err := cbg.ReadCid(cr)
+					if err != nil {
+						return xerrors.Errorf("failed to read cid field t.Prev: %w", err)
+					}
+
+					t.Prev = &c
+				}
+
+			}
+
+		default:
+			// Field doesn't exist on this type, so ignore it
+			if err := cbg.ScanForLinks(r, func(cid.Cid) {}); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+func (t *VersionNode) MarshalCBOR(w io.Writer) error {
+	if t == nil {
+		_, err := w.Write(cbg.CborNull)
+		return err
+	}
+
+	cw := cbg.NewCborWriter(w)
+
+	if _, err := cw.Write([]byte{163}); err != nil {
+		return err
+	}
+
+	// t.Manifest (cid.Cid) (struct)
+	if len("m") > 1000000 {
+		return xerrors.Errorf("Value in field \"m\" was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("m"))); err != nil {
+		return err
+	}
+	if _, err := cw.WriteString(string("m")); err != nil {
+		return err
+	}
+
+	if err := cbg.WriteCid(cw, t.Manifest); err != nil {
+		return xerrors.Errorf("failed to write cid field t.Manifest: %w", err)
+	}
+
+	// t.Seq (uint64) (uint64)
+	if len("s") > 1000000 {
+		return xerrors.Errorf("Value in field \"s\" was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("s"))); err != nil {
+		return err
+	}
+	if _, err := cw.WriteString(string("s")); err != nil {
+		return err
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajUnsignedInt, uint64(t.Seq)); err != nil {
+		return err
+	}
+
+	// t.VersionID (string) (string)
+	if len("v") > 1000000 {
+		return xerrors.Errorf("Value in field \"v\" was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("v"))); err != nil {
+		return err
+	}
+	if _, err := cw.WriteString(string("v")); err != nil {
+		return err
+	}
+
+	if len(t.VersionID) > 1000000 {
+		return xerrors.Errorf("Value in field t.VersionID was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len(t.VersionID))); err != nil {
+		return err
+	}
+	if _, err := cw.WriteString(string(t.VersionID)); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (t *VersionNode) UnmarshalCBOR(r io.Reader) (err error) {
+	*t = VersionNode{}
+
+	cr := cbg.NewCborReader(r)
+
+	maj, extra, err := cr.ReadHeader()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err == io.EOF {
+			err = io.ErrUnexpectedEOF
+		}
+	}()
+
+	if maj != cbg.MajMap {
+		return fmt.Errorf("cbor input should be of type map")
+	}
+
+	if extra > cbg.MaxLength {
+		return fmt.Errorf("VersionNode: map struct too large (%d)", extra)
+	}
+
+	n := extra
+
+	nameBuf := make([]byte, 1)
+	for i := uint64(0); i < n; i++ {
+		nameLen, ok, err := cbg.ReadFullStringIntoBuf(cr, nameBuf, 1000000)
+		if err != nil {
+			return err
+		}
+
+		if !ok {
+			// Field doesn't exist on this type, so ignore it
+			if err := cbg.ScanForLinks(cr, func(cid.Cid) {}); err != nil {
+				return err
+			}
+			continue
+		}
+
+		switch string(nameBuf[:nameLen]) {
+		// t.Manifest (cid.Cid) (struct)
+		case "m":
+
+			{
+
+				c, err := cbg.ReadCid(cr)
+				if err != nil {
+					return xerrors.Errorf("failed to read cid field t.Manifest: %w", err)
+				}
+
+				t.Manifest = c
+
+			}
+			// t.Seq (uint64) (uint64)
+		case "s":
+
+			{
+
+				maj, extra, err = cr.ReadHeader()
+				if err != nil {
+					return err
+				}
+				if maj != cbg.MajUnsignedInt {
+					return fmt.Errorf("wrong type for uint64 field")
+				}
+				t.Seq = uint64(extra)
+
+			}
+			// t.VersionID (string) (string)
+		case "v":
+
+			{
+				sval, err := cbg.ReadStringWithMax(cr, 1000000)
+				if err != nil {
+					return err
+				}
+
+				t.VersionID = string(sval)
+			}
+
+		default:
+			// Field doesn't exist on this type, so ignore it
+			if err := cbg.ScanForLinks(r, func(cid.Cid) {}); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+func (t *ValueUnion) MarshalCBOR(w io.Writer) error {
+	if t == nil {
+		_, err := w.Write(cbg.CborNull)
+		return err
+	}
+
+	cw := cbg.NewCborWriter(w)
+	fieldCount := 2
+
+	if t.Manifest == nil {
+		fieldCount--
+	}
+
+	if t.Leaf == nil {
+		fieldCount--
+	}
+
+	if _, err := cw.Write(cbg.CborEncodeMajorType(cbg.MajMap, uint64(fieldCount))); err != nil {
+		return err
+	}
+
+	// t.Leaf (bucket.ObjectLeaf) (struct)
+	if t.Leaf != nil {
+
+		if len("/objectleaf/0") > 1000000 {
+			return xerrors.Errorf("Value in field \"/objectleaf/0\" was too long")
+		}
+
+		if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("/objectleaf/0"))); err != nil {
+			return err
+		}
+		if _, err := cw.WriteString(string("/objectleaf/0")); err != nil {
+			return err
+		}
+
+		if err := t.Leaf.MarshalCBOR(cw); err != nil {
+			return err
+		}
+	}
+
+	// t.Manifest (bucket.ObjectManifest) (struct)
+	if t.Manifest != nil {
+
+		if len("/objectmanifest/0") > 1000000 {
+			return xerrors.Errorf("Value in field \"/objectmanifest/0\" was too long")
+		}
+
+		if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("/objectmanifest/0"))); err != nil {
+			return err
+		}
+		if _, err := cw.WriteString(string("/objectmanifest/0")); err != nil {
+			return err
+		}
+
+		if err := t.Manifest.MarshalCBOR(cw); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (t *ValueUnion) UnmarshalCBOR(r io.Reader) (err error) {
+	*t = ValueUnion{}
+
+	cr := cbg.NewCborReader(r)
+
+	maj, extra, err := cr.ReadHeader()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err == io.EOF {
+			err = io.ErrUnexpectedEOF
+		}
+	}()
+
+	if maj != cbg.MajMap {
+		return fmt.Errorf("cbor input should be of type map")
+	}
+
+	if extra > cbg.MaxLength {
+		return fmt.Errorf("ValueUnion: map struct too large (%d)", extra)
+	}
+
+	n := extra
+
+	nameBuf := make([]byte, 17)
+	for i := uint64(0); i < n; i++ {
+		nameLen, ok, err := cbg.ReadFullStringIntoBuf(cr, nameBuf, 1000000)
+		if err != nil {
+			return err
+		}
+
+		if !ok {
+			// Field doesn't exist on this type, so ignore it
+			if err := cbg.ScanForLinks(cr, func(cid.Cid) {}); err != nil {
+				return err
+			}
+			continue
+		}
+
+		switch string(nameBuf[:nameLen]) {
+		// t.Leaf (bucket.ObjectLeaf) (struct)
+		case "/objectleaf/0":
+
+			{
+
+				b, err := cr.ReadByte()
+				if err != nil {
+					return err
+				}
+				if b != cbg.CborNull[0] {
+					if err := cr.UnreadByte(); err != nil {
+						return err
+					}
+					t.Leaf = new(ObjectLeaf)
+					if err := t.Leaf.UnmarshalCBOR(cr); err != nil {
+						return xerrors.Errorf("unmarshaling t.Leaf pointer: %w", err)
+					}
+				}
+
+			}
+			// t.Manifest (bucket.ObjectManifest) (struct)
+		case "/objectmanifest/0":
+
+			{
+
+				b, err := cr.ReadByte()
+				if err != nil {
+					return err
+				}
+				if b != cbg.CborNull[0] {
+					if err := cr.UnreadByte(); err != nil {
+						return err
+					}
+					t.Manifest = new(ObjectManifest)
+					if err := t.Manifest.UnmarshalCBOR(cr); err != nil {
+						return xerrors.Errorf("unmarshaling t.Manifest pointer: %w", err)
+					}
+				}
+
 			}
 
 		default:

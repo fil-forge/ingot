@@ -15,9 +15,9 @@ import (
 // are split into focused interfaces so a caller can depend on only what
 // it needs; *Postgres and *inmem.MemStore satisfy all of them.
 //
-// Versioning is not implemented this iteration. NullVersionID is the
-// sentinel every blob_refs / manifest version id carries until versioning
-// lands (it is S3's "null" version id for an unversioned object).
+// NullVersionID is S3's version id for a null version — the version written
+// while a bucket is unversioned or Suspended (docs/s3-versioning.md §3). It
+// names those versions' blob_refs rows and answers `?versionId=null`.
 const NullVersionID = "null"
 
 // upload_intents.state values (the local-store lifecycle, §5).

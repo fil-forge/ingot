@@ -12,19 +12,23 @@ import (
 
 // currentObjectETag resolves the committed ETag of (bucket, key) for evaluating
 // put/copy preconditions before ingest. It distinguishes "no such key" (exists
-// = false, no error) from real errors.
+// = false, no error) from real errors; a delete-marker current counts as "no
+// object" for precondition purposes.
 func (b *Backend) currentObjectETag(ctx context.Context, bucket, key string) (etag string, exists bool, err error) {
-	mf, _, err := b.lookupManifest(ctx, bucket, key)
+	rv, err := b.resolveVersion(ctx, bucket, key, "")
 	if err != nil {
 		if isNoSuchKey(err) {
 			return "", false, nil
 		}
 		return "", false, err
 	}
-	return etagOf(mf), true, nil
+	if rv.mf.DeleteMarker {
+		return "", false, nil
+	}
+	return etagOf(rv.mf), true, nil
 }
 
-// isNoSuchKey reports whether err is the NoSuchKey API error lookupManifest
+// isNoSuchKey reports whether err is the NoSuchKey API error resolution
 // returns for a missing object.
 func isNoSuchKey(err error) bool {
 	return errors.Is(err, s3err.GetAPIError(s3err.ErrNoSuchKey))

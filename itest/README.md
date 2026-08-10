@@ -49,7 +49,7 @@ now live in the pass tables.
 
 The S3 surface is gated by curated lists of upstream
 [versitygw](https://github.com/versity/versitygw) integration cases in
-`versity_{bucket,object,multipart}_test.go`: per upstream group, a table of
+`versity_{bucket,object,multipart,versioning}_test.go`: per upstream group, a table of
 cases ingot must PASS and a table of known failures (**XFail**, reported as
 SKIP). One shared stack serves all categories.
 

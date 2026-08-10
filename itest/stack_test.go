@@ -167,6 +167,16 @@ func forgeS3Conf(endpoint, accessKey, secretKey string) *integration.S3Conf {
 	return ingottest.NewS3Conf(forgeConfig(endpoint, accessKey, secretKey))
 }
 
+// forgeS3ConfVersioned is forgeS3Conf with the upstream suite's versioned
+// mode on: teardown empties buckets via ListObjectVersions + per-version
+// deletes (a plain DeleteObject on a versioned bucket only stacks delete
+// markers). Used by the Versioning conformance categories.
+func forgeS3ConfVersioned(endpoint, accessKey, secretKey string) *integration.S3Conf {
+	cfg := forgeConfig(endpoint, accessKey, secretKey)
+	cfg.VersioningEnabled = true
+	return ingottest.NewS3Conf(cfg)
+}
+
 // waitHTTPOK polls url until it returns 2xx or the timeout elapses.
 func waitHTTPOK(t *testing.T, url string, timeout time.Duration) {
 	t.Helper()

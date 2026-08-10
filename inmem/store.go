@@ -50,6 +50,7 @@ type MemStore struct {
 	buckets  map[string]*registry.State
 	segments map[uint64]*logstore.SegmentMeta
 	nextSeq  uint64
+	verSeqs  map[string]uint64 // per-bucket next_version_seq counter
 
 	// The architecture's relational surface (docs/architecture.md §5–§7),
 	// mirroring the Postgres tables so the in-process suite exercises the
@@ -80,6 +81,7 @@ func NewMemStore() *MemStore {
 	return &MemStore{
 		buckets:    map[string]*registry.State{},
 		segments:   map[uint64]*logstore.SegmentMeta{},
+		verSeqs:    map[string]uint64{},
 		blobRefs:   map[claimKey]registry.BlobClaim{},
 		intents:    map[string]registry.UploadIntent{},
 		locations:  map[locKey]registry.BlobLocation{},
@@ -167,7 +169,12 @@ func (m *MemStore) Create(_ context.Context, name string, space did.DID) error {
 		return registry.ErrExists
 	}
 	// Stamped here for parity with the buckets.created_at column default.
-	m.buckets[name] = &registry.State{Name: name, Space: space, CreatedAt: time.Now().UTC()}
+	m.buckets[name] = &registry.State{
+		Name:       name,
+		Space:      space,
+		Versioning: registry.VersioningUnversioned,
+		CreatedAt:  time.Now().UTC(),
+	}
 	return nil
 }
 
@@ -189,6 +196,7 @@ func (m *MemStore) Delete(_ context.Context, name string) error {
 		return registry.ErrNotFound
 	}
 	delete(m.buckets, name)
+	delete(m.verSeqs, name)
 	return nil
 }
 
@@ -215,6 +223,30 @@ func (m *MemStore) SetForgeRoot(_ context.Context, name string, root cid.Cid) er
 	}
 	s.ForgeRoot = root
 	return nil
+}
+
+func (m *MemStore) SetVersioning(_ context.Context, name string, v registry.VersioningState) error {
+	if v != registry.VersioningEnabled && v != registry.VersioningSuspended {
+		return fmt.Errorf("registry: set versioning %q: invalid state %q", name, v)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.buckets[name]
+	if !ok {
+		return registry.ErrNotFound
+	}
+	s.Versioning = v
+	return nil
+}
+
+func (m *MemStore) AllocVersionSeq(_ context.Context, name string) (uint64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.buckets[name]; !ok {
+		return 0, registry.ErrNotFound
+	}
+	m.verSeqs[name]++
+	return m.verSeqs[name], nil
 }
 
 // Meta methods ===============================================================

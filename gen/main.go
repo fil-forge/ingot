@@ -17,6 +17,9 @@ func main() {
 		bucket.ObjectManifest{},
 		bucket.Body{},
 		bucket.BlobRef{},
+		bucket.ObjectLeaf{},
+		bucket.VersionNode{},
+		bucket.ValueUnion{},
 	); err != nil {
 		panic(err)
 	}
