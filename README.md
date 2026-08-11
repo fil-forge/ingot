@@ -1,7 +1,7 @@
 # ingot
 
 > **⚠️ Work in progress.** ingot is under active development and its design is
-> changing rapidly — interfaces, on-disk formats, and the Forge upload path are
+> changing rapidly: interfaces, on-disk formats, and the Forge upload path are
 > all still in flux. Expect breaking changes.
 
 **ingot is an S3 gateway over the [Forge](https://github.com/fil-forge) network,
@@ -9,15 +9,19 @@ built around a Merkle Search Tree (MST) ported from
 [bluesky-social/indigo](https://github.com/bluesky-social/indigo/tree/main/mst).**
 
 It speaks the S3 REST protocol on one side and the Forge UCAN control plane on
-the other, and runs **two ways**: as an embeddable Go **library** that a host
-process (piri, guppy, sprue) imports in-process, or as a standalone **daemon**
-(`ingot serve`). Either way it presents each S3 bucket as a per-bucket MST,
-journals mutations to a local LSM-style log, and ships sealed segments to Forge
-as a guppy-style edge client. Reads fall through local tiers and finally to the
-network.
+the other, and runs **two ways**: as an embeddable Go **library** a host
+process imports in-process, or as a standalone **daemon** (`ingot serve`).
+Either way it presents each S3 bucket as a per-bucket MST, uploads object
+bodies to Forge storage as content-addressed blobs before a write is acked,
+journals the catalog to a local per-bucket log, and ships sealed catalog
+segments to Forge as a guppy-style edge client. Reads fall through local
+tiers and finally to the network.
 
-For the full architecture, see [`DESIGN_NOTES.md`](./DESIGN_NOTES.md); for the
-log internals, [`logstore/README.md`](./logstore/README.md).
+For the architecture as it operates today, see
+[`DESIGN_NOTES.md`](./DESIGN_NOTES.md); for the target design,
+[`docs/architecture.md`](./docs/architecture.md); for the as-built diagram
+set, [`docs/diagrams.md`](./docs/diagrams.md); for the log internals,
+[`logstore/README.md`](./logstore/README.md).
 
 ### Why a forked MST, not a direct dependency
 
@@ -38,58 +42,60 @@ ingot ports it rather than depending on it, for three reasons:
 
 ## How buckets map onto the MST and Postgres
 
-Each bucket is one MST: an ordered map from **object key → object-manifest CID**.
-A manifest records the object's size, its sha256 and md5, the S3 system headers
-and user metadata, and a pointer to the chunked body. Because every node is
-addressed by its own hash, a bucket rolls up to a single **root CID** — a
-cryptographic commitment to the exact set of objects it holds — and the tree's
-ordered keys make S3 prefix/delimiter listings fall out of ordinary traversal.
+Each bucket is one MST: an ordered map from **object key → value block**. A
+key's value is its object manifest (size, sha256 and md5, the S3 system
+headers and user metadata, and the ordered list of content-addressed body
+blobs that cover it); a key with retained versions groups them under a
+per-key leaf ([`docs/s3-versioning.md`](./docs/s3-versioning.md)). Because
+every node is addressed by its own hash, a bucket rolls up to a single
+**root CID** — a cryptographic commitment to the exact set of objects it
+holds — and the tree's ordered keys make S3 prefix/delimiter listings fall
+out of ordinary traversal.
 
 Writes are functional: a PUT or DELETE rewrites only the nodes on the path from
 the changed key up to the root (every other node is immutable and shared),
-producing a **new root CID**. ingot journals the changed blocks to the local log,
-then **compare-and-swaps the bucket's root in Postgres** from the old CID to the
-new one. That split is the heart of the design:
+producing a **new root CID**. ingot journals the changed blocks to the local
+log, then **compare-and-swaps the bucket's root in Postgres** from the old CID
+to the new one. That split is the heart of the design:
 
 - **The MST is the data** — immutable, content-addressed, self-verifying, and
   shippable to Forge exactly as it sits on disk.
-- **Postgres is the mutable index** — the authoritative *current* root per bucket
-  (the CAS keeps a bucket single-writer-correct) plus each log segment's
-  hot → warm → cold lifecycle, all under the `ingot` schema.
+- **Postgres is the mutable index** — the authoritative *current* root per
+  bucket (the CAS keeps a bucket single-writer-correct), the segment
+  lifecycle, and the blob claim ledger, all under the `ingot` schema.
 
-## Data plane vs catalog plane
+## Bodies and catalog
 
-The log splits each write into **two independent pipelines**, configured
-separately:
+A write splits into two paths:
 
-- **data plane** — raw object-body chunks (the bytes a client GETs).
-- **catalog plane** — the dag-cbor MST nodes, manifests, and chunk indexes.
+- **Bodies** stream into a local spool (sha256 and md5 in one pass), split
+  into blobs of at most `max_blob_size`, and upload to Forge storage
+  synchronously: `/blob/add` via sprue, an HTTP PUT to the allocated piri,
+  and the accepted location commitment, all before the catalog commit.
+  Identical bytes dedup by digest; a reference index (`blob_refs`) counts
+  which versions still claim each blob and releases it (`/blob/remove`) when
+  the count reaches zero.
+- **The catalog** (the dag-cbor MST nodes and manifests) journals to a local
+  per-bucket log, seals into CAR segments by size or age, and ships to the
+  bucket's Forge space in the background; shipping advances the bucket's
+  `forge_root_cid` under a guard. See
+  [`logstore/README.md`](./logstore/README.md).
 
-Each plane seals, ships, and retains on its own — so (for example) the catalog
-can be kept local-only while the data plane ships to Forge. The catalog
-references data only by CID; byte location is resolved at read time through the
-indexing-service. Sealed CARs ship as a guppy-style edge client
-(`/blob/add` → PUT → `/ucan/conclude` → `/blob/accept` → `/index/add` against
-sprue). See [`logstore/README.md`](./logstore/README.md).
-
-### Storage tiers (LSM)
-
-- **Hot** — the open segment per plane on local disk; fsynced before a PUT is
-  acked (data before catalog).
-- **Warm** — sealed segments retained locally for fast reads (per-plane
-  size/age seal triggers and retention window).
-- **Cold** — segments shipped to Forge; reads fall through to the network on a
-  local miss.
+Reads fall through tiers: the spool, the local log (catalog blocks), and
+finally the network, resolved by a local locator (`blob_locations` +
+`shard_inclusions`) and fetched with a ranged `content/retrieve` against the
+storing piri. The two routes are drawn side by side in
+[`docs/diagrams.md`](./docs/diagrams.md#two-block-routes-body-blobs-and-catalog-blocks).
 
 ## Running it
 
-**As a library** (fx). A host adds the module and provides a logger, a Postgres
-pool, the agent identity, and the sprue endpoint (via `Config`):
+**As a library** (fx). A host adds the module and provides a logger, a
+Postgres pool, and the agent identity (via `Config`):
 
 ```go
 app := fx.New(
     // host provides: *zap.Logger, *pgxpool.Pool, ingot.ServiceIdentity
-    ingot.Module(cfg), // cfg sets UploadServiceURL/DID, IndexerEndpoint/DID, ...
+    ingot.Module(cfg), // cfg sets UploadServiceURL/DID, AuthServiceURL/DID, ...
 )
 ```
 
@@ -100,14 +106,17 @@ collaborators themselves.
 **As a daemon** (`cmd/`, cobra/viper/fx):
 
 ```bash
-ingot serve                       # standalone (in-memory, no Forge) or forge mode, per config
-ingot login <email>               # authorize the agent against sprue (email flow)
-ingot space generate --provision-to <email>   # mint/provision/grant the space
+ingot serve --config /etc/ingot/config.yaml   # the gateway
+ingot whoami                                  # agent DID + sprue/hilt endpoints
+ingot version
 ```
 
-`serve` runs in **standalone** mode (in-memory registry, no Forge/Postgres, both
-planes retained on disk — for local/dev S3) or **forge** mode (Postgres + the
-sprue edge client + a login token store). The deployment context is the
+`serve` requires Postgres (`postgres_dsn`), the sprue edge client
+(`upload_service_url`/`_did`), and the hilt auth/tenant service
+(`auth_service_url`/`_did`). Tenants, access keys, and buckets are owned by
+[hilt](https://github.com/fil-forge/hilt): it authorizes every non-root S3
+request, mints each bucket's Forge space, and issues the S3 credentials;
+ingot never self-provisions. The deployment context is the
 [Forge deployment RFC](https://github.com/fil-one/RFC/blob/main/2026-05-filone-forge-deployment-proposal.md):
 the S3 facade runs **at the edge**, co-located with a provider's piri or as a
 standalone client — not inside the central upload-service.
@@ -129,16 +138,17 @@ CI runs it after unit tests pass. See `itest/README.md`.
 ## Dependencies
 
 ingot depends only on the Forge stack — `ucantone` (UCAN 1.0 primitives),
-`libforge` (Forge capability definitions), the `indexing-service` query client,
-`versitygw` (the S3 front end) — plus standard plumbing (pgx, goose, fx, zap,
-go-cid). It must never import `fil-forge/sprue` or `fil-forge/guppy` (guppy
-embeds ingot → cycle); the Forge-client subset it needs is carried in
-`forgeclient/` + `tokenstore/`.
+`libforge` (Forge capability definitions), the `hilt` client (request
+authorization + tenancy), the `indexing-service` query client, `versitygw`
+(the S3 front end) — plus standard plumbing (pgx, goose, fx, zap, go-cid). It
+must never import `fil-forge/sprue` or `fil-forge/guppy` (guppy embeds ingot
+→ cycle); the Forge-client subset it needs is carried in `forgeclient/` +
+`tokenstore/`.
 
 ## Status
 
-The S3 → MST → LSM core is exercised by an in-memory smoke suite (~66 pass), and
-forge mode is verified end-to-end against a live sprue + piri + indexing-service
-by smelt's `TestIngotNativeProvision` e2e (PUT → ship → GET round trip on a
-self-provisioned space). Known gaps are tracked in
+The S3 core is exercised two ways: `make test` runs the unit tier in seconds,
+and `make itest` boots the real Forge stack (smelt, in Docker) and runs this
+working tree's binary against it, including a curated partition of the
+upstream versitygw S3 conformance suite. Known gaps are tracked in
 [`DESIGN_NOTES.md`](./DESIGN_NOTES.md).

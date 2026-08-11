@@ -1,143 +1,158 @@
-# ingot — how it works
+# ingot: how it works
 
-ingot is an **embeddable S3 gateway over the [Forge](https://github.com/fil-forge)
-network**. It presents each S3 bucket as a per-bucket Merkle Search Tree (MST),
-journals mutations to a local LSM-style log, and ships sealed segments to Forge
-as a guppy-style edge client. Reads fall through local tiers and finally to the
-network.
+ingot is an **S3 gateway over the [Forge](https://github.com/fil-forge)
+network**. It presents each S3 bucket as a per-bucket Merkle Search Tree
+(MST), stores object bodies on Forge storage nodes as content-addressed
+blobs, journals the catalog (MST nodes and manifests) to a local per-bucket
+log, and serves reads back through local tiers with the network as the last
+resort.
 
-This is the architecture **as it operates today**. Subsystem detail lives in
-package READMEs (notably [`logstore/README.md`](./logstore/README.md)); how to
-work in the repo lives in [`CLAUDE.md`](./CLAUDE.md).
+This is the architecture as it operates today. The target design and its
+rationale live in [`docs/architecture.md`](./docs/architecture.md); the
+as-built diagram set is [`docs/diagrams.md`](./docs/diagrams.md); subsystem
+detail lives in package READMEs (notably
+[`logstore/README.md`](./logstore/README.md)); how to work in the repo lives
+in [`CLAUDE.md`](./CLAUDE.md).
 
-## Two ways to run it
+## Running it
 
-- **Library.** A host (piri / guppy / sprue) imports the fx `Module(cfg)` (or
-  `ServerModule` + the non-fx `New(ctx, ServerConfig, ServerDeps)`) and supplies
-  a logger, a Postgres pool, the **agent** signer (`ServiceIdentity`), and the
-  upload-service (sprue) endpoint.
-- **Daemon.** `cmd/` builds an `ingot` binary (cobra/viper/fx). `ingot serve` has
-  two modes:
-  - **standalone** — in-memory registry/metadata (`inmem.MemStore`), no Forge, no
-    Postgres; both planes retained on local disk. Local/dev S3.
-  - **forge** — Postgres + the sprue edge client + a login-derived token store.
-  Plus `ingot login <email>`, `ingot space generate` (provision + grant), and
-  `whoami`. Docker-native; ships as a smelt system.
+- **Library.** A host imports the fx `Module(cfg)` (or `ServerModule` plus
+  the non-fx `New(ctx, ServerConfig, ServerDeps)`) and supplies a logger, a
+  Postgres pool, and the **agent** signer (`ServiceIdentity`); config names
+  the sprue endpoint (`upload_service_url`/`_did`) and the hilt endpoint
+  (`auth_service_url`/`_did`).
+- **Daemon.** `ingot serve` builds the same wiring from a config file
+  (cobra/viper/fx): Postgres, the sprue edge client, and hilt are all
+  required. The CLI is `serve`, `whoami`, and `version`. Docker-native;
+  ships as a smelt system.
+
+There is no standalone or in-memory mode: the deployment under test is
+always the real gateway. Tenancy is owned by **hilt**: an operator
+provisions tenants and access keys through hilt's tenant API, hilt mints
+each bucket's space and issues the S3 credentials, and ingot never
+self-provisions.
 
 ## Write path
 
-```
-S3 PUT (versitygw: sigv4, path-style)
- └─ s3frontend.Backend
-     └─ bucketop.Tx              per-bucket lock; snapshot the bucket Root
-         ├─ bucket.FixedChunker  chunk body → raw leaf blocks + a chunk index
-         ├─ ObjectManifest       size, sha256/md5, S3 headers + user metadata, body ref
-         ├─ mst Add/Update       new per-bucket root CID (only path nodes rewritten)
-         └─ OpStaging.Commit     classify staged blocks by codec, then:
-             └─ logstore.Store.AppendBatch(dataBlocks, catalogBlocks, opRoot)
-                 ├─ data PlaneLog.Append    → fsync segments/data/seg-N.car
-                 └─ catalog PlaneLog.Append → fsync segments/catalog/seg-N.car + .ops
-         └─ registry.CASRoot     advance the bucket Root in Postgres (old → new)
-```
+A PUT streams the body into the local **spool** (sha256 and md5 in one
+pass), splits it into blobs of at most `max_blob_size`, and uploads each
+blob to the network before anything commits: `/blob/add` against sprue, an
+HTTP PUT of the bytes to the allocated piri, a concluded receipt, and the
+`/blob/accept` location commitment. Only then does the short per-bucket
+critical section run: allocate the version seq, write the manifest, splice
+the MST, fsync one `AppendBatch` of the new catalog blocks, and
+compare-and-swap the bucket root in Postgres. The reference index
+(`blob_refs`) reconciles after the commit, releasing superseded blobs whose
+claim count reaches zero. The full trace is the
+[PutObject diagram](./docs/diagrams.md#putobject-spool-and-upload-off-the-lock-commit-under-it).
 
-A PUT is **acked** once both planes are fsynced locally and the root CAS lands in
-Postgres; it is **durable on Forge** only after the background ship. Blocks split
-into two planes by CID codec at `OpStaging.Put`: **`cid.Raw` → data** (object-body
-chunks), **dag-cbor → catalog** (MST nodes, manifests, chunk indexes).
+A `200` therefore means the body is durable and accepted on the network and
+the catalog mutation is fsynced locally; the catalog becomes durable on
+Forge through the background ship below.
 
-## The two planes
+## The catalog log
 
-The catalog and data planes are **independent pipelines** built from one module
-(`logstore.PlaneLog`) under a thin `logstore.Store` coordinator. Each plane seals
-on its own threshold, ships through its own transport, and retains on its own
-window — so the catalog can be configured never to ship (kept on local disk
-forever) while the data plane ships and retires. Full lifecycle in
-[`logstore/README.md`](./logstore/README.md). The load-bearing rules:
+The log journals only the catalog, and it is segregated per bucket:
+`logstore.Manager` holds one `Store` per bucket, so a sealed segment holds
+exactly one bucket's blocks and ships to that bucket's Forge space. The
+load-bearing rules ([`logstore/README.md`](./logstore/README.md) has the
+full lifecycle):
 
-- `Store.AppendBatch` fsyncs **data before catalog**, so a crash never leaves a
-  durable catalog entry referencing non-durable data.
-- **`forge_root_cid` advances only when the catalog plane ships** — catalog roots
-  are the MST roots that become durable on Forge. Op-roots (`(bucket, newRoot)`
-  per batch) live only on catalog segments.
-- **The catalog is location-free**: manifests / MST nodes reference data chunks by
-  CID only; the digest → (piri, blob, byte-range) mapping is resolved at read time
-  through the indexer, never embedded in the DAG. This is what lets the data
-  plane's storage mechanism evolve without touching the catalog or read path.
+- A successful `AppendBatch` (fsynced CAR plus `.ops` record) is what
+  licenses the caller's bucket-root CAS.
+- **`forge_root_cid` advances only when a segment ships, and only guarded**:
+  the update lands in the same transaction as the shipped stamp, and only
+  where `buckets.root_cid` still equals the op-root.
+- **The catalog is location-free**: manifests and MST nodes reference
+  content by CID only; byte location resolves at read time through the
+  locator, never embedded in the DAG.
 
-## Shipping (forge mode): the edge-client flow
+## Shipping: the edge-client flow
 
-`uploader.Forge.SubmitShard(plane, shard)` ships one sealed CAR as a guppy-style
-edge client — the data plane stays local, only the control plane crosses to
-sprue:
+`uploader.Forge` ships every blob the same way, whether an object-body blob
+at PUT time or a sealed catalog CAR from the background flush:
 
-1. `/blob/add` the CAR against **sprue** (which allocates against a piri).
-2. HTTP **PUT** the CAR bytes to the allocated piri.
-3. `/ucan/conclude` a synthesized `/http/put` receipt — piri has no conclude
-   handler, sprue does; this is the step that lets `/blob/accept` resolve.
-4. poll `/blob/accept` → the `/assert/location` commitment.
-5. build a 1-shard sharded-dag-index, `/blob/add` it, then `/index/add` it (sprue
-   republishes to the indexing-service).
+1. `/blob/add` against **sprue** (which allocates against a piri).
+2. HTTP **PUT** the bytes to the allocated piri (skipped on dedup).
+3. `/ucan/conclude` a synthesized `/http/put` receipt: piri has no conclude
+   handler, sprue does, and this is the step that triggers `/blob/accept`.
+4. Poll the `/blob/accept` receipt for the `/assert/location` commitment.
+5. For catalog CARs only: build a 1-shard sharded-dag-index, `/blob/add` it,
+   then `/index/add` it (best-effort; sprue republishes to the
+   indexing-service). The shard's location and every inner block's byte
+   range are recorded locally (`blob_locations` and `shard_inclusions`)
+   before the segment is marked shipped.
 
-Sprue witnesses every blob. **Byte-presence ≠ locator-presence**: the index is
-published on every ship, never skipped just because the bytes are already there.
+Multipart parts stop after step 2 (**parked**: durable, unaccepted) and run
+steps 3 and 4 at `CompleteMultipartUpload`; an abort unwinds a parked blob
+with `/blob/abort`.
 
 ## Read path
 
-```
-S3 GET → resolve bucket Root (registry) → walk MST → ObjectManifest
-       → stream body via blockstore.Layered:
-           data / catalog PlaneLog (local segments, newest-first)
-           → blockstore.Cached (byte-bounded LRU, Config.ReadCacheBytes)
-             → blockstore.Forge: indexer locate(digest) → ranged piri /content/retrieve
-```
+A GET resolves the bucket root (registry), walks the MST to the manifest
+(through the per-key version tree when the key is versioned), and serves
+each covering blob from the first tier that has it: the spool, the catalog
+log (catalog blocks only), then the network (`blockstore.Forge`). Network
+resolution uses the **local locator**: a whole-blob hit in `blob_locations`,
+or an inner-block hit in `shard_inclusions` joined to its shard's location;
+the retrieval is a ranged UCAN `content/retrieve` against the provider named
+by the location commitment. The indexing-service query path is implemented
+but unwired. The full trace is the
+[GetObject diagram](./docs/diagrams.md#getobject-version-resolution-local-tiers-network-retrieval).
 
-Local hits serve from the warm tier; a retired segment (shipped, beyond its
-Retain window) is unlinked locally, so its reads fall through to Forge.
+## Identity & auth
 
-## Identity & auth (single-space)
+- **agent**: `ServiceIdentity.Signer` (daemon: `identity.key_file` PEM), the
+  issuer of every outbound invocation to sprue, hilt, and piri.
+- **space**: per bucket, a `did:plc` minted by hilt at bucket create and
+  stored on the bucket row; the subject of every blob and retrieve
+  invocation.
+- **access key**: the S3 access key ID is a `did:key`. Every non-root
+  request is authorized through hilt (`/s3/request/authorize`, with a local
+  fast path over cached delegations); hilt re-delegates the key's grant to
+  the agent, and the per-key `DelegationCache` carries those proofs into the
+  request via `internal/reqscope`, where the uploader and the network read
+  tier spend them. The uploader also captures a per-space ship authority
+  (1h TTL) for the async catalog flush.
+- The **root account** (versitygw root credentials) bypasses hilt: bucket
+  administration works, but with no proof store it can neither write to
+  spaces nor read through the network tier.
 
-- **agent** = `ServiceIdentity.Signer` (host-injected; daemon: `identity.key_file`
-  PEM). The issuer of every invocation to sprue.
-- **space** = `<DataDir>/space.key` (ed25519, minted on first run). The subject of
-  `/blob/add`, `/index/add`, `/content/retrieve`.
-- The agent's authority over the space is delegations held in a **token store**
-  (`tokens.cbor`): the daemon self-seeds `space → agent` (blob/add, allocate,
-  accept, index/add, content/retrieve) at boot; `ingot login <email>` adds the
-  `account → agent` delegations; `ingot space generate --provision-to <email>`
-  provisions the space to the account on sprue (`/provider/add`) and grants access
-  (`space → agent` + `space → account`, `/access/delegate`).
-- One instance = one space = one tenant.
+The [principals diagram](./docs/diagrams.md#principals-and-proof-stores)
+draws the chains and the stores.
 
 ## State & durability
 
-- **Postgres (`ingot` schema)** is the mutable index: per-bucket `root_cid` +
-  `forge_root_cid`, and per-`(plane, seq)` segment metadata. goose tracks its
-  version at `ingot.goose_db_version` (never collides with a host's own
-  migrations). Standalone mode swaps Postgres for `inmem.MemStore`.
-- **The MST is the data**: immutable, content-addressed, self-verifying, shipped
-  to Forge as-is.
-- A bucket is single-writer-correct via the per-bucket in-process lock + the
-  Postgres root CAS.
+- **Postgres (`ingot` schema)** is the mutable index: per-bucket roots and
+  versioning state, segment metadata and op-roots, the blob claim ledger
+  (`blob_refs`), locations and inclusions, upload intents, multipart
+  sessions/parts/parks, and GC candidates. goose tracks its version at
+  `ingot.goose_db_version` (never collides with a host's own migrations).
+- **The MST is the data**: immutable, content-addressed, self-verifying,
+  shipped to Forge as-is.
+- A bucket is single-writer-correct via the per-bucket in-process lock plus
+  the Postgres root CAS.
 
 ## Known gaps
 
-- **S3 conformance**: no multipart upload; no conditional requests
-  (`If-Match`/`If-None-Match`); no `Range` on HEAD.
-- **Single-space / single-tenant**: the `space.key`-on-disk model has no
-  tenant → space mapping, and the space DID threads through reader/uploader/MST.
-- **No HA / no GC**: a bucket is single-writer (in-process lock) → no HA without
-  leader election; local CARs are a durability SPOF until shipped; a never-ship
-  catalog (and anything reachable from `root_cid` but not `forge_root_cid`) grows
-  with no sweeper.
-- **Orphan `forge_root_cid`**: `registry.MarkSegmentShipped` advances
-  `forge_root_cid` unconditionally, so a writer whose `AppendBatch` succeeds but
-  whose root CAS fails can later advance `forge_root_cid` to a root the bucket
-  never published. Needs a conditional update.
-- **Carried Forge-client copies** — `forgeclient/`, `tokenstore/`,
-  `blockstore/locator/`, `internal/ucanexec/` duplicate guppy/sprue code to stay
-  cycle-free (ingot must never import guppy/sprue — guppy embeds ingot). A shared
-  `forge-client` library would remove them.
-- **Co-located data path (future)**: when ingot runs in the same rack as piri, the
-  *data* plane may write straight into piri's shared store (eliding the network
-  PUT) while still witnessing through sprue. The location-free catalog makes that
-  a data-plane-only change.
+- **No HA.** A bucket is single-writer through an in-process lock; nothing
+  coordinates across instances beyond the root CAS.
+- **The spool is unbounded** (#48): nothing evicts local body blobs, and
+  DeleteObject releases network-side only, so local disk grows with every
+  body byte written.
+- **Spool crash recovery is not built**: reconciling `upload_intents`
+  against `blob_refs` after a crash between commit and reconcile is a later
+  phase; the window leaks rather than loses referenced data.
+- **No catalog GC**: `gc_candidates` is write-only; superseded MST nodes
+  accumulate on Forge with mutation volume.
+- **Reads carry no bucket context**: `Manager.Get` linear-scans every open
+  bucket store; threading the bucket into the read path removes the scan.
+- **The ship authority expires**: the async flush signs with a per-space
+  proof store captured at the last in-request write (1h TTL); a bucket idle
+  longer than that cannot ship a newly sealed segment until its next write.
+- **The indexer read path is unwired**: `LocalLocator` serves all reads; the
+  network index is still published (best-effort) but never consulted.
+- **Carried Forge-client copies**: `forgeclient/`, `tokenstore/`,
+  `blockstore/locator/`, and `internal/ucanexec/` duplicate guppy/sprue code
+  to stay cycle-free (ingot must never import guppy or sprue). A shared
+  forge-client library would remove them.

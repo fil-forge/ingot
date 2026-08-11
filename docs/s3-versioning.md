@@ -3,7 +3,8 @@
 Implementation spec for S3 bucket versioning: version identity, the storage layout, writes,
 reads, deletes, lists, and reference counting. It builds on
 [`architecture.md`](./architecture.md), which specifies the write path, the reference index,
-and the catalog plane this doc uses.
+and the catalog plane this doc uses. The storage shape (§2) is drawn in
+[`diagrams.md`](./diagrams.md#per-key-version-storage-manifest-arm-leaf-arm-prev-tree).
 
 ---
 

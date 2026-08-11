@@ -17,16 +17,16 @@ import (
 // violation (matches the literal used elsewhere in sprue's stores).
 const uniqueViolation = "23505"
 
-// Postgres is a *pgxpool.Pool-backed Registry. Schema is owned by
-// pkg/ingot/migrations and lives in the `ingot` Postgres schema. The
-// pool is borrowed, never closed by this type.
+// Postgres is a *pgxpool.Pool-backed Registry (and, via its sibling
+// files, the segment Meta and the relational stores). Schema is owned
+// by the migrations package and lives in the `ingot` Postgres schema.
+// The pool is borrowed, never closed by this type.
 //
-// Bucket operations (Create, Delete, List) are forwarded to the Hilt
-// tenant service — the authority on which buckets exist and who may act
-// on them — with the local table holding only per-bucket root state.
-// Each of those methods recovers the original signed S3 request from
-// ctx (see hiltclient.RequestFromContext), so they must be called on a
-// request-serving path.
+// Bucket authority (which buckets exist, who may act on them) lives
+// with the Hilt tenant service: s3frontend consults it through the
+// bucketauthority package before touching these rows, which hold only
+// per-bucket root/versioning state. Create and Delete here are plain
+// SQL and read nothing from ctx.
 type Postgres struct {
 	pool *pgxpool.Pool
 }
