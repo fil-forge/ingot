@@ -275,13 +275,13 @@ func (r *Postgres) CreateSession(ctx context.Context, s MultipartSession) error 
 		   (upload_id, bucket, object_key, state, content_type, metadata,
 		    content_encoding, content_disposition, content_language, cache_control, expires,
 		    website_redirect_location, checksum_algorithm, checksum_type,
-		    lock_mode, lock_retain_until, lock_legal_hold)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)`,
+		    lock_mode, lock_retain_until, lock_legal_hold, tagging)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)`,
 		s.UploadID, s.Bucket, s.ObjectKey, state, nullString(s.ContentType), meta,
 		nullString(s.ContentEncoding), nullString(s.ContentDisposition),
 		nullString(s.ContentLanguage), nullString(s.CacheControl), nullString(s.Expires),
 		nullString(s.WebsiteRedirectLocation), nullString(s.ChecksumAlgorithm), nullString(s.ChecksumType),
-		nullString(s.LockMode), s.LockRetainUntil, nullString(s.LockLegalHold))
+		nullString(s.LockMode), s.LockRetainUntil, nullString(s.LockLegalHold), nullString(s.Tagging))
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == uniqueViolation {
@@ -297,7 +297,7 @@ func (r *Postgres) GetSession(ctx context.Context, uploadID string) (*MultipartS
 		`SELECT upload_id, bucket, object_key, state, content_type, metadata, created_at,
 		        content_encoding, content_disposition, content_language, cache_control, expires,
 		        website_redirect_location, checksum_algorithm, checksum_type,
-		        lock_mode, lock_retain_until, lock_legal_hold
+		        lock_mode, lock_retain_until, lock_legal_hold, tagging
 		 FROM ingot.multipart_sessions WHERE upload_id = $1`,
 		uploadID)
 	s, err := scanSession(row)
@@ -314,11 +314,11 @@ func (r *Postgres) GetSession(ctx context.Context, uploadID string) (*MultipartS
 // (see GetSession/ListSessions selects).
 func scanSession(row pgx.Row) (*MultipartSession, error) {
 	s := &MultipartSession{}
-	var contentType, ce, cd, cl, cc, exp, wrl, ckAlgo, ckType, lockMode, lockHold *string
+	var contentType, ce, cd, cl, cc, exp, wrl, ckAlgo, ckType, lockMode, lockHold, tagging *string
 	var meta []byte
 	err := row.Scan(&s.UploadID, &s.Bucket, &s.ObjectKey, &s.State, &contentType, &meta, &s.CreatedAt,
 		&ce, &cd, &cl, &cc, &exp, &wrl, &ckAlgo, &ckType,
-		&lockMode, &s.LockRetainUntil, &lockHold)
+		&lockMode, &s.LockRetainUntil, &lockHold, &tagging)
 	if err != nil {
 		return nil, err
 	}
@@ -338,6 +338,7 @@ func scanSession(row pgx.Row) (*MultipartSession, error) {
 	setIfNotNil(&s.ChecksumType, ckType)
 	setIfNotNil(&s.LockMode, lockMode)
 	setIfNotNil(&s.LockLegalHold, lockHold)
+	setIfNotNil(&s.Tagging, tagging)
 	if s.Metadata, err = unmarshalMetadata(meta); err != nil {
 		return nil, err
 	}
@@ -409,7 +410,7 @@ func (r *Postgres) ListSessions(ctx context.Context, bucket string) ([]Multipart
 		`SELECT upload_id, bucket, object_key, state, content_type, metadata, created_at,
 		        content_encoding, content_disposition, content_language, cache_control, expires,
 		        website_redirect_location, checksum_algorithm, checksum_type,
-		        lock_mode, lock_retain_until, lock_legal_hold
+		        lock_mode, lock_retain_until, lock_legal_hold, tagging
 		 FROM ingot.multipart_sessions WHERE bucket = $1
 		 ORDER BY object_key ASC, created_at ASC, upload_id ASC`,
 		bucket)
@@ -437,7 +438,7 @@ func (r *Postgres) ListStaleSessions(ctx context.Context, state string, cutoff t
 		`SELECT upload_id, bucket, object_key, state, content_type, metadata, created_at,
 		        content_encoding, content_disposition, content_language, cache_control, expires,
 		        website_redirect_location, checksum_algorithm, checksum_type,
-		        lock_mode, lock_retain_until, lock_legal_hold
+		        lock_mode, lock_retain_until, lock_legal_hold, tagging
 		 FROM ingot.multipart_sessions WHERE state = $1 AND created_at < $2
 		 ORDER BY created_at ASC`,
 		state, cutoff)

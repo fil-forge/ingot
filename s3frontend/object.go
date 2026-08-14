@@ -62,11 +62,18 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 
 	// x-amz-object-lock-* headers: validated against the bucket's lock
 	// configuration before ingest (fail fast), stamped into the commit below
-	// (docs/s3-object-lock.md §7).
-	lockState, err := lockStateFromHeaders(bucketState, input.ObjectLockMode, input.ObjectLockRetainUntilDate, input.ObjectLockLegalHoldStatus)
+	// (docs/s3-object-lock.md §7). The x-amz-tagging header joins the same
+	// initial state (docs/s3-object-tagging.md §4); an invalid header fails
+	// before ingest and uploads nothing.
+	initState, err := lockStateFromHeaders(bucketState, input.ObjectLockMode, input.ObjectLockRetainUntilDate, input.ObjectLockLegalHoldStatus)
 	if err != nil {
 		return s3response.PutObjectOutput{}, err
 	}
+	tags, err := backend.ParseObjectTags(backend.GetStringFromPtr(input.Tagging))
+	if err != nil {
+		return s3response.PutObjectOutput{}, err
+	}
+	initState = applyTagsIfPresent(initState, tags)
 
 	// PRECONDITIONS (no lock): If-Match / If-None-Match. Evaluated here to fail
 	// fast before ingest, then RE-CHECKED under the per-bucket lock at commit so
@@ -140,7 +147,7 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 		WebsiteRedirectLocation: backend.GetStringFromPtr(input.WebsiteRedirectLocation),
 		Metadata:                input.Metadata,
 	}
-	node, effState, err := b.commitVersion(ctx, bucketState, key, mf, lockState, func(superseded *msbucket.ObjectManifest) error {
+	node, effState, err := b.commitVersion(ctx, bucketState, key, mf, initState, func(superseded *msbucket.ObjectManifest) error {
 		// Race-safe re-check of If-Match / If-None-Match under the lock. A
 		// delete-marker current means "no object" for precondition purposes.
 		oldETag, oldExists := "", false
@@ -455,8 +462,9 @@ func (b *Backend) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s
 		contentRange = &cr
 	}
 
-	// x-amz-object-lock-* headers of the resolved version (docs/s3-object-lock.md §8).
-	lockMode, lockUntil, lockHold, err := b.lockHeaderFields(ctx, rv)
+	// x-amz-object-lock-* headers and the tag count of the resolved version
+	// (docs/s3-object-lock.md §8; docs/s3-object-tagging.md §5).
+	lockMode, lockUntil, lockHold, tagCount, err := b.stateHeaderFields(ctx, rv)
 	if err != nil {
 		return nil, err
 	}
@@ -480,6 +488,7 @@ func (b *Backend) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s
 		ObjectLockMode:            lockMode,
 		ObjectLockRetainUntilDate: lockUntil,
 		ObjectLockLegalHoldStatus: lockHold,
+		TagCount:                  tagCount,
 		StorageClass:              types.StorageClassStandard,
 	}
 	if rv.versioned() {
@@ -548,8 +557,9 @@ func (b *Backend) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.
 		contentRange = &cr
 	}
 
-	// x-amz-object-lock-* headers of the resolved version (docs/s3-object-lock.md §8).
-	lockMode, lockUntil, lockHold, err := b.lockHeaderFields(ctx, rv)
+	// x-amz-object-lock-* headers and the tag count of the resolved version
+	// (docs/s3-object-lock.md §8; docs/s3-object-tagging.md §5).
+	lockMode, lockUntil, lockHold, tagCount, err := b.stateHeaderFields(ctx, rv)
 	if err != nil {
 		return nil, err
 	}
@@ -576,6 +586,7 @@ func (b *Backend) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.
 		ObjectLockMode:            lockMode,
 		ObjectLockRetainUntilDate: lockUntil,
 		ObjectLockLegalHoldStatus: lockHold,
+		TagCount:                  tagCount,
 		StorageClass:              types.StorageClassStandard,
 	}
 	if rv.versioned() {

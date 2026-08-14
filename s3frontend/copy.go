@@ -57,9 +57,20 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 
 	// x-amz-object-lock-* headers stamp the DESTINATION version; lock state
 	// is never inherited from the source (docs/s3-object-lock.md §7).
-	lockState, err := lockStateFromHeaders(bucketState, input.ObjectLockMode, input.ObjectLockRetainUntilDate, input.ObjectLockLegalHoldStatus)
+	initState, err := lockStateFromHeaders(bucketState, input.ObjectLockMode, input.ObjectLockRetainUntilDate, input.ObjectLockLegalHoldStatus)
 	if err != nil {
 		return s3response.CopyObjectOutput{}, err
+	}
+	// Destination tags per x-amz-tagging-directive (the controller defaults
+	// an absent header to COPY, so only COPY or REPLACE arrives): REPLACE
+	// parses the request's own header, failing before any further work; COPY
+	// inherits the source version's tags once it resolves below
+	// (docs/s3-object-tagging.md §4).
+	var dstTags map[string]string
+	if input.TaggingDirective == types.TaggingDirectiveReplace {
+		if dstTags, err = backend.ParseObjectTags(backend.GetStringFromPtr(input.Tagging)); err != nil {
+			return s3response.CopyObjectOutput{}, err
+		}
 	}
 
 	// Resolve the source version (NoSuchBucket / NoSuchKey / NoSuchVersion /
@@ -90,6 +101,15 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 		IfUnmodeSince: input.CopySourceIfUnmodifiedSince,
 	}); err != nil {
 		return s3response.CopyObjectOutput{}, err
+	}
+	if input.TaggingDirective == types.TaggingDirectiveCopy {
+		srcVs, err := b.versionStateOf(ctx, srcRv)
+		if err != nil {
+			return s3response.CopyObjectOutput{}, err
+		}
+		if srcVs != nil {
+			dstTags = srcVs.Tags
+		}
 	}
 
 	// Destination checksum: same bytes → the source's checksum (and type)
@@ -158,7 +178,7 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 	// Commit to the destination via the write rule: splice + reference index.
 	// The new claims use the DESTINATION bucket/space; the same digests gain
 	// another reference.
-	node, effState, err := b.commitVersion(ctx, bucketState, dstKey, dstMf, lockState, nil)
+	node, effState, err := b.commitVersion(ctx, bucketState, dstKey, dstMf, applyTagsIfPresent(initState, dstTags), nil)
 	if err != nil {
 		return s3response.CopyObjectOutput{}, err
 	}

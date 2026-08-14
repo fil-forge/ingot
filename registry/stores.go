@@ -120,8 +120,12 @@ type MultipartSession struct {
 	LockMode        string
 	LockRetainUntil *time.Time
 	LockLegalHold   string
-	Metadata        map[string]string
-	CreatedAt       time.Time
+	// Tagging carries CreateMultipartUpload's raw x-amz-tagging header
+	// (validated at create) to Complete, which stamps the parsed set
+	// (docs/s3-object-tagging.md §4). Empty when the header was absent.
+	Tagging   string
+	Metadata  map[string]string
+	CreatedAt time.Time
 }
 
 // MultipartPart is one row of ingot.multipart_parts. BlobDigests is the

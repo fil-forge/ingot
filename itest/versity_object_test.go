@@ -46,6 +46,7 @@ var putObjectPass = []forgeCase{
 	{name: "default_checksum", fn: integration.PutObject_default_checksum},
 	{name: "default_content_type", fn: integration.PutObject_default_content_type},
 	{name: "success", fn: integration.PutObject_success},
+	{name: "tagging", fn: integration.PutObject_tagging},
 	{name: "with_metadata", fn: integration.PutObject_with_metadata},
 }
 
@@ -56,7 +57,6 @@ var putObjectXFail = []forgeCase{
 	// flow.
 	{name: "should_combine_metadata", fn: integration.PutObject_should_combine_metadata},
 	{name: "object_acl_not_supported", fn: integration.PutObject_object_acl_not_supported},
-	{name: "tagging", fn: integration.PutObject_tagging},
 	// with_object_lock passes but needs the versioned teardown: it runs as
 	// LockCreation/PutObject_with_object_lock (versity_lock_test.go).
 }
@@ -78,6 +78,7 @@ var getObjectPass = []forgeCase{
 	{name: "mp_part_number_resp_status", fn: integration.GetObject_mp_part_number_resp_status},
 	{name: "mp_part_number_success", fn: integration.GetObject_mp_part_number_success},
 	{name: "non_mp_part_number_1_success", fn: integration.GetObject_non_mp_part_number_1_success},
+	{name: "success", fn: integration.GetObject_success},
 	{name: "large_object", fn: integration.GetObject_large_object},
 	{name: "non_existing_dir_object", fn: integration.GetObject_non_existing_dir_object},
 	{name: "not_enabled_checksum_mode", fn: integration.GetObject_not_enabled_checksum_mode},
@@ -94,8 +95,6 @@ var getObjectXFail = []forgeCase{
 	{name: "directory_success", fn: integration.GetObject_directory_success},
 	// Requires PutBucketPolicy, which ingot 501s (NotImplemented).
 	{name: "overrides_fail_public", fn: integration.GetObject_overrides_fail_public},
-	// Asserts object tagging (TagCount), which is unimplemented.
-	{name: "success", fn: integration.GetObject_success},
 }
 
 var headObjectPass = []forgeCase{
@@ -115,6 +114,7 @@ var headObjectPass = []forgeCase{
 	{name: "mp_part_number_resp_status", fn: integration.HeadObject_mp_part_number_resp_status},
 	{name: "mp_part_number_success", fn: integration.HeadObject_mp_part_number_success},
 	{name: "non_mp_part_number_1_success", fn: integration.HeadObject_non_mp_part_number_1_success},
+	{name: "success", fn: integration.HeadObject_success},
 	{name: "non_existing_dir_object", fn: integration.HeadObject_non_existing_dir_object},
 	{name: "not_enabled_checksum_mode", fn: integration.HeadObject_not_enabled_checksum_mode},
 	{name: "range_and_part_number", fn: integration.HeadObject_range_and_part_number},
@@ -126,8 +126,6 @@ var headObjectPass = []forgeCase{
 var headObjectXFail = []forgeCase{
 	// Requires PutBucketPolicy, which ingot 501s (NotImplemented).
 	{name: "overrides_fail_public", fn: integration.HeadObject_overrides_fail_public},
-	// Asserts object tagging (TagCount), which is unimplemented.
-	{name: "success", fn: integration.HeadObject_success},
 }
 
 var deleteObjectPass = []forgeCase{
@@ -173,6 +171,8 @@ var copyObjectPass = []forgeCase{
 	{name: "should_copy_meta_props", fn: integration.CopyObject_should_copy_meta_props},
 	{name: "should_replace_meta_props", fn: integration.CopyObject_should_replace_meta_props},
 	{name: "missing_bucket_lock", fn: integration.CopyObject_missing_bucket_lock},
+	{name: "should_copy_tagging", fn: integration.CopyObject_should_copy_tagging},
+	{name: "should_replace_tagging", fn: integration.CopyObject_should_replace_tagging},
 	// invalid_legal_hold / invalid_object_lock_mode put a source object into
 	// a withLock() bucket and need the versioned teardown: they run under
 	// LockCreation (versity_lock_test.go).
@@ -183,12 +183,10 @@ var copyObjectPass = []forgeCase{
 	{name: "to_itself_by_replacing_the_checksum", fn: integration.CopyObject_to_itself_by_replacing_the_checksum},
 }
 
-// Observed failing against the forge stack: multi-account semantics, tagging,
-// and ACLs are unimplemented surface.
+// Observed failing against the forge stack: multi-account semantics and
+// ACLs are unimplemented surface.
 var copyObjectXFail = []forgeCase{
 	{name: "not_owned_source_bucket", fn: integration.CopyObject_not_owned_source_bucket},
-	{name: "should_replace_tagging", fn: integration.CopyObject_should_replace_tagging},
-	{name: "should_copy_tagging", fn: integration.CopyObject_should_copy_tagging},
 	{name: "object_acl_not_supported", fn: integration.CopyObject_object_acl_not_supported},
 	{name: "incorrect_source_bucket_expected_owner", fn: integration.CopyObject_incorrect_source_bucket_expected_owner},
 	// with_legal_hold / with_retention_lock pass but need the versioned
