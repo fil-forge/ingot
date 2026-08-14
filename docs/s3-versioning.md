@@ -596,10 +596,11 @@ Buckets written before versioning store manifests as bare blocks with no union k
 (CLAUDE.md: "reshape migrations in place and reset any persistent dev DB"), there is **no
 migration**: existing dev buckets are reset rather than taught to read the pre-union form.
 
-Out of scope: object tagging, `UploadPartCopy`, `ListParts`/`ListMultipartUploads`,
-`GetObjectAttributes`, MFA delete, lifecycle expiration, and multi-instance seq arbitration
-beyond the existing `CASRoot` conflict surface. Object lock / retention / legal hold are
-specified in [`s3-object-lock.md`](./s3-object-lock.md).
+Out of scope: `UploadPartCopy`, `ListParts`/`ListMultipartUploads`, `GetObjectAttributes`,
+MFA delete, lifecycle expiration, and multi-instance seq arbitration beyond the existing
+`CASRoot` conflict surface. Object lock / retention / legal hold are specified in
+[`s3-object-lock.md`](./s3-object-lock.md); object tagging in
+[`s3-object-tagging.md`](./s3-object-tagging.md).
 
 ---
 
