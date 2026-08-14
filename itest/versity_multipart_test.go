@@ -8,9 +8,8 @@ import (
 
 // Multipart groups of the S3 conformance partition, partitioned empirically
 // against the forge-mode stack (see the curation note in README.md). The
-// remaining xfail surface: tagging/object-lock/ACL on create
-// (FIL-534/FIL-525), the UploadPartCopy group (FIL-586), and one
-// load-sensitive concurrency case.
+// remaining xfail surface: tagging/ACL on create (FIL-534/FIL-525), the
+// UploadPartCopy group (FIL-586), and one load-sensitive concurrency case.
 
 var createMultipartPass = []forgeCase{
 	{name: "non_existing_bucket", fn: integration.CreateMultipartUpload_non_existing_bucket},
@@ -18,6 +17,7 @@ var createMultipartPass = []forgeCase{
 	{name: "long_metadata", fn: integration.CreateMultipartUpload_long_metadata},
 	{name: "with_metadata", fn: integration.CreateMultipartUpload_with_metadata},
 	{name: "with_object_lock_invalid_retention", fn: integration.CreateMultipartUpload_with_object_lock_invalid_retention},
+	{name: "with_object_lock_not_enabled", fn: integration.CreateMultipartUpload_with_object_lock_not_enabled},
 	{name: "past_retain_until_date", fn: integration.CreateMultipartUpload_past_retain_until_date},
 	{name: "invalid_legal_hold", fn: integration.CreateMultipartUpload_invalid_legal_hold},
 	{name: "invalid_object_lock_mode", fn: integration.CreateMultipartUpload_invalid_object_lock_mode},
@@ -32,9 +32,9 @@ var createMultipartPass = []forgeCase{
 
 var createMultipartXFail = []forgeCase{
 	{name: "with_tagging", fn: integration.CreateMultipartUpload_with_tagging},
-	{name: "with_object_lock", fn: integration.CreateMultipartUpload_with_object_lock},
-	{name: "with_object_lock_not_enabled", fn: integration.CreateMultipartUpload_with_object_lock_not_enabled},
 	{name: "object_acl_not_supported", fn: integration.CreateMultipartUpload_object_acl_not_supported},
+	// with_object_lock passes but needs the versioned teardown: it runs as
+	// LockCreation/CreateMultipartUpload_with_object_lock (versity_lock_test.go).
 }
 
 var uploadPartPass = []forgeCase{

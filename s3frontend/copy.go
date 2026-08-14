@@ -55,6 +55,13 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 		return s3response.CopyObjectOutput{}, fmt.Errorf("s3frontend: copy: %w", err)
 	}
 
+	// x-amz-object-lock-* headers stamp the DESTINATION version; lock state
+	// is never inherited from the source (docs/s3-object-lock.md §7).
+	lockState, err := lockStateFromHeaders(bucketState, input.ObjectLockMode, input.ObjectLockRetainUntilDate, input.ObjectLockLegalHoldStatus)
+	if err != nil {
+		return s3response.CopyObjectOutput{}, err
+	}
+
 	// Resolve the source version (NoSuchBucket / NoSuchKey / NoSuchVersion /
 	// InvalidArgument map from resolution). A delete marker cannot be a copy
 	// source: the current-marker case is a missing key; naming a marker's
@@ -151,7 +158,7 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 	// Commit to the destination via the write rule: splice + reference index.
 	// The new claims use the DESTINATION bucket/space; the same digests gain
 	// another reference.
-	node, effState, err := b.commitVersion(ctx, bucketState, dstKey, dstMf, nil)
+	node, effState, err := b.commitVersion(ctx, bucketState, dstKey, dstMf, lockState, nil)
 	if err != nil {
 		return s3response.CopyObjectOutput{}, err
 	}

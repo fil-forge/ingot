@@ -112,8 +112,16 @@ type MultipartSession struct {
 	// at Complete, and are echoed by ListParts and ListMultipartUploads.
 	ChecksumAlgorithm string
 	ChecksumType      string
-	Metadata          map[string]string
-	CreatedAt         time.Time
+	// LockMode / LockRetainUntil / LockLegalHold carry CreateMultipartUpload's
+	// x-amz-object-lock-* headers to Complete, which stamps them onto the
+	// version it commits (docs/s3-object-lock.md §7). LockMode is the
+	// retention mode ("GOVERNANCE"/"COMPLIANCE"); LockLegalHold is the
+	// legal-hold status ("ON"/"OFF"); empty / nil when the header was absent.
+	LockMode        string
+	LockRetainUntil *time.Time
+	LockLegalHold   string
+	Metadata        map[string]string
+	CreatedAt       time.Time
 }
 
 // MultipartPart is one row of ingot.multipart_parts. BlobDigests is the

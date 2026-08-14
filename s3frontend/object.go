@@ -28,11 +28,10 @@ import (
 
 const defaultMaxKeys = 1000
 
-// PutObject writes an object. Tagging, ACLs, checksums, retention,
-// and preconditions are dropped on the floor for now — the manifest
-// schema has no place for them yet (see bucket-metadata.rfc
-// §"Canonical state vs service state"). ETag is the hex md5 of the
-// body, quoted per S3 wire format.
+// PutObject writes an object. Tagging and ACLs are dropped on the floor for
+// now (see bucket-metadata.rfc §"Canonical state vs service state"); lock
+// headers stamp the new version's state (docs/s3-object-lock.md §7). ETag is
+// the hex md5 of the body, quoted per S3 wire format.
 func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput) (s3response.PutObjectOutput, error) {
 	if input.Bucket == nil {
 		return s3response.PutObjectOutput{}, s3err.GetAPIError(s3err.ErrInvalidBucketName)
@@ -59,6 +58,14 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 			return s3response.PutObjectOutput{}, s3err.GetAPIError(s3err.ErrNoSuchBucket)
 		}
 		return s3response.PutObjectOutput{}, fmt.Errorf("s3frontend: put: %w", err)
+	}
+
+	// x-amz-object-lock-* headers: validated against the bucket's lock
+	// configuration before ingest (fail fast), stamped into the commit below
+	// (docs/s3-object-lock.md §7).
+	lockState, err := lockStateFromHeaders(bucketState, input.ObjectLockMode, input.ObjectLockRetainUntilDate, input.ObjectLockLegalHoldStatus)
+	if err != nil {
+		return s3response.PutObjectOutput{}, err
 	}
 
 	// PRECONDITIONS (no lock): If-Match / If-None-Match. Evaluated here to fail
@@ -133,7 +140,7 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 		WebsiteRedirectLocation: backend.GetStringFromPtr(input.WebsiteRedirectLocation),
 		Metadata:                input.Metadata,
 	}
-	node, effState, err := b.commitVersion(ctx, bucketState, key, mf, func(superseded *msbucket.ObjectManifest) error {
+	node, effState, err := b.commitVersion(ctx, bucketState, key, mf, lockState, func(superseded *msbucket.ObjectManifest) error {
 		// Race-safe re-check of If-Match / If-None-Match under the lock. A
 		// delete-marker current means "no object" for precondition purposes.
 		oldETag, oldExists := "", false
@@ -448,23 +455,32 @@ func (b *Backend) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s
 		contentRange = &cr
 	}
 
+	// x-amz-object-lock-* headers of the resolved version (docs/s3-object-lock.md §8).
+	lockMode, lockUntil, lockHold, err := b.lockHeaderFields(ctx, rv)
+	if err != nil {
+		return nil, err
+	}
+
 	contentType := mf.ContentType
 	out := &s3.HeadObjectOutput{
-		AcceptRanges:            backend.GetPtrFromString("bytes"),
-		ContentLength:           &length,
-		ContentType:             &contentType,
-		ContentEncoding:         strPtrOrNil(mf.ContentEncoding),
-		ContentDisposition:      strPtrOrNil(mf.ContentDisposition),
-		ContentLanguage:         strPtrOrNil(mf.ContentLanguage),
-		CacheControl:            strPtrOrNil(mf.CacheControl),
-		ExpiresString:           strPtrOrNil(mf.Expires),
-		WebsiteRedirectLocation: strPtrOrNil(mf.WebsiteRedirectLocation),
-		Metadata:                mf.Metadata,
-		ContentRange:            contentRange,
-		PartsCount:              partsCount,
-		ETag:                    &etag,
-		LastModified:            &lastModified,
-		StorageClass:            types.StorageClassStandard,
+		AcceptRanges:              backend.GetPtrFromString("bytes"),
+		ContentLength:             &length,
+		ContentType:               &contentType,
+		ContentEncoding:           strPtrOrNil(mf.ContentEncoding),
+		ContentDisposition:        strPtrOrNil(mf.ContentDisposition),
+		ContentLanguage:           strPtrOrNil(mf.ContentLanguage),
+		CacheControl:              strPtrOrNil(mf.CacheControl),
+		ExpiresString:             strPtrOrNil(mf.Expires),
+		WebsiteRedirectLocation:   strPtrOrNil(mf.WebsiteRedirectLocation),
+		Metadata:                  mf.Metadata,
+		ContentRange:              contentRange,
+		PartsCount:                partsCount,
+		ETag:                      &etag,
+		LastModified:              &lastModified,
+		ObjectLockMode:            lockMode,
+		ObjectLockRetainUntilDate: lockUntil,
+		ObjectLockLegalHoldStatus: lockHold,
+		StorageClass:              types.StorageClassStandard,
 	}
 	if rv.versioned() {
 		out.VersionId = &rv.node.VersionID
@@ -532,26 +548,35 @@ func (b *Backend) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.
 		contentRange = &cr
 	}
 
+	// x-amz-object-lock-* headers of the resolved version (docs/s3-object-lock.md §8).
+	lockMode, lockUntil, lockHold, err := b.lockHeaderFields(ctx, rv)
+	if err != nil {
+		return nil, err
+	}
+
 	etag := etagOf(mf)
 	lastModified := time.Unix(mf.Created, 0)
 	contentType := mf.ContentType
 	out := &s3.GetObjectOutput{
-		AcceptRanges:            backend.GetPtrFromString("bytes"),
-		Body:                    body,
-		ContentLength:           &length,
-		ContentType:             &contentType,
-		ContentEncoding:         strPtrOrNil(mf.ContentEncoding),
-		ContentDisposition:      strPtrOrNil(mf.ContentDisposition),
-		ContentLanguage:         strPtrOrNil(mf.ContentLanguage),
-		CacheControl:            strPtrOrNil(mf.CacheControl),
-		ExpiresString:           strPtrOrNil(mf.Expires),
-		WebsiteRedirectLocation: strPtrOrNil(mf.WebsiteRedirectLocation),
-		Metadata:                mf.Metadata,
-		ContentRange:            contentRange,
-		PartsCount:              partsCount,
-		ETag:                    &etag,
-		LastModified:            &lastModified,
-		StorageClass:            types.StorageClassStandard,
+		AcceptRanges:              backend.GetPtrFromString("bytes"),
+		Body:                      body,
+		ContentLength:             &length,
+		ContentType:               &contentType,
+		ContentEncoding:           strPtrOrNil(mf.ContentEncoding),
+		ContentDisposition:        strPtrOrNil(mf.ContentDisposition),
+		ContentLanguage:           strPtrOrNil(mf.ContentLanguage),
+		CacheControl:              strPtrOrNil(mf.CacheControl),
+		ExpiresString:             strPtrOrNil(mf.Expires),
+		WebsiteRedirectLocation:   strPtrOrNil(mf.WebsiteRedirectLocation),
+		Metadata:                  mf.Metadata,
+		ContentRange:              contentRange,
+		PartsCount:                partsCount,
+		ETag:                      &etag,
+		LastModified:              &lastModified,
+		ObjectLockMode:            lockMode,
+		ObjectLockRetainUntilDate: lockUntil,
+		ObjectLockLegalHoldStatus: lockHold,
+		StorageClass:              types.StorageClassStandard,
 	}
 	if rv.versioned() {
 		out.VersionId = &rv.node.VersionID
@@ -640,7 +665,7 @@ func (b *Backend) insertDeleteMarker(ctx context.Context, bucketState *registry.
 		Created:      time.Now().Unix(),
 		DeleteMarker: true,
 	}
-	node, _, err := b.commitVersion(ctx, bucketState, key, mf, func(superseded *msbucket.ObjectManifest) error {
+	node, _, err := b.commitVersion(ctx, bucketState, key, mf, nil, func(superseded *msbucket.ObjectManifest) error {
 		if preconds == nil || superseded == nil || superseded.DeleteMarker {
 			return nil
 		}

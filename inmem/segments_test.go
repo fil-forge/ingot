@@ -8,6 +8,7 @@ import (
 	"github.com/multiformats/go-multihash"
 
 	"github.com/fil-forge/ingot/blockstore"
+	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/libforge/testutil"
 )
 
@@ -28,7 +29,7 @@ func TestMarkSegmentShipped_GuardsForgeRootOnRoot(t *testing.T) {
 	ctx := context.Background()
 	m := NewMemStore()
 
-	if err := m.Create(ctx, "bk", testutil.RandomDID(t)); err != nil {
+	if err := m.Create(ctx, "bk", testutil.RandomDID(t), registry.CreateState{}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	committed := testCid(t, "committed-root")
@@ -61,7 +62,7 @@ func TestMarkSegmentShipped_GuardsForgeRootOnRoot(t *testing.T) {
 
 	// A segment carrying ONLY a stale op-root must not advance forge_root at all.
 	m2 := NewMemStore()
-	_ = m2.Create(ctx, "bk2", testutil.RandomDID(t))
+	_ = m2.Create(ctx, "bk2", testutil.RandomDID(t), registry.CreateState{})
 	_ = m2.CASRoot(ctx, "bk2", cid.Undef, committed)
 	seq2, _ := m2.NextSegmentSeq(ctx)
 	_ = m2.InsertSegmentOpen(ctx, blockstore.PlaneCatalog, seq2, "bk2")

@@ -19,8 +19,9 @@ type VersionNode struct {
 
 // ObjectLeaf is the per-key version group, stored under the "/objectleaf/0"
 // union key (docs/s3-versioning.md §2.1). A key's top-MST value points at one
-// once the key has been superseded; until then the value is its manifest
-// (under "/objectmanifest/0").
+// once the key has been superseded or has received version state
+// (docs/s3-object-lock.md §4.1); until then the value is its manifest (under
+// "/objectmanifest/0").
 type ObjectLeaf struct {
 	// Current is the head version — what GET/HEAD/ListObjects resolve with
 	// a single leaf read, no descent into Prev.
@@ -36,6 +37,46 @@ type ObjectLeaf struct {
 	// because Prev is keyed by Seq and the null version's id ("null") does
 	// not encode its Seq.
 	NullSeq uint64 `cborgen:"n"`
+
+	// State is the root of the per-key version-state MST: revSeqKey(seq) →
+	// the version's VersionState block CID (docs/s3-object-lock.md §4.1).
+	// Nil when no version of this key carries explicit state, which is what
+	// makes state-free keys free to read.
+	State *cid.Cid `cborgen:"st"`
+}
+
+// LegalHold values for VersionState.LegalHold. S3 distinguishes never-set
+// (a 400 from GetObjectLegalHold) from an explicit OFF (a 200), so the
+// stored state is tri-valued.
+const (
+	LegalHoldUnset uint8 = 0
+	LegalHoldOff   uint8 = 1
+	LegalHoldOn    uint8 = 2
+)
+
+// VersionState is one version's mutable service state, stored as its own
+// catalog block under the "/versionstate/0" union key (docs/s3-object-lock.md
+// §4.1). Object lock is its first tenant; the block is the home for
+// per-version state that mutates after the version is created. Mutations
+// merge: each operation replaces the fields it owns and carries every other
+// field verbatim; a mutation that leaves every field absent deletes the
+// version's state-tree entry.
+type VersionState struct {
+	// Retention is the stored retention document (docs/s3-object-lock.md §2),
+	// verbatim; nil when retention has never been set.
+	Retention []byte `cborgen:"r"`
+	// LegalHold is tri-valued: LegalHoldUnset, LegalHoldOff, LegalHoldOn.
+	LegalHold uint8 `cborgen:"h"`
+	// Tags is reserved for object tagging (planned follow-up). Declared now
+	// so every rewrite round-trips it under the merge rule; the tagging
+	// feature adds handlers, not format. Nil until it lands.
+	Tags map[string]string `cborgen:"t"`
+}
+
+// Empty reports whether every field is absent — the elision condition: an
+// empty state block is removed from the tree rather than stored.
+func (s *VersionState) Empty() bool {
+	return s.Retention == nil && s.LegalHold == LegalHoldUnset && len(s.Tags) == 0
 }
 
 // ValueUnion is the keyed union every catalog value block is encoded as
@@ -142,5 +183,40 @@ func (e *EnvelopedLeaf) UnmarshalCBOR(r io.Reader) error {
 		return fmt.Errorf("bucket: block is not an enveloped leaf")
 	}
 	e.Leaf = v.Leaf
+	return nil
+}
+
+// StateUnion is the keyed union for version-state blocks — the values of a
+// leaf's state tree (docs/s3-object-lock.md §4.1). A separate union from
+// ValueUnion so a state block decoded through ObjectValue (or vice versa)
+// fails loudly with no arm matched. cbor-gen generates its codec; decode
+// through EnvelopedVersionState, which requires the arm.
+type StateUnion struct {
+	State *VersionState `cborgen:"/versionstate/0,omitempty"`
+}
+
+// EnvelopedVersionState reads/writes one version-state block under its
+// "/versionstate/0" union key.
+type EnvelopedVersionState struct {
+	State *VersionState
+}
+
+func (e *EnvelopedVersionState) MarshalCBOR(w io.Writer) error {
+	if e.State == nil {
+		return fmt.Errorf("bucket: version-state block must carry a state")
+	}
+	u := StateUnion{State: e.State}
+	return u.MarshalCBOR(w)
+}
+
+func (e *EnvelopedVersionState) UnmarshalCBOR(r io.Reader) error {
+	var u StateUnion
+	if err := u.UnmarshalCBOR(r); err != nil {
+		return err
+	}
+	if u.State == nil {
+		return fmt.Errorf("bucket: block is not an enveloped version state")
+	}
+	e.State = u.State
 	return nil
 }

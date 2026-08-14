@@ -16,6 +16,7 @@ import (
 	"github.com/fil-forge/ingot/blockstore"
 	"github.com/fil-forge/ingot/inmem"
 	"github.com/fil-forge/ingot/logstore"
+	"github.com/fil-forge/ingot/registry"
 )
 
 // recordingRemover captures the digests RemoveBlob is called with so the
@@ -87,7 +88,7 @@ func newRefTestBackend(t *testing.T, maxBlob ...int64) (*Backend, *inmem.MemStor
 		Remover:     rm,
 		MaxBlobSize: mbs,
 	})
-	if err := mem.Create(ctx, "bk", did.Undef); err != nil {
+	if err := mem.Create(ctx, "bk", did.Undef, registry.CreateState{}); err != nil {
 		t.Fatalf("create bucket: %v", err)
 	}
 	return b, mem, rm

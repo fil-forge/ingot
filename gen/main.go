@@ -20,6 +20,8 @@ func main() {
 		bucket.ObjectLeaf{},
 		bucket.VersionNode{},
 		bucket.ValueUnion{},
+		bucket.VersionState{},
+		bucket.StateUnion{},
 	); err != nil {
 		panic(err)
 	}

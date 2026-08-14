@@ -261,11 +261,17 @@ type discardedVersion struct {
 // the lock against the superseded current manifest (nil when the key is new)
 // before anything is written, so conditional mutations are race-safe.
 //
+// initState, when non-nil, is the new version's creation-time lock state
+// (the x-amz-object-lock-* headers): it is stamped into the key's
+// version-state tree in this same commit, forcing the leaf form for a new
+// key, so the version and its protections land in one root swap
+// (docs/s3-object-lock.md §7).
+//
 // The returned VersioningState is the bucket state read UNDER the lock — the
 // state that actually decided the version's id. Response shaping must gate on
 // it, not on the caller's pre-lock snapshot, so a racing PutBucketVersioning
 // can't mint an id the response then omits.
-func (b *Backend) commitVersion(ctx context.Context, bucketState *registry.State, key string, mf *msbucket.ObjectManifest, preCheck func(superseded *msbucket.ObjectManifest) error) (msbucket.VersionNode, registry.VersioningState, error) {
+func (b *Backend) commitVersion(ctx context.Context, bucketState *registry.State, key string, mf *msbucket.ObjectManifest, initState *msbucket.VersionState, preCheck func(superseded *msbucket.ObjectManifest) error) (msbucket.VersionNode, registry.VersioningState, error) {
 	var node msbucket.VersionNode
 	var discards []discardedVersion
 	var effState registry.VersioningState
@@ -335,9 +341,12 @@ func (b *Backend) commitVersion(ctx context.Context, bucketState *registry.State
 		newNode := msbucket.VersionNode{Seq: seq, VersionID: vid, Manifest: mfCid}
 		var newLeaf *msbucket.ObjectLeaf // nil → the value stays the manifest
 		if oldLeaf != nil {
-			newLeaf = &msbucket.ObjectLeaf{Current: newNode, NullSeq: oldLeaf.NullSeq}
+			// State (the version-state tree) carries across supersession:
+			// retained versions keep their lock state (docs/s3-object-lock.md §4.1).
+			newLeaf = &msbucket.ObjectLeaf{Current: newNode, NullSeq: oldLeaf.NullSeq, State: oldLeaf.State}
 		}
 		var prevTree *mst.MerkleSearchTree
+		var discardSeqs []uint64 // discarded versions' seqs, for state-entry cleanup (§9)
 		retained, evictedNull := false, false
 		if superseded != nil {
 			if oldLeaf != nil && oldLeaf.Prev != nil {
@@ -369,6 +378,7 @@ func (b *Backend) commitVersion(ctx context.Context, bucketState *registry.State
 				// Discard (null over null). A manifest-valued key stays one; its value
 				// block is the manifest queued for GC just below.
 				discards = append(discards, discardedVersion{superseded.VersionID, bodyDigests(supersededMf.Body)})
+				discardSeqs = append(discardSeqs, superseded.Seq)
 				if err := b.gc.AddGCCandidate(ctx, superseded.Manifest.Bytes(), st.Name); err != nil {
 					return cid.Undef, fmt.Errorf("gc candidate: %w", err)
 				}
@@ -389,6 +399,7 @@ func (b *Backend) commitVersion(ctx context.Context, bucketState *registry.State
 							return cid.Undef, fmt.Errorf("load prev null manifest: %w", err)
 						}
 						discards = append(discards, discardedVersion{registry.NullVersionID, bodyDigests(nullEm.Manifest.Body)})
+						discardSeqs = append(discardSeqs, newLeaf.NullSeq)
 						if prevTree, err = prevTree.Delete(ctx, nullKey); err != nil {
 							return cid.Undef, fmt.Errorf("prev delete null: %w", err)
 						}
@@ -434,6 +445,42 @@ func (b *Backend) commitVersion(ctx context.Context, bucketState *registry.State
 				}
 				newLeaf.Prev = &proot
 			}
+		}
+
+		// Version-state maintenance (docs/s3-object-lock.md §7, §9): prune
+		// the state entries of versions this commit discarded — unreachable
+		// for lock state (§5's guard), covered for future tenants — then
+		// stamp the new version's creation-time lock state in this same
+		// commit. The common write has neither and skips both.
+		if newLeaf != nil {
+			for _, dseq := range discardSeqs {
+				var perr error
+				if newLeaf.State, perr = b.pruneVersionState(ctx, tx, st, newLeaf.State, dseq); perr != nil {
+					return cid.Undef, perr
+				}
+			}
+		}
+		if initState != nil {
+			if newLeaf == nil {
+				// Creation-time lock state forces the leaf form (§7).
+				newLeaf = &msbucket.ObjectLeaf{Current: newNode}
+			}
+			stateTree := mst.NewEmptyMST(tx, st.Space)
+			if newLeaf.State != nil {
+				stateTree = mst.LoadMST(tx, st.Space, *newLeaf.State)
+			}
+			scid, serr := tx.Put(ctx, &msbucket.EnvelopedVersionState{State: initState})
+			if serr != nil {
+				return cid.Undef, fmt.Errorf("state put: %w", serr)
+			}
+			if stateTree, serr = stateTree.Add(ctx, revSeqKey(seq), scid, -1); serr != nil {
+				return cid.Undef, fmt.Errorf("state add: %w", serr)
+			}
+			sroot, serr := stateTree.GetPointer(ctx, tx)
+			if serr != nil {
+				return cid.Undef, fmt.Errorf("state pointer: %w", serr)
+			}
+			newLeaf.State = &sroot
 		}
 
 		// The new value: the enveloped leaf when the key has (or now gains)
@@ -633,6 +680,13 @@ func (b *Backend) deleteVersionScoped(ctx context.Context, bucketState *registry
 			return cid.Undef, fmt.Errorf("gc candidate: %w", err)
 		}
 
+		// The removed version's state entry goes with it, in this commit
+		// (docs/s3-object-lock.md §9). removedSeq covers all three exits.
+		removedSeq := targetSeq
+		if isCurrent {
+			removedSeq = leaf.Current.Seq
+		}
+
 		if isCurrent {
 			// Promote the newest prev entry, or drop the leaf when none remain.
 			var headCid cid.Cid
@@ -645,6 +699,11 @@ func (b *Backend) deleteVersionScoped(ctx context.Context, bucketState *registry
 				}
 			}
 			if !ok {
+				// The key's last version: the leaf and its trees die with it;
+				// prune GCs the removed version's state block.
+				if _, err := b.pruneVersionState(ctx, tx, st, leaf.State, removedSeq); err != nil {
+					return cid.Undef, err
+				}
 				t2, err := t.Delete(ctx, key)
 				if err != nil {
 					return cid.Undef, fmt.Errorf("mst delete: %w", err)
@@ -667,6 +726,9 @@ func (b *Backend) deleteVersionScoped(ctx context.Context, bucketState *registry
 			if headMf.Seq == leaf.NullSeq {
 				newLeaf.NullSeq = 0 // the null version is current again
 			}
+			if newLeaf.State, err = b.pruneVersionState(ctx, tx, st, leaf.State, removedSeq); err != nil {
+				return cid.Undef, err
+			}
 			return b.spliceLeaf(ctx, tx, t, key, newLeaf, prevTree)
 		}
 
@@ -678,6 +740,9 @@ func (b *Backend) deleteVersionScoped(ctx context.Context, bucketState *registry
 		newLeaf := msbucket.ObjectLeaf{Current: leaf.Current, NullSeq: leaf.NullSeq}
 		if targetSeq == leaf.NullSeq {
 			newLeaf.NullSeq = 0
+		}
+		if newLeaf.State, err = b.pruneVersionState(ctx, tx, st, leaf.State, removedSeq); err != nil {
+			return cid.Undef, err
 		}
 		return b.spliceLeaf(ctx, tx, t, key, newLeaf, prevTree)
 	})
@@ -692,6 +757,44 @@ func (b *Backend) deleteVersionScoped(ctx context.Context, bucketState *registry
 		b.releaseBlobs(ctx, bucketState.Space, toRemove)
 	}
 	return res, nil
+}
+
+// pruneVersionState removes seq's entry from a leaf's version-state tree,
+// queueing the removed block for GC, and returns the tree's new root: the
+// input root untouched when there was no entry, nil when the tree empties.
+// This is the §9 cleanup rule (docs/s3-object-lock.md): a commit that
+// permanently removes a version also removes its state entry, in the same
+// commit.
+func (b *Backend) pruneVersionState(ctx context.Context, tx *bucketop.Tx, st *registry.State, stateRoot *cid.Cid, seq uint64) (*cid.Cid, error) {
+	if stateRoot == nil {
+		return nil, nil
+	}
+	t := mst.LoadMST(tx, st.Space, *stateRoot)
+	scid, err := t.Get(ctx, revSeqKey(seq))
+	if errors.Is(err, mst.ErrNotFound) {
+		return stateRoot, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("state get: %w", err)
+	}
+	if err := b.gc.AddGCCandidate(ctx, scid.Bytes(), st.Name); err != nil {
+		return nil, fmt.Errorf("gc candidate: %w", err)
+	}
+	if t, err = t.Delete(ctx, revSeqKey(seq)); err != nil {
+		return nil, fmt.Errorf("state delete: %w", err)
+	}
+	empty, err := mstEmpty(ctx, t)
+	if err != nil {
+		return nil, fmt.Errorf("state empty check: %w", err)
+	}
+	if empty {
+		return nil, nil
+	}
+	root, err := t.GetPointer(ctx, tx)
+	if err != nil {
+		return nil, fmt.Errorf("state pointer: %w", err)
+	}
+	return &root, nil
 }
 
 // spliceLeaf finalizes a rebuilt leaf: serializes the (possibly emptied) prev

@@ -41,11 +41,15 @@ func NewPostgres(pool *pgxpool.Pool) *Postgres {
 // Compile-time assertion.
 var _ Registry = (*Postgres)(nil)
 
-func (r *Postgres) Create(ctx context.Context, name string, space did.DID) error {
+func (r *Postgres) Create(ctx context.Context, name string, space did.DID, init CreateState) error {
 	// root_cid stays NULL (empty bucket); created_at from the column default.
+	v := init.Versioning
+	if v == "" {
+		v = VersioningUnversioned
+	}
 	_, err := r.pool.Exec(ctx,
-		`INSERT INTO ingot.buckets (name, space) VALUES ($1, $2)`,
-		name, space.String())
+		`INSERT INTO ingot.buckets (name, space, versioning, object_lock_config) VALUES ($1, $2, $3, $4)`,
+		name, space.String(), string(v), init.ObjectLockConfig)
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == uniqueViolation {
@@ -57,12 +61,12 @@ func (r *Postgres) Create(ctx context.Context, name string, space did.DID) error
 }
 
 func (r *Postgres) Get(ctx context.Context, name string) (*State, error) {
-	var rootBytes, forgeBytes []byte
+	var rootBytes, forgeBytes, lockCfg []byte
 	var createdAt time.Time
 	var spaceStr, versioning string
 	err := r.pool.QueryRow(ctx,
-		`SELECT root_cid, forge_root_cid, created_at, space, versioning FROM ingot.buckets WHERE name = $1`, name).
-		Scan(&rootBytes, &forgeBytes, &createdAt, &spaceStr, &versioning)
+		`SELECT root_cid, forge_root_cid, created_at, space, versioning, object_lock_config FROM ingot.buckets WHERE name = $1`, name).
+		Scan(&rootBytes, &forgeBytes, &createdAt, &spaceStr, &versioning, &lockCfg)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -73,7 +77,7 @@ func (r *Postgres) Get(ctx context.Context, name string) (*State, error) {
 	if err != nil {
 		return nil, fmt.Errorf("registry: parse space %q: %w", spaceStr, err)
 	}
-	st := &State{Name: name, Space: space, Versioning: VersioningState(versioning), CreatedAt: createdAt}
+	st := &State{Name: name, Space: space, Versioning: VersioningState(versioning), ObjectLockConfig: lockCfg, CreatedAt: createdAt}
 	if err := setCidPg(&st.Root, rootBytes, name, "root_cid"); err != nil {
 		return nil, err
 	}
@@ -154,6 +158,19 @@ func (r *Postgres) SetVersioning(ctx context.Context, name string, v VersioningS
 		string(v), name)
 	if err != nil {
 		return fmt.Errorf("registry: set versioning %q: %w", name, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (r *Postgres) SetObjectLockConfig(ctx context.Context, name string, cfg []byte) error {
+	tag, err := r.pool.Exec(ctx,
+		`UPDATE ingot.buckets SET object_lock_config = $1 WHERE name = $2`,
+		cfg, name)
+	if err != nil {
+		return fmt.Errorf("registry: set object lock config %q: %w", name, err)
 	}
 	if tag.RowsAffected() == 0 {
 		return ErrNotFound

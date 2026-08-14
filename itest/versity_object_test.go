@@ -34,11 +34,13 @@ var putObjectPass = []forgeCase{
 	{name: "invalid_retain_until_date", fn: integration.PutObject_invalid_retain_until_date},
 	{name: "invalid_website_redirect_location", fn: integration.PutObject_invalid_website_redirect_location},
 	{name: "long_metadata", fn: integration.PutObject_long_metadata},
+	{name: "missing_bucket_lock", fn: integration.PutObject_missing_bucket_lock},
 	{name: "missing_object_lock_retention_config", fn: integration.PutObject_missing_object_lock_retention_config},
 	{name: "multiple_checksum_headers", fn: integration.PutObject_multiple_checksum_headers},
 	{name: "non_existing_bucket", fn: integration.PutObject_non_existing_bucket},
 	{name: "past_retain_until_date", fn: integration.PutObject_past_retain_until_date},
-	{name: "racey_success", fn: integration.PutObject_racey_success},
+	// racey_success creates its bucket lock-enabled by hand and needs the
+	// versioned teardown: it runs as LockCreation/PutObject_racey_success.
 	{name: "special_chars", fn: integration.PutObject_special_chars},
 	{name: "conditional_writes", fn: integration.PutObject_conditional_writes},
 	{name: "default_checksum", fn: integration.PutObject_default_checksum},
@@ -53,10 +55,10 @@ var putObjectXFail = []forgeCase{
 	// A metadata-combining re-PUT is denied (403) under the hilt authorize
 	// flow.
 	{name: "should_combine_metadata", fn: integration.PutObject_should_combine_metadata},
-	{name: "missing_bucket_lock", fn: integration.PutObject_missing_bucket_lock},
 	{name: "object_acl_not_supported", fn: integration.PutObject_object_acl_not_supported},
 	{name: "tagging", fn: integration.PutObject_tagging},
-	{name: "with_object_lock", fn: integration.PutObject_with_object_lock},
+	// with_object_lock passes but needs the versioned teardown: it runs as
+	// LockCreation/PutObject_with_object_lock (versity_lock_test.go).
 }
 
 var getObjectPass = []forgeCase{
@@ -170,8 +172,10 @@ var copyObjectPass = []forgeCase{
 	{name: "long_metadata", fn: integration.CopyObject_long_metadata},
 	{name: "should_copy_meta_props", fn: integration.CopyObject_should_copy_meta_props},
 	{name: "should_replace_meta_props", fn: integration.CopyObject_should_replace_meta_props},
-	{name: "invalid_legal_hold", fn: integration.CopyObject_invalid_legal_hold},
-	{name: "invalid_object_lock_mode", fn: integration.CopyObject_invalid_object_lock_mode},
+	{name: "missing_bucket_lock", fn: integration.CopyObject_missing_bucket_lock},
+	// invalid_legal_hold / invalid_object_lock_mode put a source object into
+	// a withLock() bucket and need the versioned teardown: they run under
+	// LockCreation (versity_lock_test.go).
 	{name: "invalid_website_redirect_location", fn: integration.CopyObject_invalid_website_redirect_location},
 	{name: "create_checksum_on_copy", fn: integration.CopyObject_create_checksum_on_copy},
 	{name: "should_copy_the_existing_checksum", fn: integration.CopyObject_should_copy_the_existing_checksum},
@@ -180,16 +184,15 @@ var copyObjectPass = []forgeCase{
 }
 
 // Observed failing against the forge stack: multi-account semantics, tagging,
-// and object-lock are unimplemented surface.
+// and ACLs are unimplemented surface.
 var copyObjectXFail = []forgeCase{
 	{name: "not_owned_source_bucket", fn: integration.CopyObject_not_owned_source_bucket},
 	{name: "should_replace_tagging", fn: integration.CopyObject_should_replace_tagging},
 	{name: "should_copy_tagging", fn: integration.CopyObject_should_copy_tagging},
-	{name: "missing_bucket_lock", fn: integration.CopyObject_missing_bucket_lock},
-	{name: "with_legal_hold", fn: integration.CopyObject_with_legal_hold},
-	{name: "with_retention_lock", fn: integration.CopyObject_with_retention_lock},
 	{name: "object_acl_not_supported", fn: integration.CopyObject_object_acl_not_supported},
 	{name: "incorrect_source_bucket_expected_owner", fn: integration.CopyObject_incorrect_source_bucket_expected_owner},
+	// with_legal_hold / with_retention_lock pass but need the versioned
+	// teardown: they run under LockCreation (versity_lock_test.go).
 }
 
 var deleteObjectsPass = []forgeCase{
