@@ -19,15 +19,17 @@ import (
 // /blob/release), which needs hilt ≥ #37 (blob.Remove in the write set) and
 // smelt ≥ #19 (the piri blob/release + blob/reject seed delegations).
 //
-// Excluded entirely (feature not modeled, mirroring the absent Tagging
-// category): the Versioning_* object-tagging, GetObjectAttributes,
-// UploadPartCopy, and AccessControl (admin-API users) cases. Also excluded:
-// the upstream VersioningDisabled_{Get,Put}BucketVersioning_not_configured
-// pair, which asserts versitygw's versioning-disabled deployment mode
+// Excluded entirely (feature not modeled): the Versioning_*
+// GetObjectAttributes, UploadPartCopy, and AccessControl (admin-API users)
+// cases. Also excluded: the upstream
+// VersioningDisabled_{Get,Put}BucketVersioning_not_configured pair, which
+// asserts versitygw's versioning-disabled deployment mode
 // (ErrVersioningNotConfigured) — ingot always implements versioning, so that
 // mode never exists here. The object-lock / retention / legal-hold /
-// versioned-WORM rows live in the tables below (docs/s3-object-lock.md §11);
-// the standalone lock groups are curated in versity_lock_test.go.
+// versioned-WORM rows live in the tables below (docs/s3-object-lock.md §11),
+// as do the versioned tagging rows (docs/s3-object-tagging.md §6); the
+// standalone lock and tagging groups are curated in versity_lock_test.go and
+// versity_tagging_test.go.
 
 var putBucketVersioningPass = []forgeCase{
 	{name: "non_existing_bucket", fn: integration.PutBucketVersioning_non_existing_bucket},
@@ -136,6 +138,15 @@ var versioningPass = []forgeCase{
 	{name: "WORM_CopyObject_overwrite_locked_object", fn: integration.Versioning_WORM_CopyObject_overwrite_locked_object},
 	{name: "WORM_CompleteMultipartUpload_overwrite_locked_object", fn: integration.Versioning_WORM_CompleteMultipartUpload_overwrite_locked_object},
 	{name: "WORM_remove_delete_marker_under_bucket_default_retention", fn: integration.Versioning_WORM_remove_delete_marker_under_bucket_default_retention},
+	// Tagging (docs/s3-object-tagging.md §6)
+	{name: "PutObjectTagging_invalid_versionId", fn: integration.Versioning_PutObjectTagging_invalid_versionId},
+	{name: "PutObjectTagging_non_existing_object_version", fn: integration.Versioning_PutObjectTagging_non_existing_object_version},
+	{name: "GetObjectTagging_invalid_versionId", fn: integration.Versioning_GetObjectTagging_invalid_versionId},
+	{name: "GetObjectTagging_non_existing_object_version", fn: integration.Versioning_GetObjectTagging_non_existing_object_version},
+	{name: "DeleteObjectTagging_invalid_versionId", fn: integration.Versioning_DeleteObjectTagging_invalid_versionId},
+	{name: "DeleteObjectTagging_non_existing_object_version", fn: integration.Versioning_DeleteObjectTagging_non_existing_object_version},
+	{name: "PutGetDeleteObjectTagging_delete_marker", fn: integration.Versioning_PutGetDeleteObjectTagging_delete_marker},
+	{name: "PutGetDeleteObjectTagging_success", fn: integration.Versioning_PutGetDeleteObjectTagging_success},
 }
 
 // versioningXFail is empty: DeleteObject_non_existing_objects moved to the

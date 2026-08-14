@@ -77,6 +77,12 @@ func (b *Backend) CreateMultipartUpload(ctx context.Context, input s3response.Cr
 	if _, err := lockStateFromHeaders(st, input.ObjectLockMode, input.ObjectLockRetainUntilDate, input.ObjectLockLegalHoldStatus); err != nil {
 		return s3response.InitiateMultipartUploadResult{}, err
 	}
+	// The x-amz-tagging header is validated at create (an invalid header
+	// fails the create) and carried raw on the session; Complete stamps the
+	// parsed set (docs/s3-object-tagging.md §4).
+	if _, err := backend.ParseObjectTags(backend.GetStringFromPtr(input.Tagging)); err != nil {
+		return s3response.InitiateMultipartUploadResult{}, err
+	}
 	lockUntil := input.ObjectLockRetainUntilDate
 	if lockUntil != nil && lockUntil.IsZero() {
 		lockUntil = nil
@@ -106,6 +112,7 @@ func (b *Backend) CreateMultipartUpload(ctx context.Context, input s3response.Cr
 		LockMode:                string(input.ObjectLockMode),
 		LockRetainUntil:         lockUntil,
 		LockLegalHold:           string(input.ObjectLockLegalHoldStatus),
+		Tagging:                 backend.GetStringFromPtr(input.Tagging),
 		Metadata:                input.Metadata,
 	}); err != nil {
 		return s3response.InitiateMultipartUploadResult{}, fmt.Errorf("s3frontend: create session: %w", err)
@@ -563,17 +570,23 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 	// CreateMultipartUpload's lock headers, carried on the session, stamp the
 	// version this commit installs — exactly as a single-shot PUT would have
 	// (docs/s3-object-lock.md §7).
-	lockState, err := lockStateFromHeaders(bucketState, types.ObjectLockMode(sess.LockMode), sess.LockRetainUntil, types.ObjectLockLegalHoldStatus(sess.LockLegalHold))
+	initState, err := lockStateFromHeaders(bucketState, types.ObjectLockMode(sess.LockMode), sess.LockRetainUntil, types.ObjectLockLegalHoldStatus(sess.LockLegalHold))
 	if err != nil {
 		return s3response.CompleteMultipartUploadResult{}, "", err
 	}
+	tags, err := backend.ParseObjectTags(sess.Tagging)
+	if err != nil {
+		// Validated at CreateMultipartUpload; a parse failure here is a bug.
+		return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: parse session tagging: %w", err)
+	}
+	initState = applyTagsIfPresent(initState, tags)
 
 	// Commit through the §5 write rule (docs/s3-versioning.md): seq allocation,
 	// supersession per the bucket's versioning state, and the post-commit
 	// reference-index reconcile. The conditional-write preconditions re-check
 	// under the lock so a racing writer can't slip between the pre-check above
 	// and the swap.
-	node, effState, err := b.commitVersion(ctx, bucketState, key, mf, lockState, func(superseded *msbucket.ObjectManifest) error {
+	node, effState, err := b.commitVersion(ctx, bucketState, key, mf, initState, func(superseded *msbucket.ObjectManifest) error {
 		if ifMatch == nil && ifNoneMatch == nil {
 			return nil
 		}

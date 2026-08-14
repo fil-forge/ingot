@@ -88,13 +88,17 @@ func lockStateFromHeaders(st *registry.State, mode types.ObjectLockMode, retainU
 	return vs, nil
 }
 
-// resolveLockTarget runs the §6 read-side check order for a per-version lock
-// operation: bucket, key existence, lock-enabled, then versionId grammar and
-// resolution (via resolveVersion) and the delete-marker sentinel. Key
+// resolveStateTarget runs the read-side check order shared by the
+// per-version state operations (docs/s3-object-lock.md §6;
+// docs/s3-object-tagging.md §2): bucket, key existence, the lock-enabled gate
+// when the operation requires it (the lock methods do; tagging has no gate),
+// then versionId grammar and resolution (via resolveVersion) and the
+// delete-marker sentinel. Call through resolveLockTarget /
+// resolveTagTarget, which set the gate for their operation family. Key
 // existence outranks the lock-enabled check — a missing key on a bucket
 // without lock is NoSuchKey, never the missing-configuration error
 // (GetObjectRetention_non_existing_object pins it, matching posix).
-func (b *Backend) resolveLockTarget(ctx context.Context, bucketName, key, versionID string) (*resolvedVersion, error) {
+func (b *Backend) resolveStateTarget(ctx context.Context, bucketName, key, versionID string, requireLock bool) (*resolvedVersion, error) {
 	st, err := b.reg.Get(ctx, bucketName)
 	if err != nil {
 		if errors.Is(err, registry.ErrNotFound) {
@@ -111,7 +115,7 @@ func (b *Backend) resolveLockTarget(ctx context.Context, bucketName, key, versio
 		}
 		return nil, fmt.Errorf("s3frontend: mst get: %w", err)
 	}
-	if !bucketLockEnabled(st) {
+	if requireLock && !bucketLockEnabled(st) {
 		return nil, s3err.GetAPIError(s3err.ErrMissingObjectLockConfiguration)
 	}
 	rv, err := b.resolveVersion(ctx, bucketName, key, versionID)
@@ -122,6 +126,13 @@ func (b *Backend) resolveLockTarget(ctx context.Context, bucketName, key, versio
 		return nil, s3err.GetAPIError(s3err.ErrMethodNotAllowed)
 	}
 	return rv, nil
+}
+
+// resolveLockTarget resolves a lock method's target: resolveStateTarget
+// with the lock-enabled gate required. The tagging twin is
+// resolveTagTarget (objecttag.go).
+func (b *Backend) resolveLockTarget(ctx context.Context, bucketName, key, versionID string) (*resolvedVersion, error) {
+	return b.resolveStateTarget(ctx, bucketName, key, versionID, true)
 }
 
 // versionStateOf seeks the resolved version's VersionState block: leaf →
@@ -183,12 +194,19 @@ func (b *Backend) GetObjectLegalHold(ctx context.Context, bucket, object, versio
 	return &on, nil
 }
 
+// mutateVersionLock runs a per-version state write for the lock methods:
+// mutateVersionState with the lock-enabled gate required. The tagging twin
+// is mutateVersionTags (objecttag.go).
+func (b *Backend) mutateVersionLock(ctx context.Context, bucketName, key, versionID string, mutate func(*msbucket.VersionState)) error {
+	return b.mutateVersionState(ctx, bucketName, key, versionID, true, mutate)
+}
+
 // PutObjectRetention stores the controller's retention document on the
 // resolved version. Mode-transition policy (same-mode replacement,
 // COMPLIANCE never weakened, governance bypass) ran in the controller before
 // this is called.
 func (b *Backend) PutObjectRetention(ctx context.Context, bucket, object, versionId string, retention []byte) error {
-	return b.mutateVersionState(ctx, bucket, object, versionId, func(vs *msbucket.VersionState) {
+	return b.mutateVersionLock(ctx, bucket, object, versionId, func(vs *msbucket.VersionState) {
 		vs.Retention = retention
 	})
 }
@@ -199,7 +217,7 @@ func (b *Backend) PutObjectLegalHold(ctx context.Context, bucket, object, versio
 	if status {
 		hold = msbucket.LegalHoldOn
 	}
-	return b.mutateVersionState(ctx, bucket, object, versionId, func(vs *msbucket.VersionState) {
+	return b.mutateVersionLock(ctx, bucket, object, versionId, func(vs *msbucket.VersionState) {
 		vs.LegalHold = hold
 	})
 }
@@ -209,11 +227,13 @@ func (b *Backend) PutObjectLegalHold(ctx context.Context, bucket, object, versio
 // version's state block (mutate owns its fields and every other field is
 // carried, §4.1 rule 3), and the leaf/state-tree/top-MST splice. A
 // manifest-arm key upgrades to a leaf on its first state write (§4.1 rule 1);
-// an empty merged block is elided rather than stored. The check order runs
+// an empty merged block is elided rather than stored. Call through
+// mutateVersionLock / mutateVersionTags, which set the gate for their
+// operation family. The check order runs
 // entirely inside the commit (a missing bucket surfaces through
 // mapCommitError); key existence outranks lock-enabled, which outranks the
 // versionId grammar, matching posix and the pinning conformance cases.
-func (b *Backend) mutateVersionState(ctx context.Context, bucketName, key, versionID string, mutate func(*msbucket.VersionState)) error {
+func (b *Backend) mutateVersionState(ctx context.Context, bucketName, key, versionID string, requireLock bool, mutate func(*msbucket.VersionState)) error {
 	err := b.txns.WithTx(ctx, bucketName, func(ctx context.Context, tx *bucketop.Tx) (cid.Cid, error) {
 		st := tx.State()
 		if !st.Root.Defined() {
@@ -227,7 +247,7 @@ func (b *Backend) mutateVersionState(ctx context.Context, bucketName, key, versi
 		if gerr != nil {
 			return cid.Undef, fmt.Errorf("mst get: %w", gerr)
 		}
-		if !bucketLockEnabled(st) {
+		if requireLock && !bucketLockEnabled(st) {
 			return cid.Undef, s3err.GetAPIError(s3err.ErrMissingObjectLockConfiguration)
 		}
 		kind, seq := classifyVersionID(versionID)
@@ -411,28 +431,38 @@ func (b *Backend) mutateVersionState(ctx context.Context, bucketName, key, versi
 	return nil
 }
 
-// lockHeaderFields returns the x-amz-object-lock-* response fields for a
-// resolved version (§8): the retention mode and retain-until date from the
-// stored document, and the legal-hold status. All zero when the bucket has no
-// lock configuration or the version carries no state, so the common read
-// path costs nothing.
-func (b *Backend) lockHeaderFields(ctx context.Context, rv *resolvedVersion) (types.ObjectLockMode, *time.Time, types.ObjectLockLegalHoldStatus, error) {
-	if rv.leaf == nil || rv.leaf.State == nil || !bucketLockEnabled(rv.st) {
-		return "", nil, "", nil
+// stateHeaderFields returns the state-derived response fields for a resolved
+// version: the x-amz-object-lock-* trio (docs/s3-object-lock.md §8) and the
+// x-amz-tagging-count (docs/s3-object-tagging.md §5, set only when the
+// version carries at least one tag). One state-block fetch serves both. The
+// lock fields stay gated on the bucket's lock configuration; the tag count is
+// not (tagging has no gate). Keys without state skip the fetch, so the common
+// read path costs nothing.
+func (b *Backend) stateHeaderFields(ctx context.Context, rv *resolvedVersion) (types.ObjectLockMode, *time.Time, types.ObjectLockLegalHoldStatus, *int32, error) {
+	if rv.leaf == nil || rv.leaf.State == nil {
+		return "", nil, "", nil, nil
 	}
 	vs, err := b.versionStateOf(ctx, rv)
 	if err != nil {
-		return "", nil, "", err
+		return "", nil, "", nil, err
 	}
 	if vs == nil {
-		return "", nil, "", nil
+		return "", nil, "", nil, nil
+	}
+	var tagCount *int32
+	if n := len(vs.Tags); n > 0 {
+		c := int32(n)
+		tagCount = &c
+	}
+	if !bucketLockEnabled(rv.st) {
+		return "", nil, "", tagCount, nil
 	}
 	var mode types.ObjectLockMode
 	var until *time.Time
 	if vs.Retention != nil {
 		var ret types.ObjectLockRetention
 		if err := json.Unmarshal(vs.Retention, &ret); err != nil {
-			return "", nil, "", fmt.Errorf("s3frontend: parse stored retention: %w", err)
+			return "", nil, "", nil, fmt.Errorf("s3frontend: parse stored retention: %w", err)
 		}
 		mode = types.ObjectLockMode(ret.Mode)
 		until = ret.RetainUntilDate
@@ -444,5 +474,5 @@ func (b *Backend) lockHeaderFields(ctx context.Context, rv *resolvedVersion) (ty
 	case msbucket.LegalHoldOff:
 		hold = types.ObjectLockLegalHoldStatusOff
 	}
-	return mode, until, hold, nil
+	return mode, until, hold, tagCount, nil
 }
