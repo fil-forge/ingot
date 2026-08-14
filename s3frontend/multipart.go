@@ -61,11 +61,25 @@ func (b *Backend) CreateMultipartUpload(ctx context.Context, input s3response.Cr
 	if strings.HasSuffix(key, "/") {
 		return s3response.InitiateMultipartUploadResult{}, s3err.GetAPIError(s3err.ErrDirectoryObjectContainsData)
 	}
-	if _, err := b.reg.Get(ctx, bucket); err != nil {
+	st, err := b.reg.Get(ctx, bucket)
+	if err != nil {
 		if errors.Is(err, registry.ErrNotFound) {
 			return s3response.InitiateMultipartUploadResult{}, s3err.GetAPIError(s3err.ErrNoSuchBucket)
 		}
 		return s3response.InitiateMultipartUploadResult{}, fmt.Errorf("s3frontend: create mpu: %w", err)
+	}
+	// x-amz-object-lock-* headers are validated here (the MPU variant of the
+	// missing-configuration error) and carried on the session; Complete stamps
+	// them onto the version it commits (docs/s3-object-lock.md §7). An absent
+	// retain-until header arrives as a pointer to the zero time (the
+	// controller populates the pointer unconditionally); keep it out of the
+	// session row.
+	if _, err := lockStateFromHeaders(st, input.ObjectLockMode, input.ObjectLockRetainUntilDate, input.ObjectLockLegalHoldStatus); err != nil {
+		return s3response.InitiateMultipartUploadResult{}, err
+	}
+	lockUntil := input.ObjectLockRetainUntilDate
+	if lockUntil != nil && lockUntil.IsZero() {
+		lockUntil = nil
 	}
 	uploadID, err := newUploadID()
 	if err != nil {
@@ -89,6 +103,9 @@ func (b *Backend) CreateMultipartUpload(ctx context.Context, input s3response.Cr
 		WebsiteRedirectLocation: backend.GetStringFromPtr(input.WebsiteRedirectLocation),
 		ChecksumAlgorithm:       string(input.ChecksumAlgorithm),
 		ChecksumType:            string(input.ChecksumType),
+		LockMode:                string(input.ObjectLockMode),
+		LockRetainUntil:         lockUntil,
+		LockLegalHold:           string(input.ObjectLockLegalHoldStatus),
 		Metadata:                input.Metadata,
 	}); err != nil {
 		return s3response.InitiateMultipartUploadResult{}, fmt.Errorf("s3frontend: create session: %w", err)
@@ -543,12 +560,20 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 		mf.ChecksumAlgorithm, mf.Checksum, mf.ChecksumType = string(ckAlgo), ckValue, string(ckType)
 	}
 
+	// CreateMultipartUpload's lock headers, carried on the session, stamp the
+	// version this commit installs — exactly as a single-shot PUT would have
+	// (docs/s3-object-lock.md §7).
+	lockState, err := lockStateFromHeaders(bucketState, types.ObjectLockMode(sess.LockMode), sess.LockRetainUntil, types.ObjectLockLegalHoldStatus(sess.LockLegalHold))
+	if err != nil {
+		return s3response.CompleteMultipartUploadResult{}, "", err
+	}
+
 	// Commit through the §5 write rule (docs/s3-versioning.md): seq allocation,
 	// supersession per the bucket's versioning state, and the post-commit
 	// reference-index reconcile. The conditional-write preconditions re-check
 	// under the lock so a racing writer can't slip between the pre-check above
 	// and the swap.
-	node, effState, err := b.commitVersion(ctx, bucketState, key, mf, func(superseded *msbucket.ObjectManifest) error {
+	node, effState, err := b.commitVersion(ctx, bucketState, key, mf, lockState, func(superseded *msbucket.ObjectManifest) error {
 		if ifMatch == nil && ifNoneMatch == nil {
 			return nil
 		}

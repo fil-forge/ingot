@@ -24,10 +24,12 @@ func testCid(t *testing.T, s string) cid.Cid {
 // decodes back with its fields intact.
 func TestObjectValue_LeafRoundTrip(t *testing.T) {
 	prev := testCid(t, "prev-root")
+	state := testCid(t, "state-root")
 	leaf := &ObjectLeaf{
 		Current: VersionNode{Seq: 9, VersionID: "01ARZ3NDEKTSV4RRFFQ69G5FAV", Manifest: testCid(t, "mf")},
 		Prev:    &prev,
 		NullSeq: 4,
+		State:   &state,
 	}
 	var buf bytes.Buffer
 	if err := LeafValue(leaf).MarshalCBOR(&buf); err != nil {
@@ -46,7 +48,8 @@ func TestObjectValue_LeafRoundTrip(t *testing.T) {
 	}
 	got := val.Leaf
 	if got.Current != leaf.Current || got.NullSeq != leaf.NullSeq ||
-		got.Prev == nil || !got.Prev.Equals(prev) {
+		got.Prev == nil || !got.Prev.Equals(prev) ||
+		got.State == nil || !got.State.Equals(state) {
 		t.Fatalf("leaf round-trip = %+v, want %+v", got, leaf)
 	}
 
@@ -146,5 +149,54 @@ func TestObjectValue_RejectsNonUnionBlocks(t *testing.T) {
 	var empty ObjectValue
 	if err := empty.MarshalCBOR(&bytes.Buffer{}); err == nil {
 		t.Fatal("marshal of zero-arm value: err = nil, want rejection")
+	}
+}
+
+// TestVersionState_RoundTrip pins the version-state block: the
+// "/versionstate/0" union key, the tri-valued hold, the verbatim retention
+// bytes, and the reserved Tags field surviving a decode/re-encode cycle (the
+// §4.1 merge rule depends on unowned fields being carried).
+func TestVersionState_RoundTrip(t *testing.T) {
+	st := &VersionState{
+		Retention: []byte(`{"Mode":"GOVERNANCE","RetainUntilDate":"2027-01-02T15:04:05Z"}`),
+		LegalHold: LegalHoldOff,
+		Tags:      map[string]string{"team": "forge", "env": "dev"},
+	}
+	var buf bytes.Buffer
+	if err := (&EnvelopedVersionState{State: st}).MarshalCBOR(&buf); err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if buf.Bytes()[0] != 0xa1 {
+		t.Fatalf("header = %#x, want 0xa1 (single-entry map)", buf.Bytes()[0])
+	}
+
+	var env EnvelopedVersionState
+	if err := env.UnmarshalCBOR(bytes.NewReader(buf.Bytes())); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	got := env.State
+	if !bytes.Equal(got.Retention, st.Retention) || got.LegalHold != LegalHoldOff ||
+		got.Tags["team"] != "forge" || got.Tags["env"] != "dev" || len(got.Tags) != 2 {
+		t.Fatalf("round-trip = %+v, want %+v", got, st)
+	}
+	if got.Empty() {
+		t.Fatal("populated state reports Empty")
+	}
+	if !(&VersionState{}).Empty() {
+		t.Fatal("zero state does not report Empty")
+	}
+
+	// The strict decoders reject cross-type blocks: a value block is not a
+	// state block, and a state block is not a value block.
+	var lbuf bytes.Buffer
+	if err := LeafValue(&ObjectLeaf{Current: VersionNode{Manifest: testCid(t, "m")}}).MarshalCBOR(&lbuf); err != nil {
+		t.Fatalf("leaf marshal: %v", err)
+	}
+	if err := env.UnmarshalCBOR(bytes.NewReader(lbuf.Bytes())); err == nil {
+		t.Fatal("EnvelopedVersionState.UnmarshalCBOR(leaf block) = nil error, want rejection")
+	}
+	var val ObjectValue
+	if err := val.UnmarshalCBOR(bytes.NewReader(buf.Bytes())); err == nil {
+		t.Fatal("ObjectValue.UnmarshalCBOR(state block) = nil error, want rejection")
 	}
 }

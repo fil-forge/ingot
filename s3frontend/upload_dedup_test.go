@@ -12,6 +12,7 @@ import (
 	"github.com/fil-forge/ingot/blockstore"
 	"github.com/fil-forge/ingot/inmem"
 	"github.com/fil-forge/ingot/logstore"
+	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/uploader"
 	"github.com/fil-forge/libforge/testutil"
 	"github.com/fil-forge/ucantone/did"
@@ -82,7 +83,7 @@ func TestUploadDedup_SkipsAlreadyLocatedBlob(t *testing.T) {
 		Uploader:  up,
 		Remover:   &recordingRemover{},
 	})
-	if err := mem.Create(ctx, "bk", testutil.RandomDID(t)); err != nil {
+	if err := mem.Create(ctx, "bk", testutil.RandomDID(t), registry.CreateState{}); err != nil {
 		t.Fatalf("create bucket: %v", err)
 	}
 

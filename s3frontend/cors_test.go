@@ -11,6 +11,7 @@ import (
 
 	"github.com/fil-forge/ingot/inmem"
 	"github.com/fil-forge/ingot/internal/cors"
+	"github.com/fil-forge/ingot/registry"
 )
 
 // GetBucketCors is what makes versitygw's CORS middlewares fire at all:
@@ -27,7 +28,7 @@ func TestGetBucketCors(t *testing.T) {
 	newBackend := func(t *testing.T, corsCfg *auth.CORSConfiguration) *Backend {
 		t.Helper()
 		mem := inmem.NewMemStore()
-		if err := mem.Create(ctx, "bk", did.Undef); err != nil {
+		if err := mem.Create(ctx, "bk", did.Undef, registry.CreateState{}); err != nil {
 			t.Fatalf("create bucket: %v", err)
 		}
 		return New(Deps{Registry: mem, CORS: corsCfg})

@@ -8,6 +8,8 @@ import (
 	s3 "github.com/fil-forge/libforge/commands/s3"
 	"github.com/fil-forge/libforge/commands/s3/bucket"
 	"github.com/fil-forge/libforge/testutil"
+
+	"github.com/fil-forge/ingot/registry"
 )
 
 // TestMemStoreListBucketsPagination covers the local pagination semantics of
@@ -20,7 +22,7 @@ func TestMemStoreListBucketsPagination(t *testing.T) {
 	m := NewMemStore()
 	for _, name := range []string{"apple", "apricot", "banana", "cherry"} {
 		space := testutil.RandomDID(t)
-		if err := m.Create(ctx, name, space); err != nil {
+		if err := m.Create(ctx, name, space, registry.CreateState{}); err != nil {
 			t.Fatalf("Create %q: %v", name, err)
 		}
 	}

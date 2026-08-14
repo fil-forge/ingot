@@ -37,7 +37,19 @@ type State struct {
 	Root       cid.Cid         // current MST root; cid.Undef for empty bucket
 	ForgeRoot  cid.Cid         // last MST root whose DAG has been shipped to Forge
 	Versioning VersioningState // S3 versioning configuration
-	CreatedAt  time.Time       // set by the implementation at create time
+	// ObjectLockConfig is the bucket's object-lock configuration: the
+	// controller's auth.BucketLockConfig JSON, stored verbatim. Nil when the
+	// bucket has never been configured (docs/s3-object-lock.md §4.2).
+	ObjectLockConfig []byte
+	CreatedAt        time.Time // set by the implementation at create time
+}
+
+// CreateState is the initial bucket state Create installs, so a bucket
+// created with x-amz-bucket-object-lock-enabled is versioned and locked
+// atomically (docs/s3-object-lock.md §5).
+type CreateState struct {
+	Versioning       VersioningState // "" = unversioned
+	ObjectLockConfig []byte          // nil = no lock
 }
 
 // ListOptions selects a page of buckets.
@@ -61,9 +73,9 @@ type Page struct {
 
 // Registry tracks bucket state. All methods are safe for concurrent use.
 type Registry interface {
-	// Create inserts a new bucket, stamping its creation time. Returns
-	// ErrExists if name is taken.
-	Create(ctx context.Context, name string, space did.DID) error
+	// Create inserts a new bucket with the given initial state, stamping its
+	// creation time. Returns ErrExists if name is taken.
+	Create(ctx context.Context, name string, space did.DID, init CreateState) error
 
 	// Get returns the state of a bucket, or ErrNotFound.
 	Get(ctx context.Context, name string) (*State, error)
@@ -84,6 +96,10 @@ type Registry interface {
 	// SetVersioning updates the bucket's versioning state. Only Enabled and
 	// Suspended are settable. Returns ErrNotFound if the bucket is absent.
 	SetVersioning(ctx context.Context, name string, v VersioningState) error
+
+	// SetObjectLockConfig stores the bucket's object-lock configuration
+	// document verbatim. Returns ErrNotFound if the bucket is absent.
+	SetObjectLockConfig(ctx context.Context, name string, cfg []byte) error
 
 	// AllocVersionSeq atomically advances and returns the bucket's version
 	// ordinal (the first call returns 1; 0 is reserved to mean "none").

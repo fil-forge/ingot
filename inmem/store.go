@@ -163,18 +163,23 @@ func (m *MemStore) ListBuckets(ctx context.Context, req s3.Request) (*bucket.Lis
 
 // Registry methods ===========================================================
 
-func (m *MemStore) Create(_ context.Context, name string, space did.DID) error {
+func (m *MemStore) Create(_ context.Context, name string, space did.DID, init registry.CreateState) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, ok := m.buckets[name]; ok {
 		return registry.ErrExists
 	}
+	v := init.Versioning
+	if v == "" {
+		v = registry.VersioningUnversioned
+	}
 	// Stamped here for parity with the buckets.created_at column default.
 	m.buckets[name] = &registry.State{
-		Name:       name,
-		Space:      space,
-		Versioning: registry.VersioningUnversioned,
-		CreatedAt:  time.Now().UTC(),
+		Name:             name,
+		Space:            space,
+		Versioning:       v,
+		ObjectLockConfig: init.ObjectLockConfig,
+		CreatedAt:        time.Now().UTC(),
 	}
 	return nil
 }
@@ -237,6 +242,17 @@ func (m *MemStore) SetVersioning(_ context.Context, name string, v registry.Vers
 		return registry.ErrNotFound
 	}
 	s.Versioning = v
+	return nil
+}
+
+func (m *MemStore) SetObjectLockConfig(_ context.Context, name string, cfg []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.buckets[name]
+	if !ok {
+		return registry.ErrNotFound
+	}
+	s.ObjectLockConfig = cfg
 	return nil
 }
 

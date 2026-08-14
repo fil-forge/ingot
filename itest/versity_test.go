@@ -78,6 +78,20 @@ func TestForgeVersity(t *testing.T) {
 		{"GetBucketVersioning", getBucketVersioningPass, nil, true},
 		{"ListObjectVersions", listObjectVersionsPass, nil, true},
 		{"Versioning", versioningPass, versioningXFail, true},
+		// The object-lock partition (docs/s3-object-lock.md §11): withLock()
+		// buckets are versioning-Enabled, so these also need the versioned
+		// teardown.
+		{"PutObjectLockConfiguration", putObjectLockConfigurationPass, nil, true},
+		{"GetObjectLockConfiguration", getObjectLockConfigurationPass, nil, true},
+		{"PutObjectRetention", putObjectRetentionPass, putObjectRetentionXFail, true},
+		{"GetObjectRetention", getObjectRetentionPass, nil, true},
+		{"PutObjectLegalHold", putObjectLegalHoldPass, nil, true},
+		{"GetObjectLegalHold", getObjectLegalHoldPass, nil, true},
+		// Creation-time stamping cases whose withLock() buckets need the
+		// versioned teardown their home (plain-conf) categories can't give
+		// them (versity_lock_test.go).
+		{"LockCreation", lockCreationPass, nil, true},
+		{"WORMProtection", nil, wormProtectionXFail, true},
 		// TestListObjectVersions_VD: listing a never-versioned bucket; runs
 		// with the plain conf (the bucket stays unversioned).
 		{"ListObjectVersionsVD", listObjectVersionsVDPass, nil, false},

@@ -19,14 +19,15 @@ import (
 // /blob/release), which needs hilt ≥ #37 (blob.Remove in the write set) and
 // smelt ≥ #19 (the piri blob/release + blob/reject seed delegations).
 //
-// Excluded entirely (feature not modeled, mirroring the absent Tagging /
-// ObjectLock categories): the Versioning_* object-tagging, object-lock /
-// retention / legal-hold / WORM, GetObjectAttributes, UploadPartCopy, and
-// AccessControl (admin-API users) cases. Also excluded: the upstream
-// VersioningDisabled_{Get,Put}BucketVersioning_not_configured pair, which
-// asserts versitygw's versioning-disabled deployment mode
+// Excluded entirely (feature not modeled, mirroring the absent Tagging
+// category): the Versioning_* object-tagging, GetObjectAttributes,
+// UploadPartCopy, and AccessControl (admin-API users) cases. Also excluded:
+// the upstream VersioningDisabled_{Get,Put}BucketVersioning_not_configured
+// pair, which asserts versitygw's versioning-disabled deployment mode
 // (ErrVersioningNotConfigured) — ingot always implements versioning, so that
-// mode never exists here.
+// mode never exists here. The object-lock / retention / legal-hold /
+// versioned-WORM rows live in the tables below (docs/s3-object-lock.md §11);
+// the standalone lock groups are curated in versity_lock_test.go.
 
 var putBucketVersioningPass = []forgeCase{
 	{name: "non_existing_bucket", fn: integration.PutBucketVersioning_non_existing_bucket},
@@ -102,11 +103,42 @@ var versioningPass = []forgeCase{
 	// Multipart
 	{name: "Multipart_Upload_success", fn: integration.Versioning_Multipart_Upload_success},
 	{name: "Multipart_Upload_overwrite_an_object", fn: integration.Versioning_Multipart_Upload_overwrite_an_object},
+	// DeleteObjects on a withLock() bucket (docs/s3-object-lock.md §11).
+	{name: "DeleteObject_non_existing_objects", fn: integration.Versioning_DeleteObject_non_existing_objects},
+	// Object lock configuration (docs/s3-object-lock.md §5)
+	{name: "object_lock_not_enabled_on_bucket_creation", fn: integration.Versioning_object_lock_not_enabled_on_bucket_creation},
+	{name: "Enable_object_lock", fn: integration.Versioning_Enable_object_lock},
+	{name: "status_switch_to_suspended_with_object_lock", fn: integration.Versioning_status_switch_to_suspended_with_object_lock},
+	// Retention (docs/s3-object-lock.md §6)
+	{name: "PutObjectRetention_invalid_versionId", fn: integration.Versioning_PutObjectRetention_invalid_versionId},
+	{name: "PutObjectRetention_non_existing_object_version", fn: integration.Versioning_PutObjectRetention_non_existing_object_version},
+	{name: "GetObjectRetention_invalid_versionId", fn: integration.Versioning_GetObjectRetention_invalid_versionId},
+	{name: "GetObjectRetention_non_existing_object_version", fn: integration.Versioning_GetObjectRetention_non_existing_object_version},
+	{name: "Put_GetObjectRetention_delete_marker", fn: integration.Versioning_Put_GetObjectRetention_delete_marker},
+	{name: "Put_GetObjectRetention_success", fn: integration.Versioning_Put_GetObjectRetention_success},
+	// Legal hold (docs/s3-object-lock.md §6)
+	{name: "PutObjectLegalHold_invalid_versionId", fn: integration.Versioning_PutObjectLegalHold_invalid_versionId},
+	{name: "PutObjectLegalHold_non_existing_object_version", fn: integration.Versioning_PutObjectLegalHold_non_existing_object_version},
+	{name: "GetObjectLegalHold_invalid_versionId", fn: integration.Versioning_GetObjectLegalHold_invalid_versionId},
+	{name: "GetObjectLegalHold_non_existing_object_version", fn: integration.Versioning_GetObjectLegalHold_non_existing_object_version},
+	{name: "PutGetObjectLegalHold_delete_marker", fn: integration.Versioning_PutGetObjectLegalHold_delete_marker},
+	{name: "Put_GetObjectLegalHold_success", fn: integration.Versioning_Put_GetObjectLegalHold_success},
+	// Versioned WORM: enforcement through CheckObjectAccess against real
+	// versions — version-scoped deletes of locked versions refuse, overwrites
+	// and marker insertion stack versions (docs/s3-object-lock.md §11).
+	{name: "WORM_obj_version_locked_with_legal_hold", fn: integration.Versioning_WORM_obj_version_locked_with_legal_hold},
+	{name: "WORM_obj_version_locked_with_governance_retention", fn: integration.Versioning_WORM_obj_version_locked_with_governance_retention},
+	{name: "WORM_obj_version_locked_with_compliance_retention", fn: integration.Versioning_WORM_obj_version_locked_with_compliance_retention},
+	{name: "WORM_delete_marker_locked_object_legal_hold", fn: integration.Versioning_WORM_delete_marker_locked_object_legal_hold},
+	{name: "WORM_delete_marker_locked_object_governance_retention", fn: integration.Versioning_WORM_delete_marker_locked_object_governance_retention},
+	{name: "WORM_delete_marker_locked_object_compliance_retention", fn: integration.Versioning_WORM_delete_marker_locked_object_compliance_retention},
+	{name: "WORM_PutObject_overwrite_locked_object", fn: integration.Versioning_WORM_PutObject_overwrite_locked_object},
+	{name: "WORM_CopyObject_overwrite_locked_object", fn: integration.Versioning_WORM_CopyObject_overwrite_locked_object},
+	{name: "WORM_CompleteMultipartUpload_overwrite_locked_object", fn: integration.Versioning_WORM_CompleteMultipartUpload_overwrite_locked_object},
+	{name: "WORM_remove_delete_marker_under_bucket_default_retention", fn: integration.Versioning_WORM_remove_delete_marker_under_bucket_default_retention},
 }
 
-var versioningXFail = []forgeCase{
-	// Upstream creates its bucket withLock(), and ingot does not model
-	// object-lock creation (which on AWS auto-enables versioning), so the
-	// versionId echo assertions fail before teardown.
-	{name: "DeleteObject_non_existing_objects", fn: integration.Versioning_DeleteObject_non_existing_objects},
-}
+// versioningXFail is empty: DeleteObject_non_existing_objects moved to the
+// pass table with object-lock creation support. Kept non-nil so the category
+// registration stays stable when rows return.
+var versioningXFail []forgeCase
