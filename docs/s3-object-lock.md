@@ -470,7 +470,8 @@ unchanged:
   stored beside `object_lock_config`, registry-shaped like every bucket-level configuration.
   The lock code needs no change when it lands (§10).
 - **Object tagging**: its `Tags` field is reserved on `VersionState` (§4.1), so tagging adds
-  handlers and conformance rows, not format.
+  handlers and conformance rows, not format. Specified in
+  [`s3-object-tagging.md`](./s3-object-tagging.md).
 - **ACL grants on lock operations**, and per-version object ACLs generally: a mutable
   per-version document is the shape `VersionState` hosts by an additive field and an arm
   bump.
