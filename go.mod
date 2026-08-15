@@ -4,7 +4,7 @@ go 1.26.4
 
 require (
 	github.com/aws/aws-sdk-go-v2 v1.43.5
-	github.com/aws/aws-sdk-go-v2/config v1.32.34
+	github.com/aws/aws-sdk-go-v2/config v1.32.36
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.35
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.106.4
 	github.com/fil-forge/hilt v0.0.1-0.20260806121322-c6afc4fedeab
