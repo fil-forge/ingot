@@ -11,18 +11,19 @@ import (
 )
 
 // In-memory implementations of the architecture's relational stores
-// (registry.BlobRefStore / IntentStore / LocationStore / MultipartStore /
-// GCStore), mirroring the Postgres tables so the in-process suite and
-// standalone mode exercise the same write/read/delete code paths.
+// (registry.BlobRefStore / IntentStore / LocationStore / EncryptionParamsStore /
+// MultipartStore / GCStore), mirroring the Postgres tables so the in-process
+// suite and standalone mode exercise the same write/read/delete code paths.
 
 // Compile-time assertions: *MemStore satisfies every store interface.
 var (
-	_ registry.BlobRefStore   = (*MemStore)(nil)
-	_ registry.IntentStore    = (*MemStore)(nil)
-	_ registry.LocationStore  = (*MemStore)(nil)
-	_ registry.InclusionStore = (*MemStore)(nil)
-	_ registry.MultipartStore = (*MemStore)(nil)
-	_ registry.GCStore        = (*MemStore)(nil)
+	_ registry.BlobRefStore          = (*MemStore)(nil)
+	_ registry.IntentStore           = (*MemStore)(nil)
+	_ registry.LocationStore         = (*MemStore)(nil)
+	_ registry.EncryptionParamsStore = (*MemStore)(nil)
+	_ registry.InclusionStore        = (*MemStore)(nil)
+	_ registry.MultipartStore        = (*MemStore)(nil)
+	_ registry.GCStore               = (*MemStore)(nil)
 )
 
 func cloneBytes(b []byte) []byte {
@@ -123,10 +124,6 @@ func (m *MemStore) DeleteIntent(_ context.Context, digest []byte) error {
 // LocationStore ==============================================================
 
 func (m *MemStore) PutLocation(_ context.Context, loc registry.BlobLocation) error {
-	// Match the Postgres store: reject a partial FEE set (see ValidateFEE).
-	if err := loc.ValidateFEE(); err != nil {
-		return err
-	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.locations[locKey{loc.Space, string(loc.Digest)}] = cloneLocation(loc)
@@ -148,6 +145,37 @@ func (m *MemStore) DeleteLocation(_ context.Context, space did.DID, digest []byt
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.locations, locKey{space, string(digest)})
+	return nil
+}
+
+// EncryptionParamsStore ======================================================
+
+func (m *MemStore) PutEncryptionParams(_ context.Context, params registry.BlobEncryptionParams) error {
+	// Match the Postgres store, whose columns are all NOT NULL.
+	if err := params.Validate(); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.encParams[locKey{params.Space, string(params.Digest)}] = cloneEncryptionParams(params)
+	return nil
+}
+
+func (m *MemStore) GetEncryptionParams(_ context.Context, space did.DID, digest []byte) (*registry.BlobEncryptionParams, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	params, ok := m.encParams[locKey{space, string(digest)}]
+	if !ok {
+		return nil, registry.ErrNotFound
+	}
+	cp := cloneEncryptionParams(params)
+	return &cp, nil
+}
+
+func (m *MemStore) DeleteEncryptionParams(_ context.Context, space did.DID, digest []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.encParams, locKey{space, string(digest)})
 	return nil
 }
 
@@ -387,15 +415,22 @@ func cloneSession(s registry.MultipartSession) registry.MultipartSession {
 	return s
 }
 
-// cloneLocation deep-copies a BlobLocation's byte-slice fields (the digest and
-// the FEE wrap material) so the stored copy and any returned copy never alias
-// the caller's slices. Nil slices stay nil, preserving "unencrypted blob".
+// cloneLocation deep-copies a BlobLocation's digest so the stored copy and any
+// returned copy never alias the caller's slice.
 func cloneLocation(loc registry.BlobLocation) registry.BlobLocation {
 	loc.Digest = cloneBytes(loc.Digest)
-	loc.RegionWrappedCEK = cloneBytes(loc.RegionWrappedCEK)
-	loc.BaseNonce = cloneBytes(loc.BaseNonce)
-	loc.ProtectedHeader = cloneBytes(loc.ProtectedHeader)
 	return loc
+}
+
+// cloneEncryptionParams deep-copies a BlobEncryptionParams' byte-slice fields —
+// the digest and the key material — so the stored copy and any returned copy
+// never alias the caller's slices.
+func cloneEncryptionParams(p registry.BlobEncryptionParams) registry.BlobEncryptionParams {
+	p.Digest = cloneBytes(p.Digest)
+	p.RegionWrappedCEK = cloneBytes(p.RegionWrappedCEK)
+	p.BaseNonce = cloneBytes(p.BaseNonce)
+	p.AAD = cloneBytes(p.AAD)
+	return p
 }
 
 func clonePart(p registry.MultipartPart) registry.MultipartPart {

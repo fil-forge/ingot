@@ -3,6 +3,7 @@ package inmem
 import (
 	"context"
 	"errors"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -243,11 +244,6 @@ func TestLocations_RoundTrip(t *testing.T) {
 	if loc.URL != "http://piri/blob" || loc.Size != 100 || loc.Provider != "did:piri:1" {
 		t.Fatalf("GetLocation = %+v", loc)
 	}
-	// An unencrypted blob carries no FEE wrap material.
-	if loc.RegionWrappedCEK != nil || loc.BaseNonce != nil || loc.ProtectedHeader != nil ||
-		loc.RegionKeyVersion != "" || loc.TenantRecipientKID != "" || loc.ChunkSize != 0 {
-		t.Fatalf("unencrypted location carries wrap material: %+v", loc)
-	}
 	if _, err := m.GetLocation(ctx, testutil.RandomDID(t), digest); err != registry.ErrNotFound {
 		t.Fatalf("GetLocation wrong space err = %v, want ErrNotFound", err)
 	}
@@ -259,105 +255,196 @@ func TestLocations_RoundTrip(t *testing.T) {
 	}
 }
 
-// TestLocations_FEEWrapMaterial round-trips the FEE wrap columns and verifies
-// that (a) the stored copy does not alias the caller's byte slices, (b) a
-// returned copy does not either, and (c) a re-wrap in place (a PutLocation with
-// a new RegionWrappedCEK/RegionKeyVersion) updates only the wrap material.
-func TestLocations_FEEWrapMaterial(t *testing.T) {
+// feeParams returns a complete parameter set for space/digest, the shape a FEE
+// envelope's row takes.
+func feeParams(space did.DID, digest []byte) registry.BlobEncryptionParams {
+	return registry.BlobEncryptionParams{
+		Space:              space,
+		Digest:             digest,
+		RegionWrappedCEK:   []byte("wrapped-cek"),
+		RegionKeyVersion:   "region-v1",
+		TenantRecipientKID: "did:key:tenant#wrap",
+		HeaderLen:          212,
+		BaseNonce:          []byte("nonce07"),
+		ChunkSize:          65536,
+		AAD:                []byte("cose-enc-structure"),
+	}
+}
+
+func TestEncryptionParams_RoundTrip(t *testing.T) {
 	ctx := context.Background()
 	m := NewMemStore()
 	space := testutil.RandomDID(t)
 	digest := []byte("enc-digest")
+	want := feeParams(space, digest)
 
-	enc := registry.BlobLocation{
-		Space: space, Digest: digest, Provider: "did:piri:1", URL: "http://piri/enc", Size: 4096,
-		RegionWrappedCEK:   []byte("wrapped-cek"),
-		RegionKeyVersion:   "region-v1",
-		TenantRecipientKID: "did:key:tenant#wrap",
-		BaseNonce:          []byte("nonce07"),
-		ChunkSize:          65536,
-		ProtectedHeader:    []byte("cose-protected"),
+	if err := m.PutEncryptionParams(ctx, want); err != nil {
+		t.Fatalf("PutEncryptionParams: %v", err)
 	}
-	if err := m.PutLocation(ctx, enc); err != nil {
-		t.Fatalf("PutLocation: %v", err)
-	}
-
-	// Mutating the caller's slices after Put must not corrupt the store.
-	enc.RegionWrappedCEK[0] = 'X'
-	enc.BaseNonce[0] = 'X'
-	enc.ProtectedHeader[0] = 'X'
-
-	got, err := m.GetLocation(ctx, space, digest)
+	got, err := m.GetEncryptionParams(ctx, space, digest)
 	if err != nil {
-		t.Fatalf("GetLocation: %v", err)
+		t.Fatalf("GetEncryptionParams: %v", err)
 	}
-	if string(got.RegionWrappedCEK) != "wrapped-cek" || string(got.BaseNonce) != "nonce07" ||
-		string(got.ProtectedHeader) != "cose-protected" {
-		t.Fatalf("store aliased caller slices: %+v", got)
-	}
-	if got.RegionKeyVersion != "region-v1" || got.TenantRecipientKID != "did:key:tenant#wrap" || got.ChunkSize != 65536 {
-		t.Fatalf("GetLocation wrap scalars = %+v", got)
-	}
-
-	// Mutating a returned copy must not corrupt the store either.
-	got.RegionWrappedCEK[0] = 'Y'
-	again, _ := m.GetLocation(ctx, space, digest)
-	if string(again.RegionWrappedCEK) != "wrapped-cek" {
-		t.Fatalf("store mutated through returned slice: %q", again.RegionWrappedCEK)
-	}
-
-	// Re-wrap in place: new CEK + key version, same location, other fields kept.
-	rewrapped := *again
-	rewrapped.RegionWrappedCEK = []byte("wrapped-cek-v2")
-	rewrapped.RegionKeyVersion = "region-v2"
-	if err := m.PutLocation(ctx, rewrapped); err != nil {
-		t.Fatalf("PutLocation (re-wrap): %v", err)
-	}
-	after, err := m.GetLocation(ctx, space, digest)
-	if err != nil {
-		t.Fatalf("GetLocation after re-wrap: %v", err)
-	}
-	if string(after.RegionWrappedCEK) != "wrapped-cek-v2" || after.RegionKeyVersion != "region-v2" {
-		t.Fatalf("re-wrap did not take: %+v", after)
-	}
-	if after.URL != "http://piri/enc" || string(after.BaseNonce) != "nonce07" || after.ChunkSize != 65536 {
-		t.Fatalf("re-wrap disturbed non-wrap fields: %+v", after)
+	if !reflect.DeepEqual(*got, want) {
+		t.Fatalf("GetEncryptionParams = %+v, want %+v", *got, want)
 	}
 }
 
-// TestLocations_PartialFEE_Rejected verifies the all-or-nothing FEE invariant:
-// a location with some but not all wrap material is rejected with ErrPartialFEE
-// and never persisted, while a fully-absent (unencrypted) row is accepted.
-func TestLocations_PartialFEE_Rejected(t *testing.T) {
+// A blob with no row is a plaintext blob, which is how the read path learns not
+// to decrypt.
+func TestEncryptionParams_MissingIsNotFound(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+
+	_, err := m.GetEncryptionParams(ctx, testutil.RandomDID(t), []byte("absent"))
+	if !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("GetEncryptionParams err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestEncryptionParams_DeleteShreds(t *testing.T) {
 	ctx := context.Background()
 	m := NewMemStore()
 	space := testutil.RandomDID(t)
-	base := registry.BlobLocation{Space: space, Digest: []byte("d"), Provider: "did:piri", URL: "u", Size: 10}
-
-	partials := map[string]func(*registry.BlobLocation){
-		"only wrapped CEK": func(l *registry.BlobLocation) { l.RegionWrappedCEK = []byte("cek") },
-		"only key version": func(l *registry.BlobLocation) { l.RegionKeyVersion = "v1" },
-		"only chunk size":  func(l *registry.BlobLocation) { l.ChunkSize = 4096 },
-		"missing protected": func(l *registry.BlobLocation) {
-			l.RegionWrappedCEK, l.RegionKeyVersion, l.TenantRecipientKID = []byte("cek"), "v1", "kid"
-			l.BaseNonce, l.ChunkSize = []byte("nonce07"), 4096 // ProtectedHeader left empty
-		},
-	}
-	for name, mutate := range partials {
-		loc := base
-		mutate(&loc)
-		if err := m.PutLocation(ctx, loc); !errors.Is(err, registry.ErrPartialFEE) {
-			t.Fatalf("PutLocation(%s) err = %v, want ErrPartialFEE", name, err)
-		}
-		// Nothing should have been stored.
-		if _, err := m.GetLocation(ctx, space, []byte("d")); !errors.Is(err, registry.ErrNotFound) {
-			t.Fatalf("partial FEE (%s) leaked a row", name)
-		}
+	digest := []byte("enc-digest")
+	if err := m.PutEncryptionParams(ctx, feeParams(space, digest)); err != nil {
+		t.Fatalf("PutEncryptionParams: %v", err)
 	}
 
-	// Fully absent (unencrypted) is accepted.
-	if err := m.PutLocation(ctx, base); err != nil {
-		t.Fatalf("PutLocation(unencrypted): %v", err)
+	if err := m.DeleteEncryptionParams(ctx, space, digest); err != nil {
+		t.Fatalf("DeleteEncryptionParams: %v", err)
+	}
+	if _, err := m.GetEncryptionParams(ctx, space, digest); !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("GetEncryptionParams after delete err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestEncryptionParams_DeleteIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+
+	if err := m.DeleteEncryptionParams(ctx, testutil.RandomDID(t), []byte("absent")); err != nil {
+		t.Fatalf("DeleteEncryptionParams(absent): %v", err)
+	}
+}
+
+// The store must not alias the caller's key material, nor let a caller reach
+// back into it through a returned copy.
+func TestEncryptionParams_NoSliceAliasing(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+	space := testutil.RandomDID(t)
+	digest := []byte("enc-digest")
+	params := feeParams(space, digest)
+
+	if err := m.PutEncryptionParams(ctx, params); err != nil {
+		t.Fatalf("PutEncryptionParams: %v", err)
+	}
+	params.RegionWrappedCEK[0] = 'X'
+	params.BaseNonce[0] = 'X'
+	params.AAD[0] = 'X'
+
+	got, err := m.GetEncryptionParams(ctx, space, digest)
+	if err != nil {
+		t.Fatalf("GetEncryptionParams: %v", err)
+	}
+	got.RegionWrappedCEK[0] = 'Y'
+
+	again, err := m.GetEncryptionParams(ctx, space, digest)
+	if err != nil {
+		t.Fatalf("GetEncryptionParams (again): %v", err)
+	}
+	if !reflect.DeepEqual(*again, feeParams(space, digest)) {
+		t.Fatalf("stored params were aliased: %+v", *again)
+	}
+}
+
+// A region-key rotation re-wraps in place: same blob, new CEK + key version,
+// every other parameter untouched.
+func TestEncryptionParams_RewrapInPlace(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+	space := testutil.RandomDID(t)
+	digest := []byte("enc-digest")
+	if err := m.PutEncryptionParams(ctx, feeParams(space, digest)); err != nil {
+		t.Fatalf("PutEncryptionParams: %v", err)
+	}
+
+	want := feeParams(space, digest)
+	want.RegionWrappedCEK = []byte("wrapped-cek-v2")
+	want.RegionKeyVersion = "region-v2"
+	if err := m.PutEncryptionParams(ctx, want); err != nil {
+		t.Fatalf("PutEncryptionParams (re-wrap): %v", err)
+	}
+
+	got, err := m.GetEncryptionParams(ctx, space, digest)
+	if err != nil {
+		t.Fatalf("GetEncryptionParams: %v", err)
+	}
+	if !reflect.DeepEqual(*got, want) {
+		t.Fatalf("after re-wrap = %+v, want %+v", *got, want)
+	}
+}
+
+// Every parameter is required: a row missing any one of them could not be
+// decrypted with, so PutEncryptionParams rejects it and stores nothing.
+func TestEncryptionParams_IncompleteRejected(t *testing.T) {
+	space := testutil.RandomDID(t)
+	digest := []byte("enc-digest")
+
+	cases := []struct {
+		name   string
+		mutate func(*registry.BlobEncryptionParams)
+	}{
+		{"no space", func(p *registry.BlobEncryptionParams) { p.Space = did.Undef }},
+		{"no digest", func(p *registry.BlobEncryptionParams) { p.Digest = nil }},
+		{"no wrapped CEK", func(p *registry.BlobEncryptionParams) { p.RegionWrappedCEK = nil }},
+		{"empty wrapped CEK", func(p *registry.BlobEncryptionParams) { p.RegionWrappedCEK = []byte{} }},
+		{"no key version", func(p *registry.BlobEncryptionParams) { p.RegionKeyVersion = "" }},
+		{"no recipient kid", func(p *registry.BlobEncryptionParams) { p.TenantRecipientKID = "" }},
+		{"no header length", func(p *registry.BlobEncryptionParams) { p.HeaderLen = 0 }},
+		{"no base nonce", func(p *registry.BlobEncryptionParams) { p.BaseNonce = nil }},
+		{"no chunk size", func(p *registry.BlobEncryptionParams) { p.ChunkSize = 0 }},
+		{"no AAD", func(p *registry.BlobEncryptionParams) { p.AAD = nil }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			m := NewMemStore()
+			params := feeParams(space, digest)
+			tc.mutate(&params)
+
+			if err := m.PutEncryptionParams(ctx, params); !errors.Is(err, registry.ErrInvalidEncryptionParams) {
+				t.Fatalf("PutEncryptionParams err = %v, want ErrInvalidEncryptionParams", err)
+			}
+			if _, err := m.GetEncryptionParams(ctx, space, digest); !errors.Is(err, registry.ErrNotFound) {
+				t.Fatalf("incomplete params leaked a row")
+			}
+		})
+	}
+}
+
+// The two tables have independent lifecycles and no cascade between them:
+// deleting a location leaves the encryption parameters in place, which is why a
+// caller removing a blob must delete both.
+func TestEncryptionParams_IndependentOfLocation(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+	space := testutil.RandomDID(t)
+	digest := []byte("enc-digest")
+	if err := m.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: digest, Provider: "did:piri:1", URL: "http://piri/enc", Size: 4096}); err != nil {
+		t.Fatalf("PutLocation: %v", err)
+	}
+	if err := m.PutEncryptionParams(ctx, feeParams(space, digest)); err != nil {
+		t.Fatalf("PutEncryptionParams: %v", err)
+	}
+
+	if err := m.DeleteLocation(ctx, space, digest); err != nil {
+		t.Fatalf("DeleteLocation: %v", err)
+	}
+
+	if _, err := m.GetEncryptionParams(ctx, space, digest); err != nil {
+		t.Fatalf("DeleteLocation shredded the encryption params: %v", err)
 	}
 }
 

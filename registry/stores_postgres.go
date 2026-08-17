@@ -14,12 +14,13 @@ import (
 
 // Compile-time assertions: *Postgres satisfies every store interface.
 var (
-	_ BlobRefStore   = (*Postgres)(nil)
-	_ IntentStore    = (*Postgres)(nil)
-	_ LocationStore  = (*Postgres)(nil)
-	_ InclusionStore = (*Postgres)(nil)
-	_ MultipartStore = (*Postgres)(nil)
-	_ GCStore        = (*Postgres)(nil)
+	_ BlobRefStore          = (*Postgres)(nil)
+	_ IntentStore           = (*Postgres)(nil)
+	_ LocationStore         = (*Postgres)(nil)
+	_ EncryptionParamsStore = (*Postgres)(nil)
+	_ InclusionStore        = (*Postgres)(nil)
+	_ MultipartStore        = (*Postgres)(nil)
+	_ GCStore               = (*Postgres)(nil)
 )
 
 // BlobRefStore ===============================================================
@@ -146,31 +147,12 @@ func (r *Postgres) DeleteIntent(ctx context.Context, digest []byte) error {
 // LocationStore ==============================================================
 
 func (r *Postgres) PutLocation(ctx context.Context, loc BlobLocation) error {
-	// Reject a partial FEE set before it reaches storage (see ValidateFEE).
-	if err := loc.ValidateFEE(); err != nil {
-		return err
-	}
-	// The FEE columns are nullable: an unencrypted blob writes them NULL (nullBytes
-	// / nullString / nullInt64 map empty/zero to NULL, so an empty-but-non-nil
-	// slice never lands as a non-NULL empty bytea). The upsert overwrites the whole
-	// row state, so a rotation re-wrap is a read-modify-write of the full record.
 	_, err := r.pool.Exec(ctx,
-		`INSERT INTO ingot.blob_locations
-		   (space, digest, provider, url, size,
-		    region_wrapped_cek, region_key_version, tenant_recipient_kid,
-		    base_nonce, chunk_size, protected_header)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		`INSERT INTO ingot.blob_locations (space, digest, provider, url, size)
+		 VALUES ($1, $2, $3, $4, $5)
 		 ON CONFLICT (space, digest) DO UPDATE
-		   SET provider = EXCLUDED.provider, url = EXCLUDED.url, size = EXCLUDED.size,
-		       region_wrapped_cek   = EXCLUDED.region_wrapped_cek,
-		       region_key_version   = EXCLUDED.region_key_version,
-		       tenant_recipient_kid = EXCLUDED.tenant_recipient_kid,
-		       base_nonce           = EXCLUDED.base_nonce,
-		       chunk_size           = EXCLUDED.chunk_size,
-		       protected_header     = EXCLUDED.protected_header`,
-		loc.Space, loc.Digest, loc.Provider, loc.URL, loc.Size,
-		nullBytes(loc.RegionWrappedCEK), nullString(loc.RegionKeyVersion), nullString(loc.TenantRecipientKID),
-		nullBytes(loc.BaseNonce), nullInt64(loc.ChunkSize), nullBytes(loc.ProtectedHeader))
+		   SET provider = EXCLUDED.provider, url = EXCLUDED.url, size = EXCLUDED.size`,
+		loc.Space, loc.Digest, loc.Provider, loc.URL, loc.Size)
 	if err != nil {
 		return fmt.Errorf("registry: put location: %w", err)
 	}
@@ -179,30 +161,15 @@ func (r *Postgres) PutLocation(ctx context.Context, loc BlobLocation) error {
 
 func (r *Postgres) GetLocation(ctx context.Context, space did.DID, digest []byte) (*BlobLocation, error) {
 	loc := &BlobLocation{Space: space, Digest: digest}
-	var regionKeyVersion, tenantRecipientKID *string
-	var chunkSize *int64
 	err := r.pool.QueryRow(ctx,
-		`SELECT provider, url, size,
-		        region_wrapped_cek, region_key_version, tenant_recipient_kid,
-		        base_nonce, chunk_size, protected_header
+		`SELECT provider, url, size
 		 FROM ingot.blob_locations WHERE space = $1 AND digest = $2`,
-		space, digest).Scan(&loc.Provider, &loc.URL, &loc.Size,
-		&loc.RegionWrappedCEK, &regionKeyVersion, &tenantRecipientKID,
-		&loc.BaseNonce, &chunkSize, &loc.ProtectedHeader)
+		space, digest).Scan(&loc.Provider, &loc.URL, &loc.Size)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
 		return nil, fmt.Errorf("registry: get location: %w", err)
-	}
-	if regionKeyVersion != nil {
-		loc.RegionKeyVersion = *regionKeyVersion
-	}
-	if tenantRecipientKID != nil {
-		loc.TenantRecipientKID = *tenantRecipientKID
-	}
-	if chunkSize != nil {
-		loc.ChunkSize = *chunkSize
 	}
 	return loc, nil
 }
@@ -212,6 +179,63 @@ func (r *Postgres) DeleteLocation(ctx context.Context, space did.DID, digest []b
 		`DELETE FROM ingot.blob_locations WHERE space = $1 AND digest = $2`, space, digest)
 	if err != nil {
 		return fmt.Errorf("registry: delete location: %w", err)
+	}
+	return nil
+}
+
+// EncryptionParamsStore ======================================================
+
+func (r *Postgres) PutEncryptionParams(ctx context.Context, params BlobEncryptionParams) error {
+	// Every column is NOT NULL, so reject an incomplete set with a named error
+	// rather than a constraint violation (see BlobEncryptionParams.Validate).
+	if err := params.Validate(); err != nil {
+		return err
+	}
+	// Upsert: a rotation re-wrap replaces the material for a blob already stored.
+	_, err := r.pool.Exec(ctx,
+		`INSERT INTO ingot.blob_encryption_params
+		   (space, digest, region_wrapped_cek, region_key_version, tenant_recipient_kid,
+		    header_len, base_nonce, chunk_size, aad)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		 ON CONFLICT (space, digest) DO UPDATE
+		   SET region_wrapped_cek   = EXCLUDED.region_wrapped_cek,
+		       region_key_version   = EXCLUDED.region_key_version,
+		       tenant_recipient_kid = EXCLUDED.tenant_recipient_kid,
+		       header_len           = EXCLUDED.header_len,
+		       base_nonce           = EXCLUDED.base_nonce,
+		       chunk_size           = EXCLUDED.chunk_size,
+		       aad                  = EXCLUDED.aad`,
+		params.Space, params.Digest, params.RegionWrappedCEK, params.RegionKeyVersion,
+		params.TenantRecipientKID, params.HeaderLen, params.BaseNonce, params.ChunkSize, params.AAD)
+	if err != nil {
+		return fmt.Errorf("registry: put encryption params: %w", err)
+	}
+	return nil
+}
+
+func (r *Postgres) GetEncryptionParams(ctx context.Context, space did.DID, digest []byte) (*BlobEncryptionParams, error) {
+	params := &BlobEncryptionParams{Space: space, Digest: digest}
+	err := r.pool.QueryRow(ctx,
+		`SELECT region_wrapped_cek, region_key_version, tenant_recipient_kid,
+		        header_len, base_nonce, chunk_size, aad
+		 FROM ingot.blob_encryption_params WHERE space = $1 AND digest = $2`,
+		space, digest).Scan(&params.RegionWrappedCEK, &params.RegionKeyVersion,
+		&params.TenantRecipientKID, &params.HeaderLen, &params.BaseNonce,
+		&params.ChunkSize, &params.AAD)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("registry: get encryption params: %w", err)
+	}
+	return params, nil
+}
+
+func (r *Postgres) DeleteEncryptionParams(ctx context.Context, space did.DID, digest []byte) error {
+	_, err := r.pool.Exec(ctx,
+		`DELETE FROM ingot.blob_encryption_params WHERE space = $1 AND digest = $2`, space, digest)
+	if err != nil {
+		return fmt.Errorf("registry: delete encryption params: %w", err)
 	}
 	return nil
 }
@@ -530,26 +554,6 @@ func nullString(s string) *string {
 		return nil
 	}
 	return &s
-}
-
-// nullInt64 maps 0 to a SQL NULL so an optional bigint column stays NULL rather
-// than storing 0. Used for blob_locations.chunk_size, which is 0 (absent) for an
-// unencrypted blob and always positive for a FEE envelope.
-func nullInt64(n int64) *int64 {
-	if n == 0 {
-		return nil
-	}
-	return &n
-}
-
-// nullBytes maps an empty (nil or zero-length) slice to a SQL NULL so an
-// optional bytea column stays NULL rather than storing a non-NULL empty value.
-// Used for the FEE wrap columns, whose absence must read back as nil.
-func nullBytes(b []byte) []byte {
-	if len(b) == 0 {
-		return nil
-	}
-	return b
 }
 
 func marshalMetadata(m map[string]string) ([]byte, error) {

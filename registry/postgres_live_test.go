@@ -1,10 +1,10 @@
 package registry_test
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"os"
+	"reflect"
 	"testing"
 	"time"
 
@@ -52,7 +52,8 @@ func TestPostgresStores_Live(t *testing.T) {
 	}
 	if _, err := pool.Exec(ctx,
 		`TRUNCATE ingot.blob_refs, ingot.upload_intents, ingot.blob_locations,
-		 ingot.multipart_sessions, ingot.multipart_parts, ingot.gc_candidates, ingot.buckets CASCADE`); err != nil {
+		 ingot.blob_encryption_params, ingot.multipart_sessions, ingot.multipart_parts,
+		 ingot.gc_candidates, ingot.buckets CASCADE`); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
 
@@ -138,7 +139,6 @@ func TestPostgresStores_Live(t *testing.T) {
 	})
 
 	t.Run("location round trip", func(t *testing.T) {
-		// Unencrypted blob: the FEE wrap columns store as NULL and read back zero.
 		space := testutil.RandomDID(t)
 		if err := r.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: digest, Provider: "did:piri", URL: "http://piri/b", Size: 100}); err != nil {
 			t.Fatalf("PutLocation: %v", err)
@@ -146,10 +146,6 @@ func TestPostgresStores_Live(t *testing.T) {
 		loc, err := r.GetLocation(ctx, space, digest)
 		if err != nil || loc.URL != "http://piri/b" || loc.Size != 100 {
 			t.Fatalf("GetLocation = %+v, err %v", loc, err)
-		}
-		if loc.RegionWrappedCEK != nil || loc.BaseNonce != nil || loc.ProtectedHeader != nil ||
-			loc.RegionKeyVersion != "" || loc.TenantRecipientKID != "" || loc.ChunkSize != 0 {
-			t.Fatalf("unencrypted location read back wrap material (NULL round-trip): %+v", loc)
 		}
 		if err := r.DeleteLocation(ctx, space, digest); err != nil {
 			t.Fatalf("DeleteLocation: %v", err)
@@ -159,66 +155,103 @@ func TestPostgresStores_Live(t *testing.T) {
 		}
 	})
 
-	t.Run("location FEE wrap material", func(t *testing.T) {
-		// Binary bytea (with an embedded NUL) exercises real byte round-trips.
-		space := testutil.RandomDID(t)
-		encDigest := []byte{0x00, 0x01, 0x02, 0xff}
-		enc := registry.BlobLocation{
-			Space: space, Digest: encDigest, Provider: "did:piri", URL: "http://piri/enc", Size: 4096,
+	// liveFEEParams is a complete parameter set whose bytea values carry
+	// embedded NULs and high bytes, to exercise real byte round-trips.
+	liveFEEParams := func(space did.DID, d []byte) registry.BlobEncryptionParams {
+		return registry.BlobEncryptionParams{
+			Space:              space,
+			Digest:             d,
 			RegionWrappedCEK:   []byte{0x00, 0xde, 0xad, 0xbe, 0xef},
 			RegionKeyVersion:   "region-v1",
 			TenantRecipientKID: "did:key:tenant#wrap",
+			HeaderLen:          212,
 			BaseNonce:          []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07},
 			ChunkSize:          65536,
-			ProtectedHeader:    []byte{0xa1, 0x00, 0x18, 0x20},
+			AAD:                []byte{0xa1, 0x00, 0x18, 0x20},
 		}
-		if err := r.PutLocation(ctx, enc); err != nil {
-			t.Fatalf("PutLocation (encrypted): %v", err)
-		}
-		got, err := r.GetLocation(ctx, space, encDigest)
-		if err != nil {
-			t.Fatalf("GetLocation (encrypted): %v", err)
-		}
-		if !bytes.Equal(got.RegionWrappedCEK, enc.RegionWrappedCEK) ||
-			!bytes.Equal(got.BaseNonce, enc.BaseNonce) ||
-			!bytes.Equal(got.ProtectedHeader, enc.ProtectedHeader) {
-			t.Fatalf("bytea wrap material round-trip mismatch: %+v", got)
-		}
-		if got.RegionKeyVersion != "region-v1" || got.TenantRecipientKID != "did:key:tenant#wrap" || got.ChunkSize != 65536 {
-			t.Fatalf("wrap scalar round-trip mismatch: %+v", got)
-		}
+	}
 
-		// Re-wrap in place: a PutLocation upsert swaps the CEK + key version.
-		got.RegionWrappedCEK = []byte{0x11, 0x22, 0x33}
-		got.RegionKeyVersion = "region-v2"
-		if err := r.PutLocation(ctx, *got); err != nil {
-			t.Fatalf("PutLocation (re-wrap): %v", err)
+	t.Run("encryption params round trip", func(t *testing.T) {
+		space := testutil.RandomDID(t)
+		encDigest := []byte{0x00, 0x01, 0x02, 0xff}
+		want := liveFEEParams(space, encDigest)
+		if err := r.PutEncryptionParams(ctx, want); err != nil {
+			t.Fatalf("PutEncryptionParams: %v", err)
 		}
-		after, err := r.GetLocation(ctx, space, encDigest)
-		if err != nil || !bytes.Equal(after.RegionWrappedCEK, []byte{0x11, 0x22, 0x33}) || after.RegionKeyVersion != "region-v2" {
-			t.Fatalf("re-wrap round-trip = %+v, err %v", after, err)
+		got, err := r.GetEncryptionParams(ctx, space, encDigest)
+		if err != nil {
+			t.Fatalf("GetEncryptionParams: %v", err)
 		}
-		if after.ChunkSize != 65536 || !bytes.Equal(after.BaseNonce, enc.BaseNonce) {
-			t.Fatalf("re-wrap disturbed non-wrap fields: %+v", after)
+		if !reflect.DeepEqual(*got, want) {
+			t.Fatalf("GetEncryptionParams = %+v, want %+v", *got, want)
+		}
+	})
+
+	t.Run("encryption params re-wrap in place", func(t *testing.T) {
+		space := testutil.RandomDID(t)
+		encDigest := []byte{0x03, 0x04}
+		if err := r.PutEncryptionParams(ctx, liveFEEParams(space, encDigest)); err != nil {
+			t.Fatalf("PutEncryptionParams: %v", err)
+		}
+		want := liveFEEParams(space, encDigest)
+		want.RegionWrappedCEK = []byte{0x11, 0x22, 0x33}
+		want.RegionKeyVersion = "region-v2"
+		if err := r.PutEncryptionParams(ctx, want); err != nil {
+			t.Fatalf("PutEncryptionParams (re-wrap): %v", err)
+		}
+		got, err := r.GetEncryptionParams(ctx, space, encDigest)
+		if err != nil {
+			t.Fatalf("GetEncryptionParams: %v", err)
+		}
+		if !reflect.DeepEqual(*got, want) {
+			t.Fatalf("after re-wrap = %+v, want %+v", *got, want)
+		}
+	})
+
+	t.Run("encryption params delete shreds", func(t *testing.T) {
+		space := testutil.RandomDID(t)
+		encDigest := []byte{0x05, 0x06}
+		if err := r.PutEncryptionParams(ctx, liveFEEParams(space, encDigest)); err != nil {
+			t.Fatalf("PutEncryptionParams: %v", err)
+		}
+		if err := r.DeleteEncryptionParams(ctx, space, encDigest); err != nil {
+			t.Fatalf("DeleteEncryptionParams: %v", err)
+		}
+		if _, err := r.GetEncryptionParams(ctx, space, encDigest); !errors.Is(err, registry.ErrNotFound) {
+			t.Fatalf("GetEncryptionParams after delete = %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("incomplete encryption params rejected", func(t *testing.T) {
+		// Rejected in Go, so the NOT NULL constraints are never reached.
+		space := testutil.RandomDID(t)
+		d := []byte{0x77}
+		partial := liveFEEParams(space, d)
+		partial.AAD = nil
+		if err := r.PutEncryptionParams(ctx, partial); !errors.Is(err, registry.ErrInvalidEncryptionParams) {
+			t.Fatalf("PutEncryptionParams(partial) = %v, want ErrInvalidEncryptionParams", err)
+		}
+		if _, err := r.GetEncryptionParams(ctx, space, d); !errors.Is(err, registry.ErrNotFound) {
+			t.Fatalf("incomplete params leaked a row: %v", err)
+		}
+	})
+
+	t.Run("encryption params independent of location", func(t *testing.T) {
+		// No foreign key and no cascade: the params outlive their location row,
+		// so a caller removing a blob must delete from both tables.
+		space := testutil.RandomDID(t)
+		encDigest := []byte{0x08, 0x09}
+		if err := r.PutEncryptionParams(ctx, liveFEEParams(space, encDigest)); err != nil {
+			t.Fatalf("PutEncryptionParams: %v", err)
+		}
+		if err := r.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: encDigest, Provider: "did:piri", URL: "http://piri/enc", Size: 4096}); err != nil {
+			t.Fatalf("PutLocation: %v", err)
 		}
 		if err := r.DeleteLocation(ctx, space, encDigest); err != nil {
 			t.Fatalf("DeleteLocation: %v", err)
 		}
-	})
-
-	t.Run("location partial FEE rejected", func(t *testing.T) {
-		// A partial wrap set is rejected before it reaches SQL and leaves no row.
-		space := testutil.RandomDID(t)
-		d := []byte{0x77}
-		partial := registry.BlobLocation{
-			Space: space, Digest: d, Provider: "did:piri", URL: "u", Size: 10,
-			RegionWrappedCEK: []byte{0x01}, // the rest deliberately absent
-		}
-		if err := r.PutLocation(ctx, partial); !errors.Is(err, registry.ErrPartialFEE) {
-			t.Fatalf("PutLocation(partial) = %v, want ErrPartialFEE", err)
-		}
-		if _, err := r.GetLocation(ctx, space, d); !errors.Is(err, registry.ErrNotFound) {
-			t.Fatalf("partial FEE leaked a row: %v", err)
+		if _, err := r.GetEncryptionParams(ctx, space, encDigest); err != nil {
+			t.Fatalf("DeleteLocation shredded the encryption params: %v", err)
 		}
 	})
 

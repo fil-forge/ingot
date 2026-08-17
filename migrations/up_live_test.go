@@ -42,7 +42,7 @@ func TestUp_Live(t *testing.T) {
 
 	want := []string{
 		"buckets", "segments", "segment_op_roots",
-		"blob_refs", "upload_intents", "blob_locations",
+		"blob_refs", "upload_intents", "blob_locations", "blob_encryption_params",
 		"multipart_sessions", "multipart_parts", "gc_candidates",
 	}
 	for _, tbl := range want {
@@ -72,21 +72,24 @@ func TestUp_Live(t *testing.T) {
 		}
 	}
 
-	// The FEE wrap columns added to blob_locations (00013) exist and are nullable.
+	// blob_encryption_params (00013): every column exists and is NOT NULL — the
+	// presence of a row is what marks a blob as encrypted, so there is no such
+	// thing as a half-populated parameter set.
 	for _, col := range []string{
-		"region_wrapped_cek", "region_key_version", "tenant_recipient_kid",
-		"base_nonce", "chunk_size", "protected_header",
+		"space", "digest", "region_wrapped_cek", "region_key_version",
+		"tenant_recipient_kid", "header_len", "base_nonce", "chunk_size", "aad",
+		"created_at",
 	} {
 		var nullable string
 		err := pool.QueryRow(ctx,
 			`SELECT is_nullable FROM information_schema.columns
-			 WHERE table_schema = 'ingot' AND table_name = 'blob_locations' AND column_name = $1`, col).Scan(&nullable)
+			 WHERE table_schema = 'ingot' AND table_name = 'blob_encryption_params' AND column_name = $1`, col).Scan(&nullable)
 		if err != nil {
-			t.Errorf("column ingot.blob_locations.%s missing after migration: %v", col, err)
+			t.Errorf("column ingot.blob_encryption_params.%s missing after migration: %v", col, err)
 			continue
 		}
-		if nullable != "YES" {
-			t.Errorf("column ingot.blob_locations.%s is_nullable = %q, want YES", col, nullable)
+		if nullable != "NO" {
+			t.Errorf("column ingot.blob_encryption_params.%s is_nullable = %q, want NO", col, nullable)
 		}
 	}
 }

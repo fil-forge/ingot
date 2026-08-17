@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/fil-forge/ucantone/did"
@@ -13,6 +14,7 @@ import (
 // architecture relies on (docs/architecture.md §5–§7, Appendix C):
 // the reverse reference index (blob_refs), the local-store index
 // (upload_intents), the local blob-location table (blob_locations), the
+// per-blob FEE encryption parameters (blob_encryption_params), the
 // multipart session/part tables, and the gc_candidates log. The stores
 // are split into focused interfaces so a caller can depend on only what
 // it needs; *Postgres and *inmem.MemStore satisfy all of them.
@@ -69,78 +71,94 @@ type UploadIntent struct {
 	Bucket    string
 }
 
-// BlobLocation is one row of ingot.blob_locations: the full per-blob record
-// keyed by (Space, Digest) — where the blob can be retrieved from (captured at
-// accept) and, when the blob is an encrypted FEE envelope, the wrap material
-// the read path needs to decrypt it.
-//
-// The FEE fields are populated only for encrypted blobs; they are the cached
-// inputs a (range) GET's aesstream decryptor needs, so a read unwraps the CEK
-// and goes straight to a body-range fetch with no COSE envelope-header
-// round-trip. They are all-or-nothing: an unencrypted blob leaves them zero
-// (stored as SQL NULL), and PutLocation rejects a partial set via ValidateFEE
-// so no row is ever persisted that the decrypt path cannot use. A fresh CEK per
-// encryption event makes every ciphertext digest unique to one encryption, so
-// this wrap material is a 1:1 fact about the row. Raw CEK bytes are never
-// stored — only the region-KEK-wrapped CEK and the identifiers needed to unwrap
-// it. See docs/architecture.md §8 and FIL-480.
+// BlobLocation is one row of ingot.blob_locations: where a blob can be
+// retrieved from, captured at accept. Keyed by (Space, Digest).
 type BlobLocation struct {
 	Space    did.DID
 	Digest   []byte
 	Provider string
 	URL      string
 	Size     int64
+}
+
+// BlobEncryptionParams is one row of ingot.blob_encryption_params: the FEE
+// (FilOne encryption envelope) parameters a read needs to decrypt an encrypted
+// blob, keyed by (Space, Digest) like the blob's location.
+//
+// An encrypted body blob is an independent COSE/STREAM ciphertext envelope.
+// These are the cached inputs a (range) GET's decryptor needs, so a read
+// unwraps the CEK and goes straight to a body-range fetch with no COSE
+// envelope-header round-trip. Existence of the row is what marks a blob as
+// encrypted: every field is required, and an unencrypted blob simply has no row
+// (see EncryptionParamsStore). A fresh CEK per encryption event makes every
+// ciphertext digest unique to one encryption, so these parameters are a 1:1
+// fact about the blob. Raw CEK bytes are never stored — only the
+// region-KEK-wrapped CEK and the identifiers needed to unwrap it. See
+// docs/architecture.md §8 and FIL-480.
+type BlobEncryptionParams struct {
+	Space  did.DID
+	Digest []byte
 
 	// RegionWrappedCEK is the content-encryption key wrapped under the region
-	// KEK (A256KW). Nil for an unencrypted blob; its presence marks the blob as
-	// an encrypted FEE envelope. Never the raw CEK.
+	// KEK (A256KW). Never the raw CEK.
 	RegionWrappedCEK []byte
 	// RegionKeyVersion identifies which version of the region KEK wrapped the
 	// CEK, so a rotation can re-wrap in place. Opaque, so it is agnostic to the
-	// region-key cardinality decision (FIL-572). Empty for an unencrypted blob.
+	// region-key cardinality decision (FIL-572).
 	RegionKeyVersion string
 	// TenantRecipientKID identifies the Hilt wrap key used for insurance-recovery
 	// unwrap. Opaque, so it is agnostic to the tenant-vs-bucket granularity
-	// decision (FIL-574). Empty for an unencrypted blob.
+	// decision (FIL-574).
 	TenantRecipientKID string
+	// HeaderLen is the encoded length of the blob's COSE envelope, and so the
+	// offset at which its ciphertext begins. Without it a read could not locate
+	// byte 0 of the ciphertext without decoding the header.
+	HeaderLen int64
 	// BaseNonce is the COSE iv: the STREAM nonce seed for this blob's ciphertext.
-	// Nil for an unencrypted blob.
 	BaseNonce []byte
 	// ChunkSize is the FEE chunk size written into the COSE protected header,
 	// cached so the read path need not fetch and decode the envelope header.
-	// Zero for an unencrypted blob.
 	ChunkSize int64
-	// ProtectedHeader is the raw COSE protected header bytes, cached to
-	// reconstruct the Enc_structure (AAD) without an envelope round-trip. Nil for
-	// an unencrypted blob.
-	ProtectedHeader []byte
+	// AAD is the envelope's COSE Enc_structure — the additional authenticated
+	// data bound into every chunk's GCM tag. Stored whole rather than as the
+	// protected header because the Enc_structure's context string differs
+	// between a COSE_Encrypt and a COSE_Encrypt0, which a bare row cannot
+	// record. The protected header remains recoverable from it as element 1.
+	AAD []byte
 }
 
-// ErrPartialFEE is returned by PutLocation when a BlobLocation carries some but
-// not all of the FEE wrap material — a row the decrypt path could not use.
-var ErrPartialFEE = errors.New("registry: partial FEE wrap material")
+// ErrInvalidEncryptionParams is returned by PutEncryptionParams when a
+// BlobEncryptionParams is missing a field — a row the decrypt path could not
+// use.
+var ErrInvalidEncryptionParams = errors.New("registry: invalid blob encryption params")
 
-// ValidateFEE enforces the all-or-nothing FEE invariant that BlobLocation
-// documents: either every wrap field is present (non-empty byte slices, non-empty
-// identifiers, and ChunkSize > 0) or none is. A partial set — e.g. a wrapped CEK
-// with no nonce, or an empty (non-nil) byte slice standing in for real material —
-// would persist a row a later GET cannot decrypt, so PutLocation rejects it.
-func (loc BlobLocation) ValidateFEE() error {
-	present := 0
-	for _, ok := range []bool{
-		len(loc.RegionWrappedCEK) > 0,
-		loc.RegionKeyVersion != "",
-		loc.TenantRecipientKID != "",
-		len(loc.BaseNonce) > 0,
-		loc.ChunkSize > 0,
-		len(loc.ProtectedHeader) > 0,
+// Validate enforces that every encryption parameter is present: non-empty byte
+// slices and identifiers, and positive HeaderLen/ChunkSize. A partial set — e.g.
+// a wrapped CEK with no nonce, or an empty (non-nil) byte slice standing in for
+// real material — would persist a row a later GET cannot decrypt, so
+// PutEncryptionParams rejects it before touching the store.
+func (p BlobEncryptionParams) Validate() error {
+	var missing []string
+	for _, f := range []struct {
+		name    string
+		present bool
+	}{
+		{"space", p.Space.String() != ""},
+		{"digest", len(p.Digest) > 0},
+		{"region_wrapped_cek", len(p.RegionWrappedCEK) > 0},
+		{"region_key_version", p.RegionKeyVersion != ""},
+		{"tenant_recipient_kid", p.TenantRecipientKID != ""},
+		{"header_len", p.HeaderLen > 0},
+		{"base_nonce", len(p.BaseNonce) > 0},
+		{"chunk_size", p.ChunkSize > 0},
+		{"aad", len(p.AAD) > 0},
 	} {
-		if ok {
-			present++
+		if !f.present {
+			missing = append(missing, f.name)
 		}
 	}
-	if present != 0 && present != 6 {
-		return fmt.Errorf("%w: %d of 6 fields set", ErrPartialFEE, present)
+	if len(missing) > 0 {
+		return fmt.Errorf("%w: missing %s", ErrInvalidEncryptionParams, strings.Join(missing, ", "))
 	}
 	return nil
 }
@@ -237,18 +255,31 @@ type IntentStore interface {
 	DeleteIntent(ctx context.Context, digest []byte) error
 }
 
-// LocationStore is the local blob-location table (§8, appliance topology): the
-// per-blob record keyed by (space, digest), captured at accept and resolved on
-// read in place of the indexing-service. Besides the provider/URL/size that
-// locate the bytes, a row also carries the FEE wrap material for an encrypted
-// blob (see BlobLocation) — PutLocation writes it, GetLocation reads it back.
-// Per-blob crypto-shred is nulling that material (write a row with the FEE
-// fields zero) or DeleteLocation; a rotation re-wrap is a PutLocation with a new
-// RegionWrappedCEK/RegionKeyVersion.
+// LocationStore is the local blob-location table (§8, appliance topology):
+// the (space, digest) → provider/URL mapping captured at accept, resolved
+// on read in place of the indexing-service.
 type LocationStore interface {
 	PutLocation(ctx context.Context, loc BlobLocation) error
 	GetLocation(ctx context.Context, space did.DID, digest []byte) (*BlobLocation, error)
 	DeleteLocation(ctx context.Context, space did.DID, digest []byte) error
+}
+
+// EncryptionParamsStore is the per-blob FEE encryption-parameter table
+// (blob_encryption_params): what a read needs to decrypt an encrypted blob
+// without fetching its envelope header. A blob has a row only when it is
+// encrypted, so GetEncryptionParams returning ErrNotFound is the answer "this
+// blob is stored as plaintext".
+//
+// It is deliberately separate from LocationStore, with no foreign key between
+// the tables: a location is reconstructible from the indexer or the accept
+// receipt, a wrapped CEK is not. Put is an upsert, so a rotation re-wrap
+// replaces the material in place. Delete is the per-blob crypto-shred and is
+// idempotent — and because nothing cascades, DeleteLocation does NOT shred: a
+// caller removing a blob must call both.
+type EncryptionParamsStore interface {
+	PutEncryptionParams(ctx context.Context, params BlobEncryptionParams) error
+	GetEncryptionParams(ctx context.Context, space did.DID, digest []byte) (*BlobEncryptionParams, error)
+	DeleteEncryptionParams(ctx context.Context, space did.DID, digest []byte) error
 }
 
 // BlobPark is one row of ingot.blob_parks: the persistable state of a blob
