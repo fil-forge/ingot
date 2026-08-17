@@ -168,33 +168,61 @@ func locationFromAdded(added forgeclient.AddedBlob) (BlobLocation, error) {
 
 var _ BodyUploader = (*Forge)(nil)
 
+// ConcludeBlobResult is one parked blob's outcome from ConcludeBlobBatch:
+// its published location, or the error that kept it parked (failed entries
+// are safe to resubmit — conclude is idempotent).
+type ConcludeBlobResult struct {
+	Location BlobLocation
+	Err      error
+}
+
 // DeferredBodyUploader extends BodyUploader for multipart's deferred accept:
 // UploadBlob with WithConclude(false) makes the bytes durable (parked) at
-// UploadPart; ConcludeBlob triggers accept at Complete; AbortBlob abandons a
-// parked blob at Abort.
+// UploadPart; ConcludeBlobBatch triggers the accepts at Complete; AbortBlob
+// abandons a parked blob at Abort.
 type DeferredBodyUploader interface {
 	BodyUploader
-	ConcludeBlob(ctx context.Context, space did.DID, parked UploadedBlob) (BlobLocation, error)
+	ConcludeBlobBatch(ctx context.Context, space did.DID, parked []UploadedBlob) ([]ConcludeBlobResult, error)
 	AbortBlob(ctx context.Context, space did.DID, digest multihash.Multihash, cause cid.Cid) error
 }
 
-// ConcludeBlob finishes a parked upload: it concludes the deferred /http/put
-// receipt (triggering /blob/accept on the provider) and returns the published
-// location. parked is the UploadedBlob a WithConclude(false) upload returned
-// (rehydrated from its blob_parks row). The conclude carries no space proof
-// (accept is owned by sprue), so no proof store is required. Safe to retry.
-func (u *Forge) ConcludeBlob(ctx context.Context, space did.DID, parked UploadedBlob) (BlobLocation, error) {
-	added, err := u.client.BlobConclude(ctx, space, forgeclient.AddedBlob{
-		Digest:        parked.Digest,
-		Size:          uint64(parked.Size),
-		AddTask:       parked.AddTask,
-		AcceptTask:    parked.AcceptTask,
-		PutInvocation: parked.PutInvocation,
-	})
-	if err != nil {
-		return BlobLocation{}, fmt.Errorf("uploader: conclude blob: %w", err)
+// ConcludeBlobBatch finishes many parked uploads in one request to the upload
+// service: the deferred /http/put receipts conclude together (triggering
+// /blob/accept per blob on the provider) and each blob's published location
+// is returned positionally. parked entries are the UploadedBlobs that
+// WithConclude(false) uploads returned (rehydrated from blob_parks rows). The
+// conclude carries no space proof (accept is owned by sprue), so no proof
+// store is required. A returned error means the whole batch went nowhere;
+// otherwise inspect each ConcludeBlobResult. Safe to retry either way.
+func (u *Forge) ConcludeBlobBatch(ctx context.Context, space did.DID, parked []UploadedBlob) ([]ConcludeBlobResult, error) {
+	added := make([]forgeclient.AddedBlob, len(parked))
+	for i, p := range parked {
+		added[i] = forgeclient.AddedBlob{
+			Digest:        p.Digest,
+			Size:          uint64(p.Size),
+			AddTask:       p.AddTask,
+			AcceptTask:    p.AcceptTask,
+			PutInvocation: p.PutInvocation,
+		}
 	}
-	return locationFromAdded(added)
+	concluded, err := u.client.BlobConcludeBatch(ctx, space, added)
+	if err != nil {
+		return nil, fmt.Errorf("uploader: conclude blobs: %w", err)
+	}
+	results := make([]ConcludeBlobResult, len(parked))
+	for i, cr := range concluded {
+		if cr.Err != nil {
+			results[i] = ConcludeBlobResult{Err: cr.Err}
+			continue
+		}
+		loc, lerr := locationFromAdded(cr.Blob)
+		if lerr != nil {
+			results[i] = ConcludeBlobResult{Err: lerr}
+			continue
+		}
+		results[i] = ConcludeBlobResult{Location: loc}
+	}
+	return results, nil
 }
 
 // AbortBlob abandons a parked blob via /blob/abort on the upload

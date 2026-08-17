@@ -11,6 +11,7 @@ import (
 	"io"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -24,6 +25,7 @@ import (
 	"github.com/ipfs/go-cid"
 	mh "github.com/multiformats/go-multihash"
 	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
 
 	msbucket "github.com/fil-forge/ingot/bucket"
 	"github.com/fil-forge/ingot/internal/reqscope"
@@ -34,6 +36,29 @@ import (
 
 // defaultMaxListing is the S3 default and cap for max-parts / max-uploads.
 const defaultMaxListing = 1000
+
+// concludeBatchSize / concludeBatchInflight shape Complete's conclude phase
+// (issue #69): parked blobs conclude in chunks, each chunk one request to
+// the upload service carrying all its conclude invocations in a single UCAN
+// container. The service executes a container's invocations sequentially
+// while the request hangs open, so the chunk size bounds that hold-open
+// time; chunks in flight restore cross-chunk parallelism, taking a 256-part
+// upload's accept phase from minutes to seconds without swamping the
+// service.
+const (
+	concludeBatchSize     = 16
+	concludeBatchInflight = 4
+)
+
+// completeJoinPoll/completeJoinWait pace a Complete that lost the latch to an
+// in-flight Complete of the same upload: the loser polls the session until
+// the winner resolves it (then reports the winner's outcome) and yields a
+// retryable SlowDown once the budget is spent. Vars so tests can compress
+// the schedule.
+var (
+	completeJoinPoll = 500 * time.Millisecond
+	completeJoinWait = 2 * time.Minute
+)
 
 // newUploadID returns a random 128-bit hex upload id.
 func newUploadID() (string, error) {
@@ -491,25 +516,66 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 		}
 	}
 
-	// Idempotent re-Complete: the prior Complete committed the object; the
-	// validation above already proved the client's part list matches the
-	// retained parts, so return the same result without recommitting.
-	if sess.State == registry.SessionCompleted {
+	// completedResult answers a Complete whose object is already committed
+	// (idempotent re-Complete, or a joined peer's commit below): the part
+	// validation above proved the client's list matches the retained parts,
+	// so the recomputed ETag/checksum equal the committed ones.
+	completedResult := func() (s3response.CompleteMultipartUploadResult, string, error) {
 		etagQ := `"` + etag + `"`
 		res := s3response.CompleteMultipartUploadResult{Bucket: &bucket, Key: &key, ETag: &etagQ}
 		setCompleteResultChecksum(&res, ckAlgo, ckValue, ckType)
 		return res, "", nil
 	}
+	if sess.State == registry.SessionCompleted {
+		return completedResult()
+	}
 
-	// Single-winner latch vs a racing Abort: only the writer that moves the
-	// session off 'open' proceeds (§7.3).
-	won, err := b.multipart.LatchSession(ctx, uploadID, registry.SessionOpen, registry.SessionCompleting)
-	if err != nil {
-		return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: latch: %w", err)
+	// Single-winner latch vs a racing Abort or Complete: only the writer that
+	// moves the session off 'open' proceeds (§7.3). Losing to another
+	// Complete must NOT map to NoSuchUpload — the upload exists and is
+	// actively completing, and a client-timeout retry lands exactly here
+	// (issue #69: a terminal 404 for an upload that then commits) — so the
+	// loser joins: it awaits the in-flight completion and reports its
+	// outcome, taking over if the peer failed and reverted the session.
+	joinDeadline := time.Now().Add(completeJoinWait)
+	for {
+		won, err := b.multipart.LatchSession(ctx, uploadID, registry.SessionOpen, registry.SessionCompleting)
+		if err != nil {
+			return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: latch: %w", err)
+		}
+		if won {
+			break
+		}
+		cur, gerr := b.multipart.GetSession(ctx, uploadID)
+		if gerr != nil {
+			if errors.Is(gerr, registry.ErrNotFound) {
+				return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrNoSuchUpload)
+			}
+			return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: session state: %w", gerr)
+		}
+		switch cur.State {
+		case registry.SessionCompleted:
+			return completedResult()
+		case registry.SessionAborting:
+			return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrNoSuchUpload)
+		case registry.SessionOpen:
+			// The peer failed and reverted; contend for the latch again.
+			continue
+		}
+		// 'completing': the peer is mid-flight. Past the wait budget (the peer
+		// is wedged, or its process died leaving the row latched until the
+		// sweeper reaps it) answer with the retryable SlowDown instead of
+		// holding the connection indefinitely.
+		if time.Now().After(joinDeadline) {
+			return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrSlowDown)
+		}
+		select {
+		case <-ctx.Done():
+			return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: awaiting in-flight complete: %w", ctx.Err())
+		case <-time.After(completeJoinPoll):
+		}
 	}
-	if !won {
-		return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrNoSuchUpload)
-	}
+
 	// If anything below fails before the object is committed, revert the session
 	// to 'open' so the upload stays abortable / retriable rather than zombied in
 	// 'completing'. committed is set once the manifest is durable (the point of
@@ -847,12 +913,29 @@ func (b *Backend) parkBlobs(ctx context.Context, space did.DID, blobs []msbucket
 
 // concludeBlobs is Complete's park-aware counterpart to uploadBlobs: located
 // blobs are already accepted (dedup); parked blobs conclude their deferred
-// /http/put receipt — firing /blob/accept — and record their location;
+// /http/put receipts — firing /blob/accept — and record their locations;
 // blobs that never parked (crash between spool and park) fall back to the
 // whole synchronous upload.
+//
+// Parked blobs conclude in chunked BATCHES: each chunk is one request to the
+// upload service carrying all its conclude invocations in a single UCAN
+// container (sequential per-blob concludes held Complete's connection open
+// for O(parts) round trips — minutes at a few hundred parts, issue #69),
+// with a few chunks in flight so chunks still overlap. Failures are
+// per-blob: every blob that concluded keeps its recorded location, failed
+// blobs stay parked, and the retry after the session reverts to 'open'
+// resumes where this attempt stopped (conclude is idempotent).
 func (b *Backend) concludeBlobs(ctx context.Context, space did.DID, blobs []msbucket.BlobRef) error {
+	// Triage one entry per distinct digest: a content-addressed blob may back
+	// several parts, and its accept/location/park is per-digest state.
+	seen := make(map[string]struct{}, len(blobs))
+	var parked []uploader.UploadedBlob
+	var stragglers []msbucket.BlobRef
 	for _, blob := range blobs {
-		digest := mh.Multihash(blob.Digest)
+		if _, ok := seen[string(blob.Digest)]; ok {
+			continue
+		}
+		seen[string(blob.Digest)] = struct{}{}
 		if existing, err := b.locations.GetLocation(ctx, space, blob.Digest); err == nil && existing != nil {
 			if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentAccepted); err != nil {
 				return fmt.Errorf("mark accepted (dedup): %w", err)
@@ -861,61 +944,107 @@ func (b *Backend) concludeBlobs(ctx context.Context, space did.DID, blobs []msbu
 		} else if err != nil && !errors.Is(err, registry.ErrNotFound) {
 			return fmt.Errorf("lookup location: %w", err)
 		}
-
 		park, err := b.parks.GetPark(ctx, blob.Digest)
 		if err != nil && !errors.Is(err, registry.ErrNotFound) {
 			return fmt.Errorf("lookup park: %w", err)
 		}
-		var loc uploader.BlobLocation
-		if park != nil {
-			addTask, err := cid.Cast(park.AddTask)
+		if park == nil {
+			stragglers = append(stragglers, blob)
+			continue
+		}
+		addTask, err := cid.Cast(park.AddTask)
+		if err != nil {
+			return fmt.Errorf("decode park add task: %w", err)
+		}
+		acceptTask, err := cid.Cast(park.AcceptTask)
+		if err != nil {
+			return fmt.Errorf("decode park accept task: %w", err)
+		}
+		parked = append(parked, uploader.UploadedBlob{
+			Digest:        mh.Multihash(blob.Digest),
+			Size:          park.Size,
+			AddTask:       addTask,
+			AcceptTask:    acceptTask,
+			PutInvocation: park.PutInvocation,
+		})
+	}
+
+	// All chunks and stragglers run to completion regardless of individual
+	// failures — every additional recorded location is one less conclude for
+	// the retry — with the errors joined at the end.
+	var mu sync.Mutex
+	var errs []error
+	fail := func(err error) {
+		mu.Lock()
+		errs = append(errs, err)
+		mu.Unlock()
+	}
+	var g errgroup.Group
+	g.SetLimit(concludeBatchInflight)
+	for start := 0; start < len(parked); start += concludeBatchSize {
+		chunk := parked[start:min(start+concludeBatchSize, len(parked))]
+		g.Go(func() error {
+			results, err := b.deferred.ConcludeBlobBatch(ctx, space, chunk)
 			if err != nil {
-				return fmt.Errorf("decode park add task: %w", err)
+				fail(fmt.Errorf("conclude blobs: %w", err))
+				return nil
 			}
-			acceptTask, err := cid.Cast(park.AcceptTask)
-			if err != nil {
-				return fmt.Errorf("decode park accept task: %w", err)
+			for i, r := range results {
+				digest := []byte(chunk[i].Digest)
+				if r.Err != nil {
+					fail(fmt.Errorf("conclude blob %x: %w", digest, r.Err))
+					continue
+				}
+				if err := b.recordAccepted(ctx, space, digest, r.Location, true); err != nil {
+					fail(err)
+				}
 			}
-			loc, err = b.deferred.ConcludeBlob(ctx, space, uploader.UploadedBlob{
-				Digest:        digest,
-				Size:          park.Size,
-				AddTask:       addTask,
-				AcceptTask:    acceptTask,
-				PutInvocation: park.PutInvocation,
-			})
-			if err != nil {
-				return fmt.Errorf("conclude blob: %w", err)
-			}
-		} else {
+			return nil
+		})
+	}
+	for _, blob := range stragglers {
+		g.Go(func() error {
 			// Never parked (crash between spool and park): the spooled copy
 			// drives the whole synchronous upload.
+			digest := mh.Multihash(blob.Digest)
 			res, uerr := b.uploader.UploadBlob(ctx, space, digest, blob.Length, b.spool.Path(digest))
 			if uerr != nil {
-				return fmt.Errorf("upload blob: %w", uerr)
+				fail(fmt.Errorf("upload blob: %w", uerr))
+				return nil
 			}
 			if res.Location == nil {
-				return fmt.Errorf("upload blob %x: concluding upload returned no location", blob.Digest)
+				fail(fmt.Errorf("upload blob %x: concluding upload returned no location", blob.Digest))
+				return nil
 			}
-			loc = *res.Location
-		}
+			if err := b.recordAccepted(ctx, space, blob.Digest, *res.Location, false); err != nil {
+				fail(err)
+			}
+			return nil
+		})
+	}
+	_ = g.Wait()
+	return errors.Join(errs...)
+}
 
-		if err := b.locations.PutLocation(ctx, registry.BlobLocation{
-			Space:    space,
-			Digest:   blob.Digest,
-			Provider: loc.Provider,
-			URL:      loc.URL,
-			Size:     loc.Size,
-		}); err != nil {
-			return fmt.Errorf("record location: %w", err)
-		}
-		if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentAccepted); err != nil {
-			return fmt.Errorf("mark accepted: %w", err)
-		}
-		if park != nil {
-			// The sealed put invocation is spent — drop it promptly.
-			if err := b.parks.DeletePark(ctx, blob.Digest); err != nil {
-				return fmt.Errorf("drop park: %w", err)
-			}
+// recordAccepted persists one accepted blob's outcome: its location, the
+// intent transition, and — for a parked blob — dropping the park row (the
+// sealed put invocation is spent).
+func (b *Backend) recordAccepted(ctx context.Context, space did.DID, digest []byte, loc uploader.BlobLocation, parked bool) error {
+	if err := b.locations.PutLocation(ctx, registry.BlobLocation{
+		Space:    space,
+		Digest:   digest,
+		Provider: loc.Provider,
+		URL:      loc.URL,
+		Size:     loc.Size,
+	}); err != nil {
+		return fmt.Errorf("record location: %w", err)
+	}
+	if err := b.intents.SetIntentState(ctx, digest, registry.IntentAccepted); err != nil {
+		return fmt.Errorf("mark accepted: %w", err)
+	}
+	if parked {
+		if err := b.parks.DeletePark(ctx, digest); err != nil {
+			return fmt.Errorf("drop park: %w", err)
 		}
 	}
 	return nil

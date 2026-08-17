@@ -44,6 +44,7 @@ import (
 	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
 	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
 )
 
 // BlobAddOption configures [Client.BlobAdd].
@@ -335,6 +336,141 @@ func (c *Client) BlobConclude(ctx context.Context, space did.DID, added AddedBlo
 	}, nil
 }
 
+// ConcludeResult is one blob's outcome from BlobConcludeBatch: the completed
+// AddedBlob (Location set, PutInvocation dropped) or the error that kept it
+// parked. Failed entries stay parked and are safe to resubmit.
+type ConcludeResult struct {
+	Blob AddedBlob
+	Err  error
+}
+
+// BlobConcludeBatch finishes many parked BlobAdds in ONE round trip to the
+// upload service: every parked blob's synthesized /http/put receipt and its
+// /ucan/conclude invocation travel in a single UCAN container, which the
+// service's ucantone server executes invocation-by-invocation, returning all
+// the conclude receipts in one response container. Because the service runs
+// each /blob/accept synchronously before answering, the follow-up accept
+// receipt fetches (for the location commitments) succeed on their first
+// attempt; they run bounded-parallel here. Outcomes are positional: one
+// failed conclude does not fail the batch, and a transport-level error fails
+// the whole call with no per-blob results (everything stays parked; conclude
+// is idempotent, so resubmitting any subset is safe).
+//
+// Callers should chunk very large upload sessions (a put receipt + conclude
+// invocation is a few KB, and the service concludes a container's invocations
+// sequentially while the request hangs open) — see s3frontend's Complete for
+// the chunking policy.
+func (c *Client) BlobConcludeBatch(ctx context.Context, space did.DID, added []AddedBlob) ([]ConcludeResult, error) {
+	results := make([]ConcludeResult, len(added))
+	var invs []ucan.Invocation
+	var rcpts []ucan.Receipt
+	idxByTask := make(map[cid.Cid]int)
+	for i, ab := range added {
+		if ab.Location != nil {
+			results[i] = ConcludeResult{Blob: ab}
+			continue
+		}
+		putInv := new(invocation.Invocation)
+		if err := putInv.UnmarshalCBOR(bytes.NewReader(ab.PutInvocation)); err != nil {
+			results[i] = ConcludeResult{Err: fmt.Errorf("decoding parked /http/put invocation: %w", err)}
+			continue
+		}
+		putRcpt, err := synthesizePutReceipt(putInv)
+		if err != nil {
+			results[i] = ConcludeResult{Err: fmt.Errorf("synthesizing put receipt: %w", err)}
+			continue
+		}
+		inv, err := ucancmds.Conclude.Invoke(
+			c.signer, c.signer.DID(),
+			&ucancmds.ConcludeArguments{Receipt: putRcpt.Link()},
+			invocation.WithAudience(c.serviceID),
+		)
+		if err != nil {
+			results[i] = ConcludeResult{Err: fmt.Errorf("generating conclude invocation: %w", err)}
+			continue
+		}
+		idxByTask[inv.Task().Link()] = i
+		invs = append(invs, inv)
+		rcpts = append(rcpts, putRcpt)
+	}
+	if len(invs) == 0 {
+		return results, nil
+	}
+
+	start := time.Now()
+	// The stock client sends one primary invocation; the rest ride the same
+	// request container via WithInvocations and are executed all the same.
+	// The response's metadata is the full response container, so every
+	// conclude's receipt is recovered from it by task link.
+	resp, err := c.ucanClient.Execute(execution.NewRequest(ctx, invs[0],
+		execution.WithInvocations(invs[1:]...),
+		execution.WithReceipts(rcpts...),
+	))
+	if err != nil {
+		c.logger.Error("blob conclude batch failed",
+			zap.Stringer("space", space), zap.Int("blobs", len(invs)),
+			zap.Error(err), zap.Duration("duration", time.Since(start)))
+		return nil, fmt.Errorf("executing conclude batch: %w", err)
+	}
+	container := resp.Metadata()
+
+	// Match each conclude's receipt out of the response container, then fetch
+	// the accept receipts (location commitments) for the successes in bounded
+	// parallel.
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(concludeFetchConcurrency)
+	for _, inv := range invs {
+		i := idxByTask[inv.Task().Link()]
+		rcpt := maybeFindReceipt(inv.Task().Link(), container.Receipts())
+		if rcpt == nil {
+			results[i] = ConcludeResult{Err: fmt.Errorf("conclude receipt missing for blob %s", added[i].Digest)}
+			continue
+		}
+		if rcpt.Out().IsErr() {
+			_, x := rcpt.Out().Unpack()
+			var model edm.ErrorModel
+			if err := model.UnmarshalCBOR(bytes.NewReader(x)); err != nil {
+				results[i] = ConcludeResult{Err: fmt.Errorf("conclude failed with undecodable error")}
+				continue
+			}
+			results[i] = ConcludeResult{Err: fmt.Errorf("conclude failed: %w", model)}
+			continue
+		}
+		g.Go(func() error {
+			location, aerr := c.awaitAccept(gctx, added[i].AcceptTask)
+			if aerr != nil {
+				results[i] = ConcludeResult{Err: aerr}
+				return nil
+			}
+			results[i] = ConcludeResult{Blob: AddedBlob{
+				Digest:     added[i].Digest,
+				Size:       added[i].Size,
+				Location:   location,
+				AddTask:    added[i].AddTask,
+				AcceptTask: added[i].AcceptTask,
+			}}
+			return nil
+		})
+	}
+	_ = g.Wait()
+
+	failed := 0
+	for _, r := range results {
+		if r.Err != nil {
+			failed++
+		}
+	}
+	c.logger.Debug("blob conclude batch",
+		zap.Stringer("space", space), zap.Int("blobs", len(invs)),
+		zap.Int("failed", failed), zap.Duration("duration", time.Since(start)))
+	return results, nil
+}
+
+// concludeFetchConcurrency bounds BlobConcludeBatch's parallel accept-receipt
+// fetches. The receipts already exist by the time the batch returns, so these
+// are quick single GETs — the bound just keeps a large chunk polite.
+const concludeFetchConcurrency = 16
+
 // awaitAccept polls the /blob/accept receipt and extracts the
 // /assert/location commitment from its metadata.
 func (c *Client) awaitAccept(ctx context.Context, acceptTask cid.Cid) (ucan.Invocation, error) {
@@ -389,35 +525,46 @@ func putBlob(ctx context.Context, client *http.Client, url *url.URL, headers map
 	return nil
 }
 
-func (c *Client) sendPutReceipt(ctx context.Context, putInv ucan.Invocation, opts ...execution.RequestOption) error {
+// synthesizePutReceipt issues the /http/put success receipt for a parked put
+// invocation, signing with the derived key embedded in the invocation's
+// metadata (the same key piri expects the receipt from).
+func synthesizePutReceipt(putInv ucan.Invocation) (ucan.Receipt, error) {
 	var putMeta datamodel.Map
 	if err := putMeta.UnmarshalCBOR(bytes.NewReader(putInv.MetadataBytes())); err != nil {
-		return fmt.Errorf("unmarshaling /http/put invocation metadata: %w", err)
+		return nil, fmt.Errorf("unmarshaling /http/put invocation metadata: %w", err)
 	}
 	keysMap, ok := putMeta["keys"].(ipld.Map)
 	if !ok {
-		return fmt.Errorf("invalid put metadata, missing 'keys' field")
+		return nil, fmt.Errorf("invalid put metadata, missing 'keys' field")
 	}
 	id, ok := keysMap["id"].(string)
 	if !ok {
-		return fmt.Errorf("invalid put metadata, missing 'id' field in 'keys'")
+		return nil, fmt.Errorf("invalid put metadata, missing 'id' field in 'keys'")
 	}
 	keysKeysMap, ok := keysMap["keys"].(ipld.Map)
 	if !ok {
-		return fmt.Errorf("invalid put metadata, missing 'keys' field in 'keys'")
+		return nil, fmt.Errorf("invalid put metadata, missing 'keys' field in 'keys'")
 	}
 	keyBytes, ok := keysKeysMap[id].([]byte)
 	if !ok {
-		return fmt.Errorf("invalid put metadata, missing key for %s", id)
+		return nil, fmt.Errorf("invalid put metadata, missing key for %s", id)
 	}
 	signer, err := ed25519.Decode(keyBytes)
 	if err != nil {
-		return fmt.Errorf("decoding key for %q: %w", id, err)
+		return nil, fmt.Errorf("decoding key for %q: %w", id, err)
 	}
 	issuer := multikey.KeyIssuer(signer)
 	putRcpt, err := receipt.IssueOK(issuer, putInv.Task().Link(), &httpcmds.PutOK{}, receipt.WithIssuedAt(ucan.Now()))
 	if err != nil {
-		return fmt.Errorf("generating receipt: %w", err)
+		return nil, fmt.Errorf("generating receipt: %w", err)
+	}
+	return putRcpt, nil
+}
+
+func (c *Client) sendPutReceipt(ctx context.Context, putInv ucan.Invocation, opts ...execution.RequestOption) error {
+	putRcpt, err := synthesizePutReceipt(putInv)
+	if err != nil {
+		return err
 	}
 
 	inv, err := ucancmds.Conclude.Invoke(

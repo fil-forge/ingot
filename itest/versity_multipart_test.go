@@ -166,9 +166,11 @@ var completeMultipartPass = []forgeCase{
 	{name: "racey_success", fn: integration.CompleteMultipartUpload_racey_success, skip: func() string {
 		return "load-sensitive (10 concurrent 25MiB uploads under a 30s deadline); outcome depends on host load, not S3 semantics"
 	}},
-}
-
-// racey_data_integrity leans on atomic concurrent overwrites under load.
-var completeMultipartXFail = []forgeCase{
+	// racey_data_integrity fires five concurrent Completes of ONE upload id
+	// and requires every one to succeed with the winner's ETag: it pins the
+	// #69 join — a Complete losing the open→completing latch awaits the
+	// in-flight peer and replays its result instead of 404ing.
 	{name: "racey_data_integrity", fn: integration.CompleteMultipartUpload_racey_data_integrity},
 }
+
+var completeMultipartXFail = []forgeCase{}
