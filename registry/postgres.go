@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
+	"github.com/fil-forge/ucantone/did"
 	"github.com/ipfs/go-cid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -18,6 +20,13 @@ const uniqueViolation = "23505"
 // Postgres is a *pgxpool.Pool-backed Registry. Schema is owned by
 // pkg/ingot/migrations and lives in the `ingot` Postgres schema. The
 // pool is borrowed, never closed by this type.
+//
+// Bucket operations (Create, Delete, List) are forwarded to the Hilt
+// tenant service — the authority on which buckets exist and who may act
+// on them — with the local table holding only per-bucket root state.
+// Each of those methods recovers the original signed S3 request from
+// ctx (see hiltclient.RequestFromContext), so they must be called on a
+// request-serving path.
 type Postgres struct {
 	pool *pgxpool.Pool
 }
@@ -32,10 +41,15 @@ func NewPostgres(pool *pgxpool.Pool) *Postgres {
 // Compile-time assertion.
 var _ Registry = (*Postgres)(nil)
 
-func (r *Postgres) Create(ctx context.Context, name string, createdAt int64) error {
+func (r *Postgres) Create(ctx context.Context, name string, space did.DID, init CreateState) error {
+	// root_cid stays NULL (empty bucket); created_at from the column default.
+	v := init.Versioning
+	if v == "" {
+		v = VersioningUnversioned
+	}
 	_, err := r.pool.Exec(ctx,
-		`INSERT INTO ingot.buckets (name, root_cid, created_at) VALUES ($1, NULL, $2)`,
-		name, createdAt)
+		`INSERT INTO ingot.buckets (name, space, versioning, object_lock_config) VALUES ($1, $2, $3, $4)`,
+		name, space.String(), string(v), init.ObjectLockConfig)
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == uniqueViolation {
@@ -47,20 +61,23 @@ func (r *Postgres) Create(ctx context.Context, name string, createdAt int64) err
 }
 
 func (r *Postgres) Get(ctx context.Context, name string) (*State, error) {
-	var rootBytes, forgeBytes []byte
-	var createdAt int64
-	var space string
+	var rootBytes, forgeBytes, lockCfg []byte
+	var createdAt time.Time
+	var spaceStr, versioning string
 	err := r.pool.QueryRow(ctx,
-		`SELECT root_cid, forge_root_cid, created_at, space FROM ingot.buckets WHERE name = $1`, name).
-		Scan(&rootBytes, &forgeBytes, &createdAt, &space)
+		`SELECT root_cid, forge_root_cid, created_at, space, versioning, object_lock_config FROM ingot.buckets WHERE name = $1`, name).
+		Scan(&rootBytes, &forgeBytes, &createdAt, &spaceStr, &versioning, &lockCfg)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
 		return nil, fmt.Errorf("registry: get %q: %w", name, err)
 	}
-
-	st := &State{Name: name, Space: space, CreatedAt: createdAt}
+	space, err := did.Parse(spaceStr)
+	if err != nil {
+		return nil, fmt.Errorf("registry: parse space %q: %w", spaceStr, err)
+	}
+	st := &State{Name: name, Space: space, Versioning: VersioningState(versioning), ObjectLockConfig: lockCfg, CreatedAt: createdAt}
 	if err := setCidPg(&st.Root, rootBytes, name, "root_cid"); err != nil {
 		return nil, err
 	}
@@ -70,45 +87,9 @@ func (r *Postgres) Get(ctx context.Context, name string) (*State, error) {
 	return st, nil
 }
 
-func (r *Postgres) List(ctx context.Context) ([]*State, error) {
-	rows, err := r.pool.Query(ctx,
-		`SELECT name, root_cid, forge_root_cid, created_at, space FROM ingot.buckets ORDER BY name ASC`)
-	if err != nil {
-		return nil, fmt.Errorf("registry: list: %w", err)
-	}
-	defer rows.Close()
-
-	var out []*State
-	for rows.Next() {
-		var name string
-		var rootBytes, forgeBytes []byte
-		var createdAt int64
-		var space string
-		if err := rows.Scan(&name, &rootBytes, &forgeBytes, &createdAt, &space); err != nil {
-			return nil, fmt.Errorf("registry: list scan: %w", err)
-		}
-		st := &State{Name: name, Space: space, CreatedAt: createdAt}
-		if err := setCidPg(&st.Root, rootBytes, name, "root_cid"); err != nil {
-			return nil, err
-		}
-		if err := setCidPg(&st.ForgeRoot, forgeBytes, name, "forge_root_cid"); err != nil {
-			return nil, err
-		}
-		out = append(out, st)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("registry: list rows: %w", err)
-	}
-	return out, nil
-}
-
 func (r *Postgres) Delete(ctx context.Context, name string) error {
-	tag, err := r.pool.Exec(ctx, `DELETE FROM ingot.buckets WHERE name = $1`, name)
-	if err != nil {
+	if _, err := r.pool.Exec(ctx, `DELETE FROM ingot.buckets WHERE name = $1`, name); err != nil {
 		return fmt.Errorf("registry: delete %q: %w", name, err)
-	}
-	if tag.RowsAffected() == 0 {
-		return ErrNotFound
 	}
 	return nil
 }
@@ -166,6 +147,49 @@ func (r *Postgres) SetForgeRoot(ctx context.Context, name string, root cid.Cid) 
 		return ErrNotFound
 	}
 	return nil
+}
+
+func (r *Postgres) SetVersioning(ctx context.Context, name string, v VersioningState) error {
+	if v != VersioningEnabled && v != VersioningSuspended {
+		return fmt.Errorf("registry: set versioning %q: invalid state %q", name, v)
+	}
+	tag, err := r.pool.Exec(ctx,
+		`UPDATE ingot.buckets SET versioning = $1 WHERE name = $2`,
+		string(v), name)
+	if err != nil {
+		return fmt.Errorf("registry: set versioning %q: %w", name, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (r *Postgres) SetObjectLockConfig(ctx context.Context, name string, cfg []byte) error {
+	tag, err := r.pool.Exec(ctx,
+		`UPDATE ingot.buckets SET object_lock_config = $1 WHERE name = $2`,
+		cfg, name)
+	if err != nil {
+		return fmt.Errorf("registry: set object lock config %q: %w", name, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (r *Postgres) AllocVersionSeq(ctx context.Context, name string) (uint64, error) {
+	var seq int64
+	err := r.pool.QueryRow(ctx,
+		`UPDATE ingot.buckets SET next_version_seq = next_version_seq + 1 WHERE name = $1 RETURNING next_version_seq`,
+		name).Scan(&seq)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, ErrNotFound
+	}
+	if err != nil {
+		return 0, fmt.Errorf("registry: alloc version seq %q: %w", name, err)
+	}
+	return uint64(seq), nil
 }
 
 func setCidPg(dst *cid.Cid, raw []byte, name, field string) error {

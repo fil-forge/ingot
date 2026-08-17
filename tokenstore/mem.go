@@ -61,10 +61,6 @@ func (ms *MemStore) ProofChain(ctx context.Context, aud did.DID, cmd ucan.Comman
 	return ucanlib.ProofChain(ctx, ms.matchDelegations, aud, cmd, sub)
 }
 
-func (ms *MemStore) ProofAttestations(ctx context.Context, proofs []ucan.Delegation, authority did.DID) ([]ucan.Invocation, error) {
-	return ucanlib.ProofAttestations(ctx, ms.listInvocations, proofs, authority)
-}
-
 func (ms *MemStore) ListDelegations(ctx context.Context, aud did.DID, cmd ucan.Command, sub did.DID) iter.Seq2[ucan.Delegation, error] {
 	return func(yield func(ucan.Delegation, error) bool) {
 		ms.mu.RLock()
@@ -91,20 +87,6 @@ func (ms *MemStore) Delegations(ctx context.Context) ([]ucan.Delegation, error) 
 
 func (ms *MemStore) matchDelegations(ctx context.Context, aud did.DID, cmd ucan.Command, sub did.DID) iter.Seq2[ucan.Delegation, error] {
 	return ucanlib.NewDelegationMatcher(ms.ListDelegations)(ctx, aud, cmd, sub)
-}
-
-func (ms *MemStore) listInvocations(ctx context.Context, aud did.DID, cmd ucan.Command, sub did.DID) iter.Seq2[ucan.Invocation, error] {
-	return func(yield func(ucan.Invocation, error) bool) {
-		ms.mu.RLock()
-		defer ms.mu.RUnlock()
-		for _, d := range ms.invs {
-			if d.Audience() == aud && d.Command() == cmd && d.Subject() == sub {
-				if !yield(d, nil) {
-					return
-				}
-			}
-		}
-	}
 }
 
 func (ms *MemStore) Reset(ctx context.Context) error {

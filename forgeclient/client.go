@@ -30,7 +30,7 @@ import (
 
 // Client is a UCAN-over-HTTP client to the upload service (sprue).
 type Client struct {
-	signer         ucan.Signer
+	signer         ucan.Issuer
 	serviceID      did.DID
 	ucanClient     *client.HTTPClient
 	ucanOpts       []client.HTTPOption
@@ -41,7 +41,7 @@ type Client struct {
 
 // New builds a Client. signer is the agent identity (issuer of every
 // invocation); serviceID + serviceURL address sprue.
-func New(signer ucan.Signer, serviceID did.DID, serviceURL url.URL, options ...Option) (*Client, error) {
+func New(signer ucan.Issuer, serviceID did.DID, serviceURL url.URL, options ...Option) (*Client, error) {
 	c := Client{
 		signer:         signer,
 		serviceID:      serviceID,
@@ -71,8 +71,8 @@ func New(signer ucan.Signer, serviceID did.DID, serviceURL url.URL, options ...O
 // DID returns the DID of the agent.
 func (c *Client) DID() did.DID { return c.signer.DID() }
 
-// Issuer returns the issuing signer of the agent.
-func (c *Client) Issuer() ucan.Signer { return c.signer }
+// Issuer returns the issuing agent identity.
+func (c *Client) Issuer() ucan.Issuer { return c.signer }
 
 // ServiceID returns the DID of the upload service this client targets.
 func (c *Client) ServiceID() did.DID { return c.serviceID }
@@ -80,11 +80,6 @@ func (c *Client) ServiceID() did.DID { return c.serviceID }
 // ProofChain builds a delegation proof chain from aud to sub for cmd.
 func (c *Client) ProofChain(ctx context.Context, aud did.DID, cmd ucan.Command, sub did.DID) ([]ucan.Delegation, []cid.Cid, error) {
 	return c.tokenStore.ProofChain(ctx, aud, cmd, sub)
-}
-
-// ProofAttestations returns attestations for proofs needing them.
-func (c *Client) ProofAttestations(ctx context.Context, proofs []ucan.Delegation, authority did.DID) ([]ucan.Invocation, error) {
-	return c.tokenStore.ProofAttestations(ctx, proofs, authority)
 }
 
 // AddProofs adds delegations to the client's token store.

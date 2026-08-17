@@ -1,9 +1,13 @@
 package inmem
 
 import (
+	"bytes"
 	"context"
+	"sort"
+	"time"
 
 	"github.com/fil-forge/ingot/registry"
+	"github.com/fil-forge/ucantone/did"
 )
 
 // In-memory implementations of the architecture's relational stores
@@ -16,6 +20,7 @@ var (
 	_ registry.BlobRefStore   = (*MemStore)(nil)
 	_ registry.IntentStore    = (*MemStore)(nil)
 	_ registry.LocationStore  = (*MemStore)(nil)
+	_ registry.InclusionStore = (*MemStore)(nil)
 	_ registry.MultipartStore = (*MemStore)(nil)
 	_ registry.GCStore        = (*MemStore)(nil)
 )
@@ -28,7 +33,6 @@ func cloneBytes(b []byte) []byte {
 }
 
 // BlobRefStore ===============================================================
-
 func (m *MemStore) AddBlobClaim(_ context.Context, c registry.BlobClaim) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -46,7 +50,7 @@ func (m *MemStore) DeleteBlobClaim(_ context.Context, digest []byte, bucket, obj
 	return nil
 }
 
-func (m *MemStore) CountClaims(_ context.Context, space string, digest []byte) (int, error) {
+func (m *MemStore) CountClaims(_ context.Context, space did.DID, digest []byte) (int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	d := string(digest)
@@ -129,7 +133,7 @@ func (m *MemStore) PutLocation(_ context.Context, loc registry.BlobLocation) err
 	return nil
 }
 
-func (m *MemStore) GetLocation(_ context.Context, space string, digest []byte) (*registry.BlobLocation, error) {
+func (m *MemStore) GetLocation(_ context.Context, space did.DID, digest []byte) (*registry.BlobLocation, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	loc, ok := m.locations[locKey{space, string(digest)}]
@@ -140,11 +144,74 @@ func (m *MemStore) GetLocation(_ context.Context, space string, digest []byte) (
 	return &cp, nil
 }
 
-func (m *MemStore) DeleteLocation(_ context.Context, space string, digest []byte) error {
+func (m *MemStore) DeleteLocation(_ context.Context, space did.DID, digest []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.locations, locKey{space, string(digest)})
 	return nil
+}
+
+// ParkStore ==================================================================
+
+func (m *MemStore) PutPark(_ context.Context, p registry.BlobPark) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cp := p
+	cp.Digest = cloneBytes(p.Digest)
+	cp.AddTask = cloneBytes(p.AddTask)
+	cp.AcceptTask = cloneBytes(p.AcceptTask)
+	cp.PutInvocation = cloneBytes(p.PutInvocation)
+	m.parks[string(p.Digest)] = cp
+	return nil
+}
+
+func (m *MemStore) GetPark(_ context.Context, digest []byte) (*registry.BlobPark, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	park, ok := m.parks[string(digest)]
+	if !ok {
+		return nil, registry.ErrNotFound
+	}
+	cp := park
+	cp.Digest = cloneBytes(park.Digest)
+	cp.AddTask = cloneBytes(park.AddTask)
+	cp.AcceptTask = cloneBytes(park.AcceptTask)
+	cp.PutInvocation = cloneBytes(park.PutInvocation)
+	return &cp, nil
+}
+
+func (m *MemStore) DeletePark(_ context.Context, digest []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.parks, string(digest))
+	return nil
+}
+
+// InclusionStore =============================================================
+
+func (m *MemStore) PutInclusions(_ context.Context, incs []registry.BlobInclusion) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, inc := range incs {
+		cp := inc
+		cp.Digest = cloneBytes(inc.Digest)
+		cp.ShardDigest = cloneBytes(inc.ShardDigest)
+		m.inclusions[locKey{inc.Space, string(inc.Digest)}] = cp
+	}
+	return nil
+}
+
+func (m *MemStore) GetInclusion(_ context.Context, space did.DID, digest []byte) (*registry.BlobInclusion, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	inc, ok := m.inclusions[locKey{space, string(digest)}]
+	if !ok {
+		return nil, registry.ErrNotFound
+	}
+	cp := inc
+	cp.Digest = cloneBytes(inc.Digest)
+	cp.ShardDigest = cloneBytes(inc.ShardDigest)
+	return &cp, nil
 }
 
 // MultipartStore =============================================================
@@ -157,6 +224,9 @@ func (m *MemStore) CreateSession(_ context.Context, s registry.MultipartSession)
 	}
 	if s.State == "" {
 		s.State = registry.SessionOpen
+	}
+	if s.CreatedAt.IsZero() {
+		s.CreatedAt = time.Now()
 	}
 	m.sessions[s.UploadID] = cloneSession(s)
 	return nil
@@ -205,6 +275,9 @@ func (m *MemStore) PutPart(_ context.Context, p registry.MultipartPart) error {
 	if p.State == "" {
 		p.State = registry.PartParked
 	}
+	if p.CreatedAt.IsZero() {
+		p.CreatedAt = time.Now()
+	}
 	byNum := m.parts[p.UploadID]
 	if byNum == nil {
 		byNum = map[int]registry.MultipartPart{}
@@ -236,6 +309,60 @@ func (m *MemStore) ListParts(_ context.Context, uploadID string) ([]registry.Mul
 		out = append(out, clonePart(byNum[n]))
 	}
 	return out, nil
+}
+
+func (m *MemStore) ListSessions(_ context.Context, bucket string) ([]registry.MultipartSession, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []registry.MultipartSession
+	for _, s := range m.sessions {
+		if s.Bucket == bucket {
+			out = append(out, cloneSession(s))
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].ObjectKey != out[j].ObjectKey {
+			return out[i].ObjectKey < out[j].ObjectKey
+		}
+		if !out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].CreatedAt.Before(out[j].CreatedAt)
+		}
+		return out[i].UploadID < out[j].UploadID
+	})
+	return out, nil
+}
+
+func (m *MemStore) ListStaleSessions(_ context.Context, state string, cutoff time.Time) ([]registry.MultipartSession, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []registry.MultipartSession
+	for _, s := range m.sessions {
+		if s.State == state && s.CreatedAt.Before(cutoff) {
+			out = append(out, cloneSession(s))
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
+	return out, nil
+}
+
+func (m *MemStore) CountPartRefs(_ context.Context, digest []byte, excludeUploadID string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for uploadID, byNum := range m.parts {
+		if uploadID == excludeUploadID {
+			continue
+		}
+		for _, p := range byNum {
+			for _, d := range p.BlobDigests {
+				if bytes.Equal(d, digest) {
+					n++
+					break
+				}
+			}
+		}
+	}
+	return n, nil
 }
 
 // GCStore ====================================================================

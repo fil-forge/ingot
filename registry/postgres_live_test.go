@@ -16,6 +16,8 @@ import (
 	"github.com/fil-forge/ingot/blockstore"
 	"github.com/fil-forge/ingot/migrations"
 	"github.com/fil-forge/ingot/registry"
+	"github.com/fil-forge/libforge/testutil"
+	"github.com/fil-forge/ucantone/did"
 )
 
 func liveCid(t *testing.T, s string) cid.Cid {
@@ -55,17 +57,24 @@ func TestPostgresStores_Live(t *testing.T) {
 	}
 
 	r := registry.NewPostgres(pool)
+	seedBucket := func(t *testing.T, name string) {
+		t.Helper()
+		// space has no default (Create always supplies the DID Hilt
+		// returns); the seed uses '' — the pre-space sentinel Get maps
+		// to did.Undef.
+		if _, err := pool.Exec(ctx, `INSERT INTO ingot.buckets (name, space) VALUES ($1, '')`, name); err != nil {
+			t.Fatalf("seed bucket %q: %v", name, err)
+		}
+	}
 	digest := []byte{0x12, 0x20, 0xab, 0xcd} // binary, to exercise bytea round-trips
 
 	t.Run("bucket space defaults empty", func(t *testing.T) {
-		if err := r.Create(ctx, "b", time.Now().Unix()); err != nil {
-			t.Fatalf("Create: %v", err)
-		}
+		seedBucket(t, "b")
 		st, err := r.Get(ctx, "b")
 		if err != nil {
 			t.Fatalf("Get: %v", err)
 		}
-		if st.Space != "" {
+		if st.Space != did.Undef {
 			t.Fatalf("space = %q, want empty default", st.Space)
 		}
 	})
@@ -75,8 +84,8 @@ func TestPostgresStores_Live(t *testing.T) {
 		// denormalized, so a given (bucket, key, version) belongs to one space
 		// (a bucket has one space). A second space therefore implies a second
 		// bucket — bucket "b2" below, not a re-keyed "b".
-		const space = "did:space:1"
-		add := func(bucket, key, sp string) {
+		space := testutil.RandomDID(t)
+		add := func(bucket, key string, sp did.DID) {
 			if err := r.AddBlobClaim(ctx, registry.BlobClaim{Digest: digest, Bucket: bucket, ObjectKey: key, VersionID: registry.NullVersionID, Space: sp}); err != nil {
 				t.Fatalf("AddBlobClaim: %v", err)
 			}
@@ -84,11 +93,11 @@ func TestPostgresStores_Live(t *testing.T) {
 		add("b", "k1", space)
 		add("b", "k2", space)
 		add("b", "k1", space) // ON CONFLICT DO NOTHING — does not inflate the count
-		add("b2", "k1", "did:space:2")
+		add("b2", "k1", testutil.RandomDID(t))
 		if n, _ := r.CountClaims(ctx, space, digest); n != 2 {
 			t.Fatalf("count space1 = %d, want 2", n)
 		}
-		if n, _ := r.CountClaims(ctx, "did:space:2", digest); n != 1 {
+		if n, _ := r.CountClaims(ctx, testutil.RandomDID(t), digest); n != 1 {
 			t.Fatalf("count space2 = %d, want 1", n)
 		}
 		if err := r.DeleteBlobClaim(ctx, digest, "b", "k1", registry.NullVersionID); err != nil {
@@ -130,10 +139,11 @@ func TestPostgresStores_Live(t *testing.T) {
 
 	t.Run("location round trip", func(t *testing.T) {
 		// Unencrypted blob: the FEE wrap columns store as NULL and read back zero.
-		if err := r.PutLocation(ctx, registry.BlobLocation{Space: "s", Digest: digest, Provider: "did:piri", URL: "http://piri/b", Size: 100}); err != nil {
+		space := testutil.RandomDID(t)
+		if err := r.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: digest, Provider: "did:piri", URL: "http://piri/b", Size: 100}); err != nil {
 			t.Fatalf("PutLocation: %v", err)
 		}
-		loc, err := r.GetLocation(ctx, "s", digest)
+		loc, err := r.GetLocation(ctx, space, digest)
 		if err != nil || loc.URL != "http://piri/b" || loc.Size != 100 {
 			t.Fatalf("GetLocation = %+v, err %v", loc, err)
 		}
@@ -141,19 +151,20 @@ func TestPostgresStores_Live(t *testing.T) {
 			loc.RegionKeyVersion != "" || loc.TenantRecipientKID != "" || loc.ChunkSize != 0 {
 			t.Fatalf("unencrypted location read back wrap material (NULL round-trip): %+v", loc)
 		}
-		if err := r.DeleteLocation(ctx, "s", digest); err != nil {
+		if err := r.DeleteLocation(ctx, space, digest); err != nil {
 			t.Fatalf("DeleteLocation: %v", err)
 		}
-		if _, err := r.GetLocation(ctx, "s", digest); err != registry.ErrNotFound {
+		if _, err := r.GetLocation(ctx, space, digest); err != registry.ErrNotFound {
 			t.Fatalf("GetLocation after delete = %v, want ErrNotFound", err)
 		}
 	})
 
 	t.Run("location FEE wrap material", func(t *testing.T) {
 		// Binary bytea (with an embedded NUL) exercises real byte round-trips.
+		space := testutil.RandomDID(t)
 		encDigest := []byte{0x00, 0x01, 0x02, 0xff}
 		enc := registry.BlobLocation{
-			Space: "s", Digest: encDigest, Provider: "did:piri", URL: "http://piri/enc", Size: 4096,
+			Space: space, Digest: encDigest, Provider: "did:piri", URL: "http://piri/enc", Size: 4096,
 			RegionWrappedCEK:   []byte{0x00, 0xde, 0xad, 0xbe, 0xef},
 			RegionKeyVersion:   "region-v1",
 			TenantRecipientKID: "did:key:tenant#wrap",
@@ -164,7 +175,7 @@ func TestPostgresStores_Live(t *testing.T) {
 		if err := r.PutLocation(ctx, enc); err != nil {
 			t.Fatalf("PutLocation (encrypted): %v", err)
 		}
-		got, err := r.GetLocation(ctx, "s", encDigest)
+		got, err := r.GetLocation(ctx, space, encDigest)
 		if err != nil {
 			t.Fatalf("GetLocation (encrypted): %v", err)
 		}
@@ -183,30 +194,62 @@ func TestPostgresStores_Live(t *testing.T) {
 		if err := r.PutLocation(ctx, *got); err != nil {
 			t.Fatalf("PutLocation (re-wrap): %v", err)
 		}
-		after, err := r.GetLocation(ctx, "s", encDigest)
+		after, err := r.GetLocation(ctx, space, encDigest)
 		if err != nil || !bytes.Equal(after.RegionWrappedCEK, []byte{0x11, 0x22, 0x33}) || after.RegionKeyVersion != "region-v2" {
 			t.Fatalf("re-wrap round-trip = %+v, err %v", after, err)
 		}
 		if after.ChunkSize != 65536 || !bytes.Equal(after.BaseNonce, enc.BaseNonce) {
 			t.Fatalf("re-wrap disturbed non-wrap fields: %+v", after)
 		}
-		if err := r.DeleteLocation(ctx, "s", encDigest); err != nil {
+		if err := r.DeleteLocation(ctx, space, encDigest); err != nil {
 			t.Fatalf("DeleteLocation: %v", err)
 		}
 	})
 
 	t.Run("location partial FEE rejected", func(t *testing.T) {
 		// A partial wrap set is rejected before it reaches SQL and leaves no row.
+		space := testutil.RandomDID(t)
 		d := []byte{0x77}
 		partial := registry.BlobLocation{
-			Space: "s", Digest: d, Provider: "did:piri", URL: "u", Size: 10,
+			Space: space, Digest: d, Provider: "did:piri", URL: "u", Size: 10,
 			RegionWrappedCEK: []byte{0x01}, // the rest deliberately absent
 		}
 		if err := r.PutLocation(ctx, partial); !errors.Is(err, registry.ErrPartialFEE) {
 			t.Fatalf("PutLocation(partial) = %v, want ErrPartialFEE", err)
 		}
-		if _, err := r.GetLocation(ctx, "s", d); !errors.Is(err, registry.ErrNotFound) {
+		if _, err := r.GetLocation(ctx, space, d); !errors.Is(err, registry.ErrNotFound) {
 			t.Fatalf("partial FEE leaked a row: %v", err)
+		}
+	})
+
+	t.Run("park round trip", func(t *testing.T) {
+		park := registry.BlobPark{
+			Digest:        digest,
+			AddTask:       []byte{0x01, 0x02},
+			AcceptTask:    []byte{0x03, 0x04},
+			PutInvocation: []byte("sealed-inv"),
+			Size:          42,
+		}
+		if err := r.PutPark(ctx, park); err != nil {
+			t.Fatalf("PutPark: %v", err)
+		}
+		got, err := r.GetPark(ctx, digest)
+		if err != nil || string(got.PutInvocation) != "sealed-inv" || got.Size != 42 {
+			t.Fatalf("GetPark = %+v, err %v", got, err)
+		}
+		// Upsert replaces in place.
+		park.Size = 43
+		if err := r.PutPark(ctx, park); err != nil {
+			t.Fatalf("PutPark (upsert): %v", err)
+		}
+		if got, err := r.GetPark(ctx, digest); err != nil || got.Size != 43 {
+			t.Fatalf("GetPark after upsert = %+v, err %v", got, err)
+		}
+		if err := r.DeletePark(ctx, digest); err != nil {
+			t.Fatalf("DeletePark: %v", err)
+		}
+		if _, err := r.GetPark(ctx, digest); err != registry.ErrNotFound {
+			t.Fatalf("GetPark after delete = %v, want ErrNotFound", err)
 		}
 	})
 
@@ -255,6 +298,71 @@ func TestPostgresStores_Live(t *testing.T) {
 		}
 	})
 
+	t.Run("multipart listing sweeper and part refs", func(t *testing.T) {
+		mk := func(id, key string) {
+			t.Helper()
+			if err := r.CreateSession(ctx, registry.MultipartSession{
+				UploadID: id, Bucket: "b", ObjectKey: key,
+				ContentEncoding: "testenc", ChecksumAlgorithm: "CRC32", ChecksumType: "FULL_OBJECT",
+			}); err != nil {
+				t.Fatalf("CreateSession %s: %v", id, err)
+			}
+		}
+		mk("ls-2", "zeta")
+		mk("ls-1", "alpha")
+		mk("ls-3", "alpha") // same key, created after ls-1
+
+		// New session columns round-trip.
+		s, err := r.GetSession(ctx, "ls-1")
+		if err != nil || s.ContentEncoding != "testenc" || s.ChecksumAlgorithm != "CRC32" ||
+			s.ChecksumType != "FULL_OBJECT" || s.CreatedAt.IsZero() {
+			t.Fatalf("GetSession new columns = %+v, err %v", s, err)
+		}
+
+		// ListSessions: (object_key, created_at, upload_id) order.
+		sessions, err := r.ListSessions(ctx, "b")
+		if err != nil || len(sessions) != 3 ||
+			sessions[0].UploadID != "ls-1" || sessions[1].UploadID != "ls-3" || sessions[2].UploadID != "ls-2" {
+			ids := make([]string, len(sessions))
+			for i, x := range sessions {
+				ids[i] = x.UploadID
+			}
+			t.Fatalf("ListSessions order = %v, err %v (want [ls-1 ls-3 ls-2])", ids, err)
+		}
+
+		// ListStaleSessions: cutoff in the past excludes them, future includes.
+		if stale, err := r.ListStaleSessions(ctx, registry.SessionOpen, time.Now().Add(-time.Hour)); err != nil || len(stale) != 0 {
+			t.Fatalf("ListStaleSessions past cutoff = %d, err %v (want 0)", len(stale), err)
+		}
+		if stale, err := r.ListStaleSessions(ctx, registry.SessionOpen, time.Now().Add(time.Hour)); err != nil || len(stale) != 3 {
+			t.Fatalf("ListStaleSessions future cutoff = %d, err %v (want 3)", len(stale), err)
+		}
+
+		// CountPartRefs: bytea[] ANY-match across sessions, excluding one.
+		shared := []byte{0xee, 0x01}
+		if err := r.PutPart(ctx, registry.MultipartPart{UploadID: "ls-1", PartNumber: 1, ETagMD5: []byte{1}, Size: 1, BlobDigests: [][]byte{shared}}); err != nil {
+			t.Fatalf("PutPart ls-1: %v", err)
+		}
+		if err := r.PutPart(ctx, registry.MultipartPart{UploadID: "ls-2", PartNumber: 1, ETagMD5: []byte{2}, Size: 1, BlobDigests: [][]byte{shared, {0xee, 0x02}}}); err != nil {
+			t.Fatalf("PutPart ls-2: %v", err)
+		}
+		if n, err := r.CountPartRefs(ctx, shared, "ls-1"); err != nil || n != 1 {
+			t.Fatalf("CountPartRefs(shared, exclude ls-1) = %d, err %v (want 1)", n, err)
+		}
+		if n, err := r.CountPartRefs(ctx, []byte{0xee, 0x02}, "ls-2"); err != nil || n != 0 {
+			t.Fatalf("CountPartRefs(unique, exclude owner) = %d, err %v (want 0)", n, err)
+		}
+
+		// 'completed' passes the widened state CHECK constraint.
+		if won, err := r.LatchSession(ctx, "ls-1", registry.SessionOpen, registry.SessionCompleted); err != nil || !won {
+			t.Fatalf("latch to completed won=%v err=%v", won, err)
+		}
+
+		for _, id := range []string{"ls-1", "ls-2", "ls-3"} {
+			_ = r.DeleteSession(ctx, id)
+		}
+	})
+
 	t.Run("gc candidate idempotent", func(t *testing.T) {
 		if err := r.AddGCCandidate(ctx, digest, "b"); err != nil {
 			t.Fatalf("AddGCCandidate: %v", err)
@@ -267,9 +375,7 @@ func TestPostgresStores_Live(t *testing.T) {
 	t.Run("forge_root advance guarded on root", func(t *testing.T) {
 		committed := liveCid(t, "fg-committed")
 		stale := liveCid(t, "fg-stale")
-		if err := r.Create(ctx, "fg", time.Now().Unix()); err != nil {
-			t.Fatalf("Create: %v", err)
-		}
+		seedBucket(t, "fg")
 		if err := r.CASRoot(ctx, "fg", cid.Undef, committed); err != nil {
 			t.Fatalf("CASRoot: %v", err)
 		}
@@ -277,12 +383,12 @@ func TestPostgresStores_Live(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NextSegmentSeq: %v", err)
 		}
-		if err := r.InsertSegmentOpen(ctx, blockstore.PlaneCatalog, seq); err != nil {
+		if err := r.InsertSegmentOpen(ctx, blockstore.PlaneCatalog, seq, "fg"); err != nil {
 			t.Fatalf("InsertSegmentOpen: %v", err)
 		}
 		// Ship a segment whose op-roots include a stale root the bucket never
 		// adopted; only the committed root may advance forge_root.
-		if err := r.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seq, time.Now().Unix(),
+		if err := r.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seq, time.Now().Unix(), nil,
 			[]blockstore.OpRoot{{Bucket: "fg", Root: stale}, {Bucket: "fg", Root: committed}}); err != nil {
 			t.Fatalf("MarkSegmentShipped: %v", err)
 		}

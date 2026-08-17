@@ -1,0 +1,75 @@
+version: 2
+
+project_name: ingot
+
+builds:
+  - id: ingot
+    main: ./cmd/ingot
+    binary: ingot
+    ldflags:
+      # Stamp the build package (see internal/build). {{.Version}} has no
+      # leading v, so prefix one. CommitDate/CommitTimestamp keep the build
+      # reproducible. https://goreleaser.com/customization/builds/#reproducible-builds
+      - -s -w -X github.com/fil-forge/ingot/internal/build.Version=v{{.Version}} -X github.com/fil-forge/ingot/internal/build.Commit={{.Commit}} -X github.com/fil-forge/ingot/internal/build.Date={{.CommitDate}} -X github.com/fil-forge/ingot/internal/build.BuiltBy=goreleaser
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - 'amd64'
+      - 'arm64'
+    mod_timestamp: '{{.CommitTimestamp}}'
+    env:
+      - CGO_ENABLED=0
+
+universal_binaries:
+  - replace: true
+
+archives:
+  - format_overrides:
+      - goos: darwin
+        formats: zip
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_
+      {{- if eq .Os "darwin" }}mac_os
+      {{- else }}{{ .Os }}{{ end }}_{{ .Arch }}
+
+release:
+  mode: keep-existing
+
+changelog:
+  disable: true
+
+dockers:
+  # AMD64 image
+  - image_templates:
+      - "ghcr.io/fil-forge/ingot:{{ .Version }}-amd64"
+    dockerfile: Dockerfile.release
+    use: buildx
+    build_flag_templates:
+      - "--platform=linux/amd64"
+      - "--label=org.opencontainers.image.created={{.Date}}"
+      - "--label=org.opencontainers.image.title={{.ProjectName}}"
+      - "--label=org.opencontainers.image.revision={{.FullCommit}}"
+      - "--label=org.opencontainers.image.version={{.Version}}"
+      - "--label=org.opencontainers.image.source={{.GitURL}}"
+    goarch: amd64
+
+  # ARM64 image
+  - image_templates:
+      - "ghcr.io/fil-forge/ingot:{{ .Version }}-arm64"
+    dockerfile: Dockerfile.release
+    use: buildx
+    build_flag_templates:
+      - "--platform=linux/arm64"
+      - "--label=org.opencontainers.image.created={{.Date}}"
+      - "--label=org.opencontainers.image.title={{.ProjectName}}"
+      - "--label=org.opencontainers.image.revision={{.FullCommit}}"
+      - "--label=org.opencontainers.image.version={{.Version}}"
+      - "--label=org.opencontainers.image.source={{.GitURL}}"
+    goarch: arm64
+
+docker_manifests:
+  - name_template: "ghcr.io/fil-forge/ingot:{{ .Version }}"
+    image_templates:
+      - "ghcr.io/fil-forge/ingot:{{ .Version }}-amd64"
+      - "ghcr.io/fil-forge/ingot:{{ .Version }}-arm64"

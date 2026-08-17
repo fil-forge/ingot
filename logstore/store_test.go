@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"slices"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -44,13 +46,13 @@ func (f *fakeMeta) NextSegmentSeq(_ context.Context) (uint64, error) {
 	return f.nextSeq, nil
 }
 
-func (f *fakeMeta) InsertSegmentOpen(_ context.Context, plane blockstore.Plane, seq uint64) error {
+func (f *fakeMeta) InsertSegmentOpen(_ context.Context, plane blockstore.Plane, seq uint64, bucket string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if _, ok := f.segments[seq]; ok {
 		return nil
 	}
-	f.segments[seq] = &SegmentMeta{Seq: seq, Plane: plane, State: StateOpen}
+	f.segments[seq] = &SegmentMeta{Seq: seq, Plane: plane, Bucket: bucket, State: StateOpen}
 	return nil
 }
 
@@ -74,7 +76,7 @@ func (f *fakeMeta) MarkSegmentSealed(_ context.Context, plane blockstore.Plane, 
 	return nil
 }
 
-func (f *fakeMeta) MarkSegmentShipped(_ context.Context, plane blockstore.Plane, seq uint64, shippedAt int64, opRoots []blockstore.OpRoot) error {
+func (f *fakeMeta) MarkSegmentShipped(_ context.Context, plane blockstore.Plane, seq uint64, shippedAt int64, indexDigest []byte, opRoots []blockstore.OpRoot) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	m, ok := f.segments[seq]
@@ -85,6 +87,7 @@ func (f *fakeMeta) MarkSegmentShipped(_ context.Context, plane blockstore.Plane,
 		return nil
 	}
 	m.ShippedAt = shippedAt
+	m.IndexDigest = slices.Clone(indexDigest)
 	f.shipped = append(f.shipped, shipEvent{seq: seq, plane: plane})
 	return nil
 }
@@ -96,16 +99,35 @@ func (f *fakeMeta) DeleteSegment(_ context.Context, plane blockstore.Plane, seq 
 	return nil
 }
 
-func (f *fakeMeta) ListSegments(_ context.Context, plane blockstore.Plane) ([]SegmentMeta, error) {
+func (f *fakeMeta) ListSegments(_ context.Context, plane blockstore.Plane, bucket string) ([]SegmentMeta, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var out []SegmentMeta
 	for _, m := range f.segments {
-		if m.Plane != plane {
+		if m.Plane != plane || m.Bucket != bucket {
 			continue
 		}
 		out = append(out, *m)
 	}
+	return out, nil
+}
+
+func (f *fakeMeta) ListSegmentBuckets(_ context.Context, plane blockstore.Plane) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	seen := map[string]struct{}{}
+	var out []string
+	for _, m := range f.segments {
+		if m.Plane != plane {
+			continue
+		}
+		if _, ok := seen[m.Bucket]; ok {
+			continue
+		}
+		seen[m.Bucket] = struct{}{}
+		out = append(out, m.Bucket)
+	}
+	sort.Strings(out)
 	return out, nil
 }
 
@@ -153,9 +175,9 @@ func newTestStore(t *testing.T, sealBytes int64, sealAge time.Duration, retain i
 	meta := newFakeMeta()
 	flushCalls := &atomicCounter{}
 	logger := zaptest.NewLogger(t)
-	flush := func(_ context.Context, _ *Segment) error {
+	flush := func(_ context.Context, _ *Segment) ([]byte, error) {
 		flushCalls.add(1)
-		return nil
+		return nil, nil
 	}
 	cfg := Config{
 		Dir:     dir,
@@ -315,7 +337,7 @@ func TestForceSealRecoveredOpenOnRestart(t *testing.T) {
 		cfg := Config{
 			Dir:     dir,
 			Meta:    meta,
-			Catalog: PlaneConfig{SealBytes: 1 << 30, SealAge: time.Hour, Ship: true, Flush: func(context.Context, *Segment) error { return nil }, Retain: 6},
+			Catalog: PlaneConfig{SealBytes: 1 << 30, SealAge: time.Hour, Ship: true, Flush: func(context.Context, *Segment) ([]byte, error) { return nil, nil }, Retain: 6},
 			Logger:  logger,
 		}
 		s, err := Open(context.Background(), cfg)
@@ -492,7 +514,7 @@ func TestCatalogNeverShips(t *testing.T) {
 			SealBytes: 1,
 			SealAge:   20 * time.Millisecond,
 			Ship:      false,
-			Flush:     func(context.Context, *Segment) error { ships.add(1); return nil },
+			Flush:     func(context.Context, *Segment) ([]byte, error) { ships.add(1); return nil, nil },
 		},
 		Logger: logger,
 	}

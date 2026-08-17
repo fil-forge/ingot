@@ -26,9 +26,9 @@ import (
 //   - row present, no CAR → delete the row.
 //   - sidecar (.idx/.ops) with no CAR → stray; unlink.
 func (pl *PlaneLog) recover(ctx context.Context) error {
-	rows, err := pl.meta.ListSegments(ctx, pl.plane)
+	rows, err := pl.meta.ListSegments(ctx, pl.plane, pl.bucket)
 	if err != nil {
-		return fmt.Errorf("logstore: list %s segments: %w", pl.plane, err)
+		return fmt.Errorf("logstore: list %s segments for %q: %w", pl.plane, pl.bucket, err)
 	}
 	dbBySeq := make(map[uint64]SegmentMeta, len(rows))
 	for _, r := range rows {
@@ -106,7 +106,7 @@ func (pl *PlaneLog) recover(ctx context.Context) error {
 			if err != nil {
 				return fmt.Errorf("logstore: rebuild orphan %s seg %d: %w", pl.plane, seq, err)
 			}
-			if err := pl.meta.InsertSegmentOpen(ctx, pl.plane, seq); err != nil {
+			if err := pl.meta.InsertSegmentOpen(ctx, pl.plane, seq, pl.bucket); err != nil {
 				return fmt.Errorf("logstore: insert orphan %s row %d: %w", pl.plane, seq, err)
 			}
 			if recoveredOpen != nil {

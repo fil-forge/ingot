@@ -128,12 +128,6 @@ func (s *FsStore) AddReceipts(ctx context.Context, receipts ...ucan.Receipt) err
 	return s.save()
 }
 
-func (s *FsStore) ProofAttestations(ctx context.Context, proofs []ucan.Delegation, authority did.DID) ([]ucan.Invocation, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.data.ProofAttestations(ctx, proofs, authority)
-}
-
 func (s *FsStore) ProofChain(ctx context.Context, aud did.DID, cmd ucan.Command, sub did.DID) ([]ucan.Delegation, []cid.Cid, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

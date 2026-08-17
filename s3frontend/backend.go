@@ -12,22 +12,27 @@
 //     staging buffer, MST CBOR view, bucket-Root CAS, and per-bucket
 //     locking.
 //
-// Operations not implemented (multipart, lifecycle, locking,
-// versioning, etc.) inherit ErrNotImplemented from the embedded
+// Operations not implemented (lifecycle, tagging, bucket policies,
+// etc.) inherit ErrNotImplemented from the embedded
 // backend.BackendUnsupported. The few unsupported-by-default
 // methods that versitygw nevertheless calls on every request
-// (GetBucketAcl, GetBucketPolicy, GetObjectLockConfiguration,
-// GetBucketVersioning) are stubbed in bucket.go.
+// (GetBucketAcl, GetBucketPolicy, GetBucketCors) are stubbed in
+// bucket.go. Object lock is implemented: the bucket configuration in
+// bucket.go, the per-version retention / legal-hold methods in
+// objectlock.go (docs/s3-object-lock.md).
 package s3frontend
 
 import (
 	"context"
+	"encoding/xml"
 
-	"github.com/versity/versitygw/backend"
+	"github.com/fil-forge/versitygw/auth"
+	"github.com/fil-forge/versitygw/backend"
+	"go.uber.org/zap"
 
 	"github.com/fil-forge/ingot/blockstore"
+	"github.com/fil-forge/ingot/bucketauthority"
 	"github.com/fil-forge/ingot/bucketop"
-	"github.com/fil-forge/ingot/logstore"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/uploader"
 )
@@ -40,6 +45,7 @@ type Backend struct {
 	backend.BackendUnsupported
 
 	read      blockstore.ReadStore
+	authority bucketauthority.BucketAuthority
 	reg       registry.Registry
 	intents   registry.IntentStore
 	locations registry.LocationStore
@@ -47,19 +53,24 @@ type Backend struct {
 	gc        registry.GCStore
 	multipart registry.MultipartStore
 	txns      *bucketop.Coordinator
+	log       blockstore.Log
 	spool     *blockstore.Spool
 	uploader  uploader.BodyUploader
+	deferred  uploader.DeferredBodyUploader
+	parks     registry.ParkStore
 	remover   uploader.BlobRemover
+	logger    *zap.Logger
 
-	// space is the Forge space this instance owns; the key under which body
-	// blobs' locations and reference claims are recorded. Empty in the
-	// in-memory harness, where reads are served from the spool.
-	space       string
 	maxBlobSize int64
+	// cors is Deps.CORS marshalled once at construction — GetBucketCors
+	// is on the per-request path, so the document is built here rather
+	// than per call. Nil when CORS is disabled.
+	cors []byte
 }
 
 // Deps wires a Backend over ingot's domain primitives.
 type Deps struct {
+	Authority bucketauthority.BucketAuthority
 	// Registry tracks per-bucket roots; IntentStore tracks the local spool's
 	// upload_intents lifecycle; LocationStore records where each accepted body
 	// blob can be retrieved from. Production passes one *registry.Postgres for
@@ -75,9 +86,11 @@ type Deps struct {
 	Multipart registry.MultipartStore
 
 	// Reads is the layered read tier (spool → log → forge). Log is the catalog
-	// LSM write log driving the per-op staging buffer + commit.
+	// LSM write log driving the per-op staging buffer + commit — in production
+	// the per-bucket *logstore.Manager, which routes each append to the
+	// bucket's own log.
 	Reads blockstore.ReadStore
-	Log   *logstore.Store
+	Log   blockstore.Log
 
 	// Spool is the local blob store: SplitBody writes body blobs here on PUT,
 	// and they are served back from here on GET (read-after-write / cache).
@@ -87,13 +100,23 @@ type Deps struct {
 	// accept) synchronously, before the manifest commits. Remover releases a
 	// space's claim on a blob when its last reference is dropped.
 	Uploader uploader.BodyUploader
+	// Deferred extends Uploader for multipart's deferred accept
+	// (WithConclude(false), then ConcludeBlob/AbortBlob); Parks persists
+	// park state between UploadPart and Complete/Abort.
+	Deferred uploader.DeferredBodyUploader
+	Parks    registry.ParkStore
 	Remover  uploader.BlobRemover
-
-	// Space is the Forge space this instance owns (empty in the harness).
-	Space string
 
 	// MaxBlobSize is the coarse-split blob ceiling (0 → bucket default).
 	MaxBlobSize int64
+
+	// CORS is the S3 CORS configuration GetBucketCors reports for every
+	// bucket, rendered from config by internal/cors. New marshals it once
+	// into the XML document the S3 API serves. Nil disables CORS.
+	CORS *auth.CORSConfiguration
+
+	// Logger is optional; defaults to zap.NewNop().
+	Logger *zap.Logger
 }
 
 // Compile-time assertion that Backend satisfies versitygw's interface.
@@ -101,7 +124,24 @@ var _ backend.Backend = (*Backend)(nil)
 
 // New constructs a Backend wired over ingot's domain primitives.
 func New(d Deps) *Backend {
+	logger := d.Logger
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+	// xml.Marshal cannot fail for CORSConfiguration's plain string and
+	// int fields, but a failure must not leave the gateway serving a
+	// half-configured document: log it and fall back to CORS disabled.
+	var corsDoc []byte
+	if d.CORS != nil {
+		doc, err := xml.Marshal(d.CORS)
+		if err != nil {
+			logger.Error("marshalling CORS configuration; CORS disabled", zap.Error(err))
+		} else {
+			corsDoc = doc
+		}
+	}
 	return &Backend{
+		authority:   d.Authority,
 		read:        d.Reads,
 		reg:         d.Registry,
 		intents:     d.Intents,
@@ -110,11 +150,15 @@ func New(d Deps) *Backend {
 		gc:          d.GC,
 		multipart:   d.Multipart,
 		txns:        bucketop.NewCoordinator(bucketop.Deps{Reg: d.Registry, Log: d.Log, Reads: d.Reads}),
+		log:         d.Log,
 		spool:       d.Spool,
 		uploader:    d.Uploader,
+		deferred:    d.Deferred,
+		parks:       d.Parks,
 		remover:     d.Remover,
-		space:       d.Space,
+		logger:      logger,
 		maxBlobSize: d.MaxBlobSize,
+		cors:        corsDoc,
 	}
 }
 

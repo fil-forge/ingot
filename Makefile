@@ -11,19 +11,30 @@ GO ?= go
 
 .DEFAULT_GOAL := build
 
-.PHONY: build test gen clean help
+.PHONY: build test itest gen gen-check clean help
 
-## build: compile all packages
+## build: compile the daemon binary (-> ./ingot)
 build:
-	$(GO) build ./...
+	$(GO) build -o ingot ./cmd/ingot
 
-## test: run the full test suite (uncached)
+## test: run the unit test suite (fast, no Docker)
 test:
 	$(GO) test ./...
+
+## itest: run the integration test suite (boots the Forge stack in Docker; ~6 min)
+itest:
+	$(GO) test -tags itest -v -timeout 30m ./itest
 
 ## gen: regenerate CBOR marshalers (idempotent)
 gen:
 	$(GO) generate ./...
+
+## gen-check: regenerate, then fail if the committed generated files are stale
+gen-check: gen
+	@git diff --exit-code -- bucket/cbor_gen.go || { \
+		echo "bucket/cbor_gen.go is stale; run 'make gen' and commit the result"; \
+		exit 1; \
+	}
 
 ## clean: remove the go build/test cache
 clean:

@@ -15,6 +15,11 @@ type Config struct {
 	// <Dir>/catalog. Created if missing.
 	Dir string
 
+	// Bucket is the bucket this store belongs to. The log is segregated per
+	// bucket (each bucket's segments ship to its own Forge space); segment
+	// rows are stamped with it, and recovery lists only this bucket's rows.
+	Bucket string
+
 	// Meta is the persistence backing for segment metadata. Required.
 	Meta Meta
 
@@ -55,8 +60,12 @@ type PlaneConfig struct {
 }
 
 // FlushFunc is the contract for shipping one sealed segment's CAR to
-// Forge. The segment is single-plane, so no plane argument is needed.
-type FlushFunc func(ctx context.Context, seg *Segment) error
+// Forge. The segment is single-plane, so no plane argument is needed. On
+// success it returns the digest of the shipped sharded-dag-index blob (the
+// ship registers the CAR and its index in the bucket's space; DeleteBucket
+// releases both), or nil when nothing registered (header-only segment, or a
+// non-publishing uploader).
+type FlushFunc func(ctx context.Context, seg *Segment) ([]byte, error)
 
 func (c *Config) validate() error {
 	if c.Dir == "" {

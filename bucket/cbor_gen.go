@@ -26,7 +26,7 @@ func (t *ObjectManifest) MarshalCBOR(w io.Writer) error {
 
 	cw := cbg.NewCborWriter(w)
 
-	if _, err := cw.Write([]byte{174}); err != nil {
+	if _, err := cw.Write([]byte{178}); err != nil {
 		return err
 	}
 
@@ -275,6 +275,29 @@ func (t *ObjectManifest) MarshalCBOR(w io.Writer) error {
 		return err
 	}
 
+	// t.ChecksumType (string) (string)
+	if len("cy") > 1000000 {
+		return xerrors.Errorf("Value in field \"cy\" was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("cy"))); err != nil {
+		return err
+	}
+	if _, err := cw.WriteString(string("cy")); err != nil {
+		return err
+	}
+
+	if len(t.ChecksumType) > 1000000 {
+		return xerrors.Errorf("Value in field t.ChecksumType was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len(t.ChecksumType))); err != nil {
+		return err
+	}
+	if _, err := cw.WriteString(string(t.ChecksumType)); err != nil {
+		return err
+	}
+
 	// t.DeleteMarker (bool) (bool)
 	if len("dm") > 1000000 {
 		return xerrors.Errorf("Value in field \"dm\" was too long")
@@ -366,6 +389,68 @@ func (t *ObjectManifest) MarshalCBOR(w io.Writer) error {
 			}
 
 		}
+	}
+
+	// t.Seq (uint64) (uint64)
+	if len("sq") > 1000000 {
+		return xerrors.Errorf("Value in field \"sq\" was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("sq"))); err != nil {
+		return err
+	}
+	if _, err := cw.WriteString(string("sq")); err != nil {
+		return err
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajUnsignedInt, uint64(t.Seq)); err != nil {
+		return err
+	}
+
+	// t.VersionID (string) (string)
+	if len("vi") > 1000000 {
+		return xerrors.Errorf("Value in field \"vi\" was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("vi"))); err != nil {
+		return err
+	}
+	if _, err := cw.WriteString(string("vi")); err != nil {
+		return err
+	}
+
+	if len(t.VersionID) > 1000000 {
+		return xerrors.Errorf("Value in field t.VersionID was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len(t.VersionID))); err != nil {
+		return err
+	}
+	if _, err := cw.WriteString(string(t.VersionID)); err != nil {
+		return err
+	}
+
+	// t.WebsiteRedirectLocation (string) (string)
+	if len("wr") > 1000000 {
+		return xerrors.Errorf("Value in field \"wr\" was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("wr"))); err != nil {
+		return err
+	}
+	if _, err := cw.WriteString(string("wr")); err != nil {
+		return err
+	}
+
+	if len(t.WebsiteRedirectLocation) > 1000000 {
+		return xerrors.Errorf("Value in field t.WebsiteRedirectLocation was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len(t.WebsiteRedirectLocation))); err != nil {
+		return err
+	}
+	if _, err := cw.WriteString(string(t.WebsiteRedirectLocation)); err != nil {
+		return err
 	}
 	return nil
 }
@@ -546,6 +631,17 @@ func (t *ObjectManifest) UnmarshalCBOR(r io.Reader) (err error) {
 
 				t.ContentType = string(sval)
 			}
+			// t.ChecksumType (string) (string)
+		case "cy":
+
+			{
+				sval, err := cbg.ReadStringWithMax(cr, 1000000)
+				if err != nil {
+					return err
+				}
+
+				t.ChecksumType = string(sval)
+			}
 			// t.DeleteMarker (bool) (bool)
 		case "dm":
 
@@ -617,6 +713,43 @@ func (t *ObjectManifest) UnmarshalCBOR(r io.Reader) (err error) {
 
 				t.Metadata[k] = v
 
+			}
+			// t.Seq (uint64) (uint64)
+		case "sq":
+
+			{
+
+				maj, extra, err = cr.ReadHeader()
+				if err != nil {
+					return err
+				}
+				if maj != cbg.MajUnsignedInt {
+					return fmt.Errorf("wrong type for uint64 field")
+				}
+				t.Seq = uint64(extra)
+
+			}
+			// t.VersionID (string) (string)
+		case "vi":
+
+			{
+				sval, err := cbg.ReadStringWithMax(cr, 1000000)
+				if err != nil {
+					return err
+				}
+
+				t.VersionID = string(sval)
+			}
+			// t.WebsiteRedirectLocation (string) (string)
+		case "wr":
+
+			{
+				sval, err := cbg.ReadStringWithMax(cr, 1000000)
+				if err != nil {
+					return err
+				}
+
+				t.WebsiteRedirectLocation = string(sval)
 			}
 
 		default:
@@ -1232,6 +1365,883 @@ func (t *BlobRef) UnmarshalCBOR(r io.Reader) (err error) {
 				}
 
 				t.Offset = int64(extraI)
+			}
+
+		default:
+			// Field doesn't exist on this type, so ignore it
+			if err := cbg.ScanForLinks(r, func(cid.Cid) {}); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+func (t *ObjectLeaf) MarshalCBOR(w io.Writer) error {
+	if t == nil {
+		_, err := w.Write(cbg.CborNull)
+		return err
+	}
+
+	cw := cbg.NewCborWriter(w)
+
+	if _, err := cw.Write([]byte{164}); err != nil {
+		return err
+	}
+
+	// t.Current (bucket.VersionNode) (struct)
+	if len("c") > 1000000 {
+		return xerrors.Errorf("Value in field \"c\" was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("c"))); err != nil {
+		return err
+	}
+	if _, err := cw.WriteString(string("c")); err != nil {
+		return err
+	}
+
+	if err := t.Current.MarshalCBOR(cw); err != nil {
+		return err
+	}
+
+	// t.NullSeq (uint64) (uint64)
+	if len("n") > 1000000 {
+		return xerrors.Errorf("Value in field \"n\" was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("n"))); err != nil {
+		return err
+	}
+	if _, err := cw.WriteString(string("n")); err != nil {
+		return err
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajUnsignedInt, uint64(t.NullSeq)); err != nil {
+		return err
+	}
+
+	// t.Prev (cid.Cid) (struct)
+	if len("p") > 1000000 {
+		return xerrors.Errorf("Value in field \"p\" was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("p"))); err != nil {
+		return err
+	}
+	if _, err := cw.WriteString(string("p")); err != nil {
+		return err
+	}
+
+	if t.Prev == nil {
+		if _, err := cw.Write(cbg.CborNull); err != nil {
+			return err
+		}
+	} else {
+		if err := cbg.WriteCid(cw, *t.Prev); err != nil {
+			return xerrors.Errorf("failed to write cid field t.Prev: %w", err)
+		}
+	}
+
+	// t.State (cid.Cid) (struct)
+	if len("st") > 1000000 {
+		return xerrors.Errorf("Value in field \"st\" was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("st"))); err != nil {
+		return err
+	}
+	if _, err := cw.WriteString(string("st")); err != nil {
+		return err
+	}
+
+	if t.State == nil {
+		if _, err := cw.Write(cbg.CborNull); err != nil {
+			return err
+		}
+	} else {
+		if err := cbg.WriteCid(cw, *t.State); err != nil {
+			return xerrors.Errorf("failed to write cid field t.State: %w", err)
+		}
+	}
+
+	return nil
+}
+
+func (t *ObjectLeaf) UnmarshalCBOR(r io.Reader) (err error) {
+	*t = ObjectLeaf{}
+
+	cr := cbg.NewCborReader(r)
+
+	maj, extra, err := cr.ReadHeader()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err == io.EOF {
+			err = io.ErrUnexpectedEOF
+		}
+	}()
+
+	if maj != cbg.MajMap {
+		return fmt.Errorf("cbor input should be of type map")
+	}
+
+	if extra > cbg.MaxLength {
+		return fmt.Errorf("ObjectLeaf: map struct too large (%d)", extra)
+	}
+
+	n := extra
+
+	nameBuf := make([]byte, 2)
+	for i := uint64(0); i < n; i++ {
+		nameLen, ok, err := cbg.ReadFullStringIntoBuf(cr, nameBuf, 1000000)
+		if err != nil {
+			return err
+		}
+
+		if !ok {
+			// Field doesn't exist on this type, so ignore it
+			if err := cbg.ScanForLinks(cr, func(cid.Cid) {}); err != nil {
+				return err
+			}
+			continue
+		}
+
+		switch string(nameBuf[:nameLen]) {
+		// t.Current (bucket.VersionNode) (struct)
+		case "c":
+
+			{
+
+				if err := t.Current.UnmarshalCBOR(cr); err != nil {
+					return xerrors.Errorf("unmarshaling t.Current: %w", err)
+				}
+
+			}
+			// t.NullSeq (uint64) (uint64)
+		case "n":
+
+			{
+
+				maj, extra, err = cr.ReadHeader()
+				if err != nil {
+					return err
+				}
+				if maj != cbg.MajUnsignedInt {
+					return fmt.Errorf("wrong type for uint64 field")
+				}
+				t.NullSeq = uint64(extra)
+
+			}
+			// t.Prev (cid.Cid) (struct)
+		case "p":
+
+			{
+
+				b, err := cr.ReadByte()
+				if err != nil {
+					return err
+				}
+				if b != cbg.CborNull[0] {
+					if err := cr.UnreadByte(); err != nil {
+						return err
+					}
+
+					c, err := cbg.ReadCid(cr)
+					if err != nil {
+						return xerrors.Errorf("failed to read cid field t.Prev: %w", err)
+					}
+
+					t.Prev = &c
+				}
+
+			}
+			// t.State (cid.Cid) (struct)
+		case "st":
+
+			{
+
+				b, err := cr.ReadByte()
+				if err != nil {
+					return err
+				}
+				if b != cbg.CborNull[0] {
+					if err := cr.UnreadByte(); err != nil {
+						return err
+					}
+
+					c, err := cbg.ReadCid(cr)
+					if err != nil {
+						return xerrors.Errorf("failed to read cid field t.State: %w", err)
+					}
+
+					t.State = &c
+				}
+
+			}
+
+		default:
+			// Field doesn't exist on this type, so ignore it
+			if err := cbg.ScanForLinks(r, func(cid.Cid) {}); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+func (t *VersionNode) MarshalCBOR(w io.Writer) error {
+	if t == nil {
+		_, err := w.Write(cbg.CborNull)
+		return err
+	}
+
+	cw := cbg.NewCborWriter(w)
+
+	if _, err := cw.Write([]byte{163}); err != nil {
+		return err
+	}
+
+	// t.Manifest (cid.Cid) (struct)
+	if len("m") > 1000000 {
+		return xerrors.Errorf("Value in field \"m\" was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("m"))); err != nil {
+		return err
+	}
+	if _, err := cw.WriteString(string("m")); err != nil {
+		return err
+	}
+
+	if err := cbg.WriteCid(cw, t.Manifest); err != nil {
+		return xerrors.Errorf("failed to write cid field t.Manifest: %w", err)
+	}
+
+	// t.Seq (uint64) (uint64)
+	if len("s") > 1000000 {
+		return xerrors.Errorf("Value in field \"s\" was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("s"))); err != nil {
+		return err
+	}
+	if _, err := cw.WriteString(string("s")); err != nil {
+		return err
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajUnsignedInt, uint64(t.Seq)); err != nil {
+		return err
+	}
+
+	// t.VersionID (string) (string)
+	if len("v") > 1000000 {
+		return xerrors.Errorf("Value in field \"v\" was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("v"))); err != nil {
+		return err
+	}
+	if _, err := cw.WriteString(string("v")); err != nil {
+		return err
+	}
+
+	if len(t.VersionID) > 1000000 {
+		return xerrors.Errorf("Value in field t.VersionID was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len(t.VersionID))); err != nil {
+		return err
+	}
+	if _, err := cw.WriteString(string(t.VersionID)); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (t *VersionNode) UnmarshalCBOR(r io.Reader) (err error) {
+	*t = VersionNode{}
+
+	cr := cbg.NewCborReader(r)
+
+	maj, extra, err := cr.ReadHeader()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err == io.EOF {
+			err = io.ErrUnexpectedEOF
+		}
+	}()
+
+	if maj != cbg.MajMap {
+		return fmt.Errorf("cbor input should be of type map")
+	}
+
+	if extra > cbg.MaxLength {
+		return fmt.Errorf("VersionNode: map struct too large (%d)", extra)
+	}
+
+	n := extra
+
+	nameBuf := make([]byte, 1)
+	for i := uint64(0); i < n; i++ {
+		nameLen, ok, err := cbg.ReadFullStringIntoBuf(cr, nameBuf, 1000000)
+		if err != nil {
+			return err
+		}
+
+		if !ok {
+			// Field doesn't exist on this type, so ignore it
+			if err := cbg.ScanForLinks(cr, func(cid.Cid) {}); err != nil {
+				return err
+			}
+			continue
+		}
+
+		switch string(nameBuf[:nameLen]) {
+		// t.Manifest (cid.Cid) (struct)
+		case "m":
+
+			{
+
+				c, err := cbg.ReadCid(cr)
+				if err != nil {
+					return xerrors.Errorf("failed to read cid field t.Manifest: %w", err)
+				}
+
+				t.Manifest = c
+
+			}
+			// t.Seq (uint64) (uint64)
+		case "s":
+
+			{
+
+				maj, extra, err = cr.ReadHeader()
+				if err != nil {
+					return err
+				}
+				if maj != cbg.MajUnsignedInt {
+					return fmt.Errorf("wrong type for uint64 field")
+				}
+				t.Seq = uint64(extra)
+
+			}
+			// t.VersionID (string) (string)
+		case "v":
+
+			{
+				sval, err := cbg.ReadStringWithMax(cr, 1000000)
+				if err != nil {
+					return err
+				}
+
+				t.VersionID = string(sval)
+			}
+
+		default:
+			// Field doesn't exist on this type, so ignore it
+			if err := cbg.ScanForLinks(r, func(cid.Cid) {}); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+func (t *ValueUnion) MarshalCBOR(w io.Writer) error {
+	if t == nil {
+		_, err := w.Write(cbg.CborNull)
+		return err
+	}
+
+	cw := cbg.NewCborWriter(w)
+	fieldCount := 2
+
+	if t.Manifest == nil {
+		fieldCount--
+	}
+
+	if t.Leaf == nil {
+		fieldCount--
+	}
+
+	if _, err := cw.Write(cbg.CborEncodeMajorType(cbg.MajMap, uint64(fieldCount))); err != nil {
+		return err
+	}
+
+	// t.Leaf (bucket.ObjectLeaf) (struct)
+	if t.Leaf != nil {
+
+		if len("/objectleaf/0") > 1000000 {
+			return xerrors.Errorf("Value in field \"/objectleaf/0\" was too long")
+		}
+
+		if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("/objectleaf/0"))); err != nil {
+			return err
+		}
+		if _, err := cw.WriteString(string("/objectleaf/0")); err != nil {
+			return err
+		}
+
+		if err := t.Leaf.MarshalCBOR(cw); err != nil {
+			return err
+		}
+	}
+
+	// t.Manifest (bucket.ObjectManifest) (struct)
+	if t.Manifest != nil {
+
+		if len("/objectmanifest/0") > 1000000 {
+			return xerrors.Errorf("Value in field \"/objectmanifest/0\" was too long")
+		}
+
+		if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("/objectmanifest/0"))); err != nil {
+			return err
+		}
+		if _, err := cw.WriteString(string("/objectmanifest/0")); err != nil {
+			return err
+		}
+
+		if err := t.Manifest.MarshalCBOR(cw); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (t *ValueUnion) UnmarshalCBOR(r io.Reader) (err error) {
+	*t = ValueUnion{}
+
+	cr := cbg.NewCborReader(r)
+
+	maj, extra, err := cr.ReadHeader()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err == io.EOF {
+			err = io.ErrUnexpectedEOF
+		}
+	}()
+
+	if maj != cbg.MajMap {
+		return fmt.Errorf("cbor input should be of type map")
+	}
+
+	if extra > cbg.MaxLength {
+		return fmt.Errorf("ValueUnion: map struct too large (%d)", extra)
+	}
+
+	n := extra
+
+	nameBuf := make([]byte, 17)
+	for i := uint64(0); i < n; i++ {
+		nameLen, ok, err := cbg.ReadFullStringIntoBuf(cr, nameBuf, 1000000)
+		if err != nil {
+			return err
+		}
+
+		if !ok {
+			// Field doesn't exist on this type, so ignore it
+			if err := cbg.ScanForLinks(cr, func(cid.Cid) {}); err != nil {
+				return err
+			}
+			continue
+		}
+
+		switch string(nameBuf[:nameLen]) {
+		// t.Leaf (bucket.ObjectLeaf) (struct)
+		case "/objectleaf/0":
+
+			{
+
+				b, err := cr.ReadByte()
+				if err != nil {
+					return err
+				}
+				if b != cbg.CborNull[0] {
+					if err := cr.UnreadByte(); err != nil {
+						return err
+					}
+					t.Leaf = new(ObjectLeaf)
+					if err := t.Leaf.UnmarshalCBOR(cr); err != nil {
+						return xerrors.Errorf("unmarshaling t.Leaf pointer: %w", err)
+					}
+				}
+
+			}
+			// t.Manifest (bucket.ObjectManifest) (struct)
+		case "/objectmanifest/0":
+
+			{
+
+				b, err := cr.ReadByte()
+				if err != nil {
+					return err
+				}
+				if b != cbg.CborNull[0] {
+					if err := cr.UnreadByte(); err != nil {
+						return err
+					}
+					t.Manifest = new(ObjectManifest)
+					if err := t.Manifest.UnmarshalCBOR(cr); err != nil {
+						return xerrors.Errorf("unmarshaling t.Manifest pointer: %w", err)
+					}
+				}
+
+			}
+
+		default:
+			// Field doesn't exist on this type, so ignore it
+			if err := cbg.ScanForLinks(r, func(cid.Cid) {}); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+func (t *VersionState) MarshalCBOR(w io.Writer) error {
+	if t == nil {
+		_, err := w.Write(cbg.CborNull)
+		return err
+	}
+
+	cw := cbg.NewCborWriter(w)
+
+	if _, err := cw.Write([]byte{163}); err != nil {
+		return err
+	}
+
+	// t.LegalHold (uint8) (uint8)
+	if len("h") > 1000000 {
+		return xerrors.Errorf("Value in field \"h\" was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("h"))); err != nil {
+		return err
+	}
+	if _, err := cw.WriteString(string("h")); err != nil {
+		return err
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajUnsignedInt, uint64(t.LegalHold)); err != nil {
+		return err
+	}
+
+	// t.Retention ([]uint8) (slice)
+	if len("r") > 1000000 {
+		return xerrors.Errorf("Value in field \"r\" was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("r"))); err != nil {
+		return err
+	}
+	if _, err := cw.WriteString(string("r")); err != nil {
+		return err
+	}
+
+	if len(t.Retention) > 2097152 {
+		return xerrors.Errorf("Byte array in field t.Retention was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajByteString, uint64(len(t.Retention))); err != nil {
+		return err
+	}
+
+	if _, err := cw.Write(t.Retention); err != nil {
+		return err
+	}
+
+	// t.Tags (map[string]string) (map)
+	if len("t") > 1000000 {
+		return xerrors.Errorf("Value in field \"t\" was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("t"))); err != nil {
+		return err
+	}
+	if _, err := cw.WriteString(string("t")); err != nil {
+		return err
+	}
+
+	{
+		if len(t.Tags) > 4096 {
+			return xerrors.Errorf("cannot marshal t.Tags map too large")
+		}
+
+		if err := cw.WriteMajorTypeHeader(cbg.MajMap, uint64(len(t.Tags))); err != nil {
+			return err
+		}
+
+		keys := make([]string, 0, len(t.Tags))
+		for k := range t.Tags {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			v := t.Tags[k]
+
+			if len(k) > 1000000 {
+				return xerrors.Errorf("Value in field k was too long")
+			}
+
+			if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len(k))); err != nil {
+				return err
+			}
+			if _, err := cw.WriteString(string(k)); err != nil {
+				return err
+			}
+
+			if len(v) > 1000000 {
+				return xerrors.Errorf("Value in field v was too long")
+			}
+
+			if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len(v))); err != nil {
+				return err
+			}
+			if _, err := cw.WriteString(string(v)); err != nil {
+				return err
+			}
+
+		}
+	}
+	return nil
+}
+
+func (t *VersionState) UnmarshalCBOR(r io.Reader) (err error) {
+	*t = VersionState{}
+
+	cr := cbg.NewCborReader(r)
+
+	maj, extra, err := cr.ReadHeader()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err == io.EOF {
+			err = io.ErrUnexpectedEOF
+		}
+	}()
+
+	if maj != cbg.MajMap {
+		return fmt.Errorf("cbor input should be of type map")
+	}
+
+	if extra > cbg.MaxLength {
+		return fmt.Errorf("VersionState: map struct too large (%d)", extra)
+	}
+
+	n := extra
+
+	nameBuf := make([]byte, 1)
+	for i := uint64(0); i < n; i++ {
+		nameLen, ok, err := cbg.ReadFullStringIntoBuf(cr, nameBuf, 1000000)
+		if err != nil {
+			return err
+		}
+
+		if !ok {
+			// Field doesn't exist on this type, so ignore it
+			if err := cbg.ScanForLinks(cr, func(cid.Cid) {}); err != nil {
+				return err
+			}
+			continue
+		}
+
+		switch string(nameBuf[:nameLen]) {
+		// t.LegalHold (uint8) (uint8)
+		case "h":
+
+			maj, extra, err = cr.ReadHeader()
+			if err != nil {
+				return err
+			}
+			if maj != cbg.MajUnsignedInt {
+				return fmt.Errorf("wrong type for uint8 field")
+			}
+			if extra > math.MaxUint8 {
+				return fmt.Errorf("integer in input was too large for uint8 field")
+			}
+			t.LegalHold = uint8(extra)
+			// t.Retention ([]uint8) (slice)
+		case "r":
+
+			maj, extra, err = cr.ReadHeader()
+			if err != nil {
+				return err
+			}
+
+			if extra > 2097152 {
+				return fmt.Errorf("t.Retention: byte array too large (%d)", extra)
+			}
+			if maj != cbg.MajByteString {
+				return fmt.Errorf("expected byte array")
+			}
+
+			if extra > 0 {
+				t.Retention = make([]uint8, extra)
+			}
+
+			if _, err := io.ReadFull(cr, t.Retention); err != nil {
+				return err
+			}
+
+			// t.Tags (map[string]string) (map)
+		case "t":
+
+			maj, extra, err = cr.ReadHeader()
+			if err != nil {
+				return err
+			}
+			if maj != cbg.MajMap {
+				return fmt.Errorf("expected a map (major type 5)")
+			}
+			if extra > 4096 {
+				return fmt.Errorf("t.Tags: map too large")
+			}
+
+			t.Tags = make(map[string]string, extra)
+
+			for i, l := 0, int(extra); i < l; i++ {
+
+				var k string
+
+				{
+					sval, err := cbg.ReadStringWithMax(cr, 1000000)
+					if err != nil {
+						return err
+					}
+
+					k = string(sval)
+				}
+
+				var v string
+
+				{
+					sval, err := cbg.ReadStringWithMax(cr, 1000000)
+					if err != nil {
+						return err
+					}
+
+					v = string(sval)
+				}
+
+				t.Tags[k] = v
+
+			}
+
+		default:
+			// Field doesn't exist on this type, so ignore it
+			if err := cbg.ScanForLinks(r, func(cid.Cid) {}); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+func (t *StateUnion) MarshalCBOR(w io.Writer) error {
+	if t == nil {
+		_, err := w.Write(cbg.CborNull)
+		return err
+	}
+
+	cw := cbg.NewCborWriter(w)
+	fieldCount := 1
+
+	if t.State == nil {
+		fieldCount--
+	}
+
+	if _, err := cw.Write(cbg.CborEncodeMajorType(cbg.MajMap, uint64(fieldCount))); err != nil {
+		return err
+	}
+
+	// t.State (bucket.VersionState) (struct)
+	if t.State != nil {
+
+		if len("/versionstate/0") > 1000000 {
+			return xerrors.Errorf("Value in field \"/versionstate/0\" was too long")
+		}
+
+		if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("/versionstate/0"))); err != nil {
+			return err
+		}
+		if _, err := cw.WriteString(string("/versionstate/0")); err != nil {
+			return err
+		}
+
+		if err := t.State.MarshalCBOR(cw); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (t *StateUnion) UnmarshalCBOR(r io.Reader) (err error) {
+	*t = StateUnion{}
+
+	cr := cbg.NewCborReader(r)
+
+	maj, extra, err := cr.ReadHeader()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err == io.EOF {
+			err = io.ErrUnexpectedEOF
+		}
+	}()
+
+	if maj != cbg.MajMap {
+		return fmt.Errorf("cbor input should be of type map")
+	}
+
+	if extra > cbg.MaxLength {
+		return fmt.Errorf("StateUnion: map struct too large (%d)", extra)
+	}
+
+	n := extra
+
+	nameBuf := make([]byte, 15)
+	for i := uint64(0); i < n; i++ {
+		nameLen, ok, err := cbg.ReadFullStringIntoBuf(cr, nameBuf, 1000000)
+		if err != nil {
+			return err
+		}
+
+		if !ok {
+			// Field doesn't exist on this type, so ignore it
+			if err := cbg.ScanForLinks(cr, func(cid.Cid) {}); err != nil {
+				return err
+			}
+			continue
+		}
+
+		switch string(nameBuf[:nameLen]) {
+		// t.State (bucket.VersionState) (struct)
+		case "/versionstate/0":
+
+			{
+
+				b, err := cr.ReadByte()
+				if err != nil {
+					return err
+				}
+				if b != cbg.CborNull[0] {
+					if err := cr.UnreadByte(); err != nil {
+						return err
+					}
+					t.State = new(VersionState)
+					if err := t.State.UnmarshalCBOR(cr); err != nil {
+						return xerrors.Errorf("unmarshaling t.State pointer: %w", err)
+					}
+				}
+
 			}
 
 		default:

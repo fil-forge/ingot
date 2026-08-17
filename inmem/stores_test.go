@@ -8,15 +8,18 @@ import (
 	"testing"
 
 	"github.com/fil-forge/ingot/registry"
+	"github.com/fil-forge/libforge/testutil"
+	"github.com/fil-forge/ucantone/did"
 )
 
 func TestBlobRefs_CountToZero(t *testing.T) {
 	ctx := context.Background()
 	m := NewMemStore()
 	digest := []byte("digest-A")
-	const space = "did:space:1"
+	space := testutil.RandomDID(t)
+	space2 := testutil.RandomDID(t)
 
-	claim := func(bucket, key, version, sp string) registry.BlobClaim {
+	claim := func(bucket, key, version string, sp did.DID) registry.BlobClaim {
 		return registry.BlobClaim{Digest: digest, Bucket: bucket, ObjectKey: key, VersionID: version, Space: sp}
 	}
 
@@ -34,11 +37,11 @@ func TestBlobRefs_CountToZero(t *testing.T) {
 	}
 
 	// A claim from a different space is counted under that space only.
-	mustAdd(t, m, claim("b2", "k1", registry.NullVersionID, "did:space:2"))
+	mustAdd(t, m, claim("b2", "k1", registry.NullVersionID, space2))
 	if n := count(t, m, space, digest); n != 2 {
 		t.Fatalf("count for space 1 = %d, want 2 (space 2 must not leak in)", n)
 	}
-	if n := count(t, m, "did:space:2", digest); n != 1 {
+	if n := count(t, m, space2, digest); n != 1 {
 		t.Fatalf("count for space 2 = %d, want 1", n)
 	}
 
@@ -227,7 +230,7 @@ func TestParts_OrderedAndCascade(t *testing.T) {
 func TestLocations_RoundTrip(t *testing.T) {
 	ctx := context.Background()
 	m := NewMemStore()
-	const space = "did:space:loc"
+	space := testutil.RandomDID(t)
 	digest := []byte("loc-digest")
 
 	if err := m.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: digest, Provider: "did:piri:1", URL: "http://piri/blob", Size: 100}); err != nil {
@@ -245,7 +248,7 @@ func TestLocations_RoundTrip(t *testing.T) {
 		loc.RegionKeyVersion != "" || loc.TenantRecipientKID != "" || loc.ChunkSize != 0 {
 		t.Fatalf("unencrypted location carries wrap material: %+v", loc)
 	}
-	if _, err := m.GetLocation(ctx, "did:other", digest); err != registry.ErrNotFound {
+	if _, err := m.GetLocation(ctx, testutil.RandomDID(t), digest); err != registry.ErrNotFound {
 		t.Fatalf("GetLocation wrong space err = %v, want ErrNotFound", err)
 	}
 	if err := m.DeleteLocation(ctx, space, digest); err != nil {
@@ -263,7 +266,7 @@ func TestLocations_RoundTrip(t *testing.T) {
 func TestLocations_FEEWrapMaterial(t *testing.T) {
 	ctx := context.Background()
 	m := NewMemStore()
-	const space = "did:space:enc"
+	space := testutil.RandomDID(t)
 	digest := []byte("enc-digest")
 
 	enc := registry.BlobLocation{
@@ -328,7 +331,8 @@ func TestLocations_FEEWrapMaterial(t *testing.T) {
 func TestLocations_PartialFEE_Rejected(t *testing.T) {
 	ctx := context.Background()
 	m := NewMemStore()
-	base := registry.BlobLocation{Space: "s", Digest: []byte("d"), Provider: "did:piri", URL: "u", Size: 10}
+	space := testutil.RandomDID(t)
+	base := registry.BlobLocation{Space: space, Digest: []byte("d"), Provider: "did:piri", URL: "u", Size: 10}
 
 	partials := map[string]func(*registry.BlobLocation){
 		"only wrapped CEK": func(l *registry.BlobLocation) { l.RegionWrappedCEK = []byte("cek") },
@@ -346,7 +350,7 @@ func TestLocations_PartialFEE_Rejected(t *testing.T) {
 			t.Fatalf("PutLocation(%s) err = %v, want ErrPartialFEE", name, err)
 		}
 		// Nothing should have been stored.
-		if _, err := m.GetLocation(ctx, "s", []byte("d")); !errors.Is(err, registry.ErrNotFound) {
+		if _, err := m.GetLocation(ctx, space, []byte("d")); !errors.Is(err, registry.ErrNotFound) {
 			t.Fatalf("partial FEE (%s) leaked a row", name)
 		}
 	}
@@ -366,7 +370,7 @@ func mustAdd(t *testing.T, m *MemStore, c registry.BlobClaim) {
 	}
 }
 
-func count(t *testing.T, m *MemStore, space string, digest []byte) int {
+func count(t *testing.T, m *MemStore, space did.DID, digest []byte) int {
 	t.Helper()
 	n, err := m.CountClaims(context.Background(), space, digest)
 	if err != nil {

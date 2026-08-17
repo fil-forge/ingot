@@ -72,7 +72,7 @@ func TestUp_Live(t *testing.T) {
 		}
 	}
 
-	// The FEE wrap columns added to blob_locations (00004) exist and are nullable.
+	// The FEE wrap columns added to blob_locations (00013) exist and are nullable.
 	for _, col := range []string{
 		"region_wrapped_cek", "region_key_version", "tenant_recipient_kid",
 		"base_nonce", "chunk_size", "protected_header",
