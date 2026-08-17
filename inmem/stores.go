@@ -172,6 +172,23 @@ func (m *MemStore) GetEncryptionParams(_ context.Context, space did.DID, digest 
 	return &cp, nil
 }
 
+func (m *MemStore) RewrapEncryptionParams(_ context.Context, space did.DID, digest, wrappedCEK []byte, keyVersion string) error {
+	if err := registry.ValidateRewrap(wrappedCEK, keyVersion); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := locKey{space, string(digest)}
+	params, ok := m.encParams[key]
+	if !ok {
+		return registry.ErrNotFound
+	}
+	params.RegionWrappedCEK = cloneBytes(wrappedCEK)
+	params.RegionKeyVersion = keyVersion
+	m.encParams[key] = params
+	return nil
+}
+
 func (m *MemStore) DeleteEncryptionParams(_ context.Context, space did.DID, digest []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

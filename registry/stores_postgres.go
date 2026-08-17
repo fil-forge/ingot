@@ -231,6 +231,26 @@ func (r *Postgres) GetEncryptionParams(ctx context.Context, space did.DID, diges
 	return params, nil
 }
 
+func (r *Postgres) RewrapEncryptionParams(ctx context.Context, space did.DID, digest, wrappedCEK []byte, keyVersion string) error {
+	if err := ValidateRewrap(wrappedCEK, keyVersion); err != nil {
+		return err
+	}
+	tag, err := r.pool.Exec(ctx,
+		`UPDATE ingot.blob_encryption_params
+		    SET region_wrapped_cek = $3, region_key_version = $4
+		  WHERE space = $1 AND digest = $2`,
+		space, digest, wrappedCEK, keyVersion)
+	if err != nil {
+		return fmt.Errorf("registry: rewrap encryption params: %w", err)
+	}
+	// An UPDATE of no rows is a rotation aimed at a blob that is not encrypted (or
+	// was already shredded); surface it rather than reporting success.
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 func (r *Postgres) DeleteEncryptionParams(ctx context.Context, space did.DID, digest []byte) error {
 	_, err := r.pool.Exec(ctx,
 		`DELETE FROM ingot.blob_encryption_params WHERE space = $1 AND digest = $2`, space, digest)

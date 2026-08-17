@@ -163,6 +163,23 @@ func (p BlobEncryptionParams) Validate() error {
 	return nil
 }
 
+// ValidateRewrap enforces the two parameters a re-wrap replaces, so a rotation
+// cannot blank out the material the decrypt path needs. Every
+// EncryptionParamsStore implementation calls it from RewrapEncryptionParams.
+func ValidateRewrap(wrappedCEK []byte, keyVersion string) error {
+	var missing []string
+	if len(wrappedCEK) == 0 {
+		missing = append(missing, "region_wrapped_cek")
+	}
+	if keyVersion == "" {
+		missing = append(missing, "region_key_version")
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("%w: missing %s", ErrInvalidEncryptionParams, strings.Join(missing, ", "))
+	}
+	return nil
+}
+
 // BlobInclusion is one row of ingot.shard_inclusions: block Digest lives at
 // the inclusive byte range [RangeStart, RangeEnd] inside the shard CAR whose
 // own location is the (Space, ShardDigest) row of blob_locations. It is the
@@ -272,14 +289,23 @@ type LocationStore interface {
 //
 // It is deliberately separate from LocationStore, with no foreign key between
 // the tables: a location is reconstructible from the indexer or the accept
-// receipt, a wrapped CEK is not. Put is an upsert, so a rotation re-wrap
-// replaces the material in place. Delete is the per-blob crypto-shred and is
-// idempotent — and because nothing cascades, DeleteLocation does NOT shred: a
-// caller removing a blob must call both.
+// receipt, a wrapped CEK is not. Put is an upsert, so re-encrypting a blob
+// replaces its whole parameter set; a region-key rotation instead calls
+// RewrapEncryptionParams, which touches only the key material. Delete is the
+// per-blob crypto-shred and is idempotent — and because nothing cascades,
+// DeleteLocation does NOT shred: a caller removing a blob must call both.
 type EncryptionParamsStore interface {
 	PutEncryptionParams(ctx context.Context, params BlobEncryptionParams) error
 	GetEncryptionParams(ctx context.Context, space did.DID, digest []byte) (*BlobEncryptionParams, error)
 	DeleteEncryptionParams(ctx context.Context, space did.DID, digest []byte) error
+	// RewrapEncryptionParams replaces the wrapped CEK and its key version for an
+	// already-encrypted blob, leaving every other parameter untouched — the write
+	// a region-key rotation performs. The ciphertext is unchanged, so the nonce,
+	// chunk size, AAD and header length must survive the rotation, and a rotation
+	// that rewrote them would corrupt the row. Returns ErrNotFound when the blob
+	// has no row (nothing to re-wrap) and ErrInvalidEncryptionParams when either
+	// argument is empty.
+	RewrapEncryptionParams(ctx context.Context, space did.DID, digest, wrappedCEK []byte, keyVersion string) error
 }
 
 // BlobPark is one row of ingot.blob_parks: the persistable state of a blob

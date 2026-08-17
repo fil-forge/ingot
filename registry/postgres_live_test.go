@@ -196,8 +196,8 @@ func TestPostgresStores_Live(t *testing.T) {
 		want := liveFEEParams(space, encDigest)
 		want.RegionWrappedCEK = []byte{0x11, 0x22, 0x33}
 		want.RegionKeyVersion = "region-v2"
-		if err := r.PutEncryptionParams(ctx, want); err != nil {
-			t.Fatalf("PutEncryptionParams (re-wrap): %v", err)
+		if err := r.RewrapEncryptionParams(ctx, space, encDigest, want.RegionWrappedCEK, want.RegionKeyVersion); err != nil {
+			t.Fatalf("RewrapEncryptionParams: %v", err)
 		}
 		got, err := r.GetEncryptionParams(ctx, space, encDigest)
 		if err != nil {
@@ -205,6 +205,34 @@ func TestPostgresStores_Live(t *testing.T) {
 		}
 		if !reflect.DeepEqual(*got, want) {
 			t.Fatalf("after re-wrap = %+v, want %+v", *got, want)
+		}
+	})
+
+	t.Run("re-wrap of an absent row is not found", func(t *testing.T) {
+		// The UPDATE matches nothing, which RowsAffected turns into ErrNotFound.
+		space := testutil.RandomDID(t)
+		err := r.RewrapEncryptionParams(ctx, space, []byte{0x0a, 0x0b}, []byte{0x11}, "region-v2")
+		if !errors.Is(err, registry.ErrNotFound) {
+			t.Fatalf("RewrapEncryptionParams(absent) = %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("incomplete re-wrap rejected", func(t *testing.T) {
+		space := testutil.RandomDID(t)
+		encDigest := []byte{0x0c, 0x0d}
+		want := liveFEEParams(space, encDigest)
+		if err := r.PutEncryptionParams(ctx, want); err != nil {
+			t.Fatalf("PutEncryptionParams: %v", err)
+		}
+		if err := r.RewrapEncryptionParams(ctx, space, encDigest, nil, "region-v2"); !errors.Is(err, registry.ErrInvalidEncryptionParams) {
+			t.Fatalf("RewrapEncryptionParams(no CEK) = %v, want ErrInvalidEncryptionParams", err)
+		}
+		got, err := r.GetEncryptionParams(ctx, space, encDigest)
+		if err != nil {
+			t.Fatalf("GetEncryptionParams: %v", err)
+		}
+		if !reflect.DeepEqual(*got, want) {
+			t.Fatalf("rejected re-wrap altered the row: %+v", *got)
 		}
 	})
 
