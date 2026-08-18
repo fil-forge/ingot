@@ -56,7 +56,7 @@ func TestPostgresStores_Live(t *testing.T) {
 
 	r := registry.NewPostgres(pool)
 	// seedBucket inserts a bucket row directly, bypassing Create, and returns
-	// the space it was given. space has no default — Create always supplies
+	// the space DID it generated. space has no default — Create always supplies
 	// the DID Hilt returns — so the seed supplies one too.
 	seedBucket := func(t *testing.T, name string) did.DID {
 		t.Helper()
