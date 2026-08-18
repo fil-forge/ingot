@@ -191,22 +191,19 @@ func (r *Postgres) PutEncryptionParams(ctx context.Context, params BlobEncryptio
 	if err := params.Validate(); err != nil {
 		return err
 	}
-	// Upsert: a rotation re-wrap replaces the material for a blob already stored.
+	// Upsert: a re-encryption replaces the parameter set for a blob already stored.
 	_, err := r.pool.Exec(ctx,
 		`INSERT INTO ingot.blob_encryption_params
-		   (space, digest, region_wrapped_cek, region_key_version, tenant_recipient_kid,
-		    header_len, base_nonce, chunk_size, aad)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		   (space, digest, tenant_recipient_kid, header_len, base_nonce, chunk_size, aad)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7)
 		 ON CONFLICT (space, digest) DO UPDATE
-		   SET region_wrapped_cek   = EXCLUDED.region_wrapped_cek,
-		       region_key_version   = EXCLUDED.region_key_version,
-		       tenant_recipient_kid = EXCLUDED.tenant_recipient_kid,
+		   SET tenant_recipient_kid = EXCLUDED.tenant_recipient_kid,
 		       header_len           = EXCLUDED.header_len,
 		       base_nonce           = EXCLUDED.base_nonce,
 		       chunk_size           = EXCLUDED.chunk_size,
 		       aad                  = EXCLUDED.aad`,
-		params.Space, params.Digest, params.RegionWrappedCEK, params.RegionKeyVersion,
-		params.TenantRecipientKID, params.HeaderLen, params.BaseNonce, params.ChunkSize, params.AAD)
+		params.Space, params.Digest, params.TenantRecipientKID,
+		params.HeaderLen, params.BaseNonce, params.ChunkSize, params.AAD)
 	if err != nil {
 		return fmt.Errorf("registry: put encryption params: %w", err)
 	}
@@ -216,12 +213,10 @@ func (r *Postgres) PutEncryptionParams(ctx context.Context, params BlobEncryptio
 func (r *Postgres) GetEncryptionParams(ctx context.Context, space did.DID, digest []byte) (*BlobEncryptionParams, error) {
 	params := &BlobEncryptionParams{Space: space, Digest: digest}
 	err := r.pool.QueryRow(ctx,
-		`SELECT region_wrapped_cek, region_key_version, tenant_recipient_kid,
-		        header_len, base_nonce, chunk_size, aad
+		`SELECT tenant_recipient_kid, header_len, base_nonce, chunk_size, aad
 		 FROM ingot.blob_encryption_params WHERE space = $1 AND digest = $2`,
-		space, digest).Scan(&params.RegionWrappedCEK, &params.RegionKeyVersion,
-		&params.TenantRecipientKID, &params.HeaderLen, &params.BaseNonce,
-		&params.ChunkSize, &params.AAD)
+		space, digest).Scan(&params.TenantRecipientKID, &params.HeaderLen,
+		&params.BaseNonce, &params.ChunkSize, &params.AAD)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -229,26 +224,6 @@ func (r *Postgres) GetEncryptionParams(ctx context.Context, space did.DID, diges
 		return nil, fmt.Errorf("registry: get encryption params: %w", err)
 	}
 	return params, nil
-}
-
-func (r *Postgres) RewrapEncryptionParams(ctx context.Context, space did.DID, digest, wrappedCEK []byte, keyVersion string) error {
-	if err := ValidateRewrap(wrappedCEK, keyVersion); err != nil {
-		return err
-	}
-	tag, err := r.pool.Exec(ctx,
-		`UPDATE ingot.blob_encryption_params
-		    SET region_wrapped_cek = $3, region_key_version = $4
-		  WHERE space = $1 AND digest = $2`,
-		space, digest, wrappedCEK, keyVersion)
-	if err != nil {
-		return fmt.Errorf("registry: rewrap encryption params: %w", err)
-	}
-	// An UPDATE of no rows is a rotation aimed at a blob that is not encrypted (or
-	// was already shredded); surface it rather than reporting success.
-	if tag.RowsAffected() == 0 {
-		return ErrNotFound
-	}
-	return nil
 }
 
 func (r *Postgres) DeleteEncryptionParams(ctx context.Context, space did.DID, digest []byte) error {

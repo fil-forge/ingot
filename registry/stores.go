@@ -92,20 +92,12 @@ type BlobLocation struct {
 // encrypted: every field is required, and an unencrypted blob simply has no row
 // (see EncryptionParamsStore). A fresh CEK per encryption event makes every
 // ciphertext digest unique to one encryption, so these parameters are a 1:1
-// fact about the blob. Raw CEK bytes are never stored — only the
-// region-KEK-wrapped CEK and the identifiers needed to unwrap it. See
-// docs/architecture.md §8 and FIL-480.
+// fact about the blob. No key material is stored here: the wrapped CEK and its
+// region-KEK version live in OpenBao. See docs/architecture.md §8 and FIL-480.
 type BlobEncryptionParams struct {
 	Space  did.DID
 	Digest []byte
 
-	// RegionWrappedCEK is the content-encryption key wrapped under the region
-	// KEK (A256KW). Never the raw CEK.
-	RegionWrappedCEK []byte
-	// RegionKeyVersion identifies which version of the region KEK wrapped the
-	// CEK, so a rotation can re-wrap in place. Opaque, so it is agnostic to the
-	// region-key cardinality decision (FIL-572).
-	RegionKeyVersion string
 	// TenantRecipientKID identifies the Hilt wrap key used for insurance-recovery
 	// unwrap. Opaque, so it is agnostic to the tenant-vs-bucket granularity
 	// decision (FIL-574).
@@ -134,8 +126,8 @@ var ErrInvalidEncryptionParams = errors.New("registry: invalid blob encryption p
 
 // Validate enforces that every encryption parameter is present: non-empty byte
 // slices and identifiers, and positive HeaderLen/ChunkSize. A partial set — e.g.
-// a wrapped CEK with no nonce, or an empty (non-nil) byte slice standing in for
-// real material — would persist a row a later GET cannot decrypt, so
+// an AAD with no nonce, or an empty (non-nil) byte slice standing in for a real
+// value — would persist a row a later GET cannot decrypt, so
 // PutEncryptionParams rejects it before touching the store.
 func (p BlobEncryptionParams) Validate() error {
 	var missing []string
@@ -145,8 +137,6 @@ func (p BlobEncryptionParams) Validate() error {
 	}{
 		{"space", p.Space.String() != ""},
 		{"digest", len(p.Digest) > 0},
-		{"region_wrapped_cek", len(p.RegionWrappedCEK) > 0},
-		{"region_key_version", p.RegionKeyVersion != ""},
 		{"tenant_recipient_kid", p.TenantRecipientKID != ""},
 		{"header_len", p.HeaderLen > 0},
 		{"base_nonce", len(p.BaseNonce) > 0},
@@ -156,23 +146,6 @@ func (p BlobEncryptionParams) Validate() error {
 		if !f.present {
 			missing = append(missing, f.name)
 		}
-	}
-	if len(missing) > 0 {
-		return fmt.Errorf("%w: missing %s", ErrInvalidEncryptionParams, strings.Join(missing, ", "))
-	}
-	return nil
-}
-
-// ValidateRewrap enforces the two parameters a re-wrap replaces, so a rotation
-// cannot blank out the material the decrypt path needs. Every
-// EncryptionParamsStore implementation calls it from RewrapEncryptionParams.
-func ValidateRewrap(wrappedCEK []byte, keyVersion string) error {
-	var missing []string
-	if len(wrappedCEK) == 0 {
-		missing = append(missing, "region_wrapped_cek")
-	}
-	if keyVersion == "" {
-		missing = append(missing, "region_key_version")
 	}
 	if len(missing) > 0 {
 		return fmt.Errorf("%w: missing %s", ErrInvalidEncryptionParams, strings.Join(missing, ", "))
@@ -288,24 +261,18 @@ type LocationStore interface {
 // blob is stored as plaintext".
 //
 // It is deliberately separate from LocationStore, with no foreign key between
-// the tables: a location is reconstructible from the indexer or the accept
-// receipt, a wrapped CEK is not. Put is an upsert, so re-encrypting a blob
-// replaces its whole parameter set; a region-key rotation instead calls
-// RewrapEncryptionParams, which touches only the key material. Delete is the
-// per-blob crypto-shred and is idempotent — and because nothing cascades,
-// DeleteLocation does NOT shred: a caller removing a blob must call both.
+// the tables: the row's existence is what marks a blob as encrypted, so its
+// lifecycle is independent of the reconstructible location cache. No key
+// material lives here — the wrapped CEK sits in OpenBao, so per-blob
+// crypto-shred means deleting the key there; Delete only drops the cached
+// decrypt parameters. Put is an upsert, so re-encrypting a blob replaces its
+// whole parameter set. Delete is idempotent — and because nothing cascades,
+// DeleteLocation does NOT touch this table: a caller removing a blob must
+// call both.
 type EncryptionParamsStore interface {
 	PutEncryptionParams(ctx context.Context, params BlobEncryptionParams) error
 	GetEncryptionParams(ctx context.Context, space did.DID, digest []byte) (*BlobEncryptionParams, error)
 	DeleteEncryptionParams(ctx context.Context, space did.DID, digest []byte) error
-	// RewrapEncryptionParams replaces the wrapped CEK and its key version for an
-	// already-encrypted blob, leaving every other parameter untouched — the write
-	// a region-key rotation performs. The ciphertext is unchanged, so the nonce,
-	// chunk size, AAD and header length must survive the rotation, and a rotation
-	// that rewrote them would corrupt the row. Returns ErrNotFound when the blob
-	// has no row (nothing to re-wrap) and ErrInvalidEncryptionParams when either
-	// argument is empty.
-	RewrapEncryptionParams(ctx context.Context, space did.DID, digest, wrappedCEK []byte, keyVersion string) error
 }
 
 // BlobPark is one row of ingot.blob_parks: the persistable state of a blob

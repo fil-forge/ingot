@@ -164,8 +164,6 @@ func TestPostgresStores_Live(t *testing.T) {
 		return registry.BlobEncryptionParams{
 			Space:              space,
 			Digest:             d,
-			RegionWrappedCEK:   []byte{0x00, 0xde, 0xad, 0xbe, 0xef},
-			RegionKeyVersion:   "region-v1",
 			TenantRecipientKID: "did:key:tenant#wrap",
 			HeaderLen:          212,
 			BaseNonce:          []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07},
@@ -190,56 +188,7 @@ func TestPostgresStores_Live(t *testing.T) {
 		}
 	})
 
-	t.Run("encryption params re-wrap in place", func(t *testing.T) {
-		space := testutil.RandomDID(t)
-		encDigest := []byte{0x03, 0x04}
-		if err := r.PutEncryptionParams(ctx, liveFEEParams(space, encDigest)); err != nil {
-			t.Fatalf("PutEncryptionParams: %v", err)
-		}
-		want := liveFEEParams(space, encDigest)
-		want.RegionWrappedCEK = []byte{0x11, 0x22, 0x33}
-		want.RegionKeyVersion = "region-v2"
-		if err := r.RewrapEncryptionParams(ctx, space, encDigest, want.RegionWrappedCEK, want.RegionKeyVersion); err != nil {
-			t.Fatalf("RewrapEncryptionParams: %v", err)
-		}
-		got, err := r.GetEncryptionParams(ctx, space, encDigest)
-		if err != nil {
-			t.Fatalf("GetEncryptionParams: %v", err)
-		}
-		if !reflect.DeepEqual(*got, want) {
-			t.Fatalf("after re-wrap = %+v, want %+v", *got, want)
-		}
-	})
-
-	t.Run("re-wrap of an absent row is not found", func(t *testing.T) {
-		// The UPDATE matches nothing, which RowsAffected turns into ErrNotFound.
-		space := testutil.RandomDID(t)
-		err := r.RewrapEncryptionParams(ctx, space, []byte{0x0a, 0x0b}, []byte{0x11}, "region-v2")
-		if !errors.Is(err, registry.ErrNotFound) {
-			t.Fatalf("RewrapEncryptionParams(absent) = %v, want ErrNotFound", err)
-		}
-	})
-
-	t.Run("incomplete re-wrap rejected", func(t *testing.T) {
-		space := testutil.RandomDID(t)
-		encDigest := []byte{0x0c, 0x0d}
-		want := liveFEEParams(space, encDigest)
-		if err := r.PutEncryptionParams(ctx, want); err != nil {
-			t.Fatalf("PutEncryptionParams: %v", err)
-		}
-		if err := r.RewrapEncryptionParams(ctx, space, encDigest, nil, "region-v2"); !errors.Is(err, registry.ErrInvalidEncryptionParams) {
-			t.Fatalf("RewrapEncryptionParams(no CEK) = %v, want ErrInvalidEncryptionParams", err)
-		}
-		got, err := r.GetEncryptionParams(ctx, space, encDigest)
-		if err != nil {
-			t.Fatalf("GetEncryptionParams: %v", err)
-		}
-		if !reflect.DeepEqual(*got, want) {
-			t.Fatalf("rejected re-wrap altered the row: %+v", *got)
-		}
-	})
-
-	t.Run("encryption params delete shreds", func(t *testing.T) {
+	t.Run("encryption params delete removes the row", func(t *testing.T) {
 		space := testutil.RandomDID(t)
 		encDigest := []byte{0x05, 0x06}
 		if err := r.PutEncryptionParams(ctx, liveFEEParams(space, encDigest)); err != nil {

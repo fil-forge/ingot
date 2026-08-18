@@ -172,23 +172,6 @@ func (m *MemStore) GetEncryptionParams(_ context.Context, space did.DID, digest 
 	return &cp, nil
 }
 
-func (m *MemStore) RewrapEncryptionParams(_ context.Context, space did.DID, digest, wrappedCEK []byte, keyVersion string) error {
-	if err := registry.ValidateRewrap(wrappedCEK, keyVersion); err != nil {
-		return err
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	key := locKey{space, string(digest)}
-	params, ok := m.encParams[key]
-	if !ok {
-		return registry.ErrNotFound
-	}
-	params.RegionWrappedCEK = cloneBytes(wrappedCEK)
-	params.RegionKeyVersion = keyVersion
-	m.encParams[key] = params
-	return nil
-}
-
 func (m *MemStore) DeleteEncryptionParams(_ context.Context, space did.DID, digest []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -439,12 +422,10 @@ func cloneLocation(loc registry.BlobLocation) registry.BlobLocation {
 	return loc
 }
 
-// cloneEncryptionParams deep-copies a BlobEncryptionParams' byte-slice fields —
-// the digest and the key material — so the stored copy and any returned copy
-// never alias the caller's slices.
+// cloneEncryptionParams deep-copies a BlobEncryptionParams' byte-slice fields
+// so the stored copy and any returned copy never alias the caller's slices.
 func cloneEncryptionParams(p registry.BlobEncryptionParams) registry.BlobEncryptionParams {
 	p.Digest = cloneBytes(p.Digest)
-	p.RegionWrappedCEK = cloneBytes(p.RegionWrappedCEK)
 	p.BaseNonce = cloneBytes(p.BaseNonce)
 	p.AAD = cloneBytes(p.AAD)
 	return p

@@ -76,9 +76,8 @@ func TestUp_Live(t *testing.T) {
 	// presence of a row is what marks a blob as encrypted, so there is no such
 	// thing as a half-populated parameter set.
 	for _, col := range []string{
-		"space", "digest", "region_wrapped_cek", "region_key_version",
-		"tenant_recipient_kid", "header_len", "base_nonce", "chunk_size", "aad",
-		"created_at",
+		"space", "digest", "tenant_recipient_kid", "header_len", "base_nonce",
+		"chunk_size", "aad", "created_at",
 	} {
 		var nullable string
 		err := pool.QueryRow(ctx,
