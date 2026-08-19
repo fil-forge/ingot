@@ -349,6 +349,9 @@ func registerRevocationConsumer(lc fx.Lifecycle, c *revocation.Consumer) {
 			return nil
 		},
 		OnStop: func(ctx context.Context) error {
+			if cancel == nil {
+				return nil
+			}
 			cancel()
 			select {
 			case <-done:
