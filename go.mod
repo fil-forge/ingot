@@ -9,7 +9,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.35
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.107.1
 	github.com/cenkalti/backoff/v5 v5.0.3
-	github.com/fil-forge/hilt v0.0.1-0.20260819132006-b7184348cbcd
+	github.com/fil-forge/hilt v0.0.1-0.20260820100611-80f80f3d033b
 	github.com/fil-forge/indexing-service v1.13.5-0.20260814033032-ac30865a9766
 	github.com/fil-forge/libforge v0.0.0-20260807225550-3e6895b41be5
 	github.com/fil-forge/smelt v0.0.0-20260820091113-cc6fbd4282bd
