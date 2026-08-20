@@ -9,10 +9,10 @@ require (
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.35
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.107.1
 	github.com/cenkalti/backoff/v5 v5.0.3
-	github.com/fil-forge/hilt v0.0.1-0.20260820100611-80f80f3d033b
-	github.com/fil-forge/indexing-service v1.13.5-0.20260814033032-ac30865a9766
+	github.com/fil-forge/hilt v0.0.1-0.20260820122357-7792ca5e7f30
+	github.com/fil-forge/indexing-service v1.13.5-0.20260820151722-9eb620409a4e
 	github.com/fil-forge/libforge v0.0.0-20260807225550-3e6895b41be5
-	github.com/fil-forge/smelt v0.0.0-20260820091113-cc6fbd4282bd
+	github.com/fil-forge/smelt v0.0.0-20260820153251-144191402c87
 	github.com/fil-forge/swarf v0.0.1-0.20260818180033-fabf8b413177
 	github.com/fil-forge/ucantone v0.0.0-20260817170631-3a20cd59fabc
 	github.com/fil-forge/versitygw v0.0.0-20260716095011-7a65883d595a
