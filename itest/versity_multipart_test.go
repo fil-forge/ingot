@@ -8,15 +8,17 @@ import (
 
 // Multipart groups of the S3 conformance partition, partitioned empirically
 // against the forge-mode stack (see the curation note in README.md). The
-// remaining xfail surface: part-level checksums (FIL-620), tagging/object-lock
-// /ACL on create (FIL-534/FIL-525), and the UploadPartCopy group (FIL-586).
+// remaining xfail surface: ACL on create (FIL-525), the UploadPartCopy group
+// (FIL-586), and one load-sensitive concurrency case.
 
 var createMultipartPass = []forgeCase{
 	{name: "non_existing_bucket", fn: integration.CreateMultipartUpload_non_existing_bucket},
 	{name: "dir_obj", fn: integration.CreateMultipartUpload_dir_obj},
 	{name: "long_metadata", fn: integration.CreateMultipartUpload_long_metadata},
 	{name: "with_metadata", fn: integration.CreateMultipartUpload_with_metadata},
+	{name: "with_tagging", fn: integration.CreateMultipartUpload_with_tagging},
 	{name: "with_object_lock_invalid_retention", fn: integration.CreateMultipartUpload_with_object_lock_invalid_retention},
+	{name: "with_object_lock_not_enabled", fn: integration.CreateMultipartUpload_with_object_lock_not_enabled},
 	{name: "past_retain_until_date", fn: integration.CreateMultipartUpload_past_retain_until_date},
 	{name: "invalid_legal_hold", fn: integration.CreateMultipartUpload_invalid_legal_hold},
 	{name: "invalid_object_lock_mode", fn: integration.CreateMultipartUpload_invalid_object_lock_mode},
@@ -30,10 +32,9 @@ var createMultipartPass = []forgeCase{
 }
 
 var createMultipartXFail = []forgeCase{
-	{name: "with_tagging", fn: integration.CreateMultipartUpload_with_tagging},
-	{name: "with_object_lock", fn: integration.CreateMultipartUpload_with_object_lock},
-	{name: "with_object_lock_not_enabled", fn: integration.CreateMultipartUpload_with_object_lock_not_enabled},
 	{name: "object_acl_not_supported", fn: integration.CreateMultipartUpload_object_acl_not_supported},
+	// with_object_lock passes but needs the versioned teardown: it runs as
+	// LockCreation/CreateMultipartUpload_with_object_lock (versity_lock_test.go).
 }
 
 var uploadPartPass = []forgeCase{
@@ -45,17 +46,16 @@ var uploadPartPass = []forgeCase{
 	{name: "multiple_checksum_headers", fn: integration.UploadPart_multiple_checksum_headers},
 	{name: "invalid_checksum_header", fn: integration.UploadPart_invalid_checksum_header},
 	{name: "checksum_header_and_algo_mismatch", fn: integration.UploadPart_checksum_header_and_algo_mismatch},
-	{name: "success", fn: integration.UploadPart_success},
-}
-
-var uploadPartXFail = []forgeCase{
 	{name: "checksum_algorithm_mistmatch_on_initialization", fn: integration.UploadPart_checksum_algorithm_mistmatch_on_initialization},
 	{name: "checksum_algorithm_mistmatch_on_initialization_with_value", fn: integration.UploadPart_checksum_algorithm_mistmatch_on_initialization_with_value},
 	{name: "incorrect_checksums", fn: integration.UploadPart_incorrect_checksums},
 	{name: "no_checksum_with_full_object_checksum_type", fn: integration.UploadPart_no_checksum_with_full_object_checksum_type},
 	{name: "no_checksum_with_composite_checksum_type", fn: integration.UploadPart_no_checksum_with_composite_checksum_type},
 	{name: "with_checksums_success", fn: integration.UploadPart_with_checksums_success},
+	{name: "success", fn: integration.UploadPart_success},
 }
+
+var uploadPartXFail = []forgeCase{}
 
 var uploadPartCopyPass = []forgeCase{
 	{name: "non_existing_bucket", fn: integration.UploadPartCopy_non_existing_bucket},
@@ -90,12 +90,10 @@ var listPartsPass = []forgeCase{
 	{name: "truncated", fn: integration.ListParts_truncated},
 	{name: "success", fn: integration.ListParts_success},
 	{name: "with_checksums", fn: integration.ListParts_with_checksums},
-}
-
-// Explicit null-checksum-type echo is FIL-620.
-var listPartsXFail = []forgeCase{
 	{name: "null_checksums", fn: integration.ListParts_null_checksums},
 }
+
+var listPartsXFail = []forgeCase{}
 
 var listMultipartUploadsPass = []forgeCase{
 	{name: "non_existing_bucket", fn: integration.ListMultipartUploads_non_existing_bucket},
@@ -142,6 +140,18 @@ var completeMultipartPass = []forgeCase{
 	{name: "multiple_final_checksums", fn: integration.CompleteMultipartUpload_multiple_final_checksums},
 	{name: "invalid_final_checksums", fn: integration.CompleteMultipartUpload_invalid_final_checksums},
 	{name: "invalid_final_composite_checksum", fn: integration.CompleteMultipartUpload_invalid_final_composite_checksum},
+	{name: "invalid_checksum_part", fn: integration.CompleteMultipartUpload_invalid_checksum_part},
+	{name: "multiple_checksum_part", fn: integration.CompleteMultipartUpload_multiple_checksum_part},
+	{name: "incorrect_checksum_part", fn: integration.CompleteMultipartUpload_incorrect_checksum_part},
+	{name: "different_checksum_part", fn: integration.CompleteMultipartUpload_different_checksum_part},
+	{name: "missing_part_checksum", fn: integration.CompleteMultipartUpload_missing_part_checksum},
+	{name: "incorrect_final_checksums", fn: integration.CompleteMultipartUpload_incorrect_final_checksums},
+	{name: "should_calculate_the_final_checksum_full_object", fn: integration.CompleteMultipartUpload_should_calculate_the_final_checksum_full_object},
+	{name: "should_verify_the_final_checksum", fn: integration.CompleteMultipartUpload_should_verify_the_final_checksum},
+	{name: "should_verify_final_composite_checksum", fn: integration.CompleteMultipartUpload_should_verify_final_composite_checksum},
+	{name: "checksum_type_mismatch", fn: integration.CompleteMultipartUpload_checksum_type_mismatch},
+	{name: "should_ignore_the_final_checksum", fn: integration.CompleteMultipartUpload_should_ignore_the_final_checksum},
+	{name: "should_succeed_without_final_checksum_type", fn: integration.CompleteMultipartUpload_should_succeed_without_final_checksum_type},
 	{name: "with_metadata", fn: integration.CompleteMultipartUpload_with_metadata},
 	{name: "success", fn: integration.CompleteMultipartUpload_success},
 	{name: "already_completed", fn: integration.CompleteMultipartUpload_already_completed},
@@ -158,20 +168,7 @@ var completeMultipartPass = []forgeCase{
 	}},
 }
 
-// Part-level / composite-checksum verification is FIL-620;
-// racey_data_integrity additionally leans on atomic concurrent overwrites.
+// racey_data_integrity leans on atomic concurrent overwrites under load.
 var completeMultipartXFail = []forgeCase{
-	{name: "invalid_checksum_part", fn: integration.CompleteMultipartUpload_invalid_checksum_part},
-	{name: "multiple_checksum_part", fn: integration.CompleteMultipartUpload_multiple_checksum_part},
-	{name: "incorrect_checksum_part", fn: integration.CompleteMultipartUpload_incorrect_checksum_part},
-	{name: "different_checksum_part", fn: integration.CompleteMultipartUpload_different_checksum_part},
-	{name: "missing_part_checksum", fn: integration.CompleteMultipartUpload_missing_part_checksum},
-	{name: "incorrect_final_checksums", fn: integration.CompleteMultipartUpload_incorrect_final_checksums},
-	{name: "should_calculate_the_final_checksum_full_object", fn: integration.CompleteMultipartUpload_should_calculate_the_final_checksum_full_object},
-	{name: "should_verify_the_final_checksum", fn: integration.CompleteMultipartUpload_should_verify_the_final_checksum},
-	{name: "should_verify_final_composite_checksum", fn: integration.CompleteMultipartUpload_should_verify_final_composite_checksum},
-	{name: "checksum_type_mismatch", fn: integration.CompleteMultipartUpload_checksum_type_mismatch},
-	{name: "should_ignore_the_final_checksum", fn: integration.CompleteMultipartUpload_should_ignore_the_final_checksum},
-	{name: "should_succeed_without_final_checksum_type", fn: integration.CompleteMultipartUpload_should_succeed_without_final_checksum_type},
 	{name: "racey_data_integrity", fn: integration.CompleteMultipartUpload_racey_data_integrity},
 }

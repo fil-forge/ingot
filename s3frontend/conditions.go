@@ -12,19 +12,23 @@ import (
 
 // currentObjectETag resolves the committed ETag of (bucket, key) for evaluating
 // put/copy preconditions before ingest. It distinguishes "no such key" (exists
-// = false, no error) from real errors.
+// = false, no error) from real errors; a delete-marker current counts as "no
+// object" for precondition purposes.
 func (b *Backend) currentObjectETag(ctx context.Context, bucket, key string) (etag string, exists bool, err error) {
-	mf, _, err := b.lookupManifest(ctx, bucket, key)
+	rv, err := b.resolveVersion(ctx, bucket, key, "")
 	if err != nil {
 		if isNoSuchKey(err) {
 			return "", false, nil
 		}
 		return "", false, err
 	}
-	return etagOf(mf), true, nil
+	if rv.mf.DeleteMarker {
+		return "", false, nil
+	}
+	return etagOf(rv.mf), true, nil
 }
 
-// isNoSuchKey reports whether err is the NoSuchKey API error lookupManifest
+// isNoSuchKey reports whether err is the NoSuchKey API error resolution
 // returns for a missing object.
 func isNoSuchKey(err error) bool {
 	return errors.Is(err, s3err.GetAPIError(s3err.ErrNoSuchKey))
@@ -39,14 +43,23 @@ func mapCommitError(err error, op string) error {
 	if errors.Is(err, bucketop.ErrBucketNotFound) {
 		return s3err.GetAPIError(s3err.ErrNoSuchBucket)
 	}
-	// PreconditionFailedError embeds APIError but is a distinct concrete type, so
-	// errors.As against APIError below won't match it. Surface it verbatim so its
-	// 412 status and <Condition> XML body reach the versitygw error renderer
-	// (which type-asserts s3err.S3Error without unwrapping — a generic %w wrap
-	// would degrade it to InternalError).
+	// PreconditionFailedError, NoSuchVersionError, and InvalidArgumentError
+	// embed APIError but are distinct concrete types, so errors.As against
+	// APIError below won't match them. Surface each verbatim so its status
+	// and XML body reach the versitygw error renderer (which type-asserts
+	// s3err.S3Error without unwrapping — a generic %w wrap would degrade it
+	// to InternalError).
 	var pf s3err.PreconditionFailedError
 	if errors.As(err, &pf) {
 		return pf
+	}
+	var nsv s3err.NoSuchVersionError
+	if errors.As(err, &nsv) {
+		return nsv
+	}
+	var inv s3err.InvalidArgumentError
+	if errors.As(err, &inv) {
+		return inv
 	}
 	var apiErr s3err.APIError
 	if errors.As(err, &apiErr) {

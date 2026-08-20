@@ -2,15 +2,19 @@ package s3frontend
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/fil-forge/versitygw/auth"
 	"github.com/fil-forge/versitygw/s3err"
 	"github.com/fil-forge/versitygw/s3response"
 	"github.com/ipfs/go-cid"
+	"github.com/multiformats/go-multihash"
 	"go.uber.org/zap"
 
 	"github.com/fil-forge/ingot/bucketauthority"
@@ -104,20 +108,50 @@ func (b *Backend) GetBucketCors(ctx context.Context, bucket string) ([]byte, err
 	return b.cors, nil
 }
 
-// GetObjectLockConfiguration is called from auth.CheckObjectAccess
-// (object_lock.go:223) on every object PUT/DELETE. The caller only
-// tolerates ErrObjectLockConfigurationNotFound; ErrNotImplemented
-// propagates as "header you provided implies functionality not
-// implemented" — ingot doesn't model object lock today, so the
-// honest answer is "no configuration."
+// GetObjectLockConfiguration returns the bucket's stored lock configuration
+// document (the controller's auth.BucketLockConfig JSON, verbatim), or
+// ErrObjectLockConfigurationNotFound when the bucket has never been
+// configured. Called from auth.CheckObjectAccess (object_lock.go:223) on
+// every object PUT/DELETE, which tolerates exactly that sentinel — so this
+// stays one registry Get (docs/s3-object-lock.md §5).
 func (b *Backend) GetObjectLockConfiguration(ctx context.Context, bucket string) ([]byte, error) {
-	if _, err := b.reg.Get(ctx, bucket); err != nil {
+	st, err := b.reg.Get(ctx, bucket)
+	if err != nil {
 		if errors.Is(err, registry.ErrNotFound) {
 			return nil, s3err.GetAPIError(s3err.ErrNoSuchBucket)
 		}
 		return nil, err
 	}
-	return nil, s3err.GetAPIError(s3err.ErrObjectLockConfigurationNotFound)
+	if st.ObjectLockConfig == nil {
+		return nil, s3err.GetAPIError(s3err.ErrObjectLockConfigurationNotFound)
+	}
+	return st.ObjectLockConfig, nil
+}
+
+// PutObjectLockConfiguration stores the bucket's lock configuration. The
+// controller has already parsed and validated the XML (mode, days/years
+// bounds, Enabled status) and hands us its BucketLockConfig JSON to store
+// verbatim. Versioning must be Enabled — enabling lock on an existing
+// versioned bucket is allowed, a suspended or unversioned one is a 409
+// (docs/s3-object-lock.md §5).
+func (b *Backend) PutObjectLockConfiguration(ctx context.Context, bucket string, config []byte) error {
+	st, err := b.reg.Get(ctx, bucket)
+	if err != nil {
+		if errors.Is(err, registry.ErrNotFound) {
+			return s3err.GetAPIError(s3err.ErrNoSuchBucket)
+		}
+		return err
+	}
+	if st.Versioning != registry.VersioningEnabled {
+		return s3err.GetAPIError(s3err.ErrObjectLockConfigurationNotAllowed)
+	}
+	if err := b.reg.SetObjectLockConfig(ctx, bucket, config); err != nil {
+		if errors.Is(err, registry.ErrNotFound) {
+			return s3err.GetAPIError(s3err.ErrNoSuchBucket)
+		}
+		return fmt.Errorf("s3frontend: put object lock configuration: %w", err)
+	}
+	return nil
 }
 
 // GetBucketPolicy is called from auth.VerifyAccess (access-control.go:103)
@@ -135,19 +169,62 @@ func (b *Backend) GetBucketPolicy(ctx context.Context, bucket string) ([]byte, e
 	return nil, s3err.GetAPIError(s3err.ErrNoSuchBucketPolicy)
 }
 
-// GetBucketVersioning is called from auth.CheckObjectAccess
-// (object_lock.go:220, 257). Both call sites tolerate any error by
-// treating versioning as disabled, so we could leave the default
-// ErrNotImplemented — but returning a clean "Suspended" status is
-// less noisy in logs and makes the no-op intent explicit.
+// GetBucketVersioning reports the bucket's versioning configuration. A bucket
+// that has never been configured returns an empty <VersioningConfiguration/>
+// (nil Status); once configured, the status is Enabled or Suspended. Also
+// called from auth.CheckObjectAccess (object_lock.go:220, 257).
 func (b *Backend) GetBucketVersioning(ctx context.Context, bucket string) (s3response.GetBucketVersioningOutput, error) {
-	if _, err := b.reg.Get(ctx, bucket); err != nil {
+	st, err := b.reg.Get(ctx, bucket)
+	if err != nil {
 		if errors.Is(err, registry.ErrNotFound) {
 			return s3response.GetBucketVersioningOutput{}, s3err.GetAPIError(s3err.ErrNoSuchBucket)
 		}
 		return s3response.GetBucketVersioningOutput{}, err
 	}
-	return s3response.GetBucketVersioningOutput{}, nil
+	out := s3response.GetBucketVersioningOutput{}
+	switch st.Versioning {
+	case registry.VersioningEnabled:
+		status := types.BucketVersioningStatusEnabled
+		out.Status = &status
+	case registry.VersioningSuspended:
+		status := types.BucketVersioningStatusSuspended
+		out.Status = &status
+	}
+	return out, nil
+}
+
+// PutBucketVersioning sets the bucket's versioning state. The controller
+// rejects anything but Enabled/Suspended before we're called; there is no way
+// back to unversioned (matching S3). Suspending a bucket that carries an
+// object-lock configuration is refused — the guard that makes "a lock bucket
+// is always versioning-Enabled" an invariant (docs/s3-object-lock.md §5).
+func (b *Backend) PutBucketVersioning(ctx context.Context, bucket string, status types.BucketVersioningStatus) error {
+	st, err := b.reg.Get(ctx, bucket)
+	if err != nil {
+		if errors.Is(err, registry.ErrNotFound) {
+			return s3err.GetAPIError(s3err.ErrNoSuchBucket)
+		}
+		return err
+	}
+	var v registry.VersioningState
+	switch status {
+	case types.BucketVersioningStatusEnabled:
+		v = registry.VersioningEnabled
+	case types.BucketVersioningStatusSuspended:
+		if st.ObjectLockConfig != nil {
+			return s3err.GetAPIError(s3err.ErrSuspendedVersioningNotAllowed)
+		}
+		v = registry.VersioningSuspended
+	default:
+		return s3err.GetAPIError(s3err.ErrMalformedXML)
+	}
+	if err := b.reg.SetVersioning(ctx, bucket, v); err != nil {
+		if errors.Is(err, registry.ErrNotFound) {
+			return s3err.GetAPIError(s3err.ErrNoSuchBucket)
+		}
+		return fmt.Errorf("s3frontend: put bucket versioning: %w", err)
+	}
+	return nil
 }
 
 func (b *Backend) HeadBucket(ctx context.Context, input *s3.HeadBucketInput) (*s3.HeadBucketOutput, error) {
@@ -175,6 +252,19 @@ func (b *Backend) CreateBucket(ctx context.Context, input *s3.CreateBucketInput,
 	if !validBucketName(name) {
 		return s3err.GetAPIError(s3err.ErrInvalidBucketName)
 	}
+	// x-amz-bucket-object-lock-enabled: the bucket is born versioned and
+	// locked in one Create, so there is no window in which it exists
+	// unlocked (docs/s3-object-lock.md §5). The stored document mirrors
+	// posix: Enabled with the creation time, no default retention.
+	var init registry.CreateState
+	if input.ObjectLockEnabledForBucket != nil && *input.ObjectLockEnabledForBucket {
+		now := time.Now()
+		cfg, err := json.Marshal(auth.BucketLockConfig{Enabled: true, CreatedAt: &now})
+		if err != nil {
+			return fmt.Errorf("s3frontend: create bucket: marshal lock config: %w", err)
+		}
+		init = registry.CreateState{Versioning: registry.VersioningEnabled, ObjectLockConfig: cfg}
+	}
 	req, ok := reqscope.Request(ctx)
 	if !ok {
 		return errors.New("s3frontend: create bucket: no request in context")
@@ -186,7 +276,7 @@ func (b *Backend) CreateBucket(ctx context.Context, input *s3.CreateBucketInput,
 		}
 		return err
 	}
-	if err := b.reg.Create(ctx, name, id); err != nil {
+	if err := b.reg.Create(ctx, name, id, init); err != nil {
 		if errors.Is(err, registry.ErrExists) {
 			return s3err.GetAPIError(s3err.ErrBucketAlreadyExists)
 		}
@@ -205,8 +295,10 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 			return err
 		}
 
-		// S3 forbids deleting non-empty buckets. Walk the MST until
-		// we see any leaf, then bail.
+		// S3 forbids deleting non-empty buckets. Walk the MST until we see any
+		// leaf, then bail. Any leaf counts — a versioned bucket holding only
+		// delete markers is still non-empty, and reports the versioned error
+		// ("you must delete all versions").
 		if st.Root.Defined() {
 			t := mst.LoadMST(b.read, st.Space, st.Root)
 			var seen bool
@@ -218,6 +310,9 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 				return walkErr
 			}
 			if seen {
+				if st.Versioning.Configured() {
+					return s3err.GetAPIError(s3err.ErrVersionedBucketNotEmpty)
+				}
 				return s3err.GetAPIError(s3err.ErrBucketNotEmpty)
 			}
 		}
@@ -241,6 +336,33 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 		if aborted > 0 {
 			b.logger.Info("delete bucket: aborted in-flight multipart sessions",
 				zap.String("bucket", name), zap.Int("aborted", aborted), zap.Int("total", len(sessions)))
+		}
+
+		// Shipped catalog segments registered blobs in the bucket's space
+		// (each sealed CAR plus its sharded-dag-index blob), and hilt
+		// refuses to delete a space that still holds registrations — so
+		// release them first. Quiescing the bucket's log comes before the
+		// enumeration: it joins any in-flight ship, so a segment can't
+		// register its blobs after the release pass has already read the
+		// rows (the delete would race the flush goroutine and be refused).
+		// The release is idempotent (removing an unregistered blob is a
+		// no-op), so a retried DeleteBucket is safe.
+		if log, ok := b.log.(interface {
+			QuiesceBucketLog(ctx context.Context, bucket string) error
+			ShippedSegmentDigests(ctx context.Context, bucket string) ([][]byte, error)
+		}); ok {
+			if err := log.QuiesceBucketLog(ctx, name); err != nil {
+				return fmt.Errorf("s3frontend: delete bucket: %w", err)
+			}
+			digests, err := log.ShippedSegmentDigests(ctx, name)
+			if err != nil {
+				return fmt.Errorf("s3frontend: delete bucket: %w", err)
+			}
+			for _, d := range digests {
+				if err := b.remover.RemoveBlob(ctx, st.Space, multihash.Multihash(d)); err != nil {
+					return fmt.Errorf("s3frontend: delete bucket: release shipped segment: %w", err)
+				}
+			}
 		}
 
 		req, ok := reqscope.Request(ctx)

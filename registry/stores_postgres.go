@@ -276,12 +276,14 @@ func (r *Postgres) CreateSession(ctx context.Context, s MultipartSession) error 
 		`INSERT INTO ingot.multipart_sessions
 		   (upload_id, bucket, object_key, state, content_type, metadata,
 		    content_encoding, content_disposition, content_language, cache_control, expires,
-		    website_redirect_location, checksum_algorithm, checksum_type)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+		    website_redirect_location, checksum_algorithm, checksum_type,
+		    lock_mode, lock_retain_until, lock_legal_hold, tagging)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)`,
 		s.UploadID, s.Bucket, s.ObjectKey, state, nullString(s.ContentType), meta,
 		nullString(s.ContentEncoding), nullString(s.ContentDisposition),
 		nullString(s.ContentLanguage), nullString(s.CacheControl), nullString(s.Expires),
-		nullString(s.WebsiteRedirectLocation), nullString(s.ChecksumAlgorithm), nullString(s.ChecksumType))
+		nullString(s.WebsiteRedirectLocation), nullString(s.ChecksumAlgorithm), nullString(s.ChecksumType),
+		nullString(s.LockMode), s.LockRetainUntil, nullString(s.LockLegalHold), nullString(s.Tagging))
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == uniqueViolation {
@@ -296,7 +298,8 @@ func (r *Postgres) GetSession(ctx context.Context, uploadID string) (*MultipartS
 	row := r.pool.QueryRow(ctx,
 		`SELECT upload_id, bucket, object_key, state, content_type, metadata, created_at,
 		        content_encoding, content_disposition, content_language, cache_control, expires,
-		        website_redirect_location, checksum_algorithm, checksum_type
+		        website_redirect_location, checksum_algorithm, checksum_type,
+		        lock_mode, lock_retain_until, lock_legal_hold, tagging
 		 FROM ingot.multipart_sessions WHERE upload_id = $1`,
 		uploadID)
 	s, err := scanSession(row)
@@ -313,10 +316,11 @@ func (r *Postgres) GetSession(ctx context.Context, uploadID string) (*MultipartS
 // (see GetSession/ListSessions selects).
 func scanSession(row pgx.Row) (*MultipartSession, error) {
 	s := &MultipartSession{}
-	var contentType, ce, cd, cl, cc, exp, wrl, ckAlgo, ckType *string
+	var contentType, ce, cd, cl, cc, exp, wrl, ckAlgo, ckType, lockMode, lockHold, tagging *string
 	var meta []byte
 	err := row.Scan(&s.UploadID, &s.Bucket, &s.ObjectKey, &s.State, &contentType, &meta, &s.CreatedAt,
-		&ce, &cd, &cl, &cc, &exp, &wrl, &ckAlgo, &ckType)
+		&ce, &cd, &cl, &cc, &exp, &wrl, &ckAlgo, &ckType,
+		&lockMode, &s.LockRetainUntil, &lockHold, &tagging)
 	if err != nil {
 		return nil, err
 	}
@@ -334,6 +338,9 @@ func scanSession(row pgx.Row) (*MultipartSession, error) {
 	setIfNotNil(&s.WebsiteRedirectLocation, wrl)
 	setIfNotNil(&s.ChecksumAlgorithm, ckAlgo)
 	setIfNotNil(&s.ChecksumType, ckType)
+	setIfNotNil(&s.LockMode, lockMode)
+	setIfNotNil(&s.LockLegalHold, lockHold)
+	setIfNotNil(&s.Tagging, tagging)
 	if s.Metadata, err = unmarshalMetadata(meta); err != nil {
 		return nil, err
 	}
@@ -364,12 +371,12 @@ func (r *Postgres) PutPart(ctx context.Context, p MultipartPart) error {
 		state = PartParked
 	}
 	_, err := r.pool.Exec(ctx,
-		`INSERT INTO ingot.multipart_parts (upload_id, part_number, etag_md5, size, blob_digests, state)
-		 VALUES ($1, $2, $3, $4, $5, $6)
+		`INSERT INTO ingot.multipart_parts (upload_id, part_number, etag_md5, size, checksum, blob_digests, state)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7)
 		 ON CONFLICT (upload_id, part_number) DO UPDATE
-		   SET etag_md5 = EXCLUDED.etag_md5, size = EXCLUDED.size,
+		   SET etag_md5 = EXCLUDED.etag_md5, size = EXCLUDED.size, checksum = EXCLUDED.checksum,
 		       blob_digests = EXCLUDED.blob_digests, state = EXCLUDED.state`,
-		p.UploadID, p.PartNumber, p.ETagMD5, p.Size, p.BlobDigests, state)
+		p.UploadID, p.PartNumber, p.ETagMD5, p.Size, p.Checksum, p.BlobDigests, state)
 	if err != nil {
 		return fmt.Errorf("registry: put part: %w", err)
 	}
@@ -378,7 +385,7 @@ func (r *Postgres) PutPart(ctx context.Context, p MultipartPart) error {
 
 func (r *Postgres) ListParts(ctx context.Context, uploadID string) ([]MultipartPart, error) {
 	rows, err := r.pool.Query(ctx,
-		`SELECT part_number, etag_md5, size, blob_digests, state, created_at
+		`SELECT part_number, etag_md5, size, checksum, blob_digests, state, created_at
 		 FROM ingot.multipart_parts WHERE upload_id = $1 ORDER BY part_number ASC`,
 		uploadID)
 	if err != nil {
@@ -389,7 +396,7 @@ func (r *Postgres) ListParts(ctx context.Context, uploadID string) ([]MultipartP
 	var out []MultipartPart
 	for rows.Next() {
 		p := MultipartPart{UploadID: uploadID}
-		if err := rows.Scan(&p.PartNumber, &p.ETagMD5, &p.Size, &p.BlobDigests, &p.State, &p.CreatedAt); err != nil {
+		if err := rows.Scan(&p.PartNumber, &p.ETagMD5, &p.Size, &p.Checksum, &p.BlobDigests, &p.State, &p.CreatedAt); err != nil {
 			return nil, fmt.Errorf("registry: list parts scan: %w", err)
 		}
 		out = append(out, p)
@@ -404,7 +411,8 @@ func (r *Postgres) ListSessions(ctx context.Context, bucket string) ([]Multipart
 	rows, err := r.pool.Query(ctx,
 		`SELECT upload_id, bucket, object_key, state, content_type, metadata, created_at,
 		        content_encoding, content_disposition, content_language, cache_control, expires,
-		        website_redirect_location, checksum_algorithm, checksum_type
+		        website_redirect_location, checksum_algorithm, checksum_type,
+		        lock_mode, lock_retain_until, lock_legal_hold, tagging
 		 FROM ingot.multipart_sessions WHERE bucket = $1
 		 ORDER BY object_key ASC, created_at ASC, upload_id ASC`,
 		bucket)
@@ -431,7 +439,8 @@ func (r *Postgres) ListStaleSessions(ctx context.Context, state string, cutoff t
 	rows, err := r.pool.Query(ctx,
 		`SELECT upload_id, bucket, object_key, state, content_type, metadata, created_at,
 		        content_encoding, content_disposition, content_language, cache_control, expires,
-		        website_redirect_location, checksum_algorithm, checksum_type
+		        website_redirect_location, checksum_algorithm, checksum_type,
+		        lock_mode, lock_retain_until, lock_legal_hold, tagging
 		 FROM ingot.multipart_sessions WHERE state = $1 AND created_at < $2
 		 ORDER BY created_at ASC`,
 		state, cutoff)

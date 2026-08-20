@@ -56,25 +56,27 @@ func TestPostgresStores_Live(t *testing.T) {
 	}
 
 	r := registry.NewPostgres(pool)
-	seedBucket := func(t *testing.T, name string) {
+	// seedBucket inserts a bucket row directly, bypassing Create, and returns
+	// the space DID it generated. space has no default — Create always supplies
+	// the DID Hilt returns — so the seed supplies one too.
+	seedBucket := func(t *testing.T, name string) did.DID {
 		t.Helper()
-		// space has no default (Create always supplies the DID Hilt
-		// returns); the seed uses '' — the pre-space sentinel Get maps
-		// to did.Undef.
-		if _, err := pool.Exec(ctx, `INSERT INTO ingot.buckets (name, space) VALUES ($1, '')`, name); err != nil {
+		space := testutil.RandomDID(t)
+		if _, err := pool.Exec(ctx, `INSERT INTO ingot.buckets (name, space) VALUES ($1, $2)`, name, space.String()); err != nil {
 			t.Fatalf("seed bucket %q: %v", name, err)
 		}
+		return space
 	}
 	digest := []byte{0x12, 0x20, 0xab, 0xcd} // binary, to exercise bytea round-trips
 
-	t.Run("bucket space defaults empty", func(t *testing.T) {
-		seedBucket(t, "b")
+	t.Run("bucket space round trips", func(t *testing.T) {
+		space := seedBucket(t, "b")
 		st, err := r.Get(ctx, "b")
 		if err != nil {
 			t.Fatalf("Get: %v", err)
 		}
-		if st.Space != did.Undef {
-			t.Fatalf("space = %q, want empty default", st.Space)
+		if st.Space != space {
+			t.Fatalf("space = %q, want %q", st.Space, space)
 		}
 	})
 
@@ -84,6 +86,7 @@ func TestPostgresStores_Live(t *testing.T) {
 		// (a bucket has one space). A second space therefore implies a second
 		// bucket — bucket "b2" below, not a re-keyed "b".
 		space := testutil.RandomDID(t)
+		space2 := testutil.RandomDID(t)
 		add := func(bucket, key string, sp did.DID) {
 			if err := r.AddBlobClaim(ctx, registry.BlobClaim{Digest: digest, Bucket: bucket, ObjectKey: key, VersionID: registry.NullVersionID, Space: sp}); err != nil {
 				t.Fatalf("AddBlobClaim: %v", err)
@@ -92,11 +95,11 @@ func TestPostgresStores_Live(t *testing.T) {
 		add("b", "k1", space)
 		add("b", "k2", space)
 		add("b", "k1", space) // ON CONFLICT DO NOTHING — does not inflate the count
-		add("b2", "k1", testutil.RandomDID(t))
+		add("b2", "k1", space2)
 		if n, _ := r.CountClaims(ctx, space, digest); n != 2 {
 			t.Fatalf("count space1 = %d, want 2", n)
 		}
-		if n, _ := r.CountClaims(ctx, testutil.RandomDID(t), digest); n != 1 {
+		if n, _ := r.CountClaims(ctx, space2, digest); n != 1 {
 			t.Fatalf("count space2 = %d, want 1", n)
 		}
 		if err := r.DeleteBlobClaim(ctx, digest, "b", "k1", registry.NullVersionID); err != nil {
@@ -354,7 +357,7 @@ func TestPostgresStores_Live(t *testing.T) {
 		}
 		// Ship a segment whose op-roots include a stale root the bucket never
 		// adopted; only the committed root may advance forge_root.
-		if err := r.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seq, time.Now().Unix(),
+		if err := r.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seq, time.Now().Unix(), nil,
 			[]blockstore.OpRoot{{Bucket: "fg", Root: stale}, {Bucket: "fg", Root: committed}}); err != nil {
 			t.Fatalf("MarkSegmentShipped: %v", err)
 		}

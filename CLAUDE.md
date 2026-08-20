@@ -178,8 +178,8 @@ forge-mode daemon. Two tiers:
 - **`make itest` — integration** (`itest/`, build tag `itest`, Docker):
   boots the smelt Forge stack with THIS working tree's binary mounted over
   the published image.
-  - **`versity_{bucket,object,multipart}_test.go`** — the S3 conformance
-    partition: per upstream versitygw group, a curated pass table (every case
+  - **`versity_{bucket,object,multipart,versioning}_test.go`** — the S3
+    conformance partition: per upstream versitygw group, a curated pass table (every case
     must pass) and an XFail table (known-failing, reported as SKIP; an
     *unexpected pass* fails the test — the cue to promote the row). One
     shared stack serves all categories (`TestForgeVersity`).

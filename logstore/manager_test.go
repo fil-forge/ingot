@@ -15,20 +15,23 @@ import (
 )
 
 // recordingFlush counts flushes per bucket so tests can assert each
-// bucket's segments ship through that bucket's own closure.
+// bucket's segments ship through that bucket's own closure. Every flush
+// reports fakeIndexDigest as the shipped index blob, as a real ship would.
 type recordingFlush struct {
 	mu    sync.Mutex
 	byBkt map[string]int
 }
 
+var fakeIndexDigest = []byte("fake-index-digest-multihash")
+
 func newRecordingFlush() *recordingFlush { return &recordingFlush{byBkt: map[string]int{}} }
 
 func (r *recordingFlush) forBucket(bucket string) FlushFunc {
-	return func(context.Context, *Segment) error {
+	return func(context.Context, *Segment) ([]byte, error) {
 		r.mu.Lock()
 		defer r.mu.Unlock()
 		r.byBkt[bucket]++
-		return nil
+		return fakeIndexDigest, nil
 	}
 }
 
@@ -179,6 +182,73 @@ func TestManager_RemoveBucketLog(t *testing.T) {
 	if _, err := m.Get(context.Background(), blkB.Cid()); err != nil {
 		t.Fatalf("beta block must survive alpha's removal: %v", err)
 	}
+}
+
+// TestManager_QuiesceAndShippedSegmentDigests: quiescing joins the flush
+// pipeline so the enumeration afterwards is final — every shipped segment
+// contributes its CAR multihash and index-blob digest, sealed-but-unshipped
+// segments contribute their CAR only (a flush aborted after the CAR's
+// blob/add may have registered it), and a bucket with no sealed segments
+// contributes nothing.
+func TestManager_QuiesceAndShippedSegmentDigests(t *testing.T) {
+	dir := t.TempDir()
+	meta := newFakeMeta()
+	flush := newRecordingFlush()
+	m := openTestManager(t, dir, meta, flush)
+
+	appendFor(t, m, "alpha", "shipped-content")
+
+	// Quiesce without waiting for the seal-age tick: it force-seals the open
+	// segment and joins the flush pipeline, so the rows are final on return
+	// regardless of whether the tail segment shipped or was dropped.
+	if err := m.QuiesceBucketLog(context.Background(), "alpha"); err != nil {
+		t.Fatalf("QuiesceBucketLog: %v", err)
+	}
+
+	rows, err := meta.ListSegments(context.Background(), blockstore.PlaneCatalog, "alpha")
+	if err != nil {
+		t.Fatalf("ListSegments: %v", err)
+	}
+	shipped := map[uint64]bool{}
+	sealed := 0
+	for _, r := range rows {
+		if r.State == StateSealed {
+			sealed++
+			shipped[r.Seq] = r.ShippedAt != 0
+		}
+	}
+	if sealed == 0 {
+		t.Fatalf("expected the quiesce to force-seal the open segment")
+	}
+
+	digests, err := m.ShippedSegmentDigests(context.Background(), "alpha")
+	if err != nil {
+		t.Fatalf("ShippedSegmentDigests: %v", err)
+	}
+	// Every sealed segment contributes a 34-byte sha2-256 CAR multihash;
+	// shipped ones additionally the flush's index digest.
+	wantLen := 0
+	for _, s := range shipped {
+		wantLen++
+		if s {
+			wantLen++
+		}
+	}
+	if len(digests) != wantLen {
+		t.Fatalf("got %d digests, want %d (sealed=%d shipped=%v)", len(digests), wantLen, sealed, shipped)
+	}
+	for _, d := range digests {
+		if len(d) != 34 && string(d) != string(fakeIndexDigest) {
+			t.Fatalf("unexpected digest %q (len %d)", d, len(d))
+		}
+	}
+
+	// A bucket with no sealed segments reports none, and the quiesced
+	// bucket reopens lazily for new appends.
+	if got, err := m.ShippedSegmentDigests(context.Background(), "gamma"); err != nil || len(got) != 0 {
+		t.Fatalf("gamma: got %d digests, err %v", len(got), err)
+	}
+	appendFor(t, m, "alpha", "post-quiesce-write")
 }
 
 // TestManager_RejectsUnsafeBucketNames: the bucket→directory mapping must

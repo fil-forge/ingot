@@ -18,11 +18,17 @@ type ObjectManifest struct {
 	// because a multipart ETag cannot be recomputed from the body bytes.
 	ETag string `cborgen:"e"`
 
-	// DeleteMarker flags a tombstone version (no body). It is reserved
-	// for S3 versioning, which is not implemented this iteration; it is
-	// always false until versioning lands. The version id itself is a
-	// function of the MST key, not stored here. See docs/architecture.md §3.
+	// DeleteMarker flags a tombstone version: a zero Body, no ETag, and no
+	// blob claims. Markers are versions like any other — they occupy a leaf
+	// slot and carry a Seq/VersionID. See docs/s3-versioning.md §2.3.
 	DeleteMarker bool `cborgen:"dm"`
+
+	// Seq is the version's per-bucket ordinal (== its leaf/prev-tree
+	// position); VersionID is its S3 client handle — "null" for a
+	// null version, else the ULID token minted from Seq. Zero/empty only
+	// in pre-versioning blocks. See docs/s3-versioning.md §2–§3.
+	Seq       uint64 `cborgen:"sq"`
+	VersionID string `cborgen:"vi"`
 
 	// ChecksumAlgorithm / Checksum carry the S3 additional checksum the client
 	// requested at PUT (x-amz-checksum-*), if any: the algorithm name (e.g.
@@ -31,6 +37,11 @@ type ObjectManifest struct {
 	// checksum was requested. Independent of the internal sha256 content address.
 	ChecksumAlgorithm string `cborgen:"ca"`
 	Checksum          string `cborgen:"ck"`
+	// ChecksumType is the S3 checksum type of Checksum: "FULL_OBJECT" (computed
+	// over the whole body) or "COMPOSITE" (a multipart checksum-of-checksums
+	// with a "-N" part-count suffix). Empty in blocks written before the type
+	// was recorded, which are all full-object.
+	ChecksumType string `cborgen:"cy"`
 
 	// HTTP/S3 system headers carried through PUT and replayed on
 	// HEAD/GET. Empty strings are omitted from responses.

@@ -28,11 +28,10 @@ import (
 
 const defaultMaxKeys = 1000
 
-// PutObject writes an object. Tagging, ACLs, checksums, retention,
-// and preconditions are dropped on the floor for now — the manifest
-// schema has no place for them yet (see bucket-metadata.rfc
-// §"Canonical state vs service state"). ETag is the hex md5 of the
-// body, quoted per S3 wire format.
+// PutObject writes an object. Tagging and ACLs are dropped on the floor for
+// now (see bucket-metadata.rfc §"Canonical state vs service state"); lock
+// headers stamp the new version's state (docs/s3-object-lock.md §7). ETag is
+// the hex md5 of the body, quoted per S3 wire format.
 func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput) (s3response.PutObjectOutput, error) {
 	if input.Bucket == nil {
 		return s3response.PutObjectOutput{}, s3err.GetAPIError(s3err.ErrInvalidBucketName)
@@ -60,6 +59,21 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 		}
 		return s3response.PutObjectOutput{}, fmt.Errorf("s3frontend: put: %w", err)
 	}
+
+	// x-amz-object-lock-* headers: validated against the bucket's lock
+	// configuration before ingest (fail fast), stamped into the commit below
+	// (docs/s3-object-lock.md §7). The x-amz-tagging header joins the same
+	// initial state (docs/s3-object-tagging.md §4); an invalid header fails
+	// before ingest and uploads nothing.
+	initState, err := lockStateFromHeaders(bucketState, input.ObjectLockMode, input.ObjectLockRetainUntilDate, input.ObjectLockLegalHoldStatus)
+	if err != nil {
+		return s3response.PutObjectOutput{}, err
+	}
+	tags, err := backend.ParseObjectTags(backend.GetStringFromPtr(input.Tagging))
+	if err != nil {
+		return s3response.PutObjectOutput{}, err
+	}
+	initState = applyTagsIfPresent(initState, tags)
 
 	// PRECONDITIONS (no lock): If-Match / If-None-Match. Evaluated here to fail
 	// fast before ingest, then RE-CHECKED under the per-bucket lock at commit so
@@ -113,100 +127,48 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 		ckAlgo, ckVal = string(spec.algo), hr.Sum()
 	}
 
-	// mf is captured by the closure and read after WithTx commits, so the
-	// response ETag/size come from the same manifest that was committed.
-	// oldDigests captures the superseded version's body digests (an overwrite),
-	// so the reference index can be reconciled AFTER the commit is durable.
-	var mf *msbucket.ObjectManifest
-	var oldDigests [][]byte
-
-	// COMMIT (short per-bucket critical section): write the manifest + MST
-	// splice + guarded root swap. No large-body work happens under the lock; the
-	// reference-index reconcile runs after, so a failed commit can't diverge
-	// blob_refs from the committed catalog.
-	err = b.txns.WithTx(ctx, bucketName, func(ctx context.Context, tx *bucketop.Tx) (cid.Cid, error) {
-		mf = &msbucket.ObjectManifest{
-			Key:                     key,
-			ContentType:             contentType,
-			Created:                 time.Now().Unix(),
-			Body:                    bodyRec,
-			ETag:                    hex.EncodeToString(bodyRec.MD5),
-			ChecksumAlgorithm:       ckAlgo,
-			Checksum:                ckVal,
-			ContentEncoding:         backend.GetStringFromPtr(input.ContentEncoding),
-			ContentDisposition:      backend.GetStringFromPtr(input.ContentDisposition),
-			ContentLanguage:         backend.GetStringFromPtr(input.ContentLanguage),
-			CacheControl:            backend.GetStringFromPtr(input.CacheControl),
-			Expires:                 backend.GetStringFromPtr(input.Expires),
-			WebsiteRedirectLocation: backend.GetStringFromPtr(input.WebsiteRedirectLocation),
-			Metadata:                input.Metadata,
+	// COMMIT (short per-bucket critical section): the §5 write rule — seq
+	// allocation, manifest + rebuilt leaf + MST splice + guarded root swap,
+	// then the post-commit reference-index reconcile (docs/s3-versioning.md).
+	mf := &msbucket.ObjectManifest{
+		Key:                     key,
+		ContentType:             contentType,
+		Created:                 time.Now().Unix(),
+		Body:                    bodyRec,
+		ETag:                    hex.EncodeToString(bodyRec.MD5),
+		ChecksumAlgorithm:       ckAlgo,
+		Checksum:                ckVal,
+		ChecksumType:            string(types.ChecksumTypeFullObject),
+		ContentEncoding:         backend.GetStringFromPtr(input.ContentEncoding),
+		ContentDisposition:      backend.GetStringFromPtr(input.ContentDisposition),
+		ContentLanguage:         backend.GetStringFromPtr(input.ContentLanguage),
+		CacheControl:            backend.GetStringFromPtr(input.CacheControl),
+		Expires:                 backend.GetStringFromPtr(input.Expires),
+		WebsiteRedirectLocation: backend.GetStringFromPtr(input.WebsiteRedirectLocation),
+		Metadata:                input.Metadata,
+	}
+	node, effState, err := b.commitVersion(ctx, bucketState, key, mf, initState, func(superseded *msbucket.ObjectManifest) error {
+		// Race-safe re-check of If-Match / If-None-Match under the lock. A
+		// delete-marker current means "no object" for precondition purposes.
+		oldETag, oldExists := "", false
+		if superseded != nil && !superseded.DeleteMarker {
+			oldETag, oldExists = etagOf(superseded), true
 		}
-		mfCid, err := tx.Put(ctx, mf)
-		if err != nil {
-			return cid.Undef, fmt.Errorf("manifest put: %w", err)
-		}
-
-		t := tx.LoadTree()
-
-		// Capture the prior version's body digests + ETag (if this is an
-		// overwrite) before replacing the leaf, so the reference index can
-		// release blobs the new body no longer references and the precondition
-		// re-check sees the current state.
-		var oldETag string
-		oldCid, gerr := t.Get(ctx, key)
-		oldExists := gerr == nil
-		switch {
-		case gerr == nil:
-			var oldMf msbucket.ObjectManifest
-			if err := tx.Get(ctx, tx.State().Space, oldCid, &oldMf); err != nil {
-				return cid.Undef, fmt.Errorf("load prior manifest: %w", err)
-			}
-			oldDigests = bodyDigests(oldMf.Body)
-			oldETag = etagOf(&oldMf)
-			if err := b.gc.AddGCCandidate(ctx, oldCid.Bytes(), bucketName); err != nil {
-				return cid.Undef, fmt.Errorf("gc candidate: %w", err)
-			}
-		case errors.Is(gerr, mst.ErrNotFound):
-			// new key — no prior version
-		default:
-			return cid.Undef, fmt.Errorf("mst get prior: %w", gerr)
-		}
-
-		// Race-safe re-check of If-Match / If-None-Match against the current
-		// state under the lock (no-ops when neither header is set).
-		if err := backend.EvaluateObjectPutPreconditions(oldETag, input.IfMatch, input.IfNoneMatch, oldExists); err != nil {
-			return cid.Undef, err
-		}
-
-		t2, err := t.Add(ctx, key, mfCid, -1)
-		if errors.Is(err, mst.ErrAlreadyExists) {
-			t2, err = t.Update(ctx, key, mfCid) // unversioned overwrite-in-place
-		}
-		if err != nil {
-			return cid.Undef, fmt.Errorf("mst write: %w", err)
-		}
-
-		return t2.GetPointer(ctx, tx)
+		return backend.EvaluateObjectPutPreconditions(oldETag, input.IfMatch, input.IfNoneMatch, oldExists)
 	})
 	if err != nil {
-		return s3response.PutObjectOutput{}, mapCommitError(err, "put")
+		return s3response.PutObjectOutput{}, err
 	}
-
-	// Reference index, after the commit is durable: claim the new body's blobs
-	// and release the superseded ones (overwrite). Done post-commit so a commit
-	// failure can never leave blob_refs out of step with the catalog.
-	toRemove, err := b.reconcileClaims(ctx, bucketState, key, oldDigests, bodyDigests(bodyRec))
-	if err != nil {
-		return s3response.PutObjectOutput{}, fmt.Errorf("s3frontend: put reconcile: %w", err)
-	}
-	b.releaseBlobs(ctx, bucketState.Space, toRemove)
 
 	size := mf.Body.Size
 	out := s3response.PutObjectOutput{
 		ETag: etagOf(mf),
 		Size: &size,
 	}
-	out.ChecksumCRC32, out.ChecksumCRC32C, out.ChecksumSHA1, out.ChecksumSHA256, out.ChecksumCRC64NVME, out.ChecksumSHA512, out.ChecksumMD5, out.ChecksumXXHASH64, out.ChecksumXXHASH3, out.ChecksumXXHASH128, out.ChecksumType = checksumFields(ckAlgo, ckVal)
+	if effState.Configured() {
+		out.VersionID = node.VersionID
+	}
+	out.ChecksumCRC32, out.ChecksumCRC32C, out.ChecksumSHA1, out.ChecksumSHA256, out.ChecksumCRC64NVME, out.ChecksumSHA512, out.ChecksumMD5, out.ChecksumXXHASH64, out.ChecksumXXHASH3, out.ChecksumXXHASH128, out.ChecksumType = checksumFields(ckAlgo, ckVal, mf.ChecksumType)
 	return out, nil
 }
 
@@ -310,7 +272,7 @@ func (b *Backend) uploadBlobs(ctx context.Context, space did.DID, blobs []msbuck
 	return nil
 }
 
-// reconcileClaims updates blob_refs for an object version under (bucket, key)
+// reconcileClaims updates blob_refs for ONE version id under (bucket, key)
 // whose body changes from oldDigests to newDigests, and returns the digests
 // whose (space, digest) claim reached zero so the caller can release them after
 // the commit. The diff is the crux of safe dedup + delete:
@@ -321,8 +283,10 @@ func (b *Backend) uploadBlobs(ctx context.Context, space did.DID, blobs []msbuck
 //   - a digest in BOTH keeps its single claim untouched, so a re-PUT of
 //     identical bytes (or a split object that shares blobs) never churns the row.
 //
-// versionId is the unversioned sentinel for now — one claim row per
-// (digest, bucket, key). When versioning lands, each version carries its own id.
+// versionID names the claim rows: the version's ULID token, or "null" for a
+// null version (unversioned buckets thus produce the same rows as before
+// versioning). Callers releasing a DIFFERENT version than the one they created
+// call this once per version id (docs/s3-versioning.md §8).
 //
 // It MUST run only after the catalog/root commit succeeds: it mutates blob_refs
 // in its own (non-transactional) store, so applying it before a commit that then
@@ -330,7 +294,7 @@ func (b *Backend) uploadBlobs(ctx context.Context, space did.DID, blobs []msbuck
 // of a shared blob could drop a still-referenced one). Iterates over the
 // DEDUPLICATED digest sets, so a manifest carrying the same digest in two blobs
 // adds/deletes one claim and releases the blob at most once.
-func (b *Backend) reconcileClaims(ctx context.Context, bucketState *registry.State, key string, oldDigests, newDigests [][]byte) (toRemove [][]byte, err error) {
+func (b *Backend) reconcileClaims(ctx context.Context, bucketState *registry.State, key, versionID string, oldDigests, newDigests [][]byte) (toRemove [][]byte, err error) {
 	oldSet := digestSet(oldDigests)
 	newSet := digestSet(newDigests)
 
@@ -339,7 +303,7 @@ func (b *Backend) reconcileClaims(ctx context.Context, bucketState *registry.Sta
 			continue // unchanged reference
 		}
 		if err := b.blobRefs.AddBlobClaim(ctx, registry.BlobClaim{
-			Digest: d, Bucket: bucketState.Name, ObjectKey: key, VersionID: registry.NullVersionID, Space: bucketState.Space,
+			Digest: d, Bucket: bucketState.Name, ObjectKey: key, VersionID: versionID, Space: bucketState.Space,
 		}); err != nil {
 			return nil, fmt.Errorf("add blob claim: %w", err)
 		}
@@ -348,7 +312,7 @@ func (b *Backend) reconcileClaims(ctx context.Context, bucketState *registry.Sta
 		if _, ok := newSet[k]; ok {
 			continue // still referenced by the new body
 		}
-		if err := b.blobRefs.DeleteBlobClaim(ctx, d, bucketState.Name, key, registry.NullVersionID); err != nil {
+		if err := b.blobRefs.DeleteBlobClaim(ctx, d, bucketState.Name, key, versionID); err != nil {
 			return nil, fmt.Errorf("delete blob claim: %w", err)
 		}
 		n, err := b.blobRefs.CountClaims(ctx, bucketState.Space, d)
@@ -442,10 +406,10 @@ func partRange(body msbucket.Body, partNumber int32) (start, length int64, isRan
 	return 0, body.Size, true, nil, nil
 }
 
-// HeadObject returns an object's metadata, honoring the conditional-request
-// preconditions and the same byte-selection as GetObject (?partNumber=N or a
-// Range header → a 206 with Content-Range, plus x-amz-mp-parts-count for a
-// multipart part). Versioning and tagging are not implemented.
+// HeadObject returns an object's metadata, honoring `?versionId`, the
+// conditional-request preconditions, and the same byte-selection as GetObject
+// (?partNumber=N or a Range header → a 206 with Content-Range, plus
+// x-amz-mp-parts-count for a multipart part). Tagging is not implemented.
 func (b *Backend) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s3.HeadObjectOutput, error) {
 	if input.Bucket == nil {
 		return nil, s3err.GetAPIError(s3err.ErrInvalidBucketName)
@@ -453,9 +417,25 @@ func (b *Backend) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s
 	if input.Key == nil {
 		return nil, s3err.GetAPIError(s3err.ErrNoSuchKey)
 	}
-	mf, _, err := b.lookupManifest(ctx, *input.Bucket, *input.Key)
+	versionID := backend.GetStringFromPtr(input.VersionId)
+	rv, err := b.resolveVersion(ctx, *input.Bucket, *input.Key, versionID)
 	if err != nil {
 		return nil, err
+	}
+	mf := rv.mf
+	if mf.DeleteMarker {
+		// Current-is-marker reads 404; a version-scoped read of a marker is 405
+		// (docs/s3-versioning.md §6.2). The populated output rides along with
+		// the error so the controller emits x-amz-delete-marker and
+		// Last-Modified on the error response (it dereferences LastModified —
+		// keep it set).
+		lm := time.Unix(mf.Created, 0)
+		marker := true
+		mout := &s3.HeadObjectOutput{DeleteMarker: &marker, LastModified: &lm}
+		if versionID == "" {
+			return mout, s3err.GetAPIError(s3err.ErrNoSuchKey)
+		}
+		return mout, s3err.GetAPIError(s3err.ErrMethodNotAllowed)
 	}
 	lastModified := time.Unix(mf.Created, 0)
 	if err := backend.EvaluatePreconditions(etagOf(mf), lastModified, backend.PreConditions{
@@ -482,35 +462,50 @@ func (b *Backend) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s
 		contentRange = &cr
 	}
 
+	// x-amz-object-lock-* headers and the tag count of the resolved version
+	// (docs/s3-object-lock.md §8; docs/s3-object-tagging.md §5).
+	lockMode, lockUntil, lockHold, tagCount, err := b.stateHeaderFields(ctx, rv)
+	if err != nil {
+		return nil, err
+	}
+
 	contentType := mf.ContentType
 	out := &s3.HeadObjectOutput{
-		AcceptRanges:            backend.GetPtrFromString("bytes"),
-		ContentLength:           &length,
-		ContentType:             &contentType,
-		ContentEncoding:         strPtrOrNil(mf.ContentEncoding),
-		ContentDisposition:      strPtrOrNil(mf.ContentDisposition),
-		ContentLanguage:         strPtrOrNil(mf.ContentLanguage),
-		CacheControl:            strPtrOrNil(mf.CacheControl),
-		ExpiresString:           strPtrOrNil(mf.Expires),
-		WebsiteRedirectLocation: strPtrOrNil(mf.WebsiteRedirectLocation),
-		Metadata:                mf.Metadata,
-		ContentRange:            contentRange,
-		PartsCount:              partsCount,
-		ETag:                    &etag,
-		LastModified:            &lastModified,
-		StorageClass:            types.StorageClassStandard,
+		AcceptRanges:              backend.GetPtrFromString("bytes"),
+		ContentLength:             &length,
+		ContentType:               &contentType,
+		ContentEncoding:           strPtrOrNil(mf.ContentEncoding),
+		ContentDisposition:        strPtrOrNil(mf.ContentDisposition),
+		ContentLanguage:           strPtrOrNil(mf.ContentLanguage),
+		CacheControl:              strPtrOrNil(mf.CacheControl),
+		ExpiresString:             strPtrOrNil(mf.Expires),
+		WebsiteRedirectLocation:   strPtrOrNil(mf.WebsiteRedirectLocation),
+		Metadata:                  mf.Metadata,
+		ContentRange:              contentRange,
+		PartsCount:                partsCount,
+		ETag:                      &etag,
+		LastModified:              &lastModified,
+		ObjectLockMode:            lockMode,
+		ObjectLockRetainUntilDate: lockUntil,
+		ObjectLockLegalHoldStatus: lockHold,
+		TagCount:                  tagCount,
+		StorageClass:              types.StorageClassStandard,
+	}
+	if rv.versioned() {
+		out.VersionId = &rv.node.VersionID
 	}
 	// Echo the stored checksum only for a whole-object HEAD with checksum mode on
 	// (a ranged HEAD's checksum would not match the full object).
 	if input.ChecksumMode == types.ChecksumModeEnabled && !isRange {
-		out.ChecksumCRC32, out.ChecksumCRC32C, out.ChecksumSHA1, out.ChecksumSHA256, out.ChecksumCRC64NVME, out.ChecksumSHA512, out.ChecksumMD5, out.ChecksumXXHASH64, out.ChecksumXXHASH3, out.ChecksumXXHASH128, out.ChecksumType = checksumFields(mf.ChecksumAlgorithm, mf.Checksum)
+		out.ChecksumCRC32, out.ChecksumCRC32C, out.ChecksumSHA1, out.ChecksumSHA256, out.ChecksumCRC64NVME, out.ChecksumSHA512, out.ChecksumMD5, out.ChecksumXXHASH64, out.ChecksumXXHASH3, out.ChecksumXXHASH128, out.ChecksumType = checksumFields(mf.ChecksumAlgorithm, mf.Checksum, mf.ChecksumType)
 	}
 	return out, nil
 }
 
-// GetObject returns an object body, optionally restricted to a byte
-// range supplied via the Range header. The body io.ReadCloser is
-// owned by the caller (versitygw closes it after streaming).
+// GetObject returns an object body — the current version or the one named by
+// `?versionId` — optionally restricted to a byte range supplied via the Range
+// header. The body io.ReadCloser is owned by the caller (versitygw closes it
+// after streaming).
 func (b *Backend) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.GetObjectOutput, error) {
 	if input.Bucket == nil {
 		return nil, s3err.GetAPIError(s3err.ErrInvalidBucketName)
@@ -518,9 +513,24 @@ func (b *Backend) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.
 	if input.Key == nil {
 		return nil, s3err.GetAPIError(s3err.ErrNoSuchKey)
 	}
-	mf, st, err := b.lookupManifest(ctx, *input.Bucket, *input.Key)
+	versionID := backend.GetStringFromPtr(input.VersionId)
+	rv, err := b.resolveVersion(ctx, *input.Bucket, *input.Key, versionID)
 	if err != nil {
 		return nil, err
+	}
+	mf, st := rv.mf, rv.st
+	if mf.DeleteMarker {
+		// Current-is-marker reads 404; a version-scoped read of a marker is 405
+		// (docs/s3-versioning.md §6.2). The populated output rides along with
+		// the error so the controller emits x-amz-delete-marker and
+		// Last-Modified on the error response.
+		lm := time.Unix(mf.Created, 0)
+		marker := true
+		mout := &s3.GetObjectOutput{DeleteMarker: &marker, LastModified: &lm}
+		if versionID == "" {
+			return mout, s3err.GetAPIError(s3err.ErrNoSuchKey)
+		}
+		return mout, s3err.GetAPIError(s3err.ErrMethodNotAllowed)
 	}
 	if err := backend.EvaluatePreconditions(etagOf(mf), time.Unix(mf.Created, 0), backend.PreConditions{
 		IfMatch:       input.IfMatch,
@@ -547,37 +557,55 @@ func (b *Backend) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.
 		contentRange = &cr
 	}
 
+	// x-amz-object-lock-* headers and the tag count of the resolved version
+	// (docs/s3-object-lock.md §8; docs/s3-object-tagging.md §5).
+	lockMode, lockUntil, lockHold, tagCount, err := b.stateHeaderFields(ctx, rv)
+	if err != nil {
+		return nil, err
+	}
+
 	etag := etagOf(mf)
 	lastModified := time.Unix(mf.Created, 0)
 	contentType := mf.ContentType
 	out := &s3.GetObjectOutput{
-		AcceptRanges:            backend.GetPtrFromString("bytes"),
-		Body:                    body,
-		ContentLength:           &length,
-		ContentType:             &contentType,
-		ContentEncoding:         strPtrOrNil(mf.ContentEncoding),
-		ContentDisposition:      strPtrOrNil(mf.ContentDisposition),
-		ContentLanguage:         strPtrOrNil(mf.ContentLanguage),
-		CacheControl:            strPtrOrNil(mf.CacheControl),
-		ExpiresString:           strPtrOrNil(mf.Expires),
-		WebsiteRedirectLocation: strPtrOrNil(mf.WebsiteRedirectLocation),
-		Metadata:                mf.Metadata,
-		ContentRange:            contentRange,
-		PartsCount:              partsCount,
-		ETag:                    &etag,
-		LastModified:            &lastModified,
-		StorageClass:            types.StorageClassStandard,
+		AcceptRanges:              backend.GetPtrFromString("bytes"),
+		Body:                      body,
+		ContentLength:             &length,
+		ContentType:               &contentType,
+		ContentEncoding:           strPtrOrNil(mf.ContentEncoding),
+		ContentDisposition:        strPtrOrNil(mf.ContentDisposition),
+		ContentLanguage:           strPtrOrNil(mf.ContentLanguage),
+		CacheControl:              strPtrOrNil(mf.CacheControl),
+		ExpiresString:             strPtrOrNil(mf.Expires),
+		WebsiteRedirectLocation:   strPtrOrNil(mf.WebsiteRedirectLocation),
+		Metadata:                  mf.Metadata,
+		ContentRange:              contentRange,
+		PartsCount:                partsCount,
+		ETag:                      &etag,
+		LastModified:              &lastModified,
+		ObjectLockMode:            lockMode,
+		ObjectLockRetainUntilDate: lockUntil,
+		ObjectLockLegalHoldStatus: lockHold,
+		TagCount:                  tagCount,
+		StorageClass:              types.StorageClassStandard,
+	}
+	if rv.versioned() {
+		out.VersionId = &rv.node.VersionID
 	}
 	// Echo the stored checksum only for a whole-object GET with checksum mode on
 	// (a ranged GET's checksum would not match the full object).
 	if input.ChecksumMode == types.ChecksumModeEnabled && !isRange {
-		out.ChecksumCRC32, out.ChecksumCRC32C, out.ChecksumSHA1, out.ChecksumSHA256, out.ChecksumCRC64NVME, out.ChecksumSHA512, out.ChecksumMD5, out.ChecksumXXHASH64, out.ChecksumXXHASH3, out.ChecksumXXHASH128, out.ChecksumType = checksumFields(mf.ChecksumAlgorithm, mf.Checksum)
+		out.ChecksumCRC32, out.ChecksumCRC32C, out.ChecksumSHA1, out.ChecksumSHA256, out.ChecksumCRC64NVME, out.ChecksumSHA512, out.ChecksumMD5, out.ChecksumXXHASH64, out.ChecksumXXHASH3, out.ChecksumXXHASH128, out.ChecksumType = checksumFields(mf.ChecksumAlgorithm, mf.Checksum, mf.ChecksumType)
 	}
 	return out, nil
 }
 
-// DeleteObject removes an object. Missing keys are no-ops (matching
-// S3's idempotent DELETE semantics).
+// DeleteObject deletes an object per the bucket's versioning state
+// (docs/s3-versioning.md §7): with `?versionId` it permanently removes that one
+// version; without it, an unversioned bucket takes the permanent-delete path
+// (missing keys are idempotent no-ops), while a versioned bucket inserts a
+// delete marker — a numbered one when Enabled, the null one when Suspended —
+// even for a key that does not exist.
 func (b *Backend) DeleteObject(ctx context.Context, input *s3.DeleteObjectInput) (*s3.DeleteObjectOutput, error) {
 	if input.Bucket == nil {
 		return nil, s3err.GetAPIError(s3err.ErrInvalidBucketName)
@@ -593,23 +621,80 @@ func (b *Backend) DeleteObject(ctx context.Context, input *s3.DeleteObjectInput)
 		}
 		return nil, fmt.Errorf("s3frontend: delete object: %w", err)
 	}
+	key := *input.Key
 	preconds := &backend.ObjectDeletePreconditions{
 		IfMatch:            input.IfMatch,
 		IfMatchLastModTime: input.IfMatchLastModifiedTime,
 		IfMatchSize:        input.IfMatchSize,
 	}
-	if err := b.deleteObjectKey(ctx, bucketState, *input.Key, preconds); err != nil {
+	versioned := bucketState.Versioning.Configured()
+
+	// Version-scoped: permanently remove that one version.
+	if versionID := backend.GetStringFromPtr(input.VersionId); versionID != "" {
+		res, err := b.deleteVersionScoped(ctx, bucketState, key, versionID, preconds)
+		if err != nil {
+			return nil, err
+		}
+		out := &s3.DeleteObjectOutput{}
+		// Gate on the state read under the commit lock, not the snapshot above.
+		if res.versioning.Configured() {
+			vid := versionID
+			out.VersionId = &vid
+			if res.wasMarker {
+				marker := true
+				out.DeleteMarker = &marker
+			}
+		}
+		return out, nil
+	}
+
+	// Unversioned: permanent delete.
+	if !versioned {
+		if err := b.deleteObjectKey(ctx, bucketState, key, preconds); err != nil {
+			return nil, err
+		}
+		return &s3.DeleteObjectOutput{}, nil
+	}
+
+	// Versioned: insert a delete marker via the write rule.
+	node, err := b.insertDeleteMarker(ctx, bucketState, key, preconds)
+	if err != nil {
 		return nil, err
 	}
-	return &s3.DeleteObjectOutput{}, nil
+	marker := true
+	return &s3.DeleteObjectOutput{DeleteMarker: &marker, VersionId: &node.VersionID}, nil
 }
 
-// deleteObjectKey removes one key, releasing its body blobs through the
-// reference index. Missing keys (and an empty bucket) are idempotent no-ops.
-// preconds, when non-nil, gates the delete on If-Match / size / mod-time under
-// the lock. Shared by DeleteObject and DeleteObjects.
+// insertDeleteMarker writes a delete-marker version for key via the §5 write
+// rule: a manifest with DeleteMarker set, a zero Body, and no claims. Under
+// Enabled it is a numbered version; under Suspended it is the null version
+// (replacing any existing null). S3 inserts a marker even when the key does
+// not exist.
+func (b *Backend) insertDeleteMarker(ctx context.Context, bucketState *registry.State, key string, preconds *backend.ObjectDeletePreconditions) (msbucket.VersionNode, error) {
+	mf := &msbucket.ObjectManifest{
+		Key:          key,
+		Created:      time.Now().Unix(),
+		DeleteMarker: true,
+	}
+	node, _, err := b.commitVersion(ctx, bucketState, key, mf, nil, func(superseded *msbucket.ObjectManifest) error {
+		if preconds == nil || superseded == nil || superseded.DeleteMarker {
+			return nil
+		}
+		return backend.EvaluateObjectDeletePreconditions(etagOf(superseded), time.Unix(superseded.Created, 0), superseded.Body.Size, *preconds)
+	})
+	return node, err
+}
+
+// deleteObjectKey permanently removes one key — the unversioned bucket's
+// delete: it drops the key's value (its manifest; a leaf never occurs
+// on a purely-unversioned bucket, but is handled for completeness) and
+// releases the (single, null) version's body blobs through the reference
+// index. Missing keys (and an empty bucket) are idempotent no-ops. preconds,
+// when non-nil, gates the delete on If-Match / size / mod-time under the
+// lock. Shared by DeleteObject and DeleteObjects.
 func (b *Backend) deleteObjectKey(ctx context.Context, bucketState *registry.State, key string, preconds *backend.ObjectDeletePreconditions) error {
 	var oldDigests [][]byte
+	var oldVersionID string
 	err := b.txns.WithTx(ctx, bucketState.Name, func(ctx context.Context, tx *bucketop.Tx) (cid.Cid, error) {
 		// Empty bucket: nothing to delete. Returning cid.Undef tells WithTx to
 		// discard with no commit — the equivalent of "no-op success."
@@ -618,24 +703,32 @@ func (b *Backend) deleteObjectKey(ctx context.Context, bucketState *registry.Sta
 		}
 		t := tx.LoadTree()
 
-		// Load the manifest being removed so its body blobs can be released
-		// through the reference index.
-		oldCid, gerr := t.Get(ctx, key)
+		// Load the value + manifest being removed so the body blobs can be
+		// released through the reference index.
+		valCid, gerr := t.Get(ctx, key)
 		if errors.Is(gerr, mst.ErrNotFound) {
 			return cid.Undef, nil // idempotent DELETE: missing key isn't an error
 		}
 		if gerr != nil {
 			return cid.Undef, fmt.Errorf("mst get: %w", gerr)
 		}
-		var oldMf msbucket.ObjectManifest
-		if err := tx.Get(ctx, tx.State().Space, oldCid, &oldMf); err != nil {
-			return cid.Undef, fmt.Errorf("load manifest: %w", err)
+		var val msbucket.ObjectValue
+		if err := tx.Get(ctx, tx.State().Space, valCid, &val); err != nil {
+			return cid.Undef, fmt.Errorf("load value: %w", err)
+		}
+		oldMf := val.Manifest
+		if val.Leaf != nil {
+			var em msbucket.EnvelopedManifest
+			if err := tx.Get(ctx, tx.State().Space, val.Leaf.Current.Manifest, &em); err != nil {
+				return cid.Undef, fmt.Errorf("load manifest: %w", err)
+			}
+			oldMf = em.Manifest
 		}
 
 		// Preconditions (If-Match / size / mod-time) under the lock against the
 		// version being removed.
 		if preconds != nil {
-			if err := backend.EvaluateObjectDeletePreconditions(etagOf(&oldMf), time.Unix(oldMf.Created, 0), oldMf.Body.Size, *preconds); err != nil {
+			if err := backend.EvaluateObjectDeletePreconditions(etagOf(oldMf), time.Unix(oldMf.Created, 0), oldMf.Body.Size, *preconds); err != nil {
 				return cid.Undef, err
 			}
 		}
@@ -644,10 +737,19 @@ func (b *Backend) deleteObjectKey(ctx context.Context, bucketState *registry.Sta
 		if err != nil {
 			return cid.Undef, fmt.Errorf("mst delete: %w", err)
 		}
-		if err := b.gc.AddGCCandidate(ctx, oldCid.Bytes(), bucketState.Name); err != nil {
+		// A manifest-valued key's block is the manifest itself — one candidate
+		// covers it; a leaf key contributes the leaf block and its current
+		// manifest.
+		if val.Leaf != nil {
+			if err := b.gc.AddGCCandidate(ctx, val.Leaf.Current.Manifest.Bytes(), bucketState.Name); err != nil {
+				return cid.Undef, fmt.Errorf("gc candidate: %w", err)
+			}
+		}
+		if err := b.gc.AddGCCandidate(ctx, valCid.Bytes(), bucketState.Name); err != nil {
 			return cid.Undef, fmt.Errorf("gc candidate: %w", err)
 		}
 		oldDigests = bodyDigests(oldMf.Body)
+		oldVersionID = oldMf.VersionID
 		return t2.GetPointer(ctx, tx)
 	})
 	if err != nil {
@@ -656,7 +758,10 @@ func (b *Backend) deleteObjectKey(ctx context.Context, bucketState *registry.Sta
 	// Release the removed version's blobs through the reference index AFTER the
 	// commit is durable (so a commit failure can't diverge blob_refs). When the
 	// key was absent, oldDigests is nil and this is a no-op.
-	toRemove, err := b.reconcileClaims(ctx, bucketState, key, oldDigests, nil)
+	if oldVersionID == "" {
+		oldVersionID = registry.NullVersionID
+	}
+	toRemove, err := b.reconcileClaims(ctx, bucketState, key, oldVersionID, oldDigests, nil)
 	if err != nil {
 		return fmt.Errorf("s3frontend: delete reconcile: %w", err)
 	}
@@ -688,6 +793,7 @@ func (b *Backend) DeleteObjects(ctx context.Context, input *s3.DeleteObjectsInpu
 		return s3response.DeleteResult{}, fmt.Errorf("s3frontend: delete objects: %w", err)
 	}
 
+	versioned := bucketState.Versioning.Configured()
 	quiet := input.Delete.Quiet != nil && *input.Delete.Quiet
 	var res s3response.DeleteResult
 	for _, obj := range input.Delete.Objects {
@@ -695,15 +801,50 @@ func (b *Backend) DeleteObjects(ctx context.Context, input *s3.DeleteObjectsInpu
 			continue
 		}
 		key := *obj.Key
-		if err := b.deleteObjectKey(ctx, bucketState, key, nil); err != nil {
+		versionID := backend.GetStringFromPtr(obj.VersionId)
+		entry := types.DeletedObject{Key: &key}
+		var derr error
+		switch {
+		case versionID != "":
+			// Version-scoped: permanently remove that one version. DeleteMarker
+			// is set explicitly either way — upstream conformance expects an
+			// explicit false for a non-marker version delete.
+			var sres scopedDeleteResult
+			sres, derr = b.deleteVersionScoped(ctx, bucketState, key, versionID, nil)
+			if derr == nil && sres.versioning.Configured() {
+				vid := versionID
+				entry.VersionId = &vid
+				dm := sres.wasMarker
+				entry.DeleteMarker = &dm
+				if sres.wasMarker {
+					entry.DeleteMarkerVersionId = &vid
+				}
+			}
+		case versioned:
+			// Insert a delete marker via the write rule.
+			var node msbucket.VersionNode
+			node, derr = b.insertDeleteMarker(ctx, bucketState, key, nil)
+			if derr == nil {
+				marker := true
+				entry.DeleteMarker = &marker
+				entry.DeleteMarkerVersionId = &node.VersionID
+			}
+		default:
+			derr = b.deleteObjectKey(ctx, bucketState, key, nil)
+		}
+		if derr != nil {
 			k := key
-			code, msg := deleteErrorFields(err)
-			res.Error = append(res.Error, types.Error{Key: &k, Code: &code, Message: &msg})
+			code, msg := deleteErrorFields(derr)
+			e := types.Error{Key: &k, Code: &code, Message: &msg}
+			if versionID != "" {
+				vid := versionID
+				e.VersionId = &vid
+			}
+			res.Error = append(res.Error, e)
 			continue
 		}
 		if !quiet {
-			k := key
-			res.Deleted = append(res.Deleted, types.DeletedObject{Key: &k})
+			res.Deleted = append(res.Deleted, entry)
 		}
 	}
 	return res, nil
@@ -869,9 +1010,31 @@ func (b *Backend) listWalk(ctx context.Context, bucketName, prefix, delimiter, f
 
 	t := mst.LoadMST(b.read, st.Space, st.Root)
 	seenPrefix := map[string]struct{}{}
-	walkErr := t.WalkLeavesFromNocache(ctx, from, func(k string, mfCid cid.Cid) error {
+	walkErr := t.WalkLeavesFromNocache(ctx, from, func(k string, valCid cid.Cid) error {
 		if prefix != "" && !strings.HasPrefix(k, prefix) {
 			return mst.ErrStopWalk
+		}
+
+		// Resolve the key's current version first: a key whose current version
+		// is a delete marker is invisible to ListObjects — it produces neither
+		// a Contents entry nor a CommonPrefix (docs/s3-versioning.md §9.1).
+		// A manifest-valued key's block is the manifest itself (§2.1); a leaf key
+		// costs one more fetch.
+		var val msbucket.ObjectValue
+		if err := b.read.Get(ctx, st.Space, valCid, &val); err != nil {
+			return fmt.Errorf("value get %s: %w", valCid, err)
+		}
+		mfp := val.Manifest
+		if val.Leaf != nil {
+			var em msbucket.EnvelopedManifest
+			if err := b.read.Get(ctx, st.Space, val.Leaf.Current.Manifest, &em); err != nil {
+				return fmt.Errorf("manifest get %s: %w", val.Leaf.Current.Manifest, err)
+			}
+			mfp = em.Manifest
+		}
+		mf := *mfp
+		if mf.DeleteMarker {
+			return nil
 		}
 
 		if delimiter != "" {
@@ -892,10 +1055,6 @@ func (b *Backend) listWalk(ctx context.Context, bucketName, prefix, delimiter, f
 			}
 		}
 
-		var mf msbucket.ObjectManifest
-		if err := b.read.Get(ctx, st.Space, mfCid, &mf); err != nil {
-			return fmt.Errorf("manifest get %s: %w", mfCid, err)
-		}
 		key := k
 		etag := etagOf(&mf)
 		size := mf.Body.Size
@@ -918,37 +1077,6 @@ func (b *Backend) listWalk(ctx context.Context, bucketName, prefix, delimiter, f
 		return out, fmt.Errorf("s3frontend: walk: %w", walkErr)
 	}
 	return out, nil
-}
-
-// lookupManifest is the shared HEAD/GET path: registry → MST → CBOR
-// decode of the manifest pointed at by the leaf. Maps "missing
-// bucket" / "missing key" to S3 errors. The bucket state is returned
-// alongside the manifest so callers can thread st.Space into body
-// reads (blob retrieval is space-scoped).
-func (b *Backend) lookupManifest(ctx context.Context, bucketName, key string) (*msbucket.ObjectManifest, *registry.State, error) {
-	st, err := b.reg.Get(ctx, bucketName)
-	if err != nil {
-		if errors.Is(err, registry.ErrNotFound) {
-			return nil, nil, s3err.GetAPIError(s3err.ErrNoSuchBucket)
-		}
-		return nil, nil, err
-	}
-	if !st.Root.Defined() {
-		return nil, nil, s3err.GetAPIError(s3err.ErrNoSuchKey)
-	}
-	t := mst.LoadMST(b.read, st.Space, st.Root)
-	mfCid, err := t.Get(ctx, key)
-	if errors.Is(err, mst.ErrNotFound) {
-		return nil, nil, s3err.GetAPIError(s3err.ErrNoSuchKey)
-	}
-	if err != nil {
-		return nil, nil, fmt.Errorf("s3frontend: mst get: %w", err)
-	}
-	var mf msbucket.ObjectManifest
-	if err := b.read.Get(ctx, st.Space, mfCid, &mf); err != nil {
-		return nil, nil, fmt.Errorf("s3frontend: manifest get: %w", err)
-	}
-	return &mf, st, nil
 }
 
 // etagOf returns the manifest's S3 ETag, double-quoted per the wire

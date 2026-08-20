@@ -12,12 +12,14 @@
 //     staging buffer, MST CBOR view, bucket-Root CAS, and per-bucket
 //     locking.
 //
-// Operations not implemented (multipart, lifecycle, locking,
-// versioning, etc.) inherit ErrNotImplemented from the embedded
+// Operations not implemented (lifecycle, tagging, bucket policies,
+// etc.) inherit ErrNotImplemented from the embedded
 // backend.BackendUnsupported. The few unsupported-by-default
 // methods that versitygw nevertheless calls on every request
-// (GetBucketAcl, GetBucketPolicy, GetObjectLockConfiguration,
-// GetBucketVersioning, GetBucketCors) are stubbed in bucket.go.
+// (GetBucketAcl, GetBucketPolicy, GetBucketCors) are stubbed in
+// bucket.go. Object lock is implemented: the bucket configuration in
+// bucket.go, the per-version retention / legal-hold methods in
+// objectlock.go (docs/s3-object-lock.md).
 package s3frontend
 
 import (

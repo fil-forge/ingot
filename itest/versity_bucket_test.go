@@ -12,6 +12,7 @@ import (
 // the in-memory harness was removed).
 
 var createBucketPass = []forgeCase{
+	{name: "default_object_lock", fn: integration.CreateBucket_default_object_lock},
 	{name: "invalid_bucket_name", fn: integration.CreateBucket_invalid_bucket_name},
 	{name: "invalid_canned_acl", fn: integration.CreateBucket_invalid_canned_acl},
 	{name: "invalid_ownership", fn: integration.CreateBucket_invalid_ownership},
@@ -27,7 +28,6 @@ var createBucketXFail = []forgeCase{
 	{name: "invalid_location_constraint", fn: integration.CreateBucket_invalid_location_constraint},
 	{name: "as_user", fn: integration.CreateBucket_as_user},
 	{name: "default_acl", fn: integration.CreateBucket_default_acl},
-	{name: "default_object_lock", fn: integration.CreateBucket_default_object_lock},
 	{name: "duplicate_keys", fn: integration.CreateBucket_duplicate_keys},
 	{name: "existing_bucket", fn: integration.CreateBucket_existing_bucket},
 	{name: "invalid_tags", fn: integration.CreateBucket_invalid_tags},

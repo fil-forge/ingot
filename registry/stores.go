@@ -16,9 +16,9 @@ import (
 // are split into focused interfaces so a caller can depend on only what
 // it needs; *Postgres and *inmem.MemStore satisfy all of them.
 //
-// Versioning is not implemented this iteration. NullVersionID is the
-// sentinel every blob_refs / manifest version id carries until versioning
-// lands (it is S3's "null" version id for an unversioned object).
+// NullVersionID is S3's version id for a null version — the version written
+// while a bucket is unversioned or Suspended (docs/s3-versioning.md §3). It
+// names those versions' blob_refs rows and answers `?versionId=null`.
 const NullVersionID = "null"
 
 // upload_intents.state values (the local-store lifecycle, §5).
@@ -108,22 +108,41 @@ type MultipartSession struct {
 	Expires                 string
 	WebsiteRedirectLocation string
 	// ChecksumAlgorithm/ChecksumType are the x-amz-checksum-* declarations from
-	// CreateMultipartUpload, echoed by ListMultipartUploads. Per-part checksum
-	// computation is separate (FIL-620).
+	// CreateMultipartUpload. They select the per-part checksum algorithm at
+	// UploadPart and the final checksum derivation (COMPOSITE vs FULL_OBJECT)
+	// at Complete, and are echoed by ListParts and ListMultipartUploads.
 	ChecksumAlgorithm string
 	ChecksumType      string
-	Metadata          map[string]string
-	CreatedAt         time.Time
+	// LockMode / LockRetainUntil / LockLegalHold carry CreateMultipartUpload's
+	// x-amz-object-lock-* headers to Complete, which stamps them onto the
+	// version it commits (docs/s3-object-lock.md §7). LockMode is the
+	// retention mode ("GOVERNANCE"/"COMPLIANCE"); LockLegalHold is the
+	// legal-hold status ("ON"/"OFF"); empty / nil when the header was absent.
+	LockMode        string
+	LockRetainUntil *time.Time
+	LockLegalHold   string
+	// Tagging carries CreateMultipartUpload's raw x-amz-tagging header
+	// (validated at create) to Complete, which stamps the parsed set
+	// (docs/s3-object-tagging.md §4). Empty when the header was absent.
+	Tagging   string
+	Metadata  map[string]string
+	CreatedAt time.Time
 }
 
 // MultipartPart is one row of ingot.multipart_parts. BlobDigests is the
 // ordered list of blobs the part split into (one entry unless the part
 // exceeded max_blob_size).
 type MultipartPart struct {
-	UploadID    string
-	PartNumber  int
-	ETagMD5     []byte
-	Size        int64
+	UploadID   string
+	PartNumber int
+	ETagMD5    []byte
+	Size       int64
+	// Checksum is the part's base64 checksum. When the session declares a
+	// checksum algorithm it is that algorithm's value (client-validated or
+	// server-computed); when the session declares none it is the internal
+	// full-object CRC64NVME used to derive the default final checksum at
+	// Complete, and is never echoed by ListParts.
+	Checksum    string
 	BlobDigests [][]byte
 	State       string
 	CreatedAt   time.Time

@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/fil-forge/versitygw/backend"
+	"github.com/fil-forge/versitygw/s3api/utils"
 	"github.com/fil-forge/versitygw/s3err"
 	"github.com/fil-forge/versitygw/s3response"
 
@@ -17,7 +19,8 @@ import (
 )
 
 // CopyObject copies an object as a metadata-only operation under dedup: it
-// resolves the source manifest and writes a new destination manifest pinning the
+// resolves the source manifest — the current version, or the one named by the
+// copy-source `?versionId` — and writes a new destination version pinning the
 // SAME body blobs (same digests), adding a reference-index claim per digest. No
 // bytes move and no Forge upload happens — the blobs already exist. Honors
 // MetadataDirective (COPY = inherit source metadata; REPLACE = take it from the
@@ -27,7 +30,7 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 	if input.Bucket == nil || input.Key == nil || input.CopySource == nil {
 		return s3response.CopyObjectOutput{}, s3err.GetAPIError(s3err.ErrInvalidRequest)
 	}
-	srcBucket, srcKey, _, err := backend.ParseCopySource(*input.CopySource)
+	srcBucket, srcKey, srcVersionID, err := backend.ParseCopySource(*input.CopySource)
 	if err != nil {
 		return s3response.CopyObjectOutput{}, err
 	}
@@ -37,8 +40,9 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 	}
 
 	replace := input.MetadataDirective == types.MetadataDirectiveReplace
-	// Copy to self is only legal when the metadata is being replaced.
-	if srcBucket == dstBucket && srcKey == dstKey && !replace {
+	// Copy to self is only legal when the metadata is being replaced — unless
+	// the source names an older version (restoring a version onto its own key).
+	if srcBucket == dstBucket && srcKey == dstKey && !replace && srcVersionID == "" {
 		return s3response.CopyObjectOutput{}, s3err.GetAPIError(s3err.ErrInvalidCopyDest)
 	}
 
@@ -51,10 +55,44 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 		return s3response.CopyObjectOutput{}, fmt.Errorf("s3frontend: copy: %w", err)
 	}
 
-	// Resolve the source manifest (NoSuchBucket / NoSuchKey map from lookup).
-	srcMf, _, err := b.lookupManifest(ctx, srcBucket, srcKey)
+	// x-amz-object-lock-* headers stamp the DESTINATION version; lock state
+	// is never inherited from the source (docs/s3-object-lock.md §7).
+	initState, err := lockStateFromHeaders(bucketState, input.ObjectLockMode, input.ObjectLockRetainUntilDate, input.ObjectLockLegalHoldStatus)
 	if err != nil {
 		return s3response.CopyObjectOutput{}, err
+	}
+	// Destination tags per x-amz-tagging-directive (the controller defaults
+	// an absent header to COPY, so only COPY or REPLACE arrives): REPLACE
+	// parses the request's own header, failing before any further work; COPY
+	// inherits the source version's tags once it resolves below
+	// (docs/s3-object-tagging.md §4).
+	var dstTags map[string]string
+	if input.TaggingDirective == types.TaggingDirectiveReplace {
+		if dstTags, err = backend.ParseObjectTags(backend.GetStringFromPtr(input.Tagging)); err != nil {
+			return s3response.CopyObjectOutput{}, err
+		}
+	}
+
+	// Resolve the source version (NoSuchBucket / NoSuchKey / NoSuchVersion /
+	// InvalidArgument map from resolution). A delete marker cannot be a copy
+	// source: the current-marker case is a missing key; naming a marker's
+	// versionId is an invalid request (docs/s3-versioning.md §6.2).
+	srcRv, err := b.resolveVersion(ctx, srcBucket, srcKey, srcVersionID)
+	if err != nil {
+		return s3response.CopyObjectOutput{}, err
+	}
+	srcMf := srcRv.mf
+	if srcMf.DeleteMarker {
+		if srcVersionID == "" {
+			return s3response.CopyObjectOutput{}, s3err.GetAPIError(s3err.ErrNoSuchKey)
+		}
+		return s3response.CopyObjectOutput{}, s3err.GetAPIError(s3err.ErrInvalidRequest)
+	}
+	// A copy-source versionId naming the CURRENT version is still an illegal
+	// self-copy without metadata replacement; only restoring a noncurrent
+	// version is exempt from the check at the top.
+	if srcBucket == dstBucket && srcKey == dstKey && !replace && srcVersionID != "" && srcRv.isLatest {
+		return s3response.CopyObjectOutput{}, s3err.GetAPIError(s3err.ErrInvalidCopyDest)
 	}
 	if err := backend.EvaluatePreconditions(etagOf(srcMf), time.Unix(srcMf.Created, 0), backend.PreConditions{
 		IfMatch:       input.CopySourceIfMatch,
@@ -64,17 +102,52 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 	}); err != nil {
 		return s3response.CopyObjectOutput{}, err
 	}
+	if input.TaggingDirective == types.TaggingDirectiveCopy {
+		srcVs, err := b.versionStateOf(ctx, srcRv)
+		if err != nil {
+			return s3response.CopyObjectOutput{}, err
+		}
+		if srcVs != nil {
+			dstTags = srcVs.Tags
+		}
+	}
+
+	// Destination checksum: same bytes → the source's checksum (and type)
+	// carries over. A request naming a DIFFERENT x-amz-checksum-algorithm
+	// replaces it: the shared body streams through the new algorithm once and
+	// the result is a full-object value — the sole per-object checksum, never
+	// accumulated alongside the source's.
+	ckAlgo, ckVal, ckType := srcMf.ChecksumAlgorithm, srcMf.Checksum, srcMf.ChecksumType
+	if ckVal != "" && ckType == "" {
+		ckType = string(types.ChecksumTypeFullObject)
+	}
+	if reqAlgo := input.ChecksumAlgorithm; reqAlgo != "" && string(reqAlgo) != srcMf.ChecksumAlgorithm {
+		ht, err := hashTypeForAlgo(reqAlgo)
+		if err != nil {
+			return s3response.CopyObjectOutput{}, err
+		}
+		rc := msbucket.OpenBody(ctx, b.read, srcRv.st.Space, srcMf.Body)
+		defer rc.Close()
+		hr, err := utils.NewHashReader(rc, "", ht)
+		if err != nil {
+			return s3response.CopyObjectOutput{}, fmt.Errorf("s3frontend: copy checksum reader: %w", err)
+		}
+		if _, err := io.Copy(io.Discard, hr); err != nil {
+			return s3response.CopyObjectOutput{}, fmt.Errorf("s3frontend: copy checksum: %w", err)
+		}
+		ckAlgo, ckVal, ckType = string(reqAlgo), hr.Sum(), string(types.ChecksumTypeFullObject)
+	}
 
 	// Destination manifest: the SAME body (size/sha/md5/blobs) and ETag, since
 	// the content is identical. Metadata per the directive.
 	dstMf := &msbucket.ObjectManifest{
-		Key:     dstKey,
-		Created: time.Now().Unix(),
-		Body:    srcMf.Body,
-		ETag:    srcMf.ETag,
-		// Same content → same additional checksum, regardless of directive.
-		ChecksumAlgorithm: srcMf.ChecksumAlgorithm,
-		Checksum:          srcMf.Checksum,
+		Key:               dstKey,
+		Created:           time.Now().Unix(),
+		Body:              srcMf.Body,
+		ETag:              srcMf.ETag,
+		ChecksumAlgorithm: ckAlgo,
+		Checksum:          ckVal,
+		ChecksumType:      ckType,
 	}
 	if replace {
 		ct := backend.GetStringFromPtr(input.ContentType)
@@ -102,18 +175,30 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 		dstMf.Metadata = srcMf.Metadata
 	}
 
-	// Commit to the destination: splice + reference index. The new claims use
-	// the DESTINATION bucket/space; the same digests gain another reference.
-	if err := b.commitManifest(ctx, bucketState, dstKey, dstMf, bodyDigests(dstMf.Body)); err != nil {
+	// Commit to the destination via the write rule: splice + reference index.
+	// The new claims use the DESTINATION bucket/space; the same digests gain
+	// another reference.
+	node, effState, err := b.commitVersion(ctx, bucketState, dstKey, dstMf, applyTagsIfPresent(initState, dstTags), nil)
+	if err != nil {
 		return s3response.CopyObjectOutput{}, err
 	}
 
 	lastMod := time.Unix(dstMf.Created, 0)
 	etag := etagOf(dstMf)
-	return s3response.CopyObjectOutput{
-		CopyObjectResult: &s3response.CopyObjectResult{
-			ETag:         &etag,
-			LastModified: &lastMod,
-		},
-	}, nil
+	result := &s3response.CopyObjectResult{
+		ETag:         &etag,
+		LastModified: &lastMod,
+	}
+	result.ChecksumCRC32, result.ChecksumCRC32C, result.ChecksumSHA1, result.ChecksumSHA256, result.ChecksumCRC64NVME, result.ChecksumSHA512, result.ChecksumMD5, result.ChecksumXXHASH64, result.ChecksumXXHASH3, result.ChecksumXXHASH128, result.ChecksumType = checksumFields(dstMf.ChecksumAlgorithm, dstMf.Checksum, dstMf.ChecksumType)
+	out := s3response.CopyObjectOutput{
+		CopyObjectResult: result,
+	}
+	// Version ids in the response, per each side's bucket state (§4.3).
+	if srcRv.versioned() {
+		out.CopySourceVersionId = &srcRv.node.VersionID
+	}
+	if effState.Configured() {
+		out.VersionId = &node.VersionID
+	}
+	return out, nil
 }

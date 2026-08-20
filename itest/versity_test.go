@@ -42,37 +42,71 @@ func TestForgeVersity(t *testing.T) {
 	s, endpoint := forgeStack(t)
 	accessKey, secretKey := hiltProvisionTenant(t, t.Context(), s, "versity")
 	conf := forgeS3Conf(endpoint, accessKey, secretKey)
+	confVersioned := forgeS3ConfVersioned(endpoint, accessKey, secretKey)
 
 	categories := []struct {
-		name  string
-		pass  []forgeCase
-		xfail []forgeCase
+		name      string
+		pass      []forgeCase
+		xfail     []forgeCase
+		versioned bool // run with confVersioned (versioned teardown)
 	}{
 		// ListBuckets runs FIRST: its empty_success/success cases assert the
 		// exact bucket listing, which only holds on the pristine stack —
 		// failed cases in other categories leak their buckets (upstream
 		// teardown doesn't run on error), and unlike the old per-group
 		// in-memory harnesses, all categories share this one deployment.
-		{"ListBuckets", listBucketsPass, listBucketsXFail},
-		{"CreateBucket", createBucketPass, createBucketXFail},
-		{"HeadBucket", headBucketPass, nil},
-		{"DeleteBucket", deleteBucketPass, nil},
-		{"PutObject", putObjectPass, putObjectXFail},
-		{"GetObject", getObjectPass, getObjectXFail},
-		{"HeadObject", headObjectPass, headObjectXFail},
-		{"DeleteObject", deleteObjectPass, deleteObjectXFail},
-		{"CopyObject", copyObjectPass, copyObjectXFail},
-		{"DeleteObjects", deleteObjectsPass, nil},
-		{"CreateMultipartUpload", createMultipartPass, createMultipartXFail},
-		{"UploadPart", uploadPartPass, uploadPartXFail},
-		{"UploadPartCopy", uploadPartCopyPass, uploadPartCopyXFail},
-		{"ListParts", listPartsPass, listPartsXFail},
-		{"ListMultipartUploads", listMultipartUploadsPass, listMultipartUploadsXFail},
-		{"AbortMultipartUpload", abortMultipartPass, abortMultipartXFail},
-		{"CompleteMultipartUpload", completeMultipartPass, completeMultipartXFail},
+		{"ListBuckets", listBucketsPass, listBucketsXFail, false},
+		{"CreateBucket", createBucketPass, createBucketXFail, false},
+		{"HeadBucket", headBucketPass, nil, false},
+		{"DeleteBucket", deleteBucketPass, nil, false},
+		{"PutObject", putObjectPass, putObjectXFail, false},
+		{"GetObject", getObjectPass, getObjectXFail, false},
+		{"HeadObject", headObjectPass, headObjectXFail, false},
+		{"DeleteObject", deleteObjectPass, deleteObjectXFail, false},
+		{"CopyObject", copyObjectPass, copyObjectXFail, false},
+		{"DeleteObjects", deleteObjectsPass, nil, false},
+		{"CreateMultipartUpload", createMultipartPass, createMultipartXFail, false},
+		// The object-tagging partition (docs/s3-object-tagging.md §6):
+		// plain buckets, plain teardown.
+		{"PutObjectTagging", putObjectTaggingPass, nil, false},
+		{"GetObjectTagging", getObjectTaggingPass, nil, false},
+		{"DeleteObjectTagging", deleteObjectTaggingPass, deleteObjectTaggingXFail, false},
+		{"UploadPart", uploadPartPass, uploadPartXFail, false},
+		{"UploadPartCopy", uploadPartCopyPass, uploadPartCopyXFail, false},
+		{"ListParts", listPartsPass, listPartsXFail, false},
+		{"ListMultipartUploads", listMultipartUploadsPass, listMultipartUploadsXFail, false},
+		{"AbortMultipartUpload", abortMultipartPass, abortMultipartXFail, false},
+		{"CompleteMultipartUpload", completeMultipartPass, completeMultipartXFail, false},
+		// The versioning partition (docs/s3-versioning.md) runs with the
+		// versioned conf so upstream teardown empties buckets per-version.
+		{"PutBucketVersioning", putBucketVersioningPass, nil, true},
+		{"GetBucketVersioning", getBucketVersioningPass, nil, true},
+		{"ListObjectVersions", listObjectVersionsPass, nil, true},
+		{"Versioning", versioningPass, versioningXFail, true},
+		// The object-lock partition (docs/s3-object-lock.md §11): withLock()
+		// buckets are versioning-Enabled, so these also need the versioned
+		// teardown.
+		{"PutObjectLockConfiguration", putObjectLockConfigurationPass, nil, true},
+		{"GetObjectLockConfiguration", getObjectLockConfigurationPass, nil, true},
+		{"PutObjectRetention", putObjectRetentionPass, putObjectRetentionXFail, true},
+		{"GetObjectRetention", getObjectRetentionPass, nil, true},
+		{"PutObjectLegalHold", putObjectLegalHoldPass, nil, true},
+		{"GetObjectLegalHold", getObjectLegalHoldPass, nil, true},
+		// Creation-time stamping cases whose withLock() buckets need the
+		// versioned teardown their home (plain-conf) categories can't give
+		// them (versity_lock_test.go).
+		{"LockCreation", lockCreationPass, nil, true},
+		{"WORMProtection", nil, wormProtectionXFail, true},
+		// TestListObjectVersions_VD: listing a never-versioned bucket; runs
+		// with the plain conf (the bucket stays unversioned).
+		{"ListObjectVersionsVD", listObjectVersionsVDPass, nil, false},
 	}
 
 	for _, cat := range categories {
+		catConf := conf
+		if cat.versioned {
+			catConf = confVersioned
+		}
 		t.Run(cat.name, func(t *testing.T) {
 			for _, tt := range cat.pass {
 				t.Run(tt.name, func(t *testing.T) {
@@ -81,7 +115,7 @@ func TestForgeVersity(t *testing.T) {
 							t.Skip(reason)
 						}
 					}
-					if err := tt.fn(conf); err != nil {
+					if err := tt.fn(catConf); err != nil {
 						t.Fatalf("%v", err)
 					}
 				})
@@ -93,7 +127,7 @@ func TestForgeVersity(t *testing.T) {
 		t.Run(cat.name+"XFail", func(t *testing.T) {
 			for _, tt := range cat.xfail {
 				t.Run(tt.name, func(t *testing.T) {
-					err := tt.fn(conf)
+					err := tt.fn(catConf)
 					if err == nil {
 						t.Errorf("case unexpectedly passed; promote it from the %s xfail table to the pass table", cat.name)
 						return

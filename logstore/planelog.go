@@ -314,11 +314,11 @@ func (pl *PlaneLog) flushOne(seg *Segment) {
 	backoff := time.Second
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		err := pl.pc.Flush(ctx, seg)
+		indexDigest, err := pl.pc.Flush(ctx, seg)
 		if err == nil {
 			now := time.Now().Unix()
 			seg.markShipped(now)
-			if merr := pl.meta.MarkSegmentShipped(ctx, pl.plane, seg.Seq(), now, seg.OpRoots()); merr != nil {
+			if merr := pl.meta.MarkSegmentShipped(ctx, pl.plane, seg.Seq(), now, indexDigest, seg.OpRoots()); merr != nil {
 				pl.logger.Error("logstore: mark shipped",
 					zap.Stringer("plane", pl.plane), zap.Uint64("seq", seg.Seq()), zap.Error(merr))
 			}

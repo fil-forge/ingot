@@ -7,14 +7,15 @@
 -- local location table, in place of the indexing-service for body reads),
 -- and in-flight multipart uploads.
 --
--- Versioning is not implemented this iteration: version_id columns exist but
--- carry the constant 'null' sentinel, and buckets.versioning / next_version_seq
--- are reserved. CIDs and blob digests (sha256 multihashes) are stored as bytea.
+-- version_id columns carry each version's id — a ULID token, or 'null' for
+-- null versions (docs/s3-versioning.md §8); buckets.versioning and
+-- next_version_seq drive the S3 versioning state (§4.1). CIDs and blob
+-- digests (sha256 multihashes) are stored as bytea.
 
--- buckets gains: the Forge space it lives in, the (reserved) S3 versioning
--- state, and the (reserved) per-bucket version ordinal. Existing columns are
--- untouched. space defaults to '' so existing inserts keep working until the
--- write path threads the space DID through bucket creation.
+-- buckets gains: the Forge space it lives in, the S3 versioning state, and
+-- the per-bucket version ordinal. Existing columns are untouched. space
+-- defaults to '' so existing inserts keep working until the write path
+-- threads the space DID through bucket creation.
 ALTER TABLE ingot.buckets
     ADD COLUMN space            text   NOT NULL DEFAULT '',
     ADD COLUMN versioning       text   NOT NULL DEFAULT 'unversioned'

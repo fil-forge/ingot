@@ -11,6 +11,7 @@ import (
 
 	block "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
+	"github.com/multiformats/go-multihash"
 	"go.uber.org/zap"
 
 	"github.com/fil-forge/ingot/blockstore"
@@ -217,6 +218,63 @@ func (m *Manager) Close(ctx context.Context) error {
 		return fmt.Errorf("logstore: manager: %v", errs)
 	}
 	return nil
+}
+
+// QuiesceBucketLog stops bucket's flush pipeline and waits for any in-flight
+// ship to finish, so the segment rows ShippedSegmentDigests reads afterwards
+// are final: a ship that was mid-flight has either completed (registered its
+// blobs AND stamped shipped_at + index_digest) or aborted. Without this,
+// DeleteBucket races the flush goroutine — a segment whose CAR just
+// registered but wasn't yet marked shipped would be invisible to the release
+// pass, and the space delete would be refused. The closed store reopens
+// lazily on the bucket's next use, so a delete that fails downstream leaves
+// the bucket functional.
+func (m *Manager) QuiesceBucketLog(ctx context.Context, bucket string) error {
+	if err := validBucketDir(bucket); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	s, ok := m.stores[bucket]
+	delete(m.stores, bucket)
+	m.mu.Unlock()
+	if !ok {
+		return nil
+	}
+	if err := s.Close(ctx); err != nil {
+		return fmt.Errorf("logstore: manager: quiesce log for %q: %w", bucket, err)
+	}
+	return nil
+}
+
+// ShippedSegmentDigests returns the multihash of every blob the bucket's
+// catalog segments may have registered in its space: each shipped segment's
+// CAR and its sharded-dag-index blob, plus the CAR of any sealed-but-
+// unshipped segment (a flush aborted between the CAR's blob/add and the
+// shipped stamp leaves that registration behind; releasing an unregistered
+// blob is a no-op, so over-listing is safe). DeleteBucket must release them
+// all before the space itself can be deleted — the tenant service refuses to
+// delete a space that still holds registrations. Call QuiesceBucketLog first
+// so no ship is in flight while this reads.
+func (m *Manager) ShippedSegmentDigests(ctx context.Context, bucket string) ([][]byte, error) {
+	rows, err := m.meta.ListSegments(ctx, blockstore.PlaneCatalog, bucket)
+	if err != nil {
+		return nil, fmt.Errorf("logstore: manager: list segments for %q: %w", bucket, err)
+	}
+	var out [][]byte
+	for _, r := range rows {
+		if r.State != StateSealed || len(r.SHA256) == 0 {
+			continue
+		}
+		carDigest, err := multihash.Encode(r.SHA256, multihash.SHA2_256)
+		if err != nil {
+			return nil, fmt.Errorf("logstore: manager: encode segment %d sha: %w", r.Seq, err)
+		}
+		out = append(out, carDigest)
+		if r.ShippedAt != 0 && len(r.IndexDigest) > 0 {
+			out = append(out, r.IndexDigest)
+		}
+	}
+	return out, nil
 }
 
 // RemoveBucketLog deletes bucket's log entirely: closes its store (dropping
