@@ -63,8 +63,10 @@ import (
 	"github.com/fil-forge/ingot/logstore"
 	"github.com/fil-forge/ingot/migrations"
 	"github.com/fil-forge/ingot/registry"
+	"github.com/fil-forge/ingot/revocation"
 	"github.com/fil-forge/ingot/tokenstore"
 	"github.com/fil-forge/ingot/uploader"
+	swarfclient "github.com/fil-forge/swarf/pkg/client"
 )
 
 // ServiceIdentity carries the host's upload-service agent into the module. It
@@ -106,10 +108,21 @@ func Module(cfg config.Config) fx.Option {
 			provideUploader,
 			provideMigrationHook,
 			provideKeyProofs,
+			provideVerificationKeyCache,
 			provideIAMService,
 			fx.Annotate(bucketauthority.New, fx.As(new(bucketauthority.BucketAuthority))),
 		),
 		ServerModule,
+	}
+	if cfg.RevocationServiceURL != "" {
+		// The revocation-firehose consumer is optional: with no revocation
+		// service configured, per-key caches simply age out on their TTLs.
+		// Appended after ServerModule so its OnStart runs after the server's —
+		// whose pre-start migrations create the cursor table it reads.
+		opts = append(opts,
+			fx.Provide(provideRevocationConsumer),
+			fx.Invoke(registerRevocationConsumer),
+		)
 	}
 	return fx.Module("ingot", opts...)
 }
@@ -280,15 +293,74 @@ func provideKeyProofs() *iam.KeyProofs {
 	return iam.NewKeyProofs()
 }
 
+// provideVerificationKeyCache is the derived-SigV4-key cache shared by the
+// IAM fast path (which fills and reads it) and the revocation consumer
+// (which clears a revoked key's entries).
+func provideVerificationKeyCache() *iam.VerificationKeyCache {
+	return iam.NewVerificationKeyCache()
+}
+
 // provideIAMService adapts the hilt client to versitygw's IAM seam: a request
 // signed with a non-root access key is authorized locally when the caches
 // hold its verification key + covering delegation chains, else by Hilt's
 // /s3/request/authorize — whose response replenishes the caches. Either way
 // the gateway verifies the signature with the derived key.
-func provideIAMService(c *hiltclient.Client, proofs *iam.KeyProofs, reg registry.Registry, id ServiceIdentity, logger *zap.Logger) auth.IAMService {
-	return iam.New(c, proofs, iam.NewVerificationKeyCache(),
+func provideIAMService(c *hiltclient.Client, proofs *iam.KeyProofs, keys *iam.VerificationKeyCache, reg registry.Registry, id ServiceIdentity, logger *zap.Logger) auth.IAMService {
+	return iam.New(c, proofs, keys,
 		iam.WithLocalAuthorization(id.Signer.DID(), reg),
 		iam.WithLogger(logger))
+}
+
+// provideRevocationConsumer builds the revocation-firehose consumer: the
+// swarf client streams revocation records, the postgres cursor store
+// persists the resume point, and iam.Revoker clears the per-access-key
+// caches a revoked delegation participates in.
+func provideRevocationConsumer(cfg config.Config, cursors registry.RevocationCursorStore,
+	proofs *iam.KeyProofs, keys *iam.VerificationKeyCache, logger *zap.Logger) (*revocation.Consumer, error) {
+	revURL, err := url.Parse(cfg.RevocationServiceURL)
+	if err != nil {
+		return nil, fmt.Errorf("ingot: parse revocation_service_url: %w", err)
+	}
+	revDID, err := did.Parse(cfg.RevocationServiceDID)
+	if err != nil {
+		return nil, fmt.Errorf("ingot: parse revocation_service_did: %w", err)
+	}
+	src, err := swarfclient.New(revDID, *revURL)
+	if err != nil {
+		return nil, fmt.Errorf("ingot: revocation service client: %w", err)
+	}
+	return revocation.NewConsumer(src, cursors, iam.NewRevoker(proofs, keys, logger),
+		revocation.WithLogger(logger)), nil
+}
+
+// registerRevocationConsumer runs the consumer for the app's lifetime:
+// OnStart spawns Run on a cancelable context, OnStop cancels and joins it.
+func registerRevocationConsumer(lc fx.Lifecycle, c *revocation.Consumer) {
+	var cancel context.CancelFunc
+	done := make(chan struct{})
+	lc.Append(fx.Hook{
+		OnStart: func(context.Context) error {
+			var ctx context.Context
+			ctx, cancel = context.WithCancel(context.Background())
+			go func() {
+				defer close(done)
+				c.Run(ctx)
+			}()
+			return nil
+		},
+		OnStop: func(ctx context.Context) error {
+			if cancel == nil {
+				return nil
+			}
+			cancel()
+			select {
+			case <-done:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		},
+	})
 }
 
 // registryResult exposes the one *registry.Postgres as both collaborator
@@ -298,15 +370,16 @@ func provideIAMService(c *hiltclient.Client, proofs *iam.KeyProofs, reg registry
 type registryResult struct {
 	fx.Out
 
-	Registry   registry.Registry
-	Intents    registry.IntentStore
-	Locations  registry.LocationStore
-	Inclusions registry.InclusionStore
-	BlobRefs   registry.BlobRefStore
-	GC         registry.GCStore
-	Multipart  registry.MultipartStore
-	Parks      registry.ParkStore
-	Meta       logstore.Meta
+	Registry          registry.Registry
+	Intents           registry.IntentStore
+	Locations         registry.LocationStore
+	Inclusions        registry.InclusionStore
+	BlobRefs          registry.BlobRefStore
+	GC                registry.GCStore
+	Multipart         registry.MultipartStore
+	Parks             registry.ParkStore
+	RevocationCursors registry.RevocationCursorStore
+	Meta              logstore.Meta
 }
 
 // provideRegistry wraps the host's pool in the postgres-backed registry and
@@ -318,7 +391,7 @@ type registryResult struct {
 // needs hilt_url/hilt_did configured.
 func provideRegistry(pool *pgxpool.Pool) registryResult {
 	pg := registry.NewPostgres(pool)
-	return registryResult{Registry: pg, Intents: pg, Locations: pg, Inclusions: pg, BlobRefs: pg, GC: pg, Multipart: pg, Parks: pg, Meta: pg}
+	return registryResult{Registry: pg, Intents: pg, Locations: pg, Inclusions: pg, BlobRefs: pg, GC: pg, Multipart: pg, Parks: pg, RevocationCursors: pg, Meta: pg}
 }
 
 // migrationHookOut feeds the migration PreStartHook into the "ingot_prestart"

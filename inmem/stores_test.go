@@ -5,6 +5,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/libforge/testutil"
@@ -250,6 +251,38 @@ func TestLocations_RoundTrip(t *testing.T) {
 	}
 	if _, err := m.GetLocation(ctx, space, digest); err != registry.ErrNotFound {
 		t.Fatalf("GetLocation after delete err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestRevocationCursor_UpsertRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+
+	if _, err := m.GetRevocationCursor(ctx); err != registry.ErrNotFound {
+		t.Fatalf("GetRevocationCursor before put err = %v, want ErrNotFound", err)
+	}
+	first := registry.RevocationCursor{RecordedAt: time.Now().UTC(), Revoke: testCid(t, "revoked-1")}
+	if err := m.PutRevocationCursor(ctx, first); err != nil {
+		t.Fatalf("PutRevocationCursor: %v", err)
+	}
+	got, err := m.GetRevocationCursor(ctx)
+	if err != nil {
+		t.Fatalf("GetRevocationCursor: %v", err)
+	}
+	if !got.RecordedAt.Equal(first.RecordedAt) || !got.Revoke.Equals(first.Revoke) {
+		t.Fatalf("cursor = %+v, want %+v", got, first)
+	}
+	// The cursor is a single latch: a second put overwrites, never adds.
+	second := registry.RevocationCursor{RecordedAt: first.RecordedAt.Add(time.Hour), Revoke: testCid(t, "revoked-2")}
+	if err := m.PutRevocationCursor(ctx, second); err != nil {
+		t.Fatalf("PutRevocationCursor (upsert): %v", err)
+	}
+	got, err = m.GetRevocationCursor(ctx)
+	if err != nil {
+		t.Fatalf("GetRevocationCursor after upsert: %v", err)
+	}
+	if !got.RecordedAt.Equal(second.RecordedAt) || !got.Revoke.Equals(second.Revoke) {
+		t.Fatalf("cursor after upsert = %+v, want %+v", got, second)
 	}
 }
 

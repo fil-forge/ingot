@@ -76,6 +76,39 @@ func TestModuleValidate_HiltEnabled(t *testing.T) {
 	}
 }
 
+// TestModuleValidate_RevocationEnabled asserts the graph also validates with
+// the revocation service configured, which adds the firehose consumer
+// provider and its lifecycle invoke.
+func TestModuleValidate_RevocationEnabled(t *testing.T) {
+	signer, err := ed25519.GenerateIssuer()
+	if err != nil {
+		t.Fatalf("generate signer: %v", err)
+	}
+
+	cfg := config.Config{
+		Enabled:              true,
+		Addr:                 "127.0.0.1:0",
+		DataDir:              t.TempDir(),
+		UploadServiceURL:     "http://127.0.0.1:8000",
+		UploadServiceDID:     "did:web:upload.example",
+		AuthServiceURL:       "http://127.0.0.1:7000",
+		AuthServiceDID:       "did:web:auth.example",
+		RevocationServiceURL: "http://127.0.0.1:6000",
+		RevocationServiceDID: "did:web:swarf.example",
+	}
+
+	err = fx.ValidateApp(
+		fx.NopLogger,
+		ingot.Module(cfg),
+		fx.Supply(zap.NewNop()),
+		fx.Supply((*pgxpool.Pool)(nil)),
+		fx.Supply(ingot.ServiceIdentity{Signer: signer}),
+	)
+	if err != nil {
+		t.Fatalf("ingot.Module graph with revocation service does not validate: %v", err)
+	}
+}
+
 // TestModuleValidate_Disabled asserts that a disabled module is an inert empty
 // option that needs no host inputs, so a host can always include it.
 func TestModuleValidate_Disabled(t *testing.T) {
