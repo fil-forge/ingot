@@ -615,7 +615,8 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 	// The object is durable. Retain the session (state 'completed') and its
 	// parts so a duplicate Complete is idempotent; the sweeper reaps it later.
 	// Best-effort: a failed latch leaves the row in 'completing', which the
-	// sweeper also treats as terminal after the TTL.
+	// sweeper reaps through its abort path after the TTL — harmless here, as
+	// every blob is accepted by now, so the cleanup skips them all.
 	if _, err := b.multipart.LatchSession(ctx, uploadID, registry.SessionCompleting, registry.SessionCompleted); err != nil {
 		b.logger.Warn("latch session to completed failed; sweeper reaps the completing row after the TTL",
 			zap.String("uploadID", uploadID), zap.Error(err))
@@ -1131,52 +1132,81 @@ func (b *Backend) ListMultipartUploads(ctx context.Context, input *s3.ListMultip
 
 // SweepStaleMultipartSessions aborts in-flight multipart sessions older than
 // ttl (dropping their spooled parts, exactly like a client Abort) and reaps
-// completed/aborting leftovers past the same age. Returns how many sessions
-// were cleaned. Called periodically by the daemon's sweeper loop.
+// completed leftovers past the same age. Sessions a crash stranded
+// mid-transition get the abort treatment too: a 'completing' row (Complete
+// died before the commit) and an 'aborting' row (Abort died before dropping
+// the session) still hold parts whose parked blobs must be released on their
+// providers — deleting the row alone would leave those allocations to sit
+// until expiry. Returns how many sessions were cleaned. Called periodically
+// by the daemon's sweeper loop.
 func (b *Backend) SweepStaleMultipartSessions(ctx context.Context, ttl time.Duration) (int, error) {
 	cutoff := time.Now().Add(-ttl)
 	cleaned := 0
-	// Stale open sessions: latch (losing gracefully to a concurrent
-	// Complete/Abort) and clean up like an abort.
-	stale, err := b.multipart.ListStaleSessions(ctx, registry.SessionOpen, cutoff)
-	if err != nil {
-		return 0, fmt.Errorf("s3frontend: sweep list: %w", err)
-	}
-	for _, s := range stale {
-		won, err := b.multipart.LatchSession(ctx, s.UploadID, registry.SessionOpen, registry.SessionAborting)
-		if err != nil || !won {
-			continue
-		}
-		var digests [][]byte
-		if parts, err := b.multipart.ListParts(ctx, s.UploadID); err == nil {
-			for _, p := range parts {
-				digests = append(digests, p.BlobDigests...)
-			}
-		}
-		if err := b.multipart.DeleteSession(ctx, s.UploadID); err != nil {
-			continue
-		}
-		space, serr := b.bucketSpace(ctx, s.Bucket)
-		if serr != nil {
-			continue // bucket gone; spool rows are reapable later
-		}
-		b.cleanupPartBlobs(ctx, space, s.UploadID, digests)
-		cleaned++
-	}
-	// Terminal leftovers: completed sessions retained for Complete idempotency,
-	// and any 'completing'/'aborting' rows stranded by a crash mid-transition.
-	for _, state := range []string{registry.SessionCompleted, registry.SessionCompleting, registry.SessionAborting} {
-		leftovers, err := b.multipart.ListStaleSessions(ctx, state, cutoff)
+	// Stale open sessions and crash-stranded 'completing' rows: latch into
+	// 'aborting' (losing gracefully to a concurrent Complete/Abort) and clean
+	// up like an abort.
+	for _, state := range []string{registry.SessionOpen, registry.SessionCompleting} {
+		stale, err := b.multipart.ListStaleSessions(ctx, state, cutoff)
 		if err != nil {
-			continue
+			return cleaned, fmt.Errorf("s3frontend: sweep list: %w", err)
 		}
-		for _, s := range leftovers {
-			if err := b.multipart.DeleteSession(ctx, s.UploadID); err == nil {
+		for _, s := range stale {
+			won, err := b.multipart.LatchSession(ctx, s.UploadID, state, registry.SessionAborting)
+			if err != nil || !won {
+				continue
+			}
+			if b.reapAbortingSession(ctx, s) {
 				cleaned++
 			}
 		}
 	}
+	// 'aborting' rows stranded by a crash between the latch and the session
+	// drop: the latch is already held, so just finish the cleanup.
+	stranded, err := b.multipart.ListStaleSessions(ctx, registry.SessionAborting, cutoff)
+	if err != nil {
+		return cleaned, fmt.Errorf("s3frontend: sweep list: %w", err)
+	}
+	for _, s := range stranded {
+		if b.reapAbortingSession(ctx, s) {
+			cleaned++
+		}
+	}
+	// Completed sessions, retained for Complete idempotency: their blobs were
+	// accepted at Complete and belong to reference accounting — drop the row.
+	leftovers, err := b.multipart.ListStaleSessions(ctx, registry.SessionCompleted, cutoff)
+	if err != nil {
+		return cleaned, fmt.Errorf("s3frontend: sweep list: %w", err)
+	}
+	for _, s := range leftovers {
+		if err := b.multipart.DeleteSession(ctx, s.UploadID); err == nil {
+			cleaned++
+		}
+	}
 	return cleaned, nil
+}
+
+// reapAbortingSession drops a session already latched into 'aborting' and
+// releases its parts' now-unreferenced blobs — unallocating parked ones on
+// their providers via /blob/abort (cleanupPartBlobs skips blobs another
+// session or a committed object still references, and leaves accepted blobs
+// to reference accounting). Reports whether the session row was removed.
+func (b *Backend) reapAbortingSession(ctx context.Context, s registry.MultipartSession) bool {
+	// Snapshot the parts' blob digests before the cascade delete.
+	var digests [][]byte
+	if parts, err := b.multipart.ListParts(ctx, s.UploadID); err == nil {
+		for _, p := range parts {
+			digests = append(digests, p.BlobDigests...)
+		}
+	}
+	if err := b.multipart.DeleteSession(ctx, s.UploadID); err != nil {
+		return false
+	}
+	space, err := b.bucketSpace(ctx, s.Bucket)
+	if err != nil {
+		return true // bucket gone; spool rows are reapable later
+	}
+	b.cleanupPartBlobs(ctx, space, s.UploadID, digests)
+	return true
 }
 
 // etagsEqual compares two ETags ignoring surrounding quotes.
