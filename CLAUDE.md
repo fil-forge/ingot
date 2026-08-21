@@ -7,18 +7,21 @@ testing, and the conventions/gotchas of the codebase.
 ## What this is
 
 `github.com/fil-forge/ingot` is an **S3 gateway over the Forge network**. It runs
-two ways: an embeddable Go **library** a host (piri/guppy/sprue) imports
-in-process, and a standalone **daemon** (`ingot serve`, in `cmd/`). It presents
-each S3 bucket as a per-bucket MST, journals mutations to a local **two-plane**
-LSM log (data + catalog), and ships sealed segments to Forge (sprue → piri +
-indexing-service) as a guppy-style edge client. See DESIGN_NOTES for the full
-architecture.
+two ways: an embeddable Go **library** a host imports in-process, and a
+standalone **daemon** (`ingot serve`, in `cmd/`). It presents each S3 bucket as
+a per-bucket MST, uploads object bodies to Forge as content-addressed blobs
+before a write is acked, journals the catalog (MST nodes + manifests) to a
+local **per-bucket** log (`logstore`), and ships sealed catalog segments to
+Forge (sprue → piri) as a guppy-style edge client, with **hilt** authorizing
+every non-root request and owning tenancy. See DESIGN_NOTES for the current
+architecture, `docs/architecture.md` for the target, and `docs/diagrams.md`
+for the as-built diagrams.
 
 ## Build, test, run
 
 **Critical: use `GOWORK=off`** (or the Makefile, which sets it). The workspace
-`go.work` at `…/fil-forge/go.work` declares `go 1.26.1` (above the installed
-toolchain) and exists for cross-repo work; ingot is a standalone module:
+`go.work` at `…/fil-forge/go.work` exists for cross-repo work and drags sibling
+modules in; ingot is a standalone module and must build on its own `go.mod`:
 
 ```bash
 make build      # GOWORK=off go build ./...
@@ -30,7 +33,7 @@ GOWORK=off go test -tags itest ./itest -run 'TestForgeVersity/PutObject' -v  # o
 GOWORK=off go build -o /tmp/ingot ./cmd/ingot               # the daemon binary
 ```
 
-**go directive: 1.26.4** (matches the swarf dep; indexing-service needs ≥ 1.25.7).
+**go directive: 1.26.4.**
 
 **The test pattern — unit first, integration when you're ready to wait.**
 `make test` runs library/unit tests in seconds with no Docker. `make itest`
@@ -51,7 +54,11 @@ ingot depends only on these — it must **never** import `fil-forge/sprue` or
 - **`libforge`** — Forge capability bindings + helpers:
   `commands/{blob,content,http,assert,ucan,index,provider,access}`, `blobindex`
   (sharded-dag-index), `ucan` (ProofStore), `ucan/retrieval`, `didmailto`, `receipt`.
-- **`indexing-service/pkg/{client,types}`** — indexer query client.
+- **`fil-forge/hilt/pkg/{client,rpc/service,s3perm,sigv4}`** — the auth/tenant
+  service client: `/s3/request/authorize`, `/s3/bucket/*`, SigV4 verification
+  helpers, permission→command mapping.
+- **`indexing-service/pkg/{client,types}`** — indexer query client (the
+  indexer-backed locator compiles but is not wired; reads use the local tables).
 - **`swarf/pkg/{client,api}`** — the UCAN revocation service client: the SSE
   revocation firehose the `revocation/` consumer subscribes to.
 - **`fil-forge/versitygw`** — our fork of versity/versitygw, the S3 REST front
@@ -71,110 +78,128 @@ a real port, not an import rewrite.
 
 Public surface (what hosts import):
 
-- **`ingot` (root)** — `Module(cfg) fx.Option`, `ServerModule`, `Config`,
-  `ServiceIdentity`, `PreStartHook`; the non-fx `New(ctx, ServerConfig, ServerDeps)`
-  + `Server.{Start,Stop}`. `module.go` (fx wiring), `config.go` (host `Config` +
-  `ServerConfig()` mapping + per-plane blocks), `server.go` (`New`, lifecycle,
-  `newPlaneFlushFunc`, versitygw `s3api`), `util.go` (`LoadOrCreateSigner` — the
-  space key).
+- **`ingot` (root)** — `Module(cfg) fx.Option`, `ServerModule`,
+  `ServiceIdentity`, `PreStartHook`; the non-fx `New(ctx, ServerConfig,
+  ServerDeps)` + `Server.{Start,Stop}`. `module.go` (fx wiring), `server.go`
+  (`New`, lifecycle, `newBucketFlushFunc`, the versitygw `s3api` mount).
+- **`config/`** — the host `Config`, `Config.ServerConfig()` (the single
+  mapping site), the `CatalogPlane` block, validation.
 
 Internal:
 
-- **`cmd/`** — the daemon (cobra/viper/fx): `serve` (standalone | forge modes),
-  `login`, `space generate`/`ls`, `whoami`; `config.go` (`DaemonConfig`), `deps.go`.
-- **`s3frontend/`** — versitygw `backend.Backend`: `object.go` (Put/Get/Head/
-  Delete/List), `bucket.go`, `backend.go`.
+- **`cmd/`** — the daemon (cobra/viper/fx): `serve`, `whoami`, `version`;
+  `deps.go` (identity PEM + pgx pool).
+- **`s3frontend/`** — versitygw `backend.Backend`: `object.go`
+  (Put/Get/Head/Delete/List), `version.go` (resolveVersion / commitVersion,
+  the per-key version tree), `multipart.go`, `bucket.go`, `listversions.go`,
+  `backend.go`.
 - **`bucketop/`** — `Coordinator`/`Tx`: per-bucket write transaction (lock,
-  snapshot Root, staging buffer, CAS-commit).
-- **`blockstore/`** — block I/O contracts + impls. `log.go` (`Log`, `Plane`,
-  `OpRoot`, `BlockLoc`), `staging.go` (`OpStaging` + codec plane-classification),
-  `layered.go`, `forge.go` (network read tier), `cache.go` (`Cached` LRU),
-  `locator/` (carried from guppy).
-- **`logstore/`** — the two-plane LSM log. `store.go` (`Store` coordinator),
-  `planelog.go` (`PlaneLog`, the per-plane pipeline), `segment.go` (single-plane
-  CAR + `.idx` + `.ops`), `recovery.go`, `config.go` (`PlaneConfig`), `types.go`
-  (`Meta`, `SegmentMeta`). See `logstore/README.md`.
-- **`registry/`** — Postgres bucket + segment metadata. `postgres.go` (`Registry`
-  + `State`), `segments.go` (`logstore.Meta`). One `*Postgres` satisfies both.
-- **`uploader/`** — `forge.go`: `Uploader` / `CARShard` / `Forge.SubmitShard` —
-  the per-plane ship via the edge client.
-- **`forgeclient/`** — carried-from-guppy edge client: `/blob/add`,
-  `/ucan/conclude`, `/index/add`, `/provider/add`, `/access/delegate`, and the
-  `/access` login flow.
-- **`iam/`** — the Hilt (auth-service) integration over the external
-  `github.com/fil-forge/hilt/pkg/client` (RFC: forge-s3-tenant-management):
+  snapshot root, staging buffer, CAS commit).
+- **`blockstore/`** — block I/O contracts + impls: `log.go` (`Log`, `Plane`
+  [catalog-only], `OpRoot`), `staging.go` (`OpStaging`), `spool.go` (`Spool`),
+  `layered.go`, `forge.go` (the network read tier), `cache.go` (`Cached` LRU),
+  `locator/` (carried from guppy; the indexer-backed locator is never
+  injected).
+- **`logstore/`** — the per-bucket catalog log: `manager.go` (`Manager`, the
+  production `blockstore.Log`), `store.go`, `planelog.go`, `segment.go`,
+  `recovery.go`. See `logstore/README.md`.
+- **`registry/`** — Postgres metadata: `postgres.go` (`Registry` + `State`),
+  `segments.go` (`logstore.Meta`), `stores*.go` (intents, locations,
+  inclusions, blob_refs, GC, multipart sessions/parts, parks),
+  `locallocator.go` (the read tier's `Locator`). One `*Postgres` satisfies
+  all of them.
+- **`uploader/`** — `forge.go`/`blob.go`: `Forge` behind `Uploader`
+  (`SubmitShard`), `BodyUploader`/`DeferredBodyUploader` (`UploadBlob`,
+  `ConcludeBlob`, `AbortBlob`), and `BlobRemover`; captures the per-space
+  ship authority (`shipProofs`, 1h TTL) from in-request writes.
+- **`bucketauthority/`** — hilt bucket ops: forwards CreateBucket /
+  DeleteBucket / ListBuckets to `/s3/bucket/*`, recovering the signed S3
+  request from ctx.
+- **`iam/`** — the hilt IAM integration over `fil-forge/hilt/pkg/client`:
   versitygw `IAMService`/`RequestIAMService` authorizing each non-root
-  request via `/s3/request/authorize` (derived SigV4 key), plus
-  `DelegationCache` — a TTL cache (go-cache) of Hilt-issued delegations
-  (authorize re-delegations + `/s3/bucket/info` chains) that the network
-  read tier consumes as its per-space `/content/retrieve` proof store.
-  **Forge mode requires Hilt** (`auth_service_url`/`auth_service_did`): the
-  postgres registry forwards bucket create/delete/list to it, recovering
-  the signed S3 request from the method's ctx.
+  request via `/s3/request/authorize` (derived SigV4 key, with a local fast
+  path over cached delegations), plus `KeyProofs`/`DelegationCache` — per-
+  access-key TTL caches of hilt-issued delegations that the uploader and the
+  network read tier consume via `internal/reqscope`.
+- **`forgeclient/`** — carried-from-guppy sprue edge client: `/blob/add`
+  (with a deferrable conclude), `/ucan/conclude`, `/blob/abort`,
+  `/blob/remove`, `/index/add`, receipt polling. The `/access` login and
+  `/provider/add` flows are dormant (no CLI drives them).
 - **`revocation/`** — the Swarf firehose consumer (optional,
   `revocation_service_url`/`_did`): streams UCAN revocations and clears the
   affected access key's iam caches via `iam.Revoker`; resumes from the
   `registry.RevocationCursorStore` cursor (no cursor → subscribe from now).
-- **`tokenstore/`** — carried-from-guppy delegation store (`tokens.cbor`).
-- **`bucket/`** — per-object model: `manifest.go` (`ObjectManifest`, `Body`),
-  `chunker.go` (`BodyCodec`/`FixedChunker`), `cbor_gen.go`.
+- **`tokenstore/`** — carried-from-guppy delegation store (`tokens.cbor`);
+  empty today, read only by the dormant login paths.
+- **`bucket/`** — the per-object model: `manifest.go` (`ObjectManifest`,
+  `Body`), `leaf.go` (`ValueUnion`, `ObjectLeaf`, `VersionNode`),
+  `chunker.go` (`SplitBody`, body readers), `cbor_gen.go`.
 - **`mst/`** — the forked MST (deps: go-cid, blockstore, ucantone/did — trees
   carry their bucket's space for network-backed reads).
-- **`inmem/`** — `MemStore` (Registry+Meta), `NopBaseReader`, `NopUploader`; backs
-  standalone mode (slated for removal).
-- **`cars/`**, **`migrations/`**, **`internal/ucanexec/`**, **`gen/`**,
-  **`testing/`** — CAR codec, goose SQL (`ingot` schema), generic `Execute[T]`,
-  cborgen driver, S3-client test glue (Config/NewS3Conf + roundtrip helpers).
+- **`inmem/`** — in-memory fakes (`MemStore`, `NopBaseReader`, `NopUploader`);
+  test-only.
+- **`cars/`**, **`migrations/`**,
+  **`internal/{reqscope,ucanexec,fasthttputil,cors,build}`**, **`gen/`**,
+  **`testing/`** — CAR codec, goose SQL (`ingot` schema), request-scoped ctx
+  keys, generic `Execute[T]`, fasthttp adapters, CORS, the version stamp, the
+  cborgen driver, S3-client test glue.
 
 ## Interface seams
 
-| Contract | Production | Test / standalone |
+| Contract | Production | Test |
 |---|---|---|
 | `versitygw/backend.Backend` | `s3frontend.Backend` | (same) |
-| `blockstore.Log` | `logstore.Store` | (same) |
+| versitygw `auth.IAMService` + `middlewares.RequestIAMService` | `iam.Service` (the root account is checked before IAM) | root account only |
+| `blockstore.Log` | `logstore.Manager` (one `Store` per bucket) | in-memory fake |
 | `blockstore.BlockReader` | `blockstore.Forge` (in `Cached`) | `inmem.NopBaseReader` |
-| `registry.Registry` + `logstore.Meta` | `*registry.Postgres` (both) | `inmem.MemStore` (both) |
-| `uploader.Uploader` | `uploader.Forge` | `inmem.NopUploader` |
-| `bucket.BodyCodec` | `*bucket.FixedChunker` | (same) |
+| `registry.Registry` + the store seams + `logstore.Meta` | `*registry.Postgres` (all of them) | `inmem.MemStore` |
+| `locator.Locator` | `registry.LocalLocator` | (indexer-backed locator exists, unwired) |
+| `uploader.{Uploader,BodyUploader,DeferredBodyUploader,BlobRemover}` | `uploader.Forge` | `inmem.NopUploader` |
 
 ## fx module
 
-- **`ServerModule`** (composable core) — consumes `ServerConfig`, `*zap.Logger`,
-  and the four collaborator interfaces (`registry.Registry`, `logstore.Meta`,
-  `blockstore.BlockReader`, `uploader.Uploader`) + a `PreStartHook` group; runs
-  pre-start → `New` → `Start` on the fx lifecycle.
-- **`Module(cfg)`** (production wrapper) — supplies Postgres as both Registry+Meta
-  (`fx.Out`), the Forge reader, the edge-client uploader, the space signer, the
-  token store + a seed hook (self-issued space→agent delegations), and the goose
-  migration `PreStartHook`. Empty option when `cfg.Enabled` is false.
+- **`ServerModule`** (composable core) — consumes `ServerConfig`,
+  `*zap.Logger`, and the collaborator seams (`blockstore.BlockReader`; the
+  four `uploader` seams; `bucketauthority.BucketAuthority`;
+  `registry.Registry` plus the intent/location/inclusion/blob-ref/GC/
+  multipart/park stores; `logstore.Meta`; an optional `auth.IAMService`) +
+  a `PreStartHook` group; runs pre-start → `New` → `Start` on the fx
+  lifecycle.
+- **`Module(cfg)`** (production wrapper) — supplies Postgres as Registry +
+  Meta + every store (one `*registry.Postgres` behind them all), the Forge
+  reader (`LocalLocator` inside `Cached`), the sprue edge client + uploader,
+  the hilt client + `iam.Service` + `KeyProofs`, `bucketauthority`, the
+  (empty) token store, and the goose migration `PreStartHook`. Empty option
+  when `cfg.Enabled` is false.
 
 A host provides `*zap.Logger`, `*pgxpool.Pool`, `ingot.ServiceIdentity` (the
 agent) and sets `Config.UploadServiceURL`/`UploadServiceDID` (sprue) +
-`IndexerEndpoint`/`IndexerDID`. The non-fx escape hatch is
+`AuthServiceURL`/`AuthServiceDID` (hilt). The non-fx escape hatch is
 `New(ctx, ServerConfig, ServerDeps)`.
 
-## Configuration (`Config`)
+## Configuration (`config.Config`)
 
-Viper/yaml-bindable. Key fields: `Enabled`, `Addr`, `DataDir`, `Region`,
-`RootAccess`/`RootSecret` (single-account IAM), `ChunkSize`, top-level
-`SealBytes`/`SealAge`/`Retain` (defaults for both planes), per-plane
-`DataPlane`/`CatalogPlane` `{SealBytes, SealAge, Ship, Retain}` overrides,
-`IndexerEndpoint`/`IndexerDID`, `ReadCacheBytes` (0 → 256 MiB, <0 → off),
-`UploadServiceURL`/`UploadServiceDID`/`UploadReceiptsURL`, `TokenStoreDir`
-(→ `DataDir`), `HiltURL`/`HiltDID`/`HiltProofs` (tenant-management service;
-proofs = file path or string-encoded UCAN container, optional).
-`Config.ServerConfig()` is the single mapping site. The daemon's
-`DaemonConfig` (cmd/config.go) embeds `Config` + `Mode`/`PostgresDSN`/`Identity`.
+Viper/yaml-bindable (env prefix `INGOT_`, `.` → `_`). Key fields: `Enabled`,
+`Addr` (default `0.0.0.0:9000`), `DataDir`, `Region`, `RootAccess`/`RootSecret`
+(the versitygw root account), `MaxBlobSize`, top-level
+`SealBytes`/`SealAge`/`Retain` with a `CatalogPlane` `{SealBytes, SealAge,
+Ship, Retain}` override block (the only plane), `ReadCacheBytes` (0 → 256 MiB,
+<0 → off), `UploadServiceURL`/`UploadServiceDID`/`UploadReceiptsURL` (sprue),
+`AuthServiceURL`/`AuthServiceDID`/`AuthServiceProofs` (hilt; proofs = file
+path or string-encoded UCAN container, optional), `TokenStoreDir` (→
+`DataDir`), `MultipartSessionTTL` (0 → 7d, negative → sweeper off),
+`CORSAllowedOrigins`, `LogLevel`. `Config.ServerConfig()` is the single
+mapping site. The daemon's config (cmd/) adds `postgres_dsn` and
+`identity.key_file`.
 
 ## Testing
 
 There is no in-memory ingot: the deployment under test is always the real
 forge-mode daemon. Two tiers:
 
-- **`make test` — unit** (seconds, no Docker): `module_test.go` (root),
-  `logstore/store_test.go`, `blockstore/{cache,staging}_test.go`,
-  `forgeclient/accounts_test.go`, `cmd/space_test.go`, plus library helpers in
-  `testing/` (thin S3-client glue: `Config`/`NewS3Conf`, roundtrip helpers).
+- **`make test` — unit** (seconds, no Docker): library/unit tests across the
+  packages, plus the thin S3-client glue in `testing/` (`Config`/`NewS3Conf`,
+  roundtrip helpers).
 - **`make itest` — integration** (`itest/`, build tag `itest`, Docker):
   boots the smelt Forge stack with THIS working tree's binary mounted over
   the published image.
@@ -187,8 +212,11 @@ forge-mode daemon. Two tiers:
     (blob-split/spool-by-digest, zero-byte objects, part-spans-blobs
     multipart, failed-Complete session recovery), on a small-`max_blob_size`
     config (`testdata/config-smallblob.yaml` via smelt's WithServiceConfig).
-  - **`forge_native_test.go` / `forge_eviction_test.go`** — provisioning and
-    the read-after-eviction network tier, each on its own stack.
+  - **`forge_*_test.go`** — forge-native behaviors on dedicated stacks:
+    provisioning (`forge_native`), delete/release (`forge_delete`), deferred
+    multipart accept (`forge_multipart_deferred`), catalog retention
+    (`forge_retention`), and the read-after-eviction network tier
+    (`forge_eviction`).
 - **Suite-composition-sensitive upstream cases** — a few versitygw cases
   depend on run position rather than S3 semantics: `ListBuckets_truncated`
   names buckets from a process-global counter and asserts *creation-order*
@@ -206,9 +234,9 @@ forge-mode daemon. Two tiers:
 - **cborgen:** `make gen` (`go run ./gen`) regenerates `bucket/cbor_gen.go`.
   `mst/cbor_gen.go` is separate. Verify a no-op diff after touching `bucket` types.
 - **migrations:** SQL in `migrations/sql/*.sql` (`go:embed`), applied by
-  `migrations.Up` under the `ingot` schema at startup (forge mode, via a
-  `PreStartHook`). The schema is dev-only; reshape migrations in place and reset
-  any persistent dev DB.
+  `migrations.Up` under the `ingot` schema at startup via a `PreStartHook`.
+  The schema is dev-only; reshape migrations in place and reset any
+  persistent dev DB.
 
 ## Docker images & release
 
@@ -261,17 +289,37 @@ workspace checkout: `GOWORK=off goreleaser release --clean`.
   `internal/ucanexec/` — are deliberate duplicates of guppy/sprue code; keep them
   in sync (header comments point at upstream). DESIGN_NOTES wants a shared
   `forge-client` lib to remove them.
-- **`Store` preserves `AppendBatch`'s signature**, so the write path
-  (`OpStaging`, `bucketop`, `s3frontend`) is unaware of the plane split — it lives
-  entirely inside `logstore` (the `Store` coordinator over two `PlaneLog`s).
+- **The write path holds `blockstore.Log`; production wires `logstore.Manager`**
+  (one per-bucket `Store`). Reads carry no bucket context, so `Manager.Get`
+  linear-scans open bucket stores — the known hot spot.
 - **The Bash tool buffers / returns out of order under load** — when verifying git
   or test state, prefer a single fresh `go test -count=1` run and read its result
   over trusting interleaved buffered output.
 - Match the surrounding comment density and naming; this codebase is heavily
   doc-commented at the type/function level.
 
+## Architecture diagrams
+
+`docs/diagrams.md` is a living artifact; two of its diagrams live in
+`logstore/README.md`. A PR that changes behavior a diagram draws updates the
+diagram in the same PR. The package-to-diagram table at the bottom of
+`docs/diagrams.md` maps changed packages to the diagrams to review; each
+diagram's `Sources:` footer lists its ground-truth files. Diagrams draw the
+code as built; target-state divergences are labeled notes, and the target
+lives in `docs/architecture.md`.
+
 ## Companion docs
-- [`DESIGN_NOTES.md`](./DESIGN_NOTES.md) — how the whole system operates today +
-  known gaps.
-- [`logstore/README.md`](./logstore/README.md) — the two-plane log internals.
+- [`DESIGN_NOTES.md`](./DESIGN_NOTES.md) — how the system operates today.
+- [`docs/architecture.md`](./docs/architecture.md) — the target architecture +
+  implementation status (§12).
+- [`docs/diagrams.md`](./docs/diagrams.md) — the as-built diagram set (living).
+- [`docs/s3-versioning.md`](./docs/s3-versioning.md) — the per-key
+  version-tree design.
+- [`docs/aggregation-gate.md`](./docs/aggregation-gate.md) — why this S3
+  design is gated on Piri's aggregation.
+- [`docs/IMPLEMENTATION_PLAN.md`](./docs/IMPLEMENTATION_PLAN.md) — the phase
+  tracker for the architecture migration.
+- [`logstore/README.md`](./logstore/README.md) — the catalog log internals.
+- [`itest/README.md`](./itest/README.md) — the integration harness and the
+  conformance ratchet.
 - [`README.md`](./README.md) — orientation / deploy modes.

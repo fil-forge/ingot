@@ -1,9 +1,10 @@
 // Package ingot exposes the embedded S3 listener as both a low-level Server type
 // (see server.go) and an fx module (see Module).
 //
-// The S3 protocol layer is provided by github.com/versity/versitygw; the
-// storage backend is the LSM-style log in logstore in front of a Forge-backed
-// read tier, with versitygw -> logstore translation in s3frontend.
+// The S3 protocol layer is provided by github.com/versity/versitygw; object
+// bodies upload to Forge per blob, the catalog journals to the per-bucket log
+// in logstore, and reads fall through to a Forge-backed tier, with the
+// versitygw -> backend translation in s3frontend.
 //
 // # Using ingot as an fx module
 //
@@ -13,9 +14,8 @@
 //   - *zap.Logger
 //   - *pgxpool.Pool          — ingot owns its schema and runs its own goose
 //     migrations against this pool at startup
-//   - ingot.ServiceIdentity   — the host's upload-service signer
-//   - uploader.ProviderSelector — chooses which piri a blob is allocated to;
-//     uploader.NewStaticProviderSelector covers the single home-piri case
+//   - ingot.ServiceIdentity   — the agent signer; issuer of every outbound
+//     invocation
 //
 // Module manages the embedded S3 Server's lifecycle and provides nothing to the
 // host graph. When cfg.Enabled is false it is an empty option, so a host can
@@ -24,14 +24,16 @@
 // # ServerModule: the composable core
 //
 // Module is a thin production wrapper around [ServerModule], which is the
-// reusable core: it consumes a [ServerConfig], a *zap.Logger, and the four
-// collaborator interfaces (registry.Registry, logstore.Meta,
-// blockstore.BlockReader, uploader.Uploader) from the graph, then manages
-// New -> Start -> Stop over the fx lifecycle. Module layers the production
-// providers (Postgres registry, Forge reader/uploader, space signer) and a
-// migration pre-start hook on top. A test harness, by contrast, includes
-// ServerModule directly and supplies in-memory fakes for the same four
-// interfaces — so both paths construct the Server through identical wiring.
+// reusable core: it consumes a [ServerConfig], a *zap.Logger, and the
+// collaborator seams (the registry + store interfaces, logstore.Meta,
+// blockstore.BlockReader, the uploader seams, bucketauthority, and an
+// optional IAM service) from the graph, then manages New -> Start -> Stop
+// over the fx lifecycle. Module layers the production providers (the
+// Postgres registry, the Forge reader, the sprue uploader, the hilt
+// client/IAM) and a migration pre-start hook on top. A test harness, by
+// contrast, includes ServerModule directly and supplies in-memory fakes for
+// the same seams — so both paths construct the Server through identical
+// wiring.
 //
 // # Using ingot without fx
 //
@@ -139,7 +141,7 @@ var ServerModule = fx.Module("ingot-server",
 )
 
 // serverParams are the inputs ServerModule binds the server's start/stop hooks
-// over. The four collaborators are interfaces, so any provider satisfying them
+// over. The collaborators are interfaces, so any provider satisfying them
 // (production's Postgres + Forge, or a harness's in-memory fakes) wires in.
 type serverParams struct {
 	fx.In

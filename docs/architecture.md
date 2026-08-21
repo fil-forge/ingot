@@ -5,7 +5,8 @@ and the flows that move bytes through it. This is the target architecture. Its s
 retrieval core is now **implemented in the tree** (it superseded the bootstrap MVP); the parts that
 remain deferred or stubbed are enumerated in [§12 — Implementation status](#12-implementation-status--postponed-items).
 
-Companion docs: [`aggregation-gate.md`](./aggregation-gate.md) — why this S3 design is gated on
+Companion docs: [`diagrams.md`](./diagrams.md) — the as-built diagram set;
+[`aggregation-gate.md`](./aggregation-gate.md) — why this S3 design is gated on
 Piri's aggregation; and the [**pdp-sim**](https://github.com/fil-forge/pdp-sim) simulator — the
 measured PDP gas model behind the size knobs, the source for future gas-usage calculations (top-line
 analysis in [`analysis/SUMMARY.md`](https://github.com/fil-forge/pdp-sim/blob/main/analysis/SUMMARY.md);
@@ -623,28 +624,55 @@ The MVP this supersedes had six structural problems; each is resolved by a layer
 
 ## Appendix C — Postgres schema (the `ingot` schema)
 
-The relational tables the design relies on. Object **manifests** and **MST nodes** are not rows here —
-they are content-addressed dag-cbor *blocks* in the catalog plane ([§4](#4-the-catalog-layer)). The catalog plane's CAR
-**segment** metadata and per-operation **op-roots** (which advance `buckets.forge_root_cid` on ship)
-are owned by the [`logstore`](../logstore) package; they are not
-redefined here. CIDs and blob digests (sha256 multihashes) are stored as `bytea`, matching today's
-`ingot` schema (`migrations/sql/*.sql`).
+The relational tables as migrated (`migrations/sql/*.sql`), including the catalog log's
+**segment** metadata and per-operation **op-roots** (owned by the [`logstore`](../logstore)
+package). Object **manifests** and **MST nodes** are not rows here — they are content-addressed
+dag-cbor *blocks* in the catalog plane ([§4](#4-the-catalog-layer)). CIDs and blob digests
+(sha256 multihashes) are stored as `bytea`. The ER view is in
+[`diagrams.md`](./diagrams.md#postgres-schema-as-migrated).
 
 ```sql
 -- One row per bucket: the space its data lives in, the S3 versioning state, the
--- committed MST root, and the root that is durable on Forge (lags until the
--- catalog plane ships).
+-- committed MST root, and the root that is durable on Forge (advanced only when
+-- a catalog segment ships, and only while root_cid still equals the op-root).
 CREATE TABLE ingot.buckets (
-    name            text PRIMARY KEY,
-    space           text NOT NULL,                       -- Forge space DID
-    versioning      text NOT NULL DEFAULT 'unversioned'
-                        CHECK (versioning IN ('unversioned','enabled','suspended')),
-    root_cid          bytea,                             -- committed MST root (locally durable)
-    forge_root_cid    bytea,                             -- MST root durable on Forge (lags root_cid)
-    next_version_seq  bigint NOT NULL DEFAULT 0,         -- per-bucket version ordinal (§3, the version seq)
-    created_at        timestamptz NOT NULL DEFAULT now()
+    name             text PRIMARY KEY,
+    root_cid         bytea,                              -- committed MST root (locally durable)
+    forge_root_cid   bytea,                              -- MST root durable on Forge (lags root_cid)
+    created_at       timestamptz NOT NULL DEFAULT now(),
+    space            text NOT NULL,                      -- Forge space DID (minted by Hilt)
+    versioning       text NOT NULL DEFAULT 'unversioned'
+                         CHECK (versioning IN ('unversioned','enabled','suspended')),
+    next_version_seq bigint NOT NULL DEFAULT 0           -- per-bucket version ordinal (§3)
 );
 CREATE INDEX buckets_space_idx ON ingot.buckets (space);
+
+-- The catalog log's segment lifecycle (owned by logstore; see logstore/README.md).
+-- seq is drawn from the shared ingot.segment_seq sequence. state holds only
+-- open/sealed: shipped is the shipped_at stamp. The 'data' plane arm is dead
+-- (the log is catalog-only) but remains in the CHECK.
+CREATE SEQUENCE ingot.segment_seq;
+CREATE TABLE ingot.segments (
+    seq          bigint PRIMARY KEY,
+    plane        text   NOT NULL CHECK (plane IN ('data','catalog')),
+    state        text   NOT NULL CHECK (state IN ('open','sealed')),
+    sealed_at    bigint,
+    size_bytes   bigint NOT NULL DEFAULT 0,
+    sha256       bytea,
+    shipped_at   bigint,
+    bucket       text   NOT NULL,                        -- the log is segregated per bucket
+    index_digest bytea                                   -- shipped sharded-dag-index blob
+);
+
+-- Per-segment record of the bucket-root advances that landed in it; shipping
+-- replays these into buckets.forge_root_cid under the guard above.
+CREATE TABLE ingot.segment_op_roots (
+    seq        bigint NOT NULL REFERENCES ingot.segments(seq) ON DELETE CASCADE,
+    seq_within int    NOT NULL,
+    bucket     text   NOT NULL,
+    root_cid   bytea  NOT NULL,
+    PRIMARY KEY (seq, seq_within)
+);
 
 -- Reverse index (§5, §6): which object versions reference each blob. One row per
 -- (digest, version). A blob's space-claim is released when no rows remain for
@@ -661,10 +689,8 @@ CREATE TABLE ingot.blob_refs (
 -- Drives "is (space, digest) still claimed?" — the gate on remove(digest).
 CREATE INDEX blob_refs_claim_idx ON ingot.blob_refs (space, digest);
 
--- The local-store index (§5): every blob Ingot holds on disk, in-flight or
--- retained as cache. Drives read-after-write, cache lookup, and crash recovery.
--- state advances spooled → parked → accepted → published; cache eviction deletes
--- the row and the file.
+-- The local-store index (§5): every blob Ingot holds on disk. state advances
+-- spooled → parked → accepted ('published' is declared but unwritten today).
 CREATE TABLE ingot.upload_intents (
     digest      bytea PRIMARY KEY,                       -- sha256 multihash of the blob
     local_path  text   NOT NULL,
@@ -676,24 +702,58 @@ CREATE TABLE ingot.upload_intents (
     updated_at  timestamptz NOT NULL DEFAULT now()
 );
 
+-- Local blob location table (§8, appliance topology): (space, digest) →
+-- provider/URL, captured at accept, in place of the indexing-service.
+CREATE TABLE ingot.blob_locations (
+    space      text   NOT NULL,
+    digest     bytea  NOT NULL,
+    provider   text   NOT NULL,                          -- provider/node DID
+    url        text   NOT NULL,                          -- retrieval URL
+    size       bigint NOT NULL,                          -- whole-blob byte length
+    created_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (space, digest)
+);
+
+-- Shard inclusions (§8): which shipped CAR contains block B, at what byte range
+-- (inclusive). Written by the flush path before a segment marks shipped, so
+-- retention can never retire blocks the read tier cannot resolve.
+CREATE TABLE ingot.shard_inclusions (
+    space        text   NOT NULL,
+    digest       bytea  NOT NULL,                        -- inner block multihash
+    shard_digest bytea  NOT NULL,                        -- enclosing shard CAR multihash
+    range_start  bigint NOT NULL,
+    range_end    bigint NOT NULL,
+    PRIMARY KEY (space, digest)
+);
+
 -- One row per in-flight multipart upload (§7.2). `state` is the single-winner
--- latch (§7.3): Complete and Abort race to move it off 'open'. content_type and
--- metadata are carried from CreateMultipartUpload so Complete can write the
--- manifest without the client resupplying them.
+-- latch (§7.3): Complete and Abort race to move it off 'open'; 'completed' rows
+-- are retained so a duplicate Complete is idempotent, then reaped by the TTL
+-- sweeper. The header columns carry CreateMultipartUpload's metadata into the
+-- Complete-time manifest.
 CREATE TABLE ingot.multipart_sessions (
-    upload_id     text PRIMARY KEY,
-    bucket        text NOT NULL,
-    object_key    text NOT NULL,
-    state         text NOT NULL DEFAULT 'open'
-                      CHECK (state IN ('open','completing','aborting')),
-    content_type  text,
-    metadata      jsonb,                                 -- user metadata + system headers
-    created_at    timestamptz NOT NULL DEFAULT now()
+    upload_id                 text PRIMARY KEY,
+    bucket                    text NOT NULL,
+    object_key                text NOT NULL,
+    state                     text NOT NULL DEFAULT 'open'
+        CHECK (state IN ('open','completing','aborting','completed')),
+    content_type              text,
+    metadata                  jsonb,                     -- user metadata
+    created_at                timestamptz NOT NULL DEFAULT now(),
+    content_encoding          text,
+    content_disposition       text,
+    content_language          text,
+    cache_control             text,
+    expires                   text,
+    website_redirect_location text,
+    checksum_algorithm        text,
+    checksum_type             text
 );
 
 -- One row per uploaded part. A part larger than max_blob_size maps to several
--- blobs, so blob_digests is an ordered array. state is 'parked' until Complete
--- accepts the part's blobs (or 'accepted' immediately on a dedup hit, §5).
+-- blobs, so blob_digests is an ordered array. checksum is the part's declared-
+-- algorithm value, or the internal full-object CRC64NVME when the session
+-- declares none.
 CREATE TABLE ingot.multipart_parts (
     upload_id     text   NOT NULL REFERENCES ingot.multipart_sessions(upload_id) ON DELETE CASCADE,
     part_number   int    NOT NULL,
@@ -702,7 +762,21 @@ CREATE TABLE ingot.multipart_parts (
     blob_digests  bytea[] NOT NULL,                      -- ordered; one entry per ≤ max_blob_size blob
     state         text   NOT NULL DEFAULT 'parked'
                       CHECK (state IN ('parked','accepted')),
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    checksum      text   NOT NULL DEFAULT '',
     PRIMARY KEY (upload_id, part_number)
+);
+
+-- Deferred-accept multipart (§7.2): the state needed to conclude (or abort) a
+-- parked blob later. Keyed globally by digest, like upload_intents: dedup
+-- shares a park across sessions and parts.
+CREATE TABLE ingot.blob_parks (
+    digest         bytea PRIMARY KEY,
+    add_task       bytea  NOT NULL,                      -- /blob/add task CID (abort cause)
+    accept_task    bytea  NOT NULL,                      -- /blob/accept task CID (conclude poll target)
+    put_invocation bytea  NOT NULL,                      -- sealed /http/put invocation
+    size           bigint NOT NULL,
+    created_at     timestamptz NOT NULL DEFAULT now()
 );
 
 -- Superseded MST node CIDs, recorded on overwrite/delete (§4, §9). Write-only
@@ -714,11 +788,14 @@ CREATE TABLE ingot.gc_candidates (
 );
 ```
 
-Relationships at a glance: `blob_refs`, `multipart_sessions`, `multipart_parts`, and `gc_candidates`
-all reference a `buckets.name`; `multipart_parts` cascades from `multipart_sessions`. The reference
-count for a blob is `count(*) from blob_refs where space = ? and digest = ?`; reaching zero triggers
-`remove(digest)` ([§6](#6-the-forgechain-layer)). `upload_intents` is keyed by the blob digest and is independent of bucket
-namespace — it is the disk-side index, shared across whatever objects reference the same bytes.
+Relationships at a glance: `segment_op_roots` cascades from `segments`, and `multipart_parts` from
+`multipart_sessions` — the schema's only true foreign keys. `blob_refs`, `segments`,
+`multipart_sessions`, and `gc_candidates` reference a `buckets.name` by value, and
+`shard_inclusions` joins `blob_locations` on `shard_digest`. The reference count for a blob is
+`count(*) from blob_refs where space = ? and digest = ?`; reaching zero triggers `remove(digest)`
+([§6](#6-the-forgechain-layer)). `upload_intents` and `blob_parks` are keyed by the blob digest,
+independent of bucket namespace — the disk-side and park-side indexes, shared across whatever
+objects reference the same bytes.
 
 ---
 
