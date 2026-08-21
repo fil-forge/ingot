@@ -9,11 +9,11 @@ require (
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.35
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.107.1
 	github.com/cenkalti/backoff/v5 v5.0.3
-	github.com/fil-forge/hilt v0.0.1-0.20260820122357-7792ca5e7f30
+	github.com/fil-forge/hilt v0.0.1-0.20260821074833-0928688148af
 	github.com/fil-forge/indexing-service v1.13.5-0.20260820151722-9eb620409a4e
 	github.com/fil-forge/libforge v0.0.0-20260807225550-3e6895b41be5
-	github.com/fil-forge/smelt v0.0.0-20260820153251-144191402c87
-	github.com/fil-forge/swarf v0.0.1-0.20260818180033-fabf8b413177
+	github.com/fil-forge/smelt v0.0.0-20260821072816-ab27deb68729
+	github.com/fil-forge/swarf v0.0.1-0.20260821055917-4921bc49627c
 	github.com/fil-forge/ucantone v0.0.0-20260817170631-3a20cd59fabc
 	github.com/fil-forge/versitygw v0.0.0-20260716095011-7a65883d595a
 	github.com/gofiber/fiber/v3 v3.4.0
@@ -132,7 +132,7 @@ require (
 	github.com/jonboulle/clockwork v0.5.0 // indirect
 	github.com/klauspost/compress v1.19.1 // indirect
 	github.com/klauspost/cpuid/v2 v2.4.0 // indirect
-	github.com/lib/pq v0.0.0-20150723085316-0dad96c0b94f // indirect
+	github.com/lib/pq v1.10.9 // indirect
 	github.com/libp2p/go-buffer-pool v0.1.0 // indirect
 	github.com/libp2p/go-libp2p v0.49.0 // indirect
 	github.com/lufia/plan9stats v0.0.0-20260330125221-c963978e514e // indirect
