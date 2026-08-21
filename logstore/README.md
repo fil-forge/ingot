@@ -184,12 +184,12 @@ builds a `uploader.CARShard` from the `Segment` accessors, calls
 
 | Where | Symbols |
 |---|---|
-| `manager.go` | `Manager` (per-bucket log, the production `blockstore.Log`): `OpenManager`, `AppendBatch`, `Get`, `Close`; `QuiesceBucketLog`, `ShippedSegmentDigests`, `RemoveBucketLog` (DeleteBucket's seams) |
+| `manager.go` | `Manager` (per-bucket log, the production `blockstore.Log`): `ManagerConfig`, `OpenManager`, `AppendBatch`, `Get`, `Close`; `QuiesceBucketLog`, `ShippedSegmentDigests`, `RemoveBucketLog` (DeleteBucket's seams) |
 | `store.go` | `Store` (one bucket's catalog log): `Open`, `AppendBatch`, `Get`, `Close` |
 | `planelog.go` | `PlaneLog` (the pipeline): `openPlaneLog`, `Append`, `Get`, `Close`; `sealOpenIfDue`, `flushLoop`, `flushOne`, `runRetention`, `sealTickerLoop` |
 | `segment.go` | `Segment`: `createOpenSegment`, `append`, `seal`, `markShipped`, `retire`, `get`; `.idx`/`.ops` codecs |
 | `recovery.go` | `(*PlaneLog).recover` (disk vs `Meta` reconciliation for one bucket store) |
 | `types.go` | `State`, `SegmentMeta`, `Meta` |
-| `config.go` | `Config`, `ManagerConfig`, `PlaneConfig`, `FlushFunc` |
+| `config.go` | `Config`, `PlaneConfig`, `FlushFunc` |
 | `../server.go` | `newBucketFlushFunc` (per-bucket flush: `uploader.SubmitShard` + location/inclusion rows) |
 | `../uploader/forge.go` | `Uploader`, `CARShard`, `Forge.SubmitShard` |
