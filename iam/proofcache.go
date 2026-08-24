@@ -124,6 +124,14 @@ func keyOf(dlg ucan.Delegation) indexKey {
 	return indexKey{aud: dlg.Audience(), cmd: dlg.Command(), sub: dlg.Subject()}
 }
 
+// Contains reports whether the cache holds a live (unexpired) delegation
+// with this CID. Revocation processing uses it to find which access keys'
+// stores a revoked delegation participates in.
+func (d *DelegationCache) Contains(link cid.Cid) bool {
+	_, ok := d.data.Get(link.String())
+	return ok
+}
+
 // ProofChain assembles the root-first delegation chain granting cmd over sub
 // to aud, from the cached delegations. See [ucanlib.ProofChain].
 func (d *DelegationCache) ProofChain(ctx context.Context, aud did.DID, cmd ucan.Command, sub did.DID) ([]ucan.Delegation, []cid.Cid, error) {

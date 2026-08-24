@@ -65,6 +65,7 @@ type MemStore struct {
 	sessions   map[string]registry.MultipartSession      // keyed by uploadID
 	parts      map[string]map[int]registry.MultipartPart // uploadID -> partNumber -> part
 	gcCands    map[string]struct{}                       // keyed by string(cid)
+	revCursor  *registry.RevocationCursor                // the single revocation_cursor row
 }
 
 // claimKey / locKey are the composite map keys for the blob_refs and the

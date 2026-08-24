@@ -6,6 +6,7 @@ import (
 
 	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/ucantone/ucan"
+	"github.com/ipfs/go-cid"
 	gocache "github.com/patrickmn/go-cache"
 )
 
@@ -57,4 +58,32 @@ func (k *KeyProofs) For(key did.DID) *DelegationCache {
 // Deposit adds delegations to key's proof store.
 func (k *KeyProofs) Deposit(key did.DID, dlgs ...ucan.Delegation) {
 	k.For(key).Add(dlgs...)
+}
+
+// InvalidateHolders drops every per-key proof store holding the delegation
+// with CID link, returning the affected access-key DIDs. Dropping the whole
+// store rather than the one entry is deliberate: a revoked delegation is a
+// hop in every chain the local fast path could assemble for that key, so no
+// partial state is worth keeping — the key's next request falls through to
+// Hilt, which re-authorizes (or, for a deleted key, refuses). A caller
+// already holding the dropped *DelegationCache (an in-flight request) is
+// unaffected; the next For(key) starts a fresh empty store.
+func (k *KeyProofs) InvalidateHolders(link cid.Cid) []did.DID {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	var affected []did.DID
+	// Items() already skips expired entries; expired stores are gone anyway.
+	for id, item := range k.byKey.Items() {
+		dc, ok := item.Object.(*DelegationCache)
+		if !ok || !dc.Contains(link) {
+			continue
+		}
+		key, err := did.Parse(id)
+		if err != nil {
+			continue // unreachable: keys are For(did).String()
+		}
+		k.byKey.Delete(id)
+		affected = append(affected, key)
+	}
+	return affected
 }

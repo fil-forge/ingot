@@ -72,7 +72,7 @@ func TestUp_Live(t *testing.T) {
 		}
 	}
 
-	// blob_encryption_params (00013): every column exists and is NOT NULL — the
+	// blob_encryption_params (00014): every column exists and is NOT NULL — the
 	// presence of a row is what marks a blob as encrypted, so there is no such
 	// thing as a half-populated parameter set.
 	for _, col := range []string{

@@ -1,9 +1,10 @@
 // Package ingot exposes the embedded S3 listener as both a low-level Server type
 // (see server.go) and an fx module (see Module).
 //
-// The S3 protocol layer is provided by github.com/versity/versitygw; the
-// storage backend is the LSM-style log in logstore in front of a Forge-backed
-// read tier, with versitygw -> logstore translation in s3frontend.
+// The S3 protocol layer is provided by github.com/versity/versitygw; object
+// bodies upload to Forge per blob, the catalog journals to the per-bucket log
+// in logstore, and reads fall through to a Forge-backed tier, with the
+// versitygw -> backend translation in s3frontend.
 //
 // # Using ingot as an fx module
 //
@@ -13,9 +14,8 @@
 //   - *zap.Logger
 //   - *pgxpool.Pool          — ingot owns its schema and runs its own goose
 //     migrations against this pool at startup
-//   - ingot.ServiceIdentity   — the host's upload-service signer
-//   - uploader.ProviderSelector — chooses which piri a blob is allocated to;
-//     uploader.NewStaticProviderSelector covers the single home-piri case
+//   - ingot.ServiceIdentity   — the agent signer; issuer of every outbound
+//     invocation
 //
 // Module manages the embedded S3 Server's lifecycle and provides nothing to the
 // host graph. When cfg.Enabled is false it is an empty option, so a host can
@@ -24,14 +24,16 @@
 // # ServerModule: the composable core
 //
 // Module is a thin production wrapper around [ServerModule], which is the
-// reusable core: it consumes a [ServerConfig], a *zap.Logger, and the four
-// collaborator interfaces (registry.Registry, logstore.Meta,
-// blockstore.BlockReader, uploader.Uploader) from the graph, then manages
-// New -> Start -> Stop over the fx lifecycle. Module layers the production
-// providers (Postgres registry, Forge reader/uploader, space signer) and a
-// migration pre-start hook on top. A test harness, by contrast, includes
-// ServerModule directly and supplies in-memory fakes for the same four
-// interfaces — so both paths construct the Server through identical wiring.
+// reusable core: it consumes a [ServerConfig], a *zap.Logger, and the
+// collaborator seams (the registry + store interfaces, logstore.Meta,
+// blockstore.BlockReader, the uploader seams, bucketauthority, and an
+// optional IAM service) from the graph, then manages New -> Start -> Stop
+// over the fx lifecycle. Module layers the production providers (the
+// Postgres registry, the Forge reader, the sprue uploader, the hilt
+// client/IAM) and a migration pre-start hook on top. A test harness, by
+// contrast, includes ServerModule directly and supplies in-memory fakes for
+// the same seams — so both paths construct the Server through identical
+// wiring.
 //
 // # Using ingot without fx
 //
@@ -63,8 +65,10 @@ import (
 	"github.com/fil-forge/ingot/logstore"
 	"github.com/fil-forge/ingot/migrations"
 	"github.com/fil-forge/ingot/registry"
+	"github.com/fil-forge/ingot/revocation"
 	"github.com/fil-forge/ingot/tokenstore"
 	"github.com/fil-forge/ingot/uploader"
+	swarfclient "github.com/fil-forge/swarf/pkg/client"
 )
 
 // ServiceIdentity carries the host's upload-service agent into the module. It
@@ -106,10 +110,21 @@ func Module(cfg config.Config) fx.Option {
 			provideUploader,
 			provideMigrationHook,
 			provideKeyProofs,
+			provideVerificationKeyCache,
 			provideIAMService,
 			fx.Annotate(bucketauthority.New, fx.As(new(bucketauthority.BucketAuthority))),
 		),
 		ServerModule,
+	}
+	if cfg.RevocationServiceURL != "" {
+		// The revocation-firehose consumer is optional: with no revocation
+		// service configured, per-key caches simply age out on their TTLs.
+		// Appended after ServerModule so its OnStart runs after the server's —
+		// whose pre-start migrations create the cursor table it reads.
+		opts = append(opts,
+			fx.Provide(provideRevocationConsumer),
+			fx.Invoke(registerRevocationConsumer),
+		)
 	}
 	return fx.Module("ingot", opts...)
 }
@@ -126,7 +141,7 @@ var ServerModule = fx.Module("ingot-server",
 )
 
 // serverParams are the inputs ServerModule binds the server's start/stop hooks
-// over. The four collaborators are interfaces, so any provider satisfying them
+// over. The collaborators are interfaces, so any provider satisfying them
 // (production's Postgres + Forge, or a harness's in-memory fakes) wires in.
 type serverParams struct {
 	fx.In
@@ -280,15 +295,74 @@ func provideKeyProofs() *iam.KeyProofs {
 	return iam.NewKeyProofs()
 }
 
+// provideVerificationKeyCache is the derived-SigV4-key cache shared by the
+// IAM fast path (which fills and reads it) and the revocation consumer
+// (which clears a revoked key's entries).
+func provideVerificationKeyCache() *iam.VerificationKeyCache {
+	return iam.NewVerificationKeyCache()
+}
+
 // provideIAMService adapts the hilt client to versitygw's IAM seam: a request
 // signed with a non-root access key is authorized locally when the caches
 // hold its verification key + covering delegation chains, else by Hilt's
 // /s3/request/authorize — whose response replenishes the caches. Either way
 // the gateway verifies the signature with the derived key.
-func provideIAMService(c *hiltclient.Client, proofs *iam.KeyProofs, reg registry.Registry, id ServiceIdentity, logger *zap.Logger) auth.IAMService {
-	return iam.New(c, proofs, iam.NewVerificationKeyCache(),
+func provideIAMService(c *hiltclient.Client, proofs *iam.KeyProofs, keys *iam.VerificationKeyCache, reg registry.Registry, id ServiceIdentity, logger *zap.Logger) auth.IAMService {
+	return iam.New(c, proofs, keys,
 		iam.WithLocalAuthorization(id.Signer.DID(), reg),
 		iam.WithLogger(logger))
+}
+
+// provideRevocationConsumer builds the revocation-firehose consumer: the
+// swarf client streams revocation records, the postgres cursor store
+// persists the resume point, and iam.Revoker clears the per-access-key
+// caches a revoked delegation participates in.
+func provideRevocationConsumer(cfg config.Config, cursors registry.RevocationCursorStore,
+	proofs *iam.KeyProofs, keys *iam.VerificationKeyCache, logger *zap.Logger) (*revocation.Consumer, error) {
+	revURL, err := url.Parse(cfg.RevocationServiceURL)
+	if err != nil {
+		return nil, fmt.Errorf("ingot: parse revocation_service_url: %w", err)
+	}
+	revDID, err := did.Parse(cfg.RevocationServiceDID)
+	if err != nil {
+		return nil, fmt.Errorf("ingot: parse revocation_service_did: %w", err)
+	}
+	src, err := swarfclient.New(revDID, *revURL)
+	if err != nil {
+		return nil, fmt.Errorf("ingot: revocation service client: %w", err)
+	}
+	return revocation.NewConsumer(src, cursors, iam.NewRevoker(proofs, keys, logger),
+		revocation.WithLogger(logger)), nil
+}
+
+// registerRevocationConsumer runs the consumer for the app's lifetime:
+// OnStart spawns Run on a cancelable context, OnStop cancels and joins it.
+func registerRevocationConsumer(lc fx.Lifecycle, c *revocation.Consumer) {
+	var cancel context.CancelFunc
+	done := make(chan struct{})
+	lc.Append(fx.Hook{
+		OnStart: func(context.Context) error {
+			var ctx context.Context
+			ctx, cancel = context.WithCancel(context.Background())
+			go func() {
+				defer close(done)
+				c.Run(ctx)
+			}()
+			return nil
+		},
+		OnStop: func(ctx context.Context) error {
+			if cancel == nil {
+				return nil
+			}
+			cancel()
+			select {
+			case <-done:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		},
+	})
 }
 
 // registryResult exposes the one *registry.Postgres as both collaborator
@@ -298,15 +372,16 @@ func provideIAMService(c *hiltclient.Client, proofs *iam.KeyProofs, reg registry
 type registryResult struct {
 	fx.Out
 
-	Registry   registry.Registry
-	Intents    registry.IntentStore
-	Locations  registry.LocationStore
-	Inclusions registry.InclusionStore
-	BlobRefs   registry.BlobRefStore
-	GC         registry.GCStore
-	Multipart  registry.MultipartStore
-	Parks      registry.ParkStore
-	Meta       logstore.Meta
+	Registry          registry.Registry
+	Intents           registry.IntentStore
+	Locations         registry.LocationStore
+	Inclusions        registry.InclusionStore
+	BlobRefs          registry.BlobRefStore
+	GC                registry.GCStore
+	Multipart         registry.MultipartStore
+	Parks             registry.ParkStore
+	RevocationCursors registry.RevocationCursorStore
+	Meta              logstore.Meta
 }
 
 // provideRegistry wraps the host's pool in the postgres-backed registry and
@@ -318,7 +393,7 @@ type registryResult struct {
 // needs hilt_url/hilt_did configured.
 func provideRegistry(pool *pgxpool.Pool) registryResult {
 	pg := registry.NewPostgres(pool)
-	return registryResult{Registry: pg, Intents: pg, Locations: pg, Inclusions: pg, BlobRefs: pg, GC: pg, Multipart: pg, Parks: pg, Meta: pg}
+	return registryResult{Registry: pg, Intents: pg, Locations: pg, Inclusions: pg, BlobRefs: pg, GC: pg, Multipart: pg, Parks: pg, RevocationCursors: pg, Meta: pg}
 }
 
 // migrationHookOut feeds the migration PreStartHook into the "ingot_prestart"

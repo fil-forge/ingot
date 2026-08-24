@@ -75,6 +75,14 @@ type Config struct {
 	// Optional; when empty the client sends invocations with no proofs (Hilt
 	// may authorize registered provider DIDs directly).
 	AuthServiceProofs string `mapstructure:"auth_service_proofs" yaml:"auth_service_proofs"`
+	// RevocationServiceURL / RevocationServiceDID address the UCAN revocation
+	// service (Swarf): ingot subscribes to its revocation firehose so that
+	// Hilt's access-key deletions (published as UCAN revocations) clear the
+	// per-key authorization caches. Optional; when unset the firehose consumer
+	// is not started and cache entries age out on their own TTLs. Set both or
+	// neither.
+	RevocationServiceURL string `mapstructure:"revocation_service_url" yaml:"revocation_service_url"`
+	RevocationServiceDID string `mapstructure:"revocation_service_did" yaml:"revocation_service_did"`
 
 	// MultipartSessionTTL bounds abandoned multipart uploads (Go duration
 	// string, e.g. "168h"): open sessions older than this are aborted by a
@@ -295,6 +303,9 @@ func (c *Config) Validate() error {
 		if _, err := LoadProofsContainer(c.AuthServiceProofs); err != nil {
 			errs = multierr.Append(errs, fmt.Errorf("auth_service_proofs: %w", err))
 		}
+	}
+	if (c.RevocationServiceURL == "") != (c.RevocationServiceDID == "") {
+		errs = multierr.Append(errs, errors.New("revocation_service_url and revocation_service_did must be set together"))
 	}
 
 	if errs != nil {

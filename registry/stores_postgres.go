@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/fil-forge/ucantone/did"
+	"github.com/ipfs/go-cid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )
@@ -21,6 +22,7 @@ var (
 	_ InclusionStore        = (*Postgres)(nil)
 	_ MultipartStore        = (*Postgres)(nil)
 	_ GCStore               = (*Postgres)(nil)
+	_ RevocationCursorStore = (*Postgres)(nil)
 )
 
 // BlobRefStore ===============================================================
@@ -536,6 +538,41 @@ func (r *Postgres) AddGCCandidate(ctx context.Context, cidBytes []byte, bucket s
 		cidBytes, nullString(bucket))
 	if err != nil {
 		return fmt.Errorf("registry: add gc candidate: %w", err)
+	}
+	return nil
+}
+
+// RevocationCursorStore ======================================================
+
+func (r *Postgres) GetRevocationCursor(ctx context.Context) (*RevocationCursor, error) {
+	var cur RevocationCursor
+	var revoke []byte
+	err := r.pool.QueryRow(ctx,
+		`SELECT recorded_at, revoke FROM ingot.revocation_cursor WHERE id`).
+		Scan(&cur.RecordedAt, &revoke)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("registry: get revocation cursor: %w", err)
+	}
+	if cur.Revoke, err = cid.Cast(revoke); err != nil {
+		return nil, fmt.Errorf("registry: get revocation cursor: decode revoke cid: %w", err)
+	}
+	return &cur, nil
+}
+
+func (r *Postgres) PutRevocationCursor(ctx context.Context, cur RevocationCursor) error {
+	_, err := r.pool.Exec(ctx,
+		`INSERT INTO ingot.revocation_cursor (id, recorded_at, revoke)
+		 VALUES (true, $1, $2)
+		 ON CONFLICT (id) DO UPDATE
+		   SET recorded_at = EXCLUDED.recorded_at,
+		       revoke      = EXCLUDED.revoke,
+		       updated_at  = now()`,
+		cur.RecordedAt, cur.Revoke.Bytes())
+	if err != nil {
+		return fmt.Errorf("registry: put revocation cursor: %w", err)
 	}
 	return nil
 }

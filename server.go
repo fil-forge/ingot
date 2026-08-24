@@ -266,8 +266,8 @@ func (s *Server) Stop(ctx context.Context) error {
 	return nil
 }
 
-// newPlaneFlushFunc builds the logstore flush callback for ONE plane:
-// it ships that plane's sealed CAR to Forge via uploader.SubmitShard,
+// newBucketFlushFunc builds the logstore flush callback for one bucket's
+// log: it ships a sealed catalog CAR to Forge via uploader.SubmitShard,
 // then records the shard's location and every inner block's byte range
 // in the local location/inclusion tables (the appliance mirror of the
 // sharded-dag-index SubmitShard publishes). The store owns the
