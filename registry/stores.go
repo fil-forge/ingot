@@ -12,6 +12,7 @@ import (
 // architecture relies on (docs/architecture.md §5–§7, Appendix C):
 // the reverse reference index (blob_refs), the local-store index
 // (upload_intents), the local blob-location table (blob_locations), the
+// per-blob FEE encryption parameters (blob_encryption_params), the
 // multipart session/part tables, and the gc_candidates log. The stores
 // are split into focused interfaces so a caller can depend on only what
 // it needs; *Postgres and *inmem.MemStore satisfy all of them.
@@ -76,6 +77,45 @@ type BlobLocation struct {
 	Provider string
 	URL      string
 	Size     int64
+}
+
+// BlobEncryptionParams is one row of ingot.blob_encryption_params: the FEE
+// (Filecoin Encryption Envelope) parameters a read needs to decrypt an
+// encrypted blob, keyed by (Space, Digest) like the blob's location.
+//
+// An encrypted body blob is an independent COSE/STREAM ciphertext envelope.
+// These are the cached inputs a (range) GET's decryptor needs, so a read
+// unwraps the CEK and goes straight to a body-range fetch with no COSE
+// envelope-header round-trip. Existence of the row is what marks a blob as
+// encrypted: every field is required, and an unencrypted blob simply has no row
+// (see EncryptionParamsStore). A fresh CEK per encryption event makes every
+// ciphertext digest unique to one encryption, so these parameters are a 1:1
+// fact about the blob.
+//
+// Only what the region-KEK read path needs is cached. The COSE recipients,
+// including the tenant wrap key the insurance-recovery unwrap uses, stay in the
+// envelope header: that path is rare and out-of-band, and it reads the header
+// anyway. No key material is stored here either — the wrapped CEK and its
+// region-KEK version live in OpenBao. See docs/architecture.md §8.
+type BlobEncryptionParams struct {
+	Space  did.DID
+	Digest []byte
+
+	// HeaderLen is the encoded length of the blob's COSE envelope, and so the
+	// offset at which its ciphertext begins. Without it a read could not locate
+	// byte 0 of the ciphertext without decoding the header.
+	HeaderLen int64
+	// BaseNonce is the COSE iv: the STREAM nonce seed for this blob's ciphertext.
+	BaseNonce []byte
+	// ChunkSize is the FEE chunk size written into the COSE protected header,
+	// cached so the read path need not fetch and decode the envelope header.
+	ChunkSize int64
+	// AAD is the envelope's COSE Enc_structure — the additional authenticated
+	// data bound into every chunk's GCM tag. Stored whole rather than as the
+	// protected header because the Enc_structure's context string differs
+	// between a COSE_Encrypt and a COSE_Encrypt0, which a bare row cannot
+	// record. The protected header remains recoverable from it as element 1.
+	AAD []byte
 }
 
 // BlobInclusion is one row of ingot.shard_inclusions: block Digest lives at
@@ -177,6 +217,27 @@ type LocationStore interface {
 	PutLocation(ctx context.Context, loc BlobLocation) error
 	GetLocation(ctx context.Context, space did.DID, digest []byte) (*BlobLocation, error)
 	DeleteLocation(ctx context.Context, space did.DID, digest []byte) error
+}
+
+// EncryptionParamsStore is the per-blob FEE encryption-parameter table
+// (blob_encryption_params): what a read needs to decrypt an encrypted blob
+// without fetching its envelope header. A blob has a row only when it is
+// encrypted, so GetEncryptionParams returning ErrNotFound is the answer "this
+// blob is stored as plaintext".
+//
+// It is deliberately separate from LocationStore, with no foreign key between
+// the tables: the row's existence is what marks a blob as encrypted, so its
+// lifecycle is independent of the reconstructible location cache. No key
+// material lives here — the wrapped CEK sits in OpenBao, so per-blob
+// crypto-shred means deleting the key there; Delete only drops the cached
+// decrypt parameters. Put is an upsert, so re-encrypting a blob replaces its
+// whole parameter set. Delete is idempotent — and because nothing cascades,
+// DeleteLocation does NOT touch this table: a caller removing a blob must
+// call both.
+type EncryptionParamsStore interface {
+	PutEncryptionParams(ctx context.Context, params BlobEncryptionParams) error
+	GetEncryptionParams(ctx context.Context, space did.DID, digest []byte) (*BlobEncryptionParams, error)
+	DeleteEncryptionParams(ctx context.Context, space did.DID, digest []byte) error
 }
 
 // BlobPark is one row of ingot.blob_parks: the persistable state of a blob

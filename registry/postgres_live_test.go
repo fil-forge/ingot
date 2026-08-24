@@ -2,7 +2,9 @@ package registry_test
 
 import (
 	"context"
+	"errors"
 	"os"
+	"reflect"
 	"testing"
 	"time"
 
@@ -50,8 +52,8 @@ func TestPostgresStores_Live(t *testing.T) {
 	}
 	if _, err := pool.Exec(ctx,
 		`TRUNCATE ingot.blob_refs, ingot.upload_intents, ingot.blob_locations,
-		 ingot.multipart_sessions, ingot.multipart_parts, ingot.gc_candidates, ingot.buckets,
-		 ingot.revocation_cursor CASCADE`); err != nil {
+		 ingot.blob_encryption_params, ingot.multipart_sessions, ingot.multipart_parts,
+		 ingot.gc_candidates, ingot.buckets, ingot.revocation_cursor CASCADE`); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
 
@@ -153,6 +155,83 @@ func TestPostgresStores_Live(t *testing.T) {
 		}
 		if _, err := r.GetLocation(ctx, space, digest); err != registry.ErrNotFound {
 			t.Fatalf("GetLocation after delete = %v, want ErrNotFound", err)
+		}
+	})
+
+	// liveFEEParams is a complete parameter set whose bytea values carry
+	// embedded NULs and high bytes, to exercise real byte round-trips.
+	liveFEEParams := func(space did.DID, d []byte) registry.BlobEncryptionParams {
+		return registry.BlobEncryptionParams{
+			Space:     space,
+			Digest:    d,
+			HeaderLen: 212,
+			BaseNonce: []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07},
+			ChunkSize: 65536,
+			AAD:       []byte{0xa1, 0x00, 0x18, 0x20},
+		}
+	}
+
+	t.Run("encryption params round trip", func(t *testing.T) {
+		space := testutil.RandomDID(t)
+		encDigest := []byte{0x00, 0x01, 0x02, 0xff}
+		want := liveFEEParams(space, encDigest)
+		if err := r.PutEncryptionParams(ctx, want); err != nil {
+			t.Fatalf("PutEncryptionParams: %v", err)
+		}
+		got, err := r.GetEncryptionParams(ctx, space, encDigest)
+		if err != nil {
+			t.Fatalf("GetEncryptionParams: %v", err)
+		}
+		if !reflect.DeepEqual(*got, want) {
+			t.Fatalf("GetEncryptionParams = %+v, want %+v", *got, want)
+		}
+	})
+
+	t.Run("encryption params delete removes the row", func(t *testing.T) {
+		space := testutil.RandomDID(t)
+		encDigest := []byte{0x05, 0x06}
+		if err := r.PutEncryptionParams(ctx, liveFEEParams(space, encDigest)); err != nil {
+			t.Fatalf("PutEncryptionParams: %v", err)
+		}
+		if err := r.DeleteEncryptionParams(ctx, space, encDigest); err != nil {
+			t.Fatalf("DeleteEncryptionParams: %v", err)
+		}
+		if _, err := r.GetEncryptionParams(ctx, space, encDigest); !errors.Is(err, registry.ErrNotFound) {
+			t.Fatalf("GetEncryptionParams after delete = %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("incomplete encryption params rejected", func(t *testing.T) {
+		// The column constraints are the invariant: a half-populated set never
+		// reaches the table.
+		space := testutil.RandomDID(t)
+		d := []byte{0x77}
+		partial := liveFEEParams(space, d)
+		partial.AAD = nil
+		if err := r.PutEncryptionParams(ctx, partial); err == nil {
+			t.Fatal("PutEncryptionParams(partial) = nil, want a constraint error")
+		}
+		if _, err := r.GetEncryptionParams(ctx, space, d); !errors.Is(err, registry.ErrNotFound) {
+			t.Fatalf("incomplete params leaked a row: %v", err)
+		}
+	})
+
+	t.Run("encryption params independent of location", func(t *testing.T) {
+		// No foreign key and no cascade: the params outlive their location row,
+		// so a caller removing a blob must delete from both tables.
+		space := testutil.RandomDID(t)
+		encDigest := []byte{0x08, 0x09}
+		if err := r.PutEncryptionParams(ctx, liveFEEParams(space, encDigest)); err != nil {
+			t.Fatalf("PutEncryptionParams: %v", err)
+		}
+		if err := r.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: encDigest, Provider: "did:piri", URL: "http://piri/enc", Size: 4096}); err != nil {
+			t.Fatalf("PutLocation: %v", err)
+		}
+		if err := r.DeleteLocation(ctx, space, encDigest); err != nil {
+			t.Fatalf("DeleteLocation: %v", err)
+		}
+		if _, err := r.GetEncryptionParams(ctx, space, encDigest); err != nil {
+			t.Fatalf("DeleteLocation shredded the encryption params: %v", err)
 		}
 	})
 

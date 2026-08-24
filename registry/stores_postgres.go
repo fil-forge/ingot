@@ -18,6 +18,7 @@ var (
 	_ BlobRefStore          = (*Postgres)(nil)
 	_ IntentStore           = (*Postgres)(nil)
 	_ LocationStore         = (*Postgres)(nil)
+	_ EncryptionParamsStore = (*Postgres)(nil)
 	_ InclusionStore        = (*Postgres)(nil)
 	_ MultipartStore        = (*Postgres)(nil)
 	_ GCStore               = (*Postgres)(nil)
@@ -163,7 +164,8 @@ func (r *Postgres) PutLocation(ctx context.Context, loc BlobLocation) error {
 func (r *Postgres) GetLocation(ctx context.Context, space did.DID, digest []byte) (*BlobLocation, error) {
 	loc := &BlobLocation{Space: space, Digest: digest}
 	err := r.pool.QueryRow(ctx,
-		`SELECT provider, url, size FROM ingot.blob_locations WHERE space = $1 AND digest = $2`,
+		`SELECT provider, url, size
+		 FROM ingot.blob_locations WHERE space = $1 AND digest = $2`,
 		space, digest).Scan(&loc.Provider, &loc.URL, &loc.Size)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
@@ -179,6 +181,54 @@ func (r *Postgres) DeleteLocation(ctx context.Context, space did.DID, digest []b
 		`DELETE FROM ingot.blob_locations WHERE space = $1 AND digest = $2`, space, digest)
 	if err != nil {
 		return fmt.Errorf("registry: delete location: %w", err)
+	}
+	return nil
+}
+
+// EncryptionParamsStore ======================================================
+
+func (r *Postgres) PutEncryptionParams(ctx context.Context, params BlobEncryptionParams) error {
+	// Upsert: a re-encryption replaces the parameter set for a blob already
+	// stored. Every column is NOT NULL with a CHECK, so an incomplete set is
+	// rejected by the constraint rather than by a second check here.
+	_, err := r.pool.Exec(ctx,
+		`INSERT INTO ingot.blob_encryption_params
+		   (space, digest, header_len, base_nonce, chunk_size, aad)
+		 VALUES ($1, $2, $3, $4, $5, $6)
+		 ON CONFLICT (space, digest) DO UPDATE
+		   SET header_len = EXCLUDED.header_len,
+		       base_nonce = EXCLUDED.base_nonce,
+		       chunk_size = EXCLUDED.chunk_size,
+		       aad        = EXCLUDED.aad`,
+		params.Space, params.Digest,
+		params.HeaderLen, params.BaseNonce, params.ChunkSize, params.AAD)
+	if err != nil {
+		return fmt.Errorf("registry: put encryption params: %w", err)
+	}
+	return nil
+}
+
+func (r *Postgres) GetEncryptionParams(ctx context.Context, space did.DID, digest []byte) (*BlobEncryptionParams, error) {
+	params := &BlobEncryptionParams{Space: space, Digest: digest}
+	err := r.pool.QueryRow(ctx,
+		`SELECT header_len, base_nonce, chunk_size, aad
+		 FROM ingot.blob_encryption_params WHERE space = $1 AND digest = $2`,
+		space, digest).Scan(&params.HeaderLen, &params.BaseNonce,
+		&params.ChunkSize, &params.AAD)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("registry: get encryption params: %w", err)
+	}
+	return params, nil
+}
+
+func (r *Postgres) DeleteEncryptionParams(ctx context.Context, space did.DID, digest []byte) error {
+	_, err := r.pool.Exec(ctx,
+		`DELETE FROM ingot.blob_encryption_params WHERE space = $1 AND digest = $2`, space, digest)
+	if err != nil {
+		return fmt.Errorf("registry: delete encryption params: %w", err)
 	}
 	return nil
 }

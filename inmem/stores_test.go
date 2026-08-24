@@ -2,6 +2,8 @@ package inmem
 
 import (
 	"context"
+	"errors"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -251,6 +253,130 @@ func TestLocations_RoundTrip(t *testing.T) {
 	}
 	if _, err := m.GetLocation(ctx, space, digest); err != registry.ErrNotFound {
 		t.Fatalf("GetLocation after delete err = %v, want ErrNotFound", err)
+	}
+}
+
+// feeParams returns a complete parameter set for space/digest, the shape a FEE
+// envelope's row takes.
+func feeParams(space did.DID, digest []byte) registry.BlobEncryptionParams {
+	return registry.BlobEncryptionParams{
+		Space:     space,
+		Digest:    digest,
+		HeaderLen: 212,
+		BaseNonce: []byte("nonce07"),
+		ChunkSize: 65536,
+		AAD:       []byte("cose-enc-structure"),
+	}
+}
+
+func TestEncryptionParams_RoundTrip(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+	space := testutil.RandomDID(t)
+	digest := []byte("enc-digest")
+	want := feeParams(space, digest)
+
+	if err := m.PutEncryptionParams(ctx, want); err != nil {
+		t.Fatalf("PutEncryptionParams: %v", err)
+	}
+	got, err := m.GetEncryptionParams(ctx, space, digest)
+	if err != nil {
+		t.Fatalf("GetEncryptionParams: %v", err)
+	}
+	if !reflect.DeepEqual(*got, want) {
+		t.Fatalf("GetEncryptionParams = %+v, want %+v", *got, want)
+	}
+}
+
+// A blob with no row is a plaintext blob, which is how the read path learns not
+// to decrypt.
+func TestEncryptionParams_MissingIsNotFound(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+
+	_, err := m.GetEncryptionParams(ctx, testutil.RandomDID(t), []byte("absent"))
+	if !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("GetEncryptionParams err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestEncryptionParams_DeleteRemovesRow(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+	space := testutil.RandomDID(t)
+	digest := []byte("enc-digest")
+	if err := m.PutEncryptionParams(ctx, feeParams(space, digest)); err != nil {
+		t.Fatalf("PutEncryptionParams: %v", err)
+	}
+
+	if err := m.DeleteEncryptionParams(ctx, space, digest); err != nil {
+		t.Fatalf("DeleteEncryptionParams: %v", err)
+	}
+	if _, err := m.GetEncryptionParams(ctx, space, digest); !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("GetEncryptionParams after delete err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestEncryptionParams_DeleteIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+
+	if err := m.DeleteEncryptionParams(ctx, testutil.RandomDID(t), []byte("absent")); err != nil {
+		t.Fatalf("DeleteEncryptionParams(absent): %v", err)
+	}
+}
+
+// The store must not alias the caller's byte slices, nor let a caller reach
+// back into it through a returned copy.
+func TestEncryptionParams_NoSliceAliasing(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+	space := testutil.RandomDID(t)
+	digest := []byte("enc-digest")
+	params := feeParams(space, digest)
+
+	if err := m.PutEncryptionParams(ctx, params); err != nil {
+		t.Fatalf("PutEncryptionParams: %v", err)
+	}
+	params.BaseNonce[0] = 'X'
+	params.AAD[0] = 'X'
+
+	got, err := m.GetEncryptionParams(ctx, space, digest)
+	if err != nil {
+		t.Fatalf("GetEncryptionParams: %v", err)
+	}
+	got.BaseNonce[0] = 'Y'
+
+	again, err := m.GetEncryptionParams(ctx, space, digest)
+	if err != nil {
+		t.Fatalf("GetEncryptionParams (again): %v", err)
+	}
+	if !reflect.DeepEqual(*again, feeParams(space, digest)) {
+		t.Fatalf("stored params were aliased: %+v", *again)
+	}
+}
+
+// The two tables have independent lifecycles and no cascade between them:
+// deleting a location leaves the encryption parameters in place, which is why a
+// caller removing a blob must delete both.
+func TestEncryptionParams_IndependentOfLocation(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+	space := testutil.RandomDID(t)
+	digest := []byte("enc-digest")
+	if err := m.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: digest, Provider: "did:piri:1", URL: "http://piri/enc", Size: 4096}); err != nil {
+		t.Fatalf("PutLocation: %v", err)
+	}
+	if err := m.PutEncryptionParams(ctx, feeParams(space, digest)); err != nil {
+		t.Fatalf("PutEncryptionParams: %v", err)
+	}
+
+	if err := m.DeleteLocation(ctx, space, digest); err != nil {
+		t.Fatalf("DeleteLocation: %v", err)
+	}
+
+	if _, err := m.GetEncryptionParams(ctx, space, digest); err != nil {
+		t.Fatalf("DeleteLocation shredded the encryption params: %v", err)
 	}
 }
 

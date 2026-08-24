@@ -59,6 +59,7 @@ type MemStore struct {
 	blobRefs   map[claimKey]registry.BlobClaim
 	intents    map[string]registry.UploadIntent          // keyed by string(digest)
 	locations  map[locKey]registry.BlobLocation          // keyed by (space, digest)
+	encParams  map[locKey]registry.BlobEncryptionParams  // keyed by (space, digest)
 	inclusions map[locKey]registry.BlobInclusion         // keyed by (space, digest)
 	parks      map[string]registry.BlobPark              // keyed by string(digest)
 	sessions   map[string]registry.MultipartSession      // keyed by uploadID
@@ -67,8 +68,9 @@ type MemStore struct {
 	revCursor  *registry.RevocationCursor                // the single revocation_cursor row
 }
 
-// claimKey / locKey are the composite map keys for the blob_refs and
-// blob_locations tables (digest bytes carried as a string for comparability).
+// claimKey / locKey are the composite map keys for the blob_refs and the
+// (space, digest)-keyed tables — blob_locations, blob_encryption_params and
+// shard_inclusions (digest bytes carried as a string for comparability).
 type claimKey struct {
 	digest, bucket, objectKey, versionID string
 }
@@ -87,6 +89,7 @@ func NewMemStore() *MemStore {
 		blobRefs:   map[claimKey]registry.BlobClaim{},
 		intents:    map[string]registry.UploadIntent{},
 		locations:  map[locKey]registry.BlobLocation{},
+		encParams:  map[locKey]registry.BlobEncryptionParams{},
 		inclusions: map[locKey]registry.BlobInclusion{},
 		parks:      map[string]registry.BlobPark{},
 		sessions:   map[string]registry.MultipartSession{},
