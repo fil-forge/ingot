@@ -188,23 +188,19 @@ func (r *Postgres) DeleteLocation(ctx context.Context, space did.DID, digest []b
 // EncryptionParamsStore ======================================================
 
 func (r *Postgres) PutEncryptionParams(ctx context.Context, params BlobEncryptionParams) error {
-	// Every column is NOT NULL, so reject an incomplete set with a named error
-	// rather than a constraint violation (see BlobEncryptionParams.Validate).
-	if err := params.Validate(); err != nil {
-		return err
-	}
-	// Upsert: a re-encryption replaces the parameter set for a blob already stored.
+	// Upsert: a re-encryption replaces the parameter set for a blob already
+	// stored. Every column is NOT NULL with a CHECK, so an incomplete set is
+	// rejected by the constraint rather than by a second check here.
 	_, err := r.pool.Exec(ctx,
 		`INSERT INTO ingot.blob_encryption_params
-		   (space, digest, tenant_recipient_kid, header_len, base_nonce, chunk_size, aad)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7)
+		   (space, digest, header_len, base_nonce, chunk_size, aad)
+		 VALUES ($1, $2, $3, $4, $5, $6)
 		 ON CONFLICT (space, digest) DO UPDATE
-		   SET tenant_recipient_kid = EXCLUDED.tenant_recipient_kid,
-		       header_len           = EXCLUDED.header_len,
-		       base_nonce           = EXCLUDED.base_nonce,
-		       chunk_size           = EXCLUDED.chunk_size,
-		       aad                  = EXCLUDED.aad`,
-		params.Space, params.Digest, params.TenantRecipientKID,
+		   SET header_len = EXCLUDED.header_len,
+		       base_nonce = EXCLUDED.base_nonce,
+		       chunk_size = EXCLUDED.chunk_size,
+		       aad        = EXCLUDED.aad`,
+		params.Space, params.Digest,
 		params.HeaderLen, params.BaseNonce, params.ChunkSize, params.AAD)
 	if err != nil {
 		return fmt.Errorf("registry: put encryption params: %w", err)
@@ -215,10 +211,10 @@ func (r *Postgres) PutEncryptionParams(ctx context.Context, params BlobEncryptio
 func (r *Postgres) GetEncryptionParams(ctx context.Context, space did.DID, digest []byte) (*BlobEncryptionParams, error) {
 	params := &BlobEncryptionParams{Space: space, Digest: digest}
 	err := r.pool.QueryRow(ctx,
-		`SELECT tenant_recipient_kid, header_len, base_nonce, chunk_size, aad
+		`SELECT header_len, base_nonce, chunk_size, aad
 		 FROM ingot.blob_encryption_params WHERE space = $1 AND digest = $2`,
-		space, digest).Scan(&params.TenantRecipientKID, &params.HeaderLen,
-		&params.BaseNonce, &params.ChunkSize, &params.AAD)
+		space, digest).Scan(&params.HeaderLen, &params.BaseNonce,
+		&params.ChunkSize, &params.AAD)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}

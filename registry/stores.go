@@ -2,9 +2,6 @@ package registry
 
 import (
 	"context"
-	"errors"
-	"fmt"
-	"strings"
 	"time"
 
 	"github.com/fil-forge/ucantone/did"
@@ -83,8 +80,8 @@ type BlobLocation struct {
 }
 
 // BlobEncryptionParams is one row of ingot.blob_encryption_params: the FEE
-// (FilOne encryption envelope) parameters a read needs to decrypt an encrypted
-// blob, keyed by (Space, Digest) like the blob's location.
+// (Filecoin Encryption Envelope) parameters a read needs to decrypt an
+// encrypted blob, keyed by (Space, Digest) like the blob's location.
 //
 // An encrypted body blob is an independent COSE/STREAM ciphertext envelope.
 // These are the cached inputs a (range) GET's decryptor needs, so a read
@@ -93,16 +90,17 @@ type BlobLocation struct {
 // encrypted: every field is required, and an unencrypted blob simply has no row
 // (see EncryptionParamsStore). A fresh CEK per encryption event makes every
 // ciphertext digest unique to one encryption, so these parameters are a 1:1
-// fact about the blob. No key material is stored here: the wrapped CEK and its
-// region-KEK version live in OpenBao. See docs/architecture.md §8 and FIL-480.
+// fact about the blob.
+//
+// Only what the region-KEK read path needs is cached. The COSE recipients,
+// including the tenant wrap key the insurance-recovery unwrap uses, stay in the
+// envelope header: that path is rare and out-of-band, and it reads the header
+// anyway. No key material is stored here either — the wrapped CEK and its
+// region-KEK version live in OpenBao. See docs/architecture.md §8.
 type BlobEncryptionParams struct {
 	Space  did.DID
 	Digest []byte
 
-	// TenantRecipientKID identifies the Hilt wrap key used for insurance-recovery
-	// unwrap. Opaque, so it is agnostic to the tenant-vs-bucket granularity
-	// decision (FIL-574).
-	TenantRecipientKID string
 	// HeaderLen is the encoded length of the blob's COSE envelope, and so the
 	// offset at which its ciphertext begins. Without it a read could not locate
 	// byte 0 of the ciphertext without decoding the header.
@@ -118,40 +116,6 @@ type BlobEncryptionParams struct {
 	// between a COSE_Encrypt and a COSE_Encrypt0, which a bare row cannot
 	// record. The protected header remains recoverable from it as element 1.
 	AAD []byte
-}
-
-// ErrInvalidEncryptionParams is returned by PutEncryptionParams when a
-// BlobEncryptionParams is missing a field — a row the decrypt path could not
-// use.
-var ErrInvalidEncryptionParams = errors.New("registry: invalid blob encryption params")
-
-// Validate enforces that every encryption parameter is present: non-empty byte
-// slices and identifiers, and positive HeaderLen/ChunkSize. A partial set — e.g.
-// an AAD with no nonce, or an empty (non-nil) byte slice standing in for a real
-// value — would persist a row a later GET cannot decrypt, so
-// PutEncryptionParams rejects it before touching the store.
-func (p BlobEncryptionParams) Validate() error {
-	var missing []string
-	for _, f := range []struct {
-		name    string
-		present bool
-	}{
-		{"space", p.Space.String() != ""},
-		{"digest", len(p.Digest) > 0},
-		{"tenant_recipient_kid", p.TenantRecipientKID != ""},
-		{"header_len", p.HeaderLen > 0},
-		{"base_nonce", len(p.BaseNonce) > 0},
-		{"chunk_size", p.ChunkSize > 0},
-		{"aad", len(p.AAD) > 0},
-	} {
-		if !f.present {
-			missing = append(missing, f.name)
-		}
-	}
-	if len(missing) > 0 {
-		return fmt.Errorf("%w: missing %s", ErrInvalidEncryptionParams, strings.Join(missing, ", "))
-	}
-	return nil
 }
 
 // BlobInclusion is one row of ingot.shard_inclusions: block Digest lives at

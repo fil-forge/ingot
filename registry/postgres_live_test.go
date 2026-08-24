@@ -162,13 +162,12 @@ func TestPostgresStores_Live(t *testing.T) {
 	// embedded NULs and high bytes, to exercise real byte round-trips.
 	liveFEEParams := func(space did.DID, d []byte) registry.BlobEncryptionParams {
 		return registry.BlobEncryptionParams{
-			Space:              space,
-			Digest:             d,
-			TenantRecipientKID: "did:key:tenant#wrap",
-			HeaderLen:          212,
-			BaseNonce:          []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07},
-			ChunkSize:          65536,
-			AAD:                []byte{0xa1, 0x00, 0x18, 0x20},
+			Space:     space,
+			Digest:    d,
+			HeaderLen: 212,
+			BaseNonce: []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07},
+			ChunkSize: 65536,
+			AAD:       []byte{0xa1, 0x00, 0x18, 0x20},
 		}
 	}
 
@@ -203,13 +202,14 @@ func TestPostgresStores_Live(t *testing.T) {
 	})
 
 	t.Run("incomplete encryption params rejected", func(t *testing.T) {
-		// Rejected in Go, so the NOT NULL constraints are never reached.
+		// The column constraints are the invariant: a half-populated set never
+		// reaches the table.
 		space := testutil.RandomDID(t)
 		d := []byte{0x77}
 		partial := liveFEEParams(space, d)
 		partial.AAD = nil
-		if err := r.PutEncryptionParams(ctx, partial); !errors.Is(err, registry.ErrInvalidEncryptionParams) {
-			t.Fatalf("PutEncryptionParams(partial) = %v, want ErrInvalidEncryptionParams", err)
+		if err := r.PutEncryptionParams(ctx, partial); err == nil {
+			t.Fatal("PutEncryptionParams(partial) = nil, want a constraint error")
 		}
 		if _, err := r.GetEncryptionParams(ctx, space, d); !errors.Is(err, registry.ErrNotFound) {
 			t.Fatalf("incomplete params leaked a row: %v", err)

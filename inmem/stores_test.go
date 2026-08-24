@@ -260,13 +260,12 @@ func TestLocations_RoundTrip(t *testing.T) {
 // envelope's row takes.
 func feeParams(space did.DID, digest []byte) registry.BlobEncryptionParams {
 	return registry.BlobEncryptionParams{
-		Space:              space,
-		Digest:             digest,
-		TenantRecipientKID: "did:key:tenant#wrap",
-		HeaderLen:          212,
-		BaseNonce:          []byte("nonce07"),
-		ChunkSize:          65536,
-		AAD:                []byte("cose-enc-structure"),
+		Space:     space,
+		Digest:    digest,
+		HeaderLen: 212,
+		BaseNonce: []byte("nonce07"),
+		ChunkSize: 65536,
+		AAD:       []byte("cose-enc-structure"),
 	}
 }
 
@@ -354,41 +353,6 @@ func TestEncryptionParams_NoSliceAliasing(t *testing.T) {
 	}
 	if !reflect.DeepEqual(*again, feeParams(space, digest)) {
 		t.Fatalf("stored params were aliased: %+v", *again)
-	}
-}
-
-// Every parameter is required: a row missing any one of them could not be
-// decrypted with, so PutEncryptionParams rejects it and stores nothing.
-func TestEncryptionParams_IncompleteRejected(t *testing.T) {
-	space := testutil.RandomDID(t)
-	digest := []byte("enc-digest")
-
-	cases := []struct {
-		name   string
-		mutate func(*registry.BlobEncryptionParams)
-	}{
-		{"no space", func(p *registry.BlobEncryptionParams) { p.Space = did.Undef }},
-		{"no digest", func(p *registry.BlobEncryptionParams) { p.Digest = nil }},
-		{"no recipient kid", func(p *registry.BlobEncryptionParams) { p.TenantRecipientKID = "" }},
-		{"no header length", func(p *registry.BlobEncryptionParams) { p.HeaderLen = 0 }},
-		{"no base nonce", func(p *registry.BlobEncryptionParams) { p.BaseNonce = nil }},
-		{"no chunk size", func(p *registry.BlobEncryptionParams) { p.ChunkSize = 0 }},
-		{"no AAD", func(p *registry.BlobEncryptionParams) { p.AAD = nil }},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			ctx := context.Background()
-			m := NewMemStore()
-			params := feeParams(space, digest)
-			tc.mutate(&params)
-
-			if err := m.PutEncryptionParams(ctx, params); !errors.Is(err, registry.ErrInvalidEncryptionParams) {
-				t.Fatalf("PutEncryptionParams err = %v, want ErrInvalidEncryptionParams", err)
-			}
-			if _, err := m.GetEncryptionParams(ctx, space, digest); !errors.Is(err, registry.ErrNotFound) {
-				t.Fatalf("incomplete params leaked a row")
-			}
-		})
 	}
 }
 

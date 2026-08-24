@@ -27,20 +27,13 @@ var (
 	_ registry.RevocationCursorStore = (*MemStore)(nil)
 )
 
-func cloneBytes(b []byte) []byte {
-	if b == nil {
-		return nil
-	}
-	return append([]byte(nil), b...)
-}
-
 // BlobRefStore ===============================================================
 func (m *MemStore) AddBlobClaim(_ context.Context, c registry.BlobClaim) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	k := claimKey{string(c.Digest), c.Bucket, c.ObjectKey, c.VersionID}
 	cp := c
-	cp.Digest = cloneBytes(c.Digest)
+	cp.Digest = bytes.Clone(c.Digest)
 	m.blobRefs[k] = cp
 	return nil
 }
@@ -71,7 +64,7 @@ func (m *MemStore) PutIntent(_ context.Context, in registry.UploadIntent) error 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	cp := in
-	cp.Digest = cloneBytes(in.Digest)
+	cp.Digest = bytes.Clone(in.Digest)
 	m.intents[string(in.Digest)] = cp
 	return nil
 }
@@ -96,7 +89,7 @@ func (m *MemStore) GetIntent(_ context.Context, digest []byte) (*registry.Upload
 		return nil, registry.ErrNotFound
 	}
 	cp := in
-	cp.Digest = cloneBytes(in.Digest)
+	cp.Digest = bytes.Clone(in.Digest)
 	return &cp, nil
 }
 
@@ -109,7 +102,7 @@ func (m *MemStore) ListIntentsByState(_ context.Context, state string) ([]regist
 			continue
 		}
 		cp := in
-		cp.Digest = cloneBytes(in.Digest)
+		cp.Digest = bytes.Clone(in.Digest)
 		out = append(out, cp)
 	}
 	return out, nil
@@ -152,10 +145,6 @@ func (m *MemStore) DeleteLocation(_ context.Context, space did.DID, digest []byt
 // EncryptionParamsStore ======================================================
 
 func (m *MemStore) PutEncryptionParams(_ context.Context, params registry.BlobEncryptionParams) error {
-	// Match the Postgres store, whose columns are all NOT NULL.
-	if err := params.Validate(); err != nil {
-		return err
-	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.encParams[locKey{params.Space, string(params.Digest)}] = cloneEncryptionParams(params)
@@ -186,10 +175,10 @@ func (m *MemStore) PutPark(_ context.Context, p registry.BlobPark) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	cp := p
-	cp.Digest = cloneBytes(p.Digest)
-	cp.AddTask = cloneBytes(p.AddTask)
-	cp.AcceptTask = cloneBytes(p.AcceptTask)
-	cp.PutInvocation = cloneBytes(p.PutInvocation)
+	cp.Digest = bytes.Clone(p.Digest)
+	cp.AddTask = bytes.Clone(p.AddTask)
+	cp.AcceptTask = bytes.Clone(p.AcceptTask)
+	cp.PutInvocation = bytes.Clone(p.PutInvocation)
 	m.parks[string(p.Digest)] = cp
 	return nil
 }
@@ -202,10 +191,10 @@ func (m *MemStore) GetPark(_ context.Context, digest []byte) (*registry.BlobPark
 		return nil, registry.ErrNotFound
 	}
 	cp := park
-	cp.Digest = cloneBytes(park.Digest)
-	cp.AddTask = cloneBytes(park.AddTask)
-	cp.AcceptTask = cloneBytes(park.AcceptTask)
-	cp.PutInvocation = cloneBytes(park.PutInvocation)
+	cp.Digest = bytes.Clone(park.Digest)
+	cp.AddTask = bytes.Clone(park.AddTask)
+	cp.AcceptTask = bytes.Clone(park.AcceptTask)
+	cp.PutInvocation = bytes.Clone(park.PutInvocation)
 	return &cp, nil
 }
 
@@ -223,8 +212,8 @@ func (m *MemStore) PutInclusions(_ context.Context, incs []registry.BlobInclusio
 	defer m.mu.Unlock()
 	for _, inc := range incs {
 		cp := inc
-		cp.Digest = cloneBytes(inc.Digest)
-		cp.ShardDigest = cloneBytes(inc.ShardDigest)
+		cp.Digest = bytes.Clone(inc.Digest)
+		cp.ShardDigest = bytes.Clone(inc.ShardDigest)
 		m.inclusions[locKey{inc.Space, string(inc.Digest)}] = cp
 	}
 	return nil
@@ -238,8 +227,8 @@ func (m *MemStore) GetInclusion(_ context.Context, space did.DID, digest []byte)
 		return nil, registry.ErrNotFound
 	}
 	cp := inc
-	cp.Digest = cloneBytes(inc.Digest)
-	cp.ShardDigest = cloneBytes(inc.ShardDigest)
+	cp.Digest = bytes.Clone(inc.Digest)
+	cp.ShardDigest = bytes.Clone(inc.ShardDigest)
 	return &cp, nil
 }
 
@@ -438,25 +427,25 @@ func cloneSession(s registry.MultipartSession) registry.MultipartSession {
 // cloneLocation deep-copies a BlobLocation's digest so the stored copy and any
 // returned copy never alias the caller's slice.
 func cloneLocation(loc registry.BlobLocation) registry.BlobLocation {
-	loc.Digest = cloneBytes(loc.Digest)
+	loc.Digest = bytes.Clone(loc.Digest)
 	return loc
 }
 
 // cloneEncryptionParams deep-copies a BlobEncryptionParams' byte-slice fields
 // so the stored copy and any returned copy never alias the caller's slices.
 func cloneEncryptionParams(p registry.BlobEncryptionParams) registry.BlobEncryptionParams {
-	p.Digest = cloneBytes(p.Digest)
-	p.BaseNonce = cloneBytes(p.BaseNonce)
-	p.AAD = cloneBytes(p.AAD)
+	p.Digest = bytes.Clone(p.Digest)
+	p.BaseNonce = bytes.Clone(p.BaseNonce)
+	p.AAD = bytes.Clone(p.AAD)
 	return p
 }
 
 func clonePart(p registry.MultipartPart) registry.MultipartPart {
-	p.ETagMD5 = cloneBytes(p.ETagMD5)
+	p.ETagMD5 = bytes.Clone(p.ETagMD5)
 	if p.BlobDigests != nil {
 		ds := make([][]byte, len(p.BlobDigests))
 		for i, d := range p.BlobDigests {
-			ds[i] = cloneBytes(d)
+			ds[i] = bytes.Clone(d)
 		}
 		p.BlobDigests = ds
 	}
