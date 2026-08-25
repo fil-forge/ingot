@@ -98,7 +98,12 @@ type BindingContext struct {
 // A DID string contains no NUL, so the separator makes the encoding
 // unambiguous.
 func bindingBytes(b BindingContext) []byte {
-	return []byte(b.Space.String() + "\x00" + string(b.Digest))
+	space := b.Space.String()
+	out := make([]byte, 0, len(space)+1+len(b.Digest))
+	out = append(out, space...)
+	out = append(out, 0)
+	out = append(out, b.Digest...)
+	return out
 }
 
 // KeyVersion identifies a specific version of a region KEK. It is stored
