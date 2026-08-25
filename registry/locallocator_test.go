@@ -18,14 +18,14 @@ type fakeLocStore struct {
 	incs map[string]*BlobInclusion
 }
 
-func (f fakeLocStore) GetLocation(_ context.Context, _ did.DID, digest []byte) (*BlobLocation, error) {
+func (f fakeLocStore) GetLocation(_ context.Context, _ did.DID, digest mh.Multihash) (*BlobLocation, error) {
 	if loc, ok := f.locs[string(digest)]; ok {
 		return loc, nil
 	}
 	return nil, ErrNotFound
 }
 
-func (f fakeLocStore) GetInclusion(_ context.Context, _ did.DID, digest []byte) (*BlobInclusion, error) {
+func (f fakeLocStore) GetInclusion(_ context.Context, _ did.DID, digest mh.Multihash) (*BlobInclusion, error) {
 	if inc, ok := f.incs[string(digest)]; ok {
 		return inc, nil
 	}
@@ -112,7 +112,7 @@ func TestLocalLocator_InclusionFallthrough(t *testing.T) {
 	}
 	cm := locs[0].Commitment
 	if string(cm.Content) != string(shardDigest) {
-		t.Errorf("Content = %x, want shard digest %x (retrieve reads the shard, ranged)", []byte(cm.Content), []byte(shardDigest))
+		t.Errorf("Content = %x, want shard digest %x (retrieve reads the shard, ranged)", cm.Content, shardDigest)
 	}
 	if len(cm.Location) != 1 || cm.Location[0].URL().String() != url {
 		t.Errorf("Location = %v, want [%s]", cm.Location, url)

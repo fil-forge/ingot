@@ -236,7 +236,7 @@ func (b *Backend) UploadPart(ctx context.Context, input *s3.UploadPartInput) (*s
 
 	// Capture the superseded part's blobs (if any) before overwriting, so
 	// last-write-wins doesn't strand its spool files.
-	var superseded [][]byte
+	var superseded []mh.Multihash
 	if prior, err := b.multipart.ListParts(ctx, uploadID); err == nil {
 		for _, p := range prior {
 			if p.PartNumber == int(*input.PartNumber) {
@@ -664,7 +664,7 @@ func (b *Backend) AbortMultipartUpload(ctx context.Context, input *s3.AbortMulti
 	}
 	// Snapshot the parts' blob digests before the cascade delete, then drop
 	// the session and clean the spool.
-	var digests [][]byte
+	var digests []mh.Multihash
 	if parts, err := b.multipart.ListParts(ctx, uploadID); err == nil {
 		for _, p := range parts {
 			digests = append(digests, p.BlobDigests...)
@@ -697,7 +697,7 @@ func (b *Backend) abortOpenSession(ctx context.Context, space did.DID, sess regi
 	if err != nil || !won {
 		return
 	}
-	var digests [][]byte
+	var digests []mh.Multihash
 	if parts, err := b.multipart.ListParts(ctx, sess.UploadID); err == nil {
 		for _, p := range parts {
 			digests = append(digests, p.BlobDigests...)
@@ -716,7 +716,7 @@ func (b *Backend) abortOpenSession(ctx context.Context, space did.DID, sess regi
 // replacement or a sibling part), or by a committed object (reference claims /
 // non-spooled intent state). Best-effort: cleanup failure never fails the S3
 // operation; a stranded spool file is reapable later.
-func (b *Backend) cleanupPartBlobs(ctx context.Context, space did.DID, uploadID string, digests [][]byte) {
+func (b *Backend) cleanupPartBlobs(ctx context.Context, space did.DID, uploadID string, digests []mh.Multihash) {
 	if len(digests) == 0 {
 		return
 	}
@@ -761,7 +761,7 @@ func (b *Backend) cleanupPartBlobs(ctx context.Context, space did.DID, uploadID 
 		if state == registry.IntentParked {
 			if park, err := b.parks.GetPark(ctx, d); err == nil {
 				if cause, err := cid.Cast(park.AddTask); err == nil {
-					if aerr := b.deferred.AbortBlob(ctx, space, mh.Multihash(d), cause); aerr != nil {
+					if aerr := b.deferred.AbortBlob(ctx, space, d, cause); aerr != nil {
 						b.logger.Warn("abort parked blob failed; provider-side release deferred",
 							zap.String("digest", hex.EncodeToString(d)), zap.Error(aerr))
 					}
@@ -772,7 +772,7 @@ func (b *Backend) cleanupPartBlobs(ctx context.Context, space did.DID, uploadID 
 				}
 			}
 		}
-		if rerr := b.spool.Remove(mh.Multihash(d)); rerr != nil {
+		if rerr := b.spool.Remove(d); rerr != nil {
 			b.logger.Warn("remove spooled blob failed",
 				zap.String("digest", hex.EncodeToString(d)), zap.Error(rerr))
 		}
@@ -790,7 +790,7 @@ func (b *Backend) cleanupPartBlobs(ctx context.Context, space did.DID, uploadID 
 // state for Complete/Abort.
 func (b *Backend) parkBlobs(ctx context.Context, space did.DID, blobs []msbucket.BlobRef) error {
 	for _, blob := range blobs {
-		digest := mh.Multihash(blob.Digest)
+		digest := blob.Digest
 		if existing, err := b.locations.GetLocation(ctx, space, blob.Digest); err == nil && existing != nil {
 			if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentAccepted); err != nil {
 				return fmt.Errorf("mark accepted (dedup): %w", err)
@@ -852,7 +852,7 @@ func (b *Backend) parkBlobs(ctx context.Context, space did.DID, blobs []msbucket
 // whole synchronous upload.
 func (b *Backend) concludeBlobs(ctx context.Context, space did.DID, blobs []msbucket.BlobRef) error {
 	for _, blob := range blobs {
-		digest := mh.Multihash(blob.Digest)
+		digest := blob.Digest
 		if existing, err := b.locations.GetLocation(ctx, space, blob.Digest); err == nil && existing != nil {
 			if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentAccepted); err != nil {
 				return fmt.Errorf("mark accepted (dedup): %w", err)
@@ -1147,7 +1147,7 @@ func (b *Backend) SweepStaleMultipartSessions(ctx context.Context, ttl time.Dura
 		if err != nil || !won {
 			continue
 		}
-		var digests [][]byte
+		var digests []mh.Multihash
 		if parts, err := b.multipart.ListParts(ctx, s.UploadID); err == nil {
 			for _, p := range parts {
 				digests = append(digests, p.BlobDigests...)

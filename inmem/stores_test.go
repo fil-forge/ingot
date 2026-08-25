@@ -12,6 +12,7 @@ import (
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/libforge/testutil"
 	"github.com/fil-forge/ucantone/did"
+	"github.com/multiformats/go-multihash"
 )
 
 func TestBlobRefs_CountToZero(t *testing.T) {
@@ -194,8 +195,8 @@ func TestParts_OrderedAndCascade(t *testing.T) {
 	}
 
 	// Insert out of order; ListParts must return ascending part numbers.
-	mustPutPart(t, m, registry.MultipartPart{UploadID: id, PartNumber: 2, ETagMD5: []byte("m2"), Size: 2, BlobDigests: [][]byte{[]byte("d2")}})
-	mustPutPart(t, m, registry.MultipartPart{UploadID: id, PartNumber: 1, ETagMD5: []byte("m1"), Size: 1, BlobDigests: [][]byte{[]byte("d1a"), []byte("d1b")}})
+	mustPutPart(t, m, registry.MultipartPart{UploadID: id, PartNumber: 2, ETagMD5: []byte("m2"), Size: 2, BlobDigests: []multihash.Multihash{[]byte("d2")}})
+	mustPutPart(t, m, registry.MultipartPart{UploadID: id, PartNumber: 1, ETagMD5: []byte("m1"), Size: 1, BlobDigests: []multihash.Multihash{[]byte("d1a"), []byte("d1b")}})
 
 	parts, err := m.ListParts(ctx, id)
 	if err != nil {
@@ -216,7 +217,7 @@ func TestParts_OrderedAndCascade(t *testing.T) {
 	}
 
 	// PutPart against a missing session is rejected (FK).
-	if err := m.PutPart(ctx, registry.MultipartPart{UploadID: "missing", PartNumber: 1, ETagMD5: []byte("m"), BlobDigests: [][]byte{[]byte("d")}}); err != registry.ErrNotFound {
+	if err := m.PutPart(ctx, registry.MultipartPart{UploadID: "missing", PartNumber: 1, ETagMD5: []byte("m"), BlobDigests: []multihash.Multihash{[]byte("d")}}); err != registry.ErrNotFound {
 		t.Fatalf("PutPart missing session err = %v, want ErrNotFound", err)
 	}
 

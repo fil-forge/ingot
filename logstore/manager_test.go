@@ -9,6 +9,7 @@ import (
 	"time"
 
 	block "github.com/ipfs/go-block-format"
+	"github.com/multiformats/go-multihash"
 	"go.uber.org/zap/zaptest"
 
 	"github.com/fil-forge/ingot/blockstore"
@@ -22,12 +23,12 @@ type recordingFlush struct {
 	byBkt map[string]int
 }
 
-var fakeIndexDigest = []byte("fake-index-digest-multihash")
+var fakeIndexDigest = multihash.Multihash("fake-index-digest-multihash")
 
 func newRecordingFlush() *recordingFlush { return &recordingFlush{byBkt: map[string]int{}} }
 
 func (r *recordingFlush) forBucket(bucket string) FlushFunc {
-	return func(context.Context, *Segment) ([]byte, error) {
+	return func(context.Context, *Segment) (multihash.Multihash, error) {
 		r.mu.Lock()
 		defer r.mu.Unlock()
 		r.byBkt[bucket]++

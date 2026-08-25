@@ -255,12 +255,12 @@ func (m *Manager) QuiesceBucketLog(ctx context.Context, bucket string) error {
 // all before the space itself can be deleted — the tenant service refuses to
 // delete a space that still holds registrations. Call QuiesceBucketLog first
 // so no ship is in flight while this reads.
-func (m *Manager) ShippedSegmentDigests(ctx context.Context, bucket string) ([][]byte, error) {
+func (m *Manager) ShippedSegmentDigests(ctx context.Context, bucket string) ([]multihash.Multihash, error) {
 	rows, err := m.meta.ListSegments(ctx, blockstore.PlaneCatalog, bucket)
 	if err != nil {
 		return nil, fmt.Errorf("logstore: manager: list segments for %q: %w", bucket, err)
 	}
-	var out [][]byte
+	var out []multihash.Multihash
 	for _, r := range rows {
 		if r.State != StateSealed || len(r.SHA256) == 0 {
 			continue

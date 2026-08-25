@@ -15,12 +15,12 @@ import (
 )
 
 type LocationReader interface {
-	GetLocation(ctx context.Context, space did.DID, digest []byte) (*BlobLocation, error)
+	GetLocation(ctx context.Context, space did.DID, digest mh.Multihash) (*BlobLocation, error)
 }
 
 // InclusionReader resolves which stored shard contains a block, and where.
 type InclusionReader interface {
-	GetInclusion(ctx context.Context, space did.DID, digest []byte) (*BlobInclusion, error)
+	GetInclusion(ctx context.Context, space did.DID, digest mh.Multihash) (*BlobInclusion, error)
 }
 
 // LocalLocator resolves a blob's retrieval location from the local
@@ -111,7 +111,7 @@ func (l *LocalLocator) locateIn(ctx context.Context, space did.DID, digest mh.Mu
 	// The commitment names the SHARD (that is the blob /content/retrieve
 	// reads from); the range selects the inner block's bytes out of it —
 	// the same shape IndexLocator emits for an inclusion hit.
-	loc, err := blobLocationToLocation(space, mh.Multihash(shardLoc.Digest), shardLoc)
+	loc, err := blobLocationToLocation(space, shardLoc.Digest, shardLoc)
 	if err != nil {
 		return locator.Location{}, err
 	}
