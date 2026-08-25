@@ -208,7 +208,7 @@ func (b *Backend) splitSpool(ctx context.Context, bucket string, r io.Reader) (m
 	for _, blob := range body.Blobs {
 		if err := b.intents.PutIntent(ctx, registry.UploadIntent{
 			Digest:    blob.Digest,
-			LocalPath: b.spool.Path(multihash.Multihash(blob.Digest)),
+			LocalPath: b.spool.Path(blob.Digest),
 			Size:      blob.Length,
 			State:     registry.IntentSpooled,
 			Bucket:    bucket,
@@ -234,7 +234,7 @@ func (b *Backend) splitSpool(ctx context.Context, bucket string, r io.Reader) (m
 // deferred upload_intents × blob_locations crash recovery — see §12.)
 func (b *Backend) uploadBlobs(ctx context.Context, space did.DID, blobs []msbucket.BlobRef) error {
 	for _, blob := range blobs {
-		digest := multihash.Multihash(blob.Digest)
+		digest := blob.Digest
 		if existing, err := b.locations.GetLocation(ctx, space, blob.Digest); err == nil && existing != nil {
 			// Already durable for this space — advance the intent and move on.
 			if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentAccepted); err != nil {
@@ -294,7 +294,7 @@ func (b *Backend) uploadBlobs(ctx context.Context, space did.DID, blobs []msbuck
 // of a shared blob could drop a still-referenced one). Iterates over the
 // DEDUPLICATED digest sets, so a manifest carrying the same digest in two blobs
 // adds/deletes one claim and releases the blob at most once.
-func (b *Backend) reconcileClaims(ctx context.Context, bucketState *registry.State, key, versionID string, oldDigests, newDigests [][]byte) (toRemove [][]byte, err error) {
+func (b *Backend) reconcileClaims(ctx context.Context, bucketState *registry.State, key, versionID string, oldDigests, newDigests []multihash.Multihash) (toRemove []multihash.Multihash, err error) {
 	oldSet := digestSet(oldDigests)
 	newSet := digestSet(newDigests)
 
@@ -331,9 +331,9 @@ func (b *Backend) reconcileClaims(ctx context.Context, bucketState *registry.Sta
 // the (currently no-op) network release. Failures are logged, not fatal: a
 // missed release leaks bytes on Piri but never loses referenced data, and crash
 // recovery reconciles upload_intents × blob_refs (a later phase).
-func (b *Backend) releaseBlobs(ctx context.Context, space did.DID, digests [][]byte) {
+func (b *Backend) releaseBlobs(ctx context.Context, space did.DID, digests []multihash.Multihash) {
 	for _, d := range digests {
-		if err := b.remover.RemoveBlob(ctx, space, multihash.Multihash(d)); err != nil {
+		if err := b.remover.RemoveBlob(ctx, space, d); err != nil {
 			// best-effort; see method doc.
 			_ = err
 		}
@@ -341,8 +341,8 @@ func (b *Backend) releaseBlobs(ctx context.Context, space did.DID, digests [][]b
 }
 
 // bodyDigests returns the digests of a body's blobs in order.
-func bodyDigests(body msbucket.Body) [][]byte {
-	out := make([][]byte, 0, len(body.Blobs))
+func bodyDigests(body msbucket.Body) []multihash.Multihash {
+	out := make([]multihash.Multihash, 0, len(body.Blobs))
 	for _, blob := range body.Blobs {
 		out = append(out, blob.Digest)
 	}
@@ -350,10 +350,10 @@ func bodyDigests(body msbucket.Body) [][]byte {
 }
 
 // digestSet maps each distinct digest (by its bytes) to one representative
-// []byte, so callers can both test membership and recover the digest while
+// multihash, so callers can both test membership and recover the digest while
 // processing every digest exactly once.
-func digestSet(ds [][]byte) map[string][]byte {
-	s := make(map[string][]byte, len(ds))
+func digestSet(ds []multihash.Multihash) map[string]multihash.Multihash {
+	s := make(map[string]multihash.Multihash, len(ds))
 	for _, d := range ds {
 		s[string(d)] = d
 	}
@@ -693,7 +693,7 @@ func (b *Backend) insertDeleteMarker(ctx context.Context, bucketState *registry.
 // when non-nil, gates the delete on If-Match / size / mod-time under the
 // lock. Shared by DeleteObject and DeleteObjects.
 func (b *Backend) deleteObjectKey(ctx context.Context, bucketState *registry.State, key string, preconds *backend.ObjectDeletePreconditions) error {
-	var oldDigests [][]byte
+	var oldDigests []multihash.Multihash
 	var oldVersionID string
 	err := b.txns.WithTx(ctx, bucketState.Name, func(ctx context.Context, tx *bucketop.Tx) (cid.Cid, error) {
 		// Empty bucket: nothing to delete. Returning cid.Undef tells WithTx to

@@ -76,7 +76,7 @@ func (f *fakeMeta) MarkSegmentSealed(_ context.Context, plane blockstore.Plane, 
 	return nil
 }
 
-func (f *fakeMeta) MarkSegmentShipped(_ context.Context, plane blockstore.Plane, seq uint64, shippedAt int64, indexDigest []byte, opRoots []blockstore.OpRoot) error {
+func (f *fakeMeta) MarkSegmentShipped(_ context.Context, plane blockstore.Plane, seq uint64, shippedAt int64, indexDigest multihash.Multihash, opRoots []blockstore.OpRoot) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	m, ok := f.segments[seq]
@@ -175,7 +175,7 @@ func newTestStore(t *testing.T, sealBytes int64, sealAge time.Duration, retain i
 	meta := newFakeMeta()
 	flushCalls := &atomicCounter{}
 	logger := zaptest.NewLogger(t)
-	flush := func(_ context.Context, _ *Segment) ([]byte, error) {
+	flush := func(_ context.Context, _ *Segment) (multihash.Multihash, error) {
 		flushCalls.add(1)
 		return nil, nil
 	}
@@ -337,7 +337,7 @@ func TestForceSealRecoveredOpenOnRestart(t *testing.T) {
 		cfg := Config{
 			Dir:     dir,
 			Meta:    meta,
-			Catalog: PlaneConfig{SealBytes: 1 << 30, SealAge: time.Hour, Ship: true, Flush: func(context.Context, *Segment) ([]byte, error) { return nil, nil }, Retain: 6},
+			Catalog: PlaneConfig{SealBytes: 1 << 30, SealAge: time.Hour, Ship: true, Flush: func(context.Context, *Segment) (multihash.Multihash, error) { return nil, nil }, Retain: 6},
 			Logger:  logger,
 		}
 		s, err := Open(context.Background(), cfg)
@@ -514,7 +514,7 @@ func TestCatalogNeverShips(t *testing.T) {
 			SealBytes: 1,
 			SealAge:   20 * time.Millisecond,
 			Ship:      false,
-			Flush:     func(context.Context, *Segment) ([]byte, error) { ships.add(1); return nil, nil },
+			Flush:     func(context.Context, *Segment) (multihash.Multihash, error) { ships.add(1); return nil, nil },
 		},
 		Logger: logger,
 	}

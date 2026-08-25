@@ -8,8 +8,6 @@ import (
 	"github.com/fil-forge/ucantone/did"
 	"io"
 
-	mh "github.com/multiformats/go-multihash"
-
 	"github.com/fil-forge/ingot/blockstore"
 )
 
@@ -153,7 +151,7 @@ func (br *blobBodyReader) openCurrent() error {
 		// The Blobs list does not cover pos — a malformed manifest.
 		return io.ErrUnexpectedEOF
 	}
-	rc, err := br.bs.OpenBlob(br.ctx, br.space, mh.Multihash(b.Digest))
+	rc, err := br.bs.OpenBlob(br.ctx, br.space, b.Digest)
 	if err != nil {
 		return fmt.Errorf("read blob @%d: %w", b.Offset, err)
 	}

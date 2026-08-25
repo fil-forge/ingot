@@ -1,6 +1,9 @@
 package bucket
 
-import "github.com/ipfs/go-cid"
+import (
+	"github.com/ipfs/go-cid"
+	mh "github.com/multiformats/go-multihash"
+)
 
 // ObjectManifest is the per-object metadata record stored as a CBOR
 // block in the IPLD blockstore. The MST leaf for an object key points
@@ -107,7 +110,7 @@ type Body struct {
 // object. The ordered BlobRef list lets a ranged GET map a byte range
 // to the covering blob(s).
 type BlobRef struct {
-	Digest []byte `cborgen:"d"`
-	Offset int64  `cborgen:"o"`
-	Length int64  `cborgen:"l"`
+	Digest mh.Multihash `cborgen:"d"`
+	Offset int64        `cborgen:"o"`
+	Length int64        `cborgen:"l"`
 }

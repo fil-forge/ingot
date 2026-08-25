@@ -1179,7 +1179,7 @@ func (t *BlobRef) MarshalCBOR(w io.Writer) error {
 		return err
 	}
 
-	// t.Digest ([]uint8) (slice)
+	// t.Digest (multihash.Multihash) (slice)
 	if len("d") > 1000000 {
 		return xerrors.Errorf("Value in field \"d\" was too long")
 	}
@@ -1291,7 +1291,7 @@ func (t *BlobRef) UnmarshalCBOR(r io.Reader) (err error) {
 		}
 
 		switch string(nameBuf[:nameLen]) {
-		// t.Digest ([]uint8) (slice)
+		// t.Digest (multihash.Multihash) (slice)
 		case "d":
 
 			maj, extra, err = cr.ReadHeader()

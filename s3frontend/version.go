@@ -10,6 +10,7 @@ import (
 	"github.com/fil-forge/versitygw/backend"
 	"github.com/fil-forge/versitygw/s3err"
 	"github.com/ipfs/go-cid"
+	"github.com/multiformats/go-multihash"
 	"github.com/oklog/ulid/v2"
 
 	msbucket "github.com/fil-forge/ingot/bucket"
@@ -247,7 +248,7 @@ func (b *Backend) resolveVersion(ctx context.Context, bucketName, key, versionID
 // post-commit reference-index release (§8).
 type discardedVersion struct {
 	versionID string
-	digests   [][]byte
+	digests   []multihash.Multihash
 }
 
 // commitVersion runs the §5 write rule for one new version (a PutObject /
@@ -513,8 +514,8 @@ func (b *Backend) commitVersion(ctx context.Context, bucketState *registry.State
 	// version's id (null replacing null — the only same-id case) goes through
 	// the set-diff so unchanged digests never churn.
 	newDigests := bodyDigests(mf.Body)
-	var sameIDOld [][]byte
-	var toRemove [][]byte
+	var sameIDOld []multihash.Multihash
+	var toRemove []multihash.Multihash
 	for _, d := range discards {
 		if d.versionID == node.VersionID {
 			sameIDOld = append(sameIDOld, d.digests...)

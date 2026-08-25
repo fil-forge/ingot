@@ -8,6 +8,7 @@ import (
 
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ucantone/did"
+	"github.com/multiformats/go-multihash"
 )
 
 // In-memory implementations of the architecture's relational stores
@@ -38,14 +39,14 @@ func (m *MemStore) AddBlobClaim(_ context.Context, c registry.BlobClaim) error {
 	return nil
 }
 
-func (m *MemStore) DeleteBlobClaim(_ context.Context, digest []byte, bucket, objectKey, versionID string) error {
+func (m *MemStore) DeleteBlobClaim(_ context.Context, digest multihash.Multihash, bucket, objectKey, versionID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.blobRefs, claimKey{string(digest), bucket, objectKey, versionID})
 	return nil
 }
 
-func (m *MemStore) CountClaims(_ context.Context, space did.DID, digest []byte) (int, error) {
+func (m *MemStore) CountClaims(_ context.Context, space did.DID, digest multihash.Multihash) (int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	d := string(digest)
@@ -69,7 +70,7 @@ func (m *MemStore) PutIntent(_ context.Context, in registry.UploadIntent) error 
 	return nil
 }
 
-func (m *MemStore) SetIntentState(_ context.Context, digest []byte, state string) error {
+func (m *MemStore) SetIntentState(_ context.Context, digest multihash.Multihash, state string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	in, ok := m.intents[string(digest)]
@@ -81,7 +82,7 @@ func (m *MemStore) SetIntentState(_ context.Context, digest []byte, state string
 	return nil
 }
 
-func (m *MemStore) GetIntent(_ context.Context, digest []byte) (*registry.UploadIntent, error) {
+func (m *MemStore) GetIntent(_ context.Context, digest multihash.Multihash) (*registry.UploadIntent, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	in, ok := m.intents[string(digest)]
@@ -108,7 +109,7 @@ func (m *MemStore) ListIntentsByState(_ context.Context, state string) ([]regist
 	return out, nil
 }
 
-func (m *MemStore) DeleteIntent(_ context.Context, digest []byte) error {
+func (m *MemStore) DeleteIntent(_ context.Context, digest multihash.Multihash) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.intents, string(digest))
@@ -124,7 +125,7 @@ func (m *MemStore) PutLocation(_ context.Context, loc registry.BlobLocation) err
 	return nil
 }
 
-func (m *MemStore) GetLocation(_ context.Context, space did.DID, digest []byte) (*registry.BlobLocation, error) {
+func (m *MemStore) GetLocation(_ context.Context, space did.DID, digest multihash.Multihash) (*registry.BlobLocation, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	loc, ok := m.locations[locKey{space, string(digest)}]
@@ -135,7 +136,7 @@ func (m *MemStore) GetLocation(_ context.Context, space did.DID, digest []byte) 
 	return &cp, nil
 }
 
-func (m *MemStore) DeleteLocation(_ context.Context, space did.DID, digest []byte) error {
+func (m *MemStore) DeleteLocation(_ context.Context, space did.DID, digest multihash.Multihash) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.locations, locKey{space, string(digest)})
@@ -151,7 +152,7 @@ func (m *MemStore) PutEncryptionParams(_ context.Context, params registry.BlobEn
 	return nil
 }
 
-func (m *MemStore) GetEncryptionParams(_ context.Context, space did.DID, digest []byte) (*registry.BlobEncryptionParams, error) {
+func (m *MemStore) GetEncryptionParams(_ context.Context, space did.DID, digest multihash.Multihash) (*registry.BlobEncryptionParams, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	params, ok := m.encParams[locKey{space, string(digest)}]
@@ -162,14 +163,14 @@ func (m *MemStore) GetEncryptionParams(_ context.Context, space did.DID, digest 
 	return &cp, nil
 }
 
-func (m *MemStore) DeleteEncryptionParams(_ context.Context, space did.DID, digest []byte) error {
+func (m *MemStore) DeleteEncryptionParams(_ context.Context, space did.DID, digest multihash.Multihash) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.encParams, locKey{space, string(digest)})
 	return nil
 }
 
-func (m *MemStore) RewrapEncryptionParams(_ context.Context, space did.DID, digest, wrappedCEK []byte, keyVersion string) error {
+func (m *MemStore) RewrapEncryptionParams(_ context.Context, space did.DID, digest multihash.Multihash, wrappedCEK []byte, keyVersion string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	key := locKey{space, string(digest)}
@@ -197,7 +198,7 @@ func (m *MemStore) PutPark(_ context.Context, p registry.BlobPark) error {
 	return nil
 }
 
-func (m *MemStore) GetPark(_ context.Context, digest []byte) (*registry.BlobPark, error) {
+func (m *MemStore) GetPark(_ context.Context, digest multihash.Multihash) (*registry.BlobPark, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	park, ok := m.parks[string(digest)]
@@ -212,7 +213,7 @@ func (m *MemStore) GetPark(_ context.Context, digest []byte) (*registry.BlobPark
 	return &cp, nil
 }
 
-func (m *MemStore) DeletePark(_ context.Context, digest []byte) error {
+func (m *MemStore) DeletePark(_ context.Context, digest multihash.Multihash) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.parks, string(digest))
@@ -233,7 +234,7 @@ func (m *MemStore) PutInclusions(_ context.Context, incs []registry.BlobInclusio
 	return nil
 }
 
-func (m *MemStore) GetInclusion(_ context.Context, space did.DID, digest []byte) (*registry.BlobInclusion, error) {
+func (m *MemStore) GetInclusion(_ context.Context, space did.DID, digest multihash.Multihash) (*registry.BlobInclusion, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	inc, ok := m.inclusions[locKey{space, string(digest)}]
@@ -377,7 +378,7 @@ func (m *MemStore) ListStaleSessions(_ context.Context, state string, cutoff tim
 	return out, nil
 }
 
-func (m *MemStore) CountPartRefs(_ context.Context, digest []byte, excludeUploadID string) (int, error) {
+func (m *MemStore) CountPartRefs(_ context.Context, digest multihash.Multihash, excludeUploadID string) (int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	n := 0
@@ -458,7 +459,7 @@ func cloneEncryptionParams(p registry.BlobEncryptionParams) registry.BlobEncrypt
 func clonePart(p registry.MultipartPart) registry.MultipartPart {
 	p.ETagMD5 = bytes.Clone(p.ETagMD5)
 	if p.BlobDigests != nil {
-		ds := make([][]byte, len(p.BlobDigests))
+		ds := make([]multihash.Multihash, len(p.BlobDigests))
 		for i, d := range p.BlobDigests {
 			ds[i] = bytes.Clone(d)
 		}

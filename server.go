@@ -92,6 +92,12 @@ type ServerDeps struct {
 	IAM auth.IAMService
 }
 
+// DeleteBucket reaches the catalog log's shipped-segment release through a
+// runtime type assertion on this shape; pin *logstore.Manager to it at compile
+// time so a signature drift is a build error rather than a silently skipped
+// release.
+var _ s3frontend.SegmentDigestLister = (*logstore.Manager)(nil)
+
 // Server is a fully-wired ingot S3 listener. Use Start/Stop for
 // lifecycle. fx callers wrap these in OnStart/OnStop hooks; tests
 // call them directly.
@@ -290,7 +296,7 @@ func (s *Server) Stop(ctx context.Context) error {
 // nil so the segment marks shipped and retires.
 func newBucketFlushFunc(up uploader.Uploader, reg registry.Registry, locations registry.LocationStore, inclusions registry.InclusionStore, bucket string, logger *zap.Logger) logstore.FlushFunc {
 	plane := blockstore.PlaneCatalog
-	return func(ctx context.Context, seg *logstore.Segment) ([]byte, error) {
+	return func(ctx context.Context, seg *logstore.Segment) (multihash.Multihash, error) {
 		positions := seg.Positions()
 		if len(positions) == 0 {
 			return nil, nil
