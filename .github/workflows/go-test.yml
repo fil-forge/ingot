@@ -1,10 +1,12 @@
 name: Go Test
 
-# Two-stage test pipeline mirroring the local `make test` / `make itest`
-# split: fast unit tests run first (the shared unified workflow), and the
-# Docker-backed integration suite (itest/) only runs once they pass — a
-# broken unit test fails the PR in ~2 minutes instead of tying up a runner
-# booting the Forge stack.
+# Three test jobs mirroring the local split: fast unit tests (the shared
+# unified workflow) and the env-gated live tests (real Postgres + OpenBao as
+# service containers) run in parallel, and the Docker-backed integration
+# suite (itest/) only runs once the unit job passes — a broken unit test
+# fails the PR in ~2 minutes instead of tying up a runner booting the Forge
+# stack. The live job exists because the unit job runs the same packages
+# with no INGOT_TEST_* env, silently skipping every *_live_test.go.
 
 on:
   pull_request:
@@ -26,6 +28,57 @@ jobs:
       go-versions: '["this"]'
     secrets:
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  live:
+    # The env-gated live tests: the SQL-backed stores and migrations against
+    # a real Postgres, and the OpenBao transit provider against a real
+    # OpenBao — behavior the in-memory fakes and httptest doubles cannot
+    # prove (bytea[] round-trips, CHECK constraints, derived-context
+    # binding, key rotation). Cheap enough to run in parallel with unit.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: pw
+          POSTGRES_DB: ingot
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 15
+      openbao:
+        image: openbao/openbao:2.6.2
+        env:
+          BAO_DEV_ROOT_TOKEN_ID: root
+        ports:
+          - 8200:8200
+        options: >-
+          --health-cmd "wget -q -O /dev/null http://127.0.0.1:8200/v1/sys/health"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 15
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Run live tests
+        env:
+          GOWORK: off
+          INGOT_TEST_DSN: postgres://postgres:pw@127.0.0.1:55432/ingot
+          INGOT_TEST_BAO_ADDR: http://127.0.0.1:8200
+          INGOT_TEST_BAO_TOKEN: root
+        run: go test -v -count=1 -run Live ./registry/ ./migrations/ ./regionkey/
 
   itest:
     needs: unit
