@@ -549,10 +549,19 @@ func (b *Backend) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.
 		return nil, err
 	}
 
+	// Resolve how each blob's bytes become plaintext — the plain opener for
+	// unencrypted blobs, the decrypting opener where an encryption row
+	// exists. Doing it here (not at first Read) fails a broken encrypted
+	// object as a request error, before response headers are written.
+	opener, err := b.bodyOpener(ctx, st.Space, mf.Body)
+	if err != nil {
+		return nil, err
+	}
+
 	var contentRange *string
-	var body = msbucket.OpenBody(ctx, b.read, st.Space, mf.Body)
+	var body = msbucket.OpenBody(ctx, opener, st.Space, mf.Body)
 	if isRange {
-		body = msbucket.OpenBodyRange(ctx, b.read, st.Space, mf.Body, startOffset, startOffset+length-1)
+		body = msbucket.OpenBodyRange(ctx, opener, st.Space, mf.Body, startOffset, startOffset+length-1)
 		cr := fmt.Sprintf("bytes %d-%d/%d", startOffset, startOffset+length-1, objSize)
 		contentRange = &cr
 	}

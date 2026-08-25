@@ -314,6 +314,7 @@ sequenceDiagram
     participant LY as blockstore.Layered
     participant LG as logstore.Manager
     participant LC as registry.LocalLocator
+    participant K as regionkey.Provider<br/>(OpenBao / in-process)
     participant P as piri
 
     C->>B: GetObject(bucket, key, versionId?)
@@ -325,8 +326,13 @@ sequenceDiagram
         Note over B,LY: Current for the head, otherwise seek the prev tree at<br/>revSeqKey(seq) and confirm the stored VersionID (see version-tree)
     end
     Note over B: delete marker: 404 NoSuchKey (current) or 405 (versioned),<br/>then preconditions and selectBytes (Range, or partNumber via Body.PartSizes)
+    B->>R: bodyOpener: blob_encryption_params + blob_locations per blob<br/>(row existence = encrypted; skipped when no region key provider is configured)
     loop each covering blob or catalog block
-        B->>LY: read
+        opt encrypted blob (FEE)
+            B->>K: Unwrap region-wrapped CEK, bound to (space, digest)
+            Note over B: aesstream.CiphertextRange maps the plaintext range to<br/>one contiguous ciphertext span past the envelope header
+        end
+        B->>LY: read (whole blob, or only the ciphertext span via OpenBlobRange)
         alt spool hit
             LY-->>B: bytes from the spool
         else catalog log hit (GetBlock only)
@@ -339,11 +345,14 @@ sequenceDiagram
             else inner block via shard_inclusions
                 LC-->>LY: shard location + inclusive byte range
             end
-            LY->>P: content/retrieve (UCAN, audience = the commitment's provider,<br/>proofs from reqscope.ProofStore, absent for root)
+            LY->>P: content/retrieve (UCAN, audience = the commitment's provider,<br/>proofs from reqscope.ProofStore, absent for root;<br/>narrowed to the ciphertext span for an encrypted blob)
             P-->>LY: ranged bytes, length-checked
         end
+        opt encrypted blob (FEE)
+            Note over B: aesstream.SpanReader decrypts the span as it streams;<br/>a tampered chunk fails authentication mid-stream (ErrCorrupted)
+        end
     end
-    B-->>C: 200 or 206 body
+    B-->>C: 200 or 206 body (plaintext byte counts throughout)
 ```
 
 - `OpenBlob` (body blobs) checks spool then network; only `GetBlock`
@@ -353,12 +362,20 @@ sequenceDiagram
   blocks are local.
 - The indexer-backed locator (`blockstore/locator`) compiles but is never
   injected; `module.go` always wires `LocalLocator`.
+- Manifest coordinates are plaintext: `BlobRef.Offset/Length`, `Body.Size`,
+  ETag and Content-Length never change with encryption. `BlobRef.Digest`
+  names the stored — for an encrypted blob, ciphertext — bytes; only the
+  per-blob open translates between the two.
+- HEAD needs no decryption at all (every value it reports is a plaintext
+  manifest field).
 
 Cross-references: [`architecture.md` §7.4](./architecture.md#74-read-getobject),
 [§8](./architecture.md#8-retrieval-addressing-when-bodies-need-a-sharded-dag-index).
 
 Sources: `s3frontend/object.go` (GetObject, HeadObject, selectBytes),
-`s3frontend/version.go` (resolveVersion), `blockstore/layered.go`,
+`s3frontend/version.go` (resolveVersion), `s3frontend/decrypt.go`
+(bodyOpener, decryptingOpener), `bucket/chunker.go` (BlobRangeOpener),
+`blockstore/layered.go`,
 `blockstore/forge.go` (doRetrieve), `blockstore/cache.go`,
 `registry/locallocator.go`, `logstore/manager.go` (Get). Review when these
 change.

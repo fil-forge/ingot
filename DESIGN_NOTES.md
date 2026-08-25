@@ -100,6 +100,20 @@ by the location commitment. The indexing-service query path is implemented
 but unwired. The full trace is the
 [GetObject diagram](./docs/diagrams.md#getobject-version-resolution-local-tiers-network-retrieval).
 
+**Encrypted blobs** (the FilOne encryption design's read side) decrypt inside
+the per-blob open, leaving every other read-path value plaintext: the
+manifest's `BlobRef.Offset/Length`, `Body.Size`, ETag and Content-Length are
+plaintext coordinates, while `BlobRef.Digest` names the stored FEE envelope.
+A `blob_encryption_params` row marks a blob encrypted and carries what its
+decryptor needs; the read unwraps the region-wrapped CEK through
+`regionkey.Provider` (OpenBao transit in production, bound to the blob's
+(space, digest)), maps the plaintext range to one contiguous ciphertext span
+(`aesstream.CiphertextRange`), fetches only that span (ranged from the spool
+or piri via `OpenBlobRange`), and decrypts it as it streams
+(`aesstream.SpanReader`). A tampered chunk fails authentication mid-stream.
+With no region key provider configured the lookups are skipped entirely.
+HEAD never decrypts. See `s3frontend/decrypt.go`.
+
 ## Identity & auth
 
 - **agent**: the libforge `identity.Identity` the host provides (daemon: the `identity.key_file` PEM

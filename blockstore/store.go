@@ -43,6 +43,7 @@ package blockstore
 
 import (
 	"context"
+	"fmt"
 	"io"
 
 	"github.com/fil-forge/ucantone/did"
@@ -102,6 +103,50 @@ type BlockWriter interface {
 // the returned reader and must Close it.
 type BlobReader interface {
 	OpenBlob(ctx context.Context, space did.DID, digest mh.Multihash) (io.ReadCloser, error)
+}
+
+// BlobRangeReader is the optional ranged counterpart of BlobReader: it
+// streams only the stored bytes [off, off+n) of a blob. The decrypting read
+// path uses it to fetch exactly the ciphertext chunks a plaintext range
+// needs instead of the whole blob. Returns ErrNotFound if the blob is not in
+// this tier; a range past the stored bytes yields a shorter stream, which
+// the caller detects. A tier without this capability is served through
+// OpenBlob with the prefix discarded (see OpenBlobRangeOf).
+type BlobRangeReader interface {
+	OpenBlobRange(ctx context.Context, space did.DID, digest mh.Multihash, off, n int64) (io.ReadCloser, error)
+}
+
+// OpenBlobRangeOf opens stored bytes [off, off+n) of a blob through br,
+// using its BlobRangeReader capability when present and falling back to
+// OpenBlob with the prefix read-and-discarded (or Seek'd, for a spool file)
+// when not. It is how range-consuming callers stay correct over any tier.
+func OpenBlobRangeOf(ctx context.Context, br BlobReader, space did.DID, digest mh.Multihash, off, n int64) (io.ReadCloser, error) {
+	if rr, ok := br.(BlobRangeReader); ok {
+		return rr.OpenBlobRange(ctx, space, digest, off, n)
+	}
+	rc, err := br.OpenBlob(ctx, space, digest)
+	if err != nil {
+		return nil, err
+	}
+	if off > 0 {
+		if seeker, ok := rc.(io.Seeker); ok {
+			if _, err := seeker.Seek(off, io.SeekStart); err != nil {
+				_ = rc.Close()
+				return nil, fmt.Errorf("blockstore: seek blob to %d: %w", off, err)
+			}
+		} else if _, err := io.CopyN(io.Discard, rc, off); err != nil {
+			_ = rc.Close()
+			return nil, fmt.Errorf("blockstore: skip into blob to %d: %w", off, err)
+		}
+	}
+	return readerCloser{Reader: io.LimitReader(rc, n), Closer: rc}, nil
+}
+
+// readerCloser pairs a wrapped reader with the closer releasing its
+// underlying stream.
+type readerCloser struct {
+	io.Reader
+	io.Closer
 }
 
 // BlobWriter streams an object-body blob to local storage, computing its sha256

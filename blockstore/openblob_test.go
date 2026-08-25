@@ -79,3 +79,79 @@ func TestCached_OpenBlob_BypassesCache(t *testing.T) {
 		t.Fatalf("cached OpenBlob: got %q err %v, want streamed", got, err)
 	}
 }
+
+// TestSpool_OpenBlobRange: the section reader serves exactly [off, off+n) of
+// the spooled file, and a range past the end yields a shorter stream.
+func TestSpool_OpenBlobRange(t *testing.T) {
+	ctx := context.Background()
+	sp, err := NewSpool(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewSpool: %v", err)
+	}
+	data := []byte("0123456789abcdef")
+	digest, _, err := sp.WriteBlob(ctx, bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("WriteBlob: %v", err)
+	}
+
+	cases := []struct {
+		name   string
+		off, n int64
+		want   string
+	}{
+		{"interior", 4, 6, "456789"},
+		{"prefix", 0, 3, "012"},
+		{"suffix past end clamps", 12, 100, "cdef"},
+		{"empty", 5, 0, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			rc, err := sp.OpenBlobRange(ctx, did.Undef, digest, c.off, c.n)
+			if err != nil {
+				t.Fatalf("OpenBlobRange: %v", err)
+			}
+			defer rc.Close()
+			got, err := io.ReadAll(rc)
+			if err != nil {
+				t.Fatalf("read: %v", err)
+			}
+			if string(got) != c.want {
+				t.Fatalf("range [%d,+%d) = %q, want %q", c.off, c.n, got, c.want)
+			}
+		})
+	}
+
+	if _, err := sp.OpenBlobRange(ctx, did.Undef, mustDigest(t, []byte("absent")), 0, 1); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing blob err = %v, want ErrNotFound", err)
+	}
+}
+
+// TestOpenBlobRangeOf_Fallback: a tier without the BlobRangeReader capability
+// is served through OpenBlob with the prefix discarded and the tail limited.
+func TestOpenBlobRangeOf_Fallback(t *testing.T) {
+	ctx := context.Background()
+	tier := fakeBlobTier{data: []byte("0123456789abcdef")}
+
+	rc, err := OpenBlobRangeOf(ctx, tier, did.Undef, nil, 4, 6)
+	if err != nil {
+		t.Fatalf("OpenBlobRangeOf: %v", err)
+	}
+	defer rc.Close()
+	got, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if string(got) != "456789" {
+		t.Fatalf("fallback range = %q, want %q", got, "456789")
+	}
+}
+
+// mustDigest hashes data into the multihash form blobs are keyed by.
+func mustDigest(t *testing.T, data []byte) mh.Multihash {
+	t.Helper()
+	d, err := mh.Sum(data, mh.SHA2_256, -1)
+	if err != nil {
+		t.Fatalf("multihash: %v", err)
+	}
+	return d
+}
