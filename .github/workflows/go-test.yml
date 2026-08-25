@@ -78,7 +78,7 @@ jobs:
           INGOT_TEST_DSN: postgres://postgres:pw@127.0.0.1:55432/ingot
           INGOT_TEST_BAO_ADDR: http://127.0.0.1:8200
           INGOT_TEST_BAO_TOKEN: root
-        run: go test -v -count=1 -run Live ./registry/ ./migrations/ ./regionkey/
+        run: go test -v -count=1 -run '(Live|GraphValidates)' ./cmd/... ./registry/ ./migrations/ ./regionkey/
 
   itest:
     needs: unit
