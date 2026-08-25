@@ -169,6 +169,20 @@ func (m *MemStore) DeleteEncryptionParams(_ context.Context, space did.DID, dige
 	return nil
 }
 
+func (m *MemStore) RewrapEncryptionParams(_ context.Context, space did.DID, digest, wrappedCEK []byte, keyVersion string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := locKey{space, string(digest)}
+	params, ok := m.encParams[key]
+	if !ok {
+		return registry.ErrNotFound
+	}
+	params.RegionWrappedCEK = bytes.Clone(wrappedCEK)
+	params.RegionKeyVersion = keyVersion
+	m.encParams[key] = params
+	return nil
+}
+
 // ParkStore ==================================================================
 
 func (m *MemStore) PutPark(_ context.Context, p registry.BlobPark) error {
@@ -435,6 +449,7 @@ func cloneLocation(loc registry.BlobLocation) registry.BlobLocation {
 // so the stored copy and any returned copy never alias the caller's slices.
 func cloneEncryptionParams(p registry.BlobEncryptionParams) registry.BlobEncryptionParams {
 	p.Digest = bytes.Clone(p.Digest)
+	p.RegionWrappedCEK = bytes.Clone(p.RegionWrappedCEK)
 	p.BaseNonce = bytes.Clone(p.BaseNonce)
 	p.AAD = bytes.Clone(p.AAD)
 	return p
