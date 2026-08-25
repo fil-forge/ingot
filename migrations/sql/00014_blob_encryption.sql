@@ -3,9 +3,9 @@
 -- encrypts an object's body, each body blob is stored as an independent
 -- COSE/STREAM ciphertext envelope; a range GET must be able to decrypt any byte
 -- span of that envelope WITHOUT first fetching and parsing its header. A row
--- here caches exactly the inputs the read path's decryptor needs, so a read
--- unwraps the CEK (held in OpenBao, under the region KEK) and goes straight to
--- a body-range fetch — no envelope-header round-trip.
+-- here holds exactly the inputs the read path's decryptor needs, so a read
+-- unwraps the CEK (via the region's secrets manager, which custodies the region
+-- KEK) and goes straight to a body-range fetch — no envelope-header round-trip.
 --
 -- The existence of a row is what marks a blob as encrypted, so every column is
 -- NOT NULL: there is no such thing as a half-populated parameter set the
@@ -24,17 +24,23 @@
 -- COSE_Encrypt0 and a bare row cannot record which form was used. The protected
 -- header stays recoverable from it as element 1.
 --
--- Only what the region-KEK read path needs is cached. The COSE recipients,
+-- Only what the region-KEK read path needs is stored. The COSE recipients,
 -- including the tenant wrap key the insurance-recovery unwrap uses, stay in the
 -- envelope header: that path is rare and out-of-band, and it reads the header
--- anyway. No key material is stored here either — the region-KEK-wrapped CEK
--- and its key version live in OpenBao. Per-blob crypto-shred is deleting the
--- key there; deleting this row only drops the cached decrypt parameters.
+-- anyway. Raw key bytes never touch this table: region_wrapped_cek is
+-- ciphertext, unwrappable only by the region KEK, which lives in the region's
+-- secrets manager and never leaves it. Deleting a row is therefore the per-blob
+-- crypto-shred — without the wrapped CEK the region has no path to the
+-- plaintext (only the tenant recipient in the envelope survives, by design).
 -- Because there is no cascade, a caller removing a blob must delete here as
 -- well as from blob_locations.
 CREATE TABLE ingot.blob_encryption_params (
     space                text   NOT NULL,
     digest               bytea  NOT NULL,                 -- ciphertext blob multihash, as in blob_locations
+    region_wrapped_cek   bytea  NOT NULL                  -- CEK wrapped by the region key provider (e.g. transit ciphertext); never the raw CEK
+                             CHECK (octet_length(region_wrapped_cek) > 0),
+    region_key_version   text   NOT NULL                  -- opaque id of the region KEK version that produced the wrap
+                             CHECK (region_key_version <> ''),
     header_len           bigint NOT NULL                  -- encoded envelope length; the ciphertext starts at this offset
                              CHECK (header_len > 0),
     base_nonce           bytea  NOT NULL                  -- COSE iv: the STREAM nonce seed for this blob's ciphertext

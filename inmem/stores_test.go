@@ -260,12 +260,14 @@ func TestLocations_RoundTrip(t *testing.T) {
 // envelope's row takes.
 func feeParams(space did.DID, digest []byte) registry.BlobEncryptionParams {
 	return registry.BlobEncryptionParams{
-		Space:     space,
-		Digest:    digest,
-		HeaderLen: 212,
-		BaseNonce: []byte("nonce07"),
-		ChunkSize: 65536,
-		AAD:       []byte("cose-enc-structure"),
+		Space:            space,
+		Digest:           digest,
+		RegionWrappedCEK: []byte("wrapped-cek-bytes"),
+		RegionKeyVersion: "region-kek-v1",
+		HeaderLen:        212,
+		BaseNonce:        []byte("nonce07"),
+		ChunkSize:        65536,
+		AAD:              []byte("cose-enc-structure"),
 	}
 }
 
@@ -338,6 +340,7 @@ func TestEncryptionParams_NoSliceAliasing(t *testing.T) {
 	if err := m.PutEncryptionParams(ctx, params); err != nil {
 		t.Fatalf("PutEncryptionParams: %v", err)
 	}
+	params.RegionWrappedCEK[0] = 'X'
 	params.BaseNonce[0] = 'X'
 	params.AAD[0] = 'X'
 
@@ -345,6 +348,7 @@ func TestEncryptionParams_NoSliceAliasing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetEncryptionParams: %v", err)
 	}
+	got.RegionWrappedCEK[0] = 'Y'
 	got.BaseNonce[0] = 'Y'
 
 	again, err := m.GetEncryptionParams(ctx, space, digest)
@@ -353,6 +357,45 @@ func TestEncryptionParams_NoSliceAliasing(t *testing.T) {
 	}
 	if !reflect.DeepEqual(*again, feeParams(space, digest)) {
 		t.Fatalf("stored params were aliased: %+v", *again)
+	}
+}
+
+// A rotation re-wrap replaces only the wrapped CEK and its key version; every
+// other parameter describes the unchanged ciphertext and must survive.
+func TestEncryptionParams_RewrapInPlace(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+	space := testutil.RandomDID(t)
+	digest := []byte("enc-digest")
+	if err := m.PutEncryptionParams(ctx, feeParams(space, digest)); err != nil {
+		t.Fatalf("PutEncryptionParams: %v", err)
+	}
+
+	newCEK := []byte("re-wrapped-cek-bytes")
+	if err := m.RewrapEncryptionParams(ctx, space, digest, newCEK, "region-kek-v2"); err != nil {
+		t.Fatalf("RewrapEncryptionParams: %v", err)
+	}
+	newCEK[0] = 'X' // the store must not alias the caller's slice
+
+	got, err := m.GetEncryptionParams(ctx, space, digest)
+	if err != nil {
+		t.Fatalf("GetEncryptionParams: %v", err)
+	}
+	want := feeParams(space, digest)
+	want.RegionWrappedCEK = []byte("re-wrapped-cek-bytes")
+	want.RegionKeyVersion = "region-kek-v2"
+	if !reflect.DeepEqual(*got, want) {
+		t.Fatalf("after rewrap = %+v, want %+v", *got, want)
+	}
+}
+
+func TestEncryptionParams_RewrapMissingIsNotFound(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+
+	err := m.RewrapEncryptionParams(ctx, testutil.RandomDID(t), []byte("absent"), []byte("cek"), "v1")
+	if !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("RewrapEncryptionParams err = %v, want ErrNotFound", err)
 	}
 }
 

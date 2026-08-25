@@ -92,15 +92,23 @@ type BlobLocation struct {
 // ciphertext digest unique to one encryption, so these parameters are a 1:1
 // fact about the blob.
 //
-// Only what the region-KEK read path needs is cached. The COSE recipients,
+// Only what the region-KEK read path needs is stored. The COSE recipients,
 // including the tenant wrap key the insurance-recovery unwrap uses, stay in the
 // envelope header: that path is rare and out-of-band, and it reads the header
-// anyway. No key material is stored here either — the wrapped CEK and its
-// region-KEK version live in OpenBao. See docs/architecture.md §8.
+// anyway. Raw CEK bytes are never stored — only the region-KEK-wrapped CEK and
+// the identifiers needed to unwrap it.
 type BlobEncryptionParams struct {
 	Space  did.DID
 	Digest []byte
 
+	// RegionWrappedCEK is the content-encryption key wrapped by the region key
+	// provider (e.g. secrets-manager transit ciphertext). Never the raw CEK:
+	// unwrapping it requires the region KEK, which never leaves the provider.
+	RegionWrappedCEK []byte
+	// RegionKeyVersion identifies which version of the region KEK wrapped the
+	// CEK, so a rotation can re-wrap in place. Opaque, so it is agnostic to the
+	// region-key cardinality decision (FIL-572).
+	RegionKeyVersion string
 	// HeaderLen is the encoded length of the blob's COSE envelope, and so the
 	// offset at which its ciphertext begins. Without it a read could not locate
 	// byte 0 of the ciphertext without decoding the header.
@@ -226,18 +234,24 @@ type LocationStore interface {
 // blob is stored as plaintext".
 //
 // It is deliberately separate from LocationStore, with no foreign key between
-// the tables: the row's existence is what marks a blob as encrypted, so its
-// lifecycle is independent of the reconstructible location cache. No key
-// material lives here — the wrapped CEK sits in OpenBao, so per-blob
-// crypto-shred means deleting the key there; Delete only drops the cached
-// decrypt parameters. Put is an upsert, so re-encrypting a blob replaces its
-// whole parameter set. Delete is idempotent — and because nothing cascades,
-// DeleteLocation does NOT touch this table: a caller removing a blob must
-// call both.
+// the tables: a location is reconstructible from the indexer or the accept
+// receipt, a wrapped CEK is not. Put is an upsert, so re-encrypting a blob
+// replaces its whole parameter set; a region-key rotation instead calls
+// RewrapEncryptionParams, which touches only the key material. Delete is the
+// per-blob crypto-shred (without the wrapped CEK the region has no path to the
+// plaintext) and is idempotent — and because nothing cascades, DeleteLocation
+// does NOT shred: a caller removing a blob must call both.
 type EncryptionParamsStore interface {
 	PutEncryptionParams(ctx context.Context, params BlobEncryptionParams) error
 	GetEncryptionParams(ctx context.Context, space did.DID, digest []byte) (*BlobEncryptionParams, error)
 	DeleteEncryptionParams(ctx context.Context, space did.DID, digest []byte) error
+	// RewrapEncryptionParams replaces the wrapped CEK and its key version for an
+	// already-encrypted blob, leaving every other parameter untouched — the write
+	// a region-key rotation performs. The ciphertext is unchanged, so the nonce,
+	// chunk size, AAD and header length must survive the rotation, and a rotation
+	// that rewrote them would corrupt the row. Returns ErrNotFound when the blob
+	// has no row (nothing to re-wrap).
+	RewrapEncryptionParams(ctx context.Context, space did.DID, digest, wrappedCEK []byte, keyVersion string) error
 }
 
 // BlobPark is one row of ingot.blob_parks: the persistable state of a blob

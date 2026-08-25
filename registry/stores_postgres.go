@@ -193,14 +193,17 @@ func (r *Postgres) PutEncryptionParams(ctx context.Context, params BlobEncryptio
 	// rejected by the constraint rather than by a second check here.
 	_, err := r.pool.Exec(ctx,
 		`INSERT INTO ingot.blob_encryption_params
-		   (space, digest, header_len, base_nonce, chunk_size, aad)
-		 VALUES ($1, $2, $3, $4, $5, $6)
+		   (space, digest, region_wrapped_cek, region_key_version,
+		    header_len, base_nonce, chunk_size, aad)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		 ON CONFLICT (space, digest) DO UPDATE
-		   SET header_len = EXCLUDED.header_len,
-		       base_nonce = EXCLUDED.base_nonce,
-		       chunk_size = EXCLUDED.chunk_size,
-		       aad        = EXCLUDED.aad`,
-		params.Space, params.Digest,
+		   SET region_wrapped_cek = EXCLUDED.region_wrapped_cek,
+		       region_key_version = EXCLUDED.region_key_version,
+		       header_len         = EXCLUDED.header_len,
+		       base_nonce         = EXCLUDED.base_nonce,
+		       chunk_size         = EXCLUDED.chunk_size,
+		       aad                = EXCLUDED.aad`,
+		params.Space, params.Digest, params.RegionWrappedCEK, params.RegionKeyVersion,
 		params.HeaderLen, params.BaseNonce, params.ChunkSize, params.AAD)
 	if err != nil {
 		return fmt.Errorf("registry: put encryption params: %w", err)
@@ -211,10 +214,10 @@ func (r *Postgres) PutEncryptionParams(ctx context.Context, params BlobEncryptio
 func (r *Postgres) GetEncryptionParams(ctx context.Context, space did.DID, digest []byte) (*BlobEncryptionParams, error) {
 	params := &BlobEncryptionParams{Space: space, Digest: digest}
 	err := r.pool.QueryRow(ctx,
-		`SELECT header_len, base_nonce, chunk_size, aad
+		`SELECT region_wrapped_cek, region_key_version, header_len, base_nonce, chunk_size, aad
 		 FROM ingot.blob_encryption_params WHERE space = $1 AND digest = $2`,
-		space, digest).Scan(&params.HeaderLen, &params.BaseNonce,
-		&params.ChunkSize, &params.AAD)
+		space, digest).Scan(&params.RegionWrappedCEK, &params.RegionKeyVersion,
+		&params.HeaderLen, &params.BaseNonce, &params.ChunkSize, &params.AAD)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -229,6 +232,23 @@ func (r *Postgres) DeleteEncryptionParams(ctx context.Context, space did.DID, di
 		`DELETE FROM ingot.blob_encryption_params WHERE space = $1 AND digest = $2`, space, digest)
 	if err != nil {
 		return fmt.Errorf("registry: delete encryption params: %w", err)
+	}
+	return nil
+}
+
+func (r *Postgres) RewrapEncryptionParams(ctx context.Context, space did.DID, digest, wrappedCEK []byte, keyVersion string) error {
+	// The CHECK constraints reject an empty wrapped CEK or key version, so a
+	// rotation cannot blank out the material the decrypt path needs.
+	tag, err := r.pool.Exec(ctx,
+		`UPDATE ingot.blob_encryption_params
+		    SET region_wrapped_cek = $3, region_key_version = $4
+		  WHERE space = $1 AND digest = $2`,
+		space, digest, wrappedCEK, keyVersion)
+	if err != nil {
+		return fmt.Errorf("registry: rewrap encryption params: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
 	}
 	return nil
 }
