@@ -10,6 +10,7 @@ import (
 	"net/url"
 
 	"github.com/fil-forge/libforge/blobindex"
+	"github.com/fil-forge/libforge/digestutil"
 
 	indexclient "github.com/fil-forge/indexing-service/pkg/client"
 	contentcmds "github.com/fil-forge/libforge/commands/content"
@@ -148,23 +149,23 @@ func NewForge(cfg ForgeConfig) (*Forge, error) {
 // off/n select a sub-range of the located bytes: stored bytes [off, off+n)
 // of the blob. n < 0 retrieves the locator's whole range (the entire blob,
 // for a body blob).
-func (f *Forge) retrieve(ctx context.Context, space did.DID, c cid.Cid, off, n int64) (io.ReadCloser, int64, error) {
-	rc, got, err := f.doRetrieve(ctx, space, c, off, n)
+func (f *Forge) retrieve(ctx context.Context, space did.DID, digest mh.Multihash, off, n int64) (io.ReadCloser, int64, error) {
+	rc, got, err := f.doRetrieve(ctx, space, digest, off, n)
 	if err != nil && !errors.Is(err, ErrNotFound) {
 		f.logger.Warn("forge: retrieve failed",
-			zap.Stringer("space", space), zap.Stringer("cid", c), zap.Error(err))
+			zap.Stringer("space", space), zap.String("digest", digestutil.Format(digest)), zap.Error(err))
 	}
 	return rc, got, err
 }
 
-func (f *Forge) doRetrieve(ctx context.Context, space did.DID, c cid.Cid, off, n int64) (io.ReadCloser, int64, error) {
-	locations, err := f.locator.Locate(ctx, []did.DID{space}, c.Hash())
+func (f *Forge) doRetrieve(ctx context.Context, space did.DID, digest mh.Multihash, off, n int64) (io.ReadCloser, int64, error) {
+	locations, err := f.locator.Locate(ctx, []did.DID{space}, digest)
 	if err != nil {
 		var nf locator.NotFoundError
 		if errors.As(err, &nf) {
 			return nil, 0, ErrNotFound
 		}
-		return nil, 0, fmt.Errorf("forge: locate %s: %w", c, err)
+		return nil, 0, fmt.Errorf("forge: locate %s: %w", digestutil.Format(digest), err)
 	}
 	if len(locations) == 0 {
 		return nil, 0, ErrNotFound
@@ -173,7 +174,7 @@ func (f *Forge) doRetrieve(ctx context.Context, space did.DID, c cid.Cid, off, n
 	loc := locations[0]
 	cm := loc.Commitment
 	if len(cm.Location) == 0 {
-		return nil, 0, fmt.Errorf("forge: empty location URL set for %s", c)
+		return nil, 0, fmt.Errorf("forge: empty location URL set for %s", digestutil.Format(digest))
 	}
 	target := cm.Location[0]
 
@@ -245,7 +246,7 @@ func (f *Forge) doRetrieve(ctx context.Context, space did.DID, c cid.Cid, off, n
 		execution.WithDelegations(proofs...),
 	)
 	if err != nil {
-		return nil, 0, fmt.Errorf("forge: retrieve %s: %w", c, err)
+		return nil, 0, fmt.Errorf("forge: retrieve %s: %w", digestutil.Format(digest), err)
 	}
 
 	hcRes, ok := meta.(*retrieval.HTTPHeaderResponseContainer)
@@ -260,7 +261,7 @@ func (f *Forge) doRetrieve(ctx context.Context, space did.DID, c cid.Cid, off, n
 // via a UCAN-authorized /content/retrieve. It buffers the whole block, so it is
 // for small catalog blocks; object-body blobs use the streaming OpenBlob.
 func (f *Forge) GetBlock(ctx context.Context, space did.DID, c cid.Cid) (block.Block, error) {
-	rc, wantLen, err := f.retrieve(ctx, space, c, 0, -1)
+	rc, wantLen, err := f.retrieve(ctx, space, c.Hash(), 0, -1)
 	if err != nil {
 		return nil, err
 	}
@@ -281,7 +282,7 @@ func (f *Forge) GetBlock(ctx context.Context, space did.DID, c cid.Cid) (block.B
 // straight off the /content/retrieve response; the caller owns the reader and
 // must Close it.
 func (f *Forge) OpenBlob(ctx context.Context, space did.DID, digest mh.Multihash) (io.ReadCloser, error) {
-	rc, _, err := f.retrieve(ctx, space, cid.NewCidV1(cid.Raw, digest), 0, -1)
+	rc, _, err := f.retrieve(ctx, space, digest, 0, -1)
 	return rc, err
 }
 
@@ -289,7 +290,7 @@ func (f *Forge) OpenBlob(ctx context.Context, space did.DID, digest mh.Multihash
 // piri — a ranged /content/retrieve, so the decrypting read path fetches only
 // the ciphertext chunks a plaintext range needs rather than the whole blob.
 func (f *Forge) OpenBlobRange(ctx context.Context, space did.DID, digest mh.Multihash, off, n int64) (io.ReadCloser, error) {
-	rc, _, err := f.retrieve(ctx, space, cid.NewCidV1(cid.Raw, digest), off, n)
+	rc, _, err := f.retrieve(ctx, space, digest, off, n)
 	return rc, err
 }
 
