@@ -209,7 +209,7 @@ func (b *Backend) splitSpool(ctx context.Context, bucket string, r io.Reader) (m
 		if err := b.intents.PutIntent(ctx, registry.UploadIntent{
 			Digest:    blob.Digest,
 			LocalPath: b.spool.Path(blob.Digest),
-			Size:      blob.Length,
+			Size:      blob.Len(),
 			State:     registry.IntentSpooled,
 			Bucket:    bucket,
 		}); err != nil {
@@ -244,7 +244,7 @@ func (b *Backend) uploadBlobs(ctx context.Context, space did.DID, blobs []msbuck
 		} else if err != nil && !errors.Is(err, registry.ErrNotFound) {
 			return fmt.Errorf("lookup location: %w", err)
 		}
-		res, err := b.uploader.UploadBlob(ctx, space, digest, blob.Length, b.spool.Path(digest))
+		res, err := b.uploader.UploadBlob(ctx, space, digest, blob.Len(), b.spool.Path(digest))
 		if err != nil {
 			return fmt.Errorf("upload blob: %w", err)
 		}

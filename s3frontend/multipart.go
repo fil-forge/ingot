@@ -533,7 +533,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 			if err != nil {
 				return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: part blob %x: %w", d, err)
 			}
-			blobs = append(blobs, msbucket.BlobRef{Digest: d, Offset: offset, Length: in.Size})
+			blobs = append(blobs, msbucket.BlobRef{Digest: d, Start: offset, End: offset + in.Size - 1})
 			offset += in.Size
 		}
 		partSizes = append(partSizes, offset-partStart)
@@ -805,7 +805,7 @@ func (b *Backend) parkBlobs(ctx context.Context, space did.DID, blobs []msbucket
 			return fmt.Errorf("lookup park: %w", err)
 		}
 
-		res, err := b.deferred.UploadBlob(ctx, space, digest, blob.Length, b.spool.Path(digest), uploader.WithConclude(false))
+		res, err := b.deferred.UploadBlob(ctx, space, digest, blob.Len(), b.spool.Path(digest), uploader.WithConclude(false))
 		if err != nil {
 			return fmt.Errorf("park blob: %w", err)
 		}
@@ -834,7 +834,7 @@ func (b *Backend) parkBlobs(ctx context.Context, space did.DID, blobs []msbucket
 			AddTask:       res.AddTask.Bytes(),
 			AcceptTask:    res.AcceptTask.Bytes(),
 			PutInvocation: res.PutInvocation,
-			Size:          blob.Length,
+			Size:          blob.Len(),
 		}); err != nil {
 			return fmt.Errorf("record park: %w", err)
 		}
@@ -889,7 +889,7 @@ func (b *Backend) concludeBlobs(ctx context.Context, space did.DID, blobs []msbu
 		} else {
 			// Never parked (crash between spool and park): the spooled copy
 			// drives the whole synchronous upload.
-			res, uerr := b.uploader.UploadBlob(ctx, space, digest, blob.Length, b.spool.Path(digest))
+			res, uerr := b.uploader.UploadBlob(ctx, space, digest, blob.Len(), b.spool.Path(digest))
 			if uerr != nil {
 				return fmt.Errorf("upload blob: %w", uerr)
 			}

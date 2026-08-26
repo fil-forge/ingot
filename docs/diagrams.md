@@ -362,7 +362,7 @@ sequenceDiagram
   blocks are local.
 - The indexer-backed locator (`blockstore/locator`) compiles but is never
   injected; `module.go` always wires `LocalLocator`.
-- Manifest coordinates are plaintext: `BlobRef.Offset/Length`, `Body.Size`,
+- Manifest coordinates are plaintext: `BlobRef.Start/End`, `Body.Size`,
   ETag and Content-Length never change with encryption. `BlobRef.Digest`
   names the stored — for an encrypted blob, ciphertext — bytes; only the
   per-blob open translates between the two.

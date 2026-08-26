@@ -112,7 +112,7 @@ func newEncFixture(t *testing.T, plaintext []byte, blobSize int, plainBlobs ...i
 				t.Fatalf("PutLocation: %v", err)
 			}
 		}
-		blobs = append(blobs, msbucket.BlobRef{Digest: digest, Offset: int64(off), Length: int64(len(piece))})
+		blobs = append(blobs, msbucket.BlobRef{Digest: digest, Start: int64(off), End: int64(end - 1)})
 		off = end
 	}
 

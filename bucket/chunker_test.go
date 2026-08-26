@@ -58,17 +58,17 @@ func TestSplitBody_StreamingRoundTrip(t *testing.T) {
 		t.Errorf("whole-body MD5 mismatch")
 	}
 
-	wantBounds := []struct{ off, length int64 }{{0, 4096}, {4096, 4096}, {8192, 1808}}
+	wantBounds := []struct{ start, end int64 }{{0, 4095}, {4096, 8191}, {8192, 9999}}
 	if len(body.Blobs) != len(wantBounds) {
 		t.Fatalf("got %d blobs, want %d", len(body.Blobs), len(wantBounds))
 	}
 	for i, w := range wantBounds {
 		b := body.Blobs[i]
-		if b.Offset != w.off || b.Length != w.length {
-			t.Errorf("blob %d = {off:%d len:%d}, want {off:%d len:%d}", i, b.Offset, b.Length, w.off, w.length)
+		if b.Start != w.start || b.End != w.end {
+			t.Errorf("blob %d = [%d,%d], want [%d,%d]", i, b.Start, b.End, w.start, w.end)
 		}
 		// The recorded digest must be the sha256 multihash of exactly that slice.
-		want, _ := mh.Sum(data[w.off:w.off+w.length], mh.SHA2_256, -1)
+		want, _ := mh.Sum(data[w.start:w.end+1], mh.SHA2_256, -1)
 		if !bytes.Equal(b.Digest, want) {
 			t.Errorf("blob %d digest mismatch", i)
 		}

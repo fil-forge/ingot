@@ -102,7 +102,7 @@ but unwired. The full trace is the
 
 **Encrypted blobs** (the FilOne encryption design's read side) decrypt inside
 the per-blob open, leaving every other read-path value plaintext: the
-manifest's `BlobRef.Offset/Length`, `Body.Size`, ETag and Content-Length are
+manifest's `BlobRef.Start/End`, `Body.Size`, ETag and Content-Length are
 plaintext coordinates, while `BlobRef.Digest` names the stored FEE envelope.
 A `blob_encryption_params` row marks a blob encrypted and carries what its
 decryptor needs; the read unwraps the region-wrapped CEK through
