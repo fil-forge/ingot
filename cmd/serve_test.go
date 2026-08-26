@@ -50,6 +50,9 @@ func TestApp_GraphValidates(t *testing.T) {
 		UploadServiceDID: "did:web:upload.example",
 		AuthServiceURL:   "http://127.0.0.1:7000",
 		AuthServiceDID:   "did:web:auth.example",
+		// The region key provider is a required dependency; inprocess needs
+		// no external service (the constructor generates a throwaway KEK).
+		RegionKey: config.RegionKeyConfig{Provider: "inprocess"},
 	}
 
 	app, err := buildApp(t.Context(), cfg, zaptest.NewLogger(t))
