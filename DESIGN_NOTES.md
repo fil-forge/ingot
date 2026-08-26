@@ -46,6 +46,25 @@ compare-and-swap the bucket root in Postgres. The reference index
 claim count reaches zero. The full trace is the
 [PutObject diagram](./docs/diagrams.md#putobject-spool-and-upload-off-the-lock-commit-under-it).
 
+**Every body blob is encrypted at ingest** (the FilOne encryption design's
+write side, `s3frontend/encrypt.go`). Each plaintext piece SplitBody cuts
+gets a fresh CEK and streams through FEE into a recipient-less
+`COSE_Encrypt0` envelope (AES-256-GCM STREAM, 256 KiB chunks); the envelope
+is what the spool stores and the network receives, under its **ciphertext**
+digest. The CEK is wrapped by `regionkey.Provider` bound to (space, digest)
+and stored in the blob's `blob_encryption_params` row before any manifest
+can reference the digest. The split geometry, manifest spans, `Body.Size`,
+sha256/md5 and ETag are all plaintext values — only the digest and the
+stored sizes (`upload_intents.Size`, `blob_locations.Size`) name ciphertext.
+Consequences, per the RFC: content **dedup is gone** for bodies (a fresh CEK
+makes every stored digest unique), a DELETE that releases a blob's last
+claim also deletes its params row (crypto-shred — the ciphertext is
+unreadable even where copies survive), and **cross-space CopyObject is
+rejected** `NotImplemented` (the CEK wrap is space-bound; a rewrap flow is a
+filed follow-up). The tenant/insurance recipient of the RFC waits on Hilt's
+wrap-key registry and DID-document publication; FEE's multi-recipient model
+lets new writes add it without changing this layer.
+
 A `200` therefore means the body is durable and accepted on the network and
 the catalog mutation is fsynced locally; the catalog becomes durable on
 Forge through the background ship below.

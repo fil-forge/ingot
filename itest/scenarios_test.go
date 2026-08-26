@@ -251,9 +251,8 @@ func TestForgeScenarios(t *testing.T) {
 			t.Fatalf("CreateMultipartUpload: %v", err)
 		}
 		spoolBefore := spoolBlobCount(t, ctx, s)
-		// A 150 KiB part spans three 64 KiB blobs. The content must be unique
-		// to this test — patternBytes at the same offsets would dedup against
-		// the round-trip subtests' already-spooled blobs and skew the counts.
+		// A 150 KiB part spans three 64 KiB blobs (plaintext split; each is
+		// stored as its own envelope).
 		part := patternBytes(150 << 10)
 		for i := range part {
 			part[i] ^= 0xA5

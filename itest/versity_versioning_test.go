@@ -72,9 +72,7 @@ var versioningPass = []forgeCase{
 	// CopyObject
 	{name: "CopyObject_invalid_versionId", fn: integration.Versioning_CopyObject_invalid_versionId},
 	{name: "CopyObject_encoded_versionid_separator_invalid_versionId", fn: integration.Versioning_CopyObject_encoded_versionid_separator_invalid_versionId},
-	{name: "CopyObject_success", fn: integration.Versioning_CopyObject_success},
 	{name: "CopyObject_non_existing_version_id", fn: integration.Versioning_CopyObject_non_existing_version_id},
-	{name: "CopyObject_from_an_object_version", fn: integration.Versioning_CopyObject_from_an_object_version},
 	{name: "CopyObject_special_chars", fn: integration.Versioning_CopyObject_special_chars},
 	// HeadObject
 	{name: "HeadObject_invalid_versionId", fn: integration.Versioning_HeadObject_invalid_versionId},
@@ -149,7 +147,12 @@ var versioningPass = []forgeCase{
 	{name: "PutGetDeleteObjectTagging_success", fn: integration.Versioning_PutGetDeleteObjectTagging_success},
 }
 
-// versioningXFail is empty: DeleteObject_non_existing_objects moved to the
-// pass table with object-lock creation support. Kept non-nil so the category
-// registration stays stable when rows return.
-var versioningXFail []forgeCase
+// versioningXFail: both cases copy from a second bucket, and cross-bucket
+// copies are cross-SPACE copies (every bucket has its own space), rejected
+// NotImplemented — each blob's CEK wrap is bound to (space, digest), so
+// serving them needs the rewrap flow (a filed follow-up; see copyObjectXFail
+// in versity_object_test.go).
+var versioningXFail = []forgeCase{
+	{name: "CopyObject_success", fn: integration.Versioning_CopyObject_success},
+	{name: "CopyObject_from_an_object_version", fn: integration.Versioning_CopyObject_from_an_object_version},
+}
