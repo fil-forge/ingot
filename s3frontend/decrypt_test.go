@@ -131,6 +131,18 @@ func newEncFixture(t *testing.T, plaintext []byte, blobSize int, plainBlobs ...i
 	}
 }
 
+// testRegionKeys returns an in-process region key provider over a random KEK
+// — the required RegionKeys dependency for any test Backend that serves
+// object reads.
+func testRegionKeys(t *testing.T) regionkey.Provider {
+	t.Helper()
+	p, err := regionkey.NewInProcessProvider("v1", randBytes(t, regionkey.KEKLen))
+	if err != nil {
+		t.Fatalf("NewInProcessProvider: %v", err)
+	}
+	return p
+}
+
 func randBytes(t *testing.T, n int) []byte {
 	t.Helper()
 	b := make([]byte, n)
@@ -291,23 +303,17 @@ func TestDecryptingRead_TransplantedRowFails(t *testing.T) {
 	}
 }
 
-// With no region key provider configured the opener skips encryption lookups
-// entirely and serves stored bytes — the plaintext-only deployment contract.
-func TestDecryptingRead_NilProviderServesStoredBytes(t *testing.T) {
+// The encryption dependencies are required: a Backend missing them fails a
+// read with a clear error rather than serving ciphertext as plaintext or
+// nil-panicking.
+func TestDecryptingRead_MissingDepsFails(t *testing.T) {
 	ctx := context.Background()
 	fx := newEncFixture(t, patterned(9000), 10000)
 
 	fx.backend.regionKeys = nil
-	opener, err := fx.backend.bodyOpener(ctx, fx.space, fx.body)
-	if err != nil {
-		t.Fatalf("bodyOpener: %v", err)
-	}
-	got, err := io.ReadAll(msbucket.OpenBody(ctx, opener, fx.space, fx.body))
-	if err != nil {
-		t.Fatalf("read: %v", err)
-	}
-	if bytes.Equal(got, fx.plaintext[:len(got)]) {
-		t.Fatal("expected raw envelope bytes, got decrypted plaintext")
+	if _, err := fx.backend.bodyOpener(ctx, fx.space, fx.body); err == nil ||
+		!strings.Contains(err.Error(), "encryption dependencies not configured") {
+		t.Fatalf("bodyOpener err = %v, want encryption-dependencies error", err)
 	}
 }
 

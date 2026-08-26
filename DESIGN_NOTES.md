@@ -111,7 +111,9 @@ decryptor needs; the read unwraps the region-wrapped CEK through
 (`aesstream.CiphertextRange`), fetches only that span (ranged from the spool
 or piri via `OpenBlobRange`), and decrypts it as it streams
 (`aesstream.SpanReader`). A tampered chunk fails authentication mid-stream.
-With no region key provider configured the lookups are skipped entirely.
+The encryption-params store and region key provider are required
+dependencies; only the provider implementation (openbao vs inprocess) is
+configuration.
 HEAD never decrypts. See `s3frontend/decrypt.go`.
 
 ## Identity & auth

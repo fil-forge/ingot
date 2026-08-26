@@ -62,8 +62,6 @@ type Backend struct {
 	remover   uploader.BlobRemover
 	encParams registry.EncryptionParamsStore
 	// regionKeys unwraps region-wrapped CEKs for the decrypting read path.
-	// Nil when no region key provider is configured (a plaintext-only
-	// deployment): encryption lookups are skipped entirely.
 	regionKeys regionkey.Provider
 	logger     *zap.Logger
 
@@ -115,9 +113,9 @@ type Deps struct {
 
 	// EncParams is the per-blob FEE encryption-parameter table: what the
 	// decrypting read path needs to serve an encrypted blob. RegionKeys
-	// unwraps its region-wrapped CEKs. Both optional as a pair — nil
-	// RegionKeys means a plaintext-only deployment, and encryption lookups
-	// are skipped entirely.
+	// unwraps its region-wrapped CEKs. Both required — which implementation
+	// backs the provider (OpenBao in production, in-process for tests and
+	// development) is configuration, but bucket encryption is not optional.
 	EncParams  registry.EncryptionParamsStore
 	RegionKeys regionkey.Provider
 

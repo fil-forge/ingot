@@ -87,10 +87,11 @@ type ServerDeps struct {
 	Parks registry.ParkStore
 
 	// EncParams is the per-blob FEE encryption-parameter table the decrypting
-	// read path consults; RegionKeys unwraps its region-wrapped CEKs.
-	// Optional as a pair: with RegionKeys nil (no region key provider
-	// configured) encryption lookups are skipped and only plaintext blobs
-	// are readable. Typically the same instance as Registry.
+	// read path consults; RegionKeys unwraps its region-wrapped CEKs. Both
+	// required: which implementation backs the provider (OpenBao in
+	// production, in-process for tests and development) is configuration,
+	// but bucket encryption is not optional. EncParams is typically the same
+	// instance as Registry.
 	EncParams  registry.EncryptionParamsStore
 	RegionKeys regionkey.Provider
 
@@ -481,6 +482,12 @@ func validateServerInputs(cfg config.ServerConfig, deps ServerDeps) error {
 	}
 	if deps.Parks == nil {
 		return errors.New("ingot: ServerDeps.Parks is required")
+	}
+	if deps.EncParams == nil {
+		return errors.New("ingot: ServerDeps.EncParams is required")
+	}
+	if deps.RegionKeys == nil {
+		return errors.New("ingot: ServerDeps.RegionKeys is required")
 	}
 	if deps.Registry == nil {
 		return errors.New("ingot: ServerDeps.Registry is required")

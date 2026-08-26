@@ -108,15 +108,10 @@ func Module(cfg config.Config) fx.Option {
 			provideKeyProofs,
 			provideVerificationKeyCache,
 			provideIAMService,
+			provideRegionKeyProvider,
 			fx.Annotate(bucketauthority.New, fx.As(new(bucketauthority.BucketAuthority))),
 		),
 		ServerModule,
-	}
-	if cfg.RegionKey.Provider != "" {
-		// The region key provider is optional: with none configured
-		// (serverParams marks it `optional:"true"`) the read path skips
-		// encryption lookups entirely and serves only plaintext blobs.
-		opts = append(opts, fx.Provide(provideRegionKeyProvider))
 	}
 	if cfg.RevocationServiceURL != "" {
 		// The revocation-firehose consumer is optional: with no revocation
@@ -175,9 +170,9 @@ type serverParams struct {
 	PreStarts []PreStartHook `group:"ingot_prestart"`
 	EncParams registry.EncryptionParamsStore
 	// RegionKeys unwraps region-wrapped CEKs for the decrypting read path.
-	// Optional: absent (no regionkey.provider configured) means a
-	// plaintext-only deployment.
-	RegionKeys regionkey.Provider `optional:"true"`
+	// Required: regionkey.provider selects the implementation (openbao in
+	// production, inprocess for tests/dev); bucket encryption is not optional.
+	RegionKeys regionkey.Provider
 }
 
 // registerServerLifecycle hooks the embedded server into the fx lifecycle. All
@@ -342,9 +337,9 @@ func provideRegionKeyProvider(cfg config.Config, logger *zap.Logger) (regionkey.
 		}
 		version := regionkey.KeyVersion(config.EmptyDefault(inproc.Version, "v1"))
 		return regionkey.NewInProcessProvider(version, kek)
+	case "":
+		return nil, fmt.Errorf("ingot: regionkey.provider is required (openbao or inprocess)")
 	default:
-		// Module only registers this constructor when a provider is
-		// configured, so "" is unreachable through the fx graph.
 		return nil, fmt.Errorf("ingot: regionkey.provider %q is not one of openbao, inprocess", cfg.RegionKey.Provider)
 	}
 }

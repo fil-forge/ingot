@@ -121,6 +121,9 @@ type BlobRangeReader interface {
 // OpenBlob with the prefix read-and-discarded (or Seek'd, for a spool file)
 // when not. It is how range-consuming callers stay correct over any tier.
 func OpenBlobRangeOf(ctx context.Context, br BlobReader, space did.DID, digest mh.Multihash, off, n int64) (io.ReadCloser, error) {
+	if off < 0 || n < 0 {
+		return nil, fmt.Errorf("blockstore: invalid blob range [%d, +%d)", off, n)
+	}
 	if rr, ok := br.(BlobRangeReader); ok {
 		return rr.OpenBlobRange(ctx, space, digest, off, n)
 	}

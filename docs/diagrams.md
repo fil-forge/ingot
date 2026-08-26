@@ -326,7 +326,7 @@ sequenceDiagram
         Note over B,LY: Current for the head, otherwise seek the prev tree at<br/>revSeqKey(seq) and confirm the stored VersionID (see version-tree)
     end
     Note over B: delete marker: 404 NoSuchKey (current) or 405 (versioned),<br/>then preconditions and selectBytes (Range, or partNumber via Body.PartSizes)
-    B->>R: bodyOpener: blob_encryption_params + blob_locations per blob<br/>(row existence = encrypted; skipped when no region key provider is configured)
+    B->>R: bodyOpener: blob_encryption_params + blob_locations per blob<br/>(row existence = encrypted)
     loop each covering blob or catalog block
         opt encrypted blob (FEE)
             B->>K: Unwrap region-wrapped CEK, bound to (space, digest)

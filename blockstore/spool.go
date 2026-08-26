@@ -121,6 +121,9 @@ func (s *Spool) OpenBlob(_ context.Context, _ did.DID, digest mh.Multihash) (io.
 // decrypting read path, which fetches only the ciphertext span a plaintext
 // range needs. A range past the file's end yields a shorter stream.
 func (s *Spool) OpenBlobRange(_ context.Context, _ did.DID, digest mh.Multihash, off, n int64) (io.ReadCloser, error) {
+	if off < 0 || n < 0 {
+		return nil, fmt.Errorf("blockstore: invalid blob range [%d, +%d)", off, n)
+	}
 	f, err := os.Open(s.Path(digest))
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, ErrNotFound

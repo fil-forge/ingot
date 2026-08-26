@@ -100,9 +100,9 @@ type Config struct {
 	// RegionKey selects and configures the region CEK wrap provider
 	// (regionkey.Provider): the component that wraps each object's
 	// content-encryption key under the region KEK for the read path (the
-	// FilOne encryption design's region wrap). Optional until the encrypting
-	// put/get paths are wired; anything consuming the provider fails at
-	// startup when it is unconfigured.
+	// FilOne encryption design's region wrap). Required: the provider choice
+	// (openbao in production, inprocess for tests/dev) is configuration, but
+	// bucket encryption is not optional.
 	RegionKey RegionKeyConfig `mapstructure:"regionkey" yaml:"regionkey"`
 
 	// LogLevel is the zap level (debug|info|warn|error).
@@ -247,7 +247,7 @@ type RegionKeyConfig struct {
 	// Provider names the implementation: "openbao" (production — the wrap
 	// runs inside the region's OpenBao transit engine and the KEK never
 	// enters ingot's process) or "inprocess" (AES-256-GCM in ingot's own
-	// process; tests and development only). Empty means unconfigured.
+	// process; tests and development only). Required.
 	Provider string `mapstructure:"provider" yaml:"provider"`
 	// OpenBao configures the "openbao" provider.
 	OpenBao OpenBaoConfig `mapstructure:"openbao" yaml:"openbao"`
@@ -391,7 +391,7 @@ func (c *Config) Validate() error {
 
 	switch c.RegionKey.Provider {
 	case "":
-		// Unconfigured is valid until the encrypting put/get paths are wired.
+		errs = multierr.Append(errs, errors.New("regionkey.provider is required (openbao or inprocess)"))
 	case "openbao":
 		if c.RegionKey.OpenBao.Key == "" {
 			errs = multierr.Append(errs, errors.New("regionkey.openbao.key (transit key name) is required when regionkey.provider is openbao"))

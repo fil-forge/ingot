@@ -35,19 +35,20 @@ import (
 // bodyOpener returns the BlobRangeOpener for one request over body: the
 // plain opener when nothing is encrypted, or a decrypting opener carrying
 // the prefetched encryption state of every encrypted blob. Prefetching here
-// (rather than at first Read) surfaces "no region key provider configured"
-// and missing-row/missing-location problems as request errors, before any
-// response headers are written.
+// (rather than at first Read) surfaces missing-row/missing-location problems
+// as request errors, before any response headers are written.
 //
-// With no region key provider configured the lookups are skipped entirely —
-// a plaintext-only deployment pays nothing — and an encrypted blob would
-// surface downstream as undecryptable bytes; deployments that encrypt must
-// configure regionkey.provider.
+// The encryption-params store and the region key provider are required
+// dependencies (validated at server construction): which implementation
+// backs the provider — OpenBao in production, in-process for tests and
+// development — is configuration, but bucket encryption itself is not
+// optional. The guard below only turns a mis-built harness into a clear
+// error instead of a nil-pointer panic.
 func (b *Backend) bodyOpener(ctx context.Context, space did.DID, body msbucket.Body) (msbucket.BlobRangeOpener, error) {
-	plain := msbucket.NewPlainOpener(b.read)
 	if b.regionKeys == nil || b.encParams == nil {
-		return plain, nil
+		return nil, errors.New("s3frontend: encryption dependencies not configured (EncParams, RegionKeys)")
 	}
+	plain := msbucket.NewPlainOpener(b.read)
 
 	var enc map[string]encBlob
 	for _, ref := range body.Blobs {
@@ -82,7 +83,6 @@ func (b *Backend) bodyOpener(ctx context.Context, space did.DID, body msbucket.B
 		plain: plain,
 		read:  b.read,
 		keys:  b.regionKeys,
-		space: space,
 		enc:   enc,
 	}, nil
 }
@@ -101,7 +101,6 @@ type decryptingOpener struct {
 	plain msbucket.BlobRangeOpener
 	read  blockstore.BlobReader
 	keys  regionkey.Provider
-	space did.DID
 	enc   map[string]encBlob
 }
 
@@ -114,7 +113,7 @@ func (o *decryptingOpener) OpenBlobRange(ctx context.Context, space did.DID, ref
 	// The CEK's wrap is context-bound to (space, digest): a row transplanted
 	// under another blob fails authentication here rather than decrypting.
 	cek, err := o.keys.Unwrap(ctx,
-		regionkey.BindingContext{Space: o.space, Digest: ref.Digest},
+		regionkey.BindingContext{Space: space, Digest: ref.Digest},
 		regionkey.WrappedKey{
 			Version:    regionkey.KeyVersion(e.params.RegionKeyVersion),
 			Ciphertext: e.params.RegionWrappedCEK,
@@ -144,7 +143,7 @@ func (o *decryptingOpener) OpenBlobRange(ctx context.Context, space did.DID, ref
 		return io.NopCloser(bytes.NewReader(nil)), nil
 	}
 
-	span, err := blockstore.OpenBlobRangeOf(ctx, o.read, o.space, ref.Digest, e.params.HeaderLen+start, n)
+	span, err := blockstore.OpenBlobRangeOf(ctx, o.read, space, ref.Digest, e.params.HeaderLen+start, n)
 	if err != nil {
 		return nil, fmt.Errorf("s3frontend: fetch ciphertext span of blob %x: %w", ref.Digest, err)
 	}

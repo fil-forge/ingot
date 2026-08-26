@@ -41,3 +41,13 @@ max_blob_size: 65536
 cors_allowed_origins:
   - "https://app.example"
   - "https://*.dev.example"
+
+# Region CEK wrap provider (required): the stack's ingot-openbao transit
+# engine, provisioned by ingot-openbao-init; the token arrives via
+# INGOT_REGIONKEY_OPENBAO_TOKEN from the compose environment.
+regionkey:
+  provider: openbao
+  openbao:
+    address: "http://ingot-openbao:8200"
+    mount: transit
+    key: region-kek
