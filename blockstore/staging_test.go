@@ -42,7 +42,7 @@ func (f *fakeMeta) MarkSegmentSealed(_ context.Context, plane blockstore.Plane, 
 	f.roots = append(f.roots, opRoots...)
 	return nil
 }
-func (f *fakeMeta) MarkSegmentShipped(_ context.Context, plane blockstore.Plane, seq uint64, shippedAt int64, _ []byte, _ []blockstore.OpRoot) error {
+func (f *fakeMeta) MarkSegmentShipped(_ context.Context, plane blockstore.Plane, seq uint64, shippedAt int64, _ multihash.Multihash, _ []blockstore.OpRoot) error {
 	if r, ok := f.rows[seq]; ok {
 		r.ShippedAt = shippedAt
 	}
@@ -86,7 +86,7 @@ func (f *fakeMeta) RehydrateSegment(_ context.Context, m logstore.SegmentMeta) e
 
 // nopFlush is the per-plane ship callback for these tests: the store
 // owns the ship-state transition, so the closure is a no-op.
-func nopFlush(_ context.Context, _ *logstore.Segment) ([]byte, error) { return nil, nil }
+func nopFlush(_ context.Context, _ *logstore.Segment) (multihash.Multihash, error) { return nil, nil }
 
 // noopBase satisfies blockstore.BlockReader but always returns
 // errUnknownBase so we can detect when a GetBlock falls through

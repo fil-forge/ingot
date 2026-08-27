@@ -11,6 +11,7 @@ import (
 	"github.com/ipfs/go-cid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/multiformats/go-multihash"
 )
 
 // Compile-time assertions: *Postgres satisfies every store interface.
@@ -18,6 +19,7 @@ var (
 	_ BlobRefStore          = (*Postgres)(nil)
 	_ IntentStore           = (*Postgres)(nil)
 	_ LocationStore         = (*Postgres)(nil)
+	_ EncryptionParamsStore = (*Postgres)(nil)
 	_ InclusionStore        = (*Postgres)(nil)
 	_ MultipartStore        = (*Postgres)(nil)
 	_ GCStore               = (*Postgres)(nil)
@@ -38,7 +40,7 @@ func (r *Postgres) AddBlobClaim(ctx context.Context, c BlobClaim) error {
 	return nil
 }
 
-func (r *Postgres) DeleteBlobClaim(ctx context.Context, digest []byte, bucket, objectKey, versionID string) error {
+func (r *Postgres) DeleteBlobClaim(ctx context.Context, digest multihash.Multihash, bucket, objectKey, versionID string) error {
 	_, err := r.pool.Exec(ctx,
 		`DELETE FROM ingot.blob_refs
 		 WHERE digest = $1 AND bucket = $2 AND object_key = $3 AND version_id = $4`,
@@ -49,7 +51,7 @@ func (r *Postgres) DeleteBlobClaim(ctx context.Context, digest []byte, bucket, o
 	return nil
 }
 
-func (r *Postgres) CountClaims(ctx context.Context, space did.DID, digest []byte) (int, error) {
+func (r *Postgres) CountClaims(ctx context.Context, space did.DID, digest multihash.Multihash) (int, error) {
 	var n int
 	err := r.pool.QueryRow(ctx,
 		`SELECT count(*) FROM ingot.blob_refs WHERE space = $1 AND digest = $2`,
@@ -79,7 +81,7 @@ func (r *Postgres) PutIntent(ctx context.Context, in UploadIntent) error {
 	return nil
 }
 
-func (r *Postgres) SetIntentState(ctx context.Context, digest []byte, state string) error {
+func (r *Postgres) SetIntentState(ctx context.Context, digest multihash.Multihash, state string) error {
 	tag, err := r.pool.Exec(ctx,
 		`UPDATE ingot.upload_intents SET state = $2, updated_at = now() WHERE digest = $1`,
 		digest, state)
@@ -92,7 +94,7 @@ func (r *Postgres) SetIntentState(ctx context.Context, digest []byte, state stri
 	return nil
 }
 
-func (r *Postgres) GetIntent(ctx context.Context, digest []byte) (*UploadIntent, error) {
+func (r *Postgres) GetIntent(ctx context.Context, digest multihash.Multihash) (*UploadIntent, error) {
 	in := &UploadIntent{Digest: digest}
 	var bucket *string
 	err := r.pool.QueryRow(ctx,
@@ -137,7 +139,7 @@ func (r *Postgres) ListIntentsByState(ctx context.Context, state string) ([]Uplo
 	return out, nil
 }
 
-func (r *Postgres) DeleteIntent(ctx context.Context, digest []byte) error {
+func (r *Postgres) DeleteIntent(ctx context.Context, digest multihash.Multihash) error {
 	_, err := r.pool.Exec(ctx, `DELETE FROM ingot.upload_intents WHERE digest = $1`, digest)
 	if err != nil {
 		return fmt.Errorf("registry: delete intent: %w", err)
@@ -160,10 +162,11 @@ func (r *Postgres) PutLocation(ctx context.Context, loc BlobLocation) error {
 	return nil
 }
 
-func (r *Postgres) GetLocation(ctx context.Context, space did.DID, digest []byte) (*BlobLocation, error) {
+func (r *Postgres) GetLocation(ctx context.Context, space did.DID, digest multihash.Multihash) (*BlobLocation, error) {
 	loc := &BlobLocation{Space: space, Digest: digest}
 	err := r.pool.QueryRow(ctx,
-		`SELECT provider, url, size FROM ingot.blob_locations WHERE space = $1 AND digest = $2`,
+		`SELECT provider, url, size
+		 FROM ingot.blob_locations WHERE space = $1 AND digest = $2`,
 		space, digest).Scan(&loc.Provider, &loc.URL, &loc.Size)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
@@ -174,11 +177,79 @@ func (r *Postgres) GetLocation(ctx context.Context, space did.DID, digest []byte
 	return loc, nil
 }
 
-func (r *Postgres) DeleteLocation(ctx context.Context, space did.DID, digest []byte) error {
+func (r *Postgres) DeleteLocation(ctx context.Context, space did.DID, digest multihash.Multihash) error {
 	_, err := r.pool.Exec(ctx,
 		`DELETE FROM ingot.blob_locations WHERE space = $1 AND digest = $2`, space, digest)
 	if err != nil {
 		return fmt.Errorf("registry: delete location: %w", err)
+	}
+	return nil
+}
+
+// EncryptionParamsStore ======================================================
+
+func (r *Postgres) PutEncryptionParams(ctx context.Context, params BlobEncryptionParams) error {
+	// Upsert: a re-encryption replaces the parameter set for a blob already
+	// stored. Every column is NOT NULL with a CHECK, so an incomplete set is
+	// rejected by the constraint rather than by a second check here.
+	_, err := r.pool.Exec(ctx,
+		`INSERT INTO ingot.blob_encryption_params
+		   (space, digest, region_wrapped_cek, region_key_version,
+		    header_len, base_nonce, chunk_size, aad)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		 ON CONFLICT (space, digest) DO UPDATE
+		   SET region_wrapped_cek = EXCLUDED.region_wrapped_cek,
+		       region_key_version = EXCLUDED.region_key_version,
+		       header_len         = EXCLUDED.header_len,
+		       base_nonce         = EXCLUDED.base_nonce,
+		       chunk_size         = EXCLUDED.chunk_size,
+		       aad                = EXCLUDED.aad`,
+		params.Space, params.Digest, params.RegionWrappedCEK, params.RegionKeyVersion,
+		params.HeaderLen, params.BaseNonce, params.ChunkSize, params.AAD)
+	if err != nil {
+		return fmt.Errorf("registry: put encryption params: %w", err)
+	}
+	return nil
+}
+
+func (r *Postgres) GetEncryptionParams(ctx context.Context, space did.DID, digest multihash.Multihash) (*BlobEncryptionParams, error) {
+	params := &BlobEncryptionParams{Space: space, Digest: digest}
+	err := r.pool.QueryRow(ctx,
+		`SELECT region_wrapped_cek, region_key_version, header_len, base_nonce, chunk_size, aad
+		 FROM ingot.blob_encryption_params WHERE space = $1 AND digest = $2`,
+		space, digest).Scan(&params.RegionWrappedCEK, &params.RegionKeyVersion,
+		&params.HeaderLen, &params.BaseNonce, &params.ChunkSize, &params.AAD)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("registry: get encryption params: %w", err)
+	}
+	return params, nil
+}
+
+func (r *Postgres) DeleteEncryptionParams(ctx context.Context, space did.DID, digest multihash.Multihash) error {
+	_, err := r.pool.Exec(ctx,
+		`DELETE FROM ingot.blob_encryption_params WHERE space = $1 AND digest = $2`, space, digest)
+	if err != nil {
+		return fmt.Errorf("registry: delete encryption params: %w", err)
+	}
+	return nil
+}
+
+func (r *Postgres) RewrapEncryptionParams(ctx context.Context, space did.DID, digest multihash.Multihash, wrappedCEK []byte, keyVersion string) error {
+	// The CHECK constraints reject an empty wrapped CEK or key version, so a
+	// rotation cannot blank out the material the decrypt path needs.
+	tag, err := r.pool.Exec(ctx,
+		`UPDATE ingot.blob_encryption_params
+		    SET region_wrapped_cek = $3, region_key_version = $4
+		  WHERE space = $1 AND digest = $2`,
+		space, digest, wrappedCEK, keyVersion)
+	if err != nil {
+		return fmt.Errorf("registry: rewrap encryption params: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
 	}
 	return nil
 }
@@ -199,7 +270,7 @@ func (r *Postgres) PutPark(ctx context.Context, p BlobPark) error {
 	return nil
 }
 
-func (r *Postgres) GetPark(ctx context.Context, digest []byte) (*BlobPark, error) {
+func (r *Postgres) GetPark(ctx context.Context, digest multihash.Multihash) (*BlobPark, error) {
 	park := &BlobPark{Digest: digest}
 	err := r.pool.QueryRow(ctx,
 		`SELECT add_task, accept_task, put_invocation, size, created_at
@@ -214,7 +285,7 @@ func (r *Postgres) GetPark(ctx context.Context, digest []byte) (*BlobPark, error
 	return park, nil
 }
 
-func (r *Postgres) DeletePark(ctx context.Context, digest []byte) error {
+func (r *Postgres) DeletePark(ctx context.Context, digest multihash.Multihash) error {
 	_, err := r.pool.Exec(ctx,
 		`DELETE FROM ingot.blob_parks WHERE digest = $1`, digest)
 	if err != nil {
@@ -246,7 +317,7 @@ func (r *Postgres) PutInclusions(ctx context.Context, incs []BlobInclusion) erro
 	return nil
 }
 
-func (r *Postgres) GetInclusion(ctx context.Context, space did.DID, digest []byte) (*BlobInclusion, error) {
+func (r *Postgres) GetInclusion(ctx context.Context, space did.DID, digest multihash.Multihash) (*BlobInclusion, error) {
 	inc := &BlobInclusion{Space: space, Digest: digest}
 	err := r.pool.QueryRow(ctx,
 		`SELECT shard_digest, range_start, range_end
@@ -370,6 +441,10 @@ func (r *Postgres) PutPart(ctx context.Context, p MultipartPart) error {
 	if state == "" {
 		state = PartParked
 	}
+	// BlobDigests ([]multihash.Multihash) rides pgx's underlying-type plan into
+	// bytea[]: pgx must try that plan before its Stringer plan, or a Multihash
+	// (whose String() is base58) would land as text — pgx v5.10+ orders them
+	// correctly; don't downgrade below that.
 	_, err := r.pool.Exec(ctx,
 		`INSERT INTO ingot.multipart_parts (upload_id, part_number, etag_md5, size, checksum, blob_digests, state)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -463,7 +538,7 @@ func (r *Postgres) ListStaleSessions(ctx context.Context, state string, cutoff t
 	return out, nil
 }
 
-func (r *Postgres) CountPartRefs(ctx context.Context, digest []byte, excludeUploadID string) (int, error) {
+func (r *Postgres) CountPartRefs(ctx context.Context, digest multihash.Multihash, excludeUploadID string) (int, error) {
 	var n int
 	err := r.pool.QueryRow(ctx,
 		`SELECT count(*) FROM ingot.multipart_parts

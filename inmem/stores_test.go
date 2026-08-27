@@ -2,6 +2,8 @@ package inmem
 
 import (
 	"context"
+	"errors"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -10,6 +12,7 @@ import (
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/libforge/testutil"
 	"github.com/fil-forge/ucantone/did"
+	"github.com/multiformats/go-multihash"
 )
 
 func TestBlobRefs_CountToZero(t *testing.T) {
@@ -192,8 +195,8 @@ func TestParts_OrderedAndCascade(t *testing.T) {
 	}
 
 	// Insert out of order; ListParts must return ascending part numbers.
-	mustPutPart(t, m, registry.MultipartPart{UploadID: id, PartNumber: 2, ETagMD5: []byte("m2"), Size: 2, BlobDigests: [][]byte{[]byte("d2")}})
-	mustPutPart(t, m, registry.MultipartPart{UploadID: id, PartNumber: 1, ETagMD5: []byte("m1"), Size: 1, BlobDigests: [][]byte{[]byte("d1a"), []byte("d1b")}})
+	mustPutPart(t, m, registry.MultipartPart{UploadID: id, PartNumber: 2, ETagMD5: []byte("m2"), Size: 2, BlobDigests: []multihash.Multihash{[]byte("d2")}})
+	mustPutPart(t, m, registry.MultipartPart{UploadID: id, PartNumber: 1, ETagMD5: []byte("m1"), Size: 1, BlobDigests: []multihash.Multihash{[]byte("d1a"), []byte("d1b")}})
 
 	parts, err := m.ListParts(ctx, id)
 	if err != nil {
@@ -214,7 +217,7 @@ func TestParts_OrderedAndCascade(t *testing.T) {
 	}
 
 	// PutPart against a missing session is rejected (FK).
-	if err := m.PutPart(ctx, registry.MultipartPart{UploadID: "missing", PartNumber: 1, ETagMD5: []byte("m"), BlobDigests: [][]byte{[]byte("d")}}); err != registry.ErrNotFound {
+	if err := m.PutPart(ctx, registry.MultipartPart{UploadID: "missing", PartNumber: 1, ETagMD5: []byte("m"), BlobDigests: []multihash.Multihash{[]byte("d")}}); err != registry.ErrNotFound {
 		t.Fatalf("PutPart missing session err = %v, want ErrNotFound", err)
 	}
 
@@ -251,6 +254,173 @@ func TestLocations_RoundTrip(t *testing.T) {
 	}
 	if _, err := m.GetLocation(ctx, space, digest); err != registry.ErrNotFound {
 		t.Fatalf("GetLocation after delete err = %v, want ErrNotFound", err)
+	}
+}
+
+// feeParams returns a complete parameter set for space/digest, the shape a FEE
+// envelope's row takes.
+func feeParams(space did.DID, digest []byte) registry.BlobEncryptionParams {
+	return registry.BlobEncryptionParams{
+		Space:            space,
+		Digest:           digest,
+		RegionWrappedCEK: []byte("wrapped-cek-bytes"),
+		RegionKeyVersion: "region-kek-v1",
+		HeaderLen:        212,
+		BaseNonce:        []byte("nonce07"),
+		ChunkSize:        65536,
+		AAD:              []byte("cose-enc-structure"),
+	}
+}
+
+func TestEncryptionParams_RoundTrip(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+	space := testutil.RandomDID(t)
+	digest := []byte("enc-digest")
+	want := feeParams(space, digest)
+
+	if err := m.PutEncryptionParams(ctx, want); err != nil {
+		t.Fatalf("PutEncryptionParams: %v", err)
+	}
+	got, err := m.GetEncryptionParams(ctx, space, digest)
+	if err != nil {
+		t.Fatalf("GetEncryptionParams: %v", err)
+	}
+	if !reflect.DeepEqual(*got, want) {
+		t.Fatalf("GetEncryptionParams = %+v, want %+v", *got, want)
+	}
+}
+
+// A blob with no row is a plaintext blob, which is how the read path learns not
+// to decrypt.
+func TestEncryptionParams_MissingIsNotFound(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+
+	_, err := m.GetEncryptionParams(ctx, testutil.RandomDID(t), []byte("absent"))
+	if !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("GetEncryptionParams err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestEncryptionParams_DeleteRemovesRow(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+	space := testutil.RandomDID(t)
+	digest := []byte("enc-digest")
+	if err := m.PutEncryptionParams(ctx, feeParams(space, digest)); err != nil {
+		t.Fatalf("PutEncryptionParams: %v", err)
+	}
+
+	if err := m.DeleteEncryptionParams(ctx, space, digest); err != nil {
+		t.Fatalf("DeleteEncryptionParams: %v", err)
+	}
+	if _, err := m.GetEncryptionParams(ctx, space, digest); !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("GetEncryptionParams after delete err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestEncryptionParams_DeleteIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+
+	if err := m.DeleteEncryptionParams(ctx, testutil.RandomDID(t), []byte("absent")); err != nil {
+		t.Fatalf("DeleteEncryptionParams(absent): %v", err)
+	}
+}
+
+// The store must not alias the caller's byte slices, nor let a caller reach
+// back into it through a returned copy.
+func TestEncryptionParams_NoSliceAliasing(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+	space := testutil.RandomDID(t)
+	digest := []byte("enc-digest")
+	params := feeParams(space, digest)
+
+	if err := m.PutEncryptionParams(ctx, params); err != nil {
+		t.Fatalf("PutEncryptionParams: %v", err)
+	}
+	params.RegionWrappedCEK[0] = 'X'
+	params.BaseNonce[0] = 'X'
+	params.AAD[0] = 'X'
+
+	got, err := m.GetEncryptionParams(ctx, space, digest)
+	if err != nil {
+		t.Fatalf("GetEncryptionParams: %v", err)
+	}
+	got.RegionWrappedCEK[0] = 'Y'
+	got.BaseNonce[0] = 'Y'
+
+	again, err := m.GetEncryptionParams(ctx, space, digest)
+	if err != nil {
+		t.Fatalf("GetEncryptionParams (again): %v", err)
+	}
+	if !reflect.DeepEqual(*again, feeParams(space, digest)) {
+		t.Fatalf("stored params were aliased: %+v", *again)
+	}
+}
+
+// A rotation re-wrap replaces only the wrapped CEK and its key version; every
+// other parameter describes the unchanged ciphertext and must survive.
+func TestEncryptionParams_RewrapInPlace(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+	space := testutil.RandomDID(t)
+	digest := []byte("enc-digest")
+	if err := m.PutEncryptionParams(ctx, feeParams(space, digest)); err != nil {
+		t.Fatalf("PutEncryptionParams: %v", err)
+	}
+
+	newCEK := []byte("re-wrapped-cek-bytes")
+	if err := m.RewrapEncryptionParams(ctx, space, digest, newCEK, "region-kek-v2"); err != nil {
+		t.Fatalf("RewrapEncryptionParams: %v", err)
+	}
+	newCEK[0] = 'X' // the store must not alias the caller's slice
+
+	got, err := m.GetEncryptionParams(ctx, space, digest)
+	if err != nil {
+		t.Fatalf("GetEncryptionParams: %v", err)
+	}
+	want := feeParams(space, digest)
+	want.RegionWrappedCEK = []byte("re-wrapped-cek-bytes")
+	want.RegionKeyVersion = "region-kek-v2"
+	if !reflect.DeepEqual(*got, want) {
+		t.Fatalf("after rewrap = %+v, want %+v", *got, want)
+	}
+}
+
+func TestEncryptionParams_RewrapMissingIsNotFound(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+
+	err := m.RewrapEncryptionParams(ctx, testutil.RandomDID(t), []byte("absent"), []byte("cek"), "v1")
+	if !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("RewrapEncryptionParams err = %v, want ErrNotFound", err)
+	}
+}
+
+// The two tables have independent lifecycles and no cascade between them:
+// deleting a location leaves the encryption parameters in place, which is why a
+// caller removing a blob must delete both.
+func TestEncryptionParams_IndependentOfLocation(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+	space := testutil.RandomDID(t)
+	digest := []byte("enc-digest")
+	if err := m.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: digest, Provider: "did:piri:1", URL: "http://piri/enc", Size: 4096}); err != nil {
+		t.Fatalf("PutLocation: %v", err)
+	}
+	if err := m.PutEncryptionParams(ctx, feeParams(space, digest)); err != nil {
+		t.Fatalf("PutEncryptionParams: %v", err)
+	}
+
+	if err := m.DeleteLocation(ctx, space, digest); err != nil {
+		t.Fatalf("DeleteLocation: %v", err)
+	}
+
+	if _, err := m.GetEncryptionParams(ctx, space, digest); err != nil {
+		t.Fatalf("DeleteLocation shredded the encryption params: %v", err)
 	}
 }
 

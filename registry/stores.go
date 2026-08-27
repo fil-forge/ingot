@@ -6,12 +6,14 @@ import (
 
 	"github.com/fil-forge/ucantone/did"
 	"github.com/ipfs/go-cid"
+	"github.com/multiformats/go-multihash"
 )
 
 // This file defines the relational surface the upload/storage/delete
 // architecture relies on (docs/architecture.md §5–§7, Appendix C):
 // the reverse reference index (blob_refs), the local-store index
 // (upload_intents), the local blob-location table (blob_locations), the
+// per-blob FEE encryption parameters (blob_encryption_params), the
 // multipart session/part tables, and the gc_candidates log. The stores
 // are split into focused interfaces so a caller can depend on only what
 // it needs; *Postgres and *inmem.MemStore satisfy all of them.
@@ -51,7 +53,7 @@ const (
 // no BlobClaim rows remain for it. Distinct from bucket.BlobRef (the
 // manifest's blob descriptor); this is the reverse index over those.
 type BlobClaim struct {
-	Digest    []byte
+	Digest    multihash.Multihash
 	Bucket    string
 	ObjectKey string
 	VersionID string
@@ -61,7 +63,7 @@ type BlobClaim struct {
 // UploadIntent is one row of ingot.upload_intents: a blob Ingot holds on
 // disk, with its lifecycle state. Keyed globally by Digest.
 type UploadIntent struct {
-	Digest    []byte
+	Digest    multihash.Multihash
 	LocalPath string
 	Size      int64
 	State     string
@@ -72,10 +74,57 @@ type UploadIntent struct {
 // retrieved from, captured at accept. Keyed by (Space, Digest).
 type BlobLocation struct {
 	Space    did.DID
-	Digest   []byte
+	Digest   multihash.Multihash
 	Provider string
 	URL      string
 	Size     int64
+}
+
+// BlobEncryptionParams is one row of ingot.blob_encryption_params: the FEE
+// (Filecoin Encryption Envelope) parameters a read needs to decrypt an
+// encrypted blob, keyed by (Space, Digest) like the blob's location.
+//
+// An encrypted body blob is an independent COSE/STREAM ciphertext envelope.
+// These are the cached inputs a (range) GET's decryptor needs, so a read
+// unwraps the CEK and goes straight to a body-range fetch with no COSE
+// envelope-header round-trip. Existence of the row is what marks a blob as
+// encrypted: every field is required, and an unencrypted blob simply has no row
+// (see EncryptionParamsStore). A fresh CEK per encryption event makes every
+// ciphertext digest unique to one encryption, so these parameters are a 1:1
+// fact about the blob.
+//
+// Only what the region-KEK read path needs is stored. The COSE recipients,
+// including the tenant wrap key the insurance-recovery unwrap uses, stay in the
+// envelope header: that path is rare and out-of-band, and it reads the header
+// anyway. Raw CEK bytes are never stored — only the region-KEK-wrapped CEK and
+// the identifiers needed to unwrap it.
+type BlobEncryptionParams struct {
+	Space  did.DID
+	Digest multihash.Multihash
+
+	// RegionWrappedCEK is the content-encryption key wrapped by the region key
+	// provider (e.g. secrets-manager transit ciphertext). Never the raw CEK:
+	// unwrapping it requires the region KEK, which never leaves the provider.
+	RegionWrappedCEK []byte
+	// RegionKeyVersion identifies which version of the region KEK wrapped the
+	// CEK, so a rotation can re-wrap in place. Opaque, so it is agnostic to the
+	// region-key cardinality decision (FIL-572).
+	RegionKeyVersion string
+	// HeaderLen is the encoded length of the blob's COSE envelope, and so the
+	// offset at which its ciphertext begins. Without it a read could not locate
+	// byte 0 of the ciphertext without decoding the header.
+	HeaderLen int64
+	// BaseNonce is the COSE iv: the STREAM nonce seed for this blob's ciphertext.
+	BaseNonce []byte
+	// ChunkSize is the FEE chunk size written into the COSE protected header,
+	// cached so the read path need not fetch and decode the envelope header.
+	ChunkSize int64
+	// AAD is the envelope's COSE Enc_structure — the additional authenticated
+	// data bound into every chunk's GCM tag. Stored whole rather than as the
+	// protected header because the Enc_structure's context string differs
+	// between a COSE_Encrypt and a COSE_Encrypt0, which a bare row cannot
+	// record. The protected header remains recoverable from it as element 1.
+	AAD []byte
 }
 
 // BlobInclusion is one row of ingot.shard_inclusions: block Digest lives at
@@ -86,8 +135,8 @@ type BlobLocation struct {
 // (locations + inclusions).
 type BlobInclusion struct {
 	Space       did.DID
-	Digest      []byte // inner block multihash
-	ShardDigest []byte // enclosing shard CAR multihash
+	Digest      multihash.Multihash // inner block
+	ShardDigest multihash.Multihash // enclosing shard CAR
 	RangeStart  int64
 	RangeEnd    int64 // inclusive
 }
@@ -143,7 +192,7 @@ type MultipartPart struct {
 	// full-object CRC64NVME used to derive the default final checksum at
 	// Complete, and is never echoed by ListParts.
 	Checksum    string
-	BlobDigests [][]byte
+	BlobDigests []multihash.Multihash
 	State       string
 	CreatedAt   time.Time
 }
@@ -153,10 +202,10 @@ type MultipartPart struct {
 // remove(digest) (physical reclamation when the count reaches zero).
 type BlobRefStore interface {
 	AddBlobClaim(ctx context.Context, claim BlobClaim) error
-	DeleteBlobClaim(ctx context.Context, digest []byte, bucket, objectKey, versionID string) error
+	DeleteBlobClaim(ctx context.Context, digest multihash.Multihash, bucket, objectKey, versionID string) error
 	// CountClaims returns how many object versions in space still reference
 	// digest. Zero means the space's claim may be released.
-	CountClaims(ctx context.Context, space did.DID, digest []byte) (int, error)
+	CountClaims(ctx context.Context, space did.DID, digest multihash.Multihash) (int, error)
 }
 
 // IntentStore is the local-store index (§5): the on-disk blobs Ingot holds
@@ -164,10 +213,10 @@ type BlobRefStore interface {
 // crash recovery.
 type IntentStore interface {
 	PutIntent(ctx context.Context, in UploadIntent) error
-	SetIntentState(ctx context.Context, digest []byte, state string) error
-	GetIntent(ctx context.Context, digest []byte) (*UploadIntent, error)
+	SetIntentState(ctx context.Context, digest multihash.Multihash, state string) error
+	GetIntent(ctx context.Context, digest multihash.Multihash) (*UploadIntent, error)
 	ListIntentsByState(ctx context.Context, state string) ([]UploadIntent, error)
-	DeleteIntent(ctx context.Context, digest []byte) error
+	DeleteIntent(ctx context.Context, digest multihash.Multihash) error
 }
 
 // LocationStore is the local blob-location table (§8, appliance topology):
@@ -175,8 +224,35 @@ type IntentStore interface {
 // on read in place of the indexing-service.
 type LocationStore interface {
 	PutLocation(ctx context.Context, loc BlobLocation) error
-	GetLocation(ctx context.Context, space did.DID, digest []byte) (*BlobLocation, error)
-	DeleteLocation(ctx context.Context, space did.DID, digest []byte) error
+	GetLocation(ctx context.Context, space did.DID, digest multihash.Multihash) (*BlobLocation, error)
+	DeleteLocation(ctx context.Context, space did.DID, digest multihash.Multihash) error
+}
+
+// EncryptionParamsStore is the per-blob FEE encryption-parameter table
+// (blob_encryption_params): what a read needs to decrypt an encrypted blob
+// without fetching its envelope header. A blob has a row only when it is
+// encrypted, so GetEncryptionParams returning ErrNotFound is the answer "this
+// blob is stored as plaintext".
+//
+// It is deliberately separate from LocationStore, with no foreign key between
+// the tables: a location is reconstructible from the indexer or the accept
+// receipt, a wrapped CEK is not. Put is an upsert, so re-encrypting a blob
+// replaces its whole parameter set; a region-key rotation instead calls
+// RewrapEncryptionParams, which touches only the key material. Delete is the
+// per-blob crypto-shred (without the wrapped CEK the region has no path to the
+// plaintext) and is idempotent — and because nothing cascades, DeleteLocation
+// does NOT shred: a caller removing a blob must call both.
+type EncryptionParamsStore interface {
+	PutEncryptionParams(ctx context.Context, params BlobEncryptionParams) error
+	GetEncryptionParams(ctx context.Context, space did.DID, digest multihash.Multihash) (*BlobEncryptionParams, error)
+	DeleteEncryptionParams(ctx context.Context, space did.DID, digest multihash.Multihash) error
+	// RewrapEncryptionParams replaces the wrapped CEK and its key version for an
+	// already-encrypted blob, leaving every other parameter untouched — the write
+	// a region-key rotation performs. The ciphertext is unchanged, so the nonce,
+	// chunk size, AAD and header length must survive the rotation, and a rotation
+	// that rewrote them would corrupt the row. Returns ErrNotFound when the blob
+	// has no row (nothing to re-wrap).
+	RewrapEncryptionParams(ctx context.Context, space did.DID, digest multihash.Multihash, wrappedCEK []byte, keyVersion string) error
 }
 
 // BlobPark is one row of ingot.blob_parks: the persistable state of a blob
@@ -187,7 +263,7 @@ type LocationStore interface {
 // sensitive, deleted at conclude/abort. Keyed globally by Digest (like
 // upload_intents: content-addressed dedup shares parks across sessions).
 type BlobPark struct {
-	Digest        []byte
+	Digest        multihash.Multihash
 	AddTask       []byte // cid bytes
 	AcceptTask    []byte // cid bytes
 	PutInvocation []byte
@@ -200,8 +276,8 @@ type BlobPark struct {
 type ParkStore interface {
 	PutPark(ctx context.Context, p BlobPark) error
 	// GetPark returns ErrNotFound when digest has no park row.
-	GetPark(ctx context.Context, digest []byte) (*BlobPark, error)
-	DeletePark(ctx context.Context, digest []byte) error
+	GetPark(ctx context.Context, digest multihash.Multihash) (*BlobPark, error)
+	DeletePark(ctx context.Context, digest multihash.Multihash) error
 }
 
 // InclusionStore is the local shard-inclusion table (§8): block digest →
@@ -213,7 +289,7 @@ type InclusionStore interface {
 	// PutInclusions records a batch of inclusions (one shipped shard's worth).
 	// Re-ships of the same blocks are idempotent.
 	PutInclusions(ctx context.Context, incs []BlobInclusion) error
-	GetInclusion(ctx context.Context, space did.DID, digest []byte) (*BlobInclusion, error)
+	GetInclusion(ctx context.Context, space did.DID, digest multihash.Multihash) (*BlobInclusion, error)
 }
 
 // MultipartStore tracks in-flight multipart uploads (§7.2). LatchSession is
@@ -239,7 +315,7 @@ type MultipartStore interface {
 	// CountPartRefs returns how many parts OUTSIDE excludeUploadID reference
 	// digest — the shared-blob guard for abort/supersede spool cleanup
 	// (content-addressed part blobs may be deduped across sessions).
-	CountPartRefs(ctx context.Context, digest []byte, excludeUploadID string) (int, error)
+	CountPartRefs(ctx context.Context, digest multihash.Multihash, excludeUploadID string) (int, error)
 }
 
 // GCStore records superseded MST node CIDs (§4). Write-only this iteration.

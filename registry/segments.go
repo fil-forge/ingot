@@ -7,6 +7,7 @@ import (
 
 	"github.com/ipfs/go-cid"
 	"github.com/jackc/pgx/v5"
+	"github.com/multiformats/go-multihash"
 
 	"github.com/fil-forge/ingot/blockstore"
 	"github.com/fil-forge/ingot/logstore"
@@ -67,7 +68,7 @@ func (r *Postgres) MarkSegmentSealed(ctx context.Context, plane blockstore.Plane
 	return nil
 }
 
-func (r *Postgres) MarkSegmentShipped(ctx context.Context, plane blockstore.Plane, seq uint64, shippedAt int64, indexDigest []byte, opRoots []blockstore.OpRoot) error {
+func (r *Postgres) MarkSegmentShipped(ctx context.Context, plane blockstore.Plane, seq uint64, shippedAt int64, indexDigest multihash.Multihash, opRoots []blockstore.OpRoot) error {
 	// Only the catalog plane ships: stamp shipped_at AND advance forge_root_cid
 	// for every op-root in this segment, atomically.
 	tx, err := r.pool.Begin(ctx)
@@ -144,7 +145,7 @@ func (r *Postgres) ListSegments(ctx context.Context, plane blockstore.Plane, buc
 			size        int64
 			sha         []byte
 			shippedAt   int64
-			indexDigest []byte
+			indexDigest multihash.Multihash
 		)
 		if err := rows.Scan(&seqInt, &stateS, &sealed, &size, &sha, &shippedAt, &indexDigest); err != nil {
 			return nil, fmt.Errorf("registry: scan segment: %w", err)

@@ -5,6 +5,8 @@ import (
 	"errors"
 	"time"
 
+	"github.com/multiformats/go-multihash"
+
 	"go.uber.org/zap"
 )
 
@@ -65,7 +67,7 @@ type PlaneConfig struct {
 // ship registers the CAR and its index in the bucket's space; DeleteBucket
 // releases both), or nil when nothing registered (header-only segment, or a
 // non-publishing uploader).
-type FlushFunc func(ctx context.Context, seg *Segment) ([]byte, error)
+type FlushFunc func(ctx context.Context, seg *Segment) (multihash.Multihash, error)
 
 func (c *Config) validate() error {
 	if c.Dir == "" {

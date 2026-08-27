@@ -285,6 +285,17 @@ func (b *Backend) CreateBucket(ctx context.Context, input *s3.CreateBucketInput,
 	return nil
 }
 
+// SegmentDigestLister is the slice of the catalog log DeleteBucket needs to
+// release shipped-segment blob registrations: quiesce the bucket's log, then
+// enumerate every blob its shipped segments registered. It is matched by a
+// runtime type assertion (b.log is a blockstore.Log), which fails SILENTLY on
+// a signature drift — the compile-time assertion in the root package pins
+// *logstore.Manager to this shape so a drift is a build error instead.
+type SegmentDigestLister interface {
+	QuiesceBucketLog(ctx context.Context, bucket string) error
+	ShippedSegmentDigests(ctx context.Context, bucket string) ([]multihash.Multihash, error)
+}
+
 func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 	return b.txns.WithLock(ctx, name, func(ctx context.Context) error {
 		st, err := b.reg.Get(ctx, name)
@@ -347,10 +358,7 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 		// rows (the delete would race the flush goroutine and be refused).
 		// The release is idempotent (removing an unregistered blob is a
 		// no-op), so a retried DeleteBucket is safe.
-		if log, ok := b.log.(interface {
-			QuiesceBucketLog(ctx context.Context, bucket string) error
-			ShippedSegmentDigests(ctx context.Context, bucket string) ([][]byte, error)
-		}); ok {
+		if log, ok := b.log.(SegmentDigestLister); ok {
 			if err := log.QuiesceBucketLog(ctx, name); err != nil {
 				return fmt.Errorf("s3frontend: delete bucket: %w", err)
 			}
@@ -359,7 +367,7 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 				return fmt.Errorf("s3frontend: delete bucket: %w", err)
 			}
 			for _, d := range digests {
-				if err := b.remover.RemoveBlob(ctx, st.Space, multihash.Multihash(d)); err != nil {
+				if err := b.remover.RemoveBlob(ctx, st.Space, d); err != nil {
 					return fmt.Errorf("s3frontend: delete bucket: release shipped segment: %w", err)
 				}
 			}

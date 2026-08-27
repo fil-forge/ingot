@@ -94,13 +94,13 @@ func newRefTestBackend(t *testing.T, maxBlob ...int64) (*Backend, *inmem.MemStor
 	return b, mem, rm
 }
 
-func digestOf(t *testing.T, data []byte) []byte {
+func digestOf(t *testing.T, data []byte) multihash.Multihash {
 	t.Helper()
 	mh, err := multihash.Sum(data, multihash.SHA2_256, -1)
 	if err != nil {
 		t.Fatalf("multihash: %v", err)
 	}
-	return []byte(mh)
+	return mh
 }
 
 func putObj(t *testing.T, b *Backend, key string, data []byte) {
