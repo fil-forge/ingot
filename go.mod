@@ -1,9 +1,9 @@
 module github.com/fil-forge/ingot
 
-go 1.26.5
+go 1.27.0
 
 require (
-	github.com/alanshaw/dag-json-gen v0.0.8
+	github.com/alanshaw/dag-json-gen v0.0.9
 	github.com/aws/aws-sdk-go-v2 v1.43.6
 	github.com/aws/aws-sdk-go-v2/config v1.32.37
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.36
@@ -14,7 +14,7 @@ require (
 	github.com/fil-forge/libforge v0.0.0-20260807225550-3e6895b41be5
 	github.com/fil-forge/smelt v0.0.0-20260828101021-d08172217ec4
 	github.com/fil-forge/swarf v0.0.1-0.20260821055917-4921bc49627c
-	github.com/fil-forge/ucantone v0.0.0-20260817170631-3a20cd59fabc
+	github.com/fil-forge/ucantone v0.0.0-20260827134420-25cf8340b9a1
 	github.com/fil-forge/versitygw v0.0.0-20260716095011-7a65883d595a
 	github.com/filecoin-project/go-fee v0.1.1-0.20260826122013-1c3970b90b0d
 	github.com/gofiber/fiber/v3 v3.5.0

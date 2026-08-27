@@ -21,8 +21,8 @@ github.com/ProtonMail/go-crypto v1.3.0 h1:ILq8+Sf5If5DCpHQp4PbZdS1J7HDFRXz/+xKBi
 github.com/ProtonMail/go-crypto v1.3.0/go.mod h1:9whxjD8Rbs29b4XWbB8irEcE8KHMqaR2e7GWU1R+/PE=
 github.com/acarl005/stripansi v0.0.0-20180116102854-5a71ef0e047d h1:licZJFw2RwpHMqeKTCYkitsPqHNxTmd4SNR5r94FGM8=
 github.com/acarl005/stripansi v0.0.0-20180116102854-5a71ef0e047d/go.mod h1:asat636LX7Bqt5lYEZ27JNDcqxfjdBQuJ/MM4CN/Lzo=
-github.com/alanshaw/dag-json-gen v0.0.8 h1:Y0SfO2bp9ECDvcNbw6aQ91jmnfLC7UgRDshCeASDfT8=
-github.com/alanshaw/dag-json-gen v0.0.8/go.mod h1:v1YBZcS4B355MqxtyQr+fGNbEhm0CzHd+gOqOO/MZ+I=
+github.com/alanshaw/dag-json-gen v0.0.9 h1:q59Ra1mQB6HnFGI1ilFxsZvF1CqGN0XDlUWq16EJ6pw=
+github.com/alanshaw/dag-json-gen v0.0.9/go.mod h1:v1YBZcS4B355MqxtyQr+fGNbEhm0CzHd+gOqOO/MZ+I=
 github.com/alexbrainman/sspi v0.0.0-20250919150558-7d374ff0d59e h1:4dAU9FXIyQktpoUAgOJK3OTFc/xug0PCXYCqU0FgDKI=
 github.com/alexbrainman/sspi v0.0.0-20250919150558-7d374ff0d59e/go.mod h1:cEWa1LVoE5KvSD9ONXsZrj0z6KqySlCCNKHlLzbqAt4=
 github.com/anchore/go-struct-converter v0.1.0 h1:2rDRssAl6mgKBSLNiVCMADgZRhoqtw9dedlWa0OhD30=
@@ -187,8 +187,8 @@ github.com/fil-forge/smelt v0.0.0-20260828101021-d08172217ec4 h1:i6dFEYQbfFMloOh
 github.com/fil-forge/smelt v0.0.0-20260828101021-d08172217ec4/go.mod h1:OUO2GxgUihmYfywNIfvWTQocg6jqaNiTd04cG5BbdII=
 github.com/fil-forge/swarf v0.0.1-0.20260821055917-4921bc49627c h1:OaCpl/JkDuq3Rr6izJ8Lde6MllPOfmc6xTiQiCOLT8k=
 github.com/fil-forge/swarf v0.0.1-0.20260821055917-4921bc49627c/go.mod h1:k1gay5Byjloml4k1SylxhRff1rMH4LcGKpbMEDLZR1o=
-github.com/fil-forge/ucantone v0.0.0-20260817170631-3a20cd59fabc h1:s6QNgj3hWY2neeAWyq2FckpQoTaRZhK2utgLkauGsqA=
-github.com/fil-forge/ucantone v0.0.0-20260817170631-3a20cd59fabc/go.mod h1:uhSFN3BGtWpnIF47b1svijEa6wBmCM6JJArAG14MYh4=
+github.com/fil-forge/ucantone v0.0.0-20260827134420-25cf8340b9a1 h1:Tzy3lZ7+LAyVK4+qyWM97UMOtnXx05Wdn+rcTDLdBDE=
+github.com/fil-forge/ucantone v0.0.0-20260827134420-25cf8340b9a1/go.mod h1:aX35jlUs3hnWAhigjO8z9kMPiYnkW3XOW8iVoJyz7cg=
 github.com/fil-forge/versitygw v0.0.0-20260716095011-7a65883d595a h1:lDwnNmF4LNbevx/YYNCC0CazMiL4eIe38MvfqbRR3RA=
 github.com/fil-forge/versitygw v0.0.0-20260716095011-7a65883d595a/go.mod h1:t73Wa2xqpT0NdY+SzRZDiO+tQD13b3UEZRoe2wYFiIE=
 github.com/filecoin-project/go-data-segment v0.0.1 h1:1wmDxOG4ubWQm3ZC1XI5nCon5qgSq7Ra3Rb6Dbu10Gs=
