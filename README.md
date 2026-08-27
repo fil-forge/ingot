@@ -135,6 +135,22 @@ this working tree's binary against it — including the curated S3 conformance
 partition (per-group expected-pass and known-fail tables of versitygw cases).
 CI runs it after unit tests pass. See `itest/README.md`.
 
+## Deploying to the dev node
+
+Every merge to `main` publishes `ghcr.io/fil-forge/ingot:main` and dispatches the digest of the
+**prod** image to
+[infra-nodes](https://github.com/fil-forge/infra-nodes/blob/main/.github/workflows/bump-deployed-image.yml).
+That workflow rewrites the pin the FilOne Appliance dev node runs and opens a pull request with
+auto-merge armed. Merging queues the image; the node picks it up on its next reconcile pass, waits
+for a safe proving window, and then restarts.
+
+The `dev` matrix leg dispatches nothing. It carries delve and a debug build, and the node pins the
+prod image.
+
+The dispatch needs two repository credentials: the Actions variable `FORGE_BOT_APP_ID` and the
+Actions secret `FORGE_BOT_PRIVATE_KEY`, which mint a token scoped to `infra-nodes` alone. Without
+them the publish step fails and the image still lands in GHCR.
+
 ## Dependencies
 
 ingot depends only on the Forge stack — `ucantone` (UCAN 1.0 primitives),
