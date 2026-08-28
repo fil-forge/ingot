@@ -1,7 +1,6 @@
 package s3frontend
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -25,12 +24,13 @@ import (
 // region key provider and fetches ONLY the ciphertext chunks its plaintext
 // range overlaps, never the envelope header.
 //
-// Coordinates: BlobRef.Offset/Length are plaintext spans (the manifest
+// Coordinates: BlobRef.Start/End are inclusive plaintext spans (the manifest
 // describes the object's plaintext layout), while BlobRef.Digest names the
 // stored — for an encrypted blob, ciphertext — bytes. The bodyOpener is
 // where the two meet: it maps a plaintext range of one blob onto the
 // contiguous ciphertext span that serves it (aesstream.CiphertextRange) and
-// decrypts that span as it streams (aesstream.SpanReader).
+// decrypts that span as it streams (aesstream.SpanReader). Every range in
+// this file is HTTP-style inclusive [start, end].
 
 // bodyOpener returns the BlobRangeOpener for one request over body: the
 // plain opener when nothing is encrypted, or a decrypting opener carrying
@@ -104,10 +104,10 @@ type decryptingOpener struct {
 	enc   map[string]encBlob
 }
 
-func (o *decryptingOpener) OpenBlobRange(ctx context.Context, space did.DID, ref msbucket.BlobRef, off, length int64) (io.ReadCloser, error) {
+func (o *decryptingOpener) OpenBlobRange(ctx context.Context, space did.DID, ref msbucket.BlobRef, start, end int64) (io.ReadCloser, error) {
 	e, ok := o.enc[string(ref.Digest)]
 	if !ok {
-		return o.plain.OpenBlobRange(ctx, space, ref, off, length)
+		return o.plain.OpenBlobRange(ctx, space, ref, start, end)
 	}
 
 	// The CEK's wrap is context-bound to (space, digest): a row transplanted
@@ -129,21 +129,18 @@ func (o *decryptingOpener) OpenBlobRange(ctx context.Context, space did.DID, ref
 	// that serves it. Offsets from CiphertextRange are relative to the
 	// ciphertext stream, which starts HeaderLen bytes into the stored blob.
 	ctSize := e.storedSize - e.params.HeaderLen
-	start, n, plainLen, err := aesstream.CiphertextRange(ctSize, int(e.params.ChunkSize), off, length)
+	ctStart, ctEnd, plainLen, err := aesstream.CiphertextRange(ctSize, int(e.params.ChunkSize), start, end)
 	if err != nil {
 		return nil, fmt.Errorf("s3frontend: ciphertext range for blob %x: %w", ref.Digest, err)
 	}
-	if plainLen < length {
+	if plainLen < end-start+1 {
 		// The manifest's plaintext span extends past what this ciphertext
 		// decrypts to: the registry row and the manifest disagree.
-		return nil, fmt.Errorf("s3frontend: blob %x: plaintext range [%d,+%d) exceeds the %d bytes its ciphertext holds",
-			ref.Digest, off, length, plainLen)
-	}
-	if n == 0 {
-		return io.NopCloser(bytes.NewReader(nil)), nil
+		return nil, fmt.Errorf("s3frontend: blob %x: plaintext range [%d,%d] exceeds the %d bytes its ciphertext holds",
+			ref.Digest, start, end, plainLen)
 	}
 
-	span, err := blockstore.OpenBlobRangeOf(ctx, o.read, space, ref.Digest, e.params.HeaderLen+start, n)
+	span, err := blockstore.OpenBlobRangeOf(ctx, o.read, space, ref.Digest, e.params.HeaderLen+ctStart, e.params.HeaderLen+ctEnd)
 	if err != nil {
 		return nil, fmt.Errorf("s3frontend: fetch ciphertext span of blob %x: %w", ref.Digest, err)
 	}
@@ -152,7 +149,7 @@ func (o *decryptingOpener) OpenBlobRange(ctx context.Context, space did.DID, ref
 		BaseNonce: e.params.BaseNonce,
 		AAD:       e.params.AAD,
 		ChunkSize: int(e.params.ChunkSize),
-	}, ctSize, off, length)
+	}, ctSize, start, end)
 	if err != nil {
 		_ = span.Close()
 		return nil, fmt.Errorf("s3frontend: decrypt blob %x: %w", ref.Digest, err)

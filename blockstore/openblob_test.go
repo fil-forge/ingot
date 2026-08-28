@@ -80,8 +80,9 @@ func TestCached_OpenBlob_BypassesCache(t *testing.T) {
 	}
 }
 
-// TestSpool_OpenBlobRange: the section reader serves exactly [off, off+n) of
-// the spooled file, and a range past the end yields a shorter stream.
+// TestSpool_OpenBlobRange: the section reader serves exactly the inclusive
+// [start, end] of the spooled file, and an end past the file's end yields a
+// shorter stream.
 func TestSpool_OpenBlobRange(t *testing.T) {
 	ctx := context.Background()
 	sp, err := NewSpool(t.TempDir())
@@ -95,18 +96,18 @@ func TestSpool_OpenBlobRange(t *testing.T) {
 	}
 
 	cases := []struct {
-		name   string
-		off, n int64
-		want   string
+		name       string
+		start, end int64
+		want       string
 	}{
-		{"interior", 4, 6, "456789"},
-		{"prefix", 0, 3, "012"},
-		{"suffix past end clamps", 12, 100, "cdef"},
-		{"empty", 5, 0, ""},
+		{"interior", 4, 9, "456789"},
+		{"prefix", 0, 2, "012"},
+		{"single byte", 15, 15, "f"},
+		{"end past file clamps", 12, 100, "cdef"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			rc, err := sp.OpenBlobRange(ctx, did.Undef, digest, c.off, c.n)
+			rc, err := sp.OpenBlobRange(ctx, did.Undef, digest, c.start, c.end)
 			if err != nil {
 				t.Fatalf("OpenBlobRange: %v", err)
 			}
@@ -116,7 +117,7 @@ func TestSpool_OpenBlobRange(t *testing.T) {
 				t.Fatalf("read: %v", err)
 			}
 			if string(got) != c.want {
-				t.Fatalf("range [%d,+%d) = %q, want %q", c.off, c.n, got, c.want)
+				t.Fatalf("range [%d,%d] = %q, want %q", c.start, c.end, got, c.want)
 			}
 		})
 	}
@@ -132,7 +133,7 @@ func TestOpenBlobRangeOf_Fallback(t *testing.T) {
 	ctx := context.Background()
 	tier := fakeBlobTier{data: []byte("0123456789abcdef")}
 
-	rc, err := OpenBlobRangeOf(ctx, tier, did.Undef, nil, 4, 6)
+	rc, err := OpenBlobRangeOf(ctx, tier, did.Undef, nil, 4, 9)
 	if err != nil {
 		t.Fatalf("OpenBlobRangeOf: %v", err)
 	}

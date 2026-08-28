@@ -1,7 +1,6 @@
 package blockstore
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -146,11 +145,11 @@ func NewForge(cfg ForgeConfig) (*Forge, error) {
 // empty 200 when it can't resolve a did:plc principal in the proof chain)
 // otherwise surfaces only as a bare client-side EOF mid-body, with nothing
 // attributable in ingot's own logs.
-// off/n select a sub-range of the located bytes: stored bytes [off, off+n)
-// of the blob. n < 0 retrieves the locator's whole range (the entire blob,
+// start/end select an inclusive sub-range of the located bytes (HTTP Range
+// semantics). end < 0 retrieves the locator's whole range (the entire blob,
 // for a body blob).
-func (f *Forge) retrieve(ctx context.Context, space did.DID, digest mh.Multihash, off, n int64) (io.ReadCloser, int64, error) {
-	rc, got, err := f.doRetrieve(ctx, space, digest, off, n)
+func (f *Forge) retrieve(ctx context.Context, space did.DID, digest mh.Multihash, start, end int64) (io.ReadCloser, int64, error) {
+	rc, got, err := f.doRetrieve(ctx, space, digest, start, end)
 	if err != nil && !errors.Is(err, ErrNotFound) {
 		f.logger.Warn("forge: retrieve failed",
 			zap.Stringer("space", space), zap.String("digest", digestutil.Format(digest)), zap.Error(err))
@@ -158,7 +157,7 @@ func (f *Forge) retrieve(ctx context.Context, space did.DID, digest mh.Multihash
 	return rc, got, err
 }
 
-func (f *Forge) doRetrieve(ctx context.Context, space did.DID, digest mh.Multihash, off, n int64) (io.ReadCloser, int64, error) {
+func (f *Forge) doRetrieve(ctx context.Context, space did.DID, digest mh.Multihash, start, end int64) (io.ReadCloser, int64, error) {
 	locations, err := f.locator.Locate(ctx, []did.DID{space}, digest)
 	if err != nil {
 		var nf locator.NotFoundError
@@ -178,21 +177,21 @@ func (f *Forge) doRetrieve(ctx context.Context, space did.DID, digest mh.Multiha
 	}
 	target := cm.Location[0]
 
-	// Narrow the located range to the caller's sub-range. loc.Range is
-	// inclusive and, for a whole blob, starts at 0 — so the sub-range is
-	// [Start+off, Start+off+n-1], clamped to the located end. The decrypting
-	// read path uses this to fetch only the ciphertext chunks it needs.
-	if n >= 0 {
-		start := loc.Range.Start + off
-		if start > loc.Range.End || n == 0 {
-			// Nothing to fetch; an empty body keeps the contract simple.
-			return io.NopCloser(bytes.NewReader(nil)), 0, nil
+	// Narrow the located range to the caller's inclusive sub-range. loc.Range
+	// is inclusive too and, for a whole blob, starts at 0 — so the sub-range
+	// maps to [Range.Start+start, Range.Start+end], with the end clamped to
+	// the located end (HTTP Range semantics). The decrypting read path uses
+	// this to fetch only the ciphertext chunks it needs.
+	if end >= 0 {
+		first := loc.Range.Start + start
+		if start < 0 || end < start || first > loc.Range.End {
+			return nil, 0, fmt.Errorf("forge: range [%d,%d] of %s is unsatisfiable", start, end, digestutil.Format(digest))
 		}
-		end := start + n - 1
-		if end > loc.Range.End {
-			end = loc.Range.End
+		last := loc.Range.Start + end
+		if last > loc.Range.End {
+			last = loc.Range.End
 		}
-		loc.Range = blobindex.Range{Start: start, End: end}
+		loc.Range = blobindex.Range{Start: first, End: last}
 	}
 
 	// The commitment's space scopes the retrieve capability; fall back to
@@ -286,11 +285,12 @@ func (f *Forge) OpenBlob(ctx context.Context, space did.DID, digest mh.Multihash
 	return rc, err
 }
 
-// OpenBlobRange streams stored bytes [off, off+n) of an object-body blob from
-// piri — a ranged /content/retrieve, so the decrypting read path fetches only
-// the ciphertext chunks a plaintext range needs rather than the whole blob.
-func (f *Forge) OpenBlobRange(ctx context.Context, space did.DID, digest mh.Multihash, off, n int64) (io.ReadCloser, error) {
-	rc, _, err := f.retrieve(ctx, space, digest, off, n)
+// OpenBlobRange streams stored bytes [start, end] (inclusive) of an
+// object-body blob from piri — a ranged /content/retrieve, so the decrypting
+// read path fetches only the ciphertext chunks a plaintext range needs
+// rather than the whole blob.
+func (f *Forge) OpenBlobRange(ctx context.Context, space did.DID, digest mh.Multihash, start, end int64) (io.ReadCloser, error) {
+	rc, _, err := f.retrieve(ctx, space, digest, start, end)
 	return rc, err
 }
 

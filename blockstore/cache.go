@@ -70,11 +70,11 @@ func (c *Cached) OpenBlob(ctx context.Context, space did.DID, digest mh.Multihas
 	return nil, ErrNotFound
 }
 
-// OpenBlobRange streams stored bytes [off, off+n) of a body blob straight
+// OpenBlobRange streams stored bytes [start, end] (inclusive) of a body blob straight
 // from the base reader, bypassing the LRU exactly like OpenBlob.
-func (c *Cached) OpenBlobRange(ctx context.Context, space did.DID, digest mh.Multihash, off, n int64) (io.ReadCloser, error) {
+func (c *Cached) OpenBlobRange(ctx context.Context, space did.DID, digest mh.Multihash, start, end int64) (io.ReadCloser, error) {
 	if br, ok := c.base.(BlobReader); ok {
-		return OpenBlobRangeOf(ctx, br, space, digest, off, n)
+		return OpenBlobRangeOf(ctx, br, space, digest, start, end)
 	}
 	return nil, ErrNotFound
 }

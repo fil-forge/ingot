@@ -116,14 +116,11 @@ func (s *Spool) OpenBlob(_ context.Context, _ did.DID, digest mh.Multihash) (io.
 	return f, nil
 }
 
-// OpenBlobRange returns a reader over stored bytes [off, off+n) of the
-// spooled blob, or ErrNotFound — OpenBlob restricted to a section, for the
-// decrypting read path, which fetches only the ciphertext span a plaintext
-// range needs. A range past the file's end yields a shorter stream.
-func (s *Spool) OpenBlobRange(_ context.Context, _ did.DID, digest mh.Multihash, off, n int64) (io.ReadCloser, error) {
-	if off < 0 || n < 0 {
-		return nil, fmt.Errorf("blockstore: invalid blob range [%d, +%d)", off, n)
-	}
+// OpenBlobRange returns a reader over stored bytes [start, end] (inclusive)
+// of the spooled blob, or ErrNotFound — OpenBlob restricted to a section,
+// for the decrypting read path, which fetches only the ciphertext span a
+// plaintext range needs. An end past the file's end yields a shorter stream.
+func (s *Spool) OpenBlobRange(_ context.Context, _ did.DID, digest mh.Multihash, start, end int64) (io.ReadCloser, error) {
 	f, err := os.Open(s.Path(digest))
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, ErrNotFound
@@ -131,7 +128,7 @@ func (s *Spool) OpenBlobRange(_ context.Context, _ did.DID, digest mh.Multihash,
 	if err != nil {
 		return nil, fmt.Errorf("blockstore: spool open %s: %w", digest.B58String(), err)
 	}
-	return readerCloser{Reader: io.NewSectionReader(f, off, n), Closer: f}, nil
+	return readerCloser{Reader: io.NewSectionReader(f, start, end-start+1), Closer: f}, nil
 }
 
 // GetBlock returns the blob stored under c's multihash, or ErrNotFound. A miss

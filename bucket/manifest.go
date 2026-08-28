@@ -106,11 +106,15 @@ type Body struct {
 
 // BlobRef names one body blob: the sha256 multihash Piri stores it
 // under (the same multihash as the blob's raw-codec CID), and the
-// half-open byte span [Offset, Offset+Length) it covers within the
-// object. The ordered BlobRef list lets a ranged GET map a byte range
-// to the covering blob(s).
+// inclusive plaintext byte span [Start, End] it covers within the
+// object — HTTP Range semantics, like every range in the read path.
+// The ordered BlobRef list lets a ranged GET map a byte range to the
+// covering blob(s).
 type BlobRef struct {
 	Digest mh.Multihash `cborgen:"d"`
-	Offset int64        `cborgen:"o"`
-	Length int64        `cborgen:"l"`
+	Start  int64        `cborgen:"s"`
+	End    int64        `cborgen:"e"`
 }
+
+// Len returns the number of plaintext bytes the blob covers.
+func (b BlobRef) Len() int64 { return b.End - b.Start + 1 }
