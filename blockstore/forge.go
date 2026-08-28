@@ -8,6 +8,9 @@ import (
 	"net/http"
 	"net/url"
 
+	"github.com/fil-forge/libforge/blobindex"
+	"github.com/fil-forge/libforge/digestutil"
+
 	indexclient "github.com/fil-forge/indexing-service/pkg/client"
 	contentcmds "github.com/fil-forge/libforge/commands/content"
 	"github.com/fil-forge/libforge/ucan/retrieval"
@@ -55,8 +58,9 @@ type Forge struct {
 }
 
 var (
-	_ BlockReader = (*Forge)(nil)
-	_ BlobReader  = (*Forge)(nil)
+	_ BlockReader     = (*Forge)(nil)
+	_ BlobReader      = (*Forge)(nil)
+	_ BlobRangeReader = (*Forge)(nil)
 )
 
 // ForgeConfig wires a read-only Forge block reader.
@@ -141,23 +145,26 @@ func NewForge(cfg ForgeConfig) (*Forge, error) {
 // empty 200 when it can't resolve a did:plc principal in the proof chain)
 // otherwise surfaces only as a bare client-side EOF mid-body, with nothing
 // attributable in ingot's own logs.
-func (f *Forge) retrieve(ctx context.Context, space did.DID, c cid.Cid) (io.ReadCloser, int64, error) {
-	rc, n, err := f.doRetrieve(ctx, space, c)
+// start/end select an inclusive sub-range of the located bytes (HTTP Range
+// semantics). end < 0 retrieves the locator's whole range (the entire blob,
+// for a body blob).
+func (f *Forge) retrieve(ctx context.Context, space did.DID, digest mh.Multihash, start, end int64) (io.ReadCloser, int64, error) {
+	rc, got, err := f.doRetrieve(ctx, space, digest, start, end)
 	if err != nil && !errors.Is(err, ErrNotFound) {
 		f.logger.Warn("forge: retrieve failed",
-			zap.Stringer("space", space), zap.Stringer("cid", c), zap.Error(err))
+			zap.Stringer("space", space), zap.String("digest", digestutil.Format(digest)), zap.Error(err))
 	}
-	return rc, n, err
+	return rc, got, err
 }
 
-func (f *Forge) doRetrieve(ctx context.Context, space did.DID, c cid.Cid) (io.ReadCloser, int64, error) {
-	locations, err := f.locator.Locate(ctx, []did.DID{space}, c.Hash())
+func (f *Forge) doRetrieve(ctx context.Context, space did.DID, digest mh.Multihash, start, end int64) (io.ReadCloser, int64, error) {
+	locations, err := f.locator.Locate(ctx, []did.DID{space}, digest)
 	if err != nil {
 		var nf locator.NotFoundError
 		if errors.As(err, &nf) {
 			return nil, 0, ErrNotFound
 		}
-		return nil, 0, fmt.Errorf("forge: locate %s: %w", c, err)
+		return nil, 0, fmt.Errorf("forge: locate %s: %w", digestutil.Format(digest), err)
 	}
 	if len(locations) == 0 {
 		return nil, 0, ErrNotFound
@@ -166,9 +173,26 @@ func (f *Forge) doRetrieve(ctx context.Context, space did.DID, c cid.Cid) (io.Re
 	loc := locations[0]
 	cm := loc.Commitment
 	if len(cm.Location) == 0 {
-		return nil, 0, fmt.Errorf("forge: empty location URL set for %s", c)
+		return nil, 0, fmt.Errorf("forge: empty location URL set for %s", digestutil.Format(digest))
 	}
 	target := cm.Location[0]
+
+	// Narrow the located range to the caller's inclusive sub-range. loc.Range
+	// is inclusive too and, for a whole blob, starts at 0 — so the sub-range
+	// maps to [Range.Start+start, Range.Start+end], with the end clamped to
+	// the located end (HTTP Range semantics). The decrypting read path uses
+	// this to fetch only the ciphertext chunks it needs.
+	if end >= 0 {
+		first := loc.Range.Start + start
+		if start < 0 || end < start || first > loc.Range.End {
+			return nil, 0, fmt.Errorf("forge: range [%d,%d] of %s is unsatisfiable", start, end, digestutil.Format(digest))
+		}
+		last := loc.Range.Start + end
+		if last > loc.Range.End {
+			last = loc.Range.End
+		}
+		loc.Range = blobindex.Range{Start: first, End: last}
+	}
 
 	// The commitment's space scopes the retrieve capability; fall back to
 	// the caller's space if the commitment lacks one (the local locator
@@ -221,7 +245,7 @@ func (f *Forge) doRetrieve(ctx context.Context, space did.DID, c cid.Cid) (io.Re
 		execution.WithDelegations(proofs...),
 	)
 	if err != nil {
-		return nil, 0, fmt.Errorf("forge: retrieve %s: %w", c, err)
+		return nil, 0, fmt.Errorf("forge: retrieve %s: %w", digestutil.Format(digest), err)
 	}
 
 	hcRes, ok := meta.(*retrieval.HTTPHeaderResponseContainer)
@@ -236,7 +260,7 @@ func (f *Forge) doRetrieve(ctx context.Context, space did.DID, c cid.Cid) (io.Re
 // via a UCAN-authorized /content/retrieve. It buffers the whole block, so it is
 // for small catalog blocks; object-body blobs use the streaming OpenBlob.
 func (f *Forge) GetBlock(ctx context.Context, space did.DID, c cid.Cid) (block.Block, error) {
-	rc, wantLen, err := f.retrieve(ctx, space, c)
+	rc, wantLen, err := f.retrieve(ctx, space, c.Hash(), 0, -1)
 	if err != nil {
 		return nil, err
 	}
@@ -257,7 +281,16 @@ func (f *Forge) GetBlock(ctx context.Context, space did.DID, c cid.Cid) (block.B
 // straight off the /content/retrieve response; the caller owns the reader and
 // must Close it.
 func (f *Forge) OpenBlob(ctx context.Context, space did.DID, digest mh.Multihash) (io.ReadCloser, error) {
-	rc, _, err := f.retrieve(ctx, space, cid.NewCidV1(cid.Raw, digest))
+	rc, _, err := f.retrieve(ctx, space, digest, 0, -1)
+	return rc, err
+}
+
+// OpenBlobRange streams stored bytes [start, end] (inclusive) of an
+// object-body blob from piri — a ranged /content/retrieve, so the decrypting
+// read path fetches only the ciphertext chunks a plaintext range needs
+// rather than the whole blob.
+func (f *Forge) OpenBlobRange(ctx context.Context, space did.DID, digest mh.Multihash, start, end int64) (io.ReadCloser, error) {
+	rc, _, err := f.retrieve(ctx, space, digest, start, end)
 	return rc, err
 }
 

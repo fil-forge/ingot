@@ -54,8 +54,9 @@ func NewCached(base BlockReader, maxBytes int64) BlockReader {
 }
 
 var (
-	_ BlockReader = (*Cached)(nil)
-	_ BlobReader  = (*Cached)(nil)
+	_ BlockReader     = (*Cached)(nil)
+	_ BlobReader      = (*Cached)(nil)
+	_ BlobRangeReader = (*Cached)(nil)
 )
 
 // OpenBlob streams a body blob straight from the base reader, bypassing the LRU.
@@ -65,6 +66,15 @@ var (
 func (c *Cached) OpenBlob(ctx context.Context, space did.DID, digest mh.Multihash) (io.ReadCloser, error) {
 	if br, ok := c.base.(BlobReader); ok {
 		return br.OpenBlob(ctx, space, digest)
+	}
+	return nil, ErrNotFound
+}
+
+// OpenBlobRange streams stored bytes [start, end] (inclusive) of a body blob straight
+// from the base reader, bypassing the LRU exactly like OpenBlob.
+func (c *Cached) OpenBlobRange(ctx context.Context, space did.DID, digest mh.Multihash, start, end int64) (io.ReadCloser, error) {
+	if br, ok := c.base.(BlobReader); ok {
+		return OpenBlobRangeOf(ctx, br, space, digest, start, end)
 	}
 	return nil, ErrNotFound
 }

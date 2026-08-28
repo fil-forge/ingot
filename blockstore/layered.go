@@ -94,6 +94,26 @@ func (l *Layered) OpenBlob(ctx context.Context, space did.DID, digest mh.Multiha
 	return nil, ErrNotFound
 }
 
+// OpenBlobRange streams stored bytes [start, end] (inclusive) of a body blob with the
+// same tiering as OpenBlob: spool first, then the network base. A tier that
+// implements only BlobReader is served through OpenBlob with the prefix
+// discarded (OpenBlobRangeOf).
+func (l *Layered) OpenBlobRange(ctx context.Context, space did.DID, digest mh.Multihash, start, end int64) (io.ReadCloser, error) {
+	if br, ok := l.spool.(BlobReader); ok {
+		rc, err := OpenBlobRangeOf(ctx, br, space, digest, start, end)
+		if err == nil {
+			return rc, nil
+		}
+		if !errors.Is(err, ErrNotFound) {
+			return nil, err
+		}
+	}
+	if br, ok := l.base.(BlobReader); ok {
+		return OpenBlobRangeOf(ctx, br, space, digest, start, end)
+	}
+	return nil, ErrNotFound
+}
+
 // layeredAsBlockstore lifts Layered into a BaseStore for the
 // CborStore wrapper, with the read's space bound in. Internal-only —
 // exists so the CBOR decoder reuses Layered's fallthrough order (and

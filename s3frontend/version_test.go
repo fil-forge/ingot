@@ -148,9 +148,10 @@ func TestVersioning_EnabledPutRetainsVersions(t *testing.T) {
 	setVersioning(t, b, types.BucketVersioningStatusEnabled)
 
 	a, bb := []byte("version A"), []byte("version B")
-	da, db := digestOf(t, a), digestOf(t, bb)
 	out1 := putObjV(t, b, "k1", a)
 	out2 := putObjV(t, b, "k1", bb)
+	da := blobDigestOf(t, b, "k1", out1.VersionID)
+	db := blobDigestOf(t, b, "k1", out2.VersionID)
 	if out1.VersionID == "" || out2.VersionID == "" || out1.VersionID == out2.VersionID {
 		t.Fatalf("expected distinct non-empty version ids, got %q / %q", out1.VersionID, out2.VersionID)
 	}
@@ -213,17 +214,17 @@ func TestVersioning_SuspendedReplacesNullInPlace(t *testing.T) {
 	b, mem, rm := newRefTestBackend(t)
 	setVersioning(t, b, types.BucketVersioningStatusEnabled)
 	a := []byte("numbered A")
-	da := digestOf(t, a)
 	outA := putObjV(t, b, "k1", a)
+	da := blobDigestOf(t, b, "k1", outA.VersionID)
 
 	setVersioning(t, b, types.BucketVersioningStatusSuspended)
 	bb, cc := []byte("null B"), []byte("null C")
-	db, dc := digestOf(t, bb), digestOf(t, cc)
 
 	outB := putObjV(t, b, "k1", bb)
 	if outB.VersionID != "null" {
 		t.Fatalf("suspended PUT VersionID = %q, want null", outB.VersionID)
 	}
+	db := blobDigestOf(t, b, "k1", "null")
 	// The numbered version was retained; nothing released yet.
 	if claims(t, mem, da) != 1 || len(rm.removed) != 0 {
 		t.Fatalf("claims(A)=%d removed=%d, want 1/0", claims(t, mem, da), len(rm.removed))
@@ -231,6 +232,7 @@ func TestVersioning_SuspendedReplacesNullInPlace(t *testing.T) {
 
 	// A second null write replaces the first in place.
 	putObjV(t, b, "k1", cc)
+	dc := blobDigestOf(t, b, "k1", "null")
 	if claims(t, mem, db) != 0 || rm.removedDigests()[string(db)] != 1 {
 		t.Fatalf("claims(B)=%d removals(B)=%d, want 0/1", claims(t, mem, db), rm.removedDigests()[string(db)])
 	}
@@ -254,8 +256,8 @@ func TestVersioning_DeleteMarker(t *testing.T) {
 	b, mem, rm := newRefTestBackend(t)
 	setVersioning(t, b, types.BucketVersioningStatusEnabled)
 	data := []byte("to be marked")
-	d := digestOf(t, data)
 	putObjV(t, b, "k1", data)
+	d := blobDigestOf(t, b, "k1", "")
 
 	out, err := deleteObjV(t, b, "k1", "")
 	if err != nil {
@@ -313,9 +315,10 @@ func TestVersioning_DeleteSpecificVersionPromotes(t *testing.T) {
 	b, mem, rm := newRefTestBackend(t)
 	setVersioning(t, b, types.BucketVersioningStatusEnabled)
 	a, bb := []byte("keep me"), []byte("delete me")
-	da, db := digestOf(t, a), digestOf(t, bb)
 	outA := putObjV(t, b, "k1", a)
 	outB := putObjV(t, b, "k1", bb)
+	da := blobDigestOf(t, b, "k1", outA.VersionID)
+	db := blobDigestOf(t, b, "k1", outB.VersionID)
 
 	// Delete the CURRENT version: the older one is promoted.
 	if _, err := deleteObjV(t, b, "k1", outB.VersionID); err != nil {
@@ -436,9 +439,9 @@ func TestVersioning_CopyFromVersion(t *testing.T) {
 	b, mem, _ := newRefTestBackend(t)
 	setVersioning(t, b, types.BucketVersioningStatusEnabled)
 	a := []byte("original content")
-	da := digestOf(t, a)
 	outA := putObjV(t, b, "k1", a)
 	putObjV(t, b, "k1", []byte("newer content"))
+	da := blobDigestOf(t, b, "k1", outA.VersionID)
 
 	bucket, dstKey := "bk", "k2"
 	src := "bk/k1?versionId=" + outA.VersionID
@@ -621,18 +624,18 @@ func TestVersioning_NullEvictionFromPrev(t *testing.T) {
 	// The null version starts life unversioned, then is buried under a
 	// numbered version: noncurrent, in prev, NullSeq set.
 	a := []byte("null A")
-	da := digestOf(t, a)
 	putObjV(t, b, "k1", a)
+	da := blobDigestOf(t, b, "k1", "null")
 	setVersioning(t, b, types.BucketVersioningStatusEnabled)
 	bb := []byte("numbered B")
-	db := digestOf(t, bb)
 	outB := putObjV(t, b, "k1", bb)
+	db := blobDigestOf(t, b, "k1", outB.VersionID)
 
 	// A Suspended write is a new null: it must evict A from the prev tree.
 	setVersioning(t, b, types.BucketVersioningStatusSuspended)
 	cc := []byte("null C")
-	dc := digestOf(t, cc)
 	putObjV(t, b, "k1", cc)
+	dc := blobDigestOf(t, b, "k1", "null")
 
 	// A's claim is released and its blob removed; B and C stay claimed.
 	if claims(t, mem, da) != 0 || rm.removedDigests()[string(da)] != 1 {

@@ -94,7 +94,7 @@ Postgres pool, and the agent identity (via `Config`):
 
 ```go
 app := fx.New(
-    // host provides: *zap.Logger, *pgxpool.Pool, ingot.ServiceIdentity
+    // host provides: *zap.Logger, *pgxpool.Pool, libforge identity.Identity
     ingot.Module(cfg), // cfg sets UploadServiceURL/DID, AuthServiceURL/DID, ...
 )
 ```
@@ -107,7 +107,7 @@ collaborators themselves.
 
 ```bash
 ingot serve --config /etc/ingot/config.yaml   # the gateway
-ingot whoami                                  # agent DID + sprue/hilt endpoints
+ingot whoami                                  # agent DID (and key DID) + sprue/hilt endpoints
 ingot version
 ```
 

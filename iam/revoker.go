@@ -17,17 +17,18 @@ import (
 // (defeating local signature verification) — so the request falls through to
 // Hilt, which refuses for a deleted key.
 type Revoker struct {
-	proofs *KeyProofs
-	keys   *VerificationKeyCache
-	logger *zap.Logger
+	proofs  *KeyProofs
+	keys    *VerificationKeyCache
+	tenants *TenantCache
+	logger  *zap.Logger
 }
 
 // NewRevoker returns a Revoker over the caches the IAM service populates.
-func NewRevoker(proofs *KeyProofs, keys *VerificationKeyCache, logger *zap.Logger) *Revoker {
+func NewRevoker(proofs *KeyProofs, keys *VerificationKeyCache, tenants *TenantCache, logger *zap.Logger) *Revoker {
 	if logger == nil {
 		logger = zap.NewNop()
 	}
-	return &Revoker{proofs: proofs, keys: keys, logger: logger}
+	return &Revoker{proofs: proofs, keys: keys, tenants: tenants, logger: logger}
 }
 
 // Revoke clears the caches of every access key whose proof store holds the
@@ -42,7 +43,9 @@ func (r *Revoker) Revoke(revoked cid.Cid) []did.DID {
 		// The verification-key cache is keyed by the accessKeyId — the key's
 		// did:key identifier with the prefix stripped (see
 		// GetUserAccountForRequest).
-		r.keys.Delete(strings.TrimPrefix(key.String(), did.KeyPrefix))
+		access := strings.TrimPrefix(key.String(), did.KeyPrefix)
+		r.keys.Delete(access)
+		r.tenants.Delete(access)
 		r.logger.Info("iam: access key caches cleared by revocation",
 			zap.Stringer("access", key), zap.Stringer("revoked", revoked))
 	}

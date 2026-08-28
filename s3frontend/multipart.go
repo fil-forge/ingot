@@ -250,7 +250,7 @@ func (b *Backend) UploadPart(ctx context.Context, input *s3.UploadPartInput) (*s
 	if err != nil {
 		return nil, err
 	}
-	body, err := b.splitSpool(ctx, sess.Bucket, bodyReader)
+	body, err := b.splitSpool(ctx, sess.Bucket, space, bodyReader)
 	if err != nil {
 		var apiErr s3err.APIError
 		if errors.As(err, &apiErr) {
@@ -533,8 +533,14 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 			if err != nil {
 				return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: part blob %x: %w", d, err)
 			}
-			blobs = append(blobs, msbucket.BlobRef{Digest: d, Offset: offset, Length: in.Size})
-			offset += in.Size
+			// intent.Size is the spooled (envelope) byte count; the manifest
+			// spans are plaintext, derived from the blob's FEE geometry.
+			plainLen, err := b.blobPlaintextLen(ctx, bucketState.Space, d, in.Size)
+			if err != nil {
+				return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: part blob %x: %w", d, err)
+			}
+			blobs = append(blobs, msbucket.BlobRef{Digest: d, Start: offset, End: offset + plainLen - 1})
+			offset += plainLen
 		}
 		partSizes = append(partSizes, offset-partStart)
 	}
@@ -780,6 +786,12 @@ func (b *Backend) cleanupPartBlobs(ctx context.Context, space did.DID, uploadID 
 			b.logger.Warn("delete upload intent failed",
 				zap.String("digest", hex.EncodeToString(d)), zap.Error(derr))
 		}
+		// Crypto-shred the abandoned blob's wrapped CEK: nothing references
+		// it any more, and without the row the region cannot decrypt it.
+		if derr := b.encParams.DeleteEncryptionParams(ctx, space, d); derr != nil {
+			b.logger.Warn("delete encryption params failed",
+				zap.String("digest", hex.EncodeToString(d)), zap.Error(derr))
+		}
 	}
 }
 
@@ -805,7 +817,13 @@ func (b *Backend) parkBlobs(ctx context.Context, space did.DID, blobs []msbucket
 			return fmt.Errorf("lookup park: %w", err)
 		}
 
-		res, err := b.deferred.UploadBlob(ctx, space, digest, blob.Length, b.spool.Path(digest), uploader.WithConclude(false))
+		// The uploaded bytes are the spooled envelope; the intent records
+		// their (ciphertext) count, not the blob's plaintext span.
+		in, err := b.intents.GetIntent(ctx, digest)
+		if err != nil {
+			return fmt.Errorf("lookup intent: %w", err)
+		}
+		res, err := b.deferred.UploadBlob(ctx, space, digest, in.Size, b.spool.Path(digest), uploader.WithConclude(false))
 		if err != nil {
 			return fmt.Errorf("park blob: %w", err)
 		}
@@ -834,7 +852,7 @@ func (b *Backend) parkBlobs(ctx context.Context, space did.DID, blobs []msbucket
 			AddTask:       res.AddTask.Bytes(),
 			AcceptTask:    res.AcceptTask.Bytes(),
 			PutInvocation: res.PutInvocation,
-			Size:          blob.Length,
+			Size:          in.Size,
 		}); err != nil {
 			return fmt.Errorf("record park: %w", err)
 		}
@@ -889,7 +907,11 @@ func (b *Backend) concludeBlobs(ctx context.Context, space did.DID, blobs []msbu
 		} else {
 			// Never parked (crash between spool and park): the spooled copy
 			// drives the whole synchronous upload.
-			res, uerr := b.uploader.UploadBlob(ctx, space, digest, blob.Length, b.spool.Path(digest))
+			in, ierr := b.intents.GetIntent(ctx, digest)
+			if ierr != nil {
+				return fmt.Errorf("lookup intent: %w", ierr)
+			}
+			res, uerr := b.uploader.UploadBlob(ctx, space, digest, in.Size, b.spool.Path(digest))
 			if uerr != nil {
 				return fmt.Errorf("upload blob: %w", uerr)
 			}

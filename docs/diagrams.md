@@ -34,8 +34,10 @@ change to the diagrams to re-check. The maintenance rule lives in
 
 ## System context: services and contracts
 
-Ingot is an S3 gateway over the Forge network: versitygw serves S3 REST on
-`:9000`, hilt authorizes requests and owns tenancy, sprue brokers every blob
+Ingot is an S3 gateway over the Forge network: versitygw serves S3 REST
+(`:8080` by default; `:80` in the smelt stack, where `did:web:ingot` resolves
+to the listener's `/.well-known/did.json`), hilt authorizes requests and owns
+tenancy, sprue brokers every blob
 operation, and piri stores and serves the bytes. The indexing-service read
 path is designed but unwired; a local locator (over `blob_locations` and
 `shard_inclusions`) serves reads instead.
@@ -43,7 +45,7 @@ path is designed but unwired; a local locator (over `blob_locations` and
 ```mermaid
 flowchart LR
     client["S3 client<br/>SigV4, path-style"]
-    ingot["ingot<br/>S3 gateway :9000, /health"]
+    ingot["ingot<br/>S3 gateway, /health, /.well-known/did.json<br/>did:web:ingot"]
     hilt["hilt<br/>auth + tenant service<br/>did:web:hilt"]
     sprue["sprue<br/>upload service<br/>did:web:upload"]
     piri["piri<br/>storage node<br/>provider DID from location commitments"]
@@ -247,14 +249,15 @@ sequenceDiagram
     participant TX as bucketop.Tx
     participant L as logstore.Manager
 
-    Note over C,L: off the lock: ingest, hash, upload
+    Note over C,L: off the lock: ingest, hash, encrypt, upload
     C->>B: PutObject(bucket, key, body)
     B->>R: reg.Get(bucket), precondition pre-check
-    B->>SP: SplitBody: stream to spool per blob<br/>(temp file then rename, sha256 + md5 in one pass)
-    B->>R: PutIntent(digest, spooled) per blob
+    B->>B: tenant recipient: resolve the tenant's #wrap key<br/>(tenant DID from the request, did:plc doc via the cached PLC resolver);<br/>no recipient → the write fails
+    B->>SP: SplitBody: per plaintext piece, fresh CEK →<br/>FEE envelope (COSE_Encrypt, AES-256-GCM STREAM,<br/>one recipient: ECDH-ES+A256KW to the tenant wrap key) →<br/>spool under the CIPHERTEXT digest<br/>(sha256 + md5 of the plaintext in the same pass)
+    B->>R: PutIntent(digest, stored size) +<br/>PutEncryptionParams(region-wrapped CEK, FEE geometry) per blob
     loop each body blob (uploadBlobs)
         alt blob_locations already has (space, digest)
-            B->>R: SetIntentState(accepted), skip upload (dedup)
+            B->>R: SetIntentState(accepted), skip upload<br/>(never hits for fresh writes — every envelope digest is new)
         else upload
             B->>U: /blob/add (digest, size)
             U-->>B: allocation address (none on provider-side dedup)
@@ -274,17 +277,29 @@ sequenceDiagram
     TX-->>B: committed, lock released
     Note over B,R: post-commit, off the lock
     B->>R: reconcileClaims: blob_refs gains this version,<br/>superseded version rows removed
-    B->>U: /blob/remove per digest whose CountClaims reached 0
+    B->>U: /blob/remove per digest whose CountClaims reached 0<br/>(+ crypto-shred: its blob_encryption_params row deleted)
     B-->>C: 200 + ETag (+ x-amz-version-id when versioning is configured)
 ```
 
+- Encryption makes the stored digest a ciphertext digest: **content dedup is
+  gone for bodies** (fresh CEK per write ⇒ unique envelope), by design per
+  the encryption RFC. Manifest spans, `Body.Size`, sha256/md5 and ETag stay
+  plaintext values; `upload_intents.Size` and `blob_locations.Size` are
+  stored (envelope) sizes.
+- The envelope's one COSE recipient is the tenant wrap key (kid = the key's
+  fingerprint), the RFC's insurance copy: the tenant's private key alone
+  recovers the plaintext. The IAM layer stashes the tenant DID from Hilt's
+  authorize response on the request; `tenantkey` resolves the `#wrap` key
+  from the tenant's did:plc document.
 - The supersession rule (which prior version is retained, replaced, or
   discarded) is [`s3-versioning.md`](./s3-versioning.md) §5; the resulting
   storage shape is the [version tree](#per-key-version-storage-manifest-arm-leaf-arm-prev-tree).
 - The claim ledger and the zero-claims release are the
   [blob lifecycle](#blob-lifecycle-spooled-parked-accepted-released).
 - `CopyObject` runs the same `commitVersion` with a manifest that pins the
-  source's digests: no spool, no upload, claims incremented.
+  source's digests: no spool, no upload, claims incremented. Cross-space
+  (today: cross-bucket) copies are rejected `NotImplemented` — the CEK wrap
+  is bound to (space, digest), so they need a rewrap flow.
 - Supersession also records each replaced catalog block for future removal:
   the [catalog GC candidates](#catalog-gc-candidates-what-gets-remembered-for-removal)
   diagram shows every entry path.
@@ -312,6 +327,7 @@ sequenceDiagram
     participant LY as blockstore.Layered
     participant LG as logstore.Manager
     participant LC as registry.LocalLocator
+    participant K as regionkey.Provider<br/>(OpenBao / in-process)
     participant P as piri
 
     C->>B: GetObject(bucket, key, versionId?)
@@ -323,8 +339,13 @@ sequenceDiagram
         Note over B,LY: Current for the head, otherwise seek the prev tree at<br/>revSeqKey(seq) and confirm the stored VersionID (see version-tree)
     end
     Note over B: delete marker: 404 NoSuchKey (current) or 405 (versioned),<br/>then preconditions and selectBytes (Range, or partNumber via Body.PartSizes)
+    B->>R: bodyOpener: blob_encryption_params + blob_locations per blob<br/>(row existence = encrypted)
     loop each covering blob or catalog block
-        B->>LY: read
+        opt encrypted blob (FEE)
+            B->>K: Unwrap region-wrapped CEK, bound to (space, digest)
+            Note over B: aesstream.CiphertextRange maps the plaintext range to<br/>one contiguous ciphertext span past the envelope header
+        end
+        B->>LY: read (whole blob, or only the ciphertext span via OpenBlobRange)
         alt spool hit
             LY-->>B: bytes from the spool
         else catalog log hit (GetBlock only)
@@ -337,11 +358,14 @@ sequenceDiagram
             else inner block via shard_inclusions
                 LC-->>LY: shard location + inclusive byte range
             end
-            LY->>P: content/retrieve (UCAN, audience = the commitment's provider,<br/>proofs from reqscope.ProofStore, absent for root)
+            LY->>P: content/retrieve (UCAN, audience = the commitment's provider,<br/>proofs from reqscope.ProofStore, absent for root;<br/>narrowed to the ciphertext span for an encrypted blob)
             P-->>LY: ranged bytes, length-checked
         end
+        opt encrypted blob (FEE)
+            Note over B: aesstream.SpanReader decrypts the span as it streams;<br/>a tampered chunk fails authentication mid-stream (ErrCorrupted)
+        end
     end
-    B-->>C: 200 or 206 body
+    B-->>C: 200 or 206 body (plaintext byte counts throughout)
 ```
 
 - `OpenBlob` (body blobs) checks spool then network; only `GetBlock`
@@ -351,12 +375,20 @@ sequenceDiagram
   blocks are local.
 - The indexer-backed locator (`blockstore/locator`) compiles but is never
   injected; `module.go` always wires `LocalLocator`.
+- Manifest coordinates are plaintext: `BlobRef.Start/End`, `Body.Size`,
+  ETag and Content-Length never change with encryption. `BlobRef.Digest`
+  names the stored — for an encrypted blob, ciphertext — bytes; only the
+  per-blob open translates between the two.
+- HEAD needs no decryption at all (every value it reports is a plaintext
+  manifest field).
 
 Cross-references: [`architecture.md` §7.4](./architecture.md#74-read-getobject),
 [§8](./architecture.md#8-retrieval-addressing-when-bodies-need-a-sharded-dag-index).
 
 Sources: `s3frontend/object.go` (GetObject, HeadObject, selectBytes),
-`s3frontend/version.go` (resolveVersion), `blockstore/layered.go`,
+`s3frontend/version.go` (resolveVersion), `s3frontend/decrypt.go`
+(bodyOpener, decryptingOpener), `bucket/chunker.go` (BlobRangeOpener),
+`blockstore/layered.go`,
 `blockstore/forge.go` (doRetrieve), `blockstore/cache.go`,
 `registry/locallocator.go`, `logstore/manager.go` (Get). Review when these
 change.
@@ -381,7 +413,7 @@ sequenceDiagram
     B->>R: CreateSession(open) with headers + checksum algorithm
     B-->>C: uploadId
     C->>B: UploadPart(n)
-    B->>B: openSession (non-open: NoSuchUpload), then splitSpool
+    B->>B: openSession (non-open: NoSuchUpload), then splitSpool<br/>(resolve the tenant recipient, then encrypt per piece:<br/>fresh CEK → FEE envelope → spool under the ciphertext<br/>digest + params row, as in the PutObject diagram)
     B->>R: PutPart(parked)
     loop each part blob (parkBlobs)
         alt blob_locations already has the digest
@@ -401,6 +433,7 @@ sequenceDiagram
         B-->>C: the stored result (idempotent re-Complete)
     else latch won
         B->>R: LatchSession(open to completing), single winner
+        B->>R: manifest spans: per blob, plaintext length derived from<br/>the intent's stored size + FEE geometry (blobPlaintextLen)
         B->>U: concludeBlobs: /ucan/conclude per parked blob, poll accept
         B->>R: PutLocation + intent accepted + DeletePark per blob
         B->>TX: commitVersion (see the PutObject diagram)
@@ -409,7 +442,7 @@ sequenceDiagram
     end
     C->>B: AbortMultipartUpload
     B->>R: LatchSession(open to aborting), then DeleteSession (parts cascade)
-    B->>U: cleanupPartBlobs: /blob/abort parked blobs (cause = AddTask)
+    B->>U: cleanupPartBlobs: /blob/abort parked blobs (cause = AddTask),<br/>crypto-shred each blob's blob_encryption_params row
     Note over B,R: a background sweeper aborts open sessions older than<br/>MultipartSessionTTL (default 7d) and reaps terminal rows
 ```
 
@@ -615,7 +648,7 @@ flowchart TB
     subgraph chain["delegation chain (hilt-issued)"]
         space["bucket space<br/>did:plc, minted by hilt at bucket create"]
         ak["access key<br/>did:key (the S3 access key ID)"]
-        agent["ingot agent<br/>did:key from identity.key_file;<br/>issuer of every outbound invocation"]
+        agent["ingot agent<br/>identity.key_file key, wrapped as the<br/>identity.service_id did:web; issuer of every outbound invocation"]
         space -->|"grant at access-key creation"| ak
         ak -->|"re-delegation per authorize<br/>(expires next UTC midnight)"| agent
     end

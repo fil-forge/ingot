@@ -4,10 +4,12 @@ package itest
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -32,6 +34,38 @@ func TestForgeScenarios(t *testing.T) {
 	ctx := t.Context()
 	accessKey, secretKey := hiltProvisionTenant(t, ctx, s, "scenarios")
 	cl := sdkClient(forgeS3Conf(endpoint, accessKey, secretKey))
+
+	// AgentDIDDocument: the listener publishes the agent's DID document at the
+	// did:web well-known path, ahead of the S3 route table (otherwise the path
+	// would be read as bucket ".well-known", key "did.json"). The stack config
+	// names the agent did:web:ingot; hilt resolves this document to verify
+	// ingot's /s3/* invocations, so every other subtest depends on it too.
+	t.Run("AgentDIDDocument", func(t *testing.T) {
+		hc := &http.Client{Timeout: 10 * time.Second}
+		res, err := hc.Get(endpoint + "/.well-known/did.json")
+		if err != nil {
+			t.Fatalf("GET /.well-known/did.json: %v", err)
+		}
+		defer res.Body.Close()
+		if res.StatusCode != http.StatusOK {
+			t.Fatalf("GET /.well-known/did.json: status %d", res.StatusCode)
+		}
+		var doc struct {
+			ID                 string `json:"id"`
+			VerificationMethod []struct {
+				ID string `json:"id"`
+			} `json:"verificationMethod"`
+		}
+		if err := json.NewDecoder(res.Body).Decode(&doc); err != nil {
+			t.Fatalf("decode DID document: %v", err)
+		}
+		if doc.ID != "did:web:ingot" {
+			t.Fatalf("DID document id = %q, want did:web:ingot", doc.ID)
+		}
+		if len(doc.VerificationMethod) != 1 || doc.VerificationMethod[0].ID != "did:web:ingot#key-0" {
+			t.Fatalf("verificationMethod = %+v, want one method did:web:ingot#key-0", doc.VerificationMethod)
+		}
+	})
 
 	// BlobSplitMultiBlobRoundTrip: a PUT several times larger than
 	// max_blob_size is coarsely split into multiple BlobRefs; the
@@ -217,9 +251,8 @@ func TestForgeScenarios(t *testing.T) {
 			t.Fatalf("CreateMultipartUpload: %v", err)
 		}
 		spoolBefore := spoolBlobCount(t, ctx, s)
-		// A 150 KiB part spans three 64 KiB blobs. The content must be unique
-		// to this test — patternBytes at the same offsets would dedup against
-		// the round-trip subtests' already-spooled blobs and skew the counts.
+		// A 150 KiB part spans three 64 KiB blobs (plaintext split; each is
+		// stored as its own envelope).
 		part := patternBytes(150 << 10)
 		for i := range part {
 			part[i] ^= 0xA5

@@ -52,7 +52,7 @@ func SplitBody(ctx context.Context, w blockstore.BlobWriter, r io.Reader, maxBlo
 		if n == 0 {
 			break
 		}
-		blobs = append(blobs, BlobRef{Digest: digest, Offset: total, Length: n})
+		blobs = append(blobs, BlobRef{Digest: digest, Start: total, End: total + n - 1})
 		total += n
 		if n < max {
 			break
@@ -67,30 +67,87 @@ func SplitBody(ctx context.Context, w blockstore.BlobWriter, r io.Reader, maxBlo
 	}, nil
 }
 
-// OpenBody returns a reader over the full body, streaming each blob from bs by
-// its digest in order. space is the owning bucket's Forge space (an evicted
-// blob is re-fetched from the network by space + digest).
-func OpenBody(ctx context.Context, bs blockstore.BlobReader, space did.DID, body Body) io.ReadCloser {
-	return &blobBodyReader{ctx: ctx, bs: bs, space: space, blobs: body.Blobs, pos: 0, end: body.Size - 1}
+// BlobRangeOpener opens a body blob's plaintext. OpenBlobRange returns a
+// reader over the inclusive plaintext bytes [start, end] of the blob ref
+// describes — start and end are relative to the blob's own plaintext, not
+// the object; callers guarantee 0 <= start <= end <= ref.Len()-1. The reader
+// yields exactly end-start+1 bytes then EOF; a stream that ends earlier is a
+// short or corrupt blob, which the body reader reports as
+// io.ErrUnexpectedEOF.
+//
+// It is the seam decryption slots into: [NewPlainOpener] serves unencrypted
+// blobs (stored bytes ARE the plaintext), while an encrypting deployment's
+// opener resolves the blob's FEE parameters and decrypts only the ciphertext
+// chunks the range overlaps.
+type BlobRangeOpener interface {
+	OpenBlobRange(ctx context.Context, space did.DID, ref BlobRef, start, end int64) (io.ReadCloser, error)
+}
+
+// OpenBody returns a reader over the full body, streaming each blob through
+// opener in order. space is the owning bucket's Forge space (an evicted blob
+// is re-fetched from the network by space + digest).
+func OpenBody(ctx context.Context, opener BlobRangeOpener, space did.DID, body Body) io.ReadCloser {
+	return &blobBodyReader{ctx: ctx, opener: opener, space: space, blobs: body.Blobs, pos: 0, end: body.Size - 1}
 }
 
 // OpenBodyRange returns a reader over [start, end] inclusive of the body.
 // Caller must ensure 0 <= start <= end <= Size-1.
-func OpenBodyRange(ctx context.Context, bs blockstore.BlobReader, space did.DID, body Body, start, end int64) io.ReadCloser {
-	return &blobBodyReader{ctx: ctx, bs: bs, space: space, blobs: body.Blobs, pos: start, end: end}
+func OpenBodyRange(ctx context.Context, opener BlobRangeOpener, space did.DID, body Body, start, end int64) io.ReadCloser {
+	return &blobBodyReader{ctx: ctx, opener: opener, space: space, blobs: body.Blobs, pos: start, end: end}
+}
+
+// NewPlainOpener returns the BlobRangeOpener for unencrypted blobs, whose
+// stored bytes are their plaintext: open the blob, position at start (a Seek
+// for a spool file, read-and-discard for a network stream), and serve
+// through end.
+func NewPlainOpener(bs blockstore.BlobReader) BlobRangeOpener {
+	return plainOpener{bs: bs}
+}
+
+type plainOpener struct {
+	bs blockstore.BlobReader
+}
+
+func (o plainOpener) OpenBlobRange(ctx context.Context, space did.DID, ref BlobRef, start, end int64) (io.ReadCloser, error) {
+	rc, err := o.bs.OpenBlob(ctx, space, ref.Digest)
+	if err != nil {
+		return nil, err
+	}
+	// Position at start within the blob — a ranged read may begin mid-blob.
+	// Prefer a seek (local spool files are seekable); fall back to
+	// read-and-discard for a non-seekable network stream.
+	if start > 0 {
+		if seeker, ok := rc.(io.Seeker); ok {
+			if _, err := seeker.Seek(start, io.SeekStart); err != nil {
+				_ = rc.Close()
+				return nil, fmt.Errorf("seek blob to %d: %w", start, err)
+			}
+		} else if _, err := io.CopyN(io.Discard, rc, start); err != nil {
+			_ = rc.Close()
+			return nil, fmt.Errorf("skip into blob to %d: %w", start, err)
+		}
+	}
+	return readerCloser{Reader: io.LimitReader(rc, end-start+1), Closer: rc}, nil
+}
+
+// readerCloser pairs a wrapped reader with the closer that releases its
+// underlying stream.
+type readerCloser struct {
+	io.Reader
+	io.Closer
 }
 
 // blobBodyReader streams a Body's blobs lazily, keeping at most one open blob
 // reader at a time so a read never materializes a whole blob (up to
-// max_blob_size) in memory. It walks the ordered BlobRef list, opening the blob
-// that covers the current position, seeking/skipping into it for a ranged read,
+// max_blob_size) in memory. It walks the ordered BlobRef list, asking the
+// opener for the plaintext span of the blob that covers the current position,
 // and serving bytes until the inclusive end. Whole-body and ranged reads share
 // the loop — only the initial pos and the end differ.
 type blobBodyReader struct {
-	ctx   context.Context
-	bs    blockstore.BlobReader
-	space did.DID
-	blobs []BlobRef
+	ctx    context.Context
+	opener BlobRangeOpener
+	space  did.DID
+	blobs  []BlobRef
 
 	pos int64 // current absolute byte position (next byte to return)
 	end int64 // last byte to return (inclusive)
@@ -144,36 +201,24 @@ func (br *blobBodyReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-// openCurrent opens the blob covering br.pos and positions it at br.pos.
+// openCurrent opens the plaintext span of the blob covering br.pos, from
+// br.pos through the blob's end (or the read's end, whichever is first).
 func (br *blobBodyReader) openCurrent() error {
 	b, ok := blobAt(br.blobs, br.pos)
 	if !ok {
 		// The Blobs list does not cover pos — a malformed manifest.
 		return io.ErrUnexpectedEOF
 	}
-	rc, err := br.bs.OpenBlob(br.ctx, br.space, b.Digest)
-	if err != nil {
-		return fmt.Errorf("read blob @%d: %w", b.Offset, err)
+	curEnd := b.End
+	if curEnd > br.end {
+		curEnd = br.end
 	}
-	// Position at pos within the blob — a ranged read may start mid-blob. Prefer
-	// a seek (local spool files are seekable); fall back to read-and-discard for
-	// a non-seekable network stream.
-	if skip := br.pos - b.Offset; skip > 0 {
-		if seeker, ok := rc.(io.Seeker); ok {
-			if _, err := seeker.Seek(skip, io.SeekStart); err != nil {
-				_ = rc.Close()
-				return fmt.Errorf("seek blob @%d: %w", b.Offset, err)
-			}
-		} else if _, err := io.CopyN(io.Discard, rc, skip); err != nil {
-			_ = rc.Close()
-			return fmt.Errorf("skip into blob @%d: %w", b.Offset, err)
-		}
+	rc, err := br.opener.OpenBlobRange(br.ctx, br.space, b, br.pos-b.Start, curEnd-b.Start)
+	if err != nil {
+		return fmt.Errorf("read blob @%d: %w", b.Start, err)
 	}
 	br.cur = rc
-	br.curEnd = b.Offset + b.Length - 1
-	if br.curEnd > br.end {
-		br.curEnd = br.end
-	}
+	br.curEnd = curEnd
 	return nil
 }
 
@@ -188,11 +233,11 @@ func (br *blobBodyReader) Close() error {
 	return nil
 }
 
-// blobAt returns the BlobRef whose [Offset, Offset+Length) span contains pos.
+// blobAt returns the BlobRef whose inclusive [Start, End] span contains pos.
 // The list is ordered and contiguous, so a forward scan suffices.
 func blobAt(blobs []BlobRef, pos int64) (BlobRef, bool) {
 	for _, b := range blobs {
-		if pos >= b.Offset && pos < b.Offset+b.Length {
+		if pos >= b.Start && pos <= b.End {
 			return b, true
 		}
 	}

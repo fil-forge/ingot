@@ -18,9 +18,9 @@ import (
 	"github.com/fil-forge/ucantone/did"
 )
 
-// countingUploader records how many times each digest is uploaded, so a test can
-// assert that an already-located blob is not re-uploaded. It returns a non-empty
-// location so the backend records it (the dedup signal GetLocation reads back).
+// countingUploader records how many times each digest is uploaded. It returns
+// a non-empty location so the backend records it (what uploadBlobs'
+// already-located short-circuit reads back).
 type countingUploader struct {
 	inmem.NopUploader
 	mu    sync.Mutex
@@ -38,19 +38,13 @@ func (u *countingUploader) UploadBlob(_ context.Context, _ did.DID, digest multi
 	}, nil
 }
 
-func (u *countingUploader) count(digest []byte) int {
-	u.mu.Lock()
-	defer u.mu.Unlock()
-	return u.calls[string(digest)]
-}
-
-// TestUploadDedup_SkipsAlreadyLocatedBlob is the in-process regression for the
-// forge dedup bug surfaced in smelt: re-uploading a blob already durably stored
-// for the space (a re-PUT of identical content, an overwrite, or content shared
-// with another key) makes the upload service return an accept receipt with no
-// fresh location commitment, which the edge client rejects (500). uploadBlobs
-// must short-circuit on the recorded location and not re-upload.
-func TestUploadDedup_SkipsAlreadyLocatedBlob(t *testing.T) {
+// TestUpload_IdenticalContentUploadsDistinctBlobs pins the encryption RFC's
+// stated dedup trade-off: every write mints a fresh CEK, so identical
+// plaintext produces a different ciphertext digest each time and each PUT
+// uploads its own blob exactly once. (uploadBlobs still short-circuits on an
+// already-recorded location — that guard now only fires for digests shared
+// by same-space copies, where no re-upload is needed.)
+func TestUpload_IdenticalContentUploadsDistinctBlobs(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 	mem := inmem.NewMemStore()
@@ -71,30 +65,42 @@ func TestUploadDedup_SkipsAlreadyLocatedBlob(t *testing.T) {
 
 	up := &countingUploader{calls: map[string]int{}}
 	b := New(Deps{
-		Authority: mem,
-		Registry:  mem,
-		Intents:   mem,
-		Locations: mem,
-		BlobRefs:  mem,
-		GC:        mem,
-		Reads:     blockstore.NewLayered(spool, log, inmem.NopBaseReader{}),
-		Log:       log,
-		Spool:     spool,
-		Uploader:  up,
-		Remover:   &recordingRemover{},
+		Authority:  mem,
+		Registry:   mem,
+		Intents:    mem,
+		Locations:  mem,
+		BlobRefs:   mem,
+		GC:         mem,
+		Reads:      blockstore.NewLayered(spool, log, inmem.NopBaseReader{}),
+		Log:        log,
+		Spool:      spool,
+		Uploader:   up,
+		Remover:    &recordingRemover{},
+		EncParams:  mem,
+		RegionKeys: testRegionKeys(t),
+		TenantKeys: testTenantKeys(),
 	})
 	if err := mem.Create(ctx, "bk", testutil.RandomDID(t), registry.CreateState{}); err != nil {
 		t.Fatalf("create bucket: %v", err)
 	}
 
-	data := []byte("dedup me across puts and keys")
-	d := digestOf(t, data)
+	data := []byte("identical bytes across puts and keys")
 
-	putObj(t, b, "k1", data) // first upload
+	putObj(t, b, "k1", data)
 	putObj(t, b, "k1", data) // overwrite-in-place with identical content
 	putObj(t, b, "k2", data) // different key, same content
 
-	if n := up.count(d); n != 1 {
-		t.Fatalf("UploadBlob called %d times for the shared blob, want 1 (already-located blobs are skipped)", n)
+	up.mu.Lock()
+	defer up.mu.Unlock()
+	if len(up.calls) != 3 {
+		t.Fatalf("uploaded %d distinct digests, want 3 (fresh CEK per write ends content dedup)", len(up.calls))
+	}
+	for d, n := range up.calls {
+		if n != 1 {
+			t.Fatalf("UploadBlob called %d times for blob %x, want 1", n, []byte(d))
+		}
+	}
+	if n := up.calls[string(digestOf(t, data))]; n != 0 {
+		t.Fatalf("a stored digest equals hash(plaintext); blobs were not encrypted")
 	}
 }

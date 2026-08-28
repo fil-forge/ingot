@@ -18,7 +18,7 @@ in [`CLAUDE.md`](./CLAUDE.md).
 
 - **Library.** A host imports the fx `Module(cfg)` (or `ServerModule` plus
   the non-fx `New(ctx, ServerConfig, ServerDeps)`) and supplies a logger, a
-  Postgres pool, and the **agent** signer (`ServiceIdentity`); config names
+  Postgres pool, and the **agent** identity (libforge `identity.Identity`); config names
   the sprue endpoint (`upload_service_url`/`_did`) and the hilt endpoint
   (`auth_service_url`/`_did`, with the `auth_service_proofs` delegation
   chains hilt issues to this agent).
@@ -46,6 +46,34 @@ compare-and-swap the bucket root in Postgres. The reference index
 (`blob_refs`) reconciles after the commit, releasing superseded blobs whose
 claim count reaches zero. The full trace is the
 [PutObject diagram](./docs/diagrams.md#putobject-spool-and-upload-off-the-lock-commit-under-it).
+
+**Every body blob is encrypted at ingest** (the FilOne encryption design's
+write side, `s3frontend/encrypt.go`). Each plaintext piece SplitBody cuts
+gets a fresh CEK and streams through FEE into a `COSE_Encrypt` envelope
+(AES-256-GCM STREAM, 256 KiB chunks); the envelope is what the spool stores
+and the network receives, under its **ciphertext** digest. The CEK is wrapped
+twice. The region wrap (`regionkey.Provider`, bound to (space, digest)) goes
+into the blob's `blob_encryption_params` row before any manifest can
+reference the digest; every read uses it. The tenant wrap is the envelope's
+single COSE recipient: ECDH-ES+A256KW to the tenant's X25519 wrap key,
+which Hilt publishes in the tenant's did:plc document at the `#wrap`
+verification method. The recipient kid is the key's fingerprint (its
+Multikey string), so the envelope names the exact key it was wrapped to and
+the tenant's private key alone recovers the plaintext, with no region and no
+database involved. The write path learns the tenant from Hilt's authorize
+response (`AuthorizeOK.Tenant`, cached per access key for the local fast
+path) and resolves its wrap key through `tenantkey` (PLC resolver, cached
+for `tenantkey.cache_ttl`); a write that cannot obtain the recipient fails.
+The split geometry, manifest spans, `Body.Size`, sha256/md5 and ETag are all
+plaintext values — only the digest and the stored sizes
+(`upload_intents.Size`, `blob_locations.Size`) name ciphertext.
+Consequences, per the RFC: content **dedup is gone** for bodies (a fresh CEK
+makes every stored digest unique), a DELETE that releases a blob's last
+claim also deletes its params row (crypto-shred — the ciphertext is
+unreadable even where copies survive), and **cross-space CopyObject is
+rejected** `NotImplemented` (the CEK wrap is space-bound; a rewrap flow is a
+filed follow-up). Rotation: Hilt replaces `#wrap` in place and archives the
+old key, so a write inside the cache TTL of a rotation still recovers.
 
 A `200` therefore means the body is durable and accepted on the network and
 the catalog mutation is fsynced locally; the catalog becomes durable on
@@ -101,10 +129,31 @@ by the location commitment. The indexing-service query path is implemented
 but unwired. The full trace is the
 [GetObject diagram](./docs/diagrams.md#getobject-version-resolution-local-tiers-network-retrieval).
 
+**Encrypted blobs** (the FilOne encryption design's read side) decrypt inside
+the per-blob open, leaving every other read-path value plaintext: the
+manifest's `BlobRef.Start/End`, `Body.Size`, ETag and Content-Length are
+plaintext coordinates, while `BlobRef.Digest` names the stored FEE envelope.
+A `blob_encryption_params` row marks a blob encrypted and carries what its
+decryptor needs; the read unwraps the region-wrapped CEK through
+`regionkey.Provider` (OpenBao transit in production, bound to the blob's
+(space, digest)), maps the plaintext range to one contiguous ciphertext span
+(`aesstream.CiphertextRange`), fetches only that span (ranged from the spool
+or piri via `OpenBlobRange`), and decrypts it as it streams
+(`aesstream.SpanReader`). A tampered chunk fails authentication mid-stream.
+The encryption-params store and region key provider are required
+dependencies; only the provider implementation (openbao vs inprocess) is
+configuration.
+HEAD never decrypts. See `s3frontend/decrypt.go`.
+
 ## Identity & auth
 
-- **agent**: `ServiceIdentity.Signer` (daemon: `identity.key_file` PEM), the
-  issuer of every outbound invocation to sprue, hilt, and piri.
+- **agent**: the libforge `identity.Identity` the host provides (daemon: the `identity.key_file` PEM
+  key, wrapped as the `identity.service_id` did:web when set), the issuer of
+  every outbound invocation to sprue, hilt, and piri. The agent's DID
+  document is served at `/.well-known/did.json` on the S3 listener; peers
+  resolve it to the signing key. The hilt→agent delegations and hilt's
+  provider registration name the agent's DID, so changing it (did:key to
+  did:web) re-issues both.
 - **space**: per bucket, a `did:plc` minted by hilt at bucket create and
   stored on the bucket row; the subject of every blob and retrieve
   invocation.

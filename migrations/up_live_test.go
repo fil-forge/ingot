@@ -92,3 +92,61 @@ func TestUp_Live(t *testing.T) {
 		}
 	}
 }
+
+// TestUp_Live_Concurrent races several Up calls against a fresh database:
+// the pg_advisory_lock in Up must serialize them, or the first-run DDL
+// (goose's version table, the schema) collides — the exact failure mode of
+// parallel test packages migrating the shared CI database, and of multiple
+// ingot instances starting against one Postgres. The race needs a database
+// with no ingot schema yet, so the test creates and drops a scratch database
+// rather than touching the shared one (which other packages' live tests may
+// be using concurrently).
+func TestUp_Live_Concurrent(t *testing.T) {
+	dsn := os.Getenv("INGOT_TEST_DSN")
+	if dsn == "" {
+		t.Skip("set INGOT_TEST_DSN to run the live migration test")
+	}
+	ctx := context.Background()
+
+	admin, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer admin.Close()
+
+	const scratchDB = "ingot_migrate_race"
+	if _, err := admin.Exec(ctx, "DROP DATABASE IF EXISTS "+scratchDB+" WITH (FORCE)"); err != nil {
+		t.Fatalf("drop stale scratch database: %v", err)
+	}
+	if _, err := admin.Exec(ctx, "CREATE DATABASE "+scratchDB); err != nil {
+		t.Fatalf("create scratch database: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = admin.Exec(ctx, "DROP DATABASE IF EXISTS "+scratchDB+" WITH (FORCE)")
+	})
+
+	scratchCfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		t.Fatalf("parse dsn: %v", err)
+	}
+	scratchCfg.ConnConfig.Database = scratchDB
+
+	const racers = 4
+	errs := make(chan error, racers)
+	for i := 0; i < racers; i++ {
+		go func() {
+			pool, err := pgxpool.NewWithConfig(ctx, scratchCfg.Copy())
+			if err != nil {
+				errs <- err
+				return
+			}
+			defer pool.Close()
+			errs <- migrations.Up(ctx, pool, zaptest.NewLogger(t))
+		}()
+	}
+	for i := 0; i < racers; i++ {
+		if err := <-errs; err != nil {
+			t.Errorf("concurrent migrations.Up: %v", err)
+		}
+	}
+}

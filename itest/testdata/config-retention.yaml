@@ -5,15 +5,20 @@
 # ranged /content/retrieve path rather than a warm cache.
 # Mounted over /etc/ingot/config.yaml via stack.WithServiceConfig.
 
-addr: "0.0.0.0:9000"
+# Port 80 inside the compose network: did:web:ingot resolves to
+# http://ingot:80/.well-known/did.json (smelt's did:web convention).
+addr: "0.0.0.0:80"
 region: us-west-1
 data_dir: /data
 
 root_access: ingot
 root_secret: ingotsecret
 
+# Agent identity: the key, wrapped as did:web:ingot; the listener serves the
+# matching DID document so hilt/sprue/piri can verify ingot's invocations.
 identity:
   key_file: /keys/ingot.pem
+  service_id: did:web:ingot
 
 postgres_dsn: "postgres://ingot:ingot@ingot-postgres:5432/ingot?sslmode=disable"
 
@@ -24,7 +29,7 @@ upload_receipts_url: "http://upload:80/receipt"
 indexer_endpoint: "http://indexer:80"
 indexer_did: "did:web:indexer"
 
-# S3 authorization service (hilt); the DID is used verbatim (no resolution)
+# S3 authorization service (hilt).
 auth_service_url: "http://hilt:80"
 auth_service_did: "did:web:hilt"
 # hilt → ingot delegations for /s3/request/authorize and /s3/bucket/*
@@ -38,3 +43,18 @@ read_cache_bytes: -1
 catalog_plane:
   seal_age: 2s
   retain: 1
+
+# Region CEK wrap provider (required): the stack's ingot-openbao transit
+# engine, provisioned by ingot-openbao-init; the token arrives via
+# INGOT_REGIONKEY_OPENBAO_TOKEN from the compose environment.
+regionkey:
+  provider: openbao
+  openbao:
+    address: "http://ingot-openbao:8200"
+    mount: transit
+    key: region-kek
+
+# Tenant wrap key (FEE tenant recipient): resolved from the stack's PLC
+# directory; every write is encrypted to the tenant's #wrap key.
+tenantkey:
+  plc_directory_url: "http://plc:3000"

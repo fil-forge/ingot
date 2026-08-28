@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/base64"
 	"os"
 	"path/filepath"
 	"strings"
@@ -35,6 +36,8 @@ func validConfig(t *testing.T) Config {
 		AuthServiceDID:   "did:web:auth.example",
 
 		AuthServiceProofs: encodedProofs(t, mintDelegation(t)),
+		RegionKey:        RegionKeyConfig{Provider: "inprocess"},
+		TenantKey:        TenantKeyConfig{PLCDirectoryURL: "http://plc.example:3000"},
 	}
 }
 
@@ -87,12 +90,28 @@ func TestValidate_RequiredFields(t *testing.T) {
 		{"postgres_dsn", func(c *Config) { c.PostgresDSN = "" }, "postgres_dsn is required"},
 		{"identity key unset", func(c *Config) { c.Identity.KeyFile = "" }, "identity.key_file (agent PEM) is required"},
 		{"identity key missing", func(c *Config) { c.Identity.KeyFile = "/nonexistent/agent.pem" }, "identity.key_file"},
+		{"identity service id not a DID", func(c *Config) { c.Identity.ServiceID = "ingot.example" }, "identity.service_id"},
 		{"upload service", func(c *Config) { c.UploadServiceURL = "" }, "upload_service_url and upload_service_did are required"},
 		{"auth service", func(c *Config) { c.AuthServiceDID = "" }, "auth_service_url and auth_service_did are required"},
 		{"revocation url without did", func(c *Config) { c.RevocationServiceURL = "http://127.0.0.1:6000" }, "revocation_service_url and revocation_service_did must be set together"},
 		{"revocation did without url", func(c *Config) { c.RevocationServiceDID = "did:web:swarf.example" }, "revocation_service_url and revocation_service_did must be set together"},
 		{"bad seal_age", func(c *Config) { c.SealAge = "not-a-duration" }, "parse seal_age"},
 		{"bad cors origin", func(c *Config) { c.CORSAllowedOrigins = []string{"app.example"} }, "cors_allowed_origins"},
+		{"regionkey provider unset", func(c *Config) { c.RegionKey.Provider = "" }, "regionkey.provider is required"},
+		{"tenantkey url unset", func(c *Config) { c.TenantKey.PLCDirectoryURL = "" }, "tenantkey.plc_directory_url is required"},
+		{"tenantkey url relative", func(c *Config) { c.TenantKey.PLCDirectoryURL = "plc:3000" }, "not an absolute URL"},
+		{"tenantkey bad ttl", func(c *Config) { c.TenantKey.CacheTTL = "soon" }, "tenantkey.cache_ttl"},
+		{"tenantkey zero ttl", func(c *Config) { c.TenantKey.CacheTTL = "0s" }, "must be positive"},
+		{"unknown regionkey provider", func(c *Config) { c.RegionKey.Provider = "hsm" }, `regionkey.provider "hsm" is not one of openbao, inprocess`},
+		{"openbao without key", func(c *Config) { c.RegionKey.Provider = "openbao" }, "regionkey.openbao.key"},
+		{"inprocess kek not base64", func(c *Config) {
+			c.RegionKey.Provider = "inprocess"
+			c.RegionKey.InProcess.KEK = "not-base64!!"
+		}, "regionkey.inprocess.kek"},
+		{"inprocess kek wrong length", func(c *Config) {
+			c.RegionKey.Provider = "inprocess"
+			c.RegionKey.InProcess.KEK = "c2hvcnQ=" // "short"
+		}, "must decode to 32 bytes"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -114,6 +133,31 @@ func TestValidate_RevocationServicePair(t *testing.T) {
 	cfg.RevocationServiceDID = "did:web:swarf.example"
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("expected valid config with revocation pair set, got: %v", err)
+	}
+}
+
+// TestValidate_RegionKey: both providers validate with their required
+// settings present. The provider itself is required (see the required-fields
+// table); only the implementation choice is configuration.
+func TestValidate_RegionKey(t *testing.T) {
+	cfg := validConfig(t)
+	cfg.RegionKey.Provider = "openbao"
+	cfg.RegionKey.OpenBao.Key = "region-kek"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected valid openbao regionkey config, got: %v", err)
+	}
+
+	cfg = validConfig(t)
+	cfg.RegionKey.Provider = "inprocess"
+	cfg.RegionKey.InProcess.KEK = base64.StdEncoding.EncodeToString(make([]byte, 32))
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected valid inprocess regionkey config, got: %v", err)
+	}
+
+	cfg = validConfig(t)
+	cfg.RegionKey.Provider = "inprocess" // empty KEK: generated at startup
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected valid inprocess config with no KEK, got: %v", err)
 	}
 }
 
@@ -139,5 +183,36 @@ func TestValidate_AuthServiceProofs(t *testing.T) {
 				t.Fatalf("expected error containing %q, got: %v", tc.wantErr, err)
 			}
 		})
+	}
+}
+
+// TestValidate_IdentityServiceID: the optional service DID must parse as a
+// DID; a did:web is the expected shape but the method is not enforced.
+func TestValidate_IdentityServiceID(t *testing.T) {
+	cfg := validConfig(t)
+	cfg.Identity.ServiceID = "did:web:ingot.example"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected valid config with a did:web service id, got: %v", err)
+	}
+}
+
+// TestLoad_IdentityEnv: the identity keys are registered with viper defaults
+// so INGOT_IDENTITY_* env vars bind even when the YAML omits them.
+func TestLoad_IdentityEnv(t *testing.T) {
+	t.Setenv("INGOT_IDENTITY_KEY_FILE", "/keys/agent.pem")
+	t.Setenv("INGOT_IDENTITY_SERVICE_ID", "did:web:ingot.example")
+	cfgFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(cfgFile, []byte("addr: \"127.0.0.1:9000\"\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg, err := Load(cfgFile)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Identity.KeyFile != "/keys/agent.pem" {
+		t.Fatalf("identity.key_file = %q, want /keys/agent.pem", cfg.Identity.KeyFile)
+	}
+	if cfg.Identity.ServiceID != "did:web:ingot.example" {
+		t.Fatalf("identity.service_id = %q, want did:web:ingot.example", cfg.Identity.ServiceID)
 	}
 }

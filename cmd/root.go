@@ -37,18 +37,19 @@ func newRootCmd() *cobra.Command {
 func newWhoamiCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "whoami",
-		Short: "Print the agent DID and configured endpoints",
+		Short: "Print the agent DID (and key DID) and configured endpoints",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := config.Load(cfgFile)
 			if err != nil {
 				return err
 			}
-			id, err := loadAgentIdentity(cfg.Identity.KeyFile)
+			id, err := loadAgentIdentity(cfg.Identity)
 			if err != nil {
 				return err
 			}
-			cmd.Printf("agent DID:      %s\n", id.Signer.DID())
+			// A did:web agent prints as "did:web:… (key: z6Mk…)".
+			cmd.Printf("agent DID:      %s\n", id)
 			cmd.Printf("upload service: %s (%s)\n", cfg.UploadServiceURL, cfg.UploadServiceDID)
 			cmd.Printf("auth service:   %s (%s)\n", cfg.AuthServiceURL, cfg.AuthServiceDID)
 			return nil

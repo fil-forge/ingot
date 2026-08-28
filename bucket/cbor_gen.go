@@ -1203,46 +1203,46 @@ func (t *BlobRef) MarshalCBOR(w io.Writer) error {
 		return err
 	}
 
-	// t.Length (int64) (int64)
-	if len("l") > 1000000 {
-		return xerrors.Errorf("Value in field \"l\" was too long")
+	// t.End (int64) (int64)
+	if len("e") > 1000000 {
+		return xerrors.Errorf("Value in field \"e\" was too long")
 	}
 
-	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("l"))); err != nil {
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("e"))); err != nil {
 		return err
 	}
-	if _, err := cw.WriteString(string("l")); err != nil {
+	if _, err := cw.WriteString(string("e")); err != nil {
 		return err
 	}
 
-	if t.Length >= 0 {
-		if err := cw.WriteMajorTypeHeader(cbg.MajUnsignedInt, uint64(t.Length)); err != nil {
+	if t.End >= 0 {
+		if err := cw.WriteMajorTypeHeader(cbg.MajUnsignedInt, uint64(t.End)); err != nil {
 			return err
 		}
 	} else {
-		if err := cw.WriteMajorTypeHeader(cbg.MajNegativeInt, uint64(-t.Length-1)); err != nil {
+		if err := cw.WriteMajorTypeHeader(cbg.MajNegativeInt, uint64(-t.End-1)); err != nil {
 			return err
 		}
 	}
 
-	// t.Offset (int64) (int64)
-	if len("o") > 1000000 {
-		return xerrors.Errorf("Value in field \"o\" was too long")
+	// t.Start (int64) (int64)
+	if len("s") > 1000000 {
+		return xerrors.Errorf("Value in field \"s\" was too long")
 	}
 
-	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("o"))); err != nil {
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("s"))); err != nil {
 		return err
 	}
-	if _, err := cw.WriteString(string("o")); err != nil {
+	if _, err := cw.WriteString(string("s")); err != nil {
 		return err
 	}
 
-	if t.Offset >= 0 {
-		if err := cw.WriteMajorTypeHeader(cbg.MajUnsignedInt, uint64(t.Offset)); err != nil {
+	if t.Start >= 0 {
+		if err := cw.WriteMajorTypeHeader(cbg.MajUnsignedInt, uint64(t.Start)); err != nil {
 			return err
 		}
 	} else {
-		if err := cw.WriteMajorTypeHeader(cbg.MajNegativeInt, uint64(-t.Offset-1)); err != nil {
+		if err := cw.WriteMajorTypeHeader(cbg.MajNegativeInt, uint64(-t.Start-1)); err != nil {
 			return err
 		}
 	}
@@ -1314,8 +1314,8 @@ func (t *BlobRef) UnmarshalCBOR(r io.Reader) (err error) {
 				return err
 			}
 
-			// t.Length (int64) (int64)
-		case "l":
+			// t.End (int64) (int64)
+		case "e":
 			{
 				maj, extra, err := cr.ReadHeader()
 				if err != nil {
@@ -1338,10 +1338,10 @@ func (t *BlobRef) UnmarshalCBOR(r io.Reader) (err error) {
 					return fmt.Errorf("wrong type for int64 field: %d", maj)
 				}
 
-				t.Length = int64(extraI)
+				t.End = int64(extraI)
 			}
-			// t.Offset (int64) (int64)
-		case "o":
+			// t.Start (int64) (int64)
+		case "s":
 			{
 				maj, extra, err := cr.ReadHeader()
 				if err != nil {
@@ -1364,7 +1364,7 @@ func (t *BlobRef) UnmarshalCBOR(r io.Reader) (err error) {
 					return fmt.Errorf("wrong type for int64 field: %d", maj)
 				}
 
-				t.Offset = int64(extraI)
+				t.Start = int64(extraI)
 			}
 
 		default:

@@ -88,6 +88,17 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 		}
 		return s3response.CopyObjectOutput{}, s3err.GetAPIError(s3err.ErrInvalidRequest)
 	}
+	// A copy across spaces is not implemented. The destination manifest
+	// reuses the source's blobs, but each blob's CEK is wrapped bound to
+	// (space, digest): the destination space cannot unwrap them, and the
+	// destination space has no blob_locations/claims for those digests
+	// either. Serving this needs a rewrap flow (unwrap under the source
+	// space, rewrap under the destination, new params row + claim) — a filed
+	// follow-up. Every bucket has its own space today, so this rejects all
+	// cross-bucket copies.
+	if srcRv.st.Space != bucketState.Space {
+		return s3response.CopyObjectOutput{}, s3err.GetAPIError(s3err.ErrNotImplemented)
+	}
 	// A copy-source versionId naming the CURRENT version is still an illegal
 	// self-copy without metadata replacement; only restoring a noncurrent
 	// version is exempt from the check at the top.
@@ -126,7 +137,11 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 		if err != nil {
 			return s3response.CopyObjectOutput{}, err
 		}
-		rc := msbucket.OpenBody(ctx, b.read, srcRv.st.Space, srcMf.Body)
+		opener, err := b.bodyOpener(ctx, srcRv.st.Space, srcMf.Body)
+		if err != nil {
+			return s3response.CopyObjectOutput{}, err
+		}
+		rc := msbucket.OpenBody(ctx, opener, srcRv.st.Space, srcMf.Body)
 		defer rc.Close()
 		hr, err := utils.NewHashReader(rc, "", ht)
 		if err != nil {

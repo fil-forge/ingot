@@ -1,12 +1,15 @@
 package config
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 	"time"
 
+	"github.com/fil-forge/ucantone/did"
 	"github.com/spf13/viper"
 	"go.uber.org/multierr"
 
@@ -95,6 +98,20 @@ type Config struct {
 	// left zero/unset falls back to the top-level SealBytes / SealAge / Retain
 	// (and Ship defaults to true) — e.g. to configure the catalog never to ship.
 	CatalogPlane PlaneSettings `mapstructure:"catalog_plane" yaml:"catalog_plane"`
+
+	// RegionKey selects and configures the region CEK wrap provider
+	// (regionkey.Provider): the component that wraps each object's
+	// content-encryption key under the region KEK for the read path (the
+	// FilOne encryption design's region wrap). Required: the provider choice
+	// (openbao in production, inprocess for tests/dev) is configuration, but
+	// bucket encryption is not optional.
+	RegionKey RegionKeyConfig `mapstructure:"regionkey" yaml:"regionkey"`
+
+	// TenantKey configures resolution of the tenant wrap key (tenantkey): the
+	// X25519 key, published in each tenant's did:plc document, that every
+	// stored object is encrypted to as the FEE tenant recipient. Required:
+	// writes fail without a recipient.
+	TenantKey TenantKeyConfig `mapstructure:"tenantkey" yaml:"tenantkey"`
 
 	// LogLevel is the zap level (debug|info|warn|error).
 	LogLevel string `mapstructure:"log_level" yaml:"log_level"`
@@ -219,10 +236,92 @@ func EmptyDefault(s, def string) string {
 	return s
 }
 
-// IdentityConfig points at the agent's PEM-encoded ed25519 key — the
-// signer that issues invocations to sprue.
+// IdentityConfig describes the agent (service) identity: the signer that
+// issues every outbound invocation (to hilt, sprue, and piri).
 type IdentityConfig struct {
+	// KeyFile is the path to the agent's PEM-encoded ed25519 private key.
+	// Required.
 	KeyFile string `mapstructure:"key_file" yaml:"key_file"`
+	// ServiceID is an optional did:web identity to wrap the key with (e.g.
+	// "did:web:ingot.example.com"). When set, ingot issues invocations as that
+	// DID; peers resolve it through the DID document the S3 listener serves at
+	// /.well-known/did.json. When empty, the key's did:key is used.
+	ServiceID string `mapstructure:"service_id" yaml:"service_id"`
+}
+
+// TenantKeyConfig locates the did:plc directory tenant DID documents are
+// resolved from.
+type TenantKeyConfig struct {
+	// PLCDirectoryURL is the did:plc directory endpoint, e.g.
+	// "https://plc.directory". Required.
+	PLCDirectoryURL string `mapstructure:"plc_directory_url" yaml:"plc_directory_url"`
+	// CacheTTL is how long a resolved tenant document is reused before the
+	// directory is consulted again (a Go duration). It bounds both the
+	// directory traffic on the write path and how long a wrap-key rotation
+	// goes unseen. Empty means "10m".
+	CacheTTL string `mapstructure:"cache_ttl" yaml:"cache_ttl"`
+}
+
+// DefaultTenantKeyCacheTTL is the tenant document cache TTL when
+// tenantkey.cache_ttl is unset.
+const DefaultTenantKeyCacheTTL = 10 * time.Minute
+
+// CacheTTLDuration parses CacheTTL, returning DefaultTenantKeyCacheTTL when
+// it is empty.
+func (c TenantKeyConfig) CacheTTLDuration() (time.Duration, error) {
+	if c.CacheTTL == "" {
+		return DefaultTenantKeyCacheTTL, nil
+	}
+	d, err := time.ParseDuration(c.CacheTTL)
+	if err != nil {
+		return 0, err
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("must be positive, got %s", d)
+	}
+	return d, nil
+}
+
+// RegionKeyConfig selects the region CEK wrap provider and carries each
+// implementation's settings.
+type RegionKeyConfig struct {
+	// Provider names the implementation: "openbao" (production — the wrap
+	// runs inside the region's OpenBao transit engine and the KEK never
+	// enters ingot's process) or "inprocess" (AES-256-GCM in ingot's own
+	// process; tests and development only). Required.
+	Provider string `mapstructure:"provider" yaml:"provider"`
+	// OpenBao configures the "openbao" provider.
+	OpenBao OpenBaoConfig `mapstructure:"openbao" yaml:"openbao"`
+	// InProcess configures the "inprocess" provider.
+	InProcess InProcessConfig `mapstructure:"inprocess" yaml:"inprocess"`
+}
+
+// OpenBaoConfig is the "openbao" region-key provider's connection and key
+// settings.
+type OpenBaoConfig struct {
+	// Address of the OpenBao server, e.g. "https://bao.region.internal:8200"
+	// or a unix socket "unix:///run/openbao/api.sock". Empty falls back to
+	// the client's environment (BAO_ADDR, or upstream VAULT_ADDR).
+	Address string `mapstructure:"address" yaml:"address"`
+	// Token authenticates ingot to OpenBao; it needs encrypt/decrypt/rewrap
+	// on the transit key and nothing else. Empty falls back to the client's
+	// environment (BAO_TOKEN, or upstream VAULT_TOKEN).
+	Token string `mapstructure:"token" yaml:"token"`
+	// Mount is the transit engine's mount path. Empty means "transit".
+	Mount string `mapstructure:"mount" yaml:"mount"`
+	// Key is the transit key name holding the region KEK (provisioned with
+	// type aes256-gcm96 and derived=true). Required when provider=openbao.
+	Key string `mapstructure:"key" yaml:"key"`
+}
+
+// InProcessConfig is the "inprocess" region-key provider's settings.
+type InProcessConfig struct {
+	// KEK is the region key, base64-encoded 32 bytes. Empty generates a
+	// random key at startup — development only: wraps made under a generated
+	// key are unreadable after a restart.
+	KEK string `mapstructure:"kek" yaml:"kek"`
+	// Version tags wraps with the KEK's version. Empty means "v1".
+	Version string `mapstructure:"version" yaml:"version"`
 }
 
 // Load reads daemon config from configFile (or the default search path)
@@ -263,7 +362,26 @@ func Load(configFile string) (*Config, error) {
 
 func setDefaults(v *viper.Viper) {
 	v.SetDefault("log_level", "info")
-	v.SetDefault("addr", "0.0.0.0:9000")
+	v.SetDefault("addr", "0.0.0.0:8080")
+	// The identity keys are registered even though the defaults are empty:
+	// viper's AutomaticEnv only overrides keys it already knows, so without
+	// these an INGOT_IDENTITY_* env var would be silently ignored whenever
+	// the key is absent from the YAML.
+	v.SetDefault("identity.key_file", "")
+	v.SetDefault("identity.service_id", "")
+	// The regionkey keys are registered even where the default is empty:
+	// viper's AutomaticEnv only overrides keys it already knows, so without
+	// these an INGOT_REGIONKEY_* env var would be silently ignored whenever
+	// the key is absent from the YAML.
+	v.SetDefault("regionkey.provider", "")
+	v.SetDefault("regionkey.openbao.address", "")
+	v.SetDefault("regionkey.openbao.token", "")
+	v.SetDefault("regionkey.openbao.mount", "transit")
+	v.SetDefault("regionkey.openbao.key", "")
+	v.SetDefault("regionkey.inprocess.kek", "")
+	v.SetDefault("regionkey.inprocess.version", "v1")
+	v.SetDefault("tenantkey.plc_directory_url", "")
+	v.SetDefault("tenantkey.cache_ttl", "")
 }
 
 // Validate checks the config for the selected mode, aggregating every
@@ -292,6 +410,11 @@ func (c *Config) Validate() error {
 	} else if _, err := os.Stat(c.Identity.KeyFile); err != nil {
 		errs = multierr.Append(errs, fmt.Errorf("identity.key_file %q: %w", c.Identity.KeyFile, err))
 	}
+	if c.Identity.ServiceID != "" {
+		if _, err := did.Parse(c.Identity.ServiceID); err != nil {
+			errs = multierr.Append(errs, fmt.Errorf("identity.service_id %q: %w", c.Identity.ServiceID, err))
+		}
+	}
 	if c.UploadServiceURL == "" || c.UploadServiceDID == "" {
 		errs = multierr.Append(errs, errors.New("upload_service_url and upload_service_did are required"))
 	}
@@ -315,6 +438,35 @@ func (c *Config) Validate() error {
 	}
 	if (c.RevocationServiceURL == "") != (c.RevocationServiceDID == "") {
 		errs = multierr.Append(errs, errors.New("revocation_service_url and revocation_service_did must be set together"))
+	}
+
+	switch c.RegionKey.Provider {
+	case "":
+		errs = multierr.Append(errs, errors.New("regionkey.provider is required (openbao or inprocess)"))
+	case "openbao":
+		if c.RegionKey.OpenBao.Key == "" {
+			errs = multierr.Append(errs, errors.New("regionkey.openbao.key (transit key name) is required when regionkey.provider is openbao"))
+		}
+	case "inprocess":
+		if c.RegionKey.InProcess.KEK != "" {
+			kek, err := base64.StdEncoding.DecodeString(c.RegionKey.InProcess.KEK)
+			if err != nil {
+				errs = multierr.Append(errs, fmt.Errorf("regionkey.inprocess.kek: %w", err))
+			} else if len(kek) != 32 {
+				errs = multierr.Append(errs, fmt.Errorf("regionkey.inprocess.kek must decode to 32 bytes (AES-256), got %d", len(kek)))
+			}
+		}
+	default:
+		errs = multierr.Append(errs, fmt.Errorf("regionkey.provider %q is not one of openbao, inprocess", c.RegionKey.Provider))
+	}
+
+	if c.TenantKey.PLCDirectoryURL == "" {
+		errs = multierr.Append(errs, errors.New("tenantkey.plc_directory_url is required"))
+	} else if u, err := url.Parse(c.TenantKey.PLCDirectoryURL); err != nil || u.Scheme == "" || u.Host == "" {
+		errs = multierr.Append(errs, fmt.Errorf("tenantkey.plc_directory_url %q is not an absolute URL", c.TenantKey.PLCDirectoryURL))
+	}
+	if _, err := c.TenantKey.CacheTTLDuration(); err != nil {
+		errs = multierr.Append(errs, fmt.Errorf("tenantkey.cache_ttl: %w", err))
 	}
 
 	if errs != nil {

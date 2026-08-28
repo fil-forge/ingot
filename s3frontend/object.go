@@ -17,8 +17,10 @@ import (
 	"github.com/fil-forge/versitygw/s3api/utils"
 	"github.com/fil-forge/versitygw/s3err"
 	"github.com/fil-forge/versitygw/s3response"
+	"github.com/filecoin-project/go-fee"
 	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
+	"go.uber.org/zap"
 
 	msbucket "github.com/fil-forge/ingot/bucket"
 	"github.com/fil-forge/ingot/bucketop"
@@ -182,7 +184,7 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 // crash recovery to reconcile (a later phase); no manifest is written, so no
 // catalog entry ever references a non-durable blob.
 func (b *Backend) ingestBody(ctx context.Context, bucket *registry.State, r io.Reader) (msbucket.Body, error) {
-	body, err := b.splitSpool(ctx, bucket.Name, r)
+	body, err := b.splitSpool(ctx, bucket.Name, bucket.Space, r)
 	if err != nil {
 		return msbucket.Body{}, err
 	}
@@ -192,28 +194,54 @@ func (b *Backend) ingestBody(ctx context.Context, bucket *registry.State, r io.R
 	return body, nil
 }
 
-// splitSpool coarse-splits a body into blobs, writes each to the local spool,
-// and records a spooled upload_intents row per blob — WITHOUT uploading. It is
-// the shared first half of ingest: a single-shot PUT follows it with
-// uploadBlobs immediately; a multipart UploadPart spools here and defers the
-// upload to Complete.
-func (b *Backend) splitSpool(ctx context.Context, bucket string, r io.Reader) (msbucket.Body, error) {
+// splitSpool coarse-splits a body into blobs, encrypts each into a FEE
+// envelope (recipient: the tenant's wrap key) written to the local spool
+// under its ciphertext digest, and records a spooled upload_intents row plus
+// a blob_encryption_params row per blob — WITHOUT uploading. It is the
+// shared first half of ingest: a single-shot PUT follows it with uploadBlobs
+// immediately; a multipart UploadPart spools here and defers the upload to
+// Complete.
+//
+// The Body it returns is entirely plaintext-coordinate (Size, spans,
+// SHA256/MD5 — all computed before encryption); the intents record the
+// SPOOLED (ciphertext) byte count, which is what the uploader ships.
+func (b *Backend) splitSpool(ctx context.Context, bucket string, space did.DID, r io.Reader) (msbucket.Body, error) {
 	if r == nil {
 		r = bytes.NewReader(nil)
 	}
-	body, err := msbucket.SplitBody(ctx, b.spool, r, b.maxBlobSize)
+	// One tenant recipient per request, resolved before anything is spooled:
+	// a body that cannot be wrapped to its tenant is not stored at all.
+	recipient, err := b.tenantRecipient(ctx)
+	if err != nil {
+		return msbucket.Body{}, err
+	}
+	enc := newEncryptingBlobWriter(b.spool, b.regionKeys, space, []fee.Recipient{recipient})
+	body, err := msbucket.SplitBody(ctx, enc, r, b.maxBlobSize)
 	if err != nil {
 		return msbucket.Body{}, fmt.Errorf("split body: %w", err)
 	}
 	for _, blob := range body.Blobs {
+		storedSize, err := enc.storedSize(blob.Digest)
+		if err != nil {
+			return msbucket.Body{}, err
+		}
 		if err := b.intents.PutIntent(ctx, registry.UploadIntent{
 			Digest:    blob.Digest,
 			LocalPath: b.spool.Path(blob.Digest),
-			Size:      blob.Length,
+			Size:      storedSize,
 			State:     registry.IntentSpooled,
 			Bucket:    bucket,
 		}); err != nil {
 			return msbucket.Body{}, fmt.Errorf("record intent: %w", err)
+		}
+		// The read path decrypts from this row; it must exist before any
+		// manifest referencing the blob can commit.
+		params, err := enc.params(space, blob.Digest)
+		if err != nil {
+			return msbucket.Body{}, err
+		}
+		if err := b.encParams.PutEncryptionParams(ctx, params); err != nil {
+			return msbucket.Body{}, fmt.Errorf("record encryption params: %w", err)
 		}
 	}
 	return body, nil
@@ -244,7 +272,13 @@ func (b *Backend) uploadBlobs(ctx context.Context, space did.DID, blobs []msbuck
 		} else if err != nil && !errors.Is(err, registry.ErrNotFound) {
 			return fmt.Errorf("lookup location: %w", err)
 		}
-		res, err := b.uploader.UploadBlob(ctx, space, digest, blob.Length, b.spool.Path(digest))
+		// The uploaded bytes are the spooled envelope, so the size is the
+		// intent's stored byte count, not the blob's plaintext span.
+		in, err := b.intents.GetIntent(ctx, digest)
+		if err != nil {
+			return fmt.Errorf("lookup intent: %w", err)
+		}
+		res, err := b.uploader.UploadBlob(ctx, space, digest, in.Size, b.spool.Path(digest))
 		if err != nil {
 			return fmt.Errorf("upload blob: %w", err)
 		}
@@ -326,13 +360,24 @@ func (b *Backend) reconcileClaims(ctx context.Context, bucketState *registry.Sta
 	return toRemove, nil
 }
 
-// releaseBlobs calls RemoveBlob for each digest whose last claim was dropped.
-// Run after the commit lands, off the critical section — a 200 is not gated on
-// the (currently no-op) network release. Failures are logged, not fatal: a
-// missed release leaks bytes on Piri but never loses referenced data, and crash
-// recovery reconciles upload_intents × blob_refs (a later phase).
+// releaseBlobs runs for each digest whose last claim was dropped: it deletes
+// the blob's encryption-params row (the crypto-shred — without the wrapped
+// CEK the region can no longer decrypt the blob, per the encryption RFC's
+// DELETE semantics), drops the location row, and calls RemoveBlob. Run after
+// the commit lands, off the critical section — a 200 is not gated on the
+// (currently no-op) network release. Failures are logged, not fatal: a
+// missed release leaks bytes on Piri but never loses referenced data, and
+// crash recovery reconciles upload_intents × blob_refs (a later phase).
 func (b *Backend) releaseBlobs(ctx context.Context, space did.DID, digests []multihash.Multihash) {
 	for _, d := range digests {
+		if err := b.encParams.DeleteEncryptionParams(ctx, space, d); err != nil {
+			b.logger.Warn("crypto-shred: delete encryption params failed",
+				zap.String("digest", hex.EncodeToString(d)), zap.Error(err))
+		}
+		if err := b.locations.DeleteLocation(ctx, space, d); err != nil {
+			b.logger.Warn("release: delete location failed",
+				zap.String("digest", hex.EncodeToString(d)), zap.Error(err))
+		}
 		if err := b.remover.RemoveBlob(ctx, space, d); err != nil {
 			// best-effort; see method doc.
 			_ = err
@@ -549,10 +594,19 @@ func (b *Backend) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.
 		return nil, err
 	}
 
+	// Resolve how each blob's bytes become plaintext — the plain opener for
+	// unencrypted blobs, the decrypting opener where an encryption row
+	// exists. Doing it here (not at first Read) fails a broken encrypted
+	// object as a request error, before response headers are written.
+	opener, err := b.bodyOpener(ctx, st.Space, mf.Body)
+	if err != nil {
+		return nil, err
+	}
+
 	var contentRange *string
-	var body = msbucket.OpenBody(ctx, b.read, st.Space, mf.Body)
+	var body = msbucket.OpenBody(ctx, opener, st.Space, mf.Body)
 	if isRange {
-		body = msbucket.OpenBodyRange(ctx, b.read, st.Space, mf.Body, startOffset, startOffset+length-1)
+		body = msbucket.OpenBodyRange(ctx, opener, st.Space, mf.Body, startOffset, startOffset+length-1)
 		cr := fmt.Sprintf("bytes %d-%d/%d", startOffset, startOffset+length-1, objSize)
 		contentRange = &cr
 	}
