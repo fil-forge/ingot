@@ -14,8 +14,8 @@
 //   - *zap.Logger
 //   - *pgxpool.Pool          — ingot owns its schema and runs its own goose
 //     migrations against this pool at startup
-//   - ingot.ServiceIdentity   — the agent signer; issuer of every outbound
-//     invocation
+//   - identity.Identity       — the agent (libforge identity); issuer of every
+//     outbound invocation (a did:key, or a did:web wrapping the key)
 //
 // Module manages the embedded S3 Server's lifecycle and provides nothing to the
 // host graph. When cfg.Enabled is false it is an empty option, so a host can
@@ -26,9 +26,9 @@
 // Module is a thin production wrapper around [ServerModule], which is the
 // reusable core: it consumes a [ServerConfig], a *zap.Logger, and the
 // collaborator seams (the registry + store interfaces, logstore.Meta,
-// blockstore.BlockReader, the uploader seams, bucketauthority, and an
-// optional IAM service) from the graph, then manages New -> Start -> Stop
-// over the fx lifecycle. Module layers the production providers (the
+// blockstore.BlockReader, the uploader seams, bucketauthority, the agent
+// identity, and the IAM service) from the graph, then manages New -> Start
+// -> Stop over the fx lifecycle. Module layers the production providers (the
 // Postgres registry, the Forge reader, the sprue uploader, the hilt
 // client/IAM) and a migration pre-start hook on top. A test harness, by
 // contrast, includes ServerModule directly and supplies in-memory fakes for
@@ -47,10 +47,10 @@ import (
 	"fmt"
 	"net/url"
 
+	"github.com/fil-forge/libforge/identity"
 	"github.com/fil-forge/libforge/receipt"
 	ucanlib "github.com/fil-forge/libforge/ucan"
 	"github.com/fil-forge/ucantone/did"
-	"github.com/fil-forge/ucantone/ucan"
 	"github.com/fil-forge/versitygw/auth"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/fx"
@@ -70,14 +70,6 @@ import (
 	"github.com/fil-forge/ingot/uploader"
 	swarfclient "github.com/fil-forge/swarf/pkg/client"
 )
-
-// ServiceIdentity carries the host's upload-service agent into the module. It
-// is a named wrapper rather than a bare ucan.Issuer so it can't be confused
-// with any other issuer the host has in its fx graph. The agent is a
-// [ucan.Issuer] (a signer tied to a DID): it issues every invocation to sprue.
-type ServiceIdentity struct {
-	Signer ucan.Issuer
-}
 
 // PreStartHook runs once during the server's OnStart, before the listener is
 // constructed. Production registers the goose migration step as one of these
@@ -163,9 +155,14 @@ type serverParams struct {
 	Multipart       registry.MultipartStore
 	Parks           registry.ParkStore
 	Meta            logstore.Meta
-	// IAM authenticates non-root access keys.
-	IAM       auth.IAMService `optional:"true"`
-	PreStarts []PreStartHook  `group:"ingot_prestart"`
+	// Identity is the agent identity (the host-provided libforge identity, the
+	// issuer of every outbound invocation); the listener serves its DID
+	// document at /.well-known/did.json. Required.
+	Identity identity.Identity
+	// IAM authenticates non-root access keys. Required: New rejects a nil
+	// IAM, so the graph fails at validation rather than in OnStart.
+	IAM       auth.IAMService
+	PreStarts []PreStartHook `group:"ingot_prestart"`
 }
 
 // registerServerLifecycle hooks the embedded server into the fx lifecycle. All
@@ -206,6 +203,7 @@ func registerServerLifecycle(lc fx.Lifecycle, p serverParams) {
 				Multipart:       p.Multipart,
 				Parks:           p.Parks,
 				Meta:            p.Meta,
+				Identity:        p.Identity,
 				IAM:             p.IAM,
 			})
 			if err != nil {
@@ -235,7 +233,7 @@ func provideTokenStore(cfg config.Config) (tokenstore.Store, error) {
 
 // provideForgeClient builds the edge-client to the upload service (sprue):
 // the agent identity issues invocations, the token store supplies proofs.
-func provideForgeClient(cfg config.Config, id ServiceIdentity, store tokenstore.Store, logger *zap.Logger) (*forgeclient.Client, error) {
+func provideForgeClient(cfg config.Config, id identity.Identity, store tokenstore.Store, logger *zap.Logger) (*forgeclient.Client, error) {
 	sprueURL, err := url.Parse(cfg.UploadServiceURL)
 	if err != nil {
 		return nil, fmt.Errorf("ingot: parse upload_service_url: %w", err)
@@ -255,7 +253,7 @@ func provideForgeClient(cfg config.Config, id ServiceIdentity, store tokenstore.
 		}
 		opts = append(opts, forgeclient.WithReceiptsClient(receipt.NewClient(rcptURL)))
 	}
-	return forgeclient.New(id.Signer, sprueDID, *sprueURL, opts...)
+	return forgeclient.New(id, sprueDID, *sprueURL, opts...)
 }
 
 // provideAuthServiceClient builds the UCAN RPC client to the Hilt tenant-
@@ -263,7 +261,7 @@ func provideForgeClient(cfg config.Config, id ServiceIdentity, store tokenstore.
 // issues invocations; HiltProofs (optional) supplies the Hilt→agent proof
 // chains. The provider is lazy, so an unconfigured Hilt only errors if a
 // consumer actually needs the client.
-func provideAuthServiceClient(cfg config.Config, id ServiceIdentity, logger *zap.Logger) (*hiltclient.Client, error) {
+func provideAuthServiceClient(cfg config.Config, id identity.Identity, logger *zap.Logger) (*hiltclient.Client, error) {
 	if cfg.AuthServiceURL == "" || cfg.AuthServiceDID == "" {
 		return nil, fmt.Errorf("ingot: auth_service_url and auth_service_did are required for the auth service client")
 	}
@@ -283,7 +281,7 @@ func provideAuthServiceClient(cfg config.Config, id ServiceIdentity, logger *zap
 		}
 		proofs = ucanlib.NewContainerProofStore(ct)
 	}
-	return hiltclient.New(authServiceDID, *authServiceURL, id.Signer, hiltclient.WithBaseProofs(proofs), hiltclient.WithLogger(logger))
+	return hiltclient.New(authServiceDID, *authServiceURL, id, hiltclient.WithBaseProofs(proofs), hiltclient.WithLogger(logger))
 }
 
 // provideKeyProofs is the per-access-key delegation store registry: the IAM
@@ -307,9 +305,9 @@ func provideVerificationKeyCache() *iam.VerificationKeyCache {
 // hold its verification key + covering delegation chains, else by Hilt's
 // /s3/request/authorize — whose response replenishes the caches. Either way
 // the gateway verifies the signature with the derived key.
-func provideIAMService(c *hiltclient.Client, proofs *iam.KeyProofs, keys *iam.VerificationKeyCache, reg registry.Registry, id ServiceIdentity, logger *zap.Logger) auth.IAMService {
+func provideIAMService(c *hiltclient.Client, proofs *iam.KeyProofs, keys *iam.VerificationKeyCache, reg registry.Registry, id identity.Identity, logger *zap.Logger) auth.IAMService {
 	return iam.New(c, proofs, keys,
-		iam.WithLocalAuthorization(id.Signer.DID(), reg),
+		iam.WithLocalAuthorization(id.DID(), reg),
 		iam.WithLogger(logger))
 }
 
@@ -428,10 +426,10 @@ func provideMigrationHook(pool *pgxpool.Pool, logger *zap.Logger) migrationHookO
 // read of the shipped shard. Per-space retrieval authority is the
 // request-scoped proof store the IAM service stashes on the context; Forge
 // reads it from there, so this reader takes no proof dependency.
-func provideForgeReader(cfg config.Config, id ServiceIdentity, locations registry.LocationStore, inclusions registry.InclusionStore, logger *zap.Logger) (blockstore.BlockReader, error) {
+func provideForgeReader(cfg config.Config, id identity.Identity, locations registry.LocationStore, inclusions registry.InclusionStore, logger *zap.Logger) (blockstore.BlockReader, error) {
 	forge, err := blockstore.NewForge(blockstore.ForgeConfig{
 		Locator: registry.NewLocalLocator(locations, inclusions),
-		Signer:  id.Signer,
+		Signer:  id,
 		Logger:  logger,
 	})
 	if err != nil {

@@ -18,7 +18,7 @@ in [`CLAUDE.md`](./CLAUDE.md).
 
 - **Library.** A host imports the fx `Module(cfg)` (or `ServerModule` plus
   the non-fx `New(ctx, ServerConfig, ServerDeps)`) and supplies a logger, a
-  Postgres pool, and the **agent** signer (`ServiceIdentity`); config names
+  Postgres pool, and the **agent** identity (libforge `identity.Identity`); config names
   the sprue endpoint (`upload_service_url`/`_did`) and the hilt endpoint
   (`auth_service_url`/`_did`).
 - **Daemon.** `ingot serve` builds the same wiring from a config file
@@ -102,8 +102,13 @@ but unwired. The full trace is the
 
 ## Identity & auth
 
-- **agent**: `ServiceIdentity.Signer` (daemon: `identity.key_file` PEM), the
-  issuer of every outbound invocation to sprue, hilt, and piri.
+- **agent**: the libforge `identity.Identity` the host provides (daemon: the `identity.key_file` PEM
+  key, wrapped as the `identity.service_id` did:web when set), the issuer of
+  every outbound invocation to sprue, hilt, and piri. The agent's DID
+  document is served at `/.well-known/did.json` on the S3 listener; peers
+  resolve it to the signing key. The hilt→agent delegations and hilt's
+  provider registration name the agent's DID, so changing it (did:key to
+  did:web) re-issues both.
 - **space**: per bucket, a `did:plc` minted by hilt at bucket create and
   stored on the bucket row; the subject of every blob and retrieve
   invocation.

@@ -61,8 +61,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build-prod /out/ingot /usr/bin/ingot
-# S3 listener (override addr in config; container should bind 0.0.0.0).
-EXPOSE 9000
+# S3 listener: :8080 by default, the port every Forge service image exposes.
+# smelt overrides addr to :80 in the mounted config so did:web:ingot resolves
+# to http://ingot/.well-known/did.json, and maps that port in compose.
+EXPOSE 8080
 ENTRYPOINT ["/usr/bin/ingot"]
 
 # ---- development runtime: prod + debug tooling + delve ----
@@ -84,6 +86,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build-dev /out/ingot /usr/bin/ingot
 COPY --from=build-dev /go/bin/dlv /usr/bin/dlv
-# S3 listener + delve headless port (used when launched under dlv).
-EXPOSE 9000 2345
+# S3 listener (see the prod target) + delve headless port.
+EXPOSE 8080 2345
 ENTRYPOINT ["/usr/bin/ingot"]

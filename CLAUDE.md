@@ -79,7 +79,7 @@ a real port, not an import rewrite.
 Public surface (what hosts import):
 
 - **`ingot` (root)** — `Module(cfg) fx.Option`, `ServerModule`,
-  `ServiceIdentity`, `PreStartHook`; the non-fx `New(ctx, ServerConfig,
+  `PreStartHook`; the non-fx `New(ctx, ServerConfig,
   ServerDeps)` + `Server.{Start,Stop}`. `module.go` (fx wiring), `server.go`
   (`New`, lifecycle, `newBucketFlushFunc`, the versitygw `s3api` mount).
 - **`config/`** — the host `Config`, `Config.ServerConfig()` (the single
@@ -88,7 +88,7 @@ Public surface (what hosts import):
 Internal:
 
 - **`cmd/`** — the daemon (cobra/viper/fx): `serve`, `whoami`, `version`;
-  `deps.go` (identity PEM + pgx pool).
+  `deps.go` (agent identity from the PEM key + optional did:web, pgx pool).
 - **`s3frontend/`** — versitygw `backend.Backend`: `object.go`
   (Put/Get/Head/Delete/List), `version.go` (resolveVersion / commitVersion,
   the per-key version tree), `multipart.go`, `bucket.go`, `listversions.go`,
@@ -162,7 +162,7 @@ Internal:
   `*zap.Logger`, and the collaborator seams (`blockstore.BlockReader`; the
   four `uploader` seams; `bucketauthority.BucketAuthority`;
   `registry.Registry` plus the intent/location/inclusion/blob-ref/GC/
-  multipart/park stores; `logstore.Meta`; an optional `auth.IAMService`) +
+  multipart/park stores; `logstore.Meta`; `auth.IAMService`) +
   a `PreStartHook` group; runs pre-start → `New` → `Start` on the fx
   lifecycle.
 - **`Module(cfg)`** (production wrapper) — supplies Postgres as Registry +
@@ -172,7 +172,7 @@ Internal:
   (empty) token store, and the goose migration `PreStartHook`. Empty option
   when `cfg.Enabled` is false.
 
-A host provides `*zap.Logger`, `*pgxpool.Pool`, `ingot.ServiceIdentity` (the
+A host provides `*zap.Logger`, `*pgxpool.Pool`, libforge's `identity.Identity` (the
 agent) and sets `Config.UploadServiceURL`/`UploadServiceDID` (sprue) +
 `AuthServiceURL`/`AuthServiceDID` (hilt). The non-fx escape hatch is
 `New(ctx, ServerConfig, ServerDeps)`.
@@ -180,7 +180,7 @@ agent) and sets `Config.UploadServiceURL`/`UploadServiceDID` (sprue) +
 ## Configuration (`config.Config`)
 
 Viper/yaml-bindable (env prefix `INGOT_`, `.` → `_`). Key fields: `Enabled`,
-`Addr` (default `0.0.0.0:9000`), `DataDir`, `Region`, `RootAccess`/`RootSecret`
+`Addr` (default `0.0.0.0:8080`), `DataDir`, `Region`, `RootAccess`/`RootSecret`
 (the versitygw root account), `MaxBlobSize`, top-level
 `SealBytes`/`SealAge`/`Retain` with a `CatalogPlane` `{SealBytes, SealAge,
 Ship, Retain}` override block (the only plane), `ReadCacheBytes` (0 → 256 MiB,
@@ -189,8 +189,12 @@ Ship, Retain}` override block (the only plane), `ReadCacheBytes` (0 → 256 MiB,
 path or string-encoded UCAN container, optional), `TokenStoreDir` (→
 `DataDir`), `MultipartSessionTTL` (0 → 7d, negative → sweeper off),
 `CORSAllowedOrigins`, `LogLevel`. `Config.ServerConfig()` is the single
-mapping site. The daemon's config (cmd/) adds `postgres_dsn` and
-`identity.key_file`.
+mapping site. The daemon's config (cmd/) adds `postgres_dsn`,
+`identity.key_file` (the agent's PEM key) and `identity.service_id` (optional
+did:web the key is wrapped with). The listener always serves the agent's DID
+document at `/.well-known/did.json` — see `didDocumentHandler` in
+`server.go`, mounted via versitygw's `s3api.WithRoute` ahead of the S3
+route table.
 
 ## Testing
 

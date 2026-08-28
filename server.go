@@ -4,9 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"path/filepath"
 	"time"
 
+	"github.com/fil-forge/libforge/identity"
+	"github.com/fil-forge/ucantone/did"
+	"github.com/fil-forge/ucantone/did/web"
 	"github.com/fil-forge/versitygw/auth"
 	"github.com/fil-forge/versitygw/metrics"
 	"github.com/fil-forge/versitygw/s3api"
@@ -85,10 +89,17 @@ type ServerDeps struct {
 	// Typically the same instance as Registry.
 	Meta logstore.Meta
 
-	// IAM authenticates non-root access keys (e.g. hilt/iam, which
-	// authorizes each request against the Hilt tenant service). Optional:
-	// nil leaves the gateway with only the single root account, as in
-	// standalone mode and the test harness.
+	// Identity is the agent identity (the issuer of every outbound
+	// invocation). The listener serves its DID document at
+	// /.well-known/did.json so peers can resolve a did:web agent to its
+	// signing key (a did:key agent's document is served too; nothing needs
+	// to fetch it). Required.
+	Identity identity.Identity
+
+	// IAM authenticates non-root access keys (hilt/iam, which authorizes
+	// each request against the Hilt tenant service). Required: the root
+	// account is checked before the IAM lookup, but every other access key
+	// is resolved through it.
 	IAM auth.IAMService
 }
 
@@ -172,7 +183,7 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		Logger:      logger,
 	})
 
-	api, err := buildS3API(ctx, backend, cfg, deps.IAM)
+	api, err := buildS3API(ctx, backend, cfg, deps.IAM, deps.Identity)
 	if err != nil {
 		// Best-effort cleanup if we got past the log open: the caller
 		// has no Server handle to call Stop on.
@@ -364,9 +375,10 @@ func newBucketFlushFunc(up uploader.Uploader, reg registry.Registry, locations r
 
 // buildS3API constructs the versitygw S3ApiServer with the wiring ingot
 // needs: no audit / event sinks, generous concurrency limits. Non-root
-// access keys authenticate through iam when provided (the root account is
-// checked before the IAM lookup either way).
-func buildS3API(ctx context.Context, backend *s3frontend.Backend, cfg config.ServerConfig, iam auth.IAMService) (*s3api.S3ApiServer, error) {
+// access keys authenticate through iam, which is required (the root account
+// is checked before the IAM lookup). The server also publishes id's DID
+// document at /.well-known/did.json.
+func buildS3API(ctx context.Context, backend *s3frontend.Backend, cfg config.ServerConfig, iam auth.IAMService, id identity.Identity) (*s3api.S3ApiServer, error) {
 	if iam == nil {
 		return nil, fmt.Errorf("ingot: IAMService is required")
 	}
@@ -383,9 +395,7 @@ func buildS3API(ctx context.Context, backend *s3frontend.Backend, cfg config.Ser
 		return nil, fmt.Errorf("ingot: metrics: %w", err)
 	}
 
-	api, err := s3api.New(backend,
-		middlewares.RootUserConfig{Access: cfg.RootAccess, Secret: cfg.RootSecret},
-		cfg.Region, iam, loggers.S3Logger, loggers.AdminLogger, evSender, mm,
+	opts := []s3api.Option{
 		s3api.WithQuiet(),
 		s3api.WithHealth("/health"),
 		s3api.WithConcurrencyLimiter(cfg.MaxConnections, cfg.MaxRequests),
@@ -401,11 +411,36 @@ func buildS3API(ctx context.Context, backend *s3frontend.Backend, cfg config.Ser
 			c.Locals(reqscope.RequestKey(), fasthttputil.RequestFromHTTPContext(c.RequestCtx()))
 			return c.Next()
 		}),
+	}
+	// Public DID document for did:web resolution of the agent identity, so
+	// hilt/sprue/piri can verify ingot's UCAN signatures. WithRoute mounts
+	// ahead of the S3 route table, so this path is never read as the bucket
+	// ".well-known" / key "did.json"; it is also outside auth (a DID document
+	// is public by definition).
+	doc, err := id.DIDDocument()
+	if err != nil {
+		return nil, fmt.Errorf("ingot: building the agent DID document: %w", err)
+	}
+	opts = append(opts, s3api.WithRoute(http.MethodGet, web.WellKnownDIDPath, didDocumentHandler(doc)))
+
+	api, err := s3api.New(backend,
+		middlewares.RootUserConfig{Access: cfg.RootAccess, Secret: cfg.RootSecret},
+		cfg.Region, iam, loggers.S3Logger, loggers.AdminLogger, evSender, mm,
+		opts...,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("ingot: s3api: %w", err)
 	}
 	return api, nil
+}
+
+// didDocumentHandler serves a fixed DID document as JSON. The document is
+// built once at construction: the agent identity never changes while the
+// server runs.
+func didDocumentHandler(doc did.Document) fiber.Handler {
+	return func(c fiber.Ctx) error {
+		return c.JSON(doc)
+	}
 }
 
 func validateServerInputs(cfg config.ServerConfig, deps ServerDeps) error {
@@ -459,6 +494,9 @@ func validateServerInputs(cfg config.ServerConfig, deps ServerDeps) error {
 	}
 	if deps.Meta == nil {
 		return errors.New("ingot: ServerDeps.Meta is required")
+	}
+	if deps.Identity.Issuer == nil {
+		return errors.New("ingot: ServerDeps.Identity is required")
 	}
 	return nil
 }

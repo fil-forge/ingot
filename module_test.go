@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/fil-forge/ingot/config"
+	"github.com/fil-forge/libforge/identity"
 	"github.com/fil-forge/ucantone/multikey/ed25519"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/fx"
@@ -38,7 +39,7 @@ func TestModuleValidate_Enabled(t *testing.T) {
 		// Dependencies the host supplies:
 		fx.Supply(zap.NewNop()),
 		fx.Supply((*pgxpool.Pool)(nil)),
-		fx.Supply(ingot.ServiceIdentity{Signer: signer}),
+		fx.Supply(identity.Identity{Issuer: signer}),
 	)
 	if err != nil {
 		t.Fatalf("ingot.Module graph does not validate: %v", err)
@@ -46,8 +47,8 @@ func TestModuleValidate_Enabled(t *testing.T) {
 }
 
 // TestModuleValidate_HiltEnabled asserts the graph also validates with Hilt
-// configured, which adds the hilt-backed IAM provider (consumed by the
-// server's optional IAM dependency).
+// configured, the service behind the hilt-backed IAM provider the server
+// requires.
 func TestModuleValidate_HiltEnabled(t *testing.T) {
 	signer, err := ed25519.GenerateIssuer()
 	if err != nil {
@@ -69,7 +70,7 @@ func TestModuleValidate_HiltEnabled(t *testing.T) {
 		ingot.Module(cfg),
 		fx.Supply(zap.NewNop()),
 		fx.Supply((*pgxpool.Pool)(nil)),
-		fx.Supply(ingot.ServiceIdentity{Signer: signer}),
+		fx.Supply(identity.Identity{Issuer: signer}),
 	)
 	if err != nil {
 		t.Fatalf("ingot.Module graph with hilt does not validate: %v", err)
@@ -102,7 +103,7 @@ func TestModuleValidate_RevocationEnabled(t *testing.T) {
 		ingot.Module(cfg),
 		fx.Supply(zap.NewNop()),
 		fx.Supply((*pgxpool.Pool)(nil)),
-		fx.Supply(ingot.ServiceIdentity{Signer: signer}),
+		fx.Supply(identity.Identity{Issuer: signer}),
 	)
 	if err != nil {
 		t.Fatalf("ingot.Module graph with revocation service does not validate: %v", err)
