@@ -34,8 +34,10 @@ change to the diagrams to re-check. The maintenance rule lives in
 
 ## System context: services and contracts
 
-Ingot is an S3 gateway over the Forge network: versitygw serves S3 REST on
-`:9000`, hilt authorizes requests and owns tenancy, sprue brokers every blob
+Ingot is an S3 gateway over the Forge network: versitygw serves S3 REST
+(`:9000` by default; `:80` in the smelt stack, where `did:web:ingot` resolves
+to the listener's `/.well-known/did.json`), hilt authorizes requests and owns
+tenancy, sprue brokers every blob
 operation, and piri stores and serves the bytes. The indexing-service read
 path is designed but unwired; a local locator (over `blob_locations` and
 `shard_inclusions`) serves reads instead.
@@ -43,7 +45,7 @@ path is designed but unwired; a local locator (over `blob_locations` and
 ```mermaid
 flowchart LR
     client["S3 client<br/>SigV4, path-style"]
-    ingot["ingot<br/>S3 gateway :9000, /health"]
+    ingot["ingot<br/>S3 gateway, /health, /.well-known/did.json<br/>did:web:ingot"]
     hilt["hilt<br/>auth + tenant service<br/>did:web:hilt"]
     sprue["sprue<br/>upload service<br/>did:web:upload"]
     piri["piri<br/>storage node<br/>provider DID from location commitments"]
@@ -615,7 +617,7 @@ flowchart TB
     subgraph chain["delegation chain (hilt-issued)"]
         space["bucket space<br/>did:plc, minted by hilt at bucket create"]
         ak["access key<br/>did:key (the S3 access key ID)"]
-        agent["ingot agent<br/>did:key from identity.key_file;<br/>issuer of every outbound invocation"]
+        agent["ingot agent<br/>identity.key_file key, wrapped as the<br/>identity.service_id did:web; issuer of every outbound invocation"]
         space -->|"grant at access-key creation"| ak
         ak -->|"re-delegation per authorize<br/>(expires next UTC midnight)"| agent
     end

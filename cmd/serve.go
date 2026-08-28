@@ -61,10 +61,13 @@ func fxLogger(logger *zap.Logger) fx.Option {
 // providers it documents — logger, Postgres pool, and the agent service
 // identity.
 func buildApp(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*fx.App, error) {
-	id, err := loadAgentIdentity(cfg.Identity.KeyFile)
+	id, err := loadAgentIdentity(cfg.Identity)
 	if err != nil {
 		return nil, err
 	}
+	// The issuer's String() prints the service DID and, for a did:web agent,
+	// the underlying key: "did:web:… (key: z6Mk…)".
+	logger.Info("loaded agent identity", zap.Stringer("agent", id))
 	pool, err := openPool(ctx, cfg.PostgresDSN)
 	if err != nil {
 		return nil, err

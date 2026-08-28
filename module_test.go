@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/fil-forge/ingot/config"
+	"github.com/fil-forge/libforge/identity"
 	"github.com/fil-forge/ucantone/multikey/ed25519"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/fx"
@@ -38,7 +39,7 @@ func TestModuleValidate_Enabled(t *testing.T) {
 		// Dependencies the host supplies:
 		fx.Supply(zap.NewNop()),
 		fx.Supply((*pgxpool.Pool)(nil)),
-		fx.Supply(ingot.ServiceIdentity{Signer: signer}),
+		fx.Supply(identity.Identity{Issuer: signer}),
 	)
 	if err != nil {
 		t.Fatalf("ingot.Module graph does not validate: %v", err)
@@ -69,7 +70,7 @@ func TestModuleValidate_HiltEnabled(t *testing.T) {
 		ingot.Module(cfg),
 		fx.Supply(zap.NewNop()),
 		fx.Supply((*pgxpool.Pool)(nil)),
-		fx.Supply(ingot.ServiceIdentity{Signer: signer}),
+		fx.Supply(identity.Identity{Issuer: signer}),
 	)
 	if err != nil {
 		t.Fatalf("ingot.Module graph with hilt does not validate: %v", err)
@@ -102,7 +103,7 @@ func TestModuleValidate_RevocationEnabled(t *testing.T) {
 		ingot.Module(cfg),
 		fx.Supply(zap.NewNop()),
 		fx.Supply((*pgxpool.Pool)(nil)),
-		fx.Supply(ingot.ServiceIdentity{Signer: signer}),
+		fx.Supply(identity.Identity{Issuer: signer}),
 	)
 	if err != nil {
 		t.Fatalf("ingot.Module graph with revocation service does not validate: %v", err)

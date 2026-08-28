@@ -5,15 +5,20 @@
 # ranged /content/retrieve path rather than a warm cache.
 # Mounted over /etc/ingot/config.yaml via stack.WithServiceConfig.
 
-addr: "0.0.0.0:9000"
+# Port 80 inside the compose network: did:web:ingot resolves to
+# http://ingot:80/.well-known/did.json (smelt's did:web convention).
+addr: "0.0.0.0:80"
 region: us-west-1
 data_dir: /data
 
 root_access: ingot
 root_secret: ingotsecret
 
+# Agent identity: the key, wrapped as did:web:ingot; the listener serves the
+# matching DID document so hilt/sprue/piri can verify ingot's invocations.
 identity:
   key_file: /keys/ingot.pem
+  service_id: did:web:ingot
 
 postgres_dsn: "postgres://ingot:ingot@ingot-postgres:5432/ingot?sslmode=disable"
 
@@ -24,7 +29,7 @@ upload_receipts_url: "http://upload:80/receipt"
 indexer_endpoint: "http://indexer:80"
 indexer_did: "did:web:indexer"
 
-# S3 authorization service (hilt); the DID is used verbatim (no resolution)
+# S3 authorization service (hilt).
 auth_service_url: "http://hilt:80"
 auth_service_did: "did:web:hilt"
 # hilt → ingot delegations for /s3/request/authorize and /s3/bucket/*

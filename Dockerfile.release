@@ -11,6 +11,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 COPY ingot /usr/bin/ingot
-# S3 listener (override addr in config; container should bind 0.0.0.0).
-EXPOSE 9000
+# S3 listener. The binary defaults to :9000; the compose config binds :80 so
+# did:web:ingot resolves to http://ingot:80/.well-known/did.json.
+EXPOSE 80
 ENTRYPOINT ["/usr/bin/ingot"]

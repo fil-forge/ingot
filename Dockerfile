@@ -61,8 +61,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build-prod /out/ingot /usr/bin/ingot
-# S3 listener (override addr in config; container should bind 0.0.0.0).
-EXPOSE 9000
+# S3 listener. The binary defaults to :9000; the compose config binds :80 so
+# did:web:ingot resolves to http://ingot:80/.well-known/did.json.
+EXPOSE 80
 ENTRYPOINT ["/usr/bin/ingot"]
 
 # ---- development runtime: prod + debug tooling + delve ----
@@ -84,6 +85,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build-dev /out/ingot /usr/bin/ingot
 COPY --from=build-dev /go/bin/dlv /usr/bin/dlv
-# S3 listener + delve headless port (used when launched under dlv).
-EXPOSE 9000 2345
+# S3 listener (:80 under compose, see the prod target) + delve headless port.
+EXPOSE 80 2345
 ENTRYPOINT ["/usr/bin/ingot"]

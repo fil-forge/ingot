@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/fil-forge/ucantone/did"
 	"github.com/spf13/viper"
 	"go.uber.org/multierr"
 
@@ -218,10 +219,17 @@ func EmptyDefault(s, def string) string {
 	return s
 }
 
-// IdentityConfig points at the agent's PEM-encoded ed25519 key — the
-// signer that issues invocations to sprue.
+// IdentityConfig describes the agent (service) identity: the signer that
+// issues every outbound invocation (to hilt, sprue, and piri).
 type IdentityConfig struct {
+	// KeyFile is the path to the agent's PEM-encoded ed25519 private key.
+	// Required.
 	KeyFile string `mapstructure:"key_file" yaml:"key_file"`
+	// ServiceID is an optional did:web identity to wrap the key with (e.g.
+	// "did:web:ingot.example.com"). When set, ingot issues invocations as that
+	// DID; peers resolve it through the DID document the S3 listener serves at
+	// /.well-known/did.json. When empty, the key's did:key is used.
+	ServiceID string `mapstructure:"service_id" yaml:"service_id"`
 }
 
 // Load reads daemon config from configFile (or the default search path)
@@ -263,6 +271,12 @@ func Load(configFile string) (*Config, error) {
 func setDefaults(v *viper.Viper) {
 	v.SetDefault("log_level", "info")
 	v.SetDefault("addr", "0.0.0.0:9000")
+	// The identity keys are registered even though the defaults are empty:
+	// viper's AutomaticEnv only overrides keys it already knows, so without
+	// these an INGOT_IDENTITY_* env var would be silently ignored whenever
+	// the key is absent from the YAML.
+	v.SetDefault("identity.key_file", "")
+	v.SetDefault("identity.service_id", "")
 }
 
 // Validate checks the config for the selected mode, aggregating every
@@ -290,6 +304,11 @@ func (c *Config) Validate() error {
 		errs = multierr.Append(errs, errors.New("identity.key_file (agent PEM) is required"))
 	} else if _, err := os.Stat(c.Identity.KeyFile); err != nil {
 		errs = multierr.Append(errs, fmt.Errorf("identity.key_file %q: %w", c.Identity.KeyFile, err))
+	}
+	if c.Identity.ServiceID != "" {
+		if _, err := did.Parse(c.Identity.ServiceID); err != nil {
+			errs = multierr.Append(errs, fmt.Errorf("identity.service_id %q: %w", c.Identity.ServiceID, err))
+		}
 	}
 	if c.UploadServiceURL == "" || c.UploadServiceDID == "" {
 		errs = multierr.Append(errs, errors.New("upload_service_url and upload_service_did are required"))

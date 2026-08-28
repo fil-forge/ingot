@@ -50,6 +50,7 @@ func TestValidate_RequiredFields(t *testing.T) {
 		{"postgres_dsn", func(c *Config) { c.PostgresDSN = "" }, "postgres_dsn is required"},
 		{"identity key unset", func(c *Config) { c.Identity.KeyFile = "" }, "identity.key_file (agent PEM) is required"},
 		{"identity key missing", func(c *Config) { c.Identity.KeyFile = "/nonexistent/agent.pem" }, "identity.key_file"},
+		{"identity service id not a DID", func(c *Config) { c.Identity.ServiceID = "ingot.example" }, "identity.service_id"},
 		{"upload service", func(c *Config) { c.UploadServiceURL = "" }, "upload_service_url and upload_service_did are required"},
 		{"auth service", func(c *Config) { c.AuthServiceDID = "" }, "auth_service_url and auth_service_did are required"},
 		{"revocation url without did", func(c *Config) { c.RevocationServiceURL = "http://127.0.0.1:6000" }, "revocation_service_url and revocation_service_did must be set together"},
@@ -88,5 +89,36 @@ func TestValidate_AuthServiceProofs(t *testing.T) {
 	err := cfg.Validate()
 	if err == nil || !strings.Contains(err.Error(), "auth_service_proofs") {
 		t.Fatalf("expected error containing %q, got: %v", "auth_service_proofs", err)
+	}
+}
+
+// TestValidate_IdentityServiceID: the optional service DID must parse as a
+// DID; a did:web is the expected shape but the method is not enforced.
+func TestValidate_IdentityServiceID(t *testing.T) {
+	cfg := validConfig(t)
+	cfg.Identity.ServiceID = "did:web:ingot.example"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected valid config with a did:web service id, got: %v", err)
+	}
+}
+
+// TestLoad_IdentityEnv: the identity keys are registered with viper defaults
+// so INGOT_IDENTITY_* env vars bind even when the YAML omits them.
+func TestLoad_IdentityEnv(t *testing.T) {
+	t.Setenv("INGOT_IDENTITY_KEY_FILE", "/keys/agent.pem")
+	t.Setenv("INGOT_IDENTITY_SERVICE_ID", "did:web:ingot.example")
+	cfgFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(cfgFile, []byte("addr: \"127.0.0.1:9000\"\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg, err := Load(cfgFile)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Identity.KeyFile != "/keys/agent.pem" {
+		t.Fatalf("identity.key_file = %q, want /keys/agent.pem", cfg.Identity.KeyFile)
+	}
+	if cfg.Identity.ServiceID != "did:web:ingot.example" {
+		t.Fatalf("identity.service_id = %q, want did:web:ingot.example", cfg.Identity.ServiceID)
 	}
 }
