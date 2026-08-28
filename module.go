@@ -44,6 +44,8 @@ package ingot
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"fmt"
 	"net/url"
 
@@ -53,6 +55,7 @@ import (
 	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/versitygw/auth"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/openbao/openbao/api/v2"
 	"go.uber.org/fx"
 	"go.uber.org/zap"
 
@@ -64,6 +67,7 @@ import (
 	"github.com/fil-forge/ingot/iam"
 	"github.com/fil-forge/ingot/logstore"
 	"github.com/fil-forge/ingot/migrations"
+	"github.com/fil-forge/ingot/regionkey"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/revocation"
 	"github.com/fil-forge/ingot/tokenstore"
@@ -104,6 +108,7 @@ func Module(cfg config.Config) fx.Option {
 			provideKeyProofs,
 			provideVerificationKeyCache,
 			provideIAMService,
+			provideRegionKeyProvider,
 			fx.Annotate(bucketauthority.New, fx.As(new(bucketauthority.BucketAuthority))),
 		),
 		ServerModule,
@@ -282,6 +287,54 @@ func provideAuthServiceClient(cfg config.Config, id identity.Identity, logger *z
 		proofs = ucanlib.NewContainerProofStore(ct)
 	}
 	return hiltclient.New(authServiceDID, *authServiceURL, id, hiltclient.WithBaseProofs(proofs), hiltclient.WithLogger(logger))
+}
+
+// provideRegionKeyProvider builds the configured region CEK wrap provider
+// (config `regionkey.provider`): "openbao" runs the wrap inside the region's
+// OpenBao transit engine (the production choice — the region KEK never enters
+// this process), "inprocess" wraps with AES-256-GCM in process (tests and
+// development). The provider is lazy, so an unconfigured region key only
+// errors if a consumer actually needs it.
+func provideRegionKeyProvider(cfg config.Config, logger *zap.Logger) (regionkey.Provider, error) {
+	switch cfg.RegionKey.Provider {
+	case "openbao":
+		bao := cfg.RegionKey.OpenBao
+		apiCfg := api.DefaultConfig() // reads BAO_ADDR etc. from the environment
+		if bao.Address != "" {
+			apiCfg.Address = bao.Address
+		}
+		client, err := api.NewClient(apiCfg) // reads BAO_TOKEN from the environment
+		if err != nil {
+			return nil, fmt.Errorf("ingot: regionkey.openbao: %w", err)
+		}
+		if bao.Token != "" {
+			client.SetToken(bao.Token)
+		}
+		return regionkey.NewOpenBaoProvider(client, bao.Mount, bao.Key)
+	case "inprocess":
+		inproc := cfg.RegionKey.InProcess
+		var kek []byte
+		if inproc.KEK != "" {
+			var err error
+			kek, err = base64.StdEncoding.DecodeString(inproc.KEK)
+			if err != nil {
+				return nil, fmt.Errorf("ingot: regionkey.inprocess.kek: %w", err)
+			}
+		} else {
+			kek = make([]byte, regionkey.KEKLen)
+			if _, err := rand.Read(kek); err != nil {
+				return nil, fmt.Errorf("ingot: regionkey.inprocess: generating KEK: %w", err)
+			}
+			logger.Warn("regionkey: inprocess provider generated a random KEK; " +
+				"wrapped CEKs will be unreadable after a restart — set regionkey.inprocess.kek to persist one (development only)")
+		}
+		version := regionkey.KeyVersion(config.EmptyDefault(inproc.Version, "v1"))
+		return regionkey.NewInProcessProvider(version, kek)
+	case "":
+		return nil, fmt.Errorf("ingot: regionkey.provider is not configured")
+	default:
+		return nil, fmt.Errorf("ingot: regionkey.provider %q is not one of openbao, inprocess", cfg.RegionKey.Provider)
+	}
 }
 
 // provideKeyProofs is the per-access-key delegation store registry: the IAM

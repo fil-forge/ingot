@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"os"
@@ -95,6 +96,14 @@ type Config struct {
 	// left zero/unset falls back to the top-level SealBytes / SealAge / Retain
 	// (and Ship defaults to true) — e.g. to configure the catalog never to ship.
 	CatalogPlane PlaneSettings `mapstructure:"catalog_plane" yaml:"catalog_plane"`
+
+	// RegionKey selects and configures the region CEK wrap provider
+	// (regionkey.Provider): the component that wraps each object's
+	// content-encryption key under the region KEK for the read path (the
+	// FilOne encryption design's region wrap). Optional until the encrypting
+	// put/get paths are wired; anything consuming the provider fails at
+	// startup when it is unconfigured.
+	RegionKey RegionKeyConfig `mapstructure:"regionkey" yaml:"regionkey"`
 
 	// LogLevel is the zap level (debug|info|warn|error).
 	LogLevel string `mapstructure:"log_level" yaml:"log_level"`
@@ -232,6 +241,48 @@ type IdentityConfig struct {
 	ServiceID string `mapstructure:"service_id" yaml:"service_id"`
 }
 
+// RegionKeyConfig selects the region CEK wrap provider and carries each
+// implementation's settings.
+type RegionKeyConfig struct {
+	// Provider names the implementation: "openbao" (production — the wrap
+	// runs inside the region's OpenBao transit engine and the KEK never
+	// enters ingot's process) or "inprocess" (AES-256-GCM in ingot's own
+	// process; tests and development only). Empty means unconfigured.
+	Provider string `mapstructure:"provider" yaml:"provider"`
+	// OpenBao configures the "openbao" provider.
+	OpenBao OpenBaoConfig `mapstructure:"openbao" yaml:"openbao"`
+	// InProcess configures the "inprocess" provider.
+	InProcess InProcessConfig `mapstructure:"inprocess" yaml:"inprocess"`
+}
+
+// OpenBaoConfig is the "openbao" region-key provider's connection and key
+// settings.
+type OpenBaoConfig struct {
+	// Address of the OpenBao server, e.g. "https://bao.region.internal:8200"
+	// or a unix socket "unix:///run/openbao/api.sock". Empty falls back to
+	// the client's environment (BAO_ADDR, or upstream VAULT_ADDR).
+	Address string `mapstructure:"address" yaml:"address"`
+	// Token authenticates ingot to OpenBao; it needs encrypt/decrypt/rewrap
+	// on the transit key and nothing else. Empty falls back to the client's
+	// environment (BAO_TOKEN, or upstream VAULT_TOKEN).
+	Token string `mapstructure:"token" yaml:"token"`
+	// Mount is the transit engine's mount path. Empty means "transit".
+	Mount string `mapstructure:"mount" yaml:"mount"`
+	// Key is the transit key name holding the region KEK (provisioned with
+	// type aes256-gcm96 and derived=true). Required when provider=openbao.
+	Key string `mapstructure:"key" yaml:"key"`
+}
+
+// InProcessConfig is the "inprocess" region-key provider's settings.
+type InProcessConfig struct {
+	// KEK is the region key, base64-encoded 32 bytes. Empty generates a
+	// random key at startup — development only: wraps made under a generated
+	// key are unreadable after a restart.
+	KEK string `mapstructure:"kek" yaml:"kek"`
+	// Version tags wraps with the KEK's version. Empty means "v1".
+	Version string `mapstructure:"version" yaml:"version"`
+}
+
 // Load reads daemon config from configFile (or the default search path)
 // with env override (INGOT_* / nested keys via "_").
 func Load(configFile string) (*Config, error) {
@@ -277,6 +328,17 @@ func setDefaults(v *viper.Viper) {
 	// the key is absent from the YAML.
 	v.SetDefault("identity.key_file", "")
 	v.SetDefault("identity.service_id", "")
+	// The regionkey keys are registered even where the default is empty:
+	// viper's AutomaticEnv only overrides keys it already knows, so without
+	// these an INGOT_REGIONKEY_* env var would be silently ignored whenever
+	// the key is absent from the YAML.
+	v.SetDefault("regionkey.provider", "")
+	v.SetDefault("regionkey.openbao.address", "")
+	v.SetDefault("regionkey.openbao.token", "")
+	v.SetDefault("regionkey.openbao.mount", "transit")
+	v.SetDefault("regionkey.openbao.key", "")
+	v.SetDefault("regionkey.inprocess.kek", "")
+	v.SetDefault("regionkey.inprocess.version", "v1")
 }
 
 // Validate checks the config for the selected mode, aggregating every
@@ -325,6 +387,26 @@ func (c *Config) Validate() error {
 	}
 	if (c.RevocationServiceURL == "") != (c.RevocationServiceDID == "") {
 		errs = multierr.Append(errs, errors.New("revocation_service_url and revocation_service_did must be set together"))
+	}
+
+	switch c.RegionKey.Provider {
+	case "":
+		// Unconfigured is valid until the encrypting put/get paths are wired.
+	case "openbao":
+		if c.RegionKey.OpenBao.Key == "" {
+			errs = multierr.Append(errs, errors.New("regionkey.openbao.key (transit key name) is required when regionkey.provider is openbao"))
+		}
+	case "inprocess":
+		if c.RegionKey.InProcess.KEK != "" {
+			kek, err := base64.StdEncoding.DecodeString(c.RegionKey.InProcess.KEK)
+			if err != nil {
+				errs = multierr.Append(errs, fmt.Errorf("regionkey.inprocess.kek: %w", err))
+			} else if len(kek) != 32 {
+				errs = multierr.Append(errs, fmt.Errorf("regionkey.inprocess.kek must decode to 32 bytes (AES-256), got %d", len(kek)))
+			}
+		}
+	default:
+		errs = multierr.Append(errs, fmt.Errorf("regionkey.provider %q is not one of openbao, inprocess", c.RegionKey.Provider))
 	}
 
 	if errs != nil {

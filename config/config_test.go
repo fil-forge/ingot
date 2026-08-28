@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/base64"
 	"os"
 	"path/filepath"
 	"strings"
@@ -57,6 +58,16 @@ func TestValidate_RequiredFields(t *testing.T) {
 		{"revocation did without url", func(c *Config) { c.RevocationServiceDID = "did:web:swarf.example" }, "revocation_service_url and revocation_service_did must be set together"},
 		{"bad seal_age", func(c *Config) { c.SealAge = "not-a-duration" }, "parse seal_age"},
 		{"bad cors origin", func(c *Config) { c.CORSAllowedOrigins = []string{"app.example"} }, "cors_allowed_origins"},
+		{"unknown regionkey provider", func(c *Config) { c.RegionKey.Provider = "hsm" }, `regionkey.provider "hsm" is not one of openbao, inprocess`},
+		{"openbao without key", func(c *Config) { c.RegionKey.Provider = "openbao" }, "regionkey.openbao.key"},
+		{"inprocess kek not base64", func(c *Config) {
+			c.RegionKey.Provider = "inprocess"
+			c.RegionKey.InProcess.KEK = "not-base64!!"
+		}, "regionkey.inprocess.kek"},
+		{"inprocess kek wrong length", func(c *Config) {
+			c.RegionKey.Provider = "inprocess"
+			c.RegionKey.InProcess.KEK = "c2hvcnQ=" // "short"
+		}, "must decode to 32 bytes"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -78,6 +89,31 @@ func TestValidate_RevocationServicePair(t *testing.T) {
 	cfg.RevocationServiceDID = "did:web:swarf.example"
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("expected valid config with revocation pair set, got: %v", err)
+	}
+}
+
+// TestValidate_RegionKey: both providers validate with their required
+// settings present; unconfigured (empty provider) stays valid until the
+// encrypting paths are wired.
+func TestValidate_RegionKey(t *testing.T) {
+	cfg := validConfig(t)
+	cfg.RegionKey.Provider = "openbao"
+	cfg.RegionKey.OpenBao.Key = "region-kek"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected valid openbao regionkey config, got: %v", err)
+	}
+
+	cfg = validConfig(t)
+	cfg.RegionKey.Provider = "inprocess"
+	cfg.RegionKey.InProcess.KEK = base64.StdEncoding.EncodeToString(make([]byte, 32))
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected valid inprocess regionkey config, got: %v", err)
+	}
+
+	cfg = validConfig(t)
+	cfg.RegionKey.Provider = "inprocess" // empty KEK: generated at startup
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected valid inprocess config with no KEK, got: %v", err)
 	}
 }
 
