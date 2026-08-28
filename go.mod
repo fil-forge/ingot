@@ -11,8 +11,8 @@ require (
 	github.com/cenkalti/backoff/v5 v5.0.3
 	github.com/fil-forge/hilt v0.0.1-0.20260821074833-0928688148af
 	github.com/fil-forge/indexing-service v1.13.5-0.20260820151722-9eb620409a4e
-	github.com/fil-forge/libforge v0.0.0-20260807225550-3e6895b41be5
-	github.com/fil-forge/smelt v0.0.0-20260828101021-d08172217ec4
+	github.com/fil-forge/libforge v0.0.0-20260827180828-c9252ac89b0e
+	github.com/fil-forge/smelt v0.0.0-20260828105933-8ba0939fb9a7
 	github.com/fil-forge/swarf v0.0.1-0.20260821055917-4921bc49627c
 	github.com/fil-forge/ucantone v0.0.0-20260827134420-25cf8340b9a1
 	github.com/fil-forge/versitygw v0.0.0-20260716095011-7a65883d595a
@@ -264,7 +264,3 @@ require (
 	pitr.ca/jsontokenizer v0.3.2 // indirect
 	tags.cncf.io/container-device-interface v1.1.0 // indirect
 )
-
-replace github.com/fil-forge/libforge => ../libforge
-
-replace github.com/fil-forge/smelt => ../smelt
