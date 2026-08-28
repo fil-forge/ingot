@@ -24,7 +24,7 @@
 #     /usr/bin/ingot -- serve --config /etc/ingot/config.yaml
 # then attach your client on the mapped 2345 (smelt's compose.debug.yml pattern).
 
-FROM --platform=$BUILDPLATFORM golang:1.26-bookworm AS build
+FROM --platform=$BUILDPLATFORM golang:1.27-bookworm AS build
 ARG TARGETOS=linux
 ARG TARGETARCH
 WORKDIR /src

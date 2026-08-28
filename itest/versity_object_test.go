@@ -160,8 +160,6 @@ var copyObjectPass = []forgeCase{
 	{name: "to_itself_with_new_metadata", fn: integration.CopyObject_to_itself_with_new_metadata},
 	{name: "invalid_tagging_directive", fn: integration.CopyObject_invalid_tagging_directive},
 	{name: "invalid_checksum_algorithm", fn: integration.CopyObject_invalid_checksum_algorithm},
-	{name: "success", fn: integration.CopyObject_success},
-	{name: "copy_source_starting_with_slash", fn: integration.CopyObject_copy_source_starting_with_slash},
 	{name: "default_content_type_with_replace_metadata", fn: integration.CopyObject_default_content_type_with_replace_metadata},
 	{name: "non_existing_dir_object", fn: integration.CopyObject_non_existing_dir_object},
 	{name: "with_metadata", fn: integration.CopyObject_with_metadata},
@@ -186,6 +184,13 @@ var copyObjectPass = []forgeCase{
 // Observed failing against the forge stack: multi-account semantics and
 // ACLs are unimplemented surface.
 var copyObjectXFail = []forgeCase{
+	// Cross-bucket copies are cross-SPACE copies (every bucket has its own
+	// space) and are rejected NotImplemented: each blob's CEK wrap is bound
+	// to (space, digest), so serving them needs the rewrap flow — a filed
+	// follow-up. Cross-bucket cases whose copy fails on resolution first
+	// (e.g. non_existing_dir_object) still pass.
+	{name: "success", fn: integration.CopyObject_success},
+	{name: "copy_source_starting_with_slash", fn: integration.CopyObject_copy_source_starting_with_slash},
 	{name: "not_owned_source_bucket", fn: integration.CopyObject_not_owned_source_bucket},
 	{name: "object_acl_not_supported", fn: integration.CopyObject_object_acl_not_supported},
 	{name: "incorrect_source_bucket_expected_owner", fn: integration.CopyObject_incorrect_source_bucket_expected_owner},

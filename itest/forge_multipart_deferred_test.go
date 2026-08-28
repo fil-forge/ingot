@@ -5,6 +5,8 @@ package itest
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -64,7 +66,13 @@ func TestForgeDeferredMultipart(t *testing.T) {
 			}
 			completed = append(completed, types.CompletedPart{PartNumber: aws.Int32(pn), ETag: up.ETag})
 			whole = append(whole, data...)
-			partDigests = append(partDigests, b58Digest(t, data))
+			// The stored digest names the encrypted envelope, minted at
+			// ingest — read it back from ingot's part registry rather than
+			// predicting hash(plaintext).
+			partDigests = append(partDigests, partBlobDigests(t, ctx, s, aws.ToString(create.UploadId), pn)...)
+		}
+		if len(partDigests) != len(partData) {
+			t.Fatalf("parts stored %d blobs, want one per part (%d)", len(partDigests), len(partData))
 		}
 
 		// The parts are durable on piri (allocated + PUT) but parked: no
@@ -111,13 +119,13 @@ func TestForgeDeferredMultipart(t *testing.T) {
 			t.Fatalf("CreateMultipartUpload: %v", err)
 		}
 		data := tagged(patternBytes(512<<10), 0x33)
-		digest := b58Digest(t, data)
 		if _, err := cl.UploadPart(ctx, &s3.UploadPartInput{
 			Bucket: aws.String(bucket), Key: aws.String(key), UploadId: create.UploadId,
 			PartNumber: aws.Int32(1), Body: bytes.NewReader(data),
 		}); err != nil {
 			t.Fatalf("UploadPart: %v", err)
 		}
+		digest := partBlobDigests(t, ctx, s, aws.ToString(create.UploadId), 1)[0]
 		waitForPiriLogLine(t, ctx, s, 30*time.Second, "/blob/allocate", digest)
 
 		if _, err := cl.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
@@ -145,15 +153,34 @@ func tagged(b []byte, tag byte) []byte {
 	return b
 }
 
-// b58Digest returns the base58 sha2-256 multihash of data — the form piri's
-// handlers log blob digests in (digestutil.Format).
-func b58Digest(t *testing.T, data []byte) string {
+// partBlobDigests reads one uploaded part's stored blob digests from ingot's
+// Postgres, base58-formatted the way piri's handlers log them
+// (digestutil.Format). With encryption the stored digest names the FEE
+// envelope, minted at ingest — it cannot be predicted from the plaintext.
+func partBlobDigests(t *testing.T, ctx context.Context, s *stack.Stack, uploadID string, partNumber int32) []string {
 	t.Helper()
-	mh, err := multihash.Sum(data, multihash.SHA2_256, -1)
+	q := fmt.Sprintf(
+		`SELECT encode(d, 'hex') FROM ingot.multipart_parts, unnest(blob_digests) AS d WHERE upload_id = '%s' AND part_number = %d`,
+		uploadID, partNumber)
+	out, errOut, err := s.Exec(ctx, "ingot-postgres", "psql", "-U", "ingot", "-d", "ingot", "-tAc", q)
 	if err != nil {
-		t.Fatalf("multihash: %v", err)
+		t.Fatalf("query part %d digests: %v (stderr=%s)", partNumber, err, errOut)
 	}
-	return digestutil.Format(mh)
+	var digests []string
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		if line == "" {
+			continue
+		}
+		raw, err := hex.DecodeString(line)
+		if err != nil {
+			t.Fatalf("decode digest hex %q: %v", line, err)
+		}
+		digests = append(digests, digestutil.Format(multihash.Multihash(raw)))
+	}
+	if len(digests) == 0 {
+		t.Fatalf("no blob digests recorded for upload %s part %d", uploadID, partNumber)
+	}
+	return digests
 }
 
 // piriLogHasLine reports whether any single piri-0 log line contains all

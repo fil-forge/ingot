@@ -7,6 +7,7 @@ import (
 	"io"
 
 	"github.com/filecoin-project/go-fee/aesstream"
+	"github.com/multiformats/go-multihash"
 
 	"github.com/fil-forge/ingot/blockstore"
 	msbucket "github.com/fil-forge/ingot/bucket"
@@ -158,6 +159,26 @@ func (o *decryptingOpener) OpenBlobRange(ctx context.Context, space did.DID, ref
 	// ciphertext) surfaces from Read as aesstream.ErrCorrupted, terminating
 	// the response body — the encryption RFC's stated behavior.
 	return readerCloser{Reader: sr, Closer: span}, nil
+}
+
+// blobPlaintextLen reports how many plaintext bytes a stored blob decrypts
+// to: the FEE geometry derived from its encryption-params row and the stored
+// (envelope) byte count. A blob with no row is stored as plaintext, so the
+// stored size is the answer. Multipart Complete uses this to rebuild the
+// manifest's plaintext spans from upload_intents' stored sizes.
+func (b *Backend) blobPlaintextLen(ctx context.Context, space did.DID, digest multihash.Multihash, storedSize int64) (int64, error) {
+	params, err := b.encParams.GetEncryptionParams(ctx, space, digest)
+	if errors.Is(err, registry.ErrNotFound) {
+		return storedSize, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("encryption params for blob %x: %w", digest, err)
+	}
+	plainLen, err := aesstream.DecryptedSize(storedSize-params.HeaderLen, int(params.ChunkSize))
+	if err != nil {
+		return 0, fmt.Errorf("blob %x: %d stored bytes do not fit its FEE geometry: %w", digest, storedSize, err)
+	}
+	return plainLen, nil
 }
 
 // readerCloser pairs the decrypted plaintext reader with the ciphertext

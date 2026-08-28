@@ -249,14 +249,14 @@ sequenceDiagram
     participant TX as bucketop.Tx
     participant L as logstore.Manager
 
-    Note over C,L: off the lock: ingest, hash, upload
+    Note over C,L: off the lock: ingest, hash, encrypt, upload
     C->>B: PutObject(bucket, key, body)
     B->>R: reg.Get(bucket), precondition pre-check
-    B->>SP: SplitBody: stream to spool per blob<br/>(temp file then rename, sha256 + md5 in one pass)
-    B->>R: PutIntent(digest, spooled) per blob
+    B->>SP: SplitBody: per plaintext piece, fresh CEK →<br/>FEE envelope (COSE_Encrypt0, AES-256-GCM STREAM) →<br/>spool under the CIPHERTEXT digest<br/>(sha256 + md5 of the plaintext in the same pass)
+    B->>R: PutIntent(digest, stored size) +<br/>PutEncryptionParams(region-wrapped CEK, FEE geometry) per blob
     loop each body blob (uploadBlobs)
         alt blob_locations already has (space, digest)
-            B->>R: SetIntentState(accepted), skip upload (dedup)
+            B->>R: SetIntentState(accepted), skip upload<br/>(never hits for fresh writes — every envelope digest is new)
         else upload
             B->>U: /blob/add (digest, size)
             U-->>B: allocation address (none on provider-side dedup)
@@ -276,17 +276,24 @@ sequenceDiagram
     TX-->>B: committed, lock released
     Note over B,R: post-commit, off the lock
     B->>R: reconcileClaims: blob_refs gains this version,<br/>superseded version rows removed
-    B->>U: /blob/remove per digest whose CountClaims reached 0
+    B->>U: /blob/remove per digest whose CountClaims reached 0<br/>(+ crypto-shred: its blob_encryption_params row deleted)
     B-->>C: 200 + ETag (+ x-amz-version-id when versioning is configured)
 ```
 
+- Encryption makes the stored digest a ciphertext digest: **content dedup is
+  gone for bodies** (fresh CEK per write ⇒ unique envelope), by design per
+  the encryption RFC. Manifest spans, `Body.Size`, sha256/md5 and ETag stay
+  plaintext values; `upload_intents.Size` and `blob_locations.Size` are
+  stored (envelope) sizes.
 - The supersession rule (which prior version is retained, replaced, or
   discarded) is [`s3-versioning.md`](./s3-versioning.md) §5; the resulting
   storage shape is the [version tree](#per-key-version-storage-manifest-arm-leaf-arm-prev-tree).
 - The claim ledger and the zero-claims release are the
   [blob lifecycle](#blob-lifecycle-spooled-parked-accepted-released).
 - `CopyObject` runs the same `commitVersion` with a manifest that pins the
-  source's digests: no spool, no upload, claims incremented.
+  source's digests: no spool, no upload, claims incremented. Cross-space
+  (today: cross-bucket) copies are rejected `NotImplemented` — the CEK wrap
+  is bound to (space, digest), so they need a rewrap flow.
 - Supersession also records each replaced catalog block for future removal:
   the [catalog GC candidates](#catalog-gc-candidates-what-gets-remembered-for-removal)
   diagram shows every entry path.
@@ -400,7 +407,7 @@ sequenceDiagram
     B->>R: CreateSession(open) with headers + checksum algorithm
     B-->>C: uploadId
     C->>B: UploadPart(n)
-    B->>B: openSession (non-open: NoSuchUpload), then splitSpool
+    B->>B: openSession (non-open: NoSuchUpload), then splitSpool<br/>(encrypt per piece: fresh CEK → FEE envelope →<br/>spool under the ciphertext digest + params row,<br/>as in the PutObject diagram)
     B->>R: PutPart(parked)
     loop each part blob (parkBlobs)
         alt blob_locations already has the digest
@@ -420,6 +427,7 @@ sequenceDiagram
         B-->>C: the stored result (idempotent re-Complete)
     else latch won
         B->>R: LatchSession(open to completing), single winner
+        B->>R: manifest spans: per blob, plaintext length derived from<br/>the intent's stored size + FEE geometry (blobPlaintextLen)
         B->>U: concludeBlobs: /ucan/conclude per parked blob, poll accept
         B->>R: PutLocation + intent accepted + DeletePark per blob
         B->>TX: commitVersion (see the PutObject diagram)
@@ -428,7 +436,7 @@ sequenceDiagram
     end
     C->>B: AbortMultipartUpload
     B->>R: LatchSession(open to aborting), then DeleteSession (parts cascade)
-    B->>U: cleanupPartBlobs: /blob/abort parked blobs (cause = AddTask)
+    B->>U: cleanupPartBlobs: /blob/abort parked blobs (cause = AddTask),<br/>crypto-shred each blob's blob_encryption_params row
     Note over B,R: a background sweeper aborts open sessions older than<br/>MultipartSessionTTL (default 7d) and reaps terminal rows
 ```
 
