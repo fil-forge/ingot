@@ -28,6 +28,7 @@ func validConfig(t *testing.T) Config {
 		UploadServiceDID: "did:web:upload.example",
 		AuthServiceURL:   "http://127.0.0.1:7000",
 		AuthServiceDID:   "did:web:auth.example",
+		RegionKey:        RegionKeyConfig{Provider: "inprocess"},
 	}
 }
 
@@ -58,6 +59,7 @@ func TestValidate_RequiredFields(t *testing.T) {
 		{"revocation did without url", func(c *Config) { c.RevocationServiceDID = "did:web:swarf.example" }, "revocation_service_url and revocation_service_did must be set together"},
 		{"bad seal_age", func(c *Config) { c.SealAge = "not-a-duration" }, "parse seal_age"},
 		{"bad cors origin", func(c *Config) { c.CORSAllowedOrigins = []string{"app.example"} }, "cors_allowed_origins"},
+		{"regionkey provider unset", func(c *Config) { c.RegionKey.Provider = "" }, "regionkey.provider is required"},
 		{"unknown regionkey provider", func(c *Config) { c.RegionKey.Provider = "hsm" }, `regionkey.provider "hsm" is not one of openbao, inprocess`},
 		{"openbao without key", func(c *Config) { c.RegionKey.Provider = "openbao" }, "regionkey.openbao.key"},
 		{"inprocess kek not base64", func(c *Config) {
@@ -93,8 +95,8 @@ func TestValidate_RevocationServicePair(t *testing.T) {
 }
 
 // TestValidate_RegionKey: both providers validate with their required
-// settings present; unconfigured (empty provider) stays valid until the
-// encrypting paths are wired.
+// settings present. The provider itself is required (see the required-fields
+// table); only the implementation choice is configuration.
 func TestValidate_RegionKey(t *testing.T) {
 	cfg := validConfig(t)
 	cfg.RegionKey.Provider = "openbao"

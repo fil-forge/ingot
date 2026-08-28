@@ -116,6 +116,24 @@ func (s *Spool) OpenBlob(_ context.Context, _ did.DID, digest mh.Multihash) (io.
 	return f, nil
 }
 
+// OpenBlobRange returns a reader over stored bytes [off, off+n) of the
+// spooled blob, or ErrNotFound — OpenBlob restricted to a section, for the
+// decrypting read path, which fetches only the ciphertext span a plaintext
+// range needs. A range past the file's end yields a shorter stream.
+func (s *Spool) OpenBlobRange(_ context.Context, _ did.DID, digest mh.Multihash, off, n int64) (io.ReadCloser, error) {
+	if off < 0 || n < 0 {
+		return nil, fmt.Errorf("blockstore: invalid blob range [%d, +%d)", off, n)
+	}
+	f, err := os.Open(s.Path(digest))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("blockstore: spool open %s: %w", digest.B58String(), err)
+	}
+	return readerCloser{Reader: io.NewSectionReader(f, off, n), Closer: f}, nil
+}
+
 // GetBlock returns the blob stored under c's multihash, or ErrNotFound. A miss
 // is expected and cheap: it lets the layered read path fall through to the log
 // (for catalog blocks, which are never spooled) or the network tier (for a body
@@ -134,7 +152,8 @@ func (s *Spool) GetBlock(_ context.Context, _ did.DID, c cid.Cid) (block.Block, 
 // Compile-time assertions: Spool is a raw-block read tier and the streaming
 // blob tier for object bodies.
 var (
-	_ BlockReader = (*Spool)(nil)
-	_ BlobReader  = (*Spool)(nil)
-	_ BlobWriter  = (*Spool)(nil)
+	_ BlockReader     = (*Spool)(nil)
+	_ BlobReader      = (*Spool)(nil)
+	_ BlobRangeReader = (*Spool)(nil)
+	_ BlobWriter      = (*Spool)(nil)
 )

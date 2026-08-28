@@ -43,3 +43,13 @@ read_cache_bytes: -1
 catalog_plane:
   seal_age: 2s
   retain: 1
+
+# Region CEK wrap provider (required): the stack's ingot-openbao transit
+# engine, provisioned by ingot-openbao-init; the token arrives via
+# INGOT_REGIONKEY_OPENBAO_TOKEN from the compose environment.
+regionkey:
+  provider: openbao
+  openbao:
+    address: "http://ingot-openbao:8200"
+    mount: transit
+    key: region-kek

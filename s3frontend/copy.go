@@ -126,7 +126,11 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 		if err != nil {
 			return s3response.CopyObjectOutput{}, err
 		}
-		rc := msbucket.OpenBody(ctx, b.read, srcRv.st.Space, srcMf.Body)
+		opener, err := b.bodyOpener(ctx, srcRv.st.Space, srcMf.Body)
+		if err != nil {
+			return s3response.CopyObjectOutput{}, err
+		}
+		rc := msbucket.OpenBody(ctx, opener, srcRv.st.Space, srcMf.Body)
 		defer rc.Close()
 		hr, err := utils.NewHashReader(rc, "", ht)
 		if err != nil {

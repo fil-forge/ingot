@@ -86,6 +86,8 @@ func newRefTestBackend(t *testing.T, maxBlob ...int64) (*Backend, *inmem.MemStor
 		Uploader:    inmem.NopUploader{},
 		Deferred:    inmem.NopUploader{},
 		Remover:     rm,
+		EncParams:   mem,
+		RegionKeys:  testRegionKeys(t),
 		MaxBlobSize: mbs,
 	})
 	if err := mem.Create(ctx, "bk", did.Undef, registry.CreateState{}); err != nil {

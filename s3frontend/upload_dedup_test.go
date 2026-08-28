@@ -71,17 +71,19 @@ func TestUploadDedup_SkipsAlreadyLocatedBlob(t *testing.T) {
 
 	up := &countingUploader{calls: map[string]int{}}
 	b := New(Deps{
-		Authority: mem,
-		Registry:  mem,
-		Intents:   mem,
-		Locations: mem,
-		BlobRefs:  mem,
-		GC:        mem,
-		Reads:     blockstore.NewLayered(spool, log, inmem.NopBaseReader{}),
-		Log:       log,
-		Spool:     spool,
-		Uploader:  up,
-		Remover:   &recordingRemover{},
+		Authority:  mem,
+		Registry:   mem,
+		Intents:    mem,
+		Locations:  mem,
+		BlobRefs:   mem,
+		GC:         mem,
+		Reads:      blockstore.NewLayered(spool, log, inmem.NopBaseReader{}),
+		Log:        log,
+		Spool:      spool,
+		Uploader:   up,
+		Remover:    &recordingRemover{},
+		EncParams:  mem,
+		RegionKeys: testRegionKeys(t),
 	})
 	if err := mem.Create(ctx, "bk", testutil.RandomDID(t), registry.CreateState{}); err != nil {
 		t.Fatalf("create bucket: %v", err)

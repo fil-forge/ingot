@@ -28,6 +28,7 @@ import (
 	"github.com/fil-forge/ingot/internal/fasthttputil"
 	"github.com/fil-forge/ingot/internal/reqscope"
 	"github.com/fil-forge/ingot/logstore"
+	"github.com/fil-forge/ingot/regionkey"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/s3frontend"
 	"github.com/fil-forge/ingot/uploader"
@@ -84,6 +85,15 @@ type ServerDeps struct {
 	// Parks persists deferred-accept park state between UploadPart and
 	// Complete/Abort.
 	Parks registry.ParkStore
+
+	// EncParams is the per-blob FEE encryption-parameter table the decrypting
+	// read path consults; RegionKeys unwraps its region-wrapped CEKs. Both
+	// required: which implementation backs the provider (OpenBao in
+	// production, in-process for tests and development) is configuration,
+	// but bucket encryption is not optional. EncParams is typically the same
+	// instance as Registry.
+	EncParams  registry.EncryptionParamsStore
+	RegionKeys regionkey.Provider
 
 	// Meta is the persistence backing for log-segment metadata.
 	// Typically the same instance as Registry.
@@ -178,6 +188,8 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		Uploader:    deps.BodyUploader,
 		Deferred:    deps.Deferred,
 		Remover:     deps.Remover,
+		EncParams:   deps.EncParams,
+		RegionKeys:  deps.RegionKeys,
 		MaxBlobSize: cfg.MaxBlobSize,
 		CORS:        cfg.CORSConfig,
 		Logger:      logger,
@@ -470,6 +482,12 @@ func validateServerInputs(cfg config.ServerConfig, deps ServerDeps) error {
 	}
 	if deps.Parks == nil {
 		return errors.New("ingot: ServerDeps.Parks is required")
+	}
+	if deps.EncParams == nil {
+		return errors.New("ingot: ServerDeps.EncParams is required")
+	}
+	if deps.RegionKeys == nil {
+		return errors.New("ingot: ServerDeps.RegionKeys is required")
 	}
 	if deps.Registry == nil {
 		return errors.New("ingot: ServerDeps.Registry is required")
