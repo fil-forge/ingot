@@ -113,7 +113,8 @@ ingot version
 
 `serve` requires Postgres (`postgres_dsn`), the sprue edge client
 (`upload_service_url`/`_did`), and the hilt auth/tenant service
-(`auth_service_url`/`_did`). Tenants, access keys, and buckets are owned by
+(`auth_service_url`/`_did` plus the `auth_service_proofs` delegation chains
+hilt issues to this agent). Tenants, access keys, and buckets are owned by
 [hilt](https://github.com/fil-forge/hilt): it authorizes every non-root S3
 request, mints each bucket's Forge space, and issues the S3 credentials;
 ingot never self-provisions. The deployment context is the

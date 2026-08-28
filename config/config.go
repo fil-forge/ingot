@@ -75,8 +75,9 @@ type Config struct {
 	// AuthServiceProofs supplies the Hilt→Ingot delegation chains the hilt client
 	// attaches to its invocations: either a path to a file containing a UCAN
 	// container of proofs, or the string-encoded UCAN container itself.
-	// Optional; when empty the client sends invocations with no proofs (Hilt
-	// may authorize registered provider DIDs directly).
+	// Required whenever AuthServiceURL is set. Hilt rejects unproven
+	// invocations, so an ingot started without them accepts connections and
+	// then fails every S3 request; startup refuses instead.
 	AuthServiceProofs string `mapstructure:"auth_service_proofs" yaml:"auth_service_proofs"`
 	// RevocationServiceURL / RevocationServiceDID address the UCAN revocation
 	// service (Swarf): ingot subscribes to its revocation firehose so that
@@ -420,11 +421,19 @@ func (c *Config) Validate() error {
 	if c.AuthServiceURL == "" || c.AuthServiceDID == "" {
 		errs = multierr.Append(errs, errors.New("auth_service_url and auth_service_did are required"))
 	}
+	if c.AuthServiceURL != "" && c.AuthServiceProofs == "" {
+		errs = multierr.Append(errs, errors.New("auth_service_proofs is required when auth_service_url is set: without the Hilt delegation chains every S3 request fails authorization"))
+	}
 	if c.AuthServiceProofs != "" {
-		// Load eagerly so a bad path or encoding fails at startup rather than
-		// on the first authorized request.
-		if _, err := LoadProofsContainer(c.AuthServiceProofs); err != nil {
+		// Load eagerly so a bad path, a bad encoding, or a container carrying
+		// no delegations fails at startup rather than on the first authorized
+		// request.
+		ct, err := LoadProofsContainer(c.AuthServiceProofs)
+		switch {
+		case err != nil:
 			errs = multierr.Append(errs, fmt.Errorf("auth_service_proofs: %w", err))
+		case len(ct.Delegations()) == 0:
+			errs = multierr.Append(errs, errors.New("auth_service_proofs: the container holds no delegations"))
 		}
 	}
 	if (c.RevocationServiceURL == "") != (c.RevocationServiceDID == "") {

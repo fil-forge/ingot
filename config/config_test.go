@@ -6,11 +6,17 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	blobcmds "github.com/fil-forge/libforge/commands/blob"
+	"github.com/fil-forge/ucantone/multikey/ed25519"
+	"github.com/fil-forge/ucantone/ucan"
+	"github.com/fil-forge/ucantone/ucan/container"
+	"github.com/fil-forge/ucantone/ucan/delegation"
 )
 
 // validConfig returns a Config that passes Validate: every required field
 // set, with an agent key file that exists (Validate stats it, but does not
-// parse it).
+// parse it) and an inline proofs container holding one delegation.
 func validConfig(t *testing.T) Config {
 	t.Helper()
 	keyFile := filepath.Join(t.TempDir(), "agent.pem")
@@ -18,19 +24,49 @@ func validConfig(t *testing.T) Config {
 		t.Fatalf("write key file: %v", err)
 	}
 	return Config{
-		Addr:             "127.0.0.1:9000",
-		DataDir:          "/data",
-		RootAccess:       "root-access",
-		RootSecret:       "root-secret",
-		PostgresDSN:      "postgres://ingot@127.0.0.1:5432/ingot",
-		Identity:         IdentityConfig{KeyFile: keyFile},
-		UploadServiceURL: "http://127.0.0.1:8000",
-		UploadServiceDID: "did:web:upload.example",
-		AuthServiceURL:   "http://127.0.0.1:7000",
-		AuthServiceDID:   "did:web:auth.example",
-		RegionKey:        RegionKeyConfig{Provider: "inprocess"},
-		TenantKey:        TenantKeyConfig{PLCDirectoryURL: "http://plc.example:3000"},
+		Addr:              "127.0.0.1:9000",
+		DataDir:           "/data",
+		RootAccess:        "root-access",
+		RootSecret:        "root-secret",
+		PostgresDSN:       "postgres://ingot@127.0.0.1:5432/ingot",
+		Identity:          IdentityConfig{KeyFile: keyFile},
+		UploadServiceURL:  "http://127.0.0.1:8000",
+		UploadServiceDID:  "did:web:upload.example",
+		AuthServiceURL:    "http://127.0.0.1:7000",
+		AuthServiceDID:    "did:web:auth.example",
+		AuthServiceProofs: encodedProofs(t, mintDelegation(t)),
+		RegionKey:         RegionKeyConfig{Provider: "inprocess"},
+		TenantKey:         TenantKeyConfig{PLCDirectoryURL: "http://plc.example:3000"},
 	}
+}
+
+// mintDelegation returns one space→agent /blob/add delegation.
+func mintDelegation(t *testing.T) ucan.Delegation {
+	t.Helper()
+	space, err := ed25519.GenerateIssuer()
+	if err != nil {
+		t.Fatalf("generate space: %v", err)
+	}
+	agent, err := ed25519.GenerateIssuer()
+	if err != nil {
+		t.Fatalf("generate agent: %v", err)
+	}
+	d, err := blobcmds.Add.Delegate(space, agent.DID(), space.DID(), delegation.WithNoExpiration())
+	if err != nil {
+		t.Fatalf("delegate: %v", err)
+	}
+	return d
+}
+
+// encodedProofs renders the delegations as a base64 container, the inline
+// form an auth_service_proofs config value accepts.
+func encodedProofs(t *testing.T, dlgs ...ucan.Delegation) string {
+	t.Helper()
+	encoded, err := container.Encode(container.Base64, container.New(container.WithDelegations(dlgs...)))
+	if err != nil {
+		t.Fatalf("encode proofs container: %v", err)
+	}
+	return string(encoded)
 }
 
 func TestValidate_OK(t *testing.T) {
@@ -124,14 +160,28 @@ func TestValidate_RegionKey(t *testing.T) {
 	}
 }
 
-// TestValidate_AuthServiceProofs: the optional proofs value is loaded eagerly
-// so a bad path or encoding fails at startup.
+// TestValidate_AuthServiceProofs: the proofs a configured auth service needs
+// are resolved eagerly, so a missing, unreadable, or empty value fails at
+// startup instead of on the first authorized request.
 func TestValidate_AuthServiceProofs(t *testing.T) {
-	cfg := validConfig(t)
-	cfg.AuthServiceProofs = "/nonexistent/proofs.cbor"
-	err := cfg.Validate()
-	if err == nil || !strings.Contains(err.Error(), "auth_service_proofs") {
-		t.Fatalf("expected error containing %q, got: %v", "auth_service_proofs", err)
+	cases := []struct {
+		name    string
+		proofs  string
+		wantErr string
+	}{
+		{"unset", "", "auth_service_proofs is required when auth_service_url is set"},
+		{"missing file", "/nonexistent/proofs.cbor", "auth_service_proofs: ingot: decode proofs container"},
+		{"no delegations", encodedProofs(t), "auth_service_proofs: the container holds no delegations"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := validConfig(t)
+			cfg.AuthServiceProofs = tc.proofs
+			err := cfg.Validate()
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("expected error containing %q, got: %v", tc.wantErr, err)
+			}
+		})
 	}
 }
 

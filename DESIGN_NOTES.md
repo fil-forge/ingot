@@ -20,7 +20,8 @@ in [`CLAUDE.md`](./CLAUDE.md).
   the non-fx `New(ctx, ServerConfig, ServerDeps)`) and supplies a logger, a
   Postgres pool, and the **agent** identity (libforge `identity.Identity`); config names
   the sprue endpoint (`upload_service_url`/`_did`) and the hilt endpoint
-  (`auth_service_url`/`_did`).
+  (`auth_service_url`/`_did`, with the `auth_service_proofs` delegation
+  chains hilt issues to this agent).
 - **Daemon.** `ingot serve` builds the same wiring from a config file
   (cobra/viper/fx): Postgres, the sprue edge client, and hilt are all
   required. The CLI is `serve`, `whoami`, and `version`. Docker-native;

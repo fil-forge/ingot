@@ -5,8 +5,12 @@ import (
 	"path/filepath"
 	"testing"
 
+	blobcmds "github.com/fil-forge/libforge/commands/blob"
 	"github.com/fil-forge/libforge/identity"
 	"github.com/fil-forge/ucantone/multikey/ed25519"
+	"github.com/fil-forge/ucantone/ucan"
+	"github.com/fil-forge/ucantone/ucan/container"
+	"github.com/fil-forge/ucantone/ucan/delegation"
 	"go.uber.org/zap/zaptest"
 
 	"github.com/fil-forge/ingot/config"
@@ -50,6 +54,9 @@ func TestApp_GraphValidates(t *testing.T) {
 		UploadServiceDID: "did:web:upload.example",
 		AuthServiceURL:   "http://127.0.0.1:7000",
 		AuthServiceDID:   "did:web:auth.example",
+		// A hilt-backed client refuses to build without proof chains, and the
+		// provider runs eagerly here; one delegation satisfies it.
+		AuthServiceProofs: encodedProofs(t, mintDelegation(t)),
 		// The region key provider is a required dependency; inprocess needs
 		// no external service (the constructor generates a throwaway KEK).
 		RegionKey: config.RegionKeyConfig{Provider: "inprocess"},
@@ -65,4 +72,33 @@ func TestApp_GraphValidates(t *testing.T) {
 	if app == nil {
 		t.Fatal("buildApp returned a nil app")
 	}
+}
+
+// mintDelegation returns one space→agent /blob/add delegation.
+func mintDelegation(t *testing.T) ucan.Delegation {
+	t.Helper()
+	space, err := ed25519.GenerateIssuer()
+	if err != nil {
+		t.Fatalf("generate space: %v", err)
+	}
+	agent, err := ed25519.GenerateIssuer()
+	if err != nil {
+		t.Fatalf("generate agent: %v", err)
+	}
+	d, err := blobcmds.Add.Delegate(space, agent.DID(), space.DID(), delegation.WithNoExpiration())
+	if err != nil {
+		t.Fatalf("delegate: %v", err)
+	}
+	return d
+}
+
+// encodedProofs renders the delegations as a base64 container, the inline
+// form an auth_service_proofs config value accepts.
+func encodedProofs(t *testing.T, dlgs ...ucan.Delegation) string {
+	t.Helper()
+	encoded, err := container.Encode(container.Base64, container.New(container.WithDelegations(dlgs...)))
+	if err != nil {
+		t.Fatalf("encode proofs container: %v", err)
+	}
+	return string(encoded)
 }

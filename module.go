@@ -277,9 +277,10 @@ func provideForgeClient(cfg config.Config, id identity.Identity, store tokenstor
 
 // provideAuthServiceClient builds the UCAN RPC client to the Hilt tenant-
 // management service (/s3/request/authorize, /s3/bucket/*). The agent identity
-// issues invocations; HiltProofs (optional) supplies the Hilt→agent proof
-// chains. The provider is lazy, so an unconfigured Hilt only errors if a
-// consumer actually needs the client.
+// issues invocations; AuthServiceProofs supplies the Hilt→agent proof chains
+// and is required — Hilt rejects unproven invocations, so a client built
+// without them would fail every S3 request. The provider is lazy, so an
+// unconfigured Hilt only errors if a consumer actually needs the client.
 func provideAuthServiceClient(cfg config.Config, id identity.Identity, logger *zap.Logger) (*hiltclient.Client, error) {
 	if cfg.AuthServiceURL == "" || cfg.AuthServiceDID == "" {
 		return nil, fmt.Errorf("ingot: auth_service_url and auth_service_did are required for the auth service client")
@@ -292,14 +293,17 @@ func provideAuthServiceClient(cfg config.Config, id identity.Identity, logger *z
 	if err != nil {
 		return nil, fmt.Errorf("ingot: parse auth_service_did: %w", err)
 	}
-	var proofs ucanlib.ProofStore
-	if cfg.AuthServiceProofs != "" {
-		ct, err := config.LoadProofsContainer(cfg.AuthServiceProofs)
-		if err != nil {
-			return nil, fmt.Errorf("ingot: auth_service_proofs: %w", err)
-		}
-		proofs = ucanlib.NewContainerProofStore(ct)
+	if cfg.AuthServiceProofs == "" {
+		return nil, fmt.Errorf("ingot: auth_service_proofs is required when auth_service_url is set: without the Hilt delegation chains every S3 request fails authorization")
 	}
+	ct, err := config.LoadProofsContainer(cfg.AuthServiceProofs)
+	if err != nil {
+		return nil, fmt.Errorf("ingot: auth_service_proofs: %w", err)
+	}
+	if len(ct.Delegations()) == 0 {
+		return nil, fmt.Errorf("ingot: auth_service_proofs: the container holds no delegations")
+	}
+	proofs := ucanlib.NewContainerProofStore(ct)
 	return hiltclient.New(authServiceDID, *authServiceURL, id, hiltclient.WithBaseProofs(proofs), hiltclient.WithLogger(logger))
 }
 
