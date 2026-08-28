@@ -17,6 +17,7 @@ import (
 	"github.com/fil-forge/versitygw/s3api/utils"
 	"github.com/fil-forge/versitygw/s3err"
 	"github.com/fil-forge/versitygw/s3response"
+	"github.com/filecoin-project/go-fee"
 	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
 	"go.uber.org/zap"
@@ -194,11 +195,12 @@ func (b *Backend) ingestBody(ctx context.Context, bucket *registry.State, r io.R
 }
 
 // splitSpool coarse-splits a body into blobs, encrypts each into a FEE
-// envelope written to the local spool under its ciphertext digest, and
-// records a spooled upload_intents row plus a blob_encryption_params row per
-// blob — WITHOUT uploading. It is the shared first half of ingest: a
-// single-shot PUT follows it with uploadBlobs immediately; a multipart
-// UploadPart spools here and defers the upload to Complete.
+// envelope (recipient: the tenant's wrap key) written to the local spool
+// under its ciphertext digest, and records a spooled upload_intents row plus
+// a blob_encryption_params row per blob — WITHOUT uploading. It is the
+// shared first half of ingest: a single-shot PUT follows it with uploadBlobs
+// immediately; a multipart UploadPart spools here and defers the upload to
+// Complete.
 //
 // The Body it returns is entirely plaintext-coordinate (Size, spans,
 // SHA256/MD5 — all computed before encryption); the intents record the
@@ -207,7 +209,13 @@ func (b *Backend) splitSpool(ctx context.Context, bucket string, space did.DID, 
 	if r == nil {
 		r = bytes.NewReader(nil)
 	}
-	enc := newEncryptingBlobWriter(b.spool, b.regionKeys, space)
+	// One tenant recipient per request, resolved before anything is spooled:
+	// a body that cannot be wrapped to its tenant is not stored at all.
+	recipient, err := b.tenantRecipient(ctx)
+	if err != nil {
+		return msbucket.Body{}, err
+	}
+	enc := newEncryptingBlobWriter(b.spool, b.regionKeys, space, []fee.Recipient{recipient})
 	body, err := msbucket.SplitBody(ctx, enc, r, b.maxBlobSize)
 	if err != nil {
 		return msbucket.Body{}, fmt.Errorf("split body: %w", err)

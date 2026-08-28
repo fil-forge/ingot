@@ -135,6 +135,12 @@ func forgeStack(t *testing.T, extra ...stack.Option) (*stack.Stack, string) {
 		t.Logf("using piri binary override: %s", bin)
 		opts = append(opts, stack.WithPiriBinary(bin))
 	}
+	// And for hilt: validates an ingot change against an unreleased hilt
+	// (e.g. a new field in the authorize response) before its image publishes.
+	if bin := os.Getenv("INGOT_ITEST_HILT_BINARY"); bin != "" {
+		t.Logf("using hilt binary override: %s", bin)
+		opts = append(opts, stack.WithServiceBinary("hilt", bin))
+	}
 	opts = append(opts, extra...)
 	s := stack.MustNewStack(t, opts...)
 	endpoint := s.IngotEndpoint()

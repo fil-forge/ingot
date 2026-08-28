@@ -53,6 +53,9 @@ func TestApp_GraphValidates(t *testing.T) {
 		// The region key provider is a required dependency; inprocess needs
 		// no external service (the constructor generates a throwaway KEK).
 		RegionKey: config.RegionKeyConfig{Provider: "inprocess"},
+		// The tenant key source is required too; it makes no network calls at
+		// construction, so an unreachable directory is fine here.
+		TenantKey: config.TenantKeyConfig{PLCDirectoryURL: "http://127.0.0.1:2582"},
 	}
 
 	app, err := buildApp(t.Context(), cfg, zaptest.NewLogger(t))

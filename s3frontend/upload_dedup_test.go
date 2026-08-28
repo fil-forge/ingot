@@ -78,6 +78,7 @@ func TestUpload_IdenticalContentUploadsDistinctBlobs(t *testing.T) {
 		Remover:    &recordingRemover{},
 		EncParams:  mem,
 		RegionKeys: testRegionKeys(t),
+		TenantKeys: testTenantKeys(),
 	})
 	if err := mem.Create(ctx, "bk", testutil.RandomDID(t), registry.CreateState{}); err != nil {
 		t.Fatalf("create bucket: %v", err)

@@ -35,6 +35,7 @@ import (
 	"github.com/fil-forge/ingot/bucketop"
 	"github.com/fil-forge/ingot/regionkey"
 	"github.com/fil-forge/ingot/registry"
+	"github.com/fil-forge/ingot/tenantkey"
 	"github.com/fil-forge/ingot/uploader"
 )
 
@@ -63,6 +64,9 @@ type Backend struct {
 	encParams registry.EncryptionParamsStore
 	// regionKeys unwraps region-wrapped CEKs for the decrypting read path.
 	regionKeys regionkey.Provider
+	// tenantKeys yields the tenant wrap key each write encrypts to (the FEE
+	// tenant recipient). Writes fail without it.
+	tenantKeys tenantkey.Source
 	logger     *zap.Logger
 
 	maxBlobSize int64
@@ -118,6 +122,11 @@ type Deps struct {
 	// development) is configuration, but bucket encryption is not optional.
 	EncParams  registry.EncryptionParamsStore
 	RegionKeys regionkey.Provider
+	// TenantKeys resolves the requesting tenant's wrap key: the X25519
+	// public key every stored object is encrypted to as a COSE recipient (the
+	// encryption RFC's insurance copy, recoverable without the region).
+	// Required: a write that cannot obtain it fails.
+	TenantKeys tenantkey.Source
 
 	// MaxBlobSize is the coarse-split blob ceiling (0 → bucket default).
 	MaxBlobSize int64
@@ -170,6 +179,7 @@ func New(d Deps) *Backend {
 		remover:     d.Remover,
 		encParams:   d.EncParams,
 		regionKeys:  d.RegionKeys,
+		tenantKeys:  d.TenantKeys,
 		logger:      logger,
 		maxBlobSize: d.MaxBlobSize,
 		cors:        corsDoc,

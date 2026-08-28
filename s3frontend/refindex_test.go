@@ -88,6 +88,7 @@ func newRefTestBackend(t *testing.T, maxBlob ...int64) (*Backend, *inmem.MemStor
 		Remover:     rm,
 		EncParams:   mem,
 		RegionKeys:  testRegionKeys(t),
+		TenantKeys:  testTenantKeys(),
 		MaxBlobSize: mbs,
 	})
 	if err := mem.Create(ctx, "bk", did.Undef, registry.CreateState{}); err != nil {

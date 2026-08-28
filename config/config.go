@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -104,6 +105,12 @@ type Config struct {
 	// (openbao in production, inprocess for tests/dev) is configuration, but
 	// bucket encryption is not optional.
 	RegionKey RegionKeyConfig `mapstructure:"regionkey" yaml:"regionkey"`
+
+	// TenantKey configures resolution of the tenant wrap key (tenantkey): the
+	// X25519 key, published in each tenant's did:plc document, that every
+	// stored object is encrypted to as the FEE tenant recipient. Required:
+	// writes fail without a recipient.
+	TenantKey TenantKeyConfig `mapstructure:"tenantkey" yaml:"tenantkey"`
 
 	// LogLevel is the zap level (debug|info|warn|error).
 	LogLevel string `mapstructure:"log_level" yaml:"log_level"`
@@ -241,6 +248,39 @@ type IdentityConfig struct {
 	ServiceID string `mapstructure:"service_id" yaml:"service_id"`
 }
 
+// TenantKeyConfig locates the did:plc directory tenant DID documents are
+// resolved from.
+type TenantKeyConfig struct {
+	// PLCDirectoryURL is the did:plc directory endpoint, e.g.
+	// "https://plc.directory". Required.
+	PLCDirectoryURL string `mapstructure:"plc_directory_url" yaml:"plc_directory_url"`
+	// CacheTTL is how long a resolved tenant document is reused before the
+	// directory is consulted again (a Go duration). It bounds both the
+	// directory traffic on the write path and how long a wrap-key rotation
+	// goes unseen. Empty means "10m".
+	CacheTTL string `mapstructure:"cache_ttl" yaml:"cache_ttl"`
+}
+
+// DefaultTenantKeyCacheTTL is the tenant document cache TTL when
+// tenantkey.cache_ttl is unset.
+const DefaultTenantKeyCacheTTL = 10 * time.Minute
+
+// CacheTTLDuration parses CacheTTL, returning DefaultTenantKeyCacheTTL when
+// it is empty.
+func (c TenantKeyConfig) CacheTTLDuration() (time.Duration, error) {
+	if c.CacheTTL == "" {
+		return DefaultTenantKeyCacheTTL, nil
+	}
+	d, err := time.ParseDuration(c.CacheTTL)
+	if err != nil {
+		return 0, err
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("must be positive, got %s", d)
+	}
+	return d, nil
+}
+
 // RegionKeyConfig selects the region CEK wrap provider and carries each
 // implementation's settings.
 type RegionKeyConfig struct {
@@ -339,6 +379,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("regionkey.openbao.key", "")
 	v.SetDefault("regionkey.inprocess.kek", "")
 	v.SetDefault("regionkey.inprocess.version", "v1")
+	v.SetDefault("tenantkey.plc_directory_url", "")
+	v.SetDefault("tenantkey.cache_ttl", "")
 }
 
 // Validate checks the config for the selected mode, aggregating every
@@ -407,6 +449,15 @@ func (c *Config) Validate() error {
 		}
 	default:
 		errs = multierr.Append(errs, fmt.Errorf("regionkey.provider %q is not one of openbao, inprocess", c.RegionKey.Provider))
+	}
+
+	if c.TenantKey.PLCDirectoryURL == "" {
+		errs = multierr.Append(errs, errors.New("tenantkey.plc_directory_url is required"))
+	} else if u, err := url.Parse(c.TenantKey.PLCDirectoryURL); err != nil || u.Scheme == "" || u.Host == "" {
+		errs = multierr.Append(errs, fmt.Errorf("tenantkey.plc_directory_url %q is not an absolute URL", c.TenantKey.PLCDirectoryURL))
+	}
+	if _, err := c.TenantKey.CacheTTLDuration(); err != nil {
+		errs = multierr.Append(errs, fmt.Errorf("tenantkey.cache_ttl: %w", err))
 	}
 
 	if errs != nil {

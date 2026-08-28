@@ -48,22 +48,31 @@ claim count reaches zero. The full trace is the
 
 **Every body blob is encrypted at ingest** (the FilOne encryption design's
 write side, `s3frontend/encrypt.go`). Each plaintext piece SplitBody cuts
-gets a fresh CEK and streams through FEE into a recipient-less
-`COSE_Encrypt0` envelope (AES-256-GCM STREAM, 256 KiB chunks); the envelope
-is what the spool stores and the network receives, under its **ciphertext**
-digest. The CEK is wrapped by `regionkey.Provider` bound to (space, digest)
-and stored in the blob's `blob_encryption_params` row before any manifest
-can reference the digest. The split geometry, manifest spans, `Body.Size`,
-sha256/md5 and ETag are all plaintext values — only the digest and the
-stored sizes (`upload_intents.Size`, `blob_locations.Size`) name ciphertext.
+gets a fresh CEK and streams through FEE into a `COSE_Encrypt` envelope
+(AES-256-GCM STREAM, 256 KiB chunks); the envelope is what the spool stores
+and the network receives, under its **ciphertext** digest. The CEK is wrapped
+twice. The region wrap (`regionkey.Provider`, bound to (space, digest)) goes
+into the blob's `blob_encryption_params` row before any manifest can
+reference the digest; every read uses it. The tenant wrap is the envelope's
+single COSE recipient: ECDH-ES+A256KW to the tenant's X25519 wrap key,
+which Hilt publishes in the tenant's did:plc document at the `#wrap`
+verification method. The recipient kid is the key's fingerprint (its
+Multikey string), so the envelope names the exact key it was wrapped to and
+the tenant's private key alone recovers the plaintext, with no region and no
+database involved. The write path learns the tenant from Hilt's authorize
+response (`AuthorizeOK.Tenant`, cached per access key for the local fast
+path) and resolves its wrap key through `tenantkey` (PLC resolver, cached
+for `tenantkey.cache_ttl`); a write that cannot obtain the recipient fails.
+The split geometry, manifest spans, `Body.Size`, sha256/md5 and ETag are all
+plaintext values — only the digest and the stored sizes
+(`upload_intents.Size`, `blob_locations.Size`) name ciphertext.
 Consequences, per the RFC: content **dedup is gone** for bodies (a fresh CEK
 makes every stored digest unique), a DELETE that releases a blob's last
 claim also deletes its params row (crypto-shred — the ciphertext is
 unreadable even where copies survive), and **cross-space CopyObject is
 rejected** `NotImplemented` (the CEK wrap is space-bound; a rewrap flow is a
-filed follow-up). The tenant/insurance recipient of the RFC waits on Hilt's
-wrap-key registry and DID-document publication; FEE's multi-recipient model
-lets new writes add it without changing this layer.
+filed follow-up). Rotation: Hilt replaces `#wrap` in place and archives the
+old key, so a write inside the cache TTL of a rotation still recovers.
 
 A `200` therefore means the body is durable and accepted on the network and
 the catalog mutation is fsynced locally; the catalog becomes durable on

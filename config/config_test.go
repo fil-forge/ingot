@@ -29,6 +29,7 @@ func validConfig(t *testing.T) Config {
 		AuthServiceURL:   "http://127.0.0.1:7000",
 		AuthServiceDID:   "did:web:auth.example",
 		RegionKey:        RegionKeyConfig{Provider: "inprocess"},
+		TenantKey:        TenantKeyConfig{PLCDirectoryURL: "http://plc.example:3000"},
 	}
 }
 
@@ -60,6 +61,10 @@ func TestValidate_RequiredFields(t *testing.T) {
 		{"bad seal_age", func(c *Config) { c.SealAge = "not-a-duration" }, "parse seal_age"},
 		{"bad cors origin", func(c *Config) { c.CORSAllowedOrigins = []string{"app.example"} }, "cors_allowed_origins"},
 		{"regionkey provider unset", func(c *Config) { c.RegionKey.Provider = "" }, "regionkey.provider is required"},
+		{"tenantkey url unset", func(c *Config) { c.TenantKey.PLCDirectoryURL = "" }, "tenantkey.plc_directory_url is required"},
+		{"tenantkey url relative", func(c *Config) { c.TenantKey.PLCDirectoryURL = "plc:3000" }, "not an absolute URL"},
+		{"tenantkey bad ttl", func(c *Config) { c.TenantKey.CacheTTL = "soon" }, "tenantkey.cache_ttl"},
+		{"tenantkey zero ttl", func(c *Config) { c.TenantKey.CacheTTL = "0s" }, "must be positive"},
 		{"unknown regionkey provider", func(c *Config) { c.RegionKey.Provider = "hsm" }, `regionkey.provider "hsm" is not one of openbao, inprocess`},
 		{"openbao without key", func(c *Config) { c.RegionKey.Provider = "openbao" }, "regionkey.openbao.key"},
 		{"inprocess kek not base64", func(c *Config) {

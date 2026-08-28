@@ -31,6 +31,7 @@ import (
 	"github.com/fil-forge/ingot/regionkey"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/s3frontend"
+	"github.com/fil-forge/ingot/tenantkey"
 	"github.com/fil-forge/ingot/uploader"
 )
 
@@ -94,6 +95,9 @@ type ServerDeps struct {
 	// instance as Registry.
 	EncParams  registry.EncryptionParamsStore
 	RegionKeys regionkey.Provider
+	// TenantKeys resolves the requesting tenant's wrap key: the FEE tenant
+	// recipient every write encrypts to. Required; writes fail without it.
+	TenantKeys tenantkey.Source
 
 	// Meta is the persistence backing for log-segment metadata.
 	// Typically the same instance as Registry.
@@ -190,6 +194,7 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		Remover:     deps.Remover,
 		EncParams:   deps.EncParams,
 		RegionKeys:  deps.RegionKeys,
+		TenantKeys:  deps.TenantKeys,
 		MaxBlobSize: cfg.MaxBlobSize,
 		CORS:        cfg.CORSConfig,
 		Logger:      logger,
@@ -488,6 +493,9 @@ func validateServerInputs(cfg config.ServerConfig, deps ServerDeps) error {
 	}
 	if deps.RegionKeys == nil {
 		return errors.New("ingot: ServerDeps.RegionKeys is required")
+	}
+	if deps.TenantKeys == nil {
+		return errors.New("ingot: ServerDeps.TenantKeys is required")
 	}
 	if deps.Registry == nil {
 		return errors.New("ingot: ServerDeps.Registry is required")

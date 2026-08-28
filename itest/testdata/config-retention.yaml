@@ -53,3 +53,8 @@ regionkey:
     address: "http://ingot-openbao:8200"
     mount: transit
     key: region-kek
+
+# Tenant wrap key (FEE tenant recipient): resolved from the stack's PLC
+# directory; every write is encrypted to the tenant's #wrap key.
+tenantkey:
+  plc_directory_url: "http://plc:3000"
