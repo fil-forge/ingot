@@ -172,7 +172,7 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		Logger:      logger,
 	})
 
-	api, err := buildS3API(ctx, backend, cfg, deps.IAM)
+	api, err := buildS3API(ctx, backend, cfg, deps.IAM, logger)
 	if err != nil {
 		// Best-effort cleanup if we got past the log open: the caller
 		// has no Server handle to call Stop on.
@@ -363,10 +363,11 @@ func newBucketFlushFunc(up uploader.Uploader, reg registry.Registry, locations r
 }
 
 // buildS3API constructs the versitygw S3ApiServer with the wiring ingot
-// needs: no audit / event sinks, generous concurrency limits. Non-root
-// access keys authenticate through iam when provided (the root account is
-// checked before the IAM lookup either way).
-func buildS3API(ctx context.Context, backend *s3frontend.Backend, cfg config.ServerConfig, iam auth.IAMService) (*s3api.S3ApiServer, error) {
+// needs: no access log or event sink, generous concurrency limits, and an
+// audit-log sink that reports unexpected request failures through zap. Non-
+// root access keys authenticate through iam when provided (the root account
+// is checked before the IAM lookup either way).
+func buildS3API(ctx context.Context, backend *s3frontend.Backend, cfg config.ServerConfig, iam auth.IAMService, logger *zap.Logger) (*s3api.S3ApiServer, error) {
 	if iam == nil {
 		return nil, fmt.Errorf("ingot: IAMService is required")
 	}
@@ -374,6 +375,7 @@ func buildS3API(ctx context.Context, backend *s3frontend.Backend, cfg config.Ser
 	if err != nil {
 		return nil, fmt.Errorf("ingot: loggers: %w", err)
 	}
+	loggers.S3Logger = &errorAuditLogger{logger: logger}
 	evSender, err := s3event.InitEventSender(&s3event.EventConfig{})
 	if err != nil {
 		return nil, fmt.Errorf("ingot: event sender: %w", err)
