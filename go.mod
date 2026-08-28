@@ -1,6 +1,6 @@
 module github.com/fil-forge/ingot
 
-go 1.26.4
+go 1.26.5
 
 require (
 	github.com/alanshaw/dag-json-gen v0.0.8
@@ -16,6 +16,7 @@ require (
 	github.com/fil-forge/swarf v0.0.1-0.20260821055917-4921bc49627c
 	github.com/fil-forge/ucantone v0.0.0-20260817170631-3a20cd59fabc
 	github.com/fil-forge/versitygw v0.0.0-20260716095011-7a65883d595a
+	github.com/filecoin-project/go-fee v0.1.1-0.20260818173301-72a3a35f83ef
 	github.com/gofiber/fiber/v3 v3.5.0
 	github.com/google/uuid v1.6.0
 	github.com/ipfs/go-block-format v0.2.4
@@ -36,6 +37,7 @@ require (
 	go.uber.org/fx v1.24.0
 	go.uber.org/multierr v1.11.0
 	go.uber.org/zap v1.28.0
+	golang.org/x/sys v0.47.0
 	golang.org/x/xerrors v0.0.0-20240903120638-7835f813f4da
 )
 
@@ -98,6 +100,7 @@ require (
 	github.com/fsnotify/fsnotify v1.9.0 // indirect
 	github.com/fvbommel/sortorder v1.1.0 // indirect
 	github.com/go-asn1-ber/asn1-ber v1.5.8-0.20250403174932-29230038a667 // indirect
+	github.com/go-jose/go-jose/v4 v4.1.4 // indirect
 	github.com/go-ldap/ldap/v3 v3.4.13 // indirect
 	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
@@ -240,7 +243,6 @@ require (
 	golang.org/x/exp v0.0.0-20260718201538-764159d718ef // indirect
 	golang.org/x/net v0.57.0 // indirect
 	golang.org/x/sync v0.22.0 // indirect
-	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/term v0.45.0 // indirect
 	golang.org/x/text v0.40.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
