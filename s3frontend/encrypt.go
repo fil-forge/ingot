@@ -21,15 +21,17 @@ import (
 // encryption design's write side; the read side is decrypt.go). Every body
 // blob is encrypted at ingest: a fresh CEK per blob, the plaintext streamed
 // through FEE into a COSE envelope, the envelope spooled under its
-// CIPHERTEXT digest, and the CEK wrapped by the region key provider — bound
-// to (space, digest) — into the blob's blob_encryption_params row.
+// CIPHERTEXT digest, and the CEK wrapped twice — by the region key provider,
+// bound to (space, digest), into the blob's blob_encryption_params row (the
+// wrap every read uses), and to the tenant's X25519 wrap key as the
+// envelope's single COSE recipient (the insurance copy: recoverable from the
+// envelope alone with the tenant's private key, no region involved).
 //
-// The envelope carries no COSE recipient yet (a recipient-less
-// COSE_Encrypt0): the tenant/insurance recipient of the encryption RFC needs
-// Hilt's wrap-key registry and DID-document publication, which do not exist.
-// FEE's multi-recipient model lets new writes gain that recipient later
-// without changing this layer; existing blobs would need a Tier-2
-// re-encryption.
+// The tenant recipient is resolved once per request (tenantkey.Source),
+// before any plaintext is spooled, and a request that cannot obtain it
+// fails: a region-only wrap is the backstop-less design the RFC rejected.
+// Its kid is the key's fingerprint, so the envelope names the exact key it
+// was wrapped to whatever Hilt's DID document later says.
 //
 // A deliberate consequence (per the RFC): content dedup is gone for
 // encrypted bodies. A fresh CEK per encryption event makes every ciphertext
@@ -48,10 +50,11 @@ import (
 // Not safe for concurrent use; the write path drives one instance per body,
 // sequentially.
 type encryptingBlobWriter struct {
-	spool   blockstore.BlobWriter
-	keys    regionkey.Provider
-	space   did.DID
-	results map[string]encWrite
+	spool      blockstore.BlobWriter
+	keys       regionkey.Provider
+	space      did.DID
+	recipients []fee.Recipient
+	results    map[string]encWrite
 }
 
 // encWrite is one encrypted blob's write-side state, keyed by ciphertext
@@ -62,8 +65,22 @@ type encWrite struct {
 	storedSize int64 // envelope header + ciphertext, the spooled byte count
 }
 
-func newEncryptingBlobWriter(spool blockstore.BlobWriter, keys regionkey.Provider, space did.DID) *encryptingBlobWriter {
-	return &encryptingBlobWriter{spool: spool, keys: keys, space: space, results: map[string]encWrite{}}
+func newEncryptingBlobWriter(spool blockstore.BlobWriter, keys regionkey.Provider, space did.DID, recipients []fee.Recipient) *encryptingBlobWriter {
+	return &encryptingBlobWriter{spool: spool, keys: keys, space: space, recipients: recipients, results: map[string]encWrite{}}
+}
+
+// tenantRecipient resolves the requesting tenant's wrap key and returns it
+// as the envelope recipient for this request's blobs. The error is the
+// write's error: nothing is spooled without a recipient.
+func (b *Backend) tenantRecipient(ctx context.Context) (fee.Recipient, error) {
+	if b.tenantKeys == nil {
+		return nil, errors.New("s3frontend: tenant key source not configured (TenantKeys)")
+	}
+	kid, pub, err := b.tenantKeys.WrapKey(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("s3frontend: tenant recipient: %w", err)
+	}
+	return fee.NewECDHESRecipient([]byte(kid), pub), nil
 }
 
 // WriteBlob implements blockstore.BlobWriter over the encrypting pipeline.
@@ -92,9 +109,8 @@ func (w *encryptingBlobWriter) WriteBlob(ctx context.Context, r io.Reader) (mult
 	defer clear(cek)
 
 	plaintext := &countingReader{r: io.MultiReader(bytes.NewReader(first[:]), r)}
-	// No recipients: a recipient-less COSE_Encrypt0 (see the file comment).
 	// The descriptor is complete on return, before any plaintext is read.
-	rc, desc, err := fee.EncryptWithCEK(plaintext, cek, nil)
+	rc, desc, err := fee.EncryptWithCEK(plaintext, cek, w.recipients)
 	if err != nil {
 		return nil, 0, fmt.Errorf("s3frontend: encrypt blob: %w", err)
 	}

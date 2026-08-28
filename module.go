@@ -70,6 +70,7 @@ import (
 	"github.com/fil-forge/ingot/regionkey"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/revocation"
+	"github.com/fil-forge/ingot/tenantkey"
 	"github.com/fil-forge/ingot/tokenstore"
 	"github.com/fil-forge/ingot/uploader"
 	swarfclient "github.com/fil-forge/swarf/pkg/client"
@@ -107,8 +108,10 @@ func Module(cfg config.Config) fx.Option {
 			provideMigrationHook,
 			provideKeyProofs,
 			provideVerificationKeyCache,
+			provideTenantCache,
 			provideIAMService,
 			provideRegionKeyProvider,
+			provideTenantKeySource,
 			fx.Annotate(bucketauthority.New, fx.As(new(bucketauthority.BucketAuthority))),
 		),
 		ServerModule,
@@ -173,6 +176,9 @@ type serverParams struct {
 	// Required: regionkey.provider selects the implementation (openbao in
 	// production, inprocess for tests/dev); bucket encryption is not optional.
 	RegionKeys regionkey.Provider
+	// TenantKeys resolves the requesting tenant's wrap key, the FEE tenant
+	// recipient of every write. Required: writes fail without it.
+	TenantKeys tenantkey.Source
 }
 
 // registerServerLifecycle hooks the embedded server into the fx lifecycle. All
@@ -214,6 +220,7 @@ func registerServerLifecycle(lc fx.Lifecycle, p serverParams) {
 				Parks:           p.Parks,
 				EncParams:       p.EncParams,
 				RegionKeys:      p.RegionKeys,
+				TenantKeys:      p.TenantKeys,
 				Meta:            p.Meta,
 				Identity:        p.Identity,
 				IAM:             p.IAM,
@@ -349,6 +356,25 @@ func provideRegionKeyProvider(cfg config.Config, logger *zap.Logger) (regionkey.
 // stashes that store on the request context, from which the network read
 // tier resolves per-space /content/retrieve proof chains scoped to the
 // requesting key.
+// provideTenantKeySource builds the tenant wrap-key source (config
+// `tenantkey`): tenant DID documents are resolved from the did:plc directory
+// and cached for tenantkey.cache_ttl. No network at construction.
+func provideTenantKeySource(cfg config.Config) (tenantkey.Source, error) {
+	endpoint, err := url.Parse(cfg.TenantKey.PLCDirectoryURL)
+	if err != nil {
+		return nil, fmt.Errorf("ingot: parse tenantkey.plc_directory_url: %w", err)
+	}
+	ttl, err := cfg.TenantKey.CacheTTLDuration()
+	if err != nil {
+		return nil, fmt.Errorf("ingot: tenantkey.cache_ttl: %w", err)
+	}
+	res, err := tenantkey.NewPLCResolver(*endpoint, ttl)
+	if err != nil {
+		return nil, fmt.Errorf("ingot: tenantkey: %w", err)
+	}
+	return tenantkey.NewRequestSource(res), nil
+}
+
 func provideKeyProofs() *iam.KeyProofs {
 	return iam.NewKeyProofs()
 }
@@ -360,13 +386,20 @@ func provideVerificationKeyCache() *iam.VerificationKeyCache {
 	return iam.NewVerificationKeyCache()
 }
 
+// provideTenantCache is the per-access-key tenant DID cache shared by the IAM
+// service (fills it from Hilt, reads it on the fast path) and the revocation
+// consumer (clears a revoked key's entry).
+func provideTenantCache() *iam.TenantCache {
+	return iam.NewTenantCache()
+}
+
 // provideIAMService adapts the hilt client to versitygw's IAM seam: a request
 // signed with a non-root access key is authorized locally when the caches
 // hold its verification key + covering delegation chains, else by Hilt's
 // /s3/request/authorize — whose response replenishes the caches. Either way
 // the gateway verifies the signature with the derived key.
-func provideIAMService(c *hiltclient.Client, proofs *iam.KeyProofs, keys *iam.VerificationKeyCache, reg registry.Registry, id identity.Identity, logger *zap.Logger) auth.IAMService {
-	return iam.New(c, proofs, keys,
+func provideIAMService(c *hiltclient.Client, proofs *iam.KeyProofs, keys *iam.VerificationKeyCache, tenants *iam.TenantCache, reg registry.Registry, id identity.Identity, logger *zap.Logger) auth.IAMService {
+	return iam.New(c, proofs, keys, tenants,
 		iam.WithLocalAuthorization(id.DID(), reg),
 		iam.WithLogger(logger))
 }
@@ -376,7 +409,7 @@ func provideIAMService(c *hiltclient.Client, proofs *iam.KeyProofs, keys *iam.Ve
 // persists the resume point, and iam.Revoker clears the per-access-key
 // caches a revoked delegation participates in.
 func provideRevocationConsumer(cfg config.Config, cursors registry.RevocationCursorStore,
-	proofs *iam.KeyProofs, keys *iam.VerificationKeyCache, logger *zap.Logger) (*revocation.Consumer, error) {
+	proofs *iam.KeyProofs, keys *iam.VerificationKeyCache, tenants *iam.TenantCache, logger *zap.Logger) (*revocation.Consumer, error) {
 	revURL, err := url.Parse(cfg.RevocationServiceURL)
 	if err != nil {
 		return nil, fmt.Errorf("ingot: parse revocation_service_url: %w", err)
@@ -389,7 +422,7 @@ func provideRevocationConsumer(cfg config.Config, cursors registry.RevocationCur
 	if err != nil {
 		return nil, fmt.Errorf("ingot: revocation service client: %w", err)
 	}
-	return revocation.NewConsumer(src, cursors, iam.NewRevoker(proofs, keys, logger),
+	return revocation.NewConsumer(src, cursors, iam.NewRevoker(proofs, keys, tenants, logger),
 		revocation.WithLogger(logger)), nil
 }
 

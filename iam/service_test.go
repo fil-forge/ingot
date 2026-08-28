@@ -20,6 +20,7 @@ import (
 
 	hiltclient "github.com/fil-forge/hilt/pkg/client"
 	"github.com/fil-forge/ingot/iam"
+	"github.com/fil-forge/ingot/internal/reqscope"
 )
 
 // fakeAuthorizer records the request it authorized and returns canned
@@ -60,6 +61,9 @@ func newAccessKey(t *testing.T) (string, did.DID) {
 	return signer.DID().Identifier(), signer.DID()
 }
 
+// testTenant is the tenant every authorizeOK result names.
+var testTenant = did.MustParse("did:plc:ewvi7nxzyoun6zhxrhs64oiz")
+
 // authorizeOK builds an AuthorizeOK granting keyDID the given verification
 // keys.
 func authorizeOK(t *testing.T, keyDID did.DID, keys ...s3.VerificationKey) *s3req.AuthorizeOK {
@@ -69,6 +73,7 @@ func authorizeOK(t *testing.T, keyDID did.DID, keys ...s3.VerificationKey) *s3re
 	bucketID := bucket.DID()
 	return &s3req.AuthorizeOK{
 		Bucket:      &bucketID,
+		Tenant:      testTenant,
 		Permissions: s3.PermissionSet{Entries: map[did.DID][]string{keyDID: {"s3:GetObject"}}},
 		Keys:        s3.KeySet{Entries: map[did.DID][]s3.VerificationKey{keyDID: keys}},
 	}
@@ -100,7 +105,7 @@ func TestGetUserAccountForRequest(t *testing.T) {
 			s3.VerificationKey{Kind: s3.KeyKindSigV4a, Data: []byte("ecdsa")},
 			s3.VerificationKey{Kind: s3.KeyKindSigV4, Data: derivedKey},
 		)}
-		svc := iam.New(fake, iam.NewKeyProofs(), iam.NewVerificationKeyCache())
+		svc := iam.New(fake, iam.NewKeyProofs(), iam.NewVerificationKeyCache(), iam.NewTenantCache())
 
 		req := httptest.NewRequest(http.MethodGet, "http://example.com/bucket/key%20name?x-id=GetObject", nil)
 		req.Header.Set("X-Amz-Date", "20260707T000000Z")
@@ -118,11 +123,45 @@ func TestGetUserAccountForRequest(t *testing.T) {
 		require.Equal(t, "20260707T000000Z", fake.got.Headers["X-Amz-Date"])
 	})
 
+	t.Run("stashes the tenant on the request", func(t *testing.T) {
+		fake := &fakeAuthorizer{res: authorizeOK(t, keyDID, s3.VerificationKey{Kind: s3.KeyKindSigV4, Data: derivedKey})}
+		tenants := iam.NewTenantCache()
+		svc := iam.New(fake, iam.NewKeyProofs(), iam.NewVerificationKeyCache(), tenants)
+
+		app := fiber.New()
+		var stashed any
+		app.Use(func(c fiber.Ctx) error {
+			_, err := svc.GetUserAccountForRequest(c, access)
+			require.NoError(t, err)
+			stashed = c.Locals(reqscope.TenantKey())
+			return nil
+		})
+		resp, err := app.Test(httptest.NewRequest(http.MethodGet, "http://example.com/bucket/key", nil))
+		require.NoError(t, err)
+		require.NoError(t, resp.Body.Close())
+
+		require.Equal(t, testTenant, stashed, "tenant must reach the write path via the request")
+		cached, ok := tenants.Get(access)
+		require.True(t, ok, "tenant must be cached for the fast path")
+		require.Equal(t, testTenant, cached)
+	})
+
+	t.Run("no tenant in result", func(t *testing.T) {
+		res := authorizeOK(t, keyDID, s3.VerificationKey{Kind: s3.KeyKindSigV4, Data: derivedKey})
+		res.Tenant = did.Undef
+		fake := &fakeAuthorizer{res: res}
+		svc := iam.New(fake, iam.NewKeyProofs(), iam.NewVerificationKeyCache(), iam.NewTenantCache())
+
+		_, err := resolveForRequest(t, svc, access,
+			httptest.NewRequest(http.MethodGet, "http://example.com/bucket/key", nil))
+		require.ErrorContains(t, err, "no tenant")
+	})
+
 	t.Run("no sigv4 key in result", func(t *testing.T) {
 		fake := &fakeAuthorizer{res: authorizeOK(t, keyDID,
 			s3.VerificationKey{Kind: s3.KeyKindSigV4a, Data: []byte("ecdsa")},
 		)}
-		svc := iam.New(fake, iam.NewKeyProofs(), iam.NewVerificationKeyCache())
+		svc := iam.New(fake, iam.NewKeyProofs(), iam.NewVerificationKeyCache(), iam.NewTenantCache())
 
 		_, err := resolveForRequest(t, svc, access,
 			httptest.NewRequest(http.MethodGet, "http://example.com/bucket/key", nil))
@@ -131,7 +170,7 @@ func TestGetUserAccountForRequest(t *testing.T) {
 
 	t.Run("authorizer error propagates", func(t *testing.T) {
 		boom := errors.New("boom")
-		svc := iam.New(&fakeAuthorizer{err: boom}, iam.NewKeyProofs(), iam.NewVerificationKeyCache())
+		svc := iam.New(&fakeAuthorizer{err: boom}, iam.NewKeyProofs(), iam.NewVerificationKeyCache(), iam.NewTenantCache())
 
 		_, err := resolveForRequest(t, svc, access,
 			httptest.NewRequest(http.MethodGet, "http://example.com/bucket/key", nil))
@@ -140,7 +179,7 @@ func TestGetUserAccountForRequest(t *testing.T) {
 
 	t.Run("malformed access key id short-circuits", func(t *testing.T) {
 		fake := &fakeAuthorizer{}
-		svc := iam.New(fake, iam.NewKeyProofs(), iam.NewVerificationKeyCache())
+		svc := iam.New(fake, iam.NewKeyProofs(), iam.NewVerificationKeyCache(), iam.NewTenantCache())
 
 		_, err := resolveForRequest(t, svc, "not-a-did-key-identifier",
 			httptest.NewRequest(http.MethodGet, "http://example.com/bucket/key", nil))
@@ -161,7 +200,7 @@ func TestProofChainCapture(t *testing.T) {
 		root, mid, leaf, agent := mintRetrieveChain(t)
 		cache := iam.NewKeyProofs()
 		fake := &fakeAuthorizer{res: authorizeOK(t, keyDID, sigv4), dlgs: []ucan.Delegation{root, mid, leaf}}
-		svc := iam.New(fake, cache, iam.NewVerificationKeyCache())
+		svc := iam.New(fake, cache, iam.NewVerificationKeyCache(), iam.NewTenantCache())
 
 		_, err := resolveForRequest(t, svc, access,
 			httptest.NewRequest(http.MethodGet, "http://example.com/bkt/key", nil))
@@ -181,7 +220,7 @@ func TestProofChainCapture(t *testing.T) {
 			dlgs:     []ucan.Delegation{leaf},      // authorize: re-delegation only
 			infoDlgs: []ucan.Delegation{root, mid}, // bucket info: the rest
 		}
-		svc := iam.New(fake, cache, iam.NewVerificationKeyCache())
+		svc := iam.New(fake, cache, iam.NewVerificationKeyCache(), iam.NewTenantCache())
 
 		_, err := resolveForRequest(t, svc, access,
 			httptest.NewRequest(http.MethodGet, "http://example.com/bkt/key", nil))
@@ -200,7 +239,7 @@ func TestProofChainCapture(t *testing.T) {
 			dlgs:    []ucan.Delegation{leaf},
 			infoErr: errors.New("hilt down"),
 		}
-		svc := iam.New(fake, iam.NewKeyProofs(), iam.NewVerificationKeyCache())
+		svc := iam.New(fake, iam.NewKeyProofs(), iam.NewVerificationKeyCache(), iam.NewTenantCache())
 
 		acct, err := resolveForRequest(t, svc, access,
 			httptest.NewRequest(http.MethodGet, "http://example.com/bkt/key", nil))
@@ -213,7 +252,7 @@ func TestProofChainCapture(t *testing.T) {
 // TestBaseIAMServiceParity pins the non-request IAMService surface to
 // IAMServiceSingle's behavior: account management belongs to Hilt.
 func TestBaseIAMServiceParity(t *testing.T) {
-	svc := iam.New(&fakeAuthorizer{}, iam.NewKeyProofs(), iam.NewVerificationKeyCache())
+	svc := iam.New(&fakeAuthorizer{}, iam.NewKeyProofs(), iam.NewVerificationKeyCache(), iam.NewTenantCache())
 
 	_, err := svc.GetUserAccount("anything")
 	require.Error(t, err)

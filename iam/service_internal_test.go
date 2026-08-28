@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -12,12 +13,17 @@ import (
 	"github.com/fil-forge/versitygw/auth"
 	v4 "github.com/fil-forge/versitygw/aws/signer/v4"
 	"github.com/fil-forge/versitygw/s3err"
+	"github.com/gofiber/fiber/v3"
 
+	hiltclient "github.com/fil-forge/hilt/pkg/client"
 	hiltauth "github.com/fil-forge/hilt/pkg/rpc/service/auth"
 	"github.com/fil-forge/hilt/pkg/sigv4"
+	"github.com/fil-forge/ingot/internal/reqscope"
 	"github.com/fil-forge/ingot/registry"
 	contentcmds "github.com/fil-forge/libforge/commands/content"
 	s3 "github.com/fil-forge/libforge/commands/s3"
+	s3bkt "github.com/fil-forge/libforge/commands/s3/bucket"
+	s3req "github.com/fil-forge/libforge/commands/s3/request"
 	"github.com/fil-forge/ucantone/did"
 	ucanerrors "github.com/fil-forge/ucantone/errors"
 	"github.com/fil-forge/ucantone/multikey/ed25519"
@@ -81,7 +87,7 @@ func retrieveChain(t *testing.T, spaceIssuer, accessKey, agent ucan.Issuer) []uc
 // localService builds a Service with the fast path enabled and the given
 // agent + resolver, plus fresh caches.
 func localService(agent did.DID, r fixedResolver) *Service {
-	return New(nil, NewKeyProofs(), NewVerificationKeyCache(),
+	return New(&refusingAuthorizer{}, NewKeyProofs(), NewVerificationKeyCache(), NewTenantCache(),
 		WithLocalAuthorization(agent, r))
 }
 
@@ -240,4 +246,92 @@ func TestMapAuthError(t *testing.T) {
 			require.Equal(t, want.status, s3e.StatusCode())
 		})
 	}
+}
+
+// refusingAuthorizer fails every call: the fast-path tests use it to prove
+// Hilt was not consulted.
+type refusingAuthorizer struct{ calls int }
+
+func (a *refusingAuthorizer) AuthorizeRequest(context.Context, s3.Request, ...hiltclient.MethodOption) (*s3req.AuthorizeOK, ucan.Container, error) {
+	a.calls++
+	return nil, nil, errors.New("hilt consulted")
+}
+
+func (a *refusingAuthorizer) BucketInfo(context.Context, string, did.DID, ...hiltclient.MethodOption) (*s3bkt.InfoOK, ucan.Container, error) {
+	return nil, nil, errors.New("hilt consulted")
+}
+
+// httpRequestOf rebuilds the signed request as an *http.Request so it can be
+// driven through fiber exactly as the gateway would see it.
+func httpRequestOf(t *testing.T, req s3.Request) *http.Request {
+	t.Helper()
+	hr := httptest.NewRequest(req.Method, "http://"+req.Headers["Host"]+req.URL, nil)
+	for k, v := range req.Headers {
+		hr.Header.Set(k, v)
+	}
+	return hr
+}
+
+// TestFastPathTenant covers the tenant half of the local fast path: a request
+// that verifies locally is stashed with the cached tenant, and one whose
+// tenant is not cached falls through to Hilt rather than proceeding
+// tenant-less (the write path would refuse it).
+func TestFastPathTenant(t *testing.T) {
+	accessKey, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	spaceIssuer, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	agent, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	tenant := did.MustParse("did:plc:ewvi7nxzyoun6zhxrhs64oiz")
+
+	accessKeyID := accessKey.DID().Identifier()
+	const secret = "test-secret-access-key"
+	resolver := fixedResolver{name: "bkt", state: &registry.State{Name: "bkt", Space: spaceIssuer.DID()}}
+
+	req := signedGet(t, "s3.example", "/bkt/obj", accessKeyID, secret, time.Now())
+	sr, err := sigv4.Parse(sigv4.Request{Method: req.Method, Headers: req.Headers, URL: req.URL})
+	require.NoError(t, err)
+	key, err := sigv4.DeriveKey(sr, secret)
+	require.NoError(t, err)
+
+	drive := func(t *testing.T, s *Service) (auth.Account, any, error) {
+		t.Helper()
+		app := fiber.New()
+		var acct auth.Account
+		var stashed any
+		var authErr error
+		app.Use(func(c fiber.Ctx) error {
+			acct, authErr = s.GetUserAccountForRequest(c, accessKeyID)
+			stashed = c.Locals(reqscope.TenantKey())
+			return nil
+		})
+		resp, err := app.Test(httpRequestOf(t, req))
+		require.NoError(t, err)
+		require.NoError(t, resp.Body.Close())
+		return acct, stashed, authErr
+	}
+
+	t.Run("cached tenant is stashed without consulting Hilt", func(t *testing.T) {
+		s := localService(agent.DID(), resolver)
+		s.keys.Put(accessKeyID, time.Hour, s3.VerificationKey{Kind: s3.KeyKindSigV4, Data: key})
+		s.tenants.Put(accessKeyID, time.Hour, tenant)
+		s.proofs.Deposit(accessKey.DID(), retrieveChain(t, spaceIssuer, accessKey, agent)...)
+
+		acct, stashed, err := drive(t, s)
+		require.NoError(t, err)
+		require.Equal(t, key, acct.SigningKey)
+		require.Equal(t, tenant, stashed)
+		require.Zero(t, s.authorizer.(*refusingAuthorizer).calls)
+	})
+
+	t.Run("uncached tenant falls through to Hilt", func(t *testing.T) {
+		s := localService(agent.DID(), resolver)
+		s.keys.Put(accessKeyID, time.Hour, s3.VerificationKey{Kind: s3.KeyKindSigV4, Data: key})
+		s.proofs.Deposit(accessKey.DID(), retrieveChain(t, spaceIssuer, accessKey, agent)...)
+
+		_, _, err := drive(t, s)
+		require.ErrorContains(t, err, "hilt consulted")
+		require.Equal(t, 1, s.authorizer.(*refusingAuthorizer).calls)
+	})
 }

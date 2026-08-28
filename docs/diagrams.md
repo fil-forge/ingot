@@ -252,7 +252,8 @@ sequenceDiagram
     Note over C,L: off the lock: ingest, hash, encrypt, upload
     C->>B: PutObject(bucket, key, body)
     B->>R: reg.Get(bucket), precondition pre-check
-    B->>SP: SplitBody: per plaintext piece, fresh CEK →<br/>FEE envelope (COSE_Encrypt0, AES-256-GCM STREAM) →<br/>spool under the CIPHERTEXT digest<br/>(sha256 + md5 of the plaintext in the same pass)
+    B->>B: tenant recipient: resolve the tenant's #wrap key<br/>(tenant DID from the request, did:plc doc via the cached PLC resolver);<br/>no recipient → the write fails
+    B->>SP: SplitBody: per plaintext piece, fresh CEK →<br/>FEE envelope (COSE_Encrypt, AES-256-GCM STREAM,<br/>one recipient: ECDH-ES+A256KW to the tenant wrap key) →<br/>spool under the CIPHERTEXT digest<br/>(sha256 + md5 of the plaintext in the same pass)
     B->>R: PutIntent(digest, stored size) +<br/>PutEncryptionParams(region-wrapped CEK, FEE geometry) per blob
     loop each body blob (uploadBlobs)
         alt blob_locations already has (space, digest)
@@ -285,6 +286,11 @@ sequenceDiagram
   the encryption RFC. Manifest spans, `Body.Size`, sha256/md5 and ETag stay
   plaintext values; `upload_intents.Size` and `blob_locations.Size` are
   stored (envelope) sizes.
+- The envelope's one COSE recipient is the tenant wrap key (kid = the key's
+  fingerprint), the RFC's insurance copy: the tenant's private key alone
+  recovers the plaintext. The IAM layer stashes the tenant DID from Hilt's
+  authorize response on the request; `tenantkey` resolves the `#wrap` key
+  from the tenant's did:plc document.
 - The supersession rule (which prior version is retained, replaced, or
   discarded) is [`s3-versioning.md`](./s3-versioning.md) §5; the resulting
   storage shape is the [version tree](#per-key-version-storage-manifest-arm-leaf-arm-prev-tree).
@@ -407,7 +413,7 @@ sequenceDiagram
     B->>R: CreateSession(open) with headers + checksum algorithm
     B-->>C: uploadId
     C->>B: UploadPart(n)
-    B->>B: openSession (non-open: NoSuchUpload), then splitSpool<br/>(encrypt per piece: fresh CEK → FEE envelope →<br/>spool under the ciphertext digest + params row,<br/>as in the PutObject diagram)
+    B->>B: openSession (non-open: NoSuchUpload), then splitSpool<br/>(resolve the tenant recipient, then encrypt per piece:<br/>fresh CEK → FEE envelope → spool under the ciphertext<br/>digest + params row, as in the PutObject diagram)
     B->>R: PutPart(parked)
     loop each part blob (parkBlobs)
         alt blob_locations already has the digest
