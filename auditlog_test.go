@@ -9,8 +9,8 @@ import (
 	"github.com/fil-forge/versitygw/s3log"
 	"github.com/gofiber/fiber/v3"
 	"go.uber.org/zap"
-	"go.uber.org/zap/zaptest/observer"
 	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 // logAuditError drives one request through a fiber app whose handler feeds

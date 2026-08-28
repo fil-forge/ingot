@@ -24,20 +24,19 @@ func validConfig(t *testing.T) Config {
 		t.Fatalf("write key file: %v", err)
 	}
 	return Config{
-		Addr:             "127.0.0.1:9000",
-		DataDir:          "/data",
-		RootAccess:       "root-access",
-		RootSecret:       "root-secret",
-		PostgresDSN:      "postgres://ingot@127.0.0.1:5432/ingot",
-		Identity:         IdentityConfig{KeyFile: keyFile},
-		UploadServiceURL: "http://127.0.0.1:8000",
-		UploadServiceDID: "did:web:upload.example",
-		AuthServiceURL:   "http://127.0.0.1:7000",
-		AuthServiceDID:   "did:web:auth.example",
-
+		Addr:              "127.0.0.1:9000",
+		DataDir:           "/data",
+		RootAccess:        "root-access",
+		RootSecret:        "root-secret",
+		PostgresDSN:       "postgres://ingot@127.0.0.1:5432/ingot",
+		Identity:          IdentityConfig{KeyFile: keyFile},
+		UploadServiceURL:  "http://127.0.0.1:8000",
+		UploadServiceDID:  "did:web:upload.example",
+		AuthServiceURL:    "http://127.0.0.1:7000",
+		AuthServiceDID:    "did:web:auth.example",
 		AuthServiceProofs: encodedProofs(t, mintDelegation(t)),
-		RegionKey:        RegionKeyConfig{Provider: "inprocess"},
-		TenantKey:        TenantKeyConfig{PLCDirectoryURL: "http://plc.example:3000"},
+		RegionKey:         RegionKeyConfig{Provider: "inprocess"},
+		TenantKey:         TenantKeyConfig{PLCDirectoryURL: "http://plc.example:3000"},
 	}
 }
 
