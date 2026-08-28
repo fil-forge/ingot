@@ -12,7 +12,7 @@ require (
 	github.com/fil-forge/hilt v0.0.1-0.20260821074833-0928688148af
 	github.com/fil-forge/indexing-service v1.13.5-0.20260820151722-9eb620409a4e
 	github.com/fil-forge/libforge v0.0.0-20260807225550-3e6895b41be5
-	github.com/fil-forge/smelt v0.0.0-20260821100146-defc6a7d7e27
+	github.com/fil-forge/smelt v0.0.0-20260826125320-a1f34a711d6f
 	github.com/fil-forge/swarf v0.0.1-0.20260821055917-4921bc49627c
 	github.com/fil-forge/ucantone v0.0.0-20260817170631-3a20cd59fabc
 	github.com/fil-forge/versitygw v0.0.0-20260716095011-7a65883d595a
