@@ -186,7 +186,9 @@ Viper/yaml-bindable (env prefix `INGOT_`, `.` → `_`). Key fields: `Enabled`,
 Ship, Retain}` override block (the only plane), `ReadCacheBytes` (0 → 256 MiB,
 <0 → off), `UploadServiceURL`/`UploadServiceDID`/`UploadReceiptsURL` (sprue),
 `AuthServiceURL`/`AuthServiceDID`/`AuthServiceProofs` (hilt; proofs = file
-path or string-encoded UCAN container, optional), `TokenStoreDir` (→
+path or string-encoded UCAN container, required alongside the URL and
+validated at startup down to holding at least one delegation),
+`TokenStoreDir` (→
 `DataDir`), `MultipartSessionTTL` (0 → 7d, negative → sweeper off),
 `CORSAllowedOrigins`, `LogLevel`. `Config.ServerConfig()` is the single
 mapping site. The daemon's config (cmd/) adds `postgres_dsn` and
