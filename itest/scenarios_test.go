@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -40,7 +41,8 @@ func TestForgeScenarios(t *testing.T) {
 	// names the agent did:web:ingot; hilt resolves this document to verify
 	// ingot's /s3/* invocations, so every other subtest depends on it too.
 	t.Run("AgentDIDDocument", func(t *testing.T) {
-		res, err := http.Get(endpoint + "/.well-known/did.json")
+		hc := &http.Client{Timeout: 10 * time.Second}
+		res, err := hc.Get(endpoint + "/.well-known/did.json")
 		if err != nil {
 			t.Fatalf("GET /.well-known/did.json: %v", err)
 		}

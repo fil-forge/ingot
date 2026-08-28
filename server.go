@@ -90,17 +90,16 @@ type ServerDeps struct {
 	Meta logstore.Meta
 
 	// Identity is the agent identity (the issuer of every outbound
-	// invocation). When set, the listener serves its DID document at
+	// invocation). The listener serves its DID document at
 	// /.well-known/did.json so peers can resolve a did:web agent to its
-	// signing key. Optional: the zero value serves no document (a did:key
-	// agent needs none, and a harness that never issues invocations has no
-	// identity).
+	// signing key (a did:key agent's document is served too; nothing needs
+	// to fetch it). Required.
 	Identity identity.Identity
 
-	// IAM authenticates non-root access keys (e.g. hilt/iam, which
-	// authorizes each request against the Hilt tenant service). Optional:
-	// nil leaves the gateway with only the single root account, as in
-	// standalone mode and the test harness.
+	// IAM authenticates non-root access keys (hilt/iam, which authorizes
+	// each request against the Hilt tenant service). Required: the root
+	// account is checked before the IAM lookup, but every other access key
+	// is resolved through it.
 	IAM auth.IAMService
 }
 
@@ -376,9 +375,9 @@ func newBucketFlushFunc(up uploader.Uploader, reg registry.Registry, locations r
 
 // buildS3API constructs the versitygw S3ApiServer with the wiring ingot
 // needs: no audit / event sinks, generous concurrency limits. Non-root
-// access keys authenticate through iam when provided (the root account is
-// checked before the IAM lookup either way). With an agent identity, the
-// server also publishes its DID document at /.well-known/did.json.
+// access keys authenticate through iam, which is required (the root account
+// is checked before the IAM lookup). The server also publishes id's DID
+// document at /.well-known/did.json.
 func buildS3API(ctx context.Context, backend *s3frontend.Backend, cfg config.ServerConfig, iam auth.IAMService, id identity.Identity) (*s3api.S3ApiServer, error) {
 	if iam == nil {
 		return nil, fmt.Errorf("ingot: IAMService is required")

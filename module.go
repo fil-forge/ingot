@@ -26,9 +26,9 @@
 // Module is a thin production wrapper around [ServerModule], which is the
 // reusable core: it consumes a [ServerConfig], a *zap.Logger, and the
 // collaborator seams (the registry + store interfaces, logstore.Meta,
-// blockstore.BlockReader, the uploader seams, bucketauthority, and an
-// optional IAM service) from the graph, then manages New -> Start -> Stop
-// over the fx lifecycle. Module layers the production providers (the
+// blockstore.BlockReader, the uploader seams, bucketauthority, the agent
+// identity, and the IAM service) from the graph, then manages New -> Start
+// -> Stop over the fx lifecycle. Module layers the production providers (the
 // Postgres registry, the Forge reader, the sprue uploader, the hilt
 // client/IAM) and a migration pre-start hook on top. A test harness, by
 // contrast, includes ServerModule directly and supplies in-memory fakes for
@@ -159,9 +159,10 @@ type serverParams struct {
 	// issuer of every outbound invocation); the listener serves its DID
 	// document at /.well-known/did.json. Required.
 	Identity identity.Identity
-	// IAM authenticates non-root access keys.
-	IAM       auth.IAMService `optional:"true"`
-	PreStarts []PreStartHook  `group:"ingot_prestart"`
+	// IAM authenticates non-root access keys. Required: New rejects a nil
+	// IAM, so the graph fails at validation rather than in OnStart.
+	IAM       auth.IAMService
+	PreStarts []PreStartHook `group:"ingot_prestart"`
 }
 
 // registerServerLifecycle hooks the embedded server into the fx lifecycle. All

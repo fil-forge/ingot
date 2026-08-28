@@ -47,8 +47,8 @@ func TestModuleValidate_Enabled(t *testing.T) {
 }
 
 // TestModuleValidate_HiltEnabled asserts the graph also validates with Hilt
-// configured, which adds the hilt-backed IAM provider (consumed by the
-// server's optional IAM dependency).
+// configured, the service behind the hilt-backed IAM provider the server
+// requires.
 func TestModuleValidate_HiltEnabled(t *testing.T) {
 	signer, err := ed25519.GenerateIssuer()
 	if err != nil {

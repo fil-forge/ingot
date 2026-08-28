@@ -35,7 +35,7 @@ change to the diagrams to re-check. The maintenance rule lives in
 ## System context: services and contracts
 
 Ingot is an S3 gateway over the Forge network: versitygw serves S3 REST
-(`:9000` by default; `:80` in the smelt stack, where `did:web:ingot` resolves
+(`:8080` by default; `:80` in the smelt stack, where `did:web:ingot` resolves
 to the listener's `/.well-known/did.json`), hilt authorizes requests and owns
 tenancy, sprue brokers every blob
 operation, and piri stores and serves the bytes. The indexing-service read

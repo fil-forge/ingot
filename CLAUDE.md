@@ -162,7 +162,7 @@ Internal:
   `*zap.Logger`, and the collaborator seams (`blockstore.BlockReader`; the
   four `uploader` seams; `bucketauthority.BucketAuthority`;
   `registry.Registry` plus the intent/location/inclusion/blob-ref/GC/
-  multipart/park stores; `logstore.Meta`; an optional `auth.IAMService`) +
+  multipart/park stores; `logstore.Meta`; `auth.IAMService`) +
   a `PreStartHook` group; runs pre-start → `New` → `Start` on the fx
   lifecycle.
 - **`Module(cfg)`** (production wrapper) — supplies Postgres as Registry +
@@ -180,7 +180,7 @@ agent) and sets `Config.UploadServiceURL`/`UploadServiceDID` (sprue) +
 ## Configuration (`config.Config`)
 
 Viper/yaml-bindable (env prefix `INGOT_`, `.` → `_`). Key fields: `Enabled`,
-`Addr` (default `0.0.0.0:9000`), `DataDir`, `Region`, `RootAccess`/`RootSecret`
+`Addr` (default `0.0.0.0:8080`), `DataDir`, `Region`, `RootAccess`/`RootSecret`
 (the versitygw root account), `MaxBlobSize`, top-level
 `SealBytes`/`SealAge`/`Retain` with a `CatalogPlane` `{SealBytes, SealAge,
 Ship, Retain}` override block (the only plane), `ReadCacheBytes` (0 → 256 MiB,

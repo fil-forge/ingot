@@ -270,7 +270,7 @@ func Load(configFile string) (*Config, error) {
 
 func setDefaults(v *viper.Viper) {
 	v.SetDefault("log_level", "info")
-	v.SetDefault("addr", "0.0.0.0:9000")
+	v.SetDefault("addr", "0.0.0.0:8080")
 	// The identity keys are registered even though the defaults are empty:
 	// viper's AutomaticEnv only overrides keys it already knows, so without
 	// these an INGOT_IDENTITY_* env var would be silently ignored whenever

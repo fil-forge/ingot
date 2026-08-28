@@ -11,7 +11,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 COPY ingot /usr/bin/ingot
-# S3 listener. The binary defaults to :9000; the compose config binds :80 so
-# did:web:ingot resolves to http://ingot:80/.well-known/did.json.
-EXPOSE 80
+# S3 listener: :8080 by default, the port every Forge service image exposes.
+# smelt overrides addr to :80 in the mounted config so did:web:ingot resolves
+# to http://ingot/.well-known/did.json, and maps that port in compose.
+EXPOSE 8080
 ENTRYPOINT ["/usr/bin/ingot"]
