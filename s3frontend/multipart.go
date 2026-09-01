@@ -235,14 +235,18 @@ func (b *Backend) UploadPart(ctx context.Context, input *s3.UploadPartInput) (*s
 	}
 
 	// Capture the superseded part's blobs (if any) before overwriting, so
-	// last-write-wins doesn't strand its spool files.
+	// last-write-wins doesn't strand its spool files. A listing failure
+	// fails the upload: proceeding would silently strand the replaced
+	// part's blobs and key rows.
 	var superseded []mh.Multihash
-	if prior, err := b.multipart.ListParts(ctx, uploadID); err == nil {
-		for _, p := range prior {
-			if p.PartNumber == int(*input.PartNumber) {
-				superseded = p.BlobDigests
-				break
-			}
+	prior, err := b.multipart.ListParts(ctx, uploadID)
+	if err != nil {
+		return nil, fmt.Errorf("s3frontend: list parts before supersede: %w", err)
+	}
+	for _, p := range prior {
+		if p.PartNumber == int(*input.PartNumber) {
+			superseded = p.BlobDigests
+			break
 		}
 	}
 
@@ -277,7 +281,7 @@ func (b *Backend) UploadPart(ctx context.Context, input *s3.UploadPartInput) (*s
 		return nil, fmt.Errorf("s3frontend: park part blobs: %w", err)
 	}
 	if len(superseded) > 0 {
-		b.cleanupPartBlobs(ctx, space, uploadID, superseded)
+		b.cleanupPartBlobs(ctx, space, uploadID, superseded, nil)
 	}
 	etag := `"` + hex.EncodeToString(body.MD5) + `"`
 	out := &s3.UploadPartOutput{ETag: &etag}
@@ -621,10 +625,33 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 	// The object is durable. Retain the session (state 'completed') and its
 	// parts so a duplicate Complete is idempotent; the sweeper reaps it later.
 	// Best-effort: a failed latch leaves the row in 'completing', which the
-	// sweeper also treats as terminal after the TTL.
+	// sweeper reaps through its abort path after the TTL — harmless here, as
+	// the winners hold reference claims by now, so that cleanup skips them.
 	if _, err := b.multipart.LatchSession(ctx, uploadID, registry.SessionCompleting, registry.SessionCompleted); err != nil {
 		b.logger.Warn("latch session to completed failed; sweeper reaps the completing row after the TTL",
 			zap.String("uploadID", uploadID), zap.Error(err))
+	}
+
+	// Reap parts uploaded but omitted from the winning list: no claim was
+	// ever added for them, and nothing else revisits their blobs (the part
+	// rows are retained for idempotency, then cascade away at the sweep).
+	// keep guards the winners explicitly — the retained part rows would
+	// otherwise mark every digest, orphans included, as live. Best-effort
+	// post-commit, like the reference-index reconcile.
+	winners := make(map[string]bool, len(blobs))
+	for _, ref := range blobs {
+		winners[string(ref.Digest)] = true
+	}
+	var orphans []mh.Multihash
+	for _, sp := range stored {
+		for _, d := range sp.BlobDigests {
+			if !winners[string(d)] {
+				orphans = append(orphans, d)
+			}
+		}
+	}
+	if len(orphans) > 0 {
+		b.cleanupPartBlobs(ctx, bucketState.Space, uploadID, orphans, winners)
 	}
 
 	// The x-amz-version-id of the new version, omitted for unversioned buckets
@@ -669,12 +696,17 @@ func (b *Backend) AbortMultipartUpload(ctx context.Context, input *s3.AbortMulti
 		return s3err.GetAPIError(s3err.ErrNoSuchUpload)
 	}
 	// Snapshot the parts' blob digests before the cascade delete, then drop
-	// the session and clean the spool.
+	// the session and clean the spool. A listing failure fails the abort
+	// (the session stays latched 'aborting' for the sweeper): deleting the
+	// session first would cascade the part rows away — the only index to
+	// the blobs — stranding them unrecoverably.
+	parts, err := b.multipart.ListParts(ctx, uploadID)
+	if err != nil {
+		return fmt.Errorf("s3frontend: list parts before abort: %w", err)
+	}
 	var digests []mh.Multihash
-	if parts, err := b.multipart.ListParts(ctx, uploadID); err == nil {
-		for _, p := range parts {
-			digests = append(digests, p.BlobDigests...)
-		}
+	for _, p := range parts {
+		digests = append(digests, p.BlobDigests...)
 	}
 	if err := b.multipart.DeleteSession(ctx, uploadID); err != nil {
 		return fmt.Errorf("s3frontend: delete session: %w", err)
@@ -683,7 +715,7 @@ func (b *Backend) AbortMultipartUpload(ctx context.Context, input *s3.AbortMulti
 	if err != nil {
 		return err
 	}
-	b.cleanupPartBlobs(ctx, space, uploadID, digests)
+	b.cleanupPartBlobs(ctx, space, uploadID, digests, nil)
 	return nil
 }
 
@@ -703,33 +735,51 @@ func (b *Backend) abortOpenSession(ctx context.Context, space did.DID, sess regi
 	if err != nil || !won {
 		return
 	}
+	parts, err := b.multipart.ListParts(ctx, sess.UploadID)
+	if err != nil {
+		// Leave the session latched 'aborting': deleting it now would
+		// cascade away the part rows — the only index to the blobs. The
+		// sweeper's aborting reap retries with a fresh listing.
+		b.logger.Warn("list parts before implicit abort failed; leaving the session for the sweeper",
+			zap.String("uploadID", sess.UploadID), zap.Error(err))
+		return
+	}
 	var digests []mh.Multihash
-	if parts, err := b.multipart.ListParts(ctx, sess.UploadID); err == nil {
-		for _, p := range parts {
-			digests = append(digests, p.BlobDigests...)
-		}
+	for _, p := range parts {
+		digests = append(digests, p.BlobDigests...)
 	}
 	if err := b.multipart.DeleteSession(ctx, sess.UploadID); err != nil {
 		return
 	}
-	b.cleanupPartBlobs(ctx, space, sess.UploadID, digests)
+	b.cleanupPartBlobs(ctx, space, sess.UploadID, digests, nil)
 }
 
 // cleanupPartBlobs removes spooled blobs that belonged to aborted, expired, or
 // superseded parts of uploadID — unless the blob is still referenced: by a
 // part of another in-flight session (content-addressed dedup), by a part still
 // live in THIS session (a re-uploaded part may share blobs with its
-// replacement or a sibling part), or by a committed object (reference claims /
-// non-spooled intent state). Best-effort: cleanup failure never fails the S3
-// operation; a stranded spool file is reapable later.
-func (b *Backend) cleanupPartBlobs(ctx context.Context, space did.DID, uploadID string, digests []mh.Multihash) {
+// replacement or a sibling part), or by a committed object (reference claims).
+// keep, when non-nil, overrides the live-parts derivation: Complete passes
+// the winning digests, whose part rows are retained for idempotency and
+// would otherwise mark every digest live. Best-effort: cleanup failure never
+// fails the S3 operation; a stranded spool file is reapable later.
+func (b *Backend) cleanupPartBlobs(ctx context.Context, space did.DID, uploadID string, digests []mh.Multihash, keep map[string]bool) {
 	if len(digests) == 0 {
 		return
 	}
 	// Digests still referenced by this session's live parts (after the
-	// abort/supersede that triggered this cleanup).
-	live := map[string]bool{}
-	if parts, err := b.multipart.ListParts(ctx, uploadID); err == nil {
+	// abort/supersede that triggered this cleanup). A listing failure aborts
+	// the whole cleanup: an empty live set would delete blobs a sibling part
+	// still references.
+	live := keep
+	if live == nil {
+		parts, err := b.multipart.ListParts(ctx, uploadID)
+		if err != nil {
+			b.logger.Warn("cleanup: list live parts failed; skipping cleanup",
+				zap.String("uploadID", uploadID), zap.Error(err))
+			return
+		}
+		live = map[string]bool{}
 		for _, p := range parts {
 			for _, d := range p.BlobDigests {
 				live[string(d)] = true
@@ -753,18 +803,18 @@ func (b *Backend) cleanupPartBlobs(ctx context.Context, space did.DID, uploadID 
 		if in, err := b.intents.GetIntent(ctx, d); err == nil {
 			state = in.State
 		}
-		if state != registry.IntentSpooled && state != registry.IntentParked {
-			// Accepted/published blobs are the reference index's to manage.
-			continue
-		}
-		// A parked blob is durable on its provider — release it there too
-		// (best-effort; the reject on piri is idempotent, a straggler is
-		// FIL-625's to reap). Cause is the /blob/add task link the
-		// upload service needs to locate the provider. A BlobAccepted
-		// refusal is benign — a concurrent session in this space accepted
-		// the same content, so the reference index owns the blob now — and
-		// the park row is obsolete either way.
-		if state == registry.IntentParked {
+		switch state {
+		case registry.IntentSpooled:
+			// Local only: the spool/intent/enc-params teardown below.
+		case registry.IntentParked:
+			// A parked blob is durable on its provider — release it there too
+			// (best-effort; the reject on piri is idempotent, a straggler is
+			// the provider's allocation-expiry GC's to reap). Cause is the
+			// /blob/add task link the upload service needs to locate the
+			// provider. A BlobAccepted refusal is benign — a concurrent
+			// session in this space accepted the same content, so the
+			// reference index owns the blob now — and the park row is
+			// obsolete either way.
 			if park, err := b.parks.GetPark(ctx, d); err == nil {
 				if cause, err := cid.Cast(park.AddTask); err == nil {
 					if aerr := b.deferred.AbortBlob(ctx, space, d, cause); aerr != nil {
@@ -777,6 +827,16 @@ func (b *Backend) cleanupPartBlobs(ctx context.Context, space did.DID, uploadID 
 						zap.String("digest", hex.EncodeToString(d)), zap.Error(derr))
 				}
 			}
+		case registry.IntentAccepted:
+			// Accepted with zero claims and zero part refs: nothing will ever
+			// revisit it — an orphaned part whose Complete omitted it, or a
+			// Complete whose conclude ran and commit failed. Release through
+			// the same path a superseded committed blob takes: enc-params +
+			// location + network remove.
+			b.releaseBlobs(ctx, space, []mh.Multihash{d})
+		default:
+			// Published blobs are the reference index's to manage.
+			continue
 		}
 		if rerr := b.spool.Remove(d); rerr != nil {
 			b.logger.Warn("remove spooled blob failed",
@@ -786,11 +846,14 @@ func (b *Backend) cleanupPartBlobs(ctx context.Context, space did.DID, uploadID 
 			b.logger.Warn("delete upload intent failed",
 				zap.String("digest", hex.EncodeToString(d)), zap.Error(derr))
 		}
-		// Crypto-shred the abandoned blob's wrapped CEK: nothing references
-		// it any more, and without the row the region cannot decrypt it.
-		if derr := b.encParams.DeleteEncryptionParams(ctx, space, d); derr != nil {
-			b.logger.Warn("delete encryption params failed",
-				zap.String("digest", hex.EncodeToString(d)), zap.Error(derr))
+		if state != registry.IntentAccepted {
+			// Crypto-shred the abandoned blob's wrapped CEK: nothing
+			// references it any more, and without the row the region cannot
+			// decrypt it. (The accepted arm shredded via releaseBlobs.)
+			if derr := b.encParams.DeleteEncryptionParams(ctx, space, d); derr != nil {
+				b.logger.Warn("delete encryption params failed",
+					zap.String("digest", hex.EncodeToString(d)), zap.Error(derr))
+			}
 		}
 	}
 }
@@ -1153,52 +1216,90 @@ func (b *Backend) ListMultipartUploads(ctx context.Context, input *s3.ListMultip
 
 // SweepStaleMultipartSessions aborts in-flight multipart sessions older than
 // ttl (dropping their spooled parts, exactly like a client Abort) and reaps
-// completed/aborting leftovers past the same age. Returns how many sessions
-// were cleaned. Called periodically by the daemon's sweeper loop.
+// completed leftovers past the same age. Sessions a crash stranded
+// mid-transition get the abort treatment too: a 'completing' row (Complete
+// died before the commit) and an 'aborting' row (Abort died before dropping
+// the session) still hold parts whose parked blobs must be released on their
+// providers — deleting the row alone would leave those allocations to sit
+// until expiry. Returns how many sessions were cleaned. Called periodically
+// by the daemon's sweeper loop.
 func (b *Backend) SweepStaleMultipartSessions(ctx context.Context, ttl time.Duration) (int, error) {
 	cutoff := time.Now().Add(-ttl)
 	cleaned := 0
-	// Stale open sessions: latch (losing gracefully to a concurrent
-	// Complete/Abort) and clean up like an abort.
-	stale, err := b.multipart.ListStaleSessions(ctx, registry.SessionOpen, cutoff)
-	if err != nil {
-		return 0, fmt.Errorf("s3frontend: sweep list: %w", err)
-	}
-	for _, s := range stale {
-		won, err := b.multipart.LatchSession(ctx, s.UploadID, registry.SessionOpen, registry.SessionAborting)
-		if err != nil || !won {
-			continue
-		}
-		var digests []mh.Multihash
-		if parts, err := b.multipart.ListParts(ctx, s.UploadID); err == nil {
-			for _, p := range parts {
-				digests = append(digests, p.BlobDigests...)
-			}
-		}
-		if err := b.multipart.DeleteSession(ctx, s.UploadID); err != nil {
-			continue
-		}
-		space, serr := b.bucketSpace(ctx, s.Bucket)
-		if serr != nil {
-			continue // bucket gone; spool rows are reapable later
-		}
-		b.cleanupPartBlobs(ctx, space, s.UploadID, digests)
-		cleaned++
-	}
-	// Terminal leftovers: completed sessions retained for Complete idempotency,
-	// and any 'completing'/'aborting' rows stranded by a crash mid-transition.
-	for _, state := range []string{registry.SessionCompleted, registry.SessionCompleting, registry.SessionAborting} {
-		leftovers, err := b.multipart.ListStaleSessions(ctx, state, cutoff)
+	// Stale open sessions and crash-stranded 'completing' rows: latch into
+	// 'aborting' (losing gracefully to a concurrent Complete/Abort) and clean
+	// up like an abort. A 'completing' row whose commit actually landed is
+	// safe here: its winners hold reference claims, which the cleanup skips.
+	for _, state := range []string{registry.SessionOpen, registry.SessionCompleting} {
+		stale, err := b.multipart.ListStaleSessions(ctx, state, cutoff)
 		if err != nil {
-			continue
+			return cleaned, fmt.Errorf("s3frontend: sweep list: %w", err)
 		}
-		for _, s := range leftovers {
-			if err := b.multipart.DeleteSession(ctx, s.UploadID); err == nil {
+		for _, s := range stale {
+			won, err := b.multipart.LatchSession(ctx, s.UploadID, state, registry.SessionAborting)
+			if err != nil || !won {
+				continue
+			}
+			if b.reapAbortingSession(ctx, s) {
 				cleaned++
 			}
 		}
 	}
+	// 'aborting' rows stranded by a crash between the latch and the session
+	// drop: the latch is already held, so just finish the cleanup.
+	stranded, err := b.multipart.ListStaleSessions(ctx, registry.SessionAborting, cutoff)
+	if err != nil {
+		return cleaned, fmt.Errorf("s3frontend: sweep list: %w", err)
+	}
+	for _, s := range stranded {
+		if b.reapAbortingSession(ctx, s) {
+			cleaned++
+		}
+	}
+	// Completed sessions, retained for Complete idempotency: Complete reaped
+	// their orphaned parts, and their winners belong to reference accounting —
+	// drop the row.
+	leftovers, err := b.multipart.ListStaleSessions(ctx, registry.SessionCompleted, cutoff)
+	if err != nil {
+		return cleaned, fmt.Errorf("s3frontend: sweep list: %w", err)
+	}
+	for _, s := range leftovers {
+		if err := b.multipart.DeleteSession(ctx, s.UploadID); err == nil {
+			cleaned++
+		}
+	}
 	return cleaned, nil
+}
+
+// reapAbortingSession drops a session already latched into 'aborting' and
+// releases its parts' now-unreferenced blobs — unallocating parked ones on
+// their providers via /blob/abort and releasing accepted-but-unclaimed ones
+// through the reference-release path (cleanupPartBlobs skips anything another
+// session or a committed object still references). Reports whether the
+// session row was removed; on a parts-listing failure the session stays
+// latched for the next sweep rather than being deleted blind (the part rows
+// are the only index to the blobs).
+func (b *Backend) reapAbortingSession(ctx context.Context, s registry.MultipartSession) bool {
+	// Snapshot the parts' blob digests before the cascade delete.
+	parts, err := b.multipart.ListParts(ctx, s.UploadID)
+	if err != nil {
+		b.logger.Warn("sweep: list parts failed; retrying next sweep",
+			zap.String("uploadID", s.UploadID), zap.Error(err))
+		return false
+	}
+	var digests []mh.Multihash
+	for _, p := range parts {
+		digests = append(digests, p.BlobDigests...)
+	}
+	if err := b.multipart.DeleteSession(ctx, s.UploadID); err != nil {
+		return false
+	}
+	space, err := b.bucketSpace(ctx, s.Bucket)
+	if err != nil {
+		return true // bucket gone; spool rows are reapable later
+	}
+	b.cleanupPartBlobs(ctx, space, s.UploadID, digests, nil)
+	return true
 }
 
 // etagsEqual compares two ETags ignoring surrounding quotes.
