@@ -1,0 +1,55 @@
+# Ingot daemon config for the multipart-expiry itest — smelt's default
+# forge-mode config (systems/ingot/config/config.yaml) with
+# multipart_session_ttl lowered to 30s so the abandoned-session sweeper
+# (which ticks at ttl/2) reaps an unfinished upload within the test's
+# budget. The low TTL also reaps COMPLETED sessions, so this config gets a
+# dedicated stack — never share it with tests that re-Complete uploads.
+# Mounted over /etc/ingot/config.yaml via stack.WithServiceConfig.
+
+# Port 80 inside the compose network: did:web:ingot resolves to
+# http://ingot:80/.well-known/did.json (smelt's did:web convention).
+addr: "0.0.0.0:80"
+region: us-west-1
+data_dir: /data
+
+root_access: ingot
+root_secret: ingotsecret
+
+# Agent identity: the key, wrapped as did:web:ingot; the listener serves the
+# matching DID document so hilt/sprue/piri can verify ingot's invocations.
+identity:
+  key_file: /keys/ingot.pem
+  service_id: did:web:ingot
+
+postgres_dsn: "postgres://ingot:ingot@ingot-postgres:5432/ingot?sslmode=disable"
+
+upload_service_url: "http://upload:80"
+upload_service_did: "did:web:upload"
+upload_receipts_url: "http://upload:80/receipt"
+
+indexer_endpoint: "http://indexer:80"
+indexer_did: "did:web:indexer"
+
+# S3 authorization service (hilt).
+auth_service_url: "http://hilt:80"
+auth_service_did: "did:web:hilt"
+# hilt → ingot delegations for /s3/request/authorize and /s3/bucket/*
+auth_service_proofs: "/proofs/hilt-ingot-s3-proof.txt"
+
+# The point of this config: reap abandoned multipart sessions fast.
+multipart_session_ttl: 30s
+
+# Region CEK wrap provider (required): the stack's ingot-openbao transit
+# engine, provisioned by ingot-openbao-init; the token arrives via
+# INGOT_REGIONKEY_OPENBAO_TOKEN from the compose environment.
+regionkey:
+  provider: openbao
+  openbao:
+    address: "http://ingot-openbao:8200"
+    mount: transit
+    key: region-kek
+
+# Tenant wrap key (FEE tenant recipient): resolved from the stack's PLC
+# directory; every write is encrypted to the tenant's #wrap key.
+tenantkey:
+  plc_directory_url: "http://plc:3000"
