@@ -18,18 +18,18 @@ import (
 	msbucket "github.com/fil-forge/ingot/bucket"
 )
 
-// TestForgeEncryption is FIL-495's end-to-end encryption suite: the
+// TestForgeEncryption is the end-to-end encryption suite: the
 // encryption-specific behaviors the round-trip and conformance tests don't
 // pin, against a forge-mode stack under the DEFAULT config (~254 MiB
 // max_blob_size, aesstream's 256 KiB chunks) — the tamper subtests depend on
 // a blob holding several chunks, which the smallblob config collapses.
 //
-// The skipped subtests at the bottom are the FIL-495 assertions blocked on
-// unbuilt features; each names its blocker so this file reads as the full
-// FIL-495 checklist. The remaining FIL-495 line items live elsewhere:
-// round trips and cross-part range GETs in TestForgeScenarios and the
-// versity tables, abort blob-cleanup in TestForgeScenarios and
-// TestForgeDeferredMultipart, the 5 GiB max part in TestForgeMaxSizePart.
+// The skipped subtests at the bottom are suite assertions blocked on
+// unbuilt features; each skip names the missing capability. Related
+// coverage lives elsewhere: round trips and cross-part range GETs in
+// TestForgeScenarios and the versity tables, abort blob-cleanup in
+// TestForgeScenarios and TestForgeDeferredMultipart, the 5 GiB max part in
+// TestForgeMaxSizePart.
 func TestForgeEncryption(t *testing.T) {
 	ctx := t.Context()
 	s, endpoint := forgeStack(t)
@@ -222,36 +222,37 @@ func TestForgeEncryption(t *testing.T) {
 		}
 	})
 
-	// --- FIL-495 assertions blocked on unbuilt features. Each skip names
-	// its blocker and the assertions to write when it lands. ---
+	// --- Suite assertions blocked on unbuilt features. Each skip names the
+	// missing capability and the assertions to write when it lands. ---
 
 	t.Run("ShredThenRead", func(t *testing.T) {
-		// When FIL-489 lands: DELETE destroys every segment's region-wrap
-		// row and queues the blobs for true deletion; GET/HEAD return
-		// NoSuchKey (already asserted above and in
+		// When DELETE cryptoshreds the object: DELETE destroys every
+		// segment's region-wrap row and queues the blobs for true deletion;
+		// GET/HEAD return NoSuchKey (already asserted above and in
 		// TestForgeDeleteReleasesNetworkBlob). ingot's own
 		// blob_encryption_params deletion exists today (s3frontend
 		// releaseBlobs); the region-wrap destruction does not.
-		t.Skip("blocked on FIL-489 (DELETE cryptoshreds the object)")
+		t.Skip("blocked on DELETE cryptoshred (region-wrap row destruction) — not implemented yet")
 	})
 
 	t.Run("OverwriteRace", func(t *testing.T) {
-		// When FIL-485 lands: a GET concurrent with an overwrite serves a
-		// consistent old or new object, never a mix, and the superseded
-		// generation's keys are shredded. The flip signal already exists
-		// upstream: CompleteMultipartUpload_racey_data_integrity sits in the
-		// versity XFail table (versity_multipart_test.go) and the ratchet
-		// flags it the moment atomicity lands.
-		t.Skip("blocked on FIL-485 (overwrite atomicity via generation swap)")
+		// When overwrite atomicity (generation swap) lands: a GET concurrent
+		// with an overwrite serves a consistent old or new object, never a
+		// mix, and the superseded generation's keys are shredded. The flip
+		// signal already exists upstream:
+		// CompleteMultipartUpload_racey_data_integrity sits in the versity
+		// XFail table (versity_multipart_test.go) and the ratchet flags it
+		// the moment atomicity lands.
+		t.Skip("blocked on overwrite atomicity via generation swap — not implemented yet")
 	})
 
 	t.Run("AbortShredsKeyRows", func(t *testing.T) {
-		// When FIL-484 lands: abort and abandoned-upload expiry shred the
-		// orphaned parts' key rows and queue their blobs for true deletion;
-		// re-uploading a part number does the same for the superseded part.
-		// Blob-side abort cleanup is already covered
+		// When multipart key-row hygiene lands: abort and abandoned-upload
+		// expiry shred the orphaned parts' key rows and queue their blobs
+		// for true deletion; re-uploading a part number does the same for
+		// the superseded part. Blob-side abort cleanup is already covered
 		// (MultipartAbortCleansSpool, TestForgeDeferredMultipart/AbortRejects).
-		t.Skip("blocked on FIL-484 (multipart hygiene: key-row shred)")
+		t.Skip("blocked on multipart key-row hygiene (abort/expiry shred) — not implemented yet")
 	})
 }
 
