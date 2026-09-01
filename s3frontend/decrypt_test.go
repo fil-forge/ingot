@@ -32,6 +32,7 @@ type encFixture struct {
 	body      msbucket.Body
 	plaintext []byte
 	spool     *blockstore.Spool
+	mem       *inmem.MemStore
 }
 
 // encChunkSize is deliberately the FEE minimum so short test blobs still
@@ -41,9 +42,8 @@ const encChunkSize = aesstream.MinChunkSize
 // newEncFixture splits plaintext into blobs of blobSize bytes, encrypts each
 // into a FEE envelope stored in a fresh spool under its ciphertext digest,
 // records the encryption params + location rows, and returns a Backend wired
-// with just the pieces the read path uses. plainBlobs marks blob indexes to
-// leave unencrypted, proving plain and encrypted blobs mix in one body.
-func newEncFixture(t *testing.T, plaintext []byte, blobSize int, plainBlobs ...int) *encFixture {
+// with just the pieces the read path uses.
+func newEncFixture(t *testing.T, plaintext []byte, blobSize int) *encFixture {
 	t.Helper()
 	ctx := context.Background()
 
@@ -58,59 +58,45 @@ func newEncFixture(t *testing.T, plaintext []byte, blobSize int, plainBlobs ...i
 	}
 	space := testutil.RandomDID(t)
 
-	plain := map[int]bool{}
-	for _, i := range plainBlobs {
-		plain[i] = true
-	}
-
 	var blobs []msbucket.BlobRef
-	for i, off := 0, 0; off < len(plaintext); i++ {
+	for off := 0; off < len(plaintext); {
 		end := off + blobSize
 		if end > len(plaintext) {
 			end = len(plaintext)
 		}
 		piece := plaintext[off:end]
 
-		var digest multihash.Multihash
-		if plain[i] {
-			digest, _, err = spool.WriteBlob(ctx, bytes.NewReader(piece))
-			if err != nil {
-				t.Fatalf("WriteBlob (plain): %v", err)
-			}
-		} else {
-			cek := randBytes(t, 32)
-			rc, desc, err := fee.EncryptWithCEK(bytes.NewReader(piece), cek, nil, fee.WithChunkSize(encChunkSize))
-			if err != nil {
-				t.Fatalf("EncryptWithCEK: %v", err)
-			}
-			var n int64
-			digest, n, err = spool.WriteBlob(ctx, rc)
-			if err != nil {
-				t.Fatalf("WriteBlob (envelope): %v", err)
-			}
-			_ = rc.Close()
+		cek := randBytes(t, 32)
+		rc, desc, err := fee.EncryptWithCEK(bytes.NewReader(piece), cek, nil, fee.WithChunkSize(encChunkSize))
+		if err != nil {
+			t.Fatalf("EncryptWithCEK: %v", err)
+		}
+		digest, n, err := spool.WriteBlob(ctx, rc)
+		if err != nil {
+			t.Fatalf("WriteBlob (envelope): %v", err)
+		}
+		_ = rc.Close()
 
-			wrapped, err := provider.Wrap(ctx, regionkey.BindingContext{Space: space, Digest: digest}, cek)
-			if err != nil {
-				t.Fatalf("Wrap CEK: %v", err)
-			}
-			if err := mem.PutEncryptionParams(ctx, registry.BlobEncryptionParams{
-				Space:            space,
-				Digest:           digest,
-				RegionWrappedCEK: wrapped.Ciphertext,
-				RegionKeyVersion: string(wrapped.Version),
-				HeaderLen:        desc.HeaderLen,
-				BaseNonce:        desc.BaseNonce,
-				ChunkSize:        int64(desc.ChunkSize),
-				AAD:              desc.AAD,
-			}); err != nil {
-				t.Fatalf("PutEncryptionParams: %v", err)
-			}
-			if err := mem.PutLocation(ctx, registry.BlobLocation{
-				Space: space, Digest: digest, Provider: "did:web:piri.test", URL: "http://piri.test/blob", Size: n,
-			}); err != nil {
-				t.Fatalf("PutLocation: %v", err)
-			}
+		wrapped, err := provider.Wrap(ctx, regionkey.BindingContext{Space: space, Digest: digest}, cek)
+		if err != nil {
+			t.Fatalf("Wrap CEK: %v", err)
+		}
+		if err := mem.PutEncryptionParams(ctx, registry.BlobEncryptionParams{
+			Space:            space,
+			Digest:           digest,
+			RegionWrappedCEK: wrapped.Ciphertext,
+			RegionKeyVersion: string(wrapped.Version),
+			HeaderLen:        desc.HeaderLen,
+			BaseNonce:        desc.BaseNonce,
+			ChunkSize:        int64(desc.ChunkSize),
+			AAD:              desc.AAD,
+		}); err != nil {
+			t.Fatalf("PutEncryptionParams: %v", err)
+		}
+		if err := mem.PutLocation(ctx, registry.BlobLocation{
+			Space: space, Digest: digest, Provider: "did:web:piri.test", URL: "http://piri.test/blob", Size: n,
+		}); err != nil {
+			t.Fatalf("PutLocation: %v", err)
 		}
 		blobs = append(blobs, msbucket.BlobRef{Digest: digest, Start: int64(off), End: int64(end - 1)})
 		off = end
@@ -128,6 +114,7 @@ func newEncFixture(t *testing.T, plaintext []byte, blobSize int, plainBlobs ...i
 		body:      msbucket.Body{Size: int64(len(plaintext)), Blobs: blobs},
 		plaintext: plaintext,
 		spool:     spool,
+		mem:       mem,
 	}
 }
 
@@ -208,22 +195,22 @@ func TestDecryptingRead_Ranges(t *testing.T) {
 	}
 }
 
-// Plain and encrypted blobs mix in one body: the opener dispatches per blob
-// on row existence.
-func TestDecryptingRead_MixedPlainAndEncrypted(t *testing.T) {
+// Fail closed: every body blob is written encrypted, so a referenced blob
+// with no encryption-params row (a shredded or lost row) is a request error
+// — never "stored as plaintext", which would stream the raw envelope bytes
+// under a 200.
+func TestDecryptingRead_MissingParamsRowFailsClosed(t *testing.T) {
 	ctx := context.Background()
-	fx := newEncFixture(t, patterned(24000), 10000, 1) // blob index 1 stays plaintext
+	fx := newEncFixture(t, patterned(24000), 10000)
 
-	opener, err := fx.backend.bodyOpener(ctx, fx.space, fx.body)
-	if err != nil {
-		t.Fatalf("bodyOpener: %v", err)
+	// Shred one blob's row out from under the body.
+	if err := fx.mem.DeleteEncryptionParams(ctx, fx.space, fx.body.Blobs[1].Digest); err != nil {
+		t.Fatalf("DeleteEncryptionParams: %v", err)
 	}
-	got, err := io.ReadAll(msbucket.OpenBodyRange(ctx, opener, fx.space, fx.body, 9500, 20500))
-	if err != nil {
-		t.Fatalf("range read: %v", err)
-	}
-	if !bytes.Equal(got, fx.plaintext[9500:20501]) {
-		t.Fatal("mixed-body range mismatch")
+	if _, err := fx.backend.bodyOpener(ctx, fx.space, fx.body); err == nil {
+		t.Fatal("bodyOpener over a shredded row succeeded — raw ciphertext would have been served")
+	} else if !strings.Contains(err.Error(), "no encryption-params row") {
+		t.Fatalf("bodyOpener error = %v, want the missing-row rejection", err)
 	}
 }
 

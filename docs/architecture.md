@@ -455,7 +455,7 @@ a walk over sub-blocks.
 The only serialized work is the commit critical section, and under versioning two writes to the same
 key produce distinct versionIds — they contend only on the guarded root swap, which retries cheaply.
 Across processes, the swap (a Postgres conditional update) is the cross-instance guard; `blob_refs`
-updates are transactional with the commit.
+updates land after the commit, best-effort — not inside the transaction.
 
 | Case | Handling |
 |---|---|

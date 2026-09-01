@@ -33,11 +33,15 @@ import (
 // decrypts that span as it streams (aesstream.SpanReader). Every range in
 // this file is HTTP-style inclusive [start, end].
 
-// bodyOpener returns the BlobRangeOpener for one request over body: the
-// plain opener when nothing is encrypted, or a decrypting opener carrying
-// the prefetched encryption state of every encrypted blob. Prefetching here
-// (rather than at first Read) surfaces missing-row/missing-location problems
-// as request errors, before any response headers are written.
+// bodyOpener returns the BlobRangeOpener for one request over body: a
+// decrypting opener carrying the prefetched encryption state of every blob
+// (the plain opener alone only for a body with no blobs). Every body blob
+// is written encrypted with its params row committed before the manifest,
+// so a referenced blob without a row is an error — never "stored as
+// plaintext": failing open there would stream raw envelope bytes under a
+// 200. Prefetching here (rather than at first Read) surfaces missing-row/
+// missing-location problems as request errors, before any response headers
+// are written.
 //
 // The encryption-params store and the region key provider are required
 // dependencies (validated at server construction): which implementation
@@ -59,7 +63,10 @@ func (b *Backend) bodyOpener(ctx context.Context, space did.DID, body msbucket.B
 		}
 		params, err := b.encParams.GetEncryptionParams(ctx, space, ref.Digest)
 		if errors.Is(err, registry.ErrNotFound) {
-			continue // stored as plaintext
+			// Fail closed: the row is the blob's decryption key material. A
+			// referenced blob without one is unreadable (a shredded or lost
+			// row), not plaintext.
+			return nil, fmt.Errorf("s3frontend: blob %x has no encryption-params row; refusing to serve ciphertext", ref.Digest)
 		}
 		if err != nil {
 			return nil, fmt.Errorf("s3frontend: encryption params for blob %x: %w", ref.Digest, err)
@@ -81,10 +88,9 @@ func (b *Backend) bodyOpener(ctx context.Context, space did.DID, body msbucket.B
 		return plain, nil
 	}
 	return &decryptingOpener{
-		plain: plain,
-		read:  b.read,
-		keys:  b.regionKeys,
-		enc:   enc,
+		read: b.read,
+		keys: b.regionKeys,
+		enc:  enc,
 	}, nil
 }
 
@@ -94,21 +100,20 @@ type encBlob struct {
 	storedSize int64 // whole stored blob: envelope header + ciphertext
 }
 
-// decryptingOpener serves each blob's plaintext range, dispatching per blob:
-// blobs with no encryption row go through the plain opener untouched; for
-// encrypted blobs it unwraps the CEK, fetches the covering ciphertext span,
-// and decrypts it in a streaming pass.
+// decryptingOpener serves each blob's plaintext range: it unwraps the CEK,
+// fetches the covering ciphertext span, and decrypts it in a streaming pass.
+// bodyOpener prefetched state for every blob of the body, so a digest absent
+// from enc is a bug — fail closed rather than fall through to raw bytes.
 type decryptingOpener struct {
-	plain msbucket.BlobRangeOpener
-	read  blockstore.BlobReader
-	keys  regionkey.Provider
-	enc   map[string]encBlob
+	read blockstore.BlobReader
+	keys regionkey.Provider
+	enc  map[string]encBlob
 }
 
 func (o *decryptingOpener) OpenBlobRange(ctx context.Context, space did.DID, ref msbucket.BlobRef, start, end int64) (io.ReadCloser, error) {
 	e, ok := o.enc[string(ref.Digest)]
 	if !ok {
-		return o.plain.OpenBlobRange(ctx, space, ref, start, end)
+		return nil, fmt.Errorf("s3frontend: blob %x has no prefetched encryption state; refusing to serve ciphertext", ref.Digest)
 	}
 
 	// The CEK's wrap is context-bound to (space, digest): a row transplanted
@@ -163,13 +168,15 @@ func (o *decryptingOpener) OpenBlobRange(ctx context.Context, space did.DID, ref
 
 // blobPlaintextLen reports how many plaintext bytes a stored blob decrypts
 // to: the FEE geometry derived from its encryption-params row and the stored
-// (envelope) byte count. A blob with no row is stored as plaintext, so the
-// stored size is the answer. Multipart Complete uses this to rebuild the
-// manifest's plaintext spans from upload_intents' stored sizes.
+// (envelope) byte count. Every body blob has a row; a missing one is an
+// error — treating it as plaintext would record the envelope byte count as
+// the manifest span, permanently corrupting the object's Size and every
+// range GET. Multipart Complete uses this to rebuild the manifest's
+// plaintext spans from upload_intents' stored sizes.
 func (b *Backend) blobPlaintextLen(ctx context.Context, space did.DID, digest multihash.Multihash, storedSize int64) (int64, error) {
 	params, err := b.encParams.GetEncryptionParams(ctx, space, digest)
 	if errors.Is(err, registry.ErrNotFound) {
-		return storedSize, nil
+		return 0, fmt.Errorf("blob %x has no encryption-params row", digest)
 	}
 	if err != nil {
 		return 0, fmt.Errorf("encryption params for blob %x: %w", digest, err)
