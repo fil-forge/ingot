@@ -260,9 +260,9 @@ func TestForgeEncryption(t *testing.T) {
 // one multipart part (21 internal blobs at the default max_blob_size), then
 // reads it back: HEAD size, ranged spot checks across every internal
 // boundary type, and a full stream-compared GET that GCM-verifies every
-// chunk of every blob. This test is why bucket.DefaultMaxBlobSize sits an
-// envelope allowance under piri's piece cap: the old 256 MiB default's FEE
-// envelope overshot the cap and piri rejected every allocation.
+// chunk of every blob. It is the end-to-end regression gate for
+// bucket.DefaultMaxBlobSize's envelope allowance: every max-size split's
+// FEE envelope must clear piri's piece cap on the real ship path.
 //
 // Gated behind INGOT_ITEST_BIG=1: it moves ~10-15 GiB through the Docker
 // stack (spool copy + piri copy; nothing reclaims the spool) and takes
