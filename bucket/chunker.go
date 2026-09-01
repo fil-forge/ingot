@@ -5,20 +5,34 @@ import (
 	"crypto/md5"
 	"crypto/sha256"
 	"fmt"
-	"github.com/fil-forge/ucantone/did"
 	"io"
+
+	blobcmds "github.com/fil-forge/libforge/commands/blob"
+	"github.com/fil-forge/ucantone/did"
 
 	"github.com/fil-forge/ingot/blockstore"
 )
 
-// DefaultMaxBlobSize is the blob ceiling used when callers don't supply one.
-// 256 MiB matches Piri's current single-blob limit (MaxMemtreeSize); objects
+// envelopeAllowance reserves room inside the network blob ceiling
+// (libforge blob.MaxBlobSize — the most raw bytes a default-configured piri
+// accepts in one piece) for encryption framing: what leaves the chunker is
+// plaintext, but what ships to piri is the FEE envelope — one 16-byte GCM
+// tag per 256 KiB aesstream chunk (~16 KiB at this blob size) plus a
+// ~211-byte single-recipient COSE header. 32 KiB is ~2× the actual
+// overhead; TestDefaultMaxBlobSizeFitsPiri pins that the sum really fits.
+const envelopeAllowance int64 = 32 << 10
+
+// DefaultMaxBlobSize is the blob ceiling used when callers don't supply one:
+// the largest split whose ENCRYPTED envelope still fits the network blob
+// ceiling. (The previous 256 MiB default was unshippable — its envelope
+// overshot piri's piece cap by ~2 MiB and piri rejected every allocation
+// with BlobSizeLimitExceeded; the 5 GiB max-part itest caught it.) Objects
 // larger than this are coarsely split into ≤ max blobs.
-const DefaultMaxBlobSize int64 = 256 << 20
+const DefaultMaxBlobSize int64 = blobcmds.MaxBlobSize - envelopeAllowance
 
 // SplitBody reads body bytes from r, splits them into blobs of at most
 // maxBlobSize bytes, and streams each blob to w — which hashes it and writes it
-// to local storage as it goes, so no blob is ever held whole in memory (a 256 MiB
+// to local storage as it goes, so no blob is ever held whole in memory (a ~254 MiB
 // blob buffered in RAM × concurrent PUTs would sink a memory-constrained
 // appliance). It returns a Body whose Blobs list covers [0, Size) contiguously;
 // the whole-body sha256 and md5 are computed in the same streaming pass. A

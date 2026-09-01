@@ -97,7 +97,7 @@ type BlockWriter interface {
 
 // BlobReader streams a stored object-body blob by its digest, without holding
 // the whole blob in memory — the read counterpart to BlobWriter. Body blobs run
-// up to max_blob_size (256 MiB), so the body read path (chunker.OpenBody) streams
+// up to max_blob_size (~254 MiB), so the body read path (chunker.OpenBody) streams
 // them rather than materializing each as a block.Block the way GetBlock would.
 // Returns ErrNotFound if the blob is not present in this tier. The caller owns
 // the returned reader and must Close it.

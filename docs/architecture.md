@@ -88,9 +88,10 @@ The design is shaped by how the Forge upload pipeline works and by a handful of 
   with no off-chain work. Removing one blob from a multi-blob aggregate has no on-chain primitive:
   the whole piece is removed, the survivors are re-hashed off-chain into a new aggregate, and that is
   re-registered. This asymmetry is why the size knobs ([§6](#6-the-forgechain-layer)) matter.
-- **The 256 MiB blob ceiling is a knob, not a wall.** Piri currently caps a blob at 256 MiB because
-  it builds the commP Merkle tree in RAM; known improvements (streaming commP) lift this. Ingot
-  treats it as a tunable maximum and splits larger objects.
+- **The blob ceiling is a knob, not a wall.** Piri currently caps a blob at 266338304 raw bytes
+  (~254 MiB — a 256 MiB padded piece minus Fr32 padding) because it builds the commP Merkle tree in
+  RAM; known improvements (streaming commP) lift this. Ingot treats it as a tunable maximum and
+  splits larger objects, defaulting just under the cap so the encryption envelope still fits.
 - **The delete primitives are built.** `/blob/remove` is handled end-to-end (Sprue forwards
   `/blob/release` to the nodes and deregisters; Piri releases the space's claim and defers physical
   deletion until the aggregate root retires on-chain via the signed `schedulePieceDeletions`
@@ -222,7 +223,7 @@ MST (bucket)
    each blob: its own on-chain PIECE if ≥ min, else a subroot in an aggregate
 ```
 
-*Example: a 600 MiB object split at `max_blob_size` = 256 MiB into three blobs. This is the manifest
+*Example: a 600 MiB object split at the default `max_blob_size` (~254 MiB) into three blobs. This is the manifest
 shape `bucket/manifest.go` now implements (`Body.Blobs[]`, a stored S3 `etag`, an additional-checksum
 field, and a reserved nullable `IndexRoot`); a `deleteMarker` field is reserved for versioning, which
 is deferred ([§12](#12-implementation-status--postponed-items)).*
@@ -312,8 +313,10 @@ composition (not storage — every blob is stored whole regardless):
 - **`min_aggregate_size`** — the deletion-granularity knob (today a hardcoded 128 MiB). A blob
   **≥ min** becomes its **own** on-chain piece. A blob **< min** is folded with other small blobs
   into a shared aggregate piece (built up to ~min).
-- **`max_blob_size`** — the largest blob Piri accepts (currently 256 MiB, liftable). Larger objects
-  are split into `≤ max` blobs by the data layer.
+- **`max_blob_size`** — bounded by the largest blob Piri accepts (266338304 raw bytes ≈ 254 MiB —
+  127/128 of its 256 MiB padded memtree ceiling — liftable). Ingot's default sits an envelope
+  allowance under it (`bucket.DefaultMaxBlobSize`); larger objects are split into `≤ max` blobs by
+  the data layer.
 
 `min` is the central lever because on-chain cost is **count-driven, not size-driven** (pdp-sim). A
 small `min` means most objects are their own piece, so most deletes are O(1) (below); the price is

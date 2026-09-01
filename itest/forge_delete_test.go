@@ -3,13 +3,10 @@
 package itest
 
 import (
-	"context"
-	"strings"
 	"testing"
 	"time"
 
 	ingottest "github.com/fil-forge/ingot/testing"
-	"github.com/fil-forge/smelt/pkg/stack"
 )
 
 // TestForgeDeleteReleasesNetworkBlob is the delete-finality regression gate
@@ -73,22 +70,4 @@ func TestForgeDeleteReleasesNetworkBlob(t *testing.T) {
 	waitForPiriLog(t, ctx, s, "queueing piece removal", 2*time.Minute)
 	waitForPiriLog(t, ctx, s, "finalized piece removal", 3*time.Minute)
 	t.Logf("delete finality OK: /blob/release executed on piri and the sweep finalized the byte release")
-}
-
-// waitForPiriLog polls piri-0's container logs until substr appears.
-func waitForPiriLog(t *testing.T, ctx context.Context, s *stack.Stack, substr string, timeout time.Duration) {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		logs, err := s.Logs(ctx, "piri-0")
-		if err == nil && strings.Contains(logs, substr) {
-			return
-		}
-		select {
-		case <-ctx.Done():
-			t.Fatalf("context done waiting for piri log %q: %v", substr, ctx.Err())
-		case <-time.After(2 * time.Second):
-		}
-	}
-	t.Fatalf("piri-0 logs never contained %q within %s", substr, timeout)
 }

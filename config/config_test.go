@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/fil-forge/ingot/bucket"
 	blobcmds "github.com/fil-forge/libforge/commands/blob"
 	"github.com/fil-forge/ucantone/multikey/ed25519"
 	"github.com/fil-forge/ucantone/ucan"
@@ -157,6 +158,24 @@ func TestValidate_RegionKey(t *testing.T) {
 	cfg.RegionKey.Provider = "inprocess" // empty KEK: generated at startup
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("expected valid inprocess config with no KEK, got: %v", err)
+	}
+}
+
+// TestValidate_MaxBlobSize: a max_blob_size whose encrypted envelope cannot
+// ship to a default-configured piri fails at startup, not at the first PUT's
+// BlobSizeLimitExceeded. The default (and zero) pass.
+func TestValidate_MaxBlobSize(t *testing.T) {
+	cfg := validConfig(t)
+	cfg.MaxBlobSize = bucket.DefaultMaxBlobSize
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected the default max_blob_size to validate, got: %v", err)
+	}
+
+	cfg = validConfig(t)
+	cfg.MaxBlobSize = 256 << 20 // the old default; its envelope overshoots piri's cap
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "piece cap") {
+		t.Fatalf("expected a piece-cap error for a 256 MiB max_blob_size, got: %v", err)
 	}
 }
 
