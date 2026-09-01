@@ -158,6 +158,85 @@ func withSmallBlobConfig() stack.Option {
 	return stack.WithServiceConfig("ingot", "testdata/config-smallblob.yaml")
 }
 
+// withMultipartTTLConfig mounts testdata/config-mpttl.yaml —
+// multipart_session_ttl at 30s so the abandoned-session sweeper reaps an
+// unfinished upload within a test's budget. Dedicated stacks only: the low
+// TTL also reaps completed sessions.
+func withMultipartTTLConfig() stack.Option {
+	return stack.WithServiceConfig("ingot", "testdata/config-mpttl.yaml")
+}
+
+// ingotSQL runs one SQL statement against ingot's Postgres and returns the
+// bare psql output (rows, newline-separated). Digests round-trip as hex:
+// encode(digest,'hex') out, decode('<hex>','hex') in.
+func ingotSQL(t *testing.T, ctx context.Context, s *stack.Stack, q string) string {
+	t.Helper()
+	out, errOut, err := s.Exec(ctx, "ingot-postgres", "psql", "-U", "ingot", "-d", "ingot", "-tAc", q)
+	if err != nil {
+		t.Fatalf("ingot sql %q: %v (stderr=%s)", q, err, errOut)
+	}
+	return strings.TrimSpace(out)
+}
+
+// countRowsForDigests counts the rows of table whose digest column matches
+// any of the hex-encoded digests.
+func countRowsForDigests(t *testing.T, ctx context.Context, s *stack.Stack, table, digestCol string, hexDigests []string) int {
+	t.Helper()
+	if len(hexDigests) == 0 {
+		t.Fatalf("countRowsForDigests: no digests given")
+	}
+	terms := make([]string, len(hexDigests))
+	for i, h := range hexDigests {
+		terms[i] = fmt.Sprintf("decode('%s','hex')", h)
+	}
+	q := fmt.Sprintf("SELECT count(*) FROM %s WHERE %s IN (%s)", table, digestCol, strings.Join(terms, ","))
+	n, err := strconv.Atoi(ingotSQL(t, ctx, s, q))
+	if err != nil {
+		t.Fatalf("parse count from %s: %v", table, err)
+	}
+	return n
+}
+
+// objectBlobDigestsHex reads a committed object's body-blob digests
+// (hex-encoded ciphertext multihashes) from ingot's reference index.
+func objectBlobDigestsHex(t *testing.T, ctx context.Context, s *stack.Stack, bucket, key string) []string {
+	t.Helper()
+	q := fmt.Sprintf(`SELECT DISTINCT encode(digest,'hex') FROM ingot.blob_refs WHERE bucket = '%s' AND object_key = '%s'`, bucket, key)
+	out := ingotSQL(t, ctx, s, q)
+	var digests []string
+	for _, line := range strings.Split(out, "\n") {
+		if line != "" {
+			digests = append(digests, line)
+		}
+	}
+	if len(digests) == 0 {
+		t.Fatalf("no blob_refs rows for %s/%s", bucket, key)
+	}
+	return digests
+}
+
+// partBlobDigestsHex reads one uploaded part's stored blob digests from
+// ingot's Postgres as hex — the form that round-trips SQL (the base58 twin,
+// partBlobDigests, matches piri's log format instead). Capture BEFORE abort
+// or supersede: both destroy the multipart_parts rows.
+func partBlobDigestsHex(t *testing.T, ctx context.Context, s *stack.Stack, uploadID string, partNumber int32) []string {
+	t.Helper()
+	q := fmt.Sprintf(
+		`SELECT encode(d, 'hex') FROM ingot.multipart_parts, unnest(blob_digests) AS d WHERE upload_id = '%s' AND part_number = %d`,
+		uploadID, partNumber)
+	out := ingotSQL(t, ctx, s, q)
+	var digests []string
+	for _, line := range strings.Split(out, "\n") {
+		if line != "" {
+			digests = append(digests, line)
+		}
+	}
+	if len(digests) == 0 {
+		t.Fatalf("no blob digests recorded for upload %s part %d", uploadID, partNumber)
+	}
+	return digests
+}
+
 // forgeConfig is the roundtrip-helper config for a stack-deployed ingot,
 // signing with the given hilt-issued tenant credentials.
 func forgeConfig(endpoint, accessKey, secretKey string) ingottest.Config {
