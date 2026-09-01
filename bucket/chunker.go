@@ -24,10 +24,10 @@ const envelopeAllowance int64 = 32 << 10
 
 // DefaultMaxBlobSize is the blob ceiling used when callers don't supply one:
 // the largest split whose ENCRYPTED envelope still fits the network blob
-// ceiling. (The previous 256 MiB default was unshippable — its envelope
-// overshot piri's piece cap by ~2 MiB and piri rejected every allocation
-// with BlobSizeLimitExceeded; the 5 GiB max-part itest caught it.) Objects
-// larger than this are coarsely split into ≤ max blobs.
+// ceiling — a split at the ceiling itself would overshoot it once the
+// envelope framing is added, and piri rejects the allocation with
+// BlobSizeLimitExceeded. Objects larger than this are coarsely split into
+// ≤ max blobs.
 const DefaultMaxBlobSize int64 = blobcmds.MaxBlobSize - envelopeAllowance
 
 // SplitBody reads body bytes from r, splits them into blobs of at most

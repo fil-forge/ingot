@@ -30,9 +30,10 @@ func TestDefaultMaxBlobSizeFitsPiri(t *testing.T) {
 	if enc > blobcmds.MaxBlobSize {
 		t.Fatalf("DefaultMaxBlobSize %d: envelope %d exceeds the network blob ceiling %d", DefaultMaxBlobSize, enc, int64(blobcmds.MaxBlobSize))
 	}
-	// And the old default really is over the ceiling — the bug this guards.
+	// And the allowance is not vacuous: a split at a round 256 MiB — over
+	// the ceiling by less than the allowance — must NOT fit once framed.
 	if enc := aesstream.EncryptedSize(256<<20, aesstream.DefaultChunkSize); enc <= blobcmds.MaxBlobSize {
-		t.Fatalf("a 256 MiB blob's envelope (%d) unexpectedly fits the ceiling %d — revisit DefaultMaxBlobSize", enc, int64(blobcmds.MaxBlobSize))
+		t.Fatalf("a 256 MiB blob's envelope (%d) fits the ceiling %d — revisit DefaultMaxBlobSize", enc, int64(blobcmds.MaxBlobSize))
 	}
 }
 

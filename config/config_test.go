@@ -172,7 +172,7 @@ func TestValidate_MaxBlobSize(t *testing.T) {
 	}
 
 	cfg = validConfig(t)
-	cfg.MaxBlobSize = 256 << 20 // the old default; its envelope overshoots piri's cap
+	cfg.MaxBlobSize = 256 << 20 // over the ceiling once the envelope framing is added
 	err := cfg.Validate()
 	if err == nil || !strings.Contains(err.Error(), "piece cap") {
 		t.Fatalf("expected a piece-cap error for a 256 MiB max_blob_size, got: %v", err)
