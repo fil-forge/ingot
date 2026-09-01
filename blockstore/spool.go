@@ -64,7 +64,7 @@ func (s *Spool) Remove(digest mh.Multihash) error {
 
 // WriteBlob streams r to the spool, computing its sha256 digest as it writes so
 // the blob is never held whole in memory (object-body blobs run up to
-// max_blob_size = 256 MiB; buffering them would put that × concurrency in RAM).
+// max_blob_size ≈ 254 MiB; buffering them would put that × concurrency in RAM).
 // The write is atomic (temp file → rename to the digest path), so a crash leaves
 // no partial blob readable under its digest. An empty r writes nothing and
 // returns a nil digest with n == 0 (a zero-byte object has no blob). Re-writing

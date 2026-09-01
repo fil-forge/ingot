@@ -86,7 +86,7 @@ jobs:
     # from under us. The runner's preinstalled Docker is 28.x, well past
     # smelt's 25+ requirement.
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 45
 
     steps:
       - name: Check out the repository
@@ -102,13 +102,24 @@ jobs:
           docker version
           docker compose version
 
+      - name: Free runner disk space
+        # The 5 GiB max-part test (INGOT_ITEST_BIG) churns ~10-15 GiB
+        # (spool copy + piri copy); drop the runner's preinstalled bloat
+        # so it fits alongside the stack images.
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
       - name: Run integration tests
         # GOWORK=off matches the Makefile convention (a parent go.work may
         # declare a newer Go than the toolchain). The harness builds the
         # working-tree binary itself (itest/stack_test.go).
+        # INGOT_ITEST_BIG enables the 5 GiB max-part test, which local
+        # `make itest` runs skip (itest/README.md).
         env:
           GOWORK: off
-        run: go test -tags itest -v -timeout 20m ./itest
+          INGOT_ITEST_BIG: 1
+        run: go test -tags itest -v -timeout 40m ./itest
 
       - name: Dump container state on failure
         if: failure()
