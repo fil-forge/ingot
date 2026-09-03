@@ -8,8 +8,8 @@ import (
 
 // Multipart groups of the S3 conformance partition, partitioned empirically
 // against the forge-mode stack (see the curation note in README.md). The
-// remaining xfail surface: ACL on create (FIL-525), the UploadPartCopy group
-// (FIL-586), and one load-sensitive concurrency case.
+// remaining xfail surface: ACL on create (FIL-525) and the UploadPartCopy
+// group (FIL-586).
 
 var createMultipartPass = []forgeCase{
 	{name: "non_existing_bucket", fn: integration.CreateMultipartUpload_non_existing_bucket},
@@ -155,6 +155,10 @@ var completeMultipartPass = []forgeCase{
 	{name: "with_metadata", fn: integration.CompleteMultipartUpload_with_metadata},
 	{name: "success", fn: integration.CompleteMultipartUpload_success},
 	{name: "already_completed", fn: integration.CompleteMultipartUpload_already_completed},
+	// Concurrent Completes of one upload: latch losers wait for the winner's
+	// terminal state and replay its result, so all five racers return the
+	// identical ETag.
+	{name: "racey_data_integrity", fn: integration.CompleteMultipartUpload_racey_data_integrity},
 	// The conditional matrix's overwrite chains release superseded blobs:
 	// needs hilt ≥ #37 (blob.Remove in the write set) and smelt ≥ #19 (the
 	// piri blob/release delegation) so the releases carry proofs end-to-end.
@@ -168,7 +172,4 @@ var completeMultipartPass = []forgeCase{
 	}},
 }
 
-// racey_data_integrity leans on atomic concurrent overwrites under load.
-var completeMultipartXFail = []forgeCase{
-	{name: "racey_data_integrity", fn: integration.CompleteMultipartUpload_racey_data_integrity},
-}
+var completeMultipartXFail = []forgeCase{}

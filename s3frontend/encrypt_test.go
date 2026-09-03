@@ -170,6 +170,7 @@ func TestEncryptedWrite_DeleteShredsParams(t *testing.T) {
 	}
 
 	deleteObj(t, b, "k1")
+	drainReleases(t, b) // the release is deferred; the sweep executes it
 	if _, err := mem.GetEncryptionParams(ctx, did.Undef, d); err == nil {
 		t.Fatalf("params row survived the last-claim release; want it crypto-shredded")
 	}

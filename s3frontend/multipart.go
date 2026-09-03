@@ -495,25 +495,76 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 		}
 	}
 
-	// Idempotent re-Complete: the prior Complete committed the object; the
-	// validation above already proved the client's part list matches the
-	// retained parts, so return the same result without recommitting.
-	if sess.State == registry.SessionCompleted {
-		etagQ := `"` + etag + `"`
-		res := s3response.CompleteMultipartUploadResult{Bucket: &bucket, Key: &key, ETag: &etagQ}
-		setCompleteResultChecksum(&res, ckAlgo, ckValue, ckType)
-		return res, "", nil
+	// Idempotent re-Complete + the single-winner latch (§7.3), in one bounded
+	// loop: only the writer that moves the session off 'open' commits; a
+	// caller racing the winner waits for its terminal state and replays its
+	// result instead of failing with NoSuchUpload (concurrent Completes of
+	// one upload must all return the winner's ETag). Session fields are
+	// immutable after create and part rows are retained through completion
+	// (the orphan reap touches blobs, never rows), so nothing above this
+	// loop needs re-deriving — and the conditional-write precheck must NOT
+	// re-run here: after the winner commits it would newly fail an
+	// If-None-Match loser. The wall-clock and iteration caps bound both a
+	// revert-livelock and the poll's request occupancy (no request deadline
+	// exists to inherit).
+	completeWon := false
+	{
+		const (
+			replayWaitBudget = 10 * time.Second
+			replayMaxTries   = 64
+		)
+		backoff := 5 * time.Millisecond
+		deadline := time.Now().Add(replayWaitBudget)
+		state := sess.State
+		for tries := 0; ; tries++ {
+			if state == registry.SessionCompleted {
+				// The prior Complete committed; the validation above proved
+				// the caller's part list against the retained parts. Guard
+				// against a divergent list that happens to validate: the
+				// derived ETag must match the committed object's.
+				if rv, rerr := b.resolveVersion(ctx, bucket, key, ""); rerr == nil && !rv.mf.DeleteMarker && !etagsEqual(etagOf(rv.mf), etag) {
+					return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrInvalidPart)
+				}
+				etagQ := `"` + etag + `"`
+				res := s3response.CompleteMultipartUploadResult{Bucket: &bucket, Key: &key, ETag: &etagQ}
+				setCompleteResultChecksum(&res, ckAlgo, ckValue, ckType)
+				return res, "", nil
+			}
+			if state == registry.SessionOpen {
+				won, err := b.multipart.LatchSession(ctx, uploadID, registry.SessionOpen, registry.SessionCompleting)
+				if err != nil {
+					return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: latch: %w", err)
+				}
+				if won {
+					completeWon = true
+					break
+				}
+			}
+			if state == registry.SessionAborting {
+				return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrNoSuchUpload)
+			}
+			if tries >= replayMaxTries || time.Now().After(deadline) {
+				return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrNoSuchUpload)
+			}
+			select {
+			case <-ctx.Done():
+				return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: complete wait: %w", ctx.Err())
+			case <-time.After(backoff):
+			}
+			if backoff < 200*time.Millisecond {
+				backoff *= 2
+			}
+			s2, err := b.multipart.GetSession(ctx, uploadID)
+			if errors.Is(err, registry.ErrNotFound) {
+				return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrNoSuchUpload)
+			}
+			if err != nil {
+				return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: session poll: %w", err)
+			}
+			state = s2.State
+		}
 	}
-
-	// Single-winner latch vs a racing Abort: only the writer that moves the
-	// session off 'open' proceeds (§7.3).
-	won, err := b.multipart.LatchSession(ctx, uploadID, registry.SessionOpen, registry.SessionCompleting)
-	if err != nil {
-		return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: latch: %w", err)
-	}
-	if !won {
-		return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrNoSuchUpload)
-	}
+	_ = completeWon
 	// If anything below fails before the object is committed, revert the session
 	// to 'open' so the upload stays abortable / retriable rather than zombied in
 	// 'completing'. committed is set once the manifest is durable (the point of
@@ -831,9 +882,12 @@ func (b *Backend) cleanupPartBlobs(ctx context.Context, space did.DID, uploadID 
 			// Accepted with zero claims and zero part refs: nothing will ever
 			// revisit it — an orphaned part whose Complete omitted it, or a
 			// Complete whose conclude ran and commit failed. Release through
-			// the same path a superseded committed blob takes: enc-params +
-			// location + network remove.
-			b.releaseBlobs(ctx, space, []mh.Multihash{d})
+			// the same deferred path a superseded committed blob takes
+			// (enc-params + location + network remove, at the sweep).
+			if err := b.pendingReleases.EnqueueRelease(ctx, space, d, time.Now().Add(b.releaseGrace)); err != nil {
+				b.logger.Warn("enqueue release for accepted part blob failed",
+					zap.String("digest", hex.EncodeToString(d)), zap.Error(err))
+			}
 		default:
 			// Published blobs are the reference index's to manage.
 			continue

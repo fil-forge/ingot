@@ -26,6 +26,7 @@ var (
 	_ registry.MultipartStore        = (*MemStore)(nil)
 	_ registry.GCStore               = (*MemStore)(nil)
 	_ registry.RevocationCursorStore = (*MemStore)(nil)
+	_ registry.PendingReleaseStore   = (*MemStore)(nil)
 )
 
 // BlobRefStore ===============================================================
@@ -49,6 +50,10 @@ func (m *MemStore) DeleteBlobClaim(_ context.Context, digest multihash.Multihash
 func (m *MemStore) CountClaims(_ context.Context, space did.DID, digest multihash.Multihash) (int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.countClaimsLocked(space, digest), nil
+}
+
+func (m *MemStore) countClaimsLocked(space did.DID, digest multihash.Multihash) int {
 	d := string(digest)
 	n := 0
 	for k, c := range m.blobRefs {
@@ -56,7 +61,73 @@ func (m *MemStore) CountClaims(_ context.Context, space did.DID, digest multihas
 			n++
 		}
 	}
-	return n, nil
+	return n
+}
+
+func (m *MemStore) DropClaimEnqueueRelease(_ context.Context, digest multihash.Multihash, bucket, objectKey, versionID string, space did.DID, notBefore time.Time) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.blobRefs, claimKey{string(digest), bucket, objectKey, versionID})
+	if m.countClaimsLocked(space, digest) != 0 {
+		return false, nil
+	}
+	m.enqueueReleaseLocked(space, digest, notBefore)
+	return true, nil
+}
+
+// PendingReleaseStore =========================================================
+
+func (m *MemStore) EnqueueRelease(_ context.Context, space did.DID, digest multihash.Multihash, notBefore time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.enqueueReleaseLocked(space, digest, notBefore)
+	return nil
+}
+
+func (m *MemStore) enqueueReleaseLocked(space did.DID, digest multihash.Multihash, notBefore time.Time) {
+	k := locKey{space, string(digest)}
+	if prior, ok := m.releases[k]; ok && prior.NotBefore.After(notBefore) {
+		notBefore = prior.NotBefore // upsert keeps the later not_before
+	}
+	m.releases[k] = registry.PendingRelease{
+		Space: space, Digest: multihash.Multihash(bytes.Clone(digest)), NotBefore: notBefore,
+	}
+}
+
+func (m *MemStore) ListDueReleases(_ context.Context, now time.Time, limit int) ([]registry.PendingRelease, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []registry.PendingRelease
+	for _, pr := range m.releases {
+		if !pr.NotBefore.After(now) {
+			out = append(out, pr)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].NotBefore.Before(out[j].NotBefore) })
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+func (m *MemStore) ListReleasesBySpace(_ context.Context, space did.DID) ([]registry.PendingRelease, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []registry.PendingRelease
+	for k, pr := range m.releases {
+		if k.space == space {
+			out = append(out, pr)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].NotBefore.Before(out[j].NotBefore) })
+	return out, nil
+}
+
+func (m *MemStore) DeleteRelease(_ context.Context, space did.DID, digest multihash.Multihash) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.releases, locKey{space, string(digest)})
+	return nil
 }
 
 // IntentStore ================================================================

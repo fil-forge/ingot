@@ -5,11 +5,13 @@ package itest
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
 	"io"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -28,11 +30,9 @@ import (
 // max_blob_size, aesstream's 256 KiB chunks) — the tamper subtests depend on
 // a blob holding several chunks, which the smallblob config collapses.
 //
-// One subtest (OverwriteRace) stays skipped, blocked on overwrite
-// atomicity; its skip names the missing capability. Related coverage lives
-// elsewhere: round trips and cross-part range GETs in TestForgeScenarios
-// and the versity tables, abort blob-cleanup in TestForgeScenarios and
-// TestForgeDeferredMultipart, expiry-sweep shred in
+// Related coverage lives elsewhere: round trips and cross-part range GETs
+// in TestForgeScenarios and the versity tables, abort blob-cleanup in
+// TestForgeScenarios and TestForgeDeferredMultipart, expiry-sweep shred in
 // TestForgeMultipartExpiryShred, the 5 GiB max part in
 // TestForgeMaxSizePart.
 func TestForgeEncryption(t *testing.T) {
@@ -292,16 +292,24 @@ func TestForgeEncryption(t *testing.T) {
 			t.Fatalf("HEAD after delete succeeded, want NotFound")
 		}
 
-		// The shred: region-wrap rows, location rows, and claims all gone.
-		if n := countRowsForDigests(t, ctx, s, "ingot.blob_encryption_params", "digest", digests); n != 0 {
-			t.Fatalf("%d enc-params rows survived the delete — crypto-shred incomplete", n)
-		}
-		if n := countRowsForDigests(t, ctx, s, "ingot.blob_locations", "digest", digests); n != 0 {
-			t.Fatalf("%d blob_locations rows survived the delete", n)
-		}
+		// The claims drop synchronously with the delete; the shred (enc-params
+		// + location rows) is deferred behind the release grace (60s default)
+		// and executed by the release sweeper — poll it through.
 		refsQ := fmt.Sprintf(`SELECT count(*) FROM ingot.blob_refs WHERE bucket = '%s' AND object_key = '%s'`, bucket, key)
 		if out := ingotSQL(t, ctx, s, refsQ); out != "0" {
 			t.Fatalf("%s blob_refs rows survived the delete", out)
+		}
+		shredDeadline := time.Now().Add(3 * time.Minute)
+		for {
+			enc := countRowsForDigests(t, ctx, s, "ingot.blob_encryption_params", "digest", digests)
+			loc := countRowsForDigests(t, ctx, s, "ingot.blob_locations", "digest", digests)
+			if enc == 0 && loc == 0 {
+				break
+			}
+			if time.Now().After(shredDeadline) {
+				t.Fatalf("deferred shred never executed: %d enc-params + %d location rows survive", enc, loc)
+			}
+			time.Sleep(5 * time.Second)
 		}
 
 		// The insurance copy: nothing removes spool files on delete, and the
@@ -471,19 +479,101 @@ func TestForgeEncryption(t *testing.T) {
 		t.Logf("Complete reaped %d orphan part blobs; winner round-trips", len(orphan))
 	})
 
+	// OverwriteRace: a GET concurrent with an overwrite serves exactly the
+	// old or the new object — length, sha256, and ETag from one generation,
+	// never a mix, a short read, or an error. The guarantees under test: the
+	// catalog root swap is atomic; each generation's claims are keyed
+	// per-generation; and the superseded generation's enc-params/location
+	// rows are shredded only after the release grace, so readers holding the
+	// prior root finish first.
 	t.Run("OverwriteRace", func(t *testing.T) {
-		// When overwrite atomicity lands — deferred blob release (a grace
-		// window so readers holding the prior catalog root finish before its
-		// enc-params/location rows are shredded) and per-generation
-		// blob_refs identity (unversioned generations currently share one
-		// claim row) — assert: a GET concurrent with an overwrite serves
-		// exactly the old or the new object (length, sha256, ETag), never a
-		// mix, a short read, or an error; afterwards the superseded
-		// generation's enc-params and location rows are gone while digests
-		// shared with the new body survive. Reader-side prerequisite:
-		// fail-closed decryption — a missing enc-params row currently falls
-		// through to a plaintext opener and would serve raw envelope bytes.
-		t.Skip("blocked on overwrite atomicity (deferred blob release + per-generation claim identity) — not implemented yet")
+		const bucket, key = "overwrite-race", "obj"
+		if _, err := cl.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
+			t.Fatalf("CreateBucket: %v", err)
+		}
+		oldData := tagged(patternBytes(1<<20), 0x51)
+		newData := tagged(patternBytes(1<<20+64<<10), 0x62) // different length amplifies mix detection
+		oldETag, newETag := quotedMD5(oldData), quotedMD5(newData)
+		oldSum, newSum := sha256.Sum256(oldData), sha256.Sum256(newData)
+
+		if _, err := cl.PutObject(ctx, &s3.PutObjectInput{
+			Bucket: aws.String(bucket), Key: aws.String(key), Body: bytes.NewReader(oldData),
+		}); err != nil {
+			t.Fatalf("PutObject (old): %v", err)
+		}
+		oldDigests := objectBlobDigestsHex(t, ctx, s, bucket, key)
+
+		start := make(chan struct{})
+		stop := make(chan struct{})
+		violations := make(chan string, 16)
+		var wg sync.WaitGroup
+		for i := 0; i < 4; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				for {
+					select {
+					case <-stop:
+						return
+					default:
+					}
+					out, err := cl.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(bucket), Key: aws.String(key)})
+					if err != nil {
+						violations <- fmt.Sprintf("GET error during overwrite: %v", err)
+						return
+					}
+					body, rerr := io.ReadAll(out.Body)
+					_ = out.Body.Close()
+					if rerr != nil {
+						violations <- fmt.Sprintf("body read error during overwrite: %v", rerr)
+						return
+					}
+					etag := aws.ToString(out.ETag)
+					sum := sha256.Sum256(body)
+					oldOK := len(body) == len(oldData) && sum == oldSum && etag == oldETag
+					newOK := len(body) == len(newData) && sum == newSum && etag == newETag
+					if !oldOK && !newOK {
+						violations <- fmt.Sprintf("mixed read: %d bytes, etag %s", len(body), etag)
+						return
+					}
+				}
+			}()
+		}
+		close(start)
+		if _, err := cl.PutObject(ctx, &s3.PutObjectInput{
+			Bucket: aws.String(bucket), Key: aws.String(key), Body: bytes.NewReader(newData),
+		}); err != nil {
+			t.Fatalf("PutObject (overwrite): %v", err)
+		}
+		time.Sleep(500 * time.Millisecond) // a few post-swap reads
+		close(stop)
+		wg.Wait()
+		close(violations)
+		for v := range violations {
+			t.Errorf("%s", v)
+		}
+		if t.Failed() {
+			t.FailNow()
+		}
+
+		if got := getBody(t, ctx, cl, bucket, key, ""); !bytes.Equal(got, newData) {
+			t.Fatalf("final GET is not the new object (%d bytes)", len(got))
+		}
+		// The superseded generation's rows shred after the release grace.
+		shredDeadline := time.Now().Add(3 * time.Minute)
+		for {
+			enc := countRowsForDigests(t, ctx, s, "ingot.blob_encryption_params", "digest", oldDigests)
+			loc := countRowsForDigests(t, ctx, s, "ingot.blob_locations", "digest", oldDigests)
+			if enc == 0 && loc == 0 {
+				break
+			}
+			if time.Now().After(shredDeadline) {
+				t.Fatalf("superseded generation never shredded: %d enc-params + %d location rows survive", enc, loc)
+			}
+			time.Sleep(5 * time.Second)
+		}
+		t.Logf("overwrite race clean: every concurrent read was exactly old or new; superseded generation shredded")
 	})
 }
 

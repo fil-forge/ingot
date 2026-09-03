@@ -86,6 +86,9 @@ type ServerDeps struct {
 	// Parks persists deferred-accept park state between UploadPart and
 	// Complete/Abort.
 	Parks registry.ParkStore
+	// PendingReleases is the deferred blob-release queue drained by the
+	// release sweeper. Typically the same instance as Registry.
+	PendingReleases registry.PendingReleaseStore
 
 	// EncParams is the per-blob FEE encryption-parameter table the decrypting
 	// read path consults; RegionKeys unwraps its region-wrapped CEKs. Both
@@ -127,12 +130,13 @@ var _ s3frontend.SegmentDigestLister = (*logstore.Manager)(nil)
 // lifecycle. fx callers wrap these in OnStart/OnStop hooks; tests
 // call them directly.
 type Server struct {
-	cfg       config.ServerConfig
-	logger    *zap.Logger
-	log       blockstore.Log
-	backend   *s3frontend.Backend
-	api       *s3api.S3ApiServer
-	sweepStop chan struct{}
+	cfg         config.ServerConfig
+	logger      *zap.Logger
+	log         blockstore.Log
+	backend     *s3frontend.Backend
+	api         *s3api.S3ApiServer
+	sweepStop   chan struct{}
+	releaseStop chan struct{}
 }
 
 // New wires a ServerDeps + ServerConfig into a runnable Server. The
@@ -178,26 +182,28 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 
 	bs := blockstore.NewLayered(spool, log, deps.BaseBlockReader)
 	backend := s3frontend.New(s3frontend.Deps{
-		Authority:   deps.Authority,
-		Registry:    deps.Registry,
-		Intents:     deps.Intents,
-		Locations:   deps.Locations,
-		BlobRefs:    deps.BlobRefs,
-		GC:          deps.GC,
-		Multipart:   deps.Multipart,
-		Parks:       deps.Parks,
-		Reads:       bs,
-		Log:         log,
-		Spool:       spool,
-		Uploader:    deps.BodyUploader,
-		Deferred:    deps.Deferred,
-		Remover:     deps.Remover,
-		EncParams:   deps.EncParams,
-		RegionKeys:  deps.RegionKeys,
-		TenantKeys:  deps.TenantKeys,
-		MaxBlobSize: cfg.MaxBlobSize,
-		CORS:        cfg.CORSConfig,
-		Logger:      logger,
+		Authority:       deps.Authority,
+		Registry:        deps.Registry,
+		Intents:         deps.Intents,
+		Locations:       deps.Locations,
+		BlobRefs:        deps.BlobRefs,
+		GC:              deps.GC,
+		Multipart:       deps.Multipart,
+		Parks:           deps.Parks,
+		Reads:           bs,
+		Log:             log,
+		Spool:           spool,
+		Uploader:        deps.BodyUploader,
+		Deferred:        deps.Deferred,
+		Remover:         deps.Remover,
+		EncParams:       deps.EncParams,
+		RegionKeys:      deps.RegionKeys,
+		TenantKeys:      deps.TenantKeys,
+		PendingReleases: deps.PendingReleases,
+		ReleaseGrace:    cfg.ReleaseGrace,
+		MaxBlobSize:     cfg.MaxBlobSize,
+		CORS:            cfg.CORSConfig,
+		Logger:          logger,
 	})
 
 	api, err := buildS3API(ctx, backend, cfg, deps.IAM, deps.Identity, logger)
@@ -236,6 +242,7 @@ func (s *Server) Start(ctx context.Context) error {
 		}
 	}()
 	s.startMultipartSweeper()
+	s.startReleaseSweeper()
 	return nil
 }
 
@@ -277,6 +284,41 @@ func (s *Server) startMultipartSweeper() {
 	}()
 }
 
+// startReleaseSweeper spawns the deferred-release sweeper: release intents
+// past their not_before (last-claim drop + ReleaseGrace) are executed —
+// claim-count recheck, crypto-shred, location delete, network remove — with
+// failures retried next tick. The interval floor keeps a tiny test grace
+// from spinning a sub-second ticker.
+func (s *Server) startReleaseSweeper() {
+	interval := s.cfg.ReleaseGrace / 2
+	if interval > 10*time.Minute {
+		interval = 10 * time.Minute
+	}
+	if interval < time.Second {
+		interval = time.Second
+	}
+	s.releaseStop = make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-s.releaseStop:
+				return
+			case <-ticker.C:
+				ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+				n, err := s.backend.SweepPendingReleases(ctx)
+				cancel()
+				if err != nil {
+					s.logger.Warn("release sweep", zap.Error(err))
+				} else if n > 0 {
+					s.logger.Info("release sweep executed deferred releases", zap.Int("count", n))
+				}
+			}
+		}
+	}()
+}
+
 // Stop shuts the listener down and drains the log. Always returns
 // the combined error of the two operations so callers see all
 // failure modes; either alone is non-fatal to the other.
@@ -286,6 +328,10 @@ func (s *Server) Stop(ctx context.Context) error {
 	if s.sweepStop != nil {
 		close(s.sweepStop)
 		s.sweepStop = nil
+	}
+	if s.releaseStop != nil {
+		close(s.releaseStop)
+		s.releaseStop = nil
 	}
 	var errs []error
 	if err := s.api.ShutDown(); err != nil {
@@ -516,6 +562,9 @@ func validateServerInputs(cfg config.ServerConfig, deps ServerDeps) error {
 	}
 	if deps.Multipart == nil {
 		return errors.New("ingot: ServerDeps.Multipart is required")
+	}
+	if deps.PendingReleases == nil {
+		return errors.New("ingot: ServerDeps.PendingReleases is required")
 	}
 	if deps.Remover == nil {
 		return errors.New("ingot: ServerDeps.Remover is required")
