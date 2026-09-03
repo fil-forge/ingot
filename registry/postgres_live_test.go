@@ -53,7 +53,8 @@ func TestPostgresStores_Live(t *testing.T) {
 	if _, err := pool.Exec(ctx,
 		`TRUNCATE ingot.blob_refs, ingot.upload_intents, ingot.blob_locations,
 		 ingot.blob_encryption_params, ingot.multipart_sessions, ingot.multipart_parts,
-		 ingot.gc_candidates, ingot.buckets, ingot.revocation_cursor CASCADE`); err != nil {
+		 ingot.gc_candidates, ingot.buckets, ingot.revocation_cursor,
+		 ingot.blob_release_intents CASCADE`); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
 
@@ -112,6 +113,66 @@ func TestPostgresStores_Live(t *testing.T) {
 		}
 		if n, _ := r.CountClaims(ctx, space, digest); n != 0 {
 			t.Fatalf("count after release = %d, want 0", n)
+		}
+	})
+
+	t.Run("drop claim enqueues release atomically", func(t *testing.T) {
+		space := testutil.RandomDID(t)
+		add := func(key string) {
+			if err := r.AddBlobClaim(ctx, registry.BlobClaim{Digest: digest, Bucket: "rb", ObjectKey: key, VersionID: "null#1", Space: space}); err != nil {
+				t.Fatalf("AddBlobClaim: %v", err)
+			}
+		}
+		add("k1")
+		add("k2")
+
+		due := time.Now().Add(-time.Second) // already due
+		enq, err := r.DropClaimEnqueueRelease(ctx, digest, "rb", "k1", "null#1", space, due)
+		if err != nil {
+			t.Fatalf("DropClaimEnqueueRelease (first): %v", err)
+		}
+		if enq {
+			t.Fatalf("first drop enqueued a release while a claim remains")
+		}
+		enq, err = r.DropClaimEnqueueRelease(ctx, digest, "rb", "k2", "null#1", space, due)
+		if err != nil {
+			t.Fatalf("DropClaimEnqueueRelease (last): %v", err)
+		}
+		if !enq {
+			t.Fatalf("last drop did not enqueue a release")
+		}
+
+		listed, err := r.ListDueReleases(ctx, time.Now(), 10)
+		if err != nil {
+			t.Fatalf("ListDueReleases: %v", err)
+		}
+		found := false
+		for _, pr := range listed {
+			if pr.Space == space && string(pr.Digest) == string(digest) {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("enqueued release not listed as due: %v", listed)
+		}
+
+		// Upsert keeps the LATER not_before: re-enqueueing far in the future
+		// pushes the intent out of the due window.
+		if err := r.EnqueueRelease(ctx, space, digest, time.Now().Add(time.Hour)); err != nil {
+			t.Fatalf("EnqueueRelease (extend): %v", err)
+		}
+		listed, err = r.ListDueReleases(ctx, time.Now(), 10)
+		if err != nil {
+			t.Fatalf("ListDueReleases (after extend): %v", err)
+		}
+		for _, pr := range listed {
+			if pr.Space == space && string(pr.Digest) == string(digest) {
+				t.Fatalf("extended intent still listed as due")
+			}
+		}
+
+		if err := r.DeleteRelease(ctx, space, digest); err != nil {
+			t.Fatalf("DeleteRelease: %v", err)
 		}
 	})
 

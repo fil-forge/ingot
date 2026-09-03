@@ -233,6 +233,7 @@ func TestVersioning_SuspendedReplacesNullInPlace(t *testing.T) {
 	// A second null write replaces the first in place.
 	putObjV(t, b, "k1", cc)
 	dc := blobDigestOf(t, b, "k1", "null")
+	drainReleases(t, b)
 	if claims(t, mem, db) != 0 || rm.removedDigests()[string(db)] != 1 {
 		t.Fatalf("claims(B)=%d removals(B)=%d, want 0/1", claims(t, mem, db), rm.removedDigests()[string(db)])
 	}
@@ -327,6 +328,7 @@ func TestVersioning_DeleteSpecificVersionPromotes(t *testing.T) {
 	if _, data, err := getObjV(t, b, "k1", ""); err != nil || !bytes.Equal(data, a) {
 		t.Fatalf("GET after promotion = %q, %v; want %q", data, err, a)
 	}
+	drainReleases(t, b)
 	if claims(t, mem, db) != 0 || rm.removedDigests()[string(db)] != 1 {
 		t.Fatalf("claims(B)=%d removals(B)=%d, want 0/1", claims(t, mem, db), rm.removedDigests()[string(db)])
 	}
@@ -638,6 +640,7 @@ func TestVersioning_NullEvictionFromPrev(t *testing.T) {
 	dc := blobDigestOf(t, b, "k1", "null")
 
 	// A's claim is released and its blob removed; B and C stay claimed.
+	drainReleases(t, b)
 	if claims(t, mem, da) != 0 || rm.removedDigests()[string(da)] != 1 {
 		t.Fatalf("claims(A)=%d removals(A)=%d, want 0/1", claims(t, mem, da), rm.removedDigests()[string(da)])
 	}

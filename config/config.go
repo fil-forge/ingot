@@ -100,6 +100,13 @@ type Config struct {
 	// 7 days; a negative duration disables the sweeper.
 	MultipartSessionTTL string `mapstructure:"multipart_session_ttl" yaml:"multipart_session_ttl"`
 
+	// ReleaseGrace delays each blob release (crypto-shred + location delete +
+	// network remove) this long past the drop of its last reference claim
+	// (Go duration string), so in-flight readers holding the prior catalog
+	// root finish their decryption prefetch first. Empty → default 60s; a
+	// negative duration makes releases due immediately.
+	ReleaseGrace string `mapstructure:"release_grace" yaml:"release_grace"`
+
 	// CatalogPlane overrides the catalog logstore pipeline knobs. Any field
 	// left zero/unset falls back to the top-level SealBytes / SealAge / Retain
 	// (and Ship defaults to true) — e.g. to configure the catalog never to ship.
@@ -170,6 +177,16 @@ func (c Config) ServerConfig() (ServerConfig, error) {
 			return ServerConfig{}, fmt.Errorf("ingot: parse multipart_session_ttl %q: %w", c.MultipartSessionTTL, err)
 		}
 	}
+	releaseGrace := 60 * time.Second
+	if c.ReleaseGrace != "" {
+		releaseGrace, err = time.ParseDuration(c.ReleaseGrace)
+		if err != nil {
+			return ServerConfig{}, fmt.Errorf("ingot: parse release_grace %q: %w", c.ReleaseGrace, err)
+		}
+		if releaseGrace < 0 {
+			releaseGrace = 0
+		}
+	}
 	// Render the CORS configuration here — the single place it is built —
 	// so a typo fails at startup (via Validate) rather than from New.
 	corsCfg, err := cors.Build(c.CORSAllowedOrigins)
@@ -195,6 +212,7 @@ func (c Config) ServerConfig() (ServerConfig, error) {
 		RetainCatalog:    firstNonZeroInt(c.CatalogPlane.Retain, c.Retain),
 
 		MultipartSessionTTL: mpTTL,
+		ReleaseGrace:        releaseGrace,
 	}, nil
 }
 

@@ -44,6 +44,7 @@ func TestUp_Live(t *testing.T) {
 		"buckets", "segments", "segment_op_roots",
 		"blob_refs", "upload_intents", "blob_locations", "blob_encryption_params",
 		"multipart_sessions", "multipart_parts", "gc_candidates",
+		"blob_release_intents",
 	}
 	for _, tbl := range want {
 		var exists bool

@@ -52,10 +52,21 @@ func hygienePartDigests(t *testing.T, mem *inmem.MemStore, uploadID string, n in
 	return nil
 }
 
-// assertReleased asserts a digest's enc-params row and upload intent are gone
-// and (wantRemoved) its network release was invoked.
-func assertReleased(t *testing.T, mem *inmem.MemStore, rm *recordingRemover, d multihash.Multihash, wantRemoved bool) {
+// drainReleases executes every due deferred release (unit backends run with
+// a zero release grace, so everything enqueued is immediately due).
+func drainReleases(t *testing.T, b *Backend) {
 	t.Helper()
+	if _, err := b.SweepPendingReleases(context.Background()); err != nil {
+		t.Fatalf("SweepPendingReleases: %v", err)
+	}
+}
+
+// assertReleased drains the deferred-release queue, then asserts a digest's
+// enc-params row and upload intent are gone and (wantRemoved) its network
+// release was invoked.
+func assertReleased(t *testing.T, b *Backend, mem *inmem.MemStore, rm *recordingRemover, d multihash.Multihash, wantRemoved bool) {
+	t.Helper()
+	drainReleases(t, b)
 	ctx := context.Background()
 	if _, err := mem.GetEncryptionParams(ctx, did.Undef, d); !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("enc-params row for %x survived (err=%v) — crypto-shred missing", d, err)
@@ -105,7 +116,7 @@ func TestCompleteReapsOrphanParts(t *testing.T) {
 	}
 
 	for _, d := range orphans {
-		assertReleased(t, mem, rm, d, true)
+		assertReleased(t, b, mem, rm, d, true)
 	}
 	for _, d := range winners {
 		assertRetained(t, mem, rm, d)
@@ -133,7 +144,7 @@ func TestSupersededPartReleased(t *testing.T) {
 		t.Fatalf("UploadPart (winner): %v", err)
 	}
 	for _, d := range old {
-		assertReleased(t, mem, rm, d, true)
+		assertReleased(t, b, mem, rm, d, true)
 	}
 	for _, d := range hygienePartDigests(t, mem, uploadID, 1) {
 		assertRetained(t, mem, rm, d)
@@ -170,7 +181,7 @@ func TestAbortReleasesUnclaimedBlobs(t *testing.T) {
 		t.Fatalf("session survived the abort (err=%v)", err)
 	}
 	for _, d := range digests {
-		assertReleased(t, mem, rm, d, true)
+		assertReleased(t, b, mem, rm, d, true)
 	}
 }
 
@@ -198,7 +209,7 @@ func TestSweepReapsCompletingSession(t *testing.T) {
 		t.Fatalf("completing session survived the sweep (err=%v)", err)
 	}
 	for _, d := range digests {
-		assertReleased(t, mem, rm, d, true)
+		assertReleased(t, b, mem, rm, d, true)
 	}
 }
 
@@ -270,6 +281,87 @@ func TestCompleteFailsClosedOnMissingParamsRow(t *testing.T) {
 	}
 }
 
+// TestDrainSpaceReleasesIgnoresGrace: DeleteBucket must be able to execute a
+// space's pending releases immediately — deleted objects' blobs would
+// otherwise stay registered behind the reader grace and hilt would refuse
+// the space deletion.
+func TestDrainSpaceReleasesIgnoresGrace(t *testing.T) {
+	b, mem, rm := newRefTestBackend(t)
+	ctx := context.Background()
+	data := testBody(1 << 10)
+
+	putObj(t, b, "k1", data)
+	d := blobDigestOf(t, b, "k1", "")
+	deleteObj(t, b, "k1")
+
+	// Simulate a live grace: push the intent's not_before into the future so
+	// the ordinary sweep would not touch it.
+	if err := mem.EnqueueRelease(ctx, did.Undef, d, time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("EnqueueRelease (extend): %v", err)
+	}
+	if n, err := b.SweepPendingReleases(ctx); err != nil || n != 0 {
+		t.Fatalf("sweep executed %d releases (err=%v), want 0 — intent should not be due", n, err)
+	}
+
+	if err := b.drainSpaceReleases(ctx, did.Undef); err != nil {
+		t.Fatalf("drainSpaceReleases: %v", err)
+	}
+	if _, err := mem.GetEncryptionParams(ctx, did.Undef, d); !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("enc-params row survived the space drain (err=%v)", err)
+	}
+	if rm.removedDigests()[string(d)] != 1 {
+		t.Fatalf("expected one RemoveBlob from the space drain; got %v", rm.removedDigests())
+	}
+}
+
+// TestConcurrentCompletesReplayWinner: racing Completes of one upload must
+// all return the winner's ETag — latch losers wait for the winner's terminal
+// state and replay its result instead of failing with NoSuchUpload.
+func TestConcurrentCompletesReplayWinner(t *testing.T) {
+	b, _, _ := newRefTestBackend(t)
+	key := "race"
+	data := testBody(int(backend.MinPartSize))
+
+	uploadID := mpCreate(t, b, key, "", "")
+	out, err := mpUploadPart(t, b, key, uploadID, 1, data, nil)
+	if err != nil {
+		t.Fatalf("UploadPart: %v", err)
+	}
+	one := int32(1)
+	parts := []types.CompletedPart{{PartNumber: &one, ETag: out.ETag}}
+
+	const racers = 5
+	etags := make([]string, racers)
+	errs := make([]error, racers)
+	var wg sync.WaitGroup
+	for i := 0; i < racers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			res, err := mpComplete(t, b, key, uploadID, parts, nil)
+			if err != nil {
+				errs[i] = err
+				return
+			}
+			etags[i] = *res.ETag
+		}(i)
+	}
+	wg.Wait()
+	for i := range errs {
+		if errs[i] != nil {
+			t.Fatalf("racer %d: %v", i, errs[i])
+		}
+	}
+	for i := 1; i < racers; i++ {
+		if etags[i] != etags[0] {
+			t.Fatalf("racer %d ETag %q differs from racer 0's %q", i, etags[i], etags[0])
+		}
+	}
+	if got := getRange(t, b, key, ""); !bytes.Equal(got, data) {
+		t.Fatalf("object mismatch after racing Completes (%d bytes)", len(got))
+	}
+}
+
 // parkingUploader parks instead of accepting: UploadBlob returns no
 // Location, so part blobs stay IntentParked — the provider shape the
 // NopUploader cannot produce. AbortBlob calls are recorded.
@@ -325,23 +417,24 @@ func newParkingBackend(t *testing.T) (*Backend, *inmem.MemStore, *parkingUploade
 
 	pu := &parkingUploader{}
 	b := New(Deps{
-		Authority:  mem,
-		Registry:   mem,
-		Intents:    mem,
-		Locations:  mem,
-		BlobRefs:   mem,
-		GC:         mem,
-		Multipart:  mem,
-		Parks:      mem,
-		Reads:      blockstore.NewLayered(spool, log, inmem.NopBaseReader{}),
-		Log:        log,
-		Spool:      spool,
-		Uploader:   pu,
-		Deferred:   pu,
-		Remover:    &recordingRemover{},
-		EncParams:  mem,
-		RegionKeys: testRegionKeys(t),
-		TenantKeys: testTenantKeys(),
+		Authority:       mem,
+		Registry:        mem,
+		Intents:         mem,
+		Locations:       mem,
+		BlobRefs:        mem,
+		GC:              mem,
+		Multipart:       mem,
+		Parks:           mem,
+		Reads:           blockstore.NewLayered(spool, log, inmem.NopBaseReader{}),
+		Log:             log,
+		Spool:           spool,
+		Uploader:        pu,
+		Deferred:        pu,
+		Remover:         &recordingRemover{},
+		EncParams:       mem,
+		RegionKeys:      testRegionKeys(t),
+		TenantKeys:      testTenantKeys(),
+		PendingReleases: mem,
 	})
 	if err := mem.Create(ctx, "bk", did.Undef, registry.CreateState{}); err != nil {
 		t.Fatalf("create bucket: %v", err)

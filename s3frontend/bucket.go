@@ -373,6 +373,15 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 			}
 		}
 
+		// Deleted objects' blobs may still be registered in the space: their
+		// releases sit in the deferred queue behind the reader grace, and
+		// hilt refuses to delete a space that still holds registrations.
+		// The bucket is provably empty here and its deletion explicit, so
+		// no grace is owed — execute the space's pending releases now.
+		if err := b.drainSpaceReleases(ctx, st.Space); err != nil {
+			return fmt.Errorf("s3frontend: delete bucket: %w", err)
+		}
+
 		req, ok := reqscope.Request(ctx)
 		if !ok {
 			return errors.New("s3frontend: delete bucket: no request in context")
