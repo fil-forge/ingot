@@ -162,6 +162,7 @@ type serverParams struct {
 	GC              registry.GCStore
 	Multipart       registry.MultipartStore
 	Parks           registry.ParkStore
+	PendingReleases registry.PendingReleaseStore
 	Meta            logstore.Meta
 	// Identity is the agent identity (the host-provided libforge identity, the
 	// issuer of every outbound invocation); the listener serves its DID
@@ -218,6 +219,7 @@ func registerServerLifecycle(lc fx.Lifecycle, p serverParams) {
 				GC:              p.GC,
 				Multipart:       p.Multipart,
 				Parks:           p.Parks,
+				PendingReleases: p.PendingReleases,
 				EncParams:       p.EncParams,
 				RegionKeys:      p.RegionKeys,
 				TenantKeys:      p.TenantKeys,
@@ -475,6 +477,7 @@ type registryResult struct {
 	GC                registry.GCStore
 	Multipart         registry.MultipartStore
 	Parks             registry.ParkStore
+	PendingReleases   registry.PendingReleaseStore
 	EncParams         registry.EncryptionParamsStore
 	RevocationCursors registry.RevocationCursorStore
 	Meta              logstore.Meta
@@ -489,7 +492,7 @@ type registryResult struct {
 // needs hilt_url/hilt_did configured.
 func provideRegistry(pool *pgxpool.Pool) registryResult {
 	pg := registry.NewPostgres(pool)
-	return registryResult{Registry: pg, Intents: pg, Locations: pg, Inclusions: pg, BlobRefs: pg, GC: pg, Multipart: pg, Parks: pg, EncParams: pg, RevocationCursors: pg, Meta: pg}
+	return registryResult{Registry: pg, Intents: pg, Locations: pg, Inclusions: pg, BlobRefs: pg, GC: pg, Multipart: pg, Parks: pg, PendingReleases: pg, EncParams: pg, RevocationCursors: pg, Meta: pg}
 }
 
 // migrationHookOut feeds the migration PreStartHook into the "ingot_prestart"

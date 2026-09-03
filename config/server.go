@@ -53,6 +53,12 @@ type ServerConfig struct {
 	// negative → sweeper disabled.
 	MultipartSessionTTL time.Duration
 
+	// ReleaseGrace delays each blob release this long past the drop of its
+	// last reference claim, so in-flight readers of the prior catalog root
+	// finish first. Config.ServerConfig() applies the 60s default; zero here
+	// means releases are due immediately.
+	ReleaseGrace time.Duration
+
 	// CORSConfig is the S3 CORS configuration the backend reports for
 	// every bucket, rendered from Config.CORSAllowedOrigins by
 	// internal/cors. Nil disables CORS entirely (the default).

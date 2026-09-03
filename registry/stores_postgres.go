@@ -24,6 +24,7 @@ var (
 	_ MultipartStore        = (*Postgres)(nil)
 	_ GCStore               = (*Postgres)(nil)
 	_ RevocationCursorStore = (*Postgres)(nil)
+	_ PendingReleaseStore   = (*Postgres)(nil)
 )
 
 // BlobRefStore ===============================================================
@@ -60,6 +61,130 @@ func (r *Postgres) CountClaims(ctx context.Context, space did.DID, digest multih
 		return 0, fmt.Errorf("registry: count claims: %w", err)
 	}
 	return n, nil
+}
+
+func (r *Postgres) DropClaimEnqueueRelease(ctx context.Context, digest multihash.Multihash, bucket, objectKey, versionID string, space did.DID, notBefore time.Time) (bool, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return false, fmt.Errorf("registry: begin drop claim: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM ingot.blob_refs
+		 WHERE digest = $1 AND bucket = $2 AND object_key = $3 AND version_id = $4`,
+		digest, bucket, objectKey, versionID); err != nil {
+		return false, fmt.Errorf("registry: drop claim: %w", err)
+	}
+	var n int
+	if err := tx.QueryRow(ctx,
+		`SELECT count(*) FROM ingot.blob_refs WHERE space = $1 AND digest = $2`,
+		space, digest).Scan(&n); err != nil {
+		return false, fmt.Errorf("registry: drop claim count: %w", err)
+	}
+	enqueued := false
+	if n == 0 {
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO ingot.blob_release_intents (space, digest, not_before)
+			 VALUES ($1, $2, $3)
+			 ON CONFLICT (space, digest)
+			 DO UPDATE SET not_before = GREATEST(ingot.blob_release_intents.not_before, EXCLUDED.not_before)`,
+			space, digest, notBefore); err != nil {
+			return false, fmt.Errorf("registry: enqueue release: %w", err)
+		}
+		enqueued = true
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, fmt.Errorf("registry: commit drop claim: %w", err)
+	}
+	return enqueued, nil
+}
+
+// PendingReleaseStore =========================================================
+
+func (r *Postgres) EnqueueRelease(ctx context.Context, space did.DID, digest multihash.Multihash, notBefore time.Time) error {
+	_, err := r.pool.Exec(ctx,
+		`INSERT INTO ingot.blob_release_intents (space, digest, not_before)
+		 VALUES ($1, $2, $3)
+		 ON CONFLICT (space, digest)
+		 DO UPDATE SET not_before = GREATEST(ingot.blob_release_intents.not_before, EXCLUDED.not_before)`,
+		space, digest, notBefore)
+	if err != nil {
+		return fmt.Errorf("registry: enqueue release: %w", err)
+	}
+	return nil
+}
+
+func (r *Postgres) ListDueReleases(ctx context.Context, now time.Time, limit int) ([]PendingRelease, error) {
+	rows, err := r.pool.Query(ctx,
+		`SELECT space, digest, not_before FROM ingot.blob_release_intents
+		 WHERE not_before <= $1 ORDER BY not_before ASC LIMIT $2`,
+		now, limit)
+	if err != nil {
+		return nil, fmt.Errorf("registry: list due releases: %w", err)
+	}
+	defer rows.Close()
+
+	var out []PendingRelease
+	for rows.Next() {
+		var spaceStr string
+		var pr PendingRelease
+		var digest []byte
+		if err := rows.Scan(&spaceStr, &digest, &pr.NotBefore); err != nil {
+			return nil, fmt.Errorf("registry: list due releases scan: %w", err)
+		}
+		space, err := did.Parse(spaceStr)
+		if err != nil {
+			return nil, fmt.Errorf("registry: list due releases space %q: %w", spaceStr, err)
+		}
+		pr.Space, pr.Digest = space, multihash.Multihash(digest)
+		out = append(out, pr)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("registry: list due releases rows: %w", err)
+	}
+	return out, nil
+}
+
+func (r *Postgres) ListReleasesBySpace(ctx context.Context, space did.DID) ([]PendingRelease, error) {
+	rows, err := r.pool.Query(ctx,
+		`SELECT space, digest, not_before FROM ingot.blob_release_intents
+		 WHERE space = $1 ORDER BY not_before ASC`,
+		space)
+	if err != nil {
+		return nil, fmt.Errorf("registry: list releases by space: %w", err)
+	}
+	defer rows.Close()
+
+	var out []PendingRelease
+	for rows.Next() {
+		var spaceStr string
+		var pr PendingRelease
+		var digest []byte
+		if err := rows.Scan(&spaceStr, &digest, &pr.NotBefore); err != nil {
+			return nil, fmt.Errorf("registry: list releases by space scan: %w", err)
+		}
+		sp, err := did.Parse(spaceStr)
+		if err != nil {
+			return nil, fmt.Errorf("registry: list releases by space %q: %w", spaceStr, err)
+		}
+		pr.Space, pr.Digest = sp, multihash.Multihash(digest)
+		out = append(out, pr)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("registry: list releases by space rows: %w", err)
+	}
+	return out, nil
+}
+
+func (r *Postgres) DeleteRelease(ctx context.Context, space did.DID, digest multihash.Multihash) error {
+	_, err := r.pool.Exec(ctx,
+		`DELETE FROM ingot.blob_release_intents WHERE space = $1 AND digest = $2`,
+		space, digest)
+	if err != nil {
+		return fmt.Errorf("registry: delete release: %w", err)
+	}
+	return nil
 }
 
 // IntentStore ================================================================

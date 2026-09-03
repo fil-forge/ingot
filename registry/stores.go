@@ -206,6 +206,37 @@ type BlobRefStore interface {
 	// CountClaims returns how many object versions in space still reference
 	// digest. Zero means the space's claim may be released.
 	CountClaims(ctx context.Context, space did.DID, digest multihash.Multihash) (int, error)
+	// DropClaimEnqueueRelease deletes one claim row and, when it was the
+	// space's last claim on digest, records a release intent due at
+	// notBefore — atomically, so no crash window separates "last claim
+	// gone" from "release recorded". Reports whether an intent was
+	// enqueued.
+	DropClaimEnqueueRelease(ctx context.Context, digest multihash.Multihash, bucket, objectKey, versionID string, space did.DID, notBefore time.Time) (bool, error)
+}
+
+// PendingRelease is one deferred blob release: executed by the release
+// sweeper once not_before passes and the digest still has zero claims.
+type PendingRelease struct {
+	Space     did.DID
+	Digest    multihash.Multihash
+	NotBefore time.Time
+}
+
+// PendingReleaseStore is the deferred-release queue (blob_release_intents):
+// the durable record between "last claim dropped" and "release executed"
+// (crypto-shred + location delete + network remove). Enqueue upserts,
+// keeping the later not_before.
+type PendingReleaseStore interface {
+	EnqueueRelease(ctx context.Context, space did.DID, digest multihash.Multihash, notBefore time.Time) error
+	// ListDueReleases returns intents with not_before <= now, oldest first,
+	// at most limit.
+	ListDueReleases(ctx context.Context, now time.Time, limit int) ([]PendingRelease, error)
+	// ListReleasesBySpace returns every intent for space regardless of
+	// not_before — DeleteBucket executes a space's releases immediately (the
+	// bucket is empty and its deletion is explicit, so no reader grace is
+	// owed) before asking hilt to delete the space.
+	ListReleasesBySpace(ctx context.Context, space did.DID) ([]PendingRelease, error)
+	DeleteRelease(ctx context.Context, space did.DID, digest multihash.Multihash) error
 }
 
 // IntentStore is the local-store index (§5): the on-disk blobs Ingot holds

@@ -66,6 +66,7 @@ type MemStore struct {
 	parts      map[string]map[int]registry.MultipartPart // uploadID -> partNumber -> part
 	gcCands    map[string]struct{}                       // keyed by string(cid)
 	revCursor  *registry.RevocationCursor                // the single revocation_cursor row
+	releases   map[locKey]registry.PendingRelease        // keyed by (space, digest)
 }
 
 // claimKey / locKey are the composite map keys for the blob_refs and the
@@ -95,6 +96,7 @@ func NewMemStore() *MemStore {
 		sessions:   map[string]registry.MultipartSession{},
 		parts:      map[string]map[int]registry.MultipartPart{},
 		gcCands:    map[string]struct{}{},
+		releases:   map[locKey]registry.PendingRelease{},
 	}
 }
 
