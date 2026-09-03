@@ -23,6 +23,10 @@ github.com/acarl005/stripansi v0.0.0-20180116102854-5a71ef0e047d h1:licZJFw2RwpH
 github.com/acarl005/stripansi v0.0.0-20180116102854-5a71ef0e047d/go.mod h1:asat636LX7Bqt5lYEZ27JNDcqxfjdBQuJ/MM4CN/Lzo=
 github.com/alanshaw/dag-json-gen v0.0.9 h1:q59Ra1mQB6HnFGI1ilFxsZvF1CqGN0XDlUWq16EJ6pw=
 github.com/alanshaw/dag-json-gen v0.0.9/go.mod h1:v1YBZcS4B355MqxtyQr+fGNbEhm0CzHd+gOqOO/MZ+I=
+github.com/alanshaw/s3tests/packages/go v0.0.0-20260903131507-f7adc04f9484 h1:1Bpc/OLHceUbI5eyKYetwl775gvRhT3ApDIEtc3glu4=
+github.com/alanshaw/s3tests/packages/go v0.0.0-20260903131507-f7adc04f9484/go.mod h1:U6uDE7ZFo0VquUL5D7czSfuVSvG/yrr6fTCXwCiwb10=
+github.com/alanshaw/s3vectors/packages/go v1.0.1-0.20260903130806-99f00eee4d2f h1:eYfEBC6XVdMig67vMSkpv8pg5a45X29Yn/DkCV2VFcM=
+github.com/alanshaw/s3vectors/packages/go v1.0.1-0.20260903130806-99f00eee4d2f/go.mod h1:wQ4QfK8oWks1XK84Q1DkJbefx9UmTTUrggLk3EMq8ww=
 github.com/alexbrainman/sspi v0.0.0-20250919150558-7d374ff0d59e h1:4dAU9FXIyQktpoUAgOJK3OTFc/xug0PCXYCqU0FgDKI=
 github.com/alexbrainman/sspi v0.0.0-20250919150558-7d374ff0d59e/go.mod h1:cEWa1LVoE5KvSD9ONXsZrj0z6KqySlCCNKHlLzbqAt4=
 github.com/anchore/go-struct-converter v0.1.0 h1:2rDRssAl6mgKBSLNiVCMADgZRhoqtw9dedlWa0OhD30=
@@ -75,6 +79,8 @@ github.com/blang/semver v3.5.1+incompatible h1:cQNTCjp13qL8KC3Nbxr/y2Bqb63oX6wdn
 github.com/blang/semver v3.5.1+incompatible/go.mod h1:kRBLl5iJ+tD4TcOOxsy/0fnwebNt5EWlYSAyrTnjyyk=
 github.com/buger/goterm v1.0.4 h1:Z9YvGmOih81P0FbVtEYTFF6YsSgxSUKEhf/f9bTMXbY=
 github.com/buger/goterm v1.0.4/go.mod h1:HiFWV3xnkolgrBV3mY8m0X0Pumt4zg4QhbdOzQtB8tE=
+github.com/cbroglie/mustache v1.4.2 h1:yHvAjVmSyYwCmEIYq7kBaZ4A+Q3kSYjJheLdB2H2r9U=
+github.com/cbroglie/mustache v1.4.2/go.mod h1:Q5dS171cNzDjfoeB6S1/GBl8bUJgIa3t8i3eyL80vzc=
 github.com/cenkalti/backoff/v4 v4.3.0 h1:MyRJ/UdXutAwSAT+s3wNd7MfTIcy71VQueUuFK343L8=
 github.com/cenkalti/backoff/v4 v4.3.0/go.mod h1:Y3VNntkOUPxTVeUxJ/G5vcM//AlwfmyYozVcomhLiZE=
 github.com/cenkalti/backoff/v5 v5.0.3 h1:ZN+IMa753KfX5hd8vVaMixjnqRZ3y8CuJKRKj1xcsSM=
