@@ -86,7 +86,9 @@ jobs:
     # from under us. The runner's preinstalled Docker is 28.x, well past
     # smelt's 25+ requirement.
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    # Room for the main itest run (-timeout 40m) plus the S3 compatibility
+    # report, which boots its own stack.
+    timeout-minutes: 60
 
     steps:
       - name: Check out the repository
@@ -152,3 +154,27 @@ jobs:
           path: /tmp/container-logs/
           if-no-files-found: ignore
           retention-days: 7
+
+      - name: Generate S3 compatibility report
+        # TestForgeS3Compat runs the s3vectors corpus and reports each vector
+        # as a subtest, so it exits non-zero whenever the target is
+        # incomplete — expected for ingot, and not a build failure.
+        # continue-on-error keeps the job green; the report is uploaded next
+        # regardless. Runs even if the itest run above failed (it boots its
+        # own stack), but not on cancellation.
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        env:
+          GOWORK: off
+          INGOT_S3COMPAT: 1
+          INGOT_S3COMPAT_OUT: ${{ github.workspace }}/s3-compat-report.html
+        run: go test -tags itest -v -timeout 20m -run TestForgeS3Compat ./itest
+
+      - name: Upload S3 compatibility report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: s3-compat-report
+          path: s3-compat-report.html
+          if-no-files-found: warn
+          retention-days: 90

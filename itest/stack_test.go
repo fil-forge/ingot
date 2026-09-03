@@ -320,13 +320,28 @@ var hiltAllPermissions = []string{
 // registered ingot under (forgeRegion).
 func hiltProvisionTenant(t *testing.T, ctx context.Context, s *stack.Stack, tenantID string) (accessKey, secretKey string) {
 	t.Helper()
+	accessKey, secretKey, err := hiltProvisionTenantErr(ctx, s, tenantID)
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+	t.Logf("hilt tenant %q provisioned; access key %s", tenantID, accessKey)
+	return accessKey, secretKey
+}
+
+// hiltProvisionTenantErr is the error-returning core of hiltProvisionTenant:
+// it provisions the tenant + an all-permission access key and returns the
+// SigV4 credentials, or an error. Use this (not the t.Fatalf wrapper) from
+// code that may run off the test's main goroutine — e.g. the s3tests runner's
+// ProvisionCredential callback, where a Fatalf would be a data race and would
+// not stop the test correctly.
+func hiltProvisionTenantErr(ctx context.Context, s *stack.Stack, tenantID string) (accessKey, secretKey string, err error) {
 	const partnerAuth = "Authorization: Bearer dev-partner-key"
 
 	if out, errOut, err := s.Exec(ctx, "hilt", "curl", "-sS", "-f", "-X", "PUT",
 		"http://localhost:80/tenants/"+tenantID,
 		"-H", partnerAuth, "-H", "Content-Type: application/json",
 		"-d", fmt.Sprintf(`{"region":%q}`, forgeRegion)); err != nil {
-		t.Fatalf("hilt provision tenant %q: %v (stdout=%s stderr=%s)", tenantID, err, out, errOut)
+		return "", "", fmt.Errorf("hilt provision tenant %q: %w (stdout=%s stderr=%s)", tenantID, err, out, errOut)
 	}
 
 	keyReq, err := json.Marshal(map[string]any{
@@ -334,27 +349,26 @@ func hiltProvisionTenant(t *testing.T, ctx context.Context, s *stack.Stack, tena
 		"permissions": hiltAllPermissions,
 	})
 	if err != nil {
-		t.Fatalf("marshal access-key request: %v", err)
+		return "", "", fmt.Errorf("marshal access-key request: %w", err)
 	}
 	out, errOut, err := s.Exec(ctx, "hilt", "curl", "-sS", "-f", "-X", "POST",
 		"http://localhost:80/tenants/"+tenantID+"/access-keys",
 		"-H", partnerAuth, "-H", "Content-Type: application/json",
 		"-d", string(keyReq))
 	if err != nil {
-		t.Fatalf("hilt create access key for %q: %v (stdout=%s stderr=%s)", tenantID, err, out, errOut)
+		return "", "", fmt.Errorf("hilt create access key for %q: %w (stdout=%s stderr=%s)", tenantID, err, out, errOut)
 	}
 	var created struct {
 		AccessKeyID     string `json:"accessKeyId"`
 		SecretAccessKey string `json:"secretAccessKey"`
 	}
 	if err := json.Unmarshal([]byte(out), &created); err != nil {
-		t.Fatalf("parse access-key response %q: %v", out, err)
+		return "", "", fmt.Errorf("parse access-key response %q: %w", out, err)
 	}
 	if created.AccessKeyID == "" || created.SecretAccessKey == "" {
-		t.Fatalf("hilt returned incomplete credentials: %s", out)
+		return "", "", fmt.Errorf("hilt returned incomplete credentials: %s", out)
 	}
-	t.Logf("hilt tenant %q provisioned; access key %s", tenantID, created.AccessKeyID)
-	return created.AccessKeyID, created.SecretAccessKey
+	return created.AccessKeyID, created.SecretAccessKey, nil
 }
 
 // spoolBlobCount counts the body blobs in the ingot container's spool,
