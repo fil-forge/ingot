@@ -87,8 +87,12 @@ github.com/clipperhouse/uax29/v2 v2.7.0 h1:+gs4oBZ2gPfVrKPthwbMzWZDaAFPGYK72F0NJ
 github.com/clipperhouse/uax29/v2 v2.7.0/go.mod h1:EFJ2TJMRUaplDxHKj1qAEhCtQPW2tJSwu5BF98AuoVM=
 github.com/cloud-portable/s3tests/packages/go v0.0.0-20260904132608-a6a1ae6fc28c h1:zJR9KwYxLfwM4uKZdsl0o25OOl3MEUSFZHqcuiKmKAM=
 github.com/cloud-portable/s3tests/packages/go v0.0.0-20260904132608-a6a1ae6fc28c/go.mod h1:D9KyrAWDnciRxucDmw++gsIm30zchiufMvhNSp0a3R8=
+github.com/cloud-portable/s3tests/packages/go v0.0.0-20260904151428-8c4ec5e851a2 h1:UTBF9/f3EDEZWaJ7PnP4uwbg3hlq5D4+V2OYCT6OwoQ=
+github.com/cloud-portable/s3tests/packages/go v0.0.0-20260904151428-8c4ec5e851a2/go.mod h1:ZYdNcXgxI8XtKe3bzVmILz1goDtxmzeNkTFVxMfm2tA=
 github.com/cloud-portable/s3vectors/packages/go v1.0.0 h1:6lmMcbDktsz2Sm9n7AU6tFOox1cmJI5pbfBFhhhZYWk=
 github.com/cloud-portable/s3vectors/packages/go v1.0.0/go.mod h1:UVVpQAo0GCbDK9jUGhZygn1J1vaaLyMi+FMUbC/zsqs=
+github.com/cloud-portable/s3vectors/packages/go v1.0.1-0.20260904130847-c0f546795ba3 h1:eh1Vo8oqBc/JBoFDwfThYMnlNDkvwdqLeTQSEMVeSO0=
+github.com/cloud-portable/s3vectors/packages/go v1.0.1-0.20260904130847-c0f546795ba3/go.mod h1:UVVpQAo0GCbDK9jUGhZygn1J1vaaLyMi+FMUbC/zsqs=
 github.com/cloudflare/circl v1.6.3 h1:9GPOhQGF9MCYUeXyMYlqTR6a5gTrgR/fBLXvUgtVcg8=
 github.com/cloudflare/circl v1.6.3/go.mod h1:2eXP6Qfat4O/Yhh8BznvKnJ+uzEoTQ6jVKJRn81BiS4=
 github.com/codahale/rfc6979 v0.0.0-20141003034818-6a90f24967eb h1:EDmT6Q9Zs+SbUoc7Ik9EfrFqcylYqgPZ9ANSbTAntnE=
