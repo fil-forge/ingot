@@ -12,11 +12,11 @@ import (
 	"testing"
 	"time"
 
-	s3tests "github.com/alanshaw/s3tests/packages/go"
-	"github.com/alanshaw/s3tests/packages/go/report"
-	"github.com/alanshaw/s3tests/packages/go/report/gotest"
-	"github.com/alanshaw/s3tests/packages/go/report/html"
 	"github.com/aws/aws-sdk-go-v2/credentials"
+	s3tests "github.com/cloud-portable/s3tests/packages/go"
+	"github.com/cloud-portable/s3tests/packages/go/report"
+	"github.com/cloud-portable/s3tests/packages/go/report/gotest"
+	"github.com/cloud-portable/s3tests/packages/go/report/html"
 )
 
 // TestForgeS3Compat runs the cloud-portable S3 compatibility corpus (via the
@@ -131,6 +131,7 @@ func TestForgeS3Compat(t *testing.T) {
 		selected,
 		s3tests.Skip("Bucket ACLs are not supported", s3tests.IDs("bucket-0022", "bucket-0023")),
 		s3tests.Skip("PutBucketOwnershipControls are not supported", s3tests.IDs("bucket-0026")),
+		s3tests.Skip("us-east-1 legacy 200-on-recreate; the target signs us-west-1 (see bucket-0039)", s3tests.Tags("quirk:us-east-1-legacy")),
 	)
 	gotest.Run(t, func(yield func(s3tests.VectorResult) bool) {
 		for v := range raw {

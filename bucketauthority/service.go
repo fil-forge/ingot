@@ -17,6 +17,7 @@ var (
 	ErrNotFound        = errors.New("bucketauthority: bucket not found")
 	ErrNotEmpty        = errors.New("bucketauthority: bucket not empty")
 	ErrExists          = errors.New("bucketauthority: bucket already exists")
+	ErrAlreadyOwned    = errors.New("bucketauthority: bucket already owned by you")
 	ErrInvalidArgument = errors.New("bucketauthority: invalid argument")
 )
 
@@ -41,8 +42,13 @@ func (s *Service) CreateBucket(ctx context.Context, req s3.Request) (did.DID, er
 	createOK, _, err := s.client.CreateBucket(ctx, req)
 	if err != nil {
 		var namedErr ucanerr.Named
-		if errors.As(err, &namedErr) && namedErr.Name() == bucketrpc.BucketExistsErrorName {
-			return did.Undef, ErrExists
+		if errors.As(err, &namedErr) {
+			switch namedErr.Name() {
+			case bucketrpc.BucketExistsErrorName:
+				return did.Undef, ErrExists
+			case bucketrpc.BucketAlreadyOwnedErrorName:
+				return did.Undef, ErrAlreadyOwned
+			}
 		}
 		return did.Undef, err
 	}

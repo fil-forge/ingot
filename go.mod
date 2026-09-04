@@ -4,15 +4,15 @@ go 1.27.0
 
 require (
 	github.com/alanshaw/dag-json-gen v0.0.9
-	github.com/alanshaw/s3tests/packages/go v0.0.0-20260903131507-f7adc04f9484
 	github.com/aws/aws-sdk-go-v2 v1.43.8
 	github.com/aws/aws-sdk-go-v2/config v1.32.39
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.38
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.107.4
 	github.com/cenkalti/backoff/v5 v5.0.3
-	github.com/fil-forge/hilt v0.0.1-0.20260828114936-cb1bc0b84e7b
+	github.com/cloud-portable/s3tests/packages/go v0.0.0-20260904132608-a6a1ae6fc28c
+	github.com/fil-forge/hilt v0.0.1-0.20260904141318-f842aba7be7a
 	github.com/fil-forge/indexing-service v1.13.5-0.20260820151722-9eb620409a4e
-	github.com/fil-forge/libforge v0.0.0-20260901152319-eb2ac109f27a
+	github.com/fil-forge/libforge v0.0.0-20260904125112-81372e7200bf
 	github.com/fil-forge/smelt v0.0.0-20260828105933-8ba0939fb9a7
 	github.com/fil-forge/swarf v0.0.1-0.20260821142121-d5d1a0a56f00
 	github.com/fil-forge/ucantone v0.0.0-20260827134420-25cf8340b9a1
@@ -52,7 +52,6 @@ require (
 	github.com/DefangLabs/secret-detector v0.0.0-20250811234530-d4b4214cd679 // indirect
 	github.com/Microsoft/go-winio v0.6.3-0.20251027160822-ad3df93bed29 // indirect
 	github.com/acarl005/stripansi v0.0.0-20180116102854-5a71ef0e047d // indirect
-	github.com/alanshaw/s3vectors/packages/go v1.0.1-0.20260903130806-99f00eee4d2f // indirect
 	github.com/andybalholm/brotli v1.2.2 // indirect
 	github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream v1.7.19 // indirect
 	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.18.39 // indirect
@@ -74,6 +73,7 @@ require (
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/clipperhouse/uax29/v2 v2.7.0 // indirect
+	github.com/cloud-portable/s3vectors/packages/go v1.0.0 // indirect
 	github.com/compose-spec/compose-go/v2 v2.12.1 // indirect
 	github.com/containerd/console v1.0.5 // indirect
 	github.com/containerd/containerd/api v1.11.1 // indirect

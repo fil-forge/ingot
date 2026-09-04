@@ -271,6 +271,9 @@ func (b *Backend) CreateBucket(ctx context.Context, input *s3.CreateBucketInput,
 	}
 	id, err := b.authority.CreateBucket(ctx, req)
 	if err != nil {
+		if errors.Is(err, bucketauthority.ErrAlreadyOwned) {
+			return s3err.GetAPIError(s3err.ErrBucketAlreadyOwnedByYou)
+		}
 		if errors.Is(err, bucketauthority.ErrExists) {
 			return s3err.GetAPIError(s3err.ErrBucketAlreadyExists)
 		}
