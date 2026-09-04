@@ -9,13 +9,14 @@ require (
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.38
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.107.4
 	github.com/cenkalti/backoff/v5 v5.0.3
-	github.com/fil-forge/hilt v0.0.1-0.20260828114936-cb1bc0b84e7b
+	github.com/cloud-portable/s3tests/packages/go v0.0.0-20260904151428-8c4ec5e851a2
+	github.com/fil-forge/hilt v0.0.1-0.20260904141318-f842aba7be7a
 	github.com/fil-forge/indexing-service v1.13.5-0.20260820151722-9eb620409a4e
-	github.com/fil-forge/libforge v0.0.0-20260901152319-eb2ac109f27a
+	github.com/fil-forge/libforge v0.0.0-20260904125112-81372e7200bf
 	github.com/fil-forge/smelt v0.0.0-20260828105933-8ba0939fb9a7
 	github.com/fil-forge/swarf v0.0.1-0.20260821142121-d5d1a0a56f00
 	github.com/fil-forge/ucantone v0.0.0-20260827134420-25cf8340b9a1
-	github.com/fil-forge/versitygw v0.0.0-20260716095011-7a65883d595a
+	github.com/fil-forge/versitygw v0.0.0-20260904185814-00da8d2b13c5
 	github.com/filecoin-project/go-fee v0.1.1-0.20260826122013-1c3970b90b0d
 	github.com/gofiber/fiber/v3 v3.5.0
 	github.com/google/uuid v1.6.0
@@ -68,9 +69,11 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sts v1.45.8 // indirect
 	github.com/aws/smithy-go v1.27.10 // indirect
 	github.com/buger/goterm v1.0.4 // indirect
+	github.com/cbroglie/mustache v1.4.2 // indirect
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/clipperhouse/uax29/v2 v2.7.0 // indirect
+	github.com/cloud-portable/s3vectors/packages/go v1.0.1-0.20260904130847-c0f546795ba3 // indirect
 	github.com/compose-spec/compose-go/v2 v2.12.1 // indirect
 	github.com/containerd/console v1.0.5 // indirect
 	github.com/containerd/containerd/api v1.11.1 // indirect

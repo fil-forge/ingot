@@ -33,3 +33,6 @@ go.work.sum
 # Editor/IDE
 .idea/
 .vscode/
+
+# Local S3 compatibility report (TestForgeS3Compat, INGOT_S3COMPAT=1)
+itest/ingot-s3compat*.html
