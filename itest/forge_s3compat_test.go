@@ -99,6 +99,7 @@ func TestForgeS3Compat(t *testing.T) {
 		filters = append(filters, s3tests.Tags(strings.Split(tags, ",")...))
 		properties["tags"] = tags
 	}
+	filters = append(filters, s3tests.ExcludeTags("quirk:not-aws"))
 	selected := s3tests.ApplyFilters(vectors, filters...)
 	if len(selected) == 0 {
 		t.Fatalf("no vectors selected (groups=%q tags=%q)", os.Getenv("INGOT_S3COMPAT_GROUPS"), os.Getenv("INGOT_S3COMPAT_TAGS"))
@@ -125,7 +126,12 @@ func TestForgeS3Compat(t *testing.T) {
 	// the tee captures every result as it passes through, so the HTML render
 	// below replays the same run without executing it twice.
 	collected := make([]s3tests.VectorResult, 0, len(selected))
-	raw := runner.Run(ctx, selected)
+	raw := runner.Run(
+		ctx,
+		selected,
+		s3tests.Skip("Bucket ACLs are not supported", s3tests.IDs("bucket-0022", "bucket-0023")),
+		s3tests.Skip("PutBucketOwnershipControls are not supported", s3tests.IDs("bucket-0026")),
+	)
 	gotest.Run(t, func(yield func(s3tests.VectorResult) bool) {
 		for v := range raw {
 			collected = append(collected, v)
