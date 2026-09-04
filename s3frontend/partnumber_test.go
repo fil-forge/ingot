@@ -12,7 +12,8 @@ import (
 // TestPartRange locks the GET/HEAD ?partNumber=N contract (docs/architecture.md
 // §7.2): a multipart object addresses parts by recorded boundary, a single-PUT
 // object exposes the whole body as part 1, a zero-byte object yields no range,
-// and a partNumber past the part count is a 416 (ErrInvalidPartNumberRange).
+// and a partNumber past the part count is rejected — 416 InvalidPartNumber for a
+// multipart object, 400 InvalidPart for a non-multipart object (matching AWS).
 func TestPartRange(t *testing.T) {
 	const mib = int64(5 << 20)
 	// A 3-part multipart object: 5 MiB + 5 MiB + 5 MiB = 15 MiB.
@@ -32,27 +33,28 @@ func TestPartRange(t *testing.T) {
 		wantLength int64
 		wantRange  bool
 		wantCount  *int32
-		wantErr    bool
+		wantErr    string // s3err Code; "" = no error
 	}{
-		{"mp part 1", mp, 1, 0, mib, true, &three, false},
-		{"mp part 2", mp, 2, mib, mib, true, &three, false},
-		{"mp part 3", mp, 3, 2 * mib, mib, true, &three, false},
-		{"mp exceeds", mp, 4, 0, 0, false, nil, true},
+		{"mp part 1", mp, 1, 0, mib, true, &three, ""},
+		{"mp part 2", mp, 2, mib, mib, true, &three, ""},
+		{"mp part 3", mp, 3, 2 * mib, mib, true, &three, ""},
+		{"mp exceeds", mp, 4, 0, 0, false, nil, "InvalidPartNumber"},
 		// A zero-length part: parts-count still reported, but no byte range (so no
 		// Content-Range), mirroring a zero-byte object rather than emitting a
 		// malformed "bytes start-(start-1)".
-		{"mp zero-length part", zeroPart, 2, mib, 0, false, &three, false},
-		{"single part 1 = whole object", single, 1, 0, 1234, true, nil, false},
-		{"single part 2 exceeds", single, 2, 0, 0, false, nil, true},
-		{"empty part 1 = no range", empty, 1, 0, 0, false, nil, false},
-		{"empty part 2 exceeds", empty, 2, 0, 0, false, nil, true},
+		{"mp zero-length part", zeroPart, 2, mib, 0, false, &three, ""},
+		{"single part 1 = whole object", single, 1, 0, 1234, true, nil, ""},
+		{"single part 2 exceeds", single, 2, 0, 0, false, nil, "InvalidPart"},
+		{"empty part 1 = no range", empty, 1, 0, 0, false, nil, ""},
+		{"empty part 2 exceeds", empty, 2, 0, 0, false, nil, "InvalidPart"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			start, length, isRange, count, err := partRange(tc.body, tc.part)
-			if tc.wantErr {
-				if !errors.Is(err, s3err.GetAPIError(s3err.ErrInvalidPartNumberRange)) {
-					t.Fatalf("err = %v, want ErrInvalidPartNumberRange", err)
+			if tc.wantErr != "" {
+				var apiErr s3err.APIError
+				if !errors.As(err, &apiErr) || apiErr.Code != tc.wantErr {
+					t.Fatalf("err = %v, want code %s", err, tc.wantErr)
 				}
 				return
 			}
