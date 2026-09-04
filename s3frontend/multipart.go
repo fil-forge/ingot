@@ -27,7 +27,6 @@ import (
 
 	msbucket "github.com/fil-forge/ingot/bucket"
 	"github.com/fil-forge/ingot/internal/reqscope"
-	"github.com/fil-forge/ingot/mst"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/uploader"
 )
@@ -53,8 +52,8 @@ func (b *Backend) CreateMultipartUpload(ctx context.Context, input s3response.Cr
 		return s3response.InitiateMultipartUploadResult{}, s3err.GetAPIError(s3err.ErrInvalidRequest)
 	}
 	bucket, key := *input.Bucket, *input.Key
-	if !mst.IsValidKey(key) {
-		return s3response.InitiateMultipartUploadResult{}, s3err.GetAPIError(s3err.ErrInvalidRequest)
+	if err := objectKeyError(key); err != nil {
+		return s3response.InitiateMultipartUploadResult{}, err
 	}
 	// A directory object (trailing "/") is zero-length by definition; a
 	// multipart upload to one necessarily carries data.
@@ -101,7 +100,7 @@ func (b *Backend) CreateMultipartUpload(ctx context.Context, input s3response.Cr
 		ObjectKey:               key,
 		State:                   registry.SessionOpen,
 		ContentType:             ct,
-		ContentEncoding:         backend.GetStringFromPtr(input.ContentEncoding),
+		ContentEncoding:         normalizeContentEncoding(backend.GetStringFromPtr(input.ContentEncoding)),
 		ContentDisposition:      backend.GetStringFromPtr(input.ContentDisposition),
 		ContentLanguage:         backend.GetStringFromPtr(input.ContentLanguage),
 		CacheControl:            backend.GetStringFromPtr(input.CacheControl),

@@ -85,12 +85,8 @@ github.com/cespare/xxhash/v2 v2.3.0 h1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UF
 github.com/cespare/xxhash/v2 v2.3.0/go.mod h1:VGX0DQ3Q6kWi7AoAeZDth3/j3BFtOZR5XLFGgcrjCOs=
 github.com/clipperhouse/uax29/v2 v2.7.0 h1:+gs4oBZ2gPfVrKPthwbMzWZDaAFPGYK72F0NJv2v7Vk=
 github.com/clipperhouse/uax29/v2 v2.7.0/go.mod h1:EFJ2TJMRUaplDxHKj1qAEhCtQPW2tJSwu5BF98AuoVM=
-github.com/cloud-portable/s3tests/packages/go v0.0.0-20260904132608-a6a1ae6fc28c h1:zJR9KwYxLfwM4uKZdsl0o25OOl3MEUSFZHqcuiKmKAM=
-github.com/cloud-portable/s3tests/packages/go v0.0.0-20260904132608-a6a1ae6fc28c/go.mod h1:D9KyrAWDnciRxucDmw++gsIm30zchiufMvhNSp0a3R8=
 github.com/cloud-portable/s3tests/packages/go v0.0.0-20260904151428-8c4ec5e851a2 h1:UTBF9/f3EDEZWaJ7PnP4uwbg3hlq5D4+V2OYCT6OwoQ=
 github.com/cloud-portable/s3tests/packages/go v0.0.0-20260904151428-8c4ec5e851a2/go.mod h1:ZYdNcXgxI8XtKe3bzVmILz1goDtxmzeNkTFVxMfm2tA=
-github.com/cloud-portable/s3vectors/packages/go v1.0.0 h1:6lmMcbDktsz2Sm9n7AU6tFOox1cmJI5pbfBFhhhZYWk=
-github.com/cloud-portable/s3vectors/packages/go v1.0.0/go.mod h1:UVVpQAo0GCbDK9jUGhZygn1J1vaaLyMi+FMUbC/zsqs=
 github.com/cloud-portable/s3vectors/packages/go v1.0.1-0.20260904130847-c0f546795ba3 h1:eh1Vo8oqBc/JBoFDwfThYMnlNDkvwdqLeTQSEMVeSO0=
 github.com/cloud-portable/s3vectors/packages/go v1.0.1-0.20260904130847-c0f546795ba3/go.mod h1:UVVpQAo0GCbDK9jUGhZygn1J1vaaLyMi+FMUbC/zsqs=
 github.com/cloudflare/circl v1.6.3 h1:9GPOhQGF9MCYUeXyMYlqTR6a5gTrgR/fBLXvUgtVcg8=
@@ -199,8 +195,8 @@ github.com/fil-forge/swarf v0.0.1-0.20260821142121-d5d1a0a56f00 h1:uSJ2YCxOJQA7P
 github.com/fil-forge/swarf v0.0.1-0.20260821142121-d5d1a0a56f00/go.mod h1:k1gay5Byjloml4k1SylxhRff1rMH4LcGKpbMEDLZR1o=
 github.com/fil-forge/ucantone v0.0.0-20260827134420-25cf8340b9a1 h1:Tzy3lZ7+LAyVK4+qyWM97UMOtnXx05Wdn+rcTDLdBDE=
 github.com/fil-forge/ucantone v0.0.0-20260827134420-25cf8340b9a1/go.mod h1:aX35jlUs3hnWAhigjO8z9kMPiYnkW3XOW8iVoJyz7cg=
-github.com/fil-forge/versitygw v0.0.0-20260716095011-7a65883d595a h1:lDwnNmF4LNbevx/YYNCC0CazMiL4eIe38MvfqbRR3RA=
-github.com/fil-forge/versitygw v0.0.0-20260716095011-7a65883d595a/go.mod h1:t73Wa2xqpT0NdY+SzRZDiO+tQD13b3UEZRoe2wYFiIE=
+github.com/fil-forge/versitygw v0.0.0-20260904185814-00da8d2b13c5 h1:4QDlcu4dwU9771KkosxUIVAGWyqzn0mCcCoZV9p69Kk=
+github.com/fil-forge/versitygw v0.0.0-20260904185814-00da8d2b13c5/go.mod h1:t73Wa2xqpT0NdY+SzRZDiO+tQD13b3UEZRoe2wYFiIE=
 github.com/filecoin-project/go-data-segment v0.0.1 h1:1wmDxOG4ubWQm3ZC1XI5nCon5qgSq7Ra3Rb6Dbu10Gs=
 github.com/filecoin-project/go-data-segment v0.0.1/go.mod h1:H0/NKbsRxmRFBcLibmABv+yFNHdmtl5AyplYLnb0Zv4=
 github.com/filecoin-project/go-fee v0.1.1-0.20260826122013-1c3970b90b0d h1:W+UJ3I79FKfdY0EcNelK1APMYXBZgXfx2OPLOiVEb7E=

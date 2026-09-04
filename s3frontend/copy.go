@@ -14,7 +14,6 @@ import (
 	"github.com/fil-forge/versitygw/s3response"
 
 	msbucket "github.com/fil-forge/ingot/bucket"
-	"github.com/fil-forge/ingot/mst"
 	"github.com/fil-forge/ingot/registry"
 )
 
@@ -35,8 +34,8 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 		return s3response.CopyObjectOutput{}, err
 	}
 	dstBucket, dstKey := *input.Bucket, *input.Key
-	if !mst.IsValidKey(dstKey) {
-		return s3response.CopyObjectOutput{}, s3err.GetAPIError(s3err.ErrInvalidRequest)
+	if err := objectKeyError(dstKey); err != nil {
+		return s3response.CopyObjectOutput{}, err
 	}
 
 	replace := input.MetadataDirective == types.MetadataDirectiveReplace
@@ -170,7 +169,7 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 			ct = "application/octet-stream"
 		}
 		dstMf.ContentType = ct
-		dstMf.ContentEncoding = backend.GetStringFromPtr(input.ContentEncoding)
+		dstMf.ContentEncoding = normalizeContentEncoding(backend.GetStringFromPtr(input.ContentEncoding))
 		dstMf.ContentDisposition = backend.GetStringFromPtr(input.ContentDisposition)
 		dstMf.ContentLanguage = backend.GetStringFromPtr(input.ContentLanguage)
 		dstMf.CacheControl = backend.GetStringFromPtr(input.CacheControl)
