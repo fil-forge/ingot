@@ -118,7 +118,23 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 	// that references it is committed (docs/architecture.md §7.1).
 	bodyRec, err := b.ingestBody(ctx, bucketState, bodyReader)
 	if err != nil {
-		// A checksum mismatch surfaces as an API error from the HashReader.
+		// A checksum/digest mismatch surfaces from the HashReader. BadDigestError,
+		// InvalidDigestError, and ContentSHA256MismatchError embed APIError but are
+		// distinct concrete types, so errors.As against APIError won't match them;
+		// surface each verbatim so its 400 status and XML body reach the versitygw
+		// renderer (a generic %w wrap degrades it to InternalError).
+		var bd s3err.BadDigestError
+		if errors.As(err, &bd) {
+			return s3response.PutObjectOutput{}, bd
+		}
+		var idg s3err.InvalidDigestError
+		if errors.As(err, &idg) {
+			return s3response.PutObjectOutput{}, idg
+		}
+		var csm s3err.ContentSHA256MismatchError
+		if errors.As(err, &csm) {
+			return s3response.PutObjectOutput{}, csm
+		}
 		var apiErr s3err.APIError
 		if errors.As(err, &apiErr) {
 			return s3response.PutObjectOutput{}, apiErr
@@ -513,9 +529,11 @@ func partRange(body msbucket.Body, partNumber int32) (start, length int64, isRan
 		// The parts-count is still reported.
 		return start, length, length > 0, &n, nil
 	}
-	// Non-multipart object: a single logical part covering the whole body.
+	// Non-multipart object: a single logical part covering the whole body. A
+	// partNumber past that single part is ErrInvalidPart (HTTP 400), matching
+	// AWS for a GET partNumber on a non-multipart object.
 	if partNumber != 1 {
-		return 0, 0, false, nil, s3err.GetAPIError(s3err.ErrInvalidPartNumberRange)
+		return 0, 0, false, nil, s3err.GetAPIError(s3err.ErrInvalidPart)
 	}
 	if body.Size == 0 {
 		// A zero-byte object has no range; S3 omits Content-Range and returns 200.
@@ -644,13 +662,16 @@ func (b *Backend) GetObjectAttributes(ctx context.Context, input *s3.GetObjectAt
 	})
 	if err != nil {
 		// A version-scoped delete marker surfaces as ErrMethodNotAllowed with a
-		// populated head output; report it as NoSuchKey but carry the marker and
-		// version so the controller still emits those headers.
+		// populated head output; GetObjectAttributes on such a version returns
+		// 405 MethodNotAllowed (matching AWS), carrying the marker and version so
+		// the controller still emits those headers. The current-marker case
+		// (no versionId) surfaces as ErrNoSuchKey from HeadObject and falls
+		// through below as a 404.
 		if errors.Is(err, s3err.GetAPIError(s3err.ErrMethodNotAllowed)) && data != nil {
 			return s3response.GetObjectAttributesResponse{
 				DeleteMarker: data.DeleteMarker,
 				VersionId:    data.VersionId,
-			}, s3err.GetAPIError(s3err.ErrNoSuchKey)
+			}, s3err.GetAPIError(s3err.ErrMethodNotAllowed)
 		}
 		return s3response.GetObjectAttributesResponse{}, err
 	}
@@ -1073,7 +1094,9 @@ func (b *Backend) ListObjects(ctx context.Context, input *s3.ListObjectsInput) (
 		maxKeys = *input.MaxKeys
 	}
 	limit := int(maxKeys)
-	if limit <= 0 {
+	// Default only when max-keys is unset; an explicit max-keys=0 must return an
+	// empty page (handled in listWalk), not be promoted to the default.
+	if input.MaxKeys == nil {
 		limit = defaultMaxKeys
 	}
 
@@ -1091,7 +1114,7 @@ func (b *Backend) ListObjects(ctx context.Context, input *s3.ListObjectsInput) (
 	out := s3response.ListObjectsResult{
 		Name:           &bucketName,
 		Prefix:         &prefix,
-		Delimiter:      &delimiter,
+		Delimiter:      strPtrOrNil(delimiter),
 		MaxKeys:        &maxKeys,
 		IsTruncated:    &res.truncated,
 		Contents:       res.contents,
@@ -1133,7 +1156,9 @@ func (b *Backend) ListObjectsV2(ctx context.Context, input *s3.ListObjectsV2Inpu
 		maxKeys = *input.MaxKeys
 	}
 	limit := int(maxKeys)
-	if limit <= 0 {
+	// Default only when max-keys is unset; an explicit max-keys=0 must return an
+	// empty page (handled in listWalk), not be promoted to the default.
+	if input.MaxKeys == nil {
 		limit = defaultMaxKeys
 	}
 
@@ -1152,7 +1177,7 @@ func (b *Backend) ListObjectsV2(ctx context.Context, input *s3.ListObjectsV2Inpu
 	out := s3response.ListObjectsV2Result{
 		Name:           &bucketName,
 		Prefix:         &prefix,
-		Delimiter:      &delimiter,
+		Delimiter:      strPtrOrNil(delimiter),
 		MaxKeys:        &maxKeys,
 		KeyCount:       &keyCount,
 		IsTruncated:    &res.truncated,
@@ -1191,6 +1216,10 @@ func (b *Backend) listWalk(ctx context.Context, bucketName, prefix, delimiter, f
 	out := listWalkResult{
 		contents:       []s3response.Object{},
 		commonPrefixes: []types.CommonPrefix{},
+	}
+	// An explicit max-keys=0 lists nothing and is never truncated.
+	if limit <= 0 {
+		return out, nil
 	}
 
 	st, err := b.reg.Get(ctx, bucketName)
