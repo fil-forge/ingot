@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"strings"
 	"time"
 
@@ -43,8 +44,8 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 	}
 	bucketName := *input.Bucket
 	key := *input.Key
-	if !mst.IsValidKey(key) {
-		return s3response.PutObjectOutput{}, s3err.GetAPIError(s3err.ErrInvalidRequest)
+	if err := objectKeyError(key); err != nil {
+		return s3response.PutObjectOutput{}, err
 	}
 
 	contentType := backend.GetStringFromPtr(input.ContentType)
@@ -141,7 +142,7 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 		ChecksumAlgorithm:       ckAlgo,
 		Checksum:                ckVal,
 		ChecksumType:            string(types.ChecksumTypeFullObject),
-		ContentEncoding:         backend.GetStringFromPtr(input.ContentEncoding),
+		ContentEncoding:         normalizeContentEncoding(backend.GetStringFromPtr(input.ContentEncoding)),
 		ContentDisposition:      backend.GetStringFromPtr(input.ContentDisposition),
 		ContentLanguage:         backend.GetStringFromPtr(input.ContentLanguage),
 		CacheControl:            backend.GetStringFromPtr(input.CacheControl),
@@ -561,6 +562,15 @@ func (b *Backend) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s
 		IfModSince:    input.IfModifiedSince,
 		IfUnmodeSince: input.IfUnmodifiedSince,
 	}); err != nil {
+		// A 304 Not Modified must carry the object's ETag (RFC 7232 §4.1):
+		// return the metadata alongside the not-modified error so the S3 API
+		// layer emits the ETag header. Other precondition failures (e.g. 412
+		// PreconditionFailed) return no metadata.
+		var apiErr s3err.APIError
+		if errors.As(err, &apiErr) && apiErr.HTTPStatusCode == http.StatusNotModified {
+			ifEtag := etagOf(mf)
+			return &s3.HeadObjectOutput{ETag: &ifEtag, LastModified: &lastModified}, err
+		}
 		return nil, err
 	}
 	etag := etagOf(mf)
@@ -619,6 +629,55 @@ func (b *Backend) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s
 	return out, nil
 }
 
+// GetObjectAttributes reports an object's size, ETag, storage class and
+// checksum. It reads the same metadata as HeadObject; the controller filters
+// the result down to the attributes the client requested. ObjectParts is left
+// nil: the manifest stores per-part sizes but no per-part checksums/etags, so
+// there is nothing faithful to report, and the shipped posix/azure backends
+// likewise omit it.
+func (b *Backend) GetObjectAttributes(ctx context.Context, input *s3.GetObjectAttributesInput) (s3response.GetObjectAttributesResponse, error) {
+	data, err := b.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket:       input.Bucket,
+		Key:          input.Key,
+		VersionId:    input.VersionId,
+		ChecksumMode: types.ChecksumModeEnabled,
+	})
+	if err != nil {
+		// A version-scoped delete marker surfaces as ErrMethodNotAllowed with a
+		// populated head output; report it as NoSuchKey but carry the marker and
+		// version so the controller still emits those headers.
+		if errors.Is(err, s3err.GetAPIError(s3err.ErrMethodNotAllowed)) && data != nil {
+			return s3response.GetObjectAttributesResponse{
+				DeleteMarker: data.DeleteMarker,
+				VersionId:    data.VersionId,
+			}, s3err.GetAPIError(s3err.ErrNoSuchKey)
+		}
+		return s3response.GetObjectAttributesResponse{}, err
+	}
+
+	return s3response.GetObjectAttributesResponse{
+		ETag:         backend.TrimEtag(data.ETag),
+		ObjectSize:   data.ContentLength,
+		StorageClass: data.StorageClass,
+		LastModified: data.LastModified,
+		VersionId:    data.VersionId,
+		DeleteMarker: data.DeleteMarker,
+		Checksum: &types.Checksum{
+			ChecksumCRC32:     data.ChecksumCRC32,
+			ChecksumCRC32C:    data.ChecksumCRC32C,
+			ChecksumSHA1:      data.ChecksumSHA1,
+			ChecksumSHA256:    data.ChecksumSHA256,
+			ChecksumCRC64NVME: data.ChecksumCRC64NVME,
+			ChecksumSHA512:    data.ChecksumSHA512,
+			ChecksumMD5:       data.ChecksumMD5,
+			ChecksumXXHASH64:  data.ChecksumXXHASH64,
+			ChecksumXXHASH3:   data.ChecksumXXHASH3,
+			ChecksumXXHASH128: data.ChecksumXXHASH128,
+			ChecksumType:      data.ChecksumType,
+		},
+	}, nil
+}
+
 // GetObject returns an object body — the current version or the one named by
 // `?versionId` — optionally restricted to a byte range supplied via the Range
 // header. The body io.ReadCloser is owned by the caller (versitygw closes it
@@ -649,12 +708,22 @@ func (b *Backend) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.
 		}
 		return mout, s3err.GetAPIError(s3err.ErrMethodNotAllowed)
 	}
-	if err := backend.EvaluatePreconditions(etagOf(mf), time.Unix(mf.Created, 0), backend.PreConditions{
+	getLastModified := time.Unix(mf.Created, 0)
+	if err := backend.EvaluatePreconditions(etagOf(mf), getLastModified, backend.PreConditions{
 		IfMatch:       input.IfMatch,
 		IfNoneMatch:   input.IfNoneMatch,
 		IfModSince:    input.IfModifiedSince,
 		IfUnmodeSince: input.IfUnmodifiedSince,
 	}); err != nil {
+		// A 304 Not Modified must carry the object's ETag (RFC 7232 §4.1):
+		// return the metadata alongside the not-modified error so the S3 API
+		// layer emits the ETag header. Other precondition failures (e.g. 412
+		// PreconditionFailed) return no metadata.
+		var apiErr s3err.APIError
+		if errors.As(err, &apiErr) && apiErr.HTTPStatusCode == http.StatusNotModified {
+			ifEtag := etagOf(mf)
+			return &s3.GetObjectOutput{ETag: &ifEtag, LastModified: &getLastModified}, err
+		}
 		return nil, err
 	}
 
@@ -1226,4 +1295,37 @@ func strPtrOrNil(s string) *string {
 		return nil
 	}
 	return &s
+}
+
+// objectKeyError validates an object key for storage and returns the S3 error
+// to surface, or nil when the key is acceptable. A key over the size limit is
+// reported as KeyTooLongError (matching AWS); other invalid keys (empty,
+// non-UTF-8, NUL) are InvalidRequest.
+func objectKeyError(key string) error {
+	if len(key) > mst.MaxKeyBytes {
+		return s3err.GetAPIError(s3err.ErrKeyTooLong)
+	}
+	if !mst.IsValidKey(key) {
+		return s3err.GetAPIError(s3err.ErrInvalidRequest)
+	}
+	return nil
+}
+
+// normalizeContentEncoding drops the aws-chunked transfer token(s) from a
+// Content-Encoding value. aws-chunked marks a SigV4 streaming payload, not a
+// real content encoding, so S3 does not persist it; a value consisting only of
+// aws-chunked tokens normalizes to "" and is stored as no encoding.
+func normalizeContentEncoding(enc string) string {
+	if enc == "" {
+		return ""
+	}
+	var kept []string
+	for _, tok := range strings.Split(enc, ",") {
+		tok = strings.TrimSpace(tok)
+		if tok == "" || strings.EqualFold(tok, "aws-chunked") {
+			continue
+		}
+		kept = append(kept, tok)
+	}
+	return strings.Join(kept, ", ")
 }

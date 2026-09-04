@@ -4,12 +4,8 @@ go 1.27.0
 
 require (
 	github.com/alanshaw/dag-json-gen v0.0.9
-<<<<<<< HEAD
 	github.com/alanshaw/s3tests/packages/go v0.0.0-20260903131507-f7adc04f9484
 	github.com/aws/aws-sdk-go-v2 v1.45.1
-=======
-	github.com/aws/aws-sdk-go-v2 v1.43.8
->>>>>>> 544ff96 (fix: already owned bucket)
 	github.com/aws/aws-sdk-go-v2/config v1.32.39
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.38
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.107.4

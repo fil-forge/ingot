@@ -30,8 +30,8 @@ var putObjectPass = []forgeCase{
 	{name: "invalid_checksum_header", fn: integration.PutObject_invalid_checksum_header},
 	{name: "invalid_legal_hold", fn: integration.PutObject_invalid_legal_hold},
 	{name: "invalid_object_lock_mode", fn: integration.PutObject_invalid_object_lock_mode},
-	{name: "invalid_object_names", fn: integration.PutObject_invalid_object_names},
 	{name: "invalid_retain_until_date", fn: integration.PutObject_invalid_retain_until_date},
+	{name: "should_combine_metadata", fn: integration.PutObject_should_combine_metadata},
 	{name: "invalid_website_redirect_location", fn: integration.PutObject_invalid_website_redirect_location},
 	{name: "long_metadata", fn: integration.PutObject_long_metadata},
 	{name: "missing_bucket_lock", fn: integration.PutObject_missing_bucket_lock},
@@ -53,9 +53,12 @@ var putObjectPass = []forgeCase{
 var putObjectXFail = []forgeCase{
 	// The incorrect_md5 subcheck expects 400 InvalidDigest; ingot 500s.
 	{name: "md5", fn: integration.PutObject_md5},
-	// A metadata-combining re-PUT is denied (403) under the hilt authorize
-	// flow.
-	{name: "should_combine_metadata", fn: integration.PutObject_should_combine_metadata},
+	// This posix-oriented conformance test asserts path-traversal keys
+	// (e.g. "../../../etc/passwd") are rejected. Ingot stores keys as opaque
+	// MST byte strings, not filesystem paths, so such keys are legal literal
+	// S3 keys and are accepted (matching AWS); the test's bundled sentinels
+	// (".", "..", "//") are still rejected. The divergence is intentional.
+	{name: "invalid_object_names", fn: integration.PutObject_invalid_object_names},
 	{name: "object_acl_not_supported", fn: integration.PutObject_object_acl_not_supported},
 	// with_object_lock passes but needs the versioned teardown: it runs as
 	// LockCreation/PutObject_with_object_lock (versity_lock_test.go).

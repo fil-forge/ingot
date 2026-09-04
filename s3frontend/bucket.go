@@ -422,23 +422,71 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 	})
 }
 
-// validBucketName mirrors the rules from the prior bucket.Service:
-// 3-63 chars, lowercase letters, digits, dots, dashes; cannot begin
-// with a dot or dash. This is the S3 DNS-compliant subset.
+// validBucketName enforces AWS's general-purpose bucket naming rules
+// (https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucketnamingrules.html):
+// 3-63 characters; only lowercase letters, digits, dots and hyphens; must
+// begin and end with a letter or digit; no consecutive dots and no dot
+// adjacent to a hyphen (every dot-separated label begins and ends
+// alphanumeric); not formatted as an IPv4 address; and none of the reserved
+// prefixes/suffixes. A false result maps to S3 InvalidBucketName.
 func validBucketName(s string) bool {
 	if len(s) < 3 || len(s) > 63 {
 		return false
 	}
+	// Reserved prefixes and suffixes (AWS).
+	if strings.HasPrefix(s, "xn--") || strings.HasPrefix(s, "sthree-") {
+		return false
+	}
+	if strings.HasSuffix(s, "-s3alias") || strings.HasSuffix(s, "--ol-s3") {
+		return false
+	}
+	last := len(s) - 1
 	for i, r := range s {
 		switch {
-		case r >= 'a' && r <= 'z':
-		case r >= '0' && r <= '9':
-		case r == '-' || r == '.':
-			if i == 0 {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			// alphanumeric always allowed
+		case r == '-':
+			// hyphen may not be first or last, nor adjacent to a dot
+			if i == 0 || i == last || s[i-1] == '.' || s[i+1] == '.' {
+				return false
+			}
+		case r == '.':
+			// dot may not be first or last, nor adjacent to a dot or hyphen
+			if i == 0 || i == last {
+				return false
+			}
+			if next := s[i+1]; next == '.' || next == '-' {
+				return false
+			}
+			if prev := s[i-1]; prev == '-' {
 				return false
 			}
 		default:
 			return false
+		}
+	}
+	// Must not be formatted as an IPv4 address (e.g. 192.168.1.1).
+	if isIPv4(s) {
+		return false
+	}
+	return true
+}
+
+// isIPv4 reports whether s is four dot-separated groups of 1-3 digits — the
+// IP-address form S3 forbids as a bucket name.
+func isIPv4(s string) bool {
+	parts := strings.Split(s, ".")
+	if len(parts) != 4 {
+		return false
+	}
+	for _, p := range parts {
+		if len(p) < 1 || len(p) > 3 {
+			return false
+		}
+		for _, r := range p {
+			if r < '0' || r > '9' {
+				return false
+			}
 		}
 	}
 	return true

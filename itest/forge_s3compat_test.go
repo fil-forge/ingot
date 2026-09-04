@@ -131,6 +131,8 @@ func TestForgeS3Compat(t *testing.T) {
 		selected,
 		s3tests.Skip("Bucket ACLs are not supported", s3tests.IDs("bucket-0022", "bucket-0023")),
 		s3tests.Skip("PutBucketOwnershipControls are not supported", s3tests.IDs("bucket-0026")),
+		s3tests.Skip("Bucket request-payment configuration is not supported", s3tests.IDs("bucket-0036")),
+		s3tests.Skip("Bucket transfer acceleration is not supported", s3tests.IDs("bucket-0037")),
 		s3tests.Skip("us-east-1 legacy 200-on-recreate; the target signs us-west-1 (see bucket-0039)", s3tests.Tags("quirk:us-east-1-legacy")),
 	)
 	gotest.Run(t, func(yield func(s3tests.VectorResult) bool) {
