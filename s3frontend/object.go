@@ -533,10 +533,11 @@ func partRange(body msbucket.Body, partNumber int32) (start, length int64, isRan
 		return start, length, length > 0, &n, nil
 	}
 	// Non-multipart object: a single logical part covering the whole body. A
-	// partNumber past that single part is ErrInvalidPart (HTTP 400), matching
-	// AWS for a GET partNumber on a non-multipart object.
+	// partNumber past that single part is ErrInvalidPartNumberRange (HTTP 416),
+	// matching AWS (verified: GET ?partNumber=2 on a single-part object returns
+	// 416 InvalidPartNumber).
 	if partNumber != 1 {
-		return 0, 0, false, nil, s3err.GetAPIError(s3err.ErrInvalidPart)
+		return 0, 0, false, nil, s3err.GetAPIError(s3err.ErrInvalidPartNumberRange)
 	}
 	if body.Size == 0 {
 		// A zero-byte object has no range; S3 omits Content-Range and returns 200.

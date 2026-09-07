@@ -12,8 +12,8 @@ import (
 // TestPartRange locks the GET/HEAD ?partNumber=N contract (docs/architecture.md
 // §7.2): a multipart object addresses parts by recorded boundary, a single-PUT
 // object exposes the whole body as part 1, a zero-byte object yields no range,
-// and a partNumber past the part count is rejected — 416 InvalidPartNumber for a
-// multipart object, 400 InvalidPart for a non-multipart object (matching AWS).
+// and a partNumber past the part count is rejected with 416 InvalidPartNumber,
+// for both multipart and non-multipart objects (matching AWS).
 func TestPartRange(t *testing.T) {
 	const mib = int64(5 << 20)
 	// A 3-part multipart object: 5 MiB + 5 MiB + 5 MiB = 15 MiB.
@@ -44,9 +44,9 @@ func TestPartRange(t *testing.T) {
 		// malformed "bytes start-(start-1)".
 		{"mp zero-length part", zeroPart, 2, mib, 0, false, &three, ""},
 		{"single part 1 = whole object", single, 1, 0, 1234, true, nil, ""},
-		{"single part 2 exceeds", single, 2, 0, 0, false, nil, "InvalidPart"},
+		{"single part 2 exceeds", single, 2, 0, 0, false, nil, "InvalidPartNumber"},
 		{"empty part 1 = no range", empty, 1, 0, 0, false, nil, ""},
-		{"empty part 2 exceeds", empty, 2, 0, 0, false, nil, "InvalidPart"},
+		{"empty part 2 exceeds", empty, 2, 0, 0, false, nil, "InvalidPartNumber"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

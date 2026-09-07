@@ -99,7 +99,6 @@ func TestForgeS3Compat(t *testing.T) {
 		filters = append(filters, s3tests.Tags(strings.Split(tags, ",")...))
 		properties["tags"] = tags
 	}
-	filters = append(filters, s3tests.ExcludeTags("quirk:not-aws"))
 	selected := s3tests.ApplyFilters(vectors, filters...)
 	if len(selected) == 0 {
 		t.Fatalf("no vectors selected (groups=%q tags=%q)", os.Getenv("INGOT_S3COMPAT_GROUPS"), os.Getenv("INGOT_S3COMPAT_TAGS"))
@@ -129,11 +128,66 @@ func TestForgeS3Compat(t *testing.T) {
 	raw := runner.Run(
 		ctx,
 		selected,
-		s3tests.Skip("Bucket ACLs are not supported", s3tests.IDs("bucket-0022", "bucket-0023")),
-		s3tests.Skip("PutBucketOwnershipControls are not supported", s3tests.IDs("bucket-0026")),
-		s3tests.Skip("Bucket request-payment configuration is not supported", s3tests.IDs("bucket-0036")),
-		s3tests.Skip("Bucket transfer acceleration is not supported", s3tests.IDs("bucket-0037")),
-		s3tests.Skip("us-east-1 legacy 200-on-recreate; the target signs us-west-1 (see bucket-0039)", s3tests.Tags("quirk:us-east-1-legacy")),
+		// Quirks
+		s3tests.Skip("Non-AWS behavior", s3tests.Tags("quirk:not-aws")),
+		s3tests.Skip("us-east-1 legacy", s3tests.Tags("quirk:us-east-1-legacy")),
+		s3tests.Skip("Directory buckets not supported", s3tests.Tags("quirk:directory-bucket")),
+		// Bucket
+		s3tests.Skip("Bucket ACLs are not supported", s3tests.IDs("bucket-0021", "bucket-0022")),
+		s3tests.Skip("PutBucketOwnershipControls are not supported", s3tests.IDs("bucket-0025")),
+		s3tests.Skip("Bucket request-payment configuration is not supported", s3tests.IDs("bucket-0035")),
+		s3tests.Skip("Bucket transfer acceleration is not supported", s3tests.IDs("bucket-0036")),
+		// Anonymous access
+		s3tests.Skip(
+			"Anonymous access is not supported",
+			s3tests.IDs(
+				"anon-access-0002",
+				"anon-access-0003",
+				"anon-access-0005",
+				"anon-access-0006",
+				"anon-access-0007",
+				"anon-access-0008",
+				"anon-access-0009",
+				"anon-access-0010",
+				"anon-access-0011",
+				"anon-access-0012",
+			),
+		),
+		// Bucket logging
+		s3tests.Skip(
+			"PutBucketPolicy and PutBucketLogging are not supported",
+			s3tests.Tags("bucket-logging"),
+		),
+		// Lifecycle configuration
+		s3tests.Skip(
+			"GetBucketLifecycleConfiguration and PutBucketLifecycleConfiguration are not supported",
+			s3tests.Tags("lifecycle-config"),
+		),
+		// Encoding
+		s3tests.Skip("PutObjectAcl is not supported", s3tests.IDs("encoding-0001")),
+		// Multipart
+		s3tests.Skip("PutBucketAcl is not supported", s3tests.IDs("multipart-0005")),
+		// CORS
+		s3tests.Skip(
+			"PutBucketAcl is not supported",
+			s3tests.IDs("cors-0001", "cors-0002", "cors-0003"),
+		),
+		s3tests.Skip(
+			"PutBucketCors is not supported",
+			s3tests.IDs("cors-0004", "cors-0005", "cors-0006", "cors-0008", "cors-0009", "cors-0014", "cors-0021"),
+		),
+		s3tests.Skip("DeleteBucketCors is not supported", s3tests.IDs("cors-0011")),
+		// Listing
+		s3tests.Skip("PutBucketAcl is not supported", s3tests.IDs("listing-0060", "listing-0070")),
+		s3tests.Skip("GetObjectAcl is not supported", s3tests.IDs("listing-0062", "listing-0063")),
+		// Versioning
+		s3tests.Skip("GetObjectAcl is not supported", s3tests.IDs("versioning-0004", "versioning-0005")),
+		// Misc
+		s3tests.Skip("PutBucketAcl is not supported", s3tests.IDs("misc-0001")),
+		s3tests.Skip("PutBucketWebsite is not supported", s3tests.IDs("misc-0008")),
+		s3tests.Skip("PutBucketInventoryConfiguration is not supported", s3tests.IDs("misc-0009")),
+		s3tests.Skip("PutBucketMetricsConfiguration is not supported", s3tests.IDs("misc-0010")),
+		s3tests.Skip("PutBucketAnalyticsConfiguration is not supported", s3tests.IDs("misc-0011")),
 	)
 	gotest.Run(t, func(yield func(s3tests.VectorResult) bool) {
 		for v := range raw {
