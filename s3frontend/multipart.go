@@ -728,6 +728,14 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 		b.cleanupPartBlobs(ctx, bucketState.Space, uploadID, orphans, winners)
 	}
 
+	// The x-amz-version-id of the new version. Only an enabled bucket echoes it;
+	// a suspended bucket stores the object under the "null" version id but omits
+	// it from the CompleteMultipartUpload response, as does an unversioned bucket
+	// (docs/s3-versioning.md §4.3).
+	versionid := ""
+	if effState == registry.VersioningEnabled {
+		versionid = node.VersionID
+	}
 	etagQ := `"` + etag + `"`
 	res := s3response.CompleteMultipartUploadResult{Bucket: &bucket, Key: &key, ETag: &etagQ}
 	setCompleteResultChecksum(&res, ckAlgo, ckValue, ckType)

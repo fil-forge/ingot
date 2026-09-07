@@ -310,10 +310,14 @@ metadata — the Hilt forwarding path (forge-mode create/delete/list) is not inv
 |---|---|---|---|
 | unversioned | omitted | omitted | omitted (no marker; real delete) |
 | enabled | ULID token | resolved version's id | marker's ULID token |
-| suspended | `"null"` | resolved version's id | `"null"` |
+| suspended | omitted | resolved version's id | `"null"` |
 
-(`Versioning_PutObject_suspended_null_versionId_obj` pins the suspended-PUT `"null"` echo.
-`ListObjectVersions` always reports ids — `"null"` for null versions — regardless of state.)
+A suspended bucket stores the object under the `"null"` version id but does not
+echo it in the PUT / CompleteMPU / Copy response: only an enabled bucket returns
+a version id for a write. Verified against AWS S3 (a suspended-bucket PutObject
+and CompleteMultipartUpload return no `x-amz-version-id` header, while the object
+is stored and later listed as version `"null"`). `ListObjectVersions` always
+reports ids — `"null"` for null versions — regardless of state.
 
 ---
 

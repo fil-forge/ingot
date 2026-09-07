@@ -221,8 +221,10 @@ func TestVersioning_SuspendedReplacesNullInPlace(t *testing.T) {
 	bb, cc := []byte("null B"), []byte("null C")
 
 	outB := putObjV(t, b, "k1", bb)
-	if outB.VersionID != "null" {
-		t.Fatalf("suspended PUT VersionID = %q, want null", outB.VersionID)
+	// A suspended PUT omits the version id from the response (§4.3); the write
+	// still lands as the "null" version, confirmed by resolving it below.
+	if outB.VersionID != "" {
+		t.Fatalf("suspended PUT VersionID = %q, want empty (omitted)", outB.VersionID)
 	}
 	db := blobDigestOf(t, b, "k1", "null")
 	// The numbered version was retained; nothing released yet.

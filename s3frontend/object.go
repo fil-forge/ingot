@@ -184,7 +184,10 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 		ETag: etagOf(mf),
 		Size: &size,
 	}
-	if effState.Configured() {
+	// Only an enabled bucket echoes a version id in the response. A suspended
+	// bucket stores the object under the "null" version id but omits it from the
+	// PUT response, matching AWS (docs/s3-versioning.md §4.3).
+	if effState == registry.VersioningEnabled {
 		out.VersionID = node.VersionID
 	}
 	out.ChecksumCRC32, out.ChecksumCRC32C, out.ChecksumSHA1, out.ChecksumSHA256, out.ChecksumCRC64NVME, out.ChecksumSHA512, out.ChecksumMD5, out.ChecksumXXHASH64, out.ChecksumXXHASH3, out.ChecksumXXHASH128, out.ChecksumType = checksumFields(ckAlgo, ckVal, mf.ChecksumType)

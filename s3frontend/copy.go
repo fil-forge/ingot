@@ -207,11 +207,13 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 	out := s3response.CopyObjectOutput{
 		CopyObjectResult: result,
 	}
-	// Version ids in the response, per each side's bucket state (§4.3).
+	// Version ids in the response, per each side's bucket state (§4.3). Only an
+	// enabled destination echoes the new version id; a suspended destination
+	// stores the "null" version but omits it from the response, matching AWS.
 	if srcRv.versioned() {
 		out.CopySourceVersionId = &srcRv.node.VersionID
 	}
-	if effState.Configured() {
+	if effState == registry.VersioningEnabled {
 		out.VersionId = &node.VersionID
 	}
 	return out, nil
