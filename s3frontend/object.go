@@ -1109,7 +1109,7 @@ func (b *Backend) ListObjects(ctx context.Context, input *s3.ListObjectsInput) (
 		from = marker + "\x01"
 	}
 
-	res, err := b.listWalk(ctx, bucketName, prefix, delimiter, from, limit)
+	res, err := b.listWalk(ctx, bucketName, prefix, delimiter, from, marker, limit)
 	if err != nil {
 		return s3response.ListObjectsResult{}, err
 	}
@@ -1171,7 +1171,7 @@ func (b *Backend) ListObjectsV2(ctx context.Context, input *s3.ListObjectsV2Inpu
 		from = startAfter + "\x01"
 	}
 
-	res, err := b.listWalk(ctx, bucketName, prefix, delimiter, from, limit)
+	res, err := b.listWalk(ctx, bucketName, prefix, delimiter, from, startAfter, limit)
 	if err != nil {
 		return s3response.ListObjectsV2Result{}, err
 	}
@@ -1215,7 +1215,7 @@ type listWalkResult struct {
 // ContinuationToken / StartAfter, NextMarker vs.
 // NextContinuationToken) live in the callers; this helper only
 // understands prefix, delimiter, and the [from, ...) starting key.
-func (b *Backend) listWalk(ctx context.Context, bucketName, prefix, delimiter, from string, limit int) (listWalkResult, error) {
+func (b *Backend) listWalk(ctx context.Context, bucketName, prefix, delimiter, from, marker string, limit int) (listWalkResult, error) {
 	out := listWalkResult{
 		contents:       []s3response.Object{},
 		commonPrefixes: []types.CommonPrefix{},
@@ -1269,20 +1269,34 @@ func (b *Backend) listWalk(ctx context.Context, bucketName, prefix, delimiter, f
 			tail := k[len(prefix):]
 			if i := strings.Index(tail, delimiter); i >= 0 {
 				cp := prefix + tail[:i+len(delimiter)]
+				// A common prefix rolled up on an earlier page (its value <= the
+				// resume marker) is already returned: skip its keys entirely so
+				// the marker advances past the whole group, not just past the
+				// prefix string. Mirrors ListObjectVersions' keyMarker handling.
+				if marker != "" && cp <= marker {
+					return nil
+				}
 				if _, dup := seenPrefix[cp]; !dup {
+					// Look-ahead: a new, non-dup element found while the page is
+					// already full proves there is more — truncate here and stop,
+					// leaving nextKey at the already-emitted limit-th element.
+					if len(out.contents)+len(out.commonPrefixes) >= limit {
+						out.truncated = true
+						return mst.ErrStopWalk
+					}
 					seenPrefix[cp] = struct{}{}
 					cpCopy := cp
 					out.commonPrefixes = append(out.commonPrefixes, types.CommonPrefix{Prefix: &cpCopy})
-					if len(out.contents)+len(out.commonPrefixes) >= limit {
-						out.truncated = true
-						out.nextKey = cp
-						return mst.ErrStopWalk
-					}
+					out.nextKey = cp
 				}
 				return nil
 			}
 		}
 
+		if len(out.contents)+len(out.commonPrefixes) >= limit {
+			out.truncated = true
+			return mst.ErrStopWalk
+		}
 		key := k
 		etag := etagOf(&mf)
 		size := mf.Body.Size
@@ -1294,11 +1308,7 @@ func (b *Backend) listWalk(ctx context.Context, bucketName, prefix, delimiter, f
 			LastModified: &lastModified,
 			StorageClass: types.ObjectStorageClassStandard,
 		})
-		if len(out.contents)+len(out.commonPrefixes) >= limit {
-			out.truncated = true
-			out.nextKey = k
-			return mst.ErrStopWalk
-		}
+		out.nextKey = k
 		return nil
 	})
 	if walkErr != nil {
