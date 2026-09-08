@@ -59,6 +59,9 @@ func (b *Backend) CreateMultipartUpload(ctx context.Context, input s3response.Cr
 	if unsupportedObjectACL(input.ACL, input.GrantFullControl, input.GrantRead, input.GrantReadACP, input.GrantWriteACP) {
 		return s3response.InitiateMultipartUploadResult{}, s3err.GetAPIError(s3err.ErrNotImplemented)
 	}
+	if req, ok := reqscope.Request(ctx); ok && requestsServerSideEncryption(req.Headers) {
+		return s3response.InitiateMultipartUploadResult{}, s3err.GetAPIError(s3err.ErrNotImplemented)
+	}
 	// A directory object (trailing "/") is zero-length by definition; a
 	// multipart upload to one necessarily carries data.
 	if strings.HasSuffix(key, "/") {

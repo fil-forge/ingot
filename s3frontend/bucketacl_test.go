@@ -54,3 +54,27 @@ func TestUnsupportedObjectACL(t *testing.T) {
 		}
 	}
 }
+
+
+func TestRequestsServerSideEncryption(t *testing.T) {
+	cases := []struct {
+		name    string
+		headers map[string]string
+		want    bool
+	}{
+		{"no sse headers", map[string]string{"Content-Type": "text/plain", "X-Amz-Acl": "private"}, false},
+		{"sse-s3/kms selector", map[string]string{"X-Amz-Server-Side-Encryption": "aws:kms"}, true},
+		{"sse kms key id", map[string]string{"X-Amz-Server-Side-Encryption-Aws-Kms-Key-Id": "key"}, true},
+		{"sse context", map[string]string{"X-Amz-Server-Side-Encryption-Context": "ctx"}, true},
+		{"sse bucket-key-enabled", map[string]string{"X-Amz-Server-Side-Encryption-Bucket-Key-Enabled": "true"}, true},
+		{"sse-c algorithm", map[string]string{"X-Amz-Server-Side-Encryption-Customer-Algorithm": "AES256"}, true},
+		{"sse-c key", map[string]string{"X-Amz-Server-Side-Encryption-Customer-Key": "base64key"}, true},
+		{"copy-source sse-c", map[string]string{"X-Amz-Copy-Source-Server-Side-Encryption-Customer-Algorithm": "AES256"}, true},
+		{"case-insensitive", map[string]string{"x-amz-server-side-encryption": "AES256"}, true},
+	}
+	for _, c := range cases {
+		if got := requestsServerSideEncryption(c.headers); got != c.want {
+			t.Errorf("%s: requestsServerSideEncryption = %v, want %v", c.name, got, c.want)
+		}
+	}
+}

@@ -27,6 +27,7 @@ import (
 
 	msbucket "github.com/fil-forge/ingot/bucket"
 	"github.com/fil-forge/ingot/bucketop"
+	"github.com/fil-forge/ingot/internal/reqscope"
 	"github.com/fil-forge/ingot/mst"
 	"github.com/fil-forge/ingot/registry"
 )
@@ -37,6 +38,24 @@ const defaultMaxKeys = 1000
 // now (see bucket-metadata.rfc §"Canonical state vs service state"); lock
 // headers stamp the new version's state (docs/s3-object-lock.md §7). ETag is
 // the hex md5 of the body, quoted per S3 wire format.
+// requestsServerSideEncryption reports whether the request carries any
+// server-side-encryption header (SSE-S3, SSE-KMS or SSE-C, including the
+// copy-source SSE-C headers). ingot encrypts every object to the tenant key and
+// does not implement client-directed SSE, so PutObject / CreateMultipartUpload
+// / CopyObject reject such a request rather than silently storing the object
+// under ingot's own scheme. Only header presence is inspected; the (sensitive)
+// SSE-C customer key value is never read or logged.
+func requestsServerSideEncryption(headers map[string]string) bool {
+	for k := range headers {
+		lk := strings.ToLower(k)
+		if strings.HasPrefix(lk, "x-amz-server-side-encryption") ||
+			strings.HasPrefix(lk, "x-amz-copy-source-server-side-encryption") {
+			return true
+		}
+	}
+	return false
+}
+
 // unsupportedObjectACL reports whether a PutObject / CreateMultipartUpload
 // request sets any object ACL. ingot does not model ACLs, so — unlike a bucket,
 // which still accepts the default "private" — it rejects an object request that
@@ -67,6 +86,9 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 		return s3response.PutObjectOutput{}, err
 	}
 	if unsupportedObjectACL(input.ACL, input.GrantFullControl, input.GrantRead, input.GrantReadACP, input.GrantWriteACP) {
+		return s3response.PutObjectOutput{}, s3err.GetAPIError(s3err.ErrNotImplemented)
+	}
+	if req, ok := reqscope.Request(ctx); ok && requestsServerSideEncryption(req.Headers) {
 		return s3response.PutObjectOutput{}, s3err.GetAPIError(s3err.ErrNotImplemented)
 	}
 

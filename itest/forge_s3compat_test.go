@@ -128,24 +128,31 @@ func TestForgeS3Compat(t *testing.T) {
 	raw := runner.Run(
 		ctx,
 		selected,
+		// ACL
+		s3tests.Skip("ACL is not supported", s3tests.Tags("acl")),
+		s3tests.NoSkip(
+			s3tests.IDs("acl-0056", "acl-0059", "acl-0061", "acl-0062", "acl-0063", "acl-0065", "acl-0071", "acl-0073"),
+		),
+		// Anonymous access
+		s3tests.Skip("Anonymous access is not supported", s3tests.Tags("anon-access")),
+		s3tests.NoSkip(s3tests.IDs("anon-access-0001")),
 		// Bucket
 		s3tests.Skip("Bucket ACLs are not supported", s3tests.IDs("bucket-0021", "bucket-0022")),
 		s3tests.Skip("PutBucketOwnershipControls are not supported", s3tests.IDs("bucket-0025")),
 		s3tests.Skip("Bucket request-payment configuration is not supported", s3tests.IDs("bucket-0035")),
 		s3tests.Skip("Bucket transfer acceleration is not supported", s3tests.IDs("bucket-0036")),
-		// Anonymous access
-		s3tests.Skip("Anonymous access is not supported", s3tests.Tags("anon-access")),
-		s3tests.NoSkip(s3tests.IDs("anon-access-0001", "anon-access-0004")),
 		// Bucket logging
 		s3tests.Skip(
 			"PutBucketPolicy and PutBucketLogging are not supported",
 			s3tests.Tags("bucket-logging"),
 		),
-		// Lifecycle configuration
+		// CORS
+		s3tests.Skip("PutBucketAcl is not supported", s3tests.IDs("cors-0001", "cors-0002", "cors-0003")),
 		s3tests.Skip(
-			"GetBucketLifecycleConfiguration and PutBucketLifecycleConfiguration are not supported",
-			s3tests.Tags("lifecycle-config"),
+			"PutBucketCors is not supported",
+			s3tests.IDs("cors-0004", "cors-0005", "cors-0006", "cors-0008", "cors-0009", "cors-0014", "cors-0021"),
 		),
+		s3tests.Skip("DeleteBucketCors is not supported", s3tests.IDs("cors-0011")),
 		// Encoding
 		s3tests.Skip("PutObjectAcl is not supported", s3tests.IDs("encoding-0001")),
 		s3tests.Skip(
@@ -153,30 +160,34 @@ func TestForgeS3Compat(t *testing.T) {
 				"slashes when matching, so PUT /bucket// resolves to CreateBucket",
 			s3tests.IDs("encoding-0005"),
 		),
-		// Multipart
-		s3tests.Skip("PutBucketAcl is not supported", s3tests.IDs("multipart-0005")),
-		s3tests.Skip("GetObjectAcl is not supported", s3tests.IDs("multipart-0120")),
-		// CORS
+		// Lifecycle configuration
 		s3tests.Skip(
-			"PutBucketAcl is not supported",
-			s3tests.IDs("cors-0001", "cors-0002", "cors-0003"),
+			"GetBucketLifecycleConfiguration and PutBucketLifecycleConfiguration are not supported",
+			s3tests.Tags("lifecycle-config"),
 		),
-		s3tests.Skip(
-			"PutBucketCors is not supported",
-			s3tests.IDs("cors-0004", "cors-0005", "cors-0006", "cors-0008", "cors-0009", "cors-0014", "cors-0021"),
-		),
-		s3tests.Skip("DeleteBucketCors is not supported", s3tests.IDs("cors-0011")),
 		// Listing
 		s3tests.Skip("PutBucketAcl is not supported", s3tests.IDs("listing-0060", "listing-0070")),
 		s3tests.Skip("GetObjectAcl is not supported", s3tests.IDs("listing-0062", "listing-0063")),
-		// Versioning
-		s3tests.Skip("GetObjectAcl is not supported", s3tests.IDs("versioning-0004", "versioning-0005")),
 		// Misc
 		s3tests.Skip("PutBucketAcl is not supported", s3tests.IDs("misc-0001")),
 		s3tests.Skip("PutBucketWebsite is not supported", s3tests.IDs("misc-0008")),
 		s3tests.Skip("PutBucketInventoryConfiguration is not supported", s3tests.IDs("misc-0009")),
 		s3tests.Skip("PutBucketMetricsConfiguration is not supported", s3tests.IDs("misc-0010")),
 		s3tests.Skip("PutBucketAnalyticsConfiguration is not supported", s3tests.IDs("misc-0011")),
+		// Multipart
+		s3tests.Skip("PutBucketAcl is not supported", s3tests.IDs("multipart-0005")),
+		s3tests.Skip("GetObjectAcl is not supported", s3tests.IDs("multipart-0120")),
+		// Policy
+		s3tests.Skip("Bucket policies are not supported", s3tests.Tags("policy")),
+		s3tests.NoSkip(
+			s3tests.IDs("policy-0045", "policy-0046", "policy-0047", "policy-0048"),
+		),
+		// Presigned
+		s3tests.Skip("PutObject with ACL is not supported", s3tests.IDs("presigned-0002")),
+		// Server Side Encryption
+		s3tests.Skip("Server Side Encryption is not supported", s3tests.Tags("sse")),
+		// Versioning
+		s3tests.Skip("GetObjectAcl is not supported", s3tests.IDs("versioning-0004", "versioning-0005")),
 	)
 	gotest.Run(t, func(yield func(s3tests.VectorResult) bool) {
 		for v := range raw {

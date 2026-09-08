@@ -14,6 +14,7 @@ import (
 	"github.com/fil-forge/versitygw/s3response"
 
 	msbucket "github.com/fil-forge/ingot/bucket"
+	"github.com/fil-forge/ingot/internal/reqscope"
 	"github.com/fil-forge/ingot/registry"
 )
 
@@ -38,6 +39,9 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 		return s3response.CopyObjectOutput{}, err
 	}
 	if unsupportedObjectACL(input.ACL, input.GrantFullControl, input.GrantRead, input.GrantReadACP, input.GrantWriteACP) {
+		return s3response.CopyObjectOutput{}, s3err.GetAPIError(s3err.ErrNotImplemented)
+	}
+	if req, ok := reqscope.Request(ctx); ok && requestsServerSideEncryption(req.Headers) {
 		return s3response.CopyObjectOutput{}, s3err.GetAPIError(s3err.ErrNotImplemented)
 	}
 
