@@ -8,9 +8,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/fil-forge/ucantone/did"
@@ -645,8 +647,18 @@ func (b *Backend) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s
 	}
 	// Echo the stored checksum only for a whole-object HEAD with checksum mode on
 	// (a ranged HEAD's checksum would not match the full object).
-	if input.ChecksumMode == types.ChecksumModeEnabled && !isRange {
-		out.ChecksumCRC32, out.ChecksumCRC32C, out.ChecksumSHA1, out.ChecksumSHA256, out.ChecksumCRC64NVME, out.ChecksumSHA512, out.ChecksumMD5, out.ChecksumXXHASH64, out.ChecksumXXHASH3, out.ChecksumXXHASH128, out.ChecksumType = checksumFields(mf.ChecksumAlgorithm, mf.Checksum, mf.ChecksumType)
+	if input.ChecksumMode == types.ChecksumModeEnabled {
+		switch {
+		case !isRange:
+			// Whole-object checksum (a ranged read's would not match the object).
+			out.ChecksumCRC32, out.ChecksumCRC32C, out.ChecksumSHA1, out.ChecksumSHA256, out.ChecksumCRC64NVME, out.ChecksumSHA512, out.ChecksumMD5, out.ChecksumXXHASH64, out.ChecksumXXHASH3, out.ChecksumXXHASH128, out.ChecksumType = checksumFields(mf.ChecksumAlgorithm, mf.Checksum, mf.ChecksumType)
+		case input.PartNumber != nil:
+			// A ?partNumber read returns that part's own checksum, when the
+			// object recorded per-part checksums (a checksummed multipart upload).
+			if pn := int(*input.PartNumber); pn >= 1 && pn <= len(mf.Body.PartChecksums) {
+				out.ChecksumCRC32, out.ChecksumCRC32C, out.ChecksumSHA1, out.ChecksumSHA256, out.ChecksumCRC64NVME, out.ChecksumSHA512, out.ChecksumMD5, out.ChecksumXXHASH64, out.ChecksumXXHASH3, out.ChecksumXXHASH128, out.ChecksumType = checksumFields(mf.ChecksumAlgorithm, mf.Body.PartChecksums[pn-1], mf.ChecksumType)
+			}
+		}
 	}
 	return out, nil
 }
@@ -680,6 +692,58 @@ func (b *Backend) GetObjectAttributes(ctx context.Context, input *s3.GetObjectAt
 		return s3response.GetObjectAttributesResponse{}, err
 	}
 
+	// A completed multipart object reports its part count. HeadObject only
+	// surfaces the count for a ?partNumber request, so read it from the
+	// manifest here. The per-part list is left unpopulated: the manifest stores
+	// per-part sizes but no per-part checksums, and AWS only returns the Parts
+	// list for checksummed multipart uploads — so TotalPartsCount is the
+	// faithful subset, matching AWS for a non-checksummed multipart object.
+	var objectParts *s3response.ObjectParts
+	if rv, rerr := b.resolveVersion(ctx, *input.Bucket, *input.Key, backend.GetStringFromPtr(input.VersionId)); rerr == nil && !rv.mf.DeleteMarker {
+		sizes := rv.mf.Body.PartSizes
+		sums := rv.mf.Body.PartChecksums
+		if n := len(sizes); n > 0 {
+			op := &s3response.ObjectParts{PartsCount: n}
+			// The per-part list (and its pagination) is populated only for a
+			// checksummed multipart object; AWS returns just the count otherwise.
+			if len(sums) == n {
+				marker := 0
+				if input.PartNumberMarker != nil {
+					if m, err := strconv.Atoi(*input.PartNumberMarker); err == nil {
+						marker = m
+					}
+				}
+				maxParts := 1000
+				if input.MaxParts != nil {
+					maxParts = int(*input.MaxParts)
+				}
+				algo := types.ChecksumAlgorithm(rv.mf.ChecksumAlgorithm)
+				next := 0
+				truncated := false
+				for i := 0; i < n; i++ {
+					pn := i + 1
+					if pn <= marker {
+						continue
+					}
+					if len(op.Parts) >= maxParts {
+						truncated = true
+						break
+					}
+					sz := sizes[i]
+					part := types.ObjectPart{PartNumber: aws.Int32(int32(pn)), Size: aws.Int64(sz)}
+					setObjectPartChecksum(&part, algo, sums[i])
+					op.Parts = append(op.Parts, part)
+					next = pn
+				}
+				op.PartNumberMarker = &marker
+				op.MaxParts = &maxParts
+				op.NextPartNumberMarker = &next
+				op.IsTruncated = &truncated
+			}
+			objectParts = op
+		}
+	}
+
 	return s3response.GetObjectAttributesResponse{
 		ETag:         backend.TrimEtag(data.ETag),
 		ObjectSize:   data.ContentLength,
@@ -687,20 +751,64 @@ func (b *Backend) GetObjectAttributes(ctx context.Context, input *s3.GetObjectAt
 		LastModified: data.LastModified,
 		VersionId:    data.VersionId,
 		DeleteMarker: data.DeleteMarker,
+		ObjectParts:  objectParts,
+		// GetObjectAttributes reports a composite (multipart) checksum without
+		// the "-N" part-count suffix that the CompleteMPU response and the
+		// checksum headers carry; strip it here to match AWS.
 		Checksum: &types.Checksum{
-			ChecksumCRC32:     data.ChecksumCRC32,
-			ChecksumCRC32C:    data.ChecksumCRC32C,
-			ChecksumSHA1:      data.ChecksumSHA1,
-			ChecksumSHA256:    data.ChecksumSHA256,
-			ChecksumCRC64NVME: data.ChecksumCRC64NVME,
-			ChecksumSHA512:    data.ChecksumSHA512,
+			ChecksumCRC32:     stripCompositeChecksumSuffix(data.ChecksumCRC32),
+			ChecksumCRC32C:    stripCompositeChecksumSuffix(data.ChecksumCRC32C),
+			ChecksumSHA1:      stripCompositeChecksumSuffix(data.ChecksumSHA1),
+			ChecksumSHA256:    stripCompositeChecksumSuffix(data.ChecksumSHA256),
+			ChecksumCRC64NVME: stripCompositeChecksumSuffix(data.ChecksumCRC64NVME),
+			ChecksumSHA512:    stripCompositeChecksumSuffix(data.ChecksumSHA512),
 			ChecksumMD5:       data.ChecksumMD5,
-			ChecksumXXHASH64:  data.ChecksumXXHASH64,
-			ChecksumXXHASH3:   data.ChecksumXXHASH3,
-			ChecksumXXHASH128: data.ChecksumXXHASH128,
+			ChecksumXXHASH64:  stripCompositeChecksumSuffix(data.ChecksumXXHASH64),
+			ChecksumXXHASH3:   stripCompositeChecksumSuffix(data.ChecksumXXHASH3),
+			ChecksumXXHASH128: stripCompositeChecksumSuffix(data.ChecksumXXHASH128),
 			ChecksumType:      data.ChecksumType,
 		},
 	}, nil
+}
+
+// stripCompositeChecksumSuffix removes the "-N" multipart part-count suffix from
+// a composite checksum value. GetObjectAttributes returns the bare digest while
+// the CompleteMPU response and x-amz-checksum-* headers keep the suffix. A plain
+// (single-part) checksum has no such suffix and is returned unchanged.
+// setObjectPartChecksum sets the checksum field matching algo on a per-part
+// GetObjectAttributes entry.
+func setObjectPartChecksum(p *types.ObjectPart, algo types.ChecksumAlgorithm, value string) {
+	v := value
+	switch algo {
+	case types.ChecksumAlgorithmCrc32:
+		p.ChecksumCRC32 = &v
+	case types.ChecksumAlgorithmCrc32c:
+		p.ChecksumCRC32C = &v
+	case types.ChecksumAlgorithmSha1:
+		p.ChecksumSHA1 = &v
+	case types.ChecksumAlgorithmSha256:
+		p.ChecksumSHA256 = &v
+	case types.ChecksumAlgorithmCrc64nvme:
+		p.ChecksumCRC64NVME = &v
+	}
+}
+
+func stripCompositeChecksumSuffix(v *string) *string {
+	if v == nil {
+		return nil
+	}
+	s := *v
+	i := strings.LastIndexByte(s, '-')
+	if i < 0 || i == len(s)-1 {
+		return v
+	}
+	for _, r := range s[i+1:] {
+		if r < '0' || r > '9' {
+			return v
+		}
+	}
+	t := s[:i]
+	return &t
 }
 
 // GetObject returns an object body — the current version or the one named by
@@ -814,8 +922,18 @@ func (b *Backend) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.
 	}
 	// Echo the stored checksum only for a whole-object GET with checksum mode on
 	// (a ranged GET's checksum would not match the full object).
-	if input.ChecksumMode == types.ChecksumModeEnabled && !isRange {
-		out.ChecksumCRC32, out.ChecksumCRC32C, out.ChecksumSHA1, out.ChecksumSHA256, out.ChecksumCRC64NVME, out.ChecksumSHA512, out.ChecksumMD5, out.ChecksumXXHASH64, out.ChecksumXXHASH3, out.ChecksumXXHASH128, out.ChecksumType = checksumFields(mf.ChecksumAlgorithm, mf.Checksum, mf.ChecksumType)
+	if input.ChecksumMode == types.ChecksumModeEnabled {
+		switch {
+		case !isRange:
+			// Whole-object checksum (a ranged read's would not match the object).
+			out.ChecksumCRC32, out.ChecksumCRC32C, out.ChecksumSHA1, out.ChecksumSHA256, out.ChecksumCRC64NVME, out.ChecksumSHA512, out.ChecksumMD5, out.ChecksumXXHASH64, out.ChecksumXXHASH3, out.ChecksumXXHASH128, out.ChecksumType = checksumFields(mf.ChecksumAlgorithm, mf.Checksum, mf.ChecksumType)
+		case input.PartNumber != nil:
+			// A ?partNumber read returns that part's own checksum, when the
+			// object recorded per-part checksums (a checksummed multipart upload).
+			if pn := int(*input.PartNumber); pn >= 1 && pn <= len(mf.Body.PartChecksums) {
+				out.ChecksumCRC32, out.ChecksumCRC32C, out.ChecksumSHA1, out.ChecksumSHA256, out.ChecksumCRC64NVME, out.ChecksumSHA512, out.ChecksumMD5, out.ChecksumXXHASH64, out.ChecksumXXHASH3, out.ChecksumXXHASH128, out.ChecksumType = checksumFields(mf.ChecksumAlgorithm, mf.Body.PartChecksums[pn-1], mf.ChecksumType)
+			}
+		}
 	}
 	return out, nil
 }
@@ -1025,6 +1143,24 @@ func (b *Backend) DeleteObjects(ctx context.Context, input *s3.DeleteObjectsInpu
 		versionID := backend.GetStringFromPtr(obj.VersionId)
 		entry := types.DeletedObject{Key: &key}
 		var derr error
+		// Per-key ETag precondition (conditional delete): the object is removed
+		// only if its current version's ETag matches; otherwise the entry fails
+		// with PreconditionFailed, matching AWS. Applies to the current version.
+		if obj.ETag != nil && versionID == "" {
+			etag, exists, cerr := b.currentObjectETag(ctx, bucketName, key)
+			switch {
+			case cerr != nil:
+				derr = cerr
+			case !exists || !etagsEqual(*obj.ETag, etag):
+				derr = s3err.GetAPIError(s3err.ErrPreconditionFailed)
+			}
+		}
+		if derr != nil {
+			k := key
+			code, msg := deleteErrorFields(derr)
+			res.Error = append(res.Error, types.Error{Key: &k, Code: &code, Message: &msg})
+			continue
+		}
 		switch {
 		case versionID != "":
 			// Version-scoped: permanently remove that one version. DeleteMarker
@@ -1175,6 +1311,19 @@ func (b *Backend) ListObjectsV2(ctx context.Context, input *s3.ListObjectsV2Inpu
 	res, err := b.listWalk(ctx, bucketName, prefix, delimiter, from, startAfter, limit)
 	if err != nil {
 		return s3response.ListObjectsV2Result{}, err
+	}
+
+	// FetchOwner attaches the bucket owner to each listed object. Ingot models
+	// ownership by the Forge space DID rather than an S3 canonical user id, so
+	// that DID is reported as the owner id.
+	if input.FetchOwner != nil && *input.FetchOwner && len(res.contents) > 0 {
+		if st, gerr := b.reg.Get(ctx, bucketName); gerr == nil {
+			ownerID := st.Space.String()
+			owner := &types.Owner{ID: &ownerID}
+			for i := range res.contents {
+				res.contents[i].Owner = owner
+			}
+		}
 	}
 
 	keyCount := int32(len(res.contents) + len(res.commonPrefixes))

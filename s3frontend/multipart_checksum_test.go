@@ -359,13 +359,17 @@ func TestComplete_PartChecksumValidation(t *testing.T) {
 		t.Fatalf("wrong-algo value → %s, want BadDigest", code)
 	}
 
-	// The valid entry still completes, and re-Complete (idempotent) returns
-	// the identical checksum.
+	// The valid entry completes with a checksum; the idempotent re-Complete
+	// succeeds but omits the checksum, matching AWS (verified: re-Complete
+	// returns the ETag with no x-amz-checksum-* value).
 	res, err := mpComplete(t, b, key, uploadID, []types.CompletedPart{
 		{PartNumber: &one, ETag: out.ETag, ChecksumCRC32C: &sum},
 	}, nil)
 	if err != nil {
 		t.Fatalf("Complete: %v", err)
+	}
+	if res.ChecksumCRC32C == nil {
+		t.Fatalf("first Complete missing ChecksumCRC32C")
 	}
 	res2, err := mpComplete(t, b, key, uploadID, []types.CompletedPart{
 		{PartNumber: &one, ETag: out.ETag, ChecksumCRC32C: &sum},
@@ -373,8 +377,8 @@ func TestComplete_PartChecksumValidation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("re-Complete: %v", err)
 	}
-	if res.ChecksumCRC32C == nil || res2.ChecksumCRC32C == nil || *res.ChecksumCRC32C != *res2.ChecksumCRC32C {
-		t.Fatalf("idempotent re-Complete checksum %v != %v", res2.ChecksumCRC32C, res.ChecksumCRC32C)
+	if res2.ChecksumCRC32C != nil {
+		t.Fatalf("re-Complete should omit the checksum (AWS), got %q", *res2.ChecksumCRC32C)
 	}
 }
 

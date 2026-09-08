@@ -543,8 +543,10 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 					return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrInvalidPart)
 				}
 				etagQ := `"` + cur.CommittedETag + `"`
+				// A re-Complete of an already-completed upload returns the ETag
+				// but no checksum: AWS omits it on the idempotent replay (for both
+				// COMPOSITE and FULL_OBJECT), unlike the first Complete.
 				res := s3response.CompleteMultipartUploadResult{Bucket: &bucket, Key: &key, ETag: &etagQ}
-				setCompleteResultChecksum(&res, ckAlgo, ckValue, ckType)
 				return res, cur.CommittedVersionID, nil
 			}
 			if cur.State == registry.SessionOpen {
@@ -596,6 +598,12 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 	// blobs) is recorded so a later GET/HEAD ?partNumber=N can address it (§7.2).
 	var blobs []msbucket.BlobRef
 	var partSizes []int64
+	// Per-part checksums are retained only for a COMPOSITE checksummed upload
+	// (and only when every part recorded one). AWS exposes the per-part list and
+	// a ?partNumber checksum solely for composite multipart objects; a
+	// FULL_OBJECT upload reports only the whole-object checksum and part count.
+	var partChecksums []string
+	recordPartChecksums := mpHadChecksum && !missingStored && ckType == types.ChecksumTypeComposite
 	var offset int64
 	for _, sp := range requested {
 		partStart := offset
@@ -614,6 +622,9 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 			offset += plainLen
 		}
 		partSizes = append(partSizes, offset-partStart)
+		if recordPartChecksums {
+			partChecksums = append(partChecksums, sp.Checksum)
+		}
 	}
 
 	// Accept every part's blobs on Forge: parked blobs conclude (the deferred
@@ -628,7 +639,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 		Key:                     key,
 		ContentType:             sess.ContentType,
 		Created:                 time.Now().Unix(),
-		Body:                    msbucket.Body{Size: offset, Blobs: blobs, PartSizes: partSizes},
+		Body:                    msbucket.Body{Size: offset, Blobs: blobs, PartSizes: partSizes, PartChecksums: partChecksums},
 		ETag:                    etag,
 		ContentEncoding:         sess.ContentEncoding,
 		ContentDisposition:      sess.ContentDisposition,

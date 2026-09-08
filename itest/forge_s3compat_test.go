@@ -128,31 +128,14 @@ func TestForgeS3Compat(t *testing.T) {
 	raw := runner.Run(
 		ctx,
 		selected,
-		// Quirks
-		s3tests.Skip("Non-AWS behavior", s3tests.Tags("quirk:not-aws")),
-		s3tests.Skip("us-east-1 legacy", s3tests.Tags("quirk:us-east-1-legacy")),
-		s3tests.Skip("Directory buckets not supported", s3tests.Tags("quirk:directory-bucket")),
 		// Bucket
 		s3tests.Skip("Bucket ACLs are not supported", s3tests.IDs("bucket-0021", "bucket-0022")),
 		s3tests.Skip("PutBucketOwnershipControls are not supported", s3tests.IDs("bucket-0025")),
 		s3tests.Skip("Bucket request-payment configuration is not supported", s3tests.IDs("bucket-0035")),
 		s3tests.Skip("Bucket transfer acceleration is not supported", s3tests.IDs("bucket-0036")),
 		// Anonymous access
-		s3tests.Skip(
-			"Anonymous access is not supported",
-			s3tests.IDs(
-				"anon-access-0002",
-				"anon-access-0003",
-				"anon-access-0005",
-				"anon-access-0006",
-				"anon-access-0007",
-				"anon-access-0008",
-				"anon-access-0009",
-				"anon-access-0010",
-				"anon-access-0011",
-				"anon-access-0012",
-			),
-		),
+		s3tests.Skip("Anonymous access is not supported", s3tests.Tags("anon-access")),
+		s3tests.NoSkip(s3tests.IDs("anon-access-0001", "anon-access-0004")),
 		// Bucket logging
 		s3tests.Skip(
 			"PutBucketPolicy and PutBucketLogging are not supported",
@@ -165,8 +148,14 @@ func TestForgeS3Compat(t *testing.T) {
 		),
 		// Encoding
 		s3tests.Skip("PutObjectAcl is not supported", s3tests.IDs("encoding-0001")),
+		s3tests.Skip(
+			"Known deviation: slash-only object keys route to the bucket handler: fiber trims trailing "+
+				"slashes when matching, so PUT /bucket// resolves to CreateBucket",
+			s3tests.IDs("encoding-0005"),
+		),
 		// Multipart
 		s3tests.Skip("PutBucketAcl is not supported", s3tests.IDs("multipart-0005")),
+		s3tests.Skip("GetObjectAcl is not supported", s3tests.IDs("multipart-0120")),
 		// CORS
 		s3tests.Skip(
 			"PutBucketAcl is not supported",

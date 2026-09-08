@@ -97,6 +97,15 @@ type Body struct {
 	// The sum of PartSizes equals Size. See docs/architecture.md §7.2.
 	PartSizes []int64 `cborgen:"ps"`
 
+	// PartChecksums records each multipart part's base64 checksum (in the
+	// object's ChecksumAlgorithm), in upload order, parallel to PartSizes. It is
+	// set only for a multipart upload created with a checksum algorithm, and lets
+	// GetObjectAttributes report the per-part list and a ?partNumber GET/HEAD
+	// return that part's checksum — the two responses AWS populates only for a
+	// checksummed multipart object. Nil for single-PUT and non-checksummed
+	// multipart objects (which expose no per-part checksums).
+	PartChecksums []string `cborgen:"pc"`
+
 	// IndexRoot is reserved (nullable) for a future UnixFS + sharded-dag-index
 	// record that would make a multi-shard object reassemblable without Ingot
 	// ("credible exit"). It is unused this iteration; the flat Blobs list is
