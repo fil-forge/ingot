@@ -30,3 +30,27 @@ func TestUnsupportedBucketACL(t *testing.T) {
 		}
 	}
 }
+
+
+func TestUnsupportedObjectACL(t *testing.T) {
+	str := func(s string) *string { return &s }
+	cases := []struct {
+		name  string
+		acl   types.ObjectCannedACL
+		grant []*string
+		want  bool
+	}{
+		{"no acl, no grants", "", nil, false},
+		{"empty grant pointers", "", []*string{str(""), nil}, false},
+		{"explicit private is rejected too", types.ObjectCannedACLPrivate, nil, true},
+		{"public-read canned", types.ObjectCannedACLPublicRead, nil, true},
+		{"bucket-owner-full-control canned", types.ObjectCannedACLBucketOwnerFullControl, nil, true},
+		{"grant-read", "", []*string{str("id=abc")}, true},
+		{"grant plus no acl", "", []*string{nil, str("id=abc")}, true},
+	}
+	for _, c := range cases {
+		if got := unsupportedObjectACL(c.acl, c.grant...); got != c.want {
+			t.Errorf("%s: unsupportedObjectACL = %v, want %v", c.name, got, c.want)
+		}
+	}
+}

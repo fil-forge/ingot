@@ -37,6 +37,9 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 	if err := objectKeyError(dstKey); err != nil {
 		return s3response.CopyObjectOutput{}, err
 	}
+	if unsupportedObjectACL(input.ACL, input.GrantFullControl, input.GrantRead, input.GrantReadACP, input.GrantWriteACP) {
+		return s3response.CopyObjectOutput{}, s3err.GetAPIError(s3err.ErrNotImplemented)
+	}
 
 	replace := input.MetadataDirective == types.MetadataDirectiveReplace
 	// Copy to self is only legal when the metadata is being replaced — unless

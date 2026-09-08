@@ -37,6 +37,23 @@ const defaultMaxKeys = 1000
 // now (see bucket-metadata.rfc §"Canonical state vs service state"); lock
 // headers stamp the new version's state (docs/s3-object-lock.md §7). ETag is
 // the hex md5 of the body, quoted per S3 wire format.
+// unsupportedObjectACL reports whether a PutObject / CreateMultipartUpload
+// request sets any object ACL. ingot does not model ACLs, so — unlike a bucket,
+// which still accepts the default "private" — it rejects an object request that
+// names any canned ACL or grantee outright. The controller forwards these from
+// the x-amz-acl / x-amz-grant-* headers.
+func unsupportedObjectACL(acl types.ObjectCannedACL, grants ...*string) bool {
+	if acl != "" {
+		return true
+	}
+	for _, g := range grants {
+		if g != nil && *g != "" {
+			return true
+		}
+	}
+	return false
+}
+
 func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput) (s3response.PutObjectOutput, error) {
 	if input.Bucket == nil {
 		return s3response.PutObjectOutput{}, s3err.GetAPIError(s3err.ErrInvalidBucketName)
@@ -48,6 +65,9 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 	key := *input.Key
 	if err := objectKeyError(key); err != nil {
 		return s3response.PutObjectOutput{}, err
+	}
+	if unsupportedObjectACL(input.ACL, input.GrantFullControl, input.GrantRead, input.GrantReadACP, input.GrantWriteACP) {
+		return s3response.PutObjectOutput{}, s3err.GetAPIError(s3err.ErrNotImplemented)
 	}
 
 	contentType := backend.GetStringFromPtr(input.ContentType)
