@@ -706,19 +706,13 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 		return s3response.CompleteMultipartUploadResult{}, "", err
 	}
 	committed = true
-	// The x-amz-version-id of the new version, omitted for unversioned buckets
-	// (docs/s3-versioning.md §4.3).
-	versionid := ""
-	if effState.Configured() {
-		versionid = node.VersionID
-	}
 	// The object is durable. Retain the session (state 'completed', carrying
 	// the committed ETag and version id) and its parts so a duplicate or
 	// latch-losing Complete replays this result; the sweeper reaps it later.
 	// Best-effort: a failed latch leaves the row in 'completing', which the
 	// sweeper reaps through its abort path after the TTL — harmless here, as
 	// the winners hold reference claims by now, so that cleanup skips them.
-	if _, err := b.multipart.CompleteSession(ctx, uploadID, etag, versionid); err != nil {
+	if _, err := b.multipart.CompleteSession(ctx, uploadID, etag, node.VersionID); err != nil {
 		b.logger.Warn("latch session to completed failed; sweeper reaps the completing row after the TTL",
 			zap.String("uploadID", uploadID), zap.Error(err))
 	}
