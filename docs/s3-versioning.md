@@ -514,11 +514,12 @@ and to version-scoped deletes, evaluated against the target version.
 
 ## 8. The reference index
 
-`blob_refs` rows carry each version's id: the `registry.NullVersionID` sentinel at
-object.go:336/:345 is replaced by each version's `VersionID` (null versions carry the id
-`"null"`, so rows for unversioned buckets keep that id). The interfaces already carry
-`versionID` everywhere (`registry.BlobRefStore`, stores.go:114-120); no schema or interface
-change.
+Each `blob_refs` row is one generation's reference to one body digest, keyed by a
+per-generation reference id (`refVersionID`): the version's ULID token in a versioned bucket, or
+`null#<seq>` for a null version, where `seq` is the per-commit sequence the write already
+allocates. Two generations of one key therefore never share a row, even when both are null
+versions. The store is `registry.BlobRefStore` (`AddBlobRef`, `RemoveBlobRef`, `CountRefs`); the
+table's `version_id` column holds the reference id.
 
 Rules:
 

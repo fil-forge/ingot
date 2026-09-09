@@ -702,7 +702,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 	// Best-effort: a failed latch leaves the row in 'completing', which the
 	// sweeper reaps through its abort path after the TTL — harmless here, as
 	// the winners hold references by now, so that cleanup skips them.
-	if _, err := b.multipart.LatchSession(ctx, uploadID, registry.SessionCompleting, registry.SessionCompleted); err != nil {
+	if _, err := b.multipart.CompleteSession(ctx, uploadID, etag, versionid); err != nil {
 		b.logger.Warn("latch session to completed failed; sweeper reaps the completing row after the TTL",
 			zap.String("uploadID", uploadID), zap.Error(err))
 	}
