@@ -14,6 +14,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/versitygw/backend"
+	"github.com/fil-forge/versitygw/s3err"
 	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
 	"go.uber.org/zap/zaptest"
@@ -359,6 +360,73 @@ func TestConcurrentCompletesReplayWinner(t *testing.T) {
 	}
 	if got := getRange(t, b, key, ""); !bytes.Equal(got, data) {
 		t.Fatalf("object mismatch after racing Completes (%d bytes)", len(got))
+	}
+}
+
+// TestReCompleteAfterOverwriteReplaysCommittedResult: a duplicate Complete
+// after a plain PUT overwrote the key replays the ETag the winning Complete
+// recorded on the session — never InvalidPart from comparing against the live
+// key — and leaves the overwrite in place.
+func TestReCompleteAfterOverwriteReplaysCommittedResult(t *testing.T) {
+	b, _, _ := newRefTestBackend(t)
+	key := "replay-after-overwrite"
+	data := testBody(int(backend.MinPartSize))
+
+	uploadID := mpCreate(t, b, key, "", "")
+	out, err := mpUploadPart(t, b, key, uploadID, 1, data, nil)
+	if err != nil {
+		t.Fatalf("UploadPart: %v", err)
+	}
+	one := int32(1)
+	parts := []types.CompletedPart{{PartNumber: &one, ETag: out.ETag}}
+	first, err := mpComplete(t, b, key, uploadID, parts, nil)
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+
+	overwrite := []byte("overwritten by a single-shot PUT")
+	putObj(t, b, key, overwrite)
+
+	again, err := mpComplete(t, b, key, uploadID, parts, nil)
+	if err != nil {
+		t.Fatalf("re-Complete after overwrite: %v", err)
+	}
+	if *again.ETag != *first.ETag {
+		t.Fatalf("re-Complete ETag %q, want the committed %q", *again.ETag, *first.ETag)
+	}
+	if got := getRange(t, b, key, ""); !bytes.Equal(got, overwrite) {
+		t.Fatalf("re-Complete disturbed the overwrite (%d bytes)", len(got))
+	}
+}
+
+// TestCompleteWaitBudgetIsOperationAborted: a latch loser whose wait for the
+// winner runs out reports OperationAborted (a retryable 409), not
+// NoSuchUpload — the session exists and is merely slow.
+func TestCompleteWaitBudgetIsOperationAborted(t *testing.T) {
+	b, mem, _ := newRefTestBackend(t)
+	key := "slow-winner"
+	data := testBody(int(backend.MinPartSize))
+
+	uploadID := mpCreate(t, b, key, "", "")
+	out, err := mpUploadPart(t, b, key, uploadID, 1, data, nil)
+	if err != nil {
+		t.Fatalf("UploadPart: %v", err)
+	}
+	one := int32(1)
+	parts := []types.CompletedPart{{PartNumber: &one, ETag: out.ETag}}
+
+	// A winner that is still committing: hold the session in 'completing'.
+	if won, err := mem.LatchSession(context.Background(), uploadID, registry.SessionOpen, registry.SessionCompleting); err != nil || !won {
+		t.Fatalf("latch to completing: won=%v err=%v", won, err)
+	}
+	saveBudget, saveTries := replayWaitBudget, replayMaxTries
+	replayWaitBudget, replayMaxTries = 50*time.Millisecond, 4
+	t.Cleanup(func() { replayWaitBudget, replayMaxTries = saveBudget, saveTries })
+
+	_, err = mpComplete(t, b, key, uploadID, parts, nil)
+	var apiErr s3err.APIError
+	if !errors.As(err, &apiErr) || apiErr.Code != "OperationAborted" {
+		t.Fatalf("Complete against a slow winner: err = %v, want OperationAborted", err)
 	}
 }
 

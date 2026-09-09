@@ -73,6 +73,22 @@ func TestUp_Live(t *testing.T) {
 		}
 	}
 
+	// multipart_sessions (00016): the committed result Complete records for
+	// replay, NULL until the session completes.
+	for _, col := range []string{"committed_etag", "committed_version_id"} {
+		var nullable string
+		err := pool.QueryRow(ctx,
+			`SELECT is_nullable FROM information_schema.columns
+			 WHERE table_schema = 'ingot' AND table_name = 'multipart_sessions' AND column_name = $1`, col).Scan(&nullable)
+		if err != nil {
+			t.Errorf("column ingot.multipart_sessions.%s missing after migration: %v", col, err)
+			continue
+		}
+		if nullable != "YES" {
+			t.Errorf("column ingot.multipart_sessions.%s is_nullable = %q, want YES", col, nullable)
+		}
+	}
+
 	// blob_encryption_params (00014): every column exists and is NOT NULL — the
 	// presence of a row is what marks a blob as encrypted, so there is no such
 	// thing as a half-populated parameter set.

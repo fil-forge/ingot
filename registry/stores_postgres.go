@@ -495,7 +495,8 @@ func (r *Postgres) GetSession(ctx context.Context, uploadID string) (*MultipartS
 		`SELECT upload_id, bucket, object_key, state, content_type, metadata, created_at,
 		        content_encoding, content_disposition, content_language, cache_control, expires,
 		        website_redirect_location, checksum_algorithm, checksum_type,
-		        lock_mode, lock_retain_until, lock_legal_hold, tagging
+		        lock_mode, lock_retain_until, lock_legal_hold, tagging,
+		        committed_etag, committed_version_id
 		 FROM ingot.multipart_sessions WHERE upload_id = $1`,
 		uploadID)
 	s, err := scanSession(row)
@@ -513,10 +514,12 @@ func (r *Postgres) GetSession(ctx context.Context, uploadID string) (*MultipartS
 func scanSession(row pgx.Row) (*MultipartSession, error) {
 	s := &MultipartSession{}
 	var contentType, ce, cd, cl, cc, exp, wrl, ckAlgo, ckType, lockMode, lockHold, tagging *string
+	var committedETag, committedVersionID *string
 	var meta []byte
 	err := row.Scan(&s.UploadID, &s.Bucket, &s.ObjectKey, &s.State, &contentType, &meta, &s.CreatedAt,
 		&ce, &cd, &cl, &cc, &exp, &wrl, &ckAlgo, &ckType,
-		&lockMode, &s.LockRetainUntil, &lockHold, &tagging)
+		&lockMode, &s.LockRetainUntil, &lockHold, &tagging,
+		&committedETag, &committedVersionID)
 	if err != nil {
 		return nil, err
 	}
@@ -537,6 +540,8 @@ func scanSession(row pgx.Row) (*MultipartSession, error) {
 	setIfNotNil(&s.LockMode, lockMode)
 	setIfNotNil(&s.LockLegalHold, lockHold)
 	setIfNotNil(&s.Tagging, tagging)
+	setIfNotNil(&s.CommittedETag, committedETag)
+	setIfNotNil(&s.CommittedVersionID, committedVersionID)
 	if s.Metadata, err = unmarshalMetadata(meta); err != nil {
 		return nil, err
 	}
@@ -549,6 +554,18 @@ func (r *Postgres) LatchSession(ctx context.Context, uploadID, from, to string) 
 		uploadID, from, to)
 	if err != nil {
 		return false, fmt.Errorf("registry: latch session: %w", err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+func (r *Postgres) CompleteSession(ctx context.Context, uploadID, etag, versionID string) (bool, error) {
+	tag, err := r.pool.Exec(ctx,
+		`UPDATE ingot.multipart_sessions
+		 SET state = $2, committed_etag = $3, committed_version_id = $4
+		 WHERE upload_id = $1 AND state = $5`,
+		uploadID, SessionCompleted, etag, nullString(versionID), SessionCompleting)
+	if err != nil {
+		return false, fmt.Errorf("registry: complete session: %w", err)
 	}
 	return tag.RowsAffected() == 1, nil
 }
@@ -612,7 +629,8 @@ func (r *Postgres) ListSessions(ctx context.Context, bucket string) ([]Multipart
 		`SELECT upload_id, bucket, object_key, state, content_type, metadata, created_at,
 		        content_encoding, content_disposition, content_language, cache_control, expires,
 		        website_redirect_location, checksum_algorithm, checksum_type,
-		        lock_mode, lock_retain_until, lock_legal_hold, tagging
+		        lock_mode, lock_retain_until, lock_legal_hold, tagging,
+		        committed_etag, committed_version_id
 		 FROM ingot.multipart_sessions WHERE bucket = $1
 		 ORDER BY object_key ASC, created_at ASC, upload_id ASC`,
 		bucket)
@@ -640,7 +658,8 @@ func (r *Postgres) ListStaleSessions(ctx context.Context, state string, cutoff t
 		`SELECT upload_id, bucket, object_key, state, content_type, metadata, created_at,
 		        content_encoding, content_disposition, content_language, cache_control, expires,
 		        website_redirect_location, checksum_algorithm, checksum_type,
-		        lock_mode, lock_retain_until, lock_legal_hold, tagging
+		        lock_mode, lock_retain_until, lock_legal_hold, tagging,
+		        committed_etag, committed_version_id
 		 FROM ingot.multipart_sessions WHERE state = $1 AND created_at < $2
 		 ORDER BY created_at ASC`,
 		state, cutoff)
