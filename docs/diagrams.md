@@ -430,7 +430,7 @@ sequenceDiagram
     C->>B: CompleteMultipartUpload(parts)
     B->>B: validate parts (ascending, ETags, checksums, MinPartSize)
     alt session already completed
-        B-->>C: the stored result (idempotent re-Complete)
+        B-->>C: the ETag/version id recorded on the session (idempotent re-Complete)
     else latch won
         B->>R: LatchSession(open to completing), single winner
         B->>R: manifest spans: per blob, plaintext length derived from<br/>the intent's stored size + FEE geometry (blobPlaintextLen)
@@ -476,8 +476,11 @@ stateDiagram-v2
     completed --> [*] : sweeper past TTL
 ```
 
-- There is no wait-for-in-flight: a racing Complete either sees `completed`
-  (and returns the stored result) or loses the latch and gets `NoSuchUpload`.
+- A Complete that loses the latch waits (bounded) for the winner's terminal
+  state: `completed` replays the ETag and version id the winner recorded on
+  the session; `aborting` or a vanished row is `NoSuchUpload`; a winner still
+  running past the wait budget is `OperationAborted`, which the client
+  retries.
 - `ListParts` and `Abort` reject any non-`open` session as `NoSuchUpload`;
   `Complete` alone accepts `completed`, for idempotency.
 - The sweeper also reaps rows stuck in `completing` or `aborting` past the

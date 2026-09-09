@@ -173,9 +173,16 @@ type MultipartSession struct {
 	// Tagging carries CreateMultipartUpload's raw x-amz-tagging header
 	// (validated at create) to Complete, which stamps the parsed set
 	// (docs/s3-object-tagging.md §4). Empty when the header was absent.
-	Tagging   string
-	Metadata  map[string]string
-	CreatedAt time.Time
+	Tagging  string
+	Metadata map[string]string
+	// CommittedETag / CommittedVersionID are the result the winning Complete
+	// returned, recorded by CompleteSession with the move to 'completed'
+	// (empty before that). A duplicate or latch-losing Complete replays them
+	// rather than resolving the live key, which a later overwrite may have
+	// replaced. CommittedVersionID is empty for unversioned buckets.
+	CommittedETag      string
+	CommittedVersionID string
+	CreatedAt          time.Time
 }
 
 // MultipartPart is one row of ingot.multipart_parts. BlobDigests is the
@@ -332,6 +339,11 @@ type MultipartStore interface {
 	// LatchSession atomically moves uploadID from->to, returning true iff this
 	// caller performed the transition (the session was still in `from`).
 	LatchSession(ctx context.Context, uploadID, from, to string) (bool, error)
+	// CompleteSession is the completing→completed latch that also records the
+	// winner's result (etag; versionID, empty for unversioned buckets) in the
+	// same statement, so a completed row always carries what to replay.
+	// Returns true iff this caller performed the transition.
+	CompleteSession(ctx context.Context, uploadID, etag, versionID string) (bool, error)
 	DeleteSession(ctx context.Context, uploadID string) error
 	PutPart(ctx context.Context, p MultipartPart) error
 	ListParts(ctx context.Context, uploadID string) ([]MultipartPart, error)

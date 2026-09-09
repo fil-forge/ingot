@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -305,6 +306,24 @@ func (b *Backend) UploadPart(ctx context.Context, input *s3.UploadPartInput) (*s
 // A successful Complete retains the session in state 'completed' (with its
 // parts), so a duplicate Complete with an identical part list is idempotent
 // per S3; the abandoned-session sweeper reaps the row later.
+// replayWaitBudget / replayMaxTries bound how long a Complete that lost the
+// single-winner latch waits for the winner's terminal state before giving up
+// with errCompleteInProgress. Package-level so tests can shrink them.
+var (
+	replayWaitBudget = 10 * time.Second
+	replayMaxTries   = 64
+)
+
+// errCompleteInProgress is S3's OperationAborted: another Complete of this
+// upload is still running past the loser's wait budget. It is a 409 the
+// client retries; the retry finds the session completed and replays the
+// winner's result. (Not in the versitygw error table, hence built here.)
+var errCompleteInProgress = s3err.APIError{
+	Code:           "OperationAborted",
+	Description:    "A conflicting conditional operation is currently in progress against this resource. Please try again.",
+	HTTPStatusCode: http.StatusConflict,
+}
+
 func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.CompleteMultipartUploadInput) (s3response.CompleteMultipartUploadResult, string, error) {
 	if input.Bucket == nil || input.Key == nil || input.UploadId == nil {
 		return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrInvalidRequest)
@@ -506,31 +525,30 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 	// re-run here: after the winner commits it would newly fail an
 	// If-None-Match loser. The wall-clock and iteration caps bound both a
 	// revert-livelock and the poll's request occupancy (no request deadline
-	// exists to inherit).
+	// exists to inherit); exhausting them while the winner is still running
+	// is OperationAborted, a retryable conflict, never NoSuchUpload.
 	completeWon := false
 	{
-		const (
-			replayWaitBudget = 10 * time.Second
-			replayMaxTries   = 64
-		)
 		backoff := 5 * time.Millisecond
 		deadline := time.Now().Add(replayWaitBudget)
-		state := sess.State
+		cur := sess
 		for tries := 0; ; tries++ {
-			if state == registry.SessionCompleted {
-				// The prior Complete committed; the validation above proved
-				// the caller's part list against the retained parts. Guard
-				// against a divergent list that happens to validate: the
-				// derived ETag must match the committed object's.
-				if rv, rerr := b.resolveVersion(ctx, bucket, key, ""); rerr == nil && !rv.mf.DeleteMarker && !etagsEqual(etagOf(rv.mf), etag) {
+			if cur.State == registry.SessionCompleted {
+				// The prior Complete committed and recorded its result on the
+				// session (CompleteSession). The validation above proved the
+				// caller's part list against the retained parts; guard against
+				// a divergent list that happens to validate by comparing the
+				// derived ETag with the committed one. The session's copy is
+				// authoritative — the live key may since have been overwritten.
+				if !etagsEqual(cur.CommittedETag, etag) {
 					return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrInvalidPart)
 				}
-				etagQ := `"` + etag + `"`
+				etagQ := `"` + cur.CommittedETag + `"`
 				res := s3response.CompleteMultipartUploadResult{Bucket: &bucket, Key: &key, ETag: &etagQ}
 				setCompleteResultChecksum(&res, ckAlgo, ckValue, ckType)
-				return res, "", nil
+				return res, cur.CommittedVersionID, nil
 			}
-			if state == registry.SessionOpen {
+			if cur.State == registry.SessionOpen {
 				won, err := b.multipart.LatchSession(ctx, uploadID, registry.SessionOpen, registry.SessionCompleting)
 				if err != nil {
 					return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: latch: %w", err)
@@ -540,11 +558,11 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 					break
 				}
 			}
-			if state == registry.SessionAborting {
+			if cur.State == registry.SessionAborting {
 				return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrNoSuchUpload)
 			}
 			if tries >= replayMaxTries || time.Now().After(deadline) {
-				return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrNoSuchUpload)
+				return s3response.CompleteMultipartUploadResult{}, "", errCompleteInProgress
 			}
 			select {
 			case <-ctx.Done():
@@ -554,14 +572,13 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 			if backoff < 200*time.Millisecond {
 				backoff *= 2
 			}
-			s2, err := b.multipart.GetSession(ctx, uploadID)
+			cur, err = b.multipart.GetSession(ctx, uploadID)
 			if errors.Is(err, registry.ErrNotFound) {
 				return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrNoSuchUpload)
 			}
 			if err != nil {
 				return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: session poll: %w", err)
 			}
-			state = s2.State
 		}
 	}
 	_ = completeWon
@@ -673,12 +690,19 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 		return s3response.CompleteMultipartUploadResult{}, "", err
 	}
 	committed = true
-	// The object is durable. Retain the session (state 'completed') and its
-	// parts so a duplicate Complete is idempotent; the sweeper reaps it later.
+	// The x-amz-version-id of the new version, omitted for unversioned buckets
+	// (docs/s3-versioning.md §4.3).
+	versionid := ""
+	if effState.Configured() {
+		versionid = node.VersionID
+	}
+	// The object is durable. Retain the session (state 'completed', carrying
+	// the committed ETag and version id) and its parts so a duplicate or
+	// latch-losing Complete replays this result; the sweeper reaps it later.
 	// Best-effort: a failed latch leaves the row in 'completing', which the
 	// sweeper reaps through its abort path after the TTL — harmless here, as
 	// the winners hold reference claims by now, so that cleanup skips them.
-	if _, err := b.multipart.LatchSession(ctx, uploadID, registry.SessionCompleting, registry.SessionCompleted); err != nil {
+	if _, err := b.multipart.CompleteSession(ctx, uploadID, etag, versionid); err != nil {
 		b.logger.Warn("latch session to completed failed; sweeper reaps the completing row after the TTL",
 			zap.String("uploadID", uploadID), zap.Error(err))
 	}
@@ -705,12 +729,6 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 		b.cleanupPartBlobs(ctx, bucketState.Space, uploadID, orphans, winners)
 	}
 
-	// The x-amz-version-id of the new version, omitted for unversioned buckets
-	// (docs/s3-versioning.md §4.3).
-	versionid := ""
-	if effState.Configured() {
-		versionid = node.VersionID
-	}
 	etagQ := `"` + etag + `"`
 	res := s3response.CompleteMultipartUploadResult{Bucket: &bucket, Key: &key, ETag: &etagQ}
 	setCompleteResultChecksum(&res, ckAlgo, ckValue, ckType)

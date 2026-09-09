@@ -362,6 +362,20 @@ func (m *MemStore) LatchSession(_ context.Context, uploadID, from, to string) (b
 	return true, nil
 }
 
+func (m *MemStore) CompleteSession(_ context.Context, uploadID, etag, versionID string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.sessions[uploadID]
+	if !ok || s.State != registry.SessionCompleting {
+		return false, nil
+	}
+	s.State = registry.SessionCompleted
+	s.CommittedETag = etag
+	s.CommittedVersionID = versionID
+	m.sessions[uploadID] = s
+	return true, nil
+}
+
 func (m *MemStore) DeleteSession(_ context.Context, uploadID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
