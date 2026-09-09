@@ -60,7 +60,11 @@ func (m *MemStore) countRefsLocked(space did.DID, digest multihash.Multihash) in
 func (m *MemStore) RemoveBlobRef(_ context.Context, digest multihash.Multihash, bucket, objectKey, versionID string, space did.DID, notBefore time.Time) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	delete(m.blobRefs, refKey{string(digest), bucket, objectKey, versionID})
+	k := refKey{string(digest), bucket, objectKey, versionID}
+	if _, ok := m.blobRefs[k]; !ok {
+		return false, nil // absent: nothing to release (see the interface doc)
+	}
+	delete(m.blobRefs, k)
 	if m.countRefsLocked(space, digest) != 0 {
 		return false, nil
 	}

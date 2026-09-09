@@ -71,9 +71,24 @@ func TestBlobRefs_CountToZero(t *testing.T) {
 		t.Fatalf("count after last removal = %d, want 0", n)
 	}
 
-	// Removing an already-absent reference is not an error.
-	if _, err := m.RemoveBlobRef(ctx, digest, "b", "k1", registry.NullVersionID, space, time.Now()); err != nil {
-		t.Fatalf("idempotent RemoveBlobRef: %v", err)
+	// Removing an already-absent reference is a no-op: no error, and no
+	// second enqueue that would push the pending release's due time out.
+	later := time.Now().Add(time.Hour)
+	if enq, err := m.RemoveBlobRef(ctx, digest, "b", "k1", registry.NullVersionID, space, later); err != nil || enq {
+		t.Fatalf("absent RemoveBlobRef: err=%v enqueued=%v, want nil/false", err, enq)
+	}
+	due, err := m.ListDueReleases(ctx, time.Now().Add(time.Minute), 10)
+	if err != nil {
+		t.Fatalf("ListDueReleases: %v", err)
+	}
+	found := false
+	for _, pr := range due {
+		if pr.Space == space && string(pr.Digest) == string(digest) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("release intent missing or pushed past its original not_before by an absent remove")
 	}
 }
 

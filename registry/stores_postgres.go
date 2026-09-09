@@ -59,11 +59,15 @@ func (r *Postgres) RemoveBlobRef(ctx context.Context, digest multihash.Multihash
 	}
 	defer tx.Rollback(ctx)
 
-	if _, err := tx.Exec(ctx,
+	tag, err := tx.Exec(ctx,
 		`DELETE FROM ingot.blob_refs
 		 WHERE digest = $1 AND bucket = $2 AND object_key = $3 AND version_id = $4`,
-		digest, bucket, objectKey, versionID); err != nil {
+		digest, bucket, objectKey, versionID)
+	if err != nil {
 		return false, fmt.Errorf("registry: remove ref: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return false, nil // absent: nothing to release (see the interface doc)
 	}
 	var n int
 	if err := tx.QueryRow(ctx,

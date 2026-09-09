@@ -141,6 +141,12 @@ func TestPostgresStores_Live(t *testing.T) {
 		if !enq {
 			t.Fatalf("last drop did not enqueue a release")
 		}
+		// An absent remove is a no-op: it must not re-enqueue with a later
+		// not_before, which would push the pending release out.
+		enq, err = r.RemoveBlobRef(ctx, digest, "rb", "k2", "null#1", space, time.Now().Add(time.Hour))
+		if err != nil || enq {
+			t.Fatalf("absent RemoveBlobRef: err=%v enqueued=%v, want nil/false", err, enq)
+		}
 
 		listed, err := r.ListDueReleases(ctx, time.Now(), 10)
 		if err != nil {

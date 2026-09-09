@@ -217,8 +217,10 @@ type BlobRefStore interface {
 	// RemoveBlobRef deletes one reference row and, when the space then holds
 	// no reference to digest, records a release intent due at notBefore —
 	// atomically, so no crash window separates "last reference gone" from
-	// "release recorded". Removing an absent row is not an error. Reports
-	// whether an intent was enqueued.
+	// "release recorded". Reports whether an intent was enqueued. Removing
+	// an absent row is a no-op (false, nil): the remover that deleted it
+	// already enqueued any release, and re-enqueueing would only push the
+	// due time out (Enqueue keeps the later not_before).
 	RemoveBlobRef(ctx context.Context, digest multihash.Multihash, bucket, objectKey, versionID string, space did.DID, notBefore time.Time) (bool, error)
 }
 
