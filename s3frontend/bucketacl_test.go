@@ -31,7 +31,6 @@ func TestUnsupportedBucketACL(t *testing.T) {
 	}
 }
 
-
 func TestUnsupportedObjectACL(t *testing.T) {
 	str := func(s string) *string { return &s }
 	cases := []struct {
@@ -54,7 +53,6 @@ func TestUnsupportedObjectACL(t *testing.T) {
 		}
 	}
 }
-
 
 func TestRequestsServerSideEncryption(t *testing.T) {
 	cases := []struct {
