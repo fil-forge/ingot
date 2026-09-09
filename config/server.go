@@ -54,7 +54,7 @@ type ServerConfig struct {
 	MultipartSessionTTL time.Duration
 
 	// ReleaseGrace delays each blob release this long past the drop of its
-	// last reference claim, so in-flight readers of the prior catalog root
+	// last reference, so in-flight readers of the prior catalog root
 	// finish first. Config.ServerConfig() applies the 60s default; zero here
 	// means releases are due immediately.
 	ReleaseGrace time.Duration

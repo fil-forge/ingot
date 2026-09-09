@@ -169,8 +169,8 @@ func TestVersioning_EnabledPutRetainsVersions(t *testing.T) {
 	}
 
 	// Overwrite under Enabled releases nothing.
-	if claims(t, mem, da) != 1 || claims(t, mem, db) != 1 {
-		t.Fatalf("claims(A)=%d claims(B)=%d, want 1/1", claims(t, mem, da), claims(t, mem, db))
+	if refs(t, mem, da) != 1 || refs(t, mem, db) != 1 {
+		t.Fatalf("refs(A)=%d refs(B)=%d, want 1/1", refs(t, mem, da), refs(t, mem, db))
 	}
 	if len(rm.removed) != 0 {
 		t.Fatalf("removed %d blobs, want 0", len(rm.removed))
@@ -226,19 +226,19 @@ func TestVersioning_SuspendedReplacesNullInPlace(t *testing.T) {
 	}
 	db := blobDigestOf(t, b, "k1", "null")
 	// The numbered version was retained; nothing released yet.
-	if claims(t, mem, da) != 1 || len(rm.removed) != 0 {
-		t.Fatalf("claims(A)=%d removed=%d, want 1/0", claims(t, mem, da), len(rm.removed))
+	if refs(t, mem, da) != 1 || len(rm.removed) != 0 {
+		t.Fatalf("refs(A)=%d removed=%d, want 1/0", refs(t, mem, da), len(rm.removed))
 	}
 
 	// A second null write replaces the first in place.
 	putObjV(t, b, "k1", cc)
 	dc := blobDigestOf(t, b, "k1", "null")
 	drainReleases(t, b)
-	if claims(t, mem, db) != 0 || rm.removedDigests()[string(db)] != 1 {
-		t.Fatalf("claims(B)=%d removals(B)=%d, want 0/1", claims(t, mem, db), rm.removedDigests()[string(db)])
+	if refs(t, mem, db) != 0 || rm.removedDigests()[string(db)] != 1 {
+		t.Fatalf("refs(B)=%d removals(B)=%d, want 0/1", refs(t, mem, db), rm.removedDigests()[string(db)])
 	}
-	if claims(t, mem, dc) != 1 || claims(t, mem, da) != 1 {
-		t.Fatalf("claims(C)=%d claims(A)=%d, want 1/1", claims(t, mem, dc), claims(t, mem, da))
+	if refs(t, mem, dc) != 1 || refs(t, mem, da) != 1 {
+		t.Fatalf("refs(C)=%d refs(A)=%d, want 1/1", refs(t, mem, dc), refs(t, mem, da))
 	}
 
 	res := listVersions(t, b, nil)
@@ -278,8 +278,8 @@ func TestVersioning_DeleteMarker(t *testing.T) {
 	}
 
 	// The marked version's data is retained.
-	if claims(t, mem, d) != 1 || len(rm.removed) != 0 {
-		t.Fatalf("claims=%d removed=%d, want 1/0", claims(t, mem, d), len(rm.removed))
+	if refs(t, mem, d) != 1 || len(rm.removed) != 0 {
+		t.Fatalf("refs=%d removed=%d, want 1/0", refs(t, mem, d), len(rm.removed))
 	}
 
 	// ListObjects hides the key; ListObjectVersions shows marker + version.
@@ -329,8 +329,8 @@ func TestVersioning_DeleteSpecificVersionPromotes(t *testing.T) {
 		t.Fatalf("GET after promotion = %q, %v; want %q", data, err, a)
 	}
 	drainReleases(t, b)
-	if claims(t, mem, db) != 0 || rm.removedDigests()[string(db)] != 1 {
-		t.Fatalf("claims(B)=%d removals(B)=%d, want 0/1", claims(t, mem, db), rm.removedDigests()[string(db)])
+	if refs(t, mem, db) != 0 || rm.removedDigests()[string(db)] != 1 {
+		t.Fatalf("refs(B)=%d removals(B)=%d, want 0/1", refs(t, mem, db), rm.removedDigests()[string(db)])
 	}
 	res := listVersions(t, b, nil)
 	if len(res.Versions) != 1 || *res.Versions[0].VersionId != outA.VersionID || !*res.Versions[0].IsLatest {
@@ -344,8 +344,8 @@ func TestVersioning_DeleteSpecificVersionPromotes(t *testing.T) {
 	if _, _, err := getObjV(t, b, "k1", ""); apiErrCode(t, err) != "NoSuchKey" {
 		t.Fatalf("GET after last delete = %v, want NoSuchKey", err)
 	}
-	if claims(t, mem, da) != 0 {
-		t.Fatalf("claims(A) = %d, want 0", claims(t, mem, da))
+	if refs(t, mem, da) != 0 {
+		t.Fatalf("refs(A) = %d, want 0", refs(t, mem, da))
 	}
 	if n := len(listVersions(t, b, nil).Versions); n != 0 {
 		t.Fatalf("versions after full delete = %d, want 0", n)
@@ -464,9 +464,9 @@ func TestVersioning_CopyFromVersion(t *testing.T) {
 	if _, data, err := getObjV(t, b, "k2", ""); err != nil || !bytes.Equal(data, a) {
 		t.Fatalf("copied GET = %q, %v; want %q", data, err, a)
 	}
-	// The shared digest now has two claims: k1's old version and k2's new one.
-	if claims(t, mem, da) != 2 {
-		t.Fatalf("claims = %d, want 2", claims(t, mem, da))
+	// The shared digest now has two references: k1's old version and k2's new one.
+	if refs(t, mem, da) != 2 {
+		t.Fatalf("refs = %d, want 2", refs(t, mem, da))
 	}
 }
 
@@ -639,13 +639,13 @@ func TestVersioning_NullEvictionFromPrev(t *testing.T) {
 	putObjV(t, b, "k1", cc)
 	dc := blobDigestOf(t, b, "k1", "null")
 
-	// A's claim is released and its blob removed; B and C stay claimed.
+	// A's reference drops and its blob is removed; B and C stay referenced.
 	drainReleases(t, b)
-	if claims(t, mem, da) != 0 || rm.removedDigests()[string(da)] != 1 {
-		t.Fatalf("claims(A)=%d removals(A)=%d, want 0/1", claims(t, mem, da), rm.removedDigests()[string(da)])
+	if refs(t, mem, da) != 0 || rm.removedDigests()[string(da)] != 1 {
+		t.Fatalf("refs(A)=%d removals(A)=%d, want 0/1", refs(t, mem, da), rm.removedDigests()[string(da)])
 	}
-	if claims(t, mem, db) != 1 || claims(t, mem, dc) != 1 {
-		t.Fatalf("claims(B)=%d claims(C)=%d, want 1/1", claims(t, mem, db), claims(t, mem, dc))
+	if refs(t, mem, db) != 1 || refs(t, mem, dc) != 1 {
+		t.Fatalf("refs(B)=%d refs(C)=%d, want 1/1", refs(t, mem, db), refs(t, mem, dc))
 	}
 
 	// The stack is [C null latest, B numbered]; the old null resolves to C.

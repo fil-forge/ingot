@@ -30,7 +30,7 @@ import (
 // it, supersede, abort, and the sweeper — must release it fully: enc-params
 // row (the crypto-shred), upload intent, park row, and the network copy.
 // Under the NopUploader every part blob is IntentAccepted (there is no
-// network to park on), so these tests exercise the accepted-at-zero-claims
+// network to park on), so these tests exercise the accepted-at-zero-refs
 // release arm; the parked arm is covered by the parkingUploader tests below
 // and the Docker itests.
 
@@ -160,10 +160,10 @@ func TestSupersededPartReleased(t *testing.T) {
 	}
 }
 
-// TestAbortReleasesUnclaimedBlobs: a client abort releases every part blob —
-// including accepted-with-zero-claims ones, the state every part blob has
+// TestAbortReleasesUnreferencedBlobs: a client abort releases every part blob —
+// including accepted-with-zero-refs ones, the state every part blob has
 // under the NopUploader.
-func TestAbortReleasesUnclaimedBlobs(t *testing.T) {
+func TestAbortReleasesUnreferencedBlobs(t *testing.T) {
 	b, mem, rm := newRefTestBackend(t)
 	bucket, key := "bk", "abort"
 
@@ -187,7 +187,7 @@ func TestAbortReleasesUnclaimedBlobs(t *testing.T) {
 }
 
 // TestSweepReapsCompletingSession: a session a crash stranded in
-// 'completing' before the commit (no claims exist) is reaped like an abort —
+// 'completing' before the commit (no references exist) is reaped like an abort —
 // blobs released, session gone.
 func TestSweepReapsCompletingSession(t *testing.T) {
 	b, mem, rm := newRefTestBackend(t)
@@ -215,8 +215,8 @@ func TestSweepReapsCompletingSession(t *testing.T) {
 }
 
 // TestSweepDropsCompletedSessionKeepingWinners: the sweeper drops a
-// completed session's row without touching its winners — they hold reference
-// claims and belong to the object.
+// completed session's row without touching its winners — they hold
+// references and belong to the object.
 func TestSweepDropsCompletedSessionKeepingWinners(t *testing.T) {
 	b, mem, rm := newRefTestBackend(t)
 	ctx := context.Background()

@@ -285,8 +285,8 @@ func (s *Server) startMultipartSweeper() {
 }
 
 // startReleaseSweeper spawns the deferred-release sweeper: release intents
-// past their not_before (last-claim drop + ReleaseGrace) are executed —
-// claim-count recheck, crypto-shred, location delete, network remove — with
+// past their not_before (last-reference drop + ReleaseGrace) are executed —
+// reference-count recheck, crypto-shred, location delete, network remove — with
 // failures retried next tick. The interval floor keeps a tiny test grace
 // from spinning a sub-second ticker.
 func (s *Server) startReleaseSweeper() {

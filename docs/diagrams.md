@@ -22,7 +22,7 @@ change to the diagrams to re-check. The maintenance rule lives in
 | `get` | [GetObject](#getobject-version-resolution-local-tiers-network-retrieval) | version resolution, tier fallthrough, network retrieval | here |
 | `multipart` | [Multipart upload](#multipart-upload-park-on-write-conclude-on-complete) | park at UploadPart, conclude at Complete, abort unwind | here |
 | `multipart-states` | [Session states](#session-states-and-the-completeabort-latch) | the session state machine and the single-winner latch | here |
-| `blob-lifecycle` | [Blob lifecycle](#blob-lifecycle-spooled-parked-accepted-released) | intent states and the claim ledger gating deletion | here |
+| `blob-lifecycle` | [Blob lifecycle](#blob-lifecycle-spooled-parked-accepted-released) | intent states and the reference ledger gating deletion | here |
 | `version-tree` | [Per-key version storage](#per-key-version-storage-manifest-arm-leaf-arm-prev-tree) | the value union, the leaf, the prev tree | here |
 | `gc-candidates` | [Catalog GC candidates](#catalog-gc-candidates-what-gets-remembered-for-removal) | every path that records a superseded catalog block for removal | here |
 | `principals` | [Principals and proof stores](#principals-and-proof-stores) | every DID in play and which store proves what | here |
@@ -276,8 +276,8 @@ sequenceDiagram
     TX->>R: CASRoot(bucket, snapshot, newRoot), guarded
     TX-->>B: committed, lock released
     Note over B,R: post-commit, off the lock
-    B->>R: reconcileClaims: blob_refs gains this version,<br/>superseded version rows removed
-    B->>U: /blob/remove per digest whose CountClaims reached 0<br/>(+ crypto-shred: its blob_encryption_params row deleted)
+    B->>R: removeRefs: superseded version rows removed<br/>(this version's rows were added under the lock)
+    B->>U: release sweeper, after the grace: /blob/remove per digest whose CountRefs reached 0<br/>(+ crypto-shred: its blob_encryption_params row deleted)
     B-->>C: 200 + ETag (+ x-amz-version-id when versioning is configured)
 ```
 
@@ -294,10 +294,10 @@ sequenceDiagram
 - The supersession rule (which prior version is retained, replaced, or
   discarded) is [`s3-versioning.md`](./s3-versioning.md) §5; the resulting
   storage shape is the [version tree](#per-key-version-storage-manifest-arm-leaf-arm-prev-tree).
-- The claim ledger and the zero-claims release are the
+- The reference ledger and the zero-references release are the
   [blob lifecycle](#blob-lifecycle-spooled-parked-accepted-released).
 - `CopyObject` runs the same `commitVersion` with a manifest that pins the
-  source's digests: no spool, no upload, claims incremented. Cross-space
+  source's digests: no spool, no upload, references added. Cross-space
   (today: cross-bucket) copies are rejected `NotImplemented` — the CEK wrap
   is bound to (space, digest), so they need a rewrap flow.
 - Supersession also records each replaced catalog block for future removal:
@@ -448,7 +448,7 @@ sequenceDiagram
 
 - A part re-upload and an abort reclaim only blobs no other session, part, or
   committed object references (`cleanupPartBlobs` checks `CountPartRefs` and
-  `CountClaims`).
+  `CountRefs`).
 - A never-parked blob at Complete falls back to a full synchronous
   `UploadBlob`.
 
@@ -491,7 +491,7 @@ Sources: `s3frontend/multipart.go`, `registry/stores_postgres.go`
 
 ## Blob lifecycle: spooled, parked, accepted, released
 
-Dedup stores bytes once; the claim ledger lets them be deleted once. Intents
+Dedup stores bytes once; the reference ledger lets them be deleted once. Intents
 track the disk-and-network state of each digest; `blob_refs` counts which
 versions still reference it.
 
@@ -512,8 +512,8 @@ flowchart TB
     spooled -->|"cleanupPartBlobs:<br/>DeleteIntent + spool.Remove"| gone([deleted])
     parked -->|"cleanupPartBlobs: /blob/abort (cause AddTask),<br/>DeleteIntent + spool.Remove"| gone
 
-    accepted -->|"commit: reconcileClaims adds this version"| refs["blob_refs rows<br/>(digest, bucket, key, version_id)"]
-    refs -->|"version delete or overwrite removes its row"| zero{"CountClaims == 0<br/>for (space, digest)?"}
+    accepted -->|"commit: addRefs adds this version"| refs["blob_refs rows<br/>(digest, bucket, key, version_id)"]
+    refs -->|"version delete or overwrite removes its row"| zero{"CountRefs == 0<br/>for (space, digest)?"}
     zero -->|yes| rm["RemoveBlob: /blob/remove to sprue<br/>(space claim released)"]
     zero -->|no| keep["blob retained<br/>(still referenced)"]
 ```
@@ -530,7 +530,7 @@ Cross-references: [`architecture.md` §5](./architecture.md#5-the-data-layer),
 [`s3-versioning.md`](./s3-versioning.md) §8.
 
 Sources: `registry/stores.go` (state consts), `s3frontend/object.go`
-(ingestBody, reconcileClaims, releaseBlobs), `s3frontend/multipart.go`
+(ingestBody, addRefs, removeRefs, SweepPendingReleases), `s3frontend/multipart.go`
 (parkBlobs, concludeBlobs, cleanupPartBlobs), `uploader/blob.go` (UploadBlob,
 AbortBlob, RemoveBlob). Review when these change.
 
@@ -628,7 +628,7 @@ flowchart TB
   [`architecture.md` §4](./architecture.md#4-the-catalog-layer) scopes the
   eventual collector to those as well.
 - The body bytes a removed version referenced are handled separately, by the
-  claim ledger in the
+  reference ledger in the
   [blob lifecycle](#blob-lifecycle-spooled-parked-accepted-released):
   `gc_candidates` remembers catalog blocks, `blob_refs` counts body blobs.
 
@@ -781,7 +781,7 @@ erDiagram
         text bucket PK
         text object_key PK
         text version_id PK
-        text space "claim index (space, digest)"
+        text space "reference index (space, digest)"
     }
     upload_intents {
         bytea digest PK

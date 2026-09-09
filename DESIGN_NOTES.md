@@ -44,7 +44,7 @@ critical section run: allocate the version seq, write the manifest, splice
 the MST, fsync one `AppendBatch` of the new catalog blocks, and
 compare-and-swap the bucket root in Postgres. The reference index
 (`blob_refs`) reconciles after the commit, releasing superseded blobs whose
-claim count reaches zero. The full trace is the
+reference count reaches zero. The full trace is the
 [PutObject diagram](./docs/diagrams.md#putobject-spool-and-upload-off-the-lock-commit-under-it).
 
 **Every body blob is encrypted at ingest** (the FilOne encryption design's
@@ -68,8 +68,8 @@ The split geometry, manifest spans, `Body.Size`, sha256/md5 and ETag are all
 plaintext values — only the digest and the stored sizes
 (`upload_intents.Size`, `blob_locations.Size`) name ciphertext.
 Consequences, per the RFC: content **dedup is gone** for bodies (a fresh CEK
-makes every stored digest unique), a DELETE that releases a blob's last
-claim also deletes its params row (crypto-shred — the ciphertext is
+makes every stored digest unique), a DELETE that drops a blob's last
+reference also deletes its params row (crypto-shred — the ciphertext is
 unreadable even where copies survive), and **cross-space CopyObject is
 rejected** `NotImplemented` (the CEK wrap is space-bound; a rewrap flow is a
 filed follow-up). Rotation: Hilt replaces `#wrap` in place and archives the
@@ -174,7 +174,7 @@ draws the chains and the stores.
 ## State & durability
 
 - **Postgres (`ingot` schema)** is the mutable index: per-bucket roots and
-  versioning state, segment metadata and op-roots, the blob claim ledger
+  versioning state, segment metadata and op-roots, the blob reference ledger
   (`blob_refs`), locations and inclusions, upload intents, multipart
   sessions/parts/parks, and GC candidates. goose tracks its version at
   `ingot.goose_db_version` (never collides with a host's own migrations).

@@ -123,7 +123,7 @@ func TestForgeEncryption(t *testing.T) {
 	})
 
 	// DELETE of a multipart-created object: the accepted-blob release path
-	// (distinct from abort's /blob/abort), with one claim per part blob.
+	// (distinct from abort's /blob/abort), with one reference per part blob.
 	// TestForgeDeleteReleasesNetworkBlob pins the same chain for a single
 	// PUT; this pins it for an object assembled from parts.
 	t.Run("MultipartDeleteReleasesBlobs", func(t *testing.T) {
@@ -292,7 +292,7 @@ func TestForgeEncryption(t *testing.T) {
 			t.Fatalf("HEAD after delete succeeded, want NotFound")
 		}
 
-		// The claims drop synchronously with the delete; the shred (enc-params
+		// The references drop synchronously with the delete; the shred (enc-params
 		// + location rows) is deferred behind the release grace (60s default)
 		// and executed by the release sweeper — poll it through.
 		refsQ := fmt.Sprintf(`SELECT count(*) FROM ingot.blob_refs WHERE bucket = '%s' AND object_key = '%s'`, bucket, key)
@@ -482,7 +482,7 @@ func TestForgeEncryption(t *testing.T) {
 	// OverwriteRace: a GET concurrent with an overwrite serves exactly the
 	// old or the new object — length, sha256, and ETag from one generation,
 	// never a mix, a short read, or an error. The guarantees under test: the
-	// catalog root swap is atomic; each generation's claims are keyed
+	// catalog root swap is atomic; each generation's references are keyed
 	// per-generation; and the superseded generation's enc-params/location
 	// rows are shredded only after the release grace, so readers holding the
 	// prior root finish first.

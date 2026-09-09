@@ -64,7 +64,7 @@ type Backend struct {
 	remover   uploader.BlobRemover
 	encParams registry.EncryptionParamsStore
 	// pendingReleases is the deferred-release queue; releaseGrace is how far
-	// past the last-claim drop each release is scheduled (readers holding the
+	// past the last-reference drop each release is scheduled (readers holding the
 	// prior catalog root get at least this long to finish their prefetch).
 	pendingReleases registry.PendingReleaseStore
 	releaseGrace    time.Duration
@@ -135,10 +135,10 @@ type Deps struct {
 	TenantKeys tenantkey.Source
 
 	// PendingReleases is the deferred-release queue (blob_release_intents):
-	// a last-claim drop enqueues here and the release sweeper executes after
+	// a last-reference drop enqueues here and the release sweeper executes after
 	// ReleaseGrace. Same instance as Registry in production. Required.
 	PendingReleases registry.PendingReleaseStore
-	// ReleaseGrace schedules each release this far past its last-claim drop.
+	// ReleaseGrace schedules each release this far past its last-reference drop.
 	// Zero means immediately due (the server applies the production default
 	// before construction; tests use zero so a manual sweep drains).
 	ReleaseGrace time.Duration

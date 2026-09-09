@@ -72,8 +72,8 @@ block and skip keys whose current version is a delete marker. `ListObjectVersion
 lexicographic order and, within a key, emits the current version and then the prev tree, which
 iterates newest-first because its keys are inverted seqs.
 
-**Space** (§8). Each version claims its body digests in `blob_refs`. Removing a version
-releases only that version's claims, and the physical bytes go only when the last claim goes,
+**Space** (§8). Each version records a reference to each of its body digests in `blob_refs`.
+Removing a version drops only that version's references, and the physical bytes go only when the last reference goes,
 so deduplicated data survives partial deletes by construction.
 
 ---
@@ -167,7 +167,7 @@ the authoritative record, and the `VersionNode` fields are a two-field cache of 
 written as a standalone block at version creation — for a single-version key it *is* the
 value — and its CID is the version's stable identity (invariant 5, §2.4): prev entries store
 it, supersession pushes it down and promotion (§7.2) pulls it back, and the reference index
-(§8) counts claims on the strength of it. Inlining a copy of the current manifest into the leaf would save the
+(§8) counts references on the strength of it. Inlining a copy of the current manifest into the leaf would save the
 second fetch on leaf-key reads, but it would put each object's blob list — which scales with
 object size — on the block every list walk reads, and leaf keys are exactly the keys whose
 lists carry many versions. The leaf stays a small pointer block; the extra fetch is a hot
@@ -460,7 +460,7 @@ rows stay out of scope with it.
 
 | state | behavior |
 |---|---|
-| unversioned | permanent delete (object.go:607 `deleteObjectKey`): drop the key and its manifest, release claims. No marker, no version headers. |
+| unversioned | permanent delete (object.go:607 `deleteObjectKey`): drop the key and its manifest, drop its references. No marker, no version headers. |
 | enabled | insert a **numbered delete marker** via the write rule (§5). This happens **even if the key does not exist** (S3 semantics; `Versioning_DeleteObject_non_existing_object` deletes a nonexistent key and succeeds) — the key is created with the marker's manifest as its value. Response: `DeleteMarker: true`, `VersionId: <marker token>`. |
 | suspended | insert a **null delete marker** via the write rule — as a null write it replaces the existing null (current) or evicts a prev null, per §5.2; repeatable idempotently (`Versioning_DeleteObject_suspended` runs it five times). Response: `DeleteMarker: true`, `VersionId: "null"`. |
 
@@ -492,7 +492,7 @@ A delete never converts a leaf back to the manifest arm: a key left holding one 
 leaf (invariant 6), so the upgrade happens once per key and the write path never re-derives
 form from count.
 
-After commit: release the removed version's claims (§8) — unless it was a marker (no digests).
+After commit: drop the removed version's references (§8) — unless it was a marker (no digests).
 Response: `VersionId` = the requested id; `DeleteMarker: true` iff the removed version was a
 marker (`Versioning_DeleteObject_delete_a_delete_marker` asserts both fields); a no-op miss
 echoes the id with no marker flag.
@@ -520,19 +520,21 @@ object.go:336/:345 is replaced by each version's `VersionID` (null versions carr
 `versionID` everywhere (`registry.BlobRefStore`, stores.go:114-120); no schema or interface
 change.
 
-Rules, preserving the commit-then-reconcile ordering (reconcile strictly after a successful
-`WithTx`, object.go:196-202):
+Rules:
 
-- **New version** → `AddBlobClaim` for each body digest with the new `VersionID`. Retained
-  superseded versions keep their rows untouched — under Enabled, an overwrite **releases nothing**.
+- **New version** → `addRefs`: one `AddBlobRef` per body digest, keyed by the new generation's
+  reference id (`refVersionID`: the ULID token, or `null#<seq>` for a null version), inside the
+  commit lock before the root swap. Retained superseded versions keep their rows untouched — under
+  Enabled, an overwrite **releases nothing**.
 - **Discarded versions** (§5.2 discards, §7.2 removals, unversioned overwrite/delete) →
-  `DeleteBlobClaim` per digest with the *discarded* version's id; `CountClaims == 0` →
-  `RemoveBlob`. The evicted-prev-null case fetches the evicted manifest during
+  `removeRefs` after the commit is durable: `RemoveBlobRef` per digest with the *discarded*
+  generation's reference id; the drop that takes `(space, digest)` to zero references enqueues a
+  deferred release, which the release sweeper executes after the grace window (crypto-shred,
+  location delete, `RemoveBlob`). The evicted-prev-null case fetches the evicted manifest during
   the commit to learn its digests.
-- **Same-id replacement** (null replacing null — the only case where new and discarded share a
-  `(bucket, key, version_id)` row key) → the existing set-diff `reconcileClaims`
-  (object.go:327) so unchanged digests are never dropped-then-re-added.
-- **Delete markers** have no digests: no claims in, none out.
+- **Null replacing null** is not a special case: the two generations carry distinct reference ids,
+  so the new rows are added and the old dropped like any other discard.
+- **Delete markers** have no digests: no references in, none out.
 
 Dedup interactions stay safe by construction: N versions referencing one digest are N rows;
 `RemoveBlob` fires only when the last row for `(space, digest)` goes. `RemoveBlob` itself is
@@ -613,11 +615,11 @@ MFA delete, lifecycle expiration, and multi-instance seq arbitration beyond the 
 | `bucket/manifest.go` | `Seq`, `VersionID` fields (§2.3) |
 | `registry/registry.go`, `postgres.go`, `inmem/store.go` | `State.Versioning`, `VersioningState`, `SetVersioning`, `AllocVersionSeq` (§4.1) |
 | `s3frontend/version.go` (new) | token mint/parse/classify (§3), `revSeqKey`, the value-union dispatch (§2.1), `resolveVersion` (§6.1), the write rule (§5.2), prev-tree helpers |
-| `s3frontend/object.go` | `PutObject` splice → write rule; reads resolve via `resolveVersion`; `GetObject`/`HeadObject` versionId + marker semantics + output ids; `DeleteObject`/`deleteObjectKey`/`DeleteObjects` (§7); `reconcileClaims` call sites carry real version ids (§8); `listWalk` marker skip (§9.1) |
+| `s3frontend/object.go` | `PutObject` splice → write rule; reads resolve via `resolveVersion`; `GetObject`/`HeadObject` versionId + marker semantics + output ids; `DeleteObject`/`deleteObjectKey`/`DeleteObjects` (§7); `addRefs`/`removeRefs` call sites carry per-generation reference ids (§8); `listWalk` marker skip (§9.1) |
 | `s3frontend/copy.go`, `multipart.go` | `commitManifest` → write rule; source-version resolution; `CopySourceVersionId`; Complete's `versionid` return |
 | `s3frontend/bucket.go` | `PutBucketVersioning` (new), `GetBucketVersioning` (real states), versioned `DeleteBucket` guard (§7) |
 | `s3frontend/listversions.go` (new) | `ListObjectVersions` (§9.2) |
 | `s3frontend/conditions.go` | `currentObjectETag` resolves the current version via `resolveVersion` |
-| unit tests | token codec + classification; union codec round-trip + unknown-key and pre-union-block rejection; write-rule table tests (all four supersession rows + first-supersession leaf creation + null eviction + non-existent-key marker); promotion; per-version claim add/release on the `refindex_test.go` harness; list pagination |
+| unit tests | token codec + classification; union codec round-trip + unknown-key and pre-union-block rejection; write-rule table tests (all four supersession rows + first-supersession leaf creation + null eviction + non-existent-key marker); promotion; per-version reference add/drop on the `refindex_test.go` harness; list pagination |
 | `itest/versity_versioning_test.go` (new) + `versity_test.go` categories | curate upstream `TestVersioning` / `ListObjectVersions_*` / `GetBucketVersioning_*` / `PutBucketVersioning_*` rows into pass/xfail tables (tagging, object-lock, `GetObjectAttributes`, `UploadPartCopy` rows → xfail/omitted; note the teardown-blocked caveat, itest/README.md:40-47) |
 | `docs/architecture.md` | point §3 at this doc for versioning |

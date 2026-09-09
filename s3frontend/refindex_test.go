@@ -20,7 +20,7 @@ import (
 )
 
 // recordingRemover captures the digests RemoveBlob is called with so the
-// reference-index tests can assert exactly when a blob's last claim is released.
+// reference-index tests can assert exactly when a blob's last reference is dropped.
 type recordingRemover struct {
 	mu      sync.Mutex
 	removed [][]byte
@@ -103,7 +103,7 @@ func newRefTestBackend(t *testing.T, maxBlob ...int64) (*Backend, *inmem.MemStor
 // blobDigestsOf reads one version's manifest through the backend's own
 // resolver and returns its body blob digests — the OBSERVED stored digests.
 // Encryption mints a fresh CEK per blob, so a stored digest can no longer be
-// predicted as hash(plaintext); tests key claim and removal assertions on
+// predicted as hash(plaintext); tests key reference and removal assertions on
 // what the write path actually stored. versionID "" resolves the current
 // version.
 func blobDigestsOf(t *testing.T, b *Backend, key, versionID string) []multihash.Multihash {
@@ -158,21 +158,21 @@ func deleteObj(t *testing.T, b *Backend, key string) {
 	}
 }
 
-func claims(t *testing.T, mem *inmem.MemStore, digest []byte) int {
+func refs(t *testing.T, mem *inmem.MemStore, digest []byte) int {
 	t.Helper()
-	// MemStore buckets carry no space (did.Undef), so claims recorded via
+	// MemStore buckets carry no space (did.Undef), so references recorded via
 	// the backend are keyed under did.Undef; count under the same key.
-	// Space-keyed claim counting is covered by the live Postgres test.
-	n, err := mem.CountClaims(context.Background(), did.Undef, digest)
+	// Space-keyed reference counting is covered by the live Postgres test.
+	n, err := mem.CountRefs(context.Background(), did.Undef, digest)
 	if err != nil {
-		t.Fatalf("CountClaims: %v", err)
+		t.Fatalf("CountRefs: %v", err)
 	}
 	return n
 }
 
 // TestRefIndex_IdenticalContentDistinctBlobs: encryption ended content dedup
 // — a fresh CEK per write makes every stored digest unique, so identical
-// bytes under two keys are two blobs with one claim each.
+// bytes under two keys are two blobs with one reference each.
 func TestRefIndex_IdenticalContentDistinctBlobs(t *testing.T) {
 	b, mem, rm := newRefTestBackend(t)
 	data := []byte("identical bytes for two keys")
@@ -188,8 +188,8 @@ func TestRefIndex_IdenticalContentDistinctBlobs(t *testing.T) {
 	if bytes.Equal(d1, digestOf(t, data)) {
 		t.Fatalf("stored digest equals hash(plaintext); blob was not encrypted")
 	}
-	if got1, got2 := claims(t, mem, d1), claims(t, mem, d2); got1 != 1 || got2 != 1 {
-		t.Fatalf("claims = %d/%d, want 1/1 (one claim per distinct blob)", got1, got2)
+	if got1, got2 := refs(t, mem, d1), refs(t, mem, d2); got1 != 1 || got2 != 1 {
+		t.Fatalf("refs = %d/%d, want 1/1 (one reference per distinct blob)", got1, got2)
 	}
 	if len(rm.removed) != 0 {
 		t.Fatalf("removed %d blobs, want 0 (both still referenced)", len(rm.removed))
@@ -198,7 +198,7 @@ func TestRefIndex_IdenticalContentDistinctBlobs(t *testing.T) {
 
 // TestRefIndex_OverwriteSameContentReleasesOld: with encryption an
 // identical-bytes overwrite is a NEW blob (fresh CEK, new digest); the
-// superseded blob's claim drops to zero and it is released.
+// superseded blob's reference count drops to zero and it is released.
 func TestRefIndex_OverwriteSameContentReleasesOld(t *testing.T) {
 	b, mem, rm := newRefTestBackend(t)
 	data := []byte("same bytes re-put")
@@ -211,11 +211,11 @@ func TestRefIndex_OverwriteSameContentReleasesOld(t *testing.T) {
 	if bytes.Equal(old, cur) {
 		t.Fatalf("overwrite reused stored digest %x; encryption must mint a new one", old)
 	}
-	if got := claims(t, mem, old); got != 0 {
-		t.Fatalf("claims(old) = %d, want 0 (superseded)", got)
+	if got := refs(t, mem, old); got != 0 {
+		t.Fatalf("refs(old) = %d, want 0 (superseded)", got)
 	}
-	if got := claims(t, mem, cur); got != 1 {
-		t.Fatalf("claims(current) = %d, want 1", got)
+	if got := refs(t, mem, cur); got != 1 {
+		t.Fatalf("refs(current) = %d, want 1", got)
 	}
 	drainReleases(t, b)
 	if rm.removedDigests()[string(old)] != 1 {
@@ -233,11 +233,11 @@ func TestRefIndex_OverwriteDifferentContentReleasesOld(t *testing.T) {
 	putObj(t, b, "k1", bb) // overwrite-in-place with new content
 	db := blobDigestOf(t, b, "k1", "")
 
-	if got := claims(t, mem, da); got != 0 {
-		t.Fatalf("claims(A) = %d, want 0 (superseded)", got)
+	if got := refs(t, mem, da); got != 0 {
+		t.Fatalf("refs(A) = %d, want 0 (superseded)", got)
 	}
-	if got := claims(t, mem, db); got != 1 {
-		t.Fatalf("claims(B) = %d, want 1", got)
+	if got := refs(t, mem, db); got != 1 {
+		t.Fatalf("refs(B) = %d, want 1", got)
 	}
 	drainReleases(t, b)
 	if rm.removedDigests()[string(da)] != 1 {
@@ -256,8 +256,8 @@ func TestRefIndex_DeleteReleasesAtZero(t *testing.T) {
 	d := blobDigestOf(t, b, "k1", "")
 	deleteObj(t, b, "k1")
 
-	if got := claims(t, mem, d); got != 0 {
-		t.Fatalf("claims = %d, want 0 after delete", got)
+	if got := refs(t, mem, d); got != 0 {
+		t.Fatalf("refs = %d, want 0 after delete", got)
 	}
 	drainReleases(t, b)
 	if rm.removedDigests()[string(d)] != 1 {
@@ -267,7 +267,7 @@ func TestRefIndex_DeleteReleasesAtZero(t *testing.T) {
 
 // TestRefIndex_IdenticalPiecesInOneBody: a body of two identical 1 KiB
 // plaintext halves is stored as two DISTINCT blobs (fresh CEK per piece),
-// each with its own claim, each released exactly once on delete. (The old
+// each with its own reference, each released exactly once on delete. (The old
 // duplicate-BlobRef double-remove scenario cannot be produced by the write
 // path any more; releaseBlobs still guards it.)
 func TestRefIndex_IdenticalPiecesInOneBody(t *testing.T) {
@@ -283,16 +283,16 @@ func TestRefIndex_IdenticalPiecesInOneBody(t *testing.T) {
 		t.Fatalf("identical pieces share stored digest %x; encryption must make them distinct", ds[0])
 	}
 	for i, d := range ds {
-		if got := claims(t, mem, d); got != 1 {
-			t.Fatalf("claims(blob %d) = %d, want 1", i, got)
+		if got := refs(t, mem, d); got != 1 {
+			t.Fatalf("refs(blob %d) = %d, want 1", i, got)
 		}
 	}
 
 	deleteObj(t, b, "k1")
 	drainReleases(t, b)
 	for i, d := range ds {
-		if got := claims(t, mem, d); got != 0 {
-			t.Fatalf("claims(blob %d) after delete = %d, want 0", i, got)
+		if got := refs(t, mem, d); got != 0 {
+			t.Fatalf("refs(blob %d) after delete = %d, want 0", i, got)
 		}
 		if n := rm.removedDigests()[string(d)]; n != 1 {
 			t.Fatalf("RemoveBlob called %d times for blob %d, want exactly 1", n, i)
@@ -301,9 +301,9 @@ func TestRefIndex_IdenticalPiecesInOneBody(t *testing.T) {
 }
 
 // TestRefIndex_SharedDigestAcrossKeys: same-bucket CopyObject is the one
-// remaining way two keys reference ONE blob. The copy adds a second claim on
-// the source's digest; the blob survives the first delete and is released
-// exactly once when the last claim drops.
+// remaining way two keys reference ONE blob. The copy adds a second reference
+// to the source's digest; the blob survives the first delete and is released
+// exactly once when the last reference drops.
 func TestRefIndex_SharedDigestAcrossKeys(t *testing.T) {
 	b, mem, rm := newRefTestBackend(t)
 	data := []byte("shared across two keys")
@@ -322,14 +322,14 @@ func TestRefIndex_SharedDigestAcrossKeys(t *testing.T) {
 	if d2 := blobDigestOf(t, b, "k2", ""); !bytes.Equal(d, d2) {
 		t.Fatalf("copy stored digest %x, want the source's %x (copies share blobs)", d2, d)
 	}
-	if got := claims(t, mem, d); got != 2 {
-		t.Fatalf("claims after copy = %d, want 2", got)
+	if got := refs(t, mem, d); got != 2 {
+		t.Fatalf("refs after copy = %d, want 2", got)
 	}
 
 	deleteObj(t, b, "k1")
 	drainReleases(t, b)
-	if got := claims(t, mem, d); got != 1 {
-		t.Fatalf("claims after first delete = %d, want 1 (k2 still references it)", got)
+	if got := refs(t, mem, d); got != 1 {
+		t.Fatalf("refs after first delete = %d, want 1 (k2 still references it)", got)
 	}
 	if len(rm.removed) != 0 {
 		t.Fatalf("removed %d blobs after first delete, want 0", len(rm.removed))
@@ -337,8 +337,8 @@ func TestRefIndex_SharedDigestAcrossKeys(t *testing.T) {
 
 	deleteObj(t, b, "k2")
 	drainReleases(t, b)
-	if got := claims(t, mem, d); got != 0 {
-		t.Fatalf("claims after second delete = %d, want 0", got)
+	if got := refs(t, mem, d); got != 0 {
+		t.Fatalf("refs after second delete = %d, want 0", got)
 	}
 	if rm.removedDigests()[string(d)] != 1 {
 		t.Fatalf("expected one RemoveBlob after the last reference dropped; got %v", rm.removedDigests())

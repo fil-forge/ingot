@@ -91,9 +91,9 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 	// A copy across spaces is not implemented. The destination manifest
 	// reuses the source's blobs, but each blob's CEK is wrapped bound to
 	// (space, digest): the destination space cannot unwrap them, and the
-	// destination space has no blob_locations/claims for those digests
+	// destination space has no blob_locations/blob_refs rows for those digests
 	// either. Serving this needs a rewrap flow (unwrap under the source
-	// space, rewrap under the destination, new params row + claim) — a filed
+	// space, rewrap under the destination, new params row + reference) — a filed
 	// follow-up. Every bucket has its own space today, so this rejects all
 	// cross-bucket copies.
 	if srcRv.st.Space != bucketState.Space {
@@ -191,7 +191,7 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 	}
 
 	// Commit to the destination via the write rule: splice + reference index.
-	// The new claims use the DESTINATION bucket/space; the same digests gain
+	// The new references use the DESTINATION bucket/space; the same digests gain
 	// another reference.
 	node, effState, err := b.commitVersion(ctx, bucketState, dstKey, dstMf, applyTagsIfPresent(initState, dstTags), nil)
 	if err != nil {

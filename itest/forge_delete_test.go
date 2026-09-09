@@ -11,7 +11,7 @@ import (
 
 // TestForgeDeleteReleasesNetworkBlob is the delete-finality regression gate
 // (FIL-588): DeleteObject must release the blob on the network, not just drop
-// registry rows. The chain under test is ingot's reference index (claims→0 ⇒
+// registry rows. The chain under test is ingot's reference index (refs→0 ⇒
 // RemoveBlob) → forgeclient /blob/remove → sprue (forward + deregister) →
 // piri /blob/release (claim release; deferred physical deletion once the
 // PDP aggregate root retires on-chain).

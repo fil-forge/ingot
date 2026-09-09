@@ -22,7 +22,7 @@ type ObjectManifest struct {
 	ETag string `cborgen:"e"`
 
 	// DeleteMarker flags a tombstone version: a zero Body, no ETag, and no
-	// blob claims. Markers are versions like any other — they occupy a leaf
+	// blob references. Markers are versions like any other — they occupy a leaf
 	// slot and carry a Seq/VersionID. See docs/s3-versioning.md §2.3.
 	DeleteMarker bool `cborgen:"dm"`
 

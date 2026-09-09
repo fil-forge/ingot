@@ -1,13 +1,15 @@
 -- +goose Up
--- Deferred blob release. When a blob's last reference claim drops (overwrite,
--- delete, or multipart cleanup of an accepted-but-unclaimed part), the release
--- is not executed inline: a row lands here — in the same transaction as the
--- claim delete, so there is no crash window between "last claim gone" and
+-- Deferred blob release. When a blob's last reference drops (overwrite,
+-- delete, or multipart cleanup of an accepted-but-unreferenced part), the
+-- release is not executed inline: a row lands here — in the same transaction
+-- as the reference delete, so there is no crash window between "last
+-- reference gone" and
 -- "release recorded" — and a background sweeper executes it after not_before.
 -- The grace window lets in-flight readers holding the prior catalog root
 -- finish their encryption-params/location prefetch before the rows they need
--- are shredded; the sweeper also re-checks the claim count at drain time, so
--- a stale intent (a digest re-claimed since enqueue) self-heals into a no-op.
+-- are shredded; the sweeper also re-checks the reference count at drain time,
+-- so a stale intent (a digest re-referenced since enqueue) self-heals into a
+-- no-op.
 -- Executing a release means: delete the blob_encryption_params row (the
 -- crypto-shred), delete the blob_locations row, invoke the network remove.
 -- The row is deleted only when all three succeed; failures retry next sweep —

@@ -155,7 +155,7 @@ func TestEncryptedWrite_ZeroByteObject(t *testing.T) {
 	}
 }
 
-// TestEncryptedWrite_DeleteShredsParams: releasing a blob's last claim
+// TestEncryptedWrite_DeleteShredsParams: dropping a blob's last reference
 // deletes its blob_encryption_params row — the crypto-shred that renders the
 // ciphertext permanently unreadable even where copies survive.
 func TestEncryptedWrite_DeleteShredsParams(t *testing.T) {
@@ -172,7 +172,7 @@ func TestEncryptedWrite_DeleteShredsParams(t *testing.T) {
 	deleteObj(t, b, "k1")
 	drainReleases(t, b) // the release is deferred; the sweep executes it
 	if _, err := mem.GetEncryptionParams(ctx, did.Undef, d); err == nil {
-		t.Fatalf("params row survived the last-claim release; want it crypto-shredded")
+		t.Fatalf("params row survived the last-reference release; want it crypto-shredded")
 	}
 	if rm.removedDigests()[string(d)] != 1 {
 		t.Fatalf("expected one RemoveBlob; got %v", rm.removedDigests())

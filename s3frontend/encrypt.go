@@ -35,8 +35,8 @@ import (
 //
 // A deliberate consequence (per the RFC): content dedup is gone for
 // encrypted bodies. A fresh CEK per encryption event makes every ciphertext
-// digest unique, so re-uploading identical plaintext creates a new blob, row
-// and claim.
+// digest unique, so re-uploading identical plaintext creates a new blob,
+// params row and reference.
 
 // encryptingBlobWriter is the blockstore.BlobWriter the write path hands to
 // SplitBody: it encrypts each plaintext piece into a FEE envelope, spools

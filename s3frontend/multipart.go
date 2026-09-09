@@ -701,13 +701,13 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 	// latch-losing Complete replays this result; the sweeper reaps it later.
 	// Best-effort: a failed latch leaves the row in 'completing', which the
 	// sweeper reaps through its abort path after the TTL — harmless here, as
-	// the winners hold reference claims by now, so that cleanup skips them.
-	if _, err := b.multipart.CompleteSession(ctx, uploadID, etag, versionid); err != nil {
+	// the winners hold references by now, so that cleanup skips them.
+	if _, err := b.multipart.LatchSession(ctx, uploadID, registry.SessionCompleting, registry.SessionCompleted); err != nil {
 		b.logger.Warn("latch session to completed failed; sweeper reaps the completing row after the TTL",
 			zap.String("uploadID", uploadID), zap.Error(err))
 	}
 
-	// Reap parts uploaded but omitted from the winning list: no claim was
+	// Reap parts uploaded but omitted from the winning list: no reference was
 	// ever added for them, and nothing else revisits their blobs (the part
 	// rows are retained for idempotency, then cascade away at the sweep).
 	// keep guards the winners explicitly — the retained part rows would
@@ -739,7 +739,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 // (single-winner vs Complete), drops it (cascading its parts), and removes the
 // parts' now-unreferenced blobs from the spool — unallocating any that were
 // parked on a provider (an upload ends in exactly one of accept or
-// abort). No reference claims were taken (those happen only at
+// abort). No references were taken (those happen only at
 // Complete).
 func (b *Backend) AbortMultipartUpload(ctx context.Context, input *s3.AbortMultipartUploadInput) error {
 	if input.UploadId == nil {
@@ -827,7 +827,7 @@ func (b *Backend) abortOpenSession(ctx context.Context, space did.DID, sess regi
 // superseded parts of uploadID — unless the blob is still referenced: by a
 // part of another in-flight session (content-addressed dedup), by a part still
 // live in THIS session (a re-uploaded part may share blobs with its
-// replacement or a sibling part), or by a committed object (reference claims).
+// replacement or a sibling part), or by a committed object (blob_refs).
 // keep, when non-nil, overrides the live-parts derivation: Complete passes
 // the winning digests, whose part rows are retained for idempotency and
 // would otherwise mark every digest live. Best-effort: cleanup failure never
@@ -865,7 +865,7 @@ func (b *Backend) cleanupPartBlobs(ctx context.Context, space did.DID, uploadID 
 		if n, err := b.multipart.CountPartRefs(ctx, d, uploadID); err != nil || n > 0 {
 			continue
 		}
-		if n, err := b.blobRefs.CountClaims(ctx, space, d); err != nil || n > 0 {
+		if n, err := b.blobRefs.CountRefs(ctx, space, d); err != nil || n > 0 {
 			continue
 		}
 		state := registry.IntentSpooled
@@ -897,7 +897,7 @@ func (b *Backend) cleanupPartBlobs(ctx context.Context, space did.DID, uploadID 
 				}
 			}
 		case registry.IntentAccepted:
-			// Accepted with zero claims and zero part refs: nothing will ever
+			// Accepted with zero object references and zero part refs: nothing will ever
 			// revisit it — an orphaned part whose Complete omitted it, or a
 			// Complete whose conclude ran and commit failed. Release through
 			// the same deferred path a superseded committed blob takes
@@ -1301,7 +1301,7 @@ func (b *Backend) SweepStaleMultipartSessions(ctx context.Context, ttl time.Dura
 	// Stale open sessions and crash-stranded 'completing' rows: latch into
 	// 'aborting' (losing gracefully to a concurrent Complete/Abort) and clean
 	// up like an abort. A 'completing' row whose commit actually landed is
-	// safe here: its winners hold reference claims, which the cleanup skips.
+	// safe here: its winners hold references, which the cleanup skips.
 	for _, state := range []string{registry.SessionOpen, registry.SessionCompleting} {
 		stale, err := b.multipart.ListStaleSessions(ctx, state, cutoff)
 		if err != nil {
@@ -1345,7 +1345,7 @@ func (b *Backend) SweepStaleMultipartSessions(ctx context.Context, ttl time.Dura
 
 // reapAbortingSession drops a session already latched into 'aborting' and
 // releases its parts' now-unreferenced blobs — unallocating parked ones on
-// their providers via /blob/abort and releasing accepted-but-unclaimed ones
+// their providers via /blob/abort and releasing accepted-but-unreferenced ones
 // through the reference-release path (cleanupPartBlobs skips anything another
 // session or a committed object still references). Reports whether the
 // session row was removed; on a parts-listing failure the session stays

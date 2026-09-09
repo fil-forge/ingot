@@ -603,8 +603,10 @@ The MVP this supersedes had six structural problems; each is resolved by a layer
 - **MST** — the per-bucket Merkle Search Tree mapping composite keys to manifests.
 - **Plane** — a shipping pipeline. The **data** plane is object blobs (direct to Piri); the
   **catalog** plane is MST nodes + manifests (CAR-batched).
-- **Claim** — a space's reference to a blob; `remove` releases it, and Piri deletes bytes when no
-  space holds a claim.
+- **Reference** — one `blob_refs` row: an object version's use of a blob within its space. The
+  space's claim is released when the space's last reference to the digest goes.
+- **Claim** — a space's hold on a blob on the network; `remove` releases it, and Piri deletes bytes
+  when no space holds a claim.
 - **Spool / local store** — Ingot's on-disk copy of a blob; the read-after-write source and the read
   cache.
 - **Guarded root swap** — advancing the bucket MST root only if it still matches the snapshot read at

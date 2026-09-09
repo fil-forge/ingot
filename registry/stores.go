@@ -48,11 +48,12 @@ const (
 	PartAccepted = "accepted"
 )
 
-// BlobClaim is one row of ingot.blob_refs: a single object version's
-// reference to a blob. The space-claim on (Space, Digest) is released when
-// no BlobClaim rows remain for it. Distinct from bucket.BlobRef (the
-// manifest's blob descriptor); this is the reverse index over those.
-type BlobClaim struct {
+// BlobRef is one row of ingot.blob_refs: a single object version's
+// reference to a blob. The space's network claim on (Space, Digest) is
+// released when no BlobRef rows remain for it. Distinct from bucket.BlobRef
+// (the manifest's forward blob descriptor); this is the reverse index over
+// those.
+type BlobRef struct {
 	Digest    multihash.Multihash
 	Bucket    string
 	ObjectKey string
@@ -205,24 +206,24 @@ type MultipartPart struct {
 }
 
 // BlobRefStore is the reverse reference index (§5, §6). A commit adds a
-// claim per body digest; a delete/overwrite removes it; CountClaims gates
-// remove(digest) (physical reclamation when the count reaches zero).
+// reference per body digest; a delete/overwrite removes it; CountRefs gates
+// remove(digest), which releases the space's network claim (Piri reclaims
+// the bytes once no space claims the blob).
 type BlobRefStore interface {
-	AddBlobClaim(ctx context.Context, claim BlobClaim) error
-	DeleteBlobClaim(ctx context.Context, digest multihash.Multihash, bucket, objectKey, versionID string) error
-	// CountClaims returns how many object versions in space still reference
+	AddBlobRef(ctx context.Context, ref BlobRef) error
+	// CountRefs returns how many object versions in space still reference
 	// digest. Zero means the space's claim may be released.
-	CountClaims(ctx context.Context, space did.DID, digest multihash.Multihash) (int, error)
-	// DropClaimEnqueueRelease deletes one claim row and, when it was the
-	// space's last claim on digest, records a release intent due at
-	// notBefore — atomically, so no crash window separates "last claim
-	// gone" from "release recorded". Reports whether an intent was
-	// enqueued.
-	DropClaimEnqueueRelease(ctx context.Context, digest multihash.Multihash, bucket, objectKey, versionID string, space did.DID, notBefore time.Time) (bool, error)
+	CountRefs(ctx context.Context, space did.DID, digest multihash.Multihash) (int, error)
+	// RemoveBlobRef deletes one reference row and, when the space then holds
+	// no reference to digest, records a release intent due at notBefore —
+	// atomically, so no crash window separates "last reference gone" from
+	// "release recorded". Removing an absent row is not an error. Reports
+	// whether an intent was enqueued.
+	RemoveBlobRef(ctx context.Context, digest multihash.Multihash, bucket, objectKey, versionID string, space did.DID, notBefore time.Time) (bool, error)
 }
 
 // PendingRelease is one deferred blob release: executed by the release
-// sweeper once not_before passes and the digest still has zero claims.
+// sweeper once not_before passes and the digest still has zero references.
 type PendingRelease struct {
 	Space     did.DID
 	Digest    multihash.Multihash
@@ -230,7 +231,7 @@ type PendingRelease struct {
 }
 
 // PendingReleaseStore is the deferred-release queue (blob_release_intents):
-// the durable record between "last claim dropped" and "release executed"
+// the durable record between "last reference dropped" and "release executed"
 // (crypto-shred + location delete + network remove). Enqueue upserts,
 // keeping the later not_before.
 type PendingReleaseStore interface {

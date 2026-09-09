@@ -29,44 +29,33 @@ var (
 
 // BlobRefStore ===============================================================
 
-func (r *Postgres) AddBlobClaim(ctx context.Context, c BlobClaim) error {
+func (r *Postgres) AddBlobRef(ctx context.Context, c BlobRef) error {
 	_, err := r.pool.Exec(ctx,
 		`INSERT INTO ingot.blob_refs (digest, bucket, object_key, version_id, space)
 		 VALUES ($1, $2, $3, $4, $5)
 		 ON CONFLICT (digest, bucket, object_key, version_id) DO NOTHING`,
 		c.Digest, c.Bucket, c.ObjectKey, c.VersionID, c.Space)
 	if err != nil {
-		return fmt.Errorf("registry: add blob claim: %w", err)
+		return fmt.Errorf("registry: add blob ref: %w", err)
 	}
 	return nil
 }
 
-func (r *Postgres) DeleteBlobClaim(ctx context.Context, digest multihash.Multihash, bucket, objectKey, versionID string) error {
-	_, err := r.pool.Exec(ctx,
-		`DELETE FROM ingot.blob_refs
-		 WHERE digest = $1 AND bucket = $2 AND object_key = $3 AND version_id = $4`,
-		digest, bucket, objectKey, versionID)
-	if err != nil {
-		return fmt.Errorf("registry: delete blob claim: %w", err)
-	}
-	return nil
-}
-
-func (r *Postgres) CountClaims(ctx context.Context, space did.DID, digest multihash.Multihash) (int, error) {
+func (r *Postgres) CountRefs(ctx context.Context, space did.DID, digest multihash.Multihash) (int, error) {
 	var n int
 	err := r.pool.QueryRow(ctx,
 		`SELECT count(*) FROM ingot.blob_refs WHERE space = $1 AND digest = $2`,
 		space, digest).Scan(&n)
 	if err != nil {
-		return 0, fmt.Errorf("registry: count claims: %w", err)
+		return 0, fmt.Errorf("registry: count refs: %w", err)
 	}
 	return n, nil
 }
 
-func (r *Postgres) DropClaimEnqueueRelease(ctx context.Context, digest multihash.Multihash, bucket, objectKey, versionID string, space did.DID, notBefore time.Time) (bool, error) {
+func (r *Postgres) RemoveBlobRef(ctx context.Context, digest multihash.Multihash, bucket, objectKey, versionID string, space did.DID, notBefore time.Time) (bool, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
-		return false, fmt.Errorf("registry: begin drop claim: %w", err)
+		return false, fmt.Errorf("registry: begin remove ref: %w", err)
 	}
 	defer tx.Rollback(ctx)
 
@@ -74,13 +63,13 @@ func (r *Postgres) DropClaimEnqueueRelease(ctx context.Context, digest multihash
 		`DELETE FROM ingot.blob_refs
 		 WHERE digest = $1 AND bucket = $2 AND object_key = $3 AND version_id = $4`,
 		digest, bucket, objectKey, versionID); err != nil {
-		return false, fmt.Errorf("registry: drop claim: %w", err)
+		return false, fmt.Errorf("registry: remove ref: %w", err)
 	}
 	var n int
 	if err := tx.QueryRow(ctx,
 		`SELECT count(*) FROM ingot.blob_refs WHERE space = $1 AND digest = $2`,
 		space, digest).Scan(&n); err != nil {
-		return false, fmt.Errorf("registry: drop claim count: %w", err)
+		return false, fmt.Errorf("registry: remove ref count: %w", err)
 	}
 	enqueued := false
 	if n == 0 {
@@ -95,7 +84,7 @@ func (r *Postgres) DropClaimEnqueueRelease(ctx context.Context, digest multihash
 		enqueued = true
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return false, fmt.Errorf("registry: commit drop claim: %w", err)
+		return false, fmt.Errorf("registry: commit remove ref: %w", err)
 	}
 	return enqueued, nil
 }

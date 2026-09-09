@@ -245,9 +245,9 @@ func (b *Backend) resolveVersion(ctx context.Context, bucketName, key, versionID
 }
 
 // discardedVersion records a version permanently removed by a commit, for the
-// post-commit reference-index release (§8). seq disambiguates the claim rows:
-// unversioned generations share the "null" version id but never a claim id
-// (claimVersionID).
+// post-commit reference drop (§8). seq disambiguates the reference rows:
+// unversioned generations share the "null" version id but never a reference
+// id (refVersionID).
 type discardedVersion struct {
 	versionID string
 	seq       uint64
@@ -260,8 +260,8 @@ type discardedVersion struct {
 // Seq/VersionID, supersedes the current version per the bucket's versioning
 // state, splices the rebuilt value (the manifest itself until the key's
 // first retained supersession creates its leaf, §2.1/§5.2), and — after the
-// commit is durable — reconciles the reference index (claims for the new
-// version; releases for discarded ones). preCheck, when non-nil, runs under
+// commit is durable — reconciles the reference index (references for the
+// new version are added under the lock; discarded versions' drop after). preCheck, when non-nil, runs under
 // the lock against the superseded current manifest (nil when the key is new)
 // before anything is written, so conditional mutations are race-safe.
 //
@@ -507,12 +507,12 @@ func (b *Backend) commitVersion(ctx context.Context, bucketState *registry.State
 		}
 		node = newNode
 
-		// Claim the new generation's blobs UNDER the lock, before the root
-		// swap: a racing writer that later supersedes this generation always
-		// finds the rows to drop. A failed commit leaves at most a benign
-		// extra claim — never a wrong release; the release sweeper re-checks
-		// claim counts at drain time.
-		if err := b.addClaims(ctx, st, key, claimVersionID(vid, seq), bodyDigests(mf.Body)); err != nil {
+		// Reference the new generation's blobs UNDER the lock, before the
+		// root swap: a racing writer that later supersedes this generation
+		// always finds the rows to drop. A failed commit leaves at most a
+		// benign extra reference — never a wrong release; the release
+		// sweeper re-checks reference counts at drain time.
+		if err := b.addRefs(ctx, st, key, refVersionID(vid, seq), bodyDigests(mf.Body)); err != nil {
 			return cid.Undef, err
 		}
 		return t2.GetPointer(ctx, tx)
@@ -521,12 +521,12 @@ func (b *Backend) commitVersion(ctx context.Context, bucketState *registry.State
 		return node, effState, mapCommitError(err, "commit version")
 	}
 
-	// Reference index (§8): the new generation's claims were added under the
-	// lock; the discarded generations' claims drop here, after the commit is
-	// durable, each drop atomically enqueueing a deferred release when the
-	// space's last claim on a digest goes.
+	// Reference index (§8): the new generation's references were added under
+	// the lock; the discarded generations' references drop here, after the
+	// commit is durable, each drop atomically enqueueing a deferred release
+	// when the space's last reference to a digest goes.
 	for _, d := range discards {
-		if err := b.dropClaims(ctx, bucketState, key, claimVersionID(d.versionID, d.seq), d.digests); err != nil {
+		if err := b.removeRefs(ctx, bucketState, key, refVersionID(d.versionID, d.seq), d.digests); err != nil {
 			return node, effState, fmt.Errorf("s3frontend: commit reconcile: %w", err)
 		}
 	}
@@ -546,7 +546,7 @@ type scopedDeleteResult struct {
 
 // deleteVersionScoped permanently removes one specific version (§7.2): the
 // current version (promoting the newest prev entry, or dropping the leaf when
-// none remain) or a prev entry. Claims are released after the commit; delete
+// none remain) or a prev entry. References drop after the commit; delete
 // markers have none.
 func (b *Backend) deleteVersionScoped(ctx context.Context, bucketState *registry.State, key, versionID string, preconds *backend.ObjectDeletePreconditions) (scopedDeleteResult, error) {
 	kind, seq := classifyVersionID(versionID)
@@ -748,7 +748,7 @@ func (b *Backend) deleteVersionScoped(ctx context.Context, bucketState *registry
 		return res, mapCommitError(err, "delete version")
 	}
 	if res.found {
-		if err := b.dropClaims(ctx, bucketState, key, claimVersionID(removed.versionID, removed.seq), removed.digests); err != nil {
+		if err := b.removeRefs(ctx, bucketState, key, refVersionID(removed.versionID, removed.seq), removed.digests); err != nil {
 			return res, fmt.Errorf("s3frontend: delete version reconcile: %w", err)
 		}
 	}

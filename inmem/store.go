@@ -56,7 +56,7 @@ type MemStore struct {
 	// The architecture's relational surface (docs/architecture.md §5–§7),
 	// mirroring the Postgres tables so the in-process suite exercises the
 	// same code paths. See stores.go for the methods over these.
-	blobRefs   map[claimKey]registry.BlobClaim
+	blobRefs   map[refKey]registry.BlobRef
 	intents    map[string]registry.UploadIntent          // keyed by string(digest)
 	locations  map[locKey]registry.BlobLocation          // keyed by (space, digest)
 	encParams  map[locKey]registry.BlobEncryptionParams  // keyed by (space, digest)
@@ -69,10 +69,10 @@ type MemStore struct {
 	releases   map[locKey]registry.PendingRelease        // keyed by (space, digest)
 }
 
-// claimKey / locKey are the composite map keys for the blob_refs and the
+// refKey / locKey are the composite map keys for the blob_refs and the
 // (space, digest)-keyed tables — blob_locations, blob_encryption_params and
 // shard_inclusions (digest bytes carried as a string for comparability).
-type claimKey struct {
+type refKey struct {
 	digest, bucket, objectKey, versionID string
 }
 
@@ -87,7 +87,7 @@ func NewMemStore() *MemStore {
 		buckets:    map[string]*registry.State{},
 		segments:   map[uint64]*logstore.SegmentMeta{},
 		verSeqs:    map[string]uint64{},
-		blobRefs:   map[claimKey]registry.BlobClaim{},
+		blobRefs:   map[refKey]registry.BlobRef{},
 		intents:    map[string]registry.UploadIntent{},
 		locations:  map[locKey]registry.BlobLocation{},
 		encParams:  map[locKey]registry.BlobEncryptionParams{},

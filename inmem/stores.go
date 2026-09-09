@@ -30,30 +30,23 @@ var (
 )
 
 // BlobRefStore ===============================================================
-func (m *MemStore) AddBlobClaim(_ context.Context, c registry.BlobClaim) error {
+func (m *MemStore) AddBlobRef(_ context.Context, c registry.BlobRef) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	k := claimKey{string(c.Digest), c.Bucket, c.ObjectKey, c.VersionID}
+	k := refKey{string(c.Digest), c.Bucket, c.ObjectKey, c.VersionID}
 	cp := c
 	cp.Digest = bytes.Clone(c.Digest)
 	m.blobRefs[k] = cp
 	return nil
 }
 
-func (m *MemStore) DeleteBlobClaim(_ context.Context, digest multihash.Multihash, bucket, objectKey, versionID string) error {
+func (m *MemStore) CountRefs(_ context.Context, space did.DID, digest multihash.Multihash) (int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	delete(m.blobRefs, claimKey{string(digest), bucket, objectKey, versionID})
-	return nil
+	return m.countRefsLocked(space, digest), nil
 }
 
-func (m *MemStore) CountClaims(_ context.Context, space did.DID, digest multihash.Multihash) (int, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.countClaimsLocked(space, digest), nil
-}
-
-func (m *MemStore) countClaimsLocked(space did.DID, digest multihash.Multihash) int {
+func (m *MemStore) countRefsLocked(space did.DID, digest multihash.Multihash) int {
 	d := string(digest)
 	n := 0
 	for k, c := range m.blobRefs {
@@ -64,11 +57,11 @@ func (m *MemStore) countClaimsLocked(space did.DID, digest multihash.Multihash) 
 	return n
 }
 
-func (m *MemStore) DropClaimEnqueueRelease(_ context.Context, digest multihash.Multihash, bucket, objectKey, versionID string, space did.DID, notBefore time.Time) (bool, error) {
+func (m *MemStore) RemoveBlobRef(_ context.Context, digest multihash.Multihash, bucket, objectKey, versionID string, space did.DID, notBefore time.Time) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	delete(m.blobRefs, claimKey{string(digest), bucket, objectKey, versionID})
-	if m.countClaimsLocked(space, digest) != 0 {
+	delete(m.blobRefs, refKey{string(digest), bucket, objectKey, versionID})
+	if m.countRefsLocked(space, digest) != 0 {
 		return false, nil
 	}
 	m.enqueueReleaseLocked(space, digest, notBefore)

@@ -22,25 +22,25 @@ func TestBlobRefs_CountToZero(t *testing.T) {
 	space := testutil.RandomDID(t)
 	space2 := testutil.RandomDID(t)
 
-	claim := func(bucket, key, version string, sp did.DID) registry.BlobClaim {
-		return registry.BlobClaim{Digest: digest, Bucket: bucket, ObjectKey: key, VersionID: version, Space: sp}
+	ref := func(bucket, key, version string, sp did.DID) registry.BlobRef {
+		return registry.BlobRef{Digest: digest, Bucket: bucket, ObjectKey: key, VersionID: version, Space: sp}
 	}
 
 	// Two versions in the same space reference the same blob → count 2.
-	mustAdd(t, m, claim("b", "k1", registry.NullVersionID, space))
-	mustAdd(t, m, claim("b", "k2", registry.NullVersionID, space))
+	mustAdd(t, m, ref("b", "k1", registry.NullVersionID, space))
+	mustAdd(t, m, ref("b", "k2", registry.NullVersionID, space))
 	if n := count(t, m, space, digest); n != 2 {
 		t.Fatalf("count = %d, want 2", n)
 	}
 
 	// Idempotent add (same PK) does not inflate the count.
-	mustAdd(t, m, claim("b", "k1", registry.NullVersionID, space))
+	mustAdd(t, m, ref("b", "k1", registry.NullVersionID, space))
 	if n := count(t, m, space, digest); n != 2 {
 		t.Fatalf("count after dup add = %d, want 2", n)
 	}
 
-	// A claim from a different space is counted under that space only.
-	mustAdd(t, m, claim("b2", "k1", registry.NullVersionID, space2))
+	// A reference from a different space is counted under that space only.
+	mustAdd(t, m, ref("b2", "k1", registry.NullVersionID, space2))
 	if n := count(t, m, space, digest); n != 2 {
 		t.Fatalf("count for space 1 = %d, want 2 (space 2 must not leak in)", n)
 	}
@@ -48,23 +48,32 @@ func TestBlobRefs_CountToZero(t *testing.T) {
 		t.Fatalf("count for space 2 = %d, want 1", n)
 	}
 
-	// Releasing both space-1 versions drops its claim to zero (the remove gate).
-	if err := m.DeleteBlobClaim(ctx, digest, "b", "k1", registry.NullVersionID); err != nil {
-		t.Fatalf("DeleteBlobClaim: %v", err)
+	// Removing both space-1 versions drops its count to zero (the remove
+	// gate); only the last removal enqueues a release.
+	enq, err := m.RemoveBlobRef(ctx, digest, "b", "k1", registry.NullVersionID, space, time.Now())
+	if err != nil {
+		t.Fatalf("RemoveBlobRef: %v", err)
+	}
+	if enq {
+		t.Fatalf("first removal enqueued a release while a reference remains")
 	}
 	if n := count(t, m, space, digest); n != 1 {
-		t.Fatalf("count after first delete = %d, want 1", n)
+		t.Fatalf("count after first removal = %d, want 1", n)
 	}
-	if err := m.DeleteBlobClaim(ctx, digest, "b", "k2", registry.NullVersionID); err != nil {
-		t.Fatalf("DeleteBlobClaim: %v", err)
+	enq, err = m.RemoveBlobRef(ctx, digest, "b", "k2", registry.NullVersionID, space, time.Now())
+	if err != nil {
+		t.Fatalf("RemoveBlobRef: %v", err)
+	}
+	if !enq {
+		t.Fatalf("last removal did not enqueue a release")
 	}
 	if n := count(t, m, space, digest); n != 0 {
-		t.Fatalf("count after last delete = %d, want 0", n)
+		t.Fatalf("count after last removal = %d, want 0", n)
 	}
 
-	// Idempotent delete of an already-absent claim is not an error.
-	if err := m.DeleteBlobClaim(ctx, digest, "b", "k1", registry.NullVersionID); err != nil {
-		t.Fatalf("idempotent DeleteBlobClaim: %v", err)
+	// Removing an already-absent reference is not an error.
+	if _, err := m.RemoveBlobRef(ctx, digest, "b", "k1", registry.NullVersionID, space, time.Now()); err != nil {
+		t.Fatalf("idempotent RemoveBlobRef: %v", err)
 	}
 }
 
@@ -458,18 +467,18 @@ func TestRevocationCursor_UpsertRoundTrip(t *testing.T) {
 
 // helpers
 
-func mustAdd(t *testing.T, m *MemStore, c registry.BlobClaim) {
+func mustAdd(t *testing.T, m *MemStore, c registry.BlobRef) {
 	t.Helper()
-	if err := m.AddBlobClaim(context.Background(), c); err != nil {
-		t.Fatalf("AddBlobClaim: %v", err)
+	if err := m.AddBlobRef(context.Background(), c); err != nil {
+		t.Fatalf("AddBlobRef: %v", err)
 	}
 }
 
 func count(t *testing.T, m *MemStore, space did.DID, digest []byte) int {
 	t.Helper()
-	n, err := m.CountClaims(context.Background(), space, digest)
+	n, err := m.CountRefs(context.Background(), space, digest)
 	if err != nil {
-		t.Fatalf("CountClaims: %v", err)
+		t.Fatalf("CountRefs: %v", err)
 	}
 	return n
 }

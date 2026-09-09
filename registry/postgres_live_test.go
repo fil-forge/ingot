@@ -83,7 +83,7 @@ func TestPostgresStores_Live(t *testing.T) {
 		}
 	})
 
-	t.Run("blob claims count to zero", func(t *testing.T) {
+	t.Run("blob refs count to zero", func(t *testing.T) {
 		// The blob_refs PK is (digest, bucket, object_key, version_id); space is
 		// denormalized, so a given (bucket, key, version) belongs to one space
 		// (a bucket has one space). A second space therefore implies a second
@@ -91,52 +91,52 @@ func TestPostgresStores_Live(t *testing.T) {
 		space := testutil.RandomDID(t)
 		space2 := testutil.RandomDID(t)
 		add := func(bucket, key string, sp did.DID) {
-			if err := r.AddBlobClaim(ctx, registry.BlobClaim{Digest: digest, Bucket: bucket, ObjectKey: key, VersionID: registry.NullVersionID, Space: sp}); err != nil {
-				t.Fatalf("AddBlobClaim: %v", err)
+			if err := r.AddBlobRef(ctx, registry.BlobRef{Digest: digest, Bucket: bucket, ObjectKey: key, VersionID: registry.NullVersionID, Space: sp}); err != nil {
+				t.Fatalf("AddBlobRef: %v", err)
 			}
 		}
 		add("b", "k1", space)
 		add("b", "k2", space)
 		add("b", "k1", space) // ON CONFLICT DO NOTHING — does not inflate the count
 		add("b2", "k1", space2)
-		if n, _ := r.CountClaims(ctx, space, digest); n != 2 {
+		if n, _ := r.CountRefs(ctx, space, digest); n != 2 {
 			t.Fatalf("count space1 = %d, want 2", n)
 		}
-		if n, _ := r.CountClaims(ctx, space2, digest); n != 1 {
+		if n, _ := r.CountRefs(ctx, space2, digest); n != 1 {
 			t.Fatalf("count space2 = %d, want 1", n)
 		}
-		if err := r.DeleteBlobClaim(ctx, digest, "b", "k1", registry.NullVersionID); err != nil {
-			t.Fatalf("DeleteBlobClaim: %v", err)
+		if enq, err := r.RemoveBlobRef(ctx, digest, "b", "k1", registry.NullVersionID, space, time.Now()); err != nil || enq {
+			t.Fatalf("RemoveBlobRef (first): err=%v enqueued=%v, want nil/false", err, enq)
 		}
-		if err := r.DeleteBlobClaim(ctx, digest, "b", "k2", registry.NullVersionID); err != nil {
-			t.Fatalf("DeleteBlobClaim: %v", err)
+		if enq, err := r.RemoveBlobRef(ctx, digest, "b", "k2", registry.NullVersionID, space, time.Now()); err != nil || !enq {
+			t.Fatalf("RemoveBlobRef (last): err=%v enqueued=%v, want nil/true", err, enq)
 		}
-		if n, _ := r.CountClaims(ctx, space, digest); n != 0 {
+		if n, _ := r.CountRefs(ctx, space, digest); n != 0 {
 			t.Fatalf("count after release = %d, want 0", n)
 		}
 	})
 
-	t.Run("drop claim enqueues release atomically", func(t *testing.T) {
+	t.Run("remove ref enqueues release atomically", func(t *testing.T) {
 		space := testutil.RandomDID(t)
 		add := func(key string) {
-			if err := r.AddBlobClaim(ctx, registry.BlobClaim{Digest: digest, Bucket: "rb", ObjectKey: key, VersionID: "null#1", Space: space}); err != nil {
-				t.Fatalf("AddBlobClaim: %v", err)
+			if err := r.AddBlobRef(ctx, registry.BlobRef{Digest: digest, Bucket: "rb", ObjectKey: key, VersionID: "null#1", Space: space}); err != nil {
+				t.Fatalf("AddBlobRef: %v", err)
 			}
 		}
 		add("k1")
 		add("k2")
 
 		due := time.Now().Add(-time.Second) // already due
-		enq, err := r.DropClaimEnqueueRelease(ctx, digest, "rb", "k1", "null#1", space, due)
+		enq, err := r.RemoveBlobRef(ctx, digest, "rb", "k1", "null#1", space, due)
 		if err != nil {
-			t.Fatalf("DropClaimEnqueueRelease (first): %v", err)
+			t.Fatalf("RemoveBlobRef (first): %v", err)
 		}
 		if enq {
-			t.Fatalf("first drop enqueued a release while a claim remains")
+			t.Fatalf("first drop enqueued a release while a reference remains")
 		}
-		enq, err = r.DropClaimEnqueueRelease(ctx, digest, "rb", "k2", "null#1", space, due)
+		enq, err = r.RemoveBlobRef(ctx, digest, "rb", "k2", "null#1", space, due)
 		if err != nil {
-			t.Fatalf("DropClaimEnqueueRelease (last): %v", err)
+			t.Fatalf("RemoveBlobRef (last): %v", err)
 		}
 		if !enq {
 			t.Fatalf("last drop did not enqueue a release")

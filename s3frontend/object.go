@@ -306,65 +306,63 @@ func (b *Backend) uploadBlobs(ctx context.Context, space did.DID, blobs []msbuck
 	return nil
 }
 
-// reconcileClaims updates blob_refs for ONE version id under (bucket, key)
-// whose body changes from oldDigests to newDigests, and returns the digests
-// whose (space, digest) claim reached zero so the caller can release them after
-// the commit. The diff is the crux of safe dedup + delete:
+// Reference index (blob_refs) invariants. Each object version holds one
+// reference per body digest it uses; the space's network claim on a digest is
+// released only when the space's last reference to it goes:
 //
-//   - a digest in new but not old gains a claim (newly referenced);
-//   - each generation's claim rows are keyed by a per-generation id
-//     (claimVersionID), so racing writers never touch one shared row;
-//   - the new generation's claims are added UNDER the per-bucket commit lock,
-//     before the root swap — a racing writer that supersedes this generation
-//     always finds the rows to drop, and a failed commit leaves at most a
-//     benign extra claim, never a wrong release;
-//   - the superseded generation's claims drop AFTER the commit is durable,
-//     each drop atomically enqueueing a deferred release when the space's
-//     last claim on the digest goes (blob_release_intents); the release
-//     sweeper re-checks the claim count at drain time, so every remaining
-//     interleave converges.
+//   - each generation's reference rows are keyed by a per-generation id
+//     (refVersionID), so racing writers never touch one shared row;
+//   - the new generation's references are added UNDER the per-bucket commit
+//     lock, before the root swap — a racing writer that supersedes this
+//     generation always finds the rows to drop, and a failed commit leaves at
+//     most a benign extra reference, never a wrong release;
+//   - the superseded generation's references drop AFTER the commit is
+//     durable, each drop atomically enqueueing a deferred release when the
+//     space's last reference to the digest goes (blob_release_intents); the
+//     release sweeper re-checks the reference count at drain time, so every
+//     remaining interleave converges.
 
-// claimVersionID names a generation's blob_refs rows: the version's ULID
+// refVersionID names a generation's blob_refs rows: the version's ULID
 // token for versioned buckets, or "null#<seq>" for a null version — unique
-// per commit, so unversioned generations never share a claim row.
-func claimVersionID(versionID string, seq uint64) string {
+// per commit, so unversioned generations never share a reference row.
+func refVersionID(versionID string, seq uint64) string {
 	if versionID == registry.NullVersionID {
 		return fmt.Sprintf("null#%d", seq)
 	}
 	return versionID
 }
 
-// addClaims records one claim per DEDUPLICATED digest for a new generation.
+// addRefs records one reference per DEDUPLICATED digest for a new generation.
 // Runs inside the bucket commit lock (see the invariant note above).
-func (b *Backend) addClaims(ctx context.Context, st *registry.State, key, claimID string, digests []multihash.Multihash) error {
+func (b *Backend) addRefs(ctx context.Context, st *registry.State, key, refID string, digests []multihash.Multihash) error {
 	for _, d := range digestSet(digests) {
-		if err := b.blobRefs.AddBlobClaim(ctx, registry.BlobClaim{
-			Digest: d, Bucket: st.Name, ObjectKey: key, VersionID: claimID, Space: st.Space,
+		if err := b.blobRefs.AddBlobRef(ctx, registry.BlobRef{
+			Digest: d, Bucket: st.Name, ObjectKey: key, VersionID: refID, Space: st.Space,
 		}); err != nil {
-			return fmt.Errorf("add blob claim: %w", err)
+			return fmt.Errorf("add blob ref: %w", err)
 		}
 	}
 	return nil
 }
 
-// dropClaims drops a superseded/deleted generation's claims, atomically
-// enqueueing a deferred release for each digest whose last claim goes. Runs
+// removeRefs drops a superseded/deleted generation's references, atomically
+// enqueueing a deferred release for each digest whose last reference goes. Runs
 // after the commit is durable.
-func (b *Backend) dropClaims(ctx context.Context, bucketState *registry.State, key, claimID string, digests []multihash.Multihash) error {
+func (b *Backend) removeRefs(ctx context.Context, bucketState *registry.State, key, refID string, digests []multihash.Multihash) error {
 	if len(digests) == 0 {
 		return nil
 	}
 	notBefore := time.Now().Add(b.releaseGrace)
 	for _, d := range digestSet(digests) {
-		if _, err := b.blobRefs.DropClaimEnqueueRelease(ctx, d, bucketState.Name, key, claimID, bucketState.Space, notBefore); err != nil {
-			return fmt.Errorf("drop blob claim: %w", err)
+		if _, err := b.blobRefs.RemoveBlobRef(ctx, d, bucketState.Name, key, refID, bucketState.Space, notBefore); err != nil {
+			return fmt.Errorf("remove blob ref: %w", err)
 		}
 	}
 	return nil
 }
 
 // SweepPendingReleases executes the due deferred releases: for each intent
-// past its not_before, it re-checks the claim count (a digest re-claimed
+// past its not_before, it re-checks the reference count (a digest re-referenced
 // since enqueue self-heals into a dropped intent), then deletes the blob's
 // encryption-params row (the crypto-shred — without the wrapped CEK the
 // region can no longer decrypt the blob, per the encryption RFC's DELETE
@@ -379,15 +377,16 @@ func (b *Backend) SweepPendingReleases(ctx context.Context) (int, error) {
 	}
 	released := 0
 	for _, pr := range due {
-		n, err := b.blobRefs.CountClaims(ctx, pr.Space, pr.Digest)
+		n, err := b.blobRefs.CountRefs(ctx, pr.Space, pr.Digest)
 		if err != nil {
-			b.logger.Warn("release sweep: count claims failed; retrying next sweep",
+			b.logger.Warn("release sweep: count refs failed; retrying next sweep",
 				zap.String("digest", hex.EncodeToString(pr.Digest)), zap.Error(err))
 			continue
 		}
 		if n > 0 {
-			// Re-claimed since enqueue (e.g. a commit that failed after its
-			// drop ran, then retried) — the intent is stale, not the claim.
+			// Re-referenced since enqueue (e.g. a commit that failed after
+			// its drop ran, then retried) — the intent is stale, not the
+			// reference.
 			if err := b.pendingReleases.DeleteRelease(ctx, pr.Space, pr.Digest); err != nil {
 				b.logger.Warn("release sweep: delete stale intent failed",
 					zap.String("digest", hex.EncodeToString(pr.Digest)), zap.Error(err))
@@ -411,7 +410,7 @@ func (b *Backend) SweepPendingReleases(ctx context.Context) (int, error) {
 // ignoring their grace: DeleteBucket calls it before asking hilt to delete
 // the space, which refuses while blobs remain registered. No reader grace is
 // owed — the bucket is provably empty at that point and its deletion is the
-// operator's explicit intent. The claim recheck still applies (a re-claimed
+// operator's explicit intent. The reference recheck still applies (a re-referenced
 // digest drops its stale intent instead).
 func (b *Backend) drainSpaceReleases(ctx context.Context, space did.DID) error {
 	pending, err := b.pendingReleases.ListReleasesBySpace(ctx, space)
@@ -419,7 +418,7 @@ func (b *Backend) drainSpaceReleases(ctx context.Context, space did.DID) error {
 		return fmt.Errorf("list space releases: %w", err)
 	}
 	for _, pr := range pending {
-		if n, err := b.blobRefs.CountClaims(ctx, pr.Space, pr.Digest); err != nil || n > 0 {
+		if n, err := b.blobRefs.CountRefs(ctx, pr.Space, pr.Digest); err != nil || n > 0 {
 			if err == nil {
 				_ = b.pendingReleases.DeleteRelease(ctx, pr.Space, pr.Digest)
 			}
@@ -792,7 +791,7 @@ func (b *Backend) DeleteObject(ctx context.Context, input *s3.DeleteObjectInput)
 }
 
 // insertDeleteMarker writes a delete-marker version for key via the §5 write
-// rule: a manifest with DeleteMarker set, a zero Body, and no claims. Under
+// rule: a manifest with DeleteMarker set, a zero Body, and no blob references. Under
 // Enabled it is a numbered version; under Suspended it is the null version
 // (replacing any existing null). S3 inserts a marker even when the key does
 // not exist.
@@ -883,14 +882,14 @@ func (b *Backend) deleteObjectKey(ctx context.Context, bucketState *registry.Sta
 	if err != nil {
 		return mapCommitError(err, "delete")
 	}
-	// Drop the removed version's claims through the reference index AFTER the
-	// commit is durable (so a commit failure can't diverge blob_refs); each
-	// last-claim drop enqueues a deferred release. When the key was absent,
+	// Drop the removed version's references AFTER the commit is durable (so
+	// a commit failure can't diverge blob_refs); each last-reference drop
+	// enqueues a deferred release. When the key was absent,
 	// oldDigests is nil and this is a no-op.
 	if oldVersionID == "" {
 		oldVersionID = registry.NullVersionID
 	}
-	if err := b.dropClaims(ctx, bucketState, key, claimVersionID(oldVersionID, oldSeq), oldDigests); err != nil {
+	if err := b.removeRefs(ctx, bucketState, key, refVersionID(oldVersionID, oldSeq), oldDigests); err != nil {
 		return fmt.Errorf("s3frontend: delete reconcile: %w", err)
 	}
 	return nil

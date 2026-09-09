@@ -101,7 +101,7 @@ type Config struct {
 	MultipartSessionTTL string `mapstructure:"multipart_session_ttl" yaml:"multipart_session_ttl"`
 
 	// ReleaseGrace delays each blob release (crypto-shred + location delete +
-	// network remove) this long past the drop of its last reference claim
+	// network remove) this long past the drop of its last reference
 	// (Go duration string), so in-flight readers holding the prior catalog
 	// root finish their decryption prefetch first. Empty → default 60s; a
 	// negative duration makes releases due immediately.
