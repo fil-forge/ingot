@@ -111,7 +111,7 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 	if srcBucket == dstBucket && srcKey == dstKey && !replace && srcVersionID != "" && srcRv.isLatest {
 		return s3response.CopyObjectOutput{}, s3err.GetAPIError(s3err.ErrInvalidCopyDest)
 	}
-	if err := backend.EvaluatePreconditions(etagOf(srcMf), time.Unix(srcMf.Created, 0), backend.PreConditions{
+	if err := evaluateCopySourcePreconditions(etagOf(srcMf), time.Unix(srcMf.Created, 0), backend.PreConditions{
 		IfMatch:       input.CopySourceIfMatch,
 		IfNoneMatch:   input.CopySourceIfNoneMatch,
 		IfModSince:    input.CopySourceIfModifiedSince,
