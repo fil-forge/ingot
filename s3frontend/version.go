@@ -245,9 +245,12 @@ func (b *Backend) resolveVersion(ctx context.Context, bucketName, key, versionID
 }
 
 // discardedVersion records a version permanently removed by a commit, for the
-// post-commit reference-index release (§8).
+// post-commit reference-index release (§8). seq disambiguates the claim rows:
+// unversioned generations share the "null" version id but never a claim id
+// (claimVersionID).
 type discardedVersion struct {
 	versionID string
+	seq       uint64
 	digests   []multihash.Multihash
 }
 
@@ -378,7 +381,7 @@ func (b *Backend) commitVersion(ctx context.Context, bucketState *registry.State
 			} else {
 				// Discard (null over null). A manifest-valued key stays one; its value
 				// block is the manifest queued for GC just below.
-				discards = append(discards, discardedVersion{superseded.VersionID, bodyDigests(supersededMf.Body)})
+				discards = append(discards, discardedVersion{superseded.VersionID, superseded.Seq, bodyDigests(supersededMf.Body)})
 				discardSeqs = append(discardSeqs, superseded.Seq)
 				if err := b.gc.AddGCCandidate(ctx, superseded.Manifest.Bytes(), st.Name); err != nil {
 					return cid.Undef, fmt.Errorf("gc candidate: %w", err)
@@ -399,7 +402,7 @@ func (b *Backend) commitVersion(ctx context.Context, bucketState *registry.State
 						if err := tx.Get(ctx, st.Space, nullCid, &nullEm); err != nil {
 							return cid.Undef, fmt.Errorf("load prev null manifest: %w", err)
 						}
-						discards = append(discards, discardedVersion{registry.NullVersionID, bodyDigests(nullEm.Manifest.Body)})
+						discards = append(discards, discardedVersion{registry.NullVersionID, newLeaf.NullSeq, bodyDigests(nullEm.Manifest.Body)})
 						discardSeqs = append(discardSeqs, newLeaf.NullSeq)
 						if prevTree, err = prevTree.Delete(ctx, nullKey); err != nil {
 							return cid.Undef, fmt.Errorf("prev delete null: %w", err)
@@ -503,36 +506,30 @@ func (b *Backend) commitVersion(ctx context.Context, bucketState *registry.State
 			return cid.Undef, fmt.Errorf("mst write: %w", err)
 		}
 		node = newNode
+
+		// Claim the new generation's blobs UNDER the lock, before the root
+		// swap: a racing writer that later supersedes this generation always
+		// finds the rows to drop. A failed commit leaves at most a benign
+		// extra claim — never a wrong release; the release sweeper re-checks
+		// claim counts at drain time.
+		if err := b.addClaims(ctx, st, key, claimVersionID(vid, seq), bodyDigests(mf.Body)); err != nil {
+			return cid.Undef, err
+		}
 		return t2.GetPointer(ctx, tx)
 	})
 	if err != nil {
 		return node, effState, mapCommitError(err, "commit version")
 	}
 
-	// Reference index, after the commit is durable (§8): claim the new
-	// version's blobs; release discarded versions'. A discard sharing the new
-	// version's id (null replacing null — the only same-id case) goes through
-	// the set-diff so unchanged digests never churn.
-	newDigests := bodyDigests(mf.Body)
-	var sameIDOld []multihash.Multihash
-	var toRemove []multihash.Multihash
+	// Reference index (§8): the new generation's claims were added under the
+	// lock; the discarded generations' claims drop here, after the commit is
+	// durable, each drop atomically enqueueing a deferred release when the
+	// space's last claim on a digest goes.
 	for _, d := range discards {
-		if d.versionID == node.VersionID {
-			sameIDOld = append(sameIDOld, d.digests...)
-			continue
-		}
-		r, err := b.reconcileClaims(ctx, bucketState, key, d.versionID, d.digests, nil)
-		if err != nil {
+		if err := b.dropClaims(ctx, bucketState, key, claimVersionID(d.versionID, d.seq), d.digests); err != nil {
 			return node, effState, fmt.Errorf("s3frontend: commit reconcile: %w", err)
 		}
-		toRemove = append(toRemove, r...)
 	}
-	r, err := b.reconcileClaims(ctx, bucketState, key, node.VersionID, sameIDOld, newDigests)
-	if err != nil {
-		return node, effState, fmt.Errorf("s3frontend: commit reconcile: %w", err)
-	}
-	toRemove = append(toRemove, r...)
-	b.releaseBlobs(ctx, bucketState.Space, toRemove)
 	return node, effState, nil
 }
 
@@ -599,7 +596,7 @@ func (b *Backend) deleteVersionScoped(ctx context.Context, bucketState *registry
 					return cid.Undef, err
 				}
 			}
-			removed = discardedVersion{versionID: targetVersionID(kind, mf), digests: bodyDigests(mf.Body)}
+			removed = discardedVersion{versionID: targetVersionID(kind, mf), seq: mf.Seq, digests: bodyDigests(mf.Body)}
 			res.found, res.wasMarker = true, mf.DeleteMarker
 			// The value block is the manifest — one GC candidate covers it.
 			if err := b.gc.AddGCCandidate(ctx, valCid.Bytes(), st.Name); err != nil {
@@ -672,7 +669,7 @@ func (b *Backend) deleteVersionScoped(ctx context.Context, bucketState *registry
 			}
 		}
 
-		removed = discardedVersion{versionID: targetVersionID(kind, targetMf), digests: bodyDigests(targetMf.Body)}
+		removed = discardedVersion{versionID: targetVersionID(kind, targetMf), seq: targetMf.Seq, digests: bodyDigests(targetMf.Body)}
 		res.found, res.wasMarker = true, targetMf.DeleteMarker
 		if err := b.gc.AddGCCandidate(ctx, targetCid.Bytes(), st.Name); err != nil {
 			return cid.Undef, fmt.Errorf("gc candidate: %w", err)
@@ -751,11 +748,9 @@ func (b *Backend) deleteVersionScoped(ctx context.Context, bucketState *registry
 		return res, mapCommitError(err, "delete version")
 	}
 	if res.found {
-		toRemove, err := b.reconcileClaims(ctx, bucketState, key, removed.versionID, removed.digests, nil)
-		if err != nil {
+		if err := b.dropClaims(ctx, bucketState, key, claimVersionID(removed.versionID, removed.seq), removed.digests); err != nil {
 			return res, fmt.Errorf("s3frontend: delete version reconcile: %w", err)
 		}
-		b.releaseBlobs(ctx, bucketState.Space, toRemove)
 	}
 	return res, nil
 }

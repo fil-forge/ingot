@@ -44,6 +44,7 @@ func TestUp_Live(t *testing.T) {
 		"buckets", "segments", "segment_op_roots",
 		"blob_refs", "upload_intents", "blob_locations", "blob_encryption_params",
 		"multipart_sessions", "multipart_parts", "gc_candidates",
+		"blob_release_intents",
 	}
 	for _, tbl := range want {
 		var exists bool
@@ -69,6 +70,22 @@ func TestUp_Live(t *testing.T) {
 		}
 		if !exists {
 			t.Errorf("column ingot.buckets.%s does not exist after migration", col)
+		}
+	}
+
+	// multipart_sessions (00016): the committed result Complete records for
+	// replay, NULL until the session completes.
+	for _, col := range []string{"committed_etag", "committed_version_id"} {
+		var nullable string
+		err := pool.QueryRow(ctx,
+			`SELECT is_nullable FROM information_schema.columns
+			 WHERE table_schema = 'ingot' AND table_name = 'multipart_sessions' AND column_name = $1`, col).Scan(&nullable)
+		if err != nil {
+			t.Errorf("column ingot.multipart_sessions.%s missing after migration: %v", col, err)
+			continue
+		}
+		if nullable != "YES" {
+			t.Errorf("column ingot.multipart_sessions.%s is_nullable = %q, want YES", col, nullable)
 		}
 	}
 

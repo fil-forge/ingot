@@ -173,9 +173,16 @@ type MultipartSession struct {
 	// Tagging carries CreateMultipartUpload's raw x-amz-tagging header
 	// (validated at create) to Complete, which stamps the parsed set
 	// (docs/s3-object-tagging.md §4). Empty when the header was absent.
-	Tagging   string
-	Metadata  map[string]string
-	CreatedAt time.Time
+	Tagging  string
+	Metadata map[string]string
+	// CommittedETag / CommittedVersionID are the result the winning Complete
+	// returned, recorded by CompleteSession with the move to 'completed'
+	// (empty before that). A duplicate or latch-losing Complete replays them
+	// rather than resolving the live key, which a later overwrite may have
+	// replaced. CommittedVersionID is empty for unversioned buckets.
+	CommittedETag      string
+	CommittedVersionID string
+	CreatedAt          time.Time
 }
 
 // MultipartPart is one row of ingot.multipart_parts. BlobDigests is the
@@ -206,6 +213,37 @@ type BlobRefStore interface {
 	// CountClaims returns how many object versions in space still reference
 	// digest. Zero means the space's claim may be released.
 	CountClaims(ctx context.Context, space did.DID, digest multihash.Multihash) (int, error)
+	// DropClaimEnqueueRelease deletes one claim row and, when it was the
+	// space's last claim on digest, records a release intent due at
+	// notBefore — atomically, so no crash window separates "last claim
+	// gone" from "release recorded". Reports whether an intent was
+	// enqueued.
+	DropClaimEnqueueRelease(ctx context.Context, digest multihash.Multihash, bucket, objectKey, versionID string, space did.DID, notBefore time.Time) (bool, error)
+}
+
+// PendingRelease is one deferred blob release: executed by the release
+// sweeper once not_before passes and the digest still has zero claims.
+type PendingRelease struct {
+	Space     did.DID
+	Digest    multihash.Multihash
+	NotBefore time.Time
+}
+
+// PendingReleaseStore is the deferred-release queue (blob_release_intents):
+// the durable record between "last claim dropped" and "release executed"
+// (crypto-shred + location delete + network remove). Enqueue upserts,
+// keeping the later not_before.
+type PendingReleaseStore interface {
+	EnqueueRelease(ctx context.Context, space did.DID, digest multihash.Multihash, notBefore time.Time) error
+	// ListDueReleases returns intents with not_before <= now, oldest first,
+	// at most limit.
+	ListDueReleases(ctx context.Context, now time.Time, limit int) ([]PendingRelease, error)
+	// ListReleasesBySpace returns every intent for space regardless of
+	// not_before — DeleteBucket executes a space's releases immediately (the
+	// bucket is empty and its deletion is explicit, so no reader grace is
+	// owed) before asking hilt to delete the space.
+	ListReleasesBySpace(ctx context.Context, space did.DID) ([]PendingRelease, error)
+	DeleteRelease(ctx context.Context, space did.DID, digest multihash.Multihash) error
 }
 
 // IntentStore is the local-store index (§5): the on-disk blobs Ingot holds
@@ -301,6 +339,11 @@ type MultipartStore interface {
 	// LatchSession atomically moves uploadID from->to, returning true iff this
 	// caller performed the transition (the session was still in `from`).
 	LatchSession(ctx context.Context, uploadID, from, to string) (bool, error)
+	// CompleteSession is the completing→completed latch that also records the
+	// winner's result (etag; versionID, empty for unversioned buckets) in the
+	// same statement, so a completed row always carries what to replay.
+	// Returns true iff this caller performed the transition.
+	CompleteSession(ctx context.Context, uploadID, etag, versionID string) (bool, error)
 	DeleteSession(ctx context.Context, uploadID string) error
 	PutPart(ctx context.Context, p MultipartPart) error
 	ListParts(ctx context.Context, uploadID string) ([]MultipartPart, error)

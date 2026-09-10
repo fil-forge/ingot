@@ -72,23 +72,26 @@ func newRefTestBackend(t *testing.T, maxBlob ...int64) (*Backend, *inmem.MemStor
 
 	rm := &recordingRemover{}
 	b := New(Deps{
-		Authority:   mem,
-		Registry:    mem,
-		Intents:     mem,
-		Locations:   mem,
-		BlobRefs:    mem,
-		GC:          mem,
-		Multipart:   mem,
-		Parks:       mem,
-		Reads:       blockstore.NewLayered(spool, log, inmem.NopBaseReader{}),
-		Log:         log,
-		Spool:       spool,
-		Uploader:    inmem.NopUploader{},
-		Deferred:    inmem.NopUploader{},
-		Remover:     rm,
-		EncParams:   mem,
-		RegionKeys:  testRegionKeys(t),
-		TenantKeys:  testTenantKeys(),
+		Authority:       mem,
+		Registry:        mem,
+		Intents:         mem,
+		Locations:       mem,
+		BlobRefs:        mem,
+		GC:              mem,
+		Multipart:       mem,
+		Parks:           mem,
+		Reads:           blockstore.NewLayered(spool, log, inmem.NopBaseReader{}),
+		Log:             log,
+		Spool:           spool,
+		Uploader:        inmem.NopUploader{},
+		Deferred:        inmem.NopUploader{},
+		Remover:         rm,
+		EncParams:       mem,
+		RegionKeys:      testRegionKeys(t),
+		TenantKeys:      testTenantKeys(),
+		PendingReleases: mem,
+		// ReleaseGrace stays zero: releases are due immediately, and tests
+		// drain them explicitly with drainReleases.
 		MaxBlobSize: mbs,
 	})
 	if err := mem.Create(ctx, "bk", did.Undef, registry.CreateState{}); err != nil {
@@ -214,6 +217,7 @@ func TestRefIndex_OverwriteSameContentReleasesOld(t *testing.T) {
 	if got := claims(t, mem, cur); got != 1 {
 		t.Fatalf("claims(current) = %d, want 1", got)
 	}
+	drainReleases(t, b)
 	if rm.removedDigests()[string(old)] != 1 {
 		t.Fatalf("expected exactly one RemoveBlob(old); got removals %v", rm.removedDigests())
 	}
@@ -235,6 +239,7 @@ func TestRefIndex_OverwriteDifferentContentReleasesOld(t *testing.T) {
 	if got := claims(t, mem, db); got != 1 {
 		t.Fatalf("claims(B) = %d, want 1", got)
 	}
+	drainReleases(t, b)
 	if rm.removedDigests()[string(da)] != 1 {
 		t.Fatalf("expected exactly one RemoveBlob(A); got removals %v", rm.removedDigests())
 	}
@@ -254,6 +259,7 @@ func TestRefIndex_DeleteReleasesAtZero(t *testing.T) {
 	if got := claims(t, mem, d); got != 0 {
 		t.Fatalf("claims = %d, want 0 after delete", got)
 	}
+	drainReleases(t, b)
 	if rm.removedDigests()[string(d)] != 1 {
 		t.Fatalf("expected one RemoveBlob; got %v", rm.removedDigests())
 	}
@@ -283,6 +289,7 @@ func TestRefIndex_IdenticalPiecesInOneBody(t *testing.T) {
 	}
 
 	deleteObj(t, b, "k1")
+	drainReleases(t, b)
 	for i, d := range ds {
 		if got := claims(t, mem, d); got != 0 {
 			t.Fatalf("claims(blob %d) after delete = %d, want 0", i, got)
@@ -320,6 +327,7 @@ func TestRefIndex_SharedDigestAcrossKeys(t *testing.T) {
 	}
 
 	deleteObj(t, b, "k1")
+	drainReleases(t, b)
 	if got := claims(t, mem, d); got != 1 {
 		t.Fatalf("claims after first delete = %d, want 1 (k2 still references it)", got)
 	}
@@ -328,6 +336,7 @@ func TestRefIndex_SharedDigestAcrossKeys(t *testing.T) {
 	}
 
 	deleteObj(t, b, "k2")
+	drainReleases(t, b)
 	if got := claims(t, mem, d); got != 0 {
 		t.Fatalf("claims after second delete = %d, want 0", got)
 	}
