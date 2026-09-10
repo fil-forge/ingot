@@ -94,7 +94,7 @@ jobs:
     outputs:
       # 'true' when the S3 compatibility report was staged and uploaded as
       # the Pages artifact (main only); gates the `pages` job.
-      pages-artifact: ${{ steps.stage-pages.outcome == 'success' }}
+      pages-artifact: ${{ steps.upload-pages.outcome == 'success' }}
     # Room for the main itest run (-timeout 40m) plus the S3 compatibility
     # report, which boots its own stack.
     timeout-minutes: 60
@@ -200,6 +200,7 @@ jobs:
           cp s3-compat-report.html _site/index.html
 
       - name: Upload GitHub Pages artifact
+        id: upload-pages
         if: ${{ steps.stage-pages.outcome == 'success' }}
         uses: actions/upload-pages-artifact@v5
         with:
