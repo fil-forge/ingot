@@ -201,7 +201,7 @@ jobs:
 
       - name: Upload GitHub Pages artifact
         id: upload-pages
-        if: ${{ steps.stage-pages.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.stage-pages.outcome == 'success' }}
         uses: actions/upload-pages-artifact@v5
         with:
           path: _site/
