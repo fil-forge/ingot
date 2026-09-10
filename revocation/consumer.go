@@ -1,8 +1,14 @@
 // Package revocation subscribes to the revocation service's (Swarf's) SSE
-// revocation firehose and applies incoming UCAN revocations to ingot's local
-// authorization caches, so that an access key Hilt has deleted (whose
-// delegations Hilt revokes) stops being authorized from cache — its next
-// request falls through to Hilt, which refuses.
+// firehose and applies its records to ingot's local authorization caches, so
+// that a cached access key stops being authorized locally the moment Hilt
+// changes what it may do — its next request falls through to Hilt, which
+// re-authorizes it or refuses.
+//
+// The firehose carries two kinds of record. A revocation withdraws one
+// delegation, which is how Hilt retires a deleted access key. A principal
+// invalidation names a (tenant, principal) pair whose access has changed,
+// published before Hilt commits the change. Both clear the caches of every
+// access key they affect, and both advance the resume cursor.
 //
 // The consumer maintains a persistent resume cursor (registry's
 // revocation_cursor row): the recorded_at of the last processed record, on
@@ -21,8 +27,6 @@ import (
 	"time"
 
 	"github.com/cenkalti/backoff/v5"
-	"github.com/fil-forge/swarf/pkg/api"
-	swarfclient "github.com/fil-forge/swarf/pkg/client"
 	"github.com/fil-forge/ucantone/did"
 	"github.com/ipfs/go-cid"
 	"go.uber.org/zap"
@@ -30,22 +34,23 @@ import (
 	"github.com/fil-forge/ingot/registry"
 )
 
-// Source is the slice of the swarf client the consumer reads
-// (swarf/pkg/client.Client satisfies it): the firehose stream from a `since`
-// cursor. A zero since streams every stored record.
+// Source is the firehose the consumer reads: the event stream from a `since`
+// cursor. A zero since streams every stored record. NewSwarfSource adapts
+// the swarf client to it.
 type Source interface {
-	Stream(ctx context.Context, from time.Time) iter.Seq2[api.FirehoseRevocation, error]
+	Stream(ctx context.Context, from time.Time) iter.Seq2[Event, error]
 }
 
-// Invalidator applies one revocation to local authorization state
+// Invalidator applies one firehose event to local authorization state
 // (iam.Revoker satisfies it), returning the access keys whose caches it
-// cleared. Must be idempotent: reconnects may re-deliver records.
+// cleared. Both methods must be idempotent: reconnects may re-deliver
+// records.
 type Invalidator interface {
+	// Revoke clears every access key holding the revoked delegation.
 	Revoke(revoked cid.Cid) []did.DID
+	// InvalidatePrincipal clears every access key bound to the pair.
+	InvalidatePrincipal(tenant did.DID, principal string) []did.DID
 }
-
-// Compile-time assertion: the real swarf client satisfies Source.
-var _ Source = (*swarfclient.Client)(nil)
 
 // Reconnect backoff bounds: the exponential backoff's initial interval and
 // its cap (growth and jitter use the backoff package's defaults).
@@ -127,27 +132,32 @@ func (c *Consumer) Run(ctx context.Context) {
 	bo.InitialInterval = c.minBackoff
 	bo.MaxInterval = c.maxBackoff
 	for {
-		for rec, err := range c.src.Stream(ctx, since) {
+		for ev, err := range c.src.Stream(ctx, since) {
 			if err != nil {
 				c.logger.Warn("revocation: stream error", zap.Error(err))
 				break
 			}
 			// A live stream means the endpoint is healthy — reset backoff.
 			bo.Reset()
-			keys := c.inv.Revoke(rec.Revoke)
-			c.logger.Info("revocation: record processed",
-				zap.Stringer("revoke", rec.Revoke),
-				zap.Stringer("cause", rec.Cause),
-				zap.Int("keys_invalidated", len(keys)))
-			since = rec.RecordedAt.Time()
-			// Persist per record: revocations are human-scale events (key
-			// deletions), so a row upsert each is negligible. If the shared
-			// firehose ever becomes high-volume, debounce here — safe, since
-			// reprocessing a window after a crash is idempotent. A failed
-			// write only costs re-delivery from the previous durable cursor.
+			c.apply(ev)
+			since = ev.RecordedAt
+			if !ev.Cause.Defined() {
+				// Every firehose record names the invocation that caused
+				// it; a record without one is a source bug, and advancing
+				// the durable cursor past it would bury that.
+				c.logger.Warn("revocation: record without a cause, cursor not advanced",
+					zap.Time("recorded_at", ev.RecordedAt))
+				continue
+			}
+			// Persist per record: these are human-scale events (key
+			// deletions, access changes), so a row upsert each is
+			// negligible. If the shared firehose ever becomes high-volume,
+			// debounce here — safe, since reprocessing a window after a
+			// crash is idempotent. A failed write only costs re-delivery
+			// from the previous durable cursor.
 			if err := c.cursor.PutRevocationCursor(ctx, registry.RevocationCursor{
 				RecordedAt: since,
-				Revoke:     rec.Revoke,
+				Revoke:     ev.Revoke,
 			}); err != nil && ctx.Err() == nil {
 				c.logger.Warn("revocation: persist cursor", zap.Error(err))
 			}
@@ -161,6 +171,25 @@ func (c *Consumer) Run(ctx context.Context) {
 			return
 		}
 	}
+}
+
+// apply dispatches one event to the invalidator by kind and logs what it
+// cleared.
+func (c *Consumer) apply(ev Event) {
+	if ev.IsPrincipal() {
+		keys := c.inv.InvalidatePrincipal(ev.Tenant, ev.Principal)
+		c.logger.Info("revocation: principal invalidation processed",
+			zap.Stringer("tenant", ev.Tenant),
+			zap.String("principal", ev.Principal),
+			zap.Stringer("cause", ev.Cause),
+			zap.Int("keys_invalidated", len(keys)))
+		return
+	}
+	keys := c.inv.Revoke(ev.Revoke)
+	c.logger.Info("revocation: record processed",
+		zap.Stringer("revoke", ev.Revoke),
+		zap.Stringer("cause", ev.Cause),
+		zap.Int("keys_invalidated", len(keys)))
 }
 
 // loadFrom resolves the initial firehose cursor: the stored resume point,

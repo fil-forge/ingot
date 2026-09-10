@@ -368,10 +368,11 @@ type GCStore interface {
 
 // RevocationCursor is the single row of ingot.revocation_cursor: the resume
 // point in the revocation service's firehose. RecordedAt is the recorded_at
-// of the last processed revocation record — the service's own timeline, so a
+// of the last processed record — the service's own timeline, so a
 // reconnect's `since` cursor is immune to clock skew between ingot and the
 // service. Revoke is the CID of the delegation that record revoked, kept for
-// observability.
+// observability; a record that revokes nothing (a principal invalidation)
+// leaves it undefined and reads back undefined.
 type RevocationCursor struct {
 	RecordedAt time.Time
 	Revoke     cid.Cid

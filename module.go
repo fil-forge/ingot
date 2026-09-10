@@ -411,9 +411,10 @@ func provideIAMService(c *hiltclient.Client, proofs *iam.KeyProofs, keys *iam.Ve
 }
 
 // provideRevocationConsumer builds the revocation-firehose consumer: the
-// swarf client streams revocation records, the postgres cursor store
-// persists the resume point, and iam.Revoker clears the per-access-key
-// caches a revoked delegation participates in.
+// swarf client streams the firehose (adapted to the consumer's event Source),
+// the postgres cursor store persists the resume point, and iam.Revoker clears
+// the per-access-key caches a revoked delegation or an invalidated principal
+// covers.
 func provideRevocationConsumer(cfg config.Config, cursors registry.RevocationCursorStore,
 	proofs *iam.KeyProofs, keys *iam.VerificationKeyCache, tenants *iam.TenantCache, logger *zap.Logger) (*revocation.Consumer, error) {
 	revURL, err := url.Parse(cfg.RevocationServiceURL)
@@ -424,11 +425,12 @@ func provideRevocationConsumer(cfg config.Config, cursors registry.RevocationCur
 	if err != nil {
 		return nil, fmt.Errorf("ingot: parse revocation_service_did: %w", err)
 	}
-	src, err := swarfclient.New(revDID, *revURL)
+	client, err := swarfclient.New(revDID, *revURL)
 	if err != nil {
 		return nil, fmt.Errorf("ingot: revocation service client: %w", err)
 	}
-	return revocation.NewConsumer(src, cursors, iam.NewRevoker(proofs, keys, tenants, logger),
+	return revocation.NewConsumer(revocation.NewSwarfSource(client), cursors,
+		iam.NewRevoker(proofs, keys, tenants, logger),
 		revocation.WithLogger(logger)), nil
 }
 

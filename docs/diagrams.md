@@ -37,9 +37,10 @@ change to the diagrams to re-check. The maintenance rule lives in
 Ingot is an S3 gateway over the Forge network: versitygw serves S3 REST
 (`:8080` by default; `:80` in the smelt stack, where `did:web:ingot` resolves
 to the listener's `/.well-known/did.json`), hilt authorizes requests and owns
-tenancy, sprue brokers every blob
-operation, and piri stores and serves the bytes. The indexing-service read
-path is designed but unwired; a local locator (over `blob_locations` and
+tenancy, sprue brokers every blob operation, piri stores and serves the
+bytes, and swarf publishes the firehose that clears ingot's authorization
+caches. The indexing-service read path is
+designed but unwired; a local locator (over `blob_locations` and
 `shard_inclusions`) serves reads instead.
 
 ```mermaid
@@ -49,6 +50,7 @@ flowchart LR
     hilt["hilt<br/>auth + tenant service<br/>did:web:hilt"]
     sprue["sprue<br/>upload service<br/>did:web:upload"]
     piri["piri<br/>storage node<br/>provider DID from location commitments"]
+    swarf["swarf<br/>revocation service<br/>DID from config"]
     pg[("postgres<br/>ingot schema")]
     idx["indexing-service"]
 
@@ -57,13 +59,14 @@ flowchart LR
     ingot -->|"/blob/add, /ucan/conclude, GET /receipt/:task<br/>/blob/abort, /blob/remove, /index/add"| sprue
     ingot -->|"HTTP PUT blob bytes (allocated URL)"| piri
     ingot -->|"content/retrieve (UCAN, on read miss)"| piri
+    ingot -->|"GET /revocations/{since} (SSE revocation firehose)"| swarf
     ingot -->|"pgx + goose migrations"| pg
     ingot -.->|"QueryClaims: designed, unwired;<br/>LocalLocator serves reads"| idx
     sprue -->|"/blob/allocate, /blob/accept<br/>/blob/release, /blob/reject"| piri
     sprue -->|"republishes /index/add"| idx
 
     classDef external stroke-dasharray: 5 5
-    class hilt,sprue,piri,pg,idx external
+    class hilt,sprue,piri,swarf,pg,idx external
 ```
 
 - Ingot never invokes `/blob/accept`: sprue owns accept (and allocate), which
@@ -73,14 +76,22 @@ flowchart LR
   tier.
 - `ListBuckets` is served entirely from hilt; the local `ingot.buckets` table
   backs every other verb.
+- The swarf edge is optional (`revocation_service_url`/`_did`) and one-way:
+  ingot subscribes and never publishes. Hilt publishes to swarf, so a change
+  hilt commits reaches ingot's caches over that path. Without the edge, cache
+  entries only age out on their TTLs.
+- The consumer already dispatches principal invalidations alongside
+  revocations; the swarf client in this tree streams revocations only, so
+  `revocation/swarf.go` yields that one kind until the client exposes the
+  other.
 
 Cross-references: [`architecture.md` §9](./architecture.md#9-the-system-contract-piri--sprue--indexer)
 (the system contract), [§12](./architecture.md#12-implementation-status--postponed-items)
 (implementation status).
 
 Sources: `module.go`, `bucketauthority/service.go`, `iam/service.go`,
-`forgeclient/`, `uploader/blob.go`, `blockstore/forge.go`. Review when these
-change.
+`forgeclient/`, `uploader/blob.go`, `blockstore/forge.go`,
+`revocation/consumer.go`, `revocation/swarf.go`. Review when these change.
 
 ## Package map and interface seams
 
@@ -933,6 +944,7 @@ listed diagrams (each diagram's `Sources:` footer names its exact files).
 | `logstore/` | logstore-pipeline, segment-states, get, block-routes, delete-bucket |
 | `uploader/`, `forgeclient/` | context, put, multipart, principals, logstore-pipeline, block-routes |
 | `iam/`, `internal/reqscope/` | principals, authorize, context |
+| `revocation/` | context, principals |
 | `bucket/`, `mst/` | version-tree, put, get |
 | `migrations/sql/` | schema, plus any state diagram naming a changed CHECK |
 | `module.go`, `server.go`, `config/` | packages, context, logstore-pipeline |

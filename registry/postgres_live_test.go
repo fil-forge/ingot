@@ -529,6 +529,20 @@ func TestPostgresStores_Live(t *testing.T) {
 		if !got.RecordedAt.Equal(second.RecordedAt) || !got.Revoke.Equals(second.Revoke) {
 			t.Fatalf("cursor after upsert = %+v, want %+v", got, second)
 		}
+		// A principal invalidation revokes nothing: the undefined CID
+		// stores as empty bytes in the NOT NULL column and reads back
+		// undefined instead of failing the cast.
+		third := registry.RevocationCursor{RecordedAt: second.RecordedAt.Add(time.Hour)}
+		if err := r.PutRevocationCursor(ctx, third); err != nil {
+			t.Fatalf("PutRevocationCursor (undefined revoke): %v", err)
+		}
+		got, err = r.GetRevocationCursor(ctx)
+		if err != nil {
+			t.Fatalf("GetRevocationCursor after undefined revoke: %v", err)
+		}
+		if !got.RecordedAt.Equal(third.RecordedAt) || got.Revoke.Defined() {
+			t.Fatalf("cursor after undefined revoke = %+v, want %+v", got, third)
+		}
 	})
 
 	t.Run("forge_root advance guarded on root", func(t *testing.T) {

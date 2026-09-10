@@ -126,9 +126,10 @@ Internal:
   `/blob/remove`, `/index/add`, receipt polling. The `/access` login and
   `/provider/add` flows are dormant (no CLI drives them).
 - **`revocation/`** — the Swarf firehose consumer (optional,
-  `revocation_service_url`/`_did`): streams UCAN revocations and clears the
-  affected access key's iam caches via `iam.Revoker`; resumes from the
-  `registry.RevocationCursorStore` cursor (no cursor → subscribe from now).
+  `revocation_service_url`/`_did`): streams UCAN revocations and principal
+  invalidations and clears the affected access keys' iam caches via
+  `iam.Revoker`; resumes from the `registry.RevocationCursorStore` cursor (no
+  cursor → subscribe from now).
 - **`tokenstore/`** — carried-from-guppy delegation store (`tokens.cbor`);
   empty today, read only by the dormant login paths.
 - **`bucket/`** — the per-object model: `manifest.go` (`ObjectManifest`,
