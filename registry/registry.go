@@ -30,10 +30,19 @@ func (s VersioningState) Configured() bool {
 	return s == VersioningEnabled || s == VersioningSuspended
 }
 
+// UnknownTenant is the Tenant of a bucket row that predates the tenant column
+// (migration 00017 backfills it). A syntactically valid DID, so it reads back
+// like any other row, and never a did:plc, so no hilt tenant can equal it.
+var UnknownTenant = did.MustParse("did:web:unknown-tenant.invalid")
+
 // State is the metadata stored per bucket.
 type State struct {
-	Name       string
-	Space      did.DID         // Forge space DID the bucket's data lives in
+	Name  string
+	Space did.DID // Forge space DID the bucket's data lives in
+	// Tenant is the owning tenant's DID (hilt's did:plc for the caller that
+	// created the bucket). The copy paths compare it across buckets to refuse a
+	// source hilt never authorized; UnknownTenant on rows that predate it.
+	Tenant     did.DID
 	Root       cid.Cid         // current MST root; cid.Undef for empty bucket
 	ForgeRoot  cid.Cid         // last MST root whose DAG has been shipped to Forge
 	Versioning VersioningState // S3 versioning configuration
@@ -48,6 +57,7 @@ type State struct {
 // created with x-amz-bucket-object-lock-enabled is versioned and locked
 // atomically (docs/s3-object-lock.md §5).
 type CreateState struct {
+	Tenant           did.DID         // owning tenant; required by the Postgres registry
 	Versioning       VersioningState // "" = unversioned
 	ObjectLockConfig []byte          // nil = no lock
 }

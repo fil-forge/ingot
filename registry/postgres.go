@@ -24,9 +24,10 @@ const uniqueViolation = "23505"
 //
 // Bucket authority (which buckets exist, who may act on them) lives
 // with the Hilt tenant service: s3frontend consults it through the
-// bucketauthority package before touching these rows, which hold only
-// per-bucket root/versioning state. Create and Delete here are plain
-// SQL and read nothing from ctx.
+// bucketauthority package before touching these rows, which hold the
+// per-bucket root/versioning state plus the owning tenant (read only by
+// the copy paths, whose source bucket hilt never sees). Create and Delete
+// here are plain SQL and read nothing from ctx.
 type Postgres struct {
 	pool *pgxpool.Pool
 }
@@ -42,14 +43,20 @@ func NewPostgres(pool *pgxpool.Pool) *Postgres {
 var _ Registry = (*Postgres)(nil)
 
 func (r *Postgres) Create(ctx context.Context, name string, space did.DID, init CreateState) error {
+	// An undefined tenant would store "" — accepted by NOT NULL, rejected by
+	// did.Parse on every later Get — so refuse it here rather than write an
+	// unreadable row.
+	if !init.Tenant.Defined() {
+		return fmt.Errorf("registry: create %q: tenant required", name)
+	}
 	// root_cid stays NULL (empty bucket); created_at from the column default.
 	v := init.Versioning
 	if v == "" {
 		v = VersioningUnversioned
 	}
 	_, err := r.pool.Exec(ctx,
-		`INSERT INTO ingot.buckets (name, space, versioning, object_lock_config) VALUES ($1, $2, $3, $4)`,
-		name, space.String(), string(v), init.ObjectLockConfig)
+		`INSERT INTO ingot.buckets (name, space, tenant, versioning, object_lock_config) VALUES ($1, $2, $3, $4, $5)`,
+		name, space.String(), init.Tenant.String(), string(v), init.ObjectLockConfig)
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == uniqueViolation {
@@ -63,10 +70,10 @@ func (r *Postgres) Create(ctx context.Context, name string, space did.DID, init 
 func (r *Postgres) Get(ctx context.Context, name string) (*State, error) {
 	var rootBytes, forgeBytes, lockCfg []byte
 	var createdAt time.Time
-	var spaceStr, versioning string
+	var spaceStr, tenantStr, versioning string
 	err := r.pool.QueryRow(ctx,
-		`SELECT root_cid, forge_root_cid, created_at, space, versioning, object_lock_config FROM ingot.buckets WHERE name = $1`, name).
-		Scan(&rootBytes, &forgeBytes, &createdAt, &spaceStr, &versioning, &lockCfg)
+		`SELECT root_cid, forge_root_cid, created_at, space, tenant, versioning, object_lock_config FROM ingot.buckets WHERE name = $1`, name).
+		Scan(&rootBytes, &forgeBytes, &createdAt, &spaceStr, &tenantStr, &versioning, &lockCfg)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -77,7 +84,11 @@ func (r *Postgres) Get(ctx context.Context, name string) (*State, error) {
 	if err != nil {
 		return nil, fmt.Errorf("registry: parse space %q: %w", spaceStr, err)
 	}
-	st := &State{Name: name, Space: space, Versioning: VersioningState(versioning), ObjectLockConfig: lockCfg, CreatedAt: createdAt}
+	tenant, err := did.Parse(tenantStr)
+	if err != nil {
+		return nil, fmt.Errorf("registry: parse tenant %q: %w", tenantStr, err)
+	}
+	st := &State{Name: name, Space: space, Tenant: tenant, Versioning: VersioningState(versioning), ObjectLockConfig: lockCfg, CreatedAt: createdAt}
 	if err := setCidPg(&st.Root, rootBytes, name, "root_cid"); err != nil {
 		return nil, err
 	}

@@ -292,6 +292,15 @@ func (b *Backend) CreateBucket(ctx context.Context, input *s3.CreateBucketInput,
 	if !ok {
 		return errors.New("s3frontend: create bucket: no request in context")
 	}
+	// The owning tenant is the caller's: iam stashes it from hilt's authorize
+	// response on every non-root request, and the same access key is about
+	// to create the bucket through hilt. (hilt's create reply does not carry
+	// the tenant.) Root never reaches hilt and so cannot create buckets.
+	tenant, ok := reqscope.Tenant(ctx)
+	if !ok {
+		return errors.New("s3frontend: create bucket: no tenant in context")
+	}
+	init.Tenant = tenant
 	id, err := b.authority.CreateBucket(ctx, req)
 	if err != nil {
 		if errors.Is(err, bucketauthority.ErrAlreadyOwned) {

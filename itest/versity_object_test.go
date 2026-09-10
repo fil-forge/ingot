@@ -195,8 +195,9 @@ var copyObjectXFail = []forgeCase{
 	// Cross-bucket copies are cross-SPACE copies (every bucket has its own
 	// space) and are rejected NotImplemented: each blob's CEK wrap is bound
 	// to (space, digest), so serving them needs the rewrap flow — a filed
-	// follow-up. Cross-bucket cases whose copy fails on resolution first
-	// (e.g. non_existing_dir_object) still pass.
+	// follow-up. A source bucket in another tenant is AccessDenied before
+	// that. Cross-bucket cases whose copy fails on resolution first (e.g.
+	// non_existing_dir_object) still pass.
 	{name: "success", fn: integration.CopyObject_success},
 	{name: "copy_source_starting_with_slash", fn: integration.CopyObject_copy_source_starting_with_slash},
 	{name: "not_owned_source_bucket", fn: integration.CopyObject_not_owned_source_bucket},

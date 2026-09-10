@@ -25,7 +25,9 @@ import (
 // bytes move and no Forge upload happens — the blobs already exist. Honors
 // MetadataDirective (COPY = inherit source metadata; REPLACE = take it from the
 // request) and the x-amz-copy-source-if-* preconditions, and supports a
-// cross-bucket source in the same space.
+// cross-bucket source in the same space. The source bucket must belong to the
+// destination's tenant (copySourceBucket): hilt authorizes a copy against the
+// destination only and never sees the source.
 func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInput) (s3response.CopyObjectOutput, error) {
 	if input.Bucket == nil || input.Key == nil || input.CopySource == nil {
 		return s3response.CopyObjectOutput{}, s3err.GetAPIError(s3err.ErrInvalidRequest)
@@ -79,11 +81,16 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 		}
 	}
 
-	// Resolve the source version (NoSuchBucket / NoSuchKey / NoSuchVersion /
-	// InvalidArgument map from resolution). A delete marker cannot be a copy
-	// source: the current-marker case is a missing key; naming a marker's
-	// versionId is an invalid request (docs/s3-versioning.md §6.2).
-	srcRv, err := b.resolveVersion(ctx, srcBucket, srcKey, srcVersionID)
+	// Vet the source bucket, then resolve the source version (NoSuchKey /
+	// NoSuchVersion / InvalidArgument map from resolution). A delete marker
+	// cannot be a copy source: the current-marker case is a missing key;
+	// naming a marker's versionId is an invalid request
+	// (docs/s3-versioning.md §6.2).
+	srcSt, err := b.copySourceBucket(ctx, bucketState, srcBucket)
+	if err != nil {
+		return s3response.CopyObjectOutput{}, err
+	}
+	srcRv, err := b.resolveVersionIn(ctx, srcSt, srcKey, srcVersionID)
 	if err != nil {
 		return s3response.CopyObjectOutput{}, err
 	}
@@ -101,7 +108,8 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 	// either. Serving this needs a rewrap flow (unwrap under the source
 	// space, rewrap under the destination, new params row + claim) — a filed
 	// follow-up. Every bucket has its own space today, so this rejects all
-	// cross-bucket copies.
+	// same-tenant cross-bucket copies (a foreign tenant's bucket was already
+	// refused above).
 	if srcRv.st.Space != bucketState.Space {
 		return s3response.CopyObjectOutput{}, s3err.GetAPIError(s3err.ErrNotImplemented)
 	}
@@ -224,4 +232,27 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 		out.VersionId = &node.VersionID
 	}
 	return out, nil
+}
+
+// copySourceBucket resolves the copy source's bucket and requires it to belong
+// to the destination bucket's tenant. hilt authorizes a copy as a write to the
+// destination and never reads x-amz-copy-source, so the source bucket's tenant
+// is checked here, before any key lookup: a foreign source is AccessDenied
+// whether or not the key exists, which is what S3 returns for another
+// account's bucket. Comparing the two bucket rows (rather than the caller's
+// tenant) works for the root account, which carries no tenant, because hilt
+// has already established that the caller's tenant owns the destination.
+// UploadPartCopy shares this rule.
+func (b *Backend) copySourceBucket(ctx context.Context, dst *registry.State, srcBucket string) (*registry.State, error) {
+	src, err := b.reg.Get(ctx, srcBucket)
+	if err != nil {
+		if errors.Is(err, registry.ErrNotFound) {
+			return nil, s3err.GetAPIError(s3err.ErrNoSuchBucket)
+		}
+		return nil, fmt.Errorf("s3frontend: copy source bucket: %w", err)
+	}
+	if src.Tenant != dst.Tenant {
+		return nil, s3err.GetAPIError(s3err.ErrAccessDenied)
+	}
+	return src, nil
 }

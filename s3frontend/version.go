@@ -150,8 +150,15 @@ func (b *Backend) resolveVersion(ctx context.Context, bucketName, key, versionID
 		}
 		return nil, err
 	}
-	// Bucket existence outranks versionId validation: a malformed id against a
-	// missing bucket reports NoSuchBucket.
+	return b.resolveVersionIn(ctx, st, key, versionID)
+}
+
+// resolveVersionIn is resolveVersion from the bucket state onward, for callers
+// that must vet the bucket before any key lookup (the copy paths' source
+// bucket). Bucket existence outranks versionId validation: a malformed id
+// against a missing bucket reports NoSuchBucket, which the split preserves
+// because every caller resolves the bucket first.
+func (b *Backend) resolveVersionIn(ctx context.Context, st *registry.State, key, versionID string) (*resolvedVersion, error) {
 	kind, seq := classifyVersionID(versionID)
 	if kind == versionKindInvalid {
 		return nil, errInvalidVersionID(versionID)

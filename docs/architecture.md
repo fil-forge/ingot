@@ -644,6 +644,7 @@ CREATE TABLE ingot.buckets (
     forge_root_cid   bytea,                              -- MST root durable on Forge (lags root_cid)
     created_at       timestamptz NOT NULL DEFAULT now(),
     space            text NOT NULL,                      -- Forge space DID (minted by Hilt)
+    tenant           text NOT NULL,                      -- owning tenant DID; copy paths refuse a foreign source
     versioning       text NOT NULL DEFAULT 'unversioned'
                          CHECK (versioning IN ('unversioned','enabled','suspended')),
     next_version_seq bigint NOT NULL DEFAULT 0           -- per-bucket version ordinal (§3)

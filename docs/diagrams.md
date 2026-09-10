@@ -297,9 +297,12 @@ sequenceDiagram
 - The claim ledger and the zero-claims release are the
   [blob lifecycle](#blob-lifecycle-spooled-parked-accepted-released).
 - `CopyObject` runs the same `commitVersion` with a manifest that pins the
-  source's digests: no spool, no upload, claims incremented. Cross-space
-  (today: cross-bucket) copies are rejected `NotImplemented` — the CEK wrap
-  is bound to (space, digest), so they need a rewrap flow.
+  source's digests: no spool, no upload, claims incremented. A source bucket
+  owned by another tenant is `AccessDenied` before any key lookup (hilt
+  authorizes the copy against the destination only; the bucket rows carry
+  the tenant). Same-tenant cross-space (today: cross-bucket) copies are
+  rejected `NotImplemented` — the CEK wrap is bound to (space, digest), so
+  they need a rewrap flow.
 - Supersession also records each replaced catalog block for future removal:
   the [catalog GC candidates](#catalog-gc-candidates-what-gets-remembered-for-removal)
   diagram shows every entry path.
@@ -307,6 +310,7 @@ sequenceDiagram
 Cross-references: [`architecture.md` §7.1](./architecture.md#71-write-single-shot-putobject).
 
 Sources: `s3frontend/object.go` (PutObject, ingestBody, uploadBlobs),
+`s3frontend/copy.go` (CopyObject, copySourceBucket),
 `s3frontend/version.go` (commitVersion), `bucketop/bucketop.go`,
 `blockstore/staging.go`, `uploader/blob.go`, `uploader/forge.go`. Review when
 these change.
@@ -758,6 +762,7 @@ erDiagram
         bytea root_cid "committed MST root"
         bytea forge_root_cid "root durable on Forge"
         text space "Forge space DID"
+        text tenant "owning tenant DID"
         text versioning "unversioned, enabled, suspended"
         bigint next_version_seq
     }

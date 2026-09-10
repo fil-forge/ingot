@@ -60,7 +60,7 @@ func TestUp_Live(t *testing.T) {
 	}
 
 	// The reserved/added bucket columns exist.
-	for _, col := range []string{"space", "versioning", "next_version_seq"} {
+	for _, col := range []string{"space", "versioning", "next_version_seq", "tenant"} {
 		var exists bool
 		err := pool.QueryRow(ctx,
 			`SELECT EXISTS (SELECT 1 FROM information_schema.columns
@@ -70,6 +70,19 @@ func TestUp_Live(t *testing.T) {
 		}
 		if !exists {
 			t.Errorf("column ingot.buckets.%s does not exist after migration", col)
+		}
+	}
+
+	// buckets.tenant (00017) is NOT NULL once the backfill has run.
+	{
+		var nullable string
+		err := pool.QueryRow(ctx,
+			`SELECT is_nullable FROM information_schema.columns
+			 WHERE table_schema = 'ingot' AND table_name = 'buckets' AND column_name = 'tenant'`).Scan(&nullable)
+		if err != nil {
+			t.Errorf("column ingot.buckets.tenant missing after migration: %v", err)
+		} else if nullable != "NO" {
+			t.Errorf("column ingot.buckets.tenant is_nullable = %q, want NO", nullable)
 		}
 	}
 

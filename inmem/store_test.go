@@ -101,3 +101,28 @@ func TestMemStoreListBucketsPagination(t *testing.T) {
 		}
 	})
 }
+
+// TestMemStoreCreateTenant: the owning tenant recorded at Create reads back
+// through Get, and a Create without one leaves it undefined (the in-memory
+// registry does not enforce the Postgres registry's tenant requirement).
+func TestMemStoreCreateTenant(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+	tenant := testutil.RandomDID(t)
+	if err := m.Create(ctx, "owned", testutil.RandomDID(t), registry.CreateState{Tenant: tenant}); err != nil {
+		t.Fatalf("Create owned: %v", err)
+	}
+	if err := m.Create(ctx, "bare", testutil.RandomDID(t), registry.CreateState{}); err != nil {
+		t.Fatalf("Create bare: %v", err)
+	}
+	st, err := m.Get(ctx, "owned")
+	if err != nil {
+		t.Fatalf("Get owned: %v", err)
+	}
+	if st.Tenant != tenant {
+		t.Fatalf("Tenant = %v, want %v", st.Tenant, tenant)
+	}
+	if st, err = m.Get(ctx, "bare"); err != nil || st.Tenant.Defined() {
+		t.Fatalf("bare bucket Tenant = %v (err %v), want undefined", st.Tenant, err)
+	}
+}

@@ -8,6 +8,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/config v1.32.39
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.38
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.111.0
+	github.com/aws/smithy-go v1.28.1
 	github.com/cenkalti/backoff/v5 v5.0.3
 	github.com/cloud-portable/s3tests/packages/go v0.0.0-20260908103400-a4688c972bb0
 	github.com/fil-forge/hilt v0.0.1-0.20260904141318-f842aba7be7a
@@ -67,7 +68,6 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sso v1.33.8 // indirect
 	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.38.8 // indirect
 	github.com/aws/aws-sdk-go-v2/service/sts v1.45.8 // indirect
-	github.com/aws/smithy-go v1.28.1 // indirect
 	github.com/buger/goterm v1.0.4 // indirect
 	github.com/cbroglie/mustache v1.4.2 // indirect
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect

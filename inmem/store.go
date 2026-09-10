@@ -183,6 +183,7 @@ func (m *MemStore) Create(_ context.Context, name string, space did.DID, init re
 	m.buckets[name] = &registry.State{
 		Name:             name,
 		Space:            space,
+		Tenant:           init.Tenant,
 		Versioning:       v,
 		ObjectLockConfig: init.ObjectLockConfig,
 		CreatedAt:        time.Now().UTC(),

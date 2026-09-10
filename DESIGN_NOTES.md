@@ -72,7 +72,10 @@ makes every stored digest unique), a DELETE that releases a blob's last
 claim also deletes its params row (crypto-shred — the ciphertext is
 unreadable even where copies survive), and **cross-space CopyObject is
 rejected** `NotImplemented` (the CEK wrap is space-bound; a rewrap flow is a
-filed follow-up). Rotation: Hilt replaces `#wrap` in place and archives the
+filed follow-up). A copy source in **another tenant's bucket is refused**
+`AccessDenied` before that: hilt authorizes a copy against the destination
+only, so ingot compares the tenant recorded on the two bucket rows.
+Rotation: Hilt replaces `#wrap` in place and archives the
 old key, so a write inside the cache TTL of a rotation still recovers.
 
 A `200` therefore means the body is durable and accepted on the network and
@@ -157,6 +160,11 @@ HEAD never decrypts. See `s3frontend/decrypt.go`.
 - **space**: per bucket, a `did:plc` minted by hilt at bucket create and
   stored on the bucket row; the subject of every blob and retrieve
   invocation.
+- **tenant**: the `did:plc` hilt names as the caller's tenant in its
+  authorize response; stored on the bucket row at create (the bucket's
+  owner) and carried per request in `internal/reqscope` (the caller). The
+  write path resolves the tenant's wrap key from the request's; the copy
+  paths compare the two buckets'.
 - **access key**: the S3 access key ID is a `did:key`. Every non-root
   request is authorized through hilt (`/s3/request/authorize`, with a local
   fast path over cached delegations); hilt re-delegates the key's grant to
@@ -173,8 +181,8 @@ draws the chains and the stores.
 
 ## State & durability
 
-- **Postgres (`ingot` schema)** is the mutable index: per-bucket roots and
-  versioning state, segment metadata and op-roots, the blob claim ledger
+- **Postgres (`ingot` schema)** is the mutable index: per-bucket roots,
+  versioning state and owning tenant, segment metadata and op-roots, the blob claim ledger
   (`blob_refs`), locations and inclusions, upload intents, multipart
   sessions/parts/parks, and GC candidates. goose tracks its version at
   `ingot.goose_db_version` (never collides with a host's own migrations).
