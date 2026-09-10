@@ -10,10 +10,32 @@ import (
 	"path/filepath"
 	"testing"
 
+	blobcmds "github.com/fil-forge/libforge/commands/blob"
+	"github.com/filecoin-project/go-fee/aesstream"
 	mh "github.com/multiformats/go-multihash"
 
 	"github.com/fil-forge/ingot/blockstore"
 )
+
+// TestDefaultMaxBlobSizeFitsPiri pins DefaultMaxBlobSize's derivation: the
+// FEE envelope of a max-size plaintext blob (ciphertext with per-chunk GCM
+// tags, plus a generous COSE-header budget — the observed single-recipient
+// header is ~211 bytes) must fit the network blob ceiling (libforge
+// blob.MaxBlobSize, the most raw bytes a default-configured piri accepts).
+// Guards against the formula drifting (e.g. a chunk-count header if
+// WithContentLength is ever used, or a second recipient).
+func TestDefaultMaxBlobSizeFitsPiri(t *testing.T) {
+	const headerBudget = 1024
+	enc := aesstream.EncryptedSize(DefaultMaxBlobSize, aesstream.DefaultChunkSize) + headerBudget
+	if enc > blobcmds.MaxBlobSize {
+		t.Fatalf("DefaultMaxBlobSize %d: envelope %d exceeds the network blob ceiling %d", DefaultMaxBlobSize, enc, int64(blobcmds.MaxBlobSize))
+	}
+	// And the allowance is not vacuous: a split at a round 256 MiB — over
+	// the ceiling by less than the allowance — must NOT fit once framed.
+	if enc := aesstream.EncryptedSize(256<<20, aesstream.DefaultChunkSize); enc <= blobcmds.MaxBlobSize {
+		t.Fatalf("a 256 MiB blob's envelope (%d) fits the ceiling %d — revisit DefaultMaxBlobSize", enc, int64(blobcmds.MaxBlobSize))
+	}
+}
 
 func testSpool(t *testing.T) *blockstore.Spool {
 	t.Helper()
