@@ -403,6 +403,10 @@ func (s *Service) authorizeLocal(ctx context.Context, req s3.Request, access str
 	// Cross-key mixing is structurally impossible, so one probe per command
 	// suffices.
 	for _, r := range reqs {
+		// An action that maps to no Forge command goes to Hilt. That covers
+		// the two bucket-configuration reads (GET /{bucket}?versioning and
+		// ?object-lock): no per-request delegation carries the key's expiry
+		// for them, so a cached action set alone would outlive an expired key.
 		cmds := s3perm.CommandsFor(r.Permission)
 		if len(cmds) == 0 {
 			return auth.Account{}, false, nil
