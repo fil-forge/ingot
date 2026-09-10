@@ -10,7 +10,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.111.0
 	github.com/cenkalti/backoff/v5 v5.0.3
 	github.com/cloud-portable/s3tests/packages/go v0.0.0-20260908103400-a4688c972bb0
-	github.com/fil-forge/hilt v0.0.1-0.20260904141318-f842aba7be7a
+	github.com/fil-forge/hilt v0.0.1-0.20260910160535-b100436e29c0
 	github.com/fil-forge/indexing-service v1.13.5-0.20260820151722-9eb620409a4e
 	github.com/fil-forge/libforge v0.0.0-20260910160241-40870549a101
 	github.com/fil-forge/smelt v0.0.0-20260828105933-8ba0939fb9a7

@@ -163,7 +163,11 @@ HEAD never decrypts. See `s3frontend/decrypt.go`.
   the agent, and the per-key `DelegationCache` carries those proofs into the
   request via `internal/reqscope`, where the uploader and the network read
   tier spend them. The uploader also captures a per-space ship authority
-  (1h TTL) for the async catalog flush.
+  (1h TTL) for the async catalog flush. The two bucket-configuration reads,
+  `GET /{bucket}?versioning` and `GET /{bucket}?object-lock`, map to no
+  Forge command, so no per-request delegation carries the key's expiry for
+  them; they are authorized at hilt on every request and served from the
+  registry, as every other bucket-level operation is.
 - The **root account** (versitygw root credentials) bypasses hilt: bucket
   administration works, but with no proof store it can neither write to
   spaces nor read through the network tier.

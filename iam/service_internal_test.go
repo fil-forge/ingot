@@ -329,6 +329,135 @@ func TestPutOnlyKeyIsDeniedOnReads(t *testing.T) {
 	})
 }
 
+// TestBucketConfigReadsReachHilt pins the rule for the two bucket-configuration
+// reads, GET /{bucket}?versioning and GET /{bucket}?object-lock. They map to no
+// Forge command, so no per-request delegation carries the key's expiry for
+// them and a cached action set alone would outlive an expired key. Ingot
+// therefore asks Hilt on every such request: a cached set that permits them
+// never authorizes them locally, and one that excludes them never refuses
+// them locally.
+func TestBucketConfigReadsReachHilt(t *testing.T) {
+	accessKey, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	spaceIssuer, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	agent, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	tenant := did.MustParse("did:plc:ewvi7nxzyoun6zhxrhs64oiz")
+
+	accessKeyID := accessKey.DID().Identifier()
+	const secret = "test-secret-access-key"
+	space := spaceIssuer.DID()
+	resolver := fixedResolver{name: "bkt", state: &registry.State{Name: "bkt", Space: space}}
+
+	// A service key's worth of chains and actions: everything Hilt can
+	// grant, so the operation is the only reason left for the fast path to
+	// defer.
+	allActions := s3perm.All()
+	allChains := chainFor(t, spaceIssuer, accessKey, agent, s3perm.CommandsFor(allActions...)...)
+
+	// service builds a fast-path Service holding the key Hilt would derive
+	// for req, the tenant, every chain, and the given action set for the
+	// bucket, in front of a Hilt that fails every call.
+	service := func(t *testing.T, req s3.Request, actions []string) *Service {
+		t.Helper()
+		sr, err := sigv4.Parse(sigv4.Request{Method: req.Method, Headers: req.Headers, URL: req.URL})
+		require.NoError(t, err)
+		key, err := sigv4.DeriveKey(sr, secret)
+		require.NoError(t, err)
+
+		s := localService(agent.DID(), resolver)
+		s.keys.Put(accessKeyID, time.Hour, s3.VerificationKey{Kind: s3.KeyKindSigV4, Data: key})
+		s.tenants.Put(accessKeyID, time.Hour, tenant)
+		s.proofs.Deposit(accessKey.DID(), allChains...)
+		s.proofs.For(accessKey.DID()).PutPermissions(space, time.Hour, actions)
+		return s
+	}
+	authorize := func(s *Service, req s3.Request) (bool, error) {
+		_, ok, err := s.authorizeLocal(context.Background(), req, accessKeyID, s.proofs.For(accessKey.DID()))
+		return ok, err
+	}
+	// drive runs req through GetUserAccountForRequest as the gateway would.
+	drive := func(t *testing.T, s *Service, req s3.Request) error {
+		t.Helper()
+		app := fiber.New()
+		var authErr error
+		app.Use(func(c fiber.Ctx) error {
+			_, authErr = s.GetUserAccountForRequest(c, accessKeyID)
+			return nil
+		})
+		resp, err := app.Test(httpRequestOf(t, req))
+		require.NoError(t, err)
+		require.NoError(t, resp.Body.Close())
+		return authErr
+	}
+
+	now := time.Now()
+	reads := map[string]struct {
+		req s3.Request
+		op  hiltauth.Operation
+	}{
+		"GetBucketVersioning": {
+			req: signedRequest(t, http.MethodGet, "s3.example", "/bkt?versioning", accessKeyID, secret, now),
+			op:  hiltauth.OpGetBucketVersioning,
+		},
+		"GetBucketObjectLockConfiguration": {
+			req: signedRequest(t, http.MethodGet, "s3.example", "/bkt?object-lock", accessKeyID, secret, now),
+			op:  hiltauth.OpGetBucketObjectLockConfiguration,
+		},
+	}
+	for name, tc := range reads {
+		t.Run(name, func(t *testing.T) {
+			// The premise: Hilt classifies the read as its own operation (not
+			// ListBucket) and maps it to no Forge command.
+			op, err := hiltauth.OperationFor(tc.req)
+			require.NoError(t, err)
+			require.Equal(t, tc.op, op)
+			require.Empty(t, s3perm.CommandsFor(op.Permission()), "the read must map to no Forge command")
+			require.Contains(t, allActions, op.Permission(), "the permitting set must actually hold the action")
+
+			t.Run("a permitting set and complete chains still reach Hilt", func(t *testing.T) {
+				s := service(t, tc.req, allActions)
+				ok, err := authorize(s, tc.req)
+				require.NoError(t, err)
+				require.False(t, ok)
+
+				err = drive(t, s, tc.req)
+				require.ErrorContains(t, err, "hilt consulted")
+				require.Equal(t, 1, s.authorizer.(*refusingAuthorizer).calls)
+			})
+
+			t.Run("an excluding set never denies locally", func(t *testing.T) {
+				for _, actions := range [][]string{{"s3:GetObject"}, {}} {
+					s := service(t, tc.req, actions)
+					ok, err := authorize(s, tc.req)
+					require.NoError(t, err, "a set of %v must defer to Hilt, not refuse", actions)
+					require.False(t, ok, "a set of %v must defer to Hilt", actions)
+
+					err = drive(t, s, tc.req)
+					require.ErrorContains(t, err, "hilt consulted")
+					var s3e s3err.S3Error
+					require.False(t, errors.As(err, &s3e), "must not be refused locally for a set of %v", actions)
+					require.Equal(t, 1, s.authorizer.(*refusingAuthorizer).calls)
+				}
+			})
+		})
+	}
+
+	// The control: the same key, bucket, chains and sets decide a ListBucket
+	// locally, so the deferrals above are the operation's doing.
+	t.Run("ListBucket on the same setup is decided locally", func(t *testing.T) {
+		req := signedRequest(t, http.MethodGet, "s3.example", "/bkt", accessKeyID, secret, now)
+		ok, err := authorize(service(t, req, allActions), req)
+		require.NoError(t, err)
+		require.True(t, ok)
+
+		ok, err = authorize(service(t, req, []string{"s3:GetObject"}), req)
+		require.False(t, ok)
+		require.Equal(t, s3err.GetAPIError(s3err.ErrAccessDenied), err)
+	})
+}
+
 // commandStrings renders commands for set comparison in assertions.
 func commandStrings(cmds []ucan.Command) []string {
 	out := make([]string, 0, len(cmds))
