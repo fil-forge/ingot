@@ -66,7 +66,9 @@ var listObjectVersionsVDPass = []forgeCase{
 var versioningPass = []forgeCase{
 	// PutObject
 	{name: "PutObject_success", fn: integration.Versioning_PutObject_success},
+	{name: "PutObject_suspended_null_versionId_obj", fn: integration.Versioning_PutObject_suspended_null_versionId_obj},
 	{name: "PutObject_null_versionId_obj", fn: integration.Versioning_PutObject_null_versionId_obj},
+	{name: "PutObject_overwrite_null_versionId_obj", fn: integration.Versioning_PutObject_overwrite_null_versionId_obj},
 	// CopyObject
 	{name: "CopyObject_invalid_versionId", fn: integration.Versioning_CopyObject_invalid_versionId},
 	{name: "CopyObject_encoded_versionid_separator_invalid_versionId", fn: integration.Versioning_CopyObject_encoded_versionid_separator_invalid_versionId},
@@ -153,11 +155,4 @@ var versioningPass = []forgeCase{
 var versioningXFail = []forgeCase{
 	{name: "CopyObject_success", fn: integration.Versioning_CopyObject_success},
 	{name: "CopyObject_from_an_object_version", fn: integration.Versioning_CopyObject_from_an_object_version},
-	// These two versitygw tests assert a suspended-bucket PutObject echoes the
-	// "null" version id in the response. Verified against AWS S3, a suspended
-	// PUT returns NO x-amz-version-id header (the object is stored as version
-	// "null" but the id is not echoed) — so ingot deliberately omits it (§4.3)
-	// and these assertions are versitygw-side bugs to report upstream.
-	{name: "PutObject_suspended_null_versionId_obj", fn: integration.Versioning_PutObject_suspended_null_versionId_obj},
-	{name: "PutObject_overwrite_null_versionId_obj", fn: integration.Versioning_PutObject_overwrite_null_versionId_obj},
 }
