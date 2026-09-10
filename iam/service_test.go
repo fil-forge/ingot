@@ -249,6 +249,68 @@ func TestProofChainCapture(t *testing.T) {
 	})
 }
 
+// TestPermissionCapture covers the other half of enforcement: the effective
+// action set an authorize response carries is cached in the key's own proof
+// store, keyed by the bucket Hilt named, so the fast path can decide the
+// key's next request without another round trip.
+func TestPermissionCapture(t *testing.T) {
+	access, keyDID := newAccessKey(t)
+	sigv4 := s3.VerificationKey{Kind: s3.KeyKindSigV4, Data: []byte("dk")}
+
+	t.Run("the effective set is cached under the bucket", func(t *testing.T) {
+		res := authorizeOK(t, keyDID, sigv4)
+		res.Permissions = s3.PermissionSet{Entries: map[did.DID][]string{keyDID: {"s3:PutObject"}}}
+		proofs := iam.NewKeyProofs()
+		svc := iam.New(&fakeAuthorizer{res: res}, proofs, iam.NewVerificationKeyCache(), iam.NewTenantCache())
+
+		_, err := resolveForRequest(t, svc, access,
+			httptest.NewRequest(http.MethodPut, "http://example.com/bkt/key", nil))
+		require.NoError(t, err)
+
+		store := proofs.For(keyDID)
+		allowed, known := store.Permits(*res.Bucket, "s3:PutObject")
+		require.True(t, known, "the authorize answer must be cached")
+		require.True(t, allowed)
+
+		allowed, known = store.Permits(*res.Bucket, "s3:GetObject")
+		require.True(t, known)
+		require.False(t, allowed, "an action the key does not hold must be denied from cache")
+	})
+
+	t.Run("a result with no bucket caches no set", func(t *testing.T) {
+		// ListBuckets and CreateBucket address no existing bucket, so there
+		// is nothing to scope a set to.
+		res := authorizeOK(t, keyDID, sigv4)
+		bucket := *res.Bucket
+		res.Bucket = nil
+		proofs := iam.NewKeyProofs()
+		svc := iam.New(&fakeAuthorizer{res: res}, proofs, iam.NewVerificationKeyCache(), iam.NewTenantCache())
+
+		_, err := resolveForRequest(t, svc, access,
+			httptest.NewRequest(http.MethodGet, "http://example.com/", nil))
+		require.NoError(t, err)
+
+		_, known := proofs.For(keyDID).Permits(bucket, "s3:GetObject")
+		require.False(t, known)
+	})
+
+	t.Run("a result with no permissions for the key caches no set", func(t *testing.T) {
+		// A Hilt that reports nothing leaves the bucket unknown, so requests
+		// keep going to Hilt instead of being refused locally.
+		res := authorizeOK(t, keyDID, sigv4)
+		res.Permissions = s3.PermissionSet{}
+		proofs := iam.NewKeyProofs()
+		svc := iam.New(&fakeAuthorizer{res: res}, proofs, iam.NewVerificationKeyCache(), iam.NewTenantCache())
+
+		_, err := resolveForRequest(t, svc, access,
+			httptest.NewRequest(http.MethodGet, "http://example.com/bkt/key", nil))
+		require.NoError(t, err)
+
+		_, known := proofs.For(keyDID).Permits(*res.Bucket, "s3:GetObject")
+		require.False(t, known)
+	})
+}
+
 // TestBaseIAMServiceParity pins the non-request IAMService surface to
 // IAMServiceSingle's behavior: account management belongs to Hilt.
 func TestBaseIAMServiceParity(t *testing.T) {
