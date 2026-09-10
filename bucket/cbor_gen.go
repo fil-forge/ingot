@@ -770,7 +770,7 @@ func (t *Body) MarshalCBOR(w io.Writer) error {
 
 	cw := cbg.NewCborWriter(w)
 
-	if _, err := cw.Write([]byte{166}); err != nil {
+	if _, err := cw.Write([]byte{167}); err != nil {
 		return err
 	}
 
@@ -890,6 +890,39 @@ func (t *Body) MarshalCBOR(w io.Writer) error {
 		if err := cbg.WriteCid(cw, *t.IndexRoot); err != nil {
 			return xerrors.Errorf("failed to write cid field t.IndexRoot: %w", err)
 		}
+	}
+
+	// t.PartChecksums ([]string) (slice)
+	if len("pc") > 1000000 {
+		return xerrors.Errorf("Value in field \"pc\" was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("pc"))); err != nil {
+		return err
+	}
+	if _, err := cw.WriteString(string("pc")); err != nil {
+		return err
+	}
+
+	if len(t.PartChecksums) > 8192 {
+		return xerrors.Errorf("Slice value in field t.PartChecksums was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajArray, uint64(len(t.PartChecksums))); err != nil {
+		return err
+	}
+	for _, v := range t.PartChecksums {
+		if len(v) > 1000000 {
+			return xerrors.Errorf("Value in field v was too long")
+		}
+
+		if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len(v))); err != nil {
+			return err
+		}
+		if _, err := cw.WriteString(string(v)); err != nil {
+			return err
+		}
+
 	}
 
 	// t.PartSizes ([]int64) (slice)
@@ -1100,6 +1133,46 @@ func (t *Body) UnmarshalCBOR(r io.Reader) (err error) {
 					t.IndexRoot = &c
 				}
 
+			}
+			// t.PartChecksums ([]string) (slice)
+		case "pc":
+
+			maj, extra, err = cr.ReadHeader()
+			if err != nil {
+				return err
+			}
+
+			if extra > 8192 {
+				return fmt.Errorf("t.PartChecksums: array too large (%d)", extra)
+			}
+
+			if maj != cbg.MajArray {
+				return fmt.Errorf("expected cbor array")
+			}
+
+			if extra > 0 {
+				t.PartChecksums = make([]string, extra)
+			}
+
+			for i := 0; i < int(extra); i++ {
+				{
+					var maj byte
+					var extra uint64
+					var err error
+					_ = maj
+					_ = extra
+					_ = err
+
+					{
+						sval, err := cbg.ReadStringWithMax(cr, 1000000)
+						if err != nil {
+							return err
+						}
+
+						t.PartChecksums[i] = string(sval)
+					}
+
+				}
 			}
 			// t.PartSizes ([]int64) (slice)
 		case "ps":

@@ -56,6 +56,12 @@ func (b *Backend) CreateMultipartUpload(ctx context.Context, input s3response.Cr
 	if err := objectKeyError(key); err != nil {
 		return s3response.InitiateMultipartUploadResult{}, err
 	}
+	if unsupportedObjectACL(input.ACL, input.GrantFullControl, input.GrantRead, input.GrantReadACP, input.GrantWriteACP) {
+		return s3response.InitiateMultipartUploadResult{}, s3err.GetAPIError(s3err.ErrNotImplemented)
+	}
+	if req, ok := reqscope.Request(ctx); ok && requestsServerSideEncryption(req.Headers) {
+		return s3response.InitiateMultipartUploadResult{}, s3err.GetAPIError(s3err.ErrNotImplemented)
+	}
 	// A directory object (trailing "/") is zero-length by definition; a
 	// multipart upload to one necessarily carries data.
 	if strings.HasSuffix(key, "/") {
@@ -543,8 +549,10 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 					return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrInvalidPart)
 				}
 				etagQ := `"` + cur.CommittedETag + `"`
+				// A re-Complete of an already-completed upload returns the ETag
+				// but no checksum: AWS omits it on the idempotent replay (for both
+				// COMPOSITE and FULL_OBJECT), unlike the first Complete.
 				res := s3response.CompleteMultipartUploadResult{Bucket: &bucket, Key: &key, ETag: &etagQ}
-				setCompleteResultChecksum(&res, ckAlgo, ckValue, ckType)
 				return res, cur.CommittedVersionID, nil
 			}
 			if cur.State == registry.SessionOpen {
@@ -596,6 +604,12 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 	// blobs) is recorded so a later GET/HEAD ?partNumber=N can address it (§7.2).
 	var blobs []msbucket.BlobRef
 	var partSizes []int64
+	// Per-part checksums are retained only for a COMPOSITE checksummed upload
+	// (and only when every part recorded one). AWS exposes the per-part list and
+	// a ?partNumber checksum solely for composite multipart objects; a
+	// FULL_OBJECT upload reports only the whole-object checksum and part count.
+	var partChecksums []string
+	recordPartChecksums := mpHadChecksum && !missingStored && ckType == types.ChecksumTypeComposite
 	var offset int64
 	for _, sp := range requested {
 		partStart := offset
@@ -614,6 +628,9 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 			offset += plainLen
 		}
 		partSizes = append(partSizes, offset-partStart)
+		if recordPartChecksums {
+			partChecksums = append(partChecksums, sp.Checksum)
+		}
 	}
 
 	// Accept every part's blobs on Forge: parked blobs conclude (the deferred
@@ -628,7 +645,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 		Key:                     key,
 		ContentType:             sess.ContentType,
 		Created:                 time.Now().Unix(),
-		Body:                    msbucket.Body{Size: offset, Blobs: blobs, PartSizes: partSizes},
+		Body:                    msbucket.Body{Size: offset, Blobs: blobs, PartSizes: partSizes, PartChecksums: partChecksums},
 		ETag:                    etag,
 		ContentEncoding:         sess.ContentEncoding,
 		ContentDisposition:      sess.ContentDisposition,
@@ -689,19 +706,13 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 		return s3response.CompleteMultipartUploadResult{}, "", err
 	}
 	committed = true
-	// The x-amz-version-id of the new version, omitted for unversioned buckets
-	// (docs/s3-versioning.md §4.3).
-	versionid := ""
-	if effState.Configured() {
-		versionid = node.VersionID
-	}
 	// The object is durable. Retain the session (state 'completed', carrying
 	// the committed ETag and version id) and its parts so a duplicate or
 	// latch-losing Complete replays this result; the sweeper reaps it later.
 	// Best-effort: a failed latch leaves the row in 'completing', which the
 	// sweeper reaps through its abort path after the TTL — harmless here, as
 	// the winners hold reference claims by now, so that cleanup skips them.
-	if _, err := b.multipart.CompleteSession(ctx, uploadID, etag, versionid); err != nil {
+	if _, err := b.multipart.CompleteSession(ctx, uploadID, etag, node.VersionID); err != nil {
 		b.logger.Warn("latch session to completed failed; sweeper reaps the completing row after the TTL",
 			zap.String("uploadID", uploadID), zap.Error(err))
 	}
@@ -728,6 +739,14 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 		b.cleanupPartBlobs(ctx, bucketState.Space, uploadID, orphans, winners)
 	}
 
+	// The x-amz-version-id of the new version. Only an enabled bucket echoes it;
+	// a suspended bucket stores the object under the "null" version id but omits
+	// it from the CompleteMultipartUpload response, as does an unversioned bucket
+	// (docs/s3-versioning.md §4.3).
+	versionid := ""
+	if effState == registry.VersioningEnabled {
+		versionid = node.VersionID
+	}
 	etagQ := `"` + etag + `"`
 	res := s3response.CompleteMultipartUploadResult{Bucket: &bucket, Key: &key, ETag: &etagQ}
 	setCompleteResultChecksum(&res, ckAlgo, ckValue, ckType)

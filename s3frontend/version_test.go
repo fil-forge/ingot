@@ -221,8 +221,10 @@ func TestVersioning_SuspendedReplacesNullInPlace(t *testing.T) {
 	bb, cc := []byte("null B"), []byte("null C")
 
 	outB := putObjV(t, b, "k1", bb)
-	if outB.VersionID != "null" {
-		t.Fatalf("suspended PUT VersionID = %q, want null", outB.VersionID)
+	// A suspended PUT omits the version id from the response (§4.3); the write
+	// still lands as the "null" version, confirmed by resolving it below.
+	if outB.VersionID != "" {
+		t.Fatalf("suspended PUT VersionID = %q, want empty (omitted)", outB.VersionID)
 	}
 	db := blobDigestOf(t, b, "k1", "null")
 	// The numbered version was retained; nothing released yet.
@@ -519,6 +521,46 @@ func TestVersioning_ListVersionsPagination(t *testing.T) {
 	for i := range want {
 		if got[i] != want[i] {
 			t.Fatalf("entry %d = %q, want %q\n got: %v\nwant: %v", i, got[i], want[i], got, want)
+		}
+	}
+}
+
+// TestVersioning_ListVersionsExactFit locks the look-ahead on the versions
+// path: with 2 keys × 3 versions = 6 entries and MaxKeys=3, page 1 fills
+// exactly and IS truncated (key 2 still follows), while page 2 fills exactly
+// and is NOT truncated (nothing follows).
+func TestVersioning_ListVersionsExactFit(t *testing.T) {
+	b, _, _ := newRefTestBackend(t)
+	setVersioning(t, b, types.BucketVersioningStatusEnabled)
+	for _, key := range []string{"o1", "o2"} {
+		for i := 0; i < 3; i++ {
+			putObjV(t, b, key, []byte(key+string(rune('a'+i))))
+		}
+	}
+
+	maxKeys := int32(3)
+	res := listVersions(t, b, &s3.ListObjectVersionsInput{MaxKeys: &maxKeys})
+	if len(res.Versions) != 3 || res.IsTruncated == nil || !*res.IsTruncated {
+		t.Fatalf("page1: versions=%d truncated=%v, want 3/true", len(res.Versions), res.IsTruncated)
+	}
+	if res.NextKeyMarker == nil {
+		t.Fatal("page1 missing NextKeyMarker")
+	}
+
+	res2 := listVersions(t, b, &s3.ListObjectVersionsInput{
+		MaxKeys:         &maxKeys,
+		KeyMarker:       res.NextKeyMarker,
+		VersionIdMarker: res.NextVersionIdMarker,
+	})
+	if len(res2.Versions) != 3 {
+		t.Fatalf("page2 versions = %d, want 3", len(res2.Versions))
+	}
+	if res2.IsTruncated == nil || *res2.IsTruncated {
+		t.Fatalf("page2 IsTruncated = %v, want false (exact fit, nothing follows)", res2.IsTruncated)
+	}
+	for _, v := range res2.Versions {
+		if *v.Key != "o2" {
+			t.Fatalf("page2 key = %q, want o2", *v.Key)
 		}
 	}
 }

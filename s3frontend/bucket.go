@@ -240,6 +240,23 @@ func (b *Backend) HeadBucket(ctx context.Context, input *s3.HeadBucketInput) (*s
 	return &s3.HeadBucketOutput{}, nil
 }
 
+// unsupportedBucketACL reports whether the request asks for a bucket ACL ingot
+// cannot honor: any canned ACL other than the default "private", or any grant
+// header. An absent canned ACL (the default) and an explicit "private" pass.
+// The controller forwards these from the x-amz-acl / x-amz-grant-* headers.
+func unsupportedBucketACL(input *s3.CreateBucketInput) bool {
+	if input.ACL != "" && input.ACL != types.BucketCannedACLPrivate {
+		return true
+	}
+	return grantSet(input.GrantFullControl) ||
+		grantSet(input.GrantRead) ||
+		grantSet(input.GrantReadACP) ||
+		grantSet(input.GrantWrite) ||
+		grantSet(input.GrantWriteACP)
+}
+
+func grantSet(g *string) bool { return g != nil && *g != "" }
+
 func (b *Backend) CreateBucket(ctx context.Context, input *s3.CreateBucketInput, _ []byte) error {
 	if input.Bucket == nil {
 		return s3err.GetAPIError(s3err.ErrInvalidBucketName)
@@ -251,6 +268,12 @@ func (b *Backend) CreateBucket(ctx context.Context, input *s3.CreateBucketInput,
 	name := strings.Clone(*input.Bucket)
 	if !validBucketName(name) {
 		return s3err.GetAPIError(s3err.ErrInvalidBucketName)
+	}
+	// ingot does not model ACLs, so the only bucket ACL it accepts is the
+	// default: no ACL header, or a "private" canned ACL. Any other canned ACL,
+	// or an explicit grant header, asks for functionality we do not implement.
+	if unsupportedBucketACL(input) {
+		return s3err.GetAPIError(s3err.ErrNotImplemented)
 	}
 	// x-amz-bucket-object-lock-enabled: the bucket is born versioned and
 	// locked in one Create, so there is no window in which it exists

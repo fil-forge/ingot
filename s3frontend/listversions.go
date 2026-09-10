@@ -91,6 +91,7 @@ func (b *Backend) ListObjectVersions(ctx context.Context, input *s3.ListObjectVe
 	}
 
 	count := 0
+	overflow := false
 	var lastKey, lastVersionID string
 	full := func() bool { return count >= limit }
 
@@ -112,15 +113,19 @@ func (b *Backend) ListObjectVersions(ctx context.Context, input *s3.ListObjectVe
 					return nil
 				}
 				if _, dup := seenPrefix[cp]; !dup {
+					// Look-ahead: a new group found while the page is already
+					// full proves there is more — truncate here and stop,
+					// leaving the Next marker at the already-emitted limit-th
+					// element.
+					if full() {
+						truncated = true
+						return mst.ErrStopWalk
+					}
 					seenPrefix[cp] = struct{}{}
 					cpCopy := cp
 					res.CommonPrefixes = append(res.CommonPrefixes, types.CommonPrefix{Prefix: &cpCopy})
 					count++
-					if full() {
-						truncated = true
-						lastKey, lastVersionID = cp, ""
-						return mst.ErrStopWalk
-					}
+					lastKey, lastVersionID = cp, ""
 				}
 				return nil
 			}
@@ -166,6 +171,15 @@ func (b *Backend) ListObjectVersions(ctx context.Context, input *s3.ListObjectVe
 		}
 
 		emit := func(node msbucket.VersionNode, mf *msbucket.ObjectManifest, isLatest bool) {
+			// Look-ahead: a further version to emit while the page is already
+			// full proves there is more — mark truncated and suppress it,
+			// leaving lastKey/lastVersionID at the already-emitted limit-th
+			// entry as the Next marker. Callers stop when overflow is set.
+			if full() {
+				truncated = true
+				overflow = true
+				return
+			}
 			key := k
 			vid := node.VersionID
 			lm := time.Unix(mf.Created, 0)
@@ -212,8 +226,7 @@ func (b *Backend) ListObjectVersions(ctx context.Context, input *s3.ListObjectVe
 				mf = em.Manifest
 			}
 			emit(current, mf, true)
-			if full() {
-				truncated = true
+			if overflow {
 				return mst.ErrStopWalk
 			}
 		}
@@ -238,7 +251,7 @@ func (b *Backend) ListObjectVersions(ctx context.Context, input *s3.ListObjectVe
 			}
 			mf := em.Manifest
 			emit(msbucket.VersionNode{Seq: mf.Seq, VersionID: mf.VersionID, Manifest: mfCid}, mf, false)
-			if full() {
+			if overflow {
 				stopped = true
 				return mst.ErrStopWalk
 			}
@@ -248,7 +261,6 @@ func (b *Backend) ListObjectVersions(ctx context.Context, input *s3.ListObjectVe
 			return perr
 		}
 		if stopped {
-			truncated = true
 			return mst.ErrStopWalk
 		}
 		return nil
