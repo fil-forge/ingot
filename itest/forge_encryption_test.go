@@ -418,6 +418,59 @@ func TestForgeEncryption(t *testing.T) {
 		t.Logf("supersede shredded %d key rows; winner round-trips", len(oldDigests))
 	})
 
+	// CompleteShredsOrphanParts: a part uploaded but omitted from the
+	// Complete list is reaped at Complete — key row, upload intent, and park
+	// row gone — while the winner commits and round-trips.
+	t.Run("CompleteShredsOrphanParts", func(t *testing.T) {
+		const bucket, key = "mp-shred-orphan", "obj"
+		if _, err := cl.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
+			t.Fatalf("CreateBucket: %v", err)
+		}
+		create, err := cl.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
+			Bucket: aws.String(bucket), Key: aws.String(key),
+		})
+		if err != nil {
+			t.Fatalf("CreateMultipartUpload: %v", err)
+		}
+		winner := tagged(patternBytes(5<<20), 0x2B)
+		up1, err := cl.UploadPart(ctx, &s3.UploadPartInput{
+			Bucket: aws.String(bucket), Key: aws.String(key), UploadId: create.UploadId,
+			PartNumber: aws.Int32(1), Body: bytes.NewReader(winner),
+		})
+		if err != nil {
+			t.Fatalf("UploadPart 1: %v", err)
+		}
+		if _, err := cl.UploadPart(ctx, &s3.UploadPartInput{
+			Bucket: aws.String(bucket), Key: aws.String(key), UploadId: create.UploadId,
+			PartNumber: aws.Int32(2), Body: bytes.NewReader(tagged(patternBytes(5<<20), 0x9C)),
+		}); err != nil {
+			t.Fatalf("UploadPart 2: %v", err)
+		}
+		orphan := partBlobDigestsHex(t, ctx, s, aws.ToString(create.UploadId), 2)
+		if n := countRowsForDigests(t, ctx, s, "ingot.blob_encryption_params", "digest", orphan); n != len(orphan) {
+			t.Fatalf("pre-complete: %d enc-params rows for %d orphan blobs", n, len(orphan))
+		}
+
+		if _, err := cl.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+			Bucket: aws.String(bucket), Key: aws.String(key), UploadId: create.UploadId,
+			MultipartUpload: &types.CompletedMultipartUpload{Parts: []types.CompletedPart{
+				{PartNumber: aws.Int32(1), ETag: up1.ETag},
+			}},
+		}); err != nil {
+			t.Fatalf("CompleteMultipartUpload: %v", err)
+		}
+
+		for _, tbl := range []string{"ingot.blob_encryption_params", "ingot.upload_intents", "ingot.blob_parks"} {
+			if n := countRowsForDigests(t, ctx, s, tbl, "digest", orphan); n != 0 {
+				t.Fatalf("%d %s rows survived for the orphaned part", n, tbl)
+			}
+		}
+		if got := getBody(t, ctx, cl, bucket, key, ""); !bytes.Equal(got, winner) {
+			t.Fatalf("winner mismatch after orphan reap (%d bytes)", len(got))
+		}
+		t.Logf("Complete reaped %d orphan part blobs; winner round-trips", len(orphan))
+	})
+
 	t.Run("OverwriteRace", func(t *testing.T) {
 		// When overwrite atomicity lands — deferred blob release (a grace
 		// window so readers holding the prior catalog root finish before its

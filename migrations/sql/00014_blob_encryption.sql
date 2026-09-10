@@ -7,9 +7,11 @@
 -- unwraps the CEK (via the region's secrets manager, which custodies the region
 -- KEK) and goes straight to a body-range fetch — no envelope-header round-trip.
 --
--- The existence of a row is what marks a blob as encrypted, so every column is
--- NOT NULL: there is no such thing as a half-populated parameter set the
--- decrypt path could not use. An unencrypted blob simply has no row.
+-- Every body blob is written encrypted, so every body blob has a row (written
+-- before its manifest commits), and every column is NOT NULL: there is no such
+-- thing as a half-populated parameter set the decrypt path could not use. A
+-- referenced blob with a missing row is a read error (fail closed), never
+-- "stored as plaintext".
 --
 -- Deliberately a separate table from ingot.blob_locations, and deliberately
 -- WITHOUT a foreign key to it. blob_locations is a reconstructible cache of the
