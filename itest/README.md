@@ -84,4 +84,7 @@ Notes:
 - The other services run their published `:main` images — `docker pull` them
   occasionally; compose won't refresh an existing tag.
 - CI runs this suite on every PR after unit tests pass
-  (`.github/workflows/go-test.yml`, job `itest`).
+  (`.github/workflows/go-test.yml`, job `itest`). The same job generates the
+  S3 compatibility report and uploads it as the `s3-compat-report` build
+  artifact; on main it is also published to GitHub Pages at
+  <https://fil-forge.github.io/ingot/> (job `pages`).
