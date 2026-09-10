@@ -467,6 +467,10 @@ func buildS3API(ctx context.Context, backend *s3frontend.Backend, cfg config.Ser
 		// Without this the part-number ceiling defaults to 0 and every
 		// UploadPart is rejected. 10000 is the S3 maximum.
 		s3api.WithMpMaxParts(10000),
+		// Ingot stores keys as opaque byte strings in an MST, not as
+		// filesystem paths, so the path-traversal key guard does not apply:
+		// keys like "../file.txt" are legal literal S3 keys and must round-trip.
+		s3api.WithDisableObjNameTraversalCheck(),
 		// Stash the signed S3 request on the context for every request. The
 		// bucket-authority seam (Create/Delete/ListBuckets) recovers it to
 		// forward to Hilt; doing it here — ahead of auth — covers all auth

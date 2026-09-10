@@ -16,6 +16,7 @@ var createBucketPass = []forgeCase{
 	{name: "invalid_bucket_name", fn: integration.CreateBucket_invalid_bucket_name},
 	{name: "invalid_canned_acl", fn: integration.CreateBucket_invalid_canned_acl},
 	{name: "invalid_ownership", fn: integration.CreateBucket_invalid_ownership},
+	{name: "owned_by_you", fn: integration.CreateBucket_owned_by_you},
 	{name: "ownership_with_acl", fn: integration.CreateBucket_ownership_with_acl},
 	{name: "success", fn: integration.CreateBucket_success},
 }
@@ -33,7 +34,6 @@ var createBucketXFail = []forgeCase{
 	{name: "invalid_tags", fn: integration.CreateBucket_invalid_tags},
 	{name: "long_tags", fn: integration.CreateBucket_long_tags},
 	{name: "non_default_acl", fn: integration.CreateBucket_non_default_acl},
-	{name: "owned_by_you", fn: integration.CreateBucket_owned_by_you},
 	{name: "private_canned_acl", fn: integration.CreateBucket_private_canned_acl},
 	{name: "private_canned_acl_bucket_owner_enforced_ownership", fn: integration.CreateBucket_private_canned_acl_bucket_owner_enforced_ownership},
 	{name: "tag_count_limit", fn: integration.CreateBucket_tag_count_limit},
