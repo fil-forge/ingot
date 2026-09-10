@@ -165,7 +165,13 @@ var copyObjectPass = []forgeCase{
 	{name: "default_content_type_with_replace_metadata", fn: integration.CopyObject_default_content_type_with_replace_metadata},
 	{name: "non_existing_dir_object", fn: integration.CopyObject_non_existing_dir_object},
 	{name: "with_metadata", fn: integration.CopyObject_with_metadata},
-	{name: "conditional_reads", fn: integration.CopyObject_conditional_reads},
+	// Upstream expects 304 NotModified for a matched copy-source
+	// If-None-Match / unsatisfied If-Modified-Since; S3 returns 412
+	// PreconditionFailed for every failed copy-source precondition (the
+	// cloud-portable corpus asserts the 412), and ingot follows S3.
+	{name: "conditional_reads", fn: integration.CopyObject_conditional_reads, skip: func() string {
+		return "upstream asserts 304 NotModified for copy-source preconditions where S3 (and ingot) return 412 PreconditionFailed"
+	}},
 	{name: "with_special_characters", fn: integration.CopyObject_with_special_characters},
 	{name: "long_metadata", fn: integration.CopyObject_long_metadata},
 	{name: "should_copy_meta_props", fn: integration.CopyObject_should_copy_meta_props},
