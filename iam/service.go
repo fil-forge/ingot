@@ -39,11 +39,7 @@ package iam
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"net/http"
-	"net/url"
-	"strconv"
 	"strings"
 
 	"time"
@@ -63,7 +59,6 @@ import (
 	"github.com/fil-forge/ucantone/ucan"
 	"github.com/fil-forge/versitygw/auth"
 	"github.com/fil-forge/versitygw/s3api/middlewares"
-	"github.com/fil-forge/versitygw/s3api/utils"
 	"github.com/fil-forge/versitygw/s3err"
 	"github.com/gofiber/fiber/v3"
 	"go.uber.org/zap"
@@ -174,15 +169,6 @@ func (s *Service) GetUserAccountForRequest(ctx fiber.Ctx, accessKeyStr string) (
 	// fails, and needed whichever path authorizes.
 	store := s.proofs.For(accessKeyID)
 	ctx.Locals(reqscope.ProofStoreKey(), ucanlib.ProofStore(store))
-
-	// A copy names its source in a header the gateway validates in its
-	// controller (bucket-name and object-key rules), which runs after this
-	// hook. Validate it here first so a malformed source reports the
-	// controller's InvalidArgument rather than what Hilt makes of a bucket it
-	// cannot find, keeping the error precedence a request without Hilt has.
-	if err := s.validateCopySource(reqCtx, req); err != nil {
-		return auth.Account{}, err
-	}
 
 	// Local fast path: with a cached verification key and cached delegation
 	// chains covering the request's Forge commands, Hilt is not consulted.
@@ -316,69 +302,6 @@ func mapAuthError(err error) (error, bool) {
 // copySourceHeader names a copy's source object; it is only trusted when the
 // request signature covers it.
 const copySourceHeader = "x-amz-copy-source"
-
-// Part numbers the gateway accepts, mirroring its controller's bounds.
-const (
-	minPartNumber = 1
-	maxPartNumber = 10000
-)
-
-// validateCopySource applies the gateway controller's own validation to an
-// object or part PUT that carries an x-amz-copy-source header, ahead of
-// authorization: the copy-source value (versitygw utils.ValidateCopySource)
-// and, for a part copy, the part number. Hilt resolves the source bucket the
-// header names, so without this a request the controller would reject as
-// InvalidArgument could instead report whatever Hilt makes of a bucket it
-// cannot find. The destination bucket still comes first, as it does in the
-// controller: when it is unknown here the request goes to Hilt unvalidated,
-// so Hilt's answer for the destination (NoSuchBucket) is what the caller
-// sees. Requests of any other shape, or without the header, pass.
-func (s *Service) validateCopySource(ctx context.Context, req s3.Request) error {
-	if !strings.EqualFold(req.Method, http.MethodPut) {
-		return nil
-	}
-	src, ok := headerValue(req.Headers, copySourceHeader)
-	if !ok {
-		return nil
-	}
-	op, _ := hiltauth.OperationFor(req)
-	switch op {
-	case hiltauth.OpPutObject, hiltauth.OpCopyObject, hiltauth.OpUploadPart, hiltauth.OpUploadPartCopy:
-	default:
-		return nil
-	}
-	if s.buckets != nil {
-		if _, err := s.buckets.Get(ctx, bucketFromURL(req.URL)); errors.Is(err, registry.ErrNotFound) {
-			return nil
-		}
-	}
-	if err := utils.ValidateCopySource(strings.TrimPrefix(src, "/")); err != nil {
-		return err
-	}
-	if op == hiltauth.OpUploadPartCopy || op == hiltauth.OpUploadPart {
-		u, err := url.Parse(req.URL)
-		if err != nil {
-			return nil // classification already parsed it; leave the rest to the gateway
-		}
-		raw := u.Query().Get("partNumber")
-		n, err := strconv.Atoi(raw)
-		if err != nil || n < minPartNumber || n > maxPartNumber {
-			return s3err.GetInvalidArgumentErr(s3err.InvalidArgPartNumber, raw)
-		}
-	}
-	return nil
-}
-
-// headerValue returns the named header's value from a request's header map,
-// matched case-insensitively; an empty value counts as absent.
-func headerValue(headers map[string]string, name string) (string, bool) {
-	for k, v := range headers {
-		if strings.EqualFold(k, name) && v != "" {
-			return v, true
-		}
-	}
-	return "", false
-}
 
 // authorizeLocal is the fast path, mirroring Hilt's own verification
 // order over THIS key's proof store. It reports ok=false whenever anything

@@ -15,7 +15,6 @@ import (
 	"github.com/fil-forge/ucantone/ucan"
 	"github.com/fil-forge/ucantone/ucan/container"
 	"github.com/fil-forge/versitygw/auth"
-	"github.com/fil-forge/versitygw/s3err"
 	"github.com/gofiber/fiber/v3"
 	"github.com/stretchr/testify/require"
 
@@ -122,35 +121,6 @@ func TestGetUserAccountForRequest(t *testing.T) {
 		require.Equal(t, "/bucket/key%20name?x-id=GetObject", fake.got.URL)
 		require.Equal(t, "example.com", fake.got.Headers["Host"])
 		require.Equal(t, "20260707T000000Z", fake.got.Headers["X-Amz-Date"])
-	})
-
-	t.Run("a malformed copy source is InvalidArgument before Hilt is asked", func(t *testing.T) {
-		fake := &fakeAuthorizer{res: authorizeOK(t, keyDID, s3.VerificationKey{Kind: s3.KeyKindSigV4, Data: derivedKey})}
-		svc := iam.New(fake, iam.NewKeyProofs(), iam.NewVerificationKeyCache(), iam.NewTenantCache())
-
-		// An IP is not a valid bucket name: the controller would say so, and so
-		// must this hook, rather than Hilt reporting the bucket unknown.
-		req := httptest.NewRequest(http.MethodPut, "http://example.com/bucket/key", nil)
-		req.Header.Set("X-Amz-Copy-Source", "192.168.1.1/foo")
-		_, err := resolveForRequest(t, svc, access, req)
-		var inv s3err.InvalidArgumentError
-		require.ErrorAs(t, err, &inv)
-		require.Empty(t, fake.got.Method, "Hilt must not be consulted for a malformed copy source")
-
-		// A part copy with an out-of-range part number is InvalidArgument here
-		// too: Hilt would otherwise answer for the copy-source bucket first.
-		req = httptest.NewRequest(http.MethodPut, "http://example.com/bucket/key?partNumber=-10&uploadId=abc", nil)
-		req.Header.Set("X-Amz-Copy-Source", "src-bucket/key")
-		_, err = resolveForRequest(t, svc, access, req)
-		require.ErrorAs(t, err, &inv)
-		require.Empty(t, fake.got.Method)
-
-		// A well-formed source goes through to authorization as usual.
-		req = httptest.NewRequest(http.MethodPut, "http://example.com/bucket/key", nil)
-		req.Header.Set("X-Amz-Copy-Source", "/src-bucket/some%20key")
-		_, err = resolveForRequest(t, svc, access, req)
-		require.NoError(t, err)
-		require.Equal(t, http.MethodPut, fake.got.Method)
 	})
 
 	t.Run("stashes the tenant on the request", func(t *testing.T) {

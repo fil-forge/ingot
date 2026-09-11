@@ -75,7 +75,10 @@ rejected** `NotImplemented` (the CEK wrap is space-bound; a rewrap flow is a
 filed follow-up). A copy source in **another tenant's bucket is refused**
 `AccessDenied` before that: hilt refuses the source when it authorizes the
 request, and ingot compares the tenant recorded on the two bucket rows as
-well (a row whose owner predates the record matches none).
+well (a row whose owner predates the record matches none). Because hilt
+resolves the source during authorization, ahead of the gateway's argument
+validation, a malformed copy against a missing or foreign source reports
+hilt's answer (`NoSuchBucket`, `AccessDenied`) rather than `InvalidArgument`.
 Rotation: Hilt replaces `#wrap` in place and archives the
 old key, so a write inside the cache TTL of a rotation still recovers.
 
