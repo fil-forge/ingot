@@ -6,10 +6,16 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"testing"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/smithy-go"
 	"github.com/fil-forge/smelt/pkg/stack"
 	"github.com/filecoin-project/go-fee/cose"
 
@@ -70,6 +76,59 @@ func TestForgeNativeProvision(t *testing.T) {
 		t.Fatalf("envelope recipient kid = %q, want the tenant's active wrap key %q", kid, wantKID)
 	}
 	t.Logf("stored envelope carries the tenant recipient %s", wantKID)
+
+	// 4. A second tenant cannot use the first tenant's bucket as a copy
+	// source. hilt authorizes the copy against the destination only, so ingot
+	// enforces the source side from the tenant recorded on each bucket: the
+	// answer is AccessDenied whether or not the key exists (S3's answer for
+	// another account's bucket), while a bucket that exists nowhere is still
+	// NoSuchBucket. The direct path is hilt's call and reports the foreign
+	// bucket as missing.
+	accessKeyB, secretKeyB := hiltProvisionTenant(t, ctx, s, "native-b")
+	clientB := bigObjectClient(t, ingotEndpoint, accessKeyB, secretKeyB)
+	const bucketB = "native-provision-b"
+	if _, err := clientB.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucketB)}); err != nil {
+		t.Fatalf("tenant B create bucket: %v", err)
+	}
+	copyInto := func(source string) error {
+		_, err := clientB.CopyObject(ctx, &s3.CopyObjectInput{
+			Bucket: aws.String(bucketB), Key: aws.String("copied"), CopySource: aws.String(source),
+		})
+		return err
+	}
+	if code, status := apiErrorOf(t, copyInto(bucket+"/"+key)); code != "AccessDenied" || status != http.StatusForbidden {
+		t.Fatalf("cross-tenant copy of an existing key: %s/%d, want AccessDenied/403", code, status)
+	}
+	if code, status := apiErrorOf(t, copyInto(bucket+"/no-such-key")); code != "AccessDenied" || status != http.StatusForbidden {
+		t.Fatalf("cross-tenant copy of a missing key: %s/%d, want AccessDenied/403 (key existence must not leak)", code, status)
+	}
+	if code, status := apiErrorOf(t, copyInto("native-provision-nowhere/"+key)); code != "NoSuchBucket" || status != http.StatusNotFound {
+		t.Fatalf("copy from a nonexistent bucket: %s/%d, want NoSuchBucket/404", code, status)
+	}
+	if _, err := clientB.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: aws.String(bucket)}); err == nil {
+		t.Fatalf("tenant B could HEAD tenant A's bucket %q", bucket)
+	} else if _, status := apiErrorOf(t, err); status != http.StatusNotFound {
+		t.Fatalf("tenant B HEAD of tenant A's bucket: status %d, want 404 (hilt hides foreign buckets)", status)
+	}
+	t.Logf("cross-tenant copy source refused")
+}
+
+// apiErrorOf returns the S3 error code and HTTP status of an SDK error, or
+// fails the test when err is nil or not an API error.
+func apiErrorOf(t *testing.T, err error) (code string, status int) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("request succeeded, want an S3 error")
+	}
+	var apiErr smithy.APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("not an S3 API error: %v", err)
+	}
+	var respErr *awshttp.ResponseError
+	if !errors.As(err, &respErr) {
+		t.Fatalf("no HTTP response in error: %v", err)
+	}
+	return apiErr.ErrorCode(), respErr.HTTPStatusCode()
 }
 
 // hiltActiveWrapKID reads the active wrap-key fingerprint hilt registered for

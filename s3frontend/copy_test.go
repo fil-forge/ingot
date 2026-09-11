@@ -1,6 +1,7 @@
 package s3frontend
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net/http"
@@ -8,9 +9,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/fil-forge/libforge/testutil"
+	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/versitygw/backend"
 	"github.com/fil-forge/versitygw/s3err"
 	"github.com/fil-forge/versitygw/s3response"
+
+	"github.com/fil-forge/ingot/registry"
 )
 
 // Every failed copy-source precondition is a 412, including the two the
@@ -100,5 +105,70 @@ func TestCopyObject_IfNoneMatchIs412(t *testing.T) {
 	}
 	if _, data, err := getObjV(t, b, dst, ""); err != nil || string(data) != "copy me" {
 		t.Fatalf("copied GET = %q, %v", data, err)
+	}
+}
+
+// A copy source in another tenant's bucket is AccessDenied before any key
+// lookup, so neither the bucket's contents nor the key's existence leaks; a
+// nonexistent source bucket stays NoSuchBucket, and a same-tenant source
+// reaches the (still unimplemented) cross-space path.
+func TestCopyObject_ForeignTenantSourceIsAccessDenied(t *testing.T) {
+	b, mem, _ := newRefTestBackend(t)
+	ctx := context.Background()
+	tenantA, tenantB := testutil.RandomDID(t), testutil.RandomDID(t)
+	for name, tenant := range map[string]did.DID{"a": tenantA, "a2": tenantA, "b": tenantB} {
+		if err := mem.Create(ctx, name, testutil.RandomDID(t), registry.CreateState{Tenant: tenant}); err != nil {
+			t.Fatalf("create %s: %v", name, err)
+		}
+	}
+	srcBucket, srcKey := "a", "obj"
+	if _, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &srcBucket, Key: &srcKey, Body: bytes.NewReader([]byte("secret"))}); err != nil {
+		t.Fatalf("put source: %v", err)
+	}
+
+	copyFrom := func(dst, source string) error {
+		key := "copied"
+		_, err := b.CopyObject(ctx, s3response.CopyObjectInput{Bucket: &dst, Key: &key, CopySource: &source})
+		return err
+	}
+	if err := copyFrom("b", "a/obj"); apiErrCode(t, err) != "AccessDenied" {
+		t.Fatalf("foreign source with existing key: %v, want AccessDenied", err)
+	}
+	if err := copyFrom("b", "a/no-such-key"); apiErrCode(t, err) != "AccessDenied" {
+		t.Fatalf("foreign source with missing key: %v, want AccessDenied (not NoSuchKey)", err)
+	}
+	if err := copyFrom("b", "no-such-bucket/obj"); apiErrCode(t, err) != "NoSuchBucket" {
+		t.Fatalf("nonexistent source bucket: %v, want NoSuchBucket", err)
+	}
+	if err := copyFrom("a2", "a/obj"); apiErrCode(t, err) != "NotImplemented" {
+		t.Fatalf("same-tenant cross-space source: %v, want NotImplemented", err)
+	}
+}
+
+// Buckets whose owner was never recorded carry the same sentinel tenant, which
+// must not make them look like one tenant's: a copy between two such buckets
+// is refused, while a copy within one of them still proceeds.
+func TestCopyObject_UnknownTenantSourceIsAccessDenied(t *testing.T) {
+	b, mem, _ := newRefTestBackend(t)
+	ctx := context.Background()
+	for _, name := range []string{"legacy1", "legacy2"} {
+		if err := mem.Create(ctx, name, testutil.RandomDID(t), registry.CreateState{Tenant: registry.UnknownTenant}); err != nil {
+			t.Fatalf("create %s: %v", name, err)
+		}
+	}
+	srcBucket, srcKey := "legacy1", "obj"
+	if _, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &srcBucket, Key: &srcKey, Body: bytes.NewReader([]byte("legacy"))}); err != nil {
+		t.Fatalf("put source: %v", err)
+	}
+	copyFrom := func(dst, source string) error {
+		key := "copied"
+		_, err := b.CopyObject(ctx, s3response.CopyObjectInput{Bucket: &dst, Key: &key, CopySource: &source})
+		return err
+	}
+	if err := copyFrom("legacy2", "legacy1/obj"); apiErrCode(t, err) != "AccessDenied" {
+		t.Fatalf("copy between two unknown-tenant buckets: %v, want AccessDenied", err)
+	}
+	if err := copyFrom("legacy1", "legacy1/obj"); err != nil {
+		t.Fatalf("copy within an unknown-tenant bucket: %v", err)
 	}
 }

@@ -60,12 +60,14 @@ func TestPostgresStores_Live(t *testing.T) {
 
 	r := registry.NewPostgres(pool)
 	// seedBucket inserts a bucket row directly, bypassing Create, and returns
-	// the space DID it generated. space has no default — Create always supplies
-	// the DID Hilt returns — so the seed supplies one too.
+	// the space DID it generated. space and tenant have no default — Create
+	// always supplies the DIDs Hilt returns — so the seed supplies them too,
+	// with the tenant sentinel a pre-column row would carry.
 	seedBucket := func(t *testing.T, name string) did.DID {
 		t.Helper()
 		space := testutil.RandomDID(t)
-		if _, err := pool.Exec(ctx, `INSERT INTO ingot.buckets (name, space) VALUES ($1, $2)`, name, space.String()); err != nil {
+		if _, err := pool.Exec(ctx, `INSERT INTO ingot.buckets (name, space, tenant) VALUES ($1, $2, $3)`,
+			name, space.String(), registry.UnknownTenant.String()); err != nil {
 			t.Fatalf("seed bucket %q: %v", name, err)
 		}
 		return space
@@ -80,6 +82,33 @@ func TestPostgresStores_Live(t *testing.T) {
 		}
 		if st.Space != space {
 			t.Fatalf("space = %q, want %q", st.Space, space)
+		}
+		// The backfill sentinel reads back as the constant, no special case.
+		if st.Tenant != registry.UnknownTenant {
+			t.Fatalf("tenant = %q, want the sentinel %q", st.Tenant, registry.UnknownTenant)
+		}
+	})
+
+	t.Run("bucket tenant round trips", func(t *testing.T) {
+		tenant := testutil.RandomDID(t)
+		if err := r.Create(ctx, "owned", testutil.RandomDID(t), registry.CreateState{Tenant: tenant}); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		st, err := r.Get(ctx, "owned")
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		if st.Tenant != tenant {
+			t.Fatalf("tenant = %q, want %q", st.Tenant, tenant)
+		}
+	})
+
+	t.Run("create rejects an undefined tenant", func(t *testing.T) {
+		if err := r.Create(ctx, "tenantless", testutil.RandomDID(t), registry.CreateState{}); err == nil {
+			t.Fatal("Create without a tenant succeeded; the row would be unreadable")
+		}
+		if _, err := r.Get(ctx, "tenantless"); !errors.Is(err, registry.ErrNotFound) {
+			t.Fatalf("Get after rejected Create = %v, want ErrNotFound (no row written)", err)
 		}
 	})
 
