@@ -311,6 +311,51 @@ func TestPermissionCapture(t *testing.T) {
 	})
 }
 
+// TestPrincipalBinding covers the index a firehose principal event resolves
+// against: an authorize result that names a principal binds the key's store
+// to the (tenant, principal) pair, and one that names none (a service key)
+// binds nothing.
+func TestPrincipalBinding(t *testing.T) {
+	access, keyDID := newAccessKey(t)
+	sigv4 := s3.VerificationKey{Kind: s3.KeyKindSigV4, Data: []byte("dk")}
+	ada := iam.PrincipalRef{Tenant: testTenant, Principal: "ada"}
+
+	t.Run("a principal-bound key is indexed under its pair", func(t *testing.T) {
+		res := authorizeOK(t, keyDID, sigv4)
+		principal := ada.Principal
+		res.Principal = &principal
+		proofs := iam.NewKeyProofs()
+		svc := iam.New(&fakeAuthorizer{res: res}, proofs, iam.NewVerificationKeyCache(), iam.NewTenantCache())
+
+		_, err := resolveForRequest(t, svc, access,
+			httptest.NewRequest(http.MethodGet, "http://example.com/bkt/key", nil))
+		require.NoError(t, err)
+		_, known := proofs.For(keyDID).Permits(*res.Bucket, "s3:GetObject")
+		require.True(t, known, "the authorize answer is cached in the key's store")
+
+		require.Equal(t, []did.DID{keyDID}, proofs.InvalidatePrincipal(ada),
+			"invalidating the pair must find the key")
+		_, known = proofs.For(keyDID).Permits(*res.Bucket, "s3:GetObject")
+		require.False(t, known, "the key's store must be dropped with the binding")
+	})
+
+	t.Run("a service key binds nothing", func(t *testing.T) {
+		res := authorizeOK(t, keyDID, sigv4)
+		require.Nil(t, res.Principal)
+		proofs := iam.NewKeyProofs()
+		svc := iam.New(&fakeAuthorizer{res: res}, proofs, iam.NewVerificationKeyCache(), iam.NewTenantCache())
+
+		_, err := resolveForRequest(t, svc, access,
+			httptest.NewRequest(http.MethodGet, "http://example.com/bkt/key", nil))
+		require.NoError(t, err)
+
+		require.Empty(t, proofs.InvalidatePrincipal(ada))
+		require.Empty(t, proofs.InvalidatePrincipal(iam.PrincipalRef{Tenant: testTenant}))
+		_, known := proofs.For(keyDID).Permits(*res.Bucket, "s3:GetObject")
+		require.True(t, known, "an unbound key's store is untouched by principal invalidations")
+	})
+}
+
 // TestBaseIAMServiceParity pins the non-request IAMService surface to
 // IAMServiceSingle's behavior: account management belongs to Hilt.
 func TestBaseIAMServiceParity(t *testing.T) {

@@ -19,7 +19,9 @@
 // response carries access-key→ingot re-delegations (≤24h TTL); their
 // bucket→tenant→access-key remainder comes from /s3/bucket/info, which the
 // service fetches once (into the same per-key store) when a leaf's chain
-// doesn't yet reach the root.
+// doesn't yet reach the root. Each store is also indexed by the (tenant,
+// principal) pair Hilt names for the key, so a principal invalidation from
+// the firehose can drop every store the principal's keys hold.
 //
 // Every request stashes its key's store on the request context
 // ([reqscope.ProofStoreKey]) so an onward Forge retrieval — which sees only ctx +
@@ -221,6 +223,15 @@ func (s *Service) GetUserAccountForRequest(ctx fiber.Ctx, accessKeyStr string) (
 	// best-effort: the request IS authorized; a gap here only affects onward
 	// Forge invocations, which will surface it as missing retrieval authority.
 	s.cacheProofs(reqCtx, store, ctr, req, accessKeyID)
+
+	// Index the key's store under the principal Hilt named, so a principal
+	// invalidation from the firehose (a policy change, a removed member) can
+	// find and drop it. A service key carries its own permissions and
+	// buckets and names no principal; its store is never indexed and only
+	// ages out.
+	if ok.Principal != nil {
+		s.proofs.Bind(accessKeyID, PrincipalRef{Tenant: ok.Tenant, Principal: *ok.Principal})
+	}
 
 	// Cache the verification keys until Hilt's own expiry horizon: SigV4
 	// derived keys die at the next UTC midnight (credential-scope date

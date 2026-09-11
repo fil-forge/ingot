@@ -695,6 +695,11 @@ flowchart TB
   re-capture it.
 - Each access key gets its own `DelegationCache`, so a proof chain can never
   assemble across keys.
+- Each authorize result names the key's principal, and `KeyProofs` indexes
+  the store under that (tenant, principal) pair, so a principal invalidation
+  from the firehose drops every store the principal's keys hold. A service
+  key carries its own permissions and buckets and names no principal; its
+  store is never indexed and only ages out.
 - The same store holds the effective S3 action set hilt reported for the key
   on each bucket, expiring with the keys and the tenant (next UTC midnight
   plus clock skew). One invalidation therefore drops the chains and the set
