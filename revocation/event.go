@@ -34,3 +34,21 @@ type Event struct {
 // than a revocation. A principal is always named, so a non-empty Principal
 // is the discriminator.
 func (e Event) IsPrincipal() bool { return e.Principal != "" }
+
+// MalformedRecordError is the stream error a Source yields for a firehose
+// record it cannot map to an Event. It carries the record's position so the
+// consumer can skip it and move its cursor past it: a record that cannot be
+// applied must not stall the stream, or every later record is lost until
+// the process restarts. RecordedAt is zero and Cause undefined when the
+// record carried neither.
+type MalformedRecordError struct {
+	RecordedAt time.Time
+	Cause      cid.Cid
+	Err        error
+}
+
+func (e *MalformedRecordError) Error() string {
+	return "revocation: malformed firehose record: " + e.Err.Error()
+}
+
+func (e *MalformedRecordError) Unwrap() error { return e.Err }

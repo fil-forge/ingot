@@ -2,6 +2,7 @@ package revocation_test
 
 import (
 	"context"
+	"errors"
 	"iter"
 	"sync"
 	"testing"
@@ -53,6 +54,10 @@ func principalRecord(t *testing.T, principal string, at time.Time) revocation.Ev
 type streamScript struct {
 	records []revocation.Event
 	err     error
+	// midErr, when set, is yielded just before records[midIndex]; err still
+	// ends the script.
+	midErr   error
+	midIndex int
 }
 
 // fakeSource plays one streamScript per Stream call, recording the since
@@ -78,7 +83,12 @@ func (f *fakeSource) Stream(ctx context.Context, since time.Time) iter.Seq2[revo
 			<-ctx.Done()
 			return
 		}
-		for _, rec := range script.records {
+		for i, rec := range script.records {
+			if script.midErr != nil && i == script.midIndex {
+				if !yield(revocation.Event{}, script.midErr) {
+					return
+				}
+			}
 			if !yield(rec, nil) {
 				return
 			}
@@ -243,6 +253,43 @@ func TestConsumerInvalidatesPrincipalAndPersistsCursor(t *testing.T) {
 	cur, err := store.GetRevocationCursor(ctx)
 	require.NoError(t, err)
 	require.False(t, cur.Revoke.Defined(), "a principal event revokes nothing, so the cursor holds no CID")
+}
+
+func TestConsumerSkipsMalformedRecordAndAdvances(t *testing.T) {
+	ctx := context.Background()
+	t0 := time.Date(2026, 8, 6, 12, 0, 0, 0, time.UTC)
+	first := record(t, "first", t0)
+	badAt := t0.Add(time.Second)
+	badCause := testCid(t, "bad-cause")
+	after := record(t, "after", t0.Add(2*time.Second))
+
+	store := inmem.NewMemStore()
+	inv := &fakeInvalidator{}
+	// A malformed record between two good ones: the consumer must apply
+	// both good records over one connection, never reconnect because of
+	// the bad one, and leave the cursor past it.
+	src := &fakeSource{scripts: []streamScript{{
+		records:  []revocation.Event{first, after},
+		midErr:   &revocation.MalformedRecordError{RecordedAt: badAt, Cause: badCause, Err: errors.New("no principal")},
+		midIndex: 1,
+	}}}
+	c := revocation.NewConsumer(src, store, inv,
+		revocation.WithBackoff(time.Millisecond, time.Millisecond))
+	stop := run(c)
+	defer stop()
+
+	waitFor(t, func() bool { return len(inv.revocations()) == 2 })
+	require.Equal(t, []cid.Cid{first.Revoke, after.Revoke}, inv.revocations())
+	waitFor(t, func() bool {
+		cur, err := store.GetRevocationCursor(ctx)
+		return err == nil && cur.RecordedAt.Equal(after.RecordedAt)
+	})
+	// The good record after the malformed one arrived on the same
+	// connection (the fake plays one script per connection), and when the
+	// script ends the reconnect resumes past both, never at the malformed
+	// record's time.
+	waitFor(t, func() bool { return len(src.calls()) == 2 })
+	require.True(t, src.calls()[1].Equal(after.RecordedAt), "reconnect resumes from the last good record")
 }
 
 func TestConsumerPreservesInterleavedOrder(t *testing.T) {
