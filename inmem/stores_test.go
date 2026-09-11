@@ -454,6 +454,19 @@ func TestRevocationCursor_UpsertRoundTrip(t *testing.T) {
 	if !got.RecordedAt.Equal(second.RecordedAt) || !got.Revoke.Equals(second.Revoke) {
 		t.Fatalf("cursor after upsert = %+v, want %+v", got, second)
 	}
+	// A principal invalidation revokes nothing, so the cursor it advances
+	// carries the undefined CID and must read back undefined.
+	third := registry.RevocationCursor{RecordedAt: second.RecordedAt.Add(time.Hour)}
+	if err := m.PutRevocationCursor(ctx, third); err != nil {
+		t.Fatalf("PutRevocationCursor (undefined revoke): %v", err)
+	}
+	got, err = m.GetRevocationCursor(ctx)
+	if err != nil {
+		t.Fatalf("GetRevocationCursor after undefined revoke: %v", err)
+	}
+	if !got.RecordedAt.Equal(third.RecordedAt) || got.Revoke.Defined() {
+		t.Fatalf("cursor after undefined revoke = %+v, want %+v", got, third)
+	}
 }
 
 // helpers

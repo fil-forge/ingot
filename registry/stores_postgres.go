@@ -721,6 +721,12 @@ func (r *Postgres) GetRevocationCursor(ctx context.Context) (*RevocationCursor, 
 	if err != nil {
 		return nil, fmt.Errorf("registry: get revocation cursor: %w", err)
 	}
+	// A record that revoked nothing stored empty bytes (the column is NOT
+	// NULL); it reads back as the undefined CID rather than a cast failure.
+	if len(revoke) == 0 {
+		cur.Revoke = cid.Undef
+		return &cur, nil
+	}
 	if cur.Revoke, err = cid.Cast(revoke); err != nil {
 		return nil, fmt.Errorf("registry: get revocation cursor: decode revoke cid: %w", err)
 	}
@@ -728,6 +734,13 @@ func (r *Postgres) GetRevocationCursor(ctx context.Context) (*RevocationCursor, 
 }
 
 func (r *Postgres) PutRevocationCursor(ctx context.Context, cur RevocationCursor) error {
+	// A cursor advanced past a record that revoked nothing carries the
+	// undefined CID; the column is NOT NULL bytea, so it stores as empty
+	// bytes (never nil, which would be NULL).
+	revoke := []byte{}
+	if cur.Revoke.Defined() {
+		revoke = cur.Revoke.Bytes()
+	}
 	_, err := r.pool.Exec(ctx,
 		`INSERT INTO ingot.revocation_cursor (id, recorded_at, revoke)
 		 VALUES (true, $1, $2)
@@ -735,7 +748,7 @@ func (r *Postgres) PutRevocationCursor(ctx context.Context, cur RevocationCursor
 		   SET recorded_at = EXCLUDED.recorded_at,
 		       revoke      = EXCLUDED.revoke,
 		       updated_at  = now()`,
-		cur.RecordedAt, cur.Revoke.Bytes())
+		cur.RecordedAt, revoke)
 	if err != nil {
 		return fmt.Errorf("registry: put revocation cursor: %w", err)
 	}
