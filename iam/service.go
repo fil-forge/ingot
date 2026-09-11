@@ -285,13 +285,23 @@ func mapAuthError(err error) (error, bool) {
 		hiltauth.IssuerForbiddenErrorName,
 		hiltauth.RegionNotServedErrorName,
 		hiltauth.OperationNotPermittedErrorName,
-		hiltauth.BucketNotPermittedErrorName:
+		hiltauth.BucketNotPermittedErrorName,
+		// Another tenant's bucket is AccessDenied, as S3 answers for another
+		// account's bucket: bucket names are global, so existence is no secret.
+		hiltauth.ForeignBucketErrorName,
+		// A copy whose source header the signature does not cover cannot be
+		// authorized; the SDKs always sign it.
+		hiltauth.UnsignedCopySourceErrorName:
 		return s3err.GetAPIError(s3err.ErrAccessDenied), true
 	default:
 		// Named, but not a Hilt auth rejection we know — not ours to map.
 		return nil, false
 	}
 }
+
+// copySourceHeader names a copy's source object; it is only trusted when the
+// request signature covers it.
+const copySourceHeader = "x-amz-copy-source"
 
 // authorizeLocal is the fast path, mirroring Hilt's own verification
 // order over THIS key's proof store. It reports ok=false whenever anything
@@ -322,32 +332,40 @@ func (s *Service) authorizeLocal(ctx context.Context, req s3.Request, access str
 		return auth.Account{}, false
 	}
 
-	// 3. The S3 action must map to Forge commands. Bucket-level operations
-	// (create/delete/list-buckets) map to none — they go to Hilt regardless.
-	op, err := hiltauth.OperationFor(req)
-	if err != nil {
+	// 3. Every bucket the request acts on, with the permission it needs there:
+	// the addressed bucket, plus the copy source for CopyObject and
+	// UploadPartCopy. Operations on no existing bucket (create/delete/
+	// list-buckets) yield none — they go to Hilt regardless. A copy's source
+	// is named by a header, which the signature covers only when listed in
+	// SignedHeaders; Hilt refuses an unsigned one, and so does the fast path.
+	op, reqs, err := hiltauth.RequirementsFor(req)
+	if err != nil || len(reqs) == 0 {
 		return auth.Account{}, false
 	}
-	cmds := s3perm.CommandsFor(op.Permission())
-	if len(cmds) == 0 {
-		return auth.Account{}, false
-	}
-
-	// 4. The delegation subject is the bucket's space.
-	st, err := s.buckets.Get(ctx, bucketFromURL(req.URL))
-	if err != nil || !st.Space.Defined() {
+	if op.CopiesSource() && !sr.HeaderSigned(copySourceHeader) {
 		return auth.Account{}, false
 	}
 
-	// 5. Every command must be covered by a chain to this instance's agent
-	// in THIS key's store. Because the store holds only keyDID's delegations,
-	// a resolving agent chain is necessarily space→…→keyDID→agent — it
-	// carries both keyDID's own grant (Hilt's permission + bucket scoping)
-	// and the onward re-delegation. Cross-key mixing is structurally
-	// impossible, so one probe suffices.
-	for _, cmd := range cmds {
-		if chain, _, err := store.ProofChain(ctx, s.agent, cmd, st.Space); err != nil || len(chain) == 0 {
+	// 4. For each bucket, the delegation subject is its space, and every
+	// command the permission maps to must be covered by a chain to this
+	// instance's agent in THIS key's store. Because the store holds only
+	// keyDID's delegations, a resolving agent chain is necessarily
+	// space→…→keyDID→agent — it carries both keyDID's own grant (Hilt's
+	// permission + bucket scoping) and the onward re-delegation. Cross-key
+	// mixing is structurally impossible, so one probe per command suffices.
+	for _, r := range reqs {
+		cmds := s3perm.CommandsFor(r.Permission)
+		if len(cmds) == 0 {
 			return auth.Account{}, false
+		}
+		st, err := s.buckets.Get(ctx, r.Bucket)
+		if err != nil || !st.Space.Defined() {
+			return auth.Account{}, false
+		}
+		for _, cmd := range cmds {
+			if chain, _, err := store.ProofChain(ctx, s.agent, cmd, st.Space); err != nil || len(chain) == 0 {
+				return auth.Account{}, false
+			}
 		}
 	}
 
