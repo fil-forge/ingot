@@ -659,7 +659,7 @@ flowchart TB
     hilt["hilt did:web:hilt"] -->|"/s3/request/authorize and<br/>/s3/bucket/info responses"| kp
 
     subgraph stores["proof stores"]
-        kp["iam.KeyProofs: one DelegationCache<br/>per access key, 24h idle eviction"]
+        kp["iam.KeyProofs: one DelegationCache<br/>per access key, 24h idle eviction;<br/>also the key's effective S3 action set per bucket"]
         ship["uploader.Forge shipProofs:<br/>per-space store, 1h TTL"]
         static["AuthServiceProofs:<br/>static container from config"]
         tok["tokenstore (tokens.cbor):<br/>empty; dormant login paths only"]
@@ -684,6 +684,13 @@ flowchart TB
   re-capture it.
 - Each access key gets its own `DelegationCache`, so a proof chain can never
   assemble across keys.
+- The same store holds the effective S3 action set hilt reported for the key
+  on each bucket, expiring with the keys and the tenant (next UTC midnight
+  plus clock skew). One invalidation therefore drops the chains and the set
+  together. The set is what the fast path enforces: several S3 actions map to
+  the same Forge commands, and `s3:PutObject`'s commands are a superset of
+  `s3:GetObject`'s, `s3:ListBucket`'s and `s3:AbortMultipartUpload`'s, so a
+  chain probe alone would let a put-only key read and abort on the bucket.
 
 Cross-references: [`architecture.md` §9](./architecture.md#9-the-system-contract-piri--sprue--indexer).
 
@@ -717,11 +724,15 @@ sequenceDiagram
         G->>I: GetUserAccountForRequest
         I->>I: access key ID parsed as a did:key
         alt local fast path (authorizeLocal)
-            I->>K: cached derived key verifies SigV4,<br/>every command chains to the agent
+            I->>K: cached derived key verifies SigV4,<br/>cached action set permits the action,<br/>every command chains to the agent
+            break action outside the cached set
+                I-->>G: AccessDenied, hilt not consulted
+                G-->>C: 403
+            end
         else hilt authorize
             I->>H: /s3/request/authorize (the signed request)
-            H-->>I: account, derived SigV4 key, fresh delegations
-            I->>K: cacheProofs (re-delegations)
+            H-->>I: account, derived SigV4 key,<br/>effective action set, fresh delegations
+            I->>K: cacheProofs (re-delegations)<br/>+ the action set, keyed by the bucket hilt named
             opt chain incomplete
                 I->>H: /s3/bucket/info
                 I->>K: cache the bucket chain
@@ -735,14 +746,21 @@ sequenceDiagram
 
 - `RoleAdmin` is deliberate: authorization already happened (at hilt or the
   fast path), so versitygw's role and ACL layers must defer entirely.
+- The fast path has three outcomes, not two: authorized, refused, or
+  undecided. It refuses only on a cached action set that excludes the
+  action — hilt's own answer for that key and bucket, so re-asking would
+  repeat it. Everything else undecided (no cached set, an expired one, an
+  operation that maps to no Forge command) goes to hilt, whose response
+  refills the caches.
 - Authorize failures map to S3 errors in `mapAuthError`; unrecognized errors
   stay 500-class on purpose.
 - The signing key never leaves hilt as a secret: ingot receives a derived
   SigV4 key per request (the versitygw fork's `auth.Account.SigningKey`).
 
 Sources: `iam/service.go` (GetUserAccountForRequest, authorizeLocal,
-cacheProofs, mapAuthError), `server.go` (buildS3API middleware). Review when
-`iam/` or the hilt client changes.
+cacheProofs, mapAuthError), `iam/proofcache.go` (PutPermissions, Permits),
+`server.go` (buildS3API middleware). Review when `iam/` or the hilt client
+changes.
 
 ## Postgres schema as migrated
 
