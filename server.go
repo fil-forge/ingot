@@ -14,7 +14,6 @@ import (
 	"github.com/fil-forge/versitygw/auth"
 	"github.com/fil-forge/versitygw/metrics"
 	"github.com/fil-forge/versitygw/s3api"
-	"github.com/fil-forge/versitygw/s3api/middlewares"
 	"github.com/fil-forge/versitygw/s3event"
 	"github.com/fil-forge/versitygw/s3log"
 	"github.com/gofiber/fiber/v3"
@@ -492,9 +491,9 @@ func buildS3API(ctx context.Context, backend *s3frontend.Backend, cfg config.Ser
 	}
 	opts = append(opts, s3api.WithRoute(http.MethodGet, web.WellKnownDIDPath, didDocumentHandler(doc)))
 
+	// No s3api.WithRootUser: the gateway has no root account, so every access
+	// key resolves through iam.
 	api, err := s3api.New(backend,
-		// Zero value: root disabled. Every access key resolves through iam.
-		middlewares.RootUserConfig{},
 		cfg.Region, iam, loggers.S3Logger, loggers.AdminLogger, evSender, mm,
 		opts...,
 	)
