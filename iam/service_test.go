@@ -137,6 +137,14 @@ func TestGetUserAccountForRequest(t *testing.T) {
 		require.ErrorAs(t, err, &inv)
 		require.Empty(t, fake.got.Method, "Hilt must not be consulted for a malformed copy source")
 
+		// A part copy with an out-of-range part number is InvalidArgument here
+		// too: Hilt would otherwise answer for the copy-source bucket first.
+		req = httptest.NewRequest(http.MethodPut, "http://example.com/bucket/key?partNumber=-10&uploadId=abc", nil)
+		req.Header.Set("X-Amz-Copy-Source", "src-bucket/key")
+		_, err = resolveForRequest(t, svc, access, req)
+		require.ErrorAs(t, err, &inv)
+		require.Empty(t, fake.got.Method)
+
 		// A well-formed source goes through to authorization as usual.
 		req = httptest.NewRequest(http.MethodPut, "http://example.com/bucket/key", nil)
 		req.Header.Set("X-Amz-Copy-Source", "/src-bucket/some%20key")

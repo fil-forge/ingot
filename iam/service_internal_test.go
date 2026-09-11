@@ -475,3 +475,23 @@ func TestFastPathTenant(t *testing.T) {
 		require.Equal(t, 1, s.authorizer.(*refusingAuthorizer).calls)
 	})
 }
+
+// TestValidateCopySource_DestinationFirst: the pre-authorization copy checks
+// yield to Hilt when the destination bucket is unknown, so a request the
+// controller would reject as InvalidArgument still reports NoSuchBucket for a
+// missing destination, as it does without the checks.
+func TestValidateCopySource_DestinationFirst(t *testing.T) {
+	agent, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	s := localService(agent.DID(), fixedResolver{name: "bkt", state: &registry.State{Name: "bkt"}})
+	malformed := s3.Request{
+		Method:  http.MethodPut,
+		URL:     "/nope/key?partNumber=-10&uploadId=abc",
+		Headers: map[string]string{"X-Amz-Copy-Source": "Copy-Source"},
+	}
+	require.NoError(t, s.validateCopySource(context.Background(), malformed), "unknown destination: leave the answer to Hilt")
+
+	malformed.URL = "/bkt/key?partNumber=-10&uploadId=abc"
+	var inv s3err.InvalidArgumentError
+	require.ErrorAs(t, s.validateCopySource(context.Background(), malformed), &inv, "known destination: the gateway's validation applies")
+}
