@@ -31,11 +31,22 @@ import (
 // expiring and the janitor sweeping it, the index may still reference it —
 // lookups re-check liveness against the expiry-aware cache, so the janitor
 // only bounds memory, never correctness.
+// It also holds the effective S3 action set Hilt reported for this access
+// key, per bucket (see [DelegationCache.PutPermissions] and
+// [DelegationCache.Permits]). The set lives here because a chain probe alone
+// cannot enforce a policy: several S3 actions map to the same Forge
+// commands — s3:GetObject and s3:ListBucket both need /content/retrieve, and
+// s3:PutObject's commands are a superset of s3:AbortMultipartUpload's — so a
+// key granted one action would otherwise satisfy the probe for the others.
+// Holding the set in the same per-key store means an invalidation drops the
+// chains and the set together.
 type DelegationCache struct {
 	data *gocache.Cache
 
 	mu    sync.RWMutex
 	index map[indexKey]map[string]ucan.Delegation // → CID string → delegation
+
+	perms *gocache.Cache // bucket DID string → map[string]struct{} of S3 actions
 }
 
 // indexKey is the exact-match probe the delegation matcher uses. Powerline
@@ -60,6 +71,7 @@ func NewDelegationCache() *DelegationCache {
 	d := &DelegationCache{
 		data:  gocache.New(gocache.NoExpiration, cacheJanitorInterval),
 		index: map[indexKey]map[string]ucan.Delegation{},
+		perms: gocache.New(gocache.NoExpiration, cacheJanitorInterval),
 	}
 	d.data.OnEvicted(d.removeFromIndex)
 	return d
@@ -168,4 +180,47 @@ func (d *DelegationCache) listDelegations(_ context.Context, aud did.DID, cmd uc
 			}
 		}
 	}
+}
+
+// PutPermissions caches the effective S3 action set Hilt reported for an
+// access key on one bucket, keyed by the bucket's DID and expiring after
+// ttl. A nil actions slice means Hilt reported no set at all and nothing is
+// cached, so [DelegationCache.Permits] keeps reporting the bucket unknown
+// and requests for it keep going to Hilt. An empty but non-nil slice is a
+// real answer — the key may do nothing on this bucket — and is cached as
+// such, denying every action.
+//
+// The set lives in the same per-access-key store as the chains, so
+// [KeyProofs.InvalidateHolders] drops both together and a stale set can
+// never outlive the proofs it was issued with.
+func (d *DelegationCache) PutPermissions(bucket did.DID, ttl time.Duration, actions []string) {
+	if ttl <= 0 || !bucket.Defined() || actions == nil {
+		return
+	}
+	set := make(map[string]struct{}, len(actions))
+	for _, a := range actions {
+		set[a] = struct{}{}
+	}
+	d.perms.Set(bucket.String(), set, ttl)
+}
+
+// Permits reports whether the cached action set for bucket contains action.
+// known is false when no live set is cached for that bucket — the caller
+// must then ask Hilt rather than decide locally. Because the set is keyed by
+// the bucket DID Hilt named, a bucket whose local registry space disagrees
+// with Hilt's answer simply reports unknown and takes the Hilt path.
+func (d *DelegationCache) Permits(bucket did.DID, action string) (allowed, known bool) {
+	if !bucket.Defined() {
+		return false, false
+	}
+	v, ok := d.perms.Get(bucket.String())
+	if !ok {
+		return false, false
+	}
+	set, ok := v.(map[string]struct{})
+	if !ok {
+		return false, false
+	}
+	_, allowed = set[action]
+	return allowed, true
 }
