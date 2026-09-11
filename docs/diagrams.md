@@ -59,7 +59,7 @@ flowchart LR
     ingot -->|"/blob/add, /ucan/conclude, GET /receipt/:task<br/>/blob/abort, /blob/remove, /index/add"| sprue
     ingot -->|"HTTP PUT blob bytes (allocated URL)"| piri
     ingot -->|"content/retrieve (UCAN, on read miss)"| piri
-    ingot -->|"GET /revocations/{since} (SSE revocation firehose)"| swarf
+    ingot -->|"GET /revocations/{since} (SSE firehose:<br/>revocations + principal invalidations)"| swarf
     ingot -->|"pgx + goose migrations"| pg
     ingot -.->|"QueryClaims: designed, unwired;<br/>LocalLocator serves reads"| idx
     sprue -->|"/blob/allocate, /blob/accept<br/>/blob/release, /blob/reject"| piri
@@ -80,10 +80,10 @@ flowchart LR
   ingot subscribes and never publishes. Hilt publishes to swarf, so a change
   hilt commits reaches ingot's caches over that path. Without the edge, cache
   entries only age out on their TTLs.
-- The consumer already dispatches principal invalidations alongside
-  revocations; the swarf client in this tree streams revocations only, so
-  `revocation/swarf.go` yields that one kind until the client exposes the
-  other.
+- The firehose carries two event kinds, `revocation` and `principal`.
+  `revocation/swarf.go` maps each to an ingot `Event` by which record the
+  client set, and yields an event carrying neither as a stream error so the
+  consumer reconnects instead of applying an empty revocation.
 
 Cross-references: [`architecture.md` §9](./architecture.md#9-the-system-contract-piri--sprue--indexer)
 (the system contract), [§12](./architecture.md#12-implementation-status--postponed-items)

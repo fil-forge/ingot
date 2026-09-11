@@ -133,13 +133,27 @@ func (c *Consumer) Run(ctx context.Context) {
 	bo.MaxInterval = c.maxBackoff
 	for {
 		for ev, err := range c.src.Stream(ctx, since) {
-			if err != nil {
+			var malformed *MalformedRecordError
+			if errors.As(err, &malformed) {
+				// The connection is fine; one record cannot be applied.
+				// Skip it and move the cursor past it, or the reconnect
+				// would replay it forever and every later record would
+				// be lost for the process lifetime.
+				c.logger.Warn("revocation: skipping malformed record", zap.Error(err),
+					zap.Time("recorded_at", malformed.RecordedAt))
+				if malformed.RecordedAt.IsZero() || !malformed.Cause.Defined() {
+					continue
+				}
+				bo.Reset()
+				ev = Event{RecordedAt: malformed.RecordedAt, Cause: malformed.Cause}
+			} else if err != nil {
 				c.logger.Warn("revocation: stream error", zap.Error(err))
 				break
+			} else {
+				// A live stream means the endpoint is healthy — reset backoff.
+				bo.Reset()
+				c.apply(ev)
 			}
-			// A live stream means the endpoint is healthy — reset backoff.
-			bo.Reset()
-			c.apply(ev)
 			since = ev.RecordedAt
 			if !ev.Cause.Defined() {
 				// Every firehose record names the invocation that caused
