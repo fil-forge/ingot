@@ -23,11 +23,6 @@ type ServerConfig struct {
 	// "us-east-1".
 	Region string
 
-	// RootAccess / RootSecret configure the single-account IAM root
-	// user for the embedded S3 listener. Both required.
-	RootAccess string
-	RootSecret string
-
 	// MaxBlobSize is the blob ceiling for new objects, in bytes.
 	// 0 → bucket.DefaultMaxBlobSize.
 	MaxBlobSize int64

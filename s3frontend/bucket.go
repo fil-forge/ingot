@@ -66,8 +66,9 @@ func (b *Backend) ListBuckets(ctx context.Context, input s3response.ListBucketsI
 // BackendUnsupported default (ErrNotImplemented) propagates as
 // "header you provided implies functionality that is not implemented"
 // for *every* PUT/GET/DELETE. Returning empty bytes for a known
-// bucket lets ParseACL produce ACL{}, after which the middleware
-// substitutes the configured root access key as the owner.
+// bucket lets ParseACL produce ACL{} with an empty owner (no root
+// account is configured to substitute), so the ACL layer has nothing to
+// deny on and hilt's per-request authorization stands alone.
 func (b *Backend) GetBucketAcl(ctx context.Context, input *s3.GetBucketAclInput) ([]byte, error) {
 	if input.Bucket == nil {
 		return nil, s3err.GetAPIError(s3err.ErrInvalidBucketName)
@@ -154,11 +155,11 @@ func (b *Backend) PutObjectLockConfiguration(ctx context.Context, bucket string,
 	return nil
 }
 
-// GetBucketPolicy is called from auth.VerifyAccess (access-control.go:103)
-// for non-root requests and from auth.VerifyPublicAccess for anonymous
-// ones. Authenticated root requests short-circuit before this is hit
-// today, but stubbing it now keeps non-root authz paths from tripping
-// the same NotImplemented trap.
+// GetBucketPolicy is called from auth.VerifyAccess (access-control.go)
+// for authenticated accounts below the admin role and from
+// auth.VerifyPublicAccess for anonymous ones. Hilt-authorized accounts
+// carry the admin role and short-circuit before this is hit, but stubbing
+// it keeps the anonymous path from tripping the same NotImplemented trap.
 func (b *Backend) GetBucketPolicy(ctx context.Context, bucket string) ([]byte, error) {
 	if _, err := b.reg.Get(ctx, bucket); err != nil {
 		if errors.Is(err, registry.ErrNotFound) {
@@ -293,9 +294,9 @@ func (b *Backend) CreateBucket(ctx context.Context, input *s3.CreateBucketInput,
 		return errors.New("s3frontend: create bucket: no request in context")
 	}
 	// The owning tenant is the caller's: iam stashes it from hilt's authorize
-	// response on every non-root request, and the same access key is about
-	// to create the bucket through hilt. (hilt's create reply does not carry
-	// the tenant.) Root never reaches hilt and so cannot create buckets.
+	// response on every request, and the same access key is about to create
+	// the bucket through hilt. (hilt's create reply does not carry the
+	// tenant.)
 	tenant, ok := reqscope.Tenant(ctx)
 	if !ok {
 		return errors.New("s3frontend: create bucket: no tenant in context")

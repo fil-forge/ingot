@@ -6,7 +6,8 @@
 // where it mirrors auth.IAMServiceSingle, because accounts are managed by
 // Hilt and the gateway's admin APIs are not mounted — and the request-scoped
 // middlewares.RequestIAMService, which the auth middlewares consult for every
-// non-root access key. Per request, the service forwards the raw S3 API
+// access key (the gateway's root account is disabled). Per request, the
+// service forwards the raw S3 API
 // request to Hilt; Hilt verifies the SigV4 signature, checks the access key's
 // permission for the requested action, and returns a scope-bound derived
 // signing key (never the raw secret). The gateway then re-verifies the
@@ -243,8 +244,8 @@ func (s *Service) GetUserAccountForRequest(ctx fiber.Ctx, accessKeyStr string) (
 		// Admin so the gateway's role/ACL layers defer entirely: authorization
 		// is per-request via Hilt (or the local fast path), which enforces the
 		// key's permissions and bucket scope. The gateway doesn't model
-		// ownership for hilt-managed keys (buckets default to root-owned) and
-		// its admin APIs are not mounted.
+		// ownership for hilt-managed keys (bucket ACLs are empty) and its
+		// admin APIs are not mounted.
 		Role: auth.RoleAdmin,
 	}, nil
 }
@@ -361,8 +362,8 @@ func (s *Service) authorizeLocal(ctx context.Context, req s3.Request, access str
 		// Admin so the gateway's role/ACL layers defer entirely: authorization
 		// is per-request via Hilt (or the local fast path), which enforces the
 		// key's permissions and bucket scope. The gateway doesn't model
-		// ownership for hilt-managed keys (buckets default to root-owned) and
-		// its admin APIs are not mounted.
+		// ownership for hilt-managed keys (bucket ACLs are empty) and its
+		// admin APIs are not mounted.
 		Role: auth.RoleAdmin,
 	}, true
 }

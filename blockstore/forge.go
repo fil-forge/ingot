@@ -47,9 +47,9 @@ var ErrNotFound = errors.New("blockstore: not found")
 // invocation. Retrieval authority (a space→…→agent proof chain) comes from
 // the request-scoped proof store the auth layer stashes on the context
 // ([reqscope.ProofStore]) — the store of the access key that made the
-// request, so a read can only use that key's own delegations. A request
-// with no scoped store (e.g. the root account, which holds no Hilt
-// delegations) cannot retrieve.
+// request, so a read can only use that key's own delegations. A context
+// with no scoped store (one that never passed through the IAM layer, such
+// as a background job) cannot retrieve.
 type Forge struct {
 	locator    locator.Locator
 	signer     ucan.Issuer // service identity (issuer of /content/retrieve invocations)
@@ -207,8 +207,9 @@ func (f *Forge) doRetrieve(ctx context.Context, space did.DID, digest mh.Multiha
 
 	// Retrieval authority is the requesting access key's space→…→agent
 	// chain, from the proof store the auth layer scoped onto this request's
-	// context. No store (e.g. a root-account read) or an empty chain is an
-	// auth gap, not absent data — surface it explicitly.
+	// context. No store (a context that never passed through the IAM layer)
+	// or an empty chain is an auth gap, not absent data — surface it
+	// explicitly.
 	store, ok := reqscope.ProofStore(ctx)
 	if !ok {
 		return nil, 0, fmt.Errorf("forge: no request-scoped retrieval authority for space %s", space)
