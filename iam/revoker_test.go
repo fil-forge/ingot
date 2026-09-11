@@ -99,3 +99,47 @@ func TestRevokerUnknownCIDIsNoOp(t *testing.T) {
 	_, ok := keys.Get(a.access, s3.KeyKindSigV4)
 	require.True(t, ok)
 }
+
+// TestRevokerInvalidatePrincipal covers the firehose's second event kind:
+// an invalidation names a (tenant, principal) pair, and every access key
+// bound to it loses the state the local fast path reads.
+func TestRevokerInvalidatePrincipal(t *testing.T) {
+	ctx := context.Background()
+	kp := iam.NewKeyProofs()
+	keys := iam.NewVerificationKeyCache()
+	tenants := iam.NewTenantCache()
+	r := iam.NewRevoker(kp, keys, tenants, nil)
+
+	a := seedKey(t, kp, keys, tenants)
+	b := seedKey(t, kp, keys, tenants)
+	kp.Bind(a.key, iam.PrincipalRef{Tenant: a.tenant.DID(), Principal: "ada"})
+	kp.Bind(b.key, iam.PrincipalRef{Tenant: b.tenant.DID(), Principal: "grace"})
+
+	affected := r.InvalidatePrincipal(a.tenant.DID(), "ada")
+	require.Equal(t, []did.DID{a.key}, affected)
+
+	// Ada's key can no longer authorize locally: no chains, no verification
+	// key, no tenant.
+	chain, _, err := kp.For(a.key).ProofChain(ctx, a.dlg.Audience(), a.dlg.Command(), a.tenant.DID())
+	require.NoError(t, err)
+	require.Empty(t, chain, "the invalidated principal's chains must not resolve")
+	_, ok := keys.Get(a.access, s3.KeyKindSigV4)
+	require.False(t, ok, "the invalidated principal's verification key must be gone")
+	_, ok = tenants.Get(a.access)
+	require.False(t, ok, "the invalidated principal's tenant must be gone")
+
+	// Grace is untouched.
+	chain, _, err = kp.For(b.key).ProofChain(ctx, b.dlg.Audience(), b.dlg.Command(), b.tenant.DID())
+	require.NoError(t, err)
+	require.Len(t, chain, 1, "another principal's chains must survive")
+	_, ok = keys.Get(b.access, s3.KeyKindSigV4)
+	require.True(t, ok)
+	_, ok = tenants.Get(b.access)
+	require.True(t, ok)
+
+	// Re-delivery, and a principal ingot has never seen, are no-ops.
+	require.Empty(t, r.InvalidatePrincipal(a.tenant.DID(), "ada"))
+	require.Empty(t, r.InvalidatePrincipal(a.tenant.DID(), "nobody"))
+	_, ok = keys.Get(b.access, s3.KeyKindSigV4)
+	require.True(t, ok, "an unmatched invalidation must not touch cached state")
+}
