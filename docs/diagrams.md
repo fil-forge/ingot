@@ -298,9 +298,9 @@ sequenceDiagram
   [blob lifecycle](#blob-lifecycle-spooled-parked-accepted-released).
 - `CopyObject` runs the same `commitVersion` with a manifest that pins the
   source's digests: no spool, no upload, claims incremented. A source bucket
-  owned by another tenant is `AccessDenied` before any key lookup (hilt
-  authorizes the copy against the destination only; the bucket rows carry
-  the tenant). Same-tenant cross-space (today: cross-bucket) copies are
+  owned by another tenant is `AccessDenied` before any key lookup: hilt
+  refuses it when authorizing the request, and ingot compares the tenant on
+  the two bucket rows as well. Same-tenant cross-space (today: cross-bucket) copies are
   rejected `NotImplemented` — the CEK wrap is bound to (space, digest), so
   they need a rewrap flow.
 - Supersession also records each replaced catalog block for future removal:

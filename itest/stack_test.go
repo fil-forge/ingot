@@ -7,7 +7,10 @@ import (
 	"crypto/md5"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
+	"github.com/aws/smithy-go"
 	"io"
 	"log"
 	"net/http"
@@ -578,4 +581,24 @@ func getBody(t *testing.T, ctx context.Context, cl *s3.Client, bucket, key, rang
 		t.Fatalf("read body %s: %v", key, err)
 	}
 	return b
+}
+
+// apiErrorOf returns the S3 error code and HTTP status of an SDK error, or
+// fails the test when err is nil or carries no HTTP response. A HEAD's error
+// has no body, so its code is whatever the SDK invents; assert the status for
+// those.
+func apiErrorOf(t *testing.T, err error) (code string, status int) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("request succeeded, want an S3 error")
+	}
+	var respErr *awshttp.ResponseError
+	if !errors.As(err, &respErr) {
+		t.Fatalf("no HTTP response in error: %v", err)
+	}
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		code = apiErr.ErrorCode()
+	}
+	return code, respErr.HTTPStatusCode()
 }

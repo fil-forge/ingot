@@ -40,6 +40,7 @@ package iam
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"strings"
 
 	"time"
@@ -59,6 +60,7 @@ import (
 	"github.com/fil-forge/ucantone/ucan"
 	"github.com/fil-forge/versitygw/auth"
 	"github.com/fil-forge/versitygw/s3api/middlewares"
+	"github.com/fil-forge/versitygw/s3api/utils"
 	"github.com/fil-forge/versitygw/s3err"
 	"github.com/gofiber/fiber/v3"
 	"go.uber.org/zap"
@@ -169,6 +171,15 @@ func (s *Service) GetUserAccountForRequest(ctx fiber.Ctx, accessKeyStr string) (
 	// fails, and needed whichever path authorizes.
 	store := s.proofs.For(accessKeyID)
 	ctx.Locals(reqscope.ProofStoreKey(), ucanlib.ProofStore(store))
+
+	// A copy names its source in a header the gateway validates in its
+	// controller (bucket-name and object-key rules), which runs after this
+	// hook. Validate it here first so a malformed source reports the
+	// controller's InvalidArgument rather than what Hilt makes of a bucket it
+	// cannot find, keeping the error precedence a request without Hilt has.
+	if err := validateCopySource(req); err != nil {
+		return auth.Account{}, err
+	}
 
 	// Local fast path: with a cached verification key and cached delegation
 	// chains covering the request's Forge commands, Hilt is not consulted.
@@ -285,12 +296,53 @@ func mapAuthError(err error) (error, bool) {
 		hiltauth.IssuerForbiddenErrorName,
 		hiltauth.RegionNotServedErrorName,
 		hiltauth.OperationNotPermittedErrorName,
-		hiltauth.BucketNotPermittedErrorName:
+		hiltauth.BucketNotPermittedErrorName,
+		// Another tenant's bucket is AccessDenied, as S3 answers for another
+		// account's bucket: bucket names are global, so existence is no secret.
+		hiltauth.ForeignBucketErrorName,
+		// A copy whose source header the signature does not cover cannot be
+		// authorized; the SDKs always sign it.
+		hiltauth.UnsignedCopySourceErrorName:
 		return s3err.GetAPIError(s3err.ErrAccessDenied), true
 	default:
 		// Named, but not a Hilt auth rejection we know — not ours to map.
 		return nil, false
 	}
+}
+
+// copySourceHeader names a copy's source object; it is only trusted when the
+// request signature covers it.
+const copySourceHeader = "x-amz-copy-source"
+
+// validateCopySource applies the gateway controller's copy-source validation
+// (versitygw utils.ValidateCopySource) to an object or part PUT that carries an
+// x-amz-copy-source header, returning its InvalidArgument error. Requests of
+// any other shape, or without the header, pass.
+func validateCopySource(req s3.Request) error {
+	if !strings.EqualFold(req.Method, http.MethodPut) {
+		return nil
+	}
+	src, ok := headerValue(req.Headers, copySourceHeader)
+	if !ok {
+		return nil
+	}
+	switch op, _ := hiltauth.OperationFor(req); op {
+	case hiltauth.OpPutObject, hiltauth.OpCopyObject, hiltauth.OpUploadPart, hiltauth.OpUploadPartCopy:
+		return utils.ValidateCopySource(strings.TrimPrefix(src, "/"))
+	default:
+		return nil
+	}
+}
+
+// headerValue returns the named header's value from a request's header map,
+// matched case-insensitively; an empty value counts as absent.
+func headerValue(headers map[string]string, name string) (string, bool) {
+	for k, v := range headers {
+		if strings.EqualFold(k, name) && v != "" {
+			return v, true
+		}
+	}
+	return "", false
 }
 
 // authorizeLocal is the fast path, mirroring Hilt's own verification
@@ -322,32 +374,40 @@ func (s *Service) authorizeLocal(ctx context.Context, req s3.Request, access str
 		return auth.Account{}, false
 	}
 
-	// 3. The S3 action must map to Forge commands. Bucket-level operations
-	// (create/delete/list-buckets) map to none — they go to Hilt regardless.
-	op, err := hiltauth.OperationFor(req)
-	if err != nil {
+	// 3. Every bucket the request acts on, with the permission it needs there:
+	// the addressed bucket, plus the copy source for CopyObject and
+	// UploadPartCopy. Operations on no existing bucket (create/delete/
+	// list-buckets) yield none — they go to Hilt regardless. A copy's source
+	// is named by a header, which the signature covers only when listed in
+	// SignedHeaders; Hilt refuses an unsigned one, and so does the fast path.
+	op, reqs, err := hiltauth.RequirementsFor(req)
+	if err != nil || len(reqs) == 0 {
 		return auth.Account{}, false
 	}
-	cmds := s3perm.CommandsFor(op.Permission())
-	if len(cmds) == 0 {
-		return auth.Account{}, false
-	}
-
-	// 4. The delegation subject is the bucket's space.
-	st, err := s.buckets.Get(ctx, bucketFromURL(req.URL))
-	if err != nil || !st.Space.Defined() {
+	if op.CopiesSource() && !sr.HeaderSigned(copySourceHeader) {
 		return auth.Account{}, false
 	}
 
-	// 5. Every command must be covered by a chain to this instance's agent
-	// in THIS key's store. Because the store holds only keyDID's delegations,
-	// a resolving agent chain is necessarily space→…→keyDID→agent — it
-	// carries both keyDID's own grant (Hilt's permission + bucket scoping)
-	// and the onward re-delegation. Cross-key mixing is structurally
-	// impossible, so one probe suffices.
-	for _, cmd := range cmds {
-		if chain, _, err := store.ProofChain(ctx, s.agent, cmd, st.Space); err != nil || len(chain) == 0 {
+	// 4. For each bucket, the delegation subject is its space, and every
+	// command the permission maps to must be covered by a chain to this
+	// instance's agent in THIS key's store. Because the store holds only
+	// keyDID's delegations, a resolving agent chain is necessarily
+	// space→…→keyDID→agent — it carries both keyDID's own grant (Hilt's
+	// permission + bucket scoping) and the onward re-delegation. Cross-key
+	// mixing is structurally impossible, so one probe per command suffices.
+	for _, r := range reqs {
+		cmds := s3perm.CommandsFor(r.Permission)
+		if len(cmds) == 0 {
 			return auth.Account{}, false
+		}
+		st, err := s.buckets.Get(ctx, r.Bucket)
+		if err != nil || !st.Space.Defined() {
+			return auth.Account{}, false
+		}
+		for _, cmd := range cmds {
+			if chain, _, err := store.ProofChain(ctx, s.agent, cmd, st.Space); err != nil || len(chain) == 0 {
+				return auth.Account{}, false
+			}
 		}
 	}
 

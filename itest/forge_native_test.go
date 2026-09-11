@@ -6,16 +6,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
-	"errors"
 	"fmt"
 	"net/http"
 	"strings"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/aws/smithy-go"
 	"github.com/fil-forge/smelt/pkg/stack"
 	"github.com/filecoin-project/go-fee/cose"
 
@@ -78,12 +75,10 @@ func TestForgeNativeProvision(t *testing.T) {
 	t.Logf("stored envelope carries the tenant recipient %s", wantKID)
 
 	// 4. A second tenant cannot use the first tenant's bucket as a copy
-	// source. hilt authorizes the copy against the destination only, so ingot
-	// enforces the source side from the tenant recorded on each bucket: the
-	// answer is AccessDenied whether or not the key exists (S3's answer for
-	// another account's bucket), while a bucket that exists nowhere is still
-	// NoSuchBucket. The direct path is hilt's call and reports the foreign
-	// bucket as missing.
+	// source, nor reach it directly: hilt refuses another tenant's bucket as
+	// AccessDenied on both paths (S3's answer for another account's bucket),
+	// and ingot's own tenant comparison on the bucket rows backs the copy
+	// path up. A bucket that exists nowhere is still NoSuchBucket.
 	accessKeyB, secretKeyB := hiltProvisionTenant(t, ctx, s, "native-b")
 	clientB := bigObjectClient(t, ingotEndpoint, accessKeyB, secretKeyB)
 	const bucketB = "native-provision-b"
@@ -107,28 +102,10 @@ func TestForgeNativeProvision(t *testing.T) {
 	}
 	if _, err := clientB.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: aws.String(bucket)}); err == nil {
 		t.Fatalf("tenant B could HEAD tenant A's bucket %q", bucket)
-	} else if _, status := apiErrorOf(t, err); status != http.StatusNotFound {
-		t.Fatalf("tenant B HEAD of tenant A's bucket: status %d, want 404 (hilt hides foreign buckets)", status)
+	} else if _, status := apiErrorOf(t, err); status != http.StatusForbidden {
+		t.Fatalf("tenant B HEAD of tenant A's bucket: status %d, want 403", status)
 	}
 	t.Logf("cross-tenant copy source refused")
-}
-
-// apiErrorOf returns the S3 error code and HTTP status of an SDK error, or
-// fails the test when err is nil or not an API error.
-func apiErrorOf(t *testing.T, err error) (code string, status int) {
-	t.Helper()
-	if err == nil {
-		t.Fatal("request succeeded, want an S3 error")
-	}
-	var apiErr smithy.APIError
-	if !errors.As(err, &apiErr) {
-		t.Fatalf("not an S3 API error: %v", err)
-	}
-	var respErr *awshttp.ResponseError
-	if !errors.As(err, &respErr) {
-		t.Fatalf("no HTTP response in error: %v", err)
-	}
-	return apiErr.ErrorCode(), respErr.HTTPStatusCode()
 }
 
 // hiltActiveWrapKID reads the active wrap-key fingerprint hilt registered for

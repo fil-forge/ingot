@@ -17,6 +17,7 @@ import (
 
 	hiltclient "github.com/fil-forge/hilt/pkg/client"
 	hiltauth "github.com/fil-forge/hilt/pkg/rpc/service/auth"
+	"github.com/fil-forge/hilt/pkg/s3perm"
 	"github.com/fil-forge/hilt/pkg/sigv4"
 	"github.com/fil-forge/ingot/internal/reqscope"
 	"github.com/fil-forge/ingot/registry"
@@ -55,6 +56,70 @@ func signedGet(t *testing.T, host, rawPath, accessKeyID, secret string, when tim
 	return s3.Request{Method: http.MethodGet, Headers: headers, URL: req.URL.RequestURI()}
 }
 
+// signedCopy builds a real SigV4-signed CopyObject (PUT /dst/key with an
+// x-amz-copy-source naming src/key). signSource controls whether that header is
+// among the signed headers; the SDKs always sign it, so the unsigned variant is
+// the hand-rolled request the fast path must refuse.
+func signedCopy(t *testing.T, host, dstBucket, srcBucket, accessKeyID, secret string, signSource bool) s3.Request {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPut, "http://"+host+"/"+dstBucket+"/obj", nil)
+	require.NoError(t, err)
+	req.Header.Set("X-Amz-Content-Sha256", "UNSIGNED-PAYLOAD")
+	source := "/" + srcBucket + "/obj"
+	signed := []string{"host", "x-amz-content-sha256", "x-amz-date"}
+	if signSource {
+		// The signer covers every x-amz-* header present, so the header is
+		// set before signing only when it is meant to be signed.
+		req.Header.Set("X-Amz-Copy-Source", source)
+		signed = append(signed, "x-amz-copy-source")
+	}
+	_, err = v4.NewSigner().SignHTTP(context.Background(),
+		awsv4.Credentials{AccessKeyID: accessKeyID, SecretAccessKey: secret},
+		req, "UNSIGNED-PAYLOAD", "s3", "us-east-1", time.Now(), signed,
+		func(o *v4.SignerOptions) { o.DisableURIPathEscaping = true })
+	require.NoError(t, err)
+
+	headers := map[string]string{"Host": host}
+	for k := range req.Header {
+		headers[k] = req.Header.Get(k)
+	}
+	if !signSource {
+		// Added after signing: present on the request, absent from SignedHeaders.
+		headers["X-Amz-Copy-Source"] = source
+	}
+	return s3.Request{Method: http.MethodPut, Headers: headers, URL: req.URL.RequestURI()}
+}
+
+// mapResolver returns the bucket→space mapping for several buckets.
+type mapResolver map[string]*registry.State
+
+func (r mapResolver) Get(_ context.Context, name string) (*registry.State, error) {
+	if st, ok := r[name]; ok {
+		return st, nil
+	}
+	return nil, registry.ErrNotFound
+}
+
+// commandChains mints the RFC chain space→tenant→accessKey→agent for each
+// command, all subject = space.
+func commandChains(t *testing.T, spaceIssuer, accessKey, agent ucan.Issuer, cmds []ucan.Command) []ucan.Delegation {
+	t.Helper()
+	space := spaceIssuer.DID()
+	tenant, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	var out []ucan.Delegation
+	for _, cmd := range cmds {
+		root, err := delegation.Delegate(spaceIssuer, tenant.DID(), space, cmd, delegation.WithNoExpiration())
+		require.NoError(t, err)
+		mid, err := delegation.Delegate(tenant, accessKey.DID(), space, cmd, delegation.WithNoExpiration())
+		require.NoError(t, err)
+		leaf, err := delegation.Delegate(accessKey, agent.DID(), space, cmd, delegation.WithNoExpiration())
+		require.NoError(t, err)
+		out = append(out, root, mid, leaf)
+	}
+	return out
+}
+
 // fixedResolver returns one bucket→space mapping (or not-found for others).
 type fixedResolver struct {
 	name  string
@@ -86,7 +151,7 @@ func retrieveChain(t *testing.T, spaceIssuer, accessKey, agent ucan.Issuer) []uc
 
 // localService builds a Service with the fast path enabled and the given
 // agent + resolver, plus fresh caches.
-func localService(agent did.DID, r fixedResolver) *Service {
+func localService(agent did.DID, r BucketResolver) *Service {
 	return New(&refusingAuthorizer{}, NewKeyProofs(), NewVerificationKeyCache(), NewTenantCache(),
 		WithLocalAuthorization(agent, r))
 }
@@ -178,6 +243,79 @@ func TestAuthorizeLocal(t *testing.T) {
 	})
 }
 
+// TestAuthorizeLocalCopy: a copy is authorized locally only when THIS key's
+// store covers the destination's write commands over the destination's space
+// AND the source's read over the source's space, and only when the header
+// naming the source is signed — the checks Hilt makes, mirrored.
+func TestAuthorizeLocalCopy(t *testing.T) {
+	accessKey, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	dstIssuer, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	srcIssuer, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	agent, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+
+	accessKeyID := accessKey.DID().Identifier()
+	const secret = "test-secret-access-key"
+	resolver := mapResolver{
+		"dst": &registry.State{Name: "dst", Space: dstIssuer.DID()},
+		"src": &registry.State{Name: "src", Space: srcIssuer.DID()},
+	}
+	putCmds := s3perm.CommandsFor("s3:PutObject")
+	getCmds := s3perm.CommandsFor("s3:GetObject")
+
+	// service with the key cached for req, plus the given chains deposited.
+	service := func(t *testing.T, req s3.Request, chains ...[]ucan.Delegation) *Service {
+		t.Helper()
+		sr, err := sigv4.Parse(sigv4.Request{Method: req.Method, Headers: req.Headers, URL: req.URL})
+		require.NoError(t, err)
+		key, err := sigv4.DeriveKey(sr, secret)
+		require.NoError(t, err)
+		s := localService(agent.DID(), resolver)
+		s.keys.Put(accessKeyID, time.Hour, s3.VerificationKey{Kind: s3.KeyKindSigV4, Data: key})
+		for _, c := range chains {
+			s.proofs.Deposit(accessKey.DID(), c...)
+		}
+		return s
+	}
+	authLocal := func(s *Service, req s3.Request) bool {
+		_, ok := s.authorizeLocal(context.Background(), req, accessKeyID, s.proofs.For(accessKey.DID()))
+		return ok
+	}
+
+	t.Run("both buckets covered: authorized locally", func(t *testing.T) {
+		req := signedCopy(t, "s3.example", "dst", "src", accessKeyID, secret, true)
+		s := service(t, req,
+			commandChains(t, dstIssuer, accessKey, agent, putCmds),
+			commandChains(t, srcIssuer, accessKey, agent, getCmds))
+		require.True(t, authLocal(s, req))
+	})
+
+	t.Run("destination covered but not the source: fall through", func(t *testing.T) {
+		// The destination grant carries /content/retrieve too, but over the
+		// destination's space; it must not stand in for the source's.
+		req := signedCopy(t, "s3.example", "dst", "src", accessKeyID, secret, true)
+		s := service(t, req, commandChains(t, dstIssuer, accessKey, agent, putCmds))
+		require.False(t, authLocal(s, req))
+	})
+
+	t.Run("source header not signed: fall through", func(t *testing.T) {
+		req := signedCopy(t, "s3.example", "dst", "src", accessKeyID, secret, false)
+		s := service(t, req,
+			commandChains(t, dstIssuer, accessKey, agent, putCmds),
+			commandChains(t, srcIssuer, accessKey, agent, getCmds))
+		require.False(t, authLocal(s, req))
+	})
+
+	t.Run("copy within one bucket needs only that bucket", func(t *testing.T) {
+		req := signedCopy(t, "s3.example", "dst", "dst", accessKeyID, secret, true)
+		s := service(t, req, commandChains(t, dstIssuer, accessKey, agent, putCmds))
+		require.True(t, authLocal(s, req))
+	})
+}
+
 // hiltErr reproduces the wrapping depth a real authorize failure arrives with:
 // binding.Unpack wraps the decoded ErrorModel, the Hilt client wraps that, and
 // GetUserAccountForRequest wraps once more — mapAuthError must see through all
@@ -235,6 +373,8 @@ func TestMapAuthError(t *testing.T) {
 		hiltauth.RegionNotServedErrorName:       {"AccessDenied", 403},
 		hiltauth.OperationNotPermittedErrorName: {"AccessDenied", 403},
 		hiltauth.BucketNotPermittedErrorName:    {"AccessDenied", 403},
+		hiltauth.ForeignBucketErrorName:         {"AccessDenied", 403},
+		hiltauth.UnsignedCopySourceErrorName:    {"AccessDenied", 403},
 	}
 	for name, want := range apiCases {
 		t.Run(name, func(t *testing.T) {

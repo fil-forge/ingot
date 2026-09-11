@@ -73,9 +73,9 @@ claim also deletes its params row (crypto-shred — the ciphertext is
 unreadable even where copies survive), and **cross-space CopyObject is
 rejected** `NotImplemented` (the CEK wrap is space-bound; a rewrap flow is a
 filed follow-up). A copy source in **another tenant's bucket is refused**
-`AccessDenied` before that: hilt authorizes a copy against the destination
-only, so ingot compares the tenant recorded on the two bucket rows (a row
-whose owner predates the record matches none).
+`AccessDenied` before that: hilt refuses the source when it authorizes the
+request, and ingot compares the tenant recorded on the two bucket rows as
+well (a row whose owner predates the record matches none).
 Rotation: Hilt replaces `#wrap` in place and archives the
 old key, so a write inside the cache TTL of a rotation still recovers.
 
