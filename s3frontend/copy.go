@@ -239,11 +239,18 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 // destination and never reads x-amz-copy-source, so the source bucket's tenant
 // is checked here, before any key lookup: a foreign source is AccessDenied
 // whether or not the key exists, which is what S3 returns for another
-// account's bucket. Comparing the two bucket rows (rather than the caller's
-// tenant) works for the root account, which carries no tenant, because hilt
-// has already established that the caller's tenant owns the destination.
-// UploadPartCopy shares this rule.
+// account's bucket. The check compares the two bucket rows, so it needs no
+// tenant on the request: the root account, which bypasses hilt and carries
+// none, is covered like any other caller. A row whose owner was never
+// recorded (registry.UnknownTenant) matches no tenant, its own sentinel
+// included: two such rows prove nothing about each other. UploadPartCopy
+// shares this rule.
 func (b *Backend) copySourceBucket(ctx context.Context, dst *registry.State, srcBucket string) (*registry.State, error) {
+	// A copy within one bucket reads the bucket it writes; no lookup or
+	// comparison is needed.
+	if srcBucket == dst.Name {
+		return dst, nil
+	}
 	src, err := b.reg.Get(ctx, srcBucket)
 	if err != nil {
 		if errors.Is(err, registry.ErrNotFound) {
@@ -251,7 +258,8 @@ func (b *Backend) copySourceBucket(ctx context.Context, dst *registry.State, src
 		}
 		return nil, fmt.Errorf("s3frontend: copy source bucket: %w", err)
 	}
-	if src.Tenant != dst.Tenant {
+	known := src.Tenant.Defined() && src.Tenant != registry.UnknownTenant
+	if !known || src.Tenant != dst.Tenant {
 		return nil, s3err.GetAPIError(s3err.ErrAccessDenied)
 	}
 	return src, nil

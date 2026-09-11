@@ -144,3 +144,31 @@ func TestCopyObject_ForeignTenantSourceIsAccessDenied(t *testing.T) {
 		t.Fatalf("same-tenant cross-space source: %v, want NotImplemented", err)
 	}
 }
+
+// Buckets whose owner was never recorded carry the same sentinel tenant, which
+// must not make them look like one tenant's: a copy between two such buckets
+// is refused, while a copy within one of them still proceeds.
+func TestCopyObject_UnknownTenantSourceIsAccessDenied(t *testing.T) {
+	b, mem, _ := newRefTestBackend(t)
+	ctx := context.Background()
+	for _, name := range []string{"legacy1", "legacy2"} {
+		if err := mem.Create(ctx, name, testutil.RandomDID(t), registry.CreateState{Tenant: registry.UnknownTenant}); err != nil {
+			t.Fatalf("create %s: %v", name, err)
+		}
+	}
+	srcBucket, srcKey := "legacy1", "obj"
+	if _, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &srcBucket, Key: &srcKey, Body: bytes.NewReader([]byte("legacy"))}); err != nil {
+		t.Fatalf("put source: %v", err)
+	}
+	copyFrom := func(dst, source string) error {
+		key := "copied"
+		_, err := b.CopyObject(ctx, s3response.CopyObjectInput{Bucket: &dst, Key: &key, CopySource: &source})
+		return err
+	}
+	if err := copyFrom("legacy2", "legacy1/obj"); apiErrCode(t, err) != "AccessDenied" {
+		t.Fatalf("copy between two unknown-tenant buckets: %v, want AccessDenied", err)
+	}
+	if err := copyFrom("legacy1", "legacy1/obj"); err != nil {
+		t.Fatalf("copy within an unknown-tenant bucket: %v", err)
+	}
+}

@@ -32,7 +32,10 @@ func (s VersioningState) Configured() bool {
 
 // UnknownTenant is the Tenant of a bucket row that predates the tenant column
 // (migration 00017 backfills it). A syntactically valid DID, so it reads back
-// like any other row, and never a did:plc, so no hilt tenant can equal it.
+// like any other row, and never a did:plc, so no hilt tenant can equal it. It
+// records that the owner is unknown, so it matches no tenant: two rows carrying
+// it may belong to different tenants, and the copy paths refuse to treat them
+// as one.
 var UnknownTenant = did.MustParse("did:web:unknown-tenant.invalid")
 
 // State is the metadata stored per bucket.
