@@ -272,6 +272,7 @@ func TestBaseIAMServiceParity(t *testing.T) {
 func TestGetUserAccountForRequest_PlainAccessKey(t *testing.T) {
 	fake := &fakeAuthorizer{}
 	svc := iam.New(fake, iam.NewKeyProofs(), iam.NewVerificationKeyCache(), iam.NewTenantCache())
+	t.Cleanup(func() { require.NoError(t, svc.Shutdown()) })
 
 	for _, access := range []string{"ingot", ""} {
 		req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)

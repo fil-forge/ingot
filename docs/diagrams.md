@@ -68,9 +68,10 @@ flowchart LR
 
 - Ingot never invokes `/blob/accept`: sprue owns accept (and allocate), which
   is why the conclude call carries no space proof.
-- Versitygw's root account is disabled (an empty `RootUserConfig`), so every
-  access key resolves through hilt; a root request would reach hilt with a
-  non-DID access key and be rejected there.
+- Versitygw's root account is disabled (no `WithRootUser` option), so every
+  access key resolves through `iam.Service`. A plain (non-`did:key`) access
+  key, the shape a root credential would have, is rejected there as
+  InvalidAccessKeyId before any hilt round-trip.
 - `ListBuckets` is served entirely from hilt; the local `ingot.buckets` table
   backs every other verb.
 

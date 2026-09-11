@@ -116,8 +116,10 @@ ingot version
 (`auth_service_url`/`_did` plus the `auth_service_proofs` delegation chains
 hilt issues to this agent). Tenants, access keys, and buckets are owned by
 [hilt](https://github.com/fil-forge/hilt): it authorizes every S3 request
-(the gateway has no root account), mints each bucket's Forge space, and
-issues the S3 credentials; ingot never self-provisions. The deployment context is the
+signed with a hilt-issued access key, mints each bucket's Forge space, and
+issues the S3 credentials; ingot never self-provisions. The gateway has no
+root account, and a key that is not a `did:key` is rejected before hilt is
+consulted. The deployment context is the
 [Forge deployment RFC](https://github.com/fil-one/RFC/blob/main/2026-05-filone-forge-deployment-proposal.md):
 the S3 facade runs **at the edge**, co-located with a provider's piri or as a
 standalone client — not inside the central upload-service.
