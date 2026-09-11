@@ -363,6 +363,9 @@ func (s *Service) authorizeLocal(ctx context.Context, req s3.Request, access str
 
 	// 3. The S3 action must map to Forge commands. Bucket-level operations
 	// (create/delete/list-buckets) map to none — they go to Hilt regardless.
+	// So do the two bucket-configuration reads (GET /{bucket}?versioning and
+	// ?object-lock): no per-request delegation carries the key's expiry for
+	// them, so a cached action set alone would outlive an expired key.
 	op, err := hiltauth.OperationFor(req)
 	if err != nil {
 		return auth.Account{}, false, nil

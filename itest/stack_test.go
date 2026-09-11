@@ -299,6 +299,11 @@ var hiltAllPermissions = []string{
 	"s3:CreateBucket",
 	"s3:ListAllMyBuckets",
 	"s3:DeleteBucket",
+	// Bucket-configuration reads: hilt classifies GET /{bucket}?versioning
+	// and ?object-lock as these rather than ListBucket, so the key needs
+	// them or those reads answer 403.
+	"s3:GetBucketVersioning",
+	"s3:GetBucketObjectLockConfiguration",
 	// Multipart operations, first-class in hilt since fil-forge/hilt#35:
 	// AbortMultipartUpload carries the blob.Abort + blob.Remove delegations
 	// the abort leg invokes; the two List ops are catalog reads.
