@@ -240,8 +240,7 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 // is checked here, before any key lookup: a foreign source is AccessDenied
 // whether or not the key exists, which is what S3 returns for another
 // account's bucket. The check compares the two bucket rows, so it needs no
-// tenant on the request: the root account, which bypasses hilt and carries
-// none, is covered like any other caller. A row whose owner was never
+// tenant on the request. A row whose owner was never
 // recorded (registry.UnknownTenant) matches no tenant, its own sentinel
 // included: two such rows prove nothing about each other. UploadPartCopy
 // shares this rule.

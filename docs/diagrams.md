@@ -53,7 +53,7 @@ flowchart LR
     idx["indexing-service"]
 
     client -->|"S3 REST"| ingot
-    ingot -->|"/s3/request/authorize (every request)<br/>/s3/bucket/info (lazy chain completion)<br/>/s3/bucket/create, delete, list"| hilt
+    ingot -->|"/s3/request/authorize (every request on a local-cache miss)<br/>/s3/bucket/info (lazy chain completion)<br/>/s3/bucket/create, delete, list"| hilt
     ingot -->|"/blob/add, /ucan/conclude, GET /receipt/:task<br/>/blob/abort, /blob/remove, /index/add"| sprue
     ingot -->|"HTTP PUT blob bytes (allocated URL)"| piri
     ingot -->|"content/retrieve (UCAN, on read miss)"| piri
@@ -680,8 +680,10 @@ flowchart TB
 
 - The piri provider DID is never configured: retrieval audiences come from
   the `/assert/location` commitment each read resolves.
-- Every request carries a proof store: versitygw's root account is disabled,
-  so no auth path skips the hilt-backed IAM lookup.
+- Every authenticated S3 request carries a proof store: versitygw's root
+  account is disabled, so no access-key auth path skips the hilt-backed IAM
+  lookup. `/health` and the DID document are outside the S3 auth chain, and a
+  rejected access key never receives one.
 - A bucket whose last write is more than an hour old has an expired ship
   authority; a newly sealed segment then waits for the bucket's next write to
   re-capture it.
