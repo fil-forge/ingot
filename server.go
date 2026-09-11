@@ -113,10 +113,9 @@ type ServerDeps struct {
 	// to fetch it). Required.
 	Identity identity.Identity
 
-	// IAM authenticates non-root access keys (hilt/iam, which authorizes
-	// each request against the Hilt tenant service). Required: the root
-	// account is checked before the IAM lookup, but every other access key
-	// is resolved through it.
+	// IAM authenticates every access key (hilt/iam, which authorizes each
+	// request against the Hilt tenant service). Required: versitygw's
+	// built-in root account is disabled, so no request bypasses it.
 	IAM auth.IAMService
 }
 
@@ -438,9 +437,11 @@ func newBucketFlushFunc(up uploader.Uploader, reg registry.Registry, locations r
 
 // buildS3API constructs the versitygw S3ApiServer with the wiring ingot
 // needs: no event sink, generous concurrency limits, and an audit-log sink
-// that reports unexpected request failures through zap. Non-root access keys
-// authenticate through iam, which is required (the root account is checked
-// before the IAM lookup). The server also publishes id's DID document at
+// that reports unexpected request failures through zap. Every access key
+// authenticates through iam, which is required: versitygw's built-in root
+// account is disabled (an empty RootUserConfig), since a root request never
+// reaches hilt and so carries none of the delegations the Forge-facing
+// handlers need. The server also publishes id's DID document at
 // /.well-known/did.json.
 func buildS3API(ctx context.Context, backend *s3frontend.Backend, cfg config.ServerConfig, iam auth.IAMService, id identity.Identity, logger *zap.Logger) (*s3api.S3ApiServer, error) {
 	if iam == nil {
@@ -473,9 +474,8 @@ func buildS3API(ctx context.Context, backend *s3frontend.Backend, cfg config.Ser
 		s3api.WithDisableObjNameTraversalCheck(),
 		// Stash the signed S3 request on the context for every request. The
 		// bucket-authority seam (Create/Delete/ListBuckets) recovers it to
-		// forward to Hilt; doing it here — ahead of auth — covers all auth
-		// paths (root included), not just the Hilt-backed IAM lookup, so a
-		// root request can still drive bucket operations.
+		// forward to Hilt; doing it here, ahead of auth, covers the presigned
+		// and POST-form auth paths as well as the header-signed one.
 		s3api.WithMiddleware("/", func(c fiber.Ctx) error {
 			c.Locals(reqscope.RequestKey(), fasthttputil.RequestFromHTTPContext(c.RequestCtx()))
 			return c.Next()
@@ -493,7 +493,8 @@ func buildS3API(ctx context.Context, backend *s3frontend.Backend, cfg config.Ser
 	opts = append(opts, s3api.WithRoute(http.MethodGet, web.WellKnownDIDPath, didDocumentHandler(doc)))
 
 	api, err := s3api.New(backend,
-		middlewares.RootUserConfig{Access: cfg.RootAccess, Secret: cfg.RootSecret},
+		// Zero value: root disabled. Every access key resolves through iam.
+		middlewares.RootUserConfig{},
 		cfg.Region, iam, loggers.S3Logger, loggers.AdminLogger, evSender, mm,
 		opts...,
 	)
@@ -518,12 +519,6 @@ func validateServerInputs(cfg config.ServerConfig, deps ServerDeps) error {
 	}
 	if cfg.DataDir == "" {
 		return errors.New("ingot: ServerConfig.DataDir is required")
-	}
-	if cfg.RootAccess == "" || cfg.RootSecret == "" {
-		return errors.New("ingot: ServerConfig.RootAccess and ServerConfig.RootSecret are required")
-	}
-	if cfg.RootAccess == "" || cfg.RootSecret == "" {
-		return errors.New("ingot: ServerConfig.RootAccess and ServerConfig.RootSecret are required")
 	}
 	if deps.BaseBlockReader == nil {
 		return errors.New("ingot: ServerDeps.BaseBlockReader is required")

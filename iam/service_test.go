@@ -264,3 +264,19 @@ func TestBaseIAMServiceParity(t *testing.T) {
 	require.Error(t, err)
 	require.NoError(t, svc.Shutdown())
 }
+
+// TestGetUserAccountForRequest_PlainAccessKey pins the no-root contract: the
+// gateway's root account is disabled, so a plain (non-did:key) access key —
+// the shape a root credential would have — resolves through this service and
+// is rejected as an unknown user before any hilt round-trip.
+func TestGetUserAccountForRequest_PlainAccessKey(t *testing.T) {
+	fake := &fakeAuthorizer{}
+	svc := iam.New(fake, iam.NewKeyProofs(), iam.NewVerificationKeyCache(), iam.NewTenantCache())
+
+	for _, access := range []string{"ingot", ""} {
+		req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+		_, err := resolveForRequest(t, svc, access, req)
+		require.ErrorIs(t, err, auth.ErrNoSuchUser, "access %q", access)
+	}
+	require.Empty(t, fake.got.Method, "hilt must not be consulted for a malformed access key")
+}

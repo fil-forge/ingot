@@ -53,7 +53,7 @@ flowchart LR
     idx["indexing-service"]
 
     client -->|"S3 REST"| ingot
-    ingot -->|"/s3/request/authorize (every non-root request)<br/>/s3/bucket/info (lazy chain completion)<br/>/s3/bucket/create, delete, list"| hilt
+    ingot -->|"/s3/request/authorize (every request)<br/>/s3/bucket/info (lazy chain completion)<br/>/s3/bucket/create, delete, list"| hilt
     ingot -->|"/blob/add, /ucan/conclude, GET /receipt/:task<br/>/blob/abort, /blob/remove, /index/add"| sprue
     ingot -->|"HTTP PUT blob bytes (allocated URL)"| piri
     ingot -->|"content/retrieve (UCAN, on read miss)"| piri
@@ -68,9 +68,9 @@ flowchart LR
 
 - Ingot never invokes `/blob/accept`: sprue owns accept (and allocate), which
   is why the conclude call carries no space proof.
-- The root account (versitygw `RootUserConfig`) bypasses hilt and holds no
-  proof store, so it can manage buckets but cannot read through the network
-  tier.
+- Versitygw's root account is disabled (an empty `RootUserConfig`), so every
+  access key resolves through hilt; a root request would reach hilt with a
+  non-DID access key and be rejected there.
 - `ListBuckets` is served entirely from hilt; the local `ingot.buckets` table
   backs every other verb.
 
@@ -362,7 +362,7 @@ sequenceDiagram
             else inner block via shard_inclusions
                 LC-->>LY: shard location + inclusive byte range
             end
-            LY->>P: content/retrieve (UCAN, audience = the commitment's provider,<br/>proofs from reqscope.ProofStore, absent for root;<br/>narrowed to the ciphertext span for an encrypted blob)
+            LY->>P: content/retrieve (UCAN, audience = the commitment's provider,<br/>proofs from reqscope.ProofStore;<br/>narrowed to the ciphertext span for an encrypted blob)
             P-->>LY: ranged bytes, length-checked
         end
         opt encrypted blob (FEE)
@@ -375,8 +375,6 @@ sequenceDiagram
 - `OpenBlob` (body blobs) checks spool then network; only `GetBlock`
   (catalog blocks) consults the log tier, and only `GetBlock` is fronted by
   the `Cached` LRU.
-- A root-account read has no request proof store, so it works only while the
-  blocks are local.
 - The indexer-backed locator (`blockstore/locator`) compiles but is never
   injected; `module.go` always wires `LocalLocator`.
 - Manifest coordinates are plaintext: `BlobRef.Start/End`, `Body.Size`,
@@ -681,8 +679,8 @@ flowchart TB
 
 - The piri provider DID is never configured: retrieval audiences come from
   the `/assert/location` commitment each read resolves.
-- The root account holds no proof store: bucket administration works, network
-  reads and space-scoped writes do not.
+- Every request carries a proof store: versitygw's root account is disabled,
+  so no auth path skips the hilt-backed IAM lookup.
 - A bucket whose last write is more than an hour old has an expired ship
   authority; a newly sealed segment then waits for the bucket's next write to
   re-capture it.
@@ -698,9 +696,9 @@ Review when these change.
 
 ## Request authorization and proof capture
 
-Every non-root request is authorized against hilt (or its cached
-delegations), and the proofs captured here are what the rest of the request
-spends.
+Every request is authorized against hilt (or its cached delegations), and
+the proofs captured here are what the rest of the request spends. Versitygw's
+root account is disabled, so no access key bypasses this path.
 
 ```mermaid
 sequenceDiagram
@@ -714,26 +712,21 @@ sequenceDiagram
 
     C->>G: signed S3 request
     G->>G: middleware stashes the raw request on ctx<br/>(reqscope, ahead of auth)
-    alt root access key
-        G->>G: RootUserConfig match, IAM skipped
-        Note over G,B: no proof store: bucket admin works,<br/>network-tier reads fail
-    else non-root key
-        G->>I: GetUserAccountForRequest
-        I->>I: access key ID parsed as a did:key
-        alt local fast path (authorizeLocal)
-            I->>K: cached derived key verifies SigV4,<br/>every command chains to the agent
-        else hilt authorize
-            I->>H: /s3/request/authorize (the signed request)
-            H-->>I: account, derived SigV4 key, fresh delegations
-            I->>K: cacheProofs (re-delegations)
-            opt chain incomplete
-                I->>H: /s3/bucket/info
-                I->>K: cache the bucket chain
-            end
+    G->>I: GetUserAccountForRequest (every access key; root disabled)
+    I->>I: access key ID parsed as a did:key
+    alt local fast path (authorizeLocal)
+        I->>K: cached derived key verifies SigV4,<br/>every command chains to the agent
+    else hilt authorize
+        I->>H: /s3/request/authorize (the signed request)
+        H-->>I: account, derived SigV4 key, fresh delegations
+        I->>K: cacheProofs (re-delegations)
+        opt chain incomplete
+            I->>H: /s3/bucket/info
+            I->>K: cache the bucket chain
         end
-        I-->>G: auth.Account with SigningKey (RoleAdmin)
-        G->>G: re-verify the signature with the derived key<br/>(covers streaming per-chunk signatures hilt never sees)
     end
+    I-->>G: auth.Account with SigningKey (RoleAdmin)
+    G->>G: re-verify the signature with the derived key<br/>(covers streaming per-chunk signatures hilt never sees)
     G->>B: handler runs with reqscope.ProofStore on ctx
 ```
 
