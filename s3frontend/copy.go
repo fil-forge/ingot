@@ -7,7 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"strings"
+	"regexp"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
@@ -154,7 +154,7 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 	// The pinned body drops its part geometry: the copy is a single-part
 	// object, as on S3.
 	crossSpace := srcRv.st.Space != bucketState.Space
-	multipartSrc := len(srcMf.Body.PartSizes) > 0 || strings.Contains(srcMf.ETag, "-")
+	multipartSrc := len(srcMf.Body.PartSizes) > 0 || isMultipartETag(srcMf.ETag)
 	ckAlgo := srcMf.ChecksumAlgorithm
 	if input.ChecksumAlgorithm != "" {
 		ckAlgo = string(input.ChecksumAlgorithm)
@@ -191,12 +191,21 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 				return s3response.CopyObjectOutput{}, fmt.Errorf("s3frontend: copy ingest: %w", err)
 			}
 			etag = hex.EncodeToString(body.MD5)
-		} else {
+		} else if multipartSrc {
+			// The pinned body keeps its bytes; only the md5 the source never
+			// recorded (its ETag is md5-of-md5s) is computed alongside the
+			// checksum.
 			sum := md5.New()
 			if _, err := io.Copy(sum, hr); err != nil {
 				return s3response.CopyObjectOutput{}, fmt.Errorf("s3frontend: copy checksum: %w", err)
 			}
 			etag = hex.EncodeToString(sum.Sum(nil))
+		} else {
+			// A single-part source's ETag already is the md5; only the newly
+			// requested checksum needs the pass.
+			if _, err := io.Copy(io.Discard, hr); err != nil {
+				return s3response.CopyObjectOutput{}, fmt.Errorf("s3frontend: copy checksum: %w", err)
+			}
 		}
 		ckVal, ckType = hr.Sum(), string(types.ChecksumTypeFullObject)
 	}
@@ -268,6 +277,14 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 	}
 	return out, nil
 }
+
+// multipartETag is the ETag shape a completed multipart upload records: the hex
+// md5 of the parts' md5s and the part count. Manifests written before part
+// geometry was recorded carry only this to say they were assembled from parts.
+var multipartETag = regexp.MustCompile(`^"?[0-9a-f]{32}-[0-9]+"?$`)
+
+// isMultipartETag reports whether etag has the multipart shape.
+func isMultipartETag(etag string) bool { return multipartETag.MatchString(etag) }
 
 // copySourceBucket resolves the copy source's bucket and requires it to belong
 // to the destination bucket's tenant. hilt makes the same decision when it

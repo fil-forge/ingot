@@ -107,7 +107,7 @@ func (b *Backend) UploadPartCopy(ctx context.Context, input *s3.UploadPartCopyIn
 		return s3response.CopyPartResult{}, err
 	}
 
-	result := s3response.CopyPartResult{ETag: &rec.etag, LastModified: time.Now()}
+	result := s3response.CopyPartResult{ETag: &rec.etag, LastModified: time.Now().UTC()}
 	setCopyPartChecksum(&result, rec.echoAlgo, rec.echoSum)
 	if srcRv.versioned() {
 		result.CopySourceVersionId = srcRv.node.VersionID

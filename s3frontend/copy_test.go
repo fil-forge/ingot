@@ -311,3 +311,19 @@ func TestCopyObject_UnknownTenantSourceIsAccessDenied(t *testing.T) {
 		t.Fatalf("copy within an unknown-tenant bucket: %v", err)
 	}
 }
+
+func TestIsMultipartETag(t *testing.T) {
+	for etag, want := range map[string]bool{
+		"cce1266ca5dbeb465a0f39ec0d6c8ad5-2":    true,
+		`"cce1266ca5dbeb465a0f39ec0d6c8ad5-12"`: true,
+		"6eb9fc855f310f9dc251ab2e5dfe179f":      false,
+		`"6eb9fc855f310f9dc251ab2e5dfe179f"`:    false,
+		"not-an-etag":                           false,
+		"6eb9fc855f310f9dc251ab2e5dfe179f-":     false,
+		"6eb9fc855f310f9dc251ab2e5dfe179f-2-3":  false,
+	} {
+		if got := isMultipartETag(etag); got != want {
+			t.Errorf("isMultipartETag(%q) = %v, want %v", etag, got, want)
+		}
+	}
+}
