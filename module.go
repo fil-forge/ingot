@@ -109,6 +109,7 @@ func Module(cfg config.Config) fx.Option {
 			provideKeyProofs,
 			provideVerificationKeyCache,
 			provideTenantCache,
+			providePermissionCache,
 			provideIAMService,
 			provideRegionKeyProvider,
 			provideTenantKeySource,
@@ -399,13 +400,20 @@ func provideTenantCache() *iam.TenantCache {
 	return iam.NewTenantCache()
 }
 
+// providePermissionCache is the per-access-key S3 permission cache shared by
+// the IAM service (fills it from Hilt, checks it on the fast path) and the
+// revocation consumer (clears a revoked key's entry).
+func providePermissionCache() *iam.PermissionCache {
+	return iam.NewPermissionCache()
+}
+
 // provideIAMService adapts the hilt client to versitygw's IAM seam: a request
 // signed with a non-root access key is authorized locally when the caches
 // hold its verification key + covering delegation chains, else by Hilt's
 // /s3/request/authorize — whose response replenishes the caches. Either way
 // the gateway verifies the signature with the derived key.
-func provideIAMService(c *hiltclient.Client, proofs *iam.KeyProofs, keys *iam.VerificationKeyCache, tenants *iam.TenantCache, reg registry.Registry, id identity.Identity, logger *zap.Logger) auth.IAMService {
-	return iam.New(c, proofs, keys, tenants,
+func provideIAMService(c *hiltclient.Client, proofs *iam.KeyProofs, keys *iam.VerificationKeyCache, tenants *iam.TenantCache, perms *iam.PermissionCache, reg registry.Registry, id identity.Identity, logger *zap.Logger) auth.IAMService {
+	return iam.New(c, proofs, keys, tenants, perms,
 		iam.WithLocalAuthorization(id.DID(), reg),
 		iam.WithLogger(logger))
 }
@@ -415,7 +423,7 @@ func provideIAMService(c *hiltclient.Client, proofs *iam.KeyProofs, keys *iam.Ve
 // persists the resume point, and iam.Revoker clears the per-access-key
 // caches a revoked delegation participates in.
 func provideRevocationConsumer(cfg config.Config, cursors registry.RevocationCursorStore,
-	proofs *iam.KeyProofs, keys *iam.VerificationKeyCache, tenants *iam.TenantCache, logger *zap.Logger) (*revocation.Consumer, error) {
+	proofs *iam.KeyProofs, keys *iam.VerificationKeyCache, tenants *iam.TenantCache, perms *iam.PermissionCache, logger *zap.Logger) (*revocation.Consumer, error) {
 	revURL, err := url.Parse(cfg.RevocationServiceURL)
 	if err != nil {
 		return nil, fmt.Errorf("ingot: parse revocation_service_url: %w", err)
@@ -428,7 +436,7 @@ func provideRevocationConsumer(cfg config.Config, cursors registry.RevocationCur
 	if err != nil {
 		return nil, fmt.Errorf("ingot: revocation service client: %w", err)
 	}
-	return revocation.NewConsumer(src, cursors, iam.NewRevoker(proofs, keys, tenants, logger),
+	return revocation.NewConsumer(src, cursors, iam.NewRevoker(proofs, keys, tenants, perms, logger),
 		revocation.WithLogger(logger)), nil
 }
 

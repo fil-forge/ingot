@@ -19,9 +19,10 @@ import (
 // TestForgeCopyAuthorization proves a copy is authorized on both ends through
 // the real hilt: the caller needs write access to the destination AND read
 // access to the source, the source resolving within the caller's tenant and
-// the key's bucket scope. Each denial is asserted twice with the same key, so
-// the second request runs after ingot has cached whatever delegations the
-// first one earned: the local fast path must refuse what hilt refuses.
+// the key's bucket scope. Each denied key first makes an allowed write, so
+// ingot holds its verification key and delegation chains, and each denial is
+// then asserted twice: the second request runs against those caches, so the
+// local fast path must refuse what hilt refuses.
 //
 //	go test -tags itest ./itest -run TestForgeCopyAuthorization -v -timeout 900s
 func TestForgeCopyAuthorization(t *testing.T) {
@@ -87,19 +88,36 @@ func TestForgeCopyAuthorization(t *testing.T) {
 		t.Fatalf("copied object: %d bytes, err %v; want %d bytes", len(got), err, len(data))
 	}
 
+	// Seed every denied key with an allowed write first. A refusal caches
+	// nothing, so without this the second attempt in twice would take the
+	// hilt path again and the fast path would go untested. After the seed,
+	// each key holds a cached verification key and delegation chains for the
+	// buckets it wrote, and the fast path must still refuse what hilt refuses.
+	// The put-only key writes both buckets: its PutObject chains carry the
+	// retrieve command over the source's space, so only the permission check
+	// stands between it and a copy it may not make.
+	seed := func(c *s3.Client, bucket string) {
+		if _, err := c.PutObject(ctx, &s3.PutObjectInput{Bucket: aws.String(bucket), Key: aws.String("seed"), Body: bytes.NewReader(data)}); err != nil {
+			t.Fatalf("seed write to %s: %v", bucket, err)
+		}
+	}
+	seed(putOnly, srcBucket)
+	seed(putOnly, dstBucket)
+	seed(dstScoped, dstBucket)
+	seed(clientB, bucketB)
+
 	// Within the tenant, a key that can write the destination but cannot read
-	// the source is refused: PutObject only, or scoped away from the source.
-	// (The scoped key can write dst; the put-only key can read nothing.)
+	// the source is refused: PutObject only (within one bucket and across
+	// two), or scoped away from the source.
+	twice(t, "put-only key copying within one bucket", func() error { return copyObj(putOnly, srcBucket, srcBucket+"/"+key) },
+		"AccessDenied", http.StatusForbidden)
 	twice(t, "put-only key copying", func() error { return copyObj(putOnly, dstBucket, srcBucket+"/"+key) },
 		"AccessDenied", http.StatusForbidden)
 	twice(t, "destination-scoped key copying from the source", func() error { return copyObj(dstScoped, dstBucket, srcBucket+"/"+key) },
 		"AccessDenied", http.StatusForbidden)
 	// The scoped key's copy within its own bucket is fine as far as hilt is
 	// concerned; it must not have been the source scope that let it through.
-	if _, err := dstScoped.PutObject(ctx, &s3.PutObjectInput{Bucket: aws.String(dstBucket), Key: aws.String("own"), Body: bytes.NewReader(data)}); err != nil {
-		t.Fatalf("destination-scoped key writing its own bucket: %v", err)
-	}
-	if err := copyObj(dstScoped, dstBucket, dstBucket+"/own"); err != nil {
+	if err := copyObj(dstScoped, dstBucket, dstBucket+"/seed"); err != nil {
 		t.Fatalf("destination-scoped key copying within its bucket: %v", err)
 	}
 

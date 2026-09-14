@@ -40,6 +40,7 @@ package iam
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 
 	"time"
@@ -89,6 +90,7 @@ type Service struct {
 	proofs     *KeyProofs
 	keys       *VerificationKeyCache
 	tenants    *TenantCache
+	perms      *PermissionCache
 	logger     *zap.Logger
 
 	// agent + buckets enable the local fast path (see WithLocalAuthorization);
@@ -130,12 +132,12 @@ func WithLocalAuthorization(agent did.DID, buckets BucketResolver) Option {
 }
 
 // New creates a Service that authorizes requests via authorizer (typically a
-// *hiltclient.Client) and deposits the delegations, verification keys and
-// tenant DID Hilt returns into proofs (per-access-key), keys and tenants —
-// the caches the retrieval path, the write path and the local fast path read
-// from.
-func New(authorizer Authorizer, proofs *KeyProofs, keys *VerificationKeyCache, tenants *TenantCache, opts ...Option) *Service {
-	s := &Service{authorizer: authorizer, proofs: proofs, keys: keys, tenants: tenants, logger: zap.NewNop()}
+// *hiltclient.Client) and deposits the delegations, verification keys, tenant
+// DID and S3 permissions Hilt returns into proofs (per-access-key), keys,
+// tenants and perms — the caches the retrieval path, the write path and the
+// local fast path read from.
+func New(authorizer Authorizer, proofs *KeyProofs, keys *VerificationKeyCache, tenants *TenantCache, perms *PermissionCache, opts ...Option) *Service {
+	s := &Service{authorizer: authorizer, proofs: proofs, keys: keys, tenants: tenants, perms: perms, logger: zap.NewNop()}
 	for _, opt := range opts {
 		opt(s)
 	}
@@ -220,6 +222,9 @@ func (s *Service) GetUserAccountForRequest(ctx fiber.Ctx, accessKeyStr string) (
 	// longer so those stragglers still hit the fast path instead of Hilt.
 	ttl := untilNextUTCMidnight(time.Now()) + sigv4.MaxClockSkew
 	s.keys.Put(accessKeyStr, ttl, ok.Keys.Entries[accessKeyID]...)
+	// The key's S3 permissions travel with the key: the fast path checks the
+	// permission each bucket needs against them, as Hilt does.
+	s.perms.Put(accessKeyStr, ttl, ok.Permissions.Entries[accessKeyID])
 	// The tenant is cached to the same horizon so the fast path can stash it,
 	// and stashed on this request for the write path.
 	s.tenants.Put(accessKeyStr, ttl, ok.Tenant)
@@ -346,14 +351,22 @@ func (s *Service) authorizeLocal(ctx context.Context, req s3.Request, access str
 		return auth.Account{}, false
 	}
 
-	// 4. For each bucket, the delegation subject is its space, and every
-	// command the permission maps to must be covered by a chain to this
-	// instance's agent in THIS key's store. Because the store holds only
-	// keyDID's delegations, a resolving agent chain is necessarily
+	// 4. For each bucket, the key must hold the S3 permission the operation
+	// needs there (cached from Hilt's authorize response), and every command
+	// the permission maps to must be covered by a chain to this instance's
+	// agent in THIS key's store, with the bucket's space as subject. The
+	// permission check is what a chain cannot express: s3:PutObject's
+	// commands include the retrieve a write's cleanup needs, which is all
+	// s3:GetObject maps to, so a PutObject-only key's chains would otherwise
+	// cover a copy's source read. Because the store holds only keyDID's
+	// delegations, a resolving agent chain is necessarily
 	// space→…→keyDID→agent — it carries both keyDID's own grant (Hilt's
-	// permission + bucket scoping) and the onward re-delegation. Cross-key
-	// mixing is structurally impossible, so one probe per command suffices.
+	// bucket scoping) and the onward re-delegation. Cross-key mixing is
+	// structurally impossible, so one probe per command suffices.
 	for _, r := range reqs {
+		if !s.perms.Has(access, r.Permission) {
+			return auth.Account{}, false
+		}
 		cmds := s3perm.CommandsFor(r.Permission)
 		if len(cmds) == 0 {
 			return auth.Account{}, false
@@ -397,7 +410,8 @@ func untilNextUTCMidnight(now time.Time) time.Duration {
 // cacheProofs deposits the authorize response's delegations into this key's
 // proof store and, when it cannot assemble a root-complete chain for one of
 // the fresh leaves, fetches the bucket→tenant→access-key remainder from
-// /s3/bucket/info (once) and caches that too.
+// /s3/bucket/info (once per bucket the request acts on: the addressed bucket,
+// plus a copy's source) and caches that too.
 func (s *Service) cacheProofs(ctx context.Context, store *DelegationCache, ctr ucan.Container, req s3.Request, keyDID did.DID) {
 	if ctr == nil || len(ctr.Delegations()) == 0 {
 		return
@@ -424,21 +438,44 @@ func (s *Service) cacheProofs(ctx context.Context, store *DelegationCache, ctr u
 		return
 	}
 
-	bucketName := bucketFromURL(req.URL)
-	if bucketName == "" {
+	buckets := requestBuckets(req)
+	if len(buckets) == 0 {
 		s.logger.Warn("hilt/iam: incomplete proof chain and no bucket in request URL",
 			zap.String("url", req.URL))
 		return
 	}
-	_, infoCtr, err := s.authorizer.BucketInfo(ctx, bucketName, keyDID)
-	if err != nil {
-		s.logger.Warn("hilt/iam: bucket info fetch for proof chain failed",
-			zap.String("bucket", bucketName), zap.Error(err))
-		return
+	for _, bucketName := range buckets {
+		_, infoCtr, err := s.authorizer.BucketInfo(ctx, bucketName, keyDID)
+		if err != nil {
+			s.logger.Warn("hilt/iam: bucket info fetch for proof chain failed",
+				zap.String("bucket", bucketName), zap.Error(err))
+			continue
+		}
+		if infoCtr != nil {
+			store.Add(infoCtr.Delegations()...)
+		}
 	}
-	if infoCtr != nil {
-		store.Add(infoCtr.Delegations()...)
+}
+
+// requestBuckets names the buckets a request acts on, in the order Hilt
+// authorizes them: the addressed bucket, then a copy's source when it is a
+// different bucket. A request Hilt cannot classify falls back to the
+// path-style bucket alone; empty for bucket-less requests (ListBuckets).
+func requestBuckets(req s3.Request) []string {
+	_, reqs, err := hiltauth.RequirementsFor(req)
+	if err != nil || len(reqs) == 0 {
+		if b := bucketFromURL(req.URL); b != "" {
+			return []string{b}
+		}
+		return nil
 	}
+	var names []string
+	for _, r := range reqs {
+		if r.Bucket != "" && !slices.Contains(names, r.Bucket) {
+			names = append(names, r.Bucket)
+		}
+	}
+	return names
 }
 
 // bucketFromURL extracts the bucket name from a path-style request URL

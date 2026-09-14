@@ -20,15 +20,16 @@ type Revoker struct {
 	proofs  *KeyProofs
 	keys    *VerificationKeyCache
 	tenants *TenantCache
+	perms   *PermissionCache
 	logger  *zap.Logger
 }
 
 // NewRevoker returns a Revoker over the caches the IAM service populates.
-func NewRevoker(proofs *KeyProofs, keys *VerificationKeyCache, tenants *TenantCache, logger *zap.Logger) *Revoker {
+func NewRevoker(proofs *KeyProofs, keys *VerificationKeyCache, tenants *TenantCache, perms *PermissionCache, logger *zap.Logger) *Revoker {
 	if logger == nil {
 		logger = zap.NewNop()
 	}
-	return &Revoker{proofs: proofs, keys: keys, tenants: tenants, logger: logger}
+	return &Revoker{proofs: proofs, keys: keys, tenants: tenants, perms: perms, logger: logger}
 }
 
 // Revoke clears the caches of every access key whose proof store holds the
@@ -46,6 +47,7 @@ func (r *Revoker) Revoke(revoked cid.Cid) []did.DID {
 		access := strings.TrimPrefix(key.String(), did.KeyPrefix)
 		r.keys.Delete(access)
 		r.tenants.Delete(access)
+		r.perms.Delete(access)
 		r.logger.Info("iam: access key caches cleared by revocation",
 			zap.Stringer("access", key), zap.Stringer("revoked", revoked))
 	}

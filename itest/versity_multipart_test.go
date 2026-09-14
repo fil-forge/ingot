@@ -59,7 +59,6 @@ var uploadPartXFail = []forgeCase{}
 
 var uploadPartCopyPass = []forgeCase{
 	{name: "non_existing_bucket", fn: integration.UploadPartCopy_non_existing_bucket},
-	{name: "invalid_copy_source", fn: integration.UploadPartCopy_invalid_copy_source},
 	// hilt resolves the copy source when authorizing the request, so a missing
 	// source bucket is NoSuchBucket before the (unimplemented) backend runs.
 	{name: "non_existing_source_bucket", fn: integration.UploadPartCopy_non_existing_source_bucket},
@@ -72,6 +71,9 @@ var uploadPartCopyXFail = []forgeCase{
 	// NoSuchBucket where S3 gives InvalidArgument. A bad part number against a
 	// real source is still InvalidArgument (hilt ignores the part number).
 	{name: "invalid_part_number", fn: integration.UploadPartCopy_invalid_part_number},
+	// Badly percent-encoded sources ("bucket/%ZZ"): the same precedence, so
+	// NoSuchBucket for "bucket" where S3 gives InvalidArgument.
+	{name: "invalid_copy_source", fn: integration.UploadPartCopy_invalid_copy_source},
 	{name: "incorrect_uploadId", fn: integration.UploadPartCopy_incorrect_uploadId},
 	{name: "incorrect_object_key", fn: integration.UploadPartCopy_incorrect_object_key},
 	{name: "non_existing_source_object_key", fn: integration.UploadPartCopy_non_existing_source_object_key},

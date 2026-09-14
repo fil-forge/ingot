@@ -721,7 +721,7 @@ sequenceDiagram
         G->>I: GetUserAccountForRequest
         I->>I: access key ID parsed as a did:key
         alt local fast path (authorizeLocal)
-            I->>K: cached derived key verifies SigV4,<br/>every command chains to the agent
+            I->>K: cached derived key verifies SigV4,<br/>the key holds each bucket's permission,<br/>every command chains to the agent
         else hilt authorize
             I->>H: /s3/request/authorize (the signed request)
             H-->>I: account, derived SigV4 key, fresh delegations

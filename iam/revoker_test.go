@@ -27,7 +27,7 @@ type revokerFixture struct {
 	tenant ucan.Issuer
 }
 
-func seedKey(t *testing.T, kp *iam.KeyProofs, keys *iam.VerificationKeyCache, tenants *iam.TenantCache) revokerFixture {
+func seedKey(t *testing.T, kp *iam.KeyProofs, keys *iam.VerificationKeyCache, tenants *iam.TenantCache, perms *iam.PermissionCache) revokerFixture {
 	t.Helper()
 	tenant, err := ed25519.GenerateIssuer()
 	require.NoError(t, err)
@@ -39,6 +39,7 @@ func seedKey(t *testing.T, kp *iam.KeyProofs, keys *iam.VerificationKeyCache, te
 	access := strings.TrimPrefix(key.DID().String(), did.KeyPrefix)
 	keys.Put(access, time.Hour, s3.VerificationKey{Kind: s3.KeyKindSigV4, Data: []byte("hmac-" + access)})
 	tenants.Put(access, time.Hour, tenant.DID())
+	perms.Put(access, time.Hour, []string{"s3:GetObject"})
 	return revokerFixture{key: key.DID(), access: access, dlg: dlg, tenant: tenant}
 }
 
@@ -47,10 +48,11 @@ func TestRevokerClearsHolderCachesOnly(t *testing.T) {
 	kp := iam.NewKeyProofs()
 	keys := iam.NewVerificationKeyCache()
 	tenants := iam.NewTenantCache()
-	r := iam.NewRevoker(kp, keys, tenants, nil)
+	perms := iam.NewPermissionCache()
+	r := iam.NewRevoker(kp, keys, tenants, perms, nil)
 
-	a := seedKey(t, kp, keys, tenants)
-	b := seedKey(t, kp, keys, tenants)
+	a := seedKey(t, kp, keys, tenants, perms)
+	b := seedKey(t, kp, keys, tenants, perms)
 
 	affected := r.Revoke(a.dlg.Link())
 	require.Equal(t, []did.DID{a.key}, affected)
@@ -63,6 +65,7 @@ func TestRevokerClearsHolderCachesOnly(t *testing.T) {
 	require.False(t, ok, "revoked key's verification key must be gone")
 	_, ok = tenants.Get(a.access)
 	require.False(t, ok, "revoked key's tenant must be gone")
+	require.False(t, perms.Has(a.access, "s3:GetObject"), "revoked key's permissions must be gone")
 
 	// Key B is untouched.
 	chain, _, err = kp.For(b.key).ProofChain(ctx, b.dlg.Audience(), b.dlg.Command(), b.tenant.DID())
@@ -72,6 +75,7 @@ func TestRevokerClearsHolderCachesOnly(t *testing.T) {
 	require.True(t, ok, "unrelated key's verification key must survive")
 	_, ok = tenants.Get(b.access)
 	require.True(t, ok, "unrelated key's tenant must survive")
+	require.True(t, perms.Has(b.access, "s3:GetObject"), "unrelated key's permissions must survive")
 
 	// Re-delivery of the same revocation is a no-op.
 	require.Empty(t, r.Revoke(a.dlg.Link()))
@@ -82,9 +86,10 @@ func TestRevokerUnknownCIDIsNoOp(t *testing.T) {
 	kp := iam.NewKeyProofs()
 	keys := iam.NewVerificationKeyCache()
 	tenants := iam.NewTenantCache()
-	r := iam.NewRevoker(kp, keys, tenants, nil)
+	perms := iam.NewPermissionCache()
+	r := iam.NewRevoker(kp, keys, tenants, perms, nil)
 
-	a := seedKey(t, kp, keys, tenants)
+	a := seedKey(t, kp, keys, tenants, perms)
 	// A delegation never deposited anywhere: nothing cached depends on it.
 	stranger, err := ed25519.GenerateIssuer()
 	require.NoError(t, err)
