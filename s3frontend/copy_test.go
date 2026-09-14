@@ -20,6 +20,7 @@ import (
 	"github.com/fil-forge/versitygw/s3err"
 	"github.com/fil-forge/versitygw/s3response"
 
+	msbucket "github.com/fil-forge/ingot/bucket"
 	"github.com/fil-forge/ingot/registry"
 )
 
@@ -325,5 +326,37 @@ func TestIsMultipartETag(t *testing.T) {
 		if got := isMultipartETag(etag); got != want {
 			t.Errorf("isMultipartETag(%q) = %v, want %v", etag, got, want)
 		}
+	}
+}
+
+// A source written before every object carried a checksum has none to carry
+// over; the copy computes the default CRC64NVME over the bytes instead.
+func TestCopyObject_SourceWithoutChecksumGetsDefault(t *testing.T) {
+	b, mem, _ := newRefTestBackend(t)
+	ctx := context.Background()
+	st, err := mem.Get(ctx, "bk")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := []byte("legacy object")
+	body, err := b.ingestBody(ctx, st, bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := &msbucket.ObjectManifest{Key: "legacy", Created: time.Now().Unix(), Body: body, ETag: hex.EncodeToString(body.MD5), ContentType: "application/octet-stream"}
+	if _, _, err := b.commitVersion(ctx, st, "legacy", legacy, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	bucket, key, source := "bk", "copied", "bk/legacy"
+	out, err := b.CopyObject(ctx, s3response.CopyObjectInput{Bucket: &bucket, Key: &key, CopySource: &source})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.CopyObjectResult.ChecksumCRC64NVME == nil || out.CopyObjectResult.ChecksumType != types.ChecksumTypeFullObject {
+		t.Fatalf("copy of a checksum-less source = %+v, want a FULL_OBJECT CRC64NVME", out.CopyObjectResult)
+	}
+	if want := `"` + legacy.ETag + `"`; *out.CopyObjectResult.ETag != want {
+		t.Fatalf("copy ETag = %s, want the source's %s", *out.CopyObjectResult.ETag, want)
 	}
 }

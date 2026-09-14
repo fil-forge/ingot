@@ -165,7 +165,9 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 	}
 	body, etag := srcMf.Body, srcMf.ETag
 	body.PartSizes, body.PartChecksums = nil, nil
-	if crossSpace || multipartSrc || ckAlgo != srcMf.ChecksumAlgorithm {
+	// A source without any checksum (a manifest from before every object
+	// carried one) also takes the pass, so the copy gets the default.
+	if crossSpace || multipartSrc || ckAlgo == "" || ckAlgo != srcMf.ChecksumAlgorithm {
 		if ckAlgo == "" {
 			ckAlgo = string(types.ChecksumAlgorithmCrc64nvme)
 		}

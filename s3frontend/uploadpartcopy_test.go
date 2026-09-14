@@ -167,6 +167,7 @@ func TestUploadPartCopy_Errors(t *testing.T) {
 	if _, err := b.UploadPart(ctx, &s3.UploadPartInput{Bucket: &other, Key: strPtr("dst"), UploadId: &id, PartNumber: &one, Body: bytes.NewReader([]byte("x"))}); apiErrCode(t, err) != "NoSuchUpload" {
 		t.Fatalf("mismatched bucket on upload: %v", err)
 	}
+
 	if _, err := upc(t, b, "dst", id, 1, "no-such-bucket/src", nil); apiErrCode(t, err) != "NoSuchBucket" {
 		t.Fatalf("missing source bucket: %v", err)
 	}
@@ -186,6 +187,24 @@ func TestUploadPartCopy_Errors(t *testing.T) {
 		in.CopySourceIfNoneMatch = strPtr(trimQuotes(putETag(t, b, "src")))
 	}); !errors.Is(err, s3err.GetAPIError(s3err.ErrPreconditionFailed)) {
 		t.Fatalf("matching If-None-Match: %v, want 412", err)
+	}
+
+	// Nor may Complete assemble a session addressed through another bucket
+	// or key; it stays completable under its own. Last, since it ends the
+	// session.
+	res, err := upc(t, b, "dst", id, 1, "bk/src", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := b.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{Bucket: &other, Key: strPtr("dst"), UploadId: &id,
+		MultipartUpload: &types.CompletedMultipartUpload{Parts: []types.CompletedPart{completed(res, 1)}}}); apiErrCode(t, err) != "NoSuchUpload" {
+		t.Fatalf("complete through another bucket: %v", err)
+	}
+	if _, err := mpComplete(t, b, "other-key", id, []types.CompletedPart{completed(res, 1)}, nil); apiErrCode(t, err) != "NoSuchUpload" {
+		t.Fatalf("complete through another key: %v", err)
+	}
+	if _, err := mpComplete(t, b, "dst", id, []types.CompletedPart{completed(res, 1)}, nil); err != nil {
+		t.Fatalf("complete under its own bucket and key: %v", err)
 	}
 }
 

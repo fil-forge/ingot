@@ -380,6 +380,13 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 		}
 		return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: complete: %w", err)
 	}
+	// Upload ids are global: the session must be this bucket and key's, or the
+	// assembly below would commit another upload's parts under the request's
+	// target. Unlike openSession this admits a completed session, which the
+	// idempotent re-Complete replays.
+	if sess.Bucket != bucket || sess.ObjectKey != key {
+		return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrNoSuchUpload)
+	}
 
 	// A Complete naming a checksum type must match the CreateMultipartUpload
 	// declaration (a session without one reports the literal "null").
