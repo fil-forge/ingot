@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -236,6 +237,246 @@ func TestForgeScenarios(t *testing.T) {
 		hdr := fmt.Sprintf("bytes=%d-%d", p1-10, p1+2000)
 		if got := getBody(t, ctx, cl, bucket, key, hdr); !bytes.Equal(got, whole[p1-10:p1+2001]) {
 			t.Fatalf("ranged multipart GET across the part boundary mismatch: got %d bytes", len(got))
+		}
+	})
+
+	// HeadListPlaintextSizes: every size and ETag ingot reports is the
+	// plaintext value from the manifest, never the size of a stored FEE
+	// envelope or their sum. The spooled envelopes are measured inside the
+	// container so the assertions can name that failure mode. Checked through
+	// HEAD, GET (whole, ranged, ?partNumber), GetObjectAttributes,
+	// ListObjects, ListObjectsV2 and ListObjectVersions, for a single-PUT
+	// object and a multipart object, each spanning several envelopes.
+	t.Run("HeadListPlaintextSizes", func(t *testing.T) {
+		const bucket = "plainsizes"
+		if _, err := cl.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
+			t.Fatalf("CreateBucket: %v", err)
+		}
+
+		type object struct {
+			key       string
+			plaintext []byte
+			etag      string
+			envelopes []int64
+			envTotal  int64
+		}
+		var objects []object
+
+		// A stored envelope's size, or the envelopes' total, leaking into a
+		// response is the specific failure these assertions name.
+		assertSize := func(t *testing.T, what string, got int64, want int64, o object) {
+			t.Helper()
+			if got == want {
+				return
+			}
+			for _, e := range o.envelopes {
+				if got == e {
+					t.Fatalf("%s = %d: a stored envelope's size, want the plaintext %d", what, got, want)
+				}
+			}
+			if got == o.envTotal {
+				t.Fatalf("%s = %d: the stored envelopes' total, want the plaintext %d", what, got, want)
+			}
+			t.Fatalf("%s = %d, want the plaintext %d", what, got, want)
+		}
+		assertETag := func(t *testing.T, what string, got *string, want string) {
+			t.Helper()
+			if g := strings.Trim(aws.ToString(got), `"`); g != want {
+				t.Fatalf("%s ETag = %q, want the plaintext-derived %q", what, g, want)
+			}
+		}
+		// envelopeSizes measures the spool files a write added.
+		envelopeSizes := func(t *testing.T, before, after map[string]bool) ([]int64, int64) {
+			t.Helper()
+			paths := newSpoolPaths(before, after)
+			if len(paths) < 2 {
+				t.Fatalf("write spooled %d envelopes, want several (small blob ceiling)", len(paths))
+			}
+			var sizes []int64
+			var total int64
+			for _, p := range paths {
+				out, errOut, err := s.Exec(ctx, "ingot", "stat", "-c", "%s", p)
+				if err != nil {
+					t.Fatalf("stat %s: %v (stderr=%s)", p, err, errOut)
+				}
+				n, err := strconv.ParseInt(strings.TrimSpace(out), 10, 64)
+				if err != nil {
+					t.Fatalf("parse size %q: %v", out, err)
+				}
+				sizes = append(sizes, n)
+				total += n
+			}
+			return sizes, total
+		}
+
+		// Single PUT: 200 KiB + 37 bytes → four envelopes at 64 KiB.
+		single := patternBytes((200 << 10) + 37)
+		before := spoolBlobPaths(t, ctx, s)
+		if _, err := cl.PutObject(ctx, &s3.PutObjectInput{Bucket: aws.String(bucket), Key: aws.String("single"), Body: bytes.NewReader(single)}); err != nil {
+			t.Fatalf("PutObject: %v", err)
+		}
+		sizes, total := envelopeSizes(t, before, spoolBlobPaths(t, ctx, s))
+		sum := md5.Sum(single)
+		objects = append(objects, object{"single", single, hex.EncodeToString(sum[:]), sizes, total})
+
+		// Multipart: two parts, the first spanning many envelopes.
+		partData := [][]byte{tagged(patternBytes((5<<20)+4096), 0x61), tagged(patternBytes(9<<10), 0x62)}
+		before = spoolBlobPaths(t, ctx, s)
+		create, err := cl.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{Bucket: aws.String(bucket), Key: aws.String("multipart")})
+		if err != nil {
+			t.Fatalf("CreateMultipartUpload: %v", err)
+		}
+		var completed []types.CompletedPart
+		var mpWhole []byte
+		etagCat := md5.New()
+		for i, data := range partData {
+			pn := int32(i + 1)
+			up, err := cl.UploadPart(ctx, &s3.UploadPartInput{
+				Bucket: aws.String(bucket), Key: aws.String("multipart"), UploadId: create.UploadId,
+				PartNumber: aws.Int32(pn), Body: bytes.NewReader(data),
+			})
+			if err != nil {
+				t.Fatalf("UploadPart %d: %v", pn, err)
+			}
+			completed = append(completed, types.CompletedPart{PartNumber: aws.Int32(pn), ETag: up.ETag})
+			mpWhole = append(mpWhole, data...)
+			md := md5.Sum(data)
+			etagCat.Write(md[:])
+		}
+		if _, err := cl.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+			Bucket: aws.String(bucket), Key: aws.String("multipart"), UploadId: create.UploadId,
+			MultipartUpload: &types.CompletedMultipartUpload{Parts: completed},
+		}); err != nil {
+			t.Fatalf("CompleteMultipartUpload: %v", err)
+		}
+		sizes, total = envelopeSizes(t, before, spoolBlobPaths(t, ctx, s))
+		mp := object{"multipart", mpWhole, hex.EncodeToString(etagCat.Sum(nil)) + "-2", sizes, total}
+		objects = append(objects, mp)
+
+		for _, o := range objects {
+			if o.envTotal <= int64(len(o.plaintext)) {
+				t.Fatalf("%s stored %d bytes for %d plaintext; envelopes must be larger", o.key, o.envTotal, len(o.plaintext))
+			}
+			want := int64(len(o.plaintext))
+
+			head, err := cl.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(bucket), Key: aws.String(o.key)})
+			if err != nil {
+				t.Fatalf("HeadObject %s: %v", o.key, err)
+			}
+			assertSize(t, "HEAD "+o.key+" Content-Length", aws.ToInt64(head.ContentLength), want, o)
+			assertETag(t, "HEAD "+o.key, head.ETag, o.etag)
+
+			get, err := cl.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(bucket), Key: aws.String(o.key)})
+			if err != nil {
+				t.Fatalf("GetObject %s: %v", o.key, err)
+			}
+			get.Body.Close()
+			assertSize(t, "GET "+o.key+" Content-Length", aws.ToInt64(get.ContentLength), want, o)
+			assertETag(t, "GET "+o.key, get.ETag, o.etag)
+
+			rget, err := cl.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(bucket), Key: aws.String(o.key), Range: aws.String("bytes=10-2009")})
+			if err != nil {
+				t.Fatalf("GetObject %s range: %v", o.key, err)
+			}
+			rget.Body.Close()
+			assertSize(t, "ranged GET "+o.key+" Content-Length", aws.ToInt64(rget.ContentLength), 2000, o)
+			if wantCR := fmt.Sprintf("bytes 10-2009/%d", want); aws.ToString(rget.ContentRange) != wantCR {
+				t.Fatalf("ranged GET %s Content-Range = %q, want %q", o.key, aws.ToString(rget.ContentRange), wantCR)
+			}
+
+			attrs, err := cl.GetObjectAttributes(ctx, &s3.GetObjectAttributesInput{
+				Bucket: aws.String(bucket), Key: aws.String(o.key),
+				ObjectAttributes: []types.ObjectAttributes{types.ObjectAttributesObjectSize, types.ObjectAttributesEtag},
+			})
+			if err != nil {
+				t.Fatalf("GetObjectAttributes %s: %v", o.key, err)
+			}
+			assertSize(t, "GetObjectAttributes "+o.key+" ObjectSize", aws.ToInt64(attrs.ObjectSize), want, o)
+			assertETag(t, "GetObjectAttributes "+o.key, attrs.ETag, o.etag)
+		}
+
+		// ?partNumber on the multipart object, via HEAD and GET (separate
+		// paths): the part's plaintext length and its plaintext offset within
+		// the plaintext total.
+		assertPart := func(t *testing.T, what string, length *int64, contentRange *string, partsCount *int32, wantLen int64, wantCR string) {
+			t.Helper()
+			assertSize(t, what+" Content-Length", aws.ToInt64(length), wantLen, mp)
+			if aws.ToString(contentRange) != wantCR {
+				t.Fatalf("%s Content-Range = %q, want %q", what, aws.ToString(contentRange), wantCR)
+			}
+			if aws.ToInt32(partsCount) != int32(len(partData)) {
+				t.Fatalf("%s PartsCount = %d, want %d", what, aws.ToInt32(partsCount), len(partData))
+			}
+		}
+		var offset int64
+		for i, data := range partData {
+			pn := int32(i + 1)
+			wantCR := fmt.Sprintf("bytes %d-%d/%d", offset, offset+int64(len(data))-1, len(mpWhole))
+			head, err := cl.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(bucket), Key: aws.String("multipart"), PartNumber: aws.Int32(pn)})
+			if err != nil {
+				t.Fatalf("HeadObject partNumber=%d: %v", pn, err)
+			}
+			assertPart(t, fmt.Sprintf("HEAD partNumber=%d", pn), head.ContentLength, head.ContentRange, head.PartsCount, int64(len(data)), wantCR)
+
+			get, err := cl.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(bucket), Key: aws.String("multipart"), PartNumber: aws.Int32(pn)})
+			if err != nil {
+				t.Fatalf("GetObject partNumber=%d: %v", pn, err)
+			}
+			body, err := io.ReadAll(get.Body)
+			get.Body.Close()
+			if err != nil {
+				t.Fatalf("read GET partNumber=%d: %v", pn, err)
+			}
+			assertPart(t, fmt.Sprintf("GET partNumber=%d", pn), get.ContentLength, get.ContentRange, get.PartsCount, int64(len(data)), wantCR)
+			if !bytes.Equal(body, data) {
+				t.Fatalf("GET partNumber=%d returned %d bytes that are not part %d", pn, len(body), pn)
+			}
+			offset += int64(len(data))
+		}
+
+		// Listings.
+		byKey := map[string]object{}
+		for _, o := range objects {
+			byKey[o.key] = o
+		}
+		check := func(what, key string, size *int64, etag *string) {
+			t.Helper()
+			o, ok := byKey[key]
+			if !ok {
+				t.Fatalf("%s listed unexpected key %q", what, key)
+			}
+			assertSize(t, what+" "+key+" Size", aws.ToInt64(size), int64(len(o.plaintext)), o)
+			assertETag(t, what+" "+key, etag, o.etag)
+		}
+		v1, err := cl.ListObjects(ctx, &s3.ListObjectsInput{Bucket: aws.String(bucket)})
+		if err != nil {
+			t.Fatalf("ListObjects: %v", err)
+		}
+		if len(v1.Contents) != len(objects) {
+			t.Fatalf("ListObjects returned %d keys, want %d", len(v1.Contents), len(objects))
+		}
+		for _, c := range v1.Contents {
+			check("ListObjects", aws.ToString(c.Key), c.Size, c.ETag)
+		}
+		v2, err := cl.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: aws.String(bucket)})
+		if err != nil {
+			t.Fatalf("ListObjectsV2: %v", err)
+		}
+		if len(v2.Contents) != len(objects) {
+			t.Fatalf("ListObjectsV2 returned %d keys, want %d", len(v2.Contents), len(objects))
+		}
+		for _, c := range v2.Contents {
+			check("ListObjectsV2", aws.ToString(c.Key), c.Size, c.ETag)
+		}
+		lv, err := cl.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{Bucket: aws.String(bucket)})
+		if err != nil {
+			t.Fatalf("ListObjectVersions: %v", err)
+		}
+		if len(lv.Versions) != len(objects) {
+			t.Fatalf("ListObjectVersions returned %d versions, want %d", len(lv.Versions), len(objects))
+		}
+		for _, v := range lv.Versions {
+			check("ListObjectVersions", aws.ToString(v.Key), v.Size, v.ETag)
 		}
 	})
 
