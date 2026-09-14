@@ -168,8 +168,9 @@ type serverParams struct {
 	// issuer of every outbound invocation); the listener serves its DID
 	// document at /.well-known/did.json. Required.
 	Identity identity.Identity
-	// IAM authenticates non-root access keys. Required: New rejects a nil
-	// IAM, so the graph fails at validation rather than in OnStart.
+	// IAM authenticates every access key (the gateway has no root account).
+	// Required: New rejects a nil IAM, so the graph fails at validation
+	// rather than in OnStart.
 	IAM       auth.IAMService
 	PreStarts []PreStartHook `group:"ingot_prestart"`
 	EncParams registry.EncryptionParamsStore
@@ -400,7 +401,7 @@ func provideTenantCache() *iam.TenantCache {
 }
 
 // provideIAMService adapts the hilt client to versitygw's IAM seam: a request
-// signed with a non-root access key is authorized locally when the caches
+// signed with a hilt-issued access key is authorized locally when the caches
 // hold its verification key + covering delegation chains, else by Hilt's
 // /s3/request/authorize — whose response replenishes the caches. Either way
 // the gateway verifies the signature with the derived key.
