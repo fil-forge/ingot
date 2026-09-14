@@ -1,10 +1,12 @@
 package s3frontend
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"testing"
@@ -46,6 +48,22 @@ func assertPlaintextSize(t *testing.T, what string, got int64, want int64, envel
 		t.Fatalf("%s = %d: the stored envelopes' total, want the plaintext %d", what, got, want)
 	}
 	t.Fatalf("%s = %d, want the plaintext %d", what, got, want)
+}
+
+// assertPartHeaders checks a ?partNumber response's Content-Length,
+// Content-Range and PartsCount against the part's plaintext coordinates.
+func assertPartHeaders(t *testing.T, what string, length *int64, contentRange *string, partsCount *int32, wantLen int64, wantCR string, wantParts int32, envelopes []int64, envelopeTotal int64) {
+	t.Helper()
+	if length == nil {
+		t.Fatalf("%s: no Content-Length", what)
+	}
+	assertPlaintextSize(t, what+" Content-Length", *length, wantLen, envelopes, envelopeTotal)
+	if contentRange == nil || *contentRange != wantCR {
+		t.Fatalf("%s Content-Range = %v, want %q", what, contentRange, wantCR)
+	}
+	if partsCount == nil || *partsCount != wantParts {
+		t.Fatalf("%s PartsCount = %v, want %d", what, partsCount, wantParts)
+	}
 }
 
 func assertETag(t *testing.T, what string, got *string, want string) {
@@ -167,24 +185,33 @@ func TestHeadListReportPlaintextSizes(t *testing.T) {
 		assertETag(t, "GetObjectAttributes "+o.key, attrs.ETag, o.etag)
 	}
 
-	// The multipart object's parts: ?partNumber HEAD and GetObjectAttributes
-	// report each part's plaintext length, and Content-Range its plaintext
-	// offset within the plaintext total.
+	// The multipart object's parts: ?partNumber HEAD and GET, and
+	// GetObjectAttributes, report each part's plaintext length, and
+	// Content-Range its plaintext offset within the plaintext total. HEAD and
+	// GET resolve the part on separate paths, so both are checked.
 	env, envTotal := envelopes[mpKey], envelopeTotal[mpKey]
 	var offset int64
 	for i, data := range parts {
 		pn := int32(i + 1)
+		wantCR := fmt.Sprintf("bytes %d-%d/%d", offset, offset+int64(len(data))-1, len(mpWhole))
 		head, err := b.HeadObject(ctx, &s3.HeadObjectInput{Bucket: &bucket, Key: &mpKey, PartNumber: &pn})
 		if err != nil {
 			t.Fatalf("HeadObject partNumber=%d: %v", pn, err)
 		}
-		assertPlaintextSize(t, fmt.Sprintf("HEAD partNumber=%d Content-Length", pn), *head.ContentLength, int64(len(data)), env, envTotal)
-		wantCR := fmt.Sprintf("bytes %d-%d/%d", offset, offset+int64(len(data))-1, len(mpWhole))
-		if head.ContentRange == nil || *head.ContentRange != wantCR {
-			t.Fatalf("HEAD partNumber=%d Content-Range = %v, want %q", pn, head.ContentRange, wantCR)
+		assertPartHeaders(t, fmt.Sprintf("HEAD partNumber=%d", pn), head.ContentLength, head.ContentRange, head.PartsCount, int64(len(data)), wantCR, int32(len(parts)), env, envTotal)
+
+		get, err := b.GetObject(ctx, &s3.GetObjectInput{Bucket: &bucket, Key: &mpKey, PartNumber: &pn})
+		if err != nil {
+			t.Fatalf("GetObject partNumber=%d: %v", pn, err)
 		}
-		if head.PartsCount == nil || *head.PartsCount != int32(len(parts)) {
-			t.Fatalf("HEAD partNumber=%d PartsCount = %v, want %d", pn, head.PartsCount, len(parts))
+		body, err := io.ReadAll(get.Body)
+		get.Body.Close()
+		if err != nil {
+			t.Fatalf("read GET partNumber=%d: %v", pn, err)
+		}
+		assertPartHeaders(t, fmt.Sprintf("GET partNumber=%d", pn), get.ContentLength, get.ContentRange, get.PartsCount, int64(len(data)), wantCR, int32(len(parts)), env, envTotal)
+		if !bytes.Equal(body, data) {
+			t.Fatalf("GET partNumber=%d returned %d bytes that are not part %d", pn, len(body), pn)
 		}
 		offset += int64(len(data))
 	}

@@ -395,21 +395,41 @@ func TestForgeScenarios(t *testing.T) {
 			assertETag(t, "GetObjectAttributes "+o.key, attrs.ETag, o.etag)
 		}
 
-		// ?partNumber on the multipart object: the part's plaintext length
-		// and its plaintext offset within the plaintext total.
+		// ?partNumber on the multipart object, via HEAD and GET (separate
+		// paths): the part's plaintext length and its plaintext offset within
+		// the plaintext total.
+		assertPart := func(t *testing.T, what string, length *int64, contentRange *string, partsCount *int32, wantLen int64, wantCR string) {
+			t.Helper()
+			assertSize(t, what+" Content-Length", aws.ToInt64(length), wantLen, mp)
+			if aws.ToString(contentRange) != wantCR {
+				t.Fatalf("%s Content-Range = %q, want %q", what, aws.ToString(contentRange), wantCR)
+			}
+			if aws.ToInt32(partsCount) != int32(len(partData)) {
+				t.Fatalf("%s PartsCount = %d, want %d", what, aws.ToInt32(partsCount), len(partData))
+			}
+		}
 		var offset int64
 		for i, data := range partData {
 			pn := int32(i + 1)
+			wantCR := fmt.Sprintf("bytes %d-%d/%d", offset, offset+int64(len(data))-1, len(mpWhole))
 			head, err := cl.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(bucket), Key: aws.String("multipart"), PartNumber: aws.Int32(pn)})
 			if err != nil {
 				t.Fatalf("HeadObject partNumber=%d: %v", pn, err)
 			}
-			assertSize(t, fmt.Sprintf("HEAD partNumber=%d Content-Length", pn), aws.ToInt64(head.ContentLength), int64(len(data)), mp)
-			if wantCR := fmt.Sprintf("bytes %d-%d/%d", offset, offset+int64(len(data))-1, len(mpWhole)); aws.ToString(head.ContentRange) != wantCR {
-				t.Fatalf("HEAD partNumber=%d Content-Range = %q, want %q", pn, aws.ToString(head.ContentRange), wantCR)
+			assertPart(t, fmt.Sprintf("HEAD partNumber=%d", pn), head.ContentLength, head.ContentRange, head.PartsCount, int64(len(data)), wantCR)
+
+			get, err := cl.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(bucket), Key: aws.String("multipart"), PartNumber: aws.Int32(pn)})
+			if err != nil {
+				t.Fatalf("GetObject partNumber=%d: %v", pn, err)
 			}
-			if aws.ToInt32(head.PartsCount) != int32(len(partData)) {
-				t.Fatalf("HEAD partNumber=%d PartsCount = %d, want %d", pn, aws.ToInt32(head.PartsCount), len(partData))
+			body, err := io.ReadAll(get.Body)
+			get.Body.Close()
+			if err != nil {
+				t.Fatalf("read GET partNumber=%d: %v", pn, err)
+			}
+			assertPart(t, fmt.Sprintf("GET partNumber=%d", pn), get.ContentLength, get.ContentRange, get.PartsCount, int64(len(data)), wantCR)
+			if !bytes.Equal(body, data) {
+				t.Fatalf("GET partNumber=%d returned %d bytes that are not part %d", pn, len(body), pn)
 			}
 			offset += int64(len(data))
 		}
