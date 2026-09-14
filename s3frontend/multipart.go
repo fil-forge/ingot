@@ -127,17 +127,22 @@ func (b *Backend) CreateMultipartUpload(ctx context.Context, input s3response.Cr
 }
 
 // openSession fetches uploadID's session and maps anything that is not an
-// in-flight upload for (bucket, key) to NoSuchUpload: unknown id, a key that
-// doesn't match the session's, or a session no longer open (completed uploads
-// are retained for Complete idempotency but are gone as far as the other
-// multipart operations are concerned).
-func (b *Backend) openSession(ctx context.Context, uploadID string, key *string) (*registry.MultipartSession, error) {
+// in-flight upload for (bucket, key) to NoSuchUpload: unknown id, a bucket or
+// key that doesn't match the session's, or a session no longer open (completed
+// uploads are retained for Complete idempotency but are gone as far as the
+// other multipart operations are concerned). Upload ids are global, so the
+// bucket check is what keeps a request addressed to one bucket from acting on
+// a session that belongs to another.
+func (b *Backend) openSession(ctx context.Context, uploadID string, bucket, key *string) (*registry.MultipartSession, error) {
 	sess, err := b.multipart.GetSession(ctx, uploadID)
 	if err != nil {
 		if errors.Is(err, registry.ErrNotFound) {
 			return nil, s3err.GetAPIError(s3err.ErrNoSuchUpload)
 		}
 		return nil, fmt.Errorf("s3frontend: get session: %w", err)
+	}
+	if bucket != nil && *bucket != sess.Bucket {
+		return nil, s3err.GetAPIError(s3err.ErrNoSuchUpload)
 	}
 	if key != nil && *key != sess.ObjectKey {
 		return nil, s3err.GetAPIError(s3err.ErrNoSuchUpload)
@@ -182,7 +187,7 @@ func (b *Backend) UploadPart(ctx context.Context, input *s3.UploadPartInput) (*s
 		return nil, s3err.GetAPIError(s3err.ErrInvalidRequest)
 	}
 	uploadID := *input.UploadId
-	sess, err := b.openSession(ctx, uploadID, input.Key)
+	sess, err := b.openSession(ctx, uploadID, input.Bucket, input.Key)
 	if err != nil {
 		return nil, err
 	}
@@ -791,7 +796,7 @@ func (b *Backend) AbortMultipartUpload(ctx context.Context, input *s3.AbortMulti
 		return s3err.GetAPIError(s3err.ErrInvalidRequest)
 	}
 	uploadID := *input.UploadId
-	sess, err := b.openSession(ctx, uploadID, input.Key)
+	sess, err := b.openSession(ctx, uploadID, input.Bucket, input.Key)
 	if err != nil {
 		return err
 	}
@@ -1132,7 +1137,7 @@ func (b *Backend) ListParts(ctx context.Context, input *s3.ListPartsInput) (s3re
 		return s3response.ListPartsResult{}, s3err.GetAPIError(s3err.ErrInvalidRequest)
 	}
 	uploadID := *input.UploadId
-	sess, err := b.openSession(ctx, uploadID, input.Key)
+	sess, err := b.openSession(ctx, uploadID, input.Bucket, input.Key)
 	if err != nil {
 		return s3response.ListPartsResult{}, err
 	}

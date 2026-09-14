@@ -17,6 +17,7 @@ import (
 	"github.com/fil-forge/versitygw/s3response"
 
 	msbucket "github.com/fil-forge/ingot/bucket"
+	"github.com/fil-forge/ingot/internal/reqscope"
 	"github.com/fil-forge/ingot/registry"
 )
 
@@ -44,7 +45,10 @@ func (b *Backend) UploadPartCopy(ctx context.Context, input *s3.UploadPartCopyIn
 	if input.Bucket == nil || input.Key == nil || input.UploadId == nil || input.PartNumber == nil || input.CopySource == nil {
 		return s3response.CopyPartResult{}, s3err.GetAPIError(s3err.ErrInvalidRequest)
 	}
-	sess, err := b.openSession(ctx, *input.UploadId, input.Key)
+	if req, ok := reqscope.Request(ctx); ok && requestsServerSideEncryption(req.Headers) {
+		return s3response.CopyPartResult{}, s3err.GetAPIError(s3err.ErrNotImplemented)
+	}
+	sess, err := b.openSession(ctx, *input.UploadId, input.Bucket, input.Key)
 	if err != nil {
 		return s3response.CopyPartResult{}, err
 	}

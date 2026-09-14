@@ -155,6 +155,18 @@ func TestUploadPartCopy_Errors(t *testing.T) {
 	if _, err := upc(t, b, "other-key", id, 1, "bk/src", nil); apiErrCode(t, err) != "NoSuchUpload" {
 		t.Fatalf("mismatched key: %v", err)
 	}
+	// A valid upload id and key addressed through another bucket is not that
+	// bucket's upload: neither a copy nor an upload may write the session.
+	if err := mem.Create(ctx, "other-bucket", testutil.RandomDID(t), registry.CreateState{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := upc(t, b, "dst", id, 1, "bk/src", func(in *s3.UploadPartCopyInput) { in.Bucket = strPtr("other-bucket") }); apiErrCode(t, err) != "NoSuchUpload" {
+		t.Fatalf("mismatched bucket on copy: %v", err)
+	}
+	other, one := "other-bucket", int32(1)
+	if _, err := b.UploadPart(ctx, &s3.UploadPartInput{Bucket: &other, Key: strPtr("dst"), UploadId: &id, PartNumber: &one, Body: bytes.NewReader([]byte("x"))}); apiErrCode(t, err) != "NoSuchUpload" {
+		t.Fatalf("mismatched bucket on upload: %v", err)
+	}
 	if _, err := upc(t, b, "dst", id, 1, "no-such-bucket/src", nil); apiErrCode(t, err) != "NoSuchBucket" {
 		t.Fatalf("missing source bucket: %v", err)
 	}
