@@ -4,8 +4,11 @@ package itest
 
 import (
 	"bytes"
+	"crypto/md5"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"testing"
@@ -233,6 +236,109 @@ func TestForgeScenarios(t *testing.T) {
 		hdr := fmt.Sprintf("bytes=%d-%d", p1-10, p1+2000)
 		if got := getBody(t, ctx, cl, bucket, key, hdr); !bytes.Equal(got, whole[p1-10:p1+2001]) {
 			t.Fatalf("ranged multipart GET across the part boundary mismatch: got %d bytes", len(got))
+		}
+	})
+
+	// MultipartOutOfOrderParts: part numbers, not arrival order, define the
+	// object. Parts uploaded 3, 1, 2 list ascending by part number; Complete
+	// assembles the body and the md5-of-md5s ETag in part-number order; a
+	// range across the part-1→part-2 boundary and ?partNumber=2 both read
+	// the re-sequenced blob list. Distinct content per part so a body glued
+	// in arrival order cannot pass the comparison.
+	t.Run("MultipartOutOfOrderParts", func(t *testing.T) {
+		const bucket, key = "mp-order", "obj"
+		if _, err := cl.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
+			t.Fatalf("CreateBucket: %v", err)
+		}
+		create, err := cl.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
+			Bucket: aws.String(bucket), Key: aws.String(key),
+		})
+		if err != nil {
+			t.Fatalf("CreateMultipartUpload: %v", err)
+		}
+		uploadID := create.UploadId
+
+		partData := [][]byte{
+			tagged(patternBytes(5<<20), 0x41),
+			tagged(patternBytes((5<<20)+4096), 0x42),
+			tagged(patternBytes(9<<10), 0x43),
+		}
+		etags := make([]*string, len(partData))
+		for _, pn := range []int32{3, 1, 2} {
+			up, err := cl.UploadPart(ctx, &s3.UploadPartInput{
+				Bucket: aws.String(bucket), Key: aws.String(key), UploadId: uploadID,
+				PartNumber: aws.Int32(pn), Body: bytes.NewReader(partData[pn-1]),
+			})
+			if err != nil {
+				t.Fatalf("UploadPart %d: %v", pn, err)
+			}
+			etags[pn-1] = up.ETag
+		}
+
+		lp, err := cl.ListParts(ctx, &s3.ListPartsInput{Bucket: aws.String(bucket), Key: aws.String(key), UploadId: uploadID})
+		if err != nil {
+			t.Fatalf("ListParts: %v", err)
+		}
+		if len(lp.Parts) != len(partData) {
+			t.Fatalf("ListParts returned %d parts, want %d", len(lp.Parts), len(partData))
+		}
+		for i, p := range lp.Parts {
+			want := int32(i + 1)
+			if aws.ToInt32(p.PartNumber) != want {
+				t.Fatalf("ListParts[%d].PartNumber = %d, want %d", i, aws.ToInt32(p.PartNumber), want)
+			}
+			if aws.ToInt64(p.Size) != int64(len(partData[i])) {
+				t.Fatalf("ListParts part %d size = %d, want %d", want, aws.ToInt64(p.Size), len(partData[i]))
+			}
+			if strings.Trim(aws.ToString(p.ETag), `"`) != strings.Trim(aws.ToString(etags[i]), `"`) {
+				t.Fatalf("ListParts part %d ETag = %q, want %q", want, aws.ToString(p.ETag), aws.ToString(etags[i]))
+			}
+		}
+
+		var completed []types.CompletedPart
+		var whole []byte
+		etagCat := md5.New()
+		for i, data := range partData {
+			completed = append(completed, types.CompletedPart{PartNumber: aws.Int32(int32(i + 1)), ETag: etags[i]})
+			whole = append(whole, data...)
+			sum := md5.Sum(data)
+			etagCat.Write(sum[:])
+		}
+		wantETag := hex.EncodeToString(etagCat.Sum(nil)) + "-3"
+
+		comp, err := cl.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+			Bucket: aws.String(bucket), Key: aws.String(key), UploadId: uploadID,
+			MultipartUpload: &types.CompletedMultipartUpload{Parts: completed},
+		})
+		if err != nil {
+			t.Fatalf("CompleteMultipartUpload: %v", err)
+		}
+		if got := strings.Trim(aws.ToString(comp.ETag), `"`); got != wantETag {
+			t.Fatalf("complete ETag = %q, want %q (md5-of-md5s in part-number order)", got, wantETag)
+		}
+
+		if got := getBody(t, ctx, cl, bucket, key, ""); !bytes.Equal(got, whole) {
+			t.Fatalf("GET after out-of-order upload mismatch: got %d bytes, want %d", len(got), len(whole))
+		}
+		p1 := len(partData[0])
+		hdr := fmt.Sprintf("bytes=%d-%d", p1-10, p1+2000)
+		if got := getBody(t, ctx, cl, bucket, key, hdr); !bytes.Equal(got, whole[p1-10:p1+2001]) {
+			t.Fatalf("ranged GET across the part boundary mismatch: got %d bytes", len(got))
+		}
+		part2, err := cl.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(bucket), Key: aws.String(key), PartNumber: aws.Int32(2)})
+		if err != nil {
+			t.Fatalf("GetObject partNumber=2: %v", err)
+		}
+		defer part2.Body.Close()
+		got, err := io.ReadAll(part2.Body)
+		if err != nil {
+			t.Fatalf("read part 2: %v", err)
+		}
+		if !bytes.Equal(got, partData[1]) {
+			t.Fatalf("GET partNumber=2 returned %d bytes that are not part 2", len(got))
+		}
+		if aws.ToInt32(part2.PartsCount) != 3 {
+			t.Fatalf("GET partNumber=2 PartsCount = %d, want 3", aws.ToInt32(part2.PartsCount))
 		}
 	})
 
