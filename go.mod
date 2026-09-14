@@ -26,6 +26,7 @@ require (
 	github.com/ipfs/go-ipld-cbor v0.3.0
 	github.com/ipfs/go-log/v2 v2.9.2
 	github.com/jackc/pgx/v5 v5.10.0
+	github.com/moby/moby/api v1.55.0
 	github.com/multiformats/go-multibase v0.3.0
 	github.com/multiformats/go-multicodec v0.10.0
 	github.com/multiformats/go-multihash v0.2.3
@@ -37,6 +38,7 @@ require (
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/viper v1.21.0
 	github.com/stretchr/testify v1.12.1
+	github.com/testcontainers/testcontainers-go v0.44.0
 	github.com/valyala/fasthttp v1.73.0
 	github.com/whyrusleeping/cbor-gen v0.3.1
 	go.uber.org/fx v1.24.0
@@ -162,7 +164,6 @@ require (
 	github.com/moby/docker-image-spec v1.3.1 // indirect
 	github.com/moby/go-archive v0.2.0 // indirect
 	github.com/moby/locker v1.0.1 // indirect
-	github.com/moby/moby/api v1.55.0 // indirect
 	github.com/moby/moby/client v0.5.1 // indirect
 	github.com/moby/patternmatcher v0.6.1 // indirect
 	github.com/moby/sys/atomicwriter v0.1.0 // indirect
@@ -211,7 +212,6 @@ require (
 	github.com/spf13/pflag v1.0.10 // indirect
 	github.com/stretchr/objx v0.5.3 // indirect
 	github.com/subosito/gotenv v1.6.0 // indirect
-	github.com/testcontainers/testcontainers-go v0.44.0 // indirect
 	github.com/testcontainers/testcontainers-go/modules/compose v0.44.0 // indirect
 	github.com/tilt-dev/fsnotify v1.4.8-0.20220602155310-fff9c274a375 // indirect
 	github.com/tinylib/msgp v1.6.4 // indirect
