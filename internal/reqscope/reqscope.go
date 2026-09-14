@@ -31,8 +31,8 @@ func ProofStoreKey() any {
 }
 
 // ProofStore returns the request-scoped retrieval proof store, or ok=false
-// when none was set (e.g. a root-account request that never went through the
-// Hilt-backed IAM service).
+// when none was set (a context that never went through the Hilt-backed IAM
+// service, such as a background flush).
 func ProofStore(ctx context.Context) (ucanlib.ProofStore, bool) {
 	ps, ok := ctx.Value(proofStoreKey).(ucanlib.ProofStore)
 	return ps, ok
@@ -78,8 +78,7 @@ func TenantKey() any {
 }
 
 // Tenant returns the tenant DID stored in the context, or ok=false when none
-// was set (e.g. a root-account request that never went through the
-// Hilt-backed IAM service).
+// was set (a context that never went through the Hilt-backed IAM service).
 func Tenant(ctx context.Context) (did.DID, bool) {
 	tenant, ok := ctx.Value(tenantKey).(did.DID)
 	return tenant, ok && tenant.Defined()

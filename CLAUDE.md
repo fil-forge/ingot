@@ -13,7 +13,7 @@ a per-bucket MST, uploads object bodies to Forge as content-addressed blobs
 before a write is acked, journals the catalog (MST nodes + manifests) to a
 local **per-bucket** log (`logstore`), and ships sealed catalog segments to
 Forge (sprue → piri) as a guppy-style edge client, with **hilt** authorizing
-every non-root request and owning tenancy. See DESIGN_NOTES for the current
+every request and owning tenancy (versitygw's root account is disabled). See DESIGN_NOTES for the current
 architecture, `docs/architecture.md` for the target, and `docs/diagrams.md`
 for the as-built diagrams.
 
@@ -116,8 +116,8 @@ Internal:
   DeleteBucket / ListBuckets to `/s3/bucket/*`, recovering the signed S3
   request from ctx.
 - **`iam/`** — the hilt IAM integration over `fil-forge/hilt/pkg/client`:
-  versitygw `IAMService`/`RequestIAMService` authorizing each non-root
-  request via `/s3/request/authorize` (derived SigV4 key, with a local fast
+  versitygw `IAMService`/`RequestIAMService` authorizing each request via
+  `/s3/request/authorize` (derived SigV4 key, with a local fast
   path over cached delegations), plus `KeyProofs`/`DelegationCache` — per-
   access-key TTL caches of hilt-issued delegations that the uploader and the
   network read tier consume via `internal/reqscope`.
@@ -149,7 +149,7 @@ Internal:
 | Contract | Production | Test |
 |---|---|---|
 | `versitygw/backend.Backend` | `s3frontend.Backend` | (same) |
-| versitygw `auth.IAMService` + `middlewares.RequestIAMService` | `iam.Service` (the root account is checked before IAM) | root account only |
+| versitygw `auth.IAMService` + `middlewares.RequestIAMService` | `iam.Service` (versitygw's root account is disabled; every key resolves here) | (same; hilt-issued credentials) |
 | `blockstore.Log` | `logstore.Manager` (one `Store` per bucket) | in-memory fake |
 | `blockstore.BlockReader` | `blockstore.Forge` (in `Cached`) | `inmem.NopBaseReader` |
 | `registry.Registry` + the store seams + `logstore.Meta` | `*registry.Postgres` (all of them) | `inmem.MemStore` |
@@ -180,8 +180,7 @@ agent) and sets `Config.UploadServiceURL`/`UploadServiceDID` (sprue) +
 ## Configuration (`config.Config`)
 
 Viper/yaml-bindable (env prefix `INGOT_`, `.` → `_`). Key fields: `Enabled`,
-`Addr` (default `0.0.0.0:8080`), `DataDir`, `Region`, `RootAccess`/`RootSecret`
-(the versitygw root account), `MaxBlobSize`, top-level
+`Addr` (default `0.0.0.0:8080`), `DataDir`, `Region`, `MaxBlobSize`, top-level
 `SealBytes`/`SealAge`/`Retain` with a `CatalogPlane` `{SealBytes, SealAge,
 Ship, Retain}` override block (the only plane), `ReadCacheBytes` (0 → 256 MiB,
 <0 → off), `UploadServiceURL`/`UploadServiceDID`/`UploadReceiptsURL` (sprue),

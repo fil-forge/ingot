@@ -9,9 +9,6 @@ addr: "0.0.0.0:80"
 region: us-west-1
 data_dir: /data
 
-root_access: ingot
-root_secret: ingotsecret
-
 # Agent identity: the key, wrapped as did:web:ingot; the listener serves the
 # matching DID document so hilt/sprue/piri can verify ingot's invocations.
 identity:

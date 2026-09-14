@@ -28,8 +28,8 @@ import (
 )
 
 var (
-	// ErrNoTenant reports a request carrying no tenant DID: it did not pass
-	// through the Hilt-backed IAM service (e.g. a root-account request).
+	// ErrNoTenant reports a context carrying no tenant DID: it did not pass
+	// through the Hilt-backed IAM service (e.g. a background job).
 	ErrNoTenant = errors.New("tenantkey: request has no tenant")
 	// ErrNoWrapKey reports a tenant DID document without a usable "#wrap"
 	// verification method (absent, expired or revoked).
