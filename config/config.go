@@ -30,10 +30,6 @@ type Config struct {
 	DataDir string `mapstructure:"data_dir" yaml:"data_dir"`
 	// Region is the AWS region advertised over sigv4 (default "us-east-1").
 	Region string `mapstructure:"region" yaml:"region"`
-	// RootAccess / RootSecret are the S3 root-account credentials the embedded
-	// S3 listener (versitygw) requires. Both required.
-	RootAccess string `mapstructure:"root_access" yaml:"root_access"`
-	RootSecret string `mapstructure:"root_secret" yaml:"root_secret"`
 	// MaxBlobSize is the blob ceiling for new objects, in bytes (0 -> the
 	// default, bucket.DefaultMaxBlobSize: the largest split whose encrypted
 	// envelope fits piri's ~254 MiB piece cap). An object larger than this is
@@ -197,8 +193,6 @@ func (c Config) ServerConfig() (ServerConfig, error) {
 		Addr:        c.Addr,
 		DataDir:     c.DataDir,
 		Region:      c.Region,
-		RootAccess:  c.RootAccess,
-		RootSecret:  c.RootSecret,
 		MaxBlobSize: c.MaxBlobSize,
 
 		CORSConfig: corsCfg,
@@ -418,9 +412,6 @@ func (c *Config) Validate() error {
 	}
 	if c.DataDir == "" {
 		errs = multierr.Append(errs, errors.New("data_dir is required"))
-	}
-	if c.RootAccess == "" || c.RootSecret == "" {
-		errs = multierr.Append(errs, errors.New("root_access and root_secret (S3 root credentials) are required"))
 	}
 	if c.MaxBlobSize > 0 {
 		// What ships to piri is the FEE envelope, not the plaintext: per-chunk
