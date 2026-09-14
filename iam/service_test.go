@@ -272,6 +272,29 @@ func TestProofChainCapture(t *testing.T) {
 		require.False(t, allowed, "an action the key does not hold is denied from cache")
 	})
 
+	t.Run("a copy's action set is cached under the source bucket too", func(t *testing.T) {
+		_, _, leaf, _ := mintRetrieveChain(t)
+		cache := iam.NewKeyProofs()
+		res := authorizeOK(t, keyDID, sigv4)
+		src, err := ed25519.GenerateIssuer()
+		require.NoError(t, err)
+		srcID := src.DID()
+		res.SourceBucket = &srcID
+		fake := &fakeAuthorizer{res: res, dlgs: []ucan.Delegation{leaf}}
+		svc := iam.New(fake, cache, iam.NewVerificationKeyCache(), iam.NewTenantCache())
+
+		req := httptest.NewRequest(http.MethodPut, "http://example.com/dst/key", nil)
+		req.Header.Set("X-Amz-Copy-Source", "/src/key")
+		_, err = resolveForRequest(t, svc, access, req)
+		require.NoError(t, err)
+
+		for _, b := range []did.DID{*res.Bucket, srcID} {
+			allowed, known := cache.For(keyDID).Permits(b, "s3:GetObject")
+			require.True(t, known, "hilt named %s; its set must be cached", b)
+			require.True(t, allowed)
+		}
+	})
+
 	t.Run("bucket info failure degrades, auth still succeeds", func(t *testing.T) {
 		_, _, leaf, _ := mintRetrieveChain(t)
 		fake := &fakeAuthorizer{

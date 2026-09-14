@@ -737,7 +737,7 @@ sequenceDiagram
         else hilt authorize
             I->>H: /s3/request/authorize (the signed request)
             H-->>I: account, derived SigV4 key,<br/>effective action set, fresh delegations
-            I->>K: cacheProofs (re-delegations, bucket info<br/>per bucket) + the action set, keyed by the bucket hilt named
+            I->>K: cacheProofs (re-delegations, bucket info<br/>per bucket) + the action set, keyed by each bucket hilt named<br/>(the addressed bucket and a copy's source)
             opt chain incomplete
                 I->>H: /s3/bucket/info
                 I->>K: cache the bucket chain

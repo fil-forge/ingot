@@ -238,14 +238,18 @@ func (s *Service) GetUserAccountForRequest(ctx fiber.Ctx, accessKeyStr string) (
 	// and stashed on this request for the write path.
 	s.tenants.Put(accessKeyStr, ttl, ok.Tenant)
 	ctx.Locals(reqscope.TenantKey(), ok.Tenant)
-	// The key's effective action set on this bucket is cached to the same
-	// horizon, in the key's own proof store so a revocation drops the set
-	// with the chains. Hilt names the bucket it authorized (a copy's
-	// destination; the source's set is cached when the key acts on it
-	// directly); a result without one (ListBuckets, CreateBucket) scopes no
-	// set.
+	// The key's effective action set is cached to the same horizon under
+	// every bucket Hilt named — the addressed bucket and, for a copy, the
+	// source it authorized reading — in the key's own proof store, so a
+	// revocation drops the set with the chains. Keying by the DIDs Hilt
+	// named (not the local registry's) means a bucket the registry maps to
+	// another space reports unknown and takes the Hilt path. A result naming
+	// no bucket (ListBuckets, CreateBucket) scopes no set.
 	if ok.Bucket != nil {
 		store.PutPermissions(*ok.Bucket, ttl, ok.Permissions.Entries[accessKeyID])
+	}
+	if ok.SourceBucket != nil {
+		store.PutPermissions(*ok.SourceBucket, ttl, ok.Permissions.Entries[accessKeyID])
 	}
 
 	// Bucket is nil for bucket-level operations (CreateBucket, ListBuckets),

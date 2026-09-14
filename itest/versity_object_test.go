@@ -191,10 +191,13 @@ var copyObjectPass = []forgeCase{
 // Observed failing against the forge stack: multi-account semantics and
 // ACLs are unimplemented surface.
 var copyObjectXFail = []forgeCase{
-	// The copy sources are badly percent-encoded ("bucket/%ZZ"). hilt resolves
-	// the source bucket while authorizing the request, ahead of the
-	// controller's argument validation, so the answer is NoSuchBucket for
-	// "bucket" where S3 gives InvalidArgument for the encoding.
+	// The case walks a table of malformed copy sources. The badly encoded
+	// ones ("bucket/%ZZ") pass: hilt's parser rejects them, the request is
+	// authorized as a plain write, and the controller reports the encoding.
+	// The well-encoded ones with an invalid bucket name ("192.168.1.1/foo")
+	// or an empty key ("bucket/") parse as copies, so hilt resolves the
+	// source while authorizing, ahead of the controller's validation, and
+	// answers NoSuchBucket where S3 gives InvalidArgument.
 	{name: "invalid_copy_source", fn: integration.CopyObject_invalid_copy_source},
 	// Cross-bucket copies are cross-SPACE copies (every bucket has its own
 	// space) and are rejected NotImplemented: each blob's CEK wrap is bound

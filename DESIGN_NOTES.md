@@ -77,8 +77,11 @@ filed follow-up). A copy source in **another tenant's bucket is refused**
 request, and ingot compares the tenant recorded on the two bucket rows as
 well (a row whose owner predates the record matches none). Because hilt
 resolves the source during authorization, ahead of the gateway's argument
-validation, a malformed copy against a missing or foreign source reports
-hilt's answer (`NoSuchBucket`, `AccessDenied`) rather than `InvalidArgument`.
+validation, a copy whose source parses but names a missing or foreign bucket
+(an invalid bucket name, an empty key) reports hilt's answer (`NoSuchBucket`,
+`AccessDenied`) rather than `InvalidArgument`; a source hilt cannot parse
+(bad percent-encoding) is authorized as a plain write and the gateway
+reports the encoding error as S3 does.
 Rotation: Hilt replaces `#wrap` in place and archives the
 old key, so a write inside the cache TTL of a rotation still recovers.
 

@@ -71,8 +71,10 @@ var uploadPartCopyXFail = []forgeCase{
 	// NoSuchBucket where S3 gives InvalidArgument. A bad part number against a
 	// real source is still InvalidArgument (hilt ignores the part number).
 	{name: "invalid_part_number", fn: integration.UploadPartCopy_invalid_part_number},
-	// Badly percent-encoded sources ("bucket/%ZZ"): the same precedence, so
-	// NoSuchBucket for "bucket" where S3 gives InvalidArgument.
+	// Same table and same precedence as CopyObject_invalid_copy_source: the
+	// well-encoded sources with an invalid bucket name or an empty key are
+	// resolved by hilt first and answer NoSuchBucket where S3 gives
+	// InvalidArgument (the badly encoded ones pass).
 	{name: "invalid_copy_source", fn: integration.UploadPartCopy_invalid_copy_source},
 	{name: "incorrect_uploadId", fn: integration.UploadPartCopy_incorrect_uploadId},
 	{name: "incorrect_object_key", fn: integration.UploadPartCopy_incorrect_object_key},
