@@ -5,8 +5,11 @@ package itest
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"hash/crc64"
 	"io"
 	"net/url"
 	"os"
@@ -138,12 +141,30 @@ func TestForgeAWSCLI(t *testing.T) {
 		t.Fatalf("head-object ETag = %q, want a 3-part multipart ETag", et)
 	}
 	// The CLI declared CRC64NVME on CreateMultipartUpload and sent a value
-	// per part without being asked; ingot must have accepted each and
-	// recorded the full-object checksum. A bare FULL_OBJECT type with no
-	// value would mean ingot fell back to its own derived checksum.
-	if head.ChecksumCRC64NVME == "" || head.ChecksumType != "FULL_OBJECT" {
-		t.Fatalf("head-object checksum = %q/%q, want the CLI's default full-object CRC64NVME", head.ChecksumCRC64NVME, head.ChecksumType)
+	// per part without being asked. The reported full-object checksum must be
+	// the CRC64NVME of the plaintext. That alone cannot tell the declared
+	// path from ingot's own fallback (an undeclared session derives the same
+	// CRC64NVME), so the session row is checked too: its algorithm is what
+	// the client's CreateMultipartUpload carried, and only a declared session
+	// validates the client's per-part and final values.
+	if wantSum := crc64NVMEBase64(want); head.ChecksumCRC64NVME != wantSum || head.ChecksumType != "FULL_OBJECT" {
+		t.Fatalf("head-object checksum = %q/%q, want %q/FULL_OBJECT (CRC64NVME of the plaintext)", head.ChecksumCRC64NVME, head.ChecksumType, wantSum)
 	}
+	declared := ingotSQL(t, ctx, s, fmt.Sprintf(
+		`SELECT checksum_algorithm FROM ingot.multipart_sessions WHERE bucket = '%s' AND object_key = '%s'`, bucket, key))
+	if declared != "CRC64NVME" {
+		t.Fatalf("multipart session checksum_algorithm = %q, want CRC64NVME as declared by the CLI's CreateMultipartUpload", declared)
+	}
+}
+
+// crc64NVMEBase64 is the S3 x-amz-checksum-crc64nvme encoding of data: the
+// CRC-64/NVME (reflected polynomial 0x9a6c9329ac4bc9b5) as 8 big-endian
+// bytes, base64.
+func crc64NVMEBase64(data []byte) string {
+	sum := crc64.Checksum(data, crc64.MakeTable(0x9a6c_9329_ac4b_c9b5))
+	var b [8]byte
+	binary.BigEndian.PutUint64(b[:], sum)
+	return base64.StdEncoding.EncodeToString(b[:])
 }
 
 // fileFromContainer copies one file out of a (possibly exited) container.
