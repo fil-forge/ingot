@@ -152,7 +152,7 @@ func retrieveChain(t *testing.T, spaceIssuer, accessKey, agent ucan.Issuer) []uc
 // localService builds a Service with the fast path enabled and the given
 // agent + resolver, plus fresh caches.
 func localService(agent did.DID, r BucketResolver) *Service {
-	return New(&refusingAuthorizer{}, NewKeyProofs(), NewVerificationKeyCache(), NewTenantCache(), NewPermissionCache(),
+	return New(&refusingAuthorizer{}, NewKeyProofs(), NewVerificationKeyCache(), NewTenantCache(),
 		WithLocalAuthorization(agent, r))
 }
 
@@ -180,7 +180,7 @@ func TestAuthorizeLocal(t *testing.T) {
 
 	// authLocal mirrors GetUserAccountForRequest: resolve the requesting
 	// key's own store and hand it to the fast path.
-	authLocal := func(s *Service) (auth.Account, bool) {
+	authLocal := func(s *Service) (auth.Account, bool, error) {
 		store := s.proofs.For(accessKey.DID())
 		return s.authorizeLocal(context.Background(), req, accessKeyID, store)
 	}
@@ -188,10 +188,11 @@ func TestAuthorizeLocal(t *testing.T) {
 	t.Run("all cached: authorized locally", func(t *testing.T) {
 		s := localService(agent.DID(), resolver)
 		s.keys.Put(accessKeyID, time.Hour, s3.VerificationKey{Kind: s3.KeyKindSigV4, Data: key})
-		s.perms.Put(accessKeyID, time.Hour, []string{"s3:GetObject"})
+		s.proofs.For(accessKey.DID()).PutPermissions(space, time.Hour, []string{"s3:GetObject"})
 		s.proofs.Deposit(accessKey.DID(), retrieveChain(t, spaceIssuer, accessKey, agent)...)
 
-		acct, ok := authLocal(s)
+		acct, ok, err := authLocal(s)
+		require.NoError(t, err)
 		require.True(t, ok, "should authorize without Hilt")
 		require.Equal(t, accessKeyID, acct.Access)
 		require.Equal(t, key, acct.SigningKey)
@@ -199,56 +200,72 @@ func TestAuthorizeLocal(t *testing.T) {
 
 	t.Run("no cached key: fall through", func(t *testing.T) {
 		s := localService(agent.DID(), resolver)
-		s.perms.Put(accessKeyID, time.Hour, []string{"s3:GetObject"})
+		s.proofs.For(accessKey.DID()).PutPermissions(space, time.Hour, []string{"s3:GetObject"})
 		s.proofs.Deposit(accessKey.DID(), retrieveChain(t, spaceIssuer, accessKey, agent)...)
-		_, ok := authLocal(s)
+		_, ok, err := authLocal(s)
+		require.NoError(t, err)
 		require.False(t, ok)
 	})
 
 	// The permission check is Hilt's own, mirrored: a chain covering the
 	// commands is necessary but not sufficient, since several permissions map
 	// to the same commands.
-	t.Run("no cached permissions: fall through", func(t *testing.T) {
+	t.Run("no cached action set: fall through", func(t *testing.T) {
 		s := localService(agent.DID(), resolver)
 		s.keys.Put(accessKeyID, time.Hour, s3.VerificationKey{Kind: s3.KeyKindSigV4, Data: key})
 		s.proofs.Deposit(accessKey.DID(), retrieveChain(t, spaceIssuer, accessKey, agent)...)
-		_, ok := authLocal(s)
+		_, ok, err := authLocal(s)
+		require.NoError(t, err)
 		require.False(t, ok)
 	})
 
-	t.Run("permission not granted: fall through", func(t *testing.T) {
+	t.Run("action outside the cached set: refused without Hilt", func(t *testing.T) {
 		s := localService(agent.DID(), resolver)
 		s.keys.Put(accessKeyID, time.Hour, s3.VerificationKey{Kind: s3.KeyKindSigV4, Data: key})
 		// ListBucket maps to the same retrieve command as GetObject.
-		s.perms.Put(accessKeyID, time.Hour, []string{"s3:ListBucket"})
+		s.proofs.For(accessKey.DID()).PutPermissions(space, time.Hour, []string{"s3:ListBucket"})
 		s.proofs.Deposit(accessKey.DID(), retrieveChain(t, spaceIssuer, accessKey, agent)...)
-		_, ok := authLocal(s)
+		_, ok, err := authLocal(s)
 		require.False(t, ok)
+		require.Equal(t, s3err.GetAPIError(s3err.ErrAccessDenied), err)
+	})
+
+	t.Run("empty cached set: refused", func(t *testing.T) {
+		s := localService(agent.DID(), resolver)
+		s.keys.Put(accessKeyID, time.Hour, s3.VerificationKey{Kind: s3.KeyKindSigV4, Data: key})
+		s.proofs.For(accessKey.DID()).PutPermissions(space, time.Hour, []string{})
+		s.proofs.Deposit(accessKey.DID(), retrieveChain(t, spaceIssuer, accessKey, agent)...)
+		_, ok, err := authLocal(s)
+		require.False(t, ok)
+		require.Equal(t, s3err.GetAPIError(s3err.ErrAccessDenied), err)
 	})
 
 	t.Run("bad signature: fall through", func(t *testing.T) {
 		s := localService(agent.DID(), resolver)
 		s.keys.Put(accessKeyID, time.Hour, s3.VerificationKey{Kind: s3.KeyKindSigV4, Data: []byte("wrong-key-32-bytes-......xxxxxxx")})
 		s.proofs.Deposit(accessKey.DID(), retrieveChain(t, spaceIssuer, accessKey, agent)...)
-		_, ok := authLocal(s)
+		_, ok, err := authLocal(s)
+		require.NoError(t, err)
 		require.False(t, ok)
 	})
 
 	t.Run("missing chain: fall through", func(t *testing.T) {
 		s := localService(agent.DID(), resolver)
 		s.keys.Put(accessKeyID, time.Hour, s3.VerificationKey{Kind: s3.KeyKindSigV4, Data: key})
-		s.perms.Put(accessKeyID, time.Hour, []string{"s3:GetObject"})
+		s.proofs.For(accessKey.DID()).PutPermissions(space, time.Hour, []string{"s3:GetObject"})
 		// No delegations cached for this key.
-		_, ok := authLocal(s)
+		_, ok, err := authLocal(s)
+		require.NoError(t, err)
 		require.False(t, ok)
 	})
 
 	t.Run("unknown bucket: fall through", func(t *testing.T) {
 		s := localService(agent.DID(), fixedResolver{name: "other"})
 		s.keys.Put(accessKeyID, time.Hour, s3.VerificationKey{Kind: s3.KeyKindSigV4, Data: key})
-		s.perms.Put(accessKeyID, time.Hour, []string{"s3:GetObject"})
+		s.proofs.For(accessKey.DID()).PutPermissions(space, time.Hour, []string{"s3:GetObject"})
 		s.proofs.Deposit(accessKey.DID(), retrieveChain(t, spaceIssuer, accessKey, agent)...)
-		_, ok := authLocal(s)
+		_, ok, err := authLocal(s)
+		require.NoError(t, err)
 		require.False(t, ok)
 	})
 
@@ -261,10 +278,11 @@ func TestAuthorizeLocal(t *testing.T) {
 		require.NoError(t, err)
 		s := localService(agent.DID(), resolver)
 		s.keys.Put(accessKeyID, time.Hour, s3.VerificationKey{Kind: s3.KeyKindSigV4, Data: key})
-		s.perms.Put(accessKeyID, time.Hour, []string{"s3:GetObject"})
+		s.proofs.For(accessKey.DID()).PutPermissions(space, time.Hour, []string{"s3:GetObject"})
 		s.proofs.Deposit(otherKey.DID(), retrieveChain(t, spaceIssuer, otherKey, agent)...)
 
-		_, ok := authLocal(s)
+		_, ok, err := authLocal(s)
+		require.NoError(t, err)
 		require.False(t, ok, "must not see another key's store")
 	})
 }
@@ -305,15 +323,35 @@ func TestAuthorizeLocalCopy(t *testing.T) {
 		require.NoError(t, err)
 		s := localService(agent.DID(), resolver)
 		s.keys.Put(accessKeyID, time.Hour, s3.VerificationKey{Kind: s3.KeyKindSigV4, Data: key})
-		s.perms.Put(accessKeyID, time.Hour, perms)
+		for _, space := range []did.DID{dstIssuer.DID(), srcIssuer.DID()} {
+			s.proofs.For(accessKey.DID()).PutPermissions(space, time.Hour, perms)
+		}
 		for _, c := range chains {
 			s.proofs.Deposit(accessKey.DID(), c...)
 		}
 		return s
 	}
-	authLocal := func(s *Service, req s3.Request) bool {
-		_, ok := s.authorizeLocal(context.Background(), req, accessKeyID, s.proofs.For(accessKey.DID()))
-		return ok
+	authLocal := func(s *Service, req s3.Request) (bool, error) {
+		_, ok, err := s.authorizeLocal(context.Background(), req, accessKeyID, s.proofs.For(accessKey.DID()))
+		return ok, err
+	}
+	authorized := func(t *testing.T, s *Service, req s3.Request) {
+		t.Helper()
+		ok, err := authLocal(s, req)
+		require.NoError(t, err)
+		require.True(t, ok)
+	}
+	fallsThrough := func(t *testing.T, s *Service, req s3.Request) {
+		t.Helper()
+		ok, err := authLocal(s, req)
+		require.NoError(t, err)
+		require.False(t, ok)
+	}
+	refused := func(t *testing.T, s *Service, req s3.Request) {
+		t.Helper()
+		ok, err := authLocal(s, req)
+		require.False(t, ok)
+		require.Equal(t, s3err.GetAPIError(s3err.ErrAccessDenied), err)
 	}
 
 	t.Run("both buckets covered: authorized locally", func(t *testing.T) {
@@ -321,7 +359,7 @@ func TestAuthorizeLocalCopy(t *testing.T) {
 		s := service(t, req, readWrite,
 			commandChains(t, dstIssuer, accessKey, agent, putCmds),
 			commandChains(t, srcIssuer, accessKey, agent, getCmds))
-		require.True(t, authLocal(s, req))
+		authorized(t, s, req)
 	})
 
 	t.Run("destination covered but not the source: fall through", func(t *testing.T) {
@@ -329,7 +367,7 @@ func TestAuthorizeLocalCopy(t *testing.T) {
 		// destination's space; it must not stand in for the source's.
 		req := signedCopy(t, "s3.example", "dst", "src", accessKeyID, secret, true)
 		s := service(t, req, readWrite, commandChains(t, dstIssuer, accessKey, agent, putCmds))
-		require.False(t, authLocal(s, req))
+		fallsThrough(t, s, req)
 	})
 
 	t.Run("source header not signed: fall through", func(t *testing.T) {
@@ -337,31 +375,148 @@ func TestAuthorizeLocalCopy(t *testing.T) {
 		s := service(t, req, readWrite,
 			commandChains(t, dstIssuer, accessKey, agent, putCmds),
 			commandChains(t, srcIssuer, accessKey, agent, getCmds))
-		require.False(t, authLocal(s, req))
+		fallsThrough(t, s, req)
 	})
 
 	t.Run("copy within one bucket needs only that bucket", func(t *testing.T) {
 		req := signedCopy(t, "s3.example", "dst", "dst", accessKeyID, secret, true)
 		s := service(t, req, readWrite, commandChains(t, dstIssuer, accessKey, agent, putCmds))
-		require.True(t, authLocal(s, req))
+		authorized(t, s, req)
 	})
 
 	// A PutObject grant's commands include /content/retrieve (a write's
 	// cleanup reads), which is all s3:GetObject maps to. Chains alone would
-	// therefore let a write-only key read as a copy source; the cached
-	// permission set is what refuses it, as Hilt's own check does.
-	t.Run("write-only key copying within one bucket: fall through", func(t *testing.T) {
+	// therefore let a write-only key read as a copy source; the cached action
+	// set is what refuses it, as Hilt's own check does — and refuses from
+	// cache, since the set is Hilt's answer for this key and bucket.
+	t.Run("write-only key copying within one bucket: refused", func(t *testing.T) {
 		req := signedCopy(t, "s3.example", "dst", "dst", accessKeyID, secret, true)
 		s := service(t, req, writeOnly, commandChains(t, dstIssuer, accessKey, agent, putCmds))
-		require.False(t, authLocal(s, req))
+		refused(t, s, req)
 	})
 
-	t.Run("write-only key with chains on both buckets: fall through", func(t *testing.T) {
+	t.Run("write-only key with chains on both buckets: refused", func(t *testing.T) {
 		req := signedCopy(t, "s3.example", "dst", "src", accessKeyID, secret, true)
 		s := service(t, req, writeOnly,
 			commandChains(t, dstIssuer, accessKey, agent, putCmds),
 			commandChains(t, srcIssuer, accessKey, agent, putCmds))
-		require.False(t, authLocal(s, req))
+		refused(t, s, req)
+	})
+
+	t.Run("source bucket's set unknown: fall through", func(t *testing.T) {
+		// The destination's set is cached (the key wrote there) but the
+		// source's is not: Hilt has not yet answered for the source, so it
+		// decides.
+		req := signedCopy(t, "s3.example", "dst", "src", accessKeyID, secret, true)
+		s := service(t, req, nil,
+			commandChains(t, dstIssuer, accessKey, agent, putCmds),
+			commandChains(t, srcIssuer, accessKey, agent, getCmds))
+		s.proofs.For(accessKey.DID()).PutPermissions(dstIssuer.DID(), time.Hour, readWrite)
+		fallsThrough(t, s, req)
+	})
+}
+
+// signedRequest builds a real SigV4-signed request with no body as an
+// s3.Request (see signedGet).
+func signedRequest(t *testing.T, method, host, rawPath, accessKeyID, secret string, when time.Time) s3.Request {
+	t.Helper()
+	req, err := http.NewRequest(method, "http://"+host+rawPath, nil)
+	require.NoError(t, err)
+	req.Header.Set("X-Amz-Content-Sha256", "UNSIGNED-PAYLOAD")
+
+	_, err = v4.NewSigner().SignHTTP(context.Background(),
+		awsv4.Credentials{AccessKeyID: accessKeyID, SecretAccessKey: secret},
+		req, "UNSIGNED-PAYLOAD", "s3", "us-east-1", when,
+		[]string{"host", "x-amz-content-sha256", "x-amz-date"},
+		func(o *v4.SignerOptions) { o.DisableURIPathEscaping = true })
+	require.NoError(t, err)
+
+	headers := map[string]string{"Host": host}
+	for k := range req.Header {
+		headers[k] = req.Header.Get(k)
+	}
+	return s3.Request{Method: method, Headers: headers, URL: req.URL.RequestURI()}
+}
+
+// TestPutOnlyKeyIsDeniedOnReads pins the defect the action set closes: a key
+// granted only s3:PutObject holds chains for every command a read, a listing
+// or a multipart abort needs (PutObject's command set is a superset of each),
+// so a chain probe alone would authorize them. The cached set refuses them
+// without consulting Hilt, and still authorizes the write.
+func TestPutOnlyKeyIsDeniedOnReads(t *testing.T) {
+	accessKey, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	spaceIssuer, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	agent, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+
+	accessKeyID := accessKey.DID().Identifier()
+	const secret = "test-secret-access-key"
+	space := spaceIssuer.DID()
+	resolver := fixedResolver{name: "bkt", state: &registry.State{Name: "bkt", Space: space}}
+	now := time.Now()
+
+	// service with the key cached for req, a PutObject-only set on the
+	// bucket, and chains for every PutObject command.
+	service := func(t *testing.T, req s3.Request) *Service {
+		t.Helper()
+		sr, err := sigv4.Parse(sigv4.Request{Method: req.Method, Headers: req.Headers, URL: req.URL})
+		require.NoError(t, err)
+		key, err := sigv4.DeriveKey(sr, secret)
+		require.NoError(t, err)
+		s := localService(agent.DID(), resolver)
+		s.keys.Put(accessKeyID, time.Hour, s3.VerificationKey{Kind: s3.KeyKindSigV4, Data: key})
+		s.proofs.For(accessKey.DID()).PutPermissions(space, time.Hour, []string{"s3:PutObject"})
+		s.proofs.Deposit(accessKey.DID(), commandChains(t, spaceIssuer, accessKey, agent, s3perm.CommandsFor("s3:PutObject"))...)
+		return s
+	}
+
+	denied := map[string]s3.Request{
+		"GetObject":            signedRequest(t, http.MethodGet, "s3.example", "/bkt/obj", accessKeyID, secret, now),
+		"ListBucket":           signedRequest(t, http.MethodGet, "s3.example", "/bkt", accessKeyID, secret, now),
+		"AbortMultipartUpload": signedRequest(t, http.MethodDelete, "s3.example", "/bkt/obj?uploadId=abc", accessKeyID, secret, now),
+	}
+	for name, req := range denied {
+		t.Run(name+" is refused", func(t *testing.T) {
+			op, _, err := hiltauth.RequirementsFor(req)
+			require.NoError(t, err)
+			require.Equal(t, name, op.String())
+
+			s := service(t, req)
+			_, ok, err := s.authorizeLocal(context.Background(), req, accessKeyID, s.proofs.For(accessKey.DID()))
+			require.False(t, ok)
+			require.Equal(t, s3err.GetAPIError(s3err.ErrAccessDenied), err)
+			require.Zero(t, s.authorizer.(*refusingAuthorizer).calls)
+		})
+	}
+
+	t.Run("PutObject is still authorized", func(t *testing.T) {
+		req := signedRequest(t, http.MethodPut, "s3.example", "/bkt/obj", accessKeyID, secret, now)
+		s := service(t, req)
+		_, ok, err := s.authorizeLocal(context.Background(), req, accessKeyID, s.proofs.For(accessKey.DID()))
+		require.NoError(t, err)
+		require.True(t, ok)
+	})
+
+	t.Run("refused end to end without consulting Hilt", func(t *testing.T) {
+		req := denied["GetObject"]
+		s := service(t, req)
+		app := fiber.New()
+		var authErr error
+		app.Use(func(c fiber.Ctx) error {
+			_, authErr = s.GetUserAccountForRequest(c, accessKeyID)
+			return nil
+		})
+		resp, err := app.Test(httpRequestOf(t, req))
+		require.NoError(t, err)
+		require.NoError(t, resp.Body.Close())
+
+		var s3e s3err.S3Error
+		require.ErrorAs(t, authErr, &s3e)
+		require.Equal(t, "AccessDenied", s3e.BaseError().Code)
+		require.Equal(t, 403, s3e.StatusCode())
+		require.Zero(t, s.authorizer.(*refusingAuthorizer).calls, "the cached set is Hilt's answer; do not ask again")
 	})
 }
 
@@ -504,7 +659,7 @@ func TestFastPathTenant(t *testing.T) {
 	t.Run("cached tenant is stashed without consulting Hilt", func(t *testing.T) {
 		s := localService(agent.DID(), resolver)
 		s.keys.Put(accessKeyID, time.Hour, s3.VerificationKey{Kind: s3.KeyKindSigV4, Data: key})
-		s.perms.Put(accessKeyID, time.Hour, []string{"s3:GetObject"})
+		s.proofs.For(accessKey.DID()).PutPermissions(spaceIssuer.DID(), time.Hour, []string{"s3:GetObject"})
 		s.tenants.Put(accessKeyID, time.Hour, tenant)
 		s.proofs.Deposit(accessKey.DID(), retrieveChain(t, spaceIssuer, accessKey, agent)...)
 
@@ -518,7 +673,7 @@ func TestFastPathTenant(t *testing.T) {
 	t.Run("uncached tenant falls through to Hilt", func(t *testing.T) {
 		s := localService(agent.DID(), resolver)
 		s.keys.Put(accessKeyID, time.Hour, s3.VerificationKey{Kind: s3.KeyKindSigV4, Data: key})
-		s.perms.Put(accessKeyID, time.Hour, []string{"s3:GetObject"})
+		s.proofs.For(accessKey.DID()).PutPermissions(spaceIssuer.DID(), time.Hour, []string{"s3:GetObject"})
 		s.proofs.Deposit(accessKey.DID(), retrieveChain(t, spaceIssuer, accessKey, agent)...)
 
 		_, _, err := drive(t, s)

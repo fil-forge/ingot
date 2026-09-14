@@ -171,8 +171,8 @@ HEAD never decrypts. See `s3frontend/decrypt.go`.
   paths compare the two buckets'.
 - **access key**: the S3 access key ID is a `did:key`. Every non-root
   request is authorized through hilt (`/s3/request/authorize`, with a local
-  fast path over the cached derived key, the key's S3 permissions and its
-  delegations); hilt re-delegates the key's grant to
+  fast path over the cached derived key, the key's effective S3 action set
+  per bucket and its delegations); hilt re-delegates the key's grant to
   the agent, and the per-key `DelegationCache` carries those proofs into the
   request via `internal/reqscope`, where the uploader and the network read
   tier spend them. The uploader also captures a per-space ship authority

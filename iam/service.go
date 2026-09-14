@@ -27,14 +27,18 @@
 //
 // A local fast path (the RFC's "local cache" authorization) avoids the Hilt
 // round-trip when everything needed is already cached, mirroring Hilt's own
-// verification order: the request parses as HMAC SigV4 and a cached derived
-// key verifies its signature (hilt/pkg/sigv4.VerifyWithKey) and time bounds;
-// the request's S3 action maps to Forge commands (hilt/pkg/s3perm); and the
-// key's own store holds a chain to this instance's agent for every such
-// command (which, being the key's own store, necessarily carries the key's
-// grant too). Anything less falls through to /s3/request/authorize, whose
-// response replenishes the caches — so expiry (next UTC midnight, when SigV4
-// scope dates roll over) self-heals.
+// verification and authorization order: the request parses as HMAC SigV4 and
+// a cached derived key verifies its signature (hilt/pkg/sigv4.VerifyWithKey)
+// and time bounds; for every bucket the request acts on (the addressed
+// bucket, plus a copy's source) the S3 action it needs there maps to Forge
+// commands (hilt/pkg/s3perm), the key's cached effective action set for that
+// bucket contains the action, and the key's own store holds a chain to this
+// instance's agent for every such command (which, being the key's own store,
+// necessarily carries the key's grant too). Anything less falls through to
+// /s3/request/authorize, whose response replenishes the caches — so expiry
+// (next UTC midnight, when SigV4 scope dates roll over) self-heals. An action
+// the cached set excludes is refused outright: the set is Hilt's own answer
+// for this key and bucket, so re-asking would only repeat it.
 package iam
 
 import (
@@ -90,7 +94,6 @@ type Service struct {
 	proofs     *KeyProofs
 	keys       *VerificationKeyCache
 	tenants    *TenantCache
-	perms      *PermissionCache
 	logger     *zap.Logger
 
 	// agent + buckets enable the local fast path (see WithLocalAuthorization);
@@ -132,12 +135,12 @@ func WithLocalAuthorization(agent did.DID, buckets BucketResolver) Option {
 }
 
 // New creates a Service that authorizes requests via authorizer (typically a
-// *hiltclient.Client) and deposits the delegations, verification keys, tenant
-// DID and S3 permissions Hilt returns into proofs (per-access-key), keys,
-// tenants and perms — the caches the retrieval path, the write path and the
-// local fast path read from.
-func New(authorizer Authorizer, proofs *KeyProofs, keys *VerificationKeyCache, tenants *TenantCache, perms *PermissionCache, opts ...Option) *Service {
-	s := &Service{authorizer: authorizer, proofs: proofs, keys: keys, tenants: tenants, perms: perms, logger: zap.NewNop()}
+// *hiltclient.Client) and deposits the delegations, verification keys and
+// tenant DID Hilt returns into proofs (per-access-key), keys and tenants —
+// the caches the retrieval path, the write path and the local fast path read
+// from. The key's effective S3 action set per bucket lives in its proof store.
+func New(authorizer Authorizer, proofs *KeyProofs, keys *VerificationKeyCache, tenants *TenantCache, opts ...Option) *Service {
+	s := &Service{authorizer: authorizer, proofs: proofs, keys: keys, tenants: tenants, logger: zap.NewNop()}
 	for _, opt := range opts {
 		opt(s)
 	}
@@ -172,12 +175,21 @@ func (s *Service) GetUserAccountForRequest(ctx fiber.Ctx, accessKeyStr string) (
 	store := s.proofs.For(accessKeyID)
 	ctx.Locals(reqscope.ProofStoreKey(), ucanlib.ProofStore(store))
 
-	// Local fast path: with a cached verification key and cached delegation
-	// chains covering the request's Forge commands, Hilt is not consulted.
-	// The tenant travels with the request too (the write path encrypts to
-	// its wrap key); a verified request whose tenant has fallen out of the
-	// cache takes the Hilt path, whose response refills every cache.
-	if account, ok := s.authorizeLocal(reqCtx, req, accessKeyStr, store); ok {
+	// Local fast path: with a cached verification key, a cached action set
+	// permitting the request's S3 action on every bucket it acts on, and
+	// cached delegation chains covering its Forge commands, Hilt is not
+	// consulted. The tenant travels with the request too (the write path
+	// encrypts to its wrap key); a verified request whose tenant has fallen
+	// out of the cache takes the Hilt path, whose response refills every
+	// cache.
+	if account, ok, err := s.authorizeLocal(reqCtx, req, accessKeyStr, store); err != nil {
+		// A refusal off the cached action set: that set is Hilt's own answer
+		// for this key and bucket, so asking again would return the same
+		// refusal. Returned verbatim (not wrapped) so versitygw's renderer
+		// type-asserts it, matching how mapAuthError returns Hilt's
+		// OperationNotPermitted.
+		return auth.Account{}, err
+	} else if ok {
 		if tenant, found := s.tenants.Get(accessKeyStr); found {
 			ctx.Locals(reqscope.TenantKey(), tenant)
 			return account, nil
@@ -222,13 +234,19 @@ func (s *Service) GetUserAccountForRequest(ctx fiber.Ctx, accessKeyStr string) (
 	// longer so those stragglers still hit the fast path instead of Hilt.
 	ttl := untilNextUTCMidnight(time.Now()) + sigv4.MaxClockSkew
 	s.keys.Put(accessKeyStr, ttl, ok.Keys.Entries[accessKeyID]...)
-	// The key's S3 permissions travel with the key: the fast path checks the
-	// permission each bucket needs against them, as Hilt does.
-	s.perms.Put(accessKeyStr, ttl, ok.Permissions.Entries[accessKeyID])
 	// The tenant is cached to the same horizon so the fast path can stash it,
 	// and stashed on this request for the write path.
 	s.tenants.Put(accessKeyStr, ttl, ok.Tenant)
 	ctx.Locals(reqscope.TenantKey(), ok.Tenant)
+	// The key's effective action set on this bucket is cached to the same
+	// horizon, in the key's own proof store so a revocation drops the set
+	// with the chains. Hilt names the bucket it authorized (a copy's
+	// destination; the source's set is cached when the key acts on it
+	// directly); a result without one (ListBuckets, CreateBucket) scopes no
+	// set.
+	if ok.Bucket != nil {
+		store.PutPermissions(*ok.Bucket, ttl, ok.Permissions.Entries[accessKeyID])
+	}
 
 	// Bucket is nil for bucket-level operations (CreateBucket, ListBuckets),
 	// which authorize without addressing an existing bucket.
@@ -308,33 +326,49 @@ func mapAuthError(err error) (error, bool) {
 // request signature covers it.
 const copySourceHeader = "x-amz-copy-source"
 
-// authorizeLocal is the fast path, mirroring Hilt's own verification
-// order over THIS key's proof store. It reports ok=false whenever anything
-// needed isn't cached or doesn't check out; the caller then takes the Hilt
+// authorizeLocal is the fast path, mirroring Hilt's own verification and
+// authorization order over THIS key's proof store: signature, then per
+// bucket the effective action set and the proof chains. It reports ok=true
+// when the request checks out end to end. A non-nil error is a refusal: the
+// key's cached action set for a bucket excludes the action the request needs
+// there, and that set is Hilt's own answer, so the caller refuses rather than
+// asking again. Both zero means the fast path could not decide — something
+// it needs isn't cached or doesn't check out — and the caller takes the Hilt
 // path, whose response replenishes the caches.
-func (s *Service) authorizeLocal(ctx context.Context, req s3.Request, access string, store *DelegationCache) (auth.Account, bool) {
+//
+// Refusing from cache is sound because Hilt access keys are immutable: a
+// key's permissions change only by deleting the key, which publishes
+// revocations that clear its store (see Revoker). Should Hilt gain a way to
+// widen a live key's permissions, this refusal must fall through instead.
+//
+// The action set is what makes the chain probe safe to trust. Several S3
+// actions share Forge commands and s3:PutObject's command set is a superset
+// of s3:GetObject's, s3:ListBucket's and s3:AbortMultipartUpload's, so a
+// probe alone would let a put-only key read and abort on the same bucket, or
+// read a copy's source.
+func (s *Service) authorizeLocal(ctx context.Context, req s3.Request, access string, store *DelegationCache) (auth.Account, bool, error) {
 	if s.buckets == nil || !s.agent.Defined() {
-		return auth.Account{}, false
+		return auth.Account{}, false, nil
 	}
 
 	// 1. Parse the signature envelope. Only HMAC SigV4 is fast-pathed: the
 	// gateway re-verifies with the returned key and only speaks HMAC.
 	sr, err := sigv4.Parse(sigv4.Request{Method: req.Method, Headers: req.Headers, URL: req.URL})
 	if err != nil || sr.Scheme != sigv4.SchemeV4 {
-		return auth.Account{}, false
+		return auth.Account{}, false, nil
 	}
 
 	// 2. Cached key verifies the signature and the request is in time
 	// bounds. A scope-rolled or rotated key simply fails here.
 	key, ok := s.keys.Get(access, s3.KeyKindSigV4)
 	if !ok {
-		return auth.Account{}, false
+		return auth.Account{}, false, nil
 	}
 	if sigv4.VerifyWithKey(sr, key) != nil {
-		return auth.Account{}, false
+		return auth.Account{}, false, nil
 	}
 	if sigv4.ValidateTimeBounds(sr, time.Now()) != nil {
-		return auth.Account{}, false
+		return auth.Account{}, false, nil
 	}
 
 	// 3. Every bucket the request acts on, with the permission it needs there:
@@ -345,39 +379,47 @@ func (s *Service) authorizeLocal(ctx context.Context, req s3.Request, access str
 	// SignedHeaders; Hilt refuses an unsigned one, and so does the fast path.
 	op, reqs, err := hiltauth.RequirementsFor(req)
 	if err != nil || len(reqs) == 0 {
-		return auth.Account{}, false
+		return auth.Account{}, false, nil
 	}
 	if op.CopiesSource() && !sr.HeaderSigned(copySourceHeader) {
-		return auth.Account{}, false
+		return auth.Account{}, false, nil
 	}
 
-	// 4. For each bucket, the key must hold the S3 permission the operation
-	// needs there (cached from Hilt's authorize response), and every command
-	// the permission maps to must be covered by a chain to this instance's
-	// agent in THIS key's store, with the bucket's space as subject. The
-	// permission check is what a chain cannot express: s3:PutObject's
-	// commands include the retrieve a write's cleanup needs, which is all
-	// s3:GetObject maps to, so a PutObject-only key's chains would otherwise
-	// cover a copy's source read. Because the store holds only keyDID's
-	// delegations, a resolving agent chain is necessarily
-	// space→…→keyDID→agent — it carries both keyDID's own grant (Hilt's
-	// bucket scoping) and the onward re-delegation. Cross-key mixing is
-	// structurally impossible, so one probe per command suffices.
+	// 4. For each bucket: its space is the delegation subject; the key's
+	// cached effective action set for it decides whether the action is
+	// permitted at all (no set cached means Hilt has not answered for this
+	// bucket, or the answer expired, or the local registry's space disagrees
+	// with the bucket Hilt named — ask Hilt; a cached set that excludes the
+	// action is a refusal); and every command the action maps to must be
+	// covered by a chain to this instance's agent in THIS key's store.
+	// Because the store holds only keyDID's delegations, a resolving agent
+	// chain is necessarily space→…→keyDID→agent — it carries both keyDID's
+	// own grant (Hilt's bucket scoping) and the onward re-delegation.
+	// Cross-key mixing is structurally impossible, so one probe per command
+	// suffices.
 	for _, r := range reqs {
-		if !s.perms.Has(access, r.Permission) {
-			return auth.Account{}, false
-		}
 		cmds := s3perm.CommandsFor(r.Permission)
 		if len(cmds) == 0 {
-			return auth.Account{}, false
+			return auth.Account{}, false, nil
 		}
 		st, err := s.buckets.Get(ctx, r.Bucket)
 		if err != nil || !st.Space.Defined() {
-			return auth.Account{}, false
+			return auth.Account{}, false, nil
+		}
+		if allowed, known := store.Permits(st.Space, r.Permission); !known {
+			return auth.Account{}, false, nil
+		} else if !allowed {
+			s.logger.Debug("hilt/iam: request denied by cached action set",
+				zap.String("access", access),
+				zap.String("operation", op.String()),
+				zap.String("action", r.Permission),
+				zap.String("bucket", r.Bucket),
+			)
+			return auth.Account{}, false, s3err.GetAPIError(s3err.ErrAccessDenied)
 		}
 		for _, cmd := range cmds {
 			if chain, _, err := store.ProofChain(ctx, s.agent, cmd, st.Space); err != nil || len(chain) == 0 {
-				return auth.Account{}, false
+				return auth.Account{}, false, nil
 			}
 		}
 	}
@@ -395,7 +437,7 @@ func (s *Service) authorizeLocal(ctx context.Context, req s3.Request, access str
 		// ownership for hilt-managed keys (buckets default to root-owned) and
 		// its admin APIs are not mounted.
 		Role: auth.RoleAdmin,
-	}, true
+	}, true, nil
 }
 
 // untilNextUTCMidnight is the cache TTL horizon for verification keys,
