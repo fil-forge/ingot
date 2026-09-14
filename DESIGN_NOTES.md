@@ -172,7 +172,7 @@ HEAD never decrypts. See `s3frontend/decrypt.go`.
   owner) and carried per request in `internal/reqscope` (the caller). The
   write path resolves the tenant's wrap key from the request's; the copy
   paths compare the two buckets'.
-- **access key**: the S3 access key ID is a `did:key`. Every non-root
+- **access key**: the S3 access key ID is a `did:key`. Every
   request is authorized through hilt (`/s3/request/authorize`, with a local
   fast path over the cached derived key, the key's effective S3 action set
   per bucket and its delegations); hilt re-delegates the key's grant to
@@ -180,9 +180,9 @@ HEAD never decrypts. See `s3frontend/decrypt.go`.
   request via `internal/reqscope`, where the uploader and the network read
   tier spend them. The uploader also captures a per-space ship authority
   (1h TTL) for the async catalog flush.
-- The **root account** (versitygw root credentials) bypasses hilt: bucket
-  administration works, but with no proof store it can neither write to
-  spaces nor read through the network tier.
+- There is **no root account**: versitygw's built-in root user is disabled
+  (an empty `RootUserConfig`), so every access key resolves through hilt. A
+  key hilt has not issued is rejected as InvalidAccessKeyId.
 
 The [principals diagram](./docs/diagrams.md#principals-and-proof-stores)
 draws the chains and the stores.

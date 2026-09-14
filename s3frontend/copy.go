@@ -235,14 +235,12 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 }
 
 // copySourceBucket resolves the copy source's bucket and requires it to belong
-// to the destination bucket's tenant. hilt makes the same decision when it
-// authorizes the request (the source named by x-amz-copy-source must be the
-// caller's tenant's and within the key's scope); this check is the gateway's
-// own, from the tenant recorded on the bucket rows, before any key lookup: a
-// foreign source is AccessDenied whether or not the key exists, which is what
-// S3 returns for another account's bucket. Comparing the two rows needs no
-// tenant on the request: the root account, which bypasses hilt and carries
-// none, is covered like any other caller. A row whose owner was never
+// to the destination bucket's tenant. hilt authorizes a copy as a write to the
+// destination and never reads x-amz-copy-source, so the source bucket's tenant
+// is checked here, before any key lookup: a foreign source is AccessDenied
+// whether or not the key exists, which is what S3 returns for another
+// account's bucket. The check compares the two bucket rows, so it needs no
+// tenant on the request. A row whose owner was never
 // recorded (registry.UnknownTenant) matches no tenant, its own sentinel
 // included: two such rows prove nothing about each other. UploadPartCopy
 // shares this rule.
