@@ -21,9 +21,10 @@ import (
 	"github.com/fil-forge/ingot/registry"
 )
 
-// maxCopyPartSize is S3's ceiling on one part, and so on the range an
-// UploadPartCopy may name.
-const maxCopyPartSize = 5 << 30
+// maxCopySize is S3's ceiling on the bytes one copy request may move: the
+// whole object for CopyObject, the range for UploadPartCopy. A larger object
+// is copied as multipart parts.
+const maxCopySize = 5 << 30
 
 // UploadPartCopy ingests a part whose bytes are a range of an existing object:
 // the source's plaintext streams through the decrypting read path into the
@@ -82,8 +83,8 @@ func (b *Backend) UploadPartCopy(ctx context.Context, input *s3.UploadPartCopyIn
 	if err != nil {
 		return s3response.CopyPartResult{}, err
 	}
-	if end-start+1 > maxCopyPartSize {
-		return s3response.CopyPartResult{}, s3err.GetCopySourceObjectTooLargeErr(maxCopyPartSize)
+	if end-start+1 > maxCopySize {
+		return s3response.CopyPartResult{}, s3err.GetCopySourceObjectTooLargeErr(maxCopySize)
 	}
 	if err := evaluateCopySourcePreconditions(etagOf(srcMf), time.Unix(srcMf.Created, 0), backend.PreConditions{
 		IfMatch:       input.CopySourceIfMatch,

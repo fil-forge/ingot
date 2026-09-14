@@ -360,3 +360,23 @@ func TestCopyObject_SourceWithoutChecksumGetsDefault(t *testing.T) {
 		t.Fatalf("copy ETag = %s, want the source's %s", *out.CopyObjectResult.ETag, want)
 	}
 }
+
+// A source over S3's single-copy ceiling is refused before any byte is read;
+// the manifest is committed directly, since no test can afford the bytes.
+func TestCopyObject_SourceOverCopyLimit(t *testing.T) {
+	b, mem, _ := newRefTestBackend(t)
+	ctx := context.Background()
+	st, err := mem.Get(ctx, "bk")
+	if err != nil {
+		t.Fatal(err)
+	}
+	huge := &msbucket.ObjectManifest{Key: "huge", Created: time.Now().Unix(), Body: msbucket.Body{Size: maxCopySize + 1}, ETag: "00000000000000000000000000000000"}
+	if _, _, err := b.commitVersion(ctx, st, "huge", huge, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	bucket, key, source := "bk", "copied", "bk/huge"
+	_, err = b.CopyObject(ctx, s3response.CopyObjectInput{Bucket: &bucket, Key: &key, CopySource: &source})
+	if got := apiErrCode(t, err); got != "InvalidRequest" {
+		t.Fatalf("copy of a %d-byte source: %s (%v), want InvalidRequest", maxCopySize+1, got, err)
+	}
+}

@@ -113,6 +113,12 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 		}
 		return s3response.CopyObjectOutput{}, s3err.GetAPIError(s3err.ErrInvalidRequest)
 	}
+	// S3 copies at most 5 GiB in one CopyObject; a larger object is copied as
+	// multipart parts. Checked before any bytes are read, and on the pinned
+	// path too, for parity.
+	if srcMf.Body.Size > maxCopySize {
+		return s3response.CopyObjectOutput{}, s3err.GetCopySourceObjectTooLargeErr(maxCopySize)
+	}
 	// A copy-source versionId naming the CURRENT version is still an illegal
 	// self-copy without metadata replacement; only restoring a noncurrent
 	// version is exempt from the check at the top.
