@@ -187,11 +187,47 @@ func (b *Backend) UploadPart(ctx context.Context, input *s3.UploadPartInput) (*s
 		return nil, err
 	}
 
-	// Checksum negotiation against the session declaration. A part checksum
-	// for a different algorithm than the declared one is rejected, and a
-	// COMPOSITE session requires one on every part (the composite final
-	// checksum is derived from them).
 	partAlgo, expected := partChecksumFromInput(input)
+	src := input.Body
+	if src == nil {
+		src = bytes.NewReader(nil)
+	}
+	rec, err := b.ingestPart(ctx, sess, int(*input.PartNumber), src, partAlgo, expected)
+	if err != nil {
+		return nil, err
+	}
+	out := &s3.UploadPartOutput{ETag: &rec.etag}
+	setUploadPartChecksum(out, rec.echoAlgo, rec.echoSum)
+	return out, nil
+}
+
+// ingestedPart is what ingestPart records and reports for one part: its quoted
+// ETag (hex md5 of the part bytes) and the checksum to echo to the client, if
+// any (the session's algorithm, or one the client asked for on this part).
+type ingestedPart struct {
+	etag     string
+	size     int64
+	echoAlgo types.ChecksumAlgorithm
+	echoSum  string
+}
+
+// ingestPart is the body-source-agnostic core of UploadPart and UploadPartCopy:
+// it negotiates the part checksum against the session, streams body through
+// the checksum readers into splitSpool, records the part (superseding a prior
+// part of the same number), parks its blobs, and drops the superseded part's
+// blobs. partAlgo/expected are the checksum the request names, if any: an
+// explicit value is validated on the stream; an algorithm alone is computed.
+//
+// The checksum negotiation: a part checksum for an algorithm other than the
+// session's declared one is rejected, and a COMPOSITE session requires one on
+// every part (the composite final checksum is derived from them). The reader
+// stack: hr computes the persisted checksum (the declared algorithm, or the
+// internal CRC64NVME); clientRdr additionally computes/validates a
+// client-requested algorithm the session didn't declare (echoed, never
+// persisted). A client-supplied value mismatch surfaces from the ingest read
+// as a BadDigest API error.
+func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSession, partNumber int, body io.Reader, partAlgo types.ChecksumAlgorithm, expected string) (*ingestedPart, error) {
+	uploadID := sess.UploadID
 	sessAlgo := types.ChecksumAlgorithm(sess.ChecksumAlgorithm)
 	if sessAlgo != "" && partAlgo != "" && partAlgo != sessAlgo {
 		return nil, s3err.GetChecksumTypeMismatchErr(sessAlgo, partAlgo)
@@ -200,31 +236,23 @@ func (b *Backend) UploadPart(ctx context.Context, input *s3.UploadPartInput) (*s
 		return nil, s3err.GetChecksumTypeMismatchErr(sessAlgo, types.ChecksumAlgorithm("null"))
 	}
 
-	// Reader stack over the body: hr computes the persisted checksum (the
-	// declared algorithm, or the internal CRC64NVME), clientRdr additionally
-	// computes/validates a client-requested algorithm the session didn't
-	// declare (echoed, never persisted). A client-supplied value mismatch
-	// surfaces from the ingest read as a BadDigest API error.
-	src := input.Body
-	if src == nil {
-		src = bytes.NewReader(nil)
-	}
 	var hr, clientRdr *utils.HashReader
+	var err error
 	switch {
 	case sessAlgo != "":
 		ht, err := hashTypeForAlgo(sessAlgo)
 		if err != nil {
 			return nil, err
 		}
-		if hr, err = utils.NewHashReader(src, expected, ht); err != nil {
+		if hr, err = utils.NewHashReader(body, expected, ht); err != nil {
 			return nil, err
 		}
 	case partAlgo == "" || partAlgo == types.ChecksumAlgorithmCrc64nvme:
-		if hr, err = utils.NewHashReader(src, expected, utils.HashTypeCRC64NVME); err != nil {
+		if hr, err = utils.NewHashReader(body, expected, utils.HashTypeCRC64NVME); err != nil {
 			return nil, err
 		}
 	default:
-		if hr, err = utils.NewHashReader(src, "", utils.HashTypeCRC64NVME); err != nil {
+		if hr, err = utils.NewHashReader(body, "", utils.HashTypeCRC64NVME); err != nil {
 			return nil, err
 		}
 		ht, err := hashTypeForAlgo(partAlgo)
@@ -250,7 +278,7 @@ func (b *Backend) UploadPart(ctx context.Context, input *s3.UploadPartInput) (*s
 		return nil, fmt.Errorf("s3frontend: list parts before supersede: %w", err)
 	}
 	for _, p := range prior {
-		if p.PartNumber == int(*input.PartNumber) {
+		if p.PartNumber == partNumber {
 			superseded = p.BlobDigests
 			break
 		}
@@ -260,7 +288,7 @@ func (b *Backend) UploadPart(ctx context.Context, input *s3.UploadPartInput) (*s
 	if err != nil {
 		return nil, err
 	}
-	body, err := b.splitSpool(ctx, sess.Bucket, space, bodyReader)
+	rec, err := b.splitSpool(ctx, sess.Bucket, space, bodyReader)
 	if err != nil {
 		var apiErr s3err.APIError
 		if errors.As(err, &apiErr) {
@@ -270,11 +298,11 @@ func (b *Backend) UploadPart(ctx context.Context, input *s3.UploadPartInput) (*s
 	}
 	if err := b.multipart.PutPart(ctx, registry.MultipartPart{
 		UploadID:    uploadID,
-		PartNumber:  int(*input.PartNumber),
-		ETagMD5:     body.MD5,
-		Size:        body.Size,
+		PartNumber:  partNumber,
+		ETagMD5:     rec.MD5,
+		Size:        rec.Size,
 		Checksum:    hr.Sum(),
-		BlobDigests: bodyDigests(body),
+		BlobDigests: bodyDigests(rec),
 		State:       registry.PartParked,
 	}); err != nil {
 		return nil, fmt.Errorf("s3frontend: record part: %w", err)
@@ -283,21 +311,20 @@ func (b *Backend) UploadPart(ctx context.Context, input *s3.UploadPartInput) (*s
 	// part is durable on the network as soon as the client sees success.
 	// The part row is recorded first so a crash mid-park leaves re-drivable
 	// spooled intents.
-	if err := b.parkBlobs(ctx, space, body.Blobs); err != nil {
+	if err := b.parkBlobs(ctx, space, rec.Blobs); err != nil {
 		return nil, fmt.Errorf("s3frontend: park part blobs: %w", err)
 	}
 	if len(superseded) > 0 {
 		b.cleanupPartBlobs(ctx, space, uploadID, superseded, nil)
 	}
-	etag := `"` + hex.EncodeToString(body.MD5) + `"`
-	out := &s3.UploadPartOutput{ETag: &etag}
+	out := &ingestedPart{etag: `"` + hex.EncodeToString(rec.MD5) + `"`, size: rec.Size}
 	switch {
 	case sessAlgo != "":
-		setUploadPartChecksum(out, sessAlgo, hr.Sum())
+		out.echoAlgo, out.echoSum = sessAlgo, hr.Sum()
 	case clientRdr != nil:
-		setUploadPartChecksum(out, partAlgo, clientRdr.Sum())
+		out.echoAlgo, out.echoSum = partAlgo, clientRdr.Sum()
 	case partAlgo != "":
-		setUploadPartChecksum(out, partAlgo, hr.Sum())
+		out.echoAlgo, out.echoSum = partAlgo, hr.Sum()
 	}
 	return out, nil
 }

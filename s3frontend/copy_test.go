@@ -3,11 +3,16 @@ package s3frontend
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"errors"
+	"io"
 	"net/http"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 
 	"github.com/fil-forge/libforge/testutil"
 	"github.com/fil-forge/ucantone/did"
@@ -140,8 +145,142 @@ func TestCopyObject_ForeignTenantSourceIsAccessDenied(t *testing.T) {
 	if err := copyFrom("b", "no-such-bucket/obj"); apiErrCode(t, err) != "NoSuchBucket" {
 		t.Fatalf("nonexistent source bucket: %v, want NoSuchBucket", err)
 	}
-	if err := copyFrom("a2", "a/obj"); apiErrCode(t, err) != "NotImplemented" {
-		t.Fatalf("same-tenant cross-space source: %v, want NotImplemented", err)
+	if err := copyFrom("a2", "a/obj"); err != nil {
+		t.Fatalf("same-tenant cross-space source: %v, want the copy to proceed", err)
+	}
+}
+
+// A copy between spaces re-ingests the source's bytes: the destination reads
+// back the same bytes under new digests with their own claims, the source's
+// claims are untouched, the ETag is the md5 of the bytes, the source's
+// checksum value carries over as a full-object value, and metadata follows
+// the directive.
+func TestCopyObject_CrossSpaceReingest(t *testing.T) {
+	b, mem, _ := newRefTestBackend(t, 64<<10) // 64 KiB blobs: the body spans several
+	ctx := context.Background()
+	tenant := testutil.RandomDID(t)
+	for _, name := range []string{"src-bkt", "dst-bkt"} {
+		if err := mem.Create(ctx, name, testutil.RandomDID(t), registry.CreateState{Tenant: tenant}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	srcSt, _ := mem.Get(ctx, "src-bkt")
+	dstSt, _ := mem.Get(ctx, "dst-bkt")
+
+	data := bytes.Repeat([]byte("re-ingest me "), 20000) // ~260 KiB
+	srcBucket, srcKey, ctype := "src-bkt", "obj", "text/bla"
+	if _, err := b.PutObject(ctx, s3response.PutObjectInput{
+		Bucket: &srcBucket, Key: &srcKey, Body: bytes.NewReader(data),
+		ChecksumAlgorithm: types.ChecksumAlgorithmSha256, ContentType: &ctype,
+		Metadata: map[string]string{"foo": "bar"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	srcRv, err := b.resolveVersion(ctx, "src-bkt", "obj", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dstBucket, dstKey, source := "dst-bkt", "copied", "src-bkt/obj"
+	out, err := b.CopyObject(ctx, s3response.CopyObjectInput{Bucket: &dstBucket, Key: &dstKey, CopySource: &source})
+	if err != nil {
+		t.Fatalf("cross-space copy: %v", err)
+	}
+	if want := `"` + hex.EncodeToString(md5Sum(data)) + `"`; *out.CopyObjectResult.ETag != want {
+		t.Fatalf("copy ETag = %s, want md5 of the bytes %s", *out.CopyObjectResult.ETag, want)
+	}
+	if out.CopyObjectResult.ChecksumSHA256 == nil || *out.CopyObjectResult.ChecksumSHA256 != sha256B64(data) || out.CopyObjectResult.ChecksumType != types.ChecksumTypeFullObject {
+		t.Fatalf("copy checksum = %+v, want the source's SHA256 as FULL_OBJECT", out.CopyObjectResult)
+	}
+
+	got, err := b.GetObject(ctx, &s3.GetObjectInput{Bucket: &dstBucket, Key: &dstKey})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotBytes, _ := io.ReadAll(got.Body)
+	got.Body.Close()
+	if !bytes.Equal(gotBytes, data) || *got.ContentType != ctype || got.Metadata["foo"] != "bar" {
+		t.Fatalf("copied object: %d bytes, %q, %v", len(gotBytes), *got.ContentType, got.Metadata)
+	}
+
+	// New blobs under the destination's space, each with one claim there; the
+	// source's blobs keep exactly their one claim in the source's space.
+	dstRv, err := b.resolveVersion(ctx, "dst-bkt", "copied", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dstRv.mf.Body.Blobs) < 2 {
+		t.Fatalf("expected a multi-blob body, got %d blobs", len(dstRv.mf.Body.Blobs))
+	}
+	srcDigests := map[string]bool{}
+	for _, ref := range srcRv.mf.Body.Blobs {
+		srcDigests[string(ref.Digest)] = true
+		if n, _ := mem.CountClaims(ctx, srcSt.Space, ref.Digest); n != 1 {
+			t.Fatalf("source blob claims = %d, want 1 (untouched)", n)
+		}
+	}
+	for _, ref := range dstRv.mf.Body.Blobs {
+		if srcDigests[string(ref.Digest)] {
+			t.Fatalf("destination pins a source blob %x; a cross-space copy must re-ingest", ref.Digest)
+		}
+		if n, _ := mem.CountClaims(ctx, dstSt.Space, ref.Digest); n != 1 {
+			t.Fatalf("destination blob claims = %d, want 1", n)
+		}
+	}
+
+	// REPLACE takes the request's metadata instead of the source's.
+	replaced, newType := "replaced", "application/x-new"
+	if _, err := b.CopyObject(ctx, s3response.CopyObjectInput{
+		Bucket: &dstBucket, Key: &replaced, CopySource: &source,
+		MetadataDirective: types.MetadataDirectiveReplace, ContentType: &newType, Metadata: map[string]string{"k": "v"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	head, err := b.HeadObject(ctx, &s3.HeadObjectInput{Bucket: &dstBucket, Key: &replaced})
+	if err != nil || *head.ContentType != newType || head.Metadata["k"] != "v" || head.Metadata["foo"] != "" {
+		t.Fatalf("REPLACE copy head: %v %v %v", err, head.ContentType, head.Metadata)
+	}
+}
+
+// A copy of a multipart object is a single-part object on S3: its ETag is the
+// md5 of the whole bytes rather than the source's "-N" form, and its checksum
+// is a full-object value.
+func TestCopyObject_MultipartSourceETag(t *testing.T) {
+	b, _, _ := newRefTestBackend(t)
+	p1 := bytes.Repeat([]byte("p"), 5<<20)
+	p2 := bytes.Repeat([]byte("q"), 100)
+	id := mpCreate(t, b, "mpsrc", "", "")
+	u1, err := mpUploadPart(t, b, "mpsrc", id, 1, p1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u2, err := mpUploadPart(t, b, "mpsrc", id, 2, p2, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n1, n2 := int32(1), int32(2)
+	res, err := mpComplete(t, b, "mpsrc", id, []types.CompletedPart{{ETag: u1.ETag, PartNumber: &n1}, {ETag: u2.ETag, PartNumber: &n2}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains([]byte(*res.ETag), []byte("-2")) {
+		t.Fatalf("multipart source ETag = %s, want a -2 suffix", *res.ETag)
+	}
+
+	bucket, key, source := "bk", "mpcopy", "bk/mpsrc"
+	out, err := b.CopyObject(context.Background(), s3response.CopyObjectInput{Bucket: &bucket, Key: &key, CopySource: &source})
+	if err != nil {
+		t.Fatalf("copy of a multipart object: %v", err)
+	}
+	all := append(append([]byte{}, p1...), p2...)
+	if want := `"` + hex.EncodeToString(md5Sum(all)) + `"`; *out.CopyObjectResult.ETag != want {
+		t.Fatalf("copy ETag = %s, want md5 of the bytes %s", *out.CopyObjectResult.ETag, want)
+	}
+	if out.CopyObjectResult.ChecksumType != types.ChecksumTypeFullObject || out.CopyObjectResult.ChecksumCRC64NVME == nil {
+		t.Fatalf("copy checksum = %+v, want a FULL_OBJECT CRC64NVME", out.CopyObjectResult)
+	}
+	if _, got, err := getObjV(t, b, "mpcopy", ""); err != nil || !bytes.Equal(got, all) {
+		t.Fatalf("copy GET: %d bytes, %v", len(got), err)
 	}
 }
 

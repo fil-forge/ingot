@@ -2,9 +2,12 @@ package s3frontend
 
 import (
 	"context"
+	"crypto/md5"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
@@ -18,14 +21,20 @@ import (
 	"github.com/fil-forge/ingot/registry"
 )
 
-// CopyObject copies an object as a metadata-only operation under dedup: it
-// resolves the source manifest — the current version, or the one named by the
-// copy-source `?versionId` — and writes a new destination version pinning the
-// SAME body blobs (same digests), adding a reference-index claim per digest. No
-// bytes move and no Forge upload happens — the blobs already exist. Honors
-// MetadataDirective (COPY = inherit source metadata; REPLACE = take it from the
-// request) and the x-amz-copy-source-if-* preconditions, and supports a
-// cross-bucket source in the same space. The source bucket must belong to the
+// CopyObject copies an object. Within one space it is a metadata-only
+// operation under dedup: it resolves the source manifest — the current version,
+// or the one named by the copy-source `?versionId` — and writes a new
+// destination version pinning the SAME body blobs (same digests), adding a
+// reference-index claim per digest; no bytes move and no Forge upload happens.
+// Across spaces (every bucket has its own) the blobs cannot be shared, because
+// each blob's key is wrapped bound to (space, digest): the source's plaintext
+// instead streams through the decrypting read path into new blobs under the
+// destination's space, exactly as a PUT of those bytes would, and the copy has
+// its own digests and claims. Either way the copy's ETag is the md5 of its
+// bytes (so a multipart source's "-N" ETag is not carried over, as on S3) and
+// its checksum is a full-object value. Honors MetadataDirective (COPY = inherit
+// source metadata; REPLACE = take it from the request) and the
+// x-amz-copy-source-if-* preconditions. The source bucket must belong to the
 // destination's tenant (copySourceBucket), backing up hilt's own decision on
 // the source.
 func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInput) (s3response.CopyObjectOutput, error) {
@@ -90,6 +99,9 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 	if err != nil {
 		return s3response.CopyObjectOutput{}, err
 	}
+	if err := expectedSourceOwner(input.ExpectedSourceBucketOwner, srcSt); err != nil {
+		return s3response.CopyObjectOutput{}, err
+	}
 	srcRv, err := b.resolveVersionIn(ctx, srcSt, srcKey, srcVersionID)
 	if err != nil {
 		return s3response.CopyObjectOutput{}, err
@@ -100,18 +112,6 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 			return s3response.CopyObjectOutput{}, s3err.GetAPIError(s3err.ErrNoSuchKey)
 		}
 		return s3response.CopyObjectOutput{}, s3err.GetAPIError(s3err.ErrInvalidRequest)
-	}
-	// A copy across spaces is not implemented. The destination manifest
-	// reuses the source's blobs, but each blob's CEK is wrapped bound to
-	// (space, digest): the destination space cannot unwrap them, and the
-	// destination space has no blob_locations/claims for those digests
-	// either. Serving this needs a rewrap flow (unwrap under the source
-	// space, rewrap under the destination, new params row + claim) — a filed
-	// follow-up. Every bucket has its own space today, so this rejects all
-	// same-tenant cross-bucket copies (a foreign tenant's bucket was already
-	// refused above).
-	if srcRv.st.Space != bucketState.Space {
-		return s3response.CopyObjectOutput{}, s3err.GetAPIError(s3err.ErrNotImplemented)
 	}
 	// A copy-source versionId naming the CURRENT version is still an illegal
 	// self-copy without metadata replacement; only restoring a noncurrent
@@ -137,43 +137,77 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 		}
 	}
 
-	// Destination checksum: same bytes → the source's checksum (and type)
-	// carries over. A request naming a DIFFERENT x-amz-checksum-algorithm
-	// replaces it: the shared body streams through the new algorithm once and
-	// the result is a full-object value — the sole per-object checksum, never
-	// accumulated alongside the source's.
-	ckAlgo, ckVal, ckType := srcMf.ChecksumAlgorithm, srcMf.Checksum, srcMf.ChecksumType
+	// The copy's body, ETag and checksum. The checksum algorithm is the one the
+	// request names, else the source's, else the CRC64NVME every stored object
+	// carries; the value is always a full-object one for the copy's bytes, never
+	// a composite carried over. Three shapes:
+	//
+	//   - same space, single-part source, same algorithm: pin the source's body
+	//     and ETag verbatim, no read;
+	//   - same space, but a multipart source (its ETag is md5-of-md5s + "-N",
+	//     its checksum possibly composite) or a different algorithm requested:
+	//     pin the body, stream it once to compute the md5 ETag and checksum;
+	//   - another space: stream it once through ingestBody into new blobs
+	//     under the destination space; the ETag and checksum come from that
+	//     pass.
+	//
+	// The pinned body drops its part geometry: the copy is a single-part
+	// object, as on S3.
+	crossSpace := srcRv.st.Space != bucketState.Space
+	multipartSrc := len(srcMf.Body.PartSizes) > 0 || strings.Contains(srcMf.ETag, "-")
+	ckAlgo := srcMf.ChecksumAlgorithm
+	if input.ChecksumAlgorithm != "" {
+		ckAlgo = string(input.ChecksumAlgorithm)
+	}
+	ckVal, ckType := srcMf.Checksum, srcMf.ChecksumType
 	if ckVal != "" && ckType == "" {
 		ckType = string(types.ChecksumTypeFullObject)
 	}
-	if reqAlgo := input.ChecksumAlgorithm; reqAlgo != "" && string(reqAlgo) != srcMf.ChecksumAlgorithm {
-		ht, err := hashTypeForAlgo(reqAlgo)
+	body, etag := srcMf.Body, srcMf.ETag
+	body.PartSizes, body.PartChecksums = nil, nil
+	if crossSpace || multipartSrc || ckAlgo != srcMf.ChecksumAlgorithm {
+		if ckAlgo == "" {
+			ckAlgo = string(types.ChecksumAlgorithmCrc64nvme)
+		}
+		ht, err := hashTypeForAlgo(types.ChecksumAlgorithm(ckAlgo))
 		if err != nil {
 			return s3response.CopyObjectOutput{}, err
 		}
-		opener, err := b.bodyOpener(ctx, srcRv.st.Space, srcMf.Body)
+		rc, err := b.openCopySource(ctx, srcRv, 0, srcMf.Body.Size-1)
 		if err != nil {
 			return s3response.CopyObjectOutput{}, err
 		}
-		rc := msbucket.OpenBody(ctx, opener, srcRv.st.Space, srcMf.Body)
 		defer rc.Close()
 		hr, err := utils.NewHashReader(rc, "", ht)
 		if err != nil {
 			return s3response.CopyObjectOutput{}, fmt.Errorf("s3frontend: copy checksum reader: %w", err)
 		}
-		if _, err := io.Copy(io.Discard, hr); err != nil {
-			return s3response.CopyObjectOutput{}, fmt.Errorf("s3frontend: copy checksum: %w", err)
+		if crossSpace {
+			if body, err = b.ingestBody(ctx, bucketState, hr); err != nil {
+				var apiErr s3err.APIError
+				if errors.As(err, &apiErr) {
+					return s3response.CopyObjectOutput{}, apiErr
+				}
+				return s3response.CopyObjectOutput{}, fmt.Errorf("s3frontend: copy ingest: %w", err)
+			}
+			etag = hex.EncodeToString(body.MD5)
+		} else {
+			sum := md5.New()
+			if _, err := io.Copy(sum, hr); err != nil {
+				return s3response.CopyObjectOutput{}, fmt.Errorf("s3frontend: copy checksum: %w", err)
+			}
+			etag = hex.EncodeToString(sum.Sum(nil))
 		}
-		ckAlgo, ckVal, ckType = string(reqAlgo), hr.Sum(), string(types.ChecksumTypeFullObject)
+		ckVal, ckType = hr.Sum(), string(types.ChecksumTypeFullObject)
 	}
 
-	// Destination manifest: the SAME body (size/sha/md5/blobs) and ETag, since
-	// the content is identical. Metadata per the directive.
+	// Destination manifest: the body and ETag chosen above, metadata per the
+	// directive.
 	dstMf := &msbucket.ObjectManifest{
 		Key:               dstKey,
 		Created:           time.Now().Unix(),
-		Body:              srcMf.Body,
-		ETag:              srcMf.ETag,
+		Body:              body,
+		ETag:              etag,
 		ChecksumAlgorithm: ckAlgo,
 		Checksum:          ckVal,
 		ChecksumType:      ckType,
@@ -205,17 +239,18 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 	}
 
 	// Commit to the destination via the write rule: splice + reference index.
-	// The new claims use the DESTINATION bucket/space; the same digests gain
-	// another reference.
+	// The claims use the DESTINATION bucket/space: for a pinned body the same
+	// digests gain another reference, for a re-ingested one its new digests
+	// gain their first.
 	node, effState, err := b.commitVersion(ctx, bucketState, dstKey, dstMf, applyTagsIfPresent(initState, dstTags), nil)
 	if err != nil {
 		return s3response.CopyObjectOutput{}, err
 	}
 
 	lastMod := time.Unix(dstMf.Created, 0)
-	etag := etagOf(dstMf)
+	quotedETag := etagOf(dstMf)
 	result := &s3response.CopyObjectResult{
-		ETag:         &etag,
+		ETag:         &quotedETag,
 		LastModified: &lastMod,
 	}
 	result.ChecksumCRC32, result.ChecksumCRC32C, result.ChecksumSHA1, result.ChecksumSHA256, result.ChecksumCRC64NVME, result.ChecksumSHA512, result.ChecksumMD5, result.ChecksumXXHASH64, result.ChecksumXXHASH3, result.ChecksumXXHASH128, result.ChecksumType = checksumFields(dstMf.ChecksumAlgorithm, dstMf.Checksum, dstMf.ChecksumType)
