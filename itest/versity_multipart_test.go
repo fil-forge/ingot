@@ -8,8 +8,7 @@ import (
 
 // Multipart groups of the S3 conformance partition, partitioned empirically
 // against the forge-mode stack (see the curation note in README.md). The
-// remaining xfail surface: ACL on create (FIL-525) and the UploadPartCopy
-// group (FIL-586).
+// remaining xfail surface is ACL on create.
 
 var createMultipartPass = []forgeCase{
 	{name: "non_existing_bucket", fn: integration.CreateMultipartUpload_non_existing_bucket},
@@ -59,9 +58,30 @@ var uploadPartXFail = []forgeCase{}
 
 var uploadPartCopyPass = []forgeCase{
 	{name: "non_existing_bucket", fn: integration.UploadPartCopy_non_existing_bucket},
-	// hilt resolves the copy source when authorizing the request, so a missing
-	// source bucket is NoSuchBucket before the (unimplemented) backend runs.
 	{name: "non_existing_source_bucket", fn: integration.UploadPartCopy_non_existing_source_bucket},
+	{name: "incorrect_uploadId", fn: integration.UploadPartCopy_incorrect_uploadId},
+	{name: "incorrect_object_key", fn: integration.UploadPartCopy_incorrect_object_key},
+	{name: "non_existing_source_object_key", fn: integration.UploadPartCopy_non_existing_source_object_key},
+	{name: "success", fn: integration.UploadPartCopy_success},
+	{name: "by_range_invalid_ranges", fn: integration.UploadPartCopy_by_range_invalid_ranges},
+	// Upstream expects InvalidArgument for a range that starts past the
+	// source object; S3 returns InvalidRequest there (verified), and ingot
+	// follows S3. The end-past-the-object case it also covers agrees.
+	{name: "exceeding_copy_source_range", fn: integration.UploadPartCopy_exceeding_copy_source_range, skip: func() string {
+		return "upstream asserts InvalidArgument for a copy range starting past the object where S3 (and ingot) return InvalidRequest"
+	}},
+	{name: "greater_range_than_obj_size", fn: integration.UploadPartCopy_greater_range_than_obj_size},
+	{name: "by_range_success", fn: integration.UploadPartCopy_by_range_success},
+	{name: "should_copy_the_checksum", fn: integration.UploadPartCopy_should_copy_the_checksum},
+	{name: "should_not_copy_the_checksum", fn: integration.UploadPartCopy_should_not_copy_the_checksum},
+	{name: "should_calculate_the_checksum", fn: integration.UploadPartCopy_should_calculate_the_checksum},
+	// Same table as CopyObject_conditional_reads: upstream expects 304 for a
+	// matched copy-source If-None-Match where S3 returns 412.
+	{name: "conditional_reads", fn: integration.UploadPartCopy_conditional_reads, skip: func() string {
+		return "upstream asserts 304 NotModified for copy-source preconditions where S3 (and ingot) return 412 PreconditionFailed"
+	}},
+	// x-amz-source-expected-bucket-owner must name the source bucket's tenant.
+	{name: "incorrect_source_bucket_expected_owner", fn: integration.UploadPartCopy_incorrect_source_bucket_expected_owner},
 }
 
 var uploadPartCopyXFail = []forgeCase{
@@ -76,19 +96,6 @@ var uploadPartCopyXFail = []forgeCase{
 	// resolved by hilt first and answer NoSuchBucket where S3 gives
 	// InvalidArgument (the badly encoded ones pass).
 	{name: "invalid_copy_source", fn: integration.UploadPartCopy_invalid_copy_source},
-	{name: "incorrect_uploadId", fn: integration.UploadPartCopy_incorrect_uploadId},
-	{name: "incorrect_object_key", fn: integration.UploadPartCopy_incorrect_object_key},
-	{name: "non_existing_source_object_key", fn: integration.UploadPartCopy_non_existing_source_object_key},
-	{name: "success", fn: integration.UploadPartCopy_success},
-	{name: "by_range_invalid_ranges", fn: integration.UploadPartCopy_by_range_invalid_ranges},
-	{name: "exceeding_copy_source_range", fn: integration.UploadPartCopy_exceeding_copy_source_range},
-	{name: "greater_range_than_obj_size", fn: integration.UploadPartCopy_greater_range_than_obj_size},
-	{name: "by_range_success", fn: integration.UploadPartCopy_by_range_success},
-	{name: "should_copy_the_checksum", fn: integration.UploadPartCopy_should_copy_the_checksum},
-	{name: "should_not_copy_the_checksum", fn: integration.UploadPartCopy_should_not_copy_the_checksum},
-	{name: "should_calculate_the_checksum", fn: integration.UploadPartCopy_should_calculate_the_checksum},
-	{name: "conditional_reads", fn: integration.UploadPartCopy_conditional_reads},
-	{name: "incorrect_source_bucket_expected_owner", fn: integration.UploadPartCopy_incorrect_source_bucket_expected_owner},
 }
 
 var listPartsPass = []forgeCase{
