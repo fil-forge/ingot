@@ -11,6 +11,7 @@ import (
 	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/ucantone/multikey/ed25519"
 	"github.com/fil-forge/ucantone/ucan"
+	"github.com/fil-forge/ucantone/ucan/command"
 	"github.com/fil-forge/ucantone/ucan/delegation"
 	"github.com/stretchr/testify/require"
 
@@ -105,4 +106,54 @@ func TestRevokerUnknownCIDIsNoOp(t *testing.T) {
 	require.Len(t, chain, 1, "unmatched revocation must not touch cached state")
 	_, ok := keys.Get(a.access, s3.KeyKindSigV4)
 	require.True(t, ok)
+}
+
+// TestRevokerMarkerClearsHolder pins the consumer side of the per-key marker
+// design (fil-one/RFC#30). Beside a key's chains, hilt deposits one
+// delegation that is a member of no chain: issuer the tenant, audience the
+// key, subject the tenant, command /s3/key/marker. When the key's grants
+// narrow, hilt revokes that marker through /ucan/revoke. The revoker matches
+// on store membership, so a delegation in no chain still clears the key's
+// whole store, its action set, its verification key and its tenant, and
+// touches no other key.
+func TestRevokerMarkerClearsHolder(t *testing.T) {
+	kp := iam.NewKeyProofs()
+	keys := iam.NewVerificationKeyCache()
+	tenants := iam.NewTenantCache()
+	r := iam.NewRevoker(kp, keys, tenants, nil)
+
+	a := seedKey(t, kp, keys, tenants)
+	b := seedKey(t, kp, keys, tenants)
+
+	marker, err := delegation.Delegate(a.tenant, a.key, a.tenant.DID(),
+		command.MustParse("/s3/key/marker"), delegation.WithNoExpiration())
+	require.NoError(t, err)
+	kp.Deposit(a.key, marker)
+	require.True(t, kp.For(a.key).Contains(marker.Link()))
+	require.True(t, kp.For(a.key).Contains(a.dlg.Link()))
+
+	affected := r.Revoke(marker.Link())
+	require.Equal(t, []did.DID{a.key}, affected)
+
+	// Key A's store is gone with everything in it, chain members included.
+	require.False(t, kp.For(a.key).Contains(a.dlg.Link()), "the chain delegation must go with the store")
+	require.False(t, kp.For(a.key).Contains(marker.Link()), "the marker must go with the store")
+	_, known := kp.For(a.key).Permits(a.tenant.DID(), "s3:GetObject")
+	require.False(t, known, "the action set must go with the store")
+	_, ok := keys.Get(a.access, s3.KeyKindSigV4)
+	require.False(t, ok, "the verification key must be gone")
+	_, ok = tenants.Get(a.access)
+	require.False(t, ok, "the tenant must be gone")
+
+	// Key B is untouched.
+	require.True(t, kp.For(b.key).Contains(b.dlg.Link()), "unrelated key's chains must survive")
+	_, known = kp.For(b.key).Permits(b.tenant.DID(), "s3:GetObject")
+	require.True(t, known, "unrelated key's action set must survive")
+	_, ok = keys.Get(b.access, s3.KeyKindSigV4)
+	require.True(t, ok, "unrelated key's verification key must survive")
+	_, ok = tenants.Get(b.access)
+	require.True(t, ok, "unrelated key's tenant must survive")
+
+	// Re-delivery of the marker's revocation is a no-op.
+	require.Empty(t, r.Revoke(marker.Link()))
 }
