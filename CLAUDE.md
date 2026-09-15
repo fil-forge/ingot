@@ -220,8 +220,9 @@ forge-mode daemon. Two tiers:
   - **`forge_*_test.go`** — forge-native behaviors on dedicated stacks:
     provisioning (`forge_native`), delete/release (`forge_delete`), deferred
     multipart accept (`forge_multipart_deferred`), catalog retention
-    (`forge_retention`), and the read-after-eviction network tier
-    (`forge_eviction`).
+    (`forge_retention`), the read-after-eviction network tier
+    (`forge_eviction`), and a real `aws s3 cp` multipart round trip from the
+    official CLI image (`forge_awscli`).
 - **Suite-composition-sensitive upstream cases** — a few versitygw cases
   depend on run position rather than S3 semantics: `ListBuckets_truncated`
   names buckets from a process-global counter and asserts *creation-order*
