@@ -184,7 +184,11 @@ HEAD never decrypts. See `s3frontend/decrypt.go`.
   the agent, and the per-key `DelegationCache` carries those proofs into the
   request via `internal/reqscope`, where the uploader and the network read
   tier spend them. The uploader also captures a per-space ship authority
-  (1h TTL) for the async catalog flush.
+  (1h TTL) for the async catalog flush. The two bucket-configuration reads,
+  `GET /{bucket}?versioning` and `GET /{bucket}?object-lock`, map to no
+  Forge command, so no per-request delegation carries the key's expiry for
+  them; they are authorized at hilt on every request and served from the
+  registry, as every other bucket-level operation is.
 - There is **no root account**: versitygw's built-in root user is disabled
   (an empty `RootUserConfig`), so every access key resolves through hilt. A
   key hilt has not issued is rejected as InvalidAccessKeyId.
