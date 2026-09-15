@@ -3,12 +3,15 @@
 package itest
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
 	"os"
 	"strings"
 	"sync"
@@ -195,9 +198,17 @@ func TestForgeEncryption(t *testing.T) {
 	})
 
 	// The 5 GiB part cap (versitygw's auth middleware, strictly greater-
-	// than) rejects on the DECLARED length before reading the body, so the
-	// over-limit probe is cheap and always runs; the expensive at-limit
-	// upload is TestForgeMaxSizePart's job.
+	// than) rejects on the DECLARED Content-Length before reading the body,
+	// so the over-limit probe is cheap and always runs; the expensive
+	// at-limit upload is TestForgeMaxSizePart's job.
+	//
+	// The request is sent head-only (headersOnlyHTTPClient): the SDK signs it
+	// normally — Content-Length is part of the SigV4 signed headers, so the
+	// cap sees the real declared value — and not one payload byte follows.
+	// Streaming the 5 GiB the header promises would race the server's reply
+	// against the client's own writes: the server answers and closes while
+	// the client is still sending, and when the write error wins, the SDK
+	// reports a broken pipe instead of EntityTooLarge.
 	t.Run("PartOverMaxSizeRejected", func(t *testing.T) {
 		const bucket, key = "big-reject", "obj"
 		if _, err := cl.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
@@ -212,8 +223,8 @@ func TestForgeEncryption(t *testing.T) {
 		const tooBig = int64(5)<<30 + 1
 		_, err = cl.UploadPart(ctx, &s3.UploadPartInput{
 			Bucket: aws.String(bucket), Key: aws.String(key), UploadId: create.UploadId,
-			PartNumber: aws.Int32(1), Body: newPatternReader(tooBig), ContentLength: aws.Int64(tooBig),
-		})
+			PartNumber: aws.Int32(1), Body: bytes.NewReader(nil), ContentLength: aws.Int64(tooBig),
+		}, func(o *s3.Options) { o.HTTPClient = &headersOnlyHTTPClient{} })
 		if err == nil {
 			t.Fatalf("UploadPart of 5 GiB + 1 succeeded, want EntityTooLarge")
 		}
@@ -768,4 +779,60 @@ func spooledEnvelopeAt(t *testing.T, ctx context.Context, s *stack.Stack, path s
 		t.Fatalf("decode COSE envelope %s: %v", path, err)
 	}
 	return env
+}
+
+// headersOnlyHTTPClient sends a signed request's head and reads the response,
+// never sending the body the Content-Length header promises. It exists for
+// the over-limit part probe: versitygw rejects on the declared length before
+// it reads a byte, so the body is pure cost, and streaming it would race the
+// server's early reply against the client's own writes (see
+// PartOverMaxSizeRejected). Only for requests the server is expected to
+// refuse on their headers alone.
+type headersOnlyHTTPClient struct{}
+
+func (headersOnlyHTTPClient) Do(req *http.Request) (*http.Response, error) {
+	conn, err := net.Dial("tcp", req.URL.Host)
+	if err != nil {
+		return nil, fmt.Errorf("dial %s: %w", req.URL.Host, err)
+	}
+	host := req.Host
+	if host == "" {
+		host = req.URL.Host
+	}
+	var head bytes.Buffer
+	fmt.Fprintf(&head, "%s %s HTTP/1.1\r\n", req.Method, req.URL.RequestURI())
+	fmt.Fprintf(&head, "Host: %s\r\n", host)
+	for name, values := range req.Header {
+		// Host and Content-Length are emitted from the request fields below:
+		// Go keeps them out of Header, and the SigV4 signer covers
+		// Content-Length from req.ContentLength.
+		if strings.EqualFold(name, "Host") || strings.EqualFold(name, "Content-Length") {
+			continue
+		}
+		for _, v := range values {
+			fmt.Fprintf(&head, "%s: %s\r\n", name, v)
+		}
+	}
+	if req.ContentLength > 0 {
+		fmt.Fprintf(&head, "Content-Length: %d\r\n", req.ContentLength)
+	}
+	head.WriteString("\r\n")
+	if _, err := conn.Write(head.Bytes()); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("write request head: %w", err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(conn), req)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("read response: %w", err)
+	}
+	// Buffer the body so the connection can close with the request body
+	// still unsent; the server has already answered and hung up.
+	body, err := io.ReadAll(resp.Body)
+	conn.Close()
+	if err != nil {
+		return nil, fmt.Errorf("read response body: %w", err)
+	}
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	return resp, nil
 }

@@ -190,6 +190,36 @@ func setUploadPartChecksum(out *s3.UploadPartOutput, algo types.ChecksumAlgorith
 	}
 }
 
+// setCopyPartChecksum sets the response pointer matching algo on an
+// UploadPartCopy result. No-op for an empty algo or sum.
+func setCopyPartChecksum(res *s3response.CopyPartResult, algo types.ChecksumAlgorithm, sum string) {
+	if algo == "" || sum == "" {
+		return
+	}
+	switch algo {
+	case types.ChecksumAlgorithmCrc32:
+		res.ChecksumCRC32 = &sum
+	case types.ChecksumAlgorithmCrc32c:
+		res.ChecksumCRC32C = &sum
+	case types.ChecksumAlgorithmSha1:
+		res.ChecksumSHA1 = &sum
+	case types.ChecksumAlgorithmSha256:
+		res.ChecksumSHA256 = &sum
+	case types.ChecksumAlgorithmCrc64nvme:
+		res.ChecksumCRC64NVME = &sum
+	case types.ChecksumAlgorithmSha512:
+		res.ChecksumSHA512 = &sum
+	case types.ChecksumAlgorithmMd5:
+		res.ChecksumMD5 = &sum
+	case types.ChecksumAlgorithmXxhash64:
+		res.ChecksumXXHASH64 = &sum
+	case types.ChecksumAlgorithmXxhash3:
+		res.ChecksumXXHASH3 = &sum
+	case types.ChecksumAlgorithmXxhash128:
+		res.ChecksumXXHASH128 = &sum
+	}
+}
+
 // setResponsePartChecksum sets the per-part pointer matching algo on a
 // ListParts response entry. No-op for an empty algo or sum.
 func setResponsePartChecksum(p *s3response.Part, algo types.ChecksumAlgorithm, sum string) {

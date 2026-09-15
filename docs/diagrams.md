@@ -297,13 +297,15 @@ sequenceDiagram
   storage shape is the [version tree](#per-key-version-storage-manifest-arm-leaf-arm-prev-tree).
 - The claim ledger and the zero-claims release are the
   [blob lifecycle](#blob-lifecycle-spooled-parked-accepted-released).
-- `CopyObject` runs the same `commitVersion` with a manifest that pins the
-  source's digests: no spool, no upload, claims incremented. A source bucket
-  owned by another tenant is `AccessDenied` before any key lookup: hilt
-  refuses it when authorizing the request, and ingot compares the tenant on
-  the two bucket rows as well. Same-tenant cross-space (today: cross-bucket) copies are
-  rejected `NotImplemented` — the CEK wrap is bound to (space, digest), so
-  they need a rewrap flow.
+- `CopyObject` runs the same `commitVersion`. Within one space its manifest
+  pins the source's digests: no spool, no upload, claims incremented. Across
+  spaces (every bucket has its own) the CEK wrap bound to (space, digest)
+  rules out sharing, so the source's plaintext streams through the decrypting
+  read path into `ingestBody` and the copy gets its own blobs and claims. A
+  source bucket owned by another tenant is `AccessDenied` before any key
+  lookup (hilt refuses it when authorizing the request; ingot compares the
+  tenant on the two bucket rows as well). The copy's ETag is the md5 of its
+  bytes even for a multipart source.
 - Supersession also records each replaced catalog block for future removal:
   the [catalog GC candidates](#catalog-gc-candidates-what-gets-remembered-for-removal)
   diagram shows every entry path.
@@ -415,8 +417,12 @@ sequenceDiagram
     C->>B: CreateMultipartUpload
     B->>R: CreateSession(open) with headers + checksum algorithm
     B-->>C: uploadId
-    C->>B: UploadPart(n)
-    B->>B: openSession (non-open: NoSuchUpload), then splitSpool<br/>(resolve the tenant recipient, then encrypt per piece:<br/>fresh CEK → FEE envelope → spool under the ciphertext<br/>digest + params row, as in the PutObject diagram)
+    C->>B: UploadPart(n) / UploadPartCopy(n)
+    B->>B: openSession (non-open: NoSuchUpload)
+    opt UploadPartCopy
+        B->>B: vet the source: copySourceBucket (tenant), resolveVersionIn,<br/>range within the object, copy-source preconditions (412);<br/>the body is the source's plaintext range through the decrypting reader
+    end
+    B->>B: ingestPart: splitSpool<br/>(resolve the tenant recipient, then encrypt per piece:<br/>fresh CEK → FEE envelope → spool under the ciphertext<br/>digest + params row, as in the PutObject diagram)
     B->>R: PutPart(parked)
     loop each part blob (parkBlobs)
         alt blob_locations already has the digest
@@ -429,7 +435,7 @@ sequenceDiagram
             B->>R: PutPark(AddTask, AcceptTask, PutInvocation), intent parked
         end
     end
-    B-->>C: part ETag (part md5)
+    B-->>C: part ETag (part md5; for a copy, of the copied bytes)
     C->>B: CompleteMultipartUpload(parts)
     B->>B: validate parts (ascending, ETags, checksums, MinPartSize)
     alt session already completed
@@ -458,8 +464,9 @@ sequenceDiagram
 Cross-references: [`architecture.md` §7.2](./architecture.md#72-multipart),
 [§7.3](./architecture.md#73-the-session-latch-the-abortcomplete-race).
 
-Sources: `s3frontend/multipart.go` (all verbs, parkBlobs, concludeBlobs,
-cleanupPartBlobs, SweepStaleMultipartSessions), `registry/stores.go`,
+Sources: `s3frontend/multipart.go` (all verbs, ingestPart, parkBlobs,
+concludeBlobs, cleanupPartBlobs, SweepStaleMultipartSessions),
+`s3frontend/uploadpartcopy.go`, `registry/stores.go`,
 `server.go` (startMultipartSweeper). Review when these change.
 
 ## Session states and the Complete/Abort latch
