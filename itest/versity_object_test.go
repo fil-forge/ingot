@@ -182,6 +182,12 @@ var copyObjectPass = []forgeCase{
 	// a withLock() bucket and need the versioned teardown: they run under
 	// LockCreation (versity_lock_test.go).
 	{name: "invalid_website_redirect_location", fn: integration.CopyObject_invalid_website_redirect_location},
+	// x-amz-source-expected-bucket-owner must name the source bucket's tenant.
+	{name: "incorrect_source_bucket_expected_owner", fn: integration.CopyObject_incorrect_source_bucket_expected_owner},
+	// Cross-bucket copies cross spaces (every bucket has its own) and
+	// re-ingest the source's bytes into the destination.
+	{name: "success", fn: integration.CopyObject_success},
+	{name: "copy_source_starting_with_slash", fn: integration.CopyObject_copy_source_starting_with_slash},
 	{name: "create_checksum_on_copy", fn: integration.CopyObject_create_checksum_on_copy},
 	{name: "should_copy_the_existing_checksum", fn: integration.CopyObject_should_copy_the_existing_checksum},
 	{name: "should_replace_the_existing_checksum", fn: integration.CopyObject_should_replace_the_existing_checksum},
@@ -189,7 +195,7 @@ var copyObjectPass = []forgeCase{
 }
 
 // Observed failing against the forge stack: multi-account semantics and
-// ACLs are unimplemented surface.
+// ACLs are unimplemented surface (the upstream admin user API).
 var copyObjectXFail = []forgeCase{
 	// The case walks a table of malformed copy sources. The badly encoded
 	// ones ("bucket/%ZZ") pass: hilt's parser rejects them, the request is
@@ -199,17 +205,8 @@ var copyObjectXFail = []forgeCase{
 	// source while authorizing, ahead of the controller's validation, and
 	// answers NoSuchBucket where S3 gives InvalidArgument.
 	{name: "invalid_copy_source", fn: integration.CopyObject_invalid_copy_source},
-	// Cross-bucket copies are cross-SPACE copies (every bucket has its own
-	// space) and are rejected NotImplemented: each blob's CEK wrap is bound
-	// to (space, digest), so serving them needs the rewrap flow — a filed
-	// follow-up. A source bucket in another tenant is AccessDenied before
-	// that. Cross-bucket cases whose copy fails on resolution first (e.g.
-	// non_existing_dir_object) still pass.
-	{name: "success", fn: integration.CopyObject_success},
-	{name: "copy_source_starting_with_slash", fn: integration.CopyObject_copy_source_starting_with_slash},
 	{name: "not_owned_source_bucket", fn: integration.CopyObject_not_owned_source_bucket},
 	{name: "object_acl_not_supported", fn: integration.CopyObject_object_acl_not_supported},
-	{name: "incorrect_source_bucket_expected_owner", fn: integration.CopyObject_incorrect_source_bucket_expected_owner},
 	// with_legal_hold / with_retention_lock pass but need the versioned
 	// teardown: they run under LockCreation (versity_lock_test.go).
 }

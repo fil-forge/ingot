@@ -146,11 +146,15 @@ under the MST critical section, not only at read, so it is race-safe.
 **Multipart.** `CreateMultipartUpload` / `UploadPart` / `CompleteMultipartUpload` /
 `AbortMultipartUpload` are first-class. The mechanism lives in [§7](#7-cross-cutting-durability-concurrency-retrieval).
 
-**Copy.** `CopyObject` and `UploadPartCopy` are metadata-only operations under dedup: they resolve
-the source manifest, write a new version manifest pinning the **same** digest(s), and increment the
-reference index — no bytes move, no Piri upload. They honor `MetadataDirective`, cross-bucket sources
-(same space), `x-amz-copy-source-if-*`, and (for `UploadPartCopy`) a copy-source range; a multipart
-source copies its ordered part-digest list.
+**Copy.** `CopyObject` within a space is a metadata-only operation: it resolves the source manifest,
+writes a new version manifest pinning the **same** digests, and increments the reference index — no
+bytes move, no Piri upload. Across spaces (every bucket has its own, and each blob's key is wrapped
+bound to its space) the source's plaintext streams through the decrypting read path into new blobs
+under the destination's space, as a PUT of those bytes would. `UploadPartCopy` always re-ingests: the
+source's plaintext range becomes new parked blobs, exactly like an uploaded part. The source may be
+any bucket of the tenant. Both honor `x-amz-copy-source-if-*` (every failure
+a 412), require the source bucket to be the destination tenant's, and `CopyObject` honors
+`MetadataDirective`.
 
 **Multi-object delete.** `DeleteObjects` mixes delete-marker insertions and specific-version deletes
 (each driving the reference path), caps at 1000 keys, supports Quiet mode, and returns a per-entry
@@ -886,9 +890,9 @@ paths below are exercised against the real stack by the smelt-based `itest/` har
 - **Crash recovery for the spool is not built.** The `upload_intents` × `blob_refs` reconciliation
   the failure-mode table in [§7.5](#75-concurrency-durability-and-failure-modes) describes (resume/`abort` parked, `remove` accepted-but-unreferenced)
   is a later phase; a partial post-commit reference-index write currently relies on retry/idempotency.
-- **`UploadPartCopy` and indexer retraction on delete** are unimplemented
-  (`ErrNotImplemented` / no-op). `ListParts` and `ListMultipartUploads` are implemented
-  (paginated, prefix/delimiter/marker semantics; in-flight sessions only).
+- **Indexer retraction on delete** is unimplemented (no-op). `ListParts` and
+  `ListMultipartUploads` are implemented (paginated, prefix/delimiter/marker semantics;
+  in-flight sessions only).
 - **Multipart hygiene (spool-model edition).** Abort and part re-upload delete the
   now-unreferenced spooled blobs (guarded against content-addressed sharing with other
   sessions and committed objects), and a background sweeper aborts open sessions older
