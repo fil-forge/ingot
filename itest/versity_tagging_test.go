@@ -6,12 +6,14 @@ import (
 	"github.com/fil-forge/versitygw/tests/integration"
 )
 
-// Object-tagging groups of the S3 conformance partition (upstream
-// TestPutObjectTagging, TestGetObjectTagging, TestDeleteObjectTagging),
-// curated per docs/s3-object-tagging.md §6. These categories run with the
-// plain conf: their buckets are neither lock-enabled nor versioned, so the
-// plain teardown applies. The versioned tagging behaviors are the
-// Versioning_* rows in versity_versioning_test.go.
+// The tagging groups of the S3 conformance partition: the object-tagging
+// groups (upstream TestPutObjectTagging, TestGetObjectTagging,
+// TestDeleteObjectTagging), curated per docs/s3-object-tagging.md §6, and
+// the bucket-tagging groups (TestPutBucketTagging, TestGetBucketTagging,
+// TestDeleteBucketTagging) per §9. These categories run with the plain conf:
+// their buckets are neither lock-enabled nor versioned, so the plain
+// teardown applies. The versioned tagging behaviors are the Versioning_*
+// rows in versity_versioning_test.go.
 
 var putObjectTaggingPass = []forgeCase{
 	{name: "non_existing_object", fn: integration.PutObjectTagging_non_existing_object},
@@ -42,4 +44,28 @@ var deleteObjectTaggingXFail = []forgeCase{
 	// request 403s — the same owner-substitution surface as the
 	// *_expected_owner xfails in the object tables.
 	{name: "expected_bucket_owner", fn: integration.DeleteObjectTagging_expected_bucket_owner},
+}
+
+var putBucketTaggingPass = []forgeCase{
+	{name: "non_existing_bucket", fn: integration.PutBucketTagging_non_existing_bucket},
+	{name: "long_tags", fn: integration.PutBucketTagging_long_tags},
+	{name: "invalid_tags", fn: integration.PutBucketTagging_invalid_tags},
+	{name: "duplicate_keys", fn: integration.PutBucketTagging_duplicate_keys},
+	{name: "tag_count_limit", fn: integration.PutBucketTagging_tag_count_limit},
+	{name: "success", fn: integration.PutBucketTagging_success},
+	{name: "success_status", fn: integration.PutBucketTagging_success_status},
+}
+
+var getBucketTaggingPass = []forgeCase{
+	{name: "non_existing_bucket", fn: integration.GetBucketTagging_non_existing_bucket},
+	{name: "unset_tags", fn: integration.GetBucketTagging_unset_tags},
+	{name: "success", fn: integration.GetBucketTagging_success},
+}
+
+var deleteBucketTaggingPass = []forgeCase{
+	// The upstream helper kept the object-tagging name; the local label says
+	// what the case actually asserts, matching the Put/Get rows above.
+	{name: "non_existing_bucket", fn: integration.DeleteBucketTagging_non_existing_object},
+	{name: "success_status", fn: integration.DeleteBucketTagging_success_status},
+	{name: "success", fn: integration.DeleteBucketTagging_success},
 }

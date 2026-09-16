@@ -263,6 +263,17 @@ func (m *MemStore) SetObjectLockConfig(_ context.Context, name string, cfg []byt
 	return nil
 }
 
+func (m *MemStore) SetBucketTagging(_ context.Context, name string, tags []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.buckets[name]
+	if !ok {
+		return registry.ErrNotFound
+	}
+	s.BucketTagging = tags
+	return nil
+}
+
 func (m *MemStore) AllocVersionSeq(_ context.Context, name string) (uint64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
