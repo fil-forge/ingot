@@ -98,7 +98,7 @@ jobs:
     # Room for the main itest run (-timeout 40m) plus the S3 compatibility
     # report, which boots its own stack and, on main, moves ~10 GiB for the
     # large vectors.
-    timeout-minutes: 75
+    timeout-minutes: 90
 
     steps:
       - name: Check out the repository
