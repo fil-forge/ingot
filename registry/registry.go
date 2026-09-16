@@ -53,7 +53,11 @@ type State struct {
 	// controller's auth.BucketLockConfig JSON, stored verbatim. Nil when the
 	// bucket has never been configured (docs/s3-object-lock.md §4.2).
 	ObjectLockConfig []byte
-	CreatedAt        time.Time // set by the implementation at create time
+	// BucketTagging is the bucket's tag set as a JSON object. Nil when the
+	// bucket carries no tag set — never set, or deleted since
+	// (docs/s3-object-tagging.md §9).
+	BucketTagging []byte
+	CreatedAt     time.Time // set by the implementation at create time
 }
 
 // CreateState is the initial bucket state Create installs, so a bucket
@@ -113,6 +117,10 @@ type Registry interface {
 	// SetObjectLockConfig stores the bucket's object-lock configuration
 	// document verbatim. Returns ErrNotFound if the bucket is absent.
 	SetObjectLockConfig(ctx context.Context, name string, cfg []byte) error
+
+	// SetBucketTagging stores the bucket's tag set, replacing any previous
+	// one; nil clears it. Returns ErrNotFound if the bucket is absent.
+	SetBucketTagging(ctx context.Context, name string, tags []byte) error
 
 	// AllocVersionSeq atomically advances and returns the bucket's version
 	// ordinal (the first call returns 1; 0 is reserved to mean "none").

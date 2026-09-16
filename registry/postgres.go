@@ -68,12 +68,12 @@ func (r *Postgres) Create(ctx context.Context, name string, space did.DID, init 
 }
 
 func (r *Postgres) Get(ctx context.Context, name string) (*State, error) {
-	var rootBytes, forgeBytes, lockCfg []byte
+	var rootBytes, forgeBytes, lockCfg, tagging []byte
 	var createdAt time.Time
 	var spaceStr, tenantStr, versioning string
 	err := r.pool.QueryRow(ctx,
-		`SELECT root_cid, forge_root_cid, created_at, space, tenant, versioning, object_lock_config FROM ingot.buckets WHERE name = $1`, name).
-		Scan(&rootBytes, &forgeBytes, &createdAt, &spaceStr, &tenantStr, &versioning, &lockCfg)
+		`SELECT root_cid, forge_root_cid, created_at, space, tenant, versioning, object_lock_config, bucket_tagging FROM ingot.buckets WHERE name = $1`, name).
+		Scan(&rootBytes, &forgeBytes, &createdAt, &spaceStr, &tenantStr, &versioning, &lockCfg, &tagging)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -88,7 +88,7 @@ func (r *Postgres) Get(ctx context.Context, name string) (*State, error) {
 	if err != nil {
 		return nil, fmt.Errorf("registry: parse tenant %q: %w", tenantStr, err)
 	}
-	st := &State{Name: name, Space: space, Tenant: tenant, Versioning: VersioningState(versioning), ObjectLockConfig: lockCfg, CreatedAt: createdAt}
+	st := &State{Name: name, Space: space, Tenant: tenant, Versioning: VersioningState(versioning), ObjectLockConfig: lockCfg, BucketTagging: tagging, CreatedAt: createdAt}
 	if err := setCidPg(&st.Root, rootBytes, name, "root_cid"); err != nil {
 		return nil, err
 	}
@@ -182,6 +182,19 @@ func (r *Postgres) SetObjectLockConfig(ctx context.Context, name string, cfg []b
 		cfg, name)
 	if err != nil {
 		return fmt.Errorf("registry: set object lock config %q: %w", name, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (r *Postgres) SetBucketTagging(ctx context.Context, name string, tags []byte) error {
+	tag, err := r.pool.Exec(ctx,
+		`UPDATE ingot.buckets SET bucket_tagging = $1 WHERE name = $2`,
+		tags, name)
+	if err != nil {
+		return fmt.Errorf("registry: set bucket tagging %q: %w", name, err)
 	}
 	if tag.RowsAffected() == 0 {
 		return ErrNotFound

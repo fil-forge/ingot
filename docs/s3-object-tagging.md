@@ -1,7 +1,8 @@
 # S3 Object Tagging in Ingot
 
-Implementation spec for S3 object tagging: the three per-version tagging methods, tag
-stamping at version creation, the tag-count echo, and the conformance surface. Tagging is the
+Implementation spec for S3 tagging: the three per-version object-tagging methods, tag
+stamping at version creation, the tag-count echo, the conformance surface, and bucket
+tagging (§9). Tagging is the
 second tenant of the per-key version-state tree that
 [`s3-object-lock.md`](./s3-object-lock.md) §3 and §4.1 specify, and this document rides that
 design: the `Tags` field already exists on `VersionState`, reserved for exactly this feature,
@@ -155,8 +156,7 @@ header stamping on PUT, both copy directives, and the MPU carry; the `TagCount` 
 
 ## 7. Out of scope
 
-Bucket tagging (`Put/Get/DeleteBucketTagging`: bucket-level documents, registry-shaped like
-the lock configuration), tag-based authorization (policy conditions on tags), and the
+Tag-based authorization (policy conditions on tags) and the
 `Versioning_AccessControl_object_tagging_policy` case (admin-API users). The versioning
 design's out-of-scope list drops object tagging and points here, as does the lock design's.
 
@@ -173,3 +173,37 @@ design's out-of-scope list drops object tagging and points here, as does the loc
 | `registry/stores.go`, `stores_postgres.go`, `inmem/store.go` | `MultipartSession.Tagging` |
 | `itest/versity_tagging_test.go` (new), `versity_{object,multipart,versioning}_test.go` | new categories, the versioning rows, promotions (§6) |
 | `docs/s3-versioning.md`, `docs/s3-object-lock.md` | out-of-scope lists point here |
+
+---
+
+## 9. Bucket tagging
+
+A bucket's tag set is up to fifty key/value pairs of bucket metadata, read and replaced
+through `GetBucketTagging`, `PutBucketTagging`, and `DeleteBucketTagging`. It is unrelated to
+object tags: no write path inherits it, no object response echoes it, and nothing in the
+catalog stores it.
+
+**Storage.** `registry.State.BucketTagging` holds the set as a JSON object in the bucket row
+(`buckets.bucket_tagging`), beside the object-lock configuration `ObjectLockConfig` keeps
+there. The set is small, bounded, and read only by its own three methods, so it never enters
+the MST.
+
+**Semantics.** Unlike object tagging, absence is a 404: a bucket with no tag set answers
+`NoSuchTagSet` (`ErrBucketTaggingNotFound`), which is the state `DeleteBucketTagging`
+restores and the state a new bucket starts in. `PutBucketTagging` replaces the whole set;
+an empty set stores nothing, so it reads back as absent rather than as an empty `TagSet`.
+Delete is idempotent. A missing bucket outranks all of it with `NoSuchBucket`.
+
+versitygw's controller owns validation and rendering here too — `utils.ParseTagging` with
+`TagLimitBucket` caps the set at fifty tags and checks key/value lengths, characters, and
+duplicate keys — so the backend stores and returns a clean map.
+
+**Conformance** (`itest/versity_tagging_test.go`): the upstream `TestPutBucketTagging`,
+`TestGetBucketTagging`, and `TestDeleteBucketTagging` groups, all rows in the pass tables.
+
+| Where | Change |
+|---|---|
+| `s3frontend/buckettag.go` (new) | the three bucket-level methods |
+| `migrations/sql/00018_bucket_tagging.sql` (new) | `buckets.bucket_tagging` |
+| `registry/registry.go`, `registry/postgres.go`, `inmem/store.go` | `State.BucketTagging`, `SetBucketTagging` |
+| `itest/versity_tagging_test.go`, `versity_test.go` | the three bucket-tagging categories |
