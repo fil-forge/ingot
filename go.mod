@@ -267,7 +267,3 @@ require (
 	pitr.ca/jsontokenizer v0.3.2 // indirect
 	tags.cncf.io/container-device-interface v1.1.0 // indirect
 )
-
-replace github.com/cloud-portable/s3vectors/packages/go => /Users/alan/Code/cloud-portable/s3vectors/packages/go
-
-replace github.com/cloud-portable/s3tests/packages/go => /Users/alan/Code/cloud-portable/s3tests/packages/go
