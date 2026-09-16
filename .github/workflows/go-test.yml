@@ -96,8 +96,9 @@ jobs:
       # the Pages artifact (main only); gates the `pages` job.
       pages-artifact: ${{ steps.upload-pages.outcome == 'success' }}
     # Room for the main itest run (-timeout 40m) plus the S3 compatibility
-    # report, which boots its own stack.
-    timeout-minutes: 60
+    # report, which boots its own stack and, on main, moves ~10 GiB for the
+    # large vectors.
+    timeout-minutes: 75
 
     steps:
       - name: Check out the repository
@@ -115,8 +116,9 @@ jobs:
 
       - name: Free runner disk space
         # The 5 GiB max-part test (INGOT_ITEST_BIG) churns ~10-15 GiB
-        # (spool copy + piri copy); drop the runner's preinstalled bloat
-        # so it fits alongside the stack images.
+        # (spool copy + piri copy), and on main the compatibility report adds
+        # the large vectors (~10 GiB more, in its own stack); drop the
+        # runner's preinstalled bloat so it fits alongside the stack images.
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           df -h /
@@ -171,13 +173,20 @@ jobs:
         # continue-on-error keeps the job green; the report is uploaded next
         # regardless. Runs even if the itest run above failed (it boots its
         # own stack), but not on cancellation.
+        #
+        # INGOT_S3COMPAT_LARGE runs the vectors tagged large, which move ~10 GiB
+        # through the stack (the 5 GiB copy-source limit needs a source over
+        # 5 GiB). That is minutes of runner time for an edge case that rarely
+        # moves, so it is enabled where the published report is produced and on
+        # demand, but not on every PR. Drop the condition to run it everywhere.
         if: ${{ !cancelled() }}
         continue-on-error: true
         env:
           GOWORK: off
           INGOT_S3COMPAT: 1
           INGOT_S3COMPAT_OUT: ${{ github.workspace }}/s3-compat-report.html
-        run: go test -tags itest -v -timeout 20m -run TestForgeS3Compat ./itest
+          INGOT_S3COMPAT_LARGE: ${{ (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch') && '1' || '' }}
+        run: go test -tags itest -v -timeout 40m -run TestForgeS3Compat ./itest
 
       - name: Upload S3 compatibility report
         if: ${{ !cancelled() }}

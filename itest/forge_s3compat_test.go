@@ -40,6 +40,7 @@ import (
 //	INGOT_S3COMPAT_GROUPS=a,b        restrict to feature groups (default: all)
 //	INGOT_S3COMPAT_TAGS=tier-1       restrict to vectors carrying a tag
 //	INGOT_S3COMPAT_CONCURRENCY=8     vectors run in parallel (default 4)
+//	INGOT_S3COMPAT_LARGE=1           also run the vectors tagged large (gigabytes of data)
 //
 //	INGOT_S3COMPAT=1 GOWORK=off go test -tags itest ./itest \
 //	  -run TestForgeS3Compat -v -timeout 1800s
@@ -125,9 +126,7 @@ func TestForgeS3Compat(t *testing.T) {
 	// the tee captures every result as it passes through, so the HTML render
 	// below replays the same run without executing it twice.
 	collected := make([]s3tests.VectorResult, 0, len(selected))
-	raw := runner.Run(
-		ctx,
-		selected,
+	runOpts := []s3tests.RunOption{
 		// ACL
 		s3tests.Skip("ACL is not supported", s3tests.Tags("acl")),
 		s3tests.NoSkip(
@@ -194,7 +193,13 @@ func TestForgeS3Compat(t *testing.T) {
 		s3tests.Skip("Server Side Encryption is not supported", s3tests.Tags("sse")),
 		// Versioning
 		s3tests.Skip("GetObjectAcl is not supported", s3tests.IDs("versioning-0004", "versioning-0005")),
-	)
+	}
+	// Vectors tagged large move gigabytes (the 5 GiB copy-source limit needs a
+	// source over 5 GiB), so the runner skips them by default. Opt in on request.
+	if os.Getenv("INGOT_S3COMPAT_LARGE") != "" {
+		runOpts = append(runOpts, s3tests.NoSkip(s3tests.Tags("large")))
+	}
+	raw := runner.Run(ctx, selected, runOpts...)
 	gotest.Run(t, func(yield func(s3tests.VectorResult) bool) {
 		for v := range raw {
 			collected = append(collected, v)
