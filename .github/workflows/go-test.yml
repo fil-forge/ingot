@@ -119,8 +119,9 @@ jobs:
 
       - name: Free runner disk space
         # The 5 GiB max-part test (INGOT_ITEST_BIG) churns ~10-15 GiB
-        # (spool copy + piri copy); drop the runner's preinstalled bloat
-        # so it fits alongside the stack images.
+        # (spool copy + piri copy), and on main the compatibility report adds
+        # the large vectors (~10 GiB more, in its own stack); drop the
+        # runner's preinstalled bloat so it fits alongside the stack images.
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           df -h /
@@ -200,11 +201,19 @@ jobs:
         # regardless. -timeout 30m rather than 20m because this runner now
         # pulls the stack images cold, and the stack boots inside the test's
         # own clock.
+        #
+        # INGOT_S3COMPAT_LARGE runs the vectors tagged large, which move ~10 GiB
+        # through the stack (the 5 GiB copy-source limit needs a source over
+        # 5 GiB). That is minutes of runner time for an edge case that rarely
+        # moves, so it is enabled where the published report is produced and on
+        # demand, but not on every PR. Drop the condition to run it everywhere.
+        if: ${{ !cancelled() }}
         continue-on-error: true
         env:
           GOWORK: off
           INGOT_S3COMPAT: 1
           INGOT_S3COMPAT_OUT: ${{ github.workspace }}/s3-compat-report.html
+          INGOT_S3COMPAT_LARGE: ${{ (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch') && '1' || '' }}
         run: go test -tags itest -v -timeout 30m -run TestForgeS3Compat ./itest
 
       - name: Upload S3 compatibility report
