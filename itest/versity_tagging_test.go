@@ -63,7 +63,9 @@ var getBucketTaggingPass = []forgeCase{
 }
 
 var deleteBucketTaggingPass = []forgeCase{
-	{name: "non_existing_object", fn: integration.DeleteBucketTagging_non_existing_object},
+	// The upstream helper kept the object-tagging name; the local label says
+	// what the case actually asserts, matching the Put/Get rows above.
+	{name: "non_existing_bucket", fn: integration.DeleteBucketTagging_non_existing_object},
 	{name: "success_status", fn: integration.DeleteBucketTagging_success_status},
 	{name: "success", fn: integration.DeleteBucketTagging_success},
 }
