@@ -117,9 +117,9 @@ jobs:
           - shard: encryption
           - shard: conformance
           - shard: uploads
-            # This shard owns TestForgeMaxSizePart, the 5 GiB max-part test,
-            # which is gated on INGOT_ITEST_BIG and churns ~10-15 GiB. Move
-            # that test between shards in the Makefile and move this with it.
+            # Enables TestForgeMaxSizePart, the 5 GiB max-part test, which
+            # this shard owns. Move that test between shards in the Makefile
+            # and move this flag with it, or it silently stops running.
             big: '1'
           - shard: rest
 
@@ -134,18 +134,13 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Docker info
+      - name: Docker and disk info
+        # df because the `uploads` shard's 5 GiB part test churns ~10-15 GiB
+        # (spool copy + piri copy): the runner image starts with ~73 GiB free,
+        # so this records the margin rather than needing anything freed.
         run: |
           docker version
           docker compose version
-
-      - name: Free runner disk space
-        # Only where gigabytes actually move. The runner image leaves ~73 GiB
-        # free on its own, so this is headroom for the 5 GiB part test's spool
-        # and piri copies rather than a hard requirement.
-        if: ${{ matrix.big }}
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           df -h /
 
       - name: Run integration tests
@@ -227,14 +222,6 @@ jobs:
         uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
-
-      - name: Free runner disk space
-        # Headroom for the vectors tagged large, which move ~10 GiB through
-        # the stack on main and on demand (INGOT_S3COMPAT_LARGE below).
-        if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' }}
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-          df -h /
 
       - name: Generate S3 compatibility report
         # TestForgeS3Compat runs the s3vectors corpus and reports each vector
