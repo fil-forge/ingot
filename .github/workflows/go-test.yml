@@ -116,7 +116,7 @@ jobs:
         include:
           - shard: encryption
           - shard: conformance
-          - shard: multipart
+          - shard: uploads
             # This shard owns TestForgeMaxSizePart, the 5 GiB max-part test,
             # which is gated on INGOT_ITEST_BIG and churns ~10-15 GiB. Move
             # that test between shards in the Makefile and move this with it.

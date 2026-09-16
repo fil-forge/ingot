@@ -34,21 +34,21 @@ itest:
 # Shards are balanced by measured runtime, not by file or theme. The comments
 # are the time each test takes with its stack boot included; rebalance here
 # when `go test -tags itest -v` shows one has moved.
-SHARD_encryption  := TestForgeEncryption              # 5m20
-SHARD_conformance := TestForgeVersity                 # 4m00
-SHARD_conformance += TestForgeAWSCLI                  # 1m05
+SHARD_encryption  := TestForgeEncryption              # 6m00
+SHARD_conformance := TestForgeVersity                 # 3m48
+SHARD_conformance += TestForgeAWSCLI                  # 1m09
 SHARD_conformance += TestForgeCopyAuthorization       # 0m50
-SHARD_multipart   := TestForgeMaxSizePart             # 2m15, needs INGOT_ITEST_BIG
-SHARD_multipart   += TestForgeMultipartExpiryShred    # 1m35
-SHARD_multipart   += TestForgeScenarios               # 1m20
-SHARD_multipart   += TestForgeDeferredMultipart       # 0m50
+SHARD_uploads     := TestForgeMaxSizePart             # 2m10, needs INGOT_ITEST_BIG
+SHARD_uploads     += TestForgeMultipartExpiryShred    # 1m38
+SHARD_uploads     += TestForgeScenarios               # 1m17
+SHARD_uploads     += TestForgeDeferredMultipart       # 0m52
 
 # TestForgeS3Compat runs in its own CI job and belongs to no shard.
-SHARD_CLAIMED := $(SHARD_encryption) $(SHARD_conformance) $(SHARD_multipart) TestForgeS3Compat
+SHARD_CLAIMED := $(SHARD_encryption) $(SHARD_conformance) $(SHARD_uploads) TestForgeS3Compat
 
 # `rest` is the complement, so a test added to itest/ runs there rather than
 # matching no shard and silently never running: Delete, Retention, Eviction,
-# NativeProvision today (~5m30 in total).
+# NativeProvision today (~5m27 in total).
 SHARD_ALL  = $(filter Test%,$(shell GOWORK=off $(GO) test -tags itest -list '.*' ./itest))
 SHARD_rest = $(filter-out $(SHARD_CLAIMED),$(SHARD_ALL))
 
@@ -59,9 +59,9 @@ empty :=
 space := $(empty) $(empty)
 shard-regex = ^($(subst $(space),|,$(strip $(SHARD_$(1)))))$$
 
-## itest-shard: run one shard of the integration suite (SHARD=encryption|conformance|multipart|rest)
+## itest-shard: run one shard of the integration suite (SHARD=encryption|conformance|uploads|rest)
 itest-shard:
-	@test -n "$(strip $(SHARD))" || { echo "itest-shard: set SHARD=encryption|conformance|multipart|rest"; exit 2; }
+	@test -n "$(strip $(SHARD))" || { echo "itest-shard: set SHARD=encryption|conformance|uploads|rest"; exit 2; }
 	@test -n "$(strip $(SHARD_$(SHARD)))" || { echo "itest-shard: SHARD=$(SHARD) selects no tests (unknown shard, or 'go test -list' failed above)"; exit 2; }
 	$(GO) test -tags itest -v -timeout 20m -run '$(call shard-regex,$(SHARD))' ./itest
 

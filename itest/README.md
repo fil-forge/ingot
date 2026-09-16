@@ -21,7 +21,7 @@ go test -tags itest ./itest -run 'TestForgeVersity/PutObject/success' -v  # one 
 The suite is one Go package, so its tests run serially and each top-level
 test boots its own Forge stack (~40s of its runtime). CI therefore splits
 them across four runners; the shards are `encryption`, `conformance`,
-`multipart` and `rest`, defined in the Makefile beside `itest-shard` and
+`uploads` and `rest`, defined in the Makefile beside `itest-shard` and
 balanced by measured runtime. `rest` is the complement of the other three, so
 a test added here runs in CI without being assigned anywhere. Rebalance the
 lists when `go test -tags itest -v` shows a duration has moved.
