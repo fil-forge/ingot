@@ -12,10 +12,19 @@ when you're ready to wait for the real thing. CI does the same — unit tests
 first, integration only after they pass.
 
 ```bash
-make itest                                                  # everything (~10 min)
+make itest                                                  # everything (~20 min)
+make itest-shard SHARD=encryption                           # one CI shard (~6 min)
 go test -tags itest ./itest -run 'TestForgeVersity/PutObject' -v          # one category
 go test -tags itest ./itest -run 'TestForgeVersity/PutObject/success' -v  # one case
 ```
+
+The suite is one Go package, so its tests run serially and each top-level
+test boots its own Forge stack (~40s of its runtime). CI therefore splits
+them across four runners; the shards are `encryption`, `conformance`,
+`multipart` and `rest`, defined in the Makefile beside `itest-shard` and
+balanced by measured runtime. `rest` is the complement of the other three, so
+a test added here runs in CI without being assigned anywhere. Rebalance the
+lists when `go test -tags itest -v` shows a duration has moved.
 
 ## Hilt-era provisioning and credentials
 
@@ -84,9 +93,11 @@ Notes:
   every `smeltery-*` container, including another suite's live stack.
 - The other services run their published `:main` images — `docker pull` them
   occasionally; compose won't refresh an existing tag.
-- CI runs this suite on every PR after unit tests pass
-  (`.github/workflows/go-test.yml`, job `itest`). The compatibility corpus
-  runs beside it on a second runner (job `s3compat`) — one stack per runner,
-  since the sweep above makes two suites unable to share a Docker host — and
-  uploads the `s3-compat-report` build artifact; on main it is also published
-  to GitHub Pages at <https://fil-forge.github.io/ingot/> (job `pages`).
+- CI runs this suite on every PR after unit tests pass, four shards in
+  parallel (`.github/workflows/go-test.yml`, job `itest-shards`; job `itest`
+  aggregates them into one status check). The compatibility
+  corpus runs beside them on a fifth runner (job `s3compat`) — one stack per
+  runner, since the sweep above makes two runs unable to share a Docker host
+  — and uploads the `s3-compat-report` build artifact; on main it is also
+  published to GitHub Pages at <https://fil-forge.github.io/ingot/> (job
+  `pages`).

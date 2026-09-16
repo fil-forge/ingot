@@ -1,20 +1,23 @@
 name: Go Test
 
-# Four test jobs mirroring the local split: fast unit tests (the shared
-# unified workflow) and the env-gated live tests (real Postgres + OpenBao as
-# service containers) run in parallel, and the two Docker-backed suites only
-# run once the unit job passes — a broken unit test fails the PR in ~2
-# minutes instead of tying up a runner booting the Forge stack. The live job
-# exists because the unit job runs the same packages with no INGOT_TEST_*
-# env, silently skipping every *_live_test.go.
+# Fast unit tests (the shared unified workflow) and the env-gated live tests
+# (real Postgres + OpenBao as service containers) run in parallel, and the
+# Docker-backed suites only run once the unit job passes — a broken unit test
+# fails the PR in ~2 minutes instead of tying up runners booting the Forge
+# stack. The live job exists because the unit job runs the same packages with
+# no INGOT_TEST_* env, silently skipping every *_live_test.go.
 #
-# The Docker-backed suites split by runner: `itest` runs everything in
-# itest/ except the compatibility corpus (TestForgeS3Compat skips itself
-# without INGOT_S3COMPAT), `s3compat` runs only the corpus. They are two
-# jobs rather than two steps so the wall clock is the slower of the two
-# instead of their sum, and they cannot share a runner: each boots its own
-# Forge stack, and itest/'s TestMain sweeps every leaked `smeltery-*`
-# container on startup — which would take out the other suite's live stack.
+# The Docker-backed work spreads over five runners: four `itest-shards` and
+# `s3compat`, which runs the compatibility corpus (the shards leave
+# INGOT_S3COMPAT unset, so TestForgeS3Compat skips itself there). Shard
+# membership lives in the Makefile, target `itest-shard`; job `itest`
+# aggregates the shards into the one check the branch ruleset requires.
+#
+# A runner per shard is what makes the split pay: itest/ is a single Go
+# package, so its tests run serially and each one boots its own Forge stack.
+# Two of them also cannot share a Docker host, because itest/'s TestMain
+# sweeps every leaked `smeltery-*` container on startup — which would take
+# out the other run's live stack.
 #
 # On main, the S3 compatibility report the s3compat job produces is also
 # published to GitHub Pages (job `pages`), so the current state of ingot's
@@ -93,15 +96,34 @@ jobs:
           INGOT_TEST_BAO_TOKEN: root
         run: go test -v -count=1 -run '(Live|GraphValidates)' ./cmd/... ./registry/ ./migrations/ ./regionkey/
 
-  itest:
+  itest-shards:
     needs: unit
     # Pin to 24.04 rather than -latest so the Docker version doesn't drift
     # from under us. The runner's preinstalled Docker is 28.x, well past
     # smelt's 25+ requirement.
     runs-on: ubuntu-24.04
-    # Room for the itest run (-timeout 40m) plus image pulls and the
-    # working-tree ingot build.
-    timeout-minutes: 45
+    # The slowest shard is ~6 minutes of tests on top of ~2 minutes of image
+    # pulls and the working-tree ingot build. Comfortably above `make
+    # itest-shard`'s own -timeout 20m, so a hung test hits Go's timeout and
+    # dumps goroutine stacks before the runner is cut off.
+    timeout-minutes: 25
+
+    strategy:
+      # A failing shard must not cancel the others: which shards fail is the
+      # diagnosis, and a rerun of one shard costs a full stack boot.
+      fail-fast: false
+      matrix:
+        include:
+          - shard: encryption
+          - shard: conformance
+          - shard: multipart
+            # This shard owns TestForgeMaxSizePart, the 5 GiB max-part test,
+            # which is gated on INGOT_ITEST_BIG and churns ~10-15 GiB. Move
+            # that test between shards in the Makefile and move this with it.
+            big: '1'
+          - shard: rest
+
+    name: itest (${{ matrix.shard }})
 
     steps:
       - name: Check out the repository
@@ -118,27 +140,22 @@ jobs:
           docker compose version
 
       - name: Free runner disk space
-        # The 5 GiB max-part test (INGOT_ITEST_BIG) churns ~10-15 GiB
-        # (spool copy + piri copy), and on main the compatibility report adds
-        # the large vectors (~10 GiB more, in its own stack); drop the
-        # runner's preinstalled bloat so it fits alongside the stack images.
+        # Only where gigabytes actually move. The runner image leaves ~73 GiB
+        # free on its own, so this is headroom for the 5 GiB part test's spool
+        # and piri copies rather than a hard requirement.
+        if: ${{ matrix.big }}
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           df -h /
 
       - name: Run integration tests
-        # Everything in itest/ but the compatibility corpus: INGOT_S3COMPAT
-        # is unset here, so TestForgeS3Compat skips itself and runs in the
-        # s3compat job instead.
-        # GOWORK=off matches the Makefile convention (a parent go.work may
-        # declare a newer Go than the toolchain). The harness builds the
+        # The Makefile owns which tests each shard runs, the -run regex, and
+        # GOWORK=off; `rest` is the complement, so a newly added test runs
+        # there rather than matching no shard at all. The harness builds the
         # working-tree binary itself (itest/stack_test.go).
-        # INGOT_ITEST_BIG enables the 5 GiB max-part test, which local
-        # `make itest` runs skip (itest/README.md).
         env:
-          GOWORK: off
-          INGOT_ITEST_BIG: 1
-        run: go test -tags itest -v -timeout 40m ./itest
+          INGOT_ITEST_BIG: ${{ matrix.big }}
+        run: make itest-shard SHARD=${{ matrix.shard }}
 
       - name: Dump container state on failure
         if: failure()
@@ -167,10 +184,28 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: container-logs
+          # Per shard: upload-artifact rejects a name another job already used.
+          name: container-logs-${{ matrix.shard }}
           path: /tmp/container-logs/
           if-no-files-found: ignore
           retention-days: 7
+
+  itest:
+    # The branch ruleset requires a check named `itest`, and a matrix reports
+    # one check per shard instead. This job keeps the single name and fails
+    # unless every shard passed — `needs.<job>.result` for a matrix is the
+    # aggregate, and !cancelled() means a failed shard reaches here rather
+    # than skipping the gate into a green PR.
+    needs: itest-shards
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+
+    steps:
+      - name: Require every shard to pass
+        run: |
+          echo "itest shards: ${{ needs.itest-shards.result }}"
+          test "${{ needs.itest-shards.result }}" = success
 
   s3compat:
     needs: unit
@@ -192,6 +227,14 @@ jobs:
         uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
+
+      - name: Free runner disk space
+        # Headroom for the vectors tagged large, which move ~10 GiB through
+        # the stack on main and on demand (INGOT_S3COMPAT_LARGE below).
+        if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' }}
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
 
       - name: Generate S3 compatibility report
         # TestForgeS3Compat runs the s3vectors corpus and reports each vector
