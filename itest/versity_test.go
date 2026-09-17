@@ -71,6 +71,10 @@ func TestForgeVersity(t *testing.T) {
 		{"PutObjectTagging", putObjectTaggingPass, nil, false},
 		{"GetObjectTagging", getObjectTaggingPass, nil, false},
 		{"DeleteObjectTagging", deleteObjectTaggingPass, deleteObjectTaggingXFail, false},
+		// The bucket-tagging partition (docs/s3-object-tagging.md §9).
+		{"PutBucketTagging", putBucketTaggingPass, nil, false},
+		{"GetBucketTagging", getBucketTaggingPass, nil, false},
+		{"DeleteBucketTagging", deleteBucketTaggingPass, nil, false},
 		{"UploadPart", uploadPartPass, uploadPartXFail, false},
 		{"UploadPartCopy", uploadPartCopyPass, uploadPartCopyXFail, false},
 		{"ListParts", listPartsPass, listPartsXFail, false},

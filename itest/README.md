@@ -12,10 +12,19 @@ when you're ready to wait for the real thing. CI does the same — unit tests
 first, integration only after they pass.
 
 ```bash
-make itest                                                  # everything (~10 min)
+make itest                                                  # everything (~20 min)
+make itest-shard SHARD=encryption                           # one CI shard (~6 min)
 go test -tags itest ./itest -run 'TestForgeVersity/PutObject' -v          # one category
 go test -tags itest ./itest -run 'TestForgeVersity/PutObject/success' -v  # one case
 ```
+
+The suite is one Go package, so its tests run serially and each top-level
+test boots its own Forge stack (~40s of its runtime). CI therefore splits
+them across four runners; the shards are `encryption`, `conformance`,
+`uploads` and `rest`, defined in the Makefile beside `itest-shard` and
+balanced by measured runtime. `rest` is the complement of the other three, so
+a test added here runs in CI without being assigned anywhere. Rebalance the
+lists when `go test -tags itest -v` shows a duration has moved.
 
 ## Hilt-era provisioning and credentials
 
@@ -74,7 +83,7 @@ here and add new cases to the pass table (demote to xfail if they fail).
 | `TestForgeMultipartExpiryShred` | The abandoned-session sweeper as a full abort: a 30s `multipart_session_ttl` (`testdata/config-mpttl.yaml`, dedicated stack — the low TTL also reaps completed sessions) reaps an unfinished upload, shredding its parts' key rows, intents, and parks. | ~2 min |
 | `TestForgeMaxSizePart` | Exactly 5 GiB — the AWS-matching max part size — as one multipart part (21 internal blobs at the default `max_blob_size`): HEAD, ranged spot checks across chunk and blob boundaries, full stream-compared read-back. The end-to-end regression gate for `bucket.DefaultMaxBlobSize`'s envelope allowance under piri's 266338304-byte piece cap. **Skipped unless `INGOT_ITEST_BIG=1`** (CI sets it): ~10–15 GiB of disk churn, several minutes. | minutes (gated) |
 | `TestForgeAWSCLI` | A real, unmodified AWS CLI v2 (`amazon/aws-cli`, pinned in `forge_awscli_test.go`) round-trips a 20 MiB object with `aws s3 cp` on a default-config stack. The CLI picks multipart itself at its 8 MiB switchover and sends its default request checksums (CRC64NVME, declared on CreateMultipartUpload and carried per part); the bytes come back exact, HEAD shows a 3-part ETag and the full-object checksum. The CLI runs in its own container and reaches ingot's host-mapped port via `host.docker.internal`. | ~2 min |
-| `TestForgeS3Compat` | Runs the `cloud-portable/s3vectors` compatibility corpus (via the `alanshaw/s3tests` runner) against the stack. Reports each vector live through Go's test output (one `t.Run` subtest per vector, via the `gotest` reporter) **and** writes an HTML report from the same run. Because a failing vector is a failing subtest, the test reports FAIL when the target is incomplete — expected for ingot; the failures are the compatibility signal, and the HTML report is written regardless. **Skipped unless `INGOT_S3COMPAT=1`.** Env: `INGOT_S3COMPAT_OUT` (report path, default `itest/ingot-s3compat.html`), `INGOT_S3COMPAT_GROUPS` / `INGOT_S3COMPAT_TAGS` (restrict vectors), `INGOT_S3COMPAT_CONCURRENCY` (default 4). `$credential` vectors run against a second hilt tenant provisioned per handle (`ProvisionCredential`); ACL-grant vectors that need an S3 canonical user id still won't pass (ingot models ownership as a did:plc). | minutes (gated) |
+| `TestForgeS3Compat` | Runs the `cloud-portable/s3vectors` compatibility corpus (via the `alanshaw/s3tests` runner) against the stack. Reports each vector live through Go's test output (one `t.Run` subtest per vector, via the `gotest` reporter) **and** writes an HTML report from the same run. Because a failing vector is a failing subtest, the test reports FAIL when the target is incomplete — expected for ingot; the failures are the compatibility signal, and the HTML report is written regardless. **Skipped unless `INGOT_S3COMPAT=1`.** Env: `INGOT_S3COMPAT_OUT` (report path, default `itest/ingot-s3compat.html`), `INGOT_S3COMPAT_GROUPS` / `INGOT_S3COMPAT_TAGS` (restrict vectors), `INGOT_S3COMPAT_CONCURRENCY` (default 4), `INGOT_S3COMPAT_LARGE=1` (also run the vectors tagged `large`, which move gigabytes — the runner skips them by default; CI sets it on `main` and `workflow_dispatch` only, so the published report covers them without costing every PR). `$credential` vectors run against a second hilt tenant provisioned per handle (`ProvisionCredential`); ACL-grant vectors that need an S3 canonical user id still won't pass (ingot models ownership as a did:plc). | minutes (gated) |
 
 Notes:
 
@@ -84,8 +93,11 @@ Notes:
   every `smeltery-*` container, including another suite's live stack.
 - The other services run their published `:main` images — `docker pull` them
   occasionally; compose won't refresh an existing tag.
-- CI runs this suite on every PR after unit tests pass
-  (`.github/workflows/go-test.yml`, job `itest`). The same job generates the
-  S3 compatibility report and uploads it as the `s3-compat-report` build
-  artifact; on main it is also published to GitHub Pages at
-  <https://fil-forge.github.io/ingot/> (job `pages`).
+- CI runs this suite on every PR after unit tests pass, four shards in
+  parallel (`.github/workflows/go-test.yml`, job `itest-shards`; job `itest`
+  aggregates them into one status check). The compatibility
+  corpus runs beside them on a fifth runner (job `s3compat`) — one stack per
+  runner, since the sweep above makes two runs unable to share a Docker host
+  — and uploads the `s3-compat-report` build artifact; on main it is also
+  published to GitHub Pages at <https://fil-forge.github.io/ingot/> (job
+  `pages`).

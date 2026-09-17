@@ -10,11 +10,11 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.113.1
 	github.com/aws/smithy-go v1.28.1
 	github.com/cenkalti/backoff/v5 v5.0.3
-	github.com/cloud-portable/s3tests/packages/go v0.0.0-20260908103400-a4688c972bb0
+	github.com/cloud-portable/s3tests/packages/go v0.0.0-20260916120817-ce77c26e7f6d
 	github.com/fil-forge/hilt v0.0.1-0.20260914101649-9815d932c6ad
 	github.com/fil-forge/indexing-service v1.13.5-0.20260820151722-9eb620409a4e
 	github.com/fil-forge/libforge v0.0.0-20260914100934-63f5b20252fe
-	github.com/fil-forge/smelt v0.0.0-20260914083257-f594cf02655c
+	github.com/fil-forge/smelt v0.0.0-20260915151825-96fc212b8d91
 	github.com/fil-forge/swarf v0.0.1-0.20260821142121-d5d1a0a56f00
 	github.com/fil-forge/ucantone v0.0.0-20260827134420-25cf8340b9a1
 	github.com/fil-forge/versitygw v0.0.0-20260914113944-a628e2cc628c
@@ -74,7 +74,7 @@ require (
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/clipperhouse/uax29/v2 v2.7.0 // indirect
-	github.com/cloud-portable/s3vectors/packages/go v1.0.1-0.20260908103307-c5fd132c07fb // indirect
+	github.com/cloud-portable/s3vectors/packages/go v1.0.1-0.20260916120050-4e36de71f642 // indirect
 	github.com/compose-spec/compose-go/v2 v2.12.1 // indirect
 	github.com/containerd/console v1.0.5 // indirect
 	github.com/containerd/containerd/api v1.11.1 // indirect

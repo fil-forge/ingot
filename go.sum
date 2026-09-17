@@ -83,10 +83,10 @@ github.com/cespare/xxhash/v2 v2.3.0 h1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UF
 github.com/cespare/xxhash/v2 v2.3.0/go.mod h1:VGX0DQ3Q6kWi7AoAeZDth3/j3BFtOZR5XLFGgcrjCOs=
 github.com/clipperhouse/uax29/v2 v2.7.0 h1:+gs4oBZ2gPfVrKPthwbMzWZDaAFPGYK72F0NJv2v7Vk=
 github.com/clipperhouse/uax29/v2 v2.7.0/go.mod h1:EFJ2TJMRUaplDxHKj1qAEhCtQPW2tJSwu5BF98AuoVM=
-github.com/cloud-portable/s3tests/packages/go v0.0.0-20260908103400-a4688c972bb0 h1:PJwci0Cx1gTtjzsE2Nc/xyYysHoDma6jE3Pn5Mc5BA0=
-github.com/cloud-portable/s3tests/packages/go v0.0.0-20260908103400-a4688c972bb0/go.mod h1:tbs07Yakd88r8wO+RKeHwIf1Ys6H6peZu7g6x8jOtw4=
-github.com/cloud-portable/s3vectors/packages/go v1.0.1-0.20260908103307-c5fd132c07fb h1:OgfjpPTkh+PTm/9JX/ZkyujsUKArRgpQXiiwDoQFdXc=
-github.com/cloud-portable/s3vectors/packages/go v1.0.1-0.20260908103307-c5fd132c07fb/go.mod h1:UVVpQAo0GCbDK9jUGhZygn1J1vaaLyMi+FMUbC/zsqs=
+github.com/cloud-portable/s3tests/packages/go v0.0.0-20260916120817-ce77c26e7f6d h1:et1tPUySakxmmxYViM+V4iioe1CA7kb0eRfpLeIOiPk=
+github.com/cloud-portable/s3tests/packages/go v0.0.0-20260916120817-ce77c26e7f6d/go.mod h1:2dqOririQux3f2CVzLVIRp48vWwRiTIpZM/r8axPdhs=
+github.com/cloud-portable/s3vectors/packages/go v1.0.1-0.20260916120050-4e36de71f642 h1:LdbdA8lCrmPoDxUuWvpUKBZel7ZP/ArWMDZ3RWCcGlA=
+github.com/cloud-portable/s3vectors/packages/go v1.0.1-0.20260916120050-4e36de71f642/go.mod h1:UVVpQAo0GCbDK9jUGhZygn1J1vaaLyMi+FMUbC/zsqs=
 github.com/cloudflare/circl v1.6.3 h1:9GPOhQGF9MCYUeXyMYlqTR6a5gTrgR/fBLXvUgtVcg8=
 github.com/cloudflare/circl v1.6.3/go.mod h1:2eXP6Qfat4O/Yhh8BznvKnJ+uzEoTQ6jVKJRn81BiS4=
 github.com/codahale/rfc6979 v0.0.0-20141003034818-6a90f24967eb h1:EDmT6Q9Zs+SbUoc7Ik9EfrFqcylYqgPZ9ANSbTAntnE=
@@ -187,8 +187,8 @@ github.com/fil-forge/indexing-service v1.13.5-0.20260820151722-9eb620409a4e h1:+
 github.com/fil-forge/indexing-service v1.13.5-0.20260820151722-9eb620409a4e/go.mod h1:hrry50c9bNciNj9Z63O2QFrzidnTjkYYG2UgH4/rmVo=
 github.com/fil-forge/libforge v0.0.0-20260914100934-63f5b20252fe h1:lz/ZzYTcoFmQaB8Rm/Dv5uf3e8nTWpb3ZYzFHHXkT9w=
 github.com/fil-forge/libforge v0.0.0-20260914100934-63f5b20252fe/go.mod h1:09nIz6/BJD0Qdb8YrLwVeNQwQprTCFWVPULL3c5CNJs=
-github.com/fil-forge/smelt v0.0.0-20260914083257-f594cf02655c h1:AEUEUEs/mDNksJIXdMgNMGJ03SHk6NlKjtDH58d1T04=
-github.com/fil-forge/smelt v0.0.0-20260914083257-f594cf02655c/go.mod h1:OUO2GxgUihmYfywNIfvWTQocg6jqaNiTd04cG5BbdII=
+github.com/fil-forge/smelt v0.0.0-20260915151825-96fc212b8d91 h1:p6NNlrLKGmxwsfNMcnzrm4PR1M598d89TBu39rbxC6Y=
+github.com/fil-forge/smelt v0.0.0-20260915151825-96fc212b8d91/go.mod h1:OUO2GxgUihmYfywNIfvWTQocg6jqaNiTd04cG5BbdII=
 github.com/fil-forge/swarf v0.0.1-0.20260821142121-d5d1a0a56f00 h1:uSJ2YCxOJQA7PDnDiBJAOstoJcw2IPnbpssKYCihsxg=
 github.com/fil-forge/swarf v0.0.1-0.20260821142121-d5d1a0a56f00/go.mod h1:k1gay5Byjloml4k1SylxhRff1rMH4LcGKpbMEDLZR1o=
 github.com/fil-forge/ucantone v0.0.0-20260827134420-25cf8340b9a1 h1:Tzy3lZ7+LAyVK4+qyWM97UMOtnXx05Wdn+rcTDLdBDE=
