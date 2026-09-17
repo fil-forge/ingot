@@ -432,11 +432,14 @@ func TestCompleteWaitBudgetIsOperationAborted(t *testing.T) {
 
 // parkingUploader parks instead of accepting: UploadBlob returns no
 // Location, so part blobs stay IntentParked — the provider shape the
-// NopUploader cannot produce. AbortBlob calls are recorded.
+// NopUploader cannot produce. AbortBlob calls are recorded; the abort of a
+// digest in acceptedOnProvider is refused as already accepted, as a provider
+// answers for a blob whose conclude ran without ingot learning of it.
 type parkingUploader struct {
 	inmem.NopUploader
-	mu      sync.Mutex
-	aborted []string
+	mu                 sync.Mutex
+	aborted            []string
+	acceptedOnProvider map[string]bool
 }
 
 func (p *parkingUploader) UploadBlob(_ context.Context, _ did.DID, digest multihash.Multihash, size int64, _ string, _ ...uploader.UploadOption) (uploader.UploadedBlob, error) {
@@ -448,6 +451,9 @@ func (p *parkingUploader) AbortBlob(_ context.Context, _ did.DID, d multihash.Mu
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.aborted = append(p.aborted, string(d))
+	if p.acceptedOnProvider[string(d)] {
+		return uploader.ErrBlobAccepted
+	}
 	return nil
 }
 
@@ -1091,4 +1097,43 @@ func TestSweepReleasesLocatedBlobWhoseIntentLagged(t *testing.T) {
 	if _, err := mem.GetLocation(ctx, did.Undef, lagged); !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("location for %x survived the release (err=%v)", lagged, err)
 	}
+}
+
+// TestSweepReleasesBlobTheProviderHoldsAccepted: a conclude ran but ingot
+// never learned of it (the response was lost, or Complete died between the
+// accept and recording it), so the blob is parked locally and accepted on the
+// provider. When the session expires the abort is refused as already
+// accepted; the sweeper must then release the blob as accepted rather than
+// leave the provider holding an allocation nothing will ever revisit.
+func TestSweepReleasesBlobTheProviderHoldsAccepted(t *testing.T) {
+	pu := &parkingUploader{acceptedOnProvider: map[string]bool{}}
+	rm := &recordingRemover{}
+	b, mem := newDeferredBackend(t, pu, func(d *Deps) { d.Remover = rm })
+	ctx := context.Background()
+
+	uploadID := mpCreate(t, b, "lost-accept", "", "")
+	if _, err := mpUploadPart(t, b, "lost-accept", uploadID, 1, testBody(int(backend.MinPartSize)), nil); err != nil {
+		t.Fatalf("UploadPart: %v", err)
+	}
+	digests := hygienePartDigests(t, mem, uploadID, 1)
+	if len(digests) != 1 {
+		t.Fatalf("part digests = %d, want 1", len(digests))
+	}
+	d := digests[0]
+	if in, err := mem.GetIntent(ctx, d); err != nil || in.State != registry.IntentParked {
+		t.Fatalf("part blob intent = %v/%v, want parked", in, err)
+	}
+	pu.acceptedOnProvider[string(d)] = true
+
+	if n, err := b.SweepStaleMultipartSessions(ctx, -time.Second); err != nil || n == 0 {
+		t.Fatalf("sweep: cleaned=%d err=%v", n, err)
+	}
+	if !pu.abortedDigests()[string(d)] {
+		t.Fatalf("abort was never attempted for %x", d)
+	}
+	if _, err := mem.GetPark(ctx, d); !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("park row for %x survived the sweep (err=%v)", d, err)
+	}
+	// Released as an accepted blob: the network claim is removed.
+	assertReleased(t, b, mem, rm, d, true)
 }

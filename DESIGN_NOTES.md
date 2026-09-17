@@ -142,7 +142,10 @@ Step 4's polling remains the fallback for a blob the response did not
 cover. A completion that fails partway still records the blobs the upload
 service accepted before the failure and drops their parks, so the next
 Complete concludes only what is still parked and session expiry never
-aborts a blob that was accepted.
+aborts a blob that was accepted. When ingot never learned of an acceptance
+at all (the conclude response was lost, or Complete died before recording
+it), the provider refuses the expiry abort as already accepted, and the
+blob is released through the deferred release path instead.
 
 ## Read path
 

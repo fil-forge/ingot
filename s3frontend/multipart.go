@@ -946,13 +946,24 @@ func (b *Backend) cleanupPartBlobs(ctx context.Context, space did.DID, uploadID 
 			// (best-effort; the reject on piri is idempotent, a straggler is
 			// the provider's allocation-expiry GC's to reap). Cause is the
 			// /blob/add task link the upload service needs to locate the
-			// provider. A BlobAccepted refusal is benign — a concurrent
-			// session in this space accepted the same content, so the
-			// reference index owns the blob now — and the park row is
-			// obsolete either way.
+			// provider. The park row is obsolete whatever the answer.
+			//
+			// An abort refused because the space has accepted the blob means
+			// a conclude ran and ingot never learned of it: the response was
+			// lost, or Complete died between the accept and recording it.
+			// With zero claims nothing owns the blob, so it is released the
+			// way an accepted blob is, through the deferred release path.
 			if park, err := b.parks.GetPark(ctx, d); err == nil {
 				if cause, err := cid.Cast(park.AddTask); err == nil {
-					if aerr := b.deferred.AbortBlob(ctx, space, d, cause); aerr != nil {
+					aerr := b.deferred.AbortBlob(ctx, space, d, cause)
+					switch {
+					case errors.Is(aerr, uploader.ErrBlobAccepted):
+						state = registry.IntentAccepted
+						if err := b.pendingReleases.EnqueueRelease(ctx, space, d, time.Now().Add(b.releaseGrace)); err != nil {
+							b.logger.Warn("enqueue release for accepted blob failed",
+								zap.String("digest", hex.EncodeToString(d)), zap.Error(err))
+						}
+					case aerr != nil:
 						b.logger.Warn("abort parked blob failed; provider-side release deferred",
 							zap.String("digest", hex.EncodeToString(d)), zap.Error(aerr))
 					}
