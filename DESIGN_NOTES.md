@@ -131,6 +131,15 @@ is ingested the same way: the source's plaintext range streams through the
 decrypting read path into new parked blobs, so the source may be in any
 bucket of the tenant and nothing is shared with it.
 
+Complete concludes every parked part together: one `/ucan/conclude` carries
+all their put receipts (`receipts`, the plural argument), sprue accepts them
+one request per storage node, and each blob's `/blob/accept` receipt and
+location commitment come back in the conclude response. So a completion
+costs a couple of round trips rather than one per part, which is what an
+S3 client splitting a large object into thousands of 5 MiB parts produces.
+Step 4's polling remains the fallback for a blob the response did not
+cover.
+
 ## Read path
 
 A GET resolves the bucket root (registry), walks the MST to the manifest

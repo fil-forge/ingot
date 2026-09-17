@@ -22,13 +22,12 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"slices"
 	"time"
 
-	assertcmds "github.com/fil-forge/libforge/commands/assert"
 	blobcmds "github.com/fil-forge/libforge/commands/blob"
 	httpcmds "github.com/fil-forge/libforge/commands/http"
 	ucancmds "github.com/fil-forge/libforge/commands/ucan"
+	"github.com/fil-forge/libforge/digestutil"
 	receipt_client "github.com/fil-forge/libforge/receipt"
 	ucanlib "github.com/fil-forge/libforge/ucan"
 	"github.com/fil-forge/ucantone/did"
@@ -300,39 +299,169 @@ func (c *Client) blobAdd(ctx context.Context, space did.DID, content io.Reader, 
 // put is tolerated upstream, and an AddedBlob whose Location is already set
 // returns as-is. The result drops PutInvocation (spent — the caller should
 // delete its persisted copy too).
-func (c *Client) BlobConclude(ctx context.Context, space did.DID, added AddedBlob) (blob AddedBlob, err error) {
-	if added.Location != nil {
-		return added, nil
-	}
-	start := time.Now()
-	defer func() {
-		if err != nil {
-			c.logger.Error("blob conclude failed", zap.Stringer("space", space), zap.Error(err), zap.Duration("duration", time.Since(start)))
-		} else {
-			c.logger.Debug("blob concluded", zap.Stringer("space", space), zap.Duration("duration", time.Since(start)))
-		}
-	}()
-
-	putInv := new(invocation.Invocation)
-	if err := putInv.UnmarshalCBOR(bytes.NewReader(added.PutInvocation)); err != nil {
-		return AddedBlob{}, fmt.Errorf("decoding parked /http/put invocation: %w", err)
-	}
-
-	if err := c.sendPutReceipt(ctx, putInv); err != nil {
-		return AddedBlob{}, fmt.Errorf("sending put receipt: %w", err)
-	}
-
-	location, err := c.awaitAccept(ctx, added.AcceptTask)
+func (c *Client) BlobConclude(ctx context.Context, space did.DID, added AddedBlob) (AddedBlob, error) {
+	out, err := c.BlobConcludeBatch(ctx, space, []AddedBlob{added})
 	if err != nil {
 		return AddedBlob{}, err
 	}
-	return AddedBlob{
-		Digest:     added.Digest,
-		Size:       added.Size,
-		Location:   location,
-		AddTask:    added.AddTask,
-		AcceptTask: added.AcceptTask,
-	}, nil
+	return out[0], nil
+}
+
+// MaxConcludeBatch caps the receipts delivered in one /ucan/conclude. A UCAN
+// container holds at most 8192 tokens, and each blob costs 2 in the request
+// (its put invocation and receipt) and 4 in the response (the accept
+// invocation and receipt, plus the location commitment and PDP promise the
+// node attaches). The response is the tighter of the two, which puts the
+// ceiling near 2000; 1000 keeps a comfortable margin under it, so a batch is
+// always answered in full rather than leaving blobs to be polled for.
+const MaxConcludeBatch = 1000
+
+// BlobConcludeBatch finishes many parked uploads in as few round trips as
+// MaxConcludeBatch allows, and returns them in the order given with their
+// location commitments filled in.
+//
+// It delivers every blob's /http/put receipt in one /ucan/conclude, which
+// fires their /blob/accept invocations upload-service side, and reads each
+// acceptance out of the response rather than polling for it — a completion
+// with thousands of parts pays a couple of round trips instead of thousands.
+// An AddedBlob whose Location is already set is returned as-is, and the
+// results drop PutInvocation (spent — the caller should delete its persisted
+// copy too).
+func (c *Client) BlobConcludeBatch(ctx context.Context, space did.DID, added []AddedBlob) (blobs []AddedBlob, err error) {
+	start := time.Now()
+	defer func() {
+		if err != nil {
+			c.logger.Error("blob conclude batch failed", zap.Stringer("space", space), zap.Int("blobs", len(added)), zap.Error(err), zap.Duration("duration", time.Since(start)))
+		} else {
+			c.logger.Debug("blobs concluded", zap.Stringer("space", space), zap.Int("blobs", len(added)), zap.Duration("duration", time.Since(start)))
+		}
+	}()
+
+	out := make([]AddedBlob, len(added))
+	// Blobs already accepted (a dedup hit at add time) need no conclusion.
+	var pending []int
+	for i, a := range added {
+		out[i] = a
+		if a.Location != nil {
+			out[i].PutInvocation = nil
+			continue
+		}
+		pending = append(pending, i)
+	}
+	if len(pending) == 0 {
+		return out, nil
+	}
+
+	for start := 0; start < len(pending); start += MaxConcludeBatch {
+		chunk := pending[start:min(start+MaxConcludeBatch, len(pending))]
+		accepts, err := c.concludePuts(ctx, added, chunk)
+		if err != nil {
+			return nil, err
+		}
+		// Index the response once: matching every blob to its acceptance by
+		// scanning the container would be quadratic in the chunk size.
+		index := indexAccepts(accepts)
+		for _, i := range chunk {
+			location, err := c.locationOf(ctx, added[i], index)
+			if err != nil {
+				return nil, fmt.Errorf("blob %s: %w", digestutil.Format(added[i].Digest), err)
+			}
+			out[i] = AddedBlob{
+				Digest:     added[i].Digest,
+				Size:       added[i].Size,
+				Location:   location,
+				AddTask:    added[i].AddTask,
+				AcceptTask: added[i].AcceptTask,
+			}
+		}
+	}
+	return out, nil
+}
+
+// concludePuts delivers the put receipts of the blobs at the given indices in
+// one invocation, and returns the response container the upload service
+// answered with — the acceptances it ran as a consequence.
+func (c *Client) concludePuts(ctx context.Context, added []AddedBlob, idx []int) (ucan.Container, error) {
+	putInvs := make([]ucan.Invocation, 0, len(idx))
+	putRcpts := make([]ucan.Receipt, 0, len(idx))
+	links := make([]cid.Cid, 0, len(idx))
+	for _, i := range idx {
+		putInv := new(invocation.Invocation)
+		if err := putInv.UnmarshalCBOR(bytes.NewReader(added[i].PutInvocation)); err != nil {
+			return nil, fmt.Errorf("decoding parked /http/put invocation: %w", err)
+		}
+		putRcpt, err := putReceipt(putInv)
+		if err != nil {
+			return nil, fmt.Errorf("generating put receipt: %w", err)
+		}
+		putInvs = append(putInvs, putInv)
+		putRcpts = append(putRcpts, putRcpt)
+		links = append(links, putRcpt.Link())
+	}
+
+	inv, err := ucancmds.Conclude.Invoke(
+		c.signer, c.signer.DID(),
+		&ucancmds.ConcludeArguments{Receipts: links},
+		invocation.WithAudience(c.serviceID),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("generating invocation: %w", err)
+	}
+
+	// The put invocations ride along so the upload service need not read each
+	// one back out of its own store.
+	_, rcpt, meta, err := Execute[*ucancmds.ConcludeOK](ctx, c.ucanClient, inv,
+		execution.WithReceipts(putRcpts...),
+		execution.WithInvocations(putInvs...),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("executing invocation: %w", err)
+	}
+	if rcpt.Out().IsErr() {
+		_, x := rcpt.Out().Unpack()
+		var model edm.ErrorModel
+		if err := model.UnmarshalCBOR(bytes.NewReader(x)); err != nil {
+			return nil, fmt.Errorf("conclude failed with unknown error: %w", err)
+		}
+		return nil, fmt.Errorf("conclude failed: %w", model)
+	}
+	return meta, nil
+}
+
+// acceptIndex is a conclude response's acceptances, keyed for lookup: the
+// receipts by the task they ran, and the invocations by their own link (which
+// is what an acceptance names its location commitment by).
+type acceptIndex struct {
+	rcptsByRan map[cid.Cid]ucan.Receipt
+	invsByLink map[cid.Cid]ucan.Invocation
+}
+
+func indexAccepts(c ucan.Container) acceptIndex {
+	idx := acceptIndex{
+		rcptsByRan: map[cid.Cid]ucan.Receipt{},
+		invsByLink: map[cid.Cid]ucan.Invocation{},
+	}
+	if c == nil {
+		return idx
+	}
+	for _, r := range c.Receipts() {
+		idx.rcptsByRan[r.Ran()] = r
+	}
+	for _, inv := range c.Invocations() {
+		idx.invsByLink[inv.Link()] = inv
+	}
+	return idx
+}
+
+// locationOf reads a blob's location commitment out of the conclude response,
+// falling back to the receipts endpoint when the response carried no
+// acceptance for it (an upload service that predates batched conclusion
+// answers with an empty container).
+func (c *Client) locationOf(ctx context.Context, added AddedBlob, accepts acceptIndex) (ucan.Invocation, error) {
+	if rcpt, ok := accepts.rcptsByRan[added.AcceptTask]; ok {
+		return locationFromAccept(rcpt, accepts)
+	}
+	return c.awaitAccept(ctx, added.AcceptTask)
 }
 
 // awaitAccept polls the /blob/accept receipt and extracts the
@@ -342,6 +471,15 @@ func (c *Client) awaitAccept(ctx context.Context, acceptTask cid.Cid) (ucan.Invo
 	if err != nil {
 		return nil, fmt.Errorf("polling accept receipt: %w", err)
 	}
+	return locationFromAccept(accRcpt, indexAccepts(accMeta))
+}
+
+// locationFromAccept unpacks an accept receipt and returns the
+// /assert/location commitment it issued, found in the accompanying container
+// by the link the receipt names (AcceptOK.Site is the commitment invocation's
+// own link, not its task link). A container may hold the acceptances of many
+// blobs, so the commitment is matched by link rather than by command.
+func locationFromAccept(accRcpt ucan.Receipt, meta acceptIndex) (ucan.Invocation, error) {
 	o, x := accRcpt.Out().Unpack()
 	if accRcpt.Out().IsErr() {
 		var model edm.ErrorModel
@@ -354,17 +492,10 @@ func (c *Client) awaitAccept(ctx context.Context, acceptTask cid.Cid) (ucan.Invo
 	if err := accOK.UnmarshalCBOR(bytes.NewReader(o)); err != nil {
 		return nil, fmt.Errorf("unmarshaling accept receipt output: %w", err)
 	}
-
-	var locationCommitment ucan.Invocation
-	for _, inv := range accMeta.Invocations() {
-		if inv.Command() == assertcmds.Location.Command {
-			locationCommitment = inv
-		}
+	if inv, ok := meta.invsByLink[accOK.Site]; ok {
+		return inv, nil
 	}
-	if locationCommitment == nil {
-		return nil, fmt.Errorf("blob accept receipt missing location commitment invocation")
-	}
-	return locationCommitment, nil
+	return nil, fmt.Errorf("blob accept receipt missing location commitment invocation")
 }
 
 func putBlob(ctx context.Context, client *http.Client, url *url.URL, headers map[string]string, body io.Reader, size int64) error {
@@ -389,61 +520,35 @@ func putBlob(ctx context.Context, client *http.Client, url *url.URL, headers map
 	return nil
 }
 
-func (c *Client) sendPutReceipt(ctx context.Context, putInv ucan.Invocation, opts ...execution.RequestOption) error {
+// putReceipt mints the /http/put receipt for a parked upload, signing it with
+// the digest-derived key the upload service embedded in the put invocation's
+// metadata.
+func putReceipt(putInv ucan.Invocation) (ucan.Receipt, error) {
 	var putMeta datamodel.Map
 	if err := putMeta.UnmarshalCBOR(bytes.NewReader(putInv.MetadataBytes())); err != nil {
-		return fmt.Errorf("unmarshaling /http/put invocation metadata: %w", err)
+		return nil, fmt.Errorf("unmarshaling /http/put invocation metadata: %w", err)
 	}
 	keysMap, ok := putMeta["keys"].(ipld.Map)
 	if !ok {
-		return fmt.Errorf("invalid put metadata, missing 'keys' field")
+		return nil, fmt.Errorf("invalid put metadata, missing 'keys' field")
 	}
 	id, ok := keysMap["id"].(string)
 	if !ok {
-		return fmt.Errorf("invalid put metadata, missing 'id' field in 'keys'")
+		return nil, fmt.Errorf("invalid put metadata, missing 'id' field in 'keys'")
 	}
 	keysKeysMap, ok := keysMap["keys"].(ipld.Map)
 	if !ok {
-		return fmt.Errorf("invalid put metadata, missing 'keys' field in 'keys'")
+		return nil, fmt.Errorf("invalid put metadata, missing 'keys' field in 'keys'")
 	}
 	keyBytes, ok := keysKeysMap[id].([]byte)
 	if !ok {
-		return fmt.Errorf("invalid put metadata, missing key for %s", id)
+		return nil, fmt.Errorf("invalid put metadata, missing key for %s", id)
 	}
 	signer, err := ed25519.Decode(keyBytes)
 	if err != nil {
-		return fmt.Errorf("decoding key for %q: %w", id, err)
+		return nil, fmt.Errorf("decoding key for %q: %w", id, err)
 	}
-	issuer := multikey.KeyIssuer(signer)
-	putRcpt, err := receipt.IssueOK(issuer, putInv.Task().Link(), &httpcmds.PutOK{}, receipt.WithIssuedAt(ucan.Now()))
-	if err != nil {
-		return fmt.Errorf("generating receipt: %w", err)
-	}
-
-	inv, err := ucancmds.Conclude.Invoke(
-		c.signer, c.signer.DID(),
-		&ucancmds.ConcludeArguments{Receipt: putRcpt.Link()},
-		invocation.WithAudience(c.serviceID),
-	)
-	if err != nil {
-		return fmt.Errorf("generating invocation: %w", err)
-	}
-
-	opts = slices.Clone(opts)
-	opts = append(opts, execution.WithReceipts(putRcpt))
-	_, rcpt, _, err := Execute[*ucancmds.ConcludeOK](ctx, c.ucanClient, inv, opts...)
-	if err != nil {
-		return fmt.Errorf("executing invocation: %w", err)
-	}
-	if rcpt.Out().IsErr() {
-		_, x := rcpt.Out().Unpack()
-		var model edm.ErrorModel
-		if err := model.UnmarshalCBOR(bytes.NewReader(x)); err != nil {
-			return fmt.Errorf("conclude failed with unknown error: %w", err)
-		}
-		return fmt.Errorf("conclude failed: %w", model)
-	}
-	return nil
+	return receipt.IssueOK(multikey.KeyIssuer(signer), putInv.Task().Link(), &httpcmds.PutOK{}, receipt.WithIssuedAt(ucan.Now()))
 }
 
 func findInvocation(task cid.Cid, invocations []ucan.Invocation) (ucan.Invocation, error) {

@@ -47,7 +47,7 @@ func newUploadConfig(options ...UploadOption) *uploadConfig {
 // WithConclude controls whether UploadBlob triggers accept before returning.
 // WithConclude(false) leaves the blob parked — durable on the provider,
 // accept deferred (multipart's UploadPart): the returned UploadedBlob has a
-// nil Location and carries the state ConcludeBlob needs. Moot on dedup —
+// nil Location and carries the state ConcludeBlobs needs. Moot on dedup —
 // when the provider already held accepted bytes for the content, accept
 // already ran and the upload completes regardless.
 func WithConclude(conclude bool) UploadOption {
@@ -56,7 +56,7 @@ func WithConclude(conclude bool) UploadOption {
 
 // UploadedBlob is the result of UploadBlob. Location == nil ⇔ the blob is
 // parked (uploaded with WithConclude(false), no dedup hit): persist the task
-// links + PutInvocation (the blob_parks row) and finish with ConcludeBlob at
+// links + PutInvocation (the blob_parks row) and finish with ConcludeBlobs at
 // Complete, or abandon with AbortBlob (AddTask is the Cause). A concluding
 // upload — the default — always returns a non-nil Location or errors.
 type UploadedBlob struct {
@@ -88,7 +88,7 @@ type BodyUploader interface {
 // UploadBlob uploads one spooled blob to Forge. For a single-shot PutObject the
 // allocate→PUT→accept happens in one call (forgeclient.BlobAdd already drives
 // the whole flow and returns the location commitment); multipart's deferred
-// accept passes WithConclude(false) and finishes with ConcludeBlob at
+// accept passes WithConclude(false) and finishes with ConcludeBlobs at
 // Complete (or AbortBlob at Abort).
 func (u *Forge) UploadBlob(ctx context.Context, space did.DID, digest multihash.Multihash, size int64, localPath string, opts ...UploadOption) (UploadedBlob, error) {
 	cfg := newUploadConfig(opts...)
@@ -170,31 +170,48 @@ var _ BodyUploader = (*Forge)(nil)
 
 // DeferredBodyUploader extends BodyUploader for multipart's deferred accept:
 // UploadBlob with WithConclude(false) makes the bytes durable (parked) at
-// UploadPart; ConcludeBlob triggers accept at Complete; AbortBlob abandons a
+// UploadPart; ConcludeBlobs triggers accept at Complete; AbortBlob abandons a
 // parked blob at Abort.
 type DeferredBodyUploader interface {
 	BodyUploader
-	ConcludeBlob(ctx context.Context, space did.DID, parked UploadedBlob) (BlobLocation, error)
+	// ConcludeBlobs concludes parked uploads, returning their locations in
+	// the order given. A multipart complete has one parked blob per part, and
+	// concluding them together is what keeps its cost flat in the part count.
+	ConcludeBlobs(ctx context.Context, space did.DID, parked []UploadedBlob) ([]BlobLocation, error)
 	AbortBlob(ctx context.Context, space did.DID, digest multihash.Multihash, cause cid.Cid) error
 }
 
-// ConcludeBlob finishes a parked upload: it concludes the deferred /http/put
-// receipt (triggering /blob/accept on the provider) and returns the published
-// location. parked is the UploadedBlob a WithConclude(false) upload returned
-// (rehydrated from its blob_parks row). The conclude carries no space proof
-// (accept is owned by sprue), so no proof store is required. Safe to retry.
-func (u *Forge) ConcludeBlob(ctx context.Context, space did.DID, parked UploadedBlob) (BlobLocation, error) {
-	added, err := u.client.BlobConclude(ctx, space, forgeclient.AddedBlob{
-		Digest:        parked.Digest,
-		Size:          uint64(parked.Size),
-		AddTask:       parked.AddTask,
-		AcceptTask:    parked.AcceptTask,
-		PutInvocation: parked.PutInvocation,
-	})
-	if err != nil {
-		return BlobLocation{}, fmt.Errorf("uploader: conclude blob: %w", err)
+// ConcludeBlobs finishes many parked uploads in one exchange with the upload
+// service: it delivers every blob's deferred /http/put receipt together,
+// triggering their /blob/accept invocations, and returns the published
+// locations in the order given.
+func (u *Forge) ConcludeBlobs(ctx context.Context, space did.DID, parked []UploadedBlob) ([]BlobLocation, error) {
+	if len(parked) == 0 {
+		return nil, nil
 	}
-	return locationFromAdded(added)
+	req := make([]forgeclient.AddedBlob, len(parked))
+	for i, p := range parked {
+		req[i] = forgeclient.AddedBlob{
+			Digest:        p.Digest,
+			Size:          uint64(p.Size),
+			AddTask:       p.AddTask,
+			AcceptTask:    p.AcceptTask,
+			PutInvocation: p.PutInvocation,
+		}
+	}
+	added, err := u.client.BlobConcludeBatch(ctx, space, req)
+	if err != nil {
+		return nil, fmt.Errorf("uploader: conclude blobs: %w", err)
+	}
+	locations := make([]BlobLocation, len(added))
+	for i, a := range added {
+		loc, err := locationFromAdded(a)
+		if err != nil {
+			return nil, err
+		}
+		locations[i] = loc
+	}
+	return locations, nil
 }
 
 // AbortBlob abandons a parked blob via /blob/abort on the upload

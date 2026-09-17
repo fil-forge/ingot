@@ -117,7 +117,7 @@ type Deps struct {
 	// space's claim on a blob when its last reference is dropped.
 	Uploader uploader.BodyUploader
 	// Deferred extends Uploader for multipart's deferred accept
-	// (WithConclude(false), then ConcludeBlob/AbortBlob); Parks persists
+	// (WithConclude(false), then ConcludeBlobs/AbortBlob); Parks persists
 	// park state between UploadPart and Complete/Abort.
 	Deferred uploader.DeferredBodyUploader
 	Parks    registry.ParkStore

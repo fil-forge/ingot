@@ -110,7 +110,7 @@ Internal:
   all of them.
 - **`uploader/`** — `forge.go`/`blob.go`: `Forge` behind `Uploader`
   (`SubmitShard`), `BodyUploader`/`DeferredBodyUploader` (`UploadBlob`,
-  `ConcludeBlob`, `AbortBlob`), and `BlobRemover`; captures the per-space
+  `ConcludeBlobs`, `AbortBlob`), and `BlobRemover`; captures the per-space
   ship authority (`shipProofs`, 1h TTL) from in-request writes.
 - **`bucketauthority/`** — hilt bucket ops: forwards CreateBucket /
   DeleteBucket / ListBuckets to `/s3/bucket/*`, recovering the signed S3

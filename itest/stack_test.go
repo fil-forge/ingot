@@ -140,6 +140,14 @@ func forgeStack(t *testing.T, extra ...stack.Option) (*stack.Stack, string) {
 		t.Logf("using piri binary override: %s", bin)
 		opts = append(opts, stack.WithPiriBinary(bin))
 	}
+	// And for the upload service: mounts a locally-built sprue over the
+	// image's /usr/bin/sprue, so an ingot change can be measured against an
+	// unreleased sprue (the batched /ucan/conclude work) with no image build.
+	// Build it static: CGO_ENABLED=0 GOOS=linux GOWORK=off go build ./cmd/main.go
+	if bin := os.Getenv("INGOT_ITEST_UPLOAD_BINARY"); bin != "" {
+		t.Logf("using upload-service binary override: %s", bin)
+		opts = append(opts, stack.WithServiceBinary("upload", bin))
+	}
 	// And for hilt: validates an ingot change against an unreleased hilt
 	// (e.g. a new field in the authorize response) before its image publishes.
 	if bin := os.Getenv("INGOT_ITEST_HILT_BINARY"); bin != "" {

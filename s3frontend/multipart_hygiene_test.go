@@ -465,6 +465,15 @@ func (p *parkingUploader) abortedDigests() map[string]bool {
 // so part blobs reach IntentParked and abort exercises the /blob/abort arm.
 func newParkingBackend(t *testing.T) (*Backend, *inmem.MemStore, *parkingUploader) {
 	t.Helper()
+	pu := &parkingUploader{}
+	b, mem := newDeferredBackend(t, pu)
+	return b, mem, pu
+}
+
+// newDeferredBackend builds an in-process backend around a caller-supplied
+// deferred uploader, so a test can observe how the completion path drives it.
+func newDeferredBackend(t *testing.T, up deferredTestUploader) (*Backend, *inmem.MemStore) {
+	t.Helper()
 	ctx := context.Background()
 	dir := t.TempDir()
 	mem := inmem.NewMemStore()
@@ -483,7 +492,6 @@ func newParkingBackend(t *testing.T) (*Backend, *inmem.MemStore, *parkingUploade
 	}
 	t.Cleanup(func() { _ = log.Close(ctx) })
 
-	pu := &parkingUploader{}
 	b := New(Deps{
 		Authority:       mem,
 		Registry:        mem,
@@ -496,8 +504,8 @@ func newParkingBackend(t *testing.T) (*Backend, *inmem.MemStore, *parkingUploade
 		Reads:           blockstore.NewLayered(spool, log, inmem.NopBaseReader{}),
 		Log:             log,
 		Spool:           spool,
-		Uploader:        pu,
-		Deferred:        pu,
+		Uploader:        up,
+		Deferred:        up,
 		Remover:         &recordingRemover{},
 		EncParams:       mem,
 		RegionKeys:      testRegionKeys(t),
@@ -507,7 +515,14 @@ func newParkingBackend(t *testing.T) (*Backend, *inmem.MemStore, *parkingUploade
 	if err := mem.Create(ctx, "bk", did.Undef, registry.CreateState{}); err != nil {
 		t.Fatalf("create bucket: %v", err)
 	}
-	return b, mem, pu
+	return b, mem
+}
+
+// deferredTestUploader is what newDeferredBackend needs of a fake: the
+// uploader seams the multipart path uses.
+type deferredTestUploader interface {
+	uploader.Uploader
+	uploader.DeferredBodyUploader
 }
 
 // TestAbortUnparksParkedBlob: abort of a genuinely parked part blob releases
