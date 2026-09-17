@@ -15,7 +15,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// acceptance mints what a storage node returns for one accepted blob: the
+// acceptance issues what a storage node returns for one accepted blob: the
 // location commitment, and an accept receipt naming it. The receipt's Site is
 // the commitment invocation's own link, not its task link — matching on the
 // wrong one is why an early version of the batched conclude could not find
@@ -34,7 +34,7 @@ func acceptance(t *testing.T, node ucan.Issuer, acceptTask ucan.Invocation) (uca
 	return claim, rcpt
 }
 
-// acceptInvocation mints a stand-in /blob/accept invocation for a blob.
+// acceptInvocation issues a stand-in /blob/accept invocation for a blob.
 func acceptInvocation(t *testing.T, service ucan.Issuer, node ucan.Issuer, n int) ucan.Invocation {
 	t.Helper()
 	inv, err := invocation.Invoke(service, node.DID(), blobcmds.Accept.Command, datamodel.Map{

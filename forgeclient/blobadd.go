@@ -520,7 +520,7 @@ func putBlob(ctx context.Context, client *http.Client, url *url.URL, headers map
 	return nil
 }
 
-// putReceipt mints the /http/put receipt for a parked upload, signing it with
+// putReceipt issues the /http/put receipt for a parked upload, signing it with
 // the digest-derived key the upload service embedded in the put invocation's
 // metadata.
 func putReceipt(putInv ucan.Invocation) (ucan.Receipt, error) {

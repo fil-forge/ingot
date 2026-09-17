@@ -176,7 +176,15 @@ func TestForgeMultipartManyParts(t *testing.T) {
 // distinct bytes so nothing dedups against another part, the spool, or
 // another test's blobs.
 func mpPartByteAt(part int32, i int64) byte {
-	return byte(i*31 + 7 + int64(part)*191)
+	// Mixed rather than summed: a linear term in the part number repeats
+	// every 256 parts once truncated to a byte, so part 1 and part 257 would
+	// generate identical content and dedup against each other in the spool,
+	// quietly measuring far fewer blobs than the test asked for.
+	h := uint64(part)*0x9E3779B97F4A7C15 ^ uint64(i)*0xBF58476D1CE4E5B9
+	h ^= h >> 29
+	h *= 0x94D049BB133111EB
+	h ^= h >> 32
+	return byte(h)
 }
 
 // mpPartBytes materializes n bytes of a part's content starting at off.
