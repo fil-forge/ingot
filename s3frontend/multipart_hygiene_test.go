@@ -1041,3 +1041,54 @@ func TestUploadPartToleratesFailedStaleParkDelete(t *testing.T) {
 		t.Fatalf("stale park row survived Complete (err=%v)", err)
 	}
 }
+
+// TestSweepReleasesLocatedBlobWhoseIntentLagged: a Complete records a blob's
+// location, fails to mark its intent, and is never retried. On expiry the
+// sweeper must read the location as the acceptance it is: the blob is
+// released through the accepted path, never aborted on the provider as though
+// it were still parked.
+func TestSweepReleasesLocatedBlobWhoseIntentLagged(t *testing.T) {
+	hc := &haltingConcluder{}
+	intents := &failOnceMarkAccepted{armed: true}
+	rm := &recordingRemover{}
+	b, mem := newDeferredBackend(t, hc, func(d *Deps) {
+		intents.IntentStore = d.Intents
+		d.Intents = intents
+		d.Remover = rm
+	})
+	ctx := context.Background()
+	key := "intent-lagged"
+	uploadID, parts := completeTwoParts(t, b, key)
+
+	if _, err := mpComplete(t, b, key, uploadID, parts, nil); err == nil {
+		t.Fatal("Complete succeeded although one intent failed to update")
+	}
+	digests := hygienePartDigests(t, mem, uploadID, 1)
+	digests = append(digests, hygienePartDigests(t, mem, uploadID, 2)...)
+	var lagged multihash.Multihash
+	for _, d := range digests {
+		if in, err := mem.GetIntent(ctx, d); err == nil && in.State == registry.IntentParked {
+			lagged = d
+		}
+	}
+	if lagged == nil {
+		t.Fatal("no blob was left parked with a location")
+	}
+	if loc, err := mem.GetLocation(ctx, did.Undef, lagged); err != nil || loc == nil {
+		t.Fatalf("lagged blob has no location (err=%v)", err)
+	}
+
+	if n, err := b.SweepStaleMultipartSessions(ctx, -time.Second); err != nil || n == 0 {
+		t.Fatalf("sweep: cleaned=%d err=%v", n, err)
+	}
+	if hc.abortedDigests()[string(lagged)] {
+		t.Fatalf("located blob %x was aborted on the provider as though parked", lagged)
+	}
+	if _, err := mem.GetPark(ctx, lagged); !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("park row for located blob %x survived the sweep (err=%v)", lagged, err)
+	}
+	assertReleased(t, b, mem, rm, lagged, true)
+	if _, err := mem.GetLocation(ctx, did.Undef, lagged); !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("location for %x survived the release (err=%v)", lagged, err)
+	}
+}

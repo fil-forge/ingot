@@ -517,7 +517,10 @@ func (b *Backend) executeRelease(ctx context.Context, space did.DID, digest mult
 	// A released blob was accepted, so any park row it still has is stale: a
 	// Complete recorded the acceptance and failed before dropping the row,
 	// and the session sweep's own attempt failed too. This is the durable
-	// retry — the release intent stands until the row is gone.
+	// retry — the release intent stands until the row is gone. The row is
+	// the space's only one for the digest, like the location and the network
+	// copy released alongside it: every blob is encrypted under its own
+	// random key, so no other upload produces this digest.
 	if err := b.parks.DeletePark(ctx, digest); err != nil {
 		b.logger.Warn("release: delete stale park row failed",
 			zap.String("digest", hex.EncodeToString(digest)), zap.Error(err))

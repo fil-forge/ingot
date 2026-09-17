@@ -929,6 +929,15 @@ func (b *Backend) cleanupPartBlobs(ctx context.Context, space did.DID, uploadID 
 		if in, err := b.intents.GetIntent(ctx, d); err == nil {
 			state = in.State
 		}
+		// The location row is the record of acceptance; the intent lags it
+		// when a Complete recorded the location and failed before marking
+		// the intent. A located blob is accepted whatever its intent says,
+		// so it is released below rather than aborted as parked.
+		if state == registry.IntentParked {
+			if loc, err := b.locations.GetLocation(ctx, space, d); err == nil && loc != nil {
+				state = registry.IntentAccepted
+			}
+		}
 		switch state {
 		case registry.IntentSpooled:
 			// Local only: the spool/intent/enc-params teardown below.
