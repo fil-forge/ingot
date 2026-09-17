@@ -563,3 +563,86 @@ func TestAbortUnparksParkedBlob(t *testing.T) {
 		}
 	}
 }
+
+// haltingConcluder concludes like the parking uploader until halted; halted,
+// it answers with every blob located but the last and an error, which is
+// what a conclude that failed partway hands back. It records what each call
+// was asked to conclude.
+type haltingConcluder struct {
+	parkingUploader
+	halt  bool
+	calls [][]string
+}
+
+func (h *haltingConcluder) ConcludeBlobs(ctx context.Context, space did.DID, parked []uploader.UploadedBlob) ([]*uploader.BlobLocation, error) {
+	digests := make([]string, len(parked))
+	for i, p := range parked {
+		digests[i] = string(p.Digest)
+	}
+	h.calls = append(h.calls, digests)
+	locations, err := h.parkingUploader.ConcludeBlobs(ctx, space, parked)
+	if err != nil || !h.halt {
+		return locations, err
+	}
+	locations[len(locations)-1] = nil
+	return locations, errors.New("upload service went away")
+}
+
+// TestCompleteRecordsAcceptancesWhenConcludeFails: a conclude that fails after
+// the upload service accepted some of the blobs leaves those recorded as
+// accepted with their parks dropped and the rest parked, so the next Complete
+// concludes only what remains and nothing accepted is ever aborted as parked.
+func TestCompleteRecordsAcceptancesWhenConcludeFails(t *testing.T) {
+	hc := &haltingConcluder{halt: true}
+	b, mem := newDeferredBackend(t, hc)
+	ctx := context.Background()
+	key := "partial"
+
+	uploadID := mpCreate(t, b, key, "", "")
+	var parts []types.CompletedPart
+	for n := int32(1); n <= 2; n++ {
+		// Distinct content per part, so each part is its own blob.
+		body := testBody(int(backend.MinPartSize))
+		body[0] = byte(n)
+		out, err := mpUploadPart(t, b, key, uploadID, n, body, nil)
+		if err != nil {
+			t.Fatalf("UploadPart %d: %v", n, err)
+		}
+		num := n
+		parts = append(parts, types.CompletedPart{PartNumber: &num, ETag: out.ETag})
+	}
+
+	if _, err := mpComplete(t, b, key, uploadID, parts, nil); err == nil {
+		t.Fatal("Complete succeeded against a conclude that failed")
+	}
+	if len(hc.calls) != 1 || len(hc.calls[0]) != 2 {
+		t.Fatalf("conclude calls = %v, want one call for two blobs", hc.calls)
+	}
+	accepted := multihash.Multihash(hc.calls[0][0])
+	stillParked := multihash.Multihash(hc.calls[0][1])
+
+	if in, err := mem.GetIntent(ctx, accepted); err != nil || in.State != registry.IntentAccepted {
+		t.Fatalf("accepted blob intent = %v/%v, want accepted", in, err)
+	}
+	if loc, err := mem.GetLocation(ctx, did.Undef, accepted); err != nil || loc == nil {
+		t.Fatalf("accepted blob has no location (err=%v)", err)
+	}
+	if _, err := mem.GetPark(ctx, accepted); !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("park row for the accepted blob survived (err=%v)", err)
+	}
+	if in, err := mem.GetIntent(ctx, stillParked); err != nil || in.State != registry.IntentParked {
+		t.Fatalf("unconcluded blob intent = %v/%v, want parked", in, err)
+	}
+	if _, err := mem.GetPark(ctx, stillParked); err != nil {
+		t.Fatalf("park row for the unconcluded blob is gone: %v", err)
+	}
+
+	// The retry has only the still-parked blob to conclude.
+	hc.halt = false
+	if _, err := mpComplete(t, b, key, uploadID, parts, nil); err != nil {
+		t.Fatalf("retry Complete: %v", err)
+	}
+	if len(hc.calls) != 2 || len(hc.calls[1]) != 1 || hc.calls[1][0] != string(stillParked) {
+		t.Fatalf("retry conclude calls = %v, want exactly the still-parked blob", hc.calls[1:])
+	}
+}

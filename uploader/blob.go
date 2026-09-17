@@ -3,6 +3,7 @@ package uploader
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 
@@ -177,15 +178,20 @@ type DeferredBodyUploader interface {
 	// ConcludeBlobs concludes parked uploads, returning their locations in
 	// the order given. A multipart complete has one parked blob per part, and
 	// concluding them together is what keeps its cost flat in the part count.
-	ConcludeBlobs(ctx context.Context, space did.DID, parked []UploadedBlob) ([]BlobLocation, error)
+	//
+	// On error the slice still has one entry per blob. A non-nil entry is a
+	// blob the upload service accepted before the failure, which the caller
+	// must record so it is neither concluded again nor aborted as parked; a
+	// nil entry is a blob still parked.
+	ConcludeBlobs(ctx context.Context, space did.DID, parked []UploadedBlob) ([]*BlobLocation, error)
 	AbortBlob(ctx context.Context, space did.DID, digest multihash.Multihash, cause cid.Cid) error
 }
 
-// ConcludeBlobs finishes many parked uploads in one exchange with the upload
-// service: it delivers every blob's deferred /http/put receipt together,
-// triggering their /blob/accept invocations, and returns the published
-// locations in the order given.
-func (u *Forge) ConcludeBlobs(ctx context.Context, space did.DID, parked []UploadedBlob) ([]BlobLocation, error) {
+// ConcludeBlobs finishes many parked uploads in as few exchanges with the
+// upload service as the batch cap allows: it delivers the blobs' deferred
+// /http/put receipts together, triggering their /blob/accept invocations, and
+// returns the published locations in the order given.
+func (u *Forge) ConcludeBlobs(ctx context.Context, space did.DID, parked []UploadedBlob) ([]*BlobLocation, error) {
 	if len(parked) == 0 {
 		return nil, nil
 	}
@@ -200,16 +206,23 @@ func (u *Forge) ConcludeBlobs(ctx context.Context, space did.DID, parked []Uploa
 		}
 	}
 	added, err := u.client.BlobConcludeBatch(ctx, space, req)
-	if err != nil {
-		return nil, fmt.Errorf("uploader: conclude blobs: %w", err)
-	}
-	locations := make([]BlobLocation, len(added))
+	// Every blob comes back, located or still parked, whether or not the
+	// batch as a whole succeeded. What was located is converted before the
+	// error is looked at, so the caller can record it.
+	locations := make([]*BlobLocation, len(parked))
 	for i, a := range added {
-		loc, err := locationFromAdded(a)
-		if err != nil {
-			return nil, err
+		if a.Location == nil {
+			continue
 		}
-		locations[i] = loc
+		loc, lerr := locationFromAdded(a)
+		if lerr != nil {
+			err = errors.Join(err, lerr)
+			continue
+		}
+		locations[i] = &loc
+	}
+	if err != nil {
+		return locations, fmt.Errorf("uploader: conclude blobs: %w", err)
 	}
 	return locations, nil
 }

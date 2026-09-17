@@ -31,7 +31,7 @@ func (u *batchRecordingUploader) UploadBlob(_ context.Context, _ did.DID, digest
 	return uploader.UploadedBlob{Digest: digest, Size: size, AddTask: c, AcceptTask: c}, nil
 }
 
-func (u *batchRecordingUploader) ConcludeBlobs(ctx context.Context, space did.DID, parked []uploader.UploadedBlob) ([]uploader.BlobLocation, error) {
+func (u *batchRecordingUploader) ConcludeBlobs(ctx context.Context, space did.DID, parked []uploader.UploadedBlob) ([]*uploader.BlobLocation, error) {
 	u.mu.Lock()
 	u.calls = append(u.calls, len(parked))
 	u.mu.Unlock()

@@ -18,6 +18,7 @@ package forgeclient
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -327,11 +328,25 @@ const MaxConcludeBatch = 1000
 // An AddedBlob whose Location is already set is returned as-is, and the
 // results drop PutInvocation (spent — the caller should delete its persisted
 // copy too).
+//
+// On error the returned slice still holds every blob, and each one whose
+// acceptance was read before the failure carries its Location. The upload
+// service has run those accepts whether or not the rest of the batch
+// succeeded, so the caller must record them before retrying: a park left
+// standing for an accepted blob is concluded again on the next attempt, or
+// aborted on the node when its session expires. A blob left unresolved comes
+// back as it went in, PutInvocation included, ready for that retry.
 func (c *Client) BlobConcludeBatch(ctx context.Context, space did.DID, added []AddedBlob) (blobs []AddedBlob, err error) {
 	start := time.Now()
 	defer func() {
 		if err != nil {
-			c.logger.Error("blob conclude batch failed", zap.Stringer("space", space), zap.Int("blobs", len(added)), zap.Error(err), zap.Duration("duration", time.Since(start)))
+			located := 0
+			for _, b := range blobs {
+				if b.Location != nil {
+					located++
+				}
+			}
+			c.logger.Error("blob conclude batch failed", zap.Stringer("space", space), zap.Int("blobs", len(added)), zap.Int("located", located), zap.Error(err), zap.Duration("duration", time.Since(start)))
 		} else {
 			c.logger.Debug("blobs concluded", zap.Stringer("space", space), zap.Int("blobs", len(added)), zap.Duration("duration", time.Since(start)))
 		}
@@ -356,15 +371,32 @@ func (c *Client) BlobConcludeBatch(ctx context.Context, space did.DID, added []A
 		chunk := pending[start:min(start+MaxConcludeBatch, len(pending))]
 		accepts, err := c.concludePuts(ctx, added, chunk)
 		if err != nil {
-			return nil, err
+			return out, err
 		}
 		// Index the response once: matching every blob to its acceptance by
 		// scanning the container would be quadratic in the chunk size.
 		index := indexAccepts(accepts)
+		// The chunk's accepts have all run, so every blob in it is resolved
+		// before a failure among them is reported: one blob's refused
+		// acceptance says nothing about its neighbours, and the caller records
+		// them. A blob the response did not answer for is polled for; a failed
+		// poll means the service is not answering, which polling once more per
+		// remaining blob would only confirm slowly, so it ends the batch.
+		var failed []error
 		for _, i := range chunk {
-			location, err := c.locationOf(ctx, added[i], index)
-			if err != nil {
-				return nil, fmt.Errorf("blob %s: %w", digestutil.Format(added[i].Digest), err)
+			var location ucan.Invocation
+			if rcpt, ok := index.rcptsByRan[added[i].AcceptTask]; ok {
+				location, err = locationFromAccept(rcpt, index)
+				if err != nil {
+					failed = append(failed, fmt.Errorf("blob %s: %w", digestutil.Format(added[i].Digest), err))
+					continue
+				}
+			} else {
+				location, err = c.awaitAccept(ctx, added[i].AcceptTask)
+				if err != nil {
+					failed = append(failed, fmt.Errorf("blob %s: %w", digestutil.Format(added[i].Digest), err))
+					return out, errors.Join(failed...)
+				}
 			}
 			out[i] = AddedBlob{
 				Digest:     added[i].Digest,
@@ -373,6 +405,9 @@ func (c *Client) BlobConcludeBatch(ctx context.Context, space did.DID, added []A
 				AddTask:    added[i].AddTask,
 				AcceptTask: added[i].AcceptTask,
 			}
+		}
+		if len(failed) > 0 {
+			return out, errors.Join(failed...)
 		}
 	}
 	return out, nil
@@ -453,19 +488,10 @@ func indexAccepts(c ucan.Container) acceptIndex {
 	return idx
 }
 
-// locationOf reads a blob's location commitment out of the conclude response,
-// falling back to the receipts endpoint when the response carried no
-// acceptance for it (an upload service that predates batched conclusion
-// answers with an empty container).
-func (c *Client) locationOf(ctx context.Context, added AddedBlob, accepts acceptIndex) (ucan.Invocation, error) {
-	if rcpt, ok := accepts.rcptsByRan[added.AcceptTask]; ok {
-		return locationFromAccept(rcpt, accepts)
-	}
-	return c.awaitAccept(ctx, added.AcceptTask)
-}
-
 // awaitAccept polls the /blob/accept receipt and extracts the
-// /assert/location commitment from its metadata.
+// /assert/location commitment from its metadata. It is the fallback for a
+// blob whose acceptance the conclude response did not carry, as when the
+// upload service found the response too large to answer in one container.
 func (c *Client) awaitAccept(ctx context.Context, acceptTask cid.Cid) (ucan.Invocation, error) {
 	accRcpt, accMeta, err := c.receiptsClient.Poll(ctx, acceptTask, receipt_client.WithRetries(5))
 	if err != nil {

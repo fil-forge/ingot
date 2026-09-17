@@ -139,7 +139,10 @@ response. So a completion costs a few round trips rather than one per part,
 which is what an S3 client splitting a large object into thousands of 5 MiB
 parts produces.
 Step 4's polling remains the fallback for a blob the response did not
-cover.
+cover. A completion that fails partway still records the blobs the upload
+service accepted before the failure and drops their parks, so the next
+Complete concludes only what is still parked and session expiry never
+aborts a blob that was accepted.
 
 ## Read path
 

@@ -1124,20 +1124,31 @@ func (b *Backend) concludeBlobs(ctx context.Context, space did.DID, blobs []msbu
 			parked[i] = p.parked
 		}
 		locations, err := b.deferred.ConcludeBlobs(ctx, space, parked)
-		if err != nil {
-			return fmt.Errorf("conclude blobs: %w", err)
-		}
-		if len(locations) != len(toConclude) {
-			return fmt.Errorf("conclude blobs: got %d locations for %d blobs", len(locations), len(toConclude))
-		}
+		// Record every acceptance that came back before acting on the error.
+		// The upload service has run those accepts whether or not the rest of
+		// the batch succeeded, and a park left standing for an accepted blob
+		// is concluded again on the next Complete or aborted on the node when
+		// the session expires. Recorded as accepted, an orphan is released
+		// through the sweeper's ordinary path instead.
+		recorded := 0
 		for i, p := range toConclude {
-			if err := b.recordAccepted(ctx, space, p.blob.Digest, locations[i]); err != nil {
+			if i >= len(locations) || locations[i] == nil {
+				continue
+			}
+			if err := b.recordAccepted(ctx, space, p.blob.Digest, *locations[i]); err != nil {
 				return err
 			}
 			// The sealed put invocation is spent — drop it promptly.
 			if err := b.parks.DeletePark(ctx, p.blob.Digest); err != nil {
 				return fmt.Errorf("drop park: %w", err)
 			}
+			recorded++
+		}
+		if err != nil {
+			return fmt.Errorf("conclude blobs: %w", err)
+		}
+		if recorded != len(toConclude) {
+			return fmt.Errorf("conclude blobs: %d of %d blobs returned no location", len(toConclude)-recorded, len(toConclude))
 		}
 	}
 

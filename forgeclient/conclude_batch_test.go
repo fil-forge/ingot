@@ -2,6 +2,8 @@ package forgeclient
 
 import (
 	"crypto/rand"
+	"github.com/fil-forge/libforge/digestutil"
+	ucanerrors "github.com/fil-forge/ucantone/errors"
 	"net/http"
 	"net/url"
 	"sync"
@@ -75,9 +77,12 @@ type fakeSprue struct {
 
 	mu         sync.Mutex
 	deliveries []int
-	// silent answers with no acceptances, as an upload service that predates
-	// batched conclusion does, forcing the client back to polling.
-	silent bool
+	// failDelivery fails the nth conclude (1-based) outright, as an upload
+	// service that cannot serve the request does; zero fails none.
+	failDelivery int
+	// reject holds the accept tasks the node refuses: each answers with a
+	// failure receipt while the rest of the batch is accepted.
+	reject map[cid.Cid]bool
 }
 
 func (f *fakeSprue) sizes() []int {
@@ -90,11 +95,11 @@ func (f *fakeSprue) conclude(req *binding.Request[*ucancmds.ConcludeArguments], 
 	delivered := req.Task().Arguments().Receipts
 	f.mu.Lock()
 	f.deliveries = append(f.deliveries, len(delivered))
-	silent := f.silent
+	fail := len(f.deliveries) == f.failDelivery
 	f.mu.Unlock()
 
-	if silent {
-		return res.SetSuccess(&ucancmds.ConcludeOK{})
+	if fail {
+		return res.SetFailure(ucanerrors.New("Unavailable", "upload service unavailable"))
 	}
 
 	// Conclude arguments name receipts by their own link, not by the task
@@ -116,6 +121,17 @@ func (f *fakeSprue) conclude(req *binding.Request[*ucancmds.ConcludeArguments], 
 		acceptTask, ok := f.acceptFor[putRcpt.Ran()]
 		if !ok {
 			return res.SetFailure(ucancmds.ErrConclusionReceiptNotFound)
+		}
+		if f.reject[acceptTask] {
+			accRcpt, err := receipt.IssueErr(f.node, acceptTask, datamodel.Map{
+				"name":    "BlobNotFound",
+				"message": "the bytes never arrived",
+			})
+			if err != nil {
+				return err
+			}
+			rcpts = append(rcpts, accRcpt)
+			continue
 		}
 
 		claim, err := invocation.Invoke(f.node, f.node.DID(), assertcmds.Location.Command,
@@ -147,7 +163,7 @@ func concludeFixture(t *testing.T) (*Client, *fakeSprue) {
 	t.Helper()
 	service := randomIssuer(t)
 	node := randomIssuer(t)
-	fake := &fakeSprue{node: node, acceptFor: map[cid.Cid]cid.Cid{}}
+	fake := &fakeSprue{node: node, acceptFor: map[cid.Cid]cid.Cid{}, reject: map[cid.Cid]bool{}}
 
 	srv := server.NewHTTP(service)
 	srv.Handle(ucancmds.Conclude.Command, ucancmds.Conclude.Handler(fake.conclude))
@@ -266,4 +282,47 @@ func TestBlobConcludeBatchChunks(t *testing.T) {
 	for i, blob := range out {
 		require.NotNil(t, blob.Location, "blob %d of %d got no location", i, len(parked))
 	}
+}
+
+// TestBlobConcludeBatchKeepsCompletedChunks pins what a failure partway
+// leaves behind: the blobs of every chunk concluded before it come back
+// located, so the caller can record acceptances the upload service has
+// already run, and the rest come back as they went in, ready to retry.
+func TestBlobConcludeBatchKeepsCompletedChunks(t *testing.T) {
+	c, fake := concludeFixture(t)
+	fake.failDelivery = 2
+
+	parked := make([]AddedBlob, MaxConcludeBatch+2)
+	for i := range parked {
+		parked[i] = parkBlob(t, fake)
+	}
+
+	out, err := c.BlobConcludeBatch(t.Context(), randomDID(t), parked)
+	require.Error(t, err)
+	require.Equal(t, []int{MaxConcludeBatch, 2}, fake.sizes())
+	require.Len(t, out, len(parked), "every blob comes back, located or not")
+	for i := 0; i < MaxConcludeBatch; i++ {
+		require.NotNil(t, out[i].Location, "blob %d was concluded before the failure and must come back located", i)
+	}
+	for i := MaxConcludeBatch; i < len(parked); i++ {
+		require.Nil(t, out[i].Location, "blob %d was never concluded", i)
+		require.Equal(t, parked[i].PutInvocation, out[i].PutInvocation, "an unconcluded blob keeps what a retry needs")
+	}
+}
+
+// TestBlobConcludeBatchKeepsChunkAroundRefusedAccept pins that one blob's
+// refused acceptance does not cost its chunk: its neighbours come back
+// located, and the error names the blob that failed.
+func TestBlobConcludeBatchKeepsChunkAroundRefusedAccept(t *testing.T) {
+	c, fake := concludeFixture(t)
+
+	parked := []AddedBlob{parkBlob(t, fake), parkBlob(t, fake), parkBlob(t, fake)}
+	fake.reject[parked[1].AcceptTask] = true
+
+	out, err := c.BlobConcludeBatch(t.Context(), randomDID(t), parked)
+	require.ErrorContains(t, err, digestutil.Format(parked[1].Digest))
+	require.Equal(t, []int{3}, fake.sizes(), "one conclude carried the whole chunk")
+	require.NotNil(t, out[0].Location)
+	require.Nil(t, out[1].Location, "the refused blob is not located")
+	require.NotNil(t, out[2].Location, "a blob after the refused one is still resolved")
 }
