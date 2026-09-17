@@ -1115,9 +1115,9 @@ func (b *Backend) concludeBlobs(ctx context.Context, space did.DID, blobs []msbu
 		}})
 	}
 
-	// One exchange with the upload service for every parked blob, so an
-	// object of thousands of parts costs a couple of round trips rather than
-	// one per part.
+	// Every parked blob goes to the upload service in one exchange (the
+	// client splits only past its batch cap), so an object of thousands of
+	// parts costs a couple of round trips rather than one per part.
 	if len(toConclude) > 0 {
 		parked := make([]uploader.UploadedBlob, len(toConclude))
 		for i, p := range toConclude {

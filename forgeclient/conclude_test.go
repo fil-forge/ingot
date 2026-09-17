@@ -121,3 +121,28 @@ func TestLocationFromFailedAccept(t *testing.T) {
 	require.ErrorContains(t, err, "failure in accept receipt")
 	require.ErrorContains(t, err, "blob not delivered")
 }
+
+// A receipt whose Site names an invocation of some other command is an
+// error: the location recorded for a blob is only ever an /assert/location
+// commitment, never whatever the link happened to resolve to.
+func TestLocationFromAcceptRejectsForeignCommitment(t *testing.T) {
+	service, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	node, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+
+	acc := acceptInvocation(t, service, node, 0)
+	// The receipt points at another /blob/accept invocation instead of a
+	// location commitment.
+	foreign := acceptInvocation(t, service, node, 1)
+	rcpt, err := receipt.IssueOK(node, acc.Task().Link(), &blobcmds.AcceptOK{
+		Site: foreign.Link(),
+		PDP:  promise.AwaitOK{Task: foreign.Task().Link()},
+	})
+	require.NoError(t, err)
+
+	idx := indexAccepts(container.New(container.WithInvocations(foreign)))
+	_, err = locationFromAccept(rcpt, idx)
+	require.ErrorContains(t, err, blobcmds.Accept.Command.String())
+	require.ErrorContains(t, err, assertcmds.Location.Command.String())
+}

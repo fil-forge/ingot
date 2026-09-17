@@ -25,6 +25,7 @@ import (
 	"net/url"
 	"time"
 
+	assertcmds "github.com/fil-forge/libforge/commands/assert"
 	blobcmds "github.com/fil-forge/libforge/commands/blob"
 	httpcmds "github.com/fil-forge/libforge/commands/http"
 	ucancmds "github.com/fil-forge/libforge/commands/ucan"
@@ -379,10 +380,13 @@ func (c *Client) BlobConcludeBatch(ctx context.Context, space did.DID, added []A
 		// The chunk's accepts have all run, so every blob in it is resolved
 		// before a failure among them is reported: one blob's refused
 		// acceptance says nothing about its neighbours, and the caller records
-		// them. A blob the response did not answer for is polled for; a failed
+		// them. A blob the response did not answer for is polled for. A failed
 		// poll means the service is not answering, which polling once more per
-		// remaining blob would only confirm slowly, so it ends the batch.
+		// remaining blob would only confirm slowly, so it ends the polling;
+		// the acceptances the response did carry are still read out, and the
+		// blobs left unanswered come back as they went in.
 		var failed []error
+		polling := true
 		for _, i := range chunk {
 			var location ucan.Invocation
 			if rcpt, ok := index.rcptsByRan[added[i].AcceptTask]; ok {
@@ -391,11 +395,14 @@ func (c *Client) BlobConcludeBatch(ctx context.Context, space did.DID, added []A
 					failed = append(failed, fmt.Errorf("blob %s: %w", digestutil.Format(added[i].Digest), err))
 					continue
 				}
+			} else if !polling {
+				continue
 			} else {
 				location, err = c.awaitAccept(ctx, added[i].AcceptTask)
 				if err != nil {
 					failed = append(failed, fmt.Errorf("blob %s: %w", digestutil.Format(added[i].Digest), err))
-					return out, errors.Join(failed...)
+					polling = false
+					continue
 				}
 			}
 			out[i] = AddedBlob{
@@ -504,7 +511,9 @@ func (c *Client) awaitAccept(ctx context.Context, acceptTask cid.Cid) (ucan.Invo
 // /assert/location commitment it issued, found in the accompanying container
 // by the link the receipt names (AcceptOK.Site is the commitment invocation's
 // own link, not its task link). A container may hold the acceptances of many
-// blobs, so the commitment is matched by link rather than by command.
+// blobs, so the commitment is matched by link rather than by command; the
+// command is then checked, so the location recorded for a blob is never some
+// other invocation the receipt happened to point at.
 func locationFromAccept(accRcpt ucan.Receipt, meta acceptIndex) (ucan.Invocation, error) {
 	o, x := accRcpt.Out().Unpack()
 	if accRcpt.Out().IsErr() {
@@ -518,10 +527,14 @@ func locationFromAccept(accRcpt ucan.Receipt, meta acceptIndex) (ucan.Invocation
 	if err := accOK.UnmarshalCBOR(bytes.NewReader(o)); err != nil {
 		return nil, fmt.Errorf("unmarshaling accept receipt output: %w", err)
 	}
-	if inv, ok := meta.invsByLink[accOK.Site]; ok {
-		return inv, nil
+	inv, ok := meta.invsByLink[accOK.Site]
+	if !ok {
+		return nil, fmt.Errorf("blob accept receipt missing location commitment invocation")
 	}
-	return nil, fmt.Errorf("blob accept receipt missing location commitment invocation")
+	if inv.Command() != assertcmds.Location.Command {
+		return nil, fmt.Errorf("blob accept receipt names a %s invocation as its location commitment, want %s", inv.Command(), assertcmds.Location.Command)
+	}
+	return inv, nil
 }
 
 func putBlob(ctx context.Context, client *http.Client, url *url.URL, headers map[string]string, body io.Reader, size int64) error {

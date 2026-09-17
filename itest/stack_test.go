@@ -143,7 +143,8 @@ func forgeStack(t *testing.T, extra ...stack.Option) (*stack.Stack, string) {
 	// And for the upload service: mounts a locally-built sprue over the
 	// image's /usr/bin/sprue, so an ingot change can be measured against an
 	// unreleased sprue (the batched /ucan/conclude work) with no image build.
-	// Build it static: CGO_ENABLED=0 GOOS=linux GOWORK=off go build ./cmd/main.go
+	// Build it static, from the sprue repo:
+	//   CGO_ENABLED=0 GOOS=linux GOWORK=off go build ./cmd/main.go
 	if bin := os.Getenv("INGOT_ITEST_UPLOAD_BINARY"); bin != "" {
 		t.Logf("using upload-service binary override: %s", bin)
 		opts = append(opts, stack.WithServiceBinary("upload", bin))

@@ -13,6 +13,7 @@ import (
 	blobcmds "github.com/fil-forge/libforge/commands/blob"
 	httpcmds "github.com/fil-forge/libforge/commands/http"
 	ucancmds "github.com/fil-forge/libforge/commands/ucan"
+	receipt_client "github.com/fil-forge/libforge/receipt"
 	"github.com/fil-forge/ucantone/binding"
 	"github.com/fil-forge/ucantone/client"
 	"github.com/fil-forge/ucantone/did"
@@ -83,6 +84,33 @@ type fakeSprue struct {
 	// reject holds the accept tasks the node refuses: each answers with a
 	// failure receipt while the rest of the batch is accepted.
 	reject map[cid.Cid]bool
+	// omit holds the accept tasks whose acceptance is left out of the
+	// response, as an upload service does when the full answer would not
+	// fit in one container; the client is expected to poll for those.
+	omit map[cid.Cid]bool
+	// polls counts the receipt fetches the client made; the fixture's
+	// receipt endpoint answers every one with 503.
+	polls int
+}
+
+// RoundTrip is the fixture's receipt endpoint: an upload service that is not
+// answering receipt fetches, so a poll fails on its first attempt.
+func (f *fakeSprue) RoundTrip(r *http.Request) (*http.Response, error) {
+	f.mu.Lock()
+	f.polls++
+	f.mu.Unlock()
+	return &http.Response{
+		StatusCode: http.StatusServiceUnavailable,
+		Status:     "503 Service Unavailable",
+		Body:       http.NoBody,
+		Request:    r,
+	}, nil
+}
+
+func (f *fakeSprue) pollCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.polls
 }
 
 func (f *fakeSprue) sizes() []int {
@@ -121,6 +149,9 @@ func (f *fakeSprue) conclude(req *binding.Request[*ucancmds.ConcludeArguments], 
 		acceptTask, ok := f.acceptFor[putRcpt.Ran()]
 		if !ok {
 			return res.SetFailure(ucancmds.ErrConclusionReceiptNotFound)
+		}
+		if f.omit[acceptTask] {
+			continue
 		}
 		if f.reject[acceptTask] {
 			accRcpt, err := receipt.IssueErr(f.node, acceptTask, datamodel.Map{
@@ -163,13 +194,16 @@ func concludeFixture(t *testing.T) (*Client, *fakeSprue) {
 	t.Helper()
 	service := randomIssuer(t)
 	node := randomIssuer(t)
-	fake := &fakeSprue{node: node, acceptFor: map[cid.Cid]cid.Cid{}, reject: map[cid.Cid]bool{}}
+	fake := &fakeSprue{node: node, acceptFor: map[cid.Cid]cid.Cid{}, reject: map[cid.Cid]bool{}, omit: map[cid.Cid]bool{}}
 
 	srv := server.NewHTTP(service)
 	srv.Handle(ucancmds.Conclude.Command, ucancmds.Conclude.Handler(fake.conclude))
 
-	c, err := New(randomIssuer(t), service.DID(), *mustURL(t, "http://upload.example"),
-		WithUCANClientOptions(client.WithHTTPClient(&http.Client{Transport: srv})))
+	serviceURL := mustURL(t, "http://upload.example")
+	c, err := New(randomIssuer(t), service.DID(), *serviceURL,
+		WithUCANClientOptions(client.WithHTTPClient(&http.Client{Transport: srv})),
+		WithReceiptsClient(receipt_client.NewClient(serviceURL.JoinPath("/receipt/"),
+			receipt_client.WithHTTPClient(&http.Client{Transport: fake}))))
 	require.NoError(t, err)
 	return c, fake
 }
@@ -325,4 +359,29 @@ func TestBlobConcludeBatchKeepsChunkAroundRefusedAccept(t *testing.T) {
 	require.NotNil(t, out[0].Location)
 	require.Nil(t, out[1].Location, "the refused blob is not located")
 	require.NotNil(t, out[2].Location, "a blob after the refused one is still resolved")
+}
+
+// TestBlobConcludeBatchDrainsChunkPastFailedPoll pins what a chunk yields
+// when the response leaves a blob unanswered and the poll for it fails: the
+// acceptances the response did carry are still read out, so the caller can
+// record them, and no further blob is polled for. Unanswered blobs come back
+// as they went in, ready for the retry.
+func TestBlobConcludeBatchDrainsChunkPastFailedPoll(t *testing.T) {
+	c, fake := concludeFixture(t)
+
+	parked := []AddedBlob{parkBlob(t, fake), parkBlob(t, fake), parkBlob(t, fake)}
+	fake.omit[parked[0].AcceptTask] = true
+	fake.omit[parked[2].AcceptTask] = true
+
+	out, err := c.BlobConcludeBatch(t.Context(), randomDID(t), parked)
+	require.ErrorContains(t, err, digestutil.Format(parked[0].Digest))
+	require.Equal(t, []int{3}, fake.sizes(), "one conclude carried the whole chunk")
+	require.Equal(t, 1, fake.pollCount(), "a failed poll ends the polling; the next unanswered blob is not polled for")
+
+	require.Nil(t, out[0].Location, "the unanswered blob is not located")
+	require.Equal(t, parked[0].PutInvocation, out[0].PutInvocation, "an unanswered blob keeps what a retry needs")
+	require.NotNil(t, out[1].Location, "an acceptance the response carried is read out past the failed poll")
+	require.Nil(t, out[1].PutInvocation, "the spent put invocation must be dropped")
+	require.Nil(t, out[2].Location, "a later unanswered blob is left for the retry")
+	require.Equal(t, parked[2].PutInvocation, out[2].PutInvocation)
 }
