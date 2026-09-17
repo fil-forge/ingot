@@ -445,7 +445,7 @@ sequenceDiagram
     else latch won
         B->>R: LatchSession(open to completing), single winner
         B->>R: manifest spans: per blob, plaintext length derived from<br/>the intent's stored size + FEE geometry (blobPlaintextLen)
-        B->>U: concludeBlobs: one /ucan/conclude for every parked blob,<br/>accept receipts read from the response (poll only as fallback)
+        B->>U: concludeBlobs: every parked blob's put receipt, up to<br/>MaxConcludeBatch (1000) per /ucan/conclude, accept receipts<br/>read from the response (poll only as fallback)
         B->>R: PutLocation + intent accepted + DeletePark per blob
         B->>TX: commitVersion (see the PutObject diagram)
         B->>R: LatchSession(completing to completed), best-effort
