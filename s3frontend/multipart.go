@@ -965,10 +965,12 @@ func (b *Backend) cleanupPartBlobs(ctx context.Context, space did.DID, uploadID 
 			}
 			// An accepted blob's park row is stale — a Complete that recorded
 			// the acceptance and failed before dropping it. Dropped here for
-			// promptness; the release enqueued above drops it too, and that
-			// is the attempt that is retried until it succeeds.
+			// promptness; the release enqueued above drops it too, and is
+			// retried until it succeeds. Like everything else in this arm,
+			// the row is only as recoverable as that enqueue: the session is
+			// already gone, so a blob whose enqueue failed is not revisited.
 			if derr := b.parks.DeletePark(ctx, d); derr != nil {
-				b.logger.Warn("delete stale park row failed; release sweep will retry",
+				b.logger.Warn("delete stale park row failed",
 					zap.String("digest", hex.EncodeToString(d)), zap.Error(derr))
 			}
 		default:
