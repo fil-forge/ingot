@@ -964,10 +964,11 @@ func (b *Backend) cleanupPartBlobs(ctx context.Context, space did.DID, uploadID 
 					zap.String("digest", hex.EncodeToString(d)), zap.Error(err))
 			}
 			// An accepted blob's park row is stale — a Complete that recorded
-			// the acceptance and failed before dropping it — and nothing else
-			// will revisit it.
+			// the acceptance and failed before dropping it. Dropped here for
+			// promptness; the release enqueued above drops it too, and that
+			// is the attempt that is retried until it succeeds.
 			if derr := b.parks.DeletePark(ctx, d); derr != nil {
-				b.logger.Warn("delete stale park row failed",
+				b.logger.Warn("delete stale park row failed; release sweep will retry",
 					zap.String("digest", hex.EncodeToString(d)), zap.Error(derr))
 			}
 		default:
@@ -1008,10 +1009,12 @@ func (b *Backend) parkBlobs(ctx context.Context, space did.DID, blobs []msbucket
 			}
 			// A located blob has no use for a park. One is still here only
 			// when an earlier Complete recorded the location and then failed
-			// before marking the intent or dropping the row; this is where
-			// that row gets its retry.
+			// before dropping the row. The part is durable regardless, so a
+			// failure here is logged rather than failing the write; Complete's
+			// dedup path drops the row otherwise.
 			if err := b.parks.DeletePark(ctx, blob.Digest); err != nil {
-				return fmt.Errorf("drop park (dedup): %w", err)
+				b.logger.Warn("drop stale park row failed; Complete will retry",
+					zap.String("digest", hex.EncodeToString(blob.Digest)), zap.Error(err))
 			}
 			continue
 		} else if err != nil && !errors.Is(err, registry.ErrNotFound) {

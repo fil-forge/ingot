@@ -432,8 +432,9 @@ func (b *Backend) dropClaims(ctx context.Context, bucketState *registry.State, k
 // since enqueue self-heals into a dropped intent), then deletes the blob's
 // encryption-params row (the crypto-shred — without the wrapped CEK the
 // region can no longer decrypt the blob, per the encryption RFC's DELETE
-// semantics), drops the location row, and calls RemoveBlob. The intent is
-// deleted only when all three succeed; failures keep it for the next sweep.
+// semantics), drops the location row and any stale park row, and calls
+// RemoveBlob. The intent is deleted only when every step succeeds; failures
+// keep it for the next sweep.
 // Returns how many releases were executed. Called periodically by the
 // daemon's release sweeper, and directly by tests as the drain.
 func (b *Backend) SweepPendingReleases(ctx context.Context) (int, error) {
@@ -510,6 +511,15 @@ func (b *Backend) executeRelease(ctx context.Context, space did.DID, digest mult
 	}
 	if err := b.locations.DeleteLocation(ctx, space, digest); err != nil {
 		b.logger.Warn("release: delete location failed",
+			zap.String("digest", hex.EncodeToString(digest)), zap.Error(err))
+		ok = false
+	}
+	// A released blob was accepted, so any park row it still has is stale: a
+	// Complete recorded the acceptance and failed before dropping the row,
+	// and the session sweep's own attempt failed too. This is the durable
+	// retry — the release intent stands until the row is gone.
+	if err := b.parks.DeletePark(ctx, digest); err != nil {
+		b.logger.Warn("release: delete stale park row failed",
 			zap.String("digest", hex.EncodeToString(digest)), zap.Error(err))
 		ok = false
 	}
