@@ -472,7 +472,9 @@ func newParkingBackend(t *testing.T) (*Backend, *inmem.MemStore, *parkingUploade
 
 // newDeferredBackend builds an in-process backend around a caller-supplied
 // deferred uploader, so a test can observe how the completion path drives it.
-func newDeferredBackend(t *testing.T, up deferredTestUploader) (*Backend, *inmem.MemStore) {
+// Each mod edits the wiring before the backend is built, so a test can swap
+// one store for a faulty one.
+func newDeferredBackend(t *testing.T, up deferredTestUploader, mods ...func(*Deps)) (*Backend, *inmem.MemStore) {
 	t.Helper()
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -492,7 +494,7 @@ func newDeferredBackend(t *testing.T, up deferredTestUploader) (*Backend, *inmem
 	}
 	t.Cleanup(func() { _ = log.Close(ctx) })
 
-	b := New(Deps{
+	deps := Deps{
 		Authority:       mem,
 		Registry:        mem,
 		Intents:         mem,
@@ -511,7 +513,11 @@ func newDeferredBackend(t *testing.T, up deferredTestUploader) (*Backend, *inmem
 		RegionKeys:      testRegionKeys(t),
 		TenantKeys:      testTenantKeys(),
 		PendingReleases: mem,
-	})
+	}
+	for _, mod := range mods {
+		mod(&deps)
+	}
+	b := New(deps)
 	if err := mem.Create(ctx, "bk", did.Undef, registry.CreateState{}); err != nil {
 		t.Fatalf("create bucket: %v", err)
 	}
@@ -644,5 +650,96 @@ func TestCompleteRecordsAcceptancesWhenConcludeFails(t *testing.T) {
 	}
 	if len(hc.calls) != 2 || len(hc.calls[1]) != 1 || hc.calls[1][0] != string(stillParked) {
 		t.Fatalf("retry conclude calls = %v, want exactly the still-parked blob", hc.calls[1:])
+	}
+}
+
+// failOncePutLocation is a location store whose next PutLocation fails,
+// remembering which blob it refused; every later write goes through.
+type failOncePutLocation struct {
+	registry.LocationStore
+	armed   bool
+	refused multihash.Multihash
+}
+
+func (f *failOncePutLocation) PutLocation(ctx context.Context, loc registry.BlobLocation) error {
+	if f.armed {
+		f.armed = false
+		f.refused = loc.Digest
+		return errors.New("locations table unavailable")
+	}
+	return f.LocationStore.PutLocation(ctx, loc)
+}
+
+// TestCompleteRecordsEveryAcceptanceWhenOneFailsToPersist: the upload
+// service accepts the whole batch, but recording one blob's location fails.
+// Every other accepted blob is still recorded with its park dropped — a
+// persistence failure for one blob must not leave the rest parked, where
+// session expiry would abort them — and the next Complete concludes only the
+// blob whose record did not land.
+func TestCompleteRecordsEveryAcceptanceWhenOneFailsToPersist(t *testing.T) {
+	hc := &haltingConcluder{}
+	locs := &failOncePutLocation{armed: true}
+	b, mem := newDeferredBackend(t, hc, func(d *Deps) {
+		locs.LocationStore = d.Locations
+		d.Locations = locs
+	})
+	ctx := context.Background()
+	key := "persist-fail"
+
+	uploadID := mpCreate(t, b, key, "", "")
+	var parts []types.CompletedPart
+	for n := int32(1); n <= 2; n++ {
+		// Distinct content per part, so each part is its own blob.
+		body := testBody(int(backend.MinPartSize))
+		body[0] = byte(n)
+		out, err := mpUploadPart(t, b, key, uploadID, n, body, nil)
+		if err != nil {
+			t.Fatalf("UploadPart %d: %v", n, err)
+		}
+		num := n
+		parts = append(parts, types.CompletedPart{PartNumber: &num, ETag: out.ETag})
+	}
+
+	if _, err := mpComplete(t, b, key, uploadID, parts, nil); err == nil {
+		t.Fatal("Complete succeeded although one location failed to persist")
+	}
+	if len(hc.calls) != 1 || len(hc.calls[0]) != 2 {
+		t.Fatalf("conclude calls = %v, want one call for two blobs", hc.calls)
+	}
+	if locs.armed || locs.refused == nil {
+		t.Fatal("the location store never refused a write")
+	}
+	var recorded multihash.Multihash
+	for _, d := range hc.calls[0] {
+		if d != string(locs.refused) {
+			recorded = multihash.Multihash(d)
+		}
+	}
+
+	if in, err := mem.GetIntent(ctx, recorded); err != nil || in.State != registry.IntentAccepted {
+		t.Fatalf("recorded blob intent = %v/%v, want accepted", in, err)
+	}
+	if loc, err := mem.GetLocation(ctx, did.Undef, recorded); err != nil || loc == nil {
+		t.Fatalf("recorded blob has no location (err=%v)", err)
+	}
+	if _, err := mem.GetPark(ctx, recorded); !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("park row for the recorded blob survived (err=%v)", err)
+	}
+	if in, err := mem.GetIntent(ctx, locs.refused); err != nil || in.State != registry.IntentParked {
+		t.Fatalf("refused blob intent = %v/%v, want parked", in, err)
+	}
+	if _, err := mem.GetPark(ctx, locs.refused); err != nil {
+		t.Fatalf("park row for the refused blob is gone: %v", err)
+	}
+
+	// The retry has only the refused blob to conclude.
+	if _, err := mpComplete(t, b, key, uploadID, parts, nil); err != nil {
+		t.Fatalf("retry Complete: %v", err)
+	}
+	if len(hc.calls) != 2 || len(hc.calls[1]) != 1 || hc.calls[1][0] != string(locs.refused) {
+		t.Fatalf("retry conclude calls = %v, want exactly the refused blob", hc.calls[1:])
+	}
+	if in, err := mem.GetIntent(ctx, locs.refused); err != nil || in.State != registry.IntentAccepted {
+		t.Fatalf("refused blob intent after retry = %v/%v, want accepted", in, err)
 	}
 }

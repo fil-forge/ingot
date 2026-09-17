@@ -1124,28 +1124,38 @@ func (b *Backend) concludeBlobs(ctx context.Context, space did.DID, blobs []msbu
 			parked[i] = p.parked
 		}
 		locations, err := b.deferred.ConcludeBlobs(ctx, space, parked)
-		// Record every acceptance that came back before acting on the error.
-		// The upload service has run those accepts whether or not the rest of
-		// the batch succeeded, and a park left standing for an accepted blob
-		// is concluded again on the next Complete or aborted on the node when
+		// Record every acceptance that came back before acting on any error:
+		// the conclude's own, or one blob's persistence failing. The upload
+		// service has run those accepts whether or not the rest of the batch
+		// succeeded, and a park left standing for an accepted blob is
+		// concluded again on the next Complete or aborted on the node when
 		// the session expires. Recorded as accepted, an orphan is released
 		// through the sweeper's ordinary path instead.
+		var errs []error
+		if err != nil {
+			errs = append(errs, fmt.Errorf("conclude blobs: %w", err))
+		}
 		recorded := 0
 		for i, p := range toConclude {
 			if i >= len(locations) || locations[i] == nil {
 				continue
 			}
-			if err := b.recordAccepted(ctx, space, p.blob.Digest, *locations[i]); err != nil {
-				return err
-			}
-			// The sealed put invocation is spent — drop it promptly.
-			if err := b.parks.DeletePark(ctx, p.blob.Digest); err != nil {
-				return fmt.Errorf("drop park: %w", err)
+			if rerr := b.recordAccepted(ctx, space, p.blob.Digest, *locations[i]); rerr != nil {
+				// Still parked as far as the tables say; the next Complete
+				// concludes it again.
+				errs = append(errs, rerr)
+				continue
 			}
 			recorded++
+			// The sealed put invocation is spent — drop it promptly. A row
+			// that survives this failure is stale: the blob is located, so
+			// the next Complete takes the dedup path past it.
+			if derr := b.parks.DeletePark(ctx, p.blob.Digest); derr != nil {
+				errs = append(errs, fmt.Errorf("drop park: %w", derr))
+			}
 		}
-		if err != nil {
-			return fmt.Errorf("conclude blobs: %w", err)
+		if len(errs) > 0 {
+			return errors.Join(errs...)
 		}
 		if recorded != len(toConclude) {
 			return fmt.Errorf("conclude blobs: %d of %d blobs returned no location", len(toConclude)-recorded, len(toConclude))
