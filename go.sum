@@ -185,8 +185,8 @@ github.com/fil-forge/hilt v0.0.1-0.20260914101649-9815d932c6ad h1:ZuOKuw0zGb1F8/
 github.com/fil-forge/hilt v0.0.1-0.20260914101649-9815d932c6ad/go.mod h1:D11krICd8qoqODw9iUUMZKJIMFEUntPm4NdD7B0L8FA=
 github.com/fil-forge/indexing-service v1.13.5-0.20260820151722-9eb620409a4e h1:+A26/La8EgF1bsGhSGicYV97ckec1SJwNYLWee3Xo8g=
 github.com/fil-forge/indexing-service v1.13.5-0.20260820151722-9eb620409a4e/go.mod h1:hrry50c9bNciNj9Z63O2QFrzidnTjkYYG2UgH4/rmVo=
-github.com/fil-forge/libforge v0.0.0-20260916152810-e0f9f590d133 h1:GdOqccwGpnVT/hf9rUjrUu/2gZTIPX4Oj0HVdczssxQ=
-github.com/fil-forge/libforge v0.0.0-20260916152810-e0f9f590d133/go.mod h1:09nIz6/BJD0Qdb8YrLwVeNQwQprTCFWVPULL3c5CNJs=
+github.com/fil-forge/libforge v0.0.0-20260917175304-96b4969f0476 h1:cGqoD31GjO/qM5f2fQE29ov9NPYd655KKOM/b8amhag=
+github.com/fil-forge/libforge v0.0.0-20260917175304-96b4969f0476/go.mod h1:09nIz6/BJD0Qdb8YrLwVeNQwQprTCFWVPULL3c5CNJs=
 github.com/fil-forge/smelt v0.0.0-20260915151825-96fc212b8d91 h1:p6NNlrLKGmxwsfNMcnzrm4PR1M598d89TBu39rbxC6Y=
 github.com/fil-forge/smelt v0.0.0-20260915151825-96fc212b8d91/go.mod h1:OUO2GxgUihmYfywNIfvWTQocg6jqaNiTd04cG5BbdII=
 github.com/fil-forge/swarf v0.0.1-0.20260821142121-d5d1a0a56f00 h1:uSJ2YCxOJQA7PDnDiBJAOstoJcw2IPnbpssKYCihsxg=

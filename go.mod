@@ -13,7 +13,7 @@ require (
 	github.com/cloud-portable/s3tests/packages/go v0.0.0-20260916120817-ce77c26e7f6d
 	github.com/fil-forge/hilt v0.0.1-0.20260914101649-9815d932c6ad
 	github.com/fil-forge/indexing-service v1.13.5-0.20260820151722-9eb620409a4e
-	github.com/fil-forge/libforge v0.0.0-20260916152810-e0f9f590d133
+	github.com/fil-forge/libforge v0.0.0-20260917175304-96b4969f0476
 	github.com/fil-forge/smelt v0.0.0-20260915151825-96fc212b8d91
 	github.com/fil-forge/swarf v0.0.1-0.20260821142121-d5d1a0a56f00
 	github.com/fil-forge/ucantone v0.0.0-20260917112151-f239623f942f

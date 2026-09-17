@@ -963,6 +963,13 @@ func (b *Backend) cleanupPartBlobs(ctx context.Context, space did.DID, uploadID 
 				b.logger.Warn("enqueue release for accepted part blob failed",
 					zap.String("digest", hex.EncodeToString(d)), zap.Error(err))
 			}
+			// An accepted blob's park row is stale — a Complete that recorded
+			// the acceptance and failed before dropping it — and nothing else
+			// will revisit it.
+			if derr := b.parks.DeletePark(ctx, d); derr != nil {
+				b.logger.Warn("delete stale park row failed",
+					zap.String("digest", hex.EncodeToString(d)), zap.Error(derr))
+			}
 		default:
 			// Published blobs are the reference index's to manage.
 			continue
@@ -998,6 +1005,13 @@ func (b *Backend) parkBlobs(ctx context.Context, space did.DID, blobs []msbucket
 		if existing, err := b.locations.GetLocation(ctx, space, blob.Digest); err == nil && existing != nil {
 			if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentAccepted); err != nil {
 				return fmt.Errorf("mark accepted (dedup): %w", err)
+			}
+			// A located blob has no use for a park. One is still here only
+			// when an earlier Complete recorded the location and then failed
+			// before marking the intent or dropping the row; this is where
+			// that row gets its retry.
+			if err := b.parks.DeletePark(ctx, blob.Digest); err != nil {
+				return fmt.Errorf("drop park (dedup): %w", err)
 			}
 			continue
 		} else if err != nil && !errors.Is(err, registry.ErrNotFound) {
@@ -1085,6 +1099,13 @@ func (b *Backend) concludeBlobs(ctx context.Context, space did.DID, blobs []msbu
 			if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentAccepted); err != nil {
 				return fmt.Errorf("mark accepted (dedup): %w", err)
 			}
+			// A located blob has no use for a park. One is still here only
+			// when an earlier Complete recorded the location and then failed
+			// before marking the intent or dropping the row; this is where
+			// that row gets its retry.
+			if err := b.parks.DeletePark(ctx, blob.Digest); err != nil {
+				return fmt.Errorf("drop park (dedup): %w", err)
+			}
 			continue
 		} else if err != nil && !errors.Is(err, registry.ErrNotFound) {
 			return fmt.Errorf("lookup location: %w", err)
@@ -1148,8 +1169,8 @@ func (b *Backend) concludeBlobs(ctx context.Context, space did.DID, blobs []msbu
 			}
 			recorded++
 			// The sealed put invocation is spent — drop it promptly. A row
-			// that survives this failure is stale: the blob is located, so
-			// the next Complete takes the dedup path past it.
+			// that survives this failure is dropped by the next Complete's
+			// dedup path or by the sweeper, whichever comes first.
 			if derr := b.parks.DeletePark(ctx, p.blob.Digest); derr != nil {
 				errs = append(errs, fmt.Errorf("drop park: %w", derr))
 			}
