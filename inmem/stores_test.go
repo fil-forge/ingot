@@ -480,3 +480,69 @@ func mustPutPart(t *testing.T, m *MemStore, p registry.MultipartPart) {
 		t.Fatalf("PutPart: %v", err)
 	}
 }
+
+// Live part refs follow the session's state: parts of open and completing
+// sessions count; parts of completed and aborting sessions do not.
+func TestParts_LiveRefsFollowSessionState(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+	shared := multihash.Multihash([]byte("shared"))
+	for _, id := range []string{"a", "b", "c"} {
+		if err := m.CreateSession(ctx, registry.MultipartSession{UploadID: id, Bucket: "b", ObjectKey: id}); err != nil {
+			t.Fatalf("CreateSession %s: %v", id, err)
+		}
+		mustPutPart(t, m, registry.MultipartPart{UploadID: id, PartNumber: 1, ETagMD5: []byte("m"), Size: 1, BlobDigests: []multihash.Multihash{shared}})
+	}
+	if n, _ := m.CountLivePartRefs(ctx, shared); n != 3 {
+		t.Fatalf("live refs with three open sessions = %d, want 3", n)
+	}
+	if won, err := m.LatchSession(ctx, "a", registry.SessionOpen, registry.SessionCompleting); err != nil || !won {
+		t.Fatalf("latch a: won=%v err=%v", won, err)
+	}
+	if n, _ := m.CountLivePartRefs(ctx, shared); n != 3 {
+		t.Fatalf("live refs with one completing = %d, want 3 (completing is in flight)", n)
+	}
+	if won, err := m.LatchSession(ctx, "a", registry.SessionCompleting, registry.SessionCompleted); err != nil || !won {
+		t.Fatalf("latch a completed: won=%v err=%v", won, err)
+	}
+	if won, err := m.LatchSession(ctx, "b", registry.SessionOpen, registry.SessionAborting); err != nil || !won {
+		t.Fatalf("latch b aborting: won=%v err=%v", won, err)
+	}
+	if n, _ := m.CountLivePartRefs(ctx, shared); n != 1 {
+		t.Fatalf("live refs with one completed and one aborting = %d, want 1", n)
+	}
+	if n, _ := m.CountLivePartRefs(ctx, multihash.Multihash([]byte("other"))); n != 0 {
+		t.Fatalf("live refs of an unreferenced digest = %d, want 0", n)
+	}
+}
+
+// Bulk enqueue records each digest once and keeps the upsert's later
+// not_before.
+func TestReleases_BulkEnqueue(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+	space := did.Undef
+	d1, d2 := multihash.Multihash([]byte("d1")), multihash.Multihash([]byte("d2"))
+	later := time.Now().Add(time.Hour)
+	if err := m.EnqueueRelease(ctx, space, d1, later); err != nil {
+		t.Fatalf("EnqueueRelease: %v", err)
+	}
+	if err := m.EnqueuePartReleases(ctx, space, []multihash.Multihash{d1, d2, d2}, time.Now()); err != nil {
+		t.Fatalf("EnqueuePartReleases: %v", err)
+	}
+	all, err := m.ListReleasesBySpace(ctx, space)
+	if err != nil || len(all) != 2 {
+		t.Fatalf("releases = %d/%v, want 2 (d2 recorded once)", len(all), err)
+	}
+	for _, pr := range all {
+		if string(pr.Digest) == "d1" && !pr.NotBefore.Equal(later) {
+			t.Fatalf("d1 not_before = %v, want the later existing value kept", pr.NotBefore)
+		}
+		if !pr.PartBlob {
+			t.Fatalf("%s recorded without PartBlob", pr.Digest)
+		}
+	}
+	if err := m.EnqueuePartReleases(ctx, space, nil, time.Now()); err != nil {
+		t.Fatalf("EnqueuePartReleases of nothing: %v", err)
+	}
+}

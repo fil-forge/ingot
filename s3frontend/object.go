@@ -30,6 +30,7 @@ import (
 	"github.com/fil-forge/ingot/internal/reqscope"
 	"github.com/fil-forge/ingot/mst"
 	"github.com/fil-forge/ingot/registry"
+	"github.com/fil-forge/ingot/uploader"
 )
 
 const defaultMaxKeys = 1000
@@ -427,16 +428,31 @@ func (b *Backend) dropClaims(ctx context.Context, bucketState *registry.State, k
 	return nil
 }
 
-// SweepPendingReleases executes the due deferred releases: for each intent
-// past its not_before, it re-checks the claim count (a digest re-claimed
-// since enqueue self-heals into a dropped intent), then deletes the blob's
-// encryption-params row (the crypto-shred — without the wrapped CEK the
-// region can no longer decrypt the blob, per the encryption RFC's DELETE
-// semantics), drops the location row and any stale park row, and calls
-// RemoveBlob. The intent is deleted only when every step succeeds; failures
-// keep it for the next sweep.
-// Returns how many releases were executed. Called periodically by the
-// daemon's release sweeper, and directly by tests as the drain.
+// releaseOutcome is what one attempt at a deferred release produced, and so
+// what becomes of its record.
+type releaseOutcome int
+
+const (
+	// releaseDone: every step succeeded; the record is deleted.
+	releaseDone releaseOutcome = iota
+	// releaseStale: the blob is claimed again; the record is obsolete and
+	// deleted.
+	releaseStale
+	// releaseDeferred: a part of an in-flight session references the blob,
+	// so a session still means to claim it; the record waits.
+	releaseDeferred
+	// releaseFailed: a step failed; the record waits for the next attempt.
+	releaseFailed
+)
+
+// SweepPendingReleases executes the due deferred releases. Each record is
+// re-checked first: a digest claimed again since enqueue is a stale record
+// and is dropped; one a part of an in-flight session references is deferred,
+// since that session means to claim it. The rest run through executeRelease,
+// and the record is deleted only when every step succeeds; failures keep it
+// for the next sweep. Returns how many releases were executed. Called
+// periodically by the daemon's release sweeper, and directly by tests as the
+// drain.
 func (b *Backend) SweepPendingReleases(ctx context.Context) (int, error) {
 	due, err := b.pendingReleases.ListDueReleases(ctx, time.Now(), 512)
 	if err != nil {
@@ -444,32 +460,95 @@ func (b *Backend) SweepPendingReleases(ctx context.Context) (int, error) {
 	}
 	released := 0
 	for _, pr := range due {
-		n, err := b.blobRefs.CountClaims(ctx, pr.Space, pr.Digest)
-		if err != nil {
-			b.logger.Warn("release sweep: count claims failed; retrying next sweep",
-				zap.String("digest", hex.EncodeToString(pr.Digest)), zap.Error(err))
-			continue
-		}
-		if n > 0 {
-			// Re-claimed since enqueue (e.g. a commit that failed after its
-			// drop ran, then retried) — the intent is stale, not the claim.
-			if err := b.pendingReleases.DeleteRelease(ctx, pr.Space, pr.Digest); err != nil {
-				b.logger.Warn("release sweep: delete stale intent failed",
+		switch b.runRelease(ctx, pr) {
+		case releaseFailed:
+			continue // retry next sweep
+		case releaseDeferred:
+			// Move the record behind everything currently due: the sweep
+			// lists oldest first with a cap, and a record deferred at the
+			// head of the queue would otherwise block the ones behind it.
+			if err := b.pendingReleases.EnqueueRelease(ctx, pr.Space, pr.Digest, time.Now().Add(b.releaseDeferral())); err != nil {
+				b.logger.Warn("release sweep: defer record failed",
 					zap.String("digest", hex.EncodeToString(pr.Digest)), zap.Error(err))
 			}
 			continue
-		}
-		if !b.executeRelease(ctx, pr.Space, pr.Digest) {
-			continue // retry next sweep
-		}
-		if err := b.pendingReleases.DeleteRelease(ctx, pr.Space, pr.Digest); err != nil {
-			b.logger.Warn("release sweep: delete intent failed",
-				zap.String("digest", hex.EncodeToString(pr.Digest)), zap.Error(err))
+		case releaseStale:
+			if err := b.pendingReleases.DeleteRelease(ctx, pr.Space, pr.Digest); err != nil {
+				b.logger.Warn("release sweep: delete stale record failed",
+					zap.String("digest", hex.EncodeToString(pr.Digest)), zap.Error(err))
+			}
 			continue
+		case releaseDone:
+			if err := b.pendingReleases.DeleteRelease(ctx, pr.Space, pr.Digest); err != nil {
+				b.logger.Warn("release sweep: delete record failed",
+					zap.String("digest", hex.EncodeToString(pr.Digest)), zap.Error(err))
+				continue
+			}
+			released++
 		}
-		released++
 	}
 	return released, nil
+}
+
+// releaseDeferral is how far a deferred record is pushed back: the release
+// grace, with a floor so a zero grace still moves it behind the records due
+// now.
+func (b *Backend) releaseDeferral() time.Duration {
+	if b.releaseGrace < time.Second {
+		return time.Second
+	}
+	return b.releaseGrace
+}
+
+// releaseNow executes part blobs' release records at once, for the
+// promptness the S3 verbs owe their callers: an Abort releases parked blobs
+// on their providers before it returns. Best-effort — whatever this pass
+// does not finish, the release sweeper retries from the records, and unwinds
+// them exactly as this pass would.
+func (b *Backend) releaseNow(ctx context.Context, space did.DID, digests []multihash.Multihash) {
+	for _, d := range digests {
+		pr := registry.PendingRelease{Space: space, Digest: d, NotBefore: time.Now(), PartBlob: true}
+		switch b.runRelease(ctx, pr) {
+		case releaseDone, releaseStale:
+			if err := b.pendingReleases.DeleteRelease(ctx, space, d); err != nil {
+				b.logger.Warn("release: delete record failed",
+					zap.String("digest", hex.EncodeToString(d)), zap.Error(err))
+			}
+		}
+	}
+}
+
+// runRelease attempts one release record end to end and reports what to do
+// with the record.
+func (b *Backend) runRelease(ctx context.Context, pr registry.PendingRelease) releaseOutcome {
+	n, err := b.blobRefs.CountClaims(ctx, pr.Space, pr.Digest)
+	if err != nil {
+		b.logger.Warn("release: count claims failed; retrying next sweep",
+			zap.String("digest", hex.EncodeToString(pr.Digest)), zap.Error(err))
+		return releaseFailed
+	}
+	if n > 0 {
+		// Re-claimed since enqueue (e.g. a commit that failed after its
+		// drop ran, then retried) — the record is stale, not the claim.
+		return releaseStale
+	}
+	live, err := b.multipart.CountLivePartRefs(ctx, pr.Digest)
+	if err != nil {
+		b.logger.Warn("release: count live part refs failed; retrying next sweep",
+			zap.String("digest", hex.EncodeToString(pr.Digest)), zap.Error(err))
+		return releaseFailed
+	}
+	if live > 0 {
+		// A session in flight still references the blob (part blobs dedup by
+		// content) and means to claim it. Its Complete turns the reference
+		// into a claim, which makes this record stale; its abort or expiry
+		// records a release of its own. Either way the wait ends.
+		return releaseDeferred
+	}
+	if !b.executeRelease(ctx, pr) {
+		return releaseFailed
+	}
+	return releaseDone
 }
 
 // drainSpaceReleases executes a space's pending releases immediately,
@@ -477,59 +556,114 @@ func (b *Backend) SweepPendingReleases(ctx context.Context) (int, error) {
 // the space, which refuses while blobs remain registered. No reader grace is
 // owed — the bucket is provably empty at that point and its deletion is the
 // operator's explicit intent. The claim recheck still applies (a re-claimed
-// digest drops its stale intent instead).
+// digest drops its stale record instead), and a blob an in-flight session
+// still references is an error: the bucket is not empty after all.
 func (b *Backend) drainSpaceReleases(ctx context.Context, space did.DID) error {
 	pending, err := b.pendingReleases.ListReleasesBySpace(ctx, space)
 	if err != nil {
 		return fmt.Errorf("list space releases: %w", err)
 	}
 	for _, pr := range pending {
-		if n, err := b.blobRefs.CountClaims(ctx, pr.Space, pr.Digest); err != nil || n > 0 {
-			if err == nil {
-				_ = b.pendingReleases.DeleteRelease(ctx, pr.Space, pr.Digest)
-			}
-			continue
-		}
-		if !b.executeRelease(ctx, pr.Space, pr.Digest) {
+		switch b.runRelease(ctx, pr) {
+		case releaseFailed:
 			return fmt.Errorf("release blob %x", pr.Digest)
+		case releaseDeferred:
+			return fmt.Errorf("release blob %x: a multipart session in flight still references it", pr.Digest)
 		}
 		if err := b.pendingReleases.DeleteRelease(ctx, pr.Space, pr.Digest); err != nil {
-			return fmt.Errorf("delete release intent %x: %w", pr.Digest, err)
+			return fmt.Errorf("delete release record %x: %w", pr.Digest, err)
 		}
 	}
 	return nil
 }
 
-// executeRelease performs one blob release, reporting whether every step
-// succeeded (failures are logged and retried by the sweeper).
-func (b *Backend) executeRelease(ctx context.Context, space did.DID, digest multihash.Multihash) bool {
+// executeRelease unwinds one blob for one space, whatever state the blob is
+// in, reporting whether every step succeeded (failures are logged and the
+// record is retried). The state is read from the blob's own rows rather than
+// its upload intent, which can lag them: a location row means accepted; a
+// park row alone means parked; neither means the blob never left this node.
+//
+// The order matters for the retry. The crypto-shred goes first so a blob
+// nothing references becomes unreadable at once. The network step goes
+// next, chosen by state, and a failure there returns before any local row is
+// touched, so the retry reads the same state and takes the same step. Only
+// once the network holds nothing for this space do the location and park
+// rows go, and — for a part blob, which was never committed — the spool copy
+// and upload intent. A committed blob keeps those two: its spool copy is the
+// insurance copy until eviction.
+func (b *Backend) executeRelease(ctx context.Context, pr registry.PendingRelease) bool {
+	space, digest := pr.Space, pr.Digest
+	log := b.logger.With(zap.String("digest", hex.EncodeToString(digest)))
 	ok := true
 	if err := b.encParams.DeleteEncryptionParams(ctx, space, digest); err != nil {
-		b.logger.Warn("crypto-shred: delete encryption params failed",
-			zap.String("digest", hex.EncodeToString(digest)), zap.Error(err))
+		log.Warn("release: crypto-shred (delete encryption params) failed", zap.Error(err))
 		ok = false
 	}
+
+	located := false
+	if loc, err := b.locations.GetLocation(ctx, space, digest); err == nil && loc != nil {
+		located = true
+	} else if err != nil && !errors.Is(err, registry.ErrNotFound) {
+		log.Warn("release: lookup location failed", zap.Error(err))
+		return false
+	}
+	park, err := b.parks.GetPark(ctx, digest)
+	if err != nil && !errors.Is(err, registry.ErrNotFound) {
+		log.Warn("release: lookup park failed", zap.Error(err))
+		return false
+	}
+
+	switch {
+	case located:
+		// Accepted: drop the space's claim on the network.
+		if err := b.remover.RemoveBlob(ctx, space, digest); err != nil {
+			log.Warn("release: network remove failed", zap.Error(err))
+			return false
+		}
+	case park != nil:
+		// Parked: release the allocation on the provider. A refusal because
+		// the space has accepted the blob means a conclude ran and this node
+		// never learned of it (the response was lost, or Complete died
+		// between the accept and recording it); the blob is removed as an
+		// accepted one instead.
+		cause, err := cid.Cast(park.AddTask)
+		if err != nil {
+			log.Warn("release: decode park add task failed", zap.Error(err))
+			return false
+		}
+		aerr := b.deferred.AbortBlob(ctx, space, digest, cause)
+		switch {
+		case aerr == nil:
+		case errors.Is(aerr, uploader.ErrBlobAccepted):
+			if err := b.remover.RemoveBlob(ctx, space, digest); err != nil {
+				log.Warn("release: network remove of an accepted blob failed", zap.Error(err))
+				return false
+			}
+		default:
+			log.Warn("release: abort parked blob failed", zap.Error(aerr))
+			return false
+		}
+	default:
+		// Never left this node: nothing on the network to release.
+	}
+
 	if err := b.locations.DeleteLocation(ctx, space, digest); err != nil {
-		b.logger.Warn("release: delete location failed",
-			zap.String("digest", hex.EncodeToString(digest)), zap.Error(err))
+		log.Warn("release: delete location failed", zap.Error(err))
 		ok = false
 	}
-	// A released blob was accepted, so any park row it still has is stale: a
-	// Complete recorded the acceptance and failed before dropping the row,
-	// and the session sweep's own attempt failed too. This is the durable
-	// retry — the release intent stands until the row is gone. The row is
-	// the space's only one for the digest, like the location and the network
-	// copy released alongside it: every blob is encrypted under its own
-	// random key, so no other upload produces this digest.
 	if err := b.parks.DeletePark(ctx, digest); err != nil {
-		b.logger.Warn("release: delete stale park row failed",
-			zap.String("digest", hex.EncodeToString(digest)), zap.Error(err))
+		log.Warn("release: delete park failed", zap.Error(err))
 		ok = false
 	}
-	if err := b.remover.RemoveBlob(ctx, space, digest); err != nil {
-		b.logger.Warn("release: network remove failed",
-			zap.String("digest", hex.EncodeToString(digest)), zap.Error(err))
-		ok = false
+	if pr.PartBlob {
+		if err := b.spool.Remove(digest); err != nil {
+			log.Warn("release: remove spooled part blob failed", zap.Error(err))
+			ok = false
+		}
+		if err := b.intents.DeleteIntent(ctx, digest); err != nil {
+			log.Warn("release: delete upload intent failed", zap.Error(err))
+			ok = false
+		}
 	}
 	return ok
 }

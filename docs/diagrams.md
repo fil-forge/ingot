@@ -452,14 +452,15 @@ sequenceDiagram
         B-->>C: 200, ETag = md5-of-part-md5s + "-N"
     end
     C->>B: AbortMultipartUpload
-    B->>R: LatchSession(open to aborting), then DeleteSession (parts cascade)
-    B->>U: cleanupPartBlobs: /blob/abort parked blobs (cause = AddTask),<br/>crypto-shred each blob's blob_encryption_params row
+    B->>R: LatchSession(open to aborting); EnqueueReleases for every<br/>unreferenced part blob; then DeleteSession (parts cascade)
+    B->>U: releaseNow, per record: crypto-shred, then /blob/abort a parked blob<br/>(cause = AddTask) or /blob/remove an accepted one; local rows dropped<br/>once the network step succeeds; the release sweeper retries the rest
     Note over B,R: a background sweeper aborts open sessions older than<br/>MultipartSessionTTL (default 7d) and reaps terminal rows
 ```
 
 - A part re-upload and an abort reclaim only blobs no other session, part, or
-  committed object references (`cleanupPartBlobs` checks `CountPartRefs` and
-  `CountClaims`).
+  committed object references (`enqueuePartReleases` checks `CountPartRefs`
+  and `CountClaims`), and a release record waits while a part of an
+  in-flight session references its digest (`CountLivePartRefs`).
 - A never-parked blob at Complete falls back to a full synchronous
   `UploadBlob`.
 
@@ -467,7 +468,8 @@ Cross-references: [`architecture.md` §7.2](./architecture.md#72-multipart),
 [§7.3](./architecture.md#73-the-session-latch-the-abortcomplete-race).
 
 Sources: `s3frontend/multipart.go` (all verbs, ingestPart, parkBlobs,
-concludeBlobs, cleanupPartBlobs, SweepStaleMultipartSessions),
+concludeBlobs, enqueuePartReleases, SweepStaleMultipartSessions),
+`s3frontend/object.go` (runRelease, executeRelease),
 `s3frontend/uploadpartcopy.go`, `registry/stores.go`,
 `server.go` (startMultipartSweeper). Review when these change.
 
@@ -484,7 +486,7 @@ stateDiagram-v2
     completing --> open : pre-commit failure (deferred revert)
     completing --> completed : commit ok (best-effort stamp)
     open --> aborting : Abort, DeleteBucket implicit abort, or sweeper
-    aborting --> [*] : DeleteSession (parts cascade)
+    aborting --> [*] : EnqueueReleases, then DeleteSession (parts cascade)
     completed --> [*] : sweeper past TTL
 ```
 
@@ -521,8 +523,8 @@ flowchart TB
     spooled -->|"single-shot upload:<br/>/blob/add, PUT, conclude, accept"| accepted
     spooled -->|"parkBlobs: /blob/add WithConclude(false),<br/>PUT; blob_parks row written"| parked
     parked -->|"concludeBlobs at Complete:<br/>/ucan/conclude; blob_parks row deleted"| accepted
-    spooled -->|"cleanupPartBlobs:<br/>DeleteIntent + spool.Remove"| gone([deleted])
-    parked -->|"cleanupPartBlobs: /blob/abort (cause AddTask),<br/>DeleteIntent + spool.Remove"| gone
+    spooled -->|"part release record; executeRelease:<br/>DeleteIntent + spool.Remove"| gone([deleted])
+    parked -->|"part release record; executeRelease: /blob/abort (cause AddTask),<br/>or /blob/remove if the provider says accepted;<br/>DeleteIntent + spool.Remove"| gone
 
     accepted -->|"commit: reconcileClaims adds this version"| refs["blob_refs rows<br/>(digest, bucket, key, version_id)"]
     refs -->|"version delete or overwrite removes its row"| zero{"CountClaims == 0<br/>for (space, digest)?"}
@@ -543,7 +545,8 @@ Cross-references: [`architecture.md` §5](./architecture.md#5-the-data-layer),
 
 Sources: `registry/stores.go` (state consts), `s3frontend/object.go`
 (ingestBody, reconcileClaims, releaseBlobs), `s3frontend/multipart.go`
-(parkBlobs, concludeBlobs, cleanupPartBlobs), `uploader/blob.go` (UploadBlob,
+(parkBlobs, concludeBlobs, enqueuePartReleases), `s3frontend/object.go`
+(runRelease, executeRelease), `uploader/blob.go` (UploadBlob,
 AbortBlob, RemoveBlob). Review when these change.
 
 ## Per-key version storage: manifest arm, leaf arm, prev tree

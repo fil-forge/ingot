@@ -71,7 +71,7 @@ func (m *MemStore) DropClaimEnqueueRelease(_ context.Context, digest multihash.M
 	if m.countClaimsLocked(space, digest) != 0 {
 		return false, nil
 	}
-	m.enqueueReleaseLocked(space, digest, notBefore)
+	m.enqueueReleaseLocked(space, digest, notBefore, false)
 	return true, nil
 }
 
@@ -80,18 +80,30 @@ func (m *MemStore) DropClaimEnqueueRelease(_ context.Context, digest multihash.M
 func (m *MemStore) EnqueueRelease(_ context.Context, space did.DID, digest multihash.Multihash, notBefore time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.enqueueReleaseLocked(space, digest, notBefore)
+	m.enqueueReleaseLocked(space, digest, notBefore, false)
 	return nil
 }
 
-func (m *MemStore) enqueueReleaseLocked(space did.DID, digest multihash.Multihash, notBefore time.Time) {
+func (m *MemStore) enqueueReleaseLocked(space did.DID, digest multihash.Multihash, notBefore time.Time, partBlob bool) {
 	k := locKey{space, string(digest)}
-	if prior, ok := m.releases[k]; ok && prior.NotBefore.After(notBefore) {
-		notBefore = prior.NotBefore // upsert keeps the later not_before
+	if prior, ok := m.releases[k]; ok {
+		if prior.NotBefore.After(notBefore) {
+			notBefore = prior.NotBefore // upsert keeps the later not_before
+		}
+		partBlob = partBlob || prior.PartBlob
 	}
 	m.releases[k] = registry.PendingRelease{
-		Space: space, Digest: multihash.Multihash(bytes.Clone(digest)), NotBefore: notBefore,
+		Space: space, Digest: multihash.Multihash(bytes.Clone(digest)), NotBefore: notBefore, PartBlob: partBlob,
 	}
+}
+
+func (m *MemStore) EnqueuePartReleases(_ context.Context, space did.DID, digests []multihash.Multihash, notBefore time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, d := range digests {
+		m.enqueueReleaseLocked(space, d, notBefore, true)
+	}
+	return nil
 }
 
 func (m *MemStore) ListDueReleases(_ context.Context, now time.Time, limit int) ([]registry.PendingRelease, error) {
@@ -461,6 +473,27 @@ func (m *MemStore) ListStaleSessions(_ context.Context, state string, cutoff tim
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
 	return out, nil
+}
+
+func (m *MemStore) CountLivePartRefs(_ context.Context, digest multihash.Multihash) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for uploadID, byNum := range m.parts {
+		s, ok := m.sessions[uploadID]
+		if !ok || (s.State != registry.SessionOpen && s.State != registry.SessionCompleting) {
+			continue
+		}
+		for _, p := range byNum {
+			for _, d := range p.BlobDigests {
+				if bytes.Equal(d, digest) {
+					n++
+					break
+				}
+			}
+		}
+	}
+	return n, nil
 }
 
 func (m *MemStore) CountPartRefs(_ context.Context, digest multihash.Multihash, excludeUploadID string) (int, error) {

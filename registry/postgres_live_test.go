@@ -203,6 +203,31 @@ func TestPostgresStores_Live(t *testing.T) {
 		if err := r.DeleteRelease(ctx, space, digest); err != nil {
 			t.Fatalf("DeleteRelease: %v", err)
 		}
+
+		// Bulk enqueue: one statement, repeated digests recorded once, and
+		// the upsert keeps an existing later not_before.
+		d2 := multihash.Multihash([]byte{0xbb, 0x02})
+		if err := r.EnqueueRelease(ctx, space, digest, time.Now().Add(time.Hour)); err != nil {
+			t.Fatalf("EnqueueRelease (future): %v", err)
+		}
+		if err := r.EnqueuePartReleases(ctx, space, []multihash.Multihash{digest, d2, d2}, time.Now().Add(-time.Second)); err != nil {
+			t.Fatalf("EnqueuePartReleases: %v", err)
+		}
+		all, err := r.ListReleasesBySpace(ctx, space)
+		if err != nil || len(all) != 2 {
+			t.Fatalf("ListReleasesBySpace = %d, err %v (want 2)", len(all), err)
+		}
+		for _, pr := range all {
+			if string(pr.Digest) == string(digest) && pr.NotBefore.Before(time.Now().Add(30*time.Minute)) {
+				t.Fatalf("bulk enqueue moved an existing record's not_before earlier: %v", pr.NotBefore)
+			}
+			if !pr.PartBlob {
+				t.Fatalf("part release %x recorded without part_blob", pr.Digest)
+			}
+		}
+		for _, pr := range all {
+			_ = r.DeleteRelease(ctx, space, pr.Digest)
+		}
 	})
 
 	t.Run("intent lifecycle", func(t *testing.T) {
@@ -506,9 +531,25 @@ func TestPostgresStores_Live(t *testing.T) {
 			t.Fatalf("CountPartRefs(unique, exclude owner) = %d, err %v (want 0)", n, err)
 		}
 
+		// CountLivePartRefs: parts of open sessions count.
+		if n, err := r.CountLivePartRefs(ctx, shared); err != nil || n != 2 {
+			t.Fatalf("CountLivePartRefs(shared) = %d, err %v (want 2)", n, err)
+		}
+
 		// 'completed' passes the widened state CHECK constraint.
 		if won, err := r.LatchSession(ctx, "ls-1", registry.SessionOpen, registry.SessionCompleted); err != nil || !won {
 			t.Fatalf("latch to completed won=%v err=%v", won, err)
+		}
+		// A completed session's parts are no longer live; an aborting one's
+		// are not either.
+		if n, err := r.CountLivePartRefs(ctx, shared); err != nil || n != 1 {
+			t.Fatalf("CountLivePartRefs(shared) after ls-1 completed = %d, err %v (want 1)", n, err)
+		}
+		if won, err := r.LatchSession(ctx, "ls-2", registry.SessionOpen, registry.SessionAborting); err != nil || !won {
+			t.Fatalf("latch ls-2 to aborting won=%v err=%v", won, err)
+		}
+		if n, err := r.CountLivePartRefs(ctx, shared); err != nil || n != 0 {
+			t.Fatalf("CountLivePartRefs(shared) after ls-2 aborting = %d, err %v (want 0)", n, err)
 		}
 
 		for _, id := range []string{"ls-1", "ls-2", "ls-3"} {

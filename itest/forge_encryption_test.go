@@ -338,7 +338,7 @@ func TestForgeEncryption(t *testing.T) {
 	})
 
 	// AbortShredsKeyRows: aborting an upload shreds the orphaned parts' key
-	// rows — cleanupPartBlobs deletes each part blob's enc-params row,
+	// rows — the part blobs' releases delete each blob's enc-params row,
 	// upload intent, and park row (the spool and piri unwind are pinned by
 	// MultipartAbortCleansSpool and TestForgeDeferredMultipart/AbortRejects).
 	// Expiry-sweep shred is TestForgeMultipartExpiryShred (needs a low-TTL
@@ -382,8 +382,8 @@ func TestForgeEncryption(t *testing.T) {
 	})
 
 	// SupersededPartShredsKeyRow: re-uploading a part number shreds the
-	// superseded part's key row synchronously (cleanupPartBlobs runs inline
-	// at UploadPart), and Complete serves the winner.
+	// superseded part's key row synchronously (the superseded blobs' releases
+	// run inline at UploadPart), and Complete serves the winner.
 	t.Run("SupersededPartShredsKeyRow", func(t *testing.T) {
 		const bucket, key = "mp-shred-supersede", "obj"
 		if _, err := cl.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {

@@ -142,10 +142,28 @@ Step 4's polling remains the fallback for a blob the response did not
 cover. A completion that fails partway still records the blobs the upload
 service accepted before the failure and drops their parks, so the next
 Complete concludes only what is still parked and session expiry never
-aborts a blob that was accepted. When ingot never learned of an acceptance
-at all (the conclude response was lost, or Complete died before recording
-it), the provider refuses the expiry abort as already accepted, and the
-blob is released through the deferred release path instead.
+aborts a blob that was accepted.
+
+Every session teardown (abort, expiry, the completed-session reap, a
+superseded part, the parts a Complete omitted) records a deferred release
+for each blob nothing else references *before* it deletes the session row.
+The part rows are the only index to the blobs and cascade away with the
+session, so the record is what makes the teardown recoverable: a failure
+before it leaves the session for the sweeper, a failure after it leaves
+records the release sweeper retries. The release runs from the record and
+reads the blob's state from its rows rather than its intent. A location row
+means accepted and the space's claim is removed; a park row alone means
+parked and the allocation is aborted, or removed instead when the provider
+refuses the abort because the blob was accepted after all (a conclude ran
+and ingot never learned of it); neither means the blob never left this node.
+The crypto-shred goes first, the network step next, and the location and
+park rows only once the network holds nothing, so a retry sees the same
+state. A part blob's record is marked as such, and its release also removes
+the spool copy and upload intent; a committed blob's release leaves them,
+since its spool copy is the insurance copy until eviction. A record
+whose digest a part of an in-flight session still references waits: that
+session's Complete turns the reference into a claim, which makes the record
+stale, and its abort records a release of its own.
 
 ## Read path
 

@@ -227,6 +227,10 @@ type PendingRelease struct {
 	Space     did.DID
 	Digest    multihash.Multihash
 	NotBefore time.Time
+	// PartBlob marks a multipart part blob that was never committed: its spool
+	// copy and upload intent go with the release. A committed blob keeps them
+	// (the spool copy is the insurance copy until eviction).
+	PartBlob bool
 }
 
 // PendingReleaseStore is the deferred-release queue (blob_release_intents):
@@ -234,7 +238,15 @@ type PendingRelease struct {
 // (crypto-shred + location delete + network remove). Enqueue upserts,
 // keeping the later not_before.
 type PendingReleaseStore interface {
+	// EnqueueRelease records that (space, digest) is to be released once
+	// notBefore has passed. Upsert: an existing record keeps the later of the
+	// two not_before values.
 	EnqueueRelease(ctx context.Context, space did.DID, digest multihash.Multihash, notBefore time.Time) error
+	// EnqueuePartReleases records the release of many part blobs in one
+	// statement, for a session teardown with a blob per part; each record
+	// carries PartBlob. Repeated digests are recorded once, and the upsert
+	// keeps the later not_before like EnqueueRelease.
+	EnqueuePartReleases(ctx context.Context, space did.DID, digests []multihash.Multihash, notBefore time.Time) error
 	// ListDueReleases returns intents with not_before <= now, oldest first,
 	// at most limit.
 	ListDueReleases(ctx context.Context, now time.Time, limit int) ([]PendingRelease, error)
@@ -359,6 +371,13 @@ type MultipartStore interface {
 	// digest — the shared-blob guard for abort/supersede spool cleanup
 	// (content-addressed part blobs may be deduped across sessions).
 	CountPartRefs(ctx context.Context, digest multihash.Multihash, excludeUploadID string) (int, error)
+	// CountLivePartRefs returns how many parts of in-flight sessions (open or
+	// completing) reference digest: the guard a deferred release checks
+	// before taking a blob a session still means to claim. Parts of completed
+	// and aborting sessions do not count — a completed session's winners hold
+	// claims and its orphans have releases of their own, and an aborting
+	// session is recording releases for its parts.
+	CountLivePartRefs(ctx context.Context, digest multihash.Multihash) (int, error)
 }
 
 // GCStore records superseded MST node CIDs (§4). Write-only this iteration.
