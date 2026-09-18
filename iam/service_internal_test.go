@@ -572,6 +572,7 @@ func TestMapAuthError(t *testing.T) {
 		hiltauth.SignatureExpiredErrorName:      {"AccessDenied", 403},
 		hiltauth.UnsupportedOperationErrorName:  {"NotImplemented", 501},
 		hiltauth.UnknownBucketErrorName:         {"NoSuchBucket", 404},
+		hiltauth.BucketRegionMismatchErrorName:  {"AuthorizationHeaderMalformed", 400},
 		hiltauth.TenantDisabledErrorName:        {"AccessDenied", 403},
 		hiltauth.IssuerForbiddenErrorName:       {"AccessDenied", 403},
 		hiltauth.RegionNotServedErrorName:       {"AccessDenied", 403},
@@ -590,6 +591,23 @@ func TestMapAuthError(t *testing.T) {
 			require.Equal(t, want.status, s3e.StatusCode())
 		})
 	}
+
+	t.Run("BucketRegionMismatch names the region serving the bucket", func(t *testing.T) {
+		// hilt's typed failure carries both regions; the S3 answer is the one
+		// AWS gives for a request signed for the wrong region, with the expected
+		// region in the body so SDKs can redirect.
+		mismatch := &hiltauth.BucketRegionMismatchError{Expected: "eu-west-1", Actual: "us-west-2"}
+		err := fmt.Errorf("hilt/iam: authorize request: %w",
+			fmt.Errorf("executing /s3/request/authorize: %w", mismatch))
+		got, ok := mapAuthError(err)
+		require.True(t, ok)
+		var malformed s3err.MalformedAuthError
+		require.ErrorAs(t, got, &malformed)
+		require.Equal(t, "AuthorizationHeaderMalformed", malformed.Code)
+		require.Equal(t, http.StatusBadRequest, malformed.HTTPStatusCode)
+		require.Equal(t, "eu-west-1", malformed.Region)
+		require.Contains(t, malformed.Description, `"us-west-2" is wrong`)
+	})
 }
 
 // refusingAuthorizer fails every call: the fast-path tests use it to prove

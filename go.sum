@@ -181,8 +181,8 @@ github.com/fil-forge/automobile v0.0.1 h1:9xB3yc4l5b9EdRJSJcNwudgBFNHoMPEAdcb7Gf
 github.com/fil-forge/automobile v0.0.1/go.mod h1:TsO7jlO8ykJZY5tF8j4GsUcu3F02lEzxO7ULoB61hRA=
 github.com/fil-forge/go-ipni-tools v0.0.0-20260820150418-78ca0c16834d h1:iEXJC5aJgRHq2iM4X6usfow436OQGauLjDuga1Hiq4o=
 github.com/fil-forge/go-ipni-tools v0.0.0-20260820150418-78ca0c16834d/go.mod h1:fwLjqz34DvfoWcuzyH8Wr7dTJdr3mzYjxZRweysHOH4=
-github.com/fil-forge/hilt v0.0.1-0.20260914101649-9815d932c6ad h1:ZuOKuw0zGb1F8/HkBB9Xc8uwx3n33xSa1ap2BPQuwhw=
-github.com/fil-forge/hilt v0.0.1-0.20260914101649-9815d932c6ad/go.mod h1:D11krICd8qoqODw9iUUMZKJIMFEUntPm4NdD7B0L8FA=
+github.com/fil-forge/hilt v0.0.1-0.20260918123725-96071375aa33 h1:LCuIkZ4LM3GqUuP0PHlHGxdi20gaKpjK0sw3FN/PZPM=
+github.com/fil-forge/hilt v0.0.1-0.20260918123725-96071375aa33/go.mod h1:D11krICd8qoqODw9iUUMZKJIMFEUntPm4NdD7B0L8FA=
 github.com/fil-forge/indexing-service v1.13.5-0.20260820151722-9eb620409a4e h1:+A26/La8EgF1bsGhSGicYV97ckec1SJwNYLWee3Xo8g=
 github.com/fil-forge/indexing-service v1.13.5-0.20260820151722-9eb620409a4e/go.mod h1:hrry50c9bNciNj9Z63O2QFrzidnTjkYYG2UgH4/rmVo=
 github.com/fil-forge/libforge v0.0.0-20260917175304-96b4969f0476 h1:cGqoD31GjO/qM5f2fQE29ov9NPYd655KKOM/b8amhag=

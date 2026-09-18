@@ -45,6 +45,7 @@ package iam
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"slices"
 	"strings"
 
@@ -309,6 +310,22 @@ func mapAuthError(err error) (error, bool) {
 		return s3err.GetAPIError(s3err.ErrNotImplemented), true
 	case hiltauth.UnknownBucketErrorName:
 		return s3err.GetAPIError(s3err.ErrNoSuchBucket), true
+	case hiltauth.BucketRegionMismatchErrorName:
+		// The bucket is the caller's but is served by another region's gateway.
+		// S3 answers a request signed for the wrong region with
+		// AuthorizationHeaderMalformed naming the expected region, which the AWS
+		// SDKs follow to the right endpoint. hilt's failure carries both regions.
+		var mismatch *hiltauth.BucketRegionMismatchError
+		if ucanerrors.As(err, &mismatch) {
+			return s3err.MalformedAuth.IncorrectRegion(mismatch.Expected, mismatch.Actual), true
+		}
+		// The failure arrived without its regions (decoded by a reader that knows
+		// only the standard error model): still a wrong-region answer, unnamed.
+		return s3err.APIError{
+			Code:           "AuthorizationHeaderMalformed",
+			Description:    "The authorization header is malformed; the bucket is served by another region.",
+			HTTPStatusCode: http.StatusBadRequest,
+		}, true
 	case hiltauth.TenantDisabledErrorName,
 		hiltauth.IssuerForbiddenErrorName,
 		hiltauth.RegionNotServedErrorName,
