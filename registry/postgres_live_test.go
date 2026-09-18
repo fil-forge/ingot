@@ -476,6 +476,35 @@ func TestPostgresStores_Live(t *testing.T) {
 		}
 	})
 
+	t.Run("complete session marks winning parts", func(t *testing.T) {
+		const id = "upl-win"
+		if err := r.CreateSession(ctx, registry.MultipartSession{UploadID: id, Bucket: "b", ObjectKey: "k"}); err != nil {
+			t.Fatalf("CreateSession: %v", err)
+		}
+		for n := 1; n <= 2; n++ {
+			if err := r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: n, ETagMD5: []byte{byte(n)}, Size: 1, BlobDigests: []multihash.Multihash{{0xaa, byte(n)}}}); err != nil {
+				t.Fatalf("PutPart %d: %v", n, err)
+			}
+		}
+		if won, err := r.CompleteSession(ctx, id, "etag", "", []int{1}); err != nil || won {
+			t.Fatalf("CompleteSession from open: won=%v err=%v, want not won", won, err)
+		}
+		if won, err := r.LatchSession(ctx, id, registry.SessionOpen, registry.SessionCompleting); err != nil || !won {
+			t.Fatalf("latch: won=%v err=%v", won, err)
+		}
+		if won, err := r.CompleteSession(ctx, id, "etag", "", []int{1}); err != nil || !won {
+			t.Fatalf("CompleteSession: won=%v err=%v", won, err)
+		}
+		parts, err := r.ListParts(ctx, id)
+		if err != nil || len(parts) != 2 || parts[0].State != registry.PartAccepted || parts[1].State != registry.PartParked {
+			t.Fatalf("parts after complete = %+v, err %v (want part 1 accepted, part 2 parked)", parts, err)
+		}
+		if s, err := r.GetSession(ctx, id); err != nil || s.State != registry.SessionCompleted || s.CommittedETag != "etag" {
+			t.Fatalf("session after complete = %+v, err %v", s, err)
+		}
+		_ = r.DeleteSession(ctx, id)
+	})
+
 	t.Run("multipart listing sweeper and part refs", func(t *testing.T) {
 		mk := func(id, key string) {
 			t.Helper()

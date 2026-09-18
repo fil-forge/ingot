@@ -546,3 +546,38 @@ func TestReleases_BulkEnqueue(t *testing.T) {
 		t.Fatalf("EnqueuePartReleases of nothing: %v", err)
 	}
 }
+
+// CompleteSession marks the winning parts accepted with the latch, and only
+// when the latch is won.
+func TestMultipartComplete_MarksWinners(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+	const id = "upl-win"
+	if err := m.CreateSession(ctx, registry.MultipartSession{UploadID: id, Bucket: "b", ObjectKey: "k"}); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	mustPutPart(t, m, registry.MultipartPart{UploadID: id, PartNumber: 1, ETagMD5: []byte("m1"), Size: 1, BlobDigests: []multihash.Multihash{[]byte("d1")}})
+	mustPutPart(t, m, registry.MultipartPart{UploadID: id, PartNumber: 2, ETagMD5: []byte("m2"), Size: 2, BlobDigests: []multihash.Multihash{[]byte("d2")}})
+
+	// Not completing yet: no latch, no marks.
+	if won, err := m.CompleteSession(ctx, id, "etag", "", []int{1}); err != nil || won {
+		t.Fatalf("CompleteSession from open: won=%v err=%v, want not won", won, err)
+	}
+	if parts, _ := m.ListParts(ctx, id); parts[0].State == registry.PartAccepted {
+		t.Fatal("a lost latch marked a part accepted")
+	}
+
+	if won, err := m.LatchSession(ctx, id, registry.SessionOpen, registry.SessionCompleting); err != nil || !won {
+		t.Fatalf("latch: won=%v err=%v", won, err)
+	}
+	if won, err := m.CompleteSession(ctx, id, "etag", "v1", []int{1}); err != nil || !won {
+		t.Fatalf("CompleteSession: won=%v err=%v", won, err)
+	}
+	parts, _ := m.ListParts(ctx, id)
+	if parts[0].State != registry.PartAccepted || parts[1].State != registry.PartParked {
+		t.Fatalf("part states = %q/%q, want accepted/parked", parts[0].State, parts[1].State)
+	}
+	if s, _ := m.GetSession(ctx, id); s.State != registry.SessionCompleted || s.CommittedETag != "etag" {
+		t.Fatalf("session = %+v, want completed with the etag", s)
+	}
+}

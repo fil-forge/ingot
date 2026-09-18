@@ -457,10 +457,13 @@ sequenceDiagram
     Note over B,R: a background sweeper aborts open sessions older than<br/>MultipartSessionTTL (default 7d) and reaps terminal rows
 ```
 
-- A part re-upload and an abort reclaim only blobs no other session, part, or
-  committed object references (`enqueuePartReleases` checks `CountPartRefs`
-  and `CountClaims`), and a release record waits while a part of an
-  in-flight session references its digest (`CountLivePartRefs`).
+- A part re-upload and an abort record a release for every blob of theirs
+  that is not still live in the session; the release itself decides whether
+  the blob is free to go — a claimed digest drops the record (`CountClaims`),
+  and one a part of an in-flight session references waits
+  (`CountLivePartRefs`). `CompleteSession` marks the winning parts, so the
+  reap of a retained completed session releases only what the Complete
+  omitted.
 - A never-parked blob at Complete falls back to a full synchronous
   `UploadBlob`.
 
@@ -857,7 +860,13 @@ erDiagram
         bytea etag_md5
         bytea blob_digests "ordered array"
         text checksum
-        text state "'accepted' never written"
+        text state "parked; accepted = a completed session's winner"
+    }
+    blob_release_intents {
+        text space PK
+        bytea digest PK
+        timestamptz not_before "enqueue + release grace"
+        boolean part_blob "never committed: spool copy + intent go too"
     }
     gc_candidates {
         bytea cid PK "superseded MST node"
@@ -870,6 +879,7 @@ erDiagram
     buckets ||..o{ blob_refs : "by bucket name, no FK"
     blob_locations ||..o{ shard_inclusions : "by shard_digest"
     multipart_parts ||..o{ blob_parks : "digests in blob_digests"
+    multipart_parts ||..o{ blob_release_intents : "part_blob records, by digest"
 ```
 
 - The two solid relationships are the schema's only real foreign keys;
@@ -877,8 +887,8 @@ erDiagram
 - `gc_candidates` is write-only (no reader exists yet; its entry paths are the
   [catalog GC candidates](#catalog-gc-candidates-what-gets-remembered-for-removal)
   diagram); `segments.plane`
-  still CHECK-allows the deleted `data` arm; `upload_intents.published` and
-  `multipart_parts.accepted` are CHECK arms no code writes.
+  still CHECK-allows the deleted `data` arm; `upload_intents.published` is a
+  CHECK arm no code writes.
 - Session rows also carry the passthrough HTTP headers and checksum columns
   Complete writes into the manifest; intent and location rows carry
   timestamps. See the DDL for the full column lists.

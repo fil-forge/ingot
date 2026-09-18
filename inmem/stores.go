@@ -374,7 +374,7 @@ func (m *MemStore) LatchSession(_ context.Context, uploadID, from, to string) (b
 	return true, nil
 }
 
-func (m *MemStore) CompleteSession(_ context.Context, uploadID, etag, versionID string) (bool, error) {
+func (m *MemStore) CompleteSession(_ context.Context, uploadID, etag, versionID string, winners []int) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	s, ok := m.sessions[uploadID]
@@ -385,6 +385,12 @@ func (m *MemStore) CompleteSession(_ context.Context, uploadID, etag, versionID 
 	s.CommittedETag = etag
 	s.CommittedVersionID = versionID
 	m.sessions[uploadID] = s
+	for _, n := range winners {
+		if p, ok := m.parts[uploadID][n]; ok {
+			p.State = registry.PartAccepted
+			m.parts[uploadID][n] = p
+		}
+	}
 	return true, nil
 }
 

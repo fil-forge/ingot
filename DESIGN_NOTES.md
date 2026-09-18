@@ -146,7 +146,14 @@ aborts a blob that was accepted.
 
 Every session teardown (abort, expiry, the completed-session reap, a
 superseded part, the parts a Complete omitted) records a deferred release
-for each blob nothing else references *before* it deletes the session row.
+for each blob of the session that is not still live in it *before* it
+deletes the session row. Whether the blob is in fact free to go is decided
+when the release runs, never at teardown: a digest claimed by a committed
+object drops its record, and one a part of an in-flight session still
+references waits. Deciding at teardown would race another teardown sharing
+the blob. Complete marks its winning parts as it completes the session, so
+the reap of a retained completed row releases only what the Complete
+omitted.
 The part rows are the only index to the blobs and cascade away with the
 session, so the record is what makes the teardown recoverable: a failure
 before it leaves the session for the sweeper, a failure after it leaves

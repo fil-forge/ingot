@@ -352,10 +352,12 @@ type MultipartStore interface {
 	// caller performed the transition (the session was still in `from`).
 	LatchSession(ctx context.Context, uploadID, from, to string) (bool, error)
 	// CompleteSession is the completing→completed latch that also records the
-	// winner's result (etag; versionID, empty for unversioned buckets) in the
-	// same statement, so a completed row always carries what to replay.
-	// Returns true iff this caller performed the transition.
-	CompleteSession(ctx context.Context, uploadID, etag, versionID string) (bool, error)
+	// winner's result (etag; versionID, empty for unversioned buckets) and
+	// marks the winning parts PartAccepted, atomically, so a completed row
+	// always carries what to replay and a reap of the retained row can tell
+	// the winners from the parts the Complete omitted. Returns true iff this
+	// caller performed the transition.
+	CompleteSession(ctx context.Context, uploadID, etag, versionID string, winners []int) (bool, error)
 	DeleteSession(ctx context.Context, uploadID string) error
 	PutPart(ctx context.Context, p MultipartPart) error
 	ListParts(ctx context.Context, uploadID string) ([]MultipartPart, error)

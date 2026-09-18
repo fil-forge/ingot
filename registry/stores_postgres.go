@@ -586,8 +586,14 @@ func (r *Postgres) LatchSession(ctx context.Context, uploadID, from, to string) 
 	return tag.RowsAffected() == 1, nil
 }
 
-func (r *Postgres) CompleteSession(ctx context.Context, uploadID, etag, versionID string) (bool, error) {
-	tag, err := r.pool.Exec(ctx,
+func (r *Postgres) CompleteSession(ctx context.Context, uploadID, etag, versionID string, winners []int) (bool, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return false, fmt.Errorf("registry: begin complete session: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	tag, err := tx.Exec(ctx,
 		`UPDATE ingot.multipart_sessions
 		 SET state = $2, committed_etag = $3, committed_version_id = $4
 		 WHERE upload_id = $1 AND state = $5`,
@@ -595,7 +601,23 @@ func (r *Postgres) CompleteSession(ctx context.Context, uploadID, etag, versionI
 	if err != nil {
 		return false, fmt.Errorf("registry: complete session: %w", err)
 	}
-	return tag.RowsAffected() == 1, nil
+	if tag.RowsAffected() != 1 {
+		return false, nil
+	}
+	nums := make([]int32, len(winners))
+	for i, n := range winners {
+		nums[i] = int32(n)
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE ingot.multipart_parts SET state = $3
+		 WHERE upload_id = $1 AND part_number = ANY($2::int[])`,
+		uploadID, nums, PartAccepted); err != nil {
+		return false, fmt.Errorf("registry: mark winning parts: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, fmt.Errorf("registry: commit complete session: %w", err)
+	}
+	return true, nil
 }
 
 func (r *Postgres) DeleteSession(ctx context.Context, uploadID string) error {
