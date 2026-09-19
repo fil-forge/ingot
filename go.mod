@@ -11,7 +11,7 @@ require (
 	github.com/aws/smithy-go v1.28.1
 	github.com/cenkalti/backoff/v5 v5.0.3
 	github.com/cloud-portable/s3tests/packages/go v0.0.0-20260916120817-ce77c26e7f6d
-	github.com/fil-forge/hilt v0.0.1-0.20260914101649-9815d932c6ad
+	github.com/fil-forge/hilt v0.0.1-0.20260918123725-96071375aa33
 	github.com/fil-forge/indexing-service v1.13.5-0.20260820151722-9eb620409a4e
 	github.com/fil-forge/libforge v0.0.0-20260917175304-96b4969f0476
 	github.com/fil-forge/smelt v0.0.0-20260915151825-96fc212b8d91
