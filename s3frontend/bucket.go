@@ -366,23 +366,39 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 
 		// In-flight multipart uploads do not block deletion (the upstream
 		// conformance contract's teardown deletes buckets without aborting
-		// them): abort any open sessions, releasing their parked part blobs
-		// from the space, before asking hilt to delete the space — which
-		// refuses while the space still holds blob registrations.
+		// them): tear down every session of the bucket — open ones aborted,
+		// stranded and completed ones reaped — recording their part blobs'
+		// releases before asking hilt to delete the space, which refuses
+		// while the space still holds blob registrations. A session whose
+		// releases cannot be recorded fails the delete: its part rows are
+		// the only index to its blobs, and with the bucket row gone the
+		// sweeper would have no space to record them against.
 		sessions, err := b.multipart.ListSessions(ctx, name)
 		if err != nil {
 			return fmt.Errorf("s3frontend: delete bucket: list mp sessions: %w", err)
 		}
-		aborted := 0
 		for _, s := range sessions {
-			if s.State == registry.SessionOpen {
-				b.abortOpenSession(ctx, st.Space, s)
-				aborted++
+			var ok bool
+			switch s.State {
+			case registry.SessionOpen:
+				ok = b.abortOpenSession(ctx, st.Space, s)
+			case registry.SessionCompleted:
+				ok = b.reapCompletedSession(ctx, s)
+			case registry.SessionCompleting:
+				// A crash-stranded Complete; a live one holds the bucket
+				// lock this runs under. Latch it away like the sweeper does.
+				won, err := b.multipart.LatchSession(ctx, s.UploadID, registry.SessionCompleting, registry.SessionAborting)
+				ok = err == nil && won && b.reapAbortingSession(ctx, s)
+			default:
+				ok = b.reapAbortingSession(ctx, s)
+			}
+			if !ok {
+				return fmt.Errorf("s3frontend: delete bucket: multipart session %s: releases not recorded; retry", s.UploadID)
 			}
 		}
-		if aborted > 0 {
-			b.logger.Info("delete bucket: aborted in-flight multipart sessions",
-				zap.String("bucket", name), zap.Int("aborted", aborted), zap.Int("total", len(sessions)))
+		if len(sessions) > 0 {
+			b.logger.Info("delete bucket: tore down multipart sessions",
+				zap.String("bucket", name), zap.Int("sessions", len(sessions)))
 		}
 
 		// Shipped catalog segments registered blobs in the bucket's space

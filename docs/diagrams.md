@@ -452,14 +452,18 @@ sequenceDiagram
         B-->>C: 200, ETag = md5-of-part-md5s + "-N"
     end
     C->>B: AbortMultipartUpload
-    B->>R: LatchSession(open to aborting), then DeleteSession (parts cascade)
-    B->>U: cleanupPartBlobs: /blob/abort parked blobs (cause = AddTask),<br/>crypto-shred each blob's blob_encryption_params row
+    B->>R: LatchSession(open to aborting); EnqueueReleases for every<br/>unreferenced part blob; then DeleteSession (parts cascade)
+    B->>U: releaseNow, per record: crypto-shred, then /blob/abort a parked blob<br/>(cause = AddTask) or /blob/remove an accepted one; local rows dropped<br/>once the network step succeeds; the release sweeper retries the rest
     Note over B,R: a background sweeper aborts open sessions older than<br/>MultipartSessionTTL (default 7d) and reaps terminal rows
 ```
 
-- A part re-upload and an abort reclaim only blobs no other session, part, or
-  committed object references (`cleanupPartBlobs` checks `CountPartRefs` and
-  `CountClaims`).
+- A part re-upload and an abort record a release for every blob of theirs
+  that is not still live in the session; the release itself decides whether
+  the blob is free to go — a claimed digest drops the record (`CountClaims`),
+  and one a part of an in-flight session references waits
+  (`CountLivePartRefs`). `CompleteSession` marks the winning parts, so the
+  reap of a retained completed session releases only what the Complete
+  omitted.
 - A never-parked blob at Complete falls back to a full synchronous
   `UploadBlob`.
 
@@ -467,7 +471,8 @@ Cross-references: [`architecture.md` §7.2](./architecture.md#72-multipart),
 [§7.3](./architecture.md#73-the-session-latch-the-abortcomplete-race).
 
 Sources: `s3frontend/multipart.go` (all verbs, ingestPart, parkBlobs,
-concludeBlobs, cleanupPartBlobs, SweepStaleMultipartSessions),
+concludeBlobs, enqueuePartReleases, SweepStaleMultipartSessions),
+`s3frontend/object.go` (runRelease, executeRelease),
 `s3frontend/uploadpartcopy.go`, `registry/stores.go`,
 `server.go` (startMultipartSweeper). Review when these change.
 
@@ -484,7 +489,7 @@ stateDiagram-v2
     completing --> open : pre-commit failure (deferred revert)
     completing --> completed : commit ok (best-effort stamp)
     open --> aborting : Abort, DeleteBucket implicit abort, or sweeper
-    aborting --> [*] : DeleteSession (parts cascade)
+    aborting --> [*] : EnqueueReleases, then DeleteSession (parts cascade)
     completed --> [*] : sweeper past TTL
 ```
 
@@ -521,8 +526,8 @@ flowchart TB
     spooled -->|"single-shot upload:<br/>/blob/add, PUT, conclude, accept"| accepted
     spooled -->|"parkBlobs: /blob/add WithConclude(false),<br/>PUT; blob_parks row written"| parked
     parked -->|"concludeBlobs at Complete:<br/>/ucan/conclude; blob_parks row deleted"| accepted
-    spooled -->|"cleanupPartBlobs:<br/>DeleteIntent + spool.Remove"| gone([deleted])
-    parked -->|"cleanupPartBlobs: /blob/abort (cause AddTask),<br/>DeleteIntent + spool.Remove"| gone
+    spooled -->|"part release record; executeRelease:<br/>DeleteIntent + spool.Remove"| gone([deleted])
+    parked -->|"part release record; executeRelease: /blob/abort (cause AddTask),<br/>or /blob/remove if the provider says accepted;<br/>DeleteIntent + spool.Remove"| gone
 
     accepted -->|"commit: reconcileClaims adds this version"| refs["blob_refs rows<br/>(digest, bucket, key, version_id)"]
     refs -->|"version delete or overwrite removes its row"| zero{"CountClaims == 0<br/>for (space, digest)?"}
@@ -543,7 +548,8 @@ Cross-references: [`architecture.md` §5](./architecture.md#5-the-data-layer),
 
 Sources: `registry/stores.go` (state consts), `s3frontend/object.go`
 (ingestBody, reconcileClaims, releaseBlobs), `s3frontend/multipart.go`
-(parkBlobs, concludeBlobs, cleanupPartBlobs), `uploader/blob.go` (UploadBlob,
+(parkBlobs, concludeBlobs, enqueuePartReleases), `s3frontend/object.go`
+(runRelease, executeRelease), `uploader/blob.go` (UploadBlob,
 AbortBlob, RemoveBlob). Review when these change.
 
 ## Per-key version storage: manifest arm, leaf arm, prev tree
@@ -854,7 +860,13 @@ erDiagram
         bytea etag_md5
         bytea blob_digests "ordered array"
         text checksum
-        text state "'accepted' never written"
+        text state "parked; accepted = a completed session's winner"
+    }
+    blob_release_intents {
+        text space PK
+        bytea digest PK
+        timestamptz not_before "enqueue + release grace"
+        boolean part_blob "never committed: spool copy + intent go too"
     }
     gc_candidates {
         bytea cid PK "superseded MST node"
@@ -867,6 +879,7 @@ erDiagram
     buckets ||..o{ blob_refs : "by bucket name, no FK"
     blob_locations ||..o{ shard_inclusions : "by shard_digest"
     multipart_parts ||..o{ blob_parks : "digests in blob_digests"
+    multipart_parts ||..o{ blob_release_intents : "part_blob records, by digest"
 ```
 
 - The two solid relationships are the schema's only real foreign keys;
@@ -874,8 +887,8 @@ erDiagram
 - `gc_candidates` is write-only (no reader exists yet; its entry paths are the
   [catalog GC candidates](#catalog-gc-candidates-what-gets-remembered-for-removal)
   diagram); `segments.plane`
-  still CHECK-allows the deleted `data` arm; `upload_intents.published` and
-  `multipart_parts.accepted` are CHECK arms no code writes.
+  still CHECK-allows the deleted `data` arm; `upload_intents.published` is a
+  CHECK arm no code writes.
 - Session rows also carry the passthrough HTTP headers and checksum columns
   Complete writes into the manifest; intent and location rows carry
   timestamps. See the DDL for the full column lists.
