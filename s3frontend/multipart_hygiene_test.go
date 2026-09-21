@@ -440,6 +440,9 @@ type parkingUploader struct {
 	mu                 sync.Mutex
 	aborted            []string
 	acceptedOnProvider map[string]bool
+	// abortFails makes the next abortFails aborts fail outright, as an
+	// unreachable upload service does; they are not recorded as aborted.
+	abortFails int
 }
 
 func (p *parkingUploader) UploadBlob(_ context.Context, _ did.DID, digest multihash.Multihash, size int64, _ string, _ ...uploader.UploadOption) (uploader.UploadedBlob, error) {
@@ -450,6 +453,10 @@ func (p *parkingUploader) UploadBlob(_ context.Context, _ did.DID, digest multih
 func (p *parkingUploader) AbortBlob(_ context.Context, _ did.DID, d multihash.Multihash, _ cid.Cid) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.abortFails > 0 {
+		p.abortFails--
+		return errors.New("upload service unreachable")
+	}
 	p.aborted = append(p.aborted, string(d))
 	if p.acceptedOnProvider[string(d)] {
 		return uploader.ErrBlobAccepted
@@ -1331,9 +1338,10 @@ func TestReleaseDefersWhileAnInFlightPartReferencesTheBlob(t *testing.T) {
 }
 
 // TestCompletedSessionReapReleasesOrphansWhoseRecordingFailed: Complete's
-// own release of an omitted part is best-effort; the completed-session reap
-// records the same releases from the retained part rows before dropping
-// them, so the orphan is released late rather than never.
+// own release of an omitted part is best-effort — here both recording the
+// release and the inline attempt fail. The completed-session reap derives
+// the orphan again from the retained part rows, records it, and releases it,
+// so the orphan is released late rather than never.
 func TestCompletedSessionReapReleasesOrphansWhoseRecordingFailed(t *testing.T) {
 	pu := &parkingUploader{}
 	rel := &failEnqueuePartReleases{}
@@ -1349,19 +1357,24 @@ func TestCompletedSessionReapReleasesOrphansWhoseRecordingFailed(t *testing.T) {
 	part1 := hygienePartDigests(t, mem, uploadID, 1)
 	orphans := hygienePartDigests(t, mem, uploadID, 2)
 
-	// Complete with part 1 only; the orphan pass cannot record.
+	// Complete with part 1 only; the orphan pass can neither record the
+	// release nor abort the blob on the provider.
 	rel.fails = 1
+	pu.abortFails = 1
 	if _, err := mpComplete(t, b, key, uploadID, parts[:1], nil); err != nil {
 		t.Fatalf("Complete: %v", err)
 	}
-	if rel.fails > 0 {
-		t.Fatal("the release store never refused a write")
+	if rel.fails > 0 || pu.abortFails > 0 {
+		t.Fatalf("the failures were not exercised: record fails left=%d, abort fails left=%d", rel.fails, pu.abortFails)
 	}
 	drainReleases(t, b)
 	for _, d := range orphans {
-		if _, err := mem.GetEncryptionParams(ctx, did.Undef, d); err != nil {
-			t.Fatalf("orphan %x was released although its record failed: %v", d, err)
+		if _, err := mem.GetPark(ctx, d); err != nil {
+			t.Fatalf("orphan %x lost its park with no record and no release: %v", d, err)
 		}
+	}
+	if pending, _ := mem.ListReleasesBySpace(ctx, did.Undef); len(pending) != 0 {
+		t.Fatalf("a release record exists although recording failed: %v", pending)
 	}
 
 	if n, err := b.SweepStaleMultipartSessions(ctx, -time.Second); err != nil || n == 0 {

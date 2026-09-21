@@ -779,9 +779,12 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 	// Release parts uploaded but omitted from the winning list: no claim was
 	// ever added for them. The winners are the live set; the retained part
 	// rows would otherwise mark every digest, orphans included, as live.
-	// Best-effort post-commit for promptness: the completed-session reap
-	// records the same releases again before it drops the row, so a failure
-	// here delays the release rather than losing it.
+	// Best-effort post-commit, since the object is durable and the response
+	// must say so: the completed-session reap derives the same orphans from
+	// the marked winners and records them before it drops the row, so a
+	// failure here delays a release rather than losing it. The inline pass
+	// runs even when recording failed — the executor is idempotent, and a
+	// release that lands now spares the orphan the wait for the reap.
 	winners := make(map[string]bool, len(blobs))
 	for _, ref := range blobs {
 		winners[string(ref.Digest)] = true
@@ -795,12 +798,13 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 		}
 	}
 	if len(orphans) > 0 {
-		if released, err := b.enqueuePartReleases(ctx, bucketState.Space, orphans, winners); err != nil {
+		released, err := b.enqueuePartReleases(ctx, bucketState.Space, orphans, winners)
+		if err != nil {
 			b.logger.Warn("record orphan part releases failed; the completed-session reap records them",
 				zap.String("uploadID", uploadID), zap.Error(err))
-		} else {
-			b.releaseNow(ctx, bucketState.Space, released)
+			released = orphans
 		}
+		b.releaseNow(ctx, bucketState.Space, released)
 	}
 
 	// The x-amz-version-id of the new version. Only an enabled bucket echoes it;
