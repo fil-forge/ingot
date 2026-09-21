@@ -516,8 +516,8 @@ func TestParts_LiveRefsFollowSessionState(t *testing.T) {
 	}
 }
 
-// Bulk enqueue records each digest once and keeps the upsert's later
-// not_before.
+// Bulk enqueue records each digest once, keeps the upsert's later not_before,
+// and returns the records as they stand.
 func TestReleases_BulkEnqueue(t *testing.T) {
 	ctx := context.Background()
 	m := NewMemStore()
@@ -527,57 +527,47 @@ func TestReleases_BulkEnqueue(t *testing.T) {
 	if err := m.EnqueueRelease(ctx, space, d1, later); err != nil {
 		t.Fatalf("EnqueueRelease: %v", err)
 	}
-	if err := m.EnqueuePartReleases(ctx, space, []multihash.Multihash{d1, d2, d2}, time.Now()); err != nil {
-		t.Fatalf("EnqueuePartReleases: %v", err)
+	recs, err := m.EnqueueReleases(ctx, space, []multihash.Multihash{d1, d2, d2}, time.Now())
+	if err != nil || len(recs) != 2 {
+		t.Fatalf("EnqueueReleases = %d records, err %v (want 2: d2 recorded once)", len(recs), err)
 	}
-	all, err := m.ListReleasesBySpace(ctx, space)
-	if err != nil || len(all) != 2 {
-		t.Fatalf("releases = %d/%v, want 2 (d2 recorded once)", len(all), err)
-	}
-	for _, pr := range all {
+	for _, pr := range recs {
 		if string(pr.Digest) == "d1" && !pr.NotBefore.Equal(later) {
-			t.Fatalf("d1 not_before = %v, want the later existing value kept", pr.NotBefore)
-		}
-		if !pr.PartBlob {
-			t.Fatalf("%s recorded without PartBlob", pr.Digest)
+			t.Fatalf("d1 not_before = %v, want the later existing value kept and returned", pr.NotBefore)
 		}
 	}
-	if err := m.EnqueuePartReleases(ctx, space, nil, time.Now()); err != nil {
-		t.Fatalf("EnqueuePartReleases of nothing: %v", err)
+	if all, _ := m.ListReleasesBySpace(ctx, space); len(all) != 2 {
+		t.Fatalf("releases = %d, want 2", len(all))
+	}
+	if recs, err := m.EnqueueReleases(ctx, space, nil, time.Now()); err != nil || len(recs) != 0 {
+		t.Fatalf("EnqueueReleases of nothing = %v, %v", recs, err)
 	}
 }
 
-// CompleteSession marks the winning parts accepted with the latch, and only
-// when the latch is won.
-func TestMultipartComplete_MarksWinners(t *testing.T) {
+// A claim publishes the digest's upload intent, and the state outlives the
+// claim: it is the durable mark of a committed blob.
+func TestBlobRefs_ClaimPublishesIntent(t *testing.T) {
 	ctx := context.Background()
 	m := NewMemStore()
-	const id = "upl-win"
-	if err := m.CreateSession(ctx, registry.MultipartSession{UploadID: id, Bucket: "b", ObjectKey: "k"}); err != nil {
-		t.Fatalf("CreateSession: %v", err)
+	d := multihash.Multihash([]byte("committed"))
+	if err := m.PutIntent(ctx, registry.UploadIntent{Digest: d, LocalPath: "/spool/c", Size: 1, State: registry.IntentAccepted, Bucket: "b"}); err != nil {
+		t.Fatalf("PutIntent: %v", err)
 	}
-	mustPutPart(t, m, registry.MultipartPart{UploadID: id, PartNumber: 1, ETagMD5: []byte("m1"), Size: 1, BlobDigests: []multihash.Multihash{[]byte("d1")}})
-	mustPutPart(t, m, registry.MultipartPart{UploadID: id, PartNumber: 2, ETagMD5: []byte("m2"), Size: 2, BlobDigests: []multihash.Multihash{[]byte("d2")}})
-
-	// Not completing yet: no latch, no marks.
-	if won, err := m.CompleteSession(ctx, id, "etag", "", []int{1}); err != nil || won {
-		t.Fatalf("CompleteSession from open: won=%v err=%v, want not won", won, err)
+	claim := registry.BlobClaim{Digest: d, Bucket: "b", ObjectKey: "k", VersionID: registry.NullVersionID, Space: did.Undef}
+	if err := m.AddBlobClaim(ctx, claim); err != nil {
+		t.Fatalf("AddBlobClaim: %v", err)
 	}
-	if parts, _ := m.ListParts(ctx, id); parts[0].State == registry.PartAccepted {
-		t.Fatal("a lost latch marked a part accepted")
+	if in, _ := m.GetIntent(ctx, d); in.State != registry.IntentPublished {
+		t.Fatalf("intent after claim = %q, want published", in.State)
 	}
-
-	if won, err := m.LatchSession(ctx, id, registry.SessionOpen, registry.SessionCompleting); err != nil || !won {
-		t.Fatalf("latch: won=%v err=%v", won, err)
+	if err := m.DeleteBlobClaim(ctx, d, "b", "k", registry.NullVersionID); err != nil {
+		t.Fatalf("DeleteBlobClaim: %v", err)
 	}
-	if won, err := m.CompleteSession(ctx, id, "etag", "v1", []int{1}); err != nil || !won {
-		t.Fatalf("CompleteSession: won=%v err=%v", won, err)
+	if in, _ := m.GetIntent(ctx, d); in.State != registry.IntentPublished {
+		t.Fatalf("intent after the claim dropped = %q, want still published", in.State)
 	}
-	parts, _ := m.ListParts(ctx, id)
-	if parts[0].State != registry.PartAccepted || parts[1].State != registry.PartParked {
-		t.Fatalf("part states = %q/%q, want accepted/parked", parts[0].State, parts[1].State)
-	}
-	if s, _ := m.GetSession(ctx, id); s.State != registry.SessionCompleted || s.CommittedETag != "etag" {
-		t.Fatalf("session = %+v, want completed with the etag", s)
+	// No intent row: nothing to publish, no error.
+	if err := m.AddBlobClaim(ctx, registry.BlobClaim{Digest: multihash.Multihash([]byte("segment")), Bucket: "b", ObjectKey: "s", VersionID: registry.NullVersionID}); err != nil {
+		t.Fatalf("AddBlobClaim without intent: %v", err)
 	}
 }

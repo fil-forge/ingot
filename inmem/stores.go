@@ -37,6 +37,11 @@ func (m *MemStore) AddBlobClaim(_ context.Context, c registry.BlobClaim) error {
 	cp := c
 	cp.Digest = bytes.Clone(c.Digest)
 	m.blobRefs[k] = cp
+	// Committed blobs' intents are published, atomically with the claim.
+	if in, ok := m.intents[string(c.Digest)]; ok {
+		in.State = registry.IntentPublished
+		m.intents[string(c.Digest)] = in
+	}
 	return nil
 }
 
@@ -71,7 +76,7 @@ func (m *MemStore) DropClaimEnqueueRelease(_ context.Context, digest multihash.M
 	if m.countClaimsLocked(space, digest) != 0 {
 		return false, nil
 	}
-	m.enqueueReleaseLocked(space, digest, notBefore, false)
+	m.enqueueReleaseLocked(space, digest, notBefore)
 	return true, nil
 }
 
@@ -80,30 +85,35 @@ func (m *MemStore) DropClaimEnqueueRelease(_ context.Context, digest multihash.M
 func (m *MemStore) EnqueueRelease(_ context.Context, space did.DID, digest multihash.Multihash, notBefore time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.enqueueReleaseLocked(space, digest, notBefore, false)
+	m.enqueueReleaseLocked(space, digest, notBefore)
 	return nil
 }
 
-func (m *MemStore) enqueueReleaseLocked(space did.DID, digest multihash.Multihash, notBefore time.Time, partBlob bool) {
+func (m *MemStore) enqueueReleaseLocked(space did.DID, digest multihash.Multihash, notBefore time.Time) registry.PendingRelease {
 	k := locKey{space, string(digest)}
-	if prior, ok := m.releases[k]; ok {
-		if prior.NotBefore.After(notBefore) {
-			notBefore = prior.NotBefore // upsert keeps the later not_before
-		}
-		partBlob = partBlob || prior.PartBlob
+	if prior, ok := m.releases[k]; ok && prior.NotBefore.After(notBefore) {
+		notBefore = prior.NotBefore // upsert keeps the later not_before
 	}
-	m.releases[k] = registry.PendingRelease{
-		Space: space, Digest: multihash.Multihash(bytes.Clone(digest)), NotBefore: notBefore, PartBlob: partBlob,
+	pr := registry.PendingRelease{
+		Space: space, Digest: multihash.Multihash(bytes.Clone(digest)), NotBefore: notBefore,
 	}
+	m.releases[k] = pr
+	return pr
 }
 
-func (m *MemStore) EnqueuePartReleases(_ context.Context, space did.DID, digests []multihash.Multihash, notBefore time.Time) error {
+func (m *MemStore) EnqueueReleases(_ context.Context, space did.DID, digests []multihash.Multihash, notBefore time.Time) ([]registry.PendingRelease, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	seen := map[string]bool{}
+	var out []registry.PendingRelease
 	for _, d := range digests {
-		m.enqueueReleaseLocked(space, d, notBefore, true)
+		if seen[string(d)] {
+			continue
+		}
+		seen[string(d)] = true
+		out = append(out, m.enqueueReleaseLocked(space, d, notBefore))
 	}
-	return nil
+	return out, nil
 }
 
 func (m *MemStore) ListDueReleases(_ context.Context, now time.Time, limit int) ([]registry.PendingRelease, error) {
@@ -374,7 +384,7 @@ func (m *MemStore) LatchSession(_ context.Context, uploadID, from, to string) (b
 	return true, nil
 }
 
-func (m *MemStore) CompleteSession(_ context.Context, uploadID, etag, versionID string, winners []int) (bool, error) {
+func (m *MemStore) CompleteSession(_ context.Context, uploadID, etag, versionID string) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	s, ok := m.sessions[uploadID]
@@ -385,12 +395,6 @@ func (m *MemStore) CompleteSession(_ context.Context, uploadID, etag, versionID 
 	s.CommittedETag = etag
 	s.CommittedVersionID = versionID
 	m.sessions[uploadID] = s
-	for _, n := range winners {
-		if p, ok := m.parts[uploadID][n]; ok {
-			p.State = registry.PartAccepted
-			m.parts[uploadID][n] = p
-		}
-	}
 	return true, nil
 }
 

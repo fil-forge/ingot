@@ -304,7 +304,7 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 	// request that dies in between leaves records that resolve with the
 	// session (a claim at Complete makes them stale, an abort re-records
 	// them).
-	var superseding []mh.Multihash
+	var superseding []registry.PendingRelease
 	if len(superseded) > 0 {
 		superseding, err = b.enqueuePartReleases(ctx, space, superseded, siblings)
 		if err != nil {
@@ -337,7 +337,7 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 	if err := b.parkBlobs(ctx, space, rec.Blobs); err != nil {
 		return nil, fmt.Errorf("s3frontend: park part blobs: %w", err)
 	}
-	b.releaseNow(ctx, space, superseding)
+	b.releaseNow(ctx, superseding)
 	out := &ingestedPart{etag: `"` + hex.EncodeToString(rec.MD5) + `"`, size: rec.Size}
 	switch {
 	case sessAlgo != "":
@@ -766,12 +766,9 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 	// latch-losing Complete replays this result; the sweeper reaps it later.
 	// Best-effort: a failed latch leaves the row in 'completing', which the
 	// sweeper reaps through its abort path after the TTL — harmless here, as
-	// the winners hold reference claims by now, so that cleanup skips them.
-	winnerNums := make([]int, len(requested))
-	for i, p := range requested {
-		winnerNums[i] = p.PartNumber
-	}
-	if _, err := b.multipart.CompleteSession(ctx, uploadID, etag, node.VersionID, winnerNums); err != nil {
+	// the winners' intents are published by their claims, so that reap
+	// leaves them to the object path whatever has become of the object.
+	if _, err := b.multipart.CompleteSession(ctx, uploadID, etag, node.VersionID); err != nil {
 		b.logger.Warn("latch session to completed failed; sweeper reaps the completing row after the TTL",
 			zap.String("uploadID", uploadID), zap.Error(err))
 	}
@@ -802,9 +799,13 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 		if err != nil {
 			b.logger.Warn("record orphan part releases failed; the completed-session reap records them",
 				zap.String("uploadID", uploadID), zap.Error(err))
-			released = orphans
+			// Run them unrecorded: an orphan was never committed, so no
+			// earlier record with a grace to honour can exist for it.
+			for _, d := range orphans {
+				released = append(released, registry.PendingRelease{Space: bucketState.Space, Digest: d, NotBefore: time.Now()})
+			}
 		}
-		b.releaseNow(ctx, bucketState.Space, released)
+		b.releaseNow(ctx, released)
 	}
 
 	// The x-amz-version-id of the new version. Only an enabled bucket echoes it;
@@ -866,24 +867,18 @@ func (b *Backend) AbortMultipartUpload(ctx context.Context, input *s3.AbortMulti
 	if err := b.multipart.DeleteSession(ctx, uploadID); err != nil {
 		return fmt.Errorf("s3frontend: delete session: %w", err)
 	}
-	b.releaseNow(ctx, space, released)
+	b.releaseNow(ctx, released)
 	return nil
 }
 
 // abortOpenSession force-aborts an open multipart session exactly like a
 // client Abort: latch (losing gracefully to a concurrent Complete/Abort),
 // record its parts' releases, drop the session, release. Used by
-// DeleteBucket's implicit abort of in-flight uploads. Reports whether the
+// DeleteBucket's implicit abort of in-flight uploads, which passes a context
+// without the request's proof store (see DeleteBucket). Reports whether the
 // session's releases are recorded and its row gone; false leaves the row for
 // the sweeper, and DeleteBucket must not proceed past it.
 func (b *Backend) abortOpenSession(ctx context.Context, space did.DID, sess registry.MultipartSession) bool {
-	// s3:DeleteBucket delegates no blob commands (hilt's s3perm maps it to
-	// nil), so the surrounding request's proofs cannot authorize
-	// /blob/abort; mask them so the uploader falls back to the blob
-	// authority captured at UploadPart — the same resolution the
-	// session-expiry sweeper uses. blob.Abort rides the write set as of
-	// fil-forge/hilt#36.
-	ctx = reqscope.WithoutProofStore(ctx)
 	won, err := b.multipart.LatchSession(ctx, sess.UploadID, registry.SessionOpen, registry.SessionAborting)
 	if err != nil || !won {
 		return false
@@ -900,46 +895,58 @@ func (b *Backend) abortOpenSession(ctx context.Context, space did.DID, sess regi
 	if err := b.multipart.DeleteSession(ctx, sess.UploadID); err != nil {
 		return false
 	}
-	b.releaseNow(ctx, space, released)
+	b.releaseNow(ctx, released)
 	return true
 }
 
 // recordSessionReleases records a release for every blob of uploadID's parts
-// other than the winners of a completed session, which CompleteSession marked
-// PartAccepted. It is the durable step of a session teardown: the part rows
-// are the only index to the blobs and cascade away with the session, so the
-// caller runs this before DeleteSession and only deletes the session once it
-// has succeeded. Returns the digests recorded, for releaseNow.
-func (b *Backend) recordSessionReleases(ctx context.Context, space did.DID, uploadID string) ([]mh.Multihash, error) {
+// that was never committed. A committed blob's upload intent is published —
+// written with its first reference claim — so a completed session's winners,
+// even after their object is deleted, are recognised and left to the object
+// path's own releases. It is the durable step of a session teardown: the part
+// rows are the only index to the blobs and cascade away with the session, so
+// the caller runs this before DeleteSession and only deletes the session once
+// it has succeeded. Returns the records, for releaseNow.
+func (b *Backend) recordSessionReleases(ctx context.Context, space did.DID, uploadID string) ([]registry.PendingRelease, error) {
 	parts, err := b.multipart.ListParts(ctx, uploadID)
 	if err != nil {
 		return nil, fmt.Errorf("list parts: %w", err)
 	}
 	var digests []mh.Multihash
-	winners := map[string]bool{}
+	committed := map[string]bool{}
+	seen := map[string]bool{}
 	for _, p := range parts {
 		for _, d := range p.BlobDigests {
-			if p.State == registry.PartAccepted {
-				winners[string(d)] = true
-			} else {
-				digests = append(digests, d)
+			if seen[string(d)] {
+				continue
 			}
+			seen[string(d)] = true
+			in, err := b.intents.GetIntent(ctx, d)
+			if err != nil && !errors.Is(err, registry.ErrNotFound) {
+				return nil, fmt.Errorf("lookup intent: %w", err)
+			}
+			if err == nil && in.State == registry.IntentPublished {
+				committed[string(d)] = true
+				continue
+			}
+			digests = append(digests, d)
 		}
 	}
-	return b.enqueuePartReleases(ctx, space, digests, winners)
+	return b.enqueuePartReleases(ctx, space, digests, committed)
 }
 
 // enqueuePartReleases records a deferred release for each of digests that is
 // not in keep (the winners at Complete, the sibling parts at supersede, the
-// accepted parts of a completed session at its reap), in one statement
-// however many parts the session has. Whether a blob is in fact free to go is
-// the release's question, answered when it runs: runRelease drops a record
-// whose digest is claimed by a committed object and waits on one a part of an
-// in-flight session still references. Deciding that here instead would race
-// another teardown — two aborting sessions sharing a blob could each see the
-// other's part, both skip it, and both cascade their rows away, leaving no
-// record at all. Returns the digests recorded.
-func (b *Backend) enqueuePartReleases(ctx context.Context, space did.DID, digests []mh.Multihash, keep map[string]bool) ([]mh.Multihash, error) {
+// committed blobs at a reap), in one statement however many parts the
+// session has. Whether a blob is in fact free to go is the release's
+// question, answered when it runs: runRelease drops a record whose digest is
+// claimed by a committed object and waits on one a part of an in-flight
+// session still references. Deciding that here instead would race another
+// teardown — two aborting sessions sharing a blob could each see the other's
+// part, both skip it, and both cascade their rows away, leaving no record at
+// all. Returns the records as they stand, including any earlier not_before a
+// digest already carried.
+func (b *Backend) enqueuePartReleases(ctx context.Context, space did.DID, digests []mh.Multihash, keep map[string]bool) ([]registry.PendingRelease, error) {
 	seen := map[string]bool{}
 	var release []mh.Multihash
 	for _, d := range digests {
@@ -955,10 +962,11 @@ func (b *Backend) enqueuePartReleases(ctx context.Context, space did.DID, digest
 	}
 	// Due at once: a part blob was never readable through the catalog, so no
 	// reader grace is owed.
-	if err := b.pendingReleases.EnqueuePartReleases(ctx, space, release, time.Now()); err != nil {
+	records, err := b.pendingReleases.EnqueueReleases(ctx, space, release, time.Now())
+	if err != nil {
 		return nil, fmt.Errorf("record releases: %w", err)
 	}
-	return release, nil
+	return records, nil
 }
 
 // isNoSuchBucket reports whether a bucketSpace failure is the bucket row
@@ -1488,7 +1496,7 @@ func (b *Backend) reapCompletedSession(ctx context.Context, s registry.Multipart
 	if err := b.multipart.DeleteSession(ctx, s.UploadID); err != nil {
 		return false
 	}
-	b.releaseNow(ctx, space, released)
+	b.releaseNow(ctx, released)
 	return true
 }
 
@@ -1522,7 +1530,7 @@ func (b *Backend) reapAbortingSession(ctx context.Context, s registry.MultipartS
 	if err := b.multipart.DeleteSession(ctx, s.UploadID); err != nil {
 		return false
 	}
-	b.releaseNow(ctx, space, released)
+	b.releaseNow(ctx, released)
 	return true
 }
 

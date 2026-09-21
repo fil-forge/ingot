@@ -86,8 +86,9 @@ func TestCompleteConcludesPartsInOneCall(t *testing.T) {
 		if err != nil {
 			t.Fatalf("intent for %x: %v", d, err)
 		}
-		if in.State != registry.IntentAccepted {
-			t.Errorf("blob %x intent = %v, want accepted", d, in.State)
+		// Committed by the Complete: the claim published the intent.
+		if in.State != registry.IntentPublished {
+			t.Errorf("blob %x intent = %v, want published", d, in.State)
 		}
 		if _, err := mem.GetPark(ctx, d); err == nil {
 			t.Errorf("park row for %x survived the conclude", d)

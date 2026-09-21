@@ -752,8 +752,9 @@ func TestCompleteRecordsEveryAcceptanceWhenOneFailsToPersist(t *testing.T) {
 	if len(hc.calls) != 2 || len(hc.calls[1]) != 1 || hc.calls[1][0] != string(locs.refused) {
 		t.Fatalf("retry conclude calls = %v, want exactly the refused blob", hc.calls[1:])
 	}
-	if in, err := mem.GetIntent(ctx, locs.refused); err != nil || in.State != registry.IntentAccepted {
-		t.Fatalf("refused blob intent after retry = %v/%v, want accepted", in, err)
+	// The retry committed the object, so the claim published the intent.
+	if in, err := mem.GetIntent(ctx, locs.refused); err != nil || in.State != registry.IntentPublished {
+		t.Fatalf("refused blob intent after retry = %v/%v, want published", in, err)
 	}
 }
 
@@ -810,8 +811,9 @@ func completeTwoParts(t *testing.T, b *Backend, key string) (string, []types.Com
 func assertAcceptedAndUnparked(t *testing.T, mem *inmem.MemStore, d multihash.Multihash) {
 	t.Helper()
 	ctx := context.Background()
-	if in, err := mem.GetIntent(ctx, d); err != nil || in.State != registry.IntentAccepted {
-		t.Fatalf("blob %x intent = %v/%v, want accepted", d, in, err)
+	// Accepted, or published once a commit has claimed it.
+	if in, err := mem.GetIntent(ctx, d); err != nil || (in.State != registry.IntentAccepted && in.State != registry.IntentPublished) {
+		t.Fatalf("blob %x intent = %v/%v, want accepted or published", d, in, err)
 	}
 	if loc, err := mem.GetLocation(ctx, did.Undef, d); err != nil || loc == nil {
 		t.Fatalf("blob %x has no location (err=%v)", d, err)
@@ -1145,19 +1147,35 @@ func TestSweepReleasesBlobTheProviderHoldsAccepted(t *testing.T) {
 	assertReleased(t, b, mem, rm, d, true)
 }
 
-// failEnqueuePartReleases is a release store whose next `fails` bulk enqueues
+// failEnqueueReleases is a release store whose next `fails` bulk enqueues
 // fail, as a registry outage during a session teardown does.
-type failEnqueuePartReleases struct {
+type failEnqueueReleases struct {
 	registry.PendingReleaseStore
 	fails int
 }
 
-func (f *failEnqueuePartReleases) EnqueuePartReleases(ctx context.Context, space did.DID, digests []multihash.Multihash, notBefore time.Time) error {
+func (f *failEnqueueReleases) EnqueueReleases(ctx context.Context, space did.DID, digests []multihash.Multihash, notBefore time.Time) ([]registry.PendingRelease, error) {
 	if f.fails > 0 {
 		f.fails--
-		return errors.New("release table unavailable")
+		return nil, errors.New("release table unavailable")
 	}
-	return f.PendingReleaseStore.EnqueuePartReleases(ctx, space, digests, notBefore)
+	return f.PendingReleaseStore.EnqueueReleases(ctx, space, digests, notBefore)
+}
+
+// failCompleteSession is a multipart store whose next `fails` completion
+// latches fail after the object has committed, stranding the session in
+// 'completing'.
+type failCompleteSession struct {
+	registry.MultipartStore
+	fails int
+}
+
+func (f *failCompleteSession) CompleteSession(ctx context.Context, uploadID, etag, versionID string) (bool, error) {
+	if f.fails > 0 {
+		f.fails--
+		return false, errors.New("sessions table unavailable")
+	}
+	return f.MultipartStore.CompleteSession(ctx, uploadID, etag, versionID)
 }
 
 // failDeleteSession is a multipart store whose next `fails` session deletes
@@ -1195,7 +1213,7 @@ func (f *failRemover) RemoveBlob(ctx context.Context, space did.DID, d multihash
 // then releases the blobs on the provider.
 func TestAbortKeepsSessionWhenRecordingReleasesFails(t *testing.T) {
 	pu := &parkingUploader{}
-	rel := &failEnqueuePartReleases{fails: 1}
+	rel := &failEnqueueReleases{fails: 1}
 	b, mem := newDeferredBackend(t, pu, func(d *Deps) {
 		rel.PendingReleaseStore = d.PendingReleases
 		d.PendingReleases = rel
@@ -1344,7 +1362,7 @@ func TestReleaseDefersWhileAnInFlightPartReferencesTheBlob(t *testing.T) {
 // so the orphan is released late rather than never.
 func TestCompletedSessionReapReleasesOrphansWhoseRecordingFailed(t *testing.T) {
 	pu := &parkingUploader{}
-	rel := &failEnqueuePartReleases{}
+	rel := &failEnqueueReleases{}
 	rm := &recordingRemover{}
 	b, mem := newDeferredBackend(t, pu, func(d *Deps) {
 		rel.PendingReleaseStore = d.PendingReleases
@@ -1407,7 +1425,7 @@ func TestCompletedSessionReapReleasesOrphansWhoseRecordingFailed(t *testing.T) {
 // record fails the request with the old part intact, and nothing is released.
 func TestSupersedeRecordsReleasesBeforeWriting(t *testing.T) {
 	pu := &parkingUploader{}
-	rel := &failEnqueuePartReleases{}
+	rel := &failEnqueueReleases{}
 	b, mem := newDeferredBackend(t, pu, func(d *Deps) {
 		rel.PendingReleaseStore = d.PendingReleases
 		d.PendingReleases = rel
@@ -1494,8 +1512,8 @@ func TestReleaseKeepsRowsUntilTheNetworkStepSucceeds(t *testing.T) {
 	}
 	// A committed blob's ingest artifacts are not the release's to remove:
 	// the spool copy is the insurance copy until eviction.
-	if _, err := mem.GetIntent(ctx, d); err != nil {
-		t.Fatalf("a deleted object's release removed its upload intent: %v", err)
+	if in, err := mem.GetIntent(ctx, d); err != nil || in.State != registry.IntentPublished {
+		t.Fatalf("a deleted object's blob intent = %v/%v, want published and kept", in, err)
 	}
 }
 
@@ -1518,8 +1536,8 @@ func (f *failRegistryGet) Get(ctx context.Context, name string) (*registry.State
 // is retained after its object is deleted. Its winners' releases were
 // recorded by the delete as ordinary releases; the reap must not re-record
 // them as part blobs, which would take the spool copy that survives a DELETE
-// as the insurance copy. CompleteSession marked the winners, so the reap
-// leaves them alone.
+// as the insurance copy. Their intents were published by their claims, so the
+// reap leaves them alone.
 func TestCompletedSessionReapKeepsWinnersOfDeletedObject(t *testing.T) {
 	rm := &recordingRemover{}
 	b, mem := newDeferredBackend(t, &parkingUploader{}, func(d *Deps) { d.Remover = rm })
@@ -1535,22 +1553,59 @@ func TestCompletedSessionReapKeepsWinnersOfDeletedObject(t *testing.T) {
 	if n, err := b.SweepStaleMultipartSessions(ctx, -time.Second); err != nil || n == 0 {
 		t.Fatalf("sweep: cleaned=%d err=%v", n, err)
 	}
-	pending, err := mem.ListReleasesBySpace(ctx, did.Undef)
-	if err != nil {
-		t.Fatalf("ListReleasesBySpace: %v", err)
-	}
-	for _, pr := range pending {
-		if pr.PartBlob {
-			t.Fatalf("the reap re-recorded winner %x as a part blob", pr.Digest)
-		}
-	}
 	drainReleases(t, b)
 	for _, d := range winners {
 		if rm.removedDigests()[string(d)] != 1 {
 			t.Fatalf("winner %x removed %d times, want once by the object's own release", d, rm.removedDigests()[string(d)])
 		}
-		if _, err := mem.GetIntent(ctx, d); err != nil {
-			t.Fatalf("winner %x lost its upload intent: the spool copy is the insurance copy (err=%v)", d, err)
+		if in, err := mem.GetIntent(ctx, d); err != nil || in.State != registry.IntentPublished {
+			t.Fatalf("winner %x intent = %v/%v, want published and kept: the spool copy is the insurance copy", d, in, err)
+		}
+	}
+}
+
+// TestCompletingSessionWhoseLatchFailedKeepsCommittedBlobs: the object
+// commits, but the completing→completed latch fails, so the session is
+// reaped through the abort path after its object was deleted. Its blobs'
+// intents were published by their claims, so the reap leaves them to the
+// object's own releases and their spool copies survive.
+func TestCompletingSessionWhoseLatchFailedKeepsCommittedBlobs(t *testing.T) {
+	rm := &recordingRemover{}
+	mp := &failCompleteSession{}
+	b, mem := newDeferredBackend(t, &parkingUploader{}, func(d *Deps) {
+		mp.MultipartStore = d.Multipart
+		d.Multipart = mp
+		d.Remover = rm
+	})
+	ctx := context.Background()
+	key := "latch-failed"
+	uploadID, parts := completeTwoParts(t, b, key)
+	mp.fails = 1
+	if _, err := mpComplete(t, b, key, uploadID, parts, nil); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if mp.fails > 0 {
+		t.Fatal("the latch never failed")
+	}
+	if sess, err := mem.GetSession(ctx, uploadID); err != nil || sess.State != registry.SessionCompleting {
+		t.Fatalf("session after the failed latch = %v/%v, want stranded completing", sess, err)
+	}
+	winners := blobDigestsOf(t, b, key, "")
+	deleteObj(t, b, key)
+
+	if n, err := b.SweepStaleMultipartSessions(ctx, -time.Second); err != nil || n == 0 {
+		t.Fatalf("sweep: cleaned=%d err=%v", n, err)
+	}
+	if _, err := mem.GetSession(ctx, uploadID); !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("stranded session survived the sweep (err=%v)", err)
+	}
+	drainReleases(t, b)
+	for _, d := range winners {
+		if rm.removedDigests()[string(d)] != 1 {
+			t.Fatalf("committed blob %x removed %d times, want once", d, rm.removedDigests()[string(d)])
+		}
+		if in, err := mem.GetIntent(ctx, d); err != nil || in.State != registry.IntentPublished {
+			t.Fatalf("committed blob %x intent = %v/%v, want published and kept", d, in, err)
 		}
 	}
 }

@@ -23,7 +23,14 @@ import (
 // names those versions' blob_refs rows and answers `?versionId=null`.
 const NullVersionID = "null"
 
-// upload_intents.state values (the local-store lifecycle, §5).
+// upload_intents.state values (the local-store lifecycle, §5): spooled on
+// ingest, parked once durable on a provider with the accept deferred,
+// accepted once the provider has accepted it, and published once a bucket
+// commit has claimed it. Published is written with the blob's first
+// reference claim, in the same transaction, and never leaves: it is the
+// durable record that the blob was committed, which a release consults to
+// keep the spool copy (the insurance copy until eviction) and the intent,
+// where a never-committed part blob loses both.
 const (
 	IntentSpooled   = "spooled"
 	IntentParked    = "parked"
@@ -208,6 +215,9 @@ type MultipartPart struct {
 // claim per body digest; a delete/overwrite removes it; CountClaims gates
 // remove(digest) (physical reclamation when the count reaches zero).
 type BlobRefStore interface {
+	// AddBlobClaim records an object version's claim on a digest and, in the
+	// same transaction, marks the digest's upload intent published (see
+	// IntentPublished). Idempotent.
 	AddBlobClaim(ctx context.Context, claim BlobClaim) error
 	DeleteBlobClaim(ctx context.Context, digest multihash.Multihash, bucket, objectKey, versionID string) error
 	// CountClaims returns how many object versions in space still reference
@@ -227,10 +237,6 @@ type PendingRelease struct {
 	Space     did.DID
 	Digest    multihash.Multihash
 	NotBefore time.Time
-	// PartBlob marks a multipart part blob that was never committed: its spool
-	// copy and upload intent go with the release. A committed blob keeps them
-	// (the spool copy is the insurance copy until eviction).
-	PartBlob bool
 }
 
 // PendingReleaseStore is the deferred-release queue (blob_release_intents):
@@ -242,11 +248,12 @@ type PendingReleaseStore interface {
 	// notBefore has passed. Upsert: an existing record keeps the later of the
 	// two not_before values.
 	EnqueueRelease(ctx context.Context, space did.DID, digest multihash.Multihash, notBefore time.Time) error
-	// EnqueuePartReleases records the release of many part blobs in one
-	// statement, for a session teardown with a blob per part; each record
-	// carries PartBlob. Repeated digests are recorded once, and the upsert
-	// keeps the later not_before like EnqueueRelease.
-	EnqueuePartReleases(ctx context.Context, space did.DID, digests []multihash.Multihash, notBefore time.Time) error
+	// EnqueueReleases is EnqueueRelease for many digests in one statement,
+	// for a session teardown with a blob per part. Repeated digests are
+	// recorded once. Returns the records as they stand afterwards: a digest
+	// that already had a record keeps its later not_before, so the caller
+	// can tell which releases are due now.
+	EnqueueReleases(ctx context.Context, space did.DID, digests []multihash.Multihash, notBefore time.Time) ([]PendingRelease, error)
 	// ListDueReleases returns intents with not_before <= now, oldest first,
 	// at most limit.
 	ListDueReleases(ctx context.Context, now time.Time, limit int) ([]PendingRelease, error)
@@ -352,12 +359,10 @@ type MultipartStore interface {
 	// caller performed the transition (the session was still in `from`).
 	LatchSession(ctx context.Context, uploadID, from, to string) (bool, error)
 	// CompleteSession is the completing→completed latch that also records the
-	// winner's result (etag; versionID, empty for unversioned buckets) and
-	// marks the winning parts PartAccepted, atomically, so a completed row
-	// always carries what to replay and a reap of the retained row can tell
-	// the winners from the parts the Complete omitted. Returns true iff this
-	// caller performed the transition.
-	CompleteSession(ctx context.Context, uploadID, etag, versionID string, winners []int) (bool, error)
+	// winner's result (etag; versionID, empty for unversioned buckets) in the
+	// same statement, so a completed row always carries what to replay.
+	// Returns true iff this caller performed the transition.
+	CompleteSession(ctx context.Context, uploadID, etag, versionID string) (bool, error)
 	DeleteSession(ctx context.Context, uploadID string) error
 	PutPart(ctx context.Context, p MultipartPart) error
 	ListParts(ctx context.Context, uploadID string) ([]MultipartPart, error)

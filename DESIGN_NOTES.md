@@ -151,9 +151,10 @@ deletes the session row. Whether the blob is in fact free to go is decided
 when the release runs, never at teardown: a digest claimed by a committed
 object drops its record, and one a part of an in-flight session still
 references waits. Deciding at teardown would race another teardown sharing
-the blob. Complete marks its winning parts as it completes the session, so
-the reap of a retained completed row releases only what the Complete
-omitted.
+the blob. A committed blob is recognisable for good: its first reference
+claim marks its upload intent `published` in the same transaction, so the
+reap of a retained session, completed or stranded, leaves such blobs to the
+object path's own releases whatever has become of the object.
 The part rows are the only index to the blobs and cascade away with the
 session, so the record is what makes the teardown recoverable: a failure
 before it leaves the session for the sweeper, a failure after it leaves
@@ -165,9 +166,9 @@ refuses the abort because the blob was accepted after all (a conclude ran
 and ingot never learned of it); neither means the blob never left this node.
 The crypto-shred goes first, the network step next, and the location and
 park rows only once the network holds nothing, so a retry sees the same
-state. A part blob's record is marked as such, and its release also removes
-the spool copy and upload intent; a committed blob's release leaves them,
-since its spool copy is the insurance copy until eviction. A record
+state. A release of a blob that was never committed also removes the spool
+copy and upload intent; a committed blob's release leaves them, since its
+spool copy is the insurance copy until eviction. A record
 whose digest a part of an in-flight session still references waits: that
 session's Complete turns the reference into a claim, which makes the record
 stale, and its abort records a release of its own.

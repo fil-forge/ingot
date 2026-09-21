@@ -143,6 +143,29 @@ func TestPostgresStores_Live(t *testing.T) {
 		if n, _ := r.CountClaims(ctx, space, digest); n != 0 {
 			t.Fatalf("count after release = %d, want 0", n)
 		}
+
+		// A claim publishes the digest's upload intent, and the state stays
+		// once the claims are gone: it is the durable mark of a committed blob.
+		pubDigest := multihash.Multihash([]byte{0x12, 0x20, 0xc1, 0xa1})
+		if err := r.PutIntent(ctx, registry.UploadIntent{Digest: pubDigest, LocalPath: "/spool/x", Size: 1, State: registry.IntentAccepted, Bucket: "b"}); err != nil {
+			t.Fatalf("PutIntent: %v", err)
+		}
+		if err := r.AddBlobClaim(ctx, registry.BlobClaim{Digest: pubDigest, Bucket: "b", ObjectKey: "kp", VersionID: registry.NullVersionID, Space: space}); err != nil {
+			t.Fatalf("AddBlobClaim (publish): %v", err)
+		}
+		if in, err := r.GetIntent(ctx, pubDigest); err != nil || in.State != registry.IntentPublished {
+			t.Fatalf("intent after claim = %+v, err %v (want published)", in, err)
+		}
+		if err := r.DeleteBlobClaim(ctx, pubDigest, "b", "kp", registry.NullVersionID); err != nil {
+			t.Fatalf("DeleteBlobClaim (publish): %v", err)
+		}
+		if in, err := r.GetIntent(ctx, pubDigest); err != nil || in.State != registry.IntentPublished {
+			t.Fatalf("intent after the claim dropped = %+v, err %v (want still published)", in, err)
+		}
+		// A claim on a digest with no intent row (a shipped segment) is fine.
+		if err := r.AddBlobClaim(ctx, registry.BlobClaim{Digest: multihash.Multihash([]byte{0x12, 0x20, 0xc1, 0xa2}), Bucket: "b", ObjectKey: "kn", VersionID: registry.NullVersionID, Space: space}); err != nil {
+			t.Fatalf("AddBlobClaim (no intent): %v", err)
+		}
 	})
 
 	t.Run("drop claim enqueues release atomically", func(t *testing.T) {
@@ -204,26 +227,28 @@ func TestPostgresStores_Live(t *testing.T) {
 			t.Fatalf("DeleteRelease: %v", err)
 		}
 
-		// Bulk enqueue: one statement, repeated digests recorded once, and
-		// the upsert keeps an existing later not_before.
+		// Bulk enqueue: one statement, repeated digests recorded once, the
+		// upsert keeps an existing later not_before, and the records come
+		// back as they stand so the caller sees that later time.
 		d2 := multihash.Multihash([]byte{0xbb, 0x02})
 		if err := r.EnqueueRelease(ctx, space, digest, time.Now().Add(time.Hour)); err != nil {
 			t.Fatalf("EnqueueRelease (future): %v", err)
 		}
-		if err := r.EnqueuePartReleases(ctx, space, []multihash.Multihash{digest, d2, d2}, time.Now().Add(-time.Second)); err != nil {
-			t.Fatalf("EnqueuePartReleases: %v", err)
+		recs, err := r.EnqueueReleases(ctx, space, []multihash.Multihash{digest, d2, d2}, time.Now().Add(-time.Second))
+		if err != nil || len(recs) != 2 {
+			t.Fatalf("EnqueueReleases = %d records, err %v (want 2)", len(recs), err)
+		}
+		for _, pr := range recs {
+			if string(pr.Digest) == string(digest) && pr.NotBefore.Before(time.Now().Add(30*time.Minute)) {
+				t.Fatalf("bulk enqueue returned an existing record with an earlier not_before: %v", pr.NotBefore)
+			}
+			if string(pr.Digest) == string(d2) && pr.NotBefore.After(time.Now()) {
+				t.Fatalf("new record not due: %v", pr.NotBefore)
+			}
 		}
 		all, err := r.ListReleasesBySpace(ctx, space)
 		if err != nil || len(all) != 2 {
 			t.Fatalf("ListReleasesBySpace = %d, err %v (want 2)", len(all), err)
-		}
-		for _, pr := range all {
-			if string(pr.Digest) == string(digest) && pr.NotBefore.Before(time.Now().Add(30*time.Minute)) {
-				t.Fatalf("bulk enqueue moved an existing record's not_before earlier: %v", pr.NotBefore)
-			}
-			if !pr.PartBlob {
-				t.Fatalf("part release %x recorded without part_blob", pr.Digest)
-			}
 		}
 		for _, pr := range all {
 			_ = r.DeleteRelease(ctx, space, pr.Digest)
@@ -474,35 +499,6 @@ func TestPostgresStores_Live(t *testing.T) {
 		if after, _ := r.ListParts(ctx, id); len(after) != 0 {
 			t.Fatalf("parts after session delete = %d, want 0 (cascade)", len(after))
 		}
-	})
-
-	t.Run("complete session marks winning parts", func(t *testing.T) {
-		const id = "upl-win"
-		if err := r.CreateSession(ctx, registry.MultipartSession{UploadID: id, Bucket: "b", ObjectKey: "k"}); err != nil {
-			t.Fatalf("CreateSession: %v", err)
-		}
-		for n := 1; n <= 2; n++ {
-			if err := r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: n, ETagMD5: []byte{byte(n)}, Size: 1, BlobDigests: []multihash.Multihash{{0xaa, byte(n)}}}); err != nil {
-				t.Fatalf("PutPart %d: %v", n, err)
-			}
-		}
-		if won, err := r.CompleteSession(ctx, id, "etag", "", []int{1}); err != nil || won {
-			t.Fatalf("CompleteSession from open: won=%v err=%v, want not won", won, err)
-		}
-		if won, err := r.LatchSession(ctx, id, registry.SessionOpen, registry.SessionCompleting); err != nil || !won {
-			t.Fatalf("latch: won=%v err=%v", won, err)
-		}
-		if won, err := r.CompleteSession(ctx, id, "etag", "", []int{1}); err != nil || !won {
-			t.Fatalf("CompleteSession: won=%v err=%v", won, err)
-		}
-		parts, err := r.ListParts(ctx, id)
-		if err != nil || len(parts) != 2 || parts[0].State != registry.PartAccepted || parts[1].State != registry.PartParked {
-			t.Fatalf("parts after complete = %+v, err %v (want part 1 accepted, part 2 parked)", parts, err)
-		}
-		if s, err := r.GetSession(ctx, id); err != nil || s.State != registry.SessionCompleted || s.CommittedETag != "etag" {
-			t.Fatalf("session after complete = %+v, err %v", s, err)
-		}
-		_ = r.DeleteSession(ctx, id)
 	})
 
 	t.Run("multipart listing sweeper and part refs", func(t *testing.T) {

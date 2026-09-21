@@ -500,19 +500,24 @@ func (b *Backend) releaseDeferral() time.Duration {
 	return b.releaseGrace
 }
 
-// releaseNow executes part blobs' release records at once, for the
-// promptness the S3 verbs owe their callers: an Abort releases parked blobs
-// on their providers before it returns. Best-effort — whatever this pass
-// does not finish, the release sweeper retries from the records, and unwinds
-// them exactly as this pass would.
-func (b *Backend) releaseNow(ctx context.Context, space did.DID, digests []multihash.Multihash) {
-	for _, d := range digests {
-		pr := registry.PendingRelease{Space: space, Digest: d, NotBefore: time.Now(), PartBlob: true}
+// releaseNow executes release records at once, for the promptness the S3
+// verbs owe their callers: an Abort releases parked blobs on their providers
+// before it returns. Only records that are due run — a digest that already
+// had a record keeps its later not_before, and that grace is honoured, so
+// the deferred-release sweeper takes it when the time comes. Best-effort:
+// whatever this pass does not finish, the sweeper retries from the records
+// and unwinds exactly as this pass would.
+func (b *Backend) releaseNow(ctx context.Context, records []registry.PendingRelease) {
+	now := time.Now()
+	for _, pr := range records {
+		if pr.NotBefore.After(now) {
+			continue
+		}
 		switch b.runRelease(ctx, pr) {
 		case releaseDone, releaseStale:
-			if err := b.pendingReleases.DeleteRelease(ctx, space, d); err != nil {
+			if err := b.pendingReleases.DeleteRelease(ctx, pr.Space, pr.Digest); err != nil {
 				b.logger.Warn("release: delete record failed",
-					zap.String("digest", hex.EncodeToString(d)), zap.Error(err))
+					zap.String("digest", hex.EncodeToString(pr.Digest)), zap.Error(err))
 			}
 		}
 	}
@@ -588,9 +593,10 @@ func (b *Backend) drainSpaceReleases(ctx context.Context, space did.DID) error {
 // next, chosen by state, and a failure there returns before any local row is
 // touched, so the retry reads the same state and takes the same step. Only
 // once the network holds nothing for this space do the location and park
-// rows go, and — for a part blob, which was never committed — the spool copy
-// and upload intent. A committed blob keeps those two: its spool copy is the
-// insurance copy until eviction.
+// rows go, and — for a blob that was never committed — the spool copy and
+// upload intent. A committed blob is one whose intent is published, which
+// its first reference claim wrote atomically; it keeps those two, since its
+// spool copy is the insurance copy until eviction.
 func (b *Backend) executeRelease(ctx context.Context, pr registry.PendingRelease) bool {
 	space, digest := pr.Space, pr.Digest
 	log := b.logger.With(zap.String("digest", hex.EncodeToString(digest)))
@@ -655,12 +661,20 @@ func (b *Backend) executeRelease(ctx context.Context, pr registry.PendingRelease
 		log.Warn("release: delete park failed", zap.Error(err))
 		ok = false
 	}
-	if pr.PartBlob {
+	in, err := b.intents.GetIntent(ctx, digest)
+	switch {
+	case err != nil && !errors.Is(err, registry.ErrNotFound):
+		log.Warn("release: lookup upload intent failed", zap.Error(err))
+		return false
+	case err == nil && in.State == registry.IntentPublished:
+		// Committed at some point: the spool copy stays as the insurance
+		// copy until eviction, and the intent with it.
+	default:
 		if err := b.spool.Remove(digest); err != nil {
-			log.Warn("release: remove spooled part blob failed", zap.Error(err))
+			log.Warn("release: remove spooled blob failed", zap.Error(err))
 			ok = false
 		}
-		if err := b.intents.DeleteIntent(ctx, digest); err != nil {
+		if err := b.intents.DeleteIntent(ctx, digest); err != nil && !errors.Is(err, registry.ErrNotFound) {
 			log.Warn("release: delete upload intent failed", zap.Error(err))
 			ok = false
 		}

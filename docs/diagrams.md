@@ -520,23 +520,29 @@ flowchart TB
         spooled([spooled])
         parked([parked])
         accepted([accepted])
+        published([published])
     end
 
     spooled -->|"dedup: blob_locations hit"| accepted
     spooled -->|"single-shot upload:<br/>/blob/add, PUT, conclude, accept"| accepted
     spooled -->|"parkBlobs: /blob/add WithConclude(false),<br/>PUT; blob_parks row written"| parked
     parked -->|"concludeBlobs at Complete:<br/>/ucan/conclude; blob_parks row deleted"| accepted
-    spooled -->|"part release record; executeRelease:<br/>DeleteIntent + spool.Remove"| gone([deleted])
-    parked -->|"part release record; executeRelease: /blob/abort (cause AddTask),<br/>or /blob/remove if the provider says accepted;<br/>DeleteIntent + spool.Remove"| gone
+    spooled -->|"release record; executeRelease:<br/>DeleteIntent + spool.Remove"| gone([deleted])
+    parked -->|"release record; executeRelease: /blob/abort (cause AddTask),<br/>or /blob/remove if the provider says accepted;<br/>DeleteIntent + spool.Remove"| gone
+    accepted -->|"release record (never committed);<br/>executeRelease: DeleteIntent + spool.Remove"| gone
 
-    accepted -->|"commit: reconcileClaims adds this version"| refs["blob_refs rows<br/>(digest, bucket, key, version_id)"]
+    accepted -->|"commit: AddBlobClaim, same transaction"| published
+    published -->|"commit: reconcileClaims adds this version"| refs["blob_refs rows<br/>(digest, bucket, key, version_id)"]
     refs -->|"version delete or overwrite removes its row"| zero{"CountClaims == 0<br/>for (space, digest)?"}
     zero -->|yes| rm["RemoveBlob: /blob/remove to sprue<br/>(space claim released)"]
     zero -->|no| keep["blob retained<br/>(still referenced)"]
 ```
 
-- `published` is a declared intent state no code writes today; `blob_parks`
-  is a presence machine (a row exists while a conclude is owed), not a state
+- `published` is written with the blob's first reference claim and never
+  leaves: it is how a release recognises a committed blob once its claims
+  are gone, and keeps the spool copy (the insurance copy until eviction) and
+  the intent where a never-committed part blob loses both. `blob_parks` is a
+  presence machine (a row exists while a conclude is owed), not a state
   column.
 - Digests present in both the old and new version sets never churn: the
   reconcile computes a set difference.
@@ -823,7 +829,7 @@ erDiagram
         bytea digest PK
         text local_path
         bigint size
-        text state "spooled, parked, accepted; 'published' never written"
+        text state "spooled, parked, accepted, published (claimed by a commit)"
         text bucket
     }
     blob_locations {
@@ -860,13 +866,12 @@ erDiagram
         bytea etag_md5
         bytea blob_digests "ordered array"
         text checksum
-        text state "parked; accepted = a completed session's winner"
+        text state "'accepted' never written"
     }
     blob_release_intents {
         text space PK
         bytea digest PK
-        timestamptz not_before "enqueue + release grace"
-        boolean part_blob "never committed: spool copy + intent go too"
+        timestamptz not_before "earliest execution: claim drop + grace, or at once for a part blob"
     }
     gc_candidates {
         bytea cid PK "superseded MST node"
@@ -879,7 +884,7 @@ erDiagram
     buckets ||..o{ blob_refs : "by bucket name, no FK"
     blob_locations ||..o{ shard_inclusions : "by shard_digest"
     multipart_parts ||..o{ blob_parks : "digests in blob_digests"
-    multipart_parts ||..o{ blob_release_intents : "part_blob records, by digest"
+    multipart_parts ||..o{ blob_release_intents : "teardown records, by digest"
 ```
 
 - The two solid relationships are the schema's only real foreign keys;
@@ -887,7 +892,7 @@ erDiagram
 - `gc_candidates` is write-only (no reader exists yet; its entry paths are the
   [catalog GC candidates](#catalog-gc-candidates-what-gets-remembered-for-removal)
   diagram); `segments.plane`
-  still CHECK-allows the deleted `data` arm; `upload_intents.published` is a
+  still CHECK-allows the deleted `data` arm; `multipart_parts.accepted` is a
   CHECK arm no code writes.
 - Session rows also carry the passthrough HTTP headers and checksum columns
   Complete writes into the manifest; intent and location rows carry

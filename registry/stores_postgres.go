@@ -30,13 +30,30 @@ var (
 // BlobRefStore ===============================================================
 
 func (r *Postgres) AddBlobClaim(ctx context.Context, c BlobClaim) error {
-	_, err := r.pool.Exec(ctx,
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("registry: begin add blob claim: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx,
 		`INSERT INTO ingot.blob_refs (digest, bucket, object_key, version_id, space)
 		 VALUES ($1, $2, $3, $4, $5)
 		 ON CONFLICT (digest, bucket, object_key, version_id) DO NOTHING`,
-		c.Digest, c.Bucket, c.ObjectKey, c.VersionID, c.Space)
-	if err != nil {
+		c.Digest, c.Bucket, c.ObjectKey, c.VersionID, c.Space); err != nil {
 		return fmt.Errorf("registry: add blob claim: %w", err)
+	}
+	// The claim is the commit's durable trace on the blob; the intent's
+	// published state is how a release recognises a committed blob once the
+	// claims are gone. A blob without an intent row (a shipped catalog
+	// segment) has nothing to mark.
+	if _, err := tx.Exec(ctx,
+		`UPDATE ingot.upload_intents SET state = $2, updated_at = now()
+		 WHERE digest = $1 AND state <> $2`,
+		c.Digest, IntentPublished); err != nil {
+		return fmt.Errorf("registry: publish intent: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("registry: commit add blob claim: %w", err)
 	}
 	return nil
 }
@@ -115,37 +132,51 @@ func (r *Postgres) EnqueueRelease(ctx context.Context, space did.DID, digest mul
 	return nil
 }
 
-func (r *Postgres) EnqueuePartReleases(ctx context.Context, space did.DID, digests []multihash.Multihash, notBefore time.Time) error {
+func (r *Postgres) EnqueueReleases(ctx context.Context, space did.DID, digests []multihash.Multihash, notBefore time.Time) ([]PendingRelease, error) {
 	// ON CONFLICT DO UPDATE cannot touch one row twice in a statement, so a
 	// digest repeated in the input is recorded once.
 	seen := make(map[string]bool, len(digests))
-	rows := make([][]byte, 0, len(digests))
+	in := make([][]byte, 0, len(digests))
 	for _, d := range digests {
 		if seen[string(d)] {
 			continue
 		}
 		seen[string(d)] = true
-		rows = append(rows, []byte(d))
+		in = append(in, []byte(d))
 	}
-	if len(rows) == 0 {
-		return nil
+	if len(in) == 0 {
+		return nil, nil
 	}
-	_, err := r.pool.Exec(ctx,
-		`INSERT INTO ingot.blob_release_intents (space, digest, not_before, part_blob)
-		 SELECT $1, unnest($2::bytea[]), $3, true
+	rows, err := r.pool.Query(ctx,
+		`INSERT INTO ingot.blob_release_intents (space, digest, not_before)
+		 SELECT $1, unnest($2::bytea[]), $3
 		 ON CONFLICT (space, digest)
-		 DO UPDATE SET not_before = GREATEST(ingot.blob_release_intents.not_before, EXCLUDED.not_before),
-		               part_blob = true`,
-		space, rows, notBefore)
+		 DO UPDATE SET not_before = GREATEST(ingot.blob_release_intents.not_before, EXCLUDED.not_before)
+		 RETURNING digest, not_before`,
+		space, in, notBefore)
 	if err != nil {
-		return fmt.Errorf("registry: enqueue part releases: %w", err)
+		return nil, fmt.Errorf("registry: enqueue releases: %w", err)
 	}
-	return nil
+	defer rows.Close()
+	out := make([]PendingRelease, 0, len(in))
+	for rows.Next() {
+		var digest []byte
+		pr := PendingRelease{Space: space}
+		if err := rows.Scan(&digest, &pr.NotBefore); err != nil {
+			return nil, fmt.Errorf("registry: enqueue releases scan: %w", err)
+		}
+		pr.Digest = multihash.Multihash(digest)
+		out = append(out, pr)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("registry: enqueue releases rows: %w", err)
+	}
+	return out, nil
 }
 
 func (r *Postgres) ListDueReleases(ctx context.Context, now time.Time, limit int) ([]PendingRelease, error) {
 	rows, err := r.pool.Query(ctx,
-		`SELECT space, digest, not_before, part_blob FROM ingot.blob_release_intents
+		`SELECT space, digest, not_before FROM ingot.blob_release_intents
 		 WHERE not_before <= $1 ORDER BY not_before ASC LIMIT $2`,
 		now, limit)
 	if err != nil {
@@ -158,7 +189,7 @@ func (r *Postgres) ListDueReleases(ctx context.Context, now time.Time, limit int
 		var spaceStr string
 		var pr PendingRelease
 		var digest []byte
-		if err := rows.Scan(&spaceStr, &digest, &pr.NotBefore, &pr.PartBlob); err != nil {
+		if err := rows.Scan(&spaceStr, &digest, &pr.NotBefore); err != nil {
 			return nil, fmt.Errorf("registry: list due releases scan: %w", err)
 		}
 		space, err := did.Parse(spaceStr)
@@ -176,7 +207,7 @@ func (r *Postgres) ListDueReleases(ctx context.Context, now time.Time, limit int
 
 func (r *Postgres) ListReleasesBySpace(ctx context.Context, space did.DID) ([]PendingRelease, error) {
 	rows, err := r.pool.Query(ctx,
-		`SELECT space, digest, not_before, part_blob FROM ingot.blob_release_intents
+		`SELECT space, digest, not_before FROM ingot.blob_release_intents
 		 WHERE space = $1 ORDER BY not_before ASC`,
 		space)
 	if err != nil {
@@ -189,7 +220,7 @@ func (r *Postgres) ListReleasesBySpace(ctx context.Context, space did.DID) ([]Pe
 		var spaceStr string
 		var pr PendingRelease
 		var digest []byte
-		if err := rows.Scan(&spaceStr, &digest, &pr.NotBefore, &pr.PartBlob); err != nil {
+		if err := rows.Scan(&spaceStr, &digest, &pr.NotBefore); err != nil {
 			return nil, fmt.Errorf("registry: list releases by space scan: %w", err)
 		}
 		sp, err := did.Parse(spaceStr)
@@ -586,14 +617,8 @@ func (r *Postgres) LatchSession(ctx context.Context, uploadID, from, to string) 
 	return tag.RowsAffected() == 1, nil
 }
 
-func (r *Postgres) CompleteSession(ctx context.Context, uploadID, etag, versionID string, winners []int) (bool, error) {
-	tx, err := r.pool.Begin(ctx)
-	if err != nil {
-		return false, fmt.Errorf("registry: begin complete session: %w", err)
-	}
-	defer tx.Rollback(ctx)
-
-	tag, err := tx.Exec(ctx,
+func (r *Postgres) CompleteSession(ctx context.Context, uploadID, etag, versionID string) (bool, error) {
+	tag, err := r.pool.Exec(ctx,
 		`UPDATE ingot.multipart_sessions
 		 SET state = $2, committed_etag = $3, committed_version_id = $4
 		 WHERE upload_id = $1 AND state = $5`,
@@ -601,23 +626,7 @@ func (r *Postgres) CompleteSession(ctx context.Context, uploadID, etag, versionI
 	if err != nil {
 		return false, fmt.Errorf("registry: complete session: %w", err)
 	}
-	if tag.RowsAffected() != 1 {
-		return false, nil
-	}
-	nums := make([]int32, len(winners))
-	for i, n := range winners {
-		nums[i] = int32(n)
-	}
-	if _, err := tx.Exec(ctx,
-		`UPDATE ingot.multipart_parts SET state = $3
-		 WHERE upload_id = $1 AND part_number = ANY($2::int[])`,
-		uploadID, nums, PartAccepted); err != nil {
-		return false, fmt.Errorf("registry: mark winning parts: %w", err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return false, fmt.Errorf("registry: commit complete session: %w", err)
-	}
-	return true, nil
+	return tag.RowsAffected() == 1, nil
 }
 
 func (r *Postgres) DeleteSession(ctx context.Context, uploadID string) error {

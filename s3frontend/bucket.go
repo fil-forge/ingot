@@ -373,6 +373,14 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 		// releases cannot be recorded fails the delete: its part rows are
 		// the only index to its blobs, and with the bucket row gone the
 		// sweeper would have no space to record them against.
+		//
+		// s3:DeleteBucket delegates no blob commands (hilt's s3perm maps it
+		// to nil), so the request's proofs cannot authorize /blob/abort or
+		// /blob/remove. Every release below runs without the request proof
+		// store, so the uploader falls back to the blob authority captured
+		// at write time — the same resolution the sweepers use. The bucket
+		// deletion itself keeps the request.
+		relCtx := reqscope.WithoutProofStore(ctx)
 		sessions, err := b.multipart.ListSessions(ctx, name)
 		if err != nil {
 			return fmt.Errorf("s3frontend: delete bucket: list mp sessions: %w", err)
@@ -381,16 +389,16 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 			var ok bool
 			switch s.State {
 			case registry.SessionOpen:
-				ok = b.abortOpenSession(ctx, st.Space, s)
+				ok = b.abortOpenSession(relCtx, st.Space, s)
 			case registry.SessionCompleted:
-				ok = b.reapCompletedSession(ctx, s)
+				ok = b.reapCompletedSession(relCtx, s)
 			case registry.SessionCompleting:
 				// A crash-stranded Complete; a live one holds the bucket
 				// lock this runs under. Latch it away like the sweeper does.
 				won, err := b.multipart.LatchSession(ctx, s.UploadID, registry.SessionCompleting, registry.SessionAborting)
-				ok = err == nil && won && b.reapAbortingSession(ctx, s)
+				ok = err == nil && won && b.reapAbortingSession(relCtx, s)
 			default:
-				ok = b.reapAbortingSession(ctx, s)
+				ok = b.reapAbortingSession(relCtx, s)
 			}
 			if !ok {
 				return fmt.Errorf("s3frontend: delete bucket: multipart session %s: releases not recorded; retry", s.UploadID)
@@ -419,7 +427,7 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 				return fmt.Errorf("s3frontend: delete bucket: %w", err)
 			}
 			for _, d := range digests {
-				if err := b.remover.RemoveBlob(ctx, st.Space, d); err != nil {
+				if err := b.remover.RemoveBlob(relCtx, st.Space, d); err != nil {
 					return fmt.Errorf("s3frontend: delete bucket: release shipped segment: %w", err)
 				}
 			}
@@ -430,7 +438,7 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 		// hilt refuses to delete a space that still holds registrations.
 		// The bucket is provably empty here and its deletion explicit, so
 		// no grace is owed — execute the space's pending releases now.
-		if err := b.drainSpaceReleases(ctx, st.Space); err != nil {
+		if err := b.drainSpaceReleases(relCtx, st.Space); err != nil {
 			return fmt.Errorf("s3frontend: delete bucket: %w", err)
 		}
 
