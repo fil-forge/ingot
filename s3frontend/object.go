@@ -600,8 +600,9 @@ func (b *Backend) drainSpaceReleases(ctx context.Context, space did.DID) error {
 // nothing references becomes unreadable at once. The network step goes
 // next, chosen by state, and a failure there returns before any local row is
 // touched, so the retry reads the same state and takes the same step. Only
-// once the network holds nothing for this space do the location and park
-// rows go, and — for a blob that was never committed — the spool copy and
+// once the network holds nothing for this space do the park and location
+// rows go, park first so a partial failure leaves the retry on the same
+// path, and — for a blob that was never committed — the spool copy and
 // upload intent. A committed blob is one whose intent is published, which
 // its first reference claim wrote atomically; it keeps those two, since its
 // spool copy is the insurance copy until eviction.
@@ -669,12 +670,17 @@ func (b *Backend) executeRelease(ctx context.Context, pr registry.PendingRelease
 		}
 	}
 
-	if err := b.locations.DeleteLocation(ctx, space, digest); err != nil {
-		log.Warn("release: delete location failed", zap.Error(err))
-		ok = false
-	}
+	// The park row goes before the location row, and a failed park delete
+	// keeps the location: a located blob can still carry a stale park (a
+	// Complete that recorded the location and died before dropping the
+	// park), and with the location gone and the park left, the retry
+	// would read the blob as parked and abort an allocation the remove
+	// above already released.
 	if err := b.parks.DeletePark(ctx, digest); err != nil {
 		log.Warn("release: delete park failed", zap.Error(err))
+		ok = false
+	} else if err := b.locations.DeleteLocation(ctx, space, digest); err != nil {
+		log.Warn("release: delete location failed", zap.Error(err))
 		ok = false
 	}
 	in, err := b.intents.GetIntent(ctx, digest)

@@ -381,6 +381,11 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 // commits a manifest whose Body is the ordered union of the parts' blobs. The
 // object ETag is hex(md5(concat of part md5s)) + "-N".
 //
+// The blobs are concluded off the bucket lock, so a teardown (DeleteBucket,
+// the stale-session sweeper) can take the 'completing' row meanwhile; both
+// latch it under the bucket lock, and the commit re-checks the latch there,
+// failing with NoSuchUpload rather than committing over released blobs.
+//
 // A successful Complete retains the session in state 'completed' (with its
 // parts), so a duplicate Complete with an identical part list is idempotent
 // per S3; the abandoned-session sweeper reaps the row later.
@@ -766,6 +771,20 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 	// under the lock so a racing writer can't slip between the pre-check above
 	// and the swap.
 	node, effState, err := b.commitVersion(ctx, bucketState, key, mf, initState, func(superseded *msbucket.ObjectManifest) error {
+		// The latch is re-checked under the bucket lock, where every
+		// teardown that takes a 'completing' row (DeleteBucket, the
+		// sweeper) latches it: a session taken while its blobs were
+		// concluding off-lock has had those blobs released, and the
+		// manifest must not commit over them.
+		cur, err := b.multipart.GetSession(ctx, uploadID)
+		switch {
+		case errors.Is(err, registry.ErrNotFound):
+			return s3err.GetAPIError(s3err.ErrNoSuchUpload)
+		case err != nil:
+			return fmt.Errorf("recheck session latch: %w", err)
+		case cur.State != registry.SessionCompleting:
+			return s3err.GetAPIError(s3err.ErrNoSuchUpload)
+		}
 		if ifMatch == nil && ifNoneMatch == nil {
 			return nil
 		}
@@ -903,12 +922,17 @@ func (b *Backend) AbortMultipartUpload(ctx context.Context, input *s3.AbortMulti
 
 // abortOpenSession force-aborts an open multipart session exactly like a
 // client Abort: latch (losing gracefully to a concurrent Complete/Abort),
-// record its parts' releases, drop the session, release. Used by
-// DeleteBucket's implicit abort of in-flight uploads, which passes a context
-// without the request's proof store (see DeleteBucket). Reports whether the
-// session's releases are recorded and its row gone; false leaves the row for
-// the sweeper, and DeleteBucket must not proceed past it.
-func (b *Backend) abortOpenSession(ctx context.Context, space did.DID, sess registry.MultipartSession) bool {
+// record its parts' releases against the session's own space, drop the
+// session, release. Used by DeleteBucket's implicit abort of in-flight
+// uploads, which passes a context without the request's proof store (see
+// DeleteBucket). Reports whether the session's releases are recorded and its
+// row gone; false leaves the row for the sweeper, and DeleteBucket must not
+// proceed past it.
+func (b *Backend) abortOpenSession(ctx context.Context, sess registry.MultipartSession) bool {
+	space, ok := b.sessionSpace(ctx, sess)
+	if !ok {
+		return false
+	}
 	won, err := b.multipart.LatchSession(ctx, sess.UploadID, registry.SessionOpen, registry.SessionAborting)
 	if err != nil || !won {
 		return false
@@ -1473,8 +1497,11 @@ func (b *Backend) ListMultipartUploads(ctx context.Context, input *s3.ListMultip
 // until expiry. Staleness counts from the last state change, so a Complete
 // that latches an old session to 'completing' holds the row for a TTL of its
 // own rather than racing a sweep that would abort the parts it is concluding;
-// a session never taken past 'open' counts from its creation. Returns how
-// many rows were removed. Called periodically by the daemon's sweeper loop.
+// a session never taken past 'open' counts from its creation. A 'completing'
+// row is latched under its bucket's lock, where Complete re-checks the latch
+// before committing, so a Complete that outlives the TTL fails rather than
+// committing over blobs the sweep released. Returns how many rows were
+// removed. Called periodically by the daemon's sweeper loop.
 func (b *Backend) SweepStaleMultipartSessions(ctx context.Context, ttl time.Duration) (int, error) {
 	cutoff := time.Now().Add(-ttl)
 	cleaned := 0
@@ -1488,7 +1515,7 @@ func (b *Backend) SweepStaleMultipartSessions(ctx context.Context, ttl time.Dura
 			return cleaned, fmt.Errorf("s3frontend: sweep list: %w", err)
 		}
 		for _, s := range stale {
-			won, err := b.multipart.LatchSession(ctx, s.UploadID, state, registry.SessionAborting)
+			won, err := b.latchStaleSession(ctx, s, state)
 			if err != nil || !won {
 				continue
 			}
@@ -1521,6 +1548,26 @@ func (b *Backend) SweepStaleMultipartSessions(ctx context.Context, ttl time.Dura
 		}
 	}
 	return cleaned, nil
+}
+
+// latchStaleSession moves a stale session into 'aborting'. A 'completing'
+// row is latched under its bucket's lock: the Complete that holds it
+// re-checks the latch there before committing, so the lock orders the two
+// and that Complete fails with NoSuchUpload instead of committing a manifest
+// over blobs the reap then releases. An 'open' row has no such writer to
+// order against; the latch alone decides it against a concurrent Complete
+// or Abort.
+func (b *Backend) latchStaleSession(ctx context.Context, s registry.MultipartSession, from string) (bool, error) {
+	if from != registry.SessionCompleting {
+		return b.multipart.LatchSession(ctx, s.UploadID, from, registry.SessionAborting)
+	}
+	var won bool
+	err := b.txns.WithLock(ctx, s.Bucket, func(ctx context.Context) error {
+		var err error
+		won, err = b.multipart.LatchSession(ctx, s.UploadID, from, registry.SessionAborting)
+		return err
+	})
+	return won, err
 }
 
 // reapCompletedSession drops a completed session's row, first recording a

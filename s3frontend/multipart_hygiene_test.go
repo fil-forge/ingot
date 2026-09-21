@@ -1951,6 +1951,73 @@ func TestSweepLeavesALiveCompleteOnAnOldSession(t *testing.T) {
 	}
 }
 
+// hookAfterParkDeletes is a park store that runs hook once, right after its
+// n-th DeletePark: Complete drops each concluded blob's park as its last
+// recording step, so with n = the session's blob count the hook lands in the
+// window between the off-lock conclude and the locked commit, where a sweep
+// or DeleteBucket can take the session.
+type hookAfterParkDeletes struct {
+	registry.ParkStore
+	n    int
+	hook func()
+}
+
+func (h *hookAfterParkDeletes) DeletePark(ctx context.Context, digest multihash.Multihash) error {
+	err := h.ParkStore.DeletePark(ctx, digest)
+	h.n--
+	if h.n == 0 && h.hook != nil {
+		hook := h.hook
+		h.hook = nil
+		hook()
+	}
+	return err
+}
+
+// TestCompleteFailsWhenItsSessionIsTakenBeforeCommit: a sweep (DeleteBucket
+// latches the same way) takes a 'completing' session after its Complete has
+// concluded the blobs off the bucket lock, and releases them. Complete
+// re-checks its latch under the lock and fails with NoSuchUpload instead of
+// committing a manifest over released blobs.
+func TestCompleteFailsWhenItsSessionIsTakenBeforeCommit(t *testing.T) {
+	rm := &recordingRemover{}
+	parks := &hookAfterParkDeletes{n: 2}
+	b, mem := newDeferredBackend(t, &parkingUploader{}, func(d *Deps) {
+		parks.ParkStore = d.Parks
+		d.Parks = parks
+		d.Remover = rm
+	})
+	ctx := context.Background()
+	bucket, key := "bk", "taken-before-commit"
+	uploadID, parts := completeTwoParts(t, b, key)
+	digests := hygienePartDigests(t, mem, uploadID, 1)
+	digests = append(digests, hygienePartDigests(t, mem, uploadID, 2)...)
+	parks.hook = func() {
+		if n, err := b.SweepStaleMultipartSessions(ctx, -time.Second); err != nil || n != 1 {
+			t.Errorf("sweep before commit: cleaned=%d err=%v, want the completing session", n, err)
+		}
+	}
+
+	_, err := mpComplete(t, b, key, uploadID, parts, nil)
+	var apiErr s3err.APIError
+	if !errors.As(err, &apiErr) || apiErr.Code != "NoSuchUpload" {
+		t.Fatalf("Complete whose session was taken: err = %v, want NoSuchUpload", err)
+	}
+	if parks.hook != nil {
+		t.Fatal("the teardown never ran")
+	}
+	if _, err := b.HeadObject(ctx, &s3.HeadObjectInput{Bucket: &bucket, Key: &key}); err == nil {
+		t.Fatal("a manifest committed over released blobs")
+	}
+	if _, err := mem.GetSession(ctx, uploadID); !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("session survived (err=%v)", err)
+	}
+	for _, d := range digests {
+		if rm.removedDigests()[string(d)] != 1 {
+			t.Fatalf("accepted part blob %x removed %d times, want once", d, rm.removedDigests()[string(d)])
+		}
+	}
+}
+
 // TestReleaseRemovesBlobAcceptedWithoutRows: at Complete a never-parked blob
 // is uploaded and accepted, then the location fails to record, leaving no
 // park and no location row. If the client aborts instead of retrying, the

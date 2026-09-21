@@ -529,7 +529,7 @@ flowchart TB
     parked -->|"concludeBlobs at Complete:<br/>/ucan/conclude; blob_parks row deleted"| accepted
     spooled -->|"release record; executeRelease:<br/>DeleteIntent + spool.Remove"| gone([deleted])
     parked -->|"release record; executeRelease: /blob/abort (cause AddTask),<br/>or /blob/remove if the provider says accepted;<br/>DeleteIntent + spool.Remove"| gone
-    accepted -->|"release record (never committed);<br/>executeRelease: DeleteIntent + spool.Remove"| gone
+    accepted -->|"release record (never committed);<br/>executeRelease: /blob/remove;<br/>DeleteIntent + spool.Remove"| gone
 
     accepted -->|"commit: AddBlobClaim, same transaction"| published
     published -->|"commit: reconcileClaims adds this version"| refs["blob_refs rows<br/>(digest, bucket, key, version_id)"]

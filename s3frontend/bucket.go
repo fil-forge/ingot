@@ -390,12 +390,15 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 			var ok bool
 			switch s.State {
 			case registry.SessionOpen:
-				ok = b.abortOpenSession(relCtx, st.Space, s)
+				ok = b.abortOpenSession(relCtx, s)
 			case registry.SessionCompleted:
 				ok = b.reapCompletedSession(relCtx, s)
 			case registry.SessionCompleting:
-				// A crash-stranded Complete; a live one holds the bucket
-				// lock this runs under. Latch it away like the sweeper does.
+				// Crash-stranded, or a live Complete concluding its blobs
+				// off-lock. The latch is taken here, under the bucket
+				// lock: a live Complete re-checks its latch under this
+				// lock before committing and fails with NoSuchUpload, so
+				// it cannot commit a manifest over the blobs this releases.
 				won, err := b.multipart.LatchSession(ctx, s.UploadID, registry.SessionCompleting, registry.SessionAborting)
 				ok = err == nil && won && b.reapAbortingSession(relCtx, s)
 			default:
