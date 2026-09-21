@@ -1827,3 +1827,55 @@ func TestSweepKeepsLegacySessionWhoseBucketIsGone(t *testing.T) {
 		t.Fatal("blob was aborted without a space to record its release against")
 	}
 }
+
+// TestAbortReleasesAgainstTheSessionsOwnSpace: the session's bucket is
+// deleted and recreated under the same name with a new space before the
+// session is aborted. The abort releases against the space the parts were
+// parked in, recorded on the session, never the space that now carries the
+// bucket's name.
+func TestAbortReleasesAgainstTheSessionsOwnSpace(t *testing.T) {
+	pu := &parkingUploader{}
+	rel := &recordingReleases{}
+	b, mem := newDeferredBackend(t, pu, func(d *Deps) {
+		rel.PendingReleaseStore = d.PendingReleases
+		d.PendingReleases = rel
+	})
+	ctx := context.Background()
+	bucket, key := "reborn", "part"
+	oldSpace, _ := did.Parse("did:web:reborn-old.example")
+	newSpace, _ := did.Parse("did:web:reborn-new.example")
+	if err := mem.Create(ctx, bucket, oldSpace, registry.CreateState{}); err != nil {
+		t.Fatalf("create bucket: %v", err)
+	}
+	res, err := b.CreateMultipartUpload(ctx, s3response.CreateMultipartUploadInput{Bucket: &bucket, Key: &key})
+	if err != nil {
+		t.Fatalf("CreateMultipartUpload: %v", err)
+	}
+	uploadID := res.UploadId
+	one := int32(1)
+	if _, err := b.UploadPart(ctx, &s3.UploadPartInput{Bucket: &bucket, Key: &key, UploadId: &uploadID, PartNumber: &one, Body: bytes.NewReader(testBody(int(backend.MinPartSize)))}); err != nil {
+		t.Fatalf("UploadPart: %v", err)
+	}
+	d := hygienePartDigests(t, mem, uploadID, 1)[0]
+
+	// Same name, new space.
+	if err := mem.Delete(ctx, bucket); err != nil {
+		t.Fatalf("delete bucket row: %v", err)
+	}
+	if err := mem.Create(ctx, bucket, newSpace, registry.CreateState{}); err != nil {
+		t.Fatalf("recreate bucket: %v", err)
+	}
+
+	if err := b.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{Bucket: &bucket, Key: &key, UploadId: &uploadID}); err != nil {
+		t.Fatalf("Abort: %v", err)
+	}
+	if len(rel.spaces) == 0 || rel.spaces[len(rel.spaces)-1] != oldSpace {
+		t.Fatalf("releases recorded against %v, want the session's own space %v", rel.spaces, oldSpace)
+	}
+	if !pu.abortedDigests()[string(d)] {
+		t.Fatalf("parked blob %x was not released on the provider", d)
+	}
+	if _, err := mem.GetSession(ctx, uploadID); !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("session survived the abort (err=%v)", err)
+	}
+}

@@ -295,7 +295,7 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 		}
 	}
 
-	space, err := b.bucketSpace(ctx, sess.Bucket)
+	space, err := b.spaceOf(ctx, *sess)
 	if err != nil {
 		return nil, err
 	}
@@ -857,7 +857,7 @@ func (b *Backend) AbortMultipartUpload(ctx context.Context, input *s3.AbortMulti
 	// session, so the records must exist before the delete; a failure up to
 	// that point fails the abort and leaves the session latched 'aborting'
 	// for the sweeper to finish.
-	space, err := b.bucketSpace(ctx, sess.Bucket)
+	space, err := b.spaceOf(ctx, *sess)
 	if err != nil {
 		return err
 	}
@@ -970,18 +970,26 @@ func (b *Backend) enqueuePartReleases(ctx context.Context, space did.DID, digest
 	return records, nil
 }
 
-// sessionSpace is the space a session's blobs live in: recorded on the
-// session at create, so a teardown never depends on the bucket row (a session
-// created while DeleteBucket was listing sessions outlives the bucket, and
-// its part rows are the only index to blobs the space still holds). A row
-// that predates the column resolves its bucket instead; when that lookup
-// fails the row is kept for the next sweep, since dropping it would strand
-// the blobs. ok=false means the caller should retry later.
-func (b *Backend) sessionSpace(ctx context.Context, s registry.MultipartSession) (did.DID, bool) {
+// spaceOf is the space a session's blobs live in: recorded on the session
+// at create, so every operation on the session — parts, abort, teardown —
+// works against the space the parts were parked in, and never against
+// whatever bucket currently carries the name. A bucket deleted and recreated
+// under the same name has a new space; resolving by name would park into it
+// or release from it. A row that predates the column resolves its bucket
+// instead.
+func (b *Backend) spaceOf(ctx context.Context, s registry.MultipartSession) (did.DID, error) {
 	if s.Space.Defined() {
-		return s.Space, true
+		return s.Space, nil
 	}
-	space, err := b.bucketSpace(ctx, s.Bucket)
+	return b.bucketSpace(ctx, s.Bucket)
+}
+
+// sessionSpace is spaceOf for the sweeper: when a legacy row's bucket cannot
+// be resolved the row is kept for the next sweep, since dropping it would
+// strand the blobs (its part rows are their only index). ok=false means
+// retry later.
+func (b *Backend) sessionSpace(ctx context.Context, s registry.MultipartSession) (did.DID, bool) {
+	space, err := b.spaceOf(ctx, s)
 	if err != nil {
 		b.logger.Warn("sweep: session predates the space column and its bucket cannot be resolved; retrying next sweep",
 			zap.String("uploadID", s.UploadID), zap.String("bucket", s.Bucket), zap.Error(err))
