@@ -163,7 +163,15 @@ reads the blob's state from its rows rather than its intent. A location row
 means accepted and the space's claim is removed; a park row alone means
 parked and the allocation is aborted, or removed instead when the provider
 refuses the abort because the blob was accepted after all (a conclude ran
-and ingot never learned of it); neither means the blob never left this node.
+and ingot never learned of it). Neither row is ambiguous on its own: a blob
+uploaded and accepted at Complete whose location then failed to record has
+none either. The intent settles it. Every upload marks the intent
+`uploading` before its first network call, so a blob still `spooled` never
+left this node and is cleaned up locally, while any other state gets a
+network remove, which the upload service treats as success for a blob it
+never registered. The distinction matters for the retry: a blob that never
+uploaded captured no authority a background remove could use, and a remove
+attempted for it would fail on every retry and pin the record forever.
 The crypto-shred goes first, the network step next, and the location and
 park rows only once the network holds nothing, so a retry sees the same
 state. A release of a blob that was never committed also removes the spool

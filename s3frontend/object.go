@@ -343,6 +343,11 @@ func (b *Backend) uploadBlobs(ctx context.Context, space did.DID, blobs []msbuck
 		if err != nil {
 			return fmt.Errorf("lookup intent: %w", err)
 		}
+		// The blob may be on the network from here on; a release finding no
+		// row for it must remove it rather than assume it never left.
+		if err := b.intents.SetIntentState(ctx, digest, registry.IntentUploading); err != nil {
+			return fmt.Errorf("mark uploading: %w", err)
+		}
 		res, err := b.uploader.UploadBlob(ctx, space, digest, in.Size, b.spool.Path(digest))
 		if err != nil {
 			return fmt.Errorf("upload blob: %w", err)
@@ -624,7 +629,9 @@ func (b *Backend) drainSpaceReleases(ctx context.Context, space did.DID) error {
 // in, reporting whether every step succeeded (failures are logged and the
 // record is retried). The state is read from the blob's own rows rather than
 // its upload intent, which can lag them: a location row means accepted; a
-// park row alone means parked; neither means the blob never left this node.
+// park row alone means parked. Neither row leaves the intent to say: still
+// 'spooled', the blob never left this node; anything else, it may have, and
+// the network remove is owed.
 //
 // The order matters for the retry. The crypto-shred goes first so a blob
 // nothing references becomes unreadable at once. The network step goes
@@ -657,6 +664,14 @@ func (b *Backend) executeRelease(ctx context.Context, pr registry.PendingRelease
 		log.Warn("release: lookup park failed", zap.Error(err))
 		return false
 	}
+	in, err := b.intents.GetIntent(ctx, digest)
+	if err != nil && !errors.Is(err, registry.ErrNotFound) {
+		log.Warn("release: lookup upload intent failed", zap.Error(err))
+		return false
+	}
+	if err != nil {
+		in = nil
+	}
 
 	switch {
 	case located:
@@ -688,12 +703,20 @@ func (b *Backend) executeRelease(ctx context.Context, pr registry.PendingRelease
 			log.Warn("release: abort parked blob failed", zap.Error(aerr))
 			return false
 		}
+	case in != nil && in.State == registry.IntentSpooled:
+		// No row says the blob is on the network, and the intent says it
+		// never went: every upload moves the intent off 'spooled' before
+		// its first network call. Nothing is owed there, which matters for
+		// the retry: a blob that was never uploaded captured no authority a
+		// background remove could use, so a remove attempted anyway would
+		// fail on every retry and pin the record forever.
 	default:
-		// No row says the blob is on the network, but its absence is not
-		// proof: a never-parked blob can be uploaded and accepted at Complete
-		// and then fail to record its location, leaving neither row. The
-		// upload service treats a remove of a blob it never registered as
-		// success, so the remove costs one round trip and closes that leak.
+		// No row says the blob is on the network, but the intent says it
+		// may be: a never-parked blob can be uploaded and accepted at
+		// Complete and then fail to record its location, leaving neither
+		// row. The upload service treats a remove of a blob it never
+		// registered as success, so the remove costs one round trip and
+		// closes that leak.
 		if err := b.remover.RemoveBlob(ctx, space, digest); err != nil {
 			log.Warn("release: network remove of a blob with no rows failed", zap.Error(err))
 			return false
@@ -713,12 +736,8 @@ func (b *Backend) executeRelease(ctx context.Context, pr registry.PendingRelease
 		log.Warn("release: delete location failed", zap.Error(err))
 		ok = false
 	}
-	in, err := b.intents.GetIntent(ctx, digest)
 	switch {
-	case err != nil && !errors.Is(err, registry.ErrNotFound):
-		log.Warn("release: lookup upload intent failed", zap.Error(err))
-		return false
-	case err == nil && in.State == registry.IntentPublished:
+	case in != nil && in.State == registry.IntentPublished:
 		// Committed at some point: the spool copy stays as the insurance
 		// copy until eviction, and the intent with it.
 	default:

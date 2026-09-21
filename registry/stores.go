@@ -32,7 +32,13 @@ const NullVersionID = "null"
 // keep the spool copy (the insurance copy until eviction) and the intent,
 // where a never-committed part blob loses both.
 const (
-	IntentSpooled   = "spooled"
+	IntentSpooled = "spooled"
+	// IntentUploading is set before a blob's first network call and stands
+	// until a row records the outcome (a park or a location): the blob may
+	// be on the network. A blob still 'spooled' never left this node, which
+	// a release relies on to skip a network remove it could not authorize
+	// from the background.
+	IntentUploading = "uploading"
 	IntentParked    = "parked"
 	IntentAccepted  = "accepted"
 	IntentPublished = "published"

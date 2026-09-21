@@ -2095,12 +2095,16 @@ func (f *failPutPart) PutPart(ctx context.Context, p registry.MultipartPart) err
 // TestUploadPartFailedRowWriteReleasesItsBlobs: the part row write fails for
 // a reason other than the session being gone. No row points at the spooled
 // blobs, so the upload records their releases before failing; the session
-// stays open for the retry.
+// stays open for the retry. The blobs never left the node (the row is
+// written before the park), so their release is local and asks the network
+// for nothing: a background retry would have no authority for it.
 func TestUploadPartFailedRowWriteReleasesItsBlobs(t *testing.T) {
+	rm := &recordingRemover{}
 	mp := &failPutPart{fails: 1}
 	b, mem := newDeferredBackend(t, &parkingUploader{}, func(d *Deps) {
 		mp.MultipartStore = d.Multipart
 		d.Multipart = mp
+		d.Remover = rm
 	})
 	ctx := context.Background()
 	key := "failed-row"
@@ -2119,6 +2123,9 @@ func TestUploadPartFailedRowWriteReleasesItsBlobs(t *testing.T) {
 	}
 	if len(entries) != 0 {
 		t.Fatalf("spool holds %d blobs after the failed row write, want 0", len(entries))
+	}
+	if n := len(rm.removedDigests()); n != 0 {
+		t.Fatalf("RemoveBlob called for %d blobs that never left the node, want 0", n)
 	}
 	if sess, err := mem.GetSession(ctx, uploadID); err != nil || sess.State != registry.SessionOpen {
 		t.Fatalf("session after the failed part = %v/%v, want still open", sess, err)

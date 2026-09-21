@@ -307,6 +307,9 @@ func TestPostgresStores_Live(t *testing.T) {
 		if err := r.PutIntent(ctx, registry.UploadIntent{Digest: digest, LocalPath: "/spool/x", Size: 9, State: registry.IntentSpooled, Bucket: "b"}); err != nil {
 			t.Fatalf("PutIntent: %v", err)
 		}
+		if err := r.SetIntentState(ctx, digest, registry.IntentUploading); err != nil {
+			t.Fatalf("SetIntentState (uploading, the constraint admits it): %v", err)
+		}
 		if err := r.SetIntentState(ctx, digest, registry.IntentParked); err != nil {
 			t.Fatalf("SetIntentState: %v", err)
 		}

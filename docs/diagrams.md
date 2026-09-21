@@ -521,16 +521,19 @@ flowchart TB
 
     subgraph intents["upload_intents, per digest"]
         spooled([spooled])
+        uploading([uploading])
         parked([parked])
         accepted([accepted])
         published([published])
     end
 
     spooled -->|"dedup: blob_locations hit"| accepted
-    spooled -->|"single-shot upload:<br/>/blob/add, PUT, conclude, accept"| accepted
-    spooled -->|"parkBlobs: /blob/add WithConclude(false),<br/>PUT; blob_parks row written"| parked
+    spooled -->|"first network call begins<br/>(uploadBlobs, parkBlobs, concludeBlobs fallback)"| uploading
+    uploading -->|"single-shot upload:<br/>/blob/add, PUT, conclude, accept"| accepted
+    uploading -->|"parkBlobs: /blob/add WithConclude(false),<br/>PUT; blob_parks row written"| parked
     parked -->|"concludeBlobs at Complete:<br/>/ucan/conclude; blob_parks row deleted"| accepted
-    spooled -->|"release record; executeRelease:<br/>DeleteIntent + spool.Remove"| gone([deleted])
+    spooled -->|"release record; executeRelease, local only<br/>(the blob never left this node):<br/>DeleteIntent + spool.Remove"| gone([deleted])
+    uploading -->|"release record; executeRelease: /blob/remove<br/>(idempotent: the accept may have landed, its location not);<br/>DeleteIntent + spool.Remove"| gone
     parked -->|"release record; executeRelease: /blob/abort (cause AddTask),<br/>or /blob/remove if the provider says accepted;<br/>DeleteIntent + spool.Remove"| gone
     accepted -->|"release record (never committed);<br/>executeRelease: /blob/remove;<br/>DeleteIntent + spool.Remove"| gone
 
@@ -836,7 +839,7 @@ erDiagram
         bytea digest PK
         text local_path
         bigint size
-        text state "spooled, parked, accepted, published (claimed by a commit)"
+        text state "spooled, uploading, parked, accepted, published (claimed by a commit)"
         text bucket
     }
     blob_locations {

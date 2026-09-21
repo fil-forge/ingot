@@ -1102,6 +1102,10 @@ func (b *Backend) parkBlobs(ctx context.Context, space did.DID, blobs []msbucket
 		if err != nil {
 			return fmt.Errorf("lookup intent: %w", err)
 		}
+		// The blob may be on the network from here on (see IntentUploading).
+		if err := b.intents.SetIntentState(ctx, digest, registry.IntentUploading); err != nil {
+			return fmt.Errorf("mark uploading: %w", err)
+		}
 		res, err := b.deferred.UploadBlob(ctx, space, digest, in.Size, b.spool.Path(digest), uploader.WithConclude(false))
 		if err != nil {
 			return fmt.Errorf("park blob: %w", err)
@@ -1261,6 +1265,10 @@ func (b *Backend) concludeBlobs(ctx context.Context, space did.DID, blobs []msbu
 		in, err := b.intents.GetIntent(ctx, blob.Digest)
 		if err != nil {
 			return fmt.Errorf("lookup intent: %w", err)
+		}
+		// The blob may be on the network from here on (see IntentUploading).
+		if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentUploading); err != nil {
+			return fmt.Errorf("mark uploading: %w", err)
 		}
 		res, err := b.uploader.UploadBlob(ctx, space, blob.Digest, in.Size, b.spool.Path(blob.Digest))
 		if err != nil {
