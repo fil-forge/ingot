@@ -374,12 +374,13 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 		// the only index to its blobs, and with the bucket row gone the
 		// sweeper would have no space to record them against.
 		//
-		// s3:DeleteBucket delegates no blob commands (hilt's s3perm maps it
-		// to nil), so the request's proofs cannot authorize /blob/abort or
-		// /blob/remove. Every release below runs without the request proof
-		// store, so the uploader falls back to the blob authority captured
-		// at write time — the same resolution the sweepers use. The bucket
-		// deletion itself keeps the request.
+		// The session teardown runs without the request's proof store, as
+		// the implicit abort always has: the uploader then falls back to the
+		// blob authority captured at write time, the same resolution the
+		// sweepers use. The shipped-segment release and the drain below keep
+		// the request's proofs, which authorize their removes; a bucket that
+		// never saw a multipart write has no captured authority to fall
+		// back on, and masking them fails the delete.
 		relCtx := reqscope.WithoutProofStore(ctx)
 		sessions, err := b.multipart.ListSessions(ctx, name)
 		if err != nil {
@@ -427,7 +428,7 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 				return fmt.Errorf("s3frontend: delete bucket: %w", err)
 			}
 			for _, d := range digests {
-				if err := b.remover.RemoveBlob(relCtx, st.Space, d); err != nil {
+				if err := b.remover.RemoveBlob(ctx, st.Space, d); err != nil {
 					return fmt.Errorf("s3frontend: delete bucket: release shipped segment: %w", err)
 				}
 			}
@@ -438,7 +439,7 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 		// hilt refuses to delete a space that still holds registrations.
 		// The bucket is provably empty here and its deletion explicit, so
 		// no grace is owed — execute the space's pending releases now.
-		if err := b.drainSpaceReleases(relCtx, st.Space); err != nil {
+		if err := b.drainSpaceReleases(ctx, st.Space); err != nil {
 			return fmt.Errorf("s3frontend: delete bucket: %w", err)
 		}
 
