@@ -469,6 +469,19 @@ func TestPostgresStores_Live(t *testing.T) {
 		if err != nil || s.ContentType != "text/plain" || s.Metadata["x-amz-meta-foo"] != "bar" {
 			t.Fatalf("GetSession = %+v, err %v (metadata jsonb round-trip)", s, err)
 		}
+		if s.Space.Defined() {
+			t.Fatalf("session created without a space reads back %v, want undefined", s.Space)
+		}
+		// The bucket's space rides on the session, for teardown once the
+		// bucket row is gone.
+		space := testutil.RandomDID(t)
+		if err := r.CreateSession(ctx, registry.MultipartSession{UploadID: id + "-space", Bucket: "b", ObjectKey: "k", Space: space}); err != nil {
+			t.Fatalf("CreateSession (space): %v", err)
+		}
+		if got, err := r.GetSession(ctx, id+"-space"); err != nil || got.Space != space {
+			t.Fatalf("GetSession space = %v, err %v (want %v)", got.Space, err, space)
+		}
+		_ = r.DeleteSession(ctx, id+"-space")
 
 		// bytea[] round trip + ordering.
 		if err := r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 2, ETagMD5: []byte{0x02}, Size: 2, BlobDigests: []multihash.Multihash{{0xd2}}}); err != nil {

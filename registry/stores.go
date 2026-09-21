@@ -152,9 +152,14 @@ type BlobInclusion struct {
 // headers (ContentEncoding..Expires) are captured at CreateMultipartUpload so
 // Complete can write them into the manifest exactly like a single-shot PUT.
 type MultipartSession struct {
-	UploadID                string
-	Bucket                  string
-	ObjectKey               string
+	UploadID  string
+	Bucket    string
+	ObjectKey string
+	// Space is the bucket's Forge space, recorded at create so a teardown
+	// can record and run the parts' releases without the bucket row, which
+	// a session created during DeleteBucket can outlive. Undefined on rows
+	// that predate the column.
+	Space                   did.DID
 	State                   string
 	ContentType             string
 	ContentEncoding         string

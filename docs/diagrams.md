@@ -461,9 +461,9 @@ sequenceDiagram
   that is not still live in the session; the release itself decides whether
   the blob is free to go — a claimed digest drops the record (`CountClaims`),
   and one a part of an in-flight session references waits
-  (`CountLivePartRefs`). `CompleteSession` marks the winning parts, so the
-  reap of a retained completed session releases only what the Complete
-  omitted.
+  (`CountLivePartRefs`, checked first: a Complete claims before it leaves
+  'completing'). `AddBlobClaim` publishes a committed blob's upload intent,
+  so the reap of a retained session releases only what was never committed.
 - A never-parked blob at Complete falls back to a full synchronous
   `UploadBlob`.
 
@@ -856,6 +856,7 @@ erDiagram
     multipart_sessions {
         text upload_id PK
         text bucket
+        text space "the bucket's space, for teardown after the bucket row is gone"
         text object_key
         text state "open, completing, aborting, completed"
         text checksum_algorithm

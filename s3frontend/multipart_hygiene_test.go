@@ -15,6 +15,7 @@ import (
 	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/versitygw/backend"
 	"github.com/fil-forge/versitygw/s3err"
+	"github.com/fil-forge/versitygw/s3response"
 	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
 	"go.uber.org/zap/zaptest"
@@ -1729,5 +1730,100 @@ func TestReapKeepsSessionWhenBucketLookupFails(t *testing.T) {
 	}
 	if !pu.abortedDigests()[string(d)] {
 		t.Fatalf("blob %x was not released by the second sweep", d)
+	}
+}
+
+// recordingReleases records the space each bulk enqueue was made against.
+type recordingReleases struct {
+	registry.PendingReleaseStore
+	spaces []did.DID
+}
+
+func (r *recordingReleases) EnqueueReleases(ctx context.Context, space did.DID, digests []multihash.Multihash, notBefore time.Time) ([]registry.PendingRelease, error) {
+	r.spaces = append(r.spaces, space)
+	return r.PendingReleaseStore.EnqueueReleases(ctx, space, digests, notBefore)
+}
+
+// TestSweepReleasesSessionThatOutlivedItsBucket: a session created while its
+// bucket was being deleted outlives the bucket row. Its space was recorded at
+// create, so the sweep still records and runs its parts' releases against
+// that space rather than dropping the only index to the blobs.
+func TestSweepReleasesSessionThatOutlivedItsBucket(t *testing.T) {
+	pu := &parkingUploader{}
+	rel := &recordingReleases{}
+	b, mem := newDeferredBackend(t, pu, func(d *Deps) {
+		rel.PendingReleaseStore = d.PendingReleases
+		d.PendingReleases = rel
+	})
+	ctx := context.Background()
+	bucket, key := "doomed", "part"
+	space, err := did.Parse("did:web:doomed.example")
+	if err != nil {
+		t.Fatalf("did.Parse: %v", err)
+	}
+	if err := mem.Create(ctx, bucket, space, registry.CreateState{}); err != nil {
+		t.Fatalf("create bucket: %v", err)
+	}
+	res, err := b.CreateMultipartUpload(ctx, s3response.CreateMultipartUploadInput{Bucket: &bucket, Key: &key})
+	if err != nil {
+		t.Fatalf("CreateMultipartUpload: %v", err)
+	}
+	uploadID := res.UploadId
+	one := int32(1)
+	if _, err := b.UploadPart(ctx, &s3.UploadPartInput{Bucket: &bucket, Key: &key, UploadId: &uploadID, PartNumber: &one, Body: bytes.NewReader(testBody(int(backend.MinPartSize)))}); err != nil {
+		t.Fatalf("UploadPart: %v", err)
+	}
+	d := hygienePartDigests(t, mem, uploadID, 1)[0]
+	if sess, err := mem.GetSession(ctx, uploadID); err != nil || sess.Space != space {
+		t.Fatalf("session space = %v/%v, want %v recorded at create", sess, err, space)
+	}
+
+	// The bucket row goes while the session stands.
+	if err := mem.Delete(ctx, bucket); err != nil {
+		t.Fatalf("delete bucket row: %v", err)
+	}
+	if n, err := b.SweepStaleMultipartSessions(ctx, -time.Second); err != nil || n == 0 {
+		t.Fatalf("sweep: cleaned=%d err=%v", n, err)
+	}
+	if _, err := mem.GetSession(ctx, uploadID); !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("session survived the sweep (err=%v)", err)
+	}
+	if len(rel.spaces) == 0 || rel.spaces[len(rel.spaces)-1] != space {
+		t.Fatalf("releases recorded against %v, want the session's space %v", rel.spaces, space)
+	}
+	if !pu.abortedDigests()[string(d)] {
+		t.Fatalf("parked blob %x was not released on the provider", d)
+	}
+	if _, err := mem.GetPark(ctx, d); !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("park row for %x survived (err=%v)", d, err)
+	}
+}
+
+// TestSweepKeepsLegacySessionWhoseBucketIsGone: a session row from before the
+// space column, whose bucket row is gone, cannot record its releases. The
+// sweep keeps it rather than dropping the only index to its blobs.
+func TestSweepKeepsLegacySessionWhoseBucketIsGone(t *testing.T) {
+	b, mem, pu := newParkingBackend(t)
+	ctx := context.Background()
+	const uploadID = "legacy"
+	if err := mem.CreateSession(ctx, registry.MultipartSession{UploadID: uploadID, Bucket: "ghost", ObjectKey: "k"}); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	d := multihash.Multihash([]byte("legacy-blob"))
+	if err := mem.PutPart(ctx, registry.MultipartPart{UploadID: uploadID, PartNumber: 1, ETagMD5: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{d}, State: registry.PartParked}); err != nil {
+		t.Fatalf("PutPart: %v", err)
+	}
+
+	if n, err := b.SweepStaleMultipartSessions(ctx, -time.Second); err != nil || n != 0 {
+		t.Fatalf("sweep: cleaned=%d err=%v, want the row kept", n, err)
+	}
+	if sess, err := mem.GetSession(ctx, uploadID); err != nil || sess.State != registry.SessionAborting {
+		t.Fatalf("legacy session = %v/%v, want kept, latched aborting", sess, err)
+	}
+	if parts, _ := mem.ListParts(ctx, uploadID); len(parts) != 1 {
+		t.Fatalf("part rows = %d, want 1 (the only index to the blob)", len(parts))
+	}
+	if pu.abortedDigests()[string(d)] {
+		t.Fatal("blob was aborted without a space to record its release against")
 	}
 }

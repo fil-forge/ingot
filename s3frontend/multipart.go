@@ -105,6 +105,7 @@ func (b *Backend) CreateMultipartUpload(ctx context.Context, input s3response.Cr
 		UploadID:                uploadID,
 		Bucket:                  bucket,
 		ObjectKey:               key,
+		Space:                   st.Space,
 		State:                   registry.SessionOpen,
 		ContentType:             ct,
 		ContentEncoding:         normalizeContentEncoding(backend.GetStringFromPtr(input.ContentEncoding)),
@@ -969,11 +970,24 @@ func (b *Backend) enqueuePartReleases(ctx context.Context, space did.DID, digest
 	return records, nil
 }
 
-// isNoSuchBucket reports whether a bucketSpace failure is the bucket row
-// being gone, as opposed to a lookup that failed.
-func isNoSuchBucket(err error) bool {
-	var apiErr s3err.APIError
-	return errors.As(err, &apiErr) && apiErr.Code == "NoSuchBucket"
+// sessionSpace is the space a session's blobs live in: recorded on the
+// session at create, so a teardown never depends on the bucket row (a session
+// created while DeleteBucket was listing sessions outlives the bucket, and
+// its part rows are the only index to blobs the space still holds). A row
+// that predates the column resolves its bucket instead; when that lookup
+// fails the row is kept for the next sweep, since dropping it would strand
+// the blobs. ok=false means the caller should retry later.
+func (b *Backend) sessionSpace(ctx context.Context, s registry.MultipartSession) (did.DID, bool) {
+	if s.Space.Defined() {
+		return s.Space, true
+	}
+	space, err := b.bucketSpace(ctx, s.Bucket)
+	if err != nil {
+		b.logger.Warn("sweep: session predates the space column and its bucket cannot be resolved; retrying next sweep",
+			zap.String("uploadID", s.UploadID), zap.String("bucket", s.Bucket), zap.Error(err))
+		return did.Undef, false
+	}
+	return space, true
 }
 
 // parkBlobs makes each blob durable on its provider without accepting it:
@@ -1475,16 +1489,8 @@ func (b *Backend) SweepStaleMultipartSessions(ctx context.Context, ttl time.Dura
 // again is what makes that best-effort pass safe to lose. Reports whether
 // the row was removed; a failure leaves it for the next sweep.
 func (b *Backend) reapCompletedSession(ctx context.Context, s registry.MultipartSession) bool {
-	space, err := b.bucketSpace(ctx, s.Bucket)
-	if err != nil {
-		if isNoSuchBucket(err) {
-			// DeleteBucket reaps every session of the bucket, recording its
-			// releases, before the bucket row goes; a row that outlived the
-			// bucket has nothing left to record.
-			return b.multipart.DeleteSession(ctx, s.UploadID) == nil
-		}
-		b.logger.Warn("sweep: resolve bucket space failed; retrying next sweep",
-			zap.String("uploadID", s.UploadID), zap.Error(err))
+	space, ok := b.sessionSpace(ctx, s)
+	if !ok {
 		return false
 	}
 	released, err := b.recordSessionReleases(ctx, space, s.UploadID)
@@ -1507,16 +1513,8 @@ func (b *Backend) reapCompletedSession(ctx context.Context, s registry.Multipart
 // was removed; a failure before the delete leaves the session latched for
 // the next sweep, since the part rows are the only index to the blobs.
 func (b *Backend) reapAbortingSession(ctx context.Context, s registry.MultipartSession) bool {
-	space, err := b.bucketSpace(ctx, s.Bucket)
-	if err != nil {
-		if isNoSuchBucket(err) {
-			// DeleteBucket reaps every session of the bucket, recording its
-			// releases, before the bucket row goes; a row that outlived the
-			// bucket has nothing left to record.
-			return b.multipart.DeleteSession(ctx, s.UploadID) == nil
-		}
-		b.logger.Warn("sweep: resolve bucket space failed; retrying next sweep",
-			zap.String("uploadID", s.UploadID), zap.Error(err))
+	space, ok := b.sessionSpace(ctx, s)
+	if !ok {
 		return false
 	}
 	// Records first, then the row: the part rows are the only index to the

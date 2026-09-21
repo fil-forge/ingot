@@ -532,13 +532,14 @@ func (r *Postgres) CreateSession(ctx context.Context, s MultipartSession) error 
 		   (upload_id, bucket, object_key, state, content_type, metadata,
 		    content_encoding, content_disposition, content_language, cache_control, expires,
 		    website_redirect_location, checksum_algorithm, checksum_type,
-		    lock_mode, lock_retain_until, lock_legal_hold, tagging)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)`,
+		    lock_mode, lock_retain_until, lock_legal_hold, tagging, space)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)`,
 		s.UploadID, s.Bucket, s.ObjectKey, state, nullString(s.ContentType), meta,
 		nullString(s.ContentEncoding), nullString(s.ContentDisposition),
 		nullString(s.ContentLanguage), nullString(s.CacheControl), nullString(s.Expires),
 		nullString(s.WebsiteRedirectLocation), nullString(s.ChecksumAlgorithm), nullString(s.ChecksumType),
-		nullString(s.LockMode), s.LockRetainUntil, nullString(s.LockLegalHold), nullString(s.Tagging))
+		nullString(s.LockMode), s.LockRetainUntil, nullString(s.LockLegalHold), nullString(s.Tagging),
+		s.Space.String())
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == uniqueViolation {
@@ -555,7 +556,7 @@ func (r *Postgres) GetSession(ctx context.Context, uploadID string) (*MultipartS
 		        content_encoding, content_disposition, content_language, cache_control, expires,
 		        website_redirect_location, checksum_algorithm, checksum_type,
 		        lock_mode, lock_retain_until, lock_legal_hold, tagging,
-		        committed_etag, committed_version_id
+		        committed_etag, committed_version_id, space
 		 FROM ingot.multipart_sessions WHERE upload_id = $1`,
 		uploadID)
 	s, err := scanSession(row)
@@ -575,12 +576,18 @@ func scanSession(row pgx.Row) (*MultipartSession, error) {
 	var contentType, ce, cd, cl, cc, exp, wrl, ckAlgo, ckType, lockMode, lockHold, tagging *string
 	var committedETag, committedVersionID *string
 	var meta []byte
+	var space string
 	err := row.Scan(&s.UploadID, &s.Bucket, &s.ObjectKey, &s.State, &contentType, &meta, &s.CreatedAt,
 		&ce, &cd, &cl, &cc, &exp, &wrl, &ckAlgo, &ckType,
 		&lockMode, &s.LockRetainUntil, &lockHold, &tagging,
-		&committedETag, &committedVersionID)
+		&committedETag, &committedVersionID, &space)
 	if err != nil {
 		return nil, err
+	}
+	if space != "" {
+		if s.Space, err = did.Parse(space); err != nil {
+			return nil, fmt.Errorf("registry: session %s space %q: %w", s.UploadID, space, err)
+		}
 	}
 	setIfNotNil := func(dst *string, src *string) {
 		if src != nil {
@@ -689,7 +696,7 @@ func (r *Postgres) ListSessions(ctx context.Context, bucket string) ([]Multipart
 		        content_encoding, content_disposition, content_language, cache_control, expires,
 		        website_redirect_location, checksum_algorithm, checksum_type,
 		        lock_mode, lock_retain_until, lock_legal_hold, tagging,
-		        committed_etag, committed_version_id
+		        committed_etag, committed_version_id, space
 		 FROM ingot.multipart_sessions WHERE bucket = $1
 		 ORDER BY object_key ASC, created_at ASC, upload_id ASC`,
 		bucket)
@@ -718,7 +725,7 @@ func (r *Postgres) ListStaleSessions(ctx context.Context, state string, cutoff t
 		        content_encoding, content_disposition, content_language, cache_control, expires,
 		        website_redirect_location, checksum_algorithm, checksum_type,
 		        lock_mode, lock_retain_until, lock_legal_hold, tagging,
-		        committed_etag, committed_version_id
+		        committed_etag, committed_version_id, space
 		 FROM ingot.multipart_sessions WHERE state = $1 AND created_at < $2
 		 ORDER BY created_at ASC`,
 		state, cutoff)

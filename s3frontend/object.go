@@ -525,18 +525,15 @@ func (b *Backend) releaseNow(ctx context.Context, records []registry.PendingRele
 
 // runRelease attempts one release record end to end and reports what to do
 // with the record.
+//
+// The two checks run in this order on purpose. A Complete adds its claims
+// while its session is still 'completing' and only then marks it completed,
+// so a release that read the claims first could see none, lose the race to
+// the commit, and then find no live session either. Reading the live part
+// references first closes that window: a session seen in flight defers the
+// release, and a session seen already completed has its claims in place for
+// the check that follows.
 func (b *Backend) runRelease(ctx context.Context, pr registry.PendingRelease) releaseOutcome {
-	n, err := b.blobRefs.CountClaims(ctx, pr.Space, pr.Digest)
-	if err != nil {
-		b.logger.Warn("release: count claims failed; retrying next sweep",
-			zap.String("digest", hex.EncodeToString(pr.Digest)), zap.Error(err))
-		return releaseFailed
-	}
-	if n > 0 {
-		// Re-claimed since enqueue (e.g. a commit that failed after its
-		// drop ran, then retried) — the record is stale, not the claim.
-		return releaseStale
-	}
 	live, err := b.multipart.CountLivePartRefs(ctx, pr.Digest)
 	if err != nil {
 		b.logger.Warn("release: count live part refs failed; retrying next sweep",
@@ -549,6 +546,17 @@ func (b *Backend) runRelease(ctx context.Context, pr registry.PendingRelease) re
 		// into a claim, which makes this record stale; its abort or expiry
 		// records a release of its own. Either way the wait ends.
 		return releaseDeferred
+	}
+	n, err := b.blobRefs.CountClaims(ctx, pr.Space, pr.Digest)
+	if err != nil {
+		b.logger.Warn("release: count claims failed; retrying next sweep",
+			zap.String("digest", hex.EncodeToString(pr.Digest)), zap.Error(err))
+		return releaseFailed
+	}
+	if n > 0 {
+		// Re-claimed since enqueue (e.g. a commit that failed after its
+		// drop ran, then retried) — the record is stale, not the claim.
+		return releaseStale
 	}
 	if !b.executeRelease(ctx, pr) {
 		return releaseFailed
