@@ -658,7 +658,15 @@ func (b *Backend) executeRelease(ctx context.Context, pr registry.PendingRelease
 			return false
 		}
 	default:
-		// Never left this node: nothing on the network to release.
+		// No row says the blob is on the network, but its absence is not
+		// proof: a never-parked blob can be uploaded and accepted at Complete
+		// and then fail to record its location, leaving neither row. The
+		// upload service treats a remove of a blob it never registered as
+		// success, so the remove costs one round trip and closes that leak.
+		if err := b.remover.RemoveBlob(ctx, space, digest); err != nil {
+			log.Warn("release: network remove of a blob with no rows failed", zap.Error(err))
+			return false
+		}
 	}
 
 	if err := b.locations.DeleteLocation(ctx, space, digest); err != nil {

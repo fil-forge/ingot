@@ -571,3 +571,28 @@ func TestBlobRefs_ClaimPublishesIntent(t *testing.T) {
 		t.Fatalf("AddBlobClaim without intent: %v", err)
 	}
 }
+
+// Staleness counts from the last state change: a latch restarts the clock.
+func TestSessions_StaleByStateChange(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+	old := time.Now().Add(-2 * time.Hour)
+	for _, id := range []string{"latched", "untouched"} {
+		if err := m.CreateSession(ctx, registry.MultipartSession{UploadID: id, Bucket: "b", ObjectKey: id, CreatedAt: old}); err != nil {
+			t.Fatalf("CreateSession %s: %v", id, err)
+		}
+	}
+	if won, err := m.LatchSession(ctx, "latched", registry.SessionOpen, registry.SessionCompleting); err != nil || !won {
+		t.Fatalf("latch: won=%v err=%v", won, err)
+	}
+	cutoff := time.Now().Add(-time.Hour)
+	if stale, _ := m.ListStaleSessions(ctx, registry.SessionOpen, cutoff); len(stale) != 1 || stale[0].UploadID != "untouched" {
+		t.Fatalf("stale open = %+v, want only the untouched session", stale)
+	}
+	if stale, _ := m.ListStaleSessions(ctx, registry.SessionCompleting, cutoff); len(stale) != 0 {
+		t.Fatalf("stale completing = %+v, want none: the latch was just now", stale)
+	}
+	if s, _ := m.GetSession(ctx, "latched"); !s.StateChangedAt.After(s.CreatedAt) {
+		t.Fatalf("StateChangedAt %v not after CreatedAt %v", s.StateChangedAt, s.CreatedAt)
+	}
+}

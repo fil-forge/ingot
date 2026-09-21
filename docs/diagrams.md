@@ -454,7 +454,7 @@ sequenceDiagram
     C->>B: AbortMultipartUpload
     B->>R: LatchSession(open to aborting); EnqueueReleases for every<br/>unreferenced part blob; then DeleteSession (parts cascade)
     B->>U: releaseNow, per record: crypto-shred, then /blob/abort a parked blob<br/>(cause = AddTask) or /blob/remove an accepted one; local rows dropped<br/>once the network step succeeds; the release sweeper retries the rest
-    Note over B,R: a background sweeper aborts open sessions older than<br/>MultipartSessionTTL (default 7d) and reaps terminal rows
+    Note over B,R: a background sweeper tears down sessions whose state has not<br/>changed for MultipartSessionTTL (default 7d); a Complete's latch restarts the clock
 ```
 
 - A part re-upload and an abort record a release for every blob of theirs
@@ -859,6 +859,7 @@ erDiagram
         text space "the bucket's space, for teardown after the bucket row is gone"
         text object_key
         text state "open, completing, aborting, completed"
+        timestamptz state_changed_at "the sweeper's clock"
         text checksum_algorithm
     }
     multipart_parts {

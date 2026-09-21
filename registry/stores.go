@@ -195,6 +195,11 @@ type MultipartSession struct {
 	CommittedETag      string
 	CommittedVersionID string
 	CreatedAt          time.Time
+	// StateChangedAt is when State last changed (creation, for a session
+	// still open). The sweeper measures staleness from it, so a Complete
+	// that latches an old session to 'completing' holds the row for a TTL
+	// of its own.
+	StateChangedAt time.Time
 }
 
 // MultipartPart is one row of ingot.multipart_parts. BlobDigests is the
@@ -376,8 +381,9 @@ type MultipartStore interface {
 	// (prefix/markers/max) happens in the handler; in-flight session counts are
 	// small.
 	ListSessions(ctx context.Context, bucket string) ([]MultipartSession, error)
-	// ListStaleSessions returns sessions in `state` created before cutoff, for
-	// the abandoned-upload sweeper.
+	// ListStaleSessions returns sessions in `state` whose state last changed
+	// before cutoff, for the abandoned-upload sweeper. A session that has
+	// never left 'open' counts from its creation.
 	ListStaleSessions(ctx context.Context, state string, cutoff time.Time) ([]MultipartSession, error)
 	// CountPartRefs returns how many parts OUTSIDE excludeUploadID reference
 	// digest — the shared-blob guard for abort/supersede spool cleanup

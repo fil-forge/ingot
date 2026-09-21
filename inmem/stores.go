@@ -354,6 +354,9 @@ func (m *MemStore) CreateSession(_ context.Context, s registry.MultipartSession)
 	if s.CreatedAt.IsZero() {
 		s.CreatedAt = time.Now()
 	}
+	if s.StateChangedAt.IsZero() {
+		s.StateChangedAt = s.CreatedAt
+	}
 	m.sessions[s.UploadID] = cloneSession(s)
 	return nil
 }
@@ -380,6 +383,7 @@ func (m *MemStore) LatchSession(_ context.Context, uploadID, from, to string) (b
 		return false, nil
 	}
 	s.State = to
+	s.StateChangedAt = time.Now()
 	m.sessions[uploadID] = s
 	return true, nil
 }
@@ -394,6 +398,7 @@ func (m *MemStore) CompleteSession(_ context.Context, uploadID, etag, versionID 
 	s.State = registry.SessionCompleted
 	s.CommittedETag = etag
 	s.CommittedVersionID = versionID
+	s.StateChangedAt = time.Now()
 	m.sessions[uploadID] = s
 	return true, nil
 }
@@ -477,11 +482,11 @@ func (m *MemStore) ListStaleSessions(_ context.Context, state string, cutoff tim
 	defer m.mu.Unlock()
 	var out []registry.MultipartSession
 	for _, s := range m.sessions {
-		if s.State == state && s.CreatedAt.Before(cutoff) {
+		if s.State == state && s.StateChangedAt.Before(cutoff) {
 			out = append(out, cloneSession(s))
 		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
+	sort.Slice(out, func(i, j int) bool { return out[i].StateChangedAt.Before(out[j].StateChangedAt) })
 	return out, nil
 }
 

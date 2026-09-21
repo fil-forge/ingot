@@ -1828,12 +1828,12 @@ func TestSweepKeepsLegacySessionWhoseBucketIsGone(t *testing.T) {
 	}
 }
 
-// TestAbortReleasesAgainstTheSessionsOwnSpace: the session's bucket is
-// deleted and recreated under the same name with a new space before the
-// session is aborted. The abort releases against the space the parts were
-// parked in, recorded on the session, never the space that now carries the
-// bucket's name.
-func TestAbortReleasesAgainstTheSessionsOwnSpace(t *testing.T) {
+// TestRecreatedBucketDisownsItsPredecessorsUploads: the session's bucket is
+// deleted and recreated under the same name with a new space. The parts were
+// parked in the old space, so the new bucket does not know the upload: parts,
+// Complete and Abort all report NoSuchUpload, and the sweeper tears the
+// session down against the space recorded on it, never the new bucket's.
+func TestRecreatedBucketDisownsItsPredecessorsUploads(t *testing.T) {
 	pu := &parkingUploader{}
 	rel := &recordingReleases{}
 	b, mem := newDeferredBackend(t, pu, func(d *Deps) {
@@ -1853,7 +1853,8 @@ func TestAbortReleasesAgainstTheSessionsOwnSpace(t *testing.T) {
 	}
 	uploadID := res.UploadId
 	one := int32(1)
-	if _, err := b.UploadPart(ctx, &s3.UploadPartInput{Bucket: &bucket, Key: &key, UploadId: &uploadID, PartNumber: &one, Body: bytes.NewReader(testBody(int(backend.MinPartSize)))}); err != nil {
+	out, err := b.UploadPart(ctx, &s3.UploadPartInput{Bucket: &bucket, Key: &key, UploadId: &uploadID, PartNumber: &one, Body: bytes.NewReader(testBody(int(backend.MinPartSize)))})
+	if err != nil {
 		t.Fatalf("UploadPart: %v", err)
 	}
 	d := hygienePartDigests(t, mem, uploadID, 1)[0]
@@ -1866,8 +1867,26 @@ func TestAbortReleasesAgainstTheSessionsOwnSpace(t *testing.T) {
 		t.Fatalf("recreate bucket: %v", err)
 	}
 
-	if err := b.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{Bucket: &bucket, Key: &key, UploadId: &uploadID}); err != nil {
-		t.Fatalf("Abort: %v", err)
+	wantNoSuchUpload := func(op string, err error) {
+		t.Helper()
+		var apiErr s3err.APIError
+		if !errors.As(err, &apiErr) || apiErr.Code != "NoSuchUpload" {
+			t.Fatalf("%s against the recreated bucket: err = %v, want NoSuchUpload", op, err)
+		}
+	}
+	two := int32(2)
+	_, err = b.UploadPart(ctx, &s3.UploadPartInput{Bucket: &bucket, Key: &key, UploadId: &uploadID, PartNumber: &two, Body: bytes.NewReader(testBody(int(backend.MinPartSize)))})
+	wantNoSuchUpload("UploadPart", err)
+	_, _, err = b.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{Bucket: &bucket, Key: &key, UploadId: &uploadID,
+		MultipartUpload: &types.CompletedMultipartUpload{Parts: []types.CompletedPart{{PartNumber: &one, ETag: out.ETag}}}})
+	wantNoSuchUpload("Complete", err)
+	wantNoSuchUpload("Abort", b.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{Bucket: &bucket, Key: &key, UploadId: &uploadID}))
+	if _, err := mem.GetSession(ctx, uploadID); err != nil {
+		t.Fatalf("the disowned session should stand for the sweeper: %v", err)
+	}
+
+	if n, err := b.SweepStaleMultipartSessions(ctx, -time.Second); err != nil || n == 0 {
+		t.Fatalf("sweep: cleaned=%d err=%v", n, err)
 	}
 	if len(rel.spaces) == 0 || rel.spaces[len(rel.spaces)-1] != oldSpace {
 		t.Fatalf("releases recorded against %v, want the session's own space %v", rel.spaces, oldSpace)
@@ -1876,6 +1895,113 @@ func TestAbortReleasesAgainstTheSessionsOwnSpace(t *testing.T) {
 		t.Fatalf("parked blob %x was not released on the provider", d)
 	}
 	if _, err := mem.GetSession(ctx, uploadID); !errors.Is(err, registry.ErrNotFound) {
-		t.Fatalf("session survived the abort (err=%v)", err)
+		t.Fatalf("session survived the sweep (err=%v)", err)
+	}
+}
+
+// TestSweepLeavesALiveCompleteOnAnOldSession: a Complete on a session older
+// than the TTL latches it to 'completing', which restarts the sweeper's
+// clock. The sweep leaves that row alone while still aborting an equally old
+// session nobody has touched.
+func TestSweepLeavesALiveCompleteOnAnOldSession(t *testing.T) {
+	b, mem, pu := newParkingBackend(t)
+	ctx := context.Background()
+	old := time.Now().Add(-2 * time.Hour)
+	mk := func(id string) multihash.Multihash {
+		if err := mem.CreateSession(ctx, registry.MultipartSession{UploadID: id, Bucket: "bk", ObjectKey: id, CreatedAt: old}); err != nil {
+			t.Fatalf("CreateSession %s: %v", id, err)
+		}
+		d, err := multihash.Sum([]byte("blob-"+id), multihash.SHA2_256, -1)
+		if err != nil {
+			t.Fatalf("multihash.Sum: %v", err)
+		}
+		if err := mem.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 1, ETagMD5: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{d}, State: registry.PartParked}); err != nil {
+			t.Fatalf("PutPart %s: %v", id, err)
+		}
+		// Parked on a provider, so a release of it is an abort the fake records.
+		task := cid.NewCidV1(cid.Raw, d).Bytes()
+		if err := mem.PutPark(ctx, registry.BlobPark{Digest: d, AddTask: task, AcceptTask: task, Size: 1}); err != nil {
+			t.Fatalf("PutPark %s: %v", id, err)
+		}
+		return d
+	}
+	completing := mk("completing-now")
+	abandoned := mk("abandoned")
+	if won, err := mem.LatchSession(ctx, "completing-now", registry.SessionOpen, registry.SessionCompleting); err != nil || !won {
+		t.Fatalf("latch: won=%v err=%v", won, err)
+	}
+
+	if n, err := b.SweepStaleMultipartSessions(ctx, time.Hour); err != nil || n != 1 {
+		t.Fatalf("sweep: cleaned=%d err=%v, want only the abandoned session", n, err)
+	}
+	if sess, err := mem.GetSession(ctx, "completing-now"); err != nil || sess.State != registry.SessionCompleting {
+		t.Fatalf("live Complete's session = %v/%v, want left completing", sess, err)
+	}
+	if parts, _ := mem.ListParts(ctx, "completing-now"); len(parts) != 1 {
+		t.Fatalf("live Complete's parts = %d, want intact", len(parts))
+	}
+	if pu.abortedDigests()[string(completing)] {
+		t.Fatal("the sweep aborted a blob a live Complete is concluding")
+	}
+	if _, err := mem.GetSession(ctx, "abandoned"); !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("abandoned session survived (err=%v)", err)
+	}
+	if !pu.abortedDigests()[string(abandoned)] {
+		t.Fatal("the abandoned session's blob was not released")
+	}
+}
+
+// TestReleaseRemovesBlobAcceptedWithoutRows: at Complete a never-parked blob
+// is uploaded and accepted, then the location fails to record, leaving no
+// park and no location row. If the client aborts instead of retrying, the
+// release must still remove the blob from the network: the rows' absence is
+// not proof it never left the node.
+func TestReleaseRemovesBlobAcceptedWithoutRows(t *testing.T) {
+	rm := &recordingRemover{}
+	locs := &failOncePutLocation{}
+	b, mem := newDeferredBackend(t, inmem.NopUploader{}, func(d *Deps) {
+		locs.LocationStore = d.Locations
+		d.Locations = locs
+		d.Remover = rm
+	})
+	ctx := context.Background()
+	bucket, key := "bk", "no-rows"
+
+	uploadID := mpCreate(t, b, key, "", "")
+	out, err := mpUploadPart(t, b, key, uploadID, 1, testBody(int(backend.MinPartSize)), nil)
+	if err != nil {
+		t.Fatalf("UploadPart: %v", err)
+	}
+	d := hygienePartDigests(t, mem, uploadID, 1)[0]
+	// Make the blob look never parked: no location, intent back to spooled.
+	if err := mem.DeleteLocation(ctx, did.Undef, d); err != nil {
+		t.Fatalf("DeleteLocation: %v", err)
+	}
+	if err := mem.SetIntentState(ctx, d, registry.IntentSpooled); err != nil {
+		t.Fatalf("SetIntentState: %v", err)
+	}
+
+	// Complete uploads it synchronously, the provider accepts, the location
+	// write fails.
+	locs.armed = true
+	one := int32(1)
+	if _, err := mpComplete(t, b, key, uploadID, []types.CompletedPart{{PartNumber: &one, ETag: out.ETag}}, nil); err == nil {
+		t.Fatal("Complete succeeded although the location failed to record")
+	}
+	if locs.armed {
+		t.Fatal("the location store never refused a write")
+	}
+	if loc, err := mem.GetLocation(ctx, did.Undef, d); err == nil && loc != nil {
+		t.Fatal("location row exists; the scenario needs the blob accepted with no rows")
+	}
+
+	if err := b.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{Bucket: &bucket, Key: &key, UploadId: &uploadID}); err != nil {
+		t.Fatalf("Abort: %v", err)
+	}
+	if rm.removedDigests()[string(d)] != 1 {
+		t.Fatalf("RemoveBlob calls for %x = %d, want 1: the accepted blob must be removed from the network", d, rm.removedDigests()[string(d)])
+	}
+	if _, err := mem.GetIntent(ctx, d); !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("intent for %x survived the release (err=%v)", d, err)
 	}
 }

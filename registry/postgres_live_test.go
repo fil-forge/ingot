@@ -574,9 +574,20 @@ func TestPostgresStores_Live(t *testing.T) {
 			t.Fatalf("CountLivePartRefs(shared) = %d, err %v (want 2)", n, err)
 		}
 
-		// 'completed' passes the widened state CHECK constraint.
+		// 'completed' passes the widened state CHECK constraint, and the
+		// latch restarts the sweeper's clock: the row is not stale by a
+		// past cutoff although it was created before it.
 		if won, err := r.LatchSession(ctx, "ls-1", registry.SessionOpen, registry.SessionCompleted); err != nil || !won {
 			t.Fatalf("latch to completed won=%v err=%v", won, err)
+		}
+		if s, err := r.GetSession(ctx, "ls-1"); err != nil || s.StateChangedAt.Before(s.CreatedAt) || s.StateChangedAt.IsZero() {
+			t.Fatalf("StateChangedAt after latch = %v (created %v), err %v", s.StateChangedAt, s.CreatedAt, err)
+		}
+		if stale, err := r.ListStaleSessions(ctx, registry.SessionCompleted, time.Now().Add(-time.Minute)); err != nil || len(stale) != 0 {
+			t.Fatalf("ListStaleSessions completed, past cutoff = %d, err %v (want 0: just latched)", len(stale), err)
+		}
+		if stale, err := r.ListStaleSessions(ctx, registry.SessionCompleted, time.Now().Add(time.Hour)); err != nil || len(stale) != 1 {
+			t.Fatalf("ListStaleSessions completed, future cutoff = %d, err %v (want 1)", len(stale), err)
 		}
 		// A completed session's parts are no longer live; an aborting one's
 		// are not either.

@@ -151,7 +151,31 @@ func (b *Backend) openSession(ctx context.Context, uploadID string, bucket, key 
 	if sess.State != registry.SessionOpen {
 		return nil, s3err.GetAPIError(s3err.ErrNoSuchUpload)
 	}
+	if bucket != nil {
+		if err := b.checkSessionSpace(ctx, sess); err != nil {
+			return nil, err
+		}
+	}
 	return sess, nil
+}
+
+// checkSessionSpace rejects a session whose bucket has since been deleted and
+// recreated under the same name: the parts were parked in the old bucket's
+// space, and the current bucket's space is another. Such an upload is no
+// upload of this bucket's; the sweeper tears it down against its own space.
+// A session that predates the space column carries no space to compare.
+func (b *Backend) checkSessionSpace(ctx context.Context, sess *registry.MultipartSession) error {
+	if !sess.Space.Defined() {
+		return nil
+	}
+	space, err := b.bucketSpace(ctx, sess.Bucket)
+	if err != nil {
+		return err
+	}
+	if space != sess.Space {
+		return s3err.GetAPIError(s3err.ErrNoSuchUpload)
+	}
+	return nil
 }
 
 // bucketSpace resolves the Forge space owning bucketName. Every network-side
@@ -402,6 +426,11 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 	// target. Unlike openSession this admits a completed session, which the
 	// idempotent re-Complete replays.
 	if sess.Bucket != bucket || sess.ObjectKey != key {
+		return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrNoSuchUpload)
+	}
+	// Nor a session of an earlier bucket by this name: its parts live in
+	// that bucket's space, and this bucket's is another.
+	if sess.Space.Defined() && sess.Space != bucketState.Space {
 		return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrNoSuchUpload)
 	}
 
@@ -1434,15 +1463,18 @@ func (b *Backend) ListMultipartUploads(ctx context.Context, input *s3.ListMultip
 	return res, nil
 }
 
-// SweepStaleMultipartSessions aborts in-flight multipart sessions older than
-// ttl (dropping their spooled parts, exactly like a client Abort) and reaps
-// completed leftovers past the same age. Sessions a crash stranded
-// mid-transition get the abort treatment too: a 'completing' row (Complete
-// died before the commit) and an 'aborting' row (Abort died before dropping
-// the session) still hold parts whose parked blobs must be released on their
-// providers — deleting the row alone would leave those allocations to sit
-// until expiry. Returns how many sessions were cleaned. Called periodically
-// by the daemon's sweeper loop.
+// SweepStaleMultipartSessions tears down sessions whose state has not changed
+// for ttl: open sessions are aborted exactly like a client Abort (their
+// parked parts released on their providers, their spool dropped), completed
+// leftovers are reaped, and sessions a crash stranded mid-transition — a
+// 'completing' row whose Complete died before the commit, an 'aborting' row
+// whose Abort died before dropping the session — get the abort treatment too,
+// since deleting the row alone would leave their parked allocations to sit
+// until expiry. Staleness counts from the last state change, so a Complete
+// that latches an old session to 'completing' holds the row for a TTL of its
+// own rather than racing a sweep that would abort the parts it is concluding;
+// a session never taken past 'open' counts from its creation. Returns how
+// many rows were removed. Called periodically by the daemon's sweeper loop.
 func (b *Backend) SweepStaleMultipartSessions(ctx context.Context, ttl time.Duration) (int, error) {
 	cutoff := time.Now().Add(-ttl)
 	cleaned := 0
