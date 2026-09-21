@@ -168,32 +168,51 @@ func TestPostgresStores_Live(t *testing.T) {
 		}
 	})
 
-	t.Run("pin claim requires an existing claim", func(t *testing.T) {
+	t.Run("pin claims require an existing claim, all or nothing", func(t *testing.T) {
 		space := testutil.RandomDID(t)
-		pinDigest := multihash.Multihash([]byte{0x12, 0x20, 0xb1, 0x01})
-		pin := registry.BlobClaim{Digest: pinDigest, Bucket: "pb", ObjectKey: "copy", VersionID: "null#7", Space: space}
-		if ok, err := r.PinBlobClaim(ctx, pin); err != nil || ok {
+		d1 := multihash.Multihash([]byte{0x12, 0x20, 0xb1, 0x01})
+		d2 := multihash.Multihash([]byte{0x12, 0x20, 0xb1, 0x02})
+		pin := func(ds ...multihash.Multihash) []registry.BlobClaim {
+			var out []registry.BlobClaim
+			for _, d := range ds {
+				out = append(out, registry.BlobClaim{Digest: d, Bucket: "pb", ObjectKey: "copy", VersionID: "null#7", Space: space})
+			}
+			return out
+		}
+		if ok, err := r.PinBlobClaims(ctx, pin(d1)); err != nil || ok {
 			t.Fatalf("pin with no claim to attach to: ok=%v err=%v, want refused", ok, err)
 		}
-		if n, _ := r.CountClaims(ctx, space, pinDigest); n != 0 {
-			t.Fatalf("refused pin left %d claims", n)
-		}
-		if err := r.AddBlobClaim(ctx, registry.BlobClaim{Digest: pinDigest, Bucket: "pb", ObjectKey: "src", VersionID: "null#1", Space: space}); err != nil {
+		if err := r.AddBlobClaim(ctx, registry.BlobClaim{Digest: d1, Bucket: "pb", ObjectKey: "src", VersionID: "null#1", Space: space}); err != nil {
 			t.Fatalf("AddBlobClaim: %v", err)
 		}
-		if ok, err := r.PinBlobClaim(ctx, pin); err != nil || !ok {
+		// d1 is claimed, d2 is not: nothing is recorded.
+		if ok, err := r.PinBlobClaims(ctx, pin(d1, d2)); err != nil || ok {
+			t.Fatalf("pin with one unclaimed digest: ok=%v err=%v, want refused", ok, err)
+		}
+		if n, _ := r.CountClaims(ctx, space, d1); n != 1 {
+			t.Fatalf("refused pin left %d claims on d1, want the source's 1", n)
+		}
+		if ok, err := r.PinBlobClaims(ctx, pin(d1)); err != nil || !ok {
 			t.Fatalf("pin beside a live claim: ok=%v err=%v, want recorded", ok, err)
 		}
-		if ok, err := r.PinBlobClaim(ctx, pin); err != nil || !ok {
+		if ok, err := r.PinBlobClaims(ctx, pin(d1)); err != nil || !ok {
 			t.Fatalf("repeated pin: ok=%v err=%v, want idempotent true", ok, err)
 		}
-		if n, _ := r.CountClaims(ctx, space, pinDigest); n != 2 {
+		if n, _ := r.CountClaims(ctx, space, d1); n != 2 {
 			t.Fatalf("claims after pin = %d, want 2", n)
 		}
 		// A claim in another space does not qualify.
 		other := testutil.RandomDID(t)
-		if ok, err := r.PinBlobClaim(ctx, registry.BlobClaim{Digest: pinDigest, Bucket: "pb2", ObjectKey: "copy", VersionID: "null#1", Space: other}); err != nil || ok {
+		if ok, err := r.PinBlobClaims(ctx, []registry.BlobClaim{{Digest: d1, Bucket: "pb2", ObjectKey: "copy", VersionID: "null#1", Space: other}}); err != nil || ok {
 			t.Fatalf("pin against another space's claim: ok=%v err=%v, want refused", ok, err)
+		}
+		// Dropping the source's claim beside the pin enqueues nothing; dropping
+		// the pin too does.
+		if enq, err := r.DropClaimEnqueueRelease(ctx, d1, "pb", "src", "null#1", space, time.Now()); err != nil || enq {
+			t.Fatalf("drop source beside pin: enqueued=%v err=%v, want false", enq, err)
+		}
+		if enq, err := r.DropClaimEnqueueRelease(ctx, d1, "pb", "copy", "null#7", space, time.Now()); err != nil || !enq {
+			t.Fatalf("drop last claim: enqueued=%v err=%v, want true", enq, err)
 		}
 	})
 

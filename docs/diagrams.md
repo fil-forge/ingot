@@ -552,7 +552,7 @@ flowchart TB
 - Parked-blob reclamation is guarded: a digest live in another session, part,
   or committed object is left alone.
 - A same-space copy pins the source's body: its claims are taken with
-  `PinBlobClaim`, which requires an existing claim on the digest in the same
+  `PinBlobClaims`, which requires an existing claim on the digest in the same
   statement, so a copy racing the source's delete and release fails with
   NoSuchKey instead of claiming a blob about to go.
 

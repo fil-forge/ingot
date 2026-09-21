@@ -45,19 +45,25 @@ func (m *MemStore) AddBlobClaim(_ context.Context, c registry.BlobClaim) error {
 	return nil
 }
 
-func (m *MemStore) PinBlobClaim(_ context.Context, c registry.BlobClaim) (bool, error) {
+func (m *MemStore) PinBlobClaims(_ context.Context, claims []registry.BlobClaim) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	k := claimKey{string(c.Digest), c.Bucket, c.ObjectKey, c.VersionID}
-	if _, ok := m.blobRefs[k]; ok {
-		return true, nil
+	// All or nothing: every digest is checked before any claim is written.
+	for _, c := range claims {
+		k := claimKey{string(c.Digest), c.Bucket, c.ObjectKey, c.VersionID}
+		if _, ok := m.blobRefs[k]; ok {
+			continue
+		}
+		if m.countClaimsLocked(c.Space, c.Digest) == 0 {
+			return false, nil
+		}
 	}
-	if m.countClaimsLocked(c.Space, c.Digest) == 0 {
-		return false, nil
+	for _, c := range claims {
+		k := claimKey{string(c.Digest), c.Bucket, c.ObjectKey, c.VersionID}
+		cp := c
+		cp.Digest = bytes.Clone(c.Digest)
+		m.blobRefs[k] = cp
 	}
-	cp := c
-	cp.Digest = bytes.Clone(c.Digest)
-	m.blobRefs[k] = cp
 	return true, nil
 }
 

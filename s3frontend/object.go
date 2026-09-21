@@ -413,30 +413,29 @@ var errPinnedBlobReleased = errors.New("pinned blob has no remaining claim")
 // release of them may be under way: its claim check and its network removal
 // are separate steps, so a claim added unconditionally in between would
 // commit a manifest over a blob about to go. Pinned digests are therefore
-// claimed conditionally, in one statement that requires an existing claim
-// (PinBlobClaim), and a refused pin fails the commit with
-// errPinnedBlobReleased. Pins already taken are dropped again; the drop
-// enqueues a release if the source's claim went meanwhile, so a half-pinned
-// commit strands nothing.
+// claimed conditionally, all in one transaction that requires an existing
+// claim on each and excludes the drop of a last claim (PinBlobClaims); a
+// refused pin records nothing and fails the commit with
+// errPinnedBlobReleased.
 func (b *Backend) addClaims(ctx context.Context, st *registry.State, key, claimID string, digests []multihash.Multihash, pinned bool) error {
-	var taken []multihash.Multihash
+	var claims []registry.BlobClaim
 	for _, d := range digestSet(digests) {
-		claim := registry.BlobClaim{Digest: d, Bucket: st.Name, ObjectKey: key, VersionID: claimID, Space: st.Space}
-		if !pinned {
-			if err := b.blobRefs.AddBlobClaim(ctx, claim); err != nil {
+		claims = append(claims, registry.BlobClaim{Digest: d, Bucket: st.Name, ObjectKey: key, VersionID: claimID, Space: st.Space})
+	}
+	if !pinned {
+		for _, c := range claims {
+			if err := b.blobRefs.AddBlobClaim(ctx, c); err != nil {
 				return fmt.Errorf("add blob claim: %w", err)
 			}
-			continue
 		}
-		ok, err := b.blobRefs.PinBlobClaim(ctx, claim)
-		if err == nil && !ok {
-			err = fmt.Errorf("%w: %x", errPinnedBlobReleased, d)
-		}
-		if err != nil {
-			b.dropClaims(ctx, st, key, claimID, taken)
-			return fmt.Errorf("pin blob claim: %w", err)
-		}
-		taken = append(taken, d)
+		return nil
+	}
+	ok, err := b.blobRefs.PinBlobClaims(ctx, claims)
+	if err != nil {
+		return fmt.Errorf("pin blob claims: %w", err)
+	}
+	if !ok {
+		return errPinnedBlobReleased
 	}
 	return nil
 }
@@ -451,7 +450,6 @@ func (b *Backend) dropClaims(ctx context.Context, bucketState *registry.State, k
 	notBefore := time.Now().Add(b.releaseGrace)
 	for _, d := range digestSet(digests) {
 		if _, err := b.blobRefs.DropClaimEnqueueRelease(ctx, d, bucketState.Name, key, claimID, bucketState.Space, notBefore); err != nil {
-			b.logger.Warn("drop blob claim failed", zap.String("digest", hex.EncodeToString(d)), zap.Error(err))
 			return fmt.Errorf("drop blob claim: %w", err)
 		}
 	}

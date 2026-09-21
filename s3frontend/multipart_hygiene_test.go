@@ -2077,6 +2077,58 @@ func TestUploadPartRefusedAfterTeardownReleasesItsBlobs(t *testing.T) {
 	}
 }
 
+// failPutPart is a multipart store whose next `fails` part writes fail with
+// a store error, as an unreachable registry does.
+type failPutPart struct {
+	registry.MultipartStore
+	fails int
+}
+
+func (f *failPutPart) PutPart(ctx context.Context, p registry.MultipartPart) error {
+	if f.fails > 0 {
+		f.fails--
+		return errors.New("parts table unavailable")
+	}
+	return f.MultipartStore.PutPart(ctx, p)
+}
+
+// TestUploadPartFailedRowWriteReleasesItsBlobs: the part row write fails for
+// a reason other than the session being gone. No row points at the spooled
+// blobs, so the upload records their releases before failing; the session
+// stays open for the retry.
+func TestUploadPartFailedRowWriteReleasesItsBlobs(t *testing.T) {
+	mp := &failPutPart{fails: 1}
+	b, mem := newDeferredBackend(t, &parkingUploader{}, func(d *Deps) {
+		mp.MultipartStore = d.Multipart
+		d.Multipart = mp
+	})
+	ctx := context.Background()
+	key := "failed-row"
+	uploadID := mpCreate(t, b, key, "", "")
+
+	if _, err := mpUploadPart(t, b, key, uploadID, 1, testBody(int(backend.MinPartSize)), nil); err == nil {
+		t.Fatal("UploadPart succeeded although the part row write failed")
+	}
+	if mp.fails > 0 {
+		t.Fatal("the part store never refused a write")
+	}
+	drainReleases(t, b)
+	entries, err := os.ReadDir(b.spool.Path(nil))
+	if err != nil {
+		t.Fatalf("read spool dir: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("spool holds %d blobs after the failed row write, want 0", len(entries))
+	}
+	if sess, err := mem.GetSession(ctx, uploadID); err != nil || sess.State != registry.SessionOpen {
+		t.Fatalf("session after the failed part = %v/%v, want still open", sess, err)
+	}
+	// The retry lands.
+	if _, err := mpUploadPart(t, b, key, uploadID, 1, testBody(int(backend.MinPartSize)), nil); err != nil {
+		t.Fatalf("retry UploadPart: %v", err)
+	}
+}
+
 // TestReleaseRemovesBlobAcceptedWithoutRows: at Complete a never-parked blob
 // is uploaded and accepted, then the location fails to record, leaving no
 // park and no location row. If the client aborts instead of retrying, the

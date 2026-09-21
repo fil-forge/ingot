@@ -1,10 +1,12 @@
 package registry
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/fil-forge/ucantone/did"
@@ -58,34 +60,67 @@ func (r *Postgres) AddBlobClaim(ctx context.Context, c BlobClaim) error {
 	return nil
 }
 
-func (r *Postgres) PinBlobClaim(ctx context.Context, c BlobClaim) (bool, error) {
-	// One statement: the claim exists only if another claim on the digest
-	// exists in the space at the same snapshot. A concurrent drop of that
-	// claim then counts this row, or a release re-checks the claims and
-	// finds it; a release already past its claim check finds no claim here
-	// and the pin is refused.
-	tag, err := r.pool.Exec(ctx,
-		`INSERT INTO ingot.blob_refs (digest, bucket, object_key, version_id, space)
-		 SELECT $1, $2, $3, $4, $5
-		 WHERE EXISTS (SELECT 1 FROM ingot.blob_refs WHERE space = $5 AND digest = $1)
-		 ON CONFLICT (digest, bucket, object_key, version_id) DO NOTHING`,
-		c.Digest, c.Bucket, c.ObjectKey, c.VersionID, c.Space)
-	if err != nil {
-		return false, fmt.Errorf("registry: pin blob claim: %w", err)
+// lockClaimKey takes a transaction-scoped advisory lock on (space, digest):
+// the mutual exclusion between pinning a claim and dropping the last one,
+// which read-committed snapshots alone do not give (a pin could see a claim
+// a concurrent drop is deleting, and the drop count could miss the
+// uncommitted pin). Callers taking several keys take them in digest order.
+func lockClaimKey(ctx context.Context, tx pgx.Tx, space did.DID, digest multihash.Multihash) error {
+	if _, err := tx.Exec(ctx,
+		`SELECT pg_advisory_xact_lock(hashtextextended($1 || ':' || encode($2, 'hex'), 0))`,
+		space.String(), []byte(digest)); err != nil {
+		return fmt.Errorf("registry: lock claim key: %w", err)
 	}
-	if tag.RowsAffected() == 1 {
+	return nil
+}
+
+func (r *Postgres) PinBlobClaims(ctx context.Context, claims []BlobClaim) (bool, error) {
+	if len(claims) == 0 {
 		return true, nil
 	}
-	// Nothing inserted: either no claim to pin to, or this claim is already
-	// recorded (the conflict arm).
-	var own int
-	if err := r.pool.QueryRow(ctx,
-		`SELECT count(*) FROM ingot.blob_refs
-		 WHERE digest = $1 AND bucket = $2 AND object_key = $3 AND version_id = $4`,
-		c.Digest, c.Bucket, c.ObjectKey, c.VersionID).Scan(&own); err != nil {
-		return false, fmt.Errorf("registry: pin blob claim lookup: %w", err)
+	sorted := slices.Clone(claims)
+	slices.SortFunc(sorted, func(a, b BlobClaim) int { return bytes.Compare(a.Digest, b.Digest) })
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return false, fmt.Errorf("registry: begin pin blob claims: %w", err)
 	}
-	return own == 1, nil
+	defer tx.Rollback(ctx)
+	for _, c := range sorted {
+		if err := lockClaimKey(ctx, tx, c.Space, c.Digest); err != nil {
+			return false, err
+		}
+		// Under the key's lock, the existence check and the insert see one
+		// state: a claim exists and the pin joins it, or none does and the
+		// whole pin is refused.
+		tag, err := tx.Exec(ctx,
+			`INSERT INTO ingot.blob_refs (digest, bucket, object_key, version_id, space)
+			 SELECT $1, $2, $3, $4, $5
+			 WHERE EXISTS (SELECT 1 FROM ingot.blob_refs WHERE space = $5 AND digest = $1)
+			 ON CONFLICT (digest, bucket, object_key, version_id) DO NOTHING`,
+			c.Digest, c.Bucket, c.ObjectKey, c.VersionID, c.Space)
+		if err != nil {
+			return false, fmt.Errorf("registry: pin blob claim: %w", err)
+		}
+		if tag.RowsAffected() == 1 {
+			continue
+		}
+		// Nothing inserted: no claim to pin to, or this claim is already
+		// recorded (the conflict arm).
+		var own int
+		if err := tx.QueryRow(ctx,
+			`SELECT count(*) FROM ingot.blob_refs
+			 WHERE digest = $1 AND bucket = $2 AND object_key = $3 AND version_id = $4`,
+			c.Digest, c.Bucket, c.ObjectKey, c.VersionID).Scan(&own); err != nil {
+			return false, fmt.Errorf("registry: pin blob claim lookup: %w", err)
+		}
+		if own == 0 {
+			return false, nil // rolled back by the deferred Rollback
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, fmt.Errorf("registry: commit pin blob claims: %w", err)
+	}
+	return true, nil
 }
 
 func (r *Postgres) DeleteBlobClaim(ctx context.Context, digest multihash.Multihash, bucket, objectKey, versionID string) error {
@@ -117,6 +152,11 @@ func (r *Postgres) DropClaimEnqueueRelease(ctx context.Context, digest multihash
 	}
 	defer tx.Rollback(ctx)
 
+	// Excludes a concurrent pin of the digest (PinBlobClaims): the count
+	// below then sees a committed pin, or the pin finds no claim.
+	if err := lockClaimKey(ctx, tx, space, digest); err != nil {
+		return false, err
+	}
 	if _, err := tx.Exec(ctx,
 		`DELETE FROM ingot.blob_refs
 		 WHERE digest = $1 AND bucket = $2 AND object_key = $3 AND version_id = $4`,

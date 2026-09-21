@@ -353,16 +353,18 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 		BlobDigests: bodyDigests(rec),
 		State:       registry.PartParked,
 	}); err != nil {
+		// No part row points at the spooled blobs now, whatever went wrong:
+		// the session was completed, aborted or torn down after this upload
+		// was admitted (ErrNotFound), or the write failed. Their release is
+		// recorded here, before the error. Should the row in fact have
+		// landed and only its result been lost, the release waits on the
+		// live part reference and resolves with the session.
+		released, rerr := b.enqueuePartReleases(ctx, space, bodyDigests(rec), siblings)
+		if rerr != nil {
+			return nil, fmt.Errorf("s3frontend: record part: %w; record its blobs' releases: %w", err, rerr)
+		}
+		b.releaseNow(ctx, released)
 		if errors.Is(err, registry.ErrNotFound) {
-			// The session was completed, aborted or torn down after this
-			// upload was admitted. Its teardown never saw these blobs (they
-			// were spooled after its part listing, or the row was refused),
-			// so their release is recorded here, before the refusal.
-			released, rerr := b.enqueuePartReleases(ctx, space, bodyDigests(rec), siblings)
-			if rerr != nil {
-				return nil, fmt.Errorf("s3frontend: record refused part's releases: %w", rerr)
-			}
-			b.releaseNow(ctx, released)
 			return nil, s3err.GetAPIError(s3err.ErrNoSuchUpload)
 		}
 		return nil, fmt.Errorf("s3frontend: record part: %w", err)

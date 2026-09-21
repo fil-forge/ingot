@@ -229,14 +229,16 @@ type BlobRefStore interface {
 	// same transaction, marks the digest's upload intent published (see
 	// IntentPublished). Idempotent.
 	AddBlobClaim(ctx context.Context, claim BlobClaim) error
-	// PinBlobClaim is AddBlobClaim for a digest borrowed from another object
-	// of the same space (a same-space copy pins the source's body): the
-	// claim is recorded only while the space still holds a claim on the
-	// digest, in one statement, so it cannot land on a blob whose release
-	// has already passed its claim check. Reports whether the claim is
-	// recorded; false means the space's last claim on the digest is gone
-	// and the blob is being released. Idempotent.
-	PinBlobClaim(ctx context.Context, claim BlobClaim) (bool, error)
+	// PinBlobClaims is AddBlobClaim for digests borrowed from another object
+	// of the same space (a same-space copy pins the source's body). Each
+	// claim is recorded only while the space still holds a claim on its
+	// digest, all in one transaction, and the transaction excludes
+	// DropClaimEnqueueRelease on the same (space, digest), so a pin and the
+	// drop of the digest's last claim commit in one order or the other: the
+	// drop counts the pin, or the pin finds no claim. Reports whether every
+	// claim is recorded; false records nothing and means some digest's last
+	// claim is gone and the blob is being released. Idempotent.
+	PinBlobClaims(ctx context.Context, claims []BlobClaim) (bool, error)
 	DeleteBlobClaim(ctx context.Context, digest multihash.Multihash, bucket, objectKey, versionID string) error
 	// CountClaims returns how many object versions in space still reference
 	// digest. Zero means the space's claim may be released.
