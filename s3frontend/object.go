@@ -211,7 +211,7 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 		WebsiteRedirectLocation: backend.GetStringFromPtr(input.WebsiteRedirectLocation),
 		Metadata:                input.Metadata,
 	}
-	node, effState, err := b.commitVersion(ctx, bucketState, key, mf, initState, func(superseded *msbucket.ObjectManifest) error {
+	node, effState, err := b.commitVersion(ctx, bucketState, key, mf, initState, false, func(superseded *msbucket.ObjectManifest) error {
 		// Race-safe re-check of If-Match / If-None-Match under the lock. A
 		// delete-marker current means "no object" for precondition purposes.
 		oldETag, oldExists := "", false
@@ -399,15 +399,44 @@ func claimVersionID(versionID string, seq uint64) string {
 	return versionID
 }
 
+// errPinnedBlobReleased is returned by a pinned commit whose source body is
+// no longer claimed anywhere in the space: the source was deleted and its
+// blobs are being released, so the copy has nothing to pin.
+var errPinnedBlobReleased = errors.New("pinned blob has no remaining claim")
+
 // addClaims records one claim per DEDUPLICATED digest for a new generation.
 // Runs inside the bucket commit lock (see the invariant note above).
-func (b *Backend) addClaims(ctx context.Context, st *registry.State, key, claimID string, digests []multihash.Multihash) error {
+//
+// A body this node ingested holds fresh digests, which nothing can release
+// before they are claimed. A body pinned from another object of the space
+// (a same-space copy) holds digests some other version claims, and a
+// release of them may be under way: its claim check and its network removal
+// are separate steps, so a claim added unconditionally in between would
+// commit a manifest over a blob about to go. Pinned digests are therefore
+// claimed conditionally, in one statement that requires an existing claim
+// (PinBlobClaim), and a refused pin fails the commit with
+// errPinnedBlobReleased. Pins already taken are dropped again; the drop
+// enqueues a release if the source's claim went meanwhile, so a half-pinned
+// commit strands nothing.
+func (b *Backend) addClaims(ctx context.Context, st *registry.State, key, claimID string, digests []multihash.Multihash, pinned bool) error {
+	var taken []multihash.Multihash
 	for _, d := range digestSet(digests) {
-		if err := b.blobRefs.AddBlobClaim(ctx, registry.BlobClaim{
-			Digest: d, Bucket: st.Name, ObjectKey: key, VersionID: claimID, Space: st.Space,
-		}); err != nil {
-			return fmt.Errorf("add blob claim: %w", err)
+		claim := registry.BlobClaim{Digest: d, Bucket: st.Name, ObjectKey: key, VersionID: claimID, Space: st.Space}
+		if !pinned {
+			if err := b.blobRefs.AddBlobClaim(ctx, claim); err != nil {
+				return fmt.Errorf("add blob claim: %w", err)
+			}
+			continue
 		}
+		ok, err := b.blobRefs.PinBlobClaim(ctx, claim)
+		if err == nil && !ok {
+			err = fmt.Errorf("%w: %x", errPinnedBlobReleased, d)
+		}
+		if err != nil {
+			b.dropClaims(ctx, st, key, claimID, taken)
+			return fmt.Errorf("pin blob claim: %w", err)
+		}
+		taken = append(taken, d)
 	}
 	return nil
 }
@@ -422,6 +451,7 @@ func (b *Backend) dropClaims(ctx context.Context, bucketState *registry.State, k
 	notBefore := time.Now().Add(b.releaseGrace)
 	for _, d := range digestSet(digests) {
 		if _, err := b.blobRefs.DropClaimEnqueueRelease(ctx, d, bucketState.Name, key, claimID, bucketState.Space, notBefore); err != nil {
+			b.logger.Warn("drop blob claim failed", zap.String("digest", hex.EncodeToString(d)), zap.Error(err))
 			return fmt.Errorf("drop blob claim: %w", err)
 		}
 	}
@@ -541,10 +571,12 @@ func (b *Backend) runRelease(ctx context.Context, pr registry.PendingRelease) re
 		return releaseFailed
 	}
 	if live > 0 {
-		// A session in flight still references the blob (part blobs dedup by
-		// content) and means to claim it. Its Complete turns the reference
-		// into a claim, which makes this record stale; its abort or expiry
-		// records a release of its own. Either way the wait ends.
+		// A session in flight still references the blob and means to claim
+		// it. Its Complete turns the reference into a claim, which makes
+		// this record stale; its abort or expiry records a release of its
+		// own. Either way the wait ends. (Encryption gives every part blob
+		// a digest of its own, so today only a session's own parts can
+		// reference it; the check holds for shared digests as well.)
 		return releaseDeferred
 	}
 	n, err := b.blobRefs.CountClaims(ctx, pr.Space, pr.Digest)
@@ -1239,7 +1271,7 @@ func (b *Backend) insertDeleteMarker(ctx context.Context, bucketState *registry.
 		Created:      time.Now().Unix(),
 		DeleteMarker: true,
 	}
-	node, _, err := b.commitVersion(ctx, bucketState, key, mf, nil, func(superseded *msbucket.ObjectManifest) error {
+	node, _, err := b.commitVersion(ctx, bucketState, key, mf, nil, false, func(superseded *msbucket.ObjectManifest) error {
 		if preconds == nil || superseded == nil || superseded.DeleteMarker {
 			return nil
 		}

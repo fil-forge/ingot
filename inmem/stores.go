@@ -45,6 +45,22 @@ func (m *MemStore) AddBlobClaim(_ context.Context, c registry.BlobClaim) error {
 	return nil
 }
 
+func (m *MemStore) PinBlobClaim(_ context.Context, c registry.BlobClaim) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k := claimKey{string(c.Digest), c.Bucket, c.ObjectKey, c.VersionID}
+	if _, ok := m.blobRefs[k]; ok {
+		return true, nil
+	}
+	if m.countClaimsLocked(c.Space, c.Digest) == 0 {
+		return false, nil
+	}
+	cp := c
+	cp.Digest = bytes.Clone(c.Digest)
+	m.blobRefs[k] = cp
+	return true, nil
+}
+
 func (m *MemStore) DeleteBlobClaim(_ context.Context, digest multihash.Multihash, bucket, objectKey, versionID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -414,8 +430,8 @@ func (m *MemStore) DeleteSession(_ context.Context, uploadID string) error {
 func (m *MemStore) PutPart(_ context.Context, p registry.MultipartPart) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, ok := m.sessions[p.UploadID]; !ok {
-		return registry.ErrNotFound // FK to multipart_sessions
+	if s, ok := m.sessions[p.UploadID]; !ok || s.State != registry.SessionOpen {
+		return registry.ErrNotFound // FK to multipart_sessions, and open only
 	}
 	if p.State == "" {
 		p.State = registry.PartParked

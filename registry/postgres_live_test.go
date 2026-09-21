@@ -168,6 +168,35 @@ func TestPostgresStores_Live(t *testing.T) {
 		}
 	})
 
+	t.Run("pin claim requires an existing claim", func(t *testing.T) {
+		space := testutil.RandomDID(t)
+		pinDigest := multihash.Multihash([]byte{0x12, 0x20, 0xb1, 0x01})
+		pin := registry.BlobClaim{Digest: pinDigest, Bucket: "pb", ObjectKey: "copy", VersionID: "null#7", Space: space}
+		if ok, err := r.PinBlobClaim(ctx, pin); err != nil || ok {
+			t.Fatalf("pin with no claim to attach to: ok=%v err=%v, want refused", ok, err)
+		}
+		if n, _ := r.CountClaims(ctx, space, pinDigest); n != 0 {
+			t.Fatalf("refused pin left %d claims", n)
+		}
+		if err := r.AddBlobClaim(ctx, registry.BlobClaim{Digest: pinDigest, Bucket: "pb", ObjectKey: "src", VersionID: "null#1", Space: space}); err != nil {
+			t.Fatalf("AddBlobClaim: %v", err)
+		}
+		if ok, err := r.PinBlobClaim(ctx, pin); err != nil || !ok {
+			t.Fatalf("pin beside a live claim: ok=%v err=%v, want recorded", ok, err)
+		}
+		if ok, err := r.PinBlobClaim(ctx, pin); err != nil || !ok {
+			t.Fatalf("repeated pin: ok=%v err=%v, want idempotent true", ok, err)
+		}
+		if n, _ := r.CountClaims(ctx, space, pinDigest); n != 2 {
+			t.Fatalf("claims after pin = %d, want 2", n)
+		}
+		// A claim in another space does not qualify.
+		other := testutil.RandomDID(t)
+		if ok, err := r.PinBlobClaim(ctx, registry.BlobClaim{Digest: pinDigest, Bucket: "pb2", ObjectKey: "copy", VersionID: "null#1", Space: other}); err != nil || ok {
+			t.Fatalf("pin against another space's claim: ok=%v err=%v, want refused", ok, err)
+		}
+	})
+
 	t.Run("drop claim enqueues release atomically", func(t *testing.T) {
 		space := testutil.RandomDID(t)
 		add := func(key string) {
@@ -499,6 +528,17 @@ func TestPostgresStores_Live(t *testing.T) {
 		won, err := r.LatchSession(ctx, id, registry.SessionOpen, registry.SessionCompleting)
 		if err != nil || !won {
 			t.Fatalf("Complete latch won=%v err=%v", won, err)
+		}
+		// A part cannot land once the session has left 'open', nor on a
+		// session that does not exist.
+		if err := r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 3, ETagMD5: []byte{0x03}, Size: 3, BlobDigests: []multihash.Multihash{{0xd3}}}); !errors.Is(err, registry.ErrNotFound) {
+			t.Fatalf("PutPart on a completing session = %v, want ErrNotFound", err)
+		}
+		if err := r.PutPart(ctx, registry.MultipartPart{UploadID: "no-such-upload", PartNumber: 1, ETagMD5: []byte{0x01}, Size: 1, BlobDigests: []multihash.Multihash{{0xd1}}}); !errors.Is(err, registry.ErrNotFound) {
+			t.Fatalf("PutPart on a missing session = %v, want ErrNotFound", err)
+		}
+		if parts, _ := r.ListParts(ctx, id); len(parts) != 2 {
+			t.Fatalf("parts after the refused writes = %d, want 2", len(parts))
 		}
 		won, err = r.LatchSession(ctx, id, registry.SessionOpen, registry.SessionAborting)
 		if err != nil || won {

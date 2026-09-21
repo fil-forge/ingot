@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -2015,6 +2016,64 @@ func TestCompleteFailsWhenItsSessionIsTakenBeforeCommit(t *testing.T) {
 		if rm.removedDigests()[string(d)] != 1 {
 			t.Fatalf("accepted part blob %x removed %d times, want once", d, rm.removedDigests()[string(d)])
 		}
+	}
+}
+
+// teardownBeforePutPart is a multipart store that runs hook once, right
+// before its next PutPart: the window after UploadPart was admitted and
+// spooled its blobs, where a teardown can take the session.
+type teardownBeforePutPart struct {
+	registry.MultipartStore
+	hook func()
+}
+
+func (s *teardownBeforePutPart) PutPart(ctx context.Context, p registry.MultipartPart) error {
+	if s.hook != nil {
+		hook := s.hook
+		s.hook = nil
+		hook()
+	}
+	return s.MultipartStore.PutPart(ctx, p)
+}
+
+// TestUploadPartRefusedAfterTeardownReleasesItsBlobs: a sweep takes the
+// session after an UploadPart was admitted and spooled its blobs. The part
+// row is refused, since the session is no longer open, the upload fails
+// with NoSuchUpload, and the blobs it spooled are released rather than
+// left behind with no row pointing at them.
+func TestUploadPartRefusedAfterTeardownReleasesItsBlobs(t *testing.T) {
+	mp := &teardownBeforePutPart{}
+	b, mem := newDeferredBackend(t, &parkingUploader{}, func(d *Deps) {
+		mp.MultipartStore = d.Multipart
+		d.Multipart = mp
+	})
+	ctx := context.Background()
+	key := "refused-part"
+	uploadID := mpCreate(t, b, key, "", "")
+	mp.hook = func() {
+		if n, err := b.SweepStaleMultipartSessions(ctx, -time.Second); err != nil || n != 1 {
+			t.Errorf("sweep before the part row: cleaned=%d err=%v, want the open session", n, err)
+		}
+	}
+
+	_, err := mpUploadPart(t, b, key, uploadID, 1, testBody(int(backend.MinPartSize)), nil)
+	var apiErr s3err.APIError
+	if !errors.As(err, &apiErr) || apiErr.Code != "NoSuchUpload" {
+		t.Fatalf("UploadPart whose session was taken: err = %v, want NoSuchUpload", err)
+	}
+	if mp.hook != nil {
+		t.Fatal("the teardown never ran")
+	}
+	drainReleases(t, b)
+	entries, err := os.ReadDir(b.spool.Path(nil))
+	if err != nil {
+		t.Fatalf("read spool dir: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("spool holds %d blobs after the refused part was released, want 0", len(entries))
+	}
+	if pending, _ := mem.ListReleasesBySpace(ctx, did.Undef); len(pending) != 0 {
+		t.Fatalf("pending releases after the refused part = %v, want none", pending)
 	}
 }
 

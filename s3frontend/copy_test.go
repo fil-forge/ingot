@@ -21,6 +21,7 @@ import (
 	"github.com/fil-forge/versitygw/s3response"
 
 	msbucket "github.com/fil-forge/ingot/bucket"
+	"github.com/fil-forge/ingot/inmem"
 	"github.com/fil-forge/ingot/registry"
 )
 
@@ -243,6 +244,104 @@ func TestCopyObject_CrossSpaceReingest(t *testing.T) {
 	}
 }
 
+// hookAllocSeq is a bucket registry that runs hook once, at the named
+// bucket's next version-seq allocation: the first step of a commit, inside
+// the destination bucket's lock, after the copy has resolved its source.
+type hookAllocSeq struct {
+	registry.Registry
+	bucket string
+	hook   func()
+}
+
+func (h *hookAllocSeq) AllocVersionSeq(ctx context.Context, name string) (uint64, error) {
+	if name == h.bucket && h.hook != nil {
+		hook := h.hook
+		h.hook = nil
+		hook()
+	}
+	return h.Registry.AllocVersionSeq(ctx, name)
+}
+
+// TestCopyObject_PinnedSourceReleasedBeforeCommitIsNoSuchKey: a same-space
+// copy pins the source's body. If the source is deleted and its blobs'
+// release runs after the copy resolved the source but before its commit,
+// the pin finds no claim to attach to and the copy fails with NoSuchKey
+// instead of committing a manifest over released blobs. Nothing is left
+// claimed or pending afterwards.
+func TestCopyObject_PinnedSourceReleasedBeforeCommitIsNoSuchKey(t *testing.T) {
+	rm := &recordingRemover{}
+	reg := &hookAllocSeq{bucket: "dst"}
+	var b *Backend
+	b, mem := newDeferredBackend(t, inmem.NopUploader{}, func(d *Deps) {
+		reg.Registry = d.Registry
+		d.Registry = reg
+		d.Remover = rm
+	})
+	ctx := context.Background()
+	space, tenant := testutil.RandomDID(t), testutil.RandomDID(t)
+	for _, name := range []string{"src", "dst"} {
+		if err := mem.Create(ctx, name, space, registry.CreateState{Tenant: tenant}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	srcBucket, srcKey := "src", "obj"
+	if _, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &srcBucket, Key: &srcKey, Body: bytes.NewReader([]byte("pin me"))}); err != nil {
+		t.Fatal(err)
+	}
+	srcRv, err := b.resolveVersion(ctx, "src", "obj", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	digests := bodyDigests(srcRv.mf.Body)
+
+	reg.hook = func() {
+		if _, err := b.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: &srcBucket, Key: &srcKey}); err != nil {
+			t.Errorf("DeleteObject during the copy: %v", err)
+		}
+		drainReleases(t, b)
+	}
+	dstBucket, dstKey, source := "dst", "copied", "src/obj"
+	_, err = b.CopyObject(ctx, s3response.CopyObjectInput{Bucket: &dstBucket, Key: &dstKey, CopySource: &source})
+	var apiErr s3err.APIError
+	if !errors.As(err, &apiErr) || apiErr.Code != "NoSuchKey" {
+		t.Fatalf("copy whose source was released before the commit: err = %v, want NoSuchKey", err)
+	}
+	if reg.hook != nil {
+		t.Fatal("the source was never deleted")
+	}
+	if _, err := b.HeadObject(ctx, &s3.HeadObjectInput{Bucket: &dstBucket, Key: &dstKey}); err == nil {
+		t.Fatal("the copy committed a manifest over released blobs")
+	}
+	for _, d := range digests {
+		if n, _ := mem.CountClaims(ctx, space, d); n != 0 {
+			t.Fatalf("claims on released blob %x = %d, want 0 (a leaked pin)", d, n)
+		}
+		if rm.removedDigests()[string(d)] != 1 {
+			t.Fatalf("blob %x removed %d times, want once", d, rm.removedDigests()[string(d)])
+		}
+	}
+	if pending, _ := mem.ListReleasesBySpace(ctx, space); len(pending) != 0 {
+		t.Fatalf("pending releases after the refused copy = %v, want none", pending)
+	}
+
+	// The same copy against a live source pins as before.
+	if _, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &srcBucket, Key: &srcKey, Body: bytes.NewReader([]byte("pin me"))}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.CopyObject(ctx, s3response.CopyObjectInput{Bucket: &dstBucket, Key: &dstKey, CopySource: &source}); err != nil {
+		t.Fatalf("copy of a live source: %v", err)
+	}
+	dstRv, err := b.resolveVersion(ctx, "dst", "copied", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range bodyDigests(dstRv.mf.Body) {
+		if n, _ := mem.CountClaims(ctx, space, d); n != 2 {
+			t.Fatalf("claims on pinned blob %x = %d, want 2 (source and copy)", d, n)
+		}
+	}
+}
+
 // A copy of a multipart object is a single-part object on S3: its ETag is the
 // md5 of the whole bytes rather than the source's "-N" form, and its checksum
 // is a full-object value.
@@ -344,7 +443,7 @@ func TestCopyObject_SourceWithoutChecksumGetsDefault(t *testing.T) {
 		t.Fatal(err)
 	}
 	legacy := &msbucket.ObjectManifest{Key: "legacy", Created: time.Now().Unix(), Body: body, ETag: hex.EncodeToString(body.MD5), ContentType: "application/octet-stream"}
-	if _, _, err := b.commitVersion(ctx, st, "legacy", legacy, nil, nil); err != nil {
+	if _, _, err := b.commitVersion(ctx, st, "legacy", legacy, nil, false, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -371,7 +470,7 @@ func TestCopyObject_SourceOverCopyLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 	huge := &msbucket.ObjectManifest{Key: "huge", Created: time.Now().Unix(), Body: msbucket.Body{Size: maxCopySize + 1}, ETag: "00000000000000000000000000000000"}
-	if _, _, err := b.commitVersion(ctx, st, "huge", huge, nil, nil); err != nil {
+	if _, _, err := b.commitVersion(ctx, st, "huge", huge, nil, false, nil); err != nil {
 		t.Fatal(err)
 	}
 	bucket, key, source := "bk", "copied", "bk/huge"

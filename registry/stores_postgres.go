@@ -58,6 +58,36 @@ func (r *Postgres) AddBlobClaim(ctx context.Context, c BlobClaim) error {
 	return nil
 }
 
+func (r *Postgres) PinBlobClaim(ctx context.Context, c BlobClaim) (bool, error) {
+	// One statement: the claim exists only if another claim on the digest
+	// exists in the space at the same snapshot. A concurrent drop of that
+	// claim then counts this row, or a release re-checks the claims and
+	// finds it; a release already past its claim check finds no claim here
+	// and the pin is refused.
+	tag, err := r.pool.Exec(ctx,
+		`INSERT INTO ingot.blob_refs (digest, bucket, object_key, version_id, space)
+		 SELECT $1, $2, $3, $4, $5
+		 WHERE EXISTS (SELECT 1 FROM ingot.blob_refs WHERE space = $5 AND digest = $1)
+		 ON CONFLICT (digest, bucket, object_key, version_id) DO NOTHING`,
+		c.Digest, c.Bucket, c.ObjectKey, c.VersionID, c.Space)
+	if err != nil {
+		return false, fmt.Errorf("registry: pin blob claim: %w", err)
+	}
+	if tag.RowsAffected() == 1 {
+		return true, nil
+	}
+	// Nothing inserted: either no claim to pin to, or this claim is already
+	// recorded (the conflict arm).
+	var own int
+	if err := r.pool.QueryRow(ctx,
+		`SELECT count(*) FROM ingot.blob_refs
+		 WHERE digest = $1 AND bucket = $2 AND object_key = $3 AND version_id = $4`,
+		c.Digest, c.Bucket, c.ObjectKey, c.VersionID).Scan(&own); err != nil {
+		return false, fmt.Errorf("registry: pin blob claim lookup: %w", err)
+	}
+	return own == 1, nil
+}
+
 func (r *Postgres) DeleteBlobClaim(ctx context.Context, digest multihash.Multihash, bucket, objectKey, versionID string) error {
 	_, err := r.pool.Exec(ctx,
 		`DELETE FROM ingot.blob_refs
@@ -654,15 +684,27 @@ func (r *Postgres) PutPart(ctx context.Context, p MultipartPart) error {
 	// bytea[]: pgx must try that plan before its Stringer plan, or a Multihash
 	// (whose String() is base58) would land as text — pgx v5.10+ orders them
 	// correctly; don't downgrade below that.
-	_, err := r.pool.Exec(ctx,
+	//
+	// The session row is read FOR SHARE: a latch (UPDATE of its state) in
+	// flight blocks this write until it commits, after which the state
+	// check re-evaluates and refuses the part; a latch arriving while this
+	// statement holds the row waits for the part to commit, so the
+	// teardown's part listing includes it.
+	tag, err := r.pool.Exec(ctx,
 		`INSERT INTO ingot.multipart_parts (upload_id, part_number, etag_md5, size, checksum, blob_digests, state)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7)
+		 SELECT s.upload_id, $2, $3, $4, $5, $6, $7
+		   FROM ingot.multipart_sessions s
+		  WHERE s.upload_id = $1 AND s.state = $8
+		    FOR SHARE
 		 ON CONFLICT (upload_id, part_number) DO UPDATE
 		   SET etag_md5 = EXCLUDED.etag_md5, size = EXCLUDED.size, checksum = EXCLUDED.checksum,
 		       blob_digests = EXCLUDED.blob_digests, state = EXCLUDED.state`,
-		p.UploadID, p.PartNumber, p.ETagMD5, p.Size, p.Checksum, p.BlobDigests, state)
+		p.UploadID, p.PartNumber, p.ETagMD5, p.Size, p.Checksum, p.BlobDigests, state, SessionOpen)
 	if err != nil {
 		return fmt.Errorf("registry: put part: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
 	}
 	return nil
 }

@@ -425,7 +425,7 @@ sequenceDiagram
         B->>B: vet the source: copySourceBucket (tenant), resolveVersionIn,<br/>range within the object, copy-source preconditions (412);<br/>the body is the source's plaintext range through the decrypting reader
     end
     B->>B: ingestPart: splitSpool<br/>(resolve the tenant recipient, then encrypt per piece:<br/>fresh CEK → FEE envelope → spool under the ciphertext<br/>digest + params row, as in the PutObject diagram)
-    B->>R: PutPart(parked)
+    B->>R: PutPart(parked): open sessions only, the row held FOR SHARE<br/>against a concurrent latch; a refused part records its blobs' releases
     loop each part blob (parkBlobs)
         alt blob_locations already has the digest
             B->>R: intent accepted (dedup, no park)
@@ -464,6 +464,9 @@ sequenceDiagram
   (`CountLivePartRefs`, checked first: a Complete claims before it leaves
   'completing'). `AddBlobClaim` publishes a committed blob's upload intent,
   so the reap of a retained session releases only what was never committed.
+- A part is written only while its session is open, in the statement that
+  checks the state; a teardown that took the session refuses it, and the
+  upload records releases for the blobs it had spooled.
 - A never-parked blob at Complete falls back to a full synchronous
   `UploadBlob`.
 
@@ -548,6 +551,10 @@ flowchart TB
   reconcile computes a set difference.
 - Parked-blob reclamation is guarded: a digest live in another session, part,
   or committed object is left alone.
+- A same-space copy pins the source's body: its claims are taken with
+  `PinBlobClaim`, which requires an existing claim on the digest in the same
+  statement, so a copy racing the source's delete and release fails with
+  NoSuchKey instead of claiming a blob about to go.
 
 Cross-references: [`architecture.md` §5](./architecture.md#5-the-data-layer),
 [`s3-versioning.md`](./s3-versioning.md) §8.

@@ -353,6 +353,18 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 		BlobDigests: bodyDigests(rec),
 		State:       registry.PartParked,
 	}); err != nil {
+		if errors.Is(err, registry.ErrNotFound) {
+			// The session was completed, aborted or torn down after this
+			// upload was admitted. Its teardown never saw these blobs (they
+			// were spooled after its part listing, or the row was refused),
+			// so their release is recorded here, before the refusal.
+			released, rerr := b.enqueuePartReleases(ctx, space, bodyDigests(rec), siblings)
+			if rerr != nil {
+				return nil, fmt.Errorf("s3frontend: record refused part's releases: %w", rerr)
+			}
+			b.releaseNow(ctx, released)
+			return nil, s3err.GetAPIError(s3err.ErrNoSuchUpload)
+		}
 		return nil, fmt.Errorf("s3frontend: record part: %w", err)
 	}
 	// Park the part's blobs on their providers before returning 200 — the
@@ -770,7 +782,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 	// reference-index reconcile. The conditional-write preconditions re-check
 	// under the lock so a racing writer can't slip between the pre-check above
 	// and the swap.
-	node, effState, err := b.commitVersion(ctx, bucketState, key, mf, initState, func(superseded *msbucket.ObjectManifest) error {
+	node, effState, err := b.commitVersion(ctx, bucketState, key, mf, initState, false, func(superseded *msbucket.ObjectManifest) error {
 		// The latch is re-checked under the bucket lock, where every
 		// teardown that takes a 'completing' row (DeleteBucket, the
 		// sweeper) latches it: a session taken while its blobs were

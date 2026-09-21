@@ -229,6 +229,14 @@ type BlobRefStore interface {
 	// same transaction, marks the digest's upload intent published (see
 	// IntentPublished). Idempotent.
 	AddBlobClaim(ctx context.Context, claim BlobClaim) error
+	// PinBlobClaim is AddBlobClaim for a digest borrowed from another object
+	// of the same space (a same-space copy pins the source's body): the
+	// claim is recorded only while the space still holds a claim on the
+	// digest, in one statement, so it cannot land on a blob whose release
+	// has already passed its claim check. Reports whether the claim is
+	// recorded; false means the space's last claim on the digest is gone
+	// and the blob is being released. Idempotent.
+	PinBlobClaim(ctx context.Context, claim BlobClaim) (bool, error)
 	DeleteBlobClaim(ctx context.Context, digest multihash.Multihash, bucket, objectKey, versionID string) error
 	// CountClaims returns how many object versions in space still reference
 	// digest. Zero means the space's claim may be released.
@@ -374,6 +382,12 @@ type MultipartStore interface {
 	// Returns true iff this caller performed the transition.
 	CompleteSession(ctx context.Context, uploadID, etag, versionID string) (bool, error)
 	DeleteSession(ctx context.Context, uploadID string) error
+	// PutPart records a part of an OPEN session, superseding a prior row for
+	// the part number, and returns ErrNotFound when the session is missing
+	// or no longer open: the write and the state check are one statement
+	// that holds the session row, so a part cannot land after a Complete or
+	// a teardown has taken the session, and a teardown's part listing sees
+	// every part that did land.
 	PutPart(ctx context.Context, p MultipartPart) error
 	ListParts(ctx context.Context, uploadID string) ([]MultipartPart, error)
 	// ListSessions returns bucket's sessions ordered by (object_key, created_at,
