@@ -37,7 +37,34 @@ func (m *MemStore) AddBlobClaim(_ context.Context, c registry.BlobClaim) error {
 	cp := c
 	cp.Digest = bytes.Clone(c.Digest)
 	m.blobRefs[k] = cp
+	// Committed blobs' intents are published, atomically with the claim.
+	if in, ok := m.intents[string(c.Digest)]; ok {
+		in.State = registry.IntentPublished
+		m.intents[string(c.Digest)] = in
+	}
 	return nil
+}
+
+func (m *MemStore) PinBlobClaims(_ context.Context, claims []registry.BlobClaim) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// All or nothing: every digest is checked before any claim is written.
+	for _, c := range claims {
+		k := claimKey{string(c.Digest), c.Bucket, c.ObjectKey, c.VersionID}
+		if _, ok := m.blobRefs[k]; ok {
+			continue
+		}
+		if m.countClaimsLocked(c.Space, c.Digest) == 0 {
+			return false, nil
+		}
+	}
+	for _, c := range claims {
+		k := claimKey{string(c.Digest), c.Bucket, c.ObjectKey, c.VersionID}
+		cp := c
+		cp.Digest = bytes.Clone(c.Digest)
+		m.blobRefs[k] = cp
+	}
+	return true, nil
 }
 
 func (m *MemStore) DeleteBlobClaim(_ context.Context, digest multihash.Multihash, bucket, objectKey, versionID string) error {
@@ -84,14 +111,31 @@ func (m *MemStore) EnqueueRelease(_ context.Context, space did.DID, digest multi
 	return nil
 }
 
-func (m *MemStore) enqueueReleaseLocked(space did.DID, digest multihash.Multihash, notBefore time.Time) {
+func (m *MemStore) enqueueReleaseLocked(space did.DID, digest multihash.Multihash, notBefore time.Time) registry.PendingRelease {
 	k := locKey{space, string(digest)}
 	if prior, ok := m.releases[k]; ok && prior.NotBefore.After(notBefore) {
 		notBefore = prior.NotBefore // upsert keeps the later not_before
 	}
-	m.releases[k] = registry.PendingRelease{
+	pr := registry.PendingRelease{
 		Space: space, Digest: multihash.Multihash(bytes.Clone(digest)), NotBefore: notBefore,
 	}
+	m.releases[k] = pr
+	return pr
+}
+
+func (m *MemStore) EnqueueReleases(_ context.Context, space did.DID, digests []multihash.Multihash, notBefore time.Time) ([]registry.PendingRelease, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	seen := map[string]bool{}
+	var out []registry.PendingRelease
+	for _, d := range digests {
+		if seen[string(d)] {
+			continue
+		}
+		seen[string(d)] = true
+		out = append(out, m.enqueueReleaseLocked(space, d, notBefore))
+	}
+	return out, nil
 }
 
 func (m *MemStore) ListDueReleases(_ context.Context, now time.Time, limit int) ([]registry.PendingRelease, error) {
@@ -121,6 +165,14 @@ func (m *MemStore) ListReleasesBySpace(_ context.Context, space did.DID) ([]regi
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].NotBefore.Before(out[j].NotBefore) })
 	return out, nil
+}
+
+func (m *MemStore) DeleteIntentAndRelease(_ context.Context, space did.DID, digest multihash.Multihash) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.intents, string(digest))
+	delete(m.releases, locKey{space, string(digest)})
+	return nil
 }
 
 func (m *MemStore) DeleteRelease(_ context.Context, space did.DID, digest multihash.Multihash) error {
@@ -332,6 +384,9 @@ func (m *MemStore) CreateSession(_ context.Context, s registry.MultipartSession)
 	if s.CreatedAt.IsZero() {
 		s.CreatedAt = time.Now()
 	}
+	if s.StateChangedAt.IsZero() {
+		s.StateChangedAt = s.CreatedAt
+	}
 	m.sessions[s.UploadID] = cloneSession(s)
 	return nil
 }
@@ -358,6 +413,7 @@ func (m *MemStore) LatchSession(_ context.Context, uploadID, from, to string) (b
 		return false, nil
 	}
 	s.State = to
+	s.StateChangedAt = time.Now()
 	m.sessions[uploadID] = s
 	return true, nil
 }
@@ -372,6 +428,7 @@ func (m *MemStore) CompleteSession(_ context.Context, uploadID, etag, versionID 
 	s.State = registry.SessionCompleted
 	s.CommittedETag = etag
 	s.CommittedVersionID = versionID
+	s.StateChangedAt = time.Now()
 	m.sessions[uploadID] = s
 	return true, nil
 }
@@ -387,8 +444,8 @@ func (m *MemStore) DeleteSession(_ context.Context, uploadID string) error {
 func (m *MemStore) PutPart(_ context.Context, p registry.MultipartPart) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, ok := m.sessions[p.UploadID]; !ok {
-		return registry.ErrNotFound // FK to multipart_sessions
+	if s, ok := m.sessions[p.UploadID]; !ok || s.State != registry.SessionOpen {
+		return registry.ErrNotFound // FK to multipart_sessions, and open only
 	}
 	if p.State == "" {
 		p.State = registry.PartParked
@@ -455,12 +512,33 @@ func (m *MemStore) ListStaleSessions(_ context.Context, state string, cutoff tim
 	defer m.mu.Unlock()
 	var out []registry.MultipartSession
 	for _, s := range m.sessions {
-		if s.State == state && s.CreatedAt.Before(cutoff) {
+		if s.State == state && s.StateChangedAt.Before(cutoff) {
 			out = append(out, cloneSession(s))
 		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
+	sort.Slice(out, func(i, j int) bool { return out[i].StateChangedAt.Before(out[j].StateChangedAt) })
 	return out, nil
+}
+
+func (m *MemStore) CountLivePartRefs(_ context.Context, digest multihash.Multihash) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for uploadID, byNum := range m.parts {
+		s, ok := m.sessions[uploadID]
+		if !ok || (s.State != registry.SessionOpen && s.State != registry.SessionCompleting) {
+			continue
+		}
+		for _, p := range byNum {
+			for _, d := range p.BlobDigests {
+				if bytes.Equal(d, digest) {
+					n++
+					break
+				}
+			}
+		}
+	}
+	return n, nil
 }
 
 func (m *MemStore) CountPartRefs(_ context.Context, digest multihash.Multihash, excludeUploadID string) (int, error) {

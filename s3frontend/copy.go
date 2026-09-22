@@ -258,9 +258,14 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 	// Commit to the destination via the write rule: splice + reference index.
 	// The claims use the DESTINATION bucket/space: for a pinned body the same
 	// digests gain another reference, for a re-ingested one its new digests
-	// gain their first.
-	node, effState, err := b.commitVersion(ctx, bucketState, dstKey, dstMf, applyTagsIfPresent(initState, dstTags), nil)
+	// gain their first. A pinned body's claims are conditional on the
+	// source's: a source deleted since it was resolved, its blobs' release
+	// under way, is a source that no longer exists.
+	node, effState, err := b.commitVersion(ctx, bucketState, dstKey, dstMf, applyTagsIfPresent(initState, dstTags), !crossSpace, nil)
 	if err != nil {
+		if errors.Is(err, errPinnedBlobReleased) {
+			return s3response.CopyObjectOutput{}, s3err.GetAPIError(s3err.ErrNoSuchKey)
+		}
 		return s3response.CopyObjectOutput{}, err
 	}
 
