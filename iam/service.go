@@ -26,6 +26,14 @@
 // ([reqscope.ProofStoreKey]) so an onward Forge retrieval — which sees only ctx +
 // space — authorizes with THIS access key's chain, never another's.
 //
+// A response carrying a delegation the revocation consumer has seen revoked
+// ([KeyProofs.Revoked]) authorizes the one request it answers and is not
+// cached: it stems from a Hilt write whose revocations were published but
+// whose commit failed, and caching it would keep the old access in force
+// until midnight while the console's retry republishes revocations Swarf
+// deduplicates. The request still gets a store of its own holding the
+// response's delegations, so its onward retrieval has a chain.
+//
 // A local fast path (the RFC's "local cache" authorization) avoids the Hilt
 // round-trip when everything needed is already cached, mirroring Hilt's own
 // verification and authorization order: the request parses as HMAC SigV4 and
@@ -220,6 +228,21 @@ func (s *Service) GetUserAccountForRequest(ctx fiber.Ctx, accessKeyStr string) (
 		return auth.Account{}, fmt.Errorf("hilt/iam: no tenant for %s in authorize result", accessKeyID)
 	}
 
+	// A write's revocations reached Swarf without its commit: Hilt still
+	// answers with delegations the consumer saw revoked. Authorize this
+	// request from the response and cache nothing, so the key returns to Hilt
+	// on every request until a committed write issues fresh delegations. The
+	// request keeps a store of its own for its onward retrieval.
+	if ctr != nil && s.proofs.Revoked(ctr.Delegations()...) {
+		scoped := NewDelegationCache()
+		ctx.Locals(reqscope.ProofStoreKey(), ucanlib.ProofStore(scoped))
+		s.cacheProofs(reqCtx, scoped, ctr, req, accessKeyID)
+		ctx.Locals(reqscope.TenantKey(), ok.Tenant)
+		s.logger.Info("hilt/iam: authorize response carries a revoked delegation, not cached",
+			zap.String("access", accessKeyStr), zap.Stringer("tenant", ok.Tenant))
+		return account(accessKeyStr, key), nil
+	}
+
 	// Deposit the returned delegations (access-key→ingot re-delegations,
 	// ≤24h TTL) into THIS key's store and complete their chains if needed —
 	// best-effort: the request IS authorized; a gap here only affects onward
@@ -265,16 +288,16 @@ func (s *Service) GetUserAccountForRequest(ctx fiber.Ctx, accessKeyStr string) (
 		zap.Stringer("tenant", ok.Tenant),
 	)
 
-	return auth.Account{
-		Access:     accessKeyStr,
-		SigningKey: key,
-		// Admin so the gateway's role/ACL layers defer entirely: authorization
-		// is per-request via Hilt (or the local fast path), which enforces the
-		// key's permissions and bucket scope. The gateway doesn't model
-		// ownership for hilt-managed keys (bucket ACLs are empty) and its
-		// admin APIs are not mounted.
-		Role: auth.RoleAdmin,
-	}, nil
+	return account(accessKeyStr, key), nil
+}
+
+// account is the gateway account an authorized request runs as. Admin so the
+// gateway's role/ACL layers defer entirely: authorization is per-request via
+// Hilt (or the local fast path), which enforces the key's permissions and
+// bucket scope. The gateway doesn't model ownership for hilt-managed keys
+// (bucket ACLs are empty) and its admin APIs are not mounted.
+func account(access string, signingKey []byte) auth.Account {
+	return auth.Account{Access: access, SigningKey: signingKey, Role: auth.RoleAdmin}
 }
 
 // mapAuthError translates an /s3/request/authorize failure into the closest S3
