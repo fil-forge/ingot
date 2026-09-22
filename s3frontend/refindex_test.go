@@ -86,6 +86,7 @@ func newRefTestBackend(t *testing.T, maxBlob ...int64) (*Backend, *inmem.MemStor
 		Uploader:        inmem.NopUploader{},
 		Deferred:        inmem.NopUploader{},
 		Remover:         rm,
+		Registrar:       inmem.NopUploader{},
 		EncParams:       mem,
 		RegionKeys:      testRegionKeys(t),
 		TenantKeys:      testTenantKeys(),

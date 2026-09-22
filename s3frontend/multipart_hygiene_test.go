@@ -524,6 +524,7 @@ func newDeferredBackend(t *testing.T, up deferredTestUploader, mods ...func(*Dep
 		Uploader:        up,
 		Deferred:        up,
 		Remover:         &recordingRemover{},
+		Registrar:       inmem.NopUploader{},
 		EncParams:       mem,
 		RegionKeys:      testRegionKeys(t),
 		TenantKeys:      testTenantKeys(),
