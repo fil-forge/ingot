@@ -510,18 +510,20 @@ func TestPostgresStores_Live(t *testing.T) {
 	t.Run("multipart session parts latch metadata", func(t *testing.T) {
 		const id = "upl-1"
 		meta := map[string]string{"x-amz-meta-foo": "bar"}
-		if err := r.CreateSession(ctx, registry.MultipartSession{UploadID: id, Bucket: "b", ObjectKey: "k", ContentType: "text/plain", Metadata: meta}); err != nil {
+		bSpace := testutil.RandomDID(t)
+		if err := r.CreateSession(ctx, registry.MultipartSession{UploadID: id, Bucket: "b", ObjectKey: "k", Space: bSpace, ContentType: "text/plain", Metadata: meta}); err != nil {
 			t.Fatalf("CreateSession: %v", err)
 		}
-		if err := r.CreateSession(ctx, registry.MultipartSession{UploadID: id, Bucket: "b", ObjectKey: "k"}); err != registry.ErrExists {
+		if err := r.CreateSession(ctx, registry.MultipartSession{UploadID: id, Bucket: "b", ObjectKey: "k", Space: bSpace}); err != registry.ErrExists {
 			t.Fatalf("duplicate CreateSession = %v, want ErrExists", err)
 		}
 		s, err := r.GetSession(ctx, id)
-		if err != nil || s.ContentType != "text/plain" || s.Metadata["x-amz-meta-foo"] != "bar" {
-			t.Fatalf("GetSession = %+v, err %v (metadata jsonb round-trip)", s, err)
+		if err != nil || s.ContentType != "text/plain" || s.Metadata["x-amz-meta-foo"] != "bar" || s.Space != bSpace {
+			t.Fatalf("GetSession = %+v, err %v (metadata jsonb round-trip, space)", s, err)
 		}
-		if s.Space.Defined() {
-			t.Fatalf("session created without a space reads back %v, want undefined", s.Space)
+		// The space is required: a session without one is refused.
+		if err := r.CreateSession(ctx, registry.MultipartSession{UploadID: id + "-nospace", Bucket: "b", ObjectKey: "k"}); err == nil {
+			t.Fatal("CreateSession without a space was accepted")
 		}
 		// The bucket's space rides on the session, for teardown once the
 		// bucket row is gone.
@@ -577,10 +579,11 @@ func TestPostgresStores_Live(t *testing.T) {
 	})
 
 	t.Run("multipart listing sweeper and part refs", func(t *testing.T) {
+		lsSpace := testutil.RandomDID(t)
 		mk := func(id, key string) {
 			t.Helper()
 			if err := r.CreateSession(ctx, registry.MultipartSession{
-				UploadID: id, Bucket: "b", ObjectKey: key,
+				UploadID: id, Bucket: "b", ObjectKey: key, Space: lsSpace,
 				ContentEncoding: "testenc", ChecksumAlgorithm: "CRC32", ChecksumType: "FULL_OBJECT",
 			}); err != nil {
 				t.Fatalf("CreateSession %s: %v", id, err)

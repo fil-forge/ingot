@@ -589,6 +589,9 @@ func (r *Postgres) GetInclusion(ctx context.Context, space did.DID, digest multi
 // MultipartStore =============================================================
 
 func (r *Postgres) CreateSession(ctx context.Context, s MultipartSession) error {
+	if !s.Space.Defined() {
+		return errors.New("registry: create session: space is required")
+	}
 	state := s.State
 	if state == "" {
 		state = SessionOpen
@@ -835,7 +838,7 @@ func (r *Postgres) CountPartRefs(ctx context.Context, digest multihash.Multihash
 	var n int
 	err := r.pool.QueryRow(ctx,
 		`SELECT count(*) FROM ingot.multipart_parts
-		 WHERE $1 = ANY(blob_digests) AND upload_id <> $2`,
+		 WHERE blob_digests @> ARRAY[$1::bytea] AND upload_id <> $2`,
 		digest, excludeUploadID).Scan(&n)
 	if err != nil {
 		return 0, fmt.Errorf("registry: count part refs: %w", err)
@@ -848,7 +851,7 @@ func (r *Postgres) CountLivePartRefs(ctx context.Context, digest multihash.Multi
 	err := r.pool.QueryRow(ctx,
 		`SELECT count(*) FROM ingot.multipart_parts p
 		 JOIN ingot.multipart_sessions s ON s.upload_id = p.upload_id
-		 WHERE $1 = ANY(p.blob_digests) AND s.state IN ($2, $3)`,
+		 WHERE p.blob_digests @> ARRAY[$1::bytea] AND s.state IN ($2, $3)`,
 		digest, SessionOpen, SessionCompleting).Scan(&n)
 	if err != nil {
 		return 0, fmt.Errorf("registry: count live part refs: %w", err)

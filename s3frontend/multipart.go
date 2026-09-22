@@ -163,11 +163,7 @@ func (b *Backend) openSession(ctx context.Context, uploadID string, bucket, key 
 // recreated under the same name: the parts were parked in the old bucket's
 // space, and the current bucket's space is another. Such an upload is no
 // upload of this bucket's; the sweeper tears it down against its own space.
-// A session that predates the space column carries no space to compare.
 func (b *Backend) checkSessionSpace(ctx context.Context, sess *registry.MultipartSession) error {
-	if !sess.Space.Defined() {
-		return nil
-	}
 	space, err := b.bucketSpace(ctx, sess.Bucket)
 	if err != nil {
 		return err
@@ -319,10 +315,7 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 		}
 	}
 
-	space, err := b.spaceOf(ctx, *sess)
-	if err != nil {
-		return nil, err
-	}
+	space := sess.Space
 	// Record the superseded blobs' releases before anything is written, so
 	// no failure past this point can strand them. Until the new part row
 	// lands the old one still references them, which defers the release; a
@@ -919,10 +912,7 @@ func (b *Backend) AbortMultipartUpload(ctx context.Context, input *s3.AbortMulti
 	// session, so the records must exist before the delete; a failure up to
 	// that point fails the abort and leaves the session latched 'aborting'
 	// for the sweeper to finish.
-	space, err := b.spaceOf(ctx, *sess)
-	if err != nil {
-		return err
-	}
+	space := sess.Space
 	released, err := b.recordSessionReleases(ctx, space, uploadID)
 	if err != nil {
 		return fmt.Errorf("s3frontend: abort: %w", err)
@@ -943,10 +933,7 @@ func (b *Backend) AbortMultipartUpload(ctx context.Context, input *s3.AbortMulti
 // row gone; false leaves the row for the sweeper, and DeleteBucket must not
 // proceed past it.
 func (b *Backend) abortOpenSession(ctx context.Context, sess registry.MultipartSession) bool {
-	space, ok := b.sessionSpace(ctx, sess)
-	if !ok {
-		return false
-	}
+	space := sess.Space
 	won, err := b.multipart.LatchSession(ctx, sess.UploadID, registry.SessionOpen, registry.SessionAborting)
 	if err != nil || !won {
 		return false
@@ -1035,34 +1022,6 @@ func (b *Backend) enqueuePartReleases(ctx context.Context, space did.DID, digest
 		return nil, fmt.Errorf("record releases: %w", err)
 	}
 	return records, nil
-}
-
-// spaceOf is the space a session's blobs live in: recorded on the session
-// at create, so every operation on the session — parts, abort, teardown —
-// works against the space the parts were parked in, and never against
-// whatever bucket currently carries the name. A bucket deleted and recreated
-// under the same name has a new space; resolving by name would park into it
-// or release from it. A row that predates the column resolves its bucket
-// instead.
-func (b *Backend) spaceOf(ctx context.Context, s registry.MultipartSession) (did.DID, error) {
-	if s.Space.Defined() {
-		return s.Space, nil
-	}
-	return b.bucketSpace(ctx, s.Bucket)
-}
-
-// sessionSpace is spaceOf for the sweeper: when a legacy row's bucket cannot
-// be resolved the row is kept for the next sweep, since dropping it would
-// strand the blobs (its part rows are their only index). ok=false means
-// retry later.
-func (b *Backend) sessionSpace(ctx context.Context, s registry.MultipartSession) (did.DID, bool) {
-	space, err := b.spaceOf(ctx, s)
-	if err != nil {
-		b.logger.Warn("sweep: session predates the space column and its bucket cannot be resolved; retrying next sweep",
-			zap.String("uploadID", s.UploadID), zap.String("bucket", s.Bucket), zap.Error(err))
-		return did.Undef, false
-	}
-	return space, true
 }
 
 // parkBlobs makes each blob durable on its provider without accepting it:
@@ -1598,11 +1557,7 @@ func (b *Backend) latchStaleSession(ctx context.Context, s registry.MultipartSes
 // again is what makes that best-effort pass safe to lose. Reports whether
 // the row was removed; a failure leaves it for the next sweep.
 func (b *Backend) reapCompletedSession(ctx context.Context, s registry.MultipartSession) bool {
-	space, ok := b.sessionSpace(ctx, s)
-	if !ok {
-		return false
-	}
-	released, err := b.recordSessionReleases(ctx, space, s.UploadID)
+	released, err := b.recordSessionReleases(ctx, s.Space, s.UploadID)
 	if err != nil {
 		b.logger.Warn("sweep: record completed session's releases failed; retrying next sweep",
 			zap.String("uploadID", s.UploadID), zap.Error(err))
@@ -1622,13 +1577,9 @@ func (b *Backend) reapCompletedSession(ctx context.Context, s registry.Multipart
 // was removed; a failure before the delete leaves the session latched for
 // the next sweep, since the part rows are the only index to the blobs.
 func (b *Backend) reapAbortingSession(ctx context.Context, s registry.MultipartSession) bool {
-	space, ok := b.sessionSpace(ctx, s)
-	if !ok {
-		return false
-	}
 	// Records first, then the row: the part rows are the only index to the
 	// blobs and cascade away with the session.
-	released, err := b.recordSessionReleases(ctx, space, s.UploadID)
+	released, err := b.recordSessionReleases(ctx, s.Space, s.UploadID)
 	if err != nil {
 		b.logger.Warn("sweep: record part releases failed; retrying next sweep",
 			zap.String("uploadID", s.UploadID), zap.Error(err))

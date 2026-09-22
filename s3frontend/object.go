@@ -740,12 +740,17 @@ func (b *Backend) executeRelease(ctx context.Context, pr registry.PendingRelease
 	case in != nil && in.State == registry.IntentPublished:
 		// Committed at some point: the spool copy stays as the insurance
 		// copy until eviction, and the intent with it.
+	case !ok:
+		// A step above failed. The intent stays, with the spool copy, so
+		// the retry reads the same state: deleting it would turn a blob
+		// that never left this node into one with neither rows nor intent,
+		// whose retry then owes a network remove it cannot authorize.
 	default:
+		// The spool copy goes before the intent, for the same reason.
 		if err := b.spool.Remove(digest); err != nil {
 			log.Warn("release: remove spooled blob failed", zap.Error(err))
 			ok = false
-		}
-		if err := b.intents.DeleteIntent(ctx, digest); err != nil && !errors.Is(err, registry.ErrNotFound) {
+		} else if err := b.intents.DeleteIntent(ctx, digest); err != nil && !errors.Is(err, registry.ErrNotFound) {
 			log.Warn("release: delete upload intent failed", zap.Error(err))
 			ok = false
 		}

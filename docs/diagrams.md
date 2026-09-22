@@ -866,7 +866,7 @@ erDiagram
     multipart_sessions {
         text upload_id PK
         text bucket
-        text space "the bucket's space, for teardown after the bucket row is gone"
+        text space "the bucket's space, required: the subject of every release of the session's blobs, never resolved from the bucket name"
         text object_key
         text state "open, completing, aborting, completed"
         timestamptz state_changed_at "the sweeper's clock"

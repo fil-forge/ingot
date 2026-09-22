@@ -980,8 +980,9 @@ func TestReleaseSweepDropsParkTheSessionSweepCouldNot(t *testing.T) {
 	if _, err := mem.GetPark(ctx, stale); err != nil {
 		t.Fatalf("park row should have survived the failed sweep delete: %v", err)
 	}
-	if _, err := mem.GetIntent(ctx, stale); !errors.Is(err, registry.ErrNotFound) {
-		t.Fatalf("intent for %x survived the sweep (err=%v)", stale, err)
+	// The failed attempt keeps the intent: it is the retry's state.
+	if _, err := mem.GetIntent(ctx, stale); err != nil {
+		t.Fatalf("intent for %x did not survive the failed attempt: %v", stale, err)
 	}
 
 	// The release sweep is the retry, with a working store this time.
@@ -991,6 +992,9 @@ func TestReleaseSweepDropsParkTheSessionSweepCouldNot(t *testing.T) {
 	}
 	if _, err := mem.GetLocation(ctx, did.Undef, stale); !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("location for %x survived the release sweep (err=%v)", stale, err)
+	}
+	if _, err := mem.GetIntent(ctx, stale); !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("intent for %x survived the release sweep (err=%v)", stale, err)
 	}
 }
 
@@ -1519,21 +1523,6 @@ func TestReleaseKeepsRowsUntilTheNetworkStepSucceeds(t *testing.T) {
 	}
 }
 
-// failRegistryGet is a bucket registry whose next `fails` lookups fail, as a
-// registry outage does while the sweeper resolves a session's space.
-type failRegistryGet struct {
-	registry.Registry
-	fails int
-}
-
-func (f *failRegistryGet) Get(ctx context.Context, name string) (*registry.State, error) {
-	if f.fails > 0 {
-		f.fails--
-		return nil, errors.New("buckets table unavailable")
-	}
-	return f.Registry.Get(ctx, name)
-}
-
 // TestCompletedSessionReapKeepsWinnersOfDeletedObject: a completed session
 // is retained after its object is deleted. Its winners' releases were
 // recorded by the delete as ordinary releases; the reap must not re-record
@@ -1687,53 +1676,6 @@ func TestReleaseWaitsForAnotherOpenSessionSharingTheBlob(t *testing.T) {
 	}
 }
 
-// TestReapKeepsSessionWhenBucketLookupFails: a transient failure to resolve
-// the session's bucket must not be read as the bucket being gone. The row
-// stays for the next sweep, which finishes the teardown.
-func TestReapKeepsSessionWhenBucketLookupFails(t *testing.T) {
-	pu := &parkingUploader{}
-	reg := &failRegistryGet{}
-	b, mem := newDeferredBackend(t, pu, func(d *Deps) {
-		reg.Registry = d.Registry
-		d.Registry = reg
-	})
-	ctx := context.Background()
-	key := "lookup-fails"
-
-	uploadID := mpCreate(t, b, key, "", "")
-	if _, err := mpUploadPart(t, b, key, uploadID, 1, testBody(int(backend.MinPartSize)), nil); err != nil {
-		t.Fatalf("UploadPart: %v", err)
-	}
-	d := hygienePartDigests(t, mem, uploadID, 1)[0]
-
-	// One sweep tries twice: the open-session pass latches the session to
-	// aborting and fails the lookup, then the stranded-aborting pass tries
-	// again. Refuse both.
-	reg.fails = 2
-	if n, err := b.SweepStaleMultipartSessions(ctx, -time.Second); err != nil || n != 0 {
-		t.Fatalf("sweep with a failing bucket lookup: cleaned=%d err=%v, want 0", n, err)
-	}
-	if reg.fails > 0 {
-		t.Fatal("the registry never refused a lookup")
-	}
-	if _, err := mem.GetSession(ctx, uploadID); err != nil {
-		t.Fatalf("session was dropped on a failed bucket lookup: %v", err)
-	}
-	if parts, _ := mem.ListParts(ctx, uploadID); len(parts) != 1 {
-		t.Fatalf("part rows after the failed sweep = %d, want 1 (the only index to the blob)", len(parts))
-	}
-	if pu.abortedDigests()[string(d)] {
-		t.Fatal("blob was aborted before its release was recorded")
-	}
-
-	if n, err := b.SweepStaleMultipartSessions(ctx, -time.Second); err != nil || n == 0 {
-		t.Fatalf("second sweep: cleaned=%d err=%v", n, err)
-	}
-	if !pu.abortedDigests()[string(d)] {
-		t.Fatalf("blob %x was not released by the second sweep", d)
-	}
-}
-
 // recordingReleases records the space each bulk enqueue was made against.
 type recordingReleases struct {
 	registry.PendingReleaseStore
@@ -1797,35 +1739,6 @@ func TestSweepReleasesSessionThatOutlivedItsBucket(t *testing.T) {
 	}
 	if _, err := mem.GetPark(ctx, d); !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("park row for %x survived (err=%v)", d, err)
-	}
-}
-
-// TestSweepKeepsLegacySessionWhoseBucketIsGone: a session row from before the
-// space column, whose bucket row is gone, cannot record its releases. The
-// sweep keeps it rather than dropping the only index to its blobs.
-func TestSweepKeepsLegacySessionWhoseBucketIsGone(t *testing.T) {
-	b, mem, pu := newParkingBackend(t)
-	ctx := context.Background()
-	const uploadID = "legacy"
-	if err := mem.CreateSession(ctx, registry.MultipartSession{UploadID: uploadID, Bucket: "ghost", ObjectKey: "k"}); err != nil {
-		t.Fatalf("CreateSession: %v", err)
-	}
-	d := multihash.Multihash([]byte("legacy-blob"))
-	if err := mem.PutPart(ctx, registry.MultipartPart{UploadID: uploadID, PartNumber: 1, ETagMD5: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{d}, State: registry.PartParked}); err != nil {
-		t.Fatalf("PutPart: %v", err)
-	}
-
-	if n, err := b.SweepStaleMultipartSessions(ctx, -time.Second); err != nil || n != 0 {
-		t.Fatalf("sweep: cleaned=%d err=%v, want the row kept", n, err)
-	}
-	if sess, err := mem.GetSession(ctx, uploadID); err != nil || sess.State != registry.SessionAborting {
-		t.Fatalf("legacy session = %v/%v, want kept, latched aborting", sess, err)
-	}
-	if parts, _ := mem.ListParts(ctx, uploadID); len(parts) != 1 {
-		t.Fatalf("part rows = %d, want 1 (the only index to the blob)", len(parts))
-	}
-	if pu.abortedDigests()[string(d)] {
-		t.Fatal("blob was aborted without a space to record its release against")
 	}
 }
 
@@ -2133,6 +2046,72 @@ func TestUploadPartFailedRowWriteReleasesItsBlobs(t *testing.T) {
 	// The retry lands.
 	if _, err := mpUploadPart(t, b, key, uploadID, 1, testBody(int(backend.MinPartSize)), nil); err != nil {
 		t.Fatalf("retry UploadPart: %v", err)
+	}
+}
+
+// failShred is an encryption-params store whose next `fails` deletes fail,
+// as a registry outage does during a release's crypto-shred.
+type failShred struct {
+	registry.EncryptionParamsStore
+	fails int
+}
+
+func (f *failShred) DeleteEncryptionParams(ctx context.Context, space did.DID, digest multihash.Multihash) error {
+	if f.fails > 0 {
+		f.fails--
+		return errors.New("encryption params table unavailable")
+	}
+	return f.EncryptionParamsStore.DeleteEncryptionParams(ctx, space, digest)
+}
+
+// TestReleaseKeepsIntentUntilLocalCleanupSucceeds: a release of a blob that
+// never left the node fails at its crypto-shred. The intent and spool copy
+// must survive that attempt, or the retry would find neither rows nor
+// intent and owe a network remove it has no authority for; the retry then
+// finishes the local cleanup without touching the network.
+func TestReleaseKeepsIntentUntilLocalCleanupSucceeds(t *testing.T) {
+	rm := &recordingRemover{}
+	mp := &failPutPart{fails: 1}
+	shred := &failShred{}
+	b, mem := newDeferredBackend(t, &parkingUploader{}, func(d *Deps) {
+		mp.MultipartStore = d.Multipart
+		d.Multipart = mp
+		shred.EncryptionParamsStore = d.EncParams
+		d.EncParams = shred
+		d.Remover = rm
+	})
+	ctx := context.Background()
+	key := "shred-fails"
+	uploadID := mpCreate(t, b, key, "", "")
+	// The in-request release attempt fails its shred; the record stays.
+	shred.fails = 1
+	if _, err := mpUploadPart(t, b, key, uploadID, 1, testBody(int(backend.MinPartSize)), nil); err == nil {
+		t.Fatal("UploadPart succeeded although the part row write failed")
+	}
+	if shred.fails > 0 {
+		t.Fatal("the shred was never attempted")
+	}
+	pending, _ := mem.ListReleasesBySpace(ctx, did.Undef)
+	if len(pending) != 1 {
+		t.Fatalf("pending releases after the failed attempt = %d, want 1", len(pending))
+	}
+	d := pending[0].Digest
+	if in, err := mem.GetIntent(ctx, d); err != nil || in.State != registry.IntentSpooled {
+		t.Fatalf("intent after the failed attempt = %v/%v, want kept as spooled", in, err)
+	}
+	if _, err := os.Stat(b.spool.Path(d)); err != nil {
+		t.Fatalf("spool copy gone after the failed attempt: %v", err)
+	}
+
+	drainReleases(t, b)
+	if _, err := mem.GetIntent(ctx, d); !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("intent survived the retry (err=%v)", err)
+	}
+	if _, err := os.Stat(b.spool.Path(d)); !os.IsNotExist(err) {
+		t.Fatalf("spool copy survived the retry (err=%v)", err)
+	}
+	if n := len(rm.removedDigests()); n != 0 {
+		t.Fatalf("RemoveBlob called %d times for a blob that never left the node, want 0", n)
 	}
 }
 

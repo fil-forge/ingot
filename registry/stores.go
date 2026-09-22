@@ -161,10 +161,10 @@ type MultipartSession struct {
 	UploadID  string
 	Bucket    string
 	ObjectKey string
-	// Space is the bucket's Forge space, recorded at create so a teardown
-	// can record and run the parts' releases without the bucket row, which
-	// a session created during DeleteBucket can outlive. Undefined on rows
-	// that predate the column.
+	// Space is the bucket's Forge space, recorded at create and required: it
+	// is the subject of every release of the session's blobs, and a teardown
+	// never resolves it from the bucket name, which a later bucket of the
+	// same name would answer with another space.
 	Space                   did.DID
 	State                   string
 	ContentType             string
