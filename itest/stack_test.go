@@ -329,8 +329,9 @@ var hiltAllPermissions = []string{
 //
 // The Tenant API is reached with curl inside the hilt container (so no host
 // port mapping is needed), authenticated with smelt's local-dev partner key.
-// The tenant's region must match the provider region hilt's post_start hook
-// registered ingot under (forgeRegion).
+// A tenant carries no region; each bucket binds to the region it is created
+// in, which here is the provider region hilt's post_start hook registers
+// ingot under (forgeRegion).
 func hiltProvisionTenant(t *testing.T, ctx context.Context, s *stack.Stack, tenantID string) (accessKey, secretKey string) {
 	t.Helper()
 	accessKey, secretKey, err := hiltProvisionTenantErr(ctx, s, tenantID)
