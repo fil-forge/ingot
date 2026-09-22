@@ -366,23 +366,51 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 
 		// In-flight multipart uploads do not block deletion (the upstream
 		// conformance contract's teardown deletes buckets without aborting
-		// them): abort any open sessions, releasing their parked part blobs
-		// from the space, before asking hilt to delete the space — which
-		// refuses while the space still holds blob registrations.
+		// them): tear down every session of the bucket — open ones aborted,
+		// stranded and completed ones reaped — recording their part blobs'
+		// releases before asking hilt to delete the space, which refuses
+		// while the space still holds blob registrations. A session whose
+		// releases cannot be recorded fails the delete: its part rows are
+		// the only index to its blobs, and with the bucket row gone the
+		// sweeper would have no space to record them against.
+		//
+		// The session teardown runs without the request's proof store, as
+		// the implicit abort always has: the uploader then falls back to the
+		// blob authority captured at write time, the same resolution the
+		// sweepers use. The shipped-segment release and the drain below keep
+		// the request's proofs, which authorize their removes; a bucket that
+		// never saw a multipart write has no captured authority to fall
+		// back on, and masking them fails the delete.
+		relCtx := reqscope.WithoutProofStore(ctx)
 		sessions, err := b.multipart.ListSessions(ctx, name)
 		if err != nil {
 			return fmt.Errorf("s3frontend: delete bucket: list mp sessions: %w", err)
 		}
-		aborted := 0
 		for _, s := range sessions {
-			if s.State == registry.SessionOpen {
-				b.abortOpenSession(ctx, st.Space, s)
-				aborted++
+			var ok bool
+			switch s.State {
+			case registry.SessionOpen:
+				ok = b.abortOpenSession(relCtx, s)
+			case registry.SessionCompleted:
+				ok = b.reapCompletedSession(relCtx, s)
+			case registry.SessionCompleting:
+				// Crash-stranded, or a live Complete concluding its blobs
+				// off-lock. The latch is taken here, under the bucket
+				// lock: a live Complete re-checks its latch under this
+				// lock before committing and fails with NoSuchUpload, so
+				// it cannot commit a manifest over the blobs this releases.
+				won, err := b.multipart.LatchSession(ctx, s.UploadID, registry.SessionCompleting, registry.SessionAborting)
+				ok = err == nil && won && b.reapAbortingSession(relCtx, s)
+			default:
+				ok = b.reapAbortingSession(relCtx, s)
+			}
+			if !ok {
+				return fmt.Errorf("s3frontend: delete bucket: multipart session %s: releases not recorded; retry", s.UploadID)
 			}
 		}
-		if aborted > 0 {
-			b.logger.Info("delete bucket: aborted in-flight multipart sessions",
-				zap.String("bucket", name), zap.Int("aborted", aborted), zap.Int("total", len(sessions)))
+		if len(sessions) > 0 {
+			b.logger.Info("delete bucket: tore down multipart sessions",
+				zap.String("bucket", name), zap.Int("sessions", len(sessions)))
 		}
 
 		// Shipped catalog segments registered blobs in the bucket's space

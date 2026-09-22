@@ -23,9 +23,22 @@ import (
 // names those versions' blob_refs rows and answers `?versionId=null`.
 const NullVersionID = "null"
 
-// upload_intents.state values (the local-store lifecycle, §5).
+// upload_intents.state values (the local-store lifecycle, §5): spooled on
+// ingest, parked once durable on a provider with the accept deferred,
+// accepted once the provider has accepted it, and published once a bucket
+// commit has claimed it. Published is written with the blob's first
+// reference claim, in the same transaction, and never leaves: it is the
+// durable record that the blob was committed, which a release consults to
+// keep the spool copy (the insurance copy until eviction) and the intent,
+// where a never-committed part blob loses both.
 const (
-	IntentSpooled   = "spooled"
+	IntentSpooled = "spooled"
+	// IntentUploading is set before a blob's first network call and stands
+	// until a row records the outcome (a park or a location): the blob may
+	// be on the network. A blob still 'spooled' never left this node, which
+	// a release relies on to skip a network remove it could not authorize
+	// from the background.
+	IntentUploading = "uploading"
 	IntentParked    = "parked"
 	IntentAccepted  = "accepted"
 	IntentPublished = "published"
@@ -145,9 +158,14 @@ type BlobInclusion struct {
 // headers (ContentEncoding..Expires) are captured at CreateMultipartUpload so
 // Complete can write them into the manifest exactly like a single-shot PUT.
 type MultipartSession struct {
-	UploadID                string
-	Bucket                  string
-	ObjectKey               string
+	UploadID  string
+	Bucket    string
+	ObjectKey string
+	// Space is the bucket's Forge space, recorded at create and required: it
+	// is the subject of every release of the session's blobs, and a teardown
+	// never resolves it from the bucket name, which a later bucket of the
+	// same name would answer with another space.
+	Space                   did.DID
 	State                   string
 	ContentType             string
 	ContentEncoding         string
@@ -183,6 +201,11 @@ type MultipartSession struct {
 	CommittedETag      string
 	CommittedVersionID string
 	CreatedAt          time.Time
+	// StateChangedAt is when State last changed (creation, for a session
+	// still open). The sweeper measures staleness from it, so a Complete
+	// that latches an old session to 'completing' holds the row for a TTL
+	// of its own.
+	StateChangedAt time.Time
 }
 
 // MultipartPart is one row of ingot.multipart_parts. BlobDigests is the
@@ -208,7 +231,20 @@ type MultipartPart struct {
 // claim per body digest; a delete/overwrite removes it; CountClaims gates
 // remove(digest) (physical reclamation when the count reaches zero).
 type BlobRefStore interface {
+	// AddBlobClaim records an object version's claim on a digest and, in the
+	// same transaction, marks the digest's upload intent published (see
+	// IntentPublished). Idempotent.
 	AddBlobClaim(ctx context.Context, claim BlobClaim) error
+	// PinBlobClaims is AddBlobClaim for digests borrowed from another object
+	// of the same space (a same-space copy pins the source's body). Each
+	// claim is recorded only while the space still holds a claim on its
+	// digest, all in one transaction, and the transaction excludes
+	// DropClaimEnqueueRelease on the same (space, digest), so a pin and the
+	// drop of the digest's last claim commit in one order or the other: the
+	// drop counts the pin, or the pin finds no claim. Reports whether every
+	// claim is recorded; false records nothing and means some digest's last
+	// claim is gone and the blob is being released. Idempotent.
+	PinBlobClaims(ctx context.Context, claims []BlobClaim) (bool, error)
 	DeleteBlobClaim(ctx context.Context, digest multihash.Multihash, bucket, objectKey, versionID string) error
 	// CountClaims returns how many object versions in space still reference
 	// digest. Zero means the space's claim may be released.
@@ -234,7 +270,16 @@ type PendingRelease struct {
 // (crypto-shred + location delete + network remove). Enqueue upserts,
 // keeping the later not_before.
 type PendingReleaseStore interface {
+	// EnqueueRelease records that (space, digest) is to be released once
+	// notBefore has passed. Upsert: an existing record keeps the later of the
+	// two not_before values.
 	EnqueueRelease(ctx context.Context, space did.DID, digest multihash.Multihash, notBefore time.Time) error
+	// EnqueueReleases is EnqueueRelease for many digests in one statement,
+	// for a session teardown with a blob per part. Repeated digests are
+	// recorded once. Returns the records as they stand afterwards: a digest
+	// that already had a record keeps its later not_before, so the caller
+	// can tell which releases are due now.
+	EnqueueReleases(ctx context.Context, space did.DID, digests []multihash.Multihash, notBefore time.Time) ([]PendingRelease, error)
 	// ListDueReleases returns intents with not_before <= now, oldest first,
 	// at most limit.
 	ListDueReleases(ctx context.Context, now time.Time, limit int) ([]PendingRelease, error)
@@ -244,6 +289,15 @@ type PendingReleaseStore interface {
 	// owed) before asking hilt to delete the space.
 	ListReleasesBySpace(ctx context.Context, space did.DID) ([]PendingRelease, error)
 	DeleteRelease(ctx context.Context, space did.DID, digest multihash.Multihash) error
+	// DeleteIntentAndRelease removes a blob's upload intent and this
+	// release's record in one transaction — the last step of releasing a
+	// blob that was never committed. The two must go together: the intent
+	// is the only evidence of how far the blob ever got, and a record that
+	// outlived it would leave the retry to read a blob with no rows and no
+	// intent, owing a network remove that a never-uploaded blob has no
+	// authority for and that would fail on every attempt. Both deletes are
+	// idempotent.
+	DeleteIntentAndRelease(ctx context.Context, space did.DID, digest multihash.Multihash) error
 }
 
 // IntentStore is the local-store index (§5): the on-disk blobs Ingot holds
@@ -345,6 +399,12 @@ type MultipartStore interface {
 	// Returns true iff this caller performed the transition.
 	CompleteSession(ctx context.Context, uploadID, etag, versionID string) (bool, error)
 	DeleteSession(ctx context.Context, uploadID string) error
+	// PutPart records a part of an OPEN session, superseding a prior row for
+	// the part number, and returns ErrNotFound when the session is missing
+	// or no longer open: the write and the state check are one statement
+	// that holds the session row, so a part cannot land after a Complete or
+	// a teardown has taken the session, and a teardown's part listing sees
+	// every part that did land.
 	PutPart(ctx context.Context, p MultipartPart) error
 	ListParts(ctx context.Context, uploadID string) ([]MultipartPart, error)
 	// ListSessions returns bucket's sessions ordered by (object_key, created_at,
@@ -352,13 +412,21 @@ type MultipartStore interface {
 	// (prefix/markers/max) happens in the handler; in-flight session counts are
 	// small.
 	ListSessions(ctx context.Context, bucket string) ([]MultipartSession, error)
-	// ListStaleSessions returns sessions in `state` created before cutoff, for
-	// the abandoned-upload sweeper.
+	// ListStaleSessions returns sessions in `state` whose state last changed
+	// before cutoff, for the abandoned-upload sweeper. A session that has
+	// never left 'open' counts from its creation.
 	ListStaleSessions(ctx context.Context, state string, cutoff time.Time) ([]MultipartSession, error)
 	// CountPartRefs returns how many parts OUTSIDE excludeUploadID reference
 	// digest — the shared-blob guard for abort/supersede spool cleanup
 	// (content-addressed part blobs may be deduped across sessions).
 	CountPartRefs(ctx context.Context, digest multihash.Multihash, excludeUploadID string) (int, error)
+	// CountLivePartRefs returns how many parts of in-flight sessions (open or
+	// completing) reference digest: the guard a deferred release checks
+	// before taking a blob a session still means to claim. Parts of completed
+	// and aborting sessions do not count — a completed session's winners hold
+	// claims and its orphans have releases of their own, and an aborting
+	// session is recording releases for its parts.
+	CountLivePartRefs(ctx context.Context, digest multihash.Multihash) (int, error)
 }
 
 // GCStore records superseded MST node CIDs (§4). Write-only this iteration.

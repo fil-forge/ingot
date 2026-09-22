@@ -91,9 +91,10 @@ type Config struct {
 	RevocationServiceDID string `mapstructure:"revocation_service_did" yaml:"revocation_service_did"`
 
 	// MultipartSessionTTL bounds abandoned multipart uploads (Go duration
-	// string, e.g. "168h"): open sessions older than this are aborted by a
-	// background sweeper and their spooled parts dropped. Empty → default
-	// 7 days; a negative duration disables the sweeper.
+	// string, e.g. "168h"): a session whose state has not changed for this
+	// long is torn down by a background sweeper and its spooled parts
+	// dropped. Empty → default 7 days; a negative duration disables the
+	// sweeper.
 	MultipartSessionTTL string `mapstructure:"multipart_session_ttl" yaml:"multipart_session_ttl"`
 
 	// ReleaseGrace delays each blob release (crypto-shred + location delete +

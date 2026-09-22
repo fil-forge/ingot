@@ -425,7 +425,7 @@ sequenceDiagram
         B->>B: vet the source: copySourceBucket (tenant), resolveVersionIn,<br/>range within the object, copy-source preconditions (412);<br/>the body is the source's plaintext range through the decrypting reader
     end
     B->>B: ingestPart: splitSpool<br/>(resolve the tenant recipient, then encrypt per piece:<br/>fresh CEK → FEE envelope → spool under the ciphertext<br/>digest + params row, as in the PutObject diagram)
-    B->>R: PutPart(parked)
+    B->>R: PutPart(parked): open sessions only, the row held FOR SHARE<br/>against a concurrent latch; a refused part records its blobs' releases
     loop each part blob (parkBlobs)
         alt blob_locations already has the digest
             B->>R: intent accepted (dedup, no park)
@@ -452,14 +452,21 @@ sequenceDiagram
         B-->>C: 200, ETag = md5-of-part-md5s + "-N"
     end
     C->>B: AbortMultipartUpload
-    B->>R: LatchSession(open to aborting), then DeleteSession (parts cascade)
-    B->>U: cleanupPartBlobs: /blob/abort parked blobs (cause = AddTask),<br/>crypto-shred each blob's blob_encryption_params row
-    Note over B,R: a background sweeper aborts open sessions older than<br/>MultipartSessionTTL (default 7d) and reaps terminal rows
+    B->>R: LatchSession(open to aborting); EnqueueReleases for every<br/>unreferenced part blob; then DeleteSession (parts cascade)
+    B->>U: releaseNow, per record: crypto-shred, then /blob/abort a parked blob<br/>(cause = AddTask) or /blob/remove an accepted one; local rows dropped<br/>once the network step succeeds; the release sweeper retries the rest
+    Note over B,R: a background sweeper tears down sessions whose state has not<br/>changed for MultipartSessionTTL (default 7d); a Complete's latch restarts the clock
 ```
 
-- A part re-upload and an abort reclaim only blobs no other session, part, or
-  committed object references (`cleanupPartBlobs` checks `CountPartRefs` and
-  `CountClaims`).
+- A part re-upload and an abort record a release for every blob of theirs
+  that is not still live in the session; the release itself decides whether
+  the blob is free to go — a claimed digest drops the record (`CountClaims`),
+  and one a part of an in-flight session references waits
+  (`CountLivePartRefs`, checked first: a Complete claims before it leaves
+  'completing'). `AddBlobClaim` publishes a committed blob's upload intent,
+  so the reap of a retained session releases only what was never committed.
+- A part is written only while its session is open, in the statement that
+  checks the state; a teardown that took the session refuses it, and the
+  upload records releases for the blobs it had spooled.
 - A never-parked blob at Complete falls back to a full synchronous
   `UploadBlob`.
 
@@ -467,7 +474,8 @@ Cross-references: [`architecture.md` §7.2](./architecture.md#72-multipart),
 [§7.3](./architecture.md#73-the-session-latch-the-abortcomplete-race).
 
 Sources: `s3frontend/multipart.go` (all verbs, ingestPart, parkBlobs,
-concludeBlobs, cleanupPartBlobs, SweepStaleMultipartSessions),
+concludeBlobs, enqueuePartReleases, SweepStaleMultipartSessions),
+`s3frontend/object.go` (runRelease, executeRelease),
 `s3frontend/uploadpartcopy.go`, `registry/stores.go`,
 `server.go` (startMultipartSweeper). Review when these change.
 
@@ -484,7 +492,7 @@ stateDiagram-v2
     completing --> open : pre-commit failure (deferred revert)
     completing --> completed : commit ok (best-effort stamp)
     open --> aborting : Abort, DeleteBucket implicit abort, or sweeper
-    aborting --> [*] : DeleteSession (parts cascade)
+    aborting --> [*] : EnqueueReleases, then DeleteSession (parts cascade)
     completed --> [*] : sweeper past TTL
 ```
 
@@ -513,37 +521,51 @@ flowchart TB
 
     subgraph intents["upload_intents, per digest"]
         spooled([spooled])
+        uploading([uploading])
         parked([parked])
         accepted([accepted])
+        published([published])
     end
 
     spooled -->|"dedup: blob_locations hit"| accepted
-    spooled -->|"single-shot upload:<br/>/blob/add, PUT, conclude, accept"| accepted
-    spooled -->|"parkBlobs: /blob/add WithConclude(false),<br/>PUT; blob_parks row written"| parked
+    spooled -->|"first network call begins<br/>(uploadBlobs, parkBlobs, concludeBlobs fallback)"| uploading
+    uploading -->|"single-shot upload:<br/>/blob/add, PUT, conclude, accept"| accepted
+    uploading -->|"parkBlobs: /blob/add WithConclude(false),<br/>PUT; blob_parks row written"| parked
     parked -->|"concludeBlobs at Complete:<br/>/ucan/conclude; blob_parks row deleted"| accepted
-    spooled -->|"cleanupPartBlobs:<br/>DeleteIntent + spool.Remove"| gone([deleted])
-    parked -->|"cleanupPartBlobs: /blob/abort (cause AddTask),<br/>DeleteIntent + spool.Remove"| gone
+    spooled -->|"release record; executeRelease, local only<br/>(the blob never left this node):<br/>DeleteIntent + spool.Remove"| gone([deleted])
+    uploading -->|"release record; executeRelease: /blob/remove<br/>(idempotent: the accept may have landed, its location not);<br/>DeleteIntent + spool.Remove"| gone
+    parked -->|"release record; executeRelease: /blob/abort (cause AddTask),<br/>or /blob/remove if the provider says accepted;<br/>DeleteIntent + spool.Remove"| gone
+    accepted -->|"release record (never committed);<br/>executeRelease: /blob/remove;<br/>DeleteIntent + spool.Remove"| gone
 
-    accepted -->|"commit: reconcileClaims adds this version"| refs["blob_refs rows<br/>(digest, bucket, key, version_id)"]
+    accepted -->|"commit: AddBlobClaim, same transaction"| published
+    published -->|"commit: reconcileClaims adds this version"| refs["blob_refs rows<br/>(digest, bucket, key, version_id)"]
     refs -->|"version delete or overwrite removes its row"| zero{"CountClaims == 0<br/>for (space, digest)?"}
     zero -->|yes| rm["RemoveBlob: /blob/remove to sprue<br/>(space claim released)"]
     zero -->|no| keep["blob retained<br/>(still referenced)"]
 ```
 
-- `published` is a declared intent state no code writes today; `blob_parks`
-  is a presence machine (a row exists while a conclude is owed), not a state
+- `published` is written with the blob's first reference claim and never
+  leaves: it is how a release recognises a committed blob once its claims
+  are gone, and keeps the spool copy (the insurance copy until eviction) and
+  the intent where a never-committed part blob loses both. `blob_parks` is a
+  presence machine (a row exists while a conclude is owed), not a state
   column.
 - Digests present in both the old and new version sets never churn: the
   reconcile computes a set difference.
 - Parked-blob reclamation is guarded: a digest live in another session, part,
   or committed object is left alone.
+- A same-space copy pins the source's body: its claims are taken with
+  `PinBlobClaims`, which requires an existing claim on the digest in the same
+  statement, so a copy racing the source's delete and release fails with
+  NoSuchKey instead of claiming a blob about to go.
 
 Cross-references: [`architecture.md` §5](./architecture.md#5-the-data-layer),
 [`s3-versioning.md`](./s3-versioning.md) §8.
 
 Sources: `registry/stores.go` (state consts), `s3frontend/object.go`
 (ingestBody, reconcileClaims, releaseBlobs), `s3frontend/multipart.go`
-(parkBlobs, concludeBlobs, cleanupPartBlobs), `uploader/blob.go` (UploadBlob,
+(parkBlobs, concludeBlobs, enqueuePartReleases), `s3frontend/object.go`
+(runRelease, executeRelease), `uploader/blob.go` (UploadBlob,
 AbortBlob, RemoveBlob). Review when these change.
 
 ## Per-key version storage: manifest arm, leaf arm, prev tree
@@ -817,7 +839,7 @@ erDiagram
         bytea digest PK
         text local_path
         bigint size
-        text state "spooled, parked, accepted; 'published' never written"
+        text state "spooled, uploading, parked, accepted, published (claimed by a commit)"
         text bucket
     }
     blob_locations {
@@ -844,8 +866,10 @@ erDiagram
     multipart_sessions {
         text upload_id PK
         text bucket
+        text space "the bucket's space, required: the subject of every release of the session's blobs, never resolved from the bucket name"
         text object_key
         text state "open, completing, aborting, completed"
+        timestamptz state_changed_at "the sweeper's clock"
         text checksum_algorithm
     }
     multipart_parts {
@@ -855,6 +879,11 @@ erDiagram
         bytea blob_digests "ordered array"
         text checksum
         text state "'accepted' never written"
+    }
+    blob_release_intents {
+        text space PK
+        bytea digest PK
+        timestamptz not_before "earliest execution: claim drop + grace, or at once for a part blob"
     }
     gc_candidates {
         bytea cid PK "superseded MST node"
@@ -867,6 +896,7 @@ erDiagram
     buckets ||..o{ blob_refs : "by bucket name, no FK"
     blob_locations ||..o{ shard_inclusions : "by shard_digest"
     multipart_parts ||..o{ blob_parks : "digests in blob_digests"
+    multipart_parts ||..o{ blob_release_intents : "teardown records, by digest"
 ```
 
 - The two solid relationships are the schema's only real foreign keys;
@@ -874,8 +904,8 @@ erDiagram
 - `gc_candidates` is write-only (no reader exists yet; its entry paths are the
   [catalog GC candidates](#catalog-gc-candidates-what-gets-remembered-for-removal)
   diagram); `segments.plane`
-  still CHECK-allows the deleted `data` arm; `upload_intents.published` and
-  `multipart_parts.accepted` are CHECK arms no code writes.
+  still CHECK-allows the deleted `data` arm; `multipart_parts.accepted` is a
+  CHECK arm no code writes.
 - Session rows also carry the passthrough HTTP headers and checksum columns
   Complete writes into the manifest; intent and location rows carry
   timestamps. See the DDL for the full column lists.

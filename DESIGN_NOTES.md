@@ -142,10 +142,51 @@ Step 4's polling remains the fallback for a blob the response did not
 cover. A completion that fails partway still records the blobs the upload
 service accepted before the failure and drops their parks, so the next
 Complete concludes only what is still parked and session expiry never
-aborts a blob that was accepted. When ingot never learned of an acceptance
-at all (the conclude response was lost, or Complete died before recording
-it), the provider refuses the expiry abort as already accepted, and the
-blob is released through the deferred release path instead.
+aborts a blob that was accepted.
+
+Every session teardown (abort, expiry, the completed-session reap, a
+superseded part, the parts a Complete omitted) records a deferred release
+for each blob of the session that is not still live in it *before* it
+deletes the session row. Whether the blob is in fact free to go is decided
+when the release runs, never at teardown: a digest claimed by a committed
+object drops its record, and one a part of an in-flight session still
+references waits. Deciding at teardown would race another teardown sharing
+the blob. A committed blob is recognisable for good: its first reference
+claim marks its upload intent `published` in the same transaction, so the
+reap of a retained session, completed or stranded, leaves such blobs to the
+object path's own releases whatever has become of the object. A blob with no
+intent at all is one a release already took, intent and record together: a
+reap that still holds its part rows leaves it alone rather than recording it
+again, since the second record would find neither rows nor intent and ask
+the network to remove a blob that may never have reached it.
+The part rows are the only index to the blobs and cascade away with the
+session, so the record is what makes the teardown recoverable: a failure
+before it leaves the session for the sweeper, a failure after it leaves
+records the release sweeper retries. The release runs from the record and
+reads the blob's state from its rows rather than its intent. A location row
+means accepted and the space's claim is removed; a park row alone means
+parked and the allocation is aborted, or removed instead when the provider
+refuses the abort because the blob was accepted after all (a conclude ran
+and ingot never learned of it). Neither row is ambiguous on its own: a blob
+uploaded and accepted at Complete whose location then failed to record has
+none either. The intent settles it. Every upload marks the intent
+`uploading` before its first network call, so a blob still `spooled` never
+left this node and is cleaned up locally, while any other state gets a
+network remove, which the upload service treats as success for a blob it
+never registered. The distinction matters for the retry: a blob that never
+uploaded captured no authority a background remove could use, and a remove
+attempted for it would fail on every retry and pin the record forever.
+The crypto-shred goes first, the network step next, and the location and
+park rows only once the network holds nothing, so a retry sees the same
+state. A release of a blob that was never committed also removes the spool
+copy and upload intent, the intent in the same transaction as the release
+record, since the intent is the only evidence of how far the blob ever got
+and a record outliving it would owe a network remove nothing can authorize.
+A committed blob's release leaves both, since its spool copy is the
+insurance copy until eviction. A record
+whose digest a part of an in-flight session still references waits: that
+session's Complete turns the reference into a claim, which makes the record
+stale, and its abort records a release of its own.
 
 ## Read path
 

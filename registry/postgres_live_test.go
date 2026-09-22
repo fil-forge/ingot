@@ -143,6 +143,77 @@ func TestPostgresStores_Live(t *testing.T) {
 		if n, _ := r.CountClaims(ctx, space, digest); n != 0 {
 			t.Fatalf("count after release = %d, want 0", n)
 		}
+
+		// A claim publishes the digest's upload intent, and the state stays
+		// once the claims are gone: it is the durable mark of a committed blob.
+		pubDigest := multihash.Multihash([]byte{0x12, 0x20, 0xc1, 0xa1})
+		if err := r.PutIntent(ctx, registry.UploadIntent{Digest: pubDigest, LocalPath: "/spool/x", Size: 1, State: registry.IntentAccepted, Bucket: "b"}); err != nil {
+			t.Fatalf("PutIntent: %v", err)
+		}
+		if err := r.AddBlobClaim(ctx, registry.BlobClaim{Digest: pubDigest, Bucket: "b", ObjectKey: "kp", VersionID: registry.NullVersionID, Space: space}); err != nil {
+			t.Fatalf("AddBlobClaim (publish): %v", err)
+		}
+		if in, err := r.GetIntent(ctx, pubDigest); err != nil || in.State != registry.IntentPublished {
+			t.Fatalf("intent after claim = %+v, err %v (want published)", in, err)
+		}
+		if err := r.DeleteBlobClaim(ctx, pubDigest, "b", "kp", registry.NullVersionID); err != nil {
+			t.Fatalf("DeleteBlobClaim (publish): %v", err)
+		}
+		if in, err := r.GetIntent(ctx, pubDigest); err != nil || in.State != registry.IntentPublished {
+			t.Fatalf("intent after the claim dropped = %+v, err %v (want still published)", in, err)
+		}
+		// A claim on a digest with no intent row (a shipped segment) is fine.
+		if err := r.AddBlobClaim(ctx, registry.BlobClaim{Digest: multihash.Multihash([]byte{0x12, 0x20, 0xc1, 0xa2}), Bucket: "b", ObjectKey: "kn", VersionID: registry.NullVersionID, Space: space}); err != nil {
+			t.Fatalf("AddBlobClaim (no intent): %v", err)
+		}
+	})
+
+	t.Run("pin claims require an existing claim, all or nothing", func(t *testing.T) {
+		space := testutil.RandomDID(t)
+		d1 := multihash.Multihash([]byte{0x12, 0x20, 0xb1, 0x01})
+		d2 := multihash.Multihash([]byte{0x12, 0x20, 0xb1, 0x02})
+		pin := func(ds ...multihash.Multihash) []registry.BlobClaim {
+			var out []registry.BlobClaim
+			for _, d := range ds {
+				out = append(out, registry.BlobClaim{Digest: d, Bucket: "pb", ObjectKey: "copy", VersionID: "null#7", Space: space})
+			}
+			return out
+		}
+		if ok, err := r.PinBlobClaims(ctx, pin(d1)); err != nil || ok {
+			t.Fatalf("pin with no claim to attach to: ok=%v err=%v, want refused", ok, err)
+		}
+		if err := r.AddBlobClaim(ctx, registry.BlobClaim{Digest: d1, Bucket: "pb", ObjectKey: "src", VersionID: "null#1", Space: space}); err != nil {
+			t.Fatalf("AddBlobClaim: %v", err)
+		}
+		// d1 is claimed, d2 is not: nothing is recorded.
+		if ok, err := r.PinBlobClaims(ctx, pin(d1, d2)); err != nil || ok {
+			t.Fatalf("pin with one unclaimed digest: ok=%v err=%v, want refused", ok, err)
+		}
+		if n, _ := r.CountClaims(ctx, space, d1); n != 1 {
+			t.Fatalf("refused pin left %d claims on d1, want the source's 1", n)
+		}
+		if ok, err := r.PinBlobClaims(ctx, pin(d1)); err != nil || !ok {
+			t.Fatalf("pin beside a live claim: ok=%v err=%v, want recorded", ok, err)
+		}
+		if ok, err := r.PinBlobClaims(ctx, pin(d1)); err != nil || !ok {
+			t.Fatalf("repeated pin: ok=%v err=%v, want idempotent true", ok, err)
+		}
+		if n, _ := r.CountClaims(ctx, space, d1); n != 2 {
+			t.Fatalf("claims after pin = %d, want 2", n)
+		}
+		// A claim in another space does not qualify.
+		other := testutil.RandomDID(t)
+		if ok, err := r.PinBlobClaims(ctx, []registry.BlobClaim{{Digest: d1, Bucket: "pb2", ObjectKey: "copy", VersionID: "null#1", Space: other}}); err != nil || ok {
+			t.Fatalf("pin against another space's claim: ok=%v err=%v, want refused", ok, err)
+		}
+		// Dropping the source's claim beside the pin enqueues nothing; dropping
+		// the pin too does.
+		if enq, err := r.DropClaimEnqueueRelease(ctx, d1, "pb", "src", "null#1", space, time.Now()); err != nil || enq {
+			t.Fatalf("drop source beside pin: enqueued=%v err=%v, want false", enq, err)
+		}
+		if enq, err := r.DropClaimEnqueueRelease(ctx, d1, "pb", "copy", "null#7", space, time.Now()); err != nil || !enq {
+			t.Fatalf("drop last claim: enqueued=%v err=%v, want true", enq, err)
+		}
 	})
 
 	t.Run("drop claim enqueues release atomically", func(t *testing.T) {
@@ -203,11 +274,65 @@ func TestPostgresStores_Live(t *testing.T) {
 		if err := r.DeleteRelease(ctx, space, digest); err != nil {
 			t.Fatalf("DeleteRelease: %v", err)
 		}
+
+		// Bulk enqueue: one statement, repeated digests recorded once, the
+		// upsert keeps an existing later not_before, and the records come
+		// back as they stand so the caller sees that later time.
+		d2 := multihash.Multihash([]byte{0xbb, 0x02})
+		if err := r.EnqueueRelease(ctx, space, digest, time.Now().Add(time.Hour)); err != nil {
+			t.Fatalf("EnqueueRelease (future): %v", err)
+		}
+		recs, err := r.EnqueueReleases(ctx, space, []multihash.Multihash{digest, d2, d2}, time.Now().Add(-time.Second))
+		if err != nil || len(recs) != 2 {
+			t.Fatalf("EnqueueReleases = %d records, err %v (want 2)", len(recs), err)
+		}
+		for _, pr := range recs {
+			if string(pr.Digest) == string(digest) && pr.NotBefore.Before(time.Now().Add(30*time.Minute)) {
+				t.Fatalf("bulk enqueue returned an existing record with an earlier not_before: %v", pr.NotBefore)
+			}
+			if string(pr.Digest) == string(d2) && pr.NotBefore.After(time.Now()) {
+				t.Fatalf("new record not due: %v", pr.NotBefore)
+			}
+		}
+		all, err := r.ListReleasesBySpace(ctx, space)
+		if err != nil || len(all) != 2 {
+			t.Fatalf("ListReleasesBySpace = %d, err %v (want 2)", len(all), err)
+		}
+		for _, pr := range all {
+			_ = r.DeleteRelease(ctx, space, pr.Digest)
+		}
+	})
+
+	t.Run("delete intent and release record atomically", func(t *testing.T) {
+		space := testutil.RandomDID(t)
+		d := multihash.Multihash([]byte{0x12, 0x20, 0xda, 0x01})
+		if err := r.PutIntent(ctx, registry.UploadIntent{Digest: d, LocalPath: "/spool/d", Size: 3, State: registry.IntentSpooled, Bucket: "b"}); err != nil {
+			t.Fatalf("PutIntent: %v", err)
+		}
+		if err := r.EnqueueRelease(ctx, space, d, time.Now()); err != nil {
+			t.Fatalf("EnqueueRelease: %v", err)
+		}
+		if err := r.DeleteIntentAndRelease(ctx, space, d); err != nil {
+			t.Fatalf("DeleteIntentAndRelease: %v", err)
+		}
+		if _, err := r.GetIntent(ctx, d); err != registry.ErrNotFound {
+			t.Fatalf("intent after the paired delete = %v, want ErrNotFound", err)
+		}
+		if rows, _ := r.ListReleasesBySpace(ctx, space); len(rows) != 0 {
+			t.Fatalf("release records after the paired delete = %v, want none", rows)
+		}
+		// Idempotent: nothing left to delete is not an error.
+		if err := r.DeleteIntentAndRelease(ctx, space, d); err != nil {
+			t.Fatalf("repeated DeleteIntentAndRelease: %v", err)
+		}
 	})
 
 	t.Run("intent lifecycle", func(t *testing.T) {
 		if err := r.PutIntent(ctx, registry.UploadIntent{Digest: digest, LocalPath: "/spool/x", Size: 9, State: registry.IntentSpooled, Bucket: "b"}); err != nil {
 			t.Fatalf("PutIntent: %v", err)
+		}
+		if err := r.SetIntentState(ctx, digest, registry.IntentUploading); err != nil {
+			t.Fatalf("SetIntentState (uploading, the constraint admits it): %v", err)
 		}
 		if err := r.SetIntentState(ctx, digest, registry.IntentParked); err != nil {
 			t.Fatalf("SetIntentState: %v", err)
@@ -409,16 +534,31 @@ func TestPostgresStores_Live(t *testing.T) {
 	t.Run("multipart session parts latch metadata", func(t *testing.T) {
 		const id = "upl-1"
 		meta := map[string]string{"x-amz-meta-foo": "bar"}
-		if err := r.CreateSession(ctx, registry.MultipartSession{UploadID: id, Bucket: "b", ObjectKey: "k", ContentType: "text/plain", Metadata: meta}); err != nil {
+		bSpace := testutil.RandomDID(t)
+		if err := r.CreateSession(ctx, registry.MultipartSession{UploadID: id, Bucket: "b", ObjectKey: "k", Space: bSpace, ContentType: "text/plain", Metadata: meta}); err != nil {
 			t.Fatalf("CreateSession: %v", err)
 		}
-		if err := r.CreateSession(ctx, registry.MultipartSession{UploadID: id, Bucket: "b", ObjectKey: "k"}); err != registry.ErrExists {
+		if err := r.CreateSession(ctx, registry.MultipartSession{UploadID: id, Bucket: "b", ObjectKey: "k", Space: bSpace}); err != registry.ErrExists {
 			t.Fatalf("duplicate CreateSession = %v, want ErrExists", err)
 		}
 		s, err := r.GetSession(ctx, id)
-		if err != nil || s.ContentType != "text/plain" || s.Metadata["x-amz-meta-foo"] != "bar" {
-			t.Fatalf("GetSession = %+v, err %v (metadata jsonb round-trip)", s, err)
+		if err != nil || s.ContentType != "text/plain" || s.Metadata["x-amz-meta-foo"] != "bar" || s.Space != bSpace {
+			t.Fatalf("GetSession = %+v, err %v (metadata jsonb round-trip, space)", s, err)
 		}
+		// The space is required: a session without one is refused.
+		if err := r.CreateSession(ctx, registry.MultipartSession{UploadID: id + "-nospace", Bucket: "b", ObjectKey: "k"}); err == nil {
+			t.Fatal("CreateSession without a space was accepted")
+		}
+		// The bucket's space rides on the session, for teardown once the
+		// bucket row is gone.
+		space := testutil.RandomDID(t)
+		if err := r.CreateSession(ctx, registry.MultipartSession{UploadID: id + "-space", Bucket: "b", ObjectKey: "k", Space: space}); err != nil {
+			t.Fatalf("CreateSession (space): %v", err)
+		}
+		if got, err := r.GetSession(ctx, id+"-space"); err != nil || got.Space != space {
+			t.Fatalf("GetSession space = %v, err %v (want %v)", got.Space, err, space)
+		}
+		_ = r.DeleteSession(ctx, id+"-space")
 
 		// bytea[] round trip + ordering.
 		if err := r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 2, ETagMD5: []byte{0x02}, Size: 2, BlobDigests: []multihash.Multihash{{0xd2}}}); err != nil {
@@ -437,6 +577,17 @@ func TestPostgresStores_Live(t *testing.T) {
 		if err != nil || !won {
 			t.Fatalf("Complete latch won=%v err=%v", won, err)
 		}
+		// A part cannot land once the session has left 'open', nor on a
+		// session that does not exist.
+		if err := r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 3, ETagMD5: []byte{0x03}, Size: 3, BlobDigests: []multihash.Multihash{{0xd3}}}); !errors.Is(err, registry.ErrNotFound) {
+			t.Fatalf("PutPart on a completing session = %v, want ErrNotFound", err)
+		}
+		if err := r.PutPart(ctx, registry.MultipartPart{UploadID: "no-such-upload", PartNumber: 1, ETagMD5: []byte{0x01}, Size: 1, BlobDigests: []multihash.Multihash{{0xd1}}}); !errors.Is(err, registry.ErrNotFound) {
+			t.Fatalf("PutPart on a missing session = %v, want ErrNotFound", err)
+		}
+		if parts, _ := r.ListParts(ctx, id); len(parts) != 2 {
+			t.Fatalf("parts after the refused writes = %d, want 2", len(parts))
+		}
 		won, err = r.LatchSession(ctx, id, registry.SessionOpen, registry.SessionAborting)
 		if err != nil || won {
 			t.Fatalf("Abort latch after Complete won=%v err=%v, want won=false", won, err)
@@ -452,10 +603,11 @@ func TestPostgresStores_Live(t *testing.T) {
 	})
 
 	t.Run("multipart listing sweeper and part refs", func(t *testing.T) {
+		lsSpace := testutil.RandomDID(t)
 		mk := func(id, key string) {
 			t.Helper()
 			if err := r.CreateSession(ctx, registry.MultipartSession{
-				UploadID: id, Bucket: "b", ObjectKey: key,
+				UploadID: id, Bucket: "b", ObjectKey: key, Space: lsSpace,
 				ContentEncoding: "testenc", ChecksumAlgorithm: "CRC32", ChecksumType: "FULL_OBJECT",
 			}); err != nil {
 				t.Fatalf("CreateSession %s: %v", id, err)
@@ -506,9 +658,36 @@ func TestPostgresStores_Live(t *testing.T) {
 			t.Fatalf("CountPartRefs(unique, exclude owner) = %d, err %v (want 0)", n, err)
 		}
 
-		// 'completed' passes the widened state CHECK constraint.
+		// CountLivePartRefs: parts of open sessions count.
+		if n, err := r.CountLivePartRefs(ctx, shared); err != nil || n != 2 {
+			t.Fatalf("CountLivePartRefs(shared) = %d, err %v (want 2)", n, err)
+		}
+
+		// 'completed' passes the widened state CHECK constraint, and the
+		// latch restarts the sweeper's clock: the row is not stale by a
+		// past cutoff although it was created before it.
 		if won, err := r.LatchSession(ctx, "ls-1", registry.SessionOpen, registry.SessionCompleted); err != nil || !won {
 			t.Fatalf("latch to completed won=%v err=%v", won, err)
+		}
+		if s, err := r.GetSession(ctx, "ls-1"); err != nil || s.StateChangedAt.Before(s.CreatedAt) || s.StateChangedAt.IsZero() {
+			t.Fatalf("StateChangedAt after latch = %v (created %v), err %v", s.StateChangedAt, s.CreatedAt, err)
+		}
+		if stale, err := r.ListStaleSessions(ctx, registry.SessionCompleted, time.Now().Add(-time.Minute)); err != nil || len(stale) != 0 {
+			t.Fatalf("ListStaleSessions completed, past cutoff = %d, err %v (want 0: just latched)", len(stale), err)
+		}
+		if stale, err := r.ListStaleSessions(ctx, registry.SessionCompleted, time.Now().Add(time.Hour)); err != nil || len(stale) != 1 {
+			t.Fatalf("ListStaleSessions completed, future cutoff = %d, err %v (want 1)", len(stale), err)
+		}
+		// A completed session's parts are no longer live; an aborting one's
+		// are not either.
+		if n, err := r.CountLivePartRefs(ctx, shared); err != nil || n != 1 {
+			t.Fatalf("CountLivePartRefs(shared) after ls-1 completed = %d, err %v (want 1)", n, err)
+		}
+		if won, err := r.LatchSession(ctx, "ls-2", registry.SessionOpen, registry.SessionAborting); err != nil || !won {
+			t.Fatalf("latch ls-2 to aborting won=%v err=%v", won, err)
+		}
+		if n, err := r.CountLivePartRefs(ctx, shared); err != nil || n != 0 {
+			t.Fatalf("CountLivePartRefs(shared) after ls-2 aborting = %d, err %v (want 0)", n, err)
 		}
 
 		for _, id := range []string{"ls-1", "ls-2", "ls-3"} {
