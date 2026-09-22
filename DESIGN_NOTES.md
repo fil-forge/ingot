@@ -175,8 +175,11 @@ attempted for it would fail on every retry and pin the record forever.
 The crypto-shred goes first, the network step next, and the location and
 park rows only once the network holds nothing, so a retry sees the same
 state. A release of a blob that was never committed also removes the spool
-copy and upload intent; a committed blob's release leaves them, since its
-spool copy is the insurance copy until eviction. A record
+copy and upload intent, the intent in the same transaction as the release
+record, since the intent is the only evidence of how far the blob ever got
+and a record outliving it would owe a network remove nothing can authorize.
+A committed blob's release leaves both, since its spool copy is the
+insurance copy until eviction. A record
 whose digest a part of an in-flight session still references waits: that
 session's Complete turns the reference into a claim, which makes the record
 stale, and its abort records a release of its own.

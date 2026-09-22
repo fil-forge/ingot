@@ -306,6 +306,26 @@ func (r *Postgres) ListReleasesBySpace(ctx context.Context, space did.DID) ([]Pe
 	return out, nil
 }
 
+func (r *Postgres) DeleteIntentAndRelease(ctx context.Context, space did.DID, digest multihash.Multihash) error {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("registry: begin delete intent and release: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `DELETE FROM ingot.upload_intents WHERE digest = $1`, digest); err != nil {
+		return fmt.Errorf("registry: delete intent: %w", err)
+	}
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM ingot.blob_release_intents WHERE space = $1 AND digest = $2`,
+		space, digest); err != nil {
+		return fmt.Errorf("registry: delete release: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("registry: commit delete intent and release: %w", err)
+	}
+	return nil
+}
+
 func (r *Postgres) DeleteRelease(ctx context.Context, space did.DID, digest multihash.Multihash) error {
 	_, err := r.pool.Exec(ctx,
 		`DELETE FROM ingot.blob_release_intents WHERE space = $1 AND digest = $2`,

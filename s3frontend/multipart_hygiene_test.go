@@ -2115,6 +2115,67 @@ func TestReleaseKeepsIntentUntilLocalCleanupSucceeds(t *testing.T) {
 	}
 }
 
+// failDeleteRelease is a pending-release store whose record deletes always
+// fail, as a crash or cancellation between the release and the record's
+// removal does. Everything else passes through.
+type failDeleteRelease struct {
+	registry.PendingReleaseStore
+}
+
+func (f *failDeleteRelease) DeleteRelease(context.Context, did.DID, multihash.Multihash) error {
+	return errors.New("release intents table unavailable")
+}
+
+// TestLocalOnlyReleaseDropsIntentWithItsRecord: a blob that never left the
+// node is released, and the caller's removal of the release record fails.
+// The record is gone regardless, because the release removed it in the same
+// transaction as the intent. Were it to outlive the intent, the retry would
+// read a blob with no rows and no intent and owe a network remove it has no
+// authority for.
+func TestLocalOnlyReleaseDropsIntentWithItsRecord(t *testing.T) {
+	rm := &recordingRemover{}
+	mp := &failPutPart{fails: 1}
+	rel := &failDeleteRelease{}
+	b, mem := newDeferredBackend(t, &parkingUploader{}, func(d *Deps) {
+		mp.MultipartStore = d.Multipart
+		d.Multipart = mp
+		rel.PendingReleaseStore = d.PendingReleases
+		d.PendingReleases = rel
+		d.Remover = rm
+	})
+	ctx := context.Background()
+	key := "record-with-intent"
+	uploadID := mpCreate(t, b, key, "", "")
+
+	// The part row write fails, so the spooled blobs are released in-request;
+	// the record's own deletion then fails.
+	if _, err := mpUploadPart(t, b, key, uploadID, 1, testBody(int(backend.MinPartSize)), nil); err == nil {
+		t.Fatal("UploadPart succeeded although the part row write failed")
+	}
+	if mp.fails > 0 {
+		t.Fatal("the part store never refused a write")
+	}
+	if pending, _ := mem.ListReleasesBySpace(ctx, did.Undef); len(pending) != 0 {
+		t.Fatalf("release records after the release = %v, want none: the record outlived its intent", pending)
+	}
+	entries, err := os.ReadDir(b.spool.Path(nil))
+	if err != nil {
+		t.Fatalf("read spool dir: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("spool holds %d blobs after the release, want 0", len(entries))
+	}
+
+	// Nothing is left for the sweeper, and no retry ever asks the network to
+	// remove a blob that never reached it.
+	if n, err := b.SweepPendingReleases(ctx); err != nil || n != 0 {
+		t.Fatalf("sweep after the release: released=%d err=%v, want nothing left", n, err)
+	}
+	if n := len(rm.removedDigests()); n != 0 {
+		t.Fatalf("RemoveBlob called for %d blobs that never left the node, want 0", n)
+	}
+}
+
 // TestReleaseRemovesBlobAcceptedWithoutRows: at Complete a never-parked blob
 // is uploaded and accepted, then the location fails to record, leaving no
 // park and no location row. If the client aborts instead of retrying, the

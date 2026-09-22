@@ -640,8 +640,10 @@ func (b *Backend) drainSpaceReleases(ctx context.Context, space did.DID) error {
 // once the network holds nothing for this space do the park and location
 // rows go, park first so a partial failure leaves the retry on the same
 // path, and — for a blob that was never committed — the spool copy and
-// upload intent. A committed blob is one whose intent is published, which
-// its first reference claim wrote atomically; it keeps those two, since its
+// upload intent. The intent goes together with this release's own record,
+// in one transaction, since it is the only evidence of how far the blob
+// ever got. A committed blob is one whose intent is published, which its
+// first reference claim wrote atomically; it keeps those two, since its
 // spool copy is the insurance copy until eviction.
 func (b *Backend) executeRelease(ctx context.Context, pr registry.PendingRelease) bool {
 	space, digest := pr.Space, pr.Digest
@@ -746,12 +748,18 @@ func (b *Backend) executeRelease(ctx context.Context, pr registry.PendingRelease
 		// that never left this node into one with neither rows nor intent,
 		// whose retry then owes a network remove it cannot authorize.
 	default:
-		// The spool copy goes before the intent, for the same reason.
+		// The spool copy goes first, and removing an absent one is a no-op,
+		// so a failure after it costs the retry nothing. The intent then
+		// goes together with this release's record: the intent is the only
+		// evidence that this blob never left the node, and a record that
+		// outlived it would leave the retry reading neither rows nor
+		// intent, owing a network remove it cannot authorize and can never
+		// complete.
 		if err := b.spool.Remove(digest); err != nil {
 			log.Warn("release: remove spooled blob failed", zap.Error(err))
 			ok = false
-		} else if err := b.intents.DeleteIntent(ctx, digest); err != nil && !errors.Is(err, registry.ErrNotFound) {
-			log.Warn("release: delete upload intent failed", zap.Error(err))
+		} else if err := b.pendingReleases.DeleteIntentAndRelease(ctx, space, digest); err != nil {
+			log.Warn("release: delete upload intent with the release record failed", zap.Error(err))
 			ok = false
 		}
 	}

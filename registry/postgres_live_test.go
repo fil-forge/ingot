@@ -303,6 +303,30 @@ func TestPostgresStores_Live(t *testing.T) {
 		}
 	})
 
+	t.Run("delete intent and release record atomically", func(t *testing.T) {
+		space := testutil.RandomDID(t)
+		d := multihash.Multihash([]byte{0x12, 0x20, 0xda, 0x01})
+		if err := r.PutIntent(ctx, registry.UploadIntent{Digest: d, LocalPath: "/spool/d", Size: 3, State: registry.IntentSpooled, Bucket: "b"}); err != nil {
+			t.Fatalf("PutIntent: %v", err)
+		}
+		if err := r.EnqueueRelease(ctx, space, d, time.Now()); err != nil {
+			t.Fatalf("EnqueueRelease: %v", err)
+		}
+		if err := r.DeleteIntentAndRelease(ctx, space, d); err != nil {
+			t.Fatalf("DeleteIntentAndRelease: %v", err)
+		}
+		if _, err := r.GetIntent(ctx, d); err != registry.ErrNotFound {
+			t.Fatalf("intent after the paired delete = %v, want ErrNotFound", err)
+		}
+		if rows, _ := r.ListReleasesBySpace(ctx, space); len(rows) != 0 {
+			t.Fatalf("release records after the paired delete = %v, want none", rows)
+		}
+		// Idempotent: nothing left to delete is not an error.
+		if err := r.DeleteIntentAndRelease(ctx, space, d); err != nil {
+			t.Fatalf("repeated DeleteIntentAndRelease: %v", err)
+		}
+	})
+
 	t.Run("intent lifecycle", func(t *testing.T) {
 		if err := r.PutIntent(ctx, registry.UploadIntent{Digest: digest, LocalPath: "/spool/x", Size: 9, State: registry.IntentSpooled, Bucket: "b"}); err != nil {
 			t.Fatalf("PutIntent: %v", err)

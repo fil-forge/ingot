@@ -289,6 +289,15 @@ type PendingReleaseStore interface {
 	// owed) before asking hilt to delete the space.
 	ListReleasesBySpace(ctx context.Context, space did.DID) ([]PendingRelease, error)
 	DeleteRelease(ctx context.Context, space did.DID, digest multihash.Multihash) error
+	// DeleteIntentAndRelease removes a blob's upload intent and this
+	// release's record in one transaction — the last step of releasing a
+	// blob that was never committed. The two must go together: the intent
+	// is the only evidence of how far the blob ever got, and a record that
+	// outlived it would leave the retry to read a blob with no rows and no
+	// intent, owing a network remove that a never-uploaded blob has no
+	// authority for and that would fail on every attempt. Both deletes are
+	// idempotent.
+	DeleteIntentAndRelease(ctx context.Context, space did.DID, digest multihash.Multihash) error
 }
 
 // IntentStore is the local-store index (§5): the on-disk blobs Ingot holds

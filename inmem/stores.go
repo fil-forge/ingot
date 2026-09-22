@@ -167,6 +167,14 @@ func (m *MemStore) ListReleasesBySpace(_ context.Context, space did.DID) ([]regi
 	return out, nil
 }
 
+func (m *MemStore) DeleteIntentAndRelease(_ context.Context, space did.DID, digest multihash.Multihash) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.intents, string(digest))
+	delete(m.releases, locKey{space, string(digest)})
+	return nil
+}
+
 func (m *MemStore) DeleteRelease(_ context.Context, space did.DID, digest multihash.Multihash) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
