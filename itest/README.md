@@ -35,10 +35,18 @@ tenant + all-permission access key through hilt's Tenant API (curl inside the
 hilt container, local-dev partner key) and returns the SigV4 credentials.
 The old `ingot login` / `ingot space generate` self-provisioning CLI is gone.
 
+A tenant carries no region: `PUT /tenants/{id}` takes no body, and each
+bucket binds to the region it is created in — here `forgeRegion`, the
+provider region hilt's post_start hook registers ingot under. A request
+signed for another region comes back as `AuthorizationHeaderMalformed`
+naming the region that serves the bucket.
+
 The stack's service images are mutable `:main` tags that Docker never
-re-pulls — if hilt errors with "unsupported DID method in did:web" or sprue
-with "handler not found" (did:plc resolution and `/blob/list` landed on
-sprue main 2026-07-17), re-pull `ghcr.io/fil-forge/{hilt,sprue,...}:main`.
+re-pulls — if hilt errors with "unsupported DID method in did:web" or
+"RegionRequired region is required" (region-free tenancy is newer than the
+image you have), or sprue with "handler not found" (did:plc resolution and
+`/blob/list` landed on sprue main 2026-07-17), re-pull
+`ghcr.io/fil-forge/{hilt,sprue,...}:main`.
 To run against an upload-service (sprue) image the registry doesn't have
 yet — e.g. one built from an unmerged branch — point the stack at it:
 
