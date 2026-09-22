@@ -64,3 +64,17 @@ func TestKeyProofsForIsStable(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, chain, 1)
 }
+
+func TestKeyProofsRevoked(t *testing.T) {
+	kp := iam.NewKeyProofs()
+	// A delegation no store holds: the revocation still has to be remembered.
+	dlg, _ := grant(t)
+	require.False(t, kp.Revoked(dlg))
+
+	require.Empty(t, kp.InvalidateHolders(dlg.Link()))
+	require.True(t, kp.Revoked(dlg), "a revoked CID is remembered even when nothing cached held it")
+
+	other, _ := grant(t)
+	require.True(t, kp.Revoked(other, dlg), "any revoked delegation in the set is enough")
+	require.False(t, kp.Revoked(other))
+}

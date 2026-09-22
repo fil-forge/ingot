@@ -31,12 +31,14 @@ func NewRevoker(proofs *KeyProofs, keys *VerificationKeyCache, tenants *TenantCa
 	return &Revoker{proofs: proofs, keys: keys, tenants: tenants, logger: logger}
 }
 
-// Revoke clears the caches of every access key whose proof store holds the
-// revoked delegation, returning the affected key DIDs. An empty result means
-// nothing cached referenced the delegation — then no local authorization
-// decision depended on it and there was nothing to clear (Hilt remains
-// authoritative for everything uncached). Idempotent: re-delivery of a
-// revocation is a no-op.
+// Revoke records the revoked delegation and clears the caches of every
+// access key whose proof store holds it, returning the affected key DIDs. An
+// empty result means nothing cached referenced the delegation — then no
+// local authorization decision depended on it and there was nothing to
+// clear (Hilt remains authoritative for everything uncached) — but the CID
+// is remembered regardless, so a later authorize response carrying it is
+// served without being cached (see [KeyProofs.Revoked]). Idempotent:
+// re-delivery of a revocation clears nothing more.
 func (r *Revoker) Revoke(revoked cid.Cid) []did.DID {
 	affected := r.proofs.InvalidateHolders(revoked)
 	for _, key := range affected {
