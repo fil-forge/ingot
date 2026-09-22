@@ -44,7 +44,8 @@ import (
 
 // forgeRegion must match smelt's ingot config (systems/ingot/config/
 // config.yaml) and the provider region hilt's post_start hook registers
-// ingot under (INGOT_REGION) — tenants are provisioned per region.
+// ingot under (INGOT_REGION): S3 requests are signed for it and hilt resolves
+// the serving provider from it. Tenants themselves are region-free.
 const forgeRegion = "us-west-1"
 
 // TestMain sweeps containers/volumes leaked by prior crashed itest runs (same
@@ -328,8 +329,9 @@ var hiltAllPermissions = []string{
 //
 // The Tenant API is reached with curl inside the hilt container (so no host
 // port mapping is needed), authenticated with smelt's local-dev partner key.
-// The tenant's region must match the provider region hilt's post_start hook
-// registered ingot under (forgeRegion).
+// A tenant carries no region; each bucket binds to the region it is created
+// in, which here is the provider region hilt's post_start hook registers
+// ingot under (forgeRegion).
 func hiltProvisionTenant(t *testing.T, ctx context.Context, s *stack.Stack, tenantID string) (accessKey, secretKey string) {
 	t.Helper()
 	accessKey, secretKey, err := hiltProvisionTenantErr(ctx, s, tenantID)
@@ -349,10 +351,11 @@ func hiltProvisionTenant(t *testing.T, ctx context.Context, s *stack.Stack, tena
 func hiltProvisionTenantErr(ctx context.Context, s *stack.Stack, tenantID string) (accessKey, secretKey string, err error) {
 	const partnerAuth = "Authorization: Bearer dev-partner-key"
 
+	// PUT /tenants/{id} takes no body: a tenant is region-free, each bucket
+	// binds to the region it is created in.
 	if out, errOut, err := s.Exec(ctx, "hilt", "curl", "-sS", "-f", "-X", "PUT",
 		"http://localhost:80/tenants/"+tenantID,
-		"-H", partnerAuth, "-H", "Content-Type: application/json",
-		"-d", fmt.Sprintf(`{"region":%q}`, forgeRegion)); err != nil {
+		"-H", partnerAuth); err != nil {
 		return "", "", fmt.Errorf("hilt provision tenant %q: %w (stdout=%s stderr=%s)", tenantID, err, out, errOut)
 	}
 
