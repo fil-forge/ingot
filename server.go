@@ -74,6 +74,11 @@ type ServerDeps struct {
 	Streaming uploader.StreamingBodyUploader
 	Streams   registry.StreamStore
 
+	// Registrar keeps the upload service's content-entry list in step with the
+	// catalog: one entry per committed object version, which is what the
+	// service counts to report the space's object count.
+	Registrar uploader.UploadRegistrar
+
 	// Authority is the service that authorizes bucket creation and deletion.
 	Authority bucketauthority.BucketAuthority
 
@@ -229,6 +234,7 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		Remover:         deps.Remover,
 		Streaming:       deps.Streaming,
 		Streams:         deps.Streams,
+		Registrar:       deps.Registrar,
 		EncParams:       deps.EncParams,
 		RegionKeys:      deps.RegionKeys,
 		TenantKeys:      deps.TenantKeys,
