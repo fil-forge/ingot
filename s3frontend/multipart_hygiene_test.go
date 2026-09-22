@@ -1795,6 +1795,14 @@ func TestRecreatedBucketDisownsItsPredecessorsUploads(t *testing.T) {
 		MultipartUpload: &types.CompletedMultipartUpload{Parts: []types.CompletedPart{{PartNumber: &one, ETag: out.ETag}}}})
 	wantNoSuchUpload("Complete", err)
 	wantNoSuchUpload("Abort", b.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{Bucket: &bucket, Key: &key, UploadId: &uploadID}))
+	// Nor does the new owner see the predecessor's keys and upload ids.
+	listed, err := b.ListMultipartUploads(ctx, &s3.ListMultipartUploadsInput{Bucket: &bucket})
+	if err != nil {
+		t.Fatalf("ListMultipartUploads: %v", err)
+	}
+	if len(listed.Uploads) != 0 {
+		t.Fatalf("the recreated bucket lists %d of its predecessor's uploads, want 0: %+v", len(listed.Uploads), listed.Uploads)
+	}
 	if _, err := mem.GetSession(ctx, uploadID); err != nil {
 		t.Fatalf("the disowned session should stand for the sweeper: %v", err)
 	}
@@ -1831,6 +1839,11 @@ func TestSweepLeavesALiveCompleteOnAnOldSession(t *testing.T) {
 		}
 		if err := mem.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 1, ETagMD5: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{d}, State: registry.PartParked}); err != nil {
 			t.Fatalf("PutPart %s: %v", id, err)
+		}
+		// The write path spools every part blob before recording the part,
+		// so a part row never exists without its blob's intent.
+		if err := mem.PutIntent(ctx, registry.UploadIntent{Digest: d, LocalPath: "/spool/" + id, Size: 1, State: registry.IntentParked, Bucket: "bk"}); err != nil {
+			t.Fatalf("PutIntent %s: %v", id, err)
 		}
 		// Parked on a provider, so a release of it is an abort the fake records.
 		task := cid.NewCidV1(cid.Raw, d).Bytes()
@@ -2173,6 +2186,68 @@ func TestLocalOnlyReleaseDropsIntentWithItsRecord(t *testing.T) {
 	}
 	if n := len(rm.removedDigests()); n != 0 {
 		t.Fatalf("RemoveBlob called for %d blobs that never left the node, want 0", n)
+	}
+}
+
+// TestReapDoesNotRecordAReleaseAlreadyRunToCompletion: a teardown records
+// its parts' releases and then fails to delete the session, so the releases
+// run from the queue first and take their blobs' intents with them. The next
+// reap still has the part rows: it must recognise those blobs as gone rather
+// than queue them again, since the second record's release would find
+// neither rows nor intent and ask the network to remove a blob that may
+// never have reached it.
+func TestReapDoesNotRecordAReleaseAlreadyRunToCompletion(t *testing.T) {
+	rm := &recordingRemover{}
+	mp := &failDeleteSession{fails: 2}
+	pu := &parkingUploader{}
+	b, mem := newDeferredBackend(t, pu, func(d *Deps) {
+		mp.MultipartStore = d.Multipart
+		d.Multipart = mp
+		d.Remover = rm
+	})
+	ctx := context.Background()
+	key := "reaped-twice"
+	uploadID := mpCreate(t, b, key, "", "")
+	if _, err := mpUploadPart(t, b, key, uploadID, 1, testBody(int(backend.MinPartSize)), nil); err != nil {
+		t.Fatalf("UploadPart: %v", err)
+	}
+	d := hygienePartDigests(t, mem, uploadID, 1)[0]
+
+	// The first reap records the releases, then fails to drop the session.
+	// One sweep attempts it twice: the open pass latches the session to
+	// aborting and reaps, then the stranded-aborting pass retries.
+	if n, err := b.SweepStaleMultipartSessions(ctx, -time.Second); err != nil || n != 0 {
+		t.Fatalf("first sweep: cleaned=%d err=%v, want the session kept", n, err)
+	}
+	if mp.fails > 0 {
+		t.Fatal("the session delete never failed")
+	}
+	if pending, _ := mem.ListReleasesBySpace(ctx, did.Undef); len(pending) != 1 {
+		t.Fatalf("pending releases after the first reap = %d, want 1", len(pending))
+	}
+
+	// The release sweeper runs them to completion: the parked blob is
+	// aborted on its provider and its intent goes with the record.
+	drainReleases(t, b)
+	if !pu.abortedDigests()[string(d)] {
+		t.Fatalf("parked blob %x was not released on the provider", d)
+	}
+	if _, err := mem.GetIntent(ctx, d); !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("intent for %x survived its release (err=%v)", d, err)
+	}
+
+	// The second reap sees the same part rows and must record nothing.
+	if n, err := b.SweepStaleMultipartSessions(ctx, -time.Second); err != nil || n != 1 {
+		t.Fatalf("second sweep: cleaned=%d err=%v, want the session reaped", n, err)
+	}
+	if _, err := mem.GetSession(ctx, uploadID); !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("session survived the second sweep (err=%v)", err)
+	}
+	if pending, _ := mem.ListReleasesBySpace(ctx, did.Undef); len(pending) != 0 {
+		t.Fatalf("releases re-recorded for a blob already released = %v, want none", pending)
+	}
+	if n := len(rm.removedDigests()); n != 0 {
+		t.Fatalf("RemoveBlob called for %d blobs, want 0: the blob was released as a parked one", n)
 	}
 }
 

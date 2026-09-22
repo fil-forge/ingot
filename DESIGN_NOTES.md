@@ -154,7 +154,11 @@ references waits. Deciding at teardown would race another teardown sharing
 the blob. A committed blob is recognisable for good: its first reference
 claim marks its upload intent `published` in the same transaction, so the
 reap of a retained session, completed or stranded, leaves such blobs to the
-object path's own releases whatever has become of the object.
+object path's own releases whatever has become of the object. A blob with no
+intent at all is one a release already took, intent and record together: a
+reap that still holds its part rows leaves it alone rather than recording it
+again, since the second record would find neither rows nor intent and ask
+the network to remove a blob that may never have reached it.
 The part rows are the only index to the blobs and cascade away with the
 session, so the record is what makes the teardown recoverable: a failure
 before it leaves the session for the sweeper, a failure after it leaves

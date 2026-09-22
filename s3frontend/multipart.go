@@ -955,20 +955,28 @@ func (b *Backend) abortOpenSession(ctx context.Context, sess registry.MultipartS
 }
 
 // recordSessionReleases records a release for every blob of uploadID's parts
-// that was never committed. A committed blob's upload intent is published —
-// written with its first reference claim — so a completed session's winners,
-// even after their object is deleted, are recognised and left to the object
-// path's own releases. It is the durable step of a session teardown: the part
-// rows are the only index to the blobs and cascade away with the session, so
-// the caller runs this before DeleteSession and only deletes the session once
-// it has succeeded. Returns the records, for releaseNow.
+// that is still there to release. The blob's upload intent says which those
+// are. A published intent is a committed blob — the state its first
+// reference claim wrote — so a completed session's winners, even after their
+// object is deleted, are left to the object path's own releases. No intent
+// at all is a blob already released in full: every spooled blob gets an
+// intent, and only the last step of a release removes one, together with
+// that release's record. Recording such a blob again would enqueue a record
+// whose release then finds neither rows nor intent, takes the network arm
+// and asks to remove a blob that may never have left this node, which
+// nothing authorizes and no retry can complete.
+//
+// It is the durable step of a session teardown: the part rows are the only
+// index to the blobs and cascade away with the session, so the caller runs
+// this before DeleteSession and only deletes the session once it has
+// succeeded. Returns the records, for releaseNow.
 func (b *Backend) recordSessionReleases(ctx context.Context, space did.DID, uploadID string) ([]registry.PendingRelease, error) {
 	parts, err := b.multipart.ListParts(ctx, uploadID)
 	if err != nil {
 		return nil, fmt.Errorf("list parts: %w", err)
 	}
 	var digests []mh.Multihash
-	committed := map[string]bool{}
+	keep := map[string]bool{}
 	seen := map[string]bool{}
 	for _, p := range parts {
 		for _, d := range p.BlobDigests {
@@ -977,22 +985,27 @@ func (b *Backend) recordSessionReleases(ctx context.Context, space did.DID, uplo
 			}
 			seen[string(d)] = true
 			in, err := b.intents.GetIntent(ctx, d)
-			if err != nil && !errors.Is(err, registry.ErrNotFound) {
+			switch {
+			case errors.Is(err, registry.ErrNotFound):
+				// Already released in full, intent and all.
+				keep[string(d)] = true
+				continue
+			case err != nil:
 				return nil, fmt.Errorf("lookup intent: %w", err)
-			}
-			if err == nil && in.State == registry.IntentPublished {
-				committed[string(d)] = true
+			case in.State == registry.IntentPublished:
+				// Committed: the object path owns its release.
+				keep[string(d)] = true
 				continue
 			}
 			digests = append(digests, d)
 		}
 	}
-	return b.enqueuePartReleases(ctx, space, digests, committed)
+	return b.enqueuePartReleases(ctx, space, digests, keep)
 }
 
 // enqueuePartReleases records a deferred release for each of digests that is
 // not in keep (the winners at Complete, the sibling parts at supersede, the
-// committed blobs at a reap), in one statement however many parts the
+// committed and already-released blobs at a reap), in one statement however many parts the
 // session has. Whether a blob is in fact free to go is the release's
 // question, answered when it runs: runRelease drops a record whose digest is
 // claimed by a committed object and waits on one a part of an in-flight
@@ -1344,7 +1357,8 @@ func (b *Backend) ListMultipartUploads(ctx context.Context, input *s3.ListMultip
 		return s3response.ListMultipartUploadsResult{}, s3err.GetAPIError(s3err.ErrInvalidBucketName)
 	}
 	bucket := *input.Bucket
-	if _, err := b.reg.Get(ctx, bucket); err != nil {
+	st, err := b.reg.Get(ctx, bucket)
+	if err != nil {
 		if errors.Is(err, registry.ErrNotFound) {
 			return s3response.ListMultipartUploadsResult{}, s3err.GetAPIError(s3err.ErrNoSuchBucket)
 		}
@@ -1364,10 +1378,15 @@ func (b *Backend) ListMultipartUploads(ctx context.Context, input *s3.ListMultip
 	if err != nil {
 		return s3response.ListMultipartUploadsResult{}, fmt.Errorf("s3frontend: list sessions: %w", err)
 	}
-	// In-flight uploads only, honoring the prefix.
+	// In-flight uploads of THIS bucket only, honoring the prefix. Sessions
+	// are listed by bucket name, and a name outlives the bucket that bore
+	// it: an upload of a predecessor bucket parked its parts in another
+	// space, and its key and upload id are that space's to know, not this
+	// one's. The point operations reject such a session already
+	// (checkSessionSpace); the listing must not show it either.
 	inflight := all[:0]
 	for _, s := range all {
-		if s.State == registry.SessionOpen && strings.HasPrefix(s.ObjectKey, prefix) {
+		if s.State == registry.SessionOpen && s.Space == st.Space && strings.HasPrefix(s.ObjectKey, prefix) {
 			inflight = append(inflight, s)
 		}
 	}
