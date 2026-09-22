@@ -480,3 +480,119 @@ func mustPutPart(t *testing.T, m *MemStore, p registry.MultipartPart) {
 		t.Fatalf("PutPart: %v", err)
 	}
 }
+
+// Live part refs follow the session's state: parts of open and completing
+// sessions count; parts of completed and aborting sessions do not.
+func TestParts_LiveRefsFollowSessionState(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+	shared := multihash.Multihash([]byte("shared"))
+	for _, id := range []string{"a", "b", "c"} {
+		if err := m.CreateSession(ctx, registry.MultipartSession{UploadID: id, Bucket: "b", ObjectKey: id}); err != nil {
+			t.Fatalf("CreateSession %s: %v", id, err)
+		}
+		mustPutPart(t, m, registry.MultipartPart{UploadID: id, PartNumber: 1, ETagMD5: []byte("m"), Size: 1, BlobDigests: []multihash.Multihash{shared}})
+	}
+	if n, _ := m.CountLivePartRefs(ctx, shared); n != 3 {
+		t.Fatalf("live refs with three open sessions = %d, want 3", n)
+	}
+	if won, err := m.LatchSession(ctx, "a", registry.SessionOpen, registry.SessionCompleting); err != nil || !won {
+		t.Fatalf("latch a: won=%v err=%v", won, err)
+	}
+	if n, _ := m.CountLivePartRefs(ctx, shared); n != 3 {
+		t.Fatalf("live refs with one completing = %d, want 3 (completing is in flight)", n)
+	}
+	if won, err := m.LatchSession(ctx, "a", registry.SessionCompleting, registry.SessionCompleted); err != nil || !won {
+		t.Fatalf("latch a completed: won=%v err=%v", won, err)
+	}
+	if won, err := m.LatchSession(ctx, "b", registry.SessionOpen, registry.SessionAborting); err != nil || !won {
+		t.Fatalf("latch b aborting: won=%v err=%v", won, err)
+	}
+	if n, _ := m.CountLivePartRefs(ctx, shared); n != 1 {
+		t.Fatalf("live refs with one completed and one aborting = %d, want 1", n)
+	}
+	if n, _ := m.CountLivePartRefs(ctx, multihash.Multihash([]byte("other"))); n != 0 {
+		t.Fatalf("live refs of an unreferenced digest = %d, want 0", n)
+	}
+}
+
+// Bulk enqueue records each digest once, keeps the upsert's later not_before,
+// and returns the records as they stand.
+func TestReleases_BulkEnqueue(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+	space := did.Undef
+	d1, d2 := multihash.Multihash([]byte("d1")), multihash.Multihash([]byte("d2"))
+	later := time.Now().Add(time.Hour)
+	if err := m.EnqueueRelease(ctx, space, d1, later); err != nil {
+		t.Fatalf("EnqueueRelease: %v", err)
+	}
+	recs, err := m.EnqueueReleases(ctx, space, []multihash.Multihash{d1, d2, d2}, time.Now())
+	if err != nil || len(recs) != 2 {
+		t.Fatalf("EnqueueReleases = %d records, err %v (want 2: d2 recorded once)", len(recs), err)
+	}
+	for _, pr := range recs {
+		if string(pr.Digest) == "d1" && !pr.NotBefore.Equal(later) {
+			t.Fatalf("d1 not_before = %v, want the later existing value kept and returned", pr.NotBefore)
+		}
+	}
+	if all, _ := m.ListReleasesBySpace(ctx, space); len(all) != 2 {
+		t.Fatalf("releases = %d, want 2", len(all))
+	}
+	if recs, err := m.EnqueueReleases(ctx, space, nil, time.Now()); err != nil || len(recs) != 0 {
+		t.Fatalf("EnqueueReleases of nothing = %v, %v", recs, err)
+	}
+}
+
+// A claim publishes the digest's upload intent, and the state outlives the
+// claim: it is the durable mark of a committed blob.
+func TestBlobRefs_ClaimPublishesIntent(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+	d := multihash.Multihash([]byte("committed"))
+	if err := m.PutIntent(ctx, registry.UploadIntent{Digest: d, LocalPath: "/spool/c", Size: 1, State: registry.IntentAccepted, Bucket: "b"}); err != nil {
+		t.Fatalf("PutIntent: %v", err)
+	}
+	claim := registry.BlobClaim{Digest: d, Bucket: "b", ObjectKey: "k", VersionID: registry.NullVersionID, Space: did.Undef}
+	if err := m.AddBlobClaim(ctx, claim); err != nil {
+		t.Fatalf("AddBlobClaim: %v", err)
+	}
+	if in, _ := m.GetIntent(ctx, d); in.State != registry.IntentPublished {
+		t.Fatalf("intent after claim = %q, want published", in.State)
+	}
+	if err := m.DeleteBlobClaim(ctx, d, "b", "k", registry.NullVersionID); err != nil {
+		t.Fatalf("DeleteBlobClaim: %v", err)
+	}
+	if in, _ := m.GetIntent(ctx, d); in.State != registry.IntentPublished {
+		t.Fatalf("intent after the claim dropped = %q, want still published", in.State)
+	}
+	// No intent row: nothing to publish, no error.
+	if err := m.AddBlobClaim(ctx, registry.BlobClaim{Digest: multihash.Multihash([]byte("segment")), Bucket: "b", ObjectKey: "s", VersionID: registry.NullVersionID}); err != nil {
+		t.Fatalf("AddBlobClaim without intent: %v", err)
+	}
+}
+
+// Staleness counts from the last state change: a latch restarts the clock.
+func TestSessions_StaleByStateChange(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+	old := time.Now().Add(-2 * time.Hour)
+	for _, id := range []string{"latched", "untouched"} {
+		if err := m.CreateSession(ctx, registry.MultipartSession{UploadID: id, Bucket: "b", ObjectKey: id, CreatedAt: old}); err != nil {
+			t.Fatalf("CreateSession %s: %v", id, err)
+		}
+	}
+	if won, err := m.LatchSession(ctx, "latched", registry.SessionOpen, registry.SessionCompleting); err != nil || !won {
+		t.Fatalf("latch: won=%v err=%v", won, err)
+	}
+	cutoff := time.Now().Add(-time.Hour)
+	if stale, _ := m.ListStaleSessions(ctx, registry.SessionOpen, cutoff); len(stale) != 1 || stale[0].UploadID != "untouched" {
+		t.Fatalf("stale open = %+v, want only the untouched session", stale)
+	}
+	if stale, _ := m.ListStaleSessions(ctx, registry.SessionCompleting, cutoff); len(stale) != 0 {
+		t.Fatalf("stale completing = %+v, want none: the latch was just now", stale)
+	}
+	if s, _ := m.GetSession(ctx, "latched"); !s.StateChangedAt.After(s.CreatedAt) {
+		t.Fatalf("StateChangedAt %v not after CreatedAt %v", s.StateChangedAt, s.CreatedAt)
+	}
+}

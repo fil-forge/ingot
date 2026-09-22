@@ -41,11 +41,12 @@ type ServerConfig struct {
 	MaxConnections int
 	MaxRequests    int
 
-	// MultipartSessionTTL bounds abandoned multipart uploads: open sessions
-	// older than this are aborted by a background sweeper (dropping their
-	// spooled parts), and completed-session rows retained for Complete
-	// idempotency are reaped past the same age. Zero → default 7 days;
-	// negative → sweeper disabled.
+	// MultipartSessionTTL bounds abandoned multipart uploads: a session whose
+	// state has not changed for this long is torn down by a background
+	// sweeper — open ones aborted (dropping their spooled parts), completed
+	// rows retained for Complete idempotency reaped. A Complete's latch
+	// restarts the clock, so a live Complete on an old session is not swept
+	// from under it. Zero → default 7 days; negative → sweeper disabled.
 	MultipartSessionTTL time.Duration
 
 	// ReleaseGrace delays each blob release this long past the drop of its

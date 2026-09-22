@@ -282,7 +282,12 @@ type discardedVersion struct {
 // state that actually decided the version's id. Response shaping must gate on
 // it, not on the caller's pre-lock snapshot, so a racing PutBucketVersioning
 // can't mint an id the response then omits.
-func (b *Backend) commitVersion(ctx context.Context, bucketState *registry.State, key string, mf *msbucket.ObjectManifest, initState *msbucket.VersionState, preCheck func(superseded *msbucket.ObjectManifest) error) (msbucket.VersionNode, registry.VersioningState, error) {
+//
+// pinned says the body's digests belong to another object of the space (a
+// same-space copy) rather than to this write's own ingest: their claims are
+// then taken conditionally (see addClaims), and the commit fails with
+// errPinnedBlobReleased if the source is gone.
+func (b *Backend) commitVersion(ctx context.Context, bucketState *registry.State, key string, mf *msbucket.ObjectManifest, initState *msbucket.VersionState, pinned bool, preCheck func(superseded *msbucket.ObjectManifest) error) (msbucket.VersionNode, registry.VersioningState, error) {
 	var node msbucket.VersionNode
 	var discards []discardedVersion
 	var effState registry.VersioningState
@@ -519,7 +524,7 @@ func (b *Backend) commitVersion(ctx context.Context, bucketState *registry.State
 		// finds the rows to drop. A failed commit leaves at most a benign
 		// extra claim — never a wrong release; the release sweeper re-checks
 		// claim counts at drain time.
-		if err := b.addClaims(ctx, st, key, claimVersionID(vid, seq), bodyDigests(mf.Body)); err != nil {
+		if err := b.addClaims(ctx, st, key, claimVersionID(vid, seq), bodyDigests(mf.Body), pinned); err != nil {
 			return cid.Undef, err
 		}
 		return t2.GetPointer(ctx, tx)
