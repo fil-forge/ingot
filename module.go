@@ -153,6 +153,7 @@ type serverParams struct {
 	BodyUploader    uploader.BodyUploader
 	Deferred        uploader.DeferredBodyUploader
 	Remover         uploader.BlobRemover
+	Registrar       uploader.UploadRegistrar
 	BucketAuthority bucketauthority.BucketAuthority
 	Registry        registry.Registry
 	Intents         registry.IntentStore
@@ -211,6 +212,7 @@ func registerServerLifecycle(lc fx.Lifecycle, p serverParams) {
 				BodyUploader:    p.BodyUploader,
 				Deferred:        p.Deferred,
 				Remover:         p.Remover,
+				Registrar:       p.Registrar,
 				Authority:       p.BucketAuthority,
 				Registry:        p.Registry,
 				Intents:         p.Intents,
@@ -549,6 +551,7 @@ type uploaderResult struct {
 	BodyUploader uploader.BodyUploader
 	Deferred     uploader.DeferredBodyUploader
 	Remover      uploader.BlobRemover
+	Registrar    uploader.UploadRegistrar
 }
 
 // provideUploader builds the guppy-style edge client that ships to Forge via
@@ -560,5 +563,5 @@ func provideUploader(c *forgeclient.Client, logger *zap.Logger) (uploaderResult,
 	if err != nil {
 		return uploaderResult{}, err
 	}
-	return uploaderResult{Uploader: f, BodyUploader: f, Deferred: f, Remover: f}, nil
+	return uploaderResult{Uploader: f, BodyUploader: f, Deferred: f, Remover: f, Registrar: f}, nil
 }

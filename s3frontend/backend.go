@@ -64,6 +64,7 @@ type Backend struct {
 	deferred  uploader.DeferredBodyUploader
 	parks     registry.ParkStore
 	remover   uploader.BlobRemover
+	registrar uploader.UploadRegistrar
 	encParams registry.EncryptionParamsStore
 	// pendingReleases is the deferred-release queue; releaseGrace is how far
 	// past the last-claim drop each release is scheduled (readers holding the
@@ -122,6 +123,10 @@ type Deps struct {
 	Deferred uploader.DeferredBodyUploader
 	Parks    registry.ParkStore
 	Remover  uploader.BlobRemover
+	// Registrar keeps the upload service's content-entry list in step with the
+	// catalog: one entry per committed object version, which is what the
+	// service counts to report the space's object count.
+	Registrar uploader.UploadRegistrar
 
 	// EncParams is the per-blob FEE encryption-parameter table: what the
 	// decrypting read path needs to serve an encrypted blob. RegionKeys
@@ -194,6 +199,7 @@ func New(d Deps) *Backend {
 		deferred:        d.Deferred,
 		parks:           d.Parks,
 		remover:         d.Remover,
+		registrar:       d.Registrar,
 		encParams:       d.EncParams,
 		regionKeys:      d.RegionKeys,
 		tenantKeys:      d.TenantKeys,

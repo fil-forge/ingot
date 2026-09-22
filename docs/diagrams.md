@@ -54,7 +54,7 @@ flowchart LR
 
     client -->|"S3 REST"| ingot
     ingot -->|"/s3/request/authorize (every request on a local-cache miss)<br/>/s3/bucket/info (lazy chain completion)<br/>/s3/bucket/create, delete, list"| hilt
-    ingot -->|"/blob/add, /ucan/conclude, GET /receipt/:task<br/>/blob/abort, /blob/remove, /index/add"| sprue
+    ingot -->|"/blob/add, /ucan/conclude, GET /receipt/:task<br/>/blob/abort, /blob/remove, /index/add<br/>/upload/add, /upload/remove"| sprue
     ingot -->|"HTTP PUT blob bytes (allocated URL)"| piri
     ingot -->|"content/retrieve (UCAN, on read miss)"| piri
     ingot -->|"pgx + goose migrations"| pg
@@ -279,6 +279,7 @@ sequenceDiagram
     Note over B,R: post-commit, off the lock
     B->>R: reconcileClaims: blob_refs gains this version,<br/>superseded version rows removed
     B->>U: /blob/remove per digest whose CountClaims reached 0<br/>(+ crypto-shred: its blob_encryption_params row deleted)
+    B->>U: /upload/add(root = this version's manifest CID)<br/>+ /upload/remove per discarded version (best-effort)
     B-->>C: 200 + ETag (+ x-amz-version-id when versioning is configured)
 ```
 
@@ -309,14 +310,21 @@ sequenceDiagram
 - Supersession also records each replaced catalog block for future removal:
   the [catalog GC candidates](#catalog-gc-candidates-what-gets-remembered-for-removal)
   diagram shows every entry path.
+- The `/upload/add` is what the upload service counts to report the space's
+  object count: one content entry per committed version, keyed by the manifest
+  CID. A discarded version retracts, a retained noncurrent one does not, and a
+  delete marker registers like any other version — the same set AWS reports for
+  `NumberOfObjects`. Best-effort, as the index publication is: the object is
+  durable and the response must say so, so a failure logs and the count
+  under-reports rather than failing a write that succeeded.
 
 Cross-references: [`architecture.md` §7.1](./architecture.md#71-write-single-shot-putobject).
 
 Sources: `s3frontend/object.go` (PutObject, ingestBody, uploadBlobs),
 `s3frontend/copy.go` (CopyObject, copySourceBucket),
-`s3frontend/version.go` (commitVersion), `bucketop/bucketop.go`,
-`blockstore/staging.go`, `uploader/blob.go`, `uploader/forge.go`. Review when
-these change.
+`s3frontend/version.go` (commitVersion, registerVersion), `bucketop/bucketop.go`,
+`blockstore/staging.go`, `uploader/blob.go`, `uploader/forge.go`,
+`uploader/upload.go`. Review when these change.
 
 ## GetObject: version resolution, local tiers, network retrieval
 
@@ -677,7 +685,7 @@ flowchart TB
         tok["tokenstore (tokens.cbor):<br/>empty; dormant login paths only"]
     end
 
-    kp -->|"reqscope.ProofStore<br/>on the request ctx"| writes["uploader:<br/>/blob/add, abort, remove, /index/add"]
+    kp -->|"reqscope.ProofStore<br/>on the request ctx"| writes["uploader:<br/>/blob/add, abort, remove, /index/add<br/>/upload/add, /upload/remove"]
     kp -->|"same store"| reads["blockstore.Forge:<br/>content/retrieve"]
     kp -->|"captureShipProofs<br/>at UploadBlob"| ship
     ship --> async["async catalog ship;<br/>sweeper and DeleteBucket aborts"]

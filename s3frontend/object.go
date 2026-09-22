@@ -1089,6 +1089,7 @@ func (b *Backend) deleteObjectKey(ctx context.Context, bucketState *registry.Sta
 	var oldDigests []multihash.Multihash
 	var oldVersionID string
 	var oldSeq uint64
+	var oldManifest cid.Cid
 	err := b.txns.WithTx(ctx, bucketState.Name, func(ctx context.Context, tx *bucketop.Tx) (cid.Cid, error) {
 		// Empty bucket: nothing to delete. Returning cid.Undef tells WithTx to
 		// discard with no commit — the equivalent of "no-op success."
@@ -1111,12 +1112,16 @@ func (b *Backend) deleteObjectKey(ctx context.Context, bucketState *registry.Sta
 			return cid.Undef, fmt.Errorf("load value: %w", err)
 		}
 		oldMf := val.Manifest
+		// A manifest-valued key's block is the manifest itself; a leaf key
+		// names it. Either way this is the root the space counted.
+		oldManifest = valCid
 		if val.Leaf != nil {
 			var em msbucket.EnvelopedManifest
 			if err := tx.Get(ctx, tx.State().Space, val.Leaf.Current.Manifest, &em); err != nil {
 				return cid.Undef, fmt.Errorf("load manifest: %w", err)
 			}
 			oldMf = em.Manifest
+			oldManifest = val.Leaf.Current.Manifest
 		}
 
 		// Preconditions (If-Match / size / mod-time) under the lock against the
@@ -1160,6 +1165,9 @@ func (b *Backend) deleteObjectKey(ctx context.Context, bucketState *registry.Sta
 	if err := b.dropClaims(ctx, bucketState, key, claimVersionID(oldVersionID, oldSeq), oldDigests); err != nil {
 		return fmt.Errorf("s3frontend: delete reconcile: %w", err)
 	}
+	// The key is gone, so the space stops counting it. Undefined when the key
+	// was absent, which retractVersion skips.
+	b.retractVersion(ctx, bucketState, oldManifest)
 	return nil
 }
 

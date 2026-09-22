@@ -12,6 +12,7 @@ import (
 	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
 	"github.com/oklog/ulid/v2"
+	"go.uber.org/zap"
 
 	msbucket "github.com/fil-forge/ingot/bucket"
 	"github.com/fil-forge/ingot/bucketop"
@@ -259,6 +260,9 @@ type discardedVersion struct {
 	versionID string
 	seq       uint64
 	digests   []multihash.Multihash
+	// manifest is the discarded version's root, retracted from the upload
+	// service's content-entry list so the space stops counting it.
+	manifest cid.Cid
 }
 
 // commitVersion runs the §5 write rule for one new version (a PutObject /
@@ -388,7 +392,7 @@ func (b *Backend) commitVersion(ctx context.Context, bucketState *registry.State
 			} else {
 				// Discard (null over null). A manifest-valued key stays one; its value
 				// block is the manifest queued for GC just below.
-				discards = append(discards, discardedVersion{superseded.VersionID, superseded.Seq, bodyDigests(supersededMf.Body)})
+				discards = append(discards, discardedVersion{superseded.VersionID, superseded.Seq, bodyDigests(supersededMf.Body), superseded.Manifest})
 				discardSeqs = append(discardSeqs, superseded.Seq)
 				if err := b.gc.AddGCCandidate(ctx, superseded.Manifest.Bytes(), st.Name); err != nil {
 					return cid.Undef, fmt.Errorf("gc candidate: %w", err)
@@ -409,7 +413,7 @@ func (b *Backend) commitVersion(ctx context.Context, bucketState *registry.State
 						if err := tx.Get(ctx, st.Space, nullCid, &nullEm); err != nil {
 							return cid.Undef, fmt.Errorf("load prev null manifest: %w", err)
 						}
-						discards = append(discards, discardedVersion{registry.NullVersionID, newLeaf.NullSeq, bodyDigests(nullEm.Manifest.Body)})
+						discards = append(discards, discardedVersion{registry.NullVersionID, newLeaf.NullSeq, bodyDigests(nullEm.Manifest.Body), nullCid})
 						discardSeqs = append(discardSeqs, newLeaf.NullSeq)
 						if prevTree, err = prevTree.Delete(ctx, nullKey); err != nil {
 							return cid.Undef, fmt.Errorf("prev delete null: %w", err)
@@ -537,7 +541,53 @@ func (b *Backend) commitVersion(ctx context.Context, bucketState *registry.State
 			return node, effState, fmt.Errorf("s3frontend: commit reconcile: %w", err)
 		}
 	}
+
+	// Content entries (the space's object count): this version registers, the
+	// ones it discarded retract. Every write rule runs through here, so a PUT,
+	// a multipart Complete, a CopyObject destination and a delete marker all
+	// count as one object, and a bucket retaining noncurrent versions keeps
+	// counting them — which is what AWS reports for NumberOfObjects.
+	b.registerVersion(ctx, bucketState, node.Manifest, discards)
 	return node, effState, nil
+}
+
+// registerVersion tells the upload service that root is a content entry in the
+// bucket's space and that the discarded versions no longer are.
+//
+// Best-effort, like the index publication a catalog ship makes: the object is
+// durable and the catalog mutation is fsynced by the time this runs, so the
+// response must say so, and failing the request here would fail a write that
+// actually succeeded. The cost is that the count under-reports until something
+// re-registers the root, and unlike a blob release there is no local record to
+// retry from. (TODO: persist failed registrations so the count converges.)
+func (b *Backend) registerVersion(ctx context.Context, bucketState *registry.State, root cid.Cid, discards []discardedVersion) {
+	if err := b.registrar.RegisterUpload(ctx, bucketState.Space, root); err != nil {
+		b.logger.Warn("commit: upload registration failed; object count will under-report",
+			zap.String("bucket", bucketState.Name),
+			zap.Stringer("space", bucketState.Space),
+			zap.Stringer("root", root),
+			zap.Error(err),
+		)
+	}
+	for _, d := range discards {
+		b.retractVersion(ctx, bucketState, d.manifest)
+	}
+}
+
+// retractVersion drops a retired version's content entry. Best-effort for the
+// same reason as registerVersion; an entry left behind over-reports the count.
+func (b *Backend) retractVersion(ctx context.Context, bucketState *registry.State, root cid.Cid) {
+	if !root.Defined() {
+		return
+	}
+	if err := b.registrar.RetractUpload(ctx, bucketState.Space, root); err != nil {
+		b.logger.Warn("commit: upload retraction failed; object count will over-report",
+			zap.String("bucket", bucketState.Name),
+			zap.Stringer("space", bucketState.Space),
+			zap.Stringer("root", root),
+			zap.Error(err),
+		)
+	}
 }
 
 // scopedDeleteResult reports a version-scoped delete: whether a version was
@@ -603,7 +653,7 @@ func (b *Backend) deleteVersionScoped(ctx context.Context, bucketState *registry
 					return cid.Undef, err
 				}
 			}
-			removed = discardedVersion{versionID: targetVersionID(kind, mf), seq: mf.Seq, digests: bodyDigests(mf.Body)}
+			removed = discardedVersion{versionID: targetVersionID(kind, mf), seq: mf.Seq, digests: bodyDigests(mf.Body), manifest: valCid}
 			res.found, res.wasMarker = true, mf.DeleteMarker
 			// The value block is the manifest — one GC candidate covers it.
 			if err := b.gc.AddGCCandidate(ctx, valCid.Bytes(), st.Name); err != nil {
@@ -676,7 +726,7 @@ func (b *Backend) deleteVersionScoped(ctx context.Context, bucketState *registry
 			}
 		}
 
-		removed = discardedVersion{versionID: targetVersionID(kind, targetMf), seq: targetMf.Seq, digests: bodyDigests(targetMf.Body)}
+		removed = discardedVersion{versionID: targetVersionID(kind, targetMf), seq: targetMf.Seq, digests: bodyDigests(targetMf.Body), manifest: targetCid}
 		res.found, res.wasMarker = true, targetMf.DeleteMarker
 		if err := b.gc.AddGCCandidate(ctx, targetCid.Bytes(), st.Name); err != nil {
 			return cid.Undef, fmt.Errorf("gc candidate: %w", err)
@@ -758,6 +808,8 @@ func (b *Backend) deleteVersionScoped(ctx context.Context, bucketState *registry
 		if err := b.dropClaims(ctx, bucketState, key, claimVersionID(removed.versionID, removed.seq), removed.digests); err != nil {
 			return res, fmt.Errorf("s3frontend: delete version reconcile: %w", err)
 		}
+		// The version is gone for good, so the space stops counting it.
+		b.retractVersion(ctx, bucketState, removed.manifest)
 	}
 	return res, nil
 }

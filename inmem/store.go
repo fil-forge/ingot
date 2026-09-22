@@ -436,6 +436,12 @@ func (NopUploader) AbortBlob(_ context.Context, _ did.DID, _ multihash.Multihash
 	return nil
 }
 
+// RegisterUpload and RetractUpload keep no content-entry list: there is no
+// upload service to count against, and nothing in the suite reads one back.
+func (NopUploader) RegisterUpload(_ context.Context, _ did.DID, _ cid.Cid) error { return nil }
+
+func (NopUploader) RetractUpload(_ context.Context, _ did.DID, _ cid.Cid) error { return nil }
+
 // Compile-time guarantees.
 var (
 	_ bucketauthority.BucketAuthority = (*MemStore)(nil)
@@ -447,4 +453,5 @@ var (
 	_ uploader.BodyUploader           = NopUploader{}
 	_ uploader.DeferredBodyUploader   = NopUploader{}
 	_ uploader.BlobRemover            = NopUploader{}
+	_ uploader.UploadRegistrar        = NopUploader{}
 )
