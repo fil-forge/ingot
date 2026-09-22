@@ -84,7 +84,7 @@ func TestRevokerClearsHolderCachesOnly(t *testing.T) {
 	require.Empty(t, r.Revoke(a.dlg.Link()))
 }
 
-func TestRevokerUnknownCIDIsNoOp(t *testing.T) {
+func TestRevokerUnknownCIDClearsNothingButIsRecorded(t *testing.T) {
 	ctx := context.Background()
 	kp := iam.NewKeyProofs()
 	keys := iam.NewVerificationKeyCache()
@@ -92,13 +92,15 @@ func TestRevokerUnknownCIDIsNoOp(t *testing.T) {
 	r := iam.NewRevoker(kp, keys, tenants, nil)
 
 	a := seedKey(t, kp, keys, tenants)
-	// A delegation never deposited anywhere: nothing cached depends on it.
+	// A delegation never deposited anywhere: nothing cached depends on it,
+	// but a response carrying it later must not be cached.
 	stranger, err := ed25519.GenerateIssuer()
 	require.NoError(t, err)
 	other, err := contentcmds.Retrieve.Delegate(stranger, stranger.DID(), stranger.DID(), delegation.WithNoExpiration())
 	require.NoError(t, err)
 
 	require.Empty(t, r.Revoke(other.Link()))
+	require.True(t, kp.Revoked(other), "the revocation is remembered")
 
 	chain, _, err := kp.For(a.key).ProofChain(ctx, a.dlg.Audience(), a.dlg.Command(), a.tenant.DID())
 	require.NoError(t, err)

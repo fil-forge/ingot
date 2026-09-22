@@ -4,6 +4,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/fil-forge/hilt/pkg/sigv4"
 	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/ucantone/ucan"
 	"github.com/ipfs/go-cid"
@@ -23,9 +24,20 @@ import (
 // TTL is refreshed on every access, so an active key is never evicted
 // mid-use; a caller already holding a *DelegationCache is unaffected by
 // eviction regardless.
+//
+// It also remembers every delegation CID a revocation named, until the next
+// UTC midnight plus clock skew (the horizon of everything cached from an
+// authorize response). A Hilt write publishes its revocations before it
+// commits, so a write whose commit failed leaves the revoked delegations
+// stored at Hilt, and Hilt's next authorize response for the key carries
+// them again. The service checks a response against this set and, on a
+// match, authorizes without caching, so the key returns to Hilt on every
+// request until a committed write issues fresh delegations (which carry new
+// CIDs: ucantone gives every delegation a random nonce).
 type KeyProofs struct {
-	mu    sync.Mutex
-	byKey *gocache.Cache // access-key DID string → *DelegationCache
+	mu      sync.Mutex
+	byKey   *gocache.Cache // access-key DID string → *DelegationCache
+	revoked *gocache.Cache // revoked delegation CID string → struct{}
 }
 
 // keyProofsIdleTTL is how long a key's cache survives with no access before
@@ -36,7 +48,10 @@ const keyProofsIdleTTL = 24 * time.Hour
 
 // NewKeyProofs returns an empty per-key proof store registry.
 func NewKeyProofs() *KeyProofs {
-	return &KeyProofs{byKey: gocache.New(keyProofsIdleTTL, keyProofsIdleTTL)}
+	return &KeyProofs{
+		byKey:   gocache.New(keyProofsIdleTTL, keyProofsIdleTTL),
+		revoked: gocache.New(gocache.NoExpiration, cacheJanitorInterval),
+	}
 }
 
 // For returns key's proof store, creating it on first use. The idle TTL is
@@ -60,17 +75,20 @@ func (k *KeyProofs) Deposit(key did.DID, dlgs ...ucan.Delegation) {
 	k.For(key).Add(dlgs...)
 }
 
-// InvalidateHolders drops every per-key proof store holding the delegation
-// with CID link, returning the affected access-key DIDs. Dropping the whole
-// store rather than the one entry is deliberate: a revoked delegation is a
-// hop in every chain the local fast path could assemble for that key, so no
-// partial state is worth keeping — the key's next request falls through to
-// Hilt, which re-authorizes (or, for a deleted key, refuses). A caller
-// already holding the dropped *DelegationCache (an in-flight request) is
-// unaffected; the next For(key) starts a fresh empty store.
+// InvalidateHolders records link as revoked and drops every per-key proof
+// store holding the delegation with that CID, returning the affected
+// access-key DIDs. Dropping the whole store rather than the one entry is
+// deliberate: a revoked delegation is a hop in every chain the local fast
+// path could assemble for that key, so no partial state is worth keeping —
+// the key's next request falls through to Hilt, which re-authorizes (or, for
+// a deleted key, refuses). A caller already holding the dropped
+// *DelegationCache (an in-flight request) is unaffected; the next For(key)
+// starts a fresh empty store. A link no store holds is still recorded: the
+// revocation may precede the response that would have cached it.
 func (k *KeyProofs) InvalidateHolders(link cid.Cid) []did.DID {
 	k.mu.Lock()
 	defer k.mu.Unlock()
+	k.revoked.Set(link.String(), struct{}{}, untilNextUTCMidnight(time.Now())+sigv4.MaxClockSkew)
 	var affected []did.DID
 	// Items() already skips expired entries; expired stores are gone anyway.
 	for id, item := range k.byKey.Items() {
@@ -86,4 +104,15 @@ func (k *KeyProofs) InvalidateHolders(link cid.Cid) []did.DID {
 		affected = append(affected, key)
 	}
 	return affected
+}
+
+// Revoked reports whether any of the delegations has been named by a
+// revocation within the current horizon (see [KeyProofs]).
+func (k *KeyProofs) Revoked(dlgs ...ucan.Delegation) bool {
+	for _, d := range dlgs {
+		if _, ok := k.revoked.Get(d.Link().String()); ok {
+			return true
+		}
+	}
+	return false
 }

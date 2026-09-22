@@ -10,6 +10,7 @@ import (
 	s3 "github.com/fil-forge/libforge/commands/s3"
 	s3bkt "github.com/fil-forge/libforge/commands/s3/bucket"
 	s3req "github.com/fil-forge/libforge/commands/s3/request"
+	ucanlib "github.com/fil-forge/libforge/ucan"
 	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/ucantone/multikey/ed25519"
 	"github.com/fil-forge/ucantone/ucan"
@@ -26,10 +27,11 @@ import (
 // fakeAuthorizer records the request it authorized and returns canned
 // results, standing in for the hilt client.
 type fakeAuthorizer struct {
-	got  s3.Request
-	dlgs []ucan.Delegation // delegations in the authorize response container
-	res  *s3req.AuthorizeOK
-	err  error
+	got   s3.Request
+	calls int
+	dlgs  []ucan.Delegation // delegations in the authorize response container
+	res   *s3req.AuthorizeOK
+	err   error
 
 	infoBuckets []string          // BucketInfo calls received, by name
 	infoDlgs    []ucan.Delegation // delegations in the bucket-info container
@@ -38,6 +40,7 @@ type fakeAuthorizer struct {
 
 func (f *fakeAuthorizer) AuthorizeRequest(_ context.Context, req s3.Request, _ ...hiltclient.MethodOption) (*s3req.AuthorizeOK, ucan.Container, error) {
 	f.got = req
+	f.calls++
 	if f.err != nil {
 		return nil, nil, f.err
 	}
@@ -191,6 +194,59 @@ func TestGetUserAccountForRequest(t *testing.T) {
 // TestProofChainCapture covers the delegation plumbing: authorize-response
 // delegations land in the cache, incomplete chains trigger exactly one
 // /s3/bucket/info fetch, and info failures never fail authentication.
+func TestRevokedResponseIsNotCached(t *testing.T) {
+	access, keyDID := newAccessKey(t)
+	sigv4 := s3.VerificationKey{Kind: s3.KeyKindSigV4, Data: []byte("dk")}
+	root, mid, leaf, agent := mintRetrieveChain(t)
+	cache := iam.NewKeyProofs()
+	keys, tenants := iam.NewVerificationKeyCache(), iam.NewTenantCache()
+	fake := &fakeAuthorizer{res: authorizeOK(t, keyDID, sigv4), dlgs: []ucan.Delegation{root, mid, leaf}}
+	svc := iam.New(fake, cache, keys, tenants)
+
+	// The consumer saw leaf revoked, but Hilt's write did not commit: its
+	// next response still carries leaf.
+	require.Empty(t, iam.NewRevoker(cache, keys, tenants, nil).Revoke(leaf.Link()))
+
+	app := fiber.New()
+	var scoped ucanlib.ProofStore
+	var acct auth.Account
+	var calls int
+	app.Use(func(c fiber.Ctx) error {
+		var err error
+		acct, err = svc.GetUserAccountForRequest(c, access)
+		require.NoError(t, err)
+		scoped, _ = c.Locals(reqscope.ProofStoreKey()).(ucanlib.ProofStore)
+		calls++
+		return nil
+	})
+	for range 2 {
+		resp, err := app.Test(httptest.NewRequest(http.MethodGet, "http://example.com/bkt/key", nil))
+		require.NoError(t, err)
+		require.NoError(t, resp.Body.Close())
+	}
+	require.Equal(t, 2, calls)
+	require.Equal(t, 2, fake.calls, "every request reaches Hilt while the response carries a revoked delegation")
+	require.Equal(t, auth.Account{Access: access, SigningKey: []byte("dk"), Role: auth.RoleAdmin}, acct, "the request is authorized")
+
+	// Nothing is cached for the key: no signing key, no tenant, no action set,
+	// no delegations in its store.
+	_, found := keys.Get(access, s3.KeyKindSigV4)
+	require.False(t, found)
+	_, found = tenants.Get(access)
+	require.False(t, found)
+	_, known := cache.For(keyDID).Permits(*fake.res.Bucket, "s3:GetObject")
+	require.False(t, known)
+	held, _, err := cache.For(keyDID).ProofChain(context.Background(), agent.DID(), leaf.Command(), leaf.Subject())
+	require.NoError(t, err)
+	require.Empty(t, held)
+
+	// The request itself still had a chain for its onward retrieval.
+	require.NotNil(t, scoped)
+	chain, _, err := scoped.ProofChain(context.Background(), agent.DID(), leaf.Command(), leaf.Subject())
+	require.NoError(t, err)
+	require.Len(t, chain, 3)
+}
+
 func TestProofChainCapture(t *testing.T) {
 	access, keyDID := newAccessKey(t)
 	sigv4 := s3.VerificationKey{Kind: s3.KeyKindSigV4, Data: []byte("dk")}
