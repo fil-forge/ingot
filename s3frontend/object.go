@@ -23,11 +23,13 @@ import (
 	"github.com/filecoin-project/go-fee"
 	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
+	"go.opentelemetry.io/otel/attribute"
 	"go.uber.org/zap"
 
 	msbucket "github.com/fil-forge/ingot/bucket"
 	"github.com/fil-forge/ingot/bucketop"
 	"github.com/fil-forge/ingot/internal/reqscope"
+	"github.com/fil-forge/ingot/internal/tracing"
 	"github.com/fil-forge/ingot/mst"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/uploader"
@@ -270,10 +272,16 @@ func (b *Backend) ingestBody(ctx context.Context, bucket *registry.State, r io.R
 // The Body it returns is entirely plaintext-coordinate (Size, spans,
 // SHA256/MD5 — all computed before encryption); the intents record the
 // SPOOLED (ciphertext) byte count, which is what the uploader ships.
-func (b *Backend) splitSpool(ctx context.Context, bucket string, space did.DID, r io.Reader) (msbucket.Body, error) {
+func (b *Backend) splitSpool(ctx context.Context, bucket string, space did.DID, r io.Reader) (_ msbucket.Body, err error) {
+	// The span covers receiving the body (it streams in from the client as
+	// SplitBody reads it), encrypting it and writing it to the spool; the
+	// body.received event marks where the client finished sending.
+	ctx, span := tracing.Start(ctx, "body.spool")
+	defer func() { tracing.End(span, err) }()
 	if r == nil {
 		r = bytes.NewReader(nil)
 	}
+	r = &receivedReader{r: r, span: span}
 	// One tenant recipient per request, resolved before anything is spooled:
 	// a body that cannot be wrapped to its tenant is not stored at all.
 	recipient, err := b.tenantRecipient(ctx)
@@ -285,6 +293,10 @@ func (b *Backend) splitSpool(ctx context.Context, bucket string, space did.DID, 
 	if err != nil {
 		return msbucket.Body{}, fmt.Errorf("split body: %w", err)
 	}
+	span.SetAttributes(
+		attribute.Int64("ingot.body.bytes", body.Size),
+		attribute.Int("ingot.body.blobs", len(body.Blobs)),
+	)
 	for _, blob := range body.Blobs {
 		storedSize, err := enc.storedSize(blob.Digest)
 		if err != nil {
@@ -327,51 +339,68 @@ func (b *Backend) splitSpool(ctx context.Context, bucket string, space did.DID, 
 // deferred upload_intents × blob_locations crash recovery — see §12.)
 func (b *Backend) uploadBlobs(ctx context.Context, space did.DID, blobs []msbucket.BlobRef) error {
 	for _, blob := range blobs {
-		digest := blob.Digest
-		if existing, err := b.locations.GetLocation(ctx, space, blob.Digest); err == nil && existing != nil {
-			// Already durable for this space — advance the intent and move on.
-			if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentAccepted); err != nil {
-				return fmt.Errorf("mark accepted (dedup): %w", err)
-			}
-			continue
-		} else if err != nil && !errors.Is(err, registry.ErrNotFound) {
-			return fmt.Errorf("lookup location: %w", err)
+		if err := b.uploadBlob(ctx, space, blob); err != nil {
+			return err
 		}
-		// The uploaded bytes are the spooled envelope, so the size is the
-		// intent's stored byte count, not the blob's plaintext span.
-		in, err := b.intents.GetIntent(ctx, digest)
-		if err != nil {
-			return fmt.Errorf("lookup intent: %w", err)
-		}
-		// The blob may be on the network from here on; a release finding no
-		// row for it must remove it rather than assume it never left.
-		if err := b.intents.SetIntentState(ctx, digest, registry.IntentUploading); err != nil {
-			return fmt.Errorf("mark uploading: %w", err)
-		}
-		res, err := b.uploader.UploadBlob(ctx, space, digest, in.Size, b.spool.Path(digest))
-		if err != nil {
-			return fmt.Errorf("upload blob: %w", err)
-		}
-		// A concluding UploadBlob (the default) returns an accepted location
-		// or errors; guard the contract rather than deref-panic on a bad impl.
-		if res.Location == nil {
-			return fmt.Errorf("upload blob %x: concluding upload returned no location", blob.Digest)
-		}
-		loc := res.Location
+	}
+	return nil
+}
+
+// uploadBlob is uploadBlobs for one blob, traced as a blob.upload span whose
+// ingot.blob.result says whether it uploaded or was already stored.
+func (b *Backend) uploadBlob(ctx context.Context, space did.DID, blob msbucket.BlobRef) (err error) {
+	ctx, span := tracing.Start(ctx, "blob.upload")
+	defer func() { tracing.End(span, err) }()
+
+	digest := blob.Digest
+	if existing, err := b.locations.GetLocation(ctx, space, blob.Digest); err == nil && existing != nil {
+		// Already durable for this space — advance the intent and move on.
+		span.SetAttributes(attribute.String("ingot.blob.result", "already_stored"))
 		if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentAccepted); err != nil {
-			return fmt.Errorf("mark accepted: %w", err)
+			return fmt.Errorf("mark accepted (dedup): %w", err)
 		}
-		// Best-effort location record (unused in the harness, where reads come
-		// from the spool); keyed by (space, digest).
-		if err := b.locations.PutLocation(ctx, registry.BlobLocation{
-			Space:    space,
-			Digest:   blob.Digest,
-			Provider: loc.Provider,
-			URL:      loc.URL,
-			Size:     loc.Size,
-		}); err != nil {
-			return fmt.Errorf("record location: %w", err)
-		}
+		return nil
+	} else if err != nil && !errors.Is(err, registry.ErrNotFound) {
+		return fmt.Errorf("lookup location: %w", err)
+	}
+	// The uploaded bytes are the spooled envelope, so the size is the
+	// intent's stored byte count, not the blob's plaintext span.
+	in, err := b.intents.GetIntent(ctx, digest)
+	if err != nil {
+		return fmt.Errorf("lookup intent: %w", err)
+	}
+	span.SetAttributes(
+		attribute.String("ingot.blob.result", "uploaded"),
+		attribute.Int64("ingot.blob.bytes", in.Size),
+	)
+	// The blob may be on the network from here on; a release finding no
+	// row for it must remove it rather than assume it never left.
+	if err := b.intents.SetIntentState(ctx, digest, registry.IntentUploading); err != nil {
+		return fmt.Errorf("mark uploading: %w", err)
+	}
+	res, err := b.uploader.UploadBlob(ctx, space, digest, in.Size, b.spool.Path(digest))
+	if err != nil {
+		return fmt.Errorf("upload blob: %w", err)
+	}
+	// A concluding UploadBlob (the default) returns an accepted location
+	// or errors; guard the contract rather than deref-panic on a bad impl.
+	if res.Location == nil {
+		return fmt.Errorf("upload blob %x: concluding upload returned no location", blob.Digest)
+	}
+	loc := res.Location
+	if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentAccepted); err != nil {
+		return fmt.Errorf("mark accepted: %w", err)
+	}
+	// Best-effort location record (unused in the harness, where reads come
+	// from the spool); keyed by (space, digest).
+	if err := b.locations.PutLocation(ctx, registry.BlobLocation{
+		Space:    space,
+		Digest:   blob.Digest,
+		Provider: loc.Provider,
+		URL:      loc.URL,
+		Size:     loc.Size,
+	}); err != nil {
+		return fmt.Errorf("record location: %w", err)
 	}
 	return nil
 }
@@ -1673,12 +1702,26 @@ func (b *Backend) listWalk(ctx context.Context, bucketName, prefix, delimiter, f
 		return out, nil
 	}
 
+	// Listing cost follows the keys the walk visits, which can be far more
+	// than it returns (delete markers, keys rolled into common prefixes).
+	var walkErr error
+	scanned := 0
+	ctx, span := tracing.Start(ctx, "tree.list")
+	defer func() {
+		span.SetAttributes(
+			attribute.Int("ingot.tree.keys_scanned", scanned),
+			attribute.Int("ingot.tree.keys_returned", len(out.contents)+len(out.commonPrefixes)),
+		)
+		tracing.End(span, walkErr)
+	}()
+
 	t := mst.LoadMST(b.read, st.Space, st.Root)
 	seenPrefix := map[string]struct{}{}
-	walkErr := t.WalkLeavesFromNocache(ctx, from, func(k string, valCid cid.Cid) error {
+	walkErr = t.WalkLeavesFromNocache(ctx, from, func(k string, valCid cid.Cid) error {
 		if prefix != "" && !strings.HasPrefix(k, prefix) {
 			return mst.ErrStopWalk
 		}
+		scanned++
 
 		// Resolve the key's current version first: a key whose current version
 		// is a delete marker is invisible to ListObjects — it produces neither

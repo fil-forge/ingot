@@ -10,6 +10,8 @@ import (
 	block "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
 	mh "github.com/multiformats/go-multihash"
+
+	"github.com/fil-forge/ingot/internal/tracing"
 )
 
 // Cached wraps a BlockReader with a bounded, in-memory LRU keyed by CID. Blocks
@@ -86,12 +88,14 @@ func (c *Cached) OpenBlobRange(ctx context.Context, space did.DID, digest mh.Mul
 func (c *Cached) GetBlock(ctx context.Context, space did.DID, k cid.Cid) (block.Block, error) {
 	key := k.KeyString()
 	if blk, ok := c.get(key); ok {
+		tracing.CountRead(ctx, tracing.BlockCache)
 		return blk, nil
 	}
 	blk, err := c.base.GetBlock(ctx, space, k)
 	if err != nil {
 		return nil, err
 	}
+	tracing.CountRead(ctx, tracing.BlockNetwork)
 	c.add(key, blk)
 	return blk, nil
 }

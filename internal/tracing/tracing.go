@@ -40,7 +40,14 @@ func NewTransport() http.RoundTripper {
 
 // Middleware starts the server span for each request, continuing a trace
 // context the caller sent. The span is named for the HTTP method until the
-// audit logger renames it for the S3 action (see SpanFromRequest).
+// audit logger renames it for the S3 action (see SpanFromRequest). The
+// request's read counts (see CountRead) are set on it as the request ends.
+//
+// A streamed response body (GetObject's) is written by fasthttp after the
+// handler returns, and the blob reads and decrypts behind it happen then. So
+// for a streamed body the span ends when fasthttp releases the request after
+// writing it, closing the request's io.Closer user values; otherwise it ends
+// when the handler returns.
 //
 // versitygw hands the backend the bare *fasthttp.RequestCtx as its
 // context.Context, whose Value reads the request's user values, so a span
@@ -58,10 +65,16 @@ func Middleware() fiber.Handler {
 			trace.WithSpanKind(trace.SpanKindServer),
 			trace.WithAttributes(semconv.HTTPRequestMethodKey.String(method)),
 		)
-		defer span.End()
 		if spanKey != nil {
 			rc.SetUserValue(spanKey, span)
 		}
+		reads := attachReadCounts(rc)
+		streamed := false
+		defer func() {
+			if !streamed {
+				span.End()
+			}
+		}()
 
 		err := c.Next()
 		status := rc.Response.StatusCode()
@@ -69,8 +82,28 @@ func Middleware() fiber.Handler {
 		if status >= http.StatusInternalServerError {
 			span.SetStatus(codes.Error, http.StatusText(status))
 		}
+		if rc.Response.IsBodyStream() {
+			streamed = true
+			rc.SetUserValue(endSpanKey{}, endSpan(func() {
+				span.SetAttributes(reads.attributes()...)
+				span.End()
+			}))
+			return err
+		}
+		span.SetAttributes(reads.attributes()...)
 		return err
 	}
+}
+
+type endSpanKey struct{}
+
+// endSpan ends a streamed response's server span when fasthttp closes the
+// request's user values.
+type endSpan func()
+
+func (f endSpan) Close() error {
+	f()
+	return nil
 }
 
 // SpanFromRequest returns the request's server span, or a no-op span when

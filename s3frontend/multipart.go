@@ -24,10 +24,12 @@ import (
 	"github.com/google/uuid"
 	"github.com/ipfs/go-cid"
 	mh "github.com/multiformats/go-multihash"
+	"go.opentelemetry.io/otel/attribute"
 	"go.uber.org/zap"
 
 	msbucket "github.com/fil-forge/ingot/bucket"
 	"github.com/fil-forge/ingot/internal/reqscope"
+	"github.com/fil-forge/ingot/internal/tracing"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/uploader"
 )
@@ -1043,76 +1045,94 @@ func (b *Backend) enqueuePartReleases(ctx context.Context, space did.DID, digest
 // state for Complete/Abort.
 func (b *Backend) parkBlobs(ctx context.Context, space did.DID, blobs []msbucket.BlobRef) error {
 	for _, blob := range blobs {
-		digest := blob.Digest
-		if existing, err := b.locations.GetLocation(ctx, space, blob.Digest); err == nil && existing != nil {
-			if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentAccepted); err != nil {
-				return fmt.Errorf("mark accepted (dedup): %w", err)
-			}
-			// A located blob has no use for a park. One is still here only
-			// when an earlier Complete recorded the location and then failed
-			// before dropping the row. The part is durable regardless, so a
-			// failure here is logged rather than failing the write; Complete's
-			// dedup path drops the row otherwise.
-			if err := b.parks.DeletePark(ctx, blob.Digest); err != nil {
-				b.logger.Warn("drop stale park row failed; Complete will retry",
-					zap.String("digest", hex.EncodeToString(blob.Digest)), zap.Error(err))
-			}
-			continue
-		} else if err != nil && !errors.Is(err, registry.ErrNotFound) {
-			return fmt.Errorf("lookup location: %w", err)
+		if err := b.parkBlob(ctx, space, blob); err != nil {
+			return err
 		}
-		if _, err := b.parks.GetPark(ctx, blob.Digest); err == nil {
-			continue // already parked by a sibling part or session
-		} else if !errors.Is(err, registry.ErrNotFound) {
-			return fmt.Errorf("lookup park: %w", err)
-		}
+	}
+	return nil
+}
 
-		// The uploaded bytes are the spooled envelope; the intent records
-		// their (ciphertext) count, not the blob's plaintext span.
-		in, err := b.intents.GetIntent(ctx, digest)
-		if err != nil {
-			return fmt.Errorf("lookup intent: %w", err)
+// parkBlob is parkBlobs for one blob, traced as a blob.park span whose
+// ingot.blob.result says whether it parked, was already stored or parked, or
+// was accepted outright.
+func (b *Backend) parkBlob(ctx context.Context, space did.DID, blob msbucket.BlobRef) (err error) {
+	ctx, span := tracing.Start(ctx, "blob.park")
+	defer func() { tracing.End(span, err) }()
+
+	digest := blob.Digest
+	if existing, err := b.locations.GetLocation(ctx, space, blob.Digest); err == nil && existing != nil {
+		span.SetAttributes(attribute.String("ingot.blob.result", "already_stored"))
+		if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentAccepted); err != nil {
+			return fmt.Errorf("mark accepted (dedup): %w", err)
 		}
-		// The blob may be on the network from here on (see IntentUploading).
-		if err := b.intents.SetIntentState(ctx, digest, registry.IntentUploading); err != nil {
-			return fmt.Errorf("mark uploading: %w", err)
+		// A located blob has no use for a park. One is still here only
+		// when an earlier Complete recorded the location and then failed
+		// before dropping the row. The part is durable regardless, so a
+		// failure here is logged rather than failing the write; Complete's
+		// dedup path drops the row otherwise.
+		if err := b.parks.DeletePark(ctx, blob.Digest); err != nil {
+			b.logger.Warn("drop stale park row failed; Complete will retry",
+				zap.String("digest", hex.EncodeToString(blob.Digest)), zap.Error(err))
 		}
-		res, err := b.deferred.UploadBlob(ctx, space, digest, in.Size, b.spool.Path(digest), uploader.WithConclude(false))
-		if err != nil {
-			return fmt.Errorf("park blob: %w", err)
-		}
-		if res.Location != nil {
-			// The provider already held accepted bytes for this content —
-			// accept ran despite the deferred conclude (dedup), record the
-			// location like the synchronous path.
-			if err := b.locations.PutLocation(ctx, registry.BlobLocation{
-				Space:    space,
-				Digest:   blob.Digest,
-				Provider: res.Location.Provider,
-				URL:      res.Location.URL,
-				Size:     res.Location.Size,
-			}); err != nil {
-				return fmt.Errorf("record location: %w", err)
-			}
-			if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentAccepted); err != nil {
-				return fmt.Errorf("mark accepted: %w", err)
-			}
-			continue
-		}
-		// Location == nil ⇔ parked: durable on the provider with accept
-		// deferred — persist the conclude state for Complete/Abort.
-		if err := b.parks.PutPark(ctx, registry.BlobPark{
-			Digest:        blob.Digest,
-			AddTask:       res.AddTask.Bytes(),
-			AcceptTask:    res.AcceptTask.Bytes(),
-			PutInvocation: res.PutInvocation,
-			Size:          in.Size,
+		return nil
+	} else if err != nil && !errors.Is(err, registry.ErrNotFound) {
+		return fmt.Errorf("lookup location: %w", err)
+	}
+	if _, err := b.parks.GetPark(ctx, blob.Digest); err == nil {
+		span.SetAttributes(attribute.String("ingot.blob.result", "already_parked"))
+		return nil // already parked by a sibling part or session
+	} else if !errors.Is(err, registry.ErrNotFound) {
+		return fmt.Errorf("lookup park: %w", err)
+	}
+
+	// The uploaded bytes are the spooled envelope; the intent records
+	// their (ciphertext) count, not the blob's plaintext span.
+	in, err := b.intents.GetIntent(ctx, digest)
+	if err != nil {
+		return fmt.Errorf("lookup intent: %w", err)
+	}
+	span.SetAttributes(attribute.Int64("ingot.blob.bytes", in.Size))
+	// The blob may be on the network from here on (see IntentUploading).
+	if err := b.intents.SetIntentState(ctx, digest, registry.IntentUploading); err != nil {
+		return fmt.Errorf("mark uploading: %w", err)
+	}
+	res, err := b.deferred.UploadBlob(ctx, space, digest, in.Size, b.spool.Path(digest), uploader.WithConclude(false))
+	if err != nil {
+		return fmt.Errorf("park blob: %w", err)
+	}
+	if res.Location != nil {
+		// The provider already held accepted bytes for this content —
+		// accept ran despite the deferred conclude (dedup), record the
+		// location like the synchronous path.
+		span.SetAttributes(attribute.String("ingot.blob.result", "accepted"))
+		if err := b.locations.PutLocation(ctx, registry.BlobLocation{
+			Space:    space,
+			Digest:   blob.Digest,
+			Provider: res.Location.Provider,
+			URL:      res.Location.URL,
+			Size:     res.Location.Size,
 		}); err != nil {
-			return fmt.Errorf("record park: %w", err)
+			return fmt.Errorf("record location: %w", err)
 		}
-		if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentParked); err != nil {
-			return fmt.Errorf("mark parked: %w", err)
+		if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentAccepted); err != nil {
+			return fmt.Errorf("mark accepted: %w", err)
 		}
+		return nil
+	}
+	// Location == nil ⇔ parked: durable on the provider with accept
+	// deferred — persist the conclude state for Complete/Abort.
+	span.SetAttributes(attribute.String("ingot.blob.result", "parked"))
+	if err := b.parks.PutPark(ctx, registry.BlobPark{
+		Digest:        blob.Digest,
+		AddTask:       res.AddTask.Bytes(),
+		AcceptTask:    res.AcceptTask.Bytes(),
+		PutInvocation: res.PutInvocation,
+		Size:          in.Size,
+	}); err != nil {
+		return fmt.Errorf("record park: %w", err)
+	}
+	if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentParked); err != nil {
+		return fmt.Errorf("mark parked: %w", err)
 	}
 	return nil
 }
@@ -1122,7 +1142,10 @@ func (b *Backend) parkBlobs(ctx context.Context, space did.DID, blobs []msbucket
 // /http/put receipt — firing /blob/accept — and record their location;
 // blobs that never parked (crash between spool and park) fall back to the
 // whole synchronous upload.
-func (b *Backend) concludeBlobs(ctx context.Context, space did.DID, blobs []msbucket.BlobRef) error {
+func (b *Backend) concludeBlobs(ctx context.Context, space did.DID, blobs []msbucket.BlobRef) (err error) {
+	ctx, span := tracing.Start(ctx, "blobs.conclude", attribute.Int("ingot.blobs.total", len(blobs)))
+	defer func() { tracing.End(span, err) }()
+
 	// Classify first: a blob is already located (accepted at ingest, usually a
 	// dedup hit), parked (the common case — UploadPart made it durable), or
 	// never parked (a crash between spool and park).
@@ -1183,6 +1206,11 @@ func (b *Backend) concludeBlobs(ctx context.Context, space did.DID, blobs []msbu
 			PutInvocation: park.PutInvocation,
 		}})
 	}
+
+	span.SetAttributes(
+		attribute.Int("ingot.blobs.concluded", len(toConclude)),
+		attribute.Int("ingot.blobs.uploaded", len(toUpload)),
+	)
 
 	// Every parked blob goes to the upload service in one exchange (the
 	// client splits only past its batch cap), so an object of thousands of

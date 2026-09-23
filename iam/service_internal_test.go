@@ -31,6 +31,9 @@ import (
 	"github.com/fil-forge/ucantone/ucan"
 	"github.com/fil-forge/ucantone/ucan/delegation"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
 
 // signedGet builds a real SigV4-signed GET as an s3.Request, signed with the
@@ -639,6 +642,32 @@ func TestFastPathTenant(t *testing.T) {
 	key, err := sigv4.DeriveKey(sr, secret)
 	require.NoError(t, err)
 
+	// authPath returns the ingot.auth.path of the one auth.authorize span rec
+	// recorded.
+	authPath := func(t *testing.T, rec *tracetest.SpanRecorder) string {
+		t.Helper()
+		var paths []string
+		for _, sp := range rec.Ended() {
+			if sp.Name() != "auth.authorize" {
+				continue
+			}
+			for _, kv := range sp.Attributes() {
+				if kv.Key == "ingot.auth.path" {
+					paths = append(paths, kv.Value.AsString())
+				}
+			}
+		}
+		require.Len(t, paths, 1)
+		return paths[0]
+	}
+	recordSpans := func(t *testing.T) *tracetest.SpanRecorder {
+		rec := tracetest.NewSpanRecorder()
+		prev := otel.GetTracerProvider()
+		otel.SetTracerProvider(sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(rec)))
+		t.Cleanup(func() { otel.SetTracerProvider(prev) })
+		return rec
+	}
+
 	drive := func(t *testing.T, s *Service) (auth.Account, any, error) {
 		t.Helper()
 		app := fiber.New()
@@ -657,6 +686,7 @@ func TestFastPathTenant(t *testing.T) {
 	}
 
 	t.Run("cached tenant is stashed without consulting Hilt", func(t *testing.T) {
+		rec := recordSpans(t)
 		s := localService(agent.DID(), resolver)
 		s.keys.Put(accessKeyID, time.Hour, s3.VerificationKey{Kind: s3.KeyKindSigV4, Data: key})
 		s.proofs.For(accessKey.DID()).PutPermissions(spaceIssuer.DID(), time.Hour, []string{"s3:GetObject"})
@@ -668,9 +698,11 @@ func TestFastPathTenant(t *testing.T) {
 		require.Equal(t, key, acct.SigningKey)
 		require.Equal(t, tenant, stashed)
 		require.Zero(t, s.authorizer.(*refusingAuthorizer).calls)
+		require.Equal(t, "local", authPath(t, rec))
 	})
 
 	t.Run("uncached tenant falls through to Hilt", func(t *testing.T) {
+		rec := recordSpans(t)
 		s := localService(agent.DID(), resolver)
 		s.keys.Put(accessKeyID, time.Hour, s3.VerificationKey{Kind: s3.KeyKindSigV4, Data: key})
 		s.proofs.For(accessKey.DID()).PutPermissions(spaceIssuer.DID(), time.Hour, []string{"s3:GetObject"})
@@ -679,5 +711,6 @@ func TestFastPathTenant(t *testing.T) {
 		_, _, err := drive(t, s)
 		require.ErrorContains(t, err, "hilt consulted")
 		require.Equal(t, 1, s.authorizer.(*refusingAuthorizer).calls)
+		require.Equal(t, "hilt", authPath(t, rec))
 	})
 }

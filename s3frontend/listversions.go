@@ -14,8 +14,10 @@ import (
 	"github.com/fil-forge/versitygw/s3err"
 	"github.com/fil-forge/versitygw/s3response"
 	"github.com/ipfs/go-cid"
+	"go.opentelemetry.io/otel/attribute"
 
 	msbucket "github.com/fil-forge/ingot/bucket"
+	"github.com/fil-forge/ingot/internal/tracing"
 	"github.com/fil-forge/ingot/mst"
 	"github.com/fil-forge/ingot/registry"
 )
@@ -95,12 +97,24 @@ func (b *Backend) ListObjectVersions(ctx context.Context, input *s3.ListObjectVe
 	var lastKey, lastVersionID string
 	full := func() bool { return count >= limit }
 
+	var walkErr error
+	scanned := 0
+	ctx, span := tracing.Start(ctx, "tree.list_versions")
+	defer func() {
+		span.SetAttributes(
+			attribute.Int("ingot.tree.keys_scanned", scanned),
+			attribute.Int("ingot.tree.versions_returned", count),
+		)
+		tracing.End(span, walkErr)
+	}()
+
 	t := mst.LoadMST(b.read, st.Space, st.Root)
 	seenPrefix := map[string]struct{}{}
-	walkErr := t.WalkLeavesFromNocache(ctx, from, func(k string, valCid cid.Cid) error {
+	walkErr = t.WalkLeavesFromNocache(ctx, from, func(k string, valCid cid.Cid) error {
 		if prefix != "" && !strings.HasPrefix(k, prefix) {
 			return mst.ErrStopWalk
 		}
+		scanned++
 
 		// Delimiter grouping subsumes every version of the rolled-up keys. A
 		// group emitted on an earlier page (its prefix ≤ the key marker) is

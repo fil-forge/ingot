@@ -55,6 +55,7 @@ import (
 	"github.com/fil-forge/hilt/pkg/sigv4"
 	"github.com/fil-forge/ingot/internal/fasthttputil"
 	"github.com/fil-forge/ingot/internal/reqscope"
+	"github.com/fil-forge/ingot/internal/tracing"
 	"github.com/fil-forge/ingot/registry"
 	s3 "github.com/fil-forge/libforge/commands/s3"
 	s3bkt "github.com/fil-forge/libforge/commands/s3/bucket"
@@ -67,6 +68,7 @@ import (
 	"github.com/fil-forge/versitygw/s3api/middlewares"
 	"github.com/fil-forge/versitygw/s3err"
 	"github.com/gofiber/fiber/v3"
+	"go.opentelemetry.io/otel/attribute"
 	"go.uber.org/zap"
 
 	hiltclient "github.com/fil-forge/hilt/pkg/client"
@@ -152,7 +154,16 @@ func New(authorizer Authorizer, proofs *KeyProofs, keys *VerificationKeyCache, t
 // invoking /s3/request/authorize on Hilt. On success the returned account
 // carries the SigV4 signing key Hilt derived for the request's credential
 // scope; versitygw verifies the request signature against it locally.
-func (s *Service) GetUserAccountForRequest(ctx fiber.Ctx, accessKeyStr string) (auth.Account, error) {
+func (s *Service) GetUserAccountForRequest(ctx fiber.Ctx, accessKeyStr string) (_ auth.Account, err error) {
+	// ingot.auth.path records which path authorized the request: "local"
+	// (the cached fast path, no Hilt call) or "hilt".
+	spanCtx, span := tracing.Start(ctx.RequestCtx(), "auth.authorize")
+	path := "hilt"
+	defer func() {
+		span.SetAttributes(attribute.String("ingot.auth.path", path))
+		tracing.End(span, err)
+	}()
+
 	// The accessKeyId is the access key's did:key identifier (the DID with
 	// the prefix stripped). Reject malformed keys before calling out.
 	accessKeyID, err := did.Parse(did.KeyPrefix + accessKeyStr)
@@ -183,21 +194,27 @@ func (s *Service) GetUserAccountForRequest(ctx fiber.Ctx, accessKeyStr string) (
 	// encrypts to its wrap key); a verified request whose tenant has fallen
 	// out of the cache takes the Hilt path, whose response refills every
 	// cache.
-	if account, ok, err := s.authorizeLocal(reqCtx, req, accessKeyStr, store); err != nil {
+	localCtx, localSpan := tracing.Start(spanCtx, "auth.local")
+	account, localOK, localErr := s.authorizeLocal(localCtx, req, accessKeyStr, store)
+	localSpan.SetAttributes(attribute.Bool("ingot.auth.local_hit", localOK))
+	tracing.End(localSpan, localErr)
+	if localErr != nil {
 		// A refusal off the cached action set: that set is Hilt's own answer
 		// for this key and bucket, so asking again would return the same
 		// refusal. Returned verbatim (not wrapped) so versitygw's renderer
 		// type-asserts it, matching how mapAuthError returns Hilt's
 		// OperationNotPermitted.
-		return auth.Account{}, err
-	} else if ok {
+		path = "local"
+		return auth.Account{}, localErr
+	} else if localOK {
 		if tenant, found := s.tenants.Get(accessKeyStr); found {
 			ctx.Locals(reqscope.TenantKey(), tenant)
+			path = "local"
 			return account, nil
 		}
 	}
 
-	ok, ctr, err := s.authorizer.AuthorizeRequest(reqCtx, req)
+	ok, ctr, err := s.authorizer.AuthorizeRequest(spanCtx, req)
 	if err != nil {
 		// A recognized Hilt auth rejection maps to the closest S3 error;
 		// anything else (transport, service, internal, or an unrecognized
@@ -224,7 +241,7 @@ func (s *Service) GetUserAccountForRequest(ctx fiber.Ctx, accessKeyStr string) (
 	// ≤24h TTL) into THIS key's store and complete their chains if needed —
 	// best-effort: the request IS authorized; a gap here only affects onward
 	// Forge invocations, which will surface it as missing retrieval authority.
-	s.cacheProofs(reqCtx, store, ctr, req, accessKeyID)
+	s.cacheProofs(spanCtx, store, ctr, req, accessKeyID)
 
 	// Cache the verification keys until Hilt's own expiry horizon: SigV4
 	// derived keys die at the next UTC midnight (credential-scope date
