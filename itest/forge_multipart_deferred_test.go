@@ -5,8 +5,6 @@ package itest
 import (
 	"bytes"
 	"context"
-	"encoding/hex"
-	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -14,9 +12,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
-	"github.com/fil-forge/libforge/digestutil"
 	"github.com/fil-forge/smelt/pkg/stack"
-	"github.com/multiformats/go-multihash"
 )
 
 // TestForgeDeferredMultipart is the deferred-accept regression gate (§7.2):
@@ -154,31 +150,14 @@ func tagged(b []byte, tag byte) []byte {
 }
 
 // partBlobDigests reads one uploaded part's stored blob digests from ingot's
-// Postgres, base58-formatted the way piri's handlers log them
-// (digestutil.Format). With encryption the stored digest names the FEE
-// envelope, minted at ingest — it cannot be predicted from the plaintext.
+// Postgres, base58-formatted the way piri's handlers log them. With
+// encryption the stored digest names the FEE envelope, minted at ingest — it
+// cannot be predicted from the plaintext.
 func partBlobDigests(t *testing.T, ctx context.Context, s *stack.Stack, uploadID string, partNumber int32) []string {
 	t.Helper()
-	q := fmt.Sprintf(
-		`SELECT encode(d, 'hex') FROM ingot.multipart_parts, unnest(blob_digests) AS d WHERE upload_id = '%s' AND part_number = %d`,
-		uploadID, partNumber)
-	out, errOut, err := s.Exec(ctx, "ingot-postgres", "psql", "-U", "ingot", "-d", "ingot", "-tAc", q)
-	if err != nil {
-		t.Fatalf("query part %d digests: %v (stderr=%s)", partNumber, err, errOut)
-	}
 	var digests []string
-	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
-		if line == "" {
-			continue
-		}
-		raw, err := hex.DecodeString(line)
-		if err != nil {
-			t.Fatalf("decode digest hex %q: %v", line, err)
-		}
-		digests = append(digests, digestutil.Format(multihash.Multihash(raw)))
-	}
-	if len(digests) == 0 {
-		t.Fatalf("no blob digests recorded for upload %s part %d", uploadID, partNumber)
+	for _, h := range partBlobDigestsHex(t, ctx, s, uploadID, partNumber) {
+		digests = append(digests, digestB58(t, h))
 	}
 	return digests
 }
