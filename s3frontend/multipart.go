@@ -928,9 +928,8 @@ func (b *Backend) AbortMultipartUpload(ctx context.Context, input *s3.AbortMulti
 // client Abort: latch (losing gracefully to a concurrent Complete/Abort),
 // record its parts' releases against the session's own space, drop the
 // session, release. Used by DeleteBucket's implicit abort of in-flight
-// uploads, which passes a context without the request's proof store (see
-// DeleteBucket). Reports whether the session's releases are recorded and its
-// row gone; false leaves the row for the sweeper, and DeleteBucket must not
+// uploads. Reports whether the session's releases are recorded and its row
+// gone; false leaves the row for the sweeper, and DeleteBucket must not
 // proceed past it.
 func (b *Backend) abortOpenSession(ctx context.Context, sess registry.MultipartSession) bool {
 	space := sess.Space
