@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ecdh"
 	"fmt"
+	"net/http"
 	"net/url"
 	"time"
 
@@ -28,9 +29,10 @@ func NewResolver(docs did.Resolver) *Resolver {
 // caching resolved documents for ttl. The cache bounds both the directory
 // round-trips on the write path and how long a rotation goes unseen. Only
 // successful resolutions are cached; the short request timeout keeps a
-// directory outage from tying up write slots.
-func NewPLCResolver(endpoint url.URL, ttl time.Duration) (*Resolver, error) {
-	docs, err := plc.NewResolver(endpoint, plc.WithTimeout(3*time.Second))
+// directory outage from tying up write slots. transport carries the directory
+// requests; nil selects http.DefaultTransport.
+func NewPLCResolver(endpoint url.URL, ttl time.Duration, transport http.RoundTripper) (*Resolver, error) {
+	docs, err := plc.NewResolver(endpoint, plc.WithTimeout(3*time.Second), plc.WithTransport(transport))
 	if err != nil {
 		return nil, fmt.Errorf("tenantkey: plc resolver: %w", err)
 	}

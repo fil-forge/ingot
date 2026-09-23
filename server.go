@@ -26,6 +26,7 @@ import (
 	"github.com/fil-forge/ingot/config"
 	"github.com/fil-forge/ingot/internal/fasthttputil"
 	"github.com/fil-forge/ingot/internal/reqscope"
+	"github.com/fil-forge/ingot/internal/tracing"
 	"github.com/fil-forge/ingot/logstore"
 	"github.com/fil-forge/ingot/regionkey"
 	"github.com/fil-forge/ingot/registry"
@@ -450,7 +451,7 @@ func buildS3API(ctx context.Context, backend *s3frontend.Backend, cfg config.Ser
 	if err != nil {
 		return nil, fmt.Errorf("ingot: loggers: %w", err)
 	}
-	loggers.S3Logger = &errorAuditLogger{logger: logger}
+	loggers.S3Logger = &auditLogger{logger: logger}
 	evSender, err := s3event.InitEventSender(&s3event.EventConfig{})
 	if err != nil {
 		return nil, fmt.Errorf("ingot: event sender: %w", err)
@@ -475,6 +476,9 @@ func buildS3API(ctx context.Context, backend *s3frontend.Backend, cfg config.Ser
 		// bucket-authority seam (Create/Delete/ListBuckets) recovers it to
 		// forward to Hilt; doing it here, ahead of auth, covers the presigned
 		// and POST-form auth paths as well as the header-signed one.
+		// The request's server span. First, so it times everything after
+		// the rate limiter: auth, routing and the backend call.
+		s3api.WithMiddleware("/", tracing.Middleware()),
 		s3api.WithMiddleware("/", func(c fiber.Ctx) error {
 			c.Locals(reqscope.RequestKey(), fasthttputil.RequestFromHTTPContext(c.RequestCtx()))
 			return c.Next()
