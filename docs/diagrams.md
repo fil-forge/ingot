@@ -937,7 +937,7 @@ sequenceDiagram
     B->>B: MST emptiness walk<br/>(ErrBucketNotEmpty, or the versioned variant)
     loop each open multipart session
         B->>U: abortOpenSession: /blob/abort parked blobs
-        Note over B,U: reqscope.WithoutProofStore masks the request store,<br/>the park-time space authority signs instead<br/>(s3:DeleteBucket delegates no blob commands)
+        Note over B,U: the request's own proofs sign the release legs<br/>(s3:DeleteBucket delegates blob.Abort + blob.Remove)
     end
     B->>L: QuiesceBucketLog (stop flushes, wait for in-flight ship)
     B->>L: ShippedSegmentDigests (each CAR + its index blob,<br/>sealed-but-unshipped over-listed, release is idempotent)
