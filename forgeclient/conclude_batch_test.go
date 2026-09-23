@@ -2,10 +2,9 @@ package forgeclient
 
 import (
 	"crypto/rand"
-	"github.com/fil-forge/libforge/digestutil"
-	ucanerrors "github.com/fil-forge/ucantone/errors"
 	"net/http"
 	"net/url"
+	"runtime/debug"
 	"sync"
 	"testing"
 
@@ -13,10 +12,13 @@ import (
 	blobcmds "github.com/fil-forge/libforge/commands/blob"
 	httpcmds "github.com/fil-forge/libforge/commands/http"
 	ucancmds "github.com/fil-forge/libforge/commands/ucan"
+	"github.com/fil-forge/libforge/digestutil"
 	receipt_client "github.com/fil-forge/libforge/receipt"
 	"github.com/fil-forge/ucantone/binding"
 	"github.com/fil-forge/ucantone/client"
 	"github.com/fil-forge/ucantone/did"
+	ucanerrors "github.com/fil-forge/ucantone/errors"
+	"github.com/fil-forge/ucantone/execution"
 	"github.com/fil-forge/ucantone/ipld/datamodel"
 	"github.com/fil-forge/ucantone/multikey"
 	ed25519signer "github.com/fil-forge/ucantone/multikey/ed25519"
@@ -196,7 +198,12 @@ func concludeFixture(t *testing.T) (*Client, *fakeSprue) {
 	node := randomIssuer(t)
 	fake := &fakeSprue{node: node, acceptFor: map[cid.Cid]cid.Cid{}, reject: map[cid.Cid]bool{}, omit: map[cid.Cid]bool{}}
 
-	srv := server.NewHTTP(service)
+	// The server recovers a handler panic into an opaque failure receipt, so
+	// without this the test would fail on a missing location instead of on
+	// the panic. The logger runs on the handler goroutine, hence Errorf.
+	srv := server.NewHTTP(service, server.WithPanicLogger(func(_ execution.Request, value any) {
+		t.Errorf("fake upload service panicked: %v\n%s", value, debug.Stack())
+	}))
 	srv.Handle(ucancmds.Conclude.Command, ucancmds.Conclude.Handler(fake.conclude))
 
 	serviceURL := mustURL(t, "http://upload.example")
