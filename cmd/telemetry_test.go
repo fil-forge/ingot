@@ -15,11 +15,17 @@ import (
 )
 
 // sampledNames starts an orphan client span, then a request span with a
-// client child, and returns the names of the spans sampler kept.
+// client child, and returns the names of the spans kept. The provider is
+// built as setupTracing builds it: a nil sampler leaves the SDK's own, which
+// NewTracerProvider reads from OTEL_TRACES_SAMPLER.
 func sampledNames(t *testing.T, sampler sdktrace.Sampler) []string {
 	t.Helper()
 	rec := tracetest.NewSpanRecorder()
-	tp := sdktrace.NewTracerProvider(sdktrace.WithSampler(sampler), sdktrace.WithSpanProcessor(rec))
+	opts := []sdktrace.TracerProviderOption{sdktrace.WithSpanProcessor(rec)}
+	if sampler != nil {
+		opts = append(opts, sdktrace.WithSampler(sampler))
+	}
+	tp := sdktrace.NewTracerProvider(opts...)
 	tracer := tp.Tracer("test")
 	ctx := context.Background()
 
@@ -47,6 +53,11 @@ func TestSamplerFromEnv(t *testing.T) {
 		{name: "ratio 1", arg: "1", want: []string{"query", "PutObject"}},
 		{name: "ratio 0", arg: "0", want: nil},
 		{name: "named ratio sampler", sampler: "parentbased_traceidratio", arg: "1", want: []string{"query", "PutObject"}},
+		// Other samplers are the SDK's, and keep background client spans.
+		{name: "always_off", sampler: "always_off", want: nil},
+		{name: "always_on", sampler: "always_on", want: []string{"orphan query", "query", "PutObject"}},
+		{name: "traceidratio 0", sampler: "traceidratio", arg: "0", want: nil},
+		{name: "traceidratio 1", sampler: "traceidratio", arg: "1", want: []string{"orphan query", "query", "PutObject"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("OTEL_TRACES_SAMPLER", tc.sampler)
@@ -68,15 +79,6 @@ func TestSamplerFromEnvRejectsBadRatio(t *testing.T) {
 		if _, err := samplerFromEnv(); err == nil {
 			t.Fatalf("expected an error for OTEL_TRACES_SAMPLER_ARG=%q", arg)
 		}
-	}
-}
-
-// Any other named sampler is the SDK's to build from the environment.
-func TestSamplerFromEnvDefersOtherSamplers(t *testing.T) {
-	t.Setenv("OTEL_TRACES_SAMPLER", "always_off")
-	sampler, err := samplerFromEnv()
-	if err != nil || sampler != nil {
-		t.Fatalf("expected no sampler, got %v, %v", sampler, err)
 	}
 }
 

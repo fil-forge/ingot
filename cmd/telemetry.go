@@ -25,8 +25,8 @@ import (
 // OTEL_* environment variables apply as usual: OTEL_EXPORTER_OTLP_HEADERS
 // authenticates to the collector, OTEL_SERVICE_NAME and
 // OTEL_RESOURCE_ATTRIBUTES label the spans, and OTEL_TRACES_SAMPLER_ARG sets
-// the fraction of requests traced (see samplerFromEnv). The returned function flushes buffered spans and stops
-// the exporter.
+// the fraction of requests traced (see samplerFromEnv). The returned function
+// flushes buffered spans and stops the exporter.
 func setupTracing(ctx context.Context, logger *zap.Logger) (func(context.Context) error, error) {
 	endpoint := os.Getenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
 	if endpoint == "" {
@@ -83,7 +83,8 @@ func setupTracing(ctx context.Context, logger *zap.Logger) (func(context.Context
 // followed, and a trace starting at ingot is sampled by requestRoots at the
 // ratio in OTEL_TRACES_SAMPLER_ARG (default 1, every request). It applies when
 // OTEL_TRACES_SAMPLER is unset or parentbased_traceidratio. Any other
-// OTEL_TRACES_SAMPLER value returns nil, leaving the SDK to build that sampler.
+// OTEL_TRACES_SAMPLER value returns nil: sdktrace.NewTracerProvider builds
+// that sampler from the environment itself when no WithSampler is given.
 func samplerFromEnv() (sdktrace.Sampler, error) {
 	switch os.Getenv("OTEL_TRACES_SAMPLER") {
 	case "", "parentbased_traceidratio":
