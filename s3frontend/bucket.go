@@ -374,14 +374,10 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 		// the only index to its blobs, and with the bucket row gone the
 		// sweeper would have no space to record them against.
 		//
-		// The session teardown runs without the request's proof store, as
-		// the implicit abort always has: the uploader then falls back to the
-		// blob authority captured at write time, the same resolution the
-		// sweepers use. The shipped-segment release and the drain below keep
-		// the request's proofs, which authorize their removes; a bucket that
-		// never saw a multipart write has no captured authority to fall
-		// back on, and masking them fails the delete.
-		relCtx := reqscope.WithoutProofStore(ctx)
+		// Every leg — the session teardown, the shipped-segment release and
+		// the drain below — runs on the request's own proofs: hilt delegates
+		// blob.Abort and blob.Remove with s3:DeleteBucket, so a bucket that
+		// never saw a write has the authority to release what it holds.
 		sessions, err := b.multipart.ListSessions(ctx, name)
 		if err != nil {
 			return fmt.Errorf("s3frontend: delete bucket: list mp sessions: %w", err)
@@ -390,9 +386,9 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 			var ok bool
 			switch s.State {
 			case registry.SessionOpen:
-				ok = b.abortOpenSession(relCtx, s)
+				ok = b.abortOpenSession(ctx, s)
 			case registry.SessionCompleted:
-				ok = b.reapCompletedSession(relCtx, s)
+				ok = b.reapCompletedSession(ctx, s)
 			case registry.SessionCompleting:
 				// Crash-stranded, or a live Complete concluding its blobs
 				// off-lock. The latch is taken here, under the bucket
@@ -400,9 +396,9 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 				// lock before committing and fails with NoSuchUpload, so
 				// it cannot commit a manifest over the blobs this releases.
 				won, err := b.multipart.LatchSession(ctx, s.UploadID, registry.SessionCompleting, registry.SessionAborting)
-				ok = err == nil && won && b.reapAbortingSession(relCtx, s)
+				ok = err == nil && won && b.reapAbortingSession(ctx, s)
 			default:
-				ok = b.reapAbortingSession(relCtx, s)
+				ok = b.reapAbortingSession(ctx, s)
 			}
 			if !ok {
 				return fmt.Errorf("s3frontend: delete bucket: multipart session %s: releases not recorded; retry", s.UploadID)
