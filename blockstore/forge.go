@@ -26,6 +26,7 @@ import (
 
 	"github.com/fil-forge/ingot/blockstore/locator"
 	"github.com/fil-forge/ingot/internal/reqscope"
+	"github.com/fil-forge/ingot/internal/tracing"
 	"github.com/fil-forge/ingot/internal/ucanexec"
 )
 
@@ -274,6 +275,9 @@ func (f *Forge) GetBlock(ctx context.Context, space did.DID, c cid.Cid) (block.B
 	if int64(len(body)) != wantLen {
 		return nil, fmt.Errorf("forge: %s short read: got %d bytes, want %d", c, len(body), wantLen)
 	}
+	// Counted here rather than in Cached, so the count holds with the block
+	// cache disabled.
+	tracing.CountRead(ctx, tracing.BlockNetwork)
 	return block.NewBlockWithCid(body, c)
 }
 

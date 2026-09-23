@@ -62,6 +62,14 @@ func (s *spanTree) requireChild(parent, child sdktrace.ReadOnlySpan) {
 	}
 }
 
+// requireInTrace fails unless sp belongs to the root span's trace.
+func (s *spanTree) requireInTrace(sp sdktrace.ReadOnlySpan) {
+	s.t.Helper()
+	if sp.SpanContext().TraceID() != s.root.TraceID() {
+		s.t.Fatalf("expected %q in the request's trace", sp.Name())
+	}
+}
+
 func requireAttr(t *testing.T, sp sdktrace.ReadOnlySpan, want attribute.KeyValue) {
 	t.Helper()
 	for _, kv := range sp.Attributes() {
@@ -140,6 +148,18 @@ func TestReadSpans(t *testing.T) {
 	walk := list.one("tree.list")
 	requireAttr(t, walk, attribute.Int("ingot.tree.keys_returned", 2))
 	requireAttr(t, walk, attribute.Int("ingot.tree.keys_scanned", 3))
+
+	// A delimiter rolls d/1 and d/2 into one common prefix, which is not a
+	// version.
+	putObj(t, b, "d/1", testBody(1<<10))
+	putObj(t, b, "d/2", testBody(1<<10))
+	versions := traceOp(t, func(ctx context.Context) {
+		delim := "/"
+		if _, err := b.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{Bucket: &bucket, Delimiter: &delim}); err != nil {
+			t.Fatalf("ListObjectVersions: %v", err)
+		}
+	})
+	requireAttr(t, versions.one("tree.list_versions"), attribute.Int("ingot.tree.versions_returned", 3))
 }
 
 func TestMultipartSpans(t *testing.T) {
@@ -147,12 +167,15 @@ func TestMultipartSpans(t *testing.T) {
 	key := "mp"
 	uploadID := mpCreate(t, b, key, "", "")
 
+	bucket := "bk"
 	var completed []types.CompletedPart
-	parts := traceOp(t, func(context.Context) {
+	parts := traceOp(t, func(ctx context.Context) {
 		for i := int32(1); i <= 2; i++ {
 			n := i
 			body := append(testBody(int(backend.MinPartSize)), byte(i))
-			out, err := mpUploadPart(t, b, key, uploadID, n, body, nil)
+			out, err := b.UploadPart(ctx, &s3.UploadPartInput{
+				Bucket: &bucket, Key: &key, UploadId: &uploadID, PartNumber: &n, Body: bytes.NewReader(body),
+			})
 			if err != nil {
 				t.Fatalf("UploadPart %d: %v", n, err)
 			}
@@ -162,6 +185,7 @@ func TestMultipartSpans(t *testing.T) {
 	parked := 0
 	for _, sp := range parts.spans {
 		if sp.Name() == "blob.park" {
+			parts.requireInTrace(sp)
 			requireAttr(t, sp, attribute.String("ingot.blob.result", "parked"))
 			parked++
 		}
@@ -170,12 +194,18 @@ func TestMultipartSpans(t *testing.T) {
 		t.Fatalf("expected a blob.park span per part, got %d", parked)
 	}
 
-	complete := traceOp(t, func(context.Context) {
-		if _, err := mpComplete(t, b, key, uploadID, completed, nil); err != nil {
+	complete := traceOp(t, func(ctx context.Context) {
+		if _, _, err := b.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+			Bucket: &bucket, Key: &key, UploadId: &uploadID,
+			MultipartUpload: &types.CompletedMultipartUpload{Parts: completed},
+		}); err != nil {
 			t.Fatalf("CompleteMultipartUpload: %v", err)
 		}
 	})
 	conclude := complete.one("blobs.conclude")
+	if conclude.Parent().SpanID() != complete.root.SpanID() {
+		t.Fatalf("expected blobs.conclude under the request span")
+	}
 	requireAttr(t, conclude, attribute.Int("ingot.blobs.total", 2))
 	requireAttr(t, conclude, attribute.Int("ingot.blobs.concluded", 2))
 	requireAttr(t, conclude, attribute.Int("ingot.blobs.uploaded", 0))

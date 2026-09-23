@@ -95,7 +95,6 @@ func (c *Cached) GetBlock(ctx context.Context, space did.DID, k cid.Cid) (block.
 	if err != nil {
 		return nil, err
 	}
-	tracing.CountRead(ctx, tracing.BlockNetwork)
 	c.add(key, blk)
 	return blk, nil
 }

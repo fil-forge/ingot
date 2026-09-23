@@ -103,7 +103,7 @@ func (b *Backend) ListObjectVersions(ctx context.Context, input *s3.ListObjectVe
 	defer func() {
 		span.SetAttributes(
 			attribute.Int("ingot.tree.keys_scanned", scanned),
-			attribute.Int("ingot.tree.versions_returned", count),
+			attribute.Int("ingot.tree.versions_returned", len(res.Versions)+len(res.DeleteMarkers)),
 		)
 		tracing.End(span, walkErr)
 	}()
