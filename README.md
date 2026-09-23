@@ -124,6 +124,16 @@ consulted. The deployment context is the
 the S3 facade runs **at the edge**, co-located with a provider's piri or as a
 standalone client — not inside the central upload-service.
 
+`serve` exports OpenTelemetry traces over OTLP/HTTP when
+`OTEL_EXPORTER_OTLP_ENDPOINT` names a collector; with no endpoint, tracing is
+off. Each S3 request is a trace named for its S3 action, with the hilt, sprue,
+piri and Postgres calls it makes as child spans. The other standard `OTEL_*`
+environment variables apply: `OTEL_EXPORTER_OTLP_HEADERS` authenticates to the
+collector, and `OTEL_TRACES_SAMPLER_ARG` sets the fraction of requests traced
+(`0.01` traces 1%; the default traces every request). As a library, ingot
+records spans on the global tracer provider, so an embedding host decides
+where they go.
+
 ## Build & test
 
 ```bash

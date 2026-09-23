@@ -143,6 +143,13 @@ Internal:
   **`testing/`** — CAR codec, goose SQL (`ingot` schema), request-scoped ctx
   keys, generic `Execute[T]`, fasthttp adapters, CORS, the version stamp, the
   cborgen driver, S3-client test glue.
+- **`internal/tracing`** — OpenTelemetry: the per-request server span
+  middleware and the instrumented HTTP client every outbound caller is built
+  with. The daemon's exporter setup is `cmd/telemetry.go`. versitygw passes
+  the backend the bare `*fasthttp.RequestCtx` as its context, so the
+  middleware stores the span as a request user value under the trace API's
+  own key; `trace.SpanFromContext` on that context then finds it. A new
+  outbound HTTP client should use `tracing.NewHTTPClient()`.
 
 ## Interface seams
 

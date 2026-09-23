@@ -52,6 +52,7 @@ import (
 	"github.com/fil-forge/libforge/identity"
 	"github.com/fil-forge/libforge/receipt"
 	ucanlib "github.com/fil-forge/libforge/ucan"
+	ucanclient "github.com/fil-forge/ucantone/client"
 	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/versitygw/auth"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -65,6 +66,7 @@ import (
 	"github.com/fil-forge/ingot/config"
 	"github.com/fil-forge/ingot/forgeclient"
 	"github.com/fil-forge/ingot/iam"
+	"github.com/fil-forge/ingot/internal/tracing"
 	"github.com/fil-forge/ingot/logstore"
 	"github.com/fil-forge/ingot/migrations"
 	"github.com/fil-forge/ingot/regionkey"
@@ -255,6 +257,7 @@ func provideTokenStore(cfg config.Config) (tokenstore.Store, error) {
 
 // provideForgeClient builds the edge-client to the upload service (sprue):
 // the agent identity issues invocations, the token store supplies proofs.
+// Invocations and receipt polls go through the tracing HTTP client.
 func provideForgeClient(cfg config.Config, id identity.Identity, store tokenstore.Store, logger *zap.Logger) (*forgeclient.Client, error) {
 	sprueURL, err := url.Parse(cfg.UploadServiceURL)
 	if err != nil {
@@ -264,18 +267,20 @@ func provideForgeClient(cfg config.Config, id identity.Identity, store tokenstor
 	if err != nil {
 		return nil, fmt.Errorf("ingot: parse upload_service_did: %w", err)
 	}
-	opts := []forgeclient.Option{
-		forgeclient.WithTokenStore(store),
-		forgeclient.WithLogger(logger),
-	}
+	rcptURL := sprueURL.JoinPath("/receipt/")
 	if cfg.UploadReceiptsURL != "" {
-		rcptURL, err := url.Parse(cfg.UploadReceiptsURL)
+		rcptURL, err = url.Parse(cfg.UploadReceiptsURL)
 		if err != nil {
 			return nil, fmt.Errorf("ingot: parse upload_receipts_url: %w", err)
 		}
-		opts = append(opts, forgeclient.WithReceiptsClient(receipt.NewClient(rcptURL)))
 	}
-	return forgeclient.New(id, sprueDID, *sprueURL, opts...)
+	httpClient := tracing.NewHTTPClient()
+	return forgeclient.New(id, sprueDID, *sprueURL,
+		forgeclient.WithTokenStore(store),
+		forgeclient.WithLogger(logger),
+		forgeclient.WithUCANClientOptions(ucanclient.WithHTTPClient(httpClient)),
+		forgeclient.WithReceiptsClient(receipt.NewClient(rcptURL, receipt.WithHTTPClient(httpClient))),
+	)
 }
 
 // provideAuthServiceClient builds the UCAN RPC client to the Hilt tenant-
@@ -307,7 +312,8 @@ func provideAuthServiceClient(cfg config.Config, id identity.Identity, logger *z
 		return nil, fmt.Errorf("ingot: auth_service_proofs: the container holds no delegations")
 	}
 	proofs := ucanlib.NewContainerProofStore(ct)
-	return hiltclient.New(authServiceDID, *authServiceURL, id, hiltclient.WithBaseProofs(proofs), hiltclient.WithLogger(logger))
+	return hiltclient.New(authServiceDID, *authServiceURL, id, hiltclient.WithBaseProofs(proofs), hiltclient.WithLogger(logger),
+		hiltclient.WithHTTPClient(tracing.NewHTTPClient()))
 }
 
 // provideRegionKeyProvider builds the configured region CEK wrap provider
@@ -375,7 +381,7 @@ func provideTenantKeySource(cfg config.Config) (tenantkey.Source, error) {
 	if err != nil {
 		return nil, fmt.Errorf("ingot: tenantkey.cache_ttl: %w", err)
 	}
-	res, err := tenantkey.NewPLCResolver(*endpoint, ttl)
+	res, err := tenantkey.NewPLCResolver(*endpoint, ttl, tracing.NewTransport())
 	if err != nil {
 		return nil, fmt.Errorf("ingot: tenantkey: %w", err)
 	}
@@ -530,9 +536,10 @@ func provideMigrationHook(pool *pgxpool.Pool, logger *zap.Logger) migrationHookO
 // reads it from there, so this reader takes no proof dependency.
 func provideForgeReader(cfg config.Config, id identity.Identity, locations registry.LocationStore, inclusions registry.InclusionStore, logger *zap.Logger) (blockstore.BlockReader, error) {
 	forge, err := blockstore.NewForge(blockstore.ForgeConfig{
-		Locator: registry.NewLocalLocator(locations, inclusions),
-		Signer:  id,
-		Logger:  logger,
+		Locator:    registry.NewLocalLocator(locations, inclusions),
+		Signer:     id,
+		HTTPClient: tracing.NewHTTPClient(),
+		Logger:     logger,
 	})
 	if err != nil {
 		return nil, err
@@ -556,7 +563,7 @@ type uploaderResult struct {
 // The same client both ships sealed catalog shards (Uploader) and uploads
 // individual body blobs by digest (BodyUploader).
 func provideUploader(c *forgeclient.Client, logger *zap.Logger) (uploaderResult, error) {
-	f, err := uploader.NewForge(uploader.ForgeConfig{Client: c, Logger: logger})
+	f, err := uploader.NewForge(uploader.ForgeConfig{Client: c, PutClient: tracing.NewHTTPClient(), Logger: logger})
 	if err != nil {
 		return uploaderResult{}, err
 	}

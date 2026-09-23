@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/spf13/cobra"
 	"go.uber.org/fx"
@@ -33,6 +34,18 @@ func newServeCmd() *cobra.Command {
 				return err
 			}
 			defer func() { _ = logger.Sync() }()
+
+			shutdownTracing, err := setupTracing(cmd.Context(), logger)
+			if err != nil {
+				return err
+			}
+			defer func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				if err := shutdownTracing(ctx); err != nil {
+					logger.Warn("flushing traces", zap.Error(err))
+				}
+			}()
 
 			if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
 				return fmt.Errorf("creating data dir %s: %w", cfg.DataDir, err)

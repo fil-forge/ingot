@@ -18,7 +18,7 @@ import (
 func logAuditError(t *testing.T, err error) []observer.LoggedEntry {
 	t.Helper()
 	core, recorded := observer.New(zapcore.ErrorLevel)
-	audit := &errorAuditLogger{logger: zap.New(core)}
+	audit := &auditLogger{logger: zap.New(core)}
 
 	app := fiber.New()
 	app.Get("/bucket/key", func(c fiber.Ctx) error {
@@ -31,7 +31,7 @@ func logAuditError(t *testing.T, err error) []observer.LoggedEntry {
 	return recorded.All()
 }
 
-func TestErrorAuditLogger_LogsUnexpectedError(t *testing.T) {
+func TestAuditLogger_LogsUnexpectedError(t *testing.T) {
 	entries := logAuditError(t, errors.New("hilt: authorize: connection refused"))
 	if len(entries) != 1 {
 		t.Fatalf("expected 1 log entry, got %d: %v", len(entries), entries)
@@ -43,14 +43,14 @@ func TestErrorAuditLogger_LogsUnexpectedError(t *testing.T) {
 
 // The S3 error table is an expected outcome the response already carries, so
 // it must not reach the log.
-func TestErrorAuditLogger_SkipsS3Errors(t *testing.T) {
+func TestAuditLogger_SkipsS3Errors(t *testing.T) {
 	entries := logAuditError(t, s3err.GetAPIError(s3err.ErrNoSuchKey))
 	if len(entries) != 0 {
 		t.Fatalf("expected no log entries, got %v", entries)
 	}
 }
 
-func TestErrorAuditLogger_SkipsSuccess(t *testing.T) {
+func TestAuditLogger_SkipsSuccess(t *testing.T) {
 	entries := logAuditError(t, nil)
 	if len(entries) != 0 {
 		t.Fatalf("expected no log entries, got %v", entries)
