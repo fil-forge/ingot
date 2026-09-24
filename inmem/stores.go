@@ -462,6 +462,17 @@ func (m *MemStore) PutPart(_ context.Context, p registry.MultipartPart) error {
 	return nil
 }
 
+func (m *MemStore) GetPart(_ context.Context, uploadID string, partNumber int) (*registry.MultipartPart, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	p, ok := m.parts[uploadID][partNumber]
+	if !ok {
+		return nil, registry.ErrNotFound
+	}
+	out := clonePart(p)
+	return &out, nil
+}
+
 func (m *MemStore) ListParts(_ context.Context, uploadID string) ([]registry.MultipartPart, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

@@ -572,6 +572,15 @@ func TestPostgresStores_Live(t *testing.T) {
 			t.Fatalf("ListParts = %+v, err %v", parts, err)
 		}
 
+		// GetPart reads one part by (upload_id, part_number) — the write
+		// path's supersede lookup, which must not list the session.
+		if got, err := r.GetPart(ctx, id, 1); err != nil || got == nil || got.PartNumber != 1 || len(got.BlobDigests) != 2 {
+			t.Fatalf("GetPart 1 = %+v, err %v", got, err)
+		}
+		if got, err := r.GetPart(ctx, id, 9); !errors.Is(err, registry.ErrNotFound) {
+			t.Fatalf("GetPart of an unwritten part = %+v, err %v, want ErrNotFound", got, err)
+		}
+
 		// single-winner latch
 		won, err := r.LatchSession(ctx, id, registry.SessionOpen, registry.SessionCompleting)
 		if err != nil || !won {

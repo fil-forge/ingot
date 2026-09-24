@@ -772,6 +772,22 @@ func (r *Postgres) PutPart(ctx context.Context, p MultipartPart) error {
 	return nil
 }
 
+func (r *Postgres) GetPart(ctx context.Context, uploadID string, partNumber int) (*MultipartPart, error) {
+	p := MultipartPart{UploadID: uploadID}
+	err := r.pool.QueryRow(ctx,
+		`SELECT part_number, etag_md5, size, checksum, blob_digests, state, created_at
+		 FROM ingot.multipart_parts WHERE upload_id = $1 AND part_number = $2`,
+		uploadID, partNumber,
+	).Scan(&p.PartNumber, &p.ETagMD5, &p.Size, &p.Checksum, &p.BlobDigests, &p.State, &p.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("registry: get part: %w", err)
+	}
+	return &p, nil
+}
+
 func (r *Postgres) ListParts(ctx context.Context, uploadID string) ([]MultipartPart, error) {
 	rows, err := r.pool.Query(ctx,
 		`SELECT part_number, etag_md5, size, checksum, blob_digests, state, created_at

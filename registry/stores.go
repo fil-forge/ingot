@@ -406,6 +406,11 @@ type MultipartStore interface {
 	// a teardown has taken the session, and a teardown's part listing sees
 	// every part that did land.
 	PutPart(ctx context.Context, p MultipartPart) error
+	// GetPart returns one part of uploadID, or ErrNotFound. The part write
+	// path reads only the part it is about to supersede, so an upload costs
+	// one index probe per part rather than a listing that grows with every
+	// part already uploaded.
+	GetPart(ctx context.Context, uploadID string, partNumber int) (*MultipartPart, error)
 	ListParts(ctx context.Context, uploadID string) ([]MultipartPart, error)
 	// ListSessions returns bucket's sessions ordered by (object_key, created_at,
 	// upload_id) — the S3 ListMultipartUploads presentation order. Filtering
