@@ -17,10 +17,14 @@ import (
 // violation (matches the literal used elsewhere in sprue's stores).
 const uniqueViolation = "23505"
 
-// pgxQuerier is the Exec surface shared by *pgxpool.Pool and pgx.Tx, so a
-// statement can run standalone or inside a caller's transaction.
+// pgxQuerier is the surface shared by *pgxpool.Pool and pgx.Tx, so a statement
+// can run standalone or inside a caller's transaction. Everything a statement
+// needs has to be here: reaching back to the pool from inside a transaction
+// would hold one connection while waiting for another, which deadlocks on a
+// single-connection pool.
 type pgxQuerier interface {
 	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
 
 // Postgres is a *pgxpool.Pool-backed Registry (and, via its sibling
@@ -179,7 +183,16 @@ func (r *Postgres) casRoot(ctx context.Context, q pgxQuerier, name string, expec
 	}
 	if tag.RowsAffected() == 0 {
 		// Either the bucket doesn't exist or the expected root didn't match.
-		if _, gerr := r.Get(ctx, name); errors.Is(gerr, ErrNotFound) {
+		// Asked through the same querier: from inside CASRootEnqueue's
+		// transaction this would otherwise want a second pooled connection
+		// while holding one, which deadlocks a single-connection pool.
+		var exists bool
+		if gerr := q.QueryRow(ctx,
+			`SELECT EXISTS (SELECT 1 FROM ingot.buckets WHERE name = $1)`, name,
+		).Scan(&exists); gerr != nil {
+			return fmt.Errorf("registry: cas %q: resolving conflict: %w", name, gerr)
+		}
+		if !exists {
 			return ErrNotFound
 		}
 		return ErrConflict
