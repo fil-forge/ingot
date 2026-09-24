@@ -188,6 +188,28 @@ whose digest a part of an in-flight session still references waits: that
 session's Complete turns the reference into a claim, which makes the record
 stale, and its abort records a release of its own.
 
+## Spool eviction
+
+The spool keeps a running byte count of its blob files. With
+`spool_max_bytes` set, a sweeper checks it every 30 seconds and, when usage
+is over the budget, removes the files of blobs the provider already holds,
+oldest state change first, until usage is at 90% of the budget. A blob
+qualifies only through a row that proves the provider has it: a
+`blob_locations` row for an `accepted` or `published` intent, a `blob_parks`
+row for a `parked` one. The state alone does not qualify a blob, because a
+single PUT marks it accepted before recording its location. `spooled` and
+`uploading` files are the only copy and never qualify. The sweeper first
+honours two windows, `spool_min_residency` (10 minutes after the last state
+change, so a client reading back what it just wrote reads from disk) and
+`spool_read_retention` (an hour after a read from the spool, tracked in
+memory); if usage is still over budget it evicts inside them too, since a
+full disk fails every write. Eviction removes the file first, then sets
+`upload_intents.evicted_at`; the row and its state stay, because a release
+and Complete read them. A read of an evicted blob misses the spool and goes
+to the network tier. Hourly, the sweeper also deletes `.tmp-*` files and
+blob files with no intent row older than `spool_orphan_age` (24 hours), and
+resets the byte count from the directory scan.
+
 ## Read path
 
 A GET resolves the bucket root (registry), walks the MST to the manifest
@@ -265,9 +287,11 @@ draws the chains and the stores.
 
 - **No HA.** A bucket is single-writer through an in-process lock; nothing
   coordinates across instances beyond the root CAS.
-- **The spool is unbounded** (#48): nothing evicts local body blobs, and
-  DeleteObject releases network-side only, so local disk grows with every
-  body byte written.
+- **The spool is only partly bounded** (#48): with `spool_max_bytes` set,
+  the spool sweeper evicts blobs the provider holds down to the budget, but
+  a deleted object's envelope stays on disk (the release keeps it as the
+  insurance copy, pending a decision on whether it must), and parked
+  multipart parts stay until Complete.
 - **Spool crash recovery is not built**: reconciling `upload_intents`
   against `blob_refs` after a crash between commit and reconcile is a later
   phase; the window leaks rather than loses referenced data.

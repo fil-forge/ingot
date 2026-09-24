@@ -27,6 +27,7 @@ package s3frontend
 import (
 	"context"
 	"encoding/xml"
+	"sync"
 	"time"
 
 	"github.com/fil-forge/versitygw/auth"
@@ -70,6 +71,14 @@ type Backend struct {
 	// prior catalog root get at least this long to finish their prefetch).
 	pendingReleases registry.PendingReleaseStore
 	releaseGrace    time.Duration
+	// Spool eviction knobs (see Deps). spoolSweepMu serialises SweepSpool;
+	// lastOrphanPass is when its orphan pass last ran.
+	spoolMaxBytes      int64
+	spoolMinResidency  time.Duration
+	spoolReadRetention time.Duration
+	spoolOrphanAge     time.Duration
+	spoolSweepMu       sync.Mutex
+	lastOrphanPass     time.Time
 	// regionKeys unwraps region-wrapped CEKs for the decrypting read path.
 	regionKeys regionkey.Provider
 	// tenantKeys yields the tenant wrap key each write encrypts to (the FEE
@@ -145,6 +154,24 @@ type Deps struct {
 	// before construction; tests use zero so a manual sweep drains).
 	ReleaseGrace time.Duration
 
+	// SpoolMaxBytes is the byte budget for the spool's blob files, enforced
+	// by SweepSpool. Zero turns the budget and forced passes off: eviction
+	// needs a network read tier to serve evicted blobs, which the in-memory
+	// fakes do not have.
+	SpoolMaxBytes int64
+	// SpoolMinResidency is how long after its last state change (for a
+	// committed blob, its commit) the budget pass leaves a blob alone, so a
+	// client reading back what it just wrote reads from local disk. Zero
+	// turns it off.
+	SpoolMinResidency time.Duration
+	// SpoolReadRetention is how long after a read from the spool the budget
+	// pass leaves a blob alone, so objects read repeatedly stay local. Zero
+	// turns it off.
+	SpoolReadRetention time.Duration
+	// SpoolOrphanAge is the age at which SweepSpool deletes a .tmp-* file or
+	// a blob file with no intent row. Zero → DefaultSpoolOrphanAge.
+	SpoolOrphanAge time.Duration
+
 	// MaxBlobSize is the coarse-split blob ceiling (0 → bucket default).
 	MaxBlobSize int64
 
@@ -178,6 +205,10 @@ func New(d Deps) *Backend {
 			corsDoc = doc
 		}
 	}
+	spoolOrphanAge := d.SpoolOrphanAge
+	if spoolOrphanAge <= 0 {
+		spoolOrphanAge = DefaultSpoolOrphanAge
+	}
 	return &Backend{
 		authority:       d.Authority,
 		read:            d.Reads,
@@ -199,9 +230,15 @@ func New(d Deps) *Backend {
 		tenantKeys:      d.TenantKeys,
 		pendingReleases: d.PendingReleases,
 		releaseGrace:    d.ReleaseGrace,
-		logger:          logger,
-		maxBlobSize:     d.MaxBlobSize,
-		cors:            corsDoc,
+
+		spoolMaxBytes:      d.SpoolMaxBytes,
+		spoolMinResidency:  d.SpoolMinResidency,
+		spoolReadRetention: d.SpoolReadRetention,
+		spoolOrphanAge:     spoolOrphanAge,
+
+		logger:      logger,
+		maxBlobSize: d.MaxBlobSize,
+		cors:        corsDoc,
 	}
 }
 
