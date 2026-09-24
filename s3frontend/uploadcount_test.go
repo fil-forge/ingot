@@ -751,3 +751,29 @@ func TestRenewedAuthorityRescuesAQueuedChange(t *testing.T) {
 	require.Positive(t, reg.renewals)
 	require.Positive(t, counting.refreshes, "the renewed chain is written back to the row")
 }
+
+// TestDeadLetteredChangeHoldsItsKeysLaterRowsInTheSameSweep: a key contributes
+// several rows to one batch, and stopping on one of them stops the key. A later
+// row let through because only its predecessor failed would replay the key out
+// of order.
+func TestDeadLetteredChangeHoldsItsKeysLaterRowsInTheSameSweep(t *testing.T) {
+	b, _ := newCountingBackend(t)
+	reg := &recordingRegistrar{}
+	b.registrar = reg
+
+	// Two versions of one key, so the sweep claims two additions for it at
+	// once, and a retraction behind them.
+	putObjV(t, b, "a", []byte("first"))
+	putObjV(t, b, "a", []byte("second"))
+
+	// The space loses its authority before the sweep runs, so the first
+	// addition stops and the rest of the key must stop with it.
+	reg.spendAuthority()
+	n, err := b.SweepUploadRegistrations(context.Background())
+	require.NoError(t, err)
+	require.Zero(t, n)
+
+	added, retracted := reg.snapshot()
+	require.Empty(t, added, "no row for the key goes out once one of them has stopped")
+	require.Empty(t, retracted)
+}

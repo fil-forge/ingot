@@ -128,16 +128,22 @@ func (b *Backend) applyRegistrations(
 	var deferred []registry.UploadRegistration
 	var deadLettered []int64
 	for _, reg := range regs {
-		if held[registrationKey(reg)] {
-			// Its predecessor failed this sweep; try again once that has
-			// landed, with the same delay so the order is kept.
+		// held carries the keys an earlier phase stopped on; stalled carries
+		// the ones this loop has already stopped on. Both hold a key whole: a
+		// key contributes several rows to one batch, and letting a later one
+		// through because only its predecessor failed would replay the key out
+		// of order.
+		key := registrationKey(reg)
+		if held[key] || stalled[key] {
+			// Its predecessor failed; try again once that has landed, with the
+			// same delay so the order is kept.
 			deferred = append(deferred, reg)
-			stalled[registrationKey(reg)] = true
+			stalled[key] = true
 			continue
 		}
 		proofs, renewed, err := b.registrar.PrepareAuthority(ctx, reg.Space, registrationCommand(reg.Op), reg.Proofs)
 		if err != nil {
-			stalled[registrationKey(reg)] = true
+			stalled[key] = true
 			// Its authority is spent and the space has none to lend. Retrying
 			// costs nothing for a while, in case the space is written again;
 			// past that the row is dead-lettered, because a change that can

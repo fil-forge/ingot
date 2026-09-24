@@ -768,3 +768,102 @@ func TestPostgresStores_Live(t *testing.T) {
 		}
 	})
 }
+
+// TestCASRootEnqueueOnASingleConnection proves the enqueueing CAS never needs
+// two pooled connections at once. Resolving a conflict or a missing bucket by
+// reading through the pool, while the transaction already holds a connection,
+// deadlocks outright on a single-connection pool and deadlocks any pool once
+// enough concurrent commits exhaust it.
+//
+//	INGOT_TEST_DSN=postgres://... GOWORK=off go test ./registry/ -run SingleConnection -v
+func TestCASRootEnqueueOnASingleConnection(t *testing.T) {
+	dsn := os.Getenv("INGOT_TEST_DSN")
+	if dsn == "" {
+		t.Skip("set INGOT_TEST_DSN to run the live Postgres store test")
+	}
+	ctx := context.Background()
+
+	// Migrations and the fixture run on an ordinary pool; only the calls under
+	// test get the single connection, so a hang can only be them.
+	setupPool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("setup pool: %v", err)
+	}
+	defer setupPool.Close()
+	if err := migrations.Up(ctx, setupPool, zaptest.NewLogger(t)); err != nil {
+		t.Fatalf("migrations: %v", err)
+	}
+
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		t.Fatalf("parse dsn: %v", err)
+	}
+	cfg.MaxConns, cfg.MinConns = 1, 1
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatalf("pool: %v", err)
+	}
+	defer pool.Close()
+	reg := registry.NewPostgres(pool)
+	setup := registry.NewPostgres(setupPool)
+
+	space := testutil.RandomDID(t)
+	regs := []registry.UploadRegistration{{
+		Bucket: "cas-single-conn", ObjectKey: "k", Space: space,
+		Root: liveCid(t, "root"), Op: registry.UploadRegistrationAdd, Proofs: []byte("proofs"),
+	}}
+
+	// A deadlock hangs rather than fails, so every call below is bounded.
+	bounded := func(name string, fn func(context.Context) error) error {
+		c, cancel := context.WithTimeout(ctx, 20*time.Second)
+		defer cancel()
+		err := fn(c)
+		if c.Err() != nil {
+			t.Fatalf("%s: needed a second pooled connection: %v", name, c.Err())
+		}
+		return err
+	}
+
+	// A bucket that does not exist: the conflict path has to say so without
+	// reaching back to the pool.
+	err = bounded("missing bucket", func(c context.Context) error {
+		return reg.CASRootEnqueue(c, "cas-single-conn", cid.Undef, liveCid(t, "next"), regs)
+	})
+	if !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("missing bucket: got %v, want ErrNotFound", err)
+	}
+
+	if err := setup.Create(ctx, "cas-single-conn", space, registry.CreateState{Tenant: testutil.RandomDID(t)}); err != nil {
+		t.Fatalf("create bucket: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = setup.Delete(context.Background(), "cas-single-conn")
+		// The rows outlive the bucket row, and this suite runs against a
+		// database that persists between runs.
+		_, _ = setup.DeleteUploadRegistrationsBySpace(context.Background(), space)
+	})
+
+	// A root that does not match: the same path, reporting a conflict.
+	err = bounded("stale root", func(c context.Context) error {
+		return reg.CASRootEnqueue(c, "cas-single-conn", liveCid(t, "stale"), liveCid(t, "next"), regs)
+	})
+	if !errors.Is(err, registry.ErrConflict) {
+		t.Fatalf("stale root: got %v, want ErrConflict", err)
+	}
+
+	// And the happy path still commits both the root and its rows.
+	if err := bounded("commit", func(c context.Context) error {
+		return reg.CASRootEnqueue(c, "cas-single-conn", cid.Undef, liveCid(t, "next"), regs)
+	}); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	// Scoped to this run's space: the suite's database persists, so a global
+	// count would depend on what ran before.
+	queued, err := setup.ListUploadRegistrationsBySpace(ctx, space)
+	if err != nil {
+		t.Fatalf("list by space: %v", err)
+	}
+	if len(queued) != 1 {
+		t.Fatalf("queued %d registrations for the space, want 1", len(queued))
+	}
+}
