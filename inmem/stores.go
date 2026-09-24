@@ -671,6 +671,22 @@ func (m *MemStore) ListUploadRegistrationsBySpace(_ context.Context, space did.D
 	return out, nil
 }
 
+func (m *MemStore) DeleteUploadRegistrationsBySpace(_ context.Context, space did.DID) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	kept := m.uploadRegs[:0]
+	var dropped int64
+	for _, reg := range m.uploadRegs {
+		if reg.Space == space {
+			dropped++
+			continue
+		}
+		kept = append(kept, reg)
+	}
+	m.uploadRegs = kept
+	return dropped, nil
+}
+
 func (m *MemStore) RefreshUploadRegistrationProofs(_ context.Context, seq int64, proofs []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

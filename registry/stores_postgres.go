@@ -1024,6 +1024,15 @@ func (r *Postgres) RescheduleUploadRegistrations(ctx context.Context, seqs []int
 	return nil
 }
 
+func (r *Postgres) DeleteUploadRegistrationsBySpace(ctx context.Context, space did.DID) (int64, error) {
+	tag, err := r.pool.Exec(ctx,
+		`DELETE FROM ingot.upload_registrations WHERE space = $1`, space.String())
+	if err != nil {
+		return 0, fmt.Errorf("registry: delete upload registrations for space %s: %w", space, err)
+	}
+	return tag.RowsAffected(), nil
+}
+
 func (r *Postgres) RefreshUploadRegistrationProofs(ctx context.Context, seq int64, proofs []byte) error {
 	if _, err := r.pool.Exec(ctx,
 		`UPDATE ingot.upload_registrations SET proofs = $2 WHERE seq = $1`, seq, proofs); err != nil {

@@ -143,7 +143,16 @@ func (b *Backend) applyRegistrations(
 			// past that the row is dead-lettered, because a change that can
 			// never be made must not hold back the ones behind it for good.
 			if reg.Attempts+1 >= uploadRegistrationDeadLetterAfter {
-				b.logger.Error("registration sweep: dead-lettering a change whose authority cannot be renewed; object count will be short by one",
+				// Which way the count is wrong depends on the op, and the two
+				// are not the same mistake: an addition never made leaves the
+				// object uncounted, while a retraction never made leaves a
+				// version counted after it is gone. Say which, so the number
+				// can be reconciled from the row rather than guessed at.
+				effect := "object count will be short by one"
+				if reg.Op == registry.UploadRegistrationRemove {
+					effect = "object count will stay high by one, the retired version still counted"
+				}
+				b.logger.Error("registration sweep: dead-lettering a change whose authority cannot be renewed; "+effect,
 					zap.String("bucket", reg.Bucket),
 					zap.String("key", reg.ObjectKey),
 					zap.String("op", string(reg.Op)),
@@ -174,6 +183,9 @@ func (b *Backend) applyRegistrations(
 		batch = append(batch, uploader.QueuedUpload{Space: reg.Space, Root: reg.Root, Proofs: proofs})
 		sent = append(sent, reg)
 	}
+	// The row is kept, not dropped: it carries everything a replay needs — the
+	// space, the root and which way the change went — so a dead-lettered
+	// retraction stays reconcilable rather than being lost.
 	if err := b.uploadRegs.DeadLetterUploadRegistrations(ctx, deadLettered, "authority expired and could not be renewed"); err != nil {
 		return 0, stalled, fmt.Errorf("s3frontend: dead-letter upload registrations: %w", err)
 	}
