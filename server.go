@@ -136,6 +136,7 @@ type Server struct {
 	api         *s3api.S3ApiServer
 	sweepStop   chan struct{}
 	releaseStop chan struct{}
+	spoolStop   chan struct{}
 }
 
 // New wires a ServerDeps + ServerConfig into a runnable Server. The
@@ -200,9 +201,15 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		TenantKeys:      deps.TenantKeys,
 		PendingReleases: deps.PendingReleases,
 		ReleaseGrace:    cfg.ReleaseGrace,
-		MaxBlobSize:     cfg.MaxBlobSize,
-		CORS:            cfg.CORSConfig,
-		Logger:          logger,
+
+		SpoolMaxBytes:      cfg.SpoolMaxBytes,
+		SpoolMinResidency:  cfg.SpoolMinResidency,
+		SpoolReadRetention: cfg.SpoolReadRetention,
+		SpoolOrphanAge:     cfg.SpoolOrphanAge,
+
+		MaxBlobSize: cfg.MaxBlobSize,
+		CORS:        cfg.CORSConfig,
+		Logger:      logger,
 	})
 
 	api, err := buildS3API(ctx, backend, cfg, deps.IAM, deps.Identity, logger)
@@ -242,6 +249,7 @@ func (s *Server) Start(ctx context.Context) error {
 	}()
 	s.startMultipartSweeper()
 	s.startReleaseSweeper()
+	s.startSpoolSweeper()
 	return nil
 }
 
@@ -318,6 +326,45 @@ func (s *Server) startReleaseSweeper() {
 	}()
 }
 
+// spoolSweepInterval is how often the spool sweeper runs. The budget's 10%
+// headroom must exceed ingest rate × this interval.
+const spoolSweepInterval = 30 * time.Second
+
+// startSpoolSweeper spawns the spool sweeper: every spoolSweepInterval it
+// evicts provider-held blobs down to SpoolMaxBytes (when set), and hourly it
+// deletes orphan files (see Backend.SweepSpool).
+func (s *Server) startSpoolSweeper() {
+	s.spoolStop = make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(spoolSweepInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-s.spoolStop:
+				return
+			case <-ticker.C:
+				ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+				stats, err := s.backend.SweepSpool(ctx)
+				cancel()
+				if err != nil {
+					s.logger.Warn("spool sweep", zap.Error(err))
+				}
+				if stats.Removed() {
+					s.logger.Info("spool sweep removed files",
+						zap.Int64("budget_files", stats.BudgetFiles),
+						zap.Int64("budget_bytes", stats.BudgetBytes),
+						zap.Int64("forced_files", stats.ForcedFiles),
+						zap.Int64("forced_bytes", stats.ForcedBytes),
+						zap.Int64("orphan_files", stats.OrphanFiles),
+						zap.Int64("orphan_bytes", stats.OrphanBytes),
+						zap.Int64("usage_bytes", s.backend.SpoolUsage()),
+					)
+				}
+			}
+		}
+	}()
+}
+
 // Stop shuts the listener down and drains the log. Always returns
 // the combined error of the two operations so callers see all
 // failure modes; either alone is non-fatal to the other.
@@ -331,6 +378,10 @@ func (s *Server) Stop(ctx context.Context) error {
 	if s.releaseStop != nil {
 		close(s.releaseStop)
 		s.releaseStop = nil
+	}
+	if s.spoolStop != nil {
+		close(s.spoolStop)
+		s.spoolStop = nil
 	}
 	var errs []error
 	if err := s.api.ShutDown(); err != nil {

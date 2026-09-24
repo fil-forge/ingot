@@ -167,7 +167,7 @@ still green — no production path calls the new methods yet.
 - [ ] A `LocationStore`-backed `locator.Locator` (local-first, indexer fall-through for catalog
       blocks) so forge-mode body reads resolve from `blob_locations`. Deferred because: it is not
       harness-testable (the spool serves all in-process reads), it is only exercised **after** spool
-      eviction (not yet built), and the body-vs-catalog base-reader split + the `blockstore`↛`registry`
+      eviction (since built: `SweepSpool`), and the body-vs-catalog base-reader split + the `blockstore`↛`registry`
       cycle-avoiding package placement are best designed against the live smelt stack. The location
       **data** is already recorded (3d-2); Phase 7 wires the **consumer** and validates end-to-end.
 

@@ -538,6 +538,10 @@ flowchart TB
     accepted -->|"release record (never committed);<br/>executeRelease: /blob/remove;<br/>DeleteIntent + spool.Remove"| gone
 
     accepted -->|"commit: AddBlobClaim, same transaction"| published
+
+    parked -.->|"SweepSpool over budget (blob_parks row):<br/>spool.Remove + MarkEvicted; state unchanged"| evicted[["local file evicted<br/>(evicted_at set)"]]
+    accepted -.->|"SweepSpool over budget (blob_locations row):<br/>spool.Remove + MarkEvicted; state unchanged"| evicted
+    published -.->|"SweepSpool over budget (blob_locations row):<br/>spool.Remove + MarkEvicted; state unchanged"| evicted
     published -->|"commit: reconcileClaims adds this version"| refs["blob_refs rows<br/>(digest, bucket, key, version_id)"]
     refs -->|"version delete or overwrite removes its row"| zero{"CountClaims == 0<br/>for (space, digest)?"}
     zero -->|yes| rm["RemoveBlob: /blob/remove to sprue<br/>(space claim released)"]
@@ -550,6 +554,15 @@ flowchart TB
   the intent where a never-committed part blob loses both. `blob_parks` is a
   presence machine (a row exists while a conclude is owed), not a state
   column.
+- Eviction (the dotted edges) is orthogonal to the state: `SweepSpool` runs
+  every 30s and, when the spool is over `spool_max_bytes`, removes the local
+  files of blobs the provider already holds (a location row for `accepted`
+  and `published`, a park row for `parked`), oldest state change first, down
+  to 90% of the budget. The intent keeps its row and state and gains
+  `evicted_at`; reads fall through to the network tier. `spooled` and
+  `uploading` files are never evicted. A released committed blob has lost
+  its location row, so the budget pass does not evict it: its envelope stays
+  until the insurance-copy decision is made.
 - Digests present in both the old and new version sets never churn: the
   reconcile computes a set difference.
 - Parked-blob reclamation is guarded: a digest live in another session, part,
@@ -562,8 +575,9 @@ flowchart TB
 Cross-references: [`architecture.md` §5](./architecture.md#5-the-data-layer),
 [`s3-versioning.md`](./s3-versioning.md) §8.
 
-Sources: `registry/stores.go` (state consts), `s3frontend/object.go`
-(ingestBody, reconcileClaims, releaseBlobs), `s3frontend/multipart.go`
+Sources: `registry/stores.go` (state consts, ListEvictable), `s3frontend/object.go`
+(ingestBody, reconcileClaims, releaseBlobs), `s3frontend/spool_sweep.go`
+(SweepSpool), `s3frontend/multipart.go`
 (parkBlobs, concludeBlobs, enqueuePartReleases), `s3frontend/object.go`
 (runRelease, executeRelease), `uploader/blob.go` (UploadBlob,
 AbortBlob, RemoveBlob). Review when these change.

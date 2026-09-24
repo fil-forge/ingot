@@ -81,6 +81,16 @@ type UploadIntent struct {
 	Size      int64
 	State     string
 	Bucket    string
+	// UpdatedAt is when State last changed (for a committed blob, its commit
+	// time). Filled on every read; ignored by PutIntent.
+	UpdatedAt time.Time
+}
+
+// EvictCursor is a position in ListEvictable's (updated_at, digest) order.
+// The zero value starts at the beginning.
+type EvictCursor struct {
+	UpdatedAt time.Time
+	Digest    multihash.Multihash
 }
 
 // BlobLocation is one row of ingot.blob_locations: where a blob can be
@@ -301,14 +311,31 @@ type PendingReleaseStore interface {
 }
 
 // IntentStore is the local-store index (§5): the on-disk blobs Ingot holds
-// and their lifecycle state. Drives read-after-write, cache lookup, and
-// crash recovery.
+// and their lifecycle state. Drives read-after-write, cache lookup, spool
+// eviction, and crash recovery.
 type IntentStore interface {
+	// PutIntent upserts an intent. A digest spooled again is on disk again,
+	// so PutIntent also clears the evicted mark.
 	PutIntent(ctx context.Context, in UploadIntent) error
 	SetIntentState(ctx context.Context, digest multihash.Multihash, state string) error
 	GetIntent(ctx context.Context, digest multihash.Multihash) (*UploadIntent, error)
 	ListIntentsByState(ctx context.Context, state string) ([]UploadIntent, error)
 	DeleteIntent(ctx context.Context, digest multihash.Multihash) error
+	// ListEvictable returns intents whose spool file the provider already
+	// holds a copy of and that are not marked evicted: 'accepted' or
+	// 'published' with a blob_locations row for the digest in any space, or
+	// 'parked' with a blob_parks row. The state alone is not enough: a
+	// single PUT marks a blob accepted before it records the location, and
+	// a failed location write leaves it accepted with none. Ordered by
+	// (UpdatedAt, Digest), starting after the cursor, at most limit rows.
+	ListEvictable(ctx context.Context, after EvictCursor, limit int) ([]UploadIntent, error)
+	// MarkEvicted records that the digest's spool file is gone, leaving
+	// State and UpdatedAt alone. Returns ErrNotFound when the intent is gone
+	// (a release got there first).
+	MarkEvicted(ctx context.Context, digest multihash.Multihash) error
+	// MissingIntents returns the digests among digests that have no intent
+	// row, for the sweeper's orphan-file pass.
+	MissingIntents(ctx context.Context, digests []multihash.Multihash) ([]multihash.Multihash, error)
 }
 
 // LocationStore is the local blob-location table (§8, appliance topology):
