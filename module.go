@@ -156,6 +156,7 @@ type serverParams struct {
 	Deferred     uploader.DeferredBodyUploader
 	Remover      uploader.BlobRemover
 	Registrar    uploader.UploadRegistrar
+	UploadRegs   registry.UploadRegistrationStore
 	// Streaming and Streams are optional: without them every body blob is
 	// spooled before it is uploaded (see ServerDeps.Streaming).
 	Streaming       uploader.StreamingBodyUploader `optional:"true"`
@@ -221,6 +222,7 @@ func registerServerLifecycle(lc fx.Lifecycle, p serverParams) {
 				Streaming:       p.Streaming,
 				Streams:         p.Streams,
 				Registrar:       p.Registrar,
+				UploadRegs:      p.UploadRegs,
 				Authority:       p.BucketAuthority,
 				Registry:        p.Registry,
 				Intents:         p.Intents,
@@ -494,6 +496,7 @@ type registryResult struct {
 	Parks             registry.ParkStore
 	Streams           registry.StreamStore
 	PendingReleases   registry.PendingReleaseStore
+	UploadRegs        registry.UploadRegistrationStore
 	EncParams         registry.EncryptionParamsStore
 	RevocationCursors registry.RevocationCursorStore
 	Meta              logstore.Meta
@@ -508,7 +511,7 @@ type registryResult struct {
 // needs hilt_url/hilt_did configured.
 func provideRegistry(pool *pgxpool.Pool) registryResult {
 	pg := registry.NewPostgres(pool)
-	return registryResult{Registry: pg, Intents: pg, Locations: pg, Inclusions: pg, BlobRefs: pg, GC: pg, Multipart: pg, Parks: pg, Streams: pg, PendingReleases: pg, EncParams: pg, RevocationCursors: pg, Meta: pg}
+	return registryResult{Registry: pg, Intents: pg, Locations: pg, Inclusions: pg, BlobRefs: pg, GC: pg, Multipart: pg, Parks: pg, Streams: pg, PendingReleases: pg, UploadRegs: pg, EncParams: pg, RevocationCursors: pg, Meta: pg}
 }
 
 // migrationHookOut feeds the migration PreStartHook into the "ingot_prestart"

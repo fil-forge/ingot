@@ -17,6 +17,12 @@ import (
 // violation (matches the literal used elsewhere in sprue's stores).
 const uniqueViolation = "23505"
 
+// pgxQuerier is the Exec surface shared by *pgxpool.Pool and pgx.Tx, so a
+// statement can run standalone or inside a caller's transaction.
+type pgxQuerier interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+}
+
 // Postgres is a *pgxpool.Pool-backed Registry (and, via its sibling
 // files, the segment Meta and the relational stores). Schema is owned
 // by the migrations package and lives in the `ingot` Postgres schema.
@@ -106,6 +112,44 @@ func (r *Postgres) Delete(ctx context.Context, name string) error {
 }
 
 func (r *Postgres) CASRoot(ctx context.Context, name string, expect, next cid.Cid) error {
+	return r.casRoot(ctx, r.pool, name, expect, next)
+}
+
+// CASRootEnqueue advances the root and records the commit's upload
+// registrations in one transaction, so the outbox row exists exactly when the
+// version it describes committed. A conflict or a missing bucket rolls the
+// rows back with the CAS.
+func (r *Postgres) CASRootEnqueue(ctx context.Context, name string, expect, next cid.Cid, regs []UploadRegistration) error {
+	if len(regs) == 0 {
+		return r.CASRoot(ctx, name, expect, next)
+	}
+
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("registry: begin cas %q: %w", name, err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if err := r.casRoot(ctx, tx, name, expect, next); err != nil {
+		return err
+	}
+	for _, reg := range regs {
+		// seq comes from the sequence, so the rows of one bucket are numbered
+		// in the order its lock let them commit.
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO ingot.upload_registrations (bucket, object_key, space, root, op, proofs)
+			VALUES ($1, $2, $3, $4, $5, $6)
+		`, reg.Bucket, reg.ObjectKey, reg.Space.String(), reg.Root.Bytes(), string(reg.Op), reg.Proofs); err != nil {
+			return fmt.Errorf("registry: enqueue upload registration for %q: %w", name, err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("registry: commit cas %q: %w", name, err)
+	}
+	return nil
+}
+
+func (r *Postgres) casRoot(ctx context.Context, q pgxQuerier, name string, expect, next cid.Cid) error {
 	var (
 		expectBytes []byte
 		nextBytes   []byte
@@ -122,11 +166,11 @@ func (r *Postgres) CASRoot(ctx context.Context, name string, expect, next cid.Ci
 		err error
 	)
 	if expectBytes == nil {
-		tag, err = r.pool.Exec(ctx,
+		tag, err = q.Exec(ctx,
 			`UPDATE ingot.buckets SET root_cid = $1 WHERE name = $2 AND root_cid IS NULL`,
 			nextBytes, name)
 	} else {
-		tag, err = r.pool.Exec(ctx,
+		tag, err = q.Exec(ctx,
 			`UPDATE ingot.buckets SET root_cid = $1 WHERE name = $2 AND root_cid = $3`,
 			nextBytes, name, expectBytes)
 	}

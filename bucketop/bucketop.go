@@ -244,10 +244,24 @@ type Tx struct {
 	staging *blockstore.OpStaging
 	cst     cbor.IpldStore
 
+	// uploadRegs are the upload-registration outbox rows this commit owes.
+	// They are written in the same transaction as the root CAS, so the count
+	// can never describe a version that did not commit — nor miss one that
+	// did.
+	uploadRegs []registry.UploadRegistration
+
 	// release is the bucket-lock release closure. Set by Begin;
 	// nil-ed by finalize() so Commit and Discard mutually agree
 	// that the lock has been released exactly once.
 	release func()
+}
+
+// EnqueueUploadRegistration records a change to the space's content-entry
+// list for this commit to carry. Called under the bucket lock, so the rows of
+// one bucket are numbered in the order its commits took the lock — which is
+// the order the sweeper has to replay a key's changes in.
+func (tx *Tx) EnqueueUploadRegistration(reg registry.UploadRegistration) {
+	tx.uploadRegs = append(tx.uploadRegs, reg)
 }
 
 // Compile-time assertions: Tx is the canonical handle through which
@@ -340,7 +354,7 @@ func (tx *Tx) Commit(ctx context.Context, newRoot cid.Cid) (err error) {
 	if err := tx.staging.Commit(ctx, newRoot); err != nil {
 		return fmt.Errorf("bucketop: append: %w", err)
 	}
-	if err := tx.deps.Reg.CASRoot(ctx, tx.bucket, tx.state.Root, newRoot); err != nil {
+	if err := tx.deps.Reg.CASRootEnqueue(ctx, tx.bucket, tx.state.Root, newRoot, tx.uploadRegs); err != nil {
 		return fmt.Errorf("bucketop: advance root: %w", err)
 	}
 	return nil
