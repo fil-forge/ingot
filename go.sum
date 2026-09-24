@@ -195,8 +195,8 @@ github.com/fil-forge/swarf v0.0.1-0.20260821142121-d5d1a0a56f00 h1:uSJ2YCxOJQA7P
 github.com/fil-forge/swarf v0.0.1-0.20260821142121-d5d1a0a56f00/go.mod h1:k1gay5Byjloml4k1SylxhRff1rMH4LcGKpbMEDLZR1o=
 github.com/fil-forge/ucantone v0.0.0-20260924160040-c31dec73d9b3 h1:Ta5ODMWR9mM4zMfRp/K1unAKvnt7f5dhehRA+YHiv7w=
 github.com/fil-forge/ucantone v0.0.0-20260924160040-c31dec73d9b3/go.mod h1:aX35jlUs3hnWAhigjO8z9kMPiYnkW3XOW8iVoJyz7cg=
-github.com/fil-forge/versitygw v0.0.0-20260914113944-a628e2cc628c h1:5l+U5dNHDSMi31VJXQSAl++Js0VKz43fkmOAMEVPIlE=
-github.com/fil-forge/versitygw v0.0.0-20260914113944-a628e2cc628c/go.mod h1:8GhLviBF605A89tR9xz7QMb2nRmTRl133soOEdyIBUs=
+github.com/fil-forge/versitygw v0.0.0-20260924184025-42cfd92a57bf h1:gxCYWmGyis8HijLnvmeJ3ifXaoKsFn38dngNHmzGXL4=
+github.com/fil-forge/versitygw v0.0.0-20260924184025-42cfd92a57bf/go.mod h1:8GhLviBF605A89tR9xz7QMb2nRmTRl133soOEdyIBUs=
 github.com/filecoin-project/go-data-segment v0.0.1 h1:1wmDxOG4ubWQm3ZC1XI5nCon5qgSq7Ra3Rb6Dbu10Gs=
 github.com/filecoin-project/go-data-segment v0.0.1/go.mod h1:H0/NKbsRxmRFBcLibmABv+yFNHdmtl5AyplYLnb0Zv4=
 github.com/filecoin-project/go-fee v0.1.1-0.20260826122013-1c3970b90b0d h1:W+UJ3I79FKfdY0EcNelK1APMYXBZgXfx2OPLOiVEb7E=

@@ -38,8 +38,12 @@ const awsCLIImage = "amazon/aws-cli:2.36.44"
 // image, reaching ingot's host-mapped port through host.docker.internal;
 // the uploaded bytes come back byte-exact, HEAD reports a 3-part ETag, and
 // the object carries the full-object checksum the CLI declared.
+//
+// The stack streams every CompleteMultipartUpload response (a 1ms
+// complete_keepalive_interval), so the CLI's botocore parses the streamed
+// form: the XML declaration, whitespace, then the result document.
 func TestForgeAWSCLI(t *testing.T) {
-	s, endpoint := forgeStack(t)
+	s, endpoint := forgeStack(t, withCompleteKeepaliveConfig())
 	ctx := t.Context()
 	accessKey, secretKey := hiltProvisionTenant(t, ctx, s, "awscli")
 

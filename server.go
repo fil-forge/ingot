@@ -12,6 +12,7 @@ import (
 	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/ucantone/did/web"
 	"github.com/fil-forge/versitygw/auth"
+	"github.com/fil-forge/versitygw/backend"
 	"github.com/fil-forge/versitygw/metrics"
 	"github.com/fil-forge/versitygw/s3api"
 	"github.com/fil-forge/versitygw/s3event"
@@ -435,6 +436,13 @@ func newBucketFlushFunc(up uploader.Uploader, reg registry.Registry, locations r
 	}
 }
 
+// defaultCompleteKeepaliveInterval is far below common client read timeouts
+// (60s for the AWS CLI), and below the 10s a Complete that lost the session
+// latch waits for the winner (s3frontend's replayWaitBudget). A loser that
+// gives up has therefore already streamed, and reports its OperationAborted
+// inside the 200, which AWS SDKs retry.
+const defaultCompleteKeepaliveInterval = 5 * time.Second
+
 // buildS3API constructs the versitygw S3ApiServer with the wiring ingot
 // needs: no event sink, generous concurrency limits, and an audit-log sink
 // that reports unexpected request failures through zap. Every access key
@@ -442,8 +450,9 @@ func newBucketFlushFunc(up uploader.Uploader, reg registry.Registry, locations r
 // account is disabled (an empty RootUserConfig), since a root request never
 // reaches hilt and so carries none of the delegations the Forge-facing
 // handlers need. The server also publishes id's DID document at
-// /.well-known/did.json.
-func buildS3API(ctx context.Context, backend *s3frontend.Backend, cfg config.ServerConfig, iam auth.IAMService, id identity.Identity, logger *zap.Logger) (*s3api.S3ApiServer, error) {
+// /.well-known/did.json, and keeps a slow CompleteMultipartUpload's
+// connection alive with whitespace (cfg.CompleteKeepaliveInterval).
+func buildS3API(ctx context.Context, be backend.Backend, cfg config.ServerConfig, iam auth.IAMService, id identity.Identity, logger *zap.Logger) (*s3api.S3ApiServer, error) {
 	if iam == nil {
 		return nil, fmt.Errorf("ingot: IAMService is required")
 	}
@@ -495,9 +504,20 @@ func buildS3API(ctx context.Context, backend *s3frontend.Backend, cfg config.Ser
 	}
 	opts = append(opts, s3api.WithRoute(http.MethodGet, web.WellKnownDIDPath, didDocumentHandler(doc)))
 
+	// Completing a large upload concludes every part's blobs on Forge and
+	// can outlast a client's read timeout (60s for the AWS CLI). The
+	// keepalive sends whitespace until the result is ready, as S3 does.
+	keepalive := cfg.CompleteKeepaliveInterval
+	if keepalive == 0 {
+		keepalive = defaultCompleteKeepaliveInterval
+	}
+	if keepalive > 0 {
+		opts = append(opts, s3api.WithCompleteMultipartKeepalive(keepalive))
+	}
+
 	// No s3api.WithRootUser: the gateway has no root account, so every access
 	// key resolves through iam.
-	api, err := s3api.New(backend,
+	api, err := s3api.New(be,
 		cfg.Region, iam, loggers.S3Logger, loggers.AdminLogger, evSender, mm,
 		opts...,
 	)
