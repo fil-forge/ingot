@@ -1382,6 +1382,8 @@ func (b *Backend) deleteObjectKey(ctx context.Context, bucketState *registry.Sta
 		oldDigests = bodyDigests(oldMf.Body)
 		oldVersionID = oldMf.VersionID
 		oldSeq = oldMf.Seq
+		// The key is gone, so the space stops counting it.
+		b.enqueueRegistration(ctx, tx, tx.State(), key, oldManifest, registry.UploadRegistrationRemove)
 		return t2.GetPointer(ctx, tx)
 	})
 	if err != nil {
@@ -1397,9 +1399,6 @@ func (b *Backend) deleteObjectKey(ctx context.Context, bucketState *registry.Sta
 	if err := b.dropClaims(ctx, bucketState, key, claimVersionID(oldVersionID, oldSeq), oldDigests); err != nil {
 		return fmt.Errorf("s3frontend: delete reconcile: %w", err)
 	}
-	// The key is gone, so the space stops counting it. Undefined when the key
-	// was absent, which retractVersion skips.
-	b.retractVersion(ctx, bucketState, oldManifest)
 	return nil
 }
 

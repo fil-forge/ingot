@@ -49,23 +49,24 @@ import (
 type Backend struct {
 	backend.BackendUnsupported
 
-	read      blockstore.ReadStore
-	authority bucketauthority.BucketAuthority
-	reg       registry.Registry
-	intents   registry.IntentStore
-	locations registry.LocationStore
-	blobRefs  registry.BlobRefStore
-	gc        registry.GCStore
-	multipart registry.MultipartStore
-	txns      *bucketop.Coordinator
-	log       blockstore.Log
-	spool     *blockstore.Spool
-	uploader  uploader.BodyUploader
-	deferred  uploader.DeferredBodyUploader
-	parks     registry.ParkStore
-	remover   uploader.BlobRemover
-	registrar uploader.UploadRegistrar
-	encParams registry.EncryptionParamsStore
+	read       blockstore.ReadStore
+	authority  bucketauthority.BucketAuthority
+	reg        registry.Registry
+	intents    registry.IntentStore
+	locations  registry.LocationStore
+	blobRefs   registry.BlobRefStore
+	gc         registry.GCStore
+	multipart  registry.MultipartStore
+	txns       *bucketop.Coordinator
+	log        blockstore.Log
+	spool      *blockstore.Spool
+	uploader   uploader.BodyUploader
+	deferred   uploader.DeferredBodyUploader
+	parks      registry.ParkStore
+	remover    uploader.BlobRemover
+	registrar  uploader.UploadRegistrar
+	uploadRegs registry.UploadRegistrationStore
+	encParams  registry.EncryptionParamsStore
 	// pendingReleases is the deferred-release queue; releaseGrace is how far
 	// past the last-claim drop each release is scheduled (readers holding the
 	// prior catalog root get at least this long to finish their prefetch).
@@ -127,6 +128,8 @@ type Deps struct {
 	// catalog: one entry per committed object version, which is what the
 	// service counts to report the space's object count.
 	Registrar uploader.UploadRegistrar
+	// UploadRegs is the outbox the registration sweeper drains.
+	UploadRegs registry.UploadRegistrationStore
 
 	// EncParams is the per-blob FEE encryption-parameter table: what the
 	// decrypting read path needs to serve an encrypted blob. RegionKeys
@@ -200,6 +203,7 @@ func New(d Deps) *Backend {
 		parks:           d.Parks,
 		remover:         d.Remover,
 		registrar:       d.Registrar,
+		uploadRegs:      d.UploadRegs,
 		encParams:       d.EncParams,
 		regionKeys:      d.RegionKeys,
 		tenantKeys:      d.TenantKeys,

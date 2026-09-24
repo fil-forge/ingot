@@ -630,3 +630,130 @@ func clonePart(p registry.MultipartPart) registry.MultipartPart {
 	}
 	return p
 }
+
+// UploadRegistrationStore =====================================================
+
+func (m *MemStore) ListDueUploadRegistrations(_ context.Context, now time.Time, limit int) ([]registry.UploadRegistration, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// Per key, only the unbroken run of due rows from its oldest: once a key
+	// has a row waiting out a backoff, its later rows wait too, or a
+	// retraction could be replayed ahead of the addition it retires.
+	blocked := map[string]bool{}
+	var out []registry.UploadRegistration
+	for _, reg := range m.uploadRegs {
+		// A dead-lettered row is out of the sweep and does not hold its key back.
+		if reg.DeadLetteredAt != nil {
+			continue
+		}
+		key := reg.Bucket + "\x00" + reg.ObjectKey
+		if blocked[key] || reg.NextAt.After(now) {
+			blocked[key] = true
+			continue
+		}
+		out = append(out, reg)
+		if limit > 0 && len(out) == limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+func (m *MemStore) ListUploadRegistrationsBySpace(_ context.Context, space did.DID) ([]registry.UploadRegistration, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []registry.UploadRegistration
+	for _, reg := range m.uploadRegs {
+		if reg.Space == space {
+			out = append(out, reg)
+		}
+	}
+	return out, nil
+}
+
+func (m *MemStore) RefreshUploadRegistrationProofs(_ context.Context, seq int64, proofs []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i, reg := range m.uploadRegs {
+		if reg.Seq == seq {
+			m.uploadRegs[i].Proofs = proofs
+			return nil
+		}
+	}
+	return nil
+}
+
+func (m *MemStore) DeadLetterUploadRegistrations(_ context.Context, seqs []int64, reason string) error {
+	if len(seqs) == 0 {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	park := make(map[int64]bool, len(seqs))
+	for _, seq := range seqs {
+		park[seq] = true
+	}
+	now := time.Now()
+	for i, reg := range m.uploadRegs {
+		if park[reg.Seq] && reg.DeadLetteredAt == nil {
+			m.uploadRegs[i].DeadLetteredAt = &now
+			m.uploadRegs[i].DeadLetterReason = reason
+		}
+	}
+	return nil
+}
+
+func (m *MemStore) ListDeadLetteredUploadRegistrations(_ context.Context, limit int) ([]registry.UploadRegistration, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []registry.UploadRegistration
+	for _, reg := range m.uploadRegs {
+		if reg.DeadLetteredAt == nil {
+			continue
+		}
+		out = append(out, reg)
+		if limit > 0 && len(out) == limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+func (m *MemStore) DeleteUploadRegistrations(_ context.Context, seqs []int64) error {
+	if len(seqs) == 0 {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	drop := make(map[int64]bool, len(seqs))
+	for _, seq := range seqs {
+		drop[seq] = true
+	}
+	kept := m.uploadRegs[:0]
+	for _, reg := range m.uploadRegs {
+		if !drop[reg.Seq] {
+			kept = append(kept, reg)
+		}
+	}
+	m.uploadRegs = kept
+	return nil
+}
+
+func (m *MemStore) RescheduleUploadRegistrations(_ context.Context, seqs []int64, nextAt time.Time) error {
+	if len(seqs) == 0 {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	hold := make(map[int64]bool, len(seqs))
+	for _, seq := range seqs {
+		hold[seq] = true
+	}
+	for i, reg := range m.uploadRegs {
+		if hold[reg.Seq] {
+			m.uploadRegs[i].Attempts++
+			m.uploadRegs[i].NextAt = nextAt
+		}
+	}
+	return nil
+}

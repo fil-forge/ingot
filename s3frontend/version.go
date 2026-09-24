@@ -14,6 +14,8 @@ import (
 	"github.com/oklog/ulid/v2"
 	"go.uber.org/zap"
 
+	uploadcmds "github.com/fil-forge/libforge/commands/upload"
+
 	msbucket "github.com/fil-forge/ingot/bucket"
 	"github.com/fil-forge/ingot/bucketop"
 	"github.com/fil-forge/ingot/mst"
@@ -531,6 +533,18 @@ func (b *Backend) commitVersion(ctx context.Context, bucketState *registry.State
 		if err := b.addClaims(ctx, st, key, claimVersionID(vid, seq), bodyDigests(mf.Body), pinned); err != nil {
 			return cid.Undef, err
 		}
+
+		// Content entries (the space's object count): this version registers,
+		// the ones it discarded retract. Queued in the commit's own
+		// transaction, so the rows exist exactly when the version does, and
+		// numbered under this lock, so the sweeper replays a key's changes in
+		// commit order. Every write rule runs through here, so a PUT, a
+		// multipart Complete, a CopyObject destination and a delete marker all
+		// count as one object — which is what AWS reports for NumberOfObjects.
+		b.enqueueRegistration(ctx, tx, st, key, mfCid, registry.UploadRegistrationAdd)
+		for _, d := range discards {
+			b.enqueueRegistration(ctx, tx, st, key, d.manifest, registry.UploadRegistrationRemove)
+		}
 		return t2.GetPointer(ctx, tx)
 	})
 	if err != nil {
@@ -546,53 +560,42 @@ func (b *Backend) commitVersion(ctx context.Context, bucketState *registry.State
 			return node, effState, fmt.Errorf("s3frontend: commit reconcile: %w", err)
 		}
 	}
-
-	// Content entries (the space's object count): this version registers, the
-	// ones it discarded retract. Every write rule runs through here, so a PUT,
-	// a multipart Complete, a CopyObject destination and a delete marker all
-	// count as one object, and a bucket retaining noncurrent versions keeps
-	// counting them — which is what AWS reports for NumberOfObjects.
-	b.registerVersion(ctx, bucketState, node.Manifest, discards)
 	return node, effState, nil
 }
 
-// registerVersion tells the upload service that root is a content entry in the
-// bucket's space and that the discarded versions no longer are.
-//
-// Best-effort, like the index publication a catalog ship makes: the object is
-// durable and the catalog mutation is fsynced by the time this runs, so the
-// response must say so, and failing the request here would fail a write that
-// actually succeeded. The cost is that the count under-reports until something
-// re-registers the root, and unlike a blob release there is no local record to
-// retry from. (TODO: persist failed registrations so the count converges.)
-func (b *Backend) registerVersion(ctx context.Context, bucketState *registry.State, root cid.Cid, discards []discardedVersion) {
-	if err := b.registrar.RegisterUpload(ctx, bucketState.Space, root); err != nil {
-		b.logger.Warn("commit: upload registration failed; object count will under-report",
-			zap.String("bucket", bucketState.Name),
-			zap.Stringer("space", bucketState.Space),
-			zap.Stringer("root", root),
-			zap.Error(err),
-		)
-	}
-	for _, d := range discards {
-		b.retractVersion(ctx, bucketState, d.manifest)
-	}
-}
-
-// retractVersion drops a retired version's content entry. Best-effort for the
-// same reason as registerVersion; an entry left behind over-reports the count.
-func (b *Backend) retractVersion(ctx context.Context, bucketState *registry.State, root cid.Cid) {
+// enqueueRegistration queues one change to the space's content-entry list for
+// this commit to carry. Best-effort in one respect only: a request with no
+// proof store cannot produce authority for the sweeper to use later, and
+// failing the write over the object count would fail a write that otherwise
+// succeeded. The row is skipped and logged, and the count under-reports until
+// something registers that root again.
+func (b *Backend) enqueueRegistration(ctx context.Context, tx *bucketop.Tx, st *registry.State, key string, root cid.Cid, op registry.UploadRegistrationOp) {
 	if !root.Defined() {
 		return
 	}
-	if err := b.registrar.RetractUpload(ctx, bucketState.Space, root); err != nil {
-		b.logger.Warn("commit: upload retraction failed; object count will over-report",
-			zap.String("bucket", bucketState.Name),
-			zap.Stringer("space", bucketState.Space),
+	cmd := uploadcmds.Add.Command
+	if op == registry.UploadRegistrationRemove {
+		cmd = uploadcmds.Remove.Command
+	}
+	proofs, err := b.registrar.CaptureAuthority(ctx, st.Space, cmd)
+	if err != nil {
+		b.logger.Warn("commit: no authority to queue an upload registration; object count will drift",
+			zap.String("bucket", st.Name),
+			zap.String("op", string(op)),
+			zap.Stringer("space", st.Space),
 			zap.Stringer("root", root),
 			zap.Error(err),
 		)
+		return
 	}
+	tx.EnqueueUploadRegistration(registry.UploadRegistration{
+		Bucket:    st.Name,
+		ObjectKey: key,
+		Space:     st.Space,
+		Root:      root,
+		Op:        op,
+		Proofs:    proofs,
+	})
 }
 
 // scopedDeleteResult reports a version-scoped delete: whether a version was
@@ -660,6 +663,8 @@ func (b *Backend) deleteVersionScoped(ctx context.Context, bucketState *registry
 			}
 			removed = discardedVersion{versionID: targetVersionID(kind, mf), seq: mf.Seq, digests: bodyDigests(mf.Body), manifest: valCid}
 			res.found, res.wasMarker = true, mf.DeleteMarker
+			// The version is gone for good, so the space stops counting it.
+			b.enqueueRegistration(ctx, tx, st, key, valCid, registry.UploadRegistrationRemove)
 			// The value block is the manifest — one GC candidate covers it.
 			if err := b.gc.AddGCCandidate(ctx, valCid.Bytes(), st.Name); err != nil {
 				return cid.Undef, fmt.Errorf("gc candidate: %w", err)
@@ -733,6 +738,8 @@ func (b *Backend) deleteVersionScoped(ctx context.Context, bucketState *registry
 
 		removed = discardedVersion{versionID: targetVersionID(kind, targetMf), seq: targetMf.Seq, digests: bodyDigests(targetMf.Body), manifest: targetCid}
 		res.found, res.wasMarker = true, targetMf.DeleteMarker
+		// The version is gone for good, so the space stops counting it.
+		b.enqueueRegistration(ctx, tx, st, key, targetCid, registry.UploadRegistrationRemove)
 		if err := b.gc.AddGCCandidate(ctx, targetCid.Bytes(), st.Name); err != nil {
 			return cid.Undef, fmt.Errorf("gc candidate: %w", err)
 		}
@@ -809,12 +816,11 @@ func (b *Backend) deleteVersionScoped(ctx context.Context, bucketState *registry
 	if err != nil {
 		return res, mapCommitError(err, "delete version")
 	}
-	if res.found {
-		if err := b.dropClaims(ctx, bucketState, key, claimVersionID(removed.versionID, removed.seq), removed.digests); err != nil {
-			return res, fmt.Errorf("s3frontend: delete version reconcile: %w", err)
-		}
-		// The version is gone for good, so the space stops counting it.
-		b.retractVersion(ctx, bucketState, removed.manifest)
+	if !res.found {
+		return res, nil
+	}
+	if err := b.dropClaims(ctx, bucketState, key, claimVersionID(removed.versionID, removed.seq), removed.digests); err != nil {
+		return res, fmt.Errorf("s3frontend: delete version reconcile: %w", err)
 	}
 	return res, nil
 }

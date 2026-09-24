@@ -3,13 +3,9 @@ package forgeclient
 
 import (
 	"context"
-	"fmt"
 
-	uploadcmds "github.com/fil-forge/libforge/commands/upload"
 	ucanlib "github.com/fil-forge/libforge/ucan"
 	"github.com/fil-forge/ucantone/did"
-	"github.com/fil-forge/ucantone/execution"
-	"github.com/fil-forge/ucantone/ucan/invocation"
 	"github.com/ipfs/go-cid"
 )
 
@@ -32,30 +28,9 @@ func (c *Client) UploadAdd(ctx context.Context, space did.DID, root cid.Cid, opt
 	if cfg.ProofStore != nil {
 		proofStore = cfg.ProofStore
 	}
-
-	proofs, proofLinks, err := proofStore.ProofChain(ctx, c.signer.DID(), uploadcmds.Add.Command, space)
+	results, err := c.UploadAddBatch(ctx, []UploadChange{{Space: space, Root: root, Proofs: proofStore}})
 	if err != nil {
-		return fmt.Errorf("building proof chain: %w", err)
+		return err
 	}
-	inv, err := uploadcmds.Add.Invoke(
-		c.signer,
-		space,
-		&uploadcmds.AddArguments{Root: root},
-		invocation.WithAudience(c.serviceID),
-		invocation.WithProofs(proofLinks...),
-	)
-	if err != nil {
-		return fmt.Errorf("creating invocation: %w", err)
-	}
-
-	_, _, _, err = Execute[*uploadcmds.AddOK](
-		ctx,
-		c.ucanClient,
-		inv,
-		execution.WithDelegations(proofs...),
-	)
-	if err != nil {
-		return fmt.Errorf("executing invocation: %w", err)
-	}
-	return nil
+	return results[0]
 }
