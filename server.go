@@ -62,6 +62,12 @@ type ServerDeps struct {
 	// abort at Abort.
 	Deferred uploader.DeferredBodyUploader
 	Remover  uploader.BlobRemover
+	// Registrar keeps the upload service's content-entry list in step with the
+	// catalog: one entry per committed object version, which is what the
+	// service counts to report the space's object count.
+	Registrar uploader.UploadRegistrar
+	// UploadRegs is the upload-registration outbox the sweeper drains.
+	UploadRegs registry.UploadRegistrationStore
 
 	// Authority is the service that authorizes bucket creation and deletion.
 	Authority bucketauthority.BucketAuthority
@@ -129,13 +135,14 @@ var _ s3frontend.SegmentDigestLister = (*logstore.Manager)(nil)
 // lifecycle. fx callers wrap these in OnStart/OnStop hooks; tests
 // call them directly.
 type Server struct {
-	cfg         config.ServerConfig
-	logger      *zap.Logger
-	log         blockstore.Log
-	backend     *s3frontend.Backend
-	api         *s3api.S3ApiServer
-	sweepStop   chan struct{}
-	releaseStop chan struct{}
+	cfg           config.ServerConfig
+	logger        *zap.Logger
+	log           blockstore.Log
+	backend       *s3frontend.Backend
+	api           *s3api.S3ApiServer
+	sweepStop     chan struct{}
+	releaseStop   chan struct{}
+	uploadRegStop chan struct{}
 }
 
 // New wires a ServerDeps + ServerConfig into a runnable Server. The
@@ -195,6 +202,8 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		Uploader:        deps.BodyUploader,
 		Deferred:        deps.Deferred,
 		Remover:         deps.Remover,
+		Registrar:       deps.Registrar,
+		UploadRegs:      deps.UploadRegs,
 		EncParams:       deps.EncParams,
 		RegionKeys:      deps.RegionKeys,
 		TenantKeys:      deps.TenantKeys,
@@ -242,6 +251,7 @@ func (s *Server) Start(ctx context.Context) error {
 	}()
 	s.startMultipartSweeper()
 	s.startReleaseSweeper()
+	s.startRegistrationSweeper()
 	return nil
 }
 
@@ -318,6 +328,41 @@ func (s *Server) startReleaseSweeper() {
 	}()
 }
 
+// startRegistrationSweeper spawns the upload-registration sweeper: the write
+// path queues one row per object version committed or retired, and this drains
+// them against the upload service, retrying with backoff until each is taken.
+//
+// It runs off the request path deliberately. The object count is a reporting
+// number, so a Sprue round trip does not belong in a PUT, and a Sprue outage
+// should delay the count rather than fail writes or lose it.
+func (s *Server) startRegistrationSweeper() {
+	s.uploadRegStop = make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(uploadRegistrationSweepInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-s.uploadRegStop:
+				return
+			case <-ticker.C:
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+				n, err := s.backend.SweepUploadRegistrations(ctx)
+				cancel()
+				if err != nil {
+					s.logger.Warn("registration sweep", zap.Error(err))
+				} else if n > 0 {
+					s.logger.Info("registration sweep recorded object count changes", zap.Int("count", n))
+				}
+			}
+		}
+	}()
+}
+
+// uploadRegistrationSweepInterval is how often the queue is drained. The count
+// is reporting data, not a read-your-writes surface, so a short lag is fine and
+// a steady cadence keeps the load on the upload service predictable.
+const uploadRegistrationSweepInterval = 30 * time.Second
+
 // Stop shuts the listener down and drains the log. Always returns
 // the combined error of the two operations so callers see all
 // failure modes; either alone is non-fatal to the other.
@@ -331,6 +376,10 @@ func (s *Server) Stop(ctx context.Context) error {
 	if s.releaseStop != nil {
 		close(s.releaseStop)
 		s.releaseStop = nil
+	}
+	if s.uploadRegStop != nil {
+		close(s.uploadRegStop)
+		s.uploadRegStop = nil
 	}
 	var errs []error
 	if err := s.api.ShutDown(); err != nil {
@@ -570,6 +619,12 @@ func validateServerInputs(cfg config.ServerConfig, deps ServerDeps) error {
 	}
 	if deps.Remover == nil {
 		return errors.New("ingot: ServerDeps.Remover is required")
+	}
+	if deps.Registrar == nil {
+		return errors.New("ingot: ServerDeps.Registrar is required")
+	}
+	if deps.UploadRegs == nil {
+		return errors.New("ingot: ServerDeps.UploadRegs is required")
 	}
 	if deps.Meta == nil {
 		return errors.New("ingot: ServerDeps.Meta is required")

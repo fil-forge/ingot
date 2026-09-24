@@ -104,6 +104,13 @@ type Registry interface {
 	// Returns ErrConflict if the current root does not equal expect.
 	CASRoot(ctx context.Context, name string, expect, next cid.Cid) error
 
+	// CASRootEnqueue is CASRoot plus the upload registrations the commit
+	// owes, written in one transaction. The two belong together: a row
+	// without its commit would count a version the catalog never published,
+	// and a commit without its row would leave the version uncounted with
+	// nothing left to say so. Passing no registrations is exactly CASRoot.
+	CASRootEnqueue(ctx context.Context, name string, expect, next cid.Cid, regs []UploadRegistration) error
+
 	// SetForgeRoot records that the DAG reachable from root has been
 	// successfully shipped to Forge. Used as the high-water mark by
 	// the recovery loop: anything reachable from Root but not from

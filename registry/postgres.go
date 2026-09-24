@@ -17,6 +17,16 @@ import (
 // violation (matches the literal used elsewhere in sprue's stores).
 const uniqueViolation = "23505"
 
+// pgxQuerier is the surface shared by *pgxpool.Pool and pgx.Tx, so a statement
+// can run standalone or inside a caller's transaction. Everything a statement
+// needs has to be here: reaching back to the pool from inside a transaction
+// would hold one connection while waiting for another, which deadlocks on a
+// single-connection pool.
+type pgxQuerier interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
 // Postgres is a *pgxpool.Pool-backed Registry (and, via its sibling
 // files, the segment Meta and the relational stores). Schema is owned
 // by the migrations package and lives in the `ingot` Postgres schema.
@@ -106,6 +116,44 @@ func (r *Postgres) Delete(ctx context.Context, name string) error {
 }
 
 func (r *Postgres) CASRoot(ctx context.Context, name string, expect, next cid.Cid) error {
+	return r.casRoot(ctx, r.pool, name, expect, next)
+}
+
+// CASRootEnqueue advances the root and records the commit's upload
+// registrations in one transaction, so the outbox row exists exactly when the
+// version it describes committed. A conflict or a missing bucket rolls the
+// rows back with the CAS.
+func (r *Postgres) CASRootEnqueue(ctx context.Context, name string, expect, next cid.Cid, regs []UploadRegistration) error {
+	if len(regs) == 0 {
+		return r.CASRoot(ctx, name, expect, next)
+	}
+
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("registry: begin cas %q: %w", name, err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if err := r.casRoot(ctx, tx, name, expect, next); err != nil {
+		return err
+	}
+	for _, reg := range regs {
+		// seq comes from the sequence, so the rows of one bucket are numbered
+		// in the order its lock let them commit.
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO ingot.upload_registrations (bucket, object_key, space, root, op, proofs)
+			VALUES ($1, $2, $3, $4, $5, $6)
+		`, reg.Bucket, reg.ObjectKey, reg.Space.String(), reg.Root.Bytes(), string(reg.Op), reg.Proofs); err != nil {
+			return fmt.Errorf("registry: enqueue upload registration for %q: %w", name, err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("registry: commit cas %q: %w", name, err)
+	}
+	return nil
+}
+
+func (r *Postgres) casRoot(ctx context.Context, q pgxQuerier, name string, expect, next cid.Cid) error {
 	var (
 		expectBytes []byte
 		nextBytes   []byte
@@ -122,11 +170,11 @@ func (r *Postgres) CASRoot(ctx context.Context, name string, expect, next cid.Ci
 		err error
 	)
 	if expectBytes == nil {
-		tag, err = r.pool.Exec(ctx,
+		tag, err = q.Exec(ctx,
 			`UPDATE ingot.buckets SET root_cid = $1 WHERE name = $2 AND root_cid IS NULL`,
 			nextBytes, name)
 	} else {
-		tag, err = r.pool.Exec(ctx,
+		tag, err = q.Exec(ctx,
 			`UPDATE ingot.buckets SET root_cid = $1 WHERE name = $2 AND root_cid = $3`,
 			nextBytes, name, expectBytes)
 	}
@@ -135,7 +183,16 @@ func (r *Postgres) CASRoot(ctx context.Context, name string, expect, next cid.Ci
 	}
 	if tag.RowsAffected() == 0 {
 		// Either the bucket doesn't exist or the expected root didn't match.
-		if _, gerr := r.Get(ctx, name); errors.Is(gerr, ErrNotFound) {
+		// Asked through the same querier: from inside CASRootEnqueue's
+		// transaction this would otherwise want a second pooled connection
+		// while holding one, which deadlocks a single-connection pool.
+		var exists bool
+		if gerr := q.QueryRow(ctx,
+			`SELECT EXISTS (SELECT 1 FROM ingot.buckets WHERE name = $1)`, name,
+		).Scan(&exists); gerr != nil {
+			return fmt.Errorf("registry: cas %q: resolving conflict: %w", name, gerr)
+		}
+		if !exists {
 			return ErrNotFound
 		}
 		return ErrConflict
