@@ -149,7 +149,11 @@ Internal:
   the backend the bare `*fasthttp.RequestCtx` as its context, so the
   middleware stores the span as a request user value under the trace API's
   own key; `trace.SpanFromContext` on that context then finds it. A new
-  outbound HTTP client should use `tracing.NewHTTPClient()`.
+  outbound HTTP client should use `tracing.NewHTTPClient()`. Manual spans use
+  `tracing.Start` / `tracing.End` (an S3 error table outcome does not mark a
+  span failed); reads report their tier with `tracing.CountRead`, which lands
+  on the server span as `ingot.reads.*`. A streamed response (GetObject) keeps
+  its server span open until fasthttp has written the body.
 
 ## Interface seams
 

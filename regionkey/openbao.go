@@ -9,6 +9,8 @@ import (
 	"strings"
 
 	"github.com/openbao/openbao/api/v2"
+
+	"github.com/fil-forge/ingot/internal/tracing"
 )
 
 // OpenBaoProvider is the production region [Provider] of the regional
@@ -59,7 +61,11 @@ func NewOpenBaoProvider(client *api.Client, mount, key string) (*OpenBaoProvider
 // ciphertext is transit's "vault:vN:…" string, which embeds the version it
 // was wrapped under; WrappedKey.Version records the same version ("vN") for
 // the provider-agnostic bookkeeping column.
-func (p *OpenBaoProvider) Wrap(ctx context.Context, binding BindingContext, cek []byte) (WrappedKey, error) {
+func (p *OpenBaoProvider) Wrap(ctx context.Context, binding BindingContext, cek []byte) (_ WrappedKey, err error) {
+	// The OpenBao client cannot take the tracing HTTP transport, so the
+	// transit call is traced here.
+	ctx, span := tracing.StartClient(ctx, "openbao.encrypt")
+	defer func() { tracing.End(span, err) }()
 	secret, err := p.logical.WriteWithContext(ctx, p.mount+"/encrypt/"+p.key, map[string]interface{}{
 		"plaintext": base64.StdEncoding.EncodeToString(cek),
 		"context":   base64.StdEncoding.EncodeToString(bindingBytes(binding)),
@@ -86,7 +92,9 @@ func (p *OpenBaoProvider) Wrap(ctx context.Context, binding BindingContext, cek 
 // [ErrAuthentication]; a version the key no longer serves (behind
 // min_decryption_version, or from some other key entirely) surfaces as
 // [ErrUnknownVersion].
-func (p *OpenBaoProvider) Unwrap(ctx context.Context, binding BindingContext, wrapped WrappedKey) ([]byte, error) {
+func (p *OpenBaoProvider) Unwrap(ctx context.Context, binding BindingContext, wrapped WrappedKey) (_ []byte, err error) {
+	ctx, span := tracing.StartClient(ctx, "openbao.decrypt")
+	defer func() { tracing.End(span, err) }()
 	secret, err := p.logical.WriteWithContext(ctx, p.mount+"/decrypt/"+p.key, map[string]interface{}{
 		"ciphertext": string(wrapped.Ciphertext),
 		"context":    base64.StdEncoding.EncodeToString(bindingBytes(binding)),

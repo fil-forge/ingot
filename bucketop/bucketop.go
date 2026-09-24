@@ -31,6 +31,7 @@ import (
 	cbor "github.com/ipfs/go-ipld-cbor"
 
 	"github.com/fil-forge/ingot/blockstore"
+	"github.com/fil-forge/ingot/internal/tracing"
 	"github.com/fil-forge/ingot/mst"
 	"github.com/fil-forge/ingot/registry"
 )
@@ -97,7 +98,7 @@ func NewCoordinator(deps Deps) *Coordinator {
 // which the async flush path reads after the handler returns.
 func (c *Coordinator) Begin(ctx context.Context, bucket string) (*Tx, error) {
 	bucket = strings.Clone(bucket)
-	release := c.Lock(bucket)
+	release := c.lockTraced(ctx, bucket)
 
 	state, err := c.deps.Reg.Get(ctx, bucket)
 	if err != nil {
@@ -134,6 +135,14 @@ func (c *Coordinator) Lock(bucket string) func() {
 	return lock.Unlock
 }
 
+// lockTraced is Lock with the wait recorded as a bucket.lock span: time spent
+// here is time queued behind other writes to the same bucket.
+func (c *Coordinator) lockTraced(ctx context.Context, bucket string) func() {
+	_, span := tracing.Start(ctx, "bucket.lock")
+	defer span.End()
+	return c.Lock(bucket)
+}
+
 // MutateFn is the closure passed to WithTx. It receives the
 // transaction's bucket-state snapshot and the per-op staging
 // view, and returns the MST root the transaction should advance
@@ -162,7 +171,10 @@ type MutateFn func(ctx context.Context, tx *Tx) (newRoot cid.Cid, err error)
 //     wrapped (only reachable in cross-process races; the
 //     in-process bucket lock prevents it within one Coordinator).
 //   - Any error fn returns propagates verbatim.
-func (c *Coordinator) WithTx(ctx context.Context, bucket string, fn MutateFn) error {
+func (c *Coordinator) WithTx(ctx context.Context, bucket string, fn MutateFn) (err error) {
+	ctx, span := tracing.Start(ctx, "bucket.tx")
+	defer func() { tracing.End(span, err) }()
+
 	tx, err := c.Begin(ctx, bucket)
 	if err != nil {
 		return err
@@ -193,7 +205,7 @@ type LockFn func(ctx context.Context) error
 // (DeleteBucket's empty-check + delete; future bucket-policy
 // updates).
 func (c *Coordinator) WithLock(ctx context.Context, bucket string, fn LockFn) error {
-	release := c.Lock(bucket)
+	release := c.lockTraced(ctx, bucket)
 	defer release()
 	return fn(ctx)
 }
@@ -317,11 +329,13 @@ func (tx *Tx) LoadTree() *mst.MerkleSearchTree {
 // forge_root_cid pointing at an orphan Root the bucket never
 // published. See the TODO in pkg/ingot/registry/segments.go's
 // MarkSegmentFlushed for the planned conditional-update fix.
-func (tx *Tx) Commit(ctx context.Context, newRoot cid.Cid) error {
+func (tx *Tx) Commit(ctx context.Context, newRoot cid.Cid) (err error) {
 	if tx.release == nil {
 		return errors.New("bucketop: tx already finalized")
 	}
 	defer tx.finalize()
+	ctx, span := tracing.Start(ctx, "bucket.commit")
+	defer func() { tracing.End(span, err) }()
 
 	if err := tx.staging.Commit(ctx, newRoot); err != nil {
 		return fmt.Errorf("bucketop: append: %w", err)

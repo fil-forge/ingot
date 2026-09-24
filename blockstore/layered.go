@@ -9,6 +9,8 @@ import (
 	block "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
 	mh "github.com/multiformats/go-multihash"
+
+	"github.com/fil-forge/ingot/internal/tracing"
 )
 
 // Layered is the production ReadStore: a read-only seam that consults the local
@@ -55,6 +57,7 @@ func (l *Layered) GetBlock(ctx context.Context, space did.DID, c cid.Cid) (blk b
 	if l.spool != nil {
 		b, err := l.spool.GetBlock(ctx, space, c)
 		if err == nil {
+			tracing.CountRead(ctx, tracing.BlockSpool)
 			return b, nil
 		}
 		if !errors.Is(err, ErrNotFound) {
@@ -64,6 +67,7 @@ func (l *Layered) GetBlock(ctx context.Context, space did.DID, c cid.Cid) (blk b
 	if l.log != nil {
 		b, err := l.log.Get(ctx, c)
 		if err == nil {
+			tracing.CountRead(ctx, tracing.BlockLog)
 			return b, nil
 		}
 		if !errors.Is(err, ErrNotFound) {
@@ -82,6 +86,7 @@ func (l *Layered) OpenBlob(ctx context.Context, space did.DID, digest mh.Multiha
 	if br, ok := l.spool.(BlobReader); ok {
 		rc, err := br.OpenBlob(ctx, space, digest)
 		if err == nil {
+			tracing.CountRead(ctx, tracing.BlobSpool)
 			return rc, nil
 		}
 		if !errors.Is(err, ErrNotFound) {
@@ -89,7 +94,11 @@ func (l *Layered) OpenBlob(ctx context.Context, space did.DID, digest mh.Multiha
 		}
 	}
 	if br, ok := l.base.(BlobReader); ok {
-		return br.OpenBlob(ctx, space, digest)
+		rc, err := br.OpenBlob(ctx, space, digest)
+		if err == nil {
+			tracing.CountRead(ctx, tracing.BlobNetwork)
+		}
+		return rc, err
 	}
 	return nil, ErrNotFound
 }
@@ -102,6 +111,7 @@ func (l *Layered) OpenBlobRange(ctx context.Context, space did.DID, digest mh.Mu
 	if br, ok := l.spool.(BlobReader); ok {
 		rc, err := OpenBlobRangeOf(ctx, br, space, digest, start, end)
 		if err == nil {
+			tracing.CountRead(ctx, tracing.BlobSpool)
 			return rc, nil
 		}
 		if !errors.Is(err, ErrNotFound) {
@@ -109,7 +119,11 @@ func (l *Layered) OpenBlobRange(ctx context.Context, space did.DID, digest mh.Mu
 		}
 	}
 	if br, ok := l.base.(BlobReader); ok {
-		return OpenBlobRangeOf(ctx, br, space, digest, start, end)
+		rc, err := OpenBlobRangeOf(ctx, br, space, digest, start, end)
+		if err == nil {
+			tracing.CountRead(ctx, tracing.BlobNetwork)
+		}
+		return rc, err
 	}
 	return nil, ErrNotFound
 }

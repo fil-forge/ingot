@@ -10,9 +10,12 @@ import (
 
 	block "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 	"go.uber.org/zap"
 
 	"github.com/fil-forge/ingot/blockstore"
+	"github.com/fil-forge/ingot/internal/tracing"
 )
 
 // PlaneLog is one plane's independent LSM pipeline: one open segment
@@ -105,10 +108,21 @@ func openPlaneLog(ctx context.Context, plane blockstore.Plane, bucket, dir strin
 // not even create a segment (an MST-only S3 op writes no data blocks, so
 // the data plane stays dormant). The CAR is fsynced before Append
 // returns.
-func (pl *PlaneLog) Append(ctx context.Context, blocks []block.Block, opRoots ...blockstore.OpRoot) error {
+func (pl *PlaneLog) Append(ctx context.Context, blocks []block.Block, opRoots ...blockstore.OpRoot) (err error) {
 	if len(blocks) == 0 && len(opRoots) == 0 {
 		return nil
 	}
+	// The span covers the wait for the append lock and the segment write and
+	// fsync every acked write waits on.
+	var size int
+	for _, b := range blocks {
+		size += len(b.RawData())
+	}
+	ctx, span := tracing.Start(ctx, "log.append",
+		attribute.Int("ingot.log.blocks", len(blocks)),
+		attribute.Int("ingot.log.bytes", size),
+	)
+	defer func() { tracing.End(span, err) }()
 
 	pl.appMu.Lock()
 	defer pl.appMu.Unlock()
@@ -274,7 +288,13 @@ func (pl *PlaneLog) sealOpenIfDue(ctx context.Context, force bool) error {
 		}
 	}
 
-	if err := open.seal(ctx, pl.meta); err != nil {
+	sealCtx, span := tracing.Start(ctx, "log.seal",
+		attribute.String("ingot.log.plane", pl.plane.String()),
+		attribute.Int64("ingot.log.segment_bytes", open.Size()),
+	)
+	err := open.seal(sealCtx, pl.meta)
+	tracing.End(span, err)
+	if err != nil {
 		return err
 	}
 
@@ -309,11 +329,17 @@ func (pl *PlaneLog) flushLoop() {
 // stamps the ship state (in memory + in Meta — which advances
 // forge_root_cid for the catalog plane) and runs the retention sweep.
 func (pl *PlaneLog) flushOne(seg *Segment) {
-	ctx := context.Background()
+	// Each ship is its own trace: nothing upstream is waiting on it.
+	ctx, span := tracing.Start(context.Background(), "log.ship",
+		attribute.String("ingot.log.plane", pl.plane.String()),
+		attribute.Int64("ingot.log.segment_bytes", seg.Size()),
+	)
+	defer span.End()
 	const maxAttempts = 5
 	backoff := time.Second
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		span.SetAttributes(attribute.Int("ingot.log.attempts", attempt))
 		indexDigest, err := pl.pc.Flush(ctx, seg)
 		if err == nil {
 			now := time.Now().Unix()
@@ -328,6 +354,7 @@ func (pl *PlaneLog) flushOne(seg *Segment) {
 		pl.logger.Warn("logstore: ship attempt failed",
 			zap.Stringer("plane", pl.plane), zap.Uint64("seq", seg.Seq()),
 			zap.Int("attempt", attempt), zap.Error(err))
+		span.RecordError(err)
 		select {
 		case <-pl.closing:
 			return
@@ -339,6 +366,7 @@ func (pl *PlaneLog) flushOne(seg *Segment) {
 	}
 	pl.logger.Error("logstore: ship exhausted retries; segment remains unshipped",
 		zap.Stringer("plane", pl.plane), zap.Uint64("seq", seg.Seq()))
+	span.SetStatus(codes.Error, "ship exhausted retries")
 }
 
 // runRetention retires shipped segments beyond the Retain window and drops

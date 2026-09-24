@@ -15,6 +15,7 @@ import (
 
 	msbucket "github.com/fil-forge/ingot/bucket"
 	"github.com/fil-forge/ingot/bucketop"
+	"github.com/fil-forge/ingot/internal/tracing"
 	"github.com/fil-forge/ingot/mst"
 	"github.com/fil-forge/ingot/registry"
 )
@@ -158,7 +159,10 @@ func (b *Backend) resolveVersion(ctx context.Context, bucketName, key, versionID
 // bucket). Bucket existence outranks versionId validation: a malformed id
 // against a missing bucket reports NoSuchBucket, which the split preserves
 // because every caller resolves the bucket first.
-func (b *Backend) resolveVersionIn(ctx context.Context, st *registry.State, key, versionID string) (*resolvedVersion, error) {
+func (b *Backend) resolveVersionIn(ctx context.Context, st *registry.State, key, versionID string) (_ *resolvedVersion, err error) {
+	ctx, span := tracing.Start(ctx, "tree.lookup")
+	defer func() { tracing.End(span, err) }()
+
 	kind, seq := classifyVersionID(versionID)
 	if kind == versionKindInvalid {
 		return nil, errInvalidVersionID(versionID)
