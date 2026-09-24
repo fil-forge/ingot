@@ -464,11 +464,19 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 		// the bucket in place, and dropping the rows first would throw away a
 		// pending retraction for a root the upload service still holds, with
 		// nothing left to say it was owed.
-		dropped, err := b.uploadRegs.DeleteUploadRegistrationsBySpace(ctx, st.Space)
-		if err != nil {
-			return fmt.Errorf("s3frontend: delete bucket: drop upload registrations: %w", err)
-		}
-		if dropped > 0 {
+		//
+		// Best-effort, like the segment cleanup below and for the same reason:
+		// the space is already deleted, so failing here would report an error
+		// for a deletion that happened, and the retry could not finish the job
+		// either — hilt answers the second attempt with NoSuchBucket, which
+		// returns above and never reaches this line, leaving the bucket
+		// undeletable. Rows left behind are orphans the sweeper retries against
+		// a space that no longer exists, so they run out of attempts and
+		// dead-letter, out of the way of everything else.
+		if dropped, err := b.uploadRegs.DeleteUploadRegistrationsBySpace(ctx, st.Space); err != nil {
+			b.logger.Error("delete bucket: queued object-count changes left behind; they will dead-letter",
+				zap.String("bucket", name), zap.Stringer("space", st.Space), zap.Error(err))
+		} else if dropped > 0 {
 			b.logger.Info("delete bucket: dropped queued object-count changes",
 				zap.String("bucket", name), zap.Int64("changes", dropped))
 		}
