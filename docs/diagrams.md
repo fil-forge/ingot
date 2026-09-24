@@ -279,7 +279,7 @@ sequenceDiagram
     Note over B,R: post-commit, off the lock
     B->>R: reconcileClaims: blob_refs gains this version,<br/>superseded version rows removed
     B->>U: /blob/remove per digest whose CountClaims reached 0<br/>(+ crypto-shred: its blob_encryption_params row deleted)
-    B->>U: /upload/add(root = this version's manifest CID)<br/>+ /upload/remove per discarded version (best-effort)
+    B->>R: queue /upload/add(root = this version's manifest CID)<br/>+ /upload/remove per discarded version<br/>(upload_registrations, in the CAS transaction)
     B-->>C: 200 + ETag (+ x-amz-version-id when versioning is configured)
 ```
 
@@ -317,12 +317,41 @@ sequenceDiagram
   `NumberOfObjects`. Best-effort, as the index publication is: the object is
   durable and the response must say so, so a failure logs and the count
   under-reports rather than failing a write that succeeded.
+- The write does **not** call the upload service. It queues the change in
+  `ingot.upload_registrations` in the same transaction as the root CAS, and the
+  registration sweeper (`SweepUploadRegistrations`, every 30s) applies it. The
+  count is reporting data, so a Sprue round trip does not belong in a PUT, and
+  a Sprue outage delays the count instead of failing writes or losing it.
+- The row exists exactly when the version committed, and `seq` replays a key's
+  changes in commit order. A sweep spends **two round trips**, not one per
+  change: every queued addition in one batch, then every retraction in another.
+  Both halves are needed — a container sorts its tokens bytewise, so the
+  service may run a batch in any order, and a retraction sharing a batch with
+  the addition it retires could overtake it and leave the root counted for
+  good. Splitting by op is safe because a root is added by the commit that
+  creates the version and retracted by a later one, so an addition always
+  carries the lower `seq`.
+- A key with a refused change is held whole until it is due again, within the
+  sweep and across sweeps, so a later row can never overtake an earlier one.
+  Each row carries the delegation chain that authorizes it, captured from the
+  request that committed the version, because the sweeper has no request to
+  borrow authority from.
+- That chain is short lived — hilt expires its delegation to the gateway at the
+  next UTC midnight, so a change queued late in the day may hold minutes of
+  authority. The sweeper renews it from the space's live authority, which a
+  recent write leaves behind. A space that has gone quiet has none, and after
+  `uploadRegistrationDeadLetterAfter` attempts the row is **dead-lettered**:
+  out of the sweep, and out of the way of its key's later rows. (Nothing to do
+  with a parked blob, which is durable and awaiting its accept.) The count is then short by
+  that one change rather than frozen for that key, and `dead_letter_reason` records
+  why.
 
 Cross-references: [`architecture.md` §7.1](./architecture.md#71-write-single-shot-putobject).
 
 Sources: `s3frontend/object.go` (PutObject, ingestBody, uploadBlobs),
 `s3frontend/copy.go` (CopyObject, copySourceBucket),
-`s3frontend/version.go` (commitVersion, registerVersion), `bucketop/bucketop.go`,
+`s3frontend/version.go` (commitVersion, enqueueRegistration),
+`s3frontend/uploadsweep.go` (SweepUploadRegistrations), `bucketop/bucketop.go`,
 `blockstore/staging.go`, `uploader/blob.go`, `uploader/forge.go`,
 `uploader/upload.go`. Review when these change.
 
@@ -373,11 +402,11 @@ sequenceDiagram
             else inner block via shard_inclusions
                 LC-->>LY: shard location + inclusive byte range
             end
-            LY->>P: content/retrieve (UCAN, audience = the commitment's provider,<br/>proofs from reqscope.ProofStore;<br/>narrowed to the ciphertext span for an encrypted blob)
+            LY->>P: content/retrieve (UCAN, audience = the commitment's provider,<br/>proofs from reqscope.ProofStore - <br/>narrowed to the ciphertext span for an encrypted blob)
             P-->>LY: ranged bytes, length-checked
         end
         opt encrypted blob (FEE)
-            Note over B: aesstream.SpanReader decrypts the span as it streams;<br/>a tampered chunk fails authentication mid-stream (ErrCorrupted)
+            Note over B: aesstream.SpanReader decrypts the span as it streams - <br/>a tampered chunk fails authentication mid-stream (ErrCorrupted)
         end
     end
     B-->>C: 200 or 206 body (plaintext byte counts throughout)
@@ -430,10 +459,10 @@ sequenceDiagram
     C->>B: UploadPart(n) / UploadPartCopy(n)
     B->>B: openSession (non-open: NoSuchUpload)
     opt UploadPartCopy
-        B->>B: vet the source: copySourceBucket (tenant), resolveVersionIn,<br/>range within the object, copy-source preconditions (412);<br/>the body is the source's plaintext range through the decrypting reader
+        B->>B: vet the source: copySourceBucket (tenant), resolveVersionIn,<br/>range within the object, copy-source preconditions (412) - <br/>the body is the source's plaintext range through the decrypting reader
     end
     B->>B: ingestPart: splitSpool<br/>(resolve the tenant recipient, then encrypt per piece:<br/>fresh CEK → FEE envelope → spool under the ciphertext<br/>digest + params row, as in the PutObject diagram)
-    B->>R: PutPart(parked): open sessions only, the row held FOR SHARE<br/>against a concurrent latch; a refused part records its blobs' releases
+    B->>R: PutPart(parked): open sessions only, the row held FOR SHARE<br/>against a concurrent latch - a refused part records its blobs' releases
     loop each part blob (parkBlobs)
         alt blob_locations already has the digest
             B->>R: intent accepted (dedup, no park)
@@ -445,7 +474,7 @@ sequenceDiagram
             B->>R: PutPark(AddTask, AcceptTask, PutInvocation), intent parked
         end
     end
-    B-->>C: part ETag (part md5; for a copy, of the copied bytes)
+    B-->>C: part ETag (part md5 - for a copy, of the copied bytes)
     C->>B: CompleteMultipartUpload(parts)
     B->>B: validate parts (ascending, ETags, checksums, MinPartSize)
     alt session already completed
@@ -460,9 +489,9 @@ sequenceDiagram
         B-->>C: 200, ETag = md5-of-part-md5s + "-N"
     end
     C->>B: AbortMultipartUpload
-    B->>R: LatchSession(open to aborting); EnqueueReleases for every<br/>unreferenced part blob; then DeleteSession (parts cascade)
-    B->>U: releaseNow, per record: crypto-shred, then /blob/abort a parked blob<br/>(cause = AddTask) or /blob/remove an accepted one; local rows dropped<br/>once the network step succeeds; the release sweeper retries the rest
-    Note over B,R: a background sweeper tears down sessions whose state has not<br/>changed for MultipartSessionTTL (default 7d); a Complete's latch restarts the clock
+    B->>R: LatchSession(open to aborting) - EnqueueReleases for every<br/>unreferenced part blob - then DeleteSession (parts cascade)
+    B->>U: releaseNow, per record: crypto-shred, then /blob/abort a parked blob<br/>(cause = AddTask) or /blob/remove an accepted one - local rows dropped<br/>once the network step succeeds - the release sweeper retries the rest
+    Note over B,R: a background sweeper tears down sessions whose state has not<br/>changed for MultipartSessionTTL (default 7d) - a Complete's latch restarts the clock
 ```
 
 - A part re-upload and an abort record a release for every blob of theirs
