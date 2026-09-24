@@ -446,6 +446,20 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 			return fmt.Errorf("s3frontend: delete bucket: %w", err)
 		}
 
+		// The space's queued object-count changes go with it. Its count stops
+		// meaning anything once the space is deleted, and rows left behind
+		// would be retried against a space that no longer exists, keep their
+		// bearer proofs on disk, and — if this bucket name were reused — sit
+		// in front of the new bucket's registrations for the same key.
+		dropped, err := b.uploadRegs.DeleteUploadRegistrationsBySpace(ctx, st.Space)
+		if err != nil {
+			return fmt.Errorf("s3frontend: delete bucket: drop upload registrations: %w", err)
+		}
+		if dropped > 0 {
+			b.logger.Info("delete bucket: dropped queued object-count changes",
+				zap.String("bucket", name), zap.Int64("changes", dropped))
+		}
+
 		req, ok := reqscope.Request(ctx)
 		if !ok {
 			return errors.New("s3frontend: delete bucket: no request in context")

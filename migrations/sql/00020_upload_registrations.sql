@@ -39,8 +39,15 @@ CREATE TABLE ingot.upload_registrations (
 );
 
 -- The sweeper's claim order: due first, then commit order. Dead-lettered rows
--- are never claimed, so they stay out of the index.
+-- are never claimed, so they stay out of both indexes.
 CREATE INDEX upload_registrations_due_idx ON ingot.upload_registrations (next_at, seq)
+    WHERE dead_lettered_at IS NULL;
+
+-- The claim also asks, for each candidate, whether its key still holds an
+-- earlier row that is not due. Without an index in key order that anti-join
+-- rescans the outbox once per candidate, which is worst exactly when the queue
+-- is long and the sweeper most needs to keep up.
+CREATE INDEX upload_registrations_key_idx ON ingot.upload_registrations (bucket, object_key, seq)
     WHERE dead_lettered_at IS NULL;
 
 -- +goose Down

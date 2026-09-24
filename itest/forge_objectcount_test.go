@@ -88,6 +88,20 @@ func TestForgeObjectCount(t *testing.T) {
 	if left := ingotSQL(t, ctx, s, "SELECT count(*) FROM ingot.upload_registrations"); left != "0" {
 		t.Fatalf("upload_registrations still holds %s rows; the sweeper is not draining", left)
 	}
+
+	// Deleting the bucket takes its queued changes with it. A row left behind
+	// would be retried against a space that no longer exists, keep its bearer
+	// proofs on disk, and sit in front of a new bucket of the same name.
+	if err := ingottest.DeleteObject(ctx, cfg, bucket, "b"); err != nil {
+		t.Fatalf("delete b: %v", err)
+	}
+	if err := ingottest.DeleteBucket(ctx, cfg, bucket); err != nil {
+		t.Fatalf("delete bucket: %v", err)
+	}
+	q := fmt.Sprintf("SELECT count(*) FROM ingot.upload_registrations WHERE space = '%s'", space)
+	if left := ingotSQL(t, ctx, s, q); left != "0" {
+		t.Fatalf("the deleted bucket's space still holds %s queued changes", left)
+	}
 }
 
 // awaitObjectCount waits for the space's object count to reach want. The
