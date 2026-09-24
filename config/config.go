@@ -104,6 +104,31 @@ type Config struct {
 	// negative duration makes releases due immediately.
 	ReleaseGrace string `mapstructure:"release_grace" yaml:"release_grace"`
 
+	// SpoolMaxBytes is the byte budget for the local spool's blob files
+	// (<data_dir>/spool). A sweeper checks it every 30 seconds and evicts
+	// blobs the provider already holds, oldest first, down to 90% of the
+	// budget; reads of an evicted blob go to the provider. Usage can exceed
+	// the budget by ingest rate × 30 seconds between sweeps, and by files
+	// that must stay (blobs not yet accepted, orphans younger than
+	// SpoolOrphanAge). 0 → no budget (the default); negative is an error.
+	SpoolMaxBytes int64 `mapstructure:"spool_max_bytes" yaml:"spool_max_bytes"`
+	// SpoolMinResidency is the read-after-write window (Go duration string):
+	// the sweeper leaves alone a blob whose upload state changed less than
+	// this long ago (for a committed blob, its commit time) unless usage
+	// stays over budget without it. Costs ingest rate × residency in disk.
+	// Empty → default 10m; "0s" turns it off; negative is an error.
+	SpoolMinResidency string `mapstructure:"spool_min_residency" yaml:"spool_min_residency"`
+	// SpoolReadRetention is the read-cache window (Go duration string): the
+	// sweeper leaves alone a blob served from the spool within this long,
+	// unless usage stays over budget without it. Empty → default 1h; "0s"
+	// turns it off; negative is an error.
+	SpoolReadRetention string `mapstructure:"spool_read_retention" yaml:"spool_read_retention"`
+	// SpoolOrphanAge is the age (file modification time) at which the
+	// sweeper deletes a .tmp-* file or a spool file with no upload intent
+	// (Go duration string). It must exceed the longest time one request body
+	// takes to stream. Empty → default 24h; under 1h is an error.
+	SpoolOrphanAge string `mapstructure:"spool_orphan_age" yaml:"spool_orphan_age"`
+
 	// CatalogPlane overrides the catalog logstore pipeline knobs. Any field
 	// left zero/unset falls back to the top-level SealBytes / SealAge / Retain
 	// (and Ship defaults to true) — e.g. to configure the catalog never to ship.
@@ -184,6 +209,24 @@ func (c Config) ServerConfig() (ServerConfig, error) {
 			releaseGrace = 0
 		}
 	}
+	spoolMinResidency, err := parseSpoolWindow("spool_min_residency", c.SpoolMinResidency, 10*time.Minute)
+	if err != nil {
+		return ServerConfig{}, err
+	}
+	spoolReadRetention, err := parseSpoolWindow("spool_read_retention", c.SpoolReadRetention, time.Hour)
+	if err != nil {
+		return ServerConfig{}, err
+	}
+	spoolOrphanAge, err := parseSpoolWindow("spool_orphan_age", c.SpoolOrphanAge, 24*time.Hour)
+	if err != nil {
+		return ServerConfig{}, err
+	}
+	if spoolOrphanAge < time.Hour {
+		return ServerConfig{}, fmt.Errorf("ingot: spool_orphan_age %q: must be at least 1h, longer than any request body takes to stream", c.SpoolOrphanAge)
+	}
+	if c.SpoolMaxBytes < 0 {
+		return ServerConfig{}, fmt.Errorf("ingot: spool_max_bytes %d: must not be negative (0 means no budget)", c.SpoolMaxBytes)
+	}
 	// Render the CORS configuration here — the single place it is built —
 	// so a typo fails at startup (via Validate) rather than from New.
 	corsCfg, err := cors.Build(c.CORSAllowedOrigins)
@@ -208,7 +251,28 @@ func (c Config) ServerConfig() (ServerConfig, error) {
 
 		MultipartSessionTTL: mpTTL,
 		ReleaseGrace:        releaseGrace,
+
+		SpoolMaxBytes:      c.SpoolMaxBytes,
+		SpoolMinResidency:  spoolMinResidency,
+		SpoolReadRetention: spoolReadRetention,
+		SpoolOrphanAge:     spoolOrphanAge,
 	}, nil
+}
+
+// parseSpoolWindow parses one of the spool duration knobs: empty takes def,
+// negative is an error.
+func parseSpoolWindow(name, value string, def time.Duration) (time.Duration, error) {
+	if value == "" {
+		return def, nil
+	}
+	d, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, fmt.Errorf("ingot: parse %s %q: %w", name, value, err)
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("ingot: %s %q: must not be negative", name, value)
+	}
+	return d, nil
 }
 
 // planeSealAge resolves a plane's SealAge: the per-plane value if set,
