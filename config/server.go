@@ -49,6 +49,13 @@ type ServerConfig struct {
 	// from under it. Zero → default 7 days; negative → sweeper disabled.
 	MultipartSessionTTL time.Duration
 
+	// CompleteKeepaliveInterval is how long a CompleteMultipartUpload may run
+	// before its response commits to 200 OK and sends a space every interval
+	// until the result (or an <Error> document) ends the body. Such a
+	// response carries no x-amz-version-id header. Zero → default 5s;
+	// negative → keepalive off.
+	CompleteKeepaliveInterval time.Duration
+
 	// ReleaseGrace delays each blob release this long past the drop of its
 	// last reference claim, so in-flight readers of the prior catalog root
 	// finish first. Config.ServerConfig() applies the 60s default; zero here

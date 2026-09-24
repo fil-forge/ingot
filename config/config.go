@@ -97,6 +97,13 @@ type Config struct {
 	// sweeper.
 	MultipartSessionTTL string `mapstructure:"multipart_session_ttl" yaml:"multipart_session_ttl"`
 
+	// CompleteKeepaliveInterval keeps a slow CompleteMultipartUpload's
+	// connection alive (Go duration string): once completion has run this
+	// long, the response commits to 200 OK and sends a space every interval
+	// until the result, so a client's read timeout does not fire. Empty →
+	// default 5s; a negative duration turns the keepalive off.
+	CompleteKeepaliveInterval string `mapstructure:"complete_keepalive_interval" yaml:"complete_keepalive_interval"`
+
 	// ReleaseGrace delays each blob release (crypto-shred + location delete +
 	// network remove) this long past the drop of its last reference claim
 	// (Go duration string), so in-flight readers holding the prior catalog
@@ -174,6 +181,13 @@ func (c Config) ServerConfig() (ServerConfig, error) {
 			return ServerConfig{}, fmt.Errorf("ingot: parse multipart_session_ttl %q: %w", c.MultipartSessionTTL, err)
 		}
 	}
+	var completeKeepalive time.Duration
+	if c.CompleteKeepaliveInterval != "" {
+		completeKeepalive, err = time.ParseDuration(c.CompleteKeepaliveInterval)
+		if err != nil {
+			return ServerConfig{}, fmt.Errorf("ingot: parse complete_keepalive_interval %q: %w", c.CompleteKeepaliveInterval, err)
+		}
+	}
 	releaseGrace := 60 * time.Second
 	if c.ReleaseGrace != "" {
 		releaseGrace, err = time.ParseDuration(c.ReleaseGrace)
@@ -206,8 +220,9 @@ func (c Config) ServerConfig() (ServerConfig, error) {
 		ShipCatalog:      shipDefault(c.CatalogPlane.Ship),
 		RetainCatalog:    firstNonZeroInt(c.CatalogPlane.Retain, c.Retain),
 
-		MultipartSessionTTL: mpTTL,
-		ReleaseGrace:        releaseGrace,
+		MultipartSessionTTL:       mpTTL,
+		CompleteKeepaliveInterval: completeKeepalive,
+		ReleaseGrace:              releaseGrace,
 	}, nil
 }
 

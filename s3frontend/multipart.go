@@ -400,16 +400,23 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 // per S3; the abandoned-session sweeper reaps the row later.
 // replayWaitBudget / replayMaxTries bound how long a Complete that lost the
 // single-winner latch waits for the winner's terminal state before giving up
-// with errCompleteInProgress. Package-level so tests can shrink them.
+// with errCompleteInProgress. The budget bounds how long a loser occupies its
+// connection; it is not sized to let the winner finish. Package-level so tests
+// can shrink them.
 var (
 	replayWaitBudget = 10 * time.Second
 	replayMaxTries   = 64
 )
 
 // errCompleteInProgress is S3's OperationAborted: another Complete of this
-// upload is still running past the loser's wait budget. It is a 409 the
-// client retries; the retry finds the session completed and replays the
-// winner's result. (Not in the versitygw error table, hence built here.)
+// upload is still running past the loser's wait budget. As a plain 409 it is
+// terminal for the AWS CLI and other botocore-based clients, which retry only
+// transient errors and throttling, so the replay loop helps only a client that
+// retries on its own. A loser that outlasts the completion keepalive interval
+// (config CompleteKeepaliveInterval, default 5s, under the budget) reports it
+// inside the streamed 200 instead, which AWS SDKs rewrite to a 500 and retry;
+// the retry finds the session completed and replays the winner's result.
+// (Not in the versitygw error table, hence built here.)
 var errCompleteInProgress = s3err.APIError{
 	Code:           "OperationAborted",
 	Description:    "A conflicting conditional operation is currently in progress against this resource. Please try again.",
@@ -630,7 +637,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 	// If-None-Match loser. The wall-clock and iteration caps bound both a
 	// revert-livelock and the poll's request occupancy (no request deadline
 	// exists to inherit); exhausting them while the winner is still running
-	// is OperationAborted, a retryable conflict, never NoSuchUpload.
+	// is OperationAborted (see errCompleteInProgress), never NoSuchUpload.
 	completeWon := false
 	{
 		backoff := 5 * time.Millisecond
