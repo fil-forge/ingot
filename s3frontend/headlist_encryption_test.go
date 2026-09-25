@@ -3,8 +3,7 @@ package s3frontend
 import (
 	"bytes"
 	"context"
-	"crypto/md5"
-	"encoding/hex"
+	"crypto/sha256"
 	"fmt"
 	"io"
 	"os"
@@ -92,7 +91,8 @@ func TestHeadListReportPlaintextSizes(t *testing.T) {
 	single := testBody((200 << 10) + 37)
 	singleKey := "plain/single"
 	putObjV(t, b, singleKey, single)
-	singleETag := hex.EncodeToString(md5sum(single))
+	singleSum := sha256.Sum256(single)
+	singleETag := objectETag(singleSum[:])
 
 	// Multipart: two parts, the first spanning many envelopes. A composite
 	// checksum is declared so GetObjectAttributes emits the per-part list
@@ -102,7 +102,7 @@ func TestHeadListReportPlaintextSizes(t *testing.T) {
 	uploadID := mpCreate(t, b, mpKey, types.ChecksumAlgorithmCrc32c, types.ChecksumTypeComposite)
 	var completed []types.CompletedPart
 	var mpWhole []byte
-	etagCat := md5.New()
+	var partDigests [][]byte
 	for i, data := range parts {
 		pn := int32(i + 1)
 		sum := crc32cB64(data)
@@ -112,13 +112,13 @@ func TestHeadListReportPlaintextSizes(t *testing.T) {
 		}
 		completed = append(completed, types.CompletedPart{PartNumber: &pn, ETag: out.ETag, ChecksumCRC32C: out.ChecksumCRC32C})
 		mpWhole = append(mpWhole, data...)
-		md := md5.Sum(data)
-		etagCat.Write(md[:])
+		digest := sha256.Sum256(data)
+		partDigests = append(partDigests, digest[:])
 	}
 	if _, err := mpComplete(t, b, mpKey, uploadID, completed, nil); err != nil {
 		t.Fatalf("Complete: %v", err)
 	}
-	mpETag := hex.EncodeToString(etagCat.Sum(nil)) + "-2"
+	mpETag := multipartETag(partDigests)
 
 	type object struct {
 		key       string

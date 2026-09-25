@@ -3,7 +3,6 @@ package bucket
 import (
 	"bytes"
 	"context"
-	"crypto/md5"
 	"crypto/sha256"
 	"github.com/fil-forge/ucantone/did"
 	"io"
@@ -74,10 +73,6 @@ func TestSplitBody_StreamingRoundTrip(t *testing.T) {
 	wantSHA := sha256.Sum256(data)
 	if !bytes.Equal(body.SHA256, wantSHA[:]) {
 		t.Errorf("whole-body SHA256 mismatch")
-	}
-	wantMD5 := md5.Sum(data)
-	if !bytes.Equal(body.MD5, wantMD5[:]) {
-		t.Errorf("whole-body MD5 mismatch")
 	}
 
 	wantBounds := []struct{ start, end int64 }{{0, 4095}, {4096, 8191}, {8192, 9999}}
@@ -171,7 +166,7 @@ func (hashingDiscardWriter) WriteBlob(_ context.Context, r io.Reader) (mh.Multih
 }
 
 // BenchmarkSplitBody measures one stream through SplitBody: the whole-body
-// sha256 and md5 plus the spool's sha256 of each blob, with no disk.
+// sha256 plus the spool's sha256 of each blob, with no disk.
 func BenchmarkSplitBody(b *testing.B) {
 	const size = 64 << 20
 	data := makeData(size)
@@ -186,9 +181,7 @@ func BenchmarkSplitBody(b *testing.B) {
 }
 
 // BenchmarkSplitBodyParallel measures aggregate throughput with GOMAXPROCS
-// streams in flight, which is where the shared md5-simd server pays on
-// amd64 (its lanes pack concurrent MD5 streams onto one core); on other
-// architectures it tracks crypto/md5.
+// streams in flight.
 func BenchmarkSplitBodyParallel(b *testing.B) {
 	const size = 16 << 20
 	data := makeData(size)

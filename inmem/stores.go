@@ -620,7 +620,7 @@ func cloneEncryptionParams(p registry.BlobEncryptionParams) registry.BlobEncrypt
 }
 
 func clonePart(p registry.MultipartPart) registry.MultipartPart {
-	p.ETagMD5 = bytes.Clone(p.ETagMD5)
+	p.ETagDigest = bytes.Clone(p.ETagDigest)
 	if p.BlobDigests != nil {
 		ds := make([]multihash.Multihash, len(p.BlobDigests))
 		for i, d := range p.BlobDigests {
