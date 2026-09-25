@@ -5,10 +5,11 @@ import (
 	"context"
 	"crypto/md5"
 	"crypto/sha256"
-	"github.com/fil-forge/ucantone/did"
 	"io"
 	"path/filepath"
 	"testing"
+
+	"github.com/fil-forge/ucantone/did"
 
 	blobcmds "github.com/fil-forge/libforge/commands/blob"
 	"github.com/filecoin-project/go-fee/aesstream"
@@ -153,4 +154,53 @@ func TestSplitBody_Empty(t *testing.T) {
 	if !bytes.Equal(body.SHA256, emptySHA[:]) {
 		t.Errorf("empty SHA256 mismatch")
 	}
+}
+
+// hashingDiscardWriter stands in for the spool in benchmarks: it pays the
+// spool's sha256 pass over the bytes and drops them, so the benchmark
+// measures SplitBody's own hashing rather than the disk.
+type hashingDiscardWriter struct{}
+
+func (hashingDiscardWriter) WriteBlob(_ context.Context, r io.Reader) (mh.Multihash, int64, error) {
+	h := sha256.New()
+	n, err := io.Copy(h, r)
+	if err != nil || n == 0 {
+		return nil, n, err
+	}
+	digest, err := mh.Encode(h.Sum(nil), mh.SHA2_256)
+	return digest, n, err
+}
+
+// BenchmarkSplitBody measures one stream through SplitBody: the whole-body
+// sha256 and md5 plus the spool's sha256 of each blob, with no disk.
+func BenchmarkSplitBody(b *testing.B) {
+	const size = 64 << 20
+	data := makeData(size)
+	b.SetBytes(size)
+	b.ReportAllocs()
+
+	for b.Loop() {
+		if _, err := SplitBody(context.Background(), hashingDiscardWriter{}, bytes.NewReader(data), 0); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkSplitBodyParallel measures aggregate throughput with GOMAXPROCS
+// streams in flight, which is where the shared md5-simd server pays on
+// amd64 (its lanes pack concurrent MD5 streams onto one core); on other
+// architectures it tracks crypto/md5.
+func BenchmarkSplitBodyParallel(b *testing.B) {
+	const size = 16 << 20
+	data := makeData(size)
+	b.SetBytes(size)
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			if _, err := SplitBody(context.Background(), hashingDiscardWriter{}, bytes.NewReader(data), 0); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
 }
