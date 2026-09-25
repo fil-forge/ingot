@@ -5,10 +5,11 @@ import (
 	"context"
 	"crypto/md5"
 	"crypto/sha256"
-	"github.com/fil-forge/ucantone/did"
 	"io"
 	"path/filepath"
 	"testing"
+
+	"github.com/fil-forge/ucantone/did"
 
 	blobcmds "github.com/fil-forge/libforge/commands/blob"
 	"github.com/filecoin-project/go-fee/aesstream"
@@ -177,8 +178,8 @@ func BenchmarkSplitBody(b *testing.B) {
 	data := makeData(size)
 	b.SetBytes(size)
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+
+	for b.Loop() {
 		if _, err := SplitBody(context.Background(), hashingDiscardWriter{}, bytes.NewReader(data), 0); err != nil {
 			b.Fatal(err)
 		}
