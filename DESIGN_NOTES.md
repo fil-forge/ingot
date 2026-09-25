@@ -182,8 +182,7 @@ state. A release of a blob that was never committed also removes the spool
 copy and upload intent, the intent in the same transaction as the release
 record, since the intent is the only evidence of how far the blob ever got
 and a record outliving it would owe a network remove nothing can authorize.
-A committed blob's release leaves both, since its spool copy is the
-insurance copy until eviction. A record
+A committed blob's release removes both the same way. A record
 whose digest a part of an in-flight session still references waits: that
 session's Complete turns the reference into a claim, which makes the record
 stale, and its abort records a release of its own.
@@ -265,9 +264,9 @@ draws the chains and the stores.
 
 - **No HA.** A bucket is single-writer through an in-process lock; nothing
   coordinates across instances beyond the root CAS.
-- **The spool is unbounded** (#48): nothing evicts local body blobs, and
-  DeleteObject releases network-side only, so local disk grows with every
-  body byte written.
+- **The spool is unbounded** (#48): nothing evicts local body blobs, so
+  local disk grows with every body byte of every live object. A delete
+  frees its blobs' spool copies once their release runs.
 - **Spool crash recovery is not built**: reconciling `upload_intents`
   against `blob_refs` after a crash between commit and reconcile is a later
   phase; the window leaks rather than loses referenced data.

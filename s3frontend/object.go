@@ -668,12 +668,9 @@ func (b *Backend) drainSpaceReleases(ctx context.Context, space did.DID) error {
 // touched, so the retry reads the same state and takes the same step. Only
 // once the network holds nothing for this space do the park and location
 // rows go, park first so a partial failure leaves the retry on the same
-// path, and — for a blob that was never committed — the spool copy and
-// upload intent. The intent goes together with this release's own record,
-// in one transaction, since it is the only evidence of how far the blob
-// ever got. A committed blob is one whose intent is published, which its
-// first reference claim wrote atomically; it keeps those two, since its
-// spool copy is the insurance copy until eviction.
+// path, and then the spool copy and upload intent, committed or not. The
+// intent goes together with this release's own record, in one transaction,
+// since it is the only evidence of how far the blob ever got.
 func (b *Backend) executeRelease(ctx context.Context, pr registry.PendingRelease) bool {
 	space, digest := pr.Space, pr.Digest
 	log := b.logger.With(zap.String("digest", hex.EncodeToString(digest)))
@@ -768,9 +765,6 @@ func (b *Backend) executeRelease(ctx context.Context, pr registry.PendingRelease
 		ok = false
 	}
 	switch {
-	case in != nil && in.State == registry.IntentPublished:
-		// Committed at some point: the spool copy stays as the insurance
-		// copy until eviction, and the intent with it.
 	case !ok:
 		// A step above failed. The intent stays, with the spool copy, so
 		// the retry reads the same state: deleting it would turn a blob
