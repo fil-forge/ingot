@@ -3,7 +3,6 @@ package s3frontend
 import (
 	"bytes"
 	"context"
-	"encoding/hex"
 	"errors"
 	"io"
 	"net/http"
@@ -154,7 +153,7 @@ func TestCopyObject_ForeignTenantSourceIsAccessDenied(t *testing.T) {
 
 // A copy between spaces re-ingests the source's bytes: the destination reads
 // back the same bytes under new digests with their own claims, the source's
-// claims are untouched, the ETag is the md5 of the bytes, the source's
+// claims are untouched, the ETag is the single-part ETag of the bytes, the source's
 // checksum value carries over as a full-object value, and metadata follows
 // the directive.
 func TestCopyObject_CrossSpaceReingest(t *testing.T) {
@@ -188,8 +187,8 @@ func TestCopyObject_CrossSpaceReingest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("cross-space copy: %v", err)
 	}
-	if want := `"` + hex.EncodeToString(md5Sum(data)) + `"`; *out.CopyObjectResult.ETag != want {
-		t.Fatalf("copy ETag = %s, want md5 of the bytes %s", *out.CopyObjectResult.ETag, want)
+	if want := wantObjectETag(data); *out.CopyObjectResult.ETag != want {
+		t.Fatalf("copy ETag = %s, want the single-part ETag of the bytes %s", *out.CopyObjectResult.ETag, want)
 	}
 	if out.CopyObjectResult.ChecksumSHA256 == nil || *out.CopyObjectResult.ChecksumSHA256 != sha256B64(data) || out.CopyObjectResult.ChecksumType != types.ChecksumTypeFullObject {
 		t.Fatalf("copy checksum = %+v, want the source's SHA256 as FULL_OBJECT", out.CopyObjectResult)
@@ -373,8 +372,8 @@ func TestCopyObject_MultipartSourceETag(t *testing.T) {
 		t.Fatalf("copy of a multipart object: %v", err)
 	}
 	all := append(append([]byte{}, p1...), p2...)
-	if want := `"` + hex.EncodeToString(md5Sum(all)) + `"`; *out.CopyObjectResult.ETag != want {
-		t.Fatalf("copy ETag = %s, want md5 of the bytes %s", *out.CopyObjectResult.ETag, want)
+	if want := wantObjectETag(all); *out.CopyObjectResult.ETag != want {
+		t.Fatalf("copy ETag = %s, want the single-part ETag of the bytes %s", *out.CopyObjectResult.ETag, want)
 	}
 	if out.CopyObjectResult.ChecksumType != types.ChecksumTypeFullObject || out.CopyObjectResult.ChecksumCRC64NVME == nil {
 		t.Fatalf("copy checksum = %+v, want a FULL_OBJECT CRC64NVME", out.CopyObjectResult)
@@ -412,22 +411,6 @@ func TestCopyObject_UnknownTenantSourceIsAccessDenied(t *testing.T) {
 	}
 }
 
-func TestIsMultipartETag(t *testing.T) {
-	for etag, want := range map[string]bool{
-		"cce1266ca5dbeb465a0f39ec0d6c8ad5-2":    true,
-		`"cce1266ca5dbeb465a0f39ec0d6c8ad5-12"`: true,
-		"6eb9fc855f310f9dc251ab2e5dfe179f":      false,
-		`"6eb9fc855f310f9dc251ab2e5dfe179f"`:    false,
-		"not-an-etag":                           false,
-		"6eb9fc855f310f9dc251ab2e5dfe179f-":     false,
-		"6eb9fc855f310f9dc251ab2e5dfe179f-2-3":  false,
-	} {
-		if got := isMultipartETag(etag); got != want {
-			t.Errorf("isMultipartETag(%q) = %v, want %v", etag, got, want)
-		}
-	}
-}
-
 // A source written before every object carried a checksum has none to carry
 // over; the copy computes the default CRC64NVME over the bytes instead.
 func TestCopyObject_SourceWithoutChecksumGetsDefault(t *testing.T) {
@@ -442,7 +425,7 @@ func TestCopyObject_SourceWithoutChecksumGetsDefault(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	legacy := &msbucket.ObjectManifest{Key: "legacy", Created: time.Now().Unix(), Body: body, ETag: hex.EncodeToString(body.MD5), ContentType: "application/octet-stream"}
+	legacy := &msbucket.ObjectManifest{Key: "legacy", Created: time.Now().Unix(), Body: body, ETag: objectETag(body.SHA256), ContentType: "application/octet-stream"}
 	if _, _, err := b.commitVersion(ctx, st, "legacy", legacy, nil, false, nil); err != nil {
 		t.Fatal(err)
 	}

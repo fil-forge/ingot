@@ -3,7 +3,6 @@ package s3frontend
 import (
 	"bytes"
 	"context"
-	"crypto/md5"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -192,13 +191,13 @@ func (b *Backend) bucketSpace(ctx context.Context, bucketName string) (did.DID, 
 
 // UploadPart ingests one part: it coarse-splits the part body into blobs,
 // spools each to local disk (recording upload_intents), records the part
-// (its ordered blob digests, md5, size, checksum), and uploads each blob to
+// (its ordered blob digests, digest, size, checksum), and uploads each blob to
 // its provider — PARKED, not accepted: the /http/put conclude that triggers
 // /blob/accept is deferred to Complete, so the bytes are durable but stay
 // out of the PDP pipeline, and an Abort unwinds them with /blob/abort
 // (§7.2). Re-uploading a part number supersedes the prior part; the
 // superseded part's now-unreferenced blobs are dropped from the spool and
-// rejected. The part ETag is the hex md5 of the part bytes.
+// rejected. The part ETag is the hex sha256 of the part bytes (etag.go).
 //
 // The part checksum follows the session's CreateMultipartUpload declaration:
 // a declared algorithm is computed (and validated against a client-supplied
@@ -230,7 +229,7 @@ func (b *Backend) UploadPart(ctx context.Context, input *s3.UploadPartInput) (*s
 }
 
 // ingestedPart is what ingestPart records and reports for one part: its quoted
-// ETag (hex md5 of the part bytes) and the checksum to echo to the client, if
+// ETag (hex sha256 of the part bytes) and the checksum to echo to the client, if
 // any (the session's algorithm, or one the client asked for on this part).
 type ingestedPart struct {
 	etag     string
@@ -342,7 +341,7 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 	if err := b.multipart.PutPart(ctx, registry.MultipartPart{
 		UploadID:    uploadID,
 		PartNumber:  partNumber,
-		ETagMD5:     rec.MD5,
+		ETagDigest:  rec.SHA256,
 		Size:        rec.Size,
 		Checksum:    hr.Sum(),
 		BlobDigests: bodyDigests(rec),
@@ -372,7 +371,7 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 		return nil, fmt.Errorf("s3frontend: park part blobs: %w", err)
 	}
 	b.releaseNow(ctx, superseding)
-	out := &ingestedPart{etag: `"` + hex.EncodeToString(rec.MD5) + `"`, size: rec.Size}
+	out := &ingestedPart{etag: `"` + partETag(rec.SHA256) + `"`, size: rec.Size}
 	switch {
 	case sessAlgo != "":
 		out.echoAlgo, out.echoSum = sessAlgo, hr.Sum()
@@ -388,7 +387,7 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 // it latches the session (single-winner vs Abort), validates the client's part
 // list against the recorded parts, accepts every part's blobs on Forge, and
 // commits a manifest whose Body is the ordered union of the parts' blobs. The
-// object ETag is hex(md5(concat of part md5s)) + "-N".
+// object ETag is hex(sha256(concat of part digests)) + "-N" (etag.go).
 //
 // The blobs are concluded off the bucket lock, so a teardown (DeleteBucket,
 // the stale-session sweeper) can take the 'completing' row meanwhile; both
@@ -519,9 +518,9 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 
 	// Validate the requested parts (in-range and ascending, each matching a
 	// recorded part by number + ETag + checksum) and compute the multipart
-	// ETag while accumulating the final checksum.
+	// ETag (etag.go) while accumulating the final checksum.
 	requested := make([]registry.MultipartPart, 0, len(input.MultipartUpload.Parts))
-	etagHasher := md5.New()
+	partDigests := make([][]byte, 0, len(input.MultipartUpload.Parts))
 	prev := 0
 	for _, rp := range input.MultipartUpload.Parts {
 		// A part entry missing either field is malformed XML; a part number
@@ -544,7 +543,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 		if !ok {
 			return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrInvalidPart)
 		}
-		if !etagsEqual(*rp.ETag, hex.EncodeToString(sp.ETagMD5)) {
+		if !etagsEqual(*rp.ETag, partETag(sp.ETagDigest)) {
 			return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrInvalidPart)
 		}
 		stored := ""
@@ -555,7 +554,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 			return s3response.CompleteMultipartUploadResult{}, "", err
 		}
 		requested = append(requested, sp)
-		etagHasher.Write(sp.ETagMD5)
+		partDigests = append(partDigests, sp.ETagDigest)
 		// Accumulate from the STORED checksum (validation just proved any
 		// client-supplied value equal to it, and it also covers the internal
 		// CRC64NVME and the idempotent re-Complete).
@@ -593,7 +592,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 			return s3response.CompleteMultipartUploadResult{}, "", s3err.GetIncorrectMpObjectSizeErr(total, *input.MpuObjectSize)
 		}
 	}
-	etag := hex.EncodeToString(etagHasher.Sum(nil)) + "-" + strconv.Itoa(len(requested))
+	etag := multipartETag(partDigests)
 
 	// Derive the final checksum and verify a client-supplied value against
 	// it. A composite value may arrive bare (no "-N" part-count suffix); a
@@ -1345,7 +1344,7 @@ func (b *Backend) ListParts(ctx context.Context, input *s3.ListPartsInput) (s3re
 		}
 		part := s3response.Part{
 			PartNumber:   p.PartNumber,
-			ETag:         `"` + hex.EncodeToString(p.ETagMD5) + `"`,
+			ETag:         `"` + partETag(p.ETagDigest) + `"`,
 			Size:         p.Size,
 			LastModified: p.CreatedAt.UTC(),
 		}

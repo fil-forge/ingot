@@ -2,12 +2,10 @@ package s3frontend
 
 import (
 	"context"
-	"crypto/md5"
-	"encoding/hex"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
-	"regexp"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
@@ -30,9 +28,9 @@ import (
 // each blob's key is wrapped bound to (space, digest): the source's plaintext
 // instead streams through the decrypting read path into new blobs under the
 // destination's space, exactly as a PUT of those bytes would, and the copy has
-// its own digests and claims. Either way the copy's ETag is the md5 of its
-// bytes (so a multipart source's "-N" ETag is not carried over, as on S3) and
-// its checksum is a full-object value. Honors MetadataDirective (COPY = inherit
+// its own digests and claims. Either way the copy's ETag is the single-part
+// ETag of its bytes (so a multipart source's part count is not carried over,
+// as on S3) and its checksum is a full-object value. Honors MetadataDirective (COPY = inherit
 // source metadata; REPLACE = take it from the request) and the
 // x-amz-copy-source-if-* preconditions. The source bucket must belong to the
 // destination's tenant (copySourceBucket), backing up hilt's own decision on
@@ -150,9 +148,10 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 	//
 	//   - same space, single-part source, same algorithm: pin the source's body
 	//     and ETag verbatim, no read;
-	//   - same space, but a multipart source (its ETag is md5-of-md5s + "-N",
-	//     its checksum possibly composite) or a different algorithm requested:
-	//     pin the body, stream it once to compute the md5 ETag and checksum;
+	//   - same space, but a multipart source (its ETag is the digest of its
+	//     part digests, its checksum possibly composite) or a different
+	//     algorithm requested: pin the body, stream it once to compute the
+	//     single-part ETag and checksum;
 	//   - another space: stream it once through ingestBody into new blobs
 	//     under the destination space; the ETag and checksum come from that
 	//     pass.
@@ -160,7 +159,7 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 	// The pinned body drops its part geometry: the copy is a single-part
 	// object, as on S3.
 	crossSpace := srcRv.st.Space != bucketState.Space
-	multipartSrc := len(srcMf.Body.PartSizes) > 0 || isMultipartETag(srcMf.ETag)
+	multipartSrc := len(srcMf.Body.PartSizes) > 0
 	ckAlgo := srcMf.ChecksumAlgorithm
 	if input.ChecksumAlgorithm != "" {
 		ckAlgo = string(input.ChecksumAlgorithm)
@@ -198,19 +197,19 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 				}
 				return s3response.CopyObjectOutput{}, fmt.Errorf("s3frontend: copy ingest: %w", err)
 			}
-			etag = hex.EncodeToString(body.MD5)
+			etag = objectETag(body.SHA256)
 		} else if multipartSrc {
-			// The pinned body keeps its bytes; only the md5 the source never
-			// recorded (its ETag is md5-of-md5s) is computed alongside the
-			// checksum.
-			sum := md5.New()
+			// The pinned body keeps its bytes; only the whole-body digest the
+			// source never recorded (its ETag is the digest of its part
+			// digests) is computed alongside the checksum.
+			sum := sha256.New()
 			if _, err := io.Copy(sum, hr); err != nil {
 				return s3response.CopyObjectOutput{}, fmt.Errorf("s3frontend: copy checksum: %w", err)
 			}
-			etag = hex.EncodeToString(sum.Sum(nil))
+			etag = objectETag(sum.Sum(nil))
 		} else {
-			// A single-part source's ETag already is the md5; only the newly
-			// requested checksum needs the pass.
+			// A single-part source's ETag already is its body's; only the
+			// newly requested checksum needs the pass.
 			if _, err := io.Copy(io.Discard, hr); err != nil {
 				return s3response.CopyObjectOutput{}, fmt.Errorf("s3frontend: copy checksum: %w", err)
 			}
@@ -290,14 +289,6 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 	}
 	return out, nil
 }
-
-// multipartETag is the ETag shape a completed multipart upload records: the hex
-// md5 of the parts' md5s and the part count. Manifests written before part
-// geometry was recorded carry only this to say they were assembled from parts.
-var multipartETag = regexp.MustCompile(`^"?[0-9a-f]{32}-[0-9]+"?$`)
-
-// isMultipartETag reports whether etag has the multipart shape.
-func isMultipartETag(etag string) bool { return multipartETag.MatchString(etag) }
 
 // copySourceBucket resolves the copy source's bucket and requires it to belong
 // to the destination bucket's tenant. hilt authorizes a copy as a write to the

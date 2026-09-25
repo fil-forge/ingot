@@ -4,7 +4,7 @@ package itest
 
 import (
 	"context"
-	"crypto/md5"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -497,9 +497,23 @@ func bigObjectClient(t *testing.T, endpoint, accessKey, secretKey string) *s3.Cl
 	})
 }
 
-func quotedMD5(b []byte) string {
-	sum := md5.Sum(b)
-	return `"` + hex.EncodeToString(sum[:]) + `"`
+// quotedETag is the quoted ETag ingot returns for a single-part object of
+// these bytes: the hex sha256 with the "-1" part-count suffix
+// (s3frontend/etag.go).
+func quotedETag(b []byte) string {
+	sum := sha256.Sum256(b)
+	return `"` + hex.EncodeToString(sum[:]) + `-1"`
+}
+
+// quotedMultipartETag is the quoted ETag ingot returns for a completed
+// multipart upload of these parts, in part-number order.
+func quotedMultipartETag(parts [][]byte) string {
+	cat := sha256.New()
+	for _, p := range parts {
+		sum := sha256.Sum256(p)
+		cat.Write(sum[:])
+	}
+	return `"` + hex.EncodeToString(cat.Sum(nil)) + "-" + strconv.Itoa(len(parts)) + `"`
 }
 
 // patternBytes returns n deterministic bytes — a cheap way to make a payload

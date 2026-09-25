@@ -483,6 +483,7 @@ func buildS3API(ctx context.Context, backend *s3frontend.Backend, cfg config.Ser
 			c.Locals(reqscope.RequestKey(), fasthttputil.RequestFromHTTPContext(c.RequestCtx()))
 			return c.Next()
 		}),
+		s3api.WithMiddleware("/", sseResponseHeader),
 	}
 	// Public DID document for did:web resolution of the agent identity, so
 	// hilt/sprue/piri can verify ingot's UCAN signatures. WithRoute mounts
@@ -597,4 +598,24 @@ func applyServerDefaults(cfg config.ServerConfig) config.ServerConfig {
 		cfg.MaxRequests = 4096
 	}
 	return cfg
+}
+
+// sseResponseHeaderValue is what every object response reports for
+// x-amz-server-side-encryption: every object Ingot stores is encrypted
+// server-side to a key the tenant does not hold, which is SSE-KMS in S3's
+// vocabulary.
+const sseResponseHeaderValue = "aws:kms"
+
+// sseResponseHeader adds x-amz-server-side-encryption to every response that
+// carries an ETag header (PutObject, UploadPart, CopyObject, UploadPartCopy,
+// CompleteMultipartUpload, HeadObject, GetObject). S3 documents that an
+// SSE-KMS object's ETag is not an MD5 of its bytes, and clients that would
+// otherwise verify the ETag as one (s3cmd, the Java v1 SDK) read this header
+// to skip that check; see s3frontend/etag.go for the ETag itself.
+func sseResponseHeader(c fiber.Ctx) error {
+	err := c.Next()
+	if len(c.Response().Header.Peek(fiber.HeaderETag)) > 0 {
+		c.Set("x-amz-server-side-encryption", sseResponseHeaderValue)
+	}
+	return err
 }

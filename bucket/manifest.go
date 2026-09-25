@@ -80,12 +80,11 @@ type ObjectManifest struct {
 // ordered union of its parts' blobs. A zero-byte object has no blobs.
 //
 // Size and SHA256 are whole-object values (the total byte count and the
-// sha256 of the full body, for integrity). MD5 is the whole-object md5,
-// the source for a single-part object's S3 ETag.
+// sha256 of the full body, for integrity). SHA256 is also the source of a
+// single-part object's S3 ETag (s3frontend/etag.go).
 type Body struct {
 	Size   int64     `cborgen:"s"`
 	SHA256 []byte    `cborgen:"h"`
-	MD5    []byte    `cborgen:"m"`
 	Blobs  []BlobRef `cborgen:"bl"`
 
 	// PartSizes records the byte length of each multipart part, in upload order,

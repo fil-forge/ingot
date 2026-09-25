@@ -4,8 +4,6 @@ package itest
 
 import (
 	"bytes"
-	"crypto/md5"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -73,9 +71,11 @@ func TestForgeScenarios(t *testing.T) {
 
 	// BlobSplitMultiBlobRoundTrip: a PUT several times larger than
 	// max_blob_size is coarsely split into multiple BlobRefs; the
-	// whole-object GET, boundary-spanning ranged GETs, and md5 ETag all
+	// whole-object GET, boundary-spanning ranged GETs, and ETag all
 	// reconstruct the exact bytes, and the bodies land in the spool by
-	// digest (the data-plane inversion) — not journaled into the log.
+	// digest (the data-plane inversion) — not journaled into the log. The
+	// PUT and HEAD responses also report the object as SSE-KMS encrypted,
+	// the header that tells clients the ETag is not an MD5.
 	t.Run("BlobSplitMultiBlobRoundTrip", func(t *testing.T) {
 		const bucket = "blob-split"
 		if _, err := cl.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
@@ -95,8 +95,11 @@ func TestForgeScenarios(t *testing.T) {
 		if err != nil {
 			t.Fatalf("PutObject: %v", err)
 		}
-		if want := quotedMD5(data); aws.ToString(put.ETag) != want {
+		if want := quotedETag(data); aws.ToString(put.ETag) != want {
 			t.Fatalf("PUT ETag = %s, want %s", aws.ToString(put.ETag), want)
+		}
+		if put.ServerSideEncryption != types.ServerSideEncryptionAwsKms {
+			t.Fatalf("PUT x-amz-server-side-encryption = %q, want aws:kms", put.ServerSideEncryption)
 		}
 		if got := spoolBlobCount(t, ctx, s) - spoolBefore; got != 4 {
 			t.Fatalf("PUT added %d spool blobs, want 4 — bodies must be spooled by digest, not logged", got)
@@ -128,20 +131,23 @@ func TestForgeScenarios(t *testing.T) {
 		if aws.ToInt64(head.ContentLength) != size {
 			t.Fatalf("HEAD ContentLength = %d, want %d", aws.ToInt64(head.ContentLength), size)
 		}
-		if want := quotedMD5(data); aws.ToString(head.ETag) != want {
+		if want := quotedETag(data); aws.ToString(head.ETag) != want {
 			t.Fatalf("HEAD ETag = %s, want %s", aws.ToString(head.ETag), want)
+		}
+		if head.ServerSideEncryption != types.ServerSideEncryptionAwsKms {
+			t.Fatalf("HEAD x-amz-server-side-encryption = %q, want aws:kms", head.ServerSideEncryption)
 		}
 	})
 
 	// ZeroByteObject: a 0-byte object stores no blob, round-trips empty,
-	// and carries the well-known empty-content md5 ETag.
+	// and carries the empty body's ETag.
 	t.Run("ZeroByteObject", func(t *testing.T) {
 		const bucket = "zero-byte"
 		if _, err := cl.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
 			t.Fatalf("CreateBucket: %v", err)
 		}
 
-		const emptyMD5 = `"d41d8cd98f00b204e9800998ecf8427e"`
+		emptyETag := quotedETag(nil)
 		spoolBefore := spoolBlobCount(t, ctx, s)
 		put, err := cl.PutObject(ctx, &s3.PutObjectInput{
 			Bucket: aws.String(bucket),
@@ -151,8 +157,8 @@ func TestForgeScenarios(t *testing.T) {
 		if err != nil {
 			t.Fatalf("PutObject: %v", err)
 		}
-		if aws.ToString(put.ETag) != emptyMD5 {
-			t.Fatalf("PUT ETag = %s, want %s", aws.ToString(put.ETag), emptyMD5)
+		if aws.ToString(put.ETag) != emptyETag {
+			t.Fatalf("PUT ETag = %s, want %s", aws.ToString(put.ETag), emptyETag)
 		}
 		if got := spoolBlobCount(t, ctx, s) - spoolBefore; got != 0 {
 			t.Fatalf("zero-byte PUT added %d spool blobs, want 0", got)
@@ -168,8 +174,8 @@ func TestForgeScenarios(t *testing.T) {
 		if aws.ToInt64(head.ContentLength) != 0 {
 			t.Fatalf("HEAD ContentLength = %d, want 0", aws.ToInt64(head.ContentLength))
 		}
-		if aws.ToString(head.ETag) != emptyMD5 {
-			t.Fatalf("HEAD ETag = %s, want %s", aws.ToString(head.ETag), emptyMD5)
+		if aws.ToString(head.ETag) != emptyETag {
+			t.Fatalf("HEAD ETag = %s, want %s", aws.ToString(head.ETag), emptyETag)
 		}
 	})
 
@@ -316,8 +322,7 @@ func TestForgeScenarios(t *testing.T) {
 			t.Fatalf("PutObject: %v", err)
 		}
 		sizes, total := envelopeSizes(t, before, spoolBlobPaths(t, ctx, s))
-		sum := md5.Sum(single)
-		objects = append(objects, object{"single", single, hex.EncodeToString(sum[:]), sizes, total})
+		objects = append(objects, object{"single", single, strings.Trim(quotedETag(single), `"`), sizes, total})
 
 		// Multipart: two parts, the first spanning many envelopes.
 		partData := [][]byte{tagged(patternBytes((5<<20)+4096), 0x61), tagged(patternBytes(9<<10), 0x62)}
@@ -328,7 +333,6 @@ func TestForgeScenarios(t *testing.T) {
 		}
 		var completed []types.CompletedPart
 		var mpWhole []byte
-		etagCat := md5.New()
 		for i, data := range partData {
 			pn := int32(i + 1)
 			up, err := cl.UploadPart(ctx, &s3.UploadPartInput{
@@ -340,8 +344,6 @@ func TestForgeScenarios(t *testing.T) {
 			}
 			completed = append(completed, types.CompletedPart{PartNumber: aws.Int32(pn), ETag: up.ETag})
 			mpWhole = append(mpWhole, data...)
-			md := md5.Sum(data)
-			etagCat.Write(md[:])
 		}
 		if _, err := cl.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
 			Bucket: aws.String(bucket), Key: aws.String("multipart"), UploadId: create.UploadId,
@@ -350,7 +352,7 @@ func TestForgeScenarios(t *testing.T) {
 			t.Fatalf("CompleteMultipartUpload: %v", err)
 		}
 		sizes, total = envelopeSizes(t, before, spoolBlobPaths(t, ctx, s))
-		mp := object{"multipart", mpWhole, hex.EncodeToString(etagCat.Sum(nil)) + "-2", sizes, total}
+		mp := object{"multipart", mpWhole, strings.Trim(quotedMultipartETag(partData), `"`), sizes, total}
 		objects = append(objects, mp)
 
 		for _, o := range objects {
@@ -482,7 +484,7 @@ func TestForgeScenarios(t *testing.T) {
 
 	// MultipartOutOfOrderParts: part numbers, not arrival order, define the
 	// object. Parts uploaded 3, 1, 2 list ascending by part number; Complete
-	// assembles the body and the md5-of-md5s ETag in part-number order; a
+	// assembles the body and the digest-of-part-digests ETag in part-number order; a
 	// range across the part-1→part-2 boundary and ?partNumber=2 both read
 	// the re-sequenced blob list. Distinct content per part so a body glued
 	// in arrival order cannot pass the comparison.
@@ -538,14 +540,11 @@ func TestForgeScenarios(t *testing.T) {
 
 		var completed []types.CompletedPart
 		var whole []byte
-		etagCat := md5.New()
 		for i, data := range partData {
 			completed = append(completed, types.CompletedPart{PartNumber: aws.Int32(int32(i + 1)), ETag: etags[i]})
 			whole = append(whole, data...)
-			sum := md5.Sum(data)
-			etagCat.Write(sum[:])
 		}
-		wantETag := hex.EncodeToString(etagCat.Sum(nil)) + "-3"
+		wantETag := strings.Trim(quotedMultipartETag(partData), `"`)
 
 		comp, err := cl.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
 			Bucket: aws.String(bucket), Key: aws.String(key), UploadId: uploadID,
@@ -555,7 +554,7 @@ func TestForgeScenarios(t *testing.T) {
 			t.Fatalf("CompleteMultipartUpload: %v", err)
 		}
 		if got := strings.Trim(aws.ToString(comp.ETag), `"`); got != wantETag {
-			t.Fatalf("complete ETag = %q, want %q (md5-of-md5s in part-number order)", got, wantETag)
+			t.Fatalf("complete ETag = %q, want %q (digest of part digests in part-number order)", got, wantETag)
 		}
 
 		if got := getBody(t, ctx, cl, bucket, key, ""); !bytes.Equal(got, whole) {

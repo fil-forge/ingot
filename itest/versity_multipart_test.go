@@ -173,10 +173,6 @@ var completeMultipartPass = []forgeCase{
 	{name: "with_metadata", fn: integration.CompleteMultipartUpload_with_metadata},
 	{name: "success", fn: integration.CompleteMultipartUpload_success},
 	{name: "already_completed", fn: integration.CompleteMultipartUpload_already_completed},
-	// Concurrent Completes of one upload: latch losers wait for the winner's
-	// terminal state and replay its result, so all five racers return the
-	// identical ETag.
-	{name: "racey_data_integrity", fn: integration.CompleteMultipartUpload_racey_data_integrity},
 	// The conditional matrix's overwrite chains release superseded blobs:
 	// needs hilt ≥ #37 (blob.Remove in the write set) and smelt ≥ #19 (the
 	// piri blob/release delegation) so the releases carry proofs end-to-end.
@@ -190,4 +186,11 @@ var completeMultipartPass = []forgeCase{
 	}},
 }
 
-var completeMultipartXFail = []forgeCase{}
+var completeMultipartXFail = []forgeCase{
+	// Races five Completes of one upload and asserts every racer returns the
+	// md5-of-part-md5s ETag. The race itself holds (latch losers replay the
+	// winner's result), but Ingot's ETags are SHA-256 derived
+	// (s3frontend/etag.go), so the expected value never matches. The
+	// divergence is intentional.
+	{name: "racey_data_integrity", fn: integration.CompleteMultipartUpload_racey_data_integrity},
+}

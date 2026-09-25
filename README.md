@@ -43,7 +43,7 @@ ingot ports it rather than depending on it, for three reasons:
 ## How buckets map onto the MST and Postgres
 
 Each bucket is one MST: an ordered map from **object key → value block**. A
-key's value is its object manifest (size, sha256 and md5, the S3 system
+key's value is its object manifest (size, sha256, the S3 system
 headers and user metadata, and the ordered list of content-addressed body
 blobs that cover it); a key with retained versions groups them under a
 per-key leaf ([`docs/s3-versioning.md`](./docs/s3-versioning.md)). Because
@@ -68,7 +68,7 @@ to the new one. That split is the heart of the design:
 
 A write splits into two paths:
 
-- **Bodies** stream into a local spool (sha256 and md5 in one pass), split
+- **Bodies** stream into a local spool (sha256 in one pass), split
   into blobs of at most `max_blob_size`, and upload to Forge storage
   synchronously: `/blob/add` via sprue, an HTTP PUT to the allocated piri,
   and the accepted location commitment, all before the catalog commit.

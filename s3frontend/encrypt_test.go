@@ -4,9 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ecdh"
-	"crypto/md5"
 	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -92,15 +90,15 @@ func TestEncryptedWrite_RoundTrip(t *testing.T) {
 // TestEncryptedWrite_Opacity: every stored blob is a FEE envelope — larger
 // than its plaintext, named by a digest that is not hash(plaintext), sharing
 // no window with the plaintext, and carrying a blob_encryption_params row.
-// The object's ETag stays the plaintext md5.
+// The object's ETag stays a plaintext value (the single-part ETag).
 func TestEncryptedWrite_Opacity(t *testing.T) {
 	ctx := context.Background()
 	b, mem, _ := newRefTestBackend(t)
 	data := testBody(4 << 10)
 
 	out := putObjV(t, b, "k1", data)
-	if want := `"` + hex.EncodeToString(md5sum(data)) + `"`; out.ETag != want {
-		t.Fatalf("ETag = %q, want the plaintext md5 %q", out.ETag, want)
+	if want := wantObjectETag(data); out.ETag != want {
+		t.Fatalf("ETag = %q, want the plaintext single-part ETag %q", out.ETag, want)
 	}
 
 	d := blobDigestOf(t, b, "k1", "")
@@ -144,8 +142,8 @@ func TestEncryptedWrite_ZeroByteObject(t *testing.T) {
 	b, _, _ := newRefTestBackend(t)
 
 	out := putObjV(t, b, "k1", nil)
-	if want := `"` + hex.EncodeToString(md5sum(nil)) + `"`; out.ETag != want {
-		t.Fatalf("ETag = %q, want the empty md5 %q", out.ETag, want)
+	if want := wantObjectETag(nil); out.ETag != want {
+		t.Fatalf("ETag = %q, want the empty body's ETag %q", out.ETag, want)
 	}
 	if got := len(blobDigestsOf(t, b, "k1", "")); got != 0 {
 		t.Fatalf("blobs = %d, want 0", got)
@@ -177,11 +175,6 @@ func TestEncryptedWrite_DeleteShredsParams(t *testing.T) {
 	if rm.removedDigests()[string(d)] != 1 {
 		t.Fatalf("expected one RemoveBlob; got %v", rm.removedDigests())
 	}
-}
-
-func md5sum(data []byte) []byte {
-	s := md5.Sum(data)
-	return s[:]
 }
 
 // testWrapKey is the tenant wrap keypair every write in the s3frontend tests
