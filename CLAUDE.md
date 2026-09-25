@@ -120,14 +120,17 @@ Internal:
   `/s3/request/authorize` (derived SigV4 key, with a local fast
   path over cached delegations), plus `KeyProofs`/`DelegationCache` — per-
   access-key TTL caches of hilt-issued delegations that the uploader and the
-  network read tier consume via `internal/reqscope`.
+  network read tier consume via `internal/reqscope`. `KeyProofs` also
+  remembers every revoked CID until the next UTC midnight; a response
+  carrying one is authorized but not cached.
 - **`forgeclient/`** — carried-from-guppy sprue edge client: `/blob/add`
   (with a deferrable conclude), `/ucan/conclude`, `/blob/abort`,
   `/blob/remove`, `/index/add`, receipt polling. The `/access` login and
   `/provider/add` flows are dormant (no CLI drives them).
 - **`revocation/`** — the Swarf firehose consumer (optional,
-  `revocation_service_url`/`_did`): streams UCAN revocations and clears the
-  affected access key's iam caches via `iam.Revoker`; resumes from the
+  `revocation_service_url`/`_did`): streams UCAN revocations, records each
+  revoked CID and clears the affected access key's iam caches via
+  `iam.Revoker`; resumes from the
   `registry.RevocationCursorStore` cursor (no cursor → subscribe from now).
 - **`tokenstore/`** — carried-from-guppy delegation store (`tokens.cbor`);
   empty today, read only by the dormant login paths.
