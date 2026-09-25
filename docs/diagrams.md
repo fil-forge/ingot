@@ -536,6 +536,7 @@ flowchart TB
     uploading -->|"release record; executeRelease: /blob/remove<br/>(idempotent: the accept may have landed, its location not);<br/>DeleteIntent + spool.Remove"| gone
     parked -->|"release record; executeRelease: /blob/abort (cause AddTask),<br/>or /blob/remove if the provider says accepted;<br/>DeleteIntent + spool.Remove"| gone
     accepted -->|"release record (never committed);<br/>executeRelease: /blob/remove;<br/>DeleteIntent + spool.Remove"| gone
+    published -->|"release record (committed);<br/>executeRelease: /blob/remove;<br/>DeleteIntent + spool.Remove"| gone
 
     accepted -->|"commit: AddBlobClaim, same transaction"| published
     published -->|"commit: reconcileClaims adds this version"| refs["blob_refs rows<br/>(digest, bucket, key, version_id)"]
@@ -545,9 +546,8 @@ flowchart TB
 ```
 
 - `published` is written with the blob's first reference claim and never
-  leaves: it is how a release recognises a committed blob once its claims
-  are gone, and keeps the spool copy (the insurance copy until eviction) and
-  the intent where a never-committed part blob loses both. `blob_parks` is a
+  changes until the blob's release, which removes the spool copy and the
+  intent as it does for a never-committed blob. `blob_parks` is a
   presence machine (a row exists while a conclude is owed), not a state
   column.
 - Digests present in both the old and new version sets never churn: the
@@ -563,7 +563,7 @@ Cross-references: [`architecture.md` §5](./architecture.md#5-the-data-layer),
 [`s3-versioning.md`](./s3-versioning.md) §8.
 
 Sources: `registry/stores.go` (state consts), `s3frontend/object.go`
-(ingestBody, reconcileClaims, releaseBlobs), `s3frontend/multipart.go`
+(ingestBody, reconcileClaims), `s3frontend/multipart.go`
 (parkBlobs, concludeBlobs, enqueuePartReleases), `s3frontend/object.go`
 (runRelease, executeRelease), `uploader/blob.go` (UploadBlob,
 AbortBlob, RemoveBlob). Review when these change.

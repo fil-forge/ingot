@@ -315,6 +315,7 @@ func TestDrainSpaceReleasesIgnoresGrace(t *testing.T) {
 	if rm.removedDigests()[string(d)] != 1 {
 		t.Fatalf("expected one RemoveBlob from the space drain; got %v", rm.removedDigests())
 	}
+	assertLocalCopyReleased(t, b, mem, d)
 }
 
 // TestConcurrentCompletesReplayWinner: racing Completes of one upload must
@@ -1506,6 +1507,12 @@ func TestReleaseKeepsRowsUntilTheNetworkStepSucceeds(t *testing.T) {
 	if pending, _ := mem.ListReleasesBySpace(ctx, did.Undef); len(pending) != 1 {
 		t.Fatalf("release record after the failed attempt = %v, want it kept", pending)
 	}
+	if in, err := mem.GetIntent(ctx, d); err != nil || in.State != registry.IntentPublished {
+		t.Fatalf("intent after the failed attempt = %v/%v, want published and kept for the retry", in, err)
+	}
+	if _, err := os.Stat(b.spool.Path(d)); err != nil {
+		t.Fatalf("spool copy after the failed attempt: %v, want it kept for the retry", err)
+	}
 
 	if n, err := b.SweepPendingReleases(ctx); err != nil || n != 1 {
 		t.Fatalf("second sweep executed %d releases (err=%v), want 1", n, err)
@@ -1516,19 +1523,56 @@ func TestReleaseKeepsRowsUntilTheNetworkStepSucceeds(t *testing.T) {
 	if _, err := mem.GetLocation(ctx, did.Undef, d); !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("location row survived the release (err=%v)", err)
 	}
-	// A committed blob's ingest artifacts are not the release's to remove:
-	// the spool copy is the insurance copy until eviction.
+	assertLocalCopyReleased(t, b, mem, d)
+}
+
+// TestReleaseFreesSpoolCopyOfDeletedPutObject: deleting a single-PUT object
+// frees its local disk once its release finishes. A release whose network
+// remove fails keeps the intent and spool copy for the retry.
+func TestReleaseFreesSpoolCopyOfDeletedPutObject(t *testing.T) {
+	rm := &failRemover{recordingRemover: &recordingRemover{}, fails: 1}
+	b, mem := newDeferredBackend(t, inmem.NopUploader{}, func(d *Deps) { d.Remover = rm })
+	ctx := context.Background()
+	key := "put-delete"
+
+	putObj(t, b, key, testBody(1<<10))
+	d := blobDigestOf(t, b, key, "")
+	deleteObj(t, b, key)
+
+	if n, err := b.SweepPendingReleases(ctx); err != nil || n != 0 {
+		t.Fatalf("first sweep executed %d releases (err=%v), want 0: the network remove failed", n, err)
+	}
 	if in, err := mem.GetIntent(ctx, d); err != nil || in.State != registry.IntentPublished {
-		t.Fatalf("a deleted object's blob intent = %v/%v, want published and kept", in, err)
+		t.Fatalf("intent after the failed attempt = %v/%v, want published and kept for the retry", in, err)
+	}
+	if _, err := os.Stat(b.spool.Path(d)); err != nil {
+		t.Fatalf("spool copy after the failed attempt: %v, want it kept for the retry", err)
+	}
+
+	if n, err := b.SweepPendingReleases(ctx); err != nil || n != 1 {
+		t.Fatalf("second sweep executed %d releases (err=%v), want 1", n, err)
+	}
+	assertLocalCopyReleased(t, b, mem, d)
+}
+
+// assertLocalCopyReleased fails the test unless the blob's upload intent and
+// spool copy are both gone, as a finished release leaves them.
+func assertLocalCopyReleased(t *testing.T, b *Backend, mem *inmem.MemStore, d multihash.Multihash) {
+	t.Helper()
+	if in, err := mem.GetIntent(context.Background(), d); !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("blob %x intent = %v/%v after its release, want it deleted", d, in, err)
+	}
+	if _, err := os.Stat(b.spool.Path(d)); !os.IsNotExist(err) {
+		t.Fatalf("blob %x spool copy after its release: stat err=%v, want not-exist", d, err)
 	}
 }
 
 // TestCompletedSessionReapKeepsWinnersOfDeletedObject: a completed session
 // is retained after its object is deleted. Its winners' releases were
 // recorded by the delete as ordinary releases; the reap must not re-record
-// them as part blobs, which would take the spool copy that survives a DELETE
-// as the insurance copy. Their intents were published by their claims, so the
-// reap leaves them alone.
+// them as part blobs. Their intents were published by their claims, so the
+// reap leaves them to the object's own releases, which remove each winner
+// once and then drop its intent and spool copy.
 func TestCompletedSessionReapKeepsWinnersOfDeletedObject(t *testing.T) {
 	rm := &recordingRemover{}
 	b, mem := newDeferredBackend(t, &parkingUploader{}, func(d *Deps) { d.Remover = rm })
@@ -1549,9 +1593,7 @@ func TestCompletedSessionReapKeepsWinnersOfDeletedObject(t *testing.T) {
 		if rm.removedDigests()[string(d)] != 1 {
 			t.Fatalf("winner %x removed %d times, want once by the object's own release", d, rm.removedDigests()[string(d)])
 		}
-		if in, err := mem.GetIntent(ctx, d); err != nil || in.State != registry.IntentPublished {
-			t.Fatalf("winner %x intent = %v/%v, want published and kept: the spool copy is the insurance copy", d, in, err)
-		}
+		assertLocalCopyReleased(t, b, mem, d)
 	}
 }
 
@@ -1559,7 +1601,8 @@ func TestCompletedSessionReapKeepsWinnersOfDeletedObject(t *testing.T) {
 // commits, but the completing→completed latch fails, so the session is
 // reaped through the abort path after its object was deleted. Its blobs'
 // intents were published by their claims, so the reap leaves them to the
-// object's own releases and their spool copies survive.
+// object's own releases, which remove each blob once and then drop its
+// intent and spool copy.
 func TestCompletingSessionWhoseLatchFailedKeepsCommittedBlobs(t *testing.T) {
 	rm := &recordingRemover{}
 	mp := &failCompleteSession{}
@@ -1595,9 +1638,7 @@ func TestCompletingSessionWhoseLatchFailedKeepsCommittedBlobs(t *testing.T) {
 		if rm.removedDigests()[string(d)] != 1 {
 			t.Fatalf("committed blob %x removed %d times, want once", d, rm.removedDigests()[string(d)])
 		}
-		if in, err := mem.GetIntent(ctx, d); err != nil || in.State != registry.IntentPublished {
-			t.Fatalf("committed blob %x intent = %v/%v, want published and kept", d, in, err)
-		}
+		assertLocalCopyReleased(t, b, mem, d)
 	}
 }
 

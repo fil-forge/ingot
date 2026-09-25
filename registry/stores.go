@@ -27,10 +27,9 @@ const NullVersionID = "null"
 // ingest, parked once durable on a provider with the accept deferred,
 // accepted once the provider has accepted it, and published once a bucket
 // commit has claimed it. Published is written with the blob's first
-// reference claim, in the same transaction, and never leaves: it is the
-// durable record that the blob was committed, which a release consults to
-// keep the spool copy (the insurance copy until eviction) and the intent,
-// where a never-committed part blob loses both.
+// reference claim, in the same transaction, and never changes: it is the
+// durable record that the blob was committed. Its release removes the spool
+// copy and the intent, as it does for a blob that was never committed.
 const (
 	IntentSpooled = "spooled"
 	// IntentUploading is set before a blob's first network call and stands
@@ -291,7 +290,7 @@ type PendingReleaseStore interface {
 	DeleteRelease(ctx context.Context, space did.DID, digest multihash.Multihash) error
 	// DeleteIntentAndRelease removes a blob's upload intent and this
 	// release's record in one transaction — the last step of releasing a
-	// blob that was never committed. The two must go together: the intent
+	// blob. The two must go together: the intent
 	// is the only evidence of how far the blob ever got, and a record that
 	// outlived it would leave the retry to read a blob with no rows and no
 	// intent, owing a network remove that a never-uploaded blob has no
