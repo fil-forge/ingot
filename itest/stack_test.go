@@ -178,6 +178,14 @@ func withMultipartTTLConfig() stack.Option {
 	return stack.WithServiceConfig("ingot", "testdata/config-mpttl.yaml")
 }
 
+// withCompleteKeepaliveConfig mounts testdata/config-keepalive.yaml —
+// complete_keepalive_interval at 1ms, so every CompleteMultipartUpload
+// response is streamed: 200, the XML declaration, whitespace, then the
+// result.
+func withCompleteKeepaliveConfig() stack.Option {
+	return stack.WithServiceConfig("ingot", "testdata/config-keepalive.yaml")
+}
+
 // ingotSQL runs one SQL statement against ingot's Postgres and returns the
 // bare psql output (rows, newline-separated). Digests round-trip as hex:
 // encode(digest,'hex') out, decode('<hex>','hex') in.

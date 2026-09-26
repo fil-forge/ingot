@@ -64,7 +64,9 @@ ingot depends only on these — it must **never** import `fil-forge/sprue` or
 - **`fil-forge/versitygw`** — our fork of versity/versitygw, the S3 REST front
   end (we implement `backend.Backend`). The fork adds externally derived SigV4
   signing keys (`auth.Account.SigningKey`, `middlewares.RequestIAMService`) for
-  the Hilt flow.
+  the Hilt flow, and the CompleteMultipartUpload whitespace keepalive
+  (`s3api.WithCompleteMultipartKeepalive`), which runs the backend call on a
+  snapshot of the request's context values rather than the `RequestCtx`.
 - Plumbing: `go-cid`, `go-block-format`, `whyrusleeping/cbor-gen` (**not**
   go-ipld-prime), `multiformats/*`, `pgx/v5`, `goose/v3`, `spf13/{cobra,viper}`,
   `uber-go/fx`, `zap`.
@@ -200,6 +202,8 @@ path or string-encoded UCAN container, required alongside the URL and
 validated at startup down to holding at least one delegation),
 `TokenStoreDir` (→
 `DataDir`), `MultipartSessionTTL` (0 → 7d, negative → sweeper off),
+`CompleteKeepaliveInterval` (0 → 5s, negative → off; a slower Complete
+streams whitespace in a 200),
 `CORSAllowedOrigins`, `LogLevel`. `Config.ServerConfig()` is the single
 mapping site. The daemon's config (cmd/) adds `postgres_dsn`,
 `identity.key_file` (the agent's PEM key) and `identity.service_id` (optional

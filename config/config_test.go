@@ -2,10 +2,12 @@ package config
 
 import (
 	"encoding/base64"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/fil-forge/ingot/bucket"
 	blobcmds "github.com/fil-forge/libforge/commands/blob"
@@ -95,6 +97,7 @@ func TestValidate_RequiredFields(t *testing.T) {
 		{"revocation did without url", func(c *Config) { c.RevocationServiceDID = "did:web:swarf.example" }, "revocation_service_url and revocation_service_did must be set together"},
 		{"bad seal_age", func(c *Config) { c.SealAge = "not-a-duration" }, "parse seal_age"},
 		{"bad release_grace", func(c *Config) { c.ReleaseGrace = "soon" }, "parse release_grace"},
+		{"bad complete_keepalive_interval", func(c *Config) { c.CompleteKeepaliveInterval = "often" }, "parse complete_keepalive_interval"},
 		{"bad cors origin", func(c *Config) { c.CORSAllowedOrigins = []string{"app.example"} }, "cors_allowed_origins"},
 		{"regionkey provider unset", func(c *Config) { c.RegionKey.Provider = "" }, "regionkey.provider is required"},
 		{"tenantkey url unset", func(c *Config) { c.TenantKey.PLCDirectoryURL = "" }, "tenantkey.plc_directory_url is required"},
@@ -119,6 +122,30 @@ func TestValidate_RequiredFields(t *testing.T) {
 			err := cfg.Validate()
 			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
 				t.Fatalf("expected error containing %q, got: %v", tc.wantErr, err)
+			}
+		})
+	}
+}
+
+// TestServerConfig_CompleteKeepaliveInterval: the duration string maps
+// through as is; the server resolves zero to its default and a negative
+// value to off.
+func TestServerConfig_CompleteKeepaliveInterval(t *testing.T) {
+	cases := map[string]time.Duration{
+		"":    0,
+		"30s": 30 * time.Second,
+		"-1s": -time.Second,
+	}
+	for value, want := range cases {
+		t.Run(fmt.Sprintf("%q maps to %v", value, want), func(t *testing.T) {
+			cfg := validConfig(t)
+			cfg.CompleteKeepaliveInterval = value
+			sc, err := cfg.ServerConfig()
+			if err != nil {
+				t.Fatalf("ServerConfig: %v", err)
+			}
+			if sc.CompleteKeepaliveInterval != want {
+				t.Fatalf("CompleteKeepaliveInterval = %v, want %v", sc.CompleteKeepaliveInterval, want)
 			}
 		})
 	}

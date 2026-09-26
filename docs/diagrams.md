@@ -451,6 +451,7 @@ sequenceDiagram
         B->>R: LatchSession(completing to completed), best-effort
         B-->>C: 200, ETag = md5-of-part-md5s + "-N"
     end
+    Note over C,B: a Complete still running after CompleteKeepaliveInterval (default 5s)<br/>is streamed by versitygw: 200 and the XML declaration, a space every<br/>interval, then the result or an S3 Error document; no x-amz-version-id
     C->>B: AbortMultipartUpload
     B->>R: LatchSession(open to aborting); EnqueueReleases for every<br/>unreferenced part blob; then DeleteSession (parts cascade)
     B->>U: releaseNow, per record: crypto-shred, then /blob/abort a parked blob<br/>(cause = AddTask) or /blob/remove an accepted one; local rows dropped<br/>once the network step succeeds; the release sweeper retries the rest
@@ -469,6 +470,15 @@ sequenceDiagram
   upload records releases for the blobs it had spooled.
 - A never-parked blob at Complete falls back to a full synchronous
   `UploadBlob`.
+- Concluding many parts can outlast a client's read timeout (60s for the
+  AWS CLI), so a Complete that is still running after
+  `CompleteKeepaliveInterval` commits to 200 and sends whitespace until the
+  result is ready, as S3 does. A failure after that point is an `<Error>`
+  document inside the 200, which AWS SDKs rewrite to a 500 and retry. The
+  version id is minted at commit, after the headers went out, so a streamed
+  response carries no `x-amz-version-id`. The backend call runs on a
+  snapshot of the request's context values and finishes even if the client
+  disconnects.
 
 Cross-references: [`architecture.md` §7.2](./architecture.md#72-multipart),
 [§7.3](./architecture.md#73-the-session-latch-the-abortcomplete-race).
@@ -477,7 +487,9 @@ Sources: `s3frontend/multipart.go` (all verbs, ingestPart, parkBlobs,
 concludeBlobs, enqueuePartReleases, SweepStaleMultipartSessions),
 `s3frontend/object.go` (runRelease, executeRelease),
 `s3frontend/uploadpartcopy.go`, `registry/stores.go`,
-`server.go` (startMultipartSweeper). Review when these change.
+`server.go` (startMultipartSweeper; buildS3API for the Complete keepalive,
+implemented in the versitygw fork's `s3api/controllers/keepalive.go`).
+Review when these change.
 
 ## Session states and the Complete/Abort latch
 
@@ -499,8 +511,11 @@ stateDiagram-v2
 - A Complete that loses the latch waits (bounded) for the winner's terminal
   state: `completed` replays the ETag and version id the winner recorded on
   the session; `aborting` or a vanished row is `NoSuchUpload`; a winner still
-  running past the wait budget is `OperationAborted`, which the client
-  retries.
+  running past the wait budget is `OperationAborted`. As a plain 409 that is
+  terminal for the AWS CLI and botocore-based clients. A loser that waited
+  past the Complete keepalive interval has already streamed its 200, and
+  reports `OperationAborted` inside it; AWS SDKs retry that as a 500, and the
+  retry replays the winner's result once it has committed.
 - `ListParts` and `Abort` reject any non-`open` session as `NoSuchUpload`;
   `Complete` alone accepts `completed`, for idempotency.
 - The sweeper also reaps rows stuck in `completing` or `aborting` past the
