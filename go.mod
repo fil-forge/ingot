@@ -8,7 +8,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/config v1.33.5
 	github.com/aws/aws-sdk-go-v2/credentials v1.20.5
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.113.1
-	github.com/aws/smithy-go v1.28.1
+	github.com/aws/smithy-go v1.28.2
 	github.com/cenkalti/backoff/v5 v5.0.3
 	github.com/cloud-portable/s3tests/packages/go v0.0.0-20260916120817-ce77c26e7f6d
 	github.com/exaring/otelpgx v0.12.0
