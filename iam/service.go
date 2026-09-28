@@ -659,10 +659,8 @@ func (*Service) Shutdown() error {
 func MapAuthError(err error) (error, bool) { return mapAuthError(err) }
 
 // malformedPolicy is the S3 error for a policy document Hilt refuses, on a
-// CreateBucket's x-bucket-policy header or a PutBucketPolicy body.
+// CreateBucket's x-bucket-policy header or a PutBucketPolicy body; the
+// create path renders the same code from s3frontend.
 func malformedPolicy(description string) s3err.APIError {
 	return s3err.APIError{Code: "MalformedPolicy", Description: description, HTTPStatusCode: http.StatusBadRequest}
 }
-
-// MalformedPolicy is [malformedPolicy] for the bucket policy routes.
-func MalformedPolicy(description string) s3err.APIError { return malformedPolicy(description) }
