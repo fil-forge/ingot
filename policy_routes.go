@@ -7,6 +7,7 @@ import (
 	"github.com/fil-forge/ingot/bucketauthority"
 	"github.com/fil-forge/ingot/iam"
 	"github.com/fil-forge/ingot/internal/fasthttputil"
+	"github.com/fil-forge/ingot/s3frontend"
 	s3bkt "github.com/fil-forge/libforge/commands/s3/bucket"
 	"github.com/fil-forge/versitygw/s3api"
 	"github.com/fil-forge/versitygw/s3err"
@@ -70,7 +71,7 @@ func policyError(err error) s3err.APIError {
 	case errors.Is(err, bucketauthority.ErrNoPolicy):
 		return s3err.GetAPIError(s3err.ErrNoSuchBucketPolicy)
 	case errors.Is(err, bucketauthority.ErrMalformedPolicy):
-		return iam.MalformedPolicy(err.Error())
+		return s3frontend.MalformedPolicy(err.Error())
 	case errors.Is(err, bucketauthority.ErrPreconditionFailed):
 		return s3err.GetAPIError(s3err.ErrPreconditionFailed)
 	case errors.Is(err, bucketauthority.ErrInvalidPrecondition):
