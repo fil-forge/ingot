@@ -13,9 +13,14 @@ import (
 	"github.com/ipfs/go-cid"
 )
 
-// MaxUploadBatch caps the content-entry changes sent in one round trip. A UCAN
-// container holds at most 8192 tokens; each change costs one invocation plus
-// its proof chain in the request (chains dedupe by link, so rows from one
+// MaxUploadBatch caps the content-entry changes sent in one round trip.
+//
+// A batch in ucantone's sense: many invocations in one request, each answered
+// with its own receipt. The other shape — one invocation whose arguments are a
+// list — is /ucan/conclude, sized by MaxConcludeReceipts.
+//
+// A UCAN container holds at most 8192 tokens; each change costs one invocation
+// plus its proof chain in the request (chains dedupe by link, so rows from one
 // access key share theirs) and one receipt in the response. 512 leaves room
 // for the longest chains without approaching the ceiling.
 const MaxUploadBatch = 512

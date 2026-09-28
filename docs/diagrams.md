@@ -357,7 +357,10 @@ sequenceDiagram
   a Sprue outage delays the count instead of failing writes or losing it.
 - The row exists exactly when the version committed, and `seq` replays a key's
   changes in commit order. A sweep spends **two round trips**, not one per
-  change: every queued addition in one batch, then every retraction in another.
+  change: every queued addition in one batch of invocations, then every
+  retraction in another. (A batch in ucantone's sense — many invocations, a
+  receipt each. `/ucan/conclude` is the other shape, one invocation carrying
+  many receipts.)
   Both halves are needed — a container sorts its tokens bytewise, so the
   service may run a batch in any order, and a retraction sharing a batch with
   the addition it retires could overtake it and leave the root counted for
@@ -521,7 +524,7 @@ sequenceDiagram
     else latch won
         B->>R: LatchSession(open to completing), single winner
         B->>R: manifest spans: per blob, plaintext length derived from<br/>the intent's stored size + FEE geometry (blobPlaintextLen)
-        B->>U: concludeBlobs: every parked blob's put receipt, up to<br/>MaxConcludeBatch (1000) per /ucan/conclude, accept receipts<br/>read from the response (poll only as fallback)
+        B->>U: concludeBlobs: every parked blob's put receipt, up to<br/>MaxConcludeReceipts (1000) per /ucan/conclude, accept receipts<br/>read from the response (poll only as fallback)
         B->>R: PutLocation + intent accepted + DeletePark per blob
         B->>TX: commitVersion (see the PutObject diagram)
         B->>R: LatchSession(completing to completed), best-effort

@@ -264,14 +264,14 @@ func deriveBlobSigner(t *testing.T, digest multihash.Multihash) multikey.Issuer 
 	return multikey.KeyIssuer(signer)
 }
 
-// TestBlobConcludeBatchDeliversOnce pins the shape of the request: every
+// TestBlobConcludeAllDeliversOnce pins the shape of the request: every
 // parked blob's receipt goes in one conclude, and each blob comes back with
 // the location its own acceptance named.
-func TestBlobConcludeBatchDeliversOnce(t *testing.T) {
+func TestBlobConcludeAllDeliversOnce(t *testing.T) {
 	c, fake := concludeFixture(t)
 
 	parked := []AddedBlob{parkBlob(t, fake), parkBlob(t, fake), parkBlob(t, fake)}
-	out, err := c.BlobConcludeBatch(t.Context(), randomDID(t), parked)
+	out, err := c.BlobConcludeAll(t.Context(), randomDID(t), parked)
 	require.NoError(t, err)
 
 	require.Equal(t, []int{len(parked)}, fake.sizes(), "one conclude carrying every receipt")
@@ -283,9 +283,9 @@ func TestBlobConcludeBatchDeliversOnce(t *testing.T) {
 	}
 }
 
-// TestBlobConcludeBatchSkipsLocated pins that a blob already accepted at add
+// TestBlobConcludeAllSkipsLocated pins that a blob already accepted at add
 // time (a dedup hit) is returned as-is and never re-delivered.
-func TestBlobConcludeBatchSkipsLocated(t *testing.T) {
+func TestBlobConcludeAllSkipsLocated(t *testing.T) {
 	c, fake := concludeFixture(t)
 
 	located := parkBlob(t, fake)
@@ -295,7 +295,7 @@ func TestBlobConcludeBatchSkipsLocated(t *testing.T) {
 	located.Location = claim
 
 	parked := []AddedBlob{parkBlob(t, fake), located, parkBlob(t, fake)}
-	out, err := c.BlobConcludeBatch(t.Context(), randomDID(t), parked)
+	out, err := c.BlobConcludeAll(t.Context(), randomDID(t), parked)
 	require.NoError(t, err)
 
 	require.Equal(t, []int{2}, fake.sizes(), "only the unconcluded blobs are delivered")
@@ -304,20 +304,20 @@ func TestBlobConcludeBatchSkipsLocated(t *testing.T) {
 	require.NotNil(t, out[2].Location)
 }
 
-// TestBlobConcludeBatchChunks pins the chunk boundary: more receipts than fit
+// TestBlobConcludeAllChunks pins the chunk boundary: more receipts than fit
 // in one conclude are split, and every blob is still answered.
-func TestBlobConcludeBatchChunks(t *testing.T) {
+func TestBlobConcludeAllChunks(t *testing.T) {
 	c, fake := concludeFixture(t)
 
-	parked := make([]AddedBlob, MaxConcludeBatch+1)
+	parked := make([]AddedBlob, MaxConcludeReceipts+1)
 	for i := range parked {
 		parked[i] = parkBlob(t, fake)
 	}
 
-	out, err := c.BlobConcludeBatch(t.Context(), randomDID(t), parked)
+	out, err := c.BlobConcludeAll(t.Context(), randomDID(t), parked)
 	require.NoError(t, err)
 
-	require.Equal(t, []int{MaxConcludeBatch, 1}, fake.sizes(),
+	require.Equal(t, []int{MaxConcludeReceipts, 1}, fake.sizes(),
 		"one past the cap must split into a full conclude and a remainder")
 	require.Len(t, out, len(parked))
 	for i, blob := range out {
@@ -325,42 +325,42 @@ func TestBlobConcludeBatchChunks(t *testing.T) {
 	}
 }
 
-// TestBlobConcludeBatchKeepsCompletedChunks pins what a failure partway
+// TestBlobConcludeAllKeepsCompletedChunks pins what a failure partway
 // leaves behind: the blobs of every chunk concluded before it come back
 // located, so the caller can record acceptances the upload service has
 // already run, and the rest come back as they went in, ready to retry.
-func TestBlobConcludeBatchKeepsCompletedChunks(t *testing.T) {
+func TestBlobConcludeAllKeepsCompletedChunks(t *testing.T) {
 	c, fake := concludeFixture(t)
 	fake.failDelivery = 2
 
-	parked := make([]AddedBlob, MaxConcludeBatch+2)
+	parked := make([]AddedBlob, MaxConcludeReceipts+2)
 	for i := range parked {
 		parked[i] = parkBlob(t, fake)
 	}
 
-	out, err := c.BlobConcludeBatch(t.Context(), randomDID(t), parked)
+	out, err := c.BlobConcludeAll(t.Context(), randomDID(t), parked)
 	require.Error(t, err)
-	require.Equal(t, []int{MaxConcludeBatch, 2}, fake.sizes())
+	require.Equal(t, []int{MaxConcludeReceipts, 2}, fake.sizes())
 	require.Len(t, out, len(parked), "every blob comes back, located or not")
-	for i := 0; i < MaxConcludeBatch; i++ {
+	for i := 0; i < MaxConcludeReceipts; i++ {
 		require.NotNil(t, out[i].Location, "blob %d was concluded before the failure and must come back located", i)
 	}
-	for i := MaxConcludeBatch; i < len(parked); i++ {
+	for i := MaxConcludeReceipts; i < len(parked); i++ {
 		require.Nil(t, out[i].Location, "blob %d was never concluded", i)
 		require.Equal(t, parked[i].PutInvocation, out[i].PutInvocation, "an unconcluded blob keeps what a retry needs")
 	}
 }
 
-// TestBlobConcludeBatchKeepsChunkAroundRefusedAccept pins that one blob's
+// TestBlobConcludeAllKeepsChunkAroundRefusedAccept pins that one blob's
 // refused acceptance does not cost its chunk: its neighbours come back
 // located, and the error names the blob that failed.
-func TestBlobConcludeBatchKeepsChunkAroundRefusedAccept(t *testing.T) {
+func TestBlobConcludeAllKeepsChunkAroundRefusedAccept(t *testing.T) {
 	c, fake := concludeFixture(t)
 
 	parked := []AddedBlob{parkBlob(t, fake), parkBlob(t, fake), parkBlob(t, fake)}
 	fake.reject[parked[1].AcceptTask] = true
 
-	out, err := c.BlobConcludeBatch(t.Context(), randomDID(t), parked)
+	out, err := c.BlobConcludeAll(t.Context(), randomDID(t), parked)
 	require.ErrorContains(t, err, digestutil.Format(parked[1].Digest))
 	require.Equal(t, []int{3}, fake.sizes(), "one conclude carried the whole chunk")
 	require.NotNil(t, out[0].Location)
@@ -368,19 +368,19 @@ func TestBlobConcludeBatchKeepsChunkAroundRefusedAccept(t *testing.T) {
 	require.NotNil(t, out[2].Location, "a blob after the refused one is still resolved")
 }
 
-// TestBlobConcludeBatchDrainsChunkPastFailedPoll pins what a chunk yields
+// TestBlobConcludeAllDrainsChunkPastFailedPoll pins what a chunk yields
 // when the response leaves a blob unanswered and the poll for it fails: the
 // acceptances the response did carry are still read out, so the caller can
 // record them, and no further blob is polled for. Unanswered blobs come back
 // as they went in, ready for the retry.
-func TestBlobConcludeBatchDrainsChunkPastFailedPoll(t *testing.T) {
+func TestBlobConcludeAllDrainsChunkPastFailedPoll(t *testing.T) {
 	c, fake := concludeFixture(t)
 
 	parked := []AddedBlob{parkBlob(t, fake), parkBlob(t, fake), parkBlob(t, fake)}
 	fake.omit[parked[0].AcceptTask] = true
 	fake.omit[parked[2].AcceptTask] = true
 
-	out, err := c.BlobConcludeBatch(t.Context(), randomDID(t), parked)
+	out, err := c.BlobConcludeAll(t.Context(), randomDID(t), parked)
 	require.ErrorContains(t, err, digestutil.Format(parked[0].Digest))
 	require.Equal(t, []int{3}, fake.sizes(), "one conclude carried the whole chunk")
 	require.Equal(t, 1, fake.pollCount(), "a failed poll ends the polling; the next unanswered blob is not polled for")
