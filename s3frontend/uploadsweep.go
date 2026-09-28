@@ -302,15 +302,22 @@ func (b *Backend) DrainSpaceRegistrations(ctx context.Context, space did.DID) er
 
 	var adds, removes []registry.UploadRegistration
 	for _, reg := range rows {
-		if reg.DeadLetteredAt != nil {
-			// Already given up on, and already reported as wrong. It must not
-			// hold up the delete as well.
-			continue
-		}
 		switch reg.Op {
 		case registry.UploadRegistrationAdd:
+			if reg.DeadLettered() {
+				// A registration that never landed leaves nothing behind to
+				// retract, so there is nothing to do for it here.
+				continue
+			}
 			adds = append(adds, reg)
 		case registry.UploadRegistrationRemove:
+			// Dead-lettered retractions are tried again rather than skipped.
+			// One can mean the addition reached the upload service and the
+			// retraction never did, so the root is still counted — and the
+			// row saying so is about to be destroyed with the bucket. This is
+			// the last chance to send it, and a good one: the teardown
+			// request carries /upload/remove in its own right, where the
+			// sweep only had whatever the original write left behind.
 			removes = append(removes, reg)
 		}
 	}
@@ -338,9 +345,22 @@ func (b *Backend) DrainSpaceRegistrations(ctx context.Context, space did.DID) er
 		return fmt.Errorf("s3frontend: list space upload registrations: %w", err)
 	}
 	for _, reg := range left {
-		if reg.DeadLetteredAt == nil {
+		if !reg.DeadLettered() {
 			return fmt.Errorf("s3frontend: the upload service has not taken this space's object-count changes; retry")
 		}
+		if reg.Op != registry.UploadRegistrationRemove {
+			continue
+		}
+		// Still unsendable after the retry, and the row goes with the bucket.
+		// Nothing will retract this root now, so name it: the count it leaves
+		// behind is only reconcilable from a record of what it was.
+		b.logger.Error("delete bucket: a retraction could not be sent and its record goes with the bucket; the upload service keeps this root and its count",
+			zap.String("bucket", reg.Bucket),
+			zap.String("key", reg.ObjectKey),
+			zap.Stringer("space", reg.Space),
+			zap.Stringer("root", reg.Root),
+			zap.String("reason", reg.DeadLetterReason),
+		)
 	}
 	return nil
 }

@@ -56,6 +56,9 @@ type UploadRegistration struct {
 	DeadLetterReason string
 }
 
+// DeadLettered reports whether the row has been taken out of the sweep.
+func (r UploadRegistration) DeadLettered() bool { return r.DeadLetteredAt != nil }
+
 // UploadRegistrationStore is the outbox the registration sweeper drains
 // (upload_registrations). Rows are enqueued by Registry.CASRootEnqueue, in the
 // commit's own transaction; nothing else writes them.
