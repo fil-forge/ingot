@@ -125,6 +125,15 @@ func (m *MemStore) DeleteBucket(ctx context.Context, req s3.Request) error {
 	return nil
 }
 
+// BucketPolicy is unsupported: the in-memory store keeps no policies, so a
+// bucket has none to read or delete and a write is refused.
+func (m *MemStore) BucketPolicy(ctx context.Context, req s3.Request, body []byte) (*bucket.PolicyOK, error) {
+	if req.Method == "PUT" {
+		return nil, bucketauthority.ErrUnsupported
+	}
+	return nil, bucketauthority.ErrNoPolicy
+}
+
 func (m *MemStore) ListBuckets(ctx context.Context, req s3.Request) (*bucket.ListOK, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
