@@ -257,7 +257,7 @@ func (s *Service) GetUserAccountForRequest(ctx fiber.Ctx, accessKeyStr string) (
 		ctx.Locals(reqscope.TenantKey(), ok.Tenant)
 		s.logger.Info("hilt/iam: authorize response carries a revoked delegation, not cached",
 			zap.String("access", accessKeyStr), zap.Stringer("tenant", ok.Tenant))
-		return account(accessKeyStr, key), nil
+		return adminAccount(accessKeyStr, key), nil
 	}
 
 	// Deposit the returned delegations (access-key→ingot re-delegations,
@@ -305,15 +305,15 @@ func (s *Service) GetUserAccountForRequest(ctx fiber.Ctx, accessKeyStr string) (
 		zap.Stringer("tenant", ok.Tenant),
 	)
 
-	return account(accessKeyStr, key), nil
+	return adminAccount(accessKeyStr, key), nil
 }
 
-// account is the gateway account an authorized request runs as. Admin so the
+// adminAccount is the gateway account an authorized request runs as. Admin so the
 // gateway's role/ACL layers defer entirely: authorization is per-request via
 // Hilt (or the local fast path), which enforces the key's permissions and
 // bucket scope. The gateway doesn't model ownership for hilt-managed keys
 // (bucket ACLs are empty) and its admin APIs are not mounted.
-func account(access string, signingKey []byte) auth.Account {
+func adminAccount(access string, signingKey []byte) auth.Account {
 	return auth.Account{Access: access, SigningKey: signingKey, Role: auth.RoleAdmin}
 }
 
