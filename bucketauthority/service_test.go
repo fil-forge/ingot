@@ -9,6 +9,7 @@ import (
 	"github.com/fil-forge/ingot/bucketauthority"
 	s3 "github.com/fil-forge/libforge/commands/s3"
 	s3bkt "github.com/fil-forge/libforge/commands/s3/bucket"
+	s3req "github.com/fil-forge/libforge/commands/s3/request"
 	"github.com/fil-forge/libforge/testutil"
 	ucanlib "github.com/fil-forge/libforge/ucan"
 	"github.com/fil-forge/ucantone/binding"
@@ -83,6 +84,24 @@ func TestBucketPolicy(t *testing.T) {
 			_, err := svc.BucketPolicy(t.Context(), req, body)
 			require.ErrorIs(t, err, want, name)
 		}
+	})
+
+	t.Run("a create whose header policy Hilt refuses is a malformed policy", func(t *testing.T) {
+		srv := server.NewHTTP(hilt)
+		srv.Handle(s3bkt.Create.Command, s3bkt.Create.Handler(
+			func(req *binding.Request[*s3bkt.CreateArguments], res *binding.Response[*s3req.AuthorizeOK]) error {
+				return res.SetFailure(ucanerrors.New("InvalidBucketPolicy", "statement 0: unknown principal"))
+			}))
+		dlg, err := s3bkt.Create.Delegate(hilt, ingot.DID(), hilt.DID())
+		require.NoError(t, err)
+		proofs := ucanlib.NewContainerProofStore(container.New(container.WithDelegations(dlg)))
+		u, err := url.Parse("http://hilt.test")
+		require.NoError(t, err)
+		c, err := hiltclient.New(hilt.DID(), *u, ingot, hiltclient.WithBaseProofs(proofs), hiltclient.WithHTTPClient(&http.Client{Transport: srv}))
+		require.NoError(t, err)
+		_, err = bucketauthority.New(c).CreateBucket(t.Context(), s3.Request{Method: "PUT", URL: "/photos"})
+		require.ErrorIs(t, err, bucketauthority.ErrMalformedPolicy)
+		require.ErrorContains(t, err, "unknown principal")
 	})
 
 	t.Run("passes an authorization rejection through with its name", func(t *testing.T) {
