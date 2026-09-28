@@ -827,3 +827,63 @@ func TestDrainSpaceRegistrationsFailsWhenTheServiceRefuses(t *testing.T) {
 	err := b.DrainSpaceRegistrations(context.Background(), bucketSpaceOf(t, b))
 	require.Error(t, err, "a change the upload service would not take must fail the delete")
 }
+
+// TestDrainRetriesADeadLetteredRetraction: a dead-lettered retraction can mean
+// the addition reached the upload service and the retraction never did, so the
+// root is still counted. Deleting the bucket destroys the row that says so, and
+// the teardown request carries /upload/remove in its own right, so teardown is
+// both the last chance to send it and the best one.
+func TestDrainRetriesADeadLetteredRetraction(t *testing.T) {
+	b, _ := newCountingBackend(t)
+	reg := &recordingRegistrar{}
+	b.registrar = reg
+	space := bucketSpaceOf(t, b)
+
+	// An object written and deleted: the addition lands, the retraction is
+	// queued.
+	putObjV(t, b, "a", []byte("hello"))
+	drainRegistrations(t, b)
+	if _, err := deleteObjV(t, b, "a", ""); err != nil {
+		t.Fatalf("delete a: %v", err)
+	}
+
+	// The retraction runs out of authority and is dead-lettered, leaving the
+	// root counted in the upload service.
+	reg.spendAuthority()
+	for range uploadRegistrationDeadLetterAfter + 1 {
+		if _, err := b.SweepUploadRegistrations(context.Background()); err != nil {
+			t.Fatalf("sweep: %v", err)
+		}
+		queued, err := b.uploadRegs.ListUploadRegistrationsBySpace(context.Background(), space)
+		require.NoError(t, err)
+		var live []int64
+		for _, q := range queued {
+			if !q.DeadLettered() {
+				live = append(live, q.Seq)
+			}
+		}
+		if len(live) == 0 {
+			break
+		}
+		require.NoError(t, b.uploadRegs.RescheduleUploadRegistrations(
+			context.Background(), live, time.Now().Add(-time.Second)))
+	}
+	dead, err := b.uploadRegs.ListDeadLetteredUploadRegistrations(context.Background(), 10)
+	require.NoError(t, err)
+	require.Len(t, dead, 1, "the retraction is dead-lettered")
+	_, retracted := reg.snapshot()
+	require.Empty(t, retracted)
+
+	// Teardown, with the authority the delete request carries.
+	reg.mu.Lock()
+	reg.spent = false
+	reg.mu.Unlock()
+	require.NoError(t, b.DrainSpaceRegistrations(context.Background(), space))
+
+	_, retracted = reg.snapshot()
+	require.Len(t, retracted, 1, "the dead-lettered retraction is sent at teardown, not skipped")
+
+	left, err := b.uploadRegs.ListUploadRegistrationsBySpace(context.Background(), space)
+	require.NoError(t, err)
+	require.Empty(t, left, "and its row goes, because the change actually landed")
+}
