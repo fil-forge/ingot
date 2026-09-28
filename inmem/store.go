@@ -217,6 +217,16 @@ func (m *MemStore) Delete(_ context.Context, name string) error {
 	}
 	delete(m.buckets, name)
 	delete(m.verSeqs, name)
+	// Postgres cascades upload_registrations on the bucket; do the same here
+	// so a queued change cannot outlive the bucket it belongs to in one
+	// backend and not the other.
+	kept := m.uploadRegs[:0]
+	for _, reg := range m.uploadRegs {
+		if reg.Bucket != name {
+			kept = append(kept, reg)
+		}
+	}
+	m.uploadRegs = kept
 	return nil
 }
 

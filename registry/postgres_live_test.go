@@ -836,12 +836,9 @@ func TestCASRootEnqueueOnASingleConnection(t *testing.T) {
 	if err := setup.Create(ctx, "cas-single-conn", space, registry.CreateState{Tenant: testutil.RandomDID(t)}); err != nil {
 		t.Fatalf("create bucket: %v", err)
 	}
-	t.Cleanup(func() {
-		_ = setup.Delete(context.Background(), "cas-single-conn")
-		// The rows outlive the bucket row, and this suite runs against a
-		// database that persists between runs.
-		_, _ = setup.DeleteUploadRegistrationsBySpace(context.Background(), space)
-	})
+	// Deleting the bucket cascades to its registrations, which matters here:
+	// this suite runs against a database that persists between runs.
+	t.Cleanup(func() { _ = setup.Delete(context.Background(), "cas-single-conn") })
 
 	// A root that does not match: the same path, reporting a conflict.
 	err = bounded("stale root", func(c context.Context) error {
@@ -865,5 +862,67 @@ func TestCASRootEnqueueOnASingleConnection(t *testing.T) {
 	}
 	if len(queued) != 1 {
 		t.Fatalf("queued %d registrations for the space, want 1", len(queued))
+	}
+}
+
+// TestDeletingABucketCascadesItsUploadRegistrations: a queued object-count
+// change is only meaningful while its bucket exists, so the two share one
+// fate. The database enforces it, which is what keeps bucket teardown free of
+// a cleanup step to sequence, to fail on its own, or to leave behind.
+//
+//	INGOT_TEST_DSN=postgres://... GOWORK=off go test ./registry/ -run Cascades -v
+func TestDeletingABucketCascadesItsUploadRegistrations(t *testing.T) {
+	dsn := os.Getenv("INGOT_TEST_DSN")
+	if dsn == "" {
+		t.Skip("set INGOT_TEST_DSN to run the live Postgres store test")
+	}
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("pool: %v", err)
+	}
+	defer pool.Close()
+	if err := migrations.Up(ctx, pool, zaptest.NewLogger(t)); err != nil {
+		t.Fatalf("migrations: %v", err)
+	}
+	r := registry.NewPostgres(pool)
+
+	space := testutil.RandomDID(t)
+	if err := r.Create(ctx, "cascade-bucket", space, registry.CreateState{Tenant: testutil.RandomDID(t)}); err != nil {
+		t.Fatalf("create bucket: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Delete(context.Background(), "cascade-bucket") })
+
+	if err := r.CASRootEnqueue(ctx, "cascade-bucket", cid.Undef, liveCid(t, "root"),
+		[]registry.UploadRegistration{{
+			Bucket: "cascade-bucket", ObjectKey: "k", Space: space,
+			Root: liveCid(t, "mf"), Op: registry.UploadRegistrationAdd, Proofs: []byte("proofs"),
+		}}); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	// A dead-lettered row goes too: it is out of the sweep but still a row,
+	// and the bearer proofs on it have no reason to outlive the bucket.
+	queued, err := r.ListUploadRegistrationsBySpace(ctx, space)
+	if err != nil {
+		t.Fatalf("list by space: %v", err)
+	}
+	if len(queued) != 1 {
+		t.Fatalf("queued %d, want 1", len(queued))
+	}
+	if err := r.DeadLetterUploadRegistrations(ctx, []int64{queued[0].Seq}, "test"); err != nil {
+		t.Fatalf("dead-letter: %v", err)
+	}
+
+	if err := r.Delete(ctx, "cascade-bucket"); err != nil {
+		t.Fatalf("delete bucket: %v", err)
+	}
+
+	left, err := r.ListUploadRegistrationsBySpace(ctx, space)
+	if err != nil {
+		t.Fatalf("list by space after delete: %v", err)
+	}
+	if len(left) != 0 {
+		t.Fatalf("%d registrations outlived their bucket", len(left))
 	}
 }
