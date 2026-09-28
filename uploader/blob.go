@@ -208,7 +208,7 @@ func (u *Forge) ConcludeBlobs(ctx context.Context, space did.DID, parked []Uploa
 			PutInvocation: p.PutInvocation,
 		}
 	}
-	added, err := u.client.BlobConcludeBatch(ctx, space, req)
+	added, err := u.client.BlobConcludeAll(ctx, space, req)
 	// Every blob comes back, located or still parked, whether or not the
 	// batch as a whole succeeded. What was located is converted before the
 	// error is looked at, so the caller can record it.
