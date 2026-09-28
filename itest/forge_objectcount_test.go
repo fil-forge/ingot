@@ -92,11 +92,23 @@ func TestForgeObjectCount(t *testing.T) {
 	// Deleting the bucket takes its queued changes with it. A row left behind
 	// would be retried against a space that no longer exists, keep its bearer
 	// proofs on disk, and sit in front of a new bucket of the same name.
+	// Emptied and deleted back to back, with no sweep in between — what a
+	// script does. The retraction "b" owes is still queued, and deleting the
+	// bucket cascades the queue away, so the delete has to apply it first or
+	// the upload service keeps that root and its count for good.
 	if err := ingottest.DeleteObject(ctx, cfg, bucket, "b"); err != nil {
 		t.Fatalf("delete b: %v", err)
 	}
 	if err := ingottest.DeleteBucket(ctx, cfg, bucket); err != nil {
 		t.Fatalf("delete bucket: %v", err)
+	}
+	// The space holds no content entries: every root it registered was
+	// retracted before it went.
+	if n := sprueSQL(t, ctx, s, fmt.Sprintf("SELECT count(*) FROM upload WHERE space = '%s'", space)); n != "0" {
+		t.Fatalf("the deleted bucket's space still holds %s content entries in the upload service", n)
+	}
+	if got := spaceObjectCount(t, ctx, s, space); got != 0 {
+		t.Fatalf("the deleted bucket's space reports %d objects, want 0", got)
 	}
 	q := fmt.Sprintf("SELECT count(*) FROM ingot.upload_registrations WHERE space = '%s'", space)
 	if left := ingotSQL(t, ctx, s, q); left != "0" {
