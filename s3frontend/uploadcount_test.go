@@ -777,3 +777,53 @@ func TestDeadLetteredChangeHoldsItsKeysLaterRowsInTheSameSweep(t *testing.T) {
 	require.Empty(t, added, "no row for the key goes out once one of them has stopped")
 	require.Empty(t, retracted)
 }
+
+// TestDrainSpaceRegistrationsAppliesWhatEmptyingOwed: a bucket emptied and
+// deleted inside one sweep interval still has its retractions queued. Deleting
+// it cascades them away, and nothing else would retract those roots, so the
+// drain has to apply them first or every object stays counted for good.
+func TestDrainSpaceRegistrationsAppliesWhatEmptyingOwed(t *testing.T) {
+	b, reg := newCountingBackend(t)
+
+	putObjV(t, b, "a", []byte("hello"))
+	drainRegistrations(t, b)
+	added, retracted := reg.snapshot()
+	require.Len(t, added, 1)
+	require.Empty(t, retracted)
+
+	// Empty the bucket. The retraction is queued and no sweep has run.
+	if _, err := deleteObjV(t, b, "a", ""); err != nil {
+		t.Fatalf("delete a: %v", err)
+	}
+	_, retracted = reg.snapshot()
+	require.Empty(t, retracted, "the retraction is queued, not sent")
+
+	require.NoError(t, b.DrainSpaceRegistrations(context.Background(), bucketSpaceOf(t, b)))
+
+	_, retracted = reg.snapshot()
+	require.Len(t, retracted, 1, "the drain applies what emptying the bucket owed")
+	require.Equal(t, added[0], retracted[0])
+
+	// And the queue is empty, so the cascade has nothing left to throw away.
+	queued, err := b.uploadRegs.ListUploadRegistrationsBySpace(context.Background(), bucketSpaceOf(t, b))
+	require.NoError(t, err)
+	require.Empty(t, queued)
+}
+
+// TestDrainSpaceRegistrationsFailsWhenTheServiceRefuses: the drain runs before
+// hilt removes anything, so refusing to delete is the safe answer — the bucket
+// is still whole and the retry is clean.
+func TestDrainSpaceRegistrationsFailsWhenTheServiceRefuses(t *testing.T) {
+	b, _ := newCountingBackend(t)
+	putObjV(t, b, "a", []byte("hello"))
+	if _, err := deleteObjV(t, b, "a", ""); err != nil {
+		t.Fatalf("delete a: %v", err)
+	}
+
+	reg := &failingRegistrar{}
+	reg.refuse("add", true)
+	b.registrar = reg
+
+	err := b.DrainSpaceRegistrations(context.Background(), bucketSpaceOf(t, b))
+	require.Error(t, err, "a change the upload service would not take must fail the delete")
+}

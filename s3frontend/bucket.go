@@ -442,6 +442,16 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 			return fmt.Errorf("s3frontend: delete bucket: %w", err)
 		}
 
+		// The object-count changes the emptying owed are drained for the same
+		// reason and at the same point: the bucket is provably empty, so the
+		// queue holds its deletes' retractions, and the cascade below would
+		// throw them away. Nothing else would retract those roots — hilt's
+		// delete checks the space's blobs, not its content entries — so every
+		// object of a bucket emptied and deleted in one go would stay counted.
+		if err := b.DrainSpaceRegistrations(ctx, st.Space); err != nil {
+			return fmt.Errorf("s3frontend: delete bucket: %w", err)
+		}
+
 		req, ok := reqscope.Request(ctx)
 		if !ok {
 			return errors.New("s3frontend: delete bucket: no request in context")

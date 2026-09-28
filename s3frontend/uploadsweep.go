@@ -6,6 +6,7 @@ import (
 	"time"
 
 	uploadcmds "github.com/fil-forge/libforge/commands/upload"
+	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/ucantone/ucan"
 	"go.uber.org/zap"
 
@@ -276,4 +277,70 @@ func registrationCommand(op registry.UploadRegistrationOp) ucan.Command {
 // is only owed within one key: two keys never share a manifest root.
 func registrationKey(reg registry.UploadRegistration) string {
 	return reg.Bucket + "\x00" + reg.ObjectKey
+}
+
+// DrainSpaceRegistrations applies a space's queued object-count changes now,
+// rather than leaving them to the sweep. Bucket teardown calls it before the
+// space is deleted, the way drainSpaceReleases drains the blob releases.
+//
+// It is needed because the two ends of a deletion are cleaned up by different
+// people. Emptying a bucket queues a retraction per version, and deleting the
+// bucket drops whatever is still queued — the outbox cascades on the bucket
+// row. Nothing else retracts those roots: hilt's delete checks that the space
+// holds no blobs and never touches its content entries, and the upload service
+// keeps a space's entries and counters after the space is gone. So a bucket
+// emptied and deleted inside one sweep interval — which is what a script does
+// — would leave every one of its objects counted for good.
+//
+// Failing here fails the delete, which is safe: it runs before hilt has
+// removed anything, so the bucket is still whole and the retry is clean.
+func (b *Backend) DrainSpaceRegistrations(ctx context.Context, space did.DID) error {
+	rows, err := b.uploadRegs.ListUploadRegistrationsBySpace(ctx, space)
+	if err != nil {
+		return fmt.Errorf("s3frontend: list space upload registrations: %w", err)
+	}
+
+	var adds, removes []registry.UploadRegistration
+	for _, reg := range rows {
+		if reg.DeadLetteredAt != nil {
+			// Already given up on, and already reported as wrong. It must not
+			// hold up the delete as well.
+			continue
+		}
+		switch reg.Op {
+		case registry.UploadRegistrationAdd:
+			adds = append(adds, reg)
+		case registry.UploadRegistrationRemove:
+			removes = append(removes, reg)
+		}
+	}
+	if len(adds) == 0 && len(removes) == 0 {
+		return nil
+	}
+
+	// Additions before retractions, for the reason SweepUploadRegistrations
+	// gives: a retraction that overtook the addition it retires would leave
+	// the root counted, which is the very thing this drain exists to prevent.
+	_, stalled, err := b.applyRegistrations(ctx, adds, b.registrar.RegisterUploads, nil)
+	if err != nil {
+		return fmt.Errorf("s3frontend: drain space registrations: %w", err)
+	}
+	if _, _, err := b.applyRegistrations(ctx, removes, b.registrar.RetractUploads, stalled); err != nil {
+		return fmt.Errorf("s3frontend: drain space registrations: %w", err)
+	}
+
+	// applyRegistrations reschedules what it could not send rather than
+	// reporting it, so the queue itself is the answer: anything still owed
+	// means the upload service did not take it, and the count would be wrong
+	// if the space went now.
+	left, err := b.uploadRegs.ListUploadRegistrationsBySpace(ctx, space)
+	if err != nil {
+		return fmt.Errorf("s3frontend: list space upload registrations: %w", err)
+	}
+	for _, reg := range left {
+		if reg.DeadLetteredAt == nil {
+			return fmt.Errorf("s3frontend: the upload service has not taken this space's object-count changes; retry")
+		}
+	}
+	return nil
 }
