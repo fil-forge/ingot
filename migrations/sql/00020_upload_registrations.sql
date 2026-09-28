@@ -35,7 +35,14 @@ CREATE TABLE ingot.upload_registrations (
     next_at     timestamptz NOT NULL DEFAULT now(),
     created_at  timestamptz NOT NULL DEFAULT now(),
     dead_lettered_at   timestamptz,
-    dead_letter_reason text
+    dead_letter_reason text,
+
+    -- A row is only meaningful while its bucket exists: the space goes with
+    -- the bucket, and a change queued against a deleted space can never be
+    -- made. Cascading ties the two together in one statement, so bucket
+    -- teardown has no separate cleanup step to sequence against the remote
+    -- delete, to fail on its own, or to leave behind.
+    FOREIGN KEY (bucket) REFERENCES ingot.buckets (name) ON DELETE CASCADE
 );
 
 -- The sweeper's claim order: due first, then commit order. Dead-lettered rows

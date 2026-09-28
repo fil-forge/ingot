@@ -88,12 +88,4 @@ type UploadRegistrationStore interface {
 	// ListUploadRegistrationsBySpace returns a space's queued rows regardless
 	// of next_at, for inspecting what a space still owes.
 	ListUploadRegistrationsBySpace(ctx context.Context, space did.DID) ([]UploadRegistration, error)
-	// DeleteUploadRegistrationsBySpace drops every row for a space, queued or
-	// dead-lettered, and reports how many went. Bucket teardown calls it: the
-	// space is about to be deleted, so its object count stops meaning
-	// anything, and rows left behind would be retried against a space that no
-	// longer exists, keep their bearer proofs on disk, and — if the bucket
-	// name were reused — sit in front of the new bucket's registrations for
-	// the same key.
-	DeleteUploadRegistrationsBySpace(ctx context.Context, space did.DID) (int64, error)
 }
