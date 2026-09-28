@@ -317,6 +317,10 @@ var hiltAllPermissions = []string{
 	"s3:AbortMultipartUpload",
 	"s3:ListMultipartUploadParts",
 	"s3:ListBucketMultipartUploads",
+	// The bucket policy operations, held by service keys only.
+	"s3:GetBucketPolicy",
+	"s3:PutBucketPolicy",
+	"s3:DeleteBucketPolicy",
 }
 
 // hiltProvisionTenant provisions tenantID in hilt with an all-permission
