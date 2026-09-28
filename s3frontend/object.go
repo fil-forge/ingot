@@ -40,7 +40,7 @@ const defaultMaxKeys = 1000
 // PutObject writes an object. Tagging and ACLs are dropped on the floor for
 // now (see bucket-metadata.rfc §"Canonical state vs service state"); lock
 // headers stamp the new version's state (docs/s3-object-lock.md §7). ETag is
-// the hex md5 of the body, quoted per S3 wire format.
+// the object ETag of etag.go, quoted per S3 wire format.
 // requestsServerSideEncryption reports whether the request carries any
 // server-side-encryption header (SSE-S3, SSE-KMS or SSE-C, including the
 // copy-source SSE-C headers). ingot encrypts every object to the tenant key and
@@ -201,7 +201,7 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 		ContentType:             contentType,
 		Created:                 time.Now().Unix(),
 		Body:                    bodyRec,
-		ETag:                    hex.EncodeToString(bodyRec.MD5),
+		ETag:                    objectETag(bodyRec.SHA256),
 		ChecksumAlgorithm:       ckAlgo,
 		Checksum:                ckVal,
 		ChecksumType:            string(types.ChecksumTypeFullObject),
@@ -270,7 +270,7 @@ func (b *Backend) ingestBody(ctx context.Context, bucket *registry.State, r io.R
 // Complete.
 //
 // The Body it returns is entirely plaintext-coordinate (Size, spans,
-// SHA256/MD5 — all computed before encryption); the intents record the
+// SHA256 — all computed before encryption); the intents record the
 // SPOOLED (ciphertext) byte count, which is what the uploader ships.
 func (b *Backend) splitSpool(ctx context.Context, bucket string, space did.DID, r io.Reader) (_ msbucket.Body, err error) {
 	// The span covers receiving the body (it streams in from the client as
@@ -1798,14 +1798,15 @@ func (b *Backend) listWalk(ctx context.Context, bucketName, prefix, delimiter, f
 }
 
 // etagOf returns the manifest's S3 ETag, double-quoted per the wire
-// format. The ETag is stored verbatim on the manifest (hex md5 for a
-// single-part object; "<md5-of-md5s>-<N>" for a multipart object, which
-// cannot be re-derived from the body bytes). Falls back to the body md5
-// for any manifest written without a stored ETag.
+// format. The ETag is stored verbatim on the manifest (etag.go: the body
+// digest with "-1" for a single-part object; the digest of the part digests
+// with "-N" for a multipart object, which cannot be re-derived from the
+// body bytes). Falls back to the body digest for any manifest written
+// without a stored ETag.
 func etagOf(mf *msbucket.ObjectManifest) string {
 	tag := mf.ETag
 	if tag == "" {
-		tag = hex.EncodeToString(mf.Body.MD5)
+		tag = objectETag(mf.Body.SHA256)
 	}
 	return `"` + tag + `"`
 }

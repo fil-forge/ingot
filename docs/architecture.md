@@ -132,10 +132,14 @@ internal) and `version_id` (identity, the client handle — a ULID token, or `"n
 a sentinel. Object keys need no escaping and no terminator, and fit `MaxKeyBytes` as-is; the
 seq-derived token reveals write ordering, which is accepted (S3 ids are opaque to clients).
 
-**ETags.** The ETag is MD5-based, never the sha256 content digest. A whole-object ETag is the MD5 of
-the body; a multipart object's ETag is `hex(md5(concat of the N part MD5s)) + "-N"` (matching
-versitygw's `GetMultipartMD5`); each part's ETag is the hex of its MD5. MD5 is computed during ingest
-alongside sha256 at no extra pass, and stored in the manifest.
+**ETags.** The ETag derives from the plaintext sha256 the ingest pass already computes, so no MD5
+runs on the write path. A whole-object ETag is `hex(sha256(body)) + "-1"`; a multipart object's is
+`hex(sha256(concat of the N part sha256s)) + "-N"`; each part's ETag is the hex of its sha256. The
+part-count suffix is the shape S3 gives every multipart-uploaded object, and S3 documents that the
+ETag of a multipart, SSE-KMS or SSE-C object is not an MD5; every response that carries an ETag also
+carries `x-amz-server-side-encryption: aws:kms`, which is what clients that would otherwise verify
+the ETag as an MD5 (s3cmd, the Java v1 SDK) read to skip the check. The ETag is stored verbatim in
+the manifest.
 
 **Conditional requests.** versitygw parses `If-Match`/`If-None-Match`/`If-(Un)Modified-Since` and
 `x-amz-copy-source-if-*` but delegates evaluation to the backend. Ingot evaluates them against the
@@ -161,7 +165,7 @@ a 412), require the source bucket to be the destination tenant's, and `CopyObjec
 result (not atomic).
 
 **Zero-byte objects.** A 0-byte object stores no blob: Ingot writes a manifest with `size=0`, the
-well-known empty MD5 ETag, and no body digest. (Piri's aggregator has no piece for empty content.)
+empty body's ETag, and no body blob. (Piri's aggregator has no piece for empty content.)
 
 **Checksums.** versitygw threads `x-amz-checksum-*` (CRC32/C, SHA1, SHA256) to the backend; Ingot
 validates/echoes them, independent of the internal sha256 content address.
@@ -207,7 +211,7 @@ MST (bucket)
                     ├ key          "photos/cat.jpg"
                     ├ seq/versionId  "01J8QX…"          (identity; cached on the leaf's current)
                     ├ created      "2026-06-17T"…       (last-modified)
-                    ├ etag         "9b2cf…-3"           (md5-of-md5s-N if multipart, else md5 hex)
+                    ├ etag         "9b2cf…-3"           (sha256-of-part-sha256s-N if multipart, else sha256-1)
                     ├ contentType + http headers + user metadata
                     ├ deleteMarker "false"              (true ⇒ tombstone, no body)
                     └ body
@@ -252,7 +256,7 @@ an accepted cost until catalog GC exists ([§9](#9-the-system-contract-piri--spr
 
 The data layer turns an object body into stored blobs and tracks who references them.
 
-**Object → blobs.** A body is hashed (sha256 for content addressing, md5 for the ETag) in a single
+**Object → blobs.** A body is hashed (sha256, for integrity and the ETag) in a single
 streaming pass and written to the local store. It becomes an ordered list of content-addressed
 blobs, each `≤ max_blob_size`: one blob for objects within the ceiling, a coarse split (e.g. 256 MiB
 granularity, not fine chunking) for larger ones. Each blob is uploaded to Piri by digest ([§7](#7-cross-cutting-durability-concurrency-retrieval)).

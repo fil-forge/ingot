@@ -1622,7 +1622,7 @@ func TestAbortRecordsBlobAnotherAbortingSessionReferences(t *testing.T) {
 	if err := mem.CreateSession(ctx, registry.MultipartSession{UploadID: other, Bucket: bucket, ObjectKey: "other"}); err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
-	if err := mem.PutPart(ctx, registry.MultipartPart{UploadID: other, PartNumber: 1, ETagMD5: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{d}, State: registry.PartParked}); err != nil {
+	if err := mem.PutPart(ctx, registry.MultipartPart{UploadID: other, PartNumber: 1, ETagDigest: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{d}, State: registry.PartParked}); err != nil {
 		t.Fatalf("PutPart: %v", err)
 	}
 	if won, err := mem.LatchSession(ctx, other, registry.SessionOpen, registry.SessionAborting); err != nil || !won {
@@ -1657,7 +1657,7 @@ func TestReleaseWaitsForAnotherOpenSessionSharingTheBlob(t *testing.T) {
 	if err := mem.CreateSession(ctx, registry.MultipartSession{UploadID: other, Bucket: bucket, ObjectKey: "other"}); err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
-	if err := mem.PutPart(ctx, registry.MultipartPart{UploadID: other, PartNumber: 1, ETagMD5: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{d}, State: registry.PartParked}); err != nil {
+	if err := mem.PutPart(ctx, registry.MultipartPart{UploadID: other, PartNumber: 1, ETagDigest: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{d}, State: registry.PartParked}); err != nil {
 		t.Fatalf("PutPart: %v", err)
 	}
 
@@ -1837,7 +1837,7 @@ func TestSweepLeavesALiveCompleteOnAnOldSession(t *testing.T) {
 		if err != nil {
 			t.Fatalf("multihash.Sum: %v", err)
 		}
-		if err := mem.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 1, ETagMD5: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{d}, State: registry.PartParked}); err != nil {
+		if err := mem.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 1, ETagDigest: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{d}, State: registry.PartParked}); err != nil {
 			t.Fatalf("PutPart %s: %v", id, err)
 		}
 		// The write path spools every part blob before recording the part,

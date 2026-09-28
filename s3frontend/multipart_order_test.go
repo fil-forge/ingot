@@ -3,8 +3,7 @@ package s3frontend
 import (
 	"bytes"
 	"context"
-	"crypto/md5"
-	"encoding/hex"
+	"crypto/sha256"
 	"fmt"
 	"strings"
 	"testing"
@@ -27,7 +26,7 @@ func taggedBody(n int, tag byte) []byte {
 
 // TestMultipartPartsArriveOutOfOrder: part numbers, not arrival order, define
 // the object. Parts uploaded 3, 1, 2 list ascending by part number, Complete
-// assembles the body and the md5-of-md5s ETag in part-number order, and
+// assembles the body and the digest-of-part-digests ETag in part-number order, and
 // ?partNumber=N addresses the part by its number. A small blob ceiling makes
 // every non-final part span several internal blobs, so the assembled blob
 // list is genuinely re-sequenced rather than a one-blob-per-part passthrough.
@@ -75,15 +74,15 @@ func TestMultipartPartsArriveOutOfOrder(t *testing.T) {
 
 	var completed []types.CompletedPart
 	var whole []byte
-	etagCat := md5.New()
+	var partDigests [][]byte
 	for i := range parts {
 		pn := int32(i + 1)
 		completed = append(completed, types.CompletedPart{PartNumber: &pn, ETag: etags[i]})
 		whole = append(whole, parts[i]...)
-		sum := md5.Sum(parts[i])
-		etagCat.Write(sum[:])
+		sum := sha256.Sum256(parts[i])
+		partDigests = append(partDigests, sum[:])
 	}
-	wantETag := hex.EncodeToString(etagCat.Sum(nil)) + "-3"
+	wantETag := multipartETag(partDigests)
 
 	res, err := mpComplete(t, b, key, uploadID, completed, nil)
 	if err != nil {
@@ -93,7 +92,7 @@ func TestMultipartPartsArriveOutOfOrder(t *testing.T) {
 		t.Fatal("Complete returned no ETag")
 	}
 	if got := strings.Trim(*res.ETag, `"`); got != wantETag {
-		t.Fatalf("Complete ETag = %q, want %q (md5-of-md5s in part-number order)", got, wantETag)
+		t.Fatalf("Complete ETag = %q, want %q (digest of part digests in part-number order)", got, wantETag)
 	}
 
 	if got := getRange(t, b, key, ""); !bytes.Equal(got, whole) {

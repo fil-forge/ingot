@@ -214,7 +214,7 @@ type MultipartSession struct {
 type MultipartPart struct {
 	UploadID   string
 	PartNumber int
-	ETagMD5    []byte
+	ETagDigest []byte // sha256 of the part bytes, the source of its ETag
 	Size       int64
 	// Checksum is the part's base64 checksum. When the session declares a
 	// checksum algorithm it is that algorithm's value (client-validated or

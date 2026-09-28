@@ -34,11 +34,8 @@ const DefaultMaxBlobSize int64 = blobcmds.MaxBlobSize - envelopeAllowance
 // to local storage as it goes, so no blob is ever held whole in memory (a ~254 MiB
 // blob buffered in RAM × concurrent PUTs would sink a memory-constrained
 // appliance). It returns a Body whose Blobs list covers [0, Size) contiguously;
-// the whole-body sha256 and md5 are computed in the same streaming pass, the
-// md5 on its own goroutine so the stream is not serialized behind the slowest
-// hash (see asyncHash) and on the shared md5-simd server so concurrent bodies
-// share vector lanes where the CPU has them (see newETagHash). A zero-byte
-// body yields a Body with no blobs (and the well-known empty digests).
+// the whole-body sha256 is computed in the same streaming pass. A zero-byte
+// body yields a Body with no blobs (and the well-known empty digest).
 //
 // w is the local spool in production (blockstore.Spool): the blobs land on disk
 // before being uploaded to Forge by digest. SplitBody itself is storage-agnostic.
@@ -49,13 +46,9 @@ func SplitBody(ctx context.Context, w blockstore.BlobWriter, r io.Reader, maxBlo
 	}
 
 	bodyHasher := sha256.New()
-	etagHasher := newAsyncHash(newETagHash())
-	// Every return path must finish the async hasher so its goroutine exits;
-	// Sum is idempotent, so the success path's explicit call below is fine.
-	defer etagHasher.Sum()
-	// Tee everything read into both hashers so the whole-body digests are
+	// Tee everything read into the hasher so the whole-body digest is
 	// computed in the same pass that splits the body into blobs.
-	src := io.TeeReader(r, io.MultiWriter(bodyHasher, etagHasher))
+	src := io.TeeReader(r, bodyHasher)
 
 	var blobs []BlobRef
 	var total int64
@@ -81,7 +74,6 @@ func SplitBody(ctx context.Context, w blockstore.BlobWriter, r io.Reader, maxBlo
 	return Body{
 		Size:   total,
 		SHA256: bodyHasher.Sum(nil),
-		MD5:    etagHasher.Sum(),
 		Blobs:  blobs,
 	}, nil
 }

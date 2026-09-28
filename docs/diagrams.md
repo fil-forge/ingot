@@ -176,7 +176,7 @@ flowchart TB
     put["PutObject / UploadPart body"]
 
     subgraph bodyr["the body route (raw blobs, synchronous)"]
-        split["SplitBody: coarse split at max_blob_size,<br/>sha256 + md5 in one streaming pass"]
+        split["SplitBody: coarse split at max_blob_size,<br/>sha256 in one streaming pass"]
         spool["Spool (DataDir/spool)<br/>+ upload_intents row"]
         upload["per-blob upload before the commit:<br/>/blob/add, HTTP PUT, conclude, accept<br/>(a blob_locations hit skips it: dedup)"]
         bloc["blob_locations row: the whole blob,<br/>(space, digest) to provider URL"]
@@ -254,7 +254,7 @@ sequenceDiagram
     C->>B: PutObject(bucket, key, body)
     B->>R: reg.Get(bucket), precondition pre-check
     B->>B: tenant recipient: resolve the tenant's #wrap key<br/>(tenant DID from the request, did:plc doc via the cached PLC resolver);<br/>no recipient → the write fails
-    B->>SP: SplitBody: per plaintext piece, fresh CEK →<br/>FEE envelope (COSE_Encrypt, AES-256-GCM STREAM,<br/>one recipient: ECDH-ES+A256KW to the tenant wrap key) →<br/>spool under the CIPHERTEXT digest<br/>(sha256 + md5 of the plaintext in the same pass)
+    B->>SP: SplitBody: per plaintext piece, fresh CEK →<br/>FEE envelope (COSE_Encrypt, AES-256-GCM STREAM,<br/>one recipient: ECDH-ES+A256KW to the tenant wrap key) →<br/>spool under the CIPHERTEXT digest<br/>(sha256 of the plaintext in the same pass)
     B->>R: PutIntent(digest, stored size) +<br/>PutEncryptionParams(region-wrapped CEK, FEE geometry) per blob
     loop each body blob (uploadBlobs)
         alt blob_locations already has (space, digest)
@@ -284,7 +284,7 @@ sequenceDiagram
 
 - Encryption makes the stored digest a ciphertext digest: **content dedup is
   gone for bodies** (fresh CEK per write ⇒ unique envelope), by design per
-  the encryption RFC. Manifest spans, `Body.Size`, sha256/md5 and ETag stay
+  the encryption RFC. Manifest spans, `Body.Size`, sha256 and ETag stay
   plaintext values; `upload_intents.Size` and `blob_locations.Size` are
   stored (envelope) sizes.
 - The envelope's one COSE recipient is the tenant wrap key (kid = the key's
@@ -304,8 +304,8 @@ sequenceDiagram
   read path into `ingestBody` and the copy gets its own blobs and claims. A
   source bucket owned by another tenant is `AccessDenied` before any key
   lookup (hilt refuses it when authorizing the request; ingot compares the
-  tenant on the two bucket rows as well). The copy's ETag is the md5 of its
-  bytes even for a multipart source.
+  tenant on the two bucket rows as well). The copy's ETag is the single-part
+  ETag of its bytes even for a multipart source.
 - Supersession also records each replaced catalog block for future removal:
   the [catalog GC candidates](#catalog-gc-candidates-what-gets-remembered-for-removal)
   diagram shows every entry path.
@@ -437,7 +437,7 @@ sequenceDiagram
             B->>R: PutPark(AddTask, AcceptTask, PutInvocation), intent parked
         end
     end
-    B-->>C: part ETag (part md5; for a copy, of the copied bytes)
+    B-->>C: part ETag (part sha256; for a copy, of the copied bytes)
     C->>B: CompleteMultipartUpload(parts)
     B->>B: validate parts (ascending, ETags, checksums, MinPartSize)
     alt session already completed
@@ -449,7 +449,7 @@ sequenceDiagram
         B->>R: PutLocation + intent accepted + DeletePark per blob
         B->>TX: commitVersion (see the PutObject diagram)
         B->>R: LatchSession(completing to completed), best-effort
-        B-->>C: 200, ETag = md5-of-part-md5s + "-N"
+        B-->>C: 200, ETag = sha256-of-part-sha256s + "-N"
     end
     C->>B: AbortMultipartUpload
     B->>R: LatchSession(open to aborting); EnqueueReleases for every<br/>unreferenced part blob; then DeleteSession (parts cascade)
@@ -585,7 +585,7 @@ flowchart TB
     prev["Prev: per-key sub-MST of noncurrent versions<br/>keyed revSeqKey(seq): %016x of bit-inverted seq,<br/>so a forward walk is newest-first"]
     nulls["NullSeq: a noncurrent null<br/>version's seq (0 = none)"]
     em["EnvelopedManifest<br/>one per noncurrent version"]
-    mf["ObjectManifest<br/>Seq, VersionID, DeleteMarker, ETag, headers,<br/>Body(Size, SHA256, MD5, Blobs, PartSizes)"]
+    mf["ObjectManifest<br/>Seq, VersionID, DeleteMarker, ETag, headers,<br/>Body(Size, SHA256, Blobs, PartSizes)"]
 
     root --> leafk --> union
     union --> mans
@@ -875,7 +875,7 @@ erDiagram
     multipart_parts {
         text upload_id PK, FK
         int part_number PK
-        bytea etag_md5
+        bytea etag_digest
         bytea blob_digests "ordered array"
         text checksum
         text state "'accepted' never written"

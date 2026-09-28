@@ -561,10 +561,10 @@ func TestPostgresStores_Live(t *testing.T) {
 		_ = r.DeleteSession(ctx, id+"-space")
 
 		// bytea[] round trip + ordering.
-		if err := r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 2, ETagMD5: []byte{0x02}, Size: 2, BlobDigests: []multihash.Multihash{{0xd2}}}); err != nil {
+		if err := r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 2, ETagDigest: []byte{0x02}, Size: 2, BlobDigests: []multihash.Multihash{{0xd2}}}); err != nil {
 			t.Fatalf("PutPart 2: %v", err)
 		}
-		if err := r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 1, ETagMD5: []byte{0x01}, Size: 1, BlobDigests: []multihash.Multihash{{0xd1, 0xa}, {0xd1, 0xb}}}); err != nil {
+		if err := r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 1, ETagDigest: []byte{0x01}, Size: 1, BlobDigests: []multihash.Multihash{{0xd1, 0xa}, {0xd1, 0xb}}}); err != nil {
 			t.Fatalf("PutPart 1: %v", err)
 		}
 		parts, err := r.ListParts(ctx, id)
@@ -579,10 +579,10 @@ func TestPostgresStores_Live(t *testing.T) {
 		}
 		// A part cannot land once the session has left 'open', nor on a
 		// session that does not exist.
-		if err := r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 3, ETagMD5: []byte{0x03}, Size: 3, BlobDigests: []multihash.Multihash{{0xd3}}}); !errors.Is(err, registry.ErrNotFound) {
+		if err := r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 3, ETagDigest: []byte{0x03}, Size: 3, BlobDigests: []multihash.Multihash{{0xd3}}}); !errors.Is(err, registry.ErrNotFound) {
 			t.Fatalf("PutPart on a completing session = %v, want ErrNotFound", err)
 		}
-		if err := r.PutPart(ctx, registry.MultipartPart{UploadID: "no-such-upload", PartNumber: 1, ETagMD5: []byte{0x01}, Size: 1, BlobDigests: []multihash.Multihash{{0xd1}}}); !errors.Is(err, registry.ErrNotFound) {
+		if err := r.PutPart(ctx, registry.MultipartPart{UploadID: "no-such-upload", PartNumber: 1, ETagDigest: []byte{0x01}, Size: 1, BlobDigests: []multihash.Multihash{{0xd1}}}); !errors.Is(err, registry.ErrNotFound) {
 			t.Fatalf("PutPart on a missing session = %v, want ErrNotFound", err)
 		}
 		if parts, _ := r.ListParts(ctx, id); len(parts) != 2 {
@@ -645,10 +645,10 @@ func TestPostgresStores_Live(t *testing.T) {
 
 		// CountPartRefs: bytea[] ANY-match across sessions, excluding one.
 		shared := []byte{0xee, 0x01}
-		if err := r.PutPart(ctx, registry.MultipartPart{UploadID: "ls-1", PartNumber: 1, ETagMD5: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{shared}}); err != nil {
+		if err := r.PutPart(ctx, registry.MultipartPart{UploadID: "ls-1", PartNumber: 1, ETagDigest: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{shared}}); err != nil {
 			t.Fatalf("PutPart ls-1: %v", err)
 		}
-		if err := r.PutPart(ctx, registry.MultipartPart{UploadID: "ls-2", PartNumber: 1, ETagMD5: []byte{2}, Size: 1, BlobDigests: []multihash.Multihash{shared, {0xee, 0x02}}}); err != nil {
+		if err := r.PutPart(ctx, registry.MultipartPart{UploadID: "ls-2", PartNumber: 1, ETagDigest: []byte{2}, Size: 1, BlobDigests: []multihash.Multihash{shared, {0xee, 0x02}}}); err != nil {
 			t.Fatalf("PutPart ls-2: %v", err)
 		}
 		if n, err := r.CountPartRefs(ctx, shared, "ls-1"); err != nil || n != 1 {

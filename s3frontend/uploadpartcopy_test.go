@@ -3,8 +3,7 @@ package s3frontend
 import (
 	"bytes"
 	"context"
-	"crypto/md5"
-	"encoding/hex"
+	"crypto/sha256"
 	"errors"
 	"testing"
 
@@ -92,8 +91,9 @@ func TestUploadPartCopy_PartSizeAndETag(t *testing.T) {
 	if err != nil || len(parts.Parts) != 1 || parts.Parts[0].Size != 101 || trimQuotes(parts.Parts[0].ETag) != trimQuotes(*res.ETag) {
 		t.Fatalf("ListParts = %+v, %v; want one 101-byte part with ETag %s", parts.Parts, err, *res.ETag)
 	}
-	if want := `"` + hex.EncodeToString(md5Sum(src[100:201])) + `"`; *res.ETag != want {
-		t.Fatalf("part ETag = %s, want md5 of the copied bytes %s", *res.ETag, want)
+	copied := sha256.Sum256(src[100:201])
+	if want := `"` + partETag(copied[:]) + `"`; *res.ETag != want {
+		t.Fatalf("part ETag = %s, want the digest of the copied bytes %s", *res.ETag, want)
 	}
 
 	id = mpCreate(t, b, "empty-dst", "", "")
@@ -312,7 +312,8 @@ func putETag(t *testing.T, b *Backend, key string) string {
 	return *out.ETag
 }
 
-func md5Sum(b []byte) []byte {
-	sum := md5.Sum(b)
-	return sum[:]
+// wantObjectETag is the quoted single-part ETag of b (s3frontend/etag.go).
+func wantObjectETag(b []byte) string {
+	sum := sha256.Sum256(b)
+	return `"` + objectETag(sum[:]) + `"`
 }

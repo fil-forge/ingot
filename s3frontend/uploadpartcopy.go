@@ -41,7 +41,7 @@ const maxCopySize = 5 << 30
 // declared algorithm, which for a whole-object copy of a source checksummed
 // the same way reproduces the source's value; a session that declared none
 // records the internal CRC64NVME and echoes nothing. The part ETag is the hex
-// md5 of the copied bytes.
+// sha256 of the copied bytes (etag.go).
 func (b *Backend) UploadPartCopy(ctx context.Context, input *s3.UploadPartCopyInput) (s3response.CopyPartResult, error) {
 	if input.Bucket == nil || input.Key == nil || input.UploadId == nil || input.PartNumber == nil || input.CopySource == nil {
 		return s3response.CopyPartResult{}, s3err.GetAPIError(s3err.ErrInvalidRequest)

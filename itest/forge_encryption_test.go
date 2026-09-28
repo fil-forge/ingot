@@ -504,7 +504,7 @@ func TestForgeEncryption(t *testing.T) {
 		}
 		oldData := tagged(patternBytes(1<<20), 0x51)
 		newData := tagged(patternBytes(1<<20+64<<10), 0x62) // different length amplifies mix detection
-		oldETag, newETag := quotedMD5(oldData), quotedMD5(newData)
+		oldETag, newETag := quotedETag(oldData), quotedETag(newData)
 		oldSum, newSum := sha256.Sum256(oldData), sha256.Sum256(newData)
 
 		if _, err := cl.PutObject(ctx, &s3.PutObjectInput{

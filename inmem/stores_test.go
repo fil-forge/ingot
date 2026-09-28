@@ -195,8 +195,8 @@ func TestParts_OrderedAndCascade(t *testing.T) {
 	}
 
 	// Insert out of order; ListParts must return ascending part numbers.
-	mustPutPart(t, m, registry.MultipartPart{UploadID: id, PartNumber: 2, ETagMD5: []byte("m2"), Size: 2, BlobDigests: []multihash.Multihash{[]byte("d2")}})
-	mustPutPart(t, m, registry.MultipartPart{UploadID: id, PartNumber: 1, ETagMD5: []byte("m1"), Size: 1, BlobDigests: []multihash.Multihash{[]byte("d1a"), []byte("d1b")}})
+	mustPutPart(t, m, registry.MultipartPart{UploadID: id, PartNumber: 2, ETagDigest: []byte("m2"), Size: 2, BlobDigests: []multihash.Multihash{[]byte("d2")}})
+	mustPutPart(t, m, registry.MultipartPart{UploadID: id, PartNumber: 1, ETagDigest: []byte("m1"), Size: 1, BlobDigests: []multihash.Multihash{[]byte("d1a"), []byte("d1b")}})
 
 	parts, err := m.ListParts(ctx, id)
 	if err != nil {
@@ -217,7 +217,7 @@ func TestParts_OrderedAndCascade(t *testing.T) {
 	}
 
 	// PutPart against a missing session is rejected (FK).
-	if err := m.PutPart(ctx, registry.MultipartPart{UploadID: "missing", PartNumber: 1, ETagMD5: []byte("m"), BlobDigests: []multihash.Multihash{[]byte("d")}}); err != registry.ErrNotFound {
+	if err := m.PutPart(ctx, registry.MultipartPart{UploadID: "missing", PartNumber: 1, ETagDigest: []byte("m"), BlobDigests: []multihash.Multihash{[]byte("d")}}); err != registry.ErrNotFound {
 		t.Fatalf("PutPart missing session err = %v, want ErrNotFound", err)
 	}
 
@@ -491,7 +491,7 @@ func TestParts_LiveRefsFollowSessionState(t *testing.T) {
 		if err := m.CreateSession(ctx, registry.MultipartSession{UploadID: id, Bucket: "b", ObjectKey: id}); err != nil {
 			t.Fatalf("CreateSession %s: %v", id, err)
 		}
-		mustPutPart(t, m, registry.MultipartPart{UploadID: id, PartNumber: 1, ETagMD5: []byte("m"), Size: 1, BlobDigests: []multihash.Multihash{shared}})
+		mustPutPart(t, m, registry.MultipartPart{UploadID: id, PartNumber: 1, ETagDigest: []byte("m"), Size: 1, BlobDigests: []multihash.Multihash{shared}})
 	}
 	if n, _ := m.CountLivePartRefs(ctx, shared); n != 3 {
 		t.Fatalf("live refs with three open sessions = %d, want 3", n)

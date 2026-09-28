@@ -46,12 +46,17 @@ var putObjectPass = []forgeCase{
 	{name: "conditional_writes", fn: integration.PutObject_conditional_writes},
 	{name: "default_checksum", fn: integration.PutObject_default_checksum},
 	{name: "default_content_type", fn: integration.PutObject_default_content_type},
-	{name: "success", fn: integration.PutObject_success},
 	{name: "tagging", fn: integration.PutObject_tagging},
 	{name: "with_metadata", fn: integration.PutObject_with_metadata},
 }
 
 var putObjectXFail = []forgeCase{
+	// Asserts the ETag is the MD5 of the bytes. Ingot's ETags are SHA-256
+	// derived with a part-count suffix (s3frontend/etag.go): S3 itself
+	// documents that an SSE-KMS or multipart object's ETag is not an MD5,
+	// and every Ingot object is encrypted server-side. The divergence is
+	// intentional.
+	{name: "success", fn: integration.PutObject_success},
 	// This posix-oriented conformance test asserts path-traversal keys
 	// (e.g. "../../../etc/passwd") are rejected. Ingot stores keys as opaque
 	// MST byte strings, not filesystem paths, so such keys are legal literal
