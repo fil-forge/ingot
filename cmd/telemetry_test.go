@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"slices"
 	"testing"
 
@@ -91,6 +92,7 @@ func TestSetupTracingExportsToConfiguredEndpoint(t *testing.T) {
 		}
 	}))
 	defer collector.Close()
+	isolateOTelEnv(t)
 	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", collector.URL)
 	prev := otel.GetTracerProvider()
 	t.Cleanup(func() { otel.SetTracerProvider(prev) })
@@ -125,5 +127,34 @@ func TestSetupTracingOffWithoutEndpoint(t *testing.T) {
 	}
 	if otel.GetTracerProvider() != prev {
 		t.Fatal("expected no tracer provider installed without an endpoint")
+	}
+}
+
+// isolateOTelEnv unsets, for the test's duration, the OTEL_* variables that
+// would send the export elsewhere or sample the span away, so the shell or CI
+// running the tests cannot change the outcome.
+func isolateOTelEnv(t *testing.T) {
+	t.Helper()
+	for _, k := range []string{
+		"OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+		"OTEL_TRACES_SAMPLER",
+		"OTEL_TRACES_SAMPLER_ARG",
+		"OTEL_SDK_DISABLED",
+	} {
+		t.Setenv(k, "") // restores the original value when the test ends
+		os.Unsetenv(k)
+	}
+}
+
+func TestCollectorHostOmitsCredentials(t *testing.T) {
+	for endpoint, want := range map[string]string{
+		"http://otel-collector:4318":                      "http://otel-collector:4318",
+		"https://user:secret@collector.example.com/v1":    "https://collector.example.com",
+		"https://collector.example.com:4318?token=hunter": "https://collector.example.com:4318",
+		"not a url": "unparsed endpoint",
+	} {
+		if got := collectorHost(endpoint); got != want {
+			t.Errorf("collectorHost(%q) = %q, want %q", endpoint, got, want)
+		}
 	}
 }

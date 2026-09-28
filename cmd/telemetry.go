@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -75,8 +76,19 @@ func setupTracing(ctx context.Context, logger *zap.Logger) (func(context.Context
 	otel.SetErrorHandler(otel.ErrorHandlerFunc(func(err error) {
 		logger.Warn("opentelemetry", zap.Error(err))
 	}))
-	logger.Info("tracing enabled", zap.String("endpoint", endpoint))
+	logger.Info("tracing enabled", zap.String("collector", collectorHost(endpoint)))
 	return tp.Shutdown, nil
+}
+
+// collectorHost returns the scheme and host of an OTLP endpoint, for logging.
+// The endpoint may carry credentials in its userinfo or query, so the rest of
+// it is never logged.
+func collectorHost(endpoint string) string {
+	u, err := url.Parse(endpoint)
+	if err != nil || u.Host == "" {
+		return "unparsed endpoint"
+	}
+	return u.Scheme + "://" + u.Host
 }
 
 // samplerFromEnv returns ingot's sampler: a caller's sampling decision is
