@@ -43,8 +43,13 @@ func setupTracing(ctx context.Context, logger *zap.Logger) (func(context.Context
 		return nil, fmt.Errorf("creating trace exporter: %w", err)
 	}
 
+	// The Forge namespace groups Ingot with the other Forge services, so their
+	// telemetry is selected together rather than by each service.name.
+	// WithFromEnv comes after, so OTEL_RESOURCE_ATTRIBUTES can still override
+	// either attribute.
 	res, err := resource.New(ctx,
 		resource.WithAttributes(
+			semconv.ServiceNamespace("forge"),
 			semconv.ServiceName("ingot"),
 			semconv.ServiceVersion(build.Version),
 		),
