@@ -11,6 +11,7 @@ import (
 	"go.opentelemetry.io/otel"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	semconv "go.opentelemetry.io/otel/semconv/v1.37.0"
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 )
@@ -116,6 +117,48 @@ func TestSetupTracingExportsToConfiguredEndpoint(t *testing.T) {
 	}
 }
 
+// namespaceOf installs tracing against a collector that accepts everything,
+// starts a span, and returns its resource's service.namespace.
+func namespaceOf(t *testing.T) string {
+	t.Helper()
+	collector := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer collector.Close()
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", collector.URL)
+	prev := otel.GetTracerProvider()
+	t.Cleanup(func() { otel.SetTracerProvider(prev) })
+
+	shutdown, err := setupTracing(context.Background(), zap.NewNop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, span := otel.Tracer("test").Start(context.Background(), "PutObject")
+	ro, ok := span.(sdktrace.ReadOnlySpan)
+	if !ok {
+		t.Fatal("expected an SDK span")
+	}
+	ns, _ := ro.Resource().Set().Value(semconv.ServiceNamespaceKey)
+	span.End()
+	if err := shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	return ns.AsString()
+}
+
+func TestSetupTracingReportsForgeNamespace(t *testing.T) {
+	isolateOTelEnv(t)
+	if got := namespaceOf(t); got != "forge" {
+		t.Fatalf("expected service.namespace forge, got %q", got)
+	}
+}
+
+func TestSetupTracingNamespaceFromEnvWins(t *testing.T) {
+	isolateOTelEnv(t)
+	t.Setenv("OTEL_RESOURCE_ATTRIBUTES", "service.namespace=elsewhere")
+	if got := namespaceOf(t); got != "elsewhere" {
+		t.Fatalf("expected OTEL_RESOURCE_ATTRIBUTES to set service.namespace, got %q", got)
+	}
+}
+
 func TestSetupTracingOffWithoutEndpoint(t *testing.T) {
 	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
 	t.Setenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "")
@@ -140,6 +183,8 @@ func isolateOTelEnv(t *testing.T) {
 		"OTEL_TRACES_SAMPLER",
 		"OTEL_TRACES_SAMPLER_ARG",
 		"OTEL_SDK_DISABLED",
+		"OTEL_RESOURCE_ATTRIBUTES",
+		"OTEL_SERVICE_NAME",
 	} {
 		t.Setenv(k, "") // restores the original value when the test ends
 		os.Unsetenv(k)
