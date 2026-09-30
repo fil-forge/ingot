@@ -191,7 +191,15 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 			return s3response.CopyObjectOutput{}, fmt.Errorf("s3frontend: copy checksum reader: %w", err)
 		}
 		if crossSpace {
-			if body, err = b.ingestBody(ctx, bucketState, hr); err != nil {
+			// A single-part source's stored digest is the copy's MD5 (same
+			// bytes), so the re-ingest reuses it and skips the MD5 pass; a
+			// multipart source has none (its ETag is md5-of-md5s), so ingest
+			// computes a fresh MD5 for the copy's own single-part ETag.
+			var copyMD5 bodyMD5Source
+			if !multipartSrc && len(srcMf.Body.MD5) == md5.Size {
+				copyMD5 = knownMD5(srcMf.Body.MD5)
+			}
+			if body, err = b.ingestBody(ctx, bucketState, hr, copyMD5); err != nil {
 				var apiErr s3err.APIError
 				if errors.As(err, &apiErr) {
 					return s3response.CopyObjectOutput{}, apiErr
@@ -202,12 +210,13 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 		} else if multipartSrc {
 			// The pinned body keeps its bytes; only the md5 the source never
 			// recorded (its ETag is md5-of-md5s) is computed alongside the
-			// checksum.
-			sum := md5.New()
-			if _, err := io.Copy(sum, hr); err != nil {
+			// checksum, off the reading goroutine (see asyncHash).
+			mw := msbucket.NewMD5Writer()
+			defer mw.Sum()
+			if _, err := io.Copy(mw, hr); err != nil {
 				return s3response.CopyObjectOutput{}, fmt.Errorf("s3frontend: copy checksum: %w", err)
 			}
-			etag = hex.EncodeToString(sum.Sum(nil))
+			etag = hex.EncodeToString(mw.Sum())
 		} else {
 			// A single-part source's ETag already is the md5; only the newly
 			// requested checksum needs the pass.
