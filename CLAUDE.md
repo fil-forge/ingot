@@ -257,7 +257,7 @@ forge-mode daemon. Two tiers:
 
 ## Docker images & release
 
-Two publishing paths, both to `ghcr.io/fil-forge/ingot`. Mirrors sprue's
+Three publishing paths, all to `ghcr.io/fil-forge/ingot`. Mirrors sprue's
 pattern so smelt treats every forge service alike; where sprue and piri differ,
 we follow **sprue** (goreleaser builds the release container; `publish-ghcr.yml`
 stays main-only).
@@ -272,9 +272,14 @@ overriding `command`). BuildKit cache mounts speed the module + build cache.
 
 - **On merge to `main`** (`.github/workflows/publish-ghcr.yml`): publishes
   `:main` + `:sha-<short>` (prod) and `:main-dev` + `:sha-<short>-dev` (dev),
-  multi-arch amd64/arm64. PRs get a single-arch, no-push build-check of both
-  targets. `:main-dev` slots into smelt's `compose.debug.yml` / `make
-  debug-<svc>` flow.
+  multi-arch amd64/arm64. PR pushes get a single-arch, no-push build-check
+  of both targets. `:main-dev` slots into smelt's `compose.debug.yml` /
+  `make debug-<svc>` flow.
+- **On request from a PR** (`.github/workflows/forge-perf.yml`): a
+  `/forge-perf` comment from an owner, member or collaborator builds the PR's
+  head as the `prod` target, linux/arm64 only, and pushes
+  `:pr-<n>-<sha7>` for fil-forge/forge-perf to benchmark against main. It
+  never tags `:main` or `:sha-*`; the jobs live in forge-perf's `pr-run.yml`.
 
 **Releases** produce immutable `:vX.Y.Z` multi-arch containers **and**
 cross-platform binaries + a GitHub release, all via goreleaser. Cut one by
