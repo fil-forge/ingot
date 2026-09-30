@@ -3,7 +3,9 @@ package bucket
 import (
 	"bytes"
 	"crypto/md5"
+	"hash"
 	"io"
+	"sync"
 	"testing"
 )
 
@@ -54,5 +56,65 @@ func TestAsyncHash_CallerReusesBuffer(t *testing.T) {
 	}
 	if got, want := a.Sum(), h.Sum(nil); !bytes.Equal(got, want) {
 		t.Fatalf("digest mismatch: got %x, want %x", got, want)
+	}
+}
+
+// gatedHash reports on taken when the asyncHash goroutine first hands it a
+// buffer, then holds every Write until open is closed, so nothing can return
+// to the free list before the test allows it.
+type gatedHash struct {
+	hash.Hash
+	taken chan struct{} // closed on the first Write, before it blocks
+	open  chan struct{}
+	once  sync.Once
+}
+
+func (g *gatedHash) Write(p []byte) (int, error) {
+	g.once.Do(func() { close(g.taken) })
+	<-g.open
+	return g.Hash.Write(p)
+}
+
+// TestAsyncHash_FixedBufferSet pins the allocation bound: a stream allocates
+// exactly asyncHashQueue+1 buffers, whatever size came first (the encrypting
+// writer's one-byte EOF probe reaches the hashers before any full read) and
+// however large the later writes are (a 256 KiB read from the encrypt reader
+// is queued as eight chunks). A buffer sized by a small first write would
+// have to be replaced later and would show up here as one extra allocation.
+//
+// The hash is gated while the first asyncHashQueue+1 writes are queued, so
+// the producer cannot find a returned buffer on the free list and must
+// allocate its whole set; the gate then opens and every later write reuses
+// one. That makes the count exact rather than a bound that scheduling could
+// undershoot. The producer waits for the worker to take the first buffer
+// before queuing the rest: the worker then holds one and the queue the other
+// asyncHashQueue, so the set fills without a send ever blocking.
+func TestAsyncHash_FixedBufferSet(t *testing.T) {
+	one := make([]byte, 1)
+	chunk := make([]byte, asyncHashChunk)
+	big := make([]byte, 8*asyncHashChunk)
+	streamAllocs := func(write func(a *asyncHash, g *gatedHash)) float64 {
+		return testing.AllocsPerRun(5, func() {
+			g := &gatedHash{Hash: md5.New(), taken: make(chan struct{}), open: make(chan struct{})}
+			a := newAsyncHash(g)
+			write(a, g)
+			a.Sum()
+		})
+	}
+	base := streamAllocs(func(_ *asyncHash, g *gatedHash) { close(g.open) })
+	got := streamAllocs(func(a *asyncHash, g *gatedHash) {
+		a.Write(one)
+		<-g.taken
+		for i := 1; i < asyncHashQueue+1; i++ {
+			a.Write(chunk)
+		}
+		close(g.open)
+		for i := 0; i < 2*(asyncHashQueue+1); i++ {
+			a.Write(chunk)
+		}
+		a.Write(big)
+	})
+	if buffers := got - base; buffers != asyncHashQueue+1 {
+		t.Fatalf("stream allocated %.1f buffers; want exactly %d", buffers, asyncHashQueue+1)
 	}
 }
