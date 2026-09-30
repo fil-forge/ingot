@@ -73,7 +73,11 @@ func (a *asyncHash) Write(p []byte) (int, error) {
 			if a.spare == 0 {
 				buf = <-a.free
 			} else {
+				// Every buffer is allocated at the chunk cap, whatever this
+				// write's size, so no later append has to grow it: the
+				// stream allocates asyncHashQueue+1 buffers and no more.
 				a.spare--
+				buf = make([]byte, 0, asyncHashChunk)
 			}
 		}
 		a.full <- append(buf, p[:n]...)

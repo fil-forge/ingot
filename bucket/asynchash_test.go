@@ -56,3 +56,32 @@ func TestAsyncHash_CallerReusesBuffer(t *testing.T) {
 		t.Fatalf("digest mismatch: got %x, want %x", got, want)
 	}
 }
+
+// TestAsyncHash_FixedBufferSet pins the allocation bound: a stream allocates
+// exactly asyncHashQueue+1 buffers, whatever size came first (the encrypting
+// writer's one-byte EOF probe reaches the hashers before any full read) and
+// however large the later writes are (a 256 KiB read from the encrypt reader
+// is queued as eight chunks). A buffer sized by a small first write would
+// have to be replaced later and would show up here as one extra allocation.
+func TestAsyncHash_FixedBufferSet(t *testing.T) {
+	streamAllocs := func(write func(a *asyncHash)) float64 {
+		return testing.AllocsPerRun(5, func() {
+			a := newAsyncHash(md5.New())
+			write(a)
+			a.Sum()
+		})
+	}
+	base := streamAllocs(func(*asyncHash) {})
+	chunk := make([]byte, asyncHashChunk)
+	big := make([]byte, 8*asyncHashChunk)
+	got := streamAllocs(func(a *asyncHash) {
+		a.Write([]byte{1})
+		for i := 0; i < 2*(asyncHashQueue+1); i++ {
+			a.Write(chunk)
+		}
+		a.Write(big)
+	})
+	if buffers := got - base; buffers != asyncHashQueue+1 {
+		t.Fatalf("stream allocated %.1f buffers; want exactly %d", buffers, asyncHashQueue+1)
+	}
+}
