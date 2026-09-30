@@ -199,7 +199,7 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 			if !multipartSrc && len(srcMf.Body.MD5) == md5.Size {
 				copyMD5 = knownMD5(srcMf.Body.MD5)
 			}
-			if body, err = b.ingestBody(ctx, bucketState, hr, copyMD5); err != nil {
+			if body, err = b.ingestBody(ctx, bucketState, hr, srcMf.Body.Size, copyMD5); err != nil {
 				var apiErr s3err.APIError
 				if errors.As(err, &apiErr) {
 					return s3response.CopyObjectOutput{}, apiErr

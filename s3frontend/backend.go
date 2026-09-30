@@ -65,6 +65,10 @@ type Backend struct {
 	parks     registry.ParkStore
 	remover   uploader.BlobRemover
 	encParams registry.EncryptionParamsStore
+	// streaming sends a body blob to its provider while it is spooled;
+	// streams records each such upload until its park or acceptance is.
+	streaming uploader.StreamingBodyUploader
+	streams   registry.StreamStore
 	// pendingReleases is the deferred-release queue; releaseGrace is how far
 	// past the last-claim drop each release is scheduled (readers holding the
 	// prior catalog root get at least this long to finish their prefetch).
@@ -122,6 +126,14 @@ type Deps struct {
 	Deferred uploader.DeferredBodyUploader
 	Parks    registry.ParkStore
 	Remover  uploader.BlobRemover
+
+	// Streaming uploads each body blob while it is spooled,
+	// allocating it by size and hash function before its digest is known;
+	// Streams records each such upload until its park or acceptance is.
+	// Without Streaming every blob is spooled first and uploaded by digest.
+	// Streams is required with it.
+	Streaming uploader.StreamingBodyUploader
+	Streams   registry.StreamStore
 
 	// EncParams is the per-blob FEE encryption-parameter table: what the
 	// decrypting read path needs to serve an encrypted blob. RegionKeys
@@ -194,6 +206,8 @@ func New(d Deps) *Backend {
 		deferred:        d.Deferred,
 		parks:           d.Parks,
 		remover:         d.Remover,
+		streaming:       d.Streaming,
+		streams:         d.Streams,
 		encParams:       d.EncParams,
 		regionKeys:      d.RegionKeys,
 		tenantKeys:      d.TenantKeys,

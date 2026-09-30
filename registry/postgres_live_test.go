@@ -54,7 +54,7 @@ func TestPostgresStores_Live(t *testing.T) {
 		`TRUNCATE ingot.blob_refs, ingot.upload_intents, ingot.blob_locations,
 		 ingot.blob_encryption_params, ingot.multipart_sessions, ingot.multipart_parts,
 		 ingot.gc_candidates, ingot.buckets, ingot.revocation_cursor,
-		 ingot.blob_release_intents CASCADE`); err != nil {
+		 ingot.blob_release_intents, ingot.blob_streams CASCADE`); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
 
@@ -528,6 +528,39 @@ func TestPostgresStores_Live(t *testing.T) {
 		}
 		if _, err := r.GetPark(ctx, digest); err != registry.ErrNotFound {
 			t.Fatalf("GetPark after delete = %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("stream rows age out", func(t *testing.T) {
+		space := testutil.RandomDID(t)
+		addTask := liveCid(t, "stream-add").Bytes()
+		if err := r.PutStream(ctx, registry.BlobStream{AddTask: addTask, Space: space, Bucket: "sb", Size: 4096}); err != nil {
+			t.Fatalf("PutStream: %v", err)
+		}
+		rows, err := r.ListStaleStreams(ctx, time.Now().Add(-time.Minute), 10)
+		if err != nil {
+			t.Fatalf("ListStaleStreams: %v", err)
+		}
+		if len(rows) != 0 {
+			t.Fatalf("a fresh row is stale: %+v", rows)
+		}
+		rows, err = r.ListStaleStreams(ctx, time.Now().Add(time.Minute), 10)
+		if err != nil {
+			t.Fatalf("ListStaleStreams: %v", err)
+		}
+		if len(rows) != 1 || !reflect.DeepEqual(rows[0].AddTask, addTask) || rows[0].Space != space ||
+			rows[0].Bucket != "sb" || rows[0].Size != 4096 || rows[0].CreatedAt.IsZero() {
+			t.Fatalf("stale rows = %+v", rows)
+		}
+		if err := r.DeleteStream(ctx, addTask); err != nil {
+			t.Fatalf("DeleteStream: %v", err)
+		}
+		if err := r.DeleteStream(ctx, addTask); err != nil {
+			t.Fatalf("DeleteStream (idempotent): %v", err)
+		}
+		rows, err = r.ListStaleStreams(ctx, time.Now().Add(time.Minute), 10)
+		if err != nil || len(rows) != 0 {
+			t.Fatalf("after delete: %+v, %v", rows, err)
 		}
 	})
 

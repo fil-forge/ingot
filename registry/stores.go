@@ -372,6 +372,30 @@ type ParkStore interface {
 	DeletePark(ctx context.Context, digest multihash.Multihash) error
 }
 
+// BlobStream is one row of ingot.blob_streams: a body blob allocated by
+// digest code whose bytes are, or were, being sent to its provider before its
+// digest was known. AddTask (cid bytes) is the only name the provider knows the
+// upload by until it is parked or accepted.
+type BlobStream struct {
+	AddTask   []byte
+	Space     did.DID
+	Bucket    string
+	Size      int64
+	CreatedAt time.Time
+}
+
+// StreamStore tracks uploads allocated by digest code from allocation until
+// their park or acceptance is recorded, so one a request abandons can still be
+// aborted on its provider.
+type StreamStore interface {
+	PutStream(ctx context.Context, s BlobStream) error
+	// DeleteStream is idempotent.
+	DeleteStream(ctx context.Context, addTask []byte) error
+	// ListStaleStreams returns up to limit rows created before olderThan,
+	// oldest first.
+	ListStaleStreams(ctx context.Context, olderThan time.Time, limit int) ([]BlobStream, error)
+}
+
 // InclusionStore is the local shard-inclusion table (§8): block digest →
 // (shard digest, byte range) for every block of a shipped catalog segment,
 // written by the flush path before the segment is marked shipped. Resolved on

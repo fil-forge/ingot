@@ -30,7 +30,8 @@ const envelopeAllowance int64 = 32 << 10
 // ≤ max blobs.
 const DefaultMaxBlobSize int64 = blobcmds.MaxBlobSize - envelopeAllowance
 
-// SplitOption adjusts what SplitBody computes alongside the split.
+// SplitOption adjusts what SplitBody and SplitSizedBody compute alongside the
+// split.
 type SplitOption func(*splitConfig)
 
 type splitConfig struct {

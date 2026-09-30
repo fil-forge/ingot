@@ -74,7 +74,7 @@ func TestForgeDeferredMultipart(t *testing.T) {
 		// The parts are durable on piri (allocated + PUT) but parked: no
 		// /blob/accept for their digests until Complete.
 		for _, d := range partDigests {
-			waitForPiriLogLine(t, ctx, s, 30*time.Second, "/blob/allocate", d)
+			waitForPiriReceived(t, ctx, s, 30*time.Second, d)
 			if piriLogHasLine(t, ctx, s, "/blob/accept", d) {
 				t.Fatalf("part blob %s was accepted before Complete — parking is broken", d)
 			}
@@ -122,7 +122,7 @@ func TestForgeDeferredMultipart(t *testing.T) {
 			t.Fatalf("UploadPart: %v", err)
 		}
 		digest := partBlobDigests(t, ctx, s, aws.ToString(create.UploadId), 1)[0]
-		waitForPiriLogLine(t, ctx, s, 30*time.Second, "/blob/allocate", digest)
+		waitForPiriReceived(t, ctx, s, 30*time.Second, digest)
 
 		if _, err := cl.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
 			Bucket: aws.String(bucket), Key: aws.String(key), UploadId: create.UploadId,
@@ -183,6 +183,27 @@ func piriLogHasLine(t *testing.T, ctx context.Context, s *stack.Stack, substrs .
 		}
 	}
 	return false
+}
+
+// waitForPiriReceived polls until piri-0 has logged receiving the blob digest.
+// A blob allocated by digest code is logged by digest only once its upload is
+// in, since the allocation came before the digest; one allocated by digest is
+// logged at the allocation.
+func waitForPiriReceived(t *testing.T, ctx context.Context, s *stack.Stack, timeout time.Duration, digest string) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if piriLogHasLine(t, ctx, s, "received upload without a digest", digest) ||
+			piriLogHasLine(t, ctx, s, "/blob/allocate", digest) {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("context done waiting for piri to receive %s: %v", digest, ctx.Err())
+		case <-time.After(2 * time.Second):
+		}
+	}
+	t.Fatalf("piri-0 logs never showed blob %s received within %s", digest, timeout)
 }
 
 // waitForPiriLogLine polls until one piri-0 log line contains all substrings.

@@ -62,6 +62,13 @@ type ServerDeps struct {
 	// abort at Abort.
 	Deferred uploader.DeferredBodyUploader
 	Remover  uploader.BlobRemover
+	// Streaming, when set, uploads each body blob while it is
+	// spooled, allocating it before its digest is known; Streams records
+	// each such upload until its park or acceptance is, and is required with
+	// it. Without Streaming every blob is spooled first and uploaded by
+	// digest.
+	Streaming uploader.StreamingBodyUploader
+	Streams   registry.StreamStore
 
 	// Authority is the service that authorizes bucket creation and deletion.
 	Authority bucketauthority.BucketAuthority
@@ -195,6 +202,8 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		Uploader:        deps.BodyUploader,
 		Deferred:        deps.Deferred,
 		Remover:         deps.Remover,
+		Streaming:       deps.Streaming,
+		Streams:         deps.Streams,
 		EncParams:       deps.EncParams,
 		RegionKeys:      deps.RegionKeys,
 		TenantKeys:      deps.TenantKeys,
@@ -312,6 +321,14 @@ func (s *Server) startReleaseSweeper() {
 					s.logger.Warn("release sweep", zap.Error(err))
 				} else if n > 0 {
 					s.logger.Info("release sweep executed deferred releases", zap.Int("count", n))
+				}
+				ctx, cancel = context.WithTimeout(context.Background(), time.Minute)
+				n, err = s.backend.SweepStaleStreams(ctx)
+				cancel()
+				if err != nil {
+					s.logger.Warn("stream sweep", zap.Error(err))
+				} else if n > 0 {
+					s.logger.Info("stream sweep aborted abandoned uploads", zap.Int("count", n))
 				}
 			}
 		}
@@ -537,6 +554,9 @@ func validateServerInputs(cfg config.ServerConfig, deps ServerDeps) error {
 	}
 	if deps.Parks == nil {
 		return errors.New("ingot: ServerDeps.Parks is required")
+	}
+	if deps.Streaming != nil && deps.Streams == nil {
+		return errors.New("ingot: ServerDeps.Streams is required with Streaming")
 	}
 	if deps.EncParams == nil {
 		return errors.New("ingot: ServerDeps.EncParams is required")

@@ -62,6 +62,7 @@ type MemStore struct {
 	encParams  map[locKey]registry.BlobEncryptionParams  // keyed by (space, digest)
 	inclusions map[locKey]registry.BlobInclusion         // keyed by (space, digest)
 	parks      map[string]registry.BlobPark              // keyed by string(digest)
+	streams    map[string]registry.BlobStream            // keyed by string(add task)
 	sessions   map[string]registry.MultipartSession      // keyed by uploadID
 	parts      map[string]map[int]registry.MultipartPart // uploadID -> partNumber -> part
 	gcCands    map[string]struct{}                       // keyed by string(cid)
@@ -93,6 +94,7 @@ func NewMemStore() *MemStore {
 		encParams:  map[locKey]registry.BlobEncryptionParams{},
 		inclusions: map[locKey]registry.BlobInclusion{},
 		parks:      map[string]registry.BlobPark{},
+		streams:    map[string]registry.BlobStream{},
 		sessions:   map[string]registry.MultipartSession{},
 		parts:      map[string]map[int]registry.MultipartPart{},
 		gcCands:    map[string]struct{}{},

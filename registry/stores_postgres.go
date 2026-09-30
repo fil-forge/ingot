@@ -568,6 +568,56 @@ func (r *Postgres) DeletePark(ctx context.Context, digest multihash.Multihash) e
 	return nil
 }
 
+// StreamStore ================================================================
+
+func (r *Postgres) PutStream(ctx context.Context, s BlobStream) error {
+	_, err := r.pool.Exec(ctx,
+		`INSERT INTO ingot.blob_streams (add_task, space, bucket, size)
+		 VALUES ($1, $2, $3, $4)`,
+		s.AddTask, s.Space.String(), s.Bucket, s.Size)
+	if err != nil {
+		return fmt.Errorf("registry: put stream: %w", err)
+	}
+	return nil
+}
+
+func (r *Postgres) DeleteStream(ctx context.Context, addTask []byte) error {
+	_, err := r.pool.Exec(ctx,
+		`DELETE FROM ingot.blob_streams WHERE add_task = $1`, addTask)
+	if err != nil {
+		return fmt.Errorf("registry: delete stream: %w", err)
+	}
+	return nil
+}
+
+func (r *Postgres) ListStaleStreams(ctx context.Context, olderThan time.Time, limit int) ([]BlobStream, error) {
+	rows, err := r.pool.Query(ctx,
+		`SELECT add_task, space, bucket, size, created_at
+		 FROM ingot.blob_streams WHERE created_at < $1
+		 ORDER BY created_at LIMIT $2`,
+		olderThan, limit)
+	if err != nil {
+		return nil, fmt.Errorf("registry: list stale streams: %w", err)
+	}
+	defer rows.Close()
+	var out []BlobStream
+	for rows.Next() {
+		var s BlobStream
+		var space string
+		if err := rows.Scan(&s.AddTask, &space, &s.Bucket, &s.Size, &s.CreatedAt); err != nil {
+			return nil, fmt.Errorf("registry: scan stream: %w", err)
+		}
+		if s.Space, err = did.Parse(space); err != nil {
+			return nil, fmt.Errorf("registry: stream space %q: %w", space, err)
+		}
+		out = append(out, s)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("registry: list stale streams: %w", err)
+	}
+	return out, nil
+}
+
 // InclusionStore =============================================================
 
 func (r *Postgres) PutInclusions(ctx context.Context, incs []BlobInclusion) error {

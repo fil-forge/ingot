@@ -630,3 +630,42 @@ func clonePart(p registry.MultipartPart) registry.MultipartPart {
 	}
 	return p
 }
+
+// StreamStore ================================================================
+
+func (m *MemStore) PutStream(_ context.Context, s registry.BlobStream) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cp := s
+	cp.AddTask = bytes.Clone(s.AddTask)
+	if cp.CreatedAt.IsZero() {
+		cp.CreatedAt = time.Now()
+	}
+	m.streams[string(s.AddTask)] = cp
+	return nil
+}
+
+func (m *MemStore) DeleteStream(_ context.Context, addTask []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.streams, string(addTask))
+	return nil
+}
+
+func (m *MemStore) ListStaleStreams(_ context.Context, olderThan time.Time, limit int) ([]registry.BlobStream, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []registry.BlobStream
+	for _, s := range m.streams {
+		if s.CreatedAt.Before(olderThan) {
+			cp := s
+			cp.AddTask = bytes.Clone(s.AddTask)
+			out = append(out, cp)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
