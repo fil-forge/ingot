@@ -7,10 +7,15 @@ import (
 )
 
 // asyncHashQueue bounds how far the producer may run ahead of the hashing
-// goroutine, in chunks. A chunk is whatever one Write delivers (the
-// encryptor pulls the body through io.Copy, so 32 KiB), and a stream holds
-// at most asyncHashQueue+1 chunk buffers.
-const asyncHashQueue = 8
+// goroutine, in chunks of at most asyncHashChunk bytes; a stream holds at
+// most asyncHashQueue+1 chunk buffers. A Write larger than a chunk is
+// queued as several, so the queue's memory stays at asyncHashQueue+1 chunks
+// however large the producer's reads are (the encryptor fills a whole
+// 256 KiB STREAM chunk per read).
+const (
+	asyncHashQueue = 8
+	asyncHashChunk = 32 << 10
+)
 
 // asyncHash feeds a hash.Hash from its own goroutine so the producer does not
 // pay for the hash inline. It exists for MD5, which has no hardware
@@ -58,18 +63,23 @@ func newAsyncHash(h hash.Hash) *asyncHash {
 
 // Write implements io.Writer. It never fails: a hash.Hash's Write cannot.
 func (a *asyncHash) Write(p []byte) (int, error) {
-	var buf []byte
-	select {
-	case buf = <-a.free:
-	default:
-		if a.spare == 0 {
-			buf = <-a.free
-		} else {
-			a.spare--
+	total := len(p)
+	for len(p) > 0 {
+		n := min(len(p), asyncHashChunk)
+		var buf []byte
+		select {
+		case buf = <-a.free:
+		default:
+			if a.spare == 0 {
+				buf = <-a.free
+			} else {
+				a.spare--
+			}
 		}
+		a.full <- append(buf, p[:n]...)
+		p = p[n:]
 	}
-	a.full <- append(buf, p...)
-	return len(p), nil
+	return total, nil
 }
 
 // Sum finishes the stream and returns the digest of everything written.
