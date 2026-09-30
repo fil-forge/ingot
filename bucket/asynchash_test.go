@@ -3,6 +3,7 @@ package bucket
 import (
 	"bytes"
 	"crypto/md5"
+	"hash"
 	"io"
 	"testing"
 )
@@ -57,25 +58,49 @@ func TestAsyncHash_CallerReusesBuffer(t *testing.T) {
 	}
 }
 
+// gatedHash holds every Write until open is closed, so the asyncHash
+// goroutine can return nothing to the free list before the test allows it.
+type gatedHash struct {
+	hash.Hash
+	open chan struct{}
+}
+
+func (g *gatedHash) Write(p []byte) (int, error) {
+	<-g.open
+	return g.Hash.Write(p)
+}
+
 // TestAsyncHash_FixedBufferSet pins the allocation bound: a stream allocates
 // exactly asyncHashQueue+1 buffers, whatever size came first (the encrypting
 // writer's one-byte EOF probe reaches the hashers before any full read) and
 // however large the later writes are (a 256 KiB read from the encrypt reader
 // is queued as eight chunks). A buffer sized by a small first write would
 // have to be replaced later and would show up here as one extra allocation.
+//
+// The hash is gated while the first asyncHashQueue+1 writes are queued, so
+// the producer cannot find a returned buffer on the free list and must
+// allocate its whole set; the gate then opens and every later write reuses
+// one. That makes the count exact rather than a bound that scheduling could
+// undershoot.
 func TestAsyncHash_FixedBufferSet(t *testing.T) {
-	streamAllocs := func(write func(a *asyncHash)) float64 {
+	one := make([]byte, 1)
+	chunk := make([]byte, asyncHashChunk)
+	big := make([]byte, 8*asyncHashChunk)
+	streamAllocs := func(write func(a *asyncHash, open chan struct{})) float64 {
 		return testing.AllocsPerRun(5, func() {
-			a := newAsyncHash(md5.New())
-			write(a)
+			open := make(chan struct{})
+			a := newAsyncHash(&gatedHash{Hash: md5.New(), open: open})
+			write(a, open)
 			a.Sum()
 		})
 	}
-	base := streamAllocs(func(*asyncHash) {})
-	chunk := make([]byte, asyncHashChunk)
-	big := make([]byte, 8*asyncHashChunk)
-	got := streamAllocs(func(a *asyncHash) {
-		a.Write([]byte{1})
+	base := streamAllocs(func(_ *asyncHash, open chan struct{}) { close(open) })
+	got := streamAllocs(func(a *asyncHash, open chan struct{}) {
+		a.Write(one)
+		for i := 1; i < asyncHashQueue+1; i++ {
+			a.Write(chunk)
+		}
+		close(open)
 		for i := 0; i < 2*(asyncHashQueue+1); i++ {
 			a.Write(chunk)
 		}
