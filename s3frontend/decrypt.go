@@ -162,8 +162,23 @@ func (o *decryptingOpener) OpenBlobRange(ctx context.Context, space did.DID, ref
 	}
 	// A chunk that fails authentication mid-stream (tampered or stale
 	// ciphertext) surfaces from Read as aesstream.ErrCorrupted, terminating
-	// the response body — the encryption RFC's stated behavior.
-	return readerCloser{Reader: sr, Closer: span}, nil
+	// the response body — the encryption RFC's stated behavior. Closing the
+	// body releases the ciphertext fetch and returns the decryptor's chunk
+	// buffers for the next request to reuse.
+	return readerCloser{Reader: sr, Closer: closers{sr, span}}, nil
+}
+
+// closers closes each closer in order and reports the first error.
+type closers []io.Closer
+
+func (c closers) Close() error {
+	var first error
+	for _, cl := range c {
+		if err := cl.Close(); err != nil && first == nil {
+			first = err
+		}
+	}
+	return first
 }
 
 // blobPlaintextLen reports how many plaintext bytes a stored blob decrypts
