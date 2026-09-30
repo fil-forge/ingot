@@ -29,6 +29,22 @@ const envelopeAllowance int64 = 32 << 10
 // ≤ max blobs.
 const DefaultMaxBlobSize int64 = blobcmds.MaxBlobSize - envelopeAllowance
 
+// SplitOption adjusts what SplitBody computes alongside the split.
+type SplitOption func(*splitConfig)
+
+type splitConfig struct {
+	md5 bool
+}
+
+// WithoutMD5 skips the whole-body MD5, leaving Body.MD5 nil. The caller
+// holds the body's MD5 from another source and sets the manifest ETag from
+// it: a Content-MD5 header the checksum middleware has verified against the
+// stream, an MD5 the request's own checksum reader computes, or the ETag of
+// a single-part copy source whose bytes these are. MD5 is the slowest pass
+// over a body (no hardware acceleration, about 800 MB/s per stream), so a
+// caller that already has the value should not pay for it again.
+func WithoutMD5() SplitOption { return func(c *splitConfig) { c.md5 = false } }
+
 // SplitBody reads body bytes from r, splits them into blobs of at most
 // maxBlobSize bytes, and streams each blob to w — which hashes it and writes it
 // to local storage as it goes, so no blob is ever held whole in memory (a ~254 MiB
@@ -37,25 +53,36 @@ const DefaultMaxBlobSize int64 = blobcmds.MaxBlobSize - envelopeAllowance
 // the whole-body sha256 and md5 are computed in the same streaming pass, the
 // md5 on its own goroutine so the stream is not serialized behind the slowest
 // hash (see asyncHash) and on the shared md5-simd server so concurrent bodies
-// share vector lanes where the CPU has them (see newETagHash). A zero-byte
+// share vector lanes where the CPU has them (see newETagHash). WithoutMD5
+// drops the md5 pass for a caller that already holds the value. A zero-byte
 // body yields a Body with no blobs (and the well-known empty digests).
 //
 // w is the local spool in production (blockstore.Spool): the blobs land on disk
 // before being uploaded to Forge by digest. SplitBody itself is storage-agnostic.
-func SplitBody(ctx context.Context, w blockstore.BlobWriter, r io.Reader, maxBlobSize int64) (Body, error) {
+func SplitBody(ctx context.Context, w blockstore.BlobWriter, r io.Reader, maxBlobSize int64, opts ...SplitOption) (Body, error) {
 	max := maxBlobSize
 	if max <= 0 {
 		max = DefaultMaxBlobSize
 	}
+	cfg := splitConfig{md5: true}
+	for _, o := range opts {
+		o(&cfg)
+	}
 
 	bodyHasher := sha256.New()
-	etagHasher := newAsyncHash(newETagHash())
-	// Every return path must finish the async hasher so its goroutine exits;
-	// Sum is idempotent, so the success path's explicit call below is fine.
-	defer etagHasher.Sum()
-	// Tee everything read into both hashers so the whole-body digests are
+	hashers := []io.Writer{bodyHasher}
+	var etagHasher *asyncHash
+	if cfg.md5 {
+		etagHasher = newAsyncHash(newETagHash())
+		// Every return path must finish the async hasher so its goroutine
+		// exits; Sum is idempotent, so the success path's explicit call
+		// below is fine.
+		defer etagHasher.Sum()
+		hashers = append(hashers, etagHasher)
+	}
+	// Tee everything read into the hashers so the whole-body digests are
 	// computed in the same pass that splits the body into blobs.
-	src := io.TeeReader(r, io.MultiWriter(bodyHasher, etagHasher))
+	src := io.TeeReader(r, io.MultiWriter(hashers...))
 
 	var blobs []BlobRef
 	var total int64
@@ -78,13 +105,33 @@ func SplitBody(ctx context.Context, w blockstore.BlobWriter, r io.Reader, maxBlo
 		}
 	}
 
-	return Body{
+	body := Body{
 		Size:   total,
 		SHA256: bodyHasher.Sum(nil),
-		MD5:    etagHasher.Sum(),
 		Blobs:  blobs,
-	}, nil
+	}
+	if etagHasher != nil {
+		body.MD5 = etagHasher.Sum()
+	}
+	return body, nil
 }
+
+// MD5Writer computes a body's MD5 off the caller's goroutine, on the shared
+// ETag hasher, for a caller that streams a body outside SplitBody (the copy
+// read pass). Write queues the bytes; Sum waits for the digest and is
+// idempotent, so a caller defers it to stop the goroutine on error paths.
+type MD5Writer struct {
+	a *asyncHash
+}
+
+// NewMD5Writer returns an MD5Writer ready to receive the body.
+func NewMD5Writer() *MD5Writer { return &MD5Writer{a: newAsyncHash(newETagHash())} }
+
+// Write queues p for hashing; the caller may reuse p at once.
+func (m *MD5Writer) Write(p []byte) (int, error) { return m.a.Write(p) }
+
+// Sum finishes the hash and returns the 16-byte digest.
+func (m *MD5Writer) Sum() []byte { return m.a.Sum() }
 
 // BlobRangeOpener opens a body blob's plaintext. OpenBlobRange returns a
 // reader over the inclusive plaintext bytes [start, end] of the blob ref

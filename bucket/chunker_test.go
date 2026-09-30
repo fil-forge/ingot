@@ -204,3 +204,69 @@ func BenchmarkSplitBodyParallel(b *testing.B) {
 		}
 	})
 }
+
+// WithoutMD5 leaves Body.MD5 nil and changes nothing else about the split.
+func TestSplitBody_WithoutMD5(t *testing.T) {
+	ctx := context.Background()
+	sp := testSpool(t)
+	data := makeData(3*4096 + 100)
+	with, err := SplitBody(ctx, sp, bytes.NewReader(data), 4096)
+	if err != nil {
+		t.Fatalf("SplitBody: %v", err)
+	}
+	without, err := SplitBody(ctx, testSpool(t), bytes.NewReader(data), 4096, WithoutMD5())
+	if err != nil {
+		t.Fatalf("SplitBody without md5: %v", err)
+	}
+	if without.MD5 != nil {
+		t.Errorf("Body.MD5 = %x, want nil", without.MD5)
+	}
+	wantMD5 := md5.Sum(data)
+	if !bytes.Equal(with.MD5, wantMD5[:]) {
+		t.Errorf("default Body.MD5 mismatch")
+	}
+	if !bytes.Equal(with.SHA256, without.SHA256) || with.Size != without.Size || len(with.Blobs) != len(without.Blobs) {
+		t.Fatalf("split differs without md5: %+v vs %+v", with, without)
+	}
+	for i := range with.Blobs {
+		if !bytes.Equal(with.Blobs[i].Digest, without.Blobs[i].Digest) || with.Blobs[i].Start != without.Blobs[i].Start || with.Blobs[i].End != without.Blobs[i].End {
+			t.Fatalf("blob %d differs without md5", i)
+		}
+	}
+}
+
+// MD5Writer yields the same digest as crypto/md5 over the same bytes, in any
+// write pattern, and Sum is idempotent.
+func TestMD5Writer(t *testing.T) {
+	data := makeData(200<<10 + 7)
+	want := md5.Sum(data)
+	w := NewMD5Writer()
+	defer w.Sum()
+	for i := 0; i < len(data); i += 33 * 1024 {
+		end := min(i+33*1024, len(data))
+		if _, err := w.Write(data[i:end]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := w.Sum(); !bytes.Equal(got, want[:]) {
+		t.Fatalf("MD5Writer = %x, want %x", got, want)
+	}
+	if got := w.Sum(); !bytes.Equal(got, want[:]) {
+		t.Fatalf("second Sum = %x, want %x", got, want)
+	}
+}
+
+// BenchmarkSplitBodyNoMD5 is BenchmarkSplitBody with the md5 pass off: the
+// stream a caller gets when the client already proved the MD5.
+func BenchmarkSplitBodyNoMD5(b *testing.B) {
+	const size = 64 << 20
+	data := makeData(size)
+	b.SetBytes(size)
+	b.ReportAllocs()
+
+	for b.Loop() {
+		if _, err := SplitBody(context.Background(), hashingDiscardWriter{}, bytes.NewReader(data), 0, WithoutMD5()); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

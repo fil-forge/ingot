@@ -3,6 +3,7 @@ package s3frontend
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -57,6 +58,54 @@ func requestsServerSideEncryption(headers map[string]string) bool {
 		}
 	}
 	return false
+}
+
+// clientProvidedBodyMD5 returns the object body's MD5 when the request already
+// carries it, so ingest can skip its own MD5 pass over the body: a Content-MD5
+// header (the checksum middleware verifies it against the stream before the
+// backend commits) or an x-amz-checksum-md5 value (the request's checksum
+// reader validates it on the same read). The result is the raw 16-byte digest,
+// or nil when the request supplies no usable MD5, in which case ingest computes
+// it as before. A malformed value returns nil; the middleware or the checksum
+// reader still rejects it during the body read, so ingest never commits a wrong
+// ETag.
+func clientProvidedBodyMD5(ctx context.Context, spec *checksumSpec) []byte {
+	if md5 := decodeContentMD5(contentMD5Header(ctx)); md5 != nil {
+		return md5
+	}
+	if spec != nil && spec.algo == types.ChecksumAlgorithmMd5 {
+		return decodeContentMD5(spec.expected)
+	}
+	return nil
+}
+
+// contentMD5Header returns the request's Content-MD5 value, matched
+// case-insensitively (fasthttp canonicalizes the key to "Content-Md5"), or ""
+// when the request set none or no request is in the context.
+func contentMD5Header(ctx context.Context) string {
+	req, ok := reqscope.Request(ctx)
+	if !ok {
+		return ""
+	}
+	for k, v := range req.Headers {
+		if strings.EqualFold(k, "Content-Md5") {
+			return v
+		}
+	}
+	return ""
+}
+
+// decodeContentMD5 decodes a base64 Content-MD5 / x-amz-checksum-md5 value to
+// its raw 16 bytes, or nil when it is empty or not a 16-byte digest.
+func decodeContentMD5(s string) []byte {
+	if s == "" {
+		return nil
+	}
+	b, err := base64.StdEncoding.DecodeString(s)
+	if err != nil || len(b) != 16 { // 16 = md5.Size
+		return nil
+	}
+	return b
 }
 
 // unsupportedObjectACL reports whether a PutObject / CreateMultipartUpload
@@ -163,7 +212,8 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 	// to local disk → upload each to Forge by digest (allocate→PUT→accept). A
 	// 200 means every body blob is durable and accepted before the manifest
 	// that references it is committed (docs/architecture.md §7.1).
-	bodyRec, err := b.ingestBody(ctx, bucketState, bodyReader)
+	knownMD5 := clientProvidedBodyMD5(ctx, spec)
+	bodyRec, err := b.ingestBody(ctx, bucketState, bodyReader, knownMD5)
 	if err != nil {
 		// A checksum/digest mismatch surfaces from the HashReader. BadDigestError,
 		// InvalidDigestError, and ContentSHA256MismatchError embed APIError but are
@@ -245,13 +295,15 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 // spools each to local disk (SplitBody → Spool), records an upload_intents row
 // per blob, uploads each to Forge by digest, and advances the intent to
 // accepted. It returns the Body the manifest will pin. A zero-byte body yields
-// a Body with no blobs and uploads nothing.
+// a Body with no blobs and uploads nothing. A non-nil knownMD5 is the body's
+// MD5 the caller already holds: ingest skips its own MD5 pass and stamps this
+// value onto Body.MD5 instead.
 //
 // On any error the already-spooled/parked blobs and their intents are left for
 // crash recovery to reconcile (a later phase); no manifest is written, so no
 // catalog entry ever references a non-durable blob.
-func (b *Backend) ingestBody(ctx context.Context, bucket *registry.State, r io.Reader) (msbucket.Body, error) {
-	body, err := b.splitSpool(ctx, bucket.Name, bucket.Space, r)
+func (b *Backend) ingestBody(ctx context.Context, bucket *registry.State, r io.Reader, knownMD5 []byte) (msbucket.Body, error) {
+	body, err := b.splitSpool(ctx, bucket.Name, bucket.Space, r, knownMD5)
 	if err != nil {
 		return msbucket.Body{}, err
 	}
@@ -271,8 +323,11 @@ func (b *Backend) ingestBody(ctx context.Context, bucket *registry.State, r io.R
 //
 // The Body it returns is entirely plaintext-coordinate (Size, spans,
 // SHA256/MD5 — all computed before encryption); the intents record the
-// SPOOLED (ciphertext) byte count, which is what the uploader ships.
-func (b *Backend) splitSpool(ctx context.Context, bucket string, space did.DID, r io.Reader) (_ msbucket.Body, err error) {
+// SPOOLED (ciphertext) byte count, which is what the uploader ships. A non-nil
+// knownMD5 is the body's MD5 the caller already holds (a verified Content-MD5,
+// a client MD5 checksum, or a single-part copy source's digest): the MD5 pass
+// is skipped and Body.MD5 is set to it.
+func (b *Backend) splitSpool(ctx context.Context, bucket string, space did.DID, r io.Reader, knownMD5 []byte) (_ msbucket.Body, err error) {
 	// The span covers receiving the body (it streams in from the client as
 	// SplitBody reads it), encrypting it and writing it to the spool; the
 	// body.received event marks where the client finished sending.
@@ -289,9 +344,18 @@ func (b *Backend) splitSpool(ctx context.Context, bucket string, space did.DID, 
 		return msbucket.Body{}, err
 	}
 	enc := newEncryptingBlobWriter(b.spool, b.regionKeys, space, []fee.Recipient{recipient})
-	body, err := msbucket.SplitBody(ctx, enc, r, b.maxBlobSize)
+	var splitOpts []msbucket.SplitOption
+	if knownMD5 != nil {
+		splitOpts = append(splitOpts, msbucket.WithoutMD5())
+	}
+	body, err := msbucket.SplitBody(ctx, enc, r, b.maxBlobSize, splitOpts...)
 	if err != nil {
 		return msbucket.Body{}, fmt.Errorf("split body: %w", err)
+	}
+	if knownMD5 != nil {
+		// The body read completed without error, so the checksum middleware /
+		// reader confirmed the stream matches knownMD5; it is the body's MD5.
+		body.MD5 = knownMD5
 	}
 	span.SetAttributes(
 		attribute.Int64("ingot.body.bytes", body.Size),

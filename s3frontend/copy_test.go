@@ -438,7 +438,7 @@ func TestCopyObject_SourceWithoutChecksumGetsDefault(t *testing.T) {
 		t.Fatal(err)
 	}
 	data := []byte("legacy object")
-	body, err := b.ingestBody(ctx, st, bytes.NewReader(data))
+	body, err := b.ingestBody(ctx, st, bytes.NewReader(data), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

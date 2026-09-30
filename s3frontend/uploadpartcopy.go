@@ -100,10 +100,18 @@ func (b *Backend) UploadPartCopy(ctx context.Context, input *s3.UploadPartCopyIn
 		return s3response.CopyPartResult{}, err
 	}
 	defer rc.Close()
+	// A whole-object copy of a single-part source copies its exact bytes, so
+	// the source's stored digest is the part's MD5 and the MD5 pass is skipped;
+	// a ranged copy or a multipart source (no stored whole-object md5) computes
+	// it over the copied bytes.
+	var knownMD5 []byte
+	if input.CopySourceRange == nil && !isMultipartETag(srcMf.ETag) && len(srcMf.Body.MD5) == 16 { // 16 = md5.Size
+		knownMD5 = srcMf.Body.MD5
+	}
 	// The session's algorithm is the part's: passing it as the requested one
 	// satisfies the negotiation (a COMPOSITE session needs a checksum on every
 	// part) with no value to validate, so it is computed over the copied bytes.
-	rec, err := b.ingestPart(ctx, sess, int(*input.PartNumber), rc, types.ChecksumAlgorithm(sess.ChecksumAlgorithm), "")
+	rec, err := b.ingestPart(ctx, sess, int(*input.PartNumber), rc, types.ChecksumAlgorithm(sess.ChecksumAlgorithm), "", knownMD5)
 	if err != nil {
 		return s3response.CopyPartResult{}, err
 	}
