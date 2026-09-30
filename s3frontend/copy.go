@@ -195,9 +195,9 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 			// bytes), so the re-ingest reuses it and skips the MD5 pass; a
 			// multipart source has none (its ETag is md5-of-md5s), so ingest
 			// computes a fresh MD5 for the copy's own single-part ETag.
-			var copyMD5 []byte
+			var copyMD5 bodyMD5Source
 			if !multipartSrc && len(srcMf.Body.MD5) == md5.Size {
-				copyMD5 = srcMf.Body.MD5
+				copyMD5 = knownMD5(srcMf.Body.MD5)
 			}
 			if body, err = b.ingestBody(ctx, bucketState, hr, copyMD5); err != nil {
 				var apiErr s3err.APIError

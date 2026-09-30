@@ -154,6 +154,40 @@ func TestSplitBody_Empty(t *testing.T) {
 	if !bytes.Equal(body.SHA256, emptySHA[:]) {
 		t.Errorf("empty SHA256 mismatch")
 	}
+	emptyMD5 := md5.Sum(nil)
+	if !bytes.Equal(body.MD5, emptyMD5[:]) {
+		t.Errorf("empty MD5 = %x, want %x", body.MD5, emptyMD5)
+	}
+}
+
+// The MD5 pass starts with the first byte: a body that never delivers one
+// never starts a hasher and still reports the constant empty digest, while
+// any bytes at all produce the crypto/md5 digest.
+func TestLazyETagHash(t *testing.T) {
+	var l lazyETagHash
+	l.Write(nil)
+	if l.a != nil {
+		t.Fatal("an empty write started the MD5 hasher")
+	}
+	emptyMD5 := md5.Sum(nil)
+	if got := l.Sum(); !bytes.Equal(got, emptyMD5[:]) {
+		t.Fatalf("empty Sum = %x, want %x", got, emptyMD5)
+	}
+	if l.a != nil {
+		t.Fatal("Sum started the MD5 hasher")
+	}
+
+	data := makeData(100<<10 + 3)
+	var started lazyETagHash
+	started.Write(data[:1])
+	if started.a == nil {
+		t.Fatal("the first byte did not start the MD5 hasher")
+	}
+	started.Write(data[1:])
+	want := md5.Sum(data)
+	if got := started.Sum(); !bytes.Equal(got, want[:]) {
+		t.Fatalf("Sum = %x, want %x", got, want)
+	}
 }
 
 // hashingDiscardWriter stands in for the spool in benchmarks: it pays the

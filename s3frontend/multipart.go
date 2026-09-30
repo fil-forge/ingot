@@ -222,7 +222,11 @@ func (b *Backend) UploadPart(ctx context.Context, input *s3.UploadPartInput) (*s
 	if src == nil {
 		src = bytes.NewReader(nil)
 	}
-	rec, err := b.ingestPart(ctx, sess, int(*input.PartNumber), src, partAlgo, expected, decodeContentMD5(contentMD5Header(ctx)))
+	var md5Src bodyMD5Source
+	if digest := decodeContentMD5(contentMD5Header(ctx)); digest != nil {
+		md5Src = knownMD5(digest)
+	}
+	rec, err := b.ingestPart(ctx, sess, int(*input.PartNumber), src, partAlgo, expected, md5Src)
 	if err != nil {
 		return nil, err
 	}
@@ -247,9 +251,12 @@ type ingestedPart struct {
 // part of the same number), parks its blobs, and drops the superseded part's
 // blobs. partAlgo/expected are the checksum the request names, if any: an
 // explicit value is validated on the stream; an algorithm alone is computed.
-// A non-nil knownMD5 is the part's MD5 the caller already holds (a verified
-// Content-MD5, or a single-part copy source's digest): the MD5 pass over the
-// part is skipped and the part ETag / stored ETagMD5 come from it.
+// A non-nil md5Src is the part's MD5 the caller already holds (a verified
+// Content-MD5, or a single-part copy source's digest); without one, a
+// checksum reader that computes MD5 anyway (an MD5 session, or an MD5 part
+// checksum on a session that declared none) stands in. Either way the MD5
+// pass over the part is skipped and the part ETag / stored ETagMD5 come from
+// that source.
 //
 // The checksum negotiation: a part checksum for an algorithm other than the
 // session's declared one is rejected, and a COMPOSITE session requires one on
@@ -259,7 +266,7 @@ type ingestedPart struct {
 // client-requested algorithm the session didn't declare (echoed, never
 // persisted). A client-supplied value mismatch surfaces from the ingest read
 // as a BadDigest API error.
-func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSession, partNumber int, body io.Reader, partAlgo types.ChecksumAlgorithm, expected string, knownMD5 []byte) (*ingestedPart, error) {
+func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSession, partNumber int, body io.Reader, partAlgo types.ChecksumAlgorithm, expected string, md5Src bodyMD5Source) (*ingestedPart, error) {
 	uploadID := sess.UploadID
 	sessAlgo := types.ChecksumAlgorithm(sess.ChecksumAlgorithm)
 	if sessAlgo != "" && partAlgo != "" && partAlgo != sessAlgo {
@@ -300,6 +307,14 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 	if clientRdr != nil {
 		bodyReader = clientRdr
 	}
+	if md5Src == nil {
+		switch {
+		case sessAlgo == types.ChecksumAlgorithmMd5:
+			md5Src = checksumReaderMD5(hr)
+		case clientRdr != nil && partAlgo == types.ChecksumAlgorithmMd5:
+			md5Src = checksumReaderMD5(clientRdr)
+		}
+	}
 
 	// Capture the superseded part's blobs (if any) before overwriting, so
 	// last-write-wins doesn't strand them. The session's other parts stay
@@ -336,7 +351,7 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 			return nil, fmt.Errorf("s3frontend: record superseded part releases: %w", err)
 		}
 	}
-	rec, err := b.splitSpool(ctx, sess.Bucket, space, bodyReader, knownMD5)
+	rec, err := b.splitSpool(ctx, sess.Bucket, space, bodyReader, md5Src)
 	if err != nil {
 		var apiErr s3err.APIError
 		if errors.As(err, &apiErr) {

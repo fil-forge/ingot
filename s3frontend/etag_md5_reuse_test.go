@@ -6,9 +6,11 @@ import (
 	"crypto/md5"
 	"encoding/base64"
 	"encoding/hex"
+	"fmt"
 	"testing"
 
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	cmds3 "github.com/fil-forge/libforge/commands/s3"
 	"github.com/fil-forge/versitygw/s3response"
 
@@ -99,4 +101,123 @@ func TestUploadPart_ReusesContentMD5ForETag(t *testing.T) {
 
 func strings_Trim(s string) string {
 	return string(bytes.Trim([]byte(s), `"`))
+}
+
+// A PutObject naming an MD5 checksum, either an explicit x-amz-checksum-md5
+// value or x-amz-checksum-algorithm: MD5 alone, takes its ETag from the
+// checksum reader's digest and echoes the checksum, so neither form pays a
+// second MD5 pass.
+func TestPutObject_MD5ChecksumSpecSuppliesETag(t *testing.T) {
+	b, _, _ := newRefTestBackend(t)
+	bucket := "bk"
+	data := bytes.Repeat([]byte("md5 checksum spec "), 4000)
+	sum := md5.Sum(data)
+	wantETag := `"` + hex.EncodeToString(sum[:]) + `"`
+	wantB64 := base64.StdEncoding.EncodeToString(sum[:])
+
+	for name, mod := range map[string]func(*s3response.PutObjectInput){
+		"explicit value": func(in *s3response.PutObjectInput) { in.ChecksumMD5 = &wantB64 },
+		"algorithm only": func(in *s3response.PutObjectInput) { in.ChecksumAlgorithm = types.ChecksumAlgorithmMd5 },
+	} {
+		t.Run(name, func(t *testing.T) {
+			key := "obj-" + name
+			in := s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(data)}
+			mod(&in)
+			out, err := b.PutObject(context.Background(), in)
+			if err != nil {
+				t.Fatalf("PutObject: %v", err)
+			}
+			if out.ETag != wantETag {
+				t.Fatalf("ETag = %q, want %s", out.ETag, wantETag)
+			}
+			if out.ChecksumMD5 == nil || *out.ChecksumMD5 != wantB64 {
+				t.Fatalf("ChecksumMD5 echo = %v, want %s", out.ChecksumMD5, wantB64)
+			}
+			if _, body, err := getObjV(t, b, key, ""); err != nil || !bytes.Equal(body, data) {
+				t.Fatalf("round-trip: %d bytes, err=%v", len(body), err)
+			}
+		})
+	}
+}
+
+// An UploadPart whose checksum reader already computes MD5, on a session
+// that declared MD5 or as an MD5 part checksum on a session that declared
+// nothing, takes its part ETag from that reader.
+func TestUploadPart_MD5ChecksumReaderSuppliesETag(t *testing.T) {
+	b, _, _ := newRefTestBackend(t)
+	part := bytes.Repeat([]byte("q"), 5<<20)
+	sum := md5.Sum(part)
+	want := `"` + hex.EncodeToString(sum[:]) + `"`
+	wantB64 := base64.StdEncoding.EncodeToString(sum[:])
+
+	t.Run("MD5 session", func(t *testing.T) {
+		key := "mp-md5-session"
+		uploadID := mpCreate(t, b, key, types.ChecksumAlgorithmMd5, types.ChecksumTypeFullObject)
+		out, err := mpUploadPart(t, b, key, uploadID, 1, part, nil)
+		if err != nil {
+			t.Fatalf("UploadPart: %v", err)
+		}
+		if out.ETag == nil || *out.ETag != want {
+			t.Fatalf("part ETag = %v, want %s", out.ETag, want)
+		}
+		if out.ChecksumMD5 == nil || *out.ChecksumMD5 != wantB64 {
+			t.Fatalf("ChecksumMD5 echo = %v, want %s", out.ChecksumMD5, wantB64)
+		}
+	})
+	t.Run("MD5 part checksum, undeclared session", func(t *testing.T) {
+		key := "mp-md5-part"
+		uploadID := mpCreate(t, b, key, "", "")
+		out, err := mpUploadPart(t, b, key, uploadID, 1, part, func(in *awss3.UploadPartInput) {
+			in.ChecksumAlgorithm = types.ChecksumAlgorithmMd5
+		})
+		if err != nil {
+			t.Fatalf("UploadPart: %v", err)
+		}
+		if out.ETag == nil || *out.ETag != want {
+			t.Fatalf("part ETag = %v, want %s", out.ETag, want)
+		}
+		if out.ChecksumMD5 == nil || *out.ChecksumMD5 != wantB64 {
+			t.Fatalf("ChecksumMD5 echo = %v, want %s", out.ChecksumMD5, wantB64)
+		}
+	})
+}
+
+// An UploadPartCopy whose explicit range covers the whole single-part source
+// is a whole-object copy: the part ETag is the source's MD5, as with no
+// range header.
+func TestUploadPartCopy_ExplicitFullRangeIsWholeObject(t *testing.T) {
+	b, _, _ := newRefTestBackend(t)
+	src := bytes.Repeat([]byte("whole-range "), 6<<20/12)
+	putObjV(t, b, "src", src)
+	sum := md5.Sum(src)
+	want := `"` + hex.EncodeToString(sum[:]) + `"`
+
+	id := mpCreate(t, b, "full-range", "", "")
+	rng := fmt.Sprintf("bytes=0-%d", len(src)-1)
+	res, err := upc(t, b, "full-range", id, 1, "bk/src", func(in *awss3.UploadPartCopyInput) { in.CopySourceRange = &rng })
+	if err != nil {
+		t.Fatalf("UploadPartCopy full range: %v", err)
+	}
+	if res.ETag == nil || *res.ETag != want {
+		t.Fatalf("part ETag = %v, want %s", res.ETag, want)
+	}
+	if _, err := mpComplete(t, b, "full-range", id, []types.CompletedPart{completed(res, 1)}, nil); err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+	if _, got, err := getObjV(t, b, "full-range", ""); err != nil || !bytes.Equal(got, src) {
+		t.Fatalf("GET after full-range copy: %d bytes, %v; want the source", len(got), err)
+	}
+}
+
+// A zero-byte PutObject carries the constant empty MD5 as its ETag.
+func TestPutObject_ZeroByteETag(t *testing.T) {
+	b, _, _ := newRefTestBackend(t)
+	bucket, key := "bk", "empty"
+	out, err := b.PutObject(context.Background(), s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(nil)})
+	if err != nil {
+		t.Fatalf("PutObject: %v", err)
+	}
+	if want := `"d41d8cd98f00b204e9800998ecf8427e"`; out.ETag != want {
+		t.Fatalf("ETag = %q, want %s", out.ETag, want)
+	}
 }

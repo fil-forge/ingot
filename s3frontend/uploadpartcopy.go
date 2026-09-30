@@ -3,6 +3,7 @@ package s3frontend
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
 	"fmt"
 	"io"
 	"net/http"
@@ -101,17 +102,20 @@ func (b *Backend) UploadPartCopy(ctx context.Context, input *s3.UploadPartCopyIn
 	}
 	defer rc.Close()
 	// A whole-object copy of a single-part source copies its exact bytes, so
-	// the source's stored digest is the part's MD5 and the MD5 pass is skipped;
-	// a ranged copy or a multipart source (no stored whole-object md5) computes
-	// it over the copied bytes.
-	var knownMD5 []byte
-	if input.CopySourceRange == nil && !isMultipartETag(srcMf.ETag) && len(srcMf.Body.MD5) == 16 { // 16 = md5.Size
-		knownMD5 = srcMf.Body.MD5
+	// the source's stored digest is the part's MD5 and the MD5 pass is skipped.
+	// Whole-object is judged on the normalized range, so an explicit
+	// bytes=0-(size-1) counts as well as no range header. A partial range or
+	// a multipart source (no stored whole-object md5) computes it over the
+	// copied bytes.
+	var md5Src bodyMD5Source
+	wholeObject := start == 0 && end == srcMf.Body.Size-1
+	if wholeObject && !isMultipartETag(srcMf.ETag) && len(srcMf.Body.MD5) == md5.Size {
+		md5Src = knownMD5(srcMf.Body.MD5)
 	}
 	// The session's algorithm is the part's: passing it as the requested one
 	// satisfies the negotiation (a COMPOSITE session needs a checksum on every
 	// part) with no value to validate, so it is computed over the copied bytes.
-	rec, err := b.ingestPart(ctx, sess, int(*input.PartNumber), rc, types.ChecksumAlgorithm(sess.ChecksumAlgorithm), "", knownMD5)
+	rec, err := b.ingestPart(ctx, sess, int(*input.PartNumber), rc, types.ChecksumAlgorithm(sess.ChecksumAlgorithm), "", md5Src)
 	if err != nil {
 		return s3response.CopyPartResult{}, err
 	}

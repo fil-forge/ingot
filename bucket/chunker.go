@@ -2,6 +2,7 @@ package bucket
 
 import (
 	"context"
+	"crypto/md5"
 	"crypto/sha256"
 	"fmt"
 	"io"
@@ -71,9 +72,9 @@ func SplitBody(ctx context.Context, w blockstore.BlobWriter, r io.Reader, maxBlo
 
 	bodyHasher := sha256.New()
 	hashers := []io.Writer{bodyHasher}
-	var etagHasher *asyncHash
+	var etagHasher *lazyETagHash
 	if cfg.md5 {
-		etagHasher = newAsyncHash(newETagHash())
+		etagHasher = &lazyETagHash{}
 		// Every return path must finish the async hasher so its goroutine
 		// exits; Sum is idempotent, so the success path's explicit call
 		// below is fine.
@@ -114,6 +115,34 @@ func SplitBody(ctx context.Context, w blockstore.BlobWriter, r io.Reader, maxBlo
 		body.MD5 = etagHasher.Sum()
 	}
 	return body, nil
+}
+
+// lazyETagHash is the whole-body MD5 pass, started by the first byte. A
+// zero-byte body never starts it: no goroutine, no md5-simd lane, and Sum
+// reports the constant empty digest. Once started it is an asyncHash on the
+// shared ETag hasher (see newETagHash), and Sum is idempotent as there.
+type lazyETagHash struct {
+	a *asyncHash
+}
+
+func (l *lazyETagHash) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if l.a == nil {
+		l.a = newAsyncHash(newETagHash())
+	}
+	return l.a.Write(p)
+}
+
+// Sum returns the digest: the empty MD5 when nothing was written, else the
+// async hasher's result (which also stops its goroutine).
+func (l *lazyETagHash) Sum() []byte {
+	if l.a == nil {
+		empty := md5.Sum(nil)
+		return empty[:]
+	}
+	return l.a.Sum()
 }
 
 // MD5Writer computes a body's MD5 off the caller's goroutine, on the shared
