@@ -31,7 +31,15 @@ import (
 // sha256+file copy on the way in, and decryptingOpener → aesstream.SpanReader
 // over a spool section on the way out. The layered variants peel the pipeline
 // apart so each pass can be attributed: the disk, the spool hash, the body
-// hashes, the FEE pipe, and the AES-GCM floor.
+// hashes, the FEE stream, and the AES-GCM floor.
+//
+// Every drain goes through sink rather than io.Discard: io.Discard implements
+// io.ReaderFrom with its own 8 KiB buffer, which would replace the copy
+// pattern each benchmark claims to measure. sink has no fast path, so an
+// io.Copy into it uses the source's WriteTo when it has one (the encrypt
+// reader, as the spool sees it) and the generic 32 KiB loop otherwise (the
+// body reader, as the response writer sees it); the read benchmarks pass
+// that loop one reused buffer so the copy itself adds nothing to allocs/op.
 
 var benchSizes = []int64{4 << 10, 1 << 20, 16 << 20, 64 << 20, msbucket.DefaultMaxBlobSize}
 
@@ -105,12 +113,17 @@ func (hashingDiscardWriter) WriteBlob(_ context.Context, r io.Reader) (mh.Multih
 	return digest, n, err
 }
 
+// sink is a writer with no ReaderFrom fast path; see the package comment.
+type sink struct{}
+
+func (sink) Write(p []byte) (int, error) { return len(p), nil }
+
 // discardWriter drains the envelope and names it by a counter, so the
 // encrypting writer's map stays happy without any hash pass.
 type discardWriter struct{ n int }
 
 func (d *discardWriter) WriteBlob(_ context.Context, r io.Reader) (mh.Multihash, int64, error) {
-	n, err := io.Copy(io.Discard, r)
+	n, err := io.Copy(sink{}, r)
 	if err != nil || n == 0 {
 		return nil, n, err
 	}
@@ -136,16 +149,22 @@ func BenchmarkIngest_Full(b *testing.B) {
 				if err != nil {
 					b.Fatal(err)
 				}
+				// Deleting the blob is not part of ingest; keep it out of the
+				// measurement, and fail rather than let blobs pile up on disk.
+				b.StopTimer()
 				for _, ref := range body.Blobs {
-					_ = env.spool.Remove(ref.Digest)
+					if err := env.spool.Remove(ref.Digest); err != nil {
+						b.Fatal(err)
+					}
 				}
+				b.StartTimer()
 			}
 		})
 	}
 }
 
 // BenchmarkIngest_NoDisk is the same path with the spool's file replaced by
-// nothing: the three hash passes, the FEE pipe and the wrap remain.
+// nothing: the three hash passes, the FEE stream and the wrap remain.
 func BenchmarkIngest_NoDisk(b *testing.B) {
 	for _, size := range benchSizes {
 		b.Run(sizeName(size), func(b *testing.B) {
@@ -164,7 +183,7 @@ func BenchmarkIngest_NoDisk(b *testing.B) {
 }
 
 // BenchmarkIngest_NoSpoolHash drops the spool's sha256 too: SplitBody's body
-// hashes and the FEE pipe only.
+// hashes and the FEE stream only.
 func BenchmarkIngest_NoSpoolHash(b *testing.B) {
 	for _, size := range benchSizes {
 		b.Run(sizeName(size), func(b *testing.B) {
@@ -183,8 +202,8 @@ func BenchmarkIngest_NoSpoolHash(b *testing.B) {
 }
 
 // BenchmarkFEE_EncryptWithCEK is go-fee alone as ingot calls it: one
-// ECDH-ES recipient, the default chunk size, drained by io.Copy into
-// io.Discard (the pipe, its goroutine and AES-GCM; no hashing).
+// ECDH-ES recipient, the default chunk size, drained by io.Copy through the
+// reader's WriteTo (the pull-mode encrypt reader and AES-GCM; no hashing).
 func BenchmarkFEE_EncryptWithCEK(b *testing.B) {
 	for _, size := range benchSizes {
 		b.Run(sizeName(size), func(b *testing.B) {
@@ -199,7 +218,7 @@ func BenchmarkFEE_EncryptWithCEK(b *testing.B) {
 				if err != nil {
 					b.Fatal(err)
 				}
-				if _, err := io.Copy(io.Discard, rc); err != nil {
+				if _, err := io.Copy(sink{}, rc); err != nil {
 					b.Fatal(err)
 				}
 				rc.Close()
@@ -223,7 +242,7 @@ func BenchmarkFEE_EncryptWithCEK_NoRecipient(b *testing.B) {
 				if err != nil {
 					b.Fatal(err)
 				}
-				if _, err := io.Copy(io.Discard, rc); err != nil {
+				if _, err := io.Copy(sink{}, rc); err != nil {
 					b.Fatal(err)
 				}
 				rc.Close()
@@ -232,21 +251,22 @@ func BenchmarkFEE_EncryptWithCEK_NoRecipient(b *testing.B) {
 	}
 }
 
-// BenchmarkAESStream_Writer is the body cipher without the pipe: io.Copy from
-// the plaintext straight into aesstream.Writer over io.Discard.
+// BenchmarkAESStream_Writer is the push-mode body cipher alone: the plaintext
+// written into aesstream.Writer in 32 KiB pieces, over a discarding writer.
 func BenchmarkAESStream_Writer(b *testing.B) {
 	for _, size := range benchSizes {
 		b.Run(sizeName(size), func(b *testing.B) {
 			data := benchData(size)
 			cfg := aesstream.Config{Key: make([]byte, 32), BaseNonce: make([]byte, 7), AAD: []byte("aad")}
+			buf := make([]byte, 32<<10)
 			b.SetBytes(size)
 			b.ReportAllocs()
 			for b.Loop() {
-				w, err := aesstream.NewWriter(io.Discard, cfg)
+				w, err := aesstream.NewWriter(sink{}, cfg)
 				if err != nil {
 					b.Fatal(err)
 				}
-				if _, err := io.Copy(w, bytes.NewReader(data)); err != nil {
+				if _, err := io.CopyBuffer(w, struct{ io.Reader }{bytes.NewReader(data)}, buf); err != nil {
 					b.Fatal(err)
 				}
 				if err := w.Close(); err != nil {
@@ -287,28 +307,39 @@ func BenchmarkSHA256(b *testing.B) {
 	}
 }
 
-// BenchmarkFileWrite is the spool's disk pass alone: io.Copy of the data into
-// a temp file in 32 KiB pieces, then rename, as Spool.WriteBlob does.
+// BenchmarkFileWrite is the spool's disk pass alone: the data written to a
+// temp file in sealed-chunk-sized pieces (256 KiB + tag, what the encrypt
+// reader's WriteTo hands the spool's MultiWriter), then renamed, as
+// Spool.WriteBlob does. Both ends are wrapped so neither bytes.Reader's
+// WriteTo nor os.File's ReadFrom replaces that write pattern.
 func BenchmarkFileWrite(b *testing.B) {
 	for _, size := range benchSizes[1:] {
 		b.Run(sizeName(size), func(b *testing.B) {
 			dir := b.TempDir()
 			data := benchData(size)
+			buf := make([]byte, aesstream.DefaultChunkSize+aesstream.TagSize)
+			dst := filepath.Join(dir, "blob")
 			b.SetBytes(size)
 			for b.Loop() {
 				f, err := os.CreateTemp(dir, ".tmp-*")
 				if err != nil {
 					b.Fatal(err)
 				}
-				if _, err := io.Copy(f, bytes.NewReader(data)); err != nil {
+				_, err = io.CopyBuffer(struct{ io.Writer }{f}, struct{ io.Reader }{bytes.NewReader(data)}, buf)
+				if closeErr := f.Close(); err == nil {
+					err = closeErr
+				}
+				if err != nil {
 					b.Fatal(err)
 				}
-				f.Close()
-				dst := filepath.Join(dir, "blob")
 				if err := os.Rename(f.Name(), dst); err != nil {
 					b.Fatal(err)
 				}
-				os.Remove(dst)
+				b.StopTimer()
+				if err := os.Remove(dst); err != nil {
+					b.Fatal(err)
+				}
+				b.StartTimer()
 			}
 		})
 	}
@@ -348,11 +379,12 @@ func BenchmarkRead_Full(b *testing.B) {
 			env := newBenchEnc(b)
 			data := benchData(size)
 			body, opener := benchStored(b, env, data)
+			buf := make([]byte, 32<<10)
 			b.SetBytes(size)
 			b.ReportAllocs()
 			for b.Loop() {
 				rc := msbucket.OpenBody(context.Background(), opener, env.space, body)
-				n, err := io.Copy(io.Discard, rc)
+				n, err := io.CopyBuffer(sink{}, rc, buf)
 				rc.Close()
 				if err != nil {
 					b.Fatal(err)
@@ -378,7 +410,7 @@ func BenchmarkRead_Full4K(b *testing.B) {
 			b.ReportAllocs()
 			for b.Loop() {
 				rc := msbucket.OpenBody(context.Background(), opener, env.space, body)
-				_, err := io.CopyBuffer(io.Discard, struct{ io.Reader }{rc}, buf)
+				_, err := io.CopyBuffer(sink{}, struct{ io.Reader }{rc}, buf)
 				rc.Close()
 				if err != nil {
 					b.Fatal(err)
@@ -399,6 +431,7 @@ func BenchmarkSpanReader_Memory(b *testing.B) {
 			if err != nil {
 				b.Fatal(err)
 			}
+			buf := make([]byte, 32<<10)
 			b.SetBytes(size)
 			b.ReportAllocs()
 			for b.Loop() {
@@ -406,7 +439,7 @@ func BenchmarkSpanReader_Memory(b *testing.B) {
 				if err != nil {
 					b.Fatal(err)
 				}
-				if _, err := io.Copy(io.Discard, sr); err != nil {
+				if _, err := io.CopyBuffer(sink{}, sr, buf); err != nil {
 					b.Fatal(err)
 				}
 				sr.Close()
@@ -425,11 +458,12 @@ func BenchmarkRead_Range(b *testing.B) {
 	body, opener := benchStored(b, env, data)
 	const rangeLen = 1 << 20
 	start := size/2 + 12345
+	buf := make([]byte, 32<<10)
 	b.SetBytes(rangeLen)
 	b.ReportAllocs()
 	for b.Loop() {
 		rc := msbucket.OpenBodyRange(context.Background(), opener, env.space, body, start, start+rangeLen-1)
-		n, err := io.Copy(io.Discard, rc)
+		n, err := io.CopyBuffer(sink{}, rc, buf)
 		rc.Close()
 		if err != nil {
 			b.Fatal(err)
@@ -476,7 +510,7 @@ func BenchmarkFEE_EncryptWithCEKParallel(b *testing.B) {
 			if err != nil {
 				b.Fatal(err)
 			}
-			if _, err := io.Copy(io.Discard, rc); err != nil {
+			if _, err := io.Copy(sink{}, rc); err != nil {
 				b.Fatal(err)
 			}
 			rc.Close()
