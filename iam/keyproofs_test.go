@@ -2,6 +2,7 @@ package iam_test
 
 import (
 	"context"
+	"sync"
 	"testing"
 
 	contentcmds "github.com/fil-forge/libforge/commands/content"
@@ -65,16 +66,39 @@ func TestKeyProofsForIsStable(t *testing.T) {
 	require.Len(t, chain, 1)
 }
 
-func TestKeyProofsRevoked(t *testing.T) {
+func TestKeyProofsDepositUnlessRevoked(t *testing.T) {
 	kp := iam.NewKeyProofs()
+	key, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	store := kp.For(key.DID())
+
 	// A delegation no store holds: the revocation still has to be remembered.
 	dlg, _ := grant(t)
-	require.False(t, kp.Revoked(dlg))
-
 	require.Empty(t, kp.InvalidateHolders(dlg.Link()))
-	require.True(t, kp.Revoked(dlg), "a revoked CID is remembered even when nothing cached held it")
 
 	other, _ := grant(t)
-	require.True(t, kp.Revoked(other, dlg), "any revoked delegation in the set is enough")
-	require.False(t, kp.Revoked(other))
+	require.False(t, kp.DepositUnlessRevoked(store, other, dlg), "any revoked delegation in the set refuses the deposit")
+	require.False(t, store.Contains(other.Link()), "a refused deposit adds nothing")
+	require.True(t, kp.DepositUnlessRevoked(store, other))
+	require.True(t, store.Contains(other.Link()))
+}
+
+// TestKeyProofsDepositRacesRevocation races a deposit against the revocation
+// of the delegation it carries: whichever lands first, the key's store must
+// not end up holding the revoked delegation.
+func TestKeyProofsDepositRacesRevocation(t *testing.T) {
+	for range 200 {
+		kp := iam.NewKeyProofs()
+		key, err := ed25519.GenerateIssuer()
+		require.NoError(t, err)
+		store := kp.For(key.DID())
+		dlg, _ := grant(t)
+
+		var wg sync.WaitGroup
+		wg.Go(func() { kp.DepositUnlessRevoked(store, dlg) })
+		wg.Go(func() { kp.InvalidateHolders(dlg.Link()) })
+		wg.Wait()
+
+		require.False(t, kp.For(key.DID()).Contains(dlg.Link()))
+	}
 }
