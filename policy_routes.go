@@ -9,6 +9,7 @@ import (
 	"github.com/fil-forge/ingot/internal/fasthttputil"
 	"github.com/fil-forge/ingot/s3frontend"
 	s3bkt "github.com/fil-forge/libforge/commands/s3/bucket"
+	"github.com/fil-forge/versitygw/auth"
 	"github.com/fil-forge/versitygw/s3api"
 	"github.com/fil-forge/versitygw/s3err"
 	"github.com/gofiber/fiber/v3"
@@ -91,6 +92,12 @@ func policyError(err error) s3err.APIError {
 		var s3e s3err.S3Error
 		if errors.As(mapped, &s3e) {
 			return s3e.BaseError()
+		}
+		// An unknown, invalid or expired key: versitygw's auth middleware turns
+		// ErrNoSuchUser into InvalidAccessKeyId, but these routes mount ahead
+		// of it.
+		if errors.Is(mapped, auth.ErrNoSuchUser) {
+			return s3err.GetAPIError(s3err.ErrInvalidAccessKeyID)
 		}
 		return s3err.GetAPIError(s3err.ErrAccessDenied)
 	}
