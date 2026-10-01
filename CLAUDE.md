@@ -126,7 +126,7 @@ Internal:
   path over cached delegations), plus `KeyProofs`/`DelegationCache` — per-
   access-key TTL caches of hilt-issued delegations that the uploader and the
   network read tier consume via `internal/reqscope`. `KeyProofs` also
-  remembers every revoked CID until the next UTC midnight; a response
+  remembers every revoked CID until restart; a response
   carrying one is authorized but not cached.
 - **`forgeclient/`** — carried-from-guppy sprue edge client: `/blob/add`
   (with a deferrable conclude, or by digest code for a streamed blob), `/ucan/conclude`, `/blob/abort`,

@@ -30,7 +30,7 @@
 // ([KeyProofs.Revoked]) authorizes the one request it answers and is not
 // cached: it stems from a Hilt write whose revocations were published but
 // whose commit failed, and caching it would keep the old access in force
-// until midnight while the console's retry republishes revocations Swarf
+// while the console's retry republishes revocations Swarf
 // deduplicates. The request still gets a store of its own holding the
 // response's delegations, so its onward retrieval has a chain.
 //
