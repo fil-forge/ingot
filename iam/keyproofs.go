@@ -4,7 +4,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/fil-forge/hilt/pkg/sigv4"
 	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/ucantone/ucan"
 	"github.com/ipfs/go-cid"
@@ -25,9 +24,9 @@ import (
 // mid-use; a caller already holding a *DelegationCache is unaffected by
 // eviction regardless.
 //
-// It also remembers every delegation CID a revocation named, until the next
-// UTC midnight plus clock skew (the horizon of everything cached from an
-// authorize response). A Hilt write publishes its revocations before it
+// It also remembers every delegation CID a revocation named, for the process
+// lifetime: a revocation names only the CID, and the delegation may never
+// expire (a /s3/bucket/info chain), so no shorter horizon is safe. A Hilt write publishes its revocations before it
 // commits, so a write whose commit failed leaves the revoked delegations
 // stored at Hilt, and Hilt's next authorize response for the key carries
 // them again. The service checks a response against this set and, on a
@@ -88,7 +87,9 @@ func (k *KeyProofs) Deposit(key did.DID, dlgs ...ucan.Delegation) {
 func (k *KeyProofs) InvalidateHolders(link cid.Cid) []did.DID {
 	k.mu.Lock()
 	defer k.mu.Unlock()
-	k.revoked.Set(link.String(), struct{}{}, untilNextUTCMidnight(time.Now())+sigv4.MaxClockSkew)
+	// ponytail: grows by one CID per revocation until restart; bound it by the
+	// delegation's own expiry if Swarf records ever carry it.
+	k.revoked.Set(link.String(), struct{}{}, gocache.NoExpiration)
 	var affected []did.DID
 	// Items() already skips expired entries; expired stores are gone anyway.
 	for id, item := range k.byKey.Items() {
@@ -107,7 +108,7 @@ func (k *KeyProofs) InvalidateHolders(link cid.Cid) []did.DID {
 }
 
 // DepositUnlessRevoked adds dlgs to store unless any has been named by a
-// revocation within the current horizon (see [KeyProofs]), reporting whether
+// revocation (see [KeyProofs]), reporting whether
 // it deposited. The check and the add hold k.mu, which orders them against
 // [KeyProofs.InvalidateHolders]: a revocation lands either before (the check
 // sees it) or after (the store holds the CID and is dropped), never between —
