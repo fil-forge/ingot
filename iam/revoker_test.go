@@ -100,7 +100,7 @@ func TestRevokerUnknownCIDClearsNothingButIsRecorded(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Empty(t, r.Revoke(other.Link()))
-	require.True(t, kp.Revoked(other), "the revocation is remembered")
+	require.False(t, kp.DepositUnlessRevoked(iam.NewDelegationCache(), other), "the revocation is remembered")
 
 	chain, _, err := kp.For(a.key).ProofChain(ctx, a.dlg.Audience(), a.dlg.Command(), a.tenant.DID())
 	require.NoError(t, err)

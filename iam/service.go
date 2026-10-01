@@ -249,8 +249,10 @@ func (s *Service) GetUserAccountForRequest(ctx fiber.Ctx, accessKeyStr string) (
 	// answers with delegations the consumer saw revoked. Authorize this
 	// request from the response and cache nothing, so the key returns to Hilt
 	// on every request until a committed write issues fresh delegations. The
-	// request keeps a store of its own for its onward retrieval.
-	if ctr != nil && s.proofs.Revoked(ctr.Delegations()...) {
+	// request keeps a store of its own for its onward retrieval. Otherwise the
+	// delegations land in the key's store in the same step as the check, so a
+	// revocation arriving meanwhile still finds (and drops) them.
+	if ctr != nil && !s.proofs.DepositUnlessRevoked(store, ctr.Delegations()...) {
 		scoped := NewDelegationCache()
 		ctx.Locals(reqscope.ProofStoreKey(), ucanlib.ProofStore(scoped))
 		s.cacheProofs(reqCtx, scoped, ctr, req, accessKeyID)
