@@ -122,6 +122,8 @@ func TestPolicyRoutes(t *testing.T) {
 			{ucanerrors.New(hiltauth.OperationNotPermittedErrorName, "no"), "AccessDenied", 403},
 			{ucanerrors.New(hiltauth.SignatureMismatchErrorName, "no"), "SignatureDoesNotMatch", 403},
 			{ucanerrors.New(hiltauth.ForeignBucketErrorName, "no"), "AccessDenied", 403},
+			{ucanerrors.New(hiltauth.UnknownAccessKeyErrorName, "no"), "InvalidAccessKeyId", 403},
+			{ucanerrors.New(hiltauth.AccessKeyExpiredErrorName, "no"), "InvalidAccessKeyId", 403},
 			{errors.New("boom"), "InternalError", 500},
 		} {
 			f := &fakeAuthority{err: tc.err}
