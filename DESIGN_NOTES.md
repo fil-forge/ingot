@@ -131,9 +131,10 @@ is ingested the same way: the source's plaintext range streams through the
 decrypting read path into new parked blobs, so the source may be in any
 bucket of the tenant and nothing is shared with it.
 
-Complete concludes the parked parts in batches: each `/ucan/conclude`
-carries up to `MaxConcludeBatch` (1000) put receipts (`receipts`, the plural
-argument), sprue accepts them one request per storage node, and each blob's
+Complete concludes the parked parts a group at a time: each `/ucan/conclude`
+is one invocation carrying up to `MaxConcludeReceipts` (1000) put receipts
+(`receipts`, the plural argument — not a batch of invocations, which is what
+`/upload/add` sends), sprue accepts them one request per storage node, and each blob's
 `/blob/accept` receipt and location commitment come back in the conclude
 response. So a completion costs a few round trips rather than one per part,
 which is what an S3 client splitting a large object into thousands of 5 MiB
