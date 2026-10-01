@@ -24,10 +24,9 @@ import (
 // mid-use; a caller already holding a *DelegationCache is unaffected by
 // eviction regardless.
 //
-// It also remembers every delegation CID a revocation named, for the process
-// lifetime: a revocation names only the CID, and the delegation may never
-// expire (a /s3/bucket/info chain), so no shorter horizon is safe. A Hilt write publishes its revocations before it
-// commits, so a write whose commit failed leaves the revoked delegations
+// It also remembers every delegation CID a revocation named, for revokedTTL
+// past the last time Hilt served it. A Hilt write publishes its revocations
+// before it commits, so a write whose commit failed leaves the revoked delegations
 // stored at Hilt, and Hilt's next authorize response for the key carries
 // them again. The service checks a response against this set and, on a
 // match, authorizes without caching, so the key returns to Hilt on every
@@ -44,6 +43,12 @@ type KeyProofs struct {
 // delegation lifetimes (≤ next UTC midnight), so an in-use key's store never
 // disappears out from under it.
 const keyProofsIdleTTL = 24 * time.Hour
+
+// revokedTTL is how long a revoked CID is remembered past its last sighting.
+// A revocation names only the CID, and the grant behind it may never expire,
+// so the entry must outlive the authorize horizon. It matters only while Hilt
+// still serves the grant (a write whose commit failed); each refusal renews it.
+const revokedTTL = 48 * time.Hour
 
 // NewKeyProofs returns an empty per-key proof store registry.
 func NewKeyProofs() *KeyProofs {
@@ -87,9 +92,9 @@ func (k *KeyProofs) Deposit(key did.DID, dlgs ...ucan.Delegation) {
 func (k *KeyProofs) InvalidateHolders(link cid.Cid) []did.DID {
 	k.mu.Lock()
 	defer k.mu.Unlock()
-	// ponytail: grows by one CID per revocation until restart; bound it by the
-	// delegation's own expiry if Swarf records ever carry it.
-	k.revoked.Set(link.String(), struct{}{}, gocache.NoExpiration)
+	// ponytail: a failed Hilt write whose grant goes unserved for revokedTTL is
+	// forgotten; Hilt refusing to serve grants it revoked would close that.
+	k.revoked.Set(link.String(), struct{}{}, revokedTTL)
 	var affected []did.DID
 	// Items() already skips expired entries; expired stores are gone anyway.
 	for id, item := range k.byKey.Items() {
@@ -119,6 +124,8 @@ func (k *KeyProofs) DepositUnlessRevoked(store *DelegationCache, dlgs ...ucan.De
 	defer k.mu.Unlock()
 	for _, d := range dlgs {
 		if _, ok := k.revoked.Get(d.Link().String()); ok {
+			// Hilt still serves it: keep remembering.
+			k.revoked.Set(d.Link().String(), struct{}{}, revokedTTL)
 			return false
 		}
 	}
