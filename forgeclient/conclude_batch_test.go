@@ -229,7 +229,7 @@ func parkBlob(t *testing.T, fake *fakeSprue) AddedBlob {
 		blobProvider,
 		blobProvider.DID(),
 		&httpcmds.PutArguments{
-			Body:        blobcmds.SpecFromBlob(blobcmds.Blob{Digest: digest, Size: 1024}),
+			Body:        blobcmds.SpecFromDigest(digest, 1024),
 			Destination: promise.AwaitOK{Task: allocTask},
 		},
 		invocation.WithAudience(blobProvider.DID()),

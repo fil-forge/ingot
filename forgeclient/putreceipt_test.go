@@ -46,7 +46,7 @@ func putResult(t *testing.T, rcpt ucan.Receipt) httpcmds.PutOK {
 func TestPutReceipt(t *testing.T) {
 	t.Run("a put by digest reports nothing", func(t *testing.T) {
 		digest := randomDigest(t)
-		inv := putInvocation(t, blobcmds.SpecFromBlob(blobcmds.Blob{Digest: digest, Size: 1024}))
+		inv := putInvocation(t, blobcmds.SpecFromDigest(digest, 1024))
 		rcpt, err := putReceipt(inv, digest)
 		require.NoError(t, err)
 		require.Nil(t, putResult(t, rcpt).Blob)

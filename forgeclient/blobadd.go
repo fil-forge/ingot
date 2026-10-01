@@ -181,7 +181,7 @@ func (c *Client) blobAdd(ctx context.Context, space did.DID, content io.Reader, 
 		contentSizePtr = &contentSize
 	}
 
-	added, err := c.invokeAdd(ctx, space, blobcmds.SpecFromBlob(blobcmds.Blob{Digest: contentHash, Size: *contentSizePtr}), cfg)
+	added, err := c.invokeAdd(ctx, space, blobcmds.SpecFromDigest(contentHash, *contentSizePtr), cfg)
 	if err != nil {
 		return AddedBlob{}, err
 	}
