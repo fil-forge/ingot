@@ -12,7 +12,7 @@ require (
 	github.com/cenkalti/backoff/v5 v5.0.3
 	github.com/cloud-portable/s3tests/packages/go v0.0.0-20260916120817-ce77c26e7f6d
 	github.com/exaring/otelpgx v0.12.0
-	github.com/fil-forge/hilt v0.0.1-0.20261001085358-66f3e3ccbe8e
+	github.com/fil-forge/hilt v0.0.1-0.20261001110144-f8c25f901d2d
 	github.com/fil-forge/indexing-service v1.13.5-0.20260820151722-9eb620409a4e
 	github.com/fil-forge/libforge v0.0.0-20261002123347-24293c113b04
 	github.com/fil-forge/smelt v0.0.0-20260915151825-96fc212b8d91
