@@ -2,6 +2,7 @@ package inmem
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"testing"
 
@@ -9,8 +10,35 @@ import (
 	"github.com/fil-forge/libforge/commands/s3/bucket"
 	"github.com/fil-forge/libforge/testutil"
 
+	"github.com/fil-forge/ingot/bucketauthority"
 	"github.com/fil-forge/ingot/registry"
 )
+
+// TestMemStoreBucketPolicy pins the bucket-existence check the production
+// authority makes: an unknown bucket is ErrNotFound (rendered NoSuchBucket)
+// whatever the method; a known one has no policy and refuses a write.
+func TestMemStoreBucketPolicy(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+	if err := m.Create(ctx, "known", testutil.RandomDID(t), registry.CreateState{}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	for _, tc := range []struct {
+		method, url string
+		want        error
+	}{
+		{http.MethodGet, "/missing?policy", bucketauthority.ErrNotFound},
+		{http.MethodDelete, "/missing?policy", bucketauthority.ErrNotFound},
+		{http.MethodPut, "/missing?policy", bucketauthority.ErrNotFound},
+		{http.MethodGet, "/known?policy", bucketauthority.ErrNoPolicy},
+		{http.MethodPut, "/known?policy", bucketauthority.ErrUnsupported},
+	} {
+		_, err := m.BucketPolicy(ctx, s3.Request{Method: tc.method, URL: tc.url}, nil)
+		if !errors.Is(err, tc.want) {
+			t.Errorf("%s %s: got %v, want %v", tc.method, tc.url, err, tc.want)
+		}
+	}
+}
 
 // TestMemStoreListBucketsPagination covers the local pagination semantics of
 // the BucketAuthority ListBuckets seam: prefix filter, resume-after-token, max
