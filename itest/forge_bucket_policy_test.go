@@ -5,7 +5,6 @@ package itest
 import (
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 	"testing"
 
@@ -22,7 +21,7 @@ import (
 // merges, so the scenario runs only against a hilt override (or when
 // INGOT_ITEST_IAM=1 says the image carries it); drop the guard then.
 func TestForgeBucketPolicy(t *testing.T) {
-	if os.Getenv("INGOT_ITEST_IAM") != "1" && os.Getenv("INGOT_ITEST_HILT_BINARY") == "" && os.Getenv("INGOT_ITEST_HILT_IMAGE") == "" {
+	if !iamScenariosEnabled() {
 		t.Skip("the bucket policy scenario needs a hilt override (INGOT_ITEST_HILT_BINARY or INGOT_ITEST_HILT_IMAGE), or INGOT_ITEST_IAM=1, until the :main image serves /s3/bucket/policy")
 	}
 	s, endpoint := forgeStack(t)
