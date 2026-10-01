@@ -882,7 +882,7 @@ func (b *Backend) executeRelease(ctx context.Context, pr registry.PendingRelease
 			log.Warn("release: decode park add task failed", zap.Error(err))
 			return false
 		}
-		aerr := b.deferred.AbortBlob(ctx, space, digest, cause)
+		aerr := b.deferred.AbortBlob(ctx, space, cause)
 		switch {
 		case aerr == nil:
 		case errors.Is(aerr, uploader.ErrBlobAccepted):

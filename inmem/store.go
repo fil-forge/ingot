@@ -434,7 +434,7 @@ func (NopUploader) ConcludeBlobs(_ context.Context, _ did.DID, parked []uploader
 	return locations, nil
 }
 
-func (NopUploader) AbortBlob(_ context.Context, _ did.DID, _ multihash.Multihash, _ cid.Cid) error {
+func (NopUploader) AbortBlob(_ context.Context, _ did.DID, _ cid.Cid) error {
 	return nil
 }
 

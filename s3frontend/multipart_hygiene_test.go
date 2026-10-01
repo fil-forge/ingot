@@ -452,7 +452,9 @@ func (p *parkingUploader) UploadBlob(_ context.Context, _ did.DID, digest multih
 	return uploader.UploadedBlob{Digest: digest, Size: size, AddTask: c, AcceptTask: c}, nil
 }
 
-func (p *parkingUploader) AbortBlob(_ context.Context, _ did.DID, d multihash.Multihash, _ cid.Cid) error {
+// AbortBlob records the aborted blob's digest, which its add task carries.
+func (p *parkingUploader) AbortBlob(_ context.Context, _ did.DID, add cid.Cid) error {
+	d := add.Hash()
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.abortFails > 0 {

@@ -150,7 +150,7 @@ func (w *encryptingBlobWriter) spoolEnvelope(ctx context.Context, envelope io.Re
 // effort: the blob_streams row stays when the abort fails, and the stream
 // sweeper retries it.
 func (w *encryptingBlobWriter) abandon(ctx context.Context, sb uploader.StreamedBlob) {
-	if err := w.stream.AbortBlob(ctx, w.space, nil, sb.AddTask); err != nil {
+	if err := w.stream.AbortBlob(ctx, w.space, sb.AddTask); err != nil {
 		w.logger.Warn("abandoning streamed upload failed; the stream sweeper retries", zap.Stringer("add", sb.AddTask), zap.Error(err))
 		return
 	}
@@ -216,7 +216,7 @@ func (b *Backend) SweepStaleStreams(ctx context.Context) (int, error) {
 		cause, err := cid.Cast(row.AddTask)
 		if err != nil {
 			b.logger.Error("stream row has an undecodable add task; dropping it", zap.Binary("add", row.AddTask), zap.Error(err))
-		} else if err := b.streaming.AbortBlob(ctx, row.Space, nil, cause); err != nil &&
+		} else if err := b.streaming.AbortBlob(ctx, row.Space, cause); err != nil &&
 			!errors.Is(err, uploader.ErrBlobAccepted) && now.Sub(row.CreatedAt) < streamForgetAge {
 			b.logger.Warn("aborting stale stream failed; retrying next sweep", zap.Stringer("add", cause), zap.Error(err))
 			continue

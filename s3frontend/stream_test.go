@@ -102,7 +102,7 @@ func (s *streamingUploader) UploadBlob(ctx context.Context, space did.DID, diges
 	return s.NopUploader.UploadBlob(ctx, space, digest, size, path, opts...)
 }
 
-func (s *streamingUploader) AbortBlob(_ context.Context, _ did.DID, _ multihash.Multihash, cause cid.Cid) error {
+func (s *streamingUploader) AbortBlob(_ context.Context, _ did.DID, cause cid.Cid) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.aborted = append(s.aborted, cause)

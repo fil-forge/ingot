@@ -615,7 +615,7 @@ func putReceipt(putInv ucan.Invocation, digest multihash.Multihash) (ucan.Receip
 		return nil, fmt.Errorf("unmarshaling /http/put arguments: %w", err)
 	}
 	putOK := &httpcmds.PutOK{}
-	if _, hashed := putArgs.Body.Blob(); !hashed {
+	if _, hashed := putArgs.Body.Digest(); !hashed {
 		if len(digest) == 0 {
 			return nil, fmt.Errorf("/http/put %s names no digest and none was given", putInv.Task().Link())
 		}
