@@ -191,9 +191,6 @@ func TestGetUserAccountForRequest(t *testing.T) {
 	})
 }
 
-// TestProofChainCapture covers the delegation plumbing: authorize-response
-// delegations land in the cache, incomplete chains trigger exactly one
-// /s3/bucket/info fetch, and info failures never fail authentication.
 func TestRevokedResponseIsNotCached(t *testing.T) {
 	access, keyDID := newAccessKey(t)
 	sigv4 := s3.VerificationKey{Kind: s3.KeyKindSigV4, Data: []byte("dk")}
@@ -247,6 +244,57 @@ func TestRevokedResponseIsNotCached(t *testing.T) {
 	require.Len(t, chain, 3)
 }
 
+// TestRevokedBucketInfoDelegationIsNotCached: a leaf-only authorize response
+// is completed from /s3/bucket/info, and a revoked hop there refuses the
+// caching just as one in the authorize response does.
+func TestRevokedBucketInfoDelegationIsNotCached(t *testing.T) {
+	access, keyDID := newAccessKey(t)
+	sigv4 := s3.VerificationKey{Kind: s3.KeyKindSigV4, Data: []byte("dk")}
+	root, mid, leaf, agent := mintRetrieveChain(t)
+	cache := iam.NewKeyProofs()
+	keys, tenants := iam.NewVerificationKeyCache(), iam.NewTenantCache()
+	fake := &fakeAuthorizer{
+		res:      authorizeOK(t, keyDID, sigv4),
+		dlgs:     []ucan.Delegation{leaf},
+		infoDlgs: []ucan.Delegation{root, mid},
+	}
+	svc := iam.New(fake, cache, keys, tenants)
+	require.Empty(t, iam.NewRevoker(cache, keys, tenants, nil).Revoke(mid.Link()))
+
+	app := fiber.New()
+	var scoped ucanlib.ProofStore
+	app.Use(func(c fiber.Ctx) error {
+		_, err := svc.GetUserAccountForRequest(c, access)
+		require.NoError(t, err)
+		scoped, _ = c.Locals(reqscope.ProofStoreKey()).(ucanlib.ProofStore)
+		return nil
+	})
+	for range 2 {
+		resp, err := app.Test(httptest.NewRequest(http.MethodGet, "http://example.com/bkt/key", nil))
+		require.NoError(t, err)
+		require.NoError(t, resp.Body.Close())
+	}
+	require.Equal(t, 2, fake.calls, "every request reaches Hilt while bucket info carries a revoked delegation")
+
+	_, found := keys.Get(access, s3.KeyKindSigV4)
+	require.False(t, found)
+	_, found = tenants.Get(access)
+	require.False(t, found)
+	_, known := cache.For(keyDID).Permits(*fake.res.Bucket, "s3:GetObject")
+	require.False(t, known)
+	held, _, err := cache.For(keyDID).ProofChain(context.Background(), agent.DID(), leaf.Command(), leaf.Subject())
+	require.NoError(t, err)
+	require.Empty(t, held)
+
+	require.NotNil(t, scoped)
+	chain, _, err := scoped.ProofChain(context.Background(), agent.DID(), leaf.Command(), leaf.Subject())
+	require.NoError(t, err)
+	require.Len(t, chain, 3)
+}
+
+// TestProofChainCapture covers the delegation plumbing: authorize-response
+// delegations land in the cache, incomplete chains trigger exactly one
+// /s3/bucket/info fetch, and info failures never fail authentication.
 func TestProofChainCapture(t *testing.T) {
 	access, keyDID := newAccessKey(t)
 	sigv4 := s3.VerificationKey{Kind: s3.KeyKindSigV4, Data: []byte("dk")}
