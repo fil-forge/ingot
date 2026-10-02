@@ -217,7 +217,7 @@ func TestObjectTagging_CreationTimeStamping(t *testing.T) {
 	// PUT with x-amz-tagging: parsed before ingest, stamped in the commit.
 	key, tagging := "tagged", "team=forge&env=dev"
 	if _, err := b.PutObject(ctx, s3response.PutObjectInput{
-		Bucket: &bucket, Key: &key, Body: bytes.NewReader([]byte("x")), Tagging: &tagging,
+		Bucket: &bucket, Key: &key, Body: bytes.NewReader([]byte("x")), ContentLength: sizeOf([]byte("x")), Tagging: &tagging,
 	}); err != nil {
 		t.Fatalf("PutObject with tagging: %v", err)
 	}
@@ -227,7 +227,7 @@ func TestObjectTagging_CreationTimeStamping(t *testing.T) {
 	// An invalid header fails the PUT and writes nothing.
 	badKey, badTagging := "bad", "k="+string(bytes.Repeat([]byte("v"), 300))
 	if _, err := b.PutObject(ctx, s3response.PutObjectInput{
-		Bucket: &bucket, Key: &badKey, Body: bytes.NewReader([]byte("x")), Tagging: &badTagging,
+		Bucket: &bucket, Key: &badKey, Body: bytes.NewReader([]byte("x")), ContentLength: sizeOf([]byte("x")), Tagging: &badTagging,
 	}); err == nil {
 		t.Fatal("oversize tag value: want error")
 	}

@@ -18,20 +18,23 @@ import (
 	"github.com/fil-forge/ucantone/did"
 	"github.com/filecoin-project/go-fee"
 	"github.com/filecoin-project/go-fee/aesstream"
-	mh "github.com/multiformats/go-multihash"
+	"go.uber.org/zap"
 
 	"github.com/fil-forge/ingot/blockstore"
 	msbucket "github.com/fil-forge/ingot/bucket"
+	"github.com/fil-forge/ingot/inmem"
 	"github.com/fil-forge/ingot/regionkey"
 	"github.com/fil-forge/ingot/registry"
+	"github.com/fil-forge/ingot/uploader"
 )
 
 // These benchmarks measure go-fee as the body write and read paths drive it:
-// SplitBody → encryptingBlobWriter → fee.EncryptWithCEK → the spool's
-// sha256+file copy on the way in, and decryptingOpener → aesstream.SpanReader
-// over a spool section on the way out. The layered variants peel the pipeline
-// apart so each pass can be attributed: the disk, the spool hash, the body
-// hashes, the FEE stream, and the AES-GCM floor.
+// SplitSizedBody → encryptingBlobWriter → fee.EncryptWithCEK → the replay
+// buffer's sha256+file copy and the provider send on the way in, and
+// decryptingOpener → aesstream.SpanReader over a provider section on the way
+// out. The layered variants peel the pipeline apart so each pass can be
+// attributed: the disk, the ciphertext hash, the body hashes, the FEE stream,
+// and the AES-GCM floor.
 //
 // Every drain goes through sink rather than io.Discard: io.Discard implements
 // io.ReaderFrom with its own 8 KiB buffer, which would replace the copy
@@ -63,15 +66,43 @@ func benchData(n int64) []byte {
 }
 
 type benchEnc struct {
-	spool     *blockstore.Spool
+	store     *inmem.Provider
+	replay    *blockstore.ReplayBuffer
+	streams   *inmem.MemStore
 	keys      regionkey.Provider
 	space     did.DID
 	recipient fee.Recipient
 }
 
+// writer returns an encrypting writer wired to the benchmark's provider, as
+// splitSpool wires one.
+func (e *benchEnc) writer() *encryptingBlobWriter {
+	enc := newEncryptingBlobWriter(e.keys, e.space, []fee.Recipient{e.recipient})
+	enc.stream, enc.replay, enc.streams = e.store, e.replay, e.streams
+	enc.lease = newStreamLease(e.streams, zap.NewNop())
+	enc.bucket, enc.logger = "bench", zap.NewNop()
+	return enc
+}
+
+// ingest writes data through the production path.
+func (e *benchEnc) ingest(data []byte) (msbucket.Body, *encryptingBlobWriter, error) {
+	enc := e.writer()
+	body, err := msbucket.SplitSizedBody(context.Background(), enc, bytes.NewReader(data), int64(len(data)), 0)
+	return body, enc, err
+}
+
+// discard aborts the uploads a benchmark iteration left parked, so iterations
+// do not accumulate what the provider holds.
+func (e *benchEnc) discard(enc *encryptingBlobWriter) {
+	for _, sb := range enc.streamed() {
+		_ = e.store.AbortBlob(context.Background(), e.space, sb.AddTask)
+	}
+	enc.lease.end()
+}
+
 func newBenchEnc(tb testing.TB) *benchEnc {
 	tb.Helper()
-	spool, err := blockstore.NewSpool(filepath.Join(tb.TempDir(), "spool"))
+	replay, err := blockstore.NewReplayBuffer(tb.TempDir(), 0, 0)
 	if err != nil {
 		tb.Fatal(err)
 	}
@@ -92,25 +123,13 @@ func newBenchEnc(tb testing.TB) *benchEnc {
 		tb.Fatal(err)
 	}
 	return &benchEnc{
-		spool:     spool,
+		store:     inmem.NewProvider(),
+		replay:    replay,
+		streams:   inmem.NewMemStore(),
 		keys:      keys,
 		space:     space,
 		recipient: fee.NewECDHESRecipient([]byte("bench-kid"), priv.PublicKey()),
 	}
-}
-
-// hashingDiscardWriter is Spool.WriteBlob without the file: the sha256 pass
-// over the envelope and nothing else.
-type hashingDiscardWriter struct{}
-
-func (hashingDiscardWriter) WriteBlob(_ context.Context, r io.Reader) (mh.Multihash, int64, error) {
-	h := sha256.New()
-	n, err := io.Copy(h, r)
-	if err != nil || n == 0 {
-		return nil, n, err
-	}
-	digest, err := mh.Encode(h.Sum(nil), mh.SHA2_256)
-	return digest, n, err
 }
 
 // sink is a writer with no ReaderFrom fast path; see the package comment.
@@ -118,25 +137,11 @@ type sink struct{}
 
 func (sink) Write(p []byte) (int, error) { return len(p), nil }
 
-// discardWriter drains the envelope and names it by a counter, so the
-// encrypting writer's map stays happy without any hash pass.
-type discardWriter struct{ n int }
-
-func (d *discardWriter) WriteBlob(_ context.Context, r io.Reader) (mh.Multihash, int64, error) {
-	n, err := io.Copy(sink{}, r)
-	if err != nil || n == 0 {
-		return nil, n, err
-	}
-	d.n++
-	sum := sha256.Sum256(fmt.Append(nil, d.n))
-	digest, err := mh.Encode(sum[:], mh.SHA2_256)
-	return digest, n, err
-}
-
-// BenchmarkIngest_Full is the production write path end to end: SplitBody's
-// body sha256 + async md5, EncryptWithCEK with the tenant recipient, the
-// spool's sha256 + temp file + rename, and the region-key wrap.
-func BenchmarkIngest_Full(b *testing.B) {
+// BenchmarkIngest_Streamed is the production write path end to end: the body
+// sha256 + async md5, EncryptWithCEK with the tenant recipient, the replay
+// buffer's sha256 + file, the send to the (in-memory) provider, and the
+// region-key wrap.
+func BenchmarkIngest_Streamed(b *testing.B) {
 	for _, size := range benchSizes {
 		b.Run(sizeName(size), func(b *testing.B) {
 			env := newBenchEnc(b)
@@ -144,61 +149,35 @@ func BenchmarkIngest_Full(b *testing.B) {
 			b.SetBytes(size)
 			b.ReportAllocs()
 			for b.Loop() {
-				enc := newEncryptingBlobWriter(env.spool, env.keys, env.space, []fee.Recipient{env.recipient})
-				body, err := msbucket.SplitBody(context.Background(), enc, bytes.NewReader(data), 0)
+				_, enc, err := env.ingest(data)
 				if err != nil {
 					b.Fatal(err)
 				}
-				// Deleting the blob is not part of ingest; keep it out of the
-				// measurement, and fail rather than let blobs pile up on disk.
 				b.StopTimer()
-				for _, ref := range body.Blobs {
-					if err := env.spool.Remove(ref.Digest); err != nil {
-						b.Fatal(err)
-					}
-				}
+				env.discard(enc)
 				b.StartTimer()
 			}
 		})
 	}
 }
 
-// BenchmarkIngest_NoDisk is the same path with the spool's file replaced by
-// nothing: the three hash passes, the FEE stream and the wrap remain.
-func BenchmarkIngest_NoDisk(b *testing.B) {
-	for _, size := range benchSizes {
-		b.Run(sizeName(size), func(b *testing.B) {
-			env := newBenchEnc(b)
-			data := benchData(size)
-			b.SetBytes(size)
-			b.ReportAllocs()
-			for b.Loop() {
-				enc := newEncryptingBlobWriter(hashingDiscardWriter{}, env.keys, env.space, []fee.Recipient{env.recipient})
-				if _, err := msbucket.SplitBody(context.Background(), enc, bytes.NewReader(data), 0); err != nil {
-					b.Fatal(err)
-				}
+// BenchmarkIngest_StreamedParallel is the aggregate: GOMAXPROCS bodies in
+// flight, which is what a loaded gateway pays.
+func BenchmarkIngest_StreamedParallel(b *testing.B) {
+	const size = 16 << 20
+	env := newBenchEnc(b)
+	data := benchData(size)
+	b.SetBytes(size)
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			_, enc, err := env.ingest(data)
+			if err != nil {
+				b.Fatal(err)
 			}
-		})
-	}
-}
-
-// BenchmarkIngest_NoSpoolHash drops the spool's sha256 too: SplitBody's body
-// hashes and the FEE stream only.
-func BenchmarkIngest_NoSpoolHash(b *testing.B) {
-	for _, size := range benchSizes {
-		b.Run(sizeName(size), func(b *testing.B) {
-			env := newBenchEnc(b)
-			data := benchData(size)
-			b.SetBytes(size)
-			b.ReportAllocs()
-			for b.Loop() {
-				enc := newEncryptingBlobWriter(&discardWriter{}, env.keys, env.space, []fee.Recipient{env.recipient})
-				if _, err := msbucket.SplitBody(context.Background(), enc, bytes.NewReader(data), 0); err != nil {
-					b.Fatal(err)
-				}
-			}
-		})
-	}
+			env.discard(enc)
+		}
+	})
 }
 
 // BenchmarkFEE_EncryptWithCEK is go-fee alone as ingot calls it: one
@@ -307,7 +286,7 @@ func BenchmarkSHA256(b *testing.B) {
 	}
 }
 
-// BenchmarkFileWrite is the spool's disk pass alone: the data written to a
+// BenchmarkFileWrite is the replay buffer's disk pass alone: the data written to a
 // temp file in sealed-chunk-sized pieces (256 KiB + tag, what the encrypt
 // reader's WriteTo hands the spool's MultiWriter), then renamed, as
 // Spool.WriteBlob does. Both ends are wrapped so neither bytes.Reader's
@@ -350,11 +329,18 @@ func BenchmarkFileWrite(b *testing.B) {
 // opener with its prefetched params, exactly as bodyOpener would build it.
 func benchStored(b *testing.B, env *benchEnc, data []byte) (msbucket.Body, *decryptingOpener) {
 	b.Helper()
-	enc := newEncryptingBlobWriter(env.spool, env.keys, env.space, []fee.Recipient{env.recipient})
-	body, err := msbucket.SplitBody(context.Background(), enc, bytes.NewReader(data), 0)
+	body, enc, err := env.ingest(data)
 	if err != nil {
 		b.Fatal(err)
 	}
+	// Accept what was sent, so the provider serves it back.
+	for _, ref := range body.Blobs {
+		sb := enc.streamed()[string(ref.Digest)]
+		if _, err := env.store.ConcludeBlobs(context.Background(), env.space, []uploader.UploadedBlob{sb.Parked(ref.Digest)}); err != nil {
+			b.Fatal(err)
+		}
+	}
+	enc.lease.end()
 	encMap := make(map[string]encBlob)
 	for _, ref := range body.Blobs {
 		params, err := enc.params(env.space, ref.Digest)
@@ -367,11 +353,11 @@ func benchStored(b *testing.B, env *benchEnc, data []byte) (msbucket.Body, *decr
 		}
 		encMap[string(ref.Digest)] = encBlob{params: params, storedSize: stored}
 	}
-	return body, &decryptingOpener{read: env.spool, keys: env.keys, enc: encMap}
+	return body, &decryptingOpener{read: env.store, keys: env.keys, enc: encMap}
 }
 
 // BenchmarkRead_Full is the production read path: OpenBody over the
-// decrypting opener (region-key unwrap, spool section, SpanReader), drained
+// decrypting opener (region-key unwrap, provider section, SpanReader), drained
 // with io.Copy's 32 KiB reads as the response writer does.
 func BenchmarkRead_Full(b *testing.B) {
 	for _, size := range benchSizes {
@@ -475,24 +461,6 @@ func BenchmarkRead_Range(b *testing.B) {
 }
 
 var _ = registry.BlobEncryptionParams{}
-
-// BenchmarkIngest_NoDiskParallel is the aggregate: GOMAXPROCS bodies in
-// flight through the no-disk path, which is what a loaded gateway pays.
-func BenchmarkIngest_NoDiskParallel(b *testing.B) {
-	const size = 16 << 20
-	env := newBenchEnc(b)
-	data := benchData(size)
-	b.SetBytes(size)
-	b.ReportAllocs()
-	b.RunParallel(func(pb *testing.PB) {
-		for pb.Next() {
-			enc := newEncryptingBlobWriter(hashingDiscardWriter{}, env.keys, env.space, []fee.Recipient{env.recipient})
-			if _, err := msbucket.SplitBody(context.Background(), enc, bytes.NewReader(data), 0); err != nil {
-				b.Fatal(err)
-			}
-		}
-	})
-}
 
 // BenchmarkFEE_EncryptWithCEKParallel is go-fee alone with GOMAXPROCS
 // streams in flight.

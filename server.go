@@ -52,23 +52,15 @@ type ServerDeps struct {
 	// Uploader is the destination for sealed catalog CAR segments.
 	Uploader uploader.Uploader
 
-	// BodyUploader makes each object-body blob durable on Forge by digest
-	// (allocate→PUT→accept), synchronously during a PUT. Remover releases a
-	// space's claim on a blob when its last reference is dropped. In tests both
-	// are no-ops and reads are served from the local spool.
-	BodyUploader uploader.BodyUploader
-	// Deferred extends BodyUploader for multipart's deferred accept:
-	// park at UploadPart (WithConclude(false)), conclude at Complete,
-	// abort at Abort.
-	Deferred uploader.DeferredBodyUploader
-	Remover  uploader.BlobRemover
-	// Streaming, when set, uploads each body blob while it is
-	// spooled, allocating it before its digest is known; Streams records
-	// each such upload until its park or acceptance is recorded, and is
-	// required with it. Without Streaming every blob is spooled first and
-	// uploaded by digest.
+	// Streaming uploads each object-body blob to Forge as it arrives,
+	// allocating it before its digest is known, then concludes it on PUT or
+	// parks it until Complete (multipart) or aborts it. Streams records each
+	// upload until its park or acceptance is recorded. Remover releases a
+	// space's claim on a blob when its last reference is dropped. All three
+	// are required.
 	Streaming uploader.StreamingBodyUploader
 	Streams   registry.StreamStore
+	Remover   uploader.BlobRemover
 
 	// Authority is the service that authorizes bucket creation and deletion.
 	Authority bucketauthority.BucketAuthority
@@ -209,8 +201,6 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		Reads:           bs,
 		Log:             log,
 		Spool:           spool,
-		Uploader:        deps.BodyUploader,
-		Deferred:        deps.Deferred,
 		Remover:         deps.Remover,
 		Streaming:       deps.Streaming,
 		Replay:          replay,
@@ -557,17 +547,14 @@ func validateServerInputs(cfg config.ServerConfig, deps ServerDeps) error {
 	if deps.Uploader == nil {
 		return errors.New("ingot: ServerDeps.Uploader is required")
 	}
-	if deps.BodyUploader == nil {
-		return errors.New("ingot: ServerDeps.BodyUploader is required")
+	if deps.Streaming == nil {
+		return errors.New("ingot: ServerDeps.Streaming is required")
 	}
-	if deps.Deferred == nil {
-		return errors.New("ingot: ServerDeps.Deferred is required")
+	if deps.Streams == nil {
+		return errors.New("ingot: ServerDeps.Streams is required")
 	}
 	if deps.Parks == nil {
 		return errors.New("ingot: ServerDeps.Parks is required")
-	}
-	if deps.Streaming != nil && deps.Streams == nil {
-		return errors.New("ingot: ServerDeps.Streams is required with Streaming")
 	}
 	if deps.EncParams == nil {
 		return errors.New("ingot: ServerDeps.EncParams is required")

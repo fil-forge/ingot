@@ -338,7 +338,7 @@ func TestObjectLock_CreationTimeStamping(t *testing.T) {
 	key, mode := "locked", types.ObjectLockModeGovernance
 	until := time.Now().Add(time.Hour).UTC().Truncate(time.Second)
 	_, err := b.PutObject(ctx, s3response.PutObjectInput{
-		Bucket: &bucket, Key: &key, Body: bytes.NewReader([]byte("x")),
+		Bucket: &bucket, Key: &key, Body: bytes.NewReader([]byte("x")), ContentLength: sizeOf([]byte("x")),
 		ObjectLockMode: mode, ObjectLockRetainUntilDate: &until,
 	})
 	if err == nil {
@@ -360,7 +360,7 @@ func TestObjectLock_CreationTimeStamping(t *testing.T) {
 	var zero time.Time
 	plainOnUnlocked := "plain-zero-date"
 	if _, err := b.PutObject(ctx, s3response.PutObjectInput{
-		Bucket: &bucket, Key: &plainOnUnlocked, Body: bytes.NewReader([]byte("x")),
+		Bucket: &bucket, Key: &plainOnUnlocked, Body: bytes.NewReader([]byte("x")), ContentLength: sizeOf([]byte("x")),
 		ObjectLockRetainUntilDate: &zero,
 	}); err != nil {
 		t.Fatalf("plain PUT with zero retain-until pointer: %v", err)
@@ -370,7 +370,7 @@ func TestObjectLock_CreationTimeStamping(t *testing.T) {
 
 	// PutObject stamps retention + hold in the same commit; Head echoes them.
 	out, err := b.PutObject(ctx, s3response.PutObjectInput{
-		Bucket: &bucket, Key: &key, Body: bytes.NewReader([]byte("x")),
+		Bucket: &bucket, Key: &key, Body: bytes.NewReader([]byte("x")), ContentLength: sizeOf([]byte("x")),
 		ObjectLockMode: mode, ObjectLockRetainUntilDate: &until,
 		ObjectLockLegalHoldStatus: types.ObjectLockLegalHoldStatusOn,
 	})

@@ -11,7 +11,6 @@ import (
 	"github.com/fil-forge/ingot/uploader"
 	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/versitygw/backend"
-	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
 )
 
@@ -19,23 +18,17 @@ import (
 // each conclude carried, so a test can tell one call carrying every blob from
 // a call per blob.
 type batchRecordingUploader struct {
-	inmem.NopUploader
+	*inmem.Provider
 	mu sync.Mutex
 	// calls holds the blob count of each ConcludeBlobs call, in order.
 	calls []int
-}
-
-func (u *batchRecordingUploader) UploadBlob(_ context.Context, _ did.DID, digest multihash.Multihash, size int64, _ string, _ ...uploader.UploadOption) (uploader.UploadedBlob, error) {
-	// No Location: the blob parks, which is what UploadPart does.
-	c := cidOfDigest(digest)
-	return uploader.UploadedBlob{Digest: digest, Size: size, AddTask: c, AcceptTask: c}, nil
 }
 
 func (u *batchRecordingUploader) ConcludeBlobs(ctx context.Context, space did.DID, parked []uploader.UploadedBlob) ([]*uploader.BlobLocation, error) {
 	u.mu.Lock()
 	u.calls = append(u.calls, len(parked))
 	u.mu.Unlock()
-	return u.NopUploader.ConcludeBlobs(ctx, space, parked)
+	return u.Provider.ConcludeBlobs(ctx, space, parked)
 }
 
 // TestCompleteConcludesPartsInOneCall is the batching gate on the completion
@@ -98,9 +91,7 @@ func TestCompleteConcludesPartsInOneCall(t *testing.T) {
 
 func newBatchRecordingBackend(t *testing.T) (*Backend, *inmem.MemStore, *batchRecordingUploader) {
 	t.Helper()
-	up := &batchRecordingUploader{}
+	up := &batchRecordingUploader{Provider: inmem.NewProvider()}
 	b, mem := newDeferredBackend(t, up)
 	return b, mem, up
 }
-
-func cidOfDigest(d multihash.Multihash) cid.Cid { return cid.NewCidV1(cid.Raw, d) }

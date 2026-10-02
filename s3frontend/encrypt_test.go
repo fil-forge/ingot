@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -20,6 +19,7 @@ import (
 	"github.com/fil-forge/versitygw/s3response"
 	"github.com/filecoin-project/go-fee"
 	"github.com/filecoin-project/go-fee/cose"
+	"github.com/multiformats/go-multihash"
 
 	"github.com/fil-forge/ingot/tenantkey"
 )
@@ -32,6 +32,29 @@ import (
 
 // testBody is deliberately recognizable: any 32-byte window of it appearing
 // in a stored blob would prove plaintext leaked to storage.
+// sizeOf is the declared length of a body held in memory, which the backend
+// requires of every write.
+func sizeOf(b []byte) *int64 {
+	n := int64(len(b))
+	return &n
+}
+
+// storedBlob returns the bytes the provider holds for a blob, read as the
+// network tier reads them.
+func storedBlob(t *testing.T, b *Backend, digest multihash.Multihash) []byte {
+	t.Helper()
+	rc, err := b.read.OpenBlob(context.Background(), did.Undef, digest)
+	if err != nil {
+		t.Fatalf("open stored blob %x: %v", digest, err)
+	}
+	defer rc.Close()
+	data, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("read stored blob %x: %v", digest, err)
+	}
+	return data
+}
+
 func testBody(n int) []byte {
 	const pangram = "The quick brown fox jumps over the lazy dog. "
 	data := make([]byte, n)
@@ -107,10 +130,7 @@ func TestEncryptedWrite_Opacity(t *testing.T) {
 	if bytes.Equal(d, digestOf(t, data)) {
 		t.Fatalf("stored digest equals hash(plaintext); blob was not encrypted")
 	}
-	stored, err := os.ReadFile(b.spool.Path(d))
-	if err != nil {
-		t.Fatalf("read spooled blob: %v", err)
-	}
+	stored := storedBlob(t, b, d)
 	if len(stored) <= len(data) {
 		t.Fatalf("stored %d bytes for %d plaintext; an envelope must be larger", len(stored), len(data))
 	}
@@ -227,10 +247,7 @@ func recipientOf(t *testing.T, stored []byte) *cose.Recipient {
 // recoverability criterion: no region, no database).
 func assertTenantRecipient(t *testing.T, b *Backend, digest []byte, plaintext []byte) {
 	t.Helper()
-	stored, err := os.ReadFile(b.spool.Path(digest))
-	if err != nil {
-		t.Fatalf("read spooled blob: %v", err)
-	}
+	stored := storedBlob(t, b, digest)
 	kid := tenantkey.EncodePublicKey(testWrapKey.PublicKey())
 	rec := recipientOf(t, stored)
 	if got, ok := rec.Headers.Unprotected.Bytes(cose.HeaderLabelKID); !ok || string(got) != kid {
@@ -317,19 +334,12 @@ func TestEncryptedWrite_FailsClosedWithoutRecipient(t *testing.T) {
 
 	bucket, key := "bk", "k1"
 	if _, err := b.PutObject(context.Background(), s3response.PutObjectInput{
-		Bucket: &bucket, Key: &key, Body: bytes.NewReader(data),
+		Bucket: &bucket, Key: &key, Body: bytes.NewReader(data), ContentLength: sizeOf(data),
 	}); !errors.Is(err, tenantkey.ErrNoTenant) {
 		t.Fatalf("PutObject err = %v, want ErrNoTenant", err)
 	}
 	if _, _, err := getObjV(t, b, key, ""); err == nil {
 		t.Fatalf("object exists after a refused write")
-	}
-	entries, err := os.ReadDir(b.spool.Path(nil)) // Path of the empty digest is the spool dir itself
-	if err != nil {
-		t.Fatalf("read spool dir: %v", err)
-	}
-	if len(entries) != 0 {
-		t.Fatalf("spool holds %d files after a refused write, want 0", len(entries))
 	}
 
 	uploadID := mpCreate(t, b, "mp", "", "")

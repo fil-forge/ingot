@@ -110,9 +110,9 @@ Internal:
   `locallocator.go` (the read tier's `Locator`). One `*Postgres` satisfies
   all of them.
 - **`uploader/`** — `forge.go`/`blob.go`: `Forge` behind `Uploader`
-  (`SubmitShard`), `BodyUploader`/`DeferredBodyUploader` (`UploadBlob`,
-  `ConcludeBlobs`, `AbortBlob`), `StreamingBodyUploader` (`StartBlob`,
-  `PutBlob`: allocate by digest code, send while spooling), and
+  (`SubmitShard`), `StreamingBodyUploader` (`StartBlob`, `PutBlob`: allocate by
+  digest code, send as the body arrives; it includes
+  `DeferredBodyUploader`'s `ConcludeBlobs`/`AbortBlob`), and
   `BlobRemover`; captures the per-space
   ship authority (`shipProofs`, 1h TTL) from in-request writes.
 - **`bucketauthority/`** — hilt bucket ops: forwards CreateBucket /
@@ -125,7 +125,7 @@ Internal:
   access-key TTL caches of hilt-issued delegations that the uploader and the
   network read tier consume via `internal/reqscope`.
 - **`forgeclient/`** — carried-from-guppy sprue edge client: `/blob/add`
-  (with a deferrable conclude, or by digest code for a streamed blob), `/ucan/conclude`, `/blob/abort`,
+  (by digest code, for a streamed blob), `/ucan/conclude`, `/blob/abort`,
   `/blob/remove`, `/index/add`, receipt polling. The `/access` login and
   `/provider/add` flows are dormant (no CLI drives them).
 - **`revocation/`** — the Swarf firehose consumer (optional,
@@ -169,13 +169,14 @@ Internal:
 | `blockstore.BlockReader` | `blockstore.Forge` (in `Cached`) | `inmem.NopBaseReader` |
 | `registry.Registry` + the store seams + `logstore.Meta` | `*registry.Postgres` (all of them) | `inmem.MemStore` |
 | `locator.Locator` | `registry.LocalLocator` | (indexer-backed locator exists, unwired) |
-| `uploader.{Uploader,BodyUploader,DeferredBodyUploader,BlobRemover}` | `uploader.Forge` | `inmem.NopUploader` |
+| `uploader.{Uploader,StreamingBodyUploader,BlobRemover}` | `uploader.Forge` | `inmem.Provider` (`inmem.NopUploader` for the catalog uploader alone) |
 
 ## fx module
 
 - **`ServerModule`** (composable core) — consumes `ServerConfig`,
   `*zap.Logger`, and the collaborator seams (`blockstore.BlockReader`; the
-  four `uploader` seams; `bucketauthority.BucketAuthority`;
+  three `uploader` seams (catalog `Uploader`, `StreamingBodyUploader`,
+  `BlobRemover`) and `registry.StreamStore`; `bucketauthority.BucketAuthority`;
   `registry.Registry` plus the intent/location/inclusion/blob-ref/GC/
   multipart/park stores; `logstore.Meta`; `auth.IAMService`) +
   a `PreStartHook` group; runs pre-start → `New` → `Start` on the fx
