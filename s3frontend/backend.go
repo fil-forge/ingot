@@ -60,8 +60,6 @@ type Backend struct {
 	txns      *bucketop.Coordinator
 	log       blockstore.Log
 	spool     *blockstore.Spool
-	uploader  uploader.BodyUploader
-	deferred  uploader.DeferredBodyUploader
 	parks     registry.ParkStore
 	remover   uploader.BlobRemover
 	encParams registry.EncryptionParamsStore
@@ -118,28 +116,20 @@ type Deps struct {
 	// and they are served back from here on GET (read-after-write / cache).
 	Spool *blockstore.Spool
 
-	// Uploader makes each spooled body blob durable on Forge (allocate→PUT→
-	// accept) synchronously, before the manifest commits. Remover releases a
-	// space's claim on a blob when its last reference is dropped.
-	Uploader uploader.BodyUploader
-	// Deferred extends Uploader for multipart's deferred accept
-	// (WithConclude(false), then ConcludeBlobs/AbortBlob); Parks persists
-	// park state between UploadPart and Complete/Abort.
-	Deferred uploader.DeferredBodyUploader
-	Parks    registry.ParkStore
-	Remover  uploader.BlobRemover
-
-	// Streaming uploads each body blob as it arrives,
-	// allocating it by size and hash function before its digest is known;
-	// Streams records each such upload until its park or acceptance is recorded.
-	// Without Streaming every blob is spooled first and uploaded by digest.
-	// Streams is required with it.
+	// Streaming uploads each body blob to Forge as it arrives, allocating it
+	// by size and hash function before its digest is known, and concludes
+	// (accepts) or aborts it afterwards; multipart parks it between UploadPart
+	// and Complete/Abort. Streams records each upload until its park or
+	// acceptance is recorded, and Parks persists the park state. Remover
+	// releases a space's claim on a blob when its last reference is dropped.
+	// Streaming and Streams are required.
 	Streaming uploader.StreamingBodyUploader
+	Streams   registry.StreamStore
+	Parks     registry.ParkStore
+	Remover   uploader.BlobRemover
 	// Replay holds the copy of each streamed blob kept for resending it if
-	// its send fails. Nil gets an unbounded buffer under the system temp dir
-	// when Streaming is set.
-	Replay  *blockstore.ReplayBuffer
-	Streams registry.StreamStore
+	// its send fails. Nil gets an unbounded buffer under the system temp dir.
+	Replay *blockstore.ReplayBuffer
 
 	// EncParams is the per-blob FEE encryption-parameter table: what the
 	// decrypting read path needs to serve an encrypted blob. RegionKeys
@@ -197,7 +187,7 @@ func New(d Deps) *Backend {
 		}
 	}
 	replay := d.Replay
-	if replay == nil && d.Streaming != nil {
+	if replay == nil {
 		var err error
 		if replay, err = blockstore.NewReplayBuffer("", 0, 0); err != nil {
 			// An unbounded buffer in the system temp dir has no setup to fail.
@@ -216,8 +206,6 @@ func New(d Deps) *Backend {
 		txns:            bucketop.NewCoordinator(bucketop.Deps{Reg: d.Registry, Log: d.Log, Reads: d.Reads}),
 		log:             d.Log,
 		spool:           d.Spool,
-		uploader:        d.Uploader,
-		deferred:        d.Deferred,
 		parks:           d.Parks,
 		remover:         d.Remover,
 		streaming:       d.Streaming,

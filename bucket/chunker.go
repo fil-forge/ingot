@@ -60,7 +60,7 @@ func WithoutMD5() SplitOption { return func(c *splitConfig) { c.md5 = false } }
 // body yields a Body with no blobs (and the well-known empty digests).
 //
 // w is the local spool in production (blockstore.Spool): the blobs land on disk
-// before being uploaded to Forge by digest. SplitBody itself is storage-agnostic.
+// before being stored. SplitBody itself is storage-agnostic.
 func SplitBody(ctx context.Context, w blockstore.BlobWriter, r io.Reader, maxBlobSize int64, opts ...SplitOption) (Body, error) {
 	max := maxBlobSize
 	if max <= 0 {

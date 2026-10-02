@@ -409,19 +409,12 @@ func (NopBaseReader) OpenBlob(_ context.Context, _ did.DID, _ multihash.Multihas
 
 // NopUploader is a no-op upload sink for the in-memory suite and standalone
 // mode. SubmitShard ships nothing (a catalog plane is marked shipped without
-// touching the network); UploadBlob accepts a body blob without touching the
-// network, so the spool's local copy serves all reads.
+// touching the network); ConcludeBlobs accepts parked blobs without touching
+// it. It takes no body bytes: see Provider for a sink that does.
 type NopUploader struct{}
 
 func (NopUploader) SubmitShard(_ context.Context, _ blockstore.Plane, _ did.DID, _ uploader.CARShard) (uploader.BlobLocation, multihash.Multihash, error) {
 	return uploader.BlobLocation{}, nil, nil
-}
-
-// UploadBlob accepts immediately, even with WithConclude(false) — there is
-// no network to park on, so the deferred flow degenerates to the synchronous
-// one and reads keep coming from the spool.
-func (NopUploader) UploadBlob(_ context.Context, _ did.DID, digest multihash.Multihash, size int64, _ string, _ ...uploader.UploadOption) (uploader.UploadedBlob, error) {
-	return uploader.UploadedBlob{Digest: digest, Size: size, Location: &uploader.BlobLocation{Size: size}}, nil
 }
 
 func (NopUploader) RemoveBlob(_ context.Context, _ did.DID, _ multihash.Multihash) error { return nil }
@@ -446,7 +439,6 @@ var (
 	_ blockstore.BlockReader          = NopBaseReader{}
 	_ blockstore.BlobReader           = NopBaseReader{}
 	_ uploader.Uploader               = NopUploader{}
-	_ uploader.BodyUploader           = NopUploader{}
 	_ uploader.DeferredBodyUploader   = NopUploader{}
 	_ uploader.BlobRemover            = NopUploader{}
 )

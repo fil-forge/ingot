@@ -40,7 +40,7 @@ func TestPutObject_ReusesContentMD5ForETag(t *testing.T) {
 	want := `"` + hex.EncodeToString(sum[:]) + `"`
 
 	out, err := b.PutObject(ctxWithContentMD5(data), s3response.PutObjectInput{
-		Bucket: &bucket, Key: &key, Body: bytes.NewReader(data),
+		Bucket: &bucket, Key: &key, Body: bytes.NewReader(data), ContentLength: sizeOf(data),
 	})
 	if err != nil {
 		t.Fatalf("PutObject with Content-MD5: %v", err)
@@ -50,7 +50,7 @@ func TestPutObject_ReusesContentMD5ForETag(t *testing.T) {
 	}
 
 	out2, err := b.PutObject(context.Background(), s3response.PutObjectInput{
-		Bucket: &bucket, Key: &key2, Body: bytes.NewReader(data),
+		Bucket: &bucket, Key: &key2, Body: bytes.NewReader(data), ContentLength: sizeOf(data),
 	})
 	if err != nil {
 		t.Fatalf("PutObject computed: %v", err)
@@ -79,7 +79,7 @@ func TestUploadPart_ReusesContentMD5ForETag(t *testing.T) {
 	one := int32(1)
 	out, err := b.UploadPart(ctxWithContentMD5(part), &awss3.UploadPartInput{
 		Bucket: &bucket, Key: &key, UploadId: &uploadID, PartNumber: &one,
-		Body: bytes.NewReader(part),
+		Body: bytes.NewReader(part), ContentLength: sizeOf(part),
 	})
 	if err != nil {
 		t.Fatalf("UploadPart with Content-MD5: %v", err)
@@ -121,7 +121,7 @@ func TestPutObject_MD5ChecksumSpecSuppliesETag(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			key := "obj-" + name
-			in := s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(data)}
+			in := s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(data), ContentLength: sizeOf(data)}
 			mod(&in)
 			out, err := b.PutObject(context.Background(), in)
 			if err != nil {
@@ -213,7 +213,7 @@ func TestUploadPartCopy_ExplicitFullRangeIsWholeObject(t *testing.T) {
 func TestPutObject_ZeroByteETag(t *testing.T) {
 	b, _, _ := newRefTestBackend(t)
 	bucket, key := "bk", "empty"
-	out, err := b.PutObject(context.Background(), s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(nil)})
+	out, err := b.PutObject(context.Background(), s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(nil), ContentLength: sizeOf(nil)})
 	if err != nil {
 		t.Fatalf("PutObject: %v", err)
 	}

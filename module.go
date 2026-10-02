@@ -148,17 +148,13 @@ var ServerModule = fx.Module("ingot-server",
 type serverParams struct {
 	fx.In
 
-	Config       config.ServerConfig
-	Logger       *zap.Logger
-	Reader       blockstore.BlockReader
-	Uploader     uploader.Uploader
-	BodyUploader uploader.BodyUploader
-	Deferred     uploader.DeferredBodyUploader
-	Remover      uploader.BlobRemover
-	// Streaming and Streams are optional: without them every body blob is
-	// spooled before it is uploaded (see ServerDeps.Streaming).
-	Streaming       uploader.StreamingBodyUploader `optional:"true"`
-	Streams         registry.StreamStore           `optional:"true"`
+	Config          config.ServerConfig
+	Logger          *zap.Logger
+	Reader          blockstore.BlockReader
+	Uploader        uploader.Uploader
+	Remover         uploader.BlobRemover
+	Streaming       uploader.StreamingBodyUploader
+	Streams         registry.StreamStore
 	BucketAuthority bucketauthority.BucketAuthority
 	Registry        registry.Registry
 	Intents         registry.IntentStore
@@ -214,8 +210,6 @@ func registerServerLifecycle(lc fx.Lifecycle, p serverParams) {
 				Logger:          logger,
 				BaseBlockReader: p.Reader,
 				Uploader:        p.Uploader,
-				BodyUploader:    p.BodyUploader,
-				Deferred:        p.Deferred,
 				Remover:         p.Remover,
 				Streaming:       p.Streaming,
 				Streams:         p.Streams,
@@ -554,26 +548,24 @@ func provideForgeReader(cfg config.Config, id identity.Identity, locations regis
 	return blockstore.NewCached(forge, config.ResolveReadCacheBytes(cfg.ReadCacheBytes)), nil
 }
 
-// uploaderResult exposes the one *uploader.Forge under both upload seams:
-// Uploader (catalog CAR segments) and BodyUploader (per-blob body uploads).
+// uploaderResult exposes the one *uploader.Forge under its upload seams:
+// Uploader (catalog CAR segments) and Streaming (per-blob body uploads).
 type uploaderResult struct {
 	fx.Out
 
-	Uploader     uploader.Uploader
-	BodyUploader uploader.BodyUploader
-	Deferred     uploader.DeferredBodyUploader
-	Streaming    uploader.StreamingBodyUploader
-	Remover      uploader.BlobRemover
+	Uploader  uploader.Uploader
+	Streaming uploader.StreamingBodyUploader
+	Remover   uploader.BlobRemover
 }
 
 // provideUploader builds the guppy-style edge client that ships to Forge via
 // the upload service (/blob/add → /ucan/conclude → /blob/accept → /index/add).
 // The same client both ships sealed catalog shards (Uploader) and uploads
-// individual body blobs by digest (BodyUploader).
+// individual body blobs as they arrive (Streaming).
 func provideUploader(c *forgeclient.Client, logger *zap.Logger) (uploaderResult, error) {
 	f, err := uploader.NewForge(uploader.ForgeConfig{Client: c, PutClient: tracing.NewHTTPClient(), Logger: logger})
 	if err != nil {
 		return uploaderResult{}, err
 	}
-	return uploaderResult{Uploader: f, BodyUploader: f, Deferred: f, Streaming: f, Remover: f}, nil
+	return uploaderResult{Uploader: f, Streaming: f, Remover: f}, nil
 }

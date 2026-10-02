@@ -260,7 +260,7 @@ sequenceDiagram
     participant TX as bucketop.Tx
     participant L as logstore.Manager
 
-    Note over C,L: off the lock: ingest, hash, encrypt, upload (an upload service that cannot<br/>add by digest code gets every blob spooled first, then uploaded by digest)
+    Note over C,L: off the lock: ingest, hash, encrypt, send to the provider as the body arrives
     C->>B: PutObject(bucket, key, body)
     B->>R: reg.Get(bucket), precondition pre-check
     B->>B: tenant recipient: resolve the tenant's #wrap key<br/>(tenant DID from the request, did:plc doc via the cached PLC resolver);<br/>no recipient → the write fails
@@ -274,7 +274,7 @@ sequenceDiagram
         and
             B->>P: HTTP PUT the same envelope bytes as they arrive
         end
-        Note over B,P: a failed PUT detaches: the copy finishes, the allocation is<br/>aborted and the blob is sent again from the copy under a new allocation<br/>(up to 3 sends); UnsupportedDigestCode<br/>switches the rest of the body to spool-first
+        Note over B,P: a failed PUT detaches: the copy finishes, the allocation is<br/>aborted and the blob is sent again from the copy under a new allocation<br/>(up to 3 sends); an upload service that cannot<br/>add by digest code fails the write
     end
     B->>R: PutIntent(digest, stored size, uploading) +<br/>PutEncryptionParams(region-wrapped CEK, FEE geometry) per blob
     loop each streamed blob (uploadBlobs → concludeStreamed)
@@ -282,19 +282,7 @@ sequenceDiagram
         U-->>B: accept receipt + /assert/location commitment
         B->>R: SetIntentState(accepted) + PutLocation, DeleteStream
     end
-    loop each spooled-first blob (uploadBlobs)
-        alt blob_locations already has (space, digest)
-            B->>R: SetIntentState(accepted), skip upload<br/>(never hits for fresh writes — every envelope digest is new)
-        else upload
-            B->>U: /blob/add (digest, size)
-            U-->>B: allocation address (none on provider-side dedup)
-            B->>P: HTTP PUT bytes
-            B->>U: /ucan/conclude the put receipt, then poll /blob/accept receipt
-            U-->>B: /assert/location commitment
-            B->>R: SetIntentState(accepted) + PutLocation
-        end
-    end
-    Note over B,U: UploadBlob also captures the request proof store as the<br/>space's ship authority (captureShipProofs, 1h TTL)
+    Note over B,U: StartBlob also captures the request proof store as the<br/>space's ship authority (captureShipProofs, 1h TTL)
     Note over B,L: under the per-bucket lock: commitVersion via Coordinator.WithTx
     B->>TX: Begin (lock, snapshot root)
     TX->>R: AllocVersionSeq
@@ -457,20 +445,10 @@ sequenceDiagram
     opt UploadPartCopy
         B->>B: vet the source: copySourceBucket (tenant), resolveVersionIn,<br/>range within the object, copy-source preconditions (412);<br/>the body is the source's plaintext range through the decrypting reader
     end
-    B->>B: ingestPart: splitSpool<br/>(resolve the tenant recipient, then encrypt per piece:<br/>fresh CEK → FEE envelope → spool under the ciphertext<br/>digest + params row, as in the PutObject diagram)
+    B->>B: ingestPart: splitSpool<br/>(resolve the tenant recipient, then encrypt per piece:<br/>fresh CEK → FEE envelope → sent to the provider under the<br/>ciphertext digest + params row, as in the PutObject diagram)
     B->>R: PutPart(parked): open sessions only, the row held FOR SHARE<br/>against a concurrent latch; a refused part records its blobs' releases
     loop each part blob (parkBlobs)
-        alt streamed while spooled
-            B->>R: PutPark(AddTask, AcceptTask, PutInvocation), intent parked,<br/>DeleteStream: the PUT already went to piri in splitSpool
-        else blob_locations already has the digest
-            B->>R: intent accepted (dedup, no park)
-        else already parked (GetPark hit)
-            B->>R: reuse the park
-        else park
-            B->>U: /blob/add with WithConclude(false)
-            B->>P: HTTP PUT bytes
-            B->>R: PutPark(AddTask, AcceptTask, PutInvocation), intent parked
-        end
+        B->>R: PutPark(AddTask, AcceptTask, PutInvocation), intent parked,<br/>DeleteStream: the PUT already went to piri in splitSpool
     end
     B-->>C: part ETag (part md5; for a copy, of the copied bytes)
     C->>B: CompleteMultipartUpload(parts)
@@ -501,9 +479,10 @@ sequenceDiagram
   so the reap of a retained session releases only what was never committed.
 - A part is written only while its session is open, in the statement that
   checks the state; a teardown that took the session refuses it, and the
-  upload records releases for the blobs it had spooled.
-- A never-parked blob at Complete falls back to a full synchronous
-  `UploadBlob`.
+  upload records releases for the blobs it had sent.
+- A blob with neither a location nor a park at Complete fails it: its bytes
+  are on the provider only as a parked upload, and there is no local copy to
+  send again.
 
 Cross-references: [`architecture.md` §7.2](./architecture.md#72-multipart),
 [§7.3](./architecture.md#73-the-session-latch-the-abortcomplete-race).

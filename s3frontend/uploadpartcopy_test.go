@@ -144,7 +144,7 @@ func TestUploadPartCopy_Errors(t *testing.T) {
 		t.Fatal(err)
 	}
 	fb, fk := "foreign", "obj"
-	if _, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &fb, Key: &fk, Body: bytes.NewReader([]byte("theirs"))}); err != nil {
+	if _, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &fb, Key: &fk, Body: bytes.NewReader([]byte("theirs")), ContentLength: sizeOf([]byte("theirs"))}); err != nil {
 		t.Fatal(err)
 	}
 	id := mpCreate(t, b, "dst", "", "")
@@ -164,7 +164,7 @@ func TestUploadPartCopy_Errors(t *testing.T) {
 		t.Fatalf("mismatched bucket on copy: %v", err)
 	}
 	other, one := "other-bucket", int32(1)
-	if _, err := b.UploadPart(ctx, &s3.UploadPartInput{Bucket: &other, Key: strPtr("dst"), UploadId: &id, PartNumber: &one, Body: bytes.NewReader([]byte("x"))}); apiErrCode(t, err) != "NoSuchUpload" {
+	if _, err := b.UploadPart(ctx, &s3.UploadPartInput{Bucket: &other, Key: strPtr("dst"), UploadId: &id, PartNumber: &one, Body: bytes.NewReader([]byte("x")), ContentLength: sizeOf([]byte("x"))}); apiErrCode(t, err) != "NoSuchUpload" {
 		t.Fatalf("mismatched bucket on upload: %v", err)
 	}
 
@@ -241,7 +241,7 @@ func TestUploadPartCopy_Checksums(t *testing.T) {
 	ctx := context.Background()
 	data := bytes.Repeat([]byte("checksum me "), 25)
 	bucket, key := "bk", "src"
-	if _, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(data), ChecksumAlgorithm: types.ChecksumAlgorithmSha1}); err != nil {
+	if _, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(data), ContentLength: sizeOf(data), ChecksumAlgorithm: types.ChecksumAlgorithmSha1}); err != nil {
 		t.Fatal(err)
 	}
 

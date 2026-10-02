@@ -8,9 +8,9 @@ import (
 )
 
 // TestReadsNeedOnlyTheProvider pins that a GET depends on what the provider
-// holds and not on the local copy left behind by the write: with every spooled
-// file gone, whole and ranged reads of a multi-blob object, across blob and
-// chunk boundaries, still return the object.
+// holds: the write leaves no local copy, and whole and ranged reads of a
+// multi-blob object, across blob and chunk boundaries, still return the
+// object.
 func TestReadsNeedOnlyTheProvider(t *testing.T) {
 	const blobCeiling = 300 << 10
 	b, _, _ := newRefTestBackend(t, blobCeiling)
@@ -21,7 +21,8 @@ func TestReadsNeedOnlyTheProvider(t *testing.T) {
 	require.Len(t, digests, 3)
 
 	for _, d := range digests {
-		require.NoError(t, os.Remove(b.spool.Path(d)), "the write left a local copy to remove")
+		_, err := os.Stat(b.spool.Path(d))
+		require.ErrorIs(t, err, os.ErrNotExist, "the write left a local copy")
 	}
 
 	_, got, err := getObjV(t, b, "k1", "")
