@@ -436,4 +436,27 @@ func TestStreamedPutObjectConcludeErrorRecordsAcceptance(t *testing.T) {
 	require.Empty(t, staleStreams(t, mem), "the accepted blob's row is dropped")
 }
 
+// failingStreams refuses every stream row, as an unavailable registry would.
+type failingStreams struct{ *inmem.MemStore }
+
+func (failingStreams) PutStream(context.Context, registry.BlobStream) error {
+	return errors.New("registry unavailable")
+}
+
+// An allocation whose stream row cannot be recorded is aborted at once:
+// without the row, the sweeper would never find it.
+func TestStreamedPutObjectUnrecordedStreamIsAborted(t *testing.T) {
+	su := newStreamingUploader()
+	b, _ := newDeferredBackend(t, su, func(d *Deps) {
+		d.Streaming = su
+		d.Streams = failingStreams{d.Parks.(*inmem.MemStore)}
+		d.MaxBlobSize = streamBlobCeiling
+	})
+	data := testBody(100 << 10)
+
+	require.Error(t, putSized(t, b, "k", data, int64(len(data))))
+	require.Len(t, su.started, 1)
+	require.Equal(t, []cid.Cid{su.started[0].AddTask}, su.aborted, "the allocation is aborted")
+}
+
 func ptrInt32(v int32) *int32 { return &v }

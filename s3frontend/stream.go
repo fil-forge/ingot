@@ -88,6 +88,11 @@ func (w *encryptingBlobWriter) WriteSizedBlob(ctx context.Context, r io.Reader, 
 		Bucket:  w.bucket,
 		Size:    stored,
 	}); err != nil {
+		// Without its row nothing would abort the allocation; abort it here.
+		// One that fails too is reaped when the provider expires it.
+		if aerr := w.stream.AbortBlob(ctx, w.space, sb.AddTask); aerr != nil {
+			w.logger.Warn("aborting untracked stream failed; the provider expires it", zap.Stringer("add", sb.AddTask), zap.Error(aerr))
+		}
 		return nil, fmt.Errorf("s3frontend: record stream: %w", err)
 	}
 	w.lease.add(sb.AddTask.Bytes())

@@ -306,7 +306,9 @@ sequenceDiagram
 
 - A request that dies after allocating a streamed blob leaves its
   `blob_streams` row; the stream sweeper (on the release sweeper's tick)
-  aborts such an upload by its add task once the row is 30 minutes old, and
+  aborts such an upload by its add task once the row's lease (`touched_at`,
+  renewed every 10 minutes by the request that owns it) has gone 30 minutes
+  unrenewed, unless its blob was parked, and
   drops the row once the abort lands or the provider reports the blob
   accepted.
 - Encryption makes the stored digest a ciphertext digest: **content dedup is
@@ -901,7 +903,8 @@ erDiagram
         text space
         text bucket
         bigint size
-        timestamptz created_at "the stream sweeper's clock"
+        timestamptz created_at "when the sweeper stops retrying the abort"
+        timestamptz touched_at "the owning request's lease, renewed while it runs; the stream sweeper's clock"
     }
     multipart_sessions {
         text upload_id PK
