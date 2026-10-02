@@ -33,7 +33,7 @@ import (
 // It records every allocation, the bytes each PUT received, and what was
 // concluded, uploaded by digest and aborted.
 type streamingUploader struct {
-	inmem.NopUploader
+	*inmem.Provider
 
 	// unsupported refuses every allocation by digest code.
 	unsupported bool
@@ -56,7 +56,7 @@ type streamingUploader struct {
 }
 
 func newStreamingUploader() *streamingUploader {
-	return &streamingUploader{failPuts: -1, puts: map[cid.Cid][]byte{}, putErrs: map[cid.Cid]error{}}
+	return &streamingUploader{Provider: inmem.NewProvider(), failPuts: -1, puts: map[cid.Cid][]byte{}, putErrs: map[cid.Cid]error{}}
 }
 
 func (s *streamingUploader) StartBlob(_ context.Context, _ did.DID, size int64) (uploader.StreamedBlob, error) {
@@ -97,10 +97,21 @@ func (s *streamingUploader) ConcludeBlobs(ctx context.Context, space did.DID, pa
 	s.concluded = append(s.concluded, parked...)
 	concludeErr := s.concludeErr
 	s.mu.Unlock()
-	locations, err := s.NopUploader.ConcludeBlobs(ctx, space, parked)
+	locations, err := s.Provider.ConcludeBlobs(ctx, space, parked)
 	if err != nil {
 		return locations, err
 	}
+	// The provider keeps what the PUT received once the blob is accepted.
+	s.mu.Lock()
+	for _, p := range parked {
+		if data, ok := s.puts[p.AddTask]; ok && s.putErrs[p.AddTask] == nil {
+			if err := s.Provider.Put(p.Digest, data); err != nil {
+				s.mu.Unlock()
+				return locations, err
+			}
+		}
+	}
+	s.mu.Unlock()
 	return locations, concludeErr
 }
 
@@ -108,7 +119,7 @@ func (s *streamingUploader) UploadBlob(ctx context.Context, space did.DID, diges
 	s.mu.Lock()
 	s.uploaded = append(s.uploaded, digest)
 	s.mu.Unlock()
-	return s.NopUploader.UploadBlob(ctx, space, digest, size, path, opts...)
+	return s.Provider.UploadBlob(ctx, space, digest, size, path, opts...)
 }
 
 func (s *streamingUploader) AbortBlob(_ context.Context, _ did.DID, cause cid.Cid) error {

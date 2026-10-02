@@ -272,7 +272,7 @@ func TestCopyObject_PinnedSourceReleasedBeforeCommitIsNoSuchKey(t *testing.T) {
 	rm := &recordingRemover{}
 	reg := &hookAllocSeq{bucket: "dst"}
 	var b *Backend
-	b, mem := newDeferredBackend(t, inmem.NopUploader{}, func(d *Deps) {
+	b, mem := newDeferredBackend(t, inmem.NewProvider(), func(d *Deps) {
 		reg.Registry = d.Registry
 		d.Registry = reg
 		d.Remover = rm
