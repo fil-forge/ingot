@@ -166,7 +166,7 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 		contentType = "application/octet-stream"
 	}
 
-	// Bucket must exist before we spool + upload, so a PUT to a missing bucket
+	// Bucket must exist before we send anything, so a PUT to a missing bucket
 	// doesn't waste an upload. WithTx re-checks under the per-bucket lock.
 	bucketState, err := b.reg.Get(ctx, bucketName)
 	if err != nil {
@@ -308,7 +308,7 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 }
 
 // ingestBody streams an object body off-lock: it coarse-splits into blobs,
-// sends each to its provider as it arrives (splitSpool), records an
+// sends each to its provider as it arrives (sendBlobs), records an
 // upload_intents row per blob, and concludes each upload, advancing the intent
 // to accepted. It returns the Body the manifest will pin. A zero-byte body
 // yields a Body with no blobs and uploads nothing. A non-nil md5Src is where the
@@ -319,9 +319,9 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 // crash recovery to reconcile (a later phase); no manifest is written, so no
 // catalog entry ever references a non-durable blob.
 //
-// size is the body's declared length (see splitSpool).
+// size is the body's declared length (see sendBlobs).
 func (b *Backend) ingestBody(ctx context.Context, bucket *registry.State, r io.Reader, size int64, md5Src bodyMD5Source) (msbucket.Body, error) {
-	body, err := b.splitSpool(ctx, bucket.Name, bucket.Space, r, size, md5Src)
+	body, err := b.sendBlobs(ctx, bucket.Name, bucket.Space, r, size, md5Src)
 	if err != nil {
 		return msbucket.Body{}, err
 	}
@@ -332,10 +332,10 @@ func (b *Backend) ingestBody(ctx context.Context, bucket *registry.State, r io.R
 	return body.Body, nil
 }
 
-// spooledBody is a body split and spooled, with the blobs that already went to
-// their providers on the way, keyed by string(digest). Those are parked there
-// and need only their conclude.
-type spooledBody struct {
+// sentBody is a body split and sent, with the blobs that went to their
+// providers on the way, keyed by string(digest). Those are parked there and
+// need only their conclude.
+type sentBody struct {
 	msbucket.Body
 	streamed map[string]uploader.StreamedBlob
 	// lease renews the streamed blobs' rows until the caller has recorded
@@ -354,40 +354,38 @@ func declaredLength(n *int64) int64 {
 	return *n
 }
 
-// splitSpool coarse-splits a body into blobs, encrypts each into a FEE
-// envelope (recipient: the tenant's wrap key) written to the local spool
-// under its ciphertext digest, and records a spooled upload_intents row plus
-// a blob_encryption_params row per blob — WITHOUT uploading. It is the
-// shared first half of ingest: a single-shot PUT follows it with uploadBlobs
-// immediately; a multipart UploadPart spools here and defers the upload to
-// Complete.
+// sendBlobs coarse-splits a body into blobs, encrypts each into a FEE
+// envelope (recipient: the tenant's wrap key) sent to its provider as it is
+// produced, and records an upload_intents row plus a blob_encryption_params
+// row per blob. The blobs are parked, not accepted. It is the shared first
+// half of ingest: a single-shot PUT follows it with uploadBlobs immediately;
+// a multipart UploadPart parks the blobs and defers the accept to Complete.
 //
 // The Body it returns is entirely plaintext-coordinate (Size, spans,
 // SHA256/MD5 — all computed before encryption); the intents record the
-// SPOOLED (ciphertext) byte count, which is what the uploader ships. A non-nil
+// stored (ciphertext) byte count, which is what the uploader ships. A non-nil
 // md5Src supplies the body's MD5 (a verified Content-MD5, the request's MD5
 // checksum reader, or a single-part copy source's digest): the MD5 pass is
 // skipped and Body.MD5 is read from md5Src once the body is consumed.
 //
-// size is the body's declared length. With a streaming uploader each blob
-// goes to its provider while it is spooled: those blobs come back in
-// streamed, parked on their providers, and their intents start out uploading
-// rather than spooled. A body that turns out a different length fails.
-func (b *Backend) splitSpool(ctx context.Context, bucket string, space did.DID, r io.Reader, size int64, md5Src bodyMD5Source) (_ spooledBody, err error) {
+// size is the body's declared length. Each blob goes to its provider as it
+// arrives and comes back in streamed, parked on its provider; its intent
+// starts out uploading. A body that turns out a different length fails.
+func (b *Backend) sendBlobs(ctx context.Context, bucket string, space did.DID, r io.Reader, size int64, md5Src bodyMD5Source) (_ sentBody, err error) {
 	// The span covers receiving the body (it streams in from the client as
-	// SplitBody reads it), encrypting it and writing it to the spool; the
+	// SplitSizedBody reads it), encrypting it and sending it to the provider; the
 	// body.received event marks where the client finished sending.
-	ctx, span := tracing.Start(ctx, "body.spool")
+	ctx, span := tracing.Start(ctx, "body.send")
 	defer func() { tracing.End(span, err) }()
 	if r == nil {
 		r = bytes.NewReader(nil)
 	}
 	r = &receivedReader{r: r, span: span}
-	// One tenant recipient per request, resolved before anything is spooled:
+	// One tenant recipient per request, resolved before anything is sent:
 	// a body that cannot be wrapped to its tenant is not stored at all.
 	recipient, err := b.tenantRecipient(ctx)
 	if err != nil {
-		return spooledBody{}, err
+		return sentBody{}, err
 	}
 	enc := newEncryptingBlobWriter(b.regionKeys, space, []fee.Recipient{recipient})
 	var splitOpts []msbucket.SplitOption
@@ -405,16 +403,16 @@ func (b *Backend) splitSpool(ctx context.Context, bucket string, space did.DID, 
 	body, err := msbucket.SplitSizedBody(ctx, enc, r, size, b.maxBlobSize, splitOpts...)
 	switch {
 	case errors.Is(err, msbucket.ErrBodyShort):
-		return spooledBody{}, s3err.GetAPIError(s3err.ErrIncompleteBody)
+		return sentBody{}, s3err.GetAPIError(s3err.ErrIncompleteBody)
 	case errors.Is(err, msbucket.ErrBodyLong):
-		return spooledBody{}, s3err.GetAPIError(s3err.ErrContentLengthMismatch)
+		return sentBody{}, s3err.GetAPIError(s3err.ErrContentLengthMismatch)
 	case errors.Is(err, blockstore.ErrReplayBusy):
 		// The node cannot hold the body for retries right now: have the
 		// client back off and try again.
-		return spooledBody{}, s3err.GetAPIError(s3err.ErrSlowDown)
+		return sentBody{}, s3err.GetAPIError(s3err.ErrSlowDown)
 	}
 	if err != nil {
-		return spooledBody{}, fmt.Errorf("split body: %w", err)
+		return sentBody{}, fmt.Errorf("split body: %w", err)
 	}
 	if md5Src != nil {
 		// The body read completed without error, so a carried digest was
@@ -422,7 +420,7 @@ func (b *Backend) splitSpool(ctx context.Context, bucket string, space did.DID, 
 		// final; either is the body's MD5.
 		body.MD5 = md5Src()
 		if len(body.MD5) != md5.Size {
-			return spooledBody{}, fmt.Errorf("split body: MD5 source yielded %d bytes, want %d", len(body.MD5), md5.Size)
+			return sentBody{}, fmt.Errorf("split body: MD5 source yielded %d bytes, want %d", len(body.MD5), md5.Size)
 		}
 	}
 	streamed := enc.streamed()
@@ -434,11 +432,11 @@ func (b *Backend) splitSpool(ctx context.Context, bucket string, space did.DID, 
 	for _, blob := range body.Blobs {
 		storedSize, err := enc.storedSize(blob.Digest)
 		if err != nil {
-			return spooledBody{}, err
+			return sentBody{}, err
 		}
 		// A streamed blob is on the network already (see IntentUploading).
 		if _, ok := streamed[string(blob.Digest)]; !ok {
-			return spooledBody{}, fmt.Errorf("blob %x was not sent to its provider", blob.Digest)
+			return sentBody{}, fmt.Errorf("blob %x was not sent to its provider", blob.Digest)
 		}
 		if err := b.intents.PutIntent(ctx, registry.UploadIntent{
 			Digest: blob.Digest,
@@ -446,24 +444,24 @@ func (b *Backend) splitSpool(ctx context.Context, bucket string, space did.DID, 
 			State:  registry.IntentUploading,
 			Bucket: bucket,
 		}); err != nil {
-			return spooledBody{}, fmt.Errorf("record intent: %w", err)
+			return sentBody{}, fmt.Errorf("record intent: %w", err)
 		}
 		// The read path decrypts from this row; it must exist before any
 		// manifest referencing the blob can commit.
 		params, err := enc.params(space, blob.Digest)
 		if err != nil {
-			return spooledBody{}, err
+			return sentBody{}, err
 		}
 		if err := b.encParams.PutEncryptionParams(ctx, params); err != nil {
-			return spooledBody{}, fmt.Errorf("record encryption params: %w", err)
+			return sentBody{}, fmt.Errorf("record encryption params: %w", err)
 		}
 	}
-	return spooledBody{Body: body, streamed: streamed, lease: enc.lease}, nil
+	return sentBody{Body: body, streamed: streamed, lease: enc.lease}, nil
 }
 
 // uploadBlobs concludes each blob's upload to Forge, advancing its intent to
 // accepted and recording its location. Every blob went to its provider as it
-// arrived (see splitSpool) and is parked there, needing only its conclude.
+// arrived (see sendBlobs) and is parked there, needing only its conclude.
 func (b *Backend) uploadBlobs(ctx context.Context, space did.DID, blobs []msbucket.BlobRef, streamed map[string]uploader.StreamedBlob) error {
 	for _, blob := range blobs {
 		sb, ok := streamed[string(blob.Digest)]

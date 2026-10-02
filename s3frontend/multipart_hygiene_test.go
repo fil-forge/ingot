@@ -1811,7 +1811,7 @@ func TestSweepLeavesALiveCompleteOnAnOldSession(t *testing.T) {
 		if err := mem.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 1, ETagMD5: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{d}, State: registry.PartParked}); err != nil {
 			t.Fatalf("PutPart %s: %v", id, err)
 		}
-		// The write path spools every part blob before recording the part,
+		// The write path sends every part blob before recording the part,
 		// so a part row never exists without its blob's intent.
 		if err := mem.PutIntent(ctx, registry.UploadIntent{Digest: d, Size: 1, State: registry.IntentParked, Bucket: "bk"}); err != nil {
 			t.Fatalf("PutIntent %s: %v", id, err)
@@ -1918,7 +1918,7 @@ func TestCompleteFailsWhenItsSessionIsTakenBeforeCommit(t *testing.T) {
 
 // teardownBeforePutPart is a multipart store that runs hook once, right
 // before its next PutPart: the window after UploadPart was admitted and
-// spooled its blobs, where a teardown can take the session.
+// sent its blobs, where a teardown can take the session.
 type teardownBeforePutPart struct {
 	registry.MultipartStore
 	hook func()
@@ -1934,9 +1934,9 @@ func (s *teardownBeforePutPart) PutPart(ctx context.Context, p registry.Multipar
 }
 
 // TestUploadPartRefusedAfterTeardownReleasesItsBlobs: a sweep takes the
-// session after an UploadPart was admitted and spooled its blobs. The part
+// session after an UploadPart was admitted and sent its blobs. The part
 // row is refused, since the session is no longer open, the upload fails
-// with NoSuchUpload, and the blobs it spooled are released rather than
+// with NoSuchUpload, and the blobs it sent are released rather than
 // left behind with no row pointing at them.
 func TestUploadPartRefusedAfterTeardownReleasesItsBlobs(t *testing.T) {
 	mp := &teardownBeforePutPart{}

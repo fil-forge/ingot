@@ -29,7 +29,7 @@ import (
 //
 // Gated behind INGOT_ITEST_MP_BENCH=1: at the default 1000 parts it moves
 // ~5 GiB through the stack and lands several times that on the Docker disk
-// once the spool, piri's copy and sprue's agent-message store are counted.
+// once piri's copy and sprue's agent-message store are counted.
 // Check free space first — when the Docker VM's disk fills, MinIO answers
 // sprue with 507 and every UploadPart fails as an opaque 500. Reclaim the
 // previous run's volumes (`docker volume ls -qf dangling=true | grep
@@ -173,12 +173,12 @@ func TestForgeMultipartManyParts(t *testing.T) {
 }
 
 // mpPartByteAt is the many-parts benchmark's content formula: every part has
-// distinct bytes so nothing dedups against another part, the spool, or
+// distinct bytes so nothing dedups against another part or
 // another test's blobs.
 func mpPartByteAt(part int32, i int64) byte {
 	// Mixed rather than summed: a linear term in the part number repeats
 	// every 256 parts once truncated to a byte, so part 1 and part 257 would
-	// generate identical content and dedup against each other in the spool,
+	// generate identical content and dedup against each other,
 	// quietly measuring far fewer blobs than the test asked for.
 	h := uint64(part)*0x9E3779B97F4A7C15 ^ uint64(i)*0xBF58476D1CE4E5B9
 	h ^= h >> 29

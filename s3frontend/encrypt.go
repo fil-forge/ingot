@@ -28,7 +28,7 @@ import (
 // envelope alone with the tenant's private key, no region involved).
 //
 // The tenant recipient is resolved once per request (tenantkey.Source),
-// before any plaintext is spooled, and a request that cannot obtain it
+// before any plaintext is sent, and a request that cannot obtain it
 // fails: a region-only wrap is the backstop-less design the RFC rejected.
 // Its kid is the key's fingerprint, so the envelope names the exact key it
 // was wrapped to whatever Hilt's DID document later says.
@@ -43,7 +43,7 @@ import (
 // the envelope to the provider as it is produced (see WriteSizedBlob), and
 // wraps the CEK. Every manifest span is plaintext-based; only the digest names
 // ciphertext. The per-digest encryption state (descriptor, wrapped CEK, stored
-// size) accumulates in results for splitSpool to persist.
+// size) accumulates in results for sendBlobs to persist.
 //
 // Not safe for concurrent use; the write path drives one instance per body,
 // sequentially.
@@ -69,9 +69,9 @@ type encryptingBlobWriter struct {
 type encWrite struct {
 	desc       fee.BodyDescriptor
 	wrapped    regionkey.WrappedKey
-	storedSize int64 // envelope header + ciphertext, the spooled byte count
+	storedSize int64 // envelope header + ciphertext, the sent byte count
 	// streamed is set when the envelope already went to its provider as it
-	// was spooled: the blob is parked there, awaiting its conclude.
+	// was produced: the blob is parked there, awaiting its conclude.
 	streamed *uploader.StreamedBlob
 }
 
@@ -81,7 +81,7 @@ func newEncryptingBlobWriter(keys regionkey.Provider, space did.DID, recipients 
 
 // tenantRecipient resolves the requesting tenant's wrap key and returns it
 // as the envelope recipient for this request's blobs. The error is the
-// write's error: nothing is spooled without a recipient.
+// write's error: nothing is sent without a recipient.
 func (b *Backend) tenantRecipient(ctx context.Context) (fee.Recipient, error) {
 	if b.tenantKeys == nil {
 		return nil, errors.New("s3frontend: tenant key source not configured (TenantKeys)")
@@ -93,7 +93,7 @@ func (b *Backend) tenantRecipient(ctx context.Context) (fee.Recipient, error) {
 	return fee.NewECDHESRecipient([]byte(kid), pub), nil
 }
 
-// record wraps the blob's CEK and keeps its encryption state for splitSpool.
+// record wraps the blob's CEK and keeps its encryption state for sendBlobs.
 func (w *encryptingBlobWriter) record(ctx context.Context, digest multihash.Multihash, cek []byte, res encWrite) error {
 	wrapped, err := w.keys.Wrap(ctx, regionkey.BindingContext{Space: w.space, Digest: digest}, cek)
 	if err != nil {
@@ -123,7 +123,7 @@ func (w *encryptingBlobWriter) params(space did.DID, digest multihash.Multihash)
 	}, nil
 }
 
-// storedSize reports the spooled (envelope) byte count of one blob.
+// storedSize reports the stored (envelope) byte count of one blob.
 func (w *encryptingBlobWriter) storedSize(digest multihash.Multihash) (int64, error) {
 	res, ok := w.results[string(digest)]
 	if !ok {

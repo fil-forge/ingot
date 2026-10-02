@@ -16,8 +16,8 @@ var _ blockstore.Log = (*Store)(nil)
 
 // Store is the catalog log: a single LSM pipeline (its own seal trigger,
 // transport, and retention) over the dag-cbor MST nodes + ObjectManifests.
-// Object-body blobs are not journaled — they are spooled and uploaded per-blob
-// (see blockstore.Spool), so the data plane is gone. Store is a thin wrapper
+// Object-body blobs are not journaled — they are sent to their provider per-blob,
+// so the data plane is gone. Store is a thin wrapper
 // over one PlaneLog, kept as the blockstore.Log seam the write/read paths hold.
 type Store struct {
 	catalog *PlaneLog
@@ -50,7 +50,7 @@ func (s *Store) AppendBatch(ctx context.Context, catalogBlocks []block.Block, op
 
 // Get returns the catalog block holding c, or ErrNotFound. (Body blobs are
 // never in the log; a raw-codec lookup simply misses and the caller falls
-// through to the spool / network tier.)
+// through to the network tier.)
 func (s *Store) Get(ctx context.Context, c cid.Cid) (block.Block, error) {
 	return s.catalog.Get(ctx, c)
 }

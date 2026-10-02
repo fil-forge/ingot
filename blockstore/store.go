@@ -59,7 +59,7 @@ import (
 // The read interfaces carry the Forge space the block belongs to (the
 // owning bucket's space DID), because the bottom read tier is the network:
 // blob locations are keyed by space and retrieval is authorized per space.
-// Local tiers (spool, log, staging) are content-addressed and ignore it;
+// Local tiers (log, staging) are content-addressed and ignore it;
 // did.Undef is acceptable where no network fallthrough can occur (harness,
 // standalone reads served locally).
 type Reader interface {
@@ -120,7 +120,7 @@ type BlobRangeReader interface {
 // OpenBlobRangeOf opens stored bytes [start, end] (inclusive) of a blob
 // through br, using its BlobRangeReader capability when present and falling
 // back to OpenBlob with the prefix read-and-discarded (or Seek'd, for a
-// spool file) when not. It is how range-consuming callers stay correct over
+// seekable stream) when not. It is how range-consuming callers stay correct over
 // any tier.
 func OpenBlobRangeOf(ctx context.Context, br BlobReader, space did.DID, digest mh.Multihash, start, end int64) (io.ReadCloser, error) {
 	if rr, ok := br.(BlobRangeReader); ok {

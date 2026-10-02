@@ -90,8 +90,8 @@ type Backend struct {
 // Deps wires a Backend over ingot's domain primitives.
 type Deps struct {
 	Authority bucketauthority.BucketAuthority
-	// Registry tracks per-bucket roots; IntentStore tracks the local spool's
-	// upload_intents lifecycle; LocationStore records where each accepted body
+	// Registry tracks per-bucket roots; IntentStore tracks the upload_intents
+	// lifecycle of blobs sent to a provider; LocationStore records where each accepted body
 	// blob can be retrieved from. Production passes one *registry.Postgres for
 	// all three; the harness one *inmem.MemStore.
 	Registry  registry.Registry
@@ -104,7 +104,7 @@ type Deps struct {
 	GC        registry.GCStore
 	Multipart registry.MultipartStore
 
-	// Reads is the layered read tier (spool → log → forge). Log is the catalog
+	// Reads is the layered read tier (log → forge). Log is the catalog
 	// LSM write log driving the per-op staging buffer + commit — in production
 	// the per-bucket *logstore.Manager, which routes each append to the
 	// bucket's own log.

@@ -59,8 +59,8 @@ func WithoutMD5() SplitOption { return func(c *splitConfig) { c.md5 = false } }
 // drops the md5 pass for a caller that already holds the value. A zero-byte
 // body yields a Body with no blobs (and the well-known empty digests).
 //
-// w is the local spool in production (blockstore.Spool): the blobs land on disk
-// before being stored. SplitBody itself is storage-agnostic.
+// SplitBody is storage-agnostic: w stores each blob and names it by digest.
+// (The write path uses SplitSizedBody, which sends each blob as it arrives.)
 func SplitBody(ctx context.Context, w blockstore.BlobWriter, r io.Reader, maxBlobSize int64, opts ...SplitOption) (Body, error) {
 	max := maxBlobSize
 	if max <= 0 {
@@ -194,7 +194,7 @@ func OpenBodyRange(ctx context.Context, opener BlobRangeOpener, space did.DID, b
 
 // NewPlainOpener returns the BlobRangeOpener for unencrypted blobs, whose
 // stored bytes are their plaintext: open the blob, position at start (a Seek
-// for a spool file, read-and-discard for a network stream), and serve
+// for a seekable stream, read-and-discard for a network stream), and serve
 // through end.
 func NewPlainOpener(bs blockstore.BlobReader) BlobRangeOpener {
 	return plainOpener{bs: bs}
@@ -210,7 +210,7 @@ func (o plainOpener) OpenBlobRange(ctx context.Context, space did.DID, ref BlobR
 		return nil, err
 	}
 	// Position at start within the blob — a ranged read may begin mid-blob.
-	// Prefer a seek (local spool files are seekable); fall back to
+	// Prefer a seek (a seekable stream); fall back to
 	// read-and-discard for a non-seekable network stream.
 	if start > 0 {
 		if seeker, ok := rc.(io.Seeker); ok {

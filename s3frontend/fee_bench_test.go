@@ -40,7 +40,7 @@ import (
 // io.ReaderFrom with its own 8 KiB buffer, which would replace the copy
 // pattern each benchmark claims to measure. sink has no fast path, so an
 // io.Copy into it uses the source's WriteTo when it has one (the encrypt
-// reader, as the spool sees it) and the generic 32 KiB loop otherwise (the
+// reader, as the replay buffer sees it) and the generic 32 KiB loop otherwise (the
 // body reader, as the response writer sees it); the read benchmarks pass
 // that loop one reused buffer so the copy itself adds nothing to allocs/op.
 
@@ -75,7 +75,7 @@ type benchEnc struct {
 }
 
 // writer returns an encrypting writer wired to the benchmark's provider, as
-// splitSpool wires one.
+// sendBlobs wires one.
 func (e *benchEnc) writer() *encryptingBlobWriter {
 	enc := newEncryptingBlobWriter(e.keys, e.space, []fee.Recipient{e.recipient})
 	enc.stream, enc.replay, enc.streams = e.store, e.replay, e.streams
@@ -274,7 +274,7 @@ func BenchmarkGCMSeal(b *testing.B) {
 }
 
 // BenchmarkSHA256 is one sha256 pass over the data (ingot pays two per body:
-// the plaintext body hash and the spool's ciphertext hash).
+// the plaintext body hash and the ciphertext hash).
 func BenchmarkSHA256(b *testing.B) {
 	const size = 64 << 20
 	data := benchData(size)
@@ -288,8 +288,7 @@ func BenchmarkSHA256(b *testing.B) {
 
 // BenchmarkFileWrite is the replay buffer's disk pass alone: the data written to a
 // temp file in sealed-chunk-sized pieces (256 KiB + tag, what the encrypt
-// reader's WriteTo hands the spool's MultiWriter), then renamed, as
-// Spool.WriteBlob does. Both ends are wrapped so neither bytes.Reader's
+// reader's WriteTo hands the replay buffer's MultiWriter). Both ends are wrapped so neither bytes.Reader's
 // WriteTo nor os.File's ReadFrom replaces that write pattern.
 func BenchmarkFileWrite(b *testing.B) {
 	for _, size := range benchSizes[1:] {

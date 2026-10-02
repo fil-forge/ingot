@@ -191,14 +191,13 @@ func (b *Backend) bucketSpace(ctx context.Context, bucketName string) (did.DID, 
 }
 
 // UploadPart ingests one part: it coarse-splits the part body into blobs,
-// spools each to local disk (recording upload_intents), records the part
-// (its ordered blob digests, md5, size, checksum), and uploads each blob to
-// its provider — PARKED, not accepted: the /http/put conclude that triggers
-// /blob/accept is deferred to Complete, so the bytes are durable but stay
-// out of the PDP pipeline, and an Abort unwinds them with /blob/abort
-// (§7.2). Re-uploading a part number supersedes the prior part; the
-// superseded part's now-unreferenced blobs are dropped from the spool and
-// rejected. The part ETag is the hex md5 of the part bytes: a Content-MD5 the
+// sends each to its provider as it arrives (recording upload_intents),
+// records the part (its ordered blob digests, md5, size, checksum), and parks
+// the blobs — durable on the provider but not accepted: the /http/put conclude
+// that triggers /blob/accept is deferred to Complete, so the bytes stay out of
+// the PDP pipeline, and an Abort unwinds them with /blob/abort (§7.2).
+// Re-uploading a part number supersedes the prior part; the superseded part's
+// now-unreferenced blobs are released and rejected. The part ETag is the hex md5 of the part bytes: a Content-MD5 the
 // checksum middleware verified against the stream is reused, else it is
 // computed during ingest.
 //
@@ -247,7 +246,7 @@ type ingestedPart struct {
 
 // ingestPart is the body-source-agnostic core of UploadPart and UploadPartCopy:
 // it negotiates the part checksum against the session, streams body through
-// the checksum readers into splitSpool, records the part (superseding a prior
+// the checksum readers into sendBlobs, records the part (superseding a prior
 // part of the same number), parks its blobs, and drops the superseded part's
 // blobs. partAlgo/expected are the checksum the request names, if any: an
 // explicit value is validated on the stream; an algorithm alone is computed.
@@ -267,7 +266,7 @@ type ingestedPart struct {
 // persisted). A client-supplied value mismatch surfaces from the ingest read
 // as a BadDigest API error.
 //
-// size is the part's declared length (see splitSpool).
+// size is the part's declared length (see sendBlobs).
 func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSession, partNumber int, body io.Reader, size int64, partAlgo types.ChecksumAlgorithm, expected string, md5Src bodyMD5Source) (*ingestedPart, error) {
 	uploadID := sess.UploadID
 	sessAlgo := types.ChecksumAlgorithm(sess.ChecksumAlgorithm)
@@ -353,7 +352,7 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 			return nil, fmt.Errorf("s3frontend: record superseded part releases: %w", err)
 		}
 	}
-	spooled, err := b.splitSpool(ctx, sess.Bucket, space, bodyReader, size, md5Src)
+	sent, err := b.sendBlobs(ctx, sess.Bucket, space, bodyReader, size, md5Src)
 	if err != nil {
 		var apiErr s3err.APIError
 		if errors.As(err, &apiErr) {
@@ -361,8 +360,8 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 		}
 		return nil, fmt.Errorf("s3frontend: upload part ingest: %w", err)
 	}
-	defer spooled.lease.end()
-	rec := spooled.Body
+	defer sent.lease.end()
+	rec := sent.Body
 	if err := b.multipart.PutPart(ctx, registry.MultipartPart{
 		UploadID:    uploadID,
 		PartNumber:  partNumber,
@@ -372,7 +371,7 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 		BlobDigests: bodyDigests(rec),
 		State:       registry.PartParked,
 	}); err != nil {
-		// No part row points at the spooled blobs now, whatever went wrong:
+		// No part row points at the sent blobs now, whatever went wrong:
 		// the session was completed, aborted or torn down after this upload
 		// was admitted (ErrNotFound), or the write failed. Their release is
 		// recorded here, before the error. Should the row in fact have
@@ -390,9 +389,9 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 	}
 	// Park the part's blobs on their providers before returning 200 — the
 	// part is durable on the network as soon as the client sees success.
-	// The part row is recorded first so a crash mid-park leaves re-drivable
-	// spooled intents.
-	if err := b.parkBlobs(ctx, rec.Blobs, spooled.streamed); err != nil {
+	// The part row is recorded first so a crash mid-park leaves intents the
+	// release path can unwind.
+	if err := b.parkBlobs(ctx, rec.Blobs, sent.streamed); err != nil {
 		return nil, fmt.Errorf("s3frontend: park part blobs: %w", err)
 	}
 	b.releaseNow(ctx, superseding)
@@ -741,7 +740,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 			if err != nil {
 				return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: part blob %x: %w", d, err)
 			}
-			// intent.Size is the spooled (envelope) byte count; the manifest
+			// intent.Size is the stored (envelope) byte count; the manifest
 			// spans are plaintext, derived from the blob's FEE geometry.
 			plainLen, err := b.blobPlaintextLen(ctx, bucketState.Space, d, in.Size)
 			if err != nil {
@@ -904,7 +903,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 
 // AbortMultipartUpload cancels a multipart upload: it latches the session
 // (single-winner vs Complete), drops it (cascading its parts), and removes the
-// parts' now-unreferenced blobs from the spool — unallocating any that were
+// parts' now-unreferenced blobs — unallocating any that were
 // parked on a provider (an upload ends in exactly one of accept or
 // abort). No reference claims were taken (those happen only at
 // Complete).
@@ -982,7 +981,7 @@ func (b *Backend) abortOpenSession(ctx context.Context, sess registry.MultipartS
 // are. A published intent is a committed blob — the state its first
 // reference claim wrote — so a completed session's winners, even after their
 // object is deleted, are left to the object path's own releases. No intent
-// at all is a blob already released in full: every spooled blob gets an
+// at all is a blob already released in full: every blob gets an
 // intent, and only the last step of a release removes one, together with
 // that release's record. Recording such a blob again would enqueue a record
 // whose release then finds neither rows nor intent, takes the network arm
@@ -1061,7 +1060,7 @@ func (b *Backend) enqueuePartReleases(ctx context.Context, space did.DID, digest
 }
 
 // parkBlobs records the park each blob of a part left on its provider: every
-// blob went there as it arrived (see splitSpool), unaccepted, so only its park
+// blob went there as it arrived (see sendBlobs), unaccepted, so only its park
 // row is left to write.
 func (b *Backend) parkBlobs(ctx context.Context, blobs []msbucket.BlobRef, streamed map[string]uploader.StreamedBlob) error {
 	for _, blob := range blobs {
@@ -1451,7 +1450,7 @@ func (b *Backend) ListMultipartUploads(ctx context.Context, input *s3.ListMultip
 
 // SweepStaleMultipartSessions tears down sessions whose state has not changed
 // for ttl: open sessions are aborted exactly like a client Abort (their
-// parked parts released on their providers, their spool dropped), completed
+// parked parts released on their providers, their intents dropped), completed
 // leftovers are reaped, and sessions a crash stranded mid-transition — a
 // 'completing' row whose Complete died before the commit, an 'aborting' row
 // whose Abort died before dropping the session — get the abort treatment too,
