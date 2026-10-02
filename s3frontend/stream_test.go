@@ -8,7 +8,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
-	"os"
 	"sync"
 	"testing"
 	"time"
@@ -181,9 +180,6 @@ func TestStreamedPutObject(t *testing.T) {
 		envelope := su.puts[sb.AddTask]
 		require.Equal(t, mustSum(envelope), d, "the blob is named by the digest of the envelope the provider got")
 		require.Equal(t, int64(len(envelope)), sb.Size, "the allocation was the envelope's length")
-		_, err := os.Stat(b.spool.Path(d))
-		require.ErrorIs(t, err, os.ErrNotExist, "nothing is spooled for a streamed blob")
-
 		require.Equal(t, d, su.concluded[i].Digest, "the conclude reports the streamed digest")
 		require.Equal(t, sb.AddTask, su.concluded[i].AddTask)
 

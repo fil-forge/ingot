@@ -493,10 +493,6 @@ func newDeferredBackend(t *testing.T, up deferredTestUploader, mods ...func(*Dep
 	ctx := context.Background()
 	dir := t.TempDir()
 	mem := inmem.NewMemStore()
-	spool, err := blockstore.NewSpool(filepath.Join(dir, "spool"))
-	if err != nil {
-		t.Fatalf("spool: %v", err)
-	}
 	log, err := logstore.Open(ctx, logstore.Config{
 		Dir:     filepath.Join(dir, "segments"),
 		Meta:    mem,
@@ -526,7 +522,6 @@ func newDeferredBackend(t *testing.T, up deferredTestUploader, mods ...func(*Dep
 		Parks:           mem,
 		Reads:           blockstore.NewLayered(log, base),
 		Log:             log,
-		Spool:           spool,
 		Streaming:       up,
 		Streams:         mem,
 		Remover:         &recordingRemover{},
@@ -1495,19 +1490,16 @@ func TestReleaseKeepsRowsUntilTheNetworkStepSucceeds(t *testing.T) {
 	if _, err := mem.GetLocation(ctx, did.Undef, d); !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("location row survived the release (err=%v)", err)
 	}
-	// A committed blob's ingest artifacts are not the release's to remove:
-	// the spool copy is the insurance copy until eviction.
-	if in, err := mem.GetIntent(ctx, d); err != nil || in.State != registry.IntentPublished {
-		t.Fatalf("a deleted object's blob intent = %v/%v, want published and kept", in, err)
+	if _, err := mem.GetIntent(ctx, d); !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("intent survived the release of a deleted object's blob (err=%v)", err)
 	}
 }
 
 // TestCompletedSessionReapKeepsWinnersOfDeletedObject: a completed session
 // is retained after its object is deleted. Its winners' releases were
 // recorded by the delete as ordinary releases; the reap must not re-record
-// them as part blobs, which would take the spool copy that survives a DELETE
-// as the insurance copy. Their intents were published by their claims, so the
-// reap leaves them alone.
+// them as part blobs, which would release them a second time. Their intents
+// were published by their claims, so the reap leaves them alone.
 func TestCompletedSessionReapKeepsWinnersOfDeletedObject(t *testing.T) {
 	rm := &recordingRemover{}
 	b, mem := newDeferredBackend(t, &parkingUploader{Provider: inmem.NewProvider()}, func(d *Deps) { d.Remover = rm })
@@ -1528,8 +1520,8 @@ func TestCompletedSessionReapKeepsWinnersOfDeletedObject(t *testing.T) {
 		if rm.removedDigests()[string(d)] != 1 {
 			t.Fatalf("winner %x removed %d times, want once by the object's own release", d, rm.removedDigests()[string(d)])
 		}
-		if in, err := mem.GetIntent(ctx, d); err != nil || in.State != registry.IntentPublished {
-			t.Fatalf("winner %x intent = %v/%v, want published and kept: the spool copy is the insurance copy", d, in, err)
+		if _, err := mem.GetIntent(ctx, d); !errors.Is(err, registry.ErrNotFound) {
+			t.Fatalf("winner %x intent survived its release (err=%v)", d, err)
 		}
 	}
 }
@@ -1538,7 +1530,7 @@ func TestCompletedSessionReapKeepsWinnersOfDeletedObject(t *testing.T) {
 // commits, but the completing→completed latch fails, so the session is
 // reaped through the abort path after its object was deleted. Its blobs'
 // intents were published by their claims, so the reap leaves them to the
-// object's own releases and their spool copies survive.
+// object's own releases.
 func TestCompletingSessionWhoseLatchFailedKeepsCommittedBlobs(t *testing.T) {
 	rm := &recordingRemover{}
 	mp := &failCompleteSession{}
@@ -1574,8 +1566,8 @@ func TestCompletingSessionWhoseLatchFailedKeepsCommittedBlobs(t *testing.T) {
 		if rm.removedDigests()[string(d)] != 1 {
 			t.Fatalf("committed blob %x removed %d times, want once", d, rm.removedDigests()[string(d)])
 		}
-		if in, err := mem.GetIntent(ctx, d); err != nil || in.State != registry.IntentPublished {
-			t.Fatalf("committed blob %x intent = %v/%v, want published and kept", d, in, err)
+		if _, err := mem.GetIntent(ctx, d); !errors.Is(err, registry.ErrNotFound) {
+			t.Fatalf("committed blob %x intent survived its release (err=%v)", d, err)
 		}
 	}
 }
@@ -1821,7 +1813,7 @@ func TestSweepLeavesALiveCompleteOnAnOldSession(t *testing.T) {
 		}
 		// The write path spools every part blob before recording the part,
 		// so a part row never exists without its blob's intent.
-		if err := mem.PutIntent(ctx, registry.UploadIntent{Digest: d, LocalPath: "/spool/" + id, Size: 1, State: registry.IntentParked, Bucket: "bk"}); err != nil {
+		if err := mem.PutIntent(ctx, registry.UploadIntent{Digest: d, Size: 1, State: registry.IntentParked, Bucket: "bk"}); err != nil {
 			t.Fatalf("PutIntent %s: %v", id, err)
 		}
 		// Parked on a provider, so a release of it is an abort the fake records.

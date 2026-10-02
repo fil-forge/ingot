@@ -59,7 +59,6 @@ type Backend struct {
 	multipart registry.MultipartStore
 	txns      *bucketop.Coordinator
 	log       blockstore.Log
-	spool     *blockstore.Spool
 	parks     registry.ParkStore
 	remover   uploader.BlobRemover
 	encParams registry.EncryptionParamsStore
@@ -111,10 +110,6 @@ type Deps struct {
 	// bucket's own log.
 	Reads blockstore.ReadStore
 	Log   blockstore.Log
-
-	// Spool is the local blob store: SplitBody writes body blobs here on PUT,
-	// and they are served back from here on GET (read-after-write / cache).
-	Spool *blockstore.Spool
 
 	// Streaming uploads each body blob to Forge as it arrives, allocating it
 	// by size and hash function before its digest is known, and concludes
@@ -205,7 +200,6 @@ func New(d Deps) *Backend {
 		multipart:       d.Multipart,
 		txns:            bucketop.NewCoordinator(bucketop.Deps{Reg: d.Registry, Log: d.Log, Reads: d.Reads}),
 		log:             d.Log,
-		spool:           d.Spool,
 		parks:           d.Parks,
 		remover:         d.Remover,
 		streaming:       d.Streaming,

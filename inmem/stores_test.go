@@ -146,7 +146,7 @@ func TestIntents_StateMachine(t *testing.T) {
 	digest := []byte("intent-digest")
 
 	if err := m.PutIntent(ctx, registry.UploadIntent{
-		Digest: digest, LocalPath: "/spool/x", Size: 42, State: registry.IntentSpooled, Bucket: "b",
+		Digest: digest, Size: 42, State: registry.IntentUploading, Bucket: "b",
 	}); err != nil {
 		t.Fatalf("PutIntent: %v", err)
 	}
@@ -155,7 +155,7 @@ func TestIntents_StateMachine(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetIntent: %v", err)
 	}
-	if got.State != registry.IntentSpooled || got.Size != 42 || got.LocalPath != "/spool/x" {
+	if got.State != registry.IntentUploading || got.Size != 42 {
 		t.Fatalf("GetIntent = %+v", got)
 	}
 
@@ -169,8 +169,8 @@ func TestIntents_StateMachine(t *testing.T) {
 	if len(parked) != 1 || string(parked[0].Digest) != string(digest) {
 		t.Fatalf("parked intents = %+v, want one with our digest", parked)
 	}
-	if spooled, _ := m.ListIntentsByState(ctx, registry.IntentSpooled); len(spooled) != 0 {
-		t.Fatalf("spooled intents = %+v, want none after state change", spooled)
+	if uploading, _ := m.ListIntentsByState(ctx, registry.IntentUploading); len(uploading) != 0 {
+		t.Fatalf("uploading intents = %+v, want none after state change", uploading)
 	}
 
 	// SetIntentState on a missing digest is an explicit miss.
@@ -550,7 +550,7 @@ func TestBlobRefs_ClaimPublishesIntent(t *testing.T) {
 	ctx := context.Background()
 	m := NewMemStore()
 	d := multihash.Multihash([]byte("committed"))
-	if err := m.PutIntent(ctx, registry.UploadIntent{Digest: d, LocalPath: "/spool/c", Size: 1, State: registry.IntentAccepted, Bucket: "b"}); err != nil {
+	if err := m.PutIntent(ctx, registry.UploadIntent{Digest: d, Size: 1, State: registry.IntentAccepted, Bucket: "b"}); err != nil {
 		t.Fatalf("PutIntent: %v", err)
 	}
 	claim := registry.BlobClaim{Digest: d, Bucket: "b", ObjectKey: "k", VersionID: registry.NullVersionID, Space: did.Undef}
