@@ -434,11 +434,11 @@ func TestCompleteWaitBudgetIsOperationAborted(t *testing.T) {
 
 // parkingUploader parks instead of accepting: UploadBlob returns no
 // Location, so part blobs stay IntentParked — the provider shape the
-// NopUploader cannot produce. AbortBlob calls are recorded; the abort of a
+// Provider cannot produce. AbortBlob calls are recorded; the abort of a
 // digest in acceptedOnProvider is refused as already accepted, as a provider
 // answers for a blob whose conclude ran without ingot learning of it.
 type parkingUploader struct {
-	inmem.NopUploader
+	*inmem.Provider
 	mu                 sync.Mutex
 	aborted            []string
 	acceptedOnProvider map[string]bool
@@ -447,7 +447,11 @@ type parkingUploader struct {
 	abortFails int
 }
 
-func (p *parkingUploader) UploadBlob(_ context.Context, _ did.DID, digest multihash.Multihash, size int64, _ string, _ ...uploader.UploadOption) (uploader.UploadedBlob, error) {
+func (p *parkingUploader) UploadBlob(_ context.Context, _ did.DID, digest multihash.Multihash, size int64, path string, _ ...uploader.UploadOption) (uploader.UploadedBlob, error) {
+	// The provider holds the parked bytes, so a read after the conclude finds them.
+	if err := p.PutFile(digest, path); err != nil {
+		return uploader.UploadedBlob{}, err
+	}
 	c := cid.NewCidV1(cid.Raw, digest)
 	return uploader.UploadedBlob{Digest: digest, Size: size, AddTask: c, AcceptTask: c}, nil
 }
@@ -482,7 +486,7 @@ func (p *parkingUploader) abortedDigests() map[string]bool {
 // so part blobs reach IntentParked and abort exercises the /blob/abort arm.
 func newParkingBackend(t *testing.T) (*Backend, *inmem.MemStore, *parkingUploader) {
 	t.Helper()
-	pu := &parkingUploader{}
+	pu := &parkingUploader{Provider: inmem.NewProvider()}
 	b, mem := newDeferredBackend(t, pu)
 	return b, mem, pu
 }
@@ -511,6 +515,13 @@ func newDeferredBackend(t *testing.T, up deferredTestUploader, mods ...func(*Dep
 	}
 	t.Cleanup(func() { _ = log.Close(ctx) })
 
+	// Body reads come from the fake provider when the uploader is one that
+	// keeps what it is given, as the network tier serves them in production.
+	var base blockstore.BlockReader = inmem.NopBaseReader{}
+	if r, ok := up.(blockstore.BlockReader); ok {
+		base = r
+	}
+
 	deps := Deps{
 		Authority:       mem,
 		Registry:        mem,
@@ -520,7 +531,7 @@ func newDeferredBackend(t *testing.T, up deferredTestUploader, mods ...func(*Dep
 		GC:              mem,
 		Multipart:       mem,
 		Parks:           mem,
-		Reads:           blockstore.NewLayered(spool, log, inmem.NopBaseReader{}),
+		Reads:           blockstore.NewLayered(nil, log, base),
 		Log:             log,
 		Spool:           spool,
 		Uploader:        up,
@@ -616,7 +627,7 @@ func (h *haltingConcluder) ConcludeBlobs(ctx context.Context, space did.DID, par
 // accepted with their parks dropped and the rest parked, so the next Complete
 // concludes only what remains and nothing accepted is ever aborted as parked.
 func TestCompleteRecordsAcceptancesWhenConcludeFails(t *testing.T) {
-	hc := &haltingConcluder{halt: true}
+	hc := &haltingConcluder{parkingUploader: parkingUploader{Provider: inmem.NewProvider()}, halt: true}
 	b, mem := newDeferredBackend(t, hc)
 	ctx := context.Background()
 	key := "partial"
@@ -694,7 +705,7 @@ func (f *failOncePutLocation) PutLocation(ctx context.Context, loc registry.Blob
 // session expiry would abort them — and the next Complete concludes only the
 // blob whose record did not land.
 func TestCompleteRecordsEveryAcceptanceWhenOneFailsToPersist(t *testing.T) {
-	hc := &haltingConcluder{}
+	hc := &haltingConcluder{parkingUploader: parkingUploader{Provider: inmem.NewProvider()}}
 	locs := &failOncePutLocation{armed: true}
 	b, mem := newDeferredBackend(t, hc, func(d *Deps) {
 		locs.LocationStore = d.Locations
@@ -832,7 +843,7 @@ func assertAcceptedAndUnparked(t *testing.T, mem *inmem.MemStore, d multihash.Mu
 // with a location. The retry finds the location, so it neither concludes the
 // blob again nor leaves the park row standing.
 func TestCompleteRetryDropsParkAfterFailedIntentUpdate(t *testing.T) {
-	hc := &haltingConcluder{}
+	hc := &haltingConcluder{parkingUploader: parkingUploader{Provider: inmem.NewProvider()}}
 	intents := &failOnceMarkAccepted{armed: true}
 	b, mem := newDeferredBackend(t, hc, func(d *Deps) {
 		intents.IntentStore = d.Intents
@@ -871,7 +882,7 @@ func TestCompleteRetryDropsParkAfterFailedIntentUpdate(t *testing.T) {
 // blob's acceptance and then fails to drop its park leaves a stale row. The
 // retry takes the dedup path for that blob and drops the row from there.
 func TestCompleteRetryDropsParkAfterFailedDelete(t *testing.T) {
-	hc := &haltingConcluder{}
+	hc := &haltingConcluder{parkingUploader: parkingUploader{Provider: inmem.NewProvider()}}
 	parks := &failDeletePark{fails: 1}
 	b, mem := newDeferredBackend(t, hc, func(d *Deps) {
 		parks.ParkStore = d.Parks
@@ -914,7 +925,7 @@ func TestCompleteRetryDropsParkAfterFailedDelete(t *testing.T) {
 // blob is accepted, so it is released through the accepted path and never
 // aborted on the provider as if it were parked.
 func TestSweepDropsStaleParkOfAcceptedBlob(t *testing.T) {
-	hc := &haltingConcluder{}
+	hc := &haltingConcluder{parkingUploader: parkingUploader{Provider: inmem.NewProvider()}}
 	parks := &failDeletePark{fails: 1}
 	b, mem := newDeferredBackend(t, hc, func(d *Deps) {
 		parks.ParkStore = d.Parks
@@ -949,7 +960,7 @@ func TestSweepDropsStaleParkOfAcceptedBlob(t *testing.T) {
 // and session rows are gone, so nothing else would find the row. The release
 // the sweep enqueued is the durable retry: it stands until the park is gone.
 func TestReleaseSweepDropsParkTheSessionSweepCouldNot(t *testing.T) {
-	hc := &haltingConcluder{}
+	hc := &haltingConcluder{parkingUploader: parkingUploader{Provider: inmem.NewProvider()}}
 	parks := &failDeletePark{fails: 1}
 	b, mem := newDeferredBackend(t, hc, func(d *Deps) {
 		parks.ParkStore = d.Parks
@@ -1021,7 +1032,7 @@ func (l locatedEverywhere) GetLocation(ctx context.Context, space did.DID, diges
 // drop a stale park row for it must not fail the write. Complete's dedup path
 // drops the row instead.
 func TestUploadPartToleratesFailedStaleParkDelete(t *testing.T) {
-	hc := &haltingConcluder{}
+	hc := &haltingConcluder{parkingUploader: parkingUploader{Provider: inmem.NewProvider()}}
 	parks := &failDeletePark{fails: 1}
 	b, mem := newDeferredBackend(t, hc, func(d *Deps) {
 		parks.ParkStore = d.Parks
@@ -1071,7 +1082,7 @@ func TestUploadPartToleratesFailedStaleParkDelete(t *testing.T) {
 // released through the accepted path, never aborted on the provider as though
 // it were still parked.
 func TestSweepReleasesLocatedBlobWhoseIntentLagged(t *testing.T) {
-	hc := &haltingConcluder{}
+	hc := &haltingConcluder{parkingUploader: parkingUploader{Provider: inmem.NewProvider()}}
 	intents := &failOnceMarkAccepted{armed: true}
 	rm := &recordingRemover{}
 	b, mem := newDeferredBackend(t, hc, func(d *Deps) {
@@ -1123,7 +1134,7 @@ func TestSweepReleasesLocatedBlobWhoseIntentLagged(t *testing.T) {
 // accepted; the sweeper must then release the blob as accepted rather than
 // leave the provider holding an allocation nothing will ever revisit.
 func TestSweepReleasesBlobTheProviderHoldsAccepted(t *testing.T) {
-	pu := &parkingUploader{acceptedOnProvider: map[string]bool{}}
+	pu := &parkingUploader{Provider: inmem.NewProvider(), acceptedOnProvider: map[string]bool{}}
 	rm := &recordingRemover{}
 	b, mem := newDeferredBackend(t, pu, func(d *Deps) { d.Remover = rm })
 	ctx := context.Background()
@@ -1220,7 +1231,7 @@ func (f *failRemover) RemoveBlob(ctx context.Context, space did.DID, d multihash
 // part rows — the only index to the blobs — survive for the sweeper, which
 // then releases the blobs on the provider.
 func TestAbortKeepsSessionWhenRecordingReleasesFails(t *testing.T) {
-	pu := &parkingUploader{}
+	pu := &parkingUploader{Provider: inmem.NewProvider()}
 	rel := &failEnqueueReleases{fails: 1}
 	b, mem := newDeferredBackend(t, pu, func(d *Deps) {
 		rel.PendingReleaseStore = d.PendingReleases
@@ -1270,7 +1281,7 @@ func TestAbortKeepsSessionWhenRecordingReleasesFails(t *testing.T) {
 // nothing — the release sweep executes the records while the row is still
 // latched aborting, and a later sweep drops the row.
 func TestAbortReleasesFromRecordsWhenSessionDeleteFails(t *testing.T) {
-	pu := &parkingUploader{}
+	pu := &parkingUploader{Provider: inmem.NewProvider()}
 	mp := &failDeleteSession{fails: 1}
 	b, mem := newDeferredBackend(t, pu, func(d *Deps) {
 		mp.MultipartStore = d.Multipart
@@ -1369,7 +1380,7 @@ func TestReleaseDefersWhileAnInFlightPartReferencesTheBlob(t *testing.T) {
 // the orphan again from the retained part rows, records it, and releases it,
 // so the orphan is released late rather than never.
 func TestCompletedSessionReapReleasesOrphansWhoseRecordingFailed(t *testing.T) {
-	pu := &parkingUploader{}
+	pu := &parkingUploader{Provider: inmem.NewProvider()}
 	rel := &failEnqueueReleases{}
 	rm := &recordingRemover{}
 	b, mem := newDeferredBackend(t, pu, func(d *Deps) {
@@ -1432,7 +1443,7 @@ func TestCompletedSessionReapReleasesOrphansWhoseRecordingFailed(t *testing.T) {
 // the superseded blobs' releases before it writes anything, so a failure to
 // record fails the request with the old part intact, and nothing is released.
 func TestSupersedeRecordsReleasesBeforeWriting(t *testing.T) {
-	pu := &parkingUploader{}
+	pu := &parkingUploader{Provider: inmem.NewProvider()}
 	rel := &failEnqueueReleases{}
 	b, mem := newDeferredBackend(t, pu, func(d *Deps) {
 		rel.PendingReleaseStore = d.PendingReleases
@@ -1483,7 +1494,7 @@ func TestSupersedeRecordsReleasesBeforeWriting(t *testing.T) {
 // nothing.
 func TestReleaseKeepsRowsUntilTheNetworkStepSucceeds(t *testing.T) {
 	rm := &failRemover{recordingRemover: &recordingRemover{}, fails: 1}
-	b, mem := newDeferredBackend(t, &parkingUploader{}, func(d *Deps) { d.Remover = rm })
+	b, mem := newDeferredBackend(t, &parkingUploader{Provider: inmem.NewProvider()}, func(d *Deps) { d.Remover = rm })
 	ctx := context.Background()
 	key := "network-retry"
 
@@ -1533,7 +1544,7 @@ func TestReleaseKeepsRowsUntilTheNetworkStepSucceeds(t *testing.T) {
 // reap leaves them alone.
 func TestCompletedSessionReapKeepsWinnersOfDeletedObject(t *testing.T) {
 	rm := &recordingRemover{}
-	b, mem := newDeferredBackend(t, &parkingUploader{}, func(d *Deps) { d.Remover = rm })
+	b, mem := newDeferredBackend(t, &parkingUploader{Provider: inmem.NewProvider()}, func(d *Deps) { d.Remover = rm })
 	ctx := context.Background()
 	key := "deleted-winners"
 	uploadID, parts := completeTwoParts(t, b, key)
@@ -1565,7 +1576,7 @@ func TestCompletedSessionReapKeepsWinnersOfDeletedObject(t *testing.T) {
 func TestCompletingSessionWhoseLatchFailedKeepsCommittedBlobs(t *testing.T) {
 	rm := &recordingRemover{}
 	mp := &failCompleteSession{}
-	b, mem := newDeferredBackend(t, &parkingUploader{}, func(d *Deps) {
+	b, mem := newDeferredBackend(t, &parkingUploader{Provider: inmem.NewProvider()}, func(d *Deps) {
 		mp.MultipartStore = d.Multipart
 		d.Multipart = mp
 		d.Remover = rm
@@ -1694,7 +1705,7 @@ func (r *recordingReleases) EnqueueReleases(ctx context.Context, space did.DID, 
 // create, so the sweep still records and runs its parts' releases against
 // that space rather than dropping the only index to the blobs.
 func TestSweepReleasesSessionThatOutlivedItsBucket(t *testing.T) {
-	pu := &parkingUploader{}
+	pu := &parkingUploader{Provider: inmem.NewProvider()}
 	rel := &recordingReleases{}
 	b, mem := newDeferredBackend(t, pu, func(d *Deps) {
 		rel.PendingReleaseStore = d.PendingReleases
@@ -1750,7 +1761,7 @@ func TestSweepReleasesSessionThatOutlivedItsBucket(t *testing.T) {
 // Complete and Abort all report NoSuchUpload, and the sweeper tears the
 // session down against the space recorded on it, never the new bucket's.
 func TestRecreatedBucketDisownsItsPredecessorsUploads(t *testing.T) {
-	pu := &parkingUploader{}
+	pu := &parkingUploader{Provider: inmem.NewProvider()}
 	rel := &recordingReleases{}
 	b, mem := newDeferredBackend(t, pu, func(d *Deps) {
 		rel.PendingReleaseStore = d.PendingReleases
@@ -1910,7 +1921,7 @@ func (h *hookAfterParkDeletes) DeletePark(ctx context.Context, digest multihash.
 func TestCompleteFailsWhenItsSessionIsTakenBeforeCommit(t *testing.T) {
 	rm := &recordingRemover{}
 	parks := &hookAfterParkDeletes{n: 2}
-	b, mem := newDeferredBackend(t, &parkingUploader{}, func(d *Deps) {
+	b, mem := newDeferredBackend(t, &parkingUploader{Provider: inmem.NewProvider()}, func(d *Deps) {
 		parks.ParkStore = d.Parks
 		d.Parks = parks
 		d.Remover = rm
@@ -1971,7 +1982,7 @@ func (s *teardownBeforePutPart) PutPart(ctx context.Context, p registry.Multipar
 // left behind with no row pointing at them.
 func TestUploadPartRefusedAfterTeardownReleasesItsBlobs(t *testing.T) {
 	mp := &teardownBeforePutPart{}
-	b, mem := newDeferredBackend(t, &parkingUploader{}, func(d *Deps) {
+	b, mem := newDeferredBackend(t, &parkingUploader{Provider: inmem.NewProvider()}, func(d *Deps) {
 		mp.MultipartStore = d.Multipart
 		d.Multipart = mp
 	})
@@ -2029,7 +2040,7 @@ func (f *failPutPart) PutPart(ctx context.Context, p registry.MultipartPart) err
 func TestUploadPartFailedRowWriteReleasesItsBlobs(t *testing.T) {
 	rm := &recordingRemover{}
 	mp := &failPutPart{fails: 1}
-	b, mem := newDeferredBackend(t, &parkingUploader{}, func(d *Deps) {
+	b, mem := newDeferredBackend(t, &parkingUploader{Provider: inmem.NewProvider()}, func(d *Deps) {
 		mp.MultipartStore = d.Multipart
 		d.Multipart = mp
 		d.Remover = rm
@@ -2088,7 +2099,7 @@ func TestReleaseKeepsIntentUntilLocalCleanupSucceeds(t *testing.T) {
 	rm := &recordingRemover{}
 	mp := &failPutPart{fails: 1}
 	shred := &failShred{}
-	b, mem := newDeferredBackend(t, &parkingUploader{}, func(d *Deps) {
+	b, mem := newDeferredBackend(t, &parkingUploader{Provider: inmem.NewProvider()}, func(d *Deps) {
 		mp.MultipartStore = d.Multipart
 		d.Multipart = mp
 		shred.EncryptionParamsStore = d.EncParams
@@ -2151,7 +2162,7 @@ func TestLocalOnlyReleaseDropsIntentWithItsRecord(t *testing.T) {
 	rm := &recordingRemover{}
 	mp := &failPutPart{fails: 1}
 	rel := &failDeleteRelease{}
-	b, mem := newDeferredBackend(t, &parkingUploader{}, func(d *Deps) {
+	b, mem := newDeferredBackend(t, &parkingUploader{Provider: inmem.NewProvider()}, func(d *Deps) {
 		mp.MultipartStore = d.Multipart
 		d.Multipart = mp
 		rel.PendingReleaseStore = d.PendingReleases
@@ -2201,7 +2212,7 @@ func TestLocalOnlyReleaseDropsIntentWithItsRecord(t *testing.T) {
 func TestReapDoesNotRecordAReleaseAlreadyRunToCompletion(t *testing.T) {
 	rm := &recordingRemover{}
 	mp := &failDeleteSession{fails: 2}
-	pu := &parkingUploader{}
+	pu := &parkingUploader{Provider: inmem.NewProvider()}
 	b, mem := newDeferredBackend(t, pu, func(d *Deps) {
 		mp.MultipartStore = d.Multipart
 		d.Multipart = mp
@@ -2261,7 +2272,7 @@ func TestReapDoesNotRecordAReleaseAlreadyRunToCompletion(t *testing.T) {
 func TestReleaseRemovesBlobAcceptedWithoutRows(t *testing.T) {
 	rm := &recordingRemover{}
 	locs := &failOncePutLocation{}
-	b, mem := newDeferredBackend(t, inmem.NopUploader{}, func(d *Deps) {
+	b, mem := newDeferredBackend(t, inmem.NewProvider(), func(d *Deps) {
 		locs.LocationStore = d.Locations
 		d.Locations = locs
 		d.Remover = rm
