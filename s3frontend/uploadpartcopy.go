@@ -29,7 +29,7 @@ const maxCopySize = 5 << 30
 
 // UploadPartCopy ingests a part whose bytes are a range of an existing object:
 // the source's plaintext streams through the decrypting read path into the
-// same ingest UploadPart uses, so the part is spooled, parked and recorded
+// same ingest UploadPart uses, so the part is sent, parked and recorded
 // exactly like an uploaded one, in new blobs under the destination's space.
 // Nothing is shared with the source, so the source may live in any bucket of
 // the tenant, in any space.

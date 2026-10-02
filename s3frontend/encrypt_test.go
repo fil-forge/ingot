@@ -24,8 +24,8 @@ import (
 	"github.com/fil-forge/ingot/tenantkey"
 )
 
-// These tests drive the full write path (PutObject → SplitBody →
-// encryptingBlobWriter → spool + registry rows) through the public S3
+// These tests drive the full write path (PutObject → SplitSizedBody →
+// encryptingBlobWriter → provider + registry rows) through the public S3
 // surface and check the encryption RFC's two observable criteria:
 // correctness (every read returns the plaintext bytes) and opacity (what
 // lands in storage shares nothing with the plaintext).
@@ -220,7 +220,7 @@ func testTenantKeys() tenantkey.Source {
 	return tenantkey.NewStatic(testWrapKey.PublicKey())
 }
 
-// recipientOf decodes a spooled envelope and returns its single COSE
+// recipientOf decodes a stored envelope and returns its single COSE
 // recipient, failing if the envelope is not a one-recipient COSE_Encrypt.
 func recipientOf(t *testing.T, stored []byte) *cose.Recipient {
 	t.Helper()
@@ -299,7 +299,7 @@ func TestEncryptedWrite_TenantRecipient(t *testing.T) {
 }
 
 // TestEncryptedWrite_MultipartTenantRecipient: part blobs carry the tenant
-// recipient too (UploadPart shares splitSpool with PutObject).
+// recipient too (UploadPart shares sendBlobs with PutObject).
 func TestEncryptedWrite_MultipartTenantRecipient(t *testing.T) {
 	b, _, _ := newRefTestBackend(t)
 	key := "mp-recipient"
@@ -325,7 +325,7 @@ func (f failingTenantKeys) WrapKey(context.Context) (string, *ecdh.PublicKey, er
 }
 
 // TestEncryptedWrite_FailsClosedWithoutRecipient: a write whose tenant wrap
-// key cannot be obtained is refused before anything is spooled or recorded —
+// key cannot be obtained is refused before anything is sent or recorded —
 // there is no region-only fallback.
 func TestEncryptedWrite_FailsClosedWithoutRecipient(t *testing.T) {
 	b, _, _ := newRefTestBackend(t)

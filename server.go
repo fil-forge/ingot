@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"path/filepath"
 	"time"
 
@@ -70,7 +71,7 @@ type ServerDeps struct {
 	// separate implementations or one that does both.
 	Registry registry.Registry
 
-	// Intents tracks the local spool's upload_intents lifecycle; Locations
+	// Intents tracks the upload_intents lifecycle of blobs sent to a provider; Locations
 	// records where each accepted body blob (and shipped catalog shard) can be
 	// retrieved from; Inclusions records each shipped shard's inner-block byte
 	// ranges so retired catalog blocks stay resolvable; BlobRefs is the reverse
@@ -182,6 +183,8 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		return nil, fmt.Errorf("ingot: replay buffer: %w", err)
 	}
 
+	warnLegacySpool(logger, cfg.DataDir)
+
 	bs := blockstore.NewLayered(log, deps.BaseBlockReader)
 	backend := s3frontend.New(s3frontend.Deps{
 		Authority:       deps.Authority,
@@ -249,8 +252,8 @@ func (s *Server) Start(ctx context.Context) error {
 }
 
 // startMultipartSweeper spawns the abandoned-multipart-session sweeper: open
-// sessions older than MultipartSessionTTL are aborted (their spooled parts
-// dropped) and terminal session rows reaped. Zero TTL → 7-day default;
+// sessions older than MultipartSessionTTL are aborted (their parked parts
+// released) and terminal session rows reaped. Zero TTL → 7-day default;
 // negative → disabled.
 func (s *Server) startMultipartSweeper() {
 	ttl := s.cfg.MultipartSessionTTL
@@ -589,6 +592,18 @@ func validateServerInputs(cfg config.ServerConfig, deps ServerDeps) error {
 		return errors.New("ingot: ServerDeps.Identity is required")
 	}
 	return nil
+}
+
+// warnLegacySpool reports a spool directory left in dataDir by an earlier
+// version. Nothing reads or removes what it holds: the blobs it kept are on
+// their providers, so the directory can be deleted. It is only reported,
+// never removed here, because the files are not ingot's to delete unasked.
+func warnLegacySpool(logger *zap.Logger, dataDir string) {
+	path := filepath.Join(dataDir, "spool")
+	if fi, err := os.Stat(path); err == nil && fi.IsDir() {
+		logger.Warn("ignoring a legacy spool directory; it is no longer used and can be deleted",
+			zap.String("path", path))
+	}
 }
 
 func applyServerDefaults(cfg config.ServerConfig) config.ServerConfig {

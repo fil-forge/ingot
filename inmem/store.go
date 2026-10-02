@@ -401,8 +401,7 @@ func (NopBaseReader) GetBlock(_ context.Context, _ did.DID, _ cid.Cid) (block.Bl
 }
 
 // OpenBlob is the streaming-read counterpart: with no network tier, an evicted
-// body blob is unrecoverable. (The harness never evicts, so reads come from the
-// spool.)
+// body blob is unrecoverable. (Tests that read body blobs back use Provider.)
 func (NopBaseReader) OpenBlob(_ context.Context, _ did.DID, _ multihash.Multihash) (io.ReadCloser, error) {
 	return nil, blockstore.ErrNotFound
 }

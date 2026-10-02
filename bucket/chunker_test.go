@@ -6,7 +6,6 @@ import (
 	"crypto/md5"
 	"crypto/sha256"
 	"io"
-	"path/filepath"
 	"testing"
 
 	"github.com/fil-forge/ucantone/did"
@@ -38,14 +37,45 @@ func TestDefaultMaxBlobSizeFitsPiri(t *testing.T) {
 	}
 }
 
-func testSpool(t *testing.T) *blockstore.Spool {
-	t.Helper()
-	s, err := blockstore.NewSpool(filepath.Join(t.TempDir(), "spool"))
-	if err != nil {
-		t.Fatalf("spool: %v", err)
-	}
-	return s
+// memBlobs is an in-memory blob store: a blockstore.BlobWriter that keeps what
+// it is given under its sha256 digest, and the BlobReader over it. Its readers
+// are seekable, as a local file's is; set noSeek to serve plain streams, as a
+// network read does.
+type memBlobs struct {
+	blobs  map[string][]byte
+	noSeek bool
 }
+
+func newMemBlobs() *memBlobs { return &memBlobs{blobs: map[string][]byte{}} }
+
+func (m *memBlobs) WriteBlob(_ context.Context, r io.Reader) (mh.Multihash, int64, error) {
+	data, err := io.ReadAll(r)
+	if err != nil || len(data) == 0 {
+		return nil, int64(len(data)), err
+	}
+	digest, err := mh.Sum(data, mh.SHA2_256, -1)
+	if err != nil {
+		return nil, int64(len(data)), err
+	}
+	m.blobs[string(digest)] = data
+	return digest, int64(len(data)), nil
+}
+
+func (m *memBlobs) OpenBlob(_ context.Context, _ did.DID, digest mh.Multihash) (io.ReadCloser, error) {
+	data, ok := m.blobs[string(digest)]
+	if !ok {
+		return nil, blockstore.ErrNotFound
+	}
+	if m.noSeek {
+		return io.NopCloser(bytes.NewReader(data)), nil
+	}
+	return seekableBlob{bytes.NewReader(data)}, nil
+}
+
+// seekableBlob is a bytes.Reader with a Close, the shape of an open file.
+type seekableBlob struct{ *bytes.Reader }
+
+func (seekableBlob) Close() error { return nil }
 
 func makeData(n int) []byte {
 	d := make([]byte, n)
@@ -55,12 +85,12 @@ func makeData(n int) []byte {
 	return d
 }
 
-// TestSplitBody_StreamingRoundTrip splits a multi-blob body through the spool and
-// reads it back, asserting the blob boundaries, the whole-body digests, and a
-// byte-exact round trip — all via the streaming WriteBlob/OpenBlob path.
+// TestSplitBody_StreamingRoundTrip splits a multi-blob body into a blob store
+// and reads it back, asserting the blob boundaries, the whole-body digests, and
+// a byte-exact round trip — all via the streaming WriteBlob/OpenBlob path.
 func TestSplitBody_StreamingRoundTrip(t *testing.T) {
 	ctx := context.Background()
-	sp := testSpool(t)
+	sp := newMemBlobs()
 	const max = int64(4096)
 	data := makeData(10000) // → blobs of 4096, 4096, 1808
 
@@ -107,42 +137,48 @@ func TestSplitBody_StreamingRoundTrip(t *testing.T) {
 }
 
 // TestOpenBodyRange covers ranged reads that start mid-blob and span blob
-// boundaries — exercising the seek-into-blob path of the streaming reader.
+// boundaries, over a seekable store (the seek-into-blob path of the streaming
+// reader) and a plain stream (read-and-discard).
 func TestOpenBodyRange(t *testing.T) {
-	ctx := context.Background()
-	sp := testSpool(t)
-	const max = int64(4096)
-	data := makeData(10000)
-	body, err := SplitBody(ctx, sp, bytes.NewReader(data), max)
-	if err != nil {
-		t.Fatalf("SplitBody: %v", err)
-	}
+	for name, noSeek := range map[string]bool{"seekable": false, "stream": true} {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			sp := newMemBlobs()
+			sp.noSeek = noSeek
+			const max = int64(4096)
+			data := makeData(10000)
+			body, err := SplitBody(ctx, sp, bytes.NewReader(data), max)
+			if err != nil {
+				t.Fatalf("SplitBody: %v", err)
+			}
 
-	cases := []struct{ start, end int64 }{
-		{0, 9999},    // whole object
-		{0, 0},       // first byte
-		{4095, 4096}, // straddles the first/second blob boundary
-		{5000, 6000}, // wholly inside the second blob (mid-blob start)
-		{8192, 9999}, // the whole last (short) blob
-		{9999, 9999}, // last byte
-		{100, 8500},  // spans all three blobs, mid-blob start
-	}
-	for _, c := range cases {
-		got, err := io.ReadAll(OpenBodyRange(ctx, NewPlainOpener(sp), did.Undef, body, c.start, c.end))
-		if err != nil {
-			t.Fatalf("range [%d,%d]: %v", c.start, c.end, err)
-		}
-		want := data[c.start : c.end+1]
-		if !bytes.Equal(got, want) {
-			t.Errorf("range [%d,%d]: got %d bytes, want %d (mismatch)", c.start, c.end, len(got), len(want))
-		}
+			cases := []struct{ start, end int64 }{
+				{0, 9999},    // whole object
+				{0, 0},       // first byte
+				{4095, 4096}, // straddles the first/second blob boundary
+				{5000, 6000}, // wholly inside the second blob (mid-blob start)
+				{8192, 9999}, // the whole last (short) blob
+				{9999, 9999}, // last byte
+				{100, 8500},  // spans all three blobs, mid-blob start
+			}
+			for _, c := range cases {
+				got, err := io.ReadAll(OpenBodyRange(ctx, NewPlainOpener(sp), did.Undef, body, c.start, c.end))
+				if err != nil {
+					t.Fatalf("range [%d,%d]: %v", c.start, c.end, err)
+				}
+				want := data[c.start : c.end+1]
+				if !bytes.Equal(got, want) {
+					t.Errorf("range [%d,%d]: got %d bytes, want %d (mismatch)", c.start, c.end, len(got), len(want))
+				}
+			}
+		})
 	}
 }
 
 // TestSplitBody_Empty: a zero-byte body yields no blobs and the empty digests.
 func TestSplitBody_Empty(t *testing.T) {
 	ctx := context.Background()
-	sp := testSpool(t)
+	sp := newMemBlobs()
 	body, err := SplitBody(ctx, sp, bytes.NewReader(nil), 4096)
 	if err != nil {
 		t.Fatalf("SplitBody: %v", err)
@@ -190,9 +226,9 @@ func TestLazyETagHash(t *testing.T) {
 	}
 }
 
-// hashingDiscardWriter stands in for the spool in benchmarks: it pays the
-// spool's sha256 pass over the bytes and drops them, so the benchmark
-// measures SplitBody's own hashing rather than the disk.
+// hashingDiscardWriter stands in for a blob store in benchmarks: it pays the
+// sha256 pass over the bytes and drops them, so the benchmark measures
+// SplitBody's own hashing rather than storage.
 type hashingDiscardWriter struct{}
 
 func (hashingDiscardWriter) WriteBlob(_ context.Context, r io.Reader) (mh.Multihash, int64, error) {
@@ -206,7 +242,7 @@ func (hashingDiscardWriter) WriteBlob(_ context.Context, r io.Reader) (mh.Multih
 }
 
 // BenchmarkSplitBody measures one stream through SplitBody: the whole-body
-// sha256 and md5 plus the spool's sha256 of each blob, with no disk.
+// sha256 and md5 plus the sha256 of each blob, with no storage.
 func BenchmarkSplitBody(b *testing.B) {
 	const size = 64 << 20
 	data := makeData(size)
@@ -242,13 +278,13 @@ func BenchmarkSplitBodyParallel(b *testing.B) {
 // WithoutMD5 leaves Body.MD5 nil and changes nothing else about the split.
 func TestSplitBody_WithoutMD5(t *testing.T) {
 	ctx := context.Background()
-	sp := testSpool(t)
+	sp := newMemBlobs()
 	data := makeData(3*4096 + 100)
 	with, err := SplitBody(ctx, sp, bytes.NewReader(data), 4096)
 	if err != nil {
 		t.Fatalf("SplitBody: %v", err)
 	}
-	without, err := SplitBody(ctx, testSpool(t), bytes.NewReader(data), 4096, WithoutMD5())
+	without, err := SplitBody(ctx, newMemBlobs(), bytes.NewReader(data), 4096, WithoutMD5())
 	if err != nil {
 		t.Fatalf("SplitBody without md5: %v", err)
 	}

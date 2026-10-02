@@ -47,7 +47,7 @@ func TestCompleteConcludesPartsInOneCall(t *testing.T) {
 	var digests []multihash.Multihash
 	for i := 1; i <= parts; i++ {
 		n := int32(i)
-		// Distinct bodies: identical parts would share one spooled blob and
+		// Distinct bodies: identical parts would share one blob and
 		// collapse the batch.
 		body := append(testBody(int(backend.MinPartSize)), byte(i))
 		out, err := mpUploadPart(t, b, key, uploadID, n, body, nil)

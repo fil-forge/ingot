@@ -383,71 +383,52 @@ func hiltProvisionTenantErr(ctx context.Context, s *stack.Stack, tenantID string
 	return created.AccessKeyID, created.SecretAccessKey, nil
 }
 
-// spoolBlobCount counts the body blobs in the ingot container's spool,
-// ignoring in-progress temp files. Used to prove object bodies are spooled by
-// digest (the data-plane inversion), not journaled into the log.
-func spoolBlobCount(t *testing.T, ctx context.Context, s *stack.Stack) int {
+// uploadIntentSizes lists the blobs ingot has sent to providers and not yet
+// released: hex digest to stored (envelope) byte count, from upload_intents.
+// Diffing two listings around a write identifies the envelope(s) that write
+// sent — the digest names the ciphertext, so it cannot be computed from the
+// plaintext — and a release removes its row.
+func uploadIntentSizes(t *testing.T, ctx context.Context, s *stack.Stack) map[string]int64 {
 	t.Helper()
-	out, errOut, err := s.Exec(ctx, "ingot", "sh", "-c",
-		`find /data/spool -maxdepth 1 -type f ! -name '.tmp*' 2>/dev/null | wc -l`)
-	if err != nil {
-		t.Fatalf("count spool blobs: %v (stderr=%s)", err, errOut)
-	}
-	n, err := strconv.Atoi(strings.TrimSpace(out))
-	if err != nil {
-		t.Fatalf("parse spool count %q: %v", out, err)
-	}
-	return n
-}
-
-// spoolBlobPaths lists the body-blob files in the ingot container's spool
-// (full paths, in-progress temp files excluded). Diffing two listings around
-// a PUT identifies the envelope(s) that PUT spooled — the filename is the
-// ciphertext digest, so it cannot be computed from the plaintext.
-func spoolBlobPaths(t *testing.T, ctx context.Context, s *stack.Stack) map[string]bool {
-	t.Helper()
-	out, errOut, err := s.Exec(ctx, "ingot", "sh", "-c",
-		`find /data/spool -maxdepth 1 -type f ! -name '.tmp*' 2>/dev/null`)
-	if err != nil {
-		t.Fatalf("list spool blobs: %v (stderr=%s)", err, errOut)
-	}
-	paths := map[string]bool{}
-	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
-		if line != "" {
-			paths[line] = true
+	out := ingotSQL(t, ctx, s, `SELECT encode(digest,'hex') || ' ' || size FROM ingot.upload_intents`)
+	sizes := map[string]int64{}
+	for _, line := range strings.Split(out, "\n") {
+		if line = strings.TrimSpace(line); line == "" {
+			continue
 		}
+		hexDigest, size, ok := strings.Cut(line, " ")
+		n, err := strconv.ParseInt(size, 10, 64)
+		if !ok || err != nil {
+			t.Fatalf("parse upload intent row %q", line)
+		}
+		sizes[hexDigest] = n
 	}
-	return paths
+	return sizes
 }
 
-// newSpoolPaths returns the paths in after that are not in before.
-func newSpoolPaths(before, after map[string]bool) []string {
+// newIntentDigests returns the digests in after that are not in before.
+func newIntentDigests(before, after map[string]int64) []string {
 	var added []string
-	for p := range after {
-		if !before[p] {
-			added = append(added, p)
+	for d := range after {
+		if _, ok := before[d]; !ok {
+			added = append(added, d)
 		}
 	}
 	return added
 }
 
-// corruptSpoolFileTail overwrites 16 bytes of the spooled envelope at path,
-// tailOffset bytes from its end, with zeros — a byte-level tamper inside the
-// final ciphertext chunk (the envelope's tail is STREAM ciphertext; 16
-// random bytes are all-zero with probability 2^-128). Fails if the file
-// content did not change.
-func corruptSpoolFileTail(t *testing.T, ctx context.Context, s *stack.Stack, path string, tailOffset int64) {
+// waitForIntentCount polls until the number of intents beyond baseline equals
+// want: a release deletes its intent only once the network has let go of the
+// blob, which an in-request release attempts and the release sweeper retries.
+func waitForIntentCount(t *testing.T, ctx context.Context, s *stack.Stack, baseline map[string]int64, want int, timeout time.Duration) int {
 	t.Helper()
-	script := fmt.Sprintf(`
-		f=%q
-		size=$(wc -c < "$f")
-		before=$(md5sum "$f")
-		dd if=/dev/zero of="$f" bs=1 seek=$((size-%d)) count=16 conv=notrunc 2>/dev/null
-		after=$(md5sum "$f")
-		[ "$before" != "$after" ] || { echo "file unchanged" >&2; exit 1; }
-	`, path, tailOffset)
-	if out, errOut, err := s.Exec(ctx, "ingot", "sh", "-c", script); err != nil {
-		t.Fatalf("corrupt spool file %s: %v (stdout=%s stderr=%s)", path, err, out, errOut)
+	deadline := time.Now().Add(timeout)
+	for {
+		got := len(newIntentDigests(baseline, uploadIntentSizes(t, ctx, s)))
+		if got == want || time.Now().After(deadline) {
+			return got
+		}
+		time.Sleep(2 * time.Second)
 	}
 }
 

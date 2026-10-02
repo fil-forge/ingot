@@ -68,10 +68,11 @@ to the new one. That split is the heart of the design:
 
 A write splits into two paths:
 
-- **Bodies** stream into a local spool (sha256 and md5 in one pass), split
-  into blobs of at most `max_blob_size`, and upload to Forge storage
-  synchronously: `/blob/add` via sprue, an HTTP PUT to the allocated piri,
-  and the accepted location commitment, all before the catalog commit.
+- **Bodies** are hashed as they stream (sha256 and md5 in one pass), split
+  into blobs of at most `max_blob_size`, and sent to Forge storage as they
+  arrive: `/blob/add` via sprue, an HTTP PUT to the allocated piri, and the
+  accepted location commitment, all before the catalog commit. Nothing is
+  kept locally once a blob is sent.
   Identical bytes dedup by digest; a reference index (`blob_refs`) counts
   which versions still claim each blob and releases it (`/blob/remove`) when
   the count reaches zero.
