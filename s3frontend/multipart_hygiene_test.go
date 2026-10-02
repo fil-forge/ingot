@@ -531,7 +531,7 @@ func newDeferredBackend(t *testing.T, up deferredTestUploader, mods ...func(*Dep
 		GC:              mem,
 		Multipart:       mem,
 		Parks:           mem,
-		Reads:           blockstore.NewLayered(nil, log, base),
+		Reads:           blockstore.NewLayered(log, base),
 		Log:             log,
 		Spool:           spool,
 		Uploader:        up,

@@ -71,7 +71,7 @@ func TestUpload_IdenticalContentUploadsDistinctBlobs(t *testing.T) {
 		Locations:  mem,
 		BlobRefs:   mem,
 		GC:         mem,
-		Reads:      blockstore.NewLayered(spool, log, inmem.NopBaseReader{}),
+		Reads:      blockstore.NewLayered(log, inmem.NopBaseReader{}),
 		Log:        log,
 		Spool:      spool,
 		Uploader:   up,

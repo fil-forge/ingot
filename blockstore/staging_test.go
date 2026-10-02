@@ -138,7 +138,7 @@ func TestLayeredAndStagingHappyPath(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = log.Close(context.Background()) })
 
-	bs := blockstore.NewLayered(nil, log, noopBase{})
+	bs := blockstore.NewLayered(log, noopBase{})
 
 	// Stage two blocks for bucket "alpha", commit, then Get them back
 	// via the layered store.
@@ -181,7 +181,7 @@ func TestLayeredFallsThroughToBaseOnMiss(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = log.Close(context.Background()) })
 
-	bs := blockstore.NewLayered(nil, log, noopBase{})
+	bs := blockstore.NewLayered(log, noopBase{})
 	missing := makeBlock(t, []byte("nope")).Cid()
 	_, err = bs.GetBlock(context.Background(), did.Undef, missing)
 	if !errors.Is(err, errUnknownBase) {
@@ -205,7 +205,7 @@ func TestStagingDiscardLeavesLogUntouched(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = log.Close(context.Background()) })
 
-	bs := blockstore.NewLayered(nil, log, noopBase{})
+	bs := blockstore.NewLayered(log, noopBase{})
 	stage := blockstore.NewOpStaging(bs, log, "alpha", did.Undef)
 	blk := makeBlock(t, []byte("never-committed"))
 	if err := stage.Put(context.Background(), blk); err != nil {
