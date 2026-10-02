@@ -24,6 +24,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 
+	"github.com/fil-forge/ingot/blockstore"
 	"github.com/fil-forge/ingot/inmem"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/uploader"
@@ -38,10 +39,13 @@ type streamingUploader struct {
 	// unsupported refuses every allocation by digest code.
 	unsupported bool
 	// failPuts makes the PUTs fail after reading this many bytes; negative
-	// never fails.
-	failPuts int64
+	// never fails. failFirst limits that to the first this many PUTs; zero
+	// fails them all.
+	failPuts  int64
+	failFirst int
 
 	mu        sync.Mutex
+	putCalls  int
 	started   []uploader.StreamedBlob
 	puts      map[cid.Cid][]byte
 	putErrs   map[cid.Cid]error
@@ -79,7 +83,11 @@ func (s *streamingUploader) StartBlob(_ context.Context, _ did.DID, size int64) 
 func (s *streamingUploader) PutBlob(_ context.Context, sb uploader.StreamedBlob, body io.Reader) error {
 	var buf bytes.Buffer
 	var err error
-	if s.failPuts >= 0 {
+	s.mu.Lock()
+	s.putCalls++
+	failing := s.failPuts >= 0 && (s.failFirst == 0 || s.putCalls <= s.failFirst)
+	s.mu.Unlock()
+	if failing {
 		_, _ = io.CopyN(&buf, body, s.failPuts)
 		err = errors.New("provider went away")
 	} else {
@@ -161,13 +169,6 @@ func putSized(t *testing.T, b *Backend, key string, data []byte, declared int64)
 	return err
 }
 
-func spooled(t *testing.T, b *Backend, digest multihash.Multihash) []byte {
-	t.Helper()
-	data, err := os.ReadFile(b.spool.Path(digest))
-	require.NoError(t, err)
-	return data
-}
-
 func staleStreams(t *testing.T, mem *inmem.MemStore) []registry.BlobStream {
 	t.Helper()
 	rows, err := mem.ListStaleStreams(context.Background(), time.Now().Add(time.Hour), 1000)
@@ -190,11 +191,13 @@ func TestStreamedPutObject(t *testing.T) {
 	require.Len(t, su.concluded, 3)
 	for i, d := range digests {
 		sb := su.started[i]
-		envelope := spooled(t, b, d)
-		require.Equal(t, envelope, su.puts[sb.AddTask], "the provider got the spooled envelope")
+		envelope := su.puts[sb.AddTask]
+		require.Equal(t, mustSum(envelope), d, "the blob is named by the digest of the envelope the provider got")
 		require.Equal(t, int64(len(envelope)), sb.Size, "the allocation was the envelope's length")
+		_, err := os.Stat(b.spool.Path(d))
+		require.ErrorIs(t, err, os.ErrNotExist, "nothing is spooled for a streamed blob")
 
-		require.Equal(t, d, su.concluded[i].Digest, "the conclude reports the spooled digest")
+		require.Equal(t, d, su.concluded[i].Digest, "the conclude reports the streamed digest")
 		require.Equal(t, sb.AddTask, su.concluded[i].AddTask)
 
 		in, err := mem.GetIntent(ctx, d)
@@ -235,22 +238,45 @@ func TestStreamedPutObjectEmpty(t *testing.T) {
 	require.Empty(t, getRange(t, b, "k", ""))
 }
 
-func TestStreamedPutObjectFailedPut(t *testing.T) {
+// A send that fails is repeated from the replay buffer under a fresh
+// allocation, and the failed allocation is released.
+func TestStreamedPutObjectFailedPutIsResent(t *testing.T) {
 	su := newStreamingUploader()
 	su.failPuts = 1000
+	su.failFirst = 2 // the first blob's live send and its first resend
 	b, mem := newStreamingBackend(t, su)
 	data := testBody(400 << 10) // 2 blobs
 
 	require.NoError(t, putSized(t, b, "k", data, int64(len(data))))
 
 	digests := blobDigestsOf(t, b, "k", "")
-	require.Len(t, su.started, 2)
-	require.Equal(t, digests, su.uploaded, "each blob falls back to uploading its spooled copy")
-	require.Empty(t, su.concluded)
+	require.Len(t, digests, 2)
+	require.Len(t, su.started, 4, "the first blob took three allocations and the second one")
+	require.Empty(t, su.uploaded, "nothing is uploaded by digest")
+	require.Len(t, su.concluded, 2)
 	require.Equal(t, []cid.Cid{su.started[0].AddTask, su.started[1].AddTask}, su.aborted,
-		"the allocations that took the failed PUTs are released")
+		"the allocations that took the failed sends are released")
+	for i, d := range digests {
+		got := su.puts[su.concluded[i].AddTask]
+		require.Equal(t, mustSum(got), d, "the resent bytes are the blob")
+	}
 	require.Empty(t, staleStreams(t, mem))
 	require.Equal(t, data, getRange(t, b, "k", ""))
+}
+
+// A blob whose every send fails fails the request, rather than being left
+// without a copy anywhere.
+func TestStreamedPutObjectGivesUpAfterRepeatedFailures(t *testing.T) {
+	su := newStreamingUploader()
+	su.failPuts = 1000
+	b, mem := newStreamingBackend(t, su)
+	data := testBody(400 << 10)
+
+	require.Error(t, putSized(t, b, "k", data, int64(len(data))))
+	require.Len(t, su.started, streamAttempts)
+	require.Len(t, su.aborted, streamAttempts, "every failed allocation is released")
+	require.Empty(t, su.concluded)
+	require.Empty(t, staleStreams(t, mem))
 }
 
 func TestStreamedPutObjectUnsupportedDigestCode(t *testing.T) {
@@ -471,3 +497,64 @@ func TestStreamedPutObjectUnrecordedStreamIsAborted(t *testing.T) {
 }
 
 func ptrInt32(v int32) *int32 { return &v }
+
+// Every copy a PUT keeps for resending is gone when the PUT returns, whether
+// it succeeded or failed.
+func TestStreamedPutObjectReleasesItsReplayCopies(t *testing.T) {
+	replay, err := blockstore.NewReplayBuffer(t.TempDir(), 4*streamBlobCeiling, time.Second)
+	require.NoError(t, err)
+	for name, failPuts := range map[string]int64{"sent": -1, "failed": 1000} {
+		t.Run(name, func(t *testing.T) {
+			su := newStreamingUploader()
+			su.failPuts = failPuts
+			b, _ := newDeferredBackend(t, su, func(d *Deps) {
+				d.Streaming = su
+				d.Streams = d.Parks.(*inmem.MemStore)
+				d.MaxBlobSize = streamBlobCeiling
+				d.Replay = replay
+			})
+			data := testBody(400 << 10)
+			_ = putSized(t, b, "k", data, int64(len(data)))
+			require.Equal(t, blockstore.ReplayStats{Capacity: 4 * streamBlobCeiling}, replay.Stats())
+		})
+	}
+}
+
+// A node whose replay buffer is full answers SlowDown before reading any of
+// the body, so the client backs off rather than the node taking bytes it has
+// nowhere to keep.
+func TestStreamedPutObjectSlowDownWhenReplayBufferFull(t *testing.T) {
+	replay, err := blockstore.NewReplayBuffer(t.TempDir(), 2*streamBlobCeiling, 20*time.Millisecond)
+	require.NoError(t, err)
+	hold, err := replay.Acquire(context.Background(), 2*streamBlobCeiling)
+	require.NoError(t, err)
+	defer hold.Close()
+
+	su := newStreamingUploader()
+	b, _ := newDeferredBackend(t, su, func(d *Deps) {
+		d.Streaming = su
+		d.Streams = d.Parks.(*inmem.MemStore)
+		d.MaxBlobSize = streamBlobCeiling
+		d.Replay = replay
+	})
+	body := &countingBody{r: bytes.NewReader(testBody(100 << 10))}
+	bucket, key, n := "bk", "k", int64(100<<10)
+	_, err = b.PutObject(context.Background(), s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: body, ContentLength: &n})
+
+	var apiErr s3err.APIError
+	require.ErrorAs(t, err, &apiErr)
+	require.Equal(t, "SlowDown", apiErr.Code)
+	require.Empty(t, su.started, "nothing was allocated")
+	require.Zero(t, body.n, "none of the body was read")
+}
+
+type countingBody struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingBody) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
+}
