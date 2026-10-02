@@ -60,8 +60,9 @@ type encryptingBlobWriter struct {
 
 	// stream, when set, sends each sized blob to its provider while it is
 	// spooled (see WriteSizedBlob); streams records each such upload until
-	// its park or acceptance is. digestFirst latches once the upload service
-	// refuses to add by digest code, so the rest of the body spools first.
+	// its park or acceptance is recorded. digestFirst latches once the upload
+	// service refuses to add by digest code, so the rest of the body spools
+	// first.
 	stream      uploader.StreamingBodyUploader
 	streams     registry.StreamStore
 	lease       *streamLease

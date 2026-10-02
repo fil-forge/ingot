@@ -64,9 +64,9 @@ type ServerDeps struct {
 	Remover  uploader.BlobRemover
 	// Streaming, when set, uploads each body blob while it is
 	// spooled, allocating it before its digest is known; Streams records
-	// each such upload until its park or acceptance is, and is required with
-	// it. Without Streaming every blob is spooled first and uploaded by
-	// digest.
+	// each such upload until its park or acceptance is recorded, and is
+	// required with it. Without Streaming every blob is spooled first and
+	// uploaded by digest.
 	Streaming uploader.StreamingBodyUploader
 	Streams   registry.StreamStore
 
