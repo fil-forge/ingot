@@ -516,7 +516,7 @@ func buildS3API(ctx context.Context, backend *s3frontend.Backend, cfg config.Ser
 	// AWS-shaped document, which a Forge policy is not, and its backend seam
 	// carries neither the request's preconditions nor a response ETag. Hilt
 	// authenticates and authorizes the forwarded request itself.
-	opts = append(opts, policyRoutes(authority, logger)...)
+	opts = append(opts, policyRoutes(backend, authority, logger)...)
 
 	// No s3api.WithRootUser: the gateway has no root account, so every access
 	// key resolves through iam.
