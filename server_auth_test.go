@@ -59,7 +59,7 @@ func TestBuildS3API_NoRootShortCircuit(t *testing.T) {
 
 	cfg := config.ServerConfig{Region: "us-east-1", MaxConnections: 16, MaxRequests: 16}
 	// No backend: authentication fails before any handler runs.
-	api, err := buildS3API(ctx, nil, cfg, rec, id, zap.NewNop())
+	api, err := buildS3API(ctx, nil, cfg, rec, id, nil, zap.NewNop())
 	require.NoError(t, err)
 
 	addr := freeAddr(t)

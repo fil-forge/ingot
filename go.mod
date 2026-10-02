@@ -12,11 +12,11 @@ require (
 	github.com/cenkalti/backoff/v5 v5.0.3
 	github.com/cloud-portable/s3tests/packages/go v0.0.0-20260916120817-ce77c26e7f6d
 	github.com/exaring/otelpgx v0.12.0
-	github.com/fil-forge/hilt v0.0.1-0.20260921155013-468abb181a04
+	github.com/fil-forge/hilt v0.0.1-0.20261002160141-9259840a1459
 	github.com/fil-forge/indexing-service v1.13.5-0.20260820151722-9eb620409a4e
-	github.com/fil-forge/libforge v0.0.0-20261001200856-b2db386b1f96
+	github.com/fil-forge/libforge v0.0.0-20261002123347-24293c113b04
 	github.com/fil-forge/smelt v0.0.0-20260915151825-96fc212b8d91
-	github.com/fil-forge/swarf v0.0.1-0.20260821142121-d5d1a0a56f00
+	github.com/fil-forge/swarf v0.0.1-0.20260922133653-0b2e5b2e1c6c
 	github.com/fil-forge/ucantone v0.0.0-20260924160040-c31dec73d9b3
 	github.com/fil-forge/versitygw v0.0.0-20260914113944-a628e2cc628c
 	github.com/filecoin-project/go-fee v0.1.1-0.20260930093805-a26324dfe6ad

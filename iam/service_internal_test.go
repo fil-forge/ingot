@@ -15,6 +15,7 @@ import (
 	"github.com/fil-forge/versitygw/s3err"
 	"github.com/gofiber/fiber/v3"
 
+	"github.com/fil-forge/hilt/pkg/bucketpolicy"
 	hiltclient "github.com/fil-forge/hilt/pkg/client"
 	hiltauth "github.com/fil-forge/hilt/pkg/rpc/service/auth"
 	"github.com/fil-forge/hilt/pkg/s3perm"
@@ -570,20 +571,20 @@ func TestMapAuthError(t *testing.T) {
 		code   string
 		status int
 	}{
-		hiltauth.MalformedSignatureErrorName:    {"AuthorizationHeaderMalformed", 400},
-		hiltauth.SignatureMismatchErrorName:     {"SignatureDoesNotMatch", 403},
-		hiltauth.SignatureExpiredErrorName:      {"AccessDenied", 403},
-		hiltauth.UnsupportedOperationErrorName:  {"NotImplemented", 501},
-		hiltauth.UnknownBucketErrorName:         {"NoSuchBucket", 404},
-		hiltauth.TenantDisabledErrorName:        {"AccessDenied", 403},
-		hiltauth.IssuerForbiddenErrorName:       {"AccessDenied", 403},
-		hiltauth.RegionNotServedErrorName:       {"AccessDenied", 403},
-		hiltauth.OperationNotPermittedErrorName: {"AccessDenied", 403},
-		hiltauth.BucketNotPermittedErrorName:    {"AccessDenied", 403},
-		hiltauth.ForeignBucketErrorName:         {"AccessDenied", 403},
-		hiltauth.UnsignedCopySourceErrorName:    {"AccessDenied", 403},
-		"TemporarilyUnavailable":                {"ServiceUnavailable", 503},
-		"InvalidBucketPolicy":                   {"InvalidArgument", 400},
+		hiltauth.MalformedSignatureErrorName:     {"AuthorizationHeaderMalformed", 400},
+		hiltauth.SignatureMismatchErrorName:      {"SignatureDoesNotMatch", 403},
+		hiltauth.SignatureExpiredErrorName:       {"AccessDenied", 403},
+		hiltauth.UnsupportedOperationErrorName:   {"NotImplemented", 501},
+		hiltauth.UnknownBucketErrorName:          {"NoSuchBucket", 404},
+		hiltauth.TenantDisabledErrorName:         {"AccessDenied", 403},
+		hiltauth.IssuerForbiddenErrorName:        {"AccessDenied", 403},
+		hiltauth.RegionNotServedErrorName:        {"AccessDenied", 403},
+		hiltauth.OperationNotPermittedErrorName:  {"AccessDenied", 403},
+		hiltauth.BucketNotPermittedErrorName:     {"AccessDenied", 403},
+		hiltauth.ForeignBucketErrorName:          {"AccessDenied", 403},
+		hiltauth.UnsignedCopySourceErrorName:     {"AccessDenied", 403},
+		hiltauth.TemporarilyUnavailableErrorName: {"ServiceUnavailable", 503},
+		bucketpolicy.InvalidPolicyErrorName:      {"MalformedPolicy", 400},
 	}
 	for name, want := range apiCases {
 		t.Run(name, func(t *testing.T) {
