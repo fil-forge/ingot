@@ -150,7 +150,10 @@ Internal:
   cborgen driver, S3-client test glue.
 - **`internal/tracing`** — OpenTelemetry: the per-request server span
   middleware and the instrumented HTTP client every outbound caller is built
-  with. The daemon's exporter setup is `cmd/telemetry.go`. versitygw passes
+  with. The daemon's exporter setup is `cmd/telemetry.go` (traces and, under
+  the same `OTEL_EXPORTER_OTLP_*` variables, metrics: the replay buffer reports
+  `ingot.replay.*` gauges and wait/refusal counters through the global meter
+  provider, a no-op until the daemon installs one). versitygw passes
   the backend the bare `*fasthttp.RequestCtx` as its context, so the
   middleware stores the span as a request user value under the trace API's
   own key; `trace.SpanFromContext` on that context then finds it. A new

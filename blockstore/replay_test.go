@@ -11,6 +11,8 @@ import (
 
 	mh "github.com/multiformats/go-multihash"
 	"github.com/stretchr/testify/require"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
 
 func TestReplayFile_HoldsHashesAndReplays(t *testing.T) {
@@ -126,4 +128,52 @@ func TestReplayBuffer_UnboundedNeverWaits(t *testing.T) {
 	f, err := rb.Acquire(context.Background(), 1<<40)
 	require.NoError(t, err)
 	require.NoError(t, f.Close())
+}
+
+func TestReplayBuffer_ReportsMetrics(t *testing.T) {
+	rb, err := NewReplayBuffer(t.TempDir(), 100, 20*time.Millisecond)
+	require.NoError(t, err)
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	reg, err := rb.RegisterMetrics(provider.Meter("test"))
+	require.NoError(t, err)
+
+	f, err := rb.Acquire(context.Background(), 60)
+	require.NoError(t, err)
+	_, err = f.Write([]byte("hello"))
+	require.NoError(t, err)
+	_, err = rb.Acquire(context.Background(), 60)
+	require.ErrorIs(t, err, ErrReplayBusy)
+
+	observed := func() map[string]int64 {
+		var rm metricdata.ResourceMetrics
+		require.NoError(t, reader.Collect(context.Background(), &rm))
+		got := map[string]int64{}
+		for _, sm := range rm.ScopeMetrics {
+			for _, m := range sm.Metrics {
+				switch d := m.Data.(type) {
+				case metricdata.Gauge[int64]:
+					got[m.Name] = d.DataPoints[0].Value
+				case metricdata.Sum[int64]:
+					got[m.Name] = d.DataPoints[0].Value
+				}
+			}
+		}
+		return got
+	}
+	require.Equal(t, map[string]int64{
+		"ingot.replay.written":  5,
+		"ingot.replay.reserved": 60,
+		"ingot.replay.capacity": 100,
+		"ingot.replay.files":    1,
+		"ingot.replay.waits":    1,
+		"ingot.replay.refusals": 1,
+	}, observed())
+
+	require.NoError(t, f.Close())
+	got := observed()
+	require.Zero(t, got["ingot.replay.written"])
+	require.Zero(t, got["ingot.replay.files"])
+
+	require.NoError(t, reg.Unregister())
 }
