@@ -192,7 +192,7 @@ stale, and its abort records a release of its own.
 
 A GET resolves the bucket root (registry), walks the MST to the manifest
 (through the per-key version tree when the key is versioned), and serves
-each covering blob from the first tier that has it: the spool, the catalog
+each covering blob from the first tier that has it: the catalog
 log (catalog blocks only), then the network (`blockstore.Forge`). Network
 resolution uses the **local locator**: a whole-blob hit in `blob_locations`,
 or an inner-block hit in `shard_inclusions` joined to its shard's location;
