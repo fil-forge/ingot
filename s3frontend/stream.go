@@ -25,15 +25,24 @@ import (
 // This file is the streaming half of the body write path (the trailer-hash
 // RFC). A blob whose plaintext length is known before its first byte has a
 // known envelope length too, so it is allocated by size and hash function
-// alone and its envelope goes to the provider while it is being spooled: the
-// upload no longer waits for the body to land on disk. The spool still gets
-// its copy, which is where the digest comes from and what the read path
-// serves from, and a failed PUT falls back to uploading that copy by digest.
+// alone and its envelope goes to the provider as the body arrives: the upload
+// does not wait for the body to land anywhere. The digest is computed over the
+// same bytes as they pass, and the provider takes it from the stream's trailer.
+//
+// Each blob also keeps a copy of what it has sent in the replay buffer (an
+// anonymous file under a byte budget; see blockstore.ReplayBuffer), for one
+// purpose: if the send fails, the blob is sent again from that copy under a
+// fresh allocation rather than failing the request, whose body cannot be read
+// twice. The copy is dropped as soon as the send succeeds.
 //
 // Until the upload is parked or accepted the provider knows it only by its
 // /blob/add task, so a blob_streams row records that task from allocation
 // until the park or acceptance is recorded. A request that dies in between
 // leaves the row, and the stream sweeper aborts the upload by that task.
+
+// streamAttempts is how many times a blob is sent to its provider before the
+// request fails: the live send, then resends from the replay buffer.
+const streamAttempts = 3
 
 // WriteSizedBlob implements bucket.SizedBlobWriter: r yields exactly n
 // plaintext bytes. Without a streaming uploader, or once the upload service
@@ -69,7 +78,16 @@ func (w *encryptingBlobWriter) WriteSizedBlob(ctx context.Context, r io.Reader, 
 	stored := desc.HeaderLen + aesstream.EncryptedSize(n, desc.ChunkSize)
 	span.SetAttributes(attribute.Int64("ingot.blob.bytes", stored))
 
-	sb, err := w.stream.StartBlob(ctx, w.space, stored)
+	// The copy's budget is reserved before the first byte of the body is
+	// read, so a node whose buffer is full pushes back on the client here
+	// instead of taking bytes it has nowhere to keep.
+	replay, err := w.replay.Acquire(ctx, stored)
+	if err != nil {
+		return nil, fmt.Errorf("s3frontend: replay buffer: %w", err)
+	}
+	defer replay.Close()
+
+	sb, err := w.startStream(ctx, stored)
 	if errors.Is(err, uploader.ErrUnsupportedDigestCode) {
 		// The upload service cannot take a blob without its digest: this
 		// body falls back to spooling each blob first, and uploading it by
@@ -77,10 +95,77 @@ func (w *encryptingBlobWriter) WriteSizedBlob(ctx context.Context, r io.Reader, 
 		span.SetAttributes(attribute.String("ingot.blob.result", "digest_first"))
 		w.logger.Warn("upload service cannot add by digest code; spooling blobs before upload", zap.Error(err))
 		w.digestFirst = true
-		return w.spoolEnvelope(ctx, rc, desc, cek, nil)
+		return w.spoolEnvelope(ctx, rc, desc, cek)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("s3frontend: start blob: %w", err)
+		return nil, err
+	}
+
+	// Every byte the envelope yields goes to the copy and to the PUT. A copy
+	// failure fails the PUT with it, so the provider never receives a body
+	// that ends early and looks complete. A PUT failure only detaches the
+	// PUT: the copy carries on, and is sent again afterwards.
+	pr, pw := io.Pipe()
+	putDone := make(chan error, 1)
+	go func() {
+		err := w.stream.PutBlob(ctx, sb, pr)
+		// Nothing reads the pipe from here on; unblock the copy.
+		if err != nil {
+			pr.CloseWithError(err)
+		} else {
+			pr.CloseWithError(errPutFinished)
+		}
+		putDone <- err
+	}()
+	sink := &detachableWriter{w: pw}
+	if _, err := io.Copy(io.MultiWriter(replay, sink), rc); err != nil {
+		pw.CloseWithError(err)
+		<-putDone
+		return nil, fmt.Errorf("s3frontend: replay envelope: %w", err)
+	}
+	pw.Close()
+	putErr := <-putDone
+
+	digest, got, err := replay.Digest()
+	if err == nil && got != stored {
+		err = fmt.Errorf("s3frontend: envelope of %d bytes was allocated %d", got, stored)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	result := "streamed"
+	for attempt := 1; putErr != nil; attempt++ {
+		// The copy is whole: release the allocation that took the failed PUT
+		// and send it again under a new one.
+		result = "resent"
+		w.logger.Warn("streamed put failed", zap.Int("attempt", attempt), zap.Error(putErr))
+		w.abandon(ctx, sb)
+		if attempt >= streamAttempts || ctx.Err() != nil {
+			span.SetAttributes(attribute.String("ingot.blob.result", "put_failed"))
+			return nil, fmt.Errorf("s3frontend: send blob: %w", putErr)
+		}
+		if sb, err = w.startStream(ctx, stored); err != nil {
+			return nil, err
+		}
+		putErr = w.stream.PutBlob(ctx, sb, replay.Reader())
+	}
+	if err := w.record(ctx, digest, cek, encWrite{desc: desc, storedSize: stored, streamed: &sb}); err != nil {
+		return nil, err
+	}
+	span.SetAttributes(attribute.String("ingot.blob.result", result))
+	return digest, nil
+}
+
+// startStream allocates a blob of the given stored size on the provider and
+// records the allocation in blob_streams, under the request's lease.
+func (w *encryptingBlobWriter) startStream(ctx context.Context, stored int64) (uploader.StreamedBlob, error) {
+	sb, err := w.stream.StartBlob(ctx, w.space, stored)
+	if errors.Is(err, uploader.ErrUnsupportedDigestCode) {
+		return uploader.StreamedBlob{}, err
+	}
+	if err != nil {
+		return uploader.StreamedBlob{}, fmt.Errorf("s3frontend: start blob: %w", err)
 	}
 	if err := w.streams.PutStream(ctx, registry.BlobStream{
 		AddTask: sb.AddTask.Bytes(),
@@ -93,62 +178,21 @@ func (w *encryptingBlobWriter) WriteSizedBlob(ctx context.Context, r io.Reader, 
 		if aerr := w.stream.AbortBlob(ctx, w.space, sb.AddTask); aerr != nil {
 			w.logger.Warn("aborting untracked stream failed; the provider expires it", zap.Stringer("add", sb.AddTask), zap.Error(aerr))
 		}
-		return nil, fmt.Errorf("s3frontend: record stream: %w", err)
+		return uploader.StreamedBlob{}, fmt.Errorf("s3frontend: record stream: %w", err)
 	}
 	w.lease.add(sb.AddTask.Bytes())
-
-	// The envelope feeds the spool, and every byte the spool reads is also
-	// written to the PUT. A spool failure fails the PUT with it, so the
-	// provider never receives a body that ends early and looks complete. A
-	// PUT failure only detaches the PUT: the spool carries on, and its copy
-	// is uploaded by digest instead.
-	pr, pw := io.Pipe()
-	putDone := make(chan error, 1)
-	go func() {
-		err := w.stream.PutBlob(ctx, sb, pr)
-		// Nothing reads the pipe from here on; unblock the spool.
-		if err != nil {
-			pr.CloseWithError(err)
-		} else {
-			pr.CloseWithError(errPutFinished)
-		}
-		putDone <- err
-	}()
-	sink := &detachableWriter{w: pw}
-	digest, err := w.spoolEnvelope(ctx, io.TeeReader(rc, sink), desc, cek, &sb)
-	if err != nil {
-		pw.CloseWithError(err)
-		<-putDone
-		return nil, err
-	}
-	pw.Close()
-	if putErr := <-putDone; putErr != nil {
-		// The spooled copy is whole; the allocation that took the failed PUT
-		// is released and the blob uploads by digest like any spooled blob.
-		span.SetAttributes(attribute.String("ingot.blob.result", "put_failed"))
-		w.logger.Warn("streamed put failed; uploading the spooled blob by digest", zap.Error(putErr))
-		res := w.results[string(digest)]
-		res.streamed = nil
-		w.results[string(digest)] = res
-		w.abandon(ctx, sb)
-		return digest, nil
-	}
-	span.SetAttributes(attribute.String("ingot.blob.result", "streamed"))
-	return digest, nil
+	return sb, nil
 }
 
-// spoolEnvelope spools an envelope, checks it is the length its descriptor
-// promised, and records its encryption state. streamed is the upload the
-// envelope is being sent to, if any.
-func (w *encryptingBlobWriter) spoolEnvelope(ctx context.Context, envelope io.Reader, desc fee.BodyDescriptor, cek []byte, streamed *uploader.StreamedBlob) (multihash.Multihash, error) {
+// spoolEnvelope spools an envelope for a blob that will be uploaded by digest,
+// checks it is the length its descriptor promised, and records its encryption
+// state.
+func (w *encryptingBlobWriter) spoolEnvelope(ctx context.Context, envelope io.Reader, desc fee.BodyDescriptor, cek []byte) (multihash.Multihash, error) {
 	digest, storedSize, err := w.spool.WriteBlob(ctx, envelope)
 	if err != nil {
 		return nil, fmt.Errorf("s3frontend: spool envelope: %w", err)
 	}
-	if streamed != nil && storedSize != streamed.Size {
-		return nil, fmt.Errorf("s3frontend: envelope of %d bytes was allocated %d", storedSize, streamed.Size)
-	}
-	if err := w.record(ctx, digest, cek, encWrite{desc: desc, storedSize: storedSize, streamed: streamed}); err != nil {
+	if err := w.record(ctx, digest, cek, encWrite{desc: desc, storedSize: storedSize}); err != nil {
 		return nil, err
 	}
 	return digest, nil

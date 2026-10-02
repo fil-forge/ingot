@@ -186,6 +186,16 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		return nil, fmt.Errorf("ingot: spool: %w", err)
 	}
 
+	replayBytes := cfg.ReplayBufferBytes
+	if replayBytes < 0 {
+		replayBytes = 0 // unbounded
+	}
+	replay, err := blockstore.NewReplayBuffer(filepath.Join(cfg.DataDir, "replay"), replayBytes, cfg.ReplayWait)
+	if err != nil {
+		_ = log.Close(ctx)
+		return nil, fmt.Errorf("ingot: replay buffer: %w", err)
+	}
+
 	bs := blockstore.NewLayered(log, deps.BaseBlockReader)
 	backend := s3frontend.New(s3frontend.Deps{
 		Authority:       deps.Authority,
@@ -203,6 +213,7 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		Deferred:        deps.Deferred,
 		Remover:         deps.Remover,
 		Streaming:       deps.Streaming,
+		Replay:          replay,
 		Streams:         deps.Streams,
 		EncParams:       deps.EncParams,
 		RegionKeys:      deps.RegionKeys,
@@ -606,6 +617,10 @@ func applyServerDefaults(cfg config.ServerConfig) config.ServerConfig {
 	}
 	if cfg.MaxBlobSize <= 0 {
 		cfg.MaxBlobSize = msbucket.DefaultMaxBlobSize
+	}
+	if cfg.ReplayBufferBytes == 0 {
+		// Room for a few full-size blobs in flight at once.
+		cfg.ReplayBufferBytes = 4 * cfg.MaxBlobSize
 	}
 	// SealBytes / SealAge / Retain pass through to logstore.Open
 	// untouched; logstore.Config.defaults handles its own fallbacks.

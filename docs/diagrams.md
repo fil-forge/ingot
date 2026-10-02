@@ -177,7 +177,7 @@ flowchart TB
 
     subgraph bodyr["the body route (raw blobs, synchronous)"]
         split["SplitSizedBody at the declared length:<br/>coarse split at max_blob_size,<br/>sha256 + md5 in one streaming pass"]
-        spool["Spool (DataDir/spool)<br/>+ upload_intents row<br/>(each blob streams its PUT<br/>to the provider while it is spooled)"]
+        spool["upload_intents row per blob<br/>(each blob streams its PUT to the provider<br/>as the body arrives, keeping a replay copy<br/>until the send succeeds)"]
         upload["per-blob upload before the commit:<br/>conclude, accept (streamed), or<br/>/blob/add, HTTP PUT, conclude, accept<br/>(a blob_locations hit skips it: dedup)"]
         bloc["blob_locations row: the whole blob,<br/>(space, digest) to provider URL"]
         split --> spool --> upload --> bloc
@@ -221,9 +221,13 @@ flowchart TB
   ([catalog GC candidates](#catalog-gc-candidates-what-gets-remembered-for-removal)).
 - A body streams: each blob is allocated by size
   and hash function (`/blob/add` with a digest code) and its envelope goes to
-  the provider while the spool writes it, so the upload overlaps the body's
-  arrival instead of following it. The spool copy still supplies the digest,
-  which the put receipt reports and the node checks at accept.
+  the provider as the body arrives, so the upload overlaps the body's
+  arrival instead of following it. The digest is computed over the same
+  bytes as they pass, and the put receipt reports it for the node to check at
+  accept. A copy of the bytes sent so far sits in the replay buffer (an
+  anonymous file under a byte budget) only so a failed send can be repeated
+  under a fresh allocation; it is dropped when the send succeeds, and a full
+  budget answers the request `SlowDown` before any body is read.
 - Multipart parts ride the body route with the conclude deferred (parked);
   `Complete` finishes it
   (the [multipart diagram](#multipart-upload-park-on-write-conclude-on-complete)).
@@ -233,7 +237,7 @@ Cross-references: [`architecture.md` §4](./architecture.md#4-the-catalog-layer)
 [`logstore/README.md`](../logstore/README.md).
 
 Sources: `s3frontend/object.go` (ingestBody), `s3frontend/stream.go`,
-`bucket/sized.go`, `blockstore/spool.go`,
+`bucket/sized.go`, `blockstore/spool.go`, `blockstore/replay.go`,
 `blockstore/staging.go`, `logstore/`, `uploader/forge.go`, `uploader/blob.go`,
 `server.go` (newBucketFlushFunc). Review when these change.
 
@@ -249,7 +253,7 @@ sequenceDiagram
     autonumber
     actor C as S3 client
     participant B as s3frontend.Backend
-    participant SP as blockstore.Spool
+    participant RB as blockstore.ReplayBuffer
     participant R as registry<br/>(Postgres)
     participant U as sprue
     participant P as piri
@@ -266,15 +270,15 @@ sequenceDiagram
         U-->>B: allocation address, put and accept tasks
         B->>R: PutStream(add task): the upload's name until parked or accepted
         par
-            B->>SP: spool under the CIPHERTEXT digest<br/>(sha256 + md5 of the plaintext in the same pass)
+            B->>RB: keep a copy under the CIPHERTEXT digest<br/>(budget reserved before the body is read; a full budget → SlowDown)
         and
-            B->>P: HTTP PUT the same envelope bytes as they are spooled
+            B->>P: HTTP PUT the same envelope bytes as they arrive
         end
-        Note over B,P: a failed PUT detaches: the spool finishes, the allocation is<br/>aborted and the blob uploads by digest; UnsupportedDigestCode<br/>switches the rest of the body to spool-first
+        Note over B,P: a failed PUT detaches: the copy finishes, the allocation is<br/>aborted and the blob is sent again from the copy under a new allocation<br/>(up to 3 sends); UnsupportedDigestCode<br/>switches the rest of the body to spool-first
     end
     B->>R: PutIntent(digest, stored size, uploading) +<br/>PutEncryptionParams(region-wrapped CEK, FEE geometry) per blob
     loop each streamed blob (uploadBlobs → concludeStreamed)
-        B->>U: /ucan/conclude the put receipt, reporting the spooled digest
+        B->>U: /ucan/conclude the put receipt, reporting the streamed digest
         U-->>B: accept receipt + /assert/location commitment
         B->>R: SetIntentState(accepted) + PutLocation, DeleteStream
     end
