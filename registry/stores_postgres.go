@@ -340,15 +340,14 @@ func (r *Postgres) DeleteRelease(ctx context.Context, space did.DID, digest mult
 
 func (r *Postgres) PutIntent(ctx context.Context, in UploadIntent) error {
 	_, err := r.pool.Exec(ctx,
-		`INSERT INTO ingot.upload_intents (digest, local_path, size, state, bucket)
-		 VALUES ($1, $2, $3, $4, $5)
+		`INSERT INTO ingot.upload_intents (digest, size, state, bucket)
+		 VALUES ($1, $2, $3, $4)
 		 ON CONFLICT (digest) DO UPDATE
-		   SET local_path = EXCLUDED.local_path,
-		       size       = EXCLUDED.size,
+		   SET size       = EXCLUDED.size,
 		       state      = EXCLUDED.state,
 		       bucket     = EXCLUDED.bucket,
 		       updated_at = now()`,
-		in.Digest, in.LocalPath, in.Size, in.State, nullString(in.Bucket))
+		in.Digest, in.Size, in.State, nullString(in.Bucket))
 	if err != nil {
 		return fmt.Errorf("registry: put intent: %w", err)
 	}
@@ -372,8 +371,8 @@ func (r *Postgres) GetIntent(ctx context.Context, digest multihash.Multihash) (*
 	in := &UploadIntent{Digest: digest}
 	var bucket *string
 	err := r.pool.QueryRow(ctx,
-		`SELECT local_path, size, state, bucket FROM ingot.upload_intents WHERE digest = $1`,
-		digest).Scan(&in.LocalPath, &in.Size, &in.State, &bucket)
+		`SELECT size, state, bucket FROM ingot.upload_intents WHERE digest = $1`,
+		digest).Scan(&in.Size, &in.State, &bucket)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -388,7 +387,7 @@ func (r *Postgres) GetIntent(ctx context.Context, digest multihash.Multihash) (*
 
 func (r *Postgres) ListIntentsByState(ctx context.Context, state string) ([]UploadIntent, error) {
 	rows, err := r.pool.Query(ctx,
-		`SELECT digest, local_path, size, state, bucket FROM ingot.upload_intents WHERE state = $1`,
+		`SELECT digest, size, state, bucket FROM ingot.upload_intents WHERE state = $1`,
 		state)
 	if err != nil {
 		return nil, fmt.Errorf("registry: list intents: %w", err)
@@ -399,7 +398,7 @@ func (r *Postgres) ListIntentsByState(ctx context.Context, state string) ([]Uplo
 	for rows.Next() {
 		var in UploadIntent
 		var bucket *string
-		if err := rows.Scan(&in.Digest, &in.LocalPath, &in.Size, &in.State, &bucket); err != nil {
+		if err := rows.Scan(&in.Digest, &in.Size, &in.State, &bucket); err != nil {
 			return nil, fmt.Errorf("registry: list intents scan: %w", err)
 		}
 		if bucket != nil {

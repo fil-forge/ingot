@@ -38,17 +38,16 @@ CREATE TABLE ingot.blob_refs (
 -- Drives "is (space, digest) still claimed?" — the gate on remove(digest).
 CREATE INDEX blob_refs_claim_idx ON ingot.blob_refs (space, digest);
 
--- The local-store index (§5): every blob Ingot holds on disk, in-flight or
--- retained as cache. Drives read-after-write, cache lookup, and crash
--- recovery. state advances spooled → parked → accepted → published; cache
--- eviction deletes the row and the file. Keyed by digest (global; the spool
--- is shared across whatever objects reference the same bytes).
+-- The upload index (§5): every blob Ingot has sent to a provider, in flight or
+-- since accepted. Drives release and crash recovery. state advances
+-- uploading → parked → accepted → published; a release deletes the row. Keyed
+-- by digest (global, shared across whatever objects reference the same
+-- bytes).
 CREATE TABLE ingot.upload_intents (
     digest      bytea PRIMARY KEY,
-    local_path  text   NOT NULL,
     size        bigint NOT NULL,
     state       text   NOT NULL
-                    CHECK (state IN ('spooled','parked','accepted','published')),
+                    CHECK (state IN ('uploading','parked','accepted','published')),
     bucket      text,
     created_at  timestamptz NOT NULL DEFAULT now(),
     updated_at  timestamptz NOT NULL DEFAULT now()

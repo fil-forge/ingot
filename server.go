@@ -172,12 +172,6 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		return nil, fmt.Errorf("ingot: logstore: %w", err)
 	}
 
-	spool, err := blockstore.NewSpool(filepath.Join(cfg.DataDir, "spool"))
-	if err != nil {
-		_ = log.Close(ctx)
-		return nil, fmt.Errorf("ingot: spool: %w", err)
-	}
-
 	replayBytes := cfg.ReplayBufferBytes
 	if replayBytes < 0 {
 		replayBytes = 0 // unbounded
@@ -200,7 +194,6 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		Parks:           deps.Parks,
 		Reads:           bs,
 		Log:             log,
-		Spool:           spool,
 		Remover:         deps.Remover,
 		Streaming:       deps.Streaming,
 		Replay:          replay,

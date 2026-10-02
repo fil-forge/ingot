@@ -73,10 +73,6 @@ func newRefTestBackend(t *testing.T, maxBlob ...int64) (*Backend, *inmem.MemStor
 	ctx := context.Background()
 	dir := t.TempDir()
 	mem := inmem.NewMemStore()
-	spool, err := blockstore.NewSpool(filepath.Join(dir, "spool"))
-	if err != nil {
-		t.Fatalf("spool: %v", err)
-	}
 	log, err := logstore.Open(ctx, logstore.Config{
 		Dir:     filepath.Join(dir, "segments"),
 		Meta:    mem,
@@ -101,7 +97,6 @@ func newRefTestBackend(t *testing.T, maxBlob ...int64) (*Backend, *inmem.MemStor
 		Parks:           mem,
 		Reads:           blockstore.NewLayered(log, provider),
 		Log:             log,
-		Spool:           spool,
 		Streaming:       provider,
 		Streams:         mem,
 		Remover:         rm,
