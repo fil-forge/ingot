@@ -19,6 +19,8 @@ import (
 	"github.com/fil-forge/versitygw/s3log"
 	"github.com/gofiber/fiber/v3"
 	"github.com/multiformats/go-multihash"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/metric"
 	"go.uber.org/zap"
 
 	"github.com/fil-forge/ingot/blockstore"
@@ -134,6 +136,7 @@ type Server struct {
 	log         blockstore.Log
 	backend     *s3frontend.Backend
 	api         *s3api.S3ApiServer
+	metrics     metric.Registration // the replay buffer's gauges; nil when not registered
 	sweepStop   chan struct{}
 	releaseStop chan struct{}
 }
@@ -185,6 +188,13 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 
 	warnLegacySpool(logger, cfg.DataDir)
 
+	// The global meter provider is a no-op until a host (the daemon) installs
+	// one, so registering costs nothing when nobody is listening.
+	metricsReg, err := replay.RegisterMetrics(otel.Meter("github.com/fil-forge/ingot"))
+	if err != nil {
+		logger.Warn("replay buffer metrics not registered", zap.Error(err))
+	}
+
 	bs := blockstore.NewLayered(log, deps.BaseBlockReader)
 	backend := s3frontend.New(s3frontend.Deps{
 		Authority:       deps.Authority,
@@ -225,6 +235,7 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		log:     log,
 		backend: backend,
 		api:     api,
+		metrics: metricsReg,
 	}, nil
 }
 
@@ -347,6 +358,12 @@ func (s *Server) Stop(ctx context.Context) error {
 		s.releaseStop = nil
 	}
 	var errs []error
+	if s.metrics != nil {
+		if err := s.metrics.Unregister(); err != nil {
+			errs = append(errs, fmt.Errorf("unregister metrics: %w", err))
+		}
+		s.metrics = nil
+	}
 	if err := s.api.ShutDown(); err != nil {
 		errs = append(errs, fmt.Errorf("s3api shutdown: %w", err))
 	}
