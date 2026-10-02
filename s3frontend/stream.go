@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
+	"sync"
 	"time"
 
 	"github.com/filecoin-project/go-fee"
@@ -88,6 +90,7 @@ func (w *encryptingBlobWriter) WriteSizedBlob(ctx context.Context, r io.Reader, 
 	}); err != nil {
 		return nil, fmt.Errorf("s3frontend: record stream: %w", err)
 	}
+	w.lease.add(sb.AddTask.Bytes())
 
 	// The envelope feeds the spool, and every byte the spool reads is also
 	// written to the PUT. A spool failure fails the PUT with it, so the
@@ -186,9 +189,9 @@ func (b *Backend) finishStream(ctx context.Context, sb uploader.StreamedBlob) {
 }
 
 const (
-	// streamStaleAge is how long a blob_streams row lives before the sweeper
-	// takes its request for dead. A row covers one request's upload of one
-	// blob, so this outlasts the slowest body the gateway should accept.
+	// streamStaleAge is how long a blob_streams row's lease can go unrenewed
+	// before the sweeper takes its request for dead. A live request renews it
+	// every streamLeaseInterval, however long its body takes.
 	streamStaleAge = 30 * time.Minute
 	// streamForgetAge is when the sweeper stops trying to abort a stream and
 	// drops the row: the provider has expired the allocation by then.
@@ -197,11 +200,85 @@ const (
 	streamSweepBatch = 100
 )
 
+// streamLeaseInterval is how often a request renews the lease on its
+// blob_streams rows: well inside streamStaleAge, so the rows of a request that
+// is still running never look stale.
+var streamLeaseInterval = streamStaleAge / 3
+
+// streamLease renews the lease on one request's blob_streams rows from its
+// first streamed blob until end. A row whose blob is parked or accepted is
+// deleted meanwhile, and renewing it is a no-op.
+type streamLease struct {
+	streams registry.StreamStore
+	logger  *zap.Logger
+
+	mu    sync.Mutex
+	tasks [][]byte
+	stop  chan struct{}
+	done  chan struct{}
+	ended sync.Once
+}
+
+func newStreamLease(streams registry.StreamStore, logger *zap.Logger) *streamLease {
+	return &streamLease{streams: streams, logger: logger}
+}
+
+// add puts addTask's row under the lease, starting the renewals with the
+// request's first row.
+func (l *streamLease) add(addTask []byte) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.tasks = append(l.tasks, addTask)
+	if l.stop == nil {
+		l.stop, l.done = make(chan struct{}), make(chan struct{})
+		go l.renew(l.stop, l.done)
+	}
+}
+
+func (l *streamLease) renew(stop, done chan struct{}) {
+	defer close(done)
+	t := time.NewTicker(streamLeaseInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-t.C:
+			l.mu.Lock()
+			tasks := slices.Clone(l.tasks)
+			l.mu.Unlock()
+			ctx, cancel := context.WithTimeout(context.Background(), streamLeaseInterval)
+			if err := l.streams.TouchStreams(ctx, tasks); err != nil {
+				l.logger.Warn("renewing stream leases failed; retrying next interval", zap.Error(err))
+			}
+			cancel()
+		}
+	}
+}
+
+// end stops the renewals. The rows left, if any, belong to a request that
+// failed, and go stale for the sweeper.
+func (l *streamLease) end() {
+	if l == nil {
+		return
+	}
+	l.ended.Do(func() {
+		l.mu.Lock()
+		stop, done := l.stop, l.done
+		l.mu.Unlock()
+		if stop != nil {
+			close(stop)
+			<-done
+		}
+	})
+}
+
 // SweepStaleStreams aborts the uploads of requests that died between
 // allocating a blob by digest code and recording its park or acceptance, and
 // drops their blob_streams rows. An upload the space has since accepted is
-// not the sweeper's to abort; its row is simply dropped. It returns the rows
-// dropped.
+// not the sweeper's to abort; its row is simply dropped. Nor is one whose park
+// was recorded and the row left behind: the multipart session still needs the
+// parked blob. It returns the rows dropped.
 func (b *Backend) SweepStaleStreams(ctx context.Context) (int, error) {
 	if b.streaming == nil || b.streams == nil {
 		return 0, nil
@@ -213,9 +290,17 @@ func (b *Backend) SweepStaleStreams(ctx context.Context) (int, error) {
 	}
 	dropped := 0
 	for _, row := range rows {
+		parked := false
+		if b.parks != nil {
+			if parked, err = b.parks.HasParkFor(ctx, row.AddTask); err != nil {
+				return dropped, fmt.Errorf("s3frontend: find stream's park: %w", err)
+			}
+		}
 		cause, err := cid.Cast(row.AddTask)
 		if err != nil {
 			b.logger.Error("stream row has an undecodable add task; dropping it", zap.Binary("add", row.AddTask), zap.Error(err))
+		} else if parked {
+			b.logger.Info("stale stream's blob is parked; dropping its row", zap.Stringer("add", cause))
 		} else if err := b.streaming.AbortBlob(ctx, row.Space, cause); err != nil &&
 			!errors.Is(err, uploader.ErrBlobAccepted) && now.Sub(row.CreatedAt) < streamForgetAge {
 			b.logger.Warn("aborting stale stream failed; retrying next sweep", zap.Stringer("add", cause), zap.Error(err))

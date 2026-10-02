@@ -22,6 +22,7 @@ import (
 	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
 
 	"github.com/fil-forge/ingot/inmem"
 	"github.com/fil-forge/ingot/registry"
@@ -49,6 +50,9 @@ type streamingUploader struct {
 	aborted   []cid.Cid
 	// abortErr, when set, is what AbortBlob answers.
 	abortErr error
+	// concludeErr, when set, is returned by ConcludeBlobs alongside the
+	// locations, as a batch that failed after its accepts ran returns it.
+	concludeErr error
 }
 
 func newStreamingUploader() *streamingUploader {
@@ -91,8 +95,13 @@ func (s *streamingUploader) PutBlob(_ context.Context, sb uploader.StreamedBlob,
 func (s *streamingUploader) ConcludeBlobs(ctx context.Context, space did.DID, parked []uploader.UploadedBlob) ([]*uploader.BlobLocation, error) {
 	s.mu.Lock()
 	s.concluded = append(s.concluded, parked...)
+	concludeErr := s.concludeErr
 	s.mu.Unlock()
-	return s.NopUploader.ConcludeBlobs(ctx, space, parked)
+	locations, err := s.NopUploader.ConcludeBlobs(ctx, space, parked)
+	if err != nil {
+		return locations, err
+	}
+	return locations, concludeErr
 }
 
 func (s *streamingUploader) UploadBlob(ctx context.Context, space did.DID, digest multihash.Multihash, size int64, path string, opts ...uploader.UploadOption) (uploader.UploadedBlob, error) {
@@ -357,6 +366,74 @@ func TestSweepStaleStreams(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, 1, n)
 	})
+}
+
+// A stale row whose blob was parked belongs to a multipart session that still
+// needs the blob: its row is dropped, and the blob is not aborted.
+func TestSweepStaleStreamsKeepsParkedBlob(t *testing.T) {
+	su := newStreamingUploader()
+	b, mem := newStreamingBackend(t, su)
+	ctx := context.Background()
+	addTask := cid.NewCidV1(cid.Raw, mustSum([]byte("parked"))).Bytes()
+	require.NoError(t, mem.PutStream(ctx, registry.BlobStream{
+		AddTask: addTask, Bucket: "bk", CreatedAt: time.Now().Add(-time.Hour),
+	}))
+	require.NoError(t, mem.PutPark(ctx, registry.BlobPark{
+		Digest: mustSum([]byte("parked blob")), AddTask: addTask,
+		AcceptTask: addTask, PutInvocation: []byte("put"), Size: 1,
+	}))
+
+	n, err := b.SweepStaleStreams(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 1, n, "the row is dropped")
+	require.Empty(t, su.aborted, "the parked blob is not aborted")
+}
+
+// A request renews the lease on its rows while it runs, so an old row of a
+// live request is not stale; once the lease ends, the row goes stale.
+func TestStreamLease(t *testing.T) {
+	prev := streamLeaseInterval
+	streamLeaseInterval = 10 * time.Millisecond
+	t.Cleanup(func() { streamLeaseInterval = prev })
+	su := newStreamingUploader()
+	b, mem := newStreamingBackend(t, su)
+	ctx := context.Background()
+	addTask := cid.NewCidV1(cid.Raw, mustSum([]byte("leased"))).Bytes()
+	require.NoError(t, mem.PutStream(ctx, registry.BlobStream{
+		AddTask: addTask, Bucket: "bk", CreatedAt: time.Now().Add(-time.Hour),
+	}))
+
+	lease := newStreamLease(mem, zap.NewNop())
+	lease.add(addTask)
+	require.Eventually(t, func() bool {
+		rows, err := mem.ListStaleStreams(ctx, time.Now().Add(-streamStaleAge), 10)
+		require.NoError(t, err)
+		return len(rows) == 0
+	}, time.Second, 5*time.Millisecond, "the lease renews the row")
+	n, err := b.SweepStaleStreams(ctx)
+	require.NoError(t, err)
+	require.Zero(t, n, "a live request's row is not swept")
+
+	lease.end()
+	lease.end()
+	require.Len(t, staleStreams(t, mem), 1, "the row stays for the sweeper once the lease ends")
+}
+
+// A conclude that fails after its accept ran still records the acceptance it
+// returned, so the accepted blob is accounted for.
+func TestStreamedPutObjectConcludeErrorRecordsAcceptance(t *testing.T) {
+	su := newStreamingUploader()
+	su.concludeErr = errors.New("batch failed after accepting")
+	b, mem := newStreamingBackend(t, su)
+	ctx := context.Background()
+	data := testBody(100 << 10) // one blob
+
+	require.Error(t, putSized(t, b, "k", data, int64(len(data))))
+	require.Len(t, su.concluded, 1)
+	in, err := mem.GetIntent(ctx, su.concluded[0].Digest)
+	require.NoError(t, err)
+	require.Equal(t, registry.IntentAccepted, in.State, "the returned acceptance is recorded")
+	require.Empty(t, staleStreams(t, mem), "the accepted blob's row is dropped")
 }
 
 func ptrInt32(v int32) *int32 { return &v }

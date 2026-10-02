@@ -324,6 +324,7 @@ func (b *Backend) ingestBody(ctx context.Context, bucket *registry.State, r io.R
 	if err != nil {
 		return msbucket.Body{}, err
 	}
+	defer body.lease.end()
 	if err := b.uploadBlobs(ctx, bucket.Space, body.Blobs, body.streamed); err != nil {
 		return msbucket.Body{}, err
 	}
@@ -336,6 +337,9 @@ func (b *Backend) ingestBody(ctx context.Context, bucket *registry.State, r io.R
 type spooledBody struct {
 	msbucket.Body
 	streamed map[string]uploader.StreamedBlob
+	// lease renews the streamed blobs' rows until the caller has recorded
+	// their parks or acceptances, and ends it.
+	lease *streamLease
 }
 
 // declaredLength is a request's body length. S3 requires one on every
@@ -392,6 +396,13 @@ func (b *Backend) splitSpool(ctx context.Context, bucket string, space did.DID, 
 	var body msbucket.Body
 	if b.streaming != nil {
 		enc.stream, enc.streams, enc.bucket, enc.logger = b.streaming, b.streams, bucket, b.logger
+		enc.lease = newStreamLease(b.streams, b.logger)
+		// A failed split leaves no caller to end the lease.
+		defer func() {
+			if err != nil {
+				enc.lease.end()
+			}
+		}()
 		body, err = msbucket.SplitSizedBody(ctx, enc, r, size, b.maxBlobSize, splitOpts...)
 		switch {
 		case errors.Is(err, msbucket.ErrBodyShort):
@@ -449,7 +460,7 @@ func (b *Backend) splitSpool(ctx context.Context, bucket string, space did.DID, 
 			return spooledBody{}, fmt.Errorf("record encryption params: %w", err)
 		}
 	}
-	return spooledBody{Body: body, streamed: streamed}, nil
+	return spooledBody{Body: body, streamed: streamed, lease: enc.lease}, nil
 }
 
 // uploadBlobs uploads each spooled blob to Forge by digest (allocate→PUT→
@@ -493,16 +504,22 @@ func (b *Backend) concludeStreamed(ctx context.Context, space did.DID, blob msbu
 	defer func() { tracing.End(span, err) }()
 
 	locations, err := b.streaming.ConcludeBlobs(ctx, space, []uploader.UploadedBlob{sb.Parked(blob.Digest)})
+	// An acceptance that came back is recorded before any error is acted on,
+	// as concludeBlobs does: the upload service ran the accept whether or not
+	// the batch then failed, and recorded as accepted the blob is released
+	// through the sweeper's ordinary path rather than left unaccounted for.
+	if len(locations) == 1 && locations[0] != nil {
+		if rerr := b.recordAccepted(ctx, space, blob.Digest, *locations[0]); rerr != nil {
+			return errors.Join(err, rerr)
+		}
+		b.finishStream(ctx, sb)
+	}
 	if err != nil {
 		return fmt.Errorf("conclude streamed blob: %w", err)
 	}
 	if len(locations) != 1 || locations[0] == nil {
 		return fmt.Errorf("conclude streamed blob %x: no location", blob.Digest)
 	}
-	if err := b.recordAccepted(ctx, space, blob.Digest, *locations[0]); err != nil {
-		return err
-	}
-	b.finishStream(ctx, sb)
 	return nil
 }
 

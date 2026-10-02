@@ -361,6 +361,7 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 		}
 		return nil, fmt.Errorf("s3frontend: upload part ingest: %w", err)
 	}
+	defer spooled.lease.end()
 	rec := spooled.Body
 	if err := b.multipart.PutPart(ctx, registry.MultipartPart{
 		UploadID:    uploadID,

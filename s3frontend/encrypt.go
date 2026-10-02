@@ -64,6 +64,7 @@ type encryptingBlobWriter struct {
 	// refuses to add by digest code, so the rest of the body spools first.
 	stream      uploader.StreamingBodyUploader
 	streams     registry.StreamStore
+	lease       *streamLease
 	bucket      string
 	digestFirst bool
 	logger      *zap.Logger

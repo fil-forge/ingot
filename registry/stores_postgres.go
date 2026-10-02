@@ -559,6 +559,15 @@ func (r *Postgres) GetPark(ctx context.Context, digest multihash.Multihash) (*Bl
 	return park, nil
 }
 
+func (r *Postgres) HasParkFor(ctx context.Context, addTask []byte) (bool, error) {
+	var parked bool
+	if err := r.pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM ingot.blob_parks WHERE add_task = $1)`, addTask).Scan(&parked); err != nil {
+		return false, fmt.Errorf("registry: find park: %w", err)
+	}
+	return parked, nil
+}
+
 func (r *Postgres) DeletePark(ctx context.Context, digest multihash.Multihash) error {
 	_, err := r.pool.Exec(ctx,
 		`DELETE FROM ingot.blob_parks WHERE digest = $1`, digest)
@@ -581,6 +590,18 @@ func (r *Postgres) PutStream(ctx context.Context, s BlobStream) error {
 	return nil
 }
 
+func (r *Postgres) TouchStreams(ctx context.Context, addTasks [][]byte) error {
+	if len(addTasks) == 0 {
+		return nil
+	}
+	_, err := r.pool.Exec(ctx,
+		`UPDATE ingot.blob_streams SET touched_at = now() WHERE add_task = ANY($1)`, addTasks)
+	if err != nil {
+		return fmt.Errorf("registry: touch streams: %w", err)
+	}
+	return nil
+}
+
 func (r *Postgres) DeleteStream(ctx context.Context, addTask []byte) error {
 	_, err := r.pool.Exec(ctx,
 		`DELETE FROM ingot.blob_streams WHERE add_task = $1`, addTask)
@@ -592,9 +613,9 @@ func (r *Postgres) DeleteStream(ctx context.Context, addTask []byte) error {
 
 func (r *Postgres) ListStaleStreams(ctx context.Context, olderThan time.Time, limit int) ([]BlobStream, error) {
 	rows, err := r.pool.Query(ctx,
-		`SELECT add_task, space, bucket, size, created_at
-		 FROM ingot.blob_streams WHERE created_at < $1
-		 ORDER BY created_at LIMIT $2`,
+		`SELECT add_task, space, bucket, size, created_at, touched_at
+		 FROM ingot.blob_streams WHERE touched_at < $1
+		 ORDER BY touched_at LIMIT $2`,
 		olderThan, limit)
 	if err != nil {
 		return nil, fmt.Errorf("registry: list stale streams: %w", err)
@@ -604,7 +625,7 @@ func (r *Postgres) ListStaleStreams(ctx context.Context, olderThan time.Time, li
 	for rows.Next() {
 		var s BlobStream
 		var space string
-		if err := rows.Scan(&s.AddTask, &space, &s.Bucket, &s.Size, &s.CreatedAt); err != nil {
+		if err := rows.Scan(&s.AddTask, &space, &s.Bucket, &s.Size, &s.CreatedAt, &s.TouchedAt); err != nil {
 			return nil, fmt.Errorf("registry: scan stream: %w", err)
 		}
 		if s.Space, err = did.Parse(space); err != nil {
