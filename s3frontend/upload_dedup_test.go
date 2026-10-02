@@ -43,10 +43,6 @@ func TestUpload_IdenticalContentUploadsDistinctBlobs(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 	mem := inmem.NewMemStore()
-	spool, err := blockstore.NewSpool(filepath.Join(dir, "spool"))
-	if err != nil {
-		t.Fatalf("spool: %v", err)
-	}
 	log, err := logstore.Open(ctx, logstore.Config{
 		Dir:     filepath.Join(dir, "segments"),
 		Meta:    mem,
@@ -68,7 +64,6 @@ func TestUpload_IdenticalContentUploadsDistinctBlobs(t *testing.T) {
 		GC:         mem,
 		Reads:      blockstore.NewLayered(log, inmem.NopBaseReader{}),
 		Log:        log,
-		Spool:      spool,
 		Streaming:  up,
 		Streams:    mem,
 		Remover:    &recordingRemover{},
