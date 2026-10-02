@@ -104,6 +104,18 @@ type Config struct {
 	// negative duration makes releases due immediately.
 	ReleaseGrace string `mapstructure:"release_grace" yaml:"release_grace"`
 
+	// ReplayBufferBytes bounds the disk used to keep a copy of each blob while
+	// it is sent to its provider, so a failed send can be repeated without the
+	// client resending the body. Each blob reserves its whole size before its
+	// body is read; a request that cannot reserve within ReplayWait is answered
+	// SlowDown. Must be at least one full-size blob's envelope. Zero → four
+	// blobs' worth; negative → unbounded.
+	ReplayBufferBytes int64 `mapstructure:"replay_buffer_bytes" yaml:"replay_buffer_bytes"`
+	// ReplayWait is how long a request waits for replay-buffer budget before
+	// it is answered SlowDown (Go duration string). Empty → default 30s; a
+	// negative duration waits for as long as the client stays connected.
+	ReplayWait string `mapstructure:"replay_wait" yaml:"replay_wait"`
+
 	// CatalogPlane overrides the catalog logstore pipeline knobs. Any field
 	// left zero/unset falls back to the top-level SealBytes / SealAge / Retain
 	// (and Ship defaults to true) — e.g. to configure the catalog never to ship.
@@ -184,6 +196,16 @@ func (c Config) ServerConfig() (ServerConfig, error) {
 			releaseGrace = 0
 		}
 	}
+	replayWait := 30 * time.Second
+	if c.ReplayWait != "" {
+		replayWait, err = time.ParseDuration(c.ReplayWait)
+		if err != nil {
+			return ServerConfig{}, fmt.Errorf("ingot: parse replay_wait %q: %w", c.ReplayWait, err)
+		}
+		if replayWait < 0 {
+			replayWait = 0
+		}
+	}
 	// Render the CORS configuration here — the single place it is built —
 	// so a typo fails at startup (via Validate) rather than from New.
 	corsCfg, err := cors.Build(c.CORSAllowedOrigins)
@@ -208,6 +230,9 @@ func (c Config) ServerConfig() (ServerConfig, error) {
 
 		MultipartSessionTTL: mpTTL,
 		ReleaseGrace:        releaseGrace,
+
+		ReplayBufferBytes: c.ReplayBufferBytes,
+		ReplayWait:        replayWait,
 	}, nil
 }
 
@@ -421,6 +446,18 @@ func (c *Config) Validate() error {
 		const envelopeHeaderBudget = 1024
 		if enc := aesstream.EncryptedSize(c.MaxBlobSize, aesstream.DefaultChunkSize) + envelopeHeaderBudget; enc > blobcmds.MaxBlobSize {
 			errs = multierr.Append(errs, fmt.Errorf("max_blob_size %d: its encrypted envelope (~%d bytes) exceeds the %d-byte network blob ceiling (the piece cap of a default-configured piri) — use at most the default %d, or raise every piri in the region above piri's default piece size", c.MaxBlobSize, enc, int64(blobcmds.MaxBlobSize), bucket.DefaultMaxBlobSize))
+		}
+	}
+	if c.ReplayBufferBytes > 0 {
+		// A blob reserves its whole envelope up front, so a smaller budget
+		// could never admit a full-size one.
+		const envelopeHeaderBudget = 1024
+		maxBlob := c.MaxBlobSize
+		if maxBlob <= 0 {
+			maxBlob = bucket.DefaultMaxBlobSize
+		}
+		if enc := aesstream.EncryptedSize(maxBlob, aesstream.DefaultChunkSize) + envelopeHeaderBudget; c.ReplayBufferBytes < enc {
+			errs = multierr.Append(errs, fmt.Errorf("replay_buffer_bytes %d is below one full-size blob's envelope (~%d bytes)", c.ReplayBufferBytes, enc))
 		}
 	}
 	if _, err := c.ServerConfig(); err != nil {

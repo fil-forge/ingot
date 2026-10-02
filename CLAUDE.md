@@ -97,7 +97,7 @@ Internal:
 - **`bucketop/`** — `Coordinator`/`Tx`: per-bucket write transaction (lock,
   snapshot root, staging buffer, CAS commit).
 - **`blockstore/`** — block I/O contracts + impls: `log.go` (`Log`, `Plane`
-  [catalog-only], `OpRoot`), `staging.go` (`OpStaging`), `spool.go` (`Spool`),
+  [catalog-only], `OpRoot`), `staging.go` (`OpStaging`), `spool.go` (`Spool`), `replay.go` (`ReplayBuffer`: per-blob resend copies under a byte budget),
   `layered.go`, `forge.go` (the network read tier), `cache.go` (`Cached` LRU),
   `locator/` (carried from guppy; the indexer-backed locator is never
   injected).
@@ -202,7 +202,9 @@ Ship, Retain}` override block (the only plane), `ReadCacheBytes` (0 → 256 MiB,
 `AuthServiceURL`/`AuthServiceDID`/`AuthServiceProofs` (hilt; proofs = file
 path or string-encoded UCAN container, required alongside the URL and
 validated at startup down to holding at least one delegation),
-`TokenStoreDir` (→
+`ReplayBufferBytes`/`ReplayWait` (the disk budget for per-blob resend copies,
+0 → 4 blobs' worth, <0 → unbounded; and how long a request waits for it before
+`SlowDown`, 0 → 30s), `TokenStoreDir` (→
 `DataDir`), `MultipartSessionTTL` (0 → 7d, negative → sweeper off),
 `CORSAllowedOrigins`, `LogLevel`. `Config.ServerConfig()` is the single
 mapping site. The daemon's config (cmd/) adds `postgres_dsn`,

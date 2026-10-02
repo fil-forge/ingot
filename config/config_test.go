@@ -94,6 +94,8 @@ func TestValidate_RequiredFields(t *testing.T) {
 		{"revocation url without did", func(c *Config) { c.RevocationServiceURL = "http://127.0.0.1:6000" }, "revocation_service_url and revocation_service_did must be set together"},
 		{"revocation did without url", func(c *Config) { c.RevocationServiceDID = "did:web:swarf.example" }, "revocation_service_url and revocation_service_did must be set together"},
 		{"bad seal_age", func(c *Config) { c.SealAge = "not-a-duration" }, "parse seal_age"},
+		{"bad replay_wait", func(c *Config) { c.ReplayWait = "soon" }, "parse replay_wait"},
+		{"replay buffer below one blob", func(c *Config) { c.ReplayBufferBytes = 1 << 20 }, "replay_buffer_bytes"},
 		{"bad release_grace", func(c *Config) { c.ReleaseGrace = "soon" }, "parse release_grace"},
 		{"bad cors origin", func(c *Config) { c.CORSAllowedOrigins = []string{"app.example"} }, "cors_allowed_origins"},
 		{"regionkey provider unset", func(c *Config) { c.RegionKey.Provider = "" }, "regionkey.provider is required"},

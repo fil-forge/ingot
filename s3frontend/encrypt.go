@@ -58,12 +58,13 @@ type encryptingBlobWriter struct {
 	recipients []fee.Recipient
 	results    map[string]encWrite
 
-	// stream, when set, sends each sized blob to its provider while it is
-	// spooled (see WriteSizedBlob); streams records each such upload until
-	// its park or acceptance is recorded. digestFirst latches once the upload
-	// service refuses to add by digest code, so the rest of the body spools
-	// first.
+	// stream, when set, sends each sized blob to its provider as it arrives
+	// (see WriteSizedBlob), keeping a copy in replay for resends; streams
+	// records each such upload until its park or acceptance is recorded.
+	// digestFirst latches once the upload service refuses to add by digest
+	// code, so the rest of the body spools first.
 	stream      uploader.StreamingBodyUploader
+	replay      *blockstore.ReplayBuffer
 	streams     registry.StreamStore
 	lease       *streamLease
 	bucket      string

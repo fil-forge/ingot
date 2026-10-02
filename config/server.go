@@ -55,6 +55,13 @@ type ServerConfig struct {
 	// means releases are due immediately.
 	ReleaseGrace time.Duration
 
+	// ReplayBufferBytes is the disk budget for the copies kept while blobs are
+	// sent to their providers: zero → the server default, negative →
+	// unbounded. ReplayWait is how long a request waits for budget before it
+	// is answered SlowDown; zero waits as long as the client stays.
+	ReplayBufferBytes int64
+	ReplayWait        time.Duration
+
 	// CORSConfig is the S3 CORS configuration the backend reports for
 	// every bucket, rendered from Config.CORSAllowedOrigins by
 	// internal/cors. Nil disables CORS entirely (the default).
