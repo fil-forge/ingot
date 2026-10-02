@@ -92,7 +92,7 @@ func (k *KeyProofs) Deposit(key did.DID, dlgs ...ucan.Delegation) {
 func (k *KeyProofs) InvalidateHolders(link cid.Cid) []did.DID {
 	k.mu.Lock()
 	defer k.mu.Unlock()
-	// ponytail: a failed Hilt write whose grant goes unserved for revokedTTL is
+	// A failed Hilt write whose grant goes unserved for revokedTTL is
 	// forgotten; Hilt refusing to serve grants it revoked would close that.
 	k.revoked.Set(link.String(), struct{}{}, revokedTTL)
 	var affected []did.DID
