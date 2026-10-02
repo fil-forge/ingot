@@ -8,15 +8,26 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	hiltauth "github.com/fil-forge/hilt/pkg/rpc/service/auth"
 	"github.com/fil-forge/ingot/bucketauthority"
+	"github.com/fil-forge/ingot/config"
+	"github.com/fil-forge/ingot/iam"
+	"github.com/fil-forge/ingot/inmem"
+	"github.com/fil-forge/ingot/internal/cors"
+	"github.com/fil-forge/ingot/registry"
+	"github.com/fil-forge/ingot/s3frontend"
 	s3 "github.com/fil-forge/libforge/commands/s3"
 	s3bkt "github.com/fil-forge/libforge/commands/s3/bucket"
+	"github.com/fil-forge/libforge/identity"
 	"github.com/fil-forge/ucantone/did"
 	ucanerrors "github.com/fil-forge/ucantone/errors"
 	"github.com/gofiber/fiber/v3"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"go.uber.org/zap"
 )
 
@@ -39,7 +50,7 @@ func (f *fakeAuthority) BucketPolicy(_ context.Context, req s3.Request, body []b
 // does, ahead of a stand-in for the S3 route table.
 func policyApp(authority bucketauthority.BucketAuthority) *fiber.App {
 	app := fiber.New()
-	h := policyHandler(authority, zap.NewNop())
+	h := policyHandler(nil, authority, zap.NewNop())
 	app.Get("/:bucket", h)
 	app.Put("/:bucket", h)
 	app.Delete("/:bucket", h)
@@ -142,3 +153,76 @@ func TestPolicyRoutes(t *testing.T) {
 }
 
 var _ = did.Undef
+
+// TestBuildS3API_PolicyRoutes drives the policy routes through the real
+// versitygw wiring, where they mount ahead of the S3 route table and its
+// middleware: the response must still carry the bucket CORS headers, an
+// error body the request IDs already in the headers, and the request a
+// server span.
+func TestBuildS3API_PolicyRoutes(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	spans := tracetest.NewSpanRecorder()
+	prevTP := otel.GetTracerProvider()
+	otel.SetTracerProvider(sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(spans)))
+	t.Cleanup(func() { otel.SetTracerProvider(prevTP) })
+
+	const origin = "https://app.example"
+	corsCfg, err := cors.Build([]string{origin})
+	require.NoError(t, err)
+	mem := inmem.NewMemStore()
+	require.NoError(t, mem.Create(ctx, "photos", did.Undef, registry.CreateState{}))
+	backend := s3frontend.New(s3frontend.Deps{Registry: mem, CORS: corsCfg})
+
+	id, err := identity.New("", "did:web:ingot.test")
+	require.NoError(t, err)
+	svc := iam.New(neverAuthorizer{}, iam.NewKeyProofs(), iam.NewVerificationKeyCache(), iam.NewTenantCache())
+	f := &fakeAuthority{err: bucketauthority.ErrNoPolicy}
+	cfg := config.ServerConfig{Region: "us-east-1", MaxConnections: 16, MaxRequests: 16}
+	api, err := buildS3API(ctx, backend, cfg, svc, id, f, zap.NewNop())
+	require.NoError(t, err)
+
+	addr := freeAddr(t)
+	go func() { _ = api.ServeMultiPort([]string{addr}) }()
+	t.Cleanup(func() { require.NoError(t, api.ShutDown()) })
+	waitListening(t, addr)
+
+	get := func(t *testing.T) (*http.Response, string) {
+		t.Helper()
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+addr+"/photos?policy", nil)
+		require.NoError(t, err)
+		req.Header.Set("Origin", origin)
+		res, err := http.DefaultClient.Do(req)
+		require.NoError(t, err)
+		defer res.Body.Close()
+		body, err := io.ReadAll(res.Body)
+		require.NoError(t, err)
+		return res, string(body)
+	}
+
+	t.Run("an error body carries the request IDs", func(t *testing.T) {
+		res, body := get(t)
+		require.Equal(t, http.StatusNotFound, res.StatusCode, body)
+		reqID := res.Header.Get("x-amz-request-id")
+		require.NotEmpty(t, reqID)
+		require.Contains(t, body, "<RequestId>"+reqID+"</RequestId>")
+		require.Contains(t, body, "<HostId>"+res.Header.Get("x-amz-id-2")+"</HostId>")
+	})
+
+	t.Run("the response carries the bucket CORS headers", func(t *testing.T) {
+		f.err, f.ok = nil, &s3bkt.PolicyOK{ETag: `"bafy..."`, Policy: []byte(`{}`)}
+		res, body := get(t)
+		require.Equal(t, http.StatusOK, res.StatusCode, body)
+		require.Equal(t, origin, res.Header.Get("Access-Control-Allow-Origin"))
+		require.Contains(t, res.Header.Get("Access-Control-Expose-Headers"), "ETag")
+	})
+
+	t.Run("the request has a server span", func(t *testing.T) {
+		var names []string
+		for _, s := range spans.Ended() {
+			names = append(names, s.Name())
+		}
+		require.Contains(t, names, "S3 GET")
+	})
+}
