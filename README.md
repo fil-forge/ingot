@@ -81,8 +81,7 @@ A write splits into two paths:
   `forge_root_cid` under a guard. See
   [`logstore/README.md`](./logstore/README.md).
 
-Reads fall through tiers: the spool, the local log (catalog blocks), and
-finally the network, resolved by a local locator (`blob_locations` +
+Reads fall through tiers: the local log (catalog blocks), then the network, resolved by a local locator (`blob_locations` +
 `shard_inclusions`) and fetched with a ranged `content/retrieve` against the
 storing piri. The two routes are drawn side by side in
 [`docs/diagrams.md`](./docs/diagrams.md#two-block-routes-body-blobs-and-catalog-blocks).

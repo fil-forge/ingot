@@ -65,6 +65,20 @@ func (p *Provider) PutFile(digest multihash.Multihash, path string) error {
 	return p.Put(digest, data)
 }
 
+// Tamper rewrites the stored bytes of a blob in place without re-checking them
+// against the digest, so a test can serve a provider that returns corrupted
+// bytes. It fails when the blob is not stored.
+func (p *Provider) Tamper(digest multihash.Multihash, mutate func(data []byte)) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	data, ok := p.blobs[string(digest)]
+	if !ok {
+		return blockstore.ErrNotFound
+	}
+	mutate(data)
+	return nil
+}
+
 // Has reports whether the blob is stored.
 func (p *Provider) Has(digest multihash.Multihash) bool {
 	p.mu.Lock()
