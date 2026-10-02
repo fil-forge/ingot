@@ -53,7 +53,7 @@ flowchart LR
     idx["indexing-service"]
 
     client -->|"S3 REST"| ingot
-    ingot -->|"/s3/request/authorize (every request on a local-cache miss)<br/>/s3/bucket/info (lazy chain completion)<br/>/s3/bucket/create, delete, list"| hilt
+    ingot -->|"/s3/request/authorize (every request on a local-cache miss)<br/>/s3/bucket/info (lazy chain completion)<br/>/s3/bucket/create, delete, list<br/>/s3/bucket/policy (?policy, the signed request)"| hilt
     ingot -->|"/blob/add, /ucan/conclude, GET /receipt/:task<br/>/blob/abort, /blob/remove, /index/add<br/>/upload/add, /upload/remove"| sprue
     ingot -->|"HTTP PUT blob bytes (allocated URL)"| piri
     ingot -->|"content/retrieve (UCAN, on read miss)"| piri
@@ -80,8 +80,8 @@ Cross-references: [`architecture.md` §9](./architecture.md#9-the-system-contrac
 (implementation status).
 
 Sources: `module.go`, `bucketauthority/service.go`, `iam/service.go`,
-`forgeclient/`, `uploader/blob.go`, `blockstore/forge.go`. Review when these
-change.
+`policy_routes.go`, `forgeclient/`, `uploader/blob.go`, `blockstore/forge.go`.
+Review when these change.
 
 ## Package map and interface seams
 
@@ -850,7 +850,12 @@ Review when these change.
 
 Every request is authorized against hilt (or its cached delegations), and
 the proofs captured here are what the rest of the request spends. Versitygw's
-root account is disabled, so no access key bypasses this path.
+root account is disabled, so no access key bypasses this path. The one
+exception is the bucket policy operations (GET, PUT and DELETE on
+`/{bucket}?policy`): `policy_routes.go` answers them ahead of versitygw's
+route table and auth, forwarding the signed request to `/s3/bucket/policy`,
+where hilt authenticates and authorizes it itself. They capture no proofs and
+never reach `iam.Service`.
 
 ```mermaid
 sequenceDiagram
@@ -899,11 +904,14 @@ sequenceDiagram
   stay 500-class on purpose.
 - The signing key never leaves hilt as a secret: ingot receives a derived
   SigV4 key per request (the versitygw fork's `auth.Account.SigningKey`).
+- The policy routes mount ahead of every gateway middleware, so they apply
+  the bucket CORS rules and start their server span themselves; a hilt
+  rejection renders through the same `mapAuthError` mapping.
 
 Sources: `iam/service.go` (GetUserAccountForRequest, authorizeLocal,
 cacheProofs, mapAuthError), `iam/proofcache.go` (PutPermissions, Permits),
-`server.go` (buildS3API middleware). Review when `iam/` or the hilt client
-changes.
+`server.go` (buildS3API middleware), `policy_routes.go`. Review when `iam/`,
+`policy_routes.go` or the hilt client changes.
 
 ## Postgres schema as migrated
 
@@ -1098,4 +1106,5 @@ listed diagrams (each diagram's `Sources:` footer names its exact files).
 | `iam/`, `internal/reqscope/` | principals, authorize, context |
 | `bucket/`, `mst/` | version-tree, put, get |
 | `migrations/sql/` | schema, plus any state diagram naming a changed CHECK |
-| `module.go`, `server.go`, `config/` | packages, context, logstore-pipeline |
+| `module.go`, `server.go`, `config/` | packages, context, logstore-pipeline; `server.go` also authorize |
+| `policy_routes.go` | context, authorize |
