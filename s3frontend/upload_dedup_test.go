@@ -6,7 +6,6 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/multiformats/go-multihash"
 	"go.uber.org/zap/zaptest"
 
 	"github.com/fil-forge/ingot/blockstore"
@@ -18,24 +17,20 @@ import (
 	"github.com/fil-forge/ucantone/did"
 )
 
-// countingUploader records how many times each digest is uploaded. It returns
-// a non-empty location so the backend records it (what uploadBlobs'
-// already-located short-circuit reads back).
+// countingUploader records how many times each digest is accepted.
 type countingUploader struct {
-	inmem.NopUploader
+	*inmem.Provider
 	mu    sync.Mutex
 	calls map[string]int
 }
 
-func (u *countingUploader) UploadBlob(_ context.Context, _ did.DID, digest multihash.Multihash, size int64, _ string, _ ...uploader.UploadOption) (uploader.UploadedBlob, error) {
+func (u *countingUploader) ConcludeBlobs(ctx context.Context, space did.DID, parked []uploader.UploadedBlob) ([]*uploader.BlobLocation, error) {
 	u.mu.Lock()
-	u.calls[string(digest)]++
+	for _, p := range parked {
+		u.calls[string(p.Digest)]++
+	}
 	u.mu.Unlock()
-	return uploader.UploadedBlob{
-		Digest:   digest,
-		Size:     size,
-		Location: &uploader.BlobLocation{Provider: "did:test:piri", URL: "http://piri/blob", Size: size},
-	}, nil
+	return u.Provider.ConcludeBlobs(ctx, space, parked)
 }
 
 // TestUpload_IdenticalContentUploadsDistinctBlobs pins the encryption RFC's
@@ -63,7 +58,7 @@ func TestUpload_IdenticalContentUploadsDistinctBlobs(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = log.Close(ctx) })
 
-	up := &countingUploader{calls: map[string]int{}}
+	up := &countingUploader{Provider: inmem.NewProvider(), calls: map[string]int{}}
 	b := New(Deps{
 		Authority:  mem,
 		Registry:   mem,
@@ -74,7 +69,8 @@ func TestUpload_IdenticalContentUploadsDistinctBlobs(t *testing.T) {
 		Reads:      blockstore.NewLayered(log, inmem.NopBaseReader{}),
 		Log:        log,
 		Spool:      spool,
-		Uploader:   up,
+		Streaming:  up,
+		Streams:    mem,
 		Remover:    &recordingRemover{},
 		EncParams:  mem,
 		RegionKeys: testRegionKeys(t),
@@ -97,7 +93,7 @@ func TestUpload_IdenticalContentUploadsDistinctBlobs(t *testing.T) {
 	}
 	for d, n := range up.calls {
 		if n != 1 {
-			t.Fatalf("UploadBlob called %d times for blob %x, want 1", n, []byte(d))
+			t.Fatalf("ConcludeBlobs called %d times for blob %x, want 1", n, []byte(d))
 		}
 	}
 	if n := up.calls[string(digestOf(t, data))]; n != 0 {

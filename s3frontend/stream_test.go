@@ -32,7 +32,7 @@ import (
 
 // streamingUploader is a provider that takes blobs allocated by digest code.
 // It records every allocation, the bytes each PUT received, and what was
-// concluded, uploaded by digest and aborted.
+// concluded and aborted.
 type streamingUploader struct {
 	*inmem.Provider
 
@@ -50,7 +50,6 @@ type streamingUploader struct {
 	puts      map[cid.Cid][]byte
 	putErrs   map[cid.Cid]error
 	concluded []uploader.UploadedBlob
-	uploaded  []multihash.Multihash
 	aborted   []cid.Cid
 	// abortErr, when set, is what AbortBlob answers.
 	abortErr error
@@ -63,24 +62,24 @@ func newStreamingUploader() *streamingUploader {
 	return &streamingUploader{Provider: inmem.NewProvider(), failPuts: -1, puts: map[cid.Cid][]byte{}, putErrs: map[cid.Cid]error{}}
 }
 
-func (s *streamingUploader) StartBlob(_ context.Context, _ did.DID, size int64) (uploader.StreamedBlob, error) {
+func (s *streamingUploader) StartBlob(ctx context.Context, space did.DID, size int64) (uploader.StreamedBlob, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.unsupported {
+	unsupported := s.unsupported
+	s.mu.Unlock()
+	if unsupported {
 		return uploader.StreamedBlob{}, uploader.ErrUnsupportedDigestCode
 	}
-	n := len(s.started)
-	sb := uploader.StreamedBlob{
-		Size:          size,
-		AddTask:       cid.NewCidV1(cid.Raw, mustSum([]byte{'a', byte(n)})),
-		AcceptTask:    cid.NewCidV1(cid.Raw, mustSum([]byte{'c', byte(n)})),
-		PutInvocation: []byte{'p', byte(n)},
+	sb, err := s.Provider.StartBlob(ctx, space, size)
+	if err != nil {
+		return uploader.StreamedBlob{}, err
 	}
+	s.mu.Lock()
 	s.started = append(s.started, sb)
+	s.mu.Unlock()
 	return sb, nil
 }
 
-func (s *streamingUploader) PutBlob(_ context.Context, sb uploader.StreamedBlob, body io.Reader) error {
+func (s *streamingUploader) PutBlob(ctx context.Context, sb uploader.StreamedBlob, body io.Reader) error {
 	var buf bytes.Buffer
 	var err error
 	s.mu.Lock()
@@ -94,10 +93,13 @@ func (s *streamingUploader) PutBlob(_ context.Context, sb uploader.StreamedBlob,
 		_, err = io.Copy(&buf, body)
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.puts[sb.AddTask] = buf.Bytes()
 	s.putErrs[sb.AddTask] = err
-	return err
+	s.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	return s.Provider.PutBlob(ctx, sb, bytes.NewReader(buf.Bytes()))
 }
 
 func (s *streamingUploader) ConcludeBlobs(ctx context.Context, space did.DID, parked []uploader.UploadedBlob) ([]*uploader.BlobLocation, error) {
@@ -109,32 +111,18 @@ func (s *streamingUploader) ConcludeBlobs(ctx context.Context, space did.DID, pa
 	if err != nil {
 		return locations, err
 	}
-	// The provider keeps what the PUT received once the blob is accepted.
-	s.mu.Lock()
-	for _, p := range parked {
-		if data, ok := s.puts[p.AddTask]; ok && s.putErrs[p.AddTask] == nil {
-			if err := s.Provider.Put(p.Digest, data); err != nil {
-				s.mu.Unlock()
-				return locations, err
-			}
-		}
-	}
-	s.mu.Unlock()
 	return locations, concludeErr
 }
 
-func (s *streamingUploader) UploadBlob(ctx context.Context, space did.DID, digest multihash.Multihash, size int64, path string, opts ...uploader.UploadOption) (uploader.UploadedBlob, error) {
+func (s *streamingUploader) AbortBlob(ctx context.Context, space did.DID, cause cid.Cid) error {
 	s.mu.Lock()
-	s.uploaded = append(s.uploaded, digest)
-	s.mu.Unlock()
-	return s.Provider.UploadBlob(ctx, space, digest, size, path, opts...)
-}
-
-func (s *streamingUploader) AbortBlob(_ context.Context, _ did.DID, cause cid.Cid) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.aborted = append(s.aborted, cause)
-	return s.abortErr
+	abortErr := s.abortErr
+	s.mu.Unlock()
+	if abortErr != nil {
+		return abortErr
+	}
+	return s.Provider.AbortBlob(ctx, space, cause)
 }
 
 func mustSum(b []byte) multihash.Multihash {
@@ -187,7 +175,6 @@ func TestStreamedPutObject(t *testing.T) {
 	digests := blobDigestsOf(t, b, "k", "")
 	require.Len(t, digests, 3)
 	require.Len(t, su.started, 3, "every blob is allocated before its digest is known")
-	require.Empty(t, su.uploaded, "nothing is uploaded by digest")
 	require.Len(t, su.concluded, 3)
 	for i, d := range digests {
 		sb := su.started[i]
@@ -234,7 +221,6 @@ func TestStreamedPutObjectEmpty(t *testing.T) {
 	b, _ := newStreamingBackend(t, su)
 	require.NoError(t, putSized(t, b, "k", nil, 0))
 	require.Empty(t, su.started, "an empty body has no blob to send")
-	require.Empty(t, su.uploaded)
 	require.Empty(t, getRange(t, b, "k", ""))
 }
 
@@ -252,7 +238,6 @@ func TestStreamedPutObjectFailedPutIsResent(t *testing.T) {
 	digests := blobDigestsOf(t, b, "k", "")
 	require.Len(t, digests, 2)
 	require.Len(t, su.started, 4, "the first blob took three allocations and the second one")
-	require.Empty(t, su.uploaded, "nothing is uploaded by digest")
 	require.Len(t, su.concluded, 2)
 	require.Equal(t, []cid.Cid{su.started[0].AddTask, su.started[1].AddTask}, su.aborted,
 		"the allocations that took the failed sends are released")
@@ -279,16 +264,17 @@ func TestStreamedPutObjectGivesUpAfterRepeatedFailures(t *testing.T) {
 	require.Empty(t, staleStreams(t, mem))
 }
 
+// An upload service that cannot add by digest code fails the write: there is
+// no digest-first path to fall back to.
 func TestStreamedPutObjectUnsupportedDigestCode(t *testing.T) {
 	su := newStreamingUploader()
 	su.unsupported = true
-	b, _ := newStreamingBackend(t, su)
+	b, mem := newStreamingBackend(t, su)
 	data := testBody(700 << 10)
 
-	require.NoError(t, putSized(t, b, "k", data, int64(len(data))))
+	require.ErrorIs(t, putSized(t, b, "k", data, int64(len(data))), uploader.ErrUnsupportedDigestCode)
 	require.Empty(t, su.started)
-	require.Len(t, su.uploaded, 3, "every blob uploads by digest")
-	require.Equal(t, data, getRange(t, b, "k", ""))
+	require.Empty(t, staleStreams(t, mem))
 }
 
 func TestStreamedPutObjectWrongLength(t *testing.T) {
@@ -351,7 +337,6 @@ func TestStreamedUploadPart(t *testing.T) {
 	for i, d := range digests {
 		require.Equal(t, d, su.concluded[i].Digest)
 	}
-	require.Empty(t, su.uploaded)
 	require.Equal(t, part, getRange(t, b, key, ""))
 }
 

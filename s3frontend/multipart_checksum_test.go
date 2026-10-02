@@ -55,7 +55,7 @@ func mpUploadPart(t *testing.T, b *Backend, key, uploadID string, n int32, data 
 		Key:        &key,
 		UploadId:   &uploadID,
 		PartNumber: &n,
-		Body:       bytes.NewReader(data),
+		Body:       bytes.NewReader(data), ContentLength: sizeOf(data),
 	}
 	if mod != nil {
 		mod(in)
@@ -447,9 +447,9 @@ func TestCopyObject_Checksums(t *testing.T) {
 
 	srcKey := "cp-src"
 	if _, err := b.PutObject(context.Background(), s3response.PutObjectInput{
-		Bucket:         &bucket,
-		Key:            &srcKey,
-		Body:           bytes.NewReader(data),
+		Bucket: &bucket,
+		Key:    &srcKey,
+		Body:   bytes.NewReader(data), ContentLength: sizeOf(data),
 		ChecksumCRC32C: &crcSum,
 	}); err != nil {
 		t.Fatalf("PutObject: %v", err)

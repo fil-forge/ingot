@@ -34,7 +34,7 @@ func putObjV(t *testing.T, b *Backend, key string, data []byte) s3response.PutOb
 	out, err := b.PutObject(context.Background(), s3response.PutObjectInput{
 		Bucket: &bucket,
 		Key:    &key,
-		Body:   bytes.NewReader(data),
+		Body:   bytes.NewReader(data), ContentLength: sizeOf(data),
 	})
 	if err != nil {
 		t.Fatalf("PutObject %s: %v", key, err)

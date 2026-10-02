@@ -225,8 +225,8 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 		bodyReader = hr
 	}
 
-	// INGEST (no lock): stream the body → coarse-split into blobs → spool each
-	// to local disk → upload each to Forge by digest (allocate→PUT→accept). A
+	// INGEST (no lock): stream the body → coarse-split into blobs → send each
+	// to its provider as it arrives (allocate→PUT) → accept each. A
 	// 200 means every body blob is durable and accepted before the manifest
 	// that references it is committed (docs/architecture.md §7.1).
 	bodyRec, err := b.ingestBody(ctx, bucketState, bodyReader, declaredLength(input.ContentLength), clientProvidedBodyMD5(ctx, spec, hr))
@@ -307,15 +307,15 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 	return out, nil
 }
 
-// ingestBody streams an object body off-lock: it coarse-splits into blobs and
-// spools each to local disk (SplitBody → Spool), records an upload_intents row
-// per blob, uploads each to Forge by digest, and advances the intent to
-// accepted. It returns the Body the manifest will pin. A zero-byte body yields
-// a Body with no blobs and uploads nothing. A non-nil md5Src is where the
+// ingestBody streams an object body off-lock: it coarse-splits into blobs,
+// sends each to its provider as it arrives (splitSpool), records an
+// upload_intents row per blob, and concludes each upload, advancing the intent
+// to accepted. It returns the Body the manifest will pin. A zero-byte body
+// yields a Body with no blobs and uploads nothing. A non-nil md5Src is where the
 // body's MD5 comes from instead of ingest's own pass (see bodyMD5Source);
 // ingest reads it after the body and stamps it onto Body.MD5.
 //
-// On any error the already-spooled/parked blobs and their intents are left for
+// On any error the already-sent/parked blobs and their intents are left for
 // crash recovery to reconcile (a later phase); no manifest is written, so no
 // catalog entry ever references a non-durable blob.
 //
@@ -389,34 +389,29 @@ func (b *Backend) splitSpool(ctx context.Context, bucket string, space did.DID, 
 	if err != nil {
 		return spooledBody{}, err
 	}
-	enc := newEncryptingBlobWriter(b.spool, b.regionKeys, space, []fee.Recipient{recipient})
+	enc := newEncryptingBlobWriter(b.regionKeys, space, []fee.Recipient{recipient})
 	var splitOpts []msbucket.SplitOption
 	if md5Src != nil {
 		splitOpts = append(splitOpts, msbucket.WithoutMD5())
 	}
-	var body msbucket.Body
-	if b.streaming != nil {
-		enc.stream, enc.replay, enc.streams, enc.bucket, enc.logger = b.streaming, b.replay, b.streams, bucket, b.logger
-		enc.lease = newStreamLease(b.streams, b.logger)
-		// A failed split leaves no caller to end the lease.
-		defer func() {
-			if err != nil {
-				enc.lease.end()
-			}
-		}()
-		body, err = msbucket.SplitSizedBody(ctx, enc, r, size, b.maxBlobSize, splitOpts...)
-		switch {
-		case errors.Is(err, msbucket.ErrBodyShort):
-			return spooledBody{}, s3err.GetAPIError(s3err.ErrIncompleteBody)
-		case errors.Is(err, msbucket.ErrBodyLong):
-			return spooledBody{}, s3err.GetAPIError(s3err.ErrContentLengthMismatch)
-		case errors.Is(err, blockstore.ErrReplayBusy):
-			// The node cannot hold the body for retries right now: have the
-			// client back off and try again.
-			return spooledBody{}, s3err.GetAPIError(s3err.ErrSlowDown)
+	enc.stream, enc.replay, enc.streams, enc.bucket, enc.logger = b.streaming, b.replay, b.streams, bucket, b.logger
+	enc.lease = newStreamLease(b.streams, b.logger)
+	// A failed split leaves no caller to end the lease.
+	defer func() {
+		if err != nil {
+			enc.lease.end()
 		}
-	} else {
-		body, err = msbucket.SplitBody(ctx, enc, r, b.maxBlobSize, splitOpts...)
+	}()
+	body, err := msbucket.SplitSizedBody(ctx, enc, r, size, b.maxBlobSize, splitOpts...)
+	switch {
+	case errors.Is(err, msbucket.ErrBodyShort):
+		return spooledBody{}, s3err.GetAPIError(s3err.ErrIncompleteBody)
+	case errors.Is(err, msbucket.ErrBodyLong):
+		return spooledBody{}, s3err.GetAPIError(s3err.ErrContentLengthMismatch)
+	case errors.Is(err, blockstore.ErrReplayBusy):
+		// The node cannot hold the body for retries right now: have the
+		// client back off and try again.
+		return spooledBody{}, s3err.GetAPIError(s3err.ErrSlowDown)
 	}
 	if err != nil {
 		return spooledBody{}, fmt.Errorf("split body: %w", err)
@@ -442,17 +437,14 @@ func (b *Backend) splitSpool(ctx context.Context, bucket string, space did.DID, 
 			return spooledBody{}, err
 		}
 		// A streamed blob is on the network already (see IntentUploading).
-		// Its bytes were never spooled, so the intent has no local path.
-		state, localPath := registry.IntentSpooled, b.spool.Path(blob.Digest)
-		if _, ok := streamed[string(blob.Digest)]; ok {
-			state, localPath = registry.IntentUploading, ""
+		if _, ok := streamed[string(blob.Digest)]; !ok {
+			return spooledBody{}, fmt.Errorf("blob %x was not sent to its provider", blob.Digest)
 		}
 		if err := b.intents.PutIntent(ctx, registry.UploadIntent{
-			Digest:    blob.Digest,
-			LocalPath: localPath,
-			Size:      storedSize,
-			State:     state,
-			Bucket:    bucket,
+			Digest: blob.Digest,
+			Size:   storedSize,
+			State:  registry.IntentUploading,
+			Bucket: bucket,
 		}); err != nil {
 			return spooledBody{}, fmt.Errorf("record intent: %w", err)
 		}
@@ -469,39 +461,24 @@ func (b *Backend) splitSpool(ctx context.Context, bucket string, space did.DID, 
 	return spooledBody{Body: body, streamed: streamed, lease: enc.lease}, nil
 }
 
-// uploadBlobs uploads each spooled blob to Forge by digest (allocate→PUT→
-// accept), advances its intent to accepted, and records its location. A no-op
-// in the in-memory harness (the spool serves reads).
-//
-// A blob already durably stored for this space (a re-PUT of identical content,
-// an overwrite-in-place, or a blob shared with an earlier object) is skipped:
-// its bytes are already on Forge, so re-uploading is pure waste — and worse,
-// re-adding an already-stored blob makes the upload service return an accept
-// receipt with no fresh location commitment, which the edge client (correctly)
-// rejects. We detect this via the recorded location and short-circuit, matching
-// guppy's "blob already has location; skip /blob/add". (A crash between accept
-// and the location record could still re-add; that window closes with the
-// deferred upload_intents × blob_locations crash recovery — see §12.)
-//
-// A blob in streamed already went to its provider while it was spooled: it is
-// parked there and needs only its conclude.
+// uploadBlobs concludes each blob's upload to Forge, advancing its intent to
+// accepted and recording its location. Every blob went to its provider as it
+// arrived (see splitSpool) and is parked there, needing only its conclude.
 func (b *Backend) uploadBlobs(ctx context.Context, space did.DID, blobs []msbucket.BlobRef, streamed map[string]uploader.StreamedBlob) error {
 	for _, blob := range blobs {
-		if sb, ok := streamed[string(blob.Digest)]; ok {
-			if err := b.concludeStreamed(ctx, space, blob, sb); err != nil {
-				return err
-			}
-			continue
+		sb, ok := streamed[string(blob.Digest)]
+		if !ok {
+			return fmt.Errorf("blob %x was not sent to its provider", blob.Digest)
 		}
-		if err := b.uploadBlob(ctx, space, blob); err != nil {
+		if err := b.concludeStreamed(ctx, space, blob, sb); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// concludeStreamed accepts a blob that went to its provider as it was spooled,
-// traced as a blob.upload span like uploadBlob.
+// concludeStreamed accepts a blob that went to its provider as it arrived,
+// traced as a blob.upload span.
 func (b *Backend) concludeStreamed(ctx context.Context, space did.DID, blob msbucket.BlobRef, sb uploader.StreamedBlob) (err error) {
 	ctx, span := tracing.Start(ctx, "blob.upload",
 		attribute.String("ingot.blob.result", "streamed"),
@@ -525,65 +502,6 @@ func (b *Backend) concludeStreamed(ctx context.Context, space did.DID, blob msbu
 	}
 	if len(locations) != 1 || locations[0] == nil {
 		return fmt.Errorf("conclude streamed blob %x: no location", blob.Digest)
-	}
-	return nil
-}
-
-// uploadBlob is uploadBlobs for one blob, traced as a blob.upload span whose
-// ingot.blob.result says whether it uploaded or was already stored.
-func (b *Backend) uploadBlob(ctx context.Context, space did.DID, blob msbucket.BlobRef) (err error) {
-	ctx, span := tracing.Start(ctx, "blob.upload")
-	defer func() { tracing.End(span, err) }()
-
-	digest := blob.Digest
-	if existing, err := b.locations.GetLocation(ctx, space, blob.Digest); err == nil && existing != nil {
-		// Already durable for this space — advance the intent and move on.
-		span.SetAttributes(attribute.String("ingot.blob.result", "already_stored"))
-		if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentAccepted); err != nil {
-			return fmt.Errorf("mark accepted (dedup): %w", err)
-		}
-		return nil
-	} else if err != nil && !errors.Is(err, registry.ErrNotFound) {
-		return fmt.Errorf("lookup location: %w", err)
-	}
-	// The uploaded bytes are the spooled envelope, so the size is the
-	// intent's stored byte count, not the blob's plaintext span.
-	in, err := b.intents.GetIntent(ctx, digest)
-	if err != nil {
-		return fmt.Errorf("lookup intent: %w", err)
-	}
-	span.SetAttributes(
-		attribute.String("ingot.blob.result", "uploaded"),
-		attribute.Int64("ingot.blob.bytes", in.Size),
-	)
-	// The blob may be on the network from here on; a release finding no
-	// row for it must remove it rather than assume it never left.
-	if err := b.intents.SetIntentState(ctx, digest, registry.IntentUploading); err != nil {
-		return fmt.Errorf("mark uploading: %w", err)
-	}
-	res, err := b.uploader.UploadBlob(ctx, space, digest, in.Size, b.spool.Path(digest))
-	if err != nil {
-		return fmt.Errorf("upload blob: %w", err)
-	}
-	// A concluding UploadBlob (the default) returns an accepted location
-	// or errors; guard the contract rather than deref-panic on a bad impl.
-	if res.Location == nil {
-		return fmt.Errorf("upload blob %x: concluding upload returned no location", blob.Digest)
-	}
-	loc := res.Location
-	if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentAccepted); err != nil {
-		return fmt.Errorf("mark accepted: %w", err)
-	}
-	// Best-effort location record (unused in the harness, where reads come
-	// from the spool); keyed by (space, digest).
-	if err := b.locations.PutLocation(ctx, registry.BlobLocation{
-		Space:    space,
-		Digest:   blob.Digest,
-		Provider: loc.Provider,
-		URL:      loc.URL,
-		Size:     loc.Size,
-	}); err != nil {
-		return fmt.Errorf("record location: %w", err)
 	}
 	return nil
 }
@@ -905,7 +823,7 @@ func (b *Backend) executeRelease(ctx context.Context, pr registry.PendingRelease
 			log.Warn("release: decode park add task failed", zap.Error(err))
 			return false
 		}
-		aerr := b.deferred.AbortBlob(ctx, space, cause)
+		aerr := b.streaming.AbortBlob(ctx, space, cause)
 		switch {
 		case aerr == nil:
 		case errors.Is(aerr, uploader.ErrBlobAccepted):

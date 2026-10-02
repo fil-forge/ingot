@@ -75,7 +75,7 @@ type Forge struct {
 	// store seen on an in-request write to that space. The catalog segment
 	// ship (SubmitShard) runs asynchronously in the flush goroutine with no
 	// request context, so it reuses this to authorize its onward
-	// /blob/add + /index/add. See UploadBlob (capture) and SubmitShard (use).
+	// /blob/add + /index/add. See StartBlob (capture) and SubmitShard (use).
 	shipProofs *gocache.Cache
 }
 

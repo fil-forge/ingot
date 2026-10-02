@@ -10,6 +10,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/versitygw/s3response"
+	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
 	"go.uber.org/zap/zaptest"
 
@@ -31,6 +32,21 @@ func (r *recordingRemover) RemoveBlob(_ context.Context, _ did.DID, d multihash.
 	defer r.mu.Unlock()
 	r.removed = append(r.removed, append([]byte(nil), d...))
 	return nil
+}
+
+// releasingProvider is a Provider that reports the aborts it is asked for to a
+// recordingRemover, so a test sees every network release of a blob — the
+// remove of an accepted one and the abort of a parked one — in one place.
+type releasingProvider struct {
+	*inmem.Provider
+	rm *recordingRemover
+}
+
+func (p *releasingProvider) AbortBlob(ctx context.Context, space did.DID, add cid.Cid) error {
+	if d := p.Provider.DigestOf(add); d != nil {
+		_ = p.rm.RemoveBlob(ctx, space, d)
+	}
+	return p.Provider.AbortBlob(ctx, space, add)
 }
 
 func (r *recordingRemover) removedDigests() map[string]int {
@@ -73,7 +89,7 @@ func newRefTestBackend(t *testing.T, maxBlob ...int64) (*Backend, *inmem.MemStor
 	t.Cleanup(func() { _ = log.Close(ctx) })
 
 	rm := &recordingRemover{}
-	provider := inmem.NewProvider()
+	provider := &releasingProvider{Provider: inmem.NewProvider(), rm: rm}
 	b := New(Deps{
 		Authority:       mem,
 		Registry:        mem,
@@ -86,8 +102,8 @@ func newRefTestBackend(t *testing.T, maxBlob ...int64) (*Backend, *inmem.MemStor
 		Reads:           blockstore.NewLayered(log, provider),
 		Log:             log,
 		Spool:           spool,
-		Uploader:        provider,
-		Deferred:        provider,
+		Streaming:       provider,
+		Streams:         mem,
 		Remover:         rm,
 		EncParams:       mem,
 		RegionKeys:      testRegionKeys(t),
@@ -147,7 +163,7 @@ func putObj(t *testing.T, b *Backend, key string, data []byte) {
 	if _, err := b.PutObject(context.Background(), s3response.PutObjectInput{
 		Bucket: &bucket,
 		Key:    &key,
-		Body:   bytes.NewReader(data),
+		Body:   bytes.NewReader(data), ContentLength: sizeOf(data),
 	}); err != nil {
 		t.Fatalf("PutObject %s: %v", key, err)
 	}
