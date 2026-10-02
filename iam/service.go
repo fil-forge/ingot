@@ -26,6 +26,14 @@
 // ([reqscope.ProofStoreKey]) so an onward Forge retrieval — which sees only ctx +
 // space — authorizes with THIS access key's chain, never another's.
 //
+// A response carrying a delegation the revocation consumer has seen revoked
+// ([KeyProofs.Revoked]) authorizes the one request it answers and is not
+// cached: it stems from a Hilt write whose revocations were published but
+// whose commit failed, and caching it would keep the old access in force
+// while the console's retry republishes revocations Swarf
+// deduplicates. The request still gets a store of its own holding the
+// response's delegations, so its onward retrieval has a chain.
+//
 // A local fast path (the RFC's "local cache" authorization) avoids the Hilt
 // round-trip when everything needed is already cached, mirroring Hilt's own
 // verification and authorization order: the request parses as HMAC SigV4 and
@@ -237,12 +245,30 @@ func (s *Service) GetUserAccountForRequest(ctx fiber.Ctx, accessKeyStr string) (
 		return auth.Account{}, fmt.Errorf("hilt/iam: no tenant for %s in authorize result", accessKeyID)
 	}
 
-	// Deposit the returned delegations (access-key→ingot re-delegations,
-	// ≤24h TTL) into THIS key's store and complete their chains if needed —
+	// A write's revocations reached Swarf without its commit: Hilt still
+	// answers with delegations the consumer saw revoked. Authorize this
+	// request from the response and cache nothing, so the key returns to Hilt
+	// on every request until a committed write issues fresh delegations. The
+	// request keeps a store of its own for its onward retrieval. Otherwise the
+	// delegations land in the key's store in the same step as the check, so a
+	// revocation arriving meanwhile still finds (and drops) them. The same
+	// check covers the bucket-info remainder cacheProofs fetches.
+	if ctr != nil && !s.cacheProofs(spanCtx, store, ctr, req, accessKeyID, s.proofs.DepositUnlessRevoked) {
+		scoped := NewDelegationCache()
+		ctx.Locals(reqscope.ProofStoreKey(), ucanlib.ProofStore(scoped))
+		// Refetches bucket info already fetched above; rare (a failed Hilt commit).
+		s.cacheProofs(reqCtx, scoped, ctr, req, accessKeyID, addAll)
+		ctx.Locals(reqscope.TenantKey(), ok.Tenant)
+		s.logger.Info("hilt/iam: authorize response carries a revoked delegation, not cached",
+			zap.String("access", accessKeyStr), zap.Stringer("tenant", ok.Tenant))
+		return adminAccount(accessKeyStr, key), nil
+	}
+
+	// The returned delegations (access-key→ingot re-delegations, ≤24h TTL) are
+	// now in THIS key's store with their chains completed if needed —
 	// best-effort: the request IS authorized; a gap here only affects onward
 	// Forge invocations, which will surface it as missing retrieval authority.
-	s.cacheProofs(spanCtx, store, ctr, req, accessKeyID)
-
+	//
 	// Cache the verification keys until Hilt's own expiry horizon: SigV4
 	// derived keys die at the next UTC midnight (credential-scope date
 	// rollover), which is also when Hilt expires its re-delegations. Extend
@@ -282,16 +308,16 @@ func (s *Service) GetUserAccountForRequest(ctx fiber.Ctx, accessKeyStr string) (
 		zap.Stringer("tenant", ok.Tenant),
 	)
 
-	return auth.Account{
-		Access:     accessKeyStr,
-		SigningKey: key,
-		// Admin so the gateway's role/ACL layers defer entirely: authorization
-		// is per-request via Hilt (or the local fast path), which enforces the
-		// key's permissions and bucket scope. The gateway doesn't model
-		// ownership for hilt-managed keys (bucket ACLs are empty) and its
-		// admin APIs are not mounted.
-		Role: auth.RoleAdmin,
-	}, nil
+	return adminAccount(accessKeyStr, key), nil
+}
+
+// adminAccount is the gateway account an authorized request runs as. Admin so the
+// gateway's role/ACL layers defer entirely: authorization is per-request via
+// Hilt (or the local fast path), which enforces the key's permissions and
+// bucket scope. The gateway doesn't model ownership for hilt-managed keys
+// (bucket ACLs are empty) and its admin APIs are not mounted.
+func adminAccount(access string, signingKey []byte) auth.Account {
+	return auth.Account{Access: access, SigningKey: signingKey, Role: auth.RoleAdmin}
 }
 
 // mapAuthError translates an /s3/request/authorize failure into the closest S3
@@ -475,12 +501,15 @@ func untilNextUTCMidnight(now time.Time) time.Duration {
 // proof store and, when it cannot assemble a root-complete chain for one of
 // the fresh leaves, fetches the bucket→tenant→access-key remainder from
 // /s3/bucket/info (once per bucket the request acts on: the addressed bucket,
-// plus a copy's source) and caches that too.
-func (s *Service) cacheProofs(ctx context.Context, store *DelegationCache, ctr ucan.Container, req s3.Request, keyDID did.DID) {
+// plus a copy's source) and caches that too. Every deposit goes through
+// deposit, and it reports false as soon as deposit refuses one.
+func (s *Service) cacheProofs(ctx context.Context, store *DelegationCache, ctr ucan.Container, req s3.Request, keyDID did.DID, deposit func(*DelegationCache, ...ucan.Delegation) bool) bool {
 	if ctr == nil || len(ctr.Delegations()) == 0 {
-		return
+		return true
 	}
-	store.Add(ctr.Delegations()...)
+	if !deposit(store, ctr.Delegations()...) {
+		return false
+	}
 
 	// A leaf is complete when a chain from its audience (this instance)
 	// back to its subject's root exists in the cache. Powerline leaves
@@ -499,14 +528,14 @@ func (s *Service) cacheProofs(ctx context.Context, store *DelegationCache, ctr u
 		}
 	}
 	if !incomplete {
-		return
+		return true
 	}
 
 	buckets := requestBuckets(req)
 	if len(buckets) == 0 {
 		s.logger.Warn("hilt/iam: incomplete proof chain and no bucket in request URL",
 			zap.String("url", req.URL))
-		return
+		return true
 	}
 	for _, bucketName := range buckets {
 		_, infoCtr, err := s.authorizer.BucketInfo(ctx, bucketName, keyDID)
@@ -515,10 +544,17 @@ func (s *Service) cacheProofs(ctx context.Context, store *DelegationCache, ctr u
 				zap.String("bucket", bucketName), zap.Error(err))
 			continue
 		}
-		if infoCtr != nil {
-			store.Add(infoCtr.Delegations()...)
+		if infoCtr != nil && !deposit(store, infoCtr.Delegations()...) {
+			return false
 		}
 	}
+	return true
+}
+
+// addAll is the cacheProofs deposit for a request-scoped store: no check.
+func addAll(store *DelegationCache, dlgs ...ucan.Delegation) bool {
+	store.Add(dlgs...)
+	return true
 }
 
 // requestBuckets names the buckets a request acts on, in the order Hilt
