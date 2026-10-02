@@ -35,23 +35,29 @@ self-provisions.
 
 ## Write path
 
-A PUT streams the body into the local **spool** (sha256 and md5 in one
-pass), splits it into blobs of at most `max_blob_size`, and uploads each
-blob to the network before anything commits: `/blob/add` against sprue, an
-HTTP PUT of the bytes to the allocated piri, a concluded receipt, and the
-`/blob/accept` location commitment. Only then does the short per-bucket
+A PUT hashes the body as it streams (sha256 and md5 in one pass), splits it
+into blobs of at most `max_blob_size`, and sends each blob to the network
+as it arrives, before anything commits: `/blob/add` against sprue (by size
+and digest code, since the digest is not known yet), an HTTP PUT of the bytes
+to the allocated piri, a concluded receipt, and the `/blob/accept` location
+commitment. Nothing is kept locally after the send: each blob's bytes pass
+through a short-lived **replay copy** (an anonymous file under a byte budget,
+`replay_buffer_bytes`), kept only so a failed send can be repeated under a new
+allocation without asking the client for the body again, and dropped as soon
+as the send succeeds. A node whose budget is full answers `SlowDown` before
+reading any of the body. Only then does the short per-bucket
 critical section run: allocate the version seq, write the manifest, splice
 the MST, fsync one `AppendBatch` of the new catalog blocks, and
 compare-and-swap the bucket root in Postgres. The reference index
 (`blob_refs`) reconciles after the commit, releasing superseded blobs whose
 claim count reaches zero. The full trace is the
-[PutObject diagram](./docs/diagrams.md#putobject-spool-and-upload-off-the-lock-commit-under-it).
+[PutObject diagram](./docs/diagrams.md#putobject-send-off-the-lock-commit-under-it).
 
 **Every body blob is encrypted at ingest** (the FilOne encryption design's
 write side, `s3frontend/encrypt.go`). Each plaintext piece SplitBody cuts
 gets a fresh CEK and streams through FEE into a `COSE_Encrypt` envelope
-(AES-256-GCM STREAM, 256 KiB chunks); the envelope is what the spool stores
-and the network receives, under its **ciphertext** digest. The CEK is wrapped
+(AES-256-GCM STREAM, 256 KiB chunks); the envelope is what the network
+receives, under its **ciphertext** digest. The CEK is wrapped
 twice. The region wrap (`regionkey.Provider`, bound to (space, digest)) goes
 into the blob's `blob_encryption_params` row before any manifest can
 reference the digest; every read uses it. The tenant wrap is the envelope's
@@ -167,23 +173,15 @@ reads the blob's state from its rows rather than its intent. A location row
 means accepted and the space's claim is removed; a park row alone means
 parked and the allocation is aborted, or removed instead when the provider
 refuses the abort because the blob was accepted after all (a conclude ran
-and ingot never learned of it). Neither row is ambiguous on its own: a blob
-uploaded and accepted at Complete whose location then failed to record has
-none either. The intent settles it. Every upload marks the intent
-`uploading` before its first network call, so a blob still `spooled` never
-left this node and is cleaned up locally, while any other state gets a
-network remove, which the upload service treats as success for a blob it
-never registered. The distinction matters for the retry: a blob that never
-uploaded captured no authority a background remove could use, and a remove
-attempted for it would fail on every retry and pin the record forever.
+and ingot never learned of it). A blob with neither row may still be on the
+network: it is sent to its provider before any row records the outcome, and a
+request can die between. So it gets a network remove, which the upload service
+treats as success for a blob it never registered.
 The crypto-shred goes first, the network step next, and the location and
 park rows only once the network holds nothing, so a retry sees the same
-state. A release of a blob that was never committed also removes the spool
-copy and upload intent, the intent in the same transaction as the release
+state. The upload intent goes last, in the same transaction as the release
 record, since the intent is the only evidence of how far the blob ever got
-and a record outliving it would owe a network remove nothing can authorize.
-A committed blob's release leaves both, since its spool copy is the
-insurance copy until eviction. A record
+and a record outliving it would leave the retry guessing. A record
 whose digest a part of an in-flight session still references waits: that
 session's Complete turns the reference into a claim, which makes the record
 stale, and its abort records a release of its own.
@@ -209,8 +207,8 @@ A `blob_encryption_params` row marks a blob encrypted and carries what its
 decryptor needs; the read unwraps the region-wrapped CEK through
 `regionkey.Provider` (OpenBao transit in production, bound to the blob's
 (space, digest)), maps the plaintext range to one contiguous ciphertext span
-(`aesstream.CiphertextRange`), fetches only that span (ranged from the spool
-or piri via `OpenBlobRange`), and decrypts it as it streams
+(`aesstream.CiphertextRange`), fetches only that span (ranged from piri via
+`OpenBlobRange`), and decrypts it as it streams
 (`aesstream.SpanReader`). A tampered chunk fails authentication mid-stream.
 The encryption-params store and region key provider are required
 dependencies; only the provider implementation (openbao vs inprocess) is
@@ -265,10 +263,7 @@ draws the chains and the stores.
 
 - **No HA.** A bucket is single-writer through an in-process lock; nothing
   coordinates across instances beyond the root CAS.
-- **The spool is unbounded** (#48): nothing evicts local body blobs, and
-  DeleteObject releases network-side only, so local disk grows with every
-  body byte written.
-- **Spool crash recovery is not built**: reconciling `upload_intents`
+- **Crash recovery of in-flight uploads is not built**: reconciling `upload_intents`
   against `blob_refs` after a crash between commit and reconcile is a later
   phase; the window leaks rather than loses referenced data.
 - **No catalog GC**: `gc_candidates` is write-only; superseded MST nodes

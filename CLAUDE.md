@@ -93,11 +93,12 @@ Internal:
   (Put/Get/Head/Delete/List), `version.go` (resolveVersion / commitVersion,
   the per-key version tree), `multipart.go`, `bucket.go`, `listversions.go`,
   `backend.go`, `stream.go` (each body blob streams to its
-  provider while spooling it; the stale-stream sweeper).
+  provider as it arrives, with a replay copy for resends; the stale-stream
+  sweeper).
 - **`bucketop/`** — `Coordinator`/`Tx`: per-bucket write transaction (lock,
   snapshot root, staging buffer, CAS commit).
 - **`blockstore/`** — block I/O contracts + impls: `log.go` (`Log`, `Plane`
-  [catalog-only], `OpRoot`), `staging.go` (`OpStaging`), `spool.go` (`Spool`), `replay.go` (`ReplayBuffer`: per-blob resend copies under a byte budget),
+  [catalog-only], `OpRoot`), `staging.go` (`OpStaging`), `replay.go` (`ReplayBuffer`: per-blob resend copies under a byte budget),
   `layered.go`, `forge.go` (the network read tier), `cache.go` (`Cached` LRU),
   `locator/` (carried from guppy; the indexer-backed locator is never
   injected).
@@ -232,7 +233,7 @@ forge-mode daemon. Two tiers:
     *unexpected pass* fails the test — the cue to promote the row). One
     shared stack serves all categories (`TestForgeVersity`).
   - **`scenarios_test.go`** — ingot-unique behaviors upstream can't assert
-    (blob-split/spool-by-digest, zero-byte objects, part-spans-blobs
+    (blob-split, zero-byte objects, part-spans-blobs
     multipart, failed-Complete session recovery), on a small-`max_blob_size`
     config (`testdata/config-smallblob.yaml` via smelt's WithServiceConfig).
   - **`forge_*_test.go`** — forge-native behaviors on dedicated stacks:

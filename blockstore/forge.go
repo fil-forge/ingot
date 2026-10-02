@@ -282,7 +282,7 @@ func (f *Forge) GetBlock(ctx context.Context, space did.DID, c cid.Cid) (block.B
 }
 
 // OpenBlob streams an object-body blob from piri by digest, without buffering it
-// in memory — the network counterpart of Spool.OpenBlob. Bytes are served
+// in memory — the streaming read of a body blob. Bytes are served
 // straight off the /content/retrieve response; the caller owns the reader and
 // must Close it.
 func (f *Forge) OpenBlob(ctx context.Context, space did.DID, digest mh.Multihash) (io.ReadCloser, error) {

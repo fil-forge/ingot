@@ -93,14 +93,14 @@ func TestPutObjectSpans(t *testing.T) {
 		}
 	})
 
-	spool := tree.one("body.spool")
-	if spool.Parent().SpanID() != tree.root.SpanID() {
-		t.Fatalf("expected body.spool under the request span")
+	send := tree.one("body.send")
+	if send.Parent().SpanID() != tree.root.SpanID() {
+		t.Fatalf("expected body.send under the request span")
 	}
-	requireAttr(t, spool, attribute.Int64("ingot.body.bytes", int64(len(data))))
-	requireAttr(t, spool, attribute.Int("ingot.body.blobs", 1))
-	if ev := spool.Events(); len(ev) != 1 || ev[0].Name != "body.received" {
-		t.Fatalf("expected a body.received event on body.spool, got %v", ev)
+	requireAttr(t, send, attribute.Int64("ingot.body.bytes", int64(len(data))))
+	requireAttr(t, send, attribute.Int("ingot.body.blobs", 1))
+	if ev := send.Events(); len(ev) != 1 || ev[0].Name != "body.received" {
+		t.Fatalf("expected a body.received event on body.send, got %v", ev)
 	}
 
 	requireAttr(t, tree.one("blob.upload"), attribute.String("ingot.blob.result", "streamed"))

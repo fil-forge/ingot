@@ -136,7 +136,7 @@ jobs:
 
       - name: Docker and disk info
         # df because the `uploads` shard's 5 GiB part test churns ~10-15 GiB
-        # (spool copy + piri copy): the runner image starts with ~73 GiB free,
+        # (piri copy and the replay copy): the runner image starts with ~73 GiB free,
         # so this records the margin rather than needing anything freed.
         run: |
           docker version

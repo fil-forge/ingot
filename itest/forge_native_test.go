@@ -5,7 +5,6 @@ package itest
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"fmt"
 	"net/http"
 	"strings"
@@ -14,7 +13,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/fil-forge/smelt/pkg/stack"
-	"github.com/filecoin-project/go-fee/cose"
 
 	ingottest "github.com/fil-forge/ingot/testing"
 )
@@ -59,20 +57,11 @@ func TestForgeNativeProvision(t *testing.T) {
 	}
 	t.Logf("hilt-provisioned round-trip OK: %d bytes through sprue/piri", len(data))
 
-	// 3. Every stored blob is a COSE_Encrypt whose one recipient is the
-	// tenant's wrap key: the kid in the envelope is the fingerprint hilt
-	// registered for this tenant's active wrap key (its wrap_key row), so the
-	// envelope is recoverable from hilt's custody alone.
-	wantKID := hiltActiveWrapKID(t, ctx, s, "native")
-	env := spooledEnvelope(t, ctx, s)
-	if len(env.Recipients) != 1 {
-		t.Fatalf("stored envelope has %d recipients, want 1 (the tenant)", len(env.Recipients))
-	}
-	kid, ok := env.Recipients[0].Headers.Unprotected.Bytes(cose.HeaderLabelKID)
-	if !ok || string(kid) != wantKID {
-		t.Fatalf("envelope recipient kid = %q, want the tenant's active wrap key %q", kid, wantKID)
-	}
-	t.Logf("stored envelope carries the tenant recipient %s", wantKID)
+	// 3. (The stored envelope's tenant recipient is checked at unit level,
+	// by s3frontend's TestEncryptedWrite_TenantRecipient: ingot keeps no
+	// copy of an envelope to read back here, and piri's lives in its object
+	// store. An end-to-end check against hilt's registered wrap key would
+	// need that copy fetched from piri.)
 
 	// 4. A second tenant cannot use the first tenant's bucket as a copy
 	// source, nor reach it directly: hilt refuses another tenant's bucket as
@@ -122,24 +111,4 @@ func hiltActiveWrapKID(t *testing.T, ctx context.Context, s *stack.Stack, extern
 		t.Fatalf("hilt has no active wrap key for tenant %q", externalID)
 	}
 	return kid
-}
-
-// spooledEnvelope pulls one body blob out of the ingot container's spool and
-// decodes its COSE envelope header.
-func spooledEnvelope(t *testing.T, ctx context.Context, s *stack.Stack) *cose.Envelope {
-	t.Helper()
-	out, errOut, err := s.Exec(ctx, "ingot", "sh", "-c",
-		`f=$(find /data/spool -maxdepth 1 -type f ! -name '.tmp*' | head -1); [ -n "$f" ] && base64 < "$f"`)
-	if err != nil {
-		t.Fatalf("read a spooled blob: %v (stderr=%s)", err, errOut)
-	}
-	raw, err := base64.StdEncoding.DecodeString(strings.Join(strings.Fields(out), ""))
-	if err != nil {
-		t.Fatalf("decode spooled blob: %v", err)
-	}
-	env, _, err := cose.Decode(raw)
-	if err != nil {
-		t.Fatalf("decode COSE envelope: %v", err)
-	}
-	return env
 }

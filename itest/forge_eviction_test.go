@@ -9,13 +9,12 @@ import (
 	ingottest "github.com/fil-forge/ingot/testing"
 )
 
-// TestForgeReadAfterEviction proves the appliance read tier: after the local
-// spool is wiped, a GET must re-fetch the object's body blobs from piri by
-// resolving their location from the local blob_locations table
-// (registry.LocalLocator) and issuing a /content/retrieve — not from
-// read-after-write. Body blobs live only in the spool; the manifest/MST live
-// in the catalog log and survive the wipe, so only the body read exercises
-// the network tier.
+// TestForgeReadAfterEviction proves the appliance read tier: a GET re-fetches
+// the object's body blobs from piri by resolving their location from the
+// local blob_locations table (registry.LocalLocator) and issuing a
+// /content/retrieve. Ingot keeps no local copy of a body blob, so every body
+// read exercises the network tier; the manifest/MST live in the catalog log.
+// The test name predates the spool's removal.
 //
 //	go test -tags itest ./itest -run TestForgeReadAfterEviction -v -timeout 900s
 func TestForgeReadAfterEviction(t *testing.T) {
@@ -43,15 +42,9 @@ func TestForgeReadAfterEviction(t *testing.T) {
 		t.Fatalf("put object: %v", err)
 	}
 
-	// Wipe the local spool so the next GET cannot read-after-write — its body
-	// blobs must be re-fetched from piri.
-	if out, errOut, err := s.Exec(ctx, "ingot", "sh", "-c", "rm -rf /data/spool"); err != nil {
-		t.Fatalf("evict spool: %v (stdout=%s stderr=%s)", err, out, errOut)
-	}
-
 	got, err := ingottest.GetBytes(ctx, cfg, bucket, key)
 	if err != nil {
-		t.Fatalf("get after eviction (forge read tier): %v", err)
+		t.Fatalf("get (forge read tier): %v", err)
 	}
 	if !bytes.Equal(got, data) {
 		t.Fatalf("read-after-eviction mismatch: got %d bytes, want %d", len(got), len(data))
