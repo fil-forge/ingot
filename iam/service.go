@@ -256,7 +256,7 @@ func (s *Service) GetUserAccountForRequest(ctx fiber.Ctx, accessKeyStr string) (
 	if ctr != nil && !s.cacheProofs(spanCtx, store, ctr, req, accessKeyID, s.proofs.DepositUnlessRevoked) {
 		scoped := NewDelegationCache()
 		ctx.Locals(reqscope.ProofStoreKey(), ucanlib.ProofStore(scoped))
-		// ponytail: refetches bucket info already fetched above; rare (a failed Hilt commit).
+		// Refetches bucket info already fetched above; rare (a failed Hilt commit).
 		s.cacheProofs(reqCtx, scoped, ctr, req, accessKeyID, addAll)
 		ctx.Locals(reqscope.TenantKey(), ok.Tenant)
 		s.logger.Info("hilt/iam: authorize response carries a revoked delegation, not cached",
