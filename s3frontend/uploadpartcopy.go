@@ -115,7 +115,7 @@ func (b *Backend) UploadPartCopy(ctx context.Context, input *s3.UploadPartCopyIn
 	// The session's algorithm is the part's: passing it as the requested one
 	// satisfies the negotiation (a COMPOSITE session needs a checksum on every
 	// part) with no value to validate, so it is computed over the copied bytes.
-	rec, err := b.ingestPart(ctx, sess, int(*input.PartNumber), rc, types.ChecksumAlgorithm(sess.ChecksumAlgorithm), "", md5Src)
+	rec, err := b.ingestPart(ctx, sess, int(*input.PartNumber), rc, end-start+1, types.ChecksumAlgorithm(sess.ChecksumAlgorithm), "", md5Src)
 	if err != nil {
 		return s3response.CopyPartResult{}, err
 	}

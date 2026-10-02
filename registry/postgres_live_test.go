@@ -54,7 +54,7 @@ func TestPostgresStores_Live(t *testing.T) {
 		`TRUNCATE ingot.blob_refs, ingot.upload_intents, ingot.blob_locations,
 		 ingot.blob_encryption_params, ingot.multipart_sessions, ingot.multipart_parts,
 		 ingot.gc_candidates, ingot.buckets, ingot.revocation_cursor,
-		 ingot.blob_release_intents CASCADE`); err != nil {
+		 ingot.blob_release_intents, ingot.blob_streams CASCADE`); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
 
@@ -523,11 +523,77 @@ func TestPostgresStores_Live(t *testing.T) {
 		if got, err := r.GetPark(ctx, digest); err != nil || got.Size != 43 {
 			t.Fatalf("GetPark after upsert = %+v, err %v", got, err)
 		}
+		if parked, err := r.HasParkFor(ctx, park.AddTask); err != nil || !parked {
+			t.Fatalf("HasParkFor(park's add task) = %v, %v", parked, err)
+		}
+		if parked, err := r.HasParkFor(ctx, []byte{0x09}); err != nil || parked {
+			t.Fatalf("HasParkFor(another add task) = %v, %v", parked, err)
+		}
 		if err := r.DeletePark(ctx, digest); err != nil {
 			t.Fatalf("DeletePark: %v", err)
 		}
 		if _, err := r.GetPark(ctx, digest); err != registry.ErrNotFound {
 			t.Fatalf("GetPark after delete = %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("stream rows age out", func(t *testing.T) {
+		space := testutil.RandomDID(t)
+		addTask := liveCid(t, "stream-add").Bytes()
+		if err := r.PutStream(ctx, registry.BlobStream{AddTask: addTask, Space: space, Bucket: "sb", Size: 4096}); err != nil {
+			t.Fatalf("PutStream: %v", err)
+		}
+		rows, err := r.ListStaleStreams(ctx, time.Now().Add(-time.Minute), 10)
+		if err != nil {
+			t.Fatalf("ListStaleStreams: %v", err)
+		}
+		if len(rows) != 0 {
+			t.Fatalf("a fresh row is stale: %+v", rows)
+		}
+		rows, err = r.ListStaleStreams(ctx, time.Now().Add(time.Minute), 10)
+		if err != nil {
+			t.Fatalf("ListStaleStreams: %v", err)
+		}
+		if len(rows) != 1 || !reflect.DeepEqual(rows[0].AddTask, addTask) || rows[0].Space != space ||
+			rows[0].Bucket != "sb" || rows[0].Size != 4096 || rows[0].CreatedAt.IsZero() {
+			t.Fatalf("stale rows = %+v", rows)
+		}
+		if err := r.DeleteStream(ctx, addTask); err != nil {
+			t.Fatalf("DeleteStream: %v", err)
+		}
+		if err := r.DeleteStream(ctx, addTask); err != nil {
+			t.Fatalf("DeleteStream (idempotent): %v", err)
+		}
+		rows, err = r.ListStaleStreams(ctx, time.Now().Add(time.Minute), 10)
+		if err != nil || len(rows) != 0 {
+			t.Fatalf("after delete: %+v, %v", rows, err)
+		}
+	})
+
+	t.Run("a renewed stream lease is not stale", func(t *testing.T) {
+		addTask := liveCid(t, "stream-lease").Bytes()
+		if err := r.PutStream(ctx, registry.BlobStream{AddTask: addTask, Space: testutil.RandomDID(t), Bucket: "sb", Size: 1}); err != nil {
+			t.Fatalf("PutStream: %v", err)
+		}
+		if _, err := pool.Exec(ctx, `UPDATE ingot.blob_streams SET touched_at = now() - interval '1 hour' WHERE add_task = $1`, addTask); err != nil {
+			t.Fatalf("age row: %v", err)
+		}
+		rows, err := r.ListStaleStreams(ctx, time.Now().Add(-30*time.Minute), 10)
+		if err != nil || len(rows) != 1 {
+			t.Fatalf("an unrenewed row is not stale: %+v, %v", rows, err)
+		}
+		if err := r.TouchStreams(ctx, [][]byte{addTask, liveCid(t, "gone").Bytes()}); err != nil {
+			t.Fatalf("TouchStreams: %v", err)
+		}
+		if err := r.TouchStreams(ctx, nil); err != nil {
+			t.Fatalf("TouchStreams(nil): %v", err)
+		}
+		rows, err = r.ListStaleStreams(ctx, time.Now().Add(-30*time.Minute), 10)
+		if err != nil || len(rows) != 0 {
+			t.Fatalf("a renewed row is stale: %+v, %v", rows, err)
+		}
+		if err := r.DeleteStream(ctx, addTask); err != nil {
+			t.Fatalf("DeleteStream: %v", err)
 		}
 	})
 

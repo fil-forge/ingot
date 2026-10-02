@@ -11,10 +11,12 @@ import (
 	"github.com/fil-forge/ucantone/did"
 	"github.com/filecoin-project/go-fee"
 	"github.com/multiformats/go-multihash"
+	"go.uber.org/zap"
 
 	"github.com/fil-forge/ingot/blockstore"
 	"github.com/fil-forge/ingot/regionkey"
 	"github.com/fil-forge/ingot/registry"
+	"github.com/fil-forge/ingot/uploader"
 )
 
 // This file is the encrypting half of the body write path (the FilOne
@@ -55,6 +57,18 @@ type encryptingBlobWriter struct {
 	space      did.DID
 	recipients []fee.Recipient
 	results    map[string]encWrite
+
+	// stream, when set, sends each sized blob to its provider while it is
+	// spooled (see WriteSizedBlob); streams records each such upload until
+	// its park or acceptance is recorded. digestFirst latches once the upload
+	// service refuses to add by digest code, so the rest of the body spools
+	// first.
+	stream      uploader.StreamingBodyUploader
+	streams     registry.StreamStore
+	lease       *streamLease
+	bucket      string
+	digestFirst bool
+	logger      *zap.Logger
 }
 
 // encWrite is one encrypted blob's write-side state, keyed by ciphertext
@@ -63,6 +77,9 @@ type encWrite struct {
 	desc       fee.BodyDescriptor
 	wrapped    regionkey.WrappedKey
 	storedSize int64 // envelope header + ciphertext, the spooled byte count
+	// streamed is set when the envelope already went to its provider as it
+	// was spooled: the blob is parked there, awaiting its conclude.
+	streamed *uploader.StreamedBlob
 }
 
 func newEncryptingBlobWriter(spool blockstore.BlobWriter, keys regionkey.Provider, space did.DID, recipients []fee.Recipient) *encryptingBlobWriter {
@@ -120,14 +137,21 @@ func (w *encryptingBlobWriter) WriteBlob(ctx context.Context, r io.Reader) (mult
 	if err != nil {
 		return nil, 0, fmt.Errorf("s3frontend: spool envelope: %w", err)
 	}
+	if err := w.record(ctx, digest, cek, encWrite{desc: desc, storedSize: storedSize}); err != nil {
+		return nil, 0, err
+	}
+	return digest, plaintext.n, nil
+}
 
+// record wraps the blob's CEK and keeps its encryption state for splitSpool.
+func (w *encryptingBlobWriter) record(ctx context.Context, digest multihash.Multihash, cek []byte, res encWrite) error {
 	wrapped, err := w.keys.Wrap(ctx, regionkey.BindingContext{Space: w.space, Digest: digest}, cek)
 	if err != nil {
-		return nil, 0, fmt.Errorf("s3frontend: wrap CEK for blob %x: %w", digest, err)
+		return fmt.Errorf("s3frontend: wrap CEK for blob %x: %w", digest, err)
 	}
-
-	w.results[string(digest)] = encWrite{desc: desc, wrapped: wrapped, storedSize: storedSize}
-	return digest, plaintext.n, nil
+	res.wrapped = wrapped
+	w.results[string(digest)] = res
+	return nil
 }
 
 // params renders the recorded encryption state of one blob as its
@@ -156,6 +180,18 @@ func (w *encryptingBlobWriter) storedSize(digest multihash.Multihash) (int64, er
 		return 0, fmt.Errorf("s3frontend: no encryption state recorded for blob %x", digest)
 	}
 	return res.storedSize, nil
+}
+
+// streamed returns the blobs WriteSizedBlob sent to their providers, keyed by
+// string(digest).
+func (w *encryptingBlobWriter) streamed() map[string]uploader.StreamedBlob {
+	out := map[string]uploader.StreamedBlob{}
+	for digest, res := range w.results {
+		if res.streamed != nil {
+			out[digest] = *res.streamed
+		}
+	}
+	return out
 }
 
 // countingReader counts the bytes read through it — the plaintext length of

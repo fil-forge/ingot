@@ -181,77 +181,11 @@ func (c *Client) blobAdd(ctx context.Context, space did.DID, content io.Reader, 
 		contentSizePtr = &contentSize
 	}
 
-	proofStore := ucanlib.ProofStore(c.tokenStore)
-	if cfg.ProofStore != nil {
-		proofStore = cfg.ProofStore
-	}
-
-	proofs, proofLinks, err := proofStore.ProofChain(ctx, c.signer.DID(), blobcmds.Add.Command, space)
+	added, err := c.invokeAdd(ctx, space, blobcmds.SpecFromDigest(contentHash, *contentSizePtr), cfg)
 	if err != nil {
-		return AddedBlob{}, fmt.Errorf("building proof chain: %w", err)
+		return AddedBlob{}, err
 	}
-
-	inv, err := blobcmds.Add.Invoke(
-		c.signer, space,
-		&blobcmds.AddArguments{Blob: blobcmds.Blob{Digest: contentHash, Size: *contentSizePtr}},
-		invocation.WithAudience(c.serviceID),
-		invocation.WithProofs(proofLinks...),
-	)
-	if err != nil {
-		return AddedBlob{}, fmt.Errorf("generating invocation: %w", err)
-	}
-
-	addOK, _, meta, err := Execute[*blobcmds.AddOK](
-		ctx, c.ucanClient, inv,
-		execution.WithDelegations(proofs...),
-	)
-	if err != nil {
-		return AddedBlob{}, fmt.Errorf("executing blob add: %w", err)
-	}
-
-	accInv, err := findInvocation(addOK.Site.Task, meta.Invocations())
-	if err != nil {
-		return AddedBlob{}, fmt.Errorf("finding /blob/accept invocation: %w", err)
-	}
-	var accArgs blobcmds.AcceptArguments
-	if err := accArgs.UnmarshalCBOR(bytes.NewReader(accInv.ArgumentsBytes())); err != nil {
-		return AddedBlob{}, fmt.Errorf("unmarshaling /blob/accept arguments: %w", err)
-	}
-
-	putInv, err := findInvocation(accArgs.Put.Task, meta.Invocations())
-	if err != nil {
-		return AddedBlob{}, fmt.Errorf("finding /http/put invocation: %w", err)
-	}
-	var putArgs httpcmds.PutArguments
-	if err := putArgs.UnmarshalCBOR(bytes.NewReader(putInv.ArgumentsBytes())); err != nil {
-		return AddedBlob{}, fmt.Errorf("unmarshaling /http/put arguments: %w", err)
-	}
-	putRcpt := maybeFindReceipt(accArgs.Put.Task, meta.Receipts())
-
-	allocInv, err := findInvocation(putArgs.Destination.Task, meta.Invocations())
-	if err != nil {
-		return AddedBlob{}, fmt.Errorf("finding /blob/allocate invocation: %w", err)
-	}
-	var allocArgs blobcmds.AllocateArguments
-	if err := allocArgs.UnmarshalCBOR(bytes.NewReader(allocInv.ArgumentsBytes())); err != nil {
-		return AddedBlob{}, fmt.Errorf("unmarshaling /blob/allocate arguments: %w", err)
-	}
-	allocRcpt, err := findReceipt(putArgs.Destination.Task, meta.Receipts())
-	if err != nil {
-		return AddedBlob{}, fmt.Errorf("finding /blob/allocate receipt: %w", err)
-	}
-	o, x := allocRcpt.Out().Unpack()
-	if allocRcpt.Out().IsErr() {
-		var model edm.ErrorModel
-		if err := model.UnmarshalCBOR(bytes.NewReader(x)); err != nil {
-			return AddedBlob{}, fmt.Errorf("executing invocation")
-		}
-		return AddedBlob{}, fmt.Errorf("failure in allocation receipt: %w", model)
-	}
-	var allocOK blobcmds.AllocateOK
-	if err := allocOK.UnmarshalCBOR(bytes.NewReader(o)); err != nil {
-		return AddedBlob{}, fmt.Errorf("unmarshaling allocation receipt output: %w", err)
-	}
+	inv, accInv, putInv, putRcpt, allocOK := added.inv, added.accInv, added.putInv, added.putRcpt, added.allocOK
 
 	putSuccess := putRcpt != nil && putRcpt.Out().IsOK()
 
@@ -291,6 +225,93 @@ func (c *Client) blobAdd(ctx context.Context, space did.DID, content io.Reader, 
 		AcceptTask:    accInv.Task().Link(),
 		PutInvocation: putInv.Bytes(),
 	}, nil
+}
+
+// addResult is what a /blob/add response says about the tasks it set up: the
+// add itself, the allocation it made, and the put and accept that follow.
+type addResult struct {
+	inv     ucan.Invocation
+	accInv  ucan.Invocation
+	putInv  ucan.Invocation
+	putRcpt ucan.Receipt // set only when the provider already held the blob
+	allocOK blobcmds.AllocateOK
+}
+
+// invokeAdd invokes /blob/add for blob and reads the allocate, put and accept
+// tasks out of the response.
+func (c *Client) invokeAdd(ctx context.Context, space did.DID, blob blobcmds.BlobSpec, cfg *BlobAddConfig) (addResult, error) {
+	proofStore := ucanlib.ProofStore(c.tokenStore)
+	if cfg.ProofStore != nil {
+		proofStore = cfg.ProofStore
+	}
+
+	proofs, proofLinks, err := proofStore.ProofChain(ctx, c.signer.DID(), blobcmds.Add.Command, space)
+	if err != nil {
+		return addResult{}, fmt.Errorf("building proof chain: %w", err)
+	}
+
+	inv, err := blobcmds.Add.Invoke(
+		c.signer, space,
+		&blobcmds.AddArguments{Blob: blob},
+		invocation.WithAudience(c.serviceID),
+		invocation.WithProofs(proofLinks...),
+	)
+	if err != nil {
+		return addResult{}, fmt.Errorf("generating invocation: %w", err)
+	}
+
+	addOK, _, meta, err := Execute[*blobcmds.AddOK](
+		ctx, c.ucanClient, inv,
+		execution.WithDelegations(proofs...),
+	)
+	if err != nil {
+		return addResult{}, fmt.Errorf("executing blob add: %w", err)
+	}
+
+	accInv, err := findInvocation(addOK.Site.Task, meta.Invocations())
+	if err != nil {
+		return addResult{}, fmt.Errorf("finding /blob/accept invocation: %w", err)
+	}
+	var accArgs blobcmds.AcceptArguments
+	if err := accArgs.UnmarshalCBOR(bytes.NewReader(accInv.ArgumentsBytes())); err != nil {
+		return addResult{}, fmt.Errorf("unmarshaling /blob/accept arguments: %w", err)
+	}
+
+	putInv, err := findInvocation(accArgs.Put.Task, meta.Invocations())
+	if err != nil {
+		return addResult{}, fmt.Errorf("finding /http/put invocation: %w", err)
+	}
+	var putArgs httpcmds.PutArguments
+	if err := putArgs.UnmarshalCBOR(bytes.NewReader(putInv.ArgumentsBytes())); err != nil {
+		return addResult{}, fmt.Errorf("unmarshaling /http/put arguments: %w", err)
+	}
+	putRcpt := maybeFindReceipt(accArgs.Put.Task, meta.Receipts())
+
+	allocInv, err := findInvocation(putArgs.Destination.Task, meta.Invocations())
+	if err != nil {
+		return addResult{}, fmt.Errorf("finding /blob/allocate invocation: %w", err)
+	}
+	var allocArgs blobcmds.AllocateArguments
+	if err := allocArgs.UnmarshalCBOR(bytes.NewReader(allocInv.ArgumentsBytes())); err != nil {
+		return addResult{}, fmt.Errorf("unmarshaling /blob/allocate arguments: %w", err)
+	}
+	allocRcpt, err := findReceipt(putArgs.Destination.Task, meta.Receipts())
+	if err != nil {
+		return addResult{}, fmt.Errorf("finding /blob/allocate receipt: %w", err)
+	}
+	o, x := allocRcpt.Out().Unpack()
+	if allocRcpt.Out().IsErr() {
+		var model edm.ErrorModel
+		if err := model.UnmarshalCBOR(bytes.NewReader(x)); err != nil {
+			return addResult{}, fmt.Errorf("executing invocation")
+		}
+		return addResult{}, fmt.Errorf("failure in allocation receipt: %w", model)
+	}
+	var allocOK blobcmds.AllocateOK
+	if err := allocOK.UnmarshalCBOR(bytes.NewReader(o)); err != nil {
+		return addResult{}, fmt.Errorf("unmarshaling allocation receipt output: %w", err)
+	}
+	return addResult{inv: inv, accInv: accInv, putInv: putInv, putRcpt: putRcpt, allocOK: allocOK}, nil
 }
 
 // BlobConclude finishes a parked (unconcluded) BlobAdd: it synthesizes and
@@ -432,7 +453,7 @@ func (c *Client) concludePuts(ctx context.Context, added []AddedBlob, idx []int)
 		if err := putInv.UnmarshalCBOR(bytes.NewReader(added[i].PutInvocation)); err != nil {
 			return nil, fmt.Errorf("decoding parked /http/put invocation: %w", err)
 		}
-		putRcpt, err := putReceipt(putInv)
+		putRcpt, err := putReceipt(putInv, added[i].Digest)
 		if err != nil {
 			return nil, fmt.Errorf("generating put receipt: %w", err)
 		}
@@ -560,9 +581,11 @@ func putBlob(ctx context.Context, client *http.Client, url *url.URL, headers map
 }
 
 // putReceipt issues the /http/put receipt for a parked upload, signing it with
-// the digest-derived key the upload service embedded in the put invocation's
-// metadata.
-func putReceipt(putInv ucan.Invocation) (ucan.Receipt, error) {
+// the key the upload service embedded in the put invocation's metadata. A put
+// whose body names no digest was allocated by digest code, and its receipt
+// reports digest: the digest of the bytes sent, which the storage node checks
+// against its own at accept.
+func putReceipt(putInv ucan.Invocation, digest multihash.Multihash) (ucan.Receipt, error) {
 	var putMeta datamodel.Map
 	if err := putMeta.UnmarshalCBOR(bytes.NewReader(putInv.MetadataBytes())); err != nil {
 		return nil, fmt.Errorf("unmarshaling /http/put invocation metadata: %w", err)
@@ -587,7 +610,18 @@ func putReceipt(putInv ucan.Invocation) (ucan.Receipt, error) {
 	if err != nil {
 		return nil, fmt.Errorf("decoding key for %q: %w", id, err)
 	}
-	return receipt.IssueOK(multikey.KeyIssuer(signer), putInv.Task().Link(), &httpcmds.PutOK{}, receipt.WithIssuedAt(ucan.Now()))
+	var putArgs httpcmds.PutArguments
+	if err := putArgs.UnmarshalCBOR(bytes.NewReader(putInv.ArgumentsBytes())); err != nil {
+		return nil, fmt.Errorf("unmarshaling /http/put arguments: %w", err)
+	}
+	putOK := &httpcmds.PutOK{}
+	if _, hashed := putArgs.Body.Digest(); !hashed {
+		if len(digest) == 0 {
+			return nil, fmt.Errorf("/http/put %s names no digest and none was given", putInv.Task().Link())
+		}
+		putOK.Blob = &httpcmds.PutBlob{Digest: digest}
+	}
+	return receipt.IssueOK(multikey.KeyIssuer(signer), putInv.Task().Link(), putOK, receipt.WithIssuedAt(ucan.Now()))
 }
 
 func findInvocation(task cid.Cid, invocations []ucan.Invocation) (ucan.Invocation, error) {

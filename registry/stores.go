@@ -370,6 +370,39 @@ type ParkStore interface {
 	// GetPark returns ErrNotFound when digest has no park row.
 	GetPark(ctx context.Context, digest multihash.Multihash) (*BlobPark, error)
 	DeletePark(ctx context.Context, digest multihash.Multihash) error
+	// HasParkFor reports whether a park row records the /blob/add task
+	// addTask (cid bytes).
+	HasParkFor(ctx context.Context, addTask []byte) (bool, error)
+}
+
+// BlobStream is one row of ingot.blob_streams: a body blob allocated by
+// digest code whose bytes are, or were, being sent to its provider before its
+// digest was known. AddTask (cid bytes) is the only name the provider knows the
+// upload by until it is parked or accepted.
+type BlobStream struct {
+	AddTask   []byte
+	Space     did.DID
+	Bucket    string
+	Size      int64
+	CreatedAt time.Time
+	// TouchedAt is when the request that owns the row last renewed its
+	// lease on it; a row whose lease has lapsed belongs to a dead request.
+	TouchedAt time.Time
+}
+
+// StreamStore tracks uploads allocated by digest code from allocation until
+// their park or acceptance is recorded, so one a request abandons can still be
+// aborted on its provider.
+type StreamStore interface {
+	PutStream(ctx context.Context, s BlobStream) error
+	// DeleteStream is idempotent.
+	DeleteStream(ctx context.Context, addTask []byte) error
+	// TouchStreams renews the lease on the rows of addTasks. Rows already
+	// deleted are skipped.
+	TouchStreams(ctx context.Context, addTasks [][]byte) error
+	// ListStaleStreams returns up to limit rows last touched before
+	// olderThan, least recently touched first.
+	ListStaleStreams(ctx context.Context, olderThan time.Time, limit int) ([]BlobStream, error)
 }
 
 // InclusionStore is the local shard-inclusion table (§8): block digest →

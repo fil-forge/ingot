@@ -176,9 +176,9 @@ flowchart TB
     put["PutObject / UploadPart body"]
 
     subgraph bodyr["the body route (raw blobs, synchronous)"]
-        split["SplitBody: coarse split at max_blob_size,<br/>sha256 + md5 in one streaming pass"]
-        spool["Spool (DataDir/spool)<br/>+ upload_intents row"]
-        upload["per-blob upload before the commit:<br/>/blob/add, HTTP PUT, conclude, accept<br/>(a blob_locations hit skips it: dedup)"]
+        split["SplitSizedBody at the declared length:<br/>coarse split at max_blob_size,<br/>sha256 + md5 in one streaming pass"]
+        spool["Spool (DataDir/spool)<br/>+ upload_intents row<br/>(each blob streams its PUT<br/>to the provider while it is spooled)"]
+        upload["per-blob upload before the commit:<br/>conclude, accept (streamed), or<br/>/blob/add, HTTP PUT, conclude, accept<br/>(a blob_locations hit skips it: dedup)"]
         bloc["blob_locations row: the whole blob,<br/>(space, digest) to provider URL"]
         split --> spool --> upload --> bloc
     end
@@ -219,6 +219,11 @@ flowchart TB
   ([blob lifecycle](#blob-lifecycle-spooled-parked-accepted-released));
   superseded catalog blocks queue for a future collector
   ([catalog GC candidates](#catalog-gc-candidates-what-gets-remembered-for-removal)).
+- A body streams: each blob is allocated by size
+  and hash function (`/blob/add` with a digest code) and its envelope goes to
+  the provider while the spool writes it, so the upload overlaps the body's
+  arrival instead of following it. The spool copy still supplies the digest,
+  which the put receipt reports and the node checks at accept.
 - Multipart parts ride the body route with the conclude deferred (parked);
   `Complete` finishes it
   (the [multipart diagram](#multipart-upload-park-on-write-conclude-on-complete)).
@@ -227,7 +232,8 @@ Cross-references: [`architecture.md` §4](./architecture.md#4-the-catalog-layer)
 [§5](./architecture.md#5-the-data-layer);
 [`logstore/README.md`](../logstore/README.md).
 
-Sources: `s3frontend/object.go` (ingestBody), `blockstore/spool.go`,
+Sources: `s3frontend/object.go` (ingestBody), `s3frontend/stream.go`,
+`bucket/sized.go`, `blockstore/spool.go`,
 `blockstore/staging.go`, `logstore/`, `uploader/forge.go`, `uploader/blob.go`,
 `server.go` (newBucketFlushFunc). Review when these change.
 
@@ -250,13 +256,29 @@ sequenceDiagram
     participant TX as bucketop.Tx
     participant L as logstore.Manager
 
-    Note over C,L: off the lock: ingest, hash, encrypt, upload
+    Note over C,L: off the lock: ingest, hash, encrypt, upload (an upload service that cannot<br/>add by digest code gets every blob spooled first, then uploaded by digest)
     C->>B: PutObject(bucket, key, body)
     B->>R: reg.Get(bucket), precondition pre-check
     B->>B: tenant recipient: resolve the tenant's #wrap key<br/>(tenant DID from the request, did:plc doc via the cached PLC resolver);<br/>no recipient → the write fails
-    B->>SP: SplitBody: per plaintext piece, fresh CEK →<br/>FEE envelope (COSE_Encrypt, AES-256-GCM STREAM,<br/>one recipient: ECDH-ES+A256KW to the tenant wrap key) →<br/>spool under the CIPHERTEXT digest<br/>(sha256 + md5 of the plaintext in the same pass)
-    B->>R: PutIntent(digest, stored size) +<br/>PutEncryptionParams(region-wrapped CEK, FEE geometry) per blob
-    loop each body blob (uploadBlobs)
+    loop SplitSizedBody: each plaintext piece of min(max_blob_size, remaining) bytes
+        B->>B: fresh CEK → FEE envelope (COSE_Encrypt, AES-256-GCM STREAM,<br/>one recipient: ECDH-ES+A256KW to the tenant wrap key);<br/>its length is known from the header + plaintext length
+        B->>U: /blob/add (digestCode sha2-256, envelope size, random nonce)
+        U-->>B: allocation address, put and accept tasks
+        B->>R: PutStream(add task): the upload's name until parked or accepted
+        par
+            B->>SP: spool under the CIPHERTEXT digest<br/>(sha256 + md5 of the plaintext in the same pass)
+        and
+            B->>P: HTTP PUT the same envelope bytes as they are spooled
+        end
+        Note over B,P: a failed PUT detaches: the spool finishes, the allocation is<br/>aborted and the blob uploads by digest; UnsupportedDigestCode<br/>switches the rest of the body to spool-first
+    end
+    B->>R: PutIntent(digest, stored size, uploading) +<br/>PutEncryptionParams(region-wrapped CEK, FEE geometry) per blob
+    loop each streamed blob (uploadBlobs → concludeStreamed)
+        B->>U: /ucan/conclude the put receipt, reporting the spooled digest
+        U-->>B: accept receipt + /assert/location commitment
+        B->>R: SetIntentState(accepted) + PutLocation, DeleteStream
+    end
+    loop each spooled-first blob (uploadBlobs)
         alt blob_locations already has (space, digest)
             B->>R: SetIntentState(accepted), skip upload<br/>(never hits for fresh writes — every envelope digest is new)
         else upload
@@ -282,6 +304,13 @@ sequenceDiagram
     B-->>C: 200 + ETag (+ x-amz-version-id when versioning is configured)
 ```
 
+- A request that dies after allocating a streamed blob leaves its
+  `blob_streams` row; the stream sweeper (on the release sweeper's tick)
+  aborts such an upload by its add task once the row's lease (`touched_at`,
+  renewed every 10 minutes by the request that owns it) has gone 30 minutes
+  unrenewed, unless its blob was parked, and
+  drops the row once the abort lands or the provider reports the blob
+  accepted.
 - Encryption makes the stored digest a ciphertext digest: **content dedup is
   gone for bodies** (fresh CEK per write ⇒ unique envelope), by design per
   the encryption RFC. Manifest spans, `Body.Size`, sha256/md5 and ETag stay
@@ -312,7 +341,9 @@ sequenceDiagram
 
 Cross-references: [`architecture.md` §7.1](./architecture.md#71-write-single-shot-putobject).
 
-Sources: `s3frontend/object.go` (PutObject, ingestBody, uploadBlobs),
+Sources: `s3frontend/object.go` (PutObject, ingestBody, uploadBlobs,
+concludeStreamed), `s3frontend/stream.go` (WriteSizedBlob,
+SweepStaleStreams), `bucket/sized.go`, `uploader/stream.go`,
 `s3frontend/copy.go` (CopyObject, copySourceBucket),
 `s3frontend/version.go` (commitVersion), `bucketop/bucketop.go`,
 `blockstore/staging.go`, `uploader/blob.go`, `uploader/forge.go`. Review when
@@ -427,7 +458,9 @@ sequenceDiagram
     B->>B: ingestPart: splitSpool<br/>(resolve the tenant recipient, then encrypt per piece:<br/>fresh CEK → FEE envelope → spool under the ciphertext<br/>digest + params row, as in the PutObject diagram)
     B->>R: PutPart(parked): open sessions only, the row held FOR SHARE<br/>against a concurrent latch; a refused part records its blobs' releases
     loop each part blob (parkBlobs)
-        alt blob_locations already has the digest
+        alt streamed while spooled
+            B->>R: PutPark(AddTask, AcceptTask, PutInvocation), intent parked,<br/>DeleteStream: the PUT already went to piri in splitSpool
+        else blob_locations already has the digest
             B->>R: intent accepted (dedup, no park)
         else already parked (GetPark hit)
             B->>R: reuse the park
@@ -474,7 +507,8 @@ Cross-references: [`architecture.md` §7.2](./architecture.md#72-multipart),
 [§7.3](./architecture.md#73-the-session-latch-the-abortcomplete-race).
 
 Sources: `s3frontend/multipart.go` (all verbs, ingestPart, parkBlobs,
-concludeBlobs, enqueuePartReleases, SweepStaleMultipartSessions),
+recordStreamedPark, concludeBlobs, enqueuePartReleases,
+SweepStaleMultipartSessions), `s3frontend/stream.go`,
 `s3frontend/object.go` (runRelease, executeRelease),
 `s3frontend/uploadpartcopy.go`, `registry/stores.go`,
 `server.go` (startMultipartSweeper). Review when these change.
@@ -518,6 +552,7 @@ versions still reference it.
 ```mermaid
 flowchart TB
     W["spool write<br/>(PutObject ingest, UploadPart)"] --> spooled
+    W -->|"streamed: the PUT ran alongside the spool write"| uploading
 
     subgraph intents["upload_intents, per digest"]
         spooled([spooled])
@@ -530,7 +565,7 @@ flowchart TB
     spooled -->|"dedup: blob_locations hit"| accepted
     spooled -->|"first network call begins<br/>(uploadBlobs, parkBlobs, concludeBlobs fallback)"| uploading
     uploading -->|"single-shot upload:<br/>/blob/add, PUT, conclude, accept"| accepted
-    uploading -->|"parkBlobs: /blob/add WithConclude(false),<br/>PUT; blob_parks row written"| parked
+    uploading -->|"parkBlobs: /blob/add WithConclude(false),<br/>PUT (or already streamed); blob_parks row written"| parked
     parked -->|"concludeBlobs at Complete:<br/>/ucan/conclude; blob_parks row deleted"| accepted
     spooled -->|"release record; executeRelease, local only<br/>(the blob never left this node):<br/>DeleteIntent + spool.Remove"| gone([deleted])
     uploading -->|"release record; executeRelease: /blob/remove<br/>(idempotent: the accept may have landed, its location not);<br/>DeleteIntent + spool.Remove"| gone
@@ -863,6 +898,14 @@ erDiagram
         bytea put_invocation
         bigint size
     }
+    blob_streams {
+        bytea add_task PK "an upload allocated by digest code"
+        text space
+        text bucket
+        bigint size
+        timestamptz created_at "when the sweeper stops retrying the abort"
+        timestamptz touched_at "the owning request's lease, renewed while it runs; the stream sweeper's clock"
+    }
     multipart_sessions {
         text upload_id PK
         text bucket
@@ -968,6 +1011,7 @@ listed diagrams (each diagram's `Sources:` footer names its exact files).
 |---|---|
 | `s3frontend/object.go`, `s3frontend/version.go` | put, get, blob-lifecycle, version-tree, gc-candidates |
 | `s3frontend/multipart.go` | multipart, multipart-states, blob-lifecycle |
+| `s3frontend/stream.go` | put, multipart, block-routes, blob-lifecycle |
 | `s3frontend/bucket.go` | context, delete-bucket |
 | `bucketop/` | put, get, delete-bucket, packages |
 | `blockstore/` | get, packages, block-routes; `forge.go` also context, principals |

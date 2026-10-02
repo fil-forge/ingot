@@ -92,7 +92,8 @@ Internal:
 - **`s3frontend/`** — versitygw `backend.Backend`: `object.go`
   (Put/Get/Head/Delete/List), `version.go` (resolveVersion / commitVersion,
   the per-key version tree), `multipart.go`, `bucket.go`, `listversions.go`,
-  `backend.go`.
+  `backend.go`, `stream.go` (each body blob streams to its
+  provider while spooling it; the stale-stream sweeper).
 - **`bucketop/`** — `Coordinator`/`Tx`: per-bucket write transaction (lock,
   snapshot root, staging buffer, CAS commit).
 - **`blockstore/`** — block I/O contracts + impls: `log.go` (`Log`, `Plane`
@@ -105,12 +106,14 @@ Internal:
   `recovery.go`. See `logstore/README.md`.
 - **`registry/`** — Postgres metadata: `postgres.go` (`Registry` + `State`),
   `segments.go` (`logstore.Meta`), `stores*.go` (intents, locations,
-  inclusions, blob_refs, GC, multipart sessions/parts, parks),
+  inclusions, blob_refs, GC, multipart sessions/parts, parks, streams),
   `locallocator.go` (the read tier's `Locator`). One `*Postgres` satisfies
   all of them.
 - **`uploader/`** — `forge.go`/`blob.go`: `Forge` behind `Uploader`
   (`SubmitShard`), `BodyUploader`/`DeferredBodyUploader` (`UploadBlob`,
-  `ConcludeBlobs`, `AbortBlob`), and `BlobRemover`; captures the per-space
+  `ConcludeBlobs`, `AbortBlob`), `StreamingBodyUploader` (`StartBlob`,
+  `PutBlob`: allocate by digest code, send while spooling), and
+  `BlobRemover`; captures the per-space
   ship authority (`shipProofs`, 1h TTL) from in-request writes.
 - **`bucketauthority/`** — hilt bucket ops: forwards CreateBucket /
   DeleteBucket / ListBuckets to `/s3/bucket/*`, recovering the signed S3
@@ -122,7 +125,7 @@ Internal:
   access-key TTL caches of hilt-issued delegations that the uploader and the
   network read tier consume via `internal/reqscope`.
 - **`forgeclient/`** — carried-from-guppy sprue edge client: `/blob/add`
-  (with a deferrable conclude), `/ucan/conclude`, `/blob/abort`,
+  (with a deferrable conclude, or by digest code for a streamed blob), `/ucan/conclude`, `/blob/abort`,
   `/blob/remove`, `/index/add`, receipt polling. The `/access` login and
   `/provider/add` flows are dormant (no CLI drives them).
 - **`revocation/`** — the Swarf firehose consumer (optional,
@@ -133,7 +136,8 @@ Internal:
   empty today, read only by the dormant login paths.
 - **`bucket/`** — the per-object model: `manifest.go` (`ObjectManifest`,
   `Body`), `leaf.go` (`ValueUnion`, `ObjectLeaf`, `VersionNode`),
-  `chunker.go` (`SplitBody`, body readers), `cbor_gen.go`.
+  `chunker.go` (`SplitBody`, body readers), `sized.go` (`SplitSizedBody`, for
+  a body of declared length), `cbor_gen.go`.
 - **`mst/`** — the forked MST (deps: go-cid, blockstore, ucantone/did — trees
   carry their bucket's space for network-backed reads).
 - **`inmem/`** — in-memory fakes (`MemStore`, `NopBaseReader`, `NopUploader`);

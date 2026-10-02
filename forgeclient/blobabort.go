@@ -10,18 +10,16 @@ import (
 	"github.com/fil-forge/ucantone/execution"
 	"github.com/fil-forge/ucantone/ucan/invocation"
 	"github.com/ipfs/go-cid"
-	"github.com/multiformats/go-multihash"
 )
 
 // BlobAbort invokes /blob/abort against the upload service (sprue),
-// abandoning the space's in-flight upload of a parked (never-accepted)
-// blob. cause is the /blob/add task link (AddedBlob.AddTask) — sprue
-// walks its receipt chain to locate the storage node holding the parked
-// bytes (which have no registration or acceptance to look up by) and
-// forwards a /blob/reject there. The space is the invocation subject.
+// abandoning the space's in-flight upload of a parked (never-accepted) blob.
+// add is the /blob/add task link (AddedBlob.AddTask): sprue walks its receipt
+// chain to the storage node holding the upload and forwards a /blob/reject of
+// the allocation the add made there. The space is the invocation subject.
 // Idempotent on the node; a blob the space has accepted is refused with
 // BlobAccepted (release it via the reference index / /blob/remove instead).
-func (c *Client) BlobAbort(ctx context.Context, space did.DID, digest multihash.Multihash, cause cid.Cid, options ...BlobAddOption) error {
+func (c *Client) BlobAbort(ctx context.Context, space did.DID, add cid.Cid, options ...BlobAddOption) error {
 	cfg := NewBlobAddConfig(options...)
 	proofStore := ucanlib.ProofStore(c.tokenStore)
 	if cfg.ProofStore != nil {
@@ -37,7 +35,7 @@ func (c *Client) BlobAbort(ctx context.Context, space did.DID, digest multihash.
 		space,
 		// The space is the invocation subject; it is not repeated in the
 		// arguments.
-		&blobcmds.AbortArguments{Digest: digest, Cause: cause},
+		&blobcmds.AbortArguments{Add: add},
 		invocation.WithAudience(c.serviceID),
 		invocation.WithProofs(proofLinks...),
 	)

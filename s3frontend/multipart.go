@@ -226,7 +226,7 @@ func (b *Backend) UploadPart(ctx context.Context, input *s3.UploadPartInput) (*s
 	if digest := decodeContentMD5(contentMD5Header(ctx)); digest != nil {
 		md5Src = knownMD5(digest)
 	}
-	rec, err := b.ingestPart(ctx, sess, int(*input.PartNumber), src, partAlgo, expected, md5Src)
+	rec, err := b.ingestPart(ctx, sess, int(*input.PartNumber), src, declaredLength(input.ContentLength), partAlgo, expected, md5Src)
 	if err != nil {
 		return nil, err
 	}
@@ -266,7 +266,9 @@ type ingestedPart struct {
 // client-requested algorithm the session didn't declare (echoed, never
 // persisted). A client-supplied value mismatch surfaces from the ingest read
 // as a BadDigest API error.
-func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSession, partNumber int, body io.Reader, partAlgo types.ChecksumAlgorithm, expected string, md5Src bodyMD5Source) (*ingestedPart, error) {
+//
+// size is the part's declared length (see splitSpool).
+func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSession, partNumber int, body io.Reader, size int64, partAlgo types.ChecksumAlgorithm, expected string, md5Src bodyMD5Source) (*ingestedPart, error) {
 	uploadID := sess.UploadID
 	sessAlgo := types.ChecksumAlgorithm(sess.ChecksumAlgorithm)
 	if sessAlgo != "" && partAlgo != "" && partAlgo != sessAlgo {
@@ -351,7 +353,7 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 			return nil, fmt.Errorf("s3frontend: record superseded part releases: %w", err)
 		}
 	}
-	rec, err := b.splitSpool(ctx, sess.Bucket, space, bodyReader, md5Src)
+	spooled, err := b.splitSpool(ctx, sess.Bucket, space, bodyReader, size, md5Src)
 	if err != nil {
 		var apiErr s3err.APIError
 		if errors.As(err, &apiErr) {
@@ -359,6 +361,8 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 		}
 		return nil, fmt.Errorf("s3frontend: upload part ingest: %w", err)
 	}
+	defer spooled.lease.end()
+	rec := spooled.Body
 	if err := b.multipart.PutPart(ctx, registry.MultipartPart{
 		UploadID:    uploadID,
 		PartNumber:  partNumber,
@@ -388,7 +392,7 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 	// part is durable on the network as soon as the client sees success.
 	// The part row is recorded first so a crash mid-park leaves re-drivable
 	// spooled intents.
-	if err := b.parkBlobs(ctx, space, rec.Blobs); err != nil {
+	if err := b.parkBlobs(ctx, space, rec.Blobs, spooled.streamed); err != nil {
 		return nil, fmt.Errorf("s3frontend: park part blobs: %w", err)
 	}
 	b.releaseNow(ctx, superseding)
@@ -1063,8 +1067,17 @@ func (b *Backend) enqueuePartReleases(ctx context.Context, space did.DID, digest
 // skipped (another part or session parked the same content), the rest upload
 // with the conclude deferred (WithConclude(false)) and persist their park
 // state for Complete/Abort.
-func (b *Backend) parkBlobs(ctx context.Context, space did.DID, blobs []msbucket.BlobRef) error {
+//
+// A blob in streamed already went to its provider while it was spooled and is
+// parked there; only its park row is left to record.
+func (b *Backend) parkBlobs(ctx context.Context, space did.DID, blobs []msbucket.BlobRef, streamed map[string]uploader.StreamedBlob) error {
 	for _, blob := range blobs {
+		if sb, ok := streamed[string(blob.Digest)]; ok {
+			if err := b.recordStreamedPark(ctx, blob, sb); err != nil {
+				return err
+			}
+			continue
+		}
 		if err := b.parkBlob(ctx, space, blob); err != nil {
 			return err
 		}
@@ -1154,6 +1167,32 @@ func (b *Backend) parkBlob(ctx context.Context, space did.DID, blob msbucket.Blo
 	if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentParked); err != nil {
 		return fmt.Errorf("mark parked: %w", err)
 	}
+	return nil
+}
+
+// recordStreamedPark records the park a streamed blob left on its provider,
+// traced as a blob.park span like parkBlob.
+func (b *Backend) recordStreamedPark(ctx context.Context, blob msbucket.BlobRef, sb uploader.StreamedBlob) (err error) {
+	ctx, span := tracing.Start(ctx, "blob.park",
+		attribute.String("ingot.blob.result", "streamed"),
+		attribute.Int64("ingot.blob.bytes", sb.Size),
+	)
+	defer func() { tracing.End(span, err) }()
+
+	parked := sb.Parked(blob.Digest)
+	if err := b.parks.PutPark(ctx, registry.BlobPark{
+		Digest:        blob.Digest,
+		AddTask:       parked.AddTask.Bytes(),
+		AcceptTask:    parked.AcceptTask.Bytes(),
+		PutInvocation: parked.PutInvocation,
+		Size:          parked.Size,
+	}); err != nil {
+		return fmt.Errorf("record park: %w", err)
+	}
+	if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentParked); err != nil {
+		return fmt.Errorf("mark parked: %w", err)
+	}
+	b.finishStream(ctx, sb)
 	return nil
 }
 
