@@ -178,6 +178,14 @@ func withMultipartTTLConfig() stack.Option {
 	return stack.WithServiceConfig("ingot", "testdata/config-mpttl.yaml")
 }
 
+// withSpoolBudgetConfig mounts testdata/config-spoolbudget.yaml — a 4 MiB
+// spool_max_bytes with the residency and read-retention windows off, so the
+// spool sweeper evicts within a test's budget. Dedicated stacks only: other
+// tests read envelopes back from the spool.
+func withSpoolBudgetConfig() stack.Option {
+	return stack.WithServiceConfig("ingot", "testdata/config-spoolbudget.yaml")
+}
+
 // ingotSQL runs one SQL statement against ingot's Postgres and returns the
 // bare psql output (rows, newline-separated). Digests round-trip as hex:
 // encode(digest,'hex') out, decode('<hex>','hex') in.
@@ -398,6 +406,26 @@ func spoolBlobCount(t *testing.T, ctx context.Context, s *stack.Stack) int {
 		t.Fatalf("parse spool count %q: %v", out, err)
 	}
 	return n
+}
+
+// spoolBytes sums the sizes of the body blobs in the ingot container's spool,
+// ignoring in-progress temp files.
+func spoolBytes(t *testing.T, ctx context.Context, s *stack.Stack) int64 {
+	t.Helper()
+	out, errOut, err := s.Exec(ctx, "ingot", "sh", "-c",
+		`find /data/spool -maxdepth 1 -type f ! -name '.tmp*' -printf '%s\n' 2>/dev/null`)
+	if err != nil {
+		t.Fatalf("list spool sizes: %v (stderr=%s)", err, errOut)
+	}
+	var total int64
+	for _, line := range strings.Fields(out) {
+		n, err := strconv.ParseInt(line, 10, 64)
+		if err != nil {
+			t.Fatalf("parse spool size %q: %v", line, err)
+		}
+		total += n
+	}
+	return total
 }
 
 // spoolBlobPaths lists the body-blob files in the ingot container's spool

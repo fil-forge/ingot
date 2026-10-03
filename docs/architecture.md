@@ -275,7 +275,9 @@ digest must be known before `allocate`, and because that local copy does double 
 - **Read cache (optional, recommended):** beyond that floor, the local store serves hot reads
   directly, skipping the indexer→Piri round-trip. Read-after-write retains *recently written* data;
   a cache retains *recently read* data, so the two may use distinct eviction policies over a shared,
-  bounded, size-configurable store. The alternative — a near-stateless Ingot that resolves every read
+  bounded, size-configurable store. *(Built as one byte budget, `spool_max_bytes`, with a
+  read-after-write window, `spool_min_residency`, and a read-recency window,
+  `spool_read_retention`; see §12.)* The alternative — a near-stateless Ingot that resolves every read
   through the indexer — trades latency for simpler horizontal scaling; it is a supported mode, but
   the read-after-write floor holds regardless.
 
@@ -697,17 +699,20 @@ CREATE TABLE ingot.blob_refs (
 -- Drives "is (space, digest) still claimed?" — the gate on remove(digest).
 CREATE INDEX blob_refs_claim_idx ON ingot.blob_refs (space, digest);
 
--- The local-store index (§5): every blob Ingot holds on disk. state advances
--- spooled → parked → accepted ('published' is declared but unwritten today).
+-- The local-store index (§5): every blob Ingot has spooled. state advances
+-- spooled → uploading → (parked →) accepted → published; published is written
+-- with the first reference claim. Spool eviction removes the file and sets
+-- evicted_at, leaving the row and its state.
 CREATE TABLE ingot.upload_intents (
     digest      bytea PRIMARY KEY,                       -- sha256 multihash of the blob
     local_path  text   NOT NULL,
-    size        bigint NOT NULL,
+    size        bigint NOT NULL,                         -- stored (envelope) bytes = file size
     state       text   NOT NULL
-                    CHECK (state IN ('spooled','parked','accepted','published')),
+                    CHECK (state IN ('spooled','uploading','parked','accepted','published')),
     bucket      text,                                    -- owner ref (originating op), for cleanup
     created_at  timestamptz NOT NULL DEFAULT now(),
-    updated_at  timestamptz NOT NULL DEFAULT now()
+    updated_at  timestamptz NOT NULL DEFAULT now(),      -- last state change
+    evicted_at  timestamptz                              -- NULL: file on disk
 );
 
 -- Local blob location table (§8, appliance topology): (space, digest) →
@@ -880,9 +885,14 @@ paths below are exercised against the real stack by the smelt-based `itest/` har
   spool loss from `blob_locations` + `/content/retrieve` (`TestForgeReadAfterEviction`), and
   retention-retired catalog blocks resolve via `shard_inclusions` (#44) — the read paths of
   [§7.4](#74-read-getobject) / [§8](#8-retrieval-addressing-when-bodies-need-a-sharded-dag-index).
-  Spool **eviction** itself is still unbuilt: nothing bounds the spool, and `DeleteObject`'s
-  release is network-side only, so local disk grows with every body byte ever written — the
-  bounded-cache policy [§5](#5-the-data-layer) specifies is tracked in #48.
+  **Spool eviction to a byte budget is built** (`spool_max_bytes`, `SweepSpool`): every 30s the
+  sweeper removes the local files of blobs the provider holds (a location or park row), oldest
+  first, down to 90% of the budget, honouring a read-after-write window (`spool_min_residency`)
+  and a read-recency window (`spool_read_retention`) unless usage stays over budget; hourly it
+  deletes orphan files. The budget is off by default. Still open under #48: a deleted object's
+  local envelope stays on disk (its release keeps it as the insurance copy, and with no location
+  row the budget pass never evicts it), parked multipart parts stay on disk until Complete, and
+  there is no write-through mode or spool metric.
 - **Multipart parts park at UploadPart, accept at Complete.** (Built: `parkBlobs`/`concludeBlobs`
   over the `blob_parks` table.) The in-process harness still spools parts
   at `UploadPart` and uploads+accepts them at `Complete`; the true forge *parking* (upload early,

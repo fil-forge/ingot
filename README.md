@@ -124,6 +124,15 @@ consulted. The deployment context is the
 the S3 facade runs **at the edge**, co-located with a provider's piri or as a
 standalone client — not inside the central upload-service.
 
+`serve` writes every object body to `<data_dir>/spool` before uploading it.
+Set `spool_max_bytes` to bound that directory: a sweeper evicts bodies the
+provider already holds, oldest first, and later reads of them go to the
+provider. `spool_min_residency` (default `10m`) and `spool_read_retention`
+(default `1h`) keep just-written and recently read bodies local while the
+budget allows; usage can run over the budget by the ingest rate × 30 seconds,
+plus bodies still uploading. Without a budget the spool grows with every
+body written. A deleted object's local copy is not freed yet (#48).
+
 `serve` exports OpenTelemetry traces over OTLP/HTTP when
 `OTEL_EXPORTER_OTLP_ENDPOINT` names a collector; with no endpoint, tracing is
 off. Each S3 request is a trace named for its S3 action, with the hilt, sprue,

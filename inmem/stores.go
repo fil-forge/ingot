@@ -38,8 +38,9 @@ func (m *MemStore) AddBlobClaim(_ context.Context, c registry.BlobClaim) error {
 	cp.Digest = bytes.Clone(c.Digest)
 	m.blobRefs[k] = cp
 	// Committed blobs' intents are published, atomically with the claim.
-	if in, ok := m.intents[string(c.Digest)]; ok {
+	if in, ok := m.intents[string(c.Digest)]; ok && in.State != registry.IntentPublished {
 		in.State = registry.IntentPublished
+		in.UpdatedAt = time.Now()
 		m.intents[string(c.Digest)] = in
 	}
 	return nil
@@ -171,6 +172,7 @@ func (m *MemStore) DeleteIntentAndRelease(_ context.Context, space did.DID, dige
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.intents, string(digest))
+	delete(m.evicted, string(digest))
 	delete(m.releases, locKey{space, string(digest)})
 	return nil
 }
@@ -189,7 +191,9 @@ func (m *MemStore) PutIntent(_ context.Context, in registry.UploadIntent) error 
 	defer m.mu.Unlock()
 	cp := in
 	cp.Digest = bytes.Clone(in.Digest)
+	cp.UpdatedAt = time.Now()
 	m.intents[string(in.Digest)] = cp
+	delete(m.evicted, string(in.Digest))
 	return nil
 }
 
@@ -201,6 +205,7 @@ func (m *MemStore) SetIntentState(_ context.Context, digest multihash.Multihash,
 		return registry.ErrNotFound
 	}
 	in.State = state
+	in.UpdatedAt = time.Now()
 	m.intents[string(digest)] = in
 	return nil
 }
@@ -236,7 +241,94 @@ func (m *MemStore) DeleteIntent(_ context.Context, digest multihash.Multihash) e
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.intents, string(digest))
+	delete(m.evicted, string(digest))
 	return nil
+}
+
+func (m *MemStore) ListEvictable(_ context.Context, after registry.EvictCursor, limit int) ([]registry.UploadIntent, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []registry.UploadIntent
+	for key, in := range m.intents {
+		if _, gone := m.evicted[key]; gone {
+			continue
+		}
+		switch in.State {
+		case registry.IntentParked:
+			if _, ok := m.parks[key]; !ok {
+				continue
+			}
+		case registry.IntentAccepted, registry.IntentPublished:
+			if !m.locatedLocked(in.Digest) {
+				continue
+			}
+		default:
+			continue
+		}
+		if !evictCursorBefore(after, in) {
+			continue
+		}
+		cp := in
+		cp.Digest = bytes.Clone(in.Digest)
+		out = append(out, cp)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return evictCursorBefore(registry.EvictCursor{UpdatedAt: out[i].UpdatedAt, Digest: out[i].Digest}, out[j])
+	})
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+// locatedLocked reports whether digest has a location in any space.
+func (m *MemStore) locatedLocked(digest multihash.Multihash) bool {
+	for k := range m.locations {
+		if k.digest == string(digest) {
+			return true
+		}
+	}
+	return false
+}
+
+// evictCursorBefore reports whether c sorts strictly before in in
+// ListEvictable's (updated_at, digest) order.
+func evictCursorBefore(c registry.EvictCursor, in registry.UploadIntent) bool {
+	if !c.UpdatedAt.Equal(in.UpdatedAt) {
+		return c.UpdatedAt.Before(in.UpdatedAt)
+	}
+	return bytes.Compare(c.Digest, in.Digest) < 0
+}
+
+func (m *MemStore) MarkEvicted(_ context.Context, digest multihash.Multihash) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.intents[string(digest)]; !ok {
+		return registry.ErrNotFound
+	}
+	m.evicted[string(digest)] = struct{}{}
+	return nil
+}
+
+// IsEvicted reports whether digest's intent is marked evicted. Test-only
+// visibility into the evicted_at column.
+func (m *MemStore) IsEvicted(digest multihash.Multihash) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.evicted[string(digest)]
+	return ok
+}
+
+func (m *MemStore) MissingIntents(_ context.Context, digests []multihash.Multihash) ([]multihash.Multihash, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []multihash.Multihash
+	for _, d := range digests {
+		if _, ok := m.intents[string(d)]; !ok {
+			out = append(out, bytes.Clone(d))
+		}
+	}
+	return out, nil
 }
 
 // LocationStore ==============================================================

@@ -347,7 +347,8 @@ func (r *Postgres) PutIntent(ctx context.Context, in UploadIntent) error {
 		       size       = EXCLUDED.size,
 		       state      = EXCLUDED.state,
 		       bucket     = EXCLUDED.bucket,
-		       updated_at = now()`,
+		       updated_at = now(),
+		       evicted_at = NULL`,
 		in.Digest, in.LocalPath, in.Size, in.State, nullString(in.Bucket))
 	if err != nil {
 		return fmt.Errorf("registry: put intent: %w", err)
@@ -372,8 +373,8 @@ func (r *Postgres) GetIntent(ctx context.Context, digest multihash.Multihash) (*
 	in := &UploadIntent{Digest: digest}
 	var bucket *string
 	err := r.pool.QueryRow(ctx,
-		`SELECT local_path, size, state, bucket FROM ingot.upload_intents WHERE digest = $1`,
-		digest).Scan(&in.LocalPath, &in.Size, &in.State, &bucket)
+		`SELECT local_path, size, state, bucket, updated_at FROM ingot.upload_intents WHERE digest = $1`,
+		digest).Scan(&in.LocalPath, &in.Size, &in.State, &bucket, &in.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -388,18 +389,93 @@ func (r *Postgres) GetIntent(ctx context.Context, digest multihash.Multihash) (*
 
 func (r *Postgres) ListIntentsByState(ctx context.Context, state string) ([]UploadIntent, error) {
 	rows, err := r.pool.Query(ctx,
-		`SELECT digest, local_path, size, state, bucket FROM ingot.upload_intents WHERE state = $1`,
+		`SELECT digest, local_path, size, state, bucket, updated_at FROM ingot.upload_intents WHERE state = $1`,
 		state)
 	if err != nil {
 		return nil, fmt.Errorf("registry: list intents: %w", err)
 	}
-	defer rows.Close()
+	return scanIntents(rows)
+}
 
+func (r *Postgres) ListEvictable(ctx context.Context, after EvictCursor, limit int) ([]UploadIntent, error) {
+	// A zero cursor starts before every row; the empty digest sorts first.
+	afterDigest := after.Digest
+	if afterDigest == nil {
+		afterDigest = multihash.Multihash{}
+	}
+	// The state literals match the partial index upload_intents_evictable_idx
+	// (migration 00020); the planner uses it only when the query names the
+	// same constants, not parameters.
+	rows, err := r.pool.Query(ctx,
+		`SELECT i.digest, i.local_path, i.size, i.state, i.bucket, i.updated_at
+		   FROM ingot.upload_intents i
+		  WHERE i.evicted_at IS NULL
+		    AND i.state IN ('parked', 'accepted', 'published')
+		    AND (i.updated_at, i.digest) > ($1::timestamptz, $2::bytea)
+		    AND CASE WHEN i.state = 'parked'
+		             THEN EXISTS (SELECT 1 FROM ingot.blob_parks p WHERE p.digest = i.digest)
+		             ELSE EXISTS (SELECT 1 FROM ingot.blob_locations l WHERE l.digest = i.digest)
+		        END
+		  ORDER BY i.updated_at, i.digest
+		  LIMIT $3`,
+		after.UpdatedAt, []byte(afterDigest), limit)
+	if err != nil {
+		return nil, fmt.Errorf("registry: list evictable intents: %w", err)
+	}
+	return scanIntents(rows)
+}
+
+func (r *Postgres) MarkEvicted(ctx context.Context, digest multihash.Multihash) error {
+	tag, err := r.pool.Exec(ctx,
+		`UPDATE ingot.upload_intents SET evicted_at = now() WHERE digest = $1`, digest)
+	if err != nil {
+		return fmt.Errorf("registry: mark intent evicted: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (r *Postgres) MissingIntents(ctx context.Context, digests []multihash.Multihash) ([]multihash.Multihash, error) {
+	if len(digests) == 0 {
+		return nil, nil
+	}
+	raw := make([][]byte, len(digests))
+	for i, d := range digests {
+		raw[i] = d
+	}
+	rows, err := r.pool.Query(ctx,
+		`SELECT d FROM unnest($1::bytea[]) AS d
+		  WHERE NOT EXISTS (SELECT 1 FROM ingot.upload_intents i WHERE i.digest = d)`,
+		raw)
+	if err != nil {
+		return nil, fmt.Errorf("registry: missing intents: %w", err)
+	}
+	defer rows.Close()
+	var out []multihash.Multihash
+	for rows.Next() {
+		var d []byte
+		if err := rows.Scan(&d); err != nil {
+			return nil, fmt.Errorf("registry: missing intents scan: %w", err)
+		}
+		out = append(out, multihash.Multihash(d))
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("registry: missing intents rows: %w", err)
+	}
+	return out, nil
+}
+
+// scanIntents reads rows of (digest, local_path, size, state, bucket,
+// updated_at) and closes them.
+func scanIntents(rows pgx.Rows) ([]UploadIntent, error) {
+	defer rows.Close()
 	var out []UploadIntent
 	for rows.Next() {
 		var in UploadIntent
 		var bucket *string
-		if err := rows.Scan(&in.Digest, &in.LocalPath, &in.Size, &in.State, &bucket); err != nil {
+		if err := rows.Scan(&in.Digest, &in.LocalPath, &in.Size, &in.State, &bucket, &in.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("registry: list intents scan: %w", err)
 		}
 		if bucket != nil {

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/fil-forge/ingot/bucket"
 	blobcmds "github.com/fil-forge/libforge/commands/blob"
@@ -95,6 +96,11 @@ func TestValidate_RequiredFields(t *testing.T) {
 		{"revocation did without url", func(c *Config) { c.RevocationServiceDID = "did:web:swarf.example" }, "revocation_service_url and revocation_service_did must be set together"},
 		{"bad seal_age", func(c *Config) { c.SealAge = "not-a-duration" }, "parse seal_age"},
 		{"bad release_grace", func(c *Config) { c.ReleaseGrace = "soon" }, "parse release_grace"},
+		{"negative spool_max_bytes", func(c *Config) { c.SpoolMaxBytes = -1 }, "spool_max_bytes -1: must not be negative"},
+		{"bad spool_min_residency", func(c *Config) { c.SpoolMinResidency = "soon" }, "parse spool_min_residency"},
+		{"negative spool_min_residency", func(c *Config) { c.SpoolMinResidency = "-1m" }, `spool_min_residency "-1m": must not be negative`},
+		{"negative spool_read_retention", func(c *Config) { c.SpoolReadRetention = "-1m" }, `spool_read_retention "-1m": must not be negative`},
+		{"short spool_orphan_age", func(c *Config) { c.SpoolOrphanAge = "59m" }, `spool_orphan_age "59m": must be at least 1h`},
 		{"bad cors origin", func(c *Config) { c.CORSAllowedOrigins = []string{"app.example"} }, "cors_allowed_origins"},
 		{"regionkey provider unset", func(c *Config) { c.RegionKey.Provider = "" }, "regionkey.provider is required"},
 		{"tenantkey url unset", func(c *Config) { c.TenantKey.PLCDirectoryURL = "" }, "tenantkey.plc_directory_url is required"},
@@ -119,6 +125,52 @@ func TestValidate_RequiredFields(t *testing.T) {
 			err := cfg.Validate()
 			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
 				t.Fatalf("expected error containing %q, got: %v", tc.wantErr, err)
+			}
+		})
+	}
+}
+
+// spoolKnobs is the spool subset of ServerConfig, for comparing it whole.
+type spoolKnobs struct {
+	MaxBytes      int64
+	MinResidency  time.Duration
+	ReadRetention time.Duration
+	OrphanAge     time.Duration
+}
+
+func TestServerConfig_SpoolKnobs(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(*Config)
+		want   spoolKnobs
+	}{
+		{
+			name:   "defaults",
+			mutate: func(*Config) {},
+			want:   spoolKnobs{MaxBytes: 0, MinResidency: 10 * time.Minute, ReadRetention: time.Hour, OrphanAge: 24 * time.Hour},
+		},
+		{
+			name: "explicit values",
+			mutate: func(c *Config) {
+				c.SpoolMaxBytes = 1 << 40
+				c.SpoolMinResidency = "0s"
+				c.SpoolReadRetention = "15m"
+				c.SpoolOrphanAge = "2h"
+			},
+			want: spoolKnobs{MaxBytes: 1 << 40, MinResidency: 0, ReadRetention: 15 * time.Minute, OrphanAge: 2 * time.Hour},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := validConfig(t)
+			tc.mutate(&cfg)
+			sc, err := cfg.ServerConfig()
+			if err != nil {
+				t.Fatalf("ServerConfig: %v", err)
+			}
+			got := spoolKnobs{sc.SpoolMaxBytes, sc.SpoolMinResidency, sc.SpoolReadRetention, sc.SpoolOrphanAge}
+			if got != tc.want {
+				t.Fatalf("spool knobs = %+v, want %+v", got, tc.want)
 			}
 		})
 	}

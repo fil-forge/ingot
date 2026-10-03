@@ -55,6 +55,18 @@ type ServerConfig struct {
 	// means releases are due immediately.
 	ReleaseGrace time.Duration
 
+	// SpoolMaxBytes is the byte budget for the spool's blob files, enforced
+	// by the spool sweeper; zero means no budget. SpoolMinResidency and
+	// SpoolReadRetention are the read-after-write and read-cache windows the
+	// sweeper honours while it can; zero turns each off. SpoolOrphanAge is
+	// the age at which the sweeper deletes files no upload intent names; zero
+	// → 24h. Config.ServerConfig() applies the defaults documented on
+	// Config.
+	SpoolMaxBytes      int64
+	SpoolMinResidency  time.Duration
+	SpoolReadRetention time.Duration
+	SpoolOrphanAge     time.Duration
+
 	// CORSConfig is the S3 CORS configuration the backend reports for
 	// every bucket, rendered from Config.CORSAllowedOrigins by
 	// internal/cors. Nil disables CORS entirely (the default).
