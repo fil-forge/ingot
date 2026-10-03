@@ -880,8 +880,8 @@ paths below are exercised against the real stack by the smelt-based `itest/` har
   spool loss from `blob_locations` + `/content/retrieve` (`TestForgeReadAfterEviction`), and
   retention-retired catalog blocks resolve via `shard_inclusions` (#44) — the read paths of
   [§7.4](#74-read-getobject) / [§8](#8-retrieval-addressing-when-bodies-need-a-sharded-dag-index).
-  Spool **eviction** itself is still unbuilt: nothing bounds the spool, and `DeleteObject`'s
-  release is network-side only, so local disk grows with every body byte ever written — the
+  Spool **eviction** itself is still unbuilt: nothing bounds the spool, so local disk grows with
+  every body byte of every live object. A release frees a deleted object's spool copies. The
   bounded-cache policy [§5](#5-the-data-layer) specifies is tracked in #48.
 - **Multipart parts park at UploadPart, accept at Complete.** (Built: `parkBlobs`/`concludeBlobs`
   over the `blob_parks` table.) The in-process harness still spools parts
