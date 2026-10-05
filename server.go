@@ -379,7 +379,7 @@ func (s *Server) startLocalBlobSweeper() {
 					s.logger.Warn("local blob sweep", zap.Error(err))
 				}
 				if stats.Removed() {
-					s.logger.Info("local blob sweep removed files",
+					s.logger.Debug("local blob sweep removed files",
 						zap.Int64("budget_files", stats.BudgetFiles),
 						zap.Int64("budget_bytes", stats.BudgetBytes),
 						zap.Int64("orphan_files", stats.OrphanFiles),

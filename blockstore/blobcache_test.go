@@ -90,8 +90,9 @@ func TestLocalBlobsReadsEitherDirectory(t *testing.T) {
 	}
 }
 
-// TestScanKeepsCountsExact: recounts and scans racing writes, moves and
-// removes leave each count equal to the bytes actually in its directory.
+// TestScanKeepsCountsExact: the hourly scans and corrections racing writes,
+// moves and removes leave each count equal to the bytes actually in its
+// directory.
 func TestScanKeepsCountsExact(t *testing.T) {
 	ctx := t.Context()
 	s, c := newTestDirs(t)
@@ -130,10 +131,8 @@ func TestScanKeepsCountsExact(t *testing.T) {
 				return
 			default:
 			}
-			_ = s.count(func(BlobFile) {})
-			_ = c.count(func(BlobFile) {})
-			_ = s.Scan(ctx, func(BlobFile) {})
-			_ = c.Scan(ctx, func(BlobFile) {})
+			_, _ = s.ScanAndCorrect(ctx, func(BlobFile) {})
+			_, _ = c.ScanAndCorrect(ctx, func(BlobFile) {})
 		}
 	}()
 	wg.Wait()
@@ -179,5 +178,43 @@ func TestBlobCacheCheckTake(t *testing.T) {
 	}
 	if err := c.CheckTake(s); err == nil {
 		t.Fatal("CheckTake into a missing cache directory: want an error")
+	}
+}
+
+// TestScanAndCorrect: a file removed outside the process stays counted until a
+// scan that nothing overlapped corrects the count; a scan that a write
+// overlapped corrects nothing.
+func TestScanAndCorrect(t *testing.T) {
+	ctx := t.Context()
+	s, _ := newTestDirs(t)
+	gone := writeTestBlob(t, s, "removed by hand")
+	writeTestBlob(t, s, "kept")
+	if err := os.Remove(s.Path(gone)); err != nil {
+		t.Fatal(err)
+	}
+	stale := s.Usage()
+
+	var wrote bool
+	overlapped, err := s.ScanAndCorrect(ctx, func(BlobFile) {
+		if !wrote {
+			wrote = true
+			writeTestBlob(t, s, "written during the scan")
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterOverlap := s.Usage()
+	quiet, err := s.ScanAndCorrect(ctx, func(BlobFile) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	removed := int64(len("removed by hand"))
+	written := int64(len("written during the scan"))
+	got := [4]int64{overlapped, afterOverlap, quiet, s.Usage()}
+	want := [4]int64{0, stale + written, removed, stale + written - removed}
+	if got != want {
+		t.Fatalf("[overlapped correction, usage after it, quiet correction, usage after it] = %v, want %v", got, want)
 	}
 }
