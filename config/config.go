@@ -107,12 +107,13 @@ type Config struct {
 	// immediately.
 	ReleaseGrace string `mapstructure:"release_grace" yaml:"release_grace"`
 
-	// SpoolMaxBytes is the byte budget for the local spool's blob files
-	// (<data_dir>/spool). A sweeper checks it every 30 seconds and evicts
-	// blobs the provider already holds, oldest first, down to 90% of the
-	// budget; reads of an evicted blob go to the provider. Usage can exceed
-	// the budget by ingest rate × 30 seconds between sweeps, and by files
-	// that must stay (blobs not yet accepted, orphans younger than
+	// SpoolMaxBytes is the byte budget for the local spool's files
+	// (<data_dir>/spool), counting the bytes of writes still in progress. A
+	// sweeper checks it every 30 seconds and evicts blobs the provider
+	// already holds, oldest first, down to 90% of the budget; reads of an
+	// evicted blob go to the provider. Usage can exceed the budget by ingest
+	// rate × 30 seconds between sweeps, and by files that must stay (writes
+	// in progress, blobs not yet accepted, orphans younger than
 	// SpoolOrphanAge). 0 → no budget (the default); negative is an error.
 	SpoolMaxBytes int64 `mapstructure:"spool_max_bytes" yaml:"spool_max_bytes"`
 	// SpoolOrphanAge is the age (file modification time) at which the
