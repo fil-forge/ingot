@@ -129,7 +129,7 @@ func hiltActiveWrapKID(t *testing.T, ctx context.Context, s *stack.Stack, extern
 func spooledEnvelope(t *testing.T, ctx context.Context, s *stack.Stack) *cose.Envelope {
 	t.Helper()
 	out, errOut, err := s.Exec(ctx, "ingot", "sh", "-c",
-		`f=$(find /data/spool -maxdepth 1 -type f ! -name '.tmp*' | head -1); [ -n "$f" ] && base64 < "$f"`)
+		`f=$(find /data/spool /data/cache -maxdepth 1 -type f ! -name '.tmp*' | head -1); [ -n "$f" ] && base64 < "$f"`)
 	if err != nil {
 		t.Fatalf("read a spooled blob: %v (stderr=%s)", err, errOut)
 	}

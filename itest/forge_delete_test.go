@@ -42,10 +42,10 @@ func TestForgeDeleteReleasesNetworkBlob(t *testing.T) {
 		t.Fatalf("put object: %v", err)
 	}
 
-	// Precondition: the blob really lives on piri — wipe the spool and prove
+	// Precondition: the blob really lives on piri — wipe the local copies and prove
 	// the GET re-fetches from the network (same tier the eviction test pins).
-	if out, errOut, err := s.Exec(ctx, "ingot", "sh", "-c", "rm -rf /data/spool"); err != nil {
-		t.Fatalf("evict spool: %v (stdout=%s stderr=%s)", err, out, errOut)
+	if out, errOut, err := s.Exec(ctx, "ingot", "sh", "-c", "rm -rf /data/spool /data/cache"); err != nil {
+		t.Fatalf("wipe local blob copies: %v (stdout=%s stderr=%s)", err, out, errOut)
 	}
 	if got, err := ingottest.GetBytes(ctx, cfg, bucket, key); err != nil || len(got) != len(data) {
 		t.Fatalf("read-through from piri before delete: err=%v len=%d", err, len(got))

@@ -81,10 +81,10 @@ A write splits into two paths:
   `forge_root_cid` under a guard. See
   [`logstore/README.md`](./logstore/README.md).
 
-Reads fall through tiers: the spool, the local log (catalog blocks), and
-finally the network, resolved by a local locator (`blob_locations` +
-`shard_inclusions`) and fetched with a ranged `content/retrieve` against the
-storing piri. The two routes are drawn side by side in
+Reads fall through tiers: local disk (cache, then spool), the local log
+(catalog blocks), and finally the network, resolved by a local locator
+(`blob_locations` + `shard_inclusions`) and fetched with a ranged
+`content/retrieve` against the storing piri. The two routes are drawn side by side in
 [`docs/diagrams.md`](./docs/diagrams.md#two-block-routes-body-blobs-and-catalog-blocks).
 
 ## Running it
@@ -124,20 +124,22 @@ consulted. The deployment context is the
 the S3 facade runs **at the edge**, co-located with a provider's piri or as a
 standalone client — not inside the central upload-service.
 
-`serve` writes every object body to `<data_dir>/spool` as it uploads it.
-Set `spool_max_bytes` to bound that directory: a sweeper evicts bodies the
-provider already holds, oldest first, and later reads of them go to the
+`serve` writes every object body to `<data_dir>/spool` as it uploads it, and
+moves each body to `<data_dir>/cache` once the provider holds it, keeping it
+so a read soon after the write is served from local disk. Set
+`local_blob_max_bytes` to bound the two directories together: a sweeper
+evicts cached bodies, oldest first, and later reads of them go to the
 provider. The budget counts bodies as they are written, so the sweeper makes
 room for them, but usage can run over it by the ingest rate × 30 seconds,
-plus bodies still being written or uploaded, which cannot be evicted. Nor
-can the body of an upload that failed (its upload intent stays `spooled` or
-`uploading`): nothing reclaims those files yet, so they count against the
-budget until removed by hand. Without a budget the spool grows with every
-live object's bodies; a deleted object's local copy is freed when its
-release runs, and a multipart part's once it parks on the provider. With or
-without a budget, the sweeper deletes unfinished writes and files with no
-upload intent, hourly, once they are older than `spool_orphan_age` (default
-`24h`).
+plus the spool's bodies still being written or uploaded, which cannot be
+evicted. Nor can the body of an upload that failed (its upload intent stays
+`spooled` or `uploading`): nothing reclaims those files yet, so they count
+against the budget until removed by hand. Without a budget the cache grows
+with every live object's bodies; a deleted object's local copy is freed when
+its release runs, and a multipart part's once it parks on the provider. With
+or without a budget, the sweeper deletes unfinished writes and files with no
+upload intent, hourly, once they are older than `local_blob_orphan_age`
+(default `24h`).
 
 `serve` exports OpenTelemetry traces over OTLP/HTTP when
 `OTEL_EXPORTER_OTLP_ENDPOINT` names a collector; with no endpoint, tracing is

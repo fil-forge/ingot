@@ -32,7 +32,7 @@ func writeTestBlob(t *testing.T, s *Spool, body string) mh.Multihash {
 	return digest
 }
 
-func TestSpoolUsage(t *testing.T) {
+func TestLocalBlobUsage(t *testing.T) {
 	cases := []struct {
 		name string
 		run  func(t *testing.T, s *Spool)
@@ -190,27 +190,27 @@ func TestNewSpoolReopen(t *testing.T) {
 	}
 }
 
+// TestSpoolScan: Scan reports blob files and .tmp-* files, and resets the
+// finished count to the blob files alone.
 func TestSpoolScan(t *testing.T) {
 	s := newTestSpool(t)
 	d := writeTestBlob(t, s, "hello")
 	if err := os.WriteFile(filepath.Join(s.dir, ".tmp-abc"), []byte("partial"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	s.usage.Store(999)
 	seen := map[string]bool{}
-	total, err := s.Scan(func(e SpoolEntry) {
-		seen[e.Name] = e.Digest != nil
-	})
-	if err != nil {
+	if err := s.Scan(func(f BlobFile) { seen[f.Name] = f.Digest != nil }); err != nil {
 		t.Fatalf("Scan: %v", err)
 	}
 	got := struct {
-		Total int64
+		Usage int64
 		Seen  map[string]bool
-	}{total, seen}
+	}{s.Usage(), seen}
 	want := struct {
-		Total int64
+		Usage int64
 		Seen  map[string]bool
-	}{12, map[string]bool{filepath.Base(s.Path(d)): true, ".tmp-abc": false}}
+	}{5, map[string]bool{filepath.Base(s.Path(d)): true, ".tmp-abc": false}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("Scan = %+v, want %+v", got, want)
 	}
@@ -224,21 +224,15 @@ func TestSpoolRemoveTempRejectsBlobNames(t *testing.T) {
 	}
 }
 
-// TestSpoolRemoveTempUncountsItsBytes: a temp file the usage count included
-// (here through a correction from a scan, as the orphan pass makes) comes off the
-// count when RemoveTemp deletes it, and a second removal frees nothing.
-func TestSpoolRemoveTempUncountsItsBytes(t *testing.T) {
+// TestSpoolRemoveTempLeavesTheCountAlone: RemoveTemp reports the size it
+// freed but does not touch the in-flight count, which a live write keeps for
+// itself; a second removal frees nothing.
+func TestSpoolRemoveTempLeavesTheCountAlone(t *testing.T) {
 	s := newTestSpool(t)
 	writeTestBlob(t, s, "hello")
 	if err := os.WriteFile(filepath.Join(s.dir, ".tmp-abc"), []byte("partial"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	before := s.Usage()
-	total, err := s.Scan(func(SpoolEntry) {})
-	if err != nil {
-		t.Fatalf("Scan: %v", err)
-	}
-	s.CorrectUsage(before, total)
 	var freed []int64
 	for range 2 {
 		n, err := s.RemoveTemp(".tmp-abc")

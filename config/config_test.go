@@ -96,9 +96,9 @@ func TestValidate_RequiredFields(t *testing.T) {
 		{"revocation did without url", func(c *Config) { c.RevocationServiceDID = "did:web:swarf.example" }, "revocation_service_url and revocation_service_did must be set together"},
 		{"bad seal_age", func(c *Config) { c.SealAge = "not-a-duration" }, "parse seal_age"},
 		{"bad release_grace", func(c *Config) { c.ReleaseGrace = "soon" }, "parse release_grace"},
-		{"negative spool_max_bytes", func(c *Config) { c.SpoolMaxBytes = -1 }, "spool_max_bytes -1: must not be negative"},
-		{"bad spool_orphan_age", func(c *Config) { c.SpoolOrphanAge = "soon" }, "parse spool_orphan_age"},
-		{"short spool_orphan_age", func(c *Config) { c.SpoolOrphanAge = "59m" }, `spool_orphan_age "59m": must be at least 1h`},
+		{"negative local_blob_max_bytes", func(c *Config) { c.LocalBlobMaxBytes = -1 }, "local_blob_max_bytes -1: must not be negative"},
+		{"bad local_blob_orphan_age", func(c *Config) { c.LocalBlobOrphanAge = "soon" }, "parse local_blob_orphan_age"},
+		{"short local_blob_orphan_age", func(c *Config) { c.LocalBlobOrphanAge = "59m" }, `local_blob_orphan_age "59m": must be at least 1h`},
 		{"bad cors origin", func(c *Config) { c.CORSAllowedOrigins = []string{"app.example"} }, "cors_allowed_origins"},
 		{"regionkey provider unset", func(c *Config) { c.RegionKey.Provider = "" }, "regionkey.provider is required"},
 		{"tenantkey url unset", func(c *Config) { c.TenantKey.PLCDirectoryURL = "" }, "tenantkey.plc_directory_url is required"},
@@ -148,8 +148,8 @@ func TestServerConfig_SpoolKnobs(t *testing.T) {
 		{
 			name: "explicit values",
 			mutate: func(c *Config) {
-				c.SpoolMaxBytes = 1 << 40
-				c.SpoolOrphanAge = "2h"
+				c.LocalBlobMaxBytes = 1 << 40
+				c.LocalBlobOrphanAge = "2h"
 			},
 			want: spoolKnobs{MaxBytes: 1 << 40, OrphanAge: 2 * time.Hour},
 		},
@@ -162,7 +162,7 @@ func TestServerConfig_SpoolKnobs(t *testing.T) {
 			if err != nil {
 				t.Fatalf("ServerConfig: %v", err)
 			}
-			got := spoolKnobs{sc.SpoolMaxBytes, sc.SpoolOrphanAge}
+			got := spoolKnobs{sc.LocalBlobMaxBytes, sc.LocalBlobOrphanAge}
 			if got != tc.want {
 				t.Fatalf("spool knobs = %+v, want %+v", got, tc.want)
 			}

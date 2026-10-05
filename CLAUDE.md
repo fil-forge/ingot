@@ -97,7 +97,9 @@ Internal:
 - **`bucketop/`** — `Coordinator`/`Tx`: per-bucket write transaction (lock,
   snapshot root, staging buffer, CAS commit).
 - **`blockstore/`** — block I/O contracts + impls: `log.go` (`Log`, `Plane`
-  [catalog-only], `OpRoot`), `staging.go` (`OpStaging`), `spool.go` (`Spool`),
+  [catalog-only], `OpRoot`), `staging.go` (`OpStaging`), `spool.go`
+  (`Spool`: writes and bodies awaiting upload), `blobcache.go` (`BlobCache`:
+  copies the provider holds; `LocalBlobs` reads both), `blobdir.go`,
   `layered.go`, `forge.go` (the network read tier), `cache.go` (`Cached` LRU),
   `locator/` (carried from guppy; the indexer-backed locator is never
   injected).
@@ -204,8 +206,9 @@ path or string-encoded UCAN container, required alongside the URL and
 validated at startup down to holding at least one delegation),
 `TokenStoreDir` (→
 `DataDir`), `MultipartSessionTTL` (0 → 7d, negative → sweeper off),
-`SpoolMaxBytes` (0 → no spool budget) and `SpoolOrphanAge` (24h, ≥ 1h) for
-the spool sweeper (`s3frontend.SweepSpool`),
+`LocalBlobMaxBytes` (0 → no budget for the spool and cache together) and
+`LocalBlobOrphanAge` (24h, ≥ 1h) for the local blob sweeper
+(`s3frontend.SweepLocalBlobs`),
 `CORSAllowedOrigins`, `LogLevel`. `Config.ServerConfig()` is the single
 mapping site. The daemon's config (cmd/) adds `postgres_dsn`,
 `identity.key_file` (the agent's PEM key) and `identity.service_id` (optional
@@ -238,7 +241,7 @@ forge-mode daemon. Two tiers:
     provisioning (`forge_native`), delete/release (`forge_delete`), deferred
     multipart accept (`forge_multipart_deferred`), catalog retention
     (`forge_retention`), the read-after-eviction network tier and the
-    spool budget sweeper (`forge_eviction`), and a real `aws s3 cp`
+    local blob budget sweeper (`forge_eviction`), and a real `aws s3 cp`
     multipart round trip from the official CLI image (`forge_awscli`).
 - **Suite-composition-sensitive upstream cases** — a few versitygw cases
   depend on run position rather than S3 semantics: `ListBuckets_truncated`

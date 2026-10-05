@@ -30,7 +30,7 @@ func TestParkedPartHoldsNoLocalCopy(t *testing.T) {
 	}
 	digests := hygienePartDigests(t, mem, uploadID, 1)
 	for _, d := range digests {
-		if _, err := os.Stat(b.spool.Path(d)); !os.IsNotExist(err) {
+		if _, err := os.Stat(localPath(b, d)); !os.IsNotExist(err) {
 			t.Fatalf("parked blob %s spool copy: stat err=%v, want not-exist", d, err)
 		}
 		if in, err := mem.GetIntent(ctx, d); err != nil || in.State != registry.IntentParked {
@@ -74,7 +74,7 @@ func TestFailedParkKeepsLocalCopy(t *testing.T) {
 		t.Fatalf("UploadPart succeeded, want the park failure")
 	}
 	for _, d := range hygienePartDigests(t, mem, uploadID, 1) {
-		if _, err := os.Stat(b.spool.Path(d)); err != nil {
+		if _, err := os.Stat(localPath(b, d)); err != nil {
 			t.Fatalf("blob %s spool copy after a failed park: %v, want it kept", d, err)
 		}
 		if in, err := mem.GetIntent(ctx, d); err != nil || in.State != registry.IntentUploading {
