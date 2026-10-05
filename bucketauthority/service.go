@@ -61,10 +61,6 @@ func (s *Service) CreateBucket(ctx context.Context, req s3.Request) (did.DID, er
 				return did.Undef, ErrExists
 			case bucketrpc.BucketAlreadyOwnedErrorName:
 				return did.Undef, ErrAlreadyOwned
-			case bucketpolicy.InvalidPolicyErrorName:
-				// The policy the create carried in x-bucket-policy was refused;
-				// no bucket exists.
-				return did.Undef, fmt.Errorf("%w: %s", ErrMalformedPolicy, namedErr.Error())
 			}
 		}
 		return did.Undef, err

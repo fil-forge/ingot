@@ -80,23 +80,23 @@ func TestPolicyRoutes(t *testing.T) {
 		res, body := do(t, policyApp(f), http.MethodPut, "/photos?policy", map[string]string{
 			"Authorization": "AWS4-HMAC-SHA256 Credential=k/20260928/us/s3/aws4_request, SignedHeaders=host;if-match, Signature=abc",
 			"If-Match":      `"old"`,
-		}, `{"statement":[]}`)
+		}, `{"Statement":[]}`)
 		require.Equal(t, http.StatusNoContent, res.StatusCode, body)
 		require.Equal(t, `"bafy..."`, res.Header.Get("ETag"))
 		require.Equal(t, "PUT", f.req.Method)
 		require.Equal(t, "/photos?policy", f.req.URL)
 		require.Equal(t, `"old"`, f.req.Headers["If-Match"])
 		require.Contains(t, f.req.Headers["Authorization"], "SignedHeaders=host;if-match")
-		require.Equal(t, `{"statement":[]}`, string(f.body))
+		require.Equal(t, `{"Statement":[]}`, string(f.body))
 	})
 
 	t.Run("GET ?policy answers 200 with the document and its ETag", func(t *testing.T) {
-		f := &fakeAuthority{ok: &s3bkt.PolicyOK{ETag: `"bafy..."`, Policy: []byte(`{"statement":[]}`)}}
+		f := &fakeAuthority{ok: &s3bkt.PolicyOK{ETag: `"bafy..."`, Policy: []byte(`{"Statement":[]}`)}}
 		res, body := do(t, policyApp(f), http.MethodGet, "/photos?policy", nil, "")
 		require.Equal(t, http.StatusOK, res.StatusCode)
 		require.Equal(t, `"bafy..."`, res.Header.Get("ETag"))
 		require.Contains(t, res.Header.Get("Content-Type"), "application/json")
-		require.Equal(t, `{"statement":[]}`, body)
+		require.Equal(t, `{"Statement":[]}`, body)
 	})
 
 	t.Run("DELETE ?policy answers 204", func(t *testing.T) {
