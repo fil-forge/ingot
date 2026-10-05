@@ -60,7 +60,9 @@ func (s LocalBlobSweepStats) Removed() bool {
 // failed, blobs with no recorded location, young orphans), and it logs a
 // warning once until usage is back under budget. A failed upload's intent
 // stays spooled or uploading and nothing reclaims its file yet, so those
-// bytes count against the budget until an operator removes them.
+// bytes count against the budget until an operator removes them. The counts
+// see such a removal at the next restart, or at the next orphan pass that
+// runs while the directory is quiet.
 //
 // Eviction removes only the file. The intent keeps its row and state, marked
 // evicted: a session's release recognises a committed part blob by its
@@ -125,7 +127,7 @@ func (b *Backend) SweepLocalBlobs(ctx context.Context) (LocalBlobSweepStats, err
 	}
 	if b.lastOrphanPass.IsZero() || now.Sub(b.lastOrphanPass) >= orphanPassInterval {
 		orphanCtx, cancel := context.WithTimeout(ctx, orphanPassTimeLimit)
-		files, bytes, err := b.removeSpoolOrphans(orphanCtx, now)
+		files, bytes, err := b.removeOrphans(orphanCtx, now)
 		cancel()
 		stats.OrphanFiles, stats.OrphanBytes = files, bytes
 		b.localBlobMetrics.removed(ctx, removedOrphan, files, bytes)
@@ -228,21 +230,24 @@ func (b *Backend) evictToBudget(ctx context.Context, deadline time.Time) (pass b
 	return pass, nil
 }
 
-// removeSpoolOrphans deletes the files no intent-driven cleanup can find, once
+// removeOrphans deletes the files no intent-driven cleanup can find, once
 // they are older than the orphan age: .tmp-* files from a write that never
 // finished, and blob files with no intent row (a split that failed before
 // its intents were recorded), in the spool and the cache. The age must exceed
 // the longest time one request body takes to stream, because a request
 // records its intents only after its whole body is spooled. The scans take no
 // lock, so writes and moves go on meanwhile; a file found in the spool may have
-// moved to the cache by the time it is checked, which removeLocal handles. It
+// moved to the cache by the time it is checked, which removeLocal handles. A
+// scan that nothing in this process overlapped also corrects its directory's
+// byte count, which only a file added or removed outside ingot can throw off,
+// and logs the correction. It
 // checks the spool's blobs first, since they are few and a stray one may be the
 // cause of an over-budget spool, then the cache's in random order, so a pass
 // that runs out of time still covers a different part of a large cache each
 // hour. A file it cannot remove is skipped and the failures are logged once,
 // so one bad file does not stop the pass; only a failed scan or query does.
 // Ages are measured from now, the sweep's time.
-func (b *Backend) removeSpoolOrphans(ctx context.Context, now time.Time) (files, bytes int64, err error) {
+func (b *Backend) removeOrphans(ctx context.Context, now time.Time) (files, bytes int64, err error) {
 	var failed removeFailures
 	defer failed.log(b.logger, "orphan")
 	cutoff := now.Add(-b.localBlobOrphanAge)
@@ -264,11 +269,19 @@ func (b *Backend) removeSpoolOrphans(ctx context.Context, now time.Time) (files,
 		}
 	}
 	var inSpool, inCache found
-	if err := b.spool.Scan(ctx, collect(&inSpool)); err != nil {
-		return 0, 0, err
-	}
-	if err := b.cache.Scan(ctx, collect(&inCache)); err != nil {
-		return 0, 0, err
+	for _, dir := range []struct {
+		name string
+		scan func(context.Context, func(blockstore.BlobFile)) (int64, error)
+		into *found
+	}{{"spool", b.spool.ScanAndCorrect, &inSpool}, {"cache", b.cache.ScanAndCorrect, &inCache}} {
+		drift, err := dir.scan(ctx, collect(dir.into))
+		if err != nil {
+			return 0, 0, err
+		}
+		if drift != 0 {
+			b.logger.Warn("local blob "+dir.name+" byte count corrected: files were added or removed outside ingot",
+				zap.Int64("counted_minus_on_disk", drift))
+		}
 	}
 	for _, t := range []struct {
 		remove func(string) (int64, error)

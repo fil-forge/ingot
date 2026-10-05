@@ -139,6 +139,7 @@ type Deps struct {
 	// Spool is where SplitBody writes body blobs on PUT and where each waits
 	// until the provider holds it; Cache then holds it as a read-after-write
 	// copy until it is evicted. Reads serves both (blockstore.LocalBlobs).
+	// Both are required.
 	Spool *blockstore.Spool
 	Cache *blockstore.BlobCache
 
