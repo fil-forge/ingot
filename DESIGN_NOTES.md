@@ -300,7 +300,10 @@ draws the chains and the stores.
   against `blob_refs` after a crash between commit and reconcile is a later
   phase; the window leaks rather than loses referenced data. (Files with no
   intent row at all, and unfinished `.tmp-*` writes, are reclaimed by the
-  spool sweeper's orphan pass.)
+  spool sweeper's orphan pass.) Nor is a failed upload's spool file
+  reclaimed: its intent stays `spooled` or `uploading`, so neither eviction
+  nor the orphan pass may take it, and with `spool_max_bytes` set its bytes
+  count against the budget until an operator removes it.
 - **No catalog GC**: `gc_candidates` is write-only; superseded MST nodes
   accumulate on Forge with mutation volume.
 - **Reads carry no bucket context**: `Manager.Get` linear-scans every open

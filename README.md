@@ -178,6 +178,9 @@ intent, once they are older than `spool_orphan_age` (default `24h`, at least
   bodies to make room for them. But a body cannot itself be evicted until its
   upload finishes, so if the bodies in flight alone exceed the budget, usage
   runs over it by the difference;
+- the bodies of uploads that failed: their upload intents stay `spooled` or
+  `uploading`, nothing reclaims those files yet, and they count against the
+  budget until removed by hand;
 - the catalog log, if it shares the filesystem: `<data_dir>/segments`, per
   bucket about (`retain` + the open and unshipped segments) × `seal_bytes`.
 
