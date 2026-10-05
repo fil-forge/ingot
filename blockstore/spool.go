@@ -29,7 +29,8 @@ import (
 // a cache that fills on reads is undecided and unbuilt, not ruled out.
 //
 // Spool is deliberately pure file I/O: a blockstore.BlockReader plus the
-// streaming BlobReader/BlobWriter, plus a running byte count of its files. It knows a blob only as bytes under a digest. Whether a blob may be
+// streaming BlobReader/BlobWriter, plus a running byte count of its files.
+// It knows a blob only as bytes under a digest. Whether a blob may be
 // removed depends on what refers to it — its upload state, the objects and
 // multipart sessions that use it, and whether the provider holds it — and
 // that is the S3 layer's model (s3frontend over registry), so that layer

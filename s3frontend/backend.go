@@ -166,9 +166,9 @@ type Deps struct {
 	ReleaseGrace time.Duration
 
 	// SpoolMaxBytes is the byte budget for the spool's files, writes in
-	// progress included, enforced by SweepSpool. Zero turns the budget pass off: eviction needs a
-	// network read tier to serve evicted blobs, which the in-memory fakes do
-	// not have.
+	// progress included, enforced by SweepSpool. Zero turns the budget pass
+	// off: eviction needs a network read tier to serve evicted blobs, which
+	// the in-memory fakes do not have.
 	SpoolMaxBytes int64
 	// SpoolOrphanAge is the age at which SweepSpool deletes a .tmp-* file or
 	// a blob file with no intent row. Zero → DefaultSpoolOrphanAge.
