@@ -51,7 +51,8 @@ type ServerConfig struct {
 
 	// ReleaseGrace delays each blob release this long past the drop of its
 	// last reference claim, so in-flight readers of the prior catalog root
-	// finish first. Config.ServerConfig() applies the 60s default; zero here
+	// finish first; a reader still streaming when it ends fails at its next
+	// blob. Config.ServerConfig() applies the 60s default; zero here
 	// means releases are due immediately.
 	ReleaseGrace time.Duration
 
