@@ -190,8 +190,8 @@ func TestNewSpoolReopen(t *testing.T) {
 	}
 }
 
-// TestSpoolScan: Scan reports blob files and .tmp-* files, and resets the
-// finished count to the blob files alone.
+// TestSpoolScan: Scan reports blob files and .tmp-* files and leaves the count
+// alone; count resets the finished count to the blob files alone.
 func TestSpoolScan(t *testing.T) {
 	s := newTestSpool(t)
 	d := writeTestBlob(t, s, "hello")
@@ -200,17 +200,21 @@ func TestSpoolScan(t *testing.T) {
 	}
 	s.usage.Store(999)
 	seen := map[string]bool{}
-	if err := s.Scan(func(f BlobFile) { seen[f.Name] = f.Digest != nil }); err != nil {
+	if err := s.Scan(t.Context(), func(f BlobFile) { seen[f.Name] = f.Digest != nil }); err != nil {
 		t.Fatalf("Scan: %v", err)
 	}
+	afterScan := s.Usage()
+	if err := s.count(func(BlobFile) {}); err != nil {
+		t.Fatalf("count: %v", err)
+	}
 	got := struct {
-		Usage int64
-		Seen  map[string]bool
-	}{s.Usage(), seen}
+		AfterScan, AfterCount int64
+		Seen                  map[string]bool
+	}{afterScan, s.Usage(), seen}
 	want := struct {
-		Usage int64
-		Seen  map[string]bool
-	}{5, map[string]bool{filepath.Base(s.Path(d)): true, ".tmp-abc": false}}
+		AfterScan, AfterCount int64
+		Seen                  map[string]bool
+	}{999, 5, map[string]bool{filepath.Base(s.Path(d)): true, ".tmp-abc": false}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("Scan = %+v, want %+v", got, want)
 	}

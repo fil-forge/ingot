@@ -3,12 +3,9 @@ package blockstore
 import (
 	"context"
 	"crypto/sha256"
-	"errors"
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
-	"strings"
 	"sync/atomic"
 
 	mh "github.com/multiformats/go-multihash"
@@ -63,11 +60,12 @@ func NewSpool(dir string) (*Spool, error) {
 // leftover .tmp-* file it can (a write the previous process never finished;
 // nothing can be writing one before the listener starts) and counts the blob
 // files. A leftover it cannot delete is left for the sweeper's orphan pass,
-// which retries and logs it, rather than failing startup. Entries that are
+// which retries and logs it, rather than failing startup; until then its
+// bytes are in no count. Entries that are
 // neither, such as lost+found on a dedicated filesystem, are ignored.
 func (s *Spool) recoverDir() error {
 	var temps []string
-	if err := s.Scan(func(f BlobFile) {
+	if err := s.count(func(f BlobFile) {
 		if f.Digest == nil {
 			temps = append(temps, f.Name)
 		}
@@ -91,40 +89,14 @@ func (s *Spool) InFlight() int64 {
 	return s.inFlight.Load()
 }
 
-// RemoveTemp deletes one .tmp-* file by name and returns its size. Idempotent.
-// It refuses any other name, so it cannot be used to delete a finished blob.
-// It leaves the in-flight count alone: only an abandoned write's file is safe
-// to remove, and a write that is still live takes its own bytes off when it
-// fails.
-func (s *Spool) RemoveTemp(name string) (int64, error) {
-	if !strings.HasPrefix(name, spoolTempPrefix) || filepath.Base(name) != name {
-		return 0, fmt.Errorf("blockstore: spool remove temp: %q is not a spool temp file", name)
-	}
-	path := filepath.Join(s.dir, name)
-	info, err := os.Stat(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return 0, nil
-	}
-	if err != nil {
-		return 0, fmt.Errorf("blockstore: spool remove temp: %w", err)
-	}
-	err = os.Remove(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return 0, nil
-	}
-	if err != nil {
-		return 0, fmt.Errorf("blockstore: spool remove temp: %w", err)
-	}
-	return info.Size(), nil
-}
-
 // WriteBlob streams r to the spool, computing its sha256 digest as it writes so
 // the blob is never held whole in memory (object-body blobs run up to
 // max_blob_size ≈ 254 MiB; buffering them would put that × concurrency in RAM).
 // The write is atomic (temp file → rename to the digest path), so a crash leaves
 // no partial blob readable under its digest. Each byte counts as in flight as
 // it is written; the rename moves the bytes to the finished count, and a failed
-// write takes them off. An empty r writes nothing and returns a nil digest with
+// write takes them off. A failed write's temp file that cannot be deleted is
+// in no count until the sweeper's orphan pass removes it. An empty r writes nothing and returns a nil digest with
 // n == 0 (a zero-byte object has no blob). Re-writing an identical blob is
 // idempotent (same digest, rename overwrites in place).
 func (s *Spool) WriteBlob(_ context.Context, r io.Reader) (mh.Multihash, int64, error) {

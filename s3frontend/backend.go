@@ -86,10 +86,12 @@ type Backend struct {
 	localBlobSweepMu    sync.Mutex
 	lastOrphanPass      time.Time
 	localBlobSweepBatch int
-	// overBudgetWarned is set once the sweeper has warned that usage is over
-	// budget with nothing left to evict, and cleared when usage is back
-	// under, so the warning comes once per episode. Guarded by localBlobSweepMu.
+	// overBudgetWarned and timeLimitLogged are set once the sweeper has
+	// logged that usage is over budget with nothing left to evict, or that
+	// the budget pass ran out of time, and cleared when usage is back under,
+	// so each message comes once per episode. Guarded by localBlobSweepMu.
 	overBudgetWarned bool
+	timeLimitLogged  bool
 	// regionKeys unwraps region-wrapped CEKs for the decrypting read path.
 	regionKeys regionkey.Provider
 	// tenantKeys yields the tenant wrap key each write encrypts to (the FEE

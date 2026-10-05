@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -89,8 +90,8 @@ func TestLocalBlobsReadsEitherDirectory(t *testing.T) {
 	}
 }
 
-// TestScanKeepsCountsExact: scans racing writes, moves and removes leave each
-// count equal to the bytes actually in its directory.
+// TestScanKeepsCountsExact: recounts and scans racing writes, moves and
+// removes leave each count equal to the bytes actually in its directory.
 func TestScanKeepsCountsExact(t *testing.T) {
 	ctx := t.Context()
 	s, c := newTestDirs(t)
@@ -129,8 +130,10 @@ func TestScanKeepsCountsExact(t *testing.T) {
 				return
 			default:
 			}
-			_ = s.Scan(func(BlobFile) {})
-			_ = c.Scan(func(BlobFile) {})
+			_ = s.count(func(BlobFile) {})
+			_ = c.count(func(BlobFile) {})
+			_ = s.Scan(ctx, func(BlobFile) {})
+			_ = c.Scan(ctx, func(BlobFile) {})
 		}
 	}()
 	wg.Wait()
@@ -139,7 +142,7 @@ func TestScanKeepsCountsExact(t *testing.T) {
 
 	measure := func(d *blobDir) int64 {
 		var total int64
-		if err := d.Scan(func(f BlobFile) {
+		if err := d.Scan(ctx, func(f BlobFile) {
 			if f.Digest != nil {
 				total += f.Size
 			}
@@ -151,5 +154,30 @@ func TestScanKeepsCountsExact(t *testing.T) {
 	counted := fmt.Sprint(s.Usage(), c.Usage(), s.InFlight())
 	if actual := fmt.Sprint(measure(s.blobDir), measure(c.blobDir), 0); counted != actual {
 		t.Fatalf("spool cache in-flight counted = %s, on disk = %s", counted, actual)
+	}
+}
+
+// TestBlobCacheCheckTake: the probe moves between directories on one
+// filesystem and leaves nothing behind; a cache it cannot move into is an
+// error.
+func TestBlobCacheCheckTake(t *testing.T) {
+	s, c := newTestDirs(t)
+	if err := c.CheckTake(s); err != nil {
+		t.Fatalf("CheckTake: %v", err)
+	}
+	for _, dir := range []string{s.dir, c.dir} {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(entries) != 0 {
+			t.Fatalf("%s holds %d entries after the probe, want none", dir, len(entries))
+		}
+	}
+	if err := os.Remove(c.dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.CheckTake(s); err == nil {
+		t.Fatal("CheckTake into a missing cache directory: want an error")
 	}
 }
