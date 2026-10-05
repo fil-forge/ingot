@@ -13,10 +13,10 @@ import (
 )
 
 // TestForgeReadAfterEviction proves the appliance read tier: after the local
-// spool is wiped, a GET must re-fetch the object's body blobs from piri by
+// blob copies are wiped, a GET must re-fetch the object's body blobs from piri by
 // resolving their location from the local blob_locations table
 // (registry.LocalLocator) and issuing a /content/retrieve — not from
-// read-after-write. Body blobs live only in the spool; the manifest/MST live
+// read-after-write. Body blobs live only in the spool and cache; the manifest/MST live
 // in the catalog log and survive the wipe, so only the body read exercises
 // the network tier.
 //
@@ -46,10 +46,10 @@ func TestForgeReadAfterEviction(t *testing.T) {
 		t.Fatalf("put object: %v", err)
 	}
 
-	// Wipe the local spool so the next GET cannot read-after-write — its body
-	// blobs must be re-fetched from piri.
-	if out, errOut, err := s.Exec(ctx, "ingot", "sh", "-c", "rm -rf /data/spool"); err != nil {
-		t.Fatalf("evict spool: %v (stdout=%s stderr=%s)", err, out, errOut)
+	// Wipe the local blob copies (spool and cache) so the next GET cannot
+	// read-after-write — its body blobs must be re-fetched from piri.
+	if out, errOut, err := s.Exec(ctx, "ingot", "sh", "-c", "rm -rf /data/spool /data/cache"); err != nil {
+		t.Fatalf("wipe local blob copies: %v (stdout=%s stderr=%s)", err, out, errOut)
 	}
 
 	got, err := ingottest.GetBytes(ctx, cfg, bucket, key)
@@ -62,18 +62,19 @@ func TestForgeReadAfterEviction(t *testing.T) {
 	t.Logf("read-after-eviction OK: %d bytes re-fetched from piri via the local locator", len(got))
 }
 
-// TestForgeSpoolBudget proves the spool sweeper: with a 4 MiB spool_max_bytes
-// and both retention windows off (testdata/config-spoolbudget.yaml), 16 MiB
-// of objects are evicted down to the budget within a few sweeps, at least 12
-// of their blobs are marked evicted (so their reads must go to piri), and
-// every object then reads back byte-exact.
+// TestForgeLocalBlobBudget proves the local blob sweeper: with a 4 MiB
+// local_blob_max_bytes and both retention windows off
+// (testdata/config-localblobbudget.yaml), 16 MiB of objects are evicted down
+// to the budget within a few sweeps, at least 12 of their blobs are marked
+// evicted (so their reads must go to piri), and every object then reads back
+// byte-exact.
 //
-//	go test -tags itest ./itest -run TestForgeSpoolBudget -v -timeout 900s
-func TestForgeSpoolBudget(t *testing.T) {
+//	go test -tags itest ./itest -run TestForgeLocalBlobBudget -v -timeout 900s
+func TestForgeLocalBlobBudget(t *testing.T) {
 	ctx := t.Context()
 
-	s, ingotEndpoint := forgeStack(t, withSpoolBudgetConfig())
-	accessKey, secretKey := hiltProvisionTenant(t, ctx, s, "spoolbudget")
+	s, ingotEndpoint := forgeStack(t, withLocalBlobBudgetConfig())
+	accessKey, secretKey := hiltProvisionTenant(t, ctx, s, "localblobbudget")
 	cfg := forgeConfig(ingotEndpoint, accessKey, secretKey)
 	const bucket = "budget-bucket"
 	const budget = 4 << 20
@@ -96,13 +97,13 @@ func TestForgeSpoolBudget(t *testing.T) {
 
 	deadline := time.Now().Add(2 * time.Minute)
 	for {
-		used := spoolBytes(t, ctx, s)
+		used := localBlobBytes(t, ctx, s)
 		if used <= budget {
-			t.Logf("spool usage %d bytes, within the %d-byte budget", used, budget)
+			t.Logf("local blob usage %d bytes, within the %d-byte budget", used, budget)
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("spool usage %d bytes still over the %d-byte budget after 2 minutes", used, budget)
+			t.Fatalf("local blob usage %d bytes still over the %d-byte budget after 2 minutes", used, budget)
 		}
 		time.Sleep(5 * time.Second)
 	}

@@ -81,10 +81,10 @@ A write splits into two paths:
   `forge_root_cid` under a guard. See
   [`logstore/README.md`](./logstore/README.md).
 
-Reads fall through tiers: the spool, the local log (catalog blocks), and
-finally the network, resolved by a local locator (`blob_locations` +
-`shard_inclusions`) and fetched with a ranged `content/retrieve` against the
-storing piri. The two routes are drawn side by side in
+Reads fall through tiers: local disk (cache, then spool), the local log
+(catalog blocks), and finally the network, resolved by a local locator
+(`blob_locations` + `shard_inclusions`) and fetched with a ranged
+`content/retrieve` against the storing piri. The two routes are drawn side by side in
 [`docs/diagrams.md`](./docs/diagrams.md#two-block-routes-body-blobs-and-catalog-blocks).
 
 ## Running it
@@ -139,63 +139,71 @@ library, ingot records them on the global meter provider.
 
 ### Local disk
 
-`serve` writes every object body to `<data_dir>/spool` as it uploads it, and
-keeps that copy so a read soon after a write is served from local disk. The
-copy is not needed once the provider holds the body:
+`serve` keeps object bodies in two directories under `data_dir`, on one
+filesystem:
 
-- a deleted or overwritten object's copies go when its release runs
-  (`release_grace`, default 60s, after its last reference drops);
-- a multipart part's copy goes as soon as the part parks on its provider;
-- with `spool_max_bytes` set, a sweeper checks every 30 seconds and, when the
-  spool is over the budget, evicts bodies the provider holds, oldest first,
-  down to 90% of the budget. Later reads of an evicted body go to the
+- `<data_dir>/spool` holds each body as it is written and uploaded, until
+  the provider holds it;
+- `<data_dir>/cache` holds a body once the provider holds it (it moves there
+  by rename), so a read soon after a write is served from local disk.
+
+A cached copy is not needed, so it goes:
+
+- when a deleted or overwritten object's release runs (`release_grace`,
+  default 60s, after its last reference drops);
+- with `local_blob_max_bytes` set, when a sweeper, checking every 30 seconds,
+  finds the two directories over the budget and evicts cached bodies, oldest
+  first, down to 90% of the budget. Later reads of an evicted body go to the
   provider and take provider-read latency.
 
-Two windows keep bodies local while the budget allows:
-`spool_min_residency` (default `10m`) passes over bodies whose upload changed
+Two windows keep cached bodies local while the budget allows:
+`cache_min_residency` (default `10m`) passes over bodies whose upload changed
 state that recently (for a committed object, its commit), so a client reading
-back what it just wrote reads from disk, and `spool_read_retention` (default
-`1h`) passes over bodies read from the spool that recently. If usage is still
+back what it just wrote reads from disk, and `cache_read_retention` (default
+`1h`) passes over bodies read from the cache that recently. If usage is still
 over budget after that, the sweeper evicts inside both windows, oldest first:
 a full disk fails every write. `0s` turns either window off.
 
-The budget is off by default (`spool_max_bytes: 0`): without it the spool
-grows with every live object's bodies. With or without a budget, the sweeper
-also deletes, hourly, unfinished `.tmp-*` writes and files with no upload
-intent, once they are older than `spool_orphan_age` (default `24h`, at least
-`1h`).
+A multipart part's copy goes from the spool as soon as the part parks on its
+provider. The budget is off by default (`local_blob_max_bytes: 0`): without
+it the cache grows with every live object's bodies. With or without a
+budget, the sweeper also deletes, hourly, unfinished `.tmp-*` writes and
+files with no upload intent, in either directory, once they are older than
+`local_blob_orphan_age` (default `24h`, at least `1h`).
 
-**Sizing.** The spool's filesystem needs room for:
+**Sizing.** The filesystem needs room for:
 
-- `spool_max_bytes`, plus 10% headroom that must exceed the ingest rate × 30
-  seconds (60 GB at 2 GB/s). To evict outside `spool_min_residency`, the
-  budget must also exceed the ingest rate × the window (1.2 TB at 2 GB/s for
-  the default `10m`); below that, every sweep evicts inside the window and
-  logs a warning;
-- the bodies in flight, when they outgrow the budget: each concurrent PUT or
-  UploadPart writes its body as it streams, and a part can be up to 5 GiB.
-  The budget counts those bytes as they land, so the sweeper evicts cached
-  bodies to make room for them. But a body cannot itself be evicted until its
-  upload finishes, so if the bodies in flight alone exceed the budget, usage
-  runs over it by the difference;
+- `local_blob_max_bytes`, plus 10% headroom that must exceed the ingest rate
+  × 30 seconds (60 GB at 2 GB/s). To evict outside `cache_min_residency`,
+  the budget must also exceed the ingest rate × the window (1.2 TB at 2 GB/s
+  for the default `10m`); below that, sweeps evict inside the window and log
+  a warning;
+- the spool's bodies in flight, when they outgrow the budget: each
+  concurrent PUT or UploadPart writes its body as it streams, and a part can
+  be up to 5 GiB. The budget counts those bytes as they land, so the sweeper
+  evicts cached bodies to make room for them. But a body cannot be evicted
+  until the provider holds it, so if the spool alone exceeds the budget,
+  usage runs over it by the difference;
 - the bodies of uploads that failed: their upload intents stay `spooled` or
-  `uploading`, nothing reclaims those files yet, and they count against the
-  budget until removed by hand;
+  `uploading`, nothing reclaims those spool files yet, and they count against
+  the budget until removed by hand;
 - the catalog log, if it shares the filesystem: `<data_dir>/segments`, per
   bucket about (`retain` + the open and unshipped segments) × `seal_bytes`.
 
-**Metrics.** With metrics on, the spool reports:
+**Metrics.** With metrics on, local blob storage reports:
 
 | Metric | Meaning |
 | -- | -- |
-| `ingot.spool.usage` | Bytes held by the spool's files, writes in progress included |
-| `ingot.spool.budget` | `spool_max_bytes` (0: no budget) |
-| `ingot.spool.evictions`, `ingot.spool.evicted` | Files and bytes removed, by `reason`: `released`, `parked`, `budget`, `budget_forced` (inside a retention window), `orphan` |
-| `ingot.spool.reads` | Body-blob reads, by `tier`: `spool` or `network` (the spool's hit ratio) |
+| `ingot.local_blobs.usage` | Bytes held, by `dir`: `spool` (writes in progress and bodies awaiting upload, which eviction cannot touch) or `cache` |
+| `ingot.local_blobs.budget` | `local_blob_max_bytes` (0: no budget) |
+| `ingot.local_blobs.removals`, `ingot.local_blobs.removed_bytes` | Files and bytes removed, by `reason`: `released`, `parked`, `budget`, `budget_forced` (inside a retention window), `orphan` |
+| `ingot.local_blobs.reads` | Body-blob reads, by `tier`: `local` or `network` (the local hit ratio) |
 
-**Manual cleanup.** Whether a spool file is safe to delete is not visible on
-the filesystem. A file is safe to delete once the provider holds its body,
-which this query lists (the file names are the hex digests):
+**Manual cleanup.** Every file in `<data_dir>/cache` is safe to delete: the
+provider holds its body. A file in `<data_dir>/spool` may be the only copy.
+The one kind safe to delete is a body the provider already holds, left in
+the spool by an interrupted move; this query lists those (the file names are
+the hex digests):
 
 ```sql
 SELECT encode(i.digest, 'hex') FROM ingot.upload_intents i
@@ -203,8 +211,8 @@ WHERE i.state IN ('accepted', 'published')
   AND EXISTS (SELECT 1 FROM ingot.blob_locations l WHERE l.digest = i.digest);
 ```
 
-Never delete the file of a `spooled` or `uploading` intent: it may be the only
-copy.
+Never delete the spool file of a `spooled` or `uploading` intent: it may be
+the only copy.
 
 ## Build & test
 

@@ -97,7 +97,7 @@ type Config struct {
 	MultipartSessionTTL string `mapstructure:"multipart_session_ttl" yaml:"multipart_session_ttl"`
 
 	// ReleaseGrace delays each blob release (crypto-shred + location delete +
-	// network remove + spool-copy removal) this long past the drop of its
+	// network remove + local-copy removal) this long past the drop of its
 	// last reference claim (Go duration string), so in-flight readers holding
 	// the prior catalog root finish first. It bounds how long such a reader
 	// may take: a GET, or a copy reading the object as its source, still
@@ -107,32 +107,35 @@ type Config struct {
 	// immediately.
 	ReleaseGrace string `mapstructure:"release_grace" yaml:"release_grace"`
 
-	// SpoolMaxBytes is the byte budget for the local spool's files
-	// (<data_dir>/spool), counting the bytes of writes still in progress. A
-	// sweeper checks it every 30 seconds and evicts blobs the provider
-	// already holds, oldest first, down to 90% of the budget; reads of an
-	// evicted blob go to the provider. Usage can exceed the budget by ingest
-	// rate × 30 seconds between sweeps, and by files that must stay (writes
-	// in progress, blobs not yet accepted, orphans younger than
-	// SpoolOrphanAge). 0 → no budget (the default); negative is an error.
-	SpoolMaxBytes int64 `mapstructure:"spool_max_bytes" yaml:"spool_max_bytes"`
-	// SpoolMinResidency is the read-after-write window (Go duration string):
-	// the sweeper leaves alone a blob whose upload state changed less than
-	// this long ago (for a committed blob, its commit time) unless usage
+	// LocalBlobMaxBytes is the byte budget for local blob storage: the spool
+	// (<data_dir>/spool: writes in progress, counted as their bytes land, and
+	// bodies waiting for upload) plus the cache (<data_dir>/cache: copies of
+	// bodies the provider holds). It does not cover the catalog log. A
+	// sweeper checks it every 30 seconds and evicts cached blobs, oldest
+	// first, down to 90% of the budget; reads of an evicted blob go to the
+	// provider. Usage can exceed the budget by ingest rate × 30 seconds
+	// between sweeps, and by files that must stay (the spool's, and orphans
+	// younger than LocalBlobOrphanAge). 0 → no budget (the default); negative
+	// is an error.
+	LocalBlobMaxBytes int64 `mapstructure:"local_blob_max_bytes" yaml:"local_blob_max_bytes"`
+	// CacheMinResidency is the read-after-write window (Go duration string):
+	// the sweeper leaves alone a cached blob whose upload state changed less
+	// than this long ago (for a committed blob, its commit time) unless usage
 	// stays over budget without it. Costs ingest rate × residency in disk.
 	// Empty → default 10m; "0s" turns it off; negative is an error.
-	SpoolMinResidency string `mapstructure:"spool_min_residency" yaml:"spool_min_residency"`
-	// SpoolReadRetention is the read-cache window (Go duration string): the
-	// sweeper leaves alone a blob served from the spool within this long,
+	CacheMinResidency string `mapstructure:"cache_min_residency" yaml:"cache_min_residency"`
+	// CacheReadRetention is the read-cache window (Go duration string): the
+	// sweeper leaves alone a blob served from the cache within this long,
 	// unless usage stays over budget without it. Empty → default 1h; "0s"
 	// turns it off; negative is an error.
-	SpoolReadRetention string `mapstructure:"spool_read_retention" yaml:"spool_read_retention"`
-	// SpoolOrphanAge is the age (file modification time) at which the
-	// sweeper deletes a .tmp-* file or a spool file with no upload intent
-	// (Go duration string), hourly, whether or not a budget is set. It must
+	CacheReadRetention string `mapstructure:"cache_read_retention" yaml:"cache_read_retention"`
+	// LocalBlobOrphanAge is the age (file modification time) at which the
+	// sweeper deletes a .tmp-* file, or a blob file in the spool or the cache
+	// with no upload intent (Go duration string), hourly, whether or not a
+	// budget is set. It must
 	// exceed the longest time one request body takes to stream. Empty →
 	// default 24h; under 1h is an error.
-	SpoolOrphanAge string `mapstructure:"spool_orphan_age" yaml:"spool_orphan_age"`
+	LocalBlobOrphanAge string `mapstructure:"local_blob_orphan_age" yaml:"local_blob_orphan_age"`
 
 	// CatalogPlane overrides the catalog logstore pipeline knobs. Any field
 	// left zero/unset falls back to the top-level SealBytes / SealAge / Retain
@@ -214,23 +217,23 @@ func (c Config) ServerConfig() (ServerConfig, error) {
 			releaseGrace = 0
 		}
 	}
-	spoolMinResidency, err := parseSpoolWindow("spool_min_residency", c.SpoolMinResidency, 10*time.Minute)
+	cacheMinResidency, err := parseDurationKnob("cache_min_residency", c.CacheMinResidency, 10*time.Minute)
 	if err != nil {
 		return ServerConfig{}, err
 	}
-	spoolReadRetention, err := parseSpoolWindow("spool_read_retention", c.SpoolReadRetention, time.Hour)
+	cacheReadRetention, err := parseDurationKnob("cache_read_retention", c.CacheReadRetention, time.Hour)
 	if err != nil {
 		return ServerConfig{}, err
 	}
-	spoolOrphanAge, err := parseSpoolWindow("spool_orphan_age", c.SpoolOrphanAge, 24*time.Hour)
+	localBlobOrphanAge, err := parseDurationKnob("local_blob_orphan_age", c.LocalBlobOrphanAge, 24*time.Hour)
 	if err != nil {
 		return ServerConfig{}, err
 	}
-	if spoolOrphanAge < time.Hour {
-		return ServerConfig{}, fmt.Errorf("ingot: spool_orphan_age %q: must be at least 1h, longer than any request body takes to stream", c.SpoolOrphanAge)
+	if localBlobOrphanAge < time.Hour {
+		return ServerConfig{}, fmt.Errorf("ingot: local_blob_orphan_age %q: must be at least 1h, longer than any request body takes to stream", c.LocalBlobOrphanAge)
 	}
-	if c.SpoolMaxBytes < 0 {
-		return ServerConfig{}, fmt.Errorf("ingot: spool_max_bytes %d: must not be negative (0 means no budget)", c.SpoolMaxBytes)
+	if c.LocalBlobMaxBytes < 0 {
+		return ServerConfig{}, fmt.Errorf("ingot: local_blob_max_bytes %d: must not be negative (0 means no budget)", c.LocalBlobMaxBytes)
 	}
 	// Render the CORS configuration here — the single place it is built —
 	// so a typo fails at startup (via Validate) rather than from New.
@@ -257,16 +260,16 @@ func (c Config) ServerConfig() (ServerConfig, error) {
 		MultipartSessionTTL: mpTTL,
 		ReleaseGrace:        releaseGrace,
 
-		SpoolMaxBytes:      c.SpoolMaxBytes,
-		SpoolMinResidency:  spoolMinResidency,
-		SpoolReadRetention: spoolReadRetention,
-		SpoolOrphanAge:     spoolOrphanAge,
+		LocalBlobMaxBytes:  c.LocalBlobMaxBytes,
+		CacheMinResidency:  cacheMinResidency,
+		CacheReadRetention: cacheReadRetention,
+		LocalBlobOrphanAge: localBlobOrphanAge,
 	}, nil
 }
 
-// parseSpoolWindow parses one of the spool duration knobs: empty takes def,
+// parseDurationKnob parses a duration knob: empty takes def,
 // negative is an error.
-func parseSpoolWindow(name, value string, def time.Duration) (time.Duration, error) {
+func parseDurationKnob(name, value string, def time.Duration) (time.Duration, error) {
 	if value == "" {
 		return def, nil
 	}

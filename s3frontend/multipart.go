@@ -1099,6 +1099,7 @@ func (b *Backend) parkBlob(ctx context.Context, space did.DID, blob msbucket.Blo
 		if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentAccepted); err != nil {
 			return fmt.Errorf("mark accepted (dedup): %w", err)
 		}
+		b.cacheHeld(blob.Digest)
 		// A located blob has no use for a park. One is still here only
 		// when an earlier Complete recorded the location and then failed
 		// before dropping the row. The part is durable regardless, so a
@@ -1151,6 +1152,7 @@ func (b *Backend) parkBlob(ctx context.Context, space did.DID, blob msbucket.Blo
 		if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentAccepted); err != nil {
 			return fmt.Errorf("mark accepted: %w", err)
 		}
+		b.cacheHeld(blob.Digest)
 		return nil
 	}
 	// Location == nil ⇔ parked: durable on the provider with accept
@@ -1212,13 +1214,13 @@ func (b *Backend) recordStreamedPark(ctx context.Context, blob msbucket.BlobRef,
 // expires, its object's once Complete commits it. A failure to mark the
 // intent evicted only leaves the sweeper to find the file gone and mark it.
 func (b *Backend) dropParkedCopy(ctx context.Context, digest mh.Multihash) {
-	freed, err := b.spool.Remove(digest)
+	freed, err := b.removeLocal(digest)
 	if err != nil {
 		b.logger.Warn("drop parked blob's spool copy failed; it stays until the spool sweeper evicts it or the blob's release",
 			zap.String("digest", hex.EncodeToString(digest)), zap.Error(err))
 		return
 	}
-	b.spoolMetrics.removedFile(ctx, spoolRemovedParked, freed)
+	b.localBlobMetrics.removedFile(ctx, removedParked, freed)
 	if err := b.intents.MarkEvicted(ctx, digest); err != nil && !errors.Is(err, registry.ErrNotFound) {
 		b.logger.Warn("mark parked blob evicted failed",
 			zap.String("digest", hex.EncodeToString(digest)), zap.Error(err))
@@ -1258,6 +1260,7 @@ func (b *Backend) concludeBlobs(ctx context.Context, space did.DID, blobs []msbu
 			if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentAccepted); err != nil {
 				return fmt.Errorf("mark accepted (dedup): %w", err)
 			}
+			b.cacheHeld(blob.Digest)
 			// A located blob has no use for a park. One is still here only
 			// when an earlier Complete recorded the location and then failed
 			// before marking the intent or dropping the row; this is where
@@ -1385,6 +1388,7 @@ func (b *Backend) recordAccepted(ctx context.Context, space did.DID, digest mh.M
 	if err := b.intents.SetIntentState(ctx, digest, registry.IntentAccepted); err != nil {
 		return fmt.Errorf("mark accepted: %w", err)
 	}
+	b.cacheHeld(digest)
 	return nil
 }
 

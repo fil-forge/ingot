@@ -178,12 +178,12 @@ func withMultipartTTLConfig() stack.Option {
 	return stack.WithServiceConfig("ingot", "testdata/config-mpttl.yaml")
 }
 
-// withSpoolBudgetConfig mounts testdata/config-spoolbudget.yaml — a 4 MiB
-// spool_max_bytes with the residency and read-retention windows off, so the
-// spool sweeper evicts within a test's budget. Dedicated stacks only: other
-// tests read envelopes back from the spool.
-func withSpoolBudgetConfig() stack.Option {
-	return stack.WithServiceConfig("ingot", "testdata/config-spoolbudget.yaml")
+// withLocalBlobBudgetConfig mounts testdata/config-localblobbudget.yaml — a
+// 4 MiB local_blob_max_bytes with the residency and read-retention windows
+// off, so the local blob sweeper evicts within a test's budget. Dedicated
+// stacks only: other tests read envelopes back from local disk.
+func withLocalBlobBudgetConfig() stack.Option {
+	return stack.WithServiceConfig("ingot", "testdata/config-localblobbudget.yaml")
 }
 
 // ingotSQL runs one SQL statement against ingot's Postgres and returns the
@@ -425,13 +425,13 @@ func newIntentDigests(before, after map[string]int64) []string {
 	return added
 }
 
-// spoolBlobCount counts the body blobs in the ingot container's spool,
-// ignoring in-progress temp files. Used to prove object bodies are spooled by
+// localBlobCount counts the body blobs in the ingot container's spool and
+// cache, ignoring in-progress temp files. Used to prove object bodies are spooled by
 // digest (the data-plane inversion), not journaled into the log.
-func spoolBlobCount(t *testing.T, ctx context.Context, s *stack.Stack) int {
+func localBlobCount(t *testing.T, ctx context.Context, s *stack.Stack) int {
 	t.Helper()
 	out, errOut, err := s.Exec(ctx, "ingot", "sh", "-c",
-		`find /data/spool -maxdepth 1 -type f ! -name '.tmp*' 2>/dev/null | wc -l`)
+		`find /data/spool /data/cache -maxdepth 1 -type f ! -name '.tmp*' 2>/dev/null | wc -l`)
 	if err != nil {
 		t.Fatalf("count spool blobs: %v (stderr=%s)", err, errOut)
 	}
@@ -442,12 +442,12 @@ func spoolBlobCount(t *testing.T, ctx context.Context, s *stack.Stack) int {
 	return n
 }
 
-// spoolBytes sums the sizes of the body blobs in the ingot container's spool,
-// ignoring in-progress temp files.
-func spoolBytes(t *testing.T, ctx context.Context, s *stack.Stack) int64 {
+// localBlobBytes sums the sizes of the body blobs in the ingot container's
+// spool and cache, ignoring in-progress temp files.
+func localBlobBytes(t *testing.T, ctx context.Context, s *stack.Stack) int64 {
 	t.Helper()
 	out, errOut, err := s.Exec(ctx, "ingot", "sh", "-c",
-		`find /data/spool -maxdepth 1 -type f ! -name '.tmp*' -printf '%s\n' 2>/dev/null`)
+		`find /data/spool /data/cache -maxdepth 1 -type f ! -name '.tmp*' -printf '%s\n' 2>/dev/null`)
 	if err != nil {
 		t.Fatalf("list spool sizes: %v (stderr=%s)", err, errOut)
 	}
@@ -462,14 +462,14 @@ func spoolBytes(t *testing.T, ctx context.Context, s *stack.Stack) int64 {
 	return total
 }
 
-// spoolBlobPaths lists the body-blob files in the ingot container's spool
-// (full paths, in-progress temp files excluded). Diffing two listings around
+// localBlobPaths lists the body-blob files in the ingot container's spool and
+// cache (full paths, in-progress temp files excluded). Diffing two listings around
 // a PUT identifies the envelope(s) that PUT spooled — the filename is the
 // ciphertext digest, so it cannot be computed from the plaintext.
-func spoolBlobPaths(t *testing.T, ctx context.Context, s *stack.Stack) map[string]bool {
+func localBlobPaths(t *testing.T, ctx context.Context, s *stack.Stack) map[string]bool {
 	t.Helper()
 	out, errOut, err := s.Exec(ctx, "ingot", "sh", "-c",
-		`find /data/spool -maxdepth 1 -type f ! -name '.tmp*' 2>/dev/null`)
+		`find /data/spool /data/cache -maxdepth 1 -type f ! -name '.tmp*' 2>/dev/null`)
 	if err != nil {
 		t.Fatalf("list spool blobs: %v (stderr=%s)", err, errOut)
 	}
@@ -482,8 +482,8 @@ func spoolBlobPaths(t *testing.T, ctx context.Context, s *stack.Stack) map[strin
 	return paths
 }
 
-// newSpoolPaths returns the paths in after that are not in before.
-func newSpoolPaths(before, after map[string]bool) []string {
+// newLocalPaths returns the paths in after that are not in before.
+func newLocalPaths(before, after map[string]bool) []string {
 	var added []string
 	for p := range after {
 		if !before[p] {
@@ -493,12 +493,12 @@ func newSpoolPaths(before, after map[string]bool) []string {
 	return added
 }
 
-// corruptSpoolFileTail overwrites 16 bytes of the spooled envelope at path,
+// corruptLocalFileTail overwrites 16 bytes of the spooled envelope at path,
 // tailOffset bytes from its end, with zeros — a byte-level tamper inside the
 // final ciphertext chunk (the envelope's tail is STREAM ciphertext; 16
 // random bytes are all-zero with probability 2^-128). Fails if the file
 // content did not change.
-func corruptSpoolFileTail(t *testing.T, ctx context.Context, s *stack.Stack, path string, tailOffset int64) {
+func corruptLocalFileTail(t *testing.T, ctx context.Context, s *stack.Stack, path string, tailOffset int64) {
 	t.Helper()
 	script := fmt.Sprintf(`
 		f=%q
