@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 
@@ -566,5 +567,37 @@ func TestSweepLocalBlobs_WarnsOncePerOverBudgetEpisode(t *testing.T) {
 	got = append(got, b.overBudgetWarned)
 	if want := []bool{true, true, false}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("warned after [over, still over, back under] = %v, want %v", got, want)
+	}
+}
+
+// TestRemoveLocalRacingTakeLeavesNoCopy: a removal racing the move of the
+// same blob into the cache leaves no copy in either directory, whichever
+// runs first.
+func TestRemoveLocalRacingTakeLeavesNoCopy(t *testing.T) {
+	ctx := t.Context()
+	b, _ := newSweepBackend(t)
+	for i := range 500 {
+		d, _, err := b.spool.WriteBlob(ctx, bytes.NewReader([]byte(fmt.Sprintf("racing blob %d", i))))
+		if err != nil {
+			t.Fatalf("WriteBlob: %v", err)
+		}
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := b.cache.Take(b.spool, d); err != nil {
+				t.Errorf("Take: %v", err)
+			}
+		}()
+		if _, err := b.removeLocal(d); err != nil {
+			t.Fatalf("removeLocal: %v", err)
+		}
+		wg.Wait()
+		if fileExists(b.spool.Path(d)) || fileExists(b.cache.Path(d)) {
+			t.Fatalf("iteration %d: a copy survived removeLocal", i)
+		}
+	}
+	if got := b.localUsage(); got != 0 {
+		t.Fatalf("local usage = %d, want 0", got)
 	}
 }

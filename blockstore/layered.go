@@ -57,7 +57,7 @@ func (l *Layered) GetBlock(ctx context.Context, space did.DID, c cid.Cid) (blk b
 	if l.local != nil {
 		b, err := l.local.GetBlock(ctx, space, c)
 		if err == nil {
-			tracing.CountRead(ctx, tracing.BlockSpool)
+			tracing.CountRead(ctx, tracing.BlockLocal)
 			return b, nil
 		}
 		if !errors.Is(err, ErrNotFound) {
@@ -86,7 +86,7 @@ func (l *Layered) OpenBlob(ctx context.Context, space did.DID, digest mh.Multiha
 	if br, ok := l.local.(BlobReader); ok {
 		rc, err := br.OpenBlob(ctx, space, digest)
 		if err == nil {
-			tracing.CountRead(ctx, tracing.BlobSpool)
+			tracing.CountRead(ctx, tracing.BlobLocal)
 			return rc, nil
 		}
 		if !errors.Is(err, ErrNotFound) {
@@ -111,7 +111,7 @@ func (l *Layered) OpenBlobRange(ctx context.Context, space did.DID, digest mh.Mu
 	if br, ok := l.local.(BlobReader); ok {
 		rc, err := OpenBlobRangeOf(ctx, br, space, digest, start, end)
 		if err == nil {
-			tracing.CountRead(ctx, tracing.BlobSpool)
+			tracing.CountRead(ctx, tracing.BlobLocal)
 			return rc, nil
 		}
 		if !errors.Is(err, ErrNotFound) {

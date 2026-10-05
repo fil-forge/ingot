@@ -128,8 +128,8 @@ standalone client — not inside the central upload-service.
 moves each body to `<data_dir>/cache` once the provider holds it, keeping it
 so a read soon after the write is served from local disk. Set
 `local_blob_max_bytes` to bound the two directories together: a sweeper
-evicts cached bodies, oldest first, and later reads of them go to the
-provider. The budget counts bodies as they are written, so the sweeper makes
+evicts bodies the provider holds, oldest first, and later reads of them go
+to the provider. The budget counts bodies as they are written, so the sweeper makes
 room for them, but usage can run over it by the ingest rate × 30 seconds,
 plus the spool's bodies still being written or uploaded, which cannot be
 evicted. Nor can the body of an upload that failed (its upload intent stays

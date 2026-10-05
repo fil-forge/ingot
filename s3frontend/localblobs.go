@@ -26,13 +26,15 @@ func (b *Backend) cacheHeld(digest multihash.Multihash) {
 	}
 }
 
-// removeLocal removes a blob's local copy, from the cache or the spool,
-// and returns the bytes freed.
+// removeLocal removes a blob's local copy, from the spool or the cache,
+// and returns the bytes freed. A blob only ever moves from the spool to the
+// cache, so looking in the spool first means a concurrent move cannot slip
+// the copy past both removals.
 func (b *Backend) removeLocal(digest multihash.Multihash) (int64, error) {
-	freed, err := b.cache.Remove(digest)
+	freed, err := b.spool.Remove(digest)
 	if err != nil {
 		return freed, err
 	}
-	more, err := b.spool.Remove(digest)
+	more, err := b.cache.Remove(digest)
 	return freed + more, err
 }

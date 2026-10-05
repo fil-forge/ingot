@@ -111,8 +111,8 @@ type Config struct {
 	// (<data_dir>/spool: writes in progress, counted as their bytes land, and
 	// bodies waiting for upload) plus the cache (<data_dir>/cache: copies of
 	// bodies the provider holds). It does not cover the catalog log. A
-	// sweeper checks it every 30 seconds and evicts cached blobs, oldest
-	// first, down to 90% of the budget; reads of an evicted blob go to the
+	// sweeper checks it every 30 seconds and evicts blobs the provider
+	// holds, oldest first, down to 90% of the budget; reads of an evicted blob go to the
 	// provider. Usage can exceed the budget by ingest rate × 30 seconds
 	// between sweeps, and by files that must stay (the spool's, and orphans
 	// younger than LocalBlobOrphanAge). 0 → no budget (the default); negative
