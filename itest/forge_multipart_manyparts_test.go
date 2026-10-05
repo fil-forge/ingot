@@ -29,7 +29,8 @@ import (
 //
 // Gated behind INGOT_ITEST_MP_BENCH=1: at the default 1000 parts it moves
 // ~5 GiB through the stack and lands several times that on the Docker disk
-// once the spool, piri's copy and sprue's agent-message store are counted.
+// once piri's copy and sprue's agent-message store are counted (a part's
+// spool copy goes once it parks, but a part in flight is still spooled).
 // Check free space first — when the Docker VM's disk fills, MinIO answers
 // sprue with 507 and every UploadPart fails as an opaque 500. Reclaim the
 // previous run's volumes (`docker volume ls -qf dangling=true | grep

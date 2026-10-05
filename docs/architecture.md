@@ -891,9 +891,8 @@ paths below are exercised against the real stack by the smelt-based `itest/` har
   Still open under #48: there is no write-through mode or spool metric.
 - **Multipart parts park at UploadPart, accept at Complete.** (Built: `parkBlobs`/`concludeBlobs`
   over the `blob_parks` table.) A parked part holds no local bytes: its spool copy is removed once
-  it parks, and Complete concludes it from its park row. The in-process harness still spools parts
-  at `UploadPart` and uploads+accepts them at `Complete`; the true forge *parking* (upload early,
-  accept-at-Complete) and the `/blob/abort` unwind from [§7.2](#72-multipart)–[7.3](#73-the-session-latch-the-abortcomplete-race) are forge-mode refinements.
+  it parks, and Complete concludes it from its park row. Abort and session expiry unwind parked
+  blobs with `/blob/abort` ([§7.2](#72-multipart)–[7.3](#73-the-session-latch-the-abortcomplete-race)).
 - **Crash recovery for the spool is not built.** The `upload_intents` × `blob_refs` reconciliation
   the failure-mode table in [§7.5](#75-concurrency-durability-and-failure-modes) describes (resume/`abort` parked, `remove` accepted-but-unreferenced)
   is a later phase; a partial post-commit reference-index write currently relies on retry/idempotency.
