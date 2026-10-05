@@ -259,7 +259,7 @@ sequenceDiagram
     Note over C,L: off the lock: ingest, hash, encrypt, upload (an upload service that cannot<br/>add by digest code gets every blob spooled first, then uploaded by digest)
     C->>B: PutObject(bucket, key, body)
     B->>R: reg.Get(bucket), precondition pre-check
-    B->>B: tenant recipient: resolve the tenant's #wrap key<br/>(tenant DID from the request, did:plc doc via the cached PLC resolver)#59;<br/>no recipient → the write fails
+    B->>B: tenant recipient: resolve the tenant's #35;wrap key<br/>(tenant DID from the request, did:plc doc via the cached PLC resolver)#59;<br/>no recipient → the write fails
     loop SplitSizedBody: each plaintext piece of min(max_blob_size, remaining) bytes
         B->>B: fresh CEK → FEE envelope (COSE_Encrypt, AES-256-GCM STREAM,<br/>one recipient: ECDH-ES+A256KW to the tenant wrap key)#59;<br/>its length is known from the header + plaintext length
         B->>U: /blob/add (digestCode sha2-256, envelope size, random nonce)
