@@ -9,8 +9,10 @@ import (
 	"strings"
 
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
 	"go.opentelemetry.io/otel/propagation"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.37.0"
@@ -43,19 +45,7 @@ func setupTracing(ctx context.Context, logger *zap.Logger) (func(context.Context
 		return nil, fmt.Errorf("creating trace exporter: %w", err)
 	}
 
-	// The Forge namespace groups Ingot with the other Forge services, so their
-	// telemetry is selected together rather than by each service.name.
-	// WithFromEnv comes after, so OTEL_RESOURCE_ATTRIBUTES can still override
-	// either attribute.
-	res, err := resource.New(ctx,
-		resource.WithAttributes(
-			semconv.ServiceNamespace("forge"),
-			semconv.ServiceName("ingot"),
-			semconv.ServiceVersion(build.Version),
-		),
-		resource.WithHost(),
-		resource.WithFromEnv(),
-	)
+	res, err := telemetryResource(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("creating trace resource: %w", err)
 	}
@@ -83,6 +73,54 @@ func setupTracing(ctx context.Context, logger *zap.Logger) (func(context.Context
 	}))
 	logger.Info("tracing enabled", zap.String("collector", collectorHost(endpoint)))
 	return tp.Shutdown, nil
+}
+
+// telemetryResource describes this process on its telemetry. The Forge
+// namespace groups Ingot with the other Forge services, so their telemetry is
+// selected together rather than by each service.name. WithFromEnv comes after,
+// so OTEL_RESOURCE_ATTRIBUTES can still override either attribute.
+func telemetryResource(ctx context.Context) (*resource.Resource, error) {
+	return resource.New(ctx,
+		resource.WithAttributes(
+			semconv.ServiceNamespace("forge"),
+			semconv.ServiceName("ingot"),
+			semconv.ServiceVersion(build.Version),
+		),
+		resource.WithHost(),
+		resource.WithFromEnv(),
+	)
+}
+
+// setupMetrics installs the global meter provider, exporting over OTLP/HTTP.
+// Like tracing, metrics are off unless OTEL_EXPORTER_OTLP_ENDPOINT or
+// OTEL_EXPORTER_OTLP_METRICS_ENDPOINT names a collector, and the standard
+// OTEL_* variables apply (OTEL_METRIC_EXPORT_INTERVAL sets how often they are
+// pushed). The returned function exports a last time and stops the exporter.
+func setupMetrics(ctx context.Context, logger *zap.Logger) (func(context.Context) error, error) {
+	endpoint := os.Getenv("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT")
+	if endpoint == "" {
+		endpoint = os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+	}
+	if endpoint == "" {
+		logger.Info("metrics off: no OTLP endpoint configured")
+		return func(context.Context) error { return nil }, nil
+	}
+
+	exp, err := otlpmetrichttp.New(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("creating metric exporter: %w", err)
+	}
+	res, err := telemetryResource(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("creating metric resource: %w", err)
+	}
+	mp := sdkmetric.NewMeterProvider(
+		sdkmetric.WithReader(sdkmetric.NewPeriodicReader(exp)),
+		sdkmetric.WithResource(res),
+	)
+	otel.SetMeterProvider(mp)
+	logger.Info("metrics enabled", zap.String("collector", collectorHost(endpoint)))
+	return mp.Shutdown, nil
 }
 
 // collectorHost returns the scheme and host of an OTLP endpoint, for logging.
