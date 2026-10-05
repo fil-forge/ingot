@@ -87,7 +87,10 @@ func (c *BlobCache) Usage() int64 {
 // Take moves the blob with the given digest from spool into the cache and
 // returns its size, moving the bytes between the two counts. Idempotent: a
 // blob not in the spool moves nothing and is not an error. Only a blob the
-// provider holds may be taken; the caller decides that.
+// provider holds may be taken; the caller decides that. A copy already in the
+// cache would be replaced but counted again; that cannot happen today,
+// because every write encrypts under a fresh key and so has a digest of its
+// own.
 func (c *BlobCache) Take(spool *Spool, digest mh.Multihash) (int64, error) {
 	spool.mu.RLock()
 	defer spool.mu.RUnlock()

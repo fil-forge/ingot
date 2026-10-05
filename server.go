@@ -366,8 +366,8 @@ func (s *Server) startReleaseSweeper() {
 const localBlobSweepInterval = 30 * time.Second
 
 // startLocalBlobSweeper spawns the local blob sweeper: every
-// localBlobSweepInterval it evicts cached blobs down to LocalBlobMaxBytes
-// (when set), and hourly it deletes orphan files (see
+// localBlobSweepInterval it evicts blobs the provider holds down to
+// LocalBlobMaxBytes (when set), and hourly it deletes orphan files (see
 // Backend.SweepLocalBlobs).
 func (s *Server) startLocalBlobSweeper() {
 	s.localBlobStop = make(chan struct{})
