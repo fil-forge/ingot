@@ -25,10 +25,11 @@ type evictStore interface {
 	registry.ParkStore
 }
 
-// TestEvictionQueries runs the eviction queries against the in-memory store
-// and, when INGOT_TEST_DSN is set, against Postgres, so the fake the
-// s3frontend tests use is held to the SQL.
-func TestEvictionQueries(t *testing.T) {
+// TestEvictionQueriesLive runs the eviction queries against the in-memory
+// store and, when INGOT_TEST_DSN is set, against Postgres, so the fake the
+// s3frontend tests use is held to the SQL. The Live suffix puts it in CI's
+// live-Postgres job.
+func TestEvictionQueriesLive(t *testing.T) {
 	t.Run("inmem", func(t *testing.T) {
 		runEvictionSuite(t, func(t *testing.T) evictStore { return inmem.NewMemStore() })
 	})
