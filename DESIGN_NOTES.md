@@ -126,7 +126,8 @@ at PUT time or a sealed catalog CAR from the background flush:
 
 Multipart parts stop after step 2 (**parked**: durable, unaccepted) and run
 steps 3 and 4 at `CompleteMultipartUpload`; an abort unwinds a parked blob
-with `/blob/abort`. A part copied from an existing object (`UploadPartCopy`)
+with `/blob/abort`. A parked blob's spool copy is removed once it parks:
+Complete concludes it from its park row and never reads its bytes. A part copied from an existing object (`UploadPartCopy`)
 is ingested the same way: the source's plaintext range streams through the
 decrypting read path into new parked blobs, so the source may be in any
 bucket of the tenant and nothing is shared with it.

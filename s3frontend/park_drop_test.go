@@ -31,13 +31,13 @@ func TestParkedPartHoldsNoLocalCopy(t *testing.T) {
 	digests := hygienePartDigests(t, mem, uploadID, 1)
 	for _, d := range digests {
 		if _, err := os.Stat(b.spool.Path(d)); !os.IsNotExist(err) {
-			t.Fatalf("parked blob %x spool copy: stat err=%v, want not-exist", d, err)
+			t.Fatalf("parked blob %s spool copy: stat err=%v, want not-exist", d, err)
 		}
 		if in, err := mem.GetIntent(ctx, d); err != nil || in.State != registry.IntentParked {
-			t.Fatalf("parked blob %x intent = %v/%v, want parked", d, in, err)
+			t.Fatalf("parked blob %s intent = %v/%v, want parked", d, in, err)
 		}
 		if _, err := mem.GetPark(ctx, d); err != nil {
-			t.Fatalf("parked blob %x park row: %v", d, err)
+			t.Fatalf("parked blob %s park row: %v", d, err)
 		}
 	}
 
@@ -47,7 +47,7 @@ func TestParkedPartHoldsNoLocalCopy(t *testing.T) {
 	}
 	for _, d := range digests {
 		if loc, err := mem.GetLocation(ctx, did.Undef, d); err != nil || loc == nil {
-			t.Fatalf("blob %x location after Complete = %v/%v, want recorded", d, loc, err)
+			t.Fatalf("blob %s location after Complete = %v/%v, want recorded", d, loc, err)
 		}
 	}
 }
@@ -72,10 +72,10 @@ func TestFailedParkKeepsLocalCopy(t *testing.T) {
 	}
 	for _, d := range hygienePartDigests(t, mem, uploadID, 1) {
 		if _, err := os.Stat(b.spool.Path(d)); err != nil {
-			t.Fatalf("blob %x spool copy after a failed park: %v, want it kept", d, err)
+			t.Fatalf("blob %s spool copy after a failed park: %v, want it kept", d, err)
 		}
 		if in, err := mem.GetIntent(ctx, d); err != nil || in.State != registry.IntentUploading {
-			t.Fatalf("blob %x intent = %v/%v, want uploading", d, in, err)
+			t.Fatalf("blob %s intent = %v/%v, want uploading", d, in, err)
 		}
 	}
 }
