@@ -460,6 +460,7 @@ sequenceDiagram
     loop each part blob (parkBlobs)
         alt streamed while spooled
             B->>R: PutPark(AddTask, AcceptTask, PutInvocation), intent parked,<br/>DeleteStream: the PUT already went to piri in splitSpool
+            B->>B: spool.Remove (the part's local copy; Complete concludes from the park)
         else blob_locations already has the digest
             B->>R: intent accepted (dedup, no park)
         else already parked (GetPark hit)
@@ -468,6 +469,7 @@ sequenceDiagram
             B->>U: /blob/add with WithConclude(false)
             B->>P: HTTP PUT bytes
             B->>R: PutPark(AddTask, AcceptTask, PutInvocation), intent parked
+            B->>B: spool.Remove (the part's local copy)
         end
     end
     B-->>C: part ETag (part md5; for a copy, of the copied bytes)
@@ -565,7 +567,7 @@ flowchart TB
     spooled -->|"dedup: blob_locations hit"| accepted
     spooled -->|"first network call begins<br/>(uploadBlobs, parkBlobs, concludeBlobs fallback)"| uploading
     uploading -->|"single-shot upload:<br/>/blob/add, PUT, conclude, accept"| accepted
-    uploading -->|"parkBlobs: /blob/add WithConclude(false),<br/>PUT (or already streamed); blob_parks row written"| parked
+    uploading -->|"parkBlobs: /blob/add WithConclude(false),<br/>PUT (or already streamed); blob_parks row written;<br/>local copy removed (spool.Remove)"| parked
     parked -->|"concludeBlobs at Complete:<br/>/ucan/conclude; blob_parks row deleted"| accepted
     spooled -->|"release record; executeRelease, local only<br/>(the blob never left this node):<br/>DeleteIntent + spool.Remove"| gone([deleted])
     uploading -->|"release record; executeRelease: /blob/remove<br/>(idempotent: the accept may have landed, its location not);<br/>DeleteIntent + spool.Remove"| gone

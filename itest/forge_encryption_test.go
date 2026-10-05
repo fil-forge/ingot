@@ -140,7 +140,6 @@ func TestForgeEncryption(t *testing.T) {
 		}
 
 		partData := [][]byte{patternBytes(6 << 20), patternBytes(5 << 20), patternBytes(9 << 10)}
-		before := spoolBlobPaths(t, ctx, s)
 		var completed []types.CompletedPart
 		var whole []byte
 		for i, data := range partData {
@@ -161,17 +160,15 @@ func TestForgeEncryption(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("CompleteMultipartUpload: %v", err)
 		}
-		added := newSpoolPaths(before, spoolBlobPaths(t, ctx, s))
+		added := objectBlobDigestsHex(t, ctx, s, bucket, key)
 		if len(added) != 3 {
-			t.Fatalf("multipart upload spooled %d envelopes, want 3 (one per part under the default config)", len(added))
+			t.Fatalf("multipart object references %d blobs, want 3 (one per part under the default config)", len(added))
 		}
-
-		// Evict only THIS object's spool copies (the shared stack's other
-		// objects keep theirs), so the pre-delete read must come from piri —
-		// proving all three part blobs are durable on the network before we
-		// assert the release traverses it.
-		if out, errOut, err := s.Exec(ctx, "ingot", "rm", "-f", added[0], added[1], added[2]); err != nil {
-			t.Fatalf("evict this object's spool copies: %v (stdout=%s stderr=%s)", err, out, errOut)
+		// A part's spool copy goes once it parks, so the pre-delete read must
+		// come from piri — proving all three part blobs are durable on the
+		// network before we assert the release traverses it.
+		if spooled := spooledDigests(t, ctx, s, added); len(spooled) != 0 {
+			t.Fatalf("parked part blobs still in the spool: %v", spooled)
 		}
 		if got := getBody(t, ctx, cl, bucket, key, ""); !bytes.Equal(got, whole) {
 			t.Fatalf("read-through from piri before delete mismatched: got %d bytes, want %d", len(got), len(whole))
