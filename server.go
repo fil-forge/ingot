@@ -357,6 +357,10 @@ func (s *Server) startReleaseSweeper() {
 // budget's 10% headroom must exceed ingest rate × this interval.
 const localBlobSweepInterval = 30 * time.Second
 
+// localBlobSweepLogInterval is the least time between the local blob
+// sweeper's Info lines totalling its removals.
+const localBlobSweepLogInterval = 10 * time.Minute
+
 // startLocalBlobSweeper spawns the local blob sweeper: every
 // localBlobSweepInterval it evicts blobs the provider holds down to
 // LocalBlobMaxBytes (when set), and hourly it deletes orphan files (see
@@ -364,6 +368,10 @@ const localBlobSweepInterval = 30 * time.Second
 func (s *Server) startLocalBlobSweeper() {
 	s.localBlobStop = make(chan struct{})
 	go func() {
+		// removed totals the removals since since, not yet logged.
+		var removed s3frontend.LocalBlobSweepStats
+		var lastLog time.Time
+		since := time.Now()
 		ticker := time.NewTicker(localBlobSweepInterval)
 		defer ticker.Stop()
 		for {
@@ -378,14 +386,19 @@ func (s *Server) startLocalBlobSweeper() {
 				if err != nil {
 					s.logger.Warn("local blob sweep", zap.Error(err))
 				}
-				if stats.Removed() {
-					s.logger.Debug("local blob sweep removed files",
-						zap.Int64("budget_files", stats.BudgetFiles),
-						zap.Int64("budget_bytes", stats.BudgetBytes),
-						zap.Int64("orphan_files", stats.OrphanFiles),
-						zap.Int64("orphan_bytes", stats.OrphanBytes),
-						zap.Int64("usage_bytes", s.backend.LocalBlobUsage()),
-					)
+				// The removals are totalled and logged at most every
+				// localBlobSweepLogInterval, so steady eviction shows at
+				// Info without a line every sweep; the metrics carry each.
+				removed.Add(stats)
+				if removed.Removed() && time.Since(lastLog) >= localBlobSweepLogInterval {
+					s.logger.Info("local blob sweeper removed files",
+						append(removed.LogFields(),
+							zap.Duration("over", time.Since(since)),
+							zap.Int64("usage_bytes", s.backend.LocalBlobUsage()))...)
+					removed, lastLog = s3frontend.LocalBlobSweepStats{}, time.Now()
+				}
+				if !removed.Removed() {
+					since = time.Now()
 				}
 			}
 		}

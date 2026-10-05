@@ -279,3 +279,25 @@ func fileExistsAt(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
 }
+
+// TestScanReadsLargeDirectoriesInChunks: a directory with more entries than
+// one chunk is walked whole, and the correction matches the disk.
+func TestScanReadsLargeDirectoriesInChunks(t *testing.T) {
+	ctx := t.Context()
+	s, _ := newTestDirs(t)
+	var want int64
+	for i := range walkChunk + 10 {
+		body := fmt.Sprintf("blob %d", i)
+		writeTestBlob(t, s, body)
+		want += int64(len(body))
+	}
+	s.usage.Store(0)
+	seen := 0
+	drift, err := s.ScanAndCorrect(ctx, func(BlobFile) { seen++ })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := [3]int64{int64(seen), drift, s.Usage()}; got != [3]int64{walkChunk + 10, -want, want} {
+		t.Fatalf("[files seen, correction, usage] = %v, want [%d %d %d]", got, walkChunk+10, -want, want)
+	}
+}

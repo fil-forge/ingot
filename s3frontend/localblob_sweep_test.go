@@ -704,3 +704,86 @@ func TestSweepLocalBlobs_OrphanPassFinishesTheSpoolFirst(t *testing.T) {
 		t.Fatalf("spool orphan: removed %d files, still on disk %v; want 1 removed", stats.OrphanFiles, fileExists(b.spool.Path(d)))
 	}
 }
+
+// failNthIntents fails the nth MissingIntents call and passes the others on.
+type failNthIntents struct {
+	registry.IntentStore
+	n     int
+	calls *int
+}
+
+func (f failNthIntents) MissingIntents(ctx context.Context, digests []multihash.Multihash) ([]multihash.Multihash, error) {
+	*f.calls++
+	if *f.calls == f.n {
+		return nil, errors.New("database unavailable")
+	}
+	return f.IntentStore.MissingIntents(ctx, digests)
+}
+
+// TestSweepLocalBlobs_OrphanPassChecksInBatches: old spool blobs are checked a
+// batch at a time as the scan reaches them; orphans go and blobs with intents
+// stay, and a query that fails partway stops the pass with its error,
+// removing nothing it has not checked.
+func TestSweepLocalBlobs_OrphanPassChecksInBatches(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		failCall int // 0: no failure
+	}{{"all succeed", 0}, {"second query fails", 2}} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			b, mem := newSweepBackend(t)
+			b.localBlobSweepBatch = 2
+			old := time.Now().Add(-2 * DefaultLocalBlobOrphanAge)
+			var orphans, kept []multihash.Multihash
+			for i := range 6 {
+				d, n, err := b.spool.WriteBlob(ctx, bytes.NewReader([]byte(fmt.Sprintf("old blob %d", i))))
+				if err != nil {
+					t.Fatalf("WriteBlob: %v", err)
+				}
+				if i%2 == 0 {
+					orphans = append(orphans, d)
+				} else {
+					if err := mem.PutIntent(ctx, registry.UploadIntent{Digest: d, LocalPath: localPath(b, d), Size: n, State: registry.IntentSpooled}); err != nil {
+						t.Fatalf("PutIntent: %v", err)
+					}
+					kept = append(kept, d)
+				}
+				if err := os.Chtimes(localPath(b, d), old, old); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var calls int
+			if tc.failCall > 0 {
+				b.intents = failNthIntents{IntentStore: b.intents, n: tc.failCall, calls: &calls}
+			}
+
+			stats, err := b.SweepLocalBlobs(ctx)
+
+			if (err != nil) != (tc.failCall > 0) {
+				t.Fatalf("SweepLocalBlobs error = %v, want failure %v", err, tc.failCall > 0)
+			}
+			for _, d := range kept {
+				if !fileExists(localPath(b, d)) {
+					t.Fatalf("blob %x with an intent was removed", d)
+				}
+			}
+			removed := 0
+			for _, d := range orphans {
+				if !fileExists(localPath(b, d)) {
+					removed++
+				}
+			}
+			want := len(orphans)
+			if tc.failCall > 0 {
+				// Only the first batch was checked before the failure.
+				want = int(stats.OrphanFiles)
+				if want >= len(orphans) {
+					t.Fatalf("removed %d orphans despite the failed query, want fewer than %d", want, len(orphans))
+				}
+			}
+			if removed != want || int(stats.OrphanFiles) != want {
+				t.Fatalf("orphans removed = %d (stats %d), want %d", removed, stats.OrphanFiles, want)
+			}
+		})
+	}
+}

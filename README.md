@@ -141,8 +141,8 @@ at startup, or only at an hourly scan that no write overlapped. Without a
 budget the cache grows with every live object's bodies; a deleted object's
 local copy is freed when its release runs, and a multipart part's once it
 parks on the provider. With or without a budget, the sweeper deletes
-unfinished writes and files with no upload intent, hourly, once they are
-older than `local_blob_orphan_age` (default `24h`).
+unfinished writes, and spool files with no upload intent, hourly, once they
+are older than `local_blob_orphan_age` (default `24h`).
 
 `serve` exports OpenTelemetry traces over OTLP/HTTP when
 `OTEL_EXPORTER_OTLP_ENDPOINT` names a collector; with no endpoint, tracing is

@@ -184,7 +184,7 @@ type Deps struct {
 	// serve evicted blobs, which the in-memory fakes do not have.
 	LocalBlobMaxBytes int64
 	// LocalBlobOrphanAge is the age at which SweepLocalBlobs deletes a .tmp-*
-	// file, or a blob file in either directory with no intent row. Zero →
+	// file in either directory, or a spool blob file with no intent row. Zero →
 	// DefaultLocalBlobOrphanAge.
 	LocalBlobOrphanAge time.Duration
 

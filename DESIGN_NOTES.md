@@ -211,24 +211,27 @@ for an `accepted` or `published` intent, a `blob_parks` row for a `parked`
 one. Eviction removes the blob's local copy, which is in the cache, or still
 in the spool if the process stopped between recording the acceptance and the
 move. Spool files waiting for their upload, and writes in progress, never
-qualify; the budget counts them, so the pass evicts cached blobs to make room
-for them. Eviction order is age alone, so the newest bodies, the likeliest to
-be read back soon after they are written, go last. Eviction removes the file
-first, then sets `upload_intents.evicted_at`; the row and its state stay,
-because a release and Complete read them. A read of an evicted blob misses
-locally and goes to the network tier. A file the pass cannot remove is
-logged and skipped. Hourly, with or without a budget, the sweeper also
-deletes `.tmp-*` files and blob files with no intent row older than
-`local_blob_orphan_age` (24 hours), in both directories: the spool first,
-then the cache, a batch of files at a time. Its scans take no lock, so
-writes go on meanwhile, and a pass that runs out of time or fails waits for
-the next hour. The byte counts are set when each directory opens, and every
-write, move and removal adjusts its count under the directory's lock. A
-move holds both directories exclusively, so it never overlaps a removal of
-the same blob. The hourly scan also corrects a directory's count when no
-change overlapped it, which catches files added or removed outside ingot;
-otherwise those stay miscounted until the next quiet scan or a restart. The cache must be on the spool's filesystem, so a move is a
-rename; startup checks this.
+qualify; the budget counts them, so the pass evicts cached blobs to make
+room for them. Eviction order is age alone, so the newest bodies, the
+likeliest to be read back soon after they are written, go last. Eviction
+removes the file first, then sets `upload_intents.evicted_at`; the row and
+its state stay, because a release and Complete read them. A read of an
+evicted blob misses locally and goes to the network tier. A file the pass
+cannot remove is logged and skipped. Hourly, with or without a budget, the
+sweeper also deletes `.tmp-*` files older than `local_blob_orphan_age` (24
+hours) in both directories, and spool blob files that old with no intent
+row, checked a batch at a time; it finishes the spool before scanning the
+cache. A cache file has always had an intent, and every path that deletes an
+intent removes the file first, so the cache is not checked against intents.
+Its scans take no lock, so writes go on meanwhile, and a pass that runs out
+of time or fails waits for the next hour. The byte counts are set when each
+directory opens, and every write, move and removal adjusts its count under
+the directory's lock. A move holds both directories exclusively, so it never
+overlaps a removal of the same blob. The hourly scan also corrects a
+directory's count when no change overlapped it, which catches files added or
+removed outside ingot; otherwise those stay miscounted until the next quiet
+scan or a restart. The cache must be on the spool's filesystem, so a move is
+a rename; startup checks this.
 
 ## Read path
 
