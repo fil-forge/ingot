@@ -31,11 +31,11 @@ type blobDir struct {
 	dir string
 	// kind names the directory in errors.
 	kind string
-	// mu orders the changes that move the count: a Scan holds it
+	// mu orders the changes that move the count: count holds it
 	// exclusively while it measures, and each commit into the directory or
-	// removal from it holds it shared, so a Scan sees every file either
-	// before or after the change, counted to match. A move between
-	// directories (BlobCache.Take) holds both exclusively.
+	// removal from it holds it shared, so the count sees every file either
+	// before or after the change. A move between directories
+	// (BlobCache.Take) holds both exclusively.
 	mu sync.RWMutex
 	// usage is the byte count of the finished blob files.
 	usage atomic.Int64
@@ -60,20 +60,43 @@ type BlobFile struct {
 	ModTime time.Time
 }
 
-// Scan walks the directory, calls fn for each blob file and each .tmp-* file
-// (skipping directories and names that are neither), and resets the byte
-// count to the blob files it saw. A file removed while the scan runs is
-// skipped. fn runs while Scan holds the directory exclusively, so it must not
-// call back into this directory; collect what it needs and act afterwards.
-func (d *blobDir) Scan(fn func(BlobFile)) error {
+// Scan walks the directory and calls fn for each blob file and each .tmp-*
+// file, skipping directories and names that are neither. It takes no lock, so
+// writes, moves and removals go on while it runs: a file that changes during
+// the scan may be seen before or after the change, or not at all. It stops,
+// returning ctx's error, once ctx is done.
+func (d *blobDir) Scan(ctx context.Context, fn func(BlobFile)) error {
+	_, err := d.walk(ctx, fn)
+	return err
+}
+
+// count sets the byte count to the blob files on disk, holding the directory
+// exclusively while it measures, and calls fn for each file as Scan does. A
+// Spool or BlobCache counts once, when it opens; after that every change it
+// makes keeps the count itself. fn must not call back into this directory.
+func (d *blobDir) count(fn func(BlobFile)) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	total, err := d.walk(context.Background(), fn)
+	if err != nil {
+		return err
+	}
+	d.usage.Store(total)
+	return nil
+}
+
+// walk lists the directory for Scan and count and returns the total size of
+// the blob files it saw. A file removed while it runs is skipped.
+func (d *blobDir) walk(ctx context.Context, fn func(BlobFile)) (int64, error) {
 	entries, err := os.ReadDir(d.dir)
 	if err != nil {
-		return fmt.Errorf("blockstore: %s scan: %w", d.kind, err)
+		return 0, fmt.Errorf("blockstore: %s scan: %w", d.kind, err)
 	}
 	var total int64
 	for _, de := range entries {
+		if err := ctx.Err(); err != nil {
+			return total, err
+		}
 		if !de.Type().IsRegular() {
 			continue
 		}
@@ -90,15 +113,42 @@ func (d *blobDir) Scan(fn func(BlobFile)) error {
 			continue
 		}
 		if err != nil {
-			return fmt.Errorf("blockstore: %s stat %s: %w", d.kind, name, err)
+			return total, fmt.Errorf("blockstore: %s stat %s: %w", d.kind, name, err)
 		}
 		if digest != nil {
 			total += info.Size()
 		}
 		fn(BlobFile{Name: name, Digest: digest, Size: info.Size(), ModTime: info.ModTime()})
 	}
-	d.usage.Store(total)
-	return nil
+	return total, nil
+}
+
+// RemoveTemp deletes one .tmp-* file by name and returns its size. Idempotent.
+// It refuses any other name, so it cannot be used to delete a finished blob.
+// It leaves every count alone: a temp file is counted only while a live write
+// holds it (Spool's in-flight count), and only an abandoned write's file is
+// safe to remove; a write that is still live takes its own bytes off when it
+// fails.
+func (d *blobDir) RemoveTemp(name string) (int64, error) {
+	if !strings.HasPrefix(name, spoolTempPrefix) || filepath.Base(name) != name {
+		return 0, fmt.Errorf("blockstore: %s remove temp: %q is not a temp file", d.kind, name)
+	}
+	path := filepath.Join(d.dir, name)
+	info, err := os.Stat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("blockstore: %s remove temp: %w", d.kind, err)
+	}
+	err = os.Remove(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("blockstore: %s remove temp: %w", d.kind, err)
+	}
+	return info.Size(), nil
 }
 
 // digestFromName decodes a blob file name back into the multihash it was

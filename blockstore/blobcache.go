@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 
 	"github.com/fil-forge/ucantone/did"
 	block "github.com/ipfs/go-block-format"
@@ -35,10 +36,32 @@ func NewBlobCache(dir string) (*BlobCache, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := d.Scan(func(BlobFile) {}); err != nil {
+	if err := d.count(func(BlobFile) {}); err != nil {
 		return nil, err
 	}
 	return &BlobCache{blobDir: d}, nil
+}
+
+// CheckTake confirms that Take can move blobs from spool into the cache, which
+// needs the two directories on one filesystem, by moving an empty probe file
+// between them. Call it at startup: a cache mounted elsewhere would otherwise
+// fail every Take, one warning per blob.
+func (c *BlobCache) CheckTake(spool *Spool) error {
+	f, err := os.CreateTemp(spool.dir, spoolTempPrefix+"probe-*")
+	if err != nil {
+		return fmt.Errorf("blockstore: cache probe: %w", err)
+	}
+	from := f.Name()
+	_ = f.Close()
+	to := filepath.Join(c.dir, filepath.Base(from))
+	if err := os.Rename(from, to); err != nil {
+		_ = os.Remove(from)
+		return fmt.Errorf("blockstore: cache %s must be on the spool's filesystem (%s): %w", c.dir, spool.dir, err)
+	}
+	if err := os.Remove(to); err != nil {
+		return fmt.Errorf("blockstore: cache probe: %w", err)
+	}
+	return nil
 }
 
 // Usage returns the byte count of the cache's blob files.
@@ -109,7 +132,9 @@ func (l LocalBlobs) GetBlock(ctx context.Context, space did.DID, c cid.Cid) (blo
 	return localLookup(func(d *blobDir) (block.Block, error) { return d.GetBlock(ctx, space, c) }, l)
 }
 
-// localLookup tries the cache, the spool, then the cache again.
+// localLookup tries the cache, the spool, then the cache again. A block that
+// is never local, such as a catalog block on its way to the log, costs three
+// failed opens.
 func localLookup[T any](get func(*blobDir) (T, error), l LocalBlobs) (T, error) {
 	var zero T
 	for _, d := range []*blobDir{l.Cache.blobDir, l.Spool.blobDir, l.Cache.blobDir} {

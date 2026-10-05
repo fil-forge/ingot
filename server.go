@@ -194,6 +194,10 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		_ = log.Close(ctx)
 		return nil, fmt.Errorf("ingot: blob cache: %w", err)
 	}
+	if err := cache.CheckTake(spool); err != nil {
+		_ = log.Close(ctx)
+		return nil, fmt.Errorf("ingot: %w", err)
+	}
 
 	bs := blockstore.NewLayered(blockstore.LocalBlobs{Cache: cache, Spool: spool}, log, deps.BaseBlockReader)
 	// The global meter provider is a no-op until a host (the daemon) installs
