@@ -2,7 +2,6 @@ package s3frontend
 
 import (
 	"bytes"
-	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -35,7 +34,7 @@ const sweepBucket = "sweep"
 func newSweepBackend(t *testing.T, mods ...func(*Deps)) (*Backend, *inmem.MemStore) {
 	t.Helper()
 	b, mem := newDeferredBackend(t, inmem.NopUploader{}, mods...)
-	if err := mem.Create(context.Background(), sweepBucket, testutil.RandomDID(t), registry.CreateState{Tenant: testutil.RandomDID(t)}); err != nil {
+	if err := mem.Create(t.Context(), sweepBucket, testutil.RandomDID(t), registry.CreateState{Tenant: testutil.RandomDID(t)}); err != nil {
 		t.Fatalf("create bucket: %v", err)
 	}
 	return b, mem
@@ -45,7 +44,7 @@ func newSweepBackend(t *testing.T, mods ...func(*Deps)) (*Backend, *inmem.MemSto
 // their blob digests in the same order.
 func putSweepObjects(t *testing.T, b *Backend, n int) []multihash.Multihash {
 	t.Helper()
-	ctx := context.Background()
+	ctx := t.Context()
 	var digests []multihash.Multihash
 	for i := range n {
 		bucket, key := sweepBucket, fmt.Sprintf("obj-%d", i)
@@ -96,7 +95,7 @@ func blobStates(t *testing.T, b *Backend, mem *inmem.MemStore, digests []multiha
 
 func sweepSpool(t *testing.T, b *Backend) SpoolSweepStats {
 	t.Helper()
-	stats, err := b.SweepSpool(context.Background())
+	stats, err := b.SweepSpool(t.Context())
 	if err != nil {
 		t.Fatalf("SweepSpool: %v", err)
 	}
@@ -160,7 +159,7 @@ func TestSweepSpool_SkipsRecentlyReadBlobs(t *testing.T) {
 	b, mem := newSweepBackend(t, func(d *Deps) { d.SpoolReadRetention = time.Hour })
 	digests := putSweepObjects(t, b, 4)
 	bucket, key := sweepBucket, "obj-0"
-	got, err := b.GetObject(context.Background(), &s3.GetObjectInput{Bucket: &bucket, Key: &key})
+	got, err := b.GetObject(t.Context(), &s3.GetObjectInput{Bucket: &bucket, Key: &key})
 	if err != nil {
 		t.Fatalf("GetObject: %v", err)
 	}
@@ -180,7 +179,7 @@ func TestSweepSpool_SkipsRecentlyReadBlobs(t *testing.T) {
 // a spooled or uploading intent (the only copy), or of an accepted intent
 // whose location was never recorded, however far over budget the spool is.
 func TestSweepSpool_KeepsBlobsTheProviderMayNotHold(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	b, mem := newSweepBackend(t, func(d *Deps) { d.SpoolMaxBytes = 1 })
 	var digests []multihash.Multihash
 	for _, state := range []string{registry.IntentSpooled, registry.IntentUploading, registry.IntentAccepted} {
@@ -235,7 +234,7 @@ func TestSweepSpool_FileAlreadyGoneIsMarkedEvicted(t *testing.T) {
 // intent are deleted; young ones, and old files with an intent, stay; the
 // usage count is reset to what remains.
 func TestSweepSpool_OrphanPass(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	b, mem := newSweepBackend(t)
 	old := time.Now().Add(-2 * DefaultSpoolOrphanAge)
 

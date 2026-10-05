@@ -1208,8 +1208,8 @@ func (b *Backend) recordStreamedPark(ctx context.Context, blob msbucket.BlobRef,
 // provider, so a failed remove costs only disk: it is logged, and the file
 // waits for the spool sweeper to evict it, if a budget is set, or for a
 // release of the blob: the session's if the part is aborted, superseded or
-// expires, its object's once Complete commits it. A failure to mark the intent evicted only leaves
-// the sweeper to find the file gone and mark it.
+// expires, its object's once Complete commits it. A failure to mark the
+// intent evicted only leaves the sweeper to find the file gone and mark it.
 func (b *Backend) dropParkedCopy(ctx context.Context, digest mh.Multihash) {
 	freed, err := b.spool.Remove(digest)
 	if err != nil {

@@ -277,9 +277,9 @@ digest must be known before `allocate`, and because that local copy does double 
   a cache retains *recently read* data, so the two may use distinct eviction policies over a shared,
   bounded, size-configurable store. *(Built as one byte budget, `spool_max_bytes`, with a
   read-after-write window, `spool_min_residency`, and a read-recency window,
-  `spool_read_retention`; see §12.)* The alternative — a near-stateless Ingot that resolves every read
-  through the indexer — trades latency for simpler horizontal scaling; it is a supported mode, but
-  the read-after-write floor holds regardless.
+  `spool_read_retention`; see §12.)* The alternative — a near-stateless Ingot that resolves every
+  read through the indexer — trades latency for simpler horizontal scaling; it is a supported mode,
+  but the read-after-write floor holds regardless.
 
 The `upload_intents` table tracks each in-flight blob: `digest → { local_path, size, state:
 spooled│parked│accepted│published, owner ref }`. It drives read-after-write, cache lookup, and crash
