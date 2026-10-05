@@ -179,8 +179,8 @@ func withMultipartTTLConfig() stack.Option {
 }
 
 // withSpoolBudgetConfig mounts testdata/config-spoolbudget.yaml — a 4 MiB
-// spool_max_bytes, so the spool sweeper evicts within a test's budget. Dedicated stacks only: other
-// tests read envelopes back from the spool.
+// spool_max_bytes, so the spool sweeper evicts within a test's budget.
+// Dedicated stacks only: other tests read envelopes back from the spool.
 func withSpoolBudgetConfig() stack.Option {
 	return stack.WithServiceConfig("ingot", "testdata/config-spoolbudget.yaml")
 }
