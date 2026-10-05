@@ -275,9 +275,8 @@ digest must be known before `allocate`, and because that local copy does double 
 - **Read cache (optional, recommended):** beyond that floor, the local store serves hot reads
   directly, skipping the indexer→Piri round-trip. Read-after-write retains *recently written* data;
   a cache retains *recently read* data, so the two may use distinct eviction policies over a shared,
-  bounded, size-configurable store. *(Built as one byte budget, `spool_max_bytes`, with a
-  read-after-write window, `spool_min_residency`, and a read-recency window,
-  `spool_read_retention`; see §12.)* The alternative — a near-stateless Ingot that resolves every read
+  bounded, size-configurable store. *(Built so far as one byte budget, `spool_max_bytes`, evicting
+  oldest first; separate read-after-write and read-recency windows are not built. See §12.)* The alternative — a near-stateless Ingot that resolves every read
   through the indexer — trades latency for simpler horizontal scaling; it is a supported mode, but
   the read-after-write floor holds regardless.
 
@@ -887,11 +886,9 @@ paths below are exercised against the real stack by the smelt-based `itest/` har
   [§7.4](#74-read-getobject) / [§8](#8-retrieval-addressing-when-bodies-need-a-sharded-dag-index).
   **Spool eviction to a byte budget is built** (`spool_max_bytes`, `SweepSpool`): every 30s the
   sweeper removes the local files of blobs the provider holds (a location or park row), oldest
-  first, down to 90% of the budget, honouring a read-after-write window (`spool_min_residency`)
-  and a read-recency window (`spool_read_retention`) unless usage stays over budget; hourly it
-  deletes orphan files. The budget is off by default. A release frees a deleted object's spool
-  copies, and a parked part's copy goes once it parks. Still open under #48: there is no
-  write-through mode or spool metric.
+  first, down to 90% of the budget; hourly it deletes orphan files. The budget is off by default.
+  A release frees a deleted object's spool copies, and a parked part's copy goes once it parks.
+  Still open under #48: there is no write-through mode or spool metric.
 - **Multipart parts park at UploadPart, accept at Complete.** (Built: `parkBlobs`/`concludeBlobs`
   over the `blob_parks` table.) A parked part holds no local bytes: its spool copy is removed once
   it parks, and Complete concludes it from its park row. The in-process harness still spools parts

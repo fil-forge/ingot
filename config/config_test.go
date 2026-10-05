@@ -97,9 +97,7 @@ func TestValidate_RequiredFields(t *testing.T) {
 		{"bad seal_age", func(c *Config) { c.SealAge = "not-a-duration" }, "parse seal_age"},
 		{"bad release_grace", func(c *Config) { c.ReleaseGrace = "soon" }, "parse release_grace"},
 		{"negative spool_max_bytes", func(c *Config) { c.SpoolMaxBytes = -1 }, "spool_max_bytes -1: must not be negative"},
-		{"bad spool_min_residency", func(c *Config) { c.SpoolMinResidency = "soon" }, "parse spool_min_residency"},
-		{"negative spool_min_residency", func(c *Config) { c.SpoolMinResidency = "-1m" }, `spool_min_residency "-1m": must not be negative`},
-		{"negative spool_read_retention", func(c *Config) { c.SpoolReadRetention = "-1m" }, `spool_read_retention "-1m": must not be negative`},
+		{"bad spool_orphan_age", func(c *Config) { c.SpoolOrphanAge = "soon" }, "parse spool_orphan_age"},
 		{"short spool_orphan_age", func(c *Config) { c.SpoolOrphanAge = "59m" }, `spool_orphan_age "59m": must be at least 1h`},
 		{"bad cors origin", func(c *Config) { c.CORSAllowedOrigins = []string{"app.example"} }, "cors_allowed_origins"},
 		{"regionkey provider unset", func(c *Config) { c.RegionKey.Provider = "" }, "regionkey.provider is required"},
@@ -132,10 +130,8 @@ func TestValidate_RequiredFields(t *testing.T) {
 
 // spoolKnobs is the spool subset of ServerConfig, for comparing it whole.
 type spoolKnobs struct {
-	MaxBytes      int64
-	MinResidency  time.Duration
-	ReadRetention time.Duration
-	OrphanAge     time.Duration
+	MaxBytes  int64
+	OrphanAge time.Duration
 }
 
 func TestServerConfig_SpoolKnobs(t *testing.T) {
@@ -147,17 +143,15 @@ func TestServerConfig_SpoolKnobs(t *testing.T) {
 		{
 			name:   "defaults",
 			mutate: func(*Config) {},
-			want:   spoolKnobs{MaxBytes: 0, MinResidency: 10 * time.Minute, ReadRetention: time.Hour, OrphanAge: 24 * time.Hour},
+			want:   spoolKnobs{MaxBytes: 0, OrphanAge: 24 * time.Hour},
 		},
 		{
 			name: "explicit values",
 			mutate: func(c *Config) {
 				c.SpoolMaxBytes = 1 << 40
-				c.SpoolMinResidency = "0s"
-				c.SpoolReadRetention = "15m"
 				c.SpoolOrphanAge = "2h"
 			},
-			want: spoolKnobs{MaxBytes: 1 << 40, MinResidency: 0, ReadRetention: 15 * time.Minute, OrphanAge: 2 * time.Hour},
+			want: spoolKnobs{MaxBytes: 1 << 40, OrphanAge: 2 * time.Hour},
 		},
 	}
 	for _, tc := range cases {
@@ -168,7 +162,7 @@ func TestServerConfig_SpoolKnobs(t *testing.T) {
 			if err != nil {
 				t.Fatalf("ServerConfig: %v", err)
 			}
-			got := spoolKnobs{sc.SpoolMaxBytes, sc.SpoolMinResidency, sc.SpoolReadRetention, sc.SpoolOrphanAge}
+			got := spoolKnobs{sc.SpoolMaxBytes, sc.SpoolOrphanAge}
 			if got != tc.want {
 				t.Fatalf("spool knobs = %+v, want %+v", got, tc.want)
 			}

@@ -62,7 +62,7 @@ func TestForgeReadAfterEviction(t *testing.T) {
 }
 
 // TestForgeSpoolBudget proves the spool sweeper: with a 4 MiB spool_max_bytes
-// and both retention windows off (testdata/config-spoolbudget.yaml), 16 MiB
+// (testdata/config-spoolbudget.yaml), 16 MiB
 // of objects are evicted down to the budget within a few sweeps, and every
 // object then reads back byte-exact, most of them from piri.
 //

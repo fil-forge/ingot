@@ -127,11 +127,10 @@ standalone client — not inside the central upload-service.
 `serve` writes every object body to `<data_dir>/spool` before uploading it.
 Set `spool_max_bytes` to bound that directory: a sweeper evicts bodies the
 provider already holds, oldest first, and later reads of them go to the
-provider. `spool_min_residency` (default `10m`) and `spool_read_retention`
-(default `1h`) keep just-written and recently read bodies local while the
-budget allows; usage can run over the budget by the ingest rate × 30 seconds,
+provider. Usage can run over the budget by the ingest rate × 30 seconds,
 plus bodies still uploading. Without a budget the spool grows with every
-body written. A deleted object's local copy is not freed yet (#48).
+live object's bodies; a deleted object's local copy is freed when its
+release runs, and a multipart part's once it parks on the provider.
 
 `serve` exports OpenTelemetry traces over OTLP/HTTP when
 `OTEL_EXPORTER_OTLP_ENDPOINT` names a collector; with no endpoint, tracing is
