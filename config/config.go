@@ -98,10 +98,13 @@ type Config struct {
 	MultipartSessionTTL string `mapstructure:"multipart_session_ttl" yaml:"multipart_session_ttl"`
 
 	// ReleaseGrace delays each blob release (crypto-shred + location delete +
-	// network remove) this long past the drop of its last reference claim
-	// (Go duration string), so in-flight readers holding the prior catalog
-	// root finish their decryption prefetch first. Empty → default 60s; a
-	// negative duration makes releases due immediately.
+	// network remove + spool-copy removal) this long past the drop of its
+	// last reference claim (Go duration string), so in-flight readers holding
+	// the prior catalog root finish first. It bounds how long such a reader
+	// may take: a GET still streaming a deleted or overwritten object when
+	// the grace ends fails when it reaches a blob it has not yet opened.
+	// Empty → default 60s; a negative duration makes releases due
+	// immediately.
 	ReleaseGrace string `mapstructure:"release_grace" yaml:"release_grace"`
 
 	// CatalogPlane overrides the catalog logstore pipeline knobs. Any field

@@ -265,7 +265,7 @@ draws the chains and the stores.
 - **No HA.** A bucket is single-writer through an in-process lock; nothing
   coordinates across instances beyond the root CAS.
 - **The spool is unbounded** (#48): nothing evicts local body blobs, so
-  local disk grows with every body byte of every live object. A delete
+  local disk grows with every body byte of every retained version. A delete
   frees its blobs' spool copies once their release runs.
 - **Spool crash recovery is not built**: reconciling `upload_intents`
   against `blob_refs` after a crash between commit and reconcile is a later
