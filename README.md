@@ -139,8 +139,8 @@ library, ingot records them on the global meter provider.
 
 ### Local disk
 
-`serve` keeps object bodies in two directories under `data_dir`, on one
-filesystem:
+`serve` keeps object bodies in two directories under `data_dir`, which
+must be on one filesystem (`serve` checks this at startup):
 
 - `<data_dir>/spool` holds each body as it is written and uploaded, until
   the provider holds it;

@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"time"
 
 	"github.com/multiformats/go-multihash"
@@ -71,16 +72,17 @@ func (s LocalBlobSweepStats) Removed() bool {
 //
 // Eviction removes only the file. The intent keeps its row and state, marked
 // evicted: a session's release recognises a committed part blob by its
-// published state, and Complete reads part sizes from intents. The file goes first, so a crash in
-// between leaves a row describing a missing file, which the next pass finds
-// missing and marks. Readers tolerate the unlink: an open file survives it,
+// published state, and Complete reads part sizes from intents. The file goes
+// first, so a crash in between leaves a row describing a missing file, which
+// the next pass finds missing and marks. Readers tolerate the unlink: an open file survives it,
 // and a local miss falls through to the network tier.
 //
 // On the first run and then hourly, with or without a budget, the orphan
 // pass deletes .tmp-* files and blob files with no intent row once they are
-// older than LocalBlobOrphanAge, in both directories, and recounts each
-// directory's blob files. It runs even when the budget pass fails, with a
-// time limit of its own.
+// older than LocalBlobOrphanAge, in both directories. It runs even when the
+// budget pass fails, with a time limit of its own, and counts as run whether
+// or not it finishes, so a slow or failing pass waits for the next hour
+// rather than starting over every sweep.
 //
 // Called periodically by the daemon's local blob sweeper, and directly by tests.
 func (b *Backend) SweepLocalBlobs(ctx context.Context) (LocalBlobSweepStats, error) {
@@ -99,6 +101,11 @@ func (b *Backend) SweepLocalBlobs(ctx context.Context) (LocalBlobSweepStats, err
 		cancel()
 		stats.BudgetFiles, stats.BudgetBytes = pass.files, pass.bytes
 		b.localBlobMetrics.removed(ctx, removedBudget, pass.files, pass.bytes)
+		// A query cut off by the pass's own time limit is the time limit,
+		// not a failure.
+		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+			err = nil
+		}
 		if err != nil {
 			errs = append(errs, fmt.Errorf("s3frontend: local blob budget pass: %w", err))
 		}
@@ -109,6 +116,9 @@ func (b *Backend) SweepLocalBlobs(ctx context.Context) (LocalBlobSweepStats, err
 		cancel()
 		stats.ForcedFiles, stats.ForcedBytes = pass.files, pass.bytes
 		b.localBlobMetrics.removed(ctx, removedBudgetForced, pass.files, pass.bytes)
+		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+			err = nil
+		}
 		if pass.files > 0 {
 			b.logger.Warn("local blob storage was over budget after the budget pass; evicted blobs inside the retention windows (cache_min_residency, cache_read_retention)",
 				zap.Int64("files", pass.files),
@@ -128,13 +138,17 @@ func (b *Backend) SweepLocalBlobs(ctx context.Context) (LocalBlobSweepStats, err
 					zap.Int64("budget", b.localBlobMaxBytes))
 			}
 		default:
-			b.logger.Info("local blob forced pass reached its time limit while still over budget; the next sweep continues",
-				zap.Int64("usage", b.localUsage()),
-				zap.Int64("budget", b.localBlobMaxBytes))
+			if !b.timeLimitLogged {
+				b.timeLimitLogged = true
+				b.logger.Info("local blob forced pass reached its time limit while still over budget; the next sweep continues. This is logged once until usage is back under budget",
+					zap.Int64("usage", b.localUsage()),
+					zap.Int64("budget", b.localBlobMaxBytes))
+			}
 		}
 	}
 	if b.localUsage() <= b.localBlobMaxBytes {
 		b.overBudgetWarned = false
+		b.timeLimitLogged = false
 	}
 	if b.lastOrphanPass.IsZero() || now.Sub(b.lastOrphanPass) >= orphanPassInterval {
 		orphanCtx, cancel := context.WithTimeout(ctx, orphanPassTimeLimit)
@@ -142,10 +156,14 @@ func (b *Backend) SweepLocalBlobs(ctx context.Context) (LocalBlobSweepStats, err
 		cancel()
 		stats.OrphanFiles, stats.OrphanBytes = files, bytes
 		b.localBlobMetrics.removed(ctx, removedOrphan, files, bytes)
-		if err != nil {
+		b.lastOrphanPass = now
+		switch {
+		case errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil:
+			b.logger.Info("local blob orphan pass reached its time limit; the next pass, in an hour, starts again",
+				zap.Int64("files", files),
+				zap.Int64("bytes", bytes))
+		case err != nil:
 			errs = append(errs, fmt.Errorf("s3frontend: local blob orphan pass: %w", err))
-		} else {
-			b.lastOrphanPass = now
 		}
 	}
 	return stats, errors.Join(errs...)
@@ -256,44 +274,63 @@ func (b *Backend) evictToBudget(ctx context.Context, deadline time.Time, honorRe
 // finished, and blob files with no intent row (a split that failed before
 // its intents were recorded), in the spool and the cache. The age must exceed
 // the longest time one request body takes to stream, because a request
-// records its intents only after its whole body is spooled. Each directory's
-// scan also recounts its blob files. A file it cannot remove is skipped and
-// the failures are logged once, so one bad file neither stops the pass nor
-// makes it rerun every sweep; only a failed scan or query fails the pass. Ages
-// are measured from now, the sweep's time.
+// records its intents only after its whole body is spooled. The scans take no
+// lock, so writes and moves go on meanwhile; a file found in the spool may have
+// moved to the cache by the time it is checked, which removeLocal handles. It
+// checks the spool's blobs first, since they are few and a stray one may be the
+// cause of an over-budget spool, then the cache's in random order, so a pass
+// that runs out of time still covers a different part of a large cache each
+// hour. A file it cannot remove is skipped and the failures are logged once,
+// so one bad file does not stop the pass; only a failed scan or query does.
+// Ages are measured from now, the sweep's time.
 func (b *Backend) removeSpoolOrphans(ctx context.Context, now time.Time) (files, bytes int64, err error) {
 	var failed removeFailures
 	defer failed.log(b.logger, "orphan")
 	cutoff := now.Add(-b.localBlobOrphanAge)
-	var oldTemps []string
-	var oldBlobs []multihash.Multihash
-	collect := func(f blockstore.BlobFile) {
-		if !f.ModTime.Before(cutoff) {
-			return
-		}
-		if f.Digest == nil {
-			oldTemps = append(oldTemps, f.Name)
-		} else {
-			oldBlobs = append(oldBlobs, f.Digest)
+	// Each directory's old temp files, and the digests of its old blobs.
+	type found struct {
+		temps []string
+		blobs []multihash.Multihash
+	}
+	collect := func(into *found) func(blockstore.BlobFile) {
+		return func(f blockstore.BlobFile) {
+			if !f.ModTime.Before(cutoff) {
+				return
+			}
+			if f.Digest == nil {
+				into.temps = append(into.temps, f.Name)
+			} else {
+				into.blobs = append(into.blobs, f.Digest)
+			}
 		}
 	}
-	if err := b.spool.Scan(collect); err != nil {
+	var inSpool, inCache found
+	if err := b.spool.Scan(ctx, collect(&inSpool)); err != nil {
 		return 0, 0, err
 	}
-	if err := b.cache.Scan(collect); err != nil {
+	if err := b.cache.Scan(ctx, collect(&inCache)); err != nil {
 		return 0, 0, err
 	}
-	for _, name := range oldTemps {
-		freed, err := b.spool.RemoveTemp(name)
-		if err != nil {
-			failed.add(name, err)
-			continue
-		}
-		if freed > 0 {
-			files++
-			bytes += freed
+	for _, t := range []struct {
+		remove func(string) (int64, error)
+		names  []string
+	}{{b.spool.RemoveTemp, inSpool.temps}, {b.cache.RemoveTemp, inCache.temps}} {
+		for _, name := range t.names {
+			freed, err := t.remove(name)
+			if err != nil {
+				failed.add(name, err)
+				continue
+			}
+			if freed > 0 {
+				files++
+				bytes += freed
+			}
 		}
 	}
+	rand.Shuffle(len(inCache.blobs), func(i, j int) {
+		inCache.blobs[i], inCache.blobs[j] = inCache.blobs[j], inCache.blobs[i]
+	})
+	oldBlobs := append(inSpool.blobs, inCache.blobs...)
 	batch := b.localBlobSweepBatch
 	if batch <= 0 {
 		batch = localBlobSweepBatch

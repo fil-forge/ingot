@@ -267,18 +267,18 @@ func TestSweepLocalBlobs_FileAlreadyGoneIsMarkedEvicted(t *testing.T) {
 }
 
 // TestSweepLocalBlobs_OrphanPass: old .tmp-* files and old blob files with no
-// intent are deleted; young ones, and old files with an intent, stay; the
-// usage count is reset to the blob files that remain. A temp file counts
-// only while a live write holds it, so the young one this test wrote by hand
-// does not.
+// intent are deleted, in the spool and the cache; young ones, and old files
+// with an intent, stay; the usage count comes to the blob files that remain.
+// A temp file counts only while a live write holds it, so the young one this
+// test wrote by hand does not.
 func TestSweepLocalBlobs_OrphanPass(t *testing.T) {
 	ctx := t.Context()
 	b, mem := newSweepBackend(t)
 	old := time.Now().Add(-2 * DefaultLocalBlobOrphanAge)
 
-	writeFile := func(name, body string, modTime time.Time) string {
+	writeFile := func(dir, name, body string, modTime time.Time) string {
 		t.Helper()
-		path := filepath.Join(filepath.Dir(b.spool.Path(multihash.Multihash{0})), name)
+		path := filepath.Join(dir, name)
 		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -287,11 +287,16 @@ func TestSweepLocalBlobs_OrphanPass(t *testing.T) {
 		}
 		return path
 	}
-	writeBlob := func(body string, modTime time.Time, withIntent bool) string {
+	writeBlob := func(body string, modTime time.Time, withIntent, cached bool) string {
 		t.Helper()
 		d, n, err := b.spool.WriteBlob(ctx, bytes.NewReader([]byte(body)))
 		if err != nil {
 			t.Fatalf("WriteBlob: %v", err)
+		}
+		if cached {
+			if _, err := b.cache.Take(b.spool, d); err != nil {
+				t.Fatalf("Take: %v", err)
+			}
 		}
 		if withIntent {
 			if err := mem.PutIntent(ctx, registry.UploadIntent{Digest: d, LocalPath: localPath(b, d), Size: n, State: registry.IntentSpooled}); err != nil {
@@ -303,12 +308,17 @@ func TestSweepLocalBlobs_OrphanPass(t *testing.T) {
 		}
 		return localPath(b, d)
 	}
+	spoolDir := filepath.Dir(b.spool.Path(multihash.Multihash{0}))
+	cacheDir := filepath.Dir(b.cache.Path(multihash.Multihash{0}))
 	paths := map[string]string{
-		"old temp":             writeFile(".tmp-old", "partial", old),
-		"young temp":           writeFile(".tmp-young", "partial", time.Now()),
-		"old orphan blob":      writeBlob("old orphan", old, false),
-		"young orphan blob":    writeBlob("young orphan", time.Now(), false),
-		"old blob with intent": writeBlob("old with intent", old, true),
+		"old temp":                    writeFile(spoolDir, ".tmp-old", "partial", old),
+		"young temp":                  writeFile(spoolDir, ".tmp-young", "partial", time.Now()),
+		"old temp in cache":           writeFile(cacheDir, ".tmp-old", "partial", old),
+		"old orphan blob":             writeBlob("old orphan", old, false, false),
+		"young orphan blob":           writeBlob("young orphan", time.Now(), false, false),
+		"old blob with intent":        writeBlob("old with intent", old, true, false),
+		"old orphan blob in cache":    writeBlob("old cached orphan", old, false, true),
+		"old cached blob with intent": writeBlob("old cached with intent", old, true, true),
 	}
 
 	sweepLocalBlobs(t, b)
@@ -326,13 +336,16 @@ func TestSweepLocalBlobs_OrphanPass(t *testing.T) {
 		Usage  int64
 	}{
 		OnDisk: map[string]bool{
-			"old temp":             false,
-			"young temp":           true,
-			"old orphan blob":      false,
-			"young orphan blob":    true,
-			"old blob with intent": true,
+			"old temp":                    false,
+			"young temp":                  true,
+			"old temp in cache":           false,
+			"old orphan blob":             false,
+			"young orphan blob":           true,
+			"old blob with intent":        true,
+			"old orphan blob in cache":    false,
+			"old cached blob with intent": true,
 		},
-		Usage: int64(len("young orphan") + len("old with intent")),
+		Usage: int64(len("young orphan") + len("old with intent") + len("old cached with intent")),
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("spool after the orphan pass = %+v, want %+v", got, want)
@@ -472,9 +485,52 @@ func (w writingIntents) MissingIntents(ctx context.Context, digests []multihash.
 	return w.IntentStore.MissingIntents(ctx, digests)
 }
 
+// failingIntents fails every MissingIntents query and counts the calls.
+type failingIntents struct {
+	registry.IntentStore
+	calls *int
+}
+
+func (f failingIntents) MissingIntents(context.Context, []multihash.Multihash) ([]multihash.Multihash, error) {
+	*f.calls++
+	return nil, errors.New("database unavailable")
+}
+
+// TestSweepLocalBlobs_OrphanPassBacksOffAfterAFailure: an orphan pass whose
+// query fails reports the error but still counts as run, so the next sweep
+// within the hour does not scan again.
+func TestSweepLocalBlobs_OrphanPassBacksOffAfterAFailure(t *testing.T) {
+	ctx := t.Context()
+	b, _ := newSweepBackend(t)
+	d, _, err := b.spool.WriteBlob(ctx, bytes.NewReader([]byte("old orphan")))
+	if err != nil {
+		t.Fatalf("WriteBlob: %v", err)
+	}
+	old := time.Now().Add(-2 * DefaultLocalBlobOrphanAge)
+	if err := os.Chtimes(localPath(b, d), old, old); err != nil {
+		t.Fatal(err)
+	}
+	var calls int
+	b.intents = failingIntents{IntentStore: b.intents, calls: &calls}
+
+	_, firstErr := b.SweepLocalBlobs(ctx)
+	_, secondErr := b.SweepLocalBlobs(ctx)
+
+	got := struct {
+		FirstFailed, SecondFailed bool
+		Calls                     int
+	}{firstErr != nil, secondErr != nil, calls}
+	want := struct {
+		FirstFailed, SecondFailed bool
+		Calls                     int
+	}{true, false, 1}
+	if got != want {
+		t.Fatalf("two sweeps against a failing database = %+v, want %+v", got, want)
+	}
+}
+
 // TestSweepLocalBlobs_OrphanPassKeepsConcurrentWrites: a blob written while the
-// orphan pass runs is still counted once the pass has corrected the usage
-// count to its scan.
+// orphan pass runs is still counted after it.
 func TestSweepLocalBlobs_OrphanPassKeepsConcurrentWrites(t *testing.T) {
 	ctx := t.Context()
 	b, _ := newSweepBackend(t)
