@@ -328,8 +328,11 @@ type IntentStore interface {
 	// 'published' with a blob_locations row for the digest in any space, or
 	// 'parked' with a blob_parks row. The state alone is not enough: a
 	// single PUT marks a blob accepted before it records the location, and
-	// a failed location write leaves it accepted with none. Ordered by
-	// (UpdatedAt, Digest), starting after the cursor, at most limit rows.
+	// a failed location write leaves it accepted with none. A location in
+	// any space qualifies only because a digest belongs to one space: each
+	// write encrypts under a fresh key bound to its space, so no two spaces
+	// upload the same digest. Ordered by (UpdatedAt, Digest), starting after
+	// the cursor, at most limit rows.
 	ListEvictable(ctx context.Context, after EvictCursor, limit int) ([]UploadIntent, error)
 	// MarkEvicted records that the digest's spool file is gone, leaving
 	// State and UpdatedAt alone. Returns ErrNotFound when the intent is gone

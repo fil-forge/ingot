@@ -429,3 +429,54 @@ func TestSweepSpool_OrphanPassKeepsConcurrentWrites(t *testing.T) {
 		t.Fatalf("usage after the orphan pass = %d, want %d (the late blob, the orphan gone)", got, want)
 	}
 }
+
+// TestSweepSpool_OrphanPassSkipsAFileItCannotRemove: an orphan whose removal
+// fails is skipped; the pass removes the others and still counts as run, so
+// the next sweep does not repeat its scan.
+func TestSweepSpool_OrphanPassSkipsAFileItCannotRemove(t *testing.T) {
+	ctx := t.Context()
+	b, _ := newSweepBackend(t)
+	old := time.Now().Add(-2 * DefaultSpoolOrphanAge)
+	var digests []multihash.Multihash
+	for _, body := range []string{"stuck orphan", "other orphan"} {
+		d, _, err := b.spool.WriteBlob(ctx, bytes.NewReader([]byte(body)))
+		if err != nil {
+			t.Fatalf("WriteBlob: %v", err)
+		}
+		if err := os.Chtimes(b.spool.Path(d), old, old); err != nil {
+			t.Fatal(err)
+		}
+		digests = append(digests, d)
+	}
+	// After the scan, a non-empty directory replaces the first orphan, so
+	// its removal fails.
+	stuck := b.spool.Path(digests[0])
+	b.intents = writingIntents{IntentStore: b.intents, write: func() {
+		if err := os.Remove(stuck); err != nil {
+			t.Errorf("remove: %v", err)
+		}
+		if err := os.MkdirAll(filepath.Join(stuck, "child"), 0o755); err != nil {
+			t.Errorf("mkdir: %v", err)
+		}
+	}}
+
+	stats, err := b.SweepSpool(ctx)
+	if err != nil {
+		t.Fatalf("SweepSpool: %v", err)
+	}
+
+	_, otherErr := os.Stat(b.spool.Path(digests[1]))
+	got := struct {
+		OrphanFiles int64
+		OtherGone   bool
+		Recorded    bool
+	}{stats.OrphanFiles, os.IsNotExist(otherErr), !b.lastOrphanPass.IsZero()}
+	want := struct {
+		OrphanFiles int64
+		OtherGone   bool
+		Recorded    bool
+	}{1, true, true}
+	if got != want {
+		t.Fatalf("orphan pass = %+v, want %+v", got, want)
+	}
+}
