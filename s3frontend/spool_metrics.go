@@ -15,10 +15,11 @@ const meterName = "github.com/fil-forge/ingot/s3frontend"
 // Why a spool file was removed: the reason attribute on the eviction
 // counters.
 const (
-	spoolRemovedReleased = "released" // its object was deleted or its upload abandoned
-	spoolRemovedParked   = "parked"   // a multipart part parked on its provider
-	spoolRemovedBudget   = "budget"   // the budget pass evicted it
-	spoolRemovedOrphan   = "orphan"   // the orphan pass found no intent for it
+	spoolRemovedReleased     = "released"      // its object was deleted or its upload abandoned
+	spoolRemovedParked       = "parked"        // a multipart part parked on its provider
+	spoolRemovedBudget       = "budget"        // the budget pass evicted it
+	spoolRemovedBudgetForced = "budget_forced" // the forced pass evicted it inside a retention window
+	spoolRemovedOrphan       = "orphan"        // the orphan pass found no intent for it
 )
 
 // spoolMetrics counts the files removed from the spool, by reason. The

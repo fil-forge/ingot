@@ -217,8 +217,10 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		PendingReleases: deps.PendingReleases,
 		ReleaseGrace:    cfg.ReleaseGrace,
 
-		SpoolMaxBytes:  cfg.SpoolMaxBytes,
-		SpoolOrphanAge: cfg.SpoolOrphanAge,
+		SpoolMaxBytes:      cfg.SpoolMaxBytes,
+		SpoolMinResidency:  cfg.SpoolMinResidency,
+		SpoolReadRetention: cfg.SpoolReadRetention,
+		SpoolOrphanAge:     cfg.SpoolOrphanAge,
 
 		MaxBlobSize: cfg.MaxBlobSize,
 		CORS:        cfg.CORSConfig,
@@ -374,6 +376,8 @@ func (s *Server) startSpoolSweeper() {
 					s.logger.Info("spool sweep removed files",
 						zap.Int64("budget_files", stats.BudgetFiles),
 						zap.Int64("budget_bytes", stats.BudgetBytes),
+						zap.Int64("forced_files", stats.ForcedFiles),
+						zap.Int64("forced_bytes", stats.ForcedBytes),
 						zap.Int64("orphan_files", stats.OrphanFiles),
 						zap.Int64("orphan_bytes", stats.OrphanBytes),
 						zap.Int64("usage_bytes", s.backend.SpoolUsage()),

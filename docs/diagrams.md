@@ -597,9 +597,9 @@ flowchart TB
   and `published`, a park row for `parked`), oldest state change first, down
   to 90% of the budget. The intent keeps its row and state and gains
   `evicted_at`; reads fall through to the network tier. `spooled` and
-  `uploading` files are never evicted. The parked-part drop at UploadPart
-  marks `evicted_at` the same way. A committed blob's release removes its
-  spool copy with the intent.
+  `uploading` files are never evicted. A released committed blob has lost
+  its location row, so the budget pass does not evict it: its envelope stays
+  until the insurance-copy decision is made.
 - Digests present in both the old and new version sets never churn: the
   reconcile computes a set difference.
 - Parked-blob reclamation is guarded: a digest live in another session, part,

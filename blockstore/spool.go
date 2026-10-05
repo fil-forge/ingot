@@ -1,6 +1,7 @@
 package blockstore
 
 import (
+	"container/list"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -27,8 +29,8 @@ import (
 // tier, until it is removed. Network reads never refill the spool.
 //
 // Spool is deliberately pure file I/O: a blockstore.BlockReader plus the
-// streaming BlobReader/BlobWriter, plus a running byte count of its blob files.
-// The lifecycle of a blob (the
+// streaming BlobReader/BlobWriter, a running byte count of its blob files, and
+// the time each blob was last read from it. The lifecycle of a blob (the
 // upload_intents state machine, eviction policy) is owned by the caller that
 // has the registry handle — blockstore cannot import registry without a cycle
 // (registry imports blockstore for the segment-metadata types).
@@ -37,11 +39,16 @@ type Spool struct {
 	// usage is the byte count of the finished blob files. In-flight .tmp-*
 	// files are never counted.
 	usage atomic.Int64
+	reads *recencyMap
 }
 
 // spoolTempPrefix names the files WriteBlob streams into before the rename to
 // the digest path.
 const spoolTempPrefix = ".tmp-"
+
+// recencyCapacity caps how many blobs' last-read times the spool remembers.
+// The least recently read entry is dropped first.
+const recencyCapacity = 65536
 
 // NewSpool opens (creating if needed) a spool rooted at dir. It deletes every
 // leftover .tmp-* file (a write the previous process never finished; nothing
@@ -55,7 +62,7 @@ func NewSpool(dir string) (*Spool, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("blockstore: spool mkdir: %w", err)
 	}
-	s := &Spool{dir: dir}
+	s := &Spool{dir: dir, reads: newRecencyMap(recencyCapacity)}
 	var removeErr error
 	total, err := s.Scan(func(e SpoolEntry) {
 		if e.Digest != nil || removeErr != nil {
@@ -143,6 +150,12 @@ func (s *Spool) Usage() int64 {
 // off by that file's size until the next reset.
 func (s *Spool) ResetUsage(n int64) {
 	s.usage.Store(n)
+}
+
+// LastRead reports when the blob with the given digest was last served from
+// the spool by this process, if it is still remembered.
+func (s *Spool) LastRead(digest mh.Multihash) (time.Time, bool) {
+	return s.reads.get(string(digest))
 }
 
 // RemoveTemp deletes one .tmp-* file by name. Idempotent. It refuses any other
@@ -249,6 +262,7 @@ func (s *Spool) OpenBlob(_ context.Context, _ did.DID, digest mh.Multihash) (io.
 	if err != nil {
 		return nil, fmt.Errorf("blockstore: spool open %s: %w", digest.B58String(), err)
 	}
+	s.reads.touch(string(digest), time.Now())
 	return f, nil
 }
 
@@ -264,6 +278,7 @@ func (s *Spool) OpenBlobRange(_ context.Context, _ did.DID, digest mh.Multihash,
 	if err != nil {
 		return nil, fmt.Errorf("blockstore: spool open %s: %w", digest.B58String(), err)
 	}
+	s.reads.touch(string(digest), time.Now())
 	return readerCloser{Reader: io.NewSectionReader(f, start, end-start+1), Closer: f}, nil
 }
 
@@ -279,7 +294,51 @@ func (s *Spool) GetBlock(_ context.Context, _ did.DID, c cid.Cid) (block.Block, 
 	if err != nil {
 		return nil, fmt.Errorf("blockstore: spool read %s: %w", c, err)
 	}
+	s.reads.touch(string(c.Hash()), time.Now())
 	return block.NewBlockWithCid(data, c)
+}
+
+// recencyMap is a bounded LRU of last-read times, keyed by digest bytes.
+type recencyMap struct {
+	mu      sync.Mutex
+	cap     int
+	order   *list.List // front = most recently read; values are *recencyEntry
+	entries map[string]*list.Element
+}
+
+type recencyEntry struct {
+	key string
+	at  time.Time
+}
+
+func newRecencyMap(capacity int) *recencyMap {
+	return &recencyMap{cap: capacity, order: list.New(), entries: map[string]*list.Element{}}
+}
+
+func (m *recencyMap) touch(key string, at time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if el, ok := m.entries[key]; ok {
+		el.Value.(*recencyEntry).at = at
+		m.order.MoveToFront(el)
+		return
+	}
+	m.entries[key] = m.order.PushFront(&recencyEntry{key: key, at: at})
+	if m.order.Len() > m.cap {
+		oldest := m.order.Back()
+		m.order.Remove(oldest)
+		delete(m.entries, oldest.Value.(*recencyEntry).key)
+	}
+}
+
+func (m *recencyMap) get(key string) (time.Time, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	el, ok := m.entries[key]
+	if !ok {
+		return time.Time{}, false
+	}
+	return el.Value.(*recencyEntry).at, true
 }
 
 // Compile-time assertions: Spool is a raw-block read tier and the streaming

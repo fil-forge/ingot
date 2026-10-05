@@ -209,8 +209,9 @@ path or string-encoded UCAN container, required alongside the URL and
 validated at startup down to holding at least one delegation),
 `TokenStoreDir` (→
 `DataDir`), `MultipartSessionTTL` (0 → 7d, negative → sweeper off),
-`SpoolMaxBytes` (0 → no spool budget) and `SpoolOrphanAge` (24h, ≥ 1h) for
-the spool sweeper (`s3frontend.SweepSpool`),
+`SpoolMaxBytes` (0 → no spool budget) with `SpoolMinResidency` (10m),
+`SpoolReadRetention` (1h) and `SpoolOrphanAge` (24h, ≥ 1h) for the spool
+sweeper (`s3frontend.SweepSpool`),
 `CORSAllowedOrigins`, `LogLevel`. `Config.ServerConfig()` is the single
 mapping site. The daemon's config (cmd/) adds `postgres_dsn`,
 `identity.key_file` (the agent's PEM key) and `identity.service_id` (optional

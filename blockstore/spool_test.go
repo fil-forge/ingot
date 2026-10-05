@@ -8,7 +8,9 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 
+	"github.com/fil-forge/ucantone/did"
 	mh "github.com/multiformats/go-multihash"
 )
 
@@ -174,5 +176,79 @@ func TestSpoolRemoveTempRejectsBlobNames(t *testing.T) {
 	d := writeTestBlob(t, s, "hello")
 	if err := s.RemoveTemp(filepath.Base(s.Path(d))); err == nil {
 		t.Fatal("RemoveTemp of a blob file name succeeded, want an error")
+	}
+}
+
+func TestSpoolLastRead(t *testing.T) {
+	ctx := context.Background()
+	cases := []struct {
+		name string
+		read func(t *testing.T, s *Spool, d mh.Multihash)
+		want bool
+	}{
+		{
+			name: "OpenBlob hit records the read",
+			read: func(t *testing.T, s *Spool, d mh.Multihash) {
+				r, err := s.OpenBlob(ctx, did.Undef, d)
+				if err != nil {
+					t.Fatalf("OpenBlob: %v", err)
+				}
+				_ = r.Close()
+			},
+			want: true,
+		},
+		{
+			name: "OpenBlobRange hit records the read",
+			read: func(t *testing.T, s *Spool, d mh.Multihash) {
+				r, err := s.OpenBlobRange(ctx, did.Undef, d, 0, 1)
+				if err != nil {
+					t.Fatalf("OpenBlobRange: %v", err)
+				}
+				_ = r.Close()
+			},
+			want: true,
+		},
+		{
+			name: "miss records nothing",
+			read: func(t *testing.T, s *Spool, d mh.Multihash) {
+				if _, err := s.Remove(d); err != nil {
+					t.Fatalf("Remove: %v", err)
+				}
+				if _, err := s.OpenBlob(ctx, did.Undef, d); !errors.Is(err, ErrNotFound) {
+					t.Fatalf("OpenBlob after remove: %v, want ErrNotFound", err)
+				}
+			},
+			want: false,
+		},
+		{
+			name: "write alone records nothing",
+			read: func(*testing.T, *Spool, mh.Multihash) {},
+			want: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestSpool(t)
+			d := writeTestBlob(t, s, "hello")
+			tc.read(t, s, d)
+			if _, ok := s.LastRead(d); ok != tc.want {
+				t.Fatalf("LastRead ok = %v, want %v", ok, tc.want)
+			}
+		})
+	}
+}
+
+func TestRecencyMapDropsLeastRecentlyRead(t *testing.T) {
+	m := newRecencyMap(2)
+	now := time.Now()
+	m.touch("a", now)
+	m.touch("b", now)
+	m.touch("a", now) // a is now the most recent
+	m.touch("c", now) // evicts b
+	_, hasA := m.get("a")
+	_, hasB := m.get("b")
+	_, hasC := m.get("c")
+	if got := [3]bool{hasA, hasB, hasC}; got != [3]bool{true, false, true} {
+		t.Fatalf("remembered [a b c] = %v, want [true false true]", got)
 	}
 }

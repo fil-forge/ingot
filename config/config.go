@@ -112,6 +112,17 @@ type Config struct {
 	// that must stay (blobs not yet accepted, orphans younger than
 	// SpoolOrphanAge). 0 → no budget (the default); negative is an error.
 	SpoolMaxBytes int64 `mapstructure:"spool_max_bytes" yaml:"spool_max_bytes"`
+	// SpoolMinResidency is the read-after-write window (Go duration string):
+	// the sweeper leaves alone a blob whose upload state changed less than
+	// this long ago (for a committed blob, its commit time) unless usage
+	// stays over budget without it. Costs ingest rate × residency in disk.
+	// Empty → default 10m; "0s" turns it off; negative is an error.
+	SpoolMinResidency string `mapstructure:"spool_min_residency" yaml:"spool_min_residency"`
+	// SpoolReadRetention is the read-cache window (Go duration string): the
+	// sweeper leaves alone a blob served from the spool within this long,
+	// unless usage stays over budget without it. Empty → default 1h; "0s"
+	// turns it off; negative is an error.
+	SpoolReadRetention string `mapstructure:"spool_read_retention" yaml:"spool_read_retention"`
 	// SpoolOrphanAge is the age (file modification time) at which the
 	// sweeper deletes a .tmp-* file or a spool file with no upload intent
 	// (Go duration string). It must exceed the longest time one request body
@@ -198,6 +209,14 @@ func (c Config) ServerConfig() (ServerConfig, error) {
 			releaseGrace = 0
 		}
 	}
+	spoolMinResidency, err := parseSpoolWindow("spool_min_residency", c.SpoolMinResidency, 10*time.Minute)
+	if err != nil {
+		return ServerConfig{}, err
+	}
+	spoolReadRetention, err := parseSpoolWindow("spool_read_retention", c.SpoolReadRetention, time.Hour)
+	if err != nil {
+		return ServerConfig{}, err
+	}
 	spoolOrphanAge, err := parseSpoolWindow("spool_orphan_age", c.SpoolOrphanAge, 24*time.Hour)
 	if err != nil {
 		return ServerConfig{}, err
@@ -233,8 +252,10 @@ func (c Config) ServerConfig() (ServerConfig, error) {
 		MultipartSessionTTL: mpTTL,
 		ReleaseGrace:        releaseGrace,
 
-		SpoolMaxBytes:  c.SpoolMaxBytes,
-		SpoolOrphanAge: spoolOrphanAge,
+		SpoolMaxBytes:      c.SpoolMaxBytes,
+		SpoolMinResidency:  spoolMinResidency,
+		SpoolReadRetention: spoolReadRetention,
+		SpoolOrphanAge:     spoolOrphanAge,
 	}, nil
 }
 

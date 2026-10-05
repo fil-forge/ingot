@@ -21,8 +21,8 @@ const (
 	spoolLowWatermarkPercent = 90
 	// spoolSweepBatch is how many rows a pass reads per query.
 	spoolSweepBatch = 512
-	// spoolBudgetPassTimeLimit caps the budget pass so the orphan pass that
-	// may follow still runs within the sweep's time.
+	// spoolBudgetPassTimeLimit caps the budget pass so the forced pass that
+	// may follow always gets the rest of the sweep's time.
 	spoolBudgetPassTimeLimit = 30 * time.Second
 	// spoolOrphanPassInterval spaces the orphan pass, which scans the whole
 	// spool directory and so stays off the per-sweep path.
@@ -35,20 +35,23 @@ const (
 // SpoolSweepStats counts what one SweepSpool run removed, per pass.
 type SpoolSweepStats struct {
 	BudgetFiles, BudgetBytes int64
+	ForcedFiles, ForcedBytes int64
 	OrphanFiles, OrphanBytes int64
 }
 
 // Removed reports whether the run removed anything.
 func (s SpoolSweepStats) Removed() bool {
-	return s.BudgetFiles+s.OrphanFiles > 0
+	return s.BudgetFiles+s.ForcedFiles+s.OrphanFiles > 0
 }
 
 // SweepSpool bounds the local spool. With a budget set (Deps.SpoolMaxBytes)
 // and usage over it, the budget pass evicts blobs the provider already holds
 // (registry.IntentStore.ListEvictable), oldest state change first, down to
-// 90% of the budget. Usage left over budget after that is files no rule lets
-// it remove (bodies being written or uploaded, blobs with no recorded
-// location, young orphans), and the pass logs a warning.
+// 90% of the budget. It stops at the first blob younger than
+// SpoolMinResidency, since every later one is newer, and skips a blob read
+// from the spool within SpoolReadRetention. If usage is still over budget,
+// the forced pass repeats it without either window: evicting a located blob
+// costs read latency, and a full disk fails every write.
 //
 // Eviction removes only the file. The intent keeps its row and state, marked
 // evicted: a release recognises a committed blob by its published state, and
@@ -69,11 +72,26 @@ func (b *Backend) SweepSpool(ctx context.Context) (SpoolSweepStats, error) {
 	var stats SpoolSweepStats
 	if b.spoolMaxBytes > 0 && b.spool.Usage() > b.spoolMaxBytes {
 		deadline := time.Now().Add(spoolBudgetPassTimeLimit)
-		files, bytes, err := b.evictToBudget(ctx, deadline)
+		files, bytes, err := b.evictToBudget(ctx, deadline, true)
 		stats.BudgetFiles, stats.BudgetBytes = files, bytes
 		b.spoolMetrics.removed(ctx, spoolRemovedBudget, files, bytes)
 		if err != nil {
 			return stats, fmt.Errorf("s3frontend: spool budget pass: %w", err)
+		}
+	}
+	if b.spoolMaxBytes > 0 && b.spool.Usage() > b.spoolMaxBytes {
+		b.logger.Warn("spool is over budget after the budget pass; evicting blobs inside the retention windows",
+			zap.Int64("usage", b.spool.Usage()),
+			zap.Int64("budget", b.spoolMaxBytes))
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			deadline = time.Now().Add(spoolBudgetPassTimeLimit)
+		}
+		files, bytes, err := b.evictToBudget(ctx, deadline, false)
+		stats.ForcedFiles, stats.ForcedBytes = files, bytes
+		b.spoolMetrics.removed(ctx, spoolRemovedBudgetForced, files, bytes)
+		if err != nil {
+			return stats, fmt.Errorf("s3frontend: spool forced pass: %w", err)
 		}
 		if b.spool.Usage() > b.spoolMaxBytes {
 			b.logger.Warn("spool is still over budget with nothing left to evict: the remaining files are bodies being written or uploaded, blobs with no recorded location, or orphans younger than spool_orphan_age",
@@ -98,11 +116,13 @@ func (b *Backend) SpoolUsage() int64 {
 	return b.spool.Usage()
 }
 
-// evictToBudget pages through the evictable intents, oldest state change
-// first, removing each file and marking its intent evicted, until usage is at
-// the low watermark, the rows run out, or the deadline passes.
-func (b *Backend) evictToBudget(ctx context.Context, deadline time.Time) (files, bytes int64, err error) {
+// evictToBudget pages through the evictable intents, removing each file and
+// marking its intent evicted, until usage is at the low watermark, the rows
+// run out, or the deadline passes. honorRetention applies the residency stop
+// and the read-recency skip.
+func (b *Backend) evictToBudget(ctx context.Context, deadline time.Time, honorRetention bool) (files, bytes int64, err error) {
 	target := b.spoolMaxBytes / 100 * spoolLowWatermarkPercent
+	now := time.Now()
 	var cursor registry.EvictCursor
 	for b.spool.Usage() > target && time.Now().Before(deadline) {
 		page, err := b.intents.ListEvictable(ctx, cursor, spoolSweepBatch)
@@ -117,6 +137,14 @@ func (b *Backend) evictToBudget(ctx context.Context, deadline time.Time) (files,
 				return files, bytes, nil
 			}
 			cursor = registry.EvictCursor{UpdatedAt: in.UpdatedAt, Digest: in.Digest}
+			if honorRetention {
+				if now.Sub(in.UpdatedAt) < b.spoolMinResidency {
+					return files, bytes, nil
+				}
+				if at, ok := b.spool.LastRead(in.Digest); ok && now.Sub(at) < b.spoolReadRetention {
+					continue
+				}
+			}
 			freed, err := b.spool.Remove(in.Digest)
 			if err != nil {
 				return files, bytes, err

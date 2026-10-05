@@ -197,9 +197,12 @@ qualifies only through a row that proves the provider has it: a
 `blob_locations` row for an `accepted` or `published` intent, a `blob_parks`
 row for a `parked` one. The state alone does not qualify a blob, because a
 single PUT marks it accepted before recording its location. `spooled` and
-`uploading` files are the only copy and never qualify. Eviction order is
-age alone, so the newest bodies, the likeliest to be read back soon after
-they are written, go last. Eviction removes the file first, then sets
+`uploading` files are the only copy and never qualify. The sweeper first
+honours two windows, `spool_min_residency` (10 minutes after the last state
+change, so a client reading back what it just wrote reads from disk) and
+`spool_read_retention` (an hour after a read from the spool, tracked in
+memory); if usage is still over budget it evicts inside them too, since a
+full disk fails every write. Eviction removes the file first, then sets
 `upload_intents.evicted_at`; the row and its state stay, because a release
 and Complete read them. A read of an evicted blob misses the spool and goes
 to the network tier. Hourly, the sweeper also deletes `.tmp-*` files and

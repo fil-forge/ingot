@@ -3,6 +3,7 @@ package s3frontend
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/fil-forge/versitygw/backend"
 	"go.opentelemetry.io/otel/attribute"
@@ -110,5 +111,24 @@ func TestSpoolMetrics_Release(t *testing.T) {
 	if got["ingot.spool.evictions/released"] != 1 || got["ingot.spool.evicted/released"] != size {
 		t.Fatalf("released removals = %d files, %d bytes; want 1 file, %d bytes (all: %v)",
 			got["ingot.spool.evictions/released"], got["ingot.spool.evicted/released"], size, got)
+	}
+}
+
+func TestSpoolMetrics_ForcedPass(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	b, _ := newSweepBackend(t, meteredBackend(reader), func(d *Deps) { d.SpoolMinResidency = time.Hour })
+	digests := putSweepObjects(t, b, 4)
+	size := blobSize(t, b, digests[0])
+	budgetToEvict(b, 2, size)
+
+	sweepSpool(t, b)
+
+	got := collectSpoolMetrics(t, reader)
+	if got["ingot.spool.evictions/budget_forced"] != 2 || got["ingot.spool.evicted/budget_forced"] != 2*size {
+		t.Fatalf("forced removals = %d files, %d bytes; want 2 files, %d bytes (all: %v)",
+			got["ingot.spool.evictions/budget_forced"], got["ingot.spool.evicted/budget_forced"], 2*size, got)
+	}
+	if _, ok := got["ingot.spool.evictions/budget"]; ok {
+		t.Fatalf("the budget pass recorded removals inside the residency window: %v", got)
 	}
 }

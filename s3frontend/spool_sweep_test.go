@@ -5,12 +5,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/multiformats/go-multihash"
 
 	"github.com/fil-forge/libforge/testutil"
@@ -28,7 +30,8 @@ import (
 const sweepBucket = "sweep"
 
 // newSweepBackend returns a backend over an on-disk spool with a bucket that
-// has a space and a tenant.
+// has a space and a tenant, and no residency or read-retention window unless
+// a mod sets one.
 func newSweepBackend(t *testing.T, mods ...func(*Deps)) (*Backend, *inmem.MemStore) {
 	t.Helper()
 	b, mem := newDeferredBackend(t, inmem.NopUploader{}, mods...)
@@ -131,6 +134,45 @@ func TestSweepSpool_UsageEndsAtOrBelowTheLowWatermark(t *testing.T) {
 
 	if target := b.spoolMaxBytes / 100 * spoolLowWatermarkPercent; b.spool.Usage() > target {
 		t.Fatalf("usage after the sweep = %d, want at most %d", b.spool.Usage(), target)
+	}
+}
+
+// TestSweepSpool_ResidencyHoldsUntilTheForcedPass: with every blob inside the
+// residency window the budget pass evicts nothing, and the forced pass then
+// evicts to the watermark anyway.
+func TestSweepSpool_ResidencyHoldsUntilTheForcedPass(t *testing.T) {
+	b, _ := newSweepBackend(t, func(d *Deps) { d.SpoolMinResidency = time.Hour })
+	digests := putSweepObjects(t, b, 4)
+	size := blobSize(t, b, digests[0])
+	budgetToEvict(b, 2, size)
+
+	stats := sweepSpool(t, b)
+
+	want := SpoolSweepStats{ForcedFiles: 2, ForcedBytes: 2 * size}
+	if stats != want {
+		t.Fatalf("sweep stats = %+v, want %+v", stats, want)
+	}
+}
+
+// TestSweepSpool_SkipsRecentlyReadBlobs: the oldest blob was just read from
+// the spool, so the budget pass passes over it and evicts the next one.
+func TestSweepSpool_SkipsRecentlyReadBlobs(t *testing.T) {
+	b, mem := newSweepBackend(t, func(d *Deps) { d.SpoolReadRetention = time.Hour })
+	digests := putSweepObjects(t, b, 4)
+	bucket, key := sweepBucket, "obj-0"
+	got, err := b.GetObject(context.Background(), &s3.GetObjectInput{Bucket: &bucket, Key: &key})
+	if err != nil {
+		t.Fatalf("GetObject: %v", err)
+	}
+	_, _ = io.Copy(io.Discard, got.Body)
+	got.Body.Close()
+	budgetToEvict(b, 1, blobSize(t, b, digests[0]))
+
+	sweepSpool(t, b)
+
+	want := []blobState{{true, false}, {false, true}, {true, false}, {true, false}}
+	if states := blobStates(t, b, mem, digests); !reflect.DeepEqual(states, want) {
+		t.Fatalf("blobs after the sweep = %+v, want %+v", states, want)
 	}
 }
 

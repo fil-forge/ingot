@@ -151,6 +151,14 @@ copy is not needed once the provider holds the body:
   down to 90% of the budget. Later reads of an evicted body go to the
   provider and take provider-read latency.
 
+Two windows keep bodies local while the budget allows:
+`spool_min_residency` (default `10m`) passes over bodies whose upload changed
+state that recently (for a committed object, its commit), so a client reading
+back what it just wrote reads from disk, and `spool_read_retention` (default
+`1h`) passes over bodies read from the spool that recently. If usage is still
+over budget after that, the sweeper evicts inside both windows, oldest first:
+a full disk fails every write. `0s` turns either window off.
+
 The budget is off by default (`spool_max_bytes: 0`): without it the spool
 grows with every live object's bodies. The sweeper also deletes, hourly,
 unfinished `.tmp-*` writes and files no upload names, once they are older
@@ -159,7 +167,10 @@ than `spool_orphan_age` (default `24h`, at least `1h`).
 **Sizing.** The spool's filesystem needs room for:
 
 - `spool_max_bytes`, plus 10% headroom that must exceed the ingest rate × 30
-  seconds (60 GB at 2 GB/s);
+  seconds (60 GB at 2 GB/s). To evict outside `spool_min_residency`, the
+  budget must also exceed the ingest rate × the window (1.2 TB at 2 GB/s for
+  the default `10m`); below that, every sweep evicts inside the window and
+  logs a warning;
 - the bodies in flight: each concurrent PUT or UploadPart writes its body as
   it streams, and a part can be up to 5 GiB. Those files cannot be evicted
   until their upload finishes, so usage can run over the budget by that much;
@@ -172,7 +183,7 @@ than `spool_orphan_age` (default `24h`, at least `1h`).
 | -- | -- |
 | `ingot.spool.usage` | Bytes held by the spool's blob files |
 | `ingot.spool.budget` | `spool_max_bytes` (0: no budget) |
-| `ingot.spool.evictions`, `ingot.spool.evicted` | Files and bytes removed, by `reason`: `released`, `parked`, `budget`, `orphan` |
+| `ingot.spool.evictions`, `ingot.spool.evicted` | Files and bytes removed, by `reason`: `released`, `parked`, `budget`, `budget_forced` (inside a retention window), `orphan` |
 | `ingot.spool.reads` | Body-blob reads, by `tier`: `spool` or `network` (the spool's hit ratio) |
 
 **Manual cleanup.** Whether a spool file is safe to delete is not visible on

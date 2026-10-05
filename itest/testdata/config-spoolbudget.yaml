@@ -1,6 +1,6 @@
 # Ingot daemon config for the spool-budget itest — smelt's default
 # forge-mode config (systems/ingot/config/config.yaml) with a 4 MiB spool
-# budget, so the spool sweeper (every 30s)
+# budget and both retention windows off, so the spool sweeper (every 30s)
 # evicts provider-held blobs as soon as usage passes the budget. A dedicated
 # stack: other tests read envelopes back from the spool.
 # Mounted over /etc/ingot/config.yaml via stack.WithServiceConfig.
@@ -34,6 +34,8 @@ auth_service_proofs: "/proofs/hilt-ingot-s3-proof.txt"
 
 # The point of this config: evict to a small spool budget at once.
 spool_max_bytes: 4194304
+spool_min_residency: 0s
+spool_read_retention: 0s
 
 # Region CEK wrap provider (required): the stack's ingot-openbao transit
 # engine, provisioned by ingot-openbao-init; the token arrives via
