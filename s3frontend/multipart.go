@@ -1203,10 +1203,13 @@ func (b *Backend) recordStreamedPark(ctx context.Context, blob msbucket.BlobRef,
 // sweeper unwind it through the same row, and the object's reads go to the
 // provider once Complete records the location. The blob is durable on the
 // provider, so a failed remove costs only disk: it is logged, and the file
-// waits for the session's release.
+// stays until a release of the blob removes it. That is the session's
+// release if the part is aborted, superseded or expires, but its object's
+// release once Complete commits it, since the session's teardown leaves
+// committed blobs to their objects.
 func (b *Backend) dropParkedCopy(digest mh.Multihash) {
 	if err := b.spool.Remove(digest); err != nil {
-		b.logger.Warn("drop parked blob's spool copy failed; the session's release removes it",
+		b.logger.Warn("drop parked blob's spool copy failed; it stays until the blob's release",
 			zap.String("digest", hex.EncodeToString(digest)), zap.Error(err))
 	}
 }
