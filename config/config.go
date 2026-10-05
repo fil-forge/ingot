@@ -101,8 +101,9 @@ type Config struct {
 	// network remove + spool-copy removal) this long past the drop of its
 	// last reference claim (Go duration string), so in-flight readers holding
 	// the prior catalog root finish first. It bounds how long such a reader
-	// may take: a GET still streaming a deleted or overwritten object when
-	// the grace ends fails when it reaches a blob it has not yet opened.
+	// may take: a GET, or a copy reading the object as its source, still
+	// streaming a deleted or overwritten object when the grace ends fails
+	// when it reaches a blob it has not yet opened.
 	// Empty → default 60s; a negative duration makes releases due
 	// immediately.
 	ReleaseGrace string `mapstructure:"release_grace" yaml:"release_grace"`

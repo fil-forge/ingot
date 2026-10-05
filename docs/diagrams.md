@@ -576,7 +576,7 @@ flowchart TB
     accepted -->|"commit: AddBlobClaim, same transaction"| published
     published -->|"commit: reconcileClaims adds this version"| refs["blob_refs rows<br/>(digest, bucket, key, version_id)"]
     refs -->|"version delete or overwrite removes its row"| zero{"CountClaims == 0<br/>for (space, digest)?"}
-    zero -->|yes| rm["RemoveBlob: /blob/remove to sprue<br/>(space claim released)"]
+    zero -->|yes| rel["release record enqueued, due after release_grace<br/>(the published → deleted edge runs it)"]
     zero -->|no| keep["blob retained<br/>(still referenced)"]
 ```
 
