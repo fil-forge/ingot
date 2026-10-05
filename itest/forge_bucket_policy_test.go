@@ -45,7 +45,7 @@ func TestForgeBucketPolicy(t *testing.T) {
 	}
 
 	// Written out of order and with a duplicate; read back sorted and deduplicated.
-	written := fmt.Sprintf(`{"statement":[{"effect":"allow","principal":[%q],"action":["s3:PutObject","s3:GetObject","s3:PutObject"]}]}`, principal)
+	written := fmt.Sprintf(`{"Statement":[{"Effect":"Allow","Principal":[%q],"Action":["s3:PutObject","s3:GetObject","s3:PutObject"]}]}`, principal)
 	if _, err := client.PutBucketPolicy(ctx, &s3.PutBucketPolicyInput{Bucket: aws.String(bucket), Policy: aws.String(written)}); err != nil {
 		t.Fatalf("PutBucketPolicy: %v", err)
 	}
@@ -53,7 +53,7 @@ func TestForgeBucketPolicy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetBucketPolicy: %v", err)
 	}
-	want := fmt.Sprintf(`{"statement":[{"effect":"allow","principal":[%q],"action":["s3:GetObject","s3:PutObject"]}]}`, principal)
+	want := fmt.Sprintf(`{"Statement":[{"Effect":"Allow","Principal":[%q],"Action":["s3:GetObject","s3:PutObject"]}]}`, principal)
 	if aws.ToString(got.Policy) != want {
 		t.Fatalf("GetBucketPolicy = %s, want %s", aws.ToString(got.Policy), want)
 	}

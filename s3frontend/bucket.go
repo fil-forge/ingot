@@ -311,9 +311,6 @@ func (b *Backend) CreateBucket(ctx context.Context, input *s3.CreateBucketInput,
 		if errors.Is(err, bucketauthority.ErrExists) {
 			return s3err.GetAPIError(s3err.ErrBucketAlreadyExists)
 		}
-		if errors.Is(err, bucketauthority.ErrMalformedPolicy) {
-			return MalformedPolicy(err.Error())
-		}
 		return err
 	}
 	if err := b.reg.Create(ctx, name, id, init); err != nil {
@@ -567,9 +564,8 @@ func isIPv4(s string) bool {
 	return true
 }
 
-// MalformedPolicy is the S3 error for a bucket policy document the storage
-// system refuses, on a CreateBucket's x-bucket-policy header or a
-// PutBucketPolicy body (fil-one/RFC#30, "Failures").
+// MalformedPolicy is the S3 error for a PutBucketPolicy body the storage
+// system refuses (fil-one/RFC#30, "Failures").
 func MalformedPolicy(description string) s3err.APIError {
 	return s3err.APIError{Code: "MalformedPolicy", Description: description, HTTPStatusCode: http.StatusBadRequest}
 }
