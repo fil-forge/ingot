@@ -31,10 +31,11 @@ type blobDir struct {
 	dir string
 	// kind names the directory in errors.
 	kind string
-	// mu orders Scan against the changes that move the count: a Scan holds
-	// it exclusively while it measures, and each rename into the directory
-	// or removal from it holds it shared, so a Scan sees every file either
-	// before or after the change, counted to match.
+	// mu orders the changes that move the count: a Scan holds it
+	// exclusively while it measures, and each commit into the directory or
+	// removal from it holds it shared, so a Scan sees every file either
+	// before or after the change, counted to match. A move between
+	// directories (BlobCache.Take) holds both exclusively.
 	mu sync.RWMutex
 	// usage is the byte count of the finished blob files.
 	usage atomic.Int64

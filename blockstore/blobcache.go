@@ -53,11 +53,15 @@ func (c *BlobCache) Usage() int64 {
 // cache would be replaced but counted again; that cannot happen today,
 // because every write encrypts under a fresh key and so has a digest of its
 // own.
+//
+// Take holds both directories exclusively, so a move never overlaps a
+// removal of the same blob: whether the removal finds the file in the spool
+// or in the cache, the bytes come off one count, once.
 func (c *BlobCache) Take(spool *Spool, digest mh.Multihash) (int64, error) {
-	spool.mu.RLock()
-	defer spool.mu.RUnlock()
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	spool.mu.Lock()
+	defer spool.mu.Unlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	from := spool.Path(digest)
 	info, err := os.Stat(from)
 	if errors.Is(err, os.ErrNotExist) {
@@ -68,7 +72,7 @@ func (c *BlobCache) Take(spool *Spool, digest mh.Multihash) (int64, error) {
 	}
 	if err := os.Rename(from, c.Path(digest)); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			// A concurrent Remove or Take got there first.
+			// Removed since the Stat, by something outside this process.
 			return 0, nil
 		}
 		return 0, fmt.Errorf("blockstore: cache take: %w", err)
