@@ -43,7 +43,7 @@ type ServerConfig struct {
 
 	// MultipartSessionTTL bounds abandoned multipart uploads: a session whose
 	// state has not changed for this long is torn down by a background
-	// sweeper — open ones aborted (dropping their spooled parts), completed
+	// sweeper — open ones aborted (releasing their parked parts), completed
 	// rows retained for Complete idempotency reaped. A Complete's latch
 	// restarts the clock, so a live Complete on an old session is not swept
 	// from under it. Zero → default 7 days; negative → sweeper disabled.

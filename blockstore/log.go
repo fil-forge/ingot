@@ -31,8 +31,8 @@ type BlockLoc struct {
 }
 
 // Plane identifies a segment's block plane. The log is now a single-plane
-// pipeline: object bodies are spooled and uploaded per-blob (see Spool), so the
-// only journaled plane is the catalog.
+// pipeline: object bodies are sent to their provider per-blob, so the only
+// journaled plane is the catalog.
 //
 //   - PlaneCatalog: the dag-cbor MST nodes and ObjectManifests that describe a
 //     bucket's namespace and how to reconstruct each object.
@@ -82,7 +82,7 @@ func (p Plane) String() string {
 // ObjectManifest) plus the op-root record into the open segment before
 // returning, so a successful append is locally durable before the bucket Root
 // is allowed to advance. Object-body blobs do not flow through the log — they
-// are spooled and uploaded per-blob (see Spool) before the manifest commits.
+// are sent to their provider per-blob before the manifest commits.
 //
 // Implemented by *logstore.Store.
 type Log interface {

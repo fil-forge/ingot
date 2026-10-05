@@ -493,7 +493,7 @@ type registryResult struct {
 
 // provideRegistry wraps the host's pool in the postgres-backed registry and
 // exposes it under every interface ServerModule consumes. One *registry.Postgres
-// satisfies bucket state (Registry), the spool's upload_intents (IntentStore),
+// satisfies bucket state (Registry), upload_intents (IntentStore),
 // blob locations (LocationStore), the reference index (BlobRefStore), the GC
 // candidate log (GCStore), and segment metadata (Meta). The hilt client is
 // required: bucket create/delete/list are forwarded to Hilt, so forge mode

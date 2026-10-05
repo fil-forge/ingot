@@ -257,6 +257,16 @@ streaming pass and written to the local store. It becomes an ordered list of con
 blobs, each `≤ max_blob_size`: one blob for objects within the ceiling, a coarse split (e.g. 256 MiB
 granularity, not fine chunking) for larger ones. Each blob is uploaded to Piri by digest ([§7](#7-cross-cutting-durability-concurrency-retrieval)).
 
+> **As built, this section's local store is gone.** Ingot keeps no named local copy of a body blob.
+> Each blob is allocated by size and digest code (`/blob/add`, digest not yet known), its envelope
+> goes to Piri as the body arrives, and the digest is computed over the same bytes and reported at
+> conclude. A short-lived **replay copy** (an anonymous file under the `replay_buffer_bytes`
+> budget) exists only so a failed send can be repeated under a fresh allocation; it is dropped as soon
+> as the send succeeds, and a full budget answers `SlowDown`. Reads of body blobs come from Piri
+> (`blob_locations` + `/content/retrieve`); a local cache, if one is wanted, is a separate decision
+> (FIL-810). `upload_intents` has no `local_path` and no `spooled` state. The paragraphs below
+> describe the target as first designed. See `DESIGN_NOTES.md` for the current write path.
+
 **The local store (spool + cache).** Each blob is written locally before upload — both because the
 digest must be known before `allocate`, and because that local copy does double duty:
 - **Read-after-write (a latency/availability optimization, not a correctness backstop):** a
@@ -818,8 +828,8 @@ the reductions live here.
 The storage / delete / retrieval core is built and tested:
 
 - **Object-aligned blobs + manifest** ([§4](#4-the-catalog-layer)–[§5](#5-the-data-layer)) — `Body.Blobs[{digest,offset,length}]`, coarse split at
-  `max_blob_size`, the local **spool** (`blockstore.Spool`) + `upload_intents`, stored S3 `etag`.
-- **Synchronous durability write path** ([§7.1](#71-write-single-shot-putobject)) — off-lock ingest → spool → per-blob upload, then a
+  `max_blob_size`, `upload_intents`, stored S3 `etag`.
+- **Synchronous durability write path** ([§7.1](#71-write-single-shot-putobject)) — off-lock ingest → per-blob streamed upload, then a
   short locked commit (manifest + MST splice + guarded root swap); reference-index reconcile runs
   **after** the commit is durable so a commit failure can't diverge `blob_refs`.
 - **Single-plane catalog log** — the data plane is gone; `logstore` journals only the catalog
@@ -868,7 +878,7 @@ reference index — and is out of scope for this iteration.
 
 ### Deferred as forge-mode glue (validated live in smelt, not the in-process harness)
 
-The in-memory harness uses a no-op uploader and serves reads from the spool; the forge-network
+Unit tests use an in-memory provider (`inmem.Provider`) that keeps what it is sent and serves it back; the forge-network
 paths below are exercised against the real stack by the smelt-based `itest/` harness in CI:
 
 - **`remove(digest)` and `abort(digest)` are live.** `RemoveBlob` invokes `/blob/remove` on
@@ -880,21 +890,19 @@ paths below are exercised against the real stack by the smelt-based `itest/` har
   spool loss from `blob_locations` + `/content/retrieve` (`TestForgeReadAfterEviction`), and
   retention-retired catalog blocks resolve via `shard_inclusions` (#44) — the read paths of
   [§7.4](#74-read-getobject) / [§8](#8-retrieval-addressing-when-bodies-need-a-sharded-dag-index).
-  Spool **eviction** itself is still unbuilt: nothing bounds the spool, and `DeleteObject`'s
-  release is network-side only, so local disk grows with every body byte ever written — the
-  bounded-cache policy [§5](#5-the-data-layer) specifies is tracked in #48.
+  There is no spool to evict: the local disk holds only short-lived replay copies under a byte
+  budget (see the note in [§5](#5-the-data-layer); #48 is superseded by that design).
 - **Multipart parts park at UploadPart, accept at Complete.** (Built: `parkBlobs`/`concludeBlobs`
-  over the `blob_parks` table.) The in-process harness still spools parts
-  at `UploadPart` and uploads+accepts them at `Complete`; the true forge *parking* (upload early,
-  accept-at-Complete) and the `/blob/abort` unwind from [§7.2](#72-multipart)–[7.3](#73-the-session-latch-the-abortcomplete-race) are forge-mode refinements.
-- **Crash recovery for the spool is not built.** The `upload_intents` × `blob_refs` reconciliation
+  over the `blob_parks` table.) Parts are sent at `UploadPart` and accepted at `Complete`, and the
+  `/blob/abort` unwind from [§7.2](#72-multipart)–[7.3](#73-the-session-latch-the-abortcomplete-race) are built.
+- **Crash recovery for in-flight uploads is not built.** The `upload_intents` × `blob_refs` reconciliation
   the failure-mode table in [§7.5](#75-concurrency-durability-and-failure-modes) describes (resume/`abort` parked, `remove` accepted-but-unreferenced)
   is a later phase; a partial post-commit reference-index write currently relies on retry/idempotency.
 - **Indexer retraction on delete** is unimplemented (no-op). `ListParts` and
   `ListMultipartUploads` are implemented (paginated, prefix/delimiter/marker semantics;
   in-flight sessions only).
-- **Multipart hygiene (spool-model edition).** Abort and part re-upload delete the
-  now-unreferenced spooled blobs (guarded against content-addressed sharing with other
+- **Multipart hygiene.** Abort and part re-upload release the
+  now-unreferenced part blobs (guarded against content-addressed sharing with other
   sessions and committed objects), and a background sweeper aborts open sessions older
   than `multipart_session_ttl` (default 7d) and reaps terminal session rows. A successful
   Complete retains its session in state `completed` so a duplicate Complete is idempotent

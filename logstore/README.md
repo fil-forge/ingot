@@ -8,8 +8,8 @@ fsynced to disk before the write is acked, and are later **sealed** and
 through to the network blockstore.
 
 The log holds only the catalog. Object bodies are never journaled: they are
-spooled and uploaded to Forge per blob before the catalog commit (see
-`blockstore.Spool` and [`../docs/architecture.md`](../docs/architecture.md) §7.1),
+sent to Forge per blob before the catalog commit (see
+[`../docs/architecture.md`](../docs/architecture.md) §7.1),
 so the data plane an earlier iteration shipped through this package is gone.
 
 The log is **segregated per bucket**. `Manager` implements `blockstore.Log`

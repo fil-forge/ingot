@@ -60,10 +60,10 @@ func (r *recordingRemover) removedDigests() map[string]int {
 }
 
 // newRefTestBackend builds a Backend over real in-process collaborators (a
-// MemStore, an on-disk spool, a catalog log, an in-memory provider) plus a
+// MemStore, a catalog log, an in-memory provider) plus a
 // recording remover, so a test can drive PutObject/DeleteObject and inspect
 // blob_refs + releases. Body reads are served by the provider, as the network
-// tier serves them in production, never by the spool.
+// tier serves them in production, never from a local copy.
 func newRefTestBackend(t *testing.T, maxBlob ...int64) (*Backend, *inmem.MemStore, *recordingRemover) {
 	t.Helper()
 	var mbs int64

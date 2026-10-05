@@ -448,7 +448,7 @@ type MultipartStore interface {
 	// never left 'open' counts from its creation.
 	ListStaleSessions(ctx context.Context, state string, cutoff time.Time) ([]MultipartSession, error)
 	// CountPartRefs returns how many parts OUTSIDE excludeUploadID reference
-	// digest — the shared-blob guard for abort/supersede spool cleanup
+	// digest — the shared-blob guard for abort/supersede release
 	// (content-addressed part blobs may be deduped across sessions).
 	CountPartRefs(ctx context.Context, digest multihash.Multihash, excludeUploadID string) (int, error)
 	// CountLivePartRefs returns how many parts of in-flight sessions (open or
