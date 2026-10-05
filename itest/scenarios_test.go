@@ -577,8 +577,8 @@ func TestForgeScenarios(t *testing.T) {
 	})
 
 	// MultipartPartKeepsNoSpoolCopy: a part's blobs leave the spool once they
-	// park on the provider, so UploadPart adds no spool files, and aborting
-	// the upload leaves none behind either (upstream
+	// park on the provider, so none of them is in the spool after UploadPart,
+	// nor after the abort (upstream
 	// AbortMultipartUpload_success verifies the registry rows via
 	// ListMultipartUploads).
 	t.Run("MultipartPartKeepsNoSpoolCopy", func(t *testing.T) {
@@ -590,7 +590,6 @@ func TestForgeScenarios(t *testing.T) {
 		if err != nil {
 			t.Fatalf("CreateMultipartUpload: %v", err)
 		}
-		spoolBefore := spoolBlobCount(t, ctx, s)
 		// A 150 KiB part spans three 64 KiB blobs (plaintext split; each is
 		// stored as its own envelope).
 		part := patternBytes(150 << 10)
@@ -603,16 +602,20 @@ func TestForgeScenarios(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("UploadPart: %v", err)
 		}
-		if got := spoolBlobCount(t, ctx, s) - spoolBefore; got != 0 {
-			t.Fatalf("UploadPart left %d spool blobs, want 0: a parked part keeps no local copy", got)
+		digests := partBlobDigestsHex(t, ctx, s, aws.ToString(create.UploadId), 1)
+		if len(digests) != 3 {
+			t.Fatalf("UploadPart stored %d blobs, want 3", len(digests))
+		}
+		if spooled := spooledDigests(t, ctx, s, digests); len(spooled) != 0 {
+			t.Fatalf("UploadPart left %d of its blobs in the spool, want 0: a parked part keeps no local copy", len(spooled))
 		}
 		if _, err := cl.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
 			Bucket: aws.String(bucket), Key: aws.String(key), UploadId: create.UploadId,
 		}); err != nil {
 			t.Fatalf("AbortMultipartUpload: %v", err)
 		}
-		if got := spoolBlobCount(t, ctx, s) - spoolBefore; got != 0 {
-			t.Fatalf("abort left %d spooled part blobs behind, want 0", got)
+		if spooled := spooledDigests(t, ctx, s, digests); len(spooled) != 0 {
+			t.Fatalf("abort left %d of the part's blobs in the spool, want 0", len(spooled))
 		}
 	})
 
