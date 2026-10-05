@@ -28,6 +28,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.uber.org/zap"
 
+	"github.com/fil-forge/ingot/blockstore"
 	msbucket "github.com/fil-forge/ingot/bucket"
 	"github.com/fil-forge/ingot/bucketop"
 	"github.com/fil-forge/ingot/internal/reqscope"
@@ -395,7 +396,7 @@ func (b *Backend) splitSpool(ctx context.Context, bucket string, space did.DID, 
 	}
 	var body msbucket.Body
 	if b.streaming != nil {
-		enc.stream, enc.streams, enc.bucket, enc.logger = b.streaming, b.streams, bucket, b.logger
+		enc.stream, enc.replay, enc.streams, enc.bucket, enc.logger = b.streaming, b.replay, b.streams, bucket, b.logger
 		enc.lease = newStreamLease(b.streams, b.logger)
 		// A failed split leaves no caller to end the lease.
 		defer func() {
@@ -409,6 +410,10 @@ func (b *Backend) splitSpool(ctx context.Context, bucket string, space did.DID, 
 			return spooledBody{}, s3err.GetAPIError(s3err.ErrIncompleteBody)
 		case errors.Is(err, msbucket.ErrBodyLong):
 			return spooledBody{}, s3err.GetAPIError(s3err.ErrContentLengthMismatch)
+		case errors.Is(err, blockstore.ErrReplayBusy):
+			// The node cannot hold the body for retries right now: have the
+			// client back off and try again.
+			return spooledBody{}, s3err.GetAPIError(s3err.ErrSlowDown)
 		}
 	} else {
 		body, err = msbucket.SplitBody(ctx, enc, r, b.maxBlobSize, splitOpts...)
@@ -437,13 +442,14 @@ func (b *Backend) splitSpool(ctx context.Context, bucket string, space did.DID, 
 			return spooledBody{}, err
 		}
 		// A streamed blob is on the network already (see IntentUploading).
-		state := registry.IntentSpooled
+		// Its bytes were never spooled, so the intent has no local path.
+		state, localPath := registry.IntentSpooled, b.spool.Path(blob.Digest)
 		if _, ok := streamed[string(blob.Digest)]; ok {
-			state = registry.IntentUploading
+			state, localPath = registry.IntentUploading, ""
 		}
 		if err := b.intents.PutIntent(ctx, registry.UploadIntent{
 			Digest:    blob.Digest,
-			LocalPath: b.spool.Path(blob.Digest),
+			LocalPath: localPath,
 			Size:      storedSize,
 			State:     state,
 			Bucket:    bucket,

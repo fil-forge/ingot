@@ -65,10 +65,11 @@ type Backend struct {
 	parks     registry.ParkStore
 	remover   uploader.BlobRemover
 	encParams registry.EncryptionParamsStore
-	// streaming sends a body blob to its provider while it is spooled;
-	// streams records each such upload until its park or acceptance is
-	// recorded.
+	// streaming sends a body blob to its provider as it arrives, keeping a
+	// copy in replay for resends; streams records each such upload until its
+	// park or acceptance is recorded.
 	streaming uploader.StreamingBodyUploader
+	replay    *blockstore.ReplayBuffer
 	streams   registry.StreamStore
 	// pendingReleases is the deferred-release queue; releaseGrace is how far
 	// past the last-claim drop each release is scheduled (readers holding the
@@ -128,13 +129,17 @@ type Deps struct {
 	Parks    registry.ParkStore
 	Remover  uploader.BlobRemover
 
-	// Streaming uploads each body blob while it is spooled,
+	// Streaming uploads each body blob as it arrives,
 	// allocating it by size and hash function before its digest is known;
 	// Streams records each such upload until its park or acceptance is recorded.
 	// Without Streaming every blob is spooled first and uploaded by digest.
 	// Streams is required with it.
 	Streaming uploader.StreamingBodyUploader
-	Streams   registry.StreamStore
+	// Replay holds the copy of each streamed blob kept for resending it if
+	// its send fails. Nil gets an unbounded buffer under the system temp dir
+	// when Streaming is set.
+	Replay  *blockstore.ReplayBuffer
+	Streams registry.StreamStore
 
 	// EncParams is the per-blob FEE encryption-parameter table: what the
 	// decrypting read path needs to serve an encrypted blob. RegionKeys
@@ -191,6 +196,14 @@ func New(d Deps) *Backend {
 			corsDoc = doc
 		}
 	}
+	replay := d.Replay
+	if replay == nil && d.Streaming != nil {
+		var err error
+		if replay, err = blockstore.NewReplayBuffer("", 0, 0); err != nil {
+			// An unbounded buffer in the system temp dir has no setup to fail.
+			panic(err)
+		}
+	}
 	return &Backend{
 		authority:       d.Authority,
 		read:            d.Reads,
@@ -208,6 +221,7 @@ func New(d Deps) *Backend {
 		parks:           d.Parks,
 		remover:         d.Remover,
 		streaming:       d.Streaming,
+		replay:          replay,
 		streams:         d.Streams,
 		encParams:       d.EncParams,
 		regionKeys:      d.RegionKeys,
