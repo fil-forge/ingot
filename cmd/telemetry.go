@@ -68,11 +68,17 @@ func setupTracing(ctx context.Context, logger *zap.Logger) (func(context.Context
 		propagation.TraceContext{},
 		propagation.Baggage{},
 	))
+	logOTelErrors(logger)
+	logger.Info("tracing enabled", zap.String("collector", collectorHost(endpoint)))
+	return tp.Shutdown, nil
+}
+
+// logOTelErrors sends OpenTelemetry's internal errors, such as a failed
+// export, to logger rather than OpenTelemetry's default stderr logger.
+func logOTelErrors(logger *zap.Logger) {
 	otel.SetErrorHandler(otel.ErrorHandlerFunc(func(err error) {
 		logger.Warn("opentelemetry", zap.Error(err))
 	}))
-	logger.Info("tracing enabled", zap.String("collector", collectorHost(endpoint)))
-	return tp.Shutdown, nil
 }
 
 // telemetryResource describes this process on its telemetry. The Forge
@@ -119,6 +125,7 @@ func setupMetrics(ctx context.Context, logger *zap.Logger) (func(context.Context
 		sdkmetric.WithResource(res),
 	)
 	otel.SetMeterProvider(mp)
+	logOTelErrors(logger)
 	logger.Info("metrics enabled", zap.String("collector", collectorHost(endpoint)))
 	return mp.Shutdown, nil
 }

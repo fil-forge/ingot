@@ -229,6 +229,7 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 	if err != nil {
 		// Best-effort cleanup if we got past the log open: the caller
 		// has no Server handle to call Stop on.
+		_ = backend.CloseMetrics()
 		_ = log.Close(ctx)
 		return nil, err
 	}
