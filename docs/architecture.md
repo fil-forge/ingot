@@ -874,7 +874,7 @@ reference index — and is out of scope for this iteration.
 
 ### Deferred as forge-mode glue (validated live in smelt, not the in-process harness)
 
-The in-memory harness uses a no-op uploader and serves reads from the spool; the forge-network
+The in-memory harness uses a no-op uploader and serves reads from local disk; the forge-network
 paths below are exercised against the real stack by the smelt-based `itest/` harness in CI:
 
 - **`remove(digest)` and `abort(digest)` are live.** `RemoveBlob` invokes `/blob/remove` on

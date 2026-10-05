@@ -421,7 +421,7 @@ func (NopUploader) SubmitShard(_ context.Context, _ blockstore.Plane, _ did.DID,
 
 // UploadBlob accepts immediately, even with WithConclude(false) — there is
 // no network to park on, so the deferred flow degenerates to the synchronous
-// one and reads keep coming from the spool.
+// one and reads keep coming from local disk.
 func (NopUploader) UploadBlob(_ context.Context, _ did.DID, digest multihash.Multihash, size int64, _ string, _ ...uploader.UploadOption) (uploader.UploadedBlob, error) {
 	return uploader.UploadedBlob{Digest: digest, Size: size, Location: &uploader.BlobLocation{Size: size}}, nil
 }

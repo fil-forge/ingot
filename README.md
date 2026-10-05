@@ -159,9 +159,9 @@ A cached copy is not needed, so it goes:
 A multipart part's copy goes from the spool as soon as the part parks on its
 provider. The budget is off by default (`local_blob_max_bytes: 0`): without
 it the cache grows with every live object's bodies. With or without a
-budget, the sweeper also deletes, hourly, unfinished `.tmp-*` writes and
-files with no upload intent, in either directory, once they are older than
-`local_blob_orphan_age` (default `24h`, at least `1h`).
+budget, the sweeper also deletes, hourly, unfinished `.tmp-*` writes in
+either directory and spool files with no upload intent, once they are older
+than `local_blob_orphan_age` (default `24h`, at least `1h`).
 
 **Sizing.** The filesystem needs room for:
 

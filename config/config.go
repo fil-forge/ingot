@@ -119,12 +119,12 @@ type Config struct {
 	// is an error.
 	LocalBlobMaxBytes int64 `mapstructure:"local_blob_max_bytes" yaml:"local_blob_max_bytes"`
 	// LocalBlobOrphanAge is the age (file modification time) at which the
-	// sweeper deletes a .tmp-* file, or a blob file in the spool or the cache
-	// with no upload intent (Go duration string), hourly, whether or not a
-	// budget is set. It must exceed the longest time one request body takes
-	// to stream: the server sets no body read timeout, and a body still
-	// streaming past it can have its first blobs deleted, failing the
-	// request. Empty → default 24h; under 1h is an error.
+	// sweeper deletes a .tmp-* file in the spool or the cache, or a spool blob
+	// file with no upload intent (Go duration string), hourly, whether or not a
+	// budget is set. It must exceed the longest time one request body takes to
+	// stream: the server sets no body read timeout, and a body still streaming
+	// past it can have its first blobs deleted, failing the request. Empty →
+	// default 24h; under 1h is an error.
 	LocalBlobOrphanAge string `mapstructure:"local_blob_orphan_age" yaml:"local_blob_orphan_age"`
 
 	// CatalogPlane overrides the catalog logstore pipeline knobs. Any field

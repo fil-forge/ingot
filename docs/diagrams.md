@@ -902,7 +902,7 @@ erDiagram
         text state "spooled, uploading, parked, accepted, published (claimed by a commit)"
         text bucket
         timestamptz updated_at "last state change: the budget pass evicts oldest first"
-        timestamptz evicted_at "set once the sweeper removed the local copy"
+        timestamptz evicted_at "set once the local copy is removed (sweeper or parked-part drop)"
     }
     blob_locations {
         text space PK
