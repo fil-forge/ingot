@@ -75,7 +75,10 @@ type BlobClaim struct {
 // UploadIntent is one row of ingot.upload_intents: a blob Ingot holds on
 // disk, with its lifecycle state. Keyed globally by Digest.
 type UploadIntent struct {
-	Digest    multihash.Multihash
+	Digest multihash.Multihash
+	// LocalPath is where the blob was written: its spool path. Once the
+	// provider holds the blob its copy may move to the cache, so nothing
+	// reads a blob through this path.
 	LocalPath string
 	Size      int64
 	State     string

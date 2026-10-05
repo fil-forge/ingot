@@ -22,7 +22,7 @@ import (
 func storedEnvelopeSizes(t *testing.T, b *Backend, key string) (sizes []int64, total int64) {
 	t.Helper()
 	for _, d := range blobDigestsOf(t, b, key, "") {
-		fi, err := os.Stat(b.spool.Path(d))
+		fi, err := os.Stat(localPath(b, d))
 		if err != nil {
 			t.Fatalf("stat spooled blob: %v", err)
 		}

@@ -43,12 +43,13 @@ func TestForgeEncryption(t *testing.T) {
 	cl := sdkClient(forgeS3Conf(endpoint, accessKey, secretKey))
 
 	// Tamper setup, shared by the two tamper subtests: PUT a 1 MiB object
-	// (one blob, four 256 KiB chunks) and corrupt its spooled envelope's
+	// (one blob, four 256 KiB chunks) and corrupt its local envelope's
 	// tail — inside the FINAL chunk, so earlier chunks stay intact. The
-	// spool is the first read tier and does no digest re-verification, so
-	// every subsequent GET reads the tampered ciphertext and only the GCM
-	// tag stands between it and the client. (Never wipe the spool here the
-	// way the eviction tests do: piri's pristine copy would serve the read.)
+	// local copy is the first read tier and does no digest re-verification,
+	// so every subsequent GET reads the tampered ciphertext and only the GCM
+	// tag stands between it and the client. (Never wipe the local copies here
+	// the way the eviction tests do: piri's pristine copy would serve the
+	// read.)
 	const (
 		tamperBucket = "tamper"
 		tamperKey    = "obj"
@@ -59,17 +60,17 @@ func TestForgeEncryption(t *testing.T) {
 	if _, err := cl.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(tamperBucket)}); err != nil {
 		t.Fatalf("CreateBucket: %v", err)
 	}
-	spoolBefore := spoolBlobPaths(t, ctx, s)
+	spoolBefore := localBlobPaths(t, ctx, s)
 	if _, err := cl.PutObject(ctx, &s3.PutObjectInput{
 		Bucket: aws.String(tamperBucket), Key: aws.String(tamperKey), Body: bytes.NewReader(tamperData),
 	}); err != nil {
 		t.Fatalf("PutObject: %v", err)
 	}
-	added := newSpoolPaths(spoolBefore, spoolBlobPaths(t, ctx, s))
+	added := newLocalPaths(spoolBefore, localBlobPaths(t, ctx, s))
 	if len(added) != 1 {
 		t.Fatalf("PUT spooled %d envelopes, want 1 (a 1 MiB object is a single blob under the default config)", len(added))
 	}
-	corruptSpoolFileTail(t, ctx, s, added[0], 100)
+	corruptLocalFileTail(t, ctx, s, added[0], 100)
 
 	// A tampered chunk must never reach the client as plaintext. Decryption
 	// streams after the 200 and Content-Length are already written, so the
@@ -761,13 +762,14 @@ func TestForgeMultipartExpiryShred(t *testing.T) {
 	t.Logf("expiry sweep shredded %d part-blob key rows and the session", len(digests))
 }
 
-// spooledDigests returns the hex digests that still have a file in the ingot
-// container's spool. The spool filename is the hex ciphertext multihash, so a
-// blob_refs digest maps to /data/spool/<hex>.
+// spooledDigests returns the hex digests that still have a local copy in the
+// ingot container, in the spool or the cache. A copy's filename is the hex
+// ciphertext multihash, so a blob_refs digest maps to /data/spool/<hex> or
+// /data/cache/<hex>.
 func spooledDigests(t *testing.T, ctx context.Context, s *stack.Stack, digests []string) []string {
 	t.Helper()
 	out, errOut, err := s.Exec(ctx, "ingot", "sh", "-c",
-		fmt.Sprintf(`for d in %s; do if [ -e "/data/spool/$d" ]; then echo "$d"; fi; done`, strings.Join(digests, " ")))
+		fmt.Sprintf(`for d in %s; do if [ -e "/data/spool/$d" ] || [ -e "/data/cache/$d" ]; then echo "$d"; fi; done`, strings.Join(digests, " ")))
 	if err != nil {
 		t.Fatalf("list spooled blobs: %v (stderr=%s)", err, errOut)
 	}

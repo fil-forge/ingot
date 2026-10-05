@@ -40,7 +40,7 @@ func TestLayered_CountBlobReadsByTier(t *testing.T) {
 	got := map[string]int64{}
 	for _, sm := range rm.ScopeMetrics {
 		for _, m := range sm.Metrics {
-			if m.Name != "ingot.spool.reads" {
+			if m.Name != "ingot.local_blobs.reads" {
 				continue
 			}
 			for _, dp := range m.Data.(metricdata.Sum[int64]).DataPoints {
@@ -49,7 +49,7 @@ func TestLayered_CountBlobReadsByTier(t *testing.T) {
 			}
 		}
 	}
-	if want := map[string]int64{"spool": 2, "network": 2}; len(got) != 2 || got["spool"] != want["spool"] || got["network"] != want["network"] {
-		t.Fatalf("ingot.spool.reads by tier = %v, want %v", got, want)
+	if want := map[string]int64{"local": 2, "network": 2}; len(got) != 2 || got["local"] != want["local"] || got["network"] != want["network"] {
+		t.Fatalf("ingot.local_blobs.reads by tier = %v, want %v", got, want)
 	}
 }

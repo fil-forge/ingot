@@ -20,7 +20,7 @@ import (
 	"github.com/fil-forge/ingot/registry"
 )
 
-// These tests drive SweepSpool over a real on-disk spool. inmem.NopUploader
+// These tests drive SweepLocalBlobs over a real on-disk spool. inmem.NopUploader
 // records a location for every blob, and inmem.NopBaseReader cannot serve an
 // evicted body, so they assert which files remain and never read an evicted
 // object back; the network read of an evicted blob is covered by the itest.
@@ -68,8 +68,8 @@ func putSweepObjects(t *testing.T, b *Backend, n int) []multihash.Multihash {
 // budgetToEvict sets the spool budget so the budget pass must evict exactly
 // n of blobs, each blobSize bytes, to reach its low watermark.
 func budgetToEvict(b *Backend, n int, blobSize int64) {
-	target := b.spool.Usage() - int64(n)*blobSize
-	b.spoolMaxBytes = (target/spoolLowWatermarkPercent + 1) * 100
+	target := b.localUsage() - int64(n)*blobSize
+	b.localBlobMaxBytes = (target/lowWatermarkPercent + 1) * 100
 }
 
 // blobState is what a test observes of one blob after a sweep.
@@ -82,7 +82,7 @@ func blobStates(t *testing.T, b *Backend, mem *inmem.MemStore, digests []multiha
 	t.Helper()
 	var out []blobState
 	for _, d := range digests {
-		_, err := os.Stat(b.spool.Path(d))
+		_, err := os.Stat(localPath(b, d))
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("stat %x: %v", d, err)
 		}
@@ -91,30 +91,30 @@ func blobStates(t *testing.T, b *Backend, mem *inmem.MemStore, digests []multiha
 	return out
 }
 
-func sweepSpool(t *testing.T, b *Backend) SpoolSweepStats {
+func sweepLocalBlobs(t *testing.T, b *Backend) LocalBlobSweepStats {
 	t.Helper()
-	stats, err := b.SweepSpool(t.Context())
+	stats, err := b.SweepLocalBlobs(t.Context())
 	if err != nil {
-		t.Fatalf("SweepSpool: %v", err)
+		t.Fatalf("SweepLocalBlobs: %v", err)
 	}
 	return stats
 }
 
 func blobSize(t *testing.T, b *Backend, d multihash.Multihash) int64 {
 	t.Helper()
-	info, err := os.Stat(b.spool.Path(d))
+	info, err := os.Stat(localPath(b, d))
 	if err != nil {
 		t.Fatalf("stat %x: %v", d, err)
 	}
 	return info.Size()
 }
 
-func TestSweepSpool_EvictsOldestFirstToTheLowWatermark(t *testing.T) {
+func TestSweepLocalBlobs_EvictsOldestFirstToTheLowWatermark(t *testing.T) {
 	b, mem := newSweepBackend(t)
 	digests := putSweepObjects(t, b, 4)
 	budgetToEvict(b, 2, blobSize(t, b, digests[0]))
 
-	sweepSpool(t, b)
+	sweepLocalBlobs(t, b)
 
 	want := []blobState{{false, true}, {false, true}, {true, false}, {true, false}}
 	if got := blobStates(t, b, mem, digests); !reflect.DeepEqual(got, want) {
@@ -122,37 +122,37 @@ func TestSweepSpool_EvictsOldestFirstToTheLowWatermark(t *testing.T) {
 	}
 }
 
-func TestSweepSpool_UsageEndsAtOrBelowTheLowWatermark(t *testing.T) {
+func TestSweepLocalBlobs_UsageEndsAtOrBelowTheLowWatermark(t *testing.T) {
 	b, _ := newSweepBackend(t)
 	digests := putSweepObjects(t, b, 4)
 	budgetToEvict(b, 2, blobSize(t, b, digests[0]))
 
-	sweepSpool(t, b)
+	sweepLocalBlobs(t, b)
 
-	if target := b.spoolMaxBytes * spoolLowWatermarkPercent / 100; b.spool.Usage() > target {
-		t.Fatalf("usage after the sweep = %d, want at most %d", b.spool.Usage(), target)
+	if target := b.localBlobMaxBytes * lowWatermarkPercent / 100; b.localUsage() > target {
+		t.Fatalf("usage after the sweep = %d, want at most %d", b.localUsage(), target)
 	}
 }
 
-// TestSweepSpool_KeepsBlobsTheProviderMayNotHold: no pass removes the file of
+// TestSweepLocalBlobs_KeepsBlobsTheProviderMayNotHold: no pass removes the file of
 // a spooled or uploading intent (the only copy), or of an accepted intent
 // whose location was never recorded, however far over budget the spool is.
-func TestSweepSpool_KeepsBlobsTheProviderMayNotHold(t *testing.T) {
+func TestSweepLocalBlobs_KeepsBlobsTheProviderMayNotHold(t *testing.T) {
 	ctx := t.Context()
-	b, mem := newSweepBackend(t, func(d *Deps) { d.SpoolMaxBytes = 1 })
+	b, mem := newSweepBackend(t, func(d *Deps) { d.LocalBlobMaxBytes = 1 })
 	var digests []multihash.Multihash
 	for _, state := range []string{registry.IntentSpooled, registry.IntentUploading, registry.IntentAccepted} {
 		d, n, err := b.spool.WriteBlob(ctx, bytes.NewReader([]byte("only copy: "+state)))
 		if err != nil {
 			t.Fatalf("WriteBlob: %v", err)
 		}
-		if err := mem.PutIntent(ctx, registry.UploadIntent{Digest: d, LocalPath: b.spool.Path(d), Size: n, State: state}); err != nil {
+		if err := mem.PutIntent(ctx, registry.UploadIntent{Digest: d, LocalPath: localPath(b, d), Size: n, State: state}); err != nil {
 			t.Fatalf("PutIntent: %v", err)
 		}
 		digests = append(digests, d)
 	}
 
-	sweepSpool(t, b)
+	sweepLocalBlobs(t, b)
 
 	want := []blobState{{true, false}, {true, false}, {true, false}}
 	if got := blobStates(t, b, mem, digests); !reflect.DeepEqual(got, want) {
@@ -160,28 +160,28 @@ func TestSweepSpool_KeepsBlobsTheProviderMayNotHold(t *testing.T) {
 	}
 }
 
-func TestSweepSpool_NoBudgetEvictsNothing(t *testing.T) {
+func TestSweepLocalBlobs_NoBudgetEvictsNothing(t *testing.T) {
 	b, _ := newSweepBackend(t)
 	putSweepObjects(t, b, 3)
 
-	stats := sweepSpool(t, b)
+	stats := sweepLocalBlobs(t, b)
 
-	if stats != (SpoolSweepStats{}) {
+	if stats != (LocalBlobSweepStats{}) {
 		t.Fatalf("sweep stats = %+v, want nothing removed", stats)
 	}
 }
 
-// TestSweepSpool_FileAlreadyGoneIsMarkedEvicted: a crash between the unlink
+// TestSweepLocalBlobs_FileAlreadyGoneIsMarkedEvicted: a crash between the unlink
 // and the mark leaves a row describing a missing file; the next pass marks it.
-func TestSweepSpool_FileAlreadyGoneIsMarkedEvicted(t *testing.T) {
+func TestSweepLocalBlobs_FileAlreadyGoneIsMarkedEvicted(t *testing.T) {
 	b, mem := newSweepBackend(t)
 	digests := putSweepObjects(t, b, 2)
 	budgetToEvict(b, 1, blobSize(t, b, digests[0]))
-	if err := os.Remove(b.spool.Path(digests[0])); err != nil {
+	if err := os.Remove(localPath(b, digests[0])); err != nil {
 		t.Fatal(err)
 	}
 
-	stats := sweepSpool(t, b)
+	stats := sweepLocalBlobs(t, b)
 
 	// The missing file is marked but not counted as evicted; the count still
 	// held its bytes, so the pass went on to evict the next blob too.
@@ -198,13 +198,15 @@ func TestSweepSpool_FileAlreadyGoneIsMarkedEvicted(t *testing.T) {
 	}
 }
 
-// TestSweepSpool_OrphanPass: old .tmp-* files and old blob files with no
+// TestSweepLocalBlobs_OrphanPass: old .tmp-* files and old blob files with no
 // intent are deleted; young ones, and old files with an intent, stay; the
-// usage count is reset to what remains, the young temp file included.
-func TestSweepSpool_OrphanPass(t *testing.T) {
+// usage count is reset to the blob files that remain. A temp file counts
+// only while a live write holds it, so the young one this test wrote by hand
+// does not.
+func TestSweepLocalBlobs_OrphanPass(t *testing.T) {
 	ctx := t.Context()
 	b, mem := newSweepBackend(t)
-	old := time.Now().Add(-2 * DefaultSpoolOrphanAge)
+	old := time.Now().Add(-2 * DefaultLocalBlobOrphanAge)
 
 	writeFile := func(name, body string, modTime time.Time) string {
 		t.Helper()
@@ -224,14 +226,14 @@ func TestSweepSpool_OrphanPass(t *testing.T) {
 			t.Fatalf("WriteBlob: %v", err)
 		}
 		if withIntent {
-			if err := mem.PutIntent(ctx, registry.UploadIntent{Digest: d, LocalPath: b.spool.Path(d), Size: n, State: registry.IntentSpooled}); err != nil {
+			if err := mem.PutIntent(ctx, registry.UploadIntent{Digest: d, LocalPath: localPath(b, d), Size: n, State: registry.IntentSpooled}); err != nil {
 				t.Fatalf("PutIntent: %v", err)
 			}
 		}
-		if err := os.Chtimes(b.spool.Path(d), modTime, modTime); err != nil {
+		if err := os.Chtimes(localPath(b, d), modTime, modTime); err != nil {
 			t.Fatal(err)
 		}
-		return b.spool.Path(d)
+		return localPath(b, d)
 	}
 	paths := map[string]string{
 		"old temp":             writeFile(".tmp-old", "partial", old),
@@ -241,12 +243,12 @@ func TestSweepSpool_OrphanPass(t *testing.T) {
 		"old blob with intent": writeBlob("old with intent", old, true),
 	}
 
-	sweepSpool(t, b)
+	sweepLocalBlobs(t, b)
 
 	got := struct {
 		OnDisk map[string]bool
 		Usage  int64
-	}{OnDisk: map[string]bool{}, Usage: b.spool.Usage()}
+	}{OnDisk: map[string]bool{}, Usage: b.localUsage()}
 	for name, path := range paths {
 		_, err := os.Stat(path)
 		got.OnDisk[name] = err == nil
@@ -262,22 +264,22 @@ func TestSweepSpool_OrphanPass(t *testing.T) {
 			"young orphan blob":    true,
 			"old blob with intent": true,
 		},
-		Usage: int64(len("partial") + len("young orphan") + len("old with intent")),
+		Usage: int64(len("young orphan") + len("old with intent")),
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("spool after the orphan pass = %+v, want %+v", got, want)
 	}
 }
 
-// TestSweepSpool_PagesThroughEvictableRows: a budget pass that needs more
+// TestSweepLocalBlobs_PagesThroughEvictableRows: a budget pass that needs more
 // rows than one query returns pages on, oldest first.
-func TestSweepSpool_PagesThroughEvictableRows(t *testing.T) {
+func TestSweepLocalBlobs_PagesThroughEvictableRows(t *testing.T) {
 	b, mem := newSweepBackend(t)
-	b.spoolSweepBatch = 2
+	b.localBlobSweepBatch = 2
 	digests := putSweepObjects(t, b, 5)
 	budgetToEvict(b, 4, blobSize(t, b, digests[0]))
 
-	sweepSpool(t, b)
+	sweepLocalBlobs(t, b)
 
 	want := []blobState{{false, true}, {false, true}, {false, true}, {false, true}, {true, false}}
 	if got := blobStates(t, b, mem, digests); !reflect.DeepEqual(got, want) {
@@ -285,15 +287,15 @@ func TestSweepSpool_PagesThroughEvictableRows(t *testing.T) {
 	}
 }
 
-// TestSweepSpool_SkipsAFileItCannotRemove: a file whose removal fails is left
+// TestSweepLocalBlobs_SkipsAFileItCannotRemove: a file whose removal fails is left
 // unmarked, and the pass goes on to the next one instead of stopping there on
 // every sweep.
-func TestSweepSpool_SkipsAFileItCannotRemove(t *testing.T) {
+func TestSweepLocalBlobs_SkipsAFileItCannotRemove(t *testing.T) {
 	b, mem := newSweepBackend(t)
 	digests := putSweepObjects(t, b, 3)
 	budgetToEvict(b, 1, blobSize(t, b, digests[0]))
 	// A non-empty directory at the blob's path makes its removal fail.
-	path := b.spool.Path(digests[0])
+	path := localPath(b, digests[0])
 	if err := os.Remove(path); err != nil {
 		t.Fatal(err)
 	}
@@ -301,7 +303,7 @@ func TestSweepSpool_SkipsAFileItCannotRemove(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	sweepSpool(t, b)
+	sweepLocalBlobs(t, b)
 
 	want := []blobState{{true, false}, {false, true}, {true, false}}
 	if got := blobStates(t, b, mem, digests); !reflect.DeepEqual(got, want) {
@@ -309,23 +311,23 @@ func TestSweepSpool_SkipsAFileItCannotRemove(t *testing.T) {
 	}
 }
 
-// TestSweepSpool_EvictsAParkedBlob: a parked intent's file goes on its park
+// TestSweepLocalBlobs_EvictsAParkedBlob: a parked intent's file goes on its park
 // row, as an accepted one's does on its location.
-func TestSweepSpool_EvictsAParkedBlob(t *testing.T) {
+func TestSweepLocalBlobs_EvictsAParkedBlob(t *testing.T) {
 	ctx := t.Context()
-	b, mem := newSweepBackend(t, func(d *Deps) { d.SpoolMaxBytes = 1 })
+	b, mem := newSweepBackend(t, func(d *Deps) { d.LocalBlobMaxBytes = 1 })
 	d, n, err := b.spool.WriteBlob(ctx, bytes.NewReader([]byte("parked part")))
 	if err != nil {
 		t.Fatalf("WriteBlob: %v", err)
 	}
-	if err := mem.PutIntent(ctx, registry.UploadIntent{Digest: d, LocalPath: b.spool.Path(d), Size: n, State: registry.IntentParked}); err != nil {
+	if err := mem.PutIntent(ctx, registry.UploadIntent{Digest: d, LocalPath: localPath(b, d), Size: n, State: registry.IntentParked}); err != nil {
 		t.Fatalf("PutIntent: %v", err)
 	}
 	if err := mem.PutPark(ctx, registry.BlobPark{Digest: d, Size: n}); err != nil {
 		t.Fatalf("PutPark: %v", err)
 	}
 
-	sweepSpool(t, b)
+	sweepLocalBlobs(t, b)
 
 	want := []blobState{{false, true}}
 	if got := blobStates(t, b, mem, []multihash.Multihash{d}); !reflect.DeepEqual(got, want) {
@@ -350,7 +352,7 @@ func TestEvictToBudget_ReportsWhyItStopped(t *testing.T) {
 		}
 	})
 	t.Run("no evictable rows", func(t *testing.T) {
-		b, _ := newSweepBackend(t, func(d *Deps) { d.SpoolMaxBytes = 1 })
+		b, _ := newSweepBackend(t, func(d *Deps) { d.LocalBlobMaxBytes = 1 })
 		if _, _, err := b.spool.WriteBlob(ctx, bytes.NewReader([]byte("no intent"))); err != nil {
 			t.Fatalf("WriteBlob: %v", err)
 		}
@@ -364,24 +366,24 @@ func TestEvictToBudget_ReportsWhyItStopped(t *testing.T) {
 	})
 }
 
-// TestSweepSpool_OrphanPassRunsHourly: a sweep within the hour after an
+// TestSweepLocalBlobs_OrphanPassRunsHourly: a sweep within the hour after an
 // orphan pass leaves an old orphan alone; the next one due removes it.
-func TestSweepSpool_OrphanPassRunsHourly(t *testing.T) {
+func TestSweepLocalBlobs_OrphanPassRunsHourly(t *testing.T) {
 	b, _ := newSweepBackend(t)
-	sweepSpool(t, b)
+	sweepLocalBlobs(t, b)
 	path := filepath.Join(filepath.Dir(b.spool.Path(multihash.Multihash{0})), ".tmp-old")
 	if err := os.WriteFile(path, []byte("partial"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	old := time.Now().Add(-2 * DefaultSpoolOrphanAge)
+	old := time.Now().Add(-2 * DefaultLocalBlobOrphanAge)
 	if err := os.Chtimes(path, old, old); err != nil {
 		t.Fatal(err)
 	}
 
-	sweepSpool(t, b)
+	sweepLocalBlobs(t, b)
 	_, errSoon := os.Stat(path)
-	b.lastOrphanPass = b.lastOrphanPass.Add(-spoolOrphanPassInterval)
-	sweepSpool(t, b)
+	b.lastOrphanPass = b.lastOrphanPass.Add(-orphanPassInterval)
+	sweepLocalBlobs(t, b)
 	_, errDue := os.Stat(path)
 
 	got := [2]bool{errSoon == nil, errDue == nil}
@@ -402,18 +404,18 @@ func (w writingIntents) MissingIntents(ctx context.Context, digests []multihash.
 	return w.IntentStore.MissingIntents(ctx, digests)
 }
 
-// TestSweepSpool_OrphanPassKeepsConcurrentWrites: a blob written while the
+// TestSweepLocalBlobs_OrphanPassKeepsConcurrentWrites: a blob written while the
 // orphan pass runs is still counted once the pass has corrected the usage
 // count to its scan.
-func TestSweepSpool_OrphanPassKeepsConcurrentWrites(t *testing.T) {
+func TestSweepLocalBlobs_OrphanPassKeepsConcurrentWrites(t *testing.T) {
 	ctx := t.Context()
 	b, _ := newSweepBackend(t)
 	d, _, err := b.spool.WriteBlob(ctx, bytes.NewReader([]byte("old orphan")))
 	if err != nil {
 		t.Fatalf("WriteBlob: %v", err)
 	}
-	old := time.Now().Add(-2 * DefaultSpoolOrphanAge)
-	if err := os.Chtimes(b.spool.Path(d), old, old); err != nil {
+	old := time.Now().Add(-2 * DefaultLocalBlobOrphanAge)
+	if err := os.Chtimes(localPath(b, d), old, old); err != nil {
 		t.Fatal(err)
 	}
 	const late = "written during the pass"
@@ -423,34 +425,34 @@ func TestSweepSpool_OrphanPassKeepsConcurrentWrites(t *testing.T) {
 		}
 	}}
 
-	sweepSpool(t, b)
+	sweepLocalBlobs(t, b)
 
-	if got, want := b.spool.Usage(), int64(len(late)); got != want {
+	if got, want := b.localUsage(), int64(len(late)); got != want {
 		t.Fatalf("usage after the orphan pass = %d, want %d (the late blob, the orphan gone)", got, want)
 	}
 }
 
-// TestSweepSpool_OrphanPassSkipsAFileItCannotRemove: an orphan whose removal
+// TestSweepLocalBlobs_OrphanPassSkipsAFileItCannotRemove: an orphan whose removal
 // fails is skipped; the pass removes the others and still counts as run, so
 // the next sweep does not repeat its scan.
-func TestSweepSpool_OrphanPassSkipsAFileItCannotRemove(t *testing.T) {
+func TestSweepLocalBlobs_OrphanPassSkipsAFileItCannotRemove(t *testing.T) {
 	ctx := t.Context()
 	b, _ := newSweepBackend(t)
-	old := time.Now().Add(-2 * DefaultSpoolOrphanAge)
+	old := time.Now().Add(-2 * DefaultLocalBlobOrphanAge)
 	var digests []multihash.Multihash
 	for _, body := range []string{"stuck orphan", "other orphan"} {
 		d, _, err := b.spool.WriteBlob(ctx, bytes.NewReader([]byte(body)))
 		if err != nil {
 			t.Fatalf("WriteBlob: %v", err)
 		}
-		if err := os.Chtimes(b.spool.Path(d), old, old); err != nil {
+		if err := os.Chtimes(localPath(b, d), old, old); err != nil {
 			t.Fatal(err)
 		}
 		digests = append(digests, d)
 	}
 	// After the scan, a non-empty directory replaces the first orphan, so
 	// its removal fails.
-	stuck := b.spool.Path(digests[0])
+	stuck := localPath(b, digests[0])
 	b.intents = writingIntents{IntentStore: b.intents, write: func() {
 		if err := os.Remove(stuck); err != nil {
 			t.Errorf("remove: %v", err)
@@ -460,12 +462,12 @@ func TestSweepSpool_OrphanPassSkipsAFileItCannotRemove(t *testing.T) {
 		}
 	}}
 
-	stats, err := b.SweepSpool(ctx)
+	stats, err := b.SweepLocalBlobs(ctx)
 	if err != nil {
-		t.Fatalf("SweepSpool: %v", err)
+		t.Fatalf("SweepLocalBlobs: %v", err)
 	}
 
-	_, otherErr := os.Stat(b.spool.Path(digests[1]))
+	_, otherErr := os.Stat(localPath(b, digests[1]))
 	got := struct {
 		OrphanFiles int64
 		OtherGone   bool
@@ -478,5 +480,66 @@ func TestSweepSpool_OrphanPassSkipsAFileItCannotRemove(t *testing.T) {
 	}{1, true, true}
 	if got != want {
 		t.Fatalf("orphan pass = %+v, want %+v", got, want)
+	}
+}
+
+// TestHeldBlobMovesToTheCache: once a PUT's blob is accepted and its location
+// recorded, its copy is in the cache and the spool holds nothing.
+func TestHeldBlobMovesToTheCache(t *testing.T) {
+	b, _ := newSweepBackend(t)
+	d := putSweepObjects(t, b, 1)[0]
+	size := blobSize(t, b, d)
+
+	_, spoolErr := os.Stat(b.spool.Path(d))
+	_, cacheErr := os.Stat(b.cache.Path(d))
+	got := fmt.Sprint(os.IsNotExist(spoolErr), cacheErr == nil, b.spool.Usage(), b.cache.Usage())
+	if want := fmt.Sprint(true, true, 0, size); got != want {
+		t.Fatalf("[spool copy gone] [cache copy] spool cache = %s, want %s", got, want)
+	}
+}
+
+// TestSweepLocalBlobs_EvictsAHeldBlobLeftInTheSpool: a blob the registry shows the
+// provider holds, but whose copy never moved to the cache (the process stopped
+// in between), is still evicted.
+func TestSweepLocalBlobs_EvictsAHeldBlobLeftInTheSpool(t *testing.T) {
+	ctx := t.Context()
+	b, mem := newSweepBackend(t, func(d *Deps) { d.LocalBlobMaxBytes = 1 })
+	d, n, err := b.spool.WriteBlob(ctx, bytes.NewReader([]byte("held, never moved")))
+	if err != nil {
+		t.Fatalf("WriteBlob: %v", err)
+	}
+	if err := mem.PutIntent(ctx, registry.UploadIntent{Digest: d, LocalPath: b.spool.Path(d), Size: n, State: registry.IntentAccepted}); err != nil {
+		t.Fatalf("PutIntent: %v", err)
+	}
+	if err := mem.PutLocation(ctx, registry.BlobLocation{Space: testutil.RandomDID(t), Digest: d, Provider: "did:key:p", URL: "http://p/blob", Size: n}); err != nil {
+		t.Fatalf("PutLocation: %v", err)
+	}
+
+	sweepLocalBlobs(t, b)
+
+	want := []blobState{{false, true}}
+	if got := blobStates(t, b, mem, []multihash.Multihash{d}); !reflect.DeepEqual(got, want) {
+		t.Fatalf("blob after the sweep = %+v, want %+v", got, want)
+	}
+}
+
+// TestSweepLocalBlobs_WarnsOncePerOverBudgetEpisode: the warning that nothing is
+// left to evict is armed until usage is back under budget.
+func TestSweepLocalBlobs_WarnsOncePerOverBudgetEpisode(t *testing.T) {
+	ctx := t.Context()
+	b, _ := newSweepBackend(t, func(d *Deps) { d.LocalBlobMaxBytes = 1 })
+	if _, _, err := b.spool.WriteBlob(ctx, bytes.NewReader([]byte("unevictable"))); err != nil {
+		t.Fatalf("WriteBlob: %v", err)
+	}
+	var got []bool
+	sweepLocalBlobs(t, b)
+	got = append(got, b.overBudgetWarned)
+	sweepLocalBlobs(t, b)
+	got = append(got, b.overBudgetWarned)
+	b.localBlobMaxBytes = 1 << 20
+	sweepLocalBlobs(t, b)
+	got = append(got, b.overBudgetWarned)
+	if want := []bool{true, true, false}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("warned after [over, still over, back under] = %v, want %v", got, want)
 	}
 }

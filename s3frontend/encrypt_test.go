@@ -107,7 +107,7 @@ func TestEncryptedWrite_Opacity(t *testing.T) {
 	if bytes.Equal(d, digestOf(t, data)) {
 		t.Fatalf("stored digest equals hash(plaintext); blob was not encrypted")
 	}
-	stored, err := os.ReadFile(b.spool.Path(d))
+	stored, err := os.ReadFile(localPath(b, d))
 	if err != nil {
 		t.Fatalf("read spooled blob: %v", err)
 	}
@@ -227,7 +227,7 @@ func recipientOf(t *testing.T, stored []byte) *cose.Recipient {
 // recoverability criterion: no region, no database).
 func assertTenantRecipient(t *testing.T, b *Backend, digest []byte, plaintext []byte) {
 	t.Helper()
-	stored, err := os.ReadFile(b.spool.Path(digest))
+	stored, err := os.ReadFile(localPath(b, digest))
 	if err != nil {
 		t.Fatalf("read spooled blob: %v", err)
 	}
@@ -324,7 +324,7 @@ func TestEncryptedWrite_FailsClosedWithoutRecipient(t *testing.T) {
 	if _, _, err := getObjV(t, b, key, ""); err == nil {
 		t.Fatalf("object exists after a refused write")
 	}
-	entries, err := os.ReadDir(b.spool.Path(nil)) // Path of the empty digest is the spool dir itself
+	entries, err := os.ReadDir(localPath(b, nil)) // Path of the empty digest is the spool dir itself
 	if err != nil {
 		t.Fatalf("read spool dir: %v", err)
 	}
