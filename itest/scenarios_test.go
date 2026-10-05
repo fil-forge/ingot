@@ -576,11 +576,12 @@ func TestForgeScenarios(t *testing.T) {
 		}
 	})
 
-	// MultipartAbortCleansSpool: a part's blobs leave the spool once they park
-	// on the provider, so UploadPart adds no spool files; aborting the upload
-	// discards its parts (upstream AbortMultipartUpload_success verifies the
-	// registry rows via ListMultipartUploads) and still leaves none behind.
-	t.Run("MultipartAbortCleansSpool", func(t *testing.T) {
+	// MultipartPartKeepsNoSpoolCopy: a part's blobs leave the spool once they
+	// park on the provider, so UploadPart adds no spool files, and aborting
+	// the upload leaves none behind either (upstream
+	// AbortMultipartUpload_success verifies the registry rows via
+	// ListMultipartUploads).
+	t.Run("MultipartPartKeepsNoSpoolCopy", func(t *testing.T) {
 		const bucket, key = "mpabort-spool", "obj"
 		if _, err := cl.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
 			t.Fatalf("CreateBucket: %v", err)
