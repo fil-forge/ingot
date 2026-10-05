@@ -128,22 +128,23 @@ func TestValidate_RequiredFields(t *testing.T) {
 	}
 }
 
-// spoolKnobs is the spool subset of ServerConfig, for comparing it whole.
-type spoolKnobs struct {
+// localBlobKnobs is the local blob storage subset of ServerConfig, for
+// comparing it whole.
+type localBlobKnobs struct {
 	MaxBytes  int64
 	OrphanAge time.Duration
 }
 
-func TestServerConfig_SpoolKnobs(t *testing.T) {
+func TestServerConfig_LocalBlobKnobs(t *testing.T) {
 	cases := []struct {
 		name   string
 		mutate func(*Config)
-		want   spoolKnobs
+		want   localBlobKnobs
 	}{
 		{
 			name:   "defaults",
 			mutate: func(*Config) {},
-			want:   spoolKnobs{MaxBytes: 0, OrphanAge: 24 * time.Hour},
+			want:   localBlobKnobs{MaxBytes: 0, OrphanAge: 24 * time.Hour},
 		},
 		{
 			name: "explicit values",
@@ -151,7 +152,7 @@ func TestServerConfig_SpoolKnobs(t *testing.T) {
 				c.LocalBlobMaxBytes = 1 << 40
 				c.LocalBlobOrphanAge = "2h"
 			},
-			want: spoolKnobs{MaxBytes: 1 << 40, OrphanAge: 2 * time.Hour},
+			want: localBlobKnobs{MaxBytes: 1 << 40, OrphanAge: 2 * time.Hour},
 		},
 	}
 	for _, tc := range cases {
@@ -162,9 +163,9 @@ func TestServerConfig_SpoolKnobs(t *testing.T) {
 			if err != nil {
 				t.Fatalf("ServerConfig: %v", err)
 			}
-			got := spoolKnobs{sc.LocalBlobMaxBytes, sc.LocalBlobOrphanAge}
+			got := localBlobKnobs{sc.LocalBlobMaxBytes, sc.LocalBlobOrphanAge}
 			if got != tc.want {
-				t.Fatalf("spool knobs = %+v, want %+v", got, tc.want)
+				t.Fatalf("local blob knobs = %+v, want %+v", got, tc.want)
 			}
 		})
 	}
