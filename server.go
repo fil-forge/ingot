@@ -250,6 +250,9 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 // it to start serving on Addr).
 func (s *Server) Start(ctx context.Context) error {
 	if err := s.backend.Recover(ctx); err != nil {
+		// fx does not run OnStop for a hook whose OnStart failed, so the
+		// gauges go now; Stop calling CloseMetrics again is harmless.
+		_ = s.backend.CloseMetrics()
 		return fmt.Errorf("ingot: recover: %w", err)
 	}
 	s.logger.Info("starting ingot S3 listener",

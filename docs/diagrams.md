@@ -892,6 +892,8 @@ erDiagram
         bigint size
         text state "spooled, uploading, parked, accepted, published (claimed by a commit)"
         text bucket
+        timestamptz updated_at "last state change: the spool budget pass evicts oldest first"
+        timestamptz evicted_at "set once the sweeper removed the spool copy"
     }
     blob_locations {
         text space PK
