@@ -1198,7 +1198,10 @@ func (b *Backend) recordStreamedPark(ctx context.Context, blob msbucket.BlobRef,
 	return nil
 }
 
-// dropParkedCopy removes a parked blob's spool copy. Nothing reads it again:
+// dropParkedCopy removes a parked blob's spool copy. Unlike a release, it
+// checks no other reference to the digest: it relies on every written blob
+// having its own digest (a fresh content key per blob), so no other part,
+// session or object can be using the same file. Nothing reads it again:
 // Complete concludes the blob from its park row, Abort and the session
 // sweeper unwind it through the same row, and the object's reads go to the
 // provider once Complete records the location. The blob is durable on the

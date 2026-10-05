@@ -92,9 +92,8 @@ type Config struct {
 
 	// MultipartSessionTTL bounds abandoned multipart uploads (Go duration
 	// string, e.g. "168h"): a session whose state has not changed for this
-	// long is torn down by a background sweeper and its parts, parked on
-	// their providers, released there. Empty → default 7 days; a negative duration disables the
-	// sweeper.
+	// long is torn down by a background sweeper and its parts released.
+	// Empty → default 7 days; a negative duration disables the sweeper.
 	MultipartSessionTTL string `mapstructure:"multipart_session_ttl" yaml:"multipart_session_ttl"`
 
 	// ReleaseGrace delays each blob release (crypto-shred + location delete +
