@@ -50,8 +50,10 @@ func (s SpoolSweepStats) Removed() bool {
 // 90% of the budget, within a time limit. A file it cannot remove is logged
 // and skipped. If the pass runs out of evictable blobs with usage still over
 // budget, the rest is files no rule lets it remove (bodies being written or
-// uploaded, blobs with no recorded location, young orphans), and it logs a
-// warning.
+// uploaded, bodies whose upload failed, blobs with no recorded location,
+// young orphans), and it logs a warning. A failed upload's intent stays
+// spooled or uploading and nothing reclaims its file yet, so those bytes
+// count against the budget until an operator removes them.
 //
 // Eviction removes only the file. The intent keeps its row and state, marked
 // evicted: a release recognises a committed blob by its published state, and
@@ -86,7 +88,7 @@ func (b *Backend) SweepSpool(ctx context.Context) (SpoolSweepStats, error) {
 			errs = append(errs, fmt.Errorf("s3frontend: spool budget pass: %w", err))
 		case b.spool.Usage() <= b.spoolMaxBytes:
 		case pass.exhausted:
-			b.logger.Warn("spool is still over budget with nothing left to evict: the remaining files are bodies being written or uploaded, blobs with no recorded location, files that could not be removed, or orphans younger than spool_orphan_age",
+			b.logger.Warn("spool is still over budget with nothing left to evict: the remaining files are bodies being written or uploaded, bodies whose upload failed (their intents stay spooled or uploading; nothing reclaims them yet), blobs with no recorded location, files that could not be removed, or orphans younger than spool_orphan_age",
 				zap.Int64("usage", b.spool.Usage()),
 				zap.Int64("budget", b.spoolMaxBytes))
 		default:
@@ -122,13 +124,41 @@ type budgetPass struct {
 	exhausted    bool
 }
 
+// removeFailures tallies the files one pass could not remove, so the pass
+// skips them and logs once rather than once per file.
+type removeFailures struct {
+	count int
+	first string
+	err   error
+}
+
+func (f *removeFailures) add(name string, err error) {
+	if f.count == 0 {
+		f.first, f.err = name, err
+	}
+	f.count++
+}
+
+// log warns once if any removal failed.
+func (f *removeFailures) log(logger *zap.Logger, pass string) {
+	if f.count == 0 {
+		return
+	}
+	logger.Warn("spool "+pass+" pass: could not remove some files; skipped them",
+		zap.Int("files", f.count),
+		zap.String("first", f.first),
+		zap.Error(f.err))
+}
+
 // evictToBudget pages through the evictable intents, oldest state change
 // first, removing each file and marking its intent evicted, until usage is at
 // the low watermark, the rows run out, or the deadline passes. A file it
-// cannot remove is logged and skipped, so one bad file does not stop every
-// later pass at the same row; its intent stays unmarked. A row whose file was
-// already gone is marked but not counted.
+// cannot remove is skipped, so one bad file does not stop every later pass at
+// the same row; its intent stays unmarked, and the pass logs the failures
+// once. A row whose file was already gone is marked but not counted.
 func (b *Backend) evictToBudget(ctx context.Context, deadline time.Time) (pass budgetPass, err error) {
+	var failed removeFailures
+	defer failed.log(b.logger, "budget")
 	target := b.spoolMaxBytes * spoolLowWatermarkPercent / 100
 	batch := b.spoolSweepBatch
 	if batch <= 0 {
@@ -151,9 +181,7 @@ func (b *Backend) evictToBudget(ctx context.Context, deadline time.Time) (pass b
 			cursor = registry.EvictCursor{UpdatedAt: in.UpdatedAt, Digest: in.Digest}
 			freed, err := b.spool.Remove(in.Digest)
 			if err != nil {
-				b.logger.Warn("spool budget pass: cannot remove a file; skipping it",
-					zap.String("digest", hex.EncodeToString(in.Digest)),
-					zap.Error(err))
+				failed.add(hex.EncodeToString(in.Digest), err)
 				continue
 			}
 			if err := b.intents.MarkEvicted(ctx, in.Digest); err != nil && !errors.Is(err, registry.ErrNotFound) {
@@ -174,9 +202,13 @@ func (b *Backend) evictToBudget(ctx context.Context, deadline time.Time) (pass b
 // its intents were recorded). The age must exceed the longest time one
 // request body takes to stream, because a request records its intents only
 // after its whole body is spooled. It corrects the usage count to the scan
-// first; each removal then takes its own bytes off. Ages are measured from
-// now, the sweep's time.
+// first; each removal then takes its own bytes off. A file it cannot remove
+// is skipped and the failures are logged once, so one bad file neither stops
+// the pass nor makes it rerun every sweep; only a failed scan or query fails
+// the pass. Ages are measured from now, the sweep's time.
 func (b *Backend) removeSpoolOrphans(ctx context.Context, now time.Time) (files, bytes int64, err error) {
+	var failed removeFailures
+	defer failed.log(b.logger, "orphan")
 	cutoff := now.Add(-b.spoolOrphanAge)
 	var oldTemps []blockstore.SpoolEntry
 	var oldBlobs []blockstore.SpoolEntry
@@ -198,7 +230,8 @@ func (b *Backend) removeSpoolOrphans(ctx context.Context, now time.Time) (files,
 	for _, e := range oldTemps {
 		freed, err := b.spool.RemoveTemp(e.Name)
 		if err != nil {
-			return files, bytes, err
+			failed.add(e.Name, err)
+			continue
 		}
 		if freed > 0 {
 			files++
@@ -218,7 +251,8 @@ func (b *Backend) removeSpoolOrphans(ctx context.Context, now time.Time) (files,
 		for _, d := range missing {
 			freed, err := b.spool.Remove(d)
 			if err != nil {
-				return files, bytes, err
+				failed.add(hex.EncodeToString(d), err)
+				continue
 			}
 			if freed > 0 {
 				files++
