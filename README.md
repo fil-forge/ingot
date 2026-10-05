@@ -160,9 +160,12 @@ than `spool_orphan_age` (default `24h`, at least `1h`).
 
 - `spool_max_bytes`, plus 10% headroom that must exceed the ingest rate × 30
   seconds (60 GB at 2 GB/s);
-- the bodies in flight: each concurrent PUT or UploadPart writes its body as
-  it streams, and a part can be up to 5 GiB. Those files cannot be evicted
-  until their upload finishes, so usage can run over the budget by that much;
+- the bodies in flight, when they outgrow the budget: each concurrent PUT or
+  UploadPart writes its body as it streams, and a part can be up to 5 GiB.
+  The budget counts those bytes as they land, so the sweeper evicts cached
+  bodies to make room for them. But a body cannot itself be evicted until its
+  upload finishes, so if the bodies in flight alone exceed the budget, usage
+  runs over it by the difference;
 - the catalog log, if it shares the filesystem: `<data_dir>/segments`, per
   bucket about (`retain` + the open and unshipped segments) × `seal_bytes`.
 
@@ -170,7 +173,7 @@ than `spool_orphan_age` (default `24h`, at least `1h`).
 
 | Metric | Meaning |
 | -- | -- |
-| `ingot.spool.usage` | Bytes held by the spool's blob files |
+| `ingot.spool.usage` | Bytes held by the spool's files, writes in progress included |
 | `ingot.spool.budget` | `spool_max_bytes` (0: no budget) |
 | `ingot.spool.evictions`, `ingot.spool.evicted` | Files and bytes removed, by `reason`: `released`, `parked`, `budget`, `orphan` |
 | `ingot.spool.reads` | Body-blob reads, by `tier`: `spool` or `network` (the spool's hit ratio) |

@@ -56,8 +56,8 @@ type ServerConfig struct {
 	// means releases are due immediately.
 	ReleaseGrace time.Duration
 
-	// SpoolMaxBytes is the byte budget for the spool's blob files, enforced
-	// by the spool sweeper; zero means no budget. SpoolOrphanAge is the age
+	// SpoolMaxBytes is the byte budget for the spool's files, writes in
+	// progress included, enforced by the spool sweeper; zero means no budget. SpoolOrphanAge is the age
 	// at which the sweeper deletes files no upload intent names; zero → 24h.
 	// Config.ServerConfig() applies the defaults documented on Config.
 	SpoolMaxBytes  int64
