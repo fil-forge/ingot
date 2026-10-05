@@ -160,28 +160,26 @@ const walkChunk = 1024
 // returns the size of a blob file (ok false for anything else). An entry
 // removed since it was listed is skipped.
 func (d *blobDir) visit(de fs.DirEntry, fn func(BlobFile)) (size int64, ok bool, err error) {
-	{
-		if !de.Type().IsRegular() {
-			return 0, false, nil
-		}
-		name := de.Name()
-		var digest mh.Multihash
-		if !strings.HasPrefix(name, spoolTempPrefix) {
-			digest = digestFromName(name)
-			if digest == nil {
-				return 0, false, nil
-			}
-		}
-		info, err := de.Info()
-		if errors.Is(err, fs.ErrNotExist) {
-			return 0, false, nil
-		}
-		if err != nil {
-			return 0, false, fmt.Errorf("blockstore: %s stat %s: %w", d.kind, name, err)
-		}
-		fn(BlobFile{Name: name, Digest: digest, Size: info.Size(), ModTime: info.ModTime()})
-		return info.Size(), digest != nil, nil
+	if !de.Type().IsRegular() {
+		return 0, false, nil
 	}
+	name := de.Name()
+	var digest mh.Multihash
+	if !strings.HasPrefix(name, spoolTempPrefix) {
+		digest = digestFromName(name)
+		if digest == nil {
+			return 0, false, nil
+		}
+	}
+	info, err := de.Info()
+	if errors.Is(err, fs.ErrNotExist) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("blockstore: %s stat %s: %w", d.kind, name, err)
+	}
+	fn(BlobFile{Name: name, Digest: digest, Size: info.Size(), ModTime: info.ModTime()})
+	return info.Size(), digest != nil, nil
 }
 
 // RemoveTemp deletes one .tmp-* file by name and returns its size. Idempotent.

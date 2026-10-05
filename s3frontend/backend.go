@@ -90,15 +90,17 @@ type Backend struct {
 	localBlobSweepMu    sync.Mutex
 	lastOrphanPass      time.Time
 	localBlobSweepBatch int
-	// overBudgetWarned, timeLimitLogged and forcedWarned are set once the
-	// sweeper has logged that usage is over budget with nothing left to
-	// evict, that an eviction pass ran out of time, or that the forced pass
-	// evicted inside the retention windows, and cleared when usage is back
-	// under, so each message comes once per episode. Guarded by
-	// localBlobSweepMu.
+	// overBudgetWarned and timeLimitLogged are set once the sweeper has
+	// logged that usage is over budget with nothing left to evict, or that an
+	// eviction pass (budget or forced, whichever ran out first) ran out of
+	// time, and cleared when usage is back under, so each message comes once
+	// per episode. lastForcedWarn is when the forced pass last warned that it
+	// evicted inside the retention windows; a forced pass usually brings
+	// usage back under budget, so that warning is limited by time instead.
+	// Guarded by localBlobSweepMu.
 	overBudgetWarned bool
 	timeLimitLogged  bool
-	forcedWarned     bool
+	lastForcedWarn   time.Time
 	// localBlobMetrics counts local blob removals; localBlobGauges is the
 	// registration of the usage and budget gauges (nil when not registered).
 	localBlobMetrics localBlobMetrics
@@ -205,7 +207,7 @@ type Deps struct {
 	// turns it off.
 	CacheReadRetention time.Duration
 	// LocalBlobOrphanAge is the age at which SweepLocalBlobs deletes a .tmp-*
-	// file, or a blob file in either directory with no intent row. Zero →
+	// file in either directory, or a spool blob file with no intent row. Zero →
 	// DefaultLocalBlobOrphanAge.
 	LocalBlobOrphanAge time.Duration
 

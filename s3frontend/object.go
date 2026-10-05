@@ -569,8 +569,9 @@ func (b *Backend) uploadBlob(ctx context.Context, space did.DID, blob msbucket.B
 	if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentAccepted); err != nil {
 		return fmt.Errorf("mark accepted: %w", err)
 	}
-	// Best-effort location record (unused in the harness, where reads come
-	// from the spool); keyed by (space, digest).
+	// The location record, keyed by (space, digest): where reads go once the
+	// local copy is evicted, and the proof eviction requires that the
+	// provider holds the blob.
 	if err := b.locations.PutLocation(ctx, registry.BlobLocation{
 		Space:    space,
 		Digest:   blob.Digest,
@@ -847,7 +848,7 @@ func (b *Backend) drainSpaceReleases(ctx context.Context, space did.DID) error {
 // touched, so the retry reads the same state and takes the same step. Only
 // once the network holds nothing for this space do the park and location
 // rows go, park first so a partial failure leaves the retry on the same
-// path, and then the spool copy and upload intent, committed or not. The
+// path, and then the local copy and upload intent, committed or not. The
 // intent goes together with this release's own record, in one transaction,
 // since it is the only evidence of how far the blob ever got.
 func (b *Backend) executeRelease(ctx context.Context, pr registry.PendingRelease) bool {
@@ -945,7 +946,7 @@ func (b *Backend) executeRelease(ctx context.Context, pr registry.PendingRelease
 	}
 	switch {
 	case !ok:
-		// A step above failed. The intent stays, with the spool copy, so
+		// A step above failed. The intent stays, with the local copy, so
 		// the retry reads the same state: deleting it would turn a blob
 		// that never left this node into one with neither rows nor intent,
 		// whose retry then owes a network remove it cannot authorize.

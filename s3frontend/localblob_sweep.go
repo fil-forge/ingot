@@ -27,6 +27,8 @@ const (
 	// time.
 	budgetPassTimeLimit = 30 * time.Second
 	forcedPassTimeLimit = 30 * time.Second
+	// forcedWarnInterval spaces the forced pass's warnings.
+	forcedWarnInterval = time.Hour
 	// orphanPassTimeLimit caps the orphan pass separately, so a long
 	// budget pass cannot starve it.
 	orphanPassTimeLimit = 2 * time.Minute
@@ -50,41 +52,62 @@ func (s LocalBlobSweepStats) Removed() bool {
 	return s.BudgetFiles+s.ForcedFiles+s.OrphanFiles > 0
 }
 
+// Add adds o's counts to s, to total several runs.
+func (s *LocalBlobSweepStats) Add(o LocalBlobSweepStats) {
+	s.BudgetFiles += o.BudgetFiles
+	s.BudgetBytes += o.BudgetBytes
+	s.ForcedFiles += o.ForcedFiles
+	s.ForcedBytes += o.ForcedBytes
+	s.OrphanFiles += o.OrphanFiles
+	s.OrphanBytes += o.OrphanBytes
+}
+
+// LogFields returns the counts as log fields.
+func (s LocalBlobSweepStats) LogFields() []zap.Field {
+	return []zap.Field{
+		zap.Int64("budget_files", s.BudgetFiles),
+		zap.Int64("budget_bytes", s.BudgetBytes),
+		zap.Int64("forced_files", s.ForcedFiles),
+		zap.Int64("forced_bytes", s.ForcedBytes),
+		zap.Int64("orphan_files", s.OrphanFiles),
+		zap.Int64("orphan_bytes", s.OrphanBytes),
+	}
+}
+
 // SweepLocalBlobs bounds the local blob directories. With a budget set
-// (Deps.LocalBlobMaxBytes) and their usage over it, the budget pass evicts blobs
-// the provider already holds (registry.IntentStore.ListEvictable), oldest
+// (Deps.LocalBlobMaxBytes) and their usage over it, the budget pass evicts
+// blobs the provider already holds (registry.IntentStore.ListEvictable), oldest
 // state change first, down to 90% of the budget, within a time limit. Eviction
-// removes a blob's local copy, which is in the cache, or still in the spool
-// if the process stopped between recording that the provider holds it and
-// moving it. The pass stops at the first blob younger than
-// CacheMinResidency, since every later one is newer, and skips a blob read
-// from the cache within CacheReadRetention. If it stopped at the residency
-// window or ran out of blobs with usage still over budget, the forced pass
-// gives up the windows in stages (see forcedPass); a budget pass that only
-// ran out of time leaves the rest to the next sweep. Every pass logs and
-// skips a file it cannot remove. If the forced pass runs out of evictable
-// blobs with usage still over budget, the rest is files no rule lets it
-// remove (bodies being written or uploaded, bodies whose upload failed, blobs
-// with no recorded location, young orphans), and it logs a warning once
-// until usage is back under budget. A failed upload's intent
-// stays spooled or uploading and nothing reclaims its file yet, so those
-// bytes count against the budget until an operator removes them. The counts
-// see such a removal at the next restart, or at the next orphan pass that
-// runs while the directory is quiet.
+// removes a blob's local copy, which is in the cache, or still in the spool if
+// the process stopped between recording that the provider holds it and moving
+// it. The pass stops at the first blob younger than CacheMinResidency, since
+// every later one is newer, and skips a blob read from the cache within
+// CacheReadRetention. If it stopped at the residency window or ran out of blobs
+// with usage still over budget, the forced pass gives up the windows in stages
+// (see forcedPass); a budget pass that only ran out of time leaves the rest to
+// the next sweep. Every pass logs and skips a file it cannot remove. If the
+// forced pass runs out of evictable blobs with usage still over budget, the
+// rest is files no rule lets it remove (bodies being written or uploaded,
+// bodies whose upload failed, blobs with no recorded location, young orphans),
+// and it logs a warning once until usage is back under budget. A failed
+// upload's intent stays spooled or uploading and nothing reclaims its file yet,
+// so those bytes count against the budget until an operator removes them. The
+// counts see such a removal at the next restart, or at the next orphan pass
+// that runs while the directory is quiet.
 //
 // Eviction removes only the file. The intent keeps its row and state, marked
 // evicted: a session's release recognises a committed part blob by its
 // published state, and Complete reads part sizes from intents. The file goes
 // first, so a crash in between leaves a row describing a missing file, which
-// the next pass finds missing and marks. Readers tolerate the unlink: an open file survives it,
-// and a local miss falls through to the network tier.
+// the next pass finds missing and marks. Readers tolerate the unlink: an open
+// file survives it, and a local miss falls through to the network tier.
 //
-// On the first run and then hourly, with or without a budget, the orphan
-// pass deletes .tmp-* files and blob files with no intent row once they are
-// older than LocalBlobOrphanAge, in both directories. It runs even when the
-// budget pass fails, with a time limit of its own, and counts as run whether
-// or not it finishes, so a slow or failing pass waits for the next hour
-// rather than starting over every sweep.
+// On the first run and then hourly, with or without a budget, the orphan pass
+// deletes .tmp-* files in both directories, and spool blob files with no intent
+// row, once they are older than LocalBlobOrphanAge. It runs even when the
+// budget pass fails, with a time limit of its own, and counts as run whether or
+// not it finishes, so a slow or failing pass waits for the next hour rather
+// than starting over every sweep.
 //
 // Called periodically by the daemon's local blob sweeper, and directly by tests.
 func (b *Backend) SweepLocalBlobs(ctx context.Context) (LocalBlobSweepStats, error) {
@@ -117,7 +140,7 @@ func (b *Backend) SweepLocalBlobs(ctx context.Context) (LocalBlobSweepStats, err
 			// continues rather than evicting inside them.
 			b.logTimeLimit("budget")
 		default:
-			if err := b.forcedPass(ctx, &stats); err != nil {
+			if err := b.forcedPass(ctx, pass.stop, &stats); err != nil {
 				errs = append(errs, err)
 			}
 		}
@@ -125,7 +148,6 @@ func (b *Backend) SweepLocalBlobs(ctx context.Context) (LocalBlobSweepStats, err
 	if b.localUsage() <= b.localBlobMaxBytes {
 		b.overBudgetWarned = false
 		b.timeLimitLogged = false
-		b.forcedWarned = false
 	}
 	if b.lastOrphanPass.IsZero() || now.Sub(b.lastOrphanPass) >= orphanPassInterval {
 		orphanCtx, cancel := context.WithTimeout(ctx, orphanPassTimeLimit)
@@ -179,21 +201,28 @@ const (
 )
 
 // forcedPass evicts inside the retention windows, once the budget pass has
-// stopped at the residency window or run out of candidates with usage still
-// over budget: a full disk fails every write, which costs more than reading
-// a blob from the network. It gives up the windows in stages: first
-// cache_min_residency, still passing over blobs read within
+// stopped at the residency window or run out of candidates (budgetStop) with
+// usage still over budget: a full disk fails every write, which costs more
+// than reading a blob from the network. It gives up the windows in stages:
+// first cache_min_residency, still passing over blobs read within
 // cache_read_retention, so young unread blobs go before old hot ones; then,
-// only if that is not enough, both. It warns once per over-budget episode
+// only if that is not enough, both. After a budget pass that ran out of
+// candidates, the first stage would see the same rows, so it starts at the
+// second. It evicts only down to the budget, not to the low watermark, to
+// give up as little of the windows as it can. It warns at most once an hour
 // that it evicted inside the windows; the budget_forced removals count each
 // time.
-func (b *Backend) forcedPass(ctx context.Context, stats *LocalBlobSweepStats) error {
+func (b *Backend) forcedPass(ctx context.Context, budgetStop passStop, stats *LocalBlobSweepStats) error {
 	forcedCtx, cancel := context.WithTimeout(ctx, forcedPassTimeLimit)
 	defer cancel()
 	deadline := time.Now().Add(forcedPassTimeLimit)
 	var last budgetPass
 	var err error
-	for _, r := range []retention{honorReadWindow, honorNoWindow} {
+	stages := []retention{honorReadWindow, honorNoWindow}
+	if budgetStop == stopExhausted {
+		stages = stages[1:]
+	}
+	for _, r := range stages {
 		if b.localUsage() <= b.localBlobMaxBytes {
 			break
 		}
@@ -208,9 +237,9 @@ func (b *Backend) forcedPass(ctx context.Context, stats *LocalBlobSweepStats) er
 		}
 	}
 	b.localBlobMetrics.removed(ctx, removedBudgetForced, stats.ForcedFiles, stats.ForcedBytes)
-	if stats.ForcedFiles > 0 && !b.forcedWarned {
-		b.forcedWarned = true
-		b.logger.Warn("local blob storage was over budget after the budget pass; evicted blobs inside the retention windows (cache_min_residency, cache_read_retention). This is logged once until usage is back under budget; the budget_forced removals count each time",
+	if stats.ForcedFiles > 0 && time.Since(b.lastForcedWarn) >= forcedWarnInterval {
+		b.lastForcedWarn = time.Now()
+		b.logger.Warn("local blob storage was over budget after the budget pass; evicted blobs inside the retention windows (cache_min_residency, cache_read_retention). This is logged at most once an hour; the budget_forced removals count each time",
 			zap.Int64("files", stats.ForcedFiles),
 			zap.Int64("bytes", stats.ForcedBytes),
 			zap.Int64("budget", b.localBlobMaxBytes))
@@ -286,7 +315,12 @@ func (b *Backend) evictToBudget(ctx context.Context, deadline time.Time, r reten
 	} else {
 		defer failed.log(b.logger, "forced")
 	}
+	// The budget pass evicts to the low watermark, for headroom; a forced
+	// stage only to the budget, giving up as little of the windows as it can.
 	target := b.localBlobMaxBytes * lowWatermarkPercent / 100
+	if r != honorBothWindows {
+		target = b.localBlobMaxBytes
+	}
 	batch := b.localBlobSweepBatch
 	if batch <= 0 {
 		batch = localBlobSweepBatch
@@ -338,25 +372,27 @@ func (b *Backend) evictToBudget(ctx context.Context, deadline time.Time, r reten
 	return pass, nil
 }
 
-// removeOrphans deletes the files no intent-driven cleanup can find, once
-// they are older than the orphan age: .tmp-* files from a write that never
-// finished, and blob files with no intent row (a split that failed before
-// its intents were recorded), in the spool and the cache. The age must exceed
-// the longest time one request body takes to stream, because a request
-// records its intents only after its whole body is spooled. The scans take no
-// lock, so writes and moves go on meanwhile; a file found in the spool may have
-// moved to the cache by the time it is checked, which removeLocal handles. A
-// scan that nothing in this process overlapped also corrects its directory's
-// byte count, which only a file added or removed outside ingot can throw off,
-// and logs the correction. It finishes the spool, which is small and where
-// orphans arise, before it scans the cache, so a slow cache cannot hold up
-// the spool's cleanup. It checks each directory's old blobs a batch at a time
-// as the scan reaches them, so its memory stays small however large the
-// cache; a cache orphan is rare, since a file enters the cache only after its
-// intent exists and every path that deletes an intent removes the file first.
-// A file it cannot remove is skipped and the failures are logged once, so one
-// bad file does not stop the pass; only a failed scan or query does. Ages are
-// measured from now, the sweep's time.
+// removeOrphans deletes the files no intent-driven cleanup can find, once they
+// are older than the orphan age: .tmp-* files from a write that never finished,
+// in the spool and the cache, and spool blob files with no intent row (a split
+// that failed before its intents were recorded). The age must exceed the
+// longest time one request body takes to stream, because a request records its
+// intents only after its whole body is spooled. The scans take no lock, so
+// writes and moves go on meanwhile; a file found in the spool may have moved to
+// the cache by the time it is checked, which removeLocal handles. A scan that
+// nothing in this process overlapped also corrects its directory's byte count,
+// which only a file added or removed outside ingot can throw off, and logs the
+// correction. It finishes the spool, which is small and where orphans arise,
+// before it scans the cache, so a slow cache cannot hold up the spool's
+// cleanup. It checks the spool's old blobs a batch at a time as the scan
+// reaches them, so its memory stays small. It does not check the cache's blobs
+// against intents: a file enters the cache only after its intent exists, and
+// every path that deletes an intent removes the file first, so a cache orphan
+// can only come from outside ingot, and checking every cached file each hour
+// would cost a query per file of a large cache. The cache scan removes old temp
+// files and corrects the count. A file it cannot remove is skipped and the
+// failures are logged once, so one bad file does not stop the pass; only a
+// failed scan or query does. Ages are measured from now, the sweep's time.
 func (b *Backend) removeOrphans(ctx context.Context, now time.Time) (files, bytes int64, err error) {
 	var failed removeFailures
 	defer failed.log(b.logger, "orphan")
@@ -390,9 +426,10 @@ func (b *Backend) removeOrphans(ctx context.Context, now time.Time) (files, byte
 		name       string
 		scan       func(context.Context, func(blockstore.BlobFile)) (int64, error)
 		removeTemp func(string) (int64, error)
+		checkBlobs bool
 	}{
-		{"spool", b.spool.ScanAndCorrect, b.spool.RemoveTemp},
-		{"cache", b.cache.ScanAndCorrect, b.cache.RemoveTemp},
+		{"spool", b.spool.ScanAndCorrect, b.spool.RemoveTemp, true},
+		{"cache", b.cache.ScanAndCorrect, b.cache.RemoveTemp, false},
 	} {
 		// Each batch of old blobs is checked as the scan reaches it, so a
 		// large directory is never held in memory; a failed query stops the
@@ -410,6 +447,9 @@ func (b *Backend) removeOrphans(ctx context.Context, now time.Time) (files, byte
 				if err != nil {
 					failed.add(f.Name, err)
 				}
+				return
+			}
+			if !dir.checkBlobs {
 				return
 			}
 			pending = append(pending, f.Digest)

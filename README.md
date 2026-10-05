@@ -163,17 +163,18 @@ client reading back what it just wrote reads from disk, and
 `cache_read_retention` (default `1h`) passes over bodies read from the cache
 that recently (remembered in memory for up to 65,536 bodies, and forgotten
 on restart). If usage is still over budget after that, the sweeper evicts
-inside the windows, since a full disk fails every write: first bodies inside
-`cache_min_residency` that no one has read recently, then, only if that is
-not enough, recently read ones too. It warns once per over-budget episode
-when it does. `0s` turns either window off.
+inside the windows, since a full disk fails every write, but only down to
+the budget: first bodies inside `cache_min_residency` that no one has read
+recently, then, only if that is not enough, recently read ones too. It warns
+at most once an hour when it does; the `budget_forced` removals count each
+time. `0s` turns either window off.
 
 A multipart part's copy goes from the spool as soon as the part parks on its
 provider. The budget is off by default (`local_blob_max_bytes: 0`): without
 it the cache grows with every live object's bodies. With or without a
-budget, the sweeper also deletes, hourly, unfinished `.tmp-*` writes and
-files with no upload intent, in either directory, once they are older than
-`local_blob_orphan_age` (default `24h`, at least `1h`).
+budget, the sweeper also deletes, hourly, unfinished `.tmp-*` writes in
+either directory and spool files with no upload intent, once they are older
+than `local_blob_orphan_age` (default `24h`, at least `1h`).
 
 **Sizing.** The filesystem needs room for:
 
@@ -181,7 +182,7 @@ files with no upload intent, in either directory, once they are older than
   × 30 seconds (60 GB at 2 GB/s). To evict outside `cache_min_residency`,
   the budget must also exceed the ingest rate × the window (1.2 TB at 2 GB/s
   for the default `10m`); below that, sweeps evict inside the window, and
-  warn once per over-budget episode;
+  warn at most once an hour;
 - the spool's bodies in flight, when they outgrow the budget: each
   concurrent PUT or UploadPart writes its body as it streams, and a part can
   be up to 5 GiB. The budget counts those bytes as they land, so the sweeper

@@ -15,6 +15,8 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/multiformats/go-multihash"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/fil-forge/libforge/testutil"
 	"github.com/fil-forge/versitygw/s3response"
@@ -140,7 +142,7 @@ func TestSweepLocalBlobs_UsageEndsAtOrBelowTheLowWatermark(t *testing.T) {
 
 // TestSweepLocalBlobs_ResidencyHoldsUntilTheForcedPass: with every blob inside
 // the residency window the budget pass evicts nothing, and the forced pass
-// then evicts to the watermark anyway.
+// then evicts down to the budget anyway.
 func TestSweepLocalBlobs_ResidencyHoldsUntilTheForcedPass(t *testing.T) {
 	b, _ := newSweepBackend(t, func(d *Deps) { d.CacheMinResidency = time.Hour })
 	digests := putSweepObjects(t, b, 4)
@@ -266,9 +268,10 @@ func TestSweepLocalBlobs_FileAlreadyGoneIsMarkedEvicted(t *testing.T) {
 	}
 }
 
-// TestSweepLocalBlobs_OrphanPass: old .tmp-* files and old blob files with no
-// intent are deleted, in the spool and the cache; young ones, and old files
-// with an intent, stay; the usage count comes to the blob files that remain.
+// TestSweepLocalBlobs_OrphanPass: old .tmp-* files are deleted from the spool
+// and the cache, and old spool blob files with no intent; young ones, old
+// files with an intent, and cached blob files (never checked against intents)
+// stay; the usage count comes to the blob files that remain.
 // A temp file counts only while a live write holds it, so the young one this
 // test wrote by hand does not.
 func TestSweepLocalBlobs_OrphanPass(t *testing.T) {
@@ -342,10 +345,10 @@ func TestSweepLocalBlobs_OrphanPass(t *testing.T) {
 			"old orphan blob":             false,
 			"young orphan blob":           true,
 			"old blob with intent":        true,
-			"old orphan blob in cache":    false,
+			"old orphan blob in cache":    true,
 			"old cached blob with intent": true,
 		},
-		Usage: int64(len("young orphan") + len("old with intent") + len("old cached with intent")),
+		Usage: int64(len("young orphan") + len("old with intent") + len("old cached orphan") + len("old cached with intent")),
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("spool after the orphan pass = %+v, want %+v", got, want)
@@ -803,5 +806,135 @@ func TestSweepLocalBlobs_OrphanPassFinishesTheSpoolFirst(t *testing.T) {
 	}
 	if stats.OrphanFiles != 1 || fileExists(b.spool.Path(d)) {
 		t.Fatalf("spool orphan: removed %d files, still on disk %v; want 1 removed", stats.OrphanFiles, fileExists(b.spool.Path(d)))
+	}
+}
+
+// failNthIntents fails the nth MissingIntents call and passes the others on.
+type failNthIntents struct {
+	registry.IntentStore
+	n     int
+	calls *int
+}
+
+func (f failNthIntents) MissingIntents(ctx context.Context, digests []multihash.Multihash) ([]multihash.Multihash, error) {
+	*f.calls++
+	if *f.calls == f.n {
+		return nil, errors.New("database unavailable")
+	}
+	return f.IntentStore.MissingIntents(ctx, digests)
+}
+
+// TestSweepLocalBlobs_OrphanPassChecksInBatches: old spool blobs are checked a
+// batch at a time as the scan reaches them; orphans go and blobs with intents
+// stay, and a query that fails partway stops the pass with its error,
+// removing nothing it has not checked.
+func TestSweepLocalBlobs_OrphanPassChecksInBatches(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		failCall int // 0: no failure
+	}{{"all succeed", 0}, {"second query fails", 2}} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			b, mem := newSweepBackend(t)
+			b.localBlobSweepBatch = 2
+			old := time.Now().Add(-2 * DefaultLocalBlobOrphanAge)
+			var orphans, kept []multihash.Multihash
+			for i := range 6 {
+				d, n, err := b.spool.WriteBlob(ctx, bytes.NewReader([]byte(fmt.Sprintf("old blob %d", i))))
+				if err != nil {
+					t.Fatalf("WriteBlob: %v", err)
+				}
+				if i%2 == 0 {
+					orphans = append(orphans, d)
+				} else {
+					if err := mem.PutIntent(ctx, registry.UploadIntent{Digest: d, LocalPath: localPath(b, d), Size: n, State: registry.IntentSpooled}); err != nil {
+						t.Fatalf("PutIntent: %v", err)
+					}
+					kept = append(kept, d)
+				}
+				if err := os.Chtimes(localPath(b, d), old, old); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var calls int
+			if tc.failCall > 0 {
+				b.intents = failNthIntents{IntentStore: b.intents, n: tc.failCall, calls: &calls}
+			}
+
+			stats, err := b.SweepLocalBlobs(ctx)
+
+			if (err != nil) != (tc.failCall > 0) {
+				t.Fatalf("SweepLocalBlobs error = %v, want failure %v", err, tc.failCall > 0)
+			}
+			for _, d := range kept {
+				if !fileExists(localPath(b, d)) {
+					t.Fatalf("blob %x with an intent was removed", d)
+				}
+			}
+			removed := 0
+			for _, d := range orphans {
+				if !fileExists(localPath(b, d)) {
+					removed++
+				}
+			}
+			want := len(orphans)
+			if tc.failCall > 0 {
+				// Only the first batch was checked before the failure.
+				want = int(stats.OrphanFiles)
+				if want >= len(orphans) {
+					t.Fatalf("removed %d orphans despite the failed query, want fewer than %d", want, len(orphans))
+				}
+			}
+			if removed != want || int(stats.OrphanFiles) != want {
+				t.Fatalf("orphans removed = %d (stats %d), want %d", removed, stats.OrphanFiles, want)
+			}
+		})
+	}
+}
+
+// TestSweepLocalBlobs_ForcedPassEvictsReadBlobsLast: with every blob read
+// recently and nothing in the residency window, the budget pass runs out of
+// candidates, and the forced pass goes straight to its last stage, evicting
+// the oldest.
+func TestSweepLocalBlobs_ForcedPassEvictsReadBlobsLast(t *testing.T) {
+	b, mem := newSweepBackend(t, func(d *Deps) { d.CacheReadRetention = time.Hour })
+	digests := putSweepObjects(t, b, 4)
+	for i := range digests {
+		bucket, key := sweepBucket, fmt.Sprintf("obj-%d", i)
+		got, err := b.GetObject(t.Context(), &s3.GetObjectInput{Bucket: &bucket, Key: &key})
+		if err != nil {
+			t.Fatalf("GetObject %s: %v", key, err)
+		}
+		_, _ = io.Copy(io.Discard, got.Body)
+		got.Body.Close()
+	}
+	budgetToEvict(b, 1, blobSize(t, b, digests[0]))
+
+	stats := sweepLocalBlobs(t, b)
+
+	want := []blobState{{false, true}, {true, false}, {true, false}, {true, false}}
+	if states := blobStates(t, b, mem, digests); !reflect.DeepEqual(states, want) || stats.BudgetFiles != 0 || stats.ForcedFiles != 1 {
+		t.Fatalf("blobs after the sweep = %+v (budget %d, forced %d), want %+v (budget 0, forced 1)", states, stats.BudgetFiles, stats.ForcedFiles, want)
+	}
+}
+
+// TestSweepLocalBlobs_ForcedPassWarnsAtMostHourly: consecutive sweeps that
+// each evict inside the windows warn once.
+func TestSweepLocalBlobs_ForcedPassWarnsAtMostHourly(t *testing.T) {
+	core, logs := observer.New(zap.WarnLevel)
+	b, _ := newSweepBackend(t, func(d *Deps) {
+		d.CacheMinResidency = time.Hour
+		d.Logger = zap.New(core)
+	})
+	digests := putSweepObjects(t, b, 4)
+	size := blobSize(t, b, digests[0])
+	var forced int64
+	for range 2 {
+		budgetToEvict(b, 1, size)
+		forced += sweepLocalBlobs(t, b).ForcedFiles
+	}
+	warnings := logs.FilterMessageSnippet("inside the retention windows").Len()
+	if forced != 2 || warnings != 1 {
+		t.Fatalf("over two forced sweeps: %d forced removals, %d warnings; want 2 and 1", forced, warnings)
 	}
 }
