@@ -259,9 +259,9 @@ sequenceDiagram
     Note over C,L: off the lock: ingest, hash, encrypt, upload (an upload service that cannot<br/>add by digest code gets every blob spooled first, then uploaded by digest)
     C->>B: PutObject(bucket, key, body)
     B->>R: reg.Get(bucket), precondition pre-check
-    B->>B: tenant recipient: resolve the tenant's #wrap key<br/>(tenant DID from the request, did:plc doc via the cached PLC resolver);<br/>no recipient → the write fails
+    B->>B: tenant recipient: resolve the tenant's #wrap key<br/>(tenant DID from the request, did:plc doc via the cached PLC resolver)#59;<br/>no recipient → the write fails
     loop SplitSizedBody: each plaintext piece of min(max_blob_size, remaining) bytes
-        B->>B: fresh CEK → FEE envelope (COSE_Encrypt, AES-256-GCM STREAM,<br/>one recipient: ECDH-ES+A256KW to the tenant wrap key);<br/>its length is known from the header + plaintext length
+        B->>B: fresh CEK → FEE envelope (COSE_Encrypt, AES-256-GCM STREAM,<br/>one recipient: ECDH-ES+A256KW to the tenant wrap key)#59;<br/>its length is known from the header + plaintext length
         B->>U: /blob/add (digestCode sha2-256, envelope size, random nonce)
         U-->>B: allocation address, put and accept tasks
         B->>R: PutStream(add task): the upload's name until parked or accepted
@@ -270,7 +270,7 @@ sequenceDiagram
         and
             B->>P: HTTP PUT the same envelope bytes as they are spooled
         end
-        Note over B,P: a failed PUT detaches: the spool finishes, the allocation is<br/>aborted and the blob uploads by digest; UnsupportedDigestCode<br/>switches the rest of the body to spool-first
+        Note over B,P: a failed PUT detaches: the spool finishes, the allocation is<br/>aborted and the blob uploads by digest#59; UnsupportedDigestCode<br/>switches the rest of the body to spool-first
     end
     B->>R: PutIntent(digest, stored size, uploading) +<br/>PutEncryptionParams(region-wrapped CEK, FEE geometry) per blob
     loop each streamed blob (uploadBlobs → concludeStreamed)
@@ -396,11 +396,11 @@ sequenceDiagram
             else inner block via shard_inclusions
                 LC-->>LY: shard location + inclusive byte range
             end
-            LY->>P: content/retrieve (UCAN, audience = the commitment's provider,<br/>proofs from reqscope.ProofStore;<br/>narrowed to the ciphertext span for an encrypted blob)
+            LY->>P: content/retrieve (UCAN, audience = the commitment's provider,<br/>proofs from reqscope.ProofStore#59;<br/>narrowed to the ciphertext span for an encrypted blob)
             P-->>LY: ranged bytes, length-checked
         end
         opt encrypted blob (FEE)
-            Note over B: aesstream.SpanReader decrypts the span as it streams;<br/>a tampered chunk fails authentication mid-stream (ErrCorrupted)
+            Note over B: aesstream.SpanReader decrypts the span as it streams#59;<br/>a tampered chunk fails authentication mid-stream (ErrCorrupted)
         end
     end
     B-->>C: 200 or 206 body (plaintext byte counts throughout)
@@ -453,14 +453,14 @@ sequenceDiagram
     C->>B: UploadPart(n) / UploadPartCopy(n)
     B->>B: openSession (non-open: NoSuchUpload)
     opt UploadPartCopy
-        B->>B: vet the source: copySourceBucket (tenant), resolveVersionIn,<br/>range within the object, copy-source preconditions (412);<br/>the body is the source's plaintext range through the decrypting reader
+        B->>B: vet the source: copySourceBucket (tenant), resolveVersionIn,<br/>range within the object, copy-source preconditions (412)#59;<br/>the body is the source's plaintext range through the decrypting reader
     end
     B->>B: ingestPart: splitSpool<br/>(resolve the tenant recipient, then encrypt per piece:<br/>fresh CEK → FEE envelope → spool under the ciphertext<br/>digest + params row, as in the PutObject diagram)
-    B->>R: PutPart(parked): open sessions only, the row held FOR SHARE<br/>against a concurrent latch; a refused part records its blobs' releases
+    B->>R: PutPart(parked): open sessions only, the row held FOR SHARE<br/>against a concurrent latch#59; a refused part records its blobs' releases
     loop each part blob (parkBlobs)
         alt streamed while spooled
             B->>R: PutPark(AddTask, AcceptTask, PutInvocation), intent parked,<br/>DeleteStream: the PUT already went to piri in splitSpool
-            B->>B: spool.Remove (the part's local copy; Complete concludes from the park)
+            B->>B: spool.Remove (the part's local copy#59; Complete concludes from the park)
         else blob_locations already has the digest
             B->>R: intent accepted (dedup, no park)
         else already parked (GetPark hit)
@@ -472,7 +472,7 @@ sequenceDiagram
             B->>B: spool.Remove (the part's local copy)
         end
     end
-    B-->>C: part ETag (part md5; for a copy, of the copied bytes)
+    B-->>C: part ETag (part md5#59; for a copy, of the copied bytes)
     C->>B: CompleteMultipartUpload(parts)
     B->>B: validate parts (ascending, ETags, checksums, MinPartSize)
     alt session already completed
@@ -487,9 +487,9 @@ sequenceDiagram
         B-->>C: 200, ETag = md5-of-part-md5s + "-N"
     end
     C->>B: AbortMultipartUpload
-    B->>R: LatchSession(open to aborting); EnqueueReleases for every<br/>unreferenced part blob; then DeleteSession (parts cascade)
-    B->>U: releaseNow, per record: crypto-shred, then /blob/abort a parked blob<br/>(cause = AddTask) or /blob/remove an accepted one; local rows dropped<br/>once the network step succeeds; the release sweeper retries the rest
-    Note over B,R: a background sweeper tears down sessions whose state has not<br/>changed for MultipartSessionTTL (default 7d); a Complete's latch restarts the clock
+    B->>R: LatchSession(open to aborting)#59; EnqueueReleases for every<br/>unreferenced part blob#59; then DeleteSession (parts cascade)
+    B->>U: releaseNow, per record: crypto-shred, then /blob/abort a parked blob<br/>(cause = AddTask) or /blob/remove an accepted one#59; local rows dropped<br/>once the network step succeeds#59; the release sweeper retries the rest
+    Note over B,R: a background sweeper tears down sessions whose state has not<br/>changed for MultipartSessionTTL (default 7d)#59; a Complete's latch restarts the clock
 ```
 
 - A part re-upload and an abort record a release for every blob of theirs
@@ -791,7 +791,7 @@ sequenceDiagram
 
     C->>G: signed S3 request
     G->>G: middleware stashes the raw request on ctx<br/>(reqscope, ahead of auth)
-    G->>I: GetUserAccountForRequest (every access key; root disabled)
+    G->>I: GetUserAccountForRequest (every access key#59; root disabled)
     I->>I: access key ID parsed as a did:key
     alt local fast path (authorizeLocal)
         I->>K: cached derived key verifies SigV4,<br/>per bucket: cached action set permits the action,<br/>every command chains to the agent
