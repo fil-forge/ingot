@@ -710,7 +710,7 @@ func TestSweepLocalBlobs_EvictsAHeldBlobLeftInTheSpool(t *testing.T) {
 }
 
 // TestSweepLocalBlobs_WarnsOncePerOverBudgetEpisode: the warning that nothing is
-// left to evict is armed until usage is back under budget.
+// left to evict is armed until usage falls back to the low watermark.
 func TestSweepLocalBlobs_WarnsOncePerOverBudgetEpisode(t *testing.T) {
 	ctx := t.Context()
 	b, _ := newSweepBackend(t, func(d *Deps) { d.LocalBlobMaxBytes = 1 })
@@ -909,8 +909,16 @@ func TestSweepLocalBlobs_ForcedPassEvictsReadBlobsLast(t *testing.T) {
 		got.Body.Close()
 	}
 	budgetToEvict(b, 1, blobSize(t, b, digests[0]))
+	var calls int
+	b.intents = countingEvictable{IntentStore: b.intents, calls: &calls}
 
 	stats := sweepLocalBlobs(t, b)
+
+	// The budget pass reads a page of skipped rows and an empty one; the
+	// last stage, run directly, one page.
+	if calls != 3 {
+		t.Fatalf("ListEvictable calls = %d, want 3: the forced pass should skip its first stage", calls)
+	}
 
 	want := []blobState{{false, true}, {true, false}, {true, false}, {true, false}}
 	if states := blobStates(t, b, mem, digests); !reflect.DeepEqual(states, want) || stats.BudgetFiles != 0 || stats.ForcedFiles != 1 {
@@ -937,4 +945,80 @@ func TestSweepLocalBlobs_ForcedPassWarnsAtMostHourly(t *testing.T) {
 	if forced != 2 || warnings != 1 {
 		t.Fatalf("over two forced sweeps: %d forced removals, %d warnings; want 2 and 1", forced, warnings)
 	}
+}
+
+// TestSweepLocalBlobs_ForcedPassEscalates: every blob is young and recently
+// read, so the budget pass stops at the residency window, the forced pass's
+// first stage passes over every blob as recently read, and its last stage
+// evicts the oldest.
+func TestSweepLocalBlobs_ForcedPassEscalates(t *testing.T) {
+	b, mem := newSweepBackend(t, func(d *Deps) {
+		d.CacheMinResidency = time.Hour
+		d.CacheReadRetention = time.Hour
+	})
+	digests := putSweepObjects(t, b, 4)
+	for i := range digests {
+		bucket, key := sweepBucket, fmt.Sprintf("obj-%d", i)
+		got, err := b.GetObject(t.Context(), &s3.GetObjectInput{Bucket: &bucket, Key: &key})
+		if err != nil {
+			t.Fatalf("GetObject %s: %v", key, err)
+		}
+		_, _ = io.Copy(io.Discard, got.Body)
+		got.Body.Close()
+	}
+	budgetToEvict(b, 1, blobSize(t, b, digests[0]))
+
+	stats := sweepLocalBlobs(t, b)
+
+	want := []blobState{{false, true}, {true, false}, {true, false}, {true, false}}
+	if states := blobStates(t, b, mem, digests); !reflect.DeepEqual(states, want) || stats.BudgetFiles != 0 || stats.ForcedFiles != 1 {
+		t.Fatalf("blobs after the sweep = %+v (budget %d, forced %d), want %+v (budget 0, forced 1)", states, stats.BudgetFiles, stats.ForcedFiles, want)
+	}
+}
+
+// TestSweepLocalBlobs_ForcedPassStopsAtTheBudget: forced eviction goes only
+// down to the budget, not to the low watermark the budget pass aims for.
+func TestSweepLocalBlobs_ForcedPassStopsAtTheBudget(t *testing.T) {
+	b, _ := newSweepBackend(t, func(d *Deps) { d.CacheMinResidency = time.Hour })
+	digests := putSweepObjects(t, b, 20)
+	size := blobSize(t, b, digests[0])
+	// 3.5 blobs over: 4 evictions reach the budget; the low watermark, at
+	// 90% of it, would need 6.
+	b.localBlobMaxBytes = b.localUsage() - 7*size/2
+
+	stats := sweepLocalBlobs(t, b)
+
+	if stats.ForcedFiles != 4 || b.localUsage() > b.localBlobMaxBytes {
+		t.Fatalf("forced pass evicted %d blobs, usage %d against a budget of %d; want 4 and at most the budget", stats.ForcedFiles, b.localUsage(), b.localBlobMaxBytes)
+	}
+}
+
+// TestSweepLocalBlobs_NoForcedPassWithoutAReadWindow: with no read window, an
+// exhausted budget pass is not followed by a forced pass, which would only
+// repeat it.
+func TestSweepLocalBlobs_NoForcedPassWithoutAReadWindow(t *testing.T) {
+	ctx := t.Context()
+	b, _ := newSweepBackend(t, func(d *Deps) { d.LocalBlobMaxBytes = 1 })
+	if _, _, err := b.spool.WriteBlob(ctx, bytes.NewReader([]byte("unevictable"))); err != nil {
+		t.Fatalf("WriteBlob: %v", err)
+	}
+	var calls int
+	b.intents = countingEvictable{IntentStore: b.intents, calls: &calls}
+
+	sweepLocalBlobs(t, b)
+
+	if calls != 1 || !b.overBudgetWarned {
+		t.Fatalf("ListEvictable calls = %d, warned %v; want 1 (the budget pass only) and a warning", calls, b.overBudgetWarned)
+	}
+}
+
+// countingEvictable counts ListEvictable calls.
+type countingEvictable struct {
+	registry.IntentStore
+	calls *int
+}
+
+func (c countingEvictable) ListEvictable(ctx context.Context, cursor registry.EvictCursor, limit int) ([]registry.UploadIntent, error) {
+	*c.calls++
+	return c.IntentStore.ListEvictable(ctx, cursor, limit)
 }
