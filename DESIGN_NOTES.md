@@ -207,9 +207,10 @@ age alone, so the newest bodies, the likeliest to be read back soon after
 they are written, go last. Eviction removes the file first, then sets
 `upload_intents.evicted_at`; the row and its state stay, because a release
 and Complete read them. A read of an evicted blob misses the spool and goes
-to the network tier. Hourly, the sweeper also deletes `.tmp-*` files and
-blob files with no intent row older than `spool_orphan_age` (24 hours), and
-resets the byte count from the directory scan.
+to the network tier. A file the pass cannot remove is logged and skipped.
+Hourly, with or without a budget, the sweeper also deletes `.tmp-*` files
+and blob files with no intent row older than `spool_orphan_age` (24 hours),
+and corrects the byte count to the directory scan.
 
 ## Read path
 
@@ -294,7 +295,9 @@ draws the chains and the stores.
   release runs, and a multipart part's copy goes once it parks.
 - **Spool crash recovery is not built**: reconciling `upload_intents`
   against `blob_refs` after a crash between commit and reconcile is a later
-  phase; the window leaks rather than loses referenced data.
+  phase; the window leaks rather than loses referenced data. (Files with no
+  intent row at all, and unfinished `.tmp-*` writes, are reclaimed by the
+  spool sweeper's orphan pass.)
 - **No catalog GC**: `gc_candidates` is write-only; superseded MST nodes
   accumulate on Forge with mutation volume.
 - **Reads carry no bucket context**: `Manager.Get` linear-scans every open

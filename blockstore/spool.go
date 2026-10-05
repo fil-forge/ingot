@@ -159,11 +159,14 @@ func (s *Spool) Usage() int64 {
 	return s.usage.Load()
 }
 
-// ResetUsage replaces the usage count, for a caller that has just measured it
-// with Scan. A write or remove that lands during the scan can leave the count
-// off by that file's size until the next reset.
-func (s *Spool) ResetUsage(n int64) {
-	s.usage.Store(n)
+// CorrectUsage corrects the usage count to a Scan's measurement: before is
+// Usage() read just before the Scan, measured is the Scan's total. It adds
+// the difference rather than storing measured, so a write or remove after the
+// Scan still counts. One that lands during the Scan can be counted twice or
+// missed, leaving the count off by at most that file's size until the next
+// correction.
+func (s *Spool) CorrectUsage(before, measured int64) {
+	s.usage.Add(measured - before)
 }
 
 // RemoveTemp deletes one .tmp-* file by name and returns how many bytes it

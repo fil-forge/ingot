@@ -225,7 +225,7 @@ func TestSpoolRemoveTempRejectsBlobNames(t *testing.T) {
 }
 
 // TestSpoolRemoveTempUncountsItsBytes: a temp file the usage count included
-// (here through a reset from a scan, as the orphan pass does) comes off the
+// (here through a correction from a scan, as the orphan pass makes) comes off the
 // count when RemoveTemp deletes it, and a second removal frees nothing.
 func TestSpoolRemoveTempUncountsItsBytes(t *testing.T) {
 	s := newTestSpool(t)
@@ -233,11 +233,12 @@ func TestSpoolRemoveTempUncountsItsBytes(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(s.dir, ".tmp-abc"), []byte("partial"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	before := s.Usage()
 	total, err := s.Scan(func(SpoolEntry) {})
 	if err != nil {
 		t.Fatalf("Scan: %v", err)
 	}
-	s.ResetUsage(total)
+	s.CorrectUsage(before, total)
 	var freed []int64
 	for range 2 {
 		n, err := s.RemoveTemp(".tmp-abc")
