@@ -133,13 +133,19 @@ func (c *BlobCache) Take(spool *Spool, digest mh.Multihash) (int64, error) {
 	}
 	if err := os.Rename(from, c.Path(digest)); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			// Removed since the Stat, by something outside this process.
+			// Removed since the Stat, by something outside this process,
+			// which holding both directories rules out within it: the spool
+			// no longer holds its bytes.
+			spool.usage.Add(-info.Size())
+			spool.changes.Add(1)
 			return 0, nil
 		}
 		return 0, fmt.Errorf("blockstore: cache take: %w", err)
 	}
 	spool.usage.Add(-info.Size())
 	c.usage.Add(info.Size())
+	spool.changes.Add(1)
+	c.changes.Add(1)
 	return info.Size(), nil
 }
 

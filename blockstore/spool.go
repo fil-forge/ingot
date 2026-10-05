@@ -33,8 +33,8 @@ import (
 type Spool struct {
 	*blobDir
 	// inFlight is every byte written so far to a write in progress. It is
-	// kept apart from the finished files' count, which a Scan resets, so a
-	// Scan never measures a write mid-way.
+	// kept apart from the finished files' count, which a scan measures and
+	// may reset, so a scan never measures a write mid-way.
 	inFlight atomic.Int64
 }
 
@@ -151,6 +151,7 @@ func (s *Spool) commit(tmpName string, digest mh.Multihash, size int64) error {
 	if !existed {
 		s.usage.Add(size)
 	}
+	s.changes.Add(1)
 	return nil
 }
 

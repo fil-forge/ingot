@@ -212,7 +212,9 @@ WHERE i.state IN ('accepted', 'published')
 ```
 
 Never delete the spool file of a `spooled` or `uploading` intent: it may be
-the only copy.
+the only copy. Restart `serve` after deleting files by hand: the byte counts
+see such a change at startup, or only at an hourly scan that no write
+overlapped.
 
 ## Build & test
 

@@ -320,7 +320,9 @@ draws the chains and the stores.
   sweeper's orphan pass.) Nor is a failed upload's spool file reclaimed: its
   intent stays `spooled` or `uploading`, so neither eviction nor the orphan
   pass may take it, and with `local_blob_max_bytes` set its bytes count
-  against the budget until an operator removes it.
+  against the budget until an operator removes it and restarts ingot (the
+  counts see a removal outside ingot at startup, or at an hourly scan that
+  no write overlapped).
 - **No catalog GC**: `gc_candidates` is write-only; superseded MST nodes
   accumulate on Forge with mutation volume.
 - **Reads carry no bucket context**: `Manager.Get` linear-scans every open

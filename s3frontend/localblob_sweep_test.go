@@ -699,3 +699,23 @@ func TestRemoveLocalRacingTakeLeavesNoCopy(t *testing.T) {
 		t.Fatalf("local usage = %d, want 0", got)
 	}
 }
+
+// TestSweepLocalBlobs_OrphanPassCorrectsCountsAfterAManualRemoval: a cached
+// blob deleted by hand stays counted until the next orphan pass, which finds
+// the directory quiet and corrects the count.
+func TestSweepLocalBlobs_OrphanPassCorrectsCountsAfterAManualRemoval(t *testing.T) {
+	b, _ := newSweepBackend(t)
+	digests := putSweepObjects(t, b, 2)
+	size := blobSize(t, b, digests[0])
+	before := b.localUsage()
+	if err := os.Remove(localPath(b, digests[0])); err != nil {
+		t.Fatal(err)
+	}
+	stale := b.localUsage()
+
+	sweepLocalBlobs(t, b)
+
+	if got, want := [2]int64{stale, b.localUsage()}, [2]int64{before, before - size}; got != want {
+		t.Fatalf("usage [after the manual removal, after the sweep] = %v, want %v", got, want)
+	}
+}

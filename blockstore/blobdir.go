@@ -26,7 +26,9 @@ import (
 // may be removed is the caller's question.
 //
 // At most one blobDir may use a directory at a time: the byte count assumes
-// it makes every change to the directory.
+// it makes every change to the directory. A file added or removed by anything
+// else is miscounted until a restart, or until ScanAndCorrect finds the
+// directory quiet.
 type blobDir struct {
 	dir string
 	// kind names the directory in errors.
@@ -39,6 +41,10 @@ type blobDir struct {
 	mu sync.RWMutex
 	// usage is the byte count of the finished blob files.
 	usage atomic.Int64
+	// changes counts the changes this process makes to the directory's blob
+	// files, each made while holding mu, so ScanAndCorrect can tell whether
+	// any overlapped its scan.
+	changes atomic.Uint64
 }
 
 func newBlobDir(dir, kind string) (*blobDir, error) {
@@ -68,6 +74,32 @@ type BlobFile struct {
 func (d *blobDir) Scan(ctx context.Context, fn func(BlobFile)) error {
 	_, err := d.walk(ctx, fn)
 	return err
+}
+
+// ScanAndCorrect is Scan, and then corrects the byte count to the blob files
+// the scan found if nothing in this process changed them while it ran. That
+// condition makes the scan an exact measurement, so a difference can only be
+// files added or removed outside the process; it returns the correction (the
+// count minus what is on disk), or zero when the count was right or a change
+// overlapped the scan. Only the final comparison holds the directory
+// exclusively, briefly, so writers are not held up by the walk.
+func (d *blobDir) ScanAndCorrect(ctx context.Context, fn func(BlobFile)) (int64, error) {
+	before := d.changes.Load()
+	total, err := d.walk(ctx, fn)
+	if err != nil {
+		return 0, err
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	// Every change holds mu while it runs and counts itself before releasing
+	// it, so holding mu here, any change that overlapped the walk has counted
+	// itself by now.
+	if d.changes.Load() != before {
+		return 0, nil
+	}
+	drift := d.usage.Load() - total
+	d.usage.Store(total)
+	return drift, nil
 }
 
 // count sets the byte count to the blob files on disk, holding the directory
@@ -198,6 +230,7 @@ func (d *blobDir) Remove(digest mh.Multihash) (int64, error) {
 		return 0, fmt.Errorf("blockstore: %s remove: %w", d.kind, err)
 	}
 	d.usage.Add(-info.Size())
+	d.changes.Add(1)
 	return info.Size(), nil
 }
 
