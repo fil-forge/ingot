@@ -90,12 +90,15 @@ type Backend struct {
 	localBlobSweepMu    sync.Mutex
 	lastOrphanPass      time.Time
 	localBlobSweepBatch int
-	// overBudgetWarned and timeLimitLogged are set once the sweeper has
-	// logged that usage is over budget with nothing left to evict, or that
-	// the budget pass ran out of time, and cleared when usage is back under,
-	// so each message comes once per episode. Guarded by localBlobSweepMu.
+	// overBudgetWarned, timeLimitLogged and forcedWarned are set once the
+	// sweeper has logged that usage is over budget with nothing left to
+	// evict, that an eviction pass ran out of time, or that the forced pass
+	// evicted inside the retention windows, and cleared when usage is back
+	// under, so each message comes once per episode. Guarded by
+	// localBlobSweepMu.
 	overBudgetWarned bool
 	timeLimitLogged  bool
+	forcedWarned     bool
 	// localBlobMetrics counts local blob removals; localBlobGauges is the
 	// registration of the usage and budget gauges (nil when not registered).
 	localBlobMetrics localBlobMetrics

@@ -416,20 +416,20 @@ func TestSweepLocalBlobs_EvictsAParkedBlob(t *testing.T) {
 	}
 }
 
-// TestEvictToBudget_ReportsWhyItStopped: a pass past its deadline evicts
-// nothing and is not exhausted; a pass with no evictable rows is.
+// TestEvictToBudget_ReportsWhyItStopped: each way a pass ends is reported, and
+// the residency stop leaves the young rows alone after evicting the old ones.
 func TestEvictToBudget_ReportsWhyItStopped(t *testing.T) {
 	ctx := t.Context()
 	t.Run("deadline", func(t *testing.T) {
 		b, _ := newSweepBackend(t)
 		digests := putSweepObjects(t, b, 2)
 		budgetToEvict(b, 1, blobSize(t, b, digests[0]))
-		pass, err := b.evictToBudget(ctx, time.Now().Add(-time.Second), false)
+		pass, err := b.evictToBudget(ctx, time.Now().Add(-time.Second), honorBothWindows)
 		if err != nil {
 			t.Fatalf("evictToBudget: %v", err)
 		}
-		if pass != (budgetPass{}) {
-			t.Fatalf("pass = %+v, want nothing evicted and not exhausted", pass)
+		if pass != (budgetPass{stop: stopDeadline}) {
+			t.Fatalf("pass = %+v, want nothing evicted, stopped at the deadline", pass)
 		}
 	})
 	t.Run("no evictable rows", func(t *testing.T) {
@@ -437,14 +437,73 @@ func TestEvictToBudget_ReportsWhyItStopped(t *testing.T) {
 		if _, _, err := b.spool.WriteBlob(ctx, bytes.NewReader([]byte("no intent"))); err != nil {
 			t.Fatalf("WriteBlob: %v", err)
 		}
-		pass, err := b.evictToBudget(ctx, time.Now().Add(time.Minute), false)
+		pass, err := b.evictToBudget(ctx, time.Now().Add(time.Minute), honorBothWindows)
 		if err != nil {
 			t.Fatalf("evictToBudget: %v", err)
 		}
-		if pass != (budgetPass{exhausted: true}) {
+		if pass != (budgetPass{stop: stopExhausted}) {
 			t.Fatalf("pass = %+v, want exhausted", pass)
 		}
 	})
+	t.Run("watermark", func(t *testing.T) {
+		b, _ := newSweepBackend(t)
+		digests := putSweepObjects(t, b, 2)
+		size := blobSize(t, b, digests[0])
+		budgetToEvict(b, 1, size)
+		pass, err := b.evictToBudget(ctx, time.Now().Add(time.Minute), honorBothWindows)
+		if err != nil {
+			t.Fatalf("evictToBudget: %v", err)
+		}
+		if pass != (budgetPass{files: 1, bytes: size, stop: stopWatermark}) {
+			t.Fatalf("pass = %+v, want one eviction, stopped at the watermark", pass)
+		}
+	})
+	t.Run("residency", func(t *testing.T) {
+		const residency = time.Second
+		b, mem := newSweepBackend(t, func(d *Deps) { d.CacheMinResidency = residency })
+		old := putSweepObjects(t, b, 1)
+		time.Sleep(residency + 500*time.Millisecond)
+		young := putSweepObjects(t, b, 2)[1:]
+		size := blobSize(t, b, old[0])
+		budgetToEvict(b, 2, size)
+		pass, err := b.evictToBudget(ctx, time.Now().Add(time.Minute), honorBothWindows)
+		if err != nil {
+			t.Fatalf("evictToBudget: %v", err)
+		}
+		if pass != (budgetPass{files: 1, bytes: size, stop: stopResidency}) {
+			t.Fatalf("pass = %+v, want the old blob evicted, stopped at the residency window", pass)
+		}
+		want := []blobState{{false, true}, {true, false}}
+		if got := blobStates(t, b, mem, append(old, young...)); !reflect.DeepEqual(got, want) {
+			t.Fatalf("blobs = %+v, want %+v", got, want)
+		}
+	})
+}
+
+// TestSweepLocalBlobs_ForcedPassKeepsRecentlyReadBlobsLongest: inside the
+// residency window, the forced pass evicts the oldest blob nobody has read,
+// keeping the one just read although it is older.
+func TestSweepLocalBlobs_ForcedPassKeepsRecentlyReadBlobsLongest(t *testing.T) {
+	b, mem := newSweepBackend(t, func(d *Deps) {
+		d.CacheMinResidency = time.Hour
+		d.CacheReadRetention = time.Hour
+	})
+	digests := putSweepObjects(t, b, 4)
+	bucket, key := sweepBucket, "obj-0"
+	got, err := b.GetObject(t.Context(), &s3.GetObjectInput{Bucket: &bucket, Key: &key})
+	if err != nil {
+		t.Fatalf("GetObject: %v", err)
+	}
+	_, _ = io.Copy(io.Discard, got.Body)
+	got.Body.Close()
+	budgetToEvict(b, 1, blobSize(t, b, digests[0]))
+
+	stats := sweepLocalBlobs(t, b)
+
+	want := []blobState{{true, false}, {false, true}, {true, false}, {true, false}}
+	if states := blobStates(t, b, mem, digests); !reflect.DeepEqual(states, want) || stats.ForcedFiles != 1 {
+		t.Fatalf("blobs after the sweep = %+v (forced %d), want %+v (forced 1)", states, stats.ForcedFiles, want)
+	}
 }
 
 // TestSweepLocalBlobs_OrphanPassRunsHourly: a sweep within the hour after an

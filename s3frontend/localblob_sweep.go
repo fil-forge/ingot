@@ -58,9 +58,10 @@ func (s LocalBlobSweepStats) Removed() bool {
 // if the process stopped between recording that the provider holds it and
 // moving it. The pass stops at the first blob younger than
 // CacheMinResidency, since every later one is newer, and skips a blob read
-// from the cache within CacheReadRetention. If usage is still over budget,
-// the forced pass repeats it without either window: evicting a held blob
-// costs read latency, and a full disk fails every write. Either pass logs and
+// from the cache within CacheReadRetention. If it stopped at the residency
+// window or ran out of blobs with usage still over budget, the forced pass
+// gives up the windows in stages (see forcedPass); a budget pass that only
+// ran out of time leaves the rest to the next sweep. Every pass logs and
 // skips a file it cannot remove. If the forced pass runs out of evictable
 // blobs with usage still over budget, the rest is files no rule lets it
 // remove (bodies being written or uploaded, bodies whose upload failed, blobs
@@ -98,58 +99,33 @@ func (b *Backend) SweepLocalBlobs(ctx context.Context) (LocalBlobSweepStats, err
 	var errs []error
 	if b.localBlobMaxBytes > 0 && b.localUsage() > b.localBlobMaxBytes {
 		budgetCtx, cancel := context.WithTimeout(ctx, budgetPassTimeLimit)
-		pass, err := b.evictToBudget(budgetCtx, now.Add(budgetPassTimeLimit), true)
+		pass, err := b.evictToBudget(budgetCtx, now.Add(budgetPassTimeLimit), honorBothWindows)
 		cancel()
 		stats.BudgetFiles, stats.BudgetBytes = pass.files, pass.bytes
 		b.localBlobMetrics.removed(ctx, removedBudget, pass.files, pass.bytes)
 		// A query cut off by the pass's own time limit is the time limit,
 		// not a failure.
 		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
-			err = nil
-		}
-		if err != nil {
-			errs = append(errs, fmt.Errorf("s3frontend: local blob budget pass: %w", err))
-		}
-	}
-	if len(errs) == 0 && b.localBlobMaxBytes > 0 && b.localUsage() > b.localBlobMaxBytes {
-		forcedCtx, cancel := context.WithTimeout(ctx, forcedPassTimeLimit)
-		pass, err := b.evictToBudget(forcedCtx, time.Now().Add(forcedPassTimeLimit), false)
-		cancel()
-		stats.ForcedFiles, stats.ForcedBytes = pass.files, pass.bytes
-		b.localBlobMetrics.removed(ctx, removedBudgetForced, pass.files, pass.bytes)
-		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
-			err = nil
-		}
-		if pass.files > 0 {
-			b.logger.Warn("local blob storage was over budget after the budget pass; evicted blobs inside the retention windows (cache_min_residency, cache_read_retention)",
-				zap.Int64("files", pass.files),
-				zap.Int64("bytes", pass.bytes),
-				zap.Int64("budget", b.localBlobMaxBytes))
+			err, pass.stop = nil, stopDeadline
 		}
 		switch {
 		case err != nil:
-			errs = append(errs, fmt.Errorf("s3frontend: local blob forced pass: %w", err))
+			errs = append(errs, fmt.Errorf("s3frontend: local blob budget pass: %w", err))
 		case b.localUsage() <= b.localBlobMaxBytes:
-		case pass.exhausted:
-			if !b.overBudgetWarned {
-				b.overBudgetWarned = true
-				b.logger.Warn("local blob storage is over budget with nothing left to evict; this is logged once until usage is back under budget. The remaining files are bodies being written or uploaded, bodies whose upload failed (their intents stay spooled or uploading; nothing reclaims them yet), blobs with no recorded location, files that could not be removed, or orphans younger than local_blob_orphan_age",
-					zap.Int64("usage", b.localUsage()),
-					zap.Int64("spool", b.spool.Usage()),
-					zap.Int64("budget", b.localBlobMaxBytes))
-			}
+		case pass.stop == stopDeadline:
+			// Candidates outside the windows may remain; the next sweep
+			// continues rather than evicting inside them.
+			b.logTimeLimit("budget")
 		default:
-			if !b.timeLimitLogged {
-				b.timeLimitLogged = true
-				b.logger.Info("local blob forced pass reached its time limit while still over budget; the next sweep continues. This is logged once until usage is back under budget",
-					zap.Int64("usage", b.localUsage()),
-					zap.Int64("budget", b.localBlobMaxBytes))
+			if err := b.forcedPass(ctx, &stats); err != nil {
+				errs = append(errs, err)
 			}
 		}
 	}
 	if b.localUsage() <= b.localBlobMaxBytes {
 		b.overBudgetWarned = false
 		b.timeLimitLogged = false
+		b.forcedWarned = false
 	}
 	if b.lastOrphanPass.IsZero() || now.Sub(b.lastOrphanPass) >= orphanPassInterval {
 		orphanCtx, cancel := context.WithTimeout(ctx, orphanPassTimeLimit)
@@ -176,12 +152,97 @@ func (b *Backend) LocalBlobUsage() int64 {
 	return b.localUsage()
 }
 
-// budgetPass is what one evictToBudget run did: the files it removed and
-// their bytes, and whether it stopped because no evictable rows were left
-// (rather than at the low watermark, the residency stop, or its deadline).
+// budgetPass is what one evictToBudget run did: the files it removed, their
+// bytes, and why it stopped.
 type budgetPass struct {
 	files, bytes int64
-	exhausted    bool
+	stop         passStop
+}
+
+// passStop is why an eviction pass stopped.
+type passStop int
+
+const (
+	stopWatermark passStop = iota // usage reached the low watermark
+	stopResidency                 // the next row is inside cache_min_residency
+	stopExhausted                 // no evictable rows were left
+	stopDeadline                  // the pass reached its time limit
+)
+
+// retention is which windows an eviction pass honours.
+type retention int
+
+const (
+	honorBothWindows retention = iota // the budget pass
+	honorReadWindow                   // the forced pass's first stage
+	honorNoWindow                     // the forced pass's last stage
+)
+
+// forcedPass evicts inside the retention windows, once the budget pass has
+// stopped at the residency window or run out of candidates with usage still
+// over budget: a full disk fails every write, which costs more than reading
+// a blob from the network. It gives up the windows in stages: first
+// cache_min_residency, still passing over blobs read within
+// cache_read_retention, so young unread blobs go before old hot ones; then,
+// only if that is not enough, both. It warns once per over-budget episode
+// that it evicted inside the windows; the budget_forced removals count each
+// time.
+func (b *Backend) forcedPass(ctx context.Context, stats *LocalBlobSweepStats) error {
+	forcedCtx, cancel := context.WithTimeout(ctx, forcedPassTimeLimit)
+	defer cancel()
+	deadline := time.Now().Add(forcedPassTimeLimit)
+	var last budgetPass
+	var err error
+	for _, r := range []retention{honorReadWindow, honorNoWindow} {
+		if b.localUsage() <= b.localBlobMaxBytes {
+			break
+		}
+		last, err = b.evictToBudget(forcedCtx, deadline, r)
+		stats.ForcedFiles += last.files
+		stats.ForcedBytes += last.bytes
+		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+			err, last.stop = nil, stopDeadline
+		}
+		if err != nil || last.stop != stopExhausted {
+			break
+		}
+	}
+	b.localBlobMetrics.removed(ctx, removedBudgetForced, stats.ForcedFiles, stats.ForcedBytes)
+	if stats.ForcedFiles > 0 && !b.forcedWarned {
+		b.forcedWarned = true
+		b.logger.Warn("local blob storage was over budget after the budget pass; evicted blobs inside the retention windows (cache_min_residency, cache_read_retention). This is logged once until usage is back under budget; the budget_forced removals count each time",
+			zap.Int64("files", stats.ForcedFiles),
+			zap.Int64("bytes", stats.ForcedBytes),
+			zap.Int64("budget", b.localBlobMaxBytes))
+	}
+	switch {
+	case err != nil:
+		return fmt.Errorf("s3frontend: local blob forced pass: %w", err)
+	case b.localUsage() <= b.localBlobMaxBytes:
+	case last.stop == stopExhausted:
+		if !b.overBudgetWarned {
+			b.overBudgetWarned = true
+			b.logger.Warn("local blob storage is over budget with nothing left to evict; this is logged once until usage is back under budget. The remaining files are bodies being written or uploaded, bodies whose upload failed (their intents stay spooled or uploading; nothing reclaims them yet), blobs with no recorded location, files that could not be removed, or orphans younger than local_blob_orphan_age",
+				zap.Int64("usage", b.localUsage()),
+				zap.Int64("spool", b.spool.Usage()),
+				zap.Int64("budget", b.localBlobMaxBytes))
+		}
+	default:
+		b.logTimeLimit("forced")
+	}
+	return nil
+}
+
+// logTimeLimit notes, once per over-budget episode, that an eviction pass
+// ran out of time with usage still over budget.
+func (b *Backend) logTimeLimit(pass string) {
+	if b.timeLimitLogged {
+		return
+	}
+	b.timeLimitLogged = true
+	b.logger.Info("local blob "+pass+" pass reached its time limit while still over budget; the next sweep continues. This is logged once until usage is back under budget",
+		zap.Int64("usage", b.localUsage()),
+		zap.Int64("budget", b.localBlobMaxBytes))
 }
 
 // removeFailures tallies the files one pass could not remove, so the pass
@@ -212,14 +273,15 @@ func (f *removeFailures) log(logger *zap.Logger, pass string) {
 
 // evictToBudget pages through the evictable intents, oldest state change
 // first, removing each file and marking its intent evicted, until usage is at
-// the low watermark, the rows run out, or the deadline passes. honorRetention
-// applies the residency stop and the read-recency skip. A file it cannot
+// the low watermark, the rows run out, or the deadline passes. r says which
+// windows apply: the residency stop (honorBothWindows only) and the
+// read-recency skip (both but honorNoWindow). A zero window is off. A file it cannot
 // remove is skipped, so one bad file does not stop every later pass at the
 // same row; its intent stays unmarked, and the pass logs the failures once. A
 // row whose file was already gone is marked but not counted.
-func (b *Backend) evictToBudget(ctx context.Context, deadline time.Time, honorRetention bool) (pass budgetPass, err error) {
+func (b *Backend) evictToBudget(ctx context.Context, deadline time.Time, r retention) (pass budgetPass, err error) {
 	var failed removeFailures
-	if honorRetention {
+	if r == honorBothWindows {
 		defer failed.log(b.logger, "budget")
 	} else {
 		defer failed.log(b.logger, "forced")
@@ -237,7 +299,7 @@ func (b *Backend) evictToBudget(ctx context.Context, deadline time.Time, honorRe
 			return pass, err
 		}
 		if len(page) == 0 {
-			pass.exhausted = true
+			pass.stop = stopExhausted
 			return pass, nil
 		}
 		for _, in := range page {
@@ -245,10 +307,13 @@ func (b *Backend) evictToBudget(ctx context.Context, deadline time.Time, honorRe
 				return pass, nil
 			}
 			cursor = registry.EvictCursor{UpdatedAt: in.UpdatedAt, Digest: in.Digest}
-			if honorRetention {
-				if now.Sub(in.UpdatedAt) < b.cacheMinResidency {
-					return pass, nil
-				}
+			// UpdatedAt is the registry's clock (Postgres's now()), so
+			// skew between the hosts shifts the residency window.
+			if r == honorBothWindows && b.cacheMinResidency > 0 && now.Sub(in.UpdatedAt) < b.cacheMinResidency {
+				pass.stop = stopResidency
+				return pass, nil
+			}
+			if r != honorNoWindow && b.cacheReadRetention > 0 {
 				if at, ok := b.cache.LastRead(in.Digest); ok && now.Sub(at) < b.cacheReadRetention {
 					continue
 				}
@@ -266,6 +331,9 @@ func (b *Backend) evictToBudget(ctx context.Context, deadline time.Time, honorRe
 				return pass, fmt.Errorf("mark %s evicted: %w", hex.EncodeToString(in.Digest), err)
 			}
 		}
+	}
+	if b.localUsage() > target {
+		pass.stop = stopDeadline
 	}
 	return pass, nil
 }

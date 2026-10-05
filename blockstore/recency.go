@@ -52,3 +52,13 @@ func (m *recencyMap) get(key string) (time.Time, bool) {
 	}
 	return el.Value.(*recencyEntry).at, true
 }
+
+// forget drops key's entry, if any.
+func (m *recencyMap) forget(key string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if el, ok := m.entries[key]; ok {
+		m.order.Remove(el)
+		delete(m.entries, key)
+	}
+}

@@ -190,13 +190,27 @@ func TestBlobCacheLastRead(t *testing.T) {
 		{
 			name: "read through LocalBlobs records the read",
 			read: func(t *testing.T, c *BlobCache, d mh.Multihash) {
-				r, err := LocalBlobs{Cache: c}.OpenBlob(ctx, did.Undef, d)
+				r, err := LocalBlobs{Cache: c, Spool: newTestSpool(t)}.OpenBlob(ctx, did.Undef, d)
 				if err != nil {
 					t.Fatalf("OpenBlob: %v", err)
 				}
 				_ = r.Close()
 			},
 			want: true,
+		},
+		{
+			name: "remove forgets the read",
+			read: func(t *testing.T, c *BlobCache, d mh.Multihash) {
+				r, err := c.OpenBlob(ctx, did.Undef, d)
+				if err != nil {
+					t.Fatalf("OpenBlob: %v", err)
+				}
+				_ = r.Close()
+				if _, err := c.Remove(d); err != nil {
+					t.Fatalf("Remove: %v", err)
+				}
+			},
+			want: false,
 		},
 		{
 			name: "miss records nothing",

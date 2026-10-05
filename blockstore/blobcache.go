@@ -105,6 +105,16 @@ func (c *BlobCache) CheckTake(spool *Spool) error {
 	return nil
 }
 
+// Remove deletes the cached blob, as blobDir.Remove does, and forgets when it
+// was last read, so a removed blob does not hold a recency entry.
+func (c *BlobCache) Remove(digest mh.Multihash) (int64, error) {
+	freed, err := c.blobDir.Remove(digest)
+	if err == nil {
+		c.reads.forget(string(digest))
+	}
+	return freed, err
+}
+
 // Usage returns the byte count of the cache's blob files.
 func (c *BlobCache) Usage() int64 {
 	return c.finished()
