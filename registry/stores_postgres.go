@@ -358,7 +358,9 @@ func (r *Postgres) PutIntent(ctx context.Context, in UploadIntent) error {
 
 func (r *Postgres) SetIntentState(ctx context.Context, digest multihash.Multihash, state string) error {
 	tag, err := r.pool.Exec(ctx,
-		`UPDATE ingot.upload_intents SET state = $2, updated_at = now() WHERE digest = $1`,
+		`UPDATE ingot.upload_intents
+		 SET state = $2, updated_at = CASE WHEN state = $2 THEN updated_at ELSE now() END
+		 WHERE digest = $1`,
 		digest, state)
 	if err != nil {
 		return fmt.Errorf("registry: set intent state: %w", err)
