@@ -1509,11 +1509,11 @@ func TestReleaseKeepsRowsUntilTheNetworkStepSucceeds(t *testing.T) {
 	if pending, _ := mem.ListReleasesBySpace(ctx, did.Undef); len(pending) != 1 {
 		t.Fatalf("release record after the failed attempt = %v, want it kept", pending)
 	}
+	// The part's spool copy went when it parked; the intent is what the
+	// retry needs. TestReleaseFreesSpoolCopyOfDeletedPutObject covers a
+	// spool copy kept for the retry.
 	if in, err := mem.GetIntent(ctx, d); err != nil || in.State != registry.IntentPublished {
 		t.Fatalf("intent after the failed attempt = %v/%v, want published and kept for the retry", in, err)
-	}
-	if _, err := os.Stat(b.spool.Path(d)); err != nil {
-		t.Fatalf("spool copy after the failed attempt: %v, want it kept for the retry", err)
 	}
 
 	if n, err := b.SweepPendingReleases(ctx); err != nil || n != 1 {

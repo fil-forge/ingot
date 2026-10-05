@@ -1167,6 +1167,7 @@ func (b *Backend) parkBlob(ctx context.Context, space did.DID, blob msbucket.Blo
 	if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentParked); err != nil {
 		return fmt.Errorf("mark parked: %w", err)
 	}
+	b.dropParkedCopy(blob.Digest)
 	return nil
 }
 
@@ -1193,7 +1194,21 @@ func (b *Backend) recordStreamedPark(ctx context.Context, blob msbucket.BlobRef,
 		return fmt.Errorf("mark parked: %w", err)
 	}
 	b.finishStream(ctx, sb)
+	b.dropParkedCopy(blob.Digest)
 	return nil
+}
+
+// dropParkedCopy removes a parked blob's spool copy. Nothing reads it again:
+// Complete concludes the blob from its park row, Abort and the session
+// sweeper unwind it through the same row, and the object's reads go to the
+// provider once Complete records the location. The blob is durable on the
+// provider, so a failed remove costs only disk: it is logged, and the file
+// waits for the session's release.
+func (b *Backend) dropParkedCopy(digest mh.Multihash) {
+	if err := b.spool.Remove(digest); err != nil {
+		b.logger.Warn("drop parked blob's spool copy failed; the session's release removes it",
+			zap.String("digest", hex.EncodeToString(digest)), zap.Error(err))
+	}
 }
 
 // concludeBlobs is Complete's park-aware counterpart to uploadBlobs: located

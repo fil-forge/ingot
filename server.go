@@ -255,8 +255,8 @@ func (s *Server) Start(ctx context.Context) error {
 }
 
 // startMultipartSweeper spawns the abandoned-multipart-session sweeper: open
-// sessions older than MultipartSessionTTL are aborted (their spooled parts
-// dropped) and terminal session rows reaped. Zero TTL → 7-day default;
+// sessions older than MultipartSessionTTL are aborted (their parts, parked on
+// their providers, released there) and terminal session rows reaped. Zero TTL → 7-day default;
 // negative → disabled.
 func (s *Server) startMultipartSweeper() {
 	ttl := s.cfg.MultipartSessionTTL

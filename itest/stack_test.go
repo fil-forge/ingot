@@ -383,6 +383,40 @@ func hiltProvisionTenantErr(ctx context.Context, s *stack.Stack, tenantID string
 	return created.AccessKeyID, created.SecretAccessKey, nil
 }
 
+// uploadIntentSizes lists the blobs ingot has recorded and not yet released:
+// hex digest to stored (envelope) byte count, from upload_intents. Diffing two
+// listings around a write identifies the envelope(s) that write stored — the
+// digest names the ciphertext, so it cannot be computed from the plaintext —
+// whether or not their spool copies are still on disk.
+func uploadIntentSizes(t *testing.T, ctx context.Context, s *stack.Stack) map[string]int64 {
+	t.Helper()
+	out := ingotSQL(t, ctx, s, `SELECT encode(digest,'hex') || ' ' || size FROM ingot.upload_intents`)
+	sizes := map[string]int64{}
+	for _, line := range strings.Split(out, "\n") {
+		if line = strings.TrimSpace(line); line == "" {
+			continue
+		}
+		hexDigest, size, ok := strings.Cut(line, " ")
+		n, err := strconv.ParseInt(size, 10, 64)
+		if !ok || err != nil {
+			t.Fatalf("parse upload intent row %q", line)
+		}
+		sizes[hexDigest] = n
+	}
+	return sizes
+}
+
+// newIntentDigests returns the digests in after that are not in before.
+func newIntentDigests(before, after map[string]int64) []string {
+	var added []string
+	for d := range after {
+		if _, ok := before[d]; !ok {
+			added = append(added, d)
+		}
+	}
+	return added
+}
+
 // spoolBlobCount counts the body blobs in the ingot container's spool,
 // ignoring in-progress temp files. Used to prove object bodies are spooled by
 // digest (the data-plane inversion), not journaled into the log.
