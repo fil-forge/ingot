@@ -1599,6 +1599,41 @@ func TestCompletedSessionReapKeepsWinnersOfDeletedObject(t *testing.T) {
 	}
 }
 
+// TestReapAfterDeletedObjectReleased: the reverse order of
+// TestCompletedSessionReapKeepsWinnersOfDeletedObject. The object's release
+// runs first and deletes its winners' intents; the completed session's reap
+// then finds no intent, treats each winner as already released, and records
+// no second release.
+func TestReapAfterDeletedObjectReleased(t *testing.T) {
+	rm := &recordingRemover{}
+	b, mem := newDeferredBackend(t, &parkingUploader{}, func(d *Deps) { d.Remover = rm })
+	ctx := context.Background()
+	key := "released-then-reaped"
+	uploadID, parts := completeTwoParts(t, b, key)
+	if _, err := mpComplete(t, b, key, uploadID, parts, nil); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	winners := blobDigestsOf(t, b, key, "")
+	deleteObj(t, b, key)
+	drainReleases(t, b)
+	for _, d := range winners {
+		assertLocalCopyReleased(t, b, mem, d)
+	}
+
+	if n, err := b.SweepStaleMultipartSessions(ctx, -time.Second); err != nil || n == 0 {
+		t.Fatalf("sweep: cleaned=%d err=%v", n, err)
+	}
+	if pending, _ := mem.ListReleasesBySpace(ctx, did.Undef); len(pending) != 0 {
+		t.Fatalf("reap after the release recorded %d releases, want none", len(pending))
+	}
+	drainReleases(t, b)
+	for _, d := range winners {
+		if rm.removedDigests()[string(d)] != 1 {
+			t.Fatalf("winner %x removed %d times, want once by the object's own release", d, rm.removedDigests()[string(d)])
+		}
+	}
+}
+
 // TestCompletingSessionWhoseLatchFailedKeepsCommittedBlobs: the object
 // commits, but the completing→completed latch fails, so the session is
 // reaped through the abort path after its object was deleted. Its blobs'

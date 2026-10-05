@@ -62,8 +62,8 @@ func TestForgeDeleteReleasesNetworkBlob(t *testing.T) {
 
 	// And the release traversed the network: piri's /blob/release handler ran
 	// and, with the last claim gone, queued the piece for removal. Byte
-	// release is fully asynchronous — ingot's releaseBlobs is best-effort
-	// post-commit, and piri's removal sweep (PDPRemoveSweep, 30s ticks)
+	// release is fully asynchronous — ingot's release sweeper runs it
+	// after the release grace, and piri's removal sweep (PDPRemoveSweep, 30s ticks)
 	// re-verifies claims and pipeline state before finalizing — so poll the
 	// provider's logs through to the finalization line.
 	waitForPiriLog(t, ctx, s, "/blob/release", 2*time.Minute)
