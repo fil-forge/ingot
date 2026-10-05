@@ -18,6 +18,7 @@ import (
 	"github.com/fil-forge/versitygw/s3log"
 	"github.com/gofiber/fiber/v3"
 	"github.com/multiformats/go-multihash"
+	"go.opentelemetry.io/otel"
 	"go.uber.org/zap"
 
 	"github.com/fil-forge/ingot/blockstore"
@@ -188,6 +189,11 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 	}
 
 	bs := blockstore.NewLayered(spool, log, deps.BaseBlockReader)
+	// The global meter provider is a no-op until a host (the daemon) installs
+	// one, so counting costs nothing when nobody is listening.
+	if err := bs.CountBlobReads(otel.Meter("github.com/fil-forge/ingot/blockstore")); err != nil {
+		logger.Warn("spool read metric not created", zap.Error(err))
+	}
 	backend := s3frontend.New(s3frontend.Deps{
 		Authority:       deps.Authority,
 		Registry:        deps.Registry,
@@ -397,6 +403,9 @@ func (s *Server) Stop(ctx context.Context) error {
 		s.spoolStop = nil
 	}
 	var errs []error
+	if err := s.backend.CloseMetrics(); err != nil {
+		errs = append(errs, fmt.Errorf("unregister spool metrics: %w", err))
+	}
 	if err := s.api.ShutDown(); err != nil {
 		errs = append(errs, fmt.Errorf("s3api shutdown: %w", err))
 	}

@@ -955,10 +955,14 @@ func (b *Backend) executeRelease(ctx context.Context, pr registry.PendingRelease
 		// outlived it would leave the retry reading neither rows nor
 		// intent, owing a network remove it cannot authorize and can never
 		// complete.
-		if _, err := b.spool.Remove(digest); err != nil {
+		freed, err := b.spool.Remove(digest)
+		if err != nil {
 			log.Warn("release: remove spooled blob failed", zap.Error(err))
 			ok = false
-		} else if err := b.pendingReleases.DeleteIntentAndRelease(ctx, space, digest); err != nil {
+			break
+		}
+		b.spoolMetrics.removedFile(ctx, spoolRemovedReleased, freed)
+		if err := b.pendingReleases.DeleteIntentAndRelease(ctx, space, digest); err != nil {
 			log.Warn("release: delete upload intent with the release record failed", zap.Error(err))
 			ok = false
 		}

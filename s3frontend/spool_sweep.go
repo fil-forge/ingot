@@ -71,6 +71,7 @@ func (b *Backend) SweepSpool(ctx context.Context) (SpoolSweepStats, error) {
 		deadline := time.Now().Add(spoolBudgetPassTimeLimit)
 		files, bytes, err := b.evictToBudget(ctx, deadline)
 		stats.BudgetFiles, stats.BudgetBytes = files, bytes
+		b.spoolMetrics.removed(ctx, spoolRemovedBudget, files, bytes)
 		if err != nil {
 			return stats, fmt.Errorf("s3frontend: spool budget pass: %w", err)
 		}
@@ -83,6 +84,7 @@ func (b *Backend) SweepSpool(ctx context.Context) (SpoolSweepStats, error) {
 	if b.lastOrphanPass.IsZero() || time.Since(b.lastOrphanPass) >= spoolOrphanPassInterval {
 		files, bytes, err := b.removeSpoolOrphans(ctx)
 		stats.OrphanFiles, stats.OrphanBytes = files, bytes
+		b.spoolMetrics.removed(ctx, spoolRemovedOrphan, files, bytes)
 		if err != nil {
 			return stats, fmt.Errorf("s3frontend: spool orphan pass: %w", err)
 		}

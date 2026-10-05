@@ -124,14 +124,6 @@ consulted. The deployment context is the
 the S3 facade runs **at the edge**, co-located with a provider's piri or as a
 standalone client — not inside the central upload-service.
 
-`serve` writes every object body to `<data_dir>/spool` before uploading it.
-Set `spool_max_bytes` to bound that directory: a sweeper evicts bodies the
-provider already holds, oldest first, and later reads of them go to the
-provider. Usage can run over the budget by the ingest rate × 30 seconds,
-plus bodies still uploading. Without a budget the spool grows with every
-live object's bodies; a deleted object's local copy is freed when its
-release runs, and a multipart part's once it parks on the provider.
-
 `serve` exports OpenTelemetry traces over OTLP/HTTP when
 `OTEL_EXPORTER_OTLP_ENDPOINT` names a collector; with no endpoint, tracing is
 off. Each S3 request is a trace named for its S3 action, with the hilt, sprue,
@@ -140,7 +132,61 @@ environment variables apply: `OTEL_EXPORTER_OTLP_HEADERS` authenticates to the
 collector, and `OTEL_TRACES_SAMPLER_ARG` sets the fraction of requests traced
 (`0.01` traces 1%; the default traces every request). As a library, ingot
 records spans on the global tracer provider, so an embedding host decides
-where they go.
+where they go. Metrics go to the same collector under the same variables
+(`OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` overrides the endpoint for them alone,
+and `OTEL_METRIC_EXPORT_INTERVAL` sets how often they are pushed); as a
+library, ingot records them on the global meter provider.
+
+### Local disk
+
+`serve` writes every object body to `<data_dir>/spool` as it uploads it, and
+keeps that copy so a read soon after a write is served from local disk. The
+copy is not needed once the provider holds the body:
+
+- a deleted or overwritten object's copies go when its release runs
+  (`release_grace`, default 60s, after its last reference drops);
+- a multipart part's copy goes as soon as the part parks on its provider;
+- with `spool_max_bytes` set, a sweeper checks every 30 seconds and, when the
+  spool is over the budget, evicts bodies the provider holds, oldest first,
+  down to 90% of the budget. Later reads of an evicted body go to the
+  provider and take provider-read latency.
+
+The budget is off by default (`spool_max_bytes: 0`): without it the spool
+grows with every live object's bodies. The sweeper also deletes, hourly,
+unfinished `.tmp-*` writes and files no upload names, once they are older
+than `spool_orphan_age` (default `24h`, at least `1h`).
+
+**Sizing.** The spool's filesystem needs room for:
+
+- `spool_max_bytes`, plus 10% headroom that must exceed the ingest rate × 30
+  seconds (60 GB at 2 GB/s);
+- the bodies in flight: each concurrent PUT or UploadPart writes its body as
+  it streams, and a part can be up to 5 GiB. Those files cannot be evicted
+  until their upload finishes, so usage can run over the budget by that much;
+- the catalog log, if it shares the filesystem: `<data_dir>/segments`, per
+  bucket about (`retain` + the open and unshipped segments) × `seal_bytes`.
+
+**Metrics.** With metrics on, the spool reports:
+
+| Metric | Meaning |
+| -- | -- |
+| `ingot.spool.usage` | Bytes held by the spool's blob files |
+| `ingot.spool.budget` | `spool_max_bytes` (0: no budget) |
+| `ingot.spool.evictions`, `ingot.spool.evicted` | Files and bytes removed, by `reason`: `released`, `parked`, `budget`, `orphan` |
+| `ingot.spool.reads` | Body-blob reads, by `tier`: `spool` or `network` (the spool's hit ratio) |
+
+**Manual cleanup.** Whether a spool file is safe to delete is not visible on
+the filesystem. A file is safe to delete once the provider holds its body,
+which this query lists (the file names are the hex digests):
+
+```sql
+SELECT encode(i.digest, 'hex') FROM ingot.upload_intents i
+WHERE i.state IN ('accepted', 'published')
+  AND EXISTS (SELECT 1 FROM ingot.blob_locations l WHERE l.digest = i.digest);
+```
+
+Never delete the file of a `spooled` or `uploading` intent: it may be the only
+copy.
 
 ## Build & test
 

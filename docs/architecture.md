@@ -888,7 +888,8 @@ paths below are exercised against the real stack by the smelt-based `itest/` har
   sweeper removes the local files of blobs the provider holds (a location or park row), oldest
   first, down to 90% of the budget; hourly it deletes orphan files. The budget is off by default.
   A release frees a deleted object's spool copies, and a parked part's copy goes once it parks.
-  Still open under #48: there is no write-through mode or spool metric.
+  The spool reports its usage, budget, removals by reason and reads by tier as OpenTelemetry
+  metrics (`ingot.spool.*`). Still open under #48: there is no write-through mode.
 - **Multipart parts park at UploadPart, accept at Complete.** (Built: `parkBlobs`/`concludeBlobs`
   over the `blob_parks` table.) A parked part holds no local bytes: its spool copy is removed once
   it parks, and Complete concludes it from its park row. The in-process harness still spools parts
