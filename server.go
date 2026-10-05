@@ -186,7 +186,7 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		return nil, fmt.Errorf("ingot: spool: %w", err)
 	}
 
-	bs := blockstore.NewLayered(spool, log, deps.BaseBlockReader)
+	bs := blockstore.NewLayered(log, deps.BaseBlockReader)
 	backend := s3frontend.New(s3frontend.Deps{
 		Authority:       deps.Authority,
 		Registry:        deps.Registry,
