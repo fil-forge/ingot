@@ -223,39 +223,49 @@ func TestSetupMetricsOffWithoutEndpoint(t *testing.T) {
 	}
 }
 
-// With a collector configured, shutdown exports what the meters observed.
+// With a collector configured, through either the shared or the
+// metrics-only endpoint variable, shutdown exports what the meters observed.
 func TestSetupMetricsExportsOnShutdown(t *testing.T) {
-	got := make(chan string, 4)
-	collector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		select {
-		case got <- r.URL.Path:
-		default:
-		}
-	}))
-	defer collector.Close()
-	isolateOTelEnv(t)
-	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", collector.URL)
-	prev := otel.GetMeterProvider()
-	t.Cleanup(func() { otel.SetMeterProvider(prev) })
+	for _, env := range []string{"OTEL_EXPORTER_OTLP_ENDPOINT", "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"} {
+		t.Run(env, func(t *testing.T) {
+			got := make(chan string, 4)
+			collector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				select {
+				case got <- r.URL.Path:
+				default:
+				}
+			}))
+			defer collector.Close()
+			isolateOTelEnv(t)
+			endpoint := collector.URL
+			if env == "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT" {
+				// The signal-specific variable is the full URL, path included.
+				endpoint += "/v1/metrics"
+			}
+			t.Setenv(env, endpoint)
+			prev := otel.GetMeterProvider()
+			t.Cleanup(func() { otel.SetMeterProvider(prev) })
 
-	shutdown, err := setupMetrics(context.Background(), zap.NewNop())
-	if err != nil {
-		t.Fatal(err)
-	}
-	counter, err := otel.Meter("test").Int64Counter("test.requests")
-	if err != nil {
-		t.Fatal(err)
-	}
-	counter.Add(context.Background(), 1)
-	if err := shutdown(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case path := <-got:
-		if path != "/v1/metrics" {
-			t.Fatalf("expected an export to /v1/metrics, got %s", path)
-		}
-	default:
-		t.Fatal("expected shutdown to flush the metric to the collector")
+			shutdown, err := setupMetrics(context.Background(), zap.NewNop())
+			if err != nil {
+				t.Fatal(err)
+			}
+			counter, err := otel.Meter("test").Int64Counter("test.requests")
+			if err != nil {
+				t.Fatal(err)
+			}
+			counter.Add(context.Background(), 1)
+			if err := shutdown(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case path := <-got:
+				if path != "/v1/metrics" {
+					t.Fatalf("expected an export to /v1/metrics, got %s", path)
+				}
+			default:
+				t.Fatal("expected shutdown to flush the metric to the collector")
+			}
+		})
 	}
 }

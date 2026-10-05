@@ -178,6 +178,31 @@ func TestSweepLocalBlobs_SkipsRecentlyReadBlobs(t *testing.T) {
 
 // TestSweepLocalBlobs_KeepsBlobsTheProviderMayNotHold: no pass removes the file of
 // a spooled or uploading intent (the only copy), or of an accepted intent
+// TestSweepLocalBlobs_KeepsAPublishedBlobWithNoLocation: a release that
+// deleted a committed blob's location row and then failed leaves the intent
+// published with nothing proving the provider holds the blob, so no pass
+// evicts its local copy; the next blob goes instead.
+func TestSweepLocalBlobs_KeepsAPublishedBlobWithNoLocation(t *testing.T) {
+	ctx := t.Context()
+	b, mem := newSweepBackend(t)
+	digests := putSweepObjects(t, b, 2)
+	st, err := mem.Get(ctx, sweepBucket)
+	if err != nil {
+		t.Fatalf("get bucket: %v", err)
+	}
+	if err := mem.DeleteLocation(ctx, st.Space, digests[0]); err != nil {
+		t.Fatalf("DeleteLocation: %v", err)
+	}
+	budgetToEvict(b, 1, blobSize(t, b, digests[0]))
+
+	sweepLocalBlobs(t, b)
+
+	want := []blobState{{true, false}, {false, true}}
+	if got := blobStates(t, b, mem, digests); !reflect.DeepEqual(got, want) {
+		t.Fatalf("blobs after the sweep = %+v, want %+v", got, want)
+	}
+}
+
 // whose location was never recorded, however far over budget the spool is.
 func TestSweepLocalBlobs_KeepsBlobsTheProviderMayNotHold(t *testing.T) {
 	ctx := t.Context()
