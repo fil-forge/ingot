@@ -199,7 +199,7 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 	// The global meter provider is a no-op until a host (the daemon) installs
 	// one, so counting costs nothing when nobody is listening.
 	if err := bs.CountBlobReads(otel.Meter("github.com/fil-forge/ingot/blockstore")); err != nil {
-		logger.Warn("spool read metric not created", zap.Error(err))
+		logger.Warn("local blob read metric not created", zap.Error(err))
 	}
 	backend := s3frontend.New(s3frontend.Deps{
 		Authority:       deps.Authority,
@@ -418,7 +418,7 @@ func (s *Server) Stop(ctx context.Context) error {
 	}
 	var errs []error
 	if err := s.backend.CloseMetrics(); err != nil {
-		errs = append(errs, fmt.Errorf("unregister spool metrics: %w", err))
+		errs = append(errs, fmt.Errorf("unregister local blob metrics: %w", err))
 	}
 	if err := s.api.ShutDown(); err != nil {
 		errs = append(errs, fmt.Errorf("s3api shutdown: %w", err))
