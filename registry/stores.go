@@ -23,21 +23,19 @@ import (
 // names those versions' blob_refs rows and answers `?versionId=null`.
 const NullVersionID = "null"
 
-// upload_intents.state values (the local-store lifecycle, §5): spooled on
-// ingest, parked once durable on a provider with the accept deferred,
-// accepted once the provider has accepted it, and published once a bucket
-// commit has claimed it. Published is written with the blob's first
-// reference claim, in the same transaction, and never leaves: it is the
-// durable record that the blob was committed, which a release consults to
-// keep the spool copy (the insurance copy until eviction) and the intent,
-// where a never-committed part blob loses both.
+// upload_intents.state values (the lifecycle of a blob in flight to a
+// provider): uploading from the moment its allocation is made, parked once
+// durable on a provider with the accept deferred, accepted once the provider
+// has accepted it, and published once a bucket commit has claimed it.
+// Published is written with the blob's first reference claim, in the same
+// transaction, and never leaves: it is the durable record that the blob was
+// committed, which the reap of an abandoned multipart session consults to
+// release only the part blobs that were never committed.
 const (
-	IntentSpooled = "spooled"
-	// IntentUploading is set before a blob's first network call and stands
+	// IntentUploading is set when a blob's allocation is made and stands
 	// until a row records the outcome (a park or a location): the blob may
-	// be on the network. A blob still 'spooled' never left this node, which
-	// a release relies on to skip a network remove it could not authorize
-	// from the background.
+	// be on the network, so a release with neither row owes a network
+	// remove.
 	IntentUploading = "uploading"
 	IntentParked    = "parked"
 	IntentAccepted  = "accepted"
@@ -73,14 +71,14 @@ type BlobClaim struct {
 	Space     did.DID
 }
 
-// UploadIntent is one row of ingot.upload_intents: a blob Ingot holds on
-// disk, with its lifecycle state. Keyed globally by Digest.
+// UploadIntent is one row of ingot.upload_intents: a blob sent to a provider,
+// with its lifecycle state and stored (envelope) byte count. Keyed globally by
+// Digest.
 type UploadIntent struct {
-	Digest    multihash.Multihash
-	LocalPath string
-	Size      int64
-	State     string
-	Bucket    string
+	Digest multihash.Multihash
+	Size   int64
+	State  string
+	Bucket string
 }
 
 // BlobLocation is one row of ingot.blob_locations: where a blob can be

@@ -147,7 +147,7 @@ func TestPostgresStores_Live(t *testing.T) {
 		// A claim publishes the digest's upload intent, and the state stays
 		// once the claims are gone: it is the durable mark of a committed blob.
 		pubDigest := multihash.Multihash([]byte{0x12, 0x20, 0xc1, 0xa1})
-		if err := r.PutIntent(ctx, registry.UploadIntent{Digest: pubDigest, LocalPath: "/spool/x", Size: 1, State: registry.IntentAccepted, Bucket: "b"}); err != nil {
+		if err := r.PutIntent(ctx, registry.UploadIntent{Digest: pubDigest, Size: 1, State: registry.IntentAccepted, Bucket: "b"}); err != nil {
 			t.Fatalf("PutIntent: %v", err)
 		}
 		if err := r.AddBlobClaim(ctx, registry.BlobClaim{Digest: pubDigest, Bucket: "b", ObjectKey: "kp", VersionID: registry.NullVersionID, Space: space}); err != nil {
@@ -306,7 +306,7 @@ func TestPostgresStores_Live(t *testing.T) {
 	t.Run("delete intent and release record atomically", func(t *testing.T) {
 		space := testutil.RandomDID(t)
 		d := multihash.Multihash([]byte{0x12, 0x20, 0xda, 0x01})
-		if err := r.PutIntent(ctx, registry.UploadIntent{Digest: d, LocalPath: "/spool/d", Size: 3, State: registry.IntentSpooled, Bucket: "b"}); err != nil {
+		if err := r.PutIntent(ctx, registry.UploadIntent{Digest: d, Size: 3, State: registry.IntentUploading, Bucket: "b"}); err != nil {
 			t.Fatalf("PutIntent: %v", err)
 		}
 		if err := r.EnqueueRelease(ctx, space, d, time.Now()); err != nil {
@@ -328,11 +328,8 @@ func TestPostgresStores_Live(t *testing.T) {
 	})
 
 	t.Run("intent lifecycle", func(t *testing.T) {
-		if err := r.PutIntent(ctx, registry.UploadIntent{Digest: digest, LocalPath: "/spool/x", Size: 9, State: registry.IntentSpooled, Bucket: "b"}); err != nil {
+		if err := r.PutIntent(ctx, registry.UploadIntent{Digest: digest, Size: 9, State: registry.IntentUploading, Bucket: "b"}); err != nil {
 			t.Fatalf("PutIntent: %v", err)
-		}
-		if err := r.SetIntentState(ctx, digest, registry.IntentUploading); err != nil {
-			t.Fatalf("SetIntentState (uploading, the constraint admits it): %v", err)
 		}
 		if err := r.SetIntentState(ctx, digest, registry.IntentParked); err != nil {
 			t.Fatalf("SetIntentState: %v", err)

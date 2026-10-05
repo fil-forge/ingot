@@ -36,25 +36,14 @@ ALTER TABLE ingot.multipart_sessions
 UPDATE ingot.multipart_sessions SET state_changed_at = created_at;
 
 -- A committed blob's upload intent is 'published', written with its first
--- reference claim; a release recognises a committed blob by it once the claims
--- are gone and keeps the spool copy (the insurance copy until eviction) and the
--- intent. Blobs committed before the state existed carry 'accepted' intents and
--- their claims are the only trace: mark them, so their eventual release does not
--- take them for never-committed part blobs and remove the spool copy.
+-- reference claim; the reap of an abandoned multipart session recognises a
+-- committed blob by it and releases only the part blobs that were never
+-- committed. Blobs committed before the state existed carry 'accepted' intents
+-- and their claims are the only trace: mark them.
 UPDATE ingot.upload_intents i
    SET state = 'published', updated_at = now()
  WHERE i.state <> 'published'
    AND EXISTS (SELECT 1 FROM ingot.blob_refs r WHERE r.digest = i.digest);
-
--- 'uploading' is set before a blob's first network call and stands until a row
--- records the outcome (a park or a location). A release of a blob with neither
--- row reads it to tell a blob that never left this node (still 'spooled',
--- cleaned up locally) from one whose acceptance may have landed while its
--- location did not (removed on the network, idempotently).
-ALTER TABLE ingot.upload_intents
-    DROP CONSTRAINT upload_intents_state_check,
-    ADD CONSTRAINT upload_intents_state_check
-        CHECK (state IN ('spooled','uploading','parked','accepted','published'));
 
 -- A release asks whether any part of an in-flight session still references
 -- its digest (CountLivePartRefs, CountPartRefs). The parts table has only its
@@ -69,11 +58,6 @@ CREATE INDEX multipart_parts_blob_digests_gin
 -- intents named committed blobs before and after, and those sessions had no
 -- space to be torn down against.
 DROP INDEX ingot.multipart_parts_blob_digests_gin;
-UPDATE ingot.upload_intents SET state = 'spooled' WHERE state = 'uploading';
-ALTER TABLE ingot.upload_intents
-    DROP CONSTRAINT upload_intents_state_check,
-    ADD CONSTRAINT upload_intents_state_check
-        CHECK (state IN ('spooled','parked','accepted','published'));
 ALTER TABLE ingot.multipart_sessions DROP CONSTRAINT multipart_sessions_space_check;
 ALTER TABLE ingot.multipart_sessions DROP COLUMN state_changed_at;
 ALTER TABLE ingot.multipart_sessions DROP COLUMN space;
