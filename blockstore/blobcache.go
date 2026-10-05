@@ -24,8 +24,8 @@ import (
 //
 // Like the Spool, it holds no policy: it knows a blob only as bytes under a
 // digest, and the S3 layer decides what to remove. At most one BlobCache may
-// use a directory at a time. Its directory must be on the Spool's filesystem, so
-// Take is a rename.
+// use a directory at a time. Its directory must be on the Spool's filesystem,
+// so Take is a rename.
 type BlobCache struct {
 	*blobDir
 }
