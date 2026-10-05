@@ -21,17 +21,26 @@ import (
 )
 
 // Spool is the local on-disk blob store (docs/architecture.md §5): each
-// object-body blob is written here, keyed by its sha256 digest, before it is
-// uploaded to Forge. The local copy is the read-after-write copy: a
-// just-written blob is served straight from disk, skipping the network read
-// tier, until it is removed. Network reads never refill the spool.
+// object-body blob is written here, keyed by its sha256 digest, as it is
+// uploaded to Forge. Once the network holds it, the local copy is a
+// read-after-write cache: a just-written blob is served straight from disk,
+// skipping the network read tier, until it is removed, which may happen at
+// any time after the network holds it. Network reads do not refill it yet:
+// a cache that fills on reads is undecided and unbuilt, not ruled out.
 //
 // Spool is deliberately pure file I/O: a blockstore.BlockReader plus the
-// streaming BlobReader/BlobWriter, plus a running byte count of its blob files.
-// The lifecycle of a blob (the
-// upload_intents state machine, eviction policy) is owned by the caller that
-// has the registry handle — blockstore cannot import registry without a cycle
-// (registry imports blockstore for the segment-metadata types).
+// streaming BlobReader/BlobWriter, plus a running byte count of its blob
+// files. It knows a blob only as bytes under a digest. Whether a blob may be
+// removed depends on what refers to it — its upload state, the objects and
+// multipart sessions that use it, and whether the provider holds it — and
+// that is the S3 layer's model (s3frontend over registry), so that layer
+// owns the blob's lifecycle and eviction policy and tells the spool what to
+// remove.
+//
+// At most one Spool may use a directory at a time. NewSpool deletes every
+// unfinished write it finds, which would destroy another live Spool's
+// in-flight writes, and the byte count assumes this Spool makes every change
+// to the directory.
 type Spool struct {
 	dir string
 	// usage is the byte count of the finished blob files. In-flight .tmp-*
@@ -43,11 +52,8 @@ type Spool struct {
 // the digest path.
 const spoolTempPrefix = ".tmp-"
 
-// NewSpool opens (creating if needed) a spool rooted at dir. It deletes every
-// leftover .tmp-* file (a write the previous process never finished; nothing
-// can be writing one before the listener starts) and sums the blob files into
-// the usage count. Entries that are neither, such as lost+found on a dedicated
-// filesystem, are ignored.
+// NewSpool opens (creating if needed) a spool rooted at dir, then recovers
+// it. The caller must ensure no other Spool uses dir (see Spool).
 func NewSpool(dir string) (*Spool, error) {
 	if dir == "" {
 		return nil, errors.New("blockstore: spool dir is required")
@@ -56,6 +62,18 @@ func NewSpool(dir string) (*Spool, error) {
 		return nil, fmt.Errorf("blockstore: spool mkdir: %w", err)
 	}
 	s := &Spool{dir: dir}
+	if err := s.recoverDir(); err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+// recoverDir brings a newly opened spool to a known state: it deletes every
+// leftover .tmp-* file (a write the previous process never finished; nothing
+// can be writing one before the listener starts) and sums the blob files into
+// the usage count. Entries that are neither, such as lost+found on a
+// dedicated filesystem, are ignored.
+func (s *Spool) recoverDir() error {
 	var removeErr error
 	total, err := s.Scan(func(e SpoolEntry) {
 		if e.Digest != nil || removeErr != nil {
@@ -64,13 +82,13 @@ func NewSpool(dir string) (*Spool, error) {
 		removeErr = s.RemoveTemp(e.Name)
 	})
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if removeErr != nil {
-		return nil, removeErr
+		return removeErr
 	}
 	s.usage.Store(total)
-	return s, nil
+	return nil
 }
 
 // SpoolEntry is one file Scan found: a finished blob (Digest set) or a .tmp-*

@@ -1,7 +1,6 @@
 package registry_test
 
 import (
-	"context"
 	"errors"
 	"os"
 	"reflect"
@@ -38,7 +37,7 @@ func TestEvictionQueriesLive(t *testing.T) {
 		if dsn == "" {
 			t.Skip("set INGOT_TEST_DSN to run the eviction queries against Postgres")
 		}
-		ctx := context.Background()
+		ctx := t.Context()
 		pool, err := pgxpool.New(ctx, dsn)
 		if err != nil {
 			t.Fatalf("connect: %v", err)
@@ -67,7 +66,7 @@ func evictDigest(t *testing.T, s string) multihash.Multihash {
 }
 
 func runEvictionSuite(t *testing.T, fresh func(t *testing.T) evictStore) {
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// seed records an intent in state, optionally with a location or a park.
 	seed := func(t *testing.T, st evictStore, d multihash.Multihash, state string, located, parked bool) {
