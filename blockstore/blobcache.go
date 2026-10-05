@@ -23,9 +23,12 @@ import (
 // the network. Network reads do not fill it yet: a cache that fills on reads
 // is undecided and unbuilt, not ruled out.
 //
-// Like the Spool, it is pure file I/O, plus the time each blob was last read
-// from it, and at most one BlobCache may use a directory at a time. Its
-// directory must be on the Spool's filesystem, so Take is a rename.
+// Like the Spool, it holds no policy: it knows a blob only as bytes under a
+// digest, and the S3 layer decides what to remove. Besides the files and their
+// byte count, it remembers in memory when each blob was last read from it,
+// which the S3 layer's eviction consults. At most one BlobCache may use a
+// directory at a time. Its directory must be on the Spool's filesystem, so
+// Take is a rename.
 type BlobCache struct {
 	*blobDir
 	reads *recencyMap
