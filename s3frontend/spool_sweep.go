@@ -115,7 +115,8 @@ func (b *Backend) SweepSpool(ctx context.Context) (SpoolSweepStats, error) {
 	return stats, nil
 }
 
-// SpoolUsage returns the byte count of the spool's blob files.
+// SpoolUsage returns the byte count of the spool's files, writes in progress
+// included.
 func (b *Backend) SpoolUsage() int64 {
 	return b.spool.Usage()
 }
@@ -187,14 +188,18 @@ func (b *Backend) removeSpoolOrphans(ctx context.Context, now time.Time) (files,
 	if err != nil {
 		return 0, 0, err
 	}
+	var removed int64
 	for _, e := range oldTemps {
-		if err := b.spool.RemoveTemp(e.Name); err != nil {
+		freed, err := b.spool.RemoveTemp(e.Name)
+		if err != nil {
 			return files, bytes, err
 		}
-		files++
-		bytes += e.Size
+		if freed > 0 {
+			files++
+			bytes += freed
+			removed += freed
+		}
 	}
-	var blobBytesRemoved int64
 	for start := 0; start < len(oldBlobs); start += spoolSweepBatch {
 		batch := oldBlobs[start:min(start+spoolSweepBatch, len(oldBlobs))]
 		digests := make([]multihash.Multihash, len(batch))
@@ -213,10 +218,10 @@ func (b *Backend) removeSpoolOrphans(ctx context.Context, now time.Time) (files,
 			if freed > 0 {
 				files++
 				bytes += freed
-				blobBytesRemoved += freed
+				removed += freed
 			}
 		}
 	}
-	b.spool.ResetUsage(total - blobBytesRemoved)
+	b.spool.ResetUsage(total - removed)
 	return files, bytes, nil
 }

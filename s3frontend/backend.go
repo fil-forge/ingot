@@ -173,10 +173,10 @@ type Deps struct {
 	// before construction; tests use zero so a manual sweep drains).
 	ReleaseGrace time.Duration
 
-	// SpoolMaxBytes is the byte budget for the spool's blob files, enforced
-	// by SweepSpool. Zero turns the budget and forced passes off: eviction
-	// needs a network read tier to serve evicted blobs, which the in-memory
-	// fakes do not have.
+	// SpoolMaxBytes is the byte budget for the spool's files, writes in
+	// progress included, enforced by SweepSpool. Zero turns the budget and
+	// forced passes off: eviction needs a network read tier to serve evicted
+	// blobs, which the in-memory fakes do not have.
 	SpoolMaxBytes int64
 	// SpoolMinResidency is how long after its last state change (for a
 	// committed blob, its commit) the budget pass leaves a blob alone, so a

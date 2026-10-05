@@ -57,7 +57,7 @@ func newSpoolMetrics(mp metric.MeterProvider, b *Backend, logger *zap.Logger) (s
 // registerSpoolGauges reports the spool's usage and its budget.
 func registerSpoolGauges(meter metric.Meter, b *Backend) (metric.Registration, error) {
 	usage, err := meter.Int64ObservableGauge("ingot.spool.usage", metric.WithUnit("By"),
-		metric.WithDescription("Bytes held by the local spool's blob files"))
+		metric.WithDescription("Bytes held by the local spool's files, writes in progress included"))
 	if err != nil {
 		return nil, err
 	}

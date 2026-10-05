@@ -3,10 +3,13 @@ package blockstore
 import (
 	"bytes"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/fil-forge/ucantone/did"
@@ -78,6 +81,17 @@ func TestSpoolUsage(t *testing.T) {
 			run:  func(t *testing.T, s *Spool) { writeTestBlob(t, s, "") },
 			want: 0,
 		},
+		{
+			name: "failed write takes its bytes off again",
+			run: func(t *testing.T, s *Spool) {
+				writeTestBlob(t, s, "hello")
+				r := io.MultiReader(strings.NewReader("partial"), iotest.ErrReader(errors.New("client went away")))
+				if _, _, err := s.WriteBlob(t.Context(), r); err == nil {
+					t.Fatal("WriteBlob succeeded, want the read error")
+				}
+			},
+			want: 5,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -87,6 +101,40 @@ func TestSpoolUsage(t *testing.T) {
 				t.Fatalf("Usage() = %d, want %d", got, tc.want)
 			}
 		})
+	}
+}
+
+// pausingReader yields its first chunk, then reports the spool's usage from its
+// second Read, while the write is still in flight.
+type pausingReader struct {
+	first  []byte
+	s      *Spool
+	midway int64
+	reads  int
+}
+
+func (p *pausingReader) Read(b []byte) (int, error) {
+	p.reads++
+	if p.reads == 1 {
+		return copy(b, p.first), nil
+	}
+	p.midway = p.s.Usage()
+	return 0, io.EOF
+}
+
+// TestSpoolCountsInFlightBytes: usage includes the bytes a write has written
+// before the write finishes, and counts them once when it does.
+func TestSpoolCountsInFlightBytes(t *testing.T) {
+	s := newTestSpool(t)
+	writeTestBlob(t, s, "hello")
+	r := &pausingReader{first: []byte("in flight"), s: s}
+	if _, _, err := s.WriteBlob(t.Context(), r); err != nil {
+		t.Fatalf("WriteBlob: %v", err)
+	}
+	got := struct{ Midway, After int64 }{r.midway, s.Usage()}
+	want := struct{ Midway, After int64 }{14, 14}
+	if got != want {
+		t.Fatalf("usage = %+v, want %+v", got, want)
 	}
 }
 
@@ -164,7 +212,7 @@ func TestSpoolScan(t *testing.T) {
 	want := struct {
 		Total int64
 		Seen  map[string]bool
-	}{5, map[string]bool{filepath.Base(s.Path(d)): true, ".tmp-abc": false}}
+	}{12, map[string]bool{filepath.Base(s.Path(d)): true, ".tmp-abc": false}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("Scan = %+v, want %+v", got, want)
 	}
@@ -173,7 +221,7 @@ func TestSpoolScan(t *testing.T) {
 func TestSpoolRemoveTempRejectsBlobNames(t *testing.T) {
 	s := newTestSpool(t)
 	d := writeTestBlob(t, s, "hello")
-	if err := s.RemoveTemp(filepath.Base(s.Path(d))); err == nil {
+	if _, err := s.RemoveTemp(filepath.Base(s.Path(d))); err == nil {
 		t.Fatal("RemoveTemp of a blob file name succeeded, want an error")
 	}
 }
@@ -249,5 +297,40 @@ func TestRecencyMapDropsLeastRecentlyRead(t *testing.T) {
 	_, hasC := m.get("c")
 	if got := [3]bool{hasA, hasB, hasC}; got != [3]bool{true, false, true} {
 		t.Fatalf("remembered [a b c] = %v, want [true false true]", got)
+	}
+}
+
+// TestSpoolRemoveTempUncountsItsBytes: a temp file the usage count included
+// (here through a reset from a scan, as the orphan pass does) comes off the
+// count when RemoveTemp deletes it, and a second removal frees nothing.
+func TestSpoolRemoveTempUncountsItsBytes(t *testing.T) {
+	s := newTestSpool(t)
+	writeTestBlob(t, s, "hello")
+	if err := os.WriteFile(filepath.Join(s.dir, ".tmp-abc"), []byte("partial"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	total, err := s.Scan(func(SpoolEntry) {})
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	s.ResetUsage(total)
+	var freed []int64
+	for range 2 {
+		n, err := s.RemoveTemp(".tmp-abc")
+		if err != nil {
+			t.Fatalf("RemoveTemp: %v", err)
+		}
+		freed = append(freed, n)
+	}
+	got := struct {
+		Freed []int64
+		Usage int64
+	}{freed, s.Usage()}
+	want := struct {
+		Freed []int64
+		Usage int64
+	}{[]int64{7, 0}, 5}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("RemoveTemp = %+v, want %+v", got, want)
 	}
 }

@@ -31,11 +31,11 @@ import (
 // a cache that fills on reads is undecided and unbuilt, not ruled out.
 //
 // Spool is deliberately pure file I/O: a blockstore.BlockReader plus the
-// streaming BlobReader/BlobWriter, plus a running byte count of its blob
-// files and the time each blob was last read from it. It knows a blob only as
-// bytes under a digest. Whether a blob may be removed depends on what refers
-// to it — its upload state, the objects and multipart sessions that use it,
-// and whether the provider holds it — and that is the S3 layer's model
+// streaming BlobReader/BlobWriter, plus a running byte count of its files
+// and the time each blob was last read from it. It knows a blob only as bytes
+// under a digest. Whether a blob may be removed depends on what refers to it
+// — its upload state, the objects and multipart sessions that use it, and
+// whether the provider holds it — and that is the S3 layer's model
 // (s3frontend over registry), so that layer owns the blob's lifecycle and
 // eviction policy and tells the spool what to remove.
 //
@@ -45,8 +45,9 @@ import (
 // to the directory.
 type Spool struct {
 	dir string
-	// usage is the byte count of the finished blob files. In-flight .tmp-*
-	// files are never counted.
+	// usage is the byte count of the files in dir: the finished blob files,
+	// plus every byte written so far to an in-flight .tmp-* file, so it
+	// bounds the directory's disk use while bodies are still arriving.
 	usage atomic.Int64
 	reads *recencyMap
 }
@@ -77,16 +78,19 @@ func NewSpool(dir string) (*Spool, error) {
 
 // recoverDir brings a newly opened spool to a known state: it deletes every
 // leftover .tmp-* file (a write the previous process never finished; nothing
-// can be writing one before the listener starts) and sums the blob files into
-// the usage count. Entries that are neither, such as lost+found on a
+// can be writing one before the listener starts) and sets the usage count to
+// the blob files that remain. Entries that are neither, such as lost+found on a
 // dedicated filesystem, are ignored.
 func (s *Spool) recoverDir() error {
 	var removeErr error
+	var tempBytes int64
 	total, err := s.Scan(func(e SpoolEntry) {
 		if e.Digest != nil || removeErr != nil {
 			return
 		}
-		removeErr = s.RemoveTemp(e.Name)
+		var freed int64
+		freed, removeErr = s.RemoveTemp(e.Name)
+		tempBytes += freed
 	})
 	if err != nil {
 		return err
@@ -94,7 +98,7 @@ func (s *Spool) recoverDir() error {
 	if removeErr != nil {
 		return removeErr
 	}
-	s.usage.Store(total)
+	s.usage.Store(total - tempBytes)
 	return nil
 }
 
@@ -109,8 +113,8 @@ type SpoolEntry struct {
 
 // Scan walks the spool directory and calls fn for each blob file and each
 // .tmp-* file, skipping directories and names that are neither. It returns
-// the total size of the blob files it saw. A file removed while the scan runs
-// is skipped.
+// the total size of the files it saw, of both kinds, which is what the usage
+// count measures. A file removed while the scan runs is skipped.
 func (s *Spool) Scan(fn func(SpoolEntry)) (int64, error) {
 	entries, err := os.ReadDir(s.dir)
 	if err != nil {
@@ -136,9 +140,7 @@ func (s *Spool) Scan(fn func(SpoolEntry)) (int64, error) {
 		if err != nil {
 			return 0, fmt.Errorf("blockstore: spool stat %s: %w", name, err)
 		}
-		if digest != nil {
-			total += info.Size()
-		}
+		total += info.Size()
 		fn(SpoolEntry{Name: name, Digest: digest, Size: info.Size(), ModTime: info.ModTime()})
 	}
 	return total, nil
@@ -158,7 +160,8 @@ func digestFromName(name string) mh.Multihash {
 	return digest
 }
 
-// Usage returns the byte count of the spool's finished blob files.
+// Usage returns the byte count of the spool's files, counting the bytes
+// in-flight writes have written so far.
 func (s *Spool) Usage() int64 {
 	return s.usage.Load()
 }
@@ -176,17 +179,32 @@ func (s *Spool) LastRead(digest mh.Multihash) (time.Time, bool) {
 	return s.reads.get(string(digest))
 }
 
-// RemoveTemp deletes one .tmp-* file by name. Idempotent. It refuses any other
-// name, so it cannot be used to delete a finished blob behind the usage count.
-func (s *Spool) RemoveTemp(name string) error {
+// RemoveTemp deletes one .tmp-* file by name and returns how many bytes it
+// freed. Idempotent. It refuses any other name, so it cannot be used to delete
+// a finished blob. Only an abandoned write's file is safe to remove: a live
+// write would go on to fail, and its own cleanup would uncount its bytes
+// again.
+func (s *Spool) RemoveTemp(name string) (int64, error) {
 	if !strings.HasPrefix(name, spoolTempPrefix) || filepath.Base(name) != name {
-		return fmt.Errorf("blockstore: spool remove temp: %q is not a spool temp file", name)
+		return 0, fmt.Errorf("blockstore: spool remove temp: %q is not a spool temp file", name)
 	}
-	err := os.Remove(filepath.Join(s.dir, name))
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("blockstore: spool remove temp: %w", err)
+	path := filepath.Join(s.dir, name)
+	info, err := os.Stat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, nil
 	}
-	return nil
+	if err != nil {
+		return 0, fmt.Errorf("blockstore: spool remove temp: %w", err)
+	}
+	err = os.Remove(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("blockstore: spool remove temp: %w", err)
+	}
+	s.usage.Add(-info.Size())
+	return info.Size(), nil
 }
 
 // Path returns the on-disk path a blob with the given digest is stored at.
@@ -226,45 +244,68 @@ func (s *Spool) Remove(digest mh.Multihash) (int64, error) {
 // the blob is never held whole in memory (object-body blobs run up to
 // max_blob_size ≈ 254 MiB; buffering them would put that × concurrency in RAM).
 // The write is atomic (temp file → rename to the digest path), so a crash leaves
-// no partial blob readable under its digest. An empty r writes nothing and
-// returns a nil digest with n == 0 (a zero-byte object has no blob). Re-writing
-// an identical blob is idempotent (same digest, rename overwrites in place).
+// no partial blob readable under its digest. The usage count includes each byte
+// as it is written, and drops the bytes again if the write fails. An empty r
+// writes nothing and returns a nil digest with n == 0 (a zero-byte object has no
+// blob). Re-writing an identical blob is idempotent (same digest, rename
+// overwrites in place).
 func (s *Spool) WriteBlob(_ context.Context, r io.Reader) (mh.Multihash, int64, error) {
 	tmp, err := os.CreateTemp(s.dir, spoolTempPrefix+"*")
 	if err != nil {
 		return nil, 0, fmt.Errorf("blockstore: spool tempfile: %w", err)
 	}
 	tmpName := tmp.Name()
+	counted := &usageWriter{w: tmp, usage: &s.usage}
+	discard := func() {
+		_ = os.Remove(tmpName)
+		s.usage.Add(-counted.n)
+	}
 	hasher := sha256.New()
-	n, copyErr := io.Copy(io.MultiWriter(tmp, hasher), r)
+	n, copyErr := io.Copy(io.MultiWriter(counted, hasher), r)
 	if closeErr := tmp.Close(); closeErr != nil && copyErr == nil {
 		copyErr = closeErr
 	}
 	if copyErr != nil {
-		_ = os.Remove(tmpName)
+		discard()
 		return nil, n, fmt.Errorf("blockstore: spool write: %w", copyErr)
 	}
 	if n == 0 {
-		_ = os.Remove(tmpName)
+		discard()
 		return nil, 0, nil
 	}
 	digest, err := mh.Encode(hasher.Sum(nil), mh.SHA2_256)
 	if err != nil {
-		_ = os.Remove(tmpName)
+		discard()
 		return nil, n, fmt.Errorf("blockstore: spool digest: %w", err)
 	}
-	// An identical rewrite replaces a file already counted.
+	// An identical rewrite replaces a file already counted, so its bytes
+	// come off again.
 	path := s.Path(digest)
 	_, statErr := os.Stat(path)
 	existed := statErr == nil
 	if err := os.Rename(tmpName, path); err != nil {
-		_ = os.Remove(tmpName)
+		discard()
 		return nil, n, fmt.Errorf("blockstore: spool rename: %w", err)
 	}
-	if !existed {
-		s.usage.Add(n)
+	if existed {
+		s.usage.Add(-counted.n)
 	}
 	return digest, n, nil
+}
+
+// usageWriter adds each byte it writes to usage, and remembers how many so a
+// failed write can take them off again.
+type usageWriter struct {
+	w     io.Writer
+	usage *atomic.Int64
+	n     int64
+}
+
+func (u *usageWriter) Write(p []byte) (int, error) {
+	n, err := u.w.Write(p)
+	u.n += int64(n)
+	u.usage.Add(int64(n))
+	return n, err
 }
 
 // OpenBlob returns a streaming reader over the spooled blob with the given

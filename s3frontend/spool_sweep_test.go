@@ -232,7 +232,7 @@ func TestSweepSpool_FileAlreadyGoneIsMarkedEvicted(t *testing.T) {
 
 // TestSweepSpool_OrphanPass: old .tmp-* files and old blob files with no
 // intent are deleted; young ones, and old files with an intent, stay; the
-// usage count is reset to what remains.
+// usage count is reset to what remains, the young temp file included.
 func TestSweepSpool_OrphanPass(t *testing.T) {
 	ctx := t.Context()
 	b, mem := newSweepBackend(t)
@@ -294,7 +294,7 @@ func TestSweepSpool_OrphanPass(t *testing.T) {
 			"young orphan blob":    true,
 			"old blob with intent": true,
 		},
-		Usage: int64(len("young orphan") + len("old with intent")),
+		Usage: int64(len("partial") + len("young orphan") + len("old with intent")),
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("spool after the orphan pass = %+v, want %+v", got, want)

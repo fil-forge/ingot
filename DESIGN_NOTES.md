@@ -191,15 +191,18 @@ stale, and its abort records a release of its own.
 
 ## Spool eviction
 
-The spool keeps a running byte count of its blob files. With
-`spool_max_bytes` set, a sweeper checks it every 30 seconds and, when usage
+The spool keeps a running byte count of its files, adding each byte a
+write streams in as it lands, so the count covers bodies still arriving.
+With `spool_max_bytes` set, a sweeper checks it every 30 seconds and, when usage
 is over the budget, removes the files of blobs the provider already holds,
 oldest state change first, until usage is at 90% of the budget. A blob
 qualifies only through a row that proves the provider has it: a
 `blob_locations` row for an `accepted` or `published` intent, a `blob_parks`
 row for a `parked` one. The state alone does not qualify a blob, because a
 single PUT marks it accepted before recording its location. `spooled` and
-`uploading` files are the only copy and never qualify. The sweeper first
+`uploading` files are the only copy and never qualify, and neither do
+the `.tmp-*` files of writes in progress: the budget counts them, so the
+pass evicts cached blobs to make room for them. The sweeper first
 honours two windows, `spool_min_residency` (10 minutes after the last state
 change, so a client reading back what it just wrote reads from disk) and
 `spool_read_retention` (an hour after a read from the spool, tracked in
