@@ -321,6 +321,17 @@ func (m *MemStore) IsEvicted(digest multihash.Multihash) bool {
 	return ok
 }
 
+// AgeIntent moves the intent's last state change back by d, as if it had
+// happened that much earlier. Test-only: no store method rewrites history.
+func (m *MemStore) AgeIntent(digest multihash.Multihash, d time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if in, ok := m.intents[string(digest)]; ok {
+		in.UpdatedAt = in.UpdatedAt.Add(-d)
+		m.intents[string(digest)] = in
+	}
+}
+
 func (m *MemStore) MissingIntents(_ context.Context, digests []multihash.Multihash) ([]multihash.Multihash, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

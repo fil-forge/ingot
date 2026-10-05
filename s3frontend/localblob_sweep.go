@@ -82,18 +82,20 @@ func (s LocalBlobSweepStats) LogFields() []zap.Field {
 // the process stopped between recording that the provider holds it and moving
 // it. The pass stops at the first blob younger than CacheMinResidency, since
 // every later one is newer, and skips a blob read from the cache within
-// CacheReadRetention. If it stopped at the residency window or ran out of blobs
-// with usage still over budget, the forced pass gives up the windows in stages
-// (see forcedPass); a budget pass that only ran out of time leaves the rest to
-// the next sweep. Every pass logs and skips a file it cannot remove. If the
-// forced pass runs out of evictable blobs with usage still over budget, the
-// rest is files no rule lets it remove (bodies being written or uploaded,
-// bodies whose upload failed, blobs with no recorded location, young orphans),
-// and it logs a warning once until usage falls back to the low watermark. A
-// failed upload's intent stays spooled or uploading and nothing reclaims its
-// file yet, so those bytes count against the budget until an operator removes
-// them. The counts see such a removal at the next restart, or at the next
-// orphan pass that runs while the directory is quiet.
+// CacheReadRetention. If it stopped at the residency window, or ran out of
+// blobs while a read window is set, with usage still over budget, the forced
+// pass gives up the windows in stages (see forcedPass); a budget pass that only
+// ran out of time leaves the rest to the next sweep. Every pass logs and skips
+// a file it cannot remove. If the last pass to run (the forced pass, or the
+// budget pass when there was nothing for the forced pass to try) runs out of
+// evictable blobs with usage still over budget, the rest is files no rule lets
+// it remove (bodies being written or uploaded, bodies whose upload failed,
+// blobs with no recorded location, young orphans), and it logs a warning once
+// until usage falls back to the low watermark. A failed upload's intent stays
+// spooled or uploading and nothing reclaims its file yet, so those bytes count
+// against the budget until an operator removes them. The counts see such a
+// removal at the next restart, or at the next orphan pass that runs while the
+// directory is quiet.
 //
 // Eviction removes only the file. The intent keeps its row and state, marked
 // evicted: a session's release recognises a committed part blob by its
@@ -208,16 +210,16 @@ const (
 
 // forcedPass evicts inside the retention windows, once the budget pass has
 // stopped at the residency window or run out of candidates (budgetStop) with
-// usage still over budget: a full disk fails every write, which costs more
-// than reading a blob from the network. It gives up the windows in stages:
-// first cache_min_residency, still passing over blobs read within
+// usage still over budget: a full disk fails every write, which costs more than
+// reading a blob from the network. It gives up the windows in stages: first
+// cache_min_residency, still passing over blobs read within
 // cache_read_retention, so young unread blobs go before old hot ones; then,
 // only if that is not enough, both. After a budget pass that ran out of
 // candidates, the first stage would see the same rows, so it starts at the
-// second. It evicts only down to the budget, not to the low watermark, to
-// give up as little of the windows as it can. It warns at most once an hour
-// that it evicted inside the windows; the budget_forced removals count each
-// time.
+// second; with no read window, the two stages are the same, so it runs only the
+// first. It evicts only down to the budget, not to the low watermark, to give
+// up as little of the windows as it can. It warns at most once an hour that it
+// evicted inside the windows; the budget_forced removals count each time.
 func (b *Backend) forcedPass(ctx context.Context, budgetStop passStop, stats *LocalBlobSweepStats) error {
 	forcedCtx, cancel := context.WithTimeout(ctx, forcedPassTimeLimit)
 	defer cancel()
@@ -225,8 +227,13 @@ func (b *Backend) forcedPass(ctx context.Context, budgetStop passStop, stats *Lo
 	var last budgetPass
 	var err error
 	stages := []retention{honorReadWindow, honorNoWindow}
-	if budgetStop == stopExhausted {
+	switch {
+	case budgetStop == stopExhausted:
 		stages = stages[1:]
+	case b.cacheReadRetention == 0:
+		// With no read window, the last stage would see the same rows as
+		// the first.
+		stages = stages[:1]
 	}
 	for _, r := range stages {
 		if b.localUsage() <= b.localBlobMaxBytes {

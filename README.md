@@ -182,7 +182,10 @@ than `local_blob_orphan_age` (default `24h`, at least `1h`).
   × 30 seconds (60 GB at 2 GB/s). To evict outside `cache_min_residency`,
   the budget must also exceed the ingest rate × the window (1.2 TB at 2 GB/s
   for the default `10m`); below that, sweeps evict inside the window, and
-  warn at most once an hour;
+  warn at most once an hour. Likewise, to keep recently read bodies, it must
+  exceed the bodies read within `cache_read_retention` (up to 65,536 of them,
+  each up to `max_blob_size`); a read working set bigger than the budget is
+  evicted inside the window every sweep;
 - the spool's bodies in flight, when they outgrow the budget: each
   concurrent PUT or UploadPart writes its body as it streams, and a part can
   be up to 5 GiB. The budget counts those bytes as they land, so the sweeper

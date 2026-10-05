@@ -462,11 +462,11 @@ func TestEvictToBudget_ReportsWhyItStopped(t *testing.T) {
 		}
 	})
 	t.Run("residency", func(t *testing.T) {
-		const residency = time.Second
+		const residency = time.Hour
 		b, mem := newSweepBackend(t, func(d *Deps) { d.CacheMinResidency = residency })
-		old := putSweepObjects(t, b, 1)
-		time.Sleep(residency + 500*time.Millisecond)
-		young := putSweepObjects(t, b, 2)[1:]
+		digests := putSweepObjects(t, b, 2)
+		old, young := digests[:1], digests[1:]
+		mem.AgeIntent(old[0], 2*residency)
 		size := blobSize(t, b, old[0])
 		budgetToEvict(b, 2, size)
 		pass, err := b.evictToBudget(ctx, time.Now().Add(time.Minute), honorBothWindows)
@@ -727,6 +727,88 @@ func TestSweepLocalBlobs_WarnsOncePerOverBudgetEpisode(t *testing.T) {
 	got = append(got, b.overBudgetWarned)
 	if want := []bool{true, true, false}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("warned after [over, still over, back under] = %v, want %v", got, want)
+	}
+}
+
+// TestSweepLocalBlobs_LatchesResetAtTheLowWatermark: the once-per-episode
+// latches stay set while usage is under the budget but over the low
+// watermark, where a forced pass leaves it, and reset at the low watermark.
+func TestSweepLocalBlobs_LatchesResetAtTheLowWatermark(t *testing.T) {
+	b, _ := newSweepBackend(t, func(d *Deps) { d.LocalBlobMaxBytes = 1 })
+	if _, _, err := b.spool.WriteBlob(t.Context(), bytes.NewReader(bytes.Repeat([]byte("u"), 1000))); err != nil {
+		t.Fatalf("WriteBlob: %v", err)
+	}
+	b.timeLimitLogged = true
+	type latches struct{ Warned, TimeLimitLogged bool }
+	var got []latches
+	for _, percent := range []int64{0, 95, 89} {
+		if percent > 0 {
+			// Usage is percent% of the budget.
+			b.localBlobMaxBytes = b.localUsage() * 100 / percent
+		}
+		sweepLocalBlobs(t, b)
+		got = append(got, latches{b.overBudgetWarned, b.timeLimitLogged})
+	}
+	want := []latches{{true, true}, {true, true}, {false, false}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("latches after [over budget, at 95%%, at 89%%] = %+v, want %+v", got, want)
+	}
+}
+
+// TestSweepLocalBlobs_ForcedPassWarnsWhenNothingIsLeft: with a read window
+// set, an exhausted budget pass hands over to the forced pass, which finds
+// nothing either: it warns that nothing is left to evict, but not that it
+// evicted inside the windows.
+func TestSweepLocalBlobs_ForcedPassWarnsWhenNothingIsLeft(t *testing.T) {
+	core, logs := observer.New(zap.WarnLevel)
+	b, _ := newSweepBackend(t, func(d *Deps) {
+		d.LocalBlobMaxBytes = 1
+		d.CacheReadRetention = time.Hour
+		d.Logger = zap.New(core)
+	})
+	if _, _, err := b.spool.WriteBlob(t.Context(), bytes.NewReader([]byte("unevictable"))); err != nil {
+		t.Fatalf("WriteBlob: %v", err)
+	}
+	var calls int
+	b.intents = countingEvictable{IntentStore: b.intents, calls: &calls}
+
+	sweepLocalBlobs(t, b)
+
+	got := struct {
+		Calls               int
+		Warned              bool
+		NothingLeft, Inside int
+	}{calls, b.overBudgetWarned, logs.FilterMessageSnippet("nothing left to evict").Len(), logs.FilterMessageSnippet("inside the retention windows").Len()}
+	want := struct {
+		Calls               int
+		Warned              bool
+		NothingLeft, Inside int
+	}{2, true, 1, 0}
+	if got != want {
+		t.Fatalf("sweep = %+v, want %+v (the budget pass and the forced pass's last stage, one page each)", got, want)
+	}
+}
+
+// TestSweepLocalBlobs_ForcedPassRunsOneStageWithoutAReadWindow: with no read
+// window, the forced pass's stages are the same, so after the residency stop
+// it runs only the first.
+func TestSweepLocalBlobs_ForcedPassRunsOneStageWithoutAReadWindow(t *testing.T) {
+	b, mem := newSweepBackend(t, func(d *Deps) { d.CacheMinResidency = time.Hour })
+	digests := putSweepObjects(t, b, 1)
+	if _, _, err := b.spool.WriteBlob(t.Context(), bytes.NewReader([]byte("unevictable"))); err != nil {
+		t.Fatalf("WriteBlob: %v", err)
+	}
+	b.localBlobMaxBytes = 1
+	var calls int
+	b.intents = countingEvictable{IntentStore: b.intents, calls: &calls}
+
+	stats := sweepLocalBlobs(t, b)
+
+	// The budget pass stops at the young row on its first page; the forced
+	// pass's first stage evicts it and reads one empty page.
+	want := []blobState{{false, true}}
+	if states := blobStates(t, b, mem, digests); calls != 3 || stats.ForcedFiles != 1 || !reflect.DeepEqual(states, want) {
+		t.Fatalf("ListEvictable calls = %d, forced %d, blobs %+v; want 3, 1, %+v", calls, stats.ForcedFiles, states, want)
 	}
 }
 

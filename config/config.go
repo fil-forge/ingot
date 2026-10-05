@@ -126,8 +126,9 @@ type Config struct {
 	CacheMinResidency string `mapstructure:"cache_min_residency" yaml:"cache_min_residency"`
 	// CacheReadRetention is the read-cache window (Go duration string): the
 	// sweeper leaves alone a blob served from the cache within this long,
-	// unless usage stays over budget without it. Empty → default 1h; "0s"
-	// turns it off; negative is an error.
+	// unless usage stays over budget without it. Reads are remembered in
+	// memory, for a bounded number of blobs, and forgotten on restart. Empty
+	// → default 1h; "0s" turns it off; negative is an error.
 	CacheReadRetention string `mapstructure:"cache_read_retention" yaml:"cache_read_retention"`
 	// LocalBlobOrphanAge is the age (file modification time) at which the
 	// sweeper deletes a .tmp-* file in the spool or the cache, or a spool blob

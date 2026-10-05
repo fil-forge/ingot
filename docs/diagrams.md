@@ -604,7 +604,8 @@ flowchart TB
   already holds (a location row for `accepted` and `published`, a park row
   for `parked`), oldest state change first, down to 90% of the budget,
   passing over blobs inside `cache_min_residency` or `cache_read_retention`
-  unless usage stays over budget without them: from
+  unless usage stays over budget without them (then evicting inside the
+  windows only down to the budget): from
   the cache, or from the spool for a blob whose move never happened. The
   intent keeps its row and state and gains `evicted_at`; reads fall through
   to the network tier. `spooled` and `uploading` files are never evicted.
