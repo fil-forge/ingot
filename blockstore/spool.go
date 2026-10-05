@@ -18,7 +18,7 @@ import (
 // the finished file waits for it. Once the provider holds the blob, the S3
 // layer moves it into the BlobCache (BlobCache.Take), or removes it.
 //
-// Spool is deliberately pure file I/O: a blockstore.BlockReader plus the
+// Spool deliberately holds no policy: it is a blockstore.BlockReader plus the
 // streaming BlobReader/BlobWriter, plus running byte counts. It knows a blob
 // only as bytes under a digest. Whether a blob may move or be removed depends
 // on what refers to it — its upload state, the objects and multipart sessions
