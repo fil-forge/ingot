@@ -62,8 +62,8 @@ func (s LocalBlobSweepStats) Removed() bool {
 // bytes count against the budget until an operator removes them.
 //
 // Eviction removes only the file. The intent keeps its row and state, marked
-// evicted: a release recognises a committed blob by its published state, and
-// Complete reads part sizes from intents. The file goes first, so a crash in
+// evicted: a session's release recognises a committed part blob by its
+// published state, and Complete reads part sizes from intents. The file goes first, so a crash in
 // between leaves a row describing a missing file, which the next pass finds
 // missing and marks. Readers tolerate the unlink: an open file survives it,
 // and a local miss falls through to the network tier.
@@ -256,8 +256,12 @@ func (b *Backend) removeSpoolOrphans(ctx context.Context, now time.Time) (files,
 			bytes += freed
 		}
 	}
-	for start := 0; start < len(oldBlobs); start += localBlobSweepBatch {
-		missing, err := b.intents.MissingIntents(ctx, oldBlobs[start:min(start+localBlobSweepBatch, len(oldBlobs))])
+	batch := b.localBlobSweepBatch
+	if batch <= 0 {
+		batch = localBlobSweepBatch
+	}
+	for start := 0; start < len(oldBlobs); start += batch {
+		missing, err := b.intents.MissingIntents(ctx, oldBlobs[start:min(start+batch, len(oldBlobs))])
 		if err != nil {
 			return files, bytes, err
 		}

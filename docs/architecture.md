@@ -277,7 +277,7 @@ digest must be known before `allocate`, and because that local copy does double 
   a cache retains *recently read* data, so the two may use distinct eviction policies over a shared,
   bounded, size-configurable store. *(Built as two directories, a spool for writes and bodies
   awaiting upload and a cache for copies the provider holds, under one byte budget,
-  `local_blob_max_bytes`, evicting cached blobs oldest first; separate read-after-write and
+  `local_blob_max_bytes`, evicting blobs the provider holds, oldest first; separate read-after-write and
   read-recency windows are not built. See §12.)* The alternative — a near-stateless Ingot that resolves every read through the indexer —
   trades latency for simpler horizontal scaling; it is a supported mode, but the read-after-write
   floor holds regardless.
