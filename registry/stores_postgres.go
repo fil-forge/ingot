@@ -45,9 +45,9 @@ func (r *Postgres) AddBlobClaim(ctx context.Context, c BlobClaim) error {
 		return fmt.Errorf("registry: add blob claim: %w", err)
 	}
 	// The claim is the commit's durable trace on the blob; the intent's
-	// published state is how a release recognises a committed blob once the
-	// claims are gone. A blob without an intent row (a shipped catalog
-	// segment) has nothing to mark.
+	// published state is how a multipart session's teardown recognises a
+	// committed blob and leaves it to its object's own release. A blob
+	// without an intent row (a shipped catalog segment) has nothing to mark.
 	if _, err := tx.Exec(ctx,
 		`UPDATE ingot.upload_intents SET state = $2, updated_at = now()
 		 WHERE digest = $1 AND state <> $2`,
