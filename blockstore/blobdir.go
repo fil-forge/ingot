@@ -37,7 +37,9 @@ type blobDir struct {
 	// exclusively while it measures, and each commit into the directory or
 	// removal from it holds it shared, so the count sees every file either
 	// before or after the change. A move between directories
-	// (BlobCache.Take) holds both exclusively.
+	// (BlobCache.Take) holds both exclusively. ScanAndCorrect holds it
+	// exclusively for its final check, which is why every change counts
+	// itself in changes before releasing it.
 	mu sync.RWMutex
 	// usage is the byte count of the finished blob files.
 	usage atomic.Int64
@@ -120,39 +122,66 @@ func (d *blobDir) count(fn func(BlobFile)) error {
 // walk lists the directory for Scan and count and returns the total size of
 // the blob files it saw. A file removed while it runs is skipped.
 func (d *blobDir) walk(ctx context.Context, fn func(BlobFile)) (int64, error) {
-	entries, err := os.ReadDir(d.dir)
+	dir, err := os.Open(d.dir)
 	if err != nil {
 		return 0, fmt.Errorf("blockstore: %s scan: %w", d.kind, err)
 	}
+	defer dir.Close()
 	var total int64
-	for _, de := range entries {
-		if err := ctx.Err(); err != nil {
-			return total, err
+	for {
+		// Read the listing a chunk at a time, so a large directory is never
+		// held in memory whole, and ctx is checked as it goes.
+		entries, err := dir.ReadDir(walkChunk)
+		for _, de := range entries {
+			if err := ctx.Err(); err != nil {
+				return total, err
+			}
+			size, ok, err := d.visit(de, fn)
+			if err != nil {
+				return total, err
+			}
+			if ok {
+				total += size
+			}
 		}
+		if errors.Is(err, io.EOF) {
+			return total, nil
+		}
+		if err != nil {
+			return total, fmt.Errorf("blockstore: %s scan: %w", d.kind, err)
+		}
+	}
+}
+
+// walkChunk is how many directory entries walk reads at a time.
+const walkChunk = 1024
+
+// visit calls fn for one directory entry if it is a blob or .tmp-* file, and
+// returns the size of a blob file (ok false for anything else). An entry
+// removed since it was listed is skipped.
+func (d *blobDir) visit(de fs.DirEntry, fn func(BlobFile)) (size int64, ok bool, err error) {
+	{
 		if !de.Type().IsRegular() {
-			continue
+			return 0, false, nil
 		}
 		name := de.Name()
 		var digest mh.Multihash
 		if !strings.HasPrefix(name, spoolTempPrefix) {
 			digest = digestFromName(name)
 			if digest == nil {
-				continue
+				return 0, false, nil
 			}
 		}
 		info, err := de.Info()
 		if errors.Is(err, fs.ErrNotExist) {
-			continue
+			return 0, false, nil
 		}
 		if err != nil {
-			return total, fmt.Errorf("blockstore: %s stat %s: %w", d.kind, name, err)
-		}
-		if digest != nil {
-			total += info.Size()
+			return 0, false, fmt.Errorf("blockstore: %s stat %s: %w", d.kind, name, err)
 		}
 		fn(BlobFile{Name: name, Digest: digest, Size: info.Size(), ModTime: info.ModTime()})
+		return info.Size(), digest != nil, nil
 	}
-	return total, nil
 }
 
 // RemoveTemp deletes one .tmp-* file by name and returns its size. Idempotent.

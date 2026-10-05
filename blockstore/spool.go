@@ -34,7 +34,9 @@ type Spool struct {
 	*blobDir
 	// inFlight is every byte written so far to a write in progress. It is
 	// kept apart from the finished files' count, which a scan measures and
-	// may reset, so a scan never measures a write mid-way.
+	// may reset, so a scan never measures a write mid-way. A finished write's
+	// bytes are briefly in both, between its commit and WriteBlob's return,
+	// so Usage can run high by up to one blob per concurrent write.
 	inFlight atomic.Int64
 }
 

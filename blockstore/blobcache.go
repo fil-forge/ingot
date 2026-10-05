@@ -95,10 +95,12 @@ func (c *BlobCache) Take(spool *Spool, digest mh.Multihash) (int64, error) {
 		return 0, fmt.Errorf("blockstore: cache take: %w", err)
 	}
 	if err := os.Rename(from, c.Path(digest)); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			// Removed since the Stat, by something outside this process,
-			// which holding both directories rules out within it: the spool
-			// no longer holds its bytes.
+		if _, statErr := os.Stat(from); errors.Is(err, os.ErrNotExist) && errors.Is(statErr, os.ErrNotExist) {
+			// Removed since the first Stat, by something outside this
+			// process, which holding both directories rules out within it:
+			// the spool no longer holds its bytes. (A missing cache
+			// directory also fails the rename with ErrNotExist, but leaves
+			// the file where it was, so it is an error below.)
 			spool.usage.Add(-info.Size())
 			spool.changes.Add(1)
 			return 0, nil

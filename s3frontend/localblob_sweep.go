@@ -5,7 +5,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"math/rand/v2"
 	"time"
 
 	"github.com/multiformats/go-multihash"
@@ -238,87 +237,92 @@ func (b *Backend) evictToBudget(ctx context.Context, deadline time.Time) (pass b
 // moved to the cache by the time it is checked, which removeLocal handles. A
 // scan that nothing in this process overlapped also corrects its directory's
 // byte count, which only a file added or removed outside ingot can throw off,
-// and logs the correction. It
-// checks the spool's blobs first, since they are few and a stray one may be the
-// cause of an over-budget spool, then the cache's in random order, so a pass
-// that runs out of time still covers a different part of a large cache each
-// hour. A file it cannot remove is skipped and the failures are logged once,
-// so one bad file does not stop the pass; only a failed scan or query does.
-// Ages are measured from now, the sweep's time.
+// and logs the correction. It finishes the spool, which is small and where
+// orphans arise, before it scans the cache, so a slow cache cannot hold up
+// the spool's cleanup. It checks each directory's old blobs a batch at a time
+// as the scan reaches them, so its memory stays small however large the
+// cache; a cache orphan is rare, since a file enters the cache only after its
+// intent exists and every path that deletes an intent removes the file first.
+// A file it cannot remove is skipped and the failures are logged once, so one
+// bad file does not stop the pass; only a failed scan or query does. Ages are
+// measured from now, the sweep's time.
 func (b *Backend) removeOrphans(ctx context.Context, now time.Time) (files, bytes int64, err error) {
 	var failed removeFailures
 	defer failed.log(b.logger, "orphan")
 	cutoff := now.Add(-b.localBlobOrphanAge)
-	// Each directory's old temp files, and the digests of its old blobs.
-	type found struct {
-		temps []string
-		blobs []multihash.Multihash
-	}
-	collect := func(into *found) func(blockstore.BlobFile) {
-		return func(f blockstore.BlobFile) {
-			if !f.ModTime.Before(cutoff) {
-				return
-			}
-			if f.Digest == nil {
-				into.temps = append(into.temps, f.Name)
-			} else {
-				into.blobs = append(into.blobs, f.Digest)
-			}
-		}
-	}
-	var inSpool, inCache found
-	for _, dir := range []struct {
-		name string
-		scan func(context.Context, func(blockstore.BlobFile)) (int64, error)
-		into *found
-	}{{"spool", b.spool.ScanAndCorrect, &inSpool}, {"cache", b.cache.ScanAndCorrect, &inCache}} {
-		drift, err := dir.scan(ctx, collect(dir.into))
-		if err != nil {
-			return 0, 0, err
-		}
-		if drift != 0 {
-			b.logger.Warn("local blob "+dir.name+" byte count corrected: files were added or removed outside ingot",
-				zap.Int64("counted_minus_on_disk", drift))
-		}
-	}
-	for _, t := range []struct {
-		remove func(string) (int64, error)
-		names  []string
-	}{{b.spool.RemoveTemp, inSpool.temps}, {b.cache.RemoveTemp, inCache.temps}} {
-		for _, name := range t.names {
-			freed, err := t.remove(name)
-			if err != nil {
-				failed.add(name, err)
-				continue
-			}
-			if freed > 0 {
-				files++
-				bytes += freed
-			}
-		}
-	}
-	rand.Shuffle(len(inCache.blobs), func(i, j int) {
-		inCache.blobs[i], inCache.blobs[j] = inCache.blobs[j], inCache.blobs[i]
-	})
-	oldBlobs := append(inSpool.blobs, inCache.blobs...)
 	batch := b.localBlobSweepBatch
 	if batch <= 0 {
 		batch = localBlobSweepBatch
 	}
-	for start := 0; start < len(oldBlobs); start += batch {
-		missing, err := b.intents.MissingIntents(ctx, oldBlobs[start:min(start+batch, len(oldBlobs))])
+	count := func(freed int64) {
+		if freed > 0 {
+			files++
+			bytes += freed
+		}
+	}
+	// checkBlobs removes the local copy of each digest that has no intent.
+	checkBlobs := func(ctx context.Context, digests []multihash.Multihash) error {
+		missing, err := b.intents.MissingIntents(ctx, digests)
 		if err != nil {
-			return files, bytes, err
+			return err
 		}
 		for _, d := range missing {
 			freed, err := b.removeLocal(d)
-			if freed > 0 {
-				files++
-				bytes += freed
-			}
+			count(freed)
 			if err != nil {
 				failed.add(hex.EncodeToString(d), err)
 			}
+		}
+		return nil
+	}
+	for _, dir := range []struct {
+		name       string
+		scan       func(context.Context, func(blockstore.BlobFile)) (int64, error)
+		removeTemp func(string) (int64, error)
+	}{
+		{"spool", b.spool.ScanAndCorrect, b.spool.RemoveTemp},
+		{"cache", b.cache.ScanAndCorrect, b.cache.RemoveTemp},
+	} {
+		// Each batch of old blobs is checked as the scan reaches it, so a
+		// large directory is never held in memory; a failed query stops the
+		// scan through scanCtx.
+		scanCtx, cancel := context.WithCancel(ctx)
+		var pending []multihash.Multihash
+		var queryErr error
+		drift, err := dir.scan(scanCtx, func(f blockstore.BlobFile) {
+			if queryErr != nil || !f.ModTime.Before(cutoff) {
+				return
+			}
+			if f.Digest == nil {
+				freed, err := dir.removeTemp(f.Name)
+				count(freed)
+				if err != nil {
+					failed.add(f.Name, err)
+				}
+				return
+			}
+			pending = append(pending, f.Digest)
+			if len(pending) == batch {
+				queryErr = checkBlobs(scanCtx, pending)
+				pending = pending[:0]
+				if queryErr != nil {
+					cancel()
+				}
+			}
+		})
+		if queryErr == nil && err == nil && len(pending) > 0 {
+			queryErr = checkBlobs(ctx, pending)
+		}
+		cancel()
+		if queryErr != nil {
+			return files, bytes, queryErr
+		}
+		if err != nil {
+			return files, bytes, err
+		}
+		if drift != 0 {
+			b.logger.Warn("local blob "+dir.name+" byte count corrected: files were added or removed outside ingot",
+				zap.Int64("counted_minus_on_disk", drift))
 		}
 	}
 	return files, bytes, nil
