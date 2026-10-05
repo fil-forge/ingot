@@ -128,7 +128,8 @@ func TestValidate_RequiredFields(t *testing.T) {
 	}
 }
 
-// localBlobKnobs is the local blob storage subset of ServerConfig, for comparing it whole.
+// localBlobKnobs is the local blob storage subset of ServerConfig, for
+// comparing it whole.
 type localBlobKnobs struct {
 	MaxBytes  int64
 	OrphanAge time.Duration
