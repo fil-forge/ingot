@@ -16,14 +16,13 @@ import (
 
 // ErrUnsupportedDigestCode reports an add the upload service refused because
 // it, or every storage node it tried, cannot add a blob by digest code. The
-// caller hashes the blob first and uploads it with UploadBlob instead.
+// write fails: there is no way to add a blob whose digest is not yet known.
 var ErrUnsupportedDigestCode = errors.New("uploader: the upload service cannot add a blob by digest code")
 
 // StreamedBlob is a blob added before its digest is known, so its bytes can
 // go to the provider as they are written. Once they are sent, the blob is
 // parked: [StreamedBlob.Parked] gives the UploadedBlob that ConcludeBlobs
-// accepts and AbortBlob abandons, like one from UploadBlob with
-// WithConclude(false).
+// accepts and AbortBlob abandons.
 type StreamedBlob struct {
 	// Size is the byte count the blob was allocated for, which its body must
 	// match.
@@ -66,8 +65,10 @@ type StreamingBodyUploader interface {
 	PutBlob(ctx context.Context, blob StreamedBlob, body io.Reader) error
 }
 
-// StartBlob runs on the request ctx, like UploadBlob, and needs its proof
-// store for the same reasons.
+// StartBlob runs on the request ctx and needs its proof store: the request's
+// key authorizes the /blob/add, and it is captured as the ship authority for
+// space, so the async catalog ship (no request ctx) can reuse it. In forge mode
+// the IAM layer populates reqscope for every write, so absence is a wiring bug.
 func (u *Forge) StartBlob(ctx context.Context, space did.DID, size int64) (StreamedBlob, error) {
 	store, ok := reqscope.ProofStore(ctx)
 	if !ok {

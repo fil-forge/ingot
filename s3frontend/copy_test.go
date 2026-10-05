@@ -129,7 +129,7 @@ func TestCopyObject_ForeignTenantSourceIsAccessDenied(t *testing.T) {
 		}
 	}
 	srcBucket, srcKey := "a", "obj"
-	if _, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &srcBucket, Key: &srcKey, Body: bytes.NewReader([]byte("secret"))}); err != nil {
+	if _, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &srcBucket, Key: &srcKey, Body: bytes.NewReader([]byte("secret")), ContentLength: sizeOf([]byte("secret"))}); err != nil {
 		t.Fatalf("put source: %v", err)
 	}
 
@@ -172,7 +172,7 @@ func TestCopyObject_CrossSpaceReingest(t *testing.T) {
 	data := bytes.Repeat([]byte("re-ingest me "), 20000) // ~260 KiB
 	srcBucket, srcKey, ctype := "src-bkt", "obj", "text/bla"
 	if _, err := b.PutObject(ctx, s3response.PutObjectInput{
-		Bucket: &srcBucket, Key: &srcKey, Body: bytes.NewReader(data),
+		Bucket: &srcBucket, Key: &srcKey, Body: bytes.NewReader(data), ContentLength: sizeOf(data),
 		ChecksumAlgorithm: types.ChecksumAlgorithmSha256, ContentType: &ctype,
 		Metadata: map[string]string{"foo": "bar"},
 	}); err != nil {
@@ -285,7 +285,7 @@ func TestCopyObject_PinnedSourceReleasedBeforeCommitIsNoSuchKey(t *testing.T) {
 		}
 	}
 	srcBucket, srcKey := "src", "obj"
-	if _, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &srcBucket, Key: &srcKey, Body: bytes.NewReader([]byte("pin me"))}); err != nil {
+	if _, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &srcBucket, Key: &srcKey, Body: bytes.NewReader([]byte("pin me")), ContentLength: sizeOf([]byte("pin me"))}); err != nil {
 		t.Fatal(err)
 	}
 	srcRv, err := b.resolveVersion(ctx, "src", "obj", "")
@@ -325,7 +325,7 @@ func TestCopyObject_PinnedSourceReleasedBeforeCommitIsNoSuchKey(t *testing.T) {
 	}
 
 	// The same copy against a live source pins as before.
-	if _, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &srcBucket, Key: &srcKey, Body: bytes.NewReader([]byte("pin me"))}); err != nil {
+	if _, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &srcBucket, Key: &srcKey, Body: bytes.NewReader([]byte("pin me")), ContentLength: sizeOf([]byte("pin me"))}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := b.CopyObject(ctx, s3response.CopyObjectInput{Bucket: &dstBucket, Key: &dstKey, CopySource: &source}); err != nil {
@@ -396,7 +396,7 @@ func TestCopyObject_UnknownTenantSourceIsAccessDenied(t *testing.T) {
 		}
 	}
 	srcBucket, srcKey := "legacy1", "obj"
-	if _, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &srcBucket, Key: &srcKey, Body: bytes.NewReader([]byte("legacy"))}); err != nil {
+	if _, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &srcBucket, Key: &srcKey, Body: bytes.NewReader([]byte("legacy")), ContentLength: sizeOf([]byte("legacy"))}); err != nil {
 		t.Fatalf("put source: %v", err)
 	}
 	copyFrom := func(dst, source string) error {

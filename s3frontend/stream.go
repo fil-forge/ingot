@@ -45,20 +45,9 @@ import (
 const streamAttempts = 3
 
 // WriteSizedBlob implements bucket.SizedBlobWriter: r yields exactly n
-// plaintext bytes. Without a streaming uploader, or once the upload service
-// has refused to add by digest code, it spools the blob as WriteBlob does.
+// plaintext bytes, which it encrypts and streams to the provider, returning the
+// digest of the envelope sent.
 func (w *encryptingBlobWriter) WriteSizedBlob(ctx context.Context, r io.Reader, n int64) (_ multihash.Multihash, err error) {
-	if w.stream == nil || w.digestFirst {
-		digest, got, err := w.WriteBlob(ctx, r)
-		if err != nil {
-			return nil, err
-		}
-		if got != n {
-			return nil, fmt.Errorf("s3frontend: blob of %d bytes yielded %d", n, got)
-		}
-		return digest, nil
-	}
-
 	ctx, span := tracing.Start(ctx, "blob.stream", attribute.Int64("ingot.blob.plaintext_bytes", n))
 	defer func() { tracing.End(span, err) }()
 
@@ -88,15 +77,6 @@ func (w *encryptingBlobWriter) WriteSizedBlob(ctx context.Context, r io.Reader, 
 	defer replay.Close()
 
 	sb, err := w.startStream(ctx, stored)
-	if errors.Is(err, uploader.ErrUnsupportedDigestCode) {
-		// The upload service cannot take a blob without its digest: this
-		// body falls back to spooling each blob first, and uploading it by
-		// digest once spooled.
-		span.SetAttributes(attribute.String("ingot.blob.result", "digest_first"))
-		w.logger.Warn("upload service cannot add by digest code; spooling blobs before upload", zap.Error(err))
-		w.digestFirst = true
-		return w.spoolEnvelope(ctx, rc, desc, cek)
-	}
 	if err != nil {
 		return nil, err
 	}
@@ -161,9 +141,6 @@ func (w *encryptingBlobWriter) WriteSizedBlob(ctx context.Context, r io.Reader, 
 // records the allocation in blob_streams, under the request's lease.
 func (w *encryptingBlobWriter) startStream(ctx context.Context, stored int64) (uploader.StreamedBlob, error) {
 	sb, err := w.stream.StartBlob(ctx, w.space, stored)
-	if errors.Is(err, uploader.ErrUnsupportedDigestCode) {
-		return uploader.StreamedBlob{}, err
-	}
 	if err != nil {
 		return uploader.StreamedBlob{}, fmt.Errorf("s3frontend: start blob: %w", err)
 	}
@@ -182,20 +159,6 @@ func (w *encryptingBlobWriter) startStream(ctx context.Context, stored int64) (u
 	}
 	w.lease.add(sb.AddTask.Bytes())
 	return sb, nil
-}
-
-// spoolEnvelope spools an envelope for a blob that will be uploaded by digest,
-// checks it is the length its descriptor promised, and records its encryption
-// state.
-func (w *encryptingBlobWriter) spoolEnvelope(ctx context.Context, envelope io.Reader, desc fee.BodyDescriptor, cek []byte) (multihash.Multihash, error) {
-	digest, storedSize, err := w.spool.WriteBlob(ctx, envelope)
-	if err != nil {
-		return nil, fmt.Errorf("s3frontend: spool envelope: %w", err)
-	}
-	if err := w.record(ctx, digest, cek, encWrite{desc: desc, storedSize: storedSize}); err != nil {
-		return nil, err
-	}
-	return digest, nil
 }
 
 // abandon releases a streamed upload's allocation on its provider. It is best
