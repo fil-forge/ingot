@@ -178,6 +178,35 @@ func runEvictionSuite(t *testing.T, fresh func(t *testing.T) evictStore) {
 		})
 	}
 
+	t.Run("SetIntentState to the current state keeps updated_at", func(t *testing.T) {
+		st := fresh(t)
+		d := evictDigest(t, "retried")
+		seed(t, st, d, registry.IntentAccepted, true, false)
+		before, err := st.GetIntent(ctx, d)
+		if err != nil {
+			t.Fatalf("GetIntent: %v", err)
+		}
+		time.Sleep(5 * time.Millisecond)
+		if err := st.SetIntentState(ctx, d, registry.IntentAccepted); err != nil {
+			t.Fatalf("SetIntentState: %v", err)
+		}
+		repeated, err := st.GetIntent(ctx, d)
+		if err != nil {
+			t.Fatalf("GetIntent: %v", err)
+		}
+		if err := st.SetIntentState(ctx, d, registry.IntentPublished); err != nil {
+			t.Fatalf("SetIntentState: %v", err)
+		}
+		changed, err := st.GetIntent(ctx, d)
+		if err != nil {
+			t.Fatalf("GetIntent: %v", err)
+		}
+		got := [2]bool{repeated.UpdatedAt.Equal(before.UpdatedAt), changed.UpdatedAt.After(before.UpdatedAt)}
+		if got != [2]bool{true, true} {
+			t.Fatalf("[repeat kept updated_at, change advanced it] = %v, want [true true]", got)
+		}
+	})
+
 	t.Run("PutIntent clears the evicted mark", func(t *testing.T) {
 		st := fresh(t)
 		d := evictDigest(t, "respooled")

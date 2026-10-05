@@ -204,8 +204,10 @@ func (m *MemStore) SetIntentState(_ context.Context, digest multihash.Multihash,
 	if !ok {
 		return registry.ErrNotFound
 	}
-	in.State = state
-	in.UpdatedAt = time.Now()
+	if in.State != state {
+		in.State = state
+		in.UpdatedAt = time.Now()
+	}
 	m.intents[string(digest)] = in
 	return nil
 }

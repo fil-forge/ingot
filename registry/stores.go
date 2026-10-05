@@ -316,6 +316,9 @@ type IntentStore interface {
 	// PutIntent upserts an intent. A digest spooled again is on disk again,
 	// so PutIntent also clears the evicted mark.
 	PutIntent(ctx context.Context, in UploadIntent) error
+	// SetIntentState moves an intent to state. UpdatedAt records the last
+	// state change, which orders eviction, so setting the state an intent
+	// already has (a retry) leaves it alone.
 	SetIntentState(ctx context.Context, digest multihash.Multihash, state string) error
 	GetIntent(ctx context.Context, digest multihash.Multihash) (*UploadIntent, error)
 	ListIntentsByState(ctx context.Context, state string) ([]UploadIntent, error)
