@@ -160,9 +160,9 @@ over budget after that, the sweeper evicts inside both windows, oldest first:
 a full disk fails every write. `0s` turns either window off.
 
 The budget is off by default (`spool_max_bytes: 0`): without it the spool
-grows with every live object's bodies. The sweeper also deletes, hourly,
-unfinished `.tmp-*` writes and files no upload names, once they are older
-than `spool_orphan_age` (default `24h`, at least `1h`).
+grows with every live object's bodies. With or without a budget, the sweeper
+also deletes, hourly, unfinished `.tmp-*` writes and files no upload names,
+once they are older than `spool_orphan_age` (default `24h`, at least `1h`).
 
 **Sizing.** The spool's filesystem needs room for:
 

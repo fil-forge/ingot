@@ -19,7 +19,8 @@ const (
 	// evicts, so the next sweep does not start over budget again at once.
 	// The headroom must exceed ingest rate × the sweep interval.
 	spoolLowWatermarkPercent = 90
-	// spoolSweepBatch is how many rows a pass reads per query.
+	// spoolSweepBatch is how many rows a pass reads per query, unless a test
+	// sets Backend.spoolSweepBatch.
 	spoolSweepBatch = 512
 	// spoolBudgetPassTimeLimit caps the budget pass so the forced pass that
 	// may follow always gets the rest of the sweep's time.
@@ -47,11 +48,15 @@ func (s SpoolSweepStats) Removed() bool {
 // SweepSpool bounds the local spool. With a budget set (Deps.SpoolMaxBytes)
 // and usage over it, the budget pass evicts blobs the provider already holds
 // (registry.IntentStore.ListEvictable), oldest state change first, down to
-// 90% of the budget. It stops at the first blob younger than
-// SpoolMinResidency, since every later one is newer, and skips a blob read
-// from the spool within SpoolReadRetention. If usage is still over budget,
-// the forced pass repeats it without either window: evicting a located blob
-// costs read latency, and a full disk fails every write.
+// 90% of the budget, within a time limit. It stops at the first blob younger
+// than SpoolMinResidency, since every later one is newer, and skips a blob
+// read from the spool within SpoolReadRetention. If usage is still over
+// budget, the forced pass repeats it without either window: evicting a
+// located blob costs read latency, and a full disk fails every write. Either
+// pass logs and skips a file it cannot remove. If the forced pass runs out of
+// evictable blobs with usage still over budget, the rest is files no rule
+// lets it remove (bodies being written or uploaded, blobs with no recorded
+// location, young orphans), and it logs a warning.
 //
 // Eviction removes only the file. The intent keeps its row and state, marked
 // evicted: a release recognises a committed blob by its published state, and
@@ -60,9 +65,10 @@ func (s SpoolSweepStats) Removed() bool {
 // missing and marks. Readers tolerate the unlink: an open file survives it,
 // and a spool miss falls through to the network tier.
 //
-// On the first run and then hourly, the orphan pass deletes .tmp-* files and
-// blob files with no intent row once they are older than SpoolOrphanAge, and
-// resets the spool's usage count from the directory scan.
+// On the first run and then hourly, with or without a budget, the orphan
+// pass deletes .tmp-* files and blob files with no intent row once they are
+// older than SpoolOrphanAge, and corrects the spool's usage count to the
+// directory scan. It runs even when the budget pass fails.
 //
 // Called periodically by the daemon's spool sweeper, and directly by tests.
 func (b *Backend) SweepSpool(ctx context.Context) (SpoolSweepStats, error) {
@@ -74,16 +80,17 @@ func (b *Backend) SweepSpool(ctx context.Context) (SpoolSweepStats, error) {
 	// time limit reads it again, as it goes.
 	now := time.Now()
 	var stats SpoolSweepStats
+	var errs []error
 	if b.spoolMaxBytes > 0 && b.spool.Usage() > b.spoolMaxBytes {
 		deadline := now.Add(spoolBudgetPassTimeLimit)
-		files, bytes, err := b.evictToBudget(ctx, deadline, true)
-		stats.BudgetFiles, stats.BudgetBytes = files, bytes
-		b.spoolMetrics.removed(ctx, spoolRemovedBudget, files, bytes)
+		pass, err := b.evictToBudget(ctx, deadline, true)
+		stats.BudgetFiles, stats.BudgetBytes = pass.files, pass.bytes
+		b.spoolMetrics.removed(ctx, spoolRemovedBudget, pass.files, pass.bytes)
 		if err != nil {
-			return stats, fmt.Errorf("s3frontend: spool budget pass: %w", err)
+			errs = append(errs, fmt.Errorf("s3frontend: spool budget pass: %w", err))
 		}
 	}
-	if b.spoolMaxBytes > 0 && b.spool.Usage() > b.spoolMaxBytes {
+	if len(errs) == 0 && b.spoolMaxBytes > 0 && b.spool.Usage() > b.spoolMaxBytes {
 		b.logger.Warn("spool is over budget after the budget pass; evicting blobs inside the retention windows",
 			zap.Int64("usage", b.spool.Usage()),
 			zap.Int64("budget", b.spoolMaxBytes))
@@ -91,14 +98,19 @@ func (b *Backend) SweepSpool(ctx context.Context) (SpoolSweepStats, error) {
 		if !ok {
 			deadline = time.Now().Add(spoolBudgetPassTimeLimit)
 		}
-		files, bytes, err := b.evictToBudget(ctx, deadline, false)
-		stats.ForcedFiles, stats.ForcedBytes = files, bytes
-		b.spoolMetrics.removed(ctx, spoolRemovedBudgetForced, files, bytes)
-		if err != nil {
-			return stats, fmt.Errorf("s3frontend: spool forced pass: %w", err)
-		}
-		if b.spool.Usage() > b.spoolMaxBytes {
-			b.logger.Warn("spool is still over budget with nothing left to evict: the remaining files are bodies being written or uploaded, blobs with no recorded location, or orphans younger than spool_orphan_age",
+		pass, err := b.evictToBudget(ctx, deadline, false)
+		stats.ForcedFiles, stats.ForcedBytes = pass.files, pass.bytes
+		b.spoolMetrics.removed(ctx, spoolRemovedBudgetForced, pass.files, pass.bytes)
+		switch {
+		case err != nil:
+			errs = append(errs, fmt.Errorf("s3frontend: spool forced pass: %w", err))
+		case b.spool.Usage() <= b.spoolMaxBytes:
+		case pass.exhausted:
+			b.logger.Warn("spool is still over budget with nothing left to evict: the remaining files are bodies being written or uploaded, blobs with no recorded location, files that could not be removed, or orphans younger than spool_orphan_age",
+				zap.Int64("usage", b.spool.Usage()),
+				zap.Int64("budget", b.spoolMaxBytes))
+		default:
+			b.logger.Info("spool forced pass reached its time limit while still over budget; the next sweep continues",
 				zap.Int64("usage", b.spool.Usage()),
 				zap.Int64("budget", b.spoolMaxBytes))
 		}
@@ -108,11 +120,12 @@ func (b *Backend) SweepSpool(ctx context.Context) (SpoolSweepStats, error) {
 		stats.OrphanFiles, stats.OrphanBytes = files, bytes
 		b.spoolMetrics.removed(ctx, spoolRemovedOrphan, files, bytes)
 		if err != nil {
-			return stats, fmt.Errorf("s3frontend: spool orphan pass: %w", err)
+			errs = append(errs, fmt.Errorf("s3frontend: spool orphan pass: %w", err))
+		} else {
+			b.lastOrphanPass = now
 		}
-		b.lastOrphanPass = now
 	}
-	return stats, nil
+	return stats, errors.Join(errs...)
 }
 
 // SpoolUsage returns the byte count of the spool's files, writes in progress
@@ -121,30 +134,46 @@ func (b *Backend) SpoolUsage() int64 {
 	return b.spool.Usage()
 }
 
-// evictToBudget pages through the evictable intents, removing each file and
-// marking its intent evicted, until usage is at the low watermark, the rows
-// run out, or the deadline passes. honorRetention applies the residency stop
-// and the read-recency skip.
-func (b *Backend) evictToBudget(ctx context.Context, deadline time.Time, honorRetention bool) (files, bytes int64, err error) {
-	target := b.spoolMaxBytes / 100 * spoolLowWatermarkPercent
+// budgetPass is what one evictToBudget run did: the files it removed and
+// their bytes, and whether it stopped because no evictable rows were left
+// (rather than at the low watermark, the residency stop, or its deadline).
+type budgetPass struct {
+	files, bytes int64
+	exhausted    bool
+}
+
+// evictToBudget pages through the evictable intents, oldest state change
+// first, removing each file and marking its intent evicted, until usage is at
+// the low watermark, the rows run out, or the deadline passes. honorRetention
+// applies the residency stop and the read-recency skip. A file it cannot
+// remove is logged and skipped, so one bad file does not stop every later
+// pass at the same row; its intent stays unmarked. A row whose file was
+// already gone is marked but not counted.
+func (b *Backend) evictToBudget(ctx context.Context, deadline time.Time, honorRetention bool) (pass budgetPass, err error) {
+	target := b.spoolMaxBytes * spoolLowWatermarkPercent / 100
+	batch := b.spoolSweepBatch
+	if batch <= 0 {
+		batch = spoolSweepBatch
+	}
 	now := time.Now()
 	var cursor registry.EvictCursor
 	for b.spool.Usage() > target && time.Now().Before(deadline) {
-		page, err := b.intents.ListEvictable(ctx, cursor, spoolSweepBatch)
+		page, err := b.intents.ListEvictable(ctx, cursor, batch)
 		if err != nil {
-			return files, bytes, err
+			return pass, err
 		}
 		if len(page) == 0 {
-			return files, bytes, nil
+			pass.exhausted = true
+			return pass, nil
 		}
 		for _, in := range page {
 			if b.spool.Usage() <= target {
-				return files, bytes, nil
+				return pass, nil
 			}
 			cursor = registry.EvictCursor{UpdatedAt: in.UpdatedAt, Digest: in.Digest}
 			if honorRetention {
 				if now.Sub(in.UpdatedAt) < b.spoolMinResidency {
-					return files, bytes, nil
+					return pass, nil
 				}
 				if at, ok := b.spool.LastRead(in.Digest); ok && now.Sub(at) < b.spoolReadRetention {
 					continue
@@ -152,16 +181,21 @@ func (b *Backend) evictToBudget(ctx context.Context, deadline time.Time, honorRe
 			}
 			freed, err := b.spool.Remove(in.Digest)
 			if err != nil {
-				return files, bytes, err
+				b.logger.Warn("spool budget pass: cannot remove a file; skipping it",
+					zap.String("digest", hex.EncodeToString(in.Digest)),
+					zap.Error(err))
+				continue
 			}
 			if err := b.intents.MarkEvicted(ctx, in.Digest); err != nil && !errors.Is(err, registry.ErrNotFound) {
-				return files, bytes, fmt.Errorf("mark %s evicted: %w", hex.EncodeToString(in.Digest), err)
+				return pass, fmt.Errorf("mark %s evicted: %w", hex.EncodeToString(in.Digest), err)
 			}
-			files++
-			bytes += freed
+			if freed > 0 {
+				pass.files++
+				pass.bytes += freed
+			}
 		}
 	}
-	return files, bytes, nil
+	return pass, nil
 }
 
 // removeSpoolOrphans deletes the files no intent-driven cleanup can find, once
@@ -169,12 +203,14 @@ func (b *Backend) evictToBudget(ctx context.Context, deadline time.Time, honorRe
 // finished, and blob files with no intent row (a split that failed before
 // its intents were recorded). The age must exceed the longest time one
 // request body takes to stream, because a request records its intents only
-// after its whole body is spooled. Then it resets the usage count from the
-// scan. Ages are measured from now, the sweep's time.
+// after its whole body is spooled. It corrects the usage count to the scan
+// first; each removal then takes its own bytes off. Ages are measured from
+// now, the sweep's time.
 func (b *Backend) removeSpoolOrphans(ctx context.Context, now time.Time) (files, bytes int64, err error) {
 	cutoff := now.Add(-b.spoolOrphanAge)
 	var oldTemps []blockstore.SpoolEntry
 	var oldBlobs []blockstore.SpoolEntry
+	before := b.spool.Usage()
 	total, err := b.spool.Scan(func(e blockstore.SpoolEntry) {
 		if !e.ModTime.Before(cutoff) {
 			return
@@ -188,7 +224,7 @@ func (b *Backend) removeSpoolOrphans(ctx context.Context, now time.Time) (files,
 	if err != nil {
 		return 0, 0, err
 	}
-	var removed int64
+	b.spool.CorrectUsage(before, total)
 	for _, e := range oldTemps {
 		freed, err := b.spool.RemoveTemp(e.Name)
 		if err != nil {
@@ -197,7 +233,6 @@ func (b *Backend) removeSpoolOrphans(ctx context.Context, now time.Time) (files,
 		if freed > 0 {
 			files++
 			bytes += freed
-			removed += freed
 		}
 	}
 	for start := 0; start < len(oldBlobs); start += spoolSweepBatch {
@@ -218,10 +253,8 @@ func (b *Backend) removeSpoolOrphans(ctx context.Context, now time.Time) (files,
 			if freed > 0 {
 				files++
 				bytes += freed
-				removed += freed
 			}
 		}
 	}
-	b.spool.ResetUsage(total - removed)
 	return files, bytes, nil
 }

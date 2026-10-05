@@ -1,11 +1,15 @@
 package s3frontend
 
 import (
+	"bytes"
 	"context"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/fil-forge/versitygw/backend"
+	"github.com/multiformats/go-multihash"
 	"go.opentelemetry.io/otel/attribute"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
@@ -130,5 +134,82 @@ func TestSpoolMetrics_ForcedPass(t *testing.T) {
 	}
 	if _, ok := got["ingot.spool.evictions/budget"]; ok {
 		t.Fatalf("the budget pass recorded removals inside the residency window: %v", got)
+	}
+}
+
+// TestSpoolMetrics_BudgetPassSkipsAFileAlreadyGone: a row whose file was
+// already gone is not counted as an eviction.
+func TestSpoolMetrics_BudgetPassSkipsAFileAlreadyGone(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	b, _ := newSweepBackend(t, meteredBackend(reader))
+	digests := putSweepObjects(t, b, 2)
+	size := blobSize(t, b, digests[1])
+	budgetToEvict(b, 1, size)
+	if err := os.Remove(b.spool.Path(digests[0])); err != nil {
+		t.Fatal(err)
+	}
+
+	sweepSpool(t, b)
+
+	// The usage count still held the missing file's bytes, so the pass went
+	// on to evict the second blob, the only removal counted.
+	got := collectSpoolMetrics(t, reader)
+	if got["ingot.spool.evictions/budget"] != 1 || got["ingot.spool.evicted/budget"] != size {
+		t.Fatalf("budget removals = %d files, %d bytes; want 1 file, %d bytes (all: %v)",
+			got["ingot.spool.evictions/budget"], got["ingot.spool.evicted/budget"], size, got)
+	}
+}
+
+// TestSpoolMetrics_OrphanPass: the orphan pass counts the temp files and
+// intent-less blob files it deletes.
+func TestSpoolMetrics_OrphanPass(t *testing.T) {
+	ctx := t.Context()
+	reader := sdkmetric.NewManualReader()
+	b, _ := newSweepBackend(t, meteredBackend(reader))
+	old := time.Now().Add(-2 * DefaultSpoolOrphanAge)
+	temp := filepath.Join(filepath.Dir(b.spool.Path(multihash.Multihash{0})), ".tmp-old")
+	if err := os.WriteFile(temp, []byte("partial"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	d, _, err := b.spool.WriteBlob(ctx, bytes.NewReader([]byte("old orphan")))
+	if err != nil {
+		t.Fatalf("WriteBlob: %v", err)
+	}
+	for _, path := range []string{temp, b.spool.Path(d)} {
+		if err := os.Chtimes(path, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	sweepSpool(t, b)
+
+	got := collectSpoolMetrics(t, reader)
+	wantBytes := int64(len("partial") + len("old orphan"))
+	if got["ingot.spool.evictions/orphan"] != 2 || got["ingot.spool.evicted/orphan"] != wantBytes {
+		t.Fatalf("orphan removals = %d files, %d bytes; want 2 files, %d bytes (all: %v)",
+			got["ingot.spool.evictions/orphan"], got["ingot.spool.evicted/orphan"], wantBytes, got)
+	}
+}
+
+// TestSpoolMetrics_ReleaseOfACopyAlreadyGone: a release whose spool copy is
+// already gone, as on a retry after the copy was removed, counts nothing.
+func TestSpoolMetrics_ReleaseOfACopyAlreadyGone(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	b, _ := newDeferredBackend(t, inmem.NopUploader{}, meteredBackend(reader))
+	key := "deleted"
+	putObj(t, b, key, testBody(1<<10))
+	if err := os.Remove(b.spool.Path(blobDigestOf(t, b, key, ""))); err != nil {
+		t.Fatal(err)
+	}
+	deleteObj(t, b, key)
+
+	if n, err := b.SweepPendingReleases(context.Background()); err != nil || n != 1 {
+		t.Fatalf("release sweep executed %d releases (err=%v), want 1", n, err)
+	}
+
+	got := collectSpoolMetrics(t, reader)
+	if got["ingot.spool.evictions/released"] != 0 || got["ingot.spool.evicted/released"] != 0 {
+		t.Fatalf("released removals = %d files, %d bytes; want none (all: %v)",
+			got["ingot.spool.evictions/released"], got["ingot.spool.evicted/released"], got)
 	}
 }

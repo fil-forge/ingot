@@ -129,8 +129,9 @@ type Config struct {
 	SpoolReadRetention string `mapstructure:"spool_read_retention" yaml:"spool_read_retention"`
 	// SpoolOrphanAge is the age (file modification time) at which the
 	// sweeper deletes a .tmp-* file or a spool file with no upload intent
-	// (Go duration string). It must exceed the longest time one request body
-	// takes to stream. Empty → default 24h; under 1h is an error.
+	// (Go duration string), hourly, whether or not a budget is set. It must
+	// exceed the longest time one request body takes to stream. Empty →
+	// default 24h; under 1h is an error.
 	SpoolOrphanAge string `mapstructure:"spool_orphan_age" yaml:"spool_orphan_age"`
 
 	// CatalogPlane overrides the catalog logstore pipeline knobs. Any field

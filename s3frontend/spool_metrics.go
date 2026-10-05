@@ -96,7 +96,9 @@ func (m spoolMetrics) removedFile(ctx context.Context, reason string, freed int6
 }
 
 // CloseMetrics stops reporting the spool gauges. The backend still counts
-// removals; with no reader those cost nothing.
+// removals; with no reader those cost nothing. Server.Stop calls it, so a
+// final export the host makes after Stop carries the counters but not the
+// gauges.
 func (b *Backend) CloseMetrics() error {
 	if b.spoolGauges == nil {
 		return nil
