@@ -132,7 +132,9 @@ room for them, but usage can run over it by the ingest rate × 30 seconds,
 plus bodies still being written or uploaded, which cannot be evicted.
 Without a budget the spool grows with every live object's bodies; a deleted
 object's local copy is freed when its release runs, and a multipart part's
-once it parks on the provider.
+once it parks on the provider. With or without a budget, the sweeper deletes
+unfinished writes and files no upload names, hourly, once they are older
+than `spool_orphan_age` (default `24h`).
 
 `serve` exports OpenTelemetry traces over OTLP/HTTP when
 `OTEL_EXPORTER_OTLP_ENDPOINT` names a collector; with no endpoint, tracing is

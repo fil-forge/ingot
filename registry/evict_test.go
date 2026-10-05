@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"reflect"
+	"slices"
 	"testing"
 	"time"
 
@@ -52,6 +53,47 @@ func TestEvictionQueriesLive(t *testing.T) {
 				t.Fatalf("truncate: %v", err)
 			}
 			return registry.NewPostgres(pool)
+		})
+		// Rows one transaction updates share its now(), so the cursor's
+		// digest tie-break has to carry a page boundary between them.
+		t.Run("ListEvictable pages through equal updated_at", func(t *testing.T) {
+			if _, err := pool.Exec(ctx,
+				`TRUNCATE ingot.upload_intents, ingot.blob_locations, ingot.blob_parks CASCADE`); err != nil {
+				t.Fatalf("truncate: %v", err)
+			}
+			st := registry.NewPostgres(pool)
+			var want []string
+			for _, name := range []string{"tie-a", "tie-b", "tie-c"} {
+				d := evictDigest(t, name)
+				if err := st.PutIntent(ctx, registry.UploadIntent{Digest: d, LocalPath: "/spool/x", Size: 7, State: registry.IntentAccepted}); err != nil {
+					t.Fatalf("PutIntent: %v", err)
+				}
+				if err := st.PutLocation(ctx, registry.BlobLocation{Space: testutil.RandomDID(t), Digest: d, Provider: "did:key:p", URL: "http://p/blob", Size: 7}); err != nil {
+					t.Fatalf("PutLocation: %v", err)
+				}
+				want = append(want, string(d))
+			}
+			if _, err := pool.Exec(ctx, `UPDATE ingot.upload_intents SET updated_at = now()`); err != nil {
+				t.Fatalf("equalize updated_at: %v", err)
+			}
+			slices.Sort(want)
+
+			var got []string
+			var cursor registry.EvictCursor
+			for range len(want) + 1 {
+				page, err := st.ListEvictable(ctx, cursor, 1)
+				if err != nil {
+					t.Fatalf("ListEvictable: %v", err)
+				}
+				if len(page) == 0 {
+					break
+				}
+				got = append(got, string(page[0].Digest))
+				cursor = registry.EvictCursor{UpdatedAt: page[0].UpdatedAt, Digest: page[0].Digest}
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("paged digests = %x, want each once in digest order %x", got, want)
+			}
 		})
 	})
 }

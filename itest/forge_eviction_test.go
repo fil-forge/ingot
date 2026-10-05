@@ -5,6 +5,7 @@ package itest
 import (
 	"bytes"
 	"fmt"
+	"strconv"
 	"testing"
 	"time"
 
@@ -63,8 +64,9 @@ func TestForgeReadAfterEviction(t *testing.T) {
 
 // TestForgeSpoolBudget proves the spool sweeper: with a 4 MiB spool_max_bytes
 // (testdata/config-spoolbudget.yaml), 16 MiB of objects are evicted down to
-// the budget within a few sweeps, and every object then reads back
-// byte-exact, most of them from piri.
+// the budget within a few sweeps, at least 12 of their blobs are marked
+// evicted (so their reads must go to piri), and every object then reads back
+// byte-exact.
 //
 //	go test -tags itest ./itest -run TestForgeSpoolBudget -v -timeout 900s
 func TestForgeSpoolBudget(t *testing.T) {
@@ -103,6 +105,12 @@ func TestForgeSpoolBudget(t *testing.T) {
 			t.Fatalf("spool usage %d bytes still over the %d-byte budget after 2 minutes", used, budget)
 		}
 		time.Sleep(5 * time.Second)
+	}
+	// 16 MiB down to at most 4 MiB leaves room for at most four of the
+	// 1 MiB blobs; the rest are read back from piri below.
+	evicted := ingotSQL(t, ctx, s, `SELECT count(*) FROM ingot.upload_intents WHERE evicted_at IS NOT NULL`)
+	if n, err := strconv.Atoi(evicted); err != nil || n < 12 {
+		t.Fatalf("evicted intents = %q, want at least 12", evicted)
 	}
 
 	for key, want := range objects {

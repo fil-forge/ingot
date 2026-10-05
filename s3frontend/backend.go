@@ -77,11 +77,14 @@ type Backend struct {
 	pendingReleases registry.PendingReleaseStore
 	releaseGrace    time.Duration
 	// Spool eviction knobs (see Deps). spoolSweepMu serialises SweepSpool;
-	// lastOrphanPass is when its orphan pass last ran.
-	spoolMaxBytes  int64
-	spoolOrphanAge time.Duration
-	spoolSweepMu   sync.Mutex
-	lastOrphanPass time.Time
+	// lastOrphanPass is when its orphan pass last ran. spoolSweepBatch
+	// overrides the rows a pass reads per query, for tests; zero takes the
+	// default.
+	spoolMaxBytes   int64
+	spoolOrphanAge  time.Duration
+	spoolSweepMu    sync.Mutex
+	lastOrphanPass  time.Time
+	spoolSweepBatch int
 	// regionKeys unwraps region-wrapped CEKs for the decrypting read path.
 	regionKeys regionkey.Provider
 	// tenantKeys yields the tenant wrap key each write encrypts to (the FEE
