@@ -269,7 +269,7 @@ func TestRefIndex_DeleteReleasesAtZero(t *testing.T) {
 // plaintext halves is stored as two DISTINCT blobs (fresh CEK per piece),
 // each with its own claim, each released exactly once on delete. (The old
 // duplicate-BlobRef double-remove scenario cannot be produced by the write
-// path any more; releaseBlobs still guards it.)
+// path any more; runRelease's claim count still guards it.)
 func TestRefIndex_IdenticalPiecesInOneBody(t *testing.T) {
 	b, mem, rm := newRefTestBackend(t, 1024) // 1 KiB plaintext blob ceiling
 	data := bytes.Repeat([]byte{0x7}, 2048)  // → two identical 1 KiB pieces
