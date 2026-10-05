@@ -2,7 +2,6 @@ package blockstore
 
 import (
 	"bytes"
-	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -23,7 +22,7 @@ func newTestSpool(t *testing.T) *Spool {
 
 func writeTestBlob(t *testing.T, s *Spool, body string) mh.Multihash {
 	t.Helper()
-	digest, _, err := s.WriteBlob(context.Background(), bytes.NewReader([]byte(body)))
+	digest, _, err := s.WriteBlob(t.Context(), bytes.NewReader([]byte(body)))
 	if err != nil {
 		t.Fatalf("WriteBlob: %v", err)
 	}

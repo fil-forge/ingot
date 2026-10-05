@@ -66,9 +66,13 @@ func (b *Backend) SweepSpool(ctx context.Context) (SpoolSweepStats, error) {
 	b.spoolSweepMu.Lock()
 	defer b.spoolSweepMu.Unlock()
 
+	// One reading of the clock dates the whole sweep: the orphan cutoff and
+	// the time the orphan pass is recorded as run. Only the budget pass's
+	// time limit reads it again, as it goes.
+	now := time.Now()
 	var stats SpoolSweepStats
 	if b.spoolMaxBytes > 0 && b.spool.Usage() > b.spoolMaxBytes {
-		deadline := time.Now().Add(spoolBudgetPassTimeLimit)
+		deadline := now.Add(spoolBudgetPassTimeLimit)
 		files, bytes, err := b.evictToBudget(ctx, deadline)
 		stats.BudgetFiles, stats.BudgetBytes = files, bytes
 		if err != nil {
@@ -80,13 +84,13 @@ func (b *Backend) SweepSpool(ctx context.Context) (SpoolSweepStats, error) {
 				zap.Int64("budget", b.spoolMaxBytes))
 		}
 	}
-	if b.lastOrphanPass.IsZero() || time.Since(b.lastOrphanPass) >= spoolOrphanPassInterval {
-		files, bytes, err := b.removeSpoolOrphans(ctx)
+	if b.lastOrphanPass.IsZero() || now.Sub(b.lastOrphanPass) >= spoolOrphanPassInterval {
+		files, bytes, err := b.removeSpoolOrphans(ctx, now)
 		stats.OrphanFiles, stats.OrphanBytes = files, bytes
 		if err != nil {
 			return stats, fmt.Errorf("s3frontend: spool orphan pass: %w", err)
 		}
-		b.lastOrphanPass = time.Now()
+		b.lastOrphanPass = now
 	}
 	return stats, nil
 }
@@ -135,9 +139,9 @@ func (b *Backend) evictToBudget(ctx context.Context, deadline time.Time) (files,
 // its intents were recorded). The age must exceed the longest time one
 // request body takes to stream, because a request records its intents only
 // after its whole body is spooled. Then it resets the usage count from the
-// scan.
-func (b *Backend) removeSpoolOrphans(ctx context.Context) (files, bytes int64, err error) {
-	cutoff := time.Now().Add(-b.spoolOrphanAge)
+// scan. Ages are measured from now, the sweep's time.
+func (b *Backend) removeSpoolOrphans(ctx context.Context, now time.Time) (files, bytes int64, err error) {
+	cutoff := now.Add(-b.spoolOrphanAge)
 	var oldTemps []blockstore.SpoolEntry
 	var oldBlobs []blockstore.SpoolEntry
 	total, err := b.spool.Scan(func(e blockstore.SpoolEntry) {

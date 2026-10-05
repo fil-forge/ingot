@@ -124,7 +124,7 @@ consulted. The deployment context is the
 the S3 facade runs **at the edge**, co-located with a provider's piri or as a
 standalone client — not inside the central upload-service.
 
-`serve` writes every object body to `<data_dir>/spool` before uploading it.
+`serve` writes every object body to `<data_dir>/spool` as it uploads it.
 Set `spool_max_bytes` to bound that directory: a sweeper evicts bodies the
 provider already holds, oldest first, and later reads of them go to the
 provider. Usage can run over the budget by the ingest rate × 30 seconds,

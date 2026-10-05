@@ -275,10 +275,11 @@ digest must be known before `allocate`, and because that local copy does double 
 - **Read cache (optional, recommended):** beyond that floor, the local store serves hot reads
   directly, skipping the indexer→Piri round-trip. Read-after-write retains *recently written* data;
   a cache retains *recently read* data, so the two may use distinct eviction policies over a shared,
-  bounded, size-configurable store. *(Built so far as one byte budget, `spool_max_bytes`, evicting
-  oldest first; separate read-after-write and read-recency windows are not built. See §12.)* The alternative — a near-stateless Ingot that resolves every read
-  through the indexer — trades latency for simpler horizontal scaling; it is a supported mode, but
-  the read-after-write floor holds regardless.
+  bounded, size-configurable store. *(Built so far as one byte budget, `spool_max_bytes`,
+  evicting oldest first; separate read-after-write and read-recency windows are not built. See
+  §12.)* The alternative — a near-stateless Ingot that resolves every read through the indexer —
+  trades latency for simpler horizontal scaling; it is a supported mode, but the read-after-write
+  floor holds regardless.
 
 The `upload_intents` table tracks each in-flight blob: `digest → { local_path, size, state:
 spooled│parked│accepted│published, owner ref }`. It drives read-after-write, cache lookup, and crash
