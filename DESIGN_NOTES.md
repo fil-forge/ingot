@@ -222,14 +222,15 @@ because a release and Complete read them. A read of an evicted blob misses
 locally and goes to the network tier. A file the pass cannot remove is
 logged and skipped. Hourly, with or without a budget, the sweeper also
 deletes `.tmp-*` files and blob files with no intent row older than
-`local_blob_orphan_age` (24 hours), in both directories. Its scans take no
-lock, so writes go on meanwhile; a pass that runs out of time or fails waits
-for the next hour, and checks a large cache in random order so successive
-passes cover all of it. The byte counts need no hourly correction: each
-directory is counted when it opens, and every write, move and removal
-adjusts its count under a lock that the opening count also takes. A move
-holds both directories exclusively, so it never overlaps a removal of the
-same blob. The cache must be on the spool's filesystem, so a move is a
+`local_blob_orphan_age` (24 hours), in both directories: the spool first,
+then the cache, a batch of files at a time. Its scans take no lock, so
+writes go on meanwhile, and a pass that runs out of time or fails waits for
+the next hour. The byte counts are set when each directory opens, and every
+write, move and removal adjusts its count under the directory's lock. A
+move holds both directories exclusively, so it never overlaps a removal of
+the same blob. The hourly scan also corrects a directory's count when no
+change overlapped it, which catches files added or removed outside ingot;
+otherwise those stay miscounted until the next quiet scan or a restart. The cache must be on the spool's filesystem, so a move is a
 rename; startup checks this.
 
 ## Read path

@@ -308,3 +308,63 @@ func TestScanAndCorrect(t *testing.T) {
 		t.Fatalf("[overlapped correction, usage after it, quiet correction, usage after it] = %v, want %v", got, want)
 	}
 }
+
+// TestScanAndCorrectSkipsOverlappedRemovesAndMoves: a removal, or a move into
+// the cache, during the scan stops both affected directories' corrections,
+// even though each count would otherwise be off by the moved blob.
+func TestScanAndCorrectSkipsOverlappedRemovesAndMoves(t *testing.T) {
+	ctx := t.Context()
+	for _, tc := range []struct {
+		name   string
+		change func(*Spool, *BlobCache, mh.Multihash) error
+	}{
+		{"remove", func(s *Spool, _ *BlobCache, d mh.Multihash) error { _, err := s.Remove(d); return err }},
+		{"take", func(s *Spool, c *BlobCache, d mh.Multihash) error { _, err := c.Take(s, d); return err }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, c := newTestDirs(t)
+			gone := writeTestBlob(t, s, "removed by hand")
+			changed := writeTestBlob(t, s, "changed during the scan")
+			if err := os.Remove(s.Path(gone)); err != nil {
+				t.Fatal(err)
+			}
+			var done bool
+			drift, err := s.ScanAndCorrect(ctx, func(BlobFile) {
+				if !done {
+					done = true
+					if err := tc.change(s, c, changed); err != nil {
+						t.Errorf("change: %v", err)
+					}
+				}
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if drift != 0 {
+				t.Fatalf("correction = %d, want none: a change overlapped the scan", drift)
+			}
+		})
+	}
+}
+
+// TestBlobCacheTakeIntoMissingCacheIsAnError: a rename that fails because the
+// cache directory is gone leaves the blob, and its count, in the spool.
+func TestBlobCacheTakeIntoMissingCacheIsAnError(t *testing.T) {
+	s, c := newTestDirs(t)
+	d := writeTestBlob(t, s, "hello")
+	before := s.Usage()
+	if err := os.Remove(c.dir); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Take(s, d); err == nil {
+		t.Fatal("Take into a missing cache directory: want an error")
+	}
+	if got := [2]any{fileExistsAt(s.Path(d)), s.Usage()}; got != [2]any{true, before} {
+		t.Fatalf("[blob in the spool, spool usage] = %v, want [true %d]", got, before)
+	}
+}
+
+func fileExistsAt(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}

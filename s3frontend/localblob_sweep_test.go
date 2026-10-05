@@ -719,3 +719,30 @@ func TestSweepLocalBlobs_OrphanPassCorrectsCountsAfterAManualRemoval(t *testing.
 		t.Fatalf("usage [after the manual removal, after the sweep] = %v, want %v", got, want)
 	}
 }
+
+// TestSweepLocalBlobs_OrphanPassFinishesTheSpoolFirst: a cache scan that fails
+// does not keep the spool's orphans from being removed.
+func TestSweepLocalBlobs_OrphanPassFinishesTheSpoolFirst(t *testing.T) {
+	ctx := t.Context()
+	b, _ := newSweepBackend(t)
+	d, _, err := b.spool.WriteBlob(ctx, bytes.NewReader([]byte("old orphan")))
+	if err != nil {
+		t.Fatalf("WriteBlob: %v", err)
+	}
+	old := time.Now().Add(-2 * DefaultLocalBlobOrphanAge)
+	if err := os.Chtimes(b.spool.Path(d), old, old); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(filepath.Dir(b.cache.Path(d))); err != nil {
+		t.Fatal(err)
+	}
+
+	stats, err := b.SweepLocalBlobs(ctx)
+
+	if err == nil {
+		t.Fatal("SweepLocalBlobs with the cache directory gone: want an error")
+	}
+	if stats.OrphanFiles != 1 || fileExists(b.spool.Path(d)) {
+		t.Fatalf("spool orphan: removed %d files, still on disk %v; want 1 removed", stats.OrphanFiles, fileExists(b.spool.Path(d)))
+	}
+}
