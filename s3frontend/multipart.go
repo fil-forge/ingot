@@ -1167,7 +1167,7 @@ func (b *Backend) parkBlob(ctx context.Context, space did.DID, blob msbucket.Blo
 	if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentParked); err != nil {
 		return fmt.Errorf("mark parked: %w", err)
 	}
-	b.dropParkedCopy(blob.Digest)
+	b.dropParkedCopy(ctx, blob.Digest)
 	return nil
 }
 
@@ -1194,7 +1194,7 @@ func (b *Backend) recordStreamedPark(ctx context.Context, blob msbucket.BlobRef,
 		return fmt.Errorf("mark parked: %w", err)
 	}
 	b.finishStream(ctx, sb)
-	b.dropParkedCopy(blob.Digest)
+	b.dropParkedCopy(ctx, blob.Digest)
 	return nil
 }
 
@@ -1203,10 +1203,17 @@ func (b *Backend) recordStreamedPark(ctx context.Context, blob msbucket.BlobRef,
 // sweeper unwind it through the same row, and the object's reads go to the
 // provider once Complete records the location. The blob is durable on the
 // provider, so a failed remove costs only disk: it is logged, and the file
-// waits for the session's release.
-func (b *Backend) dropParkedCopy(digest mh.Multihash) {
-	if err := b.spool.Remove(digest); err != nil {
-		b.logger.Warn("drop parked blob's spool copy failed; the session's release removes it",
+// waits for the spool sweeper or the session's release. A failure to mark
+// the intent evicted only leaves the sweeper to find the file gone and mark
+// it.
+func (b *Backend) dropParkedCopy(ctx context.Context, digest mh.Multihash) {
+	if _, err := b.spool.Remove(digest); err != nil {
+		b.logger.Warn("drop parked blob's spool copy failed; the spool sweeper or the session's release removes it",
+			zap.String("digest", hex.EncodeToString(digest)), zap.Error(err))
+		return
+	}
+	if err := b.intents.MarkEvicted(ctx, digest); err != nil && !errors.Is(err, registry.ErrNotFound) {
+		b.logger.Warn("mark parked blob evicted failed",
 			zap.String("digest", hex.EncodeToString(digest)), zap.Error(err))
 	}
 }

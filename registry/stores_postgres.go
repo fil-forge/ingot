@@ -404,7 +404,7 @@ func (r *Postgres) ListEvictable(ctx context.Context, after EvictCursor, limit i
 		afterDigest = multihash.Multihash{}
 	}
 	// The state literals match the partial index upload_intents_evictable_idx
-	// (migration 00020); the planner uses it only when the query names the
+	// (migration 00021); the planner uses it only when the query names the
 	// same constants, not parameters.
 	rows, err := r.pool.Query(ctx,
 		`SELECT i.digest, i.local_path, i.size, i.state, i.bucket, i.updated_at

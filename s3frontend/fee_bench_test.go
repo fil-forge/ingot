@@ -153,7 +153,7 @@ func BenchmarkIngest_Full(b *testing.B) {
 				// measurement, and fail rather than let blobs pile up on disk.
 				b.StopTimer()
 				for _, ref := range body.Blobs {
-					if err := env.spool.Remove(ref.Digest); err != nil {
+					if _, err := env.spool.Remove(ref.Digest); err != nil {
 						b.Fatal(err)
 					}
 				}
