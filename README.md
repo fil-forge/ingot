@@ -129,9 +129,10 @@ Set `spool_max_bytes` to bound that directory: a sweeper evicts bodies the
 provider already holds, oldest first, and later reads of them go to the
 provider. The budget counts bodies as they are written, so the sweeper makes
 room for them, but usage can run over it by the ingest rate × 30 seconds,
-plus bodies still being written or uploaded, which cannot be evicted. Without a budget the spool grows with every
-live object's bodies; a deleted object's local copy is freed when its
-release runs, and a multipart part's once it parks on the provider.
+plus bodies still being written or uploaded, which cannot be evicted.
+Without a budget the spool grows with every live object's bodies; a deleted
+object's local copy is freed when its release runs, and a multipart part's
+once it parks on the provider.
 
 `serve` exports OpenTelemetry traces over OTLP/HTTP when
 `OTEL_EXPORTER_OTLP_ENDPOINT` names a collector; with no endpoint, tracing is
