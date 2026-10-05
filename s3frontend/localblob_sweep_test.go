@@ -224,9 +224,10 @@ func TestSweepLocalBlobs_FileAlreadyGoneIsMarkedEvicted(t *testing.T) {
 	}
 }
 
-// TestSweepLocalBlobs_OrphanPass: old .tmp-* files and old blob files with no
-// intent are deleted, in the spool and the cache; young ones, and old files
-// with an intent, stay; the usage count comes to the blob files that remain.
+// TestSweepLocalBlobs_OrphanPass: old .tmp-* files are deleted from the spool
+// and the cache, and old spool blob files with no intent; young ones, old
+// files with an intent, and cached blob files (never checked against intents)
+// stay; the usage count comes to the blob files that remain.
 // A temp file counts only while a live write holds it, so the young one this
 // test wrote by hand does not.
 func TestSweepLocalBlobs_OrphanPass(t *testing.T) {
@@ -300,10 +301,10 @@ func TestSweepLocalBlobs_OrphanPass(t *testing.T) {
 			"old orphan blob":             false,
 			"young orphan blob":           true,
 			"old blob with intent":        true,
-			"old orphan blob in cache":    false,
+			"old orphan blob in cache":    true,
 			"old cached blob with intent": true,
 		},
-		Usage: int64(len("young orphan") + len("old with intent") + len("old cached with intent")),
+		Usage: int64(len("young orphan") + len("old with intent") + len("old cached orphan") + len("old cached with intent")),
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("spool after the orphan pass = %+v, want %+v", got, want)
