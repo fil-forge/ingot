@@ -94,10 +94,10 @@ type Backend struct {
 	// logged that usage is over budget with nothing left to evict, or that an
 	// eviction pass (budget or forced, whichever ran out first) ran out of
 	// time, and cleared when usage falls back to the low watermark, so each
-	// message comes once per episode. lastForcedWarn is when the forced pass last warned that it
-	// evicted inside the retention windows; a forced pass usually brings
-	// usage back under budget, so that warning is limited by time instead.
-	// Guarded by localBlobSweepMu.
+	// message comes once per episode. lastForcedWarn is when the forced pass
+	// last warned that it evicted inside the retention windows; a forced pass
+	// usually brings usage back under budget, so that warning is limited by
+	// time instead. Guarded by localBlobSweepMu.
 	overBudgetWarned bool
 	timeLimitLogged  bool
 	lastForcedWarn   time.Time

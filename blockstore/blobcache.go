@@ -106,7 +106,9 @@ func (c *BlobCache) CheckTake(spool *Spool) error {
 }
 
 // Remove deletes the cached blob, as blobDir.Remove does, and forgets when it
-// was last read, so a removed blob does not hold a recency entry.
+// was last read. A read that opened the file before the removal can record
+// itself after it; that entry holds an LRU slot until it ages out, and keeps
+// the blob a little longer only if the same digest is cached again.
 func (c *BlobCache) Remove(digest mh.Multihash) (int64, error) {
 	freed, err := c.blobDir.Remove(digest)
 	if err == nil {

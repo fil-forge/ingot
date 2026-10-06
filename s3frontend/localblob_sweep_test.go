@@ -755,38 +755,97 @@ func TestSweepLocalBlobs_LatchesResetAtTheLowWatermark(t *testing.T) {
 	}
 }
 
-// TestSweepLocalBlobs_ForcedPassWarnsWhenNothingIsLeft: with a read window
-// set, an exhausted budget pass hands over to the forced pass, which finds
-// nothing either: it warns that nothing is left to evict, but not that it
-// evicted inside the windows.
+// TestSweepLocalBlobs_ForcedPassWarnsWhenNothingIsLeft: the forced pass
+// runs out of rows with usage still over budget, having evicted nothing (the
+// one row's file was already gone): it warns that nothing is left to evict,
+// but not that it evicted inside the windows.
 func TestSweepLocalBlobs_ForcedPassWarnsWhenNothingIsLeft(t *testing.T) {
 	core, logs := observer.New(zap.WarnLevel)
 	b, _ := newSweepBackend(t, func(d *Deps) {
-		d.LocalBlobMaxBytes = 1
-		d.CacheReadRetention = time.Hour
+		d.CacheMinResidency = time.Hour
 		d.Logger = zap.New(core)
 	})
-	if _, _, err := b.spool.WriteBlob(t.Context(), bytes.NewReader([]byte("unevictable"))); err != nil {
-		t.Fatalf("WriteBlob: %v", err)
+	digests := putSweepObjects(t, b, 1)
+	if err := os.Remove(localPath(b, digests[0])); err != nil {
+		t.Fatal(err)
 	}
+	b.localBlobMaxBytes = 1
 	var calls int
 	b.intents = countingEvictable{IntentStore: b.intents, calls: &calls}
 
-	sweepLocalBlobs(t, b)
+	stats := sweepLocalBlobs(t, b)
 
-	got := struct {
+	type sweep struct {
 		Calls               int
+		Forced              int64
 		Warned              bool
 		NothingLeft, Inside int
-	}{calls, b.overBudgetWarned, logs.FilterMessageSnippet("nothing left to evict").Len(), logs.FilterMessageSnippet("inside the retention windows").Len()}
-	want := struct {
-		Calls               int
-		Warned              bool
-		NothingLeft, Inside int
-	}{2, true, 1, 0}
-	if got != want {
-		t.Fatalf("sweep = %+v, want %+v (the budget pass and the forced pass's last stage, one page each)", got, want)
 	}
+	got := sweep{calls, stats.ForcedFiles, b.overBudgetWarned, logs.FilterMessageSnippet("nothing left to evict").Len(), logs.FilterMessageSnippet("inside the retention windows").Len()}
+	// The budget pass stops at the young row; the forced pass marks it and
+	// reads an empty page.
+	if want := (sweep{3, 0, true, 1, 0}); got != want {
+		t.Fatalf("sweep = %+v, want %+v", got, want)
+	}
+}
+
+// TestSweepLocalBlobs_TimeLimitLeavesTheWindowsAlone: a query cut off by a
+// pass's own time limit is the time limit, not a failure. A budget pass that
+// only ran out of time does not hand over to the forced pass; the next sweep
+// continues outside the windows. A forced pass that runs out of time says so.
+func TestSweepLocalBlobs_TimeLimitLeavesTheWindowsAlone(t *testing.T) {
+	cases := []struct {
+		name     string
+		failCall int
+		wantLog  string
+		calls    int
+	}{
+		{"budget pass", 1, "budget pass reached its time limit", 1},
+		{"forced pass", 2, "forced pass reached its time limit", 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			core, logs := observer.New(zap.InfoLevel)
+			b, mem := newSweepBackend(t, func(d *Deps) {
+				d.CacheMinResidency = time.Hour
+				d.Logger = zap.New(core)
+			})
+			digests := putSweepObjects(t, b, 1)
+			b.localBlobMaxBytes = 1
+			var calls int
+			b.intents = timingOutEvictable{IntentStore: b.intents, calls: &calls, failCall: tc.failCall}
+
+			stats := sweepLocalBlobs(t, b)
+
+			type sweep struct {
+				Calls, Logged int
+				Forced        int64
+				Latched       bool
+				Blobs         []blobState
+			}
+			got := sweep{calls, logs.FilterMessageSnippet(tc.wantLog).Len(), stats.ForcedFiles, b.timeLimitLogged, blobStates(t, b, mem, digests)}
+			want := sweep{tc.calls, 1, 0, true, []blobState{{true, false}}}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("sweep = %+v, want %+v", got, want)
+			}
+		})
+	}
+}
+
+// timingOutEvictable fails the failCall'th ListEvictable call as a pass's
+// own time limit would.
+type timingOutEvictable struct {
+	registry.IntentStore
+	calls    *int
+	failCall int
+}
+
+func (f timingOutEvictable) ListEvictable(ctx context.Context, cursor registry.EvictCursor, limit int) ([]registry.UploadIntent, error) {
+	*f.calls++
+	if *f.calls == f.failCall {
+		return nil, context.DeadlineExceeded
+	}
+	return f.IntentStore.ListEvictable(ctx, cursor, limit)
 }
 
 // TestSweepLocalBlobs_ForcedPassRunsOneStageWithoutAReadWindow: with no read
@@ -1075,12 +1134,15 @@ func TestSweepLocalBlobs_ForcedPassStopsAtTheBudget(t *testing.T) {
 	}
 }
 
-// TestSweepLocalBlobs_NoForcedPassWithoutAReadWindow: with no read window, an
-// exhausted budget pass is not followed by a forced pass, which would only
-// repeat it.
-func TestSweepLocalBlobs_NoForcedPassWithoutAReadWindow(t *testing.T) {
+// TestSweepLocalBlobs_NoForcedPassWhenNothingWasSkipped: a budget pass that
+// ran out of rows without passing over any recently read one is not followed
+// by a forced pass, which would only repeat it.
+func TestSweepLocalBlobs_NoForcedPassWhenNothingWasSkipped(t *testing.T) {
 	ctx := t.Context()
-	b, _ := newSweepBackend(t, func(d *Deps) { d.LocalBlobMaxBytes = 1 })
+	b, _ := newSweepBackend(t, func(d *Deps) {
+		d.LocalBlobMaxBytes = 1
+		d.CacheReadRetention = time.Hour
+	})
 	if _, _, err := b.spool.WriteBlob(ctx, bytes.NewReader([]byte("unevictable"))); err != nil {
 		t.Fatalf("WriteBlob: %v", err)
 	}
