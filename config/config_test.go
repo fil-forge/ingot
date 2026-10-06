@@ -150,7 +150,7 @@ func TestServerConfig_LocalBlobKnobs(t *testing.T) {
 		{
 			name:   "defaults",
 			mutate: func(*Config) {},
-			want:   localBlobKnobs{MaxBytes: 0, MinResidency: 10 * time.Minute, ReadRetention: time.Hour, OrphanAge: 24 * time.Hour},
+			want:   localBlobKnobs{MaxBytes: 200_000_000_000, MinResidency: 10 * time.Minute, ReadRetention: time.Hour, OrphanAge: 24 * time.Hour},
 		},
 		{
 			name: "explicit values",

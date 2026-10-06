@@ -255,6 +255,12 @@ func (c Config) ServerConfig() (ServerConfig, error) {
 	if c.LocalBlobMaxBytes < 0 {
 		return ServerConfig{}, fmt.Errorf("ingot: local_blob_max_bytes %d: must not be negative (0 means no budget)", c.LocalBlobMaxBytes)
 	}
+	// FORGE-PERF EXPERIMENT ONLY, NOT FOR MERGE: forge-perf cannot configure
+	// ingot, so an unset budget becomes 200 GB, a tenth of a 2,000 GB run.
+	localBlobMaxBytes := c.LocalBlobMaxBytes
+	if localBlobMaxBytes == 0 {
+		localBlobMaxBytes = 200_000_000_000
+	}
 	// Render the CORS configuration here — the single place it is built —
 	// so a typo fails at startup (via Validate) rather than from New.
 	corsCfg, err := cors.Build(c.CORSAllowedOrigins)
@@ -280,7 +286,7 @@ func (c Config) ServerConfig() (ServerConfig, error) {
 		MultipartSessionTTL: mpTTL,
 		ReleaseGrace:        releaseGrace,
 
-		LocalBlobMaxBytes:  c.LocalBlobMaxBytes,
+		LocalBlobMaxBytes:  localBlobMaxBytes,
 		CacheMinResidency:  cacheMinResidency,
 		CacheReadRetention: cacheReadRetention,
 		LocalBlobOrphanAge: localBlobOrphanAge,

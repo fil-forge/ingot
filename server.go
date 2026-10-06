@@ -417,10 +417,18 @@ func (s *Server) startLocalBlobSweeper() {
 				// Each pass also caps itself; this bounds them together.
 				ctx, cancel := context.WithTimeout(s.sweepCtx, 4*time.Minute)
 				ctx, span := tracing.Start(ctx, "sweep.local_blobs")
+				usageBefore := s.backend.LocalBlobUsage()
 				stats, err := s.backend.SweepLocalBlobs(ctx)
 				span.SetAttributes(attribute.Int64("ingot.sweep.usage_bytes", s.backend.LocalBlobUsage()))
 				s.endSweepSpan(span, err, stats.SpanAttributes()...)
 				cancel()
+				// FORGE-PERF EXPERIMENT ONLY, NOT FOR MERGE: every sweep's
+				// usage, so the run's log shows whether it stayed in budget.
+				s.logger.Info("forge-perf local blob usage",
+					zap.Int64("usage_before_bytes", usageBefore),
+					zap.Int64("usage_after_bytes", s.backend.LocalBlobUsage()),
+					zap.Int64("budget_bytes", s.cfg.LocalBlobMaxBytes),
+					zap.Bool("removed", stats.Removed()))
 				if err != nil && s.sweepCtx.Err() == nil {
 					s.logger.Warn("local blob sweep", zap.Error(err))
 				}
