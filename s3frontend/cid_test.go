@@ -120,3 +120,33 @@ func TestBlake3Attribute(t *testing.T) {
 		}
 	}
 }
+
+// TestBlake3AttributeGating checks that the attribute is built only when
+// requested, and that GetObjectAttributes sets no x-cid header: the header
+// belongs to GET and HEAD, and an attributes response must not change for
+// a client that did not ask for Blake3.
+func TestBlake3AttributeGating(t *testing.T) {
+	b, _, _ := newRefTestBackend(t, 4096)
+	putObj(t, b, "gate", bytes.Repeat([]byte("g"), 50_000))
+	bucket, key := "bk", "gate"
+	rc := &fasthttp.RequestCtx{}
+	res, err := b.GetObjectAttributes(rc, &s3.GetObjectAttributesInput{
+		Bucket: &bucket, Key: &key, ObjectAttributes: []types.ObjectAttributes{types.ObjectAttributesEtag},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Blake3 != nil {
+		t.Fatal("Blake3 built although only ETag was requested")
+	}
+	if res.ETag == nil {
+		t.Fatal("ETag missing")
+	}
+	if got := rc.Response.Header.Peek(cidHeader); len(got) != 0 {
+		t.Fatalf("GetObjectAttributes set %s = %q", cidHeader, got)
+	}
+	res, err = b.GetObjectAttributes(context.Background(), &s3.GetObjectAttributesInput{Bucket: &bucket, Key: &key})
+	if err != nil || res.Blake3 == nil {
+		t.Fatalf("with no attribute list the attribute must be built: %v", err)
+	}
+}

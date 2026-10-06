@@ -952,6 +952,11 @@ erDiagram
         bytea blob_digests "ordered array"
         text checksum
         text state "'accepted' never written"
+        bigint tree_offset "object offset the part's BLAKE3 tree was hashed at (UploadPart's guess)"
+        smallint tree_group "block size of tree_leaves, base-2 exponent; 0 = no tree recorded"
+        bytea tree_nodes "the part's aligned subtrees (blake3tree.EncodeSubtrees)"
+        bytea tree_leaves "the part's leaves at tree_group"
+        bytea tree_root "the part's own BLAKE3 hash, when hashed at offset 0"
     }
     blob_release_intents {
         text space PK

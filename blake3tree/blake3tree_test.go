@@ -475,3 +475,41 @@ func TestAlignedRange(t *testing.T) {
 		}
 	}
 }
+
+// TestOutboardLeaves covers the checks on a client-supplied group and
+// outboard: the group's bounds, and the entry count tying the group to the
+// size in the prefix.
+func TestOutboardLeaves(t *testing.T) {
+	const size = 300_000
+	d := data(size)
+	h, _ := NewHasher(0)
+	h.Write(d)
+	obj := h.FinishObject()
+	outboard := Outboard(obj.Leaves, size)
+
+	if n, err := OutboardLeaves(outboard, obj.GroupLog); err != nil || n != int64(len(obj.Leaves)) {
+		t.Fatalf("OutboardLeaves = %d, %v; want %d", n, err, len(obj.Leaves))
+	}
+	for _, g := range []uint8{obj.GroupLog - 1, obj.GroupLog + 1, MinGroupLog - 1, MaxGroupLog + 1, 63, 64, 200} {
+		if _, err := OutboardLeaves(outboard, g); err == nil {
+			t.Errorf("group %d accepted for an outboard at group %d", g, obj.GroupLog)
+		}
+		if _, err := VerifyBlocks(bytes.NewReader(d), outboard, g, 0, obj.Root); err == nil {
+			t.Errorf("VerifyBlocks accepted group %d", g)
+		}
+	}
+	for _, g := range []uint8{MinGroupLog - 1, 63, 64, 200} {
+		if _, _, err := AlignedRange(0, 10, g, size); err == nil {
+			t.Errorf("AlignedRange accepted group %d", g)
+		}
+	}
+	// A one-leaf body has an empty outboard at any group that holds it in
+	// one block, and a zero-length body in none.
+	small := Outboard([]CV{{1}}, 100)
+	if n, err := OutboardLeaves(small, MinGroupLog); err != nil || n != 1 {
+		t.Fatalf("one leaf: %d, %v", n, err)
+	}
+	if n, err := OutboardLeaves(Outboard(nil, 0), MinGroupLog); err != nil || n != 0 {
+		t.Fatalf("empty body: %d, %v", n, err)
+	}
+}

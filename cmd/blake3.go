@@ -78,9 +78,6 @@ func (f *blake3TreeFlags) load() ([]byte, error) {
 	if (f.outboard == "" && f.outboardPath == "") || f.group == 0 {
 		return nil, errors.New("--group and one of --outboard or --outboard-file are required together")
 	}
-	if f.group < blake3tree.MinGroupLog {
-		return nil, fmt.Errorf("--group %d is below the smallest group %d", f.group, blake3tree.MinGroupLog)
-	}
 	raw, src := []byte(f.outboard), "--outboard"
 	if f.outboardPath != "" {
 		var err error
@@ -95,8 +92,10 @@ func (f *blake3TreeFlags) load() ([]byte, error) {
 	} else if f.outboardPath == "" {
 		return nil, fmt.Errorf("--outboard is not base64: %w", err)
 	}
-	if err := blake3tree.CheckOutboard(outboard); err != nil {
-		return nil, fmt.Errorf("%s: %w", src, err)
+	// The group and the outboard must agree with each other (and the group
+	// must be one a block size can be computed from) before either is used.
+	if _, err := blake3tree.OutboardLeaves(outboard, f.group); err != nil {
+		return nil, fmt.Errorf("%s with --group %d: %w", src, f.group, err)
 	}
 	return outboard, nil
 }

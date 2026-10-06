@@ -784,6 +784,14 @@ CREATE TABLE ingot.multipart_parts (
                       CHECK (state IN ('parked','accepted')),
     created_at    timestamptz NOT NULL DEFAULT now(),
     checksum      text   NOT NULL DEFAULT '',
+    -- The part's BLAKE3 tree, hashed at the object offset UploadPart guessed
+    -- and merged into the object's digest at Complete (see blake3tree).
+    -- tree_nodes NULL / tree_group 0: no tree recorded, Complete re-hashes.
+    tree_offset   bigint NOT NULL DEFAULT 0,
+    tree_group    smallint NOT NULL DEFAULT 0,
+    tree_nodes    bytea,                                 -- aligned subtrees (blake3tree.EncodeSubtrees)
+    tree_leaves   bytea,                                 -- leaves at tree_group
+    tree_root     bytea,                                 -- the part's own hash, when hashed at offset 0
     PRIMARY KEY (upload_id, part_number)
 );
 
