@@ -355,6 +355,149 @@ func TestSweepLocalBlobs_OrphanPass(t *testing.T) {
 	}
 }
 
+// TestRemoveReleasedPublished: a committed blob whose release finished while
+// releases still kept the local copy (published, nothing naming it) loses its
+// intent and its copy, wherever the copy is; one
+// whose copy is already gone loses its intent; a live object's blob keeps
+// both.
+func TestRemoveReleasedPublished(t *testing.T) {
+	ctx := t.Context()
+	b, mem := newSweepBackend(t)
+	live := putSweepObjects(t, b, 1)[0]
+	released := func(body string, where string) (multihash.Multihash, int64) {
+		t.Helper()
+		d, n, err := b.spool.WriteBlob(ctx, bytes.NewReader([]byte(body)))
+		if err != nil {
+			t.Fatalf("WriteBlob: %v", err)
+		}
+		switch where {
+		case "cache":
+			if _, err := b.cache.Take(b.spool, d); err != nil {
+				t.Fatalf("Take: %v", err)
+			}
+		case "gone":
+			if _, err := b.spool.Remove(d); err != nil {
+				t.Fatalf("Remove: %v", err)
+			}
+		}
+		if err := mem.PutIntent(ctx, registry.UploadIntent{Digest: d, LocalPath: localPath(b, d), Size: n, State: registry.IntentPublished}); err != nil {
+			t.Fatalf("PutIntent: %v", err)
+		}
+		return d, n
+	}
+	inCache, cacheBytes := released("a deleted object's cached envelope", "cache")
+	inSpool, spoolBytes := released("a deleted object's spooled envelope", "spool")
+	gone, _ := released("a deleted object's evicted envelope", "gone")
+
+	files, freed, err := b.RemoveReleasedPublished(ctx)
+	if err != nil {
+		t.Fatalf("RemoveReleasedPublished: %v", err)
+	}
+
+	if files != 2 || freed != cacheBytes+spoolBytes {
+		t.Fatalf("released pass removed %d files, %d bytes; want 2 files, %d bytes", files, freed, cacheBytes+spoolBytes)
+	}
+	for _, d := range []multihash.Multihash{inCache, inSpool, gone} {
+		if fileExists(localPath(b, d)) {
+			t.Fatalf("released blob %x's file survived the sweep", d)
+		}
+		if _, err := mem.GetIntent(ctx, d); !errors.Is(err, registry.ErrNotFound) {
+			t.Fatalf("released blob %x's intent: err=%v, want ErrNotFound", d, err)
+		}
+	}
+	if !fileExists(localPath(b, live)) {
+		t.Fatal("live blob's file was removed, want it kept")
+	}
+	if in, err := mem.GetIntent(ctx, live); err != nil || in.State != registry.IntentPublished {
+		t.Fatalf("live blob's intent = %v/%v, want published", in, err)
+	}
+}
+
+// TestSweepLocalBlobs_LeavesReleasedBlobsToTheStartupPass: the sweeper does
+// not remove a released blob's copy; only RemoveReleasedPublished does.
+func TestSweepLocalBlobs_LeavesReleasedBlobsToTheStartupPass(t *testing.T) {
+	ctx := t.Context()
+	b, mem := newSweepBackend(t)
+	d, n, err := b.spool.WriteBlob(ctx, bytes.NewReader([]byte("a deleted object's envelope")))
+	if err != nil {
+		t.Fatalf("WriteBlob: %v", err)
+	}
+	if err := mem.PutIntent(ctx, registry.UploadIntent{Digest: d, LocalPath: localPath(b, d), Size: n, State: registry.IntentPublished}); err != nil {
+		t.Fatalf("PutIntent: %v", err)
+	}
+
+	sweepLocalBlobs(t, b)
+
+	if !fileExists(localPath(b, d)) {
+		t.Fatal("the sweeper removed a released blob's copy, want it left to the startup pass")
+	}
+}
+
+// TestRemoveReleasedPublishedRetriesACopyItCannotRemove: a cached copy that
+// cannot be removed keeps its intent, so the next run finds it again, and the
+// pass pages on past it to the rest; once the copy can go, a rerun removes it.
+func TestRemoveReleasedPublishedRetriesACopyItCannotRemove(t *testing.T) {
+	ctx := t.Context()
+	b, mem := newSweepBackend(t)
+	b.localBlobSweepBatch = 1
+	var digests []multihash.Multihash
+	for i := range 3 {
+		d, n, err := b.spool.WriteBlob(ctx, bytes.NewReader([]byte(fmt.Sprintf("released %d", i))))
+		if err != nil {
+			t.Fatalf("WriteBlob: %v", err)
+		}
+		if err := mem.PutIntent(ctx, registry.UploadIntent{Digest: d, LocalPath: localPath(b, d), Size: n, State: registry.IntentPublished}); err != nil {
+			t.Fatalf("PutIntent: %v", err)
+		}
+		digests = append(digests, d)
+	}
+	// A non-empty directory at the first blob's cache path cannot be removed.
+	if _, err := b.cache.Take(b.spool, digests[0]); err != nil {
+		t.Fatalf("Take: %v", err)
+	}
+	stuck := b.cache.Path(digests[0])
+	if err := os.Remove(stuck); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(stuck, "x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	run := func() {
+		t.Helper()
+		if _, _, err := b.RemoveReleasedPublished(ctx); err != nil {
+			t.Fatalf("RemoveReleasedPublished: %v", err)
+		}
+	}
+	intentKept := func(d multihash.Multihash) bool {
+		t.Helper()
+		_, err := mem.GetIntent(ctx, d)
+		if err != nil && !errors.Is(err, registry.ErrNotFound) {
+			t.Fatalf("GetIntent %x: %v", d, err)
+		}
+		return err == nil
+	}
+
+	run()
+
+	type state struct{ Kept, OnDisk bool }
+	var got []state
+	for _, d := range digests {
+		got = append(got, state{intentKept(d), fileExists(localPath(b, d))})
+	}
+	if want := []state{{true, true}, {false, false}, {false, false}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("after the first run = %+v, want %+v", got, want)
+	}
+
+	if err := os.RemoveAll(filepath.Join(stuck, "x")); err != nil {
+		t.Fatal(err)
+	}
+	run()
+
+	if intentKept(digests[0]) || fileExists(stuck) {
+		t.Fatalf("after the rerun: intent kept %v, copy on disk %v; want neither", intentKept(digests[0]), fileExists(stuck))
+	}
+}
+
 // TestSweepLocalBlobs_PagesThroughEvictableRows: a budget pass that needs more
 // rows than one query returns pages on, oldest first.
 func TestSweepLocalBlobs_PagesThroughEvictableRows(t *testing.T) {

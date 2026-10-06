@@ -321,6 +321,68 @@ func (m *MemStore) IsEvicted(digest multihash.Multihash) bool {
 	return ok
 }
 
+func (m *MemStore) ListReleasedPublished(_ context.Context, after multihash.Multihash, limit int) ([]registry.UploadIntent, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []registry.UploadIntent
+	for key, in := range m.intents {
+		if bytes.Compare(in.Digest, after) <= 0 || !m.releasedPublishedLocked(key, in) {
+			continue
+		}
+		cp := in
+		cp.Digest = bytes.Clone(in.Digest)
+		out = append(out, cp)
+	}
+	sort.Slice(out, func(i, j int) bool { return bytes.Compare(out[i].Digest, out[j].Digest) < 0 })
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+func (m *MemStore) DeleteReleasedPublished(_ context.Context, digest multihash.Multihash) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := string(digest)
+	in, ok := m.intents[key]
+	if !ok || !m.releasedPublishedLocked(key, in) {
+		return false, nil
+	}
+	delete(m.intents, key)
+	delete(m.evicted, key)
+	return true, nil
+}
+
+// releasedPublishedLocked is ListReleasedPublished's condition: a published
+// intent nothing names any more.
+func (m *MemStore) releasedPublishedLocked(key string, in registry.UploadIntent) bool {
+	return in.State == registry.IntentPublished && !m.locatedLocked(in.Digest) &&
+		!m.claimedAnywhereLocked(key) && !m.releasePendingAnywhereLocked(key) &&
+		m.countLivePartRefsLocked(in.Digest) == 0
+}
+
+// claimedAnywhereLocked reports whether any blob_refs row, in any space,
+// names the digest.
+func (m *MemStore) claimedAnywhereLocked(digest string) bool {
+	for k := range m.blobRefs {
+		if k.digest == digest {
+			return true
+		}
+	}
+	return false
+}
+
+// releasePendingAnywhereLocked reports whether a release of the digest is
+// pending in any space.
+func (m *MemStore) releasePendingAnywhereLocked(digest string) bool {
+	for k := range m.releases {
+		if k.digest == digest {
+			return true
+		}
+	}
+	return false
+}
+
 // AgeIntent moves the intent's last state change back by d, as if it had
 // happened that much earlier. Test-only: no store method rewrites history.
 func (m *MemStore) AgeIntent(digest multihash.Multihash, d time.Duration) {
@@ -651,6 +713,10 @@ func (m *MemStore) ListStaleSessions(_ context.Context, state string, cutoff tim
 func (m *MemStore) CountLivePartRefs(_ context.Context, digest multihash.Multihash) (int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.countLivePartRefsLocked(digest), nil
+}
+
+func (m *MemStore) countLivePartRefsLocked(digest multihash.Multihash) int {
 	n := 0
 	for uploadID, byNum := range m.parts {
 		s, ok := m.sessions[uploadID]
@@ -666,7 +732,7 @@ func (m *MemStore) CountLivePartRefs(_ context.Context, digest multihash.Multiha
 			}
 		}
 	}
-	return n, nil
+	return n
 }
 
 func (m *MemStore) CountPartRefs(_ context.Context, digest multihash.Multihash, excludeUploadID string) (int, error) {

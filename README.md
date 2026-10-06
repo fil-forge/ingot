@@ -179,10 +179,12 @@ long the provider keeps parked allocations. The TTL counts from the
 session's last state change, and a failed Complete returns the session to
 open, which restarts it, so a part can outlive the TTL. The budget is off by default
 (`local_blob_max_bytes: 0`): without it the cache grows with every live
-object's bodies. With or without a budget, the sweeper also deletes, hourly,
-unfinished `.tmp-*` writes in either directory and spool files with no
-upload intent, once they are older than `local_blob_orphan_age` (default
-`24h`, at least `1h`).
+object's bodies. With or without a budget, the sweeper also deletes, at
+startup and then hourly, unfinished `.tmp-*` writes in either directory and
+spool files with no upload intent, once they are older than
+`local_blob_orphan_age` (default `24h`, at least `1h`). Once at each
+startup, `serve` also deletes the copies of objects deleted by a version of
+ingot that kept them.
 
 **Sizing.** The filesystem needs room for:
 

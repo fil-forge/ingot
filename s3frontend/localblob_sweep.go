@@ -411,6 +411,58 @@ func (b *Backend) evictToBudget(ctx context.Context, deadline time.Time, r reten
 	return pass, nil
 }
 
+// RemoveReleasedPublished deletes the local copy and then the intent of every
+// committed blob nothing names any more: one whose release finished while
+// releases still kept both (registry.IntentStore.ListReleasedPublished). No
+// release leaves such a blob now, so a node needs this once, after upgrading;
+// the daemon runs it at startup, until it finds nothing. It pages through the
+// candidates by digest, a batch at a time, with no time limit of its own. The
+// file goes first, so the intent stays as the marker of a copy still to
+// remove: a copy it cannot remove keeps its intent, and so does one whose
+// removal a stop interrupted, and the next startup tries again. (Nothing else
+// would find a cached copy without an intent.) The intent is then deleted only
+// if it still qualifies (registry.IntentStore.DeleteReleasedPublished). A
+// digest named again between the listing and the file's removal would lose its
+// local copy; every write encrypts under a fresh key and so has a digest of its
+// own, so that should not happen. The failures are logged once, naming the
+// first, and only a failed query ends the pass. It runs beside the sweeper: the budget pass evicts only blobs with
+// a location, which these have not, and a spool file the orphan pass reaches
+// first is counted by whichever removal finds it.
+func (b *Backend) RemoveReleasedPublished(ctx context.Context) (files, bytes int64, err error) {
+	var failed removeFailures
+	defer failed.log(b.logger, "released")
+	defer func() { b.localBlobMetrics.removed(ctx, removedReleased, files, bytes) }()
+	batch := b.localBlobSweepBatch
+	if batch <= 0 {
+		batch = localBlobSweepBatch
+	}
+	var after multihash.Multihash
+	for {
+		page, err := b.intents.ListReleasedPublished(ctx, after, batch)
+		if err != nil {
+			return files, bytes, err
+		}
+		for _, in := range page {
+			after = in.Digest
+			freed, err := b.removeLocal(in.Digest)
+			if freed > 0 {
+				files++
+				bytes += freed
+			}
+			if err != nil {
+				failed.add(hex.EncodeToString(in.Digest), err)
+				continue
+			}
+			if _, err := b.intents.DeleteReleasedPublished(ctx, in.Digest); err != nil {
+				return files, bytes, fmt.Errorf("delete released intent %s: %w", hex.EncodeToString(in.Digest), err)
+			}
+		}
+		if len(page) < batch {
+			return files, bytes, nil
+		}
+	}
+}
+
 // removeOrphans deletes the files no intent-driven cleanup can find, once they
 // are older than the orphan age: .tmp-* files from a write that never finished,
 // in the spool and the cache, and spool blob files with no intent row (a split
