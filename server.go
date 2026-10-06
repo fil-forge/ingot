@@ -431,9 +431,10 @@ func (s *Server) startLocalBlobSweeper() {
 	})
 }
 
-// startReleasedPass removes, once, the local copies and intents that releases
-// kept before they freed local disk (see Backend.RemoveReleasedPublished). It
-// runs until it finds nothing, or until Stop.
+// startReleasedPass removes the local copies and intents that releases kept
+// before they freed local disk (see Backend.RemoveReleasedPublished). It runs
+// at every startup, until it has gone through every candidate or Stop
+// cancels it; on a node with none it is one scan.
 func (s *Server) startReleasedPass() {
 	s.goSweep(func() {
 		files, bytes, err := s.backend.RemoveReleasedPublished(s.sweepCtx)

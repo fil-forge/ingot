@@ -414,8 +414,9 @@ func (b *Backend) evictToBudget(ctx context.Context, deadline time.Time, r reten
 // RemoveReleasedPublished deletes the local copy and then the intent of every
 // committed blob nothing names any more: one whose release finished while
 // releases still kept both (registry.IntentStore.ListReleasedPublished). No
-// release leaves such a blob now, so a node needs this once, after upgrading;
-// the daemon runs it at startup, until it finds nothing. It pages through the
+// release leaves such a blob now, so only a node upgraded from that version
+// has any; the daemon still runs this at every startup, where on a clean node
+// it scans the published intents and finds nothing. It pages through the
 // candidates by digest, a batch at a time, with no time limit of its own. The
 // file goes first, so the intent stays as the marker of a copy still to
 // remove: a copy it cannot remove keeps its intent, and so does one whose
@@ -425,9 +426,10 @@ func (b *Backend) evictToBudget(ctx context.Context, deadline time.Time, r reten
 // digest named again between the listing and the file's removal would lose its
 // local copy; every write encrypts under a fresh key and so has a digest of its
 // own, so that should not happen. The failures are logged once, naming the
-// first, and only a failed query ends the pass. It runs beside the sweeper: the budget pass evicts only blobs with
-// a location, which these have not, and a spool file the orphan pass reaches
-// first is counted by whichever removal finds it.
+// first, and only a failed query ends the pass. It runs beside the sweeper:
+// the budget pass evicts only blobs with a location, which these have not,
+// and a spool file the orphan pass reaches first is counted by whichever
+// removal finds it.
 func (b *Backend) RemoveReleasedPublished(ctx context.Context) (files, bytes int64, err error) {
 	var failed removeFailures
 	defer failed.log(b.logger, "released")
