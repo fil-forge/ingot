@@ -212,7 +212,8 @@ path or string-encoded UCAN container, required alongside the URL and
 validated at startup down to holding at least one delegation),
 `TokenStoreDir` (→
 `DataDir`), `MultipartSessionTTL` (0 → 7d, negative → sweeper off),
-`LocalBlobMaxBytes` (0 → no budget for the spool and cache together) and
+`LocalBlobMaxBytes` (0 → no budget for the spool and cache together) with
+`CacheMinResidency` (10m), `CacheReadRetention` (1h) and
 `LocalBlobOrphanAge` (24h, ≥ 1h) for the local blob sweeper
 (`s3frontend.SweepLocalBlobs`),
 `CORSAllowedOrigins`, `LogLevel`. `Config.ServerConfig()` is the single

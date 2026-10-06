@@ -277,10 +277,11 @@ digest must be known before `allocate`, and because that local copy does double 
   a cache retains *recently read* data, so the two may use distinct eviction policies over a shared,
   bounded, size-configurable store. *(Built as two directories, a spool for writes and bodies
   awaiting upload and a cache for copies the provider holds, under one byte budget,
-  `local_blob_max_bytes`, evicting blobs the provider holds, oldest first; separate read-after-write and
-  read-recency windows are not built. See §12.)* The alternative — a near-stateless Ingot that resolves every read through the indexer —
-  trades latency for simpler horizontal scaling; it is a supported mode, but the read-after-write
-  floor holds regardless.
+  `local_blob_max_bytes`, evicting blobs the provider holds, oldest first, with a read-after-write
+  window, `cache_min_residency`, and a read-recency window, `cache_read_retention`; see §12.)* The
+  alternative — a near-stateless Ingot that resolves every read through the indexer — trades
+  latency for simpler horizontal scaling; it is a supported mode, but the read-after-write floor
+  holds regardless.
 
 The `upload_intents` table tracks each in-flight blob: `digest → { local_path, size, state:
 spooled│parked│accepted│published, owner ref }`. It drives read-after-write, cache lookup, and crash
@@ -887,14 +888,16 @@ paths below are exercised against the real stack by the smelt-based `itest/` har
   retention-retired catalog blocks resolve via `shard_inclusions` (#44) — the read paths of
   [§7.4](#74-read-getobject) / [§8](#8-retrieval-addressing-when-bodies-need-a-sharded-dag-index).
   **Local blob storage is split by role and bounded by a byte budget.** A body is written to the
-  spool (`<data_dir>/spool`) and moves to the cache (`<data_dir>/cache`) once the provider holds
-  it. With `local_blob_max_bytes` set (`SweepLocalBlobs`), every 30s the sweeper evicts blobs the
-  provider holds (a location or park row), oldest first, down to 90% of the budget; hourly it
-  deletes orphan files. The budget is off by default. A release frees a deleted object's local
-  copies, and a parked part's copy goes once it parks. Local blob storage reports its usage by
-  directory, budget, stalled uploads, removals by reason and reads by tier as OpenTelemetry
-  metrics (`ingot.local_blobs.*`). Still open under #48: there is no write-through mode, and
-  nothing reclaims a failed upload's body.
+  spool (`<data_dir>/spool`) and moves to the cache (`<data_dir>/cache`) once the provider holds it.
+  With `local_blob_max_bytes` set (`SweepLocalBlobs`), every 30s the sweeper evicts blobs the
+  provider holds (a location or park row), oldest first, down to 90% of the budget, honouring a
+  read-after-write window (`cache_min_residency`) and a read-recency window (`cache_read_retention`)
+  unless usage stays over budget, in which case it evicts inside them, only down to the budget;
+  hourly it deletes orphan files. The budget is off by default. A release frees a deleted object's
+  local copies, and a parked part's copy goes once it parks. Local blob storage reports its usage by
+  directory, budget, stalled uploads, removals by reason and reads by tier as OpenTelemetry metrics
+  (`ingot.local_blobs.*`). Still open under #48: there is no write-through mode, and nothing
+  reclaims a failed upload's body.
 - **Multipart parts park at UploadPart, accept at Complete.** (Built: `parkBlobs`/`concludeBlobs`
   over the `blob_parks` table.) A parked part holds no local bytes: its spool copy is removed once
   it parks, and Complete concludes it from its park row. Abort and session expiry unwind parked

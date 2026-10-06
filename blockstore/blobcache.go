@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/fil-forge/ucantone/did"
 	block "github.com/ipfs/go-block-format"
@@ -23,11 +24,14 @@ import (
 // is undecided and unbuilt, not ruled out.
 //
 // Like the Spool, it holds no policy: it knows a blob only as bytes under a
-// digest, and the S3 layer decides what to remove. At most one BlobCache may
-// use a directory at a time. Its directory must be on the Spool's filesystem,
-// so Take is a rename.
+// digest, and the S3 layer decides what to remove. Besides the files and their
+// byte count, it remembers in memory when each blob was last read from it,
+// which the S3 layer's eviction consults. At most one BlobCache may use a
+// directory at a time. Its directory must be on the Spool's filesystem, so
+// Take is a rename.
 type BlobCache struct {
 	*blobDir
+	reads *recencyMap
 }
 
 // NewBlobCache opens (creating if needed) a cache rooted at dir and counts its
@@ -40,7 +44,43 @@ func NewBlobCache(dir string) (*BlobCache, error) {
 	if err := d.count(func(BlobFile) {}); err != nil {
 		return nil, err
 	}
-	return &BlobCache{blobDir: d}, nil
+	return &BlobCache{blobDir: d, reads: newRecencyMap(recencyCapacity)}, nil
+}
+
+// LastRead reports when the blob with the given digest was last served from
+// the cache by this process, if it is still remembered.
+func (c *BlobCache) LastRead(digest mh.Multihash) (time.Time, bool) {
+	return c.reads.get(string(digest))
+}
+
+// OpenBlob streams the cached blob, or returns ErrNotFound, and records the
+// read.
+func (c *BlobCache) OpenBlob(ctx context.Context, space did.DID, digest mh.Multihash) (io.ReadCloser, error) {
+	rc, err := c.blobDir.OpenBlob(ctx, space, digest)
+	if err == nil {
+		c.reads.touch(string(digest), time.Now())
+	}
+	return rc, err
+}
+
+// OpenBlobRange streams stored bytes [start, end] of the cached blob, or
+// returns ErrNotFound, and records the read.
+func (c *BlobCache) OpenBlobRange(ctx context.Context, space did.DID, digest mh.Multihash, start, end int64) (io.ReadCloser, error) {
+	rc, err := c.blobDir.OpenBlobRange(ctx, space, digest, start, end)
+	if err == nil {
+		c.reads.touch(string(digest), time.Now())
+	}
+	return rc, err
+}
+
+// GetBlock reads the cached blob stored under cid's multihash, or returns
+// ErrNotFound, and records the read.
+func (c *BlobCache) GetBlock(ctx context.Context, space did.DID, k cid.Cid) (block.Block, error) {
+	b, err := c.blobDir.GetBlock(ctx, space, k)
+	if err == nil {
+		c.reads.touch(string(k.Hash()), time.Now())
+	}
+	return b, err
 }
 
 // CheckTake confirms that Take can move blobs from spool into the cache, which
@@ -63,6 +103,18 @@ func (c *BlobCache) CheckTake(spool *Spool) error {
 		return fmt.Errorf("blockstore: cache probe: %w", err)
 	}
 	return nil
+}
+
+// Remove deletes the cached blob, as blobDir.Remove does, and forgets when it
+// was last read. A read that opened the file before the removal can record
+// itself after it; that entry holds an LRU slot until it ages out, and keeps
+// the blob a little longer only if the same digest is cached again.
+func (c *BlobCache) Remove(digest mh.Multihash) (int64, error) {
+	freed, err := c.blobDir.Remove(digest)
+	if err == nil {
+		c.reads.forget(string(digest))
+	}
+	return freed, err
 }
 
 // Usage returns the byte count of the cache's blob files.
@@ -122,15 +174,22 @@ type LocalBlobs struct {
 	Spool *Spool
 }
 
+// localTier is what LocalBlobs reads from each directory.
+type localTier interface {
+	BlockReader
+	BlobReader
+	BlobRangeReader
+}
+
 // OpenBlob streams the blob from local disk, or returns ErrNotFound.
 func (l LocalBlobs) OpenBlob(ctx context.Context, space did.DID, digest mh.Multihash) (io.ReadCloser, error) {
-	return localLookup(func(d *blobDir) (io.ReadCloser, error) { return d.OpenBlob(ctx, space, digest) }, l)
+	return localLookup(func(d localTier) (io.ReadCloser, error) { return d.OpenBlob(ctx, space, digest) }, l)
 }
 
 // OpenBlobRange streams stored bytes [start, end] of the blob from local disk,
 // or returns ErrNotFound.
 func (l LocalBlobs) OpenBlobRange(ctx context.Context, space did.DID, digest mh.Multihash, start, end int64) (io.ReadCloser, error) {
-	return localLookup(func(d *blobDir) (io.ReadCloser, error) {
+	return localLookup(func(d localTier) (io.ReadCloser, error) {
 		return d.OpenBlobRange(ctx, space, digest, start, end)
 	}, l)
 }
@@ -138,15 +197,15 @@ func (l LocalBlobs) OpenBlobRange(ctx context.Context, space did.DID, digest mh.
 // GetBlock reads the blob stored under c's multihash from local disk, or
 // returns ErrNotFound.
 func (l LocalBlobs) GetBlock(ctx context.Context, space did.DID, c cid.Cid) (block.Block, error) {
-	return localLookup(func(d *blobDir) (block.Block, error) { return d.GetBlock(ctx, space, c) }, l)
+	return localLookup(func(d localTier) (block.Block, error) { return d.GetBlock(ctx, space, c) }, l)
 }
 
 // localLookup tries the cache, the spool, then the cache again. A block that
 // is never local, such as a catalog block on its way to the log, costs three
 // failed opens.
-func localLookup[T any](get func(*blobDir) (T, error), l LocalBlobs) (T, error) {
+func localLookup[T any](get func(localTier) (T, error), l LocalBlobs) (T, error) {
 	var zero T
-	for _, d := range []*blobDir{l.Cache.blobDir, l.Spool.blobDir, l.Cache.blobDir} {
+	for _, d := range []localTier{l.Cache, l.Spool, l.Cache} {
 		v, err := get(d)
 		if err == nil {
 			return v, nil

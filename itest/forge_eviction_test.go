@@ -63,8 +63,9 @@ func TestForgeReadAfterEviction(t *testing.T) {
 }
 
 // TestForgeLocalBlobBudget proves the local blob sweeper: with a 4 MiB
-// local_blob_max_bytes (testdata/config-localblobbudget.yaml), 16 MiB of
-// objects are evicted down to the budget within a few sweeps, at least 12 of their blobs are marked
+// local_blob_max_bytes and both retention windows off
+// (testdata/config-localblobbudget.yaml), 16 MiB of objects are evicted down
+// to the budget within a few sweeps, at least 12 of their blobs are marked
 // evicted (so their reads must go to piri), and every object then reads back
 // byte-exact.
 //

@@ -118,6 +118,18 @@ type Config struct {
 	// younger than LocalBlobOrphanAge). 0 → no budget (the default); negative
 	// is an error.
 	LocalBlobMaxBytes int64 `mapstructure:"local_blob_max_bytes" yaml:"local_blob_max_bytes"`
+	// CacheMinResidency is the read-after-write window (Go duration string):
+	// the sweeper leaves alone a cached blob whose upload state changed less
+	// than this long ago (for a committed blob, its commit time) unless usage
+	// stays over budget without it. Costs ingest rate × residency in disk.
+	// Empty → default 10m; "0s" turns it off; negative is an error.
+	CacheMinResidency string `mapstructure:"cache_min_residency" yaml:"cache_min_residency"`
+	// CacheReadRetention is the read-cache window (Go duration string): the
+	// sweeper leaves alone a blob served from the cache within this long,
+	// unless usage stays over budget without it. Reads are remembered in
+	// memory, for a bounded number of blobs, and forgotten on restart. Empty
+	// → default 1h; "0s" turns it off; negative is an error.
+	CacheReadRetention string `mapstructure:"cache_read_retention" yaml:"cache_read_retention"`
 	// LocalBlobOrphanAge is the age (file modification time) at which the
 	// sweeper deletes a .tmp-* file in the spool or the cache, or a spool blob
 	// file with no upload intent (Go duration string), hourly, whether or not a
@@ -207,6 +219,14 @@ func (c Config) ServerConfig() (ServerConfig, error) {
 			releaseGrace = 0
 		}
 	}
+	cacheMinResidency, err := parseDurationKnob("cache_min_residency", c.CacheMinResidency, 10*time.Minute)
+	if err != nil {
+		return ServerConfig{}, err
+	}
+	cacheReadRetention, err := parseDurationKnob("cache_read_retention", c.CacheReadRetention, time.Hour)
+	if err != nil {
+		return ServerConfig{}, err
+	}
 	localBlobOrphanAge, err := parseDurationKnob("local_blob_orphan_age", c.LocalBlobOrphanAge, 24*time.Hour)
 	if err != nil {
 		return ServerConfig{}, err
@@ -243,6 +263,8 @@ func (c Config) ServerConfig() (ServerConfig, error) {
 		ReleaseGrace:        releaseGrace,
 
 		LocalBlobMaxBytes:  c.LocalBlobMaxBytes,
+		CacheMinResidency:  cacheMinResidency,
+		CacheReadRetention: cacheReadRetention,
 		LocalBlobOrphanAge: localBlobOrphanAge,
 	}, nil
 }

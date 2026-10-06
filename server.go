@@ -230,6 +230,8 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		ReleaseGrace:    cfg.ReleaseGrace,
 
 		LocalBlobMaxBytes:  cfg.LocalBlobMaxBytes,
+		CacheMinResidency:  cfg.CacheMinResidency,
+		CacheReadRetention: cfg.CacheReadRetention,
 		LocalBlobOrphanAge: cfg.LocalBlobOrphanAge,
 
 		MaxBlobSize: cfg.MaxBlobSize,
@@ -393,8 +395,8 @@ func (s *Server) startLocalBlobSweeper() {
 			case <-stop:
 				return
 			case <-ticker.C:
-				// Each pass also caps itself; this bounds the two together.
-				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+				// Each pass also caps itself; this bounds them together.
+				ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 				stats, err := s.backend.SweepLocalBlobs(ctx)
 				cancel()
 				if err != nil {

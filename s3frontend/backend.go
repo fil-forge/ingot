@@ -85,16 +85,23 @@ type Backend struct {
 	// localBlobSweepBatch overrides the rows a pass reads per query, for
 	// tests; zero takes the default.
 	localBlobMaxBytes   int64
+	cacheMinResidency   time.Duration
+	cacheReadRetention  time.Duration
 	localBlobOrphanAge  time.Duration
 	localBlobSweepMu    sync.Mutex
 	lastOrphanPass      time.Time
 	localBlobSweepBatch int
 	// overBudgetWarned and timeLimitLogged are set once the sweeper has
-	// logged that usage is over budget with nothing left to evict, or that
-	// the budget pass ran out of time, and cleared when usage is back under,
-	// so each message comes once per episode. Guarded by localBlobSweepMu.
+	// logged that usage is over budget with nothing left to evict, or that an
+	// eviction pass (budget or forced, whichever ran out first) ran out of
+	// time, and cleared when usage falls back to the low watermark, so each
+	// message comes once per episode. lastForcedWarn is when the forced pass
+	// last warned that it evicted inside the retention windows; a forced pass
+	// usually brings usage back under budget, so that warning is limited by
+	// time instead. Guarded by localBlobSweepMu.
 	overBudgetWarned bool
 	timeLimitLogged  bool
+	lastForcedWarn   time.Time
 	// stalledBytes is the sweeper's latest sum of stalled uploads (see
 	// SweepLocalBlobs), read by the stalled_bytes gauge; stalledKnown is set
 	// once a sweep has computed it.
@@ -192,9 +199,19 @@ type Deps struct {
 
 	// LocalBlobMaxBytes is the byte budget for the spool and the cache
 	// together, writes in progress included, enforced by SweepLocalBlobs.
-	// Zero turns the budget pass off: eviction needs a network read tier to
-	// serve evicted blobs, which the in-memory fakes do not have.
+	// Zero turns the budget and forced passes off: eviction needs a network
+	// read tier to serve evicted blobs, which the in-memory fakes do not
+	// have.
 	LocalBlobMaxBytes int64
+	// CacheMinResidency is how long after its last state change (for a
+	// committed blob, its commit) the budget pass leaves a blob alone, so a
+	// client reading back what it just wrote reads from local disk. Zero
+	// turns it off.
+	CacheMinResidency time.Duration
+	// CacheReadRetention is how long after a read from the cache the budget
+	// pass leaves a blob alone, so objects read repeatedly stay local. Zero
+	// turns it off.
+	CacheReadRetention time.Duration
 	// LocalBlobOrphanAge is the age at which SweepLocalBlobs deletes a .tmp-*
 	// file in either directory, or a spool blob file with no intent row. Zero →
 	// DefaultLocalBlobOrphanAge.
@@ -268,6 +285,8 @@ func New(d Deps) *Backend {
 		releaseGrace:    d.ReleaseGrace,
 
 		localBlobMaxBytes:  d.LocalBlobMaxBytes,
+		cacheMinResidency:  d.CacheMinResidency,
+		cacheReadRetention: d.CacheReadRetention,
 		localBlobOrphanAge: localBlobOrphanAge,
 
 		logger:      logger,

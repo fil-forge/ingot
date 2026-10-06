@@ -58,10 +58,15 @@ type ServerConfig struct {
 
 	// LocalBlobMaxBytes is the byte budget for the spool and the cache
 	// together, writes in progress included, enforced by the local blob
-	// sweeper; zero means no budget. LocalBlobOrphanAge is the age at which
-	// the sweeper deletes files no upload intent names; zero → 24h.
-	// Config.ServerConfig() applies the defaults documented on Config.
+	// sweeper; zero means no budget. CacheMinResidency and
+	// CacheReadRetention are the read-after-write and read-cache windows the
+	// sweeper honours while it can; zero turns each off. LocalBlobOrphanAge
+	// is the age at which the sweeper deletes files no upload intent names;
+	// zero → 24h. Config.ServerConfig() applies the defaults documented on
+	// Config.
 	LocalBlobMaxBytes  int64
+	CacheMinResidency  time.Duration
+	CacheReadRetention time.Duration
 	LocalBlobOrphanAge time.Duration
 
 	// CORSConfig is the S3 CORS configuration the backend reports for

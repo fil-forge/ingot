@@ -156,6 +156,19 @@ A cached copy is not needed, so it goes:
   first, down to 90% of the budget. Later reads of an evicted body go to the
   provider and take provider-read latency.
 
+Two windows keep cached bodies local while the budget allows:
+`cache_min_residency` (default `10m`) passes over bodies whose upload
+changed state that recently (for a committed object, its commit), so a
+client reading back what it just wrote reads from disk, and
+`cache_read_retention` (default `1h`) passes over bodies read from the cache
+that recently (remembered in memory for up to 65,536 bodies, and forgotten
+on restart). If usage is still over budget after that, the sweeper evicts
+inside the windows, since a full disk fails every write, but only down to
+the budget: first bodies inside `cache_min_residency` that no one has read
+recently, then, only if that is not enough, recently read ones too. It warns
+at most once an hour when it does; the `budget_forced` removals count each
+time. `0s` turns either window off.
+
 A multipart part's copy goes from the spool as soon as the part parks on its
 provider. The budget is off by default (`local_blob_max_bytes: 0`): without
 it the cache grows with every live object's bodies. With or without a
@@ -166,7 +179,13 @@ than `local_blob_orphan_age` (default `24h`, at least `1h`).
 **Sizing.** The filesystem needs room for:
 
 - `local_blob_max_bytes`, plus 10% headroom that must exceed the ingest rate
-  × 30 seconds (60 GB at 2 GB/s);
+  × 30 seconds (60 GB at 2 GB/s). To evict outside `cache_min_residency`,
+  the budget must also exceed the ingest rate × the window (1.2 TB at 2 GB/s
+  for the default `10m`); below that, sweeps evict inside the window, and
+  warn at most once an hour. Likewise, to keep recently read bodies, it must
+  exceed the bodies read within `cache_read_retention` (up to 65,536 of them,
+  each up to `max_blob_size`); a read working set bigger than the budget is
+  evicted inside the window every sweep;
 - the spool's bodies in flight, when they outgrow the budget: each
   concurrent PUT or UploadPart writes its body as it streams, and a part can
   be up to 5 GiB. The budget counts those bytes as they land, so the sweeper
@@ -187,7 +206,7 @@ than `local_blob_orphan_age` (default `24h`, at least `1h`).
 | `ingot.local_blobs.usage` | Bytes held, by `dir`: `spool` (writes in progress and bodies awaiting upload, which eviction cannot touch) or `cache` |
 | `ingot.local_blobs.budget` | `local_blob_max_bytes` (0: no budget) |
 | `ingot.local_blobs.stalled_bytes` | Bytes of bodies whose upload has stalled: intents still `spooled` or `uploading` an hour after their last state change, which nothing reclaims yet. Growth means uploads are failing |
-| `ingot.local_blobs.removals`, `ingot.local_blobs.removed_bytes` | Files and bytes removed, by `reason`: `released`, `parked`, `budget`, `orphan` |
+| `ingot.local_blobs.removals`, `ingot.local_blobs.removed_bytes` | Files and bytes removed, by `reason`: `released`, `parked`, `budget`, `budget_forced` (inside a retention window), `orphan` |
 | `ingot.local_blobs.reads` | Body-blob reads, by `tier`: `local` or `network` (the local hit ratio) |
 
 **Manual cleanup.** Every file in `<data_dir>/cache` is safe to delete: the

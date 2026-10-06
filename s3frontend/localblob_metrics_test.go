@@ -126,6 +126,25 @@ func TestLocalBlobMetrics_Release(t *testing.T) {
 	}
 }
 
+func TestLocalBlobMetrics_ForcedPass(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	b, _ := newSweepBackend(t, meteredBackend(reader), func(d *Deps) { d.CacheMinResidency = time.Hour })
+	digests := putSweepObjects(t, b, 4)
+	size := blobSize(t, b, digests[0])
+	budgetToEvict(b, 2, size)
+
+	sweepLocalBlobs(t, b)
+
+	got := collectLocalBlobMetrics(t, reader)
+	if got["ingot.local_blobs.removals/budget_forced"] != 2 || got["ingot.local_blobs.removed_bytes/budget_forced"] != 2*size {
+		t.Fatalf("forced removals = %d files, %d bytes; want 2 files, %d bytes (all: %v)",
+			got["ingot.local_blobs.removals/budget_forced"], got["ingot.local_blobs.removed_bytes/budget_forced"], 2*size, got)
+	}
+	if _, ok := got["ingot.local_blobs.removals/budget"]; ok {
+		t.Fatalf("the budget pass recorded removals inside the residency window: %v", got)
+	}
+}
+
 // TestLocalBlobMetrics_BudgetPassSkipsAFileAlreadyGone: a row whose file was
 // already gone is not counted as an eviction.
 func TestLocalBlobMetrics_BudgetPassSkipsAFileAlreadyGone(t *testing.T) {

@@ -9,8 +9,10 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/fil-forge/ucantone/did"
+	"github.com/ipfs/go-cid"
 	mh "github.com/multiformats/go-multihash"
 )
 
@@ -154,6 +156,117 @@ func TestScanKeepsCountsExact(t *testing.T) {
 	counted := fmt.Sprint(s.Usage(), c.Usage(), s.InFlight())
 	if actual := fmt.Sprint(measure(s.blobDir), measure(c.blobDir), 0); counted != actual {
 		t.Fatalf("spool cache in-flight counted = %s, on disk = %s", counted, actual)
+	}
+}
+
+func TestBlobCacheLastRead(t *testing.T) {
+	ctx := t.Context()
+	cases := []struct {
+		name string
+		read func(t *testing.T, c *BlobCache, d mh.Multihash)
+		want bool
+	}{
+		{
+			name: "OpenBlob hit records the read",
+			read: func(t *testing.T, c *BlobCache, d mh.Multihash) {
+				r, err := c.OpenBlob(ctx, did.Undef, d)
+				if err != nil {
+					t.Fatalf("OpenBlob: %v", err)
+				}
+				_ = r.Close()
+			},
+			want: true,
+		},
+		{
+			name: "OpenBlobRange hit records the read",
+			read: func(t *testing.T, c *BlobCache, d mh.Multihash) {
+				r, err := c.OpenBlobRange(ctx, did.Undef, d, 0, 1)
+				if err != nil {
+					t.Fatalf("OpenBlobRange: %v", err)
+				}
+				_ = r.Close()
+			},
+			want: true,
+		},
+		{
+			name: "GetBlock hit records the read",
+			read: func(t *testing.T, c *BlobCache, d mh.Multihash) {
+				if _, err := c.GetBlock(ctx, did.Undef, cid.NewCidV1(cid.Raw, d)); err != nil {
+					t.Fatalf("GetBlock: %v", err)
+				}
+			},
+			want: true,
+		},
+		{
+			name: "read through LocalBlobs records the read",
+			read: func(t *testing.T, c *BlobCache, d mh.Multihash) {
+				r, err := LocalBlobs{Cache: c, Spool: newTestSpool(t)}.OpenBlob(ctx, did.Undef, d)
+				if err != nil {
+					t.Fatalf("OpenBlob: %v", err)
+				}
+				_ = r.Close()
+			},
+			want: true,
+		},
+		{
+			name: "remove forgets the read",
+			read: func(t *testing.T, c *BlobCache, d mh.Multihash) {
+				r, err := c.OpenBlob(ctx, did.Undef, d)
+				if err != nil {
+					t.Fatalf("OpenBlob: %v", err)
+				}
+				_ = r.Close()
+				if _, err := c.Remove(d); err != nil {
+					t.Fatalf("Remove: %v", err)
+				}
+			},
+			want: false,
+		},
+		{
+			name: "miss records nothing",
+			read: func(t *testing.T, c *BlobCache, d mh.Multihash) {
+				if _, err := c.Remove(d); err != nil {
+					t.Fatalf("Remove: %v", err)
+				}
+				if _, err := c.OpenBlob(ctx, did.Undef, d); !errors.Is(err, ErrNotFound) {
+					t.Fatalf("OpenBlob after remove: %v, want ErrNotFound", err)
+				}
+			},
+			want: false,
+		},
+		{
+			name: "take alone records nothing",
+			read: func(*testing.T, *BlobCache, mh.Multihash) {},
+			want: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, c := newTestDirs(t)
+			d := writeTestBlob(t, s, "hello")
+			if _, err := c.Take(s, d); err != nil {
+				t.Fatalf("Take: %v", err)
+			}
+			tc.read(t, c, d)
+			if _, ok := c.LastRead(d); ok != tc.want {
+				t.Fatalf("LastRead ok = %v, want %v", ok, tc.want)
+			}
+		})
+	}
+}
+
+func TestRecencyMapDropsLeastRecentlyRead(t *testing.T) {
+	m := newRecencyMap(2)
+	now := time.Now()
+	m.touch("a", now)
+	m.touch("b", now)
+	m.touch("a", now) // a is now the most recent
+	m.touch("c", now) // evicts b
+	_, hasA := m.get("a")
+	_, hasB := m.get("b")
+	_, hasC := m.get("c")
+	if got := [3]bool{hasA, hasB, hasC}; got != [3]bool{true, false, true} {
+		t.Fatalf("remembered [a b c] = %v, want [true false true]", got)
 	}
 }
 
