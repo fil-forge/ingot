@@ -289,8 +289,9 @@ func (s *Server) Start(ctx context.Context) error {
 	return nil
 }
 
-// goSweep runs fn in a sweeper goroutine that Stop waits for. fn returns
-// once s.sweepCtx is done.
+// goSweep runs fn in a sweeper goroutine that Stop waits for. fn must return
+// promptly once s.sweepCtx is done. Its errors after that are the
+// cancellation's, so the sweepers don't log them.
 func (s *Server) goSweep(fn func()) {
 	s.sweeps.Add(1)
 	go func() {
@@ -326,7 +327,7 @@ func (s *Server) startMultipartSweeper() {
 				ctx, cancel := context.WithTimeout(s.sweepCtx, time.Minute)
 				n, err := s.backend.SweepStaleMultipartSessions(ctx, ttl)
 				cancel()
-				if err != nil {
+				if err != nil && s.sweepCtx.Err() == nil {
 					s.logger.Warn("multipart sweep", zap.Error(err))
 				} else if n > 0 {
 					s.logger.Info("multipart sweep reaped stale sessions", zap.Int("count", n))
@@ -360,7 +361,7 @@ func (s *Server) startReleaseSweeper() {
 				ctx, cancel := context.WithTimeout(s.sweepCtx, time.Minute)
 				n, err := s.backend.SweepPendingReleases(ctx)
 				cancel()
-				if err != nil {
+				if err != nil && s.sweepCtx.Err() == nil {
 					s.logger.Warn("release sweep", zap.Error(err))
 				} else if n > 0 {
 					s.logger.Info("release sweep executed deferred releases", zap.Int("count", n))
@@ -368,7 +369,7 @@ func (s *Server) startReleaseSweeper() {
 				ctx, cancel = context.WithTimeout(s.sweepCtx, time.Minute)
 				n, err = s.backend.SweepStaleStreams(ctx)
 				cancel()
-				if err != nil {
+				if err != nil && s.sweepCtx.Err() == nil {
 					s.logger.Warn("stream sweep", zap.Error(err))
 				} else if n > 0 {
 					s.logger.Info("stream sweep aborted abandoned uploads", zap.Int("count", n))
@@ -407,7 +408,7 @@ func (s *Server) startLocalBlobSweeper() {
 				ctx, cancel := context.WithTimeout(s.sweepCtx, 4*time.Minute)
 				stats, err := s.backend.SweepLocalBlobs(ctx)
 				cancel()
-				if err != nil {
+				if err != nil && s.sweepCtx.Err() == nil {
 					s.logger.Warn("local blob sweep", zap.Error(err))
 				}
 				// The removals are totalled and logged at most every
@@ -429,10 +430,10 @@ func (s *Server) startLocalBlobSweeper() {
 	})
 }
 
-// Stop cancels the background sweeps and waits for them to exit, then
-// shuts the listener down and drains the log. Always returns the combined
-// error of these steps so callers see all failure modes; none is fatal to
-// the others.
+// Stop cancels the background sweeps and waits for them to exit (until ctx
+// ends), then shuts the listener down and drains the log. Always returns the
+// combined error of these steps so callers see all failure modes; none is
+// fatal to the others.
 func (s *Server) Stop(ctx context.Context) error {
 	s.logger.Info("shutting down ingot S3 listener")
 
@@ -470,6 +471,12 @@ func (s *Server) waitSweeps(ctx context.Context) error {
 	case <-done:
 		return nil
 	case <-ctx.Done():
+		// An expired ctx and already-exited sweepers can both be ready.
+		select {
+		case <-done:
+			return nil
+		default:
+		}
 		return fmt.Errorf("waiting for background sweeps: %w", ctx.Err())
 	}
 }
