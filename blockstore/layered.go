@@ -16,9 +16,10 @@ import (
 )
 
 // Layered is the production ReadStore: a read-only seam that consults the local
-// blob copies first (LocalBlobs: the cache and the spool, the read-after-write
-// floor for object-body blobs), then the local LSM log (catalog blocks: manifests, MST nodes), then a
-// base blockstore (typically *Forge — indexing-service + piri).
+// blob copies first (LocalBlobs: the cache, then the spool; each object-body
+// blob's local copy, kept after it is written until removed, and never refilled
+// by network reads), then the local LSM log (catalog blocks: manifests, MST
+// nodes), then a base blockstore (typically *Forge — indexing-service + piri).
 //
 // It exposes both halves of ReadStore from a single underlying traversal:
 //

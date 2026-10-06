@@ -33,7 +33,7 @@ type Config struct {
 	Logger *zap.Logger
 }
 
-// PlaneConfig tunes one plane's (data or catalog) independent pipeline:
+// PlaneConfig tunes the catalog plane's pipeline:
 // its seal trigger, whether/how it ships, and how much it retains.
 type PlaneConfig struct {
 	// SealBytes is the open-segment CAR size threshold at which this

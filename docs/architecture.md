@@ -284,8 +284,8 @@ digest must be known before `allocate`, and because that local copy does double 
   holds regardless.
 
 The `upload_intents` table tracks each in-flight blob: `digest → { local_path, size, state:
-spooled│parked│accepted│published, owner ref }`. It drives read-after-write, cache lookup, and crash
-recovery. The Postgres schema for this and every other Ingot table is in **[Appendix C](#appendix-c--postgres-schema-the-ingot-schema)**.
+spooled│uploading│parked│accepted│published, owner ref }`. It drives read-after-write, cache
+lookup, and crash recovery. The Postgres schema for this and every other Ingot table is in **[Appendix C](#appendix-c--postgres-schema-the-ingot-schema)**.
 
 **Dedup and the reference index.** Piri stores identical bytes once (it answers `allocate` with
 "already have it" when the digest exists), so one blob can back many object versions — a re-PUT of
@@ -908,10 +908,11 @@ paths below are exercised against the real stack by the smelt-based `itest/` har
 - **Indexer retraction on delete** is unimplemented (no-op). `ListParts` and
   `ListMultipartUploads` are implemented (paginated, prefix/delimiter/marker semantics;
   in-flight sessions only).
-- **Multipart hygiene (spool-model edition).** Abort and part re-upload delete the
-  now-unreferenced spooled blobs (guarded against content-addressed sharing with other
-  sessions and committed objects), and a background sweeper aborts open sessions older
-  than `multipart_session_ttl` (default 7d) and reaps terminal session rows. A successful
+- **Multipart hygiene.** Abort and part re-upload record a release for each now-unreferenced
+  part blob (guarded against content-addressed sharing with other sessions and committed
+  objects); the release removes the blob from its provider, then removes its local copy and
+  intent. A background sweeper aborts open sessions older than `multipart_session_ttl`
+  (default 7d) and reaps terminal session rows. A successful
   Complete retains its session in state `completed` so a duplicate Complete is idempotent
   per S3. `DeleteBucket` implicitly aborts the bucket's in-flight sessions before the space
   delete (upstream's conformance teardown never aborts them); `s3:DeleteBucket` delegates
