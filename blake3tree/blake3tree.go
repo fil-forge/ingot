@@ -632,6 +632,12 @@ func stackOf(subs []Subtree) (*Hasher, bool) {
 	return h, true
 }
 
+// emptyRoot is the BLAKE3 hash of no bytes.
+func emptyRoot() CV {
+	n := guts.CompressChunk(nil, &guts.IV, 0, guts.FlagRoot)
+	return bytesOf(guts.ChainingValue(n))
+}
+
 func parentCV(left, right [8]uint32) [8]uint32 {
 	return guts.ChainingValue(guts.ParentNode(left, right, &guts.IV, 0))
 }
@@ -788,6 +794,12 @@ func VerifyBlocks(r io.Reader, outboard []byte, chunkLog_ uint8, offset int64, r
 		}
 		if size > 0 {
 			return 0, fmt.Errorf("blake3tree: offset %d is the body's end; nothing to verify", offset)
+		}
+		// The empty body has no block to check against the outboard, so the
+		// root itself is what authenticates it: it must be the hash of
+		// nothing.
+		if root != emptyRoot() {
+			return 0, &BlockError{0, 0}
 		}
 		return 0, nil
 	}
