@@ -330,7 +330,9 @@ draws the chains and the stores.
   pass may take it, and with `local_blob_max_bytes` set its bytes count
   against the budget until an operator removes it and restarts ingot (the
   counts see a removal outside ingot at startup, or at an hourly scan that
-  no write overlapped).
+  no write overlapped). The sweeper sums those bodies each run, counting an
+  intent unchanged for an hour as stalled, for the
+  `ingot.local_blobs.stalled_bytes` gauge.
 - **No catalog GC**: `gc_candidates` is write-only; superseded MST nodes
   accumulate on Forge with mutation volume.
 - **Reads carry no bucket context**: `Manager.Get` linear-scans every open

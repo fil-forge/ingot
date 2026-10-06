@@ -194,7 +194,8 @@ than `local_blob_orphan_age` (default `24h`, at least `1h`).
   usage runs over it by the difference;
 - the bodies of uploads that failed: their upload intents stay `spooled` or
   `uploading`, nothing reclaims those spool files yet, and they count against
-  the budget until removed by hand;
+  the budget until removed by hand. `ingot.local_blobs.stalled_bytes` reports
+  how much they hold;
 - the catalog log, if it shares the filesystem: `<data_dir>/segments`, per
   bucket about (`retain` + the open and unshipped segments) × `seal_bytes`.
 
@@ -204,6 +205,7 @@ than `local_blob_orphan_age` (default `24h`, at least `1h`).
 | -- | -- |
 | `ingot.local_blobs.usage` | Bytes held, by `dir`: `spool` (writes in progress and bodies awaiting upload, which eviction cannot touch) or `cache` |
 | `ingot.local_blobs.budget` | `local_blob_max_bytes` (0: no budget) |
+| `ingot.local_blobs.stalled_bytes` | Bytes of bodies whose upload has stalled: intents still `spooled` or `uploading` an hour after their last state change, which nothing reclaims yet. Growth means uploads are failing |
 | `ingot.local_blobs.removals`, `ingot.local_blobs.removed_bytes` | Files and bytes removed, by `reason`: `released`, `parked`, `budget`, `budget_forced` (inside a retention window), `orphan` |
 | `ingot.local_blobs.reads` | Body-blob reads, by `tier`: `local` or `network` (the local hit ratio) |
 

@@ -28,6 +28,7 @@ import (
 	"context"
 	"encoding/xml"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/fil-forge/versitygw/auth"
@@ -101,6 +102,11 @@ type Backend struct {
 	overBudgetWarned bool
 	timeLimitLogged  bool
 	lastForcedWarn   time.Time
+	// stalledBytes is the sweeper's latest sum of stalled uploads (see
+	// SweepLocalBlobs), read by the stalled_bytes gauge; stalledKnown is set
+	// once a sweep has computed it.
+	stalledBytes atomic.Int64
+	stalledKnown atomic.Bool
 	// localBlobMetrics counts local blob removals; localBlobGauges is the
 	// registration of the usage and budget gauges (nil when not registered).
 	localBlobMetrics localBlobMetrics

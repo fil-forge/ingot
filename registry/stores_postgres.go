@@ -439,6 +439,22 @@ func (r *Postgres) MarkEvicted(ctx context.Context, digest multihash.Multihash) 
 	return nil
 }
 
+func (r *Postgres) StalledBytes(ctx context.Context, before time.Time) (int64, error) {
+	// The state literals match the partial index upload_intents_stalled_idx
+	// (migration 00021), as for ListEvictable.
+	var n int64
+	err := r.pool.QueryRow(ctx,
+		`SELECT COALESCE(sum(size), 0)::bigint
+		   FROM ingot.upload_intents
+		  WHERE state IN ('spooled', 'uploading')
+		    AND updated_at < $1`,
+		before).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("registry: sum stalled intents: %w", err)
+	}
+	return n, nil
+}
+
 func (r *Postgres) MissingIntents(ctx context.Context, digests []multihash.Multihash) ([]multihash.Multihash, error) {
 	if len(digests) == 0 {
 		return nil, nil
