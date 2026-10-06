@@ -51,35 +51,52 @@ func newBlake3HashCmd() *cobra.Command {
 	}
 }
 
-// blake3TreeFlags are the Blake3 attribute's values a ranged check needs.
+// blake3TreeFlags are the Blake3 attribute's values a ranged check needs:
+// the group, and the outboard either inline as the base64 from the XML or
+// from a file.
 type blake3TreeFlags struct {
+	outboard     string
 	outboardPath string
 	group        uint8
 }
 
 func (f *blake3TreeFlags) bind(c *cobra.Command) {
-	c.Flags().StringVar(&f.outboardPath, "outboard", "", "file holding the attribute's Outboard, as the base64 in the XML or as raw bytes")
+	c.Flags().StringVar(&f.outboard, "outboard", "", "the attribute's Outboard as its base64 string")
+	c.Flags().StringVar(&f.outboardPath, "outboard-file", "", "file holding the attribute's Outboard, as the base64 string or as raw bytes")
 	c.Flags().Uint8Var(&f.group, "group", 0, "the attribute's Group: block size as a base-2 exponent of bytes")
+	c.MarkFlagsMutuallyExclusive("outboard", "outboard-file")
 }
 
-// load reads and checks the outboard. Both flags are required together.
+// given reports whether any of the flags was set.
+func (f *blake3TreeFlags) given() bool {
+	return f.outboard != "" || f.outboardPath != "" || f.group != 0
+}
+
+// load decodes and checks the outboard. The group and one of the outboard
+// flags are required together.
 func (f *blake3TreeFlags) load() ([]byte, error) {
-	if f.outboardPath == "" || f.group == 0 {
-		return nil, errors.New("--outboard and --group are required together")
+	if (f.outboard == "" && f.outboardPath == "") || f.group == 0 {
+		return nil, errors.New("--group and one of --outboard or --outboard-file are required together")
 	}
-	if f.group <= blake3tree.MinGroupLog-1 {
+	if f.group < blake3tree.MinGroupLog {
 		return nil, fmt.Errorf("--group %d is below the smallest group %d", f.group, blake3tree.MinGroupLog)
 	}
-	raw, err := os.ReadFile(f.outboardPath)
-	if err != nil {
-		return nil, err
+	raw, src := []byte(f.outboard), "--outboard"
+	if f.outboardPath != "" {
+		var err error
+		if raw, err = os.ReadFile(f.outboardPath); err != nil {
+			return nil, err
+		}
+		src = f.outboardPath
 	}
 	outboard := raw
 	if dec, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(raw))); err == nil {
 		outboard = dec
+	} else if f.outboardPath == "" {
+		return nil, fmt.Errorf("--outboard is not base64: %w", err)
 	}
 	if err := blake3tree.CheckOutboard(outboard); err != nil {
-		return nil, fmt.Errorf("%s: %w", f.outboardPath, err)
+		return nil, fmt.Errorf("%s: %w", src, err)
 	}
 	return outboard, nil
 }
@@ -92,8 +109,9 @@ func newBlake3VerifyCmd() *cobra.Command {
 		Short: "Verify the data on stdin against an object CID",
 		Long: `Verify the data on stdin against an object CID, the x-cid header's value.
 
-Without flags the whole object is expected and hashed. With --outboard,
---group and --offset the data is a block-aligned range of the object (see
+Without flags the whole object is expected and hashed. With --group,
+--offset and the outboard (--outboard as the attribute's base64 string, or
+--outboard-file) the data is a block-aligned range of the object (see
 "ingot blake3 range"), checked block by block against the Bao outboard.
 
 Exit status 1 means the data does not match; any other failure is 2.`,
@@ -104,7 +122,7 @@ Exit status 1 means the data does not match; any other failure is 2.`,
 				return err
 			}
 			in := bufio.NewReaderSize(cmd.InOrStdin(), 1<<20)
-			if tree.outboardPath == "" && tree.group == 0 && !cmd.Flags().Changed("offset") {
+			if !tree.given() && !cmd.Flags().Changed("offset") {
 				got, err := hashCID(in)
 				if err != nil {
 					return err
@@ -135,7 +153,7 @@ Exit status 1 means the data does not match; any other failure is 2.`,
 		},
 	}
 	tree.bind(c)
-	c.Flags().Int64Var(&offset, "offset", 0, "object byte offset of the first byte on stdin (with --outboard)")
+	c.Flags().Int64Var(&offset, "offset", 0, "object byte offset of the first byte on stdin (ranged mode)")
 	return c
 }
 
