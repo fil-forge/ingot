@@ -2074,7 +2074,7 @@ func TestUploadPartRefusedAfterTeardownReleasesItsBlobs(t *testing.T) {
 		t.Fatal("the teardown never ran")
 	}
 	drainReleases(t, b)
-	entries, err := os.ReadDir(localPath(b, nil))
+	entries, err := os.ReadDir(b.spool.Path(nil))
 	if err != nil {
 		t.Fatalf("read spool dir: %v", err)
 	}
@@ -2126,7 +2126,7 @@ func TestUploadPartFailedRowWriteReleasesItsBlobs(t *testing.T) {
 		t.Fatal("the part store never refused a write")
 	}
 	drainReleases(t, b)
-	entries, err := os.ReadDir(localPath(b, nil))
+	entries, err := os.ReadDir(b.spool.Path(nil))
 	if err != nil {
 		t.Fatalf("read spool dir: %v", err)
 	}
@@ -2254,7 +2254,7 @@ func TestLocalOnlyReleaseDropsIntentWithItsRecord(t *testing.T) {
 	if pending, _ := mem.ListReleasesBySpace(ctx, did.Undef); len(pending) != 0 {
 		t.Fatalf("release records after the release = %v, want none: the record outlived its intent", pending)
 	}
-	entries, err := os.ReadDir(localPath(b, nil))
+	entries, err := os.ReadDir(b.spool.Path(nil))
 	if err != nil {
 		t.Fatalf("read spool dir: %v", err)
 	}
