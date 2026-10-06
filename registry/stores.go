@@ -344,6 +344,10 @@ type IntentStore interface {
 	// MissingIntents returns the digests among digests that have no intent
 	// row, for the sweeper's orphan-file pass.
 	MissingIntents(ctx context.Context, digests []multihash.Multihash) ([]multihash.Multihash, error)
+	// StalledBytes sums the sizes of 'spooled' and 'uploading' intents whose
+	// state last changed before before: bodies whose upload has outlasted
+	// any live request, which nothing reclaims.
+	StalledBytes(ctx context.Context, before time.Time) (int64, error)
 }
 
 // LocationStore is the local blob-location table (§8, appliance topology):

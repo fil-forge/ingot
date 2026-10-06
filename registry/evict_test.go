@@ -293,4 +293,25 @@ func runEvictionSuite(t *testing.T, fresh func(t *testing.T) evictStore) {
 			t.Fatalf("MissingIntents = %x, want [%x]", got, unknown)
 		}
 	})
+
+	t.Run("StalledBytes sums spooled and uploading intents older than the cutoff", func(t *testing.T) {
+		st := fresh(t)
+		seed(t, st, evictDigest(t, "spooled"), registry.IntentSpooled, false, false)
+		seed(t, st, evictDigest(t, "uploading"), registry.IntentUploading, false, false)
+		seed(t, st, evictDigest(t, "accepted"), registry.IntentAccepted, true, false)
+		seed(t, st, evictDigest(t, "parked"), registry.IntentParked, false, true)
+		var got []int64
+		// An hour either side of now, so a database clock off from this
+		// one by less still puts every row on the same side.
+		for _, before := range []time.Time{time.Now().Add(-time.Hour), time.Now().Add(time.Hour)} {
+			n, err := st.StalledBytes(ctx, before)
+			if err != nil {
+				t.Fatalf("StalledBytes: %v", err)
+			}
+			got = append(got, n)
+		}
+		if want := []int64{0, 14}; !reflect.DeepEqual(got, want) {
+			t.Fatalf("StalledBytes before [an hour ago, an hour from now] = %v, want %v", got, want)
+		}
+	})
 }

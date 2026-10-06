@@ -15,6 +15,7 @@ import (
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
 	"github.com/fil-forge/ingot/inmem"
+	"github.com/fil-forge/ingot/registry"
 )
 
 // collectLocalBlobMetrics reads every local blob instrument: gauges by name
@@ -199,5 +200,36 @@ func TestLocalBlobMetrics_ReleaseOfACopyAlreadyGone(t *testing.T) {
 	if got["ingot.local_blobs.removals/released"] != 0 || got["ingot.local_blobs.removed_bytes/released"] != 0 {
 		t.Fatalf("released removals = %d files, %d bytes; want none (all: %v)",
 			got["ingot.local_blobs.removals/released"], got["ingot.local_blobs.removed_bytes/released"], got)
+	}
+}
+
+// TestLocalBlobMetrics_StalledBytes: the stalled_bytes gauge reports nothing
+// until a sweep has summed the stalled uploads, then the bytes of intents
+// spooled for over an hour, not those of a body spooled just now.
+func TestLocalBlobMetrics_StalledBytes(t *testing.T) {
+	ctx := t.Context()
+	reader := sdkmetric.NewManualReader()
+	b, mem := newSweepBackend(t, meteredBackend(reader))
+	spooled := func(body string) (multihash.Multihash, int64) {
+		t.Helper()
+		d, n, err := b.spool.WriteBlob(ctx, bytes.NewReader([]byte(body)))
+		if err != nil {
+			t.Fatalf("WriteBlob: %v", err)
+		}
+		if err := mem.PutIntent(ctx, registry.UploadIntent{Digest: d, LocalPath: localPath(b, d), Size: n, State: registry.IntentSpooled}); err != nil {
+			t.Fatalf("PutIntent: %v", err)
+		}
+		return d, n
+	}
+	stalled, n := spooled("an upload that failed an hour ago")
+	mem.AgeIntent(stalled, 2*stalledUploadAge)
+	spooled("an upload in progress")
+
+	_, before := collectLocalBlobMetrics(t, reader)["ingot.local_blobs.stalled_bytes"]
+	sweepLocalBlobs(t, b)
+	after, ok := collectLocalBlobMetrics(t, reader)["ingot.local_blobs.stalled_bytes"]
+
+	if before || !ok || after != n {
+		t.Fatalf("stalled_bytes reported before a sweep: %v; after: %d (reported %v), want %d", before, after, ok, n)
 	}
 }

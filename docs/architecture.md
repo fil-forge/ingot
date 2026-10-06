@@ -892,8 +892,9 @@ paths below are exercised against the real stack by the smelt-based `itest/` har
   provider holds (a location or park row), oldest first, down to 90% of the budget; hourly it
   deletes orphan files. The budget is off by default. A release frees a deleted object's local
   copies, and a parked part's copy goes once it parks. Local blob storage reports its usage by
-  directory, budget, removals by reason and reads by tier as OpenTelemetry metrics
-  (`ingot.local_blobs.*`). Still open under #48: there is no write-through mode.
+  directory, budget, stalled uploads, removals by reason and reads by tier as OpenTelemetry
+  metrics (`ingot.local_blobs.*`). Still open under #48: there is no write-through mode, and
+  nothing reclaims a failed upload's body.
 - **Multipart parts park at UploadPart, accept at Complete.** (Built: `parkBlobs`/`concludeBlobs`
   over the `blob_parks` table.) A parked part holds no local bytes: its spool copy is removed once
   it parks, and Complete concludes it from its park row. Abort and session expiry unwind parked

@@ -59,9 +59,10 @@ var (
 	inCache = metric.WithAttributes(attribute.String("dir", "cache"))
 )
 
-// registerLocalBlobGauges reports the bytes each directory holds and the
-// budget they share. The spool's figure includes writes in progress, and is
-// what eviction cannot touch.
+// registerLocalBlobGauges reports the bytes each directory holds, the budget
+// they share, and the bytes of stalled uploads once a sweep has summed them.
+// The spool's figure includes writes in progress, and is what eviction cannot
+// touch.
 func registerLocalBlobGauges(meter metric.Meter, b *Backend) (metric.Registration, error) {
 	usage, err := meter.Int64ObservableGauge("ingot.local_blobs.usage", metric.WithUnit("By"),
 		metric.WithDescription("Bytes held by local blob storage, by dir: spool (writes in progress and bodies awaiting upload) or cache"))
@@ -73,6 +74,11 @@ func registerLocalBlobGauges(meter metric.Meter, b *Backend) (metric.Registratio
 	if err != nil {
 		return nil, err
 	}
+	stalled, err := meter.Int64ObservableGauge("ingot.local_blobs.stalled_bytes", metric.WithUnit("By"),
+		metric.WithDescription("Bytes of bodies whose upload has stalled: spooled or uploading for over an hour, which nothing reclaims yet"))
+	if err != nil {
+		return nil, err
+	}
 	return meter.RegisterCallback(func(_ context.Context, o metric.Observer) error {
 		if b.spool == nil || b.cache == nil {
 			return nil
@@ -80,8 +86,11 @@ func registerLocalBlobGauges(meter metric.Meter, b *Backend) (metric.Registratio
 		o.ObserveInt64(usage, b.spool.Usage(), inSpool)
 		o.ObserveInt64(usage, b.cache.Usage(), inCache)
 		o.ObserveInt64(budget, b.localBlobMaxBytes)
+		if b.stalledKnown.Load() {
+			o.ObserveInt64(stalled, b.stalledBytes.Load())
+		}
 		return nil
-	}, usage, budget)
+	}, usage, budget, stalled)
 }
 
 // removed records files removed for one reason. Nothing is recorded for a
