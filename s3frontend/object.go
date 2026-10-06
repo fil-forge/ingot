@@ -382,8 +382,9 @@ func declaredLength(n *int64) int64 {
 // size is the body's declared length. With a streaming uploader each blob
 // goes to its provider while it is spooled: those blobs come back in
 // streamed, parked on their providers, and their intents start out uploading
-// rather than spooled. A body that turns out a different length fails.
-func (b *Backend) splitSpool(ctx context.Context, bucket string, space did.DID, r io.Reader, size int64, md5Src bodyMD5Source, plaintext bool) (_ spooledBody, err error) {
+// rather than spooled. A body that turns out a different length fails. opts
+// are passed through to the split (a part skips the whole-body tree).
+func (b *Backend) splitSpool(ctx context.Context, bucket string, space did.DID, r io.Reader, size int64, md5Src bodyMD5Source, plaintext bool, opts ...msbucket.SplitOption) (_ spooledBody, err error) {
 	// The span covers receiving the body (it streams in from the client as
 	// SplitBody reads it), encrypting it and writing it to the spool; the
 	// body.received event marks where the client finished sending.
@@ -414,7 +415,7 @@ func (b *Backend) splitSpool(ctx context.Context, bucket string, space did.DID, 
 			enc.unholdAll()
 		}
 	}()
-	var splitOpts []msbucket.SplitOption
+	splitOpts := append([]msbucket.SplitOption(nil), opts...)
 	if md5Src != nil {
 		splitOpts = append(splitOpts, msbucket.WithoutMD5())
 	}
@@ -1356,6 +1357,10 @@ func (b *Backend) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s
 			}
 		}
 	}
+	// The object's CID rides on every successful read, ranged or not: it
+	// names the whole object, which a ranged reader verifies against through
+	// the tree (see cidHeader).
+	setCIDHeader(ctx, mf.Body)
 	return out, nil
 }
 
@@ -1395,7 +1400,11 @@ func (b *Backend) GetObjectAttributes(ctx context.Context, input *s3.GetObjectAt
 	// list for checksummed multipart uploads — so TotalPartsCount is the
 	// faithful subset, matching AWS for a non-checksummed multipart object.
 	var objectParts *s3response.ObjectParts
+	// The Blake3 attribute (an Ingot extension, see blake3Attribute) comes
+	// from the same manifest.
+	var blake3 *s3response.Blake3Tree
 	if rv, rerr := b.resolveVersion(ctx, *input.Bucket, *input.Key, backend.GetStringFromPtr(input.VersionId)); rerr == nil && !rv.mf.DeleteMarker {
+		blake3 = blake3Attribute(rv.mf.Body)
 		sizes := rv.mf.Body.PartSizes
 		sums := rv.mf.Body.PartChecksums
 		if n := len(sizes); n > 0 {
@@ -1441,6 +1450,7 @@ func (b *Backend) GetObjectAttributes(ctx context.Context, input *s3.GetObjectAt
 	}
 
 	return s3response.GetObjectAttributesResponse{
+		Blake3:       blake3,
 		ETag:         backend.TrimEtag(data.ETag),
 		ObjectSize:   data.ContentLength,
 		StorageClass: data.StorageClass,
@@ -1635,6 +1645,10 @@ func (b *Backend) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.
 			}
 		}
 	}
+	// The object's CID rides on every successful read, ranged or not: it
+	// names the whole object, which a ranged reader verifies against through
+	// the tree (see cidHeader).
+	setCIDHeader(ctx, mf.Body)
 	return out, nil
 }
 

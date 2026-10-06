@@ -134,6 +134,16 @@ the source's plaintext range streams through the decrypting read path into
 new parked blobs, so the source may be in any bucket of the tenant and
 nothing is shared with it.
 
+Each part also records its BLAKE3 tree (`blake3tree`): the part's aligned
+subtrees and leaves, hashed at the object offset `UploadPart` guesses from
+the parts recorded so far (exact once every lower part exists, else assumed
+uniform). Complete checks each guess against the part's true offset,
+re-hashes only the parts whose guess was wrong (or every part from one of
+odd length on), merges the parts' subtrees into the object's digest, builds
+its leaf list from their leaves, and checks the leaves against the digest.
+A single-part object takes its digest from part 1's own root. The object's
+`x-cid` and leaf list are therefore the same as a single PUT's would be.
+
 Complete concludes the parked parts a group at a time: each `/ucan/conclude`
 is one invocation carrying up to `MaxConcludeReceipts` (1000) put receipts
 (`receipts`, the plural argument — not a batch of invocations, which is what
