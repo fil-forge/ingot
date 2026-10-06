@@ -18,7 +18,7 @@ require (
 	github.com/fil-forge/smelt v0.0.0-20260915151825-96fc212b8d91
 	github.com/fil-forge/swarf v0.0.1-0.20260821142121-d5d1a0a56f00
 	github.com/fil-forge/ucantone v0.0.0-20260924160040-c31dec73d9b3
-	github.com/fil-forge/versitygw v0.0.0-20261006100531-a094a7f5d783
+	github.com/fil-forge/versitygw v0.0.0-20261006122350-5824567a6794
 	github.com/filecoin-project/go-fee v0.1.1-0.20260930093805-a26324dfe6ad
 	github.com/gofiber/fiber/v3 v3.5.0
 	github.com/google/uuid v1.6.0
