@@ -39,34 +39,20 @@ func readOpenBlob(t *testing.T, r BlobReader, digest mh.Multihash) (string, erro
 	return string(b), err
 }
 
-// TestLayered_OpenBlob_Tiering covers the body-blob read fallthrough: spool first
-// (read-after-write), then the network base after eviction, then ErrNotFound. The
-// log is never consulted (it holds no body blobs).
-func TestLayered_OpenBlob_Tiering(t *testing.T) {
+// TestLayered_OpenBlob_ReadsFromBase covers the body-blob read path: a blob is
+// streamed from the base, and ErrNotFound when the base has none. The log is
+// never consulted (it holds no body blobs).
+func TestLayered_OpenBlob_ReadsFromBase(t *testing.T) {
 	digest, _ := mh.Sum([]byte("digest"), mh.SHA2_256, -1)
 
-	// spool hit — base is not consulted.
-	l := NewLayered(fakeBlobTier{data: []byte("from-spool")}, nil, fakeBlobTier{data: []byte("from-base")})
-	if got, err := readOpenBlob(t, l, digest); err != nil || got != "from-spool" {
-		t.Fatalf("spool hit: got %q err %v, want from-spool", got, err)
-	}
-
-	// spool miss → base hit (the after-eviction path).
-	l = NewLayered(fakeBlobTier{data: nil}, nil, fakeBlobTier{data: []byte("from-base")})
+	l := NewLayered(nil, fakeBlobTier{data: []byte("from-base")})
 	if got, err := readOpenBlob(t, l, digest); err != nil || got != "from-base" {
-		t.Fatalf("spool miss → base: got %q err %v, want from-base", got, err)
+		t.Fatalf("base hit: got %q err %v, want from-base", got, err)
 	}
 
-	// both miss → ErrNotFound.
-	l = NewLayered(fakeBlobTier{data: nil}, nil, fakeBlobTier{data: nil})
+	l = NewLayered(nil, fakeBlobTier{data: nil})
 	if _, err := l.OpenBlob(context.Background(), did.Undef, digest); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("both miss: err = %v, want ErrNotFound", err)
-	}
-
-	// nil spool is skipped, not panicked.
-	l = NewLayered(nil, nil, fakeBlobTier{data: []byte("from-base")})
-	if got, err := readOpenBlob(t, l, digest); err != nil || got != "from-base" {
-		t.Fatalf("nil spool → base: got %q err %v, want from-base", got, err)
+		t.Fatalf("base miss: err = %v, want ErrNotFound", err)
 	}
 }
 

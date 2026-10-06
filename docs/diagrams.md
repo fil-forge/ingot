@@ -212,8 +212,8 @@ flowchart TB
 - The network unit differs: a body blob is retrieved whole by its own digest
   (a `blob_locations` hit); catalog blocks share a CAR, so a network read
   resolves `shard_inclusions` to a byte range inside the shard.
-- Reads mirror the split: `OpenBlob` (bodies) checks spool then network,
-  skipping the log; `GetBlock` (catalog) checks spool, log, then network
+- Reads mirror the split: `OpenBlob` (bodies) goes to the network,
+  skipping the log; `GetBlock` (catalog) checks the log, then the network
   (the [GetObject diagram](#getobject-version-resolution-local-tiers-network-retrieval)).
 - Removal mirrors it too: bodies are reference-counted
   ([blob lifecycle](#blob-lifecycle-spooled-parked-accepted-released));
@@ -352,7 +352,7 @@ these change.
 ## GetObject: version resolution, local tiers, network retrieval
 
 A read resolves the version through the MST, then serves each covering blob
-from the first tier that has it: spool, the catalog log (catalog blocks
+from the first tier that has it: the catalog log (catalog blocks
 only), then the network. Network resolution goes through the local locator
 tables, never the indexing-service.
 
@@ -384,9 +384,7 @@ sequenceDiagram
             Note over B: aesstream.CiphertextRange maps the plaintext range to<br/>one contiguous ciphertext span past the envelope header
         end
         B->>LY: read (whole blob, or only the ciphertext span via OpenBlobRange)
-        alt spool hit
-            LY-->>B: bytes from the spool
-        else catalog log hit (GetBlock only)
+        alt catalog log hit (GetBlock only)
             LY->>LG: Get: linear scan of open bucket stores
             LG-->>B: block from an open or sealed segment
         else network (blockstore.Forge)
@@ -406,7 +404,7 @@ sequenceDiagram
     B-->>C: 200 or 206 body (plaintext byte counts throughout)
 ```
 
-- `OpenBlob` (body blobs) checks spool then network; only `GetBlock`
+- `OpenBlob` (body blobs) reads from the network only; only `GetBlock`
   (catalog blocks) consults the log tier, and only `GetBlock` is fronted by
   the `Cached` LRU.
 - The indexer-backed locator (`blockstore/locator`) compiles but is never

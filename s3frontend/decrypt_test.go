@@ -6,7 +6,6 @@ import (
 	"crypto/rand"
 	"errors"
 	"io"
-	"os"
 	"strings"
 	"testing"
 
@@ -23,7 +22,7 @@ import (
 	"github.com/fil-forge/ingot/registry"
 )
 
-// encFixture is a spool + registry + region-key harness holding an object
+// encFixture is a fake-provider + registry + region-key harness holding an object
 // whose body blobs are FEE-encrypted — the state the encrypting write path
 // will produce, minted directly so the read path is testable before it lands.
 type encFixture struct {
@@ -31,7 +30,7 @@ type encFixture struct {
 	space     did.DID
 	body      msbucket.Body
 	plaintext []byte
-	spool     *blockstore.Spool
+	store     *inmem.Provider
 	mem       *inmem.MemStore
 }
 
@@ -40,17 +39,14 @@ type encFixture struct {
 const encChunkSize = aesstream.MinChunkSize
 
 // newEncFixture splits plaintext into blobs of blobSize bytes, encrypts each
-// into a FEE envelope stored in a fresh spool under its ciphertext digest,
+// into a FEE envelope held by a fake provider under its ciphertext digest,
 // records the encryption params + location rows, and returns a Backend wired
 // with just the pieces the read path uses.
 func newEncFixture(t *testing.T, plaintext []byte, blobSize int) *encFixture {
 	t.Helper()
 	ctx := context.Background()
 
-	spool, err := blockstore.NewSpool(t.TempDir())
-	if err != nil {
-		t.Fatalf("NewSpool: %v", err)
-	}
+	store := inmem.NewProvider()
 	mem := inmem.NewMemStore()
 	provider, err := regionkey.NewInProcessProvider("v1", randBytes(t, regionkey.KEKLen))
 	if err != nil {
@@ -71,11 +67,19 @@ func newEncFixture(t *testing.T, plaintext []byte, blobSize int) *encFixture {
 		if err != nil {
 			t.Fatalf("EncryptWithCEK: %v", err)
 		}
-		digest, n, err := spool.WriteBlob(ctx, rc)
-		if err != nil {
-			t.Fatalf("WriteBlob (envelope): %v", err)
-		}
+		envelope, err := io.ReadAll(rc)
 		_ = rc.Close()
+		if err != nil {
+			t.Fatalf("read envelope: %v", err)
+		}
+		n := int64(len(envelope))
+		digest, err := multihash.Sum(envelope, multihash.SHA2_256, -1)
+		if err != nil {
+			t.Fatalf("hash envelope: %v", err)
+		}
+		if err := store.Put(digest, envelope); err != nil {
+			t.Fatalf("store envelope: %v", err)
+		}
 
 		wrapped, err := provider.Wrap(ctx, regionkey.BindingContext{Space: space, Digest: digest}, cek)
 		if err != nil {
@@ -102,7 +106,7 @@ func newEncFixture(t *testing.T, plaintext []byte, blobSize int) *encFixture {
 		off = end
 	}
 
-	read := blockstore.NewLayered(spool, nil, inmem.NopBaseReader{})
+	read := blockstore.NewLayered(nil, store)
 	return &encFixture{
 		backend: &Backend{
 			read:       read,
@@ -113,7 +117,7 @@ func newEncFixture(t *testing.T, plaintext []byte, blobSize int) *encFixture {
 		space:     space,
 		body:      msbucket.Body{Size: int64(len(plaintext)), Blobs: blobs},
 		plaintext: plaintext,
-		spool:     spool,
+		store:     store,
 		mem:       mem,
 	}
 }
@@ -226,7 +230,7 @@ func TestDecryptingRead_UnrangedUnseekableStore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("bodyOpener: %v", err)
 	}
-	opener.(*decryptingOpener).read = unseekableBlobs{fx.spool}
+	opener.(*decryptingOpener).read = unseekableBlobs{fx.store}
 	got, err := io.ReadAll(msbucket.OpenBodyRange(ctx, opener, fx.space, fx.body, 9500, 15000))
 	if err != nil {
 		t.Fatalf("range read: %v", err)
@@ -242,15 +246,11 @@ func TestDecryptingRead_TamperFails(t *testing.T) {
 	ctx := context.Background()
 	fx := newEncFixture(t, patterned(9000), 10000)
 
-	// Flip one ciphertext byte on disk, past the envelope header.
-	path := fx.spool.Path(fx.body.Blobs[0].Digest)
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read spooled envelope: %v", err)
-	}
-	raw[len(raw)-1] ^= 0x01
-	if err := os.WriteFile(path, raw, 0o600); err != nil {
-		t.Fatalf("write tampered envelope: %v", err)
+	// Flip one ciphertext byte at the provider, past the envelope header.
+	if err := fx.store.Tamper(fx.body.Blobs[0].Digest, func(raw []byte) {
+		raw[len(raw)-1] ^= 0x01
+	}); err != nil {
+		t.Fatalf("tamper envelope: %v", err)
 	}
 
 	opener, err := fx.backend.bodyOpener(ctx, fx.space, fx.body)
@@ -320,13 +320,13 @@ func TestDecryptingRead_MissingLocationFails(t *testing.T) {
 }
 
 // unseekableBlobs strips both the BlobRangeReader capability and reader
-// seekability from a spool, imitating a network tier without ranged reads.
+// seekability from a provider, imitating a network tier without ranged reads.
 type unseekableBlobs struct {
-	spool *blockstore.Spool
+	store *inmem.Provider
 }
 
 func (u unseekableBlobs) OpenBlob(ctx context.Context, space did.DID, digest multihash.Multihash) (io.ReadCloser, error) {
-	rc, err := u.spool.OpenBlob(ctx, space, digest)
+	rc, err := u.store.OpenBlob(ctx, space, digest)
 	if err != nil {
 		return nil, err
 	}

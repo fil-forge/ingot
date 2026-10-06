@@ -83,7 +83,7 @@ func newRefTestBackend(t *testing.T, maxBlob ...int64) (*Backend, *inmem.MemStor
 		GC:              mem,
 		Multipart:       mem,
 		Parks:           mem,
-		Reads:           blockstore.NewLayered(nil, log, provider),
+		Reads:           blockstore.NewLayered(log, provider),
 		Log:             log,
 		Spool:           spool,
 		Uploader:        provider,
