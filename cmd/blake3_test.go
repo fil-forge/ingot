@@ -92,6 +92,25 @@ func TestBlake3Commands(t *testing.T) {
 	if _, err := run(t, data, "hash", "--bao", "--chunk-log", "60"); err == nil {
 		t.Fatal("--chunk-log 60 accepted")
 	}
+
+	// An empty object is authenticated by its CID alone: the right one
+	// passes with empty stdin, a wrong one is a mismatch, not a pass.
+	emptyOut, err := run(t, nil, "hash", "--bao")
+	if err != nil {
+		t.Fatal(err)
+	}
+	empty := map[string]string{}
+	for _, line := range strings.Split(strings.TrimSpace(emptyOut), "\n") {
+		k, v, _ := strings.Cut(line, " ")
+		empty[k] = v
+	}
+	if out, err := run(t, nil, "verify", "--outboard", empty["Outboard"], "--chunk-log", empty["ChunkLog"], "--offset", "0", empty["CID"]); err != nil || !strings.HasPrefix(out, "ok empty object") {
+		t.Fatalf("empty object with its CID: %q, %v", out, err)
+	}
+	var emptyMismatch *mismatchError
+	if _, err := run(t, nil, "verify", "--outboard", empty["Outboard"], "--chunk-log", empty["ChunkLog"], "--offset", "0", want); !errors.As(err, &emptyMismatch) {
+		t.Fatalf("empty object with another object's CID must mismatch: %v", err)
+	}
 	if out, err := run(t, data, "verify", want); err != nil || !strings.HasPrefix(out, "ok ") {
 		t.Fatalf("verify whole: %q, %v", out, err)
 	}

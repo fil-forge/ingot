@@ -616,6 +616,16 @@ func TestHostileClientInputs(t *testing.T) {
 	if _, err := VerifyBlocks(bytes.NewReader([]byte{1}), empty, MinChunkLog, 0, blake3.Sum256(nil)); err == nil {
 		t.Error("data accepted for an empty body")
 	}
+	// The empty body is authenticated by the root alone, so a wrong root is
+	// a mismatch, not a pass.
+	wrongRoot := blake3.Sum256([]byte("not empty"))
+	var be *BlockError
+	if _, err := VerifyBlocks(bytes.NewReader(nil), empty, MinChunkLog, 0, wrongRoot); !errors.As(err, &be) {
+		t.Errorf("empty body with a wrong root: %v", err)
+	}
+	if emptyRoot() != blake3.Sum256(nil) {
+		t.Error("emptyRoot differs from the reference hash of no bytes")
+	}
 	if _, err := VerifyBlocks(bytes.NewReader(nil), small, MaxChunkLog, 0, root); err == nil {
 		t.Error("empty input accepted for a 100-byte body")
 	}
