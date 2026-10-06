@@ -243,16 +243,17 @@ type MultipartPart struct {
 	// blake3tree). TreeOffset is the object byte offset the part was hashed
 	// at: UploadPart's guess from the parts recorded so far, which Complete
 	// checks against the part's true offset. TreeNodes holds the part's
-	// aligned subtrees and TreeLeaves its leaves at TreeGroup, both encoded
-	// with blake3tree.EncodeSubtrees. TreeRoot is the part's own BLAKE3 hash,
-	// set when TreeOffset is 0. Nil TreeNodes means no tree was recorded
-	// (a part from before the tree existed, or a copy that read no bytes),
-	// and Complete re-hashes the part.
-	TreeOffset int64
-	TreeGroup  uint8
-	TreeNodes  []byte
-	TreeLeaves []byte
-	TreeRoot   []byte
+	// aligned subtrees and TreeLeaves its leaves at TreeChunkLog (the block
+	// size as a base-2 exponent of chunks), both encoded with
+	// blake3tree.EncodeSubtrees. TreeRoot is the part's own BLAKE3 hash, set
+	// when TreeOffset is 0. Empty TreeNodes means no tree was recorded (a
+	// part from before the tree existed, or a copy that read no bytes), and
+	// Complete re-hashes the part.
+	TreeOffset   int64
+	TreeChunkLog uint8
+	TreeNodes    []byte
+	TreeLeaves   []byte
+	TreeRoot     []byte
 }
 
 // BlobRefStore is the reverse reference index (§5, §6). A commit adds a

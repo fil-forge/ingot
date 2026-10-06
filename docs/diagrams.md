@@ -648,7 +648,7 @@ flowchart TB
     prev["Prev: per-key sub-MST of noncurrent versions<br/>keyed revSeqKey(seq): %016x of bit-inverted seq,<br/>so a forward walk is newest-first"]
     nulls["NullSeq: a noncurrent null<br/>version's seq (0 = none)"]
     em["EnvelopedManifest<br/>one per noncurrent version"]
-    mf["ObjectManifest<br/>Seq, VersionID, DeleteMarker, ETag, headers,<br/>Body(Size, SHA256, BLAKE3, TreeGroup, TreeLeaves,<br/>MD5, Blobs, PartSizes)"]
+    mf["ObjectManifest<br/>Seq, VersionID, DeleteMarker, ETag, headers,<br/>Body(Size, SHA256, BLAKE3, TreeChunkLog, TreeLeaves,<br/>MD5, Blobs, PartSizes)"]
 
     root --> leafk --> union
     union --> mans
@@ -953,9 +953,9 @@ erDiagram
         text checksum
         text state "'accepted' never written"
         bigint tree_offset "object offset the part's BLAKE3 tree was hashed at (UploadPart's guess)"
-        smallint tree_group "block size of tree_leaves, base-2 exponent; 0 = no tree recorded"
-        bytea tree_nodes "the part's aligned subtrees (blake3tree.EncodeSubtrees)"
-        bytea tree_leaves "the part's leaves at tree_group"
+        smallint tree_chunk_log "block size of tree_leaves, base-2 exponent of chunks"
+        bytea tree_nodes "the part's aligned subtrees (blake3tree.EncodeSubtrees); NULL = no tree recorded"
+        bytea tree_leaves "the part's leaves at tree_chunk_log"
         bytea tree_root "the part's own BLAKE3 hash, when hashed at offset 0"
     }
     blob_release_intents {

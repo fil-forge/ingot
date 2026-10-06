@@ -981,19 +981,19 @@ func (t *Body) MarshalCBOR(w io.Writer) error {
 
 	}
 
-	// t.TreeGroup (uint8) (uint8)
-	if len("tg") > 1000000 {
-		return xerrors.Errorf("Value in field \"tg\" was too long")
+	// t.TreeChunkLog (uint8) (uint8)
+	if len("tc") > 1000000 {
+		return xerrors.Errorf("Value in field \"tc\" was too long")
 	}
 
-	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("tg"))); err != nil {
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("tc"))); err != nil {
 		return err
 	}
-	if _, err := cw.WriteString(string("tg")); err != nil {
+	if _, err := cw.WriteString(string("tc")); err != nil {
 		return err
 	}
 
-	if err := cw.WriteMajorTypeHeader(cbg.MajUnsignedInt, uint64(t.TreeGroup)); err != nil {
+	if err := cw.WriteMajorTypeHeader(cbg.MajUnsignedInt, uint64(t.TreeChunkLog)); err != nil {
 		return err
 	}
 
@@ -1317,8 +1317,8 @@ func (t *Body) UnmarshalCBOR(r io.Reader) (err error) {
 
 				}
 			}
-			// t.TreeGroup (uint8) (uint8)
-		case "tg":
+			// t.TreeChunkLog (uint8) (uint8)
+		case "tc":
 
 			maj, extra, err = cr.ReadHeader()
 			if err != nil {
@@ -1330,7 +1330,7 @@ func (t *Body) UnmarshalCBOR(r io.Reader) (err error) {
 			if extra > math.MaxUint8 {
 				return fmt.Errorf("integer in input was too large for uint8 field")
 			}
-			t.TreeGroup = uint8(extra)
+			t.TreeChunkLog = uint8(extra)
 			// t.TreeLeaves ([]uint8) (slice)
 		case "tl":
 

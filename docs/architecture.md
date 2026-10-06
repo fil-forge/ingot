@@ -189,7 +189,7 @@ deferred, and a hybrid (relational index *alongside* the MST source-of-truth) is
 the S3 `etag` stored verbatim (a multipart ETag cannot be re-derived from the bytes), content-type,
 system and user headers, and a delete-marker flag for tombstone versions — plus a `Body`. The `Body`
 carries the whole-object `size` and `sha256` (integrity), the whole-object BLAKE3 digest that GET and
-HEAD return as a raw-codec CID in the `x-cid` header, with the chaining values of its group-aligned
+HEAD return as a raw-codec CID in the `x-cid` header, with the chaining values of its block-aligned
 blocks (about the square root of the size in 16 KiB units: 256 leaves at 1 GiB, 8 KiB; capped at 32768) for verifying ranged reads, and an **ordered, contiguous list of body
 blobs** — *shards*, in Forge terms — `[{ digest, offset, length }]` that together cover `[0, size)`:
 one entry for a small object, N for a split or multipart object. Each `digest` is the sha256 multihash
@@ -786,11 +786,11 @@ CREATE TABLE ingot.multipart_parts (
     checksum      text   NOT NULL DEFAULT '',
     -- The part's BLAKE3 tree, hashed at the object offset UploadPart guessed
     -- and merged into the object's digest at Complete (see blake3tree).
-    -- tree_nodes NULL / tree_group 0: no tree recorded, Complete re-hashes.
+    -- tree_nodes NULL: no tree recorded, Complete re-hashes.
     tree_offset   bigint NOT NULL DEFAULT 0,
-    tree_group    smallint NOT NULL DEFAULT 0,
+    tree_chunk_log smallint NOT NULL DEFAULT 0,          -- block size of tree_leaves, base-2 exponent of chunks
     tree_nodes    bytea,                                 -- aligned subtrees (blake3tree.EncodeSubtrees)
-    tree_leaves   bytea,                                 -- leaves at tree_group
+    tree_leaves   bytea,                                 -- leaves at tree_chunk_log
     tree_root     bytea,                                 -- the part's own hash, when hashed at offset 0
     PRIMARY KEY (upload_id, part_number)
 );

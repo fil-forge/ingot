@@ -82,7 +82,7 @@ type ObjectManifest struct {
 // Size and SHA256 are whole-object values (the total byte count and the
 // sha256 of the full body, for integrity). MD5 is the whole-object md5,
 // the source for a single-part object's S3 ETag. BLAKE3 is the whole-object
-// digest clients verify against (see CID), with TreeGroup and TreeLeaves
+// digest clients verify against (see CID), with TreeChunkLog and TreeLeaves
 // the tree material for verifying ranged reads.
 type Body struct {
 	Size   int64     `cborgen:"s"`
@@ -94,15 +94,15 @@ type Body struct {
 	// x-cid header carries as a raw-codec CID. Nil in blocks written before
 	// it was recorded, which return no x-cid.
 	BLAKE3 []byte `cborgen:"b3"`
-	// TreeGroup is the leaf size of TreeLeaves as a base-2 exponent of
-	// bytes: a power of two, at least 16 KiB, near the geometric mean of the
-	// body's size and 16 KiB (blake3tree.GroupLog), so the leaf count grows
-	// with the square root of the size: 16 leaves at 4 MiB, 256 at 1 GiB,
-	// 8192 at 1 TiB, capped at 32768 (1 MiB of leaves). Zero when BLAKE3 is
-	// nil.
-	TreeGroup uint8 `cborgen:"tg"`
-	// TreeLeaves holds the BLAKE3 chaining value (32 bytes) of every
-	// TreeGroup-aligned block of the body, concatenated in order. A client
+	// TreeChunkLog is the block (leaf) size of TreeLeaves as a base-2
+	// exponent of BLAKE3 chunks, the unit Bao libraries take: at least 4
+	// (16 KiB), near the geometric mean of the body's size and 16 KiB
+	// (blake3tree.ChunkLog), so the leaf count grows with the square root
+	// of the size: 16 leaves at 4 MiB, 256 at 1 GiB, 8192 at 1 TiB, capped
+	// at 32768 (1 MiB of leaves). Zero when BLAKE3 is nil.
+	TreeChunkLog uint8 `cborgen:"tc"`
+	// TreeLeaves holds the BLAKE3 chaining value (32 bytes) of every block
+	// of the body, concatenated in order. A client
 	// checks the list against BLAKE3 by merging it up to the root, then
 	// verifies each block it reads against its leaf. Nil for a zero-byte
 	// body and in blocks written before it was recorded.

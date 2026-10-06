@@ -58,7 +58,7 @@ func guessPartOffset(prior []registry.MultipartPart, partNumber int, size int64)
 // recordPartTree stores a part's finished tree on its record.
 func recordPartTree(p *registry.MultipartPart, rng blake3tree.Range) {
 	p.TreeOffset = rng.Offset
-	p.TreeGroup = rng.GroupLog
+	p.TreeChunkLog = rng.ChunkLog
 	p.TreeNodes = blake3tree.EncodeSubtrees(rng.Subtrees)
 	p.TreeLeaves = blake3tree.EncodeSubtrees(rng.LeafSubtrees())
 	if rng.HasRoot {
@@ -76,7 +76,7 @@ func recordedPartRange(p registry.MultipartPart) (blake3tree.Range, error) {
 	if err != nil {
 		return blake3tree.Range{}, fmt.Errorf("part %d leaves: %w", p.PartNumber, err)
 	}
-	rng := blake3tree.Range{Offset: p.TreeOffset, Size: p.Size, Subtrees: subs, GroupLog: p.TreeGroup}
+	rng := blake3tree.Range{Offset: p.TreeOffset, Size: p.Size, Subtrees: subs, ChunkLog: p.TreeChunkLog}
 	for _, l := range leafSubs {
 		rng.Leaves = append(rng.Leaves, blake3tree.Leaf{CV: l.CV, Offset: int64(l.Pos) * blake3tree.ChunkSize})
 	}
@@ -136,7 +136,7 @@ func (b *Backend) partRanges(ctx context.Context, src *bodySource, parts []regis
 	ranges := make([]blake3tree.Range, 0, len(parts))
 	for i := 0; i < usable; i++ {
 		p := parts[i]
-		if p.TreeGroup != 0 && p.TreeOffset == offsets[i] {
+		if len(p.TreeNodes) > 0 && p.TreeOffset == offsets[i] {
 			rng, err := recordedPartRange(p)
 			if err == nil {
 				ranges = append(ranges, rng)

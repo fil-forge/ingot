@@ -269,3 +269,7 @@ require (
 	pitr.ca/jsontokenizer v0.3.2 // indirect
 	tags.cncf.io/container-device-interface v1.1.0 // indirect
 )
+
+// TEMPORARY: Blake3Tree.ChunkLog lives on the fork branch, unpushed. Replace
+// with a pin bump (go get github.com/fil-forge/versitygw@<sha>) once pushed.
+replace github.com/fil-forge/versitygw => ../versitygw-blake3-attribute

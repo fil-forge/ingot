@@ -78,7 +78,7 @@ func TestCIDHeader(t *testing.T) {
 }
 
 // TestBlake3Attribute checks GetObjectAttributes returns the Blake3 element:
-// the object's CID, the group for its size, and a Bao outboard the Bao
+// the object's CID, the chunk log for its size, and a Bao outboard the Bao
 // library verifies the object's blocks against. The controller filters by
 // requested attribute; the backend always populates it.
 func TestBlake3Attribute(t *testing.T) {
@@ -100,20 +100,20 @@ func TestBlake3Attribute(t *testing.T) {
 	if want := cid.NewCidV1(cid.Raw, digest).String(); res.Blake3.CID != want {
 		t.Fatalf("CID = %s, want %s", res.Blake3.CID, want)
 	}
-	if want := blake3tree.GroupLog(int64(len(data))); res.Blake3.Group != want {
-		t.Fatalf("Group = %d, want %d", res.Blake3.Group, want)
+	if want := blake3tree.ChunkLog(int64(len(data))); res.Blake3.ChunkLog != want {
+		t.Fatalf("ChunkLog = %d, want %d", res.Blake3.ChunkLog, want)
 	}
 	outboard, err := base64.StdEncoding.DecodeString(res.Blake3.Outboard)
 	if err != nil {
 		t.Fatalf("Outboard is not base64: %v", err)
 	}
-	// What a client does: load root, block size and outboard into a Bao
+	// What a client does: load root, chunk log and outboard into a Bao
 	// library and verify the blocks it read.
-	group := int(res.Blake3.Group) - 10
+	group := int(res.Blake3.ChunkLog)
 	if want, _ := bao.EncodeBuf(data, group, true); !bytes.Equal(outboard, want) {
 		t.Fatalf("outboard differs from the Bao library's encoding")
 	}
-	block := blake3tree.GroupSize(res.Blake3.Group)
+	block := blake3tree.BlockSize(res.Blake3.ChunkLog)
 	for off := int64(0); off < int64(len(data)); off += block {
 		if !bao.VerifyChunk(data[off:min(off+block, int64(len(data)))], outboard, group, uint64(off), root) {
 			t.Fatalf("block at %d not verified", off)

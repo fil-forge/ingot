@@ -29,54 +29,97 @@ func newBlake3Cmd() *cobra.Command {
 		Short: "Hash and verify object data against ingot's BLAKE3 CIDs",
 		Long: `Client-side checks for the x-cid header (a CIDv1 with the raw codec over
 the object's BLAKE3 multihash) and the Blake3 attribute of GetObjectAttributes
-(the object's CID, Group and Bao Outboard, which verify ranged reads).`,
+(the object's CID, ChunkLog and Bao Outboard, which verify ranged reads).`,
 	}
 	c.AddCommand(newBlake3HashCmd(), newBlake3VerifyCmd(), newBlake3RangeCmd())
 	return c
 }
 
 func newBlake3HashCmd() *cobra.Command {
-	return &cobra.Command{
+	var bao bool
+	var chunkLog uint8
+	c := &cobra.Command{
 		Use:   "hash",
 		Short: "Print the CID of the data on stdin",
-		Args:  cobra.NoArgs,
+		Long: `Print the CID of the data on stdin: the x-cid header ingot returns for it.
+
+With --bao, print what the Blake3 attribute of GetObjectAttributes would
+carry for it, one per line: CID, ChunkLog (the Bao block size as a base-2
+exponent of 1 KiB BLAKE3 chunks) and Outboard (the Bao outboard, base64),
+the inputs of "ingot blake3 range" and the ranged "ingot blake3 verify".
+The chunk log is the one ingot would record for a body of this size unless
+--chunk-log chooses another. For an outboard iroh can use, set --chunk-log
+4, iroh's fixed 16 KiB block; 0 is the original Bao format. The leaves are
+held in memory while hashing, 32 bytes per block.`,
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			c, err := hashCID(cmd.InOrStdin())
+			in := bufio.NewReaderSize(cmd.InOrStdin(), 1<<20)
+			if !bao {
+				if cmd.Flags().Changed("chunk-log") {
+					return errors.New("--chunk-log needs --bao")
+				}
+				c, err := hashCID(in)
+				if err != nil {
+					return err
+				}
+				fmt.Fprintln(cmd.OutOrStdout(), c)
+				return nil
+			}
+			h, err := blake3tree.NewHasher(0)
+			if cmd.Flags().Changed("chunk-log") {
+				h, err = blake3tree.NewHasherAtChunkLog(0, chunkLog)
+			}
 			if err != nil {
 				return err
 			}
-			fmt.Fprintln(cmd.OutOrStdout(), c)
+			if _, err := io.Copy(h, in); err != nil {
+				return fmt.Errorf("read stdin: %w", err)
+			}
+			obj := h.FinishObject()
+			digest, err := mh.Encode(obj.Root[:], mh.BLAKE3)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "CID %s\nChunkLog %d\nOutboard %s\n",
+				cid.NewCidV1(cid.Raw, digest), obj.ChunkLog,
+				base64.StdEncoding.EncodeToString(blake3tree.Outboard(obj.Leaves, obj.Size)))
 			return nil
 		},
 	}
+	c.Flags().BoolVar(&bao, "bao", false, "also print the ChunkLog and the base64 Bao Outboard, as the Blake3 attribute carries them")
+	c.Flags().Uint8Var(&chunkLog, "chunk-log", 0, "with --bao: build the outboard at this block size (base-2 exponent of chunks) instead of ingot's; 4 for iroh")
+	return c
 }
 
 // blake3TreeFlags are the Blake3 attribute's values a ranged check needs:
-// the group, and the outboard either inline as the base64 from the XML or
-// from a file.
+// the chunk log, and the outboard either inline as the base64 from the XML
+// or from a file.
 type blake3TreeFlags struct {
 	outboard     string
 	outboardPath string
-	group        uint8
+	chunkLog     uint8
+	chunkLogSet  bool
 }
 
 func (f *blake3TreeFlags) bind(c *cobra.Command) {
 	c.Flags().StringVar(&f.outboard, "outboard", "", "the attribute's Outboard as its base64 string")
 	c.Flags().StringVar(&f.outboardPath, "outboard-file", "", "file holding the attribute's Outboard, as the base64 string or as raw bytes")
-	c.Flags().Uint8Var(&f.group, "group", 0, "the attribute's Group: block size as a base-2 exponent of bytes")
+	c.Flags().Uint8Var(&f.chunkLog, "chunk-log", 0, "the attribute's ChunkLog: block size as a base-2 exponent of 1 KiB chunks")
 	c.MarkFlagsMutuallyExclusive("outboard", "outboard-file")
+	c.PreRun = func(c *cobra.Command, _ []string) { f.chunkLogSet = c.Flags().Changed("chunk-log") }
 }
 
 // given reports whether any of the flags was set.
 func (f *blake3TreeFlags) given() bool {
-	return f.outboard != "" || f.outboardPath != "" || f.group != 0
+	return f.outboard != "" || f.outboardPath != "" || f.chunkLogSet
 }
 
-// load decodes and checks the outboard. The group and one of the outboard
-// flags are required together.
+// load decodes and checks the outboard. The chunk log (0 is a valid value,
+// the original Bao chunk, so it must be given explicitly) and one of the
+// outboard flags are required together.
 func (f *blake3TreeFlags) load() ([]byte, error) {
-	if (f.outboard == "" && f.outboardPath == "") || f.group == 0 {
-		return nil, errors.New("--group and one of --outboard or --outboard-file are required together")
+	if (f.outboard == "" && f.outboardPath == "") || !f.chunkLogSet {
+		return nil, errors.New("--chunk-log and one of --outboard or --outboard-file are required together")
 	}
 	raw, src := []byte(f.outboard), "--outboard"
 	if f.outboardPath != "" {
@@ -92,10 +135,11 @@ func (f *blake3TreeFlags) load() ([]byte, error) {
 	} else if f.outboardPath == "" {
 		return nil, fmt.Errorf("--outboard is not base64: %w", err)
 	}
-	// The group and the outboard must agree with each other (and the group
-	// must be one a block size can be computed from) before either is used.
-	if _, err := blake3tree.OutboardLeaves(outboard, f.group); err != nil {
-		return nil, fmt.Errorf("%s with --group %d: %w", src, f.group, err)
+	// The chunk log and the outboard must agree with each other (and the
+	// chunk log must be one a block size can be computed from) before
+	// either is used.
+	if _, err := blake3tree.OutboardLeaves(outboard, f.chunkLog); err != nil {
+		return nil, fmt.Errorf("%s with --chunk-log %d: %w", src, f.chunkLog, err)
 	}
 	return outboard, nil
 }
@@ -108,7 +152,7 @@ func newBlake3VerifyCmd() *cobra.Command {
 		Short: "Verify the data on stdin against an object CID",
 		Long: `Verify the data on stdin against an object CID, the x-cid header's value.
 
-Without flags the whole object is expected and hashed. With --group,
+Without flags the whole object is expected and hashed. With --chunk-log,
 --offset and the outboard (--outboard as the attribute's base64 string, or
 --outboard-file) the data is a block-aligned range of the object (see
 "ingot blake3 range"), checked block by block against the Bao outboard.
@@ -139,7 +183,7 @@ Exit status 1 means the data does not match; any other failure is 2.`,
 			var root blake3tree.CV
 			dec, _ := mh.Decode(want.Hash())
 			copy(root[:], dec.Digest)
-			n, err := blake3tree.VerifyBlocks(in, outboard, tree.group, offset, root)
+			n, err := blake3tree.VerifyBlocks(in, outboard, tree.chunkLog, offset, root)
 			var bad *blake3tree.BlockError
 			if errors.As(err, &bad) {
 				return &mismatchError{err.Error()}
@@ -175,7 +219,7 @@ block boundaries, or to the object's end.`,
 			if err != nil {
 				return err
 			}
-			start, end, err := blake3tree.AlignedRange(a, b, tree.group, blake3tree.OutboardSize(outboard))
+			start, end, err := blake3tree.AlignedRange(a, b, tree.chunkLog, blake3tree.OutboardSize(outboard))
 			if err != nil {
 				return err
 			}
