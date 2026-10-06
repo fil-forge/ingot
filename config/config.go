@@ -149,6 +149,13 @@ type Config struct {
 	// past it can have its first blobs deleted, failing the request. Empty →
 	// default 24h; under 1h is an error.
 	LocalBlobOrphanAge string `mapstructure:"local_blob_orphan_age" yaml:"local_blob_orphan_age"`
+	// CacheWrites moves each body's local copy into the cache once the
+	// provider has accepted it, so a read soon after a write is served from
+	// local disk. false drops the copy at once: local disk then holds only
+	// bodies still being written or uploaded, and every read goes to the
+	// provider. A pointer, so an explicit false is distinguishable from unset
+	// (true).
+	CacheWrites *bool `mapstructure:"cache_writes" yaml:"cache_writes"`
 
 	// CatalogPlane overrides the catalog logstore pipeline knobs. Any field
 	// left zero/unset falls back to the top-level SealBytes / SealAge / Retain
@@ -277,6 +284,7 @@ func (c Config) ServerConfig() (ServerConfig, error) {
 		CacheMinResidency:  cacheMinResidency,
 		CacheReadRetention: cacheReadRetention,
 		LocalBlobOrphanAge: localBlobOrphanAge,
+		DropAcceptedBodies: c.CacheWrites != nil && !*c.CacheWrites,
 	}, nil
 }
 

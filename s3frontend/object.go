@@ -536,7 +536,7 @@ func (b *Backend) uploadBlob(ctx context.Context, space did.DID, blob msbucket.B
 		if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentAccepted); err != nil {
 			return fmt.Errorf("mark accepted (dedup): %w", err)
 		}
-		b.cacheHeld(blob.Digest)
+		b.cacheHeld(ctx, blob.Digest)
 		return nil
 	} else if err != nil && !errors.Is(err, registry.ErrNotFound) {
 		return fmt.Errorf("lookup location: %w", err)
@@ -581,7 +581,7 @@ func (b *Backend) uploadBlob(ctx context.Context, space did.DID, blob msbucket.B
 	}); err != nil {
 		return fmt.Errorf("record location: %w", err)
 	}
-	b.cacheHeld(blob.Digest)
+	b.cacheHeld(ctx, blob.Digest)
 	return nil
 }
 

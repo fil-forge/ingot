@@ -88,6 +88,7 @@ type Backend struct {
 	cacheMinResidency   time.Duration
 	cacheReadRetention  time.Duration
 	localBlobOrphanAge  time.Duration
+	dropAcceptedBodies  bool
 	localBlobSweepMu    sync.Mutex
 	lastOrphanPass      time.Time
 	localBlobSweepBatch int
@@ -216,6 +217,13 @@ type Deps struct {
 	// file in either directory, or a spool blob file with no intent row. Zero →
 	// DefaultLocalBlobOrphanAge.
 	LocalBlobOrphanAge time.Duration
+	// DropAcceptedBodies removes each body's local copy as soon as its
+	// location is recorded and its intent accepted, instead of moving it
+	// into the cache for reads. Off in the in-memory harness, whose base
+	// tier cannot serve a body. It gives up the read-after-write copy, which
+	// is safe while reads resolve through the local location table; an
+	// indexer-backed locator could miss a digest not yet published.
+	DropAcceptedBodies bool
 
 	// MeterProvider supplies the spool's instruments: usage and budget
 	// gauges, and removals by reason. Nil → the global provider, a no-op
@@ -288,6 +296,7 @@ func New(d Deps) *Backend {
 		cacheMinResidency:  d.CacheMinResidency,
 		cacheReadRetention: d.CacheReadRetention,
 		localBlobOrphanAge: localBlobOrphanAge,
+		dropAcceptedBodies: d.DropAcceptedBodies,
 
 		logger:      logger,
 		maxBlobSize: d.MaxBlobSize,

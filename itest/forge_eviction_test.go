@@ -124,3 +124,44 @@ func TestForgeLocalBlobBudget(t *testing.T) {
 		}
 	}
 }
+
+// TestForgeUncachedWrites proves cache_writes off
+// (testdata/config-uncachedwrites.yaml): a PUT leaves no body on local disk
+// once it returns, and the object reads back byte-exact from piri.
+//
+//	go test -tags itest ./itest -run TestForgeUncachedWrites -v -timeout 900s
+func TestForgeUncachedWrites(t *testing.T) {
+	ctx := t.Context()
+
+	s, ingotEndpoint := forgeStack(t, withUncachedWritesConfig())
+	accessKey, secretKey := hiltProvisionTenant(t, ctx, s, "uncached")
+	cfg := forgeConfig(ingotEndpoint, accessKey, secretKey)
+	const bucket, key = "uncached-bucket", "obj"
+
+	if err := ingottest.CreateBucket(ctx, cfg, bucket); err != nil {
+		t.Fatalf("create bucket: %v", err)
+	}
+	data := make([]byte, 3<<20)
+	for i := range data {
+		data[i] = byte(i*13 + 5)
+	}
+	before := localBlobCount(t, ctx, s)
+	if err := ingottest.PutBytes(ctx, cfg, bucket, key, data); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if got := localBlobCount(t, ctx, s) - before; got != 0 {
+		t.Fatalf("PUT left %d local blobs, want 0 with cache_writes off", got)
+	}
+	// Every blob the PUT accepted is marked evicted: nothing on this stack
+	// keeps a written body, so no accepted intent should be unmarked.
+	if unmarked := ingotSQL(t, ctx, s, `SELECT count(*) FROM ingot.upload_intents WHERE state IN ('accepted', 'published') AND evicted_at IS NULL`); unmarked != "0" {
+		t.Fatalf("accepted intents not marked evicted = %s, want 0", unmarked)
+	}
+	got, err := ingottest.GetBytes(ctx, cfg, bucket, key)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("get: got %d bytes, want %d matching bytes", len(got), len(data))
+	}
+}

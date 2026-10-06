@@ -68,6 +68,9 @@ type ServerConfig struct {
 	CacheMinResidency  time.Duration
 	CacheReadRetention time.Duration
 	LocalBlobOrphanAge time.Duration
+	// DropAcceptedBodies removes each body's local copy as soon as the
+	// provider has accepted it (Config.CacheWrites false).
+	DropAcceptedBodies bool
 
 	// CORSConfig is the S3 CORS configuration the backend reports for
 	// every bucket, rendered from Config.CORSAllowedOrigins by

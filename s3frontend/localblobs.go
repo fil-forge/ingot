@@ -1,10 +1,14 @@
 package s3frontend
 
 import (
+	"context"
 	"encoding/hex"
+	"errors"
 
 	"github.com/multiformats/go-multihash"
 	"go.uber.org/zap"
+
+	"github.com/fil-forge/ingot/registry"
 )
 
 // localUsage returns the bytes the local blob directories hold: the spool,
@@ -18,11 +22,35 @@ func (b *Backend) localUsage() int64 {
 // copy already elsewhere, or none at all, moves nothing. A failed move is
 // logged and leaves the copy in the spool, where eviction does not look for
 // a blob until the registry proves the provider holds it.
-func (b *Backend) cacheHeld(digest multihash.Multihash) {
+//
+// With written bodies not cached (Deps.DropAcceptedBodies), it removes the
+// copy instead and marks the intent evicted, so reads go to the provider.
+// Like the parked-part drop, a failure costs only disk and is logged.
+func (b *Backend) cacheHeld(ctx context.Context, digest multihash.Multihash) {
+	if b.dropAcceptedBodies {
+		b.dropAcceptedCopy(ctx, digest)
+		return
+	}
 	if _, err := b.cache.Take(b.spool, digest); err != nil {
 		b.logger.Warn("could not move a held blob's local copy into the cache; it stays in the spool",
 			zap.String("digest", hex.EncodeToString(digest)),
 			zap.Error(err))
+	}
+}
+
+// dropAcceptedCopy removes a held blob's local copy and marks its intent
+// evicted.
+func (b *Backend) dropAcceptedCopy(ctx context.Context, digest multihash.Multihash) {
+	freed, err := b.removeLocal(digest)
+	b.localBlobMetrics.removedFile(ctx, removedAccepted, freed)
+	if err != nil {
+		b.logger.Warn("drop accepted blob's local copy failed; the local blob sweeper or the object's release removes it",
+			zap.String("digest", hex.EncodeToString(digest)), zap.Error(err))
+		return
+	}
+	if err := b.intents.MarkEvicted(ctx, digest); err != nil && !errors.Is(err, registry.ErrNotFound) {
+		b.logger.Warn("mark accepted blob evicted failed",
+			zap.String("digest", hex.EncodeToString(digest)), zap.Error(err))
 	}
 }
 

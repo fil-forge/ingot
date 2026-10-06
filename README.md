@@ -179,12 +179,18 @@ long the provider keeps parked allocations. The TTL counts from the
 session's last state change, and a failed Complete returns the session to
 open, which restarts it, so a part can outlive the TTL. The budget is off by default
 (`local_blob_max_bytes: 0`): without it the cache grows with every live
-object's bodies. With or without a budget, the sweeper also deletes, at
-startup and then hourly, unfinished `.tmp-*` writes in either directory and
-spool files with no upload intent, once they are older than
-`local_blob_orphan_age` (default `24h`, at least `1h`). Once at each
-startup, `serve` also deletes the copies of objects deleted by a version of
-ingot that kept them.
+object's bodies. A node that rarely reads back what it just wrote can keep
+no written bodies at all: with `cache_writes: false`, each body's copy goes
+as soon as the provider accepts it instead of moving to the cache, and every
+read goes to the provider. The spool then holds only bodies still being
+written or uploaded, apart from a copy whose removal failed, which waits for
+its object's release or the budget; bodies cached before the setting was
+turned off stay until they are released or evicted. With or without a
+budget, the sweeper also deletes, at startup and then hourly, unfinished
+`.tmp-*` writes in either directory and spool files with no upload intent,
+once they are older than `local_blob_orphan_age` (default `24h`, at least
+`1h`). Once at each startup, `serve` also deletes the copies of objects
+deleted by a version of ingot that kept them.
 
 **Sizing.** The filesystem needs room for:
 
@@ -216,7 +222,7 @@ ingot that kept them.
 | `ingot.local_blobs.usage` | Bytes held, by `dir`: `spool` (writes in progress and bodies awaiting upload, which eviction cannot touch) or `cache` |
 | `ingot.local_blobs.budget` | `local_blob_max_bytes` (0: no budget) |
 | `ingot.local_blobs.stalled_bytes` | Bytes of bodies whose upload has stalled: intents still `spooled` or `uploading` an hour after their last state change, which nothing reclaims yet. Growth means uploads are failing |
-| `ingot.local_blobs.removals`, `ingot.local_blobs.removed_bytes` | Files and bytes removed, by `reason`: `released`, `parked`, `budget`, `budget_forced` (inside a retention window), `orphan` |
+| `ingot.local_blobs.removals`, `ingot.local_blobs.removed_bytes` | Files and bytes removed, by `reason`: `released`, `parked`, `accepted` (with `cache_writes: false`), `budget`, `budget_forced` (inside a retention window), `orphan` |
 | `ingot.local_blobs.reads` | Body-blob reads, by `tier`: `local` or `network` (the local hit ratio) |
 
 **Manual cleanup.** Every file in `<data_dir>/cache` is safe to delete: the

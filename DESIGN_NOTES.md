@@ -196,10 +196,13 @@ role. The **spool** (`<data_dir>/spool`, `blockstore.Spool`) holds writes in
 progress (`.tmp-*` files) and finished blobs waiting for their upload. The
 **cache** (`<data_dir>/cache`, `blockstore.BlobCache`) holds copies of blobs
 the provider already holds: once a blob's location and `accepted` state are
-both recorded, its file moves from the spool to the cache by rename, which is
-why the two share a filesystem. A failed move leaves the file in the spool.
-Reads try the cache, then the spool, then the cache again (a blob can move
-between the first two lookups), then the network.
+both recorded, its file moves from the spool to the cache by rename, which
+is why the two share a filesystem. A failed move leaves the file in the
+spool. With `cache_writes: false`, the copy is removed at that point
+instead, and its intent marked evicted, so the cache holds nothing written
+after that and every read goes to the provider. Reads try the cache, then
+the spool, then the cache again (a blob can move between the first two
+lookups), then the network.
 
 Each directory keeps a running byte count of its blob files, and the spool
 also counts writes in progress as their bytes land. With

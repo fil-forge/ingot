@@ -149,14 +149,14 @@ func mustSum(b []byte) multihash.Multihash {
 
 const streamBlobCeiling = 300 << 10
 
-func newStreamingBackend(t *testing.T, su *streamingUploader) (*Backend, *inmem.MemStore) {
+func newStreamingBackend(t *testing.T, su *streamingUploader, mods ...func(*Deps)) (*Backend, *inmem.MemStore) {
 	t.Helper()
-	return newDeferredBackend(t, su, func(d *Deps) {
+	return newDeferredBackend(t, su, append([]func(*Deps){func(d *Deps) {
 		d.Streaming = su
 		d.Streams = d.Parks.(*inmem.MemStore)
 		d.Reads = blockstore.NewLayered(blockstore.LocalBlobs{Cache: d.Cache, Spool: d.Spool}, d.Log, su)
 		d.MaxBlobSize = streamBlobCeiling
-	})
+	}}, mods...)...)
 }
 
 func putSized(t *testing.T, b *Backend, key string, data []byte, declared int64) error {
