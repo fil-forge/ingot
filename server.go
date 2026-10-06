@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/fil-forge/libforge/identity"
@@ -137,14 +138,17 @@ var _ s3frontend.SegmentDigestLister = (*logstore.Manager)(nil)
 // lifecycle. fx callers wrap these in OnStart/OnStop hooks; tests
 // call them directly.
 type Server struct {
-	cfg           config.ServerConfig
-	logger        *zap.Logger
-	log           blockstore.Log
-	backend       *s3frontend.Backend
-	api           *s3api.S3ApiServer
-	sweepStop     chan struct{}
-	releaseStop   chan struct{}
-	localBlobStop chan struct{}
+	cfg     config.ServerConfig
+	logger  *zap.Logger
+	log     blockstore.Log
+	backend *s3frontend.Backend
+	api     *s3api.S3ApiServer
+	// sweepCtx is cancelled by Stop. Every background sweep derives its
+	// context from it, and sweeps counts the sweeper goroutines, so Stop
+	// can wait for them to exit before the registry closes.
+	sweepCtx    context.Context
+	sweepCancel context.CancelFunc
+	sweeps      sync.WaitGroup
 }
 
 // New wires a ServerDeps + ServerConfig into a runnable Server. The
@@ -259,7 +263,7 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 
 // Start runs Backend.Recover and spawns the S3 listener goroutine.
 // Returns once the listener has been kicked off (does NOT wait for
-// it to start serving on Addr).
+// it to start serving on Addr). Call it at most once.
 func (s *Server) Start(ctx context.Context) error {
 	if err := s.backend.Recover(ctx); err != nil {
 		// fx does not run OnStop for a hook whose OnStart failed, so the
@@ -278,10 +282,21 @@ func (s *Server) Start(ctx context.Context) error {
 			s.logger.Error("ingot listener error", zap.Error(err))
 		}
 	}()
+	s.sweepCtx, s.sweepCancel = context.WithCancel(context.Background())
 	s.startMultipartSweeper()
 	s.startReleaseSweeper()
 	s.startLocalBlobSweeper()
 	return nil
+}
+
+// goSweep runs fn in a sweeper goroutine that Stop waits for. fn returns
+// once s.sweepCtx is done.
+func (s *Server) goSweep(fn func()) {
+	s.sweeps.Add(1)
+	go func() {
+		defer s.sweeps.Done()
+		fn()
+	}()
 }
 
 // startMultipartSweeper spawns the abandoned-multipart-session sweeper: open
@@ -300,19 +315,15 @@ func (s *Server) startMultipartSweeper() {
 	if interval > 10*time.Minute {
 		interval = 10 * time.Minute
 	}
-	s.sweepStop = make(chan struct{})
-	// The goroutine keeps its own copy of the channel, as the local blob
-	// sweeper does: Stop closes it and then clears the field.
-	stop := s.sweepStop
-	go func() {
+	s.goSweep(func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
 			select {
-			case <-stop:
+			case <-s.sweepCtx.Done():
 				return
 			case <-ticker.C:
-				ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+				ctx, cancel := context.WithTimeout(s.sweepCtx, time.Minute)
 				n, err := s.backend.SweepStaleMultipartSessions(ctx, ttl)
 				cancel()
 				if err != nil {
@@ -322,7 +333,7 @@ func (s *Server) startMultipartSweeper() {
 				}
 			}
 		}
-	}()
+	})
 }
 
 // startReleaseSweeper spawns the deferred-release sweeper: release intents
@@ -338,19 +349,15 @@ func (s *Server) startReleaseSweeper() {
 	if interval < time.Second {
 		interval = time.Second
 	}
-	s.releaseStop = make(chan struct{})
-	// The goroutine keeps its own copy of the channel, as the local blob
-	// sweeper does: Stop closes it and then clears the field.
-	stop := s.releaseStop
-	go func() {
+	s.goSweep(func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
 			select {
-			case <-stop:
+			case <-s.sweepCtx.Done():
 				return
 			case <-ticker.C:
-				ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+				ctx, cancel := context.WithTimeout(s.sweepCtx, time.Minute)
 				n, err := s.backend.SweepPendingReleases(ctx)
 				cancel()
 				if err != nil {
@@ -358,7 +365,7 @@ func (s *Server) startReleaseSweeper() {
 				} else if n > 0 {
 					s.logger.Info("release sweep executed deferred releases", zap.Int("count", n))
 				}
-				ctx, cancel = context.WithTimeout(context.Background(), time.Minute)
+				ctx, cancel = context.WithTimeout(s.sweepCtx, time.Minute)
 				n, err = s.backend.SweepStaleStreams(ctx)
 				cancel()
 				if err != nil {
@@ -368,7 +375,7 @@ func (s *Server) startReleaseSweeper() {
 				}
 			}
 		}
-	}()
+	})
 }
 
 // localBlobSweepInterval is how often the local blob sweeper runs. The
@@ -384,12 +391,7 @@ const localBlobSweepLogInterval = 10 * time.Minute
 // LocalBlobMaxBytes (when set), and hourly it deletes orphan files (see
 // Backend.SweepLocalBlobs).
 func (s *Server) startLocalBlobSweeper() {
-	s.localBlobStop = make(chan struct{})
-	// The goroutine keeps its own copy of the channel: Stop closes it and
-	// then clears the field, and a select that read the cleared field would
-	// block forever.
-	stop := s.localBlobStop
-	go func() {
+	s.goSweep(func() {
 		// removed totals the removals since since, not yet logged.
 		var removed s3frontend.LocalBlobSweepStats
 		var lastLog time.Time
@@ -398,11 +400,11 @@ func (s *Server) startLocalBlobSweeper() {
 		defer ticker.Stop()
 		for {
 			select {
-			case <-stop:
+			case <-s.sweepCtx.Done():
 				return
 			case <-ticker.C:
 				// Each pass also caps itself; this bounds them together.
-				ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+				ctx, cancel := context.WithTimeout(s.sweepCtx, 4*time.Minute)
 				stats, err := s.backend.SweepLocalBlobs(ctx)
 				cancel()
 				if err != nil {
@@ -424,28 +426,23 @@ func (s *Server) startLocalBlobSweeper() {
 				}
 			}
 		}
-	}()
+	})
 }
 
-// Stop shuts the listener down and drains the log. Always returns
-// the combined error of the two operations so callers see all
-// failure modes; either alone is non-fatal to the other.
+// Stop cancels the background sweeps and waits for them to exit, then
+// shuts the listener down and drains the log. Always returns the combined
+// error of these steps so callers see all failure modes; none is fatal to
+// the others.
 func (s *Server) Stop(ctx context.Context) error {
 	s.logger.Info("shutting down ingot S3 listener")
 
-	if s.sweepStop != nil {
-		close(s.sweepStop)
-		s.sweepStop = nil
-	}
-	if s.releaseStop != nil {
-		close(s.releaseStop)
-		s.releaseStop = nil
-	}
-	if s.localBlobStop != nil {
-		close(s.localBlobStop)
-		s.localBlobStop = nil
-	}
 	var errs []error
+	if s.sweepCancel != nil {
+		s.sweepCancel()
+		if err := s.waitSweeps(ctx); err != nil {
+			errs = append(errs, err)
+		}
+	}
 	if err := s.backend.CloseMetrics(); err != nil {
 		errs = append(errs, fmt.Errorf("unregister local blob metrics: %w", err))
 	}
@@ -459,6 +456,22 @@ func (s *Server) Stop(ctx context.Context) error {
 		return fmt.Errorf("ingot shutdown: %v", errs)
 	}
 	return nil
+}
+
+// waitSweeps waits for the sweeper goroutines to exit, or for ctx to end.
+// A sweep stops at its next context check once sweepCtx is cancelled.
+func (s *Server) waitSweeps(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() {
+		s.sweeps.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("waiting for background sweeps: %w", ctx.Err())
+	}
 }
 
 // newBucketFlushFunc builds the logstore flush callback for one bucket's

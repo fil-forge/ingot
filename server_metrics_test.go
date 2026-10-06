@@ -22,53 +22,12 @@ import (
 // TestServerReportsLocalBlobGauges: New registers the local blob gauges on
 // the global meter provider, and Stop unregisters them.
 func TestServerReportsLocalBlobGauges(t *testing.T) {
-	ctx := t.Context()
 	reader := sdkmetric.NewManualReader()
 	prev := otel.GetMeterProvider()
 	otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)))
 	t.Cleanup(func() { otel.SetMeterProvider(prev) })
 
-	id, err := identity.New("", "did:web:ingot.test")
-	require.NoError(t, err)
-	svc := iam.New(neverAuthorizer{}, iam.NewKeyProofs(), iam.NewVerificationKeyCache(), iam.NewTenantCache())
-	t.Cleanup(func() { require.NoError(t, svc.Shutdown()) })
-	kek := make([]byte, regionkey.KEKLen)
-	_, _ = rand.Read(kek)
-	regionKeys, err := regionkey.NewInProcessProvider("v1", kek)
-	require.NoError(t, err)
-	tenantPriv, err := ecdh.X25519().GenerateKey(rand.Reader)
-	require.NoError(t, err)
-	mem := inmem.NewMemStore()
-	s, err := New(ctx, config.ServerConfig{
-		Addr:              freeAddr(t),
-		DataDir:           t.TempDir(),
-		Region:            "us-east-1",
-		MaxConnections:    16,
-		MaxRequests:       16,
-		LocalBlobMaxBytes: 1 << 20,
-	}, ServerDeps{
-		BaseBlockReader: inmem.NopBaseReader{},
-		Uploader:        inmem.NopUploader{},
-		BodyUploader:    inmem.NopUploader{},
-		Deferred:        inmem.NopUploader{},
-		Remover:         inmem.NopUploader{},
-		Registry:        mem,
-		Intents:         mem,
-		Locations:       mem,
-		Inclusions:      mem,
-		BlobRefs:        mem,
-		GC:              mem,
-		Multipart:       mem,
-		Parks:           mem,
-		PendingReleases: mem,
-		EncParams:       mem,
-		RegionKeys:      regionKeys,
-		TenantKeys:      tenantkey.NewStatic(tenantPriv.PublicKey()),
-		Meta:            mem,
-		Identity:        id,
-		IAM:             svc,
-	})
-	require.NoError(t, err)
+	s := newInmemServer(t, config.ServerConfig{LocalBlobMaxBytes: 1 << 20})
 
 	require.Equal(t, map[string]bool{
 		"ingot.local_blobs.usage":  true,
@@ -91,4 +50,50 @@ func metricNames(t *testing.T, reader *sdkmetric.ManualReader) map[string]bool {
 		}
 	}
 	return names
+}
+
+// newInmemServer builds a Server over the in-memory fakes. cfg's address,
+// data directory, region and connection limits are filled in.
+func newInmemServer(t *testing.T, cfg config.ServerConfig) *Server {
+	t.Helper()
+	id, err := identity.New("", "did:web:ingot.test")
+	require.NoError(t, err)
+	svc := iam.New(neverAuthorizer{}, iam.NewKeyProofs(), iam.NewVerificationKeyCache(), iam.NewTenantCache())
+	t.Cleanup(func() { require.NoError(t, svc.Shutdown()) })
+	kek := make([]byte, regionkey.KEKLen)
+	_, _ = rand.Read(kek)
+	regionKeys, err := regionkey.NewInProcessProvider("v1", kek)
+	require.NoError(t, err)
+	tenantPriv, err := ecdh.X25519().GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	mem := inmem.NewMemStore()
+	cfg.Addr = freeAddr(t)
+	cfg.DataDir = t.TempDir()
+	cfg.Region = "us-east-1"
+	cfg.MaxConnections = 16
+	cfg.MaxRequests = 16
+	s, err := New(t.Context(), cfg, ServerDeps{
+		BaseBlockReader: inmem.NopBaseReader{},
+		Uploader:        inmem.NopUploader{},
+		BodyUploader:    inmem.NopUploader{},
+		Deferred:        inmem.NopUploader{},
+		Remover:         inmem.NopUploader{},
+		Registry:        mem,
+		Intents:         mem,
+		Locations:       mem,
+		Inclusions:      mem,
+		BlobRefs:        mem,
+		GC:              mem,
+		Multipart:       mem,
+		Parks:           mem,
+		PendingReleases: mem,
+		EncParams:       mem,
+		RegionKeys:      regionKeys,
+		TenantKeys:      tenantkey.NewStatic(tenantPriv.PublicKey()),
+		Meta:            mem,
+		Identity:        id,
+		IAM:             svc,
+	})
+	require.NoError(t, err)
+	return s
 }
