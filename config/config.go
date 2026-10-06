@@ -254,7 +254,7 @@ func (c Config) ServerConfig() (ServerConfig, error) {
 
 		CORSConfig: corsCfg,
 
-		// A per-plane override wins, else the top-level value, else the logstore
+		// The catalog_plane override wins, else the top-level value, else the logstore
 		// default. Ship defaults to true unless the catalog block sets
 		// `ship: false`.
 		SealBytesCatalog: firstNonZero64(c.CatalogPlane.SealBytes, c.SealBytes),

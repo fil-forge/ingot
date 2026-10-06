@@ -487,16 +487,15 @@ func (s *Server) waitSweeps(ctx context.Context) error {
 // in the local location/inclusion tables (the appliance mirror of the
 // sharded-dag-index SubmitShard publishes). The store owns the
 // ship-state transition (it stamps the segment's shipped timestamp and
-// advances each affected bucket's forge_root_cid)
-// once this returns nil — so a segment is only ever marked shipped (and
-// thus eligible for retention) after its blocks are resolvable through
-// the fallthrough read tier.
+// advances each affected bucket's forge_root_cid) once this returns nil —
+// so a segment is only ever marked shipped (and thus eligible for
+// retention) after its blocks are resolvable through the fallthrough read
+// tier.
 //
-// A header-only CAR (e.g. an MST-only op writes no data blocks; a
-// trimTop-to-existing-subtree writes neither) has no positions: nothing
-// to ship, so the closure returns nil and the store still marks the
-// plane shipped, letting retention reclaim the tiny CAR and (for the
-// catalog plane) advancing forge_root_cid for the recorded op-roots.
+// A header-only CAR (a trimTop-to-existing-subtree writes no blocks) has
+// no positions: nothing to ship, so the closure returns nil and the store
+// still marks the segment shipped, letting retention reclaim the tiny CAR
+// and advancing forge_root_cid for the recorded op-roots.
 //
 // The destination space is the bucket's, resolved from the registry at
 // ship time (the log is segregated per bucket, so every segment this

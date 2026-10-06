@@ -286,8 +286,8 @@ digest must be known before `allocate`, and because that local copy does double 
 
 The `upload_intents` table records each blob Ingot has spooled, from ingest until its release:
 `digest → { local_path, size, state: spooled│uploading│parked│accepted│published, owner ref,
-evicted_at }`. Releases, the local blob sweeper and multipart Complete read it; local reads go by
-the files themselves. The Postgres schema for this and every other Ingot table is in **[Appendix C](#appendix-c--postgres-schema-the-ingot-schema)**.
+evicted_at }`. It records how far each blob got, which uploads, releases and eviction act on; local
+reads go by the files themselves. The Postgres schema for this and every other Ingot table is in **[Appendix C](#appendix-c--postgres-schema-the-ingot-schema)**.
 
 **Dedup and the reference index.** Piri stores identical bytes once (it answers `allocate` with
 "already have it" when the digest exists), so one blob can back many object versions — a re-PUT of

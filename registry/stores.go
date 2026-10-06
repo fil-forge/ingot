@@ -24,10 +24,11 @@ import (
 const NullVersionID = "null"
 
 // upload_intents.state values (the local-store lifecycle, §5): spooled on
-// ingest, uploading once its upload has started, parked once durable on a
-// provider with the accept deferred,
-// accepted once the provider has accepted it, and published once a bucket
-// commit has claimed it. Published is written with the blob's first
+// ingest (uploading from the start for a blob streamed as it spools),
+// uploading once its upload has started, parked once durable on a provider
+// with the accept deferred, accepted once the provider has accepted it (at
+// once for a blob already stored for the space), and published once a
+// bucket commit has claimed it. Published is written with the blob's first
 // reference claim, in the same transaction, and never changes: it is the
 // durable record that the blob was committed. Its release removes the local
 // copy (spool or cache) and the intent, as it does for a blob that was never

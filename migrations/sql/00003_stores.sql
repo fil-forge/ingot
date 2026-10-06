@@ -39,10 +39,13 @@ CREATE TABLE ingot.blob_refs (
 CREATE INDEX blob_refs_claim_idx ON ingot.blob_refs (space, digest);
 
 -- The local-store index (§5): each blob Ingot has spooled, from ingest
--- until its release. state advances spooled → uploading → (parked →)
--- accepted → published; eviction removes the file and keeps the row (see
--- evicted_at, 00021), and a release deletes both. Keyed by digest (global;
--- the same bytes back every object that references them).
+-- until its release. state starts at spooled (uploading for a blob streamed
+-- as it spools) and advances through uploading and, for a parked part,
+-- parked, to accepted and then published; a blob already stored for the
+-- space goes straight to accepted. Eviction removes the file and keeps the
+-- row, and a release deletes both. (uploading: 00019; evicted_at: 00021.)
+-- Keyed by digest (global; the same bytes back every object that
+-- references them).
 CREATE TABLE ingot.upload_intents (
     digest      bytea PRIMARY KEY,
     local_path  text   NOT NULL,

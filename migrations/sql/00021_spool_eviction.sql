@@ -2,8 +2,7 @@
 -- Spool eviction: the budget sweeper removes a blob's local file once the
 -- provider holds it, and records that here. An evicted blob keeps its intent
 -- row and its state: a session's release recognises a committed part blob by
--- 'published', and Complete reads part sizes from intents. The table comment in 00003
--- ("eviction deletes the row and the file") predates this rule.
+-- 'published', and Complete reads part sizes from intents.
 
 -- NULL means the file is on disk as far as the table knows. PutIntent clears
 -- it when a digest is spooled again.

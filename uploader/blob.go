@@ -78,7 +78,7 @@ type UploadedBlob struct {
 // BodyUploader makes one object-body blob durable on Forge by digest: allocate
 // → PUT (skipped on dedup) → accept, returning its published location.
 // WithConclude(false) stops before accept (see UploadedBlob). It is the
-// data-plane counterpart to Uploader (which ships catalog CAR segments). Unlike
+// object-body counterpart to Uploader (which ships catalog CAR segments). Unlike
 // the old data-plane pipeline, this is synchronous: a blob is durable — and,
 // when concluding, accepted — on Piri before the write path commits the
 // manifest that references it (docs/architecture.md §5, §7.1).

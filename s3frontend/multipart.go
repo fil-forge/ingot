@@ -197,10 +197,10 @@ func (b *Backend) bucketSpace(ctx context.Context, bucketName string) (did.DID, 
 // /blob/accept is deferred to Complete, so the bytes are durable but stay
 // out of the PDP pipeline, and an Abort unwinds them with /blob/abort
 // (§7.2). Re-uploading a part number supersedes the prior part; the
-// superseded part's now-unreferenced blobs are dropped from local disk and
-// rejected. The part ETag is the hex md5 of the part bytes: a Content-MD5 the
-// checksum middleware verified against the stream is reused, else it is
-// computed during ingest.
+// superseded part's now-unreferenced blobs get a release recorded. The part
+// ETag is the hex md5 of the part bytes: a Content-MD5 the checksum
+// middleware verified against the stream is reused, else it is computed
+// during ingest.
 //
 // The part checksum follows the session's CreateMultipartUpload declaration:
 // a declared algorithm is computed (and validated against a client-supplied
@@ -906,10 +906,9 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 }
 
 // AbortMultipartUpload cancels a multipart upload: it latches the session
-// (single-winner vs Complete), drops it (cascading its parts), and removes the
-// parts' now-unreferenced blobs from local disk — unallocating any that were
-// parked on a provider (an upload ends in exactly one of accept or
-// abort). No reference claims were taken (those happen only at
+// (single-winner vs Complete), drops it (cascading its parts), and records a
+// release for each of the parts' now-unreferenced blobs (which unallocates any
+// parked on a provider: an upload ends in exactly one of accept or abort). No reference claims were taken (those happen only at
 // Complete).
 func (b *Backend) AbortMultipartUpload(ctx context.Context, input *s3.AbortMultipartUploadInput) error {
 	if input.UploadId == nil {
