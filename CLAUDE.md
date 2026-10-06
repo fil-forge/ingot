@@ -88,7 +88,9 @@ Public surface (what hosts import):
 
 Internal:
 
-- **`cmd/`** — the daemon (cobra/viper/fx): `serve`, `whoami`, `version`;
+- **`cmd/`** — the daemon (cobra/viper/fx): `serve`, `whoami`, `version`,
+  `blake3` (hash / verify / range: client-side checks of `x-cid` and the
+  `Blake3` attribute, over `blake3tree`);
   `deps.go` (agent identity from the PEM key + optional did:web, pgx pool).
 - **`s3frontend/`** — versitygw `backend.Backend`: `object.go`
   (Put/Get/Head/Delete/List), `version.go` (resolveVersion / commitVersion,

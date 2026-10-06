@@ -123,7 +123,7 @@ flowchart TB
 
     subgraph host["host"]
         root["ingot (root)<br/>Server, Module"]
-        cmd["cmd<br/>serve, whoami, version"]
+        cmd["cmd<br/>serve, whoami, version, blake3"]
     end
 
     vgw -->|"backend.Backend"| s3f

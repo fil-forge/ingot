@@ -5,6 +5,8 @@ import (
 	"math/rand"
 	"testing"
 
+	"errors"
+
 	"lukechampine.com/blake3"
 	"lukechampine.com/blake3/bao"
 )
@@ -398,6 +400,78 @@ func TestOutboard(t *testing.T) {
 			if bao.VerifyChunk(bad, got, group, 0, root) {
 				t.Errorf("size %d: a corrupted block verified", size)
 			}
+		}
+	}
+}
+
+// TestVerifyBlocks covers the client side: aligned ranges verify, including
+// one ending at the body's short tail; a corrupted block is named by offset
+// after the good blocks before it; unaligned, short or overlong input is
+// refused before any verification; and a wrong root fails the first block.
+func TestVerifyBlocks(t *testing.T) {
+	const size = 300_000 // three 128 KiB blocks under the square-root rule, the last short
+	d := data(size)
+	h, _ := NewHasher(0)
+	h.Write(d)
+	obj := h.FinishObject()
+	outboard := Outboard(obj.Leaves, size)
+	block := GroupSize(obj.GroupLog)
+	if size/block != 2 || size%block == 0 {
+		t.Fatalf("test assumes 2 full blocks and a short tail, got block %d", block)
+	}
+
+	for _, c := range []struct{ start, end int64 }{
+		{0, size}, {0, block}, {block, 2 * block}, {2 * block, size}, {block, size},
+	} {
+		n, err := VerifyBlocks(bytes.NewReader(d[c.start:c.end]), outboard, obj.GroupLog, c.start, obj.Root)
+		if err != nil || n != c.end-c.start {
+			t.Fatalf("range [%d,%d): verified %d, err %v", c.start, c.end, n, err)
+		}
+	}
+	bad := bytes.Clone(d[block:])
+	bad[block+7] ^= 1
+	n, err := VerifyBlocks(bytes.NewReader(bad), outboard, obj.GroupLog, block, obj.Root)
+	var be *BlockError
+	if !errors.As(err, &be) || be.Offset != 2*block || n != block {
+		t.Fatalf("corrupted block: verified %d, err %v", n, err)
+	}
+	if _, err := VerifyBlocks(bytes.NewReader(d[1:block+1]), outboard, obj.GroupLog, 1, obj.Root); err == nil || errors.As(err, &be) {
+		t.Fatalf("unaligned offset: %v", err)
+	}
+	if _, err := VerifyBlocks(bytes.NewReader(d[:block+5]), outboard, obj.GroupLog, 0, obj.Root); err == nil || errors.As(err, &be) {
+		t.Fatalf("data ending mid-block: %v", err)
+	}
+	if _, err := VerifyBlocks(bytes.NewReader(append(bytes.Clone(d), 1)), outboard, obj.GroupLog, 0, obj.Root); err == nil || errors.As(err, &be) {
+		t.Fatalf("data past the end: %v", err)
+	}
+	if _, err := VerifyBlocks(bytes.NewReader(d), outboard[:len(outboard)-1], obj.GroupLog, 0, obj.Root); err == nil {
+		t.Fatal("truncated outboard accepted")
+	}
+	root := obj.Root
+	root[0] ^= 1
+	if _, err := VerifyBlocks(bytes.NewReader(d[:block]), outboard, obj.GroupLog, 0, root); !errors.As(err, &be) {
+		t.Fatalf("wrong root: %v", err)
+	}
+}
+
+func TestAlignedRange(t *testing.T) {
+	const size, group = 300_000, 14
+	cases := []struct{ a, b, start, end int64 }{
+		{0, 0, 0, 16383},
+		{5000, 20000, 0, 32767},
+		{16384, 16384, 16384, 32767},
+		{299_000, 299_999, 294_912, 299_999}, // the short tail
+		{100, 400_000, 0, 299_999},           // past the end is clamped
+	}
+	for _, c := range cases {
+		start, end, err := AlignedRange(c.a, c.b, group, size)
+		if err != nil || start != c.start || end != c.end {
+			t.Errorf("AlignedRange(%d-%d) = %d-%d, %v; want %d-%d", c.a, c.b, start, end, err, c.start, c.end)
+		}
+	}
+	for _, c := range [][2]int64{{size, size}, {20, 10}, {-1, 5}} {
+		if _, _, err := AlignedRange(c[0], c[1], group, size); err == nil {
+			t.Errorf("AlignedRange(%d-%d) accepted", c[0], c[1])
 		}
 	}
 }

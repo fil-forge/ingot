@@ -24,7 +24,7 @@ in [`CLAUDE.md`](./CLAUDE.md).
   chains hilt issues to this agent).
 - **Daemon.** `ingot serve` builds the same wiring from a config file
   (cobra/viper/fx): Postgres, the sprue edge client, and hilt are all
-  required. The CLI is `serve`, `whoami`, and `version`. Docker-native;
+  required. The CLI is `serve`, `whoami`, `version` and `blake3`. Docker-native;
   ships as a smelt system.
 
 There is no standalone or in-memory mode: the deployment under test is
