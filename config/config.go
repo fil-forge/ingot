@@ -435,7 +435,8 @@ type InProcessConfig struct {
 // viper already knows from the config file or a default, so a key absent
 // from the YAML would ignore its INGOT_* variable. ExperimentalBindStruct
 // makes Unmarshal also look up every key of Config, so each field can be
-// set from the environment.
+// set from the environment. TestLoad_EnvWithoutYAMLKey fails if a viper
+// upgrade changes that.
 func Load(configFile string) (*Config, error) {
 	v := viper.NewWithOptions(viper.ExperimentalBindStruct())
 	setDefaults(v)
