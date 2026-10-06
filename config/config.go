@@ -470,6 +470,10 @@ func Load(configFile string) (*Config, error) {
 	return &cfg, nil
 }
 
+// setDefaults registers the daemon's non-empty defaults. A key needs no entry
+// here for its INGOT_* variable to apply: Load binds every field of Config.
+// Most defaults live in Config.ServerConfig instead (empty → default), since
+// library hosts build Config without calling Load.
 func setDefaults(v *viper.Viper) {
 	v.SetDefault("log_level", "info")
 	v.SetDefault("addr", "0.0.0.0:8080")
