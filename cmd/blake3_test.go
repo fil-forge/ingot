@@ -91,6 +91,16 @@ func TestBlake3Commands(t *testing.T) {
 	if _, err := run(t, data[block:], "verify", "--outboard", outboardB64, "--outboard-file", ob, "--group", group, "--offset", off, want); err == nil {
 		t.Fatal("--outboard and --outboard-file together accepted")
 	}
+	// A group the outboard does not match, or one no block size fits, is a
+	// usage error, not a mismatch.
+	for _, g := range []string{"14", "63", "64", "255"} {
+		if _, err := run(t, data[block:], "verify", "--outboard", outboardB64, "--group", g, "--offset", off, want); err == nil || errors.As(err, &mm) {
+			t.Fatalf("--group %s accepted: %v", g, err)
+		}
+		if _, err := run(t, nil, "range", "--outboard", outboardB64, "--group", g, "0-1"); err == nil {
+			t.Fatalf("range --group %s accepted", g)
+		}
+	}
 }
 
 func itoa(n int64) string { return strconv.FormatInt(n, 10) }

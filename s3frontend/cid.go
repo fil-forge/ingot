@@ -3,7 +3,9 @@ package s3frontend
 import (
 	"context"
 	"encoding/base64"
+	"slices"
 
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/fil-forge/versitygw/s3response"
 	"github.com/valyala/fasthttp"
 
@@ -56,4 +58,11 @@ func blake3Attribute(body msbucket.Body) *s3response.Blake3Tree {
 		Group:    body.TreeGroup,
 		Outboard: base64.StdEncoding.EncodeToString(blake3tree.Outboard(leaves, body.Size)),
 	}
+}
+
+// wantsBlake3 reports whether a GetObjectAttributes request asked for the
+// Blake3 attribute. An empty list means the caller did not say, and the
+// attribute is built so the controller can filter.
+func wantsBlake3(requested []types.ObjectAttributes) bool {
+	return len(requested) == 0 || slices.Contains(requested, types.ObjectAttributes(s3response.ObjectAttributesBlake3))
 }

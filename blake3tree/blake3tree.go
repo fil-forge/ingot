@@ -44,6 +44,11 @@ const (
 	// 32 TB; from there the group grows linearly with the size instead.
 	MaxLeaves = 32768
 
+	// MaxGroupLog is the largest group exponent whose block size is a
+	// positive int64; a group a client supplies (the Blake3 attribute's
+	// Group) is checked against it before any arithmetic.
+	MaxGroupLog = 62
+
 	chunkLog  = 10 // log2(ChunkSize)
 	bufChunks = guts.MaxSIMD
 )
@@ -657,11 +662,39 @@ func CheckOutboard(b []byte) error {
 	return nil
 }
 
+// OutboardLeaves checks an outboard against the group it is claimed to be
+// at, both supplied by a client, and returns the number of leaves. The
+// group must lie within [MinGroupLog, MaxGroupLog], and the outboard must
+// hold exactly one parent entry per leaf but one, which ties the group to
+// the body size in its prefix. A client-supplied pair that fails this is a
+// mistake, and this reports it before any verification arithmetic.
+func OutboardLeaves(outboard []byte, groupLog uint8) (int64, error) {
+	if err := CheckOutboard(outboard); err != nil {
+		return 0, err
+	}
+	if groupLog < MinGroupLog || groupLog > MaxGroupLog {
+		return 0, fmt.Errorf("blake3tree: group %d is outside [%d, %d]", groupLog, MinGroupLog, MaxGroupLog)
+	}
+	size := OutboardSize(outboard)
+	if size < 0 {
+		return 0, fmt.Errorf("blake3tree: outboard size prefix %d is negative", uint64(size))
+	}
+	block := GroupSize(groupLog)
+	leaves := (size + block - 1) / block
+	if parents := int64((len(outboard) - 8) / 64); parents != max(leaves-1, 0) {
+		return 0, fmt.Errorf("blake3tree: outboard has %d parent entries but a %d-byte body at group %d has %d leaves", parents, size, groupLog, leaves)
+	}
+	return leaves, nil
+}
+
 // AlignedRange widens the inclusive byte range [a, b] of a body to the
 // block-aligned inclusive range a verifier needs: down to a block boundary
 // and up to one, or to the body's end. A block is the only unit the outboard
 // can verify, since each leaf is the hash of a whole block.
 func AlignedRange(a, b int64, groupLog uint8, size int64) (start, end int64, err error) {
+	if groupLog < MinGroupLog || groupLog > MaxGroupLog {
+		return 0, 0, fmt.Errorf("blake3tree: group %d is outside [%d, %d]", groupLog, MinGroupLog, MaxGroupLog)
+	}
 	if a < 0 || b < a {
 		return 0, 0, fmt.Errorf("blake3tree: range %d-%d is not ascending", a, b)
 	}
@@ -690,7 +723,7 @@ func (e *BlockError) Error() string {
 // returned as a *BlockError after the bytes before it; any other error is a
 // malformed input.
 func VerifyBlocks(r io.Reader, outboard []byte, groupLog uint8, offset int64, root CV) (int64, error) {
-	if err := CheckOutboard(outboard); err != nil {
+	if _, err := OutboardLeaves(outboard, groupLog); err != nil {
 		return 0, err
 	}
 	size := OutboardSize(outboard)

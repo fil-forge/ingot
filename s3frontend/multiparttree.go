@@ -95,7 +95,11 @@ func recordedPartRange(p registry.MultipartPart) (blake3tree.Range, error) {
 // body is re-hashed, so the result is always right; the records only make
 // it cheap.
 func (b *Backend) multipartTree(ctx context.Context, space did.DID, parts []registry.MultipartPart, offsets []int64, body msbucket.Body) (blake3tree.Object, error) {
-	ranges, err := b.partRanges(ctx, space, parts, offsets, body)
+	// One opener serves every re-read of this completion: building it
+	// resolves the encryption parameters and locations of every blob in the
+	// body, which must not repeat per part.
+	src := &bodySource{b: b, space: space, body: body}
+	ranges, err := b.partRanges(ctx, src, parts, offsets)
 	if err == nil {
 		if obj, ok := blake3tree.Assemble(ranges); ok {
 			return obj, nil
@@ -103,7 +107,7 @@ func (b *Backend) multipartTree(ctx context.Context, space did.DID, parts []regi
 		err = fmt.Errorf("the parts' trees do not assemble into one body")
 	}
 	b.logger.Warn("re-hashing multipart object for its tree", zap.Int("parts", len(parts)), zap.Int64("size", body.Size), zap.Error(err))
-	opener, err := b.bodyOpener(ctx, space, body)
+	opener, err := src.opener(ctx)
 	if err != nil {
 		return blake3tree.Object{}, err
 	}
@@ -121,7 +125,7 @@ func (b *Backend) multipartTree(ctx context.Context, space did.DID, parts []regi
 // part other than the last whose length is not a whole number of chunks
 // puts a chunk boundary inside the next part, so no record from it onward
 // is usable: the body from that part to its end is re-hashed as one range.
-func (b *Backend) partRanges(ctx context.Context, space did.DID, parts []registry.MultipartPart, offsets []int64, body msbucket.Body) ([]blake3tree.Range, error) {
+func (b *Backend) partRanges(ctx context.Context, src *bodySource, parts []registry.MultipartPart, offsets []int64) ([]blake3tree.Range, error) {
 	usable := len(parts)
 	for i := 0; i+1 < len(parts); i++ {
 		if parts[i].Size%blake3tree.ChunkSize != 0 {
@@ -140,14 +144,14 @@ func (b *Backend) partRanges(ctx context.Context, space did.DID, parts []registr
 			}
 			b.logger.Warn("multipart part tree record unreadable; re-hashing the part", zap.Int("part", p.PartNumber), zap.Error(err))
 		}
-		rng, err := b.rehashRange(ctx, space, body, offsets[i], offsets[i]+p.Size)
+		rng, err := src.rehash(ctx, offsets[i], offsets[i]+p.Size)
 		if err != nil {
 			return nil, err
 		}
 		ranges = append(ranges, rng)
 	}
 	if usable < len(parts) {
-		rng, err := b.rehashRange(ctx, space, body, offsets[usable], body.Size)
+		rng, err := src.rehash(ctx, offsets[usable], src.body.Size)
 		if err != nil {
 			return nil, err
 		}
@@ -156,18 +160,38 @@ func (b *Backend) partRanges(ctx context.Context, space did.DID, parts []registr
 	return ranges, nil
 }
 
-// rehashRange hashes body's bytes [start, end) at their offset.
-func (b *Backend) rehashRange(ctx context.Context, space did.DID, body msbucket.Body, start, end int64) (blake3tree.Range, error) {
+// bodySource re-reads a completing body's plaintext for the tree, through
+// one opener built on first use and shared by every range.
+type bodySource struct {
+	b      *Backend
+	space  did.DID
+	body   msbucket.Body
+	opened msbucket.BlobRangeOpener
+}
+
+func (s *bodySource) opener(ctx context.Context) (msbucket.BlobRangeOpener, error) {
+	if s.opened == nil {
+		o, err := s.b.bodyOpener(ctx, s.space, s.body)
+		if err != nil {
+			return nil, err
+		}
+		s.opened = o
+	}
+	return s.opened, nil
+}
+
+// rehash hashes the body's bytes [start, end) at their offset.
+func (s *bodySource) rehash(ctx context.Context, start, end int64) (blake3tree.Range, error) {
 	h, err := blake3tree.NewHasher(start)
 	if err != nil {
 		return blake3tree.Range{}, err
 	}
 	if end > start {
-		opener, err := b.bodyOpener(ctx, space, body)
+		opener, err := s.opener(ctx)
 		if err != nil {
 			return blake3tree.Range{}, err
 		}
-		rc := msbucket.OpenBodyRange(ctx, opener, space, body, start, end-1)
+		rc := msbucket.OpenBodyRange(ctx, opener, s.space, s.body, start, end-1)
 		defer rc.Close()
 		if _, err := io.Copy(h, rc); err != nil {
 			return blake3tree.Range{}, fmt.Errorf("re-hash object bytes [%d,%d): %w", start, end, err)
