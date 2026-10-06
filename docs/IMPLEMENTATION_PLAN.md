@@ -163,17 +163,17 @@ still green — no production path calls the new methods yet.
       blob. Backend gains `Space` + `LocationStore`; wired through `ServerDeps`/fx (`ServerSpace`,
       optional so standalone/harness default to "")/harness/standalone.
 
-**3d-3 — Local-table `Locator` read tier** ⏳ DEFERRED to Phase 7 *(forge-mode read; needs live validation)*
-- [ ] A `LocationStore`-backed `locator.Locator` (local-first, indexer fall-through for catalog
-      blocks) so forge-mode body reads resolve from `blob_locations`. Deferred because: it is not
-      harness-testable (the spool serves all in-process reads), it is only exercised **after** spool
-      eviction (since built: `SweepLocalBlobs`), and the body-vs-catalog base-reader split + the
-      `blockstore`↛`registry` cycle-avoiding package placement are best designed against the live smelt stack. The location
-      **data** is already recorded (3d-2); Phase 7 wires the **consumer** and validates end-to-end.
+**3d-3 — Local-table `Locator` read tier** ✅ DONE *(validated in smelt by `TestForgeReadAfterEviction`)*
+- [x] `registry.LocalLocator` resolves reads from the local tables instead of the indexer: a body
+      blob from its `blob_locations` row, a catalog block in a retention-retired segment through its
+      `shard_inclusions` row to a ranged read of the shipped shard. `Module` wires it into the Forge
+      block reader (`provideForgeReader`). `TestForgeReadAfterEviction` reads a body back from the
+      provider once local blob eviction (`SweepLocalBlobs`) has removed its local copy.
 
-> **Validate 3d in smelt at Phase 7:** real `UploadBlob` location parsing, the `blob_locations`
-> contents, and the 3d-3 read tier are all forge-mode paths the in-process harness can't exercise —
-> confirm them against the live sprue+piri+indexer round-trip when Phase 7's e2e lands.
+> **Validate 3d in smelt at Phase 7:** real `UploadBlob` location parsing and the `blob_locations`
+> contents are forge-mode paths the in-process harness can't exercise — confirm them against the
+> live sprue+piri+indexer round-trip when Phase 7's e2e lands. (The 3d-3 read tier already runs
+> against the smelt stack in `TestForgeReadAfterEviction`.)
 
 Deliverable (3a–3b, done): PUT spools + uploads each blob synchronously, commits a catalog-only
 manifest, returns 200 only after accept; GET reconstructs across blobs; zero-byte stores no blob;

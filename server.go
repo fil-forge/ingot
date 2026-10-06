@@ -379,6 +379,10 @@ const localBlobSweepLogInterval = 10 * time.Minute
 // Backend.SweepLocalBlobs).
 func (s *Server) startLocalBlobSweeper() {
 	s.localBlobStop = make(chan struct{})
+	// The goroutine keeps its own copy of the channel: Stop closes it and
+	// then clears the field, and a select that read the cleared field would
+	// block forever.
+	stop := s.localBlobStop
 	go func() {
 		// removed totals the removals since since, not yet logged.
 		var removed s3frontend.LocalBlobSweepStats
@@ -388,7 +392,7 @@ func (s *Server) startLocalBlobSweeper() {
 		defer ticker.Stop()
 		for {
 			select {
-			case <-s.localBlobStop:
+			case <-stop:
 				return
 			case <-ticker.C:
 				// Each pass also caps itself; this bounds them together.

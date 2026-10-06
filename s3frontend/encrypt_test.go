@@ -324,7 +324,7 @@ func TestEncryptedWrite_FailsClosedWithoutRecipient(t *testing.T) {
 	if _, _, err := getObjV(t, b, key, ""); err == nil {
 		t.Fatalf("object exists after a refused write")
 	}
-	entries, err := os.ReadDir(localPath(b, nil)) // Path of the empty digest is the spool dir itself
+	entries, err := os.ReadDir(b.spool.Path(nil)) // Path of the empty digest is the spool dir itself
 	if err != nil {
 		t.Fatalf("read spool dir: %v", err)
 	}
