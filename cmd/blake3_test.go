@@ -41,8 +41,9 @@ func TestBlake3Commands(t *testing.T) {
 	want := cid.NewCidV1(cid.Raw, digest).String()
 	block := blake3tree.GroupSize(obj.GroupLog)
 	group := itoa(int64(obj.GroupLog))
+	outboardB64 := base64.StdEncoding.EncodeToString(blake3tree.Outboard(obj.Leaves, size))
 	ob := filepath.Join(t.TempDir(), "ob.b64")
-	if err := os.WriteFile(ob, []byte(base64.StdEncoding.EncodeToString(blake3tree.Outboard(obj.Leaves, size))+"\n"), 0o644); err != nil {
+	if err := os.WriteFile(ob, []byte(outboardB64+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -60,7 +61,7 @@ func TestBlake3Commands(t *testing.T) {
 		t.Fatalf("a sha2-256 CID must be a usage error: %v", err)
 	}
 
-	out, err := run(t, nil, "range", "--outboard", ob, "--group", group, "5000-200000")
+	out, err := run(t, nil, "range", "--outboard-file", ob, "--group", group, "5000-200000")
 	if err != nil || !strings.Contains(out, "Range: bytes=0-"+itoa(2*block-1)) || !strings.Contains(out, "--offset 0") {
 		t.Fatalf("range: %q, %v", out, err)
 	}
@@ -69,16 +70,26 @@ func TestBlake3Commands(t *testing.T) {
 	}
 
 	off := itoa(block)
-	if out, err := run(t, data[block:], "verify", "--outboard", ob, "--group", group, "--offset", off, want); err != nil || !strings.HasPrefix(out, "ok bytes "+off+"-"+itoa(size-1)) {
-		t.Fatalf("verify range: %q, %v", out, err)
+	// The outboard inline as base64, and from a file, are the same thing.
+	for _, ob := range [][]string{{"--outboard", outboardB64}, {"--outboard-file", ob}} {
+		args := append(append([]string{"verify"}, ob...), "--group", group, "--offset", off, want)
+		if out, err := run(t, data[block:], args...); err != nil || !strings.HasPrefix(out, "ok bytes "+off+"-"+itoa(size-1)) {
+			t.Fatalf("verify range %s: %q, %v", ob[0], out, err)
+		}
 	}
 	bad := bytes.Clone(data[block:])
 	bad[7] ^= 1
-	if _, err := run(t, bad, "verify", "--outboard", ob, "--group", group, "--offset", off, want); !errors.As(err, &mm) {
+	if _, err := run(t, bad, "verify", "--outboard", outboardB64, "--group", group, "--offset", off, want); !errors.As(err, &mm) {
 		t.Fatalf("verify corrupted range: %v", err)
 	}
-	if _, err := run(t, data[1:], "verify", "--outboard", ob, "--group", group, "--offset", "1", want); err == nil || errors.As(err, &mm) {
+	if _, err := run(t, data[1:], "verify", "--outboard", outboardB64, "--group", group, "--offset", "1", want); err == nil || errors.As(err, &mm) {
 		t.Fatalf("unaligned offset must be a usage error: %v", err)
+	}
+	if _, err := run(t, data[block:], "verify", "--outboard", "not base64!", "--group", group, "--offset", off, want); err == nil || errors.As(err, &mm) {
+		t.Fatalf("a non-base64 --outboard must be a usage error: %v", err)
+	}
+	if _, err := run(t, data[block:], "verify", "--outboard", outboardB64, "--outboard-file", ob, "--group", group, "--offset", off, want); err == nil {
+		t.Fatal("--outboard and --outboard-file together accepted")
 	}
 }
 
