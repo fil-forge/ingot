@@ -29,7 +29,7 @@ func wantCID(t *testing.T, data []byte) string {
 }
 
 // assertObjectTree checks a completed object's x-cid against its bytes and
-// its stored tree against the single-pass reference: group, leaf count and
+// its stored tree against the single-pass reference: chunk log, leaf count and
 // every leaf.
 func assertObjectTree(t *testing.T, b *Backend, key string, data []byte) {
 	t.Helper()
@@ -49,8 +49,8 @@ func assertObjectTree(t *testing.T, b *Backend, key string, data []byte) {
 	h.Write(data)
 	want := h.FinishObject()
 	body := rv.mf.Body
-	if body.TreeGroup != want.GroupLog {
-		t.Fatalf("TreeGroup = %d, want %d", body.TreeGroup, want.GroupLog)
+	if body.TreeChunkLog != want.ChunkLog {
+		t.Fatalf("TreeChunkLog = %d, want %d", body.TreeChunkLog, want.ChunkLog)
 	}
 	leaves, err := body.TreeLeafCVs()
 	if err != nil {
@@ -149,8 +149,8 @@ func TestMultipartTree(t *testing.T) {
 		whole := completeAll(t, b, "final-first", parts, []int32{3, 1, 2})
 		assertObjectTree(t, b, "final-first", whole)
 		recs := recordedParts(t, b, "final-first", 3)
-		if recs[3].TreeGroup == 0 || recs[3].TreeOffset != 2*final {
-			t.Fatalf("part 3 recorded at offset %d (group %d): with no earlier part its own size should have stood in", recs[3].TreeOffset, recs[3].TreeGroup)
+		if len(recs[3].TreeNodes) == 0 || recs[3].TreeOffset != 2*final {
+			t.Fatalf("part 3 recorded at offset %d: with no earlier part its own size should have stood in", recs[3].TreeOffset)
 		}
 		if recs[2].TreeOffset != int64(minPart) {
 			t.Fatalf("part 2 recorded offset %d: part 1 was recorded, so the guess should be exact", recs[2].TreeOffset)
@@ -163,7 +163,7 @@ func TestMultipartTree(t *testing.T) {
 		parts := [][]byte{taggedBody(minPart, 0x61), taggedBody(minPart, 0x62), taggedBody(70_000, 0x63)}
 		whole := completeAll(t, b, "final-first-odd", parts, []int32{3, 1, 2})
 		assertObjectTree(t, b, "final-first-odd", whole)
-		if recs := recordedParts(t, b, "final-first-odd", 3); recs[3].TreeGroup != 0 {
+		if recs := recordedParts(t, b, "final-first-odd", 3); len(recs[3].TreeNodes) != 0 {
 			t.Fatalf("part 3 recorded a tree at offset %d", recs[3].TreeOffset)
 		}
 	})

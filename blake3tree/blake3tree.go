@@ -1,6 +1,6 @@
 // Package blake3tree computes the BLAKE3 Merkle-tree material Ingot records
 // for an object body: the whole-object digest, the chaining values of the
-// group-aligned blocks a client verifies ranged reads against, and the
+// blocks a client verifies ranged reads against, and the
 // aligned subtrees of a byte range hashed at an offset, from which a
 // multipart object's tree is assembled without re-reading its parts.
 //
@@ -32,61 +32,65 @@ const (
 	// CVSize is the size of a chaining value.
 	CVSize = 32
 
-	// MinGroupLog is the smallest group (leaf size) the tree is recorded at,
-	// as a base-2 exponent of bytes: 16 KiB. It is also the unit the group
-	// scales from: the group is the geometric mean of the body's size and
-	// this, so the leaf count grows with the square root of the size (see
-	// GroupLog).
-	MinGroupLog = 14
+	// MinChunkLog is the smallest block (leaf size) the tree is recorded
+	// at, as a base-2 exponent of chunks: 2^4 chunks, 16 KiB. It is also the
+	// unit the block scales from: the block is the geometric mean of the
+	// body's size and this, so the leaf count grows with the square root of
+	// the size (see ChunkLog).
+	MinChunkLog = 4
 
 	// MaxLeaves is the hard cap on the leaves recorded for one body, 1 MiB
 	// of chaining values. The square-root rule reaches it only past about
-	// 32 TB; from there the group grows linearly with the size instead.
+	// 32 TB; from there the block grows linearly with the size instead.
 	MaxLeaves = 32768
 
-	// MaxGroupLog is the largest group exponent whose block size is a
-	// positive int64; a group a client supplies (the Blake3 attribute's
-	// Group) is checked against it before any arithmetic.
-	MaxGroupLog = 62
+	// MaxChunkLog is the largest chunk log whose block size is a positive
+	// int64; a chunk log a client supplies (the Blake3 attribute's ChunkLog)
+	// is checked against it before any arithmetic.
+	MaxChunkLog = 52
 
-	chunkLog  = 10 // log2(ChunkSize)
+	chunkLog  = 10 // log2(ChunkSize): bytes per chunk, as an exponent
 	bufChunks = guts.MaxSIMD
 )
 
 // CV is a BLAKE3 chaining value: the non-root hash of a chunk or subtree.
 type CV [CVSize]byte
 
-// GroupLog returns the group exponent for a body of size bytes: the smallest
-// power of two, at least 2^MinGroupLog, that is at least the geometric mean
-// of the size and 2^MinGroupLog, so the body has about sqrt(size / 16 KiB)
-// leaves. The group doubles each time the size quadruples: a 4 MiB body has
-// 16 leaves of 256 KiB, a 1 GiB body 256 leaves of 4 MiB, a 1 TiB body 8192
-// leaves of 128 MiB. Past MaxLeaves the group grows linearly instead. The
-// rule is monotone in size, which the hasher and the multipart assembly
-// rely on: a part's group never exceeds its object's.
-func GroupLog(size int64) uint8 {
-	g := uint8(MinGroupLog)
-	for g < 38 && size > int64(1)<<(2*g-MinGroupLog) {
-		g++
+// ChunkLog returns the block size for a body of size bytes, as a base-2
+// exponent of chunks, the unit Bao libraries take: the smallest power of
+// two, at least 2^MinChunkLog chunks, whose byte size is at least the
+// geometric mean of the body's size and 16 KiB, so the body has about
+// sqrt(size / 16 KiB) leaves. The block doubles each time the size
+// quadruples: a 4 MiB body has 16 leaves of 256 KiB (chunk log 8), a 1 GiB
+// body 256 leaves of 4 MiB (12), a 1 TiB body 8192 leaves of 128 MiB (17).
+// Past MaxLeaves the block grows linearly instead. The rule is monotone in
+// size, which the hasher and the multipart assembly rely on: a part's block
+// never exceeds its object's.
+func ChunkLog(size int64) uint8 {
+	// A block of 2^c chunks is 2^(c+10) bytes; the geometric-mean rule
+	// wants size <= 2^(2(c+10)-14) = 2^(2c+6).
+	c := uint8(MinChunkLog)
+	for c < 28 && size > int64(1)<<(2*c+6) {
+		c++
 	}
-	for size > int64(MaxLeaves)<<g {
-		g++
+	for size > int64(MaxLeaves)<<(c+chunkLog) {
+		c++
 	}
-	return g
+	return c
 }
 
-// GroupSize returns the leaf size for a group exponent.
-func GroupSize(groupLog uint8) int64 { return 1 << groupLog }
+// BlockSize returns the leaf size in bytes for a chunk log.
+func BlockSize(chunkLog_ uint8) int64 { return ChunkSize << chunkLog_ }
 
 // Object is the tree material of a whole body.
 type Object struct {
 	Size int64
 	// Root is the BLAKE3 hash of the body.
 	Root CV
-	// GroupLog is the leaf size of Leaves as a base-2 exponent of bytes:
-	// GroupLog(Size).
-	GroupLog uint8
-	// Leaves holds the chaining value of every group-aligned block of the
+	// ChunkLog is the leaf size of Leaves as a base-2 exponent of chunks:
+	// ChunkLog(Size).
+	ChunkLog uint8
+	// Leaves holds the chaining value of every block of the
 	// body in order; the last covers the body's tail and may be short. A
 	// zero-length body has none.
 	Leaves []CV
@@ -105,11 +109,11 @@ type Range struct {
 	// left to right. Adjacent ranges' subtrees merge into their union's,
 	// and a body's merge to its root (see RootFromSubtrees).
 	Subtrees []Subtree
-	// GroupLog is the leaf size of Leaves: GroupLog(Size), which never
-	// exceeds the group of any body containing the range, so a body's leaves
+	// ChunkLog is the leaf size of Leaves: ChunkLog(Size), which never
+	// exceeds the block of any body containing the range, so a body's leaves
 	// can be built from its ranges' leaves and subtrees.
-	GroupLog uint8
-	// Leaves holds the chaining values of the group-aligned blocks that lie
+	ChunkLog uint8
+	// Leaves holds the chaining values of the blocks that lie
 	// wholly within the range, in order. A block the range only partly
 	// covers is not a leaf, and its pieces are among Subtrees. The one
 	// exception is a range ending inside a chunk: a short chunk can only be
@@ -125,7 +129,7 @@ type Subtree struct {
 	Pos    uint64
 }
 
-// Leaf is a group-aligned block's chaining value and its byte offset.
+// Leaf is a block's chaining value and its byte offset.
 type Leaf struct {
 	CV     CV
 	Offset int64
@@ -147,7 +151,7 @@ type node struct {
 // height, keyed on absolute chunk index so a range at an offset merges the
 // same nodes the whole body's tree holds. Alongside it, every node formed at
 // the current leaf height is recorded; whenever the bytes written so far
-// call for a larger group (GroupLog is monotone) the leaf height rises by
+// call for a larger block (ChunkLog is monotone) the leaf height rises by
 // one and recorded siblings merge, so the leaf list follows the rule without
 // knowing the body's length in advance. The last chunk is held back until the
 // end, since the root node is a chunk node when the body is a single chunk.
@@ -158,9 +162,10 @@ type Hasher struct {
 	buf     [bufChunks * ChunkSize]byte
 	buflen  int
 
-	stack   []node // maximal aligned subtrees of [offset, counter), left to right
-	leafLog uint8  // current group exponent
-	leaves  []node // complete leaves at leafLog, in order
+	stack      []node // maximal aligned subtrees of [offset, counter), left to right
+	leafHeight uint8  // current leaf size as a chunk log (a subtree height)
+	fixed      bool   // leafHeight was chosen by the caller and never rises
+	leaves     []node // complete leaves at leafHeight, in order
 }
 
 // NewHasher returns a Hasher for bytes starting at offset, which must be a
@@ -170,10 +175,26 @@ func NewHasher(offset int64) (*Hasher, error) {
 		return nil, fmt.Errorf("blake3tree: offset %d is not a multiple of %d", offset, ChunkSize)
 	}
 	chunk := uint64(offset) / ChunkSize
-	return &Hasher{offset: chunk, counter: chunk, leafLog: MinGroupLog}, nil
+	return &Hasher{offset: chunk, counter: chunk, leafHeight: MinChunkLog}, nil
 }
 
-func (h *Hasher) leafHeight() uint8 { return h.leafLog - chunkLog }
+// NewHasherAtChunkLog is NewHasher with the leaf size fixed at 2^chunkLog
+// chunks instead of following ChunkLog as the body grows. It is for
+// producing a Bao outboard at a block size chosen by the reader rather than
+// by ingot: 4 is iroh's fixed 16 KiB block, 0 the original Bao chunk. The
+// chunk log may run from 0 to MaxChunkLog. The leaves are held in memory,
+// 32 bytes per block, so a fine block over a large body costs accordingly.
+func NewHasherAtChunkLog(offset int64, chunkLog_ uint8) (*Hasher, error) {
+	if chunkLog_ > MaxChunkLog {
+		return nil, fmt.Errorf("blake3tree: chunk log %d is above %d", chunkLog_, MaxChunkLog)
+	}
+	h, err := NewHasher(offset)
+	if err != nil {
+		return nil, err
+	}
+	h.leafHeight, h.fixed = chunkLog_, true
+	return h, nil
+}
 
 // Write implements io.Writer. It never fails.
 func (h *Hasher) Write(p []byte) (int, error) {
@@ -189,7 +210,7 @@ func (h *Hasher) Write(p []byte) (int, error) {
 		p = p[c:]
 	}
 	h.size += int64(n)
-	for GroupLog(h.size) > h.leafLog {
+	for !h.fixed && ChunkLog(h.size) > h.leafHeight {
 		h.promote()
 	}
 	return n, nil
@@ -197,9 +218,10 @@ func (h *Hasher) Write(p []byte) (int, error) {
 
 // flush compresses the full buffer: as one 16-chunk subtree when it is
 // aligned to one (the whole-body case, and every full buffer of a range
-// once it reaches alignment), else chunk by chunk.
+// once it reaches alignment) and the leaves are at least that large, else
+// chunk by chunk, so no leaf is skipped over.
 func (h *Hasher) flush() {
-	if h.counter%bufChunks == 0 {
+	if h.counter%bufChunks == 0 && int(h.leafHeight) >= bits.TrailingZeros(bufChunks) {
 		nd := guts.CompressBuffer(&h.buf, len(h.buf), &guts.IV, h.counter, 0)
 		h.push(guts.ChainingValue(nd), bits.TrailingZeros(bufChunks), h.counter)
 	} else {
@@ -222,7 +244,7 @@ func (h *Hasher) pushChunk(chunk []byte, pos uint64) {
 func (h *Hasher) push(cv [8]uint32, height int, pos uint64) {
 	hgt := uint8(height)
 	for {
-		if hgt == h.leafHeight() {
+		if hgt == h.leafHeight {
 			h.leaves = append(h.leaves, node{cv, hgt, pos})
 		}
 		top := len(h.stack) - 1
@@ -245,7 +267,7 @@ func (h *Hasher) push(cv [8]uint32, height int, pos uint64) {
 // formed while the leaf height was still lower is counted once, by the
 // pairing.
 func (h *Hasher) promote() {
-	hgt := h.leafHeight()
+	hgt := h.leafHeight
 	var next []node
 	for i := 0; i < len(h.leaves); {
 		l := h.leaves[i]
@@ -257,7 +279,7 @@ func (h *Hasher) promote() {
 		i++
 	}
 	h.leaves = next
-	h.leafLog++
+	h.leafHeight++
 }
 
 // drain pushes the buffered chunks up to the last one and returns the last
@@ -302,7 +324,7 @@ func (h *Hasher) FinishObject() Object {
 	// stack entries below the leaf height with the last chunk. For a body
 	// started at 0 the stack's heights fall from bottom to top, so those
 	// entries are the top ones.
-	hgt := h.leafHeight()
+	hgt := h.leafHeight
 	n := guts.CompressChunk(last, &guts.IV, h.counter, 0)
 	for i := len(h.stack) - 1; i >= 0 && h.stack[i].height < hgt; i-- {
 		n = guts.ParentNode(h.stack[i].cv, guts.ChainingValue(n), &guts.IV, 0)
@@ -312,9 +334,9 @@ func (h *Hasher) FinishObject() Object {
 		leaves = append(leaves[:len(leaves):len(leaves)], node{guts.ChainingValue(n), hgt, uint64(len(h.leaves)) << hgt})
 	}
 
-	// Write keeps the leaf height at GroupLog of the bytes so far, so it is
-	// the body's group now.
-	out := Object{Size: h.size, Root: root, GroupLog: h.leafLog, Leaves: make([]CV, len(leaves))}
+	// Write keeps the leaf height at ChunkLog of the bytes so far, so it is
+	// the body's block now.
+	out := Object{Size: h.size, Root: root, ChunkLog: h.leafHeight, Leaves: make([]CV, len(leaves))}
 	for j, l := range leaves {
 		out.Leaves[j] = bytesOf(l.cv)
 	}
@@ -328,7 +350,7 @@ func (h *Hasher) FinishRange() Range {
 	out := Range{
 		Offset:   int64(h.offset) * ChunkSize,
 		Size:     h.size,
-		GroupLog: h.leafLog,
+		ChunkLog: h.leafHeight,
 	}
 	if h.offset == 0 {
 		out.Root, out.HasRoot = bytesOf(guts.ChainingValue(h.rootNode(last))), true
@@ -353,7 +375,7 @@ func (h *Hasher) FinishRange() Range {
 func (r Range) LeafSubtrees() []Subtree {
 	out := make([]Subtree, len(r.Leaves))
 	for i, l := range r.Leaves {
-		out[i] = Subtree{CV: l.CV, Height: r.GroupLog - chunkLog, Pos: uint64(l.Offset) / ChunkSize}
+		out[i] = Subtree{CV: l.CV, Height: r.ChunkLog, Pos: uint64(l.Offset) / ChunkSize}
 	}
 	return out
 }
@@ -428,7 +450,7 @@ func CoverCV(nodes []Subtree, start, end uint64) (CV, bool) {
 // Assemble builds a body's tree material from the ranges that cover it,
 // hashed at their offsets and given in order: the root from the ranges'
 // subtrees (or the single range's own root), and the leaves at the body's
-// group from the ranges' subtrees and leaves. The leaves are checked
+// block from the ranges' subtrees and leaves. The leaves are checked
 // against the root, so ok is false when the ranges do not describe one
 // body, as well as when they are not contiguous from 0.
 func Assemble(ranges []Range) (Object, bool) {
@@ -471,10 +493,10 @@ func Assemble(ranges []Range) (Object, bool) {
 		nodes = append(nodes, r.LeafSubtrees()...)
 	}
 
-	out := Object{Size: total, Root: root, GroupLog: GroupLog(total)}
-	group := GroupSize(out.GroupLog)
-	for off := int64(0); off < total; off += group {
-		end := min(off+group, total)
+	out := Object{Size: total, Root: root, ChunkLog: ChunkLog(total)}
+	block := BlockSize(out.ChunkLog)
+	for off := int64(0); off < total; off += block {
+		end := min(off+block, total)
 		cv, ok := CoverCV(nodes, uint64(off)/ChunkSize, uint64(end+ChunkSize-1)/ChunkSize)
 		if !ok {
 			return Object{}, false
@@ -584,7 +606,7 @@ func stackOf(subs []Subtree) (*Hasher, bool) {
 	if len(subs) == 0 {
 		return nil, false
 	}
-	h := &Hasher{leafLog: 64 + chunkLog}
+	h := &Hasher{leafHeight: 64}
 	next := subs[0].Pos
 	for _, s := range subs {
 		if s.Pos != next || s.Pos%(1<<s.Height) != 0 {
@@ -615,8 +637,8 @@ func wordsOf(cv CV) (w [8]uint32) {
 }
 
 // Outboard returns the Bao outboard of a body from its leaves: the standard
-// pre-order layout a Bao library loads directly, with the body's group as
-// the Bao block size. It starts with the body's size as 8 little-endian
+// pre-order layout a Bao library loads directly, with the leaves' chunk log
+// as the Bao block size. It starts with the body's size as 8 little-endian
 // bytes, then one 64-byte entry per parent node above the leaves, each the
 // chaining values of its two children, root first and left subtree before
 // right. A body of one leaf has no parents and the outboard is the prefix
@@ -662,27 +684,28 @@ func CheckOutboard(b []byte) error {
 	return nil
 }
 
-// OutboardLeaves checks an outboard against the group it is claimed to be
-// at, both supplied by a client, and returns the number of leaves. The
-// group must lie within [MinGroupLog, MaxGroupLog], and the outboard must
-// hold exactly one parent entry per leaf but one, which ties the group to
+// OutboardLeaves checks an outboard against the chunk log it is claimed to
+// be at, both supplied by a client, and returns the number of leaves. The
+// chunk log may be at most MaxChunkLog (any block size a Bao library
+// accepts; ingot itself records none below MinChunkLog), and the outboard must
+// hold exactly one parent entry per leaf but one, which ties the chunk log to
 // the body size in its prefix. A client-supplied pair that fails this is a
 // mistake, and this reports it before any verification arithmetic.
-func OutboardLeaves(outboard []byte, groupLog uint8) (int64, error) {
+func OutboardLeaves(outboard []byte, chunkLog_ uint8) (int64, error) {
 	if err := CheckOutboard(outboard); err != nil {
 		return 0, err
 	}
-	if groupLog < MinGroupLog || groupLog > MaxGroupLog {
-		return 0, fmt.Errorf("blake3tree: group %d is outside [%d, %d]", groupLog, MinGroupLog, MaxGroupLog)
+	if chunkLog_ > MaxChunkLog {
+		return 0, fmt.Errorf("blake3tree: chunk log %d is above %d", chunkLog_, MaxChunkLog)
 	}
 	size := OutboardSize(outboard)
 	if size < 0 {
 		return 0, fmt.Errorf("blake3tree: outboard size prefix %d is negative", uint64(size))
 	}
-	block := GroupSize(groupLog)
+	block := BlockSize(chunkLog_)
 	leaves := (size + block - 1) / block
 	if parents := int64((len(outboard) - 8) / 64); parents != max(leaves-1, 0) {
-		return 0, fmt.Errorf("blake3tree: outboard has %d parent entries but a %d-byte body at group %d has %d leaves", parents, size, groupLog, leaves)
+		return 0, fmt.Errorf("blake3tree: outboard has %d parent entries but a %d-byte body at chunk log %d has %d leaves", parents, size, chunkLog_, leaves)
 	}
 	return leaves, nil
 }
@@ -691,9 +714,9 @@ func OutboardLeaves(outboard []byte, groupLog uint8) (int64, error) {
 // block-aligned inclusive range a verifier needs: down to a block boundary
 // and up to one, or to the body's end. A block is the only unit the outboard
 // can verify, since each leaf is the hash of a whole block.
-func AlignedRange(a, b int64, groupLog uint8, size int64) (start, end int64, err error) {
-	if groupLog < MinGroupLog || groupLog > MaxGroupLog {
-		return 0, 0, fmt.Errorf("blake3tree: group %d is outside [%d, %d]", groupLog, MinGroupLog, MaxGroupLog)
+func AlignedRange(a, b int64, chunkLog_ uint8, size int64) (start, end int64, err error) {
+	if chunkLog_ > MaxChunkLog {
+		return 0, 0, fmt.Errorf("blake3tree: chunk log %d is above %d", chunkLog_, MaxChunkLog)
 	}
 	if a < 0 || b < a {
 		return 0, 0, fmt.Errorf("blake3tree: range %d-%d is not ascending", a, b)
@@ -701,7 +724,7 @@ func AlignedRange(a, b int64, groupLog uint8, size int64) (start, end int64, err
 	if a >= size {
 		return 0, 0, fmt.Errorf("blake3tree: range starts at %d but the body is %d bytes", a, size)
 	}
-	block := GroupSize(groupLog)
+	block := BlockSize(chunkLog_)
 	start = a / block * block
 	end = min((b/block+1)*block, size) - 1
 	return start, end, nil
@@ -722,12 +745,12 @@ func (e *BlockError) Error() string {
 // blocks, except that it may end at the body's end. A block that fails is
 // returned as a *BlockError after the bytes before it; any other error is a
 // malformed input.
-func VerifyBlocks(r io.Reader, outboard []byte, groupLog uint8, offset int64, root CV) (int64, error) {
-	if _, err := OutboardLeaves(outboard, groupLog); err != nil {
+func VerifyBlocks(r io.Reader, outboard []byte, chunkLog_ uint8, offset int64, root CV) (int64, error) {
+	if _, err := OutboardLeaves(outboard, chunkLog_); err != nil {
 		return 0, err
 	}
 	size := OutboardSize(outboard)
-	block := GroupSize(groupLog)
+	block := BlockSize(chunkLog_)
 	if offset%block != 0 {
 		return 0, fmt.Errorf("blake3tree: offset %d is not a multiple of the block size %d", offset, block)
 	}
@@ -751,7 +774,7 @@ func VerifyBlocks(r io.Reader, outboard []byte, groupLog uint8, offset int64, ro
 		if int64(n) < block && pos+int64(n) != size {
 			return verified, fmt.Errorf("blake3tree: data ends %d bytes into the block at %d; a verifiable range holds whole blocks or ends at the body's end (%d)", n, pos, size)
 		}
-		if !bao.VerifyChunk(bytes.Clone(buf[:n]), outboard, int(groupLog)-chunkLog, uint64(pos), root) {
+		if !bao.VerifyChunk(bytes.Clone(buf[:n]), outboard, int(chunkLog_), uint64(pos), root) {
 			return verified, &BlockError{pos, int64(n)}
 		}
 		verified += int64(n)

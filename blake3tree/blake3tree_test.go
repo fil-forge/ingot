@@ -42,41 +42,41 @@ func writeIn(t *testing.T, h *Hasher, d []byte, seed int64) {
 	}
 }
 
-func TestGroupLog(t *testing.T) {
+func TestChunkLog(t *testing.T) {
 	cases := []struct {
 		size int64
 		want uint8
 	}{
-		{0, 14}, {1, 14}, {16 << 10, 14}, {16<<10 + 1, 15}, {64 << 10, 15}, {1 << 20, 17},
-		{4 << 20, 18}, {4<<20 + 1, 19}, {16 << 20, 19}, {100 << 20, 21}, {1 << 30, 22},
-		{10 << 30, 24}, {100 << 30, 26}, {1 << 40, 27}, {5 << 40, 29},
-		{50_000_000_000_000, 31}, // 50 TB: the cap holds it to 23,283 leaves of 2 GiB
-		{1 << 60, 45},            // past the cap the group grows linearly
+		{0, 4}, {1, 4}, {16 << 10, 4}, {16<<10 + 1, 5}, {64 << 10, 5}, {1 << 20, 7},
+		{4 << 20, 8}, {4<<20 + 1, 9}, {16 << 20, 9}, {100 << 20, 11}, {1 << 30, 12},
+		{10 << 30, 14}, {100 << 30, 16}, {1 << 40, 17}, {5 << 40, 19},
+		{50_000_000_000_000, 21}, // 50 TB: the cap holds it to 23,283 leaves of 2 GiB
+		{1 << 60, 35},            // past the cap the block grows linearly
 	}
 	for _, c := range cases {
-		if got := GroupLog(c.size); got != c.want {
-			t.Errorf("GroupLog(%d) = %d, want %d", c.size, got, c.want)
+		if got := ChunkLog(c.size); got != c.want {
+			t.Errorf("ChunkLog(%d) = %d, want %d", c.size, got, c.want)
 		}
-		if n := (c.size + GroupSize(c.want) - 1) / GroupSize(c.want); n > MaxLeaves {
-			t.Errorf("GroupLog(%d) = %d gives %d leaves", c.size, c.want, n)
+		if n := (c.size + BlockSize(c.want) - 1) / BlockSize(c.want); n > MaxLeaves {
+			t.Errorf("ChunkLog(%d) = %d gives %d leaves", c.size, c.want, n)
 		}
 	}
-	// Monotone, and the group doubles when the size quadruples.
+	// Monotone, and the block doubles when the size quadruples.
 	prev := uint8(0)
 	for size := int64(1); size < 1<<50; size *= 2 {
-		if g := GroupLog(size); g < prev {
-			t.Fatalf("GroupLog(%d) = %d below GroupLog of a smaller size %d", size, g, prev)
+		if g := ChunkLog(size); g < prev {
+			t.Fatalf("ChunkLog(%d) = %d below GroupLog of a smaller size %d", size, g, prev)
 		} else {
 			prev = g
 		}
 	}
-	if GroupLog(1<<32) != GroupLog(1<<30)+1 || GroupLog(1<<34) != GroupLog(1<<30)+2 {
-		t.Fatal("the group should double with each quadrupling of the size")
+	if ChunkLog(1<<32) != ChunkLog(1<<30)+1 || ChunkLog(1<<34) != ChunkLog(1<<30)+2 {
+		t.Fatal("the block should double with each quadrupling of the size")
 	}
 }
 
 // TestObject checks a whole body against the reference implementation: the
-// root is the plain BLAKE3 hash, the group is GroupLog(size), the leaf count
+// root is the plain BLAKE3 hash, the group is ChunkLog(size), the leaf count
 // is the body's size in groups, the leaves fold back to the root, and each
 // leaf is the chaining value of its block hashed at its offset.
 func TestObject(t *testing.T) {
@@ -95,11 +95,11 @@ func TestObject(t *testing.T) {
 		if obj.Size != size {
 			t.Errorf("size %d: Size = %d", size, obj.Size)
 		}
-		if want := GroupLog(size); obj.GroupLog != want {
-			t.Errorf("size %d: GroupLog = %d, want %d", size, obj.GroupLog, want)
+		if want := ChunkLog(size); obj.ChunkLog != want {
+			t.Errorf("size %d: ChunkLog = %d, want %d", size, obj.ChunkLog, want)
 		}
-		group := GroupSize(obj.GroupLog)
-		if want := (size + group - 1) / group; int64(len(obj.Leaves)) != want {
+		block := BlockSize(obj.ChunkLog)
+		if want := (size + block - 1) / block; int64(len(obj.Leaves)) != want {
 			t.Errorf("size %d: %d leaves, want %d", size, len(obj.Leaves), want)
 		}
 		if root, ok := RootFromLeaves(obj.Leaves); ok != (len(obj.Leaves) >= 2) {
@@ -108,16 +108,16 @@ func TestObject(t *testing.T) {
 			t.Errorf("size %d: leaves do not fold to the root", size)
 		}
 		for i, leaf := range obj.Leaves {
-			off := int64(i) * group
+			off := int64(i) * block
 			rh, _ := NewHasher(off)
-			rh.Write(d[off:min(off+group, size)])
+			rh.Write(d[off:min(off+block, size)])
 			rng := rh.FinishRange()
 			// A full block is one aligned subtree; the short tail is the
 			// merge of several.
 			if cv, ok := MergeSubtrees(rng.Subtrees); !ok || cv != leaf {
 				t.Errorf("size %d: leaf %d is not the CV of its block (%d subtrees)", size, i, len(rng.Subtrees))
 			}
-			if off+group <= size && len(rng.Subtrees) != 1 {
+			if off+block <= size && len(rng.Subtrees) != 1 {
 				t.Errorf("size %d: full block %d hashed as %d subtrees", size, i, len(rng.Subtrees))
 			}
 		}
@@ -159,18 +159,18 @@ func TestRanges(t *testing.T) {
 			}
 			subs = append(subs, rng.Subtrees...)
 
-			if rng.GroupLog != GroupLog(rng.Size) {
-				t.Errorf("size %d: range [%d,%d) group %d, want GroupLog(size) %d", size, start, end, rng.GroupLog, GroupLog(rng.Size))
+			if rng.ChunkLog != ChunkLog(rng.Size) {
+				t.Errorf("size %d: range [%d,%d) chunk log %d, want ChunkLog(size) %d", size, start, end, rng.ChunkLog, ChunkLog(rng.Size))
 			}
 			// A range leaf is a block wholly inside the range (or the body's
-			// short tail block), aligned to the range's group, and when the
-			// range's group is the body's it is the body's leaf for that block.
-			group := GroupSize(rng.GroupLog)
+			// short tail block), aligned to the range's block, and when the
+			// range's block is the body's it is the body's leaf for that block.
+			group := BlockSize(rng.ChunkLog)
 			for _, leaf := range rng.Leaves {
 				if leaf.Offset%group != 0 || leaf.Offset < start || (leaf.Offset+group > end && end != size) {
 					t.Errorf("size %d: range [%d,%d) leaf at %d is not an aligned block inside it", size, start, end, leaf.Offset)
 				}
-				if rng.GroupLog == obj.GroupLog && obj.Leaves[leaf.Offset/group] != leaf.CV {
+				if rng.ChunkLog == obj.ChunkLog && obj.Leaves[leaf.Offset/group] != leaf.CV {
 					t.Errorf("size %d: range [%d,%d) leaf at %d differs from the body's", size, start, end, leaf.Offset)
 				}
 			}
@@ -203,10 +203,10 @@ func TestRangeLeafCap(t *testing.T) {
 	if len(rng.Leaves) > MaxLeaves {
 		t.Fatalf("%d leaves exceed the cap", len(rng.Leaves))
 	}
-	if rng.GroupLog != GroupLog(rng.Size) || rng.GroupLog < MinGroupLog+1 {
-		t.Fatalf("group %d, want %d", rng.GroupLog, GroupLog(rng.Size))
+	if rng.ChunkLog != ChunkLog(rng.Size) || rng.ChunkLog < MinChunkLog+1 {
+		t.Fatalf("chunk log %d, want %d", rng.ChunkLog, ChunkLog(rng.Size))
 	}
-	group := GroupSize(rng.GroupLog)
+	group := BlockSize(rng.ChunkLog)
 	for _, leaf := range rng.Leaves {
 		rh, _ := NewHasher(leaf.Offset)
 		rh.Write(d[leaf.Offset : leaf.Offset+group])
@@ -264,7 +264,7 @@ func TestAssemble(t *testing.T) {
 			}
 			cutSets = append(cutSets, random)
 			// Uniform parts of a size that is not a power of two, so blocks
-			// at the body's group straddle part boundaries.
+			// at the body's block size straddle part boundaries.
 			if part := int64(5 * ChunkSize); size > part {
 				var uniform []int64
 				for pos := part; pos < size; pos += part {
@@ -295,8 +295,8 @@ func TestAssemble(t *testing.T) {
 				t.Errorf("size %d, %d ranges: Assemble not ok", size, len(ranges))
 				continue
 			}
-			if got.Root != want.Root || got.GroupLog != want.GroupLog || got.Size != want.Size {
-				t.Errorf("size %d, %d ranges: root/group/size differ", size, len(ranges))
+			if got.Root != want.Root || got.ChunkLog != want.ChunkLog || got.Size != want.Size {
+				t.Errorf("size %d, %d ranges: root/chunk log/size differ", size, len(ranges))
 			}
 			if len(got.Leaves) != len(want.Leaves) {
 				t.Errorf("size %d, %d ranges: %d leaves, want %d", size, len(ranges), len(got.Leaves), len(want.Leaves))
@@ -378,16 +378,16 @@ func TestOutboard(t *testing.T) {
 		obj := h.FinishObject()
 		got := Outboard(obj.Leaves, size)
 
-		group := int(obj.GroupLog) - chunkLog
+		group := int(obj.ChunkLog)
 		want, root := bao.EncodeBuf(d, group, true)
 		if !bytes.Equal(got, want) {
-			t.Errorf("size %d (group 2^%d): outboard differs from the Bao library's (%d vs %d bytes)", size, obj.GroupLog, len(got), len(want))
+			t.Errorf("size %d (chunk log %d): outboard differs from the Bao library's (%d vs %d bytes)", size, obj.ChunkLog, len(got), len(want))
 			continue
 		}
 		if root != obj.Root {
 			t.Errorf("size %d: Bao root differs", size)
 		}
-		groupSize := GroupSize(obj.GroupLog)
+		groupSize := BlockSize(obj.ChunkLog)
 		for off := int64(0); off < size; off += groupSize {
 			block := d[off:min(off+groupSize, size)]
 			if !bao.VerifyChunk(block, got, group, uint64(off), root) {
@@ -415,7 +415,7 @@ func TestVerifyBlocks(t *testing.T) {
 	h.Write(d)
 	obj := h.FinishObject()
 	outboard := Outboard(obj.Leaves, size)
-	block := GroupSize(obj.GroupLog)
+	block := BlockSize(obj.ChunkLog)
 	if size/block != 2 || size%block == 0 {
 		t.Fatalf("test assumes 2 full blocks and a short tail, got block %d", block)
 	}
@@ -423,39 +423,39 @@ func TestVerifyBlocks(t *testing.T) {
 	for _, c := range []struct{ start, end int64 }{
 		{0, size}, {0, block}, {block, 2 * block}, {2 * block, size}, {block, size},
 	} {
-		n, err := VerifyBlocks(bytes.NewReader(d[c.start:c.end]), outboard, obj.GroupLog, c.start, obj.Root)
+		n, err := VerifyBlocks(bytes.NewReader(d[c.start:c.end]), outboard, obj.ChunkLog, c.start, obj.Root)
 		if err != nil || n != c.end-c.start {
 			t.Fatalf("range [%d,%d): verified %d, err %v", c.start, c.end, n, err)
 		}
 	}
 	bad := bytes.Clone(d[block:])
 	bad[block+7] ^= 1
-	n, err := VerifyBlocks(bytes.NewReader(bad), outboard, obj.GroupLog, block, obj.Root)
+	n, err := VerifyBlocks(bytes.NewReader(bad), outboard, obj.ChunkLog, block, obj.Root)
 	var be *BlockError
 	if !errors.As(err, &be) || be.Offset != 2*block || n != block {
 		t.Fatalf("corrupted block: verified %d, err %v", n, err)
 	}
-	if _, err := VerifyBlocks(bytes.NewReader(d[1:block+1]), outboard, obj.GroupLog, 1, obj.Root); err == nil || errors.As(err, &be) {
+	if _, err := VerifyBlocks(bytes.NewReader(d[1:block+1]), outboard, obj.ChunkLog, 1, obj.Root); err == nil || errors.As(err, &be) {
 		t.Fatalf("unaligned offset: %v", err)
 	}
-	if _, err := VerifyBlocks(bytes.NewReader(d[:block+5]), outboard, obj.GroupLog, 0, obj.Root); err == nil || errors.As(err, &be) {
+	if _, err := VerifyBlocks(bytes.NewReader(d[:block+5]), outboard, obj.ChunkLog, 0, obj.Root); err == nil || errors.As(err, &be) {
 		t.Fatalf("data ending mid-block: %v", err)
 	}
-	if _, err := VerifyBlocks(bytes.NewReader(append(bytes.Clone(d), 1)), outboard, obj.GroupLog, 0, obj.Root); err == nil || errors.As(err, &be) {
+	if _, err := VerifyBlocks(bytes.NewReader(append(bytes.Clone(d), 1)), outboard, obj.ChunkLog, 0, obj.Root); err == nil || errors.As(err, &be) {
 		t.Fatalf("data past the end: %v", err)
 	}
-	if _, err := VerifyBlocks(bytes.NewReader(d), outboard[:len(outboard)-1], obj.GroupLog, 0, obj.Root); err == nil {
+	if _, err := VerifyBlocks(bytes.NewReader(d), outboard[:len(outboard)-1], obj.ChunkLog, 0, obj.Root); err == nil {
 		t.Fatal("truncated outboard accepted")
 	}
 	root := obj.Root
 	root[0] ^= 1
-	if _, err := VerifyBlocks(bytes.NewReader(d[:block]), outboard, obj.GroupLog, 0, root); !errors.As(err, &be) {
+	if _, err := VerifyBlocks(bytes.NewReader(d[:block]), outboard, obj.ChunkLog, 0, root); !errors.As(err, &be) {
 		t.Fatalf("wrong root: %v", err)
 	}
 }
 
 func TestAlignedRange(t *testing.T) {
-	const size, group = 300_000, 14
+	const size, group = 300_000, 4
 	cases := []struct{ a, b, start, end int64 }{
 		{0, 0, 0, 16383},
 		{5000, 20000, 0, 32767},
@@ -487,29 +487,64 @@ func TestOutboardLeaves(t *testing.T) {
 	obj := h.FinishObject()
 	outboard := Outboard(obj.Leaves, size)
 
-	if n, err := OutboardLeaves(outboard, obj.GroupLog); err != nil || n != int64(len(obj.Leaves)) {
+	if n, err := OutboardLeaves(outboard, obj.ChunkLog); err != nil || n != int64(len(obj.Leaves)) {
 		t.Fatalf("OutboardLeaves = %d, %v; want %d", n, err, len(obj.Leaves))
 	}
-	for _, g := range []uint8{obj.GroupLog - 1, obj.GroupLog + 1, MinGroupLog - 1, MaxGroupLog + 1, 63, 64, 200} {
+	for _, g := range []uint8{obj.ChunkLog - 1, obj.ChunkLog + 1, MaxChunkLog + 1, 63, 64, 200} {
 		if _, err := OutboardLeaves(outboard, g); err == nil {
-			t.Errorf("group %d accepted for an outboard at group %d", g, obj.GroupLog)
+			t.Errorf("chunk log %d accepted for an outboard at chunk log %d", g, obj.ChunkLog)
 		}
 		if _, err := VerifyBlocks(bytes.NewReader(d), outboard, g, 0, obj.Root); err == nil {
-			t.Errorf("VerifyBlocks accepted group %d", g)
+			t.Errorf("VerifyBlocks accepted chunk log %d", g)
 		}
 	}
-	for _, g := range []uint8{MinGroupLog - 1, 63, 64, 200} {
+	for _, g := range []uint8{MaxChunkLog + 1, 63, 64, 200} {
 		if _, _, err := AlignedRange(0, 10, g, size); err == nil {
 			t.Errorf("AlignedRange accepted group %d", g)
 		}
 	}
-	// A one-leaf body has an empty outboard at any group that holds it in
-	// one block, and a zero-length body in none.
+	// A one-leaf body has an empty outboard at any block that holds it, and
+	// a zero-length body in none.
 	small := Outboard([]CV{{1}}, 100)
-	if n, err := OutboardLeaves(small, MinGroupLog); err != nil || n != 1 {
+	if n, err := OutboardLeaves(small, MinChunkLog); err != nil || n != 1 {
 		t.Fatalf("one leaf: %d, %v", n, err)
 	}
-	if n, err := OutboardLeaves(Outboard(nil, 0), MinGroupLog); err != nil || n != 0 {
+	if n, err := OutboardLeaves(Outboard(nil, 0), MinChunkLog); err != nil || n != 0 {
 		t.Fatalf("empty body: %d, %v", n, err)
+	}
+}
+
+// TestHasherAtChunkLog checks a body hashed at a caller-chosen block size:
+// the root is unchanged, the leaves are one per block at that size, and the
+// outboard equals the Bao library's at the same block size, from the
+// original Bao chunk (chunk log 0) and iroh's block (4) up past the body's
+// own.
+func TestHasherAtChunkLog(t *testing.T) {
+	for _, size := range []int64{0, 1, 1023, 1024, 1025, 16384, 16385, 100_000, 1 << 20, 5<<20 + 777} {
+		d := data(size)
+		want := blake3.Sum256(d)
+		natural := ChunkLog(size)
+		for _, g := range []uint8{0, 2, MinChunkLog, natural, natural + 2} {
+			h, err := NewHasherAtChunkLog(0, g)
+			if err != nil {
+				t.Fatal(err)
+			}
+			writeIn(t, h, d, size+int64(g))
+			obj := h.FinishObject()
+			if obj.Root != want || obj.ChunkLog != g {
+				t.Fatalf("size %d chunk log %d: root or chunk log wrong", size, g)
+			}
+			block := BlockSize(g)
+			if n := (size + block - 1) / block; int64(len(obj.Leaves)) != n {
+				t.Fatalf("size %d chunk log %d: %d leaves, want %d", size, g, len(obj.Leaves), n)
+			}
+			ob, root := bao.EncodeBuf(d, int(g), true)
+			if got := Outboard(obj.Leaves, size); !bytes.Equal(got, ob) || root != want {
+				t.Fatalf("size %d chunk log %d: outboard differs from the Bao library's", size, g)
+			}
+		}
+	}
+	if _, err := NewHasherAtChunkLog(0, MaxChunkLog+1); err == nil {
+		t.Fatal("chunk log above the maximum accepted")
 	}
 }

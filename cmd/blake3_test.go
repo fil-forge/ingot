@@ -13,6 +13,7 @@ import (
 
 	"github.com/ipfs/go-cid"
 	mh "github.com/multiformats/go-multihash"
+	"lukechampine.com/blake3/bao"
 
 	"github.com/fil-forge/ingot/blake3tree"
 )
@@ -39,8 +40,8 @@ func TestBlake3Commands(t *testing.T) {
 	obj := h.FinishObject()
 	digest, _ := mh.Encode(obj.Root[:], mh.BLAKE3)
 	want := cid.NewCidV1(cid.Raw, digest).String()
-	block := blake3tree.GroupSize(obj.GroupLog)
-	group := itoa(int64(obj.GroupLog))
+	block := blake3tree.BlockSize(obj.ChunkLog)
+	chunkLog := itoa(int64(obj.ChunkLog))
 	outboardB64 := base64.StdEncoding.EncodeToString(blake3tree.Outboard(obj.Leaves, size))
 	ob := filepath.Join(t.TempDir(), "ob.b64")
 	if err := os.WriteFile(ob, []byte(outboardB64+"\n"), 0o644); err != nil {
@@ -49,6 +50,47 @@ func TestBlake3Commands(t *testing.T) {
 
 	if out, err := run(t, data, "hash"); err != nil || strings.TrimSpace(out) != want {
 		t.Fatalf("hash: %q, %v", out, err)
+	}
+	// --bao prints the attribute's three values, and they drive the ranged
+	// commands directly.
+	baoOut, err := run(t, data, "hash", "--bao")
+	if err != nil {
+		t.Fatalf("hash --bao: %v", err)
+	}
+	fields := map[string]string{}
+	for _, line := range strings.Split(strings.TrimSpace(baoOut), "\n") {
+		k, v, _ := strings.Cut(line, " ")
+		fields[k] = v
+	}
+	if fields["CID"] != want || fields["ChunkLog"] != chunkLog || fields["Outboard"] != outboardB64 {
+		t.Fatalf("hash --bao printed %q", baoOut)
+	}
+	if out, err := run(t, data[block:], "verify", "--outboard", fields["Outboard"], "--chunk-log", fields["ChunkLog"], "--offset", itoa(block), fields["CID"]); err != nil || !strings.HasPrefix(out, "ok bytes ") {
+		t.Fatalf("verify from hash --bao output: %q, %v", out, err)
+	}
+	// --chunk-log chooses the block size: 4 is iroh's, and the outboard is
+	// then the Bao library's at chunk log 4; it verifies 16 KiB blocks.
+	irohOut, err := run(t, data, "hash", "--bao", "--chunk-log", "4")
+	if err != nil {
+		t.Fatalf("hash --bao --chunk-log 4: %v", err)
+	}
+	iroh := map[string]string{}
+	for _, line := range strings.Split(strings.TrimSpace(irohOut), "\n") {
+		k, v, _ := strings.Cut(line, " ")
+		iroh[k] = v
+	}
+	wantOb, _ := bao.EncodeBuf(data, 4, true)
+	if iroh["CID"] != want || iroh["ChunkLog"] != "4" || iroh["Outboard"] != base64.StdEncoding.EncodeToString(wantOb) {
+		t.Fatalf("hash --bao --chunk-log 4 printed %q", irohOut)
+	}
+	if out, err := run(t, data[16384:32768], "verify", "--outboard", iroh["Outboard"], "--chunk-log", "4", "--offset", "16384", want); err != nil || !strings.HasPrefix(out, "ok bytes 16384-32767") {
+		t.Fatalf("verify a 16 KiB block against the iroh-sized outboard: %q, %v", out, err)
+	}
+	if _, err := run(t, data, "hash", "--chunk-log", "4"); err == nil {
+		t.Fatal("--chunk-log without --bao accepted")
+	}
+	if _, err := run(t, data, "hash", "--bao", "--chunk-log", "60"); err == nil {
+		t.Fatal("--chunk-log 60 accepted")
 	}
 	if out, err := run(t, data, "verify", want); err != nil || !strings.HasPrefix(out, "ok ") {
 		t.Fatalf("verify whole: %q, %v", out, err)
@@ -61,7 +103,7 @@ func TestBlake3Commands(t *testing.T) {
 		t.Fatalf("a sha2-256 CID must be a usage error: %v", err)
 	}
 
-	out, err := run(t, nil, "range", "--outboard-file", ob, "--group", group, "5000-200000")
+	out, err := run(t, nil, "range", "--outboard-file", ob, "--chunk-log", chunkLog, "5000-200000")
 	if err != nil || !strings.Contains(out, "Range: bytes=0-"+itoa(2*block-1)) || !strings.Contains(out, "--offset 0") {
 		t.Fatalf("range: %q, %v", out, err)
 	}
@@ -72,33 +114,33 @@ func TestBlake3Commands(t *testing.T) {
 	off := itoa(block)
 	// The outboard inline as base64, and from a file, are the same thing.
 	for _, ob := range [][]string{{"--outboard", outboardB64}, {"--outboard-file", ob}} {
-		args := append(append([]string{"verify"}, ob...), "--group", group, "--offset", off, want)
+		args := append(append([]string{"verify"}, ob...), "--chunk-log", chunkLog, "--offset", off, want)
 		if out, err := run(t, data[block:], args...); err != nil || !strings.HasPrefix(out, "ok bytes "+off+"-"+itoa(size-1)) {
 			t.Fatalf("verify range %s: %q, %v", ob[0], out, err)
 		}
 	}
 	bad := bytes.Clone(data[block:])
 	bad[7] ^= 1
-	if _, err := run(t, bad, "verify", "--outboard", outboardB64, "--group", group, "--offset", off, want); !errors.As(err, &mm) {
+	if _, err := run(t, bad, "verify", "--outboard", outboardB64, "--chunk-log", chunkLog, "--offset", off, want); !errors.As(err, &mm) {
 		t.Fatalf("verify corrupted range: %v", err)
 	}
-	if _, err := run(t, data[1:], "verify", "--outboard", outboardB64, "--group", group, "--offset", "1", want); err == nil || errors.As(err, &mm) {
+	if _, err := run(t, data[1:], "verify", "--outboard", outboardB64, "--chunk-log", chunkLog, "--offset", "1", want); err == nil || errors.As(err, &mm) {
 		t.Fatalf("unaligned offset must be a usage error: %v", err)
 	}
-	if _, err := run(t, data[block:], "verify", "--outboard", "not base64!", "--group", group, "--offset", off, want); err == nil || errors.As(err, &mm) {
+	if _, err := run(t, data[block:], "verify", "--outboard", "not base64!", "--chunk-log", chunkLog, "--offset", off, want); err == nil || errors.As(err, &mm) {
 		t.Fatalf("a non-base64 --outboard must be a usage error: %v", err)
 	}
-	if _, err := run(t, data[block:], "verify", "--outboard", outboardB64, "--outboard-file", ob, "--group", group, "--offset", off, want); err == nil {
+	if _, err := run(t, data[block:], "verify", "--outboard", outboardB64, "--outboard-file", ob, "--chunk-log", chunkLog, "--offset", off, want); err == nil {
 		t.Fatal("--outboard and --outboard-file together accepted")
 	}
-	// A group the outboard does not match, or one no block size fits, is a
-	// usage error, not a mismatch.
-	for _, g := range []string{"14", "63", "64", "255"} {
-		if _, err := run(t, data[block:], "verify", "--outboard", outboardB64, "--group", g, "--offset", off, want); err == nil || errors.As(err, &mm) {
-			t.Fatalf("--group %s accepted: %v", g, err)
+	// A chunk log the outboard does not match, or one no block size fits,
+	// is a usage error, not a mismatch.
+	for _, g := range []string{"4", "53", "63", "255"} {
+		if _, err := run(t, data[block:], "verify", "--outboard", outboardB64, "--chunk-log", g, "--offset", off, want); err == nil || errors.As(err, &mm) {
+			t.Fatalf("--chunk-log %s accepted: %v", g, err)
 		}
-		if _, err := run(t, nil, "range", "--outboard", outboardB64, "--group", g, "0-1"); err == nil {
-			t.Fatalf("range --group %s accepted", g)
+		if _, err := run(t, nil, "range", "--outboard", outboardB64, "--chunk-log", g, "0-1"); err == nil {
+			t.Fatalf("range --chunk-log %s accepted", g)
 		}
 	}
 }

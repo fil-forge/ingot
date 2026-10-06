@@ -140,7 +140,7 @@ Internal:
 - **`tokenstore/`** — carried-from-guppy delegation store (`tokens.cbor`);
   empty today, read only by the dormant login paths.
 - **`blake3tree/`** — the BLAKE3 Merkle-tree material of a body: the
-  whole-object digest (the `x-cid` header), the group-aligned leaf chaining
+  whole-object digest (the `x-cid` header), the block-aligned leaf chaining
   values the manifest records for verifying ranged reads, and the aligned
   subtrees of a range hashed at an offset (for assembling a multipart
   object's tree from its parts). Wraps `lukechampine.com/blake3/guts`.

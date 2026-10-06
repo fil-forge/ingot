@@ -13,7 +13,7 @@ import (
 )
 
 // assertTree checks a split body's BLAKE3 fields against the reference hash
-// of data: the multihash, the group, the leaf count, and that the leaves
+// of data: the multihash, the chunk log, the leaf count, and that the leaves
 // merge back to the root.
 func assertTree(t *testing.T, body Body, data []byte) {
 	t.Helper()
@@ -25,15 +25,15 @@ func assertTree(t *testing.T, body Body, data []byte) {
 	if dec.Code != mh.BLAKE3 || !bytes.Equal(dec.Digest, want[:]) {
 		t.Fatalf("BLAKE3 = code %#x digest %x, want blake3 %x", dec.Code, dec.Digest, want)
 	}
-	if g := blake3tree.GroupLog(int64(len(data))); body.TreeGroup != g {
-		t.Fatalf("TreeGroup = %d, want %d", body.TreeGroup, g)
+	if g := blake3tree.ChunkLog(int64(len(data))); body.TreeChunkLog != g {
+		t.Fatalf("TreeChunkLog = %d, want %d", body.TreeChunkLog, g)
 	}
 	leaves, err := body.TreeLeafCVs()
 	if err != nil {
 		t.Fatal(err)
 	}
-	group := blake3tree.GroupSize(body.TreeGroup)
-	if wantN := (int64(len(data)) + group - 1) / group; int64(len(leaves)) != wantN {
+	block := blake3tree.BlockSize(body.TreeChunkLog)
+	if wantN := (int64(len(data)) + block - 1) / block; int64(len(leaves)) != wantN {
 		t.Fatalf("%d leaves, want %d", len(leaves), wantN)
 	}
 	if root, ok := blake3tree.RootFromLeaves(leaves); ok && root != want {
@@ -62,7 +62,7 @@ func TestSplitBody_Tree(t *testing.T) {
 		if err != nil {
 			t.Fatalf("SplitSizedBody(%d): %v", n, err)
 		}
-		if !bytes.Equal(sized.BLAKE3, body.BLAKE3) || sized.TreeGroup != body.TreeGroup || !bytes.Equal(sized.TreeLeaves, body.TreeLeaves) {
+		if !bytes.Equal(sized.BLAKE3, body.BLAKE3) || sized.TreeChunkLog != body.TreeChunkLog || !bytes.Equal(sized.TreeLeaves, body.TreeLeaves) {
 			t.Fatalf("SplitSizedBody(%d) tree differs from SplitBody's", n)
 		}
 	}

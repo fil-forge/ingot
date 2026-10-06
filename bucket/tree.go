@@ -100,13 +100,13 @@ func (h *bodyHashes) body(total int64, blobs []BlobRef) (Body, error) {
 }
 
 // SetTree records a body's BLAKE3 tree material: the digest as a multihash,
-// the group, and the leaves concatenated.
+// the chunk log, and the leaves concatenated.
 func (b *Body) SetTree(obj blake3tree.Object) error {
 	digest, err := mh.Encode(obj.Root[:], mh.BLAKE3)
 	if err != nil {
 		return fmt.Errorf("encode blake3 multihash: %w", err)
 	}
-	b.BLAKE3, b.TreeGroup, b.TreeLeaves = digest, obj.GroupLog, nil
+	b.BLAKE3, b.TreeChunkLog, b.TreeLeaves = digest, obj.ChunkLog, nil
 	if len(obj.Leaves) > 0 {
 		b.TreeLeaves = make([]byte, 0, len(obj.Leaves)*blake3tree.CVSize)
 		for _, cv := range obj.Leaves {
