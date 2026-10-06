@@ -756,6 +756,9 @@ func clonePart(p registry.MultipartPart) registry.MultipartPart {
 		}
 		p.BlobDigests = ds
 	}
+	p.TreeNodes = bytes.Clone(p.TreeNodes)
+	p.TreeLeaves = bytes.Clone(p.TreeLeaves)
+	p.TreeRoot = bytes.Clone(p.TreeRoot)
 	return p
 }
 

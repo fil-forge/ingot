@@ -27,6 +27,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.uber.org/zap"
 
+	"github.com/fil-forge/ingot/blake3tree"
 	msbucket "github.com/fil-forge/ingot/bucket"
 	"github.com/fil-forge/ingot/internal/reqscope"
 	"github.com/fil-forge/ingot/internal/tracing"
@@ -354,7 +355,20 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 			return nil, fmt.Errorf("s3frontend: record superseded part releases: %w", err)
 		}
 	}
-	spooled, err := b.splitSpool(ctx, sess.Bucket, space, bodyReader, size, md5Src)
+	// The part's BLAKE3 tree, hashed at the offset the part is guessed to
+	// sit at in the object (see guessPartOffset); Complete merges the parts'
+	// trees into the object's digest and leaves. A guess that is not
+	// chunk-aligned (an earlier part of odd length) leaves no tree, and the
+	// part is re-hashed at Complete. The split's own whole-body tree is
+	// skipped: it would be the tree of the part alone, at offset 0.
+	treeOffset := guessPartOffset(prior, partNumber, size)
+	tree, err := blake3tree.NewHasher(treeOffset)
+	if err != nil {
+		tree = nil
+	} else {
+		bodyReader = io.TeeReader(bodyReader, tree)
+	}
+	spooled, err := b.splitSpool(ctx, sess.Bucket, space, bodyReader, size, md5Src, msbucket.WithoutTree())
 	if err != nil {
 		var apiErr s3err.APIError
 		if errors.As(err, &apiErr) {
@@ -364,7 +378,7 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 	}
 	defer spooled.lease.end()
 	rec := spooled.Body
-	if err := b.multipart.PutPart(ctx, registry.MultipartPart{
+	part := registry.MultipartPart{
 		UploadID:    uploadID,
 		PartNumber:  partNumber,
 		ETagMD5:     rec.MD5,
@@ -372,7 +386,11 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 		Checksum:    hr.Sum(),
 		BlobDigests: bodyDigests(rec),
 		State:       registry.PartParked,
-	}); err != nil {
+	}
+	if tree != nil {
+		recordPartTree(&part, tree.FinishRange())
+	}
+	if err := b.multipart.PutPart(ctx, part); err != nil {
 		// No part row points at the spooled blobs now, whatever went wrong:
 		// the session was completed, aborted or torn down after this upload
 		// was admitted (ErrNotFound), or the write failed. Their release is
@@ -727,7 +745,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 	// Assemble the ordered body: each part's byte span (it may span several
 	// blobs) is recorded so a later GET/HEAD ?partNumber=N can address it (§7.2).
 	var blobs []msbucket.BlobRef
-	var partSizes []int64
+	var partSizes, partOffsets []int64
 	// Per-part checksums are retained only for a COMPOSITE checksummed upload
 	// (and only when every part recorded one). AWS exposes the per-part list and
 	// a ?partNumber checksum solely for composite multipart objects; a
@@ -752,6 +770,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 			offset += plainLen
 		}
 		partSizes = append(partSizes, offset-partStart)
+		partOffsets = append(partOffsets, partStart)
 		if recordPartChecksums {
 			partChecksums = append(partChecksums, sp.Checksum)
 		}
@@ -765,11 +784,22 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 		return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: accept parts: %w", err)
 	}
 
+	// The object's BLAKE3 digest and leaves, assembled from the parts' trees
+	// (re-reading a part only where its record cannot serve).
+	body := msbucket.Body{Size: offset, Blobs: blobs, PartSizes: partSizes, PartChecksums: partChecksums}
+	tree, err := b.multipartTree(ctx, bucketState.Space, requested, partOffsets, body)
+	if err != nil {
+		return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: object tree: %w", err)
+	}
+	if err := body.SetTree(tree); err != nil {
+		return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: object tree: %w", err)
+	}
+
 	mf := &msbucket.ObjectManifest{
 		Key:                     key,
 		ContentType:             sess.ContentType,
 		Created:                 time.Now().Unix(),
-		Body:                    msbucket.Body{Size: offset, Blobs: blobs, PartSizes: partSizes, PartChecksums: partChecksums},
+		Body:                    body,
 		ETag:                    etag,
 		ContentEncoding:         sess.ContentEncoding,
 		ContentDisposition:      sess.ContentDisposition,

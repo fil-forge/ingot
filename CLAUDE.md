@@ -64,7 +64,8 @@ ingot depends only on these — it must **never** import `fil-forge/sprue` or
 - **`fil-forge/versitygw`** — our fork of versity/versitygw, the S3 REST front
   end (we implement `backend.Backend`). The fork adds externally derived SigV4
   signing keys (`auth.Account.SigningKey`, `middlewares.RequestIAMService`) for
-  the Hilt flow.
+  the Hilt flow, and the `Blake3` object attribute (`s3response.Blake3Tree`)
+  that GetObjectAttributes returns the object's CID and Bao outboard in.
 - Plumbing: `go-cid`, `go-block-format`, `whyrusleeping/cbor-gen` (**not**
   go-ipld-prime), `multiformats/*`, `pgx/v5`, `goose/v3`, `spf13/{cobra,viper}`,
   `uber-go/fx`, `zap`.
@@ -136,6 +137,11 @@ Internal:
   `registry.RevocationCursorStore` cursor (no cursor → subscribe from now).
 - **`tokenstore/`** — carried-from-guppy delegation store (`tokens.cbor`);
   empty today, read only by the dormant login paths.
+- **`blake3tree/`** — the BLAKE3 Merkle-tree material of a body: the
+  whole-object digest (the `x-cid` header), the group-aligned leaf chaining
+  values the manifest records for verifying ranged reads, and the aligned
+  subtrees of a range hashed at an offset (for assembling a multipart
+  object's tree from its parts). Wraps `lukechampine.com/blake3/guts`.
 - **`bucket/`** — the per-object model: `manifest.go` (`ObjectManifest`,
   `Body`), `leaf.go` (`ValueUnion`, `ObjectLeaf`, `VersionNode`),
   `chunker.go` (`SplitBody`, body readers), `sized.go` (`SplitSizedBody`, for

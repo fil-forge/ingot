@@ -237,6 +237,22 @@ type MultipartPart struct {
 	BlobDigests []multihash.Multihash
 	State       string
 	CreatedAt   time.Time
+
+	// The part's BLAKE3 tree material, from which Complete assembles the
+	// object's digest and leaf list without re-reading the part (see
+	// blake3tree). TreeOffset is the object byte offset the part was hashed
+	// at: UploadPart's guess from the parts recorded so far, which Complete
+	// checks against the part's true offset. TreeNodes holds the part's
+	// aligned subtrees and TreeLeaves its leaves at TreeGroup, both encoded
+	// with blake3tree.EncodeSubtrees. TreeRoot is the part's own BLAKE3 hash,
+	// set when TreeOffset is 0. Nil TreeNodes means no tree was recorded
+	// (a part from before the tree existed, or a copy that read no bytes),
+	// and Complete re-hashes the part.
+	TreeOffset int64
+	TreeGroup  uint8
+	TreeNodes  []byte
+	TreeLeaves []byte
+	TreeRoot   []byte
 }
 
 // BlobRefStore is the reverse reference index (§5, §6). A commit adds a

@@ -770,7 +770,7 @@ func (t *Body) MarshalCBOR(w io.Writer) error {
 
 	cw := cbg.NewCborWriter(w)
 
-	if _, err := cw.Write([]byte{167}); err != nil {
+	if _, err := cw.Write([]byte{170}); err != nil {
 		return err
 	}
 
@@ -842,6 +842,30 @@ func (t *Body) MarshalCBOR(w io.Writer) error {
 		if err := cw.WriteMajorTypeHeader(cbg.MajNegativeInt, uint64(-t.Size-1)); err != nil {
 			return err
 		}
+	}
+
+	// t.BLAKE3 ([]uint8) (slice)
+	if len("b3") > 1000000 {
+		return xerrors.Errorf("Value in field \"b3\" was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("b3"))); err != nil {
+		return err
+	}
+	if _, err := cw.WriteString(string("b3")); err != nil {
+		return err
+	}
+
+	if len(t.BLAKE3) > 2097152 {
+		return xerrors.Errorf("Byte array in field t.BLAKE3 was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajByteString, uint64(len(t.BLAKE3))); err != nil {
+		return err
+	}
+
+	if _, err := cw.Write(t.BLAKE3); err != nil {
+		return err
 	}
 
 	// t.Blobs ([]bucket.BlobRef) (slice)
@@ -956,6 +980,47 @@ func (t *Body) MarshalCBOR(w io.Writer) error {
 		}
 
 	}
+
+	// t.TreeGroup (uint8) (uint8)
+	if len("tg") > 1000000 {
+		return xerrors.Errorf("Value in field \"tg\" was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("tg"))); err != nil {
+		return err
+	}
+	if _, err := cw.WriteString(string("tg")); err != nil {
+		return err
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajUnsignedInt, uint64(t.TreeGroup)); err != nil {
+		return err
+	}
+
+	// t.TreeLeaves ([]uint8) (slice)
+	if len("tl") > 1000000 {
+		return xerrors.Errorf("Value in field \"tl\" was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("tl"))); err != nil {
+		return err
+	}
+	if _, err := cw.WriteString(string("tl")); err != nil {
+		return err
+	}
+
+	if len(t.TreeLeaves) > 2097152 {
+		return xerrors.Errorf("Byte array in field t.TreeLeaves was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajByteString, uint64(len(t.TreeLeaves))); err != nil {
+		return err
+	}
+
+	if _, err := cw.Write(t.TreeLeaves); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -1072,6 +1137,29 @@ func (t *Body) UnmarshalCBOR(r io.Reader) (err error) {
 
 				t.Size = int64(extraI)
 			}
+			// t.BLAKE3 ([]uint8) (slice)
+		case "b3":
+
+			maj, extra, err = cr.ReadHeader()
+			if err != nil {
+				return err
+			}
+
+			if extra > 2097152 {
+				return fmt.Errorf("t.BLAKE3: byte array too large (%d)", extra)
+			}
+			if maj != cbg.MajByteString {
+				return fmt.Errorf("expected byte array")
+			}
+
+			if extra > 0 {
+				t.BLAKE3 = make([]uint8, extra)
+			}
+
+			if _, err := io.ReadFull(cr, t.BLAKE3); err != nil {
+				return err
+			}
+
 			// t.Blobs ([]bucket.BlobRef) (slice)
 		case "bl":
 
@@ -1228,6 +1316,42 @@ func (t *Body) UnmarshalCBOR(r io.Reader) (err error) {
 					}
 
 				}
+			}
+			// t.TreeGroup (uint8) (uint8)
+		case "tg":
+
+			maj, extra, err = cr.ReadHeader()
+			if err != nil {
+				return err
+			}
+			if maj != cbg.MajUnsignedInt {
+				return fmt.Errorf("wrong type for uint8 field")
+			}
+			if extra > math.MaxUint8 {
+				return fmt.Errorf("integer in input was too large for uint8 field")
+			}
+			t.TreeGroup = uint8(extra)
+			// t.TreeLeaves ([]uint8) (slice)
+		case "tl":
+
+			maj, extra, err = cr.ReadHeader()
+			if err != nil {
+				return err
+			}
+
+			if extra > 2097152 {
+				return fmt.Errorf("t.TreeLeaves: byte array too large (%d)", extra)
+			}
+			if maj != cbg.MajByteString {
+				return fmt.Errorf("expected byte array")
+			}
+
+			if extra > 0 {
+				t.TreeLeaves = make([]uint8, extra)
+			}
+
+			if _, err := io.ReadFull(cr, t.TreeLeaves); err != nil {
+				return err
 			}
 
 		default:

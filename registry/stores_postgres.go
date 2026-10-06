@@ -919,15 +919,19 @@ func (r *Postgres) PutPart(ctx context.Context, p MultipartPart) error {
 	// statement holds the row waits for the part to commit, so the
 	// teardown's part listing includes it.
 	tag, err := r.pool.Exec(ctx,
-		`INSERT INTO ingot.multipart_parts (upload_id, part_number, etag_md5, size, checksum, blob_digests, state)
-		 SELECT s.upload_id, $2, $3, $4, $5, $6, $7
+		`INSERT INTO ingot.multipart_parts (upload_id, part_number, etag_md5, size, checksum, blob_digests, state,
+		                                    tree_offset, tree_group, tree_nodes, tree_leaves, tree_root)
+		 SELECT s.upload_id, $2, $3, $4, $5, $6, $7, $9, $10, $11, $12, $13
 		   FROM ingot.multipart_sessions s
 		  WHERE s.upload_id = $1 AND s.state = $8
 		    FOR SHARE
 		 ON CONFLICT (upload_id, part_number) DO UPDATE
 		   SET etag_md5 = EXCLUDED.etag_md5, size = EXCLUDED.size, checksum = EXCLUDED.checksum,
-		       blob_digests = EXCLUDED.blob_digests, state = EXCLUDED.state`,
-		p.UploadID, p.PartNumber, p.ETagMD5, p.Size, p.Checksum, p.BlobDigests, state, SessionOpen)
+		       blob_digests = EXCLUDED.blob_digests, state = EXCLUDED.state,
+		       tree_offset = EXCLUDED.tree_offset, tree_group = EXCLUDED.tree_group,
+		       tree_nodes = EXCLUDED.tree_nodes, tree_leaves = EXCLUDED.tree_leaves, tree_root = EXCLUDED.tree_root`,
+		p.UploadID, p.PartNumber, p.ETagMD5, p.Size, p.Checksum, p.BlobDigests, state, SessionOpen,
+		p.TreeOffset, int16(p.TreeGroup), p.TreeNodes, p.TreeLeaves, p.TreeRoot)
 	if err != nil {
 		return fmt.Errorf("registry: put part: %w", err)
 	}
@@ -939,7 +943,8 @@ func (r *Postgres) PutPart(ctx context.Context, p MultipartPart) error {
 
 func (r *Postgres) ListParts(ctx context.Context, uploadID string) ([]MultipartPart, error) {
 	rows, err := r.pool.Query(ctx,
-		`SELECT part_number, etag_md5, size, checksum, blob_digests, state, created_at
+		`SELECT part_number, etag_md5, size, checksum, blob_digests, state, created_at,
+		        tree_offset, tree_group, tree_nodes, tree_leaves, tree_root
 		 FROM ingot.multipart_parts WHERE upload_id = $1 ORDER BY part_number ASC`,
 		uploadID)
 	if err != nil {
@@ -950,9 +955,12 @@ func (r *Postgres) ListParts(ctx context.Context, uploadID string) ([]MultipartP
 	var out []MultipartPart
 	for rows.Next() {
 		p := MultipartPart{UploadID: uploadID}
-		if err := rows.Scan(&p.PartNumber, &p.ETagMD5, &p.Size, &p.Checksum, &p.BlobDigests, &p.State, &p.CreatedAt); err != nil {
+		var treeGroup int16
+		if err := rows.Scan(&p.PartNumber, &p.ETagMD5, &p.Size, &p.Checksum, &p.BlobDigests, &p.State, &p.CreatedAt,
+			&p.TreeOffset, &treeGroup, &p.TreeNodes, &p.TreeLeaves, &p.TreeRoot); err != nil {
 			return nil, fmt.Errorf("registry: list parts scan: %w", err)
 		}
+		p.TreeGroup = uint8(treeGroup)
 		out = append(out, p)
 	}
 	if err := rows.Err(); err != nil {
