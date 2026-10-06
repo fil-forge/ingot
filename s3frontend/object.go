@@ -959,10 +959,14 @@ func (b *Backend) executeRelease(ctx context.Context, pr registry.PendingRelease
 		// outlived it would leave the retry reading neither rows nor
 		// intent, owing a network remove it cannot authorize and can never
 		// complete.
-		if _, err := b.removeLocal(digest); err != nil {
+		freed, err := b.removeLocal(digest)
+		if err != nil {
 			log.Warn("release: remove local blob copy failed", zap.Error(err))
 			ok = false
-		} else if err := b.pendingReleases.DeleteIntentAndRelease(ctx, space, digest); err != nil {
+			break
+		}
+		b.localBlobMetrics.removedFile(ctx, removedReleased, freed)
+		if err := b.pendingReleases.DeleteIntentAndRelease(ctx, space, digest); err != nil {
 			log.Warn("release: delete upload intent with the release record failed", zap.Error(err))
 			ok = false
 		}

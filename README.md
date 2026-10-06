@@ -124,26 +124,6 @@ consulted. The deployment context is the
 the S3 facade runs **at the edge**, co-located with a provider's piri or as a
 standalone client — not inside the central upload-service.
 
-`serve` writes every object body to `<data_dir>/spool` as it uploads it, and
-moves each body to `<data_dir>/cache` once the provider holds it, keeping it
-so a read soon after the write is served from local disk. The two must be on
-one filesystem, since a body moves between them by rename; `serve` refuses
-to start otherwise. Set `local_blob_max_bytes` to bound the two directories
-together: a sweeper evicts bodies the provider holds, oldest first, and
-later reads of them go to the provider. The budget counts bodies as they are
-written, so the sweeper makes room for them, but usage can run over it by
-the ingest rate × 30 seconds, plus the spool's bodies still being written or
-uploaded, which cannot be evicted. Nor can the body of an upload that failed
-(its upload intent stays `spooled` or `uploading`): nothing reclaims those
-files yet, so they count against the budget until removed by hand. After
-removing files by hand, restart `serve`: the byte counts see such a change
-at startup, or only at an hourly scan that no write overlapped. Without a
-budget the cache grows with every live object's bodies; a deleted object's
-local copy is freed when its release runs, and a multipart part's once it
-parks on the provider. With or without a budget, the sweeper deletes
-unfinished writes, and spool files with no upload intent, hourly, once they
-are older than `local_blob_orphan_age` (default `24h`).
-
 `serve` exports OpenTelemetry traces over OTLP/HTTP when
 `OTEL_EXPORTER_OTLP_ENDPOINT` names a collector; with no endpoint, tracing is
 off. Each S3 request is a trace named for its S3 action, with the hilt, sprue,
@@ -152,7 +132,80 @@ environment variables apply: `OTEL_EXPORTER_OTLP_HEADERS` authenticates to the
 collector, and `OTEL_TRACES_SAMPLER_ARG` sets the fraction of requests traced
 (`0.01` traces 1%; the default traces every request). As a library, ingot
 records spans on the global tracer provider, so an embedding host decides
-where they go.
+where they go. Metrics go to the same collector under the same variables
+(`OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` overrides the endpoint for them alone,
+and `OTEL_METRIC_EXPORT_INTERVAL` sets how often they are pushed); as a
+library, ingot records them on the global meter provider.
+
+### Local disk
+
+`serve` keeps object bodies in two directories under `data_dir`, which
+must be on one filesystem (`serve` checks this at startup):
+
+- `<data_dir>/spool` holds each body as it is written and uploaded, until
+  the provider holds it;
+- `<data_dir>/cache` holds a body once the provider holds it (it moves there
+  by rename), so a read soon after a write is served from local disk.
+
+A cached copy is not needed, so it goes:
+
+- when a deleted or overwritten object's release runs (`release_grace`,
+  default 60s, after its last reference drops);
+- with `local_blob_max_bytes` set, when a sweeper, checking every 30 seconds,
+  finds the two directories over the budget and evicts cached bodies, oldest
+  first, down to 90% of the budget. Later reads of an evicted body go to the
+  provider and take provider-read latency.
+
+A multipart part's copy goes from the spool as soon as the part parks on its
+provider. The budget is off by default (`local_blob_max_bytes: 0`): without
+it the cache grows with every live object's bodies. With or without a
+budget, the sweeper also deletes, hourly, unfinished `.tmp-*` writes in
+either directory and spool files with no upload intent, once they are older
+than `local_blob_orphan_age` (default `24h`, at least `1h`).
+
+**Sizing.** The filesystem needs room for:
+
+- `local_blob_max_bytes`, plus 10% headroom that must exceed the ingest rate
+  × 30 seconds (60 GB at 2 GB/s);
+- the spool's bodies in flight, when they outgrow the budget: each
+  concurrent PUT or UploadPart writes its body as it streams, and a part can
+  be up to 5 GiB. The budget counts those bytes as they land, so the sweeper
+  evicts cached bodies to make room for them. But a body cannot be evicted
+  until the provider holds it, so if the spool alone exceeds the budget,
+  usage runs over it by the difference;
+- the bodies of uploads that failed: their upload intents stay `spooled` or
+  `uploading`, nothing reclaims those spool files yet, and they count against
+  the budget until removed by hand. `ingot.local_blobs.stalled_bytes` reports
+  how much they hold;
+- the catalog log, if it shares the filesystem: `<data_dir>/segments`, per
+  bucket about (`retain` + the open and unshipped segments) × `seal_bytes`.
+
+**Metrics.** With metrics on, local blob storage reports:
+
+| Metric | Meaning |
+| -- | -- |
+| `ingot.local_blobs.usage` | Bytes held, by `dir`: `spool` (writes in progress and bodies awaiting upload, which eviction cannot touch) or `cache` |
+| `ingot.local_blobs.budget` | `local_blob_max_bytes` (0: no budget) |
+| `ingot.local_blobs.stalled_bytes` | Bytes of bodies whose upload has stalled: intents still `spooled` or `uploading` an hour after their last state change, which nothing reclaims yet. Growth means uploads are failing |
+| `ingot.local_blobs.removals`, `ingot.local_blobs.removed_bytes` | Files and bytes removed, by `reason`: `released`, `parked`, `budget`, `orphan` |
+| `ingot.local_blobs.reads` | Body-blob reads, by `tier`: `local` or `network` (the local hit ratio) |
+
+**Manual cleanup.** Every file in `<data_dir>/cache` is safe to delete: the
+provider holds its body. A file in `<data_dir>/spool` may be the only copy.
+The one kind safe to delete is a body the provider already holds, left in
+the spool by an interrupted move; this query lists those (the file names are
+the hex digests):
+
+```sql
+SELECT encode(i.digest, 'hex') FROM ingot.upload_intents i
+WHERE i.state IN ('accepted', 'published')
+  AND EXISTS (SELECT 1 FROM ingot.blob_locations l WHERE l.digest = i.digest);
+```
+
+Never delete the spool file of a `spooled` or `uploading` intent: it may be
+the only copy. Restart `serve` after deleting files by hand: the byte counts
+see such a change at startup, or only at an hourly scan that no write
+overlapped.
 
 ## Build & test
 

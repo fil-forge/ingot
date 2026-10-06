@@ -18,6 +18,7 @@ import (
 	"github.com/fil-forge/versitygw/s3log"
 	"github.com/gofiber/fiber/v3"
 	"github.com/multiformats/go-multihash"
+	"go.opentelemetry.io/otel"
 	"go.uber.org/zap"
 
 	"github.com/fil-forge/ingot/blockstore"
@@ -199,6 +200,11 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 	}
 
 	bs := blockstore.NewLayered(blockstore.LocalBlobs{Cache: cache, Spool: spool}, log, deps.BaseBlockReader)
+	// The global meter provider is a no-op until a host (the daemon) installs
+	// one, so counting costs nothing when nobody is listening.
+	if err := bs.CountBlobReads(otel.Meter("github.com/fil-forge/ingot/blockstore")); err != nil {
+		logger.Warn("local blob read metric not created", zap.Error(err))
+	}
 	backend := s3frontend.New(s3frontend.Deps{
 		Authority:       deps.Authority,
 		Registry:        deps.Registry,
@@ -235,6 +241,7 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 	if err != nil {
 		// Best-effort cleanup if we got past the log open: the caller
 		// has no Server handle to call Stop on.
+		_ = backend.CloseMetrics()
 		_ = log.Close(ctx)
 		return nil, err
 	}
@@ -253,6 +260,9 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 // it to start serving on Addr).
 func (s *Server) Start(ctx context.Context) error {
 	if err := s.backend.Recover(ctx); err != nil {
+		// fx does not run OnStop for a hook whose OnStart failed, so the
+		// gauges go now; Stop calling CloseMetrics again is harmless.
+		_ = s.backend.CloseMetrics()
 		return fmt.Errorf("ingot: recover: %w", err)
 	}
 	s.logger.Info("starting ingot S3 listener",
@@ -428,6 +438,9 @@ func (s *Server) Stop(ctx context.Context) error {
 		s.localBlobStop = nil
 	}
 	var errs []error
+	if err := s.backend.CloseMetrics(); err != nil {
+		errs = append(errs, fmt.Errorf("unregister local blob metrics: %w", err))
+	}
 	if err := s.api.ShutDown(); err != nil {
 		errs = append(errs, fmt.Errorf("s3api shutdown: %w", err))
 	}

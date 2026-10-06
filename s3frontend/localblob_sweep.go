@@ -31,6 +31,10 @@ const (
 	// orphanPassInterval spaces the orphan pass, which scans the whole
 	// spool and cache directories and so stays off the per-sweep path.
 	orphanPassInterval = time.Hour
+	// stalledUploadAge is how long a body may wait for upload, since its
+	// intent last changed state, before the stalled_bytes gauge counts it:
+	// well past the longest a live upload takes.
+	stalledUploadAge = time.Hour
 	// DefaultLocalBlobOrphanAge is the age at which a .tmp-* file or a blob file
 	// with no intent row is deleted, when Deps.LocalBlobOrphanAge is zero.
 	DefaultLocalBlobOrphanAge = 24 * time.Hour
@@ -95,6 +99,10 @@ func (s LocalBlobSweepStats) LogFields() []zap.Field {
 // not it finishes, so a slow or failing pass waits for the next hour rather
 // than starting over every sweep.
 //
+// Every run also sums the bodies whose upload has stalled: intents still
+// spooled or uploading an hour after their last state change, which no live
+// request holds that long. The stalled_bytes gauge reports the sum.
+//
 // Called periodically by the daemon's local blob sweeper, and directly by tests.
 func (b *Backend) SweepLocalBlobs(ctx context.Context) (LocalBlobSweepStats, error) {
 	b.localBlobSweepMu.Lock()
@@ -111,6 +119,7 @@ func (b *Backend) SweepLocalBlobs(ctx context.Context) (LocalBlobSweepStats, err
 		pass, err := b.evictToBudget(budgetCtx, now.Add(budgetPassTimeLimit))
 		cancel()
 		stats.BudgetFiles, stats.BudgetBytes = pass.files, pass.bytes
+		b.localBlobMetrics.removed(ctx, removedBudget, pass.files, pass.bytes)
 		// A query cut off by the pass's own time limit is the time limit,
 		// not a failure.
 		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
@@ -146,6 +155,7 @@ func (b *Backend) SweepLocalBlobs(ctx context.Context) (LocalBlobSweepStats, err
 		files, bytes, err := b.removeOrphans(orphanCtx, now)
 		cancel()
 		stats.OrphanFiles, stats.OrphanBytes = files, bytes
+		b.localBlobMetrics.removed(ctx, removedOrphan, files, bytes)
 		b.lastOrphanPass = now
 		switch {
 		case errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil:
@@ -155,6 +165,14 @@ func (b *Backend) SweepLocalBlobs(ctx context.Context) (LocalBlobSweepStats, err
 		case err != nil:
 			errs = append(errs, fmt.Errorf("s3frontend: local blob orphan pass: %w", err))
 		}
+	}
+	// The stalled_bytes gauge reads this sum, so the metric callback never
+	// queries the registry.
+	if n, err := b.intents.StalledBytes(ctx, now.Add(-stalledUploadAge)); err != nil {
+		errs = append(errs, fmt.Errorf("s3frontend: sum stalled uploads: %w", err))
+	} else {
+		b.stalledBytes.Store(n)
+		b.stalledKnown.Store(true)
 	}
 	return stats, errors.Join(errs...)
 }

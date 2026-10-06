@@ -28,10 +28,13 @@ import (
 	"context"
 	"encoding/xml"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/fil-forge/versitygw/auth"
 	"github.com/fil-forge/versitygw/backend"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/metric"
 	"go.uber.org/zap"
 
 	"github.com/fil-forge/ingot/blockstore"
@@ -92,6 +95,15 @@ type Backend struct {
 	// so each message comes once per episode. Guarded by localBlobSweepMu.
 	overBudgetWarned bool
 	timeLimitLogged  bool
+	// stalledBytes is the sweeper's latest sum of stalled uploads (see
+	// SweepLocalBlobs), read by the stalled_bytes gauge; stalledKnown is set
+	// once a sweep has computed it.
+	stalledBytes atomic.Int64
+	stalledKnown atomic.Bool
+	// localBlobMetrics counts local blob removals; localBlobGauges is the
+	// registration of the usage and budget gauges (nil when not registered).
+	localBlobMetrics localBlobMetrics
+	localBlobGauges  metric.Registration
 	// regionKeys unwraps region-wrapped CEKs for the decrypting read path.
 	regionKeys regionkey.Provider
 	// tenantKeys yields the tenant wrap key each write encrypts to (the FEE
@@ -188,6 +200,11 @@ type Deps struct {
 	// DefaultLocalBlobOrphanAge.
 	LocalBlobOrphanAge time.Duration
 
+	// MeterProvider supplies the spool's instruments: usage and budget
+	// gauges, and removals by reason. Nil → the global provider, a no-op
+	// until a host installs one.
+	MeterProvider metric.MeterProvider
+
 	// MaxBlobSize is the coarse-split blob ceiling (0 → bucket default).
 	MaxBlobSize int64
 
@@ -225,7 +242,7 @@ func New(d Deps) *Backend {
 	if localBlobOrphanAge <= 0 {
 		localBlobOrphanAge = DefaultLocalBlobOrphanAge
 	}
-	return &Backend{
+	b := &Backend{
 		authority:       d.Authority,
 		read:            d.Reads,
 		reg:             d.Registry,
@@ -257,6 +274,12 @@ func New(d Deps) *Backend {
 		maxBlobSize: d.MaxBlobSize,
 		cors:        corsDoc,
 	}
+	mp := d.MeterProvider
+	if mp == nil {
+		mp = otel.GetMeterProvider()
+	}
+	b.localBlobMetrics, b.localBlobGauges = newLocalBlobMetrics(mp, b, logger)
+	return b
 }
 
 // String identifies this backend in versitygw logs.

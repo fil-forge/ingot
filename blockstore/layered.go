@@ -9,6 +9,8 @@ import (
 	block "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
 	mh "github.com/multiformats/go-multihash"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 
 	"github.com/fil-forge/ingot/internal/tracing"
 )
@@ -35,12 +37,43 @@ type Layered struct {
 	local BlockReader // local blob copies; may be nil (then skipped)
 	log   Log
 	base  BlockReader
+	// blobReads counts body-blob reads by the tier that served them; nil
+	// until CountBlobReads.
+	blobReads metric.Int64Counter
 }
 
 // NewLayered wires the local blob copies and the log in front of a base
 // blockstore. local may be nil.
 func NewLayered(local BlockReader, log Log, base BlockReader) *Layered {
 	return &Layered{local: local, log: log, base: base}
+}
+
+// CountBlobReads reports every body-blob read through meter as
+// ingot.local_blobs.reads, with a tier attribute naming where it was served
+// from (local or network), so the local hit ratio can be watched. Call it
+// before the first read.
+func (l *Layered) CountBlobReads(meter metric.Meter) error {
+	c, err := meter.Int64Counter("ingot.local_blobs.reads", metric.WithUnit("{read}"),
+		metric.WithDescription("Body-blob reads, by the tier that served them (local or network)"))
+	if err != nil {
+		return err
+	}
+	l.blobReads = c
+	return nil
+}
+
+var (
+	blobReadLocal   = metric.WithAttributes(attribute.String("tier", "local"))
+	blobReadNetwork = metric.WithAttributes(attribute.String("tier", "network"))
+)
+
+// countBlobRead records one body-blob read on the request's span and, when
+// enabled, on the reads counter.
+func (l *Layered) countBlobRead(ctx context.Context, src tracing.ReadSource, tier metric.AddOption) {
+	tracing.CountRead(ctx, src)
+	if l.blobReads != nil {
+		l.blobReads.Add(ctx, 1, tier)
+	}
 }
 
 // Get fetches a CBOR-encoded value at c and decodes it into out.
@@ -86,7 +119,7 @@ func (l *Layered) OpenBlob(ctx context.Context, space did.DID, digest mh.Multiha
 	if br, ok := l.local.(BlobReader); ok {
 		rc, err := br.OpenBlob(ctx, space, digest)
 		if err == nil {
-			tracing.CountRead(ctx, tracing.BlobLocal)
+			l.countBlobRead(ctx, tracing.BlobLocal, blobReadLocal)
 			return rc, nil
 		}
 		if !errors.Is(err, ErrNotFound) {
@@ -96,7 +129,7 @@ func (l *Layered) OpenBlob(ctx context.Context, space did.DID, digest mh.Multiha
 	if br, ok := l.base.(BlobReader); ok {
 		rc, err := br.OpenBlob(ctx, space, digest)
 		if err == nil {
-			tracing.CountRead(ctx, tracing.BlobNetwork)
+			l.countBlobRead(ctx, tracing.BlobNetwork, blobReadNetwork)
 		}
 		return rc, err
 	}
@@ -111,7 +144,7 @@ func (l *Layered) OpenBlobRange(ctx context.Context, space did.DID, digest mh.Mu
 	if br, ok := l.local.(BlobReader); ok {
 		rc, err := OpenBlobRangeOf(ctx, br, space, digest, start, end)
 		if err == nil {
-			tracing.CountRead(ctx, tracing.BlobLocal)
+			l.countBlobRead(ctx, tracing.BlobLocal, blobReadLocal)
 			return rc, nil
 		}
 		if !errors.Is(err, ErrNotFound) {
@@ -121,7 +154,7 @@ func (l *Layered) OpenBlobRange(ctx context.Context, space did.DID, digest mh.Mu
 	if br, ok := l.base.(BlobReader); ok {
 		rc, err := OpenBlobRangeOf(ctx, br, space, digest, start, end)
 		if err == nil {
-			tracing.CountRead(ctx, tracing.BlobNetwork)
+			l.countBlobRead(ctx, tracing.BlobNetwork, blobReadNetwork)
 		}
 		return rc, err
 	}

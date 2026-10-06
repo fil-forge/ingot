@@ -16,11 +16,18 @@ CREATE INDEX upload_intents_evictable_idx
     ON ingot.upload_intents (updated_at, digest)
     WHERE evicted_at IS NULL AND state IN ('parked', 'accepted', 'published');
 
+-- The sweeper's sum of stalled uploads: bodies still waiting for upload long
+-- after any request that wrote them has ended.
+CREATE INDEX upload_intents_stalled_idx
+    ON ingot.upload_intents (updated_at) INCLUDE (size)
+    WHERE state IN ('spooled', 'uploading');
+
 -- The candidate scan asks whether a digest has a location in any space; the
 -- primary key leads with space.
 CREATE INDEX blob_locations_digest_idx ON ingot.blob_locations (digest);
 
 -- +goose Down
 DROP INDEX ingot.blob_locations_digest_idx;
+DROP INDEX ingot.upload_intents_stalled_idx;
 DROP INDEX ingot.upload_intents_evictable_idx;
 ALTER TABLE ingot.upload_intents DROP COLUMN evicted_at;

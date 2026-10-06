@@ -1214,11 +1214,13 @@ func (b *Backend) recordStreamedPark(ctx context.Context, blob msbucket.BlobRef,
 // expires, its object's once Complete commits it. A failure to mark the
 // intent evicted only leaves the sweeper to find the file gone and mark it.
 func (b *Backend) dropParkedCopy(ctx context.Context, digest mh.Multihash) {
-	if _, err := b.removeLocal(digest); err != nil {
+	freed, err := b.removeLocal(digest)
+	if err != nil {
 		b.logger.Warn("drop parked blob's spool copy failed; it stays until the spool sweeper evicts it or the blob's release",
 			zap.String("digest", hex.EncodeToString(digest)), zap.Error(err))
 		return
 	}
+	b.localBlobMetrics.removedFile(ctx, removedParked, freed)
 	if err := b.intents.MarkEvicted(ctx, digest); err != nil && !errors.Is(err, registry.ErrNotFound) {
 		b.logger.Warn("mark parked blob evicted failed",
 			zap.String("digest", hex.EncodeToString(digest)), zap.Error(err))
