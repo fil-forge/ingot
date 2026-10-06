@@ -191,6 +191,10 @@ Exit status 1 means the data does not match; any other failure is 2.`,
 			if err != nil {
 				return err
 			}
+			if n == 0 {
+				fmt.Fprintf(cmd.OutOrStdout(), "ok empty object %s\n", want)
+				return nil
+			}
 			fmt.Fprintf(cmd.OutOrStdout(), "ok bytes %d-%d of %s\n", offset, offset+n-1, want)
 			return nil
 		},

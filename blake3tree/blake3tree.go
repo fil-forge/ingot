@@ -73,10 +73,24 @@ func ChunkLog(size int64) uint8 {
 	for c < 28 && size > int64(1)<<(2*c+6) {
 		c++
 	}
-	for size > int64(MaxLeaves)<<(c+chunkLog) {
+	// The cap. The loop stops where MaxLeaves blocks would reach 2^63
+	// bytes, which no int64 size exceeds, so the shift never leaves int64
+	// and the comparison always settles.
+	for c+chunkLog+15 < 63 && size > int64(MaxLeaves)<<(c+chunkLog) {
 		c++
 	}
 	return c
+}
+
+// blocksIn returns how many blocks of 2^chunkLog chunks cover size bytes,
+// without the overflow of adding block-1 to a size near the int64 limit.
+func blocksIn(size int64, chunkLog_ uint8) int64 {
+	block := BlockSize(chunkLog_)
+	n := size / block
+	if size%block != 0 {
+		n++
+	}
+	return n
 }
 
 // BlockSize returns the leaf size in bytes for a chunk log.
@@ -702,8 +716,7 @@ func OutboardLeaves(outboard []byte, chunkLog_ uint8) (int64, error) {
 	if size < 0 {
 		return 0, fmt.Errorf("blake3tree: outboard size prefix %d is negative", uint64(size))
 	}
-	block := BlockSize(chunkLog_)
-	leaves := (size + block - 1) / block
+	leaves := blocksIn(size, chunkLog_)
 	if parents := int64((len(outboard) - 8) / 64); parents != max(leaves-1, 0) {
 		return 0, fmt.Errorf("blake3tree: outboard has %d parent entries but a %d-byte body at chunk log %d has %d leaves", parents, size, chunkLog_, leaves)
 	}
@@ -726,7 +739,13 @@ func AlignedRange(a, b int64, chunkLog_ uint8, size int64) (start, end int64, er
 	}
 	block := BlockSize(chunkLog_)
 	start = a / block * block
-	end = min((b/block+1)*block, size) - 1
+	// The end block's last byte, clamped to the body; computed by block
+	// count so a block near the int64 limit cannot overflow the product.
+	if endBlocks := b/block + 1; endBlocks >= blocksIn(size, chunkLog_) {
+		end = size - 1
+	} else {
+		end = endBlocks*block - 1
+	}
 	return start, end, nil
 }
 
@@ -741,35 +760,53 @@ func (e *BlockError) Error() string {
 // VerifyBlocks is the client side of range verification: it checks the bytes
 // of r, which start at offset in the body, block by block against the Bao
 // outboard and the body's root, and returns how many bytes it verified. The
-// offset must be a multiple of the block size and the data must hold whole
-// blocks, except that it may end at the body's end. A block that fails is
-// returned as a *BlockError after the bytes before it; any other error is a
-// malformed input.
+// offset must be a multiple of the block size and the data must hold at
+// least one whole block, except that it may end at the body's end (and an
+// empty body verifies with no data). A block that fails is returned as a
+// *BlockError after the bytes before it; any other error is a malformed
+// input. The buffer is one block or the rest of the body, whichever is
+// smaller, so a huge block size over a small body costs nothing.
 func VerifyBlocks(r io.Reader, outboard []byte, chunkLog_ uint8, offset int64, root CV) (int64, error) {
 	if _, err := OutboardLeaves(outboard, chunkLog_); err != nil {
 		return 0, err
 	}
 	size := OutboardSize(outboard)
 	block := BlockSize(chunkLog_)
-	if offset%block != 0 {
-		return 0, fmt.Errorf("blake3tree: offset %d is not a multiple of the block size %d", offset, block)
+	if offset < 0 || offset%block != 0 {
+		return 0, fmt.Errorf("blake3tree: offset %d is not a non-negative multiple of the block size %d", offset, block)
 	}
 	if offset > size {
 		return 0, fmt.Errorf("blake3tree: offset %d is past the body's %d bytes", offset, size)
 	}
-	buf := make([]byte, block)
+	if offset == size {
+		// Nothing left to verify: an empty body verifies with no data, but a
+		// request at the end of a non-empty body is a mistake, as is any
+		// data where none can be checked.
+		var extra [1]byte
+		if m, _ := io.ReadFull(r, extra[:]); m > 0 {
+			return 0, fmt.Errorf("blake3tree: data runs past the body's end")
+		}
+		if size > 0 {
+			return 0, fmt.Errorf("blake3tree: offset %d is the body's end; nothing to verify", offset)
+		}
+		return 0, nil
+	}
+	buf := make([]byte, min(block, size-offset))
 	var verified int64
 	for {
 		n, err := io.ReadFull(r, buf)
 		if n == 0 && (err == io.EOF || err == io.ErrUnexpectedEOF) {
+			if verified == 0 && size > 0 {
+				return 0, fmt.Errorf("blake3tree: no data to verify (the body is %d bytes)", size)
+			}
 			return verified, nil
 		}
 		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
 			return verified, err
 		}
 		pos := offset + verified
-		if pos+int64(n) > size {
-			return verified, fmt.Errorf("blake3tree: data runs %d bytes past the body's end", pos+int64(n)-size)
+		if int64(n) > size-pos {
+			return verified, fmt.Errorf("blake3tree: data runs %d bytes past the body's end", int64(n)-(size-pos))
 		}
 		if int64(n) < block && pos+int64(n) != size {
 			return verified, fmt.Errorf("blake3tree: data ends %d bytes into the block at %d; a verifiable range holds whole blocks or ends at the body's end (%d)", n, pos, size)
@@ -778,7 +815,13 @@ func VerifyBlocks(r io.Reader, outboard []byte, chunkLog_ uint8, offset int64, r
 			return verified, &BlockError{pos, int64(n)}
 		}
 		verified += int64(n)
-		if int64(n) < block {
+		if int64(n) < block || verified == size-offset {
+			// The body's tail, or its last whole block: nothing follows but
+			// EOF, which is what the next read must see.
+			var extra [1]byte
+			if m, _ := io.ReadFull(r, extra[:]); m > 0 {
+				return verified, fmt.Errorf("blake3tree: data runs past the body's end")
+			}
 			return verified, nil
 		}
 	}
