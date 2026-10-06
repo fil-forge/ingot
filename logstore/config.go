@@ -33,8 +33,8 @@ type Config struct {
 	Logger *zap.Logger
 }
 
-// PlaneConfig tunes the catalog plane's pipeline:
-// its seal trigger, whether/how it ships, and how much it retains.
+// PlaneConfig tunes the catalog plane's pipeline: its seal trigger, whether/how
+// it ships, and how much it retains.
 type PlaneConfig struct {
 	// SealBytes is the open-segment CAR size threshold at which this
 	// plane's segment seals and is queued for flush. 0 → 64 MiB.

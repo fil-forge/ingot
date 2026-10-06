@@ -486,8 +486,8 @@ func (s *Server) waitSweeps(ctx context.Context) error {
 // then records the shard's location and every inner block's byte range
 // in the local location/inclusion tables (the appliance mirror of the
 // sharded-dag-index SubmitShard publishes). The store owns the
-// ship-state transition (it stamps the per-plane shipped timestamp and,
-// for the catalog plane, advances each affected bucket's forge_root_cid)
+// ship-state transition (it stamps the segment's shipped timestamp and
+// advances each affected bucket's forge_root_cid)
 // once this returns nil — so a segment is only ever marked shipped (and
 // thus eligible for retention) after its blocks are resolvable through
 // the fallthrough read tier.

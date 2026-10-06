@@ -278,14 +278,16 @@ digest must be known before `allocate`, and because that local copy does double 
   bounded, size-configurable store. *(Built as two directories, a spool for writes and bodies
   awaiting upload and a cache for copies the provider holds, under one byte budget,
   `local_blob_max_bytes`, evicting blobs the provider holds, oldest first, with a read-after-write
-  window, `cache_min_residency`, and a read-recency window, `cache_read_retention`; see §12.)* The
+  window, `cache_min_residency`, and a read-recency window, `cache_read_retention`; network reads
+  do not fill the cache yet; see §12.)* The
   alternative — a near-stateless Ingot that resolves every read through the indexer — trades
   latency for simpler horizontal scaling; it is a supported mode, but the read-after-write floor
   holds regardless.
 
-The `upload_intents` table tracks each in-flight blob: `digest → { local_path, size, state:
-spooled│uploading│parked│accepted│published, owner ref }`. It drives read-after-write, cache
-lookup, and crash recovery. The Postgres schema for this and every other Ingot table is in **[Appendix C](#appendix-c--postgres-schema-the-ingot-schema)**.
+The `upload_intents` table records each blob Ingot has spooled, from ingest until its release:
+`digest → { local_path, size, state: spooled│uploading│parked│accepted│published, owner ref,
+evicted_at }`. Releases, the local blob sweeper and multipart Complete read it; local reads go by
+the files themselves. The Postgres schema for this and every other Ingot table is in **[Appendix C](#appendix-c--postgres-schema-the-ingot-schema)**.
 
 **Dedup and the reference index.** Piri stores identical bytes once (it answers `allocate` with
 "already have it" when the digest exists), so one blob can back many object versions — a re-PUT of
@@ -908,17 +910,16 @@ paths below are exercised against the real stack by the smelt-based `itest/` har
 - **Indexer retraction on delete** is unimplemented (no-op). `ListParts` and
   `ListMultipartUploads` are implemented (paginated, prefix/delimiter/marker semantics;
   in-flight sessions only).
-- **Multipart hygiene.** Abort and part re-upload record a release for each now-unreferenced
-  part blob (guarded against content-addressed sharing with other sessions and committed
-  objects); the release removes the blob from its provider, then removes its local copy and
-  intent. A background sweeper aborts open sessions older than `multipart_session_ttl`
-  (default 7d) and reaps terminal session rows. A successful
-  Complete retains its session in state `completed` so a duplicate Complete is idempotent
-  per S3. `DeleteBucket` implicitly aborts the bucket's in-flight sessions before the space
-  delete (upstream's conformance teardown never aborts them); `s3:DeleteBucket` delegates
-  `blob.Abort` and `blob.Remove`, so the abort and every other release leg signs with the
-  request's own proofs. The network-side `/blob/abort` unwind remains a parking-flow
-  concern (above).
+- **Multipart hygiene.** Abort, part re-upload and Complete (for parts omitted from its list) record
+  a release for each now-unreferenced part blob (guarded against content-addressed sharing with
+  other sessions and committed objects). The release shreds the blob's key, unwinds it on the
+  network as its state requires, then removes its local copy and intent. A background sweeper aborts
+  open sessions older than `multipart_session_ttl` (default 7d) and reaps terminal session rows. A
+  successful Complete retains its session in state `completed` so a duplicate Complete is idempotent
+  per S3. `DeleteBucket` implicitly aborts the bucket's in-flight sessions before the space delete
+  (upstream's conformance teardown never aborts them); `s3:DeleteBucket` delegates `blob.Abort` and
+  `blob.Remove`, so the abort and every other release leg signs with the request's own proofs. The
+  network-side `/blob/abort` unwind remains a parking-flow concern (above).
 
 ### Known correctness boundary
 

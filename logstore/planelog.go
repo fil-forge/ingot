@@ -105,9 +105,7 @@ func openPlaneLog(ctx context.Context, plane blockstore.Plane, bucket, dir strin
 // Append persists one batch's blocks to the open segment. opRoots is
 // non-empty only for the catalog plane (the bucket-root advances it
 // records). A call with no blocks AND no op-roots is a no-op — it does
-// not even create a segment (an MST-only S3 op writes no data blocks, so
-// the data plane stays dormant). The CAR is fsynced before Append
-// returns.
+// not even create a segment. The CAR is fsynced before Append returns.
 func (pl *PlaneLog) Append(ctx context.Context, blocks []block.Block, opRoots ...blockstore.OpRoot) (err error) {
 	if len(blocks) == 0 && len(opRoots) == 0 {
 		return nil

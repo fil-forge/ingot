@@ -51,11 +51,10 @@ type Config struct {
 	// service-level routes (ListBuckets, "GET /") are not covered, so
 	// cross-origin bucket listing is unsupported.
 	CORSAllowedOrigins []string `mapstructure:"cors_allowed_origins" yaml:"cors_allowed_origins"`
-	// SealBytes / SealAge / Retain tune the logstore (zero -> logstore
-	// defaults): each bucket's catalog pipeline, when its segments seal and,
-	// once shipped, how many stay on disk. They do not apply to local blob
-	// storage (<data_dir>/spool and <data_dir>/cache), where object bodies
-	// live; local_blob_max_bytes bounds that.
+	// SealBytes / SealAge / Retain tune every bucket's catalog log (zero ->
+	// logstore defaults; catalog_plane overrides them): when a segment seals
+	// and how many shipped segments stay on disk. Object bodies are not in
+	// the log; local_blob_max_bytes bounds their local storage.
 	SealBytes int64  `mapstructure:"seal_bytes" yaml:"seal_bytes"`
 	SealAge   string `mapstructure:"seal_age" yaml:"seal_age"`
 	Retain    int    `mapstructure:"retain" yaml:"retain"`
