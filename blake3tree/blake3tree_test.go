@@ -2,6 +2,8 @@ package blake3tree
 
 import (
 	"bytes"
+	"encoding/binary"
+	"math"
 	"math/rand"
 	"testing"
 
@@ -546,5 +548,79 @@ func TestHasherAtChunkLog(t *testing.T) {
 	}
 	if _, err := NewHasherAtChunkLog(0, MaxChunkLog+1); err == nil {
 		t.Fatal("chunk log above the maximum accepted")
+	}
+}
+
+// TestHostileClientInputs covers the client-side checks against extreme or
+// malformed values a caller may supply: sizes near the int64 limit, a huge
+// chunk log over a small body, negative offsets, and empty input.
+func TestHostileClientInputs(t *testing.T) {
+	// ChunkLog terminates for any size, and keeps the body within the leaf
+	// cap: 2^62 bytes is exactly 32,768 blocks of 2^47, one byte more needs
+	// the next block size, and the largest int64 body still fits.
+	for _, c := range []struct {
+		size int64
+		want uint8
+	}{{1 << 62, 37}, {1<<62 + 1, 38}, {math.MaxInt64, 38}} {
+		if g := ChunkLog(c.size); g != c.want {
+			t.Errorf("ChunkLog(%d) = %d, want %d", c.size, g, c.want)
+		}
+		if n := blocksIn(c.size, c.want); n > MaxLeaves {
+			t.Errorf("ChunkLog(%d) = %d gives %d leaves", c.size, c.want, n)
+		}
+	}
+	// An outboard claiming a body near the int64 limit: at chunk log 52 it
+	// has two leaves, so one parent entry is required and none is wrong.
+	huge := make([]byte, 8)
+	binary.LittleEndian.PutUint64(huge, math.MaxInt64)
+	if _, err := OutboardLeaves(huge, MaxChunkLog); err == nil {
+		t.Error("an outboard with no parents accepted for a two-leaf body")
+	}
+	if n, err := OutboardLeaves(append(huge, make([]byte, 64)...), MaxChunkLog); err != nil || n != 2 {
+		t.Errorf("two-leaf body near the limit: %d, %v", n, err)
+	}
+	if start, end, err := AlignedRange(math.MaxInt64-10, math.MaxInt64-1, MaxChunkLog, math.MaxInt64); err != nil || start != 1<<62 || end != math.MaxInt64-1 {
+		t.Errorf("AlignedRange near the limit: %d-%d, %v", start, end, err)
+	}
+
+	// A two-block body for the end-of-body cases below.
+	whole := data(2 * BlockSize(MinChunkLog))
+	h, _ := NewHasherAtChunkLog(0, MinChunkLog)
+	h.Write(whole)
+	obj := h.FinishObject()
+	if _, err := VerifyBlocks(bytes.NewReader(append(bytes.Clone(whole), 1)), Outboard(obj.Leaves, obj.Size), MinChunkLog, 0, obj.Root); err == nil {
+		t.Error("a byte past a whole last block accepted")
+	}
+
+	// A small body at a huge chunk log: one leaf, an empty outboard, and the
+	// verifier must buffer the body, not the block.
+	d := data(100)
+	root := blake3.Sum256(d)
+	small := make([]byte, 8)
+	binary.LittleEndian.PutUint64(small, 100)
+	if n, err := VerifyBlocks(bytes.NewReader(d), small, MaxChunkLog, 0, root); err != nil || n != 100 {
+		t.Fatalf("small body at chunk log %d: %d, %v", MaxChunkLog, n, err)
+	}
+	if _, err := VerifyBlocks(bytes.NewReader(d), small, MaxChunkLog, -(1 << 62), root); err == nil {
+		t.Error("negative aligned offset accepted")
+	}
+	// Empty input is not a successful verification of a non-empty body,
+	// but is of an empty one.
+	if _, err := VerifyBlocks(bytes.NewReader(nil), small, MaxChunkLog, 0, root); err == nil {
+		t.Error("empty input accepted for a 100-byte body")
+	}
+	empty := Outboard(nil, 0)
+	if n, err := VerifyBlocks(bytes.NewReader(nil), empty, MinChunkLog, 0, blake3.Sum256(nil)); err != nil || n != 0 {
+		t.Errorf("empty body: %d, %v", n, err)
+	}
+	if _, err := VerifyBlocks(bytes.NewReader([]byte{1}), empty, MinChunkLog, 0, blake3.Sum256(nil)); err == nil {
+		t.Error("data accepted for an empty body")
+	}
+	if _, err := VerifyBlocks(bytes.NewReader(nil), small, MaxChunkLog, 0, root); err == nil {
+		t.Error("empty input accepted for a 100-byte body")
+	}
+	tail := Outboard(obj.Leaves, obj.Size)
+	if _, err := VerifyBlocks(bytes.NewReader(nil), tail, MinChunkLog, obj.Size, obj.Root); err == nil {
+		t.Error("a request at the end of a non-empty body accepted")
 	}
 }
