@@ -27,6 +27,7 @@ package s3frontend
 import (
 	"context"
 	"encoding/xml"
+	"sync"
 	"time"
 
 	"github.com/fil-forge/versitygw/auth"
@@ -60,6 +61,7 @@ type Backend struct {
 	txns      *bucketop.Coordinator
 	log       blockstore.Log
 	spool     *blockstore.Spool
+	cache     *blockstore.BlobCache
 	uploader  uploader.BodyUploader
 	deferred  uploader.DeferredBodyUploader
 	parks     registry.ParkStore
@@ -75,6 +77,21 @@ type Backend struct {
 	// prior catalog root get at least this long to finish their prefetch).
 	pendingReleases registry.PendingReleaseStore
 	releaseGrace    time.Duration
+	// Local blob sweeper knobs (see Deps). localBlobSweepMu serialises
+	// SweepLocalBlobs; lastOrphanPass is when its orphan pass last ran.
+	// localBlobSweepBatch overrides the rows a pass reads per query, for
+	// tests; zero takes the default.
+	localBlobMaxBytes   int64
+	localBlobOrphanAge  time.Duration
+	localBlobSweepMu    sync.Mutex
+	lastOrphanPass      time.Time
+	localBlobSweepBatch int
+	// overBudgetWarned and timeLimitLogged are set once the sweeper has
+	// logged that usage is over budget with nothing left to evict, or that
+	// the budget pass ran out of time, and cleared when usage is back under,
+	// so each message comes once per episode. Guarded by localBlobSweepMu.
+	overBudgetWarned bool
+	timeLimitLogged  bool
 	// regionKeys unwraps region-wrapped CEKs for the decrypting read path.
 	regionKeys regionkey.Provider
 	// tenantKeys yields the tenant wrap key each write encrypts to (the FEE
@@ -92,7 +109,7 @@ type Backend struct {
 // Deps wires a Backend over ingot's domain primitives.
 type Deps struct {
 	Authority bucketauthority.BucketAuthority
-	// Registry tracks per-bucket roots; IntentStore tracks the local spool's
+	// Registry tracks per-bucket roots; IntentStore tracks each local blob's
 	// upload_intents lifecycle; LocationStore records where each accepted body
 	// blob can be retrieved from. Production passes one *registry.Postgres for
 	// all three; the harness one *inmem.MemStore.
@@ -106,16 +123,19 @@ type Deps struct {
 	GC        registry.GCStore
 	Multipart registry.MultipartStore
 
-	// Reads is the layered read tier (spool → log → forge). Log is the catalog
-	// LSM write log driving the per-op staging buffer + commit — in production
-	// the per-bucket *logstore.Manager, which routes each append to the
-	// bucket's own log.
+	// Reads is the layered read tier (local blobs → log → forge). Log is the
+	// catalog LSM write log driving the per-op staging buffer + commit — in
+	// production the per-bucket *logstore.Manager, which routes each append
+	// to the bucket's own log.
 	Reads blockstore.ReadStore
 	Log   blockstore.Log
 
-	// Spool is the local blob store: SplitBody writes body blobs here on PUT,
-	// and they are served back from here on GET (read-after-write / cache).
+	// Spool is where SplitBody writes body blobs on PUT and where each waits
+	// until the provider holds it; Cache then holds it as a read-after-write
+	// copy until it is evicted. Reads serves both (blockstore.LocalBlobs).
+	// Both are required.
 	Spool *blockstore.Spool
+	Cache *blockstore.BlobCache
 
 	// Uploader makes each spooled body blob durable on Forge (allocate→PUT→
 	// accept) synchronously, before the manifest commits. Remover releases a
@@ -158,6 +178,16 @@ type Deps struct {
 	// before construction; tests use zero so a manual sweep drains).
 	ReleaseGrace time.Duration
 
+	// LocalBlobMaxBytes is the byte budget for the spool and the cache
+	// together, writes in progress included, enforced by SweepLocalBlobs.
+	// Zero turns the budget pass off: eviction needs a network read tier to
+	// serve evicted blobs, which the in-memory fakes do not have.
+	LocalBlobMaxBytes int64
+	// LocalBlobOrphanAge is the age at which SweepLocalBlobs deletes a .tmp-*
+	// file in either directory, or a spool blob file with no intent row. Zero →
+	// DefaultLocalBlobOrphanAge.
+	LocalBlobOrphanAge time.Duration
+
 	// MaxBlobSize is the coarse-split blob ceiling (0 → bucket default).
 	MaxBlobSize int64
 
@@ -191,6 +221,10 @@ func New(d Deps) *Backend {
 			corsDoc = doc
 		}
 	}
+	localBlobOrphanAge := d.LocalBlobOrphanAge
+	if localBlobOrphanAge <= 0 {
+		localBlobOrphanAge = DefaultLocalBlobOrphanAge
+	}
 	return &Backend{
 		authority:       d.Authority,
 		read:            d.Reads,
@@ -203,6 +237,7 @@ func New(d Deps) *Backend {
 		txns:            bucketop.NewCoordinator(bucketop.Deps{Reg: d.Registry, Log: d.Log, Reads: d.Reads}),
 		log:             d.Log,
 		spool:           d.Spool,
+		cache:           d.Cache,
 		uploader:        d.Uploader,
 		deferred:        d.Deferred,
 		parks:           d.Parks,
@@ -214,9 +249,13 @@ func New(d Deps) *Backend {
 		tenantKeys:      d.TenantKeys,
 		pendingReleases: d.PendingReleases,
 		releaseGrace:    d.ReleaseGrace,
-		logger:          logger,
-		maxBlobSize:     d.MaxBlobSize,
-		cors:            corsDoc,
+
+		localBlobMaxBytes:  d.LocalBlobMaxBytes,
+		localBlobOrphanAge: localBlobOrphanAge,
+
+		logger:      logger,
+		maxBlobSize: d.MaxBlobSize,
+		cors:        corsDoc,
 	}
 }
 

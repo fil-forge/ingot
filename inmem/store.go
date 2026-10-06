@@ -58,6 +58,7 @@ type MemStore struct {
 	// same code paths. See stores.go for the methods over these.
 	blobRefs   map[claimKey]registry.BlobClaim
 	intents    map[string]registry.UploadIntent          // keyed by string(digest)
+	evicted    map[string]struct{}                       // upload_intents.evicted_at IS NOT NULL, keyed by string(digest)
 	locations  map[locKey]registry.BlobLocation          // keyed by (space, digest)
 	encParams  map[locKey]registry.BlobEncryptionParams  // keyed by (space, digest)
 	inclusions map[locKey]registry.BlobInclusion         // keyed by (space, digest)
@@ -90,6 +91,7 @@ func NewMemStore() *MemStore {
 		verSeqs:    map[string]uint64{},
 		blobRefs:   map[claimKey]registry.BlobClaim{},
 		intents:    map[string]registry.UploadIntent{},
+		evicted:    map[string]struct{}{},
 		locations:  map[locKey]registry.BlobLocation{},
 		encParams:  map[locKey]registry.BlobEncryptionParams{},
 		inclusions: map[locKey]registry.BlobInclusion{},
@@ -419,7 +421,7 @@ func (NopUploader) SubmitShard(_ context.Context, _ blockstore.Plane, _ did.DID,
 
 // UploadBlob accepts immediately, even with WithConclude(false) — there is
 // no network to park on, so the deferred flow degenerates to the synchronous
-// one and reads keep coming from the spool.
+// one and reads keep coming from local disk.
 func (NopUploader) UploadBlob(_ context.Context, _ did.DID, digest multihash.Multihash, size int64, _ string, _ ...uploader.UploadOption) (uploader.UploadedBlob, error) {
 	return uploader.UploadedBlob{Digest: digest, Size: size, Location: &uploader.BlobLocation{Size: size}}, nil
 }

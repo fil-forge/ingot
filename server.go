@@ -55,7 +55,7 @@ type ServerDeps struct {
 	// BodyUploader makes each object-body blob durable on Forge by digest
 	// (allocate→PUT→accept), synchronously during a PUT. Remover releases a
 	// space's claim on a blob when its last reference is dropped. In tests both
-	// are no-ops and reads are served from the local spool.
+	// are no-ops and reads are served from local disk.
 	BodyUploader uploader.BodyUploader
 	// Deferred extends BodyUploader for multipart's deferred accept:
 	// park at UploadPart (WithConclude(false)), conclude at Complete,
@@ -78,7 +78,7 @@ type ServerDeps struct {
 	// separate implementations or one that does both.
 	Registry registry.Registry
 
-	// Intents tracks the local spool's upload_intents lifecycle; Locations
+	// Intents tracks each local blob's upload_intents lifecycle; Locations
 	// records where each accepted body blob (and shipped catalog shard) can be
 	// retrieved from; Inclusions records each shipped shard's inner-block byte
 	// ranges so retired catalog blocks stay resolvable; BlobRefs is the reverse
@@ -136,13 +136,14 @@ var _ s3frontend.SegmentDigestLister = (*logstore.Manager)(nil)
 // lifecycle. fx callers wrap these in OnStart/OnStop hooks; tests
 // call them directly.
 type Server struct {
-	cfg         config.ServerConfig
-	logger      *zap.Logger
-	log         blockstore.Log
-	backend     *s3frontend.Backend
-	api         *s3api.S3ApiServer
-	sweepStop   chan struct{}
-	releaseStop chan struct{}
+	cfg           config.ServerConfig
+	logger        *zap.Logger
+	log           blockstore.Log
+	backend       *s3frontend.Backend
+	api           *s3api.S3ApiServer
+	sweepStop     chan struct{}
+	releaseStop   chan struct{}
+	localBlobStop chan struct{}
 }
 
 // New wires a ServerDeps + ServerConfig into a runnable Server. The
@@ -180,13 +181,24 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		return nil, fmt.Errorf("ingot: logstore: %w", err)
 	}
 
+	// The spool and the cache share data_dir's filesystem, so moving a blob
+	// from one to the other is a rename.
 	spool, err := blockstore.NewSpool(filepath.Join(cfg.DataDir, "spool"))
 	if err != nil {
 		_ = log.Close(ctx)
 		return nil, fmt.Errorf("ingot: spool: %w", err)
 	}
+	cache, err := blockstore.NewBlobCache(filepath.Join(cfg.DataDir, "cache"))
+	if err != nil {
+		_ = log.Close(ctx)
+		return nil, fmt.Errorf("ingot: blob cache: %w", err)
+	}
+	if err := cache.CheckTake(spool); err != nil {
+		_ = log.Close(ctx)
+		return nil, fmt.Errorf("ingot: %w", err)
+	}
 
-	bs := blockstore.NewLayered(spool, log, deps.BaseBlockReader)
+	bs := blockstore.NewLayered(blockstore.LocalBlobs{Cache: cache, Spool: spool}, log, deps.BaseBlockReader)
 	backend := s3frontend.New(s3frontend.Deps{
 		Authority:       deps.Authority,
 		Registry:        deps.Registry,
@@ -199,6 +211,7 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		Reads:           bs,
 		Log:             log,
 		Spool:           spool,
+		Cache:           cache,
 		Uploader:        deps.BodyUploader,
 		Deferred:        deps.Deferred,
 		Remover:         deps.Remover,
@@ -209,9 +222,13 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		TenantKeys:      deps.TenantKeys,
 		PendingReleases: deps.PendingReleases,
 		ReleaseGrace:    cfg.ReleaseGrace,
-		MaxBlobSize:     cfg.MaxBlobSize,
-		CORS:            cfg.CORSConfig,
-		Logger:          logger,
+
+		LocalBlobMaxBytes:  cfg.LocalBlobMaxBytes,
+		LocalBlobOrphanAge: cfg.LocalBlobOrphanAge,
+
+		MaxBlobSize: cfg.MaxBlobSize,
+		CORS:        cfg.CORSConfig,
+		Logger:      logger,
 	})
 
 	api, err := buildS3API(ctx, backend, cfg, deps.IAM, deps.Identity, logger)
@@ -251,6 +268,7 @@ func (s *Server) Start(ctx context.Context) error {
 	}()
 	s.startMultipartSweeper()
 	s.startReleaseSweeper()
+	s.startLocalBlobSweeper()
 	return nil
 }
 
@@ -335,6 +353,62 @@ func (s *Server) startReleaseSweeper() {
 	}()
 }
 
+// localBlobSweepInterval is how often the local blob sweeper runs. The
+// budget's 10% headroom must exceed ingest rate × this interval.
+const localBlobSweepInterval = 30 * time.Second
+
+// localBlobSweepLogInterval is the least time between the local blob
+// sweeper's Info lines totalling its removals.
+const localBlobSweepLogInterval = 10 * time.Minute
+
+// startLocalBlobSweeper spawns the local blob sweeper: every
+// localBlobSweepInterval it evicts blobs the provider holds down to
+// LocalBlobMaxBytes (when set), and hourly it deletes orphan files (see
+// Backend.SweepLocalBlobs).
+func (s *Server) startLocalBlobSweeper() {
+	s.localBlobStop = make(chan struct{})
+	// The goroutine keeps its own copy of the channel: Stop closes it and
+	// then clears the field, and a select that read the cleared field would
+	// block forever.
+	stop := s.localBlobStop
+	go func() {
+		// removed totals the removals since since, not yet logged.
+		var removed s3frontend.LocalBlobSweepStats
+		var lastLog time.Time
+		since := time.Now()
+		ticker := time.NewTicker(localBlobSweepInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				// Each pass also caps itself; this bounds the two together.
+				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+				stats, err := s.backend.SweepLocalBlobs(ctx)
+				cancel()
+				if err != nil {
+					s.logger.Warn("local blob sweep", zap.Error(err))
+				}
+				// The removals are totalled and logged at most every
+				// localBlobSweepLogInterval, so steady eviction shows at
+				// Info without a line every sweep; the metrics carry each.
+				removed.Add(stats)
+				if removed.Removed() && time.Since(lastLog) >= localBlobSweepLogInterval {
+					s.logger.Info("local blob sweeper removed files",
+						append(removed.LogFields(),
+							zap.Duration("over", time.Since(since)),
+							zap.Int64("usage_bytes", s.backend.LocalBlobUsage()))...)
+					removed, lastLog = s3frontend.LocalBlobSweepStats{}, time.Now()
+				}
+				if !removed.Removed() {
+					since = time.Now()
+				}
+			}
+		}
+	}()
+}
+
 // Stop shuts the listener down and drains the log. Always returns
 // the combined error of the two operations so callers see all
 // failure modes; either alone is non-fatal to the other.
@@ -348,6 +422,10 @@ func (s *Server) Stop(ctx context.Context) error {
 	if s.releaseStop != nil {
 		close(s.releaseStop)
 		s.releaseStop = nil
+	}
+	if s.localBlobStop != nil {
+		close(s.localBlobStop)
+		s.localBlobStop = nil
 	}
 	var errs []error
 	if err := s.api.ShutDown(); err != nil {

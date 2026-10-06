@@ -85,7 +85,7 @@ func TestForgeScenarios(t *testing.T) {
 		const size = 3*maxBlob + maxBlob/2
 		data := patternBytes(size)
 
-		spoolBefore := spoolBlobCount(t, ctx, s)
+		spoolBefore := localBlobCount(t, ctx, s)
 		put, err := cl.PutObject(ctx, &s3.PutObjectInput{
 			Bucket: aws.String(bucket),
 			Key:    aws.String("big"),
@@ -97,7 +97,7 @@ func TestForgeScenarios(t *testing.T) {
 		if want := quotedMD5(data); aws.ToString(put.ETag) != want {
 			t.Fatalf("PUT ETag = %s, want %s", aws.ToString(put.ETag), want)
 		}
-		if got := spoolBlobCount(t, ctx, s) - spoolBefore; got != 4 {
+		if got := localBlobCount(t, ctx, s) - spoolBefore; got != 4 {
 			t.Fatalf("PUT added %d spool blobs, want 4 — bodies must be spooled by digest, not logged", got)
 		}
 
@@ -141,7 +141,7 @@ func TestForgeScenarios(t *testing.T) {
 		}
 
 		const emptyMD5 = `"d41d8cd98f00b204e9800998ecf8427e"`
-		spoolBefore := spoolBlobCount(t, ctx, s)
+		spoolBefore := localBlobCount(t, ctx, s)
 		put, err := cl.PutObject(ctx, &s3.PutObjectInput{
 			Bucket: aws.String(bucket),
 			Key:    aws.String("empty"),
@@ -153,7 +153,7 @@ func TestForgeScenarios(t *testing.T) {
 		if aws.ToString(put.ETag) != emptyMD5 {
 			t.Fatalf("PUT ETag = %s, want %s", aws.ToString(put.ETag), emptyMD5)
 		}
-		if got := spoolBlobCount(t, ctx, s) - spoolBefore; got != 0 {
+		if got := localBlobCount(t, ctx, s) - spoolBefore; got != 0 {
 			t.Fatalf("zero-byte PUT added %d spool blobs, want 0", got)
 		}
 

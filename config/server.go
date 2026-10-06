@@ -56,6 +56,14 @@ type ServerConfig struct {
 	// means releases are due immediately.
 	ReleaseGrace time.Duration
 
+	// LocalBlobMaxBytes is the byte budget for the spool and the cache
+	// together, writes in progress included, enforced by the local blob
+	// sweeper; zero means no budget. LocalBlobOrphanAge is the age at which
+	// the sweeper deletes files no upload intent names; zero → 24h.
+	// Config.ServerConfig() applies the defaults documented on Config.
+	LocalBlobMaxBytes  int64
+	LocalBlobOrphanAge time.Duration
+
 	// CORSConfig is the S3 CORS configuration the backend reports for
 	// every bucket, rendered from Config.CORSAllowedOrigins by
 	// internal/cors. Nil disables CORS entirely (the default).

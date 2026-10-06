@@ -105,7 +105,7 @@ flowchart TB
     end
 
     subgraph store["local storage"]
-        bs["blockstore<br/>Spool, OpStaging, Layered, Cached, Forge"]
+        bs["blockstore<br/>Spool, BlobCache, OpStaging, Layered, Cached, Forge"]
         ls["logstore<br/>Manager, Store, PlaneLog, Segment"]
         cars["cars"]
     end
@@ -180,7 +180,8 @@ flowchart TB
         spool["Spool (DataDir/spool)<br/>+ upload_intents row<br/>(each blob streams its PUT<br/>to the provider while it is spooled)"]
         upload["per-blob upload before the commit:<br/>conclude, accept (streamed), or<br/>/blob/add, HTTP PUT, conclude, accept<br/>(a blob_locations hit skips it: dedup)"]
         bloc["blob_locations row: the whole blob,<br/>(space, digest) to provider URL"]
-        split --> spool --> upload --> bloc
+        cache["BlobCache (DataDir/cache):<br/>the blob's file moves here by rename"]
+        split --> spool --> upload --> bloc --> cache
     end
 
     subgraph catr["the catalog route (dag-cbor blocks, asynchronous ship)"]
@@ -212,8 +213,9 @@ flowchart TB
 - The network unit differs: a body blob is retrieved whole by its own digest
   (a `blob_locations` hit); catalog blocks share a CAR, so a network read
   resolves `shard_inclusions` to a byte range inside the shard.
-- Reads mirror the split: `OpenBlob` (bodies) checks spool then network,
-  skipping the log; `GetBlock` (catalog) checks spool, log, then network
+- Reads mirror the split: `OpenBlob` (bodies) checks local disk (cache,
+  then spool) then network, skipping the log; `GetBlock` (catalog) checks
+  local disk, log, then network
   (the [GetObject diagram](#getobject-version-resolution-local-tiers-network-retrieval)).
 - Removal mirrors it too: bodies are reference-counted
   ([blob lifecycle](#blob-lifecycle-spooled-parked-accepted-released));
@@ -233,7 +235,7 @@ Cross-references: [`architecture.md` §4](./architecture.md#4-the-catalog-layer)
 [`logstore/README.md`](../logstore/README.md).
 
 Sources: `s3frontend/object.go` (ingestBody), `s3frontend/stream.go`,
-`bucket/sized.go`, `blockstore/spool.go`,
+`bucket/sized.go`, `blockstore/spool.go`, `blockstore/blobcache.go`,
 `blockstore/staging.go`, `logstore/`, `uploader/forge.go`, `uploader/blob.go`,
 `server.go` (newBucketFlushFunc). Review when these change.
 
@@ -277,10 +279,11 @@ sequenceDiagram
         B->>U: /ucan/conclude the put receipt, reporting the spooled digest
         U-->>B: accept receipt + /assert/location commitment
         B->>R: SetIntentState(accepted) + PutLocation, DeleteStream
+        B->>B: BlobCache.Take: the file moves from the spool to the cache
     end
     loop each spooled-first blob (uploadBlobs)
         alt blob_locations already has (space, digest)
-            B->>R: SetIntentState(accepted), skip upload<br/>(never hits for fresh writes — every envelope digest is new)
+            B->>R: SetIntentState(accepted), skip upload, BlobCache.Take<br/>(never hits for fresh writes — every envelope digest is new)
         else upload
             B->>U: /blob/add (digest, size)
             U-->>B: allocation address (none on provider-side dedup)
@@ -288,6 +291,7 @@ sequenceDiagram
             B->>U: /ucan/conclude the put receipt, then poll /blob/accept receipt
             U-->>B: /assert/location commitment
             B->>R: SetIntentState(accepted) + PutLocation
+            B->>B: BlobCache.Take: the file moves from the spool to the cache
         end
     end
     Note over B,U: UploadBlob also captures the request proof store as the<br/>space's ship authority (captureShipProofs, 1h TTL)
@@ -352,8 +356,8 @@ these change.
 ## GetObject: version resolution, local tiers, network retrieval
 
 A read resolves the version through the MST, then serves each covering blob
-from the first tier that has it: spool, the catalog log (catalog blocks
-only), then the network. Network resolution goes through the local locator
+from the first tier that has it: local disk (the cache, then the spool), the
+catalog log (catalog blocks only), then the network. Network resolution goes through the local locator
 tables, never the indexing-service.
 
 ```mermaid
@@ -384,8 +388,8 @@ sequenceDiagram
             Note over B: aesstream.CiphertextRange maps the plaintext range to<br/>one contiguous ciphertext span past the envelope header
         end
         B->>LY: read (whole blob, or only the ciphertext span via OpenBlobRange)
-        alt spool hit
-            LY-->>B: bytes from the spool
+        alt local hit (blockstore.LocalBlobs)
+            LY-->>B: bytes from the cache, else the spool<br/>(then the cache again: a blob can move between the two)
         else catalog log hit (GetBlock only)
             LY->>LG: Get: linear scan of open bucket stores
             LG-->>B: block from an open or sealed segment
@@ -406,7 +410,7 @@ sequenceDiagram
     B-->>C: 200 or 206 body (plaintext byte counts throughout)
 ```
 
-- `OpenBlob` (body blobs) checks spool then network; only `GetBlock`
+- `OpenBlob` (body blobs) checks local disk then network; only `GetBlock`
   (catalog blocks) consults the log tier, and only `GetBlock` is fronted by
   the `Cached` LRU.
 - The indexer-backed locator (`blockstore/locator`) compiles but is never
@@ -424,7 +428,7 @@ Cross-references: [`architecture.md` §7.4](./architecture.md#74-read-getobject)
 Sources: `s3frontend/object.go` (GetObject, HeadObject, selectBytes),
 `s3frontend/version.go` (resolveVersion), `s3frontend/decrypt.go`
 (bodyOpener, decryptingOpener), `bucket/chunker.go` (BlobRangeOpener),
-`blockstore/layered.go`,
+`blockstore/layered.go`, `blockstore/blobcache.go` (LocalBlobs),
 `blockstore/forge.go` (doRetrieve), `blockstore/cache.go`,
 `registry/locallocator.go`, `logstore/manager.go` (Get). Review when these
 change.
@@ -460,7 +464,7 @@ sequenceDiagram
     loop each part blob (parkBlobs)
         alt streamed while spooled
             B->>R: PutPark(AddTask, AcceptTask, PutInvocation), intent parked,<br/>DeleteStream: the PUT already went to piri in splitSpool
-            B->>B: spool.Remove (the part's local copy#59; Complete concludes from the park)
+            B->>B: removeLocal (the part's local copy#59; Complete concludes from the park)
         else blob_locations already has the digest
             B->>R: intent accepted (dedup, no park)
         else already parked (GetPark hit)
@@ -469,7 +473,7 @@ sequenceDiagram
             B->>U: /blob/add with WithConclude(false)
             B->>P: HTTP PUT bytes
             B->>R: PutPark(AddTask, AcceptTask, PutInvocation), intent parked
-            B->>B: spool.Remove (the part's local copy)
+            B->>B: removeLocal (the part's local copy)
         end
     end
     B-->>C: part ETag (part md5#59; for a copy, of the copied bytes)
@@ -564,18 +568,22 @@ flowchart TB
         published([published])
     end
 
-    spooled -->|"dedup: blob_locations hit"| accepted
+    spooled -->|"dedup: blob_locations hit;<br/>file moves to the cache"| accepted
     spooled -->|"first network call begins<br/>(uploadBlobs, parkBlobs, concludeBlobs fallback)"| uploading
-    uploading -->|"single-shot upload:<br/>/blob/add, PUT, conclude, accept"| accepted
-    uploading -->|"parkBlobs: /blob/add WithConclude(false),<br/>PUT (or already streamed); blob_parks row written;<br/>local copy removed (spool.Remove)"| parked
+    uploading -->|"single-shot upload:<br/>/blob/add, PUT, conclude, accept;<br/>file moves to the cache (BlobCache.Take)"| accepted
+    uploading -->|"parkBlobs: /blob/add WithConclude(false),<br/>PUT (or already streamed); blob_parks row written;<br/>local copy removed (removeLocal)"| parked
     parked -->|"concludeBlobs at Complete:<br/>/ucan/conclude; blob_parks row deleted"| accepted
-    spooled -->|"release record; executeRelease, local only<br/>(the blob never left this node):<br/>DeleteIntent + spool.Remove"| gone([deleted])
-    uploading -->|"release record; executeRelease: /blob/remove<br/>(idempotent: the accept may have landed, its location not);<br/>DeleteIntent + spool.Remove"| gone
-    parked -->|"release record; executeRelease: /blob/abort (cause AddTask),<br/>or /blob/remove if the provider says accepted;<br/>DeleteIntent + spool.Remove"| gone
-    accepted -->|"release record (never committed);<br/>executeRelease: /blob/remove;<br/>DeleteIntent + spool.Remove"| gone
-    published -->|"release record (committed);<br/>executeRelease: /blob/remove;<br/>DeleteIntent + spool.Remove"| gone
+    spooled -->|"release record; executeRelease, local only<br/>(the blob never left this node):<br/>DeleteIntent + removeLocal"| gone([deleted])
+    uploading -->|"release record; executeRelease: /blob/remove<br/>(idempotent: the accept may have landed, its location not);<br/>DeleteIntent + removeLocal"| gone
+    parked -->|"release record; executeRelease: /blob/abort (cause AddTask),<br/>or /blob/remove if the provider says accepted;<br/>DeleteIntent + removeLocal"| gone
+    accepted -->|"release record (never committed);<br/>executeRelease: /blob/remove;<br/>DeleteIntent + removeLocal"| gone
+    published -->|"release record (committed);<br/>executeRelease: /blob/remove;<br/>DeleteIntent + removeLocal"| gone
 
     accepted -->|"commit: AddBlobClaim, same transaction"| published
+
+    parked -.->|"SweepLocalBlobs over budget (blob_parks row):<br/>removeLocal + MarkEvicted; state unchanged"| evicted[["local file evicted<br/>(evicted_at set)"]]
+    accepted -.->|"SweepLocalBlobs over budget (blob_locations row):<br/>removeLocal + MarkEvicted; state unchanged"| evicted
+    published -.->|"SweepLocalBlobs over budget (blob_locations row):<br/>removeLocal + MarkEvicted; state unchanged"| evicted
     published -->|"commit: reconcileClaims adds this version"| refs["blob_refs rows<br/>(digest, bucket, key, version_id)"]
     refs -->|"version delete or overwrite removes its row"| zero{"CountClaims == 0<br/>for (space, digest)?"}
     zero -->|yes| rel["release record enqueued, due after release_grace<br/>(the published → deleted edge runs it)"]
@@ -583,10 +591,23 @@ flowchart TB
 ```
 
 - `published` is written with the blob's first reference claim and never
-  changes until the blob's release, which removes the spool copy and the
+  changes until the blob's release, which removes the local copy and the
   intent as it does for a never-committed blob. `blob_parks` is a
   presence machine (a row exists while a conclude is owed), not a state
   column.
+- A blob's file lives in the spool until the provider holds it, then moves
+  to the cache: once its location and `accepted` state are both recorded,
+  by rename (`BlobCache.Take`). A failed move leaves it in the spool.
+- Eviction (the dotted edges) is orthogonal to the state: `SweepLocalBlobs`
+  runs every 30s and, when the spool and cache together are over
+  `local_blob_max_bytes`, removes the local files of blobs the provider
+  already holds (a location row for `accepted` and `published`, a park row
+  for `parked`), oldest state change first, down to 90% of the budget: from
+  the cache, or from the spool for a blob whose move never happened. The
+  intent keeps its row and state and gains `evicted_at`; reads fall through
+  to the network tier. `spooled` and `uploading` files are never evicted.
+  The parked-part drop at UploadPart marks `evicted_at` the same way. A
+  committed blob's release removes its local copy with the intent.
 - Digests present in both the old and new version sets never churn: the
   reconcile computes a set difference.
 - Parked-blob reclamation is guarded: a digest live in another session, part,
@@ -599,8 +620,10 @@ flowchart TB
 Cross-references: [`architecture.md` §5](./architecture.md#5-the-data-layer),
 [`s3-versioning.md`](./s3-versioning.md) §8.
 
-Sources: `registry/stores.go` (state consts), `s3frontend/object.go`
-(ingestBody, reconcileClaims), `s3frontend/multipart.go`
+Sources: `registry/stores.go` (state consts, ListEvictable), `s3frontend/object.go`
+(ingestBody, reconcileClaims), `s3frontend/localblob_sweep.go` (SweepLocalBlobs),
+`s3frontend/localblobs.go` (cacheHeld, removeLocal),
+`s3frontend/multipart.go`
 (parkBlobs, concludeBlobs, enqueuePartReleases), `s3frontend/object.go`
 (runRelease, executeRelease), `uploader/blob.go` (UploadBlob,
 AbortBlob, RemoveBlob). Review when these change.
@@ -878,6 +901,8 @@ erDiagram
         bigint size
         text state "spooled, uploading, parked, accepted, published (claimed by a commit)"
         text bucket
+        timestamptz updated_at "last state change: the budget pass evicts oldest first"
+        timestamptz evicted_at "set once the local copy is removed (sweeper or parked-part drop)"
     }
     blob_locations {
         text space PK

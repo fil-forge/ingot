@@ -197,7 +197,7 @@ func (b *Backend) bucketSpace(ctx context.Context, bucketName string) (did.DID, 
 // /blob/accept is deferred to Complete, so the bytes are durable but stay
 // out of the PDP pipeline, and an Abort unwinds them with /blob/abort
 // (§7.2). Re-uploading a part number supersedes the prior part; the
-// superseded part's now-unreferenced blobs are dropped from the spool and
+// superseded part's now-unreferenced blobs are dropped from local disk and
 // rejected. The part ETag is the hex md5 of the part bytes: a Content-MD5 the
 // checksum middleware verified against the stream is reused, else it is
 // computed during ingest.
@@ -907,7 +907,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 
 // AbortMultipartUpload cancels a multipart upload: it latches the session
 // (single-winner vs Complete), drops it (cascading its parts), and removes the
-// parts' now-unreferenced blobs from the spool — unallocating any that were
+// parts' now-unreferenced blobs from local disk — unallocating any that were
 // parked on a provider (an upload ends in exactly one of accept or
 // abort). No reference claims were taken (those happen only at
 // Complete).
@@ -1099,6 +1099,7 @@ func (b *Backend) parkBlob(ctx context.Context, space did.DID, blob msbucket.Blo
 		if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentAccepted); err != nil {
 			return fmt.Errorf("mark accepted (dedup): %w", err)
 		}
+		b.cacheHeld(blob.Digest)
 		// A located blob has no use for a park. One is still here only
 		// when an earlier Complete recorded the location and then failed
 		// before dropping the row. The part is durable regardless, so a
@@ -1151,6 +1152,7 @@ func (b *Backend) parkBlob(ctx context.Context, space did.DID, blob msbucket.Blo
 		if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentAccepted); err != nil {
 			return fmt.Errorf("mark accepted: %w", err)
 		}
+		b.cacheHeld(blob.Digest)
 		return nil
 	}
 	// Location == nil ⇔ parked: durable on the provider with accept
@@ -1168,7 +1170,7 @@ func (b *Backend) parkBlob(ctx context.Context, space did.DID, blob msbucket.Blo
 	if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentParked); err != nil {
 		return fmt.Errorf("mark parked: %w", err)
 	}
-	b.dropParkedCopy(blob.Digest)
+	b.dropParkedCopy(ctx, blob.Digest)
 	return nil
 }
 
@@ -1195,7 +1197,7 @@ func (b *Backend) recordStreamedPark(ctx context.Context, blob msbucket.BlobRef,
 		return fmt.Errorf("mark parked: %w", err)
 	}
 	b.finishStream(ctx, sb)
-	b.dropParkedCopy(blob.Digest)
+	b.dropParkedCopy(ctx, blob.Digest)
 	return nil
 }
 
@@ -1207,13 +1209,18 @@ func (b *Backend) recordStreamedPark(ctx context.Context, blob msbucket.BlobRef,
 // sweeper unwind it through the same row, and the object's reads go to the
 // provider once Complete records the location. The blob is durable on the
 // provider, so a failed remove costs only disk: it is logged, and the file
-// stays until a release of the blob removes it. That is the session's
-// release if the part is aborted, superseded or expires, but its object's
-// release once Complete commits it, since the session's teardown leaves
-// committed blobs to their objects.
-func (b *Backend) dropParkedCopy(digest mh.Multihash) {
-	if err := b.spool.Remove(digest); err != nil {
-		b.logger.Warn("drop parked blob's spool copy failed; it stays until the blob's release",
+// waits for the spool sweeper to evict it, if a budget is set, or for a
+// release of the blob: the session's if the part is aborted, superseded or
+// expires, its object's once Complete commits it. A failure to mark the
+// intent evicted only leaves the sweeper to find the file gone and mark it.
+func (b *Backend) dropParkedCopy(ctx context.Context, digest mh.Multihash) {
+	if _, err := b.removeLocal(digest); err != nil {
+		b.logger.Warn("drop parked blob's spool copy failed; it stays until the spool sweeper evicts it or the blob's release",
+			zap.String("digest", hex.EncodeToString(digest)), zap.Error(err))
+		return
+	}
+	if err := b.intents.MarkEvicted(ctx, digest); err != nil && !errors.Is(err, registry.ErrNotFound) {
+		b.logger.Warn("mark parked blob evicted failed",
 			zap.String("digest", hex.EncodeToString(digest)), zap.Error(err))
 	}
 }
@@ -1251,6 +1258,7 @@ func (b *Backend) concludeBlobs(ctx context.Context, space did.DID, blobs []msbu
 			if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentAccepted); err != nil {
 				return fmt.Errorf("mark accepted (dedup): %w", err)
 			}
+			b.cacheHeld(blob.Digest)
 			// A located blob has no use for a park. One is still here only
 			// when an earlier Complete recorded the location and then failed
 			// before marking the intent or dropping the row; this is where
@@ -1378,6 +1386,7 @@ func (b *Backend) recordAccepted(ctx context.Context, space did.DID, digest mh.M
 	if err := b.intents.SetIntentState(ctx, digest, registry.IntentAccepted); err != nil {
 		return fmt.Errorf("mark accepted: %w", err)
 	}
+	b.cacheHeld(digest)
 	return nil
 }
 

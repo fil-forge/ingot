@@ -501,6 +501,10 @@ func newDeferredBackend(t *testing.T, up deferredTestUploader, mods ...func(*Dep
 	if err != nil {
 		t.Fatalf("spool: %v", err)
 	}
+	cache, err := blockstore.NewBlobCache(filepath.Join(dir, "cache"))
+	if err != nil {
+		t.Fatalf("spool: %v", err)
+	}
 	log, err := logstore.Open(ctx, logstore.Config{
 		Dir:     filepath.Join(dir, "segments"),
 		Meta:    mem,
@@ -521,9 +525,10 @@ func newDeferredBackend(t *testing.T, up deferredTestUploader, mods ...func(*Dep
 		GC:              mem,
 		Multipart:       mem,
 		Parks:           mem,
-		Reads:           blockstore.NewLayered(spool, log, inmem.NopBaseReader{}),
+		Reads:           blockstore.NewLayered(blockstore.LocalBlobs{Cache: cache, Spool: spool}, log, inmem.NopBaseReader{}),
 		Log:             log,
 		Spool:           spool,
+		Cache:           cache,
 		Uploader:        up,
 		Deferred:        up,
 		Remover:         &recordingRemover{},
@@ -1547,7 +1552,7 @@ func TestReleaseFreesSpoolCopyOfDeletedPutObject(t *testing.T) {
 	if in, err := mem.GetIntent(ctx, d); err != nil || in.State != registry.IntentPublished {
 		t.Fatalf("intent after the failed attempt = %v/%v, want published and kept for the retry", in, err)
 	}
-	if _, err := os.Stat(b.spool.Path(d)); err != nil {
+	if _, err := os.Stat(localPath(b, d)); err != nil {
 		t.Fatalf("spool copy after the failed attempt: %v, want it kept for the retry", err)
 	}
 
@@ -1564,7 +1569,7 @@ func assertLocalCopyReleased(t *testing.T, b *Backend, mem *inmem.MemStore, d mu
 	if in, err := mem.GetIntent(context.Background(), d); !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("blob %x intent = %v/%v after its release, want it deleted", d, in, err)
 	}
-	if _, err := os.Stat(b.spool.Path(d)); !os.IsNotExist(err) {
+	if _, err := os.Stat(localPath(b, d)); !os.IsNotExist(err) {
 		t.Fatalf("blob %x spool copy after its release: stat err=%v, want not-exist", d, err)
 	}
 }
@@ -2190,7 +2195,7 @@ func TestReleaseKeepsIntentUntilLocalCleanupSucceeds(t *testing.T) {
 	if in, err := mem.GetIntent(ctx, d); err != nil || in.State != registry.IntentSpooled {
 		t.Fatalf("intent after the failed attempt = %v/%v, want kept as spooled", in, err)
 	}
-	if _, err := os.Stat(b.spool.Path(d)); err != nil {
+	if _, err := os.Stat(localPath(b, d)); err != nil {
 		t.Fatalf("spool copy gone after the failed attempt: %v", err)
 	}
 
@@ -2198,7 +2203,7 @@ func TestReleaseKeepsIntentUntilLocalCleanupSucceeds(t *testing.T) {
 	if _, err := mem.GetIntent(ctx, d); !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("intent survived the retry (err=%v)", err)
 	}
-	if _, err := os.Stat(b.spool.Path(d)); !os.IsNotExist(err) {
+	if _, err := os.Stat(localPath(b, d)); !os.IsNotExist(err) {
 		t.Fatalf("spool copy survived the retry (err=%v)", err)
 	}
 	if n := len(rm.removedDigests()); n != 0 {
@@ -2382,4 +2387,19 @@ func TestReleaseRemovesBlobAcceptedWithoutRows(t *testing.T) {
 	if _, err := mem.GetIntent(ctx, d); !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("intent for %x survived the release (err=%v)", d, err)
 	}
+}
+
+// localPath returns where a blob's local copy is: in the cache once the
+// provider holds it, otherwise in the spool. A blob in neither gets its spool
+// path, so a stat of it reports the copy missing.
+func localPath(b *Backend, digest multihash.Multihash) string {
+	if p := b.cache.Path(digest); fileExists(p) {
+		return p
+	}
+	return b.spool.Path(digest)
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }

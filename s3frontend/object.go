@@ -536,6 +536,7 @@ func (b *Backend) uploadBlob(ctx context.Context, space did.DID, blob msbucket.B
 		if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentAccepted); err != nil {
 			return fmt.Errorf("mark accepted (dedup): %w", err)
 		}
+		b.cacheHeld(blob.Digest)
 		return nil
 	} else if err != nil && !errors.Is(err, registry.ErrNotFound) {
 		return fmt.Errorf("lookup location: %w", err)
@@ -568,8 +569,9 @@ func (b *Backend) uploadBlob(ctx context.Context, space did.DID, blob msbucket.B
 	if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentAccepted); err != nil {
 		return fmt.Errorf("mark accepted: %w", err)
 	}
-	// Best-effort location record (unused in the harness, where reads come
-	// from the spool); keyed by (space, digest).
+	// The location record, keyed by (space, digest): where reads go once the
+	// local copy is evicted, and the proof eviction requires that the
+	// provider holds the blob.
 	if err := b.locations.PutLocation(ctx, registry.BlobLocation{
 		Space:    space,
 		Digest:   blob.Digest,
@@ -579,6 +581,7 @@ func (b *Backend) uploadBlob(ctx context.Context, space did.DID, blob msbucket.B
 	}); err != nil {
 		return fmt.Errorf("record location: %w", err)
 	}
+	b.cacheHeld(blob.Digest)
 	return nil
 }
 
@@ -845,7 +848,7 @@ func (b *Backend) drainSpaceReleases(ctx context.Context, space did.DID) error {
 // touched, so the retry reads the same state and takes the same step. Only
 // once the network holds nothing for this space do the park and location
 // rows go, park first so a partial failure leaves the retry on the same
-// path, and then the spool copy and upload intent, committed or not. The
+// path, and then the local copy and upload intent, committed or not. The
 // intent goes together with this release's own record, in one transaction,
 // since it is the only evidence of how far the blob ever got.
 func (b *Backend) executeRelease(ctx context.Context, pr registry.PendingRelease) bool {
@@ -943,20 +946,21 @@ func (b *Backend) executeRelease(ctx context.Context, pr registry.PendingRelease
 	}
 	switch {
 	case !ok:
-		// A step above failed. The intent stays, with the spool copy, so
+		// A step above failed. The intent stays, with the local copy, so
 		// the retry reads the same state: deleting it would turn a blob
 		// that never left this node into one with neither rows nor intent,
 		// whose retry then owes a network remove it cannot authorize.
 	default:
-		// The spool copy goes first, and removing an absent one is a no-op,
-		// so a failure after it costs the retry nothing. The intent then
+		// The local copy goes first, from the cache or the spool, and
+		// removing an absent one is a no-op, so a failure after it costs the
+		// retry nothing. The intent then
 		// goes together with this release's record: the intent is the only
 		// evidence that this blob never left the node, and a record that
 		// outlived it would leave the retry reading neither rows nor
 		// intent, owing a network remove it cannot authorize and can never
 		// complete.
-		if err := b.spool.Remove(digest); err != nil {
-			log.Warn("release: remove spooled blob failed", zap.Error(err))
+		if _, err := b.removeLocal(digest); err != nil {
+			log.Warn("release: remove local blob copy failed", zap.Error(err))
 			ok = false
 		} else if err := b.pendingReleases.DeleteIntentAndRelease(ctx, space, digest); err != nil {
 			log.Warn("release: delete upload intent with the release record failed", zap.Error(err))

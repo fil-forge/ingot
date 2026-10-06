@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/fil-forge/ingot/bucket"
 	blobcmds "github.com/fil-forge/libforge/commands/blob"
@@ -95,6 +96,9 @@ func TestValidate_RequiredFields(t *testing.T) {
 		{"revocation did without url", func(c *Config) { c.RevocationServiceDID = "did:web:swarf.example" }, "revocation_service_url and revocation_service_did must be set together"},
 		{"bad seal_age", func(c *Config) { c.SealAge = "not-a-duration" }, "parse seal_age"},
 		{"bad release_grace", func(c *Config) { c.ReleaseGrace = "soon" }, "parse release_grace"},
+		{"negative local_blob_max_bytes", func(c *Config) { c.LocalBlobMaxBytes = -1 }, "local_blob_max_bytes -1: must not be negative"},
+		{"bad local_blob_orphan_age", func(c *Config) { c.LocalBlobOrphanAge = "soon" }, "parse local_blob_orphan_age"},
+		{"short local_blob_orphan_age", func(c *Config) { c.LocalBlobOrphanAge = "59m" }, `local_blob_orphan_age "59m": must be at least 1h`},
 		{"bad cors origin", func(c *Config) { c.CORSAllowedOrigins = []string{"app.example"} }, "cors_allowed_origins"},
 		{"regionkey provider unset", func(c *Config) { c.RegionKey.Provider = "" }, "regionkey.provider is required"},
 		{"tenantkey url unset", func(c *Config) { c.TenantKey.PLCDirectoryURL = "" }, "tenantkey.plc_directory_url is required"},
@@ -119,6 +123,49 @@ func TestValidate_RequiredFields(t *testing.T) {
 			err := cfg.Validate()
 			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
 				t.Fatalf("expected error containing %q, got: %v", tc.wantErr, err)
+			}
+		})
+	}
+}
+
+// localBlobKnobs is the local blob storage subset of ServerConfig, for
+// comparing it whole.
+type localBlobKnobs struct {
+	MaxBytes  int64
+	OrphanAge time.Duration
+}
+
+func TestServerConfig_LocalBlobKnobs(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(*Config)
+		want   localBlobKnobs
+	}{
+		{
+			name:   "defaults",
+			mutate: func(*Config) {},
+			want:   localBlobKnobs{MaxBytes: 0, OrphanAge: 24 * time.Hour},
+		},
+		{
+			name: "explicit values",
+			mutate: func(c *Config) {
+				c.LocalBlobMaxBytes = 1 << 40
+				c.LocalBlobOrphanAge = "2h"
+			},
+			want: localBlobKnobs{MaxBytes: 1 << 40, OrphanAge: 2 * time.Hour},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := validConfig(t)
+			tc.mutate(&cfg)
+			sc, err := cfg.ServerConfig()
+			if err != nil {
+				t.Fatalf("ServerConfig: %v", err)
+			}
+			got := localBlobKnobs{sc.LocalBlobMaxBytes, sc.LocalBlobOrphanAge}
+			if got != tc.want {
+				t.Fatalf("local blob knobs = %+v, want %+v", got, tc.want)
 			}
 		})
 	}

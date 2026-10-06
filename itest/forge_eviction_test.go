@@ -4,16 +4,19 @@ package itest
 
 import (
 	"bytes"
+	"fmt"
+	"strconv"
 	"testing"
+	"time"
 
 	ingottest "github.com/fil-forge/ingot/testing"
 )
 
 // TestForgeReadAfterEviction proves the appliance read tier: after the local
-// spool is wiped, a GET must re-fetch the object's body blobs from piri by
+// blob copies are wiped, a GET must re-fetch the object's body blobs from piri by
 // resolving their location from the local blob_locations table
 // (registry.LocalLocator) and issuing a /content/retrieve — not from
-// read-after-write. Body blobs live only in the spool; the manifest/MST live
+// read-after-write. Body blobs live only in the spool and cache; the manifest/MST live
 // in the catalog log and survive the wipe, so only the body read exercises
 // the network tier.
 //
@@ -43,10 +46,10 @@ func TestForgeReadAfterEviction(t *testing.T) {
 		t.Fatalf("put object: %v", err)
 	}
 
-	// Wipe the local spool so the next GET cannot read-after-write — its body
-	// blobs must be re-fetched from piri.
-	if out, errOut, err := s.Exec(ctx, "ingot", "sh", "-c", "rm -rf /data/spool"); err != nil {
-		t.Fatalf("evict spool: %v (stdout=%s stderr=%s)", err, out, errOut)
+	// Wipe the local blob copies (spool and cache) so the next GET cannot
+	// read-after-write — its body blobs must be re-fetched from piri.
+	if out, errOut, err := s.Exec(ctx, "ingot", "sh", "-c", "rm -rf /data/spool /data/cache"); err != nil {
+		t.Fatalf("wipe local blob copies: %v (stdout=%s stderr=%s)", err, out, errOut)
 	}
 
 	got, err := ingottest.GetBytes(ctx, cfg, bucket, key)
@@ -57,4 +60,66 @@ func TestForgeReadAfterEviction(t *testing.T) {
 		t.Fatalf("read-after-eviction mismatch: got %d bytes, want %d", len(got), len(data))
 	}
 	t.Logf("read-after-eviction OK: %d bytes re-fetched from piri via the local locator", len(got))
+}
+
+// TestForgeLocalBlobBudget proves the local blob sweeper: with a 4 MiB
+// local_blob_max_bytes (testdata/config-localblobbudget.yaml), 16 MiB of
+// objects are evicted down to the budget within a few sweeps, at least 12 of their blobs are marked
+// evicted (so their reads must go to piri), and every object then reads back
+// byte-exact.
+//
+//	go test -tags itest ./itest -run TestForgeLocalBlobBudget -v -timeout 900s
+func TestForgeLocalBlobBudget(t *testing.T) {
+	ctx := t.Context()
+
+	s, ingotEndpoint := forgeStack(t, withLocalBlobBudgetConfig())
+	accessKey, secretKey := hiltProvisionTenant(t, ctx, s, "localblobbudget")
+	cfg := forgeConfig(ingotEndpoint, accessKey, secretKey)
+	const bucket = "budget-bucket"
+	const budget = 4 << 20
+
+	if err := ingottest.CreateBucket(ctx, cfg, bucket); err != nil {
+		t.Fatalf("create bucket: %v", err)
+	}
+	objects := make(map[string][]byte)
+	for i := range 16 {
+		key := fmt.Sprintf("obj-%02d", i)
+		data := make([]byte, 1<<20)
+		for j := range data {
+			data[j] = byte(i*31 + j*7)
+		}
+		if err := ingottest.PutBytes(ctx, cfg, bucket, key, data); err != nil {
+			t.Fatalf("put %s: %v", key, err)
+		}
+		objects[key] = data
+	}
+
+	deadline := time.Now().Add(2 * time.Minute)
+	for {
+		used := localBlobBytes(t, ctx, s)
+		if used <= budget {
+			t.Logf("local blob usage %d bytes, within the %d-byte budget", used, budget)
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("local blob usage %d bytes still over the %d-byte budget after 2 minutes", used, budget)
+		}
+		time.Sleep(5 * time.Second)
+	}
+	// 16 MiB down to at most 4 MiB leaves room for at most four of the
+	// 1 MiB blobs; the rest are read back from piri below.
+	evicted := ingotSQL(t, ctx, s, `SELECT count(*) FROM ingot.upload_intents WHERE evicted_at IS NOT NULL`)
+	if n, err := strconv.Atoi(evicted); err != nil || n < 12 {
+		t.Fatalf("evicted intents = %q, want at least 12", evicted)
+	}
+
+	for key, want := range objects {
+		got, err := ingottest.GetBytes(ctx, cfg, bucket, key)
+		if err != nil {
+			t.Fatalf("get %s after eviction: %v", key, err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("get %s after eviction: got %d bytes, want %d matching bytes", key, len(got), len(want))
+		}
+	}
 }

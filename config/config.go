@@ -97,7 +97,7 @@ type Config struct {
 	MultipartSessionTTL string `mapstructure:"multipart_session_ttl" yaml:"multipart_session_ttl"`
 
 	// ReleaseGrace delays each blob release (crypto-shred + location delete +
-	// network remove + spool-copy removal) this long past the drop of its
+	// network remove + local-copy removal) this long past the drop of its
 	// last reference claim (Go duration string), so in-flight readers holding
 	// the prior catalog root finish first. It bounds how long such a reader
 	// may take: a GET, or a copy reading the object as its source, still
@@ -106,6 +106,26 @@ type Config struct {
 	// Empty → default 60s; a negative duration makes releases due
 	// immediately.
 	ReleaseGrace string `mapstructure:"release_grace" yaml:"release_grace"`
+
+	// LocalBlobMaxBytes is the byte budget for local blob storage: the spool
+	// (<data_dir>/spool: writes in progress, counted as their bytes land, and
+	// bodies waiting for upload) plus the cache (<data_dir>/cache: copies of
+	// bodies the provider holds). It does not cover the catalog log. A
+	// sweeper checks it every 30 seconds and evicts blobs the provider
+	// holds, oldest first, down to 90% of the budget; reads of an evicted blob go to the
+	// provider. Usage can exceed the budget by ingest rate × 30 seconds
+	// between sweeps, and by files that must stay (the spool's, and orphans
+	// younger than LocalBlobOrphanAge). 0 → no budget (the default); negative
+	// is an error.
+	LocalBlobMaxBytes int64 `mapstructure:"local_blob_max_bytes" yaml:"local_blob_max_bytes"`
+	// LocalBlobOrphanAge is the age (file modification time) at which the
+	// sweeper deletes a .tmp-* file in the spool or the cache, or a spool blob
+	// file with no upload intent (Go duration string), hourly, whether or not a
+	// budget is set. It must exceed the longest time one request body takes to
+	// stream: the server sets no body read timeout, and a body still streaming
+	// past it can have its first blobs deleted, failing the request. Empty →
+	// default 24h; under 1h is an error.
+	LocalBlobOrphanAge string `mapstructure:"local_blob_orphan_age" yaml:"local_blob_orphan_age"`
 
 	// CatalogPlane overrides the catalog logstore pipeline knobs. Any field
 	// left zero/unset falls back to the top-level SealBytes / SealAge / Retain
@@ -187,6 +207,16 @@ func (c Config) ServerConfig() (ServerConfig, error) {
 			releaseGrace = 0
 		}
 	}
+	localBlobOrphanAge, err := parseDurationKnob("local_blob_orphan_age", c.LocalBlobOrphanAge, 24*time.Hour)
+	if err != nil {
+		return ServerConfig{}, err
+	}
+	if localBlobOrphanAge < time.Hour {
+		return ServerConfig{}, fmt.Errorf("ingot: local_blob_orphan_age %q: must be at least 1h, longer than any request body takes to stream", c.LocalBlobOrphanAge)
+	}
+	if c.LocalBlobMaxBytes < 0 {
+		return ServerConfig{}, fmt.Errorf("ingot: local_blob_max_bytes %d: must not be negative (0 means no budget)", c.LocalBlobMaxBytes)
+	}
 	// Render the CORS configuration here — the single place it is built —
 	// so a typo fails at startup (via Validate) rather than from New.
 	corsCfg, err := cors.Build(c.CORSAllowedOrigins)
@@ -211,7 +241,26 @@ func (c Config) ServerConfig() (ServerConfig, error) {
 
 		MultipartSessionTTL: mpTTL,
 		ReleaseGrace:        releaseGrace,
+
+		LocalBlobMaxBytes:  c.LocalBlobMaxBytes,
+		LocalBlobOrphanAge: localBlobOrphanAge,
 	}, nil
+}
+
+// parseDurationKnob parses a duration knob: empty takes def,
+// negative is an error.
+func parseDurationKnob(name, value string, def time.Duration) (time.Duration, error) {
+	if value == "" {
+		return def, nil
+	}
+	d, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, fmt.Errorf("ingot: parse %s %q: %w", name, value, err)
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("ingot: %s %q: must not be negative", name, value)
+	}
+	return d, nil
 }
 
 // planeSealAge resolves a plane's SealAge: the per-plane value if set,

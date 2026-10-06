@@ -275,9 +275,12 @@ digest must be known before `allocate`, and because that local copy does double 
 - **Read cache (optional, recommended):** beyond that floor, the local store serves hot reads
   directly, skipping the indexer→Piri round-trip. Read-after-write retains *recently written* data;
   a cache retains *recently read* data, so the two may use distinct eviction policies over a shared,
-  bounded, size-configurable store. The alternative — a near-stateless Ingot that resolves every read
-  through the indexer — trades latency for simpler horizontal scaling; it is a supported mode, but
-  the read-after-write floor holds regardless.
+  bounded, size-configurable store. *(Built as two directories, a spool for writes and bodies
+  awaiting upload and a cache for copies the provider holds, under one byte budget,
+  `local_blob_max_bytes`, evicting blobs the provider holds, oldest first; separate read-after-write and
+  read-recency windows are not built. See §12.)* The alternative — a near-stateless Ingot that resolves every read through the indexer —
+  trades latency for simpler horizontal scaling; it is a supported mode, but the read-after-write
+  floor holds regardless.
 
 The `upload_intents` table tracks each in-flight blob: `digest → { local_path, size, state:
 spooled│parked│accepted│published, owner ref }`. It drives read-after-write, cache lookup, and crash
@@ -697,17 +700,20 @@ CREATE TABLE ingot.blob_refs (
 -- Drives "is (space, digest) still claimed?" — the gate on remove(digest).
 CREATE INDEX blob_refs_claim_idx ON ingot.blob_refs (space, digest);
 
--- The local-store index (§5): every blob Ingot holds on disk. state advances
--- spooled → parked → accepted ('published' is declared but unwritten today).
+-- The local-store index (§5): every blob Ingot has spooled. state advances
+-- spooled → uploading → (parked →) accepted → published; published is written
+-- with the first reference claim. Eviction removes the local copy and sets
+-- evicted_at, leaving the row and its state.
 CREATE TABLE ingot.upload_intents (
     digest      bytea PRIMARY KEY,                       -- sha256 multihash of the blob
     local_path  text   NOT NULL,
-    size        bigint NOT NULL,
+    size        bigint NOT NULL,                         -- stored (envelope) bytes = file size
     state       text   NOT NULL
-                    CHECK (state IN ('spooled','parked','accepted','published')),
+                    CHECK (state IN ('spooled','uploading','parked','accepted','published')),
     bucket      text,                                    -- owner ref (originating op), for cleanup
     created_at  timestamptz NOT NULL DEFAULT now(),
-    updated_at  timestamptz NOT NULL DEFAULT now()
+    updated_at  timestamptz NOT NULL DEFAULT now(),      -- last state change
+    evicted_at  timestamptz                              -- NULL: file on disk
 );
 
 -- Local blob location table (§8, appliance topology): (space, digest) →
@@ -868,7 +874,7 @@ reference index — and is out of scope for this iteration.
 
 ### Deferred as forge-mode glue (validated live in smelt, not the in-process harness)
 
-The in-memory harness uses a no-op uploader and serves reads from the spool; the forge-network
+The in-memory harness uses a no-op uploader and serves reads from local disk; the forge-network
 paths below are exercised against the real stack by the smelt-based `itest/` harness in CI:
 
 - **`remove(digest)` and `abort(digest)` are live.** `RemoveBlob` invokes `/blob/remove` on
@@ -877,12 +883,16 @@ paths below are exercised against the real stack by the smelt-based `itest/` har
   it into `/blob/reject` on the node (provider recovered from the `cause` receipt chain);
   allocation-expiry GC (FIL-625) remains the backstop when an abort never arrives.
 - **The local-table `Locator` read tier is wired and validated.** Body blobs re-resolve after
-  spool loss from `blob_locations` + `/content/retrieve` (`TestForgeReadAfterEviction`), and
+  local-copy loss from `blob_locations` + `/content/retrieve` (`TestForgeReadAfterEviction`), and
   retention-retired catalog blocks resolve via `shard_inclusions` (#44) — the read paths of
   [§7.4](#74-read-getobject) / [§8](#8-retrieval-addressing-when-bodies-need-a-sharded-dag-index).
-  Spool **eviction** itself is still unbuilt: nothing bounds the spool, so local disk grows with
-  every body byte of every retained version. A release frees a deleted object's spool copies. The
-  bounded-cache policy [§5](#5-the-data-layer) specifies is tracked in #48.
+  **Local blob storage is split by role and bounded by a byte budget.** A body is written to the
+  spool (`<data_dir>/spool`) and moves to the cache (`<data_dir>/cache`) once the provider holds
+  it. With `local_blob_max_bytes` set (`SweepLocalBlobs`), every 30s the sweeper evicts blobs the
+  provider holds (a location or park row), oldest first, down to 90% of the budget; hourly it
+  deletes orphan files. The budget is off by default. A release frees a deleted object's local
+  copies, and a parked part's copy goes once it parks. Still open under #48: there is no
+  write-through mode or local blob metric.
 - **Multipart parts park at UploadPart, accept at Complete.** (Built: `parkBlobs`/`concludeBlobs`
   over the `blob_parks` table.) A parked part holds no local bytes: its spool copy is removed once
   it parks, and Complete concludes it from its park row. Abort and session expiry unwind parked

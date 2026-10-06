@@ -154,7 +154,7 @@ func newStreamingBackend(t *testing.T, su *streamingUploader) (*Backend, *inmem.
 	return newDeferredBackend(t, su, func(d *Deps) {
 		d.Streaming = su
 		d.Streams = d.Parks.(*inmem.MemStore)
-		d.Reads = blockstore.NewLayered(d.Spool, d.Log, su)
+		d.Reads = blockstore.NewLayered(blockstore.LocalBlobs{Cache: d.Cache, Spool: d.Spool}, d.Log, su)
 		d.MaxBlobSize = streamBlobCeiling
 	})
 }
@@ -173,7 +173,7 @@ func putSized(t *testing.T, b *Backend, key string, data []byte, declared int64)
 
 func spooled(t *testing.T, b *Backend, digest multihash.Multihash) []byte {
 	t.Helper()
-	data, err := os.ReadFile(b.spool.Path(digest))
+	data, err := os.ReadFile(localPath(b, digest))
 	require.NoError(t, err)
 	return data
 }
@@ -326,7 +326,7 @@ func TestStreamedUploadPart(t *testing.T) {
 		in, err := mem.GetIntent(ctx, d)
 		require.NoError(t, err)
 		require.Equal(t, registry.IntentParked, in.State)
-		_, err = os.Stat(b.spool.Path(d))
+		_, err = os.Stat(localPath(b, d))
 		require.True(t, os.IsNotExist(err), "a parked blob keeps no spool copy (stat err=%v)", err)
 	}
 	require.Empty(t, staleStreams(t, mem))
