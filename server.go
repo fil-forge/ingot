@@ -301,12 +301,15 @@ func (s *Server) startMultipartSweeper() {
 		interval = 10 * time.Minute
 	}
 	s.sweepStop = make(chan struct{})
+	// The goroutine keeps its own copy of the channel, as the local blob
+	// sweeper does: Stop closes it and then clears the field.
+	stop := s.sweepStop
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
 			select {
-			case <-s.sweepStop:
+			case <-stop:
 				return
 			case <-ticker.C:
 				ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
@@ -336,12 +339,15 @@ func (s *Server) startReleaseSweeper() {
 		interval = time.Second
 	}
 	s.releaseStop = make(chan struct{})
+	// The goroutine keeps its own copy of the channel, as the local blob
+	// sweeper does: Stop closes it and then clears the field.
+	stop := s.releaseStop
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
 			select {
-			case <-s.releaseStop:
+			case <-stop:
 				return
 			case <-ticker.C:
 				ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
