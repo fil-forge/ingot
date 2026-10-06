@@ -320,8 +320,9 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 
 	// Capture the superseded part's blobs (if any) before overwriting, so
 	// last-write-wins doesn't strand them. The session's other parts stay
-	// live: a re-uploaded part may share blobs with a sibling. A listing
-	// failure fails the upload: proceeding would silently strand the
+	// live; the release still checks for a sibling naming the same digest,
+	// though every write gets a fresh key and so a digest of its own. A
+	// listing failure fails the upload: proceeding would silently strand the
 	// replaced part's blobs and key rows.
 	var superseded []mh.Multihash
 	siblings := map[string]bool{}
@@ -1113,7 +1114,7 @@ func (b *Backend) parkBlob(ctx context.Context, space did.DID, blob msbucket.Blo
 	}
 	if _, err := b.parks.GetPark(ctx, blob.Digest); err == nil {
 		span.SetAttributes(attribute.String("ingot.blob.result", "already_parked"))
-		return nil // already parked by a sibling part or session
+		return nil // already parked (defensive: every write gets its own digest)
 	} else if !errors.Is(err, registry.ErrNotFound) {
 		return fmt.Errorf("lookup park: %w", err)
 	}
@@ -1167,6 +1168,7 @@ func (b *Backend) parkBlob(ctx context.Context, space did.DID, blob msbucket.Blo
 	if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentParked); err != nil {
 		return fmt.Errorf("mark parked: %w", err)
 	}
+	b.dropParkedCopy(blob.Digest)
 	return nil
 }
 
@@ -1193,7 +1195,27 @@ func (b *Backend) recordStreamedPark(ctx context.Context, blob msbucket.BlobRef,
 		return fmt.Errorf("mark parked: %w", err)
 	}
 	b.finishStream(ctx, sb)
+	b.dropParkedCopy(blob.Digest)
 	return nil
+}
+
+// dropParkedCopy removes a parked blob's spool copy. Unlike a release, it
+// checks no other reference to the digest: it relies on every written blob
+// having its own digest (a fresh content key per blob), so no other part,
+// session or object can be using the same file. Nothing reads it again:
+// Complete concludes the blob from its park row, Abort and the session
+// sweeper unwind it through the same row, and the object's reads go to the
+// provider once Complete records the location. The blob is durable on the
+// provider, so a failed remove costs only disk: it is logged, and the file
+// stays until a release of the blob removes it. That is the session's
+// release if the part is aborted, superseded or expires, but its object's
+// release once Complete commits it, since the session's teardown leaves
+// committed blobs to their objects.
+func (b *Backend) dropParkedCopy(digest mh.Multihash) {
+	if err := b.spool.Remove(digest); err != nil {
+		b.logger.Warn("drop parked blob's spool copy failed; it stays until the blob's release",
+			zap.String("digest", hex.EncodeToString(digest)), zap.Error(err))
+	}
 }
 
 // concludeBlobs is Complete's park-aware counterpart to uploadBlobs: located
@@ -1216,8 +1238,8 @@ func (b *Backend) concludeBlobs(ctx context.Context, space did.DID, blobs []msbu
 		toConclude []pending
 		toUpload   []msbucket.BlobRef
 	)
-	// A digest can repeat across parts — identical part content shares one
-	// spooled blob and one park — and it must be concluded once.
+	// Conclude each digest once. Every write gets a fresh key, so a digest
+	// does not repeat across parts today; the check is defensive.
 	seen := make(map[string]bool, len(blobs))
 	for _, blob := range blobs {
 		if seen[string(blob.Digest)] {

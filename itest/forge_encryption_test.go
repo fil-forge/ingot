@@ -140,7 +140,6 @@ func TestForgeEncryption(t *testing.T) {
 		}
 
 		partData := [][]byte{patternBytes(6 << 20), patternBytes(5 << 20), patternBytes(9 << 10)}
-		before := spoolBlobPaths(t, ctx, s)
 		var completed []types.CompletedPart
 		var whole []byte
 		for i, data := range partData {
@@ -161,17 +160,15 @@ func TestForgeEncryption(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("CompleteMultipartUpload: %v", err)
 		}
-		added := newSpoolPaths(before, spoolBlobPaths(t, ctx, s))
+		added := objectBlobDigestsHex(t, ctx, s, bucket, key)
 		if len(added) != 3 {
-			t.Fatalf("multipart upload spooled %d envelopes, want 3 (one per part under the default config)", len(added))
+			t.Fatalf("multipart object references %d blobs, want 3 (one per part under the default config)", len(added))
 		}
-
-		// Evict only THIS object's spool copies (the shared stack's other
-		// objects keep theirs), so the pre-delete read must come from piri —
-		// proving all three part blobs are durable on the network before we
-		// assert the release traverses it.
-		if out, errOut, err := s.Exec(ctx, "ingot", "rm", "-f", added[0], added[1], added[2]); err != nil {
-			t.Fatalf("evict this object's spool copies: %v (stdout=%s stderr=%s)", err, out, errOut)
+		// A part's spool copy goes once it parks, so the pre-delete read must
+		// come from piri — proving all three part blobs are durable on the
+		// network before we assert the release traverses it.
+		if spooled := spooledDigests(t, ctx, s, added); len(spooled) != 0 {
+			t.Fatalf("parked part blobs still in the spool: %v", spooled)
 		}
 		if got := getBody(t, ctx, cl, bucket, key, ""); !bytes.Equal(got, whole) {
 			t.Fatalf("read-through from piri before delete mismatched: got %d bytes, want %d", len(got), len(whole))
@@ -240,8 +237,10 @@ func TestForgeEncryption(t *testing.T) {
 	// blob_encryption_params row is the region wrap of the per-blob CEK —
 	// deleting it is the per-blob crypto-shred (migration 00014) — and
 	// DeleteObject removes it, the location row, and the network claim for
-	// every body blob, then frees the blob's spooled envelope. Versioned
-	// buckets' delete-marker path deliberately does not shred (S3
+	// every body blob, then frees the blob's spooled envelope. A multipart
+	// part's envelope leaves the spool once it parks, so a single-PUT object,
+	// whose envelope stays until its release, proves the release frees it.
+	// Versioned buckets' delete-marker path deliberately does not shred (S3
 	// semantics); this covers the unversioned path.
 	t.Run("ShredThenRead", func(t *testing.T) {
 		const bucket, key = "shred", "obj"
@@ -284,6 +283,21 @@ func TestForgeEncryption(t *testing.T) {
 		if len(digests) != len(partData) {
 			t.Fatalf("blob_refs records %d digests, want %d (one per part)", len(digests), len(partData))
 		}
+
+		const putKey = "single"
+		if _, err := cl.PutObject(ctx, &s3.PutObjectInput{
+			Bucket: aws.String(bucket), Key: aws.String(putKey), Body: bytes.NewReader(tagged(patternBytes(64<<10), 0x6B)),
+		}); err != nil {
+			t.Fatalf("PutObject: %v", err)
+		}
+		putDigests := objectBlobDigestsHex(t, ctx, s, bucket, putKey)
+		if spooled := spooledDigests(t, ctx, s, putDigests); len(spooled) != len(putDigests) {
+			t.Fatalf("pre-delete: %d of the single-PUT object's %d envelopes in the spool, want all", len(spooled), len(putDigests))
+		}
+		if _, err := cl.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(bucket), Key: aws.String(putKey)}); err != nil {
+			t.Fatalf("DeleteObject %s: %v", putKey, err)
+		}
+		digests = append(digests, putDigests...)
 		// Pre-delete sanity: without this, the zero-rows assertion below
 		// would pass vacuously against an unencrypted write.
 		if n := countRowsForDigests(t, ctx, s, "ingot.blob_encryption_params", "digest", digests); n != len(digests) {
@@ -321,13 +335,13 @@ func TestForgeEncryption(t *testing.T) {
 			}
 			time.Sleep(5 * time.Second)
 		}
-		t.Logf("shred OK: %d region-wrap rows destroyed, spooled envelopes freed", len(digests))
+		t.Logf("shred OK: %d region-wrap rows destroyed, the single-PUT envelope freed from the spool", len(digests))
 	})
 
 	// AbortShredsKeyRows: aborting an upload shreds the orphaned parts' key
 	// rows — the part blobs' releases delete each blob's enc-params row,
 	// upload intent, and park row (the spool and piri unwind are pinned by
-	// MultipartAbortCleansSpool and TestForgeDeferredMultipart/AbortRejects).
+	// MultipartPartKeepsNoSpoolCopy and TestForgeDeferredMultipart/AbortRejects).
 	// Expiry-sweep shred is TestForgeMultipartExpiryShred (needs a low-TTL
 	// stack).
 	t.Run("AbortShredsKeyRows", func(t *testing.T) {

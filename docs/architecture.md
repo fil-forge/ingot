@@ -411,7 +411,7 @@ clean up parked blobs.
 ```
 CreateMultipartUpload → uploadId, session (state=open)
 UploadPart(n)         → ingest + split + blob/add + PUT → PARKED (no accept); record part
-                        ETag = hex(part MD5)
+                        ETag = hex(part MD5); the part's local copy is removed once parked
 CompleteMultipartUpload([parts])
      latch session open→completing            (§7.3); validate parts (S3 rules)
      trigger accept for every part's blobs
@@ -884,9 +884,9 @@ paths below are exercised against the real stack by the smelt-based `itest/` har
   every body byte of every retained version. A release frees a deleted object's spool copies. The
   bounded-cache policy [§5](#5-the-data-layer) specifies is tracked in #48.
 - **Multipart parts park at UploadPart, accept at Complete.** (Built: `parkBlobs`/`concludeBlobs`
-  over the `blob_parks` table.) The in-process harness still spools parts
-  at `UploadPart` and uploads+accepts them at `Complete`; the true forge *parking* (upload early,
-  accept-at-Complete) and the `/blob/abort` unwind from [§7.2](#72-multipart)–[7.3](#73-the-session-latch-the-abortcomplete-race) are forge-mode refinements.
+  over the `blob_parks` table.) A parked part holds no local bytes: its spool copy is removed once
+  it parks, and Complete concludes it from its park row. Abort and session expiry unwind parked
+  blobs with `/blob/abort` ([§7.2](#72-multipart)–[7.3](#73-the-session-latch-the-abortcomplete-race)).
 - **Crash recovery for the spool is not built.** The `upload_intents` × `blob_refs` reconciliation
   the failure-mode table in [§7.5](#75-concurrency-durability-and-failure-modes) describes (resume/`abort` parked, `remove` accepted-but-unreferenced)
   is a later phase; a partial post-commit reference-index write currently relies on retry/idempotency.

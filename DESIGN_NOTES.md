@@ -126,10 +126,12 @@ at PUT time or a sealed catalog CAR from the background flush:
 
 Multipart parts stop after step 2 (**parked**: durable, unaccepted) and run
 steps 3 and 4 at `CompleteMultipartUpload`; an abort unwinds a parked blob
-with `/blob/abort`. A part copied from an existing object (`UploadPartCopy`)
-is ingested the same way: the source's plaintext range streams through the
-decrypting read path into new parked blobs, so the source may be in any
-bucket of the tenant and nothing is shared with it.
+with `/blob/abort`. A parked blob's spool copy is removed once it parks:
+Complete concludes it from its park row and never reads its bytes. A part
+copied from an existing object (`UploadPartCopy`) is ingested the same way:
+the source's plaintext range streams through the decrypting read path into
+new parked blobs, so the source may be in any bucket of the tenant and
+nothing is shared with it.
 
 Complete concludes the parked parts in batches: each `/ucan/conclude`
 carries up to `MaxConcludeBatch` (1000) put receipts (`receipts`, the plural
@@ -265,8 +267,9 @@ draws the chains and the stores.
 - **No HA.** A bucket is single-writer through an in-process lock; nothing
   coordinates across instances beyond the root CAS.
 - **The spool is unbounded** (#48): nothing evicts local body blobs, so
-  local disk grows with every body byte of every retained version. A delete
-  frees its blobs' spool copies once their release runs.
+  local disk grows with every body byte of every retained version written
+  by a single PUT or copy. A multipart part's copy goes once it parks, and a
+  delete frees its blobs' spool copies once their release runs.
 - **Spool crash recovery is not built**: reconciling `upload_intents`
   against `blob_refs` after a crash between commit and reconcile is a later
   phase; the window leaks rather than loses referenced data.
