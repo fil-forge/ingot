@@ -13,11 +13,14 @@
 package blake3tree
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"math/bits"
 	"sort"
 
+	"lukechampine.com/blake3/bao"
 	"lukechampine.com/blake3/guts"
 )
 
@@ -638,4 +641,89 @@ func preorder(leaves []CV, out []byte) (CV, []byte) {
 	copy(out[at:], l[:])
 	copy(out[at+32:], r[:])
 	return ParentCV(l, r), out
+}
+
+// OutboardSize returns the body size an outboard's prefix records.
+func OutboardSize(outboard []byte) int64 {
+	return int64(binary.LittleEndian.Uint64(outboard))
+}
+
+// CheckOutboard reports whether b has an outboard's shape: the 8-byte size
+// prefix followed by whole 64-byte parent entries.
+func CheckOutboard(b []byte) error {
+	if len(b) < 8 || (len(b)-8)%64 != 0 {
+		return fmt.Errorf("blake3tree: %d bytes is not an 8-byte size prefix plus 64-byte parent entries", len(b))
+	}
+	return nil
+}
+
+// AlignedRange widens the inclusive byte range [a, b] of a body to the
+// block-aligned inclusive range a verifier needs: down to a block boundary
+// and up to one, or to the body's end. A block is the only unit the outboard
+// can verify, since each leaf is the hash of a whole block.
+func AlignedRange(a, b int64, groupLog uint8, size int64) (start, end int64, err error) {
+	if a < 0 || b < a {
+		return 0, 0, fmt.Errorf("blake3tree: range %d-%d is not ascending", a, b)
+	}
+	if a >= size {
+		return 0, 0, fmt.Errorf("blake3tree: range starts at %d but the body is %d bytes", a, size)
+	}
+	block := GroupSize(groupLog)
+	start = a / block * block
+	end = min((b/block+1)*block, size) - 1
+	return start, end, nil
+}
+
+// BlockError reports a block that does not verify against the outboard and
+// root.
+type BlockError struct{ Offset, Length int64 }
+
+func (e *BlockError) Error() string {
+	return fmt.Sprintf("block at %d (%d bytes) does not verify against the outboard and digest", e.Offset, e.Length)
+}
+
+// VerifyBlocks is the client side of range verification: it checks the bytes
+// of r, which start at offset in the body, block by block against the Bao
+// outboard and the body's root, and returns how many bytes it verified. The
+// offset must be a multiple of the block size and the data must hold whole
+// blocks, except that it may end at the body's end. A block that fails is
+// returned as a *BlockError after the bytes before it; any other error is a
+// malformed input.
+func VerifyBlocks(r io.Reader, outboard []byte, groupLog uint8, offset int64, root CV) (int64, error) {
+	if err := CheckOutboard(outboard); err != nil {
+		return 0, err
+	}
+	size := OutboardSize(outboard)
+	block := GroupSize(groupLog)
+	if offset%block != 0 {
+		return 0, fmt.Errorf("blake3tree: offset %d is not a multiple of the block size %d", offset, block)
+	}
+	if offset > size {
+		return 0, fmt.Errorf("blake3tree: offset %d is past the body's %d bytes", offset, size)
+	}
+	buf := make([]byte, block)
+	var verified int64
+	for {
+		n, err := io.ReadFull(r, buf)
+		if n == 0 && (err == io.EOF || err == io.ErrUnexpectedEOF) {
+			return verified, nil
+		}
+		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+			return verified, err
+		}
+		pos := offset + verified
+		if pos+int64(n) > size {
+			return verified, fmt.Errorf("blake3tree: data runs %d bytes past the body's end", pos+int64(n)-size)
+		}
+		if int64(n) < block && pos+int64(n) != size {
+			return verified, fmt.Errorf("blake3tree: data ends %d bytes into the block at %d; a verifiable range holds whole blocks or ends at the body's end (%d)", n, pos, size)
+		}
+		if !bao.VerifyChunk(bytes.Clone(buf[:n]), outboard, int(groupLog)-chunkLog, uint64(pos), root) {
+			return verified, &BlockError{pos, int64(n)}
+		}
+		verified += int64(n)
+		if int64(n) < block {
+			return verified, nil
+		}
+	}
 }

@@ -109,7 +109,15 @@ collaborators themselves.
 ingot serve --config /etc/ingot/config.yaml   # the gateway
 ingot whoami                                  # agent DID (and key DID) + sprue/hilt endpoints
 ingot version
+ingot blake3 hash < file                      # the object CID (x-cid) of the data
+ingot blake3 verify <cid> < file              # whole-object check against an x-cid
+ingot blake3 range --outboard ob.b64 --group 22 5000-200000   # aligned Range to fetch
+ingot blake3 verify --outboard ob.b64 --group 22 --offset 0 <cid> < part  # ranged check
 ```
+
+`blake3 range` and the ranged `verify` take the `Blake3` attribute of
+`GetObjectAttributes`: its `Outboard` saved to a file (the base64 as in the
+XML, or raw) and its `Group`. A mismatch exits 1; any other failure exits 2.
 
 `serve` requires Postgres (`postgres_dsn`), the sprue edge client
 (`upload_service_url`/`_did`), and the hilt auth/tenant service
