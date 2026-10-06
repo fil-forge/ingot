@@ -44,8 +44,10 @@ func (r *recordingRemover) removedDigests() map[string]int {
 }
 
 // newRefTestBackend builds a Backend over real in-process collaborators (a
-// MemStore, an on-disk spool, a catalog log) plus a recording remover, so a
-// test can drive PutObject/DeleteObject and inspect blob_refs + releases.
+// MemStore, an on-disk spool, a catalog log, an in-memory provider) plus a
+// recording remover, so a test can drive PutObject/DeleteObject and inspect
+// blob_refs + releases. Body reads are served by the provider, as the network
+// tier serves them in production, never by the spool.
 func newRefTestBackend(t *testing.T, maxBlob ...int64) (*Backend, *inmem.MemStore, *recordingRemover) {
 	t.Helper()
 	var mbs int64
@@ -71,6 +73,7 @@ func newRefTestBackend(t *testing.T, maxBlob ...int64) (*Backend, *inmem.MemStor
 	t.Cleanup(func() { _ = log.Close(ctx) })
 
 	rm := &recordingRemover{}
+	provider := inmem.NewProvider()
 	b := New(Deps{
 		Authority:       mem,
 		Registry:        mem,
@@ -80,11 +83,11 @@ func newRefTestBackend(t *testing.T, maxBlob ...int64) (*Backend, *inmem.MemStor
 		GC:              mem,
 		Multipart:       mem,
 		Parks:           mem,
-		Reads:           blockstore.NewLayered(spool, log, inmem.NopBaseReader{}),
+		Reads:           blockstore.NewLayered(nil, log, provider),
 		Log:             log,
 		Spool:           spool,
-		Uploader:        inmem.NopUploader{},
-		Deferred:        inmem.NopUploader{},
+		Uploader:        provider,
+		Deferred:        provider,
 		Remover:         rm,
 		EncParams:       mem,
 		RegionKeys:      testRegionKeys(t),
