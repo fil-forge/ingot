@@ -1217,9 +1217,10 @@ func (b *Backend) GetObjectAttributes(ctx context.Context, input *s3.GetObjectAt
 	// faithful subset, matching AWS for a non-checksummed multipart object.
 	var objectParts *s3response.ObjectParts
 	// The Blake3 attribute (an Ingot extension, see blake3Attribute) is
-	// built only when asked for: its outboard is base64 of up to 1 MiB.
-	// The controller passes the requested names through; a caller that
-	// passes none (an older controller, a direct caller) gets it.
+	// built only when asked for: its outboard is 64 bytes per leaf, 2 MiB at
+	// the 32768-leaf cap and about 2.8 MiB once base64-encoded. The
+	// controller passes the requested names through; a caller that passes
+	// none (an older controller, a direct caller) gets it.
 	var blake3 *s3response.Blake3Tree
 	if wantsBlake3(input.ObjectAttributes) {
 		blake3 = blake3Attribute(rv.mf.Body)
