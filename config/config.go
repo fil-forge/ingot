@@ -430,8 +430,15 @@ type InProcessConfig struct {
 
 // Load reads daemon config from configFile (or the default search path)
 // with env override (INGOT_* / nested keys via "_").
+//
+// Viper's AutomaticEnv alone applies an environment variable only to a key
+// viper already knows from the config file or a default, so a key absent
+// from the YAML would ignore its INGOT_* variable. ExperimentalBindStruct
+// makes Unmarshal also look up every key of Config, so each field can be
+// set from the environment. TestLoad_EnvWithoutYAMLKey fails if a viper
+// upgrade changes that.
 func Load(configFile string) (*Config, error) {
-	v := viper.GetViper()
+	v := viper.NewWithOptions(viper.ExperimentalBindStruct())
 	setDefaults(v)
 	v.SetEnvPrefix("INGOT")
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
@@ -464,28 +471,15 @@ func Load(configFile string) (*Config, error) {
 	return &cfg, nil
 }
 
+// setDefaults registers the daemon's non-empty defaults. A key needs no entry
+// here for its INGOT_* variable to apply: Load binds every field of Config.
+// Most defaults live in Config.ServerConfig instead (empty → default), since
+// library hosts build Config without calling Load.
 func setDefaults(v *viper.Viper) {
 	v.SetDefault("log_level", "info")
 	v.SetDefault("addr", "0.0.0.0:8080")
-	// The identity keys are registered even though the defaults are empty:
-	// viper's AutomaticEnv only overrides keys it already knows, so without
-	// these an INGOT_IDENTITY_* env var would be silently ignored whenever
-	// the key is absent from the YAML.
-	v.SetDefault("identity.key_file", "")
-	v.SetDefault("identity.service_id", "")
-	// The regionkey keys are registered even where the default is empty:
-	// viper's AutomaticEnv only overrides keys it already knows, so without
-	// these an INGOT_REGIONKEY_* env var would be silently ignored whenever
-	// the key is absent from the YAML.
-	v.SetDefault("regionkey.provider", "")
-	v.SetDefault("regionkey.openbao.address", "")
-	v.SetDefault("regionkey.openbao.token", "")
 	v.SetDefault("regionkey.openbao.mount", "transit")
-	v.SetDefault("regionkey.openbao.key", "")
-	v.SetDefault("regionkey.inprocess.kek", "")
 	v.SetDefault("regionkey.inprocess.version", "v1")
-	v.SetDefault("tenantkey.plc_directory_url", "")
-	v.SetDefault("tenantkey.cache_ttl", "")
 }
 
 // Validate checks the config for the selected mode, aggregating every

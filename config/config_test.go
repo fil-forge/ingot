@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -267,8 +268,8 @@ func TestValidate_IdentityServiceID(t *testing.T) {
 	}
 }
 
-// TestLoad_IdentityEnv: the identity keys are registered with viper defaults
-// so INGOT_IDENTITY_* env vars bind even when the YAML omits them.
+// TestLoad_IdentityEnv: INGOT_IDENTITY_* env vars apply even when the YAML
+// omits the identity block.
 func TestLoad_IdentityEnv(t *testing.T) {
 	t.Setenv("INGOT_IDENTITY_KEY_FILE", "/keys/agent.pem")
 	t.Setenv("INGOT_IDENTITY_SERVICE_ID", "did:web:ingot.example")
@@ -285,5 +286,54 @@ func TestLoad_IdentityEnv(t *testing.T) {
 	}
 	if cfg.Identity.ServiceID != "did:web:ingot.example" {
 		t.Fatalf("identity.service_id = %q, want did:web:ingot.example", cfg.Identity.ServiceID)
+	}
+}
+
+// TestLoad_EnvWithoutYAMLKey checks that an INGOT_* variable sets a key the
+// config file leaves out, which viper's AutomaticEnv alone would ignore,
+// and that it overrides a key the file sets.
+func TestLoad_EnvWithoutYAMLKey(t *testing.T) {
+	t.Setenv("INGOT_LOCAL_BLOB_MAX_BYTES", "1073741824")
+	t.Setenv("INGOT_LOCAL_BLOB_ORPHAN_AGE", "2h")
+	t.Setenv("INGOT_CORS_ALLOWED_ORIGINS", "https://a.example,https://b.example")
+	t.Setenv("INGOT_CATALOG_PLANE_RETAIN", "3")
+	t.Setenv("INGOT_CATALOG_PLANE_SHIP", "false")
+	t.Setenv("INGOT_REGIONKEY_OPENBAO_ADDRESS", "https://bao.example:8200")
+	t.Setenv("INGOT_REGIONKEY_OPENBAO_MOUNT", "transit-env")
+	t.Setenv("INGOT_DATA_DIR", "/from-env")
+	cfgFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(cfgFile, []byte("data_dir: /from-yaml\nregionkey:\n  openbao:\n    key: from-yaml\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg, err := Load(cfgFile)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.LocalBlobMaxBytes != 1<<30 {
+		t.Errorf("local_blob_max_bytes = %d, want %d", cfg.LocalBlobMaxBytes, 1<<30)
+	}
+	if cfg.LocalBlobOrphanAge != "2h" {
+		t.Errorf("local_blob_orphan_age = %q, want 2h", cfg.LocalBlobOrphanAge)
+	}
+	if want := []string{"https://a.example", "https://b.example"}; !slices.Equal(cfg.CORSAllowedOrigins, want) {
+		t.Errorf("cors_allowed_origins = %q, want %q", cfg.CORSAllowedOrigins, want)
+	}
+	if cfg.CatalogPlane.Retain != 3 {
+		t.Errorf("catalog_plane.retain = %d, want 3", cfg.CatalogPlane.Retain)
+	}
+	if cfg.CatalogPlane.Ship == nil || *cfg.CatalogPlane.Ship {
+		t.Errorf("catalog_plane.ship = %v, want a non-nil false", cfg.CatalogPlane.Ship)
+	}
+	if got := cfg.RegionKey.OpenBao; got.Address != "https://bao.example:8200" || got.Key != "from-yaml" {
+		t.Errorf("regionkey.openbao address, key = %q, %q, want the env address beside the YAML key", got.Address, got.Key)
+	}
+	if got := cfg.RegionKey.OpenBao.Mount; got != "transit-env" {
+		t.Errorf("regionkey.openbao.mount = %q, want the env value over the default", got)
+	}
+	if cfg.DataDir != "/from-env" {
+		t.Errorf("data_dir = %q, want /from-env", cfg.DataDir)
+	}
+	if cfg.Addr != "0.0.0.0:8080" {
+		t.Errorf("addr = %q, want the default 0.0.0.0:8080", cfg.Addr)
 	}
 }
