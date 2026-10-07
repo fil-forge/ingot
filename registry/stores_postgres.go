@@ -908,6 +908,12 @@ func (r *Postgres) PutPart(ctx context.Context, p MultipartPart) error {
 	if state == "" {
 		state = PartParked
 	}
+	// A part without a tree writes zero / NULL tree columns; ListParts
+	// reads a zero chunk log back as no tree.
+	tree := p.Tree
+	if tree == nil {
+		tree = &PartTree{}
+	}
 	// BlobDigests ([]multihash.Multihash) rides pgx's underlying-type plan into
 	// bytea[]: pgx must try that plan before its Stringer plan, or a Multihash
 	// (whose String() is base58) would land as text — pgx v5.10+ orders them
@@ -920,8 +926,8 @@ func (r *Postgres) PutPart(ctx context.Context, p MultipartPart) error {
 	// teardown's part listing includes it.
 	tag, err := r.pool.Exec(ctx,
 		`INSERT INTO ingot.multipart_parts (upload_id, part_number, etag_md5, size, checksum, blob_digests, state,
-		                                    tree_offset, tree_chunk_log, tree_nodes, tree_leaves, tree_root)
-		 SELECT s.upload_id, $2, $3, $4, $5, $6, $7, $9, $10, $11, $12, $13
+		                                    tree_offset, tree_chunk_log, tree_nodes, tree_blocks, tree_head, tree_tail, tree_root)
+		 SELECT s.upload_id, $2, $3, $4, $5, $6, $7, $9, $10, $11, $12, $13, $14, $15
 		   FROM ingot.multipart_sessions s
 		  WHERE s.upload_id = $1 AND s.state = $8
 		    FOR SHARE
@@ -929,9 +935,10 @@ func (r *Postgres) PutPart(ctx context.Context, p MultipartPart) error {
 		   SET etag_md5 = EXCLUDED.etag_md5, size = EXCLUDED.size, checksum = EXCLUDED.checksum,
 		       blob_digests = EXCLUDED.blob_digests, state = EXCLUDED.state,
 		       tree_offset = EXCLUDED.tree_offset, tree_chunk_log = EXCLUDED.tree_chunk_log,
-		       tree_nodes = EXCLUDED.tree_nodes, tree_leaves = EXCLUDED.tree_leaves, tree_root = EXCLUDED.tree_root`,
+		       tree_nodes = EXCLUDED.tree_nodes, tree_blocks = EXCLUDED.tree_blocks,
+		       tree_head = EXCLUDED.tree_head, tree_tail = EXCLUDED.tree_tail, tree_root = EXCLUDED.tree_root`,
 		p.UploadID, p.PartNumber, p.ETagMD5, p.Size, p.Checksum, p.BlobDigests, state, SessionOpen,
-		p.TreeOffset, int16(p.TreeChunkLog), p.TreeNodes, p.TreeLeaves, p.TreeRoot)
+		tree.Offset, int16(tree.ChunkLog), tree.Nodes, tree.Blocks, tree.Head, tree.Tail, tree.Root)
 	if err != nil {
 		return fmt.Errorf("registry: put part: %w", err)
 	}
@@ -944,7 +951,7 @@ func (r *Postgres) PutPart(ctx context.Context, p MultipartPart) error {
 func (r *Postgres) ListParts(ctx context.Context, uploadID string) ([]MultipartPart, error) {
 	rows, err := r.pool.Query(ctx,
 		`SELECT part_number, etag_md5, size, checksum, blob_digests, state, created_at,
-		        tree_offset, tree_chunk_log, tree_nodes, tree_leaves, tree_root
+		        tree_offset, tree_chunk_log, tree_nodes, tree_blocks, tree_head, tree_tail, tree_root
 		 FROM ingot.multipart_parts WHERE upload_id = $1 ORDER BY part_number ASC`,
 		uploadID)
 	if err != nil {
@@ -955,12 +962,16 @@ func (r *Postgres) ListParts(ctx context.Context, uploadID string) ([]MultipartP
 	var out []MultipartPart
 	for rows.Next() {
 		p := MultipartPart{UploadID: uploadID}
+		var tree PartTree
 		var treeChunkLog int16
 		if err := rows.Scan(&p.PartNumber, &p.ETagMD5, &p.Size, &p.Checksum, &p.BlobDigests, &p.State, &p.CreatedAt,
-			&p.TreeOffset, &treeChunkLog, &p.TreeNodes, &p.TreeLeaves, &p.TreeRoot); err != nil {
+			&tree.Offset, &treeChunkLog, &tree.Nodes, &tree.Blocks, &tree.Head, &tree.Tail, &tree.Root); err != nil {
 			return nil, fmt.Errorf("registry: list parts scan: %w", err)
 		}
-		p.TreeChunkLog = uint8(treeChunkLog)
+		if treeChunkLog != 0 {
+			tree.ChunkLog = uint8(treeChunkLog)
+			p.Tree = &tree
+		}
 		out = append(out, p)
 	}
 	if err := rows.Err(); err != nil {

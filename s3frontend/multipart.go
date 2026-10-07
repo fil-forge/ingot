@@ -355,13 +355,13 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 			return nil, fmt.Errorf("s3frontend: record superseded part releases: %w", err)
 		}
 	}
-	// The part's BLAKE3 tree, hashed at the offset the part is guessed to
-	// sit at in the object (see guessPartOffset); Complete merges the parts'
-	// trees into the object's digest and leaves. A guess that is not
-	// chunk-aligned (an earlier part of odd length) leaves no tree, and the
-	// part is re-hashed at Complete. The split's own whole-body tree is
+	// The part's BLAKE3 tree, hashed at the offset the part is assumed to
+	// sit at in the object (see assumedPartOffset), whole chunks only, with
+	// the bytes either side of them kept raw; Complete merges the parts'
+	// trees into the object's digest and blocks and hashes the chunks that
+	// straddle part boundaries from those raw bytes. The split's own whole-body tree is
 	// skipped: it would be the tree of the part alone, at offset 0.
-	treeOffset := guessPartOffset(prior, partNumber, size)
+	treeOffset := assumedPartOffset(prior, partNumber, size)
 	tree, err := blake3tree.NewHasher(treeOffset)
 	if err != nil {
 		tree = nil
@@ -388,7 +388,7 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 		State:       registry.PartParked,
 	}
 	if tree != nil {
-		recordPartTree(&part, tree.FinishRange())
+		part.Tree = partTreeOf(tree.FinishRange())
 	}
 	if err := b.multipart.PutPart(ctx, part); err != nil {
 		// No part row points at the spooled blobs now, whatever went wrong:
@@ -784,15 +784,18 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 		return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: accept parts: %w", err)
 	}
 
-	// The object's BLAKE3 digest and leaves, assembled from the parts' trees
-	// (re-reading a part only where its record cannot serve).
+	// The object's BLAKE3 digest and blocks, assembled from the parts' trees
+	// (re-reading a part only where its record cannot serve, within the
+	// re-hash budget; past it the object has no digest).
 	body := msbucket.Body{Size: offset, Blobs: blobs, PartSizes: partSizes, PartChecksums: partChecksums}
-	tree, err := b.multipartTree(ctx, bucketState.Space, requested, partOffsets, body)
+	tree, hasTree, err := b.multipartTree(ctx, bucketState.Space, requested, partOffsets, body)
 	if err != nil {
 		return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: object tree: %w", err)
 	}
-	if err := body.SetTree(tree); err != nil {
-		return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: object tree: %w", err)
+	if hasTree {
+		if err := body.SetTree(tree); err != nil {
+			return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: object tree: %w", err)
+		}
 	}
 
 	mf := &msbucket.ObjectManifest{

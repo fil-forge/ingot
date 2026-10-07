@@ -596,7 +596,7 @@ func (b *Backend) uploadBlob(ctx context.Context, space did.DID, blob msbucket.B
 //     (claimVersionID), so racing writers never touch one shared row;
 //   - the new generation's claims are added UNDER the per-bucket commit lock,
 //     before the root swap — a racing writer that supersedes this generation
-//     always finds the rows to drop, and a failed commit leaves at most a
+//     always finds the rows to drop, and a failed commit blocks at most a
 //     benign extra claim, never a wrong release;
 //   - the superseded generation's claims drop AFTER the commit is durable,
 //     each drop atomically enqueueing a deferred release when the space's
@@ -1217,7 +1217,7 @@ func (b *Backend) GetObjectAttributes(ctx context.Context, input *s3.GetObjectAt
 	// faithful subset, matching AWS for a non-checksummed multipart object.
 	var objectParts *s3response.ObjectParts
 	// The Blake3 attribute (an Ingot extension, see blake3Attribute) is
-	// built only when asked for: its outboard is 64 bytes per leaf, 2 MiB at
+	// built only when asked for: its outboard is 64 bytes per block, 2 MiB at
 	// the 32768-leaf cap and about 2.8 MiB once base64-encoded. The
 	// controller passes the requested names through; a caller that passes
 	// none (an older controller, a direct caller) gets it.

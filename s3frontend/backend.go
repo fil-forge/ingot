@@ -25,6 +25,7 @@
 package s3frontend
 
 import (
+	"cmp"
 	"context"
 	"encoding/xml"
 	"sync"
@@ -118,7 +119,8 @@ type Backend struct {
 	tenantKeys tenantkey.Source
 	logger     *zap.Logger
 
-	maxBlobSize int64
+	maxBlobSize  int64
+	rehashBudget int64
 	// cors is Deps.CORS marshalled once at construction — GetBucketCors
 	// is on the per-request path, so the document is built here rather
 	// than per call. Nil when CORS is disabled.
@@ -225,6 +227,12 @@ type Deps struct {
 	// MaxBlobSize is the coarse-split blob ceiling (0 → bucket default).
 	MaxBlobSize int64
 
+	// RehashBudget bounds the bytes CompleteMultipartUpload re-reads to
+	// hash non-final parts whose assumed object offset was wrong (0 →
+	// DefaultRehashBudget); the final part is always re-hashed. An upload
+	// needing more completes without a BLAKE3 digest.
+	RehashBudget int64
+
 	// CORS is the S3 CORS configuration GetBucketCors reports for every
 	// bucket, rendered from config by internal/cors. New marshals it once
 	// into the XML document the S3 API serves. Nil disables CORS.
@@ -289,9 +297,10 @@ func New(d Deps) *Backend {
 		cacheReadRetention: d.CacheReadRetention,
 		localBlobOrphanAge: localBlobOrphanAge,
 
-		logger:      logger,
-		maxBlobSize: d.MaxBlobSize,
-		cors:        corsDoc,
+		logger:       logger,
+		maxBlobSize:  d.MaxBlobSize,
+		rehashBudget: cmp.Or(d.RehashBudget, DefaultRehashBudget),
+		cors:         corsDoc,
 	}
 	mp := d.MeterProvider
 	if mp == nil {

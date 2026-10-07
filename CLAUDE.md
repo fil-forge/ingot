@@ -140,7 +140,7 @@ Internal:
 - **`tokenstore/`** — carried-from-guppy delegation store (`tokens.cbor`);
   empty today, read only by the dormant login paths.
 - **`blake3tree/`** — the BLAKE3 Merkle-tree material of a body: the
-  whole-object digest (the `x-cid` header), the block-aligned leaf chaining
+  whole-object digest (the `x-cid` header), the block-aligned block chaining
   values the manifest records for verifying ranged reads, and the aligned
   subtrees of a range hashed at an offset (for assembling a multipart
   object's tree from its parts). Wraps `lukechampine.com/blake3/guts`.
@@ -211,7 +211,10 @@ agent) and sets `Config.UploadServiceURL`/`UploadServiceDID` (sprue) +
 ## Configuration (`config.Config`)
 
 Viper/yaml-bindable (env prefix `INGOT_`, `.` → `_`). Key fields: `Enabled`,
-`Addr` (default `0.0.0.0:8080`), `DataDir`, `Region`, `MaxBlobSize`, top-level
+`Addr` (default `0.0.0.0:8080`), `DataDir`, `Region`, `MaxBlobSize`,
+`MultipartRehashBudget` (0 → 5 GiB; the re-read Complete allows for non-final
+parts hashed at a wrong assumed offset, past which the object gets no digest;
+the final part is always re-hashed), top-level
 `SealBytes`/`SealAge`/`Retain` with a `CatalogPlane` `{SealBytes, SealAge,
 Ship, Retain}` override block (the only plane), `ReadCacheBytes` (0 → 256 MiB,
 <0 → off), `UploadServiceURL`/`UploadServiceDID`/`UploadReceiptsURL` (sprue),

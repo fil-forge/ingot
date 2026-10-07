@@ -49,7 +49,7 @@ exponent of 1 KiB BLAKE3 chunks) and Outboard (the Bao outboard, base64),
 the inputs of "ingot blake3 range" and the ranged "ingot blake3 verify".
 The chunk log is the one ingot would record for a body of this size unless
 --chunk-log chooses another. For an outboard iroh can use, set --chunk-log
-4, iroh's fixed 16 KiB block; 0 is the original Bao format. The leaves are
+4, iroh's fixed 16 KiB block; 0 is the original Bao format. The blocks are
 held in memory while hashing, 32 bytes per block.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -82,7 +82,7 @@ held in memory while hashing, 32 bytes per block.`,
 			}
 			fmt.Fprintf(cmd.OutOrStdout(), "CID %s\nChunkLog %d\nOutboard %s\n",
 				cid.NewCidV1(cid.Raw, digest), obj.ChunkLog,
-				base64.StdEncoding.EncodeToString(blake3tree.Outboard(obj.Leaves, obj.Size)))
+				base64.StdEncoding.EncodeToString(blake3tree.Outboard(obj.Blocks, obj.Size)))
 			return nil
 		},
 	}
@@ -138,7 +138,7 @@ func (f *blake3TreeFlags) load() ([]byte, error) {
 	// The chunk log and the outboard must agree with each other (and the
 	// chunk log must be one a block size can be computed from) before
 	// either is used.
-	if _, err := blake3tree.OutboardLeaves(outboard, f.chunkLog); err != nil {
+	if _, err := blake3tree.OutboardBlocks(outboard, f.chunkLog); err != nil {
 		return nil, fmt.Errorf("%s with --chunk-log %d: %w", src, f.chunkLog, err)
 	}
 	return outboard, nil

@@ -238,22 +238,44 @@ type MultipartPart struct {
 	State       string
 	CreatedAt   time.Time
 
-	// The part's BLAKE3 tree material, from which Complete assembles the
-	// object's digest and leaf list without re-reading the part (see
-	// blake3tree). TreeOffset is the object byte offset the part was hashed
-	// at: UploadPart's guess from the parts recorded so far, which Complete
-	// checks against the part's true offset. TreeNodes holds the part's
-	// aligned subtrees and TreeLeaves its leaves at TreeChunkLog (the block
-	// size as a base-2 exponent of chunks), both encoded with
-	// blake3tree.EncodeSubtrees. TreeRoot is the part's own BLAKE3 hash, set
-	// when TreeOffset is 0. Empty TreeNodes means no tree was recorded (a
-	// part from before the tree existed, or a copy that read no bytes), and
-	// Complete re-hashes the part.
-	TreeOffset   int64
-	TreeChunkLog uint8
-	TreeNodes    []byte
-	TreeLeaves   []byte
-	TreeRoot     []byte
+	// Tree is the part's BLAKE3 tree material, from which Complete assembles
+	// the object's digest and block list without re-reading the part (see
+	// blake3tree). Nil when none was recorded (a part from before the tree
+	// existed, or a copy that read no bytes); Complete re-hashes such a part.
+	Tree *PartTree
+}
+
+// PartTree is the BLAKE3 tree material UploadPart records for one part: the
+// part hashed at the object offset it was assumed to sit at, as blake3tree
+// produces it (a blake3tree.Range, serialized). Complete checks the assumed
+// offset against the true one and, when they agree, merges this into the
+// object's tree without reading the part again.
+type PartTree struct {
+	// Offset is the object byte offset the part was hashed at: the offset
+	// UploadPart assumed from the parts recorded so far, which Complete
+	// checks against the part's true offset.
+	Offset int64
+	// ChunkLog is the block size of Blocks as a base-2 exponent of BLAKE3
+	// chunks.
+	ChunkLog uint8
+	// Nodes holds the aligned subtrees of the part's whole chunks, encoded
+	// with blake3tree.EncodeSubtrees.
+	Nodes []byte
+	// Blocks holds the part's blocks at ChunkLog, encoded with
+	// blake3tree.EncodeSubtrees.
+	Blocks []byte
+	// Head is the part's bytes before its first chunk boundary, under 1 KiB
+	// and empty when the part's offset is a 1 KiB multiple. Complete hashes
+	// the chunk straddling a part boundary from the previous part's Tail and
+	// this part's Head.
+	Head []byte
+	// Tail is the part's bytes after its last chunk boundary, under 1 KiB
+	// and empty when the part ends on one. For the last part it is the
+	// object's final chunk, which Complete hashes.
+	Tail []byte
+	// Root is the part's own BLAKE3 hash, set only when Offset is 0: a
+	// single-part completion takes its digest from here.
+	Root []byte
 }
 
 // BlobRefStore is the reverse reference index (§5, §6). A commit adds a

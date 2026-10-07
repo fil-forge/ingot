@@ -981,6 +981,30 @@ func (t *Body) MarshalCBOR(w io.Writer) error {
 
 	}
 
+	// t.TreeBlocks ([]uint8) (slice)
+	if len("tb") > 1000000 {
+		return xerrors.Errorf("Value in field \"tb\" was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("tb"))); err != nil {
+		return err
+	}
+	if _, err := cw.WriteString(string("tb")); err != nil {
+		return err
+	}
+
+	if len(t.TreeBlocks) > 2097152 {
+		return xerrors.Errorf("Byte array in field t.TreeBlocks was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajByteString, uint64(len(t.TreeBlocks))); err != nil {
+		return err
+	}
+
+	if _, err := cw.Write(t.TreeBlocks); err != nil {
+		return err
+	}
+
 	// t.TreeChunkLog (uint8) (uint8)
 	if len("tc") > 1000000 {
 		return xerrors.Errorf("Value in field \"tc\" was too long")
@@ -996,31 +1020,6 @@ func (t *Body) MarshalCBOR(w io.Writer) error {
 	if err := cw.WriteMajorTypeHeader(cbg.MajUnsignedInt, uint64(t.TreeChunkLog)); err != nil {
 		return err
 	}
-
-	// t.TreeLeaves ([]uint8) (slice)
-	if len("tl") > 1000000 {
-		return xerrors.Errorf("Value in field \"tl\" was too long")
-	}
-
-	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("tl"))); err != nil {
-		return err
-	}
-	if _, err := cw.WriteString(string("tl")); err != nil {
-		return err
-	}
-
-	if len(t.TreeLeaves) > 2097152 {
-		return xerrors.Errorf("Byte array in field t.TreeLeaves was too long")
-	}
-
-	if err := cw.WriteMajorTypeHeader(cbg.MajByteString, uint64(len(t.TreeLeaves))); err != nil {
-		return err
-	}
-
-	if _, err := cw.Write(t.TreeLeaves); err != nil {
-		return err
-	}
-
 	return nil
 }
 
@@ -1317,6 +1316,29 @@ func (t *Body) UnmarshalCBOR(r io.Reader) (err error) {
 
 				}
 			}
+			// t.TreeBlocks ([]uint8) (slice)
+		case "tb":
+
+			maj, extra, err = cr.ReadHeader()
+			if err != nil {
+				return err
+			}
+
+			if extra > 2097152 {
+				return fmt.Errorf("t.TreeBlocks: byte array too large (%d)", extra)
+			}
+			if maj != cbg.MajByteString {
+				return fmt.Errorf("expected byte array")
+			}
+
+			if extra > 0 {
+				t.TreeBlocks = make([]uint8, extra)
+			}
+
+			if _, err := io.ReadFull(cr, t.TreeBlocks); err != nil {
+				return err
+			}
+
 			// t.TreeChunkLog (uint8) (uint8)
 		case "tc":
 
@@ -1331,28 +1353,6 @@ func (t *Body) UnmarshalCBOR(r io.Reader) (err error) {
 				return fmt.Errorf("integer in input was too large for uint8 field")
 			}
 			t.TreeChunkLog = uint8(extra)
-			// t.TreeLeaves ([]uint8) (slice)
-		case "tl":
-
-			maj, extra, err = cr.ReadHeader()
-			if err != nil {
-				return err
-			}
-
-			if extra > 2097152 {
-				return fmt.Errorf("t.TreeLeaves: byte array too large (%d)", extra)
-			}
-			if maj != cbg.MajByteString {
-				return fmt.Errorf("expected byte array")
-			}
-
-			if extra > 0 {
-				t.TreeLeaves = make([]uint8, extra)
-			}
-
-			if _, err := io.ReadFull(cr, t.TreeLeaves); err != nil {
-				return err
-			}
 
 		default:
 			// Field doesn't exist on this type, so ignore it

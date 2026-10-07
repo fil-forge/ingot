@@ -234,9 +234,10 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		CacheReadRetention: cfg.CacheReadRetention,
 		LocalBlobOrphanAge: cfg.LocalBlobOrphanAge,
 
-		MaxBlobSize: cfg.MaxBlobSize,
-		CORS:        cfg.CORSConfig,
-		Logger:      logger,
+		MaxBlobSize:  cfg.MaxBlobSize,
+		RehashBudget: cfg.MultipartRehashBudget,
+		CORS:         cfg.CORSConfig,
+		Logger:       logger,
 	})
 
 	api, err := buildS3API(ctx, backend, cfg, deps.IAM, deps.Identity, logger)

@@ -637,7 +637,7 @@ func TestForgeScenarios(t *testing.T) {
 		if aws.ToInt32(part2.PartsCount) != 3 {
 			t.Fatalf("GET partNumber=2 PartsCount = %d, want 3", aws.ToInt32(part2.PartsCount))
 		}
-		// Part 3 arrived first and was hashed at a guessed offset Complete
+		// Part 3 arrived first and was hashed at an assumed offset Complete
 		// found wrong; the CID must still be the whole body's.
 		if got, want := rawHeader(t, part2.ResultMetadata, "x-cid"), cidOf(t, whole); got != want {
 			t.Fatalf("GET partNumber=2 x-cid = %q, want %q", got, want)

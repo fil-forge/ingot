@@ -22,21 +22,21 @@ func (b Body) CID() (c cid.Cid, ok bool) {
 	return cid.NewCidV1(cid.Raw, b.BLAKE3), true
 }
 
-// TreeLeafCVs decodes TreeLeaves into chaining values.
-func (b Body) TreeLeafCVs() ([]blake3tree.CV, error) {
-	if len(b.TreeLeaves)%blake3tree.CVSize != 0 {
-		return nil, fmt.Errorf("bucket: tree leaves are %d bytes, not a multiple of %d", len(b.TreeLeaves), blake3tree.CVSize)
+// TreeBlockCVs decodes TreeBlocks into chaining values.
+func (b Body) TreeBlockCVs() ([]blake3tree.CV, error) {
+	if len(b.TreeBlocks)%blake3tree.CVSize != 0 {
+		return nil, fmt.Errorf("bucket: tree blocks are %d bytes, not a multiple of %d", len(b.TreeBlocks), blake3tree.CVSize)
 	}
-	leaves := make([]blake3tree.CV, len(b.TreeLeaves)/blake3tree.CVSize)
-	for i := range leaves {
-		copy(leaves[i][:], b.TreeLeaves[i*blake3tree.CVSize:])
+	blocks := make([]blake3tree.CV, len(b.TreeBlocks)/blake3tree.CVSize)
+	for i := range blocks {
+		copy(blocks[i][:], b.TreeBlocks[i*blake3tree.CVSize:])
 	}
-	return leaves, nil
+	return blocks, nil
 }
 
 // bodyHashes are the whole-body digests SplitBody and SplitSizedBody compute
 // in the pass that splits the body: the sha256 content hash, the BLAKE3 tree
-// (digest and leaves), and, unless the caller holds it already, the MD5 the
+// (digest and blocks), and, unless the caller holds it already, the MD5 the
 // ETag is made from. The MD5 runs on its own goroutine (see asyncHash); the
 // other two are fast enough to run inline.
 type bodyHashes struct {
@@ -100,17 +100,17 @@ func (h *bodyHashes) body(total int64, blobs []BlobRef) (Body, error) {
 }
 
 // SetTree records a body's BLAKE3 tree material: the digest as a multihash,
-// the chunk log, and the leaves concatenated.
+// the chunk log, and the blocks concatenated.
 func (b *Body) SetTree(obj blake3tree.Object) error {
 	digest, err := mh.Encode(obj.Root[:], mh.BLAKE3)
 	if err != nil {
 		return fmt.Errorf("encode blake3 multihash: %w", err)
 	}
-	b.BLAKE3, b.TreeChunkLog, b.TreeLeaves = digest, obj.ChunkLog, nil
-	if len(obj.Leaves) > 0 {
-		b.TreeLeaves = make([]byte, 0, len(obj.Leaves)*blake3tree.CVSize)
-		for _, cv := range obj.Leaves {
-			b.TreeLeaves = append(b.TreeLeaves, cv[:]...)
+	b.BLAKE3, b.TreeChunkLog, b.TreeBlocks = digest, obj.ChunkLog, nil
+	if len(obj.Blocks) > 0 {
+		b.TreeBlocks = make([]byte, 0, len(obj.Blocks)*blake3tree.CVSize)
+		for _, cv := range obj.Blocks {
+			b.TreeBlocks = append(b.TreeBlocks, cv[:]...)
 		}
 	}
 	return nil
