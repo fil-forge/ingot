@@ -418,7 +418,7 @@ func (s *Server) startLocalBlobSweeper() {
 				ctx, cancel := context.WithTimeout(s.sweepCtx, 4*time.Minute)
 				ctx, span := tracing.Start(ctx, "sweep.local_blobs")
 				stats, err := s.backend.SweepLocalBlobs(ctx)
-				span.SetAttributes(attribute.Int64("ingot.local_blobs.usage", s.backend.LocalBlobUsage()))
+				span.SetAttributes(attribute.Int64("ingot.sweep.usage_bytes", s.backend.LocalBlobUsage()))
 				s.endSweepSpan(span, err, stats.SpanAttributes()...)
 				cancel()
 				if err != nil && s.sweepCtx.Err() == nil {

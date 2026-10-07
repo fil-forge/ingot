@@ -9,6 +9,7 @@ import (
 
 	"github.com/multiformats/go-multihash"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 
 	"github.com/fil-forge/ingot/blockstore"
@@ -71,12 +72,12 @@ func (s *LocalBlobSweepStats) Add(o LocalBlobSweepStats) {
 // SpanAttributes returns the counts as span attributes.
 func (s LocalBlobSweepStats) SpanAttributes() []attribute.KeyValue {
 	return []attribute.KeyValue{
-		attribute.Int64("ingot.local_blobs.budget_files", s.BudgetFiles),
-		attribute.Int64("ingot.local_blobs.budget_bytes", s.BudgetBytes),
-		attribute.Int64("ingot.local_blobs.forced_files", s.ForcedFiles),
-		attribute.Int64("ingot.local_blobs.forced_bytes", s.ForcedBytes),
-		attribute.Int64("ingot.local_blobs.orphan_files", s.OrphanFiles),
-		attribute.Int64("ingot.local_blobs.orphan_bytes", s.OrphanBytes),
+		attribute.Int64("ingot.sweep.budget_files", s.BudgetFiles),
+		attribute.Int64("ingot.sweep.budget_bytes", s.BudgetBytes),
+		attribute.Int64("ingot.sweep.forced_files", s.ForcedFiles),
+		attribute.Int64("ingot.sweep.forced_bytes", s.ForcedBytes),
+		attribute.Int64("ingot.sweep.orphan_files", s.OrphanFiles),
+		attribute.Int64("ingot.sweep.orphan_bytes", s.OrphanBytes),
 	}
 }
 
@@ -157,7 +158,7 @@ func (b *Backend) SweepLocalBlobs(ctx context.Context) (LocalBlobSweepStats, err
 			err, pass.stop = nil, stopDeadline
 		}
 		span.SetAttributes(pass.spanAttributes()...)
-		tracing.End(span, err)
+		endPassSpan(ctx, span, err)
 		switch {
 		case err != nil:
 			errs = append(errs, fmt.Errorf("s3frontend: local blob budget pass: %w", err))
@@ -188,13 +189,13 @@ func (b *Backend) SweepLocalBlobs(ctx context.Context) (LocalBlobSweepStats, err
 		files, bytes, err := b.removeOrphans(orphanCtx, now)
 		cancel()
 		span.SetAttributes(
-			attribute.Int64("ingot.local_blobs.files", files),
-			attribute.Int64("ingot.local_blobs.bytes", bytes))
+			attribute.Int64("ingot.sweep.files", files),
+			attribute.Int64("ingot.sweep.bytes", bytes))
 		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
 			// The pass's own time limit, logged below, not a failure.
-			tracing.End(span, nil)
+			endPassSpan(ctx, span, nil)
 		} else {
-			tracing.End(span, err)
+			endPassSpan(ctx, span, err)
 		}
 		stats.OrphanFiles, stats.OrphanBytes = files, bytes
 		b.localBlobMetrics.removed(ctx, removedOrphan, files, bytes)
@@ -233,13 +234,23 @@ type budgetPass struct {
 	stop         passStop
 }
 
+// endPassSpan ends a pass's span. Once the sweep's own ctx is done (the
+// daemon is stopping), the pass's error is the cancellation's, so it does not
+// mark the span failed.
+func endPassSpan(ctx context.Context, span trace.Span, err error) {
+	if ctx.Err() != nil {
+		err = nil
+	}
+	tracing.End(span, err)
+}
+
 // spanAttributes returns what the pass did as span attributes.
 func (p budgetPass) spanAttributes() []attribute.KeyValue {
 	return []attribute.KeyValue{
-		attribute.Int64("ingot.local_blobs.files", p.files),
-		attribute.Int64("ingot.local_blobs.bytes", p.bytes),
-		attribute.Int64("ingot.local_blobs.skipped", p.skipped),
-		attribute.String("ingot.local_blobs.stop", p.stop.String()),
+		attribute.Int64("ingot.sweep.files", p.files),
+		attribute.Int64("ingot.sweep.bytes", p.bytes),
+		attribute.Int64("ingot.sweep.skipped", p.skipped),
+		attribute.String("ingot.sweep.stop", p.stop.String()),
 	}
 }
 
@@ -295,9 +306,9 @@ func (b *Backend) forcedPass(ctx context.Context, budgetStop passStop, stats *Lo
 	forcedCtx, span := tracing.Start(forcedCtx, "local_blobs.forced_pass")
 	defer func() {
 		span.SetAttributes(
-			attribute.Int64("ingot.local_blobs.files", stats.ForcedFiles),
-			attribute.Int64("ingot.local_blobs.bytes", stats.ForcedBytes))
-		tracing.End(span, err)
+			attribute.Int64("ingot.sweep.files", stats.ForcedFiles),
+			attribute.Int64("ingot.sweep.bytes", stats.ForcedBytes))
+		endPassSpan(ctx, span, err)
 	}()
 	deadline := time.Now().Add(forcedPassTimeLimit)
 	var last budgetPass

@@ -42,3 +42,31 @@ func TestSweepersRecordRootSpans(t *testing.T) {
 	}
 	require.NotZero(t, sweeps, "no sweep.multipart_sessions spans")
 }
+
+// TestEndSweepSpan: a sweep's error marks its span failed while the server
+// runs, and not once Stop has cancelled the sweeps.
+func TestEndSweepSpan(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		stopping bool
+		want     codes.Code
+	}{
+		{"running", false, codes.Error},
+		{"stopping", true, codes.Unset},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := tracetest.NewSpanRecorder()
+			tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(rec))
+			s := &Server{}
+			s.sweepCtx, s.sweepCancel = context.WithCancel(context.Background())
+			defer s.sweepCancel()
+			if tc.stopping {
+				s.sweepCancel()
+			}
+			_, span := tp.Tracer("test").Start(context.Background(), "sweep.test")
+			s.endSweepSpan(span, context.Canceled)
+			require.Len(t, rec.Ended(), 1)
+			require.Equal(t, tc.want, rec.Ended()[0].Status().Code)
+		})
+	}
+}

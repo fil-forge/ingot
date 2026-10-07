@@ -13,6 +13,7 @@ import (
 	"github.com/fil-forge/versitygw/s3response"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"go.opentelemetry.io/otel/trace"
@@ -228,11 +229,32 @@ func TestSweepLocalBlobsSpans(t *testing.T) {
 
 	budget := tree.one("local_blobs.budget_pass")
 	tree.requireInTrace(budget)
-	requireAttr(t, budget, attribute.Int64("ingot.local_blobs.files", 0))
-	requireAttr(t, budget, attribute.String("ingot.local_blobs.stop", "residency"))
+	requireAttr(t, budget, attribute.Int64("ingot.sweep.files", 0))
+	requireAttr(t, budget, attribute.String("ingot.sweep.stop", "residency"))
 	forced := tree.one("local_blobs.forced_pass")
 	tree.requireInTrace(forced)
-	requireAttr(t, forced, attribute.Int64("ingot.local_blobs.files", 2))
-	requireAttr(t, forced, attribute.Int64("ingot.local_blobs.bytes", 2*size))
+	requireAttr(t, forced, attribute.Int64("ingot.sweep.files", 2))
+	requireAttr(t, forced, attribute.Int64("ingot.sweep.bytes", 2*size))
 	tree.requireInTrace(tree.one("local_blobs.orphan_pass"))
+}
+
+// TestSweepLocalBlobsSpansOnCancel: a sweep whose context is cancelled (the
+// daemon stopping) does not mark its pass spans failed.
+func TestSweepLocalBlobsSpansOnCancel(t *testing.T) {
+	b, _ := newSweepBackend(t)
+	digests := putSweepObjects(t, b, 4)
+	budgetToEvict(b, 2, blobSize(t, b, digests[0]))
+
+	tree := traceOp(t, func(ctx context.Context) {
+		ctx, cancel := context.WithCancel(ctx)
+		cancel()
+		_, _ = b.SweepLocalBlobs(ctx)
+	})
+
+	for _, sp := range tree.spans {
+		if sp.Status().Code == codes.Error {
+			t.Fatalf("span %q marked failed on cancellation: %s", sp.Name(), sp.Status().Description)
+		}
+	}
+	tree.one("local_blobs.orphan_pass")
 }
