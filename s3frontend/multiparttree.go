@@ -13,9 +13,9 @@ import (
 	"github.com/fil-forge/ingot/registry"
 )
 
-// guessPartOffset is the object byte offset UploadPart hashes a part's tree
-// at. The server learns a part's true offset only once every lower-numbered
-// part exists, so:
+// assumedPartOffset is the object byte offset UploadPart hashes a part's
+// tree at. The server learns a part's true offset only once every
+// lower-numbered part exists, so:
 //
 //   - part 1 is at 0;
 //   - when every lower part is recorded, the offset is their sizes' sum
@@ -25,11 +25,12 @@ import (
 //   - otherwise the part's own size does.
 //
 // Clients upload parts of one size in parallel with a shorter final part,
-// so the guess is right for every part of such an upload except a final
-// part that lands before any of its predecessors. Complete checks each
-// guess and re-hashes the parts whose guess was wrong. prior is the
-// session's recorded parts; a part being superseded is ignored.
-func guessPartOffset(prior []registry.MultipartPart, partNumber int, size int64) int64 {
+// so the assumed offset is the true one for every part of such an upload
+// except a final part that lands before any of its predecessors. Complete
+// checks each assumed offset and re-hashes the parts whose assumption was
+// wrong. prior is the session's recorded parts; a part being superseded is
+// ignored.
+func assumedPartOffset(prior []registry.MultipartPart, partNumber int, size int64) int64 {
 	if partNumber == 1 {
 		return 0
 	}
@@ -55,89 +56,79 @@ func guessPartOffset(prior []registry.MultipartPart, partNumber int, size int64)
 	}
 }
 
-// recordPartTree stores a part's finished tree on its record.
-func recordPartTree(p *registry.MultipartPart, rng blake3tree.Range) {
-	p.TreeOffset = rng.Offset
-	p.TreeChunkLog = rng.ChunkLog
-	p.TreeNodes = blake3tree.EncodeSubtrees(rng.Subtrees)
-	p.TreeLeaves = blake3tree.EncodeSubtrees(rng.LeafSubtrees())
-	if rng.HasRoot {
-		p.TreeRoot = append([]byte(nil), rng.Root[:]...)
+// DefaultRehashBudget is the re-read CompleteMultipartUpload allows itself
+// for non-final parts hashed at a wrong assumed offset: 5 GiB, S3's maximum
+// part size. The final part is exempt: in a uniform-size upload it is the
+// only part whose assumption can fail (it lands before any predecessor and
+// its own size stands in), so it is always re-hashed when wrong, bounded by
+// the part maximum. The budget therefore governs only variable-size uploads,
+// and Complete stays within seconds of local reading either way.
+const DefaultRehashBudget = 5 << 30 // 5 GiB
+
+// partTreeOf serializes a part's finished tree for its record.
+func partTreeOf(rng blake3tree.Range) *registry.PartTree {
+	t := &registry.PartTree{
+		Offset:   rng.Offset,
+		ChunkLog: rng.ChunkLog,
+		Nodes:    blake3tree.EncodeSubtrees(rng.Subtrees),
+		Blocks:   blake3tree.EncodeSubtrees(rng.BlockSubtrees()),
+		Head:     append([]byte(nil), rng.Head...),
+		Tail:     append([]byte(nil), rng.Tail...),
 	}
+	if rng.HasRoot {
+		t.Root = append([]byte(nil), rng.Root[:]...)
+	}
+	return t
 }
 
-// recordedPartRange decodes a part's recorded tree as the range it covers.
-func recordedPartRange(p registry.MultipartPart) (blake3tree.Range, error) {
-	subs, err := blake3tree.DecodeSubtrees(p.TreeNodes)
+// treeRange decodes a part's recorded tree as the range it covers; size is
+// the part's length.
+func treeRange(t *registry.PartTree, size int64) (blake3tree.Range, error) {
+	subs, err := blake3tree.DecodeSubtrees(t.Nodes)
 	if err != nil {
-		return blake3tree.Range{}, fmt.Errorf("part %d nodes: %w", p.PartNumber, err)
+		return blake3tree.Range{}, fmt.Errorf("nodes: %w", err)
 	}
-	leafSubs, err := blake3tree.DecodeSubtrees(p.TreeLeaves)
+	leafSubs, err := blake3tree.DecodeSubtrees(t.Blocks)
 	if err != nil {
-		return blake3tree.Range{}, fmt.Errorf("part %d leaves: %w", p.PartNumber, err)
+		return blake3tree.Range{}, fmt.Errorf("blocks: %w", err)
 	}
-	rng := blake3tree.Range{Offset: p.TreeOffset, Size: p.Size, Subtrees: subs, ChunkLog: p.TreeChunkLog}
+	rng := blake3tree.Range{Offset: t.Offset, Size: size, Subtrees: subs, ChunkLog: t.ChunkLog, Head: t.Head, Tail: t.Tail}
 	for _, l := range leafSubs {
-		rng.Leaves = append(rng.Leaves, blake3tree.Leaf{CV: l.CV, Offset: int64(l.Pos) * blake3tree.ChunkSize})
+		rng.Blocks = append(rng.Blocks, blake3tree.Block{CV: l.CV, Offset: int64(l.Pos) * blake3tree.ChunkSize})
 	}
-	if len(p.TreeRoot) == blake3tree.CVSize {
-		copy(rng.Root[:], p.TreeRoot)
+	if len(t.Root) == blake3tree.CVSize {
+		copy(rng.Root[:], t.Root)
 		rng.HasRoot = true
 	}
 	return rng, nil
 }
 
 // multipartTree computes the tree material of a completed multipart body
-// from its parts' records, re-reading only what the records cannot supply.
-// parts are the completed parts in order, offsets their true byte offsets
-// in body, and body the assembled object (its blobs are what a re-hash
-// reads). Should the assembly fail its own consistency check, the whole
-// body is re-hashed, so the result is always right; the records only make
-// it cheap.
-func (b *Backend) multipartTree(ctx context.Context, space did.DID, parts []registry.MultipartPart, offsets []int64, body msbucket.Body) (blake3tree.Object, error) {
-	// One opener serves every re-read of this completion: building it
-	// resolves the encryption parameters and locations of every blob in the
-	// body, which must not repeat per part.
+// from its parts' records, re-reading only the parts whose assumed offset
+// was wrong: the final part whenever it was, the others within the re-hash
+// budget. parts are the completed
+// parts in order, offsets their true byte offsets in body, and body the
+// assembled object (its blobs are what a re-hash reads). ok is false when
+// the body gets no digest: the re-read needed exceeds the budget, or the
+// parts' trees fail the assembly's consistency check. Neither is an error
+// for the completion; the object simply has no x-cid.
+func (b *Backend) multipartTree(ctx context.Context, space did.DID, parts []registry.MultipartPart, offsets []int64, body msbucket.Body) (_ blake3tree.Object, ok bool, err error) {
 	src := &bodySource{b: b, space: space, body: body}
-	ranges, err := b.partRanges(ctx, src, parts, offsets)
-	if err == nil {
-		if obj, ok := blake3tree.Assemble(ranges); ok {
-			return obj, nil
+	var rehash int64
+	for i, p := range parts[:len(parts)-1] {
+		if p.Tree == nil || p.Tree.Offset != offsets[i] {
+			rehash += p.Size
 		}
-		err = fmt.Errorf("the parts' trees do not assemble into one body")
 	}
-	b.logger.Warn("re-hashing multipart object for its tree", zap.Int("parts", len(parts)), zap.Int64("size", body.Size), zap.Error(err))
-	opener, err := src.opener(ctx)
-	if err != nil {
-		return blake3tree.Object{}, err
-	}
-	h, _ := blake3tree.NewHasher(0)
-	rc := msbucket.OpenBody(ctx, opener, space, body)
-	defer rc.Close()
-	if _, err := io.Copy(h, rc); err != nil {
-		return blake3tree.Object{}, fmt.Errorf("re-hash object: %w", err)
-	}
-	return h.FinishObject(), nil
-}
-
-// partRanges returns one range per part, from the part's record when it
-// was hashed at its true offset and re-hashed from its bytes otherwise. A
-// part other than the last whose length is not a whole number of chunks
-// puts a chunk boundary inside the next part, so no record from it onward
-// is usable: the body from that part to its end is re-hashed as one range.
-func (b *Backend) partRanges(ctx context.Context, src *bodySource, parts []registry.MultipartPart, offsets []int64) ([]blake3tree.Range, error) {
-	usable := len(parts)
-	for i := 0; i+1 < len(parts); i++ {
-		if parts[i].Size%blake3tree.ChunkSize != 0 {
-			usable = i
-			break
-		}
+	if rehash > b.rehashBudget {
+		b.logger.Info("multipart object completes without a BLAKE3 digest: re-hash over budget",
+			zap.Int("parts", len(parts)), zap.Int64("size", body.Size), zap.Int64("rehash", rehash), zap.Int64("budget", b.rehashBudget))
+		return blake3tree.Object{}, false, nil
 	}
 	ranges := make([]blake3tree.Range, 0, len(parts))
-	for i := 0; i < usable; i++ {
-		p := parts[i]
-		if len(p.TreeNodes) > 0 && p.TreeOffset == offsets[i] {
-			rng, err := recordedPartRange(p)
+	for i, p := range parts {
+		if p.Tree != nil && p.Tree.Offset == offsets[i] {
+			rng, err := treeRange(p.Tree, p.Size)
 			if err == nil {
 				ranges = append(ranges, rng)
 				continue
@@ -146,18 +137,17 @@ func (b *Backend) partRanges(ctx context.Context, src *bodySource, parts []regis
 		}
 		rng, err := src.rehash(ctx, offsets[i], offsets[i]+p.Size)
 		if err != nil {
-			return nil, err
+			return blake3tree.Object{}, false, err
 		}
 		ranges = append(ranges, rng)
 	}
-	if usable < len(parts) {
-		rng, err := src.rehash(ctx, offsets[usable], src.body.Size)
-		if err != nil {
-			return nil, err
-		}
-		ranges = append(ranges, rng)
+	obj, ok := blake3tree.Assemble(ranges)
+	if !ok {
+		b.logger.Warn("multipart object completes without a BLAKE3 digest: the parts' trees do not assemble into one body",
+			zap.Int("parts", len(parts)), zap.Int64("size", body.Size))
+		return blake3tree.Object{}, false, nil
 	}
-	return ranges, nil
+	return obj, true, nil
 }
 
 // bodySource re-reads a completing body's plaintext for the tree, through

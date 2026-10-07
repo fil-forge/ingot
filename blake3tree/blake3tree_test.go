@@ -15,7 +15,7 @@ import (
 
 // testSizes covers the chunk, buffer and group boundaries: empty, a single
 // block, exact and off-by-one chunks and buffers, a whole number of groups,
-// the leaf cap and one byte past it (the group doubles), and sizes that
+// the block cap and one byte past it (the group doubles), and sizes that
 // leave a short tail at a coarser group.
 var testSizes = []int64{
 	0, 1, 63, 64, 65, 1023, 1024, 1025, 2048, 3000,
@@ -52,15 +52,15 @@ func TestChunkLog(t *testing.T) {
 		{0, 4}, {1, 4}, {16 << 10, 4}, {16<<10 + 1, 5}, {64 << 10, 5}, {1 << 20, 7},
 		{4 << 20, 8}, {4<<20 + 1, 9}, {16 << 20, 9}, {100 << 20, 11}, {1 << 30, 12},
 		{10 << 30, 14}, {100 << 30, 16}, {1 << 40, 17}, {5 << 40, 19},
-		{50_000_000_000_000, 21}, // 50 TB: the cap holds it to 23,283 leaves of 2 GiB
+		{50_000_000_000_000, 21}, // 50 TB (decimal): the cap holds it to 23,284 blocks of 2 GiB
 		{1 << 60, 35},            // past the cap the block grows linearly
 	}
 	for _, c := range cases {
 		if got := ChunkLog(c.size); got != c.want {
 			t.Errorf("ChunkLog(%d) = %d, want %d", c.size, got, c.want)
 		}
-		if n := (c.size + BlockSize(c.want) - 1) / BlockSize(c.want); n > MaxLeaves {
-			t.Errorf("ChunkLog(%d) = %d gives %d leaves", c.size, c.want, n)
+		if n := (c.size + BlockSize(c.want) - 1) / BlockSize(c.want); n > MaxBlocks {
+			t.Errorf("ChunkLog(%d) = %d gives %d blocks", c.size, c.want, n)
 		}
 	}
 	// Monotone, and the block doubles when the size quadruples.
@@ -78,9 +78,9 @@ func TestChunkLog(t *testing.T) {
 }
 
 // TestObject checks a whole body against the reference implementation: the
-// root is the plain BLAKE3 hash, the group is ChunkLog(size), the leaf count
-// is the body's size in groups, the leaves fold back to the root, and each
-// leaf is the chaining value of its block hashed at its offset.
+// root is the plain BLAKE3 hash, the group is ChunkLog(size), the block count
+// is the body's size in groups, the blocks fold back to the root, and each
+// block is the chaining value of its block hashed at its offset.
 func TestObject(t *testing.T) {
 	for _, size := range testSizes {
 		d := data(size)
@@ -101,23 +101,27 @@ func TestObject(t *testing.T) {
 			t.Errorf("size %d: ChunkLog = %d, want %d", size, obj.ChunkLog, want)
 		}
 		block := BlockSize(obj.ChunkLog)
-		if want := (size + block - 1) / block; int64(len(obj.Leaves)) != want {
-			t.Errorf("size %d: %d leaves, want %d", size, len(obj.Leaves), want)
+		if want := (size + block - 1) / block; int64(len(obj.Blocks)) != want {
+			t.Errorf("size %d: %d blocks, want %d", size, len(obj.Blocks), want)
 		}
-		if root, ok := RootFromLeaves(obj.Leaves); ok != (len(obj.Leaves) >= 2) {
-			t.Errorf("size %d: RootFromLeaves ok = %v with %d leaves", size, ok, len(obj.Leaves))
+		if root, ok := RootFromBlocks(obj.Blocks); ok != (len(obj.Blocks) >= 2) {
+			t.Errorf("size %d: RootFromBlocks ok = %v with %d blocks", size, ok, len(obj.Blocks))
 		} else if ok && root != obj.Root {
-			t.Errorf("size %d: leaves do not fold to the root", size)
+			t.Errorf("size %d: blocks do not fold to the root", size)
 		}
-		for i, leaf := range obj.Leaves {
+		for i, want := range obj.Blocks {
 			off := int64(i) * block
 			rh, _ := NewHasher(off)
 			rh.Write(d[off:min(off+block, size)])
 			rng := rh.FinishRange()
-			// A full block is one aligned subtree; the short tail is the
-			// merge of several.
-			if cv, ok := MergeSubtrees(rng.Subtrees); !ok || cv != leaf {
-				t.Errorf("size %d: leaf %d is not the CV of its block (%d subtrees)", size, i, len(rng.Subtrees))
+			// A full block is one aligned subtree; the short tail block is
+			// the merge of its whole chunks and its tail chunk.
+			subs := rng.Subtrees
+			if tail, ok := rng.TailChunk(); ok {
+				subs = append(subs, tail)
+			}
+			if cv, ok := MergeSubtrees(subs); !ok || cv != want {
+				t.Errorf("size %d: block %d has a wrong CV (%d subtrees)", size, i, len(subs))
 			}
 			if off+block <= size && len(rng.Subtrees) != 1 {
 				t.Errorf("size %d: full block %d hashed as %d subtrees", size, i, len(rng.Subtrees))
@@ -128,7 +132,7 @@ func TestObject(t *testing.T) {
 
 // TestRanges cuts a body at chunk boundaries into ranges hashed at their
 // offsets and checks that their subtrees merge to the body's root, and that
-// the leaves wholly inside a range are the body's leaves for those blocks.
+// the blocks wholly inside a range are the body's blocks for those blocks.
 func TestRanges(t *testing.T) {
 	for _, size := range testSizes {
 		if size < 2*ChunkSize {
@@ -147,7 +151,7 @@ func TestRanges(t *testing.T) {
 		}
 		cuts = append(cuts, size)
 
-		var subs []Subtree
+		var ranges []Range
 		for i := 0; i+1 < len(cuts); i++ {
 			start, end := cuts[i], cuts[i+1]
 			h, err := NewHasher(start)
@@ -159,40 +163,32 @@ func TestRanges(t *testing.T) {
 			if rng.Offset != start || rng.Size != end-start {
 				t.Fatalf("size %d: range [%d,%d) reports offset %d size %d", size, start, end, rng.Offset, rng.Size)
 			}
-			subs = append(subs, rng.Subtrees...)
+			ranges = append(ranges, rng)
 
 			if rng.ChunkLog != ChunkLog(rng.Size) {
 				t.Errorf("size %d: range [%d,%d) chunk log %d, want ChunkLog(size) %d", size, start, end, rng.ChunkLog, ChunkLog(rng.Size))
 			}
-			// A range leaf is a block wholly inside the range (or the body's
-			// short tail block), aligned to the range's block, and when the
-			// range's block is the body's it is the body's leaf for that block.
+			// A range block is a block wholly inside the range, aligned to the
+			// range's block, and when the range's block is the body's it is
+			// the body's block for that block.
 			group := BlockSize(rng.ChunkLog)
-			for _, leaf := range rng.Leaves {
-				if leaf.Offset%group != 0 || leaf.Offset < start || (leaf.Offset+group > end && end != size) {
-					t.Errorf("size %d: range [%d,%d) leaf at %d is not an aligned block inside it", size, start, end, leaf.Offset)
+			for _, bl := range rng.Blocks {
+				if bl.Offset%group != 0 || bl.Offset < start || bl.Offset+group > end {
+					t.Errorf("size %d: range [%d,%d) block at %d is not an aligned block inside it", size, start, end, bl.Offset)
 				}
-				if rng.ChunkLog == obj.ChunkLog && obj.Leaves[leaf.Offset/group] != leaf.CV {
-					t.Errorf("size %d: range [%d,%d) leaf at %d differs from the body's", size, start, end, leaf.Offset)
+				if rng.ChunkLog == obj.ChunkLog && obj.Blocks[bl.Offset/group] != bl.CV {
+					t.Errorf("size %d: range [%d,%d) block at %d differs from the body's", size, start, end, bl.Offset)
 				}
 			}
 		}
-		root, ok := RootFromSubtrees(subs)
-		if !ok {
-			// A body hashed as one range that is a single subtree cannot
-			// be finished from its chaining value; anything else can.
-			if len(subs) != 1 {
-				t.Fatalf("size %d: RootFromSubtrees not ok (%d subtrees)", size, len(subs))
-			}
-			continue
-		}
-		if root != obj.Root {
-			t.Errorf("size %d: %d ranges' subtrees do not merge to the root", size, len(cuts)-1)
+		got, ok := Assemble(ranges)
+		if !ok || got.Root != obj.Root {
+			t.Errorf("size %d: %d ranges do not assemble to the root (ok %v)", size, len(ranges), ok)
 		}
 	}
 }
 
-// TestRangeLeafCap checks a range large enough to promote its leaves several
+// TestRangeLeafCap checks a range large enough to promote its blocks several
 // times, with an unaligned start so leading and trailing fragments are
 // dropped rather than paired.
 func TestRangeLeafCap(t *testing.T) {
@@ -202,23 +198,24 @@ func TestRangeLeafCap(t *testing.T) {
 	h, _ := NewHasher(start)
 	writeIn(t, h, d[start:], 7)
 	rng := h.FinishRange()
-	if len(rng.Leaves) > MaxLeaves {
-		t.Fatalf("%d leaves exceed the cap", len(rng.Leaves))
+	if len(rng.Blocks) > MaxBlocks {
+		t.Fatalf("%d blocks exceed the cap", len(rng.Blocks))
 	}
 	if rng.ChunkLog != ChunkLog(rng.Size) || rng.ChunkLog < MinChunkLog+1 {
 		t.Fatalf("chunk log %d, want %d", rng.ChunkLog, ChunkLog(rng.Size))
 	}
 	group := BlockSize(rng.ChunkLog)
-	for _, leaf := range rng.Leaves {
-		rh, _ := NewHasher(leaf.Offset)
-		rh.Write(d[leaf.Offset : leaf.Offset+group])
-		if sub := rh.FinishRange().Subtrees; len(sub) != 1 || sub[0].CV != leaf.CV {
-			t.Errorf("leaf at %d is not the CV of its block", leaf.Offset)
+	for _, bl := range rng.Blocks {
+		rh, _ := NewHasher(bl.Offset)
+		rh.Write(d[bl.Offset : bl.Offset+group])
+		if sub := rh.FinishRange().Subtrees; len(sub) != 1 || sub[0].CV != bl.CV {
+			t.Errorf("block at %d has a wrong CV", bl.Offset)
 		}
 	}
-	// The first and last blocks are only partly covered and so are not leaves.
-	if rng.Leaves[0].Offset < group || rng.Leaves[len(rng.Leaves)-1].Offset+group > size {
-		t.Errorf("a partly covered block was recorded as a leaf")
+	// The first and last blocks are only partly covered and so are not
+	// recorded.
+	if rng.Blocks[0].Offset < group || rng.Blocks[len(rng.Blocks)-1].Offset+group > size {
+		t.Errorf("a partly covered block was recorded")
 	}
 }
 
@@ -265,6 +262,21 @@ func TestAssemble(t *testing.T) {
 				random = append(random, pos)
 			}
 			cutSets = append(cutSets, random)
+			// Cuts inside chunks: random, and uniform parts of a size that is
+			// not a chunk multiple, which is what the AWS SDK for Go produces
+			// above its part limit.
+			var odd []int64
+			for pos := int64(1 + r.Intn(ChunkSize)); pos < size; pos += int64(ChunkSize + 1 + r.Intn(int(size/3))) {
+				odd = append(odd, pos)
+			}
+			cutSets = append(cutSets, odd)
+			if part := int64(5*ChunkSize + 37); size > part {
+				var uniform []int64
+				for pos := part; pos < size; pos += part {
+					uniform = append(uniform, pos)
+				}
+				cutSets = append(cutSets, uniform)
+			}
 			// Uniform parts of a size that is not a power of two, so blocks
 			// at the body's block size straddle part boundaries.
 			if part := int64(5 * ChunkSize); size > part {
@@ -300,13 +312,13 @@ func TestAssemble(t *testing.T) {
 			if got.Root != want.Root || got.ChunkLog != want.ChunkLog || got.Size != want.Size {
 				t.Errorf("size %d, %d ranges: root/chunk log/size differ", size, len(ranges))
 			}
-			if len(got.Leaves) != len(want.Leaves) {
-				t.Errorf("size %d, %d ranges: %d leaves, want %d", size, len(ranges), len(got.Leaves), len(want.Leaves))
+			if len(got.Blocks) != len(want.Blocks) {
+				t.Errorf("size %d, %d ranges: %d blocks, want %d", size, len(ranges), len(got.Blocks), len(want.Blocks))
 				continue
 			}
-			for i := range got.Leaves {
-				if got.Leaves[i] != want.Leaves[i] {
-					t.Errorf("size %d, %d ranges: leaf %d differs", size, len(ranges), i)
+			for i := range got.Blocks {
+				if got.Blocks[i] != want.Blocks[i] {
+					t.Errorf("size %d, %d ranges: block %d differs", size, len(ranges), i)
 					break
 				}
 			}
@@ -326,7 +338,7 @@ func TestAssembleRejects(t *testing.T) {
 		t.Error("list not starting at 0 accepted")
 	}
 	// The second range's bytes hashed as if at offset 0: wrong chunk
-	// indices, so the leaves do not fold to the root.
+	// indices, so the blocks do not fold to the root.
 	wrong, _ := NewHasher(0)
 	wrong.Write(d[16*ChunkSize:])
 	bad := wrong.FinishRange()
@@ -337,29 +349,64 @@ func TestAssembleRejects(t *testing.T) {
 	if _, err := DecodeSubtrees(make([]byte, subtreeEncSize+1)); err == nil {
 		t.Error("partial subtree record decoded")
 	}
+	// Head and tail bytes at a boundary must make exactly one chunk.
+	odd := cutRanges(t, d, []int64{16*ChunkSize + 100})
+	odd[1].Head = odd[1].Head[:50]
+	if _, ok := Assemble(odd); ok {
+		t.Error("boundary bytes short of a chunk accepted")
+	}
+	if first := cutRanges(t, d, []int64{100}); true {
+		first[0].Head = []byte{1}
+		if _, ok := Assemble(first); ok {
+			t.Error("a first range with head bytes accepted")
+		}
+	}
 }
 
-func TestNewHasherRejectsUnalignedOffset(t *testing.T) {
-	if _, err := NewHasher(ChunkSize + 1); err == nil {
-		t.Fatal("expected an error")
-	}
+// TestHasherOffsets covers offsets inside a chunk: the bytes up to the next
+// boundary are the head, the chunks after it are hashed at their indices,
+// a short end is the tail, and a negative offset is refused.
+func TestHasherOffsets(t *testing.T) {
 	if _, err := NewHasher(-ChunkSize); err == nil {
-		t.Fatal("expected an error")
+		t.Fatal("negative offset accepted")
+	}
+	d := data(10*ChunkSize + 700)
+	h, _ := NewHasher(1500)
+	writeIn(t, h, d[1500:], 3)
+	rng := h.FinishRange()
+	if rng.Offset != 1500 || rng.Size != int64(len(d))-1500 {
+		t.Fatalf("range reports offset %d size %d", rng.Offset, rng.Size)
+	}
+	if want := d[1500:2048]; !bytes.Equal(rng.Head, want) {
+		t.Fatalf("head is %d bytes, want %d", len(rng.Head), len(want))
+	}
+	if want := d[10*ChunkSize:]; !bytes.Equal(rng.Tail, want) {
+		t.Fatalf("tail is %d bytes, want %d", len(rng.Tail), len(want))
+	}
+	if rng.Subtrees[0].Pos != 2 || rng.HasRoot {
+		t.Fatalf("first subtree at chunk %d, root %v", rng.Subtrees[0].Pos, rng.HasRoot)
+	}
+	// A range starting at an aligned offset has no head, and one ending on
+	// a boundary has no tail.
+	h, _ = NewHasher(2 * ChunkSize)
+	h.Write(d[2*ChunkSize : 5*ChunkSize])
+	if rng := h.FinishRange(); len(rng.Head) != 0 || len(rng.Tail) != 0 || len(rng.Subtrees) == 0 {
+		t.Fatalf("aligned range: head %d tail %d subtrees %d", len(rng.Head), len(rng.Tail), len(rng.Subtrees))
 	}
 }
 
 func TestParentCV(t *testing.T) {
 	// Two chunks: the root is the root-flagged parent of their CVs, and
-	// RootFromLeaves over the two chunk CVs must agree with the reference.
+	// RootFromBlocks over the two chunk CVs must agree with the reference.
 	d := data(2 * ChunkSize)
 	l, _ := NewHasher(0)
 	l.Write(d[:ChunkSize])
 	r, _ := NewHasher(ChunkSize)
 	r.Write(d[ChunkSize:])
 	lc, rc := l.FinishRange().Subtrees[0].CV, r.FinishRange().Subtrees[0].CV
-	root, ok := RootFromLeaves([]CV{lc, rc})
+	root, ok := RootFromBlocks([]CV{lc, rc})
 	if !ok || root != blake3.Sum256(d) {
-		t.Fatal("RootFromLeaves over two chunks disagrees with the reference")
+		t.Fatal("RootFromBlocks over two chunks disagrees with the reference")
 	}
 	if ParentCV(lc, rc) == root {
 		t.Fatal("a non-root parent must differ from the root")
@@ -378,7 +425,7 @@ func TestOutboard(t *testing.T) {
 		h, _ := NewHasher(0)
 		h.Write(d)
 		obj := h.FinishObject()
-		got := Outboard(obj.Leaves, size)
+		got := Outboard(obj.Blocks, size)
 
 		group := int(obj.ChunkLog)
 		want, root := bao.EncodeBuf(d, group, true)
@@ -396,7 +443,7 @@ func TestOutboard(t *testing.T) {
 				t.Errorf("size %d: block at %d not verified by the Bao library", size, off)
 			}
 		}
-		if size > 0 && len(obj.Leaves) > 1 {
+		if size > 0 && len(obj.Blocks) > 1 {
 			bad := bytes.Clone(d[:groupSize])
 			bad[0] ^= 1
 			if bao.VerifyChunk(bad, got, group, 0, root) {
@@ -416,7 +463,7 @@ func TestVerifyBlocks(t *testing.T) {
 	h, _ := NewHasher(0)
 	h.Write(d)
 	obj := h.FinishObject()
-	outboard := Outboard(obj.Leaves, size)
+	outboard := Outboard(obj.Blocks, size)
 	block := BlockSize(obj.ChunkLog)
 	if size/block != 2 || size%block == 0 {
 		t.Fatalf("test assumes 2 full blocks and a short tail, got block %d", block)
@@ -487,13 +534,13 @@ func TestOutboardLeaves(t *testing.T) {
 	h, _ := NewHasher(0)
 	h.Write(d)
 	obj := h.FinishObject()
-	outboard := Outboard(obj.Leaves, size)
+	outboard := Outboard(obj.Blocks, size)
 
-	if n, err := OutboardLeaves(outboard, obj.ChunkLog); err != nil || n != int64(len(obj.Leaves)) {
-		t.Fatalf("OutboardLeaves = %d, %v; want %d", n, err, len(obj.Leaves))
+	if n, err := OutboardBlocks(outboard, obj.ChunkLog); err != nil || n != int64(len(obj.Blocks)) {
+		t.Fatalf("OutboardBlocks = %d, %v; want %d", n, err, len(obj.Blocks))
 	}
 	for _, g := range []uint8{obj.ChunkLog - 1, obj.ChunkLog + 1, MaxChunkLog + 1, 63, 64, 200} {
-		if _, err := OutboardLeaves(outboard, g); err == nil {
+		if _, err := OutboardBlocks(outboard, g); err == nil {
 			t.Errorf("chunk log %d accepted for an outboard at chunk log %d", g, obj.ChunkLog)
 		}
 		if _, err := VerifyBlocks(bytes.NewReader(d), outboard, g, 0, obj.Root); err == nil {
@@ -505,19 +552,19 @@ func TestOutboardLeaves(t *testing.T) {
 			t.Errorf("AlignedRange accepted group %d", g)
 		}
 	}
-	// A one-leaf body has an empty outboard at any block that holds it, and
+	// A one-block body has an empty outboard at any block that holds it, and
 	// a zero-length body in none.
 	small := Outboard([]CV{{1}}, 100)
-	if n, err := OutboardLeaves(small, MinChunkLog); err != nil || n != 1 {
-		t.Fatalf("one leaf: %d, %v", n, err)
+	if n, err := OutboardBlocks(small, MinChunkLog); err != nil || n != 1 {
+		t.Fatalf("one block: %d, %v", n, err)
 	}
-	if n, err := OutboardLeaves(Outboard(nil, 0), MinChunkLog); err != nil || n != 0 {
+	if n, err := OutboardBlocks(Outboard(nil, 0), MinChunkLog); err != nil || n != 0 {
 		t.Fatalf("empty body: %d, %v", n, err)
 	}
 }
 
 // TestHasherAtChunkLog checks a body hashed at a caller-chosen block size:
-// the root is unchanged, the leaves are one per block at that size, and the
+// the root is unchanged, the blocks are one per block at that size, and the
 // outboard equals the Bao library's at the same block size, from the
 // original Bao chunk (chunk log 0) and iroh's block (4) up past the body's
 // own.
@@ -537,11 +584,11 @@ func TestHasherAtChunkLog(t *testing.T) {
 				t.Fatalf("size %d chunk log %d: root or chunk log wrong", size, g)
 			}
 			block := BlockSize(g)
-			if n := (size + block - 1) / block; int64(len(obj.Leaves)) != n {
-				t.Fatalf("size %d chunk log %d: %d leaves, want %d", size, g, len(obj.Leaves), n)
+			if n := (size + block - 1) / block; int64(len(obj.Blocks)) != n {
+				t.Fatalf("size %d chunk log %d: %d blocks, want %d", size, g, len(obj.Blocks), n)
 			}
 			ob, root := bao.EncodeBuf(d, int(g), true)
-			if got := Outboard(obj.Leaves, size); !bytes.Equal(got, ob) || root != want {
+			if got := Outboard(obj.Blocks, size); !bytes.Equal(got, ob) || root != want {
 				t.Fatalf("size %d chunk log %d: outboard differs from the Bao library's", size, g)
 			}
 		}
@@ -555,7 +602,7 @@ func TestHasherAtChunkLog(t *testing.T) {
 // malformed values a caller may supply: sizes near the int64 limit, a huge
 // chunk log over a small body, negative offsets, and empty input.
 func TestHostileClientInputs(t *testing.T) {
-	// ChunkLog terminates for any size, and keeps the body within the leaf
+	// ChunkLog terminates for any size, and keeps the body within the block
 	// cap: 2^62 bytes is exactly 32,768 blocks of 2^47, one byte more needs
 	// the next block size, and the largest int64 body still fits.
 	for _, c := range []struct {
@@ -565,19 +612,19 @@ func TestHostileClientInputs(t *testing.T) {
 		if g := ChunkLog(c.size); g != c.want {
 			t.Errorf("ChunkLog(%d) = %d, want %d", c.size, g, c.want)
 		}
-		if n := blocksIn(c.size, c.want); n > MaxLeaves {
-			t.Errorf("ChunkLog(%d) = %d gives %d leaves", c.size, c.want, n)
+		if n := blocksIn(c.size, c.want); n > MaxBlocks {
+			t.Errorf("ChunkLog(%d) = %d gives %d blocks", c.size, c.want, n)
 		}
 	}
 	// An outboard claiming a body near the int64 limit: at chunk log 52 it
-	// has two leaves, so one parent entry is required and none is wrong.
+	// has two blocks, so one parent entry is required and none is wrong.
 	huge := make([]byte, 8)
 	binary.LittleEndian.PutUint64(huge, math.MaxInt64)
-	if _, err := OutboardLeaves(huge, MaxChunkLog); err == nil {
-		t.Error("an outboard with no parents accepted for a two-leaf body")
+	if _, err := OutboardBlocks(huge, MaxChunkLog); err == nil {
+		t.Error("an outboard with no parents accepted for a two-block body")
 	}
-	if n, err := OutboardLeaves(append(huge, make([]byte, 64)...), MaxChunkLog); err != nil || n != 2 {
-		t.Errorf("two-leaf body near the limit: %d, %v", n, err)
+	if n, err := OutboardBlocks(append(huge, make([]byte, 64)...), MaxChunkLog); err != nil || n != 2 {
+		t.Errorf("two-block body near the limit: %d, %v", n, err)
 	}
 	if start, end, err := AlignedRange(math.MaxInt64-10, math.MaxInt64-1, MaxChunkLog, math.MaxInt64); err != nil || start != 1<<62 || end != math.MaxInt64-1 {
 		t.Errorf("AlignedRange near the limit: %d-%d, %v", start, end, err)
@@ -588,11 +635,11 @@ func TestHostileClientInputs(t *testing.T) {
 	h, _ := NewHasherAtChunkLog(0, MinChunkLog)
 	h.Write(whole)
 	obj := h.FinishObject()
-	if _, err := VerifyBlocks(bytes.NewReader(append(bytes.Clone(whole), 1)), Outboard(obj.Leaves, obj.Size), MinChunkLog, 0, obj.Root); err == nil {
+	if _, err := VerifyBlocks(bytes.NewReader(append(bytes.Clone(whole), 1)), Outboard(obj.Blocks, obj.Size), MinChunkLog, 0, obj.Root); err == nil {
 		t.Error("a byte past a whole last block accepted")
 	}
 
-	// A small body at a huge chunk log: one leaf, an empty outboard, and the
+	// A small body at a huge chunk log: one block, an empty outboard, and the
 	// verifier must buffer the body, not the block.
 	d := data(100)
 	root := blake3.Sum256(d)
@@ -629,7 +676,7 @@ func TestHostileClientInputs(t *testing.T) {
 	if _, err := VerifyBlocks(bytes.NewReader(nil), small, MaxChunkLog, 0, root); err == nil {
 		t.Error("empty input accepted for a 100-byte body")
 	}
-	tail := Outboard(obj.Leaves, obj.Size)
+	tail := Outboard(obj.Blocks, obj.Size)
 	if _, err := VerifyBlocks(bytes.NewReader(nil), tail, MinChunkLog, obj.Size, obj.Root); err == nil {
 		t.Error("a request at the end of a non-empty body accepted")
 	}

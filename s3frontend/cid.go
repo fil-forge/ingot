@@ -41,7 +41,7 @@ func setCIDHeader(ctx context.Context, body msbucket.Body) {
 // blake3Attribute is the Blake3 object attribute GetObjectAttributes returns
 // when asked for it: the body's CID, the chunk log (the Bao block size as a
 // base-2 exponent of chunks) and the Bao outboard built from the stored
-// leaves, in base64. A client
+// blocks, in base64. A client
 // loads the three into a Bao library and verifies any block-aligned range
 // of the body. Nil for a body written before the digest was recorded, which
 // omits the element.
@@ -50,14 +50,14 @@ func blake3Attribute(body msbucket.Body) *s3response.Blake3Tree {
 	if !ok {
 		return nil
 	}
-	leaves, err := body.TreeLeafCVs()
+	blocks, err := body.TreeBlockCVs()
 	if err != nil {
 		return nil
 	}
 	return &s3response.Blake3Tree{
 		CID:      c.String(),
 		ChunkLog: body.TreeChunkLog,
-		Outboard: base64.StdEncoding.EncodeToString(blake3tree.Outboard(leaves, body.Size)),
+		Outboard: base64.StdEncoding.EncodeToString(blake3tree.Outboard(blocks, body.Size)),
 	}
 }
 

@@ -42,7 +42,7 @@ func TestBlake3Commands(t *testing.T) {
 	want := cid.NewCidV1(cid.Raw, digest).String()
 	block := blake3tree.BlockSize(obj.ChunkLog)
 	chunkLog := itoa(int64(obj.ChunkLog))
-	outboardB64 := base64.StdEncoding.EncodeToString(blake3tree.Outboard(obj.Leaves, size))
+	outboardB64 := base64.StdEncoding.EncodeToString(blake3tree.Outboard(obj.Blocks, size))
 	ob := filepath.Join(t.TempDir(), "ob.b64")
 	if err := os.WriteFile(ob, []byte(outboardB64+"\n"), 0o644); err != nil {
 		t.Fatal(err)
