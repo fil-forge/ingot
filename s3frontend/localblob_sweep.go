@@ -211,10 +211,11 @@ func (b *Backend) SweepLocalBlobs(ctx context.Context) (LocalBlobSweepStats, err
 	}
 	// The stalled_bytes gauge reads this sum, so the metric callback never
 	// queries the registry.
-	if n, err := b.intents.StalledBytes(ctx, now.Add(-stalledUploadAge)); err != nil {
+	if s, err := b.intents.StalledBytes(ctx, now.Add(-stalledUploadAge)); err != nil {
 		errs = append(errs, fmt.Errorf("s3frontend: sum stalled uploads: %w", err))
 	} else {
-		b.stalledBytes.Store(n)
+		b.stalledSpooled.Store(s.Spooled)
+		b.stalledUploading.Store(s.Uploading)
 		b.stalledKnown.Store(true)
 	}
 	return stats, errors.Join(errs...)

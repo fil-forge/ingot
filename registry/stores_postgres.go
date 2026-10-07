@@ -478,20 +478,22 @@ func (r *Postgres) DeleteReleasedPublished(ctx context.Context, digest multihash
 	return tag.RowsAffected() > 0, nil
 }
 
-func (r *Postgres) StalledBytes(ctx context.Context, before time.Time) (int64, error) {
+func (r *Postgres) StalledBytes(ctx context.Context, before time.Time) (StalledSizes, error) {
 	// The state literals match the partial index upload_intents_stalled_idx
-	// (migration 00021), as for ListEvictable.
-	var n int64
+	// (migrations 00021 and 00023), as for ListEvictable; the index carries
+	// size and state, so the sums come from it alone.
+	var s StalledSizes
 	err := r.pool.QueryRow(ctx,
-		`SELECT COALESCE(sum(size), 0)::bigint
+		`SELECT COALESCE(sum(size) FILTER (WHERE state = 'spooled'), 0)::bigint,
+		        COALESCE(sum(size) FILTER (WHERE state = 'uploading'), 0)::bigint
 		   FROM ingot.upload_intents
 		  WHERE state IN ('spooled', 'uploading')
 		    AND updated_at < $1`,
-		before).Scan(&n)
+		before).Scan(&s.Spooled, &s.Uploading)
 	if err != nil {
-		return 0, fmt.Errorf("registry: sum stalled intents: %w", err)
+		return StalledSizes{}, fmt.Errorf("registry: sum stalled intents: %w", err)
 	}
-	return n, nil
+	return s, nil
 }
 
 func (r *Postgres) MissingIntents(ctx context.Context, digests []multihash.Multihash) ([]multihash.Multihash, error) {

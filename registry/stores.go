@@ -91,6 +91,13 @@ type UploadIntent struct {
 	UpdatedAt time.Time
 }
 
+// StalledSizes is StalledBytes's sum for each state a stalled upload can be
+// left in: Spooled, a body that never left this node; Uploading, one whose
+// upload started and may have reached its provider.
+type StalledSizes struct {
+	Spooled, Uploading int64
+}
+
 // EvictCursor is a position in ListEvictable's (updated_at, digest) order.
 // The zero value starts at the beginning.
 type EvictCursor struct {
@@ -362,9 +369,9 @@ type IntentStore interface {
 	// so that should not happen; this keeps the pass safe if it ever does.)
 	DeleteReleasedPublished(ctx context.Context, digest multihash.Multihash) (bool, error)
 	// StalledBytes sums the sizes of 'spooled' and 'uploading' intents whose
-	// state last changed before before: bodies whose upload has outlasted
-	// any live request, which nothing reclaims.
-	StalledBytes(ctx context.Context, before time.Time) (int64, error)
+	// state last changed before before, by state: bodies whose upload has
+	// outlasted any live request, which nothing reclaims.
+	StalledBytes(ctx context.Context, before time.Time) (StalledSizes, error)
 }
 
 // LocationStore is the local blob-location table (§8, appliance topology):
