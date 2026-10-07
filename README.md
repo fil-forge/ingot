@@ -210,9 +210,10 @@ deleted by a version of ingot that kept them.
   until the provider holds it, so if the spool alone exceeds the budget,
   usage runs over it by the difference;
 - the bodies of uploads that failed: their upload intents stay `spooled` or
-  `uploading`, nothing reclaims those spool files yet, and they count against
-  the budget until removed by hand. `ingot.local_blobs.stalled_bytes` reports
-  how much they hold;
+  `uploading`, and nothing reclaims those spool files yet, so they stay and
+  count against the budget. They are not safe to delete by hand (see *Manual
+  cleanup* below), so size the budget with headroom for them.
+  `ingot.local_blobs.stalled_bytes` reports how much they hold;
 - the catalog log, if it shares the filesystem: `<data_dir>/segments`, per
   bucket about (`retain` + the open and unshipped segments) × `seal_bytes`.
 
