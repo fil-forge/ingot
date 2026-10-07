@@ -49,9 +49,11 @@ func TestChunkLog(t *testing.T) {
 		size int64
 		want uint8
 	}{
-		{0, 4}, {1, 4}, {16 << 10, 4}, {16<<10 + 1, 5}, {64 << 10, 5}, {1 << 20, 7},
-		{4 << 20, 8}, {4<<20 + 1, 9}, {16 << 20, 9}, {100 << 20, 11}, {1 << 30, 12},
-		{10 << 30, 14}, {100 << 30, 16}, {1 << 40, 17}, {5 << 40, 19},
+		{0, 4}, {1, 4}, {16 << 10, 4}, {16<<10 + 1, 4}, {64 << 10, 4}, {1 << 20, 4},
+		{4 << 20, 4}, {8 << 20, 4}, {8<<20 + 1, 5}, {16 << 20, 5}, {100 << 20, 6},
+		{1 << 30, 8}, {5 << 30, 9}, {10 << 30, 10},
+		{32 << 30, 10}, {32<<30 + 1, 11}, // the cap binds from 32 GiB: 32,768 blocks of 1 MiB
+		{100 << 30, 12}, {1 << 40, 15}, {5 << 40, 18},
 		{50_000_000_000_000, 21}, // 50 TB (decimal): the cap holds it to 23,284 blocks of 2 GiB
 		{1 << 60, 35},            // past the cap the block grows linearly
 	}
@@ -67,13 +69,16 @@ func TestChunkLog(t *testing.T) {
 	prev := uint8(0)
 	for size := int64(1); size < 1<<50; size *= 2 {
 		if g := ChunkLog(size); g < prev {
-			t.Fatalf("ChunkLog(%d) = %d below GroupLog of a smaller size %d", size, g, prev)
+			t.Fatalf("ChunkLog(%d) = %d below ChunkLog of a smaller size %d", size, g, prev)
 		} else {
 			prev = g
 		}
 	}
-	if ChunkLog(1<<32) != ChunkLog(1<<30)+1 || ChunkLog(1<<34) != ChunkLog(1<<30)+2 {
+	if ChunkLog(1<<28) != ChunkLog(1<<26)+1 || ChunkLog(1<<30) != ChunkLog(1<<26)+2 {
 		t.Fatal("the block should double with each quadrupling of the size")
+	}
+	if ChunkLog(1<<36) != ChunkLog(1<<35)+1 || ChunkLog(1<<37) != ChunkLog(1<<35)+2 {
+		t.Fatal("past the cap the block should double with each doubling of the size")
 	}
 }
 
@@ -458,7 +463,7 @@ func TestOutboard(t *testing.T) {
 // after the good blocks before it; unaligned, short or overlong input is
 // refused before any verification; and a wrong root fails the first block.
 func TestVerifyBlocks(t *testing.T) {
-	const size = 300_000 // three 128 KiB blocks under the square-root rule, the last short
+	const size = 40_000 // three 16 KiB blocks, the last short
 	d := data(size)
 	h, _ := NewHasher(0)
 	h.Write(d)

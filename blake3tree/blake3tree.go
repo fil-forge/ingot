@@ -33,15 +33,14 @@ const (
 	CVSize = 32
 
 	// MinChunkLog is the smallest block (block size) the tree is recorded
-	// at, as a base-2 exponent of chunks: 2^4 chunks, 16 KiB. It is also the
-	// unit the block scales from: the block is the geometric mean of the
-	// body's size and this, so the block count grows with the square root of
-	// the size (see ChunkLog).
+	// at, as a base-2 exponent of chunks: 2^4 chunks, 16 KiB. Bodies up to
+	// 8 MiB are recorded at this block; above it the block grows with the
+	// square root of the size (see ChunkLog).
 	MinChunkLog = 4
 
 	// MaxBlocks is the hard cap on the blocks recorded for one body, 1 MiB
-	// of chaining values. The square-root rule reaches it only past about
-	// 32 TB; from there the block grows linearly with the size instead.
+	// of chaining values. The square-root rule reaches it at 32 GiB; from
+	// there the block grows linearly with the size instead.
 	MaxBlocks = 32768
 
 	// MaxChunkLog is the largest chunk log whose block size is a positive
@@ -58,19 +57,22 @@ type CV [CVSize]byte
 
 // ChunkLog returns the block size for a body of size bytes, as a base-2
 // exponent of chunks, the unit Bao libraries take: the smallest power of
-// two, at least 2^MinChunkLog chunks, whose byte size is at least the
-// geometric mean of the body's size and 16 KiB, so the body has about
-// sqrt(size / 16 KiB) blocks. The block doubles each time the size
-// quadruples: a 4 MiB body has 16 blocks of 256 KiB (chunk log 8), a 1 GiB
-// body 256 blocks of 4 MiB (12), a 1 TiB body 8192 blocks of 128 MiB (17).
-// Past MaxBlocks the block grows linearly instead. The rule is monotone in
-// size, which the hasher and the multipart assembly rely on: a part's block
+// two, at least 2^MinChunkLog chunks, whose byte size is at least
+// sqrt(size × 32 B), so the body has about sqrt(size / 32 B) blocks. The
+// 16 KiB floor holds up to 8 MiB (512 blocks); past it the block doubles
+// each time the size quadruples: a 1 GiB body has 4096 blocks of 256 KiB
+// (chunk log 8), a 10 GiB body 10,240 blocks of 1 MiB (10). From 32 GiB
+// the MaxBlocks cap binds and the block grows linearly instead: a 1 TiB
+// body has 32,768 blocks of 32 MiB (15). The rule is monotone in size,
+// which the hasher and the multipart assembly rely on: a part's block
 // never exceeds its object's.
 func ChunkLog(size int64) uint8 {
-	// A block of 2^c chunks is 2^(c+10) bytes; the geometric-mean rule
-	// wants size <= 2^(2(c+10)-14) = 2^(2c+6).
+	// A block of 2^c chunks is 2^(c+10) bytes; the square-root rule wants
+	// block² >= size × 2^5, so size <= 2^(2c+15). The cap below is the
+	// tighter bound from c = 10 on, so this loop can stop short of the
+	// shift overflowing.
 	c := uint8(MinChunkLog)
-	for c < 28 && size > int64(1)<<(2*c+6) {
+	for c < 24 && size > int64(1)<<(2*c+15) {
 		c++
 	}
 	// The cap. The loop stops where MaxBlocks blocks would reach 2^63

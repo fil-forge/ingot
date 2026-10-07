@@ -190,7 +190,7 @@ the S3 `etag` stored verbatim (a multipart ETag cannot be re-derived from the by
 system and user headers, and a delete-marker flag for tombstone versions — plus a `Body`. The `Body`
 carries the whole-object `size` and `sha256` (integrity), the whole-object BLAKE3 digest that GET and
 HEAD return as a raw-codec CID in the `x-cid` header, with the chaining values of its block-aligned
-blocks (about the square root of the size in 16 KiB units: 256 blocks at 1 GiB, 8 KiB; capped at 32768) for verifying ranged reads, and an **ordered, contiguous list of body
+blocks (16 KiB blocks up to 8 MiB, then about sqrt(size / 32 B) blocks: 4096 blocks at 1 GiB, 128 KiB; capped at 32768 from 32 GiB) for verifying ranged reads, and an **ordered, contiguous list of body
 blobs** — *shards*, in Forge terms — `[{ digest, offset, length }]` that together cover `[0, size)`:
 one entry for a small object, N for a split or multipart object. Each `digest` is the sha256 multihash
 Piri stores the shard under and the indexer resolves to a node URL — so this list is what lets a ranged
