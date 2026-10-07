@@ -80,15 +80,13 @@ type SegmentMeta struct {
 	OpRoots []blockstore.OpRoot
 }
 
-// Meta is the persistence backing for the per-plane segment lifecycle.
-// Every method is plane-scoped except NextSegmentSeq, which draws from a
-// single globally-unique allocator shared by both planes. The production
-// implementation is *registry.Postgres; tests use an in-memory fake.
-// Logstore never touches SQL directly.
+// Meta is the persistence backing for the catalog log's segment lifecycle.
+// NextSegmentSeq draws from a single globally-unique allocator. The
+// production implementation is *registry.Postgres; tests use an in-memory
+// fake. Logstore never touches SQL directly.
 type Meta interface {
 	// NextSegmentSeq returns a fresh, globally-unique, monotonic segment
-	// id. Both planes draw from the same allocator; an id belongs to
-	// whichever plane records it via InsertSegmentOpen.
+	// id, which InsertSegmentOpen then records.
 	NextSegmentSeq(ctx context.Context) (uint64, error)
 
 	// InsertSegmentOpen records that segment seq has just been opened for

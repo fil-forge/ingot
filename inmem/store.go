@@ -6,7 +6,7 @@
 //
 // MemStore keeps bucket + segment metadata in memory only — it resets on
 // restart. Segment CARs still persist on local disk via logstore; in
-// standalone mode both planes are configured never to ship, so those
+// standalone mode the catalog plane is configured never to ship, so those
 // CARs are retained and serve all reads.
 package inmem
 
