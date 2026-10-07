@@ -31,13 +31,16 @@ var allowedMethods = []auth.CORSHTTPMethod{
 // cross-origin response. ETag is the one S3 clients can't live without
 // (PUT/multipart verification) and is listed explicitly because the
 // preflight controller doesn't apply versitygw's ensureExposeETag
-// fallback; the x-amz-* set covers request tracing and versioning.
+// fallback; the x-amz-* set covers request tracing and versioning; x-cid
+// is the object's BLAKE3 CID on GET and HEAD (s3frontend.setCIDHeader),
+// which a browser client can only read when it is exposed here.
 var exposeHeaders = []auth.CORSHeader{
 	"ETag",
 	"x-amz-storage-class",
 	"x-amz-request-id",
 	"x-amz-id-2",
 	"x-amz-version-id",
+	"x-cid",
 }
 
 // maxAgeSeconds caps how long a browser may cache a preflight result.
