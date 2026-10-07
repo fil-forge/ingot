@@ -278,7 +278,7 @@ sequenceDiagram
     loop each streamed blob (uploadBlobs → concludeStreamed)
         B->>U: /ucan/conclude the put receipt, reporting the spooled digest
         U-->>B: accept receipt + /assert/location commitment
-        B->>R: SetIntentState(accepted) + PutLocation, DeleteStream
+        B->>R: PutLocation, then SetIntentState(accepted); DeleteStream
         B->>B: BlobCache.Take: the file moves from the spool to the cache
     end
     loop each spooled-first blob (uploadBlobs)
@@ -290,7 +290,7 @@ sequenceDiagram
             B->>P: HTTP PUT bytes
             B->>U: /ucan/conclude the put receipt, then poll /blob/accept receipt
             U-->>B: /assert/location commitment
-            B->>R: SetIntentState(accepted) + PutLocation
+            B->>R: PutLocation, then SetIntentState(accepted)
             B->>B: BlobCache.Take: the file moves from the spool to the cache
         end
     end

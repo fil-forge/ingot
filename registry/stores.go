@@ -340,8 +340,8 @@ type IntentStore interface {
 	// holds a copy of and that are not marked evicted: 'accepted' or
 	// 'published' with a blob_locations row for the digest in any space, or
 	// 'parked' with a blob_parks row. The state alone is not enough: a
-	// single PUT marks a blob accepted before it records the location, and
-	// a failed location write leaves it accepted with none. A location in
+	// release drops the location before the intent, and a failure between
+	// the two leaves an accepted intent with none. A location in
 	// any space qualifies only because a digest belongs to one space: each
 	// write encrypts under a fresh key bound to its space, so no two spaces
 	// upload the same digest. Ordered by (UpdatedAt, Digest), starting after
