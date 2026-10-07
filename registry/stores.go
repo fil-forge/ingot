@@ -354,20 +354,6 @@ type IntentStore interface {
 	// MissingIntents returns the digests among digests that have no intent
 	// row, for the sweeper's orphan-file pass.
 	MissingIntents(ctx context.Context, digests []multihash.Multihash) ([]multihash.Multihash, error)
-	// ListReleasedPublished returns up to limit published intents that
-	// nothing names any more: no location, claim, pending release or part of
-	// an open or completing multipart session has the digest. Those are
-	// committed blobs whose release finished while releases still kept the
-	// local copy and the intent; the startup released pass deletes both.
-	// Ordered by digest, starting after the digest after (nil starts at the
-	// beginning), so a caller pages through rather than re-scanning.
-	ListReleasedPublished(ctx context.Context, after multihash.Multihash, limit int) ([]UploadIntent, error)
-	// DeleteReleasedPublished deletes digest's intent if it still meets
-	// ListReleasedPublished's conditions, and reports whether it did. The
-	// check and the delete are one statement, so a digest named again since
-	// it was listed keeps its intent. (Every write has a digest of its own,
-	// so that should not happen; this keeps the pass safe if it ever does.)
-	DeleteReleasedPublished(ctx context.Context, digest multihash.Multihash) (bool, error)
 	// StalledBytes sums the sizes of 'spooled' and 'uploading' intents whose
 	// state last changed before before, by state: bodies whose upload has
 	// outlasted any live request, which nothing reclaims.

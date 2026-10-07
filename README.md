@@ -190,8 +190,7 @@ released or evicted. With or without a
 budget, the sweeper also deletes, at startup and then hourly, unfinished
 `.tmp-*` writes in either directory and spool files with no upload intent,
 once they are older than `local_blob_orphan_age` (default `24h`, at least
-`1h`). Once at each startup, `serve` also deletes the copies of objects
-deleted by a version of ingot that kept them.
+`1h`).
 
 **Sizing.** The filesystem needs room for:
 

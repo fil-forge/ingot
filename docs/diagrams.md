@@ -613,10 +613,7 @@ flowchart TB
   intent keeps its row and state and gains `evicted_at`; reads fall through
   to the network tier. `spooled` and `uploading` files are never evicted.
   The parked-part drop at UploadPart marks `evicted_at` the same way. A
-  committed blob's release removes its local copy with the intent; once at
-  startup, the released pass does the same for `published` intents nothing
-  names any more (no location, claim, pending release or live part), left
-  by versions whose releases kept the copy.
+  committed blob's release removes its local copy with the intent.
 - Digests present in both the old and new version sets never churn: the
   reconcile computes a set difference.
 - Parked-blob reclamation is guarded: a digest live in another session, part,
@@ -629,7 +626,7 @@ flowchart TB
 Cross-references: [`architecture.md` §5](./architecture.md#5-the-data-layer),
 [`s3-versioning.md`](./s3-versioning.md) §8.
 
-Sources: `registry/stores.go` (state consts, ListEvictable, ListReleasedPublished), `s3frontend/object.go`
+Sources: `registry/stores.go` (state consts, ListEvictable), `s3frontend/object.go`
 (ingestBody, reconcileClaims), `s3frontend/localblob_sweep.go` (SweepLocalBlobs),
 `s3frontend/localblobs.go` (cacheHeld, removeLocal),
 `s3frontend/multipart.go`
