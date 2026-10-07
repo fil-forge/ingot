@@ -165,7 +165,10 @@ Internal:
   `tracing.Start` / `tracing.End` (an S3 error table outcome does not mark a
   span failed); reads report their tier with `tracing.CountRead`, which lands
   on the server span as `ingot.reads.*`. A streamed response (GetObject) keeps
-  its server span open until fasthttp has written the body.
+  its server span open until fasthttp has written the body. Each background
+  sweep (`server.go`) starts a root span of its own (`sweep.*`), so its
+  registry queries, which `otelpgx` traces only under a recording span, show
+  up too.
 
 ## Interface seams
 

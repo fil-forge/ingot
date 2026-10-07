@@ -8,9 +8,11 @@ import (
 	"time"
 
 	"github.com/multiformats/go-multihash"
+	"go.opentelemetry.io/otel/attribute"
 	"go.uber.org/zap"
 
 	"github.com/fil-forge/ingot/blockstore"
+	"github.com/fil-forge/ingot/internal/tracing"
 	"github.com/fil-forge/ingot/registry"
 )
 
@@ -64,6 +66,18 @@ func (s *LocalBlobSweepStats) Add(o LocalBlobSweepStats) {
 	s.ForcedBytes += o.ForcedBytes
 	s.OrphanFiles += o.OrphanFiles
 	s.OrphanBytes += o.OrphanBytes
+}
+
+// SpanAttributes returns the counts as span attributes.
+func (s LocalBlobSweepStats) SpanAttributes() []attribute.KeyValue {
+	return []attribute.KeyValue{
+		attribute.Int64("ingot.local_blobs.budget_files", s.BudgetFiles),
+		attribute.Int64("ingot.local_blobs.budget_bytes", s.BudgetBytes),
+		attribute.Int64("ingot.local_blobs.forced_files", s.ForcedFiles),
+		attribute.Int64("ingot.local_blobs.forced_bytes", s.ForcedBytes),
+		attribute.Int64("ingot.local_blobs.orphan_files", s.OrphanFiles),
+		attribute.Int64("ingot.local_blobs.orphan_bytes", s.OrphanBytes),
+	}
 }
 
 // LogFields returns the counts as log fields.
@@ -132,6 +146,7 @@ func (b *Backend) SweepLocalBlobs(ctx context.Context) (LocalBlobSweepStats, err
 	var errs []error
 	if b.localBlobMaxBytes > 0 && b.localUsage() > b.localBlobMaxBytes {
 		budgetCtx, cancel := context.WithTimeout(ctx, budgetPassTimeLimit)
+		budgetCtx, span := tracing.Start(budgetCtx, "local_blobs.budget_pass")
 		pass, err := b.evictToBudget(budgetCtx, now.Add(budgetPassTimeLimit), honorBothWindows)
 		cancel()
 		stats.BudgetFiles, stats.BudgetBytes = pass.files, pass.bytes
@@ -141,6 +156,8 @@ func (b *Backend) SweepLocalBlobs(ctx context.Context) (LocalBlobSweepStats, err
 		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
 			err, pass.stop = nil, stopDeadline
 		}
+		span.SetAttributes(pass.spanAttributes()...)
+		tracing.End(span, err)
 		switch {
 		case err != nil:
 			errs = append(errs, fmt.Errorf("s3frontend: local blob budget pass: %w", err))
@@ -167,8 +184,18 @@ func (b *Backend) SweepLocalBlobs(ctx context.Context) (LocalBlobSweepStats, err
 	}
 	if b.lastOrphanPass.IsZero() || now.Sub(b.lastOrphanPass) >= orphanPassInterval {
 		orphanCtx, cancel := context.WithTimeout(ctx, orphanPassTimeLimit)
+		orphanCtx, span := tracing.Start(orphanCtx, "local_blobs.orphan_pass")
 		files, bytes, err := b.removeOrphans(orphanCtx, now)
 		cancel()
+		span.SetAttributes(
+			attribute.Int64("ingot.local_blobs.files", files),
+			attribute.Int64("ingot.local_blobs.bytes", bytes))
+		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+			// The pass's own time limit, logged below, not a failure.
+			tracing.End(span, nil)
+		} else {
+			tracing.End(span, err)
+		}
 		stats.OrphanFiles, stats.OrphanBytes = files, bytes
 		b.localBlobMetrics.removed(ctx, removedOrphan, files, bytes)
 		b.lastOrphanPass = now
@@ -206,6 +233,16 @@ type budgetPass struct {
 	stop         passStop
 }
 
+// spanAttributes returns what the pass did as span attributes.
+func (p budgetPass) spanAttributes() []attribute.KeyValue {
+	return []attribute.KeyValue{
+		attribute.Int64("ingot.local_blobs.files", p.files),
+		attribute.Int64("ingot.local_blobs.bytes", p.bytes),
+		attribute.Int64("ingot.local_blobs.skipped", p.skipped),
+		attribute.String("ingot.local_blobs.stop", p.stop.String()),
+	}
+}
+
 // passStop is why an eviction pass stopped.
 type passStop int
 
@@ -215,6 +252,20 @@ const (
 	stopExhausted                 // no evictable rows were left
 	stopDeadline                  // the pass reached its time limit
 )
+
+func (s passStop) String() string {
+	switch s {
+	case stopWatermark:
+		return "watermark"
+	case stopResidency:
+		return "residency"
+	case stopExhausted:
+		return "exhausted"
+	case stopDeadline:
+		return "deadline"
+	}
+	return "unknown"
+}
 
 // retention is which windows an eviction pass honours.
 type retention int
@@ -238,12 +289,18 @@ const (
 // to give up as little of the windows as it can. It warns at most once an hour
 // that it evicted inside the windows; the budget_forced removals count each
 // time.
-func (b *Backend) forcedPass(ctx context.Context, budgetStop passStop, stats *LocalBlobSweepStats) error {
+func (b *Backend) forcedPass(ctx context.Context, budgetStop passStop, stats *LocalBlobSweepStats) (err error) {
 	forcedCtx, cancel := context.WithTimeout(ctx, forcedPassTimeLimit)
 	defer cancel()
+	forcedCtx, span := tracing.Start(forcedCtx, "local_blobs.forced_pass")
+	defer func() {
+		span.SetAttributes(
+			attribute.Int64("ingot.local_blobs.files", stats.ForcedFiles),
+			attribute.Int64("ingot.local_blobs.bytes", stats.ForcedBytes))
+		tracing.End(span, err)
+	}()
 	deadline := time.Now().Add(forcedPassTimeLimit)
 	var last budgetPass
-	var err error
 	stages := []retention{honorReadWindow, honorNoWindow}
 	switch {
 	case budgetStop == stopExhausted:
