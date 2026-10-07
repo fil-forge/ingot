@@ -14,8 +14,8 @@ import (
 // TestUploadBlobRecordsLocationBeforeAccepted: a by-digest upload that the
 // provider accepts records the location before marking the intent accepted.
 // Whichever of the two writes fails, the intent is left uploading, where it
-// counts as a stalled upload, and never accepted without a location, a state
-// nothing reads.
+// counts as a stalled upload, and never accepted without a location, which
+// neither eviction nor the stalled count sees.
 func TestUploadBlobRecordsLocationBeforeAccepted(t *testing.T) {
 	put := func(t *testing.T, b *Backend) {
 		t.Helper()
@@ -64,8 +64,8 @@ func TestUploadBlobRecordsLocationBeforeAccepted(t *testing.T) {
 			t.Fatal("the intent store never refused the accepted transition")
 		}
 		stalledUploading(t, mem, intents.refused)
-		// The location landed, so a release of the stalled intent finds it
-		// and removes the blob from the provider.
+		// The location landed, so a release of the stalled intent, if one
+		// runs, finds it and removes the blob from the provider.
 		st, err := mem.Get(t.Context(), sweepBucket)
 		if err != nil {
 			t.Fatalf("get bucket: %v", err)

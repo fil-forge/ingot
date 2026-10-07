@@ -464,7 +464,7 @@ func (b *Backend) splitSpool(ctx context.Context, bucket string, space did.DID, 
 }
 
 // uploadBlobs uploads each spooled blob to Forge by digest (allocate→PUT→
-// accept), advances its intent to accepted, and records its location. A no-op
+// accept), records its location, and advances its intent to accepted. A no-op
 // in the in-memory harness (the spool serves reads).
 //
 // A blob already durably stored for this space (a re-PUT of identical content,

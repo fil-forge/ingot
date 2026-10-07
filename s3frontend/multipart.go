@@ -1380,8 +1380,9 @@ func (b *Backend) concludeBlobs(ctx context.Context, space did.DID, blobs []msbu
 // The location is written first, so a failure between the two writes leaves
 // the intent in its earlier state with a location row, never accepted
 // without one. An intent left uploading counts as a stalled upload, and a
-// release of it finds the location and removes the blob from the provider;
-// an accepted intent with no location is in a state nothing reads.
+// release of it, if one runs, finds the location and removes the blob from
+// the provider. An accepted intent with no location is neither evictable nor
+// counted as stalled.
 func (b *Backend) recordAccepted(ctx context.Context, space did.DID, digest mh.Multihash, loc uploader.BlobLocation) error {
 	if err := b.locations.PutLocation(ctx, registry.BlobLocation{
 		Space:    space,
