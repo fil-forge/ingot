@@ -100,8 +100,11 @@ type Config struct {
 	// A part keeps no local copy once it parks on its provider, so Complete
 	// relies on the provider keeping the parked allocation: a session
 	// completed after the provider has expired it fails, and the client must
-	// upload those parts again. Keep this no longer than the provider keeps
-	// parked allocations.
+	// upload those parts again. The TTL counts from the session's last state
+	// change, and a Complete that fails returns the session to open, which
+	// restarts it; so it bounds a parked part's age only while no Complete
+	// fails. Keep it well under how long the provider keeps parked
+	// allocations.
 	MultipartSessionTTL string `mapstructure:"multipart_session_ttl" yaml:"multipart_session_ttl"`
 
 	// ReleaseGrace delays each blob release (crypto-shred + location delete +
@@ -109,8 +112,8 @@ type Config struct {
 	// last reference claim (Go duration string), so in-flight readers holding
 	// the prior catalog root finish first. It bounds how long such a reader
 	// may take: a GET, or a copy reading the object as its source, still
-	// streaming a deleted or overwritten object when the grace ends fails
-	// when it reaches a blob it has not yet opened.
+	// streaming a deleted or overwritten object once the grace has passed
+	// fails when it reaches a blob it has not yet opened.
 	// Empty → default 60s; a negative duration makes releases due
 	// immediately.
 	ReleaseGrace string `mapstructure:"release_grace" yaml:"release_grace"`
