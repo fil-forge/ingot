@@ -20,6 +20,8 @@ import (
 	"github.com/gofiber/fiber/v3"
 	"github.com/multiformats/go-multihash"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 
 	"github.com/fil-forge/ingot/blockstore"
@@ -327,7 +329,9 @@ func (s *Server) startMultipartSweeper() {
 				return
 			case <-ticker.C:
 				ctx, cancel := context.WithTimeout(s.sweepCtx, time.Minute)
+				ctx, span := tracing.Start(ctx, "sweep.multipart_sessions")
 				n, err := s.backend.SweepStaleMultipartSessions(ctx, ttl)
+				s.endSweepSpan(span, err, attribute.Int("ingot.sweep.count", n))
 				cancel()
 				if err != nil && s.sweepCtx.Err() == nil {
 					s.logger.Warn("multipart sweep", zap.Error(err))
@@ -361,7 +365,9 @@ func (s *Server) startReleaseSweeper() {
 				return
 			case <-ticker.C:
 				ctx, cancel := context.WithTimeout(s.sweepCtx, time.Minute)
+				ctx, span := tracing.Start(ctx, "sweep.releases")
 				n, err := s.backend.SweepPendingReleases(ctx)
+				s.endSweepSpan(span, err, attribute.Int("ingot.sweep.count", n))
 				cancel()
 				if err != nil && s.sweepCtx.Err() == nil {
 					s.logger.Warn("release sweep", zap.Error(err))
@@ -369,7 +375,9 @@ func (s *Server) startReleaseSweeper() {
 					s.logger.Info("release sweep executed deferred releases", zap.Int("count", n))
 				}
 				ctx, cancel = context.WithTimeout(s.sweepCtx, time.Minute)
+				ctx, span = tracing.Start(ctx, "sweep.streams")
 				n, err = s.backend.SweepStaleStreams(ctx)
+				s.endSweepSpan(span, err, attribute.Int("ingot.sweep.count", n))
 				cancel()
 				if err != nil && s.sweepCtx.Err() == nil {
 					s.logger.Warn("stream sweep", zap.Error(err))
@@ -408,7 +416,10 @@ func (s *Server) startLocalBlobSweeper() {
 			case <-ticker.C:
 				// Each pass also caps itself; this bounds them together.
 				ctx, cancel := context.WithTimeout(s.sweepCtx, 4*time.Minute)
+				ctx, span := tracing.Start(ctx, "sweep.local_blobs")
 				stats, err := s.backend.SweepLocalBlobs(ctx)
+				span.SetAttributes(attribute.Int64("ingot.sweep.usage_bytes", s.backend.LocalBlobUsage()))
+				s.endSweepSpan(span, err, stats.SpanAttributes()...)
 				cancel()
 				if err != nil && s.sweepCtx.Err() == nil {
 					s.logger.Warn("local blob sweep", zap.Error(err))
@@ -438,7 +449,11 @@ func (s *Server) startLocalBlobSweeper() {
 // cancels it; on a node with none it is one scan.
 func (s *Server) startReleasedPass() {
 	s.goSweep(func() {
-		files, bytes, err := s.backend.RemoveReleasedPublished(s.sweepCtx)
+		ctx, span := tracing.Start(s.sweepCtx, "sweep.released_pass")
+		files, bytes, err := s.backend.RemoveReleasedPublished(ctx)
+		s.endSweepSpan(span, err,
+			attribute.Int64("ingot.sweep.files", files),
+			attribute.Int64("ingot.sweep.bytes", bytes))
 		switch {
 		case err != nil && s.sweepCtx.Err() == nil:
 			s.logger.Warn("local blob released pass; the next restart tries again", zap.Error(err),
@@ -477,6 +492,17 @@ func (s *Server) Stop(ctx context.Context) error {
 		return fmt.Errorf("ingot shutdown: %v", errs)
 	}
 	return nil
+}
+
+// endSweepSpan ends a background sweep's span with attrs. A sweep's error once
+// sweepCtx is done is the cancellation's, as goSweep says, so it does not
+// mark the span failed.
+func (s *Server) endSweepSpan(span trace.Span, err error, attrs ...attribute.KeyValue) {
+	span.SetAttributes(attrs...)
+	if s.sweepCtx.Err() != nil {
+		err = nil
+	}
+	tracing.End(span, err)
 }
 
 // waitSweeps waits for the sweeper goroutines to exit, or for ctx to end.
