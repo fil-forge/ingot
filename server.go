@@ -286,6 +286,7 @@ func (s *Server) Start(ctx context.Context) error {
 	s.startMultipartSweeper()
 	s.startReleaseSweeper()
 	s.startLocalBlobSweeper()
+	s.startReleasedPass()
 	return nil
 }
 
@@ -426,6 +427,24 @@ func (s *Server) startLocalBlobSweeper() {
 					since = time.Now()
 				}
 			}
+		}
+	})
+}
+
+// startReleasedPass removes the local copies and intents that releases kept
+// before they freed local disk (see Backend.RemoveReleasedPublished). It runs
+// at every startup, until it has gone through every candidate or Stop
+// cancels it; on a node with none it is one scan.
+func (s *Server) startReleasedPass() {
+	s.goSweep(func() {
+		files, bytes, err := s.backend.RemoveReleasedPublished(s.sweepCtx)
+		switch {
+		case err != nil && s.sweepCtx.Err() == nil:
+			s.logger.Warn("local blob released pass; the next restart tries again", zap.Error(err),
+				zap.Int64("files", files), zap.Int64("bytes", bytes))
+		case files > 0:
+			s.logger.Info("local blob released pass removed copies earlier releases kept",
+				zap.Int64("files", files), zap.Int64("bytes", bytes))
 		}
 	})
 }

@@ -439,6 +439,45 @@ func (r *Postgres) MarkEvicted(ctx context.Context, digest multihash.Multihash) 
 	return nil
 }
 
+// releasedPublishedWhere is ListReleasedPublished's condition on intent i,
+// with the intent state as $1 and the live session states as $2 and $3.
+const releasedPublishedWhere = `i.state = $1
+		    AND NOT EXISTS (SELECT 1 FROM ingot.blob_locations l WHERE l.digest = i.digest)
+		    AND NOT EXISTS (SELECT 1 FROM ingot.blob_refs c WHERE c.digest = i.digest)
+		    AND NOT EXISTS (SELECT 1 FROM ingot.blob_release_intents p WHERE p.digest = i.digest)
+		    AND NOT EXISTS (SELECT 1 FROM ingot.multipart_parts mp
+		                      JOIN ingot.multipart_sessions s ON s.upload_id = mp.upload_id
+		                     WHERE mp.blob_digests @> ARRAY[i.digest] AND s.state IN ($2, $3))`
+
+func (r *Postgres) ListReleasedPublished(ctx context.Context, after multihash.Multihash, limit int) ([]UploadIntent, error) {
+	// The empty digest sorts first, so a nil cursor starts at the beginning.
+	if after == nil {
+		after = multihash.Multihash{}
+	}
+	rows, err := r.pool.Query(ctx,
+		`SELECT i.digest, i.local_path, i.size, i.state, i.bucket, i.updated_at
+		   FROM ingot.upload_intents i
+		  WHERE i.digest > $4 AND `+releasedPublishedWhere+`
+		  ORDER BY i.digest
+		  LIMIT $5`,
+		IntentPublished, SessionOpen, SessionCompleting, []byte(after), limit)
+	if err != nil {
+		return nil, fmt.Errorf("registry: list released published intents: %w", err)
+	}
+	return scanIntents(rows)
+}
+
+func (r *Postgres) DeleteReleasedPublished(ctx context.Context, digest multihash.Multihash) (bool, error) {
+	tag, err := r.pool.Exec(ctx,
+		`DELETE FROM ingot.upload_intents i
+		  WHERE i.digest = $4 AND `+releasedPublishedWhere,
+		IntentPublished, SessionOpen, SessionCompleting, []byte(digest))
+	if err != nil {
+		return false, fmt.Errorf("registry: delete released published intent: %w", err)
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
 func (r *Postgres) StalledBytes(ctx context.Context, before time.Time) (int64, error) {
 	// The state literals match the partial index upload_intents_stalled_idx
 	// (migration 00021), as for ListEvictable.
