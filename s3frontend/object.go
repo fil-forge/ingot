@@ -1218,7 +1218,7 @@ func (b *Backend) GetObjectAttributes(ctx context.Context, input *s3.GetObjectAt
 	var objectParts *s3response.ObjectParts
 	// The Blake3 attribute (an Ingot extension, see blake3Attribute) is
 	// built only when asked for: its outboard is 64 bytes per block, 2 MiB at
-	// the 32768-leaf cap and about 2.8 MiB once base64-encoded. The
+	// the 32768-block cap and about 2.7 MiB once base64-encoded. The
 	// controller passes the requested names through; a caller that passes
 	// none (an older controller, a direct caller) gets it.
 	var blake3 *s3response.Blake3Tree

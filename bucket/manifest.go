@@ -94,12 +94,12 @@ type Body struct {
 	// x-cid header carries as a raw-codec CID. Nil in blocks written before
 	// it was recorded, which return no x-cid.
 	BLAKE3 []byte `cborgen:"b3"`
-	// TreeChunkLog is the block (block) size of TreeBlocks as a base-2
-	// exponent of BLAKE3 chunks, the unit Bao libraries take: at least 4
-	// (16 KiB), near the geometric mean of the body's size and 16 KiB
-	// (blake3tree.ChunkLog), so the block count grows with the square root
-	// of the size: 16 blocks at 4 MiB, 256 at 1 GiB, 8192 at 1 TiB, capped
-	// at 32768 (1 MiB of blocks). Zero when BLAKE3 is nil.
+	// TreeChunkLog is the block size of TreeBlocks as a base-2 exponent of
+	// BLAKE3 chunks, the unit Bao libraries take: 4 (16 KiB) for bodies up
+	// to 8 MiB, then the block grows with the square root of the size
+	// (blake3tree.ChunkLog): 4096 blocks of 256 KiB at 1 GiB, 10,240 of
+	// 1 MiB at 10 GiB, capped at 32768 blocks (1 MiB) from 32 GiB. Zero
+	// when BLAKE3 is nil.
 	TreeChunkLog uint8 `cborgen:"tc"`
 	// TreeBlocks holds the BLAKE3 chaining value (32 bytes) of every block
 	// of the body, concatenated in order. A client

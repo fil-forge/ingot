@@ -123,7 +123,8 @@ func TestBlake3Commands(t *testing.T) {
 	}
 
 	out, err := run(t, nil, "range", "--outboard-file", ob, "--chunk-log", chunkLog, "5000-200000")
-	if err != nil || !strings.Contains(out, "Range: bytes=0-"+itoa(2*block-1)) || !strings.Contains(out, "--offset 0") {
+	alignedEnd := min((200000/block+1)*block, size) - 1
+	if err != nil || !strings.Contains(out, "Range: bytes=0-"+itoa(alignedEnd)) || !strings.Contains(out, "--offset 0") {
 		t.Fatalf("range: %q, %v", out, err)
 	}
 	if _, err := run(t, nil, "range", "5000-200000"); err == nil {
@@ -154,7 +155,7 @@ func TestBlake3Commands(t *testing.T) {
 	}
 	// A chunk log the outboard does not match, or one no block size fits,
 	// is a usage error, not a mismatch.
-	for _, g := range []string{"4", "53", "63", "255"} {
+	for _, g := range []string{"7", "53", "63", "255"} {
 		if _, err := run(t, data[block:], "verify", "--outboard", outboardB64, "--chunk-log", g, "--offset", off, want); err == nil || errors.As(err, &mm) {
 			t.Fatalf("--chunk-log %s accepted: %v", g, err)
 		}
