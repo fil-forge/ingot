@@ -1620,7 +1620,10 @@ func (b *Backend) ListMultipartUploads(ctx context.Context, input *s3.ListMultip
 // row is latched under its bucket's lock, where Complete re-checks the latch
 // before committing, so a Complete that outlives the TTL fails rather than
 // committing over blobs the sweep released. Returns how many rows were
-// removed. Called periodically by the daemon's sweeper loop.
+// removed. Called periodically by the daemon's sweeper loop. A cancelled
+// sweep stops before its next session; one cancelled between latching a
+// session and reaping it leaves the row 'aborting' until a later sweep finds
+// it stale, one TTL after the latch.
 func (b *Backend) SweepStaleMultipartSessions(ctx context.Context, ttl time.Duration) (int, error) {
 	cutoff := time.Now().Add(-ttl)
 	cleaned := 0
@@ -1634,6 +1637,9 @@ func (b *Backend) SweepStaleMultipartSessions(ctx context.Context, ttl time.Dura
 			return cleaned, fmt.Errorf("s3frontend: sweep list: %w", err)
 		}
 		for _, s := range stale {
+			if err := ctx.Err(); err != nil {
+				return cleaned, err
+			}
 			won, err := b.latchStaleSession(ctx, s, state)
 			if err != nil || !won {
 				continue
@@ -1650,6 +1656,9 @@ func (b *Backend) SweepStaleMultipartSessions(ctx context.Context, ttl time.Dura
 		return cleaned, fmt.Errorf("s3frontend: sweep list: %w", err)
 	}
 	for _, s := range stranded {
+		if err := ctx.Err(); err != nil {
+			return cleaned, err
+		}
 		if b.reapAbortingSession(ctx, s) {
 			cleaned++
 		}
@@ -1662,6 +1671,9 @@ func (b *Backend) SweepStaleMultipartSessions(ctx context.Context, ttl time.Dura
 		return cleaned, fmt.Errorf("s3frontend: sweep list: %w", err)
 	}
 	for _, s := range leftovers {
+		if err := ctx.Err(); err != nil {
+			return cleaned, err
+		}
 		if b.reapCompletedSession(ctx, s) {
 			cleaned++
 		}

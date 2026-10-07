@@ -702,6 +702,11 @@ func (b *Backend) SweepPendingReleases(ctx context.Context) (int, error) {
 	}
 	released := 0
 	for _, pr := range due {
+		// A cancelled sweep stops here rather than failing every remaining
+		// record; they stay due for the next sweep.
+		if err := ctx.Err(); err != nil {
+			return released, err
+		}
 		switch b.runRelease(ctx, pr) {
 		case releaseFailed:
 			continue // retry next sweep
