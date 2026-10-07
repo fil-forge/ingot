@@ -565,24 +565,7 @@ func (b *Backend) uploadBlob(ctx context.Context, space did.DID, blob msbucket.B
 	if res.Location == nil {
 		return fmt.Errorf("upload blob %x: concluding upload returned no location", blob.Digest)
 	}
-	loc := res.Location
-	if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentAccepted); err != nil {
-		return fmt.Errorf("mark accepted: %w", err)
-	}
-	// The location record, keyed by (space, digest): where reads go once the
-	// local copy is evicted, and the proof eviction requires that the
-	// provider holds the blob.
-	if err := b.locations.PutLocation(ctx, registry.BlobLocation{
-		Space:    space,
-		Digest:   blob.Digest,
-		Provider: loc.Provider,
-		URL:      loc.URL,
-		Size:     loc.Size,
-	}); err != nil {
-		return fmt.Errorf("record location: %w", err)
-	}
-	b.cacheHeld(ctx, blob.Digest)
-	return nil
+	return b.recordAccepted(ctx, space, blob.Digest, *res.Location)
 }
 
 // reconcileClaims updates blob_refs for ONE version id under (bucket, key)

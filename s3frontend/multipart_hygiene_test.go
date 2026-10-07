@@ -772,12 +772,14 @@ func TestCompleteRecordsEveryAcceptanceWhenOneFailsToPersist(t *testing.T) {
 // fails, after the location for that blob has already been recorded.
 type failOnceMarkAccepted struct {
 	registry.IntentStore
-	armed bool
+	armed   bool
+	refused multihash.Multihash
 }
 
 func (f *failOnceMarkAccepted) SetIntentState(ctx context.Context, digest multihash.Multihash, state string) error {
 	if f.armed && state == registry.IntentAccepted {
 		f.armed = false
+		f.refused = digest
 		return errors.New("intents table unavailable")
 	}
 	return f.IntentStore.SetIntentState(ctx, digest, state)
