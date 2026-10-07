@@ -150,7 +150,10 @@ must be on one filesystem (`serve` checks this at startup):
 A cached copy is not needed, so it goes:
 
 - when a deleted or overwritten object's release runs (`release_grace`,
-  default 60s, after its last reference drops);
+  default 60s, after its last reference drops). The release also removes the
+  provider's copy, so a GET still streaming the old object when the grace
+  ends fails when it reaches a blob it has not yet opened: `release_grace`
+  bounds how long such a read may take;
 - with `local_blob_max_bytes` set, when a sweeper, checking every 30 seconds,
   finds the two directories over the budget and evicts cached bodies, oldest
   first, down to 90% of the budget. Later reads of an evicted body go to the
@@ -170,11 +173,14 @@ at most once an hour when it does; the `budget_forced` removals count each
 time. `0s` turns either window off.
 
 A multipart part's copy goes from the spool as soon as the part parks on its
-provider. The budget is off by default (`local_blob_max_bytes: 0`): without
-it the cache grows with every live object's bodies. With or without a
-budget, the sweeper also deletes, hourly, unfinished `.tmp-*` writes in
-either directory and spool files with no upload intent, once they are older
-than `local_blob_orphan_age` (default `24h`, at least `1h`).
+provider, so Complete relies on the provider keeping the parked allocation
+until then; keep `multipart_session_ttl` (default `168h`) no longer than the
+provider keeps parked allocations. The budget is off by default
+(`local_blob_max_bytes: 0`): without it the cache grows with every live
+object's bodies. With or without a budget, the sweeper also deletes, hourly,
+unfinished `.tmp-*` writes in either directory and spool files with no
+upload intent, once they are older than `local_blob_orphan_age` (default
+`24h`, at least `1h`).
 
 **Sizing.** The filesystem needs room for:
 

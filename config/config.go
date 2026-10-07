@@ -97,6 +97,11 @@ type Config struct {
 	// string, e.g. "168h"): a session whose state has not changed for this
 	// long is torn down by a background sweeper and its parts released.
 	// Empty → default 7 days; a negative duration disables the sweeper.
+	// A part keeps no local copy once it parks on its provider, so Complete
+	// relies on the provider keeping the parked allocation: a session
+	// completed after the provider has expired it fails, and the client must
+	// upload those parts again. Keep this no longer than the provider keeps
+	// parked allocations.
 	MultipartSessionTTL string `mapstructure:"multipart_session_ttl" yaml:"multipart_session_ttl"`
 
 	// ReleaseGrace delays each blob release (crypto-shred + location delete +
