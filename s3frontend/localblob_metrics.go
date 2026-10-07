@@ -59,6 +59,11 @@ func newLocalBlobMetrics(mp metric.MeterProvider, b *Backend, logger *zap.Logger
 var (
 	inSpool = metric.WithAttributes(attribute.String("dir", "spool"))
 	inCache = metric.WithAttributes(attribute.String("dir", "cache"))
+	// The intent state a stalled upload's bytes are in: spooled, a body that
+	// never left this node, or uploading, one that may have reached its
+	// provider.
+	stalledSpooled   = metric.WithAttributes(attribute.String("state", "spooled"))
+	stalledUploading = metric.WithAttributes(attribute.String("state", "uploading"))
 )
 
 // registerLocalBlobGauges reports the bytes each directory holds, the budget
@@ -77,7 +82,7 @@ func registerLocalBlobGauges(meter metric.Meter, b *Backend) (metric.Registratio
 		return nil, err
 	}
 	stalled, err := meter.Int64ObservableGauge("ingot.local_blobs.stalled_bytes", metric.WithUnit("By"),
-		metric.WithDescription("Bytes of bodies whose upload has stalled: spooled or uploading for over an hour, which nothing reclaims yet"))
+		metric.WithDescription("Bytes of bodies whose upload has stalled, by state: spooled (never left this node) or uploading (may have reached its provider) for over an hour, which nothing reclaims yet"))
 	if err != nil {
 		return nil, err
 	}
@@ -89,7 +94,8 @@ func registerLocalBlobGauges(meter metric.Meter, b *Backend) (metric.Registratio
 		o.ObserveInt64(usage, b.cache.Usage(), inCache)
 		o.ObserveInt64(budget, b.localBlobMaxBytes)
 		if b.stalledKnown.Load() {
-			o.ObserveInt64(stalled, b.stalledBytes.Load())
+			o.ObserveInt64(stalled, b.stalledSpooled.Load(), stalledSpooled)
+			o.ObserveInt64(stalled, b.stalledUploading.Load(), stalledUploading)
 		}
 		return nil
 	}, usage, budget, stalled)

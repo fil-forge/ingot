@@ -394,16 +394,22 @@ func (m *MemStore) AgeIntent(digest multihash.Multihash, d time.Duration) {
 	}
 }
 
-func (m *MemStore) StalledBytes(_ context.Context, before time.Time) (int64, error) {
+func (m *MemStore) StalledBytes(_ context.Context, before time.Time) (registry.StalledSizes, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	var n int64
+	var s registry.StalledSizes
 	for _, in := range m.intents {
-		if (in.State == registry.IntentSpooled || in.State == registry.IntentUploading) && in.UpdatedAt.Before(before) {
-			n += in.Size
+		if !in.UpdatedAt.Before(before) {
+			continue
+		}
+		switch in.State {
+		case registry.IntentSpooled:
+			s.Spooled += in.Size
+		case registry.IntentUploading:
+			s.Uploading += in.Size
 		}
 	}
-	return n, nil
+	return s, nil
 }
 
 func (m *MemStore) MissingIntents(_ context.Context, digests []multihash.Multihash) ([]multihash.Multihash, error) {

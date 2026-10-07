@@ -37,6 +37,9 @@ func collectLocalBlobMetrics(t *testing.T, reader *sdkmetric.ManualReader) map[s
 					if dir, ok := dp.Attributes.Value(attribute.Key("dir")); ok {
 						name += "/" + dir.AsString()
 					}
+					if state, ok := dp.Attributes.Value(attribute.Key("state")); ok {
+						name += "/" + state.AsString()
+					}
 					got[name] = dp.Value
 				}
 			case metricdata.Sum[int64]:
@@ -244,11 +247,14 @@ func TestLocalBlobMetrics_StalledBytes(t *testing.T) {
 	mem.AgeIntent(stalled, 2*stalledUploadAge)
 	spooled("an upload in progress")
 
-	_, before := collectLocalBlobMetrics(t, reader)["ingot.local_blobs.stalled_bytes"]
+	_, before := collectLocalBlobMetrics(t, reader)["ingot.local_blobs.stalled_bytes/spooled"]
 	sweepLocalBlobs(t, b)
-	after, ok := collectLocalBlobMetrics(t, reader)["ingot.local_blobs.stalled_bytes"]
+	got := collectLocalBlobMetrics(t, reader)
+	after, ok := got["ingot.local_blobs.stalled_bytes/spooled"]
+	uploading, uploadingOK := got["ingot.local_blobs.stalled_bytes/uploading"]
 
-	if before || !ok || after != n {
-		t.Fatalf("stalled_bytes reported before a sweep: %v; after: %d (reported %v), want %d", before, after, ok, n)
+	if before || !ok || after != n || !uploadingOK || uploading != 0 {
+		t.Fatalf("stalled_bytes reported before a sweep: %v; after: spooled %d (reported %v), uploading %d (reported %v); want spooled %d, uploading 0",
+			before, after, ok, uploading, uploadingOK, n)
 	}
 }
