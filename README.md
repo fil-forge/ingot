@@ -183,9 +183,10 @@ object's bodies. A node that rarely reads back what it just wrote can keep
 no written bodies at all: with `cache_writes: false`, each body's copy goes
 as soon as the provider accepts it instead of moving to the cache, and every
 read goes to the provider. The spool then holds only bodies still being
-written or uploaded, apart from a copy whose removal failed, which waits for
-its object's release or the budget; bodies cached before the setting was
-turned off stay until they are released or evicted. With or without a
+written or uploaded and the bodies of failed uploads, apart from a copy
+whose removal failed, which waits for its object's release or the budget;
+bodies cached before the setting was turned off stay until they are
+released or evicted. With or without a
 budget, the sweeper also deletes, at startup and then hourly, unfinished
 `.tmp-*` writes in either directory and spool files with no upload intent,
 once they are older than `local_blob_orphan_age` (default `24h`, at least
