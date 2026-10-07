@@ -237,6 +237,7 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		CacheMinResidency:  cfg.CacheMinResidency,
 		CacheReadRetention: cfg.CacheReadRetention,
 		LocalBlobOrphanAge: cfg.LocalBlobOrphanAge,
+		DropAcceptedBodies: cfg.DropAcceptedBodies,
 
 		MaxBlobSize: cfg.MaxBlobSize,
 		CORS:        cfg.CORSConfig,

@@ -582,6 +582,7 @@ flowchart TB
     accepted -->|"commit: AddBlobClaim, same transaction"| published
 
     parked -.->|"SweepLocalBlobs over budget (blob_parks row):<br/>removeLocal + MarkEvicted; state unchanged"| evicted[["local file evicted<br/>(evicted_at set)"]]
+    accepted -.->|"cache_writes false: at accept,<br/>once the location is recorded;<br/>removeLocal + MarkEvicted"| evicted
     accepted -.->|"SweepLocalBlobs over budget (blob_locations row):<br/>removeLocal + MarkEvicted; state unchanged"| evicted
     published -.->|"SweepLocalBlobs over budget (blob_locations row):<br/>removeLocal + MarkEvicted; state unchanged"| evicted
     published -->|"commit: reconcileClaims adds this version"| refs["blob_refs rows<br/>(digest, bucket, key, version_id)"]
@@ -597,7 +598,9 @@ flowchart TB
   column.
 - A blob's file lives in the spool until the provider holds it, then moves
   to the cache: once its location and `accepted` state are both recorded,
-  by rename (`BlobCache.Take`). A failed move leaves it in the spool.
+  by rename (`BlobCache.Take`). A failed move leaves it in the spool. With
+  `cache_writes: false` the copy is removed at that point instead, and the
+  intent gains `evicted_at`.
 - Eviction (the dotted edges) is orthogonal to the state: `SweepLocalBlobs`
   runs every 30s and, when the spool and cache together are over
   `local_blob_max_bytes`, removes the local files of blobs the provider

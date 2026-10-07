@@ -215,7 +215,8 @@ validated at startup down to holding at least one delegation),
 `LocalBlobMaxBytes` (0 → no budget for the spool and cache together) with
 `CacheMinResidency` (10m), `CacheReadRetention` (1h) and
 `LocalBlobOrphanAge` (24h, ≥ 1h) for the local blob sweeper
-(`s3frontend.SweepLocalBlobs`),
+(`s3frontend.SweepLocalBlobs`), `CacheWrites` (unset → true; false drops
+each body's local copy once accepted),
 `CORSAllowedOrigins`, `LogLevel`. `Config.ServerConfig()` is the single
 mapping site. The daemon's config (cmd/) adds `postgres_dsn`,
 `identity.key_file` (the agent's PEM key) and `identity.service_id` (optional

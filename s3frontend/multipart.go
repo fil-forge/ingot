@@ -1098,7 +1098,7 @@ func (b *Backend) parkBlob(ctx context.Context, space did.DID, blob msbucket.Blo
 		if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentAccepted); err != nil {
 			return fmt.Errorf("mark accepted (dedup): %w", err)
 		}
-		b.cacheHeld(blob.Digest)
+		b.cacheHeld(ctx, blob.Digest)
 		// A located blob has no use for a park. One is still here only
 		// when an earlier Complete recorded the location and then failed
 		// before dropping the row. The part is durable regardless, so a
@@ -1151,7 +1151,7 @@ func (b *Backend) parkBlob(ctx context.Context, space did.DID, blob msbucket.Blo
 		if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentAccepted); err != nil {
 			return fmt.Errorf("mark accepted: %w", err)
 		}
-		b.cacheHeld(blob.Digest)
+		b.cacheHeld(ctx, blob.Digest)
 		return nil
 	}
 	// Location == nil ⇔ parked: durable on the provider with accept
@@ -1259,7 +1259,7 @@ func (b *Backend) concludeBlobs(ctx context.Context, space did.DID, blobs []msbu
 			if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentAccepted); err != nil {
 				return fmt.Errorf("mark accepted (dedup): %w", err)
 			}
-			b.cacheHeld(blob.Digest)
+			b.cacheHeld(ctx, blob.Digest)
 			// A located blob has no use for a park. One is still here only
 			// when an earlier Complete recorded the location and then failed
 			// before marking the intent or dropping the row; this is where
@@ -1387,7 +1387,7 @@ func (b *Backend) recordAccepted(ctx context.Context, space did.DID, digest mh.M
 	if err := b.intents.SetIntentState(ctx, digest, registry.IntentAccepted); err != nil {
 		return fmt.Errorf("mark accepted: %w", err)
 	}
-	b.cacheHeld(digest)
+	b.cacheHeld(ctx, digest)
 	return nil
 }
 

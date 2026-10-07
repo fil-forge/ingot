@@ -337,3 +337,53 @@ func TestLoad_EnvWithoutYAMLKey(t *testing.T) {
 		t.Errorf("addr = %q, want the default 0.0.0.0:8080", cfg.Addr)
 	}
 }
+
+// TestLoad_CacheWritesEnv: INGOT_CACHE_WRITES binds even when the YAML omits
+// cache_writes, and leaving both unset caches writes.
+func TestLoad_CacheWritesEnv(t *testing.T) {
+	for _, tc := range []struct {
+		env  string
+		drop bool
+	}{{"", false}, {"false", true}, {"true", false}} {
+		t.Run("env="+tc.env, func(t *testing.T) {
+			if tc.env != "" {
+				t.Setenv("INGOT_CACHE_WRITES", tc.env)
+			}
+			cfgFile := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(cfgFile, []byte("addr: \"127.0.0.1:9000\"\n"), 0o600); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+			cfg, err := Load(cfgFile)
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if drop := cfg.CacheWrites != nil && !*cfg.CacheWrites; drop != tc.drop {
+				t.Fatalf("drops accepted bodies = %v, want %v", drop, tc.drop)
+			}
+		})
+	}
+}
+
+func TestServerConfig_CacheWrites(t *testing.T) {
+	no, yes := false, true
+	for name, tc := range map[string]struct {
+		set  *bool
+		drop bool
+	}{
+		"unset caches": {set: nil, drop: false},
+		"true caches":  {set: &yes, drop: false},
+		"false drops":  {set: &no, drop: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := validConfig(t)
+			cfg.CacheWrites = tc.set
+			sc, err := cfg.ServerConfig()
+			if err != nil {
+				t.Fatalf("ServerConfig: %v", err)
+			}
+			if sc.DropAcceptedBodies != tc.drop {
+				t.Fatalf("DropAcceptedBodies = %v, want %v", sc.DropAcceptedBodies, tc.drop)
+			}
+		})
+	}
+}

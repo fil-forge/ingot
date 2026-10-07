@@ -186,6 +186,13 @@ func withLocalBlobBudgetConfig() stack.Option {
 	return stack.WithServiceConfig("ingot", "testdata/config-localblobbudget.yaml")
 }
 
+// withUncachedWritesConfig mounts testdata/config-uncachedwrites.yaml —
+// cache_writes off, so no written body stays on local disk. Dedicated stacks
+// only: other tests read envelopes back from local disk.
+func withUncachedWritesConfig() stack.Option {
+	return stack.WithServiceConfig("ingot", "testdata/config-uncachedwrites.yaml")
+}
+
 // ingotSQL runs one SQL statement against ingot's Postgres and returns the
 // bare psql output (rows, newline-separated). Digests round-trip as hex:
 // encode(digest,'hex') out, decode('<hex>','hex') in.

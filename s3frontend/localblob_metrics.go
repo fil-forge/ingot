@@ -17,6 +17,7 @@ const meterName = "github.com/fil-forge/ingot/s3frontend"
 const (
 	removedReleased     = "released"      // its object was deleted or its upload abandoned
 	removedParked       = "parked"        // a multipart part parked on its provider
+	removedAccepted     = "accepted"      // its provider accepted it, with written bodies not cached
 	removedBudget       = "budget"        // the budget pass evicted it
 	removedBudgetForced = "budget_forced" // the forced pass evicted it inside a retention window
 	removedOrphan       = "orphan"        // the orphan pass found no intent for it
