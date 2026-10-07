@@ -134,7 +134,7 @@ func (d *discardWriter) WriteBlob(_ context.Context, r io.Reader) (mh.Multihash,
 }
 
 // BenchmarkIngest_Full is the production write path end to end: SplitBody's
-// body sha256 + async md5, EncryptWithCEK with the tenant recipient, the
+// BLAKE3 tree + async md5, EncryptWithCEK with the tenant recipient, the
 // spool's sha256 + temp file + rename, and the region-key wrap.
 func BenchmarkIngest_Full(b *testing.B) {
 	for _, size := range benchSizes {
@@ -294,8 +294,8 @@ func BenchmarkGCMSeal(b *testing.B) {
 	}
 }
 
-// BenchmarkSHA256 is one sha256 pass over the data (ingot pays two per body:
-// the plaintext body hash and the spool's ciphertext hash).
+// BenchmarkSHA256 is one sha256 pass over the data (the spool's ciphertext
+// hash, the one sha256 ingot pays per body).
 func BenchmarkSHA256(b *testing.B) {
 	const size = 64 << 20
 	data := benchData(size)

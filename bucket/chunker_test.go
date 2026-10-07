@@ -72,10 +72,6 @@ func TestSplitBody_StreamingRoundTrip(t *testing.T) {
 	if body.Size != int64(len(data)) {
 		t.Fatalf("Size = %d, want %d", body.Size, len(data))
 	}
-	wantSHA := sha256.Sum256(data)
-	if !bytes.Equal(body.SHA256, wantSHA[:]) {
-		t.Errorf("whole-body SHA256 mismatch")
-	}
 	wantMD5 := md5.Sum(data)
 	if !bytes.Equal(body.MD5, wantMD5[:]) {
 		t.Errorf("whole-body MD5 mismatch")
@@ -150,10 +146,6 @@ func TestSplitBody_Empty(t *testing.T) {
 	if body.Size != 0 || len(body.Blobs) != 0 {
 		t.Fatalf("empty body: Size=%d Blobs=%d, want 0/0", body.Size, len(body.Blobs))
 	}
-	emptySHA := sha256.Sum256(nil)
-	if !bytes.Equal(body.SHA256, emptySHA[:]) {
-		t.Errorf("empty SHA256 mismatch")
-	}
 	emptyMD5 := md5.Sum(nil)
 	if !bytes.Equal(body.MD5, emptyMD5[:]) {
 		t.Errorf("empty MD5 = %x, want %x", body.MD5, emptyMD5)
@@ -206,7 +198,7 @@ func (hashingDiscardWriter) WriteBlob(_ context.Context, r io.Reader) (mh.Multih
 }
 
 // BenchmarkSplitBody measures one stream through SplitBody: the whole-body
-// sha256 and md5 plus the spool's sha256 of each blob, with no disk.
+// BLAKE3 tree and md5 plus the spool's sha256 of each blob, with no disk.
 func BenchmarkSplitBody(b *testing.B) {
 	const size = 64 << 20
 	data := makeData(size)
@@ -259,7 +251,7 @@ func TestSplitBody_WithoutMD5(t *testing.T) {
 	if !bytes.Equal(with.MD5, wantMD5[:]) {
 		t.Errorf("default Body.MD5 mismatch")
 	}
-	if !bytes.Equal(with.SHA256, without.SHA256) || with.Size != without.Size || len(with.Blobs) != len(without.Blobs) {
+	if !bytes.Equal(with.BLAKE3, without.BLAKE3) || with.Size != without.Size || len(with.Blobs) != len(without.Blobs) {
 		t.Fatalf("split differs without md5: %+v vs %+v", with, without)
 	}
 	for i := range with.Blobs {
