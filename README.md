@@ -222,7 +222,7 @@ deleted by a version of ingot that kept them.
 | -- | -- |
 | `ingot.local_blobs.usage` | Bytes held, by `dir`: `spool` (writes in progress and bodies awaiting upload, which eviction cannot touch) or `cache` |
 | `ingot.local_blobs.budget` | `local_blob_max_bytes` (0: no budget) |
-| `ingot.local_blobs.stalled_bytes` | Bytes of bodies whose upload has stalled: intents still `spooled` or `uploading` an hour after their last state change, which nothing reclaims yet, by `state`. `spooled` bodies never left this node; `uploading` ones may have reached their provider. Growth means uploads are failing |
+| `ingot.local_blobs.stalled_bytes` | Bytes of bodies whose upload has stalled, by `state`: intents still `spooled` or `uploading` an hour after their last state change, which nothing reclaims yet. `spooled` bodies never left this node; `uploading` ones may have reached their provider. Growth means uploads are failing |
 | `ingot.local_blobs.removals`, `ingot.local_blobs.removed_bytes` | Files and bytes removed, by `reason`: `released`, `parked`, `accepted` (with `cache_writes: false`), `budget`, `budget_forced` (inside a retention window), `orphan` |
 | `ingot.local_blobs.reads` | Body-blob reads, by `tier`: `local` or `network` (the local hit ratio) |
 

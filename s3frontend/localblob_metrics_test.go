@@ -5,6 +5,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -226,8 +227,9 @@ func TestLocalBlobMetrics_ReleaseOfACopyAlreadyGone(t *testing.T) {
 }
 
 // TestLocalBlobMetrics_StalledBytes: the stalled_bytes gauge reports nothing
-// until a sweep has summed the stalled uploads, then the bytes of intents
-// spooled for over an hour, not those of a body spooled just now.
+// until a sweep has summed the stalled uploads, then, by state, the bytes of
+// intents spooled or uploading for over an hour, not those of a body spooled
+// just now.
 func TestLocalBlobMetrics_StalledBytes(t *testing.T) {
 	ctx := t.Context()
 	reader := sdkmetric.NewManualReader()
@@ -245,16 +247,25 @@ func TestLocalBlobMetrics_StalledBytes(t *testing.T) {
 	}
 	stalled, n := spooled("an upload that failed an hour ago")
 	mem.AgeIntent(stalled, 2*stalledUploadAge)
+	started, m := spooled("an upload that started and failed an hour ago")
+	if err := mem.SetIntentState(ctx, started, registry.IntentUploading); err != nil {
+		t.Fatalf("SetIntentState: %v", err)
+	}
+	mem.AgeIntent(started, 2*stalledUploadAge)
 	spooled("an upload in progress")
 
-	_, before := collectLocalBlobMetrics(t, reader)["ingot.local_blobs.stalled_bytes/spooled"]
+	for key := range collectLocalBlobMetrics(t, reader) {
+		if strings.HasPrefix(key, "ingot.local_blobs.stalled_bytes") {
+			t.Fatalf("%s reported before a sweep", key)
+		}
+	}
 	sweepLocalBlobs(t, b)
 	got := collectLocalBlobMetrics(t, reader)
-	after, ok := got["ingot.local_blobs.stalled_bytes/spooled"]
-	uploading, uploadingOK := got["ingot.local_blobs.stalled_bytes/uploading"]
+	spooledBytes, spooledOK := got["ingot.local_blobs.stalled_bytes/spooled"]
+	uploadingBytes, uploadingOK := got["ingot.local_blobs.stalled_bytes/uploading"]
 
-	if before || !ok || after != n || !uploadingOK || uploading != 0 {
-		t.Fatalf("stalled_bytes reported before a sweep: %v; after: spooled %d (reported %v), uploading %d (reported %v); want spooled %d, uploading 0",
-			before, after, ok, uploading, uploadingOK, n)
+	if !spooledOK || spooledBytes != n || !uploadingOK || uploadingBytes != m {
+		t.Fatalf("stalled_bytes after a sweep: spooled %d (reported %v), uploading %d (reported %v); want spooled %d, uploading %d",
+			spooledBytes, spooledOK, uploadingBytes, uploadingOK, n, m)
 	}
 }
