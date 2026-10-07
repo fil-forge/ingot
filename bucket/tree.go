@@ -1,9 +1,7 @@
 package bucket
 
 import (
-	"crypto/sha256"
 	"fmt"
-	"hash"
 	"io"
 
 	"github.com/ipfs/go-cid"
@@ -35,18 +33,17 @@ func (b Body) TreeBlockCVs() ([]blake3tree.CV, error) {
 }
 
 // bodyHashes are the whole-body digests SplitBody and SplitSizedBody compute
-// in the pass that splits the body: the sha256 content hash, the BLAKE3 tree
-// (digest and blocks), and, unless the caller holds it already, the MD5 the
-// ETag is made from. The MD5 runs on its own goroutine (see asyncHash); the
-// other two are fast enough to run inline.
+// in the pass that splits the body: the BLAKE3 tree (digest and blocks) and,
+// unless the caller holds it already, the MD5 the ETag is made from. The MD5
+// runs on its own goroutine (see asyncHash); the tree is fast enough to run
+// inline.
 type bodyHashes struct {
-	sha  hash.Hash
 	tree *blake3tree.Hasher // nil when the tree pass is skipped
 	etag *lazyETagHash      // nil when the MD5 pass is skipped
 }
 
 func newBodyHashes(cfg splitConfig) *bodyHashes {
-	h := &bodyHashes{sha: sha256.New()}
+	h := &bodyHashes{}
 	if cfg.tree {
 		tree, err := blake3tree.NewHasher(0)
 		if err != nil {
@@ -62,7 +59,7 @@ func newBodyHashes(cfg splitConfig) *bodyHashes {
 
 // writer returns the sink the body is teed into.
 func (h *bodyHashes) writer() io.Writer {
-	ws := []io.Writer{h.sha}
+	var ws []io.Writer
 	if h.tree != nil {
 		ws = append(ws, h.tree)
 	}
@@ -83,11 +80,7 @@ func (h *bodyHashes) stop() {
 // body assembles the Body for the split blobs once the whole body has been
 // written.
 func (h *bodyHashes) body(total int64, blobs []BlobRef) (Body, error) {
-	body := Body{
-		Size:   total,
-		SHA256: h.sha.Sum(nil),
-		Blobs:  blobs,
-	}
+	body := Body{Size: total, Blobs: blobs}
 	if h.tree != nil {
 		if err := body.SetTree(h.tree.FinishObject()); err != nil {
 			return Body{}, err

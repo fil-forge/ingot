@@ -770,31 +770,7 @@ func (t *Body) MarshalCBOR(w io.Writer) error {
 
 	cw := cbg.NewCborWriter(w)
 
-	if _, err := cw.Write([]byte{170}); err != nil {
-		return err
-	}
-
-	// t.SHA256 ([]uint8) (slice)
-	if len("h") > 1000000 {
-		return xerrors.Errorf("Value in field \"h\" was too long")
-	}
-
-	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("h"))); err != nil {
-		return err
-	}
-	if _, err := cw.WriteString(string("h")); err != nil {
-		return err
-	}
-
-	if len(t.SHA256) > 2097152 {
-		return xerrors.Errorf("Byte array in field t.SHA256 was too long")
-	}
-
-	if err := cw.WriteMajorTypeHeader(cbg.MajByteString, uint64(len(t.SHA256))); err != nil {
-		return err
-	}
-
-	if _, err := cw.Write(t.SHA256); err != nil {
+	if _, err := cw.Write([]byte{169}); err != nil {
 		return err
 	}
 
@@ -1064,30 +1040,7 @@ func (t *Body) UnmarshalCBOR(r io.Reader) (err error) {
 		}
 
 		switch string(nameBuf[:nameLen]) {
-		// t.SHA256 ([]uint8) (slice)
-		case "h":
-
-			maj, extra, err = cr.ReadHeader()
-			if err != nil {
-				return err
-			}
-
-			if extra > 2097152 {
-				return fmt.Errorf("t.SHA256: byte array too large (%d)", extra)
-			}
-			if maj != cbg.MajByteString {
-				return fmt.Errorf("expected byte array")
-			}
-
-			if extra > 0 {
-				t.SHA256 = make([]uint8, extra)
-			}
-
-			if _, err := io.ReadFull(cr, t.SHA256); err != nil {
-				return err
-			}
-
-			// t.MD5 ([]uint8) (slice)
+		// t.MD5 ([]uint8) (slice)
 		case "m":
 
 			maj, extra, err = cr.ReadHeader()

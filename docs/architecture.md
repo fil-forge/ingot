@@ -135,7 +135,7 @@ seq-derived token reveals write ordering, which is accepted (S3 ids are opaque t
 **ETags.** The ETag is MD5-based, never the sha256 content digest. A whole-object ETag is the MD5 of
 the body; a multipart object's ETag is `hex(md5(concat of the N part MD5s)) + "-N"` (matching
 versitygw's `GetMultipartMD5`); each part's ETag is the hex of its MD5. MD5 is computed during ingest
-alongside sha256 at no extra pass, and stored in the manifest.
+alongside the BLAKE3 tree at no extra pass, and stored in the manifest.
 
 **Conditional requests.** versitygw parses `If-Match`/`If-None-Match`/`If-(Un)Modified-Since` and
 `x-amz-copy-source-if-*` but delegates evaluation to the backend. Ingot evaluates them against the
@@ -188,7 +188,7 @@ deferred, and a hybrid (relational index *alongside* the MST source-of-truth) is
 **The manifest** describes one object version: an envelope — key, version id, created/last-modified,
 the S3 `etag` stored verbatim (a multipart ETag cannot be re-derived from the bytes), content-type,
 system and user headers, and a delete-marker flag for tombstone versions — plus a `Body`. The `Body`
-carries the whole-object `size` and `sha256` (integrity), the whole-object BLAKE3 digest that GET and
+carries the whole-object `size`, the whole-object BLAKE3 digest that GET and
 HEAD return as a raw-codec CID in the `x-cid` header, with the chaining values of its block-aligned
 blocks (16 KiB blocks up to 8 MiB, then about sqrt(size / 32 B) blocks: 4096 blocks at 1 GiB, 128 KiB; capped at 32768 from 32 GiB) for verifying ranged reads, and an **ordered, contiguous list of body
 blobs** — *shards*, in Forge terms — `[{ digest, offset, length }]` that together cover `[0, size)`:
@@ -217,7 +217,7 @@ MST (bucket)
                     ├ deleteMarker "false"              (true ⇒ tombstone, no body)
                     └ body
                         ├ size     629_145_600          (600 MiB total)
-                        ├ sha256   <whole-body digest>  (integrity)
+                        ├ blake3   <whole-body digest>  (the x-cid)
                         └ blobs[] ── ordered, contiguous, covers [0, size) ──┐
                                                                              │
           ┌───────────────────────┬───────────────────────┬──────────────────┘
@@ -257,8 +257,9 @@ an accepted cost until catalog GC exists ([§9](#9-the-system-contract-piri--spr
 
 The data layer turns an object body into stored blobs and tracks who references them.
 
-**Object → blobs.** A body is hashed (sha256 for content addressing, md5 for the ETag) in a single
-streaming pass and written to the local store. It becomes an ordered list of content-addressed
+**Object → blobs.** A body is hashed (the BLAKE3 tree for the object digest, md5 for the ETag) in a
+single streaming pass and written to the local store, where each blob is hashed again for its content
+address. It becomes an ordered list of content-addressed
 blobs, each `≤ max_blob_size`: one blob for objects within the ceiling, a coarse split (e.g. 256 MiB
 granularity, not fine chunking) for larger ones. Each blob is uploaded to Piri by digest ([§7](#7-cross-cutting-durability-concurrency-retrieval)).
 
@@ -389,7 +390,7 @@ read at the start of the operation; on mismatch, reload and retry the (cheap) sp
 
 ```
 0. PRECONDITIONS (no lock)   evaluate If-Match / If-None-Match / If-(Un)Modified-Since (§3)
-1. INGEST  (no lock)         stream body → sha256 + md5 in one pass → local store;
+1. INGEST  (no lock)         stream body → blake3 tree + md5 in one pass → local store;
                              if size==0 store a manifest only (§3);
                              else split into ceil(size / max_blob_size) blobs
 2. UPLOAD  (no lock, per blob, keyed by digest)
