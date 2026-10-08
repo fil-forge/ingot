@@ -3,6 +3,7 @@ package migrations_test
 import (
 	"context"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -178,5 +179,73 @@ func TestUp_Live_Concurrent(t *testing.T) {
 		if err := <-errs; err != nil {
 			t.Errorf("concurrent migrations.Up: %v", err)
 		}
+	}
+}
+
+// TestUp_Live_StalledIndexMissing reproduces a database that applied 00021
+// before 00021 gained upload_intents_stalled_idx: migrated past 00021 with no
+// such index. Up must still apply 00023 and leave the index it defines. Like
+// the concurrency test, it works in a scratch database of its own.
+func TestUp_Live_StalledIndexMissing(t *testing.T) {
+	dsn := os.Getenv("INGOT_TEST_DSN")
+	if dsn == "" {
+		t.Skip("set INGOT_TEST_DSN to run the live migration test")
+	}
+	ctx := context.Background()
+
+	admin, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer admin.Close()
+
+	const scratchDB = "ingot_migrate_stalled_idx"
+	if _, err := admin.Exec(ctx, "DROP DATABASE IF EXISTS "+scratchDB+" WITH (FORCE)"); err != nil {
+		t.Fatalf("drop stale scratch database: %v", err)
+	}
+	if _, err := admin.Exec(ctx, "CREATE DATABASE "+scratchDB); err != nil {
+		t.Fatalf("create scratch database: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = admin.Exec(ctx, "DROP DATABASE IF EXISTS "+scratchDB+" WITH (FORCE)")
+	})
+
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		t.Fatalf("parse dsn: %v", err)
+	}
+	cfg.ConnConfig.Database = scratchDB
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatalf("connect to scratch database: %v", err)
+	}
+	defer pool.Close()
+
+	if err := migrations.Up(ctx, pool, zaptest.NewLogger(t)); err != nil {
+		t.Fatalf("migrations.Up: %v", err)
+	}
+	// Back to the state such a database is in: 00023 not yet applied, and no
+	// stalled index for it to drop.
+	for _, stmt := range []string{
+		`DROP INDEX ingot.upload_intents_stalled_idx`,
+		`DELETE FROM ingot.goose_db_version WHERE version_id >= 23`,
+	} {
+		if _, err := pool.Exec(ctx, stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+
+	if err := migrations.Up(ctx, pool, zaptest.NewLogger(t)); err != nil {
+		t.Fatalf("migrations.Up without the stalled index: %v", err)
+	}
+	var def string
+	err = pool.QueryRow(ctx,
+		`SELECT indexdef FROM pg_indexes
+		 WHERE schemaname = 'ingot' AND indexname = 'upload_intents_stalled_idx'`).Scan(&def)
+	if err != nil {
+		t.Fatalf("upload_intents_stalled_idx missing after migration: %v", err)
+	}
+	if !strings.Contains(def, "INCLUDE (size, state)") {
+		t.Errorf("upload_intents_stalled_idx = %q, want it to include size and state", def)
 	}
 }
