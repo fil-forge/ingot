@@ -598,7 +598,7 @@ take a new union key and coexist with old blocks under one reader, with no rewri
 
 Buckets written before versioning store manifests as bare blocks with no union key (and no
 `Seq`/`VersionID`, §2.3); the union readers reject them. Per the repo's dev-only data posture
-(CLAUDE.md: "reshape migrations in place and reset any persistent dev DB"), there is **no
+(CLAUDE.md: "reshape stored formats in place and reset dev data rather than migrating it"), there is **no
 migration**: existing dev buckets are reset rather than taught to read the pre-union form.
 
 Out of scope: `ListParts`/`ListMultipartUploads`, `GetObjectAttributes`,

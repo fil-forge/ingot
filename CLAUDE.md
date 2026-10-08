@@ -272,8 +272,14 @@ forge-mode daemon. Two tiers:
   `mst/cbor_gen.go` is separate. Verify a no-op diff after touching `bucket` types.
 - **migrations:** SQL in `migrations/sql/*.sql` (`go:embed`), applied by
   `migrations.Up` under the `ingot` schema at startup via a `PreStartHook`.
-  The schema is dev-only; reshape migrations in place and reset any
-  persistent dev DB.
+  Once a migration has merged, change the schema with a new migration, never
+  by editing the merged one. The dev node (fil-forge/infra-nodes) deploys
+  every image `main` publishes and keeps its database across deploys, and
+  goose never re-runs a version it has recorded, so an in-place edit never
+  reaches that database, and a later migration that assumes the edit fails
+  there at startup. Editing a migration that hasn't merged is fine. Other dev
+  data is still disposable: reshape stored formats in place and reset dev
+  data rather than migrating it.
 
 ## Docker images & release
 
