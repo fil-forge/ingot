@@ -79,16 +79,14 @@ type ObjectManifest struct {
 // split into N blobs (no fine chunking); a multipart object is the
 // ordered union of its parts' blobs. A zero-byte object has no blobs.
 //
-// Size and SHA256 are whole-object values (the total byte count and the
-// sha256 of the full body, for integrity). MD5 is the whole-object md5,
-// the source for a single-part object's S3 ETag. BLAKE3 is the whole-object
-// digest clients verify against (see CID), with TreeChunkLog and TreeBlocks
-// the tree material for verifying ranged reads.
+// Size is the total byte count. MD5 is the whole-object md5, the source for
+// a single-part object's S3 ETag. BLAKE3 is the whole-object digest clients
+// verify against (see CID), with TreeChunkLog and TreeBlocks the tree
+// material for verifying ranged reads.
 type Body struct {
-	Size   int64     `cborgen:"s"`
-	SHA256 []byte    `cborgen:"h"`
-	MD5    []byte    `cborgen:"m"`
-	Blobs  []BlobRef `cborgen:"bl"`
+	Size  int64     `cborgen:"s"`
+	MD5   []byte    `cborgen:"m"`
+	Blobs []BlobRef `cborgen:"bl"`
 
 	// BLAKE3 is the blake3 multihash of the whole body, the digest the
 	// x-cid header carries as a raw-codec CID. Nil in blocks written before

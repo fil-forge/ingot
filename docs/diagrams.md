@@ -176,7 +176,7 @@ flowchart TB
     put["PutObject / UploadPart body"]
 
     subgraph bodyr["the body route (raw blobs, synchronous)"]
-        split["SplitSizedBody at the declared length:<br/>coarse split at max_blob_size,<br/>sha256, BLAKE3 tree + md5 in one streaming pass"]
+        split["SplitSizedBody at the declared length:<br/>coarse split at max_blob_size,<br/>BLAKE3 tree + md5 in one streaming pass"]
         spool["Spool (DataDir/spool)<br/>+ upload_intents row<br/>(each blob streams its PUT<br/>to the provider while it is spooled)"]
         upload["per-blob upload before the commit:<br/>conclude, accept (streamed), or<br/>/blob/add, HTTP PUT, conclude, accept<br/>(a blob_locations hit skips it: dedup)"]
         bloc["blob_locations row: the whole blob,<br/>(space, digest) to provider URL"]
@@ -268,7 +268,7 @@ sequenceDiagram
         U-->>B: allocation address, put and accept tasks
         B->>R: PutStream(add task): the upload's name until parked or accepted
         par
-            B->>SP: spool under the CIPHERTEXT digest<br/>(sha256, BLAKE3 tree + md5 of the plaintext in the same pass)
+            B->>SP: spool under the CIPHERTEXT digest<br/>(BLAKE3 tree + md5 of the plaintext in the same pass)
         and
             B->>P: HTTP PUT the same envelope bytes as they are spooled
         end
@@ -317,7 +317,7 @@ sequenceDiagram
   accepted.
 - Encryption makes the stored digest a ciphertext digest: **content dedup is
   gone for bodies** (fresh CEK per write ⇒ unique envelope), by design per
-  the encryption RFC. Manifest spans, `Body.Size`, sha256/md5 and ETag stay
+  the encryption RFC. Manifest spans, `Body.Size`, the BLAKE3 tree, md5 and ETag stay
   plaintext values; `upload_intents.Size` and `blob_locations.Size` are
   stored (envelope) sizes.
 - The envelope's one COSE recipient is the tenant wrap key (kid = the key's
@@ -654,7 +654,7 @@ flowchart TB
     prev["Prev: per-key sub-MST of noncurrent versions<br/>keyed revSeqKey(seq): %016x of bit-inverted seq,<br/>so a forward walk is newest-first"]
     nulls["NullSeq: a noncurrent null<br/>version's seq (0 = none)"]
     em["EnvelopedManifest<br/>one per noncurrent version"]
-    mf["ObjectManifest<br/>Seq, VersionID, DeleteMarker, ETag, headers,<br/>Body(Size, SHA256, BLAKE3, TreeChunkLog, TreeBlocks,<br/>MD5, Blobs, PartSizes)"]
+    mf["ObjectManifest<br/>Seq, VersionID, DeleteMarker, ETag, headers,<br/>Body(Size, BLAKE3, TreeChunkLog, TreeBlocks,<br/>MD5, Blobs, PartSizes)"]
 
     root --> leafk --> union
     union --> mans

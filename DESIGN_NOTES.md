@@ -35,8 +35,8 @@ self-provisions.
 
 ## Write path
 
-A PUT streams the body into the local **spool** (sha256 and md5 in one
-pass), splits it into blobs of at most `max_blob_size`, and uploads each
+A PUT streams the body into the local **spool** (the BLAKE3 tree and md5 in
+one pass), splits it into blobs of at most `max_blob_size`, and uploads each
 blob to the network before anything commits: `/blob/add` against sprue, an
 HTTP PUT of the bytes to the allocated piri, a concluded receipt, and the
 `/blob/accept` location commitment. Only then does the short per-bucket
@@ -64,7 +64,7 @@ database involved. The write path learns the tenant from Hilt's authorize
 response (`AuthorizeOK.Tenant`, cached per access key for the local fast
 path) and resolves its wrap key through `tenantkey` (PLC resolver, cached
 for `tenantkey.cache_ttl`); a write that cannot obtain the recipient fails.
-The split geometry, manifest spans, `Body.Size`, sha256/md5 and ETag are all
+The split geometry, manifest spans, `Body.Size`, the BLAKE3 tree, md5 and ETag are all
 plaintext values — only the digest and the stored sizes
 (`upload_intents.Size`, `blob_locations.Size`) name ciphertext.
 Consequences, per the RFC: content **dedup is gone** for bodies (a fresh CEK
