@@ -24,7 +24,7 @@ in [`CLAUDE.md`](./CLAUDE.md).
   chains hilt issues to this agent).
 - **Daemon.** `ingot serve` builds the same wiring from a config file
   (cobra/viper/fx): Postgres, the sprue edge client, and hilt are all
-  required. The CLI is `serve`, `whoami`, and `version`. Docker-native;
+  required. The CLI is `serve`, `whoami`, `version` and `blake3`. Docker-native;
   ships as a smelt system.
 
 There is no standalone or in-memory mode: the deployment under test is
@@ -132,6 +132,21 @@ copied from an existing object (`UploadPartCopy`) is ingested the same way:
 the source's plaintext range streams through the decrypting read path into
 new parked blobs, so the source may be in any bucket of the tenant and
 nothing is shared with it.
+
+Each part also records its BLAKE3 tree (`blake3tree`): the aligned
+subtrees and blocks of its whole chunks, hashed at the object offset
+`UploadPart` assumes from the parts recorded so far (exact once every lower
+part exists, else assumed uniform), plus the raw bytes either side of those
+chunks (under 1 KiB each, empty for the MiB-sized parts every mainstream
+client sends). Complete checks each assumed offset against the part's true
+one, re-hashes only the parts whose assumption was wrong (the final part always,
+the others within `multipart_rehash_budget`, one maximum part by default;
+past it the object commits without a digest), hashes the chunk straddling each part boundary
+from the raw bytes, merges the parts' subtrees into the object's digest,
+builds its block list from their blocks, and checks the blocks against the
+digest. A single-part object takes its digest from part 1's own root. The
+object's `x-cid` and block list are therefore the same as a single PUT's
+would be.
 
 Complete concludes the parked parts in batches: each `/ucan/conclude`
 carries up to `MaxConcludeBatch` (1000) put receipts (`receipts`, the plural

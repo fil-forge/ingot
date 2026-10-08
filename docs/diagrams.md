@@ -123,7 +123,7 @@ flowchart TB
 
     subgraph host["host"]
         root["ingot (root)<br/>Server, Module"]
-        cmd["cmd<br/>serve, whoami, version"]
+        cmd["cmd<br/>serve, whoami, version, blake3"]
     end
 
     vgw -->|"backend.Backend"| s3f
@@ -176,7 +176,7 @@ flowchart TB
     put["PutObject / UploadPart body"]
 
     subgraph bodyr["the body route (raw blobs, synchronous)"]
-        split["SplitSizedBody at the declared length:<br/>coarse split at max_blob_size,<br/>sha256 + md5 in one streaming pass"]
+        split["SplitSizedBody at the declared length:<br/>coarse split at max_blob_size,<br/>sha256, BLAKE3 tree + md5 in one streaming pass"]
         spool["Spool (DataDir/spool)<br/>+ upload_intents row<br/>(each blob streams its PUT<br/>to the provider while it is spooled)"]
         upload["per-blob upload before the commit:<br/>conclude, accept (streamed), or<br/>/blob/add, HTTP PUT, conclude, accept<br/>(a blob_locations hit skips it: dedup)"]
         bloc["blob_locations row: the whole blob,<br/>(space, digest) to provider URL"]
@@ -268,7 +268,7 @@ sequenceDiagram
         U-->>B: allocation address, put and accept tasks
         B->>R: PutStream(add task): the upload's name until parked or accepted
         par
-            B->>SP: spool under the CIPHERTEXT digest<br/>(sha256 + md5 of the plaintext in the same pass)
+            B->>SP: spool under the CIPHERTEXT digest<br/>(sha256, BLAKE3 tree + md5 of the plaintext in the same pass)
         and
             B->>P: HTTP PUT the same envelope bytes as they are spooled
         end
@@ -654,7 +654,7 @@ flowchart TB
     prev["Prev: per-key sub-MST of noncurrent versions<br/>keyed revSeqKey(seq): %016x of bit-inverted seq,<br/>so a forward walk is newest-first"]
     nulls["NullSeq: a noncurrent null<br/>version's seq (0 = none)"]
     em["EnvelopedManifest<br/>one per noncurrent version"]
-    mf["ObjectManifest<br/>Seq, VersionID, DeleteMarker, ETag, headers,<br/>Body(Size, SHA256, MD5, Blobs, PartSizes)"]
+    mf["ObjectManifest<br/>Seq, VersionID, DeleteMarker, ETag, headers,<br/>Body(Size, SHA256, BLAKE3, TreeChunkLog, TreeBlocks,<br/>MD5, Blobs, PartSizes)"]
 
     root --> leafk --> union
     union --> mans
@@ -958,6 +958,13 @@ erDiagram
         bytea blob_digests "ordered array"
         text checksum
         text state "'accepted' never written"
+        bigint tree_offset "object offset the part's BLAKE3 tree was hashed at (assumed by UploadPart)"
+        smallint tree_chunk_log "block size of tree_blocks, base-2 exponent of chunks"
+        bytea tree_nodes "the part's aligned subtrees (blake3tree.EncodeSubtrees); NULL = no tree recorded"
+        bytea tree_blocks "the part's blocks at tree_chunk_log"
+        bytea tree_head "bytes before the part's first chunk boundary (< 1 KiB)"
+        bytea tree_tail "bytes after its last chunk boundary (< 1 KiB)"
+        bytea tree_root "the part's own BLAKE3 hash, when hashed at offset 0"
     }
     blob_release_intents {
         text space PK

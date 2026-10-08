@@ -36,6 +36,15 @@ type Config struct {
 	// coarsely split into ≤ max blobs. Validate rejects values whose envelope
 	// a default-configured piri would refuse.
 	MaxBlobSize int64 `mapstructure:"max_blob_size" yaml:"max_blob_size"`
+
+	// MultipartRehashBudget bounds the bytes CompleteMultipartUpload re-reads
+	// to hash non-final parts that were hashed at a wrong assumed offset
+	// (variable-size parts uploaded out of order; 0 -> the default, one
+	// maximum part: 5 GiB). The final part, the one straggler a uniform
+	// upload produces, is always re-hashed. A completion that would need
+	// more re-reading commits the object without a BLAKE3 digest (no x-cid)
+	// rather than stall.
+	MultipartRehashBudget int64 `mapstructure:"multipart_rehash_budget" yaml:"multipart_rehash_budget"`
 	// CORSAllowedOrigins lists the browser origins the S3 listener answers
 	// CORS for. Each entry is an exact origin ("https://app.example"), a
 	// wildcard origin ("https://*.dev.example" — one '*' standing for any
@@ -266,6 +275,8 @@ func (c Config) ServerConfig() (ServerConfig, error) {
 		DataDir:     c.DataDir,
 		Region:      c.Region,
 		MaxBlobSize: c.MaxBlobSize,
+
+		MultipartRehashBudget: c.MultipartRehashBudget,
 
 		CORSConfig: corsCfg,
 

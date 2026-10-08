@@ -1021,7 +1021,7 @@ func TestRemoveLocalRacingTakeLeavesNoCopy(t *testing.T) {
 	ctx := t.Context()
 	b, _ := newSweepBackend(t)
 	for i := range 500 {
-		d, _, err := b.spool.WriteBlob(ctx, bytes.NewReader([]byte(fmt.Sprintf("racing blob %d", i))))
+		d, _, err := b.spool.WriteBlob(ctx, bytes.NewReader(fmt.Appendf(nil, "racing blob %d", i)))
 		if err != nil {
 			t.Fatalf("WriteBlob: %v", err)
 		}
@@ -1124,7 +1124,7 @@ func TestSweepLocalBlobs_OrphanPassChecksInBatches(t *testing.T) {
 			old := time.Now().Add(-2 * DefaultLocalBlobOrphanAge)
 			var orphans, kept []multihash.Multihash
 			for i := range 6 {
-				d, n, err := b.spool.WriteBlob(ctx, bytes.NewReader([]byte(fmt.Sprintf("old blob %d", i))))
+				d, n, err := b.spool.WriteBlob(ctx, bytes.NewReader(fmt.Appendf(nil, "old blob %d", i)))
 				if err != nil {
 					t.Fatalf("WriteBlob: %v", err)
 				}

@@ -3,7 +3,6 @@ package bucket
 import (
 	"context"
 	"crypto/md5"
-	"crypto/sha256"
 	"fmt"
 	"io"
 
@@ -35,8 +34,15 @@ const DefaultMaxBlobSize int64 = blobcmds.MaxBlobSize - envelopeAllowance
 type SplitOption func(*splitConfig)
 
 type splitConfig struct {
-	md5 bool
+	md5  bool
+	tree bool
 }
+
+// WithoutTree skips the BLAKE3 tree, leaving Body.BLAKE3 and its leaves
+// unset. A multipart part is hashed as a range of the object at its own
+// offset by the caller (see s3frontend.ingestPart), so the whole-body tree
+// over the part alone would be wasted work.
+func WithoutTree() SplitOption { return func(c *splitConfig) { c.tree = false } }
 
 // WithoutMD5 skips the whole-body MD5, leaving Body.MD5 nil. The caller
 // holds the body's MD5 from another source and sets the manifest ETag from
@@ -52,12 +58,13 @@ func WithoutMD5() SplitOption { return func(c *splitConfig) { c.md5 = false } }
 // to local storage as it goes, so no blob is ever held whole in memory (a ~254 MiB
 // blob buffered in RAM × concurrent PUTs would sink a memory-constrained
 // appliance). It returns a Body whose Blobs list covers [0, Size) contiguously;
-// the whole-body sha256 and md5 are computed in the same streaming pass, the
-// md5 on its own goroutine so the stream is not serialized behind the slowest
-// hash (see asyncHash) and on the shared md5-simd server so concurrent bodies
-// share vector lanes where the CPU has them (see newETagHash). WithoutMD5
-// drops the md5 pass for a caller that already holds the value. A zero-byte
-// body yields a Body with no blobs (and the well-known empty digests).
+// the whole-body sha256, BLAKE3 tree and md5 are computed in the same
+// streaming pass (see bodyHashes), the md5 on its own goroutine so the stream
+// is not serialized behind the slowest hash (see asyncHash) and on the shared
+// md5-simd server so concurrent bodies share vector lanes where the CPU has
+// them (see newETagHash). WithoutMD5 drops the md5 pass for a caller that
+// already holds the value. A zero-byte body yields a Body with no blobs (and
+// the well-known empty digests).
 //
 // w is the local spool in production (blockstore.Spool): the blobs land on disk
 // before being uploaded to Forge by digest. SplitBody itself is storage-agnostic.
@@ -66,25 +73,18 @@ func SplitBody(ctx context.Context, w blockstore.BlobWriter, r io.Reader, maxBlo
 	if max <= 0 {
 		max = DefaultMaxBlobSize
 	}
-	cfg := splitConfig{md5: true}
+	cfg := splitConfig{md5: true, tree: true}
 	for _, o := range opts {
 		o(&cfg)
 	}
 
-	bodyHasher := sha256.New()
-	hashers := []io.Writer{bodyHasher}
-	var etagHasher *lazyETagHash
-	if cfg.md5 {
-		etagHasher = &lazyETagHash{}
-		// Every return path must finish the async hasher so its goroutine
-		// exits; Sum is idempotent, so the success path's explicit call
-		// below is fine.
-		defer etagHasher.Sum()
-		hashers = append(hashers, etagHasher)
-	}
+	hashes := newBodyHashes(cfg)
+	// Every return path must finish the async hasher so its goroutine
+	// exits; Sum is idempotent, so the success path's use below is fine.
+	defer hashes.stop()
 	// Tee everything read into the hashers so the whole-body digests are
 	// computed in the same pass that splits the body into blobs.
-	src := io.TeeReader(r, io.MultiWriter(hashers...))
+	src := io.TeeReader(r, hashes.writer())
 
 	var blobs []BlobRef
 	var total int64
@@ -107,15 +107,7 @@ func SplitBody(ctx context.Context, w blockstore.BlobWriter, r io.Reader, maxBlo
 		}
 	}
 
-	body := Body{
-		Size:   total,
-		SHA256: bodyHasher.Sum(nil),
-		Blobs:  blobs,
-	}
-	if etagHasher != nil {
-		body.MD5 = etagHasher.Sum()
-	}
-	return body, nil
+	return hashes.body(total, blobs)
 }
 
 // lazyETagHash is the whole-body MD5 pass, started by the first byte. A

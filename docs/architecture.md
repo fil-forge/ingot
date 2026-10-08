@@ -145,6 +145,9 @@ under the MST critical section, not only at read, so it is race-safe.
 
 **Multipart.** `CreateMultipartUpload` / `UploadPart` / `CompleteMultipartUpload` /
 `AbortMultipartUpload` are first-class. The mechanism lives in [§7](#7-cross-cutting-durability-concurrency-retrieval).
+A multipart object's BLAKE3 digest and block list are assembled at Complete from per-part trees
+recorded by `UploadPart`, so they match a single PUT's without re-reading the parts (see
+DESIGN_NOTES).
 
 **Copy.** `CopyObject` within a space is a metadata-only operation: it resolves the source manifest,
 writes a new version manifest pinning the **same** digests, and increments the reference index — no
@@ -185,7 +188,9 @@ deferred, and a hybrid (relational index *alongside* the MST source-of-truth) is
 **The manifest** describes one object version: an envelope — key, version id, created/last-modified,
 the S3 `etag` stored verbatim (a multipart ETag cannot be re-derived from the bytes), content-type,
 system and user headers, and a delete-marker flag for tombstone versions — plus a `Body`. The `Body`
-carries the whole-object `size` and `sha256` (integrity) and an **ordered, contiguous list of body
+carries the whole-object `size` and `sha256` (integrity), the whole-object BLAKE3 digest that GET and
+HEAD return as a raw-codec CID in the `x-cid` header, with the chaining values of its block-aligned
+blocks (16 KiB blocks up to 8 MiB, then about sqrt(size / 32 B) blocks: 4096 blocks at 1 GiB, 128 KiB; capped at 32768 from 32 GiB) for verifying ranged reads, and an **ordered, contiguous list of body
 blobs** — *shards*, in Forge terms — `[{ digest, offset, length }]` that together cover `[0, size)`:
 one entry for a small object, N for a split or multipart object. Each `digest` is the sha256 multihash
 Piri stores the shard under and the indexer resolves to a node URL — so this list is what lets a ranged
@@ -781,6 +786,16 @@ CREATE TABLE ingot.multipart_parts (
                       CHECK (state IN ('parked','accepted')),
     created_at    timestamptz NOT NULL DEFAULT now(),
     checksum      text   NOT NULL DEFAULT '',
+    -- The part's BLAKE3 tree, hashed at the object offset UploadPart assumed
+    -- and merged into the object's digest at Complete (see blake3tree).
+    -- tree_nodes NULL: no tree recorded, Complete re-hashes.
+    tree_offset   bigint NOT NULL DEFAULT 0,
+    tree_chunk_log smallint NOT NULL DEFAULT 0,          -- block size of tree_blocks, base-2 exponent of chunks
+    tree_nodes    bytea,                                 -- aligned subtrees (blake3tree.EncodeSubtrees)
+    tree_blocks   bytea,                                 -- blocks at tree_chunk_log
+    tree_head     bytea,                                 -- bytes before the part's first chunk boundary (< 1 KiB)
+    tree_tail     bytea,                                 -- bytes after its last (< 1 KiB)
+    tree_root     bytea,                                 -- the part's own hash, when hashed at offset 0
     PRIMARY KEY (upload_id, part_number)
 );
 

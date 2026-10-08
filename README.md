@@ -109,7 +109,20 @@ collaborators themselves.
 ingot serve --config /etc/ingot/config.yaml   # the gateway
 ingot whoami                                  # agent DID (and key DID) + sprue/hilt endpoints
 ingot version
+ingot blake3 hash < file                      # the object CID (x-cid) of the data
+ingot blake3 hash --bao < file                # plus the ChunkLog and Bao Outboard the Blake3 attribute carries
+ingot blake3 hash --bao --chunk-log 4 < file  # an outboard at iroh's 16 KiB block instead of ingot's block size
+ingot blake3 verify <cid> < file              # whole-object check against an x-cid
+ingot blake3 range --outboard "$OUTBOARD" --chunk-log 12 5000-200000   # aligned Range to fetch
+ingot blake3 verify --outboard "$OUTBOARD" --chunk-log 12 --offset 0 <cid> < part  # ranged check
 ```
+
+`blake3 range` and the ranged `verify` take the `Blake3` attribute of
+`GetObjectAttributes`: its `ChunkLog` (the Bao block size as a base-2 exponent of
+1 KiB chunks), and its `Outboard` either inline as the
+base64 string from the XML (`--outboard`) or from a file holding that string
+or the raw bytes (`--outboard-file`). A mismatch exits 1; any other failure
+exits 2.
 
 `serve` requires Postgres (`postgres_dsn`), the sprue edge client
 (`upload_service_url`/`_did`), and the hilt auth/tenant service

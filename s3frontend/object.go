@@ -371,8 +371,9 @@ func declaredLength(n *int64) int64 {
 // size is the body's declared length. With a streaming uploader each blob
 // goes to its provider while it is spooled: those blobs come back in
 // streamed, parked on their providers, and their intents start out uploading
-// rather than spooled. A body that turns out a different length fails.
-func (b *Backend) splitSpool(ctx context.Context, bucket string, space did.DID, r io.Reader, size int64, md5Src bodyMD5Source) (_ spooledBody, err error) {
+// rather than spooled. A body that turns out a different length fails. opts
+// are passed through to the split (a part skips the whole-body tree).
+func (b *Backend) splitSpool(ctx context.Context, bucket string, space did.DID, r io.Reader, size int64, md5Src bodyMD5Source, opts ...msbucket.SplitOption) (_ spooledBody, err error) {
 	// The span covers receiving the body (it streams in from the client as
 	// SplitBody reads it), encrypting it and writing it to the spool; the
 	// body.received event marks where the client finished sending.
@@ -389,7 +390,7 @@ func (b *Backend) splitSpool(ctx context.Context, bucket string, space did.DID, 
 		return spooledBody{}, err
 	}
 	enc := newEncryptingBlobWriter(b.spool, b.regionKeys, space, []fee.Recipient{recipient})
-	var splitOpts []msbucket.SplitOption
+	splitOpts := append([]msbucket.SplitOption(nil), opts...)
 	if md5Src != nil {
 		splitOpts = append(splitOpts, msbucket.WithoutMD5())
 	}
@@ -578,7 +579,7 @@ func (b *Backend) uploadBlob(ctx context.Context, space did.DID, blob msbucket.B
 //     (claimVersionID), so racing writers never touch one shared row;
 //   - the new generation's claims are added UNDER the per-bucket commit lock,
 //     before the root swap — a racing writer that supersedes this generation
-//     always finds the rows to drop, and a failed commit leaves at most a
+//     always finds the rows to drop, and a failed commit blocks at most a
 //     benign extra claim, never a wrong release;
 //   - the superseded generation's claims drop AFTER the commit is durable,
 //     each drop atomically enqueueing a deferred release when the space's
@@ -1031,21 +1032,22 @@ func partRange(body msbucket.Body, partNumber int32) (start, length int64, isRan
 	return 0, body.Size, true, nil, nil
 }
 
-// HeadObject returns an object's metadata, honoring `?versionId`, the
-// conditional-request preconditions, and the same byte-selection as GetObject
-// (?partNumber=N or a Range header → a 206 with Content-Range, plus
-// x-amz-mp-parts-count for a multipart part). Tagging is not implemented.
-func (b *Backend) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s3.HeadObjectOutput, error) {
+// headObject is HeadObject's metadata lookup, which GetObjectAttributes
+// shares: the output, plus the version it describes so a caller derives
+// everything else from the same manifest. It writes nothing to the
+// response. On the delete-marker errors the marker's version comes back
+// with the populated output; other errors return neither.
+func (b *Backend) headObject(ctx context.Context, input *s3.HeadObjectInput) (*s3.HeadObjectOutput, *resolvedVersion, error) {
 	if input.Bucket == nil {
-		return nil, s3err.GetAPIError(s3err.ErrInvalidBucketName)
+		return nil, nil, s3err.GetAPIError(s3err.ErrInvalidBucketName)
 	}
 	if input.Key == nil {
-		return nil, s3err.GetAPIError(s3err.ErrNoSuchKey)
+		return nil, nil, s3err.GetAPIError(s3err.ErrNoSuchKey)
 	}
 	versionID := backend.GetStringFromPtr(input.VersionId)
 	rv, err := b.resolveVersion(ctx, *input.Bucket, *input.Key, versionID)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	mf := rv.mf
 	if mf.DeleteMarker {
@@ -1058,9 +1060,9 @@ func (b *Backend) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s
 		marker := true
 		mout := &s3.HeadObjectOutput{DeleteMarker: &marker, LastModified: &lm}
 		if versionID == "" {
-			return mout, s3err.GetAPIError(s3err.ErrNoSuchKey)
+			return mout, rv, s3err.GetAPIError(s3err.ErrNoSuchKey)
 		}
-		return mout, s3err.GetAPIError(s3err.ErrMethodNotAllowed)
+		return mout, rv, s3err.GetAPIError(s3err.ErrMethodNotAllowed)
 	}
 	lastModified := time.Unix(mf.Created, 0)
 	if err := backend.EvaluatePreconditions(etagOf(mf), lastModified, backend.PreConditions{
@@ -1076,9 +1078,9 @@ func (b *Backend) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s
 		var apiErr s3err.APIError
 		if errors.As(err, &apiErr) && apiErr.HTTPStatusCode == http.StatusNotModified {
 			ifEtag := etagOf(mf)
-			return &s3.HeadObjectOutput{ETag: &ifEtag, LastModified: &lastModified}, err
+			return &s3.HeadObjectOutput{ETag: &ifEtag, LastModified: &lastModified}, nil, err
 		}
-		return nil, err
+		return nil, nil, err
 	}
 	etag := etagOf(mf)
 	objSize := mf.Body.Size
@@ -1088,7 +1090,7 @@ func (b *Backend) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s
 	// partNumber also carries x-amz-mp-parts-count for a multipart object.
 	startOffset, length, isRange, partsCount, err := selectBytes(mf.Body, input.PartNumber, backend.GetStringFromPtr(input.Range))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	var contentRange *string
 	if isRange {
@@ -1100,7 +1102,7 @@ func (b *Backend) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s
 	// (docs/s3-object-lock.md §8; docs/s3-object-tagging.md §5).
 	lockMode, lockUntil, lockHold, tagCount, err := b.stateHeaderFields(ctx, rv)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	contentType := mf.ContentType
@@ -1143,6 +1145,22 @@ func (b *Backend) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s
 			}
 		}
 	}
+	return out, rv, nil
+}
+
+// HeadObject returns an object's metadata, honoring `?versionId`, the
+// conditional-request preconditions, and the same byte-selection as GetObject
+// (?partNumber=N or a Range header → a 206 with Content-Range, plus
+// x-amz-mp-parts-count for a multipart part). Tagging is not implemented.
+func (b *Backend) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s3.HeadObjectOutput, error) {
+	out, rv, err := b.headObject(ctx, input)
+	if err != nil {
+		return out, err
+	}
+	// The object's CID rides on every successful read, ranged or not: it
+	// names the whole object, which a ranged reader verifies against through
+	// the tree (see cidHeader).
+	setCIDHeader(ctx, rv.mf.Body)
 	return out, nil
 }
 
@@ -1153,7 +1171,11 @@ func (b *Backend) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s
 // there is nothing faithful to report, and the shipped posix/azure backends
 // likewise omit it.
 func (b *Backend) GetObjectAttributes(ctx context.Context, input *s3.GetObjectAttributesInput) (s3response.GetObjectAttributesResponse, error) {
-	data, err := b.HeadObject(ctx, &s3.HeadObjectInput{
+	// headObject rather than HeadObject: the metadata without the x-cid
+	// header, which belongs to GET and HEAD responses only, and the manifest
+	// it read, so the part list and the Blake3 attribute below describe the
+	// same version as the ETag.
+	data, rv, err := b.headObject(ctx, &s3.HeadObjectInput{
 		Bucket:       input.Bucket,
 		Key:          input.Key,
 		VersionId:    input.VersionId,
@@ -1182,7 +1204,16 @@ func (b *Backend) GetObjectAttributes(ctx context.Context, input *s3.GetObjectAt
 	// list for checksummed multipart uploads — so TotalPartsCount is the
 	// faithful subset, matching AWS for a non-checksummed multipart object.
 	var objectParts *s3response.ObjectParts
-	if rv, rerr := b.resolveVersion(ctx, *input.Bucket, *input.Key, backend.GetStringFromPtr(input.VersionId)); rerr == nil && !rv.mf.DeleteMarker {
+	// The Blake3 attribute (an Ingot extension, see blake3Attribute) is
+	// built only when asked for: its outboard is 64 bytes per block, 2 MiB at
+	// the 32768-block cap and about 2.7 MiB once base64-encoded. The
+	// controller passes the requested names through; a caller that passes
+	// none (an older controller, a direct caller) gets it.
+	var blake3 *s3response.Blake3Tree
+	if wantsBlake3(input.ObjectAttributes) {
+		blake3 = blake3Attribute(rv.mf.Body)
+	}
+	{
 		sizes := rv.mf.Body.PartSizes
 		sums := rv.mf.Body.PartChecksums
 		if n := len(sizes); n > 0 {
@@ -1228,6 +1259,7 @@ func (b *Backend) GetObjectAttributes(ctx context.Context, input *s3.GetObjectAt
 	}
 
 	return s3response.GetObjectAttributesResponse{
+		Blake3:       blake3,
 		ETag:         backend.TrimEtag(data.ETag),
 		ObjectSize:   data.ContentLength,
 		StorageClass: data.StorageClass,
@@ -1418,6 +1450,10 @@ func (b *Backend) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.
 			}
 		}
 	}
+	// The object's CID rides on every successful read, ranged or not: it
+	// names the whole object, which a ranged reader verifies against through
+	// the tree (see cidHeader).
+	setCIDHeader(ctx, mf.Body)
 	return out, nil
 }
 

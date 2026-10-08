@@ -64,7 +64,8 @@ ingot depends only on these — it must **never** import `fil-forge/sprue` or
 - **`fil-forge/versitygw`** — our fork of versity/versitygw, the S3 REST front
   end (we implement `backend.Backend`). The fork adds externally derived SigV4
   signing keys (`auth.Account.SigningKey`, `middlewares.RequestIAMService`) for
-  the Hilt flow.
+  the Hilt flow, and the `Blake3` object attribute (`s3response.Blake3Tree`)
+  that GetObjectAttributes returns the object's CID and Bao outboard in.
 - Plumbing: `go-cid`, `go-block-format`, `whyrusleeping/cbor-gen` (**not**
   go-ipld-prime), `multiformats/*`, `pgx/v5`, `goose/v3`, `spf13/{cobra,viper}`,
   `uber-go/fx`, `zap`.
@@ -87,7 +88,9 @@ Public surface (what hosts import):
 
 Internal:
 
-- **`cmd/`** — the daemon (cobra/viper/fx): `serve`, `whoami`, `version`;
+- **`cmd/`** — the daemon (cobra/viper/fx): `serve`, `whoami`, `version`,
+  `blake3` (hash / verify / range: client-side checks of `x-cid` and the
+  `Blake3` attribute, over `blake3tree`);
   `deps.go` (agent identity from the PEM key + optional did:web, pgx pool).
 - **`s3frontend/`** — versitygw `backend.Backend`: `object.go`
   (Put/Get/Head/Delete/List), `version.go` (resolveVersion / commitVersion,
@@ -136,6 +139,11 @@ Internal:
   `registry.RevocationCursorStore` cursor (no cursor → subscribe from now).
 - **`tokenstore/`** — carried-from-guppy delegation store (`tokens.cbor`);
   empty today, read only by the dormant login paths.
+- **`blake3tree/`** — the BLAKE3 Merkle-tree material of a body: the
+  whole-object digest (the `x-cid` header), the block-aligned block chaining
+  values the manifest records for verifying ranged reads, and the aligned
+  subtrees of a range hashed at an offset (for assembling a multipart
+  object's tree from its parts). Wraps `lukechampine.com/blake3/guts`.
 - **`bucket/`** — the per-object model: `manifest.go` (`ObjectManifest`,
   `Body`), `leaf.go` (`ValueUnion`, `ObjectLeaf`, `VersionNode`),
   `chunker.go` (`SplitBody`, body readers), `sized.go` (`SplitSizedBody`, for
@@ -206,7 +214,10 @@ agent) and sets `Config.UploadServiceURL`/`UploadServiceDID` (sprue) +
 ## Configuration (`config.Config`)
 
 Viper/yaml-bindable (env prefix `INGOT_`, `.` → `_`). Key fields: `Enabled`,
-`Addr` (default `0.0.0.0:8080`), `DataDir`, `Region`, `MaxBlobSize`, top-level
+`Addr` (default `0.0.0.0:8080`), `DataDir`, `Region`, `MaxBlobSize`,
+`MultipartRehashBudget` (0 → 5 GiB; the re-read Complete allows for non-final
+parts hashed at a wrong assumed offset, past which the object gets no digest;
+the final part is always re-hashed), top-level
 `SealBytes`/`SealAge`/`Retain` with a `CatalogPlane` `{SealBytes, SealAge,
 Ship, Retain}` override block (the only plane), `ReadCacheBytes` (0 → 256 MiB,
 <0 → off), `UploadServiceURL`/`UploadServiceDID`/`UploadReceiptsURL` (sprue),

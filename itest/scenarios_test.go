@@ -15,9 +15,38 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awsmw "github.com/aws/aws-sdk-go-v2/aws/middleware"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go/middleware"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
+	"github.com/ipfs/go-cid"
+	mh "github.com/multiformats/go-multihash"
+	"lukechampine.com/blake3"
 )
+
+// cidOf returns the x-cid header value ingot must return for data: a
+// raw-codec CIDv1 over its BLAKE3 hash.
+func cidOf(t *testing.T, data []byte) string {
+	t.Helper()
+	sum := blake3.Sum256(data)
+	digest, err := mh.Encode(sum[:], mh.BLAKE3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cid.NewCidV1(cid.Raw, digest).String()
+}
+
+// rawHeader reads a response header the SDK has no field for from the
+// operation's result metadata.
+func rawHeader(t *testing.T, meta middleware.Metadata, name string) string {
+	t.Helper()
+	resp, ok := awsmw.GetRawResponse(meta).(*smithyhttp.Response)
+	if !ok {
+		t.Fatalf("no raw response in result metadata")
+	}
+	return resp.Header.Get(name)
+}
 
 // TestForgeScenarios covers ingot-unique behaviors the upstream versitygw
 // suite cannot assert — internal blob-plane properties and session-state
@@ -130,6 +159,32 @@ func TestForgeScenarios(t *testing.T) {
 		if want := quotedMD5(data); aws.ToString(head.ETag) != want {
 			t.Fatalf("HEAD ETag = %s, want %s", aws.ToString(head.ETag), want)
 		}
+		// The object's CID (raw-codec CIDv1 over its BLAKE3 hash) rides on
+		// HEAD and on every GET, ranged or whole.
+		if got, want := rawHeader(t, head.ResultMetadata, "x-cid"), cidOf(t, data); got != want {
+			t.Fatalf("HEAD x-cid = %q, want %q", got, want)
+		}
+		// The Blake3 attribute is accepted by name; the SDK's typed output has
+		// no field for the element, so only the request's acceptance is
+		// checked here (the element itself is covered by unit tests).
+		attrs, err := cl.GetObjectAttributes(ctx, &s3.GetObjectAttributesInput{
+			Bucket: aws.String(bucket), Key: aws.String("big"),
+			ObjectAttributes: []types.ObjectAttributes{types.ObjectAttributesEtag, "Blake3"},
+		})
+		if err != nil {
+			t.Fatalf("GetObjectAttributes with Blake3: %v", err)
+		}
+		if want := strings.Trim(quotedMD5(data), `"`); aws.ToString(attrs.ETag) != want {
+			t.Fatalf("GetObjectAttributes ETag = %q, want %q", aws.ToString(attrs.ETag), want)
+		}
+		get, err := cl.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(bucket), Key: aws.String("big"), Range: aws.String("bytes=0-9")})
+		if err != nil {
+			t.Fatalf("GetObject: %v", err)
+		}
+		get.Body.Close()
+		if got, want := rawHeader(t, get.ResultMetadata, "x-cid"), cidOf(t, data); got != want {
+			t.Fatalf("ranged GET x-cid = %q, want %q", got, want)
+		}
 	})
 
 	// ZeroByteObject: a 0-byte object stores no blob, round-trips empty,
@@ -169,6 +224,9 @@ func TestForgeScenarios(t *testing.T) {
 		}
 		if aws.ToString(head.ETag) != emptyMD5 {
 			t.Fatalf("HEAD ETag = %s, want %s", aws.ToString(head.ETag), emptyMD5)
+		}
+		if got, want := rawHeader(t, head.ResultMetadata, "x-cid"), cidOf(t, nil); got != want {
+			t.Fatalf("HEAD x-cid = %q, want %q", got, want)
 		}
 	})
 
@@ -230,6 +288,11 @@ func TestForgeScenarios(t *testing.T) {
 		}
 		if aws.ToInt64(head.ContentLength) != int64(len(whole)) {
 			t.Fatalf("HEAD size = %d, want %d", aws.ToInt64(head.ContentLength), len(whole))
+		}
+		// The multipart object's CID is the BLAKE3 hash of the whole body,
+		// assembled at Complete from the parts' trees.
+		if got, want := rawHeader(t, head.ResultMetadata, "x-cid"), cidOf(t, whole); got != want {
+			t.Fatalf("HEAD x-cid = %q, want %q", got, want)
 		}
 		// A ranged GET spanning the part-1→part-2 boundary still reconstructs.
 		p1 := len(partData[0])
@@ -573,6 +636,11 @@ func TestForgeScenarios(t *testing.T) {
 		}
 		if aws.ToInt32(part2.PartsCount) != 3 {
 			t.Fatalf("GET partNumber=2 PartsCount = %d, want 3", aws.ToInt32(part2.PartsCount))
+		}
+		// Part 3 arrived first and was hashed at an assumed offset Complete
+		// found wrong; the CID must still be the whole body's.
+		if got, want := rawHeader(t, part2.ResultMetadata, "x-cid"), cidOf(t, whole); got != want {
+			t.Fatalf("GET partNumber=2 x-cid = %q, want %q", got, want)
 		}
 	})
 

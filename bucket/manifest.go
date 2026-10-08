@@ -81,12 +81,32 @@ type ObjectManifest struct {
 //
 // Size and SHA256 are whole-object values (the total byte count and the
 // sha256 of the full body, for integrity). MD5 is the whole-object md5,
-// the source for a single-part object's S3 ETag.
+// the source for a single-part object's S3 ETag. BLAKE3 is the whole-object
+// digest clients verify against (see CID), with TreeChunkLog and TreeBlocks
+// the tree material for verifying ranged reads.
 type Body struct {
 	Size   int64     `cborgen:"s"`
 	SHA256 []byte    `cborgen:"h"`
 	MD5    []byte    `cborgen:"m"`
 	Blobs  []BlobRef `cborgen:"bl"`
+
+	// BLAKE3 is the blake3 multihash of the whole body, the digest the
+	// x-cid header carries as a raw-codec CID. Nil in blocks written before
+	// it was recorded, which return no x-cid.
+	BLAKE3 []byte `cborgen:"b3"`
+	// TreeChunkLog is the block size of TreeBlocks as a base-2 exponent of
+	// BLAKE3 chunks, the unit Bao libraries take: 4 (16 KiB) for bodies up
+	// to 8 MiB, then the block grows with the square root of the size
+	// (blake3tree.ChunkLog): 4096 blocks of 256 KiB at 1 GiB, 10,240 of
+	// 1 MiB at 10 GiB, capped at 32768 blocks (1 MiB) from 32 GiB. Zero
+	// when BLAKE3 is nil.
+	TreeChunkLog uint8 `cborgen:"tc"`
+	// TreeBlocks holds the BLAKE3 chaining value (32 bytes) of every block
+	// of the body, concatenated in order. A client
+	// checks the list against BLAKE3 by merging it up to the root, then
+	// verifies each block it reads against its CV. Nil for a zero-byte
+	// body and in blocks written before it was recorded.
+	TreeBlocks []byte `cborgen:"tb"`
 
 	// PartSizes records the byte length of each multipart part, in upload order,
 	// segmenting [0, Size) into the parts the client completed. It lets a GET/HEAD
