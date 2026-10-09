@@ -880,6 +880,7 @@ erDiagram
         text space "Forge space DID"
         text tenant "owning tenant DID"
         text versioning "unversioned, enabled, suspended"
+        text encryption "AES256, none; NULL = unconfigured, encrypts"
         bigint next_version_seq
     }
     segments {
@@ -949,6 +950,7 @@ erDiagram
         text object_key
         text state "open, completing, aborting, completed"
         timestamptz state_changed_at "the sweeper's clock"
+        boolean plaintext "store parts as received; decided at create"
         text checksum_algorithm
     }
     multipart_parts {
