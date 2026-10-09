@@ -81,10 +81,10 @@ A write splits into two paths:
   `forge_root_cid` under a guard. See
   [`logstore/README.md`](./logstore/README.md).
 
-Reads fall through tiers: the spool, the local log (catalog blocks), and
-finally the network, resolved by a local locator (`blob_locations` +
-`shard_inclusions`) and fetched with a ranged `content/retrieve` against the
-storing piri. The two routes are drawn side by side in
+Reads fall through tiers: local disk (cache, then spool), the local log
+(catalog blocks), and finally the network, resolved by a local locator
+(`blob_locations` + `shard_inclusions`) and fetched with a ranged
+`content/retrieve` against the storing piri. The two routes are drawn side by side in
 [`docs/diagrams.md`](./docs/diagrams.md#two-block-routes-body-blobs-and-catalog-blocks).
 
 ## Running it
@@ -132,7 +132,119 @@ environment variables apply: `OTEL_EXPORTER_OTLP_HEADERS` authenticates to the
 collector, and `OTEL_TRACES_SAMPLER_ARG` sets the fraction of requests traced
 (`0.01` traces 1%; the default traces every request). As a library, ingot
 records spans on the global tracer provider, so an embedding host decides
-where they go.
+where they go. Metrics go to the same collector under the same variables
+(`OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` overrides the endpoint for them alone,
+and `OTEL_METRIC_EXPORT_INTERVAL` sets how often they are pushed); as a
+library, ingot records them on the global meter provider.
+
+### Local disk
+
+`serve` keeps object bodies in two directories under `data_dir`, which
+must be on one filesystem (`serve` checks this at startup):
+
+- `<data_dir>/spool` holds each body as it is written and uploaded, until
+  the provider holds it;
+- `<data_dir>/cache` holds a body once the provider holds it (it moves there
+  by rename), so a read soon after a write is served from local disk.
+
+A cached copy is not needed, so it goes:
+
+- when a deleted or overwritten object's release runs (`release_grace`,
+  default 60s, after its last reference drops). The release also removes the
+  provider's copy, so a GET still streaming the old object once the grace
+  has passed fails when it reaches a blob it has not yet opened:
+  `release_grace` bounds how long such a read may take;
+- with `local_blob_max_bytes` set, when a sweeper, checking every 30 seconds,
+  finds the two directories over the budget and evicts cached bodies, oldest
+  first, down to 90% of the budget. Later reads of an evicted body go to the
+  provider and take provider-read latency.
+
+Two windows keep cached bodies local while the budget allows:
+`cache_min_residency` (default `10m`) passes over bodies whose upload
+changed state that recently (for a committed object, its commit), so a
+client reading back what it just wrote reads from disk, and
+`cache_read_retention` (default `1h`) passes over bodies read from the cache
+that recently (remembered in memory for up to 65,536 bodies, and forgotten
+on restart). If usage is still over budget after that, the sweeper evicts
+inside the windows, since a full disk fails every write, but only down to
+the budget: first bodies inside `cache_min_residency` that no one has read
+recently, then, only if that is not enough, recently read ones too. It warns
+at most once an hour when it does; the `budget_forced` removals count each
+time. `0s` turns either window off.
+
+A multipart part's copy goes from the spool as soon as the part parks on its
+provider, so Complete relies on the provider keeping the parked allocation
+until then; keep `multipart_session_ttl` (default `168h`) well under how
+long the provider keeps parked allocations. The TTL counts from the
+session's last state change, and a failed Complete returns the session to
+open, which restarts it, so a part can outlive the TTL. The budget is off by default
+(`local_blob_max_bytes: 0`): without it the cache grows with every live
+object's bodies. A node that rarely reads back what it just wrote can keep
+no written bodies at all: with `cache_writes: false`, each body's copy goes
+as soon as the provider accepts it instead of moving to the cache, and every
+read goes to the provider. The spool then holds only bodies still being
+written or uploaded and the bodies of failed uploads, apart from a copy
+whose removal failed, which waits for its object's release or the budget;
+bodies cached before the setting was turned off stay until they are
+released or evicted. With or without a
+budget, the sweeper also deletes, at startup and then hourly, unfinished
+`.tmp-*` writes in either directory and spool files with no upload intent,
+once they are older than `local_blob_orphan_age` (default `24h`, at least
+`1h`). Once at each startup, `serve` also deletes the copies of objects
+deleted by a version of ingot that kept them.
+
+**Sizing.** The filesystem needs room for:
+
+- `local_blob_max_bytes`, plus 10% headroom that must exceed the ingest rate
+  × 30 seconds (60 GB at 2 GB/s). To evict outside `cache_min_residency`,
+  the budget must also exceed the ingest rate × the window (1.2 TB at 2 GB/s
+  for the default `10m`); below that, sweeps evict inside the window, and
+  warn at most once an hour. Likewise, to keep recently read bodies, it must
+  exceed the bodies read within `cache_read_retention` (up to 65,536 of them,
+  each up to `max_blob_size`); a read working set bigger than the budget is
+  evicted inside the window every sweep;
+- the spool's bodies in flight, when they outgrow the budget: each
+  concurrent PUT or UploadPart writes its body as it streams, and a part can
+  be up to 5 GiB. The budget counts those bytes as they land, so the sweeper
+  evicts cached bodies to make room for them. But a body cannot be evicted
+  until the provider holds it, so if the spool alone exceeds the budget,
+  usage runs over it by the difference;
+- the bodies of uploads that failed: their upload intents stay `spooled` or
+  `uploading`, and nothing reclaims a failed PUT's spool files yet, so they
+  stay and count against the budget. (A multipart part's go with its
+  session, at Complete, Abort or `multipart_session_ttl`.) They are not safe
+  to delete by hand (see *Manual cleanup* below), so size the budget with
+  headroom for them. `ingot.local_blobs.stalled_bytes` reports how much they
+  hold;
+- the catalog log, if it shares the filesystem: `<data_dir>/segments`, per
+  bucket about (`retain` + the open and unshipped segments) × `seal_bytes`.
+
+**Metrics.** With metrics on, local blob storage reports:
+
+| Metric | Meaning |
+| -- | -- |
+| `ingot.local_blobs.usage` | Bytes held, by `dir`: `spool` (writes in progress and bodies awaiting upload, which eviction cannot touch) or `cache` |
+| `ingot.local_blobs.budget` | `local_blob_max_bytes` (0: no budget) |
+| `ingot.local_blobs.stalled_bytes` | Bytes of bodies whose upload has stalled, by `state`: intents still `spooled` or `uploading` an hour after their last state change, which nothing reclaims yet for a failed PUT (a multipart part's go with its session). `spooled` bodies never left this node; `uploading` ones may have reached their provider. Growth means uploads are failing |
+| `ingot.local_blobs.removals`, `ingot.local_blobs.removed_bytes` | Files and bytes removed, by `reason`: `released`, `parked`, `accepted` (with `cache_writes: false`), `budget`, `budget_forced` (inside a retention window), `orphan` |
+| `ingot.local_blobs.reads` | Body-blob reads, by `tier`: `local` or `network` (the local hit ratio) |
+
+**Manual cleanup.** Every file in `<data_dir>/cache` is safe to delete: the
+provider holds its body. A file in `<data_dir>/spool` may be the only copy.
+The one kind safe to delete is a body the provider already holds, left in
+the spool by an interrupted move; this query lists those (the file names are
+the hex digests):
+
+```sql
+SELECT encode(i.digest, 'hex') FROM ingot.upload_intents i
+WHERE i.state IN ('accepted', 'published')
+  AND EXISTS (SELECT 1 FROM ingot.blob_locations l WHERE l.digest = i.digest);
+```
+
+Never delete the spool file of a `spooled` or `uploading` intent: it may be
+the only copy. Restart `serve` after deleting files by hand: the byte counts
+see such a change at startup, or only at an hourly scan that no write
+overlapped.
 
 ## Build & test
 

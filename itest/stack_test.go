@@ -178,6 +178,21 @@ func withMultipartTTLConfig() stack.Option {
 	return stack.WithServiceConfig("ingot", "testdata/config-mpttl.yaml")
 }
 
+// withLocalBlobBudgetConfig mounts testdata/config-localblobbudget.yaml — a
+// 4 MiB local_blob_max_bytes with the residency and read-retention windows
+// off, so the local blob sweeper evicts within a test's budget. Dedicated
+// stacks only: other tests read envelopes back from local disk.
+func withLocalBlobBudgetConfig() stack.Option {
+	return stack.WithServiceConfig("ingot", "testdata/config-localblobbudget.yaml")
+}
+
+// withUncachedWritesConfig mounts testdata/config-uncachedwrites.yaml —
+// cache_writes off, so no written body stays on local disk. Dedicated stacks
+// only: other tests read envelopes back from local disk.
+func withUncachedWritesConfig() stack.Option {
+	return stack.WithServiceConfig("ingot", "testdata/config-uncachedwrites.yaml")
+}
+
 // ingotSQL runs one SQL statement against ingot's Postgres and returns the
 // bare psql output (rows, newline-separated). Digests round-trip as hex:
 // encode(digest,'hex') out, decode('<hex>','hex') in.
@@ -383,13 +398,47 @@ func hiltProvisionTenantErr(ctx context.Context, s *stack.Stack, tenantID string
 	return created.AccessKeyID, created.SecretAccessKey, nil
 }
 
-// spoolBlobCount counts the body blobs in the ingot container's spool,
-// ignoring in-progress temp files. Used to prove object bodies are spooled by
+// uploadIntentSizes lists the blobs ingot has recorded and not yet released:
+// hex digest to stored (envelope) byte count, from upload_intents. Diffing two
+// listings around a write identifies the envelope(s) that write stored — the
+// digest names the ciphertext, so it cannot be computed from the plaintext —
+// whether or not their spool copies are still on disk.
+func uploadIntentSizes(t *testing.T, ctx context.Context, s *stack.Stack) map[string]int64 {
+	t.Helper()
+	out := ingotSQL(t, ctx, s, `SELECT encode(digest,'hex') || ' ' || size FROM ingot.upload_intents`)
+	sizes := map[string]int64{}
+	for _, line := range strings.Split(out, "\n") {
+		if line = strings.TrimSpace(line); line == "" {
+			continue
+		}
+		hexDigest, size, ok := strings.Cut(line, " ")
+		n, err := strconv.ParseInt(size, 10, 64)
+		if !ok || err != nil {
+			t.Fatalf("parse upload intent row %q", line)
+		}
+		sizes[hexDigest] = n
+	}
+	return sizes
+}
+
+// newIntentDigests returns the digests in after that are not in before.
+func newIntentDigests(before, after map[string]int64) []string {
+	var added []string
+	for d := range after {
+		if _, ok := before[d]; !ok {
+			added = append(added, d)
+		}
+	}
+	return added
+}
+
+// localBlobCount counts the body blobs in the ingot container's spool and
+// cache, ignoring in-progress temp files. Used to prove object bodies are spooled by
 // digest (the data-plane inversion), not journaled into the log.
-func spoolBlobCount(t *testing.T, ctx context.Context, s *stack.Stack) int {
+func localBlobCount(t *testing.T, ctx context.Context, s *stack.Stack) int {
 	t.Helper()
 	out, errOut, err := s.Exec(ctx, "ingot", "sh", "-c",
-		`find /data/spool -maxdepth 1 -type f ! -name '.tmp*' 2>/dev/null | wc -l`)
+		`find /data/spool /data/cache -maxdepth 1 -type f ! -name '.tmp*' 2>/dev/null | wc -l`)
 	if err != nil {
 		t.Fatalf("count spool blobs: %v (stderr=%s)", err, errOut)
 	}
@@ -400,14 +449,34 @@ func spoolBlobCount(t *testing.T, ctx context.Context, s *stack.Stack) int {
 	return n
 }
 
-// spoolBlobPaths lists the body-blob files in the ingot container's spool
-// (full paths, in-progress temp files excluded). Diffing two listings around
-// a PUT identifies the envelope(s) that PUT spooled — the filename is the
-// ciphertext digest, so it cannot be computed from the plaintext.
-func spoolBlobPaths(t *testing.T, ctx context.Context, s *stack.Stack) map[string]bool {
+// localBlobBytes sums the sizes of the body blobs in the ingot container's
+// spool and cache, ignoring in-progress temp files.
+func localBlobBytes(t *testing.T, ctx context.Context, s *stack.Stack) int64 {
 	t.Helper()
 	out, errOut, err := s.Exec(ctx, "ingot", "sh", "-c",
-		`find /data/spool -maxdepth 1 -type f ! -name '.tmp*' 2>/dev/null`)
+		`find /data/spool /data/cache -maxdepth 1 -type f ! -name '.tmp*' -printf '%s\n' 2>/dev/null`)
+	if err != nil {
+		t.Fatalf("list spool sizes: %v (stderr=%s)", err, errOut)
+	}
+	var total int64
+	for _, line := range strings.Fields(out) {
+		n, err := strconv.ParseInt(line, 10, 64)
+		if err != nil {
+			t.Fatalf("parse spool size %q: %v", line, err)
+		}
+		total += n
+	}
+	return total
+}
+
+// localBlobPaths lists the body-blob files in the ingot container's spool and
+// cache (full paths, in-progress temp files excluded). Diffing two listings around
+// a PUT identifies the envelope(s) that PUT spooled — the filename is the
+// ciphertext digest, so it cannot be computed from the plaintext.
+func localBlobPaths(t *testing.T, ctx context.Context, s *stack.Stack) map[string]bool {
+	t.Helper()
+	out, errOut, err := s.Exec(ctx, "ingot", "sh", "-c",
+		`find /data/spool /data/cache -maxdepth 1 -type f ! -name '.tmp*' 2>/dev/null`)
 	if err != nil {
 		t.Fatalf("list spool blobs: %v (stderr=%s)", err, errOut)
 	}
@@ -420,8 +489,8 @@ func spoolBlobPaths(t *testing.T, ctx context.Context, s *stack.Stack) map[strin
 	return paths
 }
 
-// newSpoolPaths returns the paths in after that are not in before.
-func newSpoolPaths(before, after map[string]bool) []string {
+// newLocalPaths returns the paths in after that are not in before.
+func newLocalPaths(before, after map[string]bool) []string {
 	var added []string
 	for p := range after {
 		if !before[p] {
@@ -431,12 +500,12 @@ func newSpoolPaths(before, after map[string]bool) []string {
 	return added
 }
 
-// corruptSpoolFileTail overwrites 16 bytes of the spooled envelope at path,
+// corruptLocalFileTail overwrites 16 bytes of the spooled envelope at path,
 // tailOffset bytes from its end, with zeros — a byte-level tamper inside the
 // final ciphertext chunk (the envelope's tail is STREAM ciphertext; 16
 // random bytes are all-zero with probability 2^-128). Fails if the file
 // content did not change.
-func corruptSpoolFileTail(t *testing.T, ctx context.Context, s *stack.Stack, path string, tailOffset int64) {
+func corruptLocalFileTail(t *testing.T, ctx context.Context, s *stack.Stack, path string, tailOffset int64) {
 	t.Helper()
 	script := fmt.Sprintf(`
 		f=%q

@@ -275,13 +275,19 @@ digest must be known before `allocate`, and because that local copy does double 
 - **Read cache (optional, recommended):** beyond that floor, the local store serves hot reads
   directly, skipping the indexer→Piri round-trip. Read-after-write retains *recently written* data;
   a cache retains *recently read* data, so the two may use distinct eviction policies over a shared,
-  bounded, size-configurable store. The alternative — a near-stateless Ingot that resolves every read
-  through the indexer — trades latency for simpler horizontal scaling; it is a supported mode, but
-  the read-after-write floor holds regardless.
+  bounded, size-configurable store. *(Built as two directories, a spool for writes and bodies
+  awaiting upload and a cache for copies the provider holds, under one byte budget,
+  `local_blob_max_bytes`, evicting blobs the provider holds, oldest first, with a read-after-write
+  window, `cache_min_residency`, and a read-recency window, `cache_read_retention`; network reads
+  do not fill the cache yet; see §12.)* The
+  alternative — a near-stateless Ingot that resolves every read through the indexer — trades
+  latency for simpler horizontal scaling; it is a supported mode, but the read-after-write floor
+  holds regardless.
 
-The `upload_intents` table tracks each in-flight blob: `digest → { local_path, size, state:
-spooled│parked│accepted│published, owner ref }`. It drives read-after-write, cache lookup, and crash
-recovery. The Postgres schema for this and every other Ingot table is in **[Appendix C](#appendix-c--postgres-schema-the-ingot-schema)**.
+The `upload_intents` table records each blob Ingot has spooled, from ingest until its release:
+`digest → { local_path, size, state: spooled│uploading│parked│accepted│published, owner ref,
+evicted_at }`. It records how far each blob got, which uploads, releases and eviction act on; local
+reads go by the files themselves. The Postgres schema for this and every other Ingot table is in **[Appendix C](#appendix-c--postgres-schema-the-ingot-schema)**.
 
 **Dedup and the reference index.** Piri stores identical bytes once (it answers `allocate` with
 "already have it" when the digest exists), so one blob can back many object versions — a re-PUT of
@@ -411,7 +417,7 @@ clean up parked blobs.
 ```
 CreateMultipartUpload → uploadId, session (state=open)
 UploadPart(n)         → ingest + split + blob/add + PUT → PARKED (no accept); record part
-                        ETag = hex(part MD5)
+                        ETag = hex(part MD5); the part's local copy is removed once parked
 CompleteMultipartUpload([parts])
      latch session open→completing            (§7.3); validate parts (S3 rules)
      trigger accept for every part's blobs
@@ -523,7 +529,7 @@ negotiations).
 | Capability                                                                                     | Service                         | Status       | Notes                                                                                                                                                                                                               |
 |------------------------------------------------------------------------------------------------|---------------------------------|--------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `allocate` / `PUT` / `accept` blob lifecycle                                                   | Piri/Sprue                      | **exists**   | The storage primitive Ingot builds on.                                                                                                                                                                              |
-| Ingot-timed accept (PUT a part, defer the conclude until Complete)                             | Ingot + Sprue                   | **exists**   | `forgeclient.BlobAdd` with `WithConclude(false)` stops at the conclude seam (`BlobConcludeBatch` finishes it, delivering a Complete's parked parts in `/ucan/conclude` batches of up to 1000); UploadPart parks (durable, unaggregated), Complete concludes — Sprue's conclude handler already ran accept standalone. Ingot still does **not** issue `accept` (Piri requires the upload-service DID). |
+| Ingot-timed accept (PUT a part, defer the conclude until Complete)                             | Ingot + Sprue                   | **exists**   | `forgeclient.BlobAdd` with `WithConclude(false)` stops at the conclude seam (`BlobConcludeAll` finishes it, delivering a Complete's parked parts as up to 1000 receipts per `/ucan/conclude`); UploadPart parks (durable, unaggregated), Complete concludes — Sprue's conclude handler already ran accept standalone. Ingot still does **not** issue `accept` (Piri requires the upload-service DID). |
 | `abort(digest)` — drop a parked blob                                                           | Piri + Sprue + libforge         | **exists**   | `/blob/abort` on Sprue translates to `/blob/reject` on Piri, which refuses blobs the invoking space has accepted (`BlobAccepted`), deletes the space's allocation, and drops the bytes once no space holds an allocation or acceptance. Sprue recovers the provider from the `cause` receipt chain (a parked blob has no registration). Abort/TTL/supersede unwind through it.  |
 | `remove(digest)` — per-space claim release; physical delete/piece-retire at zero global claims | Piri + Sprue + libforge         | **exists**   | `/blob/remove` on Sprue forwards `/blob/release` to Piri, which deletes the space's allocation/acceptance/claim; at zero claims bytes delete immediately (unaggregated) or via the pending-removal sweep once the whole aggregate root is dead (FIL-623/624). Sprue forwards to primary + replicas (FIL-522). |
 | Configurable, adaptive size policy (`min`/`max`); batch guard for the `extraData` cap          | Piri                            | **partial**  | `MinAggregateSize` is hardcoded 128 MiB; lower to ~8 MiB and make configurable. The `addPieces` batch is no longer contract-capped (FWSS v1.3.0 removed the `extraData` cap); size it to the FVM `PiecesAdded` event-size + per-tx gas — a measured ceiling (default `BatchSize=10` is safely within it) (pdp-sim). No contract change. |
@@ -697,17 +703,20 @@ CREATE TABLE ingot.blob_refs (
 -- Drives "is (space, digest) still claimed?" — the gate on remove(digest).
 CREATE INDEX blob_refs_claim_idx ON ingot.blob_refs (space, digest);
 
--- The local-store index (§5): every blob Ingot holds on disk. state advances
--- spooled → parked → accepted ('published' is declared but unwritten today).
+-- The local-store index (§5): every blob Ingot has spooled. state advances
+-- spooled → uploading → (parked →) accepted → published; published is written
+-- with the first reference claim. Eviction removes the local copy and sets
+-- evicted_at, leaving the row and its state.
 CREATE TABLE ingot.upload_intents (
     digest      bytea PRIMARY KEY,                       -- sha256 multihash of the blob
     local_path  text   NOT NULL,
-    size        bigint NOT NULL,
+    size        bigint NOT NULL,                         -- stored (envelope) bytes = file size
     state       text   NOT NULL
-                    CHECK (state IN ('spooled','parked','accepted','published')),
+                    CHECK (state IN ('spooled','uploading','parked','accepted','published')),
     bucket      text,                                    -- owner ref (originating op), for cleanup
     created_at  timestamptz NOT NULL DEFAULT now(),
-    updated_at  timestamptz NOT NULL DEFAULT now()
+    updated_at  timestamptz NOT NULL DEFAULT now(),      -- last state change
+    evicted_at  timestamptz                              -- NULL: file on disk
 );
 
 -- Local blob location table (§8, appliance topology): (space, digest) →
@@ -868,7 +877,7 @@ reference index — and is out of scope for this iteration.
 
 ### Deferred as forge-mode glue (validated live in smelt, not the in-process harness)
 
-The in-memory harness uses a no-op uploader and serves reads from the spool; the forge-network
+The in-memory harness uses a no-op uploader and serves reads from local disk; the forge-network
 paths below are exercised against the real stack by the smelt-based `itest/` harness in CI:
 
 - **`remove(digest)` and `abort(digest)` are live.** `RemoveBlob` invokes `/blob/remove` on
@@ -877,32 +886,44 @@ paths below are exercised against the real stack by the smelt-based `itest/` har
   it into `/blob/reject` on the node (provider recovered from the `cause` receipt chain);
   allocation-expiry GC (FIL-625) remains the backstop when an abort never arrives.
 - **The local-table `Locator` read tier is wired and validated.** Body blobs re-resolve after
-  spool loss from `blob_locations` + `/content/retrieve` (`TestForgeReadAfterEviction`), and
+  local-copy loss from `blob_locations` + `/content/retrieve` (`TestForgeReadAfterEviction`), and
   retention-retired catalog blocks resolve via `shard_inclusions` (#44) — the read paths of
   [§7.4](#74-read-getobject) / [§8](#8-retrieval-addressing-when-bodies-need-a-sharded-dag-index).
-  Spool **eviction** itself is still unbuilt: nothing bounds the spool, and `DeleteObject`'s
-  release is network-side only, so local disk grows with every body byte ever written — the
-  bounded-cache policy [§5](#5-the-data-layer) specifies is tracked in #48.
+  **Local blob storage is split by role and bounded by a byte budget.** A body is written to the
+  spool (`<data_dir>/spool`) and moves to the cache (`<data_dir>/cache`) once the provider holds it.
+  With `local_blob_max_bytes` set (`SweepLocalBlobs`), every 30s the sweeper evicts blobs the
+  provider holds (a location or park row), oldest first, down to 90% of the budget, honouring a
+  read-after-write window (`cache_min_residency`) and a read-recency window (`cache_read_retention`)
+  unless usage stays over budget, in which case it evicts inside them, only down to the budget;
+  hourly it deletes orphan files. Once at startup, `serve` deletes the copies of committed blobs
+  whose release finished while releases kept them. The budget is off by default. A release frees a
+  deleted object's local copies, and a parked part's copy goes once it parks. Local blob storage
+  reports its usage by directory, budget, stalled uploads, removals by reason and reads by tier as
+  OpenTelemetry metrics (`ingot.local_blobs.*`). With `cache_writes: false`, a body's copy goes as
+  soon as the provider accepts it, giving up the read-after-write copy (§4): safe while reads
+  resolve through the local location table (`LocalLocator`); with an indexer-backed locator, §4's
+  race on a digest not yet published would return. Still open under #48: nothing reclaims a failed
+  upload's body.
 - **Multipart parts park at UploadPart, accept at Complete.** (Built: `parkBlobs`/`concludeBlobs`
-  over the `blob_parks` table.) The in-process harness still spools parts
-  at `UploadPart` and uploads+accepts them at `Complete`; the true forge *parking* (upload early,
-  accept-at-Complete) and the `/blob/abort` unwind from [§7.2](#72-multipart)–[7.3](#73-the-session-latch-the-abortcomplete-race) are forge-mode refinements.
+  over the `blob_parks` table.) A parked part holds no local bytes: its spool copy is removed once
+  it parks, and Complete concludes it from its park row. Abort and session expiry unwind parked
+  blobs with `/blob/abort` ([§7.2](#72-multipart)–[7.3](#73-the-session-latch-the-abortcomplete-race)).
 - **Crash recovery for the spool is not built.** The `upload_intents` × `blob_refs` reconciliation
   the failure-mode table in [§7.5](#75-concurrency-durability-and-failure-modes) describes (resume/`abort` parked, `remove` accepted-but-unreferenced)
   is a later phase; a partial post-commit reference-index write currently relies on retry/idempotency.
 - **Indexer retraction on delete** is unimplemented (no-op). `ListParts` and
   `ListMultipartUploads` are implemented (paginated, prefix/delimiter/marker semantics;
   in-flight sessions only).
-- **Multipart hygiene (spool-model edition).** Abort and part re-upload delete the
-  now-unreferenced spooled blobs (guarded against content-addressed sharing with other
-  sessions and committed objects), and a background sweeper aborts open sessions older
-  than `multipart_session_ttl` (default 7d) and reaps terminal session rows. A successful
-  Complete retains its session in state `completed` so a duplicate Complete is idempotent
-  per S3. `DeleteBucket` implicitly aborts the bucket's in-flight sessions before the space
-  delete (upstream's conformance teardown never aborts them); `s3:DeleteBucket` delegates
-  `blob.Abort` and `blob.Remove`, so the abort and every other release leg signs with the
-  request's own proofs. The network-side `/blob/abort` unwind remains a parking-flow
-  concern (above).
+- **Multipart hygiene.** Abort, part re-upload and Complete (for parts omitted from its list) record
+  a release for each now-unreferenced part blob (guarded against content-addressed sharing with
+  other sessions and committed objects). The release shreds the blob's key, unwinds it on the
+  network as its state requires, then removes its local copy and intent. A background sweeper aborts
+  open sessions older than `multipart_session_ttl` (default 7d) and reaps terminal session rows. A
+  successful Complete retains its session in state `completed` so a duplicate Complete is idempotent
+  per S3. `DeleteBucket` implicitly aborts the bucket's in-flight sessions before the space delete
+  (upstream's conformance teardown never aborts them); `s3:DeleteBucket` delegates `blob.Abort` and
+  `blob.Remove`, so the abort and every other release leg signs with the request's own proofs. The
+  network-side `/blob/abort` unwind remains a parking-flow concern (above).
 
 ### Known correctness boundary
 

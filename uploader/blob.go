@@ -78,7 +78,7 @@ type UploadedBlob struct {
 // BodyUploader makes one object-body blob durable on Forge by digest: allocate
 // → PUT (skipped on dedup) → accept, returning its published location.
 // WithConclude(false) stops before accept (see UploadedBlob). It is the
-// data-plane counterpart to Uploader (which ships catalog CAR segments). Unlike
+// object-body counterpart to Uploader (which ships catalog CAR segments). Unlike
 // the old data-plane pipeline, this is synchronous: a blob is durable — and,
 // when concluding, accepted — on Piri before the write path commits the
 // manifest that references it (docs/architecture.md §5, §7.1).
@@ -208,7 +208,7 @@ func (u *Forge) ConcludeBlobs(ctx context.Context, space did.DID, parked []Uploa
 			PutInvocation: p.PutInvocation,
 		}
 	}
-	added, err := u.client.BlobConcludeBatch(ctx, space, req)
+	added, err := u.client.BlobConcludeAll(ctx, space, req)
 	// Every blob comes back, located or still parked, whether or not the
 	// batch as a whole succeeded. What was located is converted before the
 	// error is looked at, so the caller can record it.

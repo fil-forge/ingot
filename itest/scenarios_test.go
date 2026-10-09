@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -86,7 +85,7 @@ func TestForgeScenarios(t *testing.T) {
 		const size = 3*maxBlob + maxBlob/2
 		data := patternBytes(size)
 
-		spoolBefore := spoolBlobCount(t, ctx, s)
+		spoolBefore := localBlobCount(t, ctx, s)
 		put, err := cl.PutObject(ctx, &s3.PutObjectInput{
 			Bucket: aws.String(bucket),
 			Key:    aws.String("big"),
@@ -98,7 +97,7 @@ func TestForgeScenarios(t *testing.T) {
 		if want := quotedMD5(data); aws.ToString(put.ETag) != want {
 			t.Fatalf("PUT ETag = %s, want %s", aws.ToString(put.ETag), want)
 		}
-		if got := spoolBlobCount(t, ctx, s) - spoolBefore; got != 4 {
+		if got := localBlobCount(t, ctx, s) - spoolBefore; got != 4 {
 			t.Fatalf("PUT added %d spool blobs, want 4 — bodies must be spooled by digest, not logged", got)
 		}
 
@@ -142,7 +141,7 @@ func TestForgeScenarios(t *testing.T) {
 		}
 
 		const emptyMD5 = `"d41d8cd98f00b204e9800998ecf8427e"`
-		spoolBefore := spoolBlobCount(t, ctx, s)
+		spoolBefore := localBlobCount(t, ctx, s)
 		put, err := cl.PutObject(ctx, &s3.PutObjectInput{
 			Bucket: aws.String(bucket),
 			Key:    aws.String("empty"),
@@ -154,7 +153,7 @@ func TestForgeScenarios(t *testing.T) {
 		if aws.ToString(put.ETag) != emptyMD5 {
 			t.Fatalf("PUT ETag = %s, want %s", aws.ToString(put.ETag), emptyMD5)
 		}
-		if got := spoolBlobCount(t, ctx, s) - spoolBefore; got != 0 {
+		if got := localBlobCount(t, ctx, s) - spoolBefore; got != 0 {
 			t.Fatalf("zero-byte PUT added %d spool blobs, want 0", got)
 		}
 
@@ -242,8 +241,8 @@ func TestForgeScenarios(t *testing.T) {
 
 	// HeadListPlaintextSizes: every size and ETag ingot reports is the
 	// plaintext value from the manifest, never the size of a stored FEE
-	// envelope or their sum. The spooled envelopes are measured inside the
-	// container so the assertions can name that failure mode. Checked through
+	// envelope or their sum. The stored envelope sizes are read from
+	// upload_intents so the assertions can name that failure mode. Checked through
 	// HEAD, GET (whole, ranged, ?partNumber), GetObjectAttributes,
 	// ListObjects, ListObjectsV2 and ListObjectVersions, for a single-PUT
 	// object and a multipart object, each spanning several envelopes.
@@ -285,43 +284,37 @@ func TestForgeScenarios(t *testing.T) {
 				t.Fatalf("%s ETag = %q, want the plaintext-derived %q", what, g, want)
 			}
 		}
-		// envelopeSizes measures the spool files a write added.
-		envelopeSizes := func(t *testing.T, before, after map[string]bool) ([]int64, int64) {
+		// envelopeSizes reports the stored envelope sizes of the blobs a write
+		// recorded. They come from upload_intents rather than the spool: a
+		// multipart part's spool copy is gone once it parks.
+		envelopeSizes := func(t *testing.T, before, after map[string]int64) ([]int64, int64) {
 			t.Helper()
-			paths := newSpoolPaths(before, after)
-			if len(paths) < 2 {
-				t.Fatalf("write spooled %d envelopes, want several (small blob ceiling)", len(paths))
+			added := newIntentDigests(before, after)
+			if len(added) < 2 {
+				t.Fatalf("write stored %d envelopes, want several (small blob ceiling)", len(added))
 			}
 			var sizes []int64
 			var total int64
-			for _, p := range paths {
-				out, errOut, err := s.Exec(ctx, "ingot", "stat", "-c", "%s", p)
-				if err != nil {
-					t.Fatalf("stat %s: %v (stderr=%s)", p, err, errOut)
-				}
-				n, err := strconv.ParseInt(strings.TrimSpace(out), 10, 64)
-				if err != nil {
-					t.Fatalf("parse size %q: %v", out, err)
-				}
-				sizes = append(sizes, n)
-				total += n
+			for _, d := range added {
+				sizes = append(sizes, after[d])
+				total += after[d]
 			}
 			return sizes, total
 		}
 
 		// Single PUT: 200 KiB + 37 bytes → four envelopes at 64 KiB.
 		single := patternBytes((200 << 10) + 37)
-		before := spoolBlobPaths(t, ctx, s)
+		before := uploadIntentSizes(t, ctx, s)
 		if _, err := cl.PutObject(ctx, &s3.PutObjectInput{Bucket: aws.String(bucket), Key: aws.String("single"), Body: bytes.NewReader(single)}); err != nil {
 			t.Fatalf("PutObject: %v", err)
 		}
-		sizes, total := envelopeSizes(t, before, spoolBlobPaths(t, ctx, s))
+		sizes, total := envelopeSizes(t, before, uploadIntentSizes(t, ctx, s))
 		sum := md5.Sum(single)
 		objects = append(objects, object{"single", single, hex.EncodeToString(sum[:]), sizes, total})
 
 		// Multipart: two parts, the first spanning many envelopes.
 		partData := [][]byte{tagged(patternBytes((5<<20)+4096), 0x61), tagged(patternBytes(9<<10), 0x62)}
-		before = spoolBlobPaths(t, ctx, s)
+		before = uploadIntentSizes(t, ctx, s)
 		create, err := cl.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{Bucket: aws.String(bucket), Key: aws.String("multipart")})
 		if err != nil {
 			t.Fatalf("CreateMultipartUpload: %v", err)
@@ -349,7 +342,7 @@ func TestForgeScenarios(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("CompleteMultipartUpload: %v", err)
 		}
-		sizes, total = envelopeSizes(t, before, spoolBlobPaths(t, ctx, s))
+		sizes, total = envelopeSizes(t, before, uploadIntentSizes(t, ctx, s))
 		mp := object{"multipart", mpWhole, hex.EncodeToString(etagCat.Sum(nil)) + "-2", sizes, total}
 		objects = append(objects, mp)
 
@@ -583,12 +576,12 @@ func TestForgeScenarios(t *testing.T) {
 		}
 	})
 
-	// MultipartAbortCleansSpool: aborting an upload discards its parts — the
-	// registry rows go (upstream AbortMultipartUpload_success verifies via
-	// ListMultipartUploads) and, ingot-specifically, the parts' spooled blobs
-	// are deleted, since under the spool model an abort's cleanup is entirely
-	// local (nothing shipped to the network before Complete).
-	t.Run("MultipartAbortCleansSpool", func(t *testing.T) {
+	// MultipartPartKeepsNoSpoolCopy: a part's blobs leave the spool once they
+	// park on the provider, so none of them is in the spool after UploadPart,
+	// nor after the abort (upstream
+	// AbortMultipartUpload_success verifies the registry rows via
+	// ListMultipartUploads).
+	t.Run("MultipartPartKeepsNoSpoolCopy", func(t *testing.T) {
 		const bucket, key = "mpabort-spool", "obj"
 		if _, err := cl.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
 			t.Fatalf("CreateBucket: %v", err)
@@ -597,7 +590,6 @@ func TestForgeScenarios(t *testing.T) {
 		if err != nil {
 			t.Fatalf("CreateMultipartUpload: %v", err)
 		}
-		spoolBefore := spoolBlobCount(t, ctx, s)
 		// A 150 KiB part spans three 64 KiB blobs (plaintext split; each is
 		// stored as its own envelope).
 		part := patternBytes(150 << 10)
@@ -610,16 +602,20 @@ func TestForgeScenarios(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("UploadPart: %v", err)
 		}
-		if got := spoolBlobCount(t, ctx, s) - spoolBefore; got != 3 {
-			t.Fatalf("UploadPart added %d spool blobs, want 3", got)
+		digests := partBlobDigestsHex(t, ctx, s, aws.ToString(create.UploadId), 1)
+		if len(digests) != 3 {
+			t.Fatalf("UploadPart stored %d blobs, want 3", len(digests))
+		}
+		if spooled := spooledDigests(t, ctx, s, digests); len(spooled) != 0 {
+			t.Fatalf("UploadPart left %d of its blobs in the spool, want 0: a parked part keeps no local copy", len(spooled))
 		}
 		if _, err := cl.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
 			Bucket: aws.String(bucket), Key: aws.String(key), UploadId: create.UploadId,
 		}); err != nil {
 			t.Fatalf("AbortMultipartUpload: %v", err)
 		}
-		if got := spoolBlobCount(t, ctx, s) - spoolBefore; got != 0 {
-			t.Fatalf("abort left %d spooled part blobs behind, want 0", got)
+		if spooled := spooledDigests(t, ctx, s, digests); len(spooled) != 0 {
+			t.Fatalf("abort left %d of the part's blobs in the spool, want 0", len(spooled))
 		}
 	})
 

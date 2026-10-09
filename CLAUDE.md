@@ -97,7 +97,9 @@ Internal:
 - **`bucketop/`** — `Coordinator`/`Tx`: per-bucket write transaction (lock,
   snapshot root, staging buffer, CAS commit).
 - **`blockstore/`** — block I/O contracts + impls: `log.go` (`Log`, `Plane`
-  [catalog-only], `OpRoot`), `staging.go` (`OpStaging`), `spool.go` (`Spool`),
+  [catalog-only], `OpRoot`), `staging.go` (`OpStaging`), `spool.go`
+  (`Spool`: writes and bodies awaiting upload), `blobcache.go` (`BlobCache`:
+  copies the provider holds; `LocalBlobs` reads both), `blobdir.go`,
   `layered.go`, `forge.go` (the network read tier), `cache.go` (`Cached` LRU),
   `locator/` (carried from guppy; the indexer-backed locator is never
   injected).
@@ -149,7 +151,13 @@ Internal:
   cborgen driver, S3-client test glue.
 - **`internal/tracing`** — OpenTelemetry: the per-request server span
   middleware and the instrumented HTTP client every outbound caller is built
-  with. The daemon's exporter setup is `cmd/telemetry.go`. versitygw passes
+  with. The daemon's exporter setup is `cmd/telemetry.go` (traces and, under
+  the same `OTEL_EXPORTER_OTLP_*` variables, metrics). Local blob storage's
+  instruments (`ingot.local_blobs.*`: usage by directory, budget and
+  stalled-upload gauges, removals by reason, reads by tier) are created on the global meter
+  provider, through `s3frontend.Deps.MeterProvider` and
+  `Layered.CountBlobReads`; with no provider installed they are no-ops.
+  versitygw passes
   the backend the bare `*fasthttp.RequestCtx` as its context, so the
   middleware stores the span as a request user value under the trace API's
   own key; `trace.SpanFromContext` on that context then finds it. A new
@@ -157,7 +165,10 @@ Internal:
   `tracing.Start` / `tracing.End` (an S3 error table outcome does not mark a
   span failed); reads report their tier with `tracing.CountRead`, which lands
   on the server span as `ingot.reads.*`. A streamed response (GetObject) keeps
-  its server span open until fasthttp has written the body.
+  its server span open until fasthttp has written the body. Each background
+  sweep (`server.go`) starts a root span of its own (`sweep.*`), so its
+  registry queries, which `otelpgx` traces only under a recording span, show
+  up too.
 
 ## Interface seams
 
@@ -204,6 +215,11 @@ path or string-encoded UCAN container, required alongside the URL and
 validated at startup down to holding at least one delegation),
 `TokenStoreDir` (→
 `DataDir`), `MultipartSessionTTL` (0 → 7d, negative → sweeper off),
+`LocalBlobMaxBytes` (0 → no budget for the spool and cache together) with
+`CacheMinResidency` (10m), `CacheReadRetention` (1h) and
+`LocalBlobOrphanAge` (24h, ≥ 1h) for the local blob sweeper
+(`s3frontend.SweepLocalBlobs`), `CacheWrites` (unset → true; false drops
+each body's local copy once accepted),
 `CORSAllowedOrigins`, `LogLevel`. `Config.ServerConfig()` is the single
 mapping site. The daemon's config (cmd/) adds `postgres_dsn`,
 `identity.key_file` (the agent's PEM key) and `identity.service_id` (optional
@@ -235,9 +251,9 @@ forge-mode daemon. Two tiers:
   - **`forge_*_test.go`** — forge-native behaviors on dedicated stacks:
     provisioning (`forge_native`), delete/release (`forge_delete`), deferred
     multipart accept (`forge_multipart_deferred`), catalog retention
-    (`forge_retention`), the read-after-eviction network tier
-    (`forge_eviction`), and a real `aws s3 cp` multipart round trip from the
-    official CLI image (`forge_awscli`).
+    (`forge_retention`), the read-after-eviction network tier and the
+    local blob budget sweeper (`forge_eviction`), and a real `aws s3 cp`
+    multipart round trip from the official CLI image (`forge_awscli`).
 - **Suite-composition-sensitive upstream cases** — a few versitygw cases
   depend on run position rather than S3 semantics: `ListBuckets_truncated`
   names buckets from a process-global counter and asserts *creation-order*
@@ -256,8 +272,14 @@ forge-mode daemon. Two tiers:
   `mst/cbor_gen.go` is separate. Verify a no-op diff after touching `bucket` types.
 - **migrations:** SQL in `migrations/sql/*.sql` (`go:embed`), applied by
   `migrations.Up` under the `ingot` schema at startup via a `PreStartHook`.
-  The schema is dev-only; reshape migrations in place and reset any
-  persistent dev DB.
+  Once a migration has merged, change the schema with a new migration, never
+  by editing the merged one. The dev node (fil-forge/infra-nodes) deploys
+  every image `main` publishes and keeps its database across deploys, and
+  goose never re-runs a version it has recorded, so an in-place edit never
+  reaches that database, and a later migration that assumes the edit fails
+  there at startup. Editing a migration that hasn't merged is fine. Other dev
+  data is still disposable: reshape stored formats in place and reset dev
+  data rather than migrating it.
 
 ## Docker images & release
 

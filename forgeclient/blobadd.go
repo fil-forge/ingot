@@ -323,27 +323,35 @@ func (c *Client) invokeAdd(ctx context.Context, space did.DID, blob blobcmds.Blo
 // returns as-is. The result drops PutInvocation (spent — the caller should
 // delete its persisted copy too).
 func (c *Client) BlobConclude(ctx context.Context, space did.DID, added AddedBlob) (AddedBlob, error) {
-	out, err := c.BlobConcludeBatch(ctx, space, []AddedBlob{added})
+	out, err := c.BlobConcludeAll(ctx, space, []AddedBlob{added})
 	if err != nil {
 		return AddedBlob{}, err
 	}
 	return out[0], nil
 }
 
-// MaxConcludeBatch caps the receipts delivered in one /ucan/conclude. A UCAN
-// container holds at most 8192 tokens, and each blob costs 2 in the request
-// (its put invocation and receipt) and 4 in the response (the accept
+// MaxConcludeReceipts caps the receipts carried by one /ucan/conclude.
+//
+// This is the other way of doing many things in one request, and not the one
+// ucantone calls a batch: a conclude is a single invocation whose arguments
+// are a list of receipts, where a batch is many invocations answered with a
+// receipt each (see UploadAddBatch). The two size differently, which is why
+// they have their own limits.
+//
+// A UCAN container holds at most 8192 tokens, and each blob costs 2 in the
+// request (its put invocation and receipt) and 4 in the response (the accept
 // invocation and receipt, plus the location commitment and PDP promise the
 // node attaches). The response is the tighter of the two, which puts the
-// ceiling near 2000; 1000 keeps a comfortable margin under it, so a batch is
-// always answered in full rather than leaving blobs to be polled for.
-const MaxConcludeBatch = 1000
+// ceiling near 2000; 1000 keeps a comfortable margin under it, so a conclude
+// is always answered in full rather than leaving blobs to be polled for.
+const MaxConcludeReceipts = 1000
 
-// BlobConcludeBatch finishes many parked uploads in as few round trips as
-// MaxConcludeBatch allows, and returns them in the order given with their
+// BlobConcludeAll finishes many parked uploads in as few round trips as
+// MaxConcludeReceipts allows, and returns them in the order given with their
 // location commitments filled in.
 //
-// It delivers every blob's /http/put receipt in one /ucan/conclude, which
+// It delivers every blob's /http/put receipt in one /ucan/conclude — one
+// invocation carrying many receipts, not many invocations — which
 // fires their /blob/accept invocations upload-service side, and reads each
 // acceptance out of the response rather than polling for it — a completion
 // with thousands of parts pays a couple of round trips instead of thousands.
@@ -358,7 +366,7 @@ const MaxConcludeBatch = 1000
 // standing for an accepted blob is concluded again on the next attempt, or
 // aborted on the node when its session expires. A blob left unresolved comes
 // back as it went in, PutInvocation included, ready for that retry.
-func (c *Client) BlobConcludeBatch(ctx context.Context, space did.DID, added []AddedBlob) (blobs []AddedBlob, err error) {
+func (c *Client) BlobConcludeAll(ctx context.Context, space did.DID, added []AddedBlob) (blobs []AddedBlob, err error) {
 	start := time.Now()
 	defer func() {
 		if err != nil {
@@ -389,8 +397,8 @@ func (c *Client) BlobConcludeBatch(ctx context.Context, space did.DID, added []A
 		return out, nil
 	}
 
-	for start := 0; start < len(pending); start += MaxConcludeBatch {
-		chunk := pending[start:min(start+MaxConcludeBatch, len(pending))]
+	for start := 0; start < len(pending); start += MaxConcludeReceipts {
+		chunk := pending[start:min(start+MaxConcludeReceipts, len(pending))]
 		accepts, err := c.concludePuts(ctx, added, chunk)
 		if err != nil {
 			return out, err

@@ -126,14 +126,17 @@ at PUT time or a sealed catalog CAR from the background flush:
 
 Multipart parts stop after step 2 (**parked**: durable, unaccepted) and run
 steps 3 and 4 at `CompleteMultipartUpload`; an abort unwinds a parked blob
-with `/blob/abort`. A part copied from an existing object (`UploadPartCopy`)
-is ingested the same way: the source's plaintext range streams through the
-decrypting read path into new parked blobs, so the source may be in any
-bucket of the tenant and nothing is shared with it.
+with `/blob/abort`. A parked blob's spool copy is removed once it parks:
+Complete concludes it from its park row and never reads its bytes. A part
+copied from an existing object (`UploadPartCopy`) is ingested the same way:
+the source's plaintext range streams through the decrypting read path into
+new parked blobs, so the source may be in any bucket of the tenant and
+nothing is shared with it.
 
-Complete concludes the parked parts in batches: each `/ucan/conclude`
-carries up to `MaxConcludeBatch` (1000) put receipts (`receipts`, the plural
-argument), sprue accepts them one request per storage node, and each blob's
+Complete concludes the parked parts a group at a time: each `/ucan/conclude`
+is one invocation carrying up to `MaxConcludeReceipts` (1000) put receipts
+(`receipts`, the plural argument — not a batch of invocations, which is what
+`/upload/add` sends), sprue accepts them one request per storage node, and each blob's
 `/blob/accept` receipt and location commitment come back in the conclude
 response. So a completion costs a few round trips rather than one per part,
 which is what an S3 client splitting a large object into thousands of 5 MiB
@@ -178,22 +181,75 @@ uploaded captured no authority a background remove could use, and a remove
 attempted for it would fail on every retry and pin the record forever.
 The crypto-shred goes first, the network step next, and the location and
 park rows only once the network holds nothing, so a retry sees the same
-state. A release of a blob that was never committed also removes the spool
-copy and upload intent, the intent in the same transaction as the release
-record, since the intent is the only evidence of how far the blob ever got
-and a record outliving it would owe a network remove nothing can authorize.
-A committed blob's release leaves both, since its spool copy is the
-insurance copy until eviction. A record
+state. Every release then removes the local copy and upload intent, the
+intent in the same transaction as the release record: for a blob that was
+never committed, the intent is the only evidence of how far the blob ever
+got, and a record outliving it would owe a network remove nothing can
+authorize. A record
 whose digest a part of an in-flight session still references waits: that
 session's Complete turns the reference into a claim, which makes the record
 stale, and its abort records a release of its own.
+
+## Local blob storage
+
+Body blobs live on local disk in two directories under `data_dir`, split by
+role. The **spool** (`<data_dir>/spool`, `blockstore.Spool`) holds writes in
+progress (`.tmp-*` files) and finished blobs waiting for their upload. The
+**cache** (`<data_dir>/cache`, `blockstore.BlobCache`) holds copies of blobs
+the provider already holds: once a blob's location and `accepted` state are
+both recorded, its file moves from the spool to the cache by rename, which
+is why the two share a filesystem. A failed move leaves the file in the
+spool. With `cache_writes: false`, the copy is removed at that point
+instead, and its intent marked evicted, so the cache holds nothing written
+after that and every read goes to the provider. Reads try the cache, then
+the spool, then the cache again (a blob can move between the first two
+lookups), then the network.
+
+Each directory keeps a running byte count of its blob files, and the spool
+also counts writes in progress as their bytes land. With
+`local_blob_max_bytes` set, a sweeper checks the total every 30 seconds and,
+when it is over the budget, evicts blobs the provider already holds, oldest
+state change first, until usage is at 90% of the budget. A blob qualifies
+only through a row that proves the provider has it: a `blob_locations` row
+for an `accepted` or `published` intent, a `blob_parks` row for a `parked`
+one. Eviction removes the blob's local copy, which is in the cache, or still
+in the spool if the process stopped between recording the acceptance and the
+move. Spool files waiting for their upload, and writes in progress, never
+qualify; the budget counts them, so the pass evicts cached blobs to make
+room for them. The sweeper first honours two windows, `cache_min_residency`
+(10 minutes after the last state change, so a client reading back what it
+just wrote reads from disk) and `cache_read_retention` (an hour after a read
+from the cache, tracked in memory for up to 65,536 blobs and lost on
+restart); if usage is still over budget it evicts inside them, since a full
+disk fails every write, but only down to the budget, giving them up in
+stages: first the residency window, still passing over recently read blobs,
+then both (straight to both when the budget pass ran out of candidates). A
+pass that only ran out of time does not count: the next sweep continues
+outside the windows. Eviction removes the file first, then sets
+`upload_intents.evicted_at`; the row and its state stay, because a release
+and Complete read them. A read of an evicted blob misses locally and goes to
+the network tier. A file the pass cannot remove is logged and skipped.
+Hourly, with or without a budget, the sweeper also deletes `.tmp-*` files
+older than `local_blob_orphan_age` (24 hours) in both directories, and spool
+blob files that old with no intent row, checked a batch at a time; it
+finishes the spool before scanning the cache. A cache file has always had an
+intent, and every path that deletes an intent removes the file first, so the
+cache is not checked against intents. Its scans take no lock, so writes go
+on meanwhile, and a pass that runs out of time or fails waits for the next
+hour. The byte counts are set when each directory opens, and every write,
+move and removal adjusts its count under the directory's lock. A move holds
+both directories exclusively, so it never overlaps a removal of the same
+blob. The hourly scan also corrects a directory's count when no change
+overlapped it, which catches files added or removed outside ingot; otherwise
+those stay miscounted until the next quiet scan or a restart. The cache must
+be on the spool's filesystem, so a move is a rename; startup checks this.
 
 ## Read path
 
 A GET resolves the bucket root (registry), walks the MST to the manifest
 (through the per-key version tree when the key is versioned), and serves
-each covering blob from the first tier that has it: the spool, the catalog
-log (catalog blocks only), then the network (`blockstore.Forge`). Network
+each covering blob from the first tier that has it: local disk (the cache,
+then the spool), the catalog log (catalog blocks only), then the network (`blockstore.Forge`). Network
 resolution uses the **local locator**: a whole-blob hit in `blob_locations`,
 or an inner-block hit in `shard_inclusions` joined to its shard's location;
 the retrieval is a ranged UCAN `content/retrieve` against the provider named
@@ -209,7 +265,7 @@ A `blob_encryption_params` row marks a blob encrypted and carries what its
 decryptor needs; the read unwraps the region-wrapped CEK through
 `regionkey.Provider` (OpenBao transit in production, bound to the blob's
 (space, digest)), maps the plaintext range to one contiguous ciphertext span
-(`aesstream.CiphertextRange`), fetches only that span (ranged from the spool
+(`aesstream.CiphertextRange`), fetches only that span (ranged from local disk
 or piri via `OpenBlobRange`), and decrypts it as it streams
 (`aesstream.SpanReader`). A tampered chunk fails authentication mid-stream.
 The encryption-params store and region key provider are required
@@ -265,12 +321,22 @@ draws the chains and the stores.
 
 - **No HA.** A bucket is single-writer through an in-process lock; nothing
   coordinates across instances beyond the root CAS.
-- **The spool is unbounded** (#48): nothing evicts local body blobs, and
-  DeleteObject releases network-side only, so local disk grows with every
-  body byte written.
+- **Local blob storage is bounded only when configured** (#48): with
+  `local_blob_max_bytes` set, the sweeper evicts cached blobs down to the
+  budget. A delete frees its blobs' local copies once their release runs,
+  and a multipart part's copy goes once it parks.
 - **Spool crash recovery is not built**: reconciling `upload_intents`
   against `blob_refs` after a crash between commit and reconcile is a later
-  phase; the window leaks rather than loses referenced data.
+  phase; the window leaks rather than loses referenced data. (Files with no
+  intent row at all, and unfinished `.tmp-*` writes, are reclaimed by the
+  sweeper's orphan pass.) Nor is a failed upload's spool file reclaimed: its
+  intent stays `spooled` or `uploading`, so neither eviction nor the orphan
+  pass may take it, and with `local_blob_max_bytes` set its bytes count
+  against the budget until an operator removes it and restarts ingot (the
+  counts see a removal outside ingot at startup, or at an hourly scan that
+  no write overlapped). The sweeper sums those bodies each run, counting an
+  intent unchanged for an hour as stalled, for the
+  `ingot.local_blobs.stalled_bytes` gauge.
 - **No catalog GC**: `gc_candidates` is write-only; superseded MST nodes
   accumulate on Forge with mutation volume.
 - **Reads carry no bucket context**: `Manager.Get` linear-scans every open

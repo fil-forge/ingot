@@ -27,10 +27,14 @@ package s3frontend
 import (
 	"context"
 	"encoding/xml"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/fil-forge/versitygw/auth"
 	"github.com/fil-forge/versitygw/backend"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/metric"
 	"go.uber.org/zap"
 
 	"github.com/fil-forge/ingot/blockstore"
@@ -49,22 +53,25 @@ import (
 type Backend struct {
 	backend.BackendUnsupported
 
-	read      blockstore.ReadStore
-	authority bucketauthority.BucketAuthority
-	reg       registry.Registry
-	intents   registry.IntentStore
-	locations registry.LocationStore
-	blobRefs  registry.BlobRefStore
-	gc        registry.GCStore
-	multipart registry.MultipartStore
-	txns      *bucketop.Coordinator
-	log       blockstore.Log
-	spool     *blockstore.Spool
-	uploader  uploader.BodyUploader
-	deferred  uploader.DeferredBodyUploader
-	parks     registry.ParkStore
-	remover   uploader.BlobRemover
-	encParams registry.EncryptionParamsStore
+	read       blockstore.ReadStore
+	authority  bucketauthority.BucketAuthority
+	reg        registry.Registry
+	intents    registry.IntentStore
+	locations  registry.LocationStore
+	blobRefs   registry.BlobRefStore
+	gc         registry.GCStore
+	multipart  registry.MultipartStore
+	txns       *bucketop.Coordinator
+	log        blockstore.Log
+	spool      *blockstore.Spool
+	cache      *blockstore.BlobCache
+	uploader   uploader.BodyUploader
+	deferred   uploader.DeferredBodyUploader
+	parks      registry.ParkStore
+	remover    uploader.BlobRemover
+	registrar  uploader.UploadRegistrar
+	uploadRegs registry.UploadRegistrationStore
+	encParams  registry.EncryptionParamsStore
 	// streaming sends a body blob to its provider while it is spooled;
 	// streams records each such upload until its park or acceptance is
 	// recorded.
@@ -75,6 +82,39 @@ type Backend struct {
 	// prior catalog root get at least this long to finish their prefetch).
 	pendingReleases registry.PendingReleaseStore
 	releaseGrace    time.Duration
+	// Local blob sweeper knobs (see Deps). localBlobSweepMu serialises
+	// SweepLocalBlobs; lastOrphanPass is when its orphan pass last ran.
+	// localBlobSweepBatch overrides the rows a pass reads per query, for
+	// tests; zero takes the default.
+	localBlobMaxBytes   int64
+	cacheMinResidency   time.Duration
+	cacheReadRetention  time.Duration
+	localBlobOrphanAge  time.Duration
+	dropAcceptedBodies  bool
+	localBlobSweepMu    sync.Mutex
+	lastOrphanPass      time.Time
+	localBlobSweepBatch int
+	// overBudgetWarned and timeLimitLogged are set once the sweeper has
+	// logged that usage is over budget with nothing left to evict, or that an
+	// eviction pass (budget or forced, whichever ran out first) ran out of
+	// time, and cleared when usage falls back to the low watermark, so each
+	// message comes once per episode. lastForcedWarn is when the forced pass
+	// last warned that it evicted inside the retention windows; a forced pass
+	// usually brings usage back under budget, so that warning is limited by
+	// time instead. Guarded by localBlobSweepMu.
+	overBudgetWarned bool
+	timeLimitLogged  bool
+	lastForcedWarn   time.Time
+	// stalledSpooled and stalledUploading are the sweeper's latest sums of
+	// stalled uploads by intent state (see SweepLocalBlobs), read by the
+	// stalled_bytes gauge; stalledKnown is set once a sweep has computed them.
+	stalledSpooled   atomic.Int64
+	stalledUploading atomic.Int64
+	stalledKnown     atomic.Bool
+	// localBlobMetrics counts local blob removals; localBlobGauges is the
+	// registration of the usage and budget gauges (nil when not registered).
+	localBlobMetrics localBlobMetrics
+	localBlobGauges  metric.Registration
 	// regionKeys unwraps region-wrapped CEKs for the decrypting read path.
 	regionKeys regionkey.Provider
 	// tenantKeys yields the tenant wrap key each write encrypts to (the FEE
@@ -92,7 +132,7 @@ type Backend struct {
 // Deps wires a Backend over ingot's domain primitives.
 type Deps struct {
 	Authority bucketauthority.BucketAuthority
-	// Registry tracks per-bucket roots; IntentStore tracks the local spool's
+	// Registry tracks per-bucket roots; IntentStore tracks each local blob's
 	// upload_intents lifecycle; LocationStore records where each accepted body
 	// blob can be retrieved from. Production passes one *registry.Postgres for
 	// all three; the harness one *inmem.MemStore.
@@ -106,16 +146,19 @@ type Deps struct {
 	GC        registry.GCStore
 	Multipart registry.MultipartStore
 
-	// Reads is the layered read tier (spool → log → forge). Log is the catalog
-	// LSM write log driving the per-op staging buffer + commit — in production
-	// the per-bucket *logstore.Manager, which routes each append to the
-	// bucket's own log.
+	// Reads is the layered read tier (local blobs → log → forge). Log is the
+	// catalog LSM write log driving the per-op staging buffer + commit — in
+	// production the per-bucket *logstore.Manager, which routes each append
+	// to the bucket's own log.
 	Reads blockstore.ReadStore
 	Log   blockstore.Log
 
-	// Spool is the local blob store: SplitBody writes body blobs here on PUT,
-	// and they are served back from here on GET (read-after-write / cache).
+	// Spool is where SplitBody writes body blobs on PUT and where each waits
+	// until the provider holds it; Cache then holds it as a read-after-write
+	// copy until it is evicted. Reads serves both (blockstore.LocalBlobs).
+	// Both are required.
 	Spool *blockstore.Spool
+	Cache *blockstore.BlobCache
 
 	// Uploader makes each spooled body blob durable on Forge (allocate→PUT→
 	// accept) synchronously, before the manifest commits. Remover releases a
@@ -127,6 +170,12 @@ type Deps struct {
 	Deferred uploader.DeferredBodyUploader
 	Parks    registry.ParkStore
 	Remover  uploader.BlobRemover
+	// Registrar keeps the upload service's content-entry list in step with the
+	// catalog: one entry per committed object version, which is what the
+	// service counts to report the space's object count.
+	Registrar uploader.UploadRegistrar
+	// UploadRegs is the outbox the registration sweeper drains.
+	UploadRegs registry.UploadRegistrationStore
 
 	// Streaming uploads each body blob while it is spooled,
 	// allocating it by size and hash function before its digest is known;
@@ -157,6 +206,38 @@ type Deps struct {
 	// Zero means immediately due (the server applies the production default
 	// before construction; tests use zero so a manual sweep drains).
 	ReleaseGrace time.Duration
+
+	// LocalBlobMaxBytes is the byte budget for the spool and the cache
+	// together, writes in progress included, enforced by SweepLocalBlobs.
+	// Zero turns the budget and forced passes off: eviction needs a network
+	// read tier to serve evicted blobs, which the in-memory fakes do not
+	// have.
+	LocalBlobMaxBytes int64
+	// CacheMinResidency is how long after its last state change (for a
+	// committed blob, its commit) the budget pass leaves a blob alone, so a
+	// client reading back what it just wrote reads from local disk. Zero
+	// turns it off.
+	CacheMinResidency time.Duration
+	// CacheReadRetention is how long after a read from the cache the budget
+	// pass leaves a blob alone, so objects read repeatedly stay local. Zero
+	// turns it off.
+	CacheReadRetention time.Duration
+	// LocalBlobOrphanAge is the age at which SweepLocalBlobs deletes a .tmp-*
+	// file in either directory, or a spool blob file with no intent row. Zero →
+	// DefaultLocalBlobOrphanAge.
+	LocalBlobOrphanAge time.Duration
+	// DropAcceptedBodies removes each body's local copy as soon as its
+	// location is recorded and its intent accepted, instead of moving it
+	// into the cache for reads. Off in the in-memory harness, whose base
+	// tier cannot serve a body. It gives up the read-after-write copy, which
+	// is safe while reads resolve through the local location table; an
+	// indexer-backed locator could miss a digest not yet published.
+	DropAcceptedBodies bool
+
+	// MeterProvider supplies the spool's instruments: usage and budget
+	// gauges, and removals by reason. Nil → the global provider, a no-op
+	// until a host installs one.
+	MeterProvider metric.MeterProvider
 
 	// MaxBlobSize is the coarse-split blob ceiling (0 → bucket default).
 	MaxBlobSize int64
@@ -191,7 +272,11 @@ func New(d Deps) *Backend {
 			corsDoc = doc
 		}
 	}
-	return &Backend{
+	localBlobOrphanAge := d.LocalBlobOrphanAge
+	if localBlobOrphanAge <= 0 {
+		localBlobOrphanAge = DefaultLocalBlobOrphanAge
+	}
+	b := &Backend{
 		authority:       d.Authority,
 		read:            d.Reads,
 		reg:             d.Registry,
@@ -203,21 +288,37 @@ func New(d Deps) *Backend {
 		txns:            bucketop.NewCoordinator(bucketop.Deps{Reg: d.Registry, Log: d.Log, Reads: d.Reads}),
 		log:             d.Log,
 		spool:           d.Spool,
+		cache:           d.Cache,
 		uploader:        d.Uploader,
 		deferred:        d.Deferred,
 		parks:           d.Parks,
 		remover:         d.Remover,
 		streaming:       d.Streaming,
 		streams:         d.Streams,
+		registrar:       d.Registrar,
+		uploadRegs:      d.UploadRegs,
 		encParams:       d.EncParams,
 		regionKeys:      d.RegionKeys,
 		tenantKeys:      d.TenantKeys,
 		pendingReleases: d.PendingReleases,
 		releaseGrace:    d.ReleaseGrace,
-		logger:          logger,
-		maxBlobSize:     d.MaxBlobSize,
-		cors:            corsDoc,
+
+		localBlobMaxBytes:  d.LocalBlobMaxBytes,
+		cacheMinResidency:  d.CacheMinResidency,
+		cacheReadRetention: d.CacheReadRetention,
+		localBlobOrphanAge: localBlobOrphanAge,
+		dropAcceptedBodies: d.DropAcceptedBodies,
+
+		logger:      logger,
+		maxBlobSize: d.MaxBlobSize,
+		cors:        corsDoc,
 	}
+	mp := d.MeterProvider
+	if mp == nil {
+		mp = otel.GetMeterProvider()
+	}
+	b.localBlobMetrics, b.localBlobGauges = newLocalBlobMetrics(mp, b, logger)
+	return b
 }
 
 // String identifies this backend in versitygw logs.

@@ -6,7 +6,7 @@
 //
 // MemStore keeps bucket + segment metadata in memory only — it resets on
 // restart. Segment CARs still persist on local disk via logstore; in
-// standalone mode both planes are configured never to ship, so those
+// standalone mode the catalog plane is configured never to ship, so those
 // CARs are retained and serve all reads.
 package inmem
 
@@ -27,6 +27,9 @@ import (
 	"github.com/multiformats/go-multihash"
 
 	"github.com/fil-forge/hilt/pkg/sigv4"
+	"github.com/fil-forge/ucantone/ucan"
+	"github.com/fil-forge/ucantone/ucan/container"
+
 	"github.com/fil-forge/ingot/blockstore"
 	"github.com/fil-forge/ingot/bucketauthority"
 	"github.com/fil-forge/ingot/logstore"
@@ -58,6 +61,7 @@ type MemStore struct {
 	// same code paths. See stores.go for the methods over these.
 	blobRefs   map[claimKey]registry.BlobClaim
 	intents    map[string]registry.UploadIntent          // keyed by string(digest)
+	evicted    map[string]struct{}                       // upload_intents.evicted_at IS NOT NULL, keyed by string(digest)
 	locations  map[locKey]registry.BlobLocation          // keyed by (space, digest)
 	encParams  map[locKey]registry.BlobEncryptionParams  // keyed by (space, digest)
 	inclusions map[locKey]registry.BlobInclusion         // keyed by (space, digest)
@@ -68,6 +72,10 @@ type MemStore struct {
 	gcCands    map[string]struct{}                       // keyed by string(cid)
 	revCursor  *registry.RevocationCursor                // the single revocation_cursor row
 	releases   map[locKey]registry.PendingRelease        // keyed by (space, digest)
+	// uploadRegs is the upload-registration outbox, in commit order;
+	// uploadRegSeq numbers the rows the way the Postgres sequence does.
+	uploadRegs   []registry.UploadRegistration
+	uploadRegSeq int64
 }
 
 // claimKey / locKey are the composite map keys for the blob_refs and the
@@ -90,6 +98,7 @@ func NewMemStore() *MemStore {
 		verSeqs:    map[string]uint64{},
 		blobRefs:   map[claimKey]registry.BlobClaim{},
 		intents:    map[string]registry.UploadIntent{},
+		evicted:    map[string]struct{}{},
 		locations:  map[locKey]registry.BlobLocation{},
 		encParams:  map[locKey]registry.BlobEncryptionParams{},
 		inclusions: map[locKey]registry.BlobInclusion{},
@@ -212,10 +221,27 @@ func (m *MemStore) Delete(_ context.Context, name string) error {
 	}
 	delete(m.buckets, name)
 	delete(m.verSeqs, name)
+	// Postgres cascades upload_registrations on the bucket; do the same here
+	// so a queued change cannot outlive the bucket it belongs to in one
+	// backend and not the other.
+	kept := m.uploadRegs[:0]
+	for _, reg := range m.uploadRegs {
+		if reg.Bucket != name {
+			kept = append(kept, reg)
+		}
+	}
+	m.uploadRegs = kept
 	return nil
 }
 
-func (m *MemStore) CASRoot(_ context.Context, name string, expect, next cid.Cid) error {
+func (m *MemStore) CASRoot(ctx context.Context, name string, expect, next cid.Cid) error {
+	return m.CASRootAndEnqueueUploadRegistrations(ctx, name, expect, next, nil)
+}
+
+// CASRootAndEnqueueUploadRegistrations advances the root and records the
+// commit's upload registrations together: under the one mutex here, as one
+// transaction in Postgres. A conflict records nothing.
+func (m *MemStore) CASRootAndEnqueueUploadRegistrations(_ context.Context, name string, expect, next cid.Cid, regs []registry.UploadRegistration) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	s, ok := m.buckets[name]
@@ -226,6 +252,14 @@ func (m *MemStore) CASRoot(_ context.Context, name string, expect, next cid.Cid)
 		return registry.ErrConflict
 	}
 	s.Root = next
+	for _, reg := range regs {
+		m.uploadRegSeq++
+		reg.Seq = m.uploadRegSeq
+		if reg.NextAt.IsZero() {
+			reg.NextAt = time.Now()
+		}
+		m.uploadRegs = append(m.uploadRegs, reg)
+	}
 	return nil
 }
 
@@ -419,7 +453,7 @@ func (NopUploader) SubmitShard(_ context.Context, _ blockstore.Plane, _ did.DID,
 
 // UploadBlob accepts immediately, even with WithConclude(false) — there is
 // no network to park on, so the deferred flow degenerates to the synchronous
-// one and reads keep coming from the spool.
+// one and reads keep coming from local disk.
 func (NopUploader) UploadBlob(_ context.Context, _ did.DID, digest multihash.Multihash, size int64, _ string, _ ...uploader.UploadOption) (uploader.UploadedBlob, error) {
 	return uploader.UploadedBlob{Digest: digest, Size: size, Location: &uploader.BlobLocation{Size: size}}, nil
 }
@@ -438,15 +472,39 @@ func (NopUploader) AbortBlob(_ context.Context, _ did.DID, _ cid.Cid) error {
 	return nil
 }
 
+// CaptureAuthority, RegisterUpload and RetractUpload keep no content-entry
+// list: there is no upload service to count against, and nothing in the suite
+// reads one back. The captured authority is an empty container, enough for a
+// queued row to carry.
+func (NopUploader) CaptureAuthority(_ context.Context, _ did.DID, _ ucan.Command) ([]byte, error) {
+	return container.Encode(container.RawGzip, container.New())
+}
+
+// PrepareAuthority keeps whatever the row holds: there is no upload service to
+// authorize against, so nothing expires.
+func (NopUploader) PrepareAuthority(_ context.Context, _ did.DID, _ ucan.Command, stored []byte) ([]byte, bool, error) {
+	return stored, false, nil
+}
+
+func (NopUploader) RegisterUploads(_ context.Context, changes []uploader.QueuedUpload) ([]error, error) {
+	return make([]error, len(changes)), nil
+}
+
+func (NopUploader) RetractUploads(_ context.Context, changes []uploader.QueuedUpload) ([]error, error) {
+	return make([]error, len(changes)), nil
+}
+
 // Compile-time guarantees.
 var (
-	_ bucketauthority.BucketAuthority = (*MemStore)(nil)
-	_ registry.Registry               = (*MemStore)(nil)
-	_ logstore.Meta                   = (*MemStore)(nil)
-	_ blockstore.BlockReader          = NopBaseReader{}
-	_ blockstore.BlobReader           = NopBaseReader{}
-	_ uploader.Uploader               = NopUploader{}
-	_ uploader.BodyUploader           = NopUploader{}
-	_ uploader.DeferredBodyUploader   = NopUploader{}
-	_ uploader.BlobRemover            = NopUploader{}
+	_ bucketauthority.BucketAuthority  = (*MemStore)(nil)
+	_ registry.Registry                = (*MemStore)(nil)
+	_ logstore.Meta                    = (*MemStore)(nil)
+	_ blockstore.BlockReader           = NopBaseReader{}
+	_ blockstore.BlobReader            = NopBaseReader{}
+	_ uploader.Uploader                = NopUploader{}
+	_ uploader.BodyUploader            = NopUploader{}
+	_ uploader.DeferredBodyUploader    = NopUploader{}
+	_ uploader.BlobRemover             = NopUploader{}
+	_ uploader.UploadRegistrar         = NopUploader{}
+	_ registry.UploadRegistrationStore = (*MemStore)(nil)
 )

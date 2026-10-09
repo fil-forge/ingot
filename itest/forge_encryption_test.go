@@ -7,7 +7,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/base64"
 	"fmt"
 	"io"
 	"net"
@@ -22,7 +21,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/fil-forge/smelt/pkg/stack"
-	"github.com/filecoin-project/go-fee/cose"
 
 	msbucket "github.com/fil-forge/ingot/bucket"
 )
@@ -45,12 +43,13 @@ func TestForgeEncryption(t *testing.T) {
 	cl := sdkClient(forgeS3Conf(endpoint, accessKey, secretKey))
 
 	// Tamper setup, shared by the two tamper subtests: PUT a 1 MiB object
-	// (one blob, four 256 KiB chunks) and corrupt its spooled envelope's
+	// (one blob, four 256 KiB chunks) and corrupt its local envelope's
 	// tail — inside the FINAL chunk, so earlier chunks stay intact. The
-	// spool is the first read tier and does no digest re-verification, so
-	// every subsequent GET reads the tampered ciphertext and only the GCM
-	// tag stands between it and the client. (Never wipe the spool here the
-	// way the eviction tests do: piri's pristine copy would serve the read.)
+	// local copy is the first read tier and does no digest re-verification,
+	// so every subsequent GET reads the tampered ciphertext and only the GCM
+	// tag stands between it and the client. (Never wipe the local copies here
+	// the way the eviction tests do: piri's pristine copy would serve the
+	// read.)
 	const (
 		tamperBucket = "tamper"
 		tamperKey    = "obj"
@@ -61,17 +60,17 @@ func TestForgeEncryption(t *testing.T) {
 	if _, err := cl.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(tamperBucket)}); err != nil {
 		t.Fatalf("CreateBucket: %v", err)
 	}
-	spoolBefore := spoolBlobPaths(t, ctx, s)
+	spoolBefore := localBlobPaths(t, ctx, s)
 	if _, err := cl.PutObject(ctx, &s3.PutObjectInput{
 		Bucket: aws.String(tamperBucket), Key: aws.String(tamperKey), Body: bytes.NewReader(tamperData),
 	}); err != nil {
 		t.Fatalf("PutObject: %v", err)
 	}
-	added := newSpoolPaths(spoolBefore, spoolBlobPaths(t, ctx, s))
+	added := newLocalPaths(spoolBefore, localBlobPaths(t, ctx, s))
 	if len(added) != 1 {
 		t.Fatalf("PUT spooled %d envelopes, want 1 (a 1 MiB object is a single blob under the default config)", len(added))
 	}
-	corruptSpoolFileTail(t, ctx, s, added[0], 100)
+	corruptLocalFileTail(t, ctx, s, added[0], 100)
 
 	// A tampered chunk must never reach the client as plaintext. Decryption
 	// streams after the 200 and Content-Length are already written, so the
@@ -142,7 +141,6 @@ func TestForgeEncryption(t *testing.T) {
 		}
 
 		partData := [][]byte{patternBytes(6 << 20), patternBytes(5 << 20), patternBytes(9 << 10)}
-		before := spoolBlobPaths(t, ctx, s)
 		var completed []types.CompletedPart
 		var whole []byte
 		for i, data := range partData {
@@ -163,17 +161,15 @@ func TestForgeEncryption(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("CompleteMultipartUpload: %v", err)
 		}
-		added := newSpoolPaths(before, spoolBlobPaths(t, ctx, s))
+		added := objectBlobDigestsHex(t, ctx, s, bucket, key)
 		if len(added) != 3 {
-			t.Fatalf("multipart upload spooled %d envelopes, want 3 (one per part under the default config)", len(added))
+			t.Fatalf("multipart object references %d blobs, want 3 (one per part under the default config)", len(added))
 		}
-
-		// Evict only THIS object's spool copies (the shared stack's other
-		// objects keep theirs), so the pre-delete read must come from piri —
-		// proving all three part blobs are durable on the network before we
-		// assert the release traverses it.
-		if out, errOut, err := s.Exec(ctx, "ingot", "rm", "-f", added[0], added[1], added[2]); err != nil {
-			t.Fatalf("evict this object's spool copies: %v (stdout=%s stderr=%s)", err, out, errOut)
+		// A part's spool copy goes once it parks, so the pre-delete read must
+		// come from piri — proving all three part blobs are durable on the
+		// network before we assert the release traverses it.
+		if spooled := spooledDigests(t, ctx, s, added); len(spooled) != 0 {
+			t.Fatalf("parked part blobs still in the spool: %v", spooled)
 		}
 		if got := getBody(t, ctx, cl, bucket, key, ""); !bytes.Equal(got, whole) {
 			t.Fatalf("read-through from piri before delete mismatched: got %d bytes, want %d", len(got), len(whole))
@@ -242,10 +238,11 @@ func TestForgeEncryption(t *testing.T) {
 	// blob_encryption_params row is the region wrap of the per-blob CEK —
 	// deleting it is the per-blob crypto-shred (migration 00014) — and
 	// DeleteObject removes it, the location row, and the network claim for
-	// every body blob. The spooled envelope survives with its single tenant
-	// recipient: the insurance copy hilt's custody can still open until true
-	// deletion. Versioned buckets' delete-marker path deliberately does not
-	// shred (S3 semantics); this covers the unversioned path.
+	// every body blob, then frees the blob's spooled envelope. A multipart
+	// part's envelope leaves the spool once it parks, so a single-PUT object,
+	// whose envelope stays until its release, proves the release frees it.
+	// Versioned buckets' delete-marker path deliberately does not shred (S3
+	// semantics); this covers the unversioned path.
 	t.Run("ShredThenRead", func(t *testing.T) {
 		const bucket, key = "shred", "obj"
 		if _, err := cl.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
@@ -287,6 +284,21 @@ func TestForgeEncryption(t *testing.T) {
 		if len(digests) != len(partData) {
 			t.Fatalf("blob_refs records %d digests, want %d (one per part)", len(digests), len(partData))
 		}
+
+		const putKey = "single"
+		if _, err := cl.PutObject(ctx, &s3.PutObjectInput{
+			Bucket: aws.String(bucket), Key: aws.String(putKey), Body: bytes.NewReader(tagged(patternBytes(64<<10), 0x6B)),
+		}); err != nil {
+			t.Fatalf("PutObject: %v", err)
+		}
+		putDigests := objectBlobDigestsHex(t, ctx, s, bucket, putKey)
+		if spooled := spooledDigests(t, ctx, s, putDigests); len(spooled) != len(putDigests) {
+			t.Fatalf("pre-delete: %d of the single-PUT object's %d envelopes in the spool, want all", len(spooled), len(putDigests))
+		}
+		if _, err := cl.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(bucket), Key: aws.String(putKey)}); err != nil {
+			t.Fatalf("DeleteObject %s: %v", putKey, err)
+		}
+		digests = append(digests, putDigests...)
 		// Pre-delete sanity: without this, the zero-rows assertion below
 		// would pass vacuously against an unencrypted write.
 		if n := countRowsForDigests(t, ctx, s, "ingot.blob_encryption_params", "digest", digests); n != len(digests) {
@@ -304,8 +316,9 @@ func TestForgeEncryption(t *testing.T) {
 		}
 
 		// The claims drop synchronously with the delete; the shred (enc-params
-		// + location rows) is deferred behind the release grace (60s default)
-		// and executed by the release sweeper — poll it through.
+		// + location rows) and the spool cleanup are deferred behind the
+		// release grace (60s default) and executed by the release sweeper —
+		// poll them through.
 		refsQ := fmt.Sprintf(`SELECT count(*) FROM ingot.blob_refs WHERE bucket = '%s' AND object_key = '%s'`, bucket, key)
 		if out := ingotSQL(t, ctx, s, refsQ); out != "0" {
 			t.Fatalf("%s blob_refs rows survived the delete", out)
@@ -314,33 +327,22 @@ func TestForgeEncryption(t *testing.T) {
 		for {
 			enc := countRowsForDigests(t, ctx, s, "ingot.blob_encryption_params", "digest", digests)
 			loc := countRowsForDigests(t, ctx, s, "ingot.blob_locations", "digest", digests)
-			if enc == 0 && loc == 0 {
+			spooled := spooledDigests(t, ctx, s, digests)
+			if enc == 0 && loc == 0 && len(spooled) == 0 {
 				break
 			}
 			if time.Now().After(shredDeadline) {
-				t.Fatalf("deferred shred never executed: %d enc-params + %d location rows survive", enc, loc)
+				t.Fatalf("deferred shred never executed: %d enc-params + %d location rows survive, spool still holds %v", enc, loc, spooled)
 			}
 			time.Sleep(5 * time.Second)
 		}
-
-		// The insurance copy: nothing removes spool files on delete, and the
-		// surviving envelope's sole recipient is still the tenant wrap key —
-		// recoverable from hilt's custody alone until true deletion.
-		env := spooledEnvelopeAt(t, ctx, s, "/data/spool/"+digests[0])
-		wantKID := hiltActiveWrapKID(t, ctx, s, "encryption")
-		if len(env.Recipients) != 1 {
-			t.Fatalf("surviving envelope has %d recipients, want 1 (the tenant)", len(env.Recipients))
-		}
-		if kid, ok := env.Recipients[0].Headers.Unprotected.Bytes(cose.HeaderLabelKID); !ok || string(kid) != wantKID {
-			t.Fatalf("surviving envelope recipient kid = %q, want the tenant wrap key %q", kid, wantKID)
-		}
-		t.Logf("shred OK: %d region-wrap rows destroyed, envelope + tenant recipient survive", len(digests))
+		t.Logf("shred OK: %d region-wrap rows destroyed, the single-PUT envelope freed from the spool", len(digests))
 	})
 
 	// AbortShredsKeyRows: aborting an upload shreds the orphaned parts' key
 	// rows — the part blobs' releases delete each blob's enc-params row,
 	// upload intent, and park row (the spool and piri unwind are pinned by
-	// MultipartAbortCleansSpool and TestForgeDeferredMultipart/AbortRejects).
+	// MultipartPartKeepsNoSpoolCopy and TestForgeDeferredMultipart/AbortRejects).
 	// Expiry-sweep shred is TestForgeMultipartExpiryShred (needs a low-TTL
 	// stack).
 	t.Run("AbortShredsKeyRows", func(t *testing.T) {
@@ -760,25 +762,18 @@ func TestForgeMultipartExpiryShred(t *testing.T) {
 	t.Logf("expiry sweep shredded %d part-blob key rows and the session", len(digests))
 }
 
-// spooledEnvelopeAt reads the spooled blob at path inside the ingot
-// container and decodes its COSE envelope header. The spool filename is the
-// hex ciphertext multihash, so a blob_refs digest maps to
-// /data/spool/<hex>.
-func spooledEnvelopeAt(t *testing.T, ctx context.Context, s *stack.Stack, path string) *cose.Envelope {
+// spooledDigests returns the hex digests that still have a local copy in the
+// ingot container, in the spool or the cache. A copy's filename is the hex
+// ciphertext multihash, so a blob_refs digest maps to /data/spool/<hex> or
+// /data/cache/<hex>.
+func spooledDigests(t *testing.T, ctx context.Context, s *stack.Stack, digests []string) []string {
 	t.Helper()
-	out, errOut, err := s.Exec(ctx, "ingot", "sh", "-c", fmt.Sprintf(`base64 < %q`, path))
+	out, errOut, err := s.Exec(ctx, "ingot", "sh", "-c",
+		fmt.Sprintf(`for d in %s; do if [ -e "/data/spool/$d" ] || [ -e "/data/cache/$d" ]; then echo "$d"; fi; done`, strings.Join(digests, " ")))
 	if err != nil {
-		t.Fatalf("read spooled blob %s: %v (stderr=%s)", path, err, errOut)
+		t.Fatalf("list spooled blobs: %v (stderr=%s)", err, errOut)
 	}
-	raw, err := base64.StdEncoding.DecodeString(strings.Join(strings.Fields(out), ""))
-	if err != nil {
-		t.Fatalf("decode spooled blob %s: %v", path, err)
-	}
-	env, _, err := cose.Decode(raw)
-	if err != nil {
-		t.Fatalf("decode COSE envelope %s: %v", path, err)
-	}
-	return env
+	return strings.Fields(out)
 }
 
 // headersOnlyHTTPClient sends a signed request's head and reads the response,

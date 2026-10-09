@@ -51,7 +51,10 @@ type Config struct {
 	// service-level routes (ListBuckets, "GET /") are not covered, so
 	// cross-origin bucket listing is unsupported.
 	CORSAllowedOrigins []string `mapstructure:"cors_allowed_origins" yaml:"cors_allowed_origins"`
-	// SealBytes / SealAge / Retain tune the logstore (zero -> logstore defaults).
+	// SealBytes / SealAge / Retain tune every bucket's catalog log (zero ->
+	// logstore defaults; catalog_plane overrides them): when a segment seals
+	// and how many shipped segments stay on disk. Object bodies are not in
+	// the log; local_blob_max_bytes bounds their local storage.
 	SealBytes int64  `mapstructure:"seal_bytes" yaml:"seal_bytes"`
 	SealAge   string `mapstructure:"seal_age" yaml:"seal_age"`
 	Retain    int    `mapstructure:"retain" yaml:"retain"`
@@ -92,17 +95,67 @@ type Config struct {
 
 	// MultipartSessionTTL bounds abandoned multipart uploads (Go duration
 	// string, e.g. "168h"): a session whose state has not changed for this
-	// long is torn down by a background sweeper and its spooled parts
-	// dropped. Empty → default 7 days; a negative duration disables the
-	// sweeper.
+	// long is torn down by a background sweeper and its parts released.
+	// Empty → default 7 days; a negative duration disables the sweeper.
+	// A part keeps no local copy once it parks on its provider, so Complete
+	// relies on the provider keeping the parked allocation: a session
+	// completed after the provider has expired it fails, and the client must
+	// upload those parts again. The TTL counts from the session's last state
+	// change, and a Complete that fails returns the session to open, which
+	// restarts it; so it bounds a parked part's age only while no Complete
+	// fails. Keep it well under how long the provider keeps parked
+	// allocations.
 	MultipartSessionTTL string `mapstructure:"multipart_session_ttl" yaml:"multipart_session_ttl"`
 
 	// ReleaseGrace delays each blob release (crypto-shred + location delete +
-	// network remove) this long past the drop of its last reference claim
-	// (Go duration string), so in-flight readers holding the prior catalog
-	// root finish their decryption prefetch first. Empty → default 60s; a
-	// negative duration makes releases due immediately.
+	// network remove + local-copy removal) this long past the drop of its
+	// last reference claim (Go duration string), so in-flight readers holding
+	// the prior catalog root finish first. It bounds how long such a reader
+	// may take: a GET, or a copy reading the object as its source, still
+	// streaming a deleted or overwritten object once the grace has passed
+	// fails when it reaches a blob it has not yet opened.
+	// Empty → default 60s; a negative duration makes releases due
+	// immediately.
 	ReleaseGrace string `mapstructure:"release_grace" yaml:"release_grace"`
+
+	// LocalBlobMaxBytes is the byte budget for local blob storage: the spool
+	// (<data_dir>/spool: writes in progress, counted as their bytes land, and
+	// bodies waiting for upload) plus the cache (<data_dir>/cache: copies of
+	// bodies the provider holds). It does not cover the catalog log. A
+	// sweeper checks it every 30 seconds and evicts blobs the provider
+	// holds, oldest first, down to 90% of the budget; reads of an evicted blob go to the
+	// provider. Usage can exceed the budget by ingest rate × 30 seconds
+	// between sweeps, and by files that must stay (the spool's, and orphans
+	// younger than LocalBlobOrphanAge). 0 → no budget (the default); negative
+	// is an error.
+	LocalBlobMaxBytes int64 `mapstructure:"local_blob_max_bytes" yaml:"local_blob_max_bytes"`
+	// CacheMinResidency is the read-after-write window (Go duration string):
+	// the sweeper leaves alone a cached blob whose upload state changed less
+	// than this long ago (for a committed blob, its commit time) unless usage
+	// stays over budget without it. Costs ingest rate × residency in disk.
+	// Empty → default 10m; "0s" turns it off; negative is an error.
+	CacheMinResidency string `mapstructure:"cache_min_residency" yaml:"cache_min_residency"`
+	// CacheReadRetention is the read-cache window (Go duration string): the
+	// sweeper leaves alone a blob served from the cache within this long,
+	// unless usage stays over budget without it. Reads are remembered in
+	// memory, for a bounded number of blobs, and forgotten on restart. Empty
+	// → default 1h; "0s" turns it off; negative is an error.
+	CacheReadRetention string `mapstructure:"cache_read_retention" yaml:"cache_read_retention"`
+	// LocalBlobOrphanAge is the age (file modification time) at which the
+	// sweeper deletes a .tmp-* file in the spool or the cache, or a spool blob
+	// file with no upload intent (Go duration string), hourly, whether or not a
+	// budget is set. It must exceed the longest time one request body takes to
+	// stream: the server sets no body read timeout, and a body still streaming
+	// past it can have its first blobs deleted, failing the request. Empty →
+	// default 24h; under 1h is an error.
+	LocalBlobOrphanAge string `mapstructure:"local_blob_orphan_age" yaml:"local_blob_orphan_age"`
+	// CacheWrites moves each body's local copy into the cache once the
+	// provider has accepted it, so a read soon after a write is served from
+	// local disk. false drops the copy at once: local disk then holds only
+	// bodies still being written or uploaded, and every read goes to the
+	// provider. A pointer, so an explicit false is distinguishable from unset
+	// (true).
+	CacheWrites *bool `mapstructure:"cache_writes" yaml:"cache_writes"`
 
 	// CatalogPlane overrides the catalog logstore pipeline knobs. Any field
 	// left zero/unset falls back to the top-level SealBytes / SealAge / Retain
@@ -131,7 +184,7 @@ type Config struct {
 	Identity IdentityConfig `mapstructure:"identity" yaml:"identity"`
 }
 
-// PlaneSettings are the per-plane logstore overrides (data or catalog).
+// PlaneSettings are the catalog plane's logstore overrides.
 // Zero-valued fields fall back to the top-level Config defaults; Ship is
 // a pointer so an explicit `ship: false` is distinguishable from unset
 // (which defaults to shipping).
@@ -184,6 +237,24 @@ func (c Config) ServerConfig() (ServerConfig, error) {
 			releaseGrace = 0
 		}
 	}
+	cacheMinResidency, err := parseDurationKnob("cache_min_residency", c.CacheMinResidency, 10*time.Minute)
+	if err != nil {
+		return ServerConfig{}, err
+	}
+	cacheReadRetention, err := parseDurationKnob("cache_read_retention", c.CacheReadRetention, time.Hour)
+	if err != nil {
+		return ServerConfig{}, err
+	}
+	localBlobOrphanAge, err := parseDurationKnob("local_blob_orphan_age", c.LocalBlobOrphanAge, 24*time.Hour)
+	if err != nil {
+		return ServerConfig{}, err
+	}
+	if localBlobOrphanAge < time.Hour {
+		return ServerConfig{}, fmt.Errorf("ingot: local_blob_orphan_age %q: must be at least 1h, longer than any request body takes to stream", c.LocalBlobOrphanAge)
+	}
+	if c.LocalBlobMaxBytes < 0 {
+		return ServerConfig{}, fmt.Errorf("ingot: local_blob_max_bytes %d: must not be negative (0 means no budget)", c.LocalBlobMaxBytes)
+	}
 	// Render the CORS configuration here — the single place it is built —
 	// so a typo fails at startup (via Validate) rather than from New.
 	corsCfg, err := cors.Build(c.CORSAllowedOrigins)
@@ -198,7 +269,7 @@ func (c Config) ServerConfig() (ServerConfig, error) {
 
 		CORSConfig: corsCfg,
 
-		// A per-plane override wins, else the top-level value, else the logstore
+		// The catalog_plane override wins, else the top-level value, else the logstore
 		// default. Ship defaults to true unless the catalog block sets
 		// `ship: false`.
 		SealBytesCatalog: firstNonZero64(c.CatalogPlane.SealBytes, c.SealBytes),
@@ -208,7 +279,29 @@ func (c Config) ServerConfig() (ServerConfig, error) {
 
 		MultipartSessionTTL: mpTTL,
 		ReleaseGrace:        releaseGrace,
+
+		LocalBlobMaxBytes:  c.LocalBlobMaxBytes,
+		CacheMinResidency:  cacheMinResidency,
+		CacheReadRetention: cacheReadRetention,
+		LocalBlobOrphanAge: localBlobOrphanAge,
+		DropAcceptedBodies: c.CacheWrites != nil && !*c.CacheWrites,
 	}, nil
+}
+
+// parseDurationKnob parses a duration knob: empty takes def,
+// negative is an error.
+func parseDurationKnob(name, value string, def time.Duration) (time.Duration, error) {
+	if value == "" {
+		return def, nil
+	}
+	d, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, fmt.Errorf("ingot: parse %s %q: %w", name, value, err)
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("ingot: %s %q: must not be negative", name, value)
+	}
+	return d, nil
 }
 
 // planeSealAge resolves a plane's SealAge: the per-plane value if set,
@@ -345,8 +438,15 @@ type InProcessConfig struct {
 
 // Load reads daemon config from configFile (or the default search path)
 // with env override (INGOT_* / nested keys via "_").
+//
+// Viper's AutomaticEnv alone applies an environment variable only to a key
+// viper already knows from the config file or a default, so a key absent
+// from the YAML would ignore its INGOT_* variable. ExperimentalBindStruct
+// makes Unmarshal also look up every key of Config, so each field can be
+// set from the environment. TestLoad_EnvWithoutYAMLKey fails if a viper
+// upgrade changes that.
 func Load(configFile string) (*Config, error) {
-	v := viper.GetViper()
+	v := viper.NewWithOptions(viper.ExperimentalBindStruct())
 	setDefaults(v)
 	v.SetEnvPrefix("INGOT")
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
@@ -379,28 +479,15 @@ func Load(configFile string) (*Config, error) {
 	return &cfg, nil
 }
 
+// setDefaults registers the daemon's non-empty defaults. A key needs no entry
+// here for its INGOT_* variable to apply: Load binds every field of Config.
+// Most defaults live in Config.ServerConfig instead (empty → default), since
+// library hosts build Config without calling Load.
 func setDefaults(v *viper.Viper) {
 	v.SetDefault("log_level", "info")
 	v.SetDefault("addr", "0.0.0.0:8080")
-	// The identity keys are registered even though the defaults are empty:
-	// viper's AutomaticEnv only overrides keys it already knows, so without
-	// these an INGOT_IDENTITY_* env var would be silently ignored whenever
-	// the key is absent from the YAML.
-	v.SetDefault("identity.key_file", "")
-	v.SetDefault("identity.service_id", "")
-	// The regionkey keys are registered even where the default is empty:
-	// viper's AutomaticEnv only overrides keys it already knows, so without
-	// these an INGOT_REGIONKEY_* env var would be silently ignored whenever
-	// the key is absent from the YAML.
-	v.SetDefault("regionkey.provider", "")
-	v.SetDefault("regionkey.openbao.address", "")
-	v.SetDefault("regionkey.openbao.token", "")
 	v.SetDefault("regionkey.openbao.mount", "transit")
-	v.SetDefault("regionkey.openbao.key", "")
-	v.SetDefault("regionkey.inprocess.kek", "")
 	v.SetDefault("regionkey.inprocess.version", "v1")
-	v.SetDefault("tenantkey.plc_directory_url", "")
-	v.SetDefault("tenantkey.cache_ttl", "")
 }
 
 // Validate checks the config for the selected mode, aggregating every

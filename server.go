@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/fil-forge/libforge/identity"
@@ -18,6 +19,9 @@ import (
 	"github.com/fil-forge/versitygw/s3log"
 	"github.com/gofiber/fiber/v3"
 	"github.com/multiformats/go-multihash"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 
 	"github.com/fil-forge/ingot/blockstore"
@@ -55,7 +59,7 @@ type ServerDeps struct {
 	// BodyUploader makes each object-body blob durable on Forge by digest
 	// (allocate→PUT→accept), synchronously during a PUT. Remover releases a
 	// space's claim on a blob when its last reference is dropped. In tests both
-	// are no-ops and reads are served from the local spool.
+	// are no-ops and reads are served from local disk.
 	BodyUploader uploader.BodyUploader
 	// Deferred extends BodyUploader for multipart's deferred accept:
 	// park at UploadPart (WithConclude(false)), conclude at Complete,
@@ -70,6 +74,13 @@ type ServerDeps struct {
 	Streaming uploader.StreamingBodyUploader
 	Streams   registry.StreamStore
 
+	// Registrar keeps the upload service's content-entry list in step with the
+	// catalog: one entry per committed object version, which is what the
+	// service counts to report the space's object count.
+	Registrar uploader.UploadRegistrar
+	// UploadRegs is the upload-registration outbox the sweeper drains.
+	UploadRegs registry.UploadRegistrationStore
+
 	// Authority is the service that authorizes bucket creation and deletion.
 	Authority bucketauthority.BucketAuthority
 
@@ -78,7 +89,7 @@ type ServerDeps struct {
 	// separate implementations or one that does both.
 	Registry registry.Registry
 
-	// Intents tracks the local spool's upload_intents lifecycle; Locations
+	// Intents tracks each local blob's upload_intents lifecycle; Locations
 	// records where each accepted body blob (and shipped catalog shard) can be
 	// retrieved from; Inclusions records each shipped shard's inner-block byte
 	// ranges so retired catalog blocks stay resolvable; BlobRefs is the reverse
@@ -136,13 +147,17 @@ var _ s3frontend.SegmentDigestLister = (*logstore.Manager)(nil)
 // lifecycle. fx callers wrap these in OnStart/OnStop hooks; tests
 // call them directly.
 type Server struct {
-	cfg         config.ServerConfig
-	logger      *zap.Logger
-	log         blockstore.Log
-	backend     *s3frontend.Backend
-	api         *s3api.S3ApiServer
-	sweepStop   chan struct{}
-	releaseStop chan struct{}
+	cfg     config.ServerConfig
+	logger  *zap.Logger
+	log     blockstore.Log
+	backend *s3frontend.Backend
+	api     *s3api.S3ApiServer
+	// sweepCtx is cancelled by Stop. Every background sweep derives its
+	// context from it, and sweeps counts the sweeper goroutines, so Stop
+	// can wait for them to exit before the registry closes.
+	sweepCtx    context.Context
+	sweepCancel context.CancelFunc
+	sweeps      sync.WaitGroup
 }
 
 // New wires a ServerDeps + ServerConfig into a runnable Server. The
@@ -180,13 +195,29 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		return nil, fmt.Errorf("ingot: logstore: %w", err)
 	}
 
+	// The spool and the cache share data_dir's filesystem, so moving a blob
+	// from one to the other is a rename.
 	spool, err := blockstore.NewSpool(filepath.Join(cfg.DataDir, "spool"))
 	if err != nil {
 		_ = log.Close(ctx)
 		return nil, fmt.Errorf("ingot: spool: %w", err)
 	}
+	cache, err := blockstore.NewBlobCache(filepath.Join(cfg.DataDir, "cache"))
+	if err != nil {
+		_ = log.Close(ctx)
+		return nil, fmt.Errorf("ingot: blob cache: %w", err)
+	}
+	if err := cache.CheckTake(spool); err != nil {
+		_ = log.Close(ctx)
+		return nil, fmt.Errorf("ingot: %w", err)
+	}
 
-	bs := blockstore.NewLayered(spool, log, deps.BaseBlockReader)
+	bs := blockstore.NewLayered(blockstore.LocalBlobs{Cache: cache, Spool: spool}, log, deps.BaseBlockReader)
+	// The global meter provider is a no-op until a host (the daemon) installs
+	// one, so counting costs nothing when nobody is listening.
+	if err := bs.CountBlobReads(otel.Meter("github.com/fil-forge/ingot/blockstore")); err != nil {
+		logger.Warn("local blob read metric not created", zap.Error(err))
+	}
 	backend := s3frontend.New(s3frontend.Deps{
 		Authority:       deps.Authority,
 		Registry:        deps.Registry,
@@ -199,25 +230,36 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		Reads:           bs,
 		Log:             log,
 		Spool:           spool,
+		Cache:           cache,
 		Uploader:        deps.BodyUploader,
 		Deferred:        deps.Deferred,
 		Remover:         deps.Remover,
 		Streaming:       deps.Streaming,
 		Streams:         deps.Streams,
+		Registrar:       deps.Registrar,
+		UploadRegs:      deps.UploadRegs,
 		EncParams:       deps.EncParams,
 		RegionKeys:      deps.RegionKeys,
 		TenantKeys:      deps.TenantKeys,
 		PendingReleases: deps.PendingReleases,
 		ReleaseGrace:    cfg.ReleaseGrace,
-		MaxBlobSize:     cfg.MaxBlobSize,
-		CORS:            cfg.CORSConfig,
-		Logger:          logger,
+
+		LocalBlobMaxBytes:  cfg.LocalBlobMaxBytes,
+		CacheMinResidency:  cfg.CacheMinResidency,
+		CacheReadRetention: cfg.CacheReadRetention,
+		LocalBlobOrphanAge: cfg.LocalBlobOrphanAge,
+		DropAcceptedBodies: cfg.DropAcceptedBodies,
+
+		MaxBlobSize: cfg.MaxBlobSize,
+		CORS:        cfg.CORSConfig,
+		Logger:      logger,
 	})
 
 	api, err := buildS3API(ctx, backend, cfg, deps.IAM, deps.Identity, logger)
 	if err != nil {
 		// Best-effort cleanup if we got past the log open: the caller
 		// has no Server handle to call Stop on.
+		_ = backend.CloseMetrics()
 		_ = log.Close(ctx)
 		return nil, err
 	}
@@ -233,9 +275,12 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 
 // Start runs Backend.Recover and spawns the S3 listener goroutine.
 // Returns once the listener has been kicked off (does NOT wait for
-// it to start serving on Addr).
+// it to start serving on Addr). Call it at most once.
 func (s *Server) Start(ctx context.Context) error {
 	if err := s.backend.Recover(ctx); err != nil {
+		// fx does not run OnStop for a hook whose OnStart failed, so the
+		// gauges go now; Stop calling CloseMetrics again is harmless.
+		_ = s.backend.CloseMetrics()
 		return fmt.Errorf("ingot: recover: %w", err)
 	}
 	s.logger.Info("starting ingot S3 listener",
@@ -249,14 +294,29 @@ func (s *Server) Start(ctx context.Context) error {
 			s.logger.Error("ingot listener error", zap.Error(err))
 		}
 	}()
+	s.sweepCtx, s.sweepCancel = context.WithCancel(context.Background())
 	s.startMultipartSweeper()
 	s.startReleaseSweeper()
+	s.startLocalBlobSweeper()
+	s.startReleasedPass()
+	s.startRegistrationSweeper()
 	return nil
 }
 
+// goSweep runs fn in a sweeper goroutine that Stop waits for. fn must return
+// promptly once s.sweepCtx is done. Its errors after that are the
+// cancellation's, so the sweepers don't log them.
+func (s *Server) goSweep(fn func()) {
+	s.sweeps.Add(1)
+	go func() {
+		defer s.sweeps.Done()
+		fn()
+	}()
+}
+
 // startMultipartSweeper spawns the abandoned-multipart-session sweeper: open
-// sessions older than MultipartSessionTTL are aborted (their spooled parts
-// dropped) and terminal session rows reaped. Zero TTL → 7-day default;
+// sessions older than MultipartSessionTTL are aborted (their parts, parked on
+// their providers, released there) and terminal session rows reaped. Zero TTL → 7-day default;
 // negative → disabled.
 func (s *Server) startMultipartSweeper() {
 	ttl := s.cfg.MultipartSessionTTL
@@ -270,26 +330,27 @@ func (s *Server) startMultipartSweeper() {
 	if interval > 10*time.Minute {
 		interval = 10 * time.Minute
 	}
-	s.sweepStop = make(chan struct{})
-	go func() {
+	s.goSweep(func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
 			select {
-			case <-s.sweepStop:
+			case <-s.sweepCtx.Done():
 				return
 			case <-ticker.C:
-				ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+				ctx, cancel := context.WithTimeout(s.sweepCtx, time.Minute)
+				ctx, span := tracing.Start(ctx, "sweep.multipart_sessions")
 				n, err := s.backend.SweepStaleMultipartSessions(ctx, ttl)
+				s.endSweepSpan(span, err, attribute.Int("ingot.sweep.count", n))
 				cancel()
-				if err != nil {
+				if err != nil && s.sweepCtx.Err() == nil {
 					s.logger.Warn("multipart sweep", zap.Error(err))
 				} else if n > 0 {
 					s.logger.Info("multipart sweep reaped stale sessions", zap.Int("count", n))
 				}
 			}
 		}
-	}()
+	})
 }
 
 // startReleaseSweeper spawns the deferred-release sweeper: release intents
@@ -305,51 +366,168 @@ func (s *Server) startReleaseSweeper() {
 	if interval < time.Second {
 		interval = time.Second
 	}
-	s.releaseStop = make(chan struct{})
-	go func() {
+	s.goSweep(func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
 			select {
-			case <-s.releaseStop:
+			case <-s.sweepCtx.Done():
 				return
 			case <-ticker.C:
-				ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+				ctx, cancel := context.WithTimeout(s.sweepCtx, time.Minute)
+				ctx, span := tracing.Start(ctx, "sweep.releases")
 				n, err := s.backend.SweepPendingReleases(ctx)
+				s.endSweepSpan(span, err, attribute.Int("ingot.sweep.count", n))
 				cancel()
-				if err != nil {
+				if err != nil && s.sweepCtx.Err() == nil {
 					s.logger.Warn("release sweep", zap.Error(err))
 				} else if n > 0 {
 					s.logger.Info("release sweep executed deferred releases", zap.Int("count", n))
 				}
-				ctx, cancel = context.WithTimeout(context.Background(), time.Minute)
+				ctx, cancel = context.WithTimeout(s.sweepCtx, time.Minute)
+				ctx, span = tracing.Start(ctx, "sweep.streams")
 				n, err = s.backend.SweepStaleStreams(ctx)
+				s.endSweepSpan(span, err, attribute.Int("ingot.sweep.count", n))
 				cancel()
-				if err != nil {
+				if err != nil && s.sweepCtx.Err() == nil {
 					s.logger.Warn("stream sweep", zap.Error(err))
 				} else if n > 0 {
 					s.logger.Info("stream sweep aborted abandoned uploads", zap.Int("count", n))
 				}
 			}
 		}
-	}()
+	})
 }
 
-// Stop shuts the listener down and drains the log. Always returns
-// the combined error of the two operations so callers see all
-// failure modes; either alone is non-fatal to the other.
+// localBlobSweepInterval is how often the local blob sweeper runs. The
+// budget's 10% headroom must exceed ingest rate × this interval.
+const localBlobSweepInterval = 30 * time.Second
+
+// localBlobSweepLogInterval is the least time between the local blob
+// sweeper's Info lines totalling its removals.
+const localBlobSweepLogInterval = 10 * time.Minute
+
+// startLocalBlobSweeper spawns the local blob sweeper: every
+// localBlobSweepInterval it evicts blobs the provider holds down to
+// LocalBlobMaxBytes (when set), and hourly it deletes orphan files (see
+// Backend.SweepLocalBlobs).
+func (s *Server) startLocalBlobSweeper() {
+	s.goSweep(func() {
+		// removed totals the removals since since, not yet logged.
+		var removed s3frontend.LocalBlobSweepStats
+		var lastLog time.Time
+		since := time.Now()
+		ticker := time.NewTicker(localBlobSweepInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-s.sweepCtx.Done():
+				return
+			case <-ticker.C:
+				// Each pass also caps itself; this bounds them together.
+				ctx, cancel := context.WithTimeout(s.sweepCtx, 4*time.Minute)
+				ctx, span := tracing.Start(ctx, "sweep.local_blobs")
+				stats, err := s.backend.SweepLocalBlobs(ctx)
+				span.SetAttributes(attribute.Int64("ingot.sweep.usage_bytes", s.backend.LocalBlobUsage()))
+				s.endSweepSpan(span, err, stats.SpanAttributes()...)
+				cancel()
+				if err != nil && s.sweepCtx.Err() == nil {
+					s.logger.Warn("local blob sweep", zap.Error(err))
+				}
+				// The removals are totalled and logged at most every
+				// localBlobSweepLogInterval, so steady eviction shows at
+				// Info without a line every sweep; the metrics carry each.
+				removed.Add(stats)
+				if removed.Removed() && time.Since(lastLog) >= localBlobSweepLogInterval {
+					s.logger.Info("local blob sweeper removed files",
+						append(removed.LogFields(),
+							zap.Duration("over", time.Since(since)),
+							zap.Int64("usage_bytes", s.backend.LocalBlobUsage()))...)
+					removed, lastLog = s3frontend.LocalBlobSweepStats{}, time.Now()
+				}
+				if !removed.Removed() {
+					since = time.Now()
+				}
+			}
+		}
+	})
+}
+
+// startReleasedPass removes the local copies and intents that releases kept
+// before they freed local disk (see Backend.RemoveReleasedPublished). It runs
+// at every startup, until it has gone through every candidate or Stop
+// cancels it; on a node with none it is one scan.
+func (s *Server) startReleasedPass() {
+	s.goSweep(func() {
+		ctx, span := tracing.Start(s.sweepCtx, "sweep.released_pass")
+		files, bytes, err := s.backend.RemoveReleasedPublished(ctx)
+		s.endSweepSpan(span, err,
+			attribute.Int64("ingot.sweep.files", files),
+			attribute.Int64("ingot.sweep.bytes", bytes))
+		switch {
+		case err != nil && s.sweepCtx.Err() == nil:
+			s.logger.Warn("local blob released pass; the next restart tries again", zap.Error(err),
+				zap.Int64("files", files), zap.Int64("bytes", bytes))
+		case files > 0:
+			s.logger.Info("local blob released pass removed copies earlier releases kept",
+				zap.Int64("files", files), zap.Int64("bytes", bytes))
+		}
+	})
+}
+
+// uploadRegistrationSweepInterval is how often the queue is drained. The count
+// is reporting data, not a read-your-writes surface, so a short lag is fine and
+// a steady cadence keeps the load on the upload service predictable.
+const uploadRegistrationSweepInterval = 30 * time.Second
+
+// startRegistrationSweeper spawns the upload-registration sweeper: the write
+// path queues one row per object version committed or retired, and this drains
+// them against the upload service, retrying with backoff until each is taken.
+//
+// It runs off the request path deliberately. The object count is a reporting
+// number, so a Sprue round trip does not belong in a PUT, and a Sprue outage
+// should delay the count rather than fail writes or lose it.
+func (s *Server) startRegistrationSweeper() {
+	s.goSweep(func() {
+		ticker := time.NewTicker(uploadRegistrationSweepInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-s.sweepCtx.Done():
+				return
+			case <-ticker.C:
+				ctx, cancel := context.WithTimeout(s.sweepCtx, 5*time.Minute)
+				ctx, span := tracing.Start(ctx, "sweep.upload_registrations")
+				n, err := s.backend.SweepUploadRegistrations(ctx)
+				s.endSweepSpan(span, err, attribute.Int("ingot.sweep.count", n))
+				cancel()
+				if err != nil && s.sweepCtx.Err() == nil {
+					s.logger.Warn("registration sweep", zap.Error(err))
+				} else if n > 0 {
+					s.logger.Info("registration sweep recorded object count changes", zap.Int("count", n))
+				}
+			}
+		}
+	})
+}
+
+// Stop cancels the background sweeps and waits for them to exit (until ctx
+// ends), then shuts the listener down and drains the log. Always returns the
+// combined error of these steps so callers see all failure modes; none is
+// fatal to the others.
 func (s *Server) Stop(ctx context.Context) error {
 	s.logger.Info("shutting down ingot S3 listener")
 
-	if s.sweepStop != nil {
-		close(s.sweepStop)
-		s.sweepStop = nil
-	}
-	if s.releaseStop != nil {
-		close(s.releaseStop)
-		s.releaseStop = nil
-	}
 	var errs []error
+	if s.sweepCancel != nil {
+		s.sweepCancel()
+		if err := s.waitSweeps(ctx); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if err := s.backend.CloseMetrics(); err != nil {
+		errs = append(errs, fmt.Errorf("unregister local blob metrics: %w", err))
+	}
 	if err := s.api.ShutDown(); err != nil {
 		errs = append(errs, fmt.Errorf("s3api shutdown: %w", err))
 	}
@@ -362,22 +540,54 @@ func (s *Server) Stop(ctx context.Context) error {
 	return nil
 }
 
+// endSweepSpan ends a background sweep's span with attrs. A sweep's error once
+// sweepCtx is done is the cancellation's, as goSweep says, so it does not
+// mark the span failed.
+func (s *Server) endSweepSpan(span trace.Span, err error, attrs ...attribute.KeyValue) {
+	span.SetAttributes(attrs...)
+	if s.sweepCtx.Err() != nil {
+		err = nil
+	}
+	tracing.End(span, err)
+}
+
+// waitSweeps waits for the sweeper goroutines to exit, or for ctx to end.
+// A sweep stops at its next context check once sweepCtx is cancelled.
+func (s *Server) waitSweeps(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() {
+		s.sweeps.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		// An expired ctx and already-exited sweepers can both be ready.
+		select {
+		case <-done:
+			return nil
+		default:
+		}
+		return fmt.Errorf("waiting for background sweeps: %w", ctx.Err())
+	}
+}
+
 // newBucketFlushFunc builds the logstore flush callback for one bucket's
 // log: it ships a sealed catalog CAR to Forge via uploader.SubmitShard,
 // then records the shard's location and every inner block's byte range
 // in the local location/inclusion tables (the appliance mirror of the
 // sharded-dag-index SubmitShard publishes). The store owns the
-// ship-state transition (it stamps the per-plane shipped timestamp and,
-// for the catalog plane, advances each affected bucket's forge_root_cid)
-// once this returns nil — so a segment is only ever marked shipped (and
-// thus eligible for retention) after its blocks are resolvable through
-// the fallthrough read tier.
+// ship-state transition (it stamps the segment's shipped timestamp and
+// advances each affected bucket's forge_root_cid) once this returns nil —
+// so a segment is only ever marked shipped (and thus eligible for
+// retention) after its blocks are resolvable through the fallthrough read
+// tier.
 //
-// A header-only CAR (e.g. an MST-only op writes no data blocks; a
-// trimTop-to-existing-subtree writes neither) has no positions: nothing
-// to ship, so the closure returns nil and the store still marks the
-// plane shipped, letting retention reclaim the tiny CAR and (for the
-// catalog plane) advancing forge_root_cid for the recorded op-roots.
+// A header-only CAR (a trimTop-to-existing-subtree writes no blocks) has
+// no positions: nothing to ship, so the closure returns nil and the store
+// still marks the segment shipped, letting retention reclaim the tiny CAR
+// and advancing forge_root_cid for the recorded op-roots.
 //
 // The destination space is the bucket's, resolved from the registry at
 // ship time (the log is segregated per bucket, so every segment this
@@ -590,6 +800,12 @@ func validateServerInputs(cfg config.ServerConfig, deps ServerDeps) error {
 	}
 	if deps.Remover == nil {
 		return errors.New("ingot: ServerDeps.Remover is required")
+	}
+	if deps.Registrar == nil {
+		return errors.New("ingot: ServerDeps.Registrar is required")
+	}
+	if deps.UploadRegs == nil {
+		return errors.New("ingot: ServerDeps.UploadRegs is required")
 	}
 	if deps.Meta == nil {
 		return errors.New("ingot: ServerDeps.Meta is required")

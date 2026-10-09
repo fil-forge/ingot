@@ -19,11 +19,13 @@ import (
 	"github.com/fil-forge/versitygw/backend"
 	"github.com/fil-forge/versitygw/s3err"
 	"github.com/fil-forge/versitygw/s3response"
+	block "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 
+	"github.com/fil-forge/ingot/blockstore"
 	"github.com/fil-forge/ingot/inmem"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/uploader"
@@ -118,6 +120,24 @@ func (s *streamingUploader) AbortBlob(_ context.Context, _ did.DID, cause cid.Ci
 	return s.abortErr
 }
 
+// GetBlock serves no catalog blocks: those come from the log tier.
+func (s *streamingUploader) GetBlock(context.Context, did.DID, cid.Cid) (block.Block, error) {
+	return nil, blockstore.ErrNotFound
+}
+
+// OpenBlob serves a blob from the bytes a successful PUT delivered, so a test
+// can read an object whose spool copies are gone, as the network tier would.
+func (s *streamingUploader) OpenBlob(_ context.Context, _ did.DID, digest multihash.Multihash) (io.ReadCloser, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for add, data := range s.puts {
+		if s.putErrs[add] == nil && bytes.Equal(mustSum(data), digest) {
+			return io.NopCloser(bytes.NewReader(data)), nil
+		}
+	}
+	return nil, blockstore.ErrNotFound
+}
+
 func mustSum(b []byte) multihash.Multihash {
 	sum := sha256.Sum256(b)
 	d, err := multihash.Encode(sum[:], multihash.SHA2_256)
@@ -129,13 +149,14 @@ func mustSum(b []byte) multihash.Multihash {
 
 const streamBlobCeiling = 300 << 10
 
-func newStreamingBackend(t *testing.T, su *streamingUploader) (*Backend, *inmem.MemStore) {
+func newStreamingBackend(t *testing.T, su *streamingUploader, mods ...func(*Deps)) (*Backend, *inmem.MemStore) {
 	t.Helper()
-	return newDeferredBackend(t, su, func(d *Deps) {
+	return newDeferredBackend(t, su, append([]func(*Deps){func(d *Deps) {
 		d.Streaming = su
 		d.Streams = d.Parks.(*inmem.MemStore)
+		d.Reads = blockstore.NewLayered(blockstore.LocalBlobs{Cache: d.Cache, Spool: d.Spool}, d.Log, su)
 		d.MaxBlobSize = streamBlobCeiling
-	})
+	}}, mods...)...)
 }
 
 func putSized(t *testing.T, b *Backend, key string, data []byte, declared int64) error {
@@ -152,7 +173,7 @@ func putSized(t *testing.T, b *Backend, key string, data []byte, declared int64)
 
 func spooled(t *testing.T, b *Backend, digest multihash.Multihash) []byte {
 	t.Helper()
-	data, err := os.ReadFile(b.spool.Path(digest))
+	data, err := os.ReadFile(localPath(b, digest))
 	require.NoError(t, err)
 	return data
 }
@@ -305,6 +326,8 @@ func TestStreamedUploadPart(t *testing.T) {
 		in, err := mem.GetIntent(ctx, d)
 		require.NoError(t, err)
 		require.Equal(t, registry.IntentParked, in.State)
+		_, err = os.Stat(localPath(b, d))
+		require.True(t, os.IsNotExist(err), "a parked blob keeps no spool copy (stat err=%v)", err)
 	}
 	require.Empty(t, staleStreams(t, mem))
 

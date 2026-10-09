@@ -43,7 +43,7 @@ type ServerConfig struct {
 
 	// MultipartSessionTTL bounds abandoned multipart uploads: a session whose
 	// state has not changed for this long is torn down by a background
-	// sweeper — open ones aborted (dropping their spooled parts), completed
+	// sweeper — open ones aborted (releasing their parked parts), completed
 	// rows retained for Complete idempotency reaped. A Complete's latch
 	// restarts the clock, so a live Complete on an old session is not swept
 	// from under it. Zero → default 7 days; negative → sweeper disabled.
@@ -51,9 +51,26 @@ type ServerConfig struct {
 
 	// ReleaseGrace delays each blob release this long past the drop of its
 	// last reference claim, so in-flight readers of the prior catalog root
-	// finish first. Config.ServerConfig() applies the 60s default; zero here
+	// finish first; a reader still streaming when it ends fails at its next
+	// blob. Config.ServerConfig() applies the 60s default; zero here
 	// means releases are due immediately.
 	ReleaseGrace time.Duration
+
+	// LocalBlobMaxBytes is the byte budget for the spool and the cache
+	// together, writes in progress included, enforced by the local blob
+	// sweeper; zero means no budget. CacheMinResidency and
+	// CacheReadRetention are the read-after-write and read-cache windows the
+	// sweeper honours while it can; zero turns each off. LocalBlobOrphanAge
+	// is the age at which the sweeper deletes files no upload intent names;
+	// zero → 24h. Config.ServerConfig() applies the defaults documented on
+	// Config.
+	LocalBlobMaxBytes  int64
+	CacheMinResidency  time.Duration
+	CacheReadRetention time.Duration
+	LocalBlobOrphanAge time.Duration
+	// DropAcceptedBodies removes each body's local copy as soon as the
+	// provider has accepted it (Config.CacheWrites false).
+	DropAcceptedBodies bool
 
 	// CORSConfig is the S3 CORS configuration the backend reports for
 	// every bucket, rendered from Config.CORSAllowedOrigins by
