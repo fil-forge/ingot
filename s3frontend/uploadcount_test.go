@@ -131,6 +131,10 @@ func newCountingBackend(t *testing.T) (*Backend, *recordingRegistrar) {
 	ctx := context.Background()
 	dir := t.TempDir()
 	mem := inmem.NewMemStore()
+	cache, err := blockstore.NewBlobCache(filepath.Join(dir, "cache"))
+	if err != nil {
+		t.Fatalf("cache: %v", err)
+	}
 	spool, err := blockstore.NewSpool(filepath.Join(dir, "spool"))
 	if err != nil {
 		t.Fatalf("spool: %v", err)
@@ -156,9 +160,10 @@ func newCountingBackend(t *testing.T) (*Backend, *recordingRegistrar) {
 		GC:              mem,
 		Multipart:       mem,
 		Parks:           mem,
-		Reads:           blockstore.NewLayered(spool, log, inmem.NopBaseReader{}),
+		Reads:           blockstore.NewLayered(blockstore.LocalBlobs{Cache: cache, Spool: spool}, log, inmem.NopBaseReader{}),
 		Log:             log,
 		Spool:           spool,
+		Cache:           cache,
 		Uploader:        inmem.NopUploader{},
 		Deferred:        inmem.NopUploader{},
 		Remover:         &recordingRemover{},
