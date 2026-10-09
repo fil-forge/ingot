@@ -537,6 +537,7 @@ func newDeferredBackend(t *testing.T, up deferredTestUploader, mods ...func(*Dep
 		RegionKeys:      testRegionKeys(t),
 		TenantKeys:      testTenantKeys(),
 		PendingReleases: mem,
+		UploadRegs:      mem,
 	}
 	for _, mod := range mods {
 		mod(&deps)

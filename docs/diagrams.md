@@ -1097,9 +1097,9 @@ Sources: `migrations/sql/*.sql`. Review whenever a migration is added.
 
 ## DeleteBucket teardown order
 
-Teardown crosses every seam in order: prove the bucket empty, unwind
-in-flight multipart, quiesce the log, release every network registration,
-then delete at hilt and locally.
+Teardown crosses every seam in order: prove the bucket empty, commit its
+root empty, unwind in-flight multipart, quiesce the log, release every
+network registration, then delete at hilt and locally.
 
 ```mermaid
 sequenceDiagram
@@ -1115,6 +1115,8 @@ sequenceDiagram
     Note over B,R: the whole operation runs under the per-bucket lock
     B->>R: reg.Get
     B->>B: MST emptiness walk<br/>(ErrBucketNotEmpty, or the versioned variant)
+    B->>R: CASRoot(root → empty), SetForgeRoot(empty)
+    Note over B,R: nothing the bucket reads is released below
     loop each open multipart session
         B->>U: abortOpenSession: /blob/abort parked blobs
         Note over B,U: the request's own proofs sign the release legs<br/>(s3:DeleteBucket delegates blob.Abort + blob.Remove)
@@ -1124,6 +1126,8 @@ sequenceDiagram
     loop each digest
         B->>U: /blob/remove (release the space's registration)
     end
+    B->>U: drainSpaceReleases: /blob/remove each deleted<br/>object's blob still behind the reader grace
+    B->>U: DrainSpaceRegistrations: send the space's queued<br/>/upload/add and /upload/remove changes
     B->>H: /s3/bucket/delete (hilt refuses while registrations remain)
     B->>R: reg.Delete (the local row)
     B->>L: RemoveBucketLog, best-effort<br/>(directory + segment rows)
@@ -1133,11 +1137,14 @@ sequenceDiagram
 - The log seams (`QuiesceBucketLog`, `ShippedSegmentDigests`,
   `RemoveBucketLog`) are type-asserted on `blockstore.Log`: a plain `Store`
   without them silently no-ops, which is the trap this diagram documents.
-- A failure after the quiesce leaves the bucket functional: the closed store
-  reopens lazily on the next use.
+- A failure after the root is committed empty (hilt refusing, a release
+  erroring) leaves the bucket functional: it lists empty, the closed store
+  reopens lazily on the next write, and a retried delete starts over.
 
 Sources: `s3frontend/bucket.go` (DeleteBucket), `s3frontend/multipart.go`
-(abortOpenSession), `logstore/manager.go`. Review when these change.
+(abortOpenSession), `s3frontend/object.go` (drainSpaceReleases),
+`s3frontend/uploadsweep.go` (DrainSpaceRegistrations), `logstore/manager.go`.
+Review when these change.
 
 ## Package-to-diagram map
 
