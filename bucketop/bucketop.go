@@ -354,7 +354,7 @@ func (tx *Tx) Commit(ctx context.Context, newRoot cid.Cid) (err error) {
 	if err := tx.staging.Commit(ctx, newRoot); err != nil {
 		return fmt.Errorf("bucketop: append: %w", err)
 	}
-	if err := tx.deps.Reg.CASRootAndQueueUploadRegistrations(ctx, tx.bucket, tx.state.Root, newRoot, tx.uploadRegs); err != nil {
+	if err := tx.deps.Reg.CASRootAndEnqueueUploadRegistrations(ctx, tx.bucket, tx.state.Root, newRoot, tx.uploadRegs); err != nil {
 		return fmt.Errorf("bucketop: advance root: %w", err)
 	}
 	return nil

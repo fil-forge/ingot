@@ -119,11 +119,11 @@ func (r *Postgres) CASRoot(ctx context.Context, name string, expect, next cid.Ci
 	return r.casRoot(ctx, r.pool, name, expect, next)
 }
 
-// CASRootAndQueueUploadRegistrations advances the root and records the
+// CASRootAndEnqueueUploadRegistrations advances the root and records the
 // commit's upload registrations in one transaction, so the outbox row exists
 // exactly when the version it describes committed. A conflict or a missing
 // bucket rolls the rows back with the CAS.
-func (r *Postgres) CASRootAndQueueUploadRegistrations(ctx context.Context, name string, expect, next cid.Cid, regs []UploadRegistration) error {
+func (r *Postgres) CASRootAndEnqueueUploadRegistrations(ctx context.Context, name string, expect, next cid.Cid, regs []UploadRegistration) error {
 	if len(regs) == 0 {
 		return r.CASRoot(ctx, name, expect, next)
 	}

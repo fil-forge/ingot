@@ -61,7 +61,7 @@ func (r UploadRegistration) DeadLettered() bool { return r.DeadLetteredAt != nil
 
 // UploadRegistrationStore is the outbox the registration sweeper drains
 // (upload_registrations). Rows are enqueued by
-// Registry.CASRootAndQueueUploadRegistrations, in the commit's own
+// Registry.CASRootAndEnqueueUploadRegistrations, in the commit's own
 // transaction; nothing else writes them.
 type UploadRegistrationStore interface {
 	// ListDueUploadRegistrations returns rows whose next_at has passed, in
