@@ -387,3 +387,41 @@ func TestServerConfig_CacheWrites(t *testing.T) {
 		})
 	}
 }
+
+func TestLoad_EncryptionAllowNoneEnv(t *testing.T) {
+	for _, tc := range []struct {
+		env   string
+		allow bool
+	}{{"", false}, {"true", true}, {"false", false}} {
+		t.Run("env="+tc.env, func(t *testing.T) {
+			if tc.env != "" {
+				t.Setenv("INGOT_ENCRYPTION_ALLOW_NONE", tc.env)
+			}
+			cfgFile := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(cfgFile, []byte("addr: \"127.0.0.1:9000\"\n"), 0o600); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+			cfg, err := Load(cfgFile)
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.Encryption.AllowNone != tc.allow {
+				t.Fatalf("encryption.allow_none = %v, want %v", cfg.Encryption.AllowNone, tc.allow)
+			}
+		})
+	}
+}
+
+func TestServerConfig_AllowNoneEncryption(t *testing.T) {
+	for _, allow := range []bool{false, true} {
+		cfg := validConfig(t)
+		cfg.Encryption.AllowNone = allow
+		sc, err := cfg.ServerConfig()
+		if err != nil {
+			t.Fatalf("ServerConfig: %v", err)
+		}
+		if sc.AllowNoneEncryption != allow {
+			t.Fatalf("AllowNoneEncryption = %v, want %v", sc.AllowNoneEncryption, allow)
+		}
+	}
+}

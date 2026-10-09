@@ -186,6 +186,14 @@ func withLocalBlobBudgetConfig() stack.Option {
 	return stack.WithServiceConfig("ingot", "testdata/config-localblobbudget.yaml")
 }
 
+// withAllowNoneConfig mounts testdata/config-allownone.yaml — the default
+// config with encryption.allow_none on, so a bucket's encryption can be set
+// to "none". Dedicated stacks only: every other test expects stored bodies
+// to be envelopes.
+func withAllowNoneConfig() stack.Option {
+	return stack.WithServiceConfig("ingot", "testdata/config-allownone.yaml")
+}
+
 // withUncachedWritesConfig mounts testdata/config-uncachedwrites.yaml —
 // cache_writes off, so no written body stays on local disk. Dedicated stacks
 // only: other tests read envelopes back from local disk.

@@ -28,7 +28,6 @@ import (
 	"go.uber.org/zap"
 
 	msbucket "github.com/fil-forge/ingot/bucket"
-	"github.com/fil-forge/ingot/internal/reqscope"
 	"github.com/fil-forge/ingot/internal/tracing"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/uploader"
@@ -61,8 +60,9 @@ func (b *Backend) CreateMultipartUpload(ctx context.Context, input s3response.Cr
 	if unsupportedObjectACL(input.ACL, input.GrantFullControl, input.GrantRead, input.GrantReadACP, input.GrantWriteACP) {
 		return s3response.InitiateMultipartUploadResult{}, s3err.GetAPIError(s3err.ErrNotImplemented)
 	}
-	if req, ok := reqscope.Request(ctx); ok && requestsServerSideEncryption(req.Headers) {
-		return s3response.InitiateMultipartUploadResult{}, s3err.GetAPIError(s3err.ErrNotImplemented)
+	sse, err := requestedEncryption(ctx)
+	if err != nil {
+		return s3response.InitiateMultipartUploadResult{}, err
 	}
 	// A directory object (trailing "/") is zero-length by definition; a
 	// multipart upload to one necessarily carries data.
@@ -103,6 +103,9 @@ func (b *Backend) CreateMultipartUpload(ctx context.Context, input s3response.Cr
 	if ct == "" {
 		ct = "application/octet-stream"
 	}
+	// Whether the object is stored as received is the session's to carry:
+	// decided here, as on S3, and applied to every part (sse.go).
+	plaintext := storesPlaintext(st, sse)
 	if err := b.multipart.CreateSession(ctx, registry.MultipartSession{
 		UploadID:                uploadID,
 		Bucket:                  bucket,
@@ -123,10 +126,11 @@ func (b *Backend) CreateMultipartUpload(ctx context.Context, input s3response.Cr
 		LockLegalHold:           string(input.ObjectLockLegalHoldStatus),
 		Tagging:                 backend.GetStringFromPtr(input.Tagging),
 		Metadata:                input.Metadata,
+		Plaintext:               plaintext,
 	}); err != nil {
 		return s3response.InitiateMultipartUploadResult{}, fmt.Errorf("s3frontend: create session: %w", err)
 	}
-	return s3response.InitiateMultipartUploadResult{Bucket: bucket, Key: key, UploadId: uploadID}, nil
+	return s3response.InitiateMultipartUploadResult{Bucket: bucket, Key: key, UploadId: uploadID, ServerSideEncryption: encryptionFor(plaintext)}, nil
 }
 
 // openSession fetches uploadID's session and maps anything that is not an
@@ -230,7 +234,7 @@ func (b *Backend) UploadPart(ctx context.Context, input *s3.UploadPartInput) (*s
 	if err != nil {
 		return nil, err
 	}
-	out := &s3.UploadPartOutput{ETag: &rec.etag}
+	out := &s3.UploadPartOutput{ETag: &rec.etag, ServerSideEncryption: encryptionFor(sess.Plaintext)}
 	setUploadPartChecksum(out, rec.echoAlgo, rec.echoSum)
 	return out, nil
 }
@@ -354,7 +358,7 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 			return nil, fmt.Errorf("s3frontend: record superseded part releases: %w", err)
 		}
 	}
-	spooled, err := b.splitSpool(ctx, sess.Bucket, space, bodyReader, size, md5Src)
+	spooled, err := b.splitSpool(ctx, sess.Bucket, space, bodyReader, size, md5Src, sess.Plaintext)
 	if err != nil {
 		var apiErr s3err.APIError
 		if errors.As(err, &apiErr) {
@@ -676,7 +680,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 				// A re-Complete of an already-completed upload returns the ETag
 				// but no checksum: AWS omits it on the idempotent replay (for both
 				// COMPOSITE and FULL_OBJECT), unlike the first Complete.
-				res := s3response.CompleteMultipartUploadResult{Bucket: &bucket, Key: &key, ETag: &etagQ}
+				res := s3response.CompleteMultipartUploadResult{Bucket: &bucket, Key: &key, ETag: &etagQ, ServerSideEncryption: encryptionFor(sess.Plaintext)}
 				return res, cur.CommittedVersionID, nil
 			}
 			if cur.State == registry.SessionOpen {
@@ -742,11 +746,14 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 			if err != nil {
 				return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: part blob %x: %w", d, err)
 			}
-			// intent.Size is the spooled (envelope) byte count; the manifest
-			// spans are plaintext, derived from the blob's FEE geometry.
-			plainLen, err := b.blobPlaintextLen(ctx, bucketState.Space, d, in.Size)
-			if err != nil {
-				return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: part blob %x: %w", d, err)
+			// intent.Size is the spooled byte count: the plaintext span itself
+			// for a session stored as received, else the envelope's, from
+			// which the plaintext span follows by the blob's FEE geometry.
+			plainLen := in.Size
+			if !sess.Plaintext {
+				if plainLen, err = b.blobPlaintextLen(ctx, bucketState.Space, d, in.Size); err != nil {
+					return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: part blob %x: %w", d, err)
+				}
 			}
 			blobs = append(blobs, msbucket.BlobRef{Digest: d, Start: offset, End: offset + plainLen - 1})
 			offset += plainLen
@@ -778,6 +785,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 		Expires:                 sess.Expires,
 		WebsiteRedirectLocation: sess.WebsiteRedirectLocation,
 		Metadata:                sess.Metadata,
+		Plaintext:               sess.Plaintext,
 	}
 	// Persist the final checksum so GET/HEAD/ListObjectVersions echo it —
 	// including the derived default of a session that declared none.
@@ -900,7 +908,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 		versionid = node.VersionID
 	}
 	etagQ := `"` + etag + `"`
-	res := s3response.CompleteMultipartUploadResult{Bucket: &bucket, Key: &key, ETag: &etagQ}
+	res := s3response.CompleteMultipartUploadResult{Bucket: &bucket, Key: &key, ETag: &etagQ, ServerSideEncryption: encryptionOf(mf)}
 	setCompleteResultChecksum(&res, ckAlgo, ckValue, ckType)
 	return res, versionid, nil
 }

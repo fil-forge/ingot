@@ -18,7 +18,6 @@ import (
 	"github.com/fil-forge/versitygw/s3response"
 
 	msbucket "github.com/fil-forge/ingot/bucket"
-	"github.com/fil-forge/ingot/internal/reqscope"
 	"github.com/fil-forge/ingot/registry"
 )
 
@@ -47,8 +46,10 @@ func (b *Backend) UploadPartCopy(ctx context.Context, input *s3.UploadPartCopyIn
 	if input.Bucket == nil || input.Key == nil || input.UploadId == nil || input.PartNumber == nil || input.CopySource == nil {
 		return s3response.CopyPartResult{}, s3err.GetAPIError(s3err.ErrInvalidRequest)
 	}
-	if req, ok := reqscope.Request(ctx); ok && requestsServerSideEncryption(req.Headers) {
-		return s3response.CopyPartResult{}, s3err.GetAPIError(s3err.ErrNotImplemented)
+	// The part is stored however its session is; the request's encryption
+	// headers are checked as on a write, then set nothing.
+	if _, err := requestedEncryption(ctx); err != nil {
+		return s3response.CopyPartResult{}, err
 	}
 	sess, err := b.openSession(ctx, *input.UploadId, input.Bucket, input.Key)
 	if err != nil {
@@ -120,7 +121,7 @@ func (b *Backend) UploadPartCopy(ctx context.Context, input *s3.UploadPartCopyIn
 		return s3response.CopyPartResult{}, err
 	}
 
-	result := s3response.CopyPartResult{ETag: &rec.etag, LastModified: time.Now().UTC()}
+	result := s3response.CopyPartResult{ETag: &rec.etag, LastModified: time.Now().UTC(), ServerSideEncryption: encryptionFor(sess.Plaintext)}
 	setCopyPartChecksum(&result, rec.echoAlgo, rec.echoSum)
 	if srcRv.versioned() {
 		result.CopySourceVersionId = srcRv.node.VersionID
@@ -136,7 +137,7 @@ func (b *Backend) openCopySource(ctx context.Context, src *resolvedVersion, star
 	if end < start {
 		return io.NopCloser(bytes.NewReader(nil)), nil
 	}
-	opener, err := b.bodyOpener(ctx, src.st.Space, src.mf.Body)
+	opener, err := b.bodyOpener(ctx, src.st.Space, src.mf.Body, src.mf.Plaintext)
 	if err != nil {
 		return nil, err
 	}

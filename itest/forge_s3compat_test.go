@@ -189,8 +189,26 @@ func TestForgeS3Compat(t *testing.T) {
 		),
 		// Presigned
 		s3tests.Skip("PutObject with ACL is not supported", s3tests.IDs("presigned-0002")),
-		// Server Side Encryption
-		s3tests.Skip("Server Side Encryption is not supported", s3tests.Tags("sse")),
+		// Server-side encryption. Every object is encrypted to the tenant key,
+		// which is SSE-S3 (AES256) on the wire, and the bucket-encryption API
+		// configures it; SSE-C and SSE-KMS are not supported. sse-0041 also
+		// expects an undersized SSE-C key to be judged (400) rather than SSE-C
+		// refused (501).
+		s3tests.Skip(
+			"SSE-C is not supported",
+			s3tests.IDs(
+				"misc-0003", "multipart-0019", "sse-0002", "sse-0004", "sse-0005", "sse-0008", "sse-0014",
+				"sse-0017", "sse-0018", "sse-0019", "sse-0020", "sse-0021", "sse-0022", "sse-0023", "sse-0024",
+				"sse-0025", "sse-0026", "sse-0027", "sse-0036", "sse-0039", "sse-0041",
+			),
+		),
+		s3tests.Skip(
+			"Runner limitation: the raw HEAD step is read as a GET, so the 400 it expects (HEAD with an "+
+				"x-amz-server-side-encryption header) fails on the missing error body — as it would against "+
+				"AWS, which frames HEAD errors as chunked with no body. The rejection itself is pinned by the "+
+				"s3frontend unit tests",
+			s3tests.IDs("sse-0031"),
+		),
 		// Versioning
 		s3tests.Skip("GetObjectAcl is not supported", s3tests.IDs("versioning-0004", "versioning-0005")),
 	}

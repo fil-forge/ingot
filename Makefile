@@ -48,7 +48,7 @@ SHARD_CLAIMED := $(SHARD_encryption) $(SHARD_conformance) $(SHARD_uploads) TestF
 
 # `rest` is the complement, so a test added to itest/ runs there rather than
 # matching no shard and silently never running: Delete, DeleteBucket,
-# Retention, Eviction, NativeProvision today (~6m10 in total).
+# Retention, Eviction, NativeProvision, BucketEncryption today (~7m in total).
 SHARD_ALL  = $(filter Test%,$(shell GOWORK=off $(GO) test -tags itest -list '.*' ./itest))
 SHARD_rest = $(filter-out $(SHARD_CLAIMED),$(SHARD_ALL))
 
