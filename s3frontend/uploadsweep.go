@@ -20,18 +20,17 @@ import (
 const uploadRegistrationBatch = 256
 
 // uploadRegistrationDeadLetterAfter is how many failed attempts a row gets
-// before it is dead-lettered once its authority is spent. The backoff caps at 30 minutes, so
-// this spans about three hours — long enough for a write to the space to leave
-// fresh authority behind, and short enough that a dead row stops holding its
-// key back within a shift.
+// before it is dead-lettered once its authority is spent. The backoff caps at
+// 30 minutes, so this spans about three hours — long enough for a write to the
+// space to leave fresh authority behind, and short enough that a dead row
+// stops holding its key back within a shift.
 //
 // That budget has to stay inside the overhang hilt adds to a delegation's life
 // past the derived key's own (hilt's rpc.AsyncOverhang, four hours). Retrying
 // for longer than the authority lasts turns an ordinary outage into a
 // dead-lettered row: the change expires rather than completing, and the
-// symptom shows up
-// here rather than where the window is set. Raise this and the overhang moves
-// with it.
+// symptom shows up here rather than where the window is set. Raise this and
+// the overhang moves with it.
 const uploadRegistrationDeadLetterAfter = 10
 
 // uploadRegistrationBackoff is how long a failed registration waits before the

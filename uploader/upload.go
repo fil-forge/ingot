@@ -37,13 +37,13 @@ type UploadRegistrar interface {
 	// renewing the stored chain when it has run out or is about to. It reports
 	// whether the chain it returns is a new one, so the caller can persist it.
 	//
-	// Renewal matters because the stored chain is short lived: hilt expires
-	// its delegation to the gateway at the next UTC midnight, so a change
-	// queued late in the day can outlive its own authority within minutes of
-	// the upload service being unavailable. The renewal comes from the space's
-	// live authority, which a recent write to that space leaves behind, so it
-	// rescues a space still in use. A space that has gone quiet has none, and
-	// the error says so.
+	// The stored chain has room to spare: hilt expires its delegation to the
+	// gateway at the next UTC midnight plus an async overhang, so even a
+	// change queued at 23:59 has hours to be drained in. Renewal is for the
+	// queue that outlasts that, which is the upload service being away for
+	// longer than a night. It comes from the space's live authority, which a
+	// recent write to that space leaves behind, so it rescues a space still
+	// in use. A space that has gone quiet has none, and the error says so.
 	PrepareAuthority(ctx context.Context, space did.DID, cmd ucan.Command, stored []byte) ([]byte, bool, error)
 	// RegisterUploads records each change as a content entry in one round
 	// trip, reporting the outcomes in the order given: a nil entry means the

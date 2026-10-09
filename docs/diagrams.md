@@ -372,10 +372,11 @@ sequenceDiagram
   Each row carries the delegation chain that authorizes it, captured from the
   request that committed the version, because the sweeper has no request to
   borrow authority from.
-- That chain is short lived — hilt expires its delegation to the gateway at the
-  next UTC midnight, so a change queued late in the day may hold minutes of
-  authority. The sweeper renews it from the space's live authority, which a
-  recent write leaves behind. A space that has gone quiet has none, and after
+- That chain has room to spare — hilt expires its delegation to the gateway at
+  the next UTC midnight plus an async overhang, so even a change queued at
+  23:59 has hours to be drained in. For the queue that outlasts that, the
+  sweeper renews from the space's live authority, which a recent write leaves
+  behind. A space that has gone quiet has none, and after
   `uploadRegistrationDeadLetterAfter` attempts the row is **dead-lettered**:
   out of the sweep, and out of the way of its key's later rows. (Nothing to do
   with a parked blob, which is durable and awaiting its accept.) The count is then short by

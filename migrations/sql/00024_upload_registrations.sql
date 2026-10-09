@@ -15,10 +15,12 @@
 -- its own. It is bearer authority for one space, narrowed to this command, and
 -- it is deleted with the row as soon as the registration lands.
 --
--- That chain is short lived: hilt expires its delegation to the gateway at the
--- next UTC midnight, so a row queued late in the day may hold only minutes of
--- authority. The sweeper renews it from the space's live authority when it can.
--- When it cannot, the row is dead-lettered rather than retried forever:
+-- The chain outlives the request by a wide margin: hilt expires its delegation
+-- to the gateway at the next UTC midnight plus an async overhang, so a row
+-- queued at 23:59 still has hours of authority to be drained in rather than
+-- minutes. The sweeper renews it from the space's live authority anyway, since
+-- a queue long enough to outlast even that is the case this table exists for.
+-- When it cannot renew, the row is dead-lettered rather than retried forever:
 -- dead_lettered_at takes it out of the sweep and, just as importantly, stops it
 -- holding back the later rows for its key, which a permanently failing row
 -- would otherwise freeze for good. dead_letter_reason says why, for whoever
