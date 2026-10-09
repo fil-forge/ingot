@@ -21,7 +21,9 @@ import (
 
 // This file is the encrypting half of the body write path (the FilOne
 // encryption design's write side; the read side is decrypt.go). Every body
-// blob is encrypted at ingest: a fresh CEK per blob, the plaintext streamed
+// blob is encrypted at ingest — except under a bucket whose default
+// encryption is "none" (sse.go), whose blobs the same writer spools as
+// received. Encrypted: a fresh CEK per blob, the plaintext streamed
 // through FEE into a COSE envelope, the envelope spooled under its
 // CIPHERTEXT digest, and the CEK wrapped twice — by the region key provider,
 // bound to (space, digest), into the blob's blob_encryption_params row (the
@@ -40,19 +42,27 @@ import (
 // digest unique, so re-uploading identical plaintext creates a new blob, row
 // and claim.
 
-// encryptingBlobWriter is the blockstore.BlobWriter the write path hands to
-// SplitBody: it encrypts each plaintext piece into a FEE envelope, spools
-// the envelope under its ciphertext digest, and wraps the CEK. Crucially it
-// returns the PLAINTEXT byte count — SplitBody's loop sentinels (n == 0
-// terminates, n < max marks the last blob) and every manifest span are
-// plaintext-based; only the digest names ciphertext. The per-digest
-// encryption state (descriptor, wrapped CEK, stored size) accumulates in
-// results for splitSpool to persist.
+// bodyWriter is the blockstore.BlobWriter the write path hands to
+// SplitBody. Encrypting (the default), it encrypts each plaintext piece into
+// a FEE envelope, spools the envelope under its ciphertext digest, and wraps
+// the CEK. Crucially it returns the PLAINTEXT byte count — SplitBody's loop
+// sentinels (n == 0 terminates, n < max marks the last blob) and every
+// manifest span are plaintext-based; only the digest names ciphertext. The
+// per-digest encryption state (descriptor, wrapped CEK, stored size)
+// accumulates in results for splitSpool to persist.
+//
+// A plaintext writer spools each piece as received, under the digest of its
+// own bytes, and records only the stored size: no key, no wrap, no
+// blob_encryption_params row. Two plaintext bodies with the same bytes share
+// a digest, which the encrypting path never produces.
 //
 // Not safe for concurrent use; the write path drives one instance per body,
 // sequentially.
-type encryptingBlobWriter struct {
-	spool      blockstore.BlobWriter
+type bodyWriter struct {
+	spool blockstore.BlobWriter
+	// plaintext stores each blob as received; keys and recipients are then
+	// unused.
+	plaintext  bool
 	keys       regionkey.Provider
 	space      did.DID
 	recipients []fee.Recipient
@@ -71,19 +81,25 @@ type encryptingBlobWriter struct {
 	logger      *zap.Logger
 }
 
-// encWrite is one encrypted blob's write-side state, keyed by ciphertext
-// digest in encryptingBlobWriter.results.
+// encWrite is one blob's write-side state, keyed by stored digest in
+// bodyWriter.results. A plaintext blob records only storedSize (and
+// streamed).
 type encWrite struct {
 	desc       fee.BodyDescriptor
 	wrapped    regionkey.WrappedKey
-	storedSize int64 // envelope header + ciphertext, the spooled byte count
+	storedSize int64 // the spooled byte count: envelope header + ciphertext, or the plaintext
 	// streamed is set when the envelope already went to its provider as it
 	// was spooled: the blob is parked there, awaiting its conclude.
 	streamed *uploader.StreamedBlob
 }
 
-func newEncryptingBlobWriter(spool blockstore.BlobWriter, keys regionkey.Provider, space did.DID, recipients []fee.Recipient) *encryptingBlobWriter {
-	return &encryptingBlobWriter{spool: spool, keys: keys, space: space, recipients: recipients, results: map[string]encWrite{}}
+func newEncryptingBlobWriter(spool blockstore.BlobWriter, keys regionkey.Provider, space did.DID, recipients []fee.Recipient) *bodyWriter {
+	return &bodyWriter{spool: spool, keys: keys, space: space, recipients: recipients, results: map[string]encWrite{}}
+}
+
+// newPlainBlobWriter is the writer for a body stored as received.
+func newPlainBlobWriter(spool blockstore.BlobWriter, space did.DID) *bodyWriter {
+	return &bodyWriter{spool: spool, plaintext: true, space: space, results: map[string]encWrite{}}
 }
 
 // tenantRecipient resolves the requesting tenant's wrap key and returns it
@@ -104,7 +120,17 @@ func (b *Backend) tenantRecipient(ctx context.Context) (fee.Recipient, error) {
 // It preserves the plain writer's contract exactly: an empty r stores
 // nothing and returns (nil, 0, nil), and n is the number of PLAINTEXT bytes
 // consumed from r.
-func (w *encryptingBlobWriter) WriteBlob(ctx context.Context, r io.Reader) (multihash.Multihash, int64, error) {
+func (w *bodyWriter) WriteBlob(ctx context.Context, r io.Reader) (multihash.Multihash, int64, error) {
+	if w.plaintext {
+		digest, n, err := w.spool.WriteBlob(ctx, r)
+		if err != nil {
+			return nil, 0, fmt.Errorf("s3frontend: spool blob: %w", err)
+		}
+		if n > 0 {
+			w.results[string(digest)] = encWrite{storedSize: n}
+		}
+		return digest, n, nil
+	}
 	// Probe for EOF before minting anything: an encrypted empty stream is
 	// never empty on the wire (envelope + one tag-only chunk), so without
 	// this the zero-byte object would grow a blob and SplitBody's n == 0
@@ -144,21 +170,24 @@ func (w *encryptingBlobWriter) WriteBlob(ctx context.Context, r io.Reader) (mult
 }
 
 // record wraps the blob's CEK and keeps its encryption state for splitSpool.
-func (w *encryptingBlobWriter) record(ctx context.Context, digest multihash.Multihash, cek []byte, res encWrite) error {
-	wrapped, err := w.keys.Wrap(ctx, regionkey.BindingContext{Space: w.space, Digest: digest}, cek)
-	if err != nil {
-		return fmt.Errorf("s3frontend: wrap CEK for blob %x: %w", digest, err)
+// A plaintext blob has no CEK; its stored size is all that is kept.
+func (w *bodyWriter) record(ctx context.Context, digest multihash.Multihash, cek []byte, res encWrite) error {
+	if !w.plaintext {
+		wrapped, err := w.keys.Wrap(ctx, regionkey.BindingContext{Space: w.space, Digest: digest}, cek)
+		if err != nil {
+			return fmt.Errorf("s3frontend: wrap CEK for blob %x: %w", digest, err)
+		}
+		res.wrapped = wrapped
 	}
-	res.wrapped = wrapped
 	w.results[string(digest)] = res
 	return nil
 }
 
 // params renders the recorded encryption state of one blob as its
-// blob_encryption_params row.
-func (w *encryptingBlobWriter) params(space did.DID, digest multihash.Multihash) (registry.BlobEncryptionParams, error) {
+// blob_encryption_params row. A plaintext writer has none to render.
+func (w *bodyWriter) params(space did.DID, digest multihash.Multihash) (registry.BlobEncryptionParams, error) {
 	res, ok := w.results[string(digest)]
-	if !ok {
+	if !ok || w.plaintext {
 		return registry.BlobEncryptionParams{}, fmt.Errorf("s3frontend: no encryption state recorded for blob %x", digest)
 	}
 	return registry.BlobEncryptionParams{
@@ -174,7 +203,7 @@ func (w *encryptingBlobWriter) params(space did.DID, digest multihash.Multihash)
 }
 
 // storedSize reports the spooled (envelope) byte count of one blob.
-func (w *encryptingBlobWriter) storedSize(digest multihash.Multihash) (int64, error) {
+func (w *bodyWriter) storedSize(digest multihash.Multihash) (int64, error) {
 	res, ok := w.results[string(digest)]
 	if !ok {
 		return 0, fmt.Errorf("s3frontend: no encryption state recorded for blob %x", digest)
@@ -184,7 +213,7 @@ func (w *encryptingBlobWriter) storedSize(digest multihash.Multihash) (int64, er
 
 // streamed returns the blobs WriteSizedBlob sent to their providers, keyed by
 // string(digest).
-func (w *encryptingBlobWriter) streamed() map[string]uploader.StreamedBlob {
+func (w *bodyWriter) streamed() map[string]uploader.StreamedBlob {
 	out := map[string]uploader.StreamedBlob{}
 	for digest, res := range w.results {
 		if res.streamed != nil {

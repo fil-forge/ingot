@@ -267,6 +267,17 @@ func (m *MemStore) SetObjectLockConfig(_ context.Context, name string, cfg []byt
 	return nil
 }
 
+func (m *MemStore) SetEncryption(_ context.Context, name string, enc registry.BucketEncryption) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.buckets[name]
+	if !ok {
+		return registry.ErrNotFound
+	}
+	s.Encryption = enc
+	return nil
+}
+
 func (m *MemStore) SetBucketTagging(_ context.Context, name string, tags []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

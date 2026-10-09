@@ -76,4 +76,8 @@ type ServerConfig struct {
 	// every bucket, rendered from Config.CORSAllowedOrigins by
 	// internal/cors. Nil disables CORS entirely (the default).
 	CORSConfig *auth.CORSConfiguration
+
+	// AllowNoneEncryption lets PutBucketEncryption set a bucket's default
+	// encryption to "none" (Config.Encryption.AllowNone).
+	AllowNoneEncryption bool
 }

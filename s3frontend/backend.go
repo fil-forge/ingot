@@ -120,7 +120,8 @@ type Backend struct {
 	tenantKeys tenantkey.Source
 	logger     *zap.Logger
 
-	maxBlobSize int64
+	maxBlobSize         int64
+	allowNoneEncryption bool
 	// cors is Deps.CORS marshalled once at construction — GetBucketCors
 	// is on the per-request path, so the document is built here rather
 	// than per call. Nil when CORS is disabled.
@@ -234,6 +235,11 @@ type Deps struct {
 	// MaxBlobSize is the coarse-split blob ceiling (0 → bucket default).
 	MaxBlobSize int64
 
+	// AllowNoneEncryption lets PutBucketEncryption set a bucket's default
+	// encryption to the non-standard "none", under which objects are stored
+	// as received. Off, the deployment stores every object encrypted.
+	AllowNoneEncryption bool
+
 	// CORS is the S3 CORS configuration GetBucketCors reports for every
 	// bucket, rendered from config by internal/cors. New marshals it once
 	// into the XML document the S3 API serves. Nil disables CORS.
@@ -299,9 +305,10 @@ func New(d Deps) *Backend {
 		localBlobOrphanAge: localBlobOrphanAge,
 		dropAcceptedBodies: d.DropAcceptedBodies,
 
-		logger:      logger,
-		maxBlobSize: d.MaxBlobSize,
-		cors:        corsDoc,
+		logger:              logger,
+		maxBlobSize:         d.MaxBlobSize,
+		allowNoneEncryption: d.AllowNoneEncryption,
+		cors:                corsDoc,
 	}
 	mp := d.MeterProvider
 	if mp == nil {

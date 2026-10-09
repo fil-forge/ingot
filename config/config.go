@@ -176,6 +176,10 @@ type Config struct {
 	// writes fail without a recipient.
 	TenantKey TenantKeyConfig `mapstructure:"tenantkey" yaml:"tenantkey"`
 
+	// Encryption sets which bucket encryption modes a tenant may select
+	// through the S3 bucket-encryption API (PutBucketEncryption).
+	Encryption EncryptionConfig `mapstructure:"encryption" yaml:"encryption"`
+
 	// LogLevel is the zap level (debug|info|warn|error).
 	LogLevel string `mapstructure:"log_level" yaml:"log_level"`
 	// PostgresDSN is the registry/meta database.
@@ -285,6 +289,8 @@ func (c Config) ServerConfig() (ServerConfig, error) {
 		CacheReadRetention: cacheReadRetention,
 		LocalBlobOrphanAge: localBlobOrphanAge,
 		DropAcceptedBodies: c.CacheWrites != nil && !*c.CacheWrites,
+
+		AllowNoneEncryption: c.Encryption.AllowNone,
 	}, nil
 }
 
@@ -392,6 +398,19 @@ func (c TenantKeyConfig) CacheTTLDuration() (time.Duration, error) {
 		return 0, fmt.Errorf("must be positive, got %s", d)
 	}
 	return d, nil
+}
+
+// EncryptionConfig is the deployment's policy on bucket encryption modes.
+// SSE-S3 (SSEAlgorithm AES256, the FEE envelope under the tenant and region
+// wraps) is always accepted and is what an unconfigured bucket does.
+type EncryptionConfig struct {
+	// AllowNone lets a tenant set a bucket's default encryption to the
+	// non-standard SSEAlgorithm "none", under which objects are stored as
+	// received: no envelope, no key wraps, and content-addressed by their
+	// own bytes. Meant for tenants whose data is encrypted before it reaches
+	// Ingot. Off by default: a PutBucketEncryption naming "none" is then
+	// refused, and no bucket on the deployment stores plaintext.
+	AllowNone bool `mapstructure:"allow_none" yaml:"allow_none"`
 }
 
 // RegionKeyConfig selects the region CEK wrap provider and carries each

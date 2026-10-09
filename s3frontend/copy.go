@@ -17,7 +17,6 @@ import (
 	"github.com/fil-forge/versitygw/s3response"
 
 	msbucket "github.com/fil-forge/ingot/bucket"
-	"github.com/fil-forge/ingot/internal/reqscope"
 	"github.com/fil-forge/ingot/registry"
 )
 
@@ -52,8 +51,9 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 	if unsupportedObjectACL(input.ACL, input.GrantFullControl, input.GrantRead, input.GrantReadACP, input.GrantWriteACP) {
 		return s3response.CopyObjectOutput{}, s3err.GetAPIError(s3err.ErrNotImplemented)
 	}
-	if req, ok := reqscope.Request(ctx); ok && requestsServerSideEncryption(req.Headers) {
-		return s3response.CopyObjectOutput{}, s3err.GetAPIError(s3err.ErrNotImplemented)
+	sse, err := requestedEncryption(ctx)
+	if err != nil {
+		return s3response.CopyObjectOutput{}, err
 	}
 
 	replace := input.MetadataDirective == types.MetadataDirectiveReplace
@@ -153,13 +153,16 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 	//   - same space, but a multipart source (its ETag is md5-of-md5s + "-N",
 	//     its checksum possibly composite) or a different algorithm requested:
 	//     pin the body, stream it once to compute the md5 ETag and checksum;
-	//   - another space: stream it once through ingestBody into new blobs
-	//     under the destination space; the ETag and checksum come from that
-	//     pass.
+	//   - another space, or a source stored differently from how the
+	//     destination stores (encrypted vs as received, per the destination
+	//     bucket and the request's x-amz-server-side-encryption): stream it
+	//     once through ingestBody into new blobs under the destination space;
+	//     the ETag and checksum come from that pass.
 	//
 	// The pinned body drops its part geometry: the copy is a single-part
 	// object, as on S3.
-	crossSpace := srcRv.st.Space != bucketState.Space
+	plaintext := storesPlaintext(bucketState, sse)
+	reingest := srcRv.st.Space != bucketState.Space || srcMf.Plaintext != plaintext
 	multipartSrc := len(srcMf.Body.PartSizes) > 0 || isMultipartETag(srcMf.ETag)
 	ckAlgo := srcMf.ChecksumAlgorithm
 	if input.ChecksumAlgorithm != "" {
@@ -173,7 +176,7 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 	body.PartSizes, body.PartChecksums = nil, nil
 	// A source without any checksum (a manifest from before every object
 	// carried one) also takes the pass, so the copy gets the default.
-	if crossSpace || multipartSrc || ckAlgo == "" || ckAlgo != srcMf.ChecksumAlgorithm {
+	if reingest || multipartSrc || ckAlgo == "" || ckAlgo != srcMf.ChecksumAlgorithm {
 		if ckAlgo == "" {
 			ckAlgo = string(types.ChecksumAlgorithmCrc64nvme)
 		}
@@ -190,7 +193,7 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 		if err != nil {
 			return s3response.CopyObjectOutput{}, fmt.Errorf("s3frontend: copy checksum reader: %w", err)
 		}
-		if crossSpace {
+		if reingest {
 			// A single-part source's stored digest is the copy's MD5 (same
 			// bytes), so the re-ingest reuses it and skips the MD5 pass; a
 			// multipart source has none (its ETag is md5-of-md5s), so ingest
@@ -199,7 +202,7 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 			if !multipartSrc && len(srcMf.Body.MD5) == md5.Size {
 				copyMD5 = knownMD5(srcMf.Body.MD5)
 			}
-			if body, err = b.ingestBody(ctx, bucketState, hr, srcMf.Body.Size, copyMD5); err != nil {
+			if body, err = b.ingestBody(ctx, bucketState, hr, srcMf.Body.Size, copyMD5, plaintext); err != nil {
 				var apiErr s3err.APIError
 				if errors.As(err, &apiErr) {
 					return s3response.CopyObjectOutput{}, apiErr
@@ -237,6 +240,7 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 		ChecksumAlgorithm: ckAlgo,
 		Checksum:          ckVal,
 		ChecksumType:      ckType,
+		Plaintext:         plaintext,
 	}
 	if replace {
 		ct := backend.GetStringFromPtr(input.ContentType)
@@ -270,7 +274,7 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 	// gain their first. A pinned body's claims are conditional on the
 	// source's: a source deleted since it was resolved, its blobs' release
 	// under way, is a source that no longer exists.
-	node, effState, err := b.commitVersion(ctx, bucketState, dstKey, dstMf, applyTagsIfPresent(initState, dstTags), !crossSpace, nil)
+	node, effState, err := b.commitVersion(ctx, bucketState, dstKey, dstMf, applyTagsIfPresent(initState, dstTags), !reingest, nil)
 	if err != nil {
 		if errors.Is(err, errPinnedBlobReleased) {
 			return s3response.CopyObjectOutput{}, s3err.GetAPIError(s3err.ErrNoSuchKey)
@@ -286,7 +290,8 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 	}
 	result.ChecksumCRC32, result.ChecksumCRC32C, result.ChecksumSHA1, result.ChecksumSHA256, result.ChecksumCRC64NVME, result.ChecksumSHA512, result.ChecksumMD5, result.ChecksumXXHASH64, result.ChecksumXXHASH3, result.ChecksumXXHASH128, result.ChecksumType = checksumFields(dstMf.ChecksumAlgorithm, dstMf.Checksum, dstMf.ChecksumType)
 	out := s3response.CopyObjectOutput{
-		CopyObjectResult: result,
+		CopyObjectResult:     result,
+		ServerSideEncryption: encryptionOf(dstMf),
 	}
 	// Version ids in the response, per each side's bucket state (§4.3). Only an
 	// enabled destination echoes the new version id; a suspended destination

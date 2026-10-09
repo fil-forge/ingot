@@ -38,6 +38,25 @@ func (s VersioningState) Configured() bool {
 // as one.
 var UnknownTenant = did.MustParse("did:web:unknown-tenant.invalid")
 
+// BucketEncryption is a bucket's default server-side encryption: the
+// SSEAlgorithm of its ServerSideEncryptionConfiguration, as PutBucketEncryption
+// stored it.
+type BucketEncryption string
+
+const (
+	// BucketEncryptionUnset is a bucket that was never configured. Its objects
+	// are encrypted exactly as under BucketEncryptionAES256; the two differ
+	// only in what GetBucketEncryption answers (not found vs the document).
+	BucketEncryptionUnset BucketEncryption = ""
+	// BucketEncryptionAES256 is S3's SSE-S3: every body blob is stored as a
+	// FEE envelope under the tenant and region wraps.
+	BucketEncryptionAES256 BucketEncryption = "AES256"
+	// BucketEncryptionNone is the non-standard value under which body blobs
+	// are stored as received, for tenants that encrypt before upload. A
+	// deployment opts into accepting it (config encryption.allow_none).
+	BucketEncryptionNone BucketEncryption = "none"
+)
+
 // State is the metadata stored per bucket.
 type State struct {
 	Name  string
@@ -57,7 +76,11 @@ type State struct {
 	// bucket carries no tag set — never set, or deleted since
 	// (docs/s3-object-tagging.md §9).
 	BucketTagging []byte
-	CreatedAt     time.Time // set by the implementation at create time
+	// Encryption is the bucket's default encryption as PutBucketEncryption
+	// stored it; BucketEncryptionUnset when never configured, or deleted
+	// since.
+	Encryption BucketEncryption
+	CreatedAt  time.Time // set by the implementation at create time
 }
 
 // CreateState is the initial bucket state Create installs, so a bucket
@@ -121,6 +144,11 @@ type Registry interface {
 	// SetBucketTagging stores the bucket's tag set, replacing any previous
 	// one; nil clears it. Returns ErrNotFound if the bucket is absent.
 	SetBucketTagging(ctx context.Context, name string, tags []byte) error
+
+	// SetEncryption stores the bucket's default encryption;
+	// BucketEncryptionUnset clears it. Returns ErrNotFound if the bucket is
+	// absent.
+	SetEncryption(ctx context.Context, name string, enc BucketEncryption) error
 
 	// AllocVersionSeq atomically advances and returns the bucket's version
 	// ordinal (the first call returns 1; 0 is reserved to mean "none").

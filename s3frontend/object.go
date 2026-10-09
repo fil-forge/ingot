@@ -43,24 +43,6 @@ const defaultMaxKeys = 1000
 // now (see bucket-metadata.rfc §"Canonical state vs service state"); lock
 // headers stamp the new version's state (docs/s3-object-lock.md §7). ETag is
 // the hex md5 of the body, quoted per S3 wire format.
-// requestsServerSideEncryption reports whether the request carries any
-// server-side-encryption header (SSE-S3, SSE-KMS or SSE-C, including the
-// copy-source SSE-C headers). ingot encrypts every object to the tenant key and
-// does not implement client-directed SSE, so PutObject / CreateMultipartUpload
-// / CopyObject reject such a request rather than silently storing the object
-// under ingot's own scheme. Only header presence is inspected; the (sensitive)
-// SSE-C customer key value is never read or logged.
-func requestsServerSideEncryption(headers map[string]string) bool {
-	for k := range headers {
-		lk := strings.ToLower(k)
-		if strings.HasPrefix(lk, "x-amz-server-side-encryption") ||
-			strings.HasPrefix(lk, "x-amz-copy-source-server-side-encryption") {
-			return true
-		}
-	}
-	return false
-}
-
 // bodyMD5Source supplies a body's MD5 in place of ingest's own pass. Ingest
 // calls it after the body has been read, so it may be a digest the request
 // carried or the request's MD5 checksum reader, whose Sum is final only once
@@ -156,8 +138,9 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 	if unsupportedObjectACL(input.ACL, input.GrantFullControl, input.GrantRead, input.GrantReadACP, input.GrantWriteACP) {
 		return s3response.PutObjectOutput{}, s3err.GetAPIError(s3err.ErrNotImplemented)
 	}
-	if req, ok := reqscope.Request(ctx); ok && requestsServerSideEncryption(req.Headers) {
-		return s3response.PutObjectOutput{}, s3err.GetAPIError(s3err.ErrNotImplemented)
+	sse, err := requestedEncryption(ctx)
+	if err != nil {
+		return s3response.PutObjectOutput{}, err
 	}
 
 	contentType := backend.GetStringFromPtr(input.ContentType)
@@ -189,6 +172,9 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 		return s3response.PutObjectOutput{}, err
 	}
 	initState = applyTagsIfPresent(initState, tags)
+	// Stored as received only under a "none" bucket the request did not ask
+	// AES256 of (sse.go).
+	plaintext := storesPlaintext(bucketState, sse)
 
 	// PRECONDITIONS (no lock): If-Match / If-None-Match. Evaluated here to fail
 	// fast before ingest, then RE-CHECKED under the per-bucket lock at commit so
@@ -228,7 +214,7 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 	// to local disk → upload each to Forge by digest (allocate→PUT→accept). A
 	// 200 means every body blob is durable and accepted before the manifest
 	// that references it is committed (docs/architecture.md §7.1).
-	bodyRec, err := b.ingestBody(ctx, bucketState, bodyReader, declaredLength(input.ContentLength), clientProvidedBodyMD5(ctx, spec, hr))
+	bodyRec, err := b.ingestBody(ctx, bucketState, bodyReader, declaredLength(input.ContentLength), clientProvidedBodyMD5(ctx, spec, hr), plaintext)
 	if err != nil {
 		// A checksum/digest mismatch surfaces from the HashReader. BadDigestError,
 		// InvalidDigestError, and ContentSHA256MismatchError embed APIError but are
@@ -277,6 +263,7 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 		Expires:                 backend.GetStringFromPtr(input.Expires),
 		WebsiteRedirectLocation: backend.GetStringFromPtr(input.WebsiteRedirectLocation),
 		Metadata:                input.Metadata,
+		Plaintext:               plaintext,
 	}
 	node, effState, err := b.commitVersion(ctx, bucketState, key, mf, initState, false, func(superseded *msbucket.ObjectManifest) error {
 		// Race-safe re-check of If-Match / If-None-Match under the lock. A
@@ -293,8 +280,9 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 
 	size := mf.Body.Size
 	out := s3response.PutObjectOutput{
-		ETag: etagOf(mf),
-		Size: &size,
+		ETag:                 etagOf(mf),
+		Size:                 &size,
+		ServerSideEncryption: encryptionOf(mf),
 	}
 	// Only an enabled bucket echoes a version id in the response. A suspended
 	// bucket stores the object under the "null" version id but omits it from the
@@ -318,9 +306,10 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 // crash recovery to reconcile (a later phase); no manifest is written, so no
 // catalog entry ever references a non-durable blob.
 //
-// size is the body's declared length (see splitSpool).
-func (b *Backend) ingestBody(ctx context.Context, bucket *registry.State, r io.Reader, size int64, md5Src bodyMD5Source) (msbucket.Body, error) {
-	body, err := b.splitSpool(ctx, bucket.Name, bucket.Space, r, size, md5Src)
+// size is the body's declared length (see splitSpool); plaintext stores the
+// body as received (see storesPlaintext).
+func (b *Backend) ingestBody(ctx context.Context, bucket *registry.State, r io.Reader, size int64, md5Src bodyMD5Source, plaintext bool) (msbucket.Body, error) {
+	body, err := b.splitSpool(ctx, bucket.Name, bucket.Space, r, size, md5Src, plaintext)
 	if err != nil {
 		return msbucket.Body{}, err
 	}
@@ -363,7 +352,9 @@ func declaredLength(n *int64) int64 {
 //
 // The Body it returns is entirely plaintext-coordinate (Size, spans,
 // SHA256/MD5 — all computed before encryption); the intents record the
-// SPOOLED (ciphertext) byte count, which is what the uploader ships. A non-nil
+// SPOOLED (ciphertext) byte count, which is what the uploader ships. With
+// plaintext set the body is stored as received, so the two coincide, and no
+// key material is minted or recorded for its blobs. A non-nil
 // md5Src supplies the body's MD5 (a verified Content-MD5, the request's MD5
 // checksum reader, or a single-part copy source's digest): the MD5 pass is
 // skipped and Body.MD5 is read from md5Src once the body is consumed.
@@ -372,7 +363,7 @@ func declaredLength(n *int64) int64 {
 // goes to its provider while it is spooled: those blobs come back in
 // streamed, parked on their providers, and their intents start out uploading
 // rather than spooled. A body that turns out a different length fails.
-func (b *Backend) splitSpool(ctx context.Context, bucket string, space did.DID, r io.Reader, size int64, md5Src bodyMD5Source) (_ spooledBody, err error) {
+func (b *Backend) splitSpool(ctx context.Context, bucket string, space did.DID, r io.Reader, size int64, md5Src bodyMD5Source, plaintext bool) (_ spooledBody, err error) {
 	// The span covers receiving the body (it streams in from the client as
 	// SplitBody reads it), encrypting it and writing it to the spool; the
 	// body.received event marks where the client finished sending.
@@ -383,12 +374,18 @@ func (b *Backend) splitSpool(ctx context.Context, bucket string, space did.DID, 
 	}
 	r = &receivedReader{r: r, span: span}
 	// One tenant recipient per request, resolved before anything is spooled:
-	// a body that cannot be wrapped to its tenant is not stored at all.
-	recipient, err := b.tenantRecipient(ctx)
-	if err != nil {
-		return spooledBody{}, err
+	// a body that cannot be wrapped to its tenant is not stored at all. A
+	// plaintext body wraps nothing and needs none.
+	var enc *bodyWriter
+	if plaintext {
+		enc = newPlainBlobWriter(b.spool, space)
+	} else {
+		recipient, err := b.tenantRecipient(ctx)
+		if err != nil {
+			return spooledBody{}, err
+		}
+		enc = newEncryptingBlobWriter(b.spool, b.regionKeys, space, []fee.Recipient{recipient})
 	}
-	enc := newEncryptingBlobWriter(b.spool, b.regionKeys, space, []fee.Recipient{recipient})
 	var splitOpts []msbucket.SplitOption
 	if md5Src != nil {
 		splitOpts = append(splitOpts, msbucket.WithoutMD5())
@@ -449,6 +446,9 @@ func (b *Backend) splitSpool(ctx context.Context, bucket string, space did.DID, 
 			Bucket:    bucket,
 		}); err != nil {
 			return spooledBody{}, fmt.Errorf("record intent: %w", err)
+		}
+		if plaintext {
+			continue
 		}
 		// The read path decrypts from this row; it must exist before any
 		// manifest referencing the blob can commit.
@@ -1042,6 +1042,9 @@ func (b *Backend) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s
 	if input.Key == nil {
 		return nil, s3err.GetAPIError(s3err.ErrNoSuchKey)
 	}
+	if err := rejectEncryptionHeaders(ctx); err != nil {
+		return nil, err
+	}
 	versionID := backend.GetStringFromPtr(input.VersionId)
 	rv, err := b.resolveVersion(ctx, *input.Bucket, *input.Key, versionID)
 	if err != nil {
@@ -1105,6 +1108,7 @@ func (b *Backend) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s
 
 	contentType := mf.ContentType
 	out := &s3.HeadObjectOutput{
+		ServerSideEncryption:      encryptionOf(mf),
 		AcceptRanges:              backend.GetPtrFromString("bytes"),
 		ContentLength:             &length,
 		ContentType:               &contentType,
@@ -1305,6 +1309,9 @@ func (b *Backend) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.
 	if input.Key == nil {
 		return nil, s3err.GetAPIError(s3err.ErrNoSuchKey)
 	}
+	if err := rejectEncryptionHeaders(ctx); err != nil {
+		return nil, err
+	}
 	versionID := backend.GetStringFromPtr(input.VersionId)
 	rv, err := b.resolveVersion(ctx, *input.Bucket, *input.Key, versionID)
 	if err != nil {
@@ -1355,7 +1362,7 @@ func (b *Backend) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.
 	// unencrypted blobs, the decrypting opener where an encryption row
 	// exists. Doing it here (not at first Read) fails a broken encrypted
 	// object as a request error, before response headers are written.
-	opener, err := b.bodyOpener(ctx, st.Space, mf.Body)
+	opener, err := b.bodyOpener(ctx, st.Space, mf.Body, mf.Plaintext)
 	if err != nil {
 		return nil, err
 	}
@@ -1379,6 +1386,7 @@ func (b *Backend) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.
 	lastModified := time.Unix(mf.Created, 0)
 	contentType := mf.ContentType
 	out := &s3.GetObjectOutput{
+		ServerSideEncryption:      encryptionOf(mf),
 		AcceptRanges:              backend.GetPtrFromString("bytes"),
 		Body:                      body,
 		ContentLength:             &length,
