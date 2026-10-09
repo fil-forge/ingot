@@ -364,6 +364,23 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 			}
 		}
 
+		// Everything below releases blobs, and the catalog's own segments
+		// among them. An empty bucket's catalog describes nothing it still
+		// needs, so commit the empty tree first: the bucket then reads no
+		// catalog block, and a delete that fails past this point (hilt
+		// refusing, a release erroring) leaves a bucket that lists empty and
+		// deletes on retry, not one whose root names released blocks.
+		if st.Root.Defined() {
+			if err := b.reg.CASRoot(ctx, name, st.Root, cid.Undef); err != nil {
+				return fmt.Errorf("s3frontend: delete bucket: empty the root: %w", err)
+			}
+		}
+		if st.ForgeRoot.Defined() {
+			if err := b.reg.SetForgeRoot(ctx, name, cid.Undef); err != nil {
+				return fmt.Errorf("s3frontend: delete bucket: empty the forge root: %w", err)
+			}
+		}
+
 		// In-flight multipart uploads do not block deletion (the upstream
 		// conformance contract's teardown deletes buckets without aborting
 		// them): tear down every session of the bucket — open ones aborted,
@@ -410,14 +427,15 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 		}
 
 		// Shipped catalog segments registered blobs in the bucket's space
-		// (each sealed CAR plus its sharded-dag-index blob), and hilt
-		// refuses to delete a space that still holds registrations — so
-		// release them first. Quiescing the bucket's log comes before the
-		// enumeration: it joins any in-flight ship, so a segment can't
-		// register its blobs after the release pass has already read the
-		// rows (the delete would race the flush goroutine and be refused).
-		// The release is idempotent (removing an unregistered blob is a
-		// no-op), so a retried DeleteBucket is safe.
+		// (each sealed CAR plus its sharded-dag-index blob, retired segments
+		// included), and hilt refuses to delete a space that still holds
+		// registrations — so release them first. The root is already empty,
+		// so nothing the bucket reads goes with them. Quiescing the bucket's
+		// log comes before the enumeration: it joins any in-flight ship, so a
+		// segment can't register its blobs after the release pass has already
+		// read the rows (the delete would race the flush goroutine and be
+		// refused). The release is idempotent (removing an unregistered blob
+		// is a no-op), so a retried DeleteBucket is safe.
 		if log, ok := b.log.(SegmentDigestLister); ok {
 			if err := log.QuiesceBucketLog(ctx, name); err != nil {
 				return fmt.Errorf("s3frontend: delete bucket: %w", err)
