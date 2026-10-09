@@ -33,15 +33,17 @@ import (
 // decrypts that span as it streams (aesstream.SpanReader). Every range in
 // this file is HTTP-style inclusive [start, end].
 
-// bodyOpener returns the BlobRangeOpener for one request over body: a
-// decrypting opener carrying the prefetched encryption state of every blob
-// (the plain opener alone only for a body with no blobs). Every body blob
-// is written encrypted with its params row committed before the manifest,
-// so a referenced blob without a row is an error — never "stored as
-// plaintext": failing open there would stream raw envelope bytes under a
-// 200. Prefetching here (rather than at first Read) surfaces missing-row/
-// missing-location problems as request errors, before any response headers
-// are written.
+// bodyOpener returns the BlobRangeOpener for one request over body: the
+// plain opener for a body its manifest marks plaintext (stored as received
+// under a "none" bucket, sse.go), else a decrypting opener carrying the
+// prefetched encryption state of every blob (the plain opener alone only for
+// a body with no blobs). The manifest's mark is the only thing that makes a
+// body plaintext: every encrypted body blob is written with its params row
+// committed before the manifest, so a referenced blob without a row is an
+// error — never "stored as plaintext": failing open there would stream raw
+// envelope bytes under a 200. Prefetching here (rather than at first Read)
+// surfaces missing-row/missing-location problems as request errors, before
+// any response headers are written.
 //
 // The encryption-params store and the region key provider are required
 // dependencies (validated at server construction): which implementation
@@ -49,11 +51,14 @@ import (
 // development — is configuration, but bucket encryption itself is not
 // optional. The guard below only turns a mis-built harness into a clear
 // error instead of a nil-pointer panic.
-func (b *Backend) bodyOpener(ctx context.Context, space did.DID, body msbucket.Body) (msbucket.BlobRangeOpener, error) {
+func (b *Backend) bodyOpener(ctx context.Context, space did.DID, body msbucket.Body, plaintext bool) (msbucket.BlobRangeOpener, error) {
 	if b.regionKeys == nil || b.encParams == nil {
 		return nil, errors.New("s3frontend: encryption dependencies not configured (EncParams, RegionKeys)")
 	}
 	plain := msbucket.NewPlainOpener(b.read)
+	if plaintext {
+		return plain, nil
+	}
 
 	var enc map[string]encBlob
 	for _, ref := range body.Blobs {
@@ -181,13 +186,14 @@ func (c closers) Close() error {
 	return first
 }
 
-// blobPlaintextLen reports how many plaintext bytes a stored blob decrypts
-// to: the FEE geometry derived from its encryption-params row and the stored
-// (envelope) byte count. Every body blob has a row; a missing one is an
-// error — treating it as plaintext would record the envelope byte count as
-// the manifest span, permanently corrupting the object's Size and every
-// range GET. Multipart Complete uses this to rebuild the manifest's
-// plaintext spans from upload_intents' stored sizes.
+// blobPlaintextLen reports how many plaintext bytes a stored, encrypted
+// blob decrypts to: the FEE geometry derived from its encryption-params row
+// and the stored (envelope) byte count. Every encrypted body blob has a row;
+// a missing one is an error — treating it as plaintext would record the
+// envelope byte count as the manifest span, permanently corrupting the
+// object's Size and every range GET. Multipart Complete uses this to rebuild
+// the manifest's plaintext spans from upload_intents' stored sizes (a
+// plaintext session's stored sizes are its spans already).
 func (b *Backend) blobPlaintextLen(ctx context.Context, space did.DID, digest multihash.Multihash, storedSize int64) (int64, error) {
 	params, err := b.encParams.GetEncryptionParams(ctx, space, digest)
 	if errors.Is(err, registry.ErrNotFound) {

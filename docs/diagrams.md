@@ -422,7 +422,7 @@ sequenceDiagram
         Note over B,LY: Current for the head, otherwise seek the prev tree at<br/>revSeqKey(seq) and confirm the stored VersionID (see version-tree)
     end
     Note over B: delete marker: 404 NoSuchKey (current) or 405 (versioned),<br/>then preconditions and selectBytes (Range, or partNumber via Body.PartSizes)
-    B->>R: bodyOpener: blob_encryption_params + blob_locations per blob<br/>(row existence = encrypted)
+    B->>R: bodyOpener: unless the manifest marks the body plaintext,<br/>blob_encryption_params + blob_locations per blob (a missing row fails the read)
     loop each covering blob or catalog block
         opt encrypted blob (FEE)
             B->>K: Unwrap region-wrapped CEK, bound to (space, digest)
@@ -921,6 +921,7 @@ erDiagram
         text space "Forge space DID"
         text tenant "owning tenant DID"
         text versioning "unversioned, enabled, suspended"
+        text encryption "AES256, none; NULL = unconfigured, encrypts"
         bigint next_version_seq
     }
     segments {
@@ -990,6 +991,7 @@ erDiagram
         text object_key
         text state "open, completing, aborting, completed"
         timestamptz state_changed_at "the sweeper's clock"
+        boolean plaintext "store parts as received; decided at create"
         text checksum_algorithm
     }
     multipart_parts {

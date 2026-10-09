@@ -48,7 +48,8 @@ claim count reaches zero. The full trace is the
 [PutObject diagram](./docs/diagrams.md#putobject-spool-and-upload-off-the-lock-commit-under-it).
 
 **Every body blob is encrypted at ingest** (the FilOne encryption design's
-write side, `s3frontend/encrypt.go`). Each plaintext piece SplitBody cuts
+write side, `s3frontend/encrypt.go`), unless its bucket opted out — see
+"Bucket encryption" below. Each plaintext piece SplitBody cuts
 gets a fresh CEK and streams through FEE into a `COSE_Encrypt` envelope
 (AES-256-GCM STREAM, 256 KiB chunks); the envelope is what the spool stores
 and the network receives, under its **ciphertext** digest. The CEK is wrapped
@@ -272,6 +273,30 @@ The encryption-params store and region key provider are required
 dependencies; only the provider implementation (openbao vs inprocess) is
 configuration.
 HEAD never decrypts. See `s3frontend/decrypt.go`.
+
+**Bucket encryption** (`s3frontend/sse.go`) is the S3 bucket-encryption API
+over the same machinery. A bucket's default encryption
+(`ingot.buckets.encryption`, set by PutBucketEncryption, cleared by
+DeleteBucketEncryption) is `AES256`, S3's SSE-S3 and the same envelope every
+unconfigured bucket writes, or the non-standard `none`: objects stored as
+received, with no envelope, no key wraps and no params row, content-addressed
+by their own bytes. `none` is for tenants whose data is encrypted before it
+reaches Ingot, and a deployment opts into accepting it
+(`encryption.allow_none`); without that, PutBucketEncryption refuses it and
+nothing on the deployment stores plaintext. The decision is per object at
+write time: a `none` bucket stores as received unless the request names
+`x-amz-server-side-encryption: AES256`, which encrypts that one object; a
+multipart upload decides at CreateMultipartUpload and carries the choice on
+its session (`multipart_sessions.plaintext`); a copy follows its destination,
+re-ingesting whenever the source was stored the other way. The manifest
+records the outcome (`ObjectManifest.Plaintext`), which is the read path's
+only dispatch: a plaintext body is served as stored, every other body goes
+through the decryptor and still fails closed on a blob without a params row.
+Objects report `x-amz-server-side-encryption: AES256` when encrypted and no
+header when stored as received; SSE-KMS and SSE-C are not implemented, and a
+GET or HEAD carrying any encryption header is refused, as on S3. Plaintext
+bodies bring content dedup back: two objects with the same bytes share a
+blob, each holding its own claim.
 
 ## Identity & auth
 

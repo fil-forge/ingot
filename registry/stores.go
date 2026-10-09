@@ -215,6 +215,11 @@ type MultipartSession struct {
 	// (docs/s3-object-tagging.md §4). Empty when the header was absent.
 	Tagging  string
 	Metadata map[string]string
+	// Plaintext is whether the session's object is stored as received, with
+	// no encryption: decided at CreateMultipartUpload from the bucket's
+	// encryption and the request's x-amz-server-side-encryption header,
+	// applied to every part, and stamped onto the manifest at Complete.
+	Plaintext bool
 	// CommittedETag / CommittedVersionID are the result the winning Complete
 	// returned, recorded by CompleteSession with the move to 'completed'
 	// (empty before that). A duplicate or latch-losing Complete replays them
