@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 
+	bucketpolicysvc "github.com/fil-forge/hilt/pkg/api/service/bucketpolicy"
 	"github.com/fil-forge/hilt/pkg/bucketpolicy"
 	hiltclient "github.com/fil-forge/hilt/pkg/client"
 	bucketrpc "github.com/fil-forge/hilt/pkg/rpc/service/bucket"
@@ -88,25 +89,22 @@ func (s *Service) DeleteBucket(ctx context.Context, req s3.Request) error {
 }
 
 func (s *Service) BucketPolicy(ctx context.Context, req s3.Request, body []byte) (*s3bkt.PolicyOK, error) {
-	ok, err := s.client.Policy(ctx, req, body)
+	ok, err := s.client.BucketPolicy(ctx, req, body)
 	if err != nil {
 		var namedErr ucanerr.Named
 		if errors.As(err, &namedErr) {
-			// The names are Hilt's policy service's (hilt/pkg/api/service/bucketpolicy)
-			// and its policy package's; matched literally so the gateway does
-			// not import the service's store and vault dependencies.
 			switch namedErr.Name() {
 			case bucketrpc.UnknownBucketErrorName:
 				return nil, ErrNotFound
-			case "PolicyNotFound":
+			case bucketpolicysvc.PolicyNotFoundErrorName:
 				return nil, ErrNoPolicy
 			case bucketpolicy.InvalidPolicyErrorName:
 				return nil, fmt.Errorf("%w: %s", ErrMalformedPolicy, namedErr.Error())
-			case "PreconditionFailed":
+			case bucketpolicysvc.PreconditionFailedErrorName:
 				return nil, ErrPreconditionFailed
-			case "InvalidPrecondition":
+			case bucketpolicysvc.InvalidPreconditionName:
 				return nil, fmt.Errorf("%w: %s", ErrInvalidPrecondition, namedErr.Error())
-			case "ConcurrentChange":
+			case bucketpolicysvc.ConcurrentChangeErrorName:
 				return nil, ErrConcurrentChange
 			}
 		}
