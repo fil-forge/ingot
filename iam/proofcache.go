@@ -1,8 +1,10 @@
 package iam
 
 import (
+	"cmp"
 	"context"
 	"iter"
+	"slices"
 	"sync"
 	"time"
 
@@ -159,26 +161,63 @@ func (d *DelegationCache) matchDelegations(ctx context.Context, aud did.DID, cmd
 // command variations and powerline subjects are the matcher's job. The
 // index resolves the key in one lookup; each hit is then re-checked against
 // the expiry-aware cache so an expired-but-unswept entry never yields.
+//
+// The longest-lived match comes first. Hilt issues a fresh delegation on every
+// authorize, so a key that is being used accumulates several for one command
+// and they expire at different times. Whoever takes the first match should get
+// the one with the most life in it: a caller that queues work for later — the
+// upload-registration sweep, a deferred blob release — keeps that authority
+// long after the request is gone, and handing it a chain with minutes left
+// when one with hours is sitting beside it strands the work. Ordering also
+// makes the choice deterministic, where ranging the index alone left it to Go's
+// map iteration.
 func (d *DelegationCache) listDelegations(_ context.Context, aud did.DID, cmd ucan.Command, sub did.DID) iter.Seq2[ucan.Delegation, error] {
 	d.mu.RLock()
 	byLink := d.index[indexKey{aud: aud, cmd: cmd, sub: sub}]
-	links := make([]string, 0, len(byLink))
-	dlgs := make([]ucan.Delegation, 0, len(byLink))
+	matches := make([]cachedDelegation, 0, len(byLink))
 	for link, dlg := range byLink {
-		links = append(links, link)
-		dlgs = append(dlgs, dlg)
+		matches = append(matches, cachedDelegation{link: link, dlg: dlg})
 	}
 	d.mu.RUnlock()
 
+	slices.SortFunc(matches, func(a, b cachedDelegation) int {
+		return compareRemainingLife(b.dlg, a.dlg) // descending
+	})
+
 	return func(yield func(ucan.Delegation, error) bool) {
-		for i, dlg := range dlgs {
-			if _, live := d.data.Get(links[i]); !live {
+		for _, m := range matches {
+			if _, live := d.data.Get(m.link); !live {
 				continue // expired, janitor hasn't swept yet
 			}
-			if !yield(dlg, nil) {
+			if !yield(m.dlg, nil) {
 				return
 			}
 		}
+	}
+}
+
+// cachedDelegation pairs a cached delegation with the link it is stored under,
+// so the liveness re-check survives sorting.
+type cachedDelegation struct {
+	link string
+	dlg  ucan.Delegation
+}
+
+// compareRemainingLife orders two delegations by how long they remain usable.
+// One with no expiry outlives any that has one, and two that both lack an
+// expiry, or share one, compare equal — leaving their relative order to the
+// sort, which is stable enough for a tie that cannot matter.
+func compareRemainingLife(a, b ucan.Delegation) int {
+	aExp, bExp := a.Expiration(), b.Expiration()
+	switch {
+	case aExp == nil && bExp == nil:
+		return 0
+	case aExp == nil:
+		return 1
+	case bExp == nil:
+		return -1
+	default:
+		return cmp.Compare(int64(*aExp), int64(*bExp))
 	}
 }
 

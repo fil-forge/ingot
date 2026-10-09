@@ -12,6 +12,9 @@ import (
 	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
 	"github.com/oklog/ulid/v2"
+	"go.uber.org/zap"
+
+	uploadcmds "github.com/fil-forge/libforge/commands/upload"
 
 	msbucket "github.com/fil-forge/ingot/bucket"
 	"github.com/fil-forge/ingot/bucketop"
@@ -263,6 +266,9 @@ type discardedVersion struct {
 	versionID string
 	seq       uint64
 	digests   []multihash.Multihash
+	// manifest is the discarded version's root, retracted from the upload
+	// service's content-entry list so the space stops counting it.
+	manifest cid.Cid
 }
 
 // commitVersion runs the §5 write rule for one new version (a PutObject /
@@ -397,7 +403,7 @@ func (b *Backend) commitVersion(ctx context.Context, bucketState *registry.State
 			} else {
 				// Discard (null over null). A manifest-valued key stays one; its value
 				// block is the manifest queued for GC just below.
-				discards = append(discards, discardedVersion{superseded.VersionID, superseded.Seq, bodyDigests(supersededMf.Body)})
+				discards = append(discards, discardedVersion{superseded.VersionID, superseded.Seq, bodyDigests(supersededMf.Body), superseded.Manifest})
 				discardSeqs = append(discardSeqs, superseded.Seq)
 				if err := b.gc.AddGCCandidate(ctx, superseded.Manifest.Bytes(), st.Name); err != nil {
 					return cid.Undef, fmt.Errorf("gc candidate: %w", err)
@@ -418,7 +424,7 @@ func (b *Backend) commitVersion(ctx context.Context, bucketState *registry.State
 						if err := tx.Get(ctx, st.Space, nullCid, &nullEm); err != nil {
 							return cid.Undef, fmt.Errorf("load prev null manifest: %w", err)
 						}
-						discards = append(discards, discardedVersion{registry.NullVersionID, newLeaf.NullSeq, bodyDigests(nullEm.Manifest.Body)})
+						discards = append(discards, discardedVersion{registry.NullVersionID, newLeaf.NullSeq, bodyDigests(nullEm.Manifest.Body), nullCid})
 						discardSeqs = append(discardSeqs, newLeaf.NullSeq)
 						if prevTree, err = prevTree.Delete(ctx, nullKey); err != nil {
 							return cid.Undef, fmt.Errorf("prev delete null: %w", err)
@@ -531,6 +537,18 @@ func (b *Backend) commitVersion(ctx context.Context, bucketState *registry.State
 		if err := b.addClaims(ctx, st, key, claimVersionID(vid, seq), bodyDigests(mf.Body), pinned); err != nil {
 			return cid.Undef, err
 		}
+
+		// Content entries (the space's object count): this version registers,
+		// the ones it discarded retract. Queued in the commit's own
+		// transaction, so the rows exist exactly when the version does, and
+		// numbered under this lock, so the sweeper replays a key's changes in
+		// commit order. Every write rule runs through here, so a PUT, a
+		// multipart Complete, a CopyObject destination and a delete marker all
+		// count as one object — which is what AWS reports for NumberOfObjects.
+		b.enqueueRegistration(ctx, tx, st, key, mfCid, registry.UploadRegistrationAdd)
+		for _, d := range discards {
+			b.enqueueRegistration(ctx, tx, st, key, d.manifest, registry.UploadRegistrationRemove)
+		}
 		return t2.GetPointer(ctx, tx)
 	})
 	if err != nil {
@@ -547,6 +565,41 @@ func (b *Backend) commitVersion(ctx context.Context, bucketState *registry.State
 		}
 	}
 	return node, effState, nil
+}
+
+// enqueueRegistration queues one change to the space's content-entry list for
+// this commit to carry. Best-effort in one respect only: a request with no
+// proof store cannot produce authority for the sweeper to use later, and
+// failing the write over the object count would fail a write that otherwise
+// succeeded. The row is skipped and logged, and the count under-reports until
+// something registers that root again.
+func (b *Backend) enqueueRegistration(ctx context.Context, tx *bucketop.Tx, st *registry.State, key string, root cid.Cid, op registry.UploadRegistrationOp) {
+	if !root.Defined() {
+		return
+	}
+	cmd := uploadcmds.Add.Command
+	if op == registry.UploadRegistrationRemove {
+		cmd = uploadcmds.Remove.Command
+	}
+	proofs, err := b.registrar.CaptureAuthority(ctx, st.Space, cmd)
+	if err != nil {
+		b.logger.Warn("commit: no authority to queue an upload registration; object count will drift",
+			zap.String("bucket", st.Name),
+			zap.String("op", string(op)),
+			zap.Stringer("space", st.Space),
+			zap.Stringer("root", root),
+			zap.Error(err),
+		)
+		return
+	}
+	tx.EnqueueUploadRegistration(registry.UploadRegistration{
+		Bucket:    st.Name,
+		ObjectKey: key,
+		Space:     st.Space,
+		Root:      root,
+		Op:        op,
+		Proofs:    proofs,
+	})
 }
 
 // scopedDeleteResult reports a version-scoped delete: whether a version was
@@ -612,8 +665,10 @@ func (b *Backend) deleteVersionScoped(ctx context.Context, bucketState *registry
 					return cid.Undef, err
 				}
 			}
-			removed = discardedVersion{versionID: targetVersionID(kind, mf), seq: mf.Seq, digests: bodyDigests(mf.Body)}
+			removed = discardedVersion{versionID: targetVersionID(kind, mf), seq: mf.Seq, digests: bodyDigests(mf.Body), manifest: valCid}
 			res.found, res.wasMarker = true, mf.DeleteMarker
+			// The version is gone for good, so the space stops counting it.
+			b.enqueueRegistration(ctx, tx, st, key, valCid, registry.UploadRegistrationRemove)
 			// The value block is the manifest — one GC candidate covers it.
 			if err := b.gc.AddGCCandidate(ctx, valCid.Bytes(), st.Name); err != nil {
 				return cid.Undef, fmt.Errorf("gc candidate: %w", err)
@@ -685,8 +740,10 @@ func (b *Backend) deleteVersionScoped(ctx context.Context, bucketState *registry
 			}
 		}
 
-		removed = discardedVersion{versionID: targetVersionID(kind, targetMf), seq: targetMf.Seq, digests: bodyDigests(targetMf.Body)}
+		removed = discardedVersion{versionID: targetVersionID(kind, targetMf), seq: targetMf.Seq, digests: bodyDigests(targetMf.Body), manifest: targetCid}
 		res.found, res.wasMarker = true, targetMf.DeleteMarker
+		// The version is gone for good, so the space stops counting it.
+		b.enqueueRegistration(ctx, tx, st, key, targetCid, registry.UploadRegistrationRemove)
 		if err := b.gc.AddGCCandidate(ctx, targetCid.Bytes(), st.Name); err != nil {
 			return cid.Undef, fmt.Errorf("gc candidate: %w", err)
 		}
@@ -763,10 +820,11 @@ func (b *Backend) deleteVersionScoped(ctx context.Context, bucketState *registry
 	if err != nil {
 		return res, mapCommitError(err, "delete version")
 	}
-	if res.found {
-		if err := b.dropClaims(ctx, bucketState, key, claimVersionID(removed.versionID, removed.seq), removed.digests); err != nil {
-			return res, fmt.Errorf("s3frontend: delete version reconcile: %w", err)
-		}
+	if !res.found {
+		return res, nil
+	}
+	if err := b.dropClaims(ctx, bucketState, key, claimVersionID(removed.versionID, removed.seq), removed.digests); err != nil {
+		return res, fmt.Errorf("s3frontend: delete version reconcile: %w", err)
 	}
 	return res, nil
 }

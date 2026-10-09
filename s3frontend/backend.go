@@ -53,23 +53,25 @@ import (
 type Backend struct {
 	backend.BackendUnsupported
 
-	read      blockstore.ReadStore
-	authority bucketauthority.BucketAuthority
-	reg       registry.Registry
-	intents   registry.IntentStore
-	locations registry.LocationStore
-	blobRefs  registry.BlobRefStore
-	gc        registry.GCStore
-	multipart registry.MultipartStore
-	txns      *bucketop.Coordinator
-	log       blockstore.Log
-	spool     *blockstore.Spool
-	cache     *blockstore.BlobCache
-	uploader  uploader.BodyUploader
-	deferred  uploader.DeferredBodyUploader
-	parks     registry.ParkStore
-	remover   uploader.BlobRemover
-	encParams registry.EncryptionParamsStore
+	read       blockstore.ReadStore
+	authority  bucketauthority.BucketAuthority
+	reg        registry.Registry
+	intents    registry.IntentStore
+	locations  registry.LocationStore
+	blobRefs   registry.BlobRefStore
+	gc         registry.GCStore
+	multipart  registry.MultipartStore
+	txns       *bucketop.Coordinator
+	log        blockstore.Log
+	spool      *blockstore.Spool
+	cache      *blockstore.BlobCache
+	uploader   uploader.BodyUploader
+	deferred   uploader.DeferredBodyUploader
+	parks      registry.ParkStore
+	remover    uploader.BlobRemover
+	registrar  uploader.UploadRegistrar
+	uploadRegs registry.UploadRegistrationStore
+	encParams  registry.EncryptionParamsStore
 	// streaming sends a body blob to its provider while it is spooled;
 	// streams records each such upload until its park or acceptance is
 	// recorded.
@@ -168,6 +170,12 @@ type Deps struct {
 	Deferred uploader.DeferredBodyUploader
 	Parks    registry.ParkStore
 	Remover  uploader.BlobRemover
+	// Registrar keeps the upload service's content-entry list in step with the
+	// catalog: one entry per committed object version, which is what the
+	// service counts to report the space's object count.
+	Registrar uploader.UploadRegistrar
+	// UploadRegs is the outbox the registration sweeper drains.
+	UploadRegs registry.UploadRegistrationStore
 
 	// Streaming uploads each body blob while it is spooled,
 	// allocating it by size and hash function before its digest is known;
@@ -287,6 +295,8 @@ func New(d Deps) *Backend {
 		remover:         d.Remover,
 		streaming:       d.Streaming,
 		streams:         d.Streams,
+		registrar:       d.Registrar,
+		uploadRegs:      d.UploadRegs,
 		encParams:       d.EncParams,
 		regionKeys:      d.RegionKeys,
 		tenantKeys:      d.TenantKeys,

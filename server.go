@@ -74,6 +74,13 @@ type ServerDeps struct {
 	Streaming uploader.StreamingBodyUploader
 	Streams   registry.StreamStore
 
+	// Registrar keeps the upload service's content-entry list in step with the
+	// catalog: one entry per committed object version, which is what the
+	// service counts to report the space's object count.
+	Registrar uploader.UploadRegistrar
+	// UploadRegs is the upload-registration outbox the sweeper drains.
+	UploadRegs registry.UploadRegistrationStore
+
 	// Authority is the service that authorizes bucket creation and deletion.
 	Authority bucketauthority.BucketAuthority
 
@@ -229,6 +236,8 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		Remover:         deps.Remover,
 		Streaming:       deps.Streaming,
 		Streams:         deps.Streams,
+		Registrar:       deps.Registrar,
+		UploadRegs:      deps.UploadRegs,
 		EncParams:       deps.EncParams,
 		RegionKeys:      deps.RegionKeys,
 		TenantKeys:      deps.TenantKeys,
@@ -290,6 +299,7 @@ func (s *Server) Start(ctx context.Context) error {
 	s.startReleaseSweeper()
 	s.startLocalBlobSweeper()
 	s.startReleasedPass()
+	s.startRegistrationSweeper()
 	return nil
 }
 
@@ -461,6 +471,42 @@ func (s *Server) startReleasedPass() {
 		case files > 0:
 			s.logger.Info("local blob released pass removed copies earlier releases kept",
 				zap.Int64("files", files), zap.Int64("bytes", bytes))
+		}
+	})
+}
+
+// uploadRegistrationSweepInterval is how often the queue is drained. The count
+// is reporting data, not a read-your-writes surface, so a short lag is fine and
+// a steady cadence keeps the load on the upload service predictable.
+const uploadRegistrationSweepInterval = 30 * time.Second
+
+// startRegistrationSweeper spawns the upload-registration sweeper: the write
+// path queues one row per object version committed or retired, and this drains
+// them against the upload service, retrying with backoff until each is taken.
+//
+// It runs off the request path deliberately. The object count is a reporting
+// number, so a Sprue round trip does not belong in a PUT, and a Sprue outage
+// should delay the count rather than fail writes or lose it.
+func (s *Server) startRegistrationSweeper() {
+	s.goSweep(func() {
+		ticker := time.NewTicker(uploadRegistrationSweepInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-s.sweepCtx.Done():
+				return
+			case <-ticker.C:
+				ctx, cancel := context.WithTimeout(s.sweepCtx, 5*time.Minute)
+				ctx, span := tracing.Start(ctx, "sweep.upload_registrations")
+				n, err := s.backend.SweepUploadRegistrations(ctx)
+				s.endSweepSpan(span, err, attribute.Int("ingot.sweep.count", n))
+				cancel()
+				if err != nil && s.sweepCtx.Err() == nil {
+					s.logger.Warn("registration sweep", zap.Error(err))
+				} else if n > 0 {
+					s.logger.Info("registration sweep recorded object count changes", zap.Int("count", n))
+				}
+			}
 		}
 	})
 }
@@ -754,6 +800,12 @@ func validateServerInputs(cfg config.ServerConfig, deps ServerDeps) error {
 	}
 	if deps.Remover == nil {
 		return errors.New("ingot: ServerDeps.Remover is required")
+	}
+	if deps.Registrar == nil {
+		return errors.New("ingot: ServerDeps.Registrar is required")
+	}
+	if deps.UploadRegs == nil {
+		return errors.New("ingot: ServerDeps.UploadRegs is required")
 	}
 	if deps.Meta == nil {
 		return errors.New("ingot: ServerDeps.Meta is required")

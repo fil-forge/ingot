@@ -54,7 +54,7 @@ flowchart LR
 
     client -->|"S3 REST"| ingot
     ingot -->|"/s3/request/authorize (every request on a local-cache miss)<br/>/s3/bucket/info (lazy chain completion)<br/>/s3/bucket/create, delete, list"| hilt
-    ingot -->|"/blob/add, /ucan/conclude, GET /receipt/:task<br/>/blob/abort, /blob/remove, /index/add"| sprue
+    ingot -->|"/blob/add, /ucan/conclude, GET /receipt/:task<br/>/blob/abort, /blob/remove, /index/add<br/>/upload/add, /upload/remove"| sprue
     ingot -->|"HTTP PUT blob bytes (allocated URL)"| piri
     ingot -->|"content/retrieve (UCAN, on read miss)"| piri
     ingot -->|"pgx + goose migrations"| pg
@@ -305,6 +305,7 @@ sequenceDiagram
     Note over B,R: post-commit, off the lock
     B->>R: reconcileClaims: blob_refs gains this version,<br/>superseded version rows removed
     B->>U: /blob/remove per digest whose CountClaims reached 0<br/>(+ crypto-shred: its blob_encryption_params row deleted)
+    B->>R: queue /upload/add(root = this version's manifest CID)<br/>+ /upload/remove per discarded version<br/>(upload_registrations, in the CAS transaction)
     B-->>C: 200 + ETag (+ x-amz-version-id when versioning is configured)
 ```
 
@@ -342,6 +343,45 @@ sequenceDiagram
 - Supersession also records each replaced catalog block for future removal:
   the [catalog GC candidates](#catalog-gc-candidates-what-gets-remembered-for-removal)
   diagram shows every entry path.
+- The `/upload/add` is what the upload service counts to report the space's
+  object count: one content entry per committed version, keyed by the manifest
+  CID. A discarded version retracts, a retained noncurrent one does not, and a
+  delete marker registers like any other version — the same set AWS reports for
+  `NumberOfObjects`. Best-effort, as the index publication is: the object is
+  durable and the response must say so, so a failure logs and the count
+  under-reports rather than failing a write that succeeded.
+- The write does **not** call the upload service. It queues the change in
+  `ingot.upload_registrations` in the same transaction as the root CAS, and the
+  registration sweeper (`SweepUploadRegistrations`, every 30s) applies it. The
+  count is reporting data, so a Sprue round trip does not belong in a PUT, and
+  a Sprue outage delays the count instead of failing writes or losing it.
+- The row exists exactly when the version committed, and `seq` replays a key's
+  changes in commit order. A sweep spends **two round trips**, not one per
+  change: every queued addition in one batch of invocations, then every
+  retraction in another. (A batch in ucantone's sense — many invocations, a
+  receipt each. `/ucan/conclude` is the other shape, one invocation carrying
+  many receipts.)
+  Both halves are needed — a container sorts its tokens bytewise, so the
+  service may run a batch in any order, and a retraction sharing a batch with
+  the addition it retires could overtake it and leave the root counted for
+  good. Splitting by op is safe because a root is added by the commit that
+  creates the version and retracted by a later one, so an addition always
+  carries the lower `seq`.
+- A key with a refused change is held whole until it is due again, within the
+  sweep and across sweeps, so a later row can never overtake an earlier one.
+  Each row carries the delegation chain that authorizes it, captured from the
+  request that committed the version, because the sweeper has no request to
+  borrow authority from.
+- That chain has room to spare — hilt expires its delegation to the gateway at
+  the next UTC midnight plus an async overhang, so even a change queued at
+  23:59 has hours to be drained in. For the queue that outlasts that, the
+  sweeper renews from the space's live authority, which a recent write leaves
+  behind. A space that has gone quiet has none, and after
+  `uploadRegistrationDeadLetterAfter` attempts the row is **dead-lettered**:
+  out of the sweep, and out of the way of its key's later rows. (Nothing to do
+  with a parked blob, which is durable and awaiting its accept.) The count is then short by
+  that one change rather than frozen for that key, and `dead_letter_reason` records
+  why.
 
 Cross-references: [`architecture.md` §7.1](./architecture.md#71-write-single-shot-putobject).
 
@@ -349,9 +389,10 @@ Sources: `s3frontend/object.go` (PutObject, ingestBody, uploadBlobs,
 concludeStreamed), `s3frontend/stream.go` (WriteSizedBlob,
 SweepStaleStreams), `bucket/sized.go`, `uploader/stream.go`,
 `s3frontend/copy.go` (CopyObject, copySourceBucket),
-`s3frontend/version.go` (commitVersion), `bucketop/bucketop.go`,
-`blockstore/staging.go`, `uploader/blob.go`, `uploader/forge.go`. Review when
-these change.
+`s3frontend/version.go` (commitVersion, enqueueRegistration),
+`s3frontend/uploadsweep.go` (SweepUploadRegistrations), `bucketop/bucketop.go`,
+`blockstore/staging.go`, `uploader/blob.go`, `uploader/forge.go`,
+`uploader/upload.go`. Review when these change.
 
 ## GetObject: version resolution, local tiers, network retrieval
 
@@ -484,7 +525,7 @@ sequenceDiagram
     else latch won
         B->>R: LatchSession(open to completing), single winner
         B->>R: manifest spans: per blob, plaintext length derived from<br/>the intent's stored size + FEE geometry (blobPlaintextLen)
-        B->>U: concludeBlobs: every parked blob's put receipt, up to<br/>MaxConcludeBatch (1000) per /ucan/conclude, accept receipts<br/>read from the response (poll only as fallback)
+        B->>U: concludeBlobs: every parked blob's put receipt, up to<br/>MaxConcludeReceipts (1000) per /ucan/conclude, accept receipts<br/>read from the response (poll only as fallback)
         B->>R: PutLocation + intent accepted + DeletePark per blob
         B->>TX: commitVersion (see the PutObject diagram)
         B->>R: LatchSession(completing to completed), best-effort
@@ -768,7 +809,7 @@ flowchart TB
         tok["tokenstore (tokens.cbor):<br/>empty; dormant login paths only"]
     end
 
-    kp -->|"reqscope.ProofStore<br/>on the request ctx"| writes["uploader:<br/>/blob/add, abort, remove, /index/add"]
+    kp -->|"reqscope.ProofStore<br/>on the request ctx"| writes["uploader:<br/>/blob/add, abort, remove, /index/add<br/>/upload/add, /upload/remove"]
     kp -->|"same store"| reads["blockstore.Forge:<br/>content/retrieve"]
     kp -->|"captureShipProofs<br/>at UploadBlob"| ship
     ship --> async["async catalog ship;<br/>sweeper and DeleteBucket aborts"]
