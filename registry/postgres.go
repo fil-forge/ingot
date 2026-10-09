@@ -119,11 +119,11 @@ func (r *Postgres) CASRoot(ctx context.Context, name string, expect, next cid.Ci
 	return r.casRoot(ctx, r.pool, name, expect, next)
 }
 
-// CASRootEnqueue advances the root and records the commit's upload
-// registrations in one transaction, so the outbox row exists exactly when the
-// version it describes committed. A conflict or a missing bucket rolls the
-// rows back with the CAS.
-func (r *Postgres) CASRootEnqueue(ctx context.Context, name string, expect, next cid.Cid, regs []UploadRegistration) error {
+// CASRootAndQueueUploadRegistrations advances the root and records the
+// commit's upload registrations in one transaction, so the outbox row exists
+// exactly when the version it describes committed. A conflict or a missing
+// bucket rolls the rows back with the CAS.
+func (r *Postgres) CASRootAndQueueUploadRegistrations(ctx context.Context, name string, expect, next cid.Cid, regs []UploadRegistration) error {
 	if len(regs) == 0 {
 		return r.CASRoot(ctx, name, expect, next)
 	}
@@ -183,8 +183,8 @@ func (r *Postgres) casRoot(ctx context.Context, q pgxQuerier, name string, expec
 	}
 	if tag.RowsAffected() == 0 {
 		// Either the bucket doesn't exist or the expected root didn't match.
-		// Asked through the same querier: from inside CASRootEnqueue's
-		// transaction this would otherwise want a second pooled connection
+		// Asked through the same querier: from inside this method's
+		// transaction it would otherwise want a second pooled connection
 		// while holding one, which deadlocks a single-connection pool.
 		var exists bool
 		if gerr := q.QueryRow(ctx,

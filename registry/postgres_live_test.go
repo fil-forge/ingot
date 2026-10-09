@@ -835,14 +835,15 @@ func TestPostgresStores_Live(t *testing.T) {
 	})
 }
 
-// TestCASRootEnqueueOnASingleConnection proves the enqueueing CAS never needs
-// two pooled connections at once. Resolving a conflict or a missing bucket by
-// reading through the pool, while the transaction already holds a connection,
-// deadlocks outright on a single-connection pool and deadlocks any pool once
-// enough concurrent commits exhaust it.
+// TestCASRootAndQueueUploadRegistrationsOnASingleConnection proves the
+// enqueueing CAS never needs two pooled connections at once. Resolving a
+// conflict or a missing bucket by reading through the pool, while the
+// transaction already holds a connection, deadlocks outright on a
+// single-connection pool and deadlocks any pool once enough concurrent
+// commits exhaust it.
 //
 //	INGOT_TEST_DSN=postgres://... GOWORK=off go test ./registry/ -run SingleConnection -v
-func TestCASRootEnqueueOnASingleConnection(t *testing.T) {
+func TestCASRootAndQueueUploadRegistrationsOnASingleConnection(t *testing.T) {
 	dsn := os.Getenv("INGOT_TEST_DSN")
 	if dsn == "" {
 		t.Skip("set INGOT_TEST_DSN to run the live Postgres store test")
@@ -893,7 +894,7 @@ func TestCASRootEnqueueOnASingleConnection(t *testing.T) {
 	// A bucket that does not exist: the conflict path has to say so without
 	// reaching back to the pool.
 	err = bounded("missing bucket", func(c context.Context) error {
-		return reg.CASRootEnqueue(c, "cas-single-conn", cid.Undef, liveCid(t, "next"), regs)
+		return reg.CASRootAndQueueUploadRegistrations(c, "cas-single-conn", cid.Undef, liveCid(t, "next"), regs)
 	})
 	if !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("missing bucket: got %v, want ErrNotFound", err)
@@ -908,7 +909,7 @@ func TestCASRootEnqueueOnASingleConnection(t *testing.T) {
 
 	// A root that does not match: the same path, reporting a conflict.
 	err = bounded("stale root", func(c context.Context) error {
-		return reg.CASRootEnqueue(c, "cas-single-conn", liveCid(t, "stale"), liveCid(t, "next"), regs)
+		return reg.CASRootAndQueueUploadRegistrations(c, "cas-single-conn", liveCid(t, "stale"), liveCid(t, "next"), regs)
 	})
 	if !errors.Is(err, registry.ErrConflict) {
 		t.Fatalf("stale root: got %v, want ErrConflict", err)
@@ -916,7 +917,7 @@ func TestCASRootEnqueueOnASingleConnection(t *testing.T) {
 
 	// And the happy path still commits both the root and its rows.
 	if err := bounded("commit", func(c context.Context) error {
-		return reg.CASRootEnqueue(c, "cas-single-conn", cid.Undef, liveCid(t, "next"), regs)
+		return reg.CASRootAndQueueUploadRegistrations(c, "cas-single-conn", cid.Undef, liveCid(t, "next"), regs)
 	}); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
@@ -959,7 +960,7 @@ func TestDeletingABucketCascadesItsUploadRegistrations(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = r.Delete(context.Background(), "cascade-bucket") })
 
-	if err := r.CASRootEnqueue(ctx, "cascade-bucket", cid.Undef, liveCid(t, "root"),
+	if err := r.CASRootAndQueueUploadRegistrations(ctx, "cascade-bucket", cid.Undef, liveCid(t, "root"),
 		[]registry.UploadRegistration{{
 			Bucket: "cascade-bucket", ObjectKey: "k", Space: space,
 			Root: liveCid(t, "mf"), Op: registry.UploadRegistrationAdd, Proofs: []byte("proofs"),

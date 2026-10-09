@@ -235,13 +235,13 @@ func (m *MemStore) Delete(_ context.Context, name string) error {
 }
 
 func (m *MemStore) CASRoot(ctx context.Context, name string, expect, next cid.Cid) error {
-	return m.CASRootEnqueue(ctx, name, expect, next, nil)
+	return m.CASRootAndQueueUploadRegistrations(ctx, name, expect, next, nil)
 }
 
-// CASRootEnqueue advances the root and records the commit's upload
-// registrations together: under the one mutex here, as one transaction in
-// Postgres. A conflict records nothing.
-func (m *MemStore) CASRootEnqueue(_ context.Context, name string, expect, next cid.Cid, regs []registry.UploadRegistration) error {
+// CASRootAndQueueUploadRegistrations advances the root and records the
+// commit's upload registrations together: under the one mutex here, as one
+// transaction in Postgres. A conflict records nothing.
+func (m *MemStore) CASRootAndQueueUploadRegistrations(_ context.Context, name string, expect, next cid.Cid, regs []registry.UploadRegistration) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	s, ok := m.buckets[name]
