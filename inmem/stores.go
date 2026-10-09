@@ -122,6 +122,9 @@ func (m *MemStore) enqueueReleaseLocked(space did.DID, digest multihash.Multihas
 	pr := registry.PendingRelease{
 		Space: space, Digest: multihash.Multihash(bytes.Clone(digest)), NotBefore: notBefore,
 	}
+	if prior, ok := m.releases[k]; ok {
+		pr.StartedAt = prior.StartedAt // a started record stays started
+	}
 	m.releases[k] = pr
 	return pr
 }
@@ -1112,4 +1115,40 @@ func (m *MemStore) ParkByDigest(_ context.Context, digest multihash.Multihash) (
 		return nil, registry.ErrNotFound
 	}
 	return found, nil
+}
+
+func (m *MemStore) StartRelease(_ context.Context, space did.DID, digest multihash.Multihash) (registry.ReleaseStart, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k := locKey{space, string(digest)}
+	pr, ok := m.releases[k]
+	if !ok {
+		return registry.ReleaseCancelled, nil
+	}
+	if m.countLivePartRefsLocked(&space, digest) > 0 {
+		return registry.ReleaseReferenced, nil
+	}
+	if m.countClaimsLocked(space, digest) > 0 {
+		return registry.ReleaseClaimed, nil
+	}
+	if pr.StartedAt.IsZero() {
+		pr.StartedAt = time.Now()
+		m.releases[k] = pr
+	}
+	return registry.ReleaseStarted, nil
+}
+
+func (m *MemStore) CancelRelease(_ context.Context, space did.DID, digest multihash.Multihash) (registry.ReleaseCancel, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k := locKey{space, string(digest)}
+	pr, ok := m.releases[k]
+	if !ok {
+		return registry.ReleaseNone, nil
+	}
+	if !pr.StartedAt.IsZero() {
+		return registry.ReleaseInProgress, nil
+	}
+	delete(m.releases, k)
+	return registry.ReleaseCancelledByWrite, nil
 }

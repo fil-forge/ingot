@@ -151,6 +151,7 @@ func (w *bodyWriter) spoolStored(ctx context.Context, stored io.Reader, desc fee
 	if err != nil {
 		return nil, fmt.Errorf("s3frontend: spool blob: %w", err)
 	}
+	w.takeHold(digest)
 	if streamed != nil && storedSize != streamed.Size {
 		return nil, fmt.Errorf("s3frontend: blob of %d bytes was allocated %d", storedSize, streamed.Size)
 	}

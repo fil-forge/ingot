@@ -247,7 +247,7 @@ func (r *Postgres) EnqueueReleases(ctx context.Context, space did.DID, digests [
 
 func (r *Postgres) ListDueReleases(ctx context.Context, now time.Time, limit int) ([]PendingRelease, error) {
 	rows, err := r.pool.Query(ctx,
-		`SELECT space, digest, not_before FROM ingot.blob_release_intents
+		`SELECT space, digest, not_before, started_at FROM ingot.blob_release_intents
 		 WHERE not_before <= $1 ORDER BY not_before ASC LIMIT $2`,
 		now, limit)
 	if err != nil {
@@ -260,8 +260,12 @@ func (r *Postgres) ListDueReleases(ctx context.Context, now time.Time, limit int
 		var spaceStr string
 		var pr PendingRelease
 		var digest []byte
-		if err := rows.Scan(&spaceStr, &digest, &pr.NotBefore); err != nil {
+		var started *time.Time
+		if err := rows.Scan(&spaceStr, &digest, &pr.NotBefore, &started); err != nil {
 			return nil, fmt.Errorf("registry: list due releases scan: %w", err)
+		}
+		if started != nil {
+			pr.StartedAt = *started
 		}
 		space, err := did.Parse(spaceStr)
 		if err != nil {
@@ -278,7 +282,7 @@ func (r *Postgres) ListDueReleases(ctx context.Context, now time.Time, limit int
 
 func (r *Postgres) ListReleasesBySpace(ctx context.Context, space did.DID) ([]PendingRelease, error) {
 	rows, err := r.pool.Query(ctx,
-		`SELECT space, digest, not_before FROM ingot.blob_release_intents
+		`SELECT space, digest, not_before, started_at FROM ingot.blob_release_intents
 		 WHERE space = $1 ORDER BY not_before ASC`,
 		space)
 	if err != nil {
@@ -291,8 +295,12 @@ func (r *Postgres) ListReleasesBySpace(ctx context.Context, space did.DID) ([]Pe
 		var spaceStr string
 		var pr PendingRelease
 		var digest []byte
-		if err := rows.Scan(&spaceStr, &digest, &pr.NotBefore); err != nil {
+		var started *time.Time
+		if err := rows.Scan(&spaceStr, &digest, &pr.NotBefore, &started); err != nil {
 			return nil, fmt.Errorf("registry: list releases by space scan: %w", err)
+		}
+		if started != nil {
+			pr.StartedAt = *started
 		}
 		sp, err := did.Parse(spaceStr)
 		if err != nil {
@@ -1340,4 +1348,88 @@ func scanUploadRegistrations(rows pgx.Rows) ([]UploadRegistration, error) {
 		return nil, fmt.Errorf("registry: upload registration rows: %w", err)
 	}
 	return out, nil
+}
+
+func (r *Postgres) StartRelease(ctx context.Context, space did.DID, digest multihash.Multihash) (ReleaseStart, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("registry: begin start release: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	if err := lockClaimKey(ctx, tx, space, digest); err != nil {
+		return 0, err
+	}
+	var exists bool
+	if err := tx.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM ingot.blob_release_intents WHERE space = $1 AND digest = $2)`,
+		space, digest).Scan(&exists); err != nil {
+		return 0, fmt.Errorf("registry: start release lookup: %w", err)
+	}
+	if !exists {
+		return ReleaseCancelled, nil
+	}
+	// Live part references before claims: see the interface.
+	var live int
+	if err := tx.QueryRow(ctx,
+		`SELECT count(*) FROM ingot.multipart_parts p
+		 JOIN ingot.multipart_sessions s ON s.upload_id = p.upload_id
+		 WHERE p.blob_digests @> ARRAY[$2::bytea] AND s.space = $1 AND s.state IN ($3, $4)`,
+		space, digest, SessionOpen, SessionCompleting).Scan(&live); err != nil {
+		return 0, fmt.Errorf("registry: start release count live part refs: %w", err)
+	}
+	if live > 0 {
+		return ReleaseReferenced, nil
+	}
+	var claims int
+	if err := tx.QueryRow(ctx,
+		`SELECT count(*) FROM ingot.blob_refs WHERE space = $1 AND digest = $2`,
+		space, digest).Scan(&claims); err != nil {
+		return 0, fmt.Errorf("registry: start release count claims: %w", err)
+	}
+	if claims > 0 {
+		return ReleaseClaimed, nil
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE ingot.blob_release_intents SET started_at = COALESCE(started_at, now())
+		 WHERE space = $1 AND digest = $2`,
+		space, digest); err != nil {
+		return 0, fmt.Errorf("registry: start release: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("registry: commit start release: %w", err)
+	}
+	return ReleaseStarted, nil
+}
+
+func (r *Postgres) CancelRelease(ctx context.Context, space did.DID, digest multihash.Multihash) (ReleaseCancel, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("registry: begin cancel release: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	if err := lockClaimKey(ctx, tx, space, digest); err != nil {
+		return 0, err
+	}
+	var started *time.Time
+	err = tx.QueryRow(ctx,
+		`SELECT started_at FROM ingot.blob_release_intents WHERE space = $1 AND digest = $2`,
+		space, digest).Scan(&started)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ReleaseNone, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("registry: cancel release lookup: %w", err)
+	}
+	if started != nil {
+		return ReleaseInProgress, nil
+	}
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM ingot.blob_release_intents WHERE space = $1 AND digest = $2`,
+		space, digest); err != nil {
+		return 0, fmt.Errorf("registry: cancel release: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("registry: commit cancel release: %w", err)
+	}
+	return ReleaseCancelledByWrite, nil
 }

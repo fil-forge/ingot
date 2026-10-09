@@ -3,6 +3,7 @@ package blockstore
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -255,5 +256,38 @@ func TestSpoolRemoveTempLeavesTheCountAlone(t *testing.T) {
 	}{[]int64{7, 0}, 5}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("RemoveTemp = %+v, want %+v", got, want)
+	}
+}
+
+// TestSpoolHoldKeepsTheFile: a held blob survives Remove, which frees
+// nothing; once every hold has ended, Remove takes it. Ending a hold twice
+// ends it once.
+func TestSpoolHoldKeepsTheFile(t *testing.T) {
+	s, _ := newTestDirs(t)
+	d := writeTestBlob(t, s, "held")
+	first := s.Hold(d)
+	second := s.Hold(d)
+	var got []string
+	record := func(label string) {
+		n, err := s.Remove(d)
+		if err != nil {
+			t.Fatalf("Remove (%s): %v", label, err)
+		}
+		_, statErr := os.Stat(s.Path(d))
+		got = append(got, fmt.Sprint(label, n, statErr == nil, s.Held(d)))
+	}
+	record("two holds")
+	first()
+	first() // a second end of the same hold changes nothing
+	record("one hold")
+	second()
+	record("no hold")
+	want := []string{
+		fmt.Sprint("two holds", 0, true, true),
+		fmt.Sprint("one hold", 0, true, true),
+		fmt.Sprint("no hold", 4, false, false),
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("[label freed exists held] = %v, want %v", got, want)
 	}
 }

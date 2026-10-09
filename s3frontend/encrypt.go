@@ -79,6 +79,12 @@ type bodyWriter struct {
 	bucket      string
 	digestFirst bool
 	logger      *zap.Logger
+
+	// hold, when set, marks each spooled blob as needed by this write until
+	// its upload has read it (blockstore.Spool.Hold); holds keeps the
+	// functions that end the marks, by string(digest).
+	hold  func(multihash.Multihash) func()
+	holds map[string]func()
 }
 
 // encWrite is one blob's write-side state, keyed by stored digest in
@@ -127,6 +133,7 @@ func (w *bodyWriter) WriteBlob(ctx context.Context, r io.Reader) (multihash.Mult
 			return nil, 0, fmt.Errorf("s3frontend: spool blob: %w", err)
 		}
 		if n > 0 {
+			w.takeHold(digest)
 			w.results[string(digest)] = encWrite{storedSize: n}
 		}
 		return digest, n, nil
@@ -163,6 +170,7 @@ func (w *bodyWriter) WriteBlob(ctx context.Context, r io.Reader) (multihash.Mult
 	if err != nil {
 		return nil, 0, fmt.Errorf("s3frontend: spool envelope: %w", err)
 	}
+	w.takeHold(digest)
 	if err := w.record(ctx, digest, cek, encWrite{desc: desc, storedSize: storedSize}); err != nil {
 		return nil, 0, err
 	}
@@ -244,4 +252,25 @@ func (c *countingReader) Read(p []byte) (int, error) {
 	n, err := c.r.Read(p)
 	c.n += int64(n)
 	return n, err
+}
+
+// takeHold marks a just-spooled blob as needed by this write (see hold).
+func (w *bodyWriter) takeHold(digest multihash.Multihash) {
+	if w.hold == nil {
+		return
+	}
+	if w.holds == nil {
+		w.holds = map[string]func(){}
+	}
+	if _, ok := w.holds[string(digest)]; ok {
+		return // the same bytes twice in one body: one hold is enough
+	}
+	w.holds[string(digest)] = w.hold(digest)
+}
+
+// unholdAll ends every hold this writer took.
+func (w *bodyWriter) unholdAll() {
+	for _, unhold := range w.holds {
+		unhold()
+	}
 }

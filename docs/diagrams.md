@@ -1008,6 +1008,7 @@ erDiagram
         text space PK
         bytea digest PK
         timestamptz not_before "earliest execution: claim drop + grace, or at once for a part blob"
+        timestamptz started_at "set under the claim-key lock once the release owns the blob; a reusing write cancels an unstarted record or waits out a started one"
     }
     gc_candidates {
         bytea cid PK "superseded MST node"

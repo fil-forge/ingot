@@ -296,7 +296,43 @@ type PendingRelease struct {
 	Space     did.DID
 	Digest    multihash.Multihash
 	NotBefore time.Time
+	// StartedAt is when a release took the record (StartRelease): the blob
+	// is being removed from its provider, or was and a later step failed.
+	// Zero until then.
+	StartedAt time.Time
 }
+
+// ReleaseStart is StartRelease's answer: whether the release may go ahead,
+// and if not, why.
+type ReleaseStart int
+
+const (
+	// ReleaseStarted: the record is marked started and the blob is this
+	// release's to remove.
+	ReleaseStarted ReleaseStart = iota
+	// ReleaseCancelled: no record; a write reusing the blob cancelled it.
+	ReleaseCancelled
+	// ReleaseClaimed: an object version claims the blob again; the record
+	// is stale.
+	ReleaseClaimed
+	// ReleaseReferenced: a part of one of the space's in-flight multipart
+	// sessions names the blob; the release waits.
+	ReleaseReferenced
+)
+
+// ReleaseCancel is CancelRelease's answer.
+type ReleaseCancel int
+
+const (
+	// ReleaseNone: no record; the blob is not being released.
+	ReleaseNone ReleaseCancel = iota
+	// ReleaseCancelledByWrite: the record was pending and is now deleted;
+	// the blob is the caller's to reuse.
+	ReleaseCancelledByWrite
+	// ReleaseInProgress: the record is started; the blob is going, and the
+	// caller waits for the record to disappear and uploads afresh.
+	ReleaseInProgress
+)
 
 // PendingReleaseStore is the deferred-release queue (blob_release_intents):
 // the durable record between "last claim dropped" and "release executed"
@@ -314,8 +350,25 @@ type PendingReleaseStore interface {
 	// can tell which releases are due now.
 	EnqueueReleases(ctx context.Context, space did.DID, digests []multihash.Multihash, notBefore time.Time) ([]PendingRelease, error)
 	// ListDueReleases returns intents with not_before <= now, oldest first,
-	// at most limit.
+	// at most limit. Started records are listed too: a release that failed
+	// after starting is retried.
 	ListDueReleases(ctx context.Context, now time.Time, limit int) ([]PendingRelease, error)
+	// StartRelease decides, under the (space, digest) claim-key lock, whether
+	// the record's release may go ahead, and marks it started if so. The
+	// checks run in this order on purpose: a Complete adds its claims while
+	// its session is still in flight and only then marks it completed, so a
+	// release that read the claims first could see none, lose the race to
+	// the commit, and then find no live session either; reading the live
+	// part references first closes that window. A record already started
+	// (a retry) starts again. The lock excludes CancelRelease, so a write
+	// reusing the blob either cancels the record before this, and this
+	// finds none, or finds it started and waits.
+	StartRelease(ctx context.Context, space did.DID, digest multihash.Multihash) (ReleaseStart, error)
+	// CancelRelease is a write's side of StartRelease: under the same lock,
+	// it deletes a record not yet started, so the blob is the write's to
+	// reuse, or reports one that is started, which the write waits out, or
+	// none.
+	CancelRelease(ctx context.Context, space did.DID, digest multihash.Multihash) (ReleaseCancel, error)
 	// ListReleasesBySpace returns every intent for space regardless of
 	// not_before — DeleteBucket executes a space's releases immediately (the
 	// bucket is empty and its deletion is explicit, so no reader grace is

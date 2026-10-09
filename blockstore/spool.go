@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync"
 	"sync/atomic"
 
 	mh "github.com/multiformats/go-multihash"
@@ -38,6 +39,12 @@ type Spool struct {
 	// bytes are briefly in both, between its commit and WriteBlob's return,
 	// so Usage can run high by up to one blob per concurrent write.
 	inFlight atomic.Int64
+	// holds counts, per digest, the writes that still need the blob's file:
+	// from its spool write until its upload has read it. Remove leaves a
+	// held blob alone, so a release of the same digest by another object
+	// never takes a file a write in flight is about to upload.
+	holdMu sync.Mutex
+	holds  map[string]int
 }
 
 // spoolTempPrefix names the files WriteBlob streams into before the rename to
@@ -51,7 +58,7 @@ func NewSpool(dir string) (*Spool, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &Spool{blobDir: d}
+	s := &Spool{blobDir: d, holds: map[string]int{}}
 	if err := s.recoverDir(); err != nil {
 		return nil, err
 	}
@@ -181,3 +188,46 @@ var (
 	_ BlobRangeReader = (*Spool)(nil)
 	_ BlobWriter      = (*Spool)(nil)
 )
+
+// Hold marks the blob with the given digest as needed by a write in flight,
+// so Remove leaves its file alone, and returns the function that ends the
+// hold. Ending it twice is harmless. A write holds each blob it spools from
+// the spool write until its upload has read the file, which is what keeps
+// the same bytes written as received by two objects of one space safe: a
+// release of the first object's blob can run while the second write is
+// between spooling and uploading it.
+func (s *Spool) Hold(digest mh.Multihash) (unhold func()) {
+	k := string(digest)
+	s.holdMu.Lock()
+	s.holds[k]++
+	s.holdMu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			s.holdMu.Lock()
+			defer s.holdMu.Unlock()
+			if s.holds[k] <= 1 {
+				delete(s.holds, k)
+			} else {
+				s.holds[k]--
+			}
+		})
+	}
+}
+
+// Held reports whether a write in flight holds the blob (see Hold).
+func (s *Spool) Held(digest mh.Multihash) bool {
+	s.holdMu.Lock()
+	defer s.holdMu.Unlock()
+	return s.holds[string(digest)] > 0
+}
+
+// Remove deletes the blob with the given digest, as blobDir.Remove does,
+// unless a write in flight holds it (Hold): the file is then left as it is
+// and nothing is freed.
+func (s *Spool) Remove(digest mh.Multihash) (int64, error) {
+	if s.Held(digest) {
+		return 0, nil
+	}
+	return s.blobDir.Remove(digest)
+}

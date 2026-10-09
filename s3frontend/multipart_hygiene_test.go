@@ -1373,10 +1373,10 @@ func TestReleaseDefersWhileAnInFlightPartReferencesTheBlob(t *testing.T) {
 }
 
 // TestCompletedSessionReapReleasesOrphansWhoseRecordingFailed: Complete's
-// own release of an omitted part is best-effort — here both recording the
-// release and the inline attempt fail. The completed-session reap derives
-// the orphan again from the retained part rows, records it, and releases it,
-// so the orphan is released late rather than never.
+// own release of an omitted part is best-effort — here recording the
+// release fails, and nothing runs unrecorded. The completed-session reap
+// derives the orphan again from the retained part rows, records it, and
+// releases it, so the orphan is released late rather than never.
 func TestCompletedSessionReapReleasesOrphansWhoseRecordingFailed(t *testing.T) {
 	pu := &parkingUploader{}
 	rel := &failEnqueueReleases{}
@@ -1392,15 +1392,17 @@ func TestCompletedSessionReapReleasesOrphansWhoseRecordingFailed(t *testing.T) {
 	part1 := hygienePartDigests(t, mem, uploadID, 1)
 	orphans := hygienePartDigests(t, mem, uploadID, 2)
 
-	// Complete with part 1 only; the orphan pass can neither record the
-	// release nor abort the blob on the provider.
+	// Complete with part 1 only; the orphan pass cannot record the release,
+	// and does not touch the blob on the provider without a record.
 	rel.fails = 1
-	pu.abortFails = 1
 	if _, err := mpComplete(t, b, key, uploadID, parts[:1], nil); err != nil {
 		t.Fatalf("Complete: %v", err)
 	}
-	if rel.fails > 0 || pu.abortFails > 0 {
-		t.Fatalf("the failures were not exercised: record fails left=%d, abort fails left=%d", rel.fails, pu.abortFails)
+	if rel.fails > 0 {
+		t.Fatalf("the recording failure was not exercised: fails left=%d", rel.fails)
+	}
+	if pu.abortedDigests()[string(orphans[0])] {
+		t.Fatalf("orphan %x was aborted on the provider without a release record", orphans[0])
 	}
 	drainReleases(t, b)
 	for _, d := range orphans {

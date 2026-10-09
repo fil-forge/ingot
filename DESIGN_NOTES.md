@@ -307,11 +307,18 @@ blob, each holding its own claim, and two buckets of different spaces can
 hold one digest. Every blob table is therefore keyed by `(space, digest)`,
 the upload intent and the park included: each space uploads, parks, claims
 and releases its own copy, and the one spool file between them goes with the
-last intent for it. A write of bytes whose release in the same space is
-already executing (past its claim check, inside the network remove) can
-still reuse the recorded location and commit over the removed blob; the
-window is one round trip after a delete, and closing it needs a release
-marker the writer cancels or waits on.
+last intent for it. Within a space, a write of bytes whose previous object
+was deleted meets that object's release: the release takes the blob under
+its claim-key lock and marks its record started
+(`blob_release_intents.started_at`) before it removes anything, and a write
+that finds the blob already located takes the same lock first, cancelling a
+record not yet started (its own commit would have made it stale) or waiting
+out a started one and then uploading afresh. A write holds each blob's
+spool file (`blockstore.Spool.Hold`) from its spool write until its upload
+has read it, and a release leaves a held file and its intent alone, so the
+waiting write still has its bytes to upload once the release has run. A
+release runs only through its record: Complete no longer runs an orphan's
+release unrecorded when recording it fails, and leaves it to the reap.
 
 ## Identity & auth
 

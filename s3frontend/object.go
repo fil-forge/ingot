@@ -314,7 +314,8 @@ func (b *Backend) ingestBody(ctx context.Context, bucket *registry.State, r io.R
 		return msbucket.Body{}, err
 	}
 	defer body.lease.end()
-	if err := b.uploadBlobs(ctx, bucket.Space, body.Blobs, body.streamed); err != nil {
+	defer body.unholdAll()
+	if err := b.uploadBlobs(ctx, bucket.Space, body); err != nil {
 		return msbucket.Body{}, err
 	}
 	return body.Body, nil
@@ -329,6 +330,24 @@ type spooledBody struct {
 	// lease renews the streamed blobs' rows until the caller has recorded
 	// their parks or acceptances, and ends it.
 	lease *streamLease
+	// holds end the spool holds on the body's blobs, by string(digest): each
+	// is ended once its blob's upload has read the file (unhold), and all of
+	// them when the write is over (unholdAll), whichever comes first.
+	holds map[string]func()
+}
+
+// unhold ends the hold on one blob's spool file: its upload has read it.
+func (sb spooledBody) unhold(digest multihash.Multihash) {
+	if unhold, ok := sb.holds[string(digest)]; ok {
+		unhold()
+	}
+}
+
+// unholdAll ends every hold the body still has.
+func (sb spooledBody) unholdAll() {
+	for _, unhold := range sb.holds {
+		unhold()
+	}
 }
 
 // declaredLength is a request's body length. S3 requires one on every
@@ -386,6 +405,14 @@ func (b *Backend) splitSpool(ctx context.Context, bucket string, space did.DID, 
 		}
 		enc = newEncryptingBlobWriter(b.spool, b.regionKeys, space, []fee.Recipient{recipient})
 	}
+	// Each spooled blob is held until its upload has read it; a failed
+	// split leaves no caller to end the holds.
+	enc.hold = b.spool.Hold
+	defer func() {
+		if err != nil {
+			enc.unholdAll()
+		}
+	}()
 	var splitOpts []msbucket.SplitOption
 	if md5Src != nil {
 		splitOpts = append(splitOpts, msbucket.WithoutMD5())
@@ -461,7 +488,7 @@ func (b *Backend) splitSpool(ctx context.Context, bucket string, space did.DID, 
 			return spooledBody{}, fmt.Errorf("record encryption params: %w", err)
 		}
 	}
-	return spooledBody{Body: body, streamed: streamed, lease: enc.lease}, nil
+	return spooledBody{Body: body, streamed: streamed, lease: enc.lease, holds: enc.holds}, nil
 }
 
 // uploadBlobs uploads each spooled blob to Forge by digest (allocate→PUT→
@@ -480,22 +507,23 @@ func (b *Backend) splitSpool(ctx context.Context, bucket string, space did.DID, 
 //
 // A blob in streamed already went to its provider while it was spooled: it is
 // parked there and needs only its conclude.
-func (b *Backend) uploadBlobs(ctx context.Context, space did.DID, blobs []msbucket.BlobRef, streamed map[string]uploader.StreamedBlob) error {
+func (b *Backend) uploadBlobs(ctx context.Context, space did.DID, body spooledBody) error {
 	// Each digest once: a body stored as received can hold the same bytes
 	// twice, and the provider needs them once.
-	seen := make(map[string]bool, len(blobs))
-	for _, blob := range blobs {
+	seen := make(map[string]bool, len(body.Blobs))
+	for _, blob := range body.Blobs {
 		if seen[string(blob.Digest)] {
 			continue
 		}
 		seen[string(blob.Digest)] = true
-		if sb, ok := streamed[string(blob.Digest)]; ok {
+		if sb, ok := body.streamed[string(blob.Digest)]; ok {
+			body.unhold(blob.Digest) // on its provider already; the file is not read again
 			if err := b.concludeStreamed(ctx, space, blob, sb); err != nil {
 				return err
 			}
 			continue
 		}
-		if err := b.uploadBlob(ctx, space, blob); err != nil {
+		if err := b.uploadBlob(ctx, space, blob, body); err != nil {
 			return err
 		}
 	}
@@ -532,20 +560,33 @@ func (b *Backend) concludeStreamed(ctx context.Context, space did.DID, blob msbu
 }
 
 // uploadBlob is uploadBlobs for one blob, traced as a blob.upload span whose
-// ingot.blob.result says whether it uploaded or was already stored.
-func (b *Backend) uploadBlob(ctx context.Context, space did.DID, blob msbucket.BlobRef) (err error) {
+// ingot.blob.result says whether it uploaded or was already stored. The
+// body's hold on the blob's spool file ends once the upload has read it, or
+// at once when the blob is reused as already stored.
+func (b *Backend) uploadBlob(ctx context.Context, space did.DID, blob msbucket.BlobRef, body spooledBody) (err error) {
 	ctx, span := tracing.Start(ctx, "blob.upload")
 	defer func() { tracing.End(span, err) }()
 
 	digest := blob.Digest
 	if existing, err := b.locations.GetLocation(ctx, space, blob.Digest); err == nil && existing != nil {
-		// Already durable for this space — advance the intent and move on.
-		span.SetAttributes(attribute.String("ingot.blob.result", "already_stored"))
-		if err := b.intents.SetIntentState(ctx, space, blob.Digest, registry.IntentAccepted); err != nil {
-			return fmt.Errorf("mark accepted (dedup): %w", err)
+		reuse, err := b.reuseLocated(ctx, space, blob.Digest)
+		if err != nil {
+			return err
 		}
-		b.cacheHeld(ctx, space, blob.Digest)
-		return nil
+		if reuse {
+			// Already durable for this space — advance the intent and move on.
+			span.SetAttributes(attribute.String("ingot.blob.result", "already_stored"))
+			// The hold ends before the state changes: a held file is one the
+			// eviction pass cannot take, and an accepted intent is one it lists.
+			body.unhold(blob.Digest)
+			if err := b.intents.SetIntentState(ctx, space, blob.Digest, registry.IntentAccepted); err != nil {
+				return fmt.Errorf("mark accepted (dedup): %w", err)
+			}
+			b.cacheHeld(ctx, space, blob.Digest)
+			return nil
+		}
+		// The release that held the location has run: the blob is gone
+		// from the provider, and is uploaded again below.
 	} else if err != nil && !errors.Is(err, registry.ErrNotFound) {
 		return fmt.Errorf("lookup location: %w", err)
 	}
@@ -565,6 +606,7 @@ func (b *Backend) uploadBlob(ctx context.Context, space did.DID, blob msbucket.B
 		return fmt.Errorf("mark uploading: %w", err)
 	}
 	res, err := b.uploader.UploadBlob(ctx, space, digest, in.Size, b.spool.Path(digest))
+	body.unhold(blob.Digest) // read, or failed; either way the file is not read again by this write
 	if err != nil {
 		return fmt.Errorf("upload blob: %w", err)
 	}
@@ -615,9 +657,9 @@ var errPinnedBlobReleased = errors.New("pinned blob has no remaining claim")
 // A body this node ingested is claimed unconditionally. An encrypted body
 // holds fresh digests, which nothing can release before they are claimed. A
 // body stored as received can repeat a digest the space released or is
-// releasing: a pending release finds the new claim and drops its record
-// (runRelease), and a release already past its claim check (executeRelease,
-// one network round trip) is not excluded. A body pinned from another object of the space
+// releasing: the write settled that before reusing the blob (reuseLocated),
+// by cancelling the release or waiting it out, so no release is past its
+// claim check by the time the claim lands. A body pinned from another object of the space
 // (a same-space copy) holds digests some other version claims, and a
 // release of them may be under way: its claim check and its network removal
 // are separate steps, so a claim added unconditionally in between would
@@ -768,21 +810,23 @@ func (b *Backend) releaseNow(ctx context.Context, records []registry.PendingRele
 // runRelease attempts one release record end to end and reports what to do
 // with the record.
 //
-// The two checks run in this order on purpose. A Complete adds its claims
-// while its session is still 'completing' and only then marks it completed,
-// so a release that read the claims first could see none, lose the race to
-// the commit, and then find no live session either. Reading the live part
-// references first closes that window: a session seen in flight defers the
-// release, and a session seen already completed has its claims in place for
-// the check that follows.
+// Whether the release may go ahead is one decision taken under the blob's
+// claim-key lock (registry.PendingReleaseStore.StartRelease), which marks
+// the record started. A write that finds the blob already stored for the
+// space and means to reuse it takes the same lock first (reuseLocated): it
+// cancels a record not yet started, and waits out one that is. So a record
+// this finds is either gone, because a write took the blob, or this
+// release's to run, and no write commits a manifest over a blob it is
+// removing.
 func (b *Backend) runRelease(ctx context.Context, pr registry.PendingRelease) releaseOutcome {
-	live, err := b.multipart.CountLivePartRefs(ctx, pr.Space, pr.Digest)
+	start, err := b.pendingReleases.StartRelease(ctx, pr.Space, pr.Digest)
 	if err != nil {
-		b.logger.Warn("release: count live part refs failed; retrying next sweep",
+		b.logger.Warn("release: start failed; retrying next sweep",
 			zap.String("digest", hex.EncodeToString(pr.Digest)), zap.Error(err))
 		return releaseFailed
 	}
-	if live > 0 {
+	switch start {
+	case registry.ReleaseReferenced:
 		// A session of this space in flight still references the blob and
 		// means to claim it. Its Complete turns the reference into a claim,
 		// which makes this record stale; its abort or expiry records a
@@ -790,16 +834,10 @@ func (b *Backend) runRelease(ctx context.Context, pr registry.PendingRelease) re
 		// received can be named by several sessions and objects of the
 		// space at once; an encrypted one has a digest of its own.
 		return releaseDeferred
-	}
-	n, err := b.blobRefs.CountClaims(ctx, pr.Space, pr.Digest)
-	if err != nil {
-		b.logger.Warn("release: count claims failed; retrying next sweep",
-			zap.String("digest", hex.EncodeToString(pr.Digest)), zap.Error(err))
-		return releaseFailed
-	}
-	if n > 0 {
+	case registry.ReleaseClaimed, registry.ReleaseCancelled:
 		// Re-claimed since enqueue (e.g. a commit that failed after its
-		// drop ran, then retried) — the record is stale, not the claim.
+		// drop ran, then retried), or taken by a write that reuses the
+		// blob: the record is stale, not the claim.
 		return releaseStale
 	}
 	if !b.executeRelease(ctx, pr) {
@@ -807,6 +845,60 @@ func (b *Backend) runRelease(ctx context.Context, pr registry.PendingRelease) re
 	}
 	return releaseDone
 }
+
+// reuseLocated reports whether a write may reuse a blob already stored for
+// space rather than upload it again. A recorded location proves the
+// provider holds the blob only while no release is removing it, which a
+// blob stored as received can be: its digest is its bytes', so a write of
+// the same bytes can follow the deletion of the object that stored them.
+// Under the blob's claim-key lock, a release record not yet started is
+// cancelled, and the blob is the write's: the claim its commit adds would
+// have made the record stale anyway. A record already started means the
+// blob is going; the write waits for the record to disappear, then uploads
+// afresh (false). No record at all means the blob is held as located. A release that fails after starting is retried by the
+// sweeper, so the wait is bounded by reuseWaitLimit and then refused with
+// S3's SlowDown, which the client retries. An encrypted blob has a digest
+// of its own and never has a record here.
+func (b *Backend) reuseLocated(ctx context.Context, space did.DID, digest multihash.Multihash) (bool, error) {
+	deadline := time.Now().Add(reuseWaitLimit)
+	backoff := reuseWaitFirst
+	waited := false
+	for {
+		c, err := b.pendingReleases.CancelRelease(ctx, space, digest)
+		if err != nil {
+			return false, fmt.Errorf("cancel release: %w", err)
+		}
+		switch c {
+		case registry.ReleaseNone:
+			// No release, or the one waited out has run and the location
+			// went with it.
+			return !waited, nil
+		case registry.ReleaseCancelledByWrite:
+			return true, nil
+		}
+		waited = true
+		if time.Now().After(deadline) {
+			return false, s3err.GetAPIError(s3err.ErrSlowDown)
+		}
+		select {
+		case <-ctx.Done():
+			return false, ctx.Err()
+		case <-time.After(backoff):
+		}
+		if backoff < reuseWaitMax {
+			backoff *= 2
+		}
+	}
+}
+
+// reuseLocated's wait on a started release: the first poll interval, its
+// cap, and how long in all before the write is refused. Package-level so
+// tests can shrink them.
+var (
+	reuseWaitFirst = 20 * time.Millisecond
+	reuseWaitMax   = 500 * time.Millisecond
+	reuseWaitLimit = 30 * time.Second
+)
 
 // drainSpaceReleases executes a space's pending releases immediately,
 // ignoring their grace: DeleteBucket calls it before asking hilt to delete
@@ -962,6 +1054,18 @@ func (b *Backend) executeRelease(ctx context.Context, pr registry.PendingRelease
 		// and a record that outlived it would leave the retry reading
 		// neither rows nor intent, owing a network remove it cannot
 		// authorize and can never complete.
+		if b.spool.Held(digest) {
+			// A write of the same bytes spooled them again and still needs
+			// the file: it is waiting for this release to finish
+			// (reuseLocated) before it uploads them afresh, or uploading
+			// them now. The intent and the file are that write's, so only
+			// this release's record goes.
+			if err := b.pendingReleases.DeleteRelease(ctx, space, digest); err != nil {
+				log.Warn("release: delete record failed", zap.Error(err))
+				ok = false
+			}
+			break
+		}
 		others, err := b.intents.CountOtherIntents(ctx, space, digest)
 		if err != nil {
 			log.Warn("release: count other intents failed", zap.Error(err))
