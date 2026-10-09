@@ -78,7 +78,7 @@ sequenceDiagram
     Note over F,DB: recorded before the shipped stamp, so retention<br/>can never retire blocks reads cannot resolve
     F-->>S: index digest
     S->>DB: MarkSegmentShipped: shipped_at + index_digest and, same tx,<br/>forge_root_cid per op-root (guarded: only while buckets.root_cid<br/>still equals the op-root)
-    Note over S: runRetention keeps the newest Retain shipped CARs,<br/>older ones retire (files unlinked, row deleted)
+    Note over S: runRetention keeps the newest Retain shipped CARs,<br/>older ones retire (files unlinked, row stamped retired_at)
 ```
 
 A batch may be empty of blocks: an MST mutation can produce a new root that
@@ -96,12 +96,16 @@ stateDiagram-v2
     Open --> Open : append (fsync, then index commit)
     Open --> Sealed : seal (hash CAR, write .idx, MarkSegmentSealed)
     Sealed --> Shipped : flush ok (MarkSegmentShipped, guarded forge_root advance)
-    Shipped --> Retired : retention past Retain (files unlinked)
-    Retired --> [*] : DeleteSegment
+    Shipped --> Retired : retention past Retain (files unlinked, RetireSegment)
+    Retired --> [*] : DeleteBucket (RemoveBucketLog)
 ```
 
 - The DB `state` column holds only `open` and `sealed`. Shipped is the
-  `shipped_at` stamp (plus `index_digest`); retired is file absence.
+  `shipped_at` stamp (plus `index_digest`); retired is the `retired_at`
+  stamp, set once the files are unlinked. A retired row keeps its CAR
+  `sha256` and `index_digest`, because those blobs stay registered in the
+  bucket's space until `DeleteBucket` releases them; its op-root rows are
+  dropped. Recovery and the startup sweep read only unretired rows.
 - With `Ship=false` a segment stays sealed on disk forever: the only durable
   copy and the sole source for local reads.
 - Recovery force-seals any recovered open segment, so each process starts
@@ -152,7 +156,8 @@ before any worker starts. Discovery keys on the CAR file:
 | `open` | present | `rebuildOpenFromDisk` (scan + truncate any torn trailing frame); then force-sealed |
 | `sealed` | present | `loadSealedFromIdx`; re-enqueue when shipping and not yet shipped |
 | none | present | orphan (crashed before the row): rebuild as open + `InsertSegmentOpen`, then force-sealed |
-| present | absent | delete the row |
+| `sealed` | absent | retire the row (a crash between the unlink and the `retired_at` stamp, or a lost file) |
+| `open` | absent | delete the row |
 | — | sidecar only (`.idx`/`.ops`, no CAR) | stray; unlink |
 
 ## Configuration

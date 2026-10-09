@@ -228,7 +228,7 @@ func (m *Manager) Close(ctx context.Context) error {
 // registered but wasn't yet marked shipped would be invisible to the release
 // pass, and the space delete would be refused. The closed store reopens
 // lazily on the bucket's next use, so a delete that fails downstream leaves
-// the bucket functional.
+// the log writable.
 func (m *Manager) QuiesceBucketLog(ctx context.Context, bucket string) error {
 	if err := validBucketDir(bucket); err != nil {
 		return err
@@ -248,18 +248,23 @@ func (m *Manager) QuiesceBucketLog(ctx context.Context, bucket string) error {
 
 // ShippedSegmentDigests returns the multihash of every blob the bucket's
 // catalog segments may have registered in its space: each shipped segment's
-// CAR and its sharded-dag-index blob, plus the CAR of any sealed-but-
-// unshipped segment (a flush aborted between the CAR's blob/add and the
-// shipped stamp leaves that registration behind; releasing an unregistered
-// blob is a no-op, so over-listing is safe). DeleteBucket must release them
-// all before the space itself can be deleted — the tenant service refuses to
-// delete a space that still holds registrations. Call QuiesceBucketLog first
-// so no ship is in flight while this reads.
+// CAR and its sharded-dag-index blob, retired segments included, plus the
+// CAR of any sealed-but-unshipped segment (a flush aborted between the CAR's
+// blob/add and the shipped stamp leaves that registration behind; releasing
+// an unregistered blob is a no-op, so over-listing is safe). DeleteBucket
+// must release them all before the space itself can be deleted — the tenant
+// service refuses to delete a space that still holds registrations. Call
+// QuiesceBucketLog first so no ship is in flight while this reads.
 func (m *Manager) ShippedSegmentDigests(ctx context.Context, bucket string) ([]multihash.Multihash, error) {
 	rows, err := m.meta.ListSegments(ctx, blockstore.PlaneCatalog, bucket)
 	if err != nil {
 		return nil, fmt.Errorf("logstore: manager: list segments for %q: %w", bucket, err)
 	}
+	retired, err := m.meta.ListRetiredSegments(ctx, blockstore.PlaneCatalog, bucket)
+	if err != nil {
+		return nil, fmt.Errorf("logstore: manager: list retired segments for %q: %w", bucket, err)
+	}
+	rows = append(rows, retired...)
 	var out []multihash.Multihash
 	for _, r := range rows {
 		if r.State != StateSealed || len(r.SHA256) == 0 {
@@ -279,8 +284,8 @@ func (m *Manager) ShippedSegmentDigests(ctx context.Context, bucket string) ([]m
 
 // RemoveBucketLog deletes bucket's log entirely: closes its store (dropping
 // queued-but-unshipped segments — a deleted bucket's history has nowhere to
-// ship), unlinks its directory, and removes its segment rows. Used by
-// DeleteBucket after the registry row is gone.
+// ship), unlinks its directory, and removes its segment rows, retired ones
+// included. Used by DeleteBucket after the registry row is gone.
 func (m *Manager) RemoveBucketLog(ctx context.Context, bucket string) error {
 	if err := validBucketDir(bucket); err != nil {
 		return err
@@ -303,7 +308,11 @@ func (m *Manager) RemoveBucketLog(ctx context.Context, bucket string) error {
 	if err != nil {
 		return fmt.Errorf("logstore: manager: list segments for %q: %w", bucket, err)
 	}
-	for _, r := range rows {
+	retired, err := m.meta.ListRetiredSegments(ctx, blockstore.PlaneCatalog, bucket)
+	if err != nil {
+		return fmt.Errorf("logstore: manager: list retired segments for %q: %w", bucket, err)
+	}
+	for _, r := range append(rows, retired...) {
 		if err := m.meta.DeleteSegment(ctx, r.Plane, r.Seq); err != nil {
 			return fmt.Errorf("logstore: manager: delete segment %d for %q: %w", r.Seq, bucket, err)
 		}

@@ -124,50 +124,42 @@ func (r *Postgres) DeleteSegment(ctx context.Context, plane blockstore.Plane, se
 	return nil
 }
 
-func (r *Postgres) ListSegments(ctx context.Context, plane blockstore.Plane, bucket string) ([]logstore.SegmentMeta, error) {
-	rows, err := r.pool.Query(ctx,
-		`SELECT seq, state, COALESCE(sealed_at, 0), size_bytes, sha256, COALESCE(shipped_at, 0), index_digest
-		   FROM ingot.segments
-		  WHERE plane = $1 AND bucket = $2 AND state IN ('open', 'sealed')
-		  ORDER BY seq ASC`,
-		plane.String(), bucket)
+// RetireSegment stamps retired_at and drops the segment's op-root rows in
+// one transaction. The op-roots were only needed to advance forge_root at
+// ship time and to recover the segment from disk; neither applies once its
+// files are gone.
+func (r *Postgres) RetireSegment(ctx context.Context, plane blockstore.Plane, seq uint64, retiredAt int64) error {
+	tx, err := r.pool.Begin(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("registry: list %s segments for %q: %w", plane, bucket, err)
+		return fmt.Errorf("registry: begin retire segment %d: %w", seq, err)
 	}
-	defer rows.Close()
+	defer tx.Rollback(ctx)
 
-	var out []logstore.SegmentMeta
-	for rows.Next() {
-		var (
-			seqInt      int64
-			stateS      string
-			sealed      int64
-			size        int64
-			sha         []byte
-			shippedAt   int64
-			indexDigest multihash.Multihash
-		)
-		if err := rows.Scan(&seqInt, &stateS, &sealed, &size, &sha, &shippedAt, &indexDigest); err != nil {
-			return nil, fmt.Errorf("registry: scan segment: %w", err)
-		}
-		state, ok := logstore.ParseState(stateS)
-		if !ok {
-			return nil, fmt.Errorf("registry: bad segment state %q for seq %d", stateS, seqInt)
-		}
-		out = append(out, logstore.SegmentMeta{
-			Seq:         uint64(seqInt),
-			Plane:       plane,
-			Bucket:      bucket,
-			State:       state,
-			SealedAt:    sealed,
-			Size:        size,
-			SHA256:      sha,
-			ShippedAt:   shippedAt,
-			IndexDigest: indexDigest,
-		})
+	tag, err := tx.Exec(ctx,
+		`UPDATE ingot.segments SET retired_at = $3
+		 WHERE seq = $1 AND plane = $2 AND retired_at IS NULL`,
+		int64(seq), plane.String(), retiredAt)
+	if err != nil {
+		return fmt.Errorf("registry: retire segment %d: %w", seq, err)
 	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("registry: list segments rows: %w", err)
+	if tag.RowsAffected() == 0 {
+		// Already retired, or no such row — idempotent.
+		return nil
+	}
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM ingot.segment_op_roots WHERE seq = $1`, int64(seq)); err != nil {
+		return fmt.Errorf("registry: drop op-roots of retired segment %d: %w", seq, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("registry: commit retire segment %d: %w", seq, err)
+	}
+	return nil
+}
+
+func (r *Postgres) ListSegments(ctx context.Context, plane blockstore.Plane, bucket string) ([]logstore.SegmentMeta, error) {
+	out, err := r.listSegments(ctx, plane, bucket, false)
+	if err != nil {
+		return nil, err
 	}
 
 	// Hydrate op_roots for sealed segments (open segments have none; data
@@ -185,9 +177,68 @@ func (r *Postgres) ListSegments(ctx context.Context, plane blockstore.Plane, buc
 	return out, nil
 }
 
+func (r *Postgres) ListRetiredSegments(ctx context.Context, plane blockstore.Plane, bucket string) ([]logstore.SegmentMeta, error) {
+	return r.listSegments(ctx, plane, bucket, true)
+}
+
+// listSegments reads bucket's segment rows for plane, either the unretired
+// ones or the retired ones, ordered by seq, without op-roots.
+func (r *Postgres) listSegments(ctx context.Context, plane blockstore.Plane, bucket string, retired bool) ([]logstore.SegmentMeta, error) {
+	rows, err := r.pool.Query(ctx,
+		`SELECT seq, state, COALESCE(sealed_at, 0), size_bytes, sha256, COALESCE(shipped_at, 0), index_digest,
+		        COALESCE(retired_at, 0)
+		   FROM ingot.segments
+		  WHERE plane = $1 AND bucket = $2 AND (retired_at IS NOT NULL) = $3
+		  ORDER BY seq ASC`,
+		plane.String(), bucket, retired)
+	if err != nil {
+		return nil, fmt.Errorf("registry: list %s segments for %q: %w", plane, bucket, err)
+	}
+	defer rows.Close()
+
+	var out []logstore.SegmentMeta
+	for rows.Next() {
+		var (
+			seqInt      int64
+			stateS      string
+			sealed      int64
+			size        int64
+			sha         []byte
+			shippedAt   int64
+			indexDigest multihash.Multihash
+			retiredAt   int64
+		)
+		if err := rows.Scan(&seqInt, &stateS, &sealed, &size, &sha, &shippedAt, &indexDigest, &retiredAt); err != nil {
+			return nil, fmt.Errorf("registry: scan segment: %w", err)
+		}
+		state, ok := logstore.ParseState(stateS)
+		if !ok {
+			return nil, fmt.Errorf("registry: bad segment state %q for seq %d", stateS, seqInt)
+		}
+		out = append(out, logstore.SegmentMeta{
+			Seq:         uint64(seqInt),
+			Plane:       plane,
+			Bucket:      bucket,
+			State:       state,
+			SealedAt:    sealed,
+			Size:        size,
+			SHA256:      sha,
+			ShippedAt:   shippedAt,
+			IndexDigest: indexDigest,
+			RetiredAt:   retiredAt,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("registry: list segments rows: %w", err)
+	}
+	return out, nil
+}
+
 func (r *Postgres) ListSegmentBuckets(ctx context.Context, plane blockstore.Plane) ([]string, error) {
 	rows, err := r.pool.Query(ctx,
-		`SELECT DISTINCT bucket FROM ingot.segments WHERE plane = $1 ORDER BY bucket ASC`,
+		`SELECT DISTINCT bucket FROM ingot.segments
+		  WHERE plane = $1 AND retired_at IS NULL
+		  ORDER BY bucket ASC`,
 		plane.String())
 	if err != nil {
 		return nil, fmt.Errorf("registry: list %s segment buckets: %w", plane, err)

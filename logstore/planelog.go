@@ -366,8 +366,10 @@ func (pl *PlaneLog) flushOne(seg *Segment) {
 	span.SetStatus(codes.Error, "ship exhausted retries")
 }
 
-// runRetention retires shipped segments beyond the Retain window and drops
-// them off the read tier + DB. A non-shipping plane is never retired.
+// runRetention retires shipped segments beyond the Retain window: unlinks
+// their files, drops them off the read tier, and stamps their rows retired.
+// The rows stay as the record of what each segment registered in the
+// bucket's space. A non-shipping plane is never retired.
 func (pl *PlaneLog) runRetention(ctx context.Context) {
 	if !pl.pc.Ship {
 		return
@@ -410,9 +412,10 @@ func (pl *PlaneLog) runRetention(ctx context.Context) {
 	pl.sealed = keep
 	pl.catMu.Unlock()
 
+	now := time.Now().Unix()
 	for _, seg := range remove {
-		if err := pl.meta.DeleteSegment(ctx, pl.plane, seg.Seq()); err != nil {
-			pl.logger.Warn("logstore: delete segment row",
+		if err := pl.meta.RetireSegment(ctx, pl.plane, seg.Seq(), now); err != nil {
+			pl.logger.Warn("logstore: retire segment row",
 				zap.Stringer("plane", pl.plane), zap.Uint64("seq", seg.Seq()), zap.Error(err))
 		}
 	}

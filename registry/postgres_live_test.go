@@ -1,10 +1,13 @@
 package registry_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"reflect"
+	"slices"
 	"testing"
 	"time"
 
@@ -831,6 +834,66 @@ func TestPostgresStores_Live(t *testing.T) {
 		}
 		if !st.ForgeRoot.Equals(committed) {
 			t.Fatalf("forge_root = %v, want committed root (stale op-root must be skipped)", st.ForgeRoot)
+		}
+	})
+
+	t.Run("retired segment keeps its row", func(t *testing.T) {
+		seq, err := r.NextSegmentSeq(ctx)
+		if err != nil {
+			t.Fatalf("NextSegmentSeq: %v", err)
+		}
+		bucket := fmt.Sprintf("rt-%d", seq)
+		sha := make([]byte, 32)
+		sha[0] = 0x5e
+		indexDigest := multihash.Multihash(digest)
+		now := time.Now().Unix()
+		if err := r.InsertSegmentOpen(ctx, blockstore.PlaneCatalog, seq, bucket); err != nil {
+			t.Fatalf("InsertSegmentOpen: %v", err)
+		}
+		if err := r.MarkSegmentSealed(ctx, blockstore.PlaneCatalog, seq, now, 10, sha,
+			[]blockstore.OpRoot{{Bucket: bucket, Root: liveCid(t, "rt-root")}}); err != nil {
+			t.Fatalf("MarkSegmentSealed: %v", err)
+		}
+		if err := r.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seq, now, indexDigest, nil); err != nil {
+			t.Fatalf("MarkSegmentShipped: %v", err)
+		}
+		for range 2 { // idempotent
+			if err := r.RetireSegment(ctx, blockstore.PlaneCatalog, seq, now); err != nil {
+				t.Fatalf("RetireSegment: %v", err)
+			}
+		}
+
+		live, err := r.ListSegments(ctx, blockstore.PlaneCatalog, bucket)
+		if err != nil || len(live) != 0 {
+			t.Fatalf("ListSegments = %+v (err %v), want none", live, err)
+		}
+		retired, err := r.ListRetiredSegments(ctx, blockstore.PlaneCatalog, bucket)
+		if err != nil || len(retired) != 1 {
+			t.Fatalf("ListRetiredSegments = %+v (err %v), want one row", retired, err)
+		}
+		got := retired[0]
+		if got.Seq != seq || got.RetiredAt != now || got.ShippedAt != now ||
+			!bytes.Equal(got.SHA256, sha) || !bytes.Equal(got.IndexDigest, indexDigest) {
+			t.Fatalf("retired row = %+v", got)
+		}
+		var opRoots int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM ingot.segment_op_roots WHERE seq = $1`,
+			int64(seq)).Scan(&opRoots); err != nil || opRoots != 0 {
+			t.Fatalf("op-root rows after retirement = %d (err %v), want 0", opRoots, err)
+		}
+		buckets, err := r.ListSegmentBuckets(ctx, blockstore.PlaneCatalog)
+		if err != nil {
+			t.Fatalf("ListSegmentBuckets: %v", err)
+		}
+		if slices.Contains(buckets, bucket) {
+			t.Fatalf("ListSegmentBuckets lists %q, which has only retired segments", bucket)
+		}
+
+		if err := r.DeleteSegment(ctx, blockstore.PlaneCatalog, seq); err != nil {
+			t.Fatalf("DeleteSegment: %v", err)
+		}
+		if retired, err := r.ListRetiredSegments(ctx, blockstore.PlaneCatalog, bucket); err != nil || len(retired) != 0 {
+			t.Fatalf("ListRetiredSegments after delete = %+v (err %v)", retired, err)
 		}
 	})
 }

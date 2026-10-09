@@ -75,6 +75,12 @@ type SegmentMeta struct {
 	// (the CAR + this index) — the registrations DeleteBucket must release.
 	IndexDigest multihash.Multihash
 
+	// RetiredAt is when retention unlinked this segment's files (unix
+	// seconds), or 0 while it is still on disk. A retired segment keeps its
+	// row: its blobs stay registered in the bucket's space until
+	// DeleteBucket releases them.
+	RetiredAt int64
+
 	// OpRoots are the per-batch (bucket, root) records. Populated only
 	// for catalog-plane segments — op-roots are MST roots.
 	OpRoots []blockstore.OpRoot
@@ -108,19 +114,28 @@ type Meta interface {
 	MarkSegmentShipped(ctx context.Context, plane blockstore.Plane, seq uint64, shippedAt int64, indexDigest multihash.Multihash, opRoots []blockstore.OpRoot) error
 
 	// DeleteSegment removes a segment row (cascades to op-root rows).
-	// Used by retention after the on-disk files are unlinked.
 	DeleteSegment(ctx context.Context, plane blockstore.Plane, seq uint64) error
 
-	// ListSegments returns every segment row for plane belonging to bucket
-	// (open + sealed) ordered by seq ascending, with op-roots hydrated.
-	// Recovery uses it to rebuild the read tier and re-enqueue unshipped
-	// segments.
+	// RetireSegment stamps retired_at on a segment row once its on-disk
+	// files are unlinked, and drops its op-root rows. The row itself stays:
+	// it is the record of the blobs the segment registered in the bucket's
+	// space, which DeleteBucket must release. Idempotent.
+	RetireSegment(ctx context.Context, plane blockstore.Plane, seq uint64, retiredAt int64) error
+
+	// ListSegments returns every unretired segment row for plane belonging
+	// to bucket (open + sealed) ordered by seq ascending, with op-roots
+	// hydrated. Recovery uses it to rebuild the read tier and re-enqueue
+	// unshipped segments.
 	ListSegments(ctx context.Context, plane blockstore.Plane, bucket string) ([]SegmentMeta, error)
 
+	// ListRetiredSegments returns every retired segment row for plane
+	// belonging to bucket, ordered by seq ascending, without op-roots.
+	ListRetiredSegments(ctx context.Context, plane blockstore.Plane, bucket string) ([]SegmentMeta, error)
+
 	// ListSegmentBuckets returns the distinct buckets that have at least
-	// one segment row for plane. The log manager's startup sweep uses it
-	// to re-open every bucket log with history, so unshipped segments
-	// re-enqueue without waiting for the bucket's next write.
+	// one unretired segment row for plane. The log manager's startup sweep
+	// uses it to re-open every bucket log with history, so unshipped
+	// segments re-enqueue without waiting for the bucket's next write.
 	ListSegmentBuckets(ctx context.Context, plane blockstore.Plane) ([]string, error)
 
 	// RehydrateSegment writes a segment row + its op-root rows from the

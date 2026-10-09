@@ -884,6 +884,7 @@ erDiagram
         bytea sha256
         bigint shipped_at
         bytea index_digest
+        bigint retired_at
     }
     segment_op_roots {
         bigint seq PK, FK
@@ -1013,7 +1014,7 @@ sequenceDiagram
         Note over B,U: the request's own proofs sign the release legs<br/>(s3:DeleteBucket delegates blob.Abort + blob.Remove)
     end
     B->>L: QuiesceBucketLog (stop flushes, wait for in-flight ship)
-    B->>L: ShippedSegmentDigests (each CAR + its index blob,<br/>sealed-but-unshipped over-listed, release is idempotent)
+    B->>L: ShippedSegmentDigests (each CAR + its index blob, retired<br/>segments included, sealed-but-unshipped over-listed,<br/>release is idempotent)
     loop each digest
         B->>U: /blob/remove (release the space's registration)
     end
