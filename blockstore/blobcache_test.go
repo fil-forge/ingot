@@ -414,3 +414,26 @@ func TestScanReadsLargeDirectoriesInChunks(t *testing.T) {
 		t.Fatalf("[files seen, correction, usage] = %v, want [%d %d %d]", got, walkChunk+10, -want, want)
 	}
 }
+
+// TestBlobCacheTakeReplacesACachedCopy: the same bytes stored as received
+// and written again reach the spool under the digest the cache already
+// holds; Take replaces the cached copy and the count stays exact.
+func TestBlobCacheTakeReplacesACachedCopy(t *testing.T) {
+	s, c := newTestDirs(t)
+	d := writeTestBlob(t, s, "hello")
+	if _, err := c.Take(s, d); err != nil {
+		t.Fatalf("Take: %v", err)
+	}
+	again := writeTestBlob(t, s, "hello")
+	if string(again) != string(d) {
+		t.Fatalf("second write stored under another digest")
+	}
+	n, err := c.Take(s, d)
+	if err != nil {
+		t.Fatalf("Take again: %v", err)
+	}
+	got := fmt.Sprint(n, s.Usage(), c.Usage())
+	if want := fmt.Sprint(5, 0, 5); got != want {
+		t.Fatalf("moved spool cache = %s, want %s", got, want)
+	}
+}

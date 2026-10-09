@@ -325,7 +325,7 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 	// Capture the superseded part's blobs (if any) before overwriting, so
 	// last-write-wins doesn't strand them. The session's other parts stay
 	// live; the release still checks for a sibling naming the same digest,
-	// though every write gets a fresh key and so a digest of its own. A
+	// which a session storing parts as received can have. A
 	// listing failure fails the upload: proceeding would silently strand the
 	// replaced part's blobs and key rows.
 	var superseded []mh.Multihash
@@ -742,7 +742,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 	for _, sp := range requested {
 		partStart := offset
 		for _, d := range sp.BlobDigests {
-			in, err := b.intents.GetIntent(ctx, d)
+			in, err := b.intents.GetIntent(ctx, bucketState.Space, d)
 			if err != nil {
 				return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: part blob %x: %w", d, err)
 			}
@@ -1017,7 +1017,7 @@ func (b *Backend) recordSessionReleases(ctx context.Context, space did.DID, uplo
 				continue
 			}
 			seen[string(d)] = true
-			in, err := b.intents.GetIntent(ctx, d)
+			in, err := b.intents.GetIntent(ctx, space, d)
 			switch {
 			case errors.Is(err, registry.ErrNotFound):
 				// Already released in full, intent and all.
@@ -1088,7 +1088,7 @@ func (b *Backend) parkBlobs(ctx context.Context, space did.DID, blobs []msbucket
 		}
 		seen[string(blob.Digest)] = true
 		if sb, ok := streamed[string(blob.Digest)]; ok {
-			if err := b.recordStreamedPark(ctx, blob, sb); err != nil {
+			if err := b.recordStreamedPark(ctx, space, blob, sb); err != nil {
 				return err
 			}
 			continue
@@ -1110,16 +1110,16 @@ func (b *Backend) parkBlob(ctx context.Context, space did.DID, blob msbucket.Blo
 	digest := blob.Digest
 	if existing, err := b.locations.GetLocation(ctx, space, blob.Digest); err == nil && existing != nil {
 		span.SetAttributes(attribute.String("ingot.blob.result", "already_stored"))
-		if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentAccepted); err != nil {
+		if err := b.intents.SetIntentState(ctx, space, blob.Digest, registry.IntentAccepted); err != nil {
 			return fmt.Errorf("mark accepted (dedup): %w", err)
 		}
-		b.cacheHeld(ctx, blob.Digest)
+		b.cacheHeld(ctx, space, blob.Digest)
 		// A located blob has no use for a park. One is still here only
 		// when an earlier Complete recorded the location and then failed
 		// before dropping the row. The part is durable regardless, so a
 		// failure here is logged rather than failing the write; Complete's
 		// dedup path drops the row otherwise.
-		if err := b.parks.DeletePark(ctx, blob.Digest); err != nil {
+		if err := b.parks.DeletePark(ctx, space, blob.Digest); err != nil {
 			b.logger.Warn("drop stale park row failed; Complete will retry",
 				zap.String("digest", hex.EncodeToString(blob.Digest)), zap.Error(err))
 		}
@@ -1127,22 +1127,22 @@ func (b *Backend) parkBlob(ctx context.Context, space did.DID, blob msbucket.Blo
 	} else if err != nil && !errors.Is(err, registry.ErrNotFound) {
 		return fmt.Errorf("lookup location: %w", err)
 	}
-	if _, err := b.parks.GetPark(ctx, blob.Digest); err == nil {
+	if _, err := b.parks.GetPark(ctx, space, blob.Digest); err == nil {
 		span.SetAttributes(attribute.String("ingot.blob.result", "already_parked"))
-		return nil // already parked (defensive: every write gets its own digest)
+		return nil // already parked by another part or session of the space
 	} else if !errors.Is(err, registry.ErrNotFound) {
 		return fmt.Errorf("lookup park: %w", err)
 	}
 
 	// The uploaded bytes are the spooled envelope; the intent records
 	// their (ciphertext) count, not the blob's plaintext span.
-	in, err := b.intents.GetIntent(ctx, digest)
+	in, err := b.intents.GetIntent(ctx, space, digest)
 	if err != nil {
 		return fmt.Errorf("lookup intent: %w", err)
 	}
 	span.SetAttributes(attribute.Int64("ingot.blob.bytes", in.Size))
 	// The blob may be on the network from here on (see IntentUploading).
-	if err := b.intents.SetIntentState(ctx, digest, registry.IntentUploading); err != nil {
+	if err := b.intents.SetIntentState(ctx, space, digest, registry.IntentUploading); err != nil {
 		return fmt.Errorf("mark uploading: %w", err)
 	}
 	res, err := b.deferred.UploadBlob(ctx, space, digest, in.Size, b.spool.Path(digest), uploader.WithConclude(false))
@@ -1163,16 +1163,17 @@ func (b *Backend) parkBlob(ctx context.Context, space did.DID, blob msbucket.Blo
 		}); err != nil {
 			return fmt.Errorf("record location: %w", err)
 		}
-		if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentAccepted); err != nil {
+		if err := b.intents.SetIntentState(ctx, space, blob.Digest, registry.IntentAccepted); err != nil {
 			return fmt.Errorf("mark accepted: %w", err)
 		}
-		b.cacheHeld(ctx, blob.Digest)
+		b.cacheHeld(ctx, space, blob.Digest)
 		return nil
 	}
 	// Location == nil ⇔ parked: durable on the provider with accept
 	// deferred — persist the conclude state for Complete/Abort.
 	span.SetAttributes(attribute.String("ingot.blob.result", "parked"))
 	if err := b.parks.PutPark(ctx, registry.BlobPark{
+		Space:         space,
 		Digest:        blob.Digest,
 		AddTask:       res.AddTask.Bytes(),
 		AcceptTask:    res.AcceptTask.Bytes(),
@@ -1181,16 +1182,16 @@ func (b *Backend) parkBlob(ctx context.Context, space did.DID, blob msbucket.Blo
 	}); err != nil {
 		return fmt.Errorf("record park: %w", err)
 	}
-	if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentParked); err != nil {
+	if err := b.intents.SetIntentState(ctx, space, blob.Digest, registry.IntentParked); err != nil {
 		return fmt.Errorf("mark parked: %w", err)
 	}
-	b.dropParkedCopy(ctx, blob.Digest)
+	b.dropParkedCopy(ctx, space, blob.Digest)
 	return nil
 }
 
 // recordStreamedPark records the park a streamed blob left on its provider,
 // traced as a blob.park span like parkBlob.
-func (b *Backend) recordStreamedPark(ctx context.Context, blob msbucket.BlobRef, sb uploader.StreamedBlob) (err error) {
+func (b *Backend) recordStreamedPark(ctx context.Context, space did.DID, blob msbucket.BlobRef, sb uploader.StreamedBlob) (err error) {
 	ctx, span := tracing.Start(ctx, "blob.park",
 		attribute.String("ingot.blob.result", "streamed"),
 		attribute.Int64("ingot.blob.bytes", sb.Size),
@@ -1199,6 +1200,7 @@ func (b *Backend) recordStreamedPark(ctx context.Context, blob msbucket.BlobRef,
 
 	parked := sb.Parked(blob.Digest)
 	if err := b.parks.PutPark(ctx, registry.BlobPark{
+		Space:         space,
 		Digest:        blob.Digest,
 		AddTask:       parked.AddTask.Bytes(),
 		AcceptTask:    parked.AcceptTask.Bytes(),
@@ -1207,38 +1209,28 @@ func (b *Backend) recordStreamedPark(ctx context.Context, blob msbucket.BlobRef,
 	}); err != nil {
 		return fmt.Errorf("record park: %w", err)
 	}
-	if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentParked); err != nil {
+	if err := b.intents.SetIntentState(ctx, space, blob.Digest, registry.IntentParked); err != nil {
 		return fmt.Errorf("mark parked: %w", err)
 	}
 	b.finishStream(ctx, sb)
-	b.dropParkedCopy(ctx, blob.Digest)
+	b.dropParkedCopy(ctx, space, blob.Digest)
 	return nil
 }
 
-// dropParkedCopy removes a parked blob's spool copy. Unlike a release, it
-// checks no other reference to the digest: it relies on every written blob
-// having its own digest (a fresh content key per blob), so no other part,
-// session or object can be using the same file. Nothing reads it again:
-// Complete concludes the blob from its park row, Abort and the session
-// sweeper unwind it through the same row, and the object's reads go to the
-// provider once Complete records the location. The blob is durable on the
-// provider, so a failed remove costs only disk: it is logged, and the file
-// waits for the spool sweeper to evict it, if a budget is set, or for a
-// release of the blob: the session's if the part is aborted, superseded or
-// expires, its object's once Complete commits it. A failure to mark the
-// intent evicted only leaves the sweeper to find the file gone and mark it.
-func (b *Backend) dropParkedCopy(ctx context.Context, digest mh.Multihash) {
-	freed, err := b.removeLocal(digest)
-	if err != nil {
-		b.logger.Warn("drop parked blob's spool copy failed; it stays until the spool sweeper evicts it or the blob's release",
-			zap.String("digest", hex.EncodeToString(digest)), zap.Error(err))
-		return
-	}
-	b.localBlobMetrics.removedFile(ctx, removedParked, freed)
-	if err := b.intents.MarkEvicted(ctx, digest); err != nil && !errors.Is(err, registry.ErrNotFound) {
-		b.logger.Warn("mark parked blob evicted failed",
-			zap.String("digest", hex.EncodeToString(digest)), zap.Error(err))
-	}
+// dropParkedCopy removes a parked blob's spool copy. Within the space,
+// nothing reads it again: Complete concludes the blob from its park row,
+// Abort and the session sweeper unwind it through the same row, and the
+// object's reads go to the provider once Complete records the location. A
+// part, session or object of the same space naming the same digest shares
+// the park. Another space holding an intent for the digest keeps the file
+// (see dropLocalCopy). The blob is durable on the provider, so a failed
+// remove costs only disk: it is logged, and the file waits for the spool
+// sweeper to evict it, if a budget is set, or for a release of the blob: the
+// session's if the part is aborted, superseded or expires, its object's once
+// Complete commits it. A failure to mark the intent evicted only leaves the
+// sweeper to find the file gone and mark it.
+func (b *Backend) dropParkedCopy(ctx context.Context, space did.DID, digest mh.Multihash) {
+	b.dropLocalCopy(ctx, space, digest, removedParked)
 }
 
 // concludeBlobs is Complete's park-aware counterpart to uploadBlobs: located
@@ -1261,8 +1253,7 @@ func (b *Backend) concludeBlobs(ctx context.Context, space did.DID, blobs []msbu
 		toConclude []pending
 		toUpload   []msbucket.BlobRef
 	)
-	// Conclude each digest once. Every write gets a fresh key, so a digest
-	// does not repeat across parts today; the check is defensive.
+	// Conclude each digest once: parts stored as received can repeat one.
 	seen := make(map[string]bool, len(blobs))
 	for _, blob := range blobs {
 		if seen[string(blob.Digest)] {
@@ -1271,15 +1262,15 @@ func (b *Backend) concludeBlobs(ctx context.Context, space did.DID, blobs []msbu
 		seen[string(blob.Digest)] = true
 
 		if existing, err := b.locations.GetLocation(ctx, space, blob.Digest); err == nil && existing != nil {
-			if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentAccepted); err != nil {
+			if err := b.intents.SetIntentState(ctx, space, blob.Digest, registry.IntentAccepted); err != nil {
 				return fmt.Errorf("mark accepted (dedup): %w", err)
 			}
-			b.cacheHeld(ctx, blob.Digest)
+			b.cacheHeld(ctx, space, blob.Digest)
 			// A located blob has no use for a park. One is still here only
 			// when an earlier Complete recorded the location and then failed
 			// before marking the intent or dropping the row; this is where
 			// that row gets its retry.
-			if err := b.parks.DeletePark(ctx, blob.Digest); err != nil {
+			if err := b.parks.DeletePark(ctx, space, blob.Digest); err != nil {
 				return fmt.Errorf("drop park (dedup): %w", err)
 			}
 			continue
@@ -1287,7 +1278,7 @@ func (b *Backend) concludeBlobs(ctx context.Context, space did.DID, blobs []msbu
 			return fmt.Errorf("lookup location: %w", err)
 		}
 
-		park, err := b.parks.GetPark(ctx, blob.Digest)
+		park, err := b.parks.GetPark(ctx, space, blob.Digest)
 		if err != nil && !errors.Is(err, registry.ErrNotFound) {
 			return fmt.Errorf("lookup park: %w", err)
 		}
@@ -1352,7 +1343,7 @@ func (b *Backend) concludeBlobs(ctx context.Context, space did.DID, blobs []msbu
 			// The sealed put invocation is spent — drop it promptly. A row
 			// that survives this failure is dropped by the next Complete's
 			// dedup path or by the sweeper, whichever comes first.
-			if derr := b.parks.DeletePark(ctx, p.blob.Digest); derr != nil {
+			if derr := b.parks.DeletePark(ctx, space, p.blob.Digest); derr != nil {
 				errs = append(errs, fmt.Errorf("drop park: %w", derr))
 			}
 		}
@@ -1366,12 +1357,12 @@ func (b *Backend) concludeBlobs(ctx context.Context, space did.DID, blobs []msbu
 
 	// Never parked: the spooled copy drives the whole synchronous upload.
 	for _, blob := range toUpload {
-		in, err := b.intents.GetIntent(ctx, blob.Digest)
+		in, err := b.intents.GetIntent(ctx, space, blob.Digest)
 		if err != nil {
 			return fmt.Errorf("lookup intent: %w", err)
 		}
 		// The blob may be on the network from here on (see IntentUploading).
-		if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentUploading); err != nil {
+		if err := b.intents.SetIntentState(ctx, space, blob.Digest, registry.IntentUploading); err != nil {
 			return fmt.Errorf("mark uploading: %w", err)
 		}
 		res, err := b.uploader.UploadBlob(ctx, space, blob.Digest, in.Size, b.spool.Path(blob.Digest))
@@ -1408,10 +1399,10 @@ func (b *Backend) recordAccepted(ctx context.Context, space did.DID, digest mh.M
 	}); err != nil {
 		return fmt.Errorf("record location: %w", err)
 	}
-	if err := b.intents.SetIntentState(ctx, digest, registry.IntentAccepted); err != nil {
+	if err := b.intents.SetIntentState(ctx, space, digest, registry.IntentAccepted); err != nil {
 		return fmt.Errorf("mark accepted: %w", err)
 	}
-	b.cacheHeld(ctx, digest)
+	b.cacheHeld(ctx, space, digest)
 	return nil
 }
 

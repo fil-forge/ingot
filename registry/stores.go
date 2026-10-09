@@ -76,8 +76,13 @@ type BlobClaim struct {
 }
 
 // UploadIntent is one row of ingot.upload_intents: a blob Ingot holds on
-// disk, with its lifecycle state. Keyed globally by Digest.
+// disk, with its lifecycle state for one space. Keyed by (Space, Digest): a
+// blob stored as received has the digest of its bytes, so the same bytes
+// written to two spaces are one spool file and two intents, each tracking
+// its own space's upload. The file is shared, so it may go only when no
+// intent for the digest still needs it (see ListEvictable, CountOtherIntents).
 type UploadIntent struct {
+	Space  did.DID
 	Digest multihash.Multihash
 	// LocalPath is where the blob was written: its spool path. Once the
 	// provider holds the blob its copy may move to the cache, so nothing
@@ -98,11 +103,12 @@ type StalledSizes struct {
 	Spooled, Uploading int64
 }
 
-// EvictCursor is a position in ListEvictable's (updated_at, digest) order.
-// The zero value starts at the beginning.
+// EvictCursor is a position in ListEvictable's (updated_at, digest, space)
+// order. The zero value starts at the beginning.
 type EvictCursor struct {
 	UpdatedAt time.Time
 	Digest    multihash.Multihash
+	Space     did.DID
 }
 
 // BlobLocation is one row of ingot.blob_locations: where a blob can be
@@ -259,8 +265,8 @@ type MultipartPart struct {
 // remove(digest) (physical reclamation when the count reaches zero).
 type BlobRefStore interface {
 	// AddBlobClaim records an object version's claim on a digest and, in the
-	// same transaction, marks the digest's upload intent published (see
-	// IntentPublished). Idempotent.
+	// same transaction, marks the space's upload intent for the digest
+	// published (see IntentPublished). Idempotent.
 	AddBlobClaim(ctx context.Context, claim BlobClaim) error
 	// PinBlobClaims is AddBlobClaim for digests borrowed from another object
 	// of the same space (a same-space copy pins the source's body). Each
@@ -316,9 +322,9 @@ type PendingReleaseStore interface {
 	// owed) before asking hilt to delete the space.
 	ListReleasesBySpace(ctx context.Context, space did.DID) ([]PendingRelease, error)
 	DeleteRelease(ctx context.Context, space did.DID, digest multihash.Multihash) error
-	// DeleteIntentAndRelease removes a blob's upload intent and this
-	// release's record in one transaction — the last step of releasing a
-	// blob. The two must go together: the intent
+	// DeleteIntentAndRelease removes the space's upload intent for the blob
+	// and this release's record in one transaction — the last step of
+	// releasing a blob. The two must go together: the intent
 	// is the only evidence of how far the blob ever got, and a record that
 	// outlived it would leave the retry to read a blob with no rows and no
 	// intent, owing a network remove that a never-uploaded blob has no
@@ -331,48 +337,55 @@ type PendingReleaseStore interface {
 // and their lifecycle state. Drives read-after-write, cache lookup, spool
 // eviction, and crash recovery.
 type IntentStore interface {
-	// PutIntent upserts an intent. A digest spooled again is on disk again,
-	// so PutIntent also clears the evicted mark.
+	// PutIntent upserts the (Space, Digest) intent. A digest spooled again is
+	// on disk again, so PutIntent also clears the evicted mark, on every
+	// intent for the digest: the file is one.
 	PutIntent(ctx context.Context, in UploadIntent) error
-	// SetIntentState moves an intent to state. UpdatedAt records the last
-	// state change, which orders eviction, so setting the state an intent
-	// already has (a retry) leaves it alone.
-	SetIntentState(ctx context.Context, digest multihash.Multihash, state string) error
-	GetIntent(ctx context.Context, digest multihash.Multihash) (*UploadIntent, error)
+	// SetIntentState moves the space's intent for digest to state. UpdatedAt
+	// records the last state change, which orders eviction, so setting the
+	// state an intent already has (a retry) leaves it alone.
+	SetIntentState(ctx context.Context, space did.DID, digest multihash.Multihash, state string) error
+	GetIntent(ctx context.Context, space did.DID, digest multihash.Multihash) (*UploadIntent, error)
 	ListIntentsByState(ctx context.Context, state string) ([]UploadIntent, error)
-	DeleteIntent(ctx context.Context, digest multihash.Multihash) error
+	DeleteIntent(ctx context.Context, space did.DID, digest multihash.Multihash) error
+	// CountOtherIntents returns how many spaces other than space hold an
+	// intent for digest. Zero means the local file is this space's alone to
+	// remove; otherwise another space's upload or read may still use it,
+	// and its removal is left to that space's release or to eviction.
+	CountOtherIntents(ctx context.Context, space did.DID, digest multihash.Multihash) (int, error)
 	// ListEvictable returns intents whose spool file the provider already
 	// holds a copy of and that are not marked evicted: 'accepted' or
-	// 'published' with a blob_locations row for the digest in any space, or
-	// 'parked' with a blob_parks row. The state alone is not enough: a
-	// release drops the location before the intent, and a failure between
-	// the two leaves an accepted intent with none. A location in
-	// any space qualifies only because a digest belongs to one space: each
-	// write encrypts under a fresh key bound to its space, so no two spaces
-	// upload the same digest. Ordered by (UpdatedAt, Digest), starting after
-	// the cursor, at most limit rows.
+	// 'published' with a blob_locations row for the intent's space and
+	// digest, or 'parked' with a blob_parks row for them. The state alone is
+	// not enough: a release drops the location before the intent, and a
+	// failure between the two leaves an accepted intent with none. The file
+	// is shared by every space's intent for the digest, so a digest with an
+	// intent still 'spooled' or 'uploading' in any space is not listed: that
+	// upload reads the file. Ordered by (UpdatedAt, Digest, Space), starting
+	// after the cursor, at most limit rows.
 	ListEvictable(ctx context.Context, after EvictCursor, limit int) ([]UploadIntent, error)
-	// MarkEvicted records that the digest's spool file is gone, leaving
-	// State and UpdatedAt alone. Returns ErrNotFound when the intent is gone
-	// (a release got there first).
+	// MarkEvicted records that the digest's spool file is gone, on every
+	// intent for the digest, leaving State and UpdatedAt alone. Returns
+	// ErrNotFound when no intent is left (a release got there first).
 	MarkEvicted(ctx context.Context, digest multihash.Multihash) error
 	// MissingIntents returns the digests among digests that have no intent
-	// row, for the sweeper's orphan-file pass.
+	// row in any space, for the sweeper's orphan-file pass.
 	MissingIntents(ctx context.Context, digests []multihash.Multihash) ([]multihash.Multihash, error)
 	// ListReleasedPublished returns up to limit published intents that
 	// nothing names any more: no location, claim, pending release or part of
-	// an open or completing multipart session has the digest. Those are
-	// committed blobs whose release finished while releases still kept the
-	// local copy and the intent; the startup released pass deletes both.
-	// Ordered by digest, starting after the digest after (nil starts at the
-	// beginning), so a caller pages through rather than re-scanning.
+	// an open or completing multipart session has the digest, in any space,
+	// and no other space holds an intent for it. Those are committed blobs
+	// whose release finished while releases still kept the local copy and
+	// the intent; the startup released pass deletes both. Each digest listed
+	// has that one intent. Ordered by digest, starting after the digest
+	// after (nil starts at the beginning), so a caller pages through rather
+	// than re-scanning.
 	ListReleasedPublished(ctx context.Context, after multihash.Multihash, limit int) ([]UploadIntent, error)
-	// DeleteReleasedPublished deletes digest's intent if it still meets
-	// ListReleasedPublished's conditions, and reports whether it did. The
-	// check and the delete are one statement, so a digest named again since
-	// it was listed keeps its intent. (Every write has a digest of its own,
-	// so that should not happen; this keeps the pass safe if it ever does.)
-	DeleteReleasedPublished(ctx context.Context, digest multihash.Multihash) (bool, error)
+	// DeleteReleasedPublished deletes the space's intent for digest if it
+	// still meets ListReleasedPublished's conditions, and reports whether it
+	// did. The check and the delete are one statement, so a digest named
+	// again since it was listed keeps its intent.
+	DeleteReleasedPublished(ctx context.Context, space did.DID, digest multihash.Multihash) (bool, error)
 	// StalledBytes sums the sizes of 'spooled' and 'uploading' intents whose
 	// state last changed before before, by state: bodies whose upload has
 	// outlasted any live request, which nothing reclaims.
@@ -420,9 +433,11 @@ type EncryptionParamsStore interface {
 // conclude, §7.2). AddTask/AcceptTask are the /blob/add and
 // /blob/accept task CIDs; PutInvocation is the sealed /http/put invocation
 // whose metadata carries the derived signer keys needed to conclude —
-// sensitive, deleted at conclude/abort. Keyed globally by Digest (like
-// upload_intents: content-addressed dedup shares parks across sessions).
+// sensitive, deleted at conclude/abort. Keyed by (Space, Digest), like
+// upload_intents: the allocation it records is the space's, so another
+// space parking the same bytes allocates and parks its own.
 type BlobPark struct {
+	Space         did.DID
 	Digest        multihash.Multihash
 	AddTask       []byte // cid bytes
 	AcceptTask    []byte // cid bytes
@@ -435,9 +450,9 @@ type BlobPark struct {
 // Complete/Abort (§7.2).
 type ParkStore interface {
 	PutPark(ctx context.Context, p BlobPark) error
-	// GetPark returns ErrNotFound when digest has no park row.
-	GetPark(ctx context.Context, digest multihash.Multihash) (*BlobPark, error)
-	DeletePark(ctx context.Context, digest multihash.Multihash) error
+	// GetPark returns ErrNotFound when the space has no park row for digest.
+	GetPark(ctx context.Context, space did.DID, digest multihash.Multihash) (*BlobPark, error)
+	DeletePark(ctx context.Context, space did.DID, digest multihash.Multihash) error
 	// HasParkFor reports whether a park row records the /blob/add task
 	// addTask (cid bytes).
 	HasParkFor(ctx context.Context, addTask []byte) (bool, error)
@@ -521,13 +536,15 @@ type MultipartStore interface {
 	// digest — the shared-blob guard for abort/supersede spool cleanup
 	// (content-addressed part blobs may be deduped across sessions).
 	CountPartRefs(ctx context.Context, digest multihash.Multihash, excludeUploadID string) (int, error)
-	// CountLivePartRefs returns how many parts of in-flight sessions (open or
-	// completing) reference digest: the guard a deferred release checks
-	// before taking a blob a session still means to claim. Parts of completed
-	// and aborting sessions do not count — a completed session's winners hold
-	// claims and its orphans have releases of their own, and an aborting
-	// session is recording releases for its parts.
-	CountLivePartRefs(ctx context.Context, digest multihash.Multihash) (int, error)
+	// CountLivePartRefs returns how many parts of space's in-flight sessions
+	// (open or completing) reference digest: the guard a deferred release
+	// checks before taking a blob a session still means to claim. Parts of
+	// completed and aborting sessions do not count — a completed session's
+	// winners hold claims and its orphans have releases of their own, and an
+	// aborting session is recording releases for its parts. Another space's
+	// sessions do not count either: a release is one space's, and the same
+	// bytes in another space are that space's own blob.
+	CountLivePartRefs(ctx context.Context, space did.DID, digest multihash.Multihash) (int, error)
 }
 
 // GCStore records superseded MST node CIDs (§4). Write-only this iteration.

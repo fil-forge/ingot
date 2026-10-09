@@ -82,7 +82,7 @@ func TestCompleteConcludesPartsInOneCall(t *testing.T) {
 
 	// Every part blob is accepted, and its park is gone.
 	for _, d := range digests {
-		in, err := mem.GetIntent(ctx, d)
+		in, err := mem.IntentByDigest(ctx, d)
 		if err != nil {
 			t.Fatalf("intent for %x: %v", d, err)
 		}
@@ -90,7 +90,7 @@ func TestCompleteConcludesPartsInOneCall(t *testing.T) {
 		if in.State != registry.IntentPublished {
 			t.Errorf("blob %x intent = %v, want published", d, in.State)
 		}
-		if _, err := mem.GetPark(ctx, d); err == nil {
+		if _, err := mem.ParkByDigest(ctx, d); err == nil {
 			t.Errorf("park row for %x survived the conclude", d)
 		}
 	}

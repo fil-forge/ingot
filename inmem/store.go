@@ -60,12 +60,12 @@ type MemStore struct {
 	// mirroring the Postgres tables so the in-process suite exercises the
 	// same code paths. See stores.go for the methods over these.
 	blobRefs   map[claimKey]registry.BlobClaim
-	intents    map[string]registry.UploadIntent          // keyed by string(digest)
-	evicted    map[string]struct{}                       // upload_intents.evicted_at IS NOT NULL, keyed by string(digest)
+	intents    map[locKey]registry.UploadIntent          // keyed by (space, digest)
+	evicted    map[string]struct{}                       // upload_intents.evicted_at IS NOT NULL, keyed by string(digest): the file is one for every space
 	locations  map[locKey]registry.BlobLocation          // keyed by (space, digest)
 	encParams  map[locKey]registry.BlobEncryptionParams  // keyed by (space, digest)
 	inclusions map[locKey]registry.BlobInclusion         // keyed by (space, digest)
-	parks      map[string]registry.BlobPark              // keyed by string(digest)
+	parks      map[locKey]registry.BlobPark              // keyed by (space, digest)
 	streams    map[string]registry.BlobStream            // keyed by string(add task)
 	sessions   map[string]registry.MultipartSession      // keyed by uploadID
 	parts      map[string]map[int]registry.MultipartPart // uploadID -> partNumber -> part
@@ -79,8 +79,9 @@ type MemStore struct {
 }
 
 // claimKey / locKey are the composite map keys for the blob_refs and the
-// (space, digest)-keyed tables — blob_locations, blob_encryption_params and
-// shard_inclusions (digest bytes carried as a string for comparability).
+// (space, digest)-keyed tables — upload_intents, blob_locations,
+// blob_encryption_params, shard_inclusions, blob_parks and
+// blob_release_intents (digest bytes carried as a string for comparability).
 type claimKey struct {
 	digest, bucket, objectKey, versionID string
 }
@@ -97,12 +98,12 @@ func NewMemStore() *MemStore {
 		segments:   map[uint64]*logstore.SegmentMeta{},
 		verSeqs:    map[string]uint64{},
 		blobRefs:   map[claimKey]registry.BlobClaim{},
-		intents:    map[string]registry.UploadIntent{},
+		intents:    map[locKey]registry.UploadIntent{},
 		evicted:    map[string]struct{}{},
 		locations:  map[locKey]registry.BlobLocation{},
 		encParams:  map[locKey]registry.BlobEncryptionParams{},
 		inclusions: map[locKey]registry.BlobInclusion{},
-		parks:      map[string]registry.BlobPark{},
+		parks:      map[locKey]registry.BlobPark{},
 		streams:    map[string]registry.BlobStream{},
 		sessions:   map[string]registry.MultipartSession{},
 		parts:      map[string]map[int]registry.MultipartPart{},

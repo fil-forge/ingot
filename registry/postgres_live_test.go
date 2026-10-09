@@ -147,19 +147,19 @@ func TestPostgresStores_Live(t *testing.T) {
 		// A claim publishes the digest's upload intent, and the state stays
 		// once the claims are gone: it is the durable mark of a committed blob.
 		pubDigest := multihash.Multihash([]byte{0x12, 0x20, 0xc1, 0xa1})
-		if err := r.PutIntent(ctx, registry.UploadIntent{Digest: pubDigest, LocalPath: "/spool/x", Size: 1, State: registry.IntentAccepted, Bucket: "b"}); err != nil {
+		if err := r.PutIntent(ctx, registry.UploadIntent{Space: space, Digest: pubDigest, LocalPath: "/spool/x", Size: 1, State: registry.IntentAccepted, Bucket: "b"}); err != nil {
 			t.Fatalf("PutIntent: %v", err)
 		}
 		if err := r.AddBlobClaim(ctx, registry.BlobClaim{Digest: pubDigest, Bucket: "b", ObjectKey: "kp", VersionID: registry.NullVersionID, Space: space}); err != nil {
 			t.Fatalf("AddBlobClaim (publish): %v", err)
 		}
-		if in, err := r.GetIntent(ctx, pubDigest); err != nil || in.State != registry.IntentPublished {
+		if in, err := r.GetIntent(ctx, space, pubDigest); err != nil || in.State != registry.IntentPublished {
 			t.Fatalf("intent after claim = %+v, err %v (want published)", in, err)
 		}
 		if err := r.DeleteBlobClaim(ctx, pubDigest, "b", "kp", registry.NullVersionID); err != nil {
 			t.Fatalf("DeleteBlobClaim (publish): %v", err)
 		}
-		if in, err := r.GetIntent(ctx, pubDigest); err != nil || in.State != registry.IntentPublished {
+		if in, err := r.GetIntent(ctx, space, pubDigest); err != nil || in.State != registry.IntentPublished {
 			t.Fatalf("intent after the claim dropped = %+v, err %v (want still published)", in, err)
 		}
 		// A claim on a digest with no intent row (a shipped segment) is fine.
@@ -306,7 +306,7 @@ func TestPostgresStores_Live(t *testing.T) {
 	t.Run("delete intent and release record atomically", func(t *testing.T) {
 		space := testutil.RandomDID(t)
 		d := multihash.Multihash([]byte{0x12, 0x20, 0xda, 0x01})
-		if err := r.PutIntent(ctx, registry.UploadIntent{Digest: d, LocalPath: "/spool/d", Size: 3, State: registry.IntentSpooled, Bucket: "b"}); err != nil {
+		if err := r.PutIntent(ctx, registry.UploadIntent{Space: space, Digest: d, LocalPath: "/spool/d", Size: 3, State: registry.IntentSpooled, Bucket: "b"}); err != nil {
 			t.Fatalf("PutIntent: %v", err)
 		}
 		if err := r.EnqueueRelease(ctx, space, d, time.Now()); err != nil {
@@ -315,7 +315,7 @@ func TestPostgresStores_Live(t *testing.T) {
 		if err := r.DeleteIntentAndRelease(ctx, space, d); err != nil {
 			t.Fatalf("DeleteIntentAndRelease: %v", err)
 		}
-		if _, err := r.GetIntent(ctx, d); err != registry.ErrNotFound {
+		if _, err := r.GetIntent(ctx, space, d); err != registry.ErrNotFound {
 			t.Fatalf("intent after the paired delete = %v, want ErrNotFound", err)
 		}
 		if rows, _ := r.ListReleasesBySpace(ctx, space); len(rows) != 0 {
@@ -328,16 +328,17 @@ func TestPostgresStores_Live(t *testing.T) {
 	})
 
 	t.Run("intent lifecycle", func(t *testing.T) {
-		if err := r.PutIntent(ctx, registry.UploadIntent{Digest: digest, LocalPath: "/spool/x", Size: 9, State: registry.IntentSpooled, Bucket: "b"}); err != nil {
+		space := testutil.RandomDID(t)
+		if err := r.PutIntent(ctx, registry.UploadIntent{Space: space, Digest: digest, LocalPath: "/spool/x", Size: 9, State: registry.IntentSpooled, Bucket: "b"}); err != nil {
 			t.Fatalf("PutIntent: %v", err)
 		}
-		if err := r.SetIntentState(ctx, digest, registry.IntentUploading); err != nil {
+		if err := r.SetIntentState(ctx, space, digest, registry.IntentUploading); err != nil {
 			t.Fatalf("SetIntentState (uploading, the constraint admits it): %v", err)
 		}
-		if err := r.SetIntentState(ctx, digest, registry.IntentParked); err != nil {
+		if err := r.SetIntentState(ctx, space, digest, registry.IntentParked); err != nil {
 			t.Fatalf("SetIntentState: %v", err)
 		}
-		got, err := r.GetIntent(ctx, digest)
+		got, err := r.GetIntent(ctx, space, digest)
 		if err != nil || got.State != registry.IntentParked || got.Bucket != "b" {
 			t.Fatalf("GetIntent = %+v, err %v", got, err)
 		}
@@ -345,13 +346,13 @@ func TestPostgresStores_Live(t *testing.T) {
 		if len(parked) != 1 {
 			t.Fatalf("parked = %d, want 1", len(parked))
 		}
-		if err := r.SetIntentState(ctx, []byte("missing"), registry.IntentParked); err != registry.ErrNotFound {
+		if err := r.SetIntentState(ctx, space, []byte("missing"), registry.IntentParked); err != registry.ErrNotFound {
 			t.Fatalf("SetIntentState missing = %v, want ErrNotFound", err)
 		}
-		if err := r.DeleteIntent(ctx, digest); err != nil {
+		if err := r.DeleteIntent(ctx, space, digest); err != nil {
 			t.Fatalf("DeleteIntent: %v", err)
 		}
-		if _, err := r.GetIntent(ctx, digest); err != registry.ErrNotFound {
+		if _, err := r.GetIntent(ctx, space, digest); err != registry.ErrNotFound {
 			t.Fatalf("GetIntent after delete = %v, want ErrNotFound", err)
 		}
 	})
@@ -501,7 +502,9 @@ func TestPostgresStores_Live(t *testing.T) {
 	})
 
 	t.Run("park round trip", func(t *testing.T) {
+		space := testutil.RandomDID(t)
 		park := registry.BlobPark{
+			Space:         space,
 			Digest:        digest,
 			AddTask:       []byte{0x01, 0x02},
 			AcceptTask:    []byte{0x03, 0x04},
@@ -511,7 +514,7 @@ func TestPostgresStores_Live(t *testing.T) {
 		if err := r.PutPark(ctx, park); err != nil {
 			t.Fatalf("PutPark: %v", err)
 		}
-		got, err := r.GetPark(ctx, digest)
+		got, err := r.GetPark(ctx, space, digest)
 		if err != nil || string(got.PutInvocation) != "sealed-inv" || got.Size != 42 {
 			t.Fatalf("GetPark = %+v, err %v", got, err)
 		}
@@ -520,7 +523,7 @@ func TestPostgresStores_Live(t *testing.T) {
 		if err := r.PutPark(ctx, park); err != nil {
 			t.Fatalf("PutPark (upsert): %v", err)
 		}
-		if got, err := r.GetPark(ctx, digest); err != nil || got.Size != 43 {
+		if got, err := r.GetPark(ctx, space, digest); err != nil || got.Size != 43 {
 			t.Fatalf("GetPark after upsert = %+v, err %v", got, err)
 		}
 		if parked, err := r.HasParkFor(ctx, park.AddTask); err != nil || !parked {
@@ -529,10 +532,10 @@ func TestPostgresStores_Live(t *testing.T) {
 		if parked, err := r.HasParkFor(ctx, []byte{0x09}); err != nil || parked {
 			t.Fatalf("HasParkFor(another add task) = %v, %v", parked, err)
 		}
-		if err := r.DeletePark(ctx, digest); err != nil {
+		if err := r.DeletePark(ctx, space, digest); err != nil {
 			t.Fatalf("DeletePark: %v", err)
 		}
-		if _, err := r.GetPark(ctx, digest); err != registry.ErrNotFound {
+		if _, err := r.GetPark(ctx, space, digest); err != registry.ErrNotFound {
 			t.Fatalf("GetPark after delete = %v, want ErrNotFound", err)
 		}
 	})
@@ -725,7 +728,7 @@ func TestPostgresStores_Live(t *testing.T) {
 		}
 
 		// CountLivePartRefs: parts of open sessions count.
-		if n, err := r.CountLivePartRefs(ctx, shared); err != nil || n != 2 {
+		if n, err := r.CountLivePartRefs(ctx, lsSpace, shared); err != nil || n != 2 {
 			t.Fatalf("CountLivePartRefs(shared) = %d, err %v (want 2)", n, err)
 		}
 
@@ -746,13 +749,13 @@ func TestPostgresStores_Live(t *testing.T) {
 		}
 		// A completed session's parts are no longer live; an aborting one's
 		// are not either.
-		if n, err := r.CountLivePartRefs(ctx, shared); err != nil || n != 1 {
+		if n, err := r.CountLivePartRefs(ctx, lsSpace, shared); err != nil || n != 1 {
 			t.Fatalf("CountLivePartRefs(shared) after ls-1 completed = %d, err %v (want 1)", n, err)
 		}
 		if won, err := r.LatchSession(ctx, "ls-2", registry.SessionOpen, registry.SessionAborting); err != nil || !won {
 			t.Fatalf("latch ls-2 to aborting won=%v err=%v", won, err)
 		}
-		if n, err := r.CountLivePartRefs(ctx, shared); err != nil || n != 0 {
+		if n, err := r.CountLivePartRefs(ctx, lsSpace, shared); err != nil || n != 0 {
 			t.Fatalf("CountLivePartRefs(shared) after ls-2 aborting = %d, err %v (want 0)", n, err)
 		}
 

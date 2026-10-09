@@ -439,6 +439,7 @@ func (b *Backend) splitSpool(ctx context.Context, bucket string, space did.DID, 
 			state = registry.IntentUploading
 		}
 		if err := b.intents.PutIntent(ctx, registry.UploadIntent{
+			Space:     space,
 			Digest:    blob.Digest,
 			LocalPath: b.spool.Path(blob.Digest),
 			Size:      storedSize,
@@ -540,17 +541,17 @@ func (b *Backend) uploadBlob(ctx context.Context, space did.DID, blob msbucket.B
 	if existing, err := b.locations.GetLocation(ctx, space, blob.Digest); err == nil && existing != nil {
 		// Already durable for this space — advance the intent and move on.
 		span.SetAttributes(attribute.String("ingot.blob.result", "already_stored"))
-		if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentAccepted); err != nil {
+		if err := b.intents.SetIntentState(ctx, space, blob.Digest, registry.IntentAccepted); err != nil {
 			return fmt.Errorf("mark accepted (dedup): %w", err)
 		}
-		b.cacheHeld(ctx, blob.Digest)
+		b.cacheHeld(ctx, space, blob.Digest)
 		return nil
 	} else if err != nil && !errors.Is(err, registry.ErrNotFound) {
 		return fmt.Errorf("lookup location: %w", err)
 	}
 	// The uploaded bytes are the spooled envelope, so the size is the
 	// intent's stored byte count, not the blob's plaintext span.
-	in, err := b.intents.GetIntent(ctx, digest)
+	in, err := b.intents.GetIntent(ctx, space, digest)
 	if err != nil {
 		return fmt.Errorf("lookup intent: %w", err)
 	}
@@ -560,7 +561,7 @@ func (b *Backend) uploadBlob(ctx context.Context, space did.DID, blob msbucket.B
 	)
 	// The blob may be on the network from here on; a release finding no
 	// row for it must remove it rather than assume it never left.
-	if err := b.intents.SetIntentState(ctx, digest, registry.IntentUploading); err != nil {
+	if err := b.intents.SetIntentState(ctx, space, digest, registry.IntentUploading); err != nil {
 		return fmt.Errorf("mark uploading: %w", err)
 	}
 	res, err := b.uploader.UploadBlob(ctx, space, digest, in.Size, b.spool.Path(digest))
@@ -611,8 +612,12 @@ var errPinnedBlobReleased = errors.New("pinned blob has no remaining claim")
 // addClaims records one claim per DEDUPLICATED digest for a new generation.
 // Runs inside the bucket commit lock (see the invariant note above).
 //
-// A body this node ingested holds fresh digests, which nothing can release
-// before they are claimed. A body pinned from another object of the space
+// A body this node ingested is claimed unconditionally. An encrypted body
+// holds fresh digests, which nothing can release before they are claimed. A
+// body stored as received can repeat a digest the space released or is
+// releasing: a pending release finds the new claim and drops its record
+// (runRelease), and a release already past its claim check (executeRelease,
+// one network round trip) is not excluded. A body pinned from another object of the space
 // (a same-space copy) holds digests some other version claims, and a
 // release of them may be under way: its claim check and its network removal
 // are separate steps, so a claim added unconditionally in between would
@@ -771,19 +776,19 @@ func (b *Backend) releaseNow(ctx context.Context, records []registry.PendingRele
 // release, and a session seen already completed has its claims in place for
 // the check that follows.
 func (b *Backend) runRelease(ctx context.Context, pr registry.PendingRelease) releaseOutcome {
-	live, err := b.multipart.CountLivePartRefs(ctx, pr.Digest)
+	live, err := b.multipart.CountLivePartRefs(ctx, pr.Space, pr.Digest)
 	if err != nil {
 		b.logger.Warn("release: count live part refs failed; retrying next sweep",
 			zap.String("digest", hex.EncodeToString(pr.Digest)), zap.Error(err))
 		return releaseFailed
 	}
 	if live > 0 {
-		// A session in flight still references the blob and means to claim
-		// it. Its Complete turns the reference into a claim, which makes
-		// this record stale; its abort or expiry records a release of its
-		// own. Either way the wait ends. (Encryption gives every part blob
-		// a digest of its own, so today only a session's own parts can
-		// reference it; the check holds for shared digests as well.)
+		// A session of this space in flight still references the blob and
+		// means to claim it. Its Complete turns the reference into a claim,
+		// which makes this record stale; its abort or expiry records a
+		// release of its own. Either way the wait ends. A blob stored as
+		// received can be named by several sessions and objects of the
+		// space at once; an encrypted one has a digest of its own.
 		return releaseDeferred
 	}
 	n, err := b.blobRefs.CountClaims(ctx, pr.Space, pr.Digest)
@@ -862,12 +867,12 @@ func (b *Backend) executeRelease(ctx context.Context, pr registry.PendingRelease
 		log.Warn("release: lookup location failed", zap.Error(err))
 		return false
 	}
-	park, err := b.parks.GetPark(ctx, digest)
+	park, err := b.parks.GetPark(ctx, space, digest)
 	if err != nil && !errors.Is(err, registry.ErrNotFound) {
 		log.Warn("release: lookup park failed", zap.Error(err))
 		return false
 	}
-	in, err := b.intents.GetIntent(ctx, digest)
+	in, err := b.intents.GetIntent(ctx, space, digest)
 	if err != nil && !errors.Is(err, registry.ErrNotFound) {
 		log.Warn("release: lookup upload intent failed", zap.Error(err))
 		return false
@@ -932,7 +937,7 @@ func (b *Backend) executeRelease(ctx context.Context, pr registry.PendingRelease
 	// park), and with the location gone and the park left, the retry
 	// would read the blob as parked and abort an allocation the remove
 	// above already released.
-	if err := b.parks.DeletePark(ctx, digest); err != nil {
+	if err := b.parks.DeletePark(ctx, space, digest); err != nil {
 		log.Warn("release: delete park failed", zap.Error(err))
 		ok = false
 	} else if err := b.locations.DeleteLocation(ctx, space, digest); err != nil {
@@ -948,19 +953,30 @@ func (b *Backend) executeRelease(ctx context.Context, pr registry.PendingRelease
 	default:
 		// The local copy goes first, from the cache or the spool, and
 		// removing an absent one is a no-op, so a failure after it costs the
-		// retry nothing. The intent then
-		// goes together with this release's record: the intent is the only
-		// evidence that this blob never left the node, and a record that
-		// outlived it would leave the retry reading neither rows nor
-		// intent, owing a network remove it cannot authorize and can never
-		// complete.
-		freed, err := b.removeLocal(digest)
+		// retry nothing. It is shared with every other space whose intent
+		// names the digest (the same bytes stored as received in two
+		// buckets), so while another space holds an intent the file stays,
+		// for that space's upload or reads, and goes with the last intent.
+		// The intent then goes together with this release's record: the
+		// intent is the only evidence that this blob never left the node,
+		// and a record that outlived it would leave the retry reading
+		// neither rows nor intent, owing a network remove it cannot
+		// authorize and can never complete.
+		others, err := b.intents.CountOtherIntents(ctx, space, digest)
 		if err != nil {
-			log.Warn("release: remove local blob copy failed", zap.Error(err))
+			log.Warn("release: count other intents failed", zap.Error(err))
 			ok = false
 			break
 		}
-		b.localBlobMetrics.removedFile(ctx, removedReleased, freed)
+		if others == 0 {
+			freed, err := b.removeLocal(digest)
+			if err != nil {
+				log.Warn("release: remove local blob copy failed", zap.Error(err))
+				ok = false
+				break
+			}
+			b.localBlobMetrics.removedFile(ctx, removedReleased, freed)
+		}
 		if err := b.pendingReleases.DeleteIntentAndRelease(ctx, space, digest); err != nil {
 			log.Warn("release: delete upload intent with the release record failed", zap.Error(err))
 			ok = false

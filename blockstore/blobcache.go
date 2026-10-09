@@ -126,9 +126,8 @@ func (c *BlobCache) Usage() int64 {
 // returns its size, moving the bytes between the two counts. Idempotent: a
 // blob not in the spool moves nothing and is not an error. Only a blob the
 // provider holds may be taken; the caller decides that. A copy already in the
-// cache would be replaced but counted again; that cannot happen today,
-// because every write encrypts under a fresh key and so has a digest of its
-// own.
+// cache (the same bytes stored as received and written again) is replaced,
+// and its bytes leave the count as the new copy's enter it.
 //
 // Take holds both directories exclusively, so a move never overlaps a
 // removal of the same blob: whether the removal finds the file in the spool
@@ -146,6 +145,10 @@ func (c *BlobCache) Take(spool *Spool, digest mh.Multihash) (int64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("blockstore: cache take: %w", err)
 	}
+	var replaced int64
+	if prev, err := os.Stat(c.Path(digest)); err == nil {
+		replaced = prev.Size()
+	}
 	if err := os.Rename(from, c.Path(digest)); err != nil {
 		if _, statErr := os.Stat(from); errors.Is(err, os.ErrNotExist) && errors.Is(statErr, os.ErrNotExist) {
 			// Removed since the first Stat, by something outside this
@@ -160,7 +163,7 @@ func (c *BlobCache) Take(spool *Spool, digest mh.Multihash) (int64, error) {
 		return 0, fmt.Errorf("blockstore: cache take: %w", err)
 	}
 	spool.usage.Add(-info.Size())
-	c.usage.Add(info.Size())
+	c.usage.Add(info.Size() - replaced)
 	spool.changes.Add(1)
 	c.changes.Add(1)
 	return info.Size(), nil

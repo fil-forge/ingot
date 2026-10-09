@@ -211,10 +211,13 @@ also counts writes in progress as their bytes land. With
 `local_blob_max_bytes` set, a sweeper checks the total every 30 seconds and,
 when it is over the budget, evicts blobs the provider already holds, oldest
 state change first, until usage is at 90% of the budget. A blob qualifies
-only through a row that proves the provider has it: a `blob_locations` row
-for an `accepted` or `published` intent, a `blob_parks` row for a `parked`
-one. Eviction removes the blob's local copy, which is in the cache, or still
-in the spool if the process stopped between recording the acceptance and the
+only through a row that proves the provider has it for the intent's space: a
+`blob_locations` row for an `accepted` or `published` intent, a `blob_parks`
+row for a `parked` one. A blob stored as received can have an intent in
+several spaces, one file between them; it does not qualify while any of
+them is still `spooled` or `uploading`, since that upload reads the file.
+Eviction removes the blob's local copy, which is in the cache, or still in
+the spool if the process stopped between recording the acceptance and the
 move. Spool files waiting for their upload, and writes in progress, never
 qualify; the budget counts them, so the pass evicts cached blobs to make
 room for them. The sweeper first honours two windows, `cache_min_residency`
@@ -300,7 +303,15 @@ Objects report `x-amz-server-side-encryption: AES256` when encrypted and no
 header when stored as received; SSE-KMS and SSE-C are not implemented, and a
 GET or HEAD carrying any encryption header is refused, as on S3. Plaintext
 bodies bring content dedup back: two objects with the same bytes share a
-blob, each holding its own claim.
+blob, each holding its own claim, and two buckets of different spaces can
+hold one digest. Every blob table is therefore keyed by `(space, digest)`,
+the upload intent and the park included: each space uploads, parks, claims
+and releases its own copy, and the one spool file between them goes with the
+last intent for it. A write of bytes whose release in the same space is
+already executing (past its claim check, inside the network remove) can
+still reuse the recorded location and commit over the removed blob; the
+window is one round trip after a delete, and closing it needs a release
+marker the writer cancels or waits on.
 
 ## Identity & auth
 

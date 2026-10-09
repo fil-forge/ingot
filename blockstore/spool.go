@@ -138,12 +138,13 @@ func (s *Spool) WriteBlob(_ context.Context, r io.Reader) (mh.Multihash, int64, 
 
 // commit renames a finished temp file to its digest path and counts its size
 // as finished, unless an identical blob already sat there (counted already).
-// The check and the rename are not atomic against a Remove of the same
-// digest; that cannot happen today, because every write encrypts under a
-// fresh key and so has a digest of its own.
+// It holds the directory exclusively, so the check and the rename never
+// overlap a Remove or a Take of the same digest, which the same bytes stored
+// as received and written again can race: the count sees either the old
+// file replaced in place or the new file arriving after the old one left.
 func (s *Spool) commit(tmpName string, digest mh.Multihash, size int64) error {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	path := s.Path(digest)
 	_, statErr := os.Stat(path)
 	existed := statErr == nil

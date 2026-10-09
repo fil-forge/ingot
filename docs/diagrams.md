@@ -947,6 +947,7 @@ erDiagram
         text space "claim index (space, digest)"
     }
     upload_intents {
+        text space PK "the upload's space: one file, an intent per space"
         bytea digest PK
         text local_path
         bigint size
@@ -970,6 +971,7 @@ erDiagram
         bigint range_end "inclusive"
     }
     blob_parks {
+        text space PK "the allocation's space"
         bytea digest PK
         bytea add_task
         bytea accept_task

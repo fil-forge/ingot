@@ -34,10 +34,11 @@ type blobDir struct {
 	// kind names the directory in errors.
 	kind string
 	// mu orders the changes that move the count: count holds it
-	// exclusively while it measures, and each commit into the directory or
-	// removal from it holds it shared, so the count sees every file either
-	// before or after the change. A move between directories
-	// (BlobCache.Take) holds both exclusively. ScanAndCorrect holds it
+	// exclusively while it measures, and each removal holds it shared, so
+	// the count sees every file either before or after the change. A commit
+	// into the directory (Spool.commit) and a move between directories
+	// (BlobCache.Take) hold it exclusively, so neither overlaps a removal of
+	// the same digest. ScanAndCorrect holds it
 	// exclusively for its final check, which is why every change counts
 	// itself in changes before releasing it.
 	mu sync.RWMutex

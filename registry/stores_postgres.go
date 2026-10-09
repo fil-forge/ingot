@@ -50,9 +50,9 @@ func (r *Postgres) AddBlobClaim(ctx context.Context, c BlobClaim) error {
 	// committed blob and leaves it to its object's own release. A blob
 	// without an intent row (a shipped catalog segment) has nothing to mark.
 	if _, err := tx.Exec(ctx,
-		`UPDATE ingot.upload_intents SET state = $2, updated_at = now()
-		 WHERE digest = $1 AND state <> $2`,
-		c.Digest, IntentPublished); err != nil {
+		`UPDATE ingot.upload_intents SET state = $3, updated_at = now()
+		 WHERE space = $1 AND digest = $2 AND state <> $3`,
+		c.Space, c.Digest, IntentPublished); err != nil {
 		return fmt.Errorf("registry: publish intent: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -313,7 +313,9 @@ func (r *Postgres) DeleteIntentAndRelease(ctx context.Context, space did.DID, di
 		return fmt.Errorf("registry: begin delete intent and release: %w", err)
 	}
 	defer tx.Rollback(ctx)
-	if _, err := tx.Exec(ctx, `DELETE FROM ingot.upload_intents WHERE digest = $1`, digest); err != nil {
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM ingot.upload_intents WHERE space = $1 AND digest = $2`,
+		space, digest); err != nil {
 		return fmt.Errorf("registry: delete intent: %w", err)
 	}
 	if _, err := tx.Exec(ctx,
@@ -340,29 +342,41 @@ func (r *Postgres) DeleteRelease(ctx context.Context, space did.DID, digest mult
 // IntentStore ================================================================
 
 func (r *Postgres) PutIntent(ctx context.Context, in UploadIntent) error {
-	_, err := r.pool.Exec(ctx,
-		`INSERT INTO ingot.upload_intents (digest, local_path, size, state, bucket)
-		 VALUES ($1, $2, $3, $4, $5)
-		 ON CONFLICT (digest) DO UPDATE
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("registry: begin put intent: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO ingot.upload_intents (space, digest, local_path, size, state, bucket)
+		 VALUES ($1, $2, $3, $4, $5, $6)
+		 ON CONFLICT (space, digest) DO UPDATE
 		   SET local_path = EXCLUDED.local_path,
 		       size       = EXCLUDED.size,
 		       state      = EXCLUDED.state,
 		       bucket     = EXCLUDED.bucket,
-		       updated_at = now(),
-		       evicted_at = NULL`,
-		in.Digest, in.LocalPath, in.Size, in.State, nullString(in.Bucket))
-	if err != nil {
+		       updated_at = now()`,
+		in.Space, in.Digest, in.LocalPath, in.Size, in.State, nullString(in.Bucket)); err != nil {
 		return fmt.Errorf("registry: put intent: %w", err)
+	}
+	// The file is back on disk, for every space's intent.
+	if _, err := tx.Exec(ctx,
+		`UPDATE ingot.upload_intents SET evicted_at = NULL WHERE digest = $1 AND evicted_at IS NOT NULL`,
+		in.Digest); err != nil {
+		return fmt.Errorf("registry: put intent: clear evicted: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("registry: commit put intent: %w", err)
 	}
 	return nil
 }
 
-func (r *Postgres) SetIntentState(ctx context.Context, digest multihash.Multihash, state string) error {
+func (r *Postgres) SetIntentState(ctx context.Context, space did.DID, digest multihash.Multihash, state string) error {
 	tag, err := r.pool.Exec(ctx,
 		`UPDATE ingot.upload_intents
-		 SET state = $2, updated_at = CASE WHEN state = $2 THEN updated_at ELSE now() END
-		 WHERE digest = $1`,
-		digest, state)
+		 SET state = $3, updated_at = CASE WHEN state = $3 THEN updated_at ELSE now() END
+		 WHERE space = $1 AND digest = $2`,
+		space, digest, state)
 	if err != nil {
 		return fmt.Errorf("registry: set intent state: %w", err)
 	}
@@ -372,12 +386,13 @@ func (r *Postgres) SetIntentState(ctx context.Context, digest multihash.Multihas
 	return nil
 }
 
-func (r *Postgres) GetIntent(ctx context.Context, digest multihash.Multihash) (*UploadIntent, error) {
-	in := &UploadIntent{Digest: digest}
+func (r *Postgres) GetIntent(ctx context.Context, space did.DID, digest multihash.Multihash) (*UploadIntent, error) {
+	in := &UploadIntent{Space: space, Digest: digest}
 	var bucket *string
 	err := r.pool.QueryRow(ctx,
-		`SELECT local_path, size, state, bucket, updated_at FROM ingot.upload_intents WHERE digest = $1`,
-		digest).Scan(&in.LocalPath, &in.Size, &in.State, &bucket, &in.UpdatedAt)
+		`SELECT local_path, size, state, bucket, updated_at
+		   FROM ingot.upload_intents WHERE space = $1 AND digest = $2`,
+		space, digest).Scan(&in.LocalPath, &in.Size, &in.State, &bucket, &in.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -392,7 +407,7 @@ func (r *Postgres) GetIntent(ctx context.Context, digest multihash.Multihash) (*
 
 func (r *Postgres) ListIntentsByState(ctx context.Context, state string) ([]UploadIntent, error) {
 	rows, err := r.pool.Query(ctx,
-		`SELECT digest, local_path, size, state, bucket, updated_at FROM ingot.upload_intents WHERE state = $1`,
+		`SELECT `+intentColumns+` FROM ingot.upload_intents i WHERE i.state = $1`,
 		state)
 	if err != nil {
 		return nil, fmt.Errorf("registry: list intents: %w", err)
@@ -400,28 +415,46 @@ func (r *Postgres) ListIntentsByState(ctx context.Context, state string) ([]Uplo
 	return scanIntents(rows)
 }
 
+func (r *Postgres) CountOtherIntents(ctx context.Context, space did.DID, digest multihash.Multihash) (int, error) {
+	var n int
+	err := r.pool.QueryRow(ctx,
+		`SELECT count(*) FROM ingot.upload_intents WHERE digest = $2 AND space <> $1`,
+		space, digest).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("registry: count other intents: %w", err)
+	}
+	return n, nil
+}
+
 func (r *Postgres) ListEvictable(ctx context.Context, after EvictCursor, limit int) ([]UploadIntent, error) {
-	// A zero cursor starts before every row; the empty digest sorts first.
+	// A zero cursor starts before every row; the empty digest and the empty
+	// space sort first.
 	afterDigest := after.Digest
 	if afterDigest == nil {
 		afterDigest = multihash.Multihash{}
 	}
+	afterSpace := ""
+	if after.Space.Defined() {
+		afterSpace = after.Space.String()
+	}
 	// The state literals match the partial index upload_intents_evictable_idx
-	// (migration 00021); the planner uses it only when the query names the
+	// (migration 00026); the planner uses it only when the query names the
 	// same constants, not parameters.
 	rows, err := r.pool.Query(ctx,
-		`SELECT i.digest, i.local_path, i.size, i.state, i.bucket, i.updated_at
+		`SELECT `+intentColumns+`
 		   FROM ingot.upload_intents i
 		  WHERE i.evicted_at IS NULL
 		    AND i.state IN ('parked', 'accepted', 'published')
-		    AND (i.updated_at, i.digest) > ($1::timestamptz, $2::bytea)
+		    AND (i.updated_at, i.digest, i.space) > ($1::timestamptz, $2::bytea, $3::text)
 		    AND CASE WHEN i.state = 'parked'
-		             THEN EXISTS (SELECT 1 FROM ingot.blob_parks p WHERE p.digest = i.digest)
-		             ELSE EXISTS (SELECT 1 FROM ingot.blob_locations l WHERE l.digest = i.digest)
+		             THEN EXISTS (SELECT 1 FROM ingot.blob_parks p WHERE p.space = i.space AND p.digest = i.digest)
+		             ELSE EXISTS (SELECT 1 FROM ingot.blob_locations l WHERE l.space = i.space AND l.digest = i.digest)
 		        END
-		  ORDER BY i.updated_at, i.digest
-		  LIMIT $3`,
-		after.UpdatedAt, []byte(afterDigest), limit)
+		    AND NOT EXISTS (SELECT 1 FROM ingot.upload_intents o
+		                     WHERE o.digest = i.digest AND o.state IN ('spooled', 'uploading'))
+		  ORDER BY i.updated_at, i.digest, i.space
+		  LIMIT $4`,
+		after.UpdatedAt, []byte(afterDigest), afterSpace, limit)
 	if err != nil {
 		return nil, fmt.Errorf("registry: list evictable intents: %w", err)
 	}
@@ -448,7 +481,9 @@ const releasedPublishedWhere = `i.state = $1
 		    AND NOT EXISTS (SELECT 1 FROM ingot.blob_release_intents p WHERE p.digest = i.digest)
 		    AND NOT EXISTS (SELECT 1 FROM ingot.multipart_parts mp
 		                      JOIN ingot.multipart_sessions s ON s.upload_id = mp.upload_id
-		                     WHERE mp.blob_digests @> ARRAY[i.digest] AND s.state IN ($2, $3))`
+		                     WHERE mp.blob_digests @> ARRAY[i.digest] AND s.state IN ($2, $3))
+		    AND NOT EXISTS (SELECT 1 FROM ingot.upload_intents o
+		                     WHERE o.digest = i.digest AND o.space <> i.space)`
 
 func (r *Postgres) ListReleasedPublished(ctx context.Context, after multihash.Multihash, limit int) ([]UploadIntent, error) {
 	// The empty digest sorts first, so a nil cursor starts at the beginning.
@@ -456,7 +491,7 @@ func (r *Postgres) ListReleasedPublished(ctx context.Context, after multihash.Mu
 		after = multihash.Multihash{}
 	}
 	rows, err := r.pool.Query(ctx,
-		`SELECT i.digest, i.local_path, i.size, i.state, i.bucket, i.updated_at
+		`SELECT `+intentColumns+`
 		   FROM ingot.upload_intents i
 		  WHERE i.digest > $4 AND `+releasedPublishedWhere+`
 		  ORDER BY i.digest
@@ -468,11 +503,11 @@ func (r *Postgres) ListReleasedPublished(ctx context.Context, after multihash.Mu
 	return scanIntents(rows)
 }
 
-func (r *Postgres) DeleteReleasedPublished(ctx context.Context, digest multihash.Multihash) (bool, error) {
+func (r *Postgres) DeleteReleasedPublished(ctx context.Context, space did.DID, digest multihash.Multihash) (bool, error) {
 	tag, err := r.pool.Exec(ctx,
 		`DELETE FROM ingot.upload_intents i
-		  WHERE i.digest = $4 AND `+releasedPublishedWhere,
-		IntentPublished, SessionOpen, SessionCompleting, []byte(digest))
+		  WHERE i.space = $4 AND i.digest = $5 AND `+releasedPublishedWhere,
+		IntentPublished, SessionOpen, SessionCompleting, space, []byte(digest))
 	if err != nil {
 		return false, fmt.Errorf("registry: delete released published intent: %w", err)
 	}
@@ -527,17 +562,26 @@ func (r *Postgres) MissingIntents(ctx context.Context, digests []multihash.Multi
 	return out, nil
 }
 
-// scanIntents reads rows of (digest, local_path, size, state, bucket,
-// updated_at) and closes them.
+// intentColumns is the column list scanIntents reads, qualified for the
+// alias i (unqualified names resolve against it too).
+const intentColumns = `i.space, i.digest, i.local_path, i.size, i.state, i.bucket, i.updated_at`
+
+// scanIntents reads rows of intentColumns and closes them.
 func scanIntents(rows pgx.Rows) ([]UploadIntent, error) {
 	defer rows.Close()
 	var out []UploadIntent
 	for rows.Next() {
 		var in UploadIntent
+		var space string
 		var bucket *string
-		if err := rows.Scan(&in.Digest, &in.LocalPath, &in.Size, &in.State, &bucket, &in.UpdatedAt); err != nil {
+		if err := rows.Scan(&space, &in.Digest, &in.LocalPath, &in.Size, &in.State, &bucket, &in.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("registry: list intents scan: %w", err)
 		}
+		sp, err := did.Parse(space)
+		if err != nil {
+			return nil, fmt.Errorf("registry: list intents: parse space %q: %w", space, err)
+		}
+		in.Space = sp
 		if bucket != nil {
 			in.Bucket = *bucket
 		}
@@ -549,8 +593,9 @@ func scanIntents(rows pgx.Rows) ([]UploadIntent, error) {
 	return out, nil
 }
 
-func (r *Postgres) DeleteIntent(ctx context.Context, digest multihash.Multihash) error {
-	_, err := r.pool.Exec(ctx, `DELETE FROM ingot.upload_intents WHERE digest = $1`, digest)
+func (r *Postgres) DeleteIntent(ctx context.Context, space did.DID, digest multihash.Multihash) error {
+	_, err := r.pool.Exec(ctx,
+		`DELETE FROM ingot.upload_intents WHERE space = $1 AND digest = $2`, space, digest)
 	if err != nil {
 		return fmt.Errorf("registry: delete intent: %w", err)
 	}
@@ -668,24 +713,24 @@ func (r *Postgres) RewrapEncryptionParams(ctx context.Context, space did.DID, di
 
 func (r *Postgres) PutPark(ctx context.Context, p BlobPark) error {
 	_, err := r.pool.Exec(ctx,
-		`INSERT INTO ingot.blob_parks (digest, add_task, accept_task, put_invocation, size)
-		 VALUES ($1, $2, $3, $4, $5)
-		 ON CONFLICT (digest) DO UPDATE
+		`INSERT INTO ingot.blob_parks (space, digest, add_task, accept_task, put_invocation, size)
+		 VALUES ($1, $2, $3, $4, $5, $6)
+		 ON CONFLICT (space, digest) DO UPDATE
 		   SET add_task = EXCLUDED.add_task, accept_task = EXCLUDED.accept_task,
 		       put_invocation = EXCLUDED.put_invocation, size = EXCLUDED.size`,
-		p.Digest, p.AddTask, p.AcceptTask, p.PutInvocation, p.Size)
+		p.Space, p.Digest, p.AddTask, p.AcceptTask, p.PutInvocation, p.Size)
 	if err != nil {
 		return fmt.Errorf("registry: put park: %w", err)
 	}
 	return nil
 }
 
-func (r *Postgres) GetPark(ctx context.Context, digest multihash.Multihash) (*BlobPark, error) {
-	park := &BlobPark{Digest: digest}
+func (r *Postgres) GetPark(ctx context.Context, space did.DID, digest multihash.Multihash) (*BlobPark, error) {
+	park := &BlobPark{Space: space, Digest: digest}
 	err := r.pool.QueryRow(ctx,
 		`SELECT add_task, accept_task, put_invocation, size, created_at
-		 FROM ingot.blob_parks WHERE digest = $1`,
-		digest).Scan(&park.AddTask, &park.AcceptTask, &park.PutInvocation, &park.Size, &park.CreatedAt)
+		 FROM ingot.blob_parks WHERE space = $1 AND digest = $2`,
+		space, digest).Scan(&park.AddTask, &park.AcceptTask, &park.PutInvocation, &park.Size, &park.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -704,9 +749,9 @@ func (r *Postgres) HasParkFor(ctx context.Context, addTask []byte) (bool, error)
 	return parked, nil
 }
 
-func (r *Postgres) DeletePark(ctx context.Context, digest multihash.Multihash) error {
+func (r *Postgres) DeletePark(ctx context.Context, space did.DID, digest multihash.Multihash) error {
 	_, err := r.pool.Exec(ctx,
-		`DELETE FROM ingot.blob_parks WHERE digest = $1`, digest)
+		`DELETE FROM ingot.blob_parks WHERE space = $1 AND digest = $2`, space, digest)
 	if err != nil {
 		return fmt.Errorf("registry: delete park: %w", err)
 	}
@@ -1073,13 +1118,13 @@ func (r *Postgres) CountPartRefs(ctx context.Context, digest multihash.Multihash
 	return n, nil
 }
 
-func (r *Postgres) CountLivePartRefs(ctx context.Context, digest multihash.Multihash) (int, error) {
+func (r *Postgres) CountLivePartRefs(ctx context.Context, space did.DID, digest multihash.Multihash) (int, error) {
 	var n int
 	err := r.pool.QueryRow(ctx,
 		`SELECT count(*) FROM ingot.multipart_parts p
 		 JOIN ingot.multipart_sessions s ON s.upload_id = p.upload_id
-		 WHERE p.blob_digests @> ARRAY[$1::bytea] AND s.state IN ($2, $3)`,
-		digest, SessionOpen, SessionCompleting).Scan(&n)
+		 WHERE p.blob_digests @> ARRAY[$2::bytea] AND s.space = $1 AND s.state IN ($3, $4)`,
+		space, digest, SessionOpen, SessionCompleting).Scan(&n)
 	if err != nil {
 		return 0, fmt.Errorf("registry: count live part refs: %w", err)
 	}

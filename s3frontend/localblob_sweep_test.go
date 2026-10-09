@@ -23,6 +23,7 @@ import (
 
 	"github.com/fil-forge/ingot/inmem"
 	"github.com/fil-forge/ingot/registry"
+	"github.com/fil-forge/ucantone/did"
 )
 
 // These tests drive SweepLocalBlobs over a real on-disk spool. inmem.NopUploader
@@ -42,6 +43,16 @@ func newSweepBackend(t *testing.T, mods ...func(*Deps)) (*Backend, *inmem.MemSto
 		t.Fatalf("create bucket: %v", err)
 	}
 	return b, mem
+}
+
+// sweepSpace is the sweep bucket's space, which its intents and parks carry.
+func sweepSpace(t *testing.T, mem *inmem.MemStore) did.DID {
+	t.Helper()
+	st, err := mem.Get(t.Context(), sweepBucket)
+	if err != nil {
+		t.Fatalf("get bucket: %v", err)
+	}
+	return st.Space
 }
 
 // putSweepObjects writes n single-blob objects, oldest first, and returns
@@ -216,7 +227,7 @@ func TestSweepLocalBlobs_KeepsBlobsTheProviderMayNotHold(t *testing.T) {
 		if err != nil {
 			t.Fatalf("WriteBlob: %v", err)
 		}
-		if err := mem.PutIntent(ctx, registry.UploadIntent{Digest: d, LocalPath: localPath(b, d), Size: n, State: state}); err != nil {
+		if err := mem.PutIntent(ctx, registry.UploadIntent{Space: sweepSpace(t, mem), Digest: d, LocalPath: localPath(b, d), Size: n, State: state}); err != nil {
 			t.Fatalf("PutIntent: %v", err)
 		}
 		digests = append(digests, d)
@@ -302,7 +313,7 @@ func TestSweepLocalBlobs_OrphanPass(t *testing.T) {
 			}
 		}
 		if withIntent {
-			if err := mem.PutIntent(ctx, registry.UploadIntent{Digest: d, LocalPath: localPath(b, d), Size: n, State: registry.IntentSpooled}); err != nil {
+			if err := mem.PutIntent(ctx, registry.UploadIntent{Space: sweepSpace(t, mem), Digest: d, LocalPath: localPath(b, d), Size: n, State: registry.IntentSpooled}); err != nil {
 				t.Fatalf("PutIntent: %v", err)
 			}
 		}
@@ -380,7 +391,7 @@ func TestRemoveReleasedPublished(t *testing.T) {
 				t.Fatalf("Remove: %v", err)
 			}
 		}
-		if err := mem.PutIntent(ctx, registry.UploadIntent{Digest: d, LocalPath: localPath(b, d), Size: n, State: registry.IntentPublished}); err != nil {
+		if err := mem.PutIntent(ctx, registry.UploadIntent{Space: sweepSpace(t, mem), Digest: d, LocalPath: localPath(b, d), Size: n, State: registry.IntentPublished}); err != nil {
 			t.Fatalf("PutIntent: %v", err)
 		}
 		return d, n
@@ -401,14 +412,14 @@ func TestRemoveReleasedPublished(t *testing.T) {
 		if fileExists(localPath(b, d)) {
 			t.Fatalf("released blob %x's file survived the sweep", d)
 		}
-		if _, err := mem.GetIntent(ctx, d); !errors.Is(err, registry.ErrNotFound) {
+		if _, err := mem.IntentByDigest(ctx, d); !errors.Is(err, registry.ErrNotFound) {
 			t.Fatalf("released blob %x's intent: err=%v, want ErrNotFound", d, err)
 		}
 	}
 	if !fileExists(localPath(b, live)) {
 		t.Fatal("live blob's file was removed, want it kept")
 	}
-	if in, err := mem.GetIntent(ctx, live); err != nil || in.State != registry.IntentPublished {
+	if in, err := mem.IntentByDigest(ctx, live); err != nil || in.State != registry.IntentPublished {
 		t.Fatalf("live blob's intent = %v/%v, want published", in, err)
 	}
 }
@@ -422,7 +433,7 @@ func TestSweepLocalBlobs_LeavesReleasedBlobsToTheStartupPass(t *testing.T) {
 	if err != nil {
 		t.Fatalf("WriteBlob: %v", err)
 	}
-	if err := mem.PutIntent(ctx, registry.UploadIntent{Digest: d, LocalPath: localPath(b, d), Size: n, State: registry.IntentPublished}); err != nil {
+	if err := mem.PutIntent(ctx, registry.UploadIntent{Space: sweepSpace(t, mem), Digest: d, LocalPath: localPath(b, d), Size: n, State: registry.IntentPublished}); err != nil {
 		t.Fatalf("PutIntent: %v", err)
 	}
 
@@ -446,7 +457,7 @@ func TestRemoveReleasedPublishedRetriesACopyItCannotRemove(t *testing.T) {
 		if err != nil {
 			t.Fatalf("WriteBlob: %v", err)
 		}
-		if err := mem.PutIntent(ctx, registry.UploadIntent{Digest: d, LocalPath: localPath(b, d), Size: n, State: registry.IntentPublished}); err != nil {
+		if err := mem.PutIntent(ctx, registry.UploadIntent{Space: sweepSpace(t, mem), Digest: d, LocalPath: localPath(b, d), Size: n, State: registry.IntentPublished}); err != nil {
 			t.Fatalf("PutIntent: %v", err)
 		}
 		digests = append(digests, d)
@@ -470,7 +481,7 @@ func TestRemoveReleasedPublishedRetriesACopyItCannotRemove(t *testing.T) {
 	}
 	intentKept := func(d multihash.Multihash) bool {
 		t.Helper()
-		_, err := mem.GetIntent(ctx, d)
+		_, err := mem.IntentByDigest(ctx, d)
 		if err != nil && !errors.Is(err, registry.ErrNotFound) {
 			t.Fatalf("GetIntent %x: %v", d, err)
 		}
@@ -547,10 +558,10 @@ func TestSweepLocalBlobs_EvictsAParkedBlob(t *testing.T) {
 	if err != nil {
 		t.Fatalf("WriteBlob: %v", err)
 	}
-	if err := mem.PutIntent(ctx, registry.UploadIntent{Digest: d, LocalPath: localPath(b, d), Size: n, State: registry.IntentParked}); err != nil {
+	if err := mem.PutIntent(ctx, registry.UploadIntent{Space: sweepSpace(t, mem), Digest: d, LocalPath: localPath(b, d), Size: n, State: registry.IntentParked}); err != nil {
 		t.Fatalf("PutIntent: %v", err)
 	}
-	if err := mem.PutPark(ctx, registry.BlobPark{Digest: d, Size: n}); err != nil {
+	if err := mem.PutPark(ctx, registry.BlobPark{Space: sweepSpace(t, mem), Digest: d, Size: n}); err != nil {
 		t.Fatalf("PutPark: %v", err)
 	}
 
@@ -837,10 +848,10 @@ func TestSweepLocalBlobs_EvictsAHeldBlobLeftInTheSpool(t *testing.T) {
 	if err != nil {
 		t.Fatalf("WriteBlob: %v", err)
 	}
-	if err := mem.PutIntent(ctx, registry.UploadIntent{Digest: d, LocalPath: b.spool.Path(d), Size: n, State: registry.IntentAccepted}); err != nil {
+	if err := mem.PutIntent(ctx, registry.UploadIntent{Space: sweepSpace(t, mem), Digest: d, LocalPath: b.spool.Path(d), Size: n, State: registry.IntentAccepted}); err != nil {
 		t.Fatalf("PutIntent: %v", err)
 	}
-	if err := mem.PutLocation(ctx, registry.BlobLocation{Space: testutil.RandomDID(t), Digest: d, Provider: "did:key:p", URL: "http://p/blob", Size: n}); err != nil {
+	if err := mem.PutLocation(ctx, registry.BlobLocation{Space: sweepSpace(t, mem), Digest: d, Provider: "did:key:p", URL: "http://p/blob", Size: n}); err != nil {
 		t.Fatalf("PutLocation: %v", err)
 	}
 
@@ -1131,7 +1142,7 @@ func TestSweepLocalBlobs_OrphanPassChecksInBatches(t *testing.T) {
 				if i%2 == 0 {
 					orphans = append(orphans, d)
 				} else {
-					if err := mem.PutIntent(ctx, registry.UploadIntent{Digest: d, LocalPath: localPath(b, d), Size: n, State: registry.IntentSpooled}); err != nil {
+					if err := mem.PutIntent(ctx, registry.UploadIntent{Space: sweepSpace(t, mem), Digest: d, LocalPath: localPath(b, d), Size: n, State: registry.IntentSpooled}); err != nil {
 						t.Fatalf("PutIntent: %v", err)
 					}
 					kept = append(kept, d)

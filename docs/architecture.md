@@ -285,9 +285,11 @@ digest must be known before `allocate`, and because that local copy does double 
   holds regardless.
 
 The `upload_intents` table records each blob Ingot has spooled, from ingest until its release:
-`digest → { local_path, size, state: spooled│uploading│parked│accepted│published, owner ref,
-evicted_at }`. It records how far each blob got, which uploads, releases and eviction act on; local
-reads go by the files themselves. The Postgres schema for this and every other Ingot table is in **[Appendix C](#appendix-c--postgres-schema-the-ingot-schema)**.
+`(space, digest) → { local_path, size, state: spooled│uploading│parked│accepted│published, owner
+ref, evicted_at }`. It records how far each blob got for each space, which uploads, releases and
+eviction act on; local reads go by the files themselves. A blob stored as received has the digest
+of its bytes, so two spaces can hold one digest: one spool file, an intent per space, and the file
+stays while any space's intent may still read it. The Postgres schema for this and every other Ingot table is in **[Appendix C](#appendix-c--postgres-schema-the-ingot-schema)**.
 
 **Dedup and the reference index.** Piri stores identical bytes once (it answers `allocate` with
 "already have it" when the digest exists), so one blob can back many object versions — a re-PUT of
@@ -703,12 +705,14 @@ CREATE TABLE ingot.blob_refs (
 -- Drives "is (space, digest) still claimed?" — the gate on remove(digest).
 CREATE INDEX blob_refs_claim_idx ON ingot.blob_refs (space, digest);
 
--- The local-store index (§5): every blob Ingot has spooled. state advances
--- spooled → uploading → (parked →) accepted → published; published is written
--- with the first reference claim. Eviction removes the local copy and sets
--- evicted_at, leaving the row and its state.
+-- The local-store index (§5): every blob Ingot has spooled, per space. state
+-- advances spooled → uploading → (parked →) accepted → published; published
+-- is written with the first reference claim. Eviction removes the local copy
+-- and sets evicted_at on every intent for the digest, leaving the rows and
+-- their states.
 CREATE TABLE ingot.upload_intents (
-    digest      bytea PRIMARY KEY,                       -- sha256 multihash of the blob
+    space       text   NOT NULL,                         -- the upload's space
+    digest      bytea  NOT NULL,                         -- sha256 multihash of the blob
     local_path  text   NOT NULL,
     size        bigint NOT NULL,                         -- stored (envelope) bytes = file size
     state       text   NOT NULL
@@ -716,7 +720,8 @@ CREATE TABLE ingot.upload_intents (
     bucket      text,                                    -- owner ref (originating op), for cleanup
     created_at  timestamptz NOT NULL DEFAULT now(),
     updated_at  timestamptz NOT NULL DEFAULT now(),      -- last state change
-    evicted_at  timestamptz                              -- NULL: file on disk
+    evicted_at  timestamptz,                             -- NULL: file on disk
+    PRIMARY KEY (space, digest)
 );
 
 -- Local blob location table (§8, appliance topology): (space, digest) →
@@ -785,15 +790,18 @@ CREATE TABLE ingot.multipart_parts (
 );
 
 -- Deferred-accept multipart (§7.2): the state needed to conclude (or abort) a
--- parked blob later. Keyed globally by digest, like upload_intents: dedup
--- shares a park across sessions and parts.
+-- parked blob later. Keyed by (space, digest), like upload_intents: the
+-- allocation is the space's, and dedup shares a park across the space's
+-- sessions and parts.
 CREATE TABLE ingot.blob_parks (
-    digest         bytea PRIMARY KEY,
+    space          text   NOT NULL,
+    digest         bytea  NOT NULL,
     add_task       bytea  NOT NULL,                      -- /blob/add task CID (abort cause)
     accept_task    bytea  NOT NULL,                      -- /blob/accept task CID (conclude poll target)
     put_invocation bytea  NOT NULL,                      -- sealed /http/put invocation
     size           bigint NOT NULL,
-    created_at     timestamptz NOT NULL DEFAULT now()
+    created_at     timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (space, digest)
 );
 
 -- Superseded MST node CIDs, recorded on overwrite/delete (§4, §9). Write-only
@@ -810,9 +818,10 @@ Relationships at a glance: `segment_op_roots` cascades from `segments`, and `mul
 `multipart_sessions`, and `gc_candidates` reference a `buckets.name` by value, and
 `shard_inclusions` joins `blob_locations` on `shard_digest`. The reference count for a blob is
 `count(*) from blob_refs where space = ? and digest = ?`; reaching zero triggers `remove(digest)`
-([§6](#6-the-forgechain-layer)). `upload_intents` and `blob_parks` are keyed by the blob digest,
-independent of bucket namespace — the disk-side and park-side indexes, shared across whatever
-objects reference the same bytes.
+([§6](#6-the-forgechain-layer)). `upload_intents` and `blob_parks` are keyed by `(space, digest)`,
+like every other blob table — the disk-side and park-side indexes, shared across whatever objects
+of the space reference the same bytes. The spool file itself is one per digest, shared across
+spaces, and goes with the last intent for it.
 
 ---
 

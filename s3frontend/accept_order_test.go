@@ -29,7 +29,7 @@ func TestUploadBlobRecordsLocationBeforeAccepted(t *testing.T) {
 	// stalled upload, and returns it.
 	stalledUploading := func(t *testing.T, mem *inmem.MemStore, digest []byte) *registry.UploadIntent {
 		t.Helper()
-		in, err := mem.GetIntent(t.Context(), digest)
+		in, err := mem.IntentByDigest(t.Context(), digest)
 		if err != nil || in.State != registry.IntentUploading {
 			t.Fatalf("intent = %+v/%v, want uploading", in, err)
 		}
