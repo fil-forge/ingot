@@ -18,6 +18,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -334,6 +335,24 @@ var hiltAllPermissions = []string{
 	"s3:ListBucketMultipartUploads",
 }
 
+// hiltPolicyPermissions are the bucket policy operations, held by service
+// keys only. The published hilt image does not know them until
+// fil-forge/hilt#58 merges, so the test key carries them only when the IAM
+// scenarios run (see [iamScenariosEnabled]); fold them into
+// hiltAllPermissions then.
+var hiltPolicyPermissions = []string{
+	"s3:GetBucketPolicy",
+	"s3:PutBucketPolicy",
+	"s3:DeleteBucketPolicy",
+}
+
+// iamScenariosEnabled reports whether the stack's hilt carries the IAM
+// changes: a hilt override is in use, or INGOT_ITEST_IAM=1 says the image
+// has them.
+func iamScenariosEnabled() bool {
+	return os.Getenv("INGOT_ITEST_IAM") == "1" || os.Getenv("INGOT_ITEST_HILT_BINARY") != "" || os.Getenv("INGOT_ITEST_HILT_IMAGE") != ""
+}
+
 // hiltProvisionTenant provisions tenantID in hilt with an all-permission
 // access key and returns the S3 credentials tests sign with. This is the
 // forge-mode onboarding path: ingot no longer self-provisions a space (the
@@ -371,9 +390,13 @@ func hiltProvisionTenantErr(ctx context.Context, s *stack.Stack, tenantID string
 		return "", "", fmt.Errorf("hilt provision tenant %q: %w (stdout=%s stderr=%s)", tenantID, err, out, errOut)
 	}
 
+	permissions := hiltAllPermissions
+	if iamScenariosEnabled() {
+		permissions = append(slices.Clone(permissions), hiltPolicyPermissions...)
+	}
 	keyReq, err := json.Marshal(map[string]any{
 		"name":        "itest",
-		"permissions": hiltAllPermissions,
+		"permissions": permissions,
 	})
 	if err != nil {
 		return "", "", fmt.Errorf("marshal access-key request: %w", err)

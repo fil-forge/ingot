@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 
@@ -561,4 +562,10 @@ func isIPv4(s string) bool {
 		}
 	}
 	return true
+}
+
+// MalformedPolicy is the S3 error for a PutBucketPolicy body the storage
+// system refuses (fil-one/RFC#30, "Failures").
+func MalformedPolicy(description string) s3err.APIError {
+	return s3err.APIError{Code: "MalformedPolicy", Description: description, HTTPStatusCode: http.StatusBadRequest}
 }

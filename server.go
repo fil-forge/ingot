@@ -255,7 +255,7 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		Logger:      logger,
 	})
 
-	api, err := buildS3API(ctx, backend, cfg, deps.IAM, deps.Identity, logger)
+	api, err := buildS3API(ctx, backend, cfg, deps.IAM, deps.Identity, deps.Authority, logger)
 	if err != nil {
 		// Best-effort cleanup if we got past the log open: the caller
 		// has no Server handle to call Stop on.
@@ -670,7 +670,7 @@ func newBucketFlushFunc(up uploader.Uploader, reg registry.Registry, locations r
 // reaches hilt and so carries none of the delegations the Forge-facing
 // handlers need. The server also publishes id's DID document at
 // /.well-known/did.json.
-func buildS3API(ctx context.Context, backend *s3frontend.Backend, cfg config.ServerConfig, iam auth.IAMService, id identity.Identity, logger *zap.Logger) (*s3api.S3ApiServer, error) {
+func buildS3API(ctx context.Context, backend *s3frontend.Backend, cfg config.ServerConfig, iam auth.IAMService, id identity.Identity, authority bucketauthority.BucketAuthority, logger *zap.Logger) (*s3api.S3ApiServer, error) {
 	if iam == nil {
 		return nil, fmt.Errorf("ingot: IAMService is required")
 	}
@@ -721,6 +721,12 @@ func buildS3API(ctx context.Context, backend *s3frontend.Backend, cfg config.Ser
 		return nil, fmt.Errorf("ingot: building the agent DID document: %w", err)
 	}
 	opts = append(opts, s3api.WithRoute(http.MethodGet, web.WellKnownDIDPath, didDocumentHandler(doc)))
+	// The bucket policy operations are answered here, ahead of the S3 route
+	// table: versitygw's PutBucketPolicy controller validates the body as an
+	// AWS-shaped document, which a Forge policy is not, and its backend seam
+	// carries neither the request's preconditions nor a response ETag. Hilt
+	// authenticates and authorizes the forwarded request itself.
+	opts = append(opts, policyRoutes(backend, authority, logger)...)
 
 	// No s3api.WithRootUser: the gateway has no root account, so every access
 	// key resolves through iam.
