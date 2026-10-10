@@ -3,7 +3,7 @@ module github.com/fil-forge/ingot
 go 1.27.0
 
 require (
-	github.com/alanshaw/dag-json-gen v0.0.10
+	github.com/alanshaw/dag-json-gen v0.0.11
 	github.com/aws/aws-sdk-go-v2 v1.47.1
 	github.com/aws/aws-sdk-go-v2/config v1.33.7
 	github.com/aws/aws-sdk-go-v2/credentials v1.20.7
