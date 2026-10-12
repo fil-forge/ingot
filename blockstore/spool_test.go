@@ -2,13 +2,17 @@ package blockstore
 
 import (
 	"bytes"
+	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/fil-forge/ucantone/did"
 	"testing/iotest"
 
 	mh "github.com/multiformats/go-multihash"
@@ -255,5 +259,70 @@ func TestSpoolRemoveTempLeavesTheCountAlone(t *testing.T) {
 	}{[]int64{7, 0}, 5}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("RemoveTemp = %+v, want %+v", got, want)
+	}
+}
+
+// TestSpoolHoldKeepsTheFile: a held blob survives Remove, which frees
+// nothing; once every hold has ended, Remove takes it. Ending a hold twice
+// ends it once.
+func TestSpoolHoldKeepsTheFile(t *testing.T) {
+	s, _ := newTestDirs(t)
+	d := writeTestBlob(t, s, "held")
+	first := s.Hold(did.Undef, d)
+	second := s.Hold(did.Undef, d)
+	var got []string
+	record := func(label string) {
+		n, err := s.Remove(d)
+		if err != nil && !errors.Is(err, ErrHeld) {
+			t.Fatalf("Remove (%s): %v", label, err)
+		}
+		_, statErr := os.Stat(s.Path(d))
+		got = append(got, fmt.Sprint(label, n, statErr == nil, s.Held(d), errors.Is(err, ErrHeld)))
+	}
+	record("two holds")
+	first()
+	first() // a second end of the same hold changes nothing
+	record("one hold")
+	second()
+	record("no hold")
+	want := []string{
+		fmt.Sprint("two holds", 0, true, true, true),
+		fmt.Sprint("one hold", 0, true, true, true),
+		fmt.Sprint("no hold", 4, false, false, false),
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("[label freed exists held ErrHeld] = %v, want %v", got, want)
+	}
+}
+
+// TestSpoolWriteBlobHeldPublishesTheFileHeld: a held write's file is held
+// from the moment it is visible under its digest, so a removal issued right
+// after the write frees nothing; once the hold ends, it does.
+func TestSpoolWriteBlobHeldPublishesTheFileHeld(t *testing.T) {
+	s, _ := newTestDirs(t)
+	space := did.Undef
+	d, n, unhold, err := s.WriteBlobHeld(context.Background(), strings.NewReader("held write"), space)
+	if err != nil || n != 10 || unhold == nil {
+		t.Fatalf("WriteBlobHeld = %x, %d, hold=%v, %v", d, n, unhold != nil, err)
+	}
+	var got []string
+	record := func(label string) {
+		freed, err := s.Remove(d)
+		if err != nil && !errors.Is(err, ErrHeld) {
+			t.Fatalf("Remove (%s): %v", label, err)
+		}
+		_, statErr := os.Stat(s.Path(d))
+		got = append(got, fmt.Sprint(label, freed, statErr == nil, s.HeldBy(space, d), errors.Is(err, ErrHeld)))
+	}
+	record("held")
+	unhold()
+	record("released")
+	want := []string{fmt.Sprint("held", 0, true, true, true), fmt.Sprint("released", 10, false, false, false)}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("[label freed exists held ErrHeld] = %v, want %v", got, want)
+	}
+	// An empty write publishes nothing and holds nothing.
+	if d, n, unhold, err := s.WriteBlobHeld(context.Background(), strings.NewReader(""), space); err != nil || d != nil || n != 0 || unhold != nil {
+		t.Fatalf("empty WriteBlobHeld = %x, %d, hold=%v, %v; want nothing", d, n, unhold != nil, err)
 	}
 }

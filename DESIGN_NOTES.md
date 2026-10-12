@@ -211,10 +211,13 @@ also counts writes in progress as their bytes land. With
 `local_blob_max_bytes` set, a sweeper checks the total every 30 seconds and,
 when it is over the budget, evicts blobs the provider already holds, oldest
 state change first, until usage is at 90% of the budget. A blob qualifies
-only through a row that proves the provider has it: a `blob_locations` row
-for an `accepted` or `published` intent, a `blob_parks` row for a `parked`
-one. Eviction removes the blob's local copy, which is in the cache, or still
-in the spool if the process stopped between recording the acceptance and the
+only through a row that proves the provider has it for the intent's space: a
+`blob_locations` row for an `accepted` or `published` intent, a `blob_parks`
+row for a `parked` one. A blob stored as received can have an intent in
+several spaces, one file between them; it does not qualify while any of
+them is still `spooled` or `uploading`, since that upload reads the file.
+Eviction removes the blob's local copy, which is in the cache, or still in
+the spool if the process stopped between recording the acceptance and the
 move. Spool files waiting for their upload, and writes in progress, never
 qualify; the budget counts them, so the pass evicts cached blobs to make
 room for them. The sweeper first honours two windows, `cache_min_residency`
@@ -227,8 +230,10 @@ stages: first the residency window, still passing over recently read blobs,
 then both (straight to both when the budget pass ran out of candidates). A
 pass that only ran out of time does not count: the next sweep continues
 outside the windows. Eviction removes the file first, then sets
-`upload_intents.evicted_at`; the row and its state stay, because a release
-and Complete read them. A read of an evicted blob misses locally and goes to
+`upload_intents.evicted_at` on the intents as the listing saw them; the
+rows and their states stay, because a release and Complete read them, and
+an intent a write put since the listing, whose file is on disk again, keeps
+its mark clear. A read of an evicted blob misses locally and goes to
 the network tier. A file the pass cannot remove is logged and skipped.
 Hourly, with or without a budget, the sweeper also deletes `.tmp-*` files
 older than `local_blob_orphan_age` (24 hours) in both directories, and spool
@@ -300,7 +305,48 @@ Objects report `x-amz-server-side-encryption: AES256` when encrypted and no
 header when stored as received; SSE-KMS and SSE-C are not implemented, and a
 GET or HEAD carrying any encryption header is refused, as on S3. Plaintext
 bodies bring content dedup back: two objects with the same bytes share a
-blob, each holding its own claim.
+blob, each holding its own claim, and two buckets of different spaces can
+hold one digest. Every blob table is therefore keyed by `(space, digest)`,
+the upload intent and the park included: each space uploads, parks, claims
+and releases its own copy, and the one spool file between them goes with the
+last intent for it. Within a space, a write of bytes whose previous object
+was deleted meets that object's release: the release takes the blob under
+its claim-key lock and marks its record started
+(`blob_release_intents.started_at`) before it removes anything, and a write
+that finds the blob already located takes the same lock first, cancelling a
+record not yet started (its own commit would have made it stale) or waiting
+out a started one and then uploading afresh. The write settles the release
+before every upload, park or conclude, located or not, since a release can
+have dropped the location already, or be removing a blob that never had
+one; a streamed blob settles at its conclude and, after a waited-out
+release, is given up and uploaded again from its spool file. A release
+that starts after the settle and before the commit refuses the claim
+(`registry.ErrReleaseInProgress`), and the write fails with SlowDown for the
+client to retry. Each spool file is published already held for the write's
+space (`blockstore.Spool.WriteBlobHeld`), under the directory lock, until
+its upload has read it: a release leaves a file held by its own space, and
+the intent with it, for the write waiting on it; a file held only by
+another space it leaves too, while its own intent goes; and the cache move
+waits for a held file as well. A release runs only through its record:
+Complete no longer runs an orphan's release unrecorded when recording it
+fails, and leaves it to the reap. A record a start finds stale is deleted
+by that start, under the lock, and no caller deletes a record by key
+afterwards, since the key may by then name a replacement enqueued by a drop
+of the new claim. Writes of one digest to one space take turns at the
+upload within a process (`blobKeyLock`), so the second finds the first's
+location or park; across instances a park already recorded wins, and the
+loser gives up its allocation. Of two spaces releasing the same digest at
+once, each leaving the file for the other's intent, the one whose intent
+delete finds none left removes the file. The streamed paths follow the
+same rule as the rest: a streamed blob concludes, or a streamed part is
+recorded, under the key lock, after a settle and a look at the rows, and
+a location or park another write recorded meanwhile makes the stream
+surplus, given up and reused. The last guard is the claim itself: a
+committed body blob is located by its commit, so `AddBlobClaims` refuses,
+under the claim-key lock, a digest the space has no location for, which is
+one whose release ran to completion between the write's settle and its
+commit; the write fails with SlowDown for the client to retry. A release
+not yet started defers while a write of its space holds the digest.
 
 ## Identity & auth
 

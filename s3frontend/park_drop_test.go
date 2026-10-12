@@ -33,10 +33,10 @@ func TestParkedPartHoldsNoLocalCopy(t *testing.T) {
 		if _, err := os.Stat(localPath(b, d)); !os.IsNotExist(err) {
 			t.Fatalf("parked blob %s spool copy: stat err=%v, want not-exist", d, err)
 		}
-		if in, err := mem.GetIntent(ctx, d); err != nil || in.State != registry.IntentParked {
+		if in, err := mem.IntentByDigest(ctx, d); err != nil || in.State != registry.IntentParked {
 			t.Fatalf("parked blob %s intent = %v/%v, want parked", d, in, err)
 		}
-		if _, err := mem.GetPark(ctx, d); err != nil {
+		if _, err := mem.ParkByDigest(ctx, d); err != nil {
 			t.Fatalf("parked blob %s park row: %v", d, err)
 		}
 		if !mem.IsEvicted(d) {
@@ -77,7 +77,7 @@ func TestFailedParkKeepsLocalCopy(t *testing.T) {
 		if _, err := os.Stat(localPath(b, d)); err != nil {
 			t.Fatalf("blob %s spool copy after a failed park: %v, want it kept", d, err)
 		}
-		if in, err := mem.GetIntent(ctx, d); err != nil || in.State != registry.IntentUploading {
+		if in, err := mem.IntentByDigest(ctx, d); err != nil || in.State != registry.IntentUploading {
 			t.Fatalf("blob %s intent = %v/%v, want uploading", d, in, err)
 		}
 	}

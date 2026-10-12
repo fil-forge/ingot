@@ -4,16 +4,26 @@ package itest
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/moby/moby/api/types/container"
+	"github.com/testcontainers/testcontainers-go"
+	"github.com/testcontainers/testcontainers-go/wait"
 )
 
 // TestForgeBucketEncryption is the end-to-end bucket-encryption suite, on a
@@ -245,6 +255,101 @@ func TestForgeBucketEncryption(t *testing.T) {
 		}
 		if algo := got.ServerSideEncryptionConfiguration.Rules[0].ApplyServerSideEncryptionByDefault.SSEAlgorithm; algo != types.ServerSideEncryptionAes256 {
 			t.Fatalf("GetBucketEncryption = %q, want AES256", algo)
+		}
+	})
+	t.Run("AWSCLI", func(t *testing.T) {
+		// The commands the PR description shows, run by the AWS CLI itself:
+		// the non-standard SSEAlgorithm "none" has to pass the CLI's own
+		// parameter validation, round-trip through get-bucket-encryption,
+		// and make a put-object store as received, with no SSE header on
+		// head-object.
+		ep, err := url.Parse(endpoint)
+		if err != nil {
+			t.Fatalf("parse ingot endpoint %q: %v", endpoint, err)
+		}
+		containerEndpoint := "http://host.docker.internal:" + ep.Port()
+		const cliBucket = "plain-cli"
+		work := t.TempDir()
+		inPath := filepath.Join(work, "in.bin")
+		if err := os.WriteFile(inPath, data, 0o644); err != nil {
+			t.Fatalf("write input: %v", err)
+		}
+		awsAPI := fmt.Sprintf("aws --endpoint-url %q s3api", containerEndpoint)
+		noneConfig := `'{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"none"}}]}'`
+		script := strings.Join([]string{
+			"set -eu",
+			"exec > /work/run.log 2>&1",
+			"aws configure set default.s3.addressing_style path",
+			awsAPI + " create-bucket --bucket " + cliBucket,
+			awsAPI + " put-bucket-encryption --bucket " + cliBucket + " --server-side-encryption-configuration " + noneConfig,
+			awsAPI + " get-bucket-encryption --bucket " + cliBucket + " > /work/enc.json",
+			awsAPI + " put-object --bucket " + cliBucket + " --key obj --body /work/in.bin > /work/put.json",
+			awsAPI + " head-object --bucket " + cliBucket + " --key obj > /work/head.json",
+			awsAPI + " delete-bucket-encryption --bucket " + cliBucket,
+			// Unconfigured again: get-bucket-encryption fails with 404.
+			"if " + awsAPI + " get-bucket-encryption --bucket " + cliBucket + " > /work/enc-after.json 2>&1; then echo 'get-bucket-encryption succeeded after delete' >&2; exit 1; fi",
+			"grep -q ServerSideEncryptionConfigurationNotFoundError /work/enc-after.json",
+		}, "\n")
+		cli, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+			ContainerRequest: testcontainers.ContainerRequest{
+				Image:      awsCLIImage,
+				Entrypoint: []string{"/bin/sh"},
+				Cmd:        []string{"-c", script},
+				Env: map[string]string{
+					"AWS_ACCESS_KEY_ID":         accessKey,
+					"AWS_SECRET_ACCESS_KEY":     secretKey,
+					"AWS_DEFAULT_REGION":        forgeRegion,
+					"AWS_EC2_METADATA_DISABLED": "true",
+					"AWS_PAGER":                 "",
+				},
+				Files: []testcontainers.ContainerFile{{HostFilePath: inPath, ContainerFilePath: "/work/in.bin", FileMode: 0o644}},
+				HostConfigModifier: func(hc *container.HostConfig) {
+					hc.ExtraHosts = append(hc.ExtraHosts, "host.docker.internal:host-gateway")
+				},
+				WaitingFor: wait.ForExit().WithExitTimeout(5 * time.Minute),
+			},
+			Started: true,
+		})
+		if cli != nil {
+			t.Cleanup(func() { _ = cli.Terminate(context.Background()) })
+		}
+		if err != nil {
+			t.Fatalf("run aws-cli container: %v", err)
+		}
+		state, err := cli.State(ctx)
+		if err != nil {
+			t.Fatalf("aws-cli container state: %v", err)
+		}
+		logs := string(fileFromContainer(t, ctx, cli, "/work/run.log"))
+		if state.ExitCode != 0 {
+			t.Fatalf("aws-cli script exited %d:\n%s", state.ExitCode, logs)
+		}
+		t.Logf("aws-cli output:\n%s", logs)
+
+		var enc struct {
+			ServerSideEncryptionConfiguration struct {
+				Rules []struct {
+					ApplyServerSideEncryptionByDefault struct {
+						SSEAlgorithm string `json:"SSEAlgorithm"`
+					} `json:"ApplyServerSideEncryptionByDefault"`
+				} `json:"Rules"`
+			} `json:"ServerSideEncryptionConfiguration"`
+		}
+		if err := json.Unmarshal(fileFromContainer(t, ctx, cli, "/work/enc.json"), &enc); err != nil {
+			t.Fatalf("parse get-bucket-encryption output: %v", err)
+		}
+		if rules := enc.ServerSideEncryptionConfiguration.Rules; len(rules) != 1 || rules[0].ApplyServerSideEncryptionByDefault.SSEAlgorithm != "none" {
+			t.Fatalf("get-bucket-encryption = %+v, want one rule with SSEAlgorithm none", enc)
+		}
+		var head map[string]any
+		if err := json.Unmarshal(fileFromContainer(t, ctx, cli, "/work/head.json"), &head); err != nil {
+			t.Fatalf("parse head-object output: %v", err)
+		}
+		if sse, ok := head["ServerSideEncryption"]; ok {
+			t.Fatalf("head-object reports ServerSideEncryption %v on a none bucket, want none", sse)
+		}
+		if n, _ := head["ContentLength"].(float64); int(n) != len(data) {
+			t.Fatalf("head-object ContentLength = %v, want %d", head["ContentLength"], len(data))
 		}
 	})
 }

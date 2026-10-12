@@ -61,7 +61,7 @@ func runReleasedSuite(t *testing.T, st releasedStore) {
 	published := func(name string) multihash.Multihash {
 		t.Helper()
 		d := evictDigest(t, "released:"+name)
-		if err := st.PutIntent(ctx, registry.UploadIntent{Digest: d, LocalPath: "/spool/x", Size: 7, State: registry.IntentPublished}); err != nil {
+		if err := st.PutIntent(ctx, registry.UploadIntent{Space: space, Digest: d, LocalPath: "/spool/x", Size: 7, State: registry.IntentPublished}); err != nil {
 			t.Fatalf("PutIntent: %v", err)
 		}
 		return d
@@ -73,6 +73,9 @@ func runReleasedSuite(t *testing.T, st releasedStore) {
 		t.Fatalf("PutLocation: %v", err)
 	}
 	claimed := published("claimed")
+	if err := st.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: claimed, Provider: "did:web:piri", URL: "https://piri/blob", Size: 7}); err != nil {
+		t.Fatalf("PutLocation: %v", err)
+	}
 	if err := st.AddBlobClaim(ctx, registry.BlobClaim{Digest: claimed, Bucket: "bk", ObjectKey: "k", VersionID: "v", Space: space}); err != nil {
 		t.Fatalf("AddBlobClaim: %v", err)
 	}
@@ -111,7 +114,14 @@ func runReleasedSuite(t *testing.T, st releasedStore) {
 		inDeadParts = append(inDeadParts, d)
 	}
 	accepted := evictDigest(t, "released:accepted")
-	if err := st.PutIntent(ctx, registry.UploadIntent{Digest: accepted, LocalPath: "/spool/x", Size: 7, State: registry.IntentAccepted}); err != nil {
+	if err := st.PutIntent(ctx, registry.UploadIntent{Space: space, Digest: accepted, LocalPath: "/spool/x", Size: 7, State: registry.IntentAccepted}); err != nil {
+		t.Fatalf("PutIntent: %v", err)
+	}
+	// A published intent another space also holds: the file is still that
+	// space's, so the digest is off the list until that intent goes.
+	shared := published("shared")
+	space2 := testutil.RandomDID(t)
+	if err := st.PutIntent(ctx, registry.UploadIntent{Space: space2, Digest: shared, LocalPath: "/spool/x", Size: 7, State: registry.IntentPublished}); err != nil {
 		t.Fatalf("PutIntent: %v", err)
 	}
 	hexes := func(ds []multihash.Multihash) []string {
@@ -160,20 +170,31 @@ func runReleasedSuite(t *testing.T, st releasedStore) {
 	}
 
 	// The delete rechecks the conditions: a named blob keeps its intent.
-	for _, d := range []multihash.Multihash{located, claimed, pending, inPart, accepted} {
-		if ok, err := st.DeleteReleasedPublished(ctx, d); err != nil || ok {
+	for _, d := range []multihash.Multihash{located, claimed, pending, inPart, accepted, shared} {
+		if ok, err := st.DeleteReleasedPublished(ctx, space, d); err != nil || ok {
 			t.Fatalf("DeleteReleasedPublished(%s) = %v, %v; want false", d.HexString(), ok, err)
 		}
-		if _, err := st.GetIntent(ctx, d); err != nil {
+		if _, err := st.GetIntent(ctx, space, d); err != nil {
 			t.Fatalf("intent %s after a refused delete: %v", d.HexString(), err)
 		}
 	}
 	for _, d := range append([]multihash.Multihash{released}, inDeadParts...) {
-		if ok, err := st.DeleteReleasedPublished(ctx, d); err != nil || !ok {
+		if ok, err := st.DeleteReleasedPublished(ctx, space, d); err != nil || !ok {
 			t.Fatalf("DeleteReleasedPublished(%s) = %v, %v; want true", d.HexString(), ok, err)
 		}
 	}
 	if got := listed(); len(got) != 0 {
 		t.Fatalf("after deleting the released intents: %v, want none", got)
+	}
+	// Once the other space's intent is gone, the shared digest's remaining
+	// intent is released like any other.
+	if err := st.DeleteIntent(ctx, space2, shared); err != nil {
+		t.Fatalf("DeleteIntent: %v", err)
+	}
+	if got := listed(); !reflect.DeepEqual(got, hexes([]multihash.Multihash{shared})) {
+		t.Fatalf("after the other space's intent went: %v, want only the shared digest", got)
+	}
+	if ok, err := st.DeleteReleasedPublished(ctx, space, shared); err != nil || !ok {
+		t.Fatalf("DeleteReleasedPublished(shared) = %v, %v; want true", ok, err)
 	}
 }

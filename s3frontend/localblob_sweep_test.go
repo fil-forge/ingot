@@ -21,8 +21,10 @@ import (
 	"github.com/fil-forge/libforge/testutil"
 	"github.com/fil-forge/versitygw/s3response"
 
+	"github.com/fil-forge/ingot/blockstore"
 	"github.com/fil-forge/ingot/inmem"
 	"github.com/fil-forge/ingot/registry"
+	"github.com/fil-forge/ucantone/did"
 )
 
 // These tests drive SweepLocalBlobs over a real on-disk spool. inmem.NopUploader
@@ -42,6 +44,16 @@ func newSweepBackend(t *testing.T, mods ...func(*Deps)) (*Backend, *inmem.MemSto
 		t.Fatalf("create bucket: %v", err)
 	}
 	return b, mem
+}
+
+// sweepSpace is the sweep bucket's space, which its intents and parks carry.
+func sweepSpace(t *testing.T, mem *inmem.MemStore) did.DID {
+	t.Helper()
+	st, err := mem.Get(t.Context(), sweepBucket)
+	if err != nil {
+		t.Fatalf("get bucket: %v", err)
+	}
+	return st.Space
 }
 
 // putSweepObjects writes n single-blob objects, oldest first, and returns
@@ -216,7 +228,7 @@ func TestSweepLocalBlobs_KeepsBlobsTheProviderMayNotHold(t *testing.T) {
 		if err != nil {
 			t.Fatalf("WriteBlob: %v", err)
 		}
-		if err := mem.PutIntent(ctx, registry.UploadIntent{Digest: d, LocalPath: localPath(b, d), Size: n, State: state}); err != nil {
+		if err := mem.PutIntent(ctx, registry.UploadIntent{Space: sweepSpace(t, mem), Digest: d, LocalPath: localPath(b, d), Size: n, State: state}); err != nil {
 			t.Fatalf("PutIntent: %v", err)
 		}
 		digests = append(digests, d)
@@ -302,7 +314,7 @@ func TestSweepLocalBlobs_OrphanPass(t *testing.T) {
 			}
 		}
 		if withIntent {
-			if err := mem.PutIntent(ctx, registry.UploadIntent{Digest: d, LocalPath: localPath(b, d), Size: n, State: registry.IntentSpooled}); err != nil {
+			if err := mem.PutIntent(ctx, registry.UploadIntent{Space: sweepSpace(t, mem), Digest: d, LocalPath: localPath(b, d), Size: n, State: registry.IntentSpooled}); err != nil {
 				t.Fatalf("PutIntent: %v", err)
 			}
 		}
@@ -380,7 +392,7 @@ func TestRemoveReleasedPublished(t *testing.T) {
 				t.Fatalf("Remove: %v", err)
 			}
 		}
-		if err := mem.PutIntent(ctx, registry.UploadIntent{Digest: d, LocalPath: localPath(b, d), Size: n, State: registry.IntentPublished}); err != nil {
+		if err := mem.PutIntent(ctx, registry.UploadIntent{Space: sweepSpace(t, mem), Digest: d, LocalPath: localPath(b, d), Size: n, State: registry.IntentPublished}); err != nil {
 			t.Fatalf("PutIntent: %v", err)
 		}
 		return d, n
@@ -401,14 +413,14 @@ func TestRemoveReleasedPublished(t *testing.T) {
 		if fileExists(localPath(b, d)) {
 			t.Fatalf("released blob %x's file survived the sweep", d)
 		}
-		if _, err := mem.GetIntent(ctx, d); !errors.Is(err, registry.ErrNotFound) {
+		if _, err := mem.IntentByDigest(ctx, d); !errors.Is(err, registry.ErrNotFound) {
 			t.Fatalf("released blob %x's intent: err=%v, want ErrNotFound", d, err)
 		}
 	}
 	if !fileExists(localPath(b, live)) {
 		t.Fatal("live blob's file was removed, want it kept")
 	}
-	if in, err := mem.GetIntent(ctx, live); err != nil || in.State != registry.IntentPublished {
+	if in, err := mem.IntentByDigest(ctx, live); err != nil || in.State != registry.IntentPublished {
 		t.Fatalf("live blob's intent = %v/%v, want published", in, err)
 	}
 }
@@ -422,7 +434,7 @@ func TestSweepLocalBlobs_LeavesReleasedBlobsToTheStartupPass(t *testing.T) {
 	if err != nil {
 		t.Fatalf("WriteBlob: %v", err)
 	}
-	if err := mem.PutIntent(ctx, registry.UploadIntent{Digest: d, LocalPath: localPath(b, d), Size: n, State: registry.IntentPublished}); err != nil {
+	if err := mem.PutIntent(ctx, registry.UploadIntent{Space: sweepSpace(t, mem), Digest: d, LocalPath: localPath(b, d), Size: n, State: registry.IntentPublished}); err != nil {
 		t.Fatalf("PutIntent: %v", err)
 	}
 
@@ -446,7 +458,7 @@ func TestRemoveReleasedPublishedRetriesACopyItCannotRemove(t *testing.T) {
 		if err != nil {
 			t.Fatalf("WriteBlob: %v", err)
 		}
-		if err := mem.PutIntent(ctx, registry.UploadIntent{Digest: d, LocalPath: localPath(b, d), Size: n, State: registry.IntentPublished}); err != nil {
+		if err := mem.PutIntent(ctx, registry.UploadIntent{Space: sweepSpace(t, mem), Digest: d, LocalPath: localPath(b, d), Size: n, State: registry.IntentPublished}); err != nil {
 			t.Fatalf("PutIntent: %v", err)
 		}
 		digests = append(digests, d)
@@ -470,7 +482,7 @@ func TestRemoveReleasedPublishedRetriesACopyItCannotRemove(t *testing.T) {
 	}
 	intentKept := func(d multihash.Multihash) bool {
 		t.Helper()
-		_, err := mem.GetIntent(ctx, d)
+		_, err := mem.IntentByDigest(ctx, d)
 		if err != nil && !errors.Is(err, registry.ErrNotFound) {
 			t.Fatalf("GetIntent %x: %v", d, err)
 		}
@@ -547,10 +559,10 @@ func TestSweepLocalBlobs_EvictsAParkedBlob(t *testing.T) {
 	if err != nil {
 		t.Fatalf("WriteBlob: %v", err)
 	}
-	if err := mem.PutIntent(ctx, registry.UploadIntent{Digest: d, LocalPath: localPath(b, d), Size: n, State: registry.IntentParked}); err != nil {
+	if err := mem.PutIntent(ctx, registry.UploadIntent{Space: sweepSpace(t, mem), Digest: d, LocalPath: localPath(b, d), Size: n, State: registry.IntentParked}); err != nil {
 		t.Fatalf("PutIntent: %v", err)
 	}
-	if err := mem.PutPark(ctx, registry.BlobPark{Digest: d, Size: n}); err != nil {
+	if _, err := mem.PutPark(ctx, registry.BlobPark{Space: sweepSpace(t, mem), Digest: d, Size: n}); err != nil {
 		t.Fatalf("PutPark: %v", err)
 	}
 
@@ -837,10 +849,10 @@ func TestSweepLocalBlobs_EvictsAHeldBlobLeftInTheSpool(t *testing.T) {
 	if err != nil {
 		t.Fatalf("WriteBlob: %v", err)
 	}
-	if err := mem.PutIntent(ctx, registry.UploadIntent{Digest: d, LocalPath: b.spool.Path(d), Size: n, State: registry.IntentAccepted}); err != nil {
+	if err := mem.PutIntent(ctx, registry.UploadIntent{Space: sweepSpace(t, mem), Digest: d, LocalPath: b.spool.Path(d), Size: n, State: registry.IntentAccepted}); err != nil {
 		t.Fatalf("PutIntent: %v", err)
 	}
-	if err := mem.PutLocation(ctx, registry.BlobLocation{Space: testutil.RandomDID(t), Digest: d, Provider: "did:key:p", URL: "http://p/blob", Size: n}); err != nil {
+	if err := mem.PutLocation(ctx, registry.BlobLocation{Space: sweepSpace(t, mem), Digest: d, Provider: "did:key:p", URL: "http://p/blob", Size: n}); err != nil {
 		t.Fatalf("PutLocation: %v", err)
 	}
 
@@ -1131,7 +1143,7 @@ func TestSweepLocalBlobs_OrphanPassChecksInBatches(t *testing.T) {
 				if i%2 == 0 {
 					orphans = append(orphans, d)
 				} else {
-					if err := mem.PutIntent(ctx, registry.UploadIntent{Digest: d, LocalPath: localPath(b, d), Size: n, State: registry.IntentSpooled}); err != nil {
+					if err := mem.PutIntent(ctx, registry.UploadIntent{Space: sweepSpace(t, mem), Digest: d, LocalPath: localPath(b, d), Size: n, State: registry.IntentSpooled}); err != nil {
 						t.Fatalf("PutIntent: %v", err)
 					}
 					kept = append(kept, d)
@@ -1308,4 +1320,91 @@ type countingEvictable struct {
 func (c countingEvictable) ListEvictable(ctx context.Context, cursor registry.EvictCursor, limit int) ([]registry.UploadIntent, error) {
 	*c.calls++
 	return c.IntentStore.ListEvictable(ctx, cursor, limit)
+}
+
+// holdingEvictable takes a write's hold on every blob it lists, as a write
+// of the same bytes that spools them between the listing and the removal.
+type holdingEvictable struct {
+	registry.IntentStore
+	spool   *blockstore.Spool
+	unholds []func()
+}
+
+func (h *holdingEvictable) ListEvictable(ctx context.Context, cursor registry.EvictCursor, limit int) ([]registry.UploadIntent, error) {
+	page, err := h.IntentStore.ListEvictable(ctx, cursor, limit)
+	for _, in := range page {
+		h.unholds = append(h.unholds, h.spool.Hold(in.Space, in.Digest))
+	}
+	return page, err
+}
+
+// TestSweepLocalBlobs_LeavesAHeldBlobUnmarked: a write of the same bytes
+// that takes the file between the listing and the removal keeps it, and the
+// row is not marked evicted, since the file is not gone; the pass counts it
+// as skipped and moves on.
+func TestSweepLocalBlobs_LeavesAHeldBlobUnmarked(t *testing.T) {
+	var held *holdingEvictable
+	b, mem := newSweepBackend(t, func(d *Deps) {
+		held = &holdingEvictable{IntentStore: d.Intents, spool: d.Spool}
+		d.Intents = held
+	})
+	digests := putSweepObjects(t, b, 1)
+	budgetToEvict(b, 1, blobSize(t, b, digests[0]))
+
+	stats := sweepLocalBlobs(t, b)
+	for _, unhold := range held.unholds {
+		unhold()
+	}
+
+	want := []blobState{{true, false}}
+	if got := blobStates(t, b, mem, digests); !reflect.DeepEqual(got, want) {
+		t.Fatalf("held blob after the sweep = %+v, want %+v", got, want)
+	}
+	if stats.BudgetFiles != 0 {
+		t.Fatalf("the sweep counted %d files removed, want 0", stats.BudgetFiles)
+	}
+}
+
+// respoolingEvictable puts a second space's intent for each digest it is
+// asked to mark, right before marking, as a write of the same bytes that
+// spools and commits them between the sweep's removal and its mark.
+type respoolingEvictable struct {
+	registry.IntentStore
+	mem   *inmem.MemStore
+	space did.DID
+}
+
+func (r *respoolingEvictable) MarkEvicted(ctx context.Context, digest multihash.Multihash, notAfter time.Time) error {
+	if err := r.mem.PutIntent(ctx, registry.UploadIntent{Space: r.space, Digest: digest, LocalPath: "/spool/again", Size: 1, State: registry.IntentAccepted}); err != nil {
+		return err
+	}
+	if err := r.mem.PutLocation(ctx, registry.BlobLocation{Space: r.space, Digest: digest, Provider: "did:key:p", URL: "http://p/blob", Size: 1}); err != nil {
+		return err
+	}
+	return r.IntentStore.MarkEvicted(ctx, digest, notAfter)
+}
+
+// TestSweepLocalBlobs_MarkLeavesAnIntentPutSinceTheListing: a write that
+// spools the same bytes again and commits its intent between the sweep's
+// removal and its mark keeps its mark clear, so its file is still the
+// sweep's to evict later.
+func TestSweepLocalBlobs_MarkLeavesAnIntentPutSinceTheListing(t *testing.T) {
+	ctx := t.Context()
+	var again *respoolingEvictable
+	b, mem := newSweepBackend(t, func(d *Deps) {
+		again = &respoolingEvictable{IntentStore: d.Intents, mem: d.Intents.(*inmem.MemStore), space: testutil.RandomDID(t)}
+		d.Intents = again
+	})
+	digests := putSweepObjects(t, b, 1)
+	budgetToEvict(b, 1, blobSize(t, b, digests[0]))
+
+	sweepLocalBlobs(t, b)
+
+	rows, err := mem.ListEvictable(ctx, registry.EvictCursor{}, 10)
+	if err != nil {
+		t.Fatalf("ListEvictable: %v", err)
+	}
+	if len(rows) != 1 || rows[0].Space != again.space {
+		t.Fatalf("evictable after the sweep = %+v, want only the intent put since the listing", rows)
+	}
 }

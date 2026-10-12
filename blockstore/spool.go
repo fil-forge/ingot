@@ -3,11 +3,14 @@ package blockstore
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"sync"
 	"sync/atomic"
 
+	"github.com/fil-forge/ucantone/did"
 	mh "github.com/multiformats/go-multihash"
 )
 
@@ -38,6 +41,15 @@ type Spool struct {
 	// bytes are briefly in both, between its commit and WriteBlob's return,
 	// so Usage can run high by up to one blob per concurrent write.
 	inFlight atomic.Int64
+	// holds counts, per space and digest, the writes that still need the
+	// blob's file: from its spool write until its upload has read it. Remove
+	// leaves a held blob alone, so a release of the same digest by another
+	// object never takes a file a write in flight is about to upload. The
+	// space says whose write holds it: a release reads its own space's hold
+	// as a write waiting for it, and another space's as a reason to leave
+	// the file and nothing else.
+	holdMu sync.Mutex
+	holds  map[holdKey]int
 }
 
 // spoolTempPrefix names the files WriteBlob streams into before the rename to
@@ -51,7 +63,7 @@ func NewSpool(dir string) (*Spool, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &Spool{blobDir: d}
+	s := &Spool{blobDir: d, holds: map[holdKey]int{}}
 	if err := s.recoverDir(); err != nil {
 		return nil, err
 	}
@@ -101,10 +113,26 @@ func (s *Spool) InFlight() int64 {
 // in no count until the sweeper's orphan pass removes it. An empty r writes nothing and returns a nil digest with
 // n == 0 (a zero-byte object has no blob). Re-writing an identical blob is
 // idempotent (same digest, rename overwrites in place).
-func (s *Spool) WriteBlob(_ context.Context, r io.Reader) (mh.Multihash, int64, error) {
+func (s *Spool) WriteBlob(ctx context.Context, r io.Reader) (mh.Multihash, int64, error) {
+	digest, n, _, err := s.writeBlob(ctx, r, nil)
+	return digest, n, err
+}
+
+// WriteBlobHeld is WriteBlob for a write that needs the blob's file after
+// the write, to upload it: the file is published already held for space
+// (see Hold), under the same lock as its rename, so no removal can take it
+// between the two. unhold ends the hold; it is nil when nothing was
+// written.
+func (s *Spool) WriteBlobHeld(ctx context.Context, r io.Reader, space did.DID) (digest mh.Multihash, n int64, unhold func(), err error) {
+	return s.writeBlob(ctx, r, &space)
+}
+
+// writeBlob is WriteBlob and WriteBlobHeld: hold, when set, is the space
+// whose hold the committed file is published under.
+func (s *Spool) writeBlob(_ context.Context, r io.Reader, hold *did.DID) (mh.Multihash, int64, func(), error) {
 	tmp, err := os.CreateTemp(s.dir, spoolTempPrefix+"*")
 	if err != nil {
-		return nil, 0, fmt.Errorf("blockstore: spool tempfile: %w", err)
+		return nil, 0, nil, fmt.Errorf("blockstore: spool tempfile: %w", err)
 	}
 	tmpName := tmp.Name()
 	counted := &countingWriter{w: tmp, count: &s.inFlight}
@@ -118,43 +146,51 @@ func (s *Spool) WriteBlob(_ context.Context, r io.Reader) (mh.Multihash, int64, 
 	}
 	if copyErr != nil {
 		_ = os.Remove(tmpName)
-		return nil, n, fmt.Errorf("blockstore: spool write: %w", copyErr)
+		return nil, n, nil, fmt.Errorf("blockstore: spool write: %w", copyErr)
 	}
 	if n == 0 {
 		_ = os.Remove(tmpName)
-		return nil, 0, nil
+		return nil, 0, nil, nil
 	}
 	digest, err := mh.Encode(hasher.Sum(nil), mh.SHA2_256)
 	if err != nil {
 		_ = os.Remove(tmpName)
-		return nil, n, fmt.Errorf("blockstore: spool digest: %w", err)
+		return nil, n, nil, fmt.Errorf("blockstore: spool digest: %w", err)
 	}
-	if err := s.commit(tmpName, digest, counted.n); err != nil {
+	unhold, err := s.commit(tmpName, digest, counted.n, hold)
+	if err != nil {
 		_ = os.Remove(tmpName)
-		return nil, n, err
+		return nil, n, nil, err
 	}
-	return digest, n, nil
+	return digest, n, unhold, nil
 }
 
 // commit renames a finished temp file to its digest path and counts its size
-// as finished, unless an identical blob already sat there (counted already).
-// The check and the rename are not atomic against a Remove of the same
-// digest; that cannot happen today, because every write encrypts under a
-// fresh key and so has a digest of its own.
-func (s *Spool) commit(tmpName string, digest mh.Multihash, size int64) error {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+// as finished, unless an identical blob already sat there (counted already),
+// and takes the hold for the space in hold, if any, before the file is
+// visible under its digest. It holds the directory exclusively, so the
+// check, the rename and the hold never overlap a Remove or a Take of the
+// same digest, which the same bytes stored as received and written again
+// can race: the count sees either the old file replaced in place or the new
+// file arriving after the old one left, and a removal sees the file held or
+// absent.
+func (s *Spool) commit(tmpName string, digest mh.Multihash, size int64, hold *did.DID) (unhold func(), err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	path := s.Path(digest)
 	_, statErr := os.Stat(path)
 	existed := statErr == nil
 	if err := os.Rename(tmpName, path); err != nil {
-		return fmt.Errorf("blockstore: spool rename: %w", err)
+		return nil, fmt.Errorf("blockstore: spool rename: %w", err)
 	}
 	if !existed {
 		s.usage.Add(size)
 	}
 	s.changes.Add(1)
-	return nil
+	if hold != nil {
+		unhold = s.holdLocked(holdKey{*hold, string(digest)})
+	}
+	return unhold, nil
 }
 
 // countingWriter adds each byte it writes to count, and remembers how many so
@@ -180,3 +216,81 @@ var (
 	_ BlobRangeReader = (*Spool)(nil)
 	_ BlobWriter      = (*Spool)(nil)
 )
+
+// holdKey names one space's holds on one digest.
+type holdKey struct {
+	space  did.DID
+	digest string
+}
+
+// Hold marks the blob with the given digest as needed by a write in flight
+// for space, so Remove leaves its file alone, and returns the function that
+// ends the hold. Ending it twice is harmless. A write holds each blob it
+// spools from the spool write until its upload has read the file, which is
+// what keeps the same bytes written as received by two objects safe: a
+// release of the first object's blob can run while the second write is
+// between spooling and uploading it.
+//
+// Hold takes the directory shared, as Remove takes it exclusively, so a hold
+// never lands between Remove's check and its unlink.
+func (s *Spool) Hold(space did.DID, digest mh.Multihash) (unhold func()) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.holdLocked(holdKey{space, string(digest)})
+}
+
+// holdLocked is Hold for a caller that holds mu, shared or exclusively.
+func (s *Spool) holdLocked(k holdKey) (unhold func()) {
+	s.holdMu.Lock()
+	s.holds[k]++
+	s.holdMu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			s.holdMu.Lock()
+			defer s.holdMu.Unlock()
+			if s.holds[k] <= 1 {
+				delete(s.holds, k)
+			} else {
+				s.holds[k]--
+			}
+		})
+	}
+}
+
+// Held reports whether a write in flight, in any space, holds the blob.
+func (s *Spool) Held(digest mh.Multihash) bool {
+	s.holdMu.Lock()
+	defer s.holdMu.Unlock()
+	for k := range s.holds {
+		if k.digest == string(digest) {
+			return true
+		}
+	}
+	return false
+}
+
+// HeldBy reports whether a write in flight for space holds the blob.
+func (s *Spool) HeldBy(space did.DID, digest mh.Multihash) bool {
+	s.holdMu.Lock()
+	defer s.holdMu.Unlock()
+	return s.holds[holdKey{space, string(digest)}] > 0
+}
+
+// ErrHeld is Remove's answer for a blob a write in flight holds (Hold): the
+// file is left as it is and nothing is freed. A caller that would record
+// the file as gone (an evicted mark, a deleted intent) must not.
+var ErrHeld = errors.New("blockstore: blob held by a write in flight")
+
+// Remove deletes the blob with the given digest, as blobDir.Remove does,
+// unless a write in flight holds it (Hold): it then returns ErrHeld, having
+// freed nothing. It holds the directory exclusively, so the check and the
+// unlink admit no hold or commit between them.
+func (s *Spool) Remove(digest mh.Multihash) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.Held(digest) {
+		return 0, ErrHeld
+	}
+	return s.removeLocked(digest)
+}

@@ -143,15 +143,16 @@ func TestMultipartLatch_SingleWinner_Concurrent(t *testing.T) {
 func TestIntents_StateMachine(t *testing.T) {
 	ctx := context.Background()
 	m := NewMemStore()
+	space := testutil.RandomDID(t)
 	digest := []byte("intent-digest")
 
 	if err := m.PutIntent(ctx, registry.UploadIntent{
-		Digest: digest, LocalPath: "/spool/x", Size: 42, State: registry.IntentSpooled, Bucket: "b",
+		Space: space, Digest: digest, LocalPath: "/spool/x", Size: 42, State: registry.IntentSpooled, Bucket: "b",
 	}); err != nil {
 		t.Fatalf("PutIntent: %v", err)
 	}
 
-	got, err := m.GetIntent(ctx, digest)
+	got, err := m.GetIntent(ctx, space, digest)
 	if err != nil {
 		t.Fatalf("GetIntent: %v", err)
 	}
@@ -159,7 +160,7 @@ func TestIntents_StateMachine(t *testing.T) {
 		t.Fatalf("GetIntent = %+v", got)
 	}
 
-	if err := m.SetIntentState(ctx, digest, registry.IntentParked); err != nil {
+	if err := m.SetIntentState(ctx, space, digest, registry.IntentParked); err != nil {
 		t.Fatalf("SetIntentState: %v", err)
 	}
 	parked, err := m.ListIntentsByState(ctx, registry.IntentParked)
@@ -174,14 +175,14 @@ func TestIntents_StateMachine(t *testing.T) {
 	}
 
 	// SetIntentState on a missing digest is an explicit miss.
-	if err := m.SetIntentState(ctx, []byte("nope"), registry.IntentParked); err != registry.ErrNotFound {
+	if err := m.SetIntentState(ctx, space, []byte("nope"), registry.IntentParked); err != registry.ErrNotFound {
 		t.Fatalf("SetIntentState missing err = %v, want ErrNotFound", err)
 	}
 
-	if err := m.DeleteIntent(ctx, digest); err != nil {
+	if err := m.DeleteIntent(ctx, space, digest); err != nil {
 		t.Fatalf("DeleteIntent: %v", err)
 	}
-	if _, err := m.GetIntent(ctx, digest); err != registry.ErrNotFound {
+	if _, err := m.GetIntent(ctx, space, digest); err != registry.ErrNotFound {
 		t.Fatalf("GetIntent after delete err = %v, want ErrNotFound", err)
 	}
 }
@@ -460,6 +461,10 @@ func TestRevocationCursor_UpsertRoundTrip(t *testing.T) {
 
 func mustAdd(t *testing.T, m *MemStore, c registry.BlobClaim) {
 	t.Helper()
+	// A claim requires the provider to hold the blob for the space.
+	if err := m.PutLocation(context.Background(), registry.BlobLocation{Space: c.Space, Digest: c.Digest, Provider: "did:key:p", URL: "http://p/blob", Size: 1}); err != nil {
+		t.Fatalf("PutLocation: %v", err)
+	}
 	if err := m.AddBlobClaim(context.Background(), c); err != nil {
 		t.Fatalf("AddBlobClaim: %v", err)
 	}
@@ -493,13 +498,13 @@ func TestParts_LiveRefsFollowSessionState(t *testing.T) {
 		}
 		mustPutPart(t, m, registry.MultipartPart{UploadID: id, PartNumber: 1, ETagMD5: []byte("m"), Size: 1, BlobDigests: []multihash.Multihash{shared}})
 	}
-	if n, _ := m.CountLivePartRefs(ctx, shared); n != 3 {
+	if n, _ := m.CountLivePartRefs(ctx, did.Undef, shared); n != 3 {
 		t.Fatalf("live refs with three open sessions = %d, want 3", n)
 	}
 	if won, err := m.LatchSession(ctx, "a", registry.SessionOpen, registry.SessionCompleting); err != nil || !won {
 		t.Fatalf("latch a: won=%v err=%v", won, err)
 	}
-	if n, _ := m.CountLivePartRefs(ctx, shared); n != 3 {
+	if n, _ := m.CountLivePartRefs(ctx, did.Undef, shared); n != 3 {
 		t.Fatalf("live refs with one completing = %d, want 3 (completing is in flight)", n)
 	}
 	if won, err := m.LatchSession(ctx, "a", registry.SessionCompleting, registry.SessionCompleted); err != nil || !won {
@@ -508,10 +513,10 @@ func TestParts_LiveRefsFollowSessionState(t *testing.T) {
 	if won, err := m.LatchSession(ctx, "b", registry.SessionOpen, registry.SessionAborting); err != nil || !won {
 		t.Fatalf("latch b aborting: won=%v err=%v", won, err)
 	}
-	if n, _ := m.CountLivePartRefs(ctx, shared); n != 1 {
+	if n, _ := m.CountLivePartRefs(ctx, did.Undef, shared); n != 1 {
 		t.Fatalf("live refs with one completed and one aborting = %d, want 1", n)
 	}
-	if n, _ := m.CountLivePartRefs(ctx, multihash.Multihash([]byte("other"))); n != 0 {
+	if n, _ := m.CountLivePartRefs(ctx, did.Undef, multihash.Multihash([]byte("other"))); n != 0 {
 		t.Fatalf("live refs of an unreferenced digest = %d, want 0", n)
 	}
 }
@@ -554,20 +559,27 @@ func TestBlobRefs_ClaimPublishesIntent(t *testing.T) {
 		t.Fatalf("PutIntent: %v", err)
 	}
 	claim := registry.BlobClaim{Digest: d, Bucket: "b", ObjectKey: "k", VersionID: registry.NullVersionID, Space: did.Undef}
+	if err := m.PutLocation(ctx, registry.BlobLocation{Space: did.Undef, Digest: d, Provider: "did:key:p", URL: "http://p/blob", Size: 1}); err != nil {
+		t.Fatalf("PutLocation: %v", err)
+	}
 	if err := m.AddBlobClaim(ctx, claim); err != nil {
 		t.Fatalf("AddBlobClaim: %v", err)
 	}
-	if in, _ := m.GetIntent(ctx, d); in.State != registry.IntentPublished {
+	if in, _ := m.GetIntent(ctx, did.Undef, d); in.State != registry.IntentPublished {
 		t.Fatalf("intent after claim = %q, want published", in.State)
 	}
 	if err := m.DeleteBlobClaim(ctx, d, "b", "k", registry.NullVersionID); err != nil {
 		t.Fatalf("DeleteBlobClaim: %v", err)
 	}
-	if in, _ := m.GetIntent(ctx, d); in.State != registry.IntentPublished {
+	if in, _ := m.GetIntent(ctx, did.Undef, d); in.State != registry.IntentPublished {
 		t.Fatalf("intent after the claim dropped = %q, want still published", in.State)
 	}
 	// No intent row: nothing to publish, no error.
-	if err := m.AddBlobClaim(ctx, registry.BlobClaim{Digest: multihash.Multihash([]byte("segment")), Bucket: "b", ObjectKey: "s", VersionID: registry.NullVersionID}); err != nil {
+	seg := multihash.Multihash([]byte("segment"))
+	if err := m.PutLocation(ctx, registry.BlobLocation{Space: did.Undef, Digest: seg, Provider: "did:key:p", URL: "http://p/blob", Size: 1}); err != nil {
+		t.Fatalf("PutLocation: %v", err)
+	}
+	if err := m.AddBlobClaim(ctx, registry.BlobClaim{Digest: seg, Bucket: "b", ObjectKey: "s", VersionID: registry.NullVersionID}); err != nil {
 		t.Fatalf("AddBlobClaim without intent: %v", err)
 	}
 }
@@ -594,5 +606,31 @@ func TestSessions_StaleByStateChange(t *testing.T) {
 	}
 	if s, _ := m.GetSession(ctx, "latched"); !s.StateChangedAt.After(s.CreatedAt) {
 		t.Fatalf("StateChangedAt %v not after CreatedAt %v", s.StateChangedAt, s.CreatedAt)
+	}
+}
+
+// Live part refs are one space's: the same digest parked by sessions of two
+// spaces counts once for each, and not at all for a third.
+func TestParts_LiveRefsArePerSpace(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+	a, b := testutil.RandomDID(t), testutil.RandomDID(t)
+	shared := multihash.Multihash([]byte("shared"))
+	for id, space := range map[string]did.DID{"in-a": a, "in-b": b} {
+		if err := m.CreateSession(ctx, registry.MultipartSession{UploadID: id, Bucket: id, ObjectKey: "k", Space: space}); err != nil {
+			t.Fatalf("CreateSession %s: %v", id, err)
+		}
+		mustPutPart(t, m, registry.MultipartPart{UploadID: id, PartNumber: 1, ETagMD5: []byte("m"), Size: 1, BlobDigests: []multihash.Multihash{shared}})
+	}
+	var got []int
+	for _, space := range []did.DID{a, b, testutil.RandomDID(t)} {
+		n, err := m.CountLivePartRefs(ctx, space, shared)
+		if err != nil {
+			t.Fatalf("CountLivePartRefs: %v", err)
+		}
+		got = append(got, n)
+	}
+	if want := []int{1, 1, 0}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("live refs in [a b other] = %v, want %v", got, want)
 	}
 }

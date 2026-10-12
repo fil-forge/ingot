@@ -240,7 +240,7 @@ func TestLocalBlobMetrics_StalledBytes(t *testing.T) {
 		if err != nil {
 			t.Fatalf("WriteBlob: %v", err)
 		}
-		if err := mem.PutIntent(ctx, registry.UploadIntent{Digest: d, LocalPath: localPath(b, d), Size: n, State: registry.IntentSpooled}); err != nil {
+		if err := mem.PutIntent(ctx, registry.UploadIntent{Space: sweepSpace(t, mem), Digest: d, LocalPath: localPath(b, d), Size: n, State: registry.IntentSpooled}); err != nil {
 			t.Fatalf("PutIntent: %v", err)
 		}
 		return d, n
@@ -248,7 +248,7 @@ func TestLocalBlobMetrics_StalledBytes(t *testing.T) {
 	stalled, n := spooled("an upload that failed an hour ago")
 	mem.AgeIntent(stalled, 2*stalledUploadAge)
 	started, m := spooled("an upload that started and failed an hour ago")
-	if err := mem.SetIntentState(ctx, started, registry.IntentUploading); err != nil {
+	if err := mem.SetIntentState(ctx, sweepSpace(t, mem), started, registry.IntentUploading); err != nil {
 		t.Fatalf("SetIntentState: %v", err)
 	}
 	mem.AgeIntent(started, 2*stalledUploadAge)

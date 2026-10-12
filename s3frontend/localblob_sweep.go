@@ -447,7 +447,7 @@ func (b *Backend) evictToBudget(ctx context.Context, deadline time.Time, r reten
 			if b.localUsage() <= target {
 				return pass, nil
 			}
-			cursor = registry.EvictCursor{UpdatedAt: in.UpdatedAt, Digest: in.Digest}
+			cursor = registry.EvictCursor{UpdatedAt: in.UpdatedAt, Digest: in.Digest, Space: in.Space}
 			// UpdatedAt is the registry's clock (Postgres's now()), so
 			// skew between the hosts shifts the residency window.
 			if r == honorBothWindows && b.cacheMinResidency > 0 && now.Sub(in.UpdatedAt) < b.cacheMinResidency {
@@ -465,11 +465,21 @@ func (b *Backend) evictToBudget(ctx context.Context, deadline time.Time, r reten
 				pass.files++
 				pass.bytes += freed
 			}
+			if errors.Is(err, blockstore.ErrHeld) {
+				// A write of the same bytes took the file since the listing;
+				// it is not gone, so it is not marked, and the pass moves on
+				// as it does past a recently read row.
+				pass.skipped++
+				continue
+			}
 			if err != nil {
 				failed.add(hex.EncodeToString(in.Digest), err)
 				continue
 			}
-			if err := b.intents.MarkEvicted(ctx, in.Digest); err != nil && !errors.Is(err, registry.ErrNotFound) {
+			// Marked as of the listing: a write that spooled the bytes again
+			// since, and committed its intent between the removal and here,
+			// has its file on disk and keeps its mark clear.
+			if err := b.intents.MarkEvicted(ctx, in.Digest, in.UpdatedAt); err != nil && !errors.Is(err, registry.ErrNotFound) {
 				return pass, fmt.Errorf("mark %s evicted: %w", hex.EncodeToString(in.Digest), err)
 			}
 		}
@@ -493,8 +503,7 @@ func (b *Backend) evictToBudget(ctx context.Context, deadline time.Time, r reten
 // would find a cached copy without an intent.) The intent is then deleted only
 // if it still qualifies (registry.IntentStore.DeleteReleasedPublished). A
 // digest named again between the listing and the file's removal would lose its
-// local copy; every write encrypts under a fresh key and so has a digest of its
-// own, so that should not happen. The failures are logged once, naming the
+// local copy, and its intent, then named, stays. The failures are logged once, naming the
 // first, and only a failed query ends the pass. It runs beside the sweeper:
 // the budget pass evicts only blobs with a location, which these have not,
 // and a spool file the orphan pass reaches first is counted by whichever
@@ -520,11 +529,14 @@ func (b *Backend) RemoveReleasedPublished(ctx context.Context) (files, bytes int
 				files++
 				bytes += freed
 			}
+			if errors.Is(err, blockstore.ErrHeld) {
+				continue // a write holds the file; the intent waits for the next startup
+			}
 			if err != nil {
 				failed.add(hex.EncodeToString(in.Digest), err)
 				continue
 			}
-			if _, err := b.intents.DeleteReleasedPublished(ctx, in.Digest); err != nil {
+			if _, err := b.intents.DeleteReleasedPublished(ctx, in.Space, in.Digest); err != nil {
 				return files, bytes, fmt.Errorf("delete released intent %s: %w", hex.EncodeToString(in.Digest), err)
 			}
 		}

@@ -86,12 +86,15 @@ type Backend struct {
 	// SweepLocalBlobs; lastOrphanPass is when its orphan pass last ran.
 	// localBlobSweepBatch overrides the rows a pass reads per query, for
 	// tests; zero takes the default.
-	localBlobMaxBytes   int64
-	cacheMinResidency   time.Duration
-	cacheReadRetention  time.Duration
-	localBlobOrphanAge  time.Duration
-	dropAcceptedBodies  bool
-	localBlobSweepMu    sync.Mutex
+	localBlobMaxBytes  int64
+	cacheMinResidency  time.Duration
+	cacheReadRetention time.Duration
+	localBlobOrphanAge time.Duration
+	dropAcceptedBodies bool
+	localBlobSweepMu   sync.Mutex
+	// blobKeys serialises, within this process, the writes that make one
+	// (space, digest) durable on its provider (see blobKeyLock).
+	blobKeys            blobKeyLock
 	lastOrphanPass      time.Time
 	localBlobSweepBatch int
 	// overBudgetWarned and timeLimitLogged are set once the sweeper has

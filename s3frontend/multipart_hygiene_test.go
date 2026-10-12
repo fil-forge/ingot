@@ -74,7 +74,7 @@ func assertReleased(t *testing.T, b *Backend, mem *inmem.MemStore, rm *recording
 	if _, err := mem.GetEncryptionParams(ctx, did.Undef, d); !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("enc-params row for %x survived (err=%v) — crypto-shred missing", d, err)
 	}
-	if _, err := mem.GetIntent(ctx, d); !errors.Is(err, registry.ErrNotFound) {
+	if _, err := mem.IntentByDigest(ctx, d); !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("upload intent for %x survived (err=%v)", d, err)
 	}
 	if got := rm.removedDigests()[string(d)] > 0; got != wantRemoved {
@@ -569,7 +569,7 @@ func TestAbortUnparksParkedBlob(t *testing.T) {
 	}
 	digests := hygienePartDigests(t, mem, uploadID, 1)
 	for _, d := range digests {
-		in, err := mem.GetIntent(ctx, d)
+		in, err := mem.IntentByDigest(ctx, d)
 		if err != nil || in.State != registry.IntentParked {
 			t.Fatalf("part blob %x intent = %v/%v, want parked", d, in, err)
 		}
@@ -585,7 +585,7 @@ func TestAbortUnparksParkedBlob(t *testing.T) {
 		if !aborted[string(d)] {
 			t.Fatalf("parked blob %x was not aborted on the provider", d)
 		}
-		if _, err := mem.GetPark(ctx, d); !errors.Is(err, registry.ErrNotFound) {
+		if _, err := mem.ParkByDigest(ctx, d); !errors.Is(err, registry.ErrNotFound) {
 			t.Fatalf("park row for %x survived (err=%v)", d, err)
 		}
 		if _, err := mem.GetEncryptionParams(ctx, did.Undef, d); !errors.Is(err, registry.ErrNotFound) {
@@ -651,19 +651,19 @@ func TestCompleteRecordsAcceptancesWhenConcludeFails(t *testing.T) {
 	accepted := multihash.Multihash(hc.calls[0][0])
 	stillParked := multihash.Multihash(hc.calls[0][1])
 
-	if in, err := mem.GetIntent(ctx, accepted); err != nil || in.State != registry.IntentAccepted {
+	if in, err := mem.IntentByDigest(ctx, accepted); err != nil || in.State != registry.IntentAccepted {
 		t.Fatalf("accepted blob intent = %v/%v, want accepted", in, err)
 	}
 	if loc, err := mem.GetLocation(ctx, did.Undef, accepted); err != nil || loc == nil {
 		t.Fatalf("accepted blob has no location (err=%v)", err)
 	}
-	if _, err := mem.GetPark(ctx, accepted); !errors.Is(err, registry.ErrNotFound) {
+	if _, err := mem.ParkByDigest(ctx, accepted); !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("park row for the accepted blob survived (err=%v)", err)
 	}
-	if in, err := mem.GetIntent(ctx, stillParked); err != nil || in.State != registry.IntentParked {
+	if in, err := mem.IntentByDigest(ctx, stillParked); err != nil || in.State != registry.IntentParked {
 		t.Fatalf("unconcluded blob intent = %v/%v, want parked", in, err)
 	}
-	if _, err := mem.GetPark(ctx, stillParked); err != nil {
+	if _, err := mem.ParkByDigest(ctx, stillParked); err != nil {
 		t.Fatalf("park row for the unconcluded blob is gone: %v", err)
 	}
 
@@ -740,19 +740,19 @@ func TestCompleteRecordsEveryAcceptanceWhenOneFailsToPersist(t *testing.T) {
 		}
 	}
 
-	if in, err := mem.GetIntent(ctx, recorded); err != nil || in.State != registry.IntentAccepted {
+	if in, err := mem.IntentByDigest(ctx, recorded); err != nil || in.State != registry.IntentAccepted {
 		t.Fatalf("recorded blob intent = %v/%v, want accepted", in, err)
 	}
 	if loc, err := mem.GetLocation(ctx, did.Undef, recorded); err != nil || loc == nil {
 		t.Fatalf("recorded blob has no location (err=%v)", err)
 	}
-	if _, err := mem.GetPark(ctx, recorded); !errors.Is(err, registry.ErrNotFound) {
+	if _, err := mem.ParkByDigest(ctx, recorded); !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("park row for the recorded blob survived (err=%v)", err)
 	}
-	if in, err := mem.GetIntent(ctx, locs.refused); err != nil || in.State != registry.IntentParked {
+	if in, err := mem.IntentByDigest(ctx, locs.refused); err != nil || in.State != registry.IntentParked {
 		t.Fatalf("refused blob intent = %v/%v, want parked", in, err)
 	}
-	if _, err := mem.GetPark(ctx, locs.refused); err != nil {
+	if _, err := mem.ParkByDigest(ctx, locs.refused); err != nil {
 		t.Fatalf("park row for the refused blob is gone: %v", err)
 	}
 
@@ -764,7 +764,7 @@ func TestCompleteRecordsEveryAcceptanceWhenOneFailsToPersist(t *testing.T) {
 		t.Fatalf("retry conclude calls = %v, want exactly the refused blob", hc.calls[1:])
 	}
 	// The retry committed the object, so the claim published the intent.
-	if in, err := mem.GetIntent(ctx, locs.refused); err != nil || in.State != registry.IntentPublished {
+	if in, err := mem.IntentByDigest(ctx, locs.refused); err != nil || in.State != registry.IntentPublished {
 		t.Fatalf("refused blob intent after retry = %v/%v, want published", in, err)
 	}
 }
@@ -777,13 +777,13 @@ type failOnceMarkAccepted struct {
 	refused multihash.Multihash
 }
 
-func (f *failOnceMarkAccepted) SetIntentState(ctx context.Context, digest multihash.Multihash, state string) error {
+func (f *failOnceMarkAccepted) SetIntentState(ctx context.Context, space did.DID, digest multihash.Multihash, state string) error {
 	if f.armed && state == registry.IntentAccepted {
 		f.armed = false
 		f.refused = digest
 		return errors.New("intents table unavailable")
 	}
-	return f.IntentStore.SetIntentState(ctx, digest, state)
+	return f.IntentStore.SetIntentState(ctx, space, digest, state)
 }
 
 // failDeletePark is a park store that refuses its next `fails` deletes,
@@ -793,12 +793,12 @@ type failDeletePark struct {
 	fails int
 }
 
-func (f *failDeletePark) DeletePark(ctx context.Context, digest multihash.Multihash) error {
+func (f *failDeletePark) DeletePark(ctx context.Context, space did.DID, digest multihash.Multihash) error {
 	if f.fails > 0 {
 		f.fails--
 		return errors.New("parks table unavailable")
 	}
-	return f.ParkStore.DeletePark(ctx, digest)
+	return f.ParkStore.DeletePark(ctx, space, digest)
 }
 
 // completeTwoParts uploads two distinct parts and returns what Complete needs.
@@ -825,13 +825,13 @@ func assertAcceptedAndUnparked(t *testing.T, mem *inmem.MemStore, d multihash.Mu
 	t.Helper()
 	ctx := context.Background()
 	// Accepted, or published once a commit has claimed it.
-	if in, err := mem.GetIntent(ctx, d); err != nil || (in.State != registry.IntentAccepted && in.State != registry.IntentPublished) {
+	if in, err := mem.IntentByDigest(ctx, d); err != nil || (in.State != registry.IntentAccepted && in.State != registry.IntentPublished) {
 		t.Fatalf("blob %x intent = %v/%v, want accepted or published", d, in, err)
 	}
 	if loc, err := mem.GetLocation(ctx, did.Undef, d); err != nil || loc == nil {
 		t.Fatalf("blob %x has no location (err=%v)", d, err)
 	}
-	if _, err := mem.GetPark(ctx, d); !errors.Is(err, registry.ErrNotFound) {
+	if _, err := mem.ParkByDigest(ctx, d); !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("park row for blob %x survived (err=%v)", d, err)
 	}
 }
@@ -899,7 +899,7 @@ func TestCompleteRetryDropsParkAfterFailedDelete(t *testing.T) {
 	digests := hygienePartDigests(t, mem, uploadID, 1)
 	digests = append(digests, hygienePartDigests(t, mem, uploadID, 2)...)
 	for _, d := range digests {
-		if _, err := mem.GetPark(context.Background(), d); err == nil {
+		if _, err := mem.ParkByDigest(context.Background(), d); err == nil {
 			stale++
 		}
 	}
@@ -944,7 +944,7 @@ func TestSweepDropsStaleParkOfAcceptedBlob(t *testing.T) {
 	}
 	aborted := hc.abortedDigests()
 	for _, d := range digests {
-		if _, err := mem.GetPark(ctx, d); !errors.Is(err, registry.ErrNotFound) {
+		if _, err := mem.ParkByDigest(ctx, d); !errors.Is(err, registry.ErrNotFound) {
 			t.Fatalf("park row for accepted blob %x survived the sweep (err=%v)", d, err)
 		}
 		if aborted[string(d)] {
@@ -975,7 +975,7 @@ func TestReleaseSweepDropsParkTheSessionSweepCouldNot(t *testing.T) {
 	digests = append(digests, hygienePartDigests(t, mem, uploadID, 2)...)
 	var stale multihash.Multihash
 	for _, d := range digests {
-		if _, err := mem.GetPark(ctx, d); err == nil {
+		if _, err := mem.ParkByDigest(ctx, d); err == nil {
 			stale = d
 		}
 	}
@@ -988,23 +988,23 @@ func TestReleaseSweepDropsParkTheSessionSweepCouldNot(t *testing.T) {
 	if n, err := b.SweepStaleMultipartSessions(ctx, -time.Second); err != nil || n == 0 {
 		t.Fatalf("sweep: cleaned=%d err=%v", n, err)
 	}
-	if _, err := mem.GetPark(ctx, stale); err != nil {
+	if _, err := mem.ParkByDigest(ctx, stale); err != nil {
 		t.Fatalf("park row should have survived the failed sweep delete: %v", err)
 	}
 	// The failed attempt keeps the intent: it is the retry's state.
-	if _, err := mem.GetIntent(ctx, stale); err != nil {
+	if _, err := mem.IntentByDigest(ctx, stale); err != nil {
 		t.Fatalf("intent for %x did not survive the failed attempt: %v", stale, err)
 	}
 
 	// The release sweep is the retry, with a working store this time.
 	drainReleases(t, b)
-	if _, err := mem.GetPark(ctx, stale); !errors.Is(err, registry.ErrNotFound) {
+	if _, err := mem.ParkByDigest(ctx, stale); !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("park row for %x survived the release sweep (err=%v)", stale, err)
 	}
 	if _, err := mem.GetLocation(ctx, did.Undef, stale); !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("location for %x survived the release sweep (err=%v)", stale, err)
 	}
-	if _, err := mem.GetIntent(ctx, stale); !errors.Is(err, registry.ErrNotFound) {
+	if _, err := mem.IntentByDigest(ctx, stale); !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("intent for %x survived the release sweep (err=%v)", stale, err)
 	}
 }
@@ -1054,13 +1054,17 @@ func TestUploadPartToleratesFailedStaleParkDelete(t *testing.T) {
 		t.Fatalf("part digests = %d, want 1", len(digests))
 	}
 	d := digests[0]
-	if in, err := mem.GetIntent(ctx, d); err != nil || in.State != registry.IntentAccepted {
+	if in, err := mem.IntentByDigest(ctx, d); err != nil || in.State != registry.IntentAccepted {
 		t.Fatalf("dedup part intent = %v/%v, want accepted", in, err)
+	}
+	// The fake answers located; the claim at Complete reads the row itself.
+	if err := mem.PutLocation(ctx, registry.BlobLocation{Space: did.Undef, Digest: d, Provider: "did:key:zNode", URL: "https://node.example/blob", Size: 1}); err != nil {
+		t.Fatalf("PutLocation: %v", err)
 	}
 
 	// The stale row such a failure leaves behind, as a Complete that failed
 	// after recording the acceptance would.
-	if err := mem.PutPark(ctx, registry.BlobPark{Digest: d, AddTask: []byte{1}, AcceptTask: []byte{1}, Size: 1}); err != nil {
+	if _, err := mem.PutPark(ctx, registry.BlobPark{Space: did.Undef, Digest: d, AddTask: []byte{1}, AcceptTask: []byte{1}, Size: 1}); err != nil {
 		t.Fatalf("PutPark: %v", err)
 	}
 	if _, err := mpComplete(t, b, key, uploadID, []types.CompletedPart{{PartNumber: &one, ETag: out.ETag}}, nil); err != nil {
@@ -1069,7 +1073,7 @@ func TestUploadPartToleratesFailedStaleParkDelete(t *testing.T) {
 	if len(hc.calls) != 0 {
 		t.Fatalf("conclude calls = %v, want none: the blob was located throughout", hc.calls)
 	}
-	if _, err := mem.GetPark(ctx, d); !errors.Is(err, registry.ErrNotFound) {
+	if _, err := mem.ParkByDigest(ctx, d); !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("stale park row survived Complete (err=%v)", err)
 	}
 }
@@ -1099,7 +1103,7 @@ func TestSweepReleasesLocatedBlobWhoseIntentLagged(t *testing.T) {
 	digests = append(digests, hygienePartDigests(t, mem, uploadID, 2)...)
 	var lagged multihash.Multihash
 	for _, d := range digests {
-		if in, err := mem.GetIntent(ctx, d); err == nil && in.State == registry.IntentParked {
+		if in, err := mem.IntentByDigest(ctx, d); err == nil && in.State == registry.IntentParked {
 			lagged = d
 		}
 	}
@@ -1116,7 +1120,7 @@ func TestSweepReleasesLocatedBlobWhoseIntentLagged(t *testing.T) {
 	if hc.abortedDigests()[string(lagged)] {
 		t.Fatalf("located blob %x was aborted on the provider as though parked", lagged)
 	}
-	if _, err := mem.GetPark(ctx, lagged); !errors.Is(err, registry.ErrNotFound) {
+	if _, err := mem.ParkByDigest(ctx, lagged); !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("park row for located blob %x survived the sweep (err=%v)", lagged, err)
 	}
 	assertReleased(t, b, mem, rm, lagged, true)
@@ -1146,7 +1150,7 @@ func TestSweepReleasesBlobTheProviderHoldsAccepted(t *testing.T) {
 		t.Fatalf("part digests = %d, want 1", len(digests))
 	}
 	d := digests[0]
-	if in, err := mem.GetIntent(ctx, d); err != nil || in.State != registry.IntentParked {
+	if in, err := mem.IntentByDigest(ctx, d); err != nil || in.State != registry.IntentParked {
 		t.Fatalf("part blob intent = %v/%v, want parked", in, err)
 	}
 	pu.acceptedOnProvider[string(d)] = true
@@ -1157,7 +1161,7 @@ func TestSweepReleasesBlobTheProviderHoldsAccepted(t *testing.T) {
 	if !pu.abortedDigests()[string(d)] {
 		t.Fatalf("abort was never attempted for %x", d)
 	}
-	if _, err := mem.GetPark(ctx, d); !errors.Is(err, registry.ErrNotFound) {
+	if _, err := mem.ParkByDigest(ctx, d); !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("park row for %x survived the sweep (err=%v)", d, err)
 	}
 	// Released as an accepted blob: the network claim is removed.
@@ -1252,7 +1256,7 @@ func TestAbortKeepsSessionWhenRecordingReleasesFails(t *testing.T) {
 	if err != nil || sess.State != registry.SessionAborting {
 		t.Fatalf("session after failed Abort = %v/%v, want latched aborting", sess, err)
 	}
-	if _, err := mem.GetPark(ctx, d); err != nil {
+	if _, err := mem.ParkByDigest(ctx, d); err != nil {
 		t.Fatalf("park row went before its release was recorded: %v", err)
 	}
 	if pu.abortedDigests()[string(d)] {
@@ -1269,7 +1273,7 @@ func TestAbortKeepsSessionWhenRecordingReleasesFails(t *testing.T) {
 	if !pu.abortedDigests()[string(d)] {
 		t.Fatalf("parked blob %x was not released on the provider", d)
 	}
-	if _, err := mem.GetPark(ctx, d); !errors.Is(err, registry.ErrNotFound) {
+	if _, err := mem.ParkByDigest(ctx, d); !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("park row for %x survived (err=%v)", d, err)
 	}
 }
@@ -1306,7 +1310,7 @@ func TestAbortReleasesFromRecordsWhenSessionDeleteFails(t *testing.T) {
 	if !pu.abortedDigests()[string(d)] {
 		t.Fatalf("parked blob %x was not released from its record", d)
 	}
-	if _, err := mem.GetPark(ctx, d); !errors.Is(err, registry.ErrNotFound) {
+	if _, err := mem.ParkByDigest(ctx, d); !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("park row for %x survived (err=%v)", d, err)
 	}
 	if pending, _ := mem.ListReleasesBySpace(ctx, did.Undef); len(pending) != 0 {
@@ -1342,7 +1346,7 @@ func TestReleaseDefersWhileAnInFlightPartReferencesTheBlob(t *testing.T) {
 	if n, err := b.SweepPendingReleases(ctx); err != nil || n != 0 {
 		t.Fatalf("sweep executed %d releases (err=%v), want 0: the part is in flight", n, err)
 	}
-	if _, err := mem.GetPark(ctx, d); err != nil {
+	if _, err := mem.ParkByDigest(ctx, d); err != nil {
 		t.Fatalf("park row for the in-flight part was taken by the release sweep: %v", err)
 	}
 	if pu.abortedDigests()[string(d)] {
@@ -1373,10 +1377,10 @@ func TestReleaseDefersWhileAnInFlightPartReferencesTheBlob(t *testing.T) {
 }
 
 // TestCompletedSessionReapReleasesOrphansWhoseRecordingFailed: Complete's
-// own release of an omitted part is best-effort — here both recording the
-// release and the inline attempt fail. The completed-session reap derives
-// the orphan again from the retained part rows, records it, and releases it,
-// so the orphan is released late rather than never.
+// own release of an omitted part is best-effort — here recording the
+// release fails, and nothing runs unrecorded. The completed-session reap
+// derives the orphan again from the retained part rows, records it, and
+// releases it, so the orphan is released late rather than never.
 func TestCompletedSessionReapReleasesOrphansWhoseRecordingFailed(t *testing.T) {
 	pu := &parkingUploader{}
 	rel := &failEnqueueReleases{}
@@ -1392,19 +1396,21 @@ func TestCompletedSessionReapReleasesOrphansWhoseRecordingFailed(t *testing.T) {
 	part1 := hygienePartDigests(t, mem, uploadID, 1)
 	orphans := hygienePartDigests(t, mem, uploadID, 2)
 
-	// Complete with part 1 only; the orphan pass can neither record the
-	// release nor abort the blob on the provider.
+	// Complete with part 1 only; the orphan pass cannot record the release,
+	// and does not touch the blob on the provider without a record.
 	rel.fails = 1
-	pu.abortFails = 1
 	if _, err := mpComplete(t, b, key, uploadID, parts[:1], nil); err != nil {
 		t.Fatalf("Complete: %v", err)
 	}
-	if rel.fails > 0 || pu.abortFails > 0 {
-		t.Fatalf("the failures were not exercised: record fails left=%d, abort fails left=%d", rel.fails, pu.abortFails)
+	if rel.fails > 0 {
+		t.Fatalf("the recording failure was not exercised: fails left=%d", rel.fails)
+	}
+	if pu.abortedDigests()[string(orphans[0])] {
+		t.Fatalf("orphan %x was aborted on the provider without a release record", orphans[0])
 	}
 	drainReleases(t, b)
 	for _, d := range orphans {
-		if _, err := mem.GetPark(ctx, d); err != nil {
+		if _, err := mem.ParkByDigest(ctx, d); err != nil {
 			t.Fatalf("orphan %x lost its park with no record and no release: %v", d, err)
 		}
 	}
@@ -1422,13 +1428,13 @@ func TestCompletedSessionReapReleasesOrphansWhoseRecordingFailed(t *testing.T) {
 		if !pu.abortedDigests()[string(d)] {
 			t.Fatalf("orphan %x was not released on the provider", d)
 		}
-		if _, err := mem.GetPark(ctx, d); !errors.Is(err, registry.ErrNotFound) {
+		if _, err := mem.ParkByDigest(ctx, d); !errors.Is(err, registry.ErrNotFound) {
 			t.Fatalf("park row for orphan %x survived (err=%v)", d, err)
 		}
 		if _, err := mem.GetEncryptionParams(ctx, did.Undef, d); !errors.Is(err, registry.ErrNotFound) {
 			t.Fatalf("enc-params row for orphan %x survived (err=%v)", d, err)
 		}
-		if _, err := mem.GetIntent(ctx, d); !errors.Is(err, registry.ErrNotFound) {
+		if _, err := mem.IntentByDigest(ctx, d); !errors.Is(err, registry.ErrNotFound) {
 			t.Fatalf("intent for orphan %x survived (err=%v)", d, err)
 		}
 	}
@@ -1464,7 +1470,7 @@ func TestSupersedeRecordsReleasesBeforeWriting(t *testing.T) {
 		t.Fatalf("part 1 blobs after the failed re-upload = %x, want the old part intact %x", got, old)
 	}
 	for _, d := range old {
-		if _, err := mem.GetPark(ctx, d); err != nil {
+		if _, err := mem.ParkByDigest(ctx, d); err != nil {
 			t.Fatalf("old blob %x lost its park on a failed re-upload: %v", d, err)
 		}
 		if pu.abortedDigests()[string(d)] {
@@ -1480,7 +1486,7 @@ func TestSupersedeRecordsReleasesBeforeWriting(t *testing.T) {
 		if !pu.abortedDigests()[string(d)] {
 			t.Fatalf("superseded blob %x was not released on the provider", d)
 		}
-		if _, err := mem.GetPark(ctx, d); !errors.Is(err, registry.ErrNotFound) {
+		if _, err := mem.ParkByDigest(ctx, d); !errors.Is(err, registry.ErrNotFound) {
 			t.Fatalf("park row for superseded %x survived (err=%v)", d, err)
 		}
 	}
@@ -1520,7 +1526,7 @@ func TestReleaseKeepsRowsUntilTheNetworkStepSucceeds(t *testing.T) {
 	// The part's spool copy went when it parked; the intent is what the
 	// retry needs. TestReleaseFreesSpoolCopyOfDeletedPutObject covers a
 	// spool copy kept for the retry.
-	if in, err := mem.GetIntent(ctx, d); err != nil || in.State != registry.IntentPublished {
+	if in, err := mem.IntentByDigest(ctx, d); err != nil || in.State != registry.IntentPublished {
 		t.Fatalf("intent after the failed attempt = %v/%v, want published and kept for the retry", in, err)
 	}
 
@@ -1552,7 +1558,7 @@ func TestReleaseFreesSpoolCopyOfDeletedPutObject(t *testing.T) {
 	if n, err := b.SweepPendingReleases(ctx); err != nil || n != 0 {
 		t.Fatalf("first sweep executed %d releases (err=%v), want 0: the network remove failed", n, err)
 	}
-	if in, err := mem.GetIntent(ctx, d); err != nil || in.State != registry.IntentPublished {
+	if in, err := mem.IntentByDigest(ctx, d); err != nil || in.State != registry.IntentPublished {
 		t.Fatalf("intent after the failed attempt = %v/%v, want published and kept for the retry", in, err)
 	}
 	if _, err := os.Stat(localPath(b, d)); err != nil {
@@ -1569,7 +1575,7 @@ func TestReleaseFreesSpoolCopyOfDeletedPutObject(t *testing.T) {
 // spool copy are both gone, as a finished release leaves them.
 func assertLocalCopyReleased(t *testing.T, b *Backend, mem *inmem.MemStore, d multihash.Multihash) {
 	t.Helper()
-	if in, err := mem.GetIntent(context.Background(), d); !errors.Is(err, registry.ErrNotFound) {
+	if in, err := mem.IntentByDigest(context.Background(), d); !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("blob %x intent = %v/%v after its release, want it deleted", d, in, err)
 	}
 	if _, err := os.Stat(localPath(b, d)); !os.IsNotExist(err) {
@@ -1721,7 +1727,7 @@ func TestAbortRecordsBlobAnotherAbortingSessionReferences(t *testing.T) {
 	if !pu.abortedDigests()[string(d)] {
 		t.Fatalf("shared blob %x was not released: the other session's part reference stopped the record", d)
 	}
-	if _, err := mem.GetPark(ctx, d); !errors.Is(err, registry.ErrNotFound) {
+	if _, err := mem.ParkByDigest(ctx, d); !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("park row for %x survived (err=%v)", d, err)
 	}
 }
@@ -1753,7 +1759,7 @@ func TestReleaseWaitsForAnotherOpenSessionSharingTheBlob(t *testing.T) {
 	if pu.abortedDigests()[string(d)] {
 		t.Fatalf("shared blob %x was released while another open session references it", d)
 	}
-	if _, err := mem.GetPark(ctx, d); err != nil {
+	if _, err := mem.ParkByDigest(ctx, d); err != nil {
 		t.Fatalf("park row for %x went while another open session references it: %v", d, err)
 	}
 	pending, _ := mem.ListReleasesBySpace(ctx, did.Undef)
@@ -1823,7 +1829,7 @@ func TestSweepReleasesSessionThatOutlivedItsBucket(t *testing.T) {
 	if !pu.abortedDigests()[string(d)] {
 		t.Fatalf("parked blob %x was not released on the provider", d)
 	}
-	if _, err := mem.GetPark(ctx, d); !errors.Is(err, registry.ErrNotFound) {
+	if _, err := mem.ParkByDigest(ctx, d); !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("park row for %x survived (err=%v)", d, err)
 	}
 }
@@ -1928,12 +1934,12 @@ func TestSweepLeavesALiveCompleteOnAnOldSession(t *testing.T) {
 		}
 		// The write path spools every part blob before recording the part,
 		// so a part row never exists without its blob's intent.
-		if err := mem.PutIntent(ctx, registry.UploadIntent{Digest: d, LocalPath: "/spool/" + id, Size: 1, State: registry.IntentParked, Bucket: "bk"}); err != nil {
+		if err := mem.PutIntent(ctx, registry.UploadIntent{Space: did.Undef, Digest: d, LocalPath: "/spool/" + id, Size: 1, State: registry.IntentParked, Bucket: "bk"}); err != nil {
 			t.Fatalf("PutIntent %s: %v", id, err)
 		}
 		// Parked on a provider, so a release of it is an abort the fake records.
 		task := cid.NewCidV1(cid.Raw, d).Bytes()
-		if err := mem.PutPark(ctx, registry.BlobPark{Digest: d, AddTask: task, AcceptTask: task, Size: 1}); err != nil {
+		if _, err := mem.PutPark(ctx, registry.BlobPark{Space: did.Undef, Digest: d, AddTask: task, AcceptTask: task, Size: 1}); err != nil {
 			t.Fatalf("PutPark %s: %v", id, err)
 		}
 		return d
@@ -1975,8 +1981,8 @@ type hookAfterParkDeletes struct {
 	hook func()
 }
 
-func (h *hookAfterParkDeletes) DeletePark(ctx context.Context, digest multihash.Multihash) error {
-	err := h.ParkStore.DeletePark(ctx, digest)
+func (h *hookAfterParkDeletes) DeletePark(ctx context.Context, space did.DID, digest multihash.Multihash) error {
+	err := h.ParkStore.DeletePark(ctx, space, digest)
 	h.n--
 	if h.n == 0 && h.hook != nil {
 		hook := h.hook
@@ -2195,7 +2201,7 @@ func TestReleaseKeepsIntentUntilLocalCleanupSucceeds(t *testing.T) {
 		t.Fatalf("pending releases after the failed attempt = %d, want 1", len(pending))
 	}
 	d := pending[0].Digest
-	if in, err := mem.GetIntent(ctx, d); err != nil || in.State != registry.IntentSpooled {
+	if in, err := mem.IntentByDigest(ctx, d); err != nil || in.State != registry.IntentSpooled {
 		t.Fatalf("intent after the failed attempt = %v/%v, want kept as spooled", in, err)
 	}
 	if _, err := os.Stat(localPath(b, d)); err != nil {
@@ -2203,7 +2209,7 @@ func TestReleaseKeepsIntentUntilLocalCleanupSucceeds(t *testing.T) {
 	}
 
 	drainReleases(t, b)
-	if _, err := mem.GetIntent(ctx, d); !errors.Is(err, registry.ErrNotFound) {
+	if _, err := mem.IntentByDigest(ctx, d); !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("intent survived the retry (err=%v)", err)
 	}
 	if _, err := os.Stat(localPath(b, d)); !os.IsNotExist(err) {
@@ -2318,7 +2324,7 @@ func TestReapDoesNotRecordAReleaseAlreadyRunToCompletion(t *testing.T) {
 	if !pu.abortedDigests()[string(d)] {
 		t.Fatalf("parked blob %x was not released on the provider", d)
 	}
-	if _, err := mem.GetIntent(ctx, d); !errors.Is(err, registry.ErrNotFound) {
+	if _, err := mem.IntentByDigest(ctx, d); !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("intent for %x survived its release (err=%v)", d, err)
 	}
 
@@ -2363,7 +2369,7 @@ func TestReleaseRemovesBlobAcceptedWithoutRows(t *testing.T) {
 	if err := mem.DeleteLocation(ctx, did.Undef, d); err != nil {
 		t.Fatalf("DeleteLocation: %v", err)
 	}
-	if err := mem.SetIntentState(ctx, d, registry.IntentSpooled); err != nil {
+	if err := mem.SetIntentState(ctx, did.Undef, d, registry.IntentSpooled); err != nil {
 		t.Fatalf("SetIntentState: %v", err)
 	}
 
@@ -2387,7 +2393,7 @@ func TestReleaseRemovesBlobAcceptedWithoutRows(t *testing.T) {
 	if rm.removedDigests()[string(d)] != 1 {
 		t.Fatalf("RemoveBlob calls for %x = %d, want 1: the accepted blob must be removed from the network", d, rm.removedDigests()[string(d)])
 	}
-	if _, err := mem.GetIntent(ctx, d); !errors.Is(err, registry.ErrNotFound) {
+	if _, err := mem.IntentByDigest(ctx, d); !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("intent for %x survived the release (err=%v)", d, err)
 	}
 }

@@ -207,7 +207,7 @@ func TestStreamedPutObject(t *testing.T) {
 		require.Equal(t, d, su.concluded[i].Digest, "the conclude reports the spooled digest")
 		require.Equal(t, sb.AddTask, su.concluded[i].AddTask)
 
-		in, err := mem.GetIntent(ctx, d)
+		in, err := mem.IntentByDigest(ctx, d)
 		require.NoError(t, err)
 		require.Equal(t, registry.IntentPublished, in.State, "the committed blob's intent is published")
 	}
@@ -319,11 +319,11 @@ func TestStreamedUploadPart(t *testing.T) {
 	digests := hygienePartDigests(t, mem, uploadID, 1)
 	require.Len(t, digests, len(su.started))
 	for i, d := range digests {
-		park, err := mem.GetPark(ctx, d)
+		park, err := mem.ParkByDigest(ctx, d)
 		require.NoError(t, err)
 		require.Equal(t, su.started[i].AddTask.Bytes(), park.AddTask)
 		require.Equal(t, su.started[i].PutInvocation, park.PutInvocation)
-		in, err := mem.GetIntent(ctx, d)
+		in, err := mem.IntentByDigest(ctx, d)
 		require.NoError(t, err)
 		require.Equal(t, registry.IntentParked, in.State)
 		_, err = os.Stat(localPath(b, d))
@@ -401,10 +401,11 @@ func TestSweepStaleStreamsKeepsParkedBlob(t *testing.T) {
 	require.NoError(t, mem.PutStream(ctx, registry.BlobStream{
 		AddTask: addTask, Bucket: "bk", CreatedAt: time.Now().Add(-time.Hour),
 	}))
-	require.NoError(t, mem.PutPark(ctx, registry.BlobPark{
-		Digest: mustSum([]byte("parked blob")), AddTask: addTask,
+	_, err := mem.PutPark(ctx, registry.BlobPark{
+		Space: did.Undef, Digest: mustSum([]byte("parked blob")), AddTask: addTask,
 		AcceptTask: addTask, PutInvocation: []byte("put"), Size: 1,
-	}))
+	})
+	require.NoError(t, err)
 
 	n, err := b.SweepStaleStreams(ctx)
 	require.NoError(t, err)
@@ -453,7 +454,7 @@ func TestStreamedPutObjectConcludeErrorRecordsAcceptance(t *testing.T) {
 
 	require.Error(t, putSized(t, b, "k", data, int64(len(data))))
 	require.Len(t, su.concluded, 1)
-	in, err := mem.GetIntent(ctx, su.concluded[0].Digest)
+	in, err := mem.IntentByDigest(ctx, su.concluded[0].Digest)
 	require.NoError(t, err)
 	require.Equal(t, registry.IntentAccepted, in.State, "the returned acceptance is recorded")
 	require.Empty(t, staleStreams(t, mem), "the accepted blob's row is dropped")

@@ -16,6 +16,7 @@ import (
 	"github.com/fil-forge/ingot/migrations"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/libforge/testutil"
+	"github.com/fil-forge/ucantone/did"
 )
 
 // evictStore is what the spool-eviction queries need of a store.
@@ -62,17 +63,29 @@ func TestEvictionQueriesLive(t *testing.T) {
 				t.Fatalf("truncate: %v", err)
 			}
 			st := registry.NewPostgres(pool)
+			space := testutil.RandomDID(t)
 			var want []string
 			for _, name := range []string{"tie-a", "tie-b", "tie-c"} {
 				d := evictDigest(t, name)
-				if err := st.PutIntent(ctx, registry.UploadIntent{Digest: d, LocalPath: "/spool/x", Size: 7, State: registry.IntentAccepted}); err != nil {
+				if err := st.PutIntent(ctx, registry.UploadIntent{Space: space, Digest: d, LocalPath: "/spool/x", Size: 7, State: registry.IntentAccepted}); err != nil {
 					t.Fatalf("PutIntent: %v", err)
 				}
-				if err := st.PutLocation(ctx, registry.BlobLocation{Space: testutil.RandomDID(t), Digest: d, Provider: "did:key:p", URL: "http://p/blob", Size: 7}); err != nil {
+				if err := st.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: d, Provider: "did:key:p", URL: "http://p/blob", Size: 7}); err != nil {
 					t.Fatalf("PutLocation: %v", err)
 				}
 				want = append(want, string(d))
 			}
+			// One digest held by a second space too: the cursor's space
+			// tie-break carries a page boundary between the two rows.
+			shared := evictDigest(t, "tie-b")
+			other := testutil.RandomDID(t)
+			if err := st.PutIntent(ctx, registry.UploadIntent{Space: other, Digest: shared, LocalPath: "/spool/x", Size: 7, State: registry.IntentAccepted}); err != nil {
+				t.Fatalf("PutIntent: %v", err)
+			}
+			if err := st.PutLocation(ctx, registry.BlobLocation{Space: other, Digest: shared, Provider: "did:key:p", URL: "http://p/blob", Size: 7}); err != nil {
+				t.Fatalf("PutLocation: %v", err)
+			}
+			want = append(want, string(shared))
 			if _, err := pool.Exec(ctx, `UPDATE ingot.upload_intents SET updated_at = now()`); err != nil {
 				t.Fatalf("equalize updated_at: %v", err)
 			}
@@ -89,7 +102,7 @@ func TestEvictionQueriesLive(t *testing.T) {
 					break
 				}
 				got = append(got, string(page[0].Digest))
-				cursor = registry.EvictCursor{UpdatedAt: page[0].UpdatedAt, Digest: page[0].Digest}
+				cursor = registry.EvictCursor{UpdatedAt: page[0].UpdatedAt, Digest: page[0].Digest, Space: page[0].Space}
 			}
 			if !reflect.DeepEqual(got, want) {
 				t.Fatalf("paged digests = %x, want each once in digest order %x", got, want)
@@ -109,25 +122,26 @@ func evictDigest(t *testing.T, s string) multihash.Multihash {
 
 func runEvictionSuite(t *testing.T, fresh func(t *testing.T) evictStore) {
 	ctx := t.Context()
+	space := testutil.RandomDID(t)
 
 	// seed records an intent in state, optionally with a location or a park.
 	seed := func(t *testing.T, st evictStore, d multihash.Multihash, state string, located, parked bool) {
 		t.Helper()
-		if err := st.PutIntent(ctx, registry.UploadIntent{Digest: d, LocalPath: "/spool/x", Size: 7, State: registry.IntentSpooled}); err != nil {
+		if err := st.PutIntent(ctx, registry.UploadIntent{Space: space, Digest: d, LocalPath: "/spool/x", Size: 7, State: registry.IntentSpooled}); err != nil {
 			t.Fatalf("PutIntent: %v", err)
 		}
 		if state != registry.IntentSpooled {
-			if err := st.SetIntentState(ctx, d, state); err != nil {
+			if err := st.SetIntentState(ctx, space, d, state); err != nil {
 				t.Fatalf("SetIntentState: %v", err)
 			}
 		}
 		if located {
-			if err := st.PutLocation(ctx, registry.BlobLocation{Space: testutil.RandomDID(t), Digest: d, Provider: "did:key:p", URL: "http://p/blob", Size: 7}); err != nil {
+			if err := st.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: d, Provider: "did:key:p", URL: "http://p/blob", Size: 7}); err != nil {
 				t.Fatalf("PutLocation: %v", err)
 			}
 		}
 		if parked {
-			if err := st.PutPark(ctx, registry.BlobPark{Digest: d, AddTask: []byte{1}, AcceptTask: []byte{2}, PutInvocation: []byte{3}, Size: 7}); err != nil {
+			if _, err := st.PutPark(ctx, registry.BlobPark{Space: space, Digest: d, AddTask: []byte{1}, AcceptTask: []byte{2}, PutInvocation: []byte{3}, Size: 7}); err != nil {
 				t.Fatalf("PutPark: %v", err)
 			}
 		}
@@ -168,7 +182,7 @@ func runEvictionSuite(t *testing.T, fresh func(t *testing.T) evictStore) {
 			d := evictDigest(t, tc.name)
 			seed(t, st, d, tc.state, tc.located, tc.parked)
 			if tc.evicted {
-				if err := st.MarkEvicted(ctx, d); err != nil {
+				if err := st.MarkEvicted(ctx, d, time.Now().Add(time.Hour)); err != nil {
 					t.Fatalf("MarkEvicted: %v", err)
 				}
 			}
@@ -182,22 +196,22 @@ func runEvictionSuite(t *testing.T, fresh func(t *testing.T) evictStore) {
 		st := fresh(t)
 		d := evictDigest(t, "retried")
 		seed(t, st, d, registry.IntentAccepted, true, false)
-		before, err := st.GetIntent(ctx, d)
+		before, err := st.GetIntent(ctx, space, d)
 		if err != nil {
 			t.Fatalf("GetIntent: %v", err)
 		}
 		time.Sleep(5 * time.Millisecond)
-		if err := st.SetIntentState(ctx, d, registry.IntentAccepted); err != nil {
+		if err := st.SetIntentState(ctx, space, d, registry.IntentAccepted); err != nil {
 			t.Fatalf("SetIntentState: %v", err)
 		}
-		repeated, err := st.GetIntent(ctx, d)
+		repeated, err := st.GetIntent(ctx, space, d)
 		if err != nil {
 			t.Fatalf("GetIntent: %v", err)
 		}
-		if err := st.SetIntentState(ctx, d, registry.IntentPublished); err != nil {
+		if err := st.SetIntentState(ctx, space, d, registry.IntentPublished); err != nil {
 			t.Fatalf("SetIntentState: %v", err)
 		}
-		changed, err := st.GetIntent(ctx, d)
+		changed, err := st.GetIntent(ctx, space, d)
 		if err != nil {
 			t.Fatalf("GetIntent: %v", err)
 		}
@@ -211,10 +225,10 @@ func runEvictionSuite(t *testing.T, fresh func(t *testing.T) evictStore) {
 		st := fresh(t)
 		d := evictDigest(t, "respooled")
 		seed(t, st, d, registry.IntentAccepted, true, false)
-		if err := st.MarkEvicted(ctx, d); err != nil {
+		if err := st.MarkEvicted(ctx, d, time.Now().Add(time.Hour)); err != nil {
 			t.Fatalf("MarkEvicted: %v", err)
 		}
-		if err := st.PutIntent(ctx, registry.UploadIntent{Digest: d, LocalPath: "/spool/x", Size: 7, State: registry.IntentAccepted}); err != nil {
+		if err := st.PutIntent(ctx, registry.UploadIntent{Space: space, Digest: d, LocalPath: "/spool/x", Size: 7, State: registry.IntentAccepted}); err != nil {
 			t.Fatalf("PutIntent: %v", err)
 		}
 		if got := listed(t, st); len(got) != 1 {
@@ -226,14 +240,14 @@ func runEvictionSuite(t *testing.T, fresh func(t *testing.T) evictStore) {
 		st := fresh(t)
 		d := evictDigest(t, "kept")
 		seed(t, st, d, registry.IntentPublished, true, false)
-		before, err := st.GetIntent(ctx, d)
+		before, err := st.GetIntent(ctx, space, d)
 		if err != nil {
 			t.Fatalf("GetIntent: %v", err)
 		}
-		if err := st.MarkEvicted(ctx, d); err != nil {
+		if err := st.MarkEvicted(ctx, d, time.Now().Add(time.Hour)); err != nil {
 			t.Fatalf("MarkEvicted: %v", err)
 		}
-		after, err := st.GetIntent(ctx, d)
+		after, err := st.GetIntent(ctx, space, d)
 		if err != nil {
 			t.Fatalf("GetIntent: %v", err)
 		}
@@ -244,7 +258,7 @@ func runEvictionSuite(t *testing.T, fresh func(t *testing.T) evictStore) {
 
 	t.Run("MarkEvicted of a missing intent is ErrNotFound", func(t *testing.T) {
 		st := fresh(t)
-		if err := st.MarkEvicted(ctx, evictDigest(t, "gone")); !errors.Is(err, registry.ErrNotFound) {
+		if err := st.MarkEvicted(ctx, evictDigest(t, "gone"), time.Now().Add(time.Hour)); !errors.Is(err, registry.ErrNotFound) {
 			t.Fatalf("MarkEvicted err = %v, want ErrNotFound", err)
 		}
 	})
@@ -272,7 +286,7 @@ func runEvictionSuite(t *testing.T, fresh func(t *testing.T) evictStore) {
 			}
 			for _, in := range page {
 				got = append(got, string(in.Digest))
-				cursor = registry.EvictCursor{UpdatedAt: in.UpdatedAt, Digest: in.Digest}
+				cursor = registry.EvictCursor{UpdatedAt: in.UpdatedAt, Digest: in.Digest, Space: in.Space}
 			}
 		}
 		if !reflect.DeepEqual(got, want) {
@@ -300,10 +314,10 @@ func runEvictionSuite(t *testing.T, fresh func(t *testing.T) evictStore) {
 		// A different size from seed's, so a sum credited to the wrong
 		// state shows.
 		uploading := evictDigest(t, "uploading")
-		if err := st.PutIntent(ctx, registry.UploadIntent{Digest: uploading, LocalPath: "/spool/x", Size: 11, State: registry.IntentSpooled}); err != nil {
+		if err := st.PutIntent(ctx, registry.UploadIntent{Space: space, Digest: uploading, LocalPath: "/spool/x", Size: 11, State: registry.IntentSpooled}); err != nil {
 			t.Fatalf("PutIntent: %v", err)
 		}
-		if err := st.SetIntentState(ctx, uploading, registry.IntentUploading); err != nil {
+		if err := st.SetIntentState(ctx, space, uploading, registry.IntentUploading); err != nil {
 			t.Fatalf("SetIntentState: %v", err)
 		}
 		seed(t, st, evictDigest(t, "accepted"), registry.IntentAccepted, true, false)
@@ -320,6 +334,153 @@ func runEvictionSuite(t *testing.T, fresh func(t *testing.T) evictStore) {
 		}
 		if want := []registry.StalledSizes{{}, {Spooled: 7, Uploading: 11}}; !reflect.DeepEqual(got, want) {
 			t.Fatalf("StalledBytes before [an hour ago, an hour from now] = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("ListEvictable: an upload of the digest in another space keeps it", func(t *testing.T) {
+		// The same bytes stored as received in two spaces are one spool
+		// file: while either space is still uploading it, no row lists.
+		st := fresh(t)
+		d := evictDigest(t, "shared-upload")
+		seed(t, st, d, registry.IntentAccepted, true, false)
+		other := testutil.RandomDID(t)
+		if err := st.PutIntent(ctx, registry.UploadIntent{Space: other, Digest: d, LocalPath: "/spool/x", Size: 7, State: registry.IntentSpooled}); err != nil {
+			t.Fatalf("PutIntent: %v", err)
+		}
+		var got []int
+		got = append(got, len(listed(t, st)))
+		if err := st.SetIntentState(ctx, other, d, registry.IntentUploading); err != nil {
+			t.Fatalf("SetIntentState: %v", err)
+		}
+		got = append(got, len(listed(t, st)))
+		if err := st.SetIntentState(ctx, other, d, registry.IntentAccepted); err != nil {
+			t.Fatalf("SetIntentState: %v", err)
+		}
+		// Accepted in the other space, but only located in the first:
+		// the first row lists, the other does not.
+		got = append(got, len(listed(t, st)))
+		if err := st.PutLocation(ctx, registry.BlobLocation{Space: other, Digest: d, Provider: "did:key:p", URL: "http://p/blob", Size: 7}); err != nil {
+			t.Fatalf("PutLocation: %v", err)
+		}
+		got = append(got, len(listed(t, st)))
+		if want := []int{0, 0, 1, 2}; !reflect.DeepEqual(got, want) {
+			t.Fatalf("rows listed while the other space is [spooled uploading accepted located] = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("MarkEvicted and PutIntent act on every space's intent", func(t *testing.T) {
+		st := fresh(t)
+		d := evictDigest(t, "shared-file")
+		other := testutil.RandomDID(t)
+		for _, sp := range []did.DID{space, other} {
+			if err := st.PutIntent(ctx, registry.UploadIntent{Space: sp, Digest: d, LocalPath: "/spool/x", Size: 7, State: registry.IntentAccepted}); err != nil {
+				t.Fatalf("PutIntent: %v", err)
+			}
+			if err := st.PutLocation(ctx, registry.BlobLocation{Space: sp, Digest: d, Provider: "did:key:p", URL: "http://p/blob", Size: 7}); err != nil {
+				t.Fatalf("PutLocation: %v", err)
+			}
+		}
+		var got []int
+		got = append(got, len(listed(t, st)))
+		if err := st.MarkEvicted(ctx, d, time.Now().Add(time.Hour)); err != nil {
+			t.Fatalf("MarkEvicted: %v", err)
+		}
+		got = append(got, len(listed(t, st)))
+		// Spooled again by one space: the file is back for both.
+		if err := st.PutIntent(ctx, registry.UploadIntent{Space: space, Digest: d, LocalPath: "/spool/x", Size: 7, State: registry.IntentAccepted}); err != nil {
+			t.Fatalf("PutIntent: %v", err)
+		}
+		got = append(got, len(listed(t, st)))
+		if want := []int{2, 0, 2}; !reflect.DeepEqual(got, want) {
+			t.Fatalf("rows listed [both held, evicted, respooled] = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("CountOtherIntents counts the other spaces' intents", func(t *testing.T) {
+		st := fresh(t)
+		d := evictDigest(t, "others")
+		other := testutil.RandomDID(t)
+		seed(t, st, d, registry.IntentAccepted, true, false)
+		count := func() int {
+			t.Helper()
+			n, err := st.CountOtherIntents(ctx, space, d)
+			if err != nil {
+				t.Fatalf("CountOtherIntents: %v", err)
+			}
+			return n
+		}
+		var got []int
+		got = append(got, count())
+		if err := st.PutIntent(ctx, registry.UploadIntent{Space: other, Digest: d, LocalPath: "/spool/x", Size: 7, State: registry.IntentSpooled}); err != nil {
+			t.Fatalf("PutIntent: %v", err)
+		}
+		got = append(got, count())
+		if err := st.DeleteIntent(ctx, other, d); err != nil {
+			t.Fatalf("DeleteIntent: %v", err)
+		}
+		got = append(got, count())
+		if _, err := st.GetIntent(ctx, space, d); err != nil {
+			t.Fatalf("the first space's intent after the other's delete: %v", err)
+		}
+		if want := []int{0, 1, 0}; !reflect.DeepEqual(got, want) {
+			t.Fatalf("other intents [alone, shared, other deleted] = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("parks are one space's", func(t *testing.T) {
+		st := fresh(t)
+		d := evictDigest(t, "parked-twice")
+		other := testutil.RandomDID(t)
+		if _, err := st.PutPark(ctx, registry.BlobPark{Space: space, Digest: d, AddTask: []byte{1}, AcceptTask: []byte{2}, PutInvocation: []byte{3}, Size: 7}); err != nil {
+			t.Fatalf("PutPark: %v", err)
+		}
+		if _, err := st.GetPark(ctx, other, d); !errors.Is(err, registry.ErrNotFound) {
+			t.Fatalf("GetPark in another space err = %v, want ErrNotFound", err)
+		}
+		if _, err := st.PutPark(ctx, registry.BlobPark{Space: other, Digest: d, AddTask: []byte{4}, AcceptTask: []byte{5}, PutInvocation: []byte{6}, Size: 7}); err != nil {
+			t.Fatalf("PutPark: %v", err)
+		}
+		if err := st.DeletePark(ctx, other, d); err != nil {
+			t.Fatalf("DeletePark: %v", err)
+		}
+		park, err := st.GetPark(ctx, space, d)
+		if err != nil || park.AddTask[0] != 1 {
+			t.Fatalf("the first space's park after the other's delete = %+v, %v", park, err)
+		}
+	})
+
+	t.Run("MarkEvicted leaves an intent put since the listing", func(t *testing.T) {
+		// The mark is as of the intent the caller listed or read: a write
+		// that spooled the bytes again since has a newer intent and its
+		// file on disk, and keeps its mark clear.
+		st := fresh(t)
+		d := evictDigest(t, "respooled-since")
+		seed(t, st, d, registry.IntentAccepted, true, false)
+		listed, err := st.GetIntent(ctx, space, d)
+		if err != nil {
+			t.Fatalf("GetIntent: %v", err)
+		}
+		time.Sleep(5 * time.Millisecond)
+		other := testutil.RandomDID(t)
+		if err := st.PutIntent(ctx, registry.UploadIntent{Space: other, Digest: d, LocalPath: "/spool/x", Size: 7, State: registry.IntentAccepted}); err != nil {
+			t.Fatalf("PutIntent: %v", err)
+		}
+		if err := st.PutLocation(ctx, registry.BlobLocation{Space: other, Digest: d, Provider: "did:key:p", URL: "http://p/blob", Size: 7}); err != nil {
+			t.Fatalf("PutLocation: %v", err)
+		}
+		if err := st.MarkEvicted(ctx, d, listed.UpdatedAt); err != nil {
+			t.Fatalf("MarkEvicted: %v", err)
+		}
+		rows, err := st.ListEvictable(ctx, registry.EvictCursor{}, 10)
+		if err != nil {
+			t.Fatalf("ListEvictable: %v", err)
+		}
+		if len(rows) != 1 || rows[0].Space != other {
+			t.Fatalf("listed after the mark = %+v, want only the newer intent", rows)
+		}
+		// Every intent newer than the mark: nothing marked, but not ErrNotFound.
+		if err := st.MarkEvicted(ctx, d, listed.UpdatedAt); err != nil {
+			t.Fatalf("MarkEvicted with nothing older: %v", err)
 		}
 	})
 }
