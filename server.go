@@ -752,7 +752,9 @@ func policyHeaders(c fiber.Ctx) error {
 	if *etag != "" {
 		c.Set("ETag", *etag)
 	}
-	if c.Method() == http.MethodGet && c.Response().StatusCode() == http.StatusOK {
+	// Only a request the policy backend answered fills the holder; an object
+	// read whose query happens to carry a policy key keeps its content type.
+	if *etag != "" && c.Method() == http.MethodGet && c.Response().StatusCode() == http.StatusOK {
 		c.Set(fiber.HeaderContentType, fiber.MIMEApplicationJSON)
 	}
 	return err
