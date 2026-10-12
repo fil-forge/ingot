@@ -465,6 +465,13 @@ func (b *Backend) evictToBudget(ctx context.Context, deadline time.Time, r reten
 				pass.files++
 				pass.bytes += freed
 			}
+			if errors.Is(err, blockstore.ErrHeld) {
+				// A write of the same bytes took the file since the listing;
+				// it is not gone, so it is not marked, and the pass moves on
+				// as it does past a recently read row.
+				pass.skipped++
+				continue
+			}
 			if err != nil {
 				failed.add(hex.EncodeToString(in.Digest), err)
 				continue
@@ -518,6 +525,9 @@ func (b *Backend) RemoveReleasedPublished(ctx context.Context) (files, bytes int
 			if freed > 0 {
 				files++
 				bytes += freed
+			}
+			if errors.Is(err, blockstore.ErrHeld) {
+				continue // a write holds the file; the intent waits for the next startup
 			}
 			if err != nil {
 				failed.add(hex.EncodeToString(in.Digest), err)

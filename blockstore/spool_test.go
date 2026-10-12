@@ -273,11 +273,11 @@ func TestSpoolHoldKeepsTheFile(t *testing.T) {
 	var got []string
 	record := func(label string) {
 		n, err := s.Remove(d)
-		if err != nil {
+		if err != nil && !errors.Is(err, ErrHeld) {
 			t.Fatalf("Remove (%s): %v", label, err)
 		}
 		_, statErr := os.Stat(s.Path(d))
-		got = append(got, fmt.Sprint(label, n, statErr == nil, s.Held(d)))
+		got = append(got, fmt.Sprint(label, n, statErr == nil, s.Held(d), errors.Is(err, ErrHeld)))
 	}
 	record("two holds")
 	first()
@@ -286,12 +286,12 @@ func TestSpoolHoldKeepsTheFile(t *testing.T) {
 	second()
 	record("no hold")
 	want := []string{
-		fmt.Sprint("two holds", 0, true, true),
-		fmt.Sprint("one hold", 0, true, true),
-		fmt.Sprint("no hold", 4, false, false),
+		fmt.Sprint("two holds", 0, true, true, true),
+		fmt.Sprint("one hold", 0, true, true, true),
+		fmt.Sprint("no hold", 4, false, false, false),
 	}
 	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("[label freed exists held] = %v, want %v", got, want)
+		t.Fatalf("[label freed exists held ErrHeld] = %v, want %v", got, want)
 	}
 }
 
@@ -308,18 +308,18 @@ func TestSpoolWriteBlobHeldPublishesTheFileHeld(t *testing.T) {
 	var got []string
 	record := func(label string) {
 		freed, err := s.Remove(d)
-		if err != nil {
+		if err != nil && !errors.Is(err, ErrHeld) {
 			t.Fatalf("Remove (%s): %v", label, err)
 		}
 		_, statErr := os.Stat(s.Path(d))
-		got = append(got, fmt.Sprint(label, freed, statErr == nil, s.HeldBy(space, d)))
+		got = append(got, fmt.Sprint(label, freed, statErr == nil, s.HeldBy(space, d), errors.Is(err, ErrHeld)))
 	}
 	record("held")
 	unhold()
 	record("released")
-	want := []string{fmt.Sprint("held", 0, true, true), fmt.Sprint("released", 10, false, false)}
+	want := []string{fmt.Sprint("held", 0, true, true, true), fmt.Sprint("released", 10, false, false, false)}
 	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("[label freed exists held] = %v, want %v", got, want)
+		t.Fatalf("[label freed exists held ErrHeld] = %v, want %v", got, want)
 	}
 	// An empty write publishes nothing and holds nothing.
 	if d, n, unhold, err := s.WriteBlobHeld(context.Background(), strings.NewReader(""), space); err != nil || d != nil || n != 0 || unhold != nil {

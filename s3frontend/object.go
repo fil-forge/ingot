@@ -28,6 +28,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.uber.org/zap"
 
+	"github.com/fil-forge/ingot/blockstore"
 	msbucket "github.com/fil-forge/ingot/bucket"
 	"github.com/fil-forge/ingot/bucketop"
 	"github.com/fil-forge/ingot/internal/reqscope"
@@ -1100,12 +1101,26 @@ func (b *Backend) executeRelease(ctx context.Context, pr registry.PendingRelease
 		// would; this space's intent goes either way.
 		if others == 0 && !b.spool.Held(digest) {
 			freed, err := b.removeLocal(digest)
-			if err != nil {
+			switch {
+			case errors.Is(err, blockstore.ErrHeld) && b.spool.HeldBy(space, digest):
+				// A write of this space took the file since the check
+				// above: the intent and the file are its, as in the held
+				// branch, and only the record goes.
+				if err := b.pendingReleases.DeleteRelease(ctx, space, digest); err != nil {
+					log.Warn("release: delete record failed", zap.Error(err))
+					ok = false
+				}
+				return ok
+			case errors.Is(err, blockstore.ErrHeld):
+				// Another space's write took the file: it stays, and this
+				// space's intent goes below.
+			case err != nil:
 				log.Warn("release: remove local blob copy failed", zap.Error(err))
 				ok = false
-				break
+				return ok
+			default:
+				b.localBlobMetrics.removedFile(ctx, removedReleased, freed)
 			}
-			b.localBlobMetrics.removedFile(ctx, removedReleased, freed)
 		}
 		if err := b.pendingReleases.DeleteIntentAndRelease(ctx, space, digest); err != nil {
 			log.Warn("release: delete upload intent with the release record failed", zap.Error(err))

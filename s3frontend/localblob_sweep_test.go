@@ -21,6 +21,7 @@ import (
 	"github.com/fil-forge/libforge/testutil"
 	"github.com/fil-forge/versitygw/s3response"
 
+	"github.com/fil-forge/ingot/blockstore"
 	"github.com/fil-forge/ingot/inmem"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ucantone/did"
@@ -1319,4 +1320,47 @@ type countingEvictable struct {
 func (c countingEvictable) ListEvictable(ctx context.Context, cursor registry.EvictCursor, limit int) ([]registry.UploadIntent, error) {
 	*c.calls++
 	return c.IntentStore.ListEvictable(ctx, cursor, limit)
+}
+
+// holdingEvictable takes a write's hold on every blob it lists, as a write
+// of the same bytes that spools them between the listing and the removal.
+type holdingEvictable struct {
+	registry.IntentStore
+	spool   *blockstore.Spool
+	unholds []func()
+}
+
+func (h *holdingEvictable) ListEvictable(ctx context.Context, cursor registry.EvictCursor, limit int) ([]registry.UploadIntent, error) {
+	page, err := h.IntentStore.ListEvictable(ctx, cursor, limit)
+	for _, in := range page {
+		h.unholds = append(h.unholds, h.spool.Hold(in.Space, in.Digest))
+	}
+	return page, err
+}
+
+// TestSweepLocalBlobs_LeavesAHeldBlobUnmarked: a write of the same bytes
+// that takes the file between the listing and the removal keeps it, and the
+// row is not marked evicted, since the file is not gone; the pass counts it
+// as skipped and moves on.
+func TestSweepLocalBlobs_LeavesAHeldBlobUnmarked(t *testing.T) {
+	var held *holdingEvictable
+	b, mem := newSweepBackend(t, func(d *Deps) {
+		held = &holdingEvictable{IntentStore: d.Intents, spool: d.Spool}
+		d.Intents = held
+	})
+	digests := putSweepObjects(t, b, 1)
+	budgetToEvict(b, 1, blobSize(t, b, digests[0]))
+
+	stats := sweepLocalBlobs(t, b)
+	for _, unhold := range held.unholds {
+		unhold()
+	}
+
+	want := []blobState{{true, false}}
+	if got := blobStates(t, b, mem, digests); !reflect.DeepEqual(got, want) {
+		t.Fatalf("held blob after the sweep = %+v, want %+v", got, want)
+	}
+	if stats.BudgetFiles != 0 {
+		t.Fatalf("the sweep counted %d files removed, want 0", stats.BudgetFiles)
+	}
 }

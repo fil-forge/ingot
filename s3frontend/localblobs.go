@@ -9,6 +9,7 @@ import (
 	"github.com/multiformats/go-multihash"
 	"go.uber.org/zap"
 
+	"github.com/fil-forge/ingot/blockstore"
 	"github.com/fil-forge/ingot/registry"
 )
 
@@ -57,6 +58,9 @@ func (b *Backend) dropLocalCopy(ctx context.Context, space did.DID, digest multi
 		return
 	}
 	freed, err := b.removeLocal(digest)
+	if errors.Is(err, blockstore.ErrHeld) {
+		return // a write of the same bytes holds the file, and its own flow or eviction takes it later
+	}
 	b.localBlobMetrics.removedFile(ctx, reason, freed)
 	if err != nil {
 		b.logger.Warn("drop held blob's local copy failed; the local blob sweeper or the blob's release removes it",
@@ -72,7 +76,9 @@ func (b *Backend) dropLocalCopy(ctx context.Context, space did.DID, digest multi
 // removeLocal removes a blob's local copy, from the spool or the cache,
 // and returns the bytes freed. A blob only ever moves from the spool to the
 // cache, so looking in the spool first means a concurrent move cannot slip
-// the copy past both removals.
+// the copy past both removals. A blob a write in flight holds is left
+// alone in both, and the error is blockstore.ErrHeld: the caller must not
+// record the file as gone.
 func (b *Backend) removeLocal(digest multihash.Multihash) (int64, error) {
 	freed, err := b.spool.Remove(digest)
 	if err != nil {

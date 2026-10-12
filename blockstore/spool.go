@@ -3,6 +3,7 @@ package blockstore
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -276,15 +277,20 @@ func (s *Spool) HeldBy(space did.DID, digest mh.Multihash) bool {
 	return s.holds[holdKey{space, string(digest)}] > 0
 }
 
+// ErrHeld is Remove's answer for a blob a write in flight holds (Hold): the
+// file is left as it is and nothing is freed. A caller that would record
+// the file as gone (an evicted mark, a deleted intent) must not.
+var ErrHeld = errors.New("blockstore: blob held by a write in flight")
+
 // Remove deletes the blob with the given digest, as blobDir.Remove does,
-// unless a write in flight holds it (Hold): the file is then left as it is
-// and nothing is freed. It holds the directory exclusively, so the check and
-// the unlink admit no hold or commit between them.
+// unless a write in flight holds it (Hold): it then returns ErrHeld, having
+// freed nothing. It holds the directory exclusively, so the check and the
+// unlink admit no hold or commit between them.
 func (s *Spool) Remove(digest mh.Multihash) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.Held(digest) {
-		return 0, nil
+		return 0, ErrHeld
 	}
 	return s.removeLocked(digest)
 }
