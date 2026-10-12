@@ -147,11 +147,10 @@ func (w *bodyWriter) WriteSizedBlob(ctx context.Context, r io.Reader, n int64) (
 // itself), checks they are the length promised, and records the blob's
 // state. streamed is the upload the bytes are being sent to, if any.
 func (w *bodyWriter) spoolStored(ctx context.Context, stored io.Reader, desc fee.BodyDescriptor, cek []byte, streamed *uploader.StreamedBlob) (multihash.Multihash, error) {
-	digest, storedSize, err := w.spool.WriteBlob(ctx, stored)
+	digest, storedSize, err := w.writeSpool(ctx, stored)
 	if err != nil {
 		return nil, fmt.Errorf("s3frontend: spool blob: %w", err)
 	}
-	w.takeHold(digest)
 	if streamed != nil && storedSize != streamed.Size {
 		return nil, fmt.Errorf("s3frontend: blob of %d bytes was allocated %d", storedSize, streamed.Size)
 	}

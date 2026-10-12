@@ -405,9 +405,9 @@ func (b *Backend) splitSpool(ctx context.Context, bucket string, space did.DID, 
 		}
 		enc = newEncryptingBlobWriter(b.spool, b.regionKeys, space, []fee.Recipient{recipient})
 	}
-	// Each spooled blob is held until its upload has read it; a failed
-	// split leaves no caller to end the holds.
-	enc.hold = func(digest multihash.Multihash) func() { return b.spool.Hold(space, digest) }
+	// Each spooled blob is published held, until its upload has read it; a
+	// failed split leaves no caller to end the holds.
+	enc.holdWrites = true
 	defer func() {
 		if err != nil {
 			enc.unholdAll()

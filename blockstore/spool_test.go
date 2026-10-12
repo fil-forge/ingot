@@ -2,6 +2,7 @@ package blockstore
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -291,5 +292,37 @@ func TestSpoolHoldKeepsTheFile(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("[label freed exists held] = %v, want %v", got, want)
+	}
+}
+
+// TestSpoolWriteBlobHeldPublishesTheFileHeld: a held write's file is held
+// from the moment it is visible under its digest, so a removal issued right
+// after the write frees nothing; once the hold ends, it does.
+func TestSpoolWriteBlobHeldPublishesTheFileHeld(t *testing.T) {
+	s, _ := newTestDirs(t)
+	space := did.Undef
+	d, n, unhold, err := s.WriteBlobHeld(context.Background(), strings.NewReader("held write"), space)
+	if err != nil || n != 10 || unhold == nil {
+		t.Fatalf("WriteBlobHeld = %x, %d, hold=%v, %v", d, n, unhold != nil, err)
+	}
+	var got []string
+	record := func(label string) {
+		freed, err := s.Remove(d)
+		if err != nil {
+			t.Fatalf("Remove (%s): %v", label, err)
+		}
+		_, statErr := os.Stat(s.Path(d))
+		got = append(got, fmt.Sprint(label, freed, statErr == nil, s.HeldBy(space, d)))
+	}
+	record("held")
+	unhold()
+	record("released")
+	want := []string{fmt.Sprint("held", 0, true, true), fmt.Sprint("released", 10, false, false)}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("[label freed exists held] = %v, want %v", got, want)
+	}
+	// An empty write publishes nothing and holds nothing.
+	if d, n, unhold, err := s.WriteBlobHeld(context.Background(), strings.NewReader(""), space); err != nil || d != nil || n != 0 || unhold != nil {
+		t.Fatalf("empty WriteBlobHeld = %x, %d, hold=%v, %v; want nothing", d, n, unhold != nil, err)
 	}
 }

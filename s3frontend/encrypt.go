@@ -80,11 +80,11 @@ type bodyWriter struct {
 	digestFirst bool
 	logger      *zap.Logger
 
-	// hold, when set, marks each spooled blob as needed by this write until
-	// its upload has read it (blockstore.Spool.Hold); holds keeps the
-	// functions that end the marks, by string(digest).
-	hold  func(multihash.Multihash) func()
-	holds map[string]func()
+	// holdWrites publishes each spooled blob already held for this write's
+	// space, until its upload has read the file (blockstore.Spool.WriteBlobHeld);
+	// holds keeps the functions that end the holds, by string(digest).
+	holdWrites bool
+	holds      map[string]func()
 }
 
 // encWrite is one blob's write-side state, keyed by stored digest in
@@ -128,12 +128,11 @@ func (b *Backend) tenantRecipient(ctx context.Context) (fee.Recipient, error) {
 // consumed from r.
 func (w *bodyWriter) WriteBlob(ctx context.Context, r io.Reader) (multihash.Multihash, int64, error) {
 	if w.plaintext {
-		digest, n, err := w.spool.WriteBlob(ctx, r)
+		digest, n, err := w.writeSpool(ctx, r)
 		if err != nil {
 			return nil, 0, fmt.Errorf("s3frontend: spool blob: %w", err)
 		}
 		if n > 0 {
-			w.takeHold(digest)
 			w.results[string(digest)] = encWrite{storedSize: n}
 		}
 		return digest, n, nil
@@ -166,11 +165,10 @@ func (w *bodyWriter) WriteBlob(ctx context.Context, r io.Reader) (multihash.Mult
 	}
 	defer rc.Close()
 
-	digest, storedSize, err := w.spool.WriteBlob(ctx, rc)
+	digest, storedSize, err := w.writeSpool(ctx, rc)
 	if err != nil {
 		return nil, 0, fmt.Errorf("s3frontend: spool envelope: %w", err)
 	}
-	w.takeHold(digest)
 	if err := w.record(ctx, digest, cek, encWrite{desc: desc, storedSize: storedSize}); err != nil {
 		return nil, 0, err
 	}
@@ -254,18 +252,32 @@ func (c *countingReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// takeHold marks a just-spooled blob as needed by this write (see hold).
-func (w *bodyWriter) takeHold(digest multihash.Multihash) {
-	if w.hold == nil {
-		return
+// heldBlobWriter is a spool that can publish a blob already held for a
+// write (blockstore.Spool); the in-process fakes need not.
+type heldBlobWriter interface {
+	WriteBlobHeld(ctx context.Context, r io.Reader, space did.DID) (multihash.Multihash, int64, func(), error)
+}
+
+// writeSpool spools r as WriteBlob on the spool does and, with holdWrites
+// set and a spool that can, publishes the file already held for this
+// write's space, keeping the function that ends the hold.
+func (w *bodyWriter) writeSpool(ctx context.Context, r io.Reader) (multihash.Multihash, int64, error) {
+	held, ok := w.spool.(heldBlobWriter)
+	if !w.holdWrites || !ok {
+		return w.spool.WriteBlob(ctx, r)
+	}
+	digest, n, unhold, err := held.WriteBlobHeld(ctx, r, w.space)
+	if err != nil || unhold == nil {
+		return digest, n, err
 	}
 	if w.holds == nil {
 		w.holds = map[string]func(){}
 	}
-	if _, ok := w.holds[string(digest)]; ok {
-		return // the same bytes twice in one body: one hold is enough
+	if prior, ok := w.holds[string(digest)]; ok {
+		prior() // the same bytes twice in one body: the newer hold stands
 	}
-	w.holds[string(digest)] = w.hold(digest)
+	w.holds[string(digest)] = unhold
+	return digest, n, nil
 }
 
 // unholdAll ends every hold this writer took.

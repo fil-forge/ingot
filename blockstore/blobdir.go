@@ -241,6 +241,11 @@ func (d *blobDir) Path(digest mh.Multihash) string {
 func (d *blobDir) Remove(digest mh.Multihash) (int64, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
+	return d.removeLocked(digest)
+}
+
+// removeLocked is Remove for a caller that holds mu, shared or exclusive.
+func (d *blobDir) removeLocked(digest mh.Multihash) (int64, error) {
 	path := d.Path(digest)
 	info, err := os.Stat(path)
 	if errors.Is(err, os.ErrNotExist) {
