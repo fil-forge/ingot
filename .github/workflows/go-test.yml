@@ -7,7 +7,7 @@ name: Go Test
 # stack. The live job exists because the unit job runs the same packages with
 # no INGOT_TEST_* env, silently skipping every *_live_test.go.
 #
-# The Docker-backed work spreads over five runners: four `itest-shards` and
+# The Docker-backed work spreads over six runners: five `itest-shards` and
 # `s3compat`, which runs the compatibility corpus (the shards leave
 # INGOT_S3COMPAT unset, so TestForgeS3Compat skips itself there). Shard
 # membership lives in the Makefile, target `itest-shard`; job `itest`
@@ -102,7 +102,7 @@ jobs:
     # from under us. The runner's preinstalled Docker is 28.x, well past
     # smelt's 25+ requirement.
     runs-on: ubuntu-24.04
-    # The slowest shard is ~6 minutes of tests on top of ~2 minutes of image
+    # The slowest shard is ~7 minutes of tests on top of ~2 minutes of image
     # pulls and the working-tree ingot build. Comfortably above `make
     # itest-shard`'s own -timeout 20m, so a hung test hits Go's timeout and
     # dumps goroutine stacks before the runner is cut off.
@@ -121,6 +121,7 @@ jobs:
             # this shard owns. Move that test between shards in the Makefile
             # and move this flag with it, or it silently stops running.
             big: '1'
+          - shard: releases
           - shard: rest
 
     name: itest (${{ matrix.shard }})
