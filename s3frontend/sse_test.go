@@ -193,8 +193,14 @@ func TestBucketEncryption_Configuration(t *testing.T) {
 		t.Fatalf("stored encryption after refused puts = %q (%v), want AES256", st.Encryption, err)
 	}
 
+	// A KMS key beside "none" is refused like one beside AES256, allowed or
+	// not, and refused before the deployment gate is consulted.
+	noneWithKey := sseConfig(sseNone)
+	noneWithKey.Rules[0].ApplyServerSideEncryptionByDefault.KMSMasterKeyID = &keyID
+	wantInvalidArgument(t, b.PutBucketEncryption(ctx, "bk", noneWithKey))
 	// Allowed, "none" stores and reads back.
 	b.allowNoneEncryption = true
+	wantInvalidArgument(t, b.PutBucketEncryption(ctx, "bk", noneWithKey))
 	if err := b.PutBucketEncryption(ctx, "bk", sseConfig(sseNone)); err != nil {
 		t.Fatalf("PutBucketEncryption none: %v", err)
 	}

@@ -174,12 +174,15 @@ func (b *Backend) PutBucketEncryption(ctx context.Context, bucket string, config
 		return s3err.GetAPIError(s3err.ErrMalformedXML)
 	}
 	byDefault := config.Rules[0].ApplyServerSideEncryptionByDefault
+	// A KMS key belongs to aws:kms alone: with AES256 or "none" it is a
+	// malformed request, refused rather than dropped.
+	kms := byDefault.SSEAlgorithm == types.ServerSideEncryptionAwsKms || byDefault.SSEAlgorithm == types.ServerSideEncryptionAwsKmsDsse
+	if byDefault.KMSMasterKeyID != nil && !kms {
+		return errSSEArgument("KMSMasterKeyID can only be specified with aws:kms")
+	}
 	var enc registry.BucketEncryption
 	switch byDefault.SSEAlgorithm {
 	case types.ServerSideEncryptionAes256:
-		if byDefault.KMSMasterKeyID != nil {
-			return errSSEArgument("KMSMasterKeyID can only be specified with aws:kms")
-		}
 		enc = registry.BucketEncryptionAES256
 	case types.ServerSideEncryptionAwsKms, types.ServerSideEncryptionAwsKmsDsse:
 		return s3err.GetAPIError(s3err.ErrNotImplemented)
