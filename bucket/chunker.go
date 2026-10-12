@@ -193,9 +193,11 @@ func OpenBodyRange(ctx context.Context, opener BlobRangeOpener, space did.DID, b
 }
 
 // NewPlainOpener returns the BlobRangeOpener for unencrypted blobs, whose
-// stored bytes are their plaintext: open the blob, position at start (a Seek
-// for a spool file, read-and-discard for a network stream), and serve
-// through end.
+// stored bytes are their plaintext: a reader that can serve a byte range
+// (blockstore.BlobRangeReader, as the production tiers do) is asked for
+// exactly [start, end], so a small range late in a large blob fetches only
+// that; one that cannot is opened whole and positioned at start, by a seek
+// for a local file or by reading and discarding for a stream.
 func NewPlainOpener(bs blockstore.BlobReader) BlobRangeOpener {
 	return plainOpener{bs: bs}
 }
@@ -205,25 +207,7 @@ type plainOpener struct {
 }
 
 func (o plainOpener) OpenBlobRange(ctx context.Context, space did.DID, ref BlobRef, start, end int64) (io.ReadCloser, error) {
-	rc, err := o.bs.OpenBlob(ctx, space, ref.Digest)
-	if err != nil {
-		return nil, err
-	}
-	// Position at start within the blob — a ranged read may begin mid-blob.
-	// Prefer a seek (local spool files are seekable); fall back to
-	// read-and-discard for a non-seekable network stream.
-	if start > 0 {
-		if seeker, ok := rc.(io.Seeker); ok {
-			if _, err := seeker.Seek(start, io.SeekStart); err != nil {
-				_ = rc.Close()
-				return nil, fmt.Errorf("seek blob to %d: %w", start, err)
-			}
-		} else if _, err := io.CopyN(io.Discard, rc, start); err != nil {
-			_ = rc.Close()
-			return nil, fmt.Errorf("skip into blob to %d: %w", start, err)
-		}
-	}
-	return readerCloser{Reader: io.LimitReader(rc, end-start+1), Closer: rc}, nil
+	return blockstore.OpenBlobRangeOf(ctx, o.bs, space, ref.Digest, start, end)
 }
 
 // readerCloser pairs a wrapped reader with the closer that releases its
