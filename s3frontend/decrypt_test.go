@@ -158,7 +158,7 @@ func TestDecryptingRead_Ranges(t *testing.T) {
 	// ranges cross STREAM chunk boundaries as well as blob boundaries.
 	fx := newEncFixture(t, patterned(24000), 10000)
 
-	opener, err := fx.backend.bodyOpener(ctx, fx.space, fx.body)
+	opener, err := fx.backend.bodyOpener(ctx, fx.space, fx.body, false)
 	if err != nil {
 		t.Fatalf("bodyOpener: %v", err)
 	}
@@ -207,7 +207,7 @@ func TestDecryptingRead_MissingParamsRowFailsClosed(t *testing.T) {
 	if err := fx.mem.DeleteEncryptionParams(ctx, fx.space, fx.body.Blobs[1].Digest); err != nil {
 		t.Fatalf("DeleteEncryptionParams: %v", err)
 	}
-	if _, err := fx.backend.bodyOpener(ctx, fx.space, fx.body); err == nil {
+	if _, err := fx.backend.bodyOpener(ctx, fx.space, fx.body, false); err == nil {
 		t.Fatal("bodyOpener over a shredded row succeeded — raw ciphertext would have been served")
 	} else if !strings.Contains(err.Error(), "no encryption-params row") {
 		t.Fatalf("bodyOpener error = %v, want the missing-row rejection", err)
@@ -222,7 +222,7 @@ func TestDecryptingRead_UnrangedUnseekableStore(t *testing.T) {
 	ctx := context.Background()
 	fx := newEncFixture(t, patterned(24000), 10000)
 
-	opener, err := fx.backend.bodyOpener(ctx, fx.space, fx.body)
+	opener, err := fx.backend.bodyOpener(ctx, fx.space, fx.body, false)
 	if err != nil {
 		t.Fatalf("bodyOpener: %v", err)
 	}
@@ -253,7 +253,7 @@ func TestDecryptingRead_TamperFails(t *testing.T) {
 		t.Fatalf("write tampered envelope: %v", err)
 	}
 
-	opener, err := fx.backend.bodyOpener(ctx, fx.space, fx.body)
+	opener, err := fx.backend.bodyOpener(ctx, fx.space, fx.body, false)
 	if err != nil {
 		t.Fatalf("bodyOpener: %v", err)
 	}
@@ -280,7 +280,7 @@ func TestDecryptingRead_TransplantedRowFails(t *testing.T) {
 		t.Fatalf("PutEncryptionParams: %v", err)
 	}
 
-	opener, err := fx.backend.bodyOpener(ctx, fx.space, fx.body)
+	opener, err := fx.backend.bodyOpener(ctx, fx.space, fx.body, false)
 	if err != nil {
 		t.Fatalf("bodyOpener: %v", err)
 	}
@@ -298,7 +298,7 @@ func TestDecryptingRead_MissingDepsFails(t *testing.T) {
 	fx := newEncFixture(t, patterned(9000), 10000)
 
 	fx.backend.regionKeys = nil
-	if _, err := fx.backend.bodyOpener(ctx, fx.space, fx.body); err == nil ||
+	if _, err := fx.backend.bodyOpener(ctx, fx.space, fx.body, false); err == nil ||
 		!strings.Contains(err.Error(), "encryption dependencies not configured") {
 		t.Fatalf("bodyOpener err = %v, want encryption-dependencies error", err)
 	}
@@ -313,7 +313,7 @@ func TestDecryptingRead_MissingLocationFails(t *testing.T) {
 	if err := fx.backend.locations.DeleteLocation(ctx, fx.space, fx.body.Blobs[0].Digest); err != nil {
 		t.Fatalf("DeleteLocation: %v", err)
 	}
-	_, err := fx.backend.bodyOpener(ctx, fx.space, fx.body)
+	_, err := fx.backend.bodyOpener(ctx, fx.space, fx.body, false)
 	if err == nil || !strings.Contains(err.Error(), "no recorded location") {
 		t.Fatalf("bodyOpener err = %v, want missing-location error", err)
 	}

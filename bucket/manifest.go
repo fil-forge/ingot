@@ -71,6 +71,15 @@ type ObjectManifest struct {
 	// the prefix stripped and keys lower-cased by the S3 layer). Nil when
 	// the object carries no user metadata.
 	Metadata map[string]string `cborgen:"md"`
+
+	// Plaintext marks an object whose body blobs are stored as received:
+	// no FEE envelope, no blob_encryption_params row, the digest naming the
+	// plaintext bytes. It is the read path's dispatch: a plaintext body is
+	// served as stored, every other body is decrypted and fails closed on a
+	// blob without a row. False (and so absent from blocks written before the
+	// field) means encrypted. Written only for a bucket whose encryption is
+	// "none" (docs/architecture.md; s3frontend/sse.go).
+	Plaintext bool `cborgen:"pt"`
 }
 
 // Body describes an object's bytes as an ordered, contiguous list of

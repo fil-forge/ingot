@@ -304,3 +304,46 @@ func BenchmarkSplitBodyNoMD5(b *testing.B) {
 		}
 	}
 }
+
+// rangeRecordingReader serves a blob and records the byte range each
+// OpenBlobRange was asked for, as a read tier that fetches ranges from the
+// network does.
+type rangeRecordingReader struct {
+	data   []byte
+	ranges [][2]int64
+}
+
+func (r *rangeRecordingReader) OpenBlob(context.Context, did.DID, mh.Multihash) (io.ReadCloser, error) {
+	return io.NopCloser(bytes.NewReader(r.data)), nil
+}
+
+func (r *rangeRecordingReader) OpenBlobRange(_ context.Context, _ did.DID, _ mh.Multihash, start, end int64) (io.ReadCloser, error) {
+	r.ranges = append(r.ranges, [2]int64{start, end})
+	return io.NopCloser(bytes.NewReader(r.data[start : end+1])), nil
+}
+
+// TestPlainOpenerAsksForTheRange: a reader that can serve a byte range is
+// asked for exactly the range a ranged read needs, so a small range late in
+// a large blob never fetches the prefix before it.
+func TestPlainOpenerAsksForTheRange(t *testing.T) {
+	data := bytes.Repeat([]byte("plaintext blob "), 1000)
+	rr := &rangeRecordingReader{data: data}
+	d, err := mh.Sum(data, mh.SHA2_256, -1)
+	if err != nil {
+		t.Fatalf("multihash: %v", err)
+	}
+	ref := BlobRef{Digest: d, Start: 0, End: int64(len(data)) - 1}
+	body := Body{Size: int64(len(data)), Blobs: []BlobRef{ref}}
+	start, end := int64(len(data))-20, int64(len(data))-1
+
+	got, err := io.ReadAll(OpenBodyRange(context.Background(), NewPlainOpener(rr), did.Undef, body, start, end))
+	if err != nil {
+		t.Fatalf("read range: %v", err)
+	}
+	if !bytes.Equal(got, data[start:end+1]) {
+		t.Fatalf("range read %q, want %q", got, data[start:end+1])
+	}
+	if want := [][2]int64{{start, end}}; len(rr.ranges) != 1 || rr.ranges[0] != want[0] {
+		t.Fatalf("ranges asked of the reader = %v, want %v", rr.ranges, want)
+	}
+}

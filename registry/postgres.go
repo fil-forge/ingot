@@ -81,9 +81,10 @@ func (r *Postgres) Get(ctx context.Context, name string) (*State, error) {
 	var rootBytes, forgeBytes, lockCfg, tagging []byte
 	var createdAt time.Time
 	var spaceStr, tenantStr, versioning string
+	var encryption *string
 	err := r.pool.QueryRow(ctx,
-		`SELECT root_cid, forge_root_cid, created_at, space, tenant, versioning, object_lock_config, bucket_tagging FROM ingot.buckets WHERE name = $1`, name).
-		Scan(&rootBytes, &forgeBytes, &createdAt, &spaceStr, &tenantStr, &versioning, &lockCfg, &tagging)
+		`SELECT root_cid, forge_root_cid, created_at, space, tenant, versioning, object_lock_config, bucket_tagging, encryption FROM ingot.buckets WHERE name = $1`, name).
+		Scan(&rootBytes, &forgeBytes, &createdAt, &spaceStr, &tenantStr, &versioning, &lockCfg, &tagging, &encryption)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -99,6 +100,9 @@ func (r *Postgres) Get(ctx context.Context, name string) (*State, error) {
 		return nil, fmt.Errorf("registry: parse tenant %q: %w", tenantStr, err)
 	}
 	st := &State{Name: name, Space: space, Tenant: tenant, Versioning: VersioningState(versioning), ObjectLockConfig: lockCfg, BucketTagging: tagging, CreatedAt: createdAt}
+	if encryption != nil {
+		st.Encryption = BucketEncryption(*encryption)
+	}
 	if err := setCidPg(&st.Root, rootBytes, name, "root_cid"); err != nil {
 		return nil, err
 	}
@@ -252,6 +256,19 @@ func (r *Postgres) SetBucketTagging(ctx context.Context, name string, tags []byt
 		tags, name)
 	if err != nil {
 		return fmt.Errorf("registry: set bucket tagging %q: %w", name, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (r *Postgres) SetEncryption(ctx context.Context, name string, enc BucketEncryption) error {
+	tag, err := r.pool.Exec(ctx,
+		`UPDATE ingot.buckets SET encryption = $1 WHERE name = $2`,
+		nullString(string(enc)), name)
+	if err != nil {
+		return fmt.Errorf("registry: set encryption %q: %w", name, err)
 	}
 	if tag.RowsAffected() == 0 {
 		return ErrNotFound

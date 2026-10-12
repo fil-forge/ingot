@@ -483,3 +483,28 @@ func TestStreamedPutObjectUnrecordedStreamIsAborted(t *testing.T) {
 }
 
 func ptrInt32(v int32) *int32 { return &v }
+
+// TestStreamedPutObjectRepeatedPlaintextChunk: a body stored as received can
+// hold the same bytes twice, so two streamed blobs share a digest. The
+// provider needs the bytes once: the first stream is concluded, the second
+// is given up at once rather than left for the stale-stream sweeper, and
+// the object reads back whole.
+func TestStreamedPutObjectRepeatedPlaintextChunk(t *testing.T) {
+	su := newStreamingUploader()
+	b, mem := newStreamingBackend(t, su)
+	setNone(t, b)
+	chunk := testBody(streamBlobCeiling)
+	data := append(append([]byte{}, chunk...), chunk...)
+
+	require.NoError(t, putSized(t, b, "k", data, int64(len(data))))
+
+	digests := blobDigestsOf(t, b, "k", "")
+	require.Len(t, digests, 2)
+	require.Equal(t, digests[0], digests[1], "the two chunks share a digest")
+	require.Len(t, su.started, 2, "each chunk was allocated as it streamed")
+	require.Len(t, su.concluded, 1, "the provider was asked to accept the bytes once")
+	require.Len(t, su.aborted, 1, "the second allocation was given up")
+	require.Equal(t, su.started[1].AddTask, su.aborted[0], "the later allocation is the one given up")
+	require.Empty(t, staleStreams(t, mem), "no upload is left for the sweeper")
+	require.Equal(t, data, getRange(t, b, "k", ""))
+}
