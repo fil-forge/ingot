@@ -32,21 +32,31 @@ var (
 
 // BlobRefStore ===============================================================
 func (m *MemStore) AddBlobClaim(_ context.Context, c registry.BlobClaim) error {
+	return m.AddBlobClaims(context.Background(), []registry.BlobClaim{c})
+}
+
+func (m *MemStore) AddBlobClaims(_ context.Context, claims []registry.BlobClaim) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if pr, ok := m.releases[locKey{c.Space, string(c.Digest)}]; ok && !pr.StartedAt.IsZero() {
-		return registry.ErrReleaseInProgress
+	// Every digest is checked before any claim is recorded: a refusal
+	// records nothing.
+	for _, c := range claims {
+		if pr, ok := m.releases[locKey{c.Space, string(c.Digest)}]; ok && !pr.StartedAt.IsZero() {
+			return registry.ErrReleaseInProgress
+		}
 	}
-	k := claimKey{string(c.Digest), c.Bucket, c.ObjectKey, c.VersionID}
-	cp := c
-	cp.Digest = bytes.Clone(c.Digest)
-	m.blobRefs[k] = cp
-	// Committed blobs' intents are published, atomically with the claim.
-	ik := locKey{c.Space, string(c.Digest)}
-	if in, ok := m.intents[ik]; ok && in.State != registry.IntentPublished {
-		in.State = registry.IntentPublished
-		in.UpdatedAt = time.Now()
-		m.intents[ik] = in
+	for _, c := range claims {
+		k := claimKey{string(c.Digest), c.Bucket, c.ObjectKey, c.VersionID}
+		cp := c
+		cp.Digest = bytes.Clone(c.Digest)
+		m.blobRefs[k] = cp
+		// Committed blobs' intents are published, atomically with the claim.
+		ik := locKey{c.Space, string(c.Digest)}
+		if in, ok := m.intents[ik]; ok && in.State != registry.IntentPublished {
+			in.State = registry.IntentPublished
+			in.UpdatedAt = time.Now()
+			m.intents[ik] = in
+		}
 	}
 	return nil
 }

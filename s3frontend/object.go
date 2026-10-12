@@ -686,16 +686,16 @@ func (b *Backend) addClaims(ctx context.Context, st *registry.State, key, claimI
 		claims = append(claims, registry.BlobClaim{Digest: d, Bucket: st.Name, ObjectKey: key, VersionID: claimID, Space: st.Space})
 	}
 	if !pinned {
-		for _, c := range claims {
-			if err := b.blobRefs.AddBlobClaim(ctx, c); err != nil {
-				if errors.Is(err, registry.ErrReleaseInProgress) {
-					// A release of the same digest started after the write
-					// settled it (settleRelease) and is removing the blob; the
-					// client retries once it has run.
-					return s3err.GetAPIError(s3err.ErrSlowDown)
-				}
-				return fmt.Errorf("add blob claim: %w", err)
+		// All or nothing: a commit that fails here leaves no claim behind,
+		// since no generation would ever drop one.
+		if err := b.blobRefs.AddBlobClaims(ctx, claims); err != nil {
+			if errors.Is(err, registry.ErrReleaseInProgress) {
+				// A release of one of the digests started after the write
+				// settled it (settleRelease) and is removing the blob; the
+				// client retries once it has run.
+				return s3err.GetAPIError(s3err.ErrSlowDown)
 			}
+			return fmt.Errorf("add blob claims: %w", err)
 		}
 		return nil
 	}

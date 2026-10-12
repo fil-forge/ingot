@@ -33,43 +33,54 @@ var (
 // BlobRefStore ===============================================================
 
 func (r *Postgres) AddBlobClaim(ctx context.Context, c BlobClaim) error {
+	return r.AddBlobClaims(ctx, []BlobClaim{c})
+}
+
+func (r *Postgres) AddBlobClaims(ctx context.Context, claims []BlobClaim) error {
+	if len(claims) == 0 {
+		return nil
+	}
+	sorted := slices.Clone(claims)
+	slices.SortFunc(sorted, func(a, b BlobClaim) int { return bytes.Compare(a.Digest, b.Digest) })
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("registry: begin add blob claim: %w", err)
+		return fmt.Errorf("registry: begin add blob claims: %w", err)
 	}
 	defer tx.Rollback(ctx)
-	if err := lockClaimKey(ctx, tx, c.Space, c.Digest); err != nil {
-		return err
-	}
-	var started bool
-	if err := tx.QueryRow(ctx,
-		`SELECT EXISTS (SELECT 1 FROM ingot.blob_release_intents
-		                 WHERE space = $1 AND digest = $2 AND started_at IS NOT NULL)`,
-		c.Space, c.Digest).Scan(&started); err != nil {
-		return fmt.Errorf("registry: add blob claim: release lookup: %w", err)
-	}
-	if started {
-		return ErrReleaseInProgress
-	}
-	if _, err := tx.Exec(ctx,
-		`INSERT INTO ingot.blob_refs (digest, bucket, object_key, version_id, space)
-		 VALUES ($1, $2, $3, $4, $5)
-		 ON CONFLICT (digest, bucket, object_key, version_id) DO NOTHING`,
-		c.Digest, c.Bucket, c.ObjectKey, c.VersionID, c.Space); err != nil {
-		return fmt.Errorf("registry: add blob claim: %w", err)
-	}
-	// The claim is the commit's durable trace on the blob; the intent's
-	// published state is how a multipart session's teardown recognises a
-	// committed blob and leaves it to its object's own release. A blob
-	// without an intent row (a shipped catalog segment) has nothing to mark.
-	if _, err := tx.Exec(ctx,
-		`UPDATE ingot.upload_intents SET state = $3, updated_at = now()
-		 WHERE space = $1 AND digest = $2 AND state <> $3`,
-		c.Space, c.Digest, IntentPublished); err != nil {
-		return fmt.Errorf("registry: publish intent: %w", err)
+	for _, c := range sorted {
+		if err := lockClaimKey(ctx, tx, c.Space, c.Digest); err != nil {
+			return err
+		}
+		var started bool
+		if err := tx.QueryRow(ctx,
+			`SELECT EXISTS (SELECT 1 FROM ingot.blob_release_intents
+			                 WHERE space = $1 AND digest = $2 AND started_at IS NOT NULL)`,
+			c.Space, c.Digest).Scan(&started); err != nil {
+			return fmt.Errorf("registry: add blob claim: release lookup: %w", err)
+		}
+		if started {
+			return ErrReleaseInProgress // rolled back by the deferred Rollback
+		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO ingot.blob_refs (digest, bucket, object_key, version_id, space)
+			 VALUES ($1, $2, $3, $4, $5)
+			 ON CONFLICT (digest, bucket, object_key, version_id) DO NOTHING`,
+			c.Digest, c.Bucket, c.ObjectKey, c.VersionID, c.Space); err != nil {
+			return fmt.Errorf("registry: add blob claim: %w", err)
+		}
+		// The claim is the commit's durable trace on the blob; the intent's
+		// published state is how a multipart session's teardown recognises a
+		// committed blob and leaves it to its object's own release. A blob
+		// without an intent row (a shipped catalog segment) has nothing to mark.
+		if _, err := tx.Exec(ctx,
+			`UPDATE ingot.upload_intents SET state = $3, updated_at = now()
+			 WHERE space = $1 AND digest = $2 AND state <> $3`,
+			c.Space, c.Digest, IntentPublished); err != nil {
+			return fmt.Errorf("registry: publish intent: %w", err)
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("registry: commit add blob claim: %w", err)
+		return fmt.Errorf("registry: commit add blob claims: %w", err)
 	}
 	return nil
 }

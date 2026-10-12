@@ -212,4 +212,35 @@ func runReleaseStartSuite(t *testing.T, st releaseStartStore) {
 			t.Fatalf("AddBlobClaim after the release: %v", err)
 		}
 	})
+
+	t.Run("a generation's claims land together or not at all", func(t *testing.T) {
+		free := evictDigest(t, "start:free")
+		going := enqueue("claims-going")
+		if s, err := st.StartRelease(ctx, space, going); err != nil || s != registry.ReleaseStarted {
+			t.Fatalf("StartRelease = %v, %v", s, err)
+		}
+		claims := []registry.BlobClaim{
+			{Digest: free, Bucket: "bk", ObjectKey: "k", VersionID: "v", Space: space},
+			{Digest: going, Bucket: "bk", ObjectKey: "k", VersionID: "v", Space: space},
+		}
+		if err := st.AddBlobClaims(ctx, claims); !errors.Is(err, registry.ErrReleaseInProgress) {
+			t.Fatalf("AddBlobClaims with one digest under a started release err = %v, want ErrReleaseInProgress", err)
+		}
+		for _, d := range []multihash.Multihash{free, going} {
+			if n, _ := st.CountClaims(ctx, space, d); n != 0 {
+				t.Fatalf("a refused batch recorded a claim on %x", d)
+			}
+		}
+		if err := st.DeleteRelease(ctx, space, going); err != nil {
+			t.Fatalf("DeleteRelease: %v", err)
+		}
+		if err := st.AddBlobClaims(ctx, claims); err != nil {
+			t.Fatalf("AddBlobClaims after the release: %v", err)
+		}
+		for _, d := range []multihash.Multihash{free, going} {
+			if n, _ := st.CountClaims(ctx, space, d); n != 1 {
+				t.Fatalf("claims on %x after the batch = %d, want 1", d, n)
+			}
+		}
+	})
 }

@@ -509,16 +509,20 @@ func (s *startAfterSettle) CancelRelease(ctx context.Context, space did.DID, dig
 // TestPlaintextRelease_ClaimRefusedDuringAStartedRelease: a release that
 // starts after the write settled it and before its commit refuses the
 // claim, so the write fails with SlowDown rather than commit a manifest
-// over a blob the release is removing.
+// over a blob the release is removing. The body has two blobs and the
+// release is of the second: the first blob's claim does not land either,
+// since no generation would ever drop it.
 func TestPlaintextRelease_ClaimRefusedDuringAStartedRelease(t *testing.T) {
 	rel := &startAfterSettle{}
 	b, mem := newDeferredBackend(t, inmem.NopUploader{}, func(d *Deps) {
 		rel.PendingReleaseStore = d.PendingReleases
 		d.PendingReleases = rel
+		d.MaxBlobSize = 4 << 10
 	})
 	setNone(t, b)
 	data := testBody(8 << 10)
-	rel.digest, rel.space, rel.armed = digestOf(t, data), did.Undef, true
+	first, second := digestOf(t, data[:4<<10]), digestOf(t, data[4<<10:])
+	rel.digest, rel.space, rel.armed = second, did.Undef, true
 
 	bucket, key := "bk", "k"
 	_, err := b.PutObject(context.Background(), s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(data)})
@@ -526,8 +530,10 @@ func TestPlaintextRelease_ClaimRefusedDuringAStartedRelease(t *testing.T) {
 	if !errors.As(err, &apiErr) || apiErr.Code != "SlowDown" {
 		t.Fatalf("PutObject with a release started before its commit: err = %v, want SlowDown", err)
 	}
-	if n, _ := mem.CountClaims(context.Background(), did.Undef, rel.digest); n != 0 {
-		t.Fatalf("a claim landed during the started release: %d", n)
+	for _, d := range []multihash.Multihash{first, second} {
+		if n, _ := mem.CountClaims(context.Background(), did.Undef, d); n != 0 {
+			t.Fatalf("a claim on %x landed although the commit was refused: %d", d, n)
+		}
 	}
 }
 

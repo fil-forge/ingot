@@ -271,6 +271,12 @@ type BlobRefStore interface {
 	// release holds the digest (PendingReleaseStore.StartRelease): a claim
 	// landing then would name a blob the release is removing.
 	AddBlobClaim(ctx context.Context, claim BlobClaim) error
+	// AddBlobClaims is AddBlobClaim for every claim of one generation, all
+	// in one transaction, each under its claim-key lock, taken in digest
+	// order: a digest refused for a started release records nothing for
+	// the others, so a commit that fails leaves no claim behind that no
+	// generation will ever drop.
+	AddBlobClaims(ctx context.Context, claims []BlobClaim) error
 	// PinBlobClaims is AddBlobClaim for digests borrowed from another object
 	// of the same space (a same-space copy pins the source's body). Each
 	// claim is recorded only while the space still holds a claim on its
