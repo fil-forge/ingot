@@ -9,6 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/fil-forge/ucantone/did"
 	mh "github.com/multiformats/go-multihash"
 )
 
@@ -39,12 +40,15 @@ type Spool struct {
 	// bytes are briefly in both, between its commit and WriteBlob's return,
 	// so Usage can run high by up to one blob per concurrent write.
 	inFlight atomic.Int64
-	// holds counts, per digest, the writes that still need the blob's file:
-	// from its spool write until its upload has read it. Remove leaves a
-	// held blob alone, so a release of the same digest by another object
-	// never takes a file a write in flight is about to upload.
+	// holds counts, per space and digest, the writes that still need the
+	// blob's file: from its spool write until its upload has read it. Remove
+	// leaves a held blob alone, so a release of the same digest by another
+	// object never takes a file a write in flight is about to upload. The
+	// space says whose write holds it: a release reads its own space's hold
+	// as a write waiting for it, and another space's as a reason to leave
+	// the file and nothing else.
 	holdMu sync.Mutex
-	holds  map[string]int
+	holds  map[holdKey]int
 }
 
 // spoolTempPrefix names the files WriteBlob streams into before the rename to
@@ -58,7 +62,7 @@ func NewSpool(dir string) (*Spool, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &Spool{blobDir: d, holds: map[string]int{}}
+	s := &Spool{blobDir: d, holds: map[holdKey]int{}}
 	if err := s.recoverDir(); err != nil {
 		return nil, err
 	}
@@ -189,15 +193,21 @@ var (
 	_ BlobWriter      = (*Spool)(nil)
 )
 
-// Hold marks the blob with the given digest as needed by a write in flight,
-// so Remove leaves its file alone, and returns the function that ends the
-// hold. Ending it twice is harmless. A write holds each blob it spools from
-// the spool write until its upload has read the file, which is what keeps
-// the same bytes written as received by two objects of one space safe: a
+// holdKey names one space's holds on one digest.
+type holdKey struct {
+	space  did.DID
+	digest string
+}
+
+// Hold marks the blob with the given digest as needed by a write in flight
+// for space, so Remove leaves its file alone, and returns the function that
+// ends the hold. Ending it twice is harmless. A write holds each blob it
+// spools from the spool write until its upload has read the file, which is
+// what keeps the same bytes written as received by two objects safe: a
 // release of the first object's blob can run while the second write is
 // between spooling and uploading it.
-func (s *Spool) Hold(digest mh.Multihash) (unhold func()) {
-	k := string(digest)
+func (s *Spool) Hold(space did.DID, digest mh.Multihash) (unhold func()) {
+	k := holdKey{space, string(digest)}
 	s.holdMu.Lock()
 	s.holds[k]++
 	s.holdMu.Unlock()
@@ -215,11 +225,23 @@ func (s *Spool) Hold(digest mh.Multihash) (unhold func()) {
 	}
 }
 
-// Held reports whether a write in flight holds the blob (see Hold).
+// Held reports whether a write in flight, in any space, holds the blob.
 func (s *Spool) Held(digest mh.Multihash) bool {
 	s.holdMu.Lock()
 	defer s.holdMu.Unlock()
-	return s.holds[string(digest)] > 0
+	for k := range s.holds {
+		if k.digest == string(digest) {
+			return true
+		}
+	}
+	return false
+}
+
+// HeldBy reports whether a write in flight for space holds the blob.
+func (s *Spool) HeldBy(space did.DID, digest mh.Multihash) bool {
+	s.holdMu.Lock()
+	defer s.holdMu.Unlock()
+	return s.holds[holdKey{space, string(digest)}] > 0
 }
 
 // Remove deletes the blob with the given digest, as blobDir.Remove does,

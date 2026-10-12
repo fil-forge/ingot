@@ -371,3 +371,33 @@ func TestPlaintextRelease_WaitIsBounded(t *testing.T) {
 		t.Fatalf("PutObject during a release that never finishes: err = %v, want SlowDown", err)
 	}
 }
+
+// TestPlaintextSpaces_ReleaseIgnoresAnotherSpacesHold: a hold says whose
+// write needs the file. A release in one space meeting the other space's
+// hold deletes its own intent and record and leaves the file; it does not
+// mistake the hold for a write of its own waiting on it.
+func TestPlaintextSpaces_ReleaseIgnoresAnotherSpacesHold(t *testing.T) {
+	b, mem, _ := newRefTestBackend(t)
+	space2 := secondPlaintextBucket(t, b, mem)
+	ctx := context.Background()
+	data := testBody(8 << 10)
+
+	putIn(t, b, "bk", "k", data)
+	d := blobDigestOf(t, b, "k", "")
+	// A write in bk2 is between spooling and uploading the same bytes.
+	unhold := b.spool.Hold(space2, d)
+	defer unhold()
+
+	deleteFrom(t, b, "bk", "k")
+	drainReleases(t, b)
+
+	if _, err := mem.GetIntent(ctx, did.Undef, d); !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("the releasing space's intent survived behind another space's hold (err=%v)", err)
+	}
+	if pending, _ := mem.ListReleasesBySpace(ctx, did.Undef); len(pending) != 0 {
+		t.Fatalf("release record survived: %v", pending)
+	}
+	if !localCopyExists(b, d) {
+		t.Fatalf("the release removed the file the other space's write holds")
+	}
+}

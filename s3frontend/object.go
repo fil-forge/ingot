@@ -407,7 +407,7 @@ func (b *Backend) splitSpool(ctx context.Context, bucket string, space did.DID, 
 	}
 	// Each spooled blob is held until its upload has read it; a failed
 	// split leaves no caller to end the holds.
-	enc.hold = b.spool.Hold
+	enc.hold = func(digest multihash.Multihash) func() { return b.spool.Hold(space, digest) }
 	defer func() {
 		if err != nil {
 			enc.unholdAll()
@@ -1054,9 +1054,9 @@ func (b *Backend) executeRelease(ctx context.Context, pr registry.PendingRelease
 		// and a record that outlived it would leave the retry reading
 		// neither rows nor intent, owing a network remove it cannot
 		// authorize and can never complete.
-		if b.spool.Held(digest) {
-			// A write of the same bytes spooled them again and still needs
-			// the file: it is waiting for this release to finish
+		if b.spool.HeldBy(space, digest) {
+			// A write of the same bytes in this space spooled them again and
+			// still needs the file: it is waiting for this release to finish
 			// (reuseLocated) before it uploads them afresh, or uploading
 			// them now. The intent and the file are that write's, so only
 			// this release's record goes.
@@ -1072,7 +1072,9 @@ func (b *Backend) executeRelease(ctx context.Context, pr registry.PendingRelease
 			ok = false
 			break
 		}
-		if others == 0 {
+		// Another space's write holding the file keeps it, as its intent
+		// would; this space's intent goes either way.
+		if others == 0 && !b.spool.Held(digest) {
 			freed, err := b.removeLocal(digest)
 			if err != nil {
 				log.Warn("release: remove local blob copy failed", zap.Error(err))

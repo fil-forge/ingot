@@ -10,6 +10,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/fil-forge/ucantone/did"
 	"testing/iotest"
 
 	mh "github.com/multiformats/go-multihash"
@@ -265,8 +267,8 @@ func TestSpoolRemoveTempLeavesTheCountAlone(t *testing.T) {
 func TestSpoolHoldKeepsTheFile(t *testing.T) {
 	s, _ := newTestDirs(t)
 	d := writeTestBlob(t, s, "held")
-	first := s.Hold(d)
-	second := s.Hold(d)
+	first := s.Hold(did.Undef, d)
+	second := s.Hold(did.Undef, d)
 	var got []string
 	record := func(label string) {
 		n, err := s.Remove(d)
