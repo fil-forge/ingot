@@ -49,6 +49,11 @@ type DelegationCache struct {
 	index map[indexKey]map[string]ucan.Delegation // → CID string → delegation
 
 	perms *gocache.Cache // bucket DID string → map[string]struct{} of S3 actions
+
+	// revoked is the revoked-CID set [KeyProofs] shares across every key's
+	// store; Add refuses a batch naming any of it. Nil for a request-scoped
+	// store, which keeps a response's delegations for its onward retrieval.
+	revoked *gocache.Cache
 }
 
 // indexKey is the exact-match probe the delegation matcher uses. Powerline
@@ -79,11 +84,40 @@ func NewDelegationCache() *DelegationCache {
 	return d
 }
 
-// Add caches each delegation for its own lifetime: TTL = expiration - now,
-// no expiration → cached until restart, already expired → skipped.
-func (d *DelegationCache) Add(dlgs ...ucan.Delegation) {
+// newRevocationAwareCache returns an empty cache whose Add refuses any batch
+// naming a CID in revoked.
+func newRevocationAwareCache(revoked *gocache.Cache) *DelegationCache {
+	d := NewDelegationCache()
+	d.revoked = revoked
+	return d
+}
+
+// Add caches one Hilt response's proofs, each for its own lifetime: TTL =
+// expiration - now, no expiration → cached until restart, already expired →
+// skipped. In a key's store (see [KeyProofs.For]) the batch goes in all or
+// nothing: if any proof has been named by a revocation, Add caches none of
+// them, renews that revocation, and reports false.
+//
+// The check and the inserts hold d.mu, and [DelegationCache.Contains] takes
+// it too, which orders Add against [KeyProofs.InvalidateHolders]: that
+// records the CID before it scans, so a revocation lands either before (the
+// check sees it) or after (the scan finds the CID and drops the store), never
+// between — where it would find the store without the CID, clear nothing, and
+// leave the revoked delegation cached until the horizon.
+func (d *DelegationCache) Add(proofs ...ucan.Delegation) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.revoked != nil {
+		for _, p := range proofs {
+			if _, ok := d.revoked.Get(p.Link().String()); ok {
+				// Hilt still serves it: keep remembering.
+				d.revoked.Set(p.Link().String(), struct{}{}, revokedTTL)
+				return false
+			}
+		}
+	}
 	now := ucan.Now()
-	for _, dlg := range dlgs {
+	for _, dlg := range proofs {
 		ttl := gocache.NoExpiration
 		if exp := dlg.Expiration(); exp != nil {
 			remaining := time.Duration(int64(*exp)-int64(now)) * time.Second
@@ -97,15 +131,14 @@ func (d *DelegationCache) Add(dlgs ...ucan.Delegation) {
 		// the cache doesn't hold.
 		d.data.Set(link, dlg, ttl)
 		key := keyOf(dlg)
-		d.mu.Lock()
 		byLink, ok := d.index[key]
 		if !ok {
 			byLink = map[string]ucan.Delegation{}
 			d.index[key] = byLink
 		}
 		byLink[link] = dlg
-		d.mu.Unlock()
 	}
+	return true
 }
 
 // removeFromIndex is the go-cache OnEvicted hook: it prunes the evicted
@@ -142,6 +175,8 @@ func keyOf(dlg ucan.Delegation) indexKey {
 // with this CID. Revocation processing uses it to find which access keys'
 // stores a revoked delegation participates in.
 func (d *DelegationCache) Contains(link cid.Cid) bool {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
 	_, ok := d.data.Get(link.String())
 	return ok
 }

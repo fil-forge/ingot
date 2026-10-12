@@ -28,10 +28,11 @@ import (
 // past the last time Hilt served it. A Hilt write publishes its revocations
 // before it commits, so a write whose commit failed leaves the revoked delegations
 // stored at Hilt, and Hilt's next authorize response for the key carries
-// them again. The service checks a response against this set and, on a
-// match, authorizes without caching, so the key returns to Hilt on every
-// request until a committed write issues fresh delegations (which carry new
-// CIDs: ucantone gives every delegation a random nonce).
+// them again. Each key's store refuses a batch naming this set (see
+// [DelegationCache.Add]), and the service then authorizes without caching,
+// so the key returns to Hilt on every request until a committed write issues
+// fresh delegations (which carry new CIDs: ucantone gives every delegation a
+// random nonce).
 type KeyProofs struct {
 	mu      sync.Mutex
 	byKey   *gocache.Cache // access-key DID string → *DelegationCache
@@ -69,12 +70,13 @@ func (k *KeyProofs) For(key did.DID) *DelegationCache {
 		k.byKey.Set(id, dc, gocache.DefaultExpiration) // refresh idle window
 		return dc
 	}
-	dc := NewDelegationCache()
+	dc := newRevocationAwareCache(k.revoked)
 	k.byKey.Set(id, dc, gocache.DefaultExpiration)
 	return dc
 }
 
-// Deposit adds delegations to key's proof store.
+// Deposit adds delegations to key's proof store, unless any has been named
+// by a revocation (see [DelegationCache.Add]).
 func (k *KeyProofs) Deposit(key did.DID, dlgs ...ucan.Delegation) {
 	k.For(key).Add(dlgs...)
 }
@@ -110,25 +112,4 @@ func (k *KeyProofs) InvalidateHolders(link cid.Cid) []did.DID {
 		affected = append(affected, key)
 	}
 	return affected
-}
-
-// DepositUnlessRevoked adds dlgs to store unless any has been named by a
-// revocation (see [KeyProofs]), reporting whether
-// it deposited. The check and the add hold k.mu, which orders them against
-// [KeyProofs.InvalidateHolders]: a revocation lands either before (the check
-// sees it) or after (the store holds the CID and is dropped), never between —
-// where it would find the store without the CID, clear nothing, and leave the
-// revoked delegation cached until the horizon.
-func (k *KeyProofs) DepositUnlessRevoked(store *DelegationCache, dlgs ...ucan.Delegation) bool {
-	k.mu.Lock()
-	defer k.mu.Unlock()
-	for _, d := range dlgs {
-		if _, ok := k.revoked.Get(d.Link().String()); ok {
-			// Hilt still serves it: keep remembering.
-			k.revoked.Set(d.Link().String(), struct{}{}, revokedTTL)
-			return false
-		}
-	}
-	store.Add(dlgs...)
-	return true
 }
