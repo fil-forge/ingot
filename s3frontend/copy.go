@@ -161,7 +161,7 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 	//
 	// The pinned body drops its part geometry: the copy is a single-part
 	// object, as on S3.
-	plaintext := b.storesPlaintext(bucketState, sse)
+	plaintext := storesPlaintext(bucketState, sse)
 	reingest := srcRv.st.Space != bucketState.Space || srcMf.Plaintext != plaintext
 	multipartSrc := len(srcMf.Body.PartSizes) > 0 || isMultipartETag(srcMf.ETag)
 	ckAlgo := srcMf.ChecksumAlgorithm

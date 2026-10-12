@@ -543,34 +543,26 @@ func TestPlaintextMultipart_SessionCarriesTheMode(t *testing.T) {
 	}
 }
 
-// TestBucketEncryption_NoneNeedsTheDeploymentToAllowIt: a stored "none" is in
-// force only while the deployment allows it. Once it does not, writes to the
-// bucket encrypt and the bucket reports AES256, whatever is stored; allowed
-// again, the stored setting applies once more.
-func TestBucketEncryption_NoneNeedsTheDeploymentToAllowIt(t *testing.T) {
-	b, _, _ := newRefTestBackend(t)
+// TestBucketEncryption_AllowNoneGatesOnlyTheRequest: encryption.allow_none
+// is consulted by PutBucketEncryption alone. A bucket keeps the setting it
+// was given: once the deployment stops allowing "none", an existing "none"
+// bucket still stores as received and still reports "none", and only a new
+// request for "none" is refused.
+func TestBucketEncryption_AllowNoneGatesOnlyTheRequest(t *testing.T) {
+	b, mem, _ := newRefTestBackend(t)
 	ctx := context.Background()
 	setNone(t, b)
 	data := testBody(8 << 10)
 
-	putWithCtx(t, ctx, b, "allowed", data)
-	assertStoredAsReceived(t, b, "allowed", data)
-
 	b.allowNoneEncryption = false
-	putWithCtx(t, ctx, b, "disallowed", data)
-	assertStoredEncrypted(t, b, "disallowed", data)
+	putWithCtx(t, ctx, b, "still-none", data)
+	assertStoredAsReceived(t, b, "still-none", data)
 	cfg, err := b.GetBucketEncryption(ctx, "bk")
-	if err != nil || cfg.Rules[0].ApplyServerSideEncryptionByDefault.SSEAlgorithm != types.ServerSideEncryptionAes256 {
-		t.Fatalf("GetBucketEncryption with none disallowed = %+v, %v; want AES256", cfg, err)
-	}
-	// The object written while it was allowed is still served as stored.
-	assertStoredAsReceived(t, b, "allowed", data)
-
-	b.allowNoneEncryption = true
-	putWithCtx(t, ctx, b, "allowed-again", data)
-	assertStoredAsReceived(t, b, "allowed-again", data)
-	cfg, err = b.GetBucketEncryption(ctx, "bk")
 	if err != nil || cfg.Rules[0].ApplyServerSideEncryptionByDefault.SSEAlgorithm != sseNone {
-		t.Fatalf("GetBucketEncryption with none allowed again = %+v, %v; want none", cfg, err)
+		t.Fatalf("GetBucketEncryption after allow_none was turned off = %+v, %v; want the stored none", cfg, err)
 	}
+	if err := mem.Create(ctx, "bk2", did.Undef, registry.CreateState{}); err != nil {
+		t.Fatalf("create bk2: %v", err)
+	}
+	wantInvalidArgument(t, b.PutBucketEncryption(ctx, "bk2", sseConfig(sseNone)))
 }

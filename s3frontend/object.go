@@ -174,7 +174,7 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 	initState = applyTagsIfPresent(initState, tags)
 	// Stored as received only under a "none" bucket the request did not ask
 	// AES256 of (sse.go).
-	plaintext := b.storesPlaintext(bucketState, sse)
+	plaintext := storesPlaintext(bucketState, sse)
 
 	// PRECONDITIONS (no lock): If-Match / If-None-Match. Evaluated here to fail
 	// fast before ingest, then RE-CHECKED under the per-bucket lock at commit so

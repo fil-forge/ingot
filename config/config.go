@@ -409,7 +409,10 @@ type EncryptionConfig struct {
 	// received: no envelope, no key wraps, and content-addressed by their
 	// own bytes. Meant for tenants whose data is encrypted before it reaches
 	// Ingot. Off by default: a PutBucketEncryption naming "none" is then
-	// refused, and no bucket on the deployment stores plaintext.
+	// refused. It is consulted only by that request: a bucket keeps the
+	// setting it was given, so turning this off on a deployment that has
+	// "none" buckets leaves them storing as received and only refuses new
+	// ones. A deployment that has never allowed it stores no plaintext.
 	AllowNone bool `mapstructure:"allow_none" yaml:"allow_none"`
 }
 

@@ -109,23 +109,17 @@ func rejectEncryptionHeaders(ctx context.Context) error {
 }
 
 // storesPlaintext decides how a new object of bucket is stored: as received
-// only when the bucket's encryption in force is "none" (see
-// encryptionInForce) and the request did not ask for AES256 itself.
-func (b *Backend) storesPlaintext(bucket *registry.State, requested types.ServerSideEncryption) bool {
-	return b.encryptionInForce(bucket) == registry.BucketEncryptionNone && requested == ""
-}
-
-// encryptionInForce is the bucket's default encryption as it applies now: a
-// stored "none" counts only while the deployment allows it
-// (encryption.allow_none). A deployment that no longer does encrypts every
-// write as AES256 and reports the bucket as AES256, whatever the stored
-// setting says, so the deployment guarantee holds across the change; the
-// setting itself stays, for a deployment that allows "none" again.
-func (b *Backend) encryptionInForce(bucket *registry.State) registry.BucketEncryption {
-	if bucket.Encryption == registry.BucketEncryptionNone && !b.allowNoneEncryption {
-		return registry.BucketEncryptionAES256
-	}
-	return bucket.Encryption
+// only when the bucket's default encryption is "none" and the request did
+// not ask for AES256 itself.
+//
+// The deployment's encryption.allow_none is not consulted here. It gates
+// the PutBucketEncryption request that sets "none", and a bucket keeps the
+// setting it was given: turning the knob off afterwards leaves existing
+// "none" buckets storing as received, and only refuses new ones. An
+// operator who wants such a bucket to encrypt again sets its encryption to
+// AES256, or deletes the configuration.
+func storesPlaintext(bucket *registry.State, requested types.ServerSideEncryption) bool {
+	return bucket.Encryption == registry.BucketEncryptionNone && requested == ""
 }
 
 // encryptionOf is the x-amz-server-side-encryption a stored object reports:
@@ -162,7 +156,7 @@ func (b *Backend) GetBucketEncryption(ctx context.Context, bucket string) (s3res
 	return s3response.ServerSideEncryptionConfiguration{
 		Rules: []s3response.ServerSideEncryptionRule{{
 			ApplyServerSideEncryptionByDefault: &s3response.ServerSideEncryptionByDefault{
-				SSEAlgorithm: types.ServerSideEncryption(b.encryptionInForce(st)),
+				SSEAlgorithm: types.ServerSideEncryption(st.Encryption),
 			},
 		}},
 	}, nil

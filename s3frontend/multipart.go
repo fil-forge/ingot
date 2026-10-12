@@ -105,7 +105,7 @@ func (b *Backend) CreateMultipartUpload(ctx context.Context, input s3response.Cr
 	}
 	// Whether the object is stored as received is the session's to carry:
 	// decided here, as on S3, and applied to every part (sse.go).
-	plaintext := b.storesPlaintext(st, sse)
+	plaintext := storesPlaintext(st, sse)
 	if err := b.multipart.CreateSession(ctx, registry.MultipartSession{
 		UploadID:                uploadID,
 		Bucket:                  bucket,
