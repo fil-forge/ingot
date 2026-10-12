@@ -741,7 +741,27 @@ func (m *MemStore) PutPart(_ context.Context, p registry.MultipartPart) error {
 	return nil
 }
 
-func (m *MemStore) ListParts(_ context.Context, uploadID string) ([]registry.MultipartPart, error) {
+func (m *MemStore) ListParts(ctx context.Context, uploadID string) ([]registry.MultipartPart, error) {
+	parts, err := m.ListPartsWithTrees(ctx, uploadID)
+	for i := range parts {
+		parts[i].Tree = nil
+	}
+	return parts, err
+}
+
+// DeletePartTrees mirrors the tree table's delete: the part records stay,
+// their trees go.
+func (m *MemStore) DeletePartTrees(_ context.Context, uploadID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for n, p := range m.parts[uploadID] {
+		p.Tree = nil
+		m.parts[uploadID][n] = p
+	}
+	return nil
+}
+
+func (m *MemStore) ListPartsWithTrees(_ context.Context, uploadID string) ([]registry.MultipartPart, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	byNum := m.parts[uploadID]

@@ -1003,13 +1003,17 @@ erDiagram
         bytea blob_digests "ordered array"
         text checksum
         text state "'accepted' never written"
+    }
+    multipart_part_trees {
+        text upload_id PK, FK
+        int part_number PK, FK
         bigint tree_offset "object offset the part's BLAKE3 tree was hashed at (assumed by UploadPart)"
-        smallint tree_chunk_log "block size of tree_blocks, base-2 exponent of chunks"
-        bytea tree_nodes "the part's aligned subtrees (blake3tree.EncodeSubtrees); NULL = no tree recorded"
-        bytea tree_blocks "the part's blocks at tree_chunk_log"
-        bytea tree_head "bytes before the part's first chunk boundary (< 1 KiB)"
-        bytea tree_tail "bytes after its last chunk boundary (< 1 KiB)"
-        bytea tree_root "the part's own BLAKE3 hash, when hashed at offset 0"
+        smallint chunk_log "block size of blocks, base-2 exponent of chunks"
+        bytea nodes "the part's aligned subtrees (blake3tree.EncodeSubtrees)"
+        bytea blocks "the part's blocks at chunk_log; up to 320 KiB for a 5 GiB part"
+        bytea head "bytes before the part's first chunk boundary (< 1 KiB)"
+        bytea tail "bytes after its last chunk boundary (< 1 KiB)"
+        bytea root "the part's own BLAKE3 hash, when hashed at offset 0"
     }
     blob_release_intents {
         text space PK
@@ -1024,6 +1028,7 @@ erDiagram
 
     segments ||--o{ segment_op_roots : "ON DELETE CASCADE"
     multipart_sessions ||--o{ multipart_parts : "ON DELETE CASCADE"
+    multipart_parts ||--o| multipart_part_trees : "ON DELETE CASCADE; deleted by Complete once the object commits"
     buckets ||..o{ segments : "by bucket name, no FK"
     buckets ||..o{ blob_refs : "by bucket name, no FK"
     blob_locations ||..o{ shard_inclusions : "by shard_digest"

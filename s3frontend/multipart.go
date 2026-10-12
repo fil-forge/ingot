@@ -536,7 +536,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 	if input.MultipartUpload == nil || len(input.MultipartUpload.Parts) == 0 {
 		return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrInvalidPart)
 	}
-	stored, err := b.multipart.ListParts(ctx, uploadID)
+	stored, err := b.multipart.ListPartsWithTrees(ctx, uploadID)
 	if err != nil {
 		return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: list parts: %w", err)
 	}
@@ -907,6 +907,14 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 	// leaves them to the object path whatever has become of the object.
 	if _, err := b.multipart.CompleteSession(ctx, uploadID, etag, node.VersionID); err != nil {
 		b.logger.Warn("latch session to completed failed; sweeper reaps the completing row after the TTL",
+			zap.String("uploadID", uploadID), zap.Error(err))
+	}
+	// The parts' tree material is dead now that the manifest holds the
+	// object's tree, and it is the bulk of a large upload's rows (up to
+	// about 320 KiB per 5 GiB part). Best-effort: rows a failure leaves go
+	// with the session when the sweeper reaps it.
+	if err := b.multipart.DeletePartTrees(ctx, uploadID); err != nil {
+		b.logger.Warn("delete part trees after commit failed; they go with the session row",
 			zap.String("uploadID", uploadID), zap.Error(err))
 	}
 

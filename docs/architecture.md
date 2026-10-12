@@ -791,17 +791,27 @@ CREATE TABLE ingot.multipart_parts (
                       CHECK (state IN ('parked','accepted')),
     created_at    timestamptz NOT NULL DEFAULT now(),
     checksum      text   NOT NULL DEFAULT '',
-    -- The part's BLAKE3 tree, hashed at the object offset UploadPart assumed
-    -- and merged into the object's digest at Complete (see blake3tree).
-    -- tree_nodes NULL: no tree recorded, Complete re-hashes.
-    tree_offset   bigint NOT NULL DEFAULT 0,
-    tree_chunk_log smallint NOT NULL DEFAULT 0,          -- block size of tree_blocks, base-2 exponent of chunks
-    tree_nodes    bytea,                                 -- aligned subtrees (blake3tree.EncodeSubtrees)
-    tree_blocks   bytea,                                 -- blocks at tree_chunk_log
-    tree_head     bytea,                                 -- bytes before the part's first chunk boundary (< 1 KiB)
-    tree_tail     bytea,                                 -- bytes after its last (< 1 KiB)
-    tree_root     bytea,                                 -- the part's own hash, when hashed at offset 0
     PRIMARY KEY (upload_id, part_number)
+);
+
+-- The part's BLAKE3 tree, hashed at the object offset UploadPart assumed and
+-- merged into the object's digest at Complete (see blake3tree). Its own
+-- table because it is large (about 320 KiB for a 5 GiB part) and short-lived:
+-- Complete deletes the upload's rows once the manifest holds the object's
+-- tree; only Complete's listing joins it. No row: no tree recorded, Complete
+-- re-hashes the part.
+CREATE TABLE ingot.multipart_part_trees (
+    upload_id     text     NOT NULL,
+    part_number   int      NOT NULL,
+    tree_offset   bigint   NOT NULL,                      -- object offset the part was hashed at (assumed)
+    chunk_log     smallint NOT NULL,                      -- block size of blocks, base-2 exponent of chunks
+    nodes         bytea,                                  -- aligned subtrees (blake3tree.EncodeSubtrees)
+    blocks        bytea,                                  -- blocks at chunk_log
+    head          bytea,                                  -- bytes before the part's first chunk boundary (< 1 KiB)
+    tail          bytea,                                  -- bytes after its last (< 1 KiB)
+    root          bytea,                                  -- the part's own hash, when hashed at offset 0
+    PRIMARY KEY (upload_id, part_number),
+    FOREIGN KEY (upload_id, part_number) REFERENCES ingot.multipart_parts(upload_id, part_number) ON DELETE CASCADE
 );
 
 -- Deferred-accept multipart (§7.2): the state needed to conclude (or abort) a
@@ -828,8 +838,9 @@ CREATE TABLE ingot.gc_candidates (
 );
 ```
 
-Relationships at a glance: `segment_op_roots` cascades from `segments`, and `multipart_parts` from
-`multipart_sessions` — the schema's only true foreign keys. `blob_refs`, `segments`,
+Relationships at a glance: `segment_op_roots` cascades from `segments`, `multipart_parts` from
+`multipart_sessions`, and `multipart_part_trees` from `multipart_parts` — the schema's only true
+foreign keys. `blob_refs`, `segments`,
 `multipart_sessions`, and `gc_candidates` reference a `buckets.name` by value, and
 `shard_inclusions` joins `blob_locations` on `shard_digest`. The reference count for a blob is
 `count(*) from blob_refs where space = ? and digest = ?`; reaching zero triggers `remove(digest)`
