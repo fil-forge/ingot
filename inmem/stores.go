@@ -1128,6 +1128,9 @@ func (m *MemStore) StartRelease(_ context.Context, space did.DID, digest multiha
 	if !ok {
 		return registry.ReleaseCancelled, nil
 	}
+	if !pr.StartedAt.IsZero() {
+		return registry.ReleaseStarted, nil // a retry: the release owns the blob since it started
+	}
 	if m.countLivePartRefsLocked(&space, digest) > 0 {
 		return registry.ReleaseReferenced, nil
 	}

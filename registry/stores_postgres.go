@@ -1372,14 +1372,20 @@ func (r *Postgres) StartRelease(ctx context.Context, space did.DID, digest multi
 	if err := lockClaimKey(ctx, tx, space, digest); err != nil {
 		return 0, err
 	}
-	var exists bool
-	if err := tx.QueryRow(ctx,
-		`SELECT EXISTS (SELECT 1 FROM ingot.blob_release_intents WHERE space = $1 AND digest = $2)`,
-		space, digest).Scan(&exists); err != nil {
+	var started *time.Time
+	err = tx.QueryRow(ctx,
+		`SELECT started_at FROM ingot.blob_release_intents WHERE space = $1 AND digest = $2`,
+		space, digest).Scan(&started)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ReleaseCancelled, nil
+	}
+	if err != nil {
 		return 0, fmt.Errorf("registry: start release lookup: %w", err)
 	}
-	if !exists {
-		return ReleaseCancelled, nil
+	if started != nil {
+		// A retry: the release owns the blob since it started, and a part
+		// recorded or a write begun since is waiting for it to finish.
+		return ReleaseStarted, nil
 	}
 	// Live part references before claims: see the interface.
 	var live int

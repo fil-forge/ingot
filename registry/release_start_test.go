@@ -105,6 +105,25 @@ func runReleaseStartSuite(t *testing.T, st releaseStartStore) {
 		}
 	})
 
+	t.Run("a started record starts again despite a part recorded since", func(t *testing.T) {
+		// The release owns the blob from its start; a part recorded after
+		// that belongs to a write waiting for the release to finish, and
+		// must not hold the retry back.
+		d := enqueue("retry")
+		if s, err := st.StartRelease(ctx, space, d); err != nil || s != registry.ReleaseStarted {
+			t.Fatalf("StartRelease = %v, %v", s, err)
+		}
+		if err := st.CreateSession(ctx, registry.MultipartSession{UploadID: "rs-retry", Bucket: "bk", ObjectKey: "k", Space: space, State: registry.SessionOpen}); err != nil {
+			t.Fatalf("CreateSession: %v", err)
+		}
+		if err := st.PutPart(ctx, registry.MultipartPart{UploadID: "rs-retry", PartNumber: 1, ETagMD5: make([]byte, 16), Size: 7, BlobDigests: []multihash.Multihash{d}, State: registry.PartParked}); err != nil {
+			t.Fatalf("PutPart: %v", err)
+		}
+		if s, err := st.StartRelease(ctx, space, d); err != nil || s != registry.ReleaseStarted {
+			t.Fatalf("StartRelease retry with a later part = %v, %v; want ReleaseStarted", s, err)
+		}
+	})
+
 	t.Run("a claimed blob is not started", func(t *testing.T) {
 		d := enqueue("claimed")
 		if err := st.AddBlobClaim(ctx, registry.BlobClaim{Digest: d, Bucket: "bk", ObjectKey: "k", VersionID: "v", Space: space}); err != nil {

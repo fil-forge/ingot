@@ -363,9 +363,12 @@ type PendingReleaseStore interface {
 	// release that read the claims first could see none, lose the race to
 	// the commit, and then find no live session either; reading the live
 	// part references first closes that window. A record already started
-	// (a retry) starts again. The lock excludes CancelRelease, so a write
-	// reusing the blob either cancels the record before this, and this
-	// finds none, or finds it started and waits.
+	// (a retry) starts again without the checks: the release has owned the
+	// blob since it started, no claim can land meanwhile (AddBlobClaim), and
+	// a part recorded since belongs to a write waiting for it to finish.
+	// The lock excludes CancelRelease, so a write reusing the blob either
+	// cancels the record before this, and this finds none, or finds it
+	// started and waits.
 	StartRelease(ctx context.Context, space did.DID, digest multihash.Multihash) (ReleaseStart, error)
 	// CancelRelease is a write's side of StartRelease: under the same lock,
 	// it deletes a record not yet started, so the blob is the write's to
