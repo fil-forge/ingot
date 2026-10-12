@@ -174,7 +174,7 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 	initState = applyTagsIfPresent(initState, tags)
 	// Stored as received only under a "none" bucket the request did not ask
 	// AES256 of (sse.go).
-	plaintext := storesPlaintext(bucketState, sse)
+	plaintext := b.storesPlaintext(bucketState, sse)
 
 	// PRECONDITIONS (no lock): If-Match / If-None-Match. Evaluated here to fail
 	// fast before ingest, then RE-CHECKED under the per-bucket lock at commit so
@@ -480,7 +480,14 @@ func (b *Backend) splitSpool(ctx context.Context, bucket string, space did.DID, 
 // A blob in streamed already went to its provider while it was spooled: it is
 // parked there and needs only its conclude.
 func (b *Backend) uploadBlobs(ctx context.Context, space did.DID, blobs []msbucket.BlobRef, streamed map[string]uploader.StreamedBlob) error {
+	// Each digest once: a body stored as received can hold the same bytes
+	// twice, and the provider needs them once.
+	seen := make(map[string]bool, len(blobs))
 	for _, blob := range blobs {
+		if seen[string(blob.Digest)] {
+			continue
+		}
+		seen[string(blob.Digest)] = true
 		if sb, ok := streamed[string(blob.Digest)]; ok {
 			if err := b.concludeStreamed(ctx, space, blob, sb); err != nil {
 				return err

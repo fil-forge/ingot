@@ -105,7 +105,7 @@ func (b *Backend) CreateMultipartUpload(ctx context.Context, input s3response.Cr
 	}
 	// Whether the object is stored as received is the session's to carry:
 	// decided here, as on S3, and applied to every part (sse.go).
-	plaintext := storesPlaintext(st, sse)
+	plaintext := b.storesPlaintext(st, sse)
 	if err := b.multipart.CreateSession(ctx, registry.MultipartSession{
 		UploadID:                uploadID,
 		Bucket:                  bucket,
@@ -1079,7 +1079,14 @@ func (b *Backend) enqueuePartReleases(ctx context.Context, space did.DID, digest
 // A blob in streamed already went to its provider while it was spooled and is
 // parked there; only its park row is left to record.
 func (b *Backend) parkBlobs(ctx context.Context, space did.DID, blobs []msbucket.BlobRef, streamed map[string]uploader.StreamedBlob) error {
+	// Each digest once: a part stored as received can hold the same bytes
+	// twice, and the provider needs them once.
+	seen := make(map[string]bool, len(blobs))
 	for _, blob := range blobs {
+		if seen[string(blob.Digest)] {
+			continue
+		}
+		seen[string(blob.Digest)] = true
 		if sb, ok := streamed[string(blob.Digest)]; ok {
 			if err := b.recordStreamedPark(ctx, blob, sb); err != nil {
 				return err

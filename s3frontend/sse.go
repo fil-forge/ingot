@@ -58,11 +58,11 @@ func requestedEncryption(ctx context.Context) (types.ServerSideEncryption, error
 		return "", nil
 	}
 	var algo, kmsKeyID, kmsContext string
-	var customer, copySourceCustomer bool
+	var algoPresent, customer, copySourceCustomer bool
 	for k, v := range req.Headers {
 		switch lk := strings.ToLower(k); {
 		case lk == "x-amz-server-side-encryption":
-			algo = v
+			algo, algoPresent = v, true
 		case lk == "x-amz-server-side-encryption-aws-kms-key-id":
 			kmsKeyID = v
 		case lk == "x-amz-server-side-encryption-context":
@@ -78,6 +78,10 @@ func requestedEncryption(ctx context.Context) (types.ServerSideEncryption, error
 	switch {
 	case customer && algo != "":
 		return "", errSSEArgument("Server Side Encryption with Customer provided key is incompatible with the encryption method specified")
+	case algoPresent && algo == "":
+		// Present but empty is a malformed request, as on S3, and never the
+		// bucket default.
+		return "", errSSEArgument("The encryption method specified is not supported")
 	case algo != "" && sse != types.ServerSideEncryptionAes256 && !kms:
 		return "", errSSEArgument("The encryption method specified is not supported")
 	case (kmsKeyID != "" || kmsContext != "") && !kms:
@@ -105,10 +109,23 @@ func rejectEncryptionHeaders(ctx context.Context) error {
 }
 
 // storesPlaintext decides how a new object of bucket is stored: as received
-// only when the bucket's default encryption is "none" and the request did
-// not ask for AES256 itself.
-func storesPlaintext(bucket *registry.State, requested types.ServerSideEncryption) bool {
-	return bucket.Encryption == registry.BucketEncryptionNone && requested == ""
+// only when the bucket's encryption in force is "none" (see
+// encryptionInForce) and the request did not ask for AES256 itself.
+func (b *Backend) storesPlaintext(bucket *registry.State, requested types.ServerSideEncryption) bool {
+	return b.encryptionInForce(bucket) == registry.BucketEncryptionNone && requested == ""
+}
+
+// encryptionInForce is the bucket's default encryption as it applies now: a
+// stored "none" counts only while the deployment allows it
+// (encryption.allow_none). A deployment that no longer does encrypts every
+// write as AES256 and reports the bucket as AES256, whatever the stored
+// setting says, so the deployment guarantee holds across the change; the
+// setting itself stays, for a deployment that allows "none" again.
+func (b *Backend) encryptionInForce(bucket *registry.State) registry.BucketEncryption {
+	if bucket.Encryption == registry.BucketEncryptionNone && !b.allowNoneEncryption {
+		return registry.BucketEncryptionAES256
+	}
+	return bucket.Encryption
 }
 
 // encryptionOf is the x-amz-server-side-encryption a stored object reports:
@@ -145,7 +162,7 @@ func (b *Backend) GetBucketEncryption(ctx context.Context, bucket string) (s3res
 	return s3response.ServerSideEncryptionConfiguration{
 		Rules: []s3response.ServerSideEncryptionRule{{
 			ApplyServerSideEncryptionByDefault: &s3response.ServerSideEncryptionByDefault{
-				SSEAlgorithm: types.ServerSideEncryption(st.Encryption),
+				SSEAlgorithm: types.ServerSideEncryption(b.encryptionInForce(st)),
 			},
 		}},
 	}, nil

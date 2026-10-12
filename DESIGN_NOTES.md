@@ -283,7 +283,10 @@ received, with no envelope, no key wraps and no params row, content-addressed
 by their own bytes. `none` is for tenants whose data is encrypted before it
 reaches Ingot, and a deployment opts into accepting it
 (`encryption.allow_none`); without that, PutBucketEncryption refuses it and
-nothing on the deployment stores plaintext. The decision is per object at
+nothing on the deployment stores plaintext. A stored `none` is in force
+only while the deployment allows it: once it does not, writes to the bucket
+encrypt and GetBucketEncryption reports AES256, and the stored setting
+applies again when the deployment allows `none` again. The decision is per object at
 write time: a `none` bucket stores as received unless the request names
 `x-amz-server-side-encryption: AES256`, which encrypts that one object; a
 multipart upload decides at CreateMultipartUpload and carries the choice on

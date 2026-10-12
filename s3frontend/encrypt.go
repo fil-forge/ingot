@@ -172,6 +172,16 @@ func (w *bodyWriter) WriteBlob(ctx context.Context, r io.Reader) (multihash.Mult
 // record wraps the blob's CEK and keeps its encryption state for splitSpool.
 // A plaintext blob has no CEK; its stored size is all that is kept.
 func (w *bodyWriter) record(ctx context.Context, digest multihash.Multihash, cek []byte, res encWrite) error {
+	if _, ok := w.results[string(digest)]; ok {
+		// The same bytes twice in one body, which a body stored as received
+		// can hold: the first record stands, and the provider needs the
+		// bytes once. A second allocation streamed for them is given up
+		// now, or it would wait for the stale-stream sweeper.
+		if res.streamed != nil {
+			w.abandon(ctx, *res.streamed)
+		}
+		return nil
+	}
 	if !w.plaintext {
 		wrapped, err := w.keys.Wrap(ctx, regionkey.BindingContext{Space: w.space, Digest: digest}, cek)
 		if err != nil {

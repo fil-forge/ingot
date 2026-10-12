@@ -251,6 +251,7 @@ func TestRequestedEncryption(t *testing.T) {
 		{"AES256", map[string]string{"X-Amz-Server-Side-Encryption": "AES256"}, types.ServerSideEncryptionAes256, ok},
 		{"AES256, lower-case header", map[string]string{"x-amz-server-side-encryption": "AES256"}, types.ServerSideEncryptionAes256, ok},
 		{"bucket-key-enabled alone is ignored", map[string]string{"X-Amz-Server-Side-Encryption-Bucket-Key-Enabled": "true"}, "", ok},
+		{"present but empty", map[string]string{"X-Amz-Server-Side-Encryption": ""}, "", invalid},
 		{"unknown algorithm", map[string]string{"X-Amz-Server-Side-Encryption": "aes:kms"}, "", invalid},
 		{"INVALID algorithm", map[string]string{"X-Amz-Server-Side-Encryption": "INVALID"}, "", invalid},
 		{"AES256 with a KMS key id", map[string]string{"X-Amz-Server-Side-Encryption": "AES256", "X-Amz-Server-Side-Encryption-Aws-Kms-Key-Id": "fool-me-once"}, "", invalid},
@@ -539,5 +540,37 @@ func TestPlaintextMultipart_SessionCarriesTheMode(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestBucketEncryption_NoneNeedsTheDeploymentToAllowIt: a stored "none" is in
+// force only while the deployment allows it. Once it does not, writes to the
+// bucket encrypt and the bucket reports AES256, whatever is stored; allowed
+// again, the stored setting applies once more.
+func TestBucketEncryption_NoneNeedsTheDeploymentToAllowIt(t *testing.T) {
+	b, _, _ := newRefTestBackend(t)
+	ctx := context.Background()
+	setNone(t, b)
+	data := testBody(8 << 10)
+
+	putWithCtx(t, ctx, b, "allowed", data)
+	assertStoredAsReceived(t, b, "allowed", data)
+
+	b.allowNoneEncryption = false
+	putWithCtx(t, ctx, b, "disallowed", data)
+	assertStoredEncrypted(t, b, "disallowed", data)
+	cfg, err := b.GetBucketEncryption(ctx, "bk")
+	if err != nil || cfg.Rules[0].ApplyServerSideEncryptionByDefault.SSEAlgorithm != types.ServerSideEncryptionAes256 {
+		t.Fatalf("GetBucketEncryption with none disallowed = %+v, %v; want AES256", cfg, err)
+	}
+	// The object written while it was allowed is still served as stored.
+	assertStoredAsReceived(t, b, "allowed", data)
+
+	b.allowNoneEncryption = true
+	putWithCtx(t, ctx, b, "allowed-again", data)
+	assertStoredAsReceived(t, b, "allowed-again", data)
+	cfg, err = b.GetBucketEncryption(ctx, "bk")
+	if err != nil || cfg.Rules[0].ApplyServerSideEncryptionByDefault.SSEAlgorithm != sseNone {
+		t.Fatalf("GetBucketEncryption with none allowed again = %+v, %v; want none", cfg, err)
 	}
 }
