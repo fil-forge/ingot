@@ -536,12 +536,12 @@ func (b *Backend) uploadBlobs(ctx context.Context, space did.DID, body spooledBo
 // (see settleRelease); the stream is then given up and the blob uploaded
 // afresh from its spool file, which the write still holds.
 func (b *Backend) concludeStreamed(ctx context.Context, space did.DID, blob msbucket.BlobRef, sb uploader.StreamedBlob, body spooledBody) (err error) {
-	// One write of these bytes at a time for this space (see blobKeyLock):
+	// One write of these bytes at a time for this space (see Backend.blobKeys):
 	// another write can have accepted the same digest while this stream was
 	// in flight, and its location is read under the lock before this one
 	// concludes, so two streams of the same bytes never both record a
 	// location.
-	unlock := b.blobKeys.lock(space, blob.Digest)
+	unlock := b.blobKeys.Lock(blobKey(space, blob.Digest))
 	defer unlock()
 	settled, err := b.settleRelease(ctx, space, blob.Digest)
 	if err != nil {
@@ -604,8 +604,8 @@ func (b *Backend) uploadBlob(ctx context.Context, space did.DID, blob msbucket.B
 	defer func() { tracing.End(span, err) }()
 
 	// One write of these bytes at a time for this space: a second finds the
-	// first's location and reuses it (see blobKeyLock).
-	defer b.blobKeys.lock(space, blob.Digest)()
+	// first's location and reuses it (see Backend.blobKeys).
+	defer b.blobKeys.Lock(blobKey(space, blob.Digest))()
 
 	digest := blob.Digest
 	// Whatever the rows say, no release of this digest may be running

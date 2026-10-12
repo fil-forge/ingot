@@ -1110,8 +1110,8 @@ func (b *Backend) parkBlob(ctx context.Context, space did.DID, blob msbucket.Blo
 	defer func() { tracing.End(span, err) }()
 
 	// One write of these bytes at a time for this space: a second finds the
-	// first's park and reuses it (see blobKeyLock).
-	defer b.blobKeys.lock(space, blob.Digest)()
+	// first's park and reuses it (see Backend.blobKeys).
+	defer b.blobKeys.Lock(blobKey(space, blob.Digest))()
 
 	digest := blob.Digest
 	// Whatever the rows say, no release of this digest may be running
@@ -1211,12 +1211,12 @@ func (b *Backend) parkBlob(ctx context.Context, space did.DID, blob msbucket.Blo
 // recordStreamedPark records the park a streamed blob left on its provider,
 // traced as a blob.park span like parkBlob.
 func (b *Backend) recordStreamedPark(ctx context.Context, space did.DID, blob msbucket.BlobRef, sb uploader.StreamedBlob, body spooledBody) (err error) {
-	// One write of these bytes at a time for this space (see blobKeyLock):
+	// One write of these bytes at a time for this space (see Backend.blobKeys):
 	// a Complete or another part can have accepted or parked the same
 	// digest while this stream was in flight, and the rows are read under
 	// the lock before the park is recorded, so a park is never recorded
 	// beside a location.
-	unlock := b.blobKeys.lock(space, blob.Digest)
+	unlock := b.blobKeys.Lock(blobKey(space, blob.Digest))
 	defer unlock()
 	// A release of the same digest that ran while the stream was in flight
 	// may have taken what it parked (see settleRelease): the stream is then
@@ -1473,10 +1473,10 @@ func (b *Backend) concludeBlobs(ctx context.Context, space did.DID, blobs []msbu
 
 // uploadNeverParked is Complete's fallback for a part blob that never
 // parked, under the (space, digest) lock that every write of the bytes
-// takes (see blobKeyLock), so a part upload of the same bytes meanwhile
+// takes (see Backend.blobKeys), so a part upload of the same bytes meanwhile
 // finds this upload's location rather than allocating beside it.
 func (b *Backend) uploadNeverParked(ctx context.Context, space did.DID, blob msbucket.BlobRef) error {
-	defer b.blobKeys.lock(space, blob.Digest)()
+	defer b.blobKeys.Lock(blobKey(space, blob.Digest))()
 	// Settled under the lock, as uploadBlob does: the settle at
 	// classification ran outside it, and a release can have started since.
 	settled, err := b.settleRelease(ctx, space, blob.Digest)
