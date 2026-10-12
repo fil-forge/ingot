@@ -493,13 +493,24 @@ func (r *Postgres) ListEvictable(ctx context.Context, after EvictCursor, limit i
 	return scanIntents(rows)
 }
 
-func (r *Postgres) MarkEvicted(ctx context.Context, digest multihash.Multihash) error {
+func (r *Postgres) MarkEvicted(ctx context.Context, digest multihash.Multihash, notAfter time.Time) error {
 	tag, err := r.pool.Exec(ctx,
-		`UPDATE ingot.upload_intents SET evicted_at = now() WHERE digest = $1`, digest)
+		`UPDATE ingot.upload_intents SET evicted_at = now()
+		  WHERE digest = $1 AND updated_at <= $2`, digest, notAfter)
 	if err != nil {
 		return fmt.Errorf("registry: mark intent evicted: %w", err)
 	}
-	if tag.RowsAffected() == 0 {
+	if tag.RowsAffected() > 0 {
+		return nil
+	}
+	// Nothing marked: no intent is left, or every one of them is a newer
+	// write's, whose file is on disk.
+	var exists bool
+	if err := r.pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM ingot.upload_intents WHERE digest = $1)`, digest).Scan(&exists); err != nil {
+		return fmt.Errorf("registry: mark intent evicted lookup: %w", err)
+	}
+	if !exists {
 		return ErrNotFound
 	}
 	return nil

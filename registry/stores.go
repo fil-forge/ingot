@@ -430,9 +430,13 @@ type IntentStore interface {
 	// after the cursor, at most limit rows.
 	ListEvictable(ctx context.Context, after EvictCursor, limit int) ([]UploadIntent, error)
 	// MarkEvicted records that the digest's spool file is gone, on every
-	// intent for the digest, leaving State and UpdatedAt alone. Returns
-	// ErrNotFound when no intent is left (a release got there first).
-	MarkEvicted(ctx context.Context, digest multihash.Multihash) error
+	// intent for the digest whose last state change is not after notAfter,
+	// leaving State and UpdatedAt alone. An intent changed since belongs to
+	// a write that spooled the bytes again after the caller listed or read
+	// the intent it is acting on: that write's file is on disk, and its mark
+	// is left clear. Returns ErrNotFound when no intent is left (a release
+	// got there first).
+	MarkEvicted(ctx context.Context, digest multihash.Multihash, notAfter time.Time) error
 	// MissingIntents returns the digests among digests that have no intent
 	// row in any space, for the sweeper's orphan-file pass.
 	MissingIntents(ctx context.Context, digests []multihash.Multihash) ([]multihash.Multihash, error)

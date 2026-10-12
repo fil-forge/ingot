@@ -1364,3 +1364,47 @@ func TestSweepLocalBlobs_LeavesAHeldBlobUnmarked(t *testing.T) {
 		t.Fatalf("the sweep counted %d files removed, want 0", stats.BudgetFiles)
 	}
 }
+
+// respoolingEvictable puts a second space's intent for each digest it is
+// asked to mark, right before marking, as a write of the same bytes that
+// spools and commits them between the sweep's removal and its mark.
+type respoolingEvictable struct {
+	registry.IntentStore
+	mem   *inmem.MemStore
+	space did.DID
+}
+
+func (r *respoolingEvictable) MarkEvicted(ctx context.Context, digest multihash.Multihash, notAfter time.Time) error {
+	if err := r.mem.PutIntent(ctx, registry.UploadIntent{Space: r.space, Digest: digest, LocalPath: "/spool/again", Size: 1, State: registry.IntentAccepted}); err != nil {
+		return err
+	}
+	if err := r.mem.PutLocation(ctx, registry.BlobLocation{Space: r.space, Digest: digest, Provider: "did:key:p", URL: "http://p/blob", Size: 1}); err != nil {
+		return err
+	}
+	return r.IntentStore.MarkEvicted(ctx, digest, notAfter)
+}
+
+// TestSweepLocalBlobs_MarkLeavesAnIntentPutSinceTheListing: a write that
+// spools the same bytes again and commits its intent between the sweep's
+// removal and its mark keeps its mark clear, so its file is still the
+// sweep's to evict later.
+func TestSweepLocalBlobs_MarkLeavesAnIntentPutSinceTheListing(t *testing.T) {
+	ctx := t.Context()
+	var again *respoolingEvictable
+	b, mem := newSweepBackend(t, func(d *Deps) {
+		again = &respoolingEvictable{IntentStore: d.Intents, mem: d.Intents.(*inmem.MemStore), space: testutil.RandomDID(t)}
+		d.Intents = again
+	})
+	digests := putSweepObjects(t, b, 1)
+	budgetToEvict(b, 1, blobSize(t, b, digests[0]))
+
+	sweepLocalBlobs(t, b)
+
+	rows, err := mem.ListEvictable(ctx, registry.EvictCursor{}, 10)
+	if err != nil {
+		t.Fatalf("ListEvictable: %v", err)
+	}
+	if len(rows) != 1 || rows[0].Space != again.space {
+		t.Fatalf("evictable after the sweep = %+v, want only the intent put since the listing", rows)
+	}
+}

@@ -230,8 +230,10 @@ stages: first the residency window, still passing over recently read blobs,
 then both (straight to both when the budget pass ran out of candidates). A
 pass that only ran out of time does not count: the next sweep continues
 outside the windows. Eviction removes the file first, then sets
-`upload_intents.evicted_at`; the row and its state stay, because a release
-and Complete read them. A read of an evicted blob misses locally and goes to
+`upload_intents.evicted_at` on the intents as the listing saw them; the
+rows and their states stay, because a release and Complete read them, and
+an intent a write put since the listing, whose file is on disk again, keeps
+its mark clear. A read of an evicted blob misses locally and goes to
 the network tier. A file the pass cannot remove is logged and skipped.
 Hourly, with or without a budget, the sweeper also deletes `.tmp-*` files
 older than `local_blob_orphan_age` (24 hours) in both directories, and spool

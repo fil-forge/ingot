@@ -57,6 +57,15 @@ func (b *Backend) dropLocalCopy(ctx context.Context, space did.DID, digest multi
 	if others > 0 {
 		return
 	}
+	// The mark is as of this write's own intent, read before the removal: a
+	// write that spools the bytes again in between has a newer intent, its
+	// file on disk, and keeps its mark clear.
+	in, err := b.intents.GetIntent(ctx, space, digest)
+	if err != nil {
+		b.logger.Warn("read a held blob's intent failed; its local copy stays",
+			zap.String("digest", hex.EncodeToString(digest)), zap.Error(err))
+		return
+	}
 	freed, err := b.removeLocal(digest)
 	if errors.Is(err, blockstore.ErrHeld) {
 		return // a write of the same bytes holds the file, and its own flow or eviction takes it later
@@ -67,7 +76,7 @@ func (b *Backend) dropLocalCopy(ctx context.Context, space did.DID, digest multi
 			zap.String("digest", hex.EncodeToString(digest)), zap.Error(err))
 		return
 	}
-	if err := b.intents.MarkEvicted(ctx, digest); err != nil && !errors.Is(err, registry.ErrNotFound) {
+	if err := b.intents.MarkEvicted(ctx, digest, in.UpdatedAt); err != nil && !errors.Is(err, registry.ErrNotFound) {
 		b.logger.Warn("mark held blob evicted failed",
 			zap.String("digest", hex.EncodeToString(digest)), zap.Error(err))
 	}

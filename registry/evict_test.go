@@ -182,7 +182,7 @@ func runEvictionSuite(t *testing.T, fresh func(t *testing.T) evictStore) {
 			d := evictDigest(t, tc.name)
 			seed(t, st, d, tc.state, tc.located, tc.parked)
 			if tc.evicted {
-				if err := st.MarkEvicted(ctx, d); err != nil {
+				if err := st.MarkEvicted(ctx, d, time.Now().Add(time.Hour)); err != nil {
 					t.Fatalf("MarkEvicted: %v", err)
 				}
 			}
@@ -225,7 +225,7 @@ func runEvictionSuite(t *testing.T, fresh func(t *testing.T) evictStore) {
 		st := fresh(t)
 		d := evictDigest(t, "respooled")
 		seed(t, st, d, registry.IntentAccepted, true, false)
-		if err := st.MarkEvicted(ctx, d); err != nil {
+		if err := st.MarkEvicted(ctx, d, time.Now().Add(time.Hour)); err != nil {
 			t.Fatalf("MarkEvicted: %v", err)
 		}
 		if err := st.PutIntent(ctx, registry.UploadIntent{Space: space, Digest: d, LocalPath: "/spool/x", Size: 7, State: registry.IntentAccepted}); err != nil {
@@ -244,7 +244,7 @@ func runEvictionSuite(t *testing.T, fresh func(t *testing.T) evictStore) {
 		if err != nil {
 			t.Fatalf("GetIntent: %v", err)
 		}
-		if err := st.MarkEvicted(ctx, d); err != nil {
+		if err := st.MarkEvicted(ctx, d, time.Now().Add(time.Hour)); err != nil {
 			t.Fatalf("MarkEvicted: %v", err)
 		}
 		after, err := st.GetIntent(ctx, space, d)
@@ -258,7 +258,7 @@ func runEvictionSuite(t *testing.T, fresh func(t *testing.T) evictStore) {
 
 	t.Run("MarkEvicted of a missing intent is ErrNotFound", func(t *testing.T) {
 		st := fresh(t)
-		if err := st.MarkEvicted(ctx, evictDigest(t, "gone")); !errors.Is(err, registry.ErrNotFound) {
+		if err := st.MarkEvicted(ctx, evictDigest(t, "gone"), time.Now().Add(time.Hour)); !errors.Is(err, registry.ErrNotFound) {
 			t.Fatalf("MarkEvicted err = %v, want ErrNotFound", err)
 		}
 	})
@@ -382,7 +382,7 @@ func runEvictionSuite(t *testing.T, fresh func(t *testing.T) evictStore) {
 		}
 		var got []int
 		got = append(got, len(listed(t, st)))
-		if err := st.MarkEvicted(ctx, d); err != nil {
+		if err := st.MarkEvicted(ctx, d, time.Now().Add(time.Hour)); err != nil {
 			t.Fatalf("MarkEvicted: %v", err)
 		}
 		got = append(got, len(listed(t, st)))
@@ -446,6 +446,41 @@ func runEvictionSuite(t *testing.T, fresh func(t *testing.T) evictStore) {
 		park, err := st.GetPark(ctx, space, d)
 		if err != nil || park.AddTask[0] != 1 {
 			t.Fatalf("the first space's park after the other's delete = %+v, %v", park, err)
+		}
+	})
+
+	t.Run("MarkEvicted leaves an intent put since the listing", func(t *testing.T) {
+		// The mark is as of the intent the caller listed or read: a write
+		// that spooled the bytes again since has a newer intent and its
+		// file on disk, and keeps its mark clear.
+		st := fresh(t)
+		d := evictDigest(t, "respooled-since")
+		seed(t, st, d, registry.IntentAccepted, true, false)
+		listed, err := st.GetIntent(ctx, space, d)
+		if err != nil {
+			t.Fatalf("GetIntent: %v", err)
+		}
+		time.Sleep(5 * time.Millisecond)
+		other := testutil.RandomDID(t)
+		if err := st.PutIntent(ctx, registry.UploadIntent{Space: other, Digest: d, LocalPath: "/spool/x", Size: 7, State: registry.IntentAccepted}); err != nil {
+			t.Fatalf("PutIntent: %v", err)
+		}
+		if err := st.PutLocation(ctx, registry.BlobLocation{Space: other, Digest: d, Provider: "did:key:p", URL: "http://p/blob", Size: 7}); err != nil {
+			t.Fatalf("PutLocation: %v", err)
+		}
+		if err := st.MarkEvicted(ctx, d, listed.UpdatedAt); err != nil {
+			t.Fatalf("MarkEvicted: %v", err)
+		}
+		rows, err := st.ListEvictable(ctx, registry.EvictCursor{}, 10)
+		if err != nil {
+			t.Fatalf("ListEvictable: %v", err)
+		}
+		if len(rows) != 1 || rows[0].Space != other {
+			t.Fatalf("listed after the mark = %+v, want only the newer intent", rows)
+		}
+		// Every intent newer than the mark: nothing marked, but not ErrNotFound.
+		if err := st.MarkEvicted(ctx, d, listed.UpdatedAt); err != nil {
+			t.Fatalf("MarkEvicted with nothing older: %v", err)
 		}
 	})
 }

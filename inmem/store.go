@@ -61,7 +61,7 @@ type MemStore struct {
 	// same code paths. See stores.go for the methods over these.
 	blobRefs   map[claimKey]registry.BlobClaim
 	intents    map[locKey]registry.UploadIntent          // keyed by (space, digest)
-	evicted    map[string]struct{}                       // upload_intents.evicted_at IS NOT NULL, keyed by string(digest): the file is one for every space
+	evicted    map[locKey]struct{}                       // upload_intents.evicted_at IS NOT NULL, keyed by (space, digest)
 	locations  map[locKey]registry.BlobLocation          // keyed by (space, digest)
 	encParams  map[locKey]registry.BlobEncryptionParams  // keyed by (space, digest)
 	inclusions map[locKey]registry.BlobInclusion         // keyed by (space, digest)
@@ -99,7 +99,7 @@ func NewMemStore() *MemStore {
 		verSeqs:    map[string]uint64{},
 		blobRefs:   map[claimKey]registry.BlobClaim{},
 		intents:    map[locKey]registry.UploadIntent{},
-		evicted:    map[string]struct{}{},
+		evicted:    map[locKey]struct{}{},
 		locations:  map[locKey]registry.BlobLocation{},
 		encParams:  map[locKey]registry.BlobEncryptionParams{},
 		inclusions: map[locKey]registry.BlobInclusion{},

@@ -198,9 +198,7 @@ func (m *MemStore) DeleteIntentAndRelease(_ context.Context, space did.DID, dige
 // digest, the digest's evicted mark.
 func (m *MemStore) deleteIntentLocked(k locKey) {
 	delete(m.intents, k)
-	if m.countIntentsLocked(k.digest, nil) == 0 {
-		delete(m.evicted, k.digest)
-	}
+	delete(m.evicted, k)
 }
 
 // countIntentsLocked returns how many intents name digest, in every space
@@ -231,7 +229,12 @@ func (m *MemStore) PutIntent(_ context.Context, in registry.UploadIntent) error 
 	cp.Digest = bytes.Clone(in.Digest)
 	cp.UpdatedAt = time.Now()
 	m.intents[locKey{in.Space, string(in.Digest)}] = cp
-	delete(m.evicted, string(in.Digest))
+	// The file is back on disk, for every space's intent.
+	for k := range m.evicted {
+		if k.digest == string(in.Digest) {
+			delete(m.evicted, k)
+		}
+	}
 	return nil
 }
 
@@ -296,7 +299,7 @@ func (m *MemStore) ListEvictable(_ context.Context, after registry.EvictCursor, 
 	defer m.mu.Unlock()
 	var out []registry.UploadIntent
 	for key, in := range m.intents {
-		if _, gone := m.evicted[key.digest]; gone {
+		if _, gone := m.evicted[key]; gone {
 			continue
 		}
 		switch in.State {
@@ -360,23 +363,36 @@ func evictCursorBefore(c registry.EvictCursor, in registry.UploadIntent) bool {
 	return c.Space.String() < in.Space.String()
 }
 
-func (m *MemStore) MarkEvicted(_ context.Context, digest multihash.Multihash) error {
+func (m *MemStore) MarkEvicted(_ context.Context, digest multihash.Multihash, notAfter time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.countIntentsLocked(string(digest), nil) == 0 {
 		return registry.ErrNotFound
 	}
-	m.evicted[string(digest)] = struct{}{}
+	for k, in := range m.intents {
+		if k.digest == string(digest) && !in.UpdatedAt.After(notAfter) {
+			m.evicted[k] = struct{}{}
+		}
+	}
 	return nil
 }
 
-// IsEvicted reports whether digest's intent is marked evicted. Test-only
-// visibility into the evicted_at column.
+// IsEvicted reports whether every intent for digest is marked evicted, and
+// there is at least one. Test-only visibility into the evicted_at column.
 func (m *MemStore) IsEvicted(digest multihash.Multihash) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	_, ok := m.evicted[string(digest)]
-	return ok
+	n := 0
+	for k := range m.intents {
+		if k.digest != string(digest) {
+			continue
+		}
+		if _, ok := m.evicted[k]; !ok {
+			return false
+		}
+		n++
+	}
+	return n > 0
 }
 
 func (m *MemStore) ListReleasedPublished(_ context.Context, after multihash.Multihash, limit int) ([]registry.UploadIntent, error) {

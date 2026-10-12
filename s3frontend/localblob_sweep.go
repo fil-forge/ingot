@@ -476,7 +476,10 @@ func (b *Backend) evictToBudget(ctx context.Context, deadline time.Time, r reten
 				failed.add(hex.EncodeToString(in.Digest), err)
 				continue
 			}
-			if err := b.intents.MarkEvicted(ctx, in.Digest); err != nil && !errors.Is(err, registry.ErrNotFound) {
+			// Marked as of the listing: a write that spooled the bytes again
+			// since, and committed its intent between the removal and here,
+			// has its file on disk and keeps its mark clear.
+			if err := b.intents.MarkEvicted(ctx, in.Digest, in.UpdatedAt); err != nil && !errors.Is(err, registry.ErrNotFound) {
 				return pass, fmt.Errorf("mark %s evicted: %w", hex.EncodeToString(in.Digest), err)
 			}
 		}
