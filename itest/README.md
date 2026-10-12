@@ -20,9 +20,9 @@ go test -tags itest ./itest -run 'TestForgeVersity/PutObject/success' -v  # one 
 
 The suite is one Go package, so its tests run serially and each top-level
 test boots its own Forge stack (~40s of its runtime). CI therefore splits
-them across four runners; the shards are `encryption`, `conformance`,
-`uploads` and `rest`, defined in the Makefile beside `itest-shard` and
-balanced by measured runtime. `rest` is the complement of the other three, so
+them across five runners; the shards are `encryption`, `conformance`,
+`uploads`, `releases` and `rest`, defined in the Makefile beside `itest-shard`
+and balanced by measured runtime. `rest` is the complement of the other four, so
 a test added here runs in CI without being assigned anywhere. Rebalance the
 lists when `go test -tags itest -v` shows a duration has moved.
 
@@ -96,10 +96,10 @@ Notes:
   every `smeltery-*` container, including another suite's live stack.
 - The other services run their published `:main` images — `docker pull` them
   occasionally; compose won't refresh an existing tag.
-- CI runs this suite on every PR after unit tests pass, four shards in
+- CI runs this suite on every PR after unit tests pass, five shards in
   parallel (`.github/workflows/go-test.yml`, job `itest-shards`; job `itest`
   aggregates them into one status check). The compatibility
-  corpus runs beside them on a fifth runner (job `s3compat`) — one stack per
+  corpus runs beside them on a sixth runner (job `s3compat`) — one stack per
   runner, since the sweep above makes two runs unable to share a Docker host
   — and uploads the `s3-compat-report` build artifact; on main it is also
   published to GitHub Pages at <https://fil-forge.github.io/ingot/> (job
