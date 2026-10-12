@@ -9,11 +9,13 @@ ALTER TABLE ingot.upload_intents ADD COLUMN space text;
 -- An intent's space is its bucket's. A row whose bucket is gone takes the
 -- space of whatever else names the digest, which is the one space that can
 -- have written it while every write encrypted under a key of its own.
+-- A bucket from before spaces were recorded carries '', which is no space:
+-- NULLIF passes over it to the other sources.
 UPDATE ingot.upload_intents i SET space = COALESCE(
-    (SELECT b.space FROM ingot.buckets b WHERE b.name = i.bucket),
-    (SELECT l.space FROM ingot.blob_locations l WHERE l.digest = i.digest LIMIT 1),
-    (SELECT r.space FROM ingot.blob_refs r WHERE r.digest = i.digest LIMIT 1),
-    (SELECT p.space FROM ingot.blob_release_intents p WHERE p.digest = i.digest LIMIT 1));
+    (SELECT NULLIF(b.space, '') FROM ingot.buckets b WHERE b.name = i.bucket),
+    (SELECT NULLIF(l.space, '') FROM ingot.blob_locations l WHERE l.digest = i.digest AND l.space <> '' LIMIT 1),
+    (SELECT NULLIF(r.space, '') FROM ingot.blob_refs r WHERE r.digest = i.digest AND r.space <> '' LIMIT 1),
+    (SELECT NULLIF(p.space, '') FROM ingot.blob_release_intents p WHERE p.digest = i.digest AND p.space <> '' LIMIT 1));
 -- An intent nothing can place belongs to no space: no bucket, location,
 -- claim or release names its blob, so no release or eviction would ever
 -- reach it. Its spool file, if any, is left to the orphan pass.
@@ -35,11 +37,11 @@ ALTER TABLE ingot.blob_parks ADD COLUMN space text;
 -- A park's space is its session's. A park whose session is gone takes the
 -- space of its pending release or of its intent.
 UPDATE ingot.blob_parks p SET space = COALESCE(
-    (SELECT s.space FROM ingot.multipart_parts mp
+    (SELECT NULLIF(s.space, '') FROM ingot.multipart_parts mp
        JOIN ingot.multipart_sessions s ON s.upload_id = mp.upload_id
-      WHERE mp.blob_digests @> ARRAY[p.digest] LIMIT 1),
-    (SELECT r.space FROM ingot.blob_release_intents r WHERE r.digest = p.digest LIMIT 1),
-    (SELECT i.space FROM ingot.upload_intents i WHERE i.digest = p.digest LIMIT 1));
+      WHERE mp.blob_digests @> ARRAY[p.digest] AND s.space <> '' LIMIT 1),
+    (SELECT NULLIF(r.space, '') FROM ingot.blob_release_intents r WHERE r.digest = p.digest AND r.space <> '' LIMIT 1),
+    (SELECT NULLIF(i.space, '') FROM ingot.upload_intents i WHERE i.digest = p.digest AND i.space <> '' LIMIT 1));
 -- A park nothing names has no release to run it: the provider expires the
 -- allocation on its own.
 DELETE FROM ingot.blob_parks WHERE space IS NULL;

@@ -556,16 +556,15 @@ func (b *Backend) concludeStreamed(ctx context.Context, space did.DID, blob msbu
 		// Accepted for the space meanwhile: the stream's allocation is
 		// surplus, and the blob is reused as uploadBlob reuses a located one.
 		b.abandonStream(ctx, space, sb)
-		body.unhold(blob.Digest)
 		if err := b.intents.SetIntentState(ctx, space, blob.Digest, registry.IntentAccepted); err != nil {
 			return fmt.Errorf("mark accepted (dedup): %w", err)
 		}
+		body.unhold(blob.Digest) // the rows say the provider holds it
 		b.cacheHeld(ctx, space, blob.Digest)
 		return nil
 	} else if err != nil && !errors.Is(err, registry.ErrNotFound) {
 		return fmt.Errorf("lookup location: %w", err)
 	}
-	body.unhold(blob.Digest) // on its provider already; the file is not read again
 
 	ctx, span := tracing.Start(ctx, "blob.upload",
 		attribute.String("ingot.blob.result", "streamed"),
@@ -579,7 +578,10 @@ func (b *Backend) concludeStreamed(ctx context.Context, space did.DID, blob msbu
 	// the batch then failed, and recorded as accepted the blob is released
 	// through the sweeper's ordinary path rather than left unaccounted for.
 	if len(locations) == 1 && locations[0] != nil {
-		if rerr := b.recordAccepted(ctx, space, blob.Digest, *locations[0]); rerr != nil {
+		// The hold ends once the location and the intent are written (see
+		// recordAccepted): until then a release reading an intent still
+		// uploading with neither row would take the file and the allocation.
+		if rerr := b.recordAccepted(ctx, space, blob.Digest, *locations[0], func() { body.unhold(blob.Digest) }); rerr != nil {
 			return errors.Join(err, rerr)
 		}
 		b.finishStream(ctx, sb)
@@ -615,12 +617,10 @@ func (b *Backend) uploadBlob(ctx context.Context, space did.DID, blob msbucket.B
 	if existing, err := b.locations.GetLocation(ctx, space, blob.Digest); err == nil && existing != nil && settled {
 		// Already durable for this space — advance the intent and move on.
 		span.SetAttributes(attribute.String("ingot.blob.result", "already_stored"))
-		// The hold ends before the state changes: a held file is one the
-		// eviction pass cannot take, and an accepted intent is one it lists.
-		body.unhold(blob.Digest)
 		if err := b.intents.SetIntentState(ctx, space, blob.Digest, registry.IntentAccepted); err != nil {
 			return fmt.Errorf("mark accepted (dedup): %w", err)
 		}
+		body.unhold(blob.Digest) // the rows say the provider holds it
 		b.cacheHeld(ctx, space, blob.Digest)
 		return nil
 	} else if err != nil && !errors.Is(err, registry.ErrNotFound) {
@@ -644,7 +644,6 @@ func (b *Backend) uploadBlob(ctx context.Context, space did.DID, blob msbucket.B
 		return fmt.Errorf("mark uploading: %w", err)
 	}
 	res, err := b.uploader.UploadBlob(ctx, space, digest, in.Size, b.spool.Path(digest))
-	body.unhold(blob.Digest) // read, or failed; either way the file is not read again by this write
 	if err != nil {
 		return fmt.Errorf("upload blob: %w", err)
 	}
@@ -653,7 +652,9 @@ func (b *Backend) uploadBlob(ctx context.Context, space did.DID, blob msbucket.B
 	if res.Location == nil {
 		return fmt.Errorf("upload blob %x: concluding upload returned no location", blob.Digest)
 	}
-	return b.recordAccepted(ctx, space, blob.Digest, *res.Location)
+	// The hold ends once the location and the intent are written (see
+	// recordAccepted), not when the upload has read the file.
+	return b.recordAccepted(ctx, space, blob.Digest, *res.Location, func() { body.unhold(blob.Digest) })
 }
 
 // reconcileClaims updates blob_refs for ONE version id under (bucket, key)

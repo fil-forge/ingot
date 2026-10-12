@@ -1122,10 +1122,10 @@ func (b *Backend) parkBlob(ctx context.Context, space did.DID, blob msbucket.Blo
 	}
 	if existing, err := b.locations.GetLocation(ctx, space, blob.Digest); err == nil && existing != nil && settled {
 		span.SetAttributes(attribute.String("ingot.blob.result", "already_stored"))
-		body.unhold(blob.Digest) // before the state changes, as in uploadBlob
 		if err := b.intents.SetIntentState(ctx, space, blob.Digest, registry.IntentAccepted); err != nil {
 			return fmt.Errorf("mark accepted (dedup): %w", err)
 		}
+		body.unhold(blob.Digest) // the rows say the provider holds it
 		b.cacheHeld(ctx, space, blob.Digest)
 		// A located blob has no use for a park. One is still here only
 		// when an earlier Complete recorded the location and then failed
@@ -1163,29 +1163,18 @@ func (b *Backend) parkBlob(ctx context.Context, space did.DID, blob msbucket.Blo
 		return fmt.Errorf("mark uploading: %w", err)
 	}
 	res, err := b.deferred.UploadBlob(ctx, space, digest, in.Size, b.spool.Path(digest), uploader.WithConclude(false))
-	body.unhold(blob.Digest) // read, or failed; either way the file is not read again by this write
 	if err != nil {
 		return fmt.Errorf("park blob: %w", err)
 	}
+	// The hold ends once the registry says the provider holds the blob, a
+	// location or a park (see recordAccepted), and before the local copy
+	// moves or goes.
 	if res.Location != nil {
 		// The provider already held accepted bytes for this content —
 		// accept ran despite the deferred conclude (dedup), record the
 		// location like the synchronous path.
 		span.SetAttributes(attribute.String("ingot.blob.result", "accepted"))
-		if err := b.locations.PutLocation(ctx, registry.BlobLocation{
-			Space:    space,
-			Digest:   blob.Digest,
-			Provider: res.Location.Provider,
-			URL:      res.Location.URL,
-			Size:     res.Location.Size,
-		}); err != nil {
-			return fmt.Errorf("record location: %w", err)
-		}
-		if err := b.intents.SetIntentState(ctx, space, blob.Digest, registry.IntentAccepted); err != nil {
-			return fmt.Errorf("mark accepted: %w", err)
-		}
-		b.cacheHeld(ctx, space, blob.Digest)
-		return nil
+		return b.recordAccepted(ctx, space, blob.Digest, *res.Location, func() { body.unhold(blob.Digest) })
 	}
 	// Location == nil ⇔ parked: durable on the provider with accept
 	// deferred — persist the conclude state for Complete/Abort.
@@ -1214,6 +1203,7 @@ func (b *Backend) parkBlob(ctx context.Context, space did.DID, blob msbucket.Blo
 	if err := b.intents.SetIntentState(ctx, space, blob.Digest, registry.IntentParked); err != nil {
 		return fmt.Errorf("mark parked: %w", err)
 	}
+	body.unhold(blob.Digest) // the park and the intent say the provider holds it
 	b.dropParkedCopy(ctx, space, blob.Digest)
 	return nil
 }
@@ -1257,7 +1247,6 @@ func (b *Backend) recordStreamedPark(ctx context.Context, space did.DID, blob ms
 	} else if !errors.Is(err, registry.ErrNotFound) {
 		return fmt.Errorf("lookup park: %w", err)
 	}
-	body.unhold(blob.Digest) // on its provider already; the file is not read again
 
 	ctx, span := tracing.Start(ctx, "blob.park",
 		attribute.String("ingot.blob.result", "streamed"),
@@ -1287,19 +1276,19 @@ func (b *Backend) recordStreamedPark(ctx context.Context, space did.DID, blob ms
 	if err := b.intents.SetIntentState(ctx, space, blob.Digest, registry.IntentParked); err != nil {
 		return fmt.Errorf("mark parked: %w", err)
 	}
+	body.unhold(blob.Digest) // the park and the intent say the provider holds it
 	b.dropParkedCopy(ctx, space, blob.Digest)
 	return nil
 }
 
 // reuseLocatedPart records a part blob the provider already holds for the
-// space, accepted: the intent advances, the hold ends before the state
-// changes (see uploadBlob), the local copy moves to the cache, and a stale
-// park, if any, is dropped.
+// space, accepted: the intent advances, the hold ends, the local copy moves
+// to the cache, and a stale park, if any, is dropped.
 func (b *Backend) reuseLocatedPart(ctx context.Context, space did.DID, blob msbucket.BlobRef, body spooledBody) error {
-	body.unhold(blob.Digest)
 	if err := b.intents.SetIntentState(ctx, space, blob.Digest, registry.IntentAccepted); err != nil {
 		return fmt.Errorf("mark accepted (dedup): %w", err)
 	}
+	body.unhold(blob.Digest) // the rows say the provider holds it
 	b.cacheHeld(ctx, space, blob.Digest)
 	// A located blob has no use for a park. One is still here only when an
 	// earlier Complete recorded the location and then failed before
@@ -1317,10 +1306,10 @@ func (b *Backend) reuseLocatedPart(ctx context.Context, space did.DID, blob msbu
 // has parked: the intent follows the park and the local copy goes, as it
 // does after a park of this write's own.
 func (b *Backend) reuseParkedPart(ctx context.Context, space did.DID, blob msbucket.BlobRef, body spooledBody) error {
-	body.unhold(blob.Digest)
 	if err := b.intents.SetIntentState(ctx, space, blob.Digest, registry.IntentParked); err != nil {
 		return fmt.Errorf("mark parked (dedup): %w", err)
 	}
+	body.unhold(blob.Digest) // the rows say the provider holds it
 	b.dropParkedCopy(ctx, space, blob.Digest)
 	return nil
 }
@@ -1451,7 +1440,7 @@ func (b *Backend) concludeBlobs(ctx context.Context, space did.DID, blobs []msbu
 			if i >= len(locations) || locations[i] == nil {
 				continue
 			}
-			if rerr := b.recordAccepted(ctx, space, p.blob.Digest, *locations[i]); rerr != nil {
+			if rerr := b.recordAccepted(ctx, space, p.blob.Digest, *locations[i], nil); rerr != nil {
 				// Still parked as far as the tables say; the next Complete
 				// concludes it again.
 				errs = append(errs, rerr)
@@ -1515,12 +1504,16 @@ func (b *Backend) uploadNeverParked(ctx context.Context, space did.DID, blob msb
 	if res.Location == nil {
 		return fmt.Errorf("upload blob %x: concluding upload returned no location", blob.Digest)
 	}
-	return b.recordAccepted(ctx, space, blob.Digest, *res.Location)
+	return b.recordAccepted(ctx, space, blob.Digest, *res.Location, nil)
 }
 
 // recordAccepted persists an accepted blob's location and marks its intent.
 // The location is the proof eviction requires that the provider holds the
-// blob, and where reads go once the local copy is gone.
+// blob, and where reads go once the local copy is gone. unhold, when set,
+// ends the write's hold on the spool file once both rows are written and
+// before the local copy moves: a hold ends only when the registry says the
+// provider holds the blob, so no release reads an intent still uploading
+// with neither row and takes the file or the allocation in between.
 //
 // The location is written first, so a failure between the two writes leaves
 // the intent in its earlier state with a location row, never accepted
@@ -1528,7 +1521,7 @@ func (b *Backend) uploadNeverParked(ctx context.Context, space did.DID, blob msb
 // release of it, if one runs, finds the location and removes the blob from
 // the provider. An accepted intent with no location is neither evictable nor
 // counted as stalled.
-func (b *Backend) recordAccepted(ctx context.Context, space did.DID, digest mh.Multihash, loc uploader.BlobLocation) error {
+func (b *Backend) recordAccepted(ctx context.Context, space did.DID, digest mh.Multihash, loc uploader.BlobLocation, unhold func()) error {
 	if err := b.locations.PutLocation(ctx, registry.BlobLocation{
 		Space:    space,
 		Digest:   digest,
@@ -1540,6 +1533,9 @@ func (b *Backend) recordAccepted(ctx context.Context, space did.DID, digest mh.M
 	}
 	if err := b.intents.SetIntentState(ctx, space, digest, registry.IntentAccepted); err != nil {
 		return fmt.Errorf("mark accepted: %w", err)
+	}
+	if unhold != nil {
+		unhold()
 	}
 	b.cacheHeld(ctx, space, digest)
 	return nil

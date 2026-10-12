@@ -14,6 +14,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/multiformats/go-multihash"
 
+	"github.com/fil-forge/ingot/blockstore"
 	"github.com/fil-forge/ingot/inmem"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/libforge/testutil"
@@ -947,4 +948,106 @@ func TestPlaintextRelease_StreamedPartLocatedMeanwhileReuses(t *testing.T) {
 	if got := getFrom(t, b, "bk", "k"); !bytes.Equal(got, part) {
 		t.Fatalf("the completed object does not read back")
 	}
+}
+
+// heldWhenRecorded is a location and park store that notes, for one digest,
+// whether the write still held the spool file when its location or park was
+// recorded: the hold must outlast the row that says the provider holds the
+// blob, so no release reads an intent still uploading with neither row.
+type heldWhenRecorded struct {
+	registry.LocationStore
+	registry.ParkStore
+	spool  *blockstore.Spool
+	space  did.DID
+	digest multihash.Multihash
+	mu     sync.Mutex
+	held   []bool
+}
+
+func (h *heldWhenRecorded) note(digest multihash.Multihash) {
+	if bytes.Equal(digest, h.digest) {
+		h.mu.Lock()
+		h.held = append(h.held, h.spool.HeldBy(h.space, digest))
+		h.mu.Unlock()
+	}
+}
+
+func (h *heldWhenRecorded) PutLocation(ctx context.Context, loc registry.BlobLocation) error {
+	h.note(loc.Digest)
+	return h.LocationStore.PutLocation(ctx, loc)
+}
+
+func (h *heldWhenRecorded) PutPark(ctx context.Context, p registry.BlobPark) (bool, error) {
+	h.note(p.Digest)
+	return h.ParkStore.PutPark(ctx, p)
+}
+
+func (h *heldWhenRecorded) wantHeld(t *testing.T, what string) {
+	t.Helper()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.held) == 0 {
+		t.Fatalf("%s: nothing was recorded for the digest", what)
+	}
+	for i, held := range h.held {
+		if !held {
+			t.Fatalf("%s: record %d was written after the write had ended its hold", what, i)
+		}
+	}
+}
+
+// TestPlaintextRelease_HoldOutlastsTheRecord covers the four write paths:
+// the single-shot upload, the part park, and both streamed forms. In each
+// the spool file is still held when the location or park is recorded.
+func TestPlaintextRelease_HoldOutlastsTheRecord(t *testing.T) {
+	data := testBody(8 << 10)
+	d := digestOf(t, data)
+	wire := func(h *heldWhenRecorded) func(*Deps) {
+		return func(dp *Deps) {
+			h.LocationStore, h.ParkStore, h.spool, h.space, h.digest = dp.Locations, dp.Parks, dp.Spool, did.Undef, d
+			dp.Locations, dp.Parks = h, h
+		}
+	}
+
+	t.Run("upload", func(t *testing.T) {
+		h := &heldWhenRecorded{}
+		b, _ := newDeferredBackend(t, &countingUploader{calls: map[string]int{}}, wire(h))
+		setNone(t, b)
+		putIn(t, b, "bk", "k", data)
+		h.wantHeld(t, "location of a single-shot upload")
+	})
+	t.Run("park", func(t *testing.T) {
+		h := &heldWhenRecorded{}
+		b, _ := newDeferredBackend(t, &parkingUploader{}, wire(h))
+		setNone(t, b)
+		uploadOnePart(t, b, "bk", "k", data)
+		h.wantHeld(t, "park of a part")
+	})
+	t.Run("streamed upload", func(t *testing.T) {
+		h := &heldWhenRecorded{}
+		su := newStreamingUploader()
+		b, _ := newStreamingBackend(t, su, wire(h))
+		setNone(t, b)
+		if err := putSized(t, b, "k", data, int64(len(data))); err != nil {
+			t.Fatalf("PutObject: %v", err)
+		}
+		h.wantHeld(t, "location of a streamed upload")
+	})
+	t.Run("streamed park", func(t *testing.T) {
+		h := &heldWhenRecorded{}
+		su := newStreamingUploader()
+		b, _ := newStreamingBackend(t, su, wire(h))
+		setNone(t, b)
+		bucket, key := "bk", "k"
+		ctx := context.Background()
+		created, err := b.CreateMultipartUpload(ctx, s3response.CreateMultipartUploadInput{Bucket: &bucket, Key: &key})
+		if err != nil {
+			t.Fatalf("CreateMultipartUpload: %v", err)
+		}
+		id, n, size := created.UploadId, int32(1), int64(len(data))
+		if _, err := b.UploadPart(ctx, &s3.UploadPartInput{Bucket: &bucket, Key: &key, UploadId: &id, PartNumber: &n, Body: bytes.NewReader(data), ContentLength: &size}); err != nil {
+			t.Fatalf("UploadPart: %v", err)
+		}
+		h.wantHeld(t, "park of a streamed part")
+	})
 }
