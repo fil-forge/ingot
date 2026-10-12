@@ -22,7 +22,6 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"sync"
 
 	block "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
@@ -34,6 +33,7 @@ import (
 	"github.com/fil-forge/ingot/internal/tracing"
 	"github.com/fil-forge/ingot/mst"
 	"github.com/fil-forge/ingot/registry"
+	"github.com/fil-forge/libforge/syncutil"
 )
 
 // ErrBucketNotFound is returned by Begin when the bucket doesn't
@@ -69,16 +69,13 @@ type Deps struct {
 type Coordinator struct {
 	deps Deps
 
-	mu    sync.Mutex
-	locks map[string]*sync.Mutex
+	// locks serialises transactions per bucket, within this process.
+	locks syncutil.KeyedMutex
 }
 
 // NewCoordinator returns a Coordinator wired to the given deps.
 func NewCoordinator(deps Deps) *Coordinator {
-	return &Coordinator{
-		deps:  deps,
-		locks: map[string]*sync.Mutex{},
-	}
+	return &Coordinator{deps: deps}
 }
 
 // Begin starts a write transaction against bucket. Steps:
@@ -130,9 +127,7 @@ func (c *Coordinator) Begin(ctx context.Context, bucket string) (*Tx, error) {
 // Most callers should prefer WithLock, which removes the
 // defer-or-leak hazard.
 func (c *Coordinator) Lock(bucket string) func() {
-	lock := c.lockFor(bucket)
-	lock.Lock()
-	return lock.Unlock
+	return c.locks.Lock(bucket)
 }
 
 // lockTraced is Lock with the wait recorded as a bucket.lock span: time spent
@@ -208,17 +203,6 @@ func (c *Coordinator) WithLock(ctx context.Context, bucket string, fn LockFn) er
 	release := c.lockTraced(ctx, bucket)
 	defer release()
 	return fn(ctx)
-}
-
-func (c *Coordinator) lockFor(bucket string) *sync.Mutex {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if m, ok := c.locks[bucket]; ok {
-		return m
-	}
-	m := &sync.Mutex{}
-	c.locks[bucket] = m
-	return m
 }
 
 // Close shuts down the underlying log — with the per-bucket

@@ -44,6 +44,7 @@ import (
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/tenantkey"
 	"github.com/fil-forge/ingot/uploader"
+	"github.com/fil-forge/libforge/syncutil"
 )
 
 // Backend implements versitygw's backend.Backend directly over the
@@ -93,8 +94,12 @@ type Backend struct {
 	dropAcceptedBodies bool
 	localBlobSweepMu   sync.Mutex
 	// blobKeys serialises, within this process, the writes that make one
-	// (space, digest) durable on its provider (see blobKeyLock).
-	blobKeys            blobKeyLock
+	// (space, digest) durable on its provider, keyed by blobKey: the check
+	// for a location or a park, the upload or park, and the row that records
+	// it, so a second write of the same bytes finds the first's row. The
+	// registry stays the guard between instances (ParkStore.PutPark refuses
+	// to overwrite a park).
+	blobKeys            syncutil.KeyedMutex
 	lastOrphanPass      time.Time
 	localBlobSweepBatch int
 	// overBudgetWarned and timeLimitLogged are set once the sweeper has

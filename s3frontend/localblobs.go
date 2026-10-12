@@ -96,3 +96,9 @@ func (b *Backend) removeLocal(digest multihash.Multihash) (int64, error) {
 	more, err := b.cache.Remove(digest)
 	return freed + more, err
 }
+
+// blobKey is the key under which Backend.blobKeys serialises the writes of
+// one digest to one space.
+func blobKey(space did.DID, digest multihash.Multihash) string {
+	return space.String() + "\x00" + string(digest)
+}
