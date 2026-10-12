@@ -268,8 +268,11 @@ type BlobRefStore interface {
 	// same transaction, marks the space's upload intent for the digest
 	// published (see IntentPublished). Idempotent. Under the (space, digest)
 	// claim-key lock it refuses with ErrReleaseInProgress while a started
-	// release holds the digest (PendingReleaseStore.StartRelease): a claim
-	// landing then would name a blob the release is removing.
+	// release holds the digest (PendingReleaseStore.StartRelease), or when
+	// the space has no location for the digest: a claim landing then would
+	// name a blob a release is removing, or has removed since the write
+	// settled it. Every committed body blob is located by its commit, so a
+	// claim with no location is one such write's.
 	AddBlobClaim(ctx context.Context, claim BlobClaim) error
 	// AddBlobClaims is AddBlobClaim for every claim of one generation, all
 	// in one transaction, each under its claim-key lock, taken in digest

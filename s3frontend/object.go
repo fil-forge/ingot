@@ -536,13 +536,34 @@ func (b *Backend) uploadBlobs(ctx context.Context, space did.DID, body spooledBo
 // (see settleRelease); the stream is then given up and the blob uploaded
 // afresh from its spool file, which the write still holds.
 func (b *Backend) concludeStreamed(ctx context.Context, space did.DID, blob msbucket.BlobRef, sb uploader.StreamedBlob, body spooledBody) (err error) {
+	// One write of these bytes at a time for this space (see blobKeyLock):
+	// another write can have accepted the same digest while this stream was
+	// in flight, and its location is read under the lock before this one
+	// concludes, so two streams of the same bytes never both record a
+	// location.
+	unlock := b.blobKeys.lock(space, blob.Digest)
+	defer unlock()
 	settled, err := b.settleRelease(ctx, space, blob.Digest)
 	if err != nil {
 		return err
 	}
 	if !settled {
 		b.abandonStream(ctx, space, sb)
+		unlock() // uploadBlob takes the key itself
 		return b.uploadBlob(ctx, space, blob, body)
+	}
+	if existing, err := b.locations.GetLocation(ctx, space, blob.Digest); err == nil && existing != nil {
+		// Accepted for the space meanwhile: the stream's allocation is
+		// surplus, and the blob is reused as uploadBlob reuses a located one.
+		b.abandonStream(ctx, space, sb)
+		body.unhold(blob.Digest)
+		if err := b.intents.SetIntentState(ctx, space, blob.Digest, registry.IntentAccepted); err != nil {
+			return fmt.Errorf("mark accepted (dedup): %w", err)
+		}
+		b.cacheHeld(ctx, space, blob.Digest)
+		return nil
+	} else if err != nil && !errors.Is(err, registry.ErrNotFound) {
+		return fmt.Errorf("lookup location: %w", err)
 	}
 	body.unhold(blob.Digest) // on its provider already; the file is not read again
 
@@ -833,6 +854,15 @@ func (b *Backend) releaseNow(ctx context.Context, records []registry.PendingRele
 // release's to run, and no write commits a manifest over a blob it is
 // removing.
 func (b *Backend) runRelease(ctx context.Context, pr registry.PendingRelease) releaseOutcome {
+	if pr.StartedAt.IsZero() && b.spool.HeldBy(pr.Space, pr.Digest) {
+		// A write of this space is between spooling the same bytes and its
+		// commit: it settles the release before it uploads or reuses, and
+		// its claim is checked against the location (AddBlobClaims), so a
+		// release not yet started waits for it rather than start under it.
+		// A started one goes on: it owns the blob, and a write holding the
+		// file is waiting for it to finish.
+		return releaseDeferred
+	}
 	start, err := b.pendingReleases.StartRelease(ctx, pr.Space, pr.Digest)
 	if err != nil {
 		b.logger.Warn("release: start failed; retrying next sweep",

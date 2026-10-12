@@ -120,6 +120,9 @@ func TestPostgresStores_Live(t *testing.T) {
 		space := testutil.RandomDID(t)
 		space2 := testutil.RandomDID(t)
 		add := func(bucket, key string, sp did.DID) {
+			if err := r.PutLocation(ctx, registry.BlobLocation{Space: sp, Digest: digest, Provider: "did:key:p", URL: "http://p/blob", Size: 1}); err != nil {
+				t.Fatalf("PutLocation: %v", err)
+			}
 			if err := r.AddBlobClaim(ctx, registry.BlobClaim{Digest: digest, Bucket: bucket, ObjectKey: key, VersionID: registry.NullVersionID, Space: sp}); err != nil {
 				t.Fatalf("AddBlobClaim: %v", err)
 			}
@@ -150,6 +153,9 @@ func TestPostgresStores_Live(t *testing.T) {
 		if err := r.PutIntent(ctx, registry.UploadIntent{Space: space, Digest: pubDigest, LocalPath: "/spool/x", Size: 1, State: registry.IntentAccepted, Bucket: "b"}); err != nil {
 			t.Fatalf("PutIntent: %v", err)
 		}
+		if err := r.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: pubDigest, Provider: "did:key:p", URL: "http://p/blob", Size: 1}); err != nil {
+			t.Fatalf("PutLocation: %v", err)
+		}
 		if err := r.AddBlobClaim(ctx, registry.BlobClaim{Digest: pubDigest, Bucket: "b", ObjectKey: "kp", VersionID: registry.NullVersionID, Space: space}); err != nil {
 			t.Fatalf("AddBlobClaim (publish): %v", err)
 		}
@@ -163,6 +169,9 @@ func TestPostgresStores_Live(t *testing.T) {
 			t.Fatalf("intent after the claim dropped = %+v, err %v (want still published)", in, err)
 		}
 		// A claim on a digest with no intent row (a shipped segment) is fine.
+		if err := r.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: multihash.Multihash([]byte{0x12, 0x20, 0xc1, 0xa2}), Provider: "did:key:p", URL: "http://p/blob", Size: 1}); err != nil {
+			t.Fatalf("PutLocation: %v", err)
+		}
 		if err := r.AddBlobClaim(ctx, registry.BlobClaim{Digest: multihash.Multihash([]byte{0x12, 0x20, 0xc1, 0xa2}), Bucket: "b", ObjectKey: "kn", VersionID: registry.NullVersionID, Space: space}); err != nil {
 			t.Fatalf("AddBlobClaim (no intent): %v", err)
 		}
@@ -181,6 +190,9 @@ func TestPostgresStores_Live(t *testing.T) {
 		}
 		if ok, err := r.PinBlobClaims(ctx, pin(d1)); err != nil || ok {
 			t.Fatalf("pin with no claim to attach to: ok=%v err=%v, want refused", ok, err)
+		}
+		if err := r.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: d1, Provider: "did:key:p", URL: "http://p/blob", Size: 1}); err != nil {
+			t.Fatalf("PutLocation: %v", err)
 		}
 		if err := r.AddBlobClaim(ctx, registry.BlobClaim{Digest: d1, Bucket: "pb", ObjectKey: "src", VersionID: "null#1", Space: space}); err != nil {
 			t.Fatalf("AddBlobClaim: %v", err)
@@ -219,6 +231,9 @@ func TestPostgresStores_Live(t *testing.T) {
 	t.Run("drop claim enqueues release atomically", func(t *testing.T) {
 		space := testutil.RandomDID(t)
 		add := func(key string) {
+			if err := r.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: digest, Provider: "did:key:p", URL: "http://p/blob", Size: 1}); err != nil {
+				t.Fatalf("PutLocation: %v", err)
+			}
 			if err := r.AddBlobClaim(ctx, registry.BlobClaim{Digest: digest, Bucket: "rb", ObjectKey: key, VersionID: "null#1", Space: space}); err != nil {
 				t.Fatalf("AddBlobClaim: %v", err)
 			}

@@ -461,6 +461,10 @@ func TestRevocationCursor_UpsertRoundTrip(t *testing.T) {
 
 func mustAdd(t *testing.T, m *MemStore, c registry.BlobClaim) {
 	t.Helper()
+	// A claim requires the provider to hold the blob for the space.
+	if err := m.PutLocation(context.Background(), registry.BlobLocation{Space: c.Space, Digest: c.Digest, Provider: "did:key:p", URL: "http://p/blob", Size: 1}); err != nil {
+		t.Fatalf("PutLocation: %v", err)
+	}
 	if err := m.AddBlobClaim(context.Background(), c); err != nil {
 		t.Fatalf("AddBlobClaim: %v", err)
 	}
@@ -555,6 +559,9 @@ func TestBlobRefs_ClaimPublishesIntent(t *testing.T) {
 		t.Fatalf("PutIntent: %v", err)
 	}
 	claim := registry.BlobClaim{Digest: d, Bucket: "b", ObjectKey: "k", VersionID: registry.NullVersionID, Space: did.Undef}
+	if err := m.PutLocation(ctx, registry.BlobLocation{Space: did.Undef, Digest: d, Provider: "did:key:p", URL: "http://p/blob", Size: 1}); err != nil {
+		t.Fatalf("PutLocation: %v", err)
+	}
 	if err := m.AddBlobClaim(ctx, claim); err != nil {
 		t.Fatalf("AddBlobClaim: %v", err)
 	}
@@ -568,7 +575,11 @@ func TestBlobRefs_ClaimPublishesIntent(t *testing.T) {
 		t.Fatalf("intent after the claim dropped = %q, want still published", in.State)
 	}
 	// No intent row: nothing to publish, no error.
-	if err := m.AddBlobClaim(ctx, registry.BlobClaim{Digest: multihash.Multihash([]byte("segment")), Bucket: "b", ObjectKey: "s", VersionID: registry.NullVersionID}); err != nil {
+	seg := multihash.Multihash([]byte("segment"))
+	if err := m.PutLocation(ctx, registry.BlobLocation{Space: did.Undef, Digest: seg, Provider: "did:key:p", URL: "http://p/blob", Size: 1}); err != nil {
+		t.Fatalf("PutLocation: %v", err)
+	}
+	if err := m.AddBlobClaim(ctx, registry.BlobClaim{Digest: seg, Bucket: "b", ObjectKey: "s", VersionID: registry.NullVersionID}); err != nil {
 		t.Fatalf("AddBlobClaim without intent: %v", err)
 	}
 }

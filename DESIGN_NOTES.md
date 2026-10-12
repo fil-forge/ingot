@@ -337,7 +337,16 @@ upload within a process (`blobKeyLock`), so the second finds the first's
 location or park; across instances a park already recorded wins, and the
 loser gives up its allocation. Of two spaces releasing the same digest at
 once, each leaving the file for the other's intent, the one whose intent
-delete finds none left removes the file.
+delete finds none left removes the file. The streamed paths follow the
+same rule as the rest: a streamed blob concludes, or a streamed part is
+recorded, under the key lock, after a settle and a look at the rows, and
+a location or park another write recorded meanwhile makes the stream
+surplus, given up and reused. The last guard is the claim itself: a
+committed body blob is located by its commit, so `AddBlobClaims` refuses,
+under the claim-key lock, a digest the space has no location for, which is
+one whose release ran to completion between the write's settle and its
+commit; the write fails with SlowDown for the client to retry. A release
+not yet started defers while a write of its space holds the digest.
 
 ## Identity & auth
 

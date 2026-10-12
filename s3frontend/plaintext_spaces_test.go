@@ -767,3 +767,184 @@ func TestPlaintextSpaces_LastReleaseOutRemovesTheSharedFile(t *testing.T) {
 		t.Fatalf("the shared file survived both releases")
 	}
 }
+
+// TestPlaintextRelease_CompleteFallbackSettlesUnderTheLock: Complete's
+// upload of a part that never parked settles the release under the key
+// lock, like every other upload: a record pending for the digest is
+// cancelled there, and the part uploaded afresh. (A started record cannot
+// meet this path: a part is recorded only once its own park settled the
+// digest, and its live session keeps any later release from starting.)
+func TestPlaintextRelease_CompleteFallbackSettlesUnderTheLock(t *testing.T) {
+	up := &countingUploader{calls: map[string]int{}}
+	b, mem := newDeferredBackend(t, up)
+	ctx := context.Background()
+	setNone(t, b)
+	part := testBody(5 << 20)
+	d := digestOf(t, part)
+
+	id, parts := uploadOnePart(t, b, "bk", "k", part)
+	// Make the part look never parked, with its location gone and a release
+	// of the digest started: as a release that took the blob after the part
+	// was recorded.
+	if err := mem.DeleteLocation(ctx, did.Undef, d); err != nil {
+		t.Fatalf("DeleteLocation: %v", err)
+	}
+	if err := mem.SetIntentState(ctx, did.Undef, d, registry.IntentSpooled); err != nil {
+		t.Fatalf("SetIntentState: %v", err)
+	}
+	if err := mem.EnqueueRelease(ctx, did.Undef, d, time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("EnqueueRelease: %v", err)
+	}
+
+	completeIn(t, b, "bk", "k", id, parts)
+	if pending, _ := mem.ListReleasesBySpace(ctx, did.Undef); len(pending) != 0 {
+		t.Fatalf("the fallback upload left the pending record in place: %v", pending)
+	}
+	up.mu.Lock()
+	uploads := up.calls[string(d)]
+	up.mu.Unlock()
+	if uploads != 2 {
+		t.Fatalf("uploads of %x = %d, want 2 (the part was uploaded again by the fallback)", d, uploads)
+	}
+	if got := getFrom(t, b, "bk", "k"); !bytes.Equal(got, part) {
+		t.Fatalf("the completed object does not read back")
+	}
+}
+
+// releaseBetweenReuseAndCommit is an intent store under which a release of
+// the digest runs to completion right after a write has decided to reuse
+// the located blob (the mark it sets then): the location is gone by the
+// time the write's claim lands.
+type releaseBetweenReuseAndCommit struct {
+	registry.IntentStore
+	locations registry.LocationStore
+	digest    multihash.Multihash
+	armed     bool
+}
+
+func (r *releaseBetweenReuseAndCommit) SetIntentState(ctx context.Context, space did.DID, digest multihash.Multihash, state string) error {
+	err := r.IntentStore.SetIntentState(ctx, space, digest, state)
+	if err == nil && r.armed && state == registry.IntentAccepted && bytes.Equal(digest, r.digest) {
+		r.armed = false
+		if err := r.locations.DeleteLocation(ctx, space, digest); err != nil {
+			return err
+		}
+	}
+	return err
+}
+
+// TestPlaintextRelease_ClaimRefusedOnceTheLocationIsGone: a write that
+// settled with no release in the way and reuses the located blob finds, at
+// its commit, that a release ran to completion meanwhile: the claim is
+// refused, since the blob is gone from the provider, and the write fails
+// with SlowDown for the client to retry.
+func TestPlaintextRelease_ClaimRefusedOnceTheLocationIsGone(t *testing.T) {
+	rel := &releaseBetweenReuseAndCommit{}
+	b, mem := newDeferredBackend(t, inmem.NopUploader{}, func(d *Deps) {
+		rel.IntentStore, rel.locations = d.Intents, d.Locations
+		d.Intents = rel
+	})
+	setNone(t, b)
+	data := testBody(8 << 10)
+	putIn(t, b, "bk", "old", data)
+	rel.digest, rel.armed = blobDigestOf(t, b, "old", ""), true
+
+	bucket, key := "bk", "new"
+	_, err := b.PutObject(context.Background(), s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(data)})
+	var apiErr s3err.APIError
+	if !errors.As(err, &apiErr) || apiErr.Code != "SlowDown" {
+		t.Fatalf("PutObject whose blob was released before its commit: err = %v, want SlowDown", err)
+	}
+	if n, _ := mem.CountClaims(context.Background(), did.Undef, rel.digest); n != 1 {
+		t.Fatalf("claims on the digest = %d, want only the old object's", n)
+	}
+}
+
+// TestPlaintextRelease_ConcurrentStreamedWritesConcludeOnce: two streamed
+// writes of the same bytes to one space take turns at the conclude; the
+// second finds the first's location, gives up its stream and reuses the
+// blob, so the provider holds one allocation.
+func TestPlaintextRelease_ConcurrentStreamedWritesConcludeOnce(t *testing.T) {
+	su := newStreamingUploader()
+	b, _ := newStreamingBackend(t, su)
+	setNone(t, b)
+	data := testBody(8 << 10)
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 3)
+	for i := range 3 {
+		wg.Add(1)
+		go func(key string) {
+			defer wg.Done()
+			errs <- putSized(t, b, key, data, int64(len(data)))
+		}(fmt.Sprintf("s%d", i))
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("PutObject: %v", err)
+		}
+	}
+	su.mu.Lock()
+	started, concluded, aborted := len(su.started), len(su.concluded), len(su.aborted)
+	su.mu.Unlock()
+	if started != 3 || concluded != 1 || aborted != 2 {
+		t.Fatalf("streams started/concluded/aborted = %d/%d/%d, want 3/1/2", started, concluded, aborted)
+	}
+	for i := range 3 {
+		if got := getFrom(t, b, "bk", fmt.Sprintf("s%d", i)); !bytes.Equal(got, data) {
+			t.Fatalf("s%d does not read back", i)
+		}
+	}
+}
+
+// TestPlaintextRelease_StreamedPartLocatedMeanwhileReuses: a streamed part
+// whose digest another write accepted for the space while the stream was in
+// flight records no park beside that location: the stream is given up and
+// the part reuses the located blob.
+func TestPlaintextRelease_StreamedPartLocatedMeanwhileReuses(t *testing.T) {
+	su := newStreamingUploader()
+	b, mem := newStreamingBackend(t, su)
+	ctx := context.Background()
+	setNone(t, b)
+	// One blob: below the streaming backend's blob ceiling, and a single
+	// last part may be small.
+	part := testBody(8 << 10)
+	d := digestOf(t, part)
+
+	// The object write accepts the bytes for the space first.
+	if err := putSized(t, b, "obj", part, int64(len(part))); err != nil {
+		t.Fatalf("PutObject: %v", err)
+	}
+	// A streamed part declares its length, as a streamed object does.
+	bucket, key := "bk", "k"
+	created, err := b.CreateMultipartUpload(ctx, s3response.CreateMultipartUploadInput{Bucket: &bucket, Key: &key})
+	if err != nil {
+		t.Fatalf("CreateMultipartUpload: %v", err)
+	}
+	id, n, size := created.UploadId, int32(1), int64(len(part))
+	out, err := b.UploadPart(ctx, &s3.UploadPartInput{Bucket: &bucket, Key: &key, UploadId: &id, PartNumber: &n, Body: bytes.NewReader(part), ContentLength: &size})
+	if err != nil {
+		t.Fatalf("UploadPart: %v", err)
+	}
+	parts := []types.CompletedPart{{ETag: out.ETag, PartNumber: &n}}
+
+	if _, err := mem.GetPark(ctx, did.Undef, d); !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("a park was recorded beside the location (err=%v)", err)
+	}
+	in, err := mem.GetIntent(ctx, did.Undef, d)
+	if err != nil || in.State != registry.IntentAccepted {
+		t.Fatalf("the part's intent = %+v, %v; want accepted (reused)", in, err)
+	}
+	su.mu.Lock()
+	aborted := len(su.aborted)
+	su.mu.Unlock()
+	if aborted != 1 {
+		t.Fatalf("streams aborted = %d, want 1 (the part's surplus allocation)", aborted)
+	}
+	completeIn(t, b, "bk", "k", id, parts)
+	if got := getFrom(t, b, "bk", "k"); !bytes.Equal(got, part) {
+		t.Fatalf("the completed object does not read back")
+	}
+}

@@ -44,6 +44,9 @@ func (m *MemStore) AddBlobClaims(_ context.Context, claims []registry.BlobClaim)
 		if pr, ok := m.releases[locKey{c.Space, string(c.Digest)}]; ok && !pr.StartedAt.IsZero() {
 			return registry.ErrReleaseInProgress
 		}
+		if _, ok := m.locations[locKey{c.Space, string(c.Digest)}]; !ok {
+			return registry.ErrReleaseInProgress // released to completion since the write settled it
+		}
 	}
 	for _, c := range claims {
 		k := claimKey{string(c.Digest), c.Bucket, c.ObjectKey, c.VersionID}

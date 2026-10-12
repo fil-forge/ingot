@@ -61,6 +61,17 @@ func (r *Postgres) AddBlobClaims(ctx context.Context, claims []BlobClaim) error 
 		if started {
 			return ErrReleaseInProgress // rolled back by the deferred Rollback
 		}
+		var located bool
+		if err := tx.QueryRow(ctx,
+			`SELECT EXISTS (SELECT 1 FROM ingot.blob_locations WHERE space = $1 AND digest = $2)`,
+			c.Space, c.Digest).Scan(&located); err != nil {
+			return fmt.Errorf("registry: add blob claim: location lookup: %w", err)
+		}
+		if !located {
+			// A release ran to completion since the write settled it: the
+			// blob is gone from the provider.
+			return ErrReleaseInProgress
+		}
 		if _, err := tx.Exec(ctx,
 			`INSERT INTO ingot.blob_refs (digest, bucket, object_key, version_id, space)
 			 VALUES ($1, $2, $3, $4, $5)

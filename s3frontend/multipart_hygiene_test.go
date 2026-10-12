@@ -1057,6 +1057,10 @@ func TestUploadPartToleratesFailedStaleParkDelete(t *testing.T) {
 	if in, err := mem.IntentByDigest(ctx, d); err != nil || in.State != registry.IntentAccepted {
 		t.Fatalf("dedup part intent = %v/%v, want accepted", in, err)
 	}
+	// The fake answers located; the claim at Complete reads the row itself.
+	if err := mem.PutLocation(ctx, registry.BlobLocation{Space: did.Undef, Digest: d, Provider: "did:key:zNode", URL: "https://node.example/blob", Size: 1}); err != nil {
+		t.Fatalf("PutLocation: %v", err)
+	}
 
 	// The stale row such a failure leaves behind, as a Complete that failed
 	// after recording the acceptance would.

@@ -40,13 +40,19 @@ func (l *blobKeyLock) lock(space did.DID, digest multihash.Multihash) func() {
 	e.waiters++
 	l.mu.Unlock()
 	e.mu.Lock()
+	// The unlock releases the key once; a second call does nothing, so an
+	// explicit release before delegating to a path that takes the key
+	// itself is safe beside the deferred one.
+	var once sync.Once
 	return func() {
-		e.mu.Unlock()
-		l.mu.Lock()
-		e.waiters--
-		if e.waiters == 0 {
-			delete(l.locks, key)
-		}
-		l.mu.Unlock()
+		once.Do(func() {
+			e.mu.Unlock()
+			l.mu.Lock()
+			e.waiters--
+			if e.waiters == 0 {
+				delete(l.locks, key)
+			}
+			l.mu.Unlock()
+		})
 	}
 }

@@ -1144,9 +1144,9 @@ func (b *Backend) parkBlob(ctx context.Context, space did.DID, blob msbucket.Blo
 	// the blob from the provider: parked afresh, unless a park of the
 	// space's own already stands.
 	if _, err := b.parks.GetPark(ctx, space, blob.Digest); err == nil {
+		// Already parked by another part or session of the space.
 		span.SetAttributes(attribute.String("ingot.blob.result", "already_parked"))
-		body.unhold(blob.Digest)
-		return nil // already parked by another part or session of the space
+		return b.reuseParkedPart(ctx, space, blob, body)
 	} else if !errors.Is(err, registry.ErrNotFound) {
 		return fmt.Errorf("lookup park: %w", err)
 	}
@@ -1221,6 +1221,13 @@ func (b *Backend) parkBlob(ctx context.Context, space did.DID, blob msbucket.Blo
 // recordStreamedPark records the park a streamed blob left on its provider,
 // traced as a blob.park span like parkBlob.
 func (b *Backend) recordStreamedPark(ctx context.Context, space did.DID, blob msbucket.BlobRef, sb uploader.StreamedBlob, body spooledBody) (err error) {
+	// One write of these bytes at a time for this space (see blobKeyLock):
+	// a Complete or another part can have accepted or parked the same
+	// digest while this stream was in flight, and the rows are read under
+	// the lock before the park is recorded, so a park is never recorded
+	// beside a location.
+	unlock := b.blobKeys.lock(space, blob.Digest)
+	defer unlock()
 	// A release of the same digest that ran while the stream was in flight
 	// may have taken what it parked (see settleRelease): the stream is then
 	// given up and the blob parked afresh from its spool file, which the
@@ -1231,7 +1238,24 @@ func (b *Backend) recordStreamedPark(ctx context.Context, space did.DID, blob ms
 	}
 	if !settled {
 		b.abandonStream(ctx, space, sb)
+		unlock() // parkBlob takes the key itself
 		return b.parkBlob(ctx, space, blob, body)
+	}
+	if existing, err := b.locations.GetLocation(ctx, space, blob.Digest); err == nil && existing != nil {
+		// Accepted for the space meanwhile: the stream's allocation is
+		// surplus, and the blob is reused as parkBlob reuses a located one.
+		b.abandonStream(ctx, space, sb)
+		return b.reuseLocatedPart(ctx, space, blob, body)
+	} else if err != nil && !errors.Is(err, registry.ErrNotFound) {
+		return fmt.Errorf("lookup location: %w", err)
+	}
+	if _, err := b.parks.GetPark(ctx, space, blob.Digest); err == nil {
+		// Parked for the space meanwhile, by another part or session: that
+		// park stands, and this stream is given up.
+		b.abandonStream(ctx, space, sb)
+		return b.reuseParkedPart(ctx, space, blob, body)
+	} else if !errors.Is(err, registry.ErrNotFound) {
+		return fmt.Errorf("lookup park: %w", err)
 	}
 	body.unhold(blob.Digest) // on its provider already; the file is not read again
 
@@ -1262,6 +1286,40 @@ func (b *Backend) recordStreamedPark(ctx context.Context, space did.DID, blob ms
 	}
 	if err := b.intents.SetIntentState(ctx, space, blob.Digest, registry.IntentParked); err != nil {
 		return fmt.Errorf("mark parked: %w", err)
+	}
+	b.dropParkedCopy(ctx, space, blob.Digest)
+	return nil
+}
+
+// reuseLocatedPart records a part blob the provider already holds for the
+// space, accepted: the intent advances, the hold ends before the state
+// changes (see uploadBlob), the local copy moves to the cache, and a stale
+// park, if any, is dropped.
+func (b *Backend) reuseLocatedPart(ctx context.Context, space did.DID, blob msbucket.BlobRef, body spooledBody) error {
+	body.unhold(blob.Digest)
+	if err := b.intents.SetIntentState(ctx, space, blob.Digest, registry.IntentAccepted); err != nil {
+		return fmt.Errorf("mark accepted (dedup): %w", err)
+	}
+	b.cacheHeld(ctx, space, blob.Digest)
+	// A located blob has no use for a park. One is still here only when an
+	// earlier Complete recorded the location and then failed before
+	// dropping the row. The part is durable regardless, so a failure here
+	// is logged rather than failing the write; Complete's dedup path drops
+	// the row otherwise.
+	if err := b.parks.DeletePark(ctx, space, blob.Digest); err != nil {
+		b.logger.Warn("drop stale park row failed; Complete will retry",
+			zap.String("digest", hex.EncodeToString(blob.Digest)), zap.Error(err))
+	}
+	return nil
+}
+
+// reuseParkedPart records a part blob another part or session of the space
+// has parked: the intent follows the park and the local copy goes, as it
+// does after a park of this write's own.
+func (b *Backend) reuseParkedPart(ctx context.Context, space did.DID, blob msbucket.BlobRef, body spooledBody) error {
+	body.unhold(blob.Digest)
+	if err := b.intents.SetIntentState(ctx, space, blob.Digest, registry.IntentParked); err != nil {
+		return fmt.Errorf("mark parked (dedup): %w", err)
 	}
 	b.dropParkedCopy(ctx, space, blob.Digest)
 	return nil
@@ -1430,7 +1488,13 @@ func (b *Backend) concludeBlobs(ctx context.Context, space did.DID, blobs []msbu
 // finds this upload's location rather than allocating beside it.
 func (b *Backend) uploadNeverParked(ctx context.Context, space did.DID, blob msbucket.BlobRef) error {
 	defer b.blobKeys.lock(space, blob.Digest)()
-	if existing, err := b.locations.GetLocation(ctx, space, blob.Digest); err == nil && existing != nil {
+	// Settled under the lock, as uploadBlob does: the settle at
+	// classification ran outside it, and a release can have started since.
+	settled, err := b.settleRelease(ctx, space, blob.Digest)
+	if err != nil {
+		return err
+	}
+	if existing, err := b.locations.GetLocation(ctx, space, blob.Digest); err == nil && existing != nil && settled {
 		// Located while this waited for the lock.
 		return b.intents.SetIntentState(ctx, space, blob.Digest, registry.IntentAccepted)
 	} else if err != nil && !errors.Is(err, registry.ErrNotFound) {

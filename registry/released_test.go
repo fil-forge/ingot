@@ -73,6 +73,9 @@ func runReleasedSuite(t *testing.T, st releasedStore) {
 		t.Fatalf("PutLocation: %v", err)
 	}
 	claimed := published("claimed")
+	if err := st.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: claimed, Provider: "did:web:piri", URL: "https://piri/blob", Size: 7}); err != nil {
+		t.Fatalf("PutLocation: %v", err)
+	}
 	if err := st.AddBlobClaim(ctx, registry.BlobClaim{Digest: claimed, Bucket: "bk", ObjectKey: "k", VersionID: "v", Space: space}); err != nil {
 		t.Fatalf("AddBlobClaim: %v", err)
 	}

@@ -24,6 +24,7 @@ type releaseStartStore interface {
 	registry.BlobRefStore
 	registry.MultipartStore
 	registry.IntentStore
+	registry.LocationStore
 }
 
 // TestReleaseStartLive runs the release start and cancel against the
@@ -58,6 +59,13 @@ func TestReleaseStartLive(t *testing.T) {
 func runReleaseStartSuite(t *testing.T, st releaseStartStore) {
 	ctx := t.Context()
 	space := testutil.RandomDID(t)
+	// locate records the provider as holding d for sp: what a claim requires.
+	locate := func(sp did.DID, d multihash.Multihash) {
+		t.Helper()
+		if err := st.PutLocation(ctx, registry.BlobLocation{Space: sp, Digest: d, Provider: "did:key:p", URL: "http://p/blob", Size: 7}); err != nil {
+			t.Fatalf("PutLocation: %v", err)
+		}
+	}
 	enqueue := func(name string) multihash.Multihash {
 		t.Helper()
 		d := evictDigest(t, "start:"+name)
@@ -129,6 +137,7 @@ func runReleaseStartSuite(t *testing.T, st releaseStartStore) {
 
 	t.Run("a claimed blob is not started", func(t *testing.T) {
 		d := enqueue("claimed")
+		locate(space, d)
 		if err := st.AddBlobClaim(ctx, registry.BlobClaim{Digest: d, Bucket: "bk", ObjectKey: "k", VersionID: "v", Space: space}); err != nil {
 			t.Fatalf("AddBlobClaim: %v", err)
 		}
@@ -212,9 +221,25 @@ func runReleaseStartSuite(t *testing.T, st releaseStartStore) {
 		}
 	})
 
+	t.Run("a claim needs the location", func(t *testing.T) {
+		// A committed body blob is located by its commit; a claim with no
+		// location is one whose blob a release removed since the write
+		// settled it.
+		d := evictDigest(t, "start:unlocated")
+		claim := registry.BlobClaim{Digest: d, Bucket: "bk", ObjectKey: "k", VersionID: "v", Space: space}
+		if err := st.AddBlobClaim(ctx, claim); !errors.Is(err, registry.ErrReleaseInProgress) {
+			t.Fatalf("AddBlobClaim with no location err = %v, want ErrReleaseInProgress", err)
+		}
+		locate(space, d)
+		if err := st.AddBlobClaim(ctx, claim); err != nil {
+			t.Fatalf("AddBlobClaim once located: %v", err)
+		}
+	})
+
 	t.Run("a claim is refused while a release is started", func(t *testing.T) {
 		d := enqueue("claim-during")
 		claim := registry.BlobClaim{Digest: d, Bucket: "bk", ObjectKey: "k", VersionID: "v", Space: space}
+		locate(space, d)
 		if s, err := st.StartRelease(ctx, space, d); err != nil || s != registry.ReleaseStarted {
 			t.Fatalf("StartRelease = %v, %v", s, err)
 		}
@@ -226,6 +251,7 @@ func runReleaseStartSuite(t *testing.T, st releaseStartStore) {
 		}
 		// Another space's release does not refuse this space's claim.
 		other := registry.BlobClaim{Digest: d, Bucket: "bk2", ObjectKey: "k", VersionID: "v", Space: testutil.RandomDID(t)}
+		locate(other.Space, d)
 		if err := st.AddBlobClaim(ctx, other); err != nil {
 			t.Fatalf("AddBlobClaim in another space: %v", err)
 		}
@@ -241,6 +267,8 @@ func runReleaseStartSuite(t *testing.T, st releaseStartStore) {
 	t.Run("a generation's claims land together or not at all", func(t *testing.T) {
 		free := evictDigest(t, "start:free")
 		going := enqueue("claims-going")
+		locate(space, free)
+		locate(space, going)
 		if s, err := st.StartRelease(ctx, space, going); err != nil || s != registry.ReleaseStarted {
 			t.Fatalf("StartRelease = %v, %v", s, err)
 		}
