@@ -437,3 +437,28 @@ func TestBlobCacheTakeReplacesACachedCopy(t *testing.T) {
 		t.Fatalf("moved spool cache = %s, want %s", got, want)
 	}
 }
+
+// TestBlobCacheTakeWaitsForHolds: a blob a write still holds is not moved,
+// since that write uploads from the spool path; once the hold ends, the
+// next Take moves it.
+func TestBlobCacheTakeWaitsForHolds(t *testing.T) {
+	s, c := newTestDirs(t)
+	d := writeTestBlob(t, s, "held")
+	unhold := s.Hold(did.Undef, d)
+	var moved []int64
+	n, err := c.Take(s, d)
+	if err != nil {
+		t.Fatalf("Take while held: %v", err)
+	}
+	moved = append(moved, n)
+	unhold()
+	n, err = c.Take(s, d)
+	if err != nil {
+		t.Fatalf("Take after the hold: %v", err)
+	}
+	moved = append(moved, n)
+	got := fmt.Sprint(moved, s.Usage(), c.Usage())
+	if want := fmt.Sprint([]int64{0, 4}, 0, 4); got != want {
+		t.Fatalf("[moved] spool cache = %s, want %s", got, want)
+	}
+}

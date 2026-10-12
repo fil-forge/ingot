@@ -401,3 +401,28 @@ func TestPlaintextSpaces_ReleaseIgnoresAnotherSpacesHold(t *testing.T) {
 		t.Fatalf("the release removed the file the other space's write holds")
 	}
 }
+
+// TestPlaintextSpaces_CacheMoveWaitsForAnotherWritesHold: a write that
+// finishes while another write still holds the same bytes leaves the file
+// in the spool, where the other write uploads from; the next write's cache
+// move takes it once the hold has ended.
+func TestPlaintextSpaces_CacheMoveWaitsForAnotherWritesHold(t *testing.T) {
+	b, mem, _ := newRefTestBackend(t)
+	space2 := secondPlaintextBucket(t, b, mem)
+	data := testBody(8 << 10)
+	d := digestOf(t, data)
+
+	// A write in bk2 is between spooling and uploading the same bytes.
+	unhold := b.spool.Hold(space2, d)
+	putIn(t, b, "bk", "one", data)
+	if _, err := os.Stat(b.spool.Path(d)); err != nil {
+		t.Fatalf("the finished write moved the file the other write holds: %v", err)
+	}
+	unhold()
+	putIn(t, b, "bk", "two", data)
+	_, spoolErr := os.Stat(b.spool.Path(d))
+	_, cacheErr := os.Stat(b.cache.Path(d))
+	if spoolErr == nil || cacheErr != nil {
+		t.Fatalf("after the hold ended: spool err=%v cache err=%v, want the file moved to the cache", spoolErr, cacheErr)
+	}
+}

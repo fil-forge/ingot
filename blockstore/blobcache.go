@@ -129,14 +129,22 @@ func (c *BlobCache) Usage() int64 {
 // cache (the same bytes stored as received and written again) is replaced,
 // and its bytes leave the count as the new copy's enter it.
 //
+// A blob a write in flight still holds (Spool.Hold) stays where it is and
+// moves nothing: that write uploads from the spool path, and the move waits
+// for its own cache move, or for eviction, once the hold has ended.
+//
 // Take holds both directories exclusively, so a move never overlaps a
-// removal of the same blob: whether the removal finds the file in the spool
-// or in the cache, the bytes come off one count, once.
+// removal of the same blob, or a hold being taken: whether the removal
+// finds the file in the spool or in the cache, the bytes come off one
+// count, once.
 func (c *BlobCache) Take(spool *Spool, digest mh.Multihash) (int64, error) {
 	spool.mu.Lock()
 	defer spool.mu.Unlock()
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if spool.Held(digest) {
+		return 0, nil
+	}
 	from := spool.Path(digest)
 	info, err := os.Stat(from)
 	if errors.Is(err, os.ErrNotExist) {
