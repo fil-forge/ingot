@@ -9,17 +9,23 @@ import (
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awsmiddleware "github.com/aws/aws-sdk-go-v2/aws/middleware"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/smithy-go"
+	"github.com/aws/smithy-go/middleware"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
+	"github.com/fil-forge/hilt/pkg/bucketpolicy"
 )
 
 // TestForgeBucketPolicy drives the S3 bucket policy operations end to end: a
-// service key writes a Forge policy naming a principal with PutBucketPolicy,
-// reads it back canonical with GetBucketPolicy, is refused an AWS-shaped
-// document with MalformedPolicy, and removes it with DeleteBucketPolicy. The
-// published hilt image lacks /s3/bucket/policy until fil-forge/hilt#89
-// merges, so the scenario runs only against a hilt override (or when
-// INGOT_ITEST_IAM=1 says the image carries it); drop the guard then.
+// service key writes an AWS-shaped policy naming a principal by its user ARN
+// with PutBucketPolicy, reads it back canonical with GetBucketPolicy (both
+// answering the document's ETag), replaces it with a wildcard document, is
+// refused a document versitygw rejects (a bare principal name) and one Hilt
+// rejects (no Version) with MalformedPolicy, and removes it with
+// DeleteBucketPolicy. The published hilt image lacks /s3/bucket/policy until
+// fil-forge/hilt#89 merges, so the scenario runs only against a hilt override
+// (or when INGOT_ITEST_IAM=1 says the image carries it); drop the guard then.
 func TestForgeBucketPolicy(t *testing.T) {
 	if !iamScenariosEnabled() {
 		t.Skip("the bucket policy scenario needs a hilt override (INGOT_ITEST_HILT_BINARY or INGOT_ITEST_HILT_IMAGE), or INGOT_ITEST_IAM=1, until the :main image serves /s3/bucket/policy")
@@ -45,22 +51,44 @@ func TestForgeBucketPolicy(t *testing.T) {
 	}
 
 	// Written out of order and with a duplicate; read back sorted and deduplicated.
-	written := fmt.Sprintf(`{"Statement":[{"Effect":"Allow","Principal":[%q],"Action":["s3:PutObject","s3:GetObject","s3:PutObject"]}]}`, principal)
-	if _, err := client.PutBucketPolicy(ctx, &s3.PutBucketPolicyInput{Bucket: aws.String(bucket), Policy: aws.String(written)}); err != nil {
+	objects := bucketpolicy.ObjectsARN(bucket)
+	written := fmt.Sprintf(`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":[%q]},"Action":["s3:PutObject","s3:GetObject","s3:PutObject"],"Resource":%q}]}`,
+		bucketpolicy.UserARN(principal), objects)
+	put, err := client.PutBucketPolicy(ctx, &s3.PutBucketPolicyInput{Bucket: aws.String(bucket), Policy: aws.String(written)})
+	if err != nil {
 		t.Fatalf("PutBucketPolicy: %v", err)
+	}
+	putETag := responseETag(put.ResultMetadata)
+	if putETag == "" {
+		t.Fatal("PutBucketPolicy answered no ETag")
 	}
 	got, err := client.GetBucketPolicy(ctx, &s3.GetBucketPolicyInput{Bucket: aws.String(bucket)})
 	if err != nil {
 		t.Fatalf("GetBucketPolicy: %v", err)
 	}
-	want := fmt.Sprintf(`{"Statement":[{"Effect":"Allow","Principal":[%q],"Action":["s3:GetObject","s3:PutObject"]}]}`, principal)
+	want := fmt.Sprintf(`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":[%q]},"Action":["s3:GetObject","s3:PutObject"],"Resource":[%q]}]}`,
+		bucketpolicy.UserARN(principal), objects)
 	if aws.ToString(got.Policy) != want {
 		t.Fatalf("GetBucketPolicy = %s, want %s", aws.ToString(got.Policy), want)
 	}
+	if getETag := responseETag(got.ResultMetadata); getETag != putETag {
+		t.Fatalf("GetBucketPolicy ETag = %q, want the PutBucketPolicy ETag %q", getETag, putETag)
+	}
 
-	awsShaped := `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::policied/*"}]}`
-	if _, err := client.PutBucketPolicy(ctx, &s3.PutBucketPolicyInput{Bucket: aws.String(bucket), Policy: aws.String(awsShaped)}); !isS3Code(err, "MalformedPolicy") {
-		t.Fatalf("PutBucketPolicy with an AWS-shaped document: got %v, want MalformedPolicy", err)
+	wildcard := fmt.Sprintf(`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":%q}]}`, objects)
+	if _, err := client.PutBucketPolicy(ctx, &s3.PutBucketPolicyInput{Bucket: aws.String(bucket), Policy: aws.String(wildcard)}); err != nil {
+		t.Fatalf("PutBucketPolicy with a wildcard principal: %v", err)
+	}
+
+	for name, doc := range map[string]string{
+		// versitygw's validation finds no account for a bare name.
+		"a bare principal name": fmt.Sprintf(`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":[%q]},"Action":"s3:GetObject","Resource":%q}]}`, principal, objects),
+		// versitygw defaults the Version; Hilt requires it.
+		"no Version": fmt.Sprintf(`{"Statement":[{"Effect":"Allow","Principal":{"AWS":[%q]},"Action":"s3:GetObject","Resource":%q}]}`, bucketpolicy.UserARN(principal), objects),
+	} {
+		if _, err := client.PutBucketPolicy(ctx, &s3.PutBucketPolicyInput{Bucket: aws.String(bucket), Policy: aws.String(doc)}); !isS3Code(err, "MalformedPolicy") {
+			t.Fatalf("PutBucketPolicy with %s: got %v, want MalformedPolicy", name, err)
+		}
 	}
 
 	if _, err := client.DeleteBucketPolicy(ctx, &s3.DeleteBucketPolicyInput{Bucket: aws.String(bucket)}); err != nil {
@@ -72,6 +100,14 @@ func TestForgeBucketPolicy(t *testing.T) {
 	if _, err := client.DeleteBucketPolicy(ctx, &s3.DeleteBucketPolicyInput{Bucket: aws.String(bucket)}); !isS3Code(err, "NoSuchBucketPolicy") {
 		t.Fatalf("DeleteBucketPolicy twice: got %v, want NoSuchBucketPolicy", err)
 	}
+}
+
+// responseETag returns the ETag header of the response an SDK output came from.
+func responseETag(md middleware.Metadata) string {
+	if res, ok := awsmiddleware.GetRawResponse(md).(*smithyhttp.Response); ok {
+		return res.Header.Get("ETag")
+	}
+	return ""
 }
 
 // isS3Code reports whether err is an S3 API error with the given code.
