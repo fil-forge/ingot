@@ -266,7 +266,10 @@ type MultipartPart struct {
 type BlobRefStore interface {
 	// AddBlobClaim records an object version's claim on a digest and, in the
 	// same transaction, marks the space's upload intent for the digest
-	// published (see IntentPublished). Idempotent.
+	// published (see IntentPublished). Idempotent. Under the (space, digest)
+	// claim-key lock it refuses with ErrReleaseInProgress while a started
+	// release holds the digest (PendingReleaseStore.StartRelease): a claim
+	// landing then would name a blob the release is removing.
 	AddBlobClaim(ctx context.Context, claim BlobClaim) error
 	// PinBlobClaims is AddBlobClaim for digests borrowed from another object
 	// of the same space (a same-space copy pins the source's body). Each

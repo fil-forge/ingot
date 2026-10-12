@@ -1090,8 +1090,7 @@ func (b *Backend) parkBlobs(ctx context.Context, space did.DID, body spooledBody
 		}
 		seen[string(blob.Digest)] = true
 		if sb, ok := body.streamed[string(blob.Digest)]; ok {
-			body.unhold(blob.Digest) // on its provider already; the file is not read again
-			if err := b.recordStreamedPark(ctx, space, blob, sb); err != nil {
+			if err := b.recordStreamedPark(ctx, space, blob, sb, body); err != nil {
 				return err
 			}
 			continue
@@ -1111,34 +1110,35 @@ func (b *Backend) parkBlob(ctx context.Context, space did.DID, blob msbucket.Blo
 	defer func() { tracing.End(span, err) }()
 
 	digest := blob.Digest
-	if existing, err := b.locations.GetLocation(ctx, space, blob.Digest); err == nil && existing != nil {
-		reuse, err := b.reuseLocated(ctx, space, blob.Digest)
-		if err != nil {
-			return err
+	// Whatever the rows say, no release of this digest may be running
+	// while the blob is parked or reused (see settleRelease).
+	settled, err := b.settleRelease(ctx, space, blob.Digest)
+	if err != nil {
+		return err
+	}
+	if existing, err := b.locations.GetLocation(ctx, space, blob.Digest); err == nil && existing != nil && settled {
+		span.SetAttributes(attribute.String("ingot.blob.result", "already_stored"))
+		body.unhold(blob.Digest) // before the state changes, as in uploadBlob
+		if err := b.intents.SetIntentState(ctx, space, blob.Digest, registry.IntentAccepted); err != nil {
+			return fmt.Errorf("mark accepted (dedup): %w", err)
 		}
-		if reuse {
-			span.SetAttributes(attribute.String("ingot.blob.result", "already_stored"))
-			body.unhold(blob.Digest) // before the state changes, as in uploadBlob
-			if err := b.intents.SetIntentState(ctx, space, blob.Digest, registry.IntentAccepted); err != nil {
-				return fmt.Errorf("mark accepted (dedup): %w", err)
-			}
-			b.cacheHeld(ctx, space, blob.Digest)
-			// A located blob has no use for a park. One is still here only
-			// when an earlier Complete recorded the location and then failed
-			// before dropping the row. The part is durable regardless, so a
-			// failure here is logged rather than failing the write; Complete's
-			// dedup path drops the row otherwise.
-			if err := b.parks.DeletePark(ctx, space, blob.Digest); err != nil {
-				b.logger.Warn("drop stale park row failed; Complete will retry",
-					zap.String("digest", hex.EncodeToString(blob.Digest)), zap.Error(err))
-			}
-			return nil
+		b.cacheHeld(ctx, space, blob.Digest)
+		// A located blob has no use for a park. One is still here only
+		// when an earlier Complete recorded the location and then failed
+		// before dropping the row. The part is durable regardless, so a
+		// failure here is logged rather than failing the write; Complete's
+		// dedup path drops the row otherwise.
+		if err := b.parks.DeletePark(ctx, space, blob.Digest); err != nil {
+			b.logger.Warn("drop stale park row failed; Complete will retry",
+				zap.String("digest", hex.EncodeToString(blob.Digest)), zap.Error(err))
 		}
-		// The release that held the location has run: the blob is gone
-		// from the provider, and is parked again below.
+		return nil
 	} else if err != nil && !errors.Is(err, registry.ErrNotFound) {
 		return fmt.Errorf("lookup location: %w", err)
 	}
+	// Not located, or located by a release that has since run and taken
+	// the blob from the provider: parked afresh, unless a park of the
+	// space's own already stands.
 	if _, err := b.parks.GetPark(ctx, space, blob.Digest); err == nil {
 		span.SetAttributes(attribute.String("ingot.blob.result", "already_parked"))
 		body.unhold(blob.Digest)
@@ -1205,7 +1205,21 @@ func (b *Backend) parkBlob(ctx context.Context, space did.DID, blob msbucket.Blo
 
 // recordStreamedPark records the park a streamed blob left on its provider,
 // traced as a blob.park span like parkBlob.
-func (b *Backend) recordStreamedPark(ctx context.Context, space did.DID, blob msbucket.BlobRef, sb uploader.StreamedBlob) (err error) {
+func (b *Backend) recordStreamedPark(ctx context.Context, space did.DID, blob msbucket.BlobRef, sb uploader.StreamedBlob, body spooledBody) (err error) {
+	// A release of the same digest that ran while the stream was in flight
+	// may have taken what it parked (see settleRelease): the stream is then
+	// given up and the blob parked afresh from its spool file, which the
+	// write still holds.
+	settled, err := b.settleRelease(ctx, space, blob.Digest)
+	if err != nil {
+		return err
+	}
+	if !settled {
+		b.abandonStream(ctx, space, sb)
+		return b.parkBlob(ctx, space, blob, body)
+	}
+	body.unhold(blob.Digest) // on its provider already; the file is not read again
+
 	ctx, span := tracing.Start(ctx, "blob.park",
 		attribute.String("ingot.blob.result", "streamed"),
 		attribute.Int64("ingot.blob.bytes", sb.Size),
@@ -1275,31 +1289,32 @@ func (b *Backend) concludeBlobs(ctx context.Context, space did.DID, blobs []msbu
 		}
 		seen[string(blob.Digest)] = true
 
-		if existing, err := b.locations.GetLocation(ctx, space, blob.Digest); err == nil && existing != nil {
-			reuse, err := b.reuseLocated(ctx, space, blob.Digest)
-			if err != nil {
-				return err
+		// Whatever the rows say, no release of this digest may be running
+		// while the blob is concluded, uploaded or reused (see
+		// settleRelease).
+		settled, err := b.settleRelease(ctx, space, blob.Digest)
+		if err != nil {
+			return err
+		}
+		if existing, err := b.locations.GetLocation(ctx, space, blob.Digest); err == nil && existing != nil && settled {
+			if err := b.intents.SetIntentState(ctx, space, blob.Digest, registry.IntentAccepted); err != nil {
+				return fmt.Errorf("mark accepted (dedup): %w", err)
 			}
-			if reuse {
-				if err := b.intents.SetIntentState(ctx, space, blob.Digest, registry.IntentAccepted); err != nil {
-					return fmt.Errorf("mark accepted (dedup): %w", err)
-				}
-				b.cacheHeld(ctx, space, blob.Digest)
-				// A located blob has no use for a park. One is still here only
-				// when an earlier Complete recorded the location and then failed
-				// before marking the intent or dropping the row; this is where
-				// that row gets its retry.
-				if err := b.parks.DeletePark(ctx, space, blob.Digest); err != nil {
-					return fmt.Errorf("drop park (dedup): %w", err)
-				}
-				continue
+			b.cacheHeld(ctx, space, blob.Digest)
+			// A located blob has no use for a park. One is still here only
+			// when an earlier Complete recorded the location and then failed
+			// before marking the intent or dropping the row; this is where
+			// that row gets its retry.
+			if err := b.parks.DeletePark(ctx, space, blob.Digest); err != nil {
+				return fmt.Errorf("drop park (dedup): %w", err)
 			}
-			// The release that held the location has run: the blob is gone
-			// from the provider, and its park, if any, went with it; it is
-			// uploaded again below.
+			continue
 		} else if err != nil && !errors.Is(err, registry.ErrNotFound) {
 			return fmt.Errorf("lookup location: %w", err)
 		}
+		// Not located, or located by a release that has since run and
+		// taken the blob from the provider, and its park with it: concluded
+		// from a park of the space's own, or uploaded afresh below.
 
 		park, err := b.parks.GetPark(ctx, space, blob.Digest)
 		if err != nil && !errors.Is(err, registry.ErrNotFound) {

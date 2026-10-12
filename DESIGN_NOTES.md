@@ -313,12 +313,21 @@ its claim-key lock and marks its record started
 (`blob_release_intents.started_at`) before it removes anything, and a write
 that finds the blob already located takes the same lock first, cancelling a
 record not yet started (its own commit would have made it stale) or waiting
-out a started one and then uploading afresh. A write holds each blob's
-spool file (`blockstore.Spool.Hold`) from its spool write until its upload
-has read it, and a release leaves a held file and its intent alone, so the
-waiting write still has its bytes to upload once the release has run. A
-release runs only through its record: Complete no longer runs an orphan's
-release unrecorded when recording it fails, and leaves it to the reap.
+out a started one and then uploading afresh. The write settles the release
+before every upload, park or conclude, located or not, since a release can
+have dropped the location already, or be removing a blob that never had
+one; a streamed blob settles at its conclude and, after a waited-out
+release, is given up and uploaded again from its spool file. A release
+that starts after the settle and before the commit refuses the claim
+(`registry.ErrReleaseInProgress`), and the write fails with SlowDown for the
+client to retry. Each spool file is published already held for the write's
+space (`blockstore.Spool.WriteBlobHeld`), under the directory lock, until
+its upload has read it: a release leaves a file held by its own space, and
+the intent with it, for the write waiting on it; a file held only by
+another space it leaves too, while its own intent goes; and the cache move
+waits for a held file as well. A release runs only through its record:
+Complete no longer runs an orphan's release unrecorded when recording it
+fails, and leaves it to the reap.
 
 ## Identity & auth
 

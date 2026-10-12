@@ -1,6 +1,7 @@
 package registry_test
 
 import (
+	"errors"
 	"os"
 	"testing"
 	"time"
@@ -164,6 +165,32 @@ func runReleaseStartSuite(t *testing.T, st releaseStartStore) {
 		}
 		if !started(running) {
 			t.Fatalf("a refused cancel removed the record")
+		}
+	})
+
+	t.Run("a claim is refused while a release is started", func(t *testing.T) {
+		d := enqueue("claim-during")
+		claim := registry.BlobClaim{Digest: d, Bucket: "bk", ObjectKey: "k", VersionID: "v", Space: space}
+		if s, err := st.StartRelease(ctx, space, d); err != nil || s != registry.ReleaseStarted {
+			t.Fatalf("StartRelease = %v, %v", s, err)
+		}
+		if err := st.AddBlobClaim(ctx, claim); !errors.Is(err, registry.ErrReleaseInProgress) {
+			t.Fatalf("AddBlobClaim during a started release err = %v, want ErrReleaseInProgress", err)
+		}
+		if n, _ := st.CountClaims(ctx, space, d); n != 0 {
+			t.Fatalf("a refused claim was recorded: %d", n)
+		}
+		// Another space's release does not refuse this space's claim.
+		other := registry.BlobClaim{Digest: d, Bucket: "bk2", ObjectKey: "k", VersionID: "v", Space: testutil.RandomDID(t)}
+		if err := st.AddBlobClaim(ctx, other); err != nil {
+			t.Fatalf("AddBlobClaim in another space: %v", err)
+		}
+		// Once the release has run, the claim lands.
+		if err := st.DeleteRelease(ctx, space, d); err != nil {
+			t.Fatalf("DeleteRelease: %v", err)
+		}
+		if err := st.AddBlobClaim(ctx, claim); err != nil {
+			t.Fatalf("AddBlobClaim after the release: %v", err)
 		}
 	})
 }

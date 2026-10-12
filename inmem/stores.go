@@ -34,6 +34,9 @@ var (
 func (m *MemStore) AddBlobClaim(_ context.Context, c registry.BlobClaim) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if pr, ok := m.releases[locKey{c.Space, string(c.Digest)}]; ok && !pr.StartedAt.IsZero() {
+		return registry.ErrReleaseInProgress
+	}
 	k := claimKey{string(c.Digest), c.Bucket, c.ObjectKey, c.VersionID}
 	cp := c
 	cp.Digest = bytes.Clone(c.Digest)

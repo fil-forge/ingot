@@ -168,7 +168,11 @@ type Registry interface {
 // Common errors.
 var (
 	ErrNotFound = errors.New("registry: bucket not found")
-	ErrNotEmpty = errors.New("registry: bucket not empty")
-	ErrExists   = errors.New("registry: bucket already exists")
-	ErrConflict = errors.New("registry: root cas conflict")
+	// ErrReleaseInProgress refuses a blob claim while a started release is
+	// removing the blob from its provider (PendingReleaseStore.StartRelease):
+	// the write retries once the release has run and uploads afresh.
+	ErrReleaseInProgress = errors.New("registry: a release of the blob is in progress")
+	ErrNotEmpty          = errors.New("registry: bucket not empty")
+	ErrExists            = errors.New("registry: bucket already exists")
+	ErrConflict          = errors.New("registry: root cas conflict")
 )

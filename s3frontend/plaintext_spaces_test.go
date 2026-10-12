@@ -426,3 +426,160 @@ func TestPlaintextSpaces_CacheMoveWaitsForAnotherWritesHold(t *testing.T) {
 		t.Fatalf("after the hold ended: spool err=%v cache err=%v, want the file moved to the cache", spoolErr, cacheErr)
 	}
 }
+
+// TestPlaintextRelease_WriteWaitsOutAStartedReleaseWithNoLocation: a
+// release that has already dropped the blob's location, or one of a blob
+// that never had one, is settled before the write uploads afresh, so the
+// release cannot remove what the write adds.
+func TestPlaintextRelease_WriteWaitsOutAStartedReleaseWithNoLocation(t *testing.T) {
+	up := &countingUploader{calls: map[string]int{}}
+	b, mem := newDeferredBackend(t, up)
+	ctx := context.Background()
+	setNone(t, b)
+	data := testBody(8 << 10)
+
+	putIn(t, b, "bk", "old", data)
+	d := blobDigestOf(t, b, "old", "")
+	deleteFrom(t, b, "bk", "old")
+	// The release is started and past its location delete.
+	if s, err := mem.StartRelease(ctx, did.Undef, d); err != nil || s != registry.ReleaseStarted {
+		t.Fatalf("StartRelease = %v, %v", s, err)
+	}
+	if err := mem.DeleteLocation(ctx, did.Undef, d); err != nil {
+		t.Fatalf("DeleteLocation: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		bucket, key := "bk", "new"
+		_, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(data)})
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("PutObject returned %v while the release was started", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	up.mu.Lock()
+	early := up.calls[string(d)]
+	up.mu.Unlock()
+	if early != 1 {
+		t.Fatalf("uploads of %x while the release was started = %d, want 1 (the write waited)", d, early)
+	}
+
+	drainReleases(t, b)
+	if err := <-done; err != nil {
+		t.Fatalf("PutObject after the release: %v", err)
+	}
+	up.mu.Lock()
+	uploads := up.calls[string(d)]
+	up.mu.Unlock()
+	if uploads != 2 {
+		t.Fatalf("uploads of %x = %d, want 2", d, uploads)
+	}
+	if got := getFrom(t, b, "bk", "new"); !bytes.Equal(got, data) {
+		t.Fatalf("the rewritten object does not read back")
+	}
+}
+
+// startAfterSettle is a release store that starts a release of the digest
+// right after a write has settled it, as a sweep that runs between the
+// write's settle and its commit does.
+type startAfterSettle struct {
+	registry.PendingReleaseStore
+	digest multihash.Multihash
+	space  did.DID
+	armed  bool
+}
+
+func (s *startAfterSettle) CancelRelease(ctx context.Context, space did.DID, digest multihash.Multihash) (registry.ReleaseCancel, error) {
+	c, err := s.PendingReleaseStore.CancelRelease(ctx, space, digest)
+	if err == nil && s.armed && bytes.Equal(digest, s.digest) {
+		s.armed = false
+		if err := s.PendingReleaseStore.EnqueueRelease(ctx, s.space, s.digest, time.Now()); err != nil {
+			return 0, err
+		}
+		if _, err := s.PendingReleaseStore.StartRelease(ctx, s.space, s.digest); err != nil {
+			return 0, err
+		}
+	}
+	return c, err
+}
+
+// TestPlaintextRelease_ClaimRefusedDuringAStartedRelease: a release that
+// starts after the write settled it and before its commit refuses the
+// claim, so the write fails with SlowDown rather than commit a manifest
+// over a blob the release is removing.
+func TestPlaintextRelease_ClaimRefusedDuringAStartedRelease(t *testing.T) {
+	rel := &startAfterSettle{}
+	b, mem := newDeferredBackend(t, inmem.NopUploader{}, func(d *Deps) {
+		rel.PendingReleaseStore = d.PendingReleases
+		d.PendingReleases = rel
+	})
+	setNone(t, b)
+	data := testBody(8 << 10)
+	rel.digest, rel.space, rel.armed = digestOf(t, data), did.Undef, true
+
+	bucket, key := "bk", "k"
+	_, err := b.PutObject(context.Background(), s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(data)})
+	var apiErr s3err.APIError
+	if !errors.As(err, &apiErr) || apiErr.Code != "SlowDown" {
+		t.Fatalf("PutObject with a release started before its commit: err = %v, want SlowDown", err)
+	}
+	if n, _ := mem.CountClaims(context.Background(), did.Undef, rel.digest); n != 0 {
+		t.Fatalf("a claim landed during the started release: %d", n)
+	}
+}
+
+// TestPlaintextRelease_StreamedWriteWaitsOutAStartedRelease: a blob sent
+// to its provider as it was spooled settles the release at its conclude.
+// After a waited-out release the stream is given up, since the release may
+// have taken what it parked, and the blob is uploaded again from the spool
+// file the write still holds.
+func TestPlaintextRelease_StreamedWriteWaitsOutAStartedRelease(t *testing.T) {
+	su := newStreamingUploader()
+	b, mem := newStreamingBackend(t, su)
+	ctx := context.Background()
+	setNone(t, b)
+	data := testBody(8 << 10)
+
+	if err := putSized(t, b, "old", data, int64(len(data))); err != nil {
+		t.Fatalf("PutObject old: %v", err)
+	}
+	d := blobDigestOf(t, b, "old", "")
+	deleteFrom(t, b, "bk", "old")
+	if s, err := mem.StartRelease(ctx, did.Undef, d); err != nil || s != registry.ReleaseStarted {
+		t.Fatalf("StartRelease = %v, %v", s, err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- putSized(t, b, "new", data, int64(len(data))) }()
+	select {
+	case err := <-done:
+		t.Fatalf("PutObject returned %v while the release was started", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	drainReleases(t, b)
+	if err := <-done; err != nil {
+		t.Fatalf("PutObject after the release: %v", err)
+	}
+
+	su.mu.Lock()
+	var uploaded, aborted int
+	for _, u := range su.uploaded {
+		if bytes.Equal(u, d) {
+			uploaded++
+		}
+	}
+	aborted = len(su.aborted)
+	su.mu.Unlock()
+	if uploaded != 1 || aborted != 1 {
+		t.Fatalf("after the waited-out release: fresh uploads of %x = %d, streams aborted = %d; want 1 and 1", d, uploaded, aborted)
+	}
+	if _, err := mem.GetLocation(ctx, did.Undef, d); err != nil {
+		t.Fatalf("no location after the fresh upload: %v", err)
+	}
+	if got := getFrom(t, b, "bk", "new"); !bytes.Equal(got, data) {
+		t.Fatalf("the rewritten object does not read back")
+	}
+}

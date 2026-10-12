@@ -38,6 +38,19 @@ func (r *Postgres) AddBlobClaim(ctx context.Context, c BlobClaim) error {
 		return fmt.Errorf("registry: begin add blob claim: %w", err)
 	}
 	defer tx.Rollback(ctx)
+	if err := lockClaimKey(ctx, tx, c.Space, c.Digest); err != nil {
+		return err
+	}
+	var started bool
+	if err := tx.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM ingot.blob_release_intents
+		                 WHERE space = $1 AND digest = $2 AND started_at IS NOT NULL)`,
+		c.Space, c.Digest).Scan(&started); err != nil {
+		return fmt.Errorf("registry: add blob claim: release lookup: %w", err)
+	}
+	if started {
+		return ErrReleaseInProgress
+	}
 	if _, err := tx.Exec(ctx,
 		`INSERT INTO ingot.blob_refs (digest, bucket, object_key, version_id, space)
 		 VALUES ($1, $2, $3, $4, $5)

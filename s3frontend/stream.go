@@ -20,6 +20,7 @@ import (
 	"github.com/fil-forge/ingot/internal/tracing"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/uploader"
+	"github.com/fil-forge/ucantone/did"
 )
 
 // This file is the streaming half of the body write path (the trailer-hash
@@ -323,4 +324,16 @@ func (b *Backend) SweepStaleStreams(ctx context.Context) (int, error) {
 		dropped++
 	}
 	return dropped, nil
+}
+
+// abandonStream gives up a streamed upload whose parked bytes a release may
+// have taken (see concludeStreamed): the allocation is aborted on its
+// provider and its row dropped, both best effort, as bodyWriter.abandon
+// does; the stream sweeper retries whatever fails.
+func (b *Backend) abandonStream(ctx context.Context, space did.DID, sb uploader.StreamedBlob) {
+	if err := b.streaming.AbortBlob(ctx, space, sb.AddTask); err != nil {
+		b.logger.Warn("abandoning streamed upload failed; the stream sweeper retries", zap.Stringer("add", sb.AddTask), zap.Error(err))
+		return
+	}
+	b.finishStream(ctx, sb)
 }
