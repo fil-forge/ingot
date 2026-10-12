@@ -1036,7 +1036,7 @@ erDiagram
     multipart_parts ||..o{ blob_release_intents : "teardown records, by digest"
 ```
 
-- The two solid relationships are the schema's only real foreign keys;
+- The three solid relationships are the schema's only real foreign keys;
   dashed ones are soft joins the code performs.
 - `gc_candidates` is write-only (no reader exists yet; its entry paths are the
   [catalog GC candidates](#catalog-gc-candidates-what-gets-remembered-for-removal)

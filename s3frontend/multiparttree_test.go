@@ -300,6 +300,32 @@ func TestMultipartTree(t *testing.T) {
 		assertObjectTree(t, b, key, whole)
 	})
 
+	t.Run("duplicate Complete replays after the trees are gone", func(t *testing.T) {
+		// Complete deletes the parts' trees, so a duplicate request sees
+		// none. It must replay the committed ETag, never weigh the missing
+		// trees against the budget: with no budget at all, the two
+		// non-final parts would otherwise count as a re-hash of the whole
+		// object.
+		parts := [][]byte{taggedBody(minPart, 0xa1), taggedBody(minPart, 0xa2), taggedBody(70<<10, 0xa3)}
+		key := "replay"
+		uploadID, completed, whole := uploadAll(t, b, key, parts, []int32{1, 2, 3})
+		first, err := mpComplete(t, b, key, uploadID, completed, nil)
+		if err != nil {
+			t.Fatalf("Complete: %v", err)
+		}
+		saved := b.rehashBudget
+		b.rehashBudget = 0
+		defer func() { b.rehashBudget = saved }()
+		again, err := mpComplete(t, b, key, uploadID, completed, nil)
+		if err != nil {
+			t.Fatalf("duplicate Complete: %v", err)
+		}
+		if *again.ETag != *first.ETag {
+			t.Fatalf("duplicate Complete returned ETag %s, want the committed %s", *again.ETag, *first.ETag)
+		}
+		assertObjectTree(t, b, key, whole)
+	})
+
 	t.Run("single part", func(t *testing.T) {
 		for _, n := range []int{0, 1, 1024, 3000, 100_000} {
 			key := "single"

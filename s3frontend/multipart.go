@@ -536,7 +536,10 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 	if input.MultipartUpload == nil || len(input.MultipartUpload.Parts) == 0 {
 		return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrInvalidPart)
 	}
-	stored, err := b.multipart.ListPartsWithTrees(ctx, uploadID)
+	// Without the trees: validation and the replay of a completed upload
+	// need part numbers, sizes, ETags and checksums only, and the trees are
+	// gone once an upload completes. The winner loads them after the latch.
+	stored, err := b.multipart.ListParts(ctx, uploadID)
 	if err != nil {
 		return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: list parts: %w", err)
 	}
@@ -636,16 +639,6 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 		}
 		trueOffsets = append(trueOffsets, total)
 		total += sp.Size
-	}
-	// The object's digest is assembled from the parts' trees. A non-final
-	// part hashed at a wrong assumed offset (variable sizes uploaded out of
-	// order) is read back from its storage node first, within a budget;
-	// over it the completion is refused here, before any part is accepted,
-	// and the upload stays open for a retry.
-	if need := rehashNeeded(requested, trueOffsets); need > b.rehashBudget {
-		b.logger.Info("multipart completion refused: re-hash over budget",
-			zap.String("key", key), zap.Int("parts", len(requested)), zap.Int64("size", total), zap.Int64("rehash", need), zap.Int64("budget", b.rehashBudget))
-		return s3response.CompleteMultipartUploadResult{}, "", errPartLayoutOverBudget(need, b.rehashBudget)
 	}
 	if input.MpuObjectSize != nil {
 		if *input.MpuObjectSize < 0 {
@@ -760,6 +753,31 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 			_, _ = b.multipart.LatchSession(ctx, uploadID, registry.SessionCompleting, registry.SessionOpen)
 		}
 	}()
+
+	// The winner alone needs the parts' trees: the object's digest is
+	// assembled from them, and a non-final part hashed at a wrong assumed
+	// offset (variable sizes uploaded out of order) is read back from its
+	// storage node first, within a budget. Over it the completion is refused
+	// here, before any part is accepted, and the revert above reopens the
+	// upload for a retry. A replay never gets here, which matters because a
+	// completed upload's trees are deleted (below) and would count as
+	// re-hash in full.
+	withTrees, err := b.multipart.ListPartsWithTrees(ctx, uploadID)
+	if err != nil {
+		return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: list part trees: %w", err)
+	}
+	treeByNum := make(map[int]*registry.PartTree, len(withTrees))
+	for _, p := range withTrees {
+		treeByNum[p.PartNumber] = p.Tree
+	}
+	for i := range requested {
+		requested[i].Tree = treeByNum[requested[i].PartNumber]
+	}
+	if need := rehashNeeded(requested, trueOffsets); need > b.rehashBudget {
+		b.logger.Info("multipart completion refused: re-hash over budget",
+			zap.String("key", key), zap.Int("parts", len(requested)), zap.Int64("size", total), zap.Int64("rehash", need), zap.Int64("budget", b.rehashBudget))
+		return s3response.CompleteMultipartUploadResult{}, "", errPartLayoutOverBudget(need, b.rehashBudget)
+	}
 
 	// Assemble the ordered body: each part's byte span (it may span several
 	// blobs) is recorded so a later GET/HEAD ?partNumber=N can address it (§7.2).
