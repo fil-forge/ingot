@@ -810,7 +810,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 	// re-reading a part only where its record cannot serve (bounded above,
 	// before the parts were accepted).
 	body := msbucket.Body{Size: offset, Blobs: blobs, PartSizes: partSizes, PartChecksums: partChecksums}
-	tree, err := b.multipartTree(ctx, bucketState.Space, requested, partOffsets, body)
+	tree, err := b.multipartTree(ctx, bucketState.Space, sess.Plaintext, requested, partOffsets, body)
 	if err != nil {
 		return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: object tree: %w", err)
 	}

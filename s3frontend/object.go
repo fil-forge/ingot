@@ -1254,7 +1254,7 @@ func (b *Backend) headObject(ctx context.Context, input *s3.HeadObjectInput) (*s
 		return nil, nil, s3err.GetAPIError(s3err.ErrNoSuchKey)
 	}
 	if err := rejectEncryptionHeaders(ctx); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	versionID := backend.GetStringFromPtr(input.VersionId)
 	rv, err := b.resolveVersion(ctx, *input.Bucket, *input.Key, versionID)

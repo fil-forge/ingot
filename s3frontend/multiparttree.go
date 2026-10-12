@@ -139,12 +139,12 @@ func treeRange(t *registry.PartTree, size int64) (blake3tree.Range, error) {
 // from its parts' records, re-reading only the parts whose assumed offset
 // was wrong or whose record cannot serve. parts are the completed parts in
 // order, offsets their true byte offsets in body, and body the assembled
-// object (its blobs are what a re-hash reads). The caller has already held
+// object (its blobs are what a re-hash reads, decrypting unless plaintext). The caller has already held
 // the non-final re-read within the budget (rehashNeeded). Parts' trees that
 // fail the assembly's consistency check are an error: the object is
 // committed neither with a digest that might be wrong nor without one.
-func (b *Backend) multipartTree(ctx context.Context, space did.DID, parts []registry.MultipartPart, offsets []int64, body msbucket.Body) (blake3tree.Object, error) {
-	src := &bodySource{b: b, space: space, body: body}
+func (b *Backend) multipartTree(ctx context.Context, space did.DID, plaintext bool, parts []registry.MultipartPart, offsets []int64, body msbucket.Body) (blake3tree.Object, error) {
+	src := &bodySource{b: b, space: space, body: body, plaintext: plaintext}
 	ranges := make([]blake3tree.Range, 0, len(parts))
 	for i, p := range parts {
 		if p.Tree != nil && p.Tree.Offset == offsets[i] {
@@ -171,15 +171,16 @@ func (b *Backend) multipartTree(ctx context.Context, space did.DID, parts []regi
 // bodySource re-reads a completing body's plaintext for the tree, through
 // one opener built on first use and shared by every range.
 type bodySource struct {
-	b      *Backend
-	space  did.DID
-	body   msbucket.Body
-	opened msbucket.BlobRangeOpener
+	b         *Backend
+	space     did.DID
+	body      msbucket.Body
+	plaintext bool
+	opened    msbucket.BlobRangeOpener
 }
 
 func (s *bodySource) opener(ctx context.Context) (msbucket.BlobRangeOpener, error) {
 	if s.opened == nil {
-		o, err := s.b.bodyOpener(ctx, s.space, s.body)
+		o, err := s.b.bodyOpener(ctx, s.space, s.body, s.plaintext)
 		if err != nil {
 			return nil, err
 		}
