@@ -80,7 +80,7 @@ Cross-references: [`architecture.md` §9](./architecture.md#9-the-system-contrac
 (implementation status).
 
 Sources: `module.go`, `bucketauthority/service.go`, `iam/service.go`,
-`policy_routes.go`, `forgeclient/`, `uploader/blob.go`, `blockstore/forge.go`.
+`s3frontend/policy.go`, `forgeclient/`, `uploader/blob.go`, `blockstore/forge.go`.
 Review when these change.
 
 ## Package map and interface seams
@@ -850,12 +850,11 @@ Review when these change.
 
 Every request is authorized against hilt (or its cached delegations), and
 the proofs captured here are what the rest of the request spends. Versitygw's
-root account is disabled, so no access key bypasses this path. The one
-exception is the bucket policy operations (GET, PUT and DELETE on
-`/{bucket}?policy`): `policy_routes.go` answers them ahead of versitygw's
-route table and auth, forwarding the signed request to `/s3/bucket/policy`,
-where hilt authenticates and authorizes it itself. They capture no proofs and
-never reach `iam.Service`.
+root account is disabled, so no access key bypasses this path. The bucket
+policy operations (GET, PUT and DELETE on `/{bucket}?policy`) take it too,
+through versitygw's own controllers; the backend (`s3frontend/policy.go`)
+then forwards the signed request to `/s3/bucket/policy`, where hilt
+authenticates and authorizes it again and keeps the document.
 
 ```mermaid
 sequenceDiagram
@@ -904,14 +903,19 @@ sequenceDiagram
   stay 500-class on purpose.
 - The signing key never leaves hilt as a secret: ingot receives a derived
   SigV4 key per request (the versitygw fork's `auth.Account.SigningKey`).
-- The policy routes mount ahead of every gateway middleware, so they apply
-  the bucket CORS rules and start their server span themselves; a hilt
-  rejection renders through the same `mapAuthError` mapping.
+- A policy document reaches hilt only after versitygw's PutBucketPolicy
+  controller has validated its AWS shape; `iam.Service.GetUserAccount`
+  answers that validation's principal lookups for any well-formed user ARN.
+  GetBucketPolicy forwards only a signed GET ?policy: versitygw's own access
+  checks call it too and get the stub answer, so versitygw never evaluates a
+  policy. A hilt rejection renders through the same `mapAuthError` mapping;
+  a gateway middleware (`policyHeaders`) adds the response ETag the backend
+  leaves in a reqscope holder, and a GET's JSON content type.
 
 Sources: `iam/service.go` (GetUserAccountForRequest, authorizeLocal,
 cacheProofs, mapAuthError), `iam/proofcache.go` (PutPermissions, Permits),
-`server.go` (buildS3API middleware), `policy_routes.go`. Review when `iam/`,
-`policy_routes.go` or the hilt client changes.
+`server.go` (buildS3API middleware, policyHeaders), `s3frontend/policy.go`.
+Review when `iam/`, `s3frontend/policy.go` or the hilt client changes.
 
 ## Postgres schema as migrated
 
@@ -1124,4 +1128,4 @@ listed diagrams (each diagram's `Sources:` footer names its exact files).
 | `bucket/`, `mst/` | version-tree, put, get |
 | `migrations/sql/` | schema, plus any state diagram naming a changed CHECK |
 | `module.go`, `server.go`, `config/` | packages, context, logstore-pipeline; `server.go` also authorize |
-| `policy_routes.go` | context, authorize |
+| `s3frontend/policy.go` | context, authorize |

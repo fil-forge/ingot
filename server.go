@@ -257,7 +257,7 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		Logger:              logger,
 	})
 
-	api, err := buildS3API(ctx, backend, cfg, deps.IAM, deps.Identity, deps.Authority, logger)
+	api, err := buildS3API(ctx, backend, cfg, deps.IAM, deps.Identity, logger)
 	if err != nil {
 		// Best-effort cleanup if we got past the log open: the caller
 		// has no Server handle to call Stop on.
@@ -672,7 +672,7 @@ func newBucketFlushFunc(up uploader.Uploader, reg registry.Registry, locations r
 // reaches hilt and so carries none of the delegations the Forge-facing
 // handlers need. The server also publishes id's DID document at
 // /.well-known/did.json.
-func buildS3API(ctx context.Context, backend *s3frontend.Backend, cfg config.ServerConfig, iam auth.IAMService, id identity.Identity, authority bucketauthority.BucketAuthority, logger *zap.Logger) (*s3api.S3ApiServer, error) {
+func buildS3API(ctx context.Context, backend *s3frontend.Backend, cfg config.ServerConfig, iam auth.IAMService, id identity.Identity, logger *zap.Logger) (*s3api.S3ApiServer, error) {
 	if iam == nil {
 		return nil, fmt.Errorf("ingot: IAMService is required")
 	}
@@ -702,7 +702,8 @@ func buildS3API(ctx context.Context, backend *s3frontend.Backend, cfg config.Ser
 		// keys like "../file.txt" are legal literal S3 keys and must round-trip.
 		s3api.WithDisableObjNameTraversalCheck(),
 		// Stash the signed S3 request on the context for every request. The
-		// bucket-authority seam (Create/Delete/ListBuckets) recovers it to
+		// bucket-authority seam (Create/Delete/ListBuckets, the bucket policy
+		// operations) recovers it to
 		// forward to Hilt; doing it here, ahead of auth, covers the presigned
 		// and POST-form auth paths as well as the header-signed one.
 		// The request's server span. First, so it times everything after
@@ -712,6 +713,7 @@ func buildS3API(ctx context.Context, backend *s3frontend.Backend, cfg config.Ser
 			c.Locals(reqscope.RequestKey(), fasthttputil.RequestFromHTTPContext(c.RequestCtx()))
 			return c.Next()
 		}),
+		s3api.WithMiddleware("/", policyHeaders),
 	}
 	// Public DID document for did:web resolution of the agent identity, so
 	// hilt/sprue/piri can verify ingot's UCAN signatures. WithRoute mounts
@@ -723,12 +725,6 @@ func buildS3API(ctx context.Context, backend *s3frontend.Backend, cfg config.Ser
 		return nil, fmt.Errorf("ingot: building the agent DID document: %w", err)
 	}
 	opts = append(opts, s3api.WithRoute(http.MethodGet, web.WellKnownDIDPath, didDocumentHandler(doc)))
-	// The bucket policy operations are answered here, ahead of the S3 route
-	// table: versitygw's PutBucketPolicy controller validates the body as an
-	// AWS-shaped document, which a Forge policy is not, and its backend seam
-	// carries neither the request's preconditions nor a response ETag. Hilt
-	// authenticates and authorizes the forwarded request itself.
-	opts = append(opts, policyRoutes(backend, authority, logger)...)
 
 	// No s3api.WithRootUser: the gateway has no root account, so every access
 	// key resolves through iam.
@@ -740,6 +736,26 @@ func buildS3API(ctx context.Context, backend *s3frontend.Backend, cfg config.Ser
 		return nil, fmt.Errorf("ingot: s3api: %w", err)
 	}
 	return api, nil
+}
+
+// policyHeaders adds what versitygw's bucket policy controllers leave out of
+// a ?policy response, since the backend seam returns only the document: the
+// ETag Hilt answered with, which the backend leaves in the request's
+// reqscope holder, and the JSON content type of a GetBucketPolicy document.
+func policyHeaders(c fiber.Ctx) error {
+	if !c.RequestCtx().QueryArgs().Has("policy") {
+		return c.Next()
+	}
+	etag := new(string)
+	c.Locals(reqscope.ETagKey(), etag)
+	err := c.Next()
+	if *etag != "" {
+		c.Set("ETag", *etag)
+	}
+	if c.Method() == http.MethodGet && c.Response().StatusCode() == http.StatusOK {
+		c.Set(fiber.HeaderContentType, fiber.MIMEApplicationJSON)
+	}
+	return err
 }
 
 // didDocumentHandler serves a fixed DID document as JSON. The document is
