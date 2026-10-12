@@ -629,11 +629,23 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 	// (backend.MinPartSize — an S3 constant clients and SDKs assume, not an
 	// operator knob).
 	var total int64
+	trueOffsets := make([]int64, 0, len(requested))
 	for i, sp := range requested {
 		if i < len(requested)-1 && sp.Size < backend.MinPartSize {
 			return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrEntityTooSmall)
 		}
+		trueOffsets = append(trueOffsets, total)
 		total += sp.Size
+	}
+	// The object's digest is assembled from the parts' trees. A non-final
+	// part hashed at a wrong assumed offset (variable sizes uploaded out of
+	// order) is read back from its storage node first, within a budget;
+	// over it the completion is refused here, before any part is accepted,
+	// and the upload stays open for a retry.
+	if need := rehashNeeded(requested, trueOffsets); need > b.rehashBudget {
+		b.logger.Info("multipart completion refused: re-hash over budget",
+			zap.String("key", key), zap.Int("parts", len(requested)), zap.Int64("size", total), zap.Int64("rehash", need), zap.Int64("budget", b.rehashBudget))
+		return s3response.CompleteMultipartUploadResult{}, "", errPartLayoutOverBudget(need, b.rehashBudget)
 	}
 	if input.MpuObjectSize != nil {
 		if *input.MpuObjectSize < 0 {
@@ -794,18 +806,16 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 		return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: accept parts: %w", err)
 	}
 
-	// The object's BLAKE3 digest and blocks, assembled from the parts' trees
-	// (re-reading a part only where its record cannot serve, within the
-	// re-hash budget; past it the object has no digest).
+	// The object's BLAKE3 digest and blocks, assembled from the parts' trees,
+	// re-reading a part only where its record cannot serve (bounded above,
+	// before the parts were accepted).
 	body := msbucket.Body{Size: offset, Blobs: blobs, PartSizes: partSizes, PartChecksums: partChecksums}
-	tree, hasTree, err := b.multipartTree(ctx, bucketState.Space, requested, partOffsets, body)
+	tree, err := b.multipartTree(ctx, bucketState.Space, requested, partOffsets, body)
 	if err != nil {
 		return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: object tree: %w", err)
 	}
-	if hasTree {
-		if err := body.SetTree(tree); err != nil {
-			return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: object tree: %w", err)
-		}
+	if err := body.SetTree(tree); err != nil {
+		return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: object tree: %w", err)
 	}
 
 	mf := &msbucket.ObjectManifest{

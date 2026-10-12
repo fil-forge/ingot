@@ -216,8 +216,8 @@ agent) and sets `Config.UploadServiceURL`/`UploadServiceDID` (sprue) +
 Viper/yaml-bindable (env prefix `INGOT_`, `.` → `_`). Key fields: `Enabled`,
 `Addr` (default `0.0.0.0:8080`), `DataDir`, `Region`, `MaxBlobSize`,
 `MultipartRehashBudget` (0 → 5 GiB; the re-read Complete allows for non-final
-parts hashed at a wrong assumed offset, past which the object gets no digest;
-the final part is always re-hashed), top-level
+parts hashed at a wrong assumed offset, past which Complete is refused with
+InvalidPartLayout; the final part is always re-hashed), top-level
 `SealBytes`/`SealAge`/`Retain` with a `CatalogPlane` `{SealBytes, SealAge,
 Ship, Retain}` override block (the only plane), `ReadCacheBytes` (0 → 256 MiB,
 <0 → off), `UploadServiceURL`/`UploadServiceDID`/`UploadReceiptsURL` (sprue),

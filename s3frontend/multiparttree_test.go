@@ -3,12 +3,16 @@ package s3frontend
 import (
 	"bytes"
 	"context"
-	"io"
+	"errors"
+	"net/http"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/fil-forge/versitygw/backend"
+	"github.com/fil-forge/versitygw/s3err"
 	"github.com/ipfs/go-cid"
 	mh "github.com/multiformats/go-multihash"
 	"github.com/valyala/fasthttp"
@@ -214,42 +218,50 @@ func TestMultipartTree(t *testing.T) {
 		assertObjectTree(t, b, "final-exempt", whole)
 	})
 
-	t.Run("re-hash over budget completes without a digest", func(t *testing.T) {
+	t.Run("re-hash over budget refuses the completion", func(t *testing.T) {
 		// Variable sizes uploaded in reverse: part 2 (non-final) is assumed
-		// wrongly, and with a budget below its size the object commits with
-		// its ETag and bytes but no digest.
+		// wrongly, and with a budget below its size Complete is refused as
+		// InvalidPartLayout before any part is accepted. The upload stays
+		// open, and the same Complete within the default budget commits the
+		// object with its digest.
 		saved := b.rehashBudget
 		b.rehashBudget = 1
 		defer func() { b.rehashBudget = saved }()
 		parts := [][]byte{taggedBody(minPart+4096, 0x81), taggedBody(minPart, 0x82), taggedBody(70<<10, 0x83)}
-		whole := completeAll(t, b, "over-budget", parts, []int32{3, 2, 1})
 		bucket, key := "bk", "over-budget"
-		rc := &fasthttp.RequestCtx{}
-		head, err := b.HeadObject(rc, &s3.HeadObjectInput{Bucket: &bucket, Key: &key})
-		if err != nil {
-			t.Fatal(err)
+		uploadID := mpCreate(t, b, key, "", "")
+		etags := make([]*string, len(parts))
+		for _, pn := range []int32{3, 2, 1} {
+			n := int64(len(parts[pn-1]))
+			out, err := mpUploadPart(t, b, key, uploadID, pn, parts[pn-1], func(in *s3.UploadPartInput) { in.ContentLength = &n })
+			if err != nil {
+				t.Fatalf("UploadPart %d: %v", pn, err)
+			}
+			etags[pn-1] = out.ETag
 		}
-		if got := rc.Response.Header.Peek(cidHeader); len(got) != 0 {
-			t.Fatalf("x-cid %q set on an object completed over budget", got)
+		var completed []types.CompletedPart
+		var whole []byte
+		for i := range parts {
+			pn := int32(i + 1)
+			completed = append(completed, types.CompletedPart{PartNumber: &pn, ETag: etags[i]})
+			whole = append(whole, parts[i]...)
 		}
-		if *head.ContentLength != int64(len(whole)) {
-			t.Fatalf("ContentLength %d, want %d", *head.ContentLength, len(whole))
+		_, err := mpComplete(t, b, key, uploadID, completed, nil)
+		var apiErr s3err.APIError
+		if !errors.As(err, &apiErr) || apiErr.Code != "InvalidPartLayout" || apiErr.HTTPStatusCode != http.StatusBadRequest {
+			t.Fatalf("Complete over budget: err = %v, want InvalidPartLayout", err)
 		}
-		res, err := b.GetObjectAttributes(context.Background(), &s3.GetObjectAttributesInput{Bucket: &bucket, Key: &key})
-		if err != nil || res.Blake3 != nil {
-			t.Fatalf("Blake3 attribute present or error: %v", err)
+		if !strings.Contains(apiErr.Description, strconv.Itoa(minPart)) {
+			t.Fatalf("refusal names %q, want the %d bytes to re-hash", apiErr.Description, minPart)
 		}
-		out, err := b.GetObject(context.Background(), &s3.GetObjectInput{Bucket: &bucket, Key: &key})
-		if err != nil {
-			t.Fatal(err)
+		if _, err := b.HeadObject(&fasthttp.RequestCtx{}, &s3.HeadObjectInput{Bucket: &bucket, Key: &key}); err == nil {
+			t.Fatal("object exists after a refused Complete")
 		}
-		if got, _ := io.ReadAll(out.Body); !bytes.Equal(got, whole) {
-			t.Fatal("body differs")
-		}
-		// The same upload within the default budget gets its digest.
 		b.rehashBudget = DefaultRehashBudget
-		whole = completeAll(t, b, "within-budget", parts, []int32{3, 2, 1})
-		assertObjectTree(t, b, "within-budget", whole)
+		if _, err := mpComplete(t, b, key, uploadID, completed, nil); err != nil {
+			t.Fatalf("Complete within budget after the refusal: %v", err)
+		}
+		assertObjectTree(t, b, key, whole)
 	})
 
 	t.Run("single part", func(t *testing.T) {

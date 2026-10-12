@@ -142,7 +142,7 @@ chunks (under 1 KiB each, empty for the MiB-sized parts every mainstream
 client sends). Complete checks each assumed offset against the part's true
 one, re-hashes only the parts whose assumption was wrong (the final part always,
 the others within `multipart_rehash_budget`, one maximum part by default;
-past it the object commits without a digest), hashes the chunk straddling each part boundary
+past it Complete is refused with InvalidPartLayout and the upload stays open), hashes the chunk straddling each part boundary
 from the raw bytes, merges the parts' subtrees into the object's digest,
 builds its block list from their blocks, and checks the blocks against the
 digest. A single-part object takes its digest from part 1's own root. The

@@ -42,8 +42,8 @@ type Config struct {
 	// (variable-size parts uploaded out of order; 0 -> the default, one
 	// maximum part: 5 GiB). The final part, the one straggler a uniform
 	// upload produces, is always re-hashed. A completion that would need
-	// more re-reading commits the object without a BLAKE3 digest (no x-cid)
-	// rather than stall.
+	// more re-reading is refused (InvalidPartLayout) rather than stall; the
+	// budget bounds how long Complete may spend reading parts back.
 	MultipartRehashBudget int64 `mapstructure:"multipart_rehash_budget" yaml:"multipart_rehash_budget"`
 	// CORSAllowedOrigins lists the browser origins the S3 listener answers
 	// CORS for. Each entry is an exact origin ("https://app.example"), a

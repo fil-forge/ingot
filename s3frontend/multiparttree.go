@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/http"
 
 	"github.com/fil-forge/ucantone/did"
+	"github.com/fil-forge/versitygw/s3err"
 	"go.uber.org/zap"
 
 	"github.com/fil-forge/ingot/blake3tree"
@@ -61,9 +63,39 @@ func assumedPartOffset(prior []registry.MultipartPart, partNumber int, size int6
 // part size. The final part is exempt: in a uniform-size upload it is the
 // only part whose assumption can fail (it lands before any predecessor and
 // its own size stands in), so it is always re-hashed when wrong, bounded by
-// the part maximum. The budget therefore governs only variable-size uploads,
-// and Complete stays within seconds of local reading either way.
+// the part maximum. The budget therefore governs only variable-size parts
+// uploaded out of order, and bounds how long Complete spends reading parts
+// back from their storage nodes. A completion that would need more is
+// refused (errPartLayoutOverBudget); an object is never committed without
+// its digest.
 const DefaultRehashBudget = 5 << 30 // 5 GiB
+
+// rehashNeeded is the byte count of the non-final parts whose assumed
+// offset was wrong, or whose tree was not recorded, which Complete must
+// read back to hash. parts are the completed parts in order and offsets
+// their true byte offsets in the object.
+func rehashNeeded(parts []registry.MultipartPart, offsets []int64) int64 {
+	var n int64
+	for i := 0; i+1 < len(parts); i++ {
+		if p := parts[i]; p.Tree == nil || p.Tree.Offset != offsets[i] {
+			n += p.Size
+		}
+	}
+	return n
+}
+
+// errPartLayoutOverBudget refuses a Complete whose re-hash would exceed the
+// budget: a 400 the client resolves by uploading parts of one size, or in
+// part-number order, and completing again. (Not in the versitygw error
+// table, hence built here.)
+func errPartLayoutOverBudget(need, budget int64) s3err.APIError {
+	return s3err.APIError{
+		Code: "InvalidPartLayout",
+		Description: fmt.Sprintf("The parts were uploaded out of order with varying sizes, so %d bytes would have to be read back to compute the object's digest, over this server's limit of %d bytes. "+
+			"Upload parts of one size (the last part may be shorter), or upload them in part-number order, then complete the upload again.", need, budget),
+		HTTPStatusCode: http.StatusBadRequest,
+	}
+}
 
 // partTreeOf serializes a part's finished tree for its record.
 func partTreeOf(rng blake3tree.Range) *registry.PartTree {
@@ -105,26 +137,14 @@ func treeRange(t *registry.PartTree, size int64) (blake3tree.Range, error) {
 
 // multipartTree computes the tree material of a completed multipart body
 // from its parts' records, re-reading only the parts whose assumed offset
-// was wrong: the final part whenever it was, the others within the re-hash
-// budget. parts are the completed
-// parts in order, offsets their true byte offsets in body, and body the
-// assembled object (its blobs are what a re-hash reads). ok is false when
-// the body gets no digest: the re-read needed exceeds the budget, or the
-// parts' trees fail the assembly's consistency check. Neither is an error
-// for the completion; the object simply has no x-cid.
-func (b *Backend) multipartTree(ctx context.Context, space did.DID, parts []registry.MultipartPart, offsets []int64, body msbucket.Body) (_ blake3tree.Object, ok bool, err error) {
+// was wrong or whose record cannot serve. parts are the completed parts in
+// order, offsets their true byte offsets in body, and body the assembled
+// object (its blobs are what a re-hash reads). The caller has already held
+// the non-final re-read within the budget (rehashNeeded). Parts' trees that
+// fail the assembly's consistency check are an error: the object is
+// committed neither with a digest that might be wrong nor without one.
+func (b *Backend) multipartTree(ctx context.Context, space did.DID, parts []registry.MultipartPart, offsets []int64, body msbucket.Body) (blake3tree.Object, error) {
 	src := &bodySource{b: b, space: space, body: body}
-	var rehash int64
-	for i, p := range parts[:len(parts)-1] {
-		if p.Tree == nil || p.Tree.Offset != offsets[i] {
-			rehash += p.Size
-		}
-	}
-	if rehash > b.rehashBudget {
-		b.logger.Info("multipart object completes without a BLAKE3 digest: re-hash over budget",
-			zap.Int("parts", len(parts)), zap.Int64("size", body.Size), zap.Int64("rehash", rehash), zap.Int64("budget", b.rehashBudget))
-		return blake3tree.Object{}, false, nil
-	}
 	ranges := make([]blake3tree.Range, 0, len(parts))
 	for i, p := range parts {
 		if p.Tree != nil && p.Tree.Offset == offsets[i] {
@@ -137,17 +157,15 @@ func (b *Backend) multipartTree(ctx context.Context, space did.DID, parts []regi
 		}
 		rng, err := src.rehash(ctx, offsets[i], offsets[i]+p.Size)
 		if err != nil {
-			return blake3tree.Object{}, false, err
+			return blake3tree.Object{}, err
 		}
 		ranges = append(ranges, rng)
 	}
 	obj, ok := blake3tree.Assemble(ranges)
 	if !ok {
-		b.logger.Warn("multipart object completes without a BLAKE3 digest: the parts' trees do not assemble into one body",
-			zap.Int("parts", len(parts)), zap.Int64("size", body.Size))
-		return blake3tree.Object{}, false, nil
+		return blake3tree.Object{}, fmt.Errorf("the trees of %d parts do not assemble into one %d-byte body", len(parts), body.Size)
 	}
-	return obj, true, nil
+	return obj, nil
 }
 
 // bodySource re-reads a completing body's plaintext for the tree, through

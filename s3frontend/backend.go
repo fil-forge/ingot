@@ -258,10 +258,10 @@ type Deps struct {
 	// as received. Off, the deployment stores every object encrypted.
 	AllowNoneEncryption bool
 
-	// RehashBudget bounds the bytes CompleteMultipartUpload re-reads to
+	// RehashBudget bounds the bytes CompleteMultipartUpload reads back to
 	// hash non-final parts whose assumed object offset was wrong (0 →
-	// DefaultRehashBudget); the final part is always re-hashed. An upload
-	// needing more completes without a BLAKE3 digest.
+	// DefaultRehashBudget); the final part is always re-hashed. A completion
+	// needing more is refused with InvalidPartLayout.
 	RehashBudget int64
 
 	// CORS is the S3 CORS configuration GetBucketCors reports for every
