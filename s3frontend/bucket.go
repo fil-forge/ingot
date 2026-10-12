@@ -156,21 +156,6 @@ func (b *Backend) PutObjectLockConfiguration(ctx context.Context, bucket string,
 	return nil
 }
 
-// GetBucketPolicy is called from auth.VerifyAccess (access-control.go)
-// for authenticated accounts below the admin role and from
-// auth.VerifyPublicAccess for anonymous ones. Hilt-authorized accounts
-// carry the admin role and short-circuit before this is hit, but stubbing
-// it keeps the anonymous path from tripping the same NotImplemented trap.
-func (b *Backend) GetBucketPolicy(ctx context.Context, bucket string) ([]byte, error) {
-	if _, err := b.reg.Get(ctx, bucket); err != nil {
-		if errors.Is(err, registry.ErrNotFound) {
-			return nil, s3err.GetAPIError(s3err.ErrNoSuchBucket)
-		}
-		return nil, err
-	}
-	return nil, s3err.GetAPIError(s3err.ErrNoSuchBucketPolicy)
-}
-
 // GetBucketVersioning reports the bucket's versioning configuration. A bucket
 // that has never been configured returns an empty <VersioningConfiguration/>
 // (nil Status); once configured, the status is Enabled or Suspended. Also
