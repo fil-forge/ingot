@@ -562,7 +562,7 @@ func TestSweepLocalBlobs_EvictsAParkedBlob(t *testing.T) {
 	if err := mem.PutIntent(ctx, registry.UploadIntent{Space: sweepSpace(t, mem), Digest: d, LocalPath: localPath(b, d), Size: n, State: registry.IntentParked}); err != nil {
 		t.Fatalf("PutIntent: %v", err)
 	}
-	if err := mem.PutPark(ctx, registry.BlobPark{Space: sweepSpace(t, mem), Digest: d, Size: n}); err != nil {
+	if _, err := mem.PutPark(ctx, registry.BlobPark{Space: sweepSpace(t, mem), Digest: d, Size: n}); err != nil {
 		t.Fatalf("PutPark: %v", err)
 	}
 

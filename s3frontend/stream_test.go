@@ -401,10 +401,11 @@ func TestSweepStaleStreamsKeepsParkedBlob(t *testing.T) {
 	require.NoError(t, mem.PutStream(ctx, registry.BlobStream{
 		AddTask: addTask, Bucket: "bk", CreatedAt: time.Now().Add(-time.Hour),
 	}))
-	require.NoError(t, mem.PutPark(ctx, registry.BlobPark{
+	_, err := mem.PutPark(ctx, registry.BlobPark{
 		Space: did.Undef, Digest: mustSum([]byte("parked blob")), AddTask: addTask,
 		AcceptTask: addTask, PutInvocation: []byte("put"), Size: 1,
-	}))
+	})
+	require.NoError(t, err)
 
 	n, err := b.SweepStaleStreams(ctx)
 	require.NoError(t, err)

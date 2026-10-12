@@ -141,7 +141,7 @@ func runEvictionSuite(t *testing.T, fresh func(t *testing.T) evictStore) {
 			}
 		}
 		if parked {
-			if err := st.PutPark(ctx, registry.BlobPark{Space: space, Digest: d, AddTask: []byte{1}, AcceptTask: []byte{2}, PutInvocation: []byte{3}, Size: 7}); err != nil {
+			if _, err := st.PutPark(ctx, registry.BlobPark{Space: space, Digest: d, AddTask: []byte{1}, AcceptTask: []byte{2}, PutInvocation: []byte{3}, Size: 7}); err != nil {
 				t.Fatalf("PutPark: %v", err)
 			}
 		}
@@ -431,13 +431,13 @@ func runEvictionSuite(t *testing.T, fresh func(t *testing.T) evictStore) {
 		st := fresh(t)
 		d := evictDigest(t, "parked-twice")
 		other := testutil.RandomDID(t)
-		if err := st.PutPark(ctx, registry.BlobPark{Space: space, Digest: d, AddTask: []byte{1}, AcceptTask: []byte{2}, PutInvocation: []byte{3}, Size: 7}); err != nil {
+		if _, err := st.PutPark(ctx, registry.BlobPark{Space: space, Digest: d, AddTask: []byte{1}, AcceptTask: []byte{2}, PutInvocation: []byte{3}, Size: 7}); err != nil {
 			t.Fatalf("PutPark: %v", err)
 		}
 		if _, err := st.GetPark(ctx, other, d); !errors.Is(err, registry.ErrNotFound) {
 			t.Fatalf("GetPark in another space err = %v, want ErrNotFound", err)
 		}
-		if err := st.PutPark(ctx, registry.BlobPark{Space: other, Digest: d, AddTask: []byte{4}, AcceptTask: []byte{5}, PutInvocation: []byte{6}, Size: 7}); err != nil {
+		if _, err := st.PutPark(ctx, registry.BlobPark{Space: other, Digest: d, AddTask: []byte{4}, AcceptTask: []byte{5}, PutInvocation: []byte{6}, Size: 7}); err != nil {
 			t.Fatalf("PutPark: %v", err)
 		}
 		if err := st.DeletePark(ctx, other, d); err != nil {

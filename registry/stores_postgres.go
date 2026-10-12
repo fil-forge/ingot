@@ -339,26 +339,38 @@ func (r *Postgres) ListReleasesBySpace(ctx context.Context, space did.DID) ([]Pe
 	return out, nil
 }
 
-func (r *Postgres) DeleteIntentAndRelease(ctx context.Context, space did.DID, digest multihash.Multihash) error {
+func (r *Postgres) DeleteIntentAndRelease(ctx context.Context, space did.DID, digest multihash.Multihash) (int, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("registry: begin delete intent and release: %w", err)
+		return 0, fmt.Errorf("registry: begin delete intent and release: %w", err)
 	}
 	defer tx.Rollback(ctx)
+	// The digest's lock, not the claim key's: two spaces releasing the same
+	// digest take turns here, so exactly one of them counts no intent left.
+	if _, err := tx.Exec(ctx,
+		`SELECT pg_advisory_xact_lock(hashtextextended('intent:' || encode($1, 'hex'), 0))`,
+		[]byte(digest)); err != nil {
+		return 0, fmt.Errorf("registry: lock digest: %w", err)
+	}
 	if _, err := tx.Exec(ctx,
 		`DELETE FROM ingot.upload_intents WHERE space = $1 AND digest = $2`,
 		space, digest); err != nil {
-		return fmt.Errorf("registry: delete intent: %w", err)
+		return 0, fmt.Errorf("registry: delete intent: %w", err)
 	}
 	if _, err := tx.Exec(ctx,
 		`DELETE FROM ingot.blob_release_intents WHERE space = $1 AND digest = $2`,
 		space, digest); err != nil {
-		return fmt.Errorf("registry: delete release: %w", err)
+		return 0, fmt.Errorf("registry: delete release: %w", err)
+	}
+	var remaining int
+	if err := tx.QueryRow(ctx,
+		`SELECT count(*) FROM ingot.upload_intents WHERE digest = $1`, digest).Scan(&remaining); err != nil {
+		return 0, fmt.Errorf("registry: count remaining intents: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("registry: commit delete intent and release: %w", err)
+		return 0, fmt.Errorf("registry: commit delete intent and release: %w", err)
 	}
-	return nil
+	return remaining, nil
 }
 
 func (r *Postgres) DeleteRelease(ctx context.Context, space did.DID, digest multihash.Multihash) error {
@@ -754,18 +766,16 @@ func (r *Postgres) RewrapEncryptionParams(ctx context.Context, space did.DID, di
 
 // ParkStore ==================================================================
 
-func (r *Postgres) PutPark(ctx context.Context, p BlobPark) error {
-	_, err := r.pool.Exec(ctx,
+func (r *Postgres) PutPark(ctx context.Context, p BlobPark) (bool, error) {
+	tag, err := r.pool.Exec(ctx,
 		`INSERT INTO ingot.blob_parks (space, digest, add_task, accept_task, put_invocation, size)
 		 VALUES ($1, $2, $3, $4, $5, $6)
-		 ON CONFLICT (space, digest) DO UPDATE
-		   SET add_task = EXCLUDED.add_task, accept_task = EXCLUDED.accept_task,
-		       put_invocation = EXCLUDED.put_invocation, size = EXCLUDED.size`,
+		 ON CONFLICT (space, digest) DO NOTHING`,
 		p.Space, p.Digest, p.AddTask, p.AcceptTask, p.PutInvocation, p.Size)
 	if err != nil {
-		return fmt.Errorf("registry: put park: %w", err)
+		return false, fmt.Errorf("registry: put park: %w", err)
 	}
-	return nil
+	return tag.RowsAffected() == 1, nil
 }
 
 func (r *Postgres) GetPark(ctx context.Context, space did.DID, digest multihash.Multihash) (*BlobPark, error) {
@@ -1428,6 +1438,16 @@ func (r *Postgres) StartRelease(ctx context.Context, space did.DID, digest multi
 		return 0, fmt.Errorf("registry: start release count claims: %w", err)
 	}
 	if claims > 0 {
+		// Stale: deleted here, under the lock, so a replacement a later
+		// drop enqueues is never the one a caller deletes.
+		if _, err := tx.Exec(ctx,
+			`DELETE FROM ingot.blob_release_intents WHERE space = $1 AND digest = $2`,
+			space, digest); err != nil {
+			return 0, fmt.Errorf("registry: start release: delete stale record: %w", err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return 0, fmt.Errorf("registry: commit start release: %w", err)
+		}
 		return ReleaseClaimed, nil
 	}
 	if _, err := tx.Exec(ctx,

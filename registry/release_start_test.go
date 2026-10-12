@@ -1,6 +1,7 @@
 package registry_test
 
 import (
+	"context"
 	"errors"
 	"os"
 	"testing"
@@ -14,6 +15,7 @@ import (
 	"github.com/fil-forge/ingot/migrations"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/libforge/testutil"
+	"github.com/fil-forge/ucantone/did"
 )
 
 // releaseStartStore is what the release start and cancel need of a store.
@@ -21,6 +23,7 @@ type releaseStartStore interface {
 	registry.PendingReleaseStore
 	registry.BlobRefStore
 	registry.MultipartStore
+	registry.IntentStore
 }
 
 // TestReleaseStartLive runs the release start and cancel against the
@@ -133,8 +136,30 @@ func runReleaseStartSuite(t *testing.T, st releaseStartStore) {
 		if err != nil || got != registry.ReleaseClaimed {
 			t.Fatalf("StartRelease = %v, %v; want ReleaseClaimed", got, err)
 		}
-		if started(d) {
-			t.Fatalf("a refused start marked the record")
+		// Stale, and gone: deleted under the lock, so no caller deletes a
+		// replacement by key afterwards.
+		for _, pr := range mustListReleases(t, st, space) {
+			if string(pr.Digest) == string(d) {
+				t.Fatalf("a stale record survived its start: %+v", pr)
+			}
+		}
+	})
+
+	t.Run("the intent delete counts the intents other spaces keep", func(t *testing.T) {
+		d := enqueue("last-out")
+		other := testutil.RandomDID(t)
+		for _, sp := range []did.DID{space, other} {
+			if err := st.PutIntent(ctx, registry.UploadIntent{Space: sp, Digest: d, LocalPath: "/spool/x", Size: 7, State: registry.IntentPublished}); err != nil {
+				t.Fatalf("PutIntent: %v", err)
+			}
+		}
+		remaining, err := st.DeleteIntentAndRelease(ctx, space, d)
+		if err != nil || remaining != 1 {
+			t.Fatalf("DeleteIntentAndRelease with another space's intent = %d, %v; want 1", remaining, err)
+		}
+		remaining, err = st.DeleteIntentAndRelease(ctx, other, d)
+		if err != nil || remaining != 0 {
+			t.Fatalf("DeleteIntentAndRelease of the last intent = %d, %v; want 0", remaining, err)
 		}
 	})
 
@@ -243,4 +268,13 @@ func runReleaseStartSuite(t *testing.T, st releaseStartStore) {
 			}
 		}
 	})
+}
+
+func mustListReleases(t *testing.T, st registry.PendingReleaseStore, space did.DID) []registry.PendingRelease {
+	t.Helper()
+	rows, err := st.ListReleasesBySpace(context.Background(), space)
+	if err != nil {
+		t.Fatalf("ListReleasesBySpace: %v", err)
+	}
+	return rows
 }

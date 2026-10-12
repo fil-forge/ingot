@@ -312,7 +312,7 @@ func TestPostgresStores_Live(t *testing.T) {
 		if err := r.EnqueueRelease(ctx, space, d, time.Now()); err != nil {
 			t.Fatalf("EnqueueRelease: %v", err)
 		}
-		if err := r.DeleteIntentAndRelease(ctx, space, d); err != nil {
+		if _, err := r.DeleteIntentAndRelease(ctx, space, d); err != nil {
 			t.Fatalf("DeleteIntentAndRelease: %v", err)
 		}
 		if _, err := r.GetIntent(ctx, space, d); err != registry.ErrNotFound {
@@ -322,7 +322,7 @@ func TestPostgresStores_Live(t *testing.T) {
 			t.Fatalf("release records after the paired delete = %v, want none", rows)
 		}
 		// Idempotent: nothing left to delete is not an error.
-		if err := r.DeleteIntentAndRelease(ctx, space, d); err != nil {
+		if _, err := r.DeleteIntentAndRelease(ctx, space, d); err != nil {
 			t.Fatalf("repeated DeleteIntentAndRelease: %v", err)
 		}
 	})
@@ -511,20 +511,20 @@ func TestPostgresStores_Live(t *testing.T) {
 			PutInvocation: []byte("sealed-inv"),
 			Size:          42,
 		}
-		if err := r.PutPark(ctx, park); err != nil {
-			t.Fatalf("PutPark: %v", err)
+		if recorded, err := r.PutPark(ctx, park); err != nil || !recorded {
+			t.Fatalf("PutPark = %v, %v; want recorded", recorded, err)
 		}
 		got, err := r.GetPark(ctx, space, digest)
 		if err != nil || string(got.PutInvocation) != "sealed-inv" || got.Size != 42 {
 			t.Fatalf("GetPark = %+v, err %v", got, err)
 		}
-		// Upsert replaces in place.
+		// A second park for the key is refused and the first stands.
 		park.Size = 43
-		if err := r.PutPark(ctx, park); err != nil {
-			t.Fatalf("PutPark (upsert): %v", err)
+		if recorded, err := r.PutPark(ctx, park); err != nil || recorded {
+			t.Fatalf("PutPark (duplicate) = %v, %v; want refused", recorded, err)
 		}
-		if got, err := r.GetPark(ctx, space, digest); err != nil || got.Size != 43 {
-			t.Fatalf("GetPark after upsert = %+v, err %v", got, err)
+		if got, err := r.GetPark(ctx, space, digest); err != nil || got.Size != 42 {
+			t.Fatalf("GetPark after the refused put = %+v, err %v; want the first park", got, err)
 		}
 		if parked, err := r.HasParkFor(ctx, park.AddTask); err != nil || !parked {
 			t.Fatalf("HasParkFor(park's add task) = %v, %v", parked, err)

@@ -1060,7 +1060,7 @@ func TestUploadPartToleratesFailedStaleParkDelete(t *testing.T) {
 
 	// The stale row such a failure leaves behind, as a Complete that failed
 	// after recording the acceptance would.
-	if err := mem.PutPark(ctx, registry.BlobPark{Space: did.Undef, Digest: d, AddTask: []byte{1}, AcceptTask: []byte{1}, Size: 1}); err != nil {
+	if _, err := mem.PutPark(ctx, registry.BlobPark{Space: did.Undef, Digest: d, AddTask: []byte{1}, AcceptTask: []byte{1}, Size: 1}); err != nil {
 		t.Fatalf("PutPark: %v", err)
 	}
 	if _, err := mpComplete(t, b, key, uploadID, []types.CompletedPart{{PartNumber: &one, ETag: out.ETag}}, nil); err != nil {
@@ -1935,7 +1935,7 @@ func TestSweepLeavesALiveCompleteOnAnOldSession(t *testing.T) {
 		}
 		// Parked on a provider, so a release of it is an abort the fake records.
 		task := cid.NewCidV1(cid.Raw, d).Bytes()
-		if err := mem.PutPark(ctx, registry.BlobPark{Space: did.Undef, Digest: d, AddTask: task, AcceptTask: task, Size: 1}); err != nil {
+		if _, err := mem.PutPark(ctx, registry.BlobPark{Space: did.Undef, Digest: d, AddTask: task, AcceptTask: task, Size: 1}); err != nil {
 			t.Fatalf("PutPark %s: %v", id, err)
 		}
 		return d

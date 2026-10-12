@@ -580,6 +580,10 @@ func (b *Backend) uploadBlob(ctx context.Context, space did.DID, blob msbucket.B
 	ctx, span := tracing.Start(ctx, "blob.upload")
 	defer func() { tracing.End(span, err) }()
 
+	// One write of these bytes at a time for this space: a second finds the
+	// first's location and reuses it (see blobKeyLock).
+	defer b.blobKeys.lock(space, blob.Digest)()
+
 	digest := blob.Digest
 	// Whatever the rows say, no release of this digest may be running
 	// while the blob is uploaded or reused.
@@ -776,17 +780,12 @@ func (b *Backend) SweepPendingReleases(ctx context.Context) (int, error) {
 			}
 			continue
 		case releaseStale:
-			if err := b.pendingReleases.DeleteRelease(ctx, pr.Space, pr.Digest); err != nil {
-				b.logger.Warn("release sweep: delete stale record failed",
-					zap.String("digest", hex.EncodeToString(pr.Digest)), zap.Error(err))
-			}
+			// Gone already, deleted under the claim-key lock by the start
+			// that found it stale (see runRelease); a delete by key here
+			// could only take a replacement a later drop enqueued.
 			continue
 		case releaseDone:
-			if err := b.pendingReleases.DeleteRelease(ctx, pr.Space, pr.Digest); err != nil {
-				b.logger.Warn("release sweep: delete record failed",
-					zap.String("digest", hex.EncodeToString(pr.Digest)), zap.Error(err))
-				continue
-			}
+			// Gone already, with the intent, as the release's last step.
 			released++
 		}
 	}
@@ -816,13 +815,9 @@ func (b *Backend) releaseNow(ctx context.Context, records []registry.PendingRele
 		if pr.NotBefore.After(now) {
 			continue
 		}
-		switch b.runRelease(ctx, pr) {
-		case releaseDone, releaseStale:
-			if err := b.pendingReleases.DeleteRelease(ctx, pr.Space, pr.Digest); err != nil {
-				b.logger.Warn("release: delete record failed",
-					zap.String("digest", hex.EncodeToString(pr.Digest)), zap.Error(err))
-			}
-		}
+		// A record done or found stale is gone already (see runRelease);
+		// nothing is deleted here, where only a replacement could be found.
+		b.runRelease(ctx, pr)
 	}
 }
 
@@ -856,7 +851,10 @@ func (b *Backend) runRelease(ctx context.Context, pr registry.PendingRelease) re
 	case registry.ReleaseClaimed, registry.ReleaseCancelled:
 		// Re-claimed since enqueue (e.g. a commit that failed after its
 		// drop ran, then retried), or taken by a write that reuses the
-		// blob: the record is stale, not the claim.
+		// blob: the record is stale, not the claim, and it is gone, deleted
+		// under the lock by the start or by the write. No caller deletes it
+		// again: by then the key may name a replacement, enqueued by a drop
+		// of the new claim, that is not stale at all.
 		return releaseStale
 	}
 	if !b.executeRelease(ctx, pr) {
@@ -944,9 +942,7 @@ func (b *Backend) drainSpaceReleases(ctx context.Context, space did.DID) error {
 		case releaseDeferred:
 			return fmt.Errorf("release blob %x: a multipart session in flight still references it", pr.Digest)
 		}
-		if err := b.pendingReleases.DeleteRelease(ctx, pr.Space, pr.Digest); err != nil {
-			return fmt.Errorf("delete release record %x: %w", pr.Digest, err)
-		}
+		// Done or stale: the record is gone already (see runRelease).
 	}
 	return nil
 }
@@ -1122,9 +1118,23 @@ func (b *Backend) executeRelease(ctx context.Context, pr registry.PendingRelease
 				b.localBlobMetrics.removedFile(ctx, removedReleased, freed)
 			}
 		}
-		if err := b.pendingReleases.DeleteIntentAndRelease(ctx, space, digest); err != nil {
+		remaining, err := b.pendingReleases.DeleteIntentAndRelease(ctx, space, digest)
+		if err != nil {
 			log.Warn("release: delete upload intent with the release record failed", zap.Error(err))
 			ok = false
+			break
+		}
+		if remaining == 0 && (others > 0 || b.spool.Held(digest)) {
+			// The file was left for another space's intent, and that intent
+			// went meanwhile: its release counted this one and left the file
+			// too, so this release, the last out, takes it. A hold refuses
+			// the removal, and that write's own flow takes the file later.
+			freed, err := b.removeLocal(digest)
+			if err != nil && !errors.Is(err, blockstore.ErrHeld) {
+				log.Warn("release: remove the last intent's local blob copy failed; the orphan pass takes a spool file, a cached one waits for a write of the same bytes", zap.Error(err))
+			} else if err == nil {
+				b.localBlobMetrics.removedFile(ctx, removedReleased, freed)
+			}
 		}
 	}
 	return ok

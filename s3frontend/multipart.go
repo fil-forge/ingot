@@ -1109,6 +1109,10 @@ func (b *Backend) parkBlob(ctx context.Context, space did.DID, blob msbucket.Blo
 	ctx, span := tracing.Start(ctx, "blob.park")
 	defer func() { tracing.End(span, err) }()
 
+	// One write of these bytes at a time for this space: a second finds the
+	// first's park and reuses it (see blobKeyLock).
+	defer b.blobKeys.lock(space, blob.Digest)()
+
 	digest := blob.Digest
 	// Whatever the rows say, no release of this digest may be running
 	// while the blob is parked or reused (see settleRelease).
@@ -1186,14 +1190,25 @@ func (b *Backend) parkBlob(ctx context.Context, space did.DID, blob msbucket.Blo
 	// Location == nil ⇔ parked: durable on the provider with accept
 	// deferred — persist the conclude state for Complete/Abort.
 	span.SetAttributes(attribute.String("ingot.blob.result", "parked"))
-	if err := b.parks.PutPark(ctx, registry.BlobPark{
+	recorded, err := b.parks.PutPark(ctx, registry.BlobPark{
 		Space:         space,
 		Digest:        blob.Digest,
 		AddTask:       res.AddTask.Bytes(),
 		AcceptTask:    res.AcceptTask.Bytes(),
 		PutInvocation: res.PutInvocation,
 		Size:          in.Size,
-	}); err != nil {
+	})
+	if err == nil && !recorded {
+		// A write in another instance parked the same bytes for the space
+		// first; its park stands and this allocation is given up, or the
+		// provider would hold it until it expires.
+		span.SetAttributes(attribute.String("ingot.blob.result", "already_parked"))
+		if aerr := b.deferred.AbortBlob(ctx, space, res.AddTask); aerr != nil {
+			b.logger.Warn("abort of a duplicate park failed; the provider expires the allocation",
+				zap.String("digest", hex.EncodeToString(blob.Digest)), zap.Error(aerr))
+		}
+	}
+	if err != nil {
 		return fmt.Errorf("record park: %w", err)
 	}
 	if err := b.intents.SetIntentState(ctx, space, blob.Digest, registry.IntentParked); err != nil {
@@ -1227,20 +1242,27 @@ func (b *Backend) recordStreamedPark(ctx context.Context, space did.DID, blob ms
 	defer func() { tracing.End(span, err) }()
 
 	parked := sb.Parked(blob.Digest)
-	if err := b.parks.PutPark(ctx, registry.BlobPark{
+	recorded, err := b.parks.PutPark(ctx, registry.BlobPark{
 		Space:         space,
 		Digest:        blob.Digest,
 		AddTask:       parked.AddTask.Bytes(),
 		AcceptTask:    parked.AcceptTask.Bytes(),
 		PutInvocation: parked.PutInvocation,
 		Size:          parked.Size,
-	}); err != nil {
+	})
+	if err != nil {
 		return fmt.Errorf("record park: %w", err)
+	}
+	if !recorded {
+		// A write in another instance parked the same bytes for the space
+		// first; its park stands and this stream is given up.
+		b.abandonStream(ctx, space, sb)
+	} else {
+		b.finishStream(ctx, sb)
 	}
 	if err := b.intents.SetIntentState(ctx, space, blob.Digest, registry.IntentParked); err != nil {
 		return fmt.Errorf("mark parked: %w", err)
 	}
-	b.finishStream(ctx, sb)
 	b.dropParkedCopy(ctx, space, blob.Digest)
 	return nil
 }
@@ -1395,26 +1417,41 @@ func (b *Backend) concludeBlobs(ctx context.Context, space did.DID, blobs []msbu
 
 	// Never parked: the spooled copy drives the whole synchronous upload.
 	for _, blob := range toUpload {
-		in, err := b.intents.GetIntent(ctx, space, blob.Digest)
-		if err != nil {
-			return fmt.Errorf("lookup intent: %w", err)
-		}
-		// The blob may be on the network from here on (see IntentUploading).
-		if err := b.intents.SetIntentState(ctx, space, blob.Digest, registry.IntentUploading); err != nil {
-			return fmt.Errorf("mark uploading: %w", err)
-		}
-		res, err := b.uploader.UploadBlob(ctx, space, blob.Digest, in.Size, b.spool.Path(blob.Digest))
-		if err != nil {
-			return fmt.Errorf("upload blob: %w", err)
-		}
-		if res.Location == nil {
-			return fmt.Errorf("upload blob %x: concluding upload returned no location", blob.Digest)
-		}
-		if err := b.recordAccepted(ctx, space, blob.Digest, *res.Location); err != nil {
+		if err := b.uploadNeverParked(ctx, space, blob); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// uploadNeverParked is Complete's fallback for a part blob that never
+// parked, under the (space, digest) lock that every write of the bytes
+// takes (see blobKeyLock), so a part upload of the same bytes meanwhile
+// finds this upload's location rather than allocating beside it.
+func (b *Backend) uploadNeverParked(ctx context.Context, space did.DID, blob msbucket.BlobRef) error {
+	defer b.blobKeys.lock(space, blob.Digest)()
+	if existing, err := b.locations.GetLocation(ctx, space, blob.Digest); err == nil && existing != nil {
+		// Located while this waited for the lock.
+		return b.intents.SetIntentState(ctx, space, blob.Digest, registry.IntentAccepted)
+	} else if err != nil && !errors.Is(err, registry.ErrNotFound) {
+		return fmt.Errorf("lookup location: %w", err)
+	}
+	in, err := b.intents.GetIntent(ctx, space, blob.Digest)
+	if err != nil {
+		return fmt.Errorf("lookup intent: %w", err)
+	}
+	// The blob may be on the network from here on (see IntentUploading).
+	if err := b.intents.SetIntentState(ctx, space, blob.Digest, registry.IntentUploading); err != nil {
+		return fmt.Errorf("mark uploading: %w", err)
+	}
+	res, err := b.uploader.UploadBlob(ctx, space, blob.Digest, in.Size, b.spool.Path(blob.Digest))
+	if err != nil {
+		return fmt.Errorf("upload blob: %w", err)
+	}
+	if res.Location == nil {
+		return fmt.Errorf("upload blob %x: concluding upload returned no location", blob.Digest)
+	}
+	return b.recordAccepted(ctx, space, blob.Digest, *res.Location)
 }
 
 // recordAccepted persists an accepted blob's location and marks its intent.

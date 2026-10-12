@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -587,5 +589,181 @@ func TestPlaintextRelease_StreamedWriteWaitsOutAStartedRelease(t *testing.T) {
 	}
 	if got := getFrom(t, b, "bk", "new"); !bytes.Equal(got, data) {
 		t.Fatalf("the rewritten object does not read back")
+	}
+}
+
+// TestPlaintextSpaces_ConcurrentWritesOfTheSameBytesUploadOnce: two writes
+// of the same bytes to one space at the same time take turns at the upload
+// (blobKeyLock): the second finds the first's location and reuses it, so
+// the provider is asked for the bytes once.
+func TestPlaintextSpaces_ConcurrentWritesOfTheSameBytesUploadOnce(t *testing.T) {
+	up := &countingUploader{calls: map[string]int{}}
+	b, _ := newDeferredBackend(t, up)
+	setNone(t, b)
+	data := testBody(8 << 10)
+	d := digestOf(t, data)
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 4)
+	for i := range 4 {
+		wg.Add(1)
+		go func(key string) {
+			defer wg.Done()
+			bucket := "bk"
+			_, err := b.PutObject(context.Background(), s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(data)})
+			errs <- err
+		}(fmt.Sprintf("k%d", i))
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("PutObject: %v", err)
+		}
+	}
+	up.mu.Lock()
+	uploads := up.calls[string(d)]
+	up.mu.Unlock()
+	if uploads != 1 {
+		t.Fatalf("uploads of %x by four concurrent writes = %d, want 1", d, uploads)
+	}
+	for i := range 4 {
+		if got := getFrom(t, b, "bk", fmt.Sprintf("k%d", i)); !bytes.Equal(got, data) {
+			t.Fatalf("k%d does not read back", i)
+		}
+	}
+}
+
+// TestPlaintextSpaces_ConcurrentPartsOfTheSameBytesParkOnce: two part
+// uploads of the same bytes to one space at the same time park once; the
+// second finds the first's park. The parking fake accepts outright, so the
+// count is of uploads.
+func TestPlaintextSpaces_ConcurrentPartsOfTheSameBytesParkOnce(t *testing.T) {
+	up := &countingUploader{calls: map[string]int{}}
+	b, mem := newDeferredBackend(t, up)
+	setNone(t, b)
+	part := testBody(5 << 20)
+	d := digestOf(t, part)
+
+	var wg sync.WaitGroup
+	ids := make(chan string, 3)
+	for i := range 3 {
+		wg.Add(1)
+		go func(key string) {
+			defer wg.Done()
+			id, _ := uploadOnePart(t, b, "bk", key, part)
+			ids <- id
+		}(fmt.Sprintf("mp%d", i))
+	}
+	wg.Wait()
+	close(ids)
+	for id := range ids {
+		if got := hygienePartDigests(t, mem, id, 1)[0]; !bytes.Equal(got, d) {
+			t.Fatalf("part of %s stored under %x, want %x", id, got, d)
+		}
+	}
+	up.mu.Lock()
+	uploads := up.calls[string(d)]
+	up.mu.Unlock()
+	if uploads != 1 {
+		t.Fatalf("uploads of %x by three concurrent part uploads = %d, want 1", d, uploads)
+	}
+}
+
+// staleThenReplaced is a release store that, when a start finds a record
+// stale, enqueues a replacement for the digest right after, as a drop of the
+// new claim that lands between the stale decision and a delete by key would.
+type staleThenReplaced struct {
+	registry.PendingReleaseStore
+	replaced int
+}
+
+func (s *staleThenReplaced) StartRelease(ctx context.Context, space did.DID, digest multihash.Multihash) (registry.ReleaseStart, error) {
+	r, err := s.PendingReleaseStore.StartRelease(ctx, space, digest)
+	if err == nil && r == registry.ReleaseClaimed {
+		s.replaced++
+		if err := s.PendingReleaseStore.EnqueueRelease(ctx, space, digest, time.Now().Add(time.Hour)); err != nil {
+			return 0, err
+		}
+	}
+	return r, err
+}
+
+// TestPlaintextRelease_StaleRecordDoesNotTakeAReplacement: a record found
+// stale is deleted by the start itself, under the lock; a replacement
+// enqueued right after survives the sweep, since nothing deletes by key.
+func TestPlaintextRelease_StaleRecordDoesNotTakeAReplacement(t *testing.T) {
+	rel := &staleThenReplaced{}
+	b, mem := newDeferredBackend(t, inmem.NopUploader{}, func(d *Deps) {
+		rel.PendingReleaseStore = d.PendingReleases
+		d.PendingReleases = rel
+	})
+	ctx := context.Background()
+	setNone(t, b)
+	data := testBody(8 << 10)
+	putIn(t, b, "bk", "k", data)
+	d := blobDigestOf(t, b, "k", "")
+	// A record for a claimed digest: stale from the start.
+	if err := mem.EnqueueRelease(ctx, did.Undef, d, time.Now()); err != nil {
+		t.Fatalf("EnqueueRelease: %v", err)
+	}
+
+	drainReleases(t, b)
+
+	if rel.replaced != 1 {
+		t.Fatalf("stale starts = %d, want 1", rel.replaced)
+	}
+	pending, _ := mem.ListReleasesBySpace(ctx, did.Undef)
+	if len(pending) != 1 {
+		t.Fatalf("records after the sweep = %v, want the replacement alone", pending)
+	}
+}
+
+// otherSpaceDeletesFirst is a release store under which, as space A's
+// release deletes its intent, space B's release has just deleted its own:
+// both had seen the other's intent and left the shared file.
+type otherSpaceDeletesFirst struct {
+	registry.PendingReleaseStore
+	first, second did.DID
+	done          bool
+}
+
+func (o *otherSpaceDeletesFirst) DeleteIntentAndRelease(ctx context.Context, space did.DID, digest multihash.Multihash) (int, error) {
+	if space == o.first && !o.done {
+		o.done = true
+		if _, err := o.PendingReleaseStore.DeleteIntentAndRelease(ctx, o.second, digest); err != nil {
+			return 0, err
+		}
+	}
+	return o.PendingReleaseStore.DeleteIntentAndRelease(ctx, space, digest)
+}
+
+// TestPlaintextSpaces_LastReleaseOutRemovesTheSharedFile: two spaces
+// releasing the same digest at once each see the other's intent and leave
+// the file; the one whose delete finds no intent left removes it.
+func TestPlaintextSpaces_LastReleaseOutRemovesTheSharedFile(t *testing.T) {
+	rel := &otherSpaceDeletesFirst{}
+	b, mem, _ := newRefTestBackend(t)
+	rel.PendingReleaseStore = b.pendingReleases
+	b.pendingReleases = rel
+	space2 := secondPlaintextBucket(t, b, mem)
+	rel.first, rel.second = did.Undef, space2
+	ctx := context.Background()
+	data := testBody(8 << 10)
+
+	putIn(t, b, "bk", "k", data)
+	putIn(t, b, "bk2", "k", data)
+	d := blobDigestOf(t, b, "k", "")
+	deleteFrom(t, b, "bk", "k")
+	deleteFrom(t, b, "bk2", "k")
+	drainReleases(t, b)
+
+	for _, sp := range []did.DID{did.Undef, space2} {
+		if _, err := mem.GetIntent(ctx, sp, d); !errors.Is(err, registry.ErrNotFound) {
+			t.Fatalf("intent in %s survived (err=%v)", sp, err)
+		}
+	}
+	if localCopyExists(b, d) {
+		t.Fatalf("the shared file survived both releases")
 	}
 }

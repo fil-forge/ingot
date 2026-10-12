@@ -186,12 +186,12 @@ func (m *MemStore) ListReleasesBySpace(_ context.Context, space did.DID) ([]regi
 	return out, nil
 }
 
-func (m *MemStore) DeleteIntentAndRelease(_ context.Context, space did.DID, digest multihash.Multihash) error {
+func (m *MemStore) DeleteIntentAndRelease(_ context.Context, space did.DID, digest multihash.Multihash) (int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.deleteIntentLocked(locKey{space, string(digest)})
 	delete(m.releases, locKey{space, string(digest)})
-	return nil
+	return m.countIntentsLocked(string(digest), nil), nil
 }
 
 // deleteIntentLocked removes one intent and, with it the last for its
@@ -571,16 +571,19 @@ func (m *MemStore) RewrapEncryptionParams(_ context.Context, space did.DID, dige
 
 // ParkStore ==================================================================
 
-func (m *MemStore) PutPark(_ context.Context, p registry.BlobPark) error {
+func (m *MemStore) PutPark(_ context.Context, p registry.BlobPark) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if _, ok := m.parks[locKey{p.Space, string(p.Digest)}]; ok {
+		return false, nil
+	}
 	cp := p
 	cp.Digest = bytes.Clone(p.Digest)
 	cp.AddTask = bytes.Clone(p.AddTask)
 	cp.AcceptTask = bytes.Clone(p.AcceptTask)
 	cp.PutInvocation = bytes.Clone(p.PutInvocation)
 	m.parks[locKey{p.Space, string(p.Digest)}] = cp
-	return nil
+	return true, nil
 }
 
 func (m *MemStore) GetPark(_ context.Context, space did.DID, digest multihash.Multihash) (*registry.BlobPark, error) {
@@ -1161,6 +1164,7 @@ func (m *MemStore) StartRelease(_ context.Context, space did.DID, digest multiha
 		return registry.ReleaseReferenced, nil
 	}
 	if m.countClaimsLocked(space, digest) > 0 {
+		delete(m.releases, k) // stale: gone here, so no caller deletes a replacement
 		return registry.ReleaseClaimed, nil
 	}
 	if pr.StartedAt.IsZero() {

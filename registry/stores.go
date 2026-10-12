@@ -371,7 +371,10 @@ type PendingReleaseStore interface {
 	// part references first closes that window. A record already started
 	// (a retry) starts again without the checks: the release has owned the
 	// blob since it started, no claim can land meanwhile (AddBlobClaim), and
-	// a part recorded since belongs to a write waiting for it to finish.
+	// a part recorded since belongs to a write waiting for it to finish. A
+	// record found claimed is stale and is deleted here, under the lock: a
+	// caller deleting it afterwards by key could take a replacement that a
+	// later drop of that claim enqueued in between.
 	// The lock excludes CancelRelease, so a write reusing the blob either
 	// cancels the record before this, and this finds none, or finds it
 	// started and waits.
@@ -389,13 +392,16 @@ type PendingReleaseStore interface {
 	DeleteRelease(ctx context.Context, space did.DID, digest multihash.Multihash) error
 	// DeleteIntentAndRelease removes the space's upload intent for the blob
 	// and this release's record in one transaction — the last step of
-	// releasing a blob. The two must go together: the intent
+	// releasing a blob — and returns how many intents for the digest other
+	// spaces still hold, counted under a lock on the digest, so of two
+	// spaces releasing the same digest at once exactly one counts none and
+	// removes the shared file. The two deletes must go together: the intent
 	// is the only evidence of how far the blob ever got, and a record that
 	// outlived it would leave the retry to read a blob with no rows and no
 	// intent, owing a network remove that a never-uploaded blob has no
 	// authority for and that would fail on every attempt. Both deletes are
 	// idempotent.
-	DeleteIntentAndRelease(ctx context.Context, space did.DID, digest multihash.Multihash) error
+	DeleteIntentAndRelease(ctx context.Context, space did.DID, digest multihash.Multihash) (int, error)
 }
 
 // IntentStore is the local-store index (§5): the on-disk blobs Ingot holds
@@ -518,7 +524,11 @@ type BlobPark struct {
 // ParkStore persists deferred-accept park state between UploadPart and
 // Complete/Abort (§7.2).
 type ParkStore interface {
-	PutPark(ctx context.Context, p BlobPark) error
+	// PutPark records a park and reports whether it did: a park already
+	// recorded for the (space, digest), by a write in another instance that
+	// parked the same bytes first, is left as it is, and the caller gives up
+	// its own allocation instead.
+	PutPark(ctx context.Context, p BlobPark) (bool, error)
 	// GetPark returns ErrNotFound when the space has no park row for digest.
 	GetPark(ctx context.Context, space did.DID, digest multihash.Multihash) (*BlobPark, error)
 	DeletePark(ctx context.Context, space did.DID, digest multihash.Multihash) error

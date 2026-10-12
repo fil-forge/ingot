@@ -329,7 +329,15 @@ the intent with it, for the write waiting on it; a file held only by
 another space it leaves too, while its own intent goes; and the cache move
 waits for a held file as well. A release runs only through its record:
 Complete no longer runs an orphan's release unrecorded when recording it
-fails, and leaves it to the reap.
+fails, and leaves it to the reap. A record a start finds stale is deleted
+by that start, under the lock, and no caller deletes a record by key
+afterwards, since the key may by then name a replacement enqueued by a drop
+of the new claim. Writes of one digest to one space take turns at the
+upload within a process (`blobKeyLock`), so the second finds the first's
+location or park; across instances a park already recorded wins, and the
+loser gives up its allocation. Of two spaces releasing the same digest at
+once, each leaving the file for the other's intent, the one whose intent
+delete finds none left removes the file.
 
 ## Identity & auth
 
