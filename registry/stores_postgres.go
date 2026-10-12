@@ -1054,7 +1054,7 @@ func (r *Postgres) DeleteSession(ctx context.Context, uploadID string) error {
 	return nil
 }
 
-func (r *Postgres) PutPart(ctx context.Context, p MultipartPart) error {
+func (r *Postgres) PutPart(ctx context.Context, p MultipartPart, tree *PartTree) error {
 	state := p.State
 	if state == "" {
 		state = PartParked
@@ -1092,7 +1092,7 @@ func (r *Postgres) PutPart(ctx context.Context, p MultipartPart) error {
 	}
 	// The tree row follows the part row: a superseding part without a tree
 	// must not keep its predecessor's.
-	if t := p.Tree; t != nil {
+	if t := tree; t != nil {
 		_, err = tx.Exec(ctx,
 			`INSERT INTO ingot.multipart_part_trees (upload_id, part_number, tree_offset, chunk_log, nodes, blocks, head, tail, root)
 			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
@@ -1120,27 +1120,10 @@ func (r *Postgres) DeletePartTrees(ctx context.Context, uploadID string) error {
 }
 
 func (r *Postgres) ListParts(ctx context.Context, uploadID string) ([]MultipartPart, error) {
-	return r.listParts(ctx, uploadID, false)
-}
-
-func (r *Postgres) ListPartsWithTrees(ctx context.Context, uploadID string) ([]MultipartPart, error) {
-	return r.listParts(ctx, uploadID, true)
-}
-
-// listParts reads uploadID's parts; the tree table is joined only when
-// withTrees, so a listing that does not need the trees never moves them.
-func (r *Postgres) listParts(ctx context.Context, uploadID string, withTrees bool) ([]MultipartPart, error) {
-	q := `SELECT p.part_number, p.etag_md5, p.size, p.checksum, p.blob_digests, p.state, p.created_at
-	        FROM ingot.multipart_parts p WHERE p.upload_id = $1 ORDER BY p.part_number ASC`
-	if withTrees {
-		q = `SELECT p.part_number, p.etag_md5, p.size, p.checksum, p.blob_digests, p.state, p.created_at,
-		            t.part_number IS NOT NULL, COALESCE(t.tree_offset, 0), COALESCE(t.chunk_log, 0),
-		            t.nodes, t.blocks, t.head, t.tail, t.root
-		       FROM ingot.multipart_parts p
-		       LEFT JOIN ingot.multipart_part_trees t USING (upload_id, part_number)
-		      WHERE p.upload_id = $1 ORDER BY p.part_number ASC`
-	}
-	rows, err := r.pool.Query(ctx, q, uploadID)
+	rows, err := r.pool.Query(ctx,
+		`SELECT part_number, etag_md5, size, checksum, blob_digests, state, created_at
+		 FROM ingot.multipart_parts WHERE upload_id = $1 ORDER BY part_number ASC`,
+		uploadID)
 	if err != nil {
 		return nil, fmt.Errorf("registry: list parts: %w", err)
 	}
@@ -1149,24 +1132,40 @@ func (r *Postgres) listParts(ctx context.Context, uploadID string, withTrees boo
 	var out []MultipartPart
 	for rows.Next() {
 		p := MultipartPart{UploadID: uploadID}
-		dest := []any{&p.PartNumber, &p.ETagMD5, &p.Size, &p.Checksum, &p.BlobDigests, &p.State, &p.CreatedAt}
-		var tree PartTree
-		var hasTree bool
-		var chunkLog int16
-		if withTrees {
-			dest = append(dest, &hasTree, &tree.Offset, &chunkLog, &tree.Nodes, &tree.Blocks, &tree.Head, &tree.Tail, &tree.Root)
-		}
-		if err := rows.Scan(dest...); err != nil {
+		if err := rows.Scan(&p.PartNumber, &p.ETagMD5, &p.Size, &p.Checksum, &p.BlobDigests, &p.State, &p.CreatedAt); err != nil {
 			return nil, fmt.Errorf("registry: list parts scan: %w", err)
-		}
-		if hasTree {
-			tree.ChunkLog = uint8(chunkLog)
-			p.Tree = &tree
 		}
 		out = append(out, p)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("registry: list parts rows: %w", err)
+	}
+	return out, nil
+}
+
+func (r *Postgres) ListPartTrees(ctx context.Context, uploadID string) (map[int]*PartTree, error) {
+	rows, err := r.pool.Query(ctx,
+		`SELECT part_number, tree_offset, chunk_log, nodes, blocks, head, tail, root
+		 FROM ingot.multipart_part_trees WHERE upload_id = $1`,
+		uploadID)
+	if err != nil {
+		return nil, fmt.Errorf("registry: list part trees: %w", err)
+	}
+	defer rows.Close()
+
+	out := map[int]*PartTree{}
+	for rows.Next() {
+		var n int
+		var chunkLog int16
+		t := &PartTree{}
+		if err := rows.Scan(&n, &t.Offset, &chunkLog, &t.Nodes, &t.Blocks, &t.Head, &t.Tail, &t.Root); err != nil {
+			return nil, fmt.Errorf("registry: list part trees scan: %w", err)
+		}
+		t.ChunkLog = uint8(chunkLog)
+		out[n] = t
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("registry: list part trees rows: %w", err)
 	}
 	return out, nil
 }

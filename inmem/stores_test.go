@@ -196,9 +196,9 @@ func TestParts_OrderedAndCascade(t *testing.T) {
 	}
 
 	// Insert out of order; ListParts must return ascending part numbers.
-	mustPutPart(t, m, registry.MultipartPart{UploadID: id, PartNumber: 2, ETagMD5: []byte("m2"), Size: 2, BlobDigests: []multihash.Multihash{[]byte("d2")}})
-	mustPutPart(t, m, registry.MultipartPart{UploadID: id, PartNumber: 1, ETagMD5: []byte("m1"), Size: 1, BlobDigests: []multihash.Multihash{[]byte("d1a"), []byte("d1b")},
-		Tree: &registry.PartTree{Offset: 0, ChunkLog: 4, Nodes: []byte("n"), Blocks: []byte("b"), Head: []byte("h"), Tail: []byte("t"), Root: []byte("r")}})
+	mustPutPart(t, m, registry.MultipartPart{UploadID: id, PartNumber: 2, ETagMD5: []byte("m2"), Size: 2, BlobDigests: []multihash.Multihash{[]byte("d2")}}, nil)
+	mustPutPart(t, m, registry.MultipartPart{UploadID: id, PartNumber: 1, ETagMD5: []byte("m1"), Size: 1, BlobDigests: []multihash.Multihash{[]byte("d1a"), []byte("d1b")}},
+		&registry.PartTree{Offset: 0, ChunkLog: 4, Nodes: []byte("n"), Blocks: []byte("b"), Head: []byte("h"), Tail: []byte("t"), Root: []byte("r")})
 
 	parts, err := m.ListParts(ctx, id)
 	if err != nil {
@@ -210,28 +210,28 @@ func TestParts_OrderedAndCascade(t *testing.T) {
 	if len(parts[0].BlobDigests) != 2 {
 		t.Fatalf("part 1 blob digests = %d, want 2", len(parts[0].BlobDigests))
 	}
-	// The plain listing carries no tree; the tree listing carries the one
-	// recorded, and both are copies.
-	if parts[0].Tree != nil {
-		t.Fatalf("ListParts returned a tree: %+v", parts[0].Tree)
+	// The tree listing carries the one tree recorded, by part number, as a
+	// copy.
+	trees, err := m.ListPartTrees(ctx, id)
+	if err != nil || len(trees) != 1 || trees[1] == nil {
+		t.Fatalf("ListPartTrees = %+v, err %v; want part 1's tree only", trees, err)
 	}
-	withTrees, err := m.ListPartsWithTrees(ctx, id)
-	if err != nil || len(withTrees) != 2 || withTrees[0].Tree == nil || withTrees[1].Tree != nil {
-		t.Fatalf("ListPartsWithTrees = %+v, err %v; want part 1's tree only", withTrees, err)
-	}
-	if tr := withTrees[0].Tree; tr.ChunkLog != 4 || string(tr.Blocks) != "b" || string(tr.Head) != "h" || string(tr.Tail) != "t" || string(tr.Root) != "r" {
+	if tr := trees[1]; tr.ChunkLog != 4 || string(tr.Blocks) != "b" || string(tr.Head) != "h" || string(tr.Tail) != "t" || string(tr.Root) != "r" {
 		t.Fatalf("part 1 tree = %+v", tr)
 	}
-	withTrees[0].Tree.Blocks[0] = 'X'
-	if again, _ := m.ListPartsWithTrees(ctx, id); string(again[0].Tree.Blocks) != "b" {
-		t.Fatalf("store mutated through returned tree: %q", again[0].Tree.Blocks)
+	trees[1].Blocks[0] = 'X'
+	if again, _ := m.ListPartTrees(ctx, id); string(again[1].Blocks) != "b" {
+		t.Fatalf("store mutated through returned tree: %q", again[1].Blocks)
 	}
 	// Deleting the trees keeps the part records.
 	if err := m.DeletePartTrees(ctx, id); err != nil {
 		t.Fatalf("DeletePartTrees: %v", err)
 	}
-	if after, _ := m.ListPartsWithTrees(ctx, id); len(after) != 2 || after[0].Tree != nil {
-		t.Fatalf("after DeletePartTrees = %+v, want two records without trees", after)
+	if after, _ := m.ListPartTrees(ctx, id); len(after) != 0 {
+		t.Fatalf("after DeletePartTrees = %+v, want no trees", after)
+	}
+	if after, _ := m.ListParts(ctx, id); len(after) != 2 {
+		t.Fatalf("after DeletePartTrees = %+v, want two part records", after)
 	}
 
 	// Returned data is a copy: mutating it must not corrupt the store.
@@ -242,7 +242,7 @@ func TestParts_OrderedAndCascade(t *testing.T) {
 	}
 
 	// PutPart against a missing session is rejected (FK).
-	if err := m.PutPart(ctx, registry.MultipartPart{UploadID: "missing", PartNumber: 1, ETagMD5: []byte("m"), BlobDigests: []multihash.Multihash{[]byte("d")}}); err != registry.ErrNotFound {
+	if err := m.PutPart(ctx, registry.MultipartPart{UploadID: "missing", PartNumber: 1, ETagMD5: []byte("m"), BlobDigests: []multihash.Multihash{[]byte("d")}}, nil); err != registry.ErrNotFound {
 		t.Fatalf("PutPart missing session err = %v, want ErrNotFound", err)
 	}
 
@@ -503,9 +503,9 @@ func count(t *testing.T, m *MemStore, space did.DID, digest []byte) int {
 	return n
 }
 
-func mustPutPart(t *testing.T, m *MemStore, p registry.MultipartPart) {
+func mustPutPart(t *testing.T, m *MemStore, p registry.MultipartPart, tree *registry.PartTree) {
 	t.Helper()
-	if err := m.PutPart(context.Background(), p); err != nil {
+	if err := m.PutPart(context.Background(), p, tree); err != nil {
 		t.Fatalf("PutPart: %v", err)
 	}
 }
@@ -520,7 +520,7 @@ func TestParts_LiveRefsFollowSessionState(t *testing.T) {
 		if err := m.CreateSession(ctx, registry.MultipartSession{UploadID: id, Bucket: "b", ObjectKey: id}); err != nil {
 			t.Fatalf("CreateSession %s: %v", id, err)
 		}
-		mustPutPart(t, m, registry.MultipartPart{UploadID: id, PartNumber: 1, ETagMD5: []byte("m"), Size: 1, BlobDigests: []multihash.Multihash{shared}})
+		mustPutPart(t, m, registry.MultipartPart{UploadID: id, PartNumber: 1, ETagMD5: []byte("m"), Size: 1, BlobDigests: []multihash.Multihash{shared}}, nil)
 	}
 	if n, _ := m.CountLivePartRefs(ctx, did.Undef, shared); n != 3 {
 		t.Fatalf("live refs with three open sessions = %d, want 3", n)
@@ -644,7 +644,7 @@ func TestParts_LiveRefsArePerSpace(t *testing.T) {
 		if err := m.CreateSession(ctx, registry.MultipartSession{UploadID: id, Bucket: id, ObjectKey: "k", Space: space}); err != nil {
 			t.Fatalf("CreateSession %s: %v", id, err)
 		}
-		mustPutPart(t, m, registry.MultipartPart{UploadID: id, PartNumber: 1, ETagMD5: []byte("m"), Size: 1, BlobDigests: []multihash.Multihash{shared}})
+		mustPutPart(t, m, registry.MultipartPart{UploadID: id, PartNumber: 1, ETagMD5: []byte("m"), Size: 1, BlobDigests: []multihash.Multihash{shared}}, nil)
 	}
 	var got []int
 	for _, space := range []did.DID{a, b, testutil.RandomDID(t)} {

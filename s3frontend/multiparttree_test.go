@@ -113,36 +113,34 @@ func completeUpload(t *testing.T, b *Backend, key, uploadID string, completed []
 	if _, err := mpComplete(t, b, key, uploadID, completed, nil); err != nil {
 		t.Fatalf("Complete: %v", err)
 	}
-	recs, err := b.multipart.ListPartsWithTrees(context.Background(), uploadID)
+	recs, err := b.multipart.ListParts(context.Background(), uploadID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(recs) < len(completed) {
 		t.Fatalf("%d part records retained after Complete, want at least %d", len(recs), len(completed))
 	}
-	for _, p := range recs {
-		if p.Tree != nil {
-			t.Fatalf("part %d keeps its tree after Complete", p.PartNumber)
-		}
+	if trees, err := b.multipart.ListPartTrees(context.Background(), uploadID); err != nil || len(trees) != 0 {
+		t.Fatalf("%d part trees kept after Complete, err %v; want none", len(trees), err)
 	}
 }
 
-// recordedParts returns the open upload's part records, trees included, by
-// part number.
-func recordedParts(t *testing.T, b *Backend, uploadID string, parts int) map[int]registry.MultipartPart {
+// recordedParts returns the open upload's recorded part trees by part
+// number, having checked that it holds parts part records.
+func recordedParts(t *testing.T, b *Backend, uploadID string, parts int) map[int]*registry.PartTree {
 	t.Helper()
-	recs, err := b.multipart.ListPartsWithTrees(context.Background(), uploadID)
+	recs, err := b.multipart.ListParts(context.Background(), uploadID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	out := map[int]registry.MultipartPart{}
-	for _, p := range recs {
-		out[p.PartNumber] = p
+	if len(recs) != parts {
+		t.Fatalf("%d part records for %s, want %d", len(recs), uploadID, parts)
 	}
-	if len(out) != parts {
-		t.Fatalf("%d part records for %s, want %d", len(out), uploadID, parts)
+	trees, err := b.multipart.ListPartTrees(context.Background(), uploadID)
+	if err != nil {
+		t.Fatal(err)
 	}
-	return out
+	return trees
 }
 
 // TestMultipartTree covers the paths Complete takes to the object's tree:
@@ -159,14 +157,8 @@ func TestMultipartTree(t *testing.T) {
 		parts := [][]byte{taggedBody(minPart, 0x01), taggedBody(minPart, 0x02), taggedBody(70_000, 0x03)}
 		uploadID, completed, whole := uploadAll(t, b, "in-order", parts, []int32{1, 2, 3})
 		recs := recordedParts(t, b, uploadID, 3)
-		if recs[1].Tree.Offset != 0 || recs[2].Tree.Offset != int64(minPart) || recs[3].Tree.Offset != 2*int64(minPart) {
-			t.Fatalf("recorded offsets %d %d %d: every assumed offset should have been exact", recs[1].Tree.Offset, recs[2].Tree.Offset, recs[3].Tree.Offset)
-		}
-		// The plain listing, what UploadPart and ListParts use, never
-		// carries the trees.
-		plain, err := b.multipart.ListParts(context.Background(), uploadID)
-		if err != nil || len(plain) != 3 || plain[0].Tree != nil || plain[2].Tree != nil {
-			t.Fatalf("ListParts = %+v, err %v; want three records without trees", plain, err)
+		if recs[1].Offset != 0 || recs[2].Offset != int64(minPart) || recs[3].Offset != 2*int64(minPart) {
+			t.Fatalf("recorded offsets %d %d %d: every assumed offset should have been exact", recs[1].Offset, recs[2].Offset, recs[3].Offset)
 		}
 		completeUpload(t, b, "in-order", uploadID, completed)
 		assertObjectTree(t, b, "in-order", whole)
@@ -179,11 +171,11 @@ func TestMultipartTree(t *testing.T) {
 		parts := [][]byte{taggedBody(minPart, 0x11), taggedBody(minPart, 0x12), taggedBody(final, 0x13)}
 		uploadID, completed, whole := uploadAll(t, b, "final-first", parts, []int32{3, 1, 2})
 		recs := recordedParts(t, b, uploadID, 3)
-		if recs[3].Tree == nil || recs[3].Tree.Offset != 2*final {
-			t.Fatalf("part 3 recorded at offset %d: with no earlier part its own size should have stood in", recs[3].Tree.Offset)
+		if recs[3] == nil || recs[3].Offset != 2*final {
+			t.Fatalf("part 3 recorded at offset %d: with no earlier part its own size should have stood in", recs[3].Offset)
 		}
-		if recs[2].Tree.Offset != int64(minPart) {
-			t.Fatalf("part 2 recorded offset %d: part 1 was recorded, so the assumed offset should be exact", recs[2].Tree.Offset)
+		if recs[2].Offset != int64(minPart) {
+			t.Fatalf("part 2 recorded offset %d: part 1 was recorded, so the assumed offset should be exact", recs[2].Offset)
 		}
 		completeUpload(t, b, "final-first", uploadID, completed)
 		assertObjectTree(t, b, "final-first", whole)
@@ -196,8 +188,8 @@ func TestMultipartTree(t *testing.T) {
 		parts := [][]byte{taggedBody(minPart, 0x61), taggedBody(minPart, 0x62), taggedBody(70_000, 0x63)}
 		uploadID, completed, whole := uploadAll(t, b, "final-first-odd", parts, []int32{3, 1, 2})
 		recs := recordedParts(t, b, uploadID, 3)
-		if recs[3].Tree == nil || recs[3].Tree.Offset != 2*70_000 || len(recs[3].Tree.Head) != 1024-(2*70_000)%1024 {
-			t.Fatalf("part 3 recorded as %+v", recs[3].Tree)
+		if recs[3] == nil || recs[3].Offset != 2*70_000 || len(recs[3].Head) != 1024-(2*70_000)%1024 {
+			t.Fatalf("part 3 recorded as %+v", recs[3])
 		}
 		completeUpload(t, b, "final-first-odd", uploadID, completed)
 		assertObjectTree(t, b, "final-first-odd", whole)
@@ -207,8 +199,8 @@ func TestMultipartTree(t *testing.T) {
 		parts := [][]byte{taggedBody(minPart, 0x21), taggedBody(minPart, 0x22), taggedBody(minPart, 0x23), taggedBody(1024, 0x24)}
 		uploadID, completed, whole := uploadAll(t, b, "sibling", parts, []int32{1, 3, 4, 2})
 		recs := recordedParts(t, b, uploadID, 4)
-		if recs[3].Tree.Offset != 2*int64(minPart) || recs[4].Tree.Offset != 3*int64(minPart) {
-			t.Fatalf("recorded offsets %d %d: parts 3 and 4 should have been assumed from part 1's size", recs[3].Tree.Offset, recs[4].Tree.Offset)
+		if recs[3].Offset != 2*int64(minPart) || recs[4].Offset != 3*int64(minPart) {
+			t.Fatalf("recorded offsets %d %d: parts 3 and 4 should have been assumed from part 1's size", recs[3].Offset, recs[4].Offset)
 		}
 		completeUpload(t, b, "sibling", uploadID, completed)
 		assertObjectTree(t, b, "sibling", whole)
@@ -223,15 +215,15 @@ func TestMultipartTree(t *testing.T) {
 		uploadID, completed, whole := uploadAll(t, b, "odd", parts, []int32{1, 2, 3})
 		recs := recordedParts(t, b, uploadID, 3)
 		for n := 1; n <= 3; n++ {
-			if recs[n].Tree == nil {
+			if recs[n] == nil {
 				t.Fatalf("part %d recorded no tree", n)
 			}
 		}
-		if recs[1].Tree.Offset != 0 || recs[2].Tree.Offset != int64(minPart+100) || recs[3].Tree.Offset != 2*int64(minPart+100) {
-			t.Fatalf("assumed offsets %d %d %d are not exact", recs[1].Tree.Offset, recs[2].Tree.Offset, recs[3].Tree.Offset)
+		if recs[1].Offset != 0 || recs[2].Offset != int64(minPart+100) || recs[3].Offset != 2*int64(minPart+100) {
+			t.Fatalf("assumed offsets %d %d %d are not exact", recs[1].Offset, recs[2].Offset, recs[3].Offset)
 		}
-		if len(recs[1].Tree.Tail) != 100 || len(recs[2].Tree.Head) != 1024-100 {
-			t.Fatalf("part 1 tail %d bytes, part 2 head %d bytes", len(recs[1].Tree.Tail), len(recs[2].Tree.Head))
+		if len(recs[1].Tail) != 100 || len(recs[2].Head) != 1024-100 {
+			t.Fatalf("part 1 tail %d bytes, part 2 head %d bytes", len(recs[1].Tail), len(recs[2].Head))
 		}
 		completeUpload(t, b, "odd", uploadID, completed)
 		assertObjectTree(t, b, "odd", whole)
@@ -288,10 +280,8 @@ func TestMultipartTree(t *testing.T) {
 			t.Fatal("object exists after a refused Complete")
 		}
 		// A refusal keeps the parts' trees, so the retry merges them.
-		for n, p := range recordedParts(t, b, uploadID, 3) {
-			if p.Tree == nil {
-				t.Fatalf("part %d lost its tree on a refused Complete", n)
-			}
+		if trees := recordedParts(t, b, uploadID, 3); len(trees) != 3 {
+			t.Fatalf("%d part trees after a refused Complete, want 3", len(trees))
 		}
 		b.rehashBudget = DefaultRehashBudget
 		if _, err := mpComplete(t, b, key, uploadID, completed, nil); err != nil {

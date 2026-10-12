@@ -716,11 +716,12 @@ func (m *MemStore) DeleteSession(_ context.Context, uploadID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.sessions, uploadID)
-	delete(m.parts, uploadID) // FK ON DELETE CASCADE
+	delete(m.parts, uploadID)     // FK ON DELETE CASCADE
+	delete(m.partTrees, uploadID) // ...and from the parts to their trees
 	return nil
 }
 
-func (m *MemStore) PutPart(_ context.Context, p registry.MultipartPart) error {
+func (m *MemStore) PutPart(_ context.Context, p registry.MultipartPart, tree *registry.PartTree) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if s, ok := m.sessions[p.UploadID]; !ok || s.State != registry.SessionOpen {
@@ -738,15 +739,29 @@ func (m *MemStore) PutPart(_ context.Context, p registry.MultipartPart) error {
 		m.parts[p.UploadID] = byNum
 	}
 	byNum[p.PartNumber] = clonePart(p)
+	// The tree row follows the part row, as in Postgres.
+	trees := m.partTrees[p.UploadID]
+	if tree == nil {
+		delete(trees, p.PartNumber)
+		return nil
+	}
+	if trees == nil {
+		trees = map[int]*registry.PartTree{}
+		m.partTrees[p.UploadID] = trees
+	}
+	trees[p.PartNumber] = cloneTree(tree)
 	return nil
 }
 
-func (m *MemStore) ListParts(ctx context.Context, uploadID string) ([]registry.MultipartPart, error) {
-	parts, err := m.ListPartsWithTrees(ctx, uploadID)
-	for i := range parts {
-		parts[i].Tree = nil
+// ListPartTrees returns copies of the upload's tree rows by part number.
+func (m *MemStore) ListPartTrees(_ context.Context, uploadID string) (map[int]*registry.PartTree, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := map[int]*registry.PartTree{}
+	for n, t := range m.partTrees[uploadID] {
+		out[n] = cloneTree(t)
 	}
-	return parts, err
+	return out, nil
 }
 
 // DeletePartTrees mirrors the tree table's delete: the part records stay,
@@ -754,14 +769,11 @@ func (m *MemStore) ListParts(ctx context.Context, uploadID string) ([]registry.M
 func (m *MemStore) DeletePartTrees(_ context.Context, uploadID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	for n, p := range m.parts[uploadID] {
-		p.Tree = nil
-		m.parts[uploadID][n] = p
-	}
+	delete(m.partTrees, uploadID)
 	return nil
 }
 
-func (m *MemStore) ListPartsWithTrees(_ context.Context, uploadID string) ([]registry.MultipartPart, error) {
+func (m *MemStore) ListParts(_ context.Context, uploadID string) ([]registry.MultipartPart, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	byNum := m.parts[uploadID]
@@ -936,16 +948,17 @@ func clonePart(p registry.MultipartPart) registry.MultipartPart {
 		}
 		p.BlobDigests = ds
 	}
-	if p.Tree != nil {
-		t := *p.Tree
-		t.Nodes = bytes.Clone(t.Nodes)
-		t.Blocks = bytes.Clone(t.Blocks)
-		t.Head = bytes.Clone(t.Head)
-		t.Tail = bytes.Clone(t.Tail)
-		t.Root = bytes.Clone(t.Root)
-		p.Tree = &t
-	}
 	return p
+}
+
+func cloneTree(t *registry.PartTree) *registry.PartTree {
+	c := *t
+	c.Nodes = bytes.Clone(t.Nodes)
+	c.Blocks = bytes.Clone(t.Blocks)
+	c.Head = bytes.Clone(t.Head)
+	c.Tail = bytes.Clone(t.Tail)
+	c.Root = bytes.Clone(t.Root)
+	return &c
 }
 
 // StreamStore ================================================================

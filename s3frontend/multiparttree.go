@@ -72,13 +72,14 @@ const DefaultRehashBudget = 5 << 30 // 5 GiB
 
 // rehashNeeded is the byte count of the non-final parts whose assumed
 // offset was wrong, or whose tree was not recorded, which Complete must
-// read back to hash. parts are the completed parts in order and offsets
-// their true byte offsets in the object.
-func rehashNeeded(parts []registry.MultipartPart, offsets []int64) int64 {
+// read back to hash. parts are the completed parts in order, trees their
+// recorded trees by part number, and offsets their true byte offsets in
+// the object.
+func rehashNeeded(parts []registry.MultipartPart, trees map[int]*registry.PartTree, offsets []int64) int64 {
 	var n int64
 	for i := 0; i+1 < len(parts); i++ {
-		if p := parts[i]; p.Tree == nil || p.Tree.Offset != offsets[i] {
-			n += p.Size
+		if t := trees[parts[i].PartNumber]; t == nil || t.Offset != offsets[i] {
+			n += parts[i].Size
 		}
 	}
 	return n
@@ -138,17 +139,18 @@ func treeRange(t *registry.PartTree, size int64) (blake3tree.Range, error) {
 // multipartTree computes the tree material of a completed multipart body
 // from its parts' records, re-reading only the parts whose assumed offset
 // was wrong or whose record cannot serve. parts are the completed parts in
-// order, offsets their true byte offsets in body, and body the assembled
-// object (its blobs are what a re-hash reads, decrypting unless plaintext). The caller has already held
+// order, trees their recorded trees by part number, offsets their true byte
+// offsets in body, and body the assembled object (its blobs are what a
+// re-hash reads, decrypting unless plaintext). The caller has already held
 // the non-final re-read within the budget (rehashNeeded). Parts' trees that
 // fail the assembly's consistency check are an error: the object is
 // committed neither with a digest that might be wrong nor without one.
-func (b *Backend) multipartTree(ctx context.Context, space did.DID, plaintext bool, parts []registry.MultipartPart, offsets []int64, body msbucket.Body) (blake3tree.Object, error) {
+func (b *Backend) multipartTree(ctx context.Context, space did.DID, plaintext bool, parts []registry.MultipartPart, trees map[int]*registry.PartTree, offsets []int64, body msbucket.Body) (blake3tree.Object, error) {
 	src := &bodySource{b: b, space: space, body: body, plaintext: plaintext}
 	ranges := make([]blake3tree.Range, 0, len(parts))
 	for i, p := range parts {
-		if p.Tree != nil && p.Tree.Offset == offsets[i] {
-			rng, err := treeRange(p.Tree, p.Size)
+		if t := trees[p.PartNumber]; t != nil && t.Offset == offsets[i] {
+			rng, err := treeRange(t, p.Size)
 			if err == nil {
 				ranges = append(ranges, rng)
 				continue

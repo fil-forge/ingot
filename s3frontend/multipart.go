@@ -392,10 +392,11 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 		BlobDigests: bodyDigests(rec),
 		State:       registry.PartParked,
 	}
+	var partTree *registry.PartTree
 	if tree != nil {
-		part.Tree = partTreeOf(tree.FinishRange())
+		partTree = partTreeOf(tree.FinishRange())
 	}
-	if err := b.multipart.PutPart(ctx, part); err != nil {
+	if err := b.multipart.PutPart(ctx, part, partTree); err != nil {
 		// No part row points at the spooled blobs now, whatever went wrong:
 		// the session was completed, aborted or torn down after this upload
 		// was admitted (ErrNotFound), or the write failed. Their release is
@@ -762,18 +763,11 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 	// upload for a retry. A replay never gets here, which matters because a
 	// completed upload's trees are deleted (below) and would count as
 	// re-hash in full.
-	withTrees, err := b.multipart.ListPartsWithTrees(ctx, uploadID)
+	trees, err := b.multipart.ListPartTrees(ctx, uploadID)
 	if err != nil {
 		return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: list part trees: %w", err)
 	}
-	treeByNum := make(map[int]*registry.PartTree, len(withTrees))
-	for _, p := range withTrees {
-		treeByNum[p.PartNumber] = p.Tree
-	}
-	for i := range requested {
-		requested[i].Tree = treeByNum[requested[i].PartNumber]
-	}
-	if need := rehashNeeded(requested, trueOffsets); need > b.rehashBudget {
+	if need := rehashNeeded(requested, trees, trueOffsets); need > b.rehashBudget {
 		b.logger.Info("multipart completion refused: re-hash over budget",
 			zap.String("key", key), zap.Int("parts", len(requested)), zap.Int64("size", total), zap.Int64("rehash", need), zap.Int64("budget", b.rehashBudget))
 		return s3response.CompleteMultipartUploadResult{}, "", errPartLayoutOverBudget(need, b.rehashBudget)
@@ -828,7 +822,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 	// re-reading a part only where its record cannot serve (bounded above,
 	// before the parts were accepted).
 	body := msbucket.Body{Size: offset, Blobs: blobs, PartSizes: partSizes, PartChecksums: partChecksums}
-	tree, err := b.multipartTree(ctx, bucketState.Space, sess.Plaintext, requested, partOffsets, body)
+	tree, err := b.multipartTree(ctx, bucketState.Space, sess.Plaintext, requested, trees, partOffsets, body)
 	if err != nil {
 		return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: object tree: %w", err)
 	}
