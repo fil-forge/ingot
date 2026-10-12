@@ -622,9 +622,20 @@ func (*Service) CreateAccount(auth.Account) error {
 	return s3err.GetAPIError(s3err.ErrAdminMethodNotSupported)
 }
 
+// userARNPrefix is how a bucket policy document names a principal:
+// arn:aws:iam:::user/<id>.
+const userARNPrefix = "arn:aws:iam:::user/"
+
 // GetUserAccount resolves accounts only in request context (see
-// GetUserAccountForRequest); lookups without a request find nothing.
-func (*Service) GetUserAccount(string) (auth.Account, error) {
+// GetUserAccountForRequest), with one exception: versitygw's PutBucketPolicy
+// validation asks whether each principal a document names exists, and a
+// well-formed user ARN does. Hilt decides whether the id is one of the
+// tenant's principals when it stores the document. Any other name, a bare one
+// included, finds nothing, so versitygw refuses the document as malformed.
+func (*Service) GetUserAccount(access string) (auth.Account, error) {
+	if id, ok := strings.CutPrefix(access, userARNPrefix); ok && id != "" {
+		return auth.Account{}, nil
+	}
 	return auth.Account{}, s3err.GetAPIError(s3err.ErrAdminUserNotFound)
 }
 
