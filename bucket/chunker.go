@@ -210,13 +210,6 @@ func (o plainOpener) OpenBlobRange(ctx context.Context, space did.DID, ref BlobR
 	return blockstore.OpenBlobRangeOf(ctx, o.bs, space, ref.Digest, start, end)
 }
 
-// readerCloser pairs a wrapped reader with the closer that releases its
-// underlying stream.
-type readerCloser struct {
-	io.Reader
-	io.Closer
-}
-
 // blobBodyReader streams a Body's blobs lazily, keeping at most one open blob
 // reader at a time so a read never materializes a whole blob (up to
 // max_blob_size) in memory. It walks the ordered BlobRef list, asking the
