@@ -250,15 +250,14 @@ func (s *Service) GetUserAccountForRequest(ctx fiber.Ctx, accessKeyStr string) (
 	// request from the response and cache nothing, so the key returns to Hilt
 	// on every request until a committed write issues fresh delegations. The
 	// request keeps a store of its own for its onward retrieval. Otherwise the
-	// delegations land in the key's store in the same step as the check (the
-	// store's Add does both), so a revocation arriving meanwhile still finds
-	// (and drops) them. The same check covers the bucket-info remainder
-	// cacheProofs fetches.
-	if ctr != nil && !s.cacheProofs(spanCtx, store, ctr, req, accessKeyID) {
+	// delegations land in the key's store in the same step as the check, so a
+	// revocation arriving meanwhile still finds (and drops) them. The same
+	// check covers the bucket-info remainder cacheProofs fetches.
+	if ctr != nil && !s.cacheProofs(spanCtx, store, ctr, req, accessKeyID, s.proofs.DepositUnlessRevoked) {
 		scoped := NewDelegationCache()
 		ctx.Locals(reqscope.ProofStoreKey(), ucanlib.ProofStore(scoped))
 		// Refetches bucket info already fetched above; rare (a failed Hilt commit).
-		s.cacheProofs(reqCtx, scoped, ctr, req, accessKeyID)
+		s.cacheProofs(reqCtx, scoped, ctr, req, accessKeyID, addAll)
 		ctx.Locals(reqscope.TenantKey(), ok.Tenant)
 		s.logger.Info("hilt/iam: authorize response carries a revoked delegation, not cached",
 			zap.String("access", accessKeyStr), zap.Stringer("tenant", ok.Tenant))
@@ -502,13 +501,13 @@ func untilNextUTCMidnight(now time.Time) time.Duration {
 // proof store and, when it cannot assemble a root-complete chain for one of
 // the fresh leaves, fetches the bucket→tenant→access-key remainder from
 // /s3/bucket/info (once per bucket the request acts on: the addressed bucket,
-// plus a copy's source) and caches that too. It reports false as soon as the
-// store refuses a batch (see [DelegationCache.Add]).
-func (s *Service) cacheProofs(ctx context.Context, store *DelegationCache, ctr ucan.Container, req s3.Request, keyDID did.DID) bool {
+// plus a copy's source) and caches that too. Every deposit goes through
+// deposit, and it reports false as soon as deposit refuses one.
+func (s *Service) cacheProofs(ctx context.Context, store *DelegationCache, ctr ucan.Container, req s3.Request, keyDID did.DID, deposit func(*DelegationCache, ...ucan.Delegation) bool) bool {
 	if ctr == nil || len(ctr.Delegations()) == 0 {
 		return true
 	}
-	if !store.Add(ctr.Delegations()...) {
+	if !deposit(store, ctr.Delegations()...) {
 		return false
 	}
 
@@ -545,10 +544,16 @@ func (s *Service) cacheProofs(ctx context.Context, store *DelegationCache, ctr u
 				zap.String("bucket", bucketName), zap.Error(err))
 			continue
 		}
-		if infoCtr != nil && !store.Add(infoCtr.Delegations()...) {
+		if infoCtr != nil && !deposit(store, infoCtr.Delegations()...) {
 			return false
 		}
 	}
+	return true
+}
+
+// addAll is the cacheProofs deposit for a request-scoped store: no check.
+func addAll(store *DelegationCache, dlgs ...ucan.Delegation) bool {
+	store.Add(dlgs...)
 	return true
 }
 

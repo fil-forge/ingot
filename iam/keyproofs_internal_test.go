@@ -26,6 +26,6 @@ func TestRevocationTTL(t *testing.T) {
 
 	// Hilt serving the revoked CID again renews it.
 	kp.revoked.Set(id, struct{}{}, time.Minute)
-	require.False(t, kp.For(dlg.Audience()).Add(dlg))
+	require.False(t, kp.DepositUnlessRevoked(NewDelegationCache(), dlg))
 	require.InDelta(t, revokedTTL, expiresIn(), float64(time.Minute), "a refusal renews the revocation")
 }

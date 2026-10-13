@@ -66,7 +66,7 @@ func TestKeyProofsForIsStable(t *testing.T) {
 	require.Len(t, chain, 1)
 }
 
-func TestKeyProofsStoreRefusesRevoked(t *testing.T) {
+func TestKeyProofsDepositUnlessRevoked(t *testing.T) {
 	kp := iam.NewKeyProofs()
 	key, err := ed25519.GenerateIssuer()
 	require.NoError(t, err)
@@ -77,23 +77,10 @@ func TestKeyProofsStoreRefusesRevoked(t *testing.T) {
 	require.Empty(t, kp.InvalidateHolders(dlg.Link()))
 
 	other, _ := grant(t)
-	require.False(t, store.Add(other, dlg), "any revoked delegation in the batch refuses the add")
-	require.False(t, store.Contains(other.Link()), "a refused add adds nothing")
-	require.True(t, store.Add(other))
+	require.False(t, kp.DepositUnlessRevoked(store, other, dlg), "any revoked delegation in the set refuses the deposit")
+	require.False(t, store.Contains(other.Link()), "a refused deposit adds nothing")
+	require.True(t, kp.DepositUnlessRevoked(store, other))
 	require.True(t, store.Contains(other.Link()))
-}
-
-// TestRequestScopedStoreKeepsRevoked: a request authorized from a response
-// Hilt served after a failed commit still needs that response's delegations
-// for its onward retrieval, so a store built outside KeyProofs adds them.
-func TestRequestScopedStoreKeepsRevoked(t *testing.T) {
-	kp := iam.NewKeyProofs()
-	dlg, _ := grant(t)
-	kp.InvalidateHolders(dlg.Link())
-
-	scoped := iam.NewDelegationCache()
-	require.True(t, scoped.Add(dlg))
-	require.True(t, scoped.Contains(dlg.Link()))
 }
 
 // TestKeyProofsDepositRacesRevocation races a deposit against the revocation
@@ -108,7 +95,7 @@ func TestKeyProofsDepositRacesRevocation(t *testing.T) {
 		dlg, _ := grant(t)
 
 		var wg sync.WaitGroup
-		wg.Go(func() { store.Add(dlg) })
+		wg.Go(func() { kp.DepositUnlessRevoked(store, dlg) })
 		wg.Go(func() { kp.InvalidateHolders(dlg.Link()) })
 		wg.Wait()
 
