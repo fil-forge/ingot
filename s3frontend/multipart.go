@@ -330,9 +330,9 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 	// Only the part being written is read here. Listing the whole session
 	// costs a row per part already uploaded, so doing it on every part is
 	// quadratic in the part count: the AWS CLI's 8 MiB default chunk makes
-	// a 5 GiB object 640 parts and ~200k rows read. The sibling digests
-	// that listing also produced serve only to suppress releases, on the
-	// two paths below that release something; each fetches them itself.
+	// a 5 GiB object 640 parts and ~200k rows read. The two paths below
+	// that release something ask the registry which of their digests a
+	// sibling part still names.
 	var superseded []mh.Multihash
 	priorPart, err := b.multipart.GetPart(ctx, uploadID, partNumber)
 	if err != nil && !errors.Is(err, registry.ErrNotFound) {
@@ -342,23 +342,18 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 		superseded = priorPart.BlobDigests
 	}
 
-	// siblingDigests is the digest set of the session's OTHER parts: blobs a
-	// release must not take, because a sibling part still references them.
-	// A session storing parts as received can have a sibling naming the
-	// same digest. Computed on demand, never on the common path.
-	siblingDigests := func() (map[string]bool, error) {
-		keep := map[string]bool{}
-		parts, err := b.multipart.ListParts(ctx, uploadID)
+	// siblingDigests is the subset of digests that the session's OTHER parts
+	// reference: blobs a release must not take, because a sibling part
+	// still names them. A session storing parts as received can have a
+	// sibling naming the same digest.
+	siblingDigests := func(digests []mh.Multihash) (map[string]bool, error) {
+		shared, err := b.multipart.SiblingPartDigests(ctx, uploadID, partNumber, digests)
 		if err != nil {
-			return nil, fmt.Errorf("s3frontend: list parts for sibling blobs: %w", err)
+			return nil, fmt.Errorf("s3frontend: look up sibling part blobs: %w", err)
 		}
-		for _, p := range parts {
-			if p.PartNumber == partNumber {
-				continue
-			}
-			for _, d := range p.BlobDigests {
-				keep[string(d)] = true
-			}
+		keep := make(map[string]bool, len(shared))
+		for _, d := range shared {
+			keep[string(d)] = true
 		}
 		return keep, nil
 	}
@@ -372,7 +367,7 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 	// them).
 	var superseding []registry.PendingRelease
 	if len(superseded) > 0 {
-		siblings, serr := siblingDigests()
+		siblings, serr := siblingDigests(superseded)
 		if serr != nil {
 			return nil, serr
 		}
@@ -408,12 +403,22 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 		// files end first, so the release can take them. Should the row in
 		// fact have landed and only its result been lost, the release waits
 		// on the live part reference and resolves with the session.
+		//
+		// A failed sibling lookup still records every release: a blob a
+		// sibling part names is then deferred by that live reference, and
+		// the session resolves it. Returning here instead would strand the
+		// spooled blobs.
 		spooled.unholdAll()
-		siblings, serr := siblingDigests()
-		if serr != nil {
-			return nil, fmt.Errorf("s3frontend: record part: %w; list sibling blobs: %w", err, serr)
+		digests := bodyDigests(rec)
+		var siblings map[string]bool
+		if len(digests) > 0 {
+			var serr error
+			if siblings, serr = siblingDigests(digests); serr != nil {
+				b.logger.Warn("record part: sibling lookup failed, releasing every blob",
+					zap.String("upload_id", uploadID), zap.Int("part", partNumber), zap.Error(serr))
+			}
 		}
-		released, rerr := b.enqueuePartReleases(ctx, space, bodyDigests(rec), siblings)
+		released, rerr := b.enqueuePartReleases(ctx, space, digests, siblings)
 		if rerr != nil {
 			return nil, fmt.Errorf("s3frontend: record part: %w; record its blobs' releases: %w", err, rerr)
 		}

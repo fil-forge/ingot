@@ -1104,6 +1104,37 @@ func (r *Postgres) GetPart(ctx context.Context, uploadID string, partNumber int)
 	return &p, nil
 }
 
+func (r *Postgres) SiblingPartDigests(ctx context.Context, uploadID string, partNumber int, digests []multihash.Multihash) ([]multihash.Multihash, error) {
+	if len(digests) == 0 {
+		return nil, nil
+	}
+	in := make([][]byte, len(digests))
+	for i, d := range digests {
+		in[i] = []byte(d)
+	}
+	rows, err := r.pool.Query(ctx,
+		`SELECT DISTINCT d FROM ingot.multipart_parts p, unnest(p.blob_digests) AS d
+		 WHERE p.upload_id = $1 AND p.part_number <> $2 AND d = ANY($3::bytea[])`,
+		uploadID, partNumber, in)
+	if err != nil {
+		return nil, fmt.Errorf("registry: sibling part digests: %w", err)
+	}
+	defer rows.Close()
+
+	var out []multihash.Multihash
+	for rows.Next() {
+		var d []byte
+		if err := rows.Scan(&d); err != nil {
+			return nil, fmt.Errorf("registry: sibling part digests scan: %w", err)
+		}
+		out = append(out, multihash.Multihash(d))
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("registry: sibling part digests rows: %w", err)
+	}
+	return out, nil
+}
+
 func (r *Postgres) ListParts(ctx context.Context, uploadID string) ([]MultipartPart, error) {
 	rows, err := r.pool.Query(ctx,
 		`SELECT part_number, etag_md5, size, checksum, blob_digests, state, created_at

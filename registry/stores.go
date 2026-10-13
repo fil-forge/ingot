@@ -609,6 +609,11 @@ type MultipartStore interface {
 	// one index probe per part rather than a listing that grows with every
 	// part already uploaded.
 	GetPart(ctx context.Context, uploadID string, partNumber int) (*MultipartPart, error)
+	// SiblingPartDigests returns those of digests that a part of uploadID
+	// other than partNumber references, each once. A session storing parts
+	// as received can name one digest in several parts; a part's release
+	// skips these, which stay live through the sibling.
+	SiblingPartDigests(ctx context.Context, uploadID string, partNumber int, digests []multihash.Multihash) ([]multihash.Multihash, error)
 	ListParts(ctx context.Context, uploadID string) ([]MultipartPart, error)
 	// ListSessions returns bucket's sessions ordered by (object_key, created_at,
 	// upload_id) — the S3 ListMultipartUploads presentation order. Filtering

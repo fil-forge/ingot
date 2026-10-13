@@ -658,12 +658,25 @@ func TestPostgresStores_Live(t *testing.T) {
 
 		// GetPart reads one part by (upload_id, part_number) — the write
 		// path's supersede lookup, which must not list the session.
-		if got, err := r.GetPart(ctx, id, 1); err != nil || got == nil || got.PartNumber != 1 || len(got.BlobDigests) != 2 {
-			t.Fatalf("GetPart 1 = %+v, err %v", got, err)
-		}
-		if got, err := r.GetPart(ctx, id, 9); !errors.Is(err, registry.ErrNotFound) {
-			t.Fatalf("GetPart of an unwritten part = %+v, err %v, want ErrNotFound", got, err)
-		}
+		t.Run("GetPart returns the listed part", func(t *testing.T) {
+			got, err := r.GetPart(ctx, id, 1)
+			if err != nil || !reflect.DeepEqual(got, &parts[0]) {
+				t.Fatalf("GetPart 1 = %+v, err %v, want %+v", got, err, parts[0])
+			}
+		})
+		t.Run("GetPart of an unwritten part is ErrNotFound", func(t *testing.T) {
+			if got, err := r.GetPart(ctx, id, 9); !errors.Is(err, registry.ErrNotFound) {
+				t.Fatalf("GetPart 9 = %+v, err %v, want ErrNotFound", got, err)
+			}
+		})
+		// SiblingPartDigests answers a release's question without listing
+		// the session: which of these digests does another part name?
+		t.Run("SiblingPartDigests returns digests other parts name", func(t *testing.T) {
+			got, err := r.SiblingPartDigests(ctx, id, 1, []multihash.Multihash{{0xd2}, {0xd1, 0xa}})
+			if want := []multihash.Multihash{{0xd2}}; err != nil || !reflect.DeepEqual(got, want) {
+				t.Fatalf("SiblingPartDigests = %x, err %v, want %x", got, err, want)
+			}
+		})
 
 		// single-winner latch
 		won, err := r.LatchSession(ctx, id, registry.SessionOpen, registry.SessionCompleting)

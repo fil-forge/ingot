@@ -752,6 +752,28 @@ func (m *MemStore) GetPart(_ context.Context, uploadID string, partNumber int) (
 	return &out, nil
 }
 
+func (m *MemStore) SiblingPartDigests(_ context.Context, uploadID string, partNumber int, digests []multihash.Multihash) ([]multihash.Multihash, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	want := make(map[string]bool, len(digests))
+	for _, d := range digests {
+		want[string(d)] = true
+	}
+	var out []multihash.Multihash
+	for n, p := range m.parts[uploadID] {
+		if n == partNumber {
+			continue
+		}
+		for _, d := range p.BlobDigests {
+			if want[string(d)] {
+				delete(want, string(d))
+				out = append(out, bytes.Clone(d))
+			}
+		}
+	}
+	return out, nil
+}
+
 func (m *MemStore) ListParts(_ context.Context, uploadID string) ([]registry.MultipartPart, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
