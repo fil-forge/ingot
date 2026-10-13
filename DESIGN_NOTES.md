@@ -147,7 +147,9 @@ from the raw bytes, merges the parts' subtrees into the object's digest,
 builds its block list from their blocks, and checks the blocks against the
 digest. A single-part object takes its digest from part 1's own root. The
 object's `x-cid` and block list are therefore the same as a single PUT's
-would be.
+would be. The tree material lives in its own table (`multipart_part_trees`),
+read only by Complete and deleted once the object commits; every other part
+listing leaves it on disk.
 
 Complete concludes the parked parts a group at a time: each `/ucan/conclude`
 is one invocation carrying up to `MaxConcludeReceipts` (1000) put receipts

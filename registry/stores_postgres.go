@@ -1054,17 +1054,16 @@ func (r *Postgres) DeleteSession(ctx context.Context, uploadID string) error {
 	return nil
 }
 
-func (r *Postgres) PutPart(ctx context.Context, p MultipartPart) error {
+func (r *Postgres) PutPart(ctx context.Context, p MultipartPart, tree *PartTree) error {
 	state := p.State
 	if state == "" {
 		state = PartParked
 	}
-	// A part without a tree writes zero / NULL tree columns; ListParts
-	// reads a zero chunk log back as no tree.
-	tree := p.Tree
-	if tree == nil {
-		tree = &PartTree{}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("registry: put part: begin: %w", err)
 	}
+	defer tx.Rollback(ctx)
 	// BlobDigests ([]multihash.Multihash) rides pgx's underlying-type plan into
 	// bytea[]: pgx must try that plan before its Stringer plan, or a Multihash
 	// (whose String() is base58) would land as text — pgx v5.10+ orders them
@@ -1075,34 +1074,54 @@ func (r *Postgres) PutPart(ctx context.Context, p MultipartPart) error {
 	// check re-evaluates and refuses the part; a latch arriving while this
 	// statement holds the row waits for the part to commit, so the
 	// teardown's part listing includes it.
-	tag, err := r.pool.Exec(ctx,
-		`INSERT INTO ingot.multipart_parts (upload_id, part_number, etag_md5, size, checksum, blob_digests, state,
-		                                    tree_offset, tree_chunk_log, tree_nodes, tree_blocks, tree_head, tree_tail, tree_root)
-		 SELECT s.upload_id, $2, $3, $4, $5, $6, $7, $9, $10, $11, $12, $13, $14, $15
+	tag, err := tx.Exec(ctx,
+		`INSERT INTO ingot.multipart_parts (upload_id, part_number, etag_md5, size, checksum, blob_digests, state)
+		 SELECT s.upload_id, $2, $3, $4, $5, $6, $7
 		   FROM ingot.multipart_sessions s
 		  WHERE s.upload_id = $1 AND s.state = $8
 		    FOR SHARE
 		 ON CONFLICT (upload_id, part_number) DO UPDATE
 		   SET etag_md5 = EXCLUDED.etag_md5, size = EXCLUDED.size, checksum = EXCLUDED.checksum,
-		       blob_digests = EXCLUDED.blob_digests, state = EXCLUDED.state,
-		       tree_offset = EXCLUDED.tree_offset, tree_chunk_log = EXCLUDED.tree_chunk_log,
-		       tree_nodes = EXCLUDED.tree_nodes, tree_blocks = EXCLUDED.tree_blocks,
-		       tree_head = EXCLUDED.tree_head, tree_tail = EXCLUDED.tree_tail, tree_root = EXCLUDED.tree_root`,
-		p.UploadID, p.PartNumber, p.ETagMD5, p.Size, p.Checksum, p.BlobDigests, state, SessionOpen,
-		tree.Offset, int16(tree.ChunkLog), tree.Nodes, tree.Blocks, tree.Head, tree.Tail, tree.Root)
+		       blob_digests = EXCLUDED.blob_digests, state = EXCLUDED.state`,
+		p.UploadID, p.PartNumber, p.ETagMD5, p.Size, p.Checksum, p.BlobDigests, state, SessionOpen)
 	if err != nil {
 		return fmt.Errorf("registry: put part: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
 		return ErrNotFound
 	}
+	// The tree row follows the part row: a superseding part without a tree
+	// must not keep its predecessor's.
+	if t := tree; t != nil {
+		_, err = tx.Exec(ctx,
+			`INSERT INTO ingot.multipart_part_trees (upload_id, part_number, tree_offset, chunk_log, nodes, blocks, head, tail, root)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+			 ON CONFLICT (upload_id, part_number) DO UPDATE
+			   SET tree_offset = EXCLUDED.tree_offset, chunk_log = EXCLUDED.chunk_log, nodes = EXCLUDED.nodes,
+			       blocks = EXCLUDED.blocks, head = EXCLUDED.head, tail = EXCLUDED.tail, root = EXCLUDED.root`,
+			p.UploadID, p.PartNumber, t.Offset, int16(t.ChunkLog), t.Nodes, t.Blocks, t.Head, t.Tail, t.Root)
+	} else {
+		_, err = tx.Exec(ctx, `DELETE FROM ingot.multipart_part_trees WHERE upload_id = $1 AND part_number = $2`, p.UploadID, p.PartNumber)
+	}
+	if err != nil {
+		return fmt.Errorf("registry: put part tree: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("registry: put part: commit: %w", err)
+	}
+	return nil
+}
+
+func (r *Postgres) DeletePartTrees(ctx context.Context, uploadID string) error {
+	if _, err := r.pool.Exec(ctx, `DELETE FROM ingot.multipart_part_trees WHERE upload_id = $1`, uploadID); err != nil {
+		return fmt.Errorf("registry: delete part trees: %w", err)
+	}
 	return nil
 }
 
 func (r *Postgres) ListParts(ctx context.Context, uploadID string) ([]MultipartPart, error) {
 	rows, err := r.pool.Query(ctx,
-		`SELECT part_number, etag_md5, size, checksum, blob_digests, state, created_at,
-		        tree_offset, tree_chunk_log, tree_nodes, tree_blocks, tree_head, tree_tail, tree_root
+		`SELECT part_number, etag_md5, size, checksum, blob_digests, state, created_at
 		 FROM ingot.multipart_parts WHERE upload_id = $1 ORDER BY part_number ASC`,
 		uploadID)
 	if err != nil {
@@ -1113,20 +1132,40 @@ func (r *Postgres) ListParts(ctx context.Context, uploadID string) ([]MultipartP
 	var out []MultipartPart
 	for rows.Next() {
 		p := MultipartPart{UploadID: uploadID}
-		var tree PartTree
-		var treeChunkLog int16
-		if err := rows.Scan(&p.PartNumber, &p.ETagMD5, &p.Size, &p.Checksum, &p.BlobDigests, &p.State, &p.CreatedAt,
-			&tree.Offset, &treeChunkLog, &tree.Nodes, &tree.Blocks, &tree.Head, &tree.Tail, &tree.Root); err != nil {
+		if err := rows.Scan(&p.PartNumber, &p.ETagMD5, &p.Size, &p.Checksum, &p.BlobDigests, &p.State, &p.CreatedAt); err != nil {
 			return nil, fmt.Errorf("registry: list parts scan: %w", err)
-		}
-		if treeChunkLog != 0 {
-			tree.ChunkLog = uint8(treeChunkLog)
-			p.Tree = &tree
 		}
 		out = append(out, p)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("registry: list parts rows: %w", err)
+	}
+	return out, nil
+}
+
+func (r *Postgres) ListPartTrees(ctx context.Context, uploadID string) (map[int]*PartTree, error) {
+	rows, err := r.pool.Query(ctx,
+		`SELECT part_number, tree_offset, chunk_log, nodes, blocks, head, tail, root
+		 FROM ingot.multipart_part_trees WHERE upload_id = $1`,
+		uploadID)
+	if err != nil {
+		return nil, fmt.Errorf("registry: list part trees: %w", err)
+	}
+	defer rows.Close()
+
+	out := map[int]*PartTree{}
+	for rows.Next() {
+		var n int
+		var chunkLog int16
+		t := &PartTree{}
+		if err := rows.Scan(&n, &t.Offset, &chunkLog, &t.Nodes, &t.Blocks, &t.Head, &t.Tail, &t.Root); err != nil {
+			return nil, fmt.Errorf("registry: list part trees scan: %w", err)
+		}
+		t.ChunkLog = uint8(chunkLog)
+		out[n] = t
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("registry: list part trees rows: %w", err)
 	}
 	return out, nil
 }

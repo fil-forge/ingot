@@ -258,26 +258,25 @@ type MultipartPart struct {
 	BlobDigests []multihash.Multihash
 	State       string
 	CreatedAt   time.Time
-
-	// Tree is the part's BLAKE3 tree material, from which Complete assembles
-	// the object's digest and block list without re-reading the part (see
-	// blake3tree). Nil when none was recorded (a part from before the tree
-	// existed, or a copy that read no bytes); Complete re-hashes such a part.
-	Tree *PartTree
 }
 
 // PartTree is the BLAKE3 tree material UploadPart records for one part: the
 // part hashed at the object offset it was assumed to sit at, as blake3tree
-// produces it (a blake3tree.Range, serialized). Complete checks the assumed
-// offset against the true one and, when they agree, merges this into the
-// object's tree without reading the part again.
+// produces it (a blake3tree.Range, serialized). It lives in its own row
+// (multipart_part_trees), written by PutPart beside the part, read back by
+// ListPartTrees for Complete alone, and dropped by DeletePartTrees once the
+// object is committed. Complete checks the assumed offset against the true
+// one and, when they agree, merges this into the object's tree without
+// reading the part again; a part without a tree (recorded before the tree
+// existed, or a copy that read no bytes) is re-hashed.
 type PartTree struct {
 	// Offset is the object byte offset the part was hashed at: the offset
 	// UploadPart assumed from the parts recorded so far, which Complete
 	// checks against the part's true offset.
 	Offset int64
 	// ChunkLog is the block size of Blocks as a base-2 exponent of BLAKE3
-	// chunks.
+	// chunks: that of a body ending where the part ends, the finest block
+	// the object can have when Offset proves true.
 	ChunkLog uint8
 	// Nodes holds the aligned subtrees of the part's whole chunks, encoded
 	// with blake3tree.EncodeSubtrees.
@@ -636,14 +635,28 @@ type MultipartStore interface {
 	// Returns true iff this caller performed the transition.
 	CompleteSession(ctx context.Context, uploadID, etag, versionID string) (bool, error)
 	DeleteSession(ctx context.Context, uploadID string) error
-	// PutPart records a part of an OPEN session, superseding a prior row for
-	// the part number, and returns ErrNotFound when the session is missing
-	// or no longer open: the write and the state check are one statement
-	// that holds the session row, so a part cannot land after a Complete or
-	// a teardown has taken the session, and a teardown's part listing sees
-	// every part that did land.
-	PutPart(ctx context.Context, p MultipartPart) error
+	// PutPart records a part of an OPEN session and its tree (nil for none),
+	// superseding a prior row for the part number and its tree row, and
+	// returns ErrNotFound when the session is missing or no longer open: the
+	// write and the state check are one statement that holds the session
+	// row, so a part cannot land after a Complete or a teardown has taken
+	// the session, and a teardown's part listing sees every part that did
+	// land.
+	PutPart(ctx context.Context, p MultipartPart, tree *PartTree) error
+	// ListParts returns uploadID's parts in part-number order. The trees
+	// are separate (ListPartTrees): a part's tree is up to hundreds of KiB
+	// and only Complete merges them, while UploadPart, ListParts and the
+	// teardown list the parts of every upload, large ones once per part.
 	ListParts(ctx context.Context, uploadID string) ([]MultipartPart, error)
+	// ListPartTrees returns uploadID's recorded part trees by part number,
+	// for Complete, which already holds the parts from ListParts. A part
+	// without a tree has no entry.
+	ListPartTrees(ctx context.Context, uploadID string) (map[int]*PartTree, error)
+	// DeletePartTrees drops uploadID's tree rows. Complete calls it once the
+	// object is committed: the manifest then holds the object's tree and
+	// nothing reads the parts' again, while the part rows themselves stay
+	// for the idempotent re-Complete. A missing upload is not an error.
+	DeletePartTrees(ctx context.Context, uploadID string) error
 	// ListSessions returns bucket's sessions ordered by (object_key, created_at,
 	// upload_id) — the S3 ListMultipartUploads presentation order. Filtering
 	// (prefix/markers/max) happens in the handler; in-flight session counts are

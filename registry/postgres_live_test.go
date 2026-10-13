@@ -1,6 +1,7 @@
 package registry_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -645,15 +646,50 @@ func TestPostgresStores_Live(t *testing.T) {
 		_ = r.DeleteSession(ctx, id+"-space")
 
 		// bytea[] round trip + ordering.
-		if err := r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 2, ETagMD5: []byte{0x02}, Size: 2, BlobDigests: []multihash.Multihash{{0xd2}}}); err != nil {
+		if err := r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 2, ETagMD5: []byte{0x02}, Size: 2, BlobDigests: []multihash.Multihash{{0xd2}}}, nil); err != nil {
 			t.Fatalf("PutPart 2: %v", err)
 		}
-		if err := r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 1, ETagMD5: []byte{0x01}, Size: 1, BlobDigests: []multihash.Multihash{{0xd1, 0xa}, {0xd1, 0xb}}}); err != nil {
+		if err := r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 1, ETagMD5: []byte{0x01}, Size: 1, BlobDigests: []multihash.Multihash{{0xd1, 0xa}, {0xd1, 0xb}}},
+			&registry.PartTree{Offset: 0, ChunkLog: 4, Nodes: []byte{0x0a}, Blocks: []byte{0x0b, 0x0c}, Head: []byte{0x0d}, Tail: []byte{0x0e}, Root: []byte{0x0f}}); err != nil {
 			t.Fatalf("PutPart 1: %v", err)
 		}
 		parts, err := r.ListParts(ctx, id)
 		if err != nil || len(parts) != 2 || parts[0].PartNumber != 1 || len(parts[0].BlobDigests) != 2 {
 			t.Fatalf("ListParts = %+v, err %v", parts, err)
+		}
+		// The tree listing round-trips the tree rows by part number, absent
+		// where none was recorded.
+		trees, err := r.ListPartTrees(ctx, id)
+		if err != nil || len(trees) != 1 || trees[1] == nil {
+			t.Fatalf("ListPartTrees = %+v, err %v; want part 1's tree only", trees, err)
+		}
+		if tr := trees[1]; tr.ChunkLog != 4 || !bytes.Equal(tr.Blocks, []byte{0x0b, 0x0c}) || !bytes.Equal(tr.Head, []byte{0x0d}) || !bytes.Equal(tr.Tail, []byte{0x0e}) || !bytes.Equal(tr.Root, []byte{0x0f}) {
+			t.Fatalf("part 1 tree = %+v", tr)
+		}
+		// A superseding part without a tree drops its predecessor's row; one
+		// with a tree replaces it.
+		if err := r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 1, ETagMD5: []byte{0x01}, Size: 1, BlobDigests: []multihash.Multihash{{0xd1}}}, nil); err != nil {
+			t.Fatalf("PutPart 1 again: %v", err)
+		}
+		if again, _ := r.ListPartTrees(ctx, id); again[1] != nil {
+			t.Fatalf("superseded part kept its tree: %+v", again[1])
+		}
+		if err := r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 2, ETagMD5: []byte{0x02}, Size: 2, BlobDigests: []multihash.Multihash{{0xd2}}},
+			&registry.PartTree{Offset: 1, ChunkLog: 5, Nodes: []byte{0x1a}, Blocks: []byte{0x1b}}); err != nil {
+			t.Fatalf("PutPart 2 with tree: %v", err)
+		}
+		if again, _ := r.ListPartTrees(ctx, id); again[2] == nil || again[2].Offset != 1 || again[2].ChunkLog != 5 || again[2].Head != nil {
+			t.Fatalf("part 2 tree = %+v", again[2])
+		}
+		// Deleting the trees keeps the part records.
+		if err := r.DeletePartTrees(ctx, id); err != nil {
+			t.Fatalf("DeletePartTrees: %v", err)
+		}
+		if after, _ := r.ListPartTrees(ctx, id); len(after) != 0 {
+			t.Fatalf("after DeletePartTrees = %+v, want no trees", after)
+		}
+		if after, _ := r.ListParts(ctx, id); len(after) != 2 {
+			t.Fatalf("after DeletePartTrees = %+v, want two part records", after)
 		}
 
 		// single-winner latch
@@ -663,10 +699,10 @@ func TestPostgresStores_Live(t *testing.T) {
 		}
 		// A part cannot land once the session has left 'open', nor on a
 		// session that does not exist.
-		if err := r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 3, ETagMD5: []byte{0x03}, Size: 3, BlobDigests: []multihash.Multihash{{0xd3}}}); !errors.Is(err, registry.ErrNotFound) {
+		if err := r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 3, ETagMD5: []byte{0x03}, Size: 3, BlobDigests: []multihash.Multihash{{0xd3}}}, nil); !errors.Is(err, registry.ErrNotFound) {
 			t.Fatalf("PutPart on a completing session = %v, want ErrNotFound", err)
 		}
-		if err := r.PutPart(ctx, registry.MultipartPart{UploadID: "no-such-upload", PartNumber: 1, ETagMD5: []byte{0x01}, Size: 1, BlobDigests: []multihash.Multihash{{0xd1}}}); !errors.Is(err, registry.ErrNotFound) {
+		if err := r.PutPart(ctx, registry.MultipartPart{UploadID: "no-such-upload", PartNumber: 1, ETagMD5: []byte{0x01}, Size: 1, BlobDigests: []multihash.Multihash{{0xd1}}}, nil); !errors.Is(err, registry.ErrNotFound) {
 			t.Fatalf("PutPart on a missing session = %v, want ErrNotFound", err)
 		}
 		if parts, _ := r.ListParts(ctx, id); len(parts) != 2 {
@@ -729,10 +765,10 @@ func TestPostgresStores_Live(t *testing.T) {
 
 		// CountPartRefs: bytea[] ANY-match across sessions, excluding one.
 		shared := []byte{0xee, 0x01}
-		if err := r.PutPart(ctx, registry.MultipartPart{UploadID: "ls-1", PartNumber: 1, ETagMD5: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{shared}}); err != nil {
+		if err := r.PutPart(ctx, registry.MultipartPart{UploadID: "ls-1", PartNumber: 1, ETagMD5: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{shared}}, nil); err != nil {
 			t.Fatalf("PutPart ls-1: %v", err)
 		}
-		if err := r.PutPart(ctx, registry.MultipartPart{UploadID: "ls-2", PartNumber: 1, ETagMD5: []byte{2}, Size: 1, BlobDigests: []multihash.Multihash{shared, {0xee, 0x02}}}); err != nil {
+		if err := r.PutPart(ctx, registry.MultipartPart{UploadID: "ls-2", PartNumber: 1, ETagMD5: []byte{2}, Size: 1, BlobDigests: []multihash.Multihash{shared, {0xee, 0x02}}}, nil); err != nil {
 			t.Fatalf("PutPart ls-2: %v", err)
 		}
 		if n, err := r.CountPartRefs(ctx, shared, "ls-1"); err != nil || n != 1 {

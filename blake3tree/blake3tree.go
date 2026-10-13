@@ -139,9 +139,12 @@ type Range struct {
 	// merge into their union's, and a body's merge to its root (see
 	// RootFromSubtrees).
 	Subtrees []Subtree
-	// ChunkLog is the block size of Blocks: ChunkLog(Size), which never
-	// exceeds the block of any body containing the range, so a body's blocks
-	// can be built from its ranges' blocks and subtrees.
+	// ChunkLog is the block size of Blocks: ChunkLog(Size) from NewHasher,
+	// or the chunk log given to NewHasherAtChunkLog. Assemble builds a
+	// body's blocks from its ranges' blocks and subtrees, so it needs each
+	// range's block no coarser than the body's; ChunkLog(Size) never is,
+	// and neither is ChunkLog(Offset+Size), the size of the body's bytes
+	// up to the range's end.
 	ChunkLog uint8
 	// Blocks holds the chaining values of the blocks that lie wholly within
 	// the range's whole chunks, in order. A block the range only partly
@@ -218,9 +221,10 @@ func NewHasher(offset int64) (*Hasher, error) {
 }
 
 // NewHasherAtChunkLog is NewHasher with the block size fixed at 2^chunkLog
-// chunks instead of following ChunkLog as the body grows. It is for
-// producing a Bao outboard at a block size chosen by the reader rather than
-// by ingot: 4 is iroh's fixed 16 KiB block, 0 the original Bao chunk. The
+// chunks instead of following ChunkLog as the body grows. It produces a Bao
+// outboard at a block size chosen by the reader rather than by ingot (4 is
+// iroh's fixed 16 KiB block, 0 the original Bao chunk), and a range's
+// blocks at the coarsest size its body can be known to allow. The
 // chunk log may run from 0 to MaxChunkLog. The blocks are held in memory,
 // 32 bytes per block, so a fine block over a large body costs accordingly.
 func NewHasherAtChunkLog(offset int64, chunkLog_ uint8) (*Hasher, error) {

@@ -228,10 +228,24 @@ func TestRangeLeafCap(t *testing.T) {
 // aligned, ascending, excluding 0 and len(d)).
 func cutRanges(t *testing.T, d []byte, cuts []int64) []Range {
 	t.Helper()
+	return cutRangesWith(t, d, cuts, func(start, _ int64) (*Hasher, error) { return NewHasher(start) })
+}
+
+// cutRangesCoarse is cutRanges with each range's blocks at the block size
+// of the body up to the range's end, as UploadPart records a part's.
+func cutRangesCoarse(t *testing.T, d []byte, cuts []int64) []Range {
+	t.Helper()
+	return cutRangesWith(t, d, cuts, func(start, end int64) (*Hasher, error) {
+		return NewHasherAtChunkLog(start, ChunkLog(end))
+	})
+}
+
+func cutRangesWith(t *testing.T, d []byte, cuts []int64, newHasher func(start, end int64) (*Hasher, error)) []Range {
+	t.Helper()
 	bounds := append(append([]int64{0}, cuts...), int64(len(d)))
 	var out []Range
 	for i := 0; i+1 < len(bounds); i++ {
-		h, err := NewHasher(bounds[i])
+		h, err := newHasher(bounds[i], bounds[i+1])
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -244,7 +258,8 @@ func cutRanges(t *testing.T, d []byte, cuts []int64) []Range {
 // TestAssemble checks that a body's tree assembled from its ranges equals
 // the one hashed in a single pass, for random chunk-aligned cuts, uniform
 // cuts with a short tail (the multipart norm), a single range, and ranges
-// whose blocks straddle cuts at a coarse group.
+// whose blocks straddle cuts at a coarse group; each with the ranges'
+// blocks sized by the range alone and by the body up to the range's end.
 func TestAssemble(t *testing.T) {
 	for _, size := range testSizes {
 		d := data(size)
@@ -300,33 +315,41 @@ func TestAssemble(t *testing.T) {
 			}
 		}
 		for _, cuts := range cutSets {
-			ranges := cutRanges(t, d, cuts)
-			// Round-trip the storage encoding on the way.
-			for i := range ranges {
-				subs, err := DecodeSubtrees(EncodeSubtrees(ranges[i].Subtrees))
-				if err != nil {
-					t.Fatal(err)
-				}
-				ranges[i].Subtrees = subs
+			for _, cut := range []func(*testing.T, []byte, []int64) []Range{cutRanges, cutRangesCoarse} {
+				assembleMatches(t, want, cut(t, d, cuts))
 			}
-			got, ok := Assemble(ranges)
-			if !ok {
-				t.Errorf("size %d, %d ranges: Assemble not ok", size, len(ranges))
-				continue
-			}
-			if got.Root != want.Root || got.ChunkLog != want.ChunkLog || got.Size != want.Size {
-				t.Errorf("size %d, %d ranges: root/chunk log/size differ", size, len(ranges))
-			}
-			if len(got.Blocks) != len(want.Blocks) {
-				t.Errorf("size %d, %d ranges: %d blocks, want %d", size, len(ranges), len(got.Blocks), len(want.Blocks))
-				continue
-			}
-			for i := range got.Blocks {
-				if got.Blocks[i] != want.Blocks[i] {
-					t.Errorf("size %d, %d ranges: block %d differs", size, len(ranges), i)
-					break
-				}
-			}
+		}
+	}
+}
+
+// assembleMatches checks that ranges assemble into want, round-tripping
+// their subtrees through the storage encoding on the way.
+func assembleMatches(t *testing.T, want Object, ranges []Range) {
+	t.Helper()
+	size := want.Size
+	for i := range ranges {
+		subs, err := DecodeSubtrees(EncodeSubtrees(ranges[i].Subtrees))
+		if err != nil {
+			t.Fatal(err)
+		}
+		ranges[i].Subtrees = subs
+	}
+	got, ok := Assemble(ranges)
+	if !ok {
+		t.Errorf("size %d, %d ranges: Assemble not ok", size, len(ranges))
+		return
+	}
+	if got.Root != want.Root || got.ChunkLog != want.ChunkLog || got.Size != want.Size {
+		t.Errorf("size %d, %d ranges: root/chunk log/size differ", size, len(ranges))
+	}
+	if len(got.Blocks) != len(want.Blocks) {
+		t.Errorf("size %d, %d ranges: %d blocks, want %d", size, len(ranges), len(got.Blocks), len(want.Blocks))
+		return
+	}
+	for i := range got.Blocks {
+		if got.Blocks[i] != want.Blocks[i] {
+			t.Errorf("size %d, %d ranges: block %d differs", size, len(ranges), i)
+			break
 		}
 	}
 }
