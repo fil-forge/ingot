@@ -14,7 +14,7 @@ import (
 	"github.com/aws/smithy-go"
 	"github.com/aws/smithy-go/middleware"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
-	"github.com/fil-forge/hilt/pkg/bucketpolicy"
+	s3bkt "github.com/fil-forge/libforge/commands/s3/bucket"
 )
 
 // TestForgeBucketPolicy drives the S3 bucket policy operations end to end: a
@@ -51,9 +51,9 @@ func TestForgeBucketPolicy(t *testing.T) {
 	}
 
 	// Written out of order and with a duplicate; read back sorted and deduplicated.
-	objects := bucketpolicy.ObjectsARN(bucket)
+	objects := s3bkt.ObjectsARN(bucket)
 	written := fmt.Sprintf(`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":[%q]},"Action":["s3:PutObject","s3:GetObject","s3:PutObject"],"Resource":%q}]}`,
-		bucketpolicy.UserARN(principal), objects)
+		s3bkt.UserARN(principal), objects)
 	put, err := client.PutBucketPolicy(ctx, &s3.PutBucketPolicyInput{Bucket: aws.String(bucket), Policy: aws.String(written)})
 	if err != nil {
 		t.Fatalf("PutBucketPolicy: %v", err)
@@ -67,7 +67,7 @@ func TestForgeBucketPolicy(t *testing.T) {
 		t.Fatalf("GetBucketPolicy: %v", err)
 	}
 	want := fmt.Sprintf(`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":[%q]},"Action":["s3:GetObject","s3:PutObject"],"Resource":[%q]}]}`,
-		bucketpolicy.UserARN(principal), objects)
+		s3bkt.UserARN(principal), objects)
 	if aws.ToString(got.Policy) != want {
 		t.Fatalf("GetBucketPolicy = %s, want %s", aws.ToString(got.Policy), want)
 	}
@@ -84,7 +84,7 @@ func TestForgeBucketPolicy(t *testing.T) {
 		// versitygw's validation finds no account for a bare name.
 		"a bare principal name": fmt.Sprintf(`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":[%q]},"Action":"s3:GetObject","Resource":%q}]}`, principal, objects),
 		// versitygw defaults the Version; Hilt requires it.
-		"no Version": fmt.Sprintf(`{"Statement":[{"Effect":"Allow","Principal":{"AWS":[%q]},"Action":"s3:GetObject","Resource":%q}]}`, bucketpolicy.UserARN(principal), objects),
+		"no Version": fmt.Sprintf(`{"Statement":[{"Effect":"Allow","Principal":{"AWS":[%q]},"Action":"s3:GetObject","Resource":%q}]}`, s3bkt.UserARN(principal), objects),
 	} {
 		if _, err := client.PutBucketPolicy(ctx, &s3.PutBucketPolicyInput{Bucket: aws.String(bucket), Policy: aws.String(doc)}); !isS3Code(err, "MalformedPolicy") {
 			t.Fatalf("PutBucketPolicy with %s: got %v, want MalformedPolicy", name, err)

@@ -6,7 +6,6 @@ import (
 	"fmt"
 
 	bucketpolicysvc "github.com/fil-forge/hilt/pkg/api/service/bucketpolicy"
-	"github.com/fil-forge/hilt/pkg/bucketpolicy"
 	hiltclient "github.com/fil-forge/hilt/pkg/client"
 	bucketrpc "github.com/fil-forge/hilt/pkg/rpc/service/bucket"
 	"github.com/fil-forge/libforge/commands/s3"
@@ -98,7 +97,7 @@ func (s *Service) BucketPolicy(ctx context.Context, req s3.Request, body []byte)
 				return nil, ErrNotFound
 			case bucketpolicysvc.PolicyNotFoundErrorName:
 				return nil, ErrNoPolicy
-			case bucketpolicy.InvalidPolicyErrorName:
+			case s3bkt.InvalidPolicyErrorName:
 				return nil, fmt.Errorf("%w: %s", ErrMalformedPolicy, namedErr.Error())
 			case bucketpolicysvc.PreconditionFailedErrorName:
 				return nil, ErrPreconditionFailed
