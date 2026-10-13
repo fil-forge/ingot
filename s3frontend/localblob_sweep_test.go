@@ -454,7 +454,7 @@ func TestRemoveReleasedPublishedRetriesACopyItCannotRemove(t *testing.T) {
 	b.localBlobSweepBatch = 1
 	var digests []multihash.Multihash
 	for i := range 3 {
-		d, n, err := b.spool.WriteBlob(ctx, bytes.NewReader([]byte(fmt.Sprintf("released %d", i))))
+		d, n, err := b.spool.WriteBlob(ctx, bytes.NewReader(fmt.Appendf(nil, "released %d", i)))
 		if err != nil {
 			t.Fatalf("WriteBlob: %v", err)
 		}
