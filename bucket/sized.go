@@ -2,7 +2,6 @@ package bucket
 
 import (
 	"context"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -43,20 +42,14 @@ func SplitSizedBody(ctx context.Context, w SizedBlobWriter, r io.Reader, size, m
 	if size < 0 {
 		return Body{}, fmt.Errorf("bucket: negative body size %d", size)
 	}
-	cfg := splitConfig{md5: true}
+	cfg := splitConfig{md5: true, tree: true}
 	for _, o := range opts {
 		o(&cfg)
 	}
 
-	bodyHasher := sha256.New()
-	hashers := []io.Writer{bodyHasher}
-	var etagHasher *lazyETagHash
-	if cfg.md5 {
-		etagHasher = &lazyETagHash{}
-		defer etagHasher.Sum()
-		hashers = append(hashers, etagHasher)
-	}
-	src := io.TeeReader(r, io.MultiWriter(hashers...))
+	hashes := newBodyHashes(cfg)
+	defer hashes.stop()
+	src := io.TeeReader(r, hashes.writer())
 
 	var blobs []BlobRef
 	var total int64
@@ -80,15 +73,7 @@ func SplitSizedBody(ctx context.Context, w SizedBlobWriter, r io.Reader, size, m
 		}
 	}
 
-	body := Body{
-		Size:   total,
-		SHA256: bodyHasher.Sum(nil),
-		Blobs:  blobs,
-	}
-	if etagHasher != nil {
-		body.MD5 = etagHasher.Sum()
-	}
-	return body, nil
+	return hashes.body(total, blobs)
 }
 
 // exactReader yields exactly remaining bytes of src. The body's last blob also

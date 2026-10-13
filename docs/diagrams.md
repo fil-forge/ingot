@@ -123,7 +123,7 @@ flowchart TB
 
     subgraph host["host"]
         root["ingot (root)<br/>Server, Module"]
-        cmd["cmd<br/>serve, whoami, version"]
+        cmd["cmd<br/>serve, whoami, version, blake3"]
     end
 
     vgw -->|"backend.Backend"| s3f
@@ -176,7 +176,7 @@ flowchart TB
     put["PutObject / UploadPart body"]
 
     subgraph bodyr["the body route (raw blobs, synchronous)"]
-        split["SplitSizedBody at the declared length:<br/>coarse split at max_blob_size,<br/>sha256 + md5 in one streaming pass"]
+        split["SplitSizedBody at the declared length:<br/>coarse split at max_blob_size,<br/>BLAKE3 tree + md5 in one streaming pass"]
         spool["Spool (DataDir/spool)<br/>+ upload_intents row<br/>(each blob streams its PUT<br/>to the provider while it is spooled)"]
         upload["per-blob upload before the commit:<br/>conclude, accept (streamed), or<br/>/blob/add, HTTP PUT, conclude, accept<br/>(a blob_locations hit skips it: dedup)"]
         bloc["blob_locations row: the whole blob,<br/>(space, digest) to provider URL"]
@@ -268,7 +268,7 @@ sequenceDiagram
         U-->>B: allocation address, put and accept tasks
         B->>R: PutStream(add task): the upload's name until parked or accepted
         par
-            B->>SP: spool under the CIPHERTEXT digest<br/>(sha256 + md5 of the plaintext in the same pass)
+            B->>SP: spool under the CIPHERTEXT digest<br/>(BLAKE3 tree + md5 of the plaintext in the same pass)
         and
             B->>P: HTTP PUT the same envelope bytes as they are spooled
         end
@@ -318,7 +318,7 @@ sequenceDiagram
   accepted.
 - Encryption makes the stored digest a ciphertext digest: **content dedup is
   gone for bodies** (fresh CEK per write ⇒ unique envelope), by design per
-  the encryption RFC. Manifest spans, `Body.Size`, sha256/md5 and ETag stay
+  the encryption RFC. Manifest spans, `Body.Size`, the BLAKE3 tree, md5 and ETag stay
   plaintext values; `upload_intents.Size` and `blob_locations.Size` are
   stored (envelope) sizes.
 - The envelope's one COSE recipient is the tenant wrap key (kid = the key's
@@ -695,7 +695,7 @@ flowchart TB
     prev["Prev: per-key sub-MST of noncurrent versions<br/>keyed revSeqKey(seq): %016x of bit-inverted seq,<br/>so a forward walk is newest-first"]
     nulls["NullSeq: a noncurrent null<br/>version's seq (0 = none)"]
     em["EnvelopedManifest<br/>one per noncurrent version"]
-    mf["ObjectManifest<br/>Seq, VersionID, DeleteMarker, ETag, headers,<br/>Body(Size, SHA256, MD5, Blobs, PartSizes)"]
+    mf["ObjectManifest<br/>Seq, VersionID, DeleteMarker, ETag, headers,<br/>Body(Size, BLAKE3, TreeChunkLog, TreeBlocks,<br/>MD5, Blobs, PartSizes)"]
 
     root --> leafk --> union
     union --> mans
@@ -1004,6 +1004,17 @@ erDiagram
         text checksum
         text state "'accepted' never written"
     }
+    multipart_part_trees {
+        text upload_id PK, FK
+        int part_number PK, FK
+        bigint tree_offset "object offset the part's BLAKE3 tree was hashed at (assumed by UploadPart)"
+        smallint chunk_log "block size of blocks, base-2 exponent of chunks"
+        bytea nodes "the part's aligned subtrees (blake3tree.EncodeSubtrees)"
+        bytea blocks "the part's blocks at chunk_log; up to 320 KiB for a 5 GiB part"
+        bytea head "bytes before the part's first chunk boundary (< 1 KiB)"
+        bytea tail "bytes after its last chunk boundary (< 1 KiB)"
+        bytea root "the part's own BLAKE3 hash, when hashed at offset 0"
+    }
     blob_release_intents {
         text space PK
         bytea digest PK
@@ -1017,6 +1028,7 @@ erDiagram
 
     segments ||--o{ segment_op_roots : "ON DELETE CASCADE"
     multipart_sessions ||--o{ multipart_parts : "ON DELETE CASCADE"
+    multipart_parts ||--o| multipart_part_trees : "ON DELETE CASCADE; deleted by Complete once the object commits"
     buckets ||..o{ segments : "by bucket name, no FK"
     buckets ||..o{ blob_refs : "by bucket name, no FK"
     blob_locations ||..o{ shard_inclusions : "by shard_digest"
@@ -1024,7 +1036,7 @@ erDiagram
     multipart_parts ||..o{ blob_release_intents : "teardown records, by digest"
 ```
 
-- The two solid relationships are the schema's only real foreign keys;
+- The three solid relationships are the schema's only real foreign keys;
   dashed ones are soft joins the code performs.
 - `gc_candidates` is write-only (no reader exists yet; its entry paths are the
   [catalog GC candidates](#catalog-gc-candidates-what-gets-remembered-for-removal)

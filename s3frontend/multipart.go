@@ -27,6 +27,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.uber.org/zap"
 
+	"github.com/fil-forge/ingot/blake3tree"
 	msbucket "github.com/fil-forge/ingot/bucket"
 	"github.com/fil-forge/ingot/internal/tracing"
 	"github.com/fil-forge/ingot/registry"
@@ -328,11 +329,12 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 	// and key rows.
 	//
 	// Only the part being written is read here. Listing the whole session
-	// costs a row per part already uploaded, so doing it on every part is
+	// returns a row per part already uploaded, so doing it on every part is
 	// quadratic in the part count: the AWS CLI's 8 MiB default chunk makes
 	// a 5 GiB object 640 parts and ~200k rows read. The two paths below
 	// that release something ask the registry which of their digests a
-	// sibling part still names.
+	// sibling part still names, and the tree's offset comes from the
+	// PartsBelow aggregate.
 	var superseded []mh.Multihash
 	priorPart, err := b.multipart.GetPart(ctx, uploadID, partNumber)
 	if err != nil && !errors.Is(err, registry.ErrNotFound) {
@@ -376,7 +378,32 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 			return nil, fmt.Errorf("s3frontend: record superseded part releases: %w", err)
 		}
 	}
-	spooled, err := b.splitSpool(ctx, sess.Bucket, space, bodyReader, size, md5Src, sess.Plaintext)
+	// The part's BLAKE3 tree, hashed at the offset the part is assumed to
+	// sit at in the object (see assumedPartOffset), whole chunks only, with
+	// the bytes either side of them kept raw; Complete merges the parts'
+	// trees into the object's digest and blocks and hashes the chunks that
+	// straddle part boundaries from those raw bytes. The split's own whole-body tree is
+	// skipped: it would be the tree of the part alone, at offset 0.
+	//
+	// The blocks are recorded at the block size of a treeOffset+size body.
+	// Complete uses the tree only when treeOffset proves to be the part's
+	// true offset, and the object then holds at least those bytes, so its
+	// block is no finer (blake3tree.ChunkLog is monotone). Sizing the blocks
+	// by the part alone would record far more than the object needs: a
+	// 5 GiB part has 10,240 blocks of 512 KiB, where a 10,000-part upload of
+	// them has 2 GiB blocks.
+	below, err := b.multipart.PartsBelow(ctx, uploadID, partNumber)
+	if err != nil {
+		return nil, fmt.Errorf("s3frontend: summarize lower parts: %w", err)
+	}
+	treeOffset := assumedPartOffset(below, partNumber, size)
+	tree, err := blake3tree.NewHasherAtChunkLog(treeOffset, blake3tree.ChunkLog(treeOffset+size))
+	if err != nil {
+		tree = nil
+	} else {
+		bodyReader = io.TeeReader(bodyReader, tree)
+	}
+	spooled, err := b.splitSpool(ctx, sess.Bucket, space, bodyReader, size, md5Src, sess.Plaintext, msbucket.WithoutTree())
 	if err != nil {
 		var apiErr s3err.APIError
 		if errors.As(err, &apiErr) {
@@ -387,7 +414,7 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 	defer spooled.lease.end()
 	defer spooled.unholdAll()
 	rec := spooled.Body
-	if err := b.multipart.PutPart(ctx, registry.MultipartPart{
+	part := registry.MultipartPart{
 		UploadID:    uploadID,
 		PartNumber:  partNumber,
 		ETagMD5:     rec.MD5,
@@ -395,7 +422,12 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 		Checksum:    hr.Sum(),
 		BlobDigests: bodyDigests(rec),
 		State:       registry.PartParked,
-	}); err != nil {
+	}
+	var partTree *registry.PartTree
+	if tree != nil {
+		partTree = partTreeOf(tree.FinishRange())
+	}
+	if err := b.multipart.PutPart(ctx, part, partTree); err != nil {
 		// No part row points at the spooled blobs now, whatever went wrong:
 		// the session was completed, aborted or torn down after this upload
 		// was admitted (ErrNotFound), or the write failed. Their release is
@@ -553,6 +585,9 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 	if input.MultipartUpload == nil || len(input.MultipartUpload.Parts) == 0 {
 		return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrInvalidPart)
 	}
+	// Without the trees: validation and the replay of a completed upload
+	// need part numbers, sizes, ETags and checksums only, and the trees are
+	// gone once an upload completes. The winner loads them after the latch.
 	stored, err := b.multipart.ListParts(ctx, uploadID)
 	if err != nil {
 		return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: list parts: %w", err)
@@ -646,10 +681,12 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 	// (backend.MinPartSize — an S3 constant clients and SDKs assume, not an
 	// operator knob).
 	var total int64
+	trueOffsets := make([]int64, 0, len(requested))
 	for i, sp := range requested {
 		if i < len(requested)-1 && sp.Size < backend.MinPartSize {
 			return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrEntityTooSmall)
 		}
+		trueOffsets = append(trueOffsets, total)
 		total += sp.Size
 	}
 	if input.MpuObjectSize != nil {
@@ -766,10 +803,28 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 		}
 	}()
 
+	// The winner alone needs the parts' trees: the object's digest is
+	// assembled from them, and a non-final part hashed at a wrong assumed
+	// offset (variable sizes uploaded out of order) is read back from its
+	// storage node first, within a budget. Over it the completion is refused
+	// here, before any part is accepted, and the revert above reopens the
+	// upload for a retry. A replay never gets here, which matters because a
+	// completed upload's trees are deleted (below) and would count as
+	// re-hash in full.
+	trees, err := b.multipart.ListPartTrees(ctx, uploadID)
+	if err != nil {
+		return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: list part trees: %w", err)
+	}
+	if need := rehashNeeded(requested, trees, trueOffsets); need > b.rehashBudget {
+		b.logger.Info("multipart completion refused: re-hash over budget",
+			zap.String("key", key), zap.Int("parts", len(requested)), zap.Int64("size", total), zap.Int64("rehash", need), zap.Int64("budget", b.rehashBudget))
+		return s3response.CompleteMultipartUploadResult{}, "", errPartLayoutOverBudget(need, b.rehashBudget)
+	}
+
 	// Assemble the ordered body: each part's byte span (it may span several
 	// blobs) is recorded so a later GET/HEAD ?partNumber=N can address it (§7.2).
 	var blobs []msbucket.BlobRef
-	var partSizes []int64
+	var partSizes, partOffsets []int64
 	// Per-part checksums are retained only for a COMPOSITE checksummed upload
 	// (and only when every part recorded one). AWS exposes the per-part list and
 	// a ?partNumber checksum solely for composite multipart objects; a
@@ -797,6 +852,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 			offset += plainLen
 		}
 		partSizes = append(partSizes, offset-partStart)
+		partOffsets = append(partOffsets, partStart)
 		if recordPartChecksums {
 			partChecksums = append(partChecksums, sp.Checksum)
 		}
@@ -810,11 +866,23 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 		return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: accept parts: %w", err)
 	}
 
+	// The object's BLAKE3 digest and blocks, assembled from the parts' trees,
+	// re-reading a part only where its record cannot serve (bounded above,
+	// before the parts were accepted).
+	body := msbucket.Body{Size: offset, Blobs: blobs, PartSizes: partSizes, PartChecksums: partChecksums}
+	tree, err := b.multipartTree(ctx, bucketState.Space, sess.Plaintext, requested, trees, partOffsets, body)
+	if err != nil {
+		return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: object tree: %w", err)
+	}
+	if err := body.SetTree(tree); err != nil {
+		return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: object tree: %w", err)
+	}
+
 	mf := &msbucket.ObjectManifest{
 		Key:                     key,
 		ContentType:             sess.ContentType,
 		Created:                 time.Now().Unix(),
-		Body:                    msbucket.Body{Size: offset, Blobs: blobs, PartSizes: partSizes, PartChecksums: partChecksums},
+		Body:                    body,
 		ETag:                    etag,
 		ContentEncoding:         sess.ContentEncoding,
 		ContentDisposition:      sess.ContentDisposition,
@@ -899,6 +967,14 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 	// leaves them to the object path whatever has become of the object.
 	if _, err := b.multipart.CompleteSession(ctx, uploadID, etag, node.VersionID); err != nil {
 		b.logger.Warn("latch session to completed failed; sweeper reaps the completing row after the TTL",
+			zap.String("uploadID", uploadID), zap.Error(err))
+	}
+	// The parts' tree material is dead now that the manifest holds the
+	// object's tree, and it is the bulk of a large upload's rows (up to
+	// about 320 KiB per 5 GiB part). Best-effort: rows a failure leaves go
+	// with the session when the sweeper reaps it.
+	if err := b.multipart.DeletePartTrees(ctx, uploadID); err != nil {
+		b.logger.Warn("delete part trees after commit failed; they go with the session row",
 			zap.String("uploadID", uploadID), zap.Error(err))
 	}
 

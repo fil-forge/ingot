@@ -27,6 +27,10 @@ type ServerConfig struct {
 	// 0 → bucket.DefaultMaxBlobSize.
 	MaxBlobSize int64
 
+	// MultipartRehashBudget bounds the bytes CompleteMultipartUpload re-reads
+	// for parts hashed at a wrong assumed offset. 0 → s3frontend default.
+	MultipartRehashBudget int64
+
 	// Catalog plane seal threshold, ship gate, and retention. Zero
 	// SealBytes/SealAge pick logstore defaults (64 MiB / 5 s); zero Retain → 6
 	// (ignored for a non-shipping plane, which is retained indefinitely).

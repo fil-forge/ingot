@@ -111,8 +111,10 @@ func TestBuild_AllowanceHeaders(t *testing.T) {
 			t.Errorf("Methods = %q, want it to include %s", allowance.Methods, m)
 		}
 	}
-	if !strings.Contains(allowance.ExposedHeaders, "ETag") {
-		t.Errorf("ExposedHeaders = %q, want it to include ETag", allowance.ExposedHeaders)
+	for _, h := range []string{"ETag", "x-cid"} {
+		if !strings.Contains(allowance.ExposedHeaders, h) {
+			t.Errorf("ExposedHeaders = %q, want it to include %s", allowance.ExposedHeaders, h)
+		}
 	}
 	if allowance.MaxAge == nil || *allowance.MaxAge != maxAgeSeconds {
 		t.Errorf("MaxAge = %v, want %d", allowance.MaxAge, maxAgeSeconds)

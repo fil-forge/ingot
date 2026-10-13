@@ -135,7 +135,7 @@ seq-derived token reveals write ordering, which is accepted (S3 ids are opaque t
 **ETags.** The ETag is MD5-based, never the sha256 content digest. A whole-object ETag is the MD5 of
 the body; a multipart object's ETag is `hex(md5(concat of the N part MD5s)) + "-N"` (matching
 versitygw's `GetMultipartMD5`); each part's ETag is the hex of its MD5. MD5 is computed during ingest
-alongside sha256 at no extra pass, and stored in the manifest.
+alongside the BLAKE3 tree at no extra pass, and stored in the manifest.
 
 **Conditional requests.** versitygw parses `If-Match`/`If-None-Match`/`If-(Un)Modified-Since` and
 `x-amz-copy-source-if-*` but delegates evaluation to the backend. Ingot evaluates them against the
@@ -145,6 +145,9 @@ under the MST critical section, not only at read, so it is race-safe.
 
 **Multipart.** `CreateMultipartUpload` / `UploadPart` / `CompleteMultipartUpload` /
 `AbortMultipartUpload` are first-class. The mechanism lives in [§7](#7-cross-cutting-durability-concurrency-retrieval).
+A multipart object's BLAKE3 digest and block list are assembled at Complete from per-part trees
+recorded by `UploadPart`, so they match a single PUT's without re-reading the parts (see
+DESIGN_NOTES).
 
 **Copy.** `CopyObject` within a space is a metadata-only operation: it resolves the source manifest,
 writes a new version manifest pinning the **same** digests, and increments the reference index — no
@@ -185,7 +188,9 @@ deferred, and a hybrid (relational index *alongside* the MST source-of-truth) is
 **The manifest** describes one object version: an envelope — key, version id, created/last-modified,
 the S3 `etag` stored verbatim (a multipart ETag cannot be re-derived from the bytes), content-type,
 system and user headers, and a delete-marker flag for tombstone versions — plus a `Body`. The `Body`
-carries the whole-object `size` and `sha256` (integrity) and an **ordered, contiguous list of body
+carries the whole-object `size`, the whole-object BLAKE3 digest that GET and
+HEAD return as a raw-codec CID in the `x-cid` header, with the chaining values of its block-aligned
+blocks (16 KiB blocks up to 8 MiB, then about sqrt(size / 32 B) blocks: 4096 blocks at 1 GiB, 128 KiB; capped at 32768 from 32 GiB) for verifying ranged reads, and an **ordered, contiguous list of body
 blobs** — *shards*, in Forge terms — `[{ digest, offset, length }]` that together cover `[0, size)`:
 one entry for a small object, N for a split or multipart object. Each `digest` is the sha256 multihash
 Piri stores the shard under and the indexer resolves to a node URL — so this list is what lets a ranged
@@ -212,7 +217,7 @@ MST (bucket)
                     ├ deleteMarker "false"              (true ⇒ tombstone, no body)
                     └ body
                         ├ size     629_145_600          (600 MiB total)
-                        ├ sha256   <whole-body digest>  (integrity)
+                        ├ blake3   <whole-body digest>  (the x-cid)
                         └ blobs[] ── ordered, contiguous, covers [0, size) ──┐
                                                                              │
           ┌───────────────────────┬───────────────────────┬──────────────────┘
@@ -252,8 +257,9 @@ an accepted cost until catalog GC exists ([§9](#9-the-system-contract-piri--spr
 
 The data layer turns an object body into stored blobs and tracks who references them.
 
-**Object → blobs.** A body is hashed (sha256 for content addressing, md5 for the ETag) in a single
-streaming pass and written to the local store. It becomes an ordered list of content-addressed
+**Object → blobs.** A body is hashed (the BLAKE3 tree for the object digest, md5 for the ETag) in a
+single streaming pass and written to the local store, where each blob is hashed again for its content
+address. It becomes an ordered list of content-addressed
 blobs, each `≤ max_blob_size`: one blob for objects within the ceiling, a coarse split (e.g. 256 MiB
 granularity, not fine chunking) for larger ones. Each blob is uploaded to Piri by digest ([§7](#7-cross-cutting-durability-concurrency-retrieval)).
 
@@ -388,7 +394,7 @@ read at the start of the operation; on mismatch, reload and retry the (cheap) sp
 
 ```
 0. PRECONDITIONS (no lock)   evaluate If-Match / If-None-Match / If-(Un)Modified-Since (§3)
-1. INGEST  (no lock)         stream body → sha256 + md5 in one pass → local store;
+1. INGEST  (no lock)         stream body → blake3 tree + md5 in one pass → local store;
                              if size==0 store a manifest only (§3);
                              else split into ceil(size / max_blob_size) blobs
 2. UPLOAD  (no lock, per blob, keyed by digest)
@@ -789,6 +795,26 @@ CREATE TABLE ingot.multipart_parts (
     PRIMARY KEY (upload_id, part_number)
 );
 
+-- The part's BLAKE3 tree, hashed at the object offset UploadPart assumed and
+-- merged into the object's digest at Complete (see blake3tree). Its own
+-- table because it is large (about 320 KiB for a 5 GiB part) and short-lived:
+-- Complete deletes the upload's rows once the manifest holds the object's
+-- tree; only Complete's listing joins it. No row: no tree recorded, Complete
+-- re-hashes the part.
+CREATE TABLE ingot.multipart_part_trees (
+    upload_id     text     NOT NULL,
+    part_number   int      NOT NULL,
+    tree_offset   bigint   NOT NULL,                      -- object offset the part was hashed at (assumed)
+    chunk_log     smallint NOT NULL,                      -- block size of blocks, base-2 exponent of chunks
+    nodes         bytea,                                  -- aligned subtrees (blake3tree.EncodeSubtrees)
+    blocks        bytea,                                  -- blocks at chunk_log
+    head          bytea,                                  -- bytes before the part's first chunk boundary (< 1 KiB)
+    tail          bytea,                                  -- bytes after its last (< 1 KiB)
+    root          bytea,                                  -- the part's own hash, when hashed at offset 0
+    PRIMARY KEY (upload_id, part_number),
+    FOREIGN KEY (upload_id, part_number) REFERENCES ingot.multipart_parts(upload_id, part_number) ON DELETE CASCADE
+);
+
 -- Deferred-accept multipart (§7.2): the state needed to conclude (or abort) a
 -- parked blob later. Keyed by (space, digest), like upload_intents: the
 -- allocation is the space's, and dedup shares a park across the space's
@@ -813,8 +839,9 @@ CREATE TABLE ingot.gc_candidates (
 );
 ```
 
-Relationships at a glance: `segment_op_roots` cascades from `segments`, and `multipart_parts` from
-`multipart_sessions` — the schema's only true foreign keys. `blob_refs`, `segments`,
+Relationships at a glance: `segment_op_roots` cascades from `segments`, `multipart_parts` from
+`multipart_sessions`, and `multipart_part_trees` from `multipart_parts` — the schema's only true
+foreign keys. `blob_refs`, `segments`,
 `multipart_sessions`, and `gc_candidates` reference a `buckets.name` by value, and
 `shard_inclusions` joins `blob_locations` on `shard_digest`. The reference count for a blob is
 `count(*) from blob_refs where space = ? and digest = ?`; reaching zero triggers `remove(digest)`

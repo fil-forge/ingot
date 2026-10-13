@@ -260,6 +260,55 @@ type MultipartPart struct {
 	CreatedAt   time.Time
 }
 
+// PartsBelow summarizes the recorded parts of an upload numbered below one
+// part: what UploadPart needs to assume that part's object offset.
+type PartsBelow struct {
+	// Count is how many parts below are recorded.
+	Count int
+	// Size is the sum of their sizes.
+	Size int64
+	// LowestSize is the size of the lowest-numbered one, 0 when Count is 0.
+	LowestSize int64
+}
+
+// PartTree is the BLAKE3 tree material UploadPart records for one part: the
+// part hashed at the object offset it was assumed to sit at, as blake3tree
+// produces it (a blake3tree.Range, serialized). It lives in its own row
+// (multipart_part_trees), written by PutPart beside the part, read back by
+// ListPartTrees for Complete alone, and dropped by DeletePartTrees once the
+// object is committed. Complete checks the assumed offset against the true
+// one and, when they agree, merges this into the object's tree without
+// reading the part again; a part without a tree (recorded before the tree
+// existed, or a copy that read no bytes) is re-hashed.
+type PartTree struct {
+	// Offset is the object byte offset the part was hashed at: the offset
+	// UploadPart assumed from the parts recorded so far, which Complete
+	// checks against the part's true offset.
+	Offset int64
+	// ChunkLog is the block size of Blocks as a base-2 exponent of BLAKE3
+	// chunks: that of a body ending where the part ends, the finest block
+	// the object can have when Offset proves true.
+	ChunkLog uint8
+	// Nodes holds the aligned subtrees of the part's whole chunks, encoded
+	// with blake3tree.EncodeSubtrees.
+	Nodes []byte
+	// Blocks holds the part's blocks at ChunkLog, encoded with
+	// blake3tree.EncodeSubtrees.
+	Blocks []byte
+	// Head is the part's bytes before its first chunk boundary, under 1 KiB
+	// and empty when the part's offset is a 1 KiB multiple. Complete hashes
+	// the chunk straddling a part boundary from the previous part's Tail and
+	// this part's Head.
+	Head []byte
+	// Tail is the part's bytes after its last chunk boundary, under 1 KiB
+	// and empty when the part ends on one. For the last part it is the
+	// object's final chunk, which Complete hashes.
+	Tail []byte
+	// Root is the part's own BLAKE3 hash, set only when Offset is 0: a
+	// single-part completion takes its digest from here.
+	Root []byte
+}
+
 // BlobRefStore is the reverse reference index (§5, §6). A commit adds a
 // claim per body digest; a delete/overwrite removes it; CountClaims gates
 // remove(digest) (physical reclamation when the count reaches zero).
@@ -597,24 +646,41 @@ type MultipartStore interface {
 	// Returns true iff this caller performed the transition.
 	CompleteSession(ctx context.Context, uploadID, etag, versionID string) (bool, error)
 	DeleteSession(ctx context.Context, uploadID string) error
-	// PutPart records a part of an OPEN session, superseding a prior row for
-	// the part number, and returns ErrNotFound when the session is missing
-	// or no longer open: the write and the state check are one statement
-	// that holds the session row, so a part cannot land after a Complete or
-	// a teardown has taken the session, and a teardown's part listing sees
-	// every part that did land.
-	PutPart(ctx context.Context, p MultipartPart) error
+	// PutPart records a part of an OPEN session and its tree (nil for none),
+	// superseding a prior row for the part number and its tree row, and
+	// returns ErrNotFound when the session is missing or no longer open: the
+	// write and the state check are one statement that holds the session
+	// row, so a part cannot land after a Complete or a teardown has taken
+	// the session, and a teardown's part listing sees every part that did
+	// land.
+	PutPart(ctx context.Context, p MultipartPart, tree *PartTree) error
 	// GetPart returns one part of uploadID, or ErrNotFound. The part write
-	// path reads only the part it is about to supersede, so an upload costs
-	// one index probe per part rather than a listing that grows with every
-	// part already uploaded.
+	// path reads only the part it is about to supersede, plus the
+	// PartsBelow aggregate, rather than listing every part already
+	// uploaded.
 	GetPart(ctx context.Context, uploadID string, partNumber int) (*MultipartPart, error)
+	// PartsBelow summarizes uploadID's recorded parts numbered below
+	// partNumber. A missing upload yields the zero value.
+	PartsBelow(ctx context.Context, uploadID string, partNumber int) (PartsBelow, error)
 	// SiblingPartDigests returns those of digests that a part of uploadID
 	// other than partNumber references, each once. A session storing parts
 	// as received can name one digest in several parts; a part's release
 	// skips these, which stay live through the sibling.
 	SiblingPartDigests(ctx context.Context, uploadID string, partNumber int, digests []multihash.Multihash) ([]multihash.Multihash, error)
+	// ListParts returns uploadID's parts in part-number order. The trees
+	// are separate (ListPartTrees): a part's tree is up to hundreds of KiB
+	// and only Complete merges them, while ListParts and the teardown list
+	// the parts of every upload.
 	ListParts(ctx context.Context, uploadID string) ([]MultipartPart, error)
+	// ListPartTrees returns uploadID's recorded part trees by part number,
+	// for Complete, which already holds the parts from ListParts. A part
+	// without a tree has no entry.
+	ListPartTrees(ctx context.Context, uploadID string) (map[int]*PartTree, error)
+	// DeletePartTrees drops uploadID's tree rows. Complete calls it once the
+	// object is committed: the manifest then holds the object's tree and
+	// nothing reads the parts' again, while the part rows themselves stay
+	// for the idempotent re-Complete. A missing upload is not an error.
+	DeletePartTrees(ctx context.Context, uploadID string) error
 	// ListSessions returns bucket's sessions ordered by (object_key, created_at,
 	// upload_id) — the S3 ListMultipartUploads presentation order. Filtering
 	// (prefix/markers/max) happens in the handler; in-flight session counts are

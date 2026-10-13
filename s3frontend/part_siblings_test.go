@@ -220,7 +220,7 @@ type failRecordAndSiblings struct {
 	registry.MultipartStore
 }
 
-func (f *failRecordAndSiblings) PutPart(context.Context, registry.MultipartPart) error {
+func (f *failRecordAndSiblings) PutPart(context.Context, registry.MultipartPart, *registry.PartTree) error {
 	return registry.ErrNotFound
 }
 
