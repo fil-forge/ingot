@@ -66,14 +66,23 @@ func requireS3Error(t *testing.T, err error, code string) {
 }
 
 func TestBucketPolicy(t *testing.T) {
-	t.Run("PutBucketPolicy forwards the signed request and document and keeps the ETag", func(t *testing.T) {
-		f := &policyAuthority{ok: &s3bkt.PolicyOK{ETag: `"bafy..."`}}
+	t.Run("PutBucketPolicy forwards the signed request and document and answers the document's ETag", func(t *testing.T) {
+		f := &policyAuthority{ok: &s3bkt.PolicyOK{}}
 		req := s3.Request{Method: http.MethodPut, URL: "/photos?policy", Headers: map[string]string{"Authorization": signedAuth, "If-Match": `"old"`}}
 		ctx, etag := policyCtx(req)
-		require.NoError(t, policyBackend(t, f).PutBucketPolicy(ctx, "photos", []byte(`{"Statement":[]}`)))
+		// Two statements, sent in the opposite order of their canonical form:
+		// the tag is the normalized document's, as Hilt stores it.
+		body := `{"Version":"2012-10-17","Statement":[` +
+			`{"Effect":"Allow","Principal":{"AWS":["arn:aws:iam:::user/alice"]},"Action":["s3:PutObject"],"Resource":["arn:aws:s3:::photos/*"]},` +
+			`{"Effect":"Deny","Principal":"*","Action":["s3:DeleteObject"],"Resource":["arn:aws:s3:::photos/*"]}]}`
+		require.NoError(t, policyBackend(t, f).PutBucketPolicy(ctx, "photos", []byte(body)))
 		require.Equal(t, req, f.req)
-		require.Equal(t, `{"Statement":[]}`, string(f.body))
-		require.Equal(t, `"bafy..."`, *etag)
+		require.Equal(t, body, string(f.body))
+		want := s3bkt.BucketPolicy{Version: "2012-10-17", Statements: []s3bkt.Statement{
+			{Effect: s3bkt.Deny, Principal: s3bkt.Everyone(), Actions: s3bkt.NewStringSet("s3:DeleteObject"), Resources: s3bkt.NewStringSet("arn:aws:s3:::photos/*")},
+			{Effect: s3bkt.Allow, Principal: s3bkt.Only("alice"), Actions: s3bkt.NewStringSet("s3:PutObject"), Resources: s3bkt.NewStringSet("arn:aws:s3:::photos/*")},
+		}}
+		require.Equal(t, s3bkt.ETag(want), *etag)
 	})
 
 	t.Run("GetBucketPolicy forwards a signed GET ?policy and returns the document", func(t *testing.T) {
@@ -84,14 +93,14 @@ func TestBucketPolicy(t *testing.T) {
 			policy := &s3bkt.BucketPolicy{Version: "2012-10-17", Statements: []s3bkt.Statement{
 				{Effect: s3bkt.Allow, Principal: s3bkt.Only("alice"), Actions: s3bkt.NewStringSet("s3:GetObject"), Resources: s3bkt.NewStringSet("arn:aws:s3:::photos/*")},
 			}}
-			f := &policyAuthority{ok: &s3bkt.PolicyOK{ETag: `"bafy..."`, Policy: policy}}
+			f := &policyAuthority{ok: &s3bkt.PolicyOK{Policy: policy}}
 			ctx, etag := policyCtx(req)
 			doc, err := policyBackend(t, f).GetBucketPolicy(ctx, "photos")
 			require.NoError(t, err, req.URL)
 			require.Equal(t, `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":["arn:aws:iam:::user/alice"]},"Action":["s3:GetObject"],"Resource":["arn:aws:s3:::photos/*"]}]}`, string(doc))
 			require.Equal(t, req, f.req)
 			require.Nil(t, f.body)
-			require.Equal(t, `"bafy..."`, *etag)
+			require.Equal(t, s3bkt.ETag(*policy), *etag)
 		}
 	})
 

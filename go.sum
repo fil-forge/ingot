@@ -195,8 +195,8 @@ github.com/fil-forge/swarf v0.0.1-0.20260922133653-0b2e5b2e1c6c h1:uzLK4I8rD2SXB
 github.com/fil-forge/swarf v0.0.1-0.20260922133653-0b2e5b2e1c6c/go.mod h1:sSe3eJWknrWxnldIpU46aWI2Rvq9PwiA3nUiSFn9Rxk=
 github.com/fil-forge/ucantone v0.0.0-20260924160040-c31dec73d9b3 h1:Ta5ODMWR9mM4zMfRp/K1unAKvnt7f5dhehRA+YHiv7w=
 github.com/fil-forge/ucantone v0.0.0-20260924160040-c31dec73d9b3/go.mod h1:aX35jlUs3hnWAhigjO8z9kMPiYnkW3XOW8iVoJyz7cg=
-github.com/fil-forge/versitygw v0.0.0-20261009091422-e53000131c6b h1:VzPyGRpUn2o+YV5wyTQaw8Oj7rgHNoScXY59kU0dyV0=
-github.com/fil-forge/versitygw v0.0.0-20261009091422-e53000131c6b/go.mod h1:8GhLviBF605A89tR9xz7QMb2nRmTRl133soOEdyIBUs=
+github.com/fil-forge/versitygw v0.0.0-20261012091619-8f0754b48e4e h1:QSDhEWn4UyCuB/gTUJou5+uY35ppk5OUcyuUnDtFtCg=
+github.com/fil-forge/versitygw v0.0.0-20261012091619-8f0754b48e4e/go.mod h1:8FE8N25p7UITOm1/3aXzdzlg/0dqQ/VSqrClx05+EP4=
 github.com/filecoin-project/go-data-segment v0.0.1 h1:1wmDxOG4ubWQm3ZC1XI5nCon5qgSq7Ra3Rb6Dbu10Gs=
 github.com/filecoin-project/go-data-segment v0.0.1/go.mod h1:H0/NKbsRxmRFBcLibmABv+yFNHdmtl5AyplYLnb0Zv4=
 github.com/filecoin-project/go-fee v0.1.1-0.20260930093805-a26324dfe6ad h1:FCif32XJ/G4+TU0NIz80PZzXJXksows4y+vocti5Hk8=
@@ -538,8 +538,8 @@ github.com/prometheus/common v0.70.1 h1:1HvjP4D5oL3t8RsPlwxA9onvvStjtIHYE5XuuwOi
 github.com/prometheus/common v0.70.1/go.mod h1:VdFUQDMZK3VLkurFUVhia6uys/0suUp86TJz5qbJRhc=
 github.com/prometheus/procfs v0.22.0 h1:6q9+/JL9IKAPbCmBrv9n5O5Ty3NKnciV5X7YGw0oics=
 github.com/prometheus/procfs v0.22.0/go.mod h1:CvmFr/GVhIjIvWJZW3tgkODBQMRIf0EyWMQLHCHab58=
-github.com/rabbitmq/amqp091-go v1.12.0 h1:V0v14Iqfs+MwHWihJt/nGS5Ulu0vw572b2Co3mwunkI=
-github.com/rabbitmq/amqp091-go v1.12.0/go.mod h1:Hy4jKW5kQART1u+JkDTF9YYOQUHXqMuhrgxOEeS7G4o=
+github.com/rabbitmq/amqp091-go v1.13.0 h1:L8NA1WtF76C6KA3LAoufjfLgbist/If1UQYcsOjtxXA=
+github.com/rabbitmq/amqp091-go v1.13.0/go.mod h1:Hy4jKW5kQART1u+JkDTF9YYOQUHXqMuhrgxOEeS7G4o=
 github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec h1:W09IVJc94icq4NjY3clb7Lk8O1qJ8BdBEF8z0ibU0rE=
 github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec/go.mod h1:qqbHyh8v60DhA7CoWK5oRCqLrMHRGoxYCSS9EjAz6Eo=
 github.com/rogpeppe/go-internal v1.14.1 h1:UQB4HGPB6osV0SQTLymcB4TgvyWu6ZyliaW0tI/otEQ=

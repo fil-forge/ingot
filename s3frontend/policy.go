@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/fil-forge/libforge/commands/s3"
+	s3bkt "github.com/fil-forge/libforge/commands/s3/bucket"
 	"github.com/fil-forge/versitygw/auth"
 	"github.com/fil-forge/versitygw/s3err"
 	"go.uber.org/zap"
@@ -23,8 +24,9 @@ import (
 // authority (Hilt's /s3/bucket/policy), which authenticates and authorizes
 // it, checks its preconditions and keeps the document. versitygw's
 // controllers have validated a PUT body's AWS shape first. The response ETag
-// travels back through the request's reqscope ETag holder, since the backend
-// seam returns no headers.
+// is computed here from the document, with the same [s3bkt.ETag] Hilt stores
+// and checks If-Match against, and travels back through the request's
+// reqscope ETag holder, since the backend seam returns no headers.
 
 // PutBucketPolicy stores the policy document through the bucket authority.
 func (b *Backend) PutBucketPolicy(ctx context.Context, _ string, policy []byte) error {
@@ -79,14 +81,25 @@ func (b *Backend) bucketPolicy(ctx context.Context, body []byte) ([]byte, error)
 		}
 		return nil, apiErr
 	}
-	reqscope.SetETag(ctx, res.ETag)
-	if res.Policy == nil {
-		return nil, nil
+	switch {
+	case res.Policy != nil: // GET
+		reqscope.SetETag(ctx, s3bkt.ETag(*res.Policy))
+		// The policy types encode as the AWS document Hilt stores; their
+		// encoding cannot fail.
+		doc, _ := json.Marshal(res.Policy)
+		return doc, nil
+	case body != nil: // PUT
+		// Hilt stores the document this body decodes to, normalized, so its tag
+		// is the stored tag. The body passed Hilt's own decoder a moment ago;
+		// a failure here means the two sides run different libforge versions.
+		var doc s3bkt.BucketPolicy
+		if err := json.Unmarshal(body, &doc); err != nil {
+			b.logger.Error("tagging an accepted bucket policy", zap.Error(err))
+			return nil, nil
+		}
+		reqscope.SetETag(ctx, s3bkt.ETag(doc))
 	}
-	// The policy types encode as the AWS document Hilt stores; their encoding
-	// cannot fail.
-	doc, _ := json.Marshal(res.Policy)
-	return doc, nil
+	return nil, nil
 }
 
 // isSignedPolicyGet reports whether req is a GetBucketPolicy request carrying

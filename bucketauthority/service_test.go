@@ -61,11 +61,10 @@ func TestBucketPolicy(t *testing.T) {
 		var got *s3bkt.PolicyArguments
 		svc := newService(t, func(args *s3bkt.PolicyArguments) (*s3bkt.PolicyOK, error) {
 			got = args
-			return &s3bkt.PolicyOK{ETag: `"bafy..."`, Policy: policy}, nil
+			return &s3bkt.PolicyOK{Policy: policy}, nil
 		})
 		ok, err := svc.BucketPolicy(t.Context(), req, body)
 		require.NoError(t, err)
-		require.Equal(t, `"bafy..."`, ok.ETag)
 		require.Equal(t, policy, ok.Policy)
 		require.Equal(t, req, got.Request)
 		require.Equal(t, body, got.Body)

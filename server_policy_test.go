@@ -64,7 +64,8 @@ func (s secretIAM) GetUserAccountForRequest(_ fiber.Ctx, access string) (auth.Ac
 // TestBuildS3API_BucketPolicy drives the bucket policy operations through
 // the real versitygw route table and controllers: a GET answers the stored
 // document as JSON with its ETag, a PUT answers 204 with the new ETag, both
-// headers coming from the ?policy middleware, which reads the ETag the
+// headers coming from the ?policy middleware, which reads the ETag the backend
+// computed from the document and the
 // backend left in the request's reqscope holder.
 func TestBuildS3API_BucketPolicy(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -126,21 +127,21 @@ func TestBuildS3API_BucketPolicy(t *testing.T) {
 	}}
 
 	t.Run("GET answers the document as JSON with its ETag and the bucket CORS headers", func(t *testing.T) {
-		f.ok, f.err = &s3bkt.PolicyOK{ETag: `"bafy-get"`, Policy: policy}, nil
+		f.ok, f.err = &s3bkt.PolicyOK{Policy: policy}, nil
 		res, body := do(t, http.MethodGet, nil, true)
 		require.Equal(t, http.StatusOK, res.StatusCode, body)
 		require.Equal(t, doc, body)
-		require.Equal(t, `"bafy-get"`, res.Header.Get("ETag"))
+		require.Equal(t, s3bkt.ETag(*policy), res.Header.Get("ETag"))
 		require.Equal(t, "application/json", res.Header.Get("Content-Type"))
 		require.Equal(t, origin, res.Header.Get("Access-Control-Allow-Origin"))
 		require.Equal(t, http.MethodGet, f.req.Method)
 	})
 
 	t.Run("PUT forwards the document and answers 204 with the new ETag", func(t *testing.T) {
-		f.ok, f.err = &s3bkt.PolicyOK{ETag: `"bafy-put"`}, nil
+		f.ok, f.err = &s3bkt.PolicyOK{}, nil
 		res, body := do(t, http.MethodPut, []byte(doc), true)
 		require.Equal(t, http.StatusNoContent, res.StatusCode, body)
-		require.Equal(t, `"bafy-put"`, res.Header.Get("ETag"))
+		require.Equal(t, s3bkt.ETag(*policy), res.Header.Get("ETag"))
 		require.Equal(t, doc, string(f.body))
 	})
 
