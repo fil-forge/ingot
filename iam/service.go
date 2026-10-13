@@ -366,11 +366,7 @@ func mapAuthError(err error) (error, bool) {
 		// authorized; the SDKs always sign it.
 		hiltauth.UnsignedCopySourceErrorName:
 		return s3err.GetAPIError(s3err.ErrAccessDenied), true
-	// The two names below are matched literally: the pinned hilt predates
-	// hiltauth.TemporarilyUnavailableErrorName and
-	// bucketpolicy.InvalidPolicyErrorName. Switch to the constants with the
-	// next hilt bump.
-	case "TemporarilyUnavailable":
+	case hiltauth.TemporarilyUnavailableErrorName:
 		// An authorize that waited out Hilt's lock timeout behind a policy
 		// write: the client retries.
 		return s3err.APIError{
@@ -378,7 +374,7 @@ func mapAuthError(err error) (error, bool) {
 			Description:    "The authorization service is busy. Retry the request.",
 			HTTPStatusCode: http.StatusServiceUnavailable,
 		}, true
-	case "InvalidBucketPolicy":
+	case s3bkt.InvalidPolicyErrorName:
 		// A CreateBucket whose x-bucket-policy header is unsigned or fails
 		// validation.
 		return s3err.InvalidArgumentError{Description: named.Error(), ArgumentName: "x-bucket-policy"}, true
