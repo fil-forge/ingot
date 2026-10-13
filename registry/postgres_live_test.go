@@ -1,10 +1,12 @@
 package registry_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
 	"reflect"
+	"slices"
 	"testing"
 	"time"
 
@@ -645,7 +647,7 @@ func TestPostgresStores_Live(t *testing.T) {
 		_ = r.DeleteSession(ctx, id+"-space")
 
 		// bytea[] round trip + ordering.
-		if err := r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 2, ETagMD5: []byte{0x02}, Size: 2, BlobDigests: []multihash.Multihash{{0xd2}}}); err != nil {
+		if err := r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 2, ETagMD5: []byte{0x02}, Size: 2, BlobDigests: []multihash.Multihash{{0xd2}, {0xd1, 0xb}}}); err != nil {
 			t.Fatalf("PutPart 2: %v", err)
 		}
 		if err := r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 1, ETagMD5: []byte{0x01}, Size: 1, BlobDigests: []multihash.Multihash{{0xd1, 0xa}, {0xd1, 0xb}}}); err != nil {
@@ -670,11 +672,14 @@ func TestPostgresStores_Live(t *testing.T) {
 			}
 		})
 		// SiblingPartDigests answers a release's question without listing
-		// the session: which of these digests does another part name?
+		// the session: which of these digests does another part name? Part
+		// 2 names {0xd2} and shares {0xd1, 0xb} with part 1; {0xd1, 0xa} is
+		// part 1's alone. The result has no order, so it is sorted first.
 		t.Run("SiblingPartDigests returns digests other parts name", func(t *testing.T) {
-			got, err := r.SiblingPartDigests(ctx, id, 1, []multihash.Multihash{{0xd2}, {0xd1, 0xa}})
-			if want := []multihash.Multihash{{0xd2}}; err != nil || !reflect.DeepEqual(got, want) {
-				t.Fatalf("SiblingPartDigests = %x, err %v, want %x", got, err, want)
+			got, err := r.SiblingPartDigests(ctx, id, 1, []multihash.Multihash{{0xd2}, {0xd1, 0xa}, {0xd1, 0xb}})
+			slices.SortFunc(got, func(a, b multihash.Multihash) int { return bytes.Compare(a, b) })
+			if want := []multihash.Multihash{{0xd1, 0xb}, {0xd2}}; err != nil || !reflect.DeepEqual(got, want) {
+				t.Fatalf("SiblingPartDigests = %v, err %v, want %v", got, err, want)
 			}
 		})
 

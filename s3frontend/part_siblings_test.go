@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -15,11 +16,12 @@ import (
 	"github.com/fil-forge/ingot/registry"
 )
 
-// TestUploadPart_FreshPartsDoNotListTheSession: writing a part reads only
+// TestUploadPart_FreshPartsDoNotScanTheSession: writing a part reads only
 // the part it would supersede, so an upload's cost per part does not grow
-// with the parts already uploaded.
-func TestUploadPart_FreshPartsDoNotListTheSession(t *testing.T) {
-	counting := &countingListParts{}
+// with the parts already uploaded. Both ListParts and SiblingPartDigests
+// read across the session's parts, so a fresh part calls neither.
+func TestUploadPart_FreshPartsDoNotScanTheSession(t *testing.T) {
+	counting := &countingPartScans{}
 	b, _ := newDeferredBackend(t, &parkingUploader{}, func(d *Deps) {
 		counting.MultipartStore = d.Multipart
 		d.Multipart = counting
@@ -32,8 +34,50 @@ func TestUploadPart_FreshPartsDoNotListTheSession(t *testing.T) {
 			t.Fatalf("UploadPart %d: %v", n, err)
 		}
 	}
-	if got := counting.count(); got != 0 {
-		t.Fatalf("ListParts calls = %d, want 0", got)
+
+	t.Run("does not list the session", func(t *testing.T) {
+		if got := counting.listCalls(); got != 0 {
+			t.Fatalf("ListParts calls = %d, want 0", got)
+		}
+	})
+	t.Run("does not look up sibling parts", func(t *testing.T) {
+		if got := counting.siblingCalls(); got != 0 {
+			t.Fatalf("SiblingPartDigests calls = %d, want 0", got)
+		}
+	})
+}
+
+// TestUploadPart_FailedSupersedeLookupFailsTheUpload: when the registry
+// cannot say which part a write supersedes, or which of the superseded
+// blobs a sibling part still names, the upload fails. Going on would
+// overwrite the part row without recording the superseded blobs' releases.
+func TestUploadPart_FailedSupersedeLookupFailsTheUpload(t *testing.T) {
+	cases := []struct {
+		desc string
+		arm  func(*failingPartLookups)
+	}{
+		{"GetPart fails", func(f *failingPartLookups) { f.failGetPart.Store(true) }},
+		{"the sibling lookup fails", func(f *failingPartLookups) { f.failSiblings.Store(true) }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.desc, func(t *testing.T) {
+			failing := &failingPartLookups{}
+			b, _ := newDeferredBackend(t, &parkingUploader{}, func(d *Deps) {
+				failing.MultipartStore = d.Multipart
+				d.Multipart = failing
+			})
+			key := "failed-lookup"
+
+			uploadID := mpCreate(t, b, key, "", "")
+			if _, err := mpUploadPart(t, b, key, uploadID, 1, testBody(int(backend.MinPartSize)), nil); err != nil {
+				t.Fatalf("UploadPart 1: %v", err)
+			}
+			tc.arm(failing)
+			_, err := mpUploadPart(t, b, key, uploadID, 1, testBody(int(backend.MinPartSize)+1), nil)
+			if !errors.Is(err, errPartLookupUnavailable) {
+				t.Fatalf("UploadPart 1 (re-upload) err = %v, want %v", err, errPartLookupUnavailable)
+			}
+		})
 	}
 }
 
@@ -77,7 +121,7 @@ func TestUploadPart_SupersedeKeepsADigestASiblingNames(t *testing.T) {
 		}
 	}
 	if len(recorded) != 0 {
-		t.Fatalf("releases recorded for digests part 1 still names: %x", recorded)
+		t.Fatalf("releases recorded for digests part 1 still names: %v", recorded)
 	}
 }
 
@@ -112,24 +156,62 @@ func TestUploadPart_FailedRecordReleasesDespiteFailedSiblingLookup(t *testing.T)
 	})
 }
 
-// countingListParts counts ListParts calls.
-type countingListParts struct {
+// countingPartScans counts the calls that read across a session's parts:
+// ListParts and SiblingPartDigests.
+type countingPartScans struct {
 	registry.MultipartStore
-	mu    sync.Mutex
-	lists int
+	mu       sync.Mutex
+	lists    int
+	siblings int
 }
 
-func (c *countingListParts) ListParts(ctx context.Context, uploadID string) ([]registry.MultipartPart, error) {
+func (c *countingPartScans) ListParts(ctx context.Context, uploadID string) ([]registry.MultipartPart, error) {
 	c.mu.Lock()
 	c.lists++
 	c.mu.Unlock()
 	return c.MultipartStore.ListParts(ctx, uploadID)
 }
 
-func (c *countingListParts) count() int {
+func (c *countingPartScans) SiblingPartDigests(ctx context.Context, uploadID string, partNumber int, digests []multihash.Multihash) ([]multihash.Multihash, error) {
+	c.mu.Lock()
+	c.siblings++
+	c.mu.Unlock()
+	return c.MultipartStore.SiblingPartDigests(ctx, uploadID, partNumber, digests)
+}
+
+func (c *countingPartScans) listCalls() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.lists
+}
+
+func (c *countingPartScans) siblingCalls() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.siblings
+}
+
+var errPartLookupUnavailable = errors.New("part lookup unavailable")
+
+// failingPartLookups fails GetPart or SiblingPartDigests once armed.
+type failingPartLookups struct {
+	registry.MultipartStore
+	failGetPart  atomic.Bool
+	failSiblings atomic.Bool
+}
+
+func (f *failingPartLookups) GetPart(ctx context.Context, uploadID string, partNumber int) (*registry.MultipartPart, error) {
+	if f.failGetPart.Load() {
+		return nil, errPartLookupUnavailable
+	}
+	return f.MultipartStore.GetPart(ctx, uploadID, partNumber)
+}
+
+func (f *failingPartLookups) SiblingPartDigests(ctx context.Context, uploadID string, partNumber int, digests []multihash.Multihash) ([]multihash.Multihash, error) {
+	if f.failSiblings.Load() {
+		return nil, errPartLookupUnavailable
+	}
+	return f.MultipartStore.SiblingPartDigests(ctx, uploadID, partNumber, digests)
 }
 
 // failRecordAndSiblings reports every part write as finding its session

@@ -404,10 +404,13 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 		// fact have landed and only its result been lost, the release waits
 		// on the live part reference and resolves with the session.
 		//
-		// A failed sibling lookup still records every release: a blob a
-		// sibling part names is then deferred by that live reference, and
-		// the session resolves it. Returning here instead would strand the
-		// spooled blobs.
+		// A failed sibling lookup still records every release. While the
+		// session is open or completing, a blob a sibling part names is
+		// deferred by that part's reference and resolves with the session.
+		// A completed session's parts defer nothing: the record is stale
+		// for a blob the object claims, and releases one it does not, as
+		// Complete does for the parts it left out. Returning here instead
+		// would strand the spooled blobs.
 		spooled.unholdAll()
 		digests := bodyDigests(rec)
 		var siblings map[string]bool

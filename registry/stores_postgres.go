@@ -1112,9 +1112,13 @@ func (r *Postgres) SiblingPartDigests(ctx context.Context, uploadID string, part
 	for i, d := range digests {
 		in[i] = []byte(d)
 	}
+	// The overlap predicate (&&) lets the blob_digests GIN index pick the
+	// parts naming one of digests, so a lookup reads those rows rather
+	// than every part of the session.
 	rows, err := r.pool.Query(ctx,
 		`SELECT DISTINCT d FROM ingot.multipart_parts p, unnest(p.blob_digests) AS d
-		 WHERE p.upload_id = $1 AND p.part_number <> $2 AND d = ANY($3::bytea[])`,
+		 WHERE p.upload_id = $1 AND p.part_number <> $2
+		   AND p.blob_digests && $3::bytea[] AND d = ANY($3::bytea[])`,
 		uploadID, partNumber, in)
 	if err != nil {
 		return nil, fmt.Errorf("registry: sibling part digests: %w", err)
