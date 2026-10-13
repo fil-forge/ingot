@@ -121,9 +121,12 @@ func TestBuildS3API_BucketPolicy(t *testing.T) {
 	}
 
 	const doc = `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::photos/*"]}]}`
+	policy := &s3bkt.BucketPolicy{Version: "2012-10-17", Statements: []s3bkt.Statement{
+		{Effect: s3bkt.Allow, Principal: s3bkt.Everyone(), Actions: []string{"s3:GetObject"}, Resources: []string{"arn:aws:s3:::photos/*"}},
+	}}
 
 	t.Run("GET answers the document as JSON with its ETag and the bucket CORS headers", func(t *testing.T) {
-		f.ok, f.err = &s3bkt.PolicyOK{ETag: `"bafy-get"`, Policy: []byte(doc)}, nil
+		f.ok, f.err = &s3bkt.PolicyOK{ETag: `"bafy-get"`, Policy: policy}, nil
 		res, body := do(t, http.MethodGet, nil, true)
 		require.Equal(t, http.StatusOK, res.StatusCode, body)
 		require.Equal(t, doc, body)

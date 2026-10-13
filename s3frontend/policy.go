@@ -2,6 +2,7 @@ package s3frontend
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/url"
@@ -79,7 +80,13 @@ func (b *Backend) bucketPolicy(ctx context.Context, body []byte) ([]byte, error)
 		return nil, apiErr
 	}
 	reqscope.SetETag(ctx, res.ETag)
-	return res.Policy, nil
+	if res.Policy == nil {
+		return nil, nil
+	}
+	// The policy types encode as the AWS document Hilt stores; their encoding
+	// cannot fail.
+	doc, _ := json.Marshal(res.Policy)
+	return doc, nil
 }
 
 // isSignedPolicyGet reports whether req is a GetBucketPolicy request carrying

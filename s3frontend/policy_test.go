@@ -81,11 +81,14 @@ func TestBucketPolicy(t *testing.T) {
 			{Method: http.MethodGet, URL: "/photos?policy", Headers: map[string]string{"Authorization": signedAuth}},
 			{Method: http.MethodGet, URL: "/photos?policy&X-Amz-Signature=abc", Headers: map[string]string{}},
 		} {
-			f := &policyAuthority{ok: &s3bkt.PolicyOK{ETag: `"bafy..."`, Policy: []byte(`{"Statement":[]}`)}}
+			policy := &s3bkt.BucketPolicy{Version: "2012-10-17", Statements: []s3bkt.Statement{
+				{Effect: s3bkt.Allow, Principal: s3bkt.Only("alice"), Actions: []string{"s3:GetObject"}, Resources: []string{"arn:aws:s3:::photos/*"}},
+			}}
+			f := &policyAuthority{ok: &s3bkt.PolicyOK{ETag: `"bafy..."`, Policy: policy}}
 			ctx, etag := policyCtx(req)
 			doc, err := policyBackend(t, f).GetBucketPolicy(ctx, "photos")
 			require.NoError(t, err, req.URL)
-			require.Equal(t, `{"Statement":[]}`, string(doc))
+			require.Equal(t, `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":["arn:aws:iam:::user/alice"]},"Action":["s3:GetObject"],"Resource":["arn:aws:s3:::photos/*"]}]}`, string(doc))
 			require.Equal(t, req, f.req)
 			require.Nil(t, f.body)
 			require.Equal(t, `"bafy..."`, *etag)

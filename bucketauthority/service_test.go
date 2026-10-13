@@ -53,17 +53,20 @@ func TestBucketPolicy(t *testing.T) {
 		Headers: map[string]string{"If-Match": `"old"`, "X-Amz-Content-Sha256": "abc", "Authorization": "AWS4-HMAC-SHA256 ..."},
 	}
 	body := []byte(`{"Statement":[]}`)
+	policy := &s3bkt.BucketPolicy{Version: "2012-10-17", Statements: []s3bkt.Statement{
+		{Effect: s3bkt.Allow, Principal: s3bkt.Everyone(), Actions: []string{"s3:GetObject"}, Resources: []string{"arn:aws:s3:::photos/*"}},
+	}}
 
 	t.Run("forwards the request and body unchanged and returns the result", func(t *testing.T) {
 		var got *s3bkt.PolicyArguments
 		svc := newService(t, func(args *s3bkt.PolicyArguments) (*s3bkt.PolicyOK, error) {
 			got = args
-			return &s3bkt.PolicyOK{ETag: `"bafy..."`, Policy: []byte(`{"Statement":[]}`)}, nil
+			return &s3bkt.PolicyOK{ETag: `"bafy..."`, Policy: policy}, nil
 		})
 		ok, err := svc.BucketPolicy(t.Context(), req, body)
 		require.NoError(t, err)
 		require.Equal(t, `"bafy..."`, ok.ETag)
-		require.Equal(t, []byte(`{"Statement":[]}`), ok.Policy)
+		require.Equal(t, policy, ok.Policy)
 		require.Equal(t, req, got.Request)
 		require.Equal(t, body, got.Body)
 	})
