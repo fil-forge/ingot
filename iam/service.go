@@ -375,9 +375,8 @@ func mapAuthError(err error) (error, bool) {
 			HTTPStatusCode: http.StatusServiceUnavailable,
 		}, true
 	case s3bkt.InvalidPolicyErrorName:
-		// A CreateBucket whose x-bucket-policy header is unsigned or fails
-		// validation.
-		return s3err.InvalidArgumentError{Description: named.Error(), ArgumentName: "x-bucket-policy"}, true
+		// A policy document Hilt refuses: the code a PutBucketPolicy body gets.
+		return malformedPolicy(named.Error()), true
 	default:
 		// Named, but not a Hilt auth rejection we know — not ours to map.
 		return nil, false
@@ -657,4 +656,13 @@ func (*Service) ListUserAccounts() ([]auth.Account, error) {
 // Shutdown is a no-op; the service holds no resources of its own.
 func (*Service) Shutdown() error {
 	return nil
+}
+
+// MapAuthError is [mapAuthError] for the bucket policy operations, which render
+// Hilt's authorization rejections the way every other operation does.
+func MapAuthError(err error) (error, bool) { return mapAuthError(err) }
+
+// malformedPolicy is the S3 error for a PutBucketPolicy body Hilt refuses.
+func malformedPolicy(description string) s3err.APIError {
+	return s3err.APIError{Code: "MalformedPolicy", Description: description, HTTPStatusCode: http.StatusBadRequest}
 }

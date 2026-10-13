@@ -583,7 +583,7 @@ func TestMapAuthError(t *testing.T) {
 		hiltauth.ForeignBucketErrorName:          {"AccessDenied", 403},
 		hiltauth.UnsignedCopySourceErrorName:     {"AccessDenied", 403},
 		hiltauth.TemporarilyUnavailableErrorName: {"ServiceUnavailable", 503},
-		s3bkt.InvalidPolicyErrorName:             {"InvalidArgument", 400},
+		s3bkt.InvalidPolicyErrorName:             {"MalformedPolicy", 400},
 	}
 	for name, want := range apiCases {
 		t.Run(name, func(t *testing.T) {
