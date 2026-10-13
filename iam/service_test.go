@@ -27,11 +27,11 @@ import (
 // fakeAuthorizer records the request it authorized and returns canned
 // results, standing in for the hilt client.
 type fakeAuthorizer struct {
-	got   s3.Request
-	calls int
-	dlgs  []ucan.Delegation // delegations in the authorize response container
-	res   *s3req.AuthorizeOK
-	err   error
+	got    s3.Request
+	calls  int
+	proofs []ucan.Delegation // the proof chain in the authorize response container
+	res    *s3req.AuthorizeOK
+	err    error
 
 	infoBuckets []string          // BucketInfo calls received, by name
 	infoDlgs    []ucan.Delegation // delegations in the bucket-info container
@@ -44,7 +44,7 @@ func (f *fakeAuthorizer) AuthorizeRequest(_ context.Context, req s3.Request, _ .
 	if f.err != nil {
 		return nil, nil, f.err
 	}
-	return f.res, container.New(container.WithDelegations(f.dlgs...)), nil
+	return f.res, container.New(container.WithDelegations(f.proofs...)), nil
 }
 
 func (f *fakeAuthorizer) BucketInfo(_ context.Context, name string, _ did.DID, _ ...hiltclient.MethodOption) (*s3bkt.InfoOK, ucan.Container, error) {
@@ -197,7 +197,7 @@ func TestRevokedResponseIsNotCached(t *testing.T) {
 	root, mid, leaf, agent := mintRetrieveChain(t)
 	cache := iam.NewKeyProofs()
 	keys, tenants := iam.NewVerificationKeyCache(), iam.NewTenantCache()
-	fake := &fakeAuthorizer{res: authorizeOK(t, keyDID, sigv4), dlgs: []ucan.Delegation{root, mid, leaf}}
+	fake := &fakeAuthorizer{res: authorizeOK(t, keyDID, sigv4), proofs: []ucan.Delegation{root, mid, leaf}}
 	svc := iam.New(fake, cache, keys, tenants)
 
 	// The consumer saw leaf revoked, but Hilt's write did not commit: its
@@ -255,7 +255,7 @@ func TestRevokedBucketInfoDelegationIsNotCached(t *testing.T) {
 	keys, tenants := iam.NewVerificationKeyCache(), iam.NewTenantCache()
 	fake := &fakeAuthorizer{
 		res:      authorizeOK(t, keyDID, sigv4),
-		dlgs:     []ucan.Delegation{leaf},
+		proofs:   []ucan.Delegation{leaf},
 		infoDlgs: []ucan.Delegation{root, mid},
 	}
 	svc := iam.New(fake, cache, keys, tenants)
@@ -303,7 +303,7 @@ func TestProofChainCapture(t *testing.T) {
 	t.Run("complete chain in authorize response: no bucket info call", func(t *testing.T) {
 		root, mid, leaf, agent := mintRetrieveChain(t)
 		cache := iam.NewKeyProofs()
-		fake := &fakeAuthorizer{res: authorizeOK(t, keyDID, sigv4), dlgs: []ucan.Delegation{root, mid, leaf}}
+		fake := &fakeAuthorizer{res: authorizeOK(t, keyDID, sigv4), proofs: []ucan.Delegation{root, mid, leaf}}
 		svc := iam.New(fake, cache, iam.NewVerificationKeyCache(), iam.NewTenantCache())
 
 		_, err := resolveForRequest(t, svc, access,
@@ -321,7 +321,7 @@ func TestProofChainCapture(t *testing.T) {
 		cache := iam.NewKeyProofs()
 		fake := &fakeAuthorizer{
 			res:      authorizeOK(t, keyDID, sigv4),
-			dlgs:     []ucan.Delegation{leaf},      // authorize: re-delegation only
+			proofs:   []ucan.Delegation{leaf},      // authorize: re-delegation only
 			infoDlgs: []ucan.Delegation{root, mid}, // bucket info: the rest
 		}
 		svc := iam.New(fake, cache, iam.NewVerificationKeyCache(), iam.NewTenantCache())
@@ -341,7 +341,7 @@ func TestProofChainCapture(t *testing.T) {
 		cache := iam.NewKeyProofs()
 		fake := &fakeAuthorizer{
 			res:      authorizeOK(t, keyDID, sigv4),
-			dlgs:     []ucan.Delegation{leaf},
+			proofs:   []ucan.Delegation{leaf},
 			infoDlgs: []ucan.Delegation{root, mid},
 		}
 		svc := iam.New(fake, cache, iam.NewVerificationKeyCache(), iam.NewTenantCache())
@@ -361,7 +361,7 @@ func TestProofChainCapture(t *testing.T) {
 	t.Run("the effective action set is cached under the bucket hilt named", func(t *testing.T) {
 		_, _, leaf, _ := mintRetrieveChain(t)
 		cache := iam.NewKeyProofs()
-		fake := &fakeAuthorizer{res: authorizeOK(t, keyDID, sigv4), dlgs: []ucan.Delegation{leaf}}
+		fake := &fakeAuthorizer{res: authorizeOK(t, keyDID, sigv4), proofs: []ucan.Delegation{leaf}}
 		svc := iam.New(fake, cache, iam.NewVerificationKeyCache(), iam.NewTenantCache())
 
 		_, err := resolveForRequest(t, svc, access,
@@ -384,7 +384,7 @@ func TestProofChainCapture(t *testing.T) {
 		require.NoError(t, err)
 		srcID := src.DID()
 		res.SourceBucket = &srcID
-		fake := &fakeAuthorizer{res: res, dlgs: []ucan.Delegation{leaf}}
+		fake := &fakeAuthorizer{res: res, proofs: []ucan.Delegation{leaf}}
 		svc := iam.New(fake, cache, iam.NewVerificationKeyCache(), iam.NewTenantCache())
 
 		req := httptest.NewRequest(http.MethodPut, "http://example.com/dst/key", nil)
@@ -403,7 +403,7 @@ func TestProofChainCapture(t *testing.T) {
 		_, _, leaf, _ := mintRetrieveChain(t)
 		fake := &fakeAuthorizer{
 			res:     authorizeOK(t, keyDID, sigv4),
-			dlgs:    []ucan.Delegation{leaf},
+			proofs:  []ucan.Delegation{leaf},
 			infoErr: errors.New("hilt down"),
 		}
 		svc := iam.New(fake, iam.NewKeyProofs(), iam.NewVerificationKeyCache(), iam.NewTenantCache())

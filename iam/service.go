@@ -552,8 +552,8 @@ func (s *Service) cacheProofs(ctx context.Context, store *DelegationCache, ctr u
 }
 
 // addAll is the cacheProofs deposit for a request-scoped store: no check.
-func addAll(store *DelegationCache, dlgs ...ucan.Delegation) bool {
-	store.Add(dlgs...)
+func addAll(store *DelegationCache, proofs ...ucan.Delegation) bool {
+	store.Add(proofs...)
 	return true
 }
 

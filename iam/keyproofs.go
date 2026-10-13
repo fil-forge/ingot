@@ -112,23 +112,23 @@ func (k *KeyProofs) InvalidateHolders(link cid.Cid) []did.DID {
 	return affected
 }
 
-// DepositUnlessRevoked adds dlgs to store unless any has been named by a
-// revocation (see [KeyProofs]), reporting whether
-// it deposited. The check and the add hold k.mu, which orders them against
+// DepositUnlessRevoked adds the proof chain proofs to store unless one of its
+// delegations has been named by a revocation (see [KeyProofs]), reporting
+// whether it deposited. The check and the add hold k.mu, which orders them against
 // [KeyProofs.InvalidateHolders]: a revocation lands either before (the check
 // sees it) or after (the store holds the CID and is dropped), never between —
 // where it would find the store without the CID, clear nothing, and leave the
 // revoked delegation cached until the horizon.
-func (k *KeyProofs) DepositUnlessRevoked(store *DelegationCache, dlgs ...ucan.Delegation) bool {
+func (k *KeyProofs) DepositUnlessRevoked(store *DelegationCache, proofs ...ucan.Delegation) bool {
 	k.mu.Lock()
 	defer k.mu.Unlock()
-	for _, d := range dlgs {
+	for _, d := range proofs {
 		if _, ok := k.revoked.Get(d.Link().String()); ok {
 			// Hilt still serves it: keep remembering.
 			k.revoked.Set(d.Link().String(), struct{}{}, revokedTTL)
 			return false
 		}
 	}
-	store.Add(dlgs...)
+	store.Add(proofs...)
 	return true
 }
