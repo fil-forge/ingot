@@ -275,7 +275,8 @@ type PartTree struct {
 	// checks against the part's true offset.
 	Offset int64
 	// ChunkLog is the block size of Blocks as a base-2 exponent of BLAKE3
-	// chunks.
+	// chunks: that of a body ending where the part ends, the finest block
+	// the object can have when Offset proves true.
 	ChunkLog uint8
 	// Nodes holds the aligned subtrees of the part's whole chunks, encoded
 	// with blake3tree.EncodeSubtrees.

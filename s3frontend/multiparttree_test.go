@@ -126,7 +126,8 @@ func completeUpload(t *testing.T, b *Backend, key, uploadID string, completed []
 }
 
 // recordedParts returns the open upload's recorded part trees by part
-// number, having checked that it holds parts part records.
+// number, having checked that it holds parts part records and that each
+// tree's blocks are at the block size of the body up to the part's end.
 func recordedParts(t *testing.T, b *Backend, uploadID string, parts int) map[int]*registry.PartTree {
 	t.Helper()
 	recs, err := b.multipart.ListParts(context.Background(), uploadID)
@@ -139,6 +140,15 @@ func recordedParts(t *testing.T, b *Backend, uploadID string, parts int) map[int
 	trees, err := b.multipart.ListPartTrees(context.Background(), uploadID)
 	if err != nil {
 		t.Fatal(err)
+	}
+	for _, p := range recs {
+		tree := trees[p.PartNumber]
+		if tree == nil {
+			continue
+		}
+		if want := blake3tree.ChunkLog(tree.Offset + p.Size); tree.ChunkLog != want {
+			t.Fatalf("part %d at offset %d: tree blocks at chunk log %d, want %d", p.PartNumber, tree.Offset, tree.ChunkLog, want)
+		}
 	}
 	return trees
 }

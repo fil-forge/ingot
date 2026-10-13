@@ -365,8 +365,16 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 	// trees into the object's digest and blocks and hashes the chunks that
 	// straddle part boundaries from those raw bytes. The split's own whole-body tree is
 	// skipped: it would be the tree of the part alone, at offset 0.
+	//
+	// The blocks are recorded at the block size of a treeOffset+size body.
+	// Complete uses the tree only when treeOffset proves to be the part's
+	// true offset, and the object then holds at least those bytes, so its
+	// block is no finer (blake3tree.ChunkLog is monotone). Sizing the blocks
+	// by the part alone would record far more than the object needs: a
+	// 5 GiB part has 10,240 blocks of 512 KiB, where a 10,000-part upload of
+	// them has 2 GiB blocks.
 	treeOffset := assumedPartOffset(prior, partNumber, size)
-	tree, err := blake3tree.NewHasher(treeOffset)
+	tree, err := blake3tree.NewHasherAtChunkLog(treeOffset, blake3tree.ChunkLog(treeOffset+size))
 	if err != nil {
 		tree = nil
 	} else {
