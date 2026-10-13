@@ -3,6 +3,7 @@ package inmem
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"sort"
 	"time"
 
@@ -31,16 +32,34 @@ var (
 
 // BlobRefStore ===============================================================
 func (m *MemStore) AddBlobClaim(_ context.Context, c registry.BlobClaim) error {
+	return m.AddBlobClaims(context.Background(), []registry.BlobClaim{c})
+}
+
+func (m *MemStore) AddBlobClaims(_ context.Context, claims []registry.BlobClaim) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	k := claimKey{string(c.Digest), c.Bucket, c.ObjectKey, c.VersionID}
-	cp := c
-	cp.Digest = bytes.Clone(c.Digest)
-	m.blobRefs[k] = cp
-	// Committed blobs' intents are published, atomically with the claim.
-	if in, ok := m.intents[string(c.Digest)]; ok {
-		in.State = registry.IntentPublished
-		m.intents[string(c.Digest)] = in
+	// Every digest is checked before any claim is recorded: a refusal
+	// records nothing.
+	for _, c := range claims {
+		if pr, ok := m.releases[locKey{c.Space, string(c.Digest)}]; ok && !pr.StartedAt.IsZero() {
+			return registry.ErrReleaseInProgress
+		}
+		if _, ok := m.locations[locKey{c.Space, string(c.Digest)}]; !ok {
+			return registry.ErrReleaseInProgress // released to completion since the write settled it
+		}
+	}
+	for _, c := range claims {
+		k := claimKey{string(c.Digest), c.Bucket, c.ObjectKey, c.VersionID}
+		cp := c
+		cp.Digest = bytes.Clone(c.Digest)
+		m.blobRefs[k] = cp
+		// Committed blobs' intents are published, atomically with the claim.
+		ik := locKey{c.Space, string(c.Digest)}
+		if in, ok := m.intents[ik]; ok && in.State != registry.IntentPublished {
+			in.State = registry.IntentPublished
+			in.UpdatedAt = time.Now()
+			m.intents[ik] = in
+		}
 	}
 	return nil
 }
@@ -119,6 +138,9 @@ func (m *MemStore) enqueueReleaseLocked(space did.DID, digest multihash.Multihas
 	pr := registry.PendingRelease{
 		Space: space, Digest: multihash.Multihash(bytes.Clone(digest)), NotBefore: notBefore,
 	}
+	if prior, ok := m.releases[k]; ok {
+		pr.StartedAt = prior.StartedAt // a started record stays started
+	}
 	m.releases[k] = pr
 	return pr
 }
@@ -167,12 +189,31 @@ func (m *MemStore) ListReleasesBySpace(_ context.Context, space did.DID) ([]regi
 	return out, nil
 }
 
-func (m *MemStore) DeleteIntentAndRelease(_ context.Context, space did.DID, digest multihash.Multihash) error {
+func (m *MemStore) DeleteIntentAndRelease(_ context.Context, space did.DID, digest multihash.Multihash) (int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	delete(m.intents, string(digest))
+	m.deleteIntentLocked(locKey{space, string(digest)})
 	delete(m.releases, locKey{space, string(digest)})
-	return nil
+	return m.countIntentsLocked(string(digest), nil), nil
+}
+
+// deleteIntentLocked removes one intent and, with it the last for its
+// digest, the digest's evicted mark.
+func (m *MemStore) deleteIntentLocked(k locKey) {
+	delete(m.intents, k)
+	delete(m.evicted, k)
+}
+
+// countIntentsLocked returns how many intents name digest, in every space
+// but except (nil counts them all).
+func (m *MemStore) countIntentsLocked(digest string, except *did.DID) int {
+	n := 0
+	for k := range m.intents {
+		if k.digest == digest && (except == nil || k.space != *except) {
+			n++
+		}
+	}
+	return n
 }
 
 func (m *MemStore) DeleteRelease(_ context.Context, space did.DID, digest multihash.Multihash) error {
@@ -189,32 +230,49 @@ func (m *MemStore) PutIntent(_ context.Context, in registry.UploadIntent) error 
 	defer m.mu.Unlock()
 	cp := in
 	cp.Digest = bytes.Clone(in.Digest)
-	m.intents[string(in.Digest)] = cp
+	cp.UpdatedAt = time.Now()
+	m.intents[locKey{in.Space, string(in.Digest)}] = cp
+	// The file is back on disk, for every space's intent.
+	for k := range m.evicted {
+		if k.digest == string(in.Digest) {
+			delete(m.evicted, k)
+		}
+	}
 	return nil
 }
 
-func (m *MemStore) SetIntentState(_ context.Context, digest multihash.Multihash, state string) error {
+func (m *MemStore) SetIntentState(_ context.Context, space did.DID, digest multihash.Multihash, state string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	in, ok := m.intents[string(digest)]
+	k := locKey{space, string(digest)}
+	in, ok := m.intents[k]
 	if !ok {
 		return registry.ErrNotFound
 	}
-	in.State = state
-	m.intents[string(digest)] = in
+	if in.State != state {
+		in.State = state
+		in.UpdatedAt = time.Now()
+	}
+	m.intents[k] = in
 	return nil
 }
 
-func (m *MemStore) GetIntent(_ context.Context, digest multihash.Multihash) (*registry.UploadIntent, error) {
+func (m *MemStore) GetIntent(_ context.Context, space did.DID, digest multihash.Multihash) (*registry.UploadIntent, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	in, ok := m.intents[string(digest)]
+	in, ok := m.intents[locKey{space, string(digest)}]
 	if !ok {
 		return nil, registry.ErrNotFound
 	}
 	cp := in
 	cp.Digest = bytes.Clone(in.Digest)
 	return &cp, nil
+}
+
+func (m *MemStore) CountOtherIntents(_ context.Context, space did.DID, digest multihash.Multihash) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.countIntentsLocked(string(digest), &space), nil
 }
 
 func (m *MemStore) ListIntentsByState(_ context.Context, state string) ([]registry.UploadIntent, error) {
@@ -232,11 +290,218 @@ func (m *MemStore) ListIntentsByState(_ context.Context, state string) ([]regist
 	return out, nil
 }
 
-func (m *MemStore) DeleteIntent(_ context.Context, digest multihash.Multihash) error {
+func (m *MemStore) DeleteIntent(_ context.Context, space did.DID, digest multihash.Multihash) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	delete(m.intents, string(digest))
+	m.deleteIntentLocked(locKey{space, string(digest)})
 	return nil
+}
+
+func (m *MemStore) ListEvictable(_ context.Context, after registry.EvictCursor, limit int) ([]registry.UploadIntent, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []registry.UploadIntent
+	for key, in := range m.intents {
+		if _, gone := m.evicted[key]; gone {
+			continue
+		}
+		switch in.State {
+		case registry.IntentParked:
+			if _, ok := m.parks[key]; !ok {
+				continue
+			}
+		case registry.IntentAccepted, registry.IntentPublished:
+			if _, ok := m.locations[key]; !ok {
+				continue
+			}
+		default:
+			continue
+		}
+		if m.uploadingAnywhereLocked(key.digest) || !evictCursorBefore(after, in) {
+			continue
+		}
+		cp := in
+		cp.Digest = bytes.Clone(in.Digest)
+		out = append(out, cp)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return evictCursorBefore(registry.EvictCursor{UpdatedAt: out[i].UpdatedAt, Digest: out[i].Digest, Space: out[i].Space}, out[j])
+	})
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+// uploadingAnywhereLocked reports whether any space's intent for digest is
+// still spooled or uploading: an upload that reads the file.
+func (m *MemStore) uploadingAnywhereLocked(digest string) bool {
+	for k, in := range m.intents {
+		if k.digest == digest && (in.State == registry.IntentSpooled || in.State == registry.IntentUploading) {
+			return true
+		}
+	}
+	return false
+}
+
+// locatedLocked reports whether digest has a location in any space.
+func (m *MemStore) locatedLocked(digest multihash.Multihash) bool {
+	for k := range m.locations {
+		if k.digest == string(digest) {
+			return true
+		}
+	}
+	return false
+}
+
+// evictCursorBefore reports whether c sorts strictly before in in
+// ListEvictable's (updated_at, digest, space) order.
+func evictCursorBefore(c registry.EvictCursor, in registry.UploadIntent) bool {
+	if !c.UpdatedAt.Equal(in.UpdatedAt) {
+		return c.UpdatedAt.Before(in.UpdatedAt)
+	}
+	if d := bytes.Compare(c.Digest, in.Digest); d != 0 {
+		return d < 0
+	}
+	return c.Space.String() < in.Space.String()
+}
+
+func (m *MemStore) MarkEvicted(_ context.Context, digest multihash.Multihash, notAfter time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.countIntentsLocked(string(digest), nil) == 0 {
+		return registry.ErrNotFound
+	}
+	for k, in := range m.intents {
+		if k.digest == string(digest) && !in.UpdatedAt.After(notAfter) {
+			m.evicted[k] = struct{}{}
+		}
+	}
+	return nil
+}
+
+// IsEvicted reports whether every intent for digest is marked evicted, and
+// there is at least one. Test-only visibility into the evicted_at column.
+func (m *MemStore) IsEvicted(digest multihash.Multihash) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for k := range m.intents {
+		if k.digest != string(digest) {
+			continue
+		}
+		if _, ok := m.evicted[k]; !ok {
+			return false
+		}
+		n++
+	}
+	return n > 0
+}
+
+func (m *MemStore) ListReleasedPublished(_ context.Context, after multihash.Multihash, limit int) ([]registry.UploadIntent, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []registry.UploadIntent
+	for key, in := range m.intents {
+		if bytes.Compare(in.Digest, after) <= 0 || !m.releasedPublishedLocked(key, in) {
+			continue
+		}
+		cp := in
+		cp.Digest = bytes.Clone(in.Digest)
+		out = append(out, cp)
+	}
+	sort.Slice(out, func(i, j int) bool { return bytes.Compare(out[i].Digest, out[j].Digest) < 0 })
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+func (m *MemStore) DeleteReleasedPublished(_ context.Context, space did.DID, digest multihash.Multihash) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := locKey{space, string(digest)}
+	in, ok := m.intents[key]
+	if !ok || !m.releasedPublishedLocked(key, in) {
+		return false, nil
+	}
+	m.deleteIntentLocked(key)
+	return true, nil
+}
+
+// releasedPublishedLocked is ListReleasedPublished's condition: a published
+// intent nothing names any more, in any space, and the digest's only intent.
+func (m *MemStore) releasedPublishedLocked(key locKey, in registry.UploadIntent) bool {
+	return in.State == registry.IntentPublished && !m.locatedLocked(in.Digest) &&
+		!m.claimedAnywhereLocked(key.digest) && !m.releasePendingAnywhereLocked(key.digest) &&
+		m.countLivePartRefsLocked(nil, in.Digest) == 0 &&
+		m.countIntentsLocked(key.digest, &key.space) == 0
+}
+
+// claimedAnywhereLocked reports whether any blob_refs row, in any space,
+// names the digest.
+func (m *MemStore) claimedAnywhereLocked(digest string) bool {
+	for k := range m.blobRefs {
+		if k.digest == digest {
+			return true
+		}
+	}
+	return false
+}
+
+// releasePendingAnywhereLocked reports whether a release of the digest is
+// pending in any space.
+func (m *MemStore) releasePendingAnywhereLocked(digest string) bool {
+	for k := range m.releases {
+		if k.digest == digest {
+			return true
+		}
+	}
+	return false
+}
+
+// AgeIntent moves the last state change of every intent for digest back by
+// d, as if it had happened that much earlier. Test-only: no store method
+// rewrites history.
+func (m *MemStore) AgeIntent(digest multihash.Multihash, d time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for k, in := range m.intents {
+		if k.digest == string(digest) {
+			in.UpdatedAt = in.UpdatedAt.Add(-d)
+			m.intents[k] = in
+		}
+	}
+}
+
+func (m *MemStore) StalledBytes(_ context.Context, before time.Time) (registry.StalledSizes, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var s registry.StalledSizes
+	for _, in := range m.intents {
+		if !in.UpdatedAt.Before(before) {
+			continue
+		}
+		switch in.State {
+		case registry.IntentSpooled:
+			s.Spooled += in.Size
+		case registry.IntentUploading:
+			s.Uploading += in.Size
+		}
+	}
+	return s, nil
+}
+
+func (m *MemStore) MissingIntents(_ context.Context, digests []multihash.Multihash) ([]multihash.Multihash, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []multihash.Multihash
+	for _, d := range digests {
+		if m.countIntentsLocked(string(d), nil) == 0 {
+			out = append(out, bytes.Clone(d))
+		}
+	}
+	return out, nil
 }
 
 // LocationStore ==============================================================
@@ -309,22 +574,25 @@ func (m *MemStore) RewrapEncryptionParams(_ context.Context, space did.DID, dige
 
 // ParkStore ==================================================================
 
-func (m *MemStore) PutPark(_ context.Context, p registry.BlobPark) error {
+func (m *MemStore) PutPark(_ context.Context, p registry.BlobPark) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if _, ok := m.parks[locKey{p.Space, string(p.Digest)}]; ok {
+		return false, nil
+	}
 	cp := p
 	cp.Digest = bytes.Clone(p.Digest)
 	cp.AddTask = bytes.Clone(p.AddTask)
 	cp.AcceptTask = bytes.Clone(p.AcceptTask)
 	cp.PutInvocation = bytes.Clone(p.PutInvocation)
-	m.parks[string(p.Digest)] = cp
-	return nil
+	m.parks[locKey{p.Space, string(p.Digest)}] = cp
+	return true, nil
 }
 
-func (m *MemStore) GetPark(_ context.Context, digest multihash.Multihash) (*registry.BlobPark, error) {
+func (m *MemStore) GetPark(_ context.Context, space did.DID, digest multihash.Multihash) (*registry.BlobPark, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	park, ok := m.parks[string(digest)]
+	park, ok := m.parks[locKey{space, string(digest)}]
 	if !ok {
 		return nil, registry.ErrNotFound
 	}
@@ -336,10 +604,21 @@ func (m *MemStore) GetPark(_ context.Context, digest multihash.Multihash) (*regi
 	return &cp, nil
 }
 
-func (m *MemStore) DeletePark(_ context.Context, digest multihash.Multihash) error {
+func (m *MemStore) HasParkFor(_ context.Context, addTask []byte) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	delete(m.parks, string(digest))
+	for _, park := range m.parks {
+		if bytes.Equal(park.AddTask, addTask) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (m *MemStore) DeletePark(_ context.Context, space did.DID, digest multihash.Multihash) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.parks, locKey{space, string(digest)})
 	return nil
 }
 
@@ -531,13 +810,22 @@ func (m *MemStore) ListStaleSessions(_ context.Context, state string, cutoff tim
 	return out, nil
 }
 
-func (m *MemStore) CountLivePartRefs(_ context.Context, digest multihash.Multihash) (int, error) {
+func (m *MemStore) CountLivePartRefs(_ context.Context, space did.DID, digest multihash.Multihash) (int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.countLivePartRefsLocked(&space, digest), nil
+}
+
+// countLivePartRefsLocked counts the parts of in-flight sessions that name
+// digest: space's sessions, or every space's when space is nil.
+func (m *MemStore) countLivePartRefsLocked(space *did.DID, digest multihash.Multihash) int {
 	n := 0
 	for uploadID, byNum := range m.parts {
 		s, ok := m.sessions[uploadID]
 		if !ok || (s.State != registry.SessionOpen && s.State != registry.SessionCompleting) {
+			continue
+		}
+		if space != nil && s.Space != *space {
 			continue
 		}
 		for _, p := range byNum {
@@ -549,7 +837,7 @@ func (m *MemStore) CountLivePartRefs(_ context.Context, digest multihash.Multiha
 			}
 		}
 	}
-	return n, nil
+	return n
 }
 
 func (m *MemStore) CountPartRefs(_ context.Context, digest multihash.Multihash, excludeUploadID string) (int, error) {
@@ -640,4 +928,277 @@ func clonePart(p registry.MultipartPart) registry.MultipartPart {
 		p.BlobDigests = ds
 	}
 	return p
+}
+
+// StreamStore ================================================================
+
+func (m *MemStore) PutStream(_ context.Context, s registry.BlobStream) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cp := s
+	cp.AddTask = bytes.Clone(s.AddTask)
+	if cp.CreatedAt.IsZero() {
+		cp.CreatedAt = time.Now()
+	}
+	if cp.TouchedAt.IsZero() {
+		cp.TouchedAt = cp.CreatedAt
+	}
+	m.streams[string(s.AddTask)] = cp
+	return nil
+}
+
+func (m *MemStore) TouchStreams(_ context.Context, addTasks [][]byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := time.Now()
+	for _, addTask := range addTasks {
+		if s, ok := m.streams[string(addTask)]; ok {
+			s.TouchedAt = now
+			m.streams[string(addTask)] = s
+		}
+	}
+	return nil
+}
+
+func (m *MemStore) DeleteStream(_ context.Context, addTask []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.streams, string(addTask))
+	return nil
+}
+
+func (m *MemStore) ListStaleStreams(_ context.Context, olderThan time.Time, limit int) ([]registry.BlobStream, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []registry.BlobStream
+	for _, s := range m.streams {
+		if s.TouchedAt.Before(olderThan) {
+			cp := s
+			cp.AddTask = bytes.Clone(s.AddTask)
+			out = append(out, cp)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].TouchedAt.Before(out[j].TouchedAt) })
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+// UploadRegistrationStore =====================================================
+
+func (m *MemStore) ListDueUploadRegistrations(_ context.Context, now time.Time, limit int) ([]registry.UploadRegistration, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// Per key, only the unbroken run of due rows from its oldest: once a key
+	// has a row waiting out a backoff, its later rows wait too, or a
+	// retraction could be replayed ahead of the addition it retires.
+	blocked := map[string]bool{}
+	var out []registry.UploadRegistration
+	for _, reg := range m.uploadRegs {
+		// A dead-lettered row is out of the sweep and does not hold its key back.
+		if reg.DeadLetteredAt != nil {
+			continue
+		}
+		key := reg.Bucket + "\x00" + reg.ObjectKey
+		if blocked[key] || reg.NextAt.After(now) {
+			blocked[key] = true
+			continue
+		}
+		out = append(out, reg)
+		if limit > 0 && len(out) == limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+func (m *MemStore) ListUploadRegistrationsBySpace(_ context.Context, space did.DID) ([]registry.UploadRegistration, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []registry.UploadRegistration
+	for _, reg := range m.uploadRegs {
+		if reg.Space == space {
+			out = append(out, reg)
+		}
+	}
+	return out, nil
+}
+
+func (m *MemStore) RefreshUploadRegistrationProofs(_ context.Context, seq int64, proofs []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i, reg := range m.uploadRegs {
+		if reg.Seq == seq {
+			m.uploadRegs[i].Proofs = proofs
+			return nil
+		}
+	}
+	return nil
+}
+
+func (m *MemStore) DeadLetterUploadRegistrations(_ context.Context, seqs []int64, reason string) error {
+	if len(seqs) == 0 {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	park := make(map[int64]bool, len(seqs))
+	for _, seq := range seqs {
+		park[seq] = true
+	}
+	now := time.Now()
+	for i, reg := range m.uploadRegs {
+		if park[reg.Seq] && reg.DeadLetteredAt == nil {
+			m.uploadRegs[i].DeadLetteredAt = &now
+			m.uploadRegs[i].DeadLetterReason = reason
+		}
+	}
+	return nil
+}
+
+func (m *MemStore) ListDeadLetteredUploadRegistrations(_ context.Context, limit int) ([]registry.UploadRegistration, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []registry.UploadRegistration
+	for _, reg := range m.uploadRegs {
+		if reg.DeadLetteredAt == nil {
+			continue
+		}
+		out = append(out, reg)
+		if limit > 0 && len(out) == limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+func (m *MemStore) DeleteUploadRegistrations(_ context.Context, seqs []int64) error {
+	if len(seqs) == 0 {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	drop := make(map[int64]bool, len(seqs))
+	for _, seq := range seqs {
+		drop[seq] = true
+	}
+	kept := m.uploadRegs[:0]
+	for _, reg := range m.uploadRegs {
+		if !drop[reg.Seq] {
+			kept = append(kept, reg)
+		}
+	}
+	m.uploadRegs = kept
+	return nil
+}
+
+func (m *MemStore) RescheduleUploadRegistrations(_ context.Context, seqs []int64, nextAt time.Time) error {
+	if len(seqs) == 0 {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	hold := make(map[int64]bool, len(seqs))
+	for _, seq := range seqs {
+		hold[seq] = true
+	}
+	for i, reg := range m.uploadRegs {
+		if hold[reg.Seq] {
+			m.uploadRegs[i].Attempts++
+			m.uploadRegs[i].NextAt = nextAt
+		}
+	}
+	return nil
+}
+
+// IntentByDigest returns the one intent for digest, in whichever space holds
+// it, or ErrNotFound. Test-only: an intent is keyed by (space, digest), and a
+// test that wrote the bytes to one bucket asks after them by digest alone.
+// More than one intent is an error, since the digest alone does not pick
+// one.
+func (m *MemStore) IntentByDigest(_ context.Context, digest multihash.Multihash) (*registry.UploadIntent, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var found *registry.UploadIntent
+	for k, in := range m.intents {
+		if k.digest != string(digest) {
+			continue
+		}
+		if found != nil {
+			return nil, fmt.Errorf("inmem: digest %x has intents in %s and %s", digest, found.Space, in.Space)
+		}
+		cp := in
+		cp.Digest = bytes.Clone(in.Digest)
+		found = &cp
+	}
+	if found == nil {
+		return nil, registry.ErrNotFound
+	}
+	return found, nil
+}
+
+// ParkByDigest is IntentByDigest for parks.
+func (m *MemStore) ParkByDigest(_ context.Context, digest multihash.Multihash) (*registry.BlobPark, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var found *registry.BlobPark
+	for k, park := range m.parks {
+		if k.digest != string(digest) {
+			continue
+		}
+		if found != nil {
+			return nil, fmt.Errorf("inmem: digest %x has parks in %s and %s", digest, found.Space, park.Space)
+		}
+		cp := park
+		cp.Digest = bytes.Clone(park.Digest)
+		cp.AddTask = bytes.Clone(park.AddTask)
+		cp.AcceptTask = bytes.Clone(park.AcceptTask)
+		cp.PutInvocation = bytes.Clone(park.PutInvocation)
+		found = &cp
+	}
+	if found == nil {
+		return nil, registry.ErrNotFound
+	}
+	return found, nil
+}
+
+func (m *MemStore) StartRelease(_ context.Context, space did.DID, digest multihash.Multihash) (registry.ReleaseStart, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k := locKey{space, string(digest)}
+	pr, ok := m.releases[k]
+	if !ok {
+		return registry.ReleaseCancelled, nil
+	}
+	if !pr.StartedAt.IsZero() {
+		return registry.ReleaseStarted, nil // a retry: the release owns the blob since it started
+	}
+	if m.countLivePartRefsLocked(&space, digest) > 0 {
+		return registry.ReleaseReferenced, nil
+	}
+	if m.countClaimsLocked(space, digest) > 0 {
+		delete(m.releases, k) // stale: gone here, so no caller deletes a replacement
+		return registry.ReleaseClaimed, nil
+	}
+	if pr.StartedAt.IsZero() {
+		pr.StartedAt = time.Now()
+		m.releases[k] = pr
+	}
+	return registry.ReleaseStarted, nil
+}
+
+func (m *MemStore) CancelRelease(_ context.Context, space did.DID, digest multihash.Multihash) (registry.ReleaseCancel, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k := locKey{space, string(digest)}
+	pr, ok := m.releases[k]
+	if !ok {
+		return registry.ReleaseNone, nil
+	}
+	if !pr.StartedAt.IsZero() {
+		return registry.ReleaseInProgress, nil
+	}
+	delete(m.releases, k)
+	return registry.ReleaseCancelledByWrite, nil
 }

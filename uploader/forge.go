@@ -23,11 +23,10 @@ import (
 	"github.com/fil-forge/ingot/internal/reqscope"
 )
 
-// Uploader is the seam between the per-plane log flushers and durable
-// Forge storage. The data plane and the catalog plane each ship through
-// their own pipeline, so the contract is "ship ONE plane's CAR of one
-// sealed segment". The implementation streams the file body straight
-// into the HTTP PUT, never materializing it as a []block.Block.
+// Uploader is the seam between the catalog log's flusher and durable
+// Forge storage: it ships one sealed segment's CAR. The implementation
+// streams the file body straight into the HTTP PUT, never materializing
+// it as a []block.Block.
 //
 // SubmitShard returns the shipped CAR's published location (provider DID +
 // retrieval URL from the accept-time commitment) so the flush path can record

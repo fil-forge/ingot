@@ -3,6 +3,7 @@ package s3frontend
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
 	"fmt"
 	"io"
 	"net/http"
@@ -17,7 +18,6 @@ import (
 	"github.com/fil-forge/versitygw/s3response"
 
 	msbucket "github.com/fil-forge/ingot/bucket"
-	"github.com/fil-forge/ingot/internal/reqscope"
 	"github.com/fil-forge/ingot/registry"
 )
 
@@ -46,8 +46,10 @@ func (b *Backend) UploadPartCopy(ctx context.Context, input *s3.UploadPartCopyIn
 	if input.Bucket == nil || input.Key == nil || input.UploadId == nil || input.PartNumber == nil || input.CopySource == nil {
 		return s3response.CopyPartResult{}, s3err.GetAPIError(s3err.ErrInvalidRequest)
 	}
-	if req, ok := reqscope.Request(ctx); ok && requestsServerSideEncryption(req.Headers) {
-		return s3response.CopyPartResult{}, s3err.GetAPIError(s3err.ErrNotImplemented)
+	// The part is stored however its session is; the request's encryption
+	// headers are checked as on a write, then set nothing.
+	if _, err := requestedEncryption(ctx); err != nil {
+		return s3response.CopyPartResult{}, err
 	}
 	sess, err := b.openSession(ctx, *input.UploadId, input.Bucket, input.Key)
 	if err != nil {
@@ -100,15 +102,26 @@ func (b *Backend) UploadPartCopy(ctx context.Context, input *s3.UploadPartCopyIn
 		return s3response.CopyPartResult{}, err
 	}
 	defer rc.Close()
+	// A whole-object copy of a single-part source copies its exact bytes, so
+	// the source's stored digest is the part's MD5 and the MD5 pass is skipped.
+	// Whole-object is judged on the normalized range, so an explicit
+	// bytes=0-(size-1) counts as well as no range header. A partial range or
+	// a multipart source (no stored whole-object md5) computes it over the
+	// copied bytes.
+	var md5Src bodyMD5Source
+	wholeObject := start == 0 && end == srcMf.Body.Size-1
+	if wholeObject && !isMultipartETag(srcMf.ETag) && len(srcMf.Body.MD5) == md5.Size {
+		md5Src = knownMD5(srcMf.Body.MD5)
+	}
 	// The session's algorithm is the part's: passing it as the requested one
 	// satisfies the negotiation (a COMPOSITE session needs a checksum on every
 	// part) with no value to validate, so it is computed over the copied bytes.
-	rec, err := b.ingestPart(ctx, sess, int(*input.PartNumber), rc, types.ChecksumAlgorithm(sess.ChecksumAlgorithm), "")
+	rec, err := b.ingestPart(ctx, sess, int(*input.PartNumber), rc, end-start+1, types.ChecksumAlgorithm(sess.ChecksumAlgorithm), "", md5Src)
 	if err != nil {
 		return s3response.CopyPartResult{}, err
 	}
 
-	result := s3response.CopyPartResult{ETag: &rec.etag, LastModified: time.Now().UTC()}
+	result := s3response.CopyPartResult{ETag: &rec.etag, LastModified: time.Now().UTC(), ServerSideEncryption: encryptionFor(sess.Plaintext)}
 	setCopyPartChecksum(&result, rec.echoAlgo, rec.echoSum)
 	if srcRv.versioned() {
 		result.CopySourceVersionId = srcRv.node.VersionID
@@ -124,7 +137,7 @@ func (b *Backend) openCopySource(ctx context.Context, src *resolvedVersion, star
 	if end < start {
 		return io.NopCloser(bytes.NewReader(nil)), nil
 	}
-	opener, err := b.bodyOpener(ctx, src.st.Space, src.mf.Body)
+	opener, err := b.bodyOpener(ctx, src.st.Space, src.mf.Body, src.mf.Plaintext)
 	if err != nil {
 		return nil, err
 	}

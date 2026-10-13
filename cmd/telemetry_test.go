@@ -4,12 +4,14 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"slices"
 	"testing"
 
 	"go.opentelemetry.io/otel"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	semconv "go.opentelemetry.io/otel/semconv/v1.37.0"
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 )
@@ -91,6 +93,7 @@ func TestSetupTracingExportsToConfiguredEndpoint(t *testing.T) {
 		}
 	}))
 	defer collector.Close()
+	isolateOTelEnv(t)
 	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", collector.URL)
 	prev := otel.GetTracerProvider()
 	t.Cleanup(func() { otel.SetTracerProvider(prev) })
@@ -114,6 +117,48 @@ func TestSetupTracingExportsToConfiguredEndpoint(t *testing.T) {
 	}
 }
 
+// namespaceOf installs tracing against a collector that accepts everything,
+// starts a span, and returns its resource's service.namespace.
+func namespaceOf(t *testing.T) string {
+	t.Helper()
+	collector := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer collector.Close()
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", collector.URL)
+	prev := otel.GetTracerProvider()
+	t.Cleanup(func() { otel.SetTracerProvider(prev) })
+
+	shutdown, err := setupTracing(context.Background(), zap.NewNop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, span := otel.Tracer("test").Start(context.Background(), "PutObject")
+	ro, ok := span.(sdktrace.ReadOnlySpan)
+	if !ok {
+		t.Fatal("expected an SDK span")
+	}
+	ns, _ := ro.Resource().Set().Value(semconv.ServiceNamespaceKey)
+	span.End()
+	if err := shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	return ns.AsString()
+}
+
+func TestSetupTracingReportsForgeNamespace(t *testing.T) {
+	isolateOTelEnv(t)
+	if got := namespaceOf(t); got != "forge" {
+		t.Fatalf("expected service.namespace forge, got %q", got)
+	}
+}
+
+func TestSetupTracingNamespaceFromEnvWins(t *testing.T) {
+	isolateOTelEnv(t)
+	t.Setenv("OTEL_RESOURCE_ATTRIBUTES", "service.namespace=elsewhere")
+	if got := namespaceOf(t); got != "elsewhere" {
+		t.Fatalf("expected OTEL_RESOURCE_ATTRIBUTES to set service.namespace, got %q", got)
+	}
+}
+
 func TestSetupTracingOffWithoutEndpoint(t *testing.T) {
 	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
 	t.Setenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "")
@@ -125,5 +170,102 @@ func TestSetupTracingOffWithoutEndpoint(t *testing.T) {
 	}
 	if otel.GetTracerProvider() != prev {
 		t.Fatal("expected no tracer provider installed without an endpoint")
+	}
+}
+
+// isolateOTelEnv unsets, for the test's duration, the OTEL_* variables that
+// would send the export elsewhere or sample the span away, so the shell or CI
+// running the tests cannot change the outcome.
+func isolateOTelEnv(t *testing.T) {
+	t.Helper()
+	for _, k := range []string{
+		"OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+		"OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+		"OTEL_TRACES_SAMPLER",
+		"OTEL_TRACES_SAMPLER_ARG",
+		"OTEL_SDK_DISABLED",
+		"OTEL_RESOURCE_ATTRIBUTES",
+		"OTEL_SERVICE_NAME",
+	} {
+		t.Setenv(k, "") // restores the original value when the test ends
+		os.Unsetenv(k)
+	}
+}
+
+func TestCollectorHostOmitsCredentials(t *testing.T) {
+	for endpoint, want := range map[string]string{
+		"http://otel-collector:4318":                      "http://otel-collector:4318",
+		"https://user:secret@collector.example.com/v1":    "https://collector.example.com",
+		"https://collector.example.com:4318?token=hunter": "https://collector.example.com:4318",
+		"not a url": "unparsed endpoint",
+	} {
+		if got := collectorHost(endpoint); got != want {
+			t.Errorf("collectorHost(%q) = %q, want %q", endpoint, got, want)
+		}
+	}
+}
+
+func TestSetupMetricsOffWithoutEndpoint(t *testing.T) {
+	isolateOTelEnv(t)
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+	prev := otel.GetMeterProvider()
+	t.Cleanup(func() { otel.SetMeterProvider(prev) })
+
+	shutdown, err := setupMetrics(context.Background(), zap.NewNop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if otel.GetMeterProvider() != prev {
+		t.Fatal("expected no meter provider installed without an endpoint")
+	}
+}
+
+// With a collector configured, through either the shared or the
+// metrics-only endpoint variable, shutdown exports what the meters observed.
+func TestSetupMetricsExportsOnShutdown(t *testing.T) {
+	for _, env := range []string{"OTEL_EXPORTER_OTLP_ENDPOINT", "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"} {
+		t.Run(env, func(t *testing.T) {
+			got := make(chan string, 4)
+			collector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				select {
+				case got <- r.URL.Path:
+				default:
+				}
+			}))
+			defer collector.Close()
+			isolateOTelEnv(t)
+			endpoint := collector.URL
+			if env == "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT" {
+				// The signal-specific variable is the full URL, path included.
+				endpoint += "/v1/metrics"
+			}
+			t.Setenv(env, endpoint)
+			prev := otel.GetMeterProvider()
+			t.Cleanup(func() { otel.SetMeterProvider(prev) })
+
+			shutdown, err := setupMetrics(context.Background(), zap.NewNop())
+			if err != nil {
+				t.Fatal(err)
+			}
+			counter, err := otel.Meter("test").Int64Counter("test.requests")
+			if err != nil {
+				t.Fatal(err)
+			}
+			counter.Add(context.Background(), 1)
+			if err := shutdown(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case path := <-got:
+				if path != "/v1/metrics" {
+					t.Fatalf("expected an export to /v1/metrics, got %s", path)
+				}
+			default:
+				t.Fatal("expected shutdown to flush the metric to the collector")
+			}
+		})
 	}
 }

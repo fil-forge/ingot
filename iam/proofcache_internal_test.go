@@ -6,6 +6,7 @@ import (
 	"time"
 
 	contentcmds "github.com/fil-forge/libforge/commands/content"
+	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/ucantone/multikey/ed25519"
 	"github.com/fil-forge/ucantone/ucan"
 	"github.com/fil-forge/ucantone/ucan/delegation"
@@ -105,4 +106,74 @@ func TestEvictionReAddRace(t *testing.T) {
 	// And the normal path still prunes once the cache entry is really gone.
 	d.data.Delete(dlg.Link().String())
 	require.Equal(t, 0, d.indexSize())
+}
+
+// mintDelegationFor issues a /content/retrieve delegation between the given
+// principals, so several can share an (aud, cmd, sub) key and compete to be
+// chosen.
+func mintDelegationFor(t *testing.T, iss ucan.Issuer, aud, sub did.DID, opts ...delegation.Option) ucan.Delegation {
+	t.Helper()
+	dlg, err := contentcmds.Retrieve.Delegate(iss, aud, sub, opts...)
+	require.NoError(t, err)
+	return dlg
+}
+
+// TestListDelegationsPrefersTheLongestLived: hilt issues a fresh delegation on
+// every authorize, so a key in use holds several for one command at once. The
+// longest-lived has to come first — work queued for later keeps whichever
+// chain it was handed, and one with minutes left strands it.
+func TestListDelegationsPrefersTheLongestLived(t *testing.T) {
+	iss, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	aud, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	sub := iss.DID()
+
+	now := time.Now()
+	soon := mintDelegationFor(t, iss, aud.DID(), sub,
+		delegation.WithExpiration(ucan.UnixTimestamp(now.Add(2*time.Minute).Unix())))
+	later := mintDelegationFor(t, iss, aud.DID(), sub,
+		delegation.WithExpiration(ucan.UnixTimestamp(now.Add(20*time.Hour).Unix())))
+	middle := mintDelegationFor(t, iss, aud.DID(), sub,
+		delegation.WithExpiration(ucan.UnixTimestamp(now.Add(time.Hour).Unix())))
+
+	// Added shortest-first, so insertion order cannot be what puts the
+	// longest-lived in front.
+	c := NewDelegationCache()
+	c.Add(soon, middle, later)
+
+	var got []ucan.Delegation
+	for dlg, err := range c.listDelegations(context.Background(), aud.DID(), contentcmds.Retrieve.Command, sub) {
+		require.NoError(t, err)
+		got = append(got, dlg)
+	}
+	require.Len(t, got, 3)
+	require.Equal(t, later.Link(), got[0].Link(), "the longest-lived match comes first")
+	require.Equal(t, middle.Link(), got[1].Link())
+	require.Equal(t, soon.Link(), got[2].Link())
+}
+
+// TestListDelegationsRanksAnUnexpiringDelegationFirst: a delegation with no
+// expiry outlives every one that has an expiry.
+func TestListDelegationsRanksAnUnexpiringDelegationFirst(t *testing.T) {
+	iss, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	aud, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	sub := iss.DID()
+
+	bounded := mintDelegationFor(t, iss, aud.DID(), sub,
+		delegation.WithExpiration(ucan.UnixTimestamp(time.Now().Add(20*time.Hour).Unix())))
+	forever := mintDelegationFor(t, iss, aud.DID(), sub, delegation.WithNoExpiration())
+
+	c := NewDelegationCache()
+	c.Add(bounded, forever)
+
+	var first ucan.Delegation
+	for dlg, err := range c.listDelegations(context.Background(), aud.DID(), contentcmds.Retrieve.Command, sub) {
+		require.NoError(t, err)
+		first = dlg
+		break
+	}
+	require.Equal(t, forever.Link(), first.Link())
 }

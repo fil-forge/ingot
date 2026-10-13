@@ -59,6 +59,10 @@ func newRefTestBackend(t *testing.T, maxBlob ...int64) (*Backend, *inmem.MemStor
 	if err != nil {
 		t.Fatalf("spool: %v", err)
 	}
+	cache, err := blockstore.NewBlobCache(filepath.Join(dir, "cache"))
+	if err != nil {
+		t.Fatalf("spool: %v", err)
+	}
 	log, err := logstore.Open(ctx, logstore.Config{
 		Dir:     filepath.Join(dir, "segments"),
 		Meta:    mem,
@@ -80,12 +84,14 @@ func newRefTestBackend(t *testing.T, maxBlob ...int64) (*Backend, *inmem.MemStor
 		GC:              mem,
 		Multipart:       mem,
 		Parks:           mem,
-		Reads:           blockstore.NewLayered(spool, log, inmem.NopBaseReader{}),
+		Reads:           blockstore.NewLayered(blockstore.LocalBlobs{Cache: cache, Spool: spool}, log, inmem.NopBaseReader{}),
 		Log:             log,
 		Spool:           spool,
+		Cache:           cache,
 		Uploader:        inmem.NopUploader{},
 		Deferred:        inmem.NopUploader{},
 		Remover:         rm,
+		Registrar:       inmem.NopUploader{},
 		EncParams:       mem,
 		RegionKeys:      testRegionKeys(t),
 		TenantKeys:      testTenantKeys(),
@@ -269,7 +275,7 @@ func TestRefIndex_DeleteReleasesAtZero(t *testing.T) {
 // plaintext halves is stored as two DISTINCT blobs (fresh CEK per piece),
 // each with its own claim, each released exactly once on delete. (The old
 // duplicate-BlobRef double-remove scenario cannot be produced by the write
-// path any more; releaseBlobs still guards it.)
+// path any more; runRelease's claim count still guards it.)
 func TestRefIndex_IdenticalPiecesInOneBody(t *testing.T) {
 	b, mem, rm := newRefTestBackend(t, 1024) // 1 KiB plaintext blob ceiling
 	data := bytes.Repeat([]byte{0x7}, 2048)  // → two identical 1 KiB pieces

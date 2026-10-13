@@ -148,13 +148,19 @@ var ServerModule = fx.Module("ingot-server",
 type serverParams struct {
 	fx.In
 
-	Config          config.ServerConfig
-	Logger          *zap.Logger
-	Reader          blockstore.BlockReader
-	Uploader        uploader.Uploader
-	BodyUploader    uploader.BodyUploader
-	Deferred        uploader.DeferredBodyUploader
-	Remover         uploader.BlobRemover
+	Config       config.ServerConfig
+	Logger       *zap.Logger
+	Reader       blockstore.BlockReader
+	Uploader     uploader.Uploader
+	BodyUploader uploader.BodyUploader
+	Deferred     uploader.DeferredBodyUploader
+	Remover      uploader.BlobRemover
+	Registrar    uploader.UploadRegistrar
+	UploadRegs   registry.UploadRegistrationStore
+	// Streaming and Streams are optional: without them every body blob is
+	// spooled before it is uploaded (see ServerDeps.Streaming).
+	Streaming       uploader.StreamingBodyUploader `optional:"true"`
+	Streams         registry.StreamStore           `optional:"true"`
 	BucketAuthority bucketauthority.BucketAuthority
 	Registry        registry.Registry
 	Intents         registry.IntentStore
@@ -213,6 +219,10 @@ func registerServerLifecycle(lc fx.Lifecycle, p serverParams) {
 				BodyUploader:    p.BodyUploader,
 				Deferred:        p.Deferred,
 				Remover:         p.Remover,
+				Streaming:       p.Streaming,
+				Streams:         p.Streams,
+				Registrar:       p.Registrar,
+				UploadRegs:      p.UploadRegs,
 				Authority:       p.BucketAuthority,
 				Registry:        p.Registry,
 				Intents:         p.Intents,
@@ -484,7 +494,9 @@ type registryResult struct {
 	GC                registry.GCStore
 	Multipart         registry.MultipartStore
 	Parks             registry.ParkStore
+	Streams           registry.StreamStore
 	PendingReleases   registry.PendingReleaseStore
+	UploadRegs        registry.UploadRegistrationStore
 	EncParams         registry.EncryptionParamsStore
 	RevocationCursors registry.RevocationCursorStore
 	Meta              logstore.Meta
@@ -499,7 +511,7 @@ type registryResult struct {
 // needs hilt_url/hilt_did configured.
 func provideRegistry(pool *pgxpool.Pool) registryResult {
 	pg := registry.NewPostgres(pool)
-	return registryResult{Registry: pg, Intents: pg, Locations: pg, Inclusions: pg, BlobRefs: pg, GC: pg, Multipart: pg, Parks: pg, PendingReleases: pg, EncParams: pg, RevocationCursors: pg, Meta: pg}
+	return registryResult{Registry: pg, Intents: pg, Locations: pg, Inclusions: pg, BlobRefs: pg, GC: pg, Multipart: pg, Parks: pg, Streams: pg, PendingReleases: pg, UploadRegs: pg, EncParams: pg, RevocationCursors: pg, Meta: pg}
 }
 
 // migrationHookOut feeds the migration PreStartHook into the "ingot_prestart"
@@ -555,7 +567,9 @@ type uploaderResult struct {
 	Uploader     uploader.Uploader
 	BodyUploader uploader.BodyUploader
 	Deferred     uploader.DeferredBodyUploader
+	Streaming    uploader.StreamingBodyUploader
 	Remover      uploader.BlobRemover
+	Registrar    uploader.UploadRegistrar
 }
 
 // provideUploader builds the guppy-style edge client that ships to Forge via
@@ -567,5 +581,5 @@ func provideUploader(c *forgeclient.Client, logger *zap.Logger) (uploaderResult,
 	if err != nil {
 		return uploaderResult{}, err
 	}
-	return uploaderResult{Uploader: f, BodyUploader: f, Deferred: f, Remover: f}, nil
+	return uploaderResult{Uploader: f, BodyUploader: f, Deferred: f, Streaming: f, Remover: f, Registrar: f}, nil
 }

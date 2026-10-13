@@ -75,7 +75,7 @@ func TestForgeDeleteBucketReleases(t *testing.T) {
 	// The part rows are the only index to the blob and the teardown destroys
 	// them, so read the digest while the session is still open.
 	partDigest := partBlobDigests(t, ctx, s, aws.ToString(create.UploadId), 1)[0]
-	waitForPiriLogLine(t, ctx, s, 30*time.Second, "/blob/allocate", partDigest)
+	waitForPiriReceived(t, ctx, s, 30*time.Second, partDigest)
 	if piriLogHasLine(t, ctx, s, "/blob/accept", partDigest) {
 		t.Fatalf("part blob %s was accepted while its upload is open — parking is broken", partDigest)
 	}

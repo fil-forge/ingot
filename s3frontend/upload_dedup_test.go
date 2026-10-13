@@ -52,6 +52,10 @@ func TestUpload_IdenticalContentUploadsDistinctBlobs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("spool: %v", err)
 	}
+	cache, err := blockstore.NewBlobCache(filepath.Join(dir, "cache"))
+	if err != nil {
+		t.Fatalf("spool: %v", err)
+	}
 	log, err := logstore.Open(ctx, logstore.Config{
 		Dir:     filepath.Join(dir, "segments"),
 		Meta:    mem,
@@ -65,20 +69,23 @@ func TestUpload_IdenticalContentUploadsDistinctBlobs(t *testing.T) {
 
 	up := &countingUploader{calls: map[string]int{}}
 	b := New(Deps{
-		Authority:  mem,
-		Registry:   mem,
-		Intents:    mem,
-		Locations:  mem,
-		BlobRefs:   mem,
-		GC:         mem,
-		Reads:      blockstore.NewLayered(spool, log, inmem.NopBaseReader{}),
-		Log:        log,
-		Spool:      spool,
-		Uploader:   up,
-		Remover:    &recordingRemover{},
-		EncParams:  mem,
-		RegionKeys: testRegionKeys(t),
-		TenantKeys: testTenantKeys(),
+		Authority:       mem,
+		Registry:        mem,
+		Intents:         mem,
+		Locations:       mem,
+		BlobRefs:        mem,
+		GC:              mem,
+		Reads:           blockstore.NewLayered(blockstore.LocalBlobs{Cache: cache, Spool: spool}, log, inmem.NopBaseReader{}),
+		Log:             log,
+		Spool:           spool,
+		Cache:           cache,
+		Uploader:        up,
+		Remover:         &recordingRemover{},
+		PendingReleases: mem,
+		Registrar:       inmem.NopUploader{},
+		EncParams:       mem,
+		RegionKeys:      testRegionKeys(t),
+		TenantKeys:      testTenantKeys(),
 	})
 	if err := mem.Create(ctx, "bk", testutil.RandomDID(t), registry.CreateState{}); err != nil {
 		t.Fatalf("create bucket: %v", err)

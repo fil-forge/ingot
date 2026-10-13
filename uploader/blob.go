@@ -78,7 +78,7 @@ type UploadedBlob struct {
 // BodyUploader makes one object-body blob durable on Forge by digest: allocate
 // → PUT (skipped on dedup) → accept, returning its published location.
 // WithConclude(false) stops before accept (see UploadedBlob). It is the
-// data-plane counterpart to Uploader (which ships catalog CAR segments). Unlike
+// object-body counterpart to Uploader (which ships catalog CAR segments). Unlike
 // the old data-plane pipeline, this is synchronous: a blob is durable — and,
 // when concluding, accepted — on Piri before the write path commits the
 // manifest that references it (docs/architecture.md §5, §7.1).
@@ -187,7 +187,7 @@ type DeferredBodyUploader interface {
 	// AbortBlob releases a parked blob on its provider. A blob the space has
 	// already accepted cannot be aborted: the error wraps [ErrBlobAccepted]
 	// and the caller releases it as an accepted blob instead.
-	AbortBlob(ctx context.Context, space did.DID, digest multihash.Multihash, cause cid.Cid) error
+	AbortBlob(ctx context.Context, space did.DID, add cid.Cid) error
 }
 
 // ConcludeBlobs finishes many parked uploads in as few exchanges with the
@@ -208,7 +208,7 @@ func (u *Forge) ConcludeBlobs(ctx context.Context, space did.DID, parked []Uploa
 			PutInvocation: p.PutInvocation,
 		}
 	}
-	added, err := u.client.BlobConcludeBatch(ctx, space, req)
+	added, err := u.client.BlobConcludeAll(ctx, space, req)
 	// Every blob comes back, located or still parked, whether or not the
 	// batch as a whole succeeded. What was located is converted before the
 	// error is looked at, so the caller can record it.
@@ -237,24 +237,24 @@ func (u *Forge) ConcludeBlobs(ctx context.Context, space did.DID, parked []Uploa
 var ErrBlobAccepted = errors.New("uploader: blob accepted by the space; release it with remove")
 
 // AbortBlob abandons a parked blob via /blob/abort on the upload
-// service: sprue recovers the provider from the cause receipt chain and the
-// node releases the allocation + parked bytes. cause is the parked blob's
+// service: sprue recovers the provider from the receipt chain of the add and
+// the node releases the allocation + parked bytes. add is the parked blob's
 // AddTask. The proof store is request-scoped when present (an S3 Abort) and
 // otherwise the store captured at park time (the session-expiry sweeper).
 // A refusal because the space has accepted the blob is returned wrapping
 // [ErrBlobAccepted], so the caller can release the blob instead. Errors are
 // logged here (callers treat abort cleanup as best-effort and may discard
 // them).
-func (u *Forge) AbortBlob(ctx context.Context, space did.DID, digest multihash.Multihash, cause cid.Cid) error {
+func (u *Forge) AbortBlob(ctx context.Context, space did.DID, add cid.Cid) error {
 	u.logger.Info("blob abort",
 		zap.Stringer("space", space),
-		zap.String("digest", digestutil.Format(digest)),
+		zap.Stringer("add", add),
 	)
 	store, ok := u.shipProofStore(ctx, space)
 	if !ok {
 		return fmt.Errorf("uploader: no proof store for space %s (no request scope and no captured write authority)", space)
 	}
-	if err := u.client.BlobAbort(ctx, space, digest, cause, forgeclient.WithProofStore(store)); err != nil {
+	if err := u.client.BlobAbort(ctx, space, add, forgeclient.WithProofStore(store)); err != nil {
 		// A BlobAccepted refusal is final, not a fault: the space accepted
 		// this content (e.g. a concurrent session completed with the same
 		// content-addressed part), so the blob now belongs to the reference
@@ -263,13 +263,13 @@ func (u *Forge) AbortBlob(ctx context.Context, space did.DID, digest multihash.M
 		if ucanerrors.As(err, &named) && named.Name() == blobcmds.BlobAcceptedErrorName {
 			u.logger.Info("blob abort refused: blob accepted by the space; reference accounting owns it",
 				zap.Stringer("space", space),
-				zap.String("digest", digestutil.Format(digest)),
+				zap.Stringer("add", add),
 			)
 			return fmt.Errorf("uploader: aborting blob: %w", ErrBlobAccepted)
 		}
 		u.logger.Error("blob abort failed",
 			zap.Stringer("space", space),
-			zap.String("digest", digestutil.Format(digest)),
+			zap.Stringer("add", add),
 			zap.Error(err),
 		)
 		return fmt.Errorf("uploader: aborting blob: %w", err)

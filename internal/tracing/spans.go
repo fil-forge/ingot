@@ -40,27 +40,29 @@ func End(span trace.Span, err error) {
 type ReadSource int
 
 const (
-	// BlockSpool is a block read from the local blob spool.
-	BlockSpool ReadSource = iota
+	// BlockLocal is a block read from local blob storage (the spool or the
+	// cache).
+	BlockLocal ReadSource = iota
 	// BlockLog is a catalog block read from the local log.
 	BlockLog
 	// BlockCache is a block read from the in-memory block cache.
 	BlockCache
 	// BlockNetwork is a block fetched from Forge.
 	BlockNetwork
-	// BlobSpool is a body blob streamed from the local spool.
-	BlobSpool
+	// BlobLocal is a body blob streamed from local blob storage (the spool or
+	// the cache).
+	BlobLocal
 	// BlobNetwork is a body blob streamed from Forge.
 	BlobNetwork
 	numReadSources
 )
 
 var readSourceAttrs = [numReadSources]string{
-	BlockSpool:   "ingot.reads.blocks.spool",
+	BlockLocal:   "ingot.reads.blocks.local",
 	BlockLog:     "ingot.reads.blocks.log",
 	BlockCache:   "ingot.reads.blocks.cache",
 	BlockNetwork: "ingot.reads.blocks.network",
-	BlobSpool:    "ingot.reads.blobs.spool",
+	BlobLocal:    "ingot.reads.blobs.local",
 	BlobNetwork:  "ingot.reads.blobs.network",
 }
 

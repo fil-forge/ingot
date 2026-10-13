@@ -11,6 +11,7 @@ import (
 	blobcmds "github.com/fil-forge/libforge/commands/blob"
 	contentcmds "github.com/fil-forge/libforge/commands/content"
 	indexcmds "github.com/fil-forge/libforge/commands/index"
+	uploadcmds "github.com/fil-forge/libforge/commands/upload"
 	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/ucantone/multikey/ed25519"
 	"github.com/fil-forge/ucantone/ucan"
@@ -112,4 +113,52 @@ func TestIndexAddUsesProofStoreOverride(t *testing.T) {
 		require.Equal(t, agent.DID(), q.aud)
 		require.Equal(t, space.DID(), q.sub)
 	}
+}
+
+func TestUploadAddUsesProofStoreOverride(t *testing.T) {
+	ctx := context.Background()
+	agent, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	space, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+
+	c := newAccountsTestClient(t, agent, tokenstore.NewMemStore())
+
+	// Return an empty (non-error) chain so UploadAdd runs the ProofChain lookup
+	// before failing at the network step (which we ignore).
+	rec := &recordingProofStore{}
+	digest, err := multihash.Sum([]byte("manifest-bytes"), multihash.SHA2_256, -1)
+	require.NoError(t, err)
+	root := cid.NewCidV1(cid.Raw, digest)
+
+	_ = c.UploadAdd(ctx, space.DID(), root, WithProofStore(rec))
+
+	qs := rec.queries()
+	require.Len(t, qs, 1, "UploadAdd builds one upload/add chain")
+	require.Equal(t, uploadcmds.Add.Command, qs[0].cmd)
+	require.Equal(t, agent.DID(), qs[0].aud)
+	require.Equal(t, space.DID(), qs[0].sub)
+}
+
+func TestUploadRemoveUsesProofStoreOverride(t *testing.T) {
+	ctx := context.Background()
+	agent, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	space, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+
+	c := newAccountsTestClient(t, agent, tokenstore.NewMemStore())
+
+	rec := &recordingProofStore{}
+	digest, err := multihash.Sum([]byte("manifest-bytes"), multihash.SHA2_256, -1)
+	require.NoError(t, err)
+	root := cid.NewCidV1(cid.Raw, digest)
+
+	_ = c.UploadRemove(ctx, space.DID(), root, WithProofStore(rec))
+
+	qs := rec.queries()
+	require.Len(t, qs, 1, "UploadRemove builds one upload/remove chain")
+	require.Equal(t, uploadcmds.Remove.Command, qs[0].cmd)
+	require.Equal(t, agent.DID(), qs[0].aud)
+	require.Equal(t, space.DID(), qs[0].sub)
 }

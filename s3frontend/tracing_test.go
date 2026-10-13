@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
@@ -12,6 +13,7 @@ import (
 	"github.com/fil-forge/versitygw/s3response"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"go.opentelemetry.io/otel/trace"
@@ -209,4 +211,50 @@ func TestMultipartSpans(t *testing.T) {
 	requireAttr(t, conclude, attribute.Int("ingot.blobs.total", 2))
 	requireAttr(t, conclude, attribute.Int("ingot.blobs.concluded", 2))
 	requireAttr(t, conclude, attribute.Int("ingot.blobs.uploaded", 0))
+}
+
+// TestSweepLocalBlobsSpans: each pass of a local blob sweep records a span
+// under the caller's, carrying what it removed and why it stopped.
+func TestSweepLocalBlobsSpans(t *testing.T) {
+	b, _ := newSweepBackend(t, func(d *Deps) { d.CacheMinResidency = time.Hour })
+	digests := putSweepObjects(t, b, 4)
+	size := blobSize(t, b, digests[0])
+	budgetToEvict(b, 2, size)
+
+	tree := traceOp(t, func(ctx context.Context) {
+		if _, err := b.SweepLocalBlobs(ctx); err != nil {
+			t.Fatalf("SweepLocalBlobs: %v", err)
+		}
+	})
+
+	budget := tree.one("local_blobs.budget_pass")
+	tree.requireInTrace(budget)
+	requireAttr(t, budget, attribute.Int64("ingot.sweep.files", 0))
+	requireAttr(t, budget, attribute.String("ingot.sweep.stop", "residency"))
+	forced := tree.one("local_blobs.forced_pass")
+	tree.requireInTrace(forced)
+	requireAttr(t, forced, attribute.Int64("ingot.sweep.files", 2))
+	requireAttr(t, forced, attribute.Int64("ingot.sweep.bytes", 2*size))
+	tree.requireInTrace(tree.one("local_blobs.orphan_pass"))
+}
+
+// TestSweepLocalBlobsSpansOnCancel: a sweep whose context is cancelled (the
+// daemon stopping) does not mark its pass spans failed.
+func TestSweepLocalBlobsSpansOnCancel(t *testing.T) {
+	b, _ := newSweepBackend(t)
+	digests := putSweepObjects(t, b, 4)
+	budgetToEvict(b, 2, blobSize(t, b, digests[0]))
+
+	tree := traceOp(t, func(ctx context.Context) {
+		ctx, cancel := context.WithCancel(ctx)
+		cancel()
+		_, _ = b.SweepLocalBlobs(ctx)
+	})
+
+	for _, sp := range tree.spans {
+		if sp.Status().Code == codes.Error {
+			t.Fatalf("span %q marked failed on cancellation: %s", sp.Name(), sp.Status().Description)
+		}
+	}
+	tree.one("local_blobs.orphan_pass")
 }

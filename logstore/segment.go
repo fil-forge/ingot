@@ -26,11 +26,10 @@ import (
 // CAR header.
 var placeholderRoot = cid.NewCidV1(cid.Raw, []byte{0x00, 0x00})
 
-// Segment is one plane's log entry: a single CAR file plus a .idx
-// sidecar. A catalog-plane segment also owns an append-only .ops sidecar
-// recording each batch's (bucket, root); data-plane segments have no
-// op-roots. Open segments accept appends; sealed segments are read-only
-// and ship/retire independently.
+// Segment is one catalog log entry: a single CAR file plus a .idx sidecar
+// and an append-only .ops sidecar recording each batch's (bucket, root).
+// Open segments accept appends; sealed segments are read-only and
+// ship/retire independently.
 //
 // Concurrency: append is serialized by PlaneLog.appMu. stateMu guards
 // every mutable field below; readers RLock for lookups, writers Lock for

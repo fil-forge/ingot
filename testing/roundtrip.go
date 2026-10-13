@@ -46,6 +46,17 @@ func CreateBucket(ctx context.Context, c Config, bucket string) error {
 	return err
 }
 
+// DeleteBucket deletes bucket on the ingot listener at c. The bucket must be
+// empty, as S3 requires.
+func DeleteBucket(ctx context.Context, c Config, bucket string) error {
+	cl, err := s3Client(ctx, c)
+	if err != nil {
+		return err
+	}
+	_, err = cl.DeleteBucket(ctx, &s3.DeleteBucketInput{Bucket: &bucket})
+	return err
+}
+
 // PutBytes uploads body as object key in bucket.
 func PutBytes(ctx context.Context, c Config, bucket, key string, body []byte) error {
 	cl, err := s3Client(ctx, c)

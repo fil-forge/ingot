@@ -26,7 +26,7 @@ func (t *ObjectManifest) MarshalCBOR(w io.Writer) error {
 
 	cw := cbg.NewCborWriter(w)
 
-	if _, err := cw.Write([]byte{178}); err != nil {
+	if _, err := cw.Write([]byte{179}); err != nil {
 		return err
 	}
 
@@ -391,6 +391,22 @@ func (t *ObjectManifest) MarshalCBOR(w io.Writer) error {
 		}
 	}
 
+	// t.Plaintext (bool) (bool)
+	if len("pt") > 1000000 {
+		return xerrors.Errorf("Value in field \"pt\" was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("pt"))); err != nil {
+		return err
+	}
+	if _, err := cw.WriteString(string("pt")); err != nil {
+		return err
+	}
+
+	if err := cbg.WriteBool(w, t.Plaintext); err != nil {
+		return err
+	}
+
 	// t.Seq (uint64) (uint64)
 	if len("sq") > 1000000 {
 		return xerrors.Errorf("Value in field \"sq\" was too long")
@@ -713,6 +729,24 @@ func (t *ObjectManifest) UnmarshalCBOR(r io.Reader) (err error) {
 
 				t.Metadata[k] = v
 
+			}
+			// t.Plaintext (bool) (bool)
+		case "pt":
+
+			maj, extra, err = cr.ReadHeader()
+			if err != nil {
+				return err
+			}
+			if maj != cbg.MajOther {
+				return fmt.Errorf("booleans must be major type 7")
+			}
+			switch extra {
+			case 20:
+				t.Plaintext = false
+			case 21:
+				t.Plaintext = true
+			default:
+				return fmt.Errorf("booleans are either major type 7, value 20 or 21 (got %d)", extra)
 			}
 			// t.Seq (uint64) (uint64)
 		case "sq":

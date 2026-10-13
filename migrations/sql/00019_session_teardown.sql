@@ -36,9 +36,8 @@ ALTER TABLE ingot.multipart_sessions
 UPDATE ingot.multipart_sessions SET state_changed_at = created_at;
 
 -- A committed blob's upload intent is 'published', written with its first
--- reference claim; a release recognises a committed blob by it once the claims
--- are gone and keeps the spool copy (the insurance copy until eviction) and the
--- intent. Blobs committed before the state existed carry 'accepted' intents and
+-- reference claim; a session's release recognises a committed part blob by it
+-- and leaves the blob to the object's own release. Blobs committed before the state existed carry 'accepted' intents and
 -- their claims are the only trace: mark them, so their eventual release does not
 -- take them for never-committed part blobs and remove the spool copy.
 UPDATE ingot.upload_intents i

@@ -3,6 +3,8 @@ package s3frontend
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -26,6 +28,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.uber.org/zap"
 
+	"github.com/fil-forge/ingot/blockstore"
 	msbucket "github.com/fil-forge/ingot/bucket"
 	"github.com/fil-forge/ingot/bucketop"
 	"github.com/fil-forge/ingot/internal/reqscope"
@@ -41,22 +44,67 @@ const defaultMaxKeys = 1000
 // now (see bucket-metadata.rfc §"Canonical state vs service state"); lock
 // headers stamp the new version's state (docs/s3-object-lock.md §7). ETag is
 // the hex md5 of the body, quoted per S3 wire format.
-// requestsServerSideEncryption reports whether the request carries any
-// server-side-encryption header (SSE-S3, SSE-KMS or SSE-C, including the
-// copy-source SSE-C headers). ingot encrypts every object to the tenant key and
-// does not implement client-directed SSE, so PutObject / CreateMultipartUpload
-// / CopyObject reject such a request rather than silently storing the object
-// under ingot's own scheme. Only header presence is inspected; the (sensitive)
-// SSE-C customer key value is never read or logged.
-func requestsServerSideEncryption(headers map[string]string) bool {
-	for k := range headers {
-		lk := strings.ToLower(k)
-		if strings.HasPrefix(lk, "x-amz-server-side-encryption") ||
-			strings.HasPrefix(lk, "x-amz-copy-source-server-side-encryption") {
-			return true
+// bodyMD5Source supplies a body's MD5 in place of ingest's own pass. Ingest
+// calls it after the body has been read, so it may be a digest the request
+// carried or the request's MD5 checksum reader, whose Sum is final only once
+// the stream is consumed. It returns the raw 16-byte digest.
+type bodyMD5Source func() []byte
+
+// knownMD5 is the bodyMD5Source for a digest already in hand.
+func knownMD5(digest []byte) bodyMD5Source { return func() []byte { return digest } }
+
+// checksumReaderMD5 is the bodyMD5Source for a HashReader computing MD5 over
+// the body: its Sum is the base64 digest once the read completes.
+func checksumReaderMD5(hr *utils.HashReader) bodyMD5Source {
+	return func() []byte { return decodeContentMD5(hr.Sum()) }
+}
+
+// clientProvidedBodyMD5 returns where the object body's MD5 comes from when
+// the request already establishes it, so ingest can skip its own MD5 pass: a
+// Content-MD5 header (the checksum middleware verifies it against the stream
+// before the backend commits), or an MD5 checksum spec, explicit
+// (x-amz-checksum-md5, validated by hr on the same read) or algorithm-only
+// (x-amz-checksum-algorithm: MD5, computed by hr on the same read). It returns
+// nil when the request supplies no usable MD5, in which case ingest computes
+// it as before. A malformed Content-MD5 yields nil; the middleware still
+// rejects it during the body read, so ingest never commits a wrong ETag.
+func clientProvidedBodyMD5(ctx context.Context, spec *checksumSpec, hr *utils.HashReader) bodyMD5Source {
+	if digest := decodeContentMD5(contentMD5Header(ctx)); digest != nil {
+		return knownMD5(digest)
+	}
+	if hr != nil && spec != nil && spec.algo == types.ChecksumAlgorithmMd5 {
+		return checksumReaderMD5(hr)
+	}
+	return nil
+}
+
+// contentMD5Header returns the request's Content-MD5 value, matched
+// case-insensitively (fasthttp canonicalizes the key to "Content-Md5"), or ""
+// when the request set none or no request is in the context.
+func contentMD5Header(ctx context.Context) string {
+	req, ok := reqscope.Request(ctx)
+	if !ok {
+		return ""
+	}
+	for k, v := range req.Headers {
+		if strings.EqualFold(k, "Content-Md5") {
+			return v
 		}
 	}
-	return false
+	return ""
+}
+
+// decodeContentMD5 decodes a base64 Content-MD5 / x-amz-checksum-md5 value to
+// its raw 16 bytes, or nil when it is empty or not a 16-byte digest.
+func decodeContentMD5(s string) []byte {
+	if s == "" {
+		return nil
+	}
+	b, err := base64.StdEncoding.DecodeString(s)
+	if err != nil || len(b) != md5.Size {
+		return nil
+	}
+	return b
 }
 
 // unsupportedObjectACL reports whether a PutObject / CreateMultipartUpload
@@ -91,8 +139,9 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 	if unsupportedObjectACL(input.ACL, input.GrantFullControl, input.GrantRead, input.GrantReadACP, input.GrantWriteACP) {
 		return s3response.PutObjectOutput{}, s3err.GetAPIError(s3err.ErrNotImplemented)
 	}
-	if req, ok := reqscope.Request(ctx); ok && requestsServerSideEncryption(req.Headers) {
-		return s3response.PutObjectOutput{}, s3err.GetAPIError(s3err.ErrNotImplemented)
+	sse, err := requestedEncryption(ctx)
+	if err != nil {
+		return s3response.PutObjectOutput{}, err
 	}
 
 	contentType := backend.GetStringFromPtr(input.ContentType)
@@ -124,6 +173,9 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 		return s3response.PutObjectOutput{}, err
 	}
 	initState = applyTagsIfPresent(initState, tags)
+	// Stored as received only under a "none" bucket the request did not ask
+	// AES256 of (sse.go).
+	plaintext := storesPlaintext(bucketState, sse)
 
 	// PRECONDITIONS (no lock): If-Match / If-None-Match. Evaluated here to fail
 	// fast before ingest, then RE-CHECKED under the per-bucket lock at commit so
@@ -163,7 +215,7 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 	// to local disk → upload each to Forge by digest (allocate→PUT→accept). A
 	// 200 means every body blob is durable and accepted before the manifest
 	// that references it is committed (docs/architecture.md §7.1).
-	bodyRec, err := b.ingestBody(ctx, bucketState, bodyReader)
+	bodyRec, err := b.ingestBody(ctx, bucketState, bodyReader, declaredLength(input.ContentLength), clientProvidedBodyMD5(ctx, spec, hr), plaintext)
 	if err != nil {
 		// A checksum/digest mismatch surfaces from the HashReader. BadDigestError,
 		// InvalidDigestError, and ContentSHA256MismatchError embed APIError but are
@@ -212,6 +264,7 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 		Expires:                 backend.GetStringFromPtr(input.Expires),
 		WebsiteRedirectLocation: backend.GetStringFromPtr(input.WebsiteRedirectLocation),
 		Metadata:                input.Metadata,
+		Plaintext:               plaintext,
 	}
 	node, effState, err := b.commitVersion(ctx, bucketState, key, mf, initState, false, func(superseded *msbucket.ObjectManifest) error {
 		// Race-safe re-check of If-Match / If-None-Match under the lock. A
@@ -228,8 +281,9 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 
 	size := mf.Body.Size
 	out := s3response.PutObjectOutput{
-		ETag: etagOf(mf),
-		Size: &size,
+		ETag:                 etagOf(mf),
+		Size:                 &size,
+		ServerSideEncryption: encryptionOf(mf),
 	}
 	// Only an enabled bucket echoes a version id in the response. A suspended
 	// bucket stores the object under the "null" version id but omits it from the
@@ -245,20 +299,67 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 // spools each to local disk (SplitBody → Spool), records an upload_intents row
 // per blob, uploads each to Forge by digest, and advances the intent to
 // accepted. It returns the Body the manifest will pin. A zero-byte body yields
-// a Body with no blobs and uploads nothing.
+// a Body with no blobs and uploads nothing. A non-nil md5Src is where the
+// body's MD5 comes from instead of ingest's own pass (see bodyMD5Source);
+// ingest reads it after the body and stamps it onto Body.MD5.
 //
 // On any error the already-spooled/parked blobs and their intents are left for
 // crash recovery to reconcile (a later phase); no manifest is written, so no
 // catalog entry ever references a non-durable blob.
-func (b *Backend) ingestBody(ctx context.Context, bucket *registry.State, r io.Reader) (msbucket.Body, error) {
-	body, err := b.splitSpool(ctx, bucket.Name, bucket.Space, r)
+//
+// size is the body's declared length (see splitSpool); plaintext stores the
+// body as received (see storesPlaintext).
+func (b *Backend) ingestBody(ctx context.Context, bucket *registry.State, r io.Reader, size int64, md5Src bodyMD5Source, plaintext bool) (msbucket.Body, error) {
+	body, err := b.splitSpool(ctx, bucket.Name, bucket.Space, r, size, md5Src, plaintext)
 	if err != nil {
 		return msbucket.Body{}, err
 	}
-	if err := b.uploadBlobs(ctx, bucket.Space, body.Blobs); err != nil {
+	defer body.lease.end()
+	defer body.unholdAll()
+	if err := b.uploadBlobs(ctx, bucket.Space, body); err != nil {
 		return msbucket.Body{}, err
 	}
-	return body, nil
+	return body.Body, nil
+}
+
+// spooledBody is a body split and spooled, with the blobs that already went to
+// their providers on the way, keyed by string(digest). Those are parked there
+// and need only their conclude.
+type spooledBody struct {
+	msbucket.Body
+	streamed map[string]uploader.StreamedBlob
+	// lease renews the streamed blobs' rows until the caller has recorded
+	// their parks or acceptances, and ends it.
+	lease *streamLease
+	// holds end the spool holds on the body's blobs, by string(digest): each
+	// is ended once its blob's upload has read the file (unhold), and all of
+	// them when the write is over (unholdAll), whichever comes first.
+	holds map[string]func()
+}
+
+// unhold ends the hold on one blob's spool file: its upload has read it.
+func (sb spooledBody) unhold(digest multihash.Multihash) {
+	if unhold, ok := sb.holds[string(digest)]; ok {
+		unhold()
+	}
+}
+
+// unholdAll ends every hold the body still has.
+func (sb spooledBody) unholdAll() {
+	for _, unhold := range sb.holds {
+		unhold()
+	}
+}
+
+// declaredLength is a request's body length. S3 requires one on every
+// PutObject and UploadPart (versitygw's auth middleware refuses a request
+// without it, and takes an aws-chunked body's from its decoded length), so
+// only a direct caller of the backend passes none, meaning an empty body.
+func declaredLength(n *int64) int64 {
+	if n == nil || *n < 0 {
+		return 0
+	}
+	return *n
 }
 
 // splitSpool coarse-splits a body into blobs, encrypts each into a FEE
@@ -271,8 +372,18 @@ func (b *Backend) ingestBody(ctx context.Context, bucket *registry.State, r io.R
 //
 // The Body it returns is entirely plaintext-coordinate (Size, spans,
 // SHA256/MD5 — all computed before encryption); the intents record the
-// SPOOLED (ciphertext) byte count, which is what the uploader ships.
-func (b *Backend) splitSpool(ctx context.Context, bucket string, space did.DID, r io.Reader) (_ msbucket.Body, err error) {
+// SPOOLED (ciphertext) byte count, which is what the uploader ships. With
+// plaintext set the body is stored as received, so the two coincide, and no
+// key material is minted or recorded for its blobs. A non-nil
+// md5Src supplies the body's MD5 (a verified Content-MD5, the request's MD5
+// checksum reader, or a single-part copy source's digest): the MD5 pass is
+// skipped and Body.MD5 is read from md5Src once the body is consumed.
+//
+// size is the body's declared length. With a streaming uploader each blob
+// goes to its provider while it is spooled: those blobs come back in
+// streamed, parked on their providers, and their intents start out uploading
+// rather than spooled. A body that turns out a different length fails.
+func (b *Backend) splitSpool(ctx context.Context, bucket string, space did.DID, r io.Reader, size int64, md5Src bodyMD5Source, plaintext bool) (_ spooledBody, err error) {
 	// The span covers receiving the body (it streams in from the client as
 	// SplitBody reads it), encrypting it and writing it to the spool; the
 	// body.received event marks where the client finished sending.
@@ -283,49 +394,106 @@ func (b *Backend) splitSpool(ctx context.Context, bucket string, space did.DID, 
 	}
 	r = &receivedReader{r: r, span: span}
 	// One tenant recipient per request, resolved before anything is spooled:
-	// a body that cannot be wrapped to its tenant is not stored at all.
-	recipient, err := b.tenantRecipient(ctx)
-	if err != nil {
-		return msbucket.Body{}, err
+	// a body that cannot be wrapped to its tenant is not stored at all. A
+	// plaintext body wraps nothing and needs none.
+	var enc *bodyWriter
+	if plaintext {
+		enc = newPlainBlobWriter(b.spool, space)
+	} else {
+		recipient, err := b.tenantRecipient(ctx)
+		if err != nil {
+			return spooledBody{}, err
+		}
+		enc = newEncryptingBlobWriter(b.spool, b.regionKeys, space, []fee.Recipient{recipient})
 	}
-	enc := newEncryptingBlobWriter(b.spool, b.regionKeys, space, []fee.Recipient{recipient})
-	body, err := msbucket.SplitBody(ctx, enc, r, b.maxBlobSize)
-	if err != nil {
-		return msbucket.Body{}, fmt.Errorf("split body: %w", err)
+	// Each spooled blob is published held, until its upload has read it; a
+	// failed split leaves no caller to end the holds.
+	enc.holdWrites = true
+	defer func() {
+		if err != nil {
+			enc.unholdAll()
+		}
+	}()
+	var splitOpts []msbucket.SplitOption
+	if md5Src != nil {
+		splitOpts = append(splitOpts, msbucket.WithoutMD5())
 	}
+	var body msbucket.Body
+	if b.streaming != nil {
+		enc.stream, enc.streams, enc.bucket, enc.logger = b.streaming, b.streams, bucket, b.logger
+		enc.lease = newStreamLease(b.streams, b.logger)
+		// A failed split leaves no caller to end the lease.
+		defer func() {
+			if err != nil {
+				enc.lease.end()
+			}
+		}()
+		body, err = msbucket.SplitSizedBody(ctx, enc, r, size, b.maxBlobSize, splitOpts...)
+		switch {
+		case errors.Is(err, msbucket.ErrBodyShort):
+			return spooledBody{}, s3err.GetAPIError(s3err.ErrIncompleteBody)
+		case errors.Is(err, msbucket.ErrBodyLong):
+			return spooledBody{}, s3err.GetAPIError(s3err.ErrContentLengthMismatch)
+		}
+	} else {
+		body, err = msbucket.SplitBody(ctx, enc, r, b.maxBlobSize, splitOpts...)
+	}
+	if err != nil {
+		return spooledBody{}, fmt.Errorf("split body: %w", err)
+	}
+	if md5Src != nil {
+		// The body read completed without error, so a carried digest was
+		// verified against the stream and a checksum reader's digest is
+		// final; either is the body's MD5.
+		body.MD5 = md5Src()
+		if len(body.MD5) != md5.Size {
+			return spooledBody{}, fmt.Errorf("split body: MD5 source yielded %d bytes, want %d", len(body.MD5), md5.Size)
+		}
+	}
+	streamed := enc.streamed()
 	span.SetAttributes(
 		attribute.Int64("ingot.body.bytes", body.Size),
 		attribute.Int("ingot.body.blobs", len(body.Blobs)),
+		attribute.Int("ingot.body.streamed", len(streamed)),
 	)
 	for _, blob := range body.Blobs {
 		storedSize, err := enc.storedSize(blob.Digest)
 		if err != nil {
-			return msbucket.Body{}, err
+			return spooledBody{}, err
+		}
+		// A streamed blob is on the network already (see IntentUploading).
+		state := registry.IntentSpooled
+		if _, ok := streamed[string(blob.Digest)]; ok {
+			state = registry.IntentUploading
 		}
 		if err := b.intents.PutIntent(ctx, registry.UploadIntent{
+			Space:     space,
 			Digest:    blob.Digest,
 			LocalPath: b.spool.Path(blob.Digest),
 			Size:      storedSize,
-			State:     registry.IntentSpooled,
+			State:     state,
 			Bucket:    bucket,
 		}); err != nil {
-			return msbucket.Body{}, fmt.Errorf("record intent: %w", err)
+			return spooledBody{}, fmt.Errorf("record intent: %w", err)
+		}
+		if plaintext {
+			continue
 		}
 		// The read path decrypts from this row; it must exist before any
 		// manifest referencing the blob can commit.
 		params, err := enc.params(space, blob.Digest)
 		if err != nil {
-			return msbucket.Body{}, err
+			return spooledBody{}, err
 		}
 		if err := b.encParams.PutEncryptionParams(ctx, params); err != nil {
-			return msbucket.Body{}, fmt.Errorf("record encryption params: %w", err)
+			return spooledBody{}, fmt.Errorf("record encryption params: %w", err)
 		}
 	}
-	return body, nil
+	return spooledBody{Body: body, streamed: streamed, lease: enc.lease, holds: enc.holds}, nil
 }
 
 // uploadBlobs uploads each spooled blob to Forge by digest (allocate→PUT→
-// accept), advances its intent to accepted, and records its location. A no-op
+// accept), records its location, and advances its intent to accepted. A no-op
 // in the in-memory harness (the spool serves reads).
 //
 // A blob already durably stored for this space (a re-PUT of identical content,
@@ -337,35 +505,132 @@ func (b *Backend) splitSpool(ctx context.Context, bucket string, space did.DID, 
 // guppy's "blob already has location; skip /blob/add". (A crash between accept
 // and the location record could still re-add; that window closes with the
 // deferred upload_intents × blob_locations crash recovery — see §12.)
-func (b *Backend) uploadBlobs(ctx context.Context, space did.DID, blobs []msbucket.BlobRef) error {
-	for _, blob := range blobs {
-		if err := b.uploadBlob(ctx, space, blob); err != nil {
+//
+// A blob in streamed already went to its provider while it was spooled: it is
+// parked there and needs only its conclude.
+func (b *Backend) uploadBlobs(ctx context.Context, space did.DID, body spooledBody) error {
+	// Each digest once: a body stored as received can hold the same bytes
+	// twice, and the provider needs them once.
+	seen := make(map[string]bool, len(body.Blobs))
+	for _, blob := range body.Blobs {
+		if seen[string(blob.Digest)] {
+			continue
+		}
+		seen[string(blob.Digest)] = true
+		if sb, ok := body.streamed[string(blob.Digest)]; ok {
+			if err := b.concludeStreamed(ctx, space, blob, sb, body); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := b.uploadBlob(ctx, space, blob, body); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// uploadBlob is uploadBlobs for one blob, traced as a blob.upload span whose
-// ingot.blob.result says whether it uploaded or was already stored.
-func (b *Backend) uploadBlob(ctx context.Context, space did.DID, blob msbucket.BlobRef) (err error) {
-	ctx, span := tracing.Start(ctx, "blob.upload")
-	defer func() { tracing.End(span, err) }()
-
-	digest := blob.Digest
+// concludeStreamed accepts a blob that went to its provider as it was spooled,
+// traced as a blob.upload span like uploadBlob. A release of the same
+// digest that was running meanwhile may have taken what the stream parked
+// (see settleRelease); the stream is then given up and the blob uploaded
+// afresh from its spool file, which the write still holds.
+func (b *Backend) concludeStreamed(ctx context.Context, space did.DID, blob msbucket.BlobRef, sb uploader.StreamedBlob, body spooledBody) (err error) {
+	// One write of these bytes at a time for this space (see Backend.blobKeys):
+	// another write can have accepted the same digest while this stream was
+	// in flight, and its location is read under the lock before this one
+	// concludes, so two streams of the same bytes never both record a
+	// location.
+	unlock := b.blobKeys.Lock(blobKey(space, blob.Digest))
+	defer unlock()
+	settled, err := b.settleRelease(ctx, space, blob.Digest)
+	if err != nil {
+		return err
+	}
+	if !settled {
+		b.abandonStream(ctx, space, sb)
+		unlock() // uploadBlob takes the key itself
+		return b.uploadBlob(ctx, space, blob, body)
+	}
 	if existing, err := b.locations.GetLocation(ctx, space, blob.Digest); err == nil && existing != nil {
-		// Already durable for this space — advance the intent and move on.
-		span.SetAttributes(attribute.String("ingot.blob.result", "already_stored"))
-		if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentAccepted); err != nil {
+		// Accepted for the space meanwhile: the stream's allocation is
+		// surplus, and the blob is reused as uploadBlob reuses a located one.
+		b.abandonStream(ctx, space, sb)
+		if err := b.intents.SetIntentState(ctx, space, blob.Digest, registry.IntentAccepted); err != nil {
 			return fmt.Errorf("mark accepted (dedup): %w", err)
 		}
+		body.unhold(blob.Digest) // the rows say the provider holds it
+		b.cacheHeld(ctx, space, blob.Digest)
 		return nil
 	} else if err != nil && !errors.Is(err, registry.ErrNotFound) {
 		return fmt.Errorf("lookup location: %w", err)
 	}
+
+	ctx, span := tracing.Start(ctx, "blob.upload",
+		attribute.String("ingot.blob.result", "streamed"),
+		attribute.Int64("ingot.blob.bytes", sb.Size),
+	)
+	defer func() { tracing.End(span, err) }()
+
+	locations, err := b.streaming.ConcludeBlobs(ctx, space, []uploader.UploadedBlob{sb.Parked(blob.Digest)})
+	// An acceptance that came back is recorded before any error is acted on,
+	// as concludeBlobs does: the upload service ran the accept whether or not
+	// the batch then failed, and recorded as accepted the blob is released
+	// through the sweeper's ordinary path rather than left unaccounted for.
+	if len(locations) == 1 && locations[0] != nil {
+		// The hold ends once the location and the intent are written (see
+		// recordAccepted): until then a release reading an intent still
+		// uploading with neither row would take the file and the allocation.
+		if rerr := b.recordAccepted(ctx, space, blob.Digest, *locations[0], func() { body.unhold(blob.Digest) }); rerr != nil {
+			return errors.Join(err, rerr)
+		}
+		b.finishStream(ctx, sb)
+	}
+	if err != nil {
+		return fmt.Errorf("conclude streamed blob: %w", err)
+	}
+	if len(locations) != 1 || locations[0] == nil {
+		return fmt.Errorf("conclude streamed blob %x: no location", blob.Digest)
+	}
+	return nil
+}
+
+// uploadBlob is uploadBlobs for one blob, traced as a blob.upload span whose
+// ingot.blob.result says whether it uploaded or was already stored. The
+// body's hold on the blob's spool file ends once the upload has read it, or
+// at once when the blob is reused as already stored.
+func (b *Backend) uploadBlob(ctx context.Context, space did.DID, blob msbucket.BlobRef, body spooledBody) (err error) {
+	ctx, span := tracing.Start(ctx, "blob.upload")
+	defer func() { tracing.End(span, err) }()
+
+	// One write of these bytes at a time for this space: a second finds the
+	// first's location and reuses it (see Backend.blobKeys).
+	defer b.blobKeys.Lock(blobKey(space, blob.Digest))()
+
+	digest := blob.Digest
+	// Whatever the rows say, no release of this digest may be running
+	// while the blob is uploaded or reused.
+	settled, err := b.settleRelease(ctx, space, blob.Digest)
+	if err != nil {
+		return err
+	}
+	if existing, err := b.locations.GetLocation(ctx, space, blob.Digest); err == nil && existing != nil && settled {
+		// Already durable for this space — advance the intent and move on.
+		span.SetAttributes(attribute.String("ingot.blob.result", "already_stored"))
+		if err := b.intents.SetIntentState(ctx, space, blob.Digest, registry.IntentAccepted); err != nil {
+			return fmt.Errorf("mark accepted (dedup): %w", err)
+		}
+		body.unhold(blob.Digest) // the rows say the provider holds it
+		b.cacheHeld(ctx, space, blob.Digest)
+		return nil
+	} else if err != nil && !errors.Is(err, registry.ErrNotFound) {
+		return fmt.Errorf("lookup location: %w", err)
+	}
+	// Not located, or located by a release that has since run and taken
+	// the blob from the provider: uploaded afresh.
 	// The uploaded bytes are the spooled envelope, so the size is the
 	// intent's stored byte count, not the blob's plaintext span.
-	in, err := b.intents.GetIntent(ctx, digest)
+	in, err := b.intents.GetIntent(ctx, space, digest)
 	if err != nil {
 		return fmt.Errorf("lookup intent: %w", err)
 	}
@@ -375,7 +640,7 @@ func (b *Backend) uploadBlob(ctx context.Context, space did.DID, blob msbucket.B
 	)
 	// The blob may be on the network from here on; a release finding no
 	// row for it must remove it rather than assume it never left.
-	if err := b.intents.SetIntentState(ctx, digest, registry.IntentUploading); err != nil {
+	if err := b.intents.SetIntentState(ctx, space, digest, registry.IntentUploading); err != nil {
 		return fmt.Errorf("mark uploading: %w", err)
 	}
 	res, err := b.uploader.UploadBlob(ctx, space, digest, in.Size, b.spool.Path(digest))
@@ -387,22 +652,9 @@ func (b *Backend) uploadBlob(ctx context.Context, space did.DID, blob msbucket.B
 	if res.Location == nil {
 		return fmt.Errorf("upload blob %x: concluding upload returned no location", blob.Digest)
 	}
-	loc := res.Location
-	if err := b.intents.SetIntentState(ctx, blob.Digest, registry.IntentAccepted); err != nil {
-		return fmt.Errorf("mark accepted: %w", err)
-	}
-	// Best-effort location record (unused in the harness, where reads come
-	// from the spool); keyed by (space, digest).
-	if err := b.locations.PutLocation(ctx, registry.BlobLocation{
-		Space:    space,
-		Digest:   blob.Digest,
-		Provider: loc.Provider,
-		URL:      loc.URL,
-		Size:     loc.Size,
-	}); err != nil {
-		return fmt.Errorf("record location: %w", err)
-	}
-	return nil
+	// The hold ends once the location and the intent are written (see
+	// recordAccepted), not when the upload has read the file.
+	return b.recordAccepted(ctx, space, blob.Digest, *res.Location, func() { body.unhold(blob.Digest) })
 }
 
 // reconcileClaims updates blob_refs for ONE version id under (bucket, key)
@@ -441,8 +693,12 @@ var errPinnedBlobReleased = errors.New("pinned blob has no remaining claim")
 // addClaims records one claim per DEDUPLICATED digest for a new generation.
 // Runs inside the bucket commit lock (see the invariant note above).
 //
-// A body this node ingested holds fresh digests, which nothing can release
-// before they are claimed. A body pinned from another object of the space
+// A body this node ingested is claimed unconditionally. An encrypted body
+// holds fresh digests, which nothing can release before they are claimed. A
+// body stored as received can repeat a digest the space released or is
+// releasing: the write settled that before reusing the blob (settleRelease),
+// by cancelling the release or waiting it out, so no release is past its
+// claim check by the time the claim lands. A body pinned from another object of the space
 // (a same-space copy) holds digests some other version claims, and a
 // release of them may be under way: its claim check and its network removal
 // are separate steps, so a claim added unconditionally in between would
@@ -457,10 +713,16 @@ func (b *Backend) addClaims(ctx context.Context, st *registry.State, key, claimI
 		claims = append(claims, registry.BlobClaim{Digest: d, Bucket: st.Name, ObjectKey: key, VersionID: claimID, Space: st.Space})
 	}
 	if !pinned {
-		for _, c := range claims {
-			if err := b.blobRefs.AddBlobClaim(ctx, c); err != nil {
-				return fmt.Errorf("add blob claim: %w", err)
+		// All or nothing: a commit that fails here leaves no claim behind,
+		// since no generation would ever drop one.
+		if err := b.blobRefs.AddBlobClaims(ctx, claims); err != nil {
+			if errors.Is(err, registry.ErrReleaseInProgress) {
+				// A release of one of the digests started after the write
+				// settled it (settleRelease) and is removing the blob; the
+				// client retries once it has run.
+				return s3err.GetAPIError(s3err.ErrSlowDown)
 			}
+			return fmt.Errorf("add blob claims: %w", err)
 		}
 		return nil
 	}
@@ -522,6 +784,11 @@ func (b *Backend) SweepPendingReleases(ctx context.Context) (int, error) {
 	}
 	released := 0
 	for _, pr := range due {
+		// A cancelled sweep stops here rather than failing every remaining
+		// record; they stay due for the next sweep.
+		if err := ctx.Err(); err != nil {
+			return released, err
+		}
 		switch b.runRelease(ctx, pr) {
 		case releaseFailed:
 			continue // retry next sweep
@@ -535,17 +802,12 @@ func (b *Backend) SweepPendingReleases(ctx context.Context) (int, error) {
 			}
 			continue
 		case releaseStale:
-			if err := b.pendingReleases.DeleteRelease(ctx, pr.Space, pr.Digest); err != nil {
-				b.logger.Warn("release sweep: delete stale record failed",
-					zap.String("digest", hex.EncodeToString(pr.Digest)), zap.Error(err))
-			}
+			// Gone already, deleted under the claim-key lock by the start
+			// that found it stale (see runRelease); a delete by key here
+			// could only take a replacement a later drop enqueued.
 			continue
 		case releaseDone:
-			if err := b.pendingReleases.DeleteRelease(ctx, pr.Space, pr.Digest); err != nil {
-				b.logger.Warn("release sweep: delete record failed",
-					zap.String("digest", hex.EncodeToString(pr.Digest)), zap.Error(err))
-				continue
-			}
+			// Gone already, with the intent, as the release's last step.
 			released++
 		}
 	}
@@ -575,51 +837,55 @@ func (b *Backend) releaseNow(ctx context.Context, records []registry.PendingRele
 		if pr.NotBefore.After(now) {
 			continue
 		}
-		switch b.runRelease(ctx, pr) {
-		case releaseDone, releaseStale:
-			if err := b.pendingReleases.DeleteRelease(ctx, pr.Space, pr.Digest); err != nil {
-				b.logger.Warn("release: delete record failed",
-					zap.String("digest", hex.EncodeToString(pr.Digest)), zap.Error(err))
-			}
-		}
+		// A record done or found stale is gone already (see runRelease);
+		// nothing is deleted here, where only a replacement could be found.
+		b.runRelease(ctx, pr)
 	}
 }
 
 // runRelease attempts one release record end to end and reports what to do
 // with the record.
 //
-// The two checks run in this order on purpose. A Complete adds its claims
-// while its session is still 'completing' and only then marks it completed,
-// so a release that read the claims first could see none, lose the race to
-// the commit, and then find no live session either. Reading the live part
-// references first closes that window: a session seen in flight defers the
-// release, and a session seen already completed has its claims in place for
-// the check that follows.
+// Whether the release may go ahead is one decision taken under the blob's
+// claim-key lock (registry.PendingReleaseStore.StartRelease), which marks
+// the record started. A write that finds the blob already stored for the
+// space and means to reuse it takes the same lock first (settleRelease): it
+// cancels a record not yet started, and waits out one that is. So a record
+// this finds is either gone, because a write took the blob, or this
+// release's to run, and no write commits a manifest over a blob it is
+// removing.
 func (b *Backend) runRelease(ctx context.Context, pr registry.PendingRelease) releaseOutcome {
-	live, err := b.multipart.CountLivePartRefs(ctx, pr.Digest)
-	if err != nil {
-		b.logger.Warn("release: count live part refs failed; retrying next sweep",
-			zap.String("digest", hex.EncodeToString(pr.Digest)), zap.Error(err))
-		return releaseFailed
-	}
-	if live > 0 {
-		// A session in flight still references the blob and means to claim
-		// it. Its Complete turns the reference into a claim, which makes
-		// this record stale; its abort or expiry records a release of its
-		// own. Either way the wait ends. (Encryption gives every part blob
-		// a digest of its own, so today only a session's own parts can
-		// reference it; the check holds for shared digests as well.)
+	if pr.StartedAt.IsZero() && b.spool.HeldBy(pr.Space, pr.Digest) {
+		// A write of this space is between spooling the same bytes and its
+		// commit: it settles the release before it uploads or reuses, and
+		// its claim is checked against the location (AddBlobClaims), so a
+		// release not yet started waits for it rather than start under it.
+		// A started one goes on: it owns the blob, and a write holding the
+		// file is waiting for it to finish.
 		return releaseDeferred
 	}
-	n, err := b.blobRefs.CountClaims(ctx, pr.Space, pr.Digest)
+	start, err := b.pendingReleases.StartRelease(ctx, pr.Space, pr.Digest)
 	if err != nil {
-		b.logger.Warn("release: count claims failed; retrying next sweep",
+		b.logger.Warn("release: start failed; retrying next sweep",
 			zap.String("digest", hex.EncodeToString(pr.Digest)), zap.Error(err))
 		return releaseFailed
 	}
-	if n > 0 {
+	switch start {
+	case registry.ReleaseReferenced:
+		// A session of this space in flight still references the blob and
+		// means to claim it. Its Complete turns the reference into a claim,
+		// which makes this record stale; its abort or expiry records a
+		// release of its own. Either way the wait ends. A blob stored as
+		// received can be named by several sessions and objects of the
+		// space at once; an encrypted one has a digest of its own.
+		return releaseDeferred
+	case registry.ReleaseClaimed, registry.ReleaseCancelled:
 		// Re-claimed since enqueue (e.g. a commit that failed after its
-		// drop ran, then retried) — the record is stale, not the claim.
+		// drop ran, then retried), or taken by a write that reuses the
+		// blob: the record is stale, not the claim, and it is gone, deleted
+		// under the lock by the start or by the write. No caller deletes it
+		// again: by then the key may name a replacement, enqueued by a drop
+		// of the new claim, that is not stale at all.
 		return releaseStale
 	}
 	if !b.executeRelease(ctx, pr) {
@@ -627,6 +893,66 @@ func (b *Backend) runRelease(ctx context.Context, pr registry.PendingRelease) re
 	}
 	return releaseDone
 }
+
+// settleRelease settles, before a write uploads, parks, concludes or reuses
+// a blob, whether a release of the same digest in the space stands in the
+// way, and reports whether the blob may be reused as located. A blob
+// stored as received has the digest of its bytes, so a write of the same
+// bytes can follow the deletion of the object that stored them, with that
+// object's release pending or running: a recorded location proves the
+// provider holds the blob only while no release is removing it, and a
+// fresh upload is only safe while no release will remove what it adds.
+// Under the blob's claim-key lock, a release record not yet started is
+// cancelled, and the blob is the write's: the claim its commit adds would
+// have made the record stale anyway. A record already started means the
+// blob is going; the write waits for the record to disappear, then uploads
+// afresh (false). No record at all leaves a located blob reusable (true).
+// A release that starts after this and before the commit is caught by the
+// claim itself (registry.ErrReleaseInProgress). A release that fails after
+// starting is retried by the sweeper, so the wait is bounded by
+// reuseWaitLimit and then refused with S3's SlowDown, which the client
+// retries. An encrypted blob has a digest of its own and never has a
+// record here.
+func (b *Backend) settleRelease(ctx context.Context, space did.DID, digest multihash.Multihash) (bool, error) {
+	deadline := time.Now().Add(reuseWaitLimit)
+	backoff := reuseWaitFirst
+	waited := false
+	for {
+		c, err := b.pendingReleases.CancelRelease(ctx, space, digest)
+		if err != nil {
+			return false, fmt.Errorf("cancel release: %w", err)
+		}
+		switch c {
+		case registry.ReleaseNone:
+			// No release, or the one waited out has run and the location
+			// went with it.
+			return !waited, nil
+		case registry.ReleaseCancelledByWrite:
+			return true, nil
+		}
+		waited = true
+		if time.Now().After(deadline) {
+			return false, s3err.GetAPIError(s3err.ErrSlowDown)
+		}
+		select {
+		case <-ctx.Done():
+			return false, ctx.Err()
+		case <-time.After(backoff):
+		}
+		if backoff < reuseWaitMax {
+			backoff *= 2
+		}
+	}
+}
+
+// settleRelease's wait on a started release: the first poll interval, its
+// cap, and how long in all before the write is refused. Package-level so
+// tests can shrink them.
+var (
+	reuseWaitFirst = 20 * time.Millisecond
+	reuseWaitMax   = 500 * time.Millisecond
+	reuseWaitLimit = 30 * time.Second
+)
 
 // drainSpaceReleases executes a space's pending releases immediately,
 // ignoring their grace: DeleteBucket calls it before asking hilt to delete
@@ -647,9 +973,7 @@ func (b *Backend) drainSpaceReleases(ctx context.Context, space did.DID) error {
 		case releaseDeferred:
 			return fmt.Errorf("release blob %x: a multipart session in flight still references it", pr.Digest)
 		}
-		if err := b.pendingReleases.DeleteRelease(ctx, pr.Space, pr.Digest); err != nil {
-			return fmt.Errorf("delete release record %x: %w", pr.Digest, err)
-		}
+		// Done or stale: the record is gone already (see runRelease).
 	}
 	return nil
 }
@@ -668,12 +992,9 @@ func (b *Backend) drainSpaceReleases(ctx context.Context, space did.DID) error {
 // touched, so the retry reads the same state and takes the same step. Only
 // once the network holds nothing for this space do the park and location
 // rows go, park first so a partial failure leaves the retry on the same
-// path, and — for a blob that was never committed — the spool copy and
-// upload intent. The intent goes together with this release's own record,
-// in one transaction, since it is the only evidence of how far the blob
-// ever got. A committed blob is one whose intent is published, which its
-// first reference claim wrote atomically; it keeps those two, since its
-// spool copy is the insurance copy until eviction.
+// path, and then the local copy and upload intent, committed or not. The
+// intent goes together with this release's own record, in one transaction,
+// since it is the only evidence of how far the blob ever got.
 func (b *Backend) executeRelease(ctx context.Context, pr registry.PendingRelease) bool {
 	space, digest := pr.Space, pr.Digest
 	log := b.logger.With(zap.String("digest", hex.EncodeToString(digest)))
@@ -690,12 +1011,12 @@ func (b *Backend) executeRelease(ctx context.Context, pr registry.PendingRelease
 		log.Warn("release: lookup location failed", zap.Error(err))
 		return false
 	}
-	park, err := b.parks.GetPark(ctx, digest)
+	park, err := b.parks.GetPark(ctx, space, digest)
 	if err != nil && !errors.Is(err, registry.ErrNotFound) {
 		log.Warn("release: lookup park failed", zap.Error(err))
 		return false
 	}
-	in, err := b.intents.GetIntent(ctx, digest)
+	in, err := b.intents.GetIntent(ctx, space, digest)
 	if err != nil && !errors.Is(err, registry.ErrNotFound) {
 		log.Warn("release: lookup upload intent failed", zap.Error(err))
 		return false
@@ -722,7 +1043,7 @@ func (b *Backend) executeRelease(ctx context.Context, pr registry.PendingRelease
 			log.Warn("release: decode park add task failed", zap.Error(err))
 			return false
 		}
-		aerr := b.deferred.AbortBlob(ctx, space, digest, cause)
+		aerr := b.deferred.AbortBlob(ctx, space, cause)
 		switch {
 		case aerr == nil:
 		case errors.Is(aerr, uploader.ErrBlobAccepted):
@@ -760,7 +1081,7 @@ func (b *Backend) executeRelease(ctx context.Context, pr registry.PendingRelease
 	// park), and with the location gone and the park left, the retry
 	// would read the blob as parked and abort an allocation the remove
 	// above already released.
-	if err := b.parks.DeletePark(ctx, digest); err != nil {
+	if err := b.parks.DeletePark(ctx, space, digest); err != nil {
 		log.Warn("release: delete park failed", zap.Error(err))
 		ok = false
 	} else if err := b.locations.DeleteLocation(ctx, space, digest); err != nil {
@@ -768,28 +1089,83 @@ func (b *Backend) executeRelease(ctx context.Context, pr registry.PendingRelease
 		ok = false
 	}
 	switch {
-	case in != nil && in.State == registry.IntentPublished:
-		// Committed at some point: the spool copy stays as the insurance
-		// copy until eviction, and the intent with it.
 	case !ok:
-		// A step above failed. The intent stays, with the spool copy, so
+		// A step above failed. The intent stays, with the local copy, so
 		// the retry reads the same state: deleting it would turn a blob
 		// that never left this node into one with neither rows nor intent,
 		// whose retry then owes a network remove it cannot authorize.
 	default:
-		// The spool copy goes first, and removing an absent one is a no-op,
-		// so a failure after it costs the retry nothing. The intent then
-		// goes together with this release's record: the intent is the only
-		// evidence that this blob never left the node, and a record that
-		// outlived it would leave the retry reading neither rows nor
-		// intent, owing a network remove it cannot authorize and can never
-		// complete.
-		if err := b.spool.Remove(digest); err != nil {
-			log.Warn("release: remove spooled blob failed", zap.Error(err))
+		// The local copy goes first, from the cache or the spool, and
+		// removing an absent one is a no-op, so a failure after it costs the
+		// retry nothing. It is shared with every other space whose intent
+		// names the digest (the same bytes stored as received in two
+		// buckets), so while another space holds an intent the file stays,
+		// for that space's upload or reads, and goes with the last intent.
+		// The intent then goes together with this release's record: the
+		// intent is the only evidence that this blob never left the node,
+		// and a record that outlived it would leave the retry reading
+		// neither rows nor intent, owing a network remove it cannot
+		// authorize and can never complete.
+		if b.spool.HeldBy(space, digest) {
+			// A write of the same bytes in this space spooled them again and
+			// still needs the file: it is waiting for this release to finish
+			// (settleRelease) before it uploads them afresh, or uploading
+			// them now. The intent and the file are that write's, so only
+			// this release's record goes.
+			if err := b.pendingReleases.DeleteRelease(ctx, space, digest); err != nil {
+				log.Warn("release: delete record failed", zap.Error(err))
+				ok = false
+			}
+			break
+		}
+		others, err := b.intents.CountOtherIntents(ctx, space, digest)
+		if err != nil {
+			log.Warn("release: count other intents failed", zap.Error(err))
 			ok = false
-		} else if err := b.pendingReleases.DeleteIntentAndRelease(ctx, space, digest); err != nil {
+			break
+		}
+		// Another space's write holding the file keeps it, as its intent
+		// would; this space's intent goes either way.
+		if others == 0 && !b.spool.Held(digest) {
+			freed, err := b.removeLocal(digest)
+			switch {
+			case errors.Is(err, blockstore.ErrHeld) && b.spool.HeldBy(space, digest):
+				// A write of this space took the file since the check
+				// above: the intent and the file are its, as in the held
+				// branch, and only the record goes.
+				if err := b.pendingReleases.DeleteRelease(ctx, space, digest); err != nil {
+					log.Warn("release: delete record failed", zap.Error(err))
+					ok = false
+				}
+				return ok
+			case errors.Is(err, blockstore.ErrHeld):
+				// Another space's write took the file: it stays, and this
+				// space's intent goes below.
+			case err != nil:
+				log.Warn("release: remove local blob copy failed", zap.Error(err))
+				ok = false
+				return ok
+			default:
+				b.localBlobMetrics.removedFile(ctx, removedReleased, freed)
+			}
+		}
+		remaining, err := b.pendingReleases.DeleteIntentAndRelease(ctx, space, digest)
+		if err != nil {
 			log.Warn("release: delete upload intent with the release record failed", zap.Error(err))
 			ok = false
+			break
+		}
+		if remaining == 0 && (others > 0 || b.spool.Held(digest)) {
+			// The file was left for another space's intent, and that intent
+			// went meanwhile: its release counted this one and left the file
+			// too, so this release, the last out, takes it. A hold refuses
+			// the removal, and that write's own flow takes the file later.
+			freed, err := b.removeLocal(digest)
+			if err != nil && !errors.Is(err, blockstore.ErrHeld) {
+				log.Warn("release: remove the last intent's local blob copy failed; the orphan pass takes a spool file, a cached one waits for a write of the same bytes", zap.Error(err))
+			} else if err == nil {
+				b.localBlobMetrics.removedFile(ctx, removedReleased, freed)
+			}
 		}
 	}
 	return ok
@@ -875,6 +1251,9 @@ func (b *Backend) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s
 	if input.Key == nil {
 		return nil, s3err.GetAPIError(s3err.ErrNoSuchKey)
 	}
+	if err := rejectEncryptionHeaders(ctx); err != nil {
+		return nil, err
+	}
 	versionID := backend.GetStringFromPtr(input.VersionId)
 	rv, err := b.resolveVersion(ctx, *input.Bucket, *input.Key, versionID)
 	if err != nil {
@@ -938,6 +1317,7 @@ func (b *Backend) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s
 
 	contentType := mf.ContentType
 	out := &s3.HeadObjectOutput{
+		ServerSideEncryption:      encryptionOf(mf),
 		AcceptRanges:              backend.GetPtrFromString("bytes"),
 		ContentLength:             &length,
 		ContentType:               &contentType,
@@ -1138,6 +1518,9 @@ func (b *Backend) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.
 	if input.Key == nil {
 		return nil, s3err.GetAPIError(s3err.ErrNoSuchKey)
 	}
+	if err := rejectEncryptionHeaders(ctx); err != nil {
+		return nil, err
+	}
 	versionID := backend.GetStringFromPtr(input.VersionId)
 	rv, err := b.resolveVersion(ctx, *input.Bucket, *input.Key, versionID)
 	if err != nil {
@@ -1188,7 +1571,7 @@ func (b *Backend) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.
 	// unencrypted blobs, the decrypting opener where an encryption row
 	// exists. Doing it here (not at first Read) fails a broken encrypted
 	// object as a request error, before response headers are written.
-	opener, err := b.bodyOpener(ctx, st.Space, mf.Body)
+	opener, err := b.bodyOpener(ctx, st.Space, mf.Body, mf.Plaintext)
 	if err != nil {
 		return nil, err
 	}
@@ -1212,6 +1595,7 @@ func (b *Backend) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.
 	lastModified := time.Unix(mf.Created, 0)
 	contentType := mf.ContentType
 	out := &s3.GetObjectOutput{
+		ServerSideEncryption:      encryptionOf(mf),
 		AcceptRanges:              backend.GetPtrFromString("bytes"),
 		Body:                      body,
 		ContentLength:             &length,
@@ -1350,6 +1734,7 @@ func (b *Backend) deleteObjectKey(ctx context.Context, bucketState *registry.Sta
 	var oldDigests []multihash.Multihash
 	var oldVersionID string
 	var oldSeq uint64
+	var oldManifest cid.Cid
 	err := b.txns.WithTx(ctx, bucketState.Name, func(ctx context.Context, tx *bucketop.Tx) (cid.Cid, error) {
 		// Empty bucket: nothing to delete. Returning cid.Undef tells WithTx to
 		// discard with no commit — the equivalent of "no-op success."
@@ -1372,12 +1757,16 @@ func (b *Backend) deleteObjectKey(ctx context.Context, bucketState *registry.Sta
 			return cid.Undef, fmt.Errorf("load value: %w", err)
 		}
 		oldMf := val.Manifest
+		// A manifest-valued key's block is the manifest itself; a leaf key
+		// names it. Either way this is the root the space counted.
+		oldManifest = valCid
 		if val.Leaf != nil {
 			var em msbucket.EnvelopedManifest
 			if err := tx.Get(ctx, tx.State().Space, val.Leaf.Current.Manifest, &em); err != nil {
 				return cid.Undef, fmt.Errorf("load manifest: %w", err)
 			}
 			oldMf = em.Manifest
+			oldManifest = val.Leaf.Current.Manifest
 		}
 
 		// Preconditions (If-Match / size / mod-time) under the lock against the
@@ -1406,6 +1795,8 @@ func (b *Backend) deleteObjectKey(ctx context.Context, bucketState *registry.Sta
 		oldDigests = bodyDigests(oldMf.Body)
 		oldVersionID = oldMf.VersionID
 		oldSeq = oldMf.Seq
+		// The key is gone, so the space stops counting it.
+		b.enqueueRegistration(ctx, tx, tx.State(), key, oldManifest, registry.UploadRegistrationRemove)
 		return t2.GetPointer(ctx, tx)
 	})
 	if err != nil {

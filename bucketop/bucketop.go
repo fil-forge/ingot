@@ -22,7 +22,6 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"sync"
 
 	block "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
@@ -34,6 +33,7 @@ import (
 	"github.com/fil-forge/ingot/internal/tracing"
 	"github.com/fil-forge/ingot/mst"
 	"github.com/fil-forge/ingot/registry"
+	"github.com/fil-forge/libforge/syncutil"
 )
 
 // ErrBucketNotFound is returned by Begin when the bucket doesn't
@@ -69,16 +69,13 @@ type Deps struct {
 type Coordinator struct {
 	deps Deps
 
-	mu    sync.Mutex
-	locks map[string]*sync.Mutex
+	// locks serialises transactions per bucket, within this process.
+	locks syncutil.KeyedMutex
 }
 
 // NewCoordinator returns a Coordinator wired to the given deps.
 func NewCoordinator(deps Deps) *Coordinator {
-	return &Coordinator{
-		deps:  deps,
-		locks: map[string]*sync.Mutex{},
-	}
+	return &Coordinator{deps: deps}
 }
 
 // Begin starts a write transaction against bucket. Steps:
@@ -130,9 +127,7 @@ func (c *Coordinator) Begin(ctx context.Context, bucket string) (*Tx, error) {
 // Most callers should prefer WithLock, which removes the
 // defer-or-leak hazard.
 func (c *Coordinator) Lock(bucket string) func() {
-	lock := c.lockFor(bucket)
-	lock.Lock()
-	return lock.Unlock
+	return c.locks.Lock(bucket)
 }
 
 // lockTraced is Lock with the wait recorded as a bucket.lock span: time spent
@@ -210,17 +205,6 @@ func (c *Coordinator) WithLock(ctx context.Context, bucket string, fn LockFn) er
 	return fn(ctx)
 }
 
-func (c *Coordinator) lockFor(bucket string) *sync.Mutex {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if m, ok := c.locks[bucket]; ok {
-		return m
-	}
-	m := &sync.Mutex{}
-	c.locks[bucket] = m
-	return m
-}
-
 // Close shuts down the underlying log — with the per-bucket
 // manager, every bucket's log: each seals its open segment,
 // drains its flush queue, and updates its bucket's forge_root_cid
@@ -244,10 +228,24 @@ type Tx struct {
 	staging *blockstore.OpStaging
 	cst     cbor.IpldStore
 
+	// uploadRegs are the upload-registration outbox rows this commit owes.
+	// They are written in the same transaction as the root CAS, so the count
+	// can never describe a version that did not commit — nor miss one that
+	// did.
+	uploadRegs []registry.UploadRegistration
+
 	// release is the bucket-lock release closure. Set by Begin;
 	// nil-ed by finalize() so Commit and Discard mutually agree
 	// that the lock has been released exactly once.
 	release func()
+}
+
+// EnqueueUploadRegistration records a change to the space's content-entry
+// list for this commit to carry. Called under the bucket lock, so the rows of
+// one bucket are numbered in the order its commits took the lock — which is
+// the order the sweeper has to replay a key's changes in.
+func (tx *Tx) EnqueueUploadRegistration(reg registry.UploadRegistration) {
+	tx.uploadRegs = append(tx.uploadRegs, reg)
 }
 
 // Compile-time assertions: Tx is the canonical handle through which
@@ -340,7 +338,7 @@ func (tx *Tx) Commit(ctx context.Context, newRoot cid.Cid) (err error) {
 	if err := tx.staging.Commit(ctx, newRoot); err != nil {
 		return fmt.Errorf("bucketop: append: %w", err)
 	}
-	if err := tx.deps.Reg.CASRoot(ctx, tx.bucket, tx.state.Root, newRoot); err != nil {
+	if err := tx.deps.Reg.CASRootAndEnqueueUploadRegistrations(ctx, tx.bucket, tx.state.Root, newRoot, tx.uploadRegs); err != nil {
 		return fmt.Errorf("bucketop: advance root: %w", err)
 	}
 	return nil
