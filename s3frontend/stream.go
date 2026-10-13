@@ -41,7 +41,7 @@ import (
 // has refused to add by digest code, it spools the blob as WriteBlob does.
 func (w *bodyWriter) WriteSizedBlob(ctx context.Context, r io.Reader, n int64) (_ multihash.Multihash, err error) {
 	if w.stream == nil || w.digestFirst {
-		digest, got, err := w.WriteBlob(ctx, r)
+		digest, got, err := w.writeBlob(ctx, r, n)
 		if err != nil {
 			return nil, err
 		}
@@ -66,7 +66,7 @@ func (w *bodyWriter) WriteSizedBlob(ctx context.Context, r io.Reader, n int64) (
 			return nil, fmt.Errorf("s3frontend: generate CEK: %w", err)
 		}
 		defer clear(cek)
-		rc, d, err := fee.EncryptWithCEK(r, cek, w.recipients)
+		rc, d, err := fee.EncryptWithCEK(r, cek, w.recipients, fee.WithContentLength(n))
 		if err != nil {
 			return nil, fmt.Errorf("s3frontend: encrypt blob: %w", err)
 		}

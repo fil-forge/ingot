@@ -19,6 +19,8 @@ import (
 	"github.com/fil-forge/versitygw/backend"
 	"github.com/fil-forge/versitygw/s3err"
 	"github.com/fil-forge/versitygw/s3response"
+	"github.com/filecoin-project/go-fee/aesstream"
+	"github.com/filecoin-project/go-fee/cose"
 	block "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
@@ -273,6 +275,39 @@ func TestStreamedPutObjectUnsupportedDigestCode(t *testing.T) {
 	require.Empty(t, su.started)
 	require.Len(t, su.uploaded, 3, "every blob uploads by digest")
 	require.Equal(t, data, getRange(t, b, "k", ""))
+}
+
+// feeChunkCountLabel is the FEE unprotected header that records an envelope's
+// chunk count. go-fee does not export it; the value is fixed by the wire
+// format the foc-encryption reference shares.
+const feeChunkCountLabel = -65791
+
+// TestStreamedPutObjectRecordsChunkCount: a sized PUT declares each blob's
+// length to the encryptor, so every envelope records its chunk count, which
+// readers that plan ranges from the header alone depend on. That holds both
+// when the blob streams and when it falls back to spooling first.
+func TestStreamedPutObjectRecordsChunkCount(t *testing.T) {
+	for name, unsupported := range map[string]bool{"streamed": false, "digest first": true} {
+		t.Run(name, func(t *testing.T) {
+			su := newStreamingUploader()
+			su.unsupported = unsupported
+			b, _ := newStreamingBackend(t, su)
+			data := testBody(700 << 10) // 3 blobs, of 2, 2 and 1 chunks
+
+			require.NoError(t, putSized(t, b, "k", data, int64(len(data))))
+			digests := blobDigestsOf(t, b, "k", "")
+			require.Len(t, digests, 3)
+			for _, d := range digests {
+				env, ciphertext, err := cose.Decode(spooled(t, b, d))
+				require.NoError(t, err)
+				declared, ok := env.Headers.Unprotected.Int(feeChunkCountLabel)
+				require.True(t, ok, "the envelope records its chunk count")
+				want, err := aesstream.ChunkCount(int64(len(ciphertext)), aesstream.DefaultChunkSize)
+				require.NoError(t, err)
+				require.Equal(t, want, declared)
+			}
+		})
+	}
 }
 
 func TestStreamedPutObjectWrongLength(t *testing.T) {
