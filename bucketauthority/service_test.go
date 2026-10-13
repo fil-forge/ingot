@@ -54,7 +54,7 @@ func TestBucketPolicy(t *testing.T) {
 	}
 	body := []byte(`{"Statement":[]}`)
 	policy := &s3bkt.BucketPolicy{Version: "2012-10-17", Statements: []s3bkt.Statement{
-		{Effect: s3bkt.Allow, Principal: s3bkt.Everyone(), Actions: []string{"s3:GetObject"}, Resources: []string{"arn:aws:s3:::photos/*"}},
+		{Effect: s3bkt.Allow, Principal: s3bkt.Everyone(), Actions: s3bkt.NewStringSet("s3:GetObject"), Resources: s3bkt.NewStringSet("arn:aws:s3:::photos/*")},
 	}}
 
 	t.Run("forwards the request and body unchanged and returns the result", func(t *testing.T) {

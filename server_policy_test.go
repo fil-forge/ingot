@@ -122,7 +122,7 @@ func TestBuildS3API_BucketPolicy(t *testing.T) {
 
 	const doc = `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::photos/*"]}]}`
 	policy := &s3bkt.BucketPolicy{Version: "2012-10-17", Statements: []s3bkt.Statement{
-		{Effect: s3bkt.Allow, Principal: s3bkt.Everyone(), Actions: []string{"s3:GetObject"}, Resources: []string{"arn:aws:s3:::photos/*"}},
+		{Effect: s3bkt.Allow, Principal: s3bkt.Everyone(), Actions: s3bkt.NewStringSet("s3:GetObject"), Resources: s3bkt.NewStringSet("arn:aws:s3:::photos/*")},
 	}}
 
 	t.Run("GET answers the document as JSON with its ETag and the bucket CORS headers", func(t *testing.T) {

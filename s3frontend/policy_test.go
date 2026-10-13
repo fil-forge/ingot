@@ -82,7 +82,7 @@ func TestBucketPolicy(t *testing.T) {
 			{Method: http.MethodGet, URL: "/photos?policy&X-Amz-Signature=abc", Headers: map[string]string{}},
 		} {
 			policy := &s3bkt.BucketPolicy{Version: "2012-10-17", Statements: []s3bkt.Statement{
-				{Effect: s3bkt.Allow, Principal: s3bkt.Only("alice"), Actions: []string{"s3:GetObject"}, Resources: []string{"arn:aws:s3:::photos/*"}},
+				{Effect: s3bkt.Allow, Principal: s3bkt.Only("alice"), Actions: s3bkt.NewStringSet("s3:GetObject"), Resources: s3bkt.NewStringSet("arn:aws:s3:::photos/*")},
 			}}
 			f := &policyAuthority{ok: &s3bkt.PolicyOK{ETag: `"bafy..."`, Policy: policy}}
 			ctx, etag := policyCtx(req)
