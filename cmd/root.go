@@ -1,9 +1,12 @@
 // Package cmd is the ingot daemon's cobra/viper CLI:
-//   - `serve` runs the S3 gateway.
+//   - `serve` runs the S3 gateway;
+//   - `whoami` and `version` report the agent and the build;
+//   - `blake3` hashes and verifies object data against ingot's BLAKE3 CIDs.
 package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 
@@ -30,6 +33,7 @@ func newRootCmd() *cobra.Command {
 		newServeCmd(),
 		newWhoamiCmd(),
 		newVersionCmd(),
+		newBlake3Cmd(),
 	)
 	return root
 }
@@ -57,10 +61,15 @@ func newWhoamiCmd() *cobra.Command {
 	}
 }
 
-// Execute runs the root command.
+// Execute runs the root command. A verification mismatch exits 1; any other
+// failure exits 2, so a script can tell bad data from a bad invocation.
 func Execute() {
 	if err := newRootCmd().ExecuteContext(context.Background()); err != nil {
 		fmt.Fprintln(os.Stderr, "ingot:", err)
-		os.Exit(1)
+		var mm *mismatchError
+		if errors.As(err, &mm) {
+			os.Exit(1)
+		}
+		os.Exit(2)
 	}
 }

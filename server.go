@@ -251,6 +251,7 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		DropAcceptedBodies: cfg.DropAcceptedBodies,
 
 		MaxBlobSize:         cfg.MaxBlobSize,
+		RehashBudget:        cfg.MultipartRehashBudget,
 		CORS:                cfg.CORSConfig,
 		AllowNoneEncryption: cfg.AllowNoneEncryption,
 		Logger:              logger,

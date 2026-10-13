@@ -25,6 +25,7 @@
 package s3frontend
 
 import (
+	"cmp"
 	"context"
 	"encoding/xml"
 	"sync"
@@ -132,6 +133,7 @@ type Backend struct {
 
 	maxBlobSize         int64
 	allowNoneEncryption bool
+	rehashBudget        int64
 	// cors is Deps.CORS marshalled once at construction — GetBucketCors
 	// is on the per-request path, so the document is built here rather
 	// than per call. Nil when CORS is disabled.
@@ -256,6 +258,12 @@ type Deps struct {
 	// as received. Off, the deployment stores every object encrypted.
 	AllowNoneEncryption bool
 
+	// RehashBudget bounds the bytes CompleteMultipartUpload reads back to
+	// hash non-final parts whose assumed object offset was wrong (0 →
+	// DefaultRehashBudget); the final part is always re-hashed. A completion
+	// needing more is refused with InvalidPartLayout.
+	RehashBudget int64
+
 	// CORS is the S3 CORS configuration GetBucketCors reports for every
 	// bucket, rendered from config by internal/cors. New marshals it once
 	// into the XML document the S3 API serves. Nil disables CORS.
@@ -326,6 +334,7 @@ func New(d Deps) *Backend {
 		logger:              logger,
 		maxBlobSize:         d.MaxBlobSize,
 		allowNoneEncryption: d.AllowNoneEncryption,
+		rehashBudget:        cmp.Or(d.RehashBudget, DefaultRehashBudget),
 		cors:                corsDoc,
 	}
 	mp := d.MeterProvider
