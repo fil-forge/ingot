@@ -67,7 +67,8 @@ func newEncFixture(t *testing.T, plaintext []byte, blobSize int) *encFixture {
 		piece := plaintext[off:end]
 
 		cek := randBytes(t, 32)
-		rc, desc, err := fee.EncryptWithCEK(bytes.NewReader(piece), cek, nil, fee.WithChunkSize(encChunkSize))
+		rc, desc, err := fee.EncryptWithCEK(bytes.NewReader(piece), cek, nil,
+			fee.WithChunkSize(encChunkSize), fee.WithPlaintextLength(int64(len(piece))))
 		if err != nil {
 			t.Fatalf("EncryptWithCEK: %v", err)
 		}
@@ -87,8 +88,6 @@ func newEncFixture(t *testing.T, plaintext []byte, blobSize int) *encFixture {
 			RegionWrappedCEK: wrapped.Ciphertext,
 			RegionKeyVersion: string(wrapped.Version),
 			HeaderLen:        desc.HeaderLen,
-			BaseNonce:        desc.BaseNonce,
-			ChunkSize:        int64(desc.ChunkSize),
 			AAD:              desc.AAD,
 		}); err != nil {
 			t.Fatalf("PutEncryptionParams: %v", err)
@@ -316,6 +315,31 @@ func TestDecryptingRead_MissingLocationFails(t *testing.T) {
 	_, err := fx.backend.bodyOpener(ctx, fx.space, fx.body, false)
 	if err == nil || !strings.Contains(err.Error(), "no recorded location") {
 		t.Fatalf("bodyOpener err = %v, want missing-location error", err)
+	}
+}
+
+// An encrypted blob whose recorded stored size contradicts the plaintext
+// length its envelope declares fails at opener construction, before any
+// response headers could go out, even when the blob's bytes are intact.
+func TestDecryptingRead_StoredSizeMismatchFails(t *testing.T) {
+	ctx := context.Background()
+	for name, delta := range map[string]int64{"truncated": -1, "padded": 1} {
+		t.Run(name, func(t *testing.T) {
+			fx := newEncFixture(t, patterned(9000), 10000)
+			ref := fx.body.Blobs[0]
+			loc, err := fx.backend.locations.GetLocation(ctx, fx.space, ref.Digest)
+			if err != nil {
+				t.Fatalf("GetLocation: %v", err)
+			}
+			loc.Size += delta
+			if err := fx.mem.PutLocation(ctx, *loc); err != nil {
+				t.Fatalf("PutLocation: %v", err)
+			}
+			_, err = fx.backend.bodyOpener(ctx, fx.space, fx.body, false)
+			if !errors.Is(err, fee.ErrSizeMismatch) {
+				t.Fatalf("bodyOpener err = %v, want fee.ErrSizeMismatch", err)
+			}
+		})
 	}
 }
 

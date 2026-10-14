@@ -934,7 +934,6 @@ func cloneLocation(loc registry.BlobLocation) registry.BlobLocation {
 func cloneEncryptionParams(p registry.BlobEncryptionParams) registry.BlobEncryptionParams {
 	p.Digest = bytes.Clone(p.Digest)
 	p.RegionWrappedCEK = bytes.Clone(p.RegionWrappedCEK)
-	p.BaseNonce = bytes.Clone(p.BaseNonce)
 	p.AAD = bytes.Clone(p.AAD)
 	return p
 }

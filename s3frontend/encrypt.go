@@ -168,7 +168,7 @@ func (w *bodyWriter) writeBlob(ctx context.Context, r io.Reader, size int64) (mu
 
 	plaintext := &countingReader{r: io.MultiReader(bytes.NewReader(first[:]), r)}
 	// The descriptor is complete on return, before any plaintext is read.
-	rc, desc, err := fee.EncryptWithCEK(plaintext, cek, w.recipients, fee.WithContentLength(size))
+	rc, desc, err := fee.EncryptWithCEK(plaintext, cek, w.recipients, fee.WithPlaintextLength(size))
 	if err != nil {
 		return nil, 0, fmt.Errorf("s3frontend: encrypt blob: %w", err)
 	}
@@ -221,8 +221,6 @@ func (w *bodyWriter) params(space did.DID, digest multihash.Multihash) (registry
 		RegionWrappedCEK: res.wrapped.Ciphertext,
 		RegionKeyVersion: string(res.wrapped.Version),
 		HeaderLen:        res.desc.HeaderLen,
-		BaseNonce:        res.desc.BaseNonce,
-		ChunkSize:        int64(res.desc.ChunkSize),
 		AAD:              res.desc.AAD,
 	}, nil
 }

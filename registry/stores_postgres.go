@@ -715,18 +715,15 @@ func (r *Postgres) PutEncryptionParams(ctx context.Context, params BlobEncryptio
 	// rejected by the constraint rather than by a second check here.
 	_, err := r.pool.Exec(ctx,
 		`INSERT INTO ingot.blob_encryption_params
-		   (space, digest, region_wrapped_cek, region_key_version,
-		    header_len, base_nonce, chunk_size, aad)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		   (space, digest, region_wrapped_cek, region_key_version, header_len, aad)
+		 VALUES ($1, $2, $3, $4, $5, $6)
 		 ON CONFLICT (space, digest) DO UPDATE
 		   SET region_wrapped_cek = EXCLUDED.region_wrapped_cek,
 		       region_key_version = EXCLUDED.region_key_version,
 		       header_len         = EXCLUDED.header_len,
-		       base_nonce         = EXCLUDED.base_nonce,
-		       chunk_size         = EXCLUDED.chunk_size,
 		       aad                = EXCLUDED.aad`,
 		params.Space, params.Digest, params.RegionWrappedCEK, params.RegionKeyVersion,
-		params.HeaderLen, params.BaseNonce, params.ChunkSize, params.AAD)
+		params.HeaderLen, params.AAD)
 	if err != nil {
 		return fmt.Errorf("registry: put encryption params: %w", err)
 	}
@@ -736,10 +733,10 @@ func (r *Postgres) PutEncryptionParams(ctx context.Context, params BlobEncryptio
 func (r *Postgres) GetEncryptionParams(ctx context.Context, space did.DID, digest multihash.Multihash) (*BlobEncryptionParams, error) {
 	params := &BlobEncryptionParams{Space: space, Digest: digest}
 	err := r.pool.QueryRow(ctx,
-		`SELECT region_wrapped_cek, region_key_version, header_len, base_nonce, chunk_size, aad
+		`SELECT region_wrapped_cek, region_key_version, header_len, aad
 		 FROM ingot.blob_encryption_params WHERE space = $1 AND digest = $2`,
 		space, digest).Scan(&params.RegionWrappedCEK, &params.RegionKeyVersion,
-		&params.HeaderLen, &params.BaseNonce, &params.ChunkSize, &params.AAD)
+		&params.HeaderLen, &params.AAD)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}

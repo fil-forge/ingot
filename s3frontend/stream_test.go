@@ -277,16 +277,17 @@ func TestStreamedPutObjectUnsupportedDigestCode(t *testing.T) {
 	require.Equal(t, data, getRange(t, b, "k", ""))
 }
 
-// feeChunkCountLabel is the FEE unprotected header that records an envelope's
-// chunk count. go-fee does not export it; the value is fixed by the wire
-// format the foc-encryption reference shares.
-const feeChunkCountLabel = -65791
+// feePlaintextLengthLabel is the FEE protected header that records an
+// envelope's plaintext length. go-fee does not export it; the value is fixed by
+// the wire format shared with the Synapse SDK.
+const feePlaintextLengthLabel = -65789
 
-// TestStreamedPutObjectRecordsChunkCount: a sized PUT declares each blob's
-// length to the encryptor, so every envelope records its chunk count, which
-// readers that plan ranges from the header alone depend on. That holds both
-// when the blob streams and when it falls back to spooling first.
-func TestStreamedPutObjectRecordsChunkCount(t *testing.T) {
+// TestStreamedPutObjectRecordsPlaintextLength: a sized PUT declares each
+// blob's length to the encryptor, so every envelope records its plaintext
+// length in the protected header. A reader checks it against the blob size,
+// detecting a truncated blob from the header alone. That holds both when the
+// blob streams and when it falls back to spooling first.
+func TestStreamedPutObjectRecordsPlaintextLength(t *testing.T) {
 	for name, unsupported := range map[string]bool{"streamed": false, "digest first": true} {
 		t.Run(name, func(t *testing.T) {
 			su := newStreamingUploader()
@@ -300,9 +301,9 @@ func TestStreamedPutObjectRecordsChunkCount(t *testing.T) {
 			for _, d := range digests {
 				env, ciphertext, err := cose.Decode(spooled(t, b, d))
 				require.NoError(t, err)
-				declared, ok := env.Headers.Unprotected.Int(feeChunkCountLabel)
-				require.True(t, ok, "the envelope records its chunk count")
-				want, err := aesstream.ChunkCount(int64(len(ciphertext)), aesstream.DefaultChunkSize)
+				declared, ok := env.Headers.Protected.Int(feePlaintextLengthLabel)
+				require.True(t, ok, "the envelope records its plaintext length")
+				want, err := aesstream.DecryptedSize(int64(len(ciphertext)), aesstream.DefaultChunkSize)
 				require.NoError(t, err)
 				require.Equal(t, want, declared)
 			}

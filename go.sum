@@ -199,8 +199,8 @@ github.com/fil-forge/versitygw v0.0.0-20261014123502-37d109788d28 h1:RIVH+8yAwuf
 github.com/fil-forge/versitygw v0.0.0-20261014123502-37d109788d28/go.mod h1:8FE8N25p7UITOm1/3aXzdzlg/0dqQ/VSqrClx05+EP4=
 github.com/filecoin-project/go-data-segment v0.0.1 h1:1wmDxOG4ubWQm3ZC1XI5nCon5qgSq7Ra3Rb6Dbu10Gs=
 github.com/filecoin-project/go-data-segment v0.0.1/go.mod h1:H0/NKbsRxmRFBcLibmABv+yFNHdmtl5AyplYLnb0Zv4=
-github.com/filecoin-project/go-fee v0.2.0 h1:rFb0/pZ+Xqvt+besnTE+aJtr8jX7Q/k07N1iOCH16Us=
-github.com/filecoin-project/go-fee v0.2.0/go.mod h1:A+3InT4C3mn8B10ZQ+ySX7hxjYxN9MlsoF/87RuIUvg=
+github.com/filecoin-project/go-fee v0.3.0 h1:BzfXcD6qU1OjpG5z+uYxndAVPPZQ10bCaR4/XP0Cuog=
+github.com/filecoin-project/go-fee v0.3.0/go.mod h1:A+3InT4C3mn8B10ZQ+ySX7hxjYxN9MlsoF/87RuIUvg=
 github.com/filecoin-project/go-fil-commcid v0.3.1 h1:4EfxpHSlvtkOqa9weG2Yt5kxFmPib2xU7Uc9Lbqk7fs=
 github.com/filecoin-project/go-fil-commcid v0.3.1/go.mod h1:z7Ssf8d7kspF9QRAVHDbZ+43JK4mkhbGH5lyph1TnKY=
 github.com/frankban/quicktest v1.14.6 h1:7Xjx+VpznH+oBnejlPUj8oUpdxnVs4f8XU8WnHkI4W8=

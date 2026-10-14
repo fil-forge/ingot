@@ -155,16 +155,13 @@ type BlobEncryptionParams struct {
 	// offset at which its ciphertext begins. Without it a read could not locate
 	// byte 0 of the ciphertext without decoding the header.
 	HeaderLen int64
-	// BaseNonce is the COSE iv: the STREAM nonce seed for this blob's ciphertext.
-	BaseNonce []byte
-	// ChunkSize is the FEE chunk size written into the COSE protected header,
-	// cached so the read path need not fetch and decode the envelope header.
-	ChunkSize int64
 	// AAD is the envelope's COSE Enc_structure — the additional authenticated
 	// data bound into every chunk's GCM tag. Stored whole rather than as the
 	// protected header because the Enc_structure's context string differs
 	// between a COSE_Encrypt and a COSE_Encrypt0, which a bare row cannot
-	// record. The protected header remains recoverable from it as element 1.
+	// record. The protected header is its element 1, and carries the FEE base
+	// nonce, chunk size and plaintext length, so the read path reads them from
+	// here (see fee.BodyDescriptor) rather than from the envelope header.
 	AAD []byte
 }
 

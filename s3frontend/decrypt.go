@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/filecoin-project/go-fee"
 	"github.com/filecoin-project/go-fee/aesstream"
 	"github.com/multiformats/go-multihash"
 
@@ -84,10 +85,14 @@ func (b *Backend) bodyOpener(ctx context.Context, space did.DID, body msbucket.B
 		if err != nil {
 			return nil, fmt.Errorf("s3frontend: encrypted blob %x has no recorded location: %w", ref.Digest, err)
 		}
+		e, err := newEncBlob(*params, loc.Size)
+		if err != nil {
+			return nil, fmt.Errorf("s3frontend: blob %x: %w", ref.Digest, err)
+		}
 		if enc == nil {
 			enc = make(map[string]encBlob)
 		}
-		enc[key] = encBlob{params: *params, storedSize: loc.Size}
+		enc[key] = e
 	}
 	if len(enc) == 0 {
 		return plain, nil
@@ -103,6 +108,30 @@ func (b *Backend) bodyOpener(ctx context.Context, space did.DID, body msbucket.B
 type encBlob struct {
 	params     registry.BlobEncryptionParams
 	storedSize int64 // whole stored blob: envelope header + ciphertext
+	baseNonce  []byte
+	chunkSize  int
+}
+
+// newEncBlob reads a blob's body parameters from its params row (the protected
+// header in its AAD carries the base nonce, chunk size and any declared
+// plaintext length), and checks the stored size against them: an envelope
+// that declares its plaintext length is rejected when storedSize contradicts
+// it, so a truncated or padded blob fails here, before any response headers
+// are written.
+func newEncBlob(params registry.BlobEncryptionParams, storedSize int64) (encBlob, error) {
+	desc := fee.BodyDescriptor{HeaderLen: params.HeaderLen, AAD: params.AAD}
+	if _, err := desc.PlaintextSize(storedSize); err != nil {
+		return encBlob{}, err
+	}
+	chunkSize, err := desc.ChunkSize()
+	if err != nil {
+		return encBlob{}, err
+	}
+	baseNonce, err := desc.BaseNonce()
+	if err != nil {
+		return encBlob{}, err
+	}
+	return encBlob{params: params, storedSize: storedSize, baseNonce: baseNonce, chunkSize: chunkSize}, nil
 }
 
 // decryptingOpener serves each blob's plaintext range: it unwraps the CEK,
@@ -140,7 +169,7 @@ func (o *decryptingOpener) OpenBlobRange(ctx context.Context, space did.DID, ref
 	// that serves it. Offsets from CiphertextRange are relative to the
 	// ciphertext stream, which starts HeaderLen bytes into the stored blob.
 	ctSize := e.storedSize - e.params.HeaderLen
-	ctStart, ctEnd, plainLen, err := aesstream.CiphertextRange(ctSize, int(e.params.ChunkSize), start, end)
+	ctStart, ctEnd, plainLen, err := aesstream.CiphertextRange(ctSize, e.chunkSize, start, end)
 	if err != nil {
 		return nil, fmt.Errorf("s3frontend: ciphertext range for blob %x: %w", ref.Digest, err)
 	}
@@ -157,9 +186,9 @@ func (o *decryptingOpener) OpenBlobRange(ctx context.Context, space did.DID, ref
 	}
 	sr, err := aesstream.NewSpanReader(span, aesstream.Config{
 		Key:       cek,
-		BaseNonce: e.params.BaseNonce,
+		BaseNonce: e.baseNonce,
 		AAD:       e.params.AAD,
-		ChunkSize: int(e.params.ChunkSize),
+		ChunkSize: e.chunkSize,
 	}, ctSize, start, end)
 	if err != nil {
 		_ = span.Close()
@@ -188,7 +217,8 @@ func (c closers) Close() error {
 
 // blobPlaintextLen reports how many plaintext bytes a stored, encrypted
 // blob decrypts to: the FEE geometry derived from its encryption-params row
-// and the stored (envelope) byte count. Every encrypted body blob has a row;
+// and the stored (envelope) byte count, checked against the plaintext length
+// the envelope declares. Every encrypted body blob has a row;
 // a missing one is an error — treating it as plaintext would record the
 // envelope byte count as the manifest span, permanently corrupting the
 // object's Size and every range GET. Multipart Complete uses this to rebuild
@@ -202,7 +232,7 @@ func (b *Backend) blobPlaintextLen(ctx context.Context, space did.DID, digest mu
 	if err != nil {
 		return 0, fmt.Errorf("encryption params for blob %x: %w", digest, err)
 	}
-	plainLen, err := aesstream.DecryptedSize(storedSize-params.HeaderLen, int(params.ChunkSize))
+	plainLen, err := fee.BodyDescriptor{HeaderLen: params.HeaderLen, AAD: params.AAD}.PlaintextSize(storedSize)
 	if err != nil {
 		return 0, fmt.Errorf("blob %x: %d stored bytes do not fit its FEE geometry: %w", digest, storedSize, err)
 	}
