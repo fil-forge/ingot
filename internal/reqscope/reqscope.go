@@ -73,3 +73,24 @@ func Tenant(ctx context.Context) (did.DID, bool) {
 	tenant, ok := ctx.Value(tenantKey).(did.DID)
 	return tenant, ok && tenant.Defined()
 }
+
+type etagContextKey struct{}
+
+var etagKey any = etagContextKey{}
+
+// ETagKey returns the fasthttp/fiber user-value key under which a bucket
+// policy request carries a *string holder for its response ETag. versitygw's
+// backend seam returns no headers, so the gateway middleware installs the
+// holder, the backend fills it from Hilt's answer, and the middleware sets
+// the header from it once the controller has run.
+func ETagKey() any {
+	return etagKey
+}
+
+// SetETag fills the request's ETag holder; a context without one (any
+// request but a bucket policy operation) ignores it.
+func SetETag(ctx context.Context, etag string) {
+	if holder, ok := ctx.Value(etagKey).(*string); ok {
+		*holder = etag
+	}
+}

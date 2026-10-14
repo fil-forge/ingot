@@ -702,7 +702,8 @@ func buildS3API(ctx context.Context, backend *s3frontend.Backend, cfg config.Ser
 		// keys like "../file.txt" are legal literal S3 keys and must round-trip.
 		s3api.WithDisableObjNameTraversalCheck(),
 		// Stash the signed S3 request on the context for every request. The
-		// bucket-authority seam (Create/Delete/ListBuckets) recovers it to
+		// bucket-authority seam (Create/Delete/ListBuckets, the bucket policy
+		// operations) recovers it to
 		// forward to Hilt; doing it here, ahead of auth, covers the presigned
 		// and POST-form auth paths as well as the header-signed one.
 		// The request's server span. First, so it times everything after
@@ -712,6 +713,7 @@ func buildS3API(ctx context.Context, backend *s3frontend.Backend, cfg config.Ser
 			c.Locals(reqscope.RequestKey(), fasthttputil.RequestFromHTTPContext(c.RequestCtx()))
 			return c.Next()
 		}),
+		s3api.WithMiddleware("/", policyHeaders),
 	}
 	// Public DID document for did:web resolution of the agent identity, so
 	// hilt/sprue/piri can verify ingot's UCAN signatures. WithRoute mounts
@@ -734,6 +736,28 @@ func buildS3API(ctx context.Context, backend *s3frontend.Backend, cfg config.Ser
 		return nil, fmt.Errorf("ingot: s3api: %w", err)
 	}
 	return api, nil
+}
+
+// policyHeaders adds what versitygw's bucket policy controllers leave out of
+// a ?policy response, since the backend seam returns only the document: the
+// document's ETag, which the backend computes and leaves in the request's
+// reqscope holder, and the JSON content type of a GetBucketPolicy document.
+func policyHeaders(c fiber.Ctx) error {
+	if !c.RequestCtx().QueryArgs().Has("policy") {
+		return c.Next()
+	}
+	etag := new(string)
+	c.Locals(reqscope.ETagKey(), etag)
+	err := c.Next()
+	if *etag != "" {
+		c.Set("ETag", *etag)
+	}
+	// Only a request the policy backend answered fills the holder; an object
+	// read whose query happens to carry a policy key keeps its content type.
+	if *etag != "" && c.Method() == http.MethodGet && c.Response().StatusCode() == http.StatusOK {
+		c.Set(fiber.HeaderContentType, fiber.MIMEApplicationJSON)
+	}
+	return err
 }
 
 // didDocumentHandler serves a fixed DID document as JSON. The document is

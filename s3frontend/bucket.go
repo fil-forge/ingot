@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 
@@ -153,21 +154,6 @@ func (b *Backend) PutObjectLockConfiguration(ctx context.Context, bucket string,
 		return fmt.Errorf("s3frontend: put object lock configuration: %w", err)
 	}
 	return nil
-}
-
-// GetBucketPolicy is called from auth.VerifyAccess (access-control.go)
-// for authenticated accounts below the admin role and from
-// auth.VerifyPublicAccess for anonymous ones. Hilt-authorized accounts
-// carry the admin role and short-circuit before this is hit, but stubbing
-// it keeps the anonymous path from tripping the same NotImplemented trap.
-func (b *Backend) GetBucketPolicy(ctx context.Context, bucket string) ([]byte, error) {
-	if _, err := b.reg.Get(ctx, bucket); err != nil {
-		if errors.Is(err, registry.ErrNotFound) {
-			return nil, s3err.GetAPIError(s3err.ErrNoSuchBucket)
-		}
-		return nil, err
-	}
-	return nil, s3err.GetAPIError(s3err.ErrNoSuchBucketPolicy)
 }
 
 // GetBucketVersioning reports the bucket's versioning configuration. A bucket
@@ -561,4 +547,10 @@ func isIPv4(s string) bool {
 		}
 	}
 	return true
+}
+
+// MalformedPolicy is the S3 error for a PutBucketPolicy body the storage
+// system refuses (fil-one/RFC#30, "Failures").
+func MalformedPolicy(description string) s3err.APIError {
+	return s3err.APIError{Code: "MalformedPolicy", Description: description, HTTPStatusCode: http.StatusBadRequest}
 }

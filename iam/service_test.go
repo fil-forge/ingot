@@ -16,6 +16,7 @@ import (
 	"github.com/fil-forge/ucantone/ucan"
 	"github.com/fil-forge/ucantone/ucan/container"
 	"github.com/fil-forge/versitygw/auth"
+	"github.com/fil-forge/versitygw/s3err"
 	"github.com/gofiber/fiber/v3"
 	"github.com/stretchr/testify/require"
 
@@ -430,6 +431,30 @@ func TestBaseIAMServiceParity(t *testing.T) {
 	_, err = svc.ListUserAccounts()
 	require.Error(t, err)
 	require.NoError(t, svc.Shutdown())
+}
+
+// TestGetUserAccount_UserARN pins the one non-request lookup that answers:
+// versitygw's PutBucketPolicy validation asks GetUserAccount whether each
+// principal a document names exists. A well-formed user ARN does (Hilt decides
+// whether the id is one of the tenant's principals); anything else, a bare
+// name included, does not, so versitygw refuses the document as malformed.
+func TestGetUserAccount_UserARN(t *testing.T) {
+	svc := iam.New(&fakeAuthorizer{}, iam.NewKeyProofs(), iam.NewVerificationKeyCache(), iam.NewTenantCache())
+
+	_, err := svc.GetUserAccount("arn:aws:iam:::user/8f2c")
+	require.NoError(t, err)
+	for _, name := range []string{"arn:aws:iam:::user/", "8f2c", "arn:aws:iam:::root", ""} {
+		_, err := svc.GetUserAccount(name)
+		require.Equal(t, s3err.GetAPIError(s3err.ErrAdminUserNotFound), err, "name %q", name)
+	}
+
+	policy := func(principal string) []byte {
+		return []byte(`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":` + principal +
+			`,"Action":["s3:GetObject"],"Resource":["arn:aws:s3:::photos/*"]}]}`)
+	}
+	require.NoError(t, auth.ValidatePolicyDocument(policy(`{"AWS":["arn:aws:iam:::user/8f2c"]}`), "photos", svc))
+	require.NoError(t, auth.ValidatePolicyDocument(policy(`"*"`), "photos", svc))
+	require.Error(t, auth.ValidatePolicyDocument(policy(`{"AWS":["8f2c"]}`), "photos", svc))
 }
 
 // TestGetUserAccountForRequest_PlainAccessKey pins the no-root contract: the

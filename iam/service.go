@@ -375,9 +375,8 @@ func mapAuthError(err error) (error, bool) {
 			HTTPStatusCode: http.StatusServiceUnavailable,
 		}, true
 	case s3bkt.InvalidPolicyErrorName:
-		// A CreateBucket whose x-bucket-policy header is unsigned or fails
-		// validation.
-		return s3err.InvalidArgumentError{Description: named.Error(), ArgumentName: "x-bucket-policy"}, true
+		// A policy document Hilt refuses: the code a PutBucketPolicy body gets.
+		return malformedPolicy(named.Error()), true
 	default:
 		// Named, but not a Hilt auth rejection we know — not ours to map.
 		return nil, false
@@ -622,9 +621,20 @@ func (*Service) CreateAccount(auth.Account) error {
 	return s3err.GetAPIError(s3err.ErrAdminMethodNotSupported)
 }
 
+// userARNPrefix is how a bucket policy document names a principal:
+// arn:aws:iam:::user/<id>.
+const userARNPrefix = "arn:aws:iam:::user/"
+
 // GetUserAccount resolves accounts only in request context (see
-// GetUserAccountForRequest); lookups without a request find nothing.
-func (*Service) GetUserAccount(string) (auth.Account, error) {
+// GetUserAccountForRequest), with one exception: versitygw's PutBucketPolicy
+// validation asks whether each principal a document names exists, and a
+// well-formed user ARN does. Hilt decides whether the id is one of the
+// tenant's principals when it stores the document. Any other name, a bare one
+// included, finds nothing, so versitygw refuses the document as malformed.
+func (*Service) GetUserAccount(access string) (auth.Account, error) {
+	if id, ok := strings.CutPrefix(access, userARNPrefix); ok && id != "" {
+		return auth.Account{}, nil
+	}
 	return auth.Account{}, s3err.GetAPIError(s3err.ErrAdminUserNotFound)
 }
 
@@ -646,4 +656,13 @@ func (*Service) ListUserAccounts() ([]auth.Account, error) {
 // Shutdown is a no-op; the service holds no resources of its own.
 func (*Service) Shutdown() error {
 	return nil
+}
+
+// MapAuthError is [mapAuthError] for the bucket policy operations, which render
+// Hilt's authorization rejections the way every other operation does.
+func MapAuthError(err error) (error, bool) { return mapAuthError(err) }
+
+// malformedPolicy is the S3 error for a PutBucketPolicy body Hilt refuses.
+func malformedPolicy(description string) s3err.APIError {
+	return s3err.APIError{Code: "MalformedPolicy", Description: description, HTTPStatusCode: http.StatusBadRequest}
 }
