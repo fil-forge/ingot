@@ -38,7 +38,7 @@ func (d *DelegationCache) indexSize() int {
 }
 
 func TestIndexTracksAddAndLookup(t *testing.T) {
-	d := NewDelegationCache()
+	d := NewDelegationCache(nil)
 	dlg := mintDelegation(t, delegation.WithNoExpiration())
 	d.Add(dlg)
 
@@ -61,7 +61,7 @@ func TestIndexTracksAddAndLookup(t *testing.T) {
 // TestExpiredEntryIsLiveCheckedBeforeJanitor: an expired-but-unswept entry
 // stays in the index (janitor hasn't run) but must not yield from lookups.
 func TestExpiredEntryIsLiveCheckedBeforeJanitor(t *testing.T) {
-	d := NewDelegationCache()
+	d := NewDelegationCache(nil)
 	dlg := mintDelegation(t, delegation.WithExpiration(ucan.Now()+1))
 	d.Add(dlg)
 	require.Equal(t, 1, d.indexSize())
@@ -80,7 +80,7 @@ func TestExpiredEntryIsLiveCheckedBeforeJanitor(t *testing.T) {
 }
 
 func TestExplicitDeletePrunesIndex(t *testing.T) {
-	d := NewDelegationCache()
+	d := NewDelegationCache(nil)
 	dlg := mintDelegation(t, delegation.WithNoExpiration())
 	d.Add(dlg)
 	require.Equal(t, 1, d.indexSize())
@@ -94,7 +94,7 @@ func TestExplicitDeletePrunesIndex(t *testing.T) {
 // stale value). The handler must keep the index entry when the cache holds a
 // live entry again.
 func TestEvictionReAddRace(t *testing.T) {
-	d := NewDelegationCache()
+	d := NewDelegationCache(nil)
 	dlg := mintDelegation(t, delegation.WithNoExpiration())
 	d.Add(dlg)
 
@@ -139,7 +139,7 @@ func TestListDelegationsPrefersTheLongestLived(t *testing.T) {
 
 	// Added shortest-first, so insertion order cannot be what puts the
 	// longest-lived in front.
-	c := NewDelegationCache()
+	c := NewDelegationCache(nil)
 	c.Add(soon, middle, later)
 
 	var got []ucan.Delegation
@@ -166,7 +166,7 @@ func TestListDelegationsRanksAnUnexpiringDelegationFirst(t *testing.T) {
 		delegation.WithExpiration(ucan.UnixTimestamp(time.Now().Add(20*time.Hour).Unix())))
 	forever := mintDelegationFor(t, iss, aud.DID(), sub, delegation.WithNoExpiration())
 
-	c := NewDelegationCache()
+	c := NewDelegationCache(nil)
 	c.Add(bounded, forever)
 
 	var first ucan.Delegation

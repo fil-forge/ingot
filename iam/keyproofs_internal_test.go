@@ -24,8 +24,14 @@ func TestRevocationTTL(t *testing.T) {
 	kp.InvalidateHolders(dlg.Link())
 	require.InDelta(t, revokedTTL, expiresIn(), float64(time.Minute), "recorded for revokedTTL, not until midnight")
 
-	// Hilt serving the revoked CID again renews it.
+	// A refusal while the entry is young leaves it alone: a read is not a write.
+	fresh := kp.revoked.Items()[id].Expiration
+	require.False(t, kp.For(dlg.Audience()).Add(dlg))
+	require.Equal(t, fresh, kp.revoked.Items()[id].Expiration, "a young revocation is not rewritten")
+
+	// Hilt serving the revoked CID again once the entry has used up half its
+	// life renews it.
 	kp.revoked.Set(id, struct{}{}, time.Minute)
-	require.False(t, kp.DepositUnlessRevoked(NewDelegationCache(), dlg))
-	require.InDelta(t, revokedTTL, expiresIn(), float64(time.Minute), "a refusal renews the revocation")
+	require.False(t, kp.For(dlg.Audience()).Add(dlg))
+	require.InDelta(t, revokedTTL, expiresIn(), float64(time.Minute), "a refusal renews an ageing revocation")
 }
