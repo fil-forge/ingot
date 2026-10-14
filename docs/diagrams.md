@@ -975,6 +975,16 @@ erDiagram
         text url
         bigint size
     }
+    blob_encryption_params {
+        text space PK
+        bytea digest PK "ciphertext blob multihash"
+        bytea region_wrapped_cek "never the raw CEK; deleting the row crypto-shreds the blob"
+        text region_key_version
+        bigint header_len "the ciphertext starts here"
+        bytea base_nonce
+        bigint chunk_size
+        bytea aad "COSE Enc_structure"
+    }
     shard_inclusions {
         text space PK
         bytea digest PK "inner block multihash"
@@ -1037,19 +1047,36 @@ erDiagram
         bytea cid PK "superseded MST node"
         text bucket
     }
+    upload_registrations {
+        bigint seq PK "commit order"
+        text bucket FK
+        text object_key
+        text space
+        bytea root "the version's manifest CID"
+        text op "add, remove"
+        timestamptz next_at "the sweeper's clock"
+        timestamptz dead_lettered_at "set once retrying stops"
+    }
+    revocation_cursor {
+        boolean id PK "single-row latch"
+        timestamptz recorded_at "resume point in the revocation stream"
+    }
 
     segments ||--o{ segment_op_roots : "ON DELETE CASCADE"
     multipart_sessions ||--o{ multipart_parts : "ON DELETE CASCADE"
     multipart_parts ||--o| multipart_part_trees : "ON DELETE CASCADE; deleted by Complete once the object commits"
+    buckets ||--o{ upload_registrations : "ON DELETE CASCADE"
     buckets ||..o{ segments : "by bucket name, no FK"
     buckets ||..o{ blob_refs : "by bucket name, no FK"
     blob_locations ||..o{ shard_inclusions : "by shard_digest"
+    blob_locations ||..o| blob_encryption_params : "by (space, digest), deliberately no FK"
     multipart_parts ||..o{ blob_parks : "digests in blob_digests"
     multipart_parts ||..o{ blob_release_intents : "teardown records, by digest"
 ```
 
-- The three solid relationships are the schema's only real foreign keys;
-  dashed ones are soft joins the code performs.
+- The four solid relationships are the schema's only real foreign keys;
+  dashed ones are soft joins the code performs. `revocation_cursor` stands
+  alone.
 - `gc_candidates` is write-only (no reader exists yet; its entry paths are the
   [catalog GC candidates](#catalog-gc-candidates-what-gets-remembered-for-removal)
   diagram); `segments.plane`
