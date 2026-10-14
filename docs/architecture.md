@@ -656,16 +656,22 @@ dag-cbor *blocks* in the catalog plane ([§4](#4-the-catalog-layer)). CIDs and b
 -- One row per bucket: the space its data lives in, the S3 versioning state, the
 -- committed MST root, and the root that is durable on Forge (advanced only when
 -- a catalog segment ships, and only while root_cid still equals the op-root).
+-- The bucket-level S3 configuration rides here too: object lock, tagging and
+-- default encryption, each NULL until configured.
 CREATE TABLE ingot.buckets (
-    name             text PRIMARY KEY,
-    root_cid         bytea,                              -- committed MST root (locally durable)
-    forge_root_cid   bytea,                              -- MST root durable on Forge (lags root_cid)
-    created_at       timestamptz NOT NULL DEFAULT now(),
-    space            text NOT NULL,                      -- Forge space DID (minted by Hilt)
-    tenant           text NOT NULL,                      -- owning tenant DID; copy paths refuse a foreign source
-    versioning       text NOT NULL DEFAULT 'unversioned'
-                         CHECK (versioning IN ('unversioned','enabled','suspended')),
-    next_version_seq bigint NOT NULL DEFAULT 0           -- per-bucket version ordinal (§3)
+    name               text PRIMARY KEY,
+    root_cid           bytea,                            -- committed MST root (locally durable)
+    forge_root_cid     bytea,                            -- MST root durable on Forge (lags root_cid)
+    created_at         timestamptz NOT NULL DEFAULT now(),
+    space              text NOT NULL,                    -- Forge space DID (minted by Hilt)
+    tenant             text NOT NULL CHECK (tenant <> ''), -- owning tenant DID; copy paths refuse a foreign source
+    versioning         text NOT NULL DEFAULT 'unversioned'
+                           CHECK (versioning IN ('unversioned','enabled','suspended')),
+    next_version_seq   bigint NOT NULL DEFAULT 0,        -- per-bucket version ordinal (§3)
+    object_lock_config bytea,                            -- auth.BucketLockConfig JSON; NULL = never configured
+    bucket_tagging     bytea,                            -- tag set as a JSON object; NULL = no tag set
+    encryption         text CHECK (encryption IN ('AES256','none'))
+                                                         -- default encryption; NULL = unconfigured (encrypts)
 );
 CREATE INDEX buckets_space_idx ON ingot.buckets (space);
 
@@ -742,6 +748,31 @@ CREATE TABLE ingot.blob_locations (
     PRIMARY KEY (space, digest)
 );
 
+-- FEE encryption parameters of each encrypted body blob: exactly the inputs a
+-- range read's decryptor needs, so it can decrypt any span without fetching the
+-- envelope header. Every encrypted blob has a row (written before its manifest
+-- commits); a referenced blob with no row is a read error, never plaintext.
+-- Deliberately no FK to blob_locations: the two have independent lifecycles.
+-- Deleting the row is the per-blob crypto-shred.
+CREATE TABLE ingot.blob_encryption_params (
+    space              text   NOT NULL,
+    digest             bytea  NOT NULL,                  -- ciphertext blob multihash, as in blob_locations
+    region_wrapped_cek bytea  NOT NULL CHECK (octet_length(region_wrapped_cek) > 0),
+                                                         -- CEK wrapped by the region key provider; never the raw CEK
+    region_key_version text   NOT NULL CHECK (region_key_version <> ''),
+                                                         -- region KEK version that produced the wrap
+    header_len         bigint NOT NULL CHECK (header_len > 0),
+                                                         -- encoded envelope length; the ciphertext starts here
+    base_nonce         bytea  NOT NULL CHECK (octet_length(base_nonce) > 0),
+                                                         -- the STREAM base nonce (COSE iv)
+    chunk_size         bigint NOT NULL CHECK (chunk_size > 0),
+                                                         -- FEE chunk size
+    aad                bytea  NOT NULL CHECK (octet_length(aad) > 0),
+                                                         -- COSE Enc_structure, bound into every chunk's GCM tag
+    created_at         timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (space, digest)
+);
+
 -- Shard inclusions (§8): which shipped CAR contains block B, at what byte range
 -- (inclusive). Written by the flush path before a segment marks shipped, so
 -- retention can never retire blocks the read tier cannot resolve.
@@ -757,8 +788,10 @@ CREATE TABLE ingot.shard_inclusions (
 -- One row per in-flight multipart upload (§7.2). `state` is the single-winner
 -- latch (§7.3): Complete and Abort race to move it off 'open'; 'completed' rows
 -- are retained so a duplicate Complete is idempotent, then reaped by the TTL
--- sweeper. The header columns carry CreateMultipartUpload's metadata into the
--- Complete-time manifest.
+-- sweeper, which measures staleness from state_changed_at. The header, lock and
+-- tagging columns carry CreateMultipartUpload's metadata into the Complete-time
+-- manifest; committed_* hold what Complete returned, for a duplicate Complete to
+-- replay. space is recorded so teardown never depends on the bucket row.
 CREATE TABLE ingot.multipart_sessions (
     upload_id                 text PRIMARY KEY,
     bucket                    text NOT NULL,
@@ -775,7 +808,16 @@ CREATE TABLE ingot.multipart_sessions (
     expires                   text,
     website_redirect_location text,
     checksum_algorithm        text,
-    checksum_type             text
+    checksum_type             text,
+    lock_mode                 text,                      -- x-amz-object-lock-* headers, stamped at Complete
+    lock_retain_until         timestamptz,
+    lock_legal_hold           text,
+    tagging                   text,                      -- raw x-amz-tagging header
+    committed_etag            text,                      -- NULL until 'completed'
+    committed_version_id      text,
+    space                     text NOT NULL DEFAULT '' CHECK (space <> ''),
+    state_changed_at          timestamptz NOT NULL DEFAULT now(),
+    plaintext                 boolean NOT NULL DEFAULT false -- parts stored as received (decided at create)
 );
 
 -- One row per uploaded part. A part larger than max_blob_size maps to several
@@ -830,6 +872,40 @@ CREATE TABLE ingot.blob_parks (
     PRIMARY KEY (space, digest)
 );
 
+-- Body blobs allocated by digest code and streamed to the provider before their
+-- digest is known. The /blob/add task is the provider's only name for such an
+-- upload until it is parked or accepted. The owning request renews touched_at;
+-- the stream sweeper aborts a row whose lease has lapsed, unless its blob was
+-- parked.
+CREATE TABLE ingot.blob_streams (
+    add_task   bytea PRIMARY KEY,                        -- /blob/add task CID (the abort cause)
+    space      text   NOT NULL,
+    bucket     text   NOT NULL,
+    size       bigint NOT NULL,                          -- envelope bytes allocated
+    created_at timestamptz NOT NULL DEFAULT now(),
+    touched_at timestamptz NOT NULL DEFAULT now()        -- the owning request's lease
+);
+CREATE INDEX blob_streams_touched_at ON ingot.blob_streams (touched_at);
+CREATE INDEX blob_parks_add_task ON ingot.blob_parks (add_task);
+
+-- Deferred blob release (§6): written in the same transaction as the claim drop
+-- that leaves a blob unreferenced, and executed by a sweeper after not_before.
+-- Executing it deletes the blob_encryption_params row (the crypto-shred) and the
+-- blob_locations row, and removes the blob from its provider; the row goes only
+-- once all three succeed. started_at is set under the claim-key lock once the
+-- release owns the blob, so a write reusing the digest cancels an unstarted
+-- release or waits out a started one.
+CREATE TABLE ingot.blob_release_intents (
+    space      text   NOT NULL,
+    digest     bytea  NOT NULL,                          -- ciphertext blob multihash, as in blob_refs
+    not_before timestamptz NOT NULL,                     -- earliest execution (claim drop + grace)
+    created_at timestamptz NOT NULL DEFAULT now(),
+    started_at timestamptz,
+    PRIMARY KEY (space, digest)
+);
+CREATE INDEX blob_release_intents_due_idx ON ingot.blob_release_intents (not_before);
+CREATE INDEX blob_release_intents_digest_idx ON ingot.blob_release_intents (digest);
+
 -- Superseded MST node CIDs, recorded on overwrite/delete (§4, §9). Write-only
 -- this iteration — no catalog GC yet; a future collector consumes it.
 CREATE TABLE ingot.gc_candidates (
@@ -837,18 +913,53 @@ CREATE TABLE ingot.gc_candidates (
     bucket      text,
     created_at  timestamptz NOT NULL DEFAULT now()
 );
+
+-- The outbox for the upload service's content-entry list: one row per object
+-- version committed or retired, written in the same transaction as the
+-- bucket-root CAS and drained in commit order per key by the registration
+-- sweeper. proofs is the delegation chain authorizing the invocation; a row
+-- that cannot be renewed is dead-lettered rather than retried forever.
+CREATE TABLE ingot.upload_registrations (
+    seq                bigserial PRIMARY KEY,
+    bucket             text  NOT NULL REFERENCES ingot.buckets(name) ON DELETE CASCADE,
+    object_key         text  NOT NULL,
+    space              text  NOT NULL,
+    root               bytea NOT NULL,                   -- the version's manifest CID
+    op                 text  NOT NULL CHECK (op IN ('add','remove')),
+    proofs             bytea NOT NULL,                   -- encoded UCAN container
+    attempts           integer NOT NULL DEFAULT 0,
+    next_at            timestamptz NOT NULL DEFAULT now(),
+    created_at         timestamptz NOT NULL DEFAULT now(),
+    dead_lettered_at   timestamptz,
+    dead_letter_reason text
+);
+CREATE INDEX upload_registrations_due_idx ON ingot.upload_registrations (next_at, seq)
+    WHERE dead_lettered_at IS NULL;
+CREATE INDEX upload_registrations_key_idx ON ingot.upload_registrations (bucket, object_key, seq)
+    WHERE dead_lettered_at IS NULL;
+
+-- The revocation-firehose cursor: one row holding the resume point in the
+-- revocation service's stream. No row means "connect from now".
+CREATE TABLE ingot.revocation_cursor (
+    id          boolean PRIMARY KEY DEFAULT true CHECK (id), -- single-row latch
+    recorded_at timestamptz NOT NULL,                    -- the {since} of the next reconnect
+    revoke      bytea NOT NULL,                          -- revoked delegation CID, for observability
+    updated_at  timestamptz NOT NULL DEFAULT now()
+);
 ```
 
 Relationships at a glance: `segment_op_roots` cascades from `segments`, `multipart_parts` from
-`multipart_sessions`, and `multipart_part_trees` from `multipart_parts` — the schema's only true
-foreign keys. `blob_refs`, `segments`,
-`multipart_sessions`, and `gc_candidates` reference a `buckets.name` by value, and
-`shard_inclusions` joins `blob_locations` on `shard_digest`. The reference count for a blob is
-`count(*) from blob_refs where space = ? and digest = ?`; reaching zero triggers `remove(digest)`
-([§6](#6-the-forgechain-layer)). `upload_intents` and `blob_parks` are keyed by `(space, digest)`,
-like every other blob table — the disk-side and park-side indexes, shared across whatever objects
-of the space reference the same bytes. The spool file itself is one per digest, shared across
-spaces, and goes with the last intent for it.
+`multipart_sessions`, `multipart_part_trees` from `multipart_parts`, and `upload_registrations`
+from `buckets` — the schema's only true foreign keys. `blob_refs`, `segments`,
+`multipart_sessions`, `blob_streams` and `gc_candidates` reference a `buckets.name` by value,
+`shard_inclusions` joins `blob_locations` on `shard_digest`, and `blob_encryption_params` joins
+`blob_locations` on `(space, digest)` with deliberately no FK. `revocation_cursor` stands alone.
+The reference count for a blob is `count(*) from blob_refs where space = ? and digest = ?`;
+reaching zero triggers `remove(digest)` ([§6](#6-the-forgechain-layer)), through a
+`blob_release_intents` row. `upload_intents` and `blob_parks` are keyed by `(space, digest)`, like
+every other blob table — the disk-side and park-side indexes, shared across whatever objects of the
+space reference the same bytes. The spool file itself is one per digest, shared across spaces, and
+goes with the last intent for it.
 
 ---
 
