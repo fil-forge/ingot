@@ -53,7 +53,7 @@ func TestBucketPolicy(t *testing.T) {
 		Headers: map[string]string{"If-Match": `"old"`, "X-Amz-Content-Sha256": "abc", "Authorization": "AWS4-HMAC-SHA256 ..."},
 	}
 	body := []byte(`{"Statement":[]}`)
-	policy := &s3bkt.BucketPolicy{Version: "2012-10-17", Statements: []s3bkt.Statement{
+	policy := &s3bkt.PolicyDocument{Version: "2012-10-17", Statements: []s3bkt.Statement{
 		{Effect: s3bkt.Allow, Principal: s3bkt.Everyone(), Actions: s3bkt.NewStringSet("s3:GetObject"), Resources: s3bkt.NewStringSet("arn:aws:s3:::photos/*")},
 	}}
 
@@ -63,7 +63,7 @@ func TestBucketPolicy(t *testing.T) {
 			got = args
 			return &s3bkt.PolicyOK{Policy: policy}, nil
 		})
-		ok, err := svc.BucketPolicy(t.Context(), req, body)
+		ok, err := svc.PolicyDocument(t.Context(), req, body)
 		require.NoError(t, err)
 		require.Equal(t, policy, ok.Policy)
 		require.Equal(t, req, got.Request)
@@ -82,7 +82,7 @@ func TestBucketPolicy(t *testing.T) {
 			svc := newService(t, func(*s3bkt.PolicyArguments) (*s3bkt.PolicyOK, error) {
 				return nil, ucanerrors.New(name, "refused: "+name)
 			})
-			_, err := svc.BucketPolicy(t.Context(), req, body)
+			_, err := svc.PolicyDocument(t.Context(), req, body)
 			require.ErrorIs(t, err, want, name)
 		}
 	})
@@ -91,7 +91,7 @@ func TestBucketPolicy(t *testing.T) {
 		svc := newService(t, func(*s3bkt.PolicyArguments) (*s3bkt.PolicyOK, error) {
 			return nil, ucanerrors.New("OperationNotPermitted", "a principal-bound key")
 		})
-		_, err := svc.BucketPolicy(t.Context(), req, body)
+		_, err := svc.PolicyDocument(t.Context(), req, body)
 		var named ucanerrors.Named
 		require.ErrorAs(t, err, &named)
 		require.Equal(t, "OperationNotPermitted", named.Name())

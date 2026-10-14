@@ -35,9 +35,9 @@ type BucketAuthority interface {
 	CreateBucket(ctx context.Context, req s3.Request) (did.DID, error)
 	DeleteBucket(ctx context.Context, req s3.Request) error
 	ListBuckets(ctx context.Context, req s3.Request) (*s3bkt.ListOK, error)
-	// BucketPolicy forwards a GetBucketPolicy, PutBucketPolicy or
+	// PolicyDocument forwards a GetBucketPolicy, PutBucketPolicy or
 	// DeleteBucketPolicy request; body is the policy document on a PUT.
-	BucketPolicy(ctx context.Context, req s3.Request, body []byte) (*s3bkt.PolicyOK, error)
+	PolicyDocument(ctx context.Context, req s3.Request, body []byte) (*s3bkt.PolicyOK, error)
 }
 
 type Service struct {
@@ -87,8 +87,8 @@ func (s *Service) DeleteBucket(ctx context.Context, req s3.Request) error {
 	return nil
 }
 
-func (s *Service) BucketPolicy(ctx context.Context, req s3.Request, body []byte) (*s3bkt.PolicyOK, error) {
-	ok, err := s.client.BucketPolicy(ctx, req, body)
+func (s *Service) PolicyDocument(ctx context.Context, req s3.Request, body []byte) (*s3bkt.PolicyOK, error) {
+	ok, err := s.client.PolicyDocument(ctx, req, body)
 	if err != nil {
 		var namedErr ucanerr.Named
 		if errors.As(err, &namedErr) {

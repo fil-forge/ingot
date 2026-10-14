@@ -73,7 +73,7 @@ func (b *Backend) bucketPolicy(ctx context.Context, body []byte) ([]byte, error)
 		b.logger.Error("bucket policy operation without a request in context")
 		return nil, s3err.GetAPIError(s3err.ErrInternalError)
 	}
-	res, err := b.authority.BucketPolicy(ctx, req, body)
+	res, err := b.authority.PolicyDocument(ctx, req, body)
 	if err != nil {
 		apiErr := policyError(err)
 		if apiErr.HTTPStatusCode >= http.StatusInternalServerError {
@@ -92,7 +92,7 @@ func (b *Backend) bucketPolicy(ctx context.Context, body []byte) ([]byte, error)
 		// Hilt stores the document this body decodes to, normalized, so its tag
 		// is the stored tag. The body passed Hilt's own decoder a moment ago;
 		// a failure here means the two sides run different libforge versions.
-		var doc s3bkt.BucketPolicy
+		var doc s3bkt.PolicyDocument
 		if err := json.Unmarshal(body, &doc); err != nil {
 			b.logger.Error("tagging an accepted bucket policy", zap.Error(err))
 			return nil, nil

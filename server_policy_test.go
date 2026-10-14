@@ -32,7 +32,7 @@ import (
 	"go.uber.org/zap"
 )
 
-// fakeAuthority answers BucketPolicy with a canned result or error and
+// fakeAuthority answers PolicyDocument with a canned result or error and
 // records what it was given.
 type fakeAuthority struct {
 	bucketauthority.BucketAuthority
@@ -43,7 +43,7 @@ type fakeAuthority struct {
 	body  []byte
 }
 
-func (f *fakeAuthority) BucketPolicy(_ context.Context, req s3.Request, body []byte) (*s3bkt.PolicyOK, error) {
+func (f *fakeAuthority) PolicyDocument(_ context.Context, req s3.Request, body []byte) (*s3bkt.PolicyOK, error) {
 	f.calls++
 	f.req, f.body = req, body
 	return f.ok, f.err
@@ -122,7 +122,7 @@ func TestBuildS3API_BucketPolicy(t *testing.T) {
 	}
 
 	const doc = `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::photos/*"]}]}`
-	policy := &s3bkt.BucketPolicy{Version: "2012-10-17", Statements: []s3bkt.Statement{
+	policy := &s3bkt.PolicyDocument{Version: "2012-10-17", Statements: []s3bkt.Statement{
 		{Effect: s3bkt.Allow, Principal: s3bkt.Everyone(), Actions: s3bkt.NewStringSet("s3:GetObject"), Resources: s3bkt.NewStringSet("arn:aws:s3:::photos/*")},
 	}}
 

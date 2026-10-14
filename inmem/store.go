@@ -128,10 +128,10 @@ func (m *MemStore) DeleteBucket(ctx context.Context, req s3.Request) error {
 	return nil
 }
 
-// BucketPolicy is unsupported: the in-memory store keeps no policies, so a
+// PolicyDocument is unsupported: the in-memory store keeps no policies, so a
 // bucket has none to read or delete and a write is refused. An unknown
 // (path-style) bucket is ErrNotFound, as from the production authority.
-func (m *MemStore) BucketPolicy(ctx context.Context, req s3.Request, body []byte) (*bucket.PolicyOK, error) {
+func (m *MemStore) PolicyDocument(ctx context.Context, req s3.Request, body []byte) (*bucket.PolicyOK, error) {
 	path, _, _ := strings.Cut(strings.TrimPrefix(req.URL, "/"), "?")
 	name, _, _ := strings.Cut(path, "/")
 	m.mu.Lock()

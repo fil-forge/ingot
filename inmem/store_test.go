@@ -33,7 +33,7 @@ func TestMemStoreBucketPolicy(t *testing.T) {
 		{http.MethodGet, "/known?policy", bucketauthority.ErrNoPolicy},
 		{http.MethodPut, "/known?policy", bucketauthority.ErrUnsupported},
 	} {
-		_, err := m.BucketPolicy(ctx, s3.Request{Method: tc.method, URL: tc.url}, nil)
+		_, err := m.PolicyDocument(ctx, s3.Request{Method: tc.method, URL: tc.url}, nil)
 		if !errors.Is(err, tc.want) {
 			t.Errorf("%s %s: got %v, want %v", tc.method, tc.url, err, tc.want)
 		}

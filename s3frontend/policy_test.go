@@ -21,7 +21,7 @@ import (
 	"github.com/fil-forge/ingot/s3frontend"
 )
 
-// policyAuthority answers BucketPolicy with a canned result or error and
+// policyAuthority answers PolicyDocument with a canned result or error and
 // records what it was given.
 type policyAuthority struct {
 	bucketauthority.BucketAuthority
@@ -32,7 +32,7 @@ type policyAuthority struct {
 	body  []byte
 }
 
-func (f *policyAuthority) BucketPolicy(_ context.Context, req s3.Request, body []byte) (*s3bkt.PolicyOK, error) {
+func (f *policyAuthority) PolicyDocument(_ context.Context, req s3.Request, body []byte) (*s3bkt.PolicyOK, error) {
 	f.calls++
 	f.req, f.body = req, body
 	return f.ok, f.err
@@ -78,7 +78,7 @@ func TestBucketPolicy(t *testing.T) {
 		require.NoError(t, policyBackend(t, f).PutBucketPolicy(ctx, "photos", []byte(body)))
 		require.Equal(t, req, f.req)
 		require.Equal(t, body, string(f.body))
-		want := s3bkt.BucketPolicy{Version: "2012-10-17", Statements: []s3bkt.Statement{
+		want := s3bkt.PolicyDocument{Version: "2012-10-17", Statements: []s3bkt.Statement{
 			{Effect: s3bkt.Deny, Principal: s3bkt.Everyone(), Actions: s3bkt.NewStringSet("s3:DeleteObject"), Resources: s3bkt.NewStringSet("arn:aws:s3:::photos/*")},
 			{Effect: s3bkt.Allow, Principal: s3bkt.Only("alice"), Actions: s3bkt.NewStringSet("s3:PutObject"), Resources: s3bkt.NewStringSet("arn:aws:s3:::photos/*")},
 		}}
@@ -90,7 +90,7 @@ func TestBucketPolicy(t *testing.T) {
 			{Method: http.MethodGet, URL: "/photos?policy", Headers: map[string]string{"Authorization": signedAuth}},
 			{Method: http.MethodGet, URL: "/photos?policy&X-Amz-Signature=abc", Headers: map[string]string{}},
 		} {
-			policy := &s3bkt.BucketPolicy{Version: "2012-10-17", Statements: []s3bkt.Statement{
+			policy := &s3bkt.PolicyDocument{Version: "2012-10-17", Statements: []s3bkt.Statement{
 				{Effect: s3bkt.Allow, Principal: s3bkt.Only("alice"), Actions: s3bkt.NewStringSet("s3:GetObject"), Resources: s3bkt.NewStringSet("arn:aws:s3:::photos/*")},
 			}}
 			f := &policyAuthority{ok: &s3bkt.PolicyOK{Policy: policy}}
