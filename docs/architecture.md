@@ -750,8 +750,10 @@ CREATE TABLE ingot.blob_locations (
 
 -- FEE encryption parameters of each encrypted body blob: exactly the inputs a
 -- range read's decryptor needs, so it can decrypt any span without fetching the
--- envelope header. Every encrypted blob has a row (written before its manifest
--- commits); a referenced blob with no row is a read error, never plaintext.
+-- envelope header. The base nonce, chunk size and plaintext length are in the
+-- protected header, which aad holds. Every encrypted blob has a row (written
+-- before its manifest commits); a referenced blob with no row is a read error,
+-- never plaintext.
 -- Deliberately no FK to blob_locations: the two have independent lifecycles.
 -- Deleting the row is the per-blob crypto-shred.
 CREATE TABLE ingot.blob_encryption_params (
@@ -763,12 +765,9 @@ CREATE TABLE ingot.blob_encryption_params (
                                                          -- region KEK version that produced the wrap
     header_len         bigint NOT NULL CHECK (header_len > 0),
                                                          -- encoded envelope length; the ciphertext starts here
-    base_nonce         bytea  NOT NULL CHECK (octet_length(base_nonce) > 0),
-                                                         -- the STREAM base nonce (COSE iv)
-    chunk_size         bigint NOT NULL CHECK (chunk_size > 0),
-                                                         -- FEE chunk size
     aad                bytea  NOT NULL CHECK (octet_length(aad) > 0),
-                                                         -- COSE Enc_structure, bound into every chunk's GCM tag
+                                                         -- COSE Enc_structure, bound into every chunk's GCM tag;
+                                                         -- its protected header holds the body parameters
     created_at         timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (space, digest)
 );

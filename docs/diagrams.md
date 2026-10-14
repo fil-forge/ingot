@@ -981,9 +981,7 @@ erDiagram
         bytea region_wrapped_cek "never the raw CEK; deleting the row crypto-shreds the blob"
         text region_key_version
         bigint header_len "the ciphertext starts here"
-        bytea base_nonce
-        bigint chunk_size
-        bytea aad "COSE Enc_structure"
+        bytea aad "COSE Enc_structure; its protected header holds the base nonce and chunk size"
     }
     shard_inclusions {
         text space PK
