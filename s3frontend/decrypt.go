@@ -7,7 +7,6 @@ import (
 	"io"
 
 	"github.com/filecoin-project/go-fee"
-	"github.com/filecoin-project/go-fee/aesstream"
 	"github.com/multiformats/go-multihash"
 
 	"github.com/fil-forge/ingot/blockstore"
@@ -21,18 +20,19 @@ import (
 // encryption design's read side). An encrypted body blob is stored as a FEE
 // envelope: a COSE header followed by the AES-256-GCM STREAM ciphertext of
 // the blob's plaintext. The blob_encryption_params row caches everything the
-// decryptor needs — the header length, STREAM base nonce, chunk size, AAD,
-// and the region-wrapped CEK — so a ranged GET unwraps the CEK through the
-// region key provider and fetches ONLY the ciphertext chunks its plaintext
-// range overlaps, never the envelope header.
+// decryptor needs — the header length, the AAD (whose protected header holds
+// the STREAM base nonce, chunk size and plaintext length), and the
+// region-wrapped CEK — so a ranged GET unwraps the CEK through the region key
+// provider and fetches ONLY the ciphertext chunks its plaintext range
+// overlaps, never the envelope header.
 //
 // Coordinates: BlobRef.Start/End are inclusive plaintext spans (the manifest
 // describes the object's plaintext layout), while BlobRef.Digest names the
 // stored — for an encrypted blob, ciphertext — bytes. The bodyOpener is
-// where the two meet: it maps a plaintext range of one blob onto the
-// contiguous ciphertext span that serves it (aesstream.CiphertextRange) and
-// decrypts that span as it streams (aesstream.SpanReader). Every range in
-// this file is HTTP-style inclusive [start, end].
+// where the two meet: go-fee's fee.DecryptRangeWithCEK maps a plaintext range
+// of one blob onto the contiguous ciphertext span that serves it, and
+// decrypts that span as it streams. Every range in this file is HTTP-style
+// inclusive [start, end].
 
 // bodyOpener returns the BlobRangeOpener for one request over body: the
 // plain opener for a body its manifest marks plaintext (stored as received
@@ -85,14 +85,18 @@ func (b *Backend) bodyOpener(ctx context.Context, space did.DID, body msbucket.B
 		if err != nil {
 			return nil, fmt.Errorf("s3frontend: encrypted blob %x has no recorded location: %w", ref.Digest, err)
 		}
-		e, err := newEncBlob(*params, loc.Size)
-		if err != nil {
+		// The row must describe a FEE body, and an envelope that declares its
+		// plaintext length must agree with the stored size, so a bad row or a
+		// truncated or padded blob fails here, before any response headers
+		// are written.
+		desc := fee.BodyDescriptor{HeaderLen: params.HeaderLen, AAD: params.AAD}
+		if _, err := desc.PlaintextSize(loc.Size); err != nil {
 			return nil, fmt.Errorf("s3frontend: blob %x: %w", ref.Digest, err)
 		}
 		if enc == nil {
 			enc = make(map[string]encBlob)
 		}
-		enc[key] = e
+		enc[key] = encBlob{desc: desc, params: *params, storedSize: loc.Size}
 	}
 	if len(enc) == 0 {
 		return plain, nil
@@ -106,32 +110,9 @@ func (b *Backend) bodyOpener(ctx context.Context, space did.DID, body msbucket.B
 
 // encBlob is one encrypted blob's prefetched decryption state.
 type encBlob struct {
+	desc       fee.BodyDescriptor
 	params     registry.BlobEncryptionParams
 	storedSize int64 // whole stored blob: envelope header + ciphertext
-	baseNonce  []byte
-	chunkSize  int
-}
-
-// newEncBlob reads a blob's body parameters from its params row (the protected
-// header in its AAD carries the base nonce, chunk size and any declared
-// plaintext length), and checks the stored size against them: an envelope
-// that declares its plaintext length is rejected when storedSize contradicts
-// it, so a truncated or padded blob fails here, before any response headers
-// are written.
-func newEncBlob(params registry.BlobEncryptionParams, storedSize int64) (encBlob, error) {
-	desc := fee.BodyDescriptor{HeaderLen: params.HeaderLen, AAD: params.AAD}
-	if _, err := desc.PlaintextSize(storedSize); err != nil {
-		return encBlob{}, err
-	}
-	chunkSize, err := desc.ChunkSize()
-	if err != nil {
-		return encBlob{}, err
-	}
-	baseNonce, err := desc.BaseNonce()
-	if err != nil {
-		return encBlob{}, err
-	}
-	return encBlob{params: params, storedSize: storedSize, baseNonce: baseNonce, chunkSize: chunkSize}, nil
 }
 
 // decryptingOpener serves each blob's plaintext range: it unwraps the CEK,
@@ -161,58 +142,69 @@ func (o *decryptingOpener) OpenBlobRange(ctx context.Context, space did.DID, ref
 	if err != nil {
 		return nil, fmt.Errorf("s3frontend: unwrap CEK for blob %x: %w", ref.Digest, err)
 	}
-	// NewSpanReader copies the key into its cipher at construction, so the
-	// raw CEK is wiped before this function returns, on every path.
+	// DecryptRangeWithCEK copies the key into its cipher at construction, so
+	// the raw CEK is wiped before this function returns, on every path.
 	defer clear(cek)
 
-	// Map the plaintext range onto the single contiguous ciphertext span
-	// that serves it. Offsets from CiphertextRange are relative to the
-	// ciphertext stream, which starts HeaderLen bytes into the stored blob.
-	ctSize := e.storedSize - e.params.HeaderLen
-	ctStart, ctEnd, plainLen, err := aesstream.CiphertextRange(ctSize, e.chunkSize, start, end)
+	// No ciphertext is read until the first Read, so the reader is built
+	// first, and its ciphertext span then fetched in one ranged request.
+	src := &spanReaderAt{}
+	rr, err := fee.DecryptRangeWithCEK(src, e.storedSize, cek, start, end, &e.desc)
 	if err != nil {
-		return nil, fmt.Errorf("s3frontend: ciphertext range for blob %x: %w", ref.Digest, err)
-	}
-	if plainLen < end-start+1 {
-		// The manifest's plaintext span extends past what this ciphertext
-		// decrypts to: the registry row and the manifest disagree.
-		return nil, fmt.Errorf("s3frontend: blob %x: plaintext range [%d,%d] exceeds the %d bytes its ciphertext holds",
-			ref.Digest, start, end, plainLen)
-	}
-
-	span, err := blockstore.OpenBlobRangeOf(ctx, o.read, space, ref.Digest, e.params.HeaderLen+ctStart, e.params.HeaderLen+ctEnd)
-	if err != nil {
-		return nil, fmt.Errorf("s3frontend: fetch ciphertext span of blob %x: %w", ref.Digest, err)
-	}
-	sr, err := aesstream.NewSpanReader(span, aesstream.Config{
-		Key:       cek,
-		BaseNonce: e.baseNonce,
-		AAD:       e.params.AAD,
-		ChunkSize: e.chunkSize,
-	}, ctSize, start, end)
-	if err != nil {
-		_ = span.Close()
 		return nil, fmt.Errorf("s3frontend: decrypt blob %x: %w", ref.Digest, err)
 	}
-	// A chunk that fails authentication mid-stream (tampered or stale
-	// ciphertext) surfaces from Read as aesstream.ErrCorrupted, terminating
-	// the response body — the encryption RFC's stated behavior. Closing the
-	// body releases the ciphertext fetch and returns the decryptor's chunk
-	// buffers for the next request to reuse.
-	return readerCloser{Reader: sr, Closer: closers{sr, span}}, nil
+	if rr.Len() < end-start+1 {
+		// The manifest's plaintext span extends past what this ciphertext
+		// decrypts to: the registry row and the manifest disagree. (go-fee
+		// clamps such a range rather than rejecting it.)
+		_ = rr.Close()
+		return nil, fmt.Errorf("s3frontend: blob %x: plaintext range [%d,%d] exceeds the %d bytes its ciphertext holds",
+			ref.Digest, start, end, rr.Size())
+	}
+	spanStart, spanEnd := rr.CiphertextSpan()
+	span, err := blockstore.OpenBlobRangeOf(ctx, o.read, space, ref.Digest, spanStart, spanEnd)
+	if err != nil {
+		_ = rr.Close()
+		return nil, fmt.Errorf("s3frontend: fetch ciphertext span of blob %x: %w", ref.Digest, err)
+	}
+	src.span, src.pos = span, spanStart
+	// Read fails mid-stream, ending the response body, on a chunk that fails
+	// authentication (tampered or stale ciphertext: aesstream.ErrCorrupted)
+	// or a fetch that ends before its span does.
+	return decryptedRange{RangeReader: rr, span: span}, nil
 }
 
-// closers closes each closer in order and reports the first error.
-type closers []io.Closer
+// spanReaderAt serves go-fee's reads of one blob's ciphertext span from a
+// single ranged fetch of that span. fee.DecryptRangeWithCEK reads the span in
+// order, each read starting where the last ended and the whole covering
+// exactly RangeReader.CiphertextSpan, so a read at any other offset is a bug
+// and fails rather than returning the wrong bytes.
+type spanReaderAt struct {
+	span io.Reader // the fetched span; nil until it is opened
+	pos  int64     // blob-absolute offset of span's next byte
+}
 
-func (c closers) Close() error {
-	var first error
-	for _, cl := range c {
-		if err := cl.Close(); err != nil && first == nil {
-			first = err
-		}
+func (s *spanReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	if s.span == nil {
+		return 0, errors.New("s3frontend: ciphertext read before its span was fetched")
 	}
-	return first
+	if off != s.pos {
+		return 0, fmt.Errorf("s3frontend: ciphertext read at offset %d, want %d", off, s.pos)
+	}
+	n, err := io.ReadFull(s.span, p)
+	s.pos += int64(n)
+	return n, err
+}
+
+// decryptedRange is one blob's decrypted plaintext range. Closing it releases
+// both the decryptor and the ciphertext fetch it reads from.
+type decryptedRange struct {
+	*fee.RangeReader
+	span io.Closer
+}
+
+func (d decryptedRange) Close() error {
+	return errors.Join(d.RangeReader.Close(), d.span.Close())
 }
 
 // blobPlaintextLen reports how many plaintext bytes a stored, encrypted
@@ -237,11 +229,4 @@ func (b *Backend) blobPlaintextLen(ctx context.Context, space did.DID, digest mu
 		return 0, fmt.Errorf("blob %x: %d stored bytes do not fit its FEE geometry: %w", digest, storedSize, err)
 	}
 	return plainLen, nil
-}
-
-// readerCloser pairs the decrypted plaintext reader with the ciphertext
-// stream it consumes, so closing the body releases the underlying fetch.
-type readerCloser struct {
-	io.Reader
-	io.Closer
 }
