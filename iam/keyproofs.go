@@ -23,9 +23,20 @@ import (
 // TTL is refreshed on every access, so an active key is never evicted
 // mid-use; a caller already holding a *DelegationCache is unaffected by
 // eviction regardless.
+//
+// It also remembers every delegation CID a revocation named, for revokedTTL
+// past the last time Hilt served it. A Hilt write publishes its revocations
+// before it commits, so a write whose commit failed leaves the revoked delegations
+// stored at Hilt, and Hilt's next authorize response for the key carries
+// them again. Each key's store refuses a batch naming this set (see
+// [DelegationCache.Add]), and the service then authorizes without caching,
+// so the key returns to Hilt on every request until a committed write issues
+// fresh delegations (which carry new CIDs: ucantone gives every delegation a
+// random nonce).
 type KeyProofs struct {
-	mu    sync.Mutex
-	byKey *gocache.Cache // access-key DID string → *DelegationCache
+	mu      sync.Mutex
+	byKey   *gocache.Cache // access-key DID string → *DelegationCache
+	revoked *gocache.Cache // revoked delegation CID string → struct{}
 }
 
 // keyProofsIdleTTL is how long a key's cache survives with no access before
@@ -34,9 +45,18 @@ type KeyProofs struct {
 // disappears out from under it.
 const keyProofsIdleTTL = 24 * time.Hour
 
+// revokedTTL is how long a revoked CID is remembered past its last sighting.
+// A revocation names only the CID, and the grant behind it may never expire,
+// so the entry must outlive the authorize horizon. It matters only while Hilt
+// still serves the grant (a write whose commit failed); each refusal renews it.
+const revokedTTL = 48 * time.Hour
+
 // NewKeyProofs returns an empty per-key proof store registry.
 func NewKeyProofs() *KeyProofs {
-	return &KeyProofs{byKey: gocache.New(keyProofsIdleTTL, keyProofsIdleTTL)}
+	return &KeyProofs{
+		byKey:   gocache.New(keyProofsIdleTTL, keyProofsIdleTTL),
+		revoked: gocache.New(gocache.NoExpiration, cacheJanitorInterval),
+	}
 }
 
 // For returns key's proof store, creating it on first use. The idle TTL is
@@ -50,27 +70,33 @@ func (k *KeyProofs) For(key did.DID) *DelegationCache {
 		k.byKey.Set(id, dc, gocache.DefaultExpiration) // refresh idle window
 		return dc
 	}
-	dc := NewDelegationCache()
+	dc := NewDelegationCache(k.revoked)
 	k.byKey.Set(id, dc, gocache.DefaultExpiration)
 	return dc
 }
 
-// Deposit adds delegations to key's proof store.
+// Deposit adds delegations to key's proof store, unless any has been named
+// by a revocation (see [DelegationCache.Add]).
 func (k *KeyProofs) Deposit(key did.DID, dlgs ...ucan.Delegation) {
 	k.For(key).Add(dlgs...)
 }
 
-// InvalidateHolders drops every per-key proof store holding the delegation
-// with CID link, returning the affected access-key DIDs. Dropping the whole
-// store rather than the one entry is deliberate: a revoked delegation is a
-// hop in every chain the local fast path could assemble for that key, so no
-// partial state is worth keeping — the key's next request falls through to
-// Hilt, which re-authorizes (or, for a deleted key, refuses). A caller
-// already holding the dropped *DelegationCache (an in-flight request) is
-// unaffected; the next For(key) starts a fresh empty store.
+// InvalidateHolders records link as revoked and drops every per-key proof
+// store holding the delegation with that CID, returning the affected
+// access-key DIDs. Dropping the whole store rather than the one entry is
+// deliberate: a revoked delegation is a hop in every chain the local fast
+// path could assemble for that key, so no partial state is worth keeping —
+// the key's next request falls through to Hilt, which re-authorizes (or, for
+// a deleted key, refuses). A caller already holding the dropped
+// *DelegationCache (an in-flight request) is unaffected; the next For(key)
+// starts a fresh empty store. A link no store holds is still recorded: the
+// revocation may precede the response that would have cached it.
 func (k *KeyProofs) InvalidateHolders(link cid.Cid) []did.DID {
 	k.mu.Lock()
 	defer k.mu.Unlock()
+	// A failed Hilt write whose grant goes unserved for revokedTTL is
+	// forgotten; Hilt refusing to serve grants it revoked would close that.
+	k.revoked.Set(link.String(), struct{}{}, revokedTTL)
 	var affected []did.DID
 	// Items() already skips expired entries; expired stores are gone anyway.
 	for id, item := range k.byKey.Items() {

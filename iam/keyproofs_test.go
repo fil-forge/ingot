@@ -2,6 +2,7 @@ package iam_test
 
 import (
 	"context"
+	"sync"
 	"testing"
 
 	contentcmds "github.com/fil-forge/libforge/commands/content"
@@ -63,4 +64,54 @@ func TestKeyProofsForIsStable(t *testing.T) {
 	chain, _, err := kp.For(key.DID()).ProofChain(context.Background(), dlg.Audience(), dlg.Command(), iss.DID())
 	require.NoError(t, err)
 	require.Len(t, chain, 1)
+}
+
+func TestKeyProofsStoreRefusesRevoked(t *testing.T) {
+	kp := iam.NewKeyProofs()
+	key, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	store := kp.For(key.DID())
+
+	// A delegation no store holds: the revocation still has to be remembered.
+	dlg, _ := grant(t)
+	require.Empty(t, kp.InvalidateHolders(dlg.Link()))
+
+	other, _ := grant(t)
+	require.False(t, store.Add(other, dlg), "any revoked delegation in the batch refuses the add")
+	require.False(t, store.Contains(other.Link()), "a refused add adds nothing")
+	require.True(t, store.Add(other))
+	require.True(t, store.Contains(other.Link()))
+}
+
+// TestRequestScopedStoreKeepsRevoked: a request authorized from a response
+// Hilt served after a failed commit still needs that response's delegations
+// for its onward retrieval, so a store built outside KeyProofs adds them.
+func TestRequestScopedStoreKeepsRevoked(t *testing.T) {
+	kp := iam.NewKeyProofs()
+	dlg, _ := grant(t)
+	kp.InvalidateHolders(dlg.Link())
+
+	scoped := iam.NewDelegationCache(nil)
+	require.True(t, scoped.Add(dlg))
+	require.True(t, scoped.Contains(dlg.Link()))
+}
+
+// TestKeyProofsDepositRacesRevocation races a deposit against the revocation
+// of the delegation it carries: whichever lands first, the key's store must
+// not end up holding the revoked delegation.
+func TestKeyProofsDepositRacesRevocation(t *testing.T) {
+	for range 200 {
+		kp := iam.NewKeyProofs()
+		key, err := ed25519.GenerateIssuer()
+		require.NoError(t, err)
+		store := kp.For(key.DID())
+		dlg, _ := grant(t)
+
+		var wg sync.WaitGroup
+		wg.Go(func() { store.Add(dlg) })
+		wg.Go(func() { kp.InvalidateHolders(dlg.Link()) })
+		wg.Wait()
+
+		require.False(t, kp.For(key.DID()).Contains(dlg.Link()))
+	}
 }
