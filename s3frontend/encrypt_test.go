@@ -122,8 +122,11 @@ func TestEncryptedWrite_Opacity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetEncryptionParams: %v", err)
 	}
-	if len(params.RegionWrappedCEK) == 0 || params.HeaderLen <= 0 || params.ChunkSize <= 0 {
+	if len(params.RegionWrappedCEK) == 0 || params.HeaderLen <= 0 {
 		t.Fatalf("params row incomplete: %+v", params)
+	}
+	if err := (fee.BodyDescriptor{HeaderLen: params.HeaderLen, AAD: params.AAD}).Validate(); err != nil {
+		t.Fatalf("params row does not describe a FEE body: %v", err)
 	}
 	// The registry records the STORED size: what decryption geometry is
 	// derived from, and what gets uploaded.

@@ -291,8 +291,6 @@ func feeParams(space did.DID, digest []byte) registry.BlobEncryptionParams {
 		RegionWrappedCEK: []byte("wrapped-cek-bytes"),
 		RegionKeyVersion: "region-kek-v1",
 		HeaderLen:        212,
-		BaseNonce:        []byte("nonce07"),
-		ChunkSize:        65536,
 		AAD:              []byte("cose-enc-structure"),
 	}
 }
@@ -367,7 +365,6 @@ func TestEncryptionParams_NoSliceAliasing(t *testing.T) {
 		t.Fatalf("PutEncryptionParams: %v", err)
 	}
 	params.RegionWrappedCEK[0] = 'X'
-	params.BaseNonce[0] = 'X'
 	params.AAD[0] = 'X'
 
 	got, err := m.GetEncryptionParams(ctx, space, digest)
@@ -375,7 +372,7 @@ func TestEncryptionParams_NoSliceAliasing(t *testing.T) {
 		t.Fatalf("GetEncryptionParams: %v", err)
 	}
 	got.RegionWrappedCEK[0] = 'Y'
-	got.BaseNonce[0] = 'Y'
+	got.AAD[0] = 'Y'
 
 	again, err := m.GetEncryptionParams(ctx, space, digest)
 	if err != nil {

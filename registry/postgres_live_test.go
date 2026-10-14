@@ -399,8 +399,6 @@ func TestPostgresStores_Live(t *testing.T) {
 			RegionWrappedCEK: []byte{0xde, 0xad, 0x00, 0xbe, 0xef, 0xff},
 			RegionKeyVersion: "region-kek-v1",
 			HeaderLen:        212,
-			BaseNonce:        []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07},
-			ChunkSize:        65536,
 			AAD:              []byte{0xa1, 0x00, 0x18, 0x20},
 		}
 	}

@@ -127,6 +127,15 @@ func (b *Backend) tenantRecipient(ctx context.Context) (fee.Recipient, error) {
 // nothing and returns (nil, 0, nil), and n is the number of PLAINTEXT bytes
 // consumed from r.
 func (w *bodyWriter) WriteBlob(ctx context.Context, r io.Reader) (multihash.Multihash, int64, error) {
+	return w.writeBlob(ctx, r, -1)
+}
+
+// writeBlob is WriteBlob with the plaintext length, when the caller knows it.
+// A non-negative size is recorded in the envelope as its chunk count, which
+// range readers of the stored blob that plan from the header rely on, and the
+// encryption fails if r yields any other number of bytes. A negative size
+// means unknown.
+func (w *bodyWriter) writeBlob(ctx context.Context, r io.Reader, size int64) (multihash.Multihash, int64, error) {
 	if w.plaintext {
 		digest, n, err := w.writeSpool(ctx, r)
 		if err != nil {
@@ -159,7 +168,7 @@ func (w *bodyWriter) WriteBlob(ctx context.Context, r io.Reader) (multihash.Mult
 
 	plaintext := &countingReader{r: io.MultiReader(bytes.NewReader(first[:]), r)}
 	// The descriptor is complete on return, before any plaintext is read.
-	rc, desc, err := fee.EncryptWithCEK(plaintext, cek, w.recipients)
+	rc, desc, err := fee.EncryptWithCEK(plaintext, cek, w.recipients, fee.WithPlaintextLength(size))
 	if err != nil {
 		return nil, 0, fmt.Errorf("s3frontend: encrypt blob: %w", err)
 	}
@@ -212,8 +221,6 @@ func (w *bodyWriter) params(space did.DID, digest multihash.Multihash) (registry
 		RegionWrappedCEK: res.wrapped.Ciphertext,
 		RegionKeyVersion: string(res.wrapped.Version),
 		HeaderLen:        res.desc.HeaderLen,
-		BaseNonce:        res.desc.BaseNonce,
-		ChunkSize:        int64(res.desc.ChunkSize),
 		AAD:              res.desc.AAD,
 	}, nil
 }

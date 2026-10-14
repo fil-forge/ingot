@@ -19,6 +19,8 @@ import (
 	"github.com/fil-forge/versitygw/backend"
 	"github.com/fil-forge/versitygw/s3err"
 	"github.com/fil-forge/versitygw/s3response"
+	"github.com/filecoin-project/go-fee/aesstream"
+	"github.com/filecoin-project/go-fee/cose"
 	block "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
@@ -273,6 +275,40 @@ func TestStreamedPutObjectUnsupportedDigestCode(t *testing.T) {
 	require.Empty(t, su.started)
 	require.Len(t, su.uploaded, 3, "every blob uploads by digest")
 	require.Equal(t, data, getRange(t, b, "k", ""))
+}
+
+// feePlaintextLengthLabel is the FEE protected header that records an
+// envelope's plaintext length. go-fee does not export it; the value is fixed by
+// the wire format shared with the Synapse SDK.
+const feePlaintextLengthLabel = -65789
+
+// TestStreamedPutObjectRecordsPlaintextLength: a sized PUT declares each
+// blob's length to the encryptor, so every envelope records its plaintext
+// length in the protected header. A reader checks it against the blob size,
+// detecting a truncated blob from the header alone. That holds both when the
+// blob streams and when it falls back to spooling first.
+func TestStreamedPutObjectRecordsPlaintextLength(t *testing.T) {
+	for name, unsupported := range map[string]bool{"streamed": false, "digest first": true} {
+		t.Run(name, func(t *testing.T) {
+			su := newStreamingUploader()
+			su.unsupported = unsupported
+			b, _ := newStreamingBackend(t, su)
+			data := testBody(700 << 10) // 3 blobs, of 2, 2 and 1 chunks
+
+			require.NoError(t, putSized(t, b, "k", data, int64(len(data))))
+			digests := blobDigestsOf(t, b, "k", "")
+			require.Len(t, digests, 3)
+			for _, d := range digests {
+				env, ciphertext, err := cose.Decode(spooled(t, b, d))
+				require.NoError(t, err)
+				declared, ok := env.Headers.Protected.Int(feePlaintextLengthLabel)
+				require.True(t, ok, "the envelope records its plaintext length")
+				want, err := aesstream.DecryptedSize(int64(len(ciphertext)), aesstream.DefaultChunkSize)
+				require.NoError(t, err)
+				require.Equal(t, want, declared)
+			}
+		})
+	}
 }
 
 func TestStreamedPutObjectWrongLength(t *testing.T) {

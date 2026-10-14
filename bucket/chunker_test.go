@@ -20,11 +20,11 @@ import (
 
 // TestDefaultMaxBlobSizeFitsPiri pins DefaultMaxBlobSize's derivation: the
 // FEE envelope of a max-size plaintext blob (ciphertext with per-chunk GCM
-// tags, plus a generous COSE-header budget — the observed single-recipient
-// header is ~211 bytes) must fit the network blob ceiling (libforge
+// tags, plus a generous COSE-header budget — a single-recipient header is a
+// few hundred bytes) must fit the network blob ceiling (libforge
 // blob.MaxBlobSize, the most raw bytes a default-configured piri accepts).
-// Guards against the formula drifting (e.g. a chunk-count header if
-// WithContentLength is ever used, or a second recipient).
+// Guards against the formula drifting (e.g. a larger header, or a second
+// recipient).
 func TestDefaultMaxBlobSizeFitsPiri(t *testing.T) {
 	const headerBudget = 1024
 	enc := aesstream.EncryptedSize(DefaultMaxBlobSize, aesstream.DefaultChunkSize) + headerBudget

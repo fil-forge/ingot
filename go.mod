@@ -19,7 +19,7 @@ require (
 	github.com/fil-forge/swarf v0.0.1-0.20260922133653-0b2e5b2e1c6c
 	github.com/fil-forge/ucantone v0.0.0-20260924160040-c31dec73d9b3
 	github.com/fil-forge/versitygw v0.0.0-20261014123502-37d109788d28
-	github.com/filecoin-project/go-fee v0.1.1-0.20260930093805-a26324dfe6ad
+	github.com/filecoin-project/go-fee v0.3.0
 	github.com/gofiber/fiber/v3 v3.5.0
 	github.com/google/uuid v1.6.0
 	github.com/ipfs/go-block-format v0.2.4

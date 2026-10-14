@@ -102,12 +102,12 @@ func TestUp_Live(t *testing.T) {
 		}
 	}
 
-	// blob_encryption_params (00014): every column exists and is NOT NULL — the
-	// presence of a row is what marks a blob as encrypted, so there is no such
-	// thing as a half-populated parameter set.
+	// blob_encryption_params (00014, 00029): every column exists and is NOT
+	// NULL — the presence of a row is what marks a blob as encrypted, so there
+	// is no such thing as a half-populated parameter set.
 	for _, col := range []string{
 		"space", "digest", "region_wrapped_cek", "region_key_version",
-		"header_len", "base_nonce", "chunk_size", "aad", "created_at",
+		"header_len", "aad", "created_at",
 	} {
 		var nullable string
 		err := pool.QueryRow(ctx,
@@ -119,6 +119,19 @@ func TestUp_Live(t *testing.T) {
 		}
 		if nullable != "NO" {
 			t.Errorf("column ingot.blob_encryption_params.%s is_nullable = %q, want NO", col, nullable)
+		}
+	}
+	// The base nonce and chunk size are read from aad (00029).
+	for _, col := range []string{"base_nonce", "chunk_size"} {
+		var exists bool
+		err := pool.QueryRow(ctx,
+			`SELECT EXISTS (SELECT 1 FROM information_schema.columns
+			 WHERE table_schema = 'ingot' AND table_name = 'blob_encryption_params' AND column_name = $1)`, col).Scan(&exists)
+		if err != nil {
+			t.Fatalf("check column blob_encryption_params.%s: %v", col, err)
+		}
+		if exists {
+			t.Errorf("column ingot.blob_encryption_params.%s still exists after migration", col)
 		}
 	}
 }
