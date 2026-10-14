@@ -359,3 +359,100 @@ func (u unseekableBlobs) OpenBlob(ctx context.Context, space did.DID, digest mul
 		io.Closer
 	}{io.Reader(rc), rc}, nil
 }
+
+// A plaintext range past the end of a blob means the manifest and the
+// registry row disagree; the read fails instead of serving a clamped range.
+func TestDecryptingRead_RangePastBlobEndFails(t *testing.T) {
+	ctx := context.Background()
+	fx := newEncFixture(t, patterned(9000), 10000)
+	opener, err := fx.backend.bodyOpener(ctx, fx.space, fx.body, false)
+	if err != nil {
+		t.Fatalf("bodyOpener: %v", err)
+	}
+	_, err = opener.OpenBlobRange(ctx, fx.space, fx.body.Blobs[0], 0, 9000)
+	if err == nil || !strings.Contains(err.Error(), "exceeds the 9000 bytes its ciphertext holds") {
+		t.Fatalf("OpenBlobRange err = %v, want a range-past-end error", err)
+	}
+}
+
+// spanReaderAt only serves in-order reads of an opened span, and reports a
+// span that ends early.
+func TestSpanReaderAt(t *testing.T) {
+	data := []byte("0123456789")
+
+	var unopened spanReaderAt
+	if _, err := unopened.ReadAt(make([]byte, 2), 0); err == nil {
+		t.Fatal("ReadAt before the span is fetched: want an error")
+	}
+
+	s := &spanReaderAt{span: bytes.NewReader(data), pos: 100}
+	buf := make([]byte, 4)
+	if n, err := s.ReadAt(buf, 100); err != nil || n != 4 || string(buf) != "0123" {
+		t.Fatalf("first ReadAt = %d, %v, %q", n, err, buf[:n])
+	}
+	if _, err := s.ReadAt(buf, 100); err == nil {
+		t.Fatal("ReadAt repeating an offset: want an error")
+	}
+	if _, err := s.ReadAt(buf, 105); err == nil {
+		t.Fatal("ReadAt skipping ahead: want an error")
+	}
+	if n, err := s.ReadAt(buf, 104); err != nil || n != 4 || string(buf) != "4567" {
+		t.Fatalf("second ReadAt = %d, %v, %q", n, err, buf[:n])
+	}
+	if n, err := s.ReadAt(buf, 108); !errors.Is(err, io.ErrUnexpectedEOF) || n != 2 {
+		t.Fatalf("ReadAt past the span's end = %d, %v, want 2, io.ErrUnexpectedEOF", n, err)
+	}
+}
+
+// trackingBlobs wraps a read store, counting the ranged fetches it opens and
+// how many are closed.
+type trackingBlobs struct {
+	blockstore.ReadStore
+	opened, closed int
+}
+
+func (t *trackingBlobs) OpenBlobRange(ctx context.Context, space did.DID, digest multihash.Multihash, start, end int64) (io.ReadCloser, error) {
+	rc, err := blockstore.OpenBlobRangeOf(ctx, t.ReadStore, space, digest, start, end)
+	if err != nil {
+		return nil, err
+	}
+	t.opened++
+	return struct {
+		io.Reader
+		io.Closer
+	}{rc, closerFunc(func() error { t.closed++; return rc.Close() })}, nil
+}
+
+type closerFunc func() error
+
+func (f closerFunc) Close() error { return f() }
+
+// Closing a decrypted range releases its ciphertext fetch.
+func TestDecryptingRead_CloseReleasesFetch(t *testing.T) {
+	ctx := context.Background()
+	fx := newEncFixture(t, patterned(9000), 10000)
+	tracked := &trackingBlobs{ReadStore: fx.backend.read}
+	fx.backend.read = tracked
+
+	opener, err := fx.backend.bodyOpener(ctx, fx.space, fx.body, false)
+	if err != nil {
+		t.Fatalf("bodyOpener: %v", err)
+	}
+	rc, err := opener.OpenBlobRange(ctx, fx.space, fx.body.Blobs[0], 100, 199)
+	if err != nil {
+		t.Fatalf("OpenBlobRange: %v", err)
+	}
+	got, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if !bytes.Equal(got, fx.plaintext[100:200]) {
+		t.Fatal("decrypted range does not match the plaintext")
+	}
+	if err := rc.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if tracked.opened != 1 || tracked.closed != 1 {
+		t.Fatalf("fetches opened %d, closed %d; want 1 and 1", tracked.opened, tracked.closed)
+	}
+}
