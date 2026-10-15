@@ -1599,21 +1599,28 @@ func (b *Backend) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.
 		return nil, err
 	}
 
-	// Resolve how each blob's bytes become plaintext — the plain opener for
-	// unencrypted blobs, the decrypting opener where an encryption row
-	// exists. Doing it here (not at first Read) fails a broken encrypted
-	// object as a request error, before response headers are written.
-	opener, err := b.bodyOpener(ctx, st.Space, mf.Body, mf.Plaintext)
+	// Resolve how each blob of the bytes read becomes plaintext — the plain
+	// opener for unencrypted blobs, the decrypting opener where an
+	// encryption row exists. Doing it here (not at first Read) fails a broken
+	// encrypted object as a request error, before response headers are
+	// written.
+	readStart, readEnd := int64(0), objSize-1
+	if isRange {
+		readStart, readEnd = startOffset, startOffset+length-1
+	}
+	opener, err := b.bodyOpener(ctx, st.Space, mf.Body, mf.Plaintext, readStart, readEnd)
 	if err != nil {
 		return nil, err
 	}
 
 	var contentRange *string
-	var body = msbucket.OpenBody(ctx, opener, st.Space, mf.Body)
+	var body io.ReadCloser
 	if isRange {
-		body = msbucket.OpenBodyRange(ctx, opener, st.Space, mf.Body, startOffset, startOffset+length-1)
+		body = msbucket.OpenBodyRange(ctx, opener, st.Space, mf.Body, readStart, readEnd)
 		cr := fmt.Sprintf("bytes %d-%d/%d", startOffset, startOffset+length-1, objSize)
 		contentRange = &cr
+	} else {
+		body = msbucket.OpenBody(ctx, opener, st.Space, mf.Body)
 	}
 
 	// x-amz-object-lock-* headers and the tag count of the resolved version

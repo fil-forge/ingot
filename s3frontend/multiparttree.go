@@ -170,25 +170,13 @@ func (b *Backend) multipartTree(ctx context.Context, space did.DID, plaintext bo
 	return obj, nil
 }
 
-// bodySource re-reads a completing body's plaintext for the tree, through
-// one opener built on first use and shared by every range.
+// bodySource re-reads a completing body's plaintext for the tree. Each range
+// gets its own opener, which prefetches only the blobs that range reads.
 type bodySource struct {
 	b         *Backend
 	space     did.DID
 	body      msbucket.Body
 	plaintext bool
-	opened    msbucket.BlobRangeOpener
-}
-
-func (s *bodySource) opener(ctx context.Context) (msbucket.BlobRangeOpener, error) {
-	if s.opened == nil {
-		o, err := s.b.bodyOpener(ctx, s.space, s.body, s.plaintext)
-		if err != nil {
-			return nil, err
-		}
-		s.opened = o
-	}
-	return s.opened, nil
 }
 
 // rehash hashes the body's bytes [start, end) at their offset.
@@ -198,7 +186,7 @@ func (s *bodySource) rehash(ctx context.Context, start, end int64) (blake3tree.R
 		return blake3tree.Range{}, err
 	}
 	if end > start {
-		opener, err := s.opener(ctx)
+		opener, err := s.b.bodyOpener(ctx, s.space, s.body, s.plaintext, start, end-1)
 		if err != nil {
 			return blake3tree.Range{}, err
 		}

@@ -390,6 +390,33 @@ func TestPostgresStores_Live(t *testing.T) {
 		}
 	})
 
+	t.Run("locations batch", func(t *testing.T) {
+		// Only the space's own rows come back, keyed by digest; a digest
+		// without a row is simply absent.
+		space, other := testutil.RandomDID(t), testutil.RandomDID(t)
+		a, b, missing := []byte{0x00, 0x0a}, []byte{0xff, 0x0b}, []byte{0x0c}
+		for _, loc := range []registry.BlobLocation{
+			{Space: space, Digest: a, Provider: "did:piri", URL: "http://piri/a", Size: 10},
+			{Space: space, Digest: b, Provider: "did:piri", URL: "http://piri/b", Size: 20},
+			{Space: other, Digest: missing, Provider: "did:piri", URL: "http://piri/c", Size: 30},
+		} {
+			if err := r.PutLocation(ctx, loc); err != nil {
+				t.Fatalf("PutLocation: %v", err)
+			}
+		}
+		got, err := r.GetLocations(ctx, space, []multihash.Multihash{a, b, missing})
+		if err != nil {
+			t.Fatalf("GetLocations: %v", err)
+		}
+		if len(got) != 2 || got[string(a)].URL != "http://piri/a" || got[string(b)].Size != 20 ||
+			!bytes.Equal(got[string(b)].Digest, b) || got[string(a)].Space != space {
+			t.Fatalf("GetLocations = %+v", got)
+		}
+		if empty, err := r.GetLocations(ctx, space, nil); err != nil || len(empty) != 0 {
+			t.Fatalf("GetLocations(nil) = %+v, %v", empty, err)
+		}
+	})
+
 	// liveFEEParams is a complete parameter set whose bytea values carry
 	// embedded NULs and high bytes, to exercise real byte round-trips.
 	liveFEEParams := func(space did.DID, d []byte) registry.BlobEncryptionParams {
@@ -416,6 +443,33 @@ func TestPostgresStores_Live(t *testing.T) {
 		}
 		if !reflect.DeepEqual(*got, want) {
 			t.Fatalf("GetEncryptionParams = %+v, want %+v", *got, want)
+		}
+	})
+
+	t.Run("encryption params batch", func(t *testing.T) {
+		space, other := testutil.RandomDID(t), testutil.RandomDID(t)
+		a, b, missing := []byte{0x00, 0x1a}, []byte{0xff, 0x1b}, []byte{0x1c}
+		for _, p := range []registry.BlobEncryptionParams{
+			liveFEEParams(space, a), liveFEEParams(space, b), liveFEEParams(other, missing),
+		} {
+			if err := r.PutEncryptionParams(ctx, p); err != nil {
+				t.Fatalf("PutEncryptionParams: %v", err)
+			}
+		}
+		got, err := r.GetEncryptionParamsBatch(ctx, space, []multihash.Multihash{a, b, missing})
+		if err != nil {
+			t.Fatalf("GetEncryptionParamsBatch: %v", err)
+		}
+		if len(got) != 2 {
+			t.Fatalf("GetEncryptionParamsBatch returned %d rows, want 2", len(got))
+		}
+		for _, d := range [][]byte{a, b} {
+			if want := liveFEEParams(space, d); !reflect.DeepEqual(got[string(d)], want) {
+				t.Fatalf("row %x = %+v, want %+v", d, got[string(d)], want)
+			}
+		}
+		if empty, err := r.GetEncryptionParamsBatch(ctx, space, nil); err != nil || len(empty) != 0 {
+			t.Fatalf("GetEncryptionParamsBatch(nil) = %+v, %v", empty, err)
 		}
 	})
 
