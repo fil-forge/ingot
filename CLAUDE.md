@@ -341,6 +341,28 @@ it. CI checkouts and the Docker build context don't contain the parent `go.work`
 `go.mod`. Only *local* `go`/`goreleaser` runs need it; to release from a
 workspace checkout: `GOWORK=off goreleaser release --clean`.
 
+## Observability
+
+When a change adds or alters behavior someone depends on, decide how on-call
+would see it working and see it fail, and add that in the same PR where it is
+useful. Skip it for changes nothing operational depends on. Ingot runs on the
+appliances, whose traces, metrics and container logs ship to Grafana
+(fil-forge/infra-nodes, `docs/observability.md`).
+
+- **Metrics.** Create instruments on the global meter provider, as the
+  `ingot.local_blobs.*` ones are (see `internal/tracing` above). Prefer a
+  signal that answers "is this working?", such as a failure count or a stalled
+  amount, over one that only measures volume, and keep attributes
+  low-cardinality: no keys, CIDs or bucket names. List each new metric in the
+  README's metrics table.
+- **Traces.** New work runs inside the request's span or a sweep's root span;
+  a new outbound HTTP client uses `tracing.NewHTTPClient()`.
+- **Alerts and dashboard panels** live in fil-forge/infra-central, under
+  `terraform/envs/grafana/`: the Forge Regions rule groups (which already read
+  `ingot_local_blobs_*`) and the `forge-regions` dashboard. Its `AGENTS.md`
+  says how to add them. Open a companion PR there, or say in this PR that one
+  is needed.
+
 ## Conventions & gotchas
 
 - **`GOWORK=off` for every *local* go command** (build/test/vet/run/tidy). The
