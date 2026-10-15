@@ -346,22 +346,24 @@ workspace checkout: `GOWORK=off goreleaser release --clean`.
 When a change adds or alters behavior someone depends on, decide how on-call
 would see it working and see it fail, and add that in the same PR where it is
 useful. Skip it for changes nothing operational depends on. Ingot runs on the
-appliances, whose traces, metrics and container logs ship to Grafana
-(fil-forge/infra-nodes, `docs/observability.md`).
+appliances, where it pushes traces and metrics over OTLP to Alloy (compose sets
+`OTEL_EXPORTER_OTLP_ENDPOINT`) and its container logs ship too; infra-central's
+alert rules and `forge-regions` dashboard already read `ingot_local_blobs_*`.
 
-- **Metrics.** Create instruments on the global meter provider, as the
-  `ingot.local_blobs.*` ones are (see `internal/tracing` above). Prefer a
-  signal that answers "is this working?", such as a failure count or a stalled
-  amount, over one that only measures volume, and keep attributes
-  low-cardinality: no keys, CIDs or bucket names. List each new metric in the
-  README's metrics table.
+- **Metrics.** Create instruments through an injectable `MeterProvider` that
+  defaults to the global one, as `ingot.local_blobs.*` do
+  (`s3frontend.Deps.MeterProvider`). Prefer a signal that answers "is this
+  working?", such as a failure count or a stalled amount, over one that only
+  measures volume, and keep attributes low-cardinality: no keys, CIDs or
+  bucket names. List each new metric in a metrics table in the README: the
+  local blob one, or a new one beside it.
 - **Traces.** New work runs inside the request's span or a sweep's root span;
   a new outbound HTTP client uses `tracing.NewHTTPClient()`.
 - **Alerts and dashboard panels** live in fil-forge/infra-central, under
-  `terraform/envs/grafana/`: the Forge Regions rule groups (which already read
-  `ingot_local_blobs_*`) and the `forge-regions` dashboard. Its `AGENTS.md`
-  says how to add them. Open a companion PR there, or say in this PR that one
-  is needed.
+  `terraform/envs/grafana/`: the Forge Regions rule groups (the main Forge
+  Regions group holds the two Ingot rules today) and the `forge-regions`
+  dashboard. Its `AGENTS.md` says how to add them. Open a companion PR there,
+  or say in this PR that one is needed.
 
 ## Conventions & gotchas
 
