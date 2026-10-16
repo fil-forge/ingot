@@ -27,20 +27,6 @@ const borrowTTL = time.Hour
 // most reads cost a lookup rather than a proof check and a write.
 const recaptureEvery = time.Minute
 
-// dropper is a proof store that can report having been dropped for a
-// revocation (iam.DelegationCache).
-type dropper interface {
-	Dropped() bool
-}
-
-// usable reports whether store may be held past its request: one that can
-// report a revocation's drop and hasn't been dropped. A store that can't
-// report it is never held.
-func usable(store ucanlib.ProofStore) bool {
-	d, ok := store.(dropper)
-	return ok && !d.Dropped()
-}
-
 // Authority holds, for each space, the proof store of the latest request that
 // read in it, so a walk can read that space's catalog from Forge for up to
 // borrowTTL afterwards. It takes only a store the IAM service marked
@@ -72,11 +58,8 @@ func NewAuthority(agent did.DID) *Authority {
 // job's, a walk's own) is ignored, and so is a store that can't prove
 // retrieval in space.
 func (a *Authority) Capture(ctx context.Context, space did.DID) {
-	if !reqscope.Borrowable(ctx) {
-		return
-	}
-	store, ok := reqscope.ProofStore(ctx)
-	if !ok || store == nil || !usable(store) {
+	store, ok := reqscope.BorrowableProofStore(ctx)
+	if !ok {
 		return
 	}
 	key, now := space.String(), a.now()
@@ -151,5 +134,5 @@ func (a *Authority) Prune() {
 // lendable reports whether b was captured within borrowTTL and its store
 // hasn't been dropped since.
 func (a *Authority) lendable(b borrowed) bool {
-	return a.now().Sub(b.at) < borrowTTL && usable(b.store)
+	return a.now().Sub(b.at) < borrowTTL && reqscope.StillBorrowable(b.store)
 }

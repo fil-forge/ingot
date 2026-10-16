@@ -58,6 +58,34 @@ func Borrowable(ctx context.Context) bool {
 	return b
 }
 
+// dropper is a proof store that can report having been dropped because a
+// delegation in it was revoked (iam.DelegationCache).
+type dropper interface {
+	Dropped() bool
+}
+
+// BorrowableProofStore returns the request's proof store if background work
+// may hold it past the request: the request is marked borrowable and its
+// store passes StillBorrowable. ok is false otherwise.
+func BorrowableProofStore(ctx context.Context) (ucanlib.ProofStore, bool) {
+	if !Borrowable(ctx) {
+		return nil, false
+	}
+	store, ok := ProofStore(ctx)
+	if !ok || !StillBorrowable(store) {
+		return nil, false
+	}
+	return store, true
+}
+
+// StillBorrowable reports whether a store borrowed from a request may still
+// be used: it can report being dropped for a revocation and hasn't been. A
+// store that can't report it is never borrowed.
+func StillBorrowable(store ucanlib.ProofStore) bool {
+	d, ok := store.(dropper)
+	return ok && !d.Dropped()
+}
+
 type requestContextKey struct{}
 
 var requestKey any = requestContextKey{}

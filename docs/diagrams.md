@@ -299,7 +299,7 @@ sequenceDiagram
             B->>B: BlobCache.Take: the file moves from the spool to the cache
         end
     end
-    Note over B,U: UploadBlob also captures the request proof store as the<br/>space's ship authority (captureShipProofs, 1h TTL)
+    Note over B,U: UploadBlob also captures the request proof store, if borrowable,<br/>as the space's ship authority (captureShipProofs, 1h TTL)
     Note over B,L: under the per-bucket lock: commitVersion via Coordinator.WithTx
     B->>TX: Begin (lock, snapshot root)
     TX->>R: AllocVersionSeq
@@ -822,7 +822,7 @@ flowchart TB
 
     kp -->|"reqscope.ProofStore<br/>on the request ctx"| writes["uploader:<br/>/blob/add, abort, remove, /index/add<br/>/upload/add, /upload/remove"]
     kp -->|"same store"| reads["blockstore.Forge:<br/>content/retrieve"]
-    kp -->|"captureShipProofs<br/>at UploadBlob"| ship
+    kp -->|"captureShipProofs on writes,<br/>borrowable stores only"| ship
     ship --> async["async catalog ship;<br/>sweeper and DeleteBucket aborts"]
     kp -->|"Capture on every read in a space<br/>(Layered.OnRead), borrowable stores only"| walk
     walk --> walker["catalog walker:<br/>content/retrieve of the bucket's catalog"]
@@ -838,17 +838,21 @@ flowchart TB
   account is disabled, so no access-key auth path skips the hilt-backed IAM
   lookup. `/health` and the DID document are outside the S3 auth chain, and a
   rejected access key never receives one.
-- A bucket whose last write is more than an hour old has an expired ship
-  authority; a newly sealed segment then waits for the bucket's next write to
-  re-capture it.
-- The catalog walker borrows read authority the same way, from any request's
-  reads in the space (hilt grants `/content/retrieve` with every catalog
-  write as well as every read and list). It takes only a store the IAM layer
-  marked `reqscope.Borrowable`, the key's own `DelegationCache`, and only one
-  that proves `/content/retrieve` on the space to the agent. A revocation
-  that drops the key's store marks it `Dropped`, and a dropped store is
-  neither taken nor lent. A request authorized off a response carrying a
-  revoked delegation spends a store of its own, which is not marked.
+- The uploader's ship authority and the catalog walker hold a request's
+  store past the request under the same rules
+  (`reqscope.BorrowableProofStore`): only a store the IAM layer marked
+  `reqscope.Borrowable`, the key's own `DelegationCache`, is taken. A
+  revocation that drops the key's store marks it `Dropped`, and a dropped
+  store is neither taken nor used (`reqscope.StillBorrowable`). A request
+  authorized off a response carrying a revoked delegation spends a store of
+  its own, which is not marked.
+- A bucket whose last write is more than an hour old, or whose captured
+  store a revocation has dropped, has no ship authority; a newly sealed
+  segment then waits for the bucket's next write to re-capture it.
+- The catalog walker borrows read authority from any request's reads in the
+  space (hilt grants `/content/retrieve` with every catalog write as well as
+  every read and list), and only a store that proves `/content/retrieve` on
+  the space to the agent.
 - Each access key gets its own `DelegationCache`, so a proof chain can never
   assemble across keys.
 - The same store holds the effective S3 action set hilt reported for the key
