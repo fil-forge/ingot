@@ -163,9 +163,12 @@ a pass takes the upload's parked parts in part order up to 1000 blobs,
 concludes them, and moves them to `accepted`, and the acceptor exits when a
 pass finds nothing. Parts that land during a pass are taken by the next one.
 A failed pass leaves its parts parked and retries after a backoff (1 s,
-doubling to 30 s). The acceptor stops for a session that is no longer open
-or completing. A part whose blob has neither a park nor a location goes back
-to `spooled`, which is Complete's to finish. At start and every 30 s the
+doubling to 30 s); a pass that runs past `acceptPassTimeout` (2 min) fails
+the same way, since the Forge client sets no timeout of its own. The
+acceptor stops for a session that is no longer open or completing. It never
+takes a blob over from its release: a part holding a blob with a release
+record (started or not), or one with neither a park nor a location, goes
+back to `spooled`, which is Complete's to finish. At start and every 30 s the
 accept sweeper nudges the acceptor of every open or completing upload with
 parked parts, so work a stopped process left, or a nudge that went missing,
 is picked up.
@@ -183,8 +186,10 @@ only what is still parked and session expiry never aborts a blob that was
 accepted.
 
 A blob's acceptance is recorded by swapping its park row for its location
-row in one transaction, and only while the park row stands, under the
-blob's in-process write lock. An abort, a session expiry or a part re-upload
+row in one transaction, and only while the park row the conclude started
+from stands (matched by its `/blob/add` task), under the blob's in-process
+write lock. A park of the same bytes recorded since by another write names
+another allocation, and stays for its own conclude. An abort, a session expiry or a part re-upload
 can release a blob while it is being concluded, and the provider settles the
 order: a released allocation refuses the accept, and an accepted blob
 refuses the abort, so the release removes it instead. The release drops the
@@ -201,8 +206,10 @@ new parts, and waits for the upload's acceptor to finish, up to 30 s
 reads the parts it was asked to commit. A `spooled` part is concluded, or
 uploaded from its spool copy if it never parked, by Complete itself. A part
 still `parked` means the acceptor is behind or failing, and Complete answers
-OperationAborted, a retryable 409; the latch reverts to `open` and the
-acceptor carries on. Complete lays out the object's byte ranges from the
+OperationAborted, a 409; the latch reverts to `open` and the acceptor
+carries on. The AWS CLI and other botocore-based clients treat that 409 as
+final and abort the upload, so the 30 s wait is the margin before a client
+sees a failed upload. Complete lays out the object's byte ranges from the
 part rows' blob lengths and claims every blob in one transaction of four
 statements, however many blobs there are (`AddBlobClaims`).
 

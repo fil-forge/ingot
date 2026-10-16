@@ -414,8 +414,8 @@ func TestReCompleteAfterOverwriteReplaysCommittedResult(t *testing.T) {
 }
 
 // TestCompleteWaitBudgetIsOperationAborted: a latch loser whose wait for the
-// winner runs out reports OperationAborted (a retryable 409), not
-// NoSuchUpload — the session exists and is merely slow.
+// winner runs out reports OperationAborted (a 409), not NoSuchUpload — the
+// session exists and is merely slow.
 func TestCompleteWaitBudgetIsOperationAborted(t *testing.T) {
 	b, mem, _ := newRefTestBackend(t)
 	key := "slow-winner"
@@ -713,13 +713,13 @@ type failOnceConcludePark struct {
 	refused multihash.Multihash
 }
 
-func (f *failOnceConcludePark) ConcludePark(ctx context.Context, loc registry.BlobLocation) (bool, error) {
+func (f *failOnceConcludePark) ConcludePark(ctx context.Context, loc registry.BlobLocation, addTask []byte) (bool, error) {
 	if f.armed {
 		f.armed = false
 		f.refused = loc.Digest
 		return false, errors.New("parks table unavailable")
 	}
-	return f.ParkStore.ConcludePark(ctx, loc)
+	return f.ParkStore.ConcludePark(ctx, loc, addTask)
 }
 
 // TestCompleteRecordsEveryAcceptanceWhenOneFailsToPersist: the upload
@@ -924,8 +924,14 @@ func plantStaleAcceptedPark(t *testing.T, mem *inmem.MemStore, uploadID string) 
 			if err := mem.PutLocation(ctx, loc); err != nil {
 				t.Fatalf("PutLocation: %v", err)
 			}
-		} else if swapped, err := mem.ConcludePark(ctx, loc); err != nil || !swapped {
-			t.Fatalf("ConcludePark = %v, %v", swapped, err)
+		} else {
+			park, err := mem.GetPark(ctx, sess.Space, d)
+			if err != nil {
+				t.Fatalf("GetPark: %v", err)
+			}
+			if swapped, err := mem.ConcludePark(ctx, loc, park.AddTask); err != nil || !swapped {
+				t.Fatalf("ConcludePark = %v, %v", swapped, err)
+			}
 		}
 		if err := mem.SetIntentState(ctx, sess.Space, d, registry.IntentAccepted); err != nil {
 			t.Fatalf("SetIntentState: %v", err)
@@ -1995,8 +2001,8 @@ type hookAfterParkConcludes struct {
 	hook func()
 }
 
-func (h *hookAfterParkConcludes) ConcludePark(ctx context.Context, loc registry.BlobLocation) (bool, error) {
-	swapped, err := h.ParkStore.ConcludePark(ctx, loc)
+func (h *hookAfterParkConcludes) ConcludePark(ctx context.Context, loc registry.BlobLocation, addTask []byte) (bool, error) {
+	swapped, err := h.ParkStore.ConcludePark(ctx, loc, addTask)
 	h.n--
 	if h.n == 0 && h.hook != nil {
 		hook := h.hook

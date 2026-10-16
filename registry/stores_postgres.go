@@ -900,14 +900,14 @@ func (r *Postgres) DeletePark(ctx context.Context, space did.DID, digest multiha
 	return nil
 }
 
-func (r *Postgres) ConcludePark(ctx context.Context, loc BlobLocation) (bool, error) {
+func (r *Postgres) ConcludePark(ctx context.Context, loc BlobLocation, addTask []byte) (bool, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return false, fmt.Errorf("registry: conclude park: begin: %w", err)
 	}
 	defer tx.Rollback(ctx)
 	tag, err := tx.Exec(ctx,
-		`DELETE FROM ingot.blob_parks WHERE space = $1 AND digest = $2`, loc.Space, loc.Digest)
+		`DELETE FROM ingot.blob_parks WHERE space = $1 AND digest = $2 AND add_task = $3`, loc.Space, loc.Digest, addTask)
 	if err != nil {
 		return false, fmt.Errorf("registry: conclude park: delete park: %w", err)
 	}
@@ -1705,6 +1705,31 @@ func (r *Postgres) StartRelease(ctx context.Context, space did.DID, digest multi
 		return 0, fmt.Errorf("registry: commit start release: %w", err)
 	}
 	return ReleaseStarted, nil
+}
+
+func (r *Postgres) ReleasingDigests(ctx context.Context, space did.DID, digests []multihash.Multihash) (map[string]bool, error) {
+	out := map[string]bool{}
+	if len(digests) == 0 {
+		return out, nil
+	}
+	raw := make([][]byte, len(digests))
+	for i, d := range digests {
+		raw[i] = d
+	}
+	rows, err := r.pool.Query(ctx,
+		`SELECT digest FROM ingot.blob_release_intents WHERE space = $1 AND digest = ANY($2::bytea[])`,
+		space, raw)
+	if err != nil {
+		return nil, fmt.Errorf("registry: releasing digests: %w", err)
+	}
+	found, err := pgx.CollectRows(rows, pgx.RowTo[[]byte])
+	if err != nil {
+		return nil, fmt.Errorf("registry: releasing digests: %w", err)
+	}
+	for _, d := range found {
+		out[string(d)] = true
+	}
+	return out, nil
 }
 
 func (r *Postgres) CancelRelease(ctx context.Context, space did.DID, digest multihash.Multihash) (ReleaseCancel, error) {

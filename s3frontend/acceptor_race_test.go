@@ -1,6 +1,7 @@
 package s3frontend
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/versitygw/backend"
+	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
 
 	"github.com/fil-forge/ingot/inmem"
@@ -276,5 +278,134 @@ func TestAcceptorsShareAPark(t *testing.T) {
 	assertAcceptedAndUnparked(t, mem, d)
 	if n := rm.removedDigests()[string(d)]; n != 0 {
 		t.Fatalf("shared blob %s removed %d times, want never", d, n)
+	}
+}
+
+// TestAcceptorLeavesAReplacementPark: the provider accepts a part's blob, an
+// abort removes it, and another write of the same bytes parks them again
+// under its own allocation before the acceptor records the accept. The
+// acceptor's record names the allocation it concluded, so the replacement
+// park stays for its own conclude and no location is written: the
+// replacement's allocation was never accepted, and the bytes the old
+// location would name are being removed.
+func TestAcceptorLeavesAReplacementPark(t *testing.T) {
+	shrinkAcceptBackoff(t)
+	pc := &providerConcluder{}
+	rm := &recordingRemover{}
+	b, mem := newDeferredBackend(t, pc, func(d *Deps) { d.Remover = rm })
+	ctx := context.Background()
+	bucket, key := "bk", "race-replacement-park"
+	uploadID := mpCreate(t, b, key, "", "")
+	uploadDistinctParts(t, b, key, uploadID, 1)
+	d := hygienePartDigests(t, mem, uploadID, 1)[0]
+
+	h, err := multihash.Sum([]byte("replacement allocation"), multihash.SHA2_256, -1)
+	if err != nil {
+		t.Fatalf("multihash: %v", err)
+	}
+	replacement := cid.NewCidV1(cid.Raw, h)
+	pc.after = func() {
+		if err := b.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{Bucket: &bucket, Key: &key, UploadId: &uploadID}); err != nil {
+			t.Errorf("Abort: %v", err)
+		}
+		if ok, err := mem.PutPark(ctx, registry.BlobPark{Space: did.Undef, Digest: d, AddTask: replacement.Bytes(), AcceptTask: replacement.Bytes(), PutInvocation: []byte{1}, Size: 1}); err != nil || !ok {
+			t.Errorf("PutPark (replacement) = %v, %v", ok, err)
+		}
+	}
+
+	startAcceptors(t, b)
+	drainUntilIdle(t, b, uploadID)
+
+	park, err := mem.GetPark(ctx, did.Undef, d)
+	if err != nil {
+		t.Fatalf("replacement park consumed by a stale conclude: %v", err)
+	}
+	if !bytes.Equal(park.AddTask, replacement.Bytes()) {
+		t.Fatalf("park add task = %x, want the replacement's", park.AddTask)
+	}
+	if loc, err := mem.GetLocation(ctx, did.Undef, d); !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("stale conclude wrote a location for the replacement's bytes: %+v (err=%v)", loc, err)
+	}
+	if n := rm.removedDigests()[string(d)]; n != 1 {
+		t.Fatalf("accepted blob %s removed %d times, want once", d, n)
+	}
+}
+
+// TestAcceptorLeavesAReleasingBlobForComplete: a parked part whose blob has a
+// release record pending (the same bytes stored as received by an object
+// whose delete is behind its reader grace) is not the acceptor's to take
+// over. The record stays, the part goes back to spooled, and Complete settles
+// it the way every committing write does.
+func TestAcceptorLeavesAReleasingBlobForComplete(t *testing.T) {
+	cc := &countingConcluder{}
+	b, mem := newDeferredBackend(t, cc)
+	ctx := context.Background()
+	key := "accept-releasing"
+	uploadID := mpCreate(t, b, key, "", "")
+	parts := uploadDistinctParts(t, b, key, uploadID, 1)
+	d := hygienePartDigests(t, mem, uploadID, 1)[0]
+	if err := mem.EnqueueRelease(ctx, did.Undef, d, time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("EnqueueRelease: %v", err)
+	}
+
+	startAcceptors(t, b)
+	if err := b.drainAcceptor(ctx, uploadID); err != nil {
+		t.Fatalf("drainAcceptor: %v", err)
+	}
+	if got, err := mem.ReleasingDigests(ctx, did.Undef, []multihash.Multihash{d}); err != nil || !got[string(d)] {
+		t.Fatalf("release record after the acceptor's pass = %v, %v; want it kept", got, err)
+	}
+	if states := partStates(t, mem, uploadID); states[1] != registry.PartSpooled {
+		t.Fatalf("part state = %q, want spooled", states[1])
+	}
+	if got := cc.concluded(); len(got) != 0 {
+		t.Fatalf("conclude calls = %v, want none", got)
+	}
+
+	if _, err := mpComplete(t, b, key, uploadID, parts, nil); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	assertAcceptedAndUnparked(t, mem, d)
+}
+
+// TestAcceptorRacesASupersedesRelease: a part is uploaded again, and the
+// acceptor makes a pass after the new upload has recorded the old blob's
+// release and before its part row lands. The acceptor leaves the old blob to
+// that release, which then aborts it: taking the record over would accept a
+// blob no part or object names any more, and nothing would release it.
+func TestAcceptorRacesASupersedesRelease(t *testing.T) {
+	pc := &providerConcluder{}
+	store := &teardownBeforePutPart{}
+	b, mem := newDeferredBackend(t, pc, func(d *Deps) {
+		store.MultipartStore = d.Multipart
+		d.Multipart = store
+	})
+	ctx := context.Background()
+	key := "race-supersede-release"
+	uploadID := mpCreate(t, b, key, "", "")
+	uploadDistinctParts(t, b, key, uploadID, 1)
+	old := hygienePartDigests(t, mem, uploadID, 1)[0]
+
+	startAcceptors(t, b)
+	store.hook = func() {
+		if err := b.drainAcceptor(ctx, uploadID); err != nil {
+			t.Errorf("drainAcceptor: %v", err)
+		}
+	}
+	replacement := testBody(int(backend.MinPartSize))
+	replacement[0] = 0xee
+	if _, err := mpUploadPart(t, b, key, uploadID, 1, replacement, nil); err != nil {
+		t.Fatalf("superseding UploadPart: %v", err)
+	}
+	if store.hook != nil {
+		t.Fatal("the hook never ran")
+	}
+
+	assertGone(t, mem, old)
+	if !pc.abortedDigests()[string(old)] {
+		t.Fatalf("superseded blob %s was not aborted", old)
+	}
+	if got, _ := mem.ReleasingDigests(ctx, did.Undef, []multihash.Multihash{old}); got[string(old)] {
+		t.Fatalf("release record for %s left behind", old)
 	}
 }

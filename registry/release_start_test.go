@@ -297,6 +297,33 @@ func runReleaseStartSuite(t *testing.T, st releaseStartStore) {
 		}
 	})
 
+	t.Run("releasing digests reports records without touching them", func(t *testing.T) {
+		pending := enqueue("releasing-pending")
+		running := enqueue("releasing-started")
+		if s, err := st.StartRelease(ctx, space, running); err != nil || s != registry.ReleaseStarted {
+			t.Fatalf("StartRelease = %v, %v", s, err)
+		}
+		none := evictDigest(t, "start:releasing-none")
+		got, err := st.ReleasingDigests(ctx, space, []multihash.Multihash{pending, running, none})
+		if err != nil {
+			t.Fatalf("ReleasingDigests: %v", err)
+		}
+		if !got[string(pending)] || !got[string(running)] || got[string(none)] || len(got) != 2 {
+			t.Fatalf("ReleasingDigests = %v; want the pending and started records only", got)
+		}
+		// Another space's records are not this space's.
+		if other, err := st.ReleasingDigests(ctx, testutil.RandomDID(t), []multihash.Multihash{pending}); err != nil || len(other) != 0 {
+			t.Fatalf("ReleasingDigests in another space = %v, %v; want none", other, err)
+		}
+		// The pending record is still there to start.
+		if s, err := st.StartRelease(ctx, space, pending); err != nil || s != registry.ReleaseStarted {
+			t.Fatalf("StartRelease after ReleasingDigests = %v, %v; want started", s, err)
+		}
+		for _, d := range []multihash.Multihash{pending, running} {
+			_ = st.DeleteRelease(ctx, space, d)
+		}
+	})
+
 	t.Run("a generation's claims need every location, publish the intents, and repeat digests", func(t *testing.T) {
 		located := evictDigest(t, "start:batch-located")
 		unlocated := evictDigest(t, "start:batch-unlocated")

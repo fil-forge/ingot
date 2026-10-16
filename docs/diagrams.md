@@ -527,7 +527,7 @@ sequenceDiagram
     loop while a pass finds parked parts
         A->>R: GetSession (stop unless open or completing)#59; ListParkedParts
         A->>U: acceptParked: up to 1000 blobs' put receipts in one /ucan/conclude,<br/>accept receipts read from the response (poll only as fallback)
-        A->>R: per blob, under its write lock: ConcludePark (park swapped for the<br/>location, only while the park stands) + intent accepted
+        A->>R: per blob, under its write lock: ConcludePark (park swapped for the<br/>location, only while the concluded park, by AddTask, stands) + intent accepted
         A->>R: MoveParts(parked to accepted)
     end
     Note over A,R: a failed pass backs off (1 s to 30 s) and retries#59; the accept sweeper<br/>nudges every live upload with parked parts at start and every 30 s
@@ -565,7 +565,12 @@ sequenceDiagram
 - A release can take a blob while the acceptor concludes it. The provider
   refuses whichever of accept and abort comes second, and the release drops
   the park row before anything else, so `ConcludePark` finds no park and the
-  acceptor records nothing for a blob a release took.
+  acceptor records nothing for a blob a release took. `ConcludePark`
+  matches the park's `/blob/add` task, so a later park of the same bytes
+  stays for its own conclude.
+- The acceptor never cancels a release record (`ReleasingDigests`, read
+  only); a part holding such a blob goes back to `spooled` for Complete.
+  Each pass runs under `acceptPassTimeout`.
 - A part is written only while its session is open, in the statement that
   checks the state; a teardown that took the session refuses it, and the
   upload records releases for the blobs it had spooled.
@@ -594,7 +599,7 @@ stateDiagram-v2
     [*] --> spooled : PutPart (UploadPart, before its blobs park)
     spooled --> parked : every blob parked or located (MoveParts, then nudge)
     parked --> accepted : acceptor pass concludes and records the blobs
-    parked --> spooled : acceptor finds a blob with neither park nor location
+    parked --> spooled : acceptor finds a blob with a release record, or neither park nor location
     spooled --> accepted : Complete finishes it (conclude, or upload from the spool)
     parked --> accepted : Complete, when no acceptors run
     spooled --> [*] : a later UploadPart of the same number replaces the row
@@ -606,7 +611,7 @@ stateDiagram-v2
   blobs, or died doing so. The acceptor never takes it; Complete does.
 - Complete requires every part it names to be `accepted` before the commit:
   it waits for the acceptor, finishes `spooled` parts itself, and answers a
-  part still `parked` with a retryable 409.
+  part still `parked` with a 409 that botocore clients treat as final.
 - Rows from before migration 00030 are `parked` or `accepted` and have no
   `blob_sizes`; Complete derives their lengths per blob.
 
@@ -636,8 +641,8 @@ stateDiagram-v2
 - A Complete that loses the latch waits (bounded) for the winner's terminal
   state: `completed` replays the ETag and version id the winner recorded on
   the session; `aborting` or a vanished row is `NoSuchUpload`; a winner still
-  running past the wait budget is `OperationAborted`, which the client
-  retries.
+  running past the wait budget is `OperationAborted`, a 409 the AWS CLI
+  and other botocore clients treat as final.
 - `ListParts` and `Abort` reject any non-`open` session as `NoSuchUpload`;
   `Complete` alone accepts `completed`, for idempotency.
 - The sweeper also reaps rows stuck in `completing` or `aborting` past the

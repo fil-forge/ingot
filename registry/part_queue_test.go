@@ -171,7 +171,7 @@ func runPartQueueSuite(t *testing.T, st partQueueStore) {
 	t.Run("a park is swapped for its location only while it stands", func(t *testing.T) {
 		digest := multihash.Multihash{0xf1, 0x01}
 		loc := registry.BlobLocation{Space: space, Digest: digest, Provider: "did:web:piri", URL: "https://piri/blob", Size: 7}
-		if swapped, err := st.ConcludePark(ctx, loc); err != nil || swapped {
+		if swapped, err := st.ConcludePark(ctx, loc, []byte{1}); err != nil || swapped {
 			t.Fatalf("ConcludePark without a park = %v, %v; want false", swapped, err)
 		}
 		if _, err := st.GetLocation(ctx, space, digest); !errors.Is(err, registry.ErrNotFound) {
@@ -181,7 +181,15 @@ func runPartQueueSuite(t *testing.T, st partQueueStore) {
 		if ok, err := st.PutPark(ctx, park); err != nil || !ok {
 			t.Fatalf("PutPark = %v, %v", ok, err)
 		}
-		if swapped, err := st.ConcludePark(ctx, loc); err != nil || !swapped {
+		// A conclude of another allocation of the same bytes leaves the
+		// park, which is not the one it accepted.
+		if swapped, err := st.ConcludePark(ctx, loc, []byte{9}); err != nil || swapped {
+			t.Fatalf("ConcludePark of another add task = %v, %v; want false", swapped, err)
+		}
+		if _, err := st.GetLocation(ctx, space, digest); !errors.Is(err, registry.ErrNotFound) {
+			t.Fatalf("location written for another add task's conclude: %v", err)
+		}
+		if swapped, err := st.ConcludePark(ctx, loc, []byte{1}); err != nil || !swapped {
 			t.Fatalf("ConcludePark = %v, %v; want true", swapped, err)
 		}
 		if _, err := st.GetPark(ctx, space, digest); !errors.Is(err, registry.ErrNotFound) {
@@ -190,7 +198,7 @@ func runPartQueueSuite(t *testing.T, st partQueueStore) {
 		if got, err := st.GetLocation(ctx, space, digest); err != nil || got.URL != loc.URL {
 			t.Fatalf("location after the swap = %+v, %v", got, err)
 		}
-		if swapped, err := st.ConcludePark(ctx, loc); err != nil || swapped {
+		if swapped, err := st.ConcludePark(ctx, loc, []byte{1}); err != nil || swapped {
 			t.Fatalf("second ConcludePark = %v, %v; want false", swapped, err)
 		}
 		_ = st.DeleteLocation(ctx, space, digest)
