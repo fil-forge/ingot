@@ -167,10 +167,10 @@ A cached copy is not needed, so it goes:
   provider's copy, so a GET still streaming the old object once the grace
   has passed fails when it reaches a blob it has not yet opened:
   `release_grace` bounds how long such a read may take;
-- with `local_blob_max_bytes` set, when a sweeper, checking every 30 seconds,
-  finds the two directories over the budget and evicts cached bodies, oldest
-  first, down to 90% of the budget. Later reads of an evicted body go to the
-  provider and take provider-read latency.
+- with a nonzero `local_blob_max_bytes`, when a sweeper, checking every 30
+  seconds, finds the two directories over the budget and evicts cached
+  bodies, oldest first, down to 90% of the budget. Later reads of an evicted
+  body go to the provider and take provider-read latency.
 
 Two windows keep cached bodies local while the budget allows:
 `cache_min_residency` (default `10m`) passes over bodies whose upload

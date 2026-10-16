@@ -1043,8 +1043,8 @@ paths below are exercised against the real stack by the smelt-based `itest/` har
   [§7.4](#74-read-getobject) / [§8](#8-retrieval-addressing-when-bodies-need-a-sharded-dag-index).
   **Local blob storage is split by role and bounded by a byte budget.** A body is written to the
   spool (`<data_dir>/spool`) and moves to the cache (`<data_dir>/cache`) once the provider holds it.
-  With `local_blob_max_bytes` set (`SweepLocalBlobs`), every 30s the sweeper evicts blobs the
-  provider holds (a location or park row), oldest first, down to 90% of the budget, honouring a
+  With a nonzero `local_blob_max_bytes` (`SweepLocalBlobs`), every 30s the sweeper evicts blobs
+  the provider holds (a location or park row), oldest first, down to 90% of the budget, honouring a
   read-after-write window (`cache_min_residency`) and a read-recency window (`cache_read_retention`)
   unless usage stays over budget, in which case it evicts inside them, only down to the budget;
   hourly it deletes orphan files. Once at startup, `serve` deletes the copies of committed blobs

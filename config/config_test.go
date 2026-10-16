@@ -180,6 +180,14 @@ func TestServerConfig_LocalBlobKnobs(t *testing.T) {
 			},
 			want: localBlobKnobs{MaxBytes: 0, MinResidency: 10 * time.Minute, ReadRetention: time.Hour, OrphanAge: 24 * time.Hour},
 		},
+		{
+			name: "budget set, writes not cached",
+			mutate: func(c *Config) {
+				no, budget := false, int64(1<<30)
+				c.LocalBlobMaxBytes, c.CacheWrites = &budget, &no
+			},
+			want: localBlobKnobs{MaxBytes: 1 << 30, MinResidency: 10 * time.Minute, ReadRetention: time.Hour, OrphanAge: 24 * time.Hour},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

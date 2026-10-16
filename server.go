@@ -412,7 +412,7 @@ const localBlobSweepLogInterval = 10 * time.Minute
 
 // startLocalBlobSweeper spawns the local blob sweeper: every
 // localBlobSweepInterval it evicts blobs the provider holds down to
-// LocalBlobMaxBytes (when set), and hourly it deletes orphan files (see
+// LocalBlobMaxBytes (when nonzero), and hourly it deletes orphan files (see
 // Backend.SweepLocalBlobs).
 func (s *Server) startLocalBlobSweeper() {
 	s.goSweep(func() {
