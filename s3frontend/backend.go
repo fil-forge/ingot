@@ -125,6 +125,12 @@ type Backend struct {
 	// registration of the usage and budget gauges (nil when not registered).
 	localBlobMetrics localBlobMetrics
 	localBlobGauges  metric.Registration
+	// catalogUsage reports each bucket's catalog storage on Forge (nil: no
+	// catalog gauges). catalogSnapshot is its latest report, which the
+	// gauges registered as catalogGauges read.
+	catalogUsage    registry.CatalogUsageStore
+	catalogSnapshot atomic.Pointer[[]registry.CatalogUsage]
+	catalogGauges   metric.Registration
 	// regionKeys unwraps region-wrapped CEKs for the decrypting read path.
 	regionKeys regionkey.Provider
 	// tenantKeys yields the tenant wrap key each write encrypts to (the FEE
@@ -251,6 +257,11 @@ type Deps struct {
 	// until a host installs one.
 	MeterProvider metric.MeterProvider
 
+	// CatalogUsage, when set, is what the catalog gauges report each
+	// bucket's catalog storage on Forge from, refreshed by
+	// RefreshCatalogUsage. Typically the same instance as Registry.
+	CatalogUsage registry.CatalogUsageStore
+
 	// MaxBlobSize is the coarse-split blob ceiling (0 → bucket default).
 	MaxBlobSize int64
 
@@ -337,12 +348,20 @@ func New(d Deps) *Backend {
 		allowNoneEncryption: d.AllowNoneEncryption,
 		rehashBudget:        cmp.Or(d.RehashBudget, DefaultRehashBudget),
 		cors:                corsDoc,
+		catalogUsage:        d.CatalogUsage,
 	}
 	mp := d.MeterProvider
 	if mp == nil {
 		mp = otel.GetMeterProvider()
 	}
 	b.localBlobMetrics, b.localBlobGauges = newLocalBlobMetrics(mp, b, logger)
+	if b.catalogUsage != nil {
+		reg, err := registerCatalogUsageGauges(mp.Meter(meterName), b)
+		if err != nil {
+			logger.Warn("catalog usage gauges not registered", zap.Error(err))
+		}
+		b.catalogGauges = reg
+	}
 	return b
 }
 

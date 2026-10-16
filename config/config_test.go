@@ -98,6 +98,8 @@ func TestValidate_RequiredFields(t *testing.T) {
 		{"bad seal_age", func(c *Config) { c.SealAge = "not-a-duration" }, "parse seal_age"},
 		{"bad release_grace", func(c *Config) { c.ReleaseGrace = "soon" }, "parse release_grace"},
 		{"negative local_blob_max_bytes", func(c *Config) { c.LocalBlobMaxBytes = -1 }, "local_blob_max_bytes -1: must not be negative"},
+		{"bad catalog_walk_interval", func(c *Config) { c.CatalogWalkInterval = "often" }, "parse catalog_walk_interval"},
+		{"negative catalog_walk_rate", func(c *Config) { c.CatalogWalkRate = -1 }, "catalog_walk_rate -1: must not be negative"},
 		{"bad cache_min_residency", func(c *Config) { c.CacheMinResidency = "soon" }, "parse cache_min_residency"},
 		{"negative cache_min_residency", func(c *Config) { c.CacheMinResidency = "-1m" }, `cache_min_residency "-1m": must not be negative`},
 		{"negative cache_read_retention", func(c *Config) { c.CacheReadRetention = "-1m" }, `cache_read_retention "-1m": must not be negative`},
@@ -174,6 +176,34 @@ func TestServerConfig_LocalBlobKnobs(t *testing.T) {
 			got := localBlobKnobs{sc.LocalBlobMaxBytes, sc.CacheMinResidency, sc.CacheReadRetention, sc.LocalBlobOrphanAge}
 			if got != tc.want {
 				t.Fatalf("local blob knobs = %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestServerConfig_CatalogWalkKnobs: the walk interval and rate pass through,
+// zero meaning the walker's defaults and a negative interval turning it off.
+func TestServerConfig_CatalogWalkKnobs(t *testing.T) {
+	cases := []struct {
+		name     string
+		interval string
+		rate     int
+		want     time.Duration
+	}{
+		{name: "defaults", want: 0},
+		{name: "explicit", interval: "90m", rate: 25, want: 90 * time.Minute},
+		{name: "off", interval: "-1s", want: -time.Second},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := validConfig(t)
+			cfg.CatalogWalkInterval, cfg.CatalogWalkRate = tc.interval, tc.rate
+			sc, err := cfg.ServerConfig()
+			if err != nil {
+				t.Fatalf("ServerConfig: %v", err)
+			}
+			if sc.CatalogWalkInterval != tc.want || sc.CatalogWalkRate != tc.rate {
+				t.Fatalf("walk knobs = %v, %d; want %v, %d", sc.CatalogWalkInterval, sc.CatalogWalkRate, tc.want, tc.rate)
 			}
 		})
 	}

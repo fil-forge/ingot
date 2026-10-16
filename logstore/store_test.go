@@ -77,7 +77,7 @@ func (f *fakeMeta) MarkSegmentSealed(_ context.Context, plane blockstore.Plane, 
 	return nil
 }
 
-func (f *fakeMeta) MarkSegmentShipped(_ context.Context, plane blockstore.Plane, seq uint64, shippedAt int64, indexDigest multihash.Multihash, opRoots []blockstore.OpRoot) error {
+func (f *fakeMeta) MarkSegmentShipped(_ context.Context, plane blockstore.Plane, seq uint64, shippedAt int64, indexDigest multihash.Multihash, deadBytes int64, opRoots []blockstore.OpRoot) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	m, ok := f.segments[seq]
@@ -89,6 +89,7 @@ func (f *fakeMeta) MarkSegmentShipped(_ context.Context, plane blockstore.Plane,
 	}
 	m.ShippedAt = shippedAt
 	m.IndexDigest = slices.Clone(indexDigest)
+	m.DeadBytes = deadBytes
 	f.shipped = append(f.shipped, shipEvent{seq: seq, plane: plane})
 	return nil
 }

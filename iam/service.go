@@ -195,6 +195,7 @@ func (s *Service) GetUserAccountForRequest(ctx fiber.Ctx, accessKeyStr string) (
 	// fails, and needed whichever path authorizes.
 	store := s.proofs.For(accessKeyID)
 	ctx.Locals(reqscope.ProofStoreKey(), ucanlib.ProofStore(store))
+	ctx.Locals(reqscope.BorrowableKey(), true)
 
 	// Local fast path: with a cached verification key, a cached action set
 	// permitting the request's S3 action on every bucket it acts on, and
@@ -258,6 +259,9 @@ func (s *Service) GetUserAccountForRequest(ctx fiber.Ctx, accessKeyStr string) (
 	if ctr != nil && !s.cacheProofs(spanCtx, store, ctr, req, accessKeyID) {
 		scoped := NewDelegationCache(nil)
 		ctx.Locals(reqscope.ProofStoreKey(), ucanlib.ProofStore(scoped))
+		// The scoped store holds a delegation known revoked: only this
+		// request may use it.
+		ctx.Locals(reqscope.BorrowableKey(), false)
 		// Refetches bucket info already fetched above; rare (a failed Hilt commit).
 		s.cacheProofs(reqCtx, scoped, ctr, req, accessKeyID)
 		ctx.Locals(reqscope.TenantKey(), ok.Tenant)

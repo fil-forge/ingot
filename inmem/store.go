@@ -77,6 +77,10 @@ type MemStore struct {
 	// uploadRegSeq numbers the rows the way the Postgres sequence does.
 	uploadRegs   []registry.UploadRegistration
 	uploadRegSeq int64
+	// catalogWalks and walkSubtrees are the catalog walker's tables, keyed
+	// by bucket (subtrees then by string(cid)).
+	catalogWalks map[string]registry.CatalogWalk
+	walkSubtrees map[string]map[string]registry.CatalogSubtree
 }
 
 // claimKey / locKey are the composite map keys for the blob_refs and the
@@ -111,6 +115,9 @@ func NewMemStore() *MemStore {
 		partTrees:  map[string]map[int]*registry.PartTree{},
 		gcCands:    map[string]struct{}{},
 		releases:   map[locKey]registry.PendingRelease{},
+
+		catalogWalks: map[string]registry.CatalogWalk{},
+		walkSubtrees: map[string]map[string]registry.CatalogSubtree{},
 	}
 }
 
@@ -242,6 +249,9 @@ func (m *MemStore) Delete(_ context.Context, name string) error {
 	}
 	delete(m.buckets, name)
 	delete(m.verSeqs, name)
+	// The catalog walker's rows cascade on the bucket in Postgres too.
+	delete(m.catalogWalks, name)
+	delete(m.walkSubtrees, name)
 	// Postgres cascades upload_registrations on the bucket; do the same here
 	// so a queued change cannot outlive the bucket it belongs to in one
 	// backend and not the other.
@@ -390,12 +400,13 @@ func (m *MemStore) MarkSegmentSealed(_ context.Context, plane blockstore.Plane, 
 	return nil
 }
 
-func (m *MemStore) MarkSegmentShipped(_ context.Context, plane blockstore.Plane, seq uint64, shippedAt int64, indexDigest multihash.Multihash, opRoots []blockstore.OpRoot) error {
+func (m *MemStore) MarkSegmentShipped(_ context.Context, plane blockstore.Plane, seq uint64, shippedAt int64, indexDigest multihash.Multihash, deadBytes int64, opRoots []blockstore.OpRoot) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if r, ok := m.segments[seq]; ok {
 		r.ShippedAt = shippedAt
 		r.IndexDigest = slices.Clone(indexDigest)
+		r.DeadBytes = deadBytes
 	}
 	if plane == blockstore.PlaneCatalog {
 		for _, opr := range opRoots {
@@ -408,6 +419,104 @@ func (m *MemStore) MarkSegmentShipped(_ context.Context, plane blockstore.Plane,
 		}
 	}
 	return nil
+}
+
+// BucketCatalogUsage is CatalogUsage for one bucket: nil when it has no
+// shipped catalog segments.
+func (m *MemStore) BucketCatalogUsage(ctx context.Context, bucket string) (*registry.CatalogUsage, error) {
+	usage, err := m.CatalogUsage(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, u := range usage {
+		if u.Bucket == bucket {
+			return &u, nil
+		}
+	}
+	return nil, nil
+}
+
+// CatalogSubtrees returns the subtrees remembered for bucket.
+func (m *MemStore) CatalogSubtrees(_ context.Context, bucket string) ([]registry.CatalogSubtree, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []registry.CatalogSubtree
+	for _, st := range m.walkSubtrees[bucket] {
+		out = append(out, st)
+	}
+	return out, nil
+}
+
+// PutCatalogSubtrees remembers subtrees for bucket, leaving a row already
+// there as it is, as the Postgres insert does.
+func (m *MemStore) PutCatalogSubtrees(_ context.Context, bucket string, subtrees []registry.CatalogSubtree) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.buckets[bucket]; !ok {
+		return fmt.Errorf("inmem: catalog subtrees of missing bucket %q", bucket)
+	}
+	rows := m.walkSubtrees[bucket]
+	if rows == nil {
+		rows = map[string]registry.CatalogSubtree{}
+		m.walkSubtrees[bucket] = rows
+	}
+	for _, st := range subtrees {
+		if _, ok := rows[string(st.CID.Bytes())]; !ok {
+			rows[string(st.CID.Bytes())] = st
+		}
+	}
+	return nil
+}
+
+// CompleteCatalogWalk records w and drops the listed subtrees.
+func (m *MemStore) CompleteCatalogWalk(_ context.Context, bucket string, w registry.CatalogWalk, drop []cid.Cid) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.buckets[bucket]; !ok {
+		return fmt.Errorf("inmem: catalog walk of missing bucket %q", bucket)
+	}
+	m.catalogWalks[bucket] = w
+	for _, c := range drop {
+		delete(m.walkSubtrees[bucket], string(c.Bytes()))
+	}
+	return nil
+}
+
+// CatalogUsage sums each bucket's shipped catalog segments, as the Postgres
+// query does: those whose ship registered blobs (IndexDigest set).
+func (m *MemStore) CatalogUsage(_ context.Context) ([]registry.CatalogUsage, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	byBucket := map[string]*registry.CatalogUsage{}
+	for _, r := range m.segments {
+		if r.Plane != blockstore.PlaneCatalog || r.IndexDigest == nil {
+			continue
+		}
+		b, ok := m.buckets[r.Bucket]
+		if !ok {
+			continue
+		}
+		u, ok := byBucket[r.Bucket]
+		if !ok {
+			u = &registry.CatalogUsage{Bucket: r.Bucket, Space: b.Space, Root: b.Root}
+			if w, ok := m.catalogWalks[r.Bucket]; ok {
+				u.Walk = &w
+			}
+			byBucket[r.Bucket] = u
+		}
+		u.Bytes += r.Size
+		if r.DeadBytes < 0 {
+			u.UnmeasuredBytes += r.Size
+		} else {
+			u.DeadOnArrivalBytes += r.DeadBytes
+		}
+	}
+	out := make([]registry.CatalogUsage, 0, len(byBucket))
+	for _, u := range byBucket {
+		out = append(out, *u)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Bucket < out[j].Bucket })
+	return out, nil
 }
 
 func (m *MemStore) ListSegmentBuckets(_ context.Context, plane blockstore.Plane) ([]string, error) {

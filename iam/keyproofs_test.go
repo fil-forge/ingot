@@ -83,6 +83,23 @@ func TestKeyProofsStoreRefusesRevoked(t *testing.T) {
 	require.True(t, store.Contains(other.Link()))
 }
 
+// TestInvalidatedStoreReportsDropped: the store a revocation drops reports
+// Dropped, so a holder can tell it must not keep it; the key's next store
+// does not.
+func TestInvalidatedStoreReportsDropped(t *testing.T) {
+	kp := iam.NewKeyProofs()
+	key, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	dlg, _ := grant(t)
+	kp.Deposit(key.DID(), dlg)
+	held := kp.For(key.DID())
+	require.False(t, held.Dropped())
+
+	require.Len(t, kp.InvalidateHolders(dlg.Link()), 1)
+	require.True(t, held.Dropped())
+	require.False(t, kp.For(key.DID()).Dropped())
+}
+
 // TestRequestScopedStoreKeepsRevoked: a request authorized from a response
 // Hilt served after a failed commit still needs that response's delegations
 // for its onward retrieval, so a store built outside KeyProofs adds them.

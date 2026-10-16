@@ -73,11 +73,12 @@ sequenceDiagram
     S->>DB: MarkSegmentSealed(size, sha256, op-roots) in one tx
     S->>F: enqueueFlush (queue cap 64, drop + warn, restart re-enqueues)
 
+    S->>FS: measure dead bytes: walk from the last op-root through<br/>this segment's own blocks (a failure leaves it unmeasured)
     F->>F: SubmitShard: /blob/add the CAR to sprue, PUT, conclude, receipt<br/>(index publish is best-effort, space resolved via reg.Get at ship time)
     F->>DB: PutLocation(shard) + PutInclusions(every inner block)
     Note over F,DB: recorded before the shipped stamp, so retention<br/>can never retire blocks reads cannot resolve
     F-->>S: index digest
-    S->>DB: MarkSegmentShipped: shipped_at + index_digest and, same tx,<br/>forge_root_cid per op-root (guarded: only while buckets.root_cid<br/>still equals the op-root)
+    S->>DB: MarkSegmentShipped: shipped_at + index_digest + dead_bytes and, same tx,<br/>forge_root_cid per op-root (guarded: only while buckets.root_cid<br/>still equals the op-root)
     Note over S: runRetention keeps the newest Retain shipped CARs,<br/>older ones retire (files unlinked, row stamped retired_at)
 ```
 
@@ -87,6 +88,14 @@ is called with the op-root alone. A flush error keeps the segment unshipped
 and retried (5 attempts, backoff 1s doubling to a 30s cap); a bucket deleted
 while segments were queued has nowhere to ship, so the closure returns nil and
 the segment marks shipped and retires.
+
+Before a segment ships, its flush worker measures how much of it is already
+dead (`Segment.deadBytes`): the bytes of the CAR frames holding blocks the
+segment's last op-root no longer reaches, following links only through the
+segment's own blocks. These are blocks superseded within the segment's
+lifetime, mostly MST interior nodes that later writes rewrote. The ship
+records them as `dead_bytes`, which the catalog gauges (`ingot.catalog.*`)
+sum per bucket.
 
 ## Segment lifecycle
 
@@ -101,7 +110,7 @@ stateDiagram-v2
 ```
 
 - The DB `state` column holds only `open` and `sealed`. Shipped is the
-  `shipped_at` stamp (plus `index_digest`); retired is the `retired_at`
+  `shipped_at` stamp (plus `index_digest` and `dead_bytes`); retired is the `retired_at`
   stamp, set once the files are unlinked. A retired row keeps its CAR
   `sha256` and `index_digest`, because those blobs stay registered in the
   bucket's space until `DeleteBucket` releases them; its op-root rows are
@@ -193,6 +202,7 @@ builds a `uploader.CARShard` from the `Segment` accessors, calls
 | `store.go` | `Store` (one bucket's catalog log): `Open`, `AppendBatch`, `Get`, `Close` |
 | `planelog.go` | `PlaneLog` (the pipeline): `openPlaneLog`, `Append`, `Get`, `Close`; `sealOpenIfDue`, `flushLoop`, `flushOne`, `runRetention`, `sealTickerLoop` |
 | `segment.go` | `Segment`: `createOpenSegment`, `append`, `seal`, `markShipped`, `retire`, `get`; `.idx`/`.ops` codecs |
+| `dead.go` | `(*Segment).deadBytes` (the dead-on-arrival walk the ship records) |
 | `recovery.go` | `(*PlaneLog).recover` (disk vs `Meta` reconciliation for one bucket store) |
 | `types.go` | `State`, `SegmentMeta`, `Meta` |
 | `config.go` | `Config`, `PlaneConfig`, `FlushFunc` |

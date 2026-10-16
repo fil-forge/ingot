@@ -955,7 +955,7 @@ func TestPostgresStores_Live(t *testing.T) {
 		}
 		// Ship a segment whose op-roots include a stale root the bucket never
 		// adopted; only the committed root may advance forge_root.
-		if err := r.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seq, time.Now().Unix(), nil,
+		if err := r.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seq, time.Now().Unix(), nil, -1,
 			[]blockstore.OpRoot{{Bucket: "fg", Root: stale}, {Bucket: "fg", Root: committed}}); err != nil {
 			t.Fatalf("MarkSegmentShipped: %v", err)
 		}
@@ -985,7 +985,7 @@ func TestPostgresStores_Live(t *testing.T) {
 			[]blockstore.OpRoot{{Bucket: bucket, Root: liveCid(t, "rt-root")}}); err != nil {
 			t.Fatalf("MarkSegmentSealed: %v", err)
 		}
-		if err := r.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seq, now, indexDigest, nil); err != nil {
+		if err := r.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seq, now, indexDigest, -1, nil); err != nil {
 			t.Fatalf("MarkSegmentShipped: %v", err)
 		}
 		for range 2 { // idempotent
@@ -1003,7 +1003,7 @@ func TestPostgresStores_Live(t *testing.T) {
 			t.Fatalf("ListRetiredSegments = %+v (err %v), want one row", retired, err)
 		}
 		got := retired[0]
-		if got.Seq != seq || got.RetiredAt != now || got.ShippedAt != now ||
+		if got.Seq != seq || got.RetiredAt != now || got.ShippedAt != now || got.DeadBytes != -1 ||
 			!bytes.Equal(got.SHA256, sha) || !bytes.Equal(got.IndexDigest, indexDigest) {
 			t.Fatalf("retired row = %+v", got)
 		}
@@ -1025,6 +1025,109 @@ func TestPostgresStores_Live(t *testing.T) {
 		}
 		if retired, err := r.ListRetiredSegments(ctx, blockstore.PlaneCatalog, bucket); err != nil || len(retired) != 0 {
 			t.Fatalf("ListRetiredSegments after delete = %+v (err %v)", retired, err)
+		}
+	})
+
+	t.Run("catalog usage sums shipped segments", func(t *testing.T) {
+		bucket := fmt.Sprintf("cu-%d", time.Now().UnixNano())
+		space := seedBucket(t, bucket)
+		segment := func(size int64, ship bool, dead int64, indexDigest multihash.Multihash) {
+			t.Helper()
+			seq, err := r.NextSegmentSeq(ctx)
+			if err != nil {
+				t.Fatalf("NextSegmentSeq: %v", err)
+			}
+			if err := r.InsertSegmentOpen(ctx, blockstore.PlaneCatalog, seq, bucket); err != nil {
+				t.Fatalf("InsertSegmentOpen: %v", err)
+			}
+			if err := r.MarkSegmentSealed(ctx, blockstore.PlaneCatalog, seq, 1, size, nil, nil); err != nil {
+				t.Fatalf("MarkSegmentSealed: %v", err)
+			}
+			if !ship {
+				return
+			}
+			if err := r.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seq, 2, indexDigest, dead, nil); err != nil {
+				t.Fatalf("MarkSegmentShipped: %v", err)
+			}
+		}
+		segment(1000, true, 300, digest)
+		segment(500, true, -1, digest)
+		segment(59, true, 0, nil) // shipped without registering anything
+		segment(700, false, 0, nil)
+
+		usage, err := r.CatalogUsage(ctx)
+		if err != nil {
+			t.Fatalf("CatalogUsage: %v", err)
+		}
+		want := registry.CatalogUsage{Bucket: bucket, Space: space, Bytes: 1500, DeadOnArrivalBytes: 300, UnmeasuredBytes: 500}
+		i := slices.IndexFunc(usage, func(u registry.CatalogUsage) bool { return u.Bucket == bucket })
+		if i < 0 || usage[i] != want {
+			t.Fatalf("CatalogUsage = %+v, want an entry %+v", usage, want)
+		}
+
+		// A walk's subtrees and record: subtrees round-trip with their
+		// children, a second insert of a CID leaves the first, and a completed
+		// walk drops the subtrees it lists.
+		root := liveCid(t, "cu-root")
+		kept, dropped, child := liveCid(t, "cu-kept"), liveCid(t, "cu-dropped"), liveCid(t, "cu-child")
+		if err := r.PutCatalogSubtrees(ctx, bucket, []registry.CatalogSubtree{
+			{CID: kept, Bytes: 10, Blocks: 2, Children: []cid.Cid{child, dropped}},
+			{CID: dropped, Bytes: 20, Blocks: 3},
+			{CID: child, Bytes: 5, Blocks: 1},
+		}); err != nil {
+			t.Fatalf("PutCatalogSubtrees: %v", err)
+		}
+		if err := r.PutCatalogSubtrees(ctx, bucket, []registry.CatalogSubtree{{CID: child, Bytes: 99, Blocks: 99}}); err != nil {
+			t.Fatalf("PutCatalogSubtrees again: %v", err)
+		}
+		walk := registry.CatalogWalk{Root: root, StartedAt: 200, FinishedAt: 260, LiveBytes: 700,
+			ForgeBytes: 1500, DeadOnArrivalBytes: 300, UnmeasuredBytes: 500}
+		if err := r.CompleteCatalogWalk(ctx, bucket, walk, []cid.Cid{dropped}); err != nil {
+			t.Fatalf("CompleteCatalogWalk: %v", err)
+		}
+		subtrees, err := r.CatalogSubtrees(ctx, bucket)
+		if err != nil {
+			t.Fatalf("CatalogSubtrees: %v", err)
+		}
+		byCid := map[string]registry.CatalogSubtree{}
+		for _, st := range subtrees {
+			byCid[st.CID.String()] = st
+		}
+		if len(byCid) != 2 {
+			t.Fatalf("subtrees after the walk = %+v, want kept and child", subtrees)
+		}
+		if got := byCid[kept.String()]; got.Bytes != 10 || got.Blocks != 2 ||
+			!slices.EqualFunc(got.Children, []cid.Cid{child, dropped}, cid.Cid.Equals) {
+			t.Fatalf("kept subtree = %+v", got)
+		}
+		if got := byCid[child.String()]; got.Bytes != 5 || len(got.Children) != 0 {
+			t.Fatalf("child subtree = %+v, want the first insert's", got)
+		}
+		usage, err = r.CatalogUsage(ctx)
+		if err != nil {
+			t.Fatalf("CatalogUsage: %v", err)
+		}
+		i = slices.IndexFunc(usage, func(u registry.CatalogUsage) bool { return u.Bucket == bucket })
+		if i < 0 || usage[i].Walk == nil || *usage[i].Walk != walk {
+			t.Fatalf("CatalogUsage after the walk = %+v, want walk %+v", usage, walk)
+		}
+		one, err := r.BucketCatalogUsage(ctx, bucket)
+		if err != nil || one == nil || *one.Walk != walk || one.Bucket != bucket || one.Bytes != 1500 {
+			t.Fatalf("BucketCatalogUsage = %+v (err %v), want the bucket's entry with its walk", one, err)
+		}
+		if one, err := r.BucketCatalogUsage(ctx, bucket+"-missing"); err != nil || one != nil {
+			t.Fatalf("BucketCatalogUsage of a missing bucket = %+v (err %v), want nil", one, err)
+		}
+		unshipped := bucket + "-unshipped"
+		seedBucket(t, unshipped)
+		if one, err := r.BucketCatalogUsage(ctx, unshipped); err != nil || one != nil {
+			t.Fatalf("BucketCatalogUsage of a bucket with nothing shipped = %+v (err %v), want nil", one, err)
+		}
+		if _, err := pool.Exec(ctx, `DELETE FROM ingot.buckets WHERE name = $1`, bucket); err != nil {
+			t.Fatalf("delete bucket: %v", err)
+		}
+		if subtrees, err := r.CatalogSubtrees(ctx, bucket); err != nil || len(subtrees) != 0 {
+			t.Fatalf("subtrees after the bucket's delete = %v (err %v), want none", subtrees, err)
 		}
 	})
 }
