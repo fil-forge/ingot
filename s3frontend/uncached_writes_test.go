@@ -47,8 +47,9 @@ func TestDropAcceptedBodiesStreamed(t *testing.T) {
 
 	rv, err := b.resolveVersion(t.Context(), "bk", "k", "")
 	require.NoError(t, err)
-	require.Greater(t, len(rv.mf.Body.Blobs), 1)
-	for _, blob := range rv.mf.Body.Blobs {
+	blobs := storedBlobs(t, b, rv)
+	require.Greater(t, len(blobs), 1)
+	for _, blob := range blobs {
 		require.False(t, fileExists(localPath(b, blob.Digest)), "blob %x has a local copy", blob.Digest)
 		require.True(t, mem.IsEvicted(blob.Digest))
 	}

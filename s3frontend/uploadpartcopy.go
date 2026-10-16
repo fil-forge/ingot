@@ -137,11 +137,12 @@ func (b *Backend) openCopySource(ctx context.Context, src *resolvedVersion, star
 	if end < start {
 		return io.NopCloser(bytes.NewReader(nil)), nil
 	}
-	opener, err := b.bodyOpener(ctx, src.st.Space, src.mf.Body, src.mf.Plaintext, start, end)
+	blobs := src.mf.Body.Index(b.read, src.st.Space)
+	opener, err := b.bodyOpener(ctx, src.st.Space, blobs, src.mf.Plaintext, start, end)
 	if err != nil {
 		return nil, err
 	}
-	return msbucket.OpenBodyRange(ctx, opener, src.st.Space, src.mf.Body, start, end), nil
+	return msbucket.OpenBodyRange(ctx, opener, src.st.Space, blobs, start, end), nil
 }
 
 // copySourceRangeForm is the only shape S3 accepts for x-amz-copy-source-range:

@@ -282,6 +282,11 @@ type discardedVersion struct {
 // the lock against the superseded current manifest (nil when the key is new)
 // before anything is written, so conditional mutations are race-safe.
 //
+// blobs is the body's blob list as written; the commit cuts it into the
+// manifest's inline list and extent blocks (msbucket.BuildBlobList) and
+// claims its digests. Nil means mf.Body.Blobs is final as it stands (a
+// delete marker, which has no blobs).
+//
 // initState, when non-nil, is the new version's creation-time lock state
 // (the x-amz-object-lock-* headers): it is stamped into the key's
 // version-state tree in this same commit, forcing the leaf form for a new
@@ -297,7 +302,7 @@ type discardedVersion struct {
 // same-space copy) rather than to this write's own ingest: their claims are
 // then taken conditionally (see addClaims), and the commit fails with
 // errPinnedBlobReleased if the source is gone.
-func (b *Backend) commitVersion(ctx context.Context, bucketState *registry.State, key string, mf *msbucket.ObjectManifest, initState *msbucket.VersionState, pinned bool, preCheck func(superseded *msbucket.ObjectManifest) error) (msbucket.VersionNode, registry.VersioningState, error) {
+func (b *Backend) commitVersion(ctx context.Context, bucketState *registry.State, key string, mf *msbucket.ObjectManifest, blobs msbucket.BlobRefs, initState *msbucket.VersionState, pinned bool, preCheck func(superseded *msbucket.ObjectManifest) error) (msbucket.VersionNode, registry.VersioningState, error) {
 	var node msbucket.VersionNode
 	var discards []discardedVersion
 	var effState registry.VersioningState
@@ -317,6 +322,13 @@ func (b *Backend) commitVersion(ctx context.Context, bucketState *registry.State
 			vid = mintVersionID(seq)
 		}
 		mf.Seq, mf.VersionID = seq, vid
+		// The body's blob list: Head inline, the rest as extent blocks
+		// written in this commit beside the manifest that names them.
+		if blobs != nil {
+			if mf.Body.Blobs, err = msbucket.BuildBlobList(ctx, tx, blobs); err != nil {
+				return cid.Undef, fmt.Errorf("blob list: %w", err)
+			}
+		}
 		mfCid, err := tx.Put(ctx, msbucket.ManifestValue(mf))
 		if err != nil {
 			return cid.Undef, fmt.Errorf("manifest put: %w", err)
@@ -403,7 +415,11 @@ func (b *Backend) commitVersion(ctx context.Context, bucketState *registry.State
 			} else {
 				// Discard (null over null). A manifest-valued key stays one; its value
 				// block is the manifest queued for GC just below.
-				discards = append(discards, discardedVersion{superseded.VersionID, superseded.Seq, bodyDigests(supersededMf.Body), superseded.Manifest})
+				digests, err := bodyDigests(ctx, tx, st.Space, supersededMf.Body)
+				if err != nil {
+					return cid.Undef, err
+				}
+				discards = append(discards, discardedVersion{superseded.VersionID, superseded.Seq, digests, superseded.Manifest})
 				discardSeqs = append(discardSeqs, superseded.Seq)
 				if err := b.gc.AddGCCandidate(ctx, superseded.Manifest.Bytes(), st.Name); err != nil {
 					return cid.Undef, fmt.Errorf("gc candidate: %w", err)
@@ -424,7 +440,11 @@ func (b *Backend) commitVersion(ctx context.Context, bucketState *registry.State
 						if err := tx.Get(ctx, st.Space, nullCid, &nullEm); err != nil {
 							return cid.Undef, fmt.Errorf("load prev null manifest: %w", err)
 						}
-						discards = append(discards, discardedVersion{registry.NullVersionID, newLeaf.NullSeq, bodyDigests(nullEm.Manifest.Body), nullCid})
+						digests, err := bodyDigests(ctx, tx, st.Space, nullEm.Manifest.Body)
+						if err != nil {
+							return cid.Undef, err
+						}
+						discards = append(discards, discardedVersion{registry.NullVersionID, newLeaf.NullSeq, digests, nullCid})
 						discardSeqs = append(discardSeqs, newLeaf.NullSeq)
 						if prevTree, err = prevTree.Delete(ctx, nullKey); err != nil {
 							return cid.Undef, fmt.Errorf("prev delete null: %w", err)
@@ -534,7 +554,13 @@ func (b *Backend) commitVersion(ctx context.Context, bucketState *registry.State
 		// finds the rows to drop. A failed commit leaves at most a benign
 		// extra claim — never a wrong release; the release sweeper re-checks
 		// claim counts at drain time.
-		if err := b.addClaims(ctx, st, key, claimVersionID(vid, seq), bodyDigests(mf.Body), pinned); err != nil {
+		claimed := blobs.DigestList()
+		if blobs == nil {
+			if claimed, err = bodyDigests(ctx, tx, st.Space, mf.Body); err != nil {
+				return cid.Undef, err
+			}
+		}
+		if err := b.addClaims(ctx, st, key, claimVersionID(vid, seq), claimed, pinned); err != nil {
 			return cid.Undef, err
 		}
 
@@ -665,7 +691,11 @@ func (b *Backend) deleteVersionScoped(ctx context.Context, bucketState *registry
 					return cid.Undef, err
 				}
 			}
-			removed = discardedVersion{versionID: targetVersionID(kind, mf), seq: mf.Seq, digests: bodyDigests(mf.Body), manifest: valCid}
+			digests, err := bodyDigests(ctx, tx, st.Space, mf.Body)
+			if err != nil {
+				return cid.Undef, err
+			}
+			removed = discardedVersion{versionID: targetVersionID(kind, mf), seq: mf.Seq, digests: digests, manifest: valCid}
 			res.found, res.wasMarker = true, mf.DeleteMarker
 			// The version is gone for good, so the space stops counting it.
 			b.enqueueRegistration(ctx, tx, st, key, valCid, registry.UploadRegistrationRemove)
@@ -740,7 +770,11 @@ func (b *Backend) deleteVersionScoped(ctx context.Context, bucketState *registry
 			}
 		}
 
-		removed = discardedVersion{versionID: targetVersionID(kind, targetMf), seq: targetMf.Seq, digests: bodyDigests(targetMf.Body), manifest: targetCid}
+		digests, err := bodyDigests(ctx, tx, st.Space, targetMf.Body)
+		if err != nil {
+			return cid.Undef, err
+		}
+		removed = discardedVersion{versionID: targetVersionID(kind, targetMf), seq: targetMf.Seq, digests: digests, manifest: targetCid}
 		res.found, res.wasMarker = true, targetMf.DeleteMarker
 		// The version is gone for good, so the space stops counting it.
 		b.enqueueRegistration(ctx, tx, st, key, targetCid, registry.UploadRegistrationRemove)
@@ -804,7 +838,6 @@ func (b *Backend) deleteVersionScoped(ctx context.Context, bucketState *registry
 		}
 
 		// Remove a noncurrent version.
-		var err error
 		if prevTree, err = prevTree.Delete(ctx, revSeqKey(targetSeq)); err != nil {
 			return cid.Undef, fmt.Errorf("prev delete: %w", err)
 		}

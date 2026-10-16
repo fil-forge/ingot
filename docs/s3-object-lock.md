@@ -202,7 +202,8 @@ The structural rules:
    no compatibility shim: a pre-lock reader would silently drop the field on its next
    rewrite, and per the repo's dev-only data posture (reshape in place, reset dev data;
    `s3-versioning.md` §10) no such reader exists. The union's format-revision mechanism
-   (`s3-versioning.md` §2.1) stays in reserve for revisions that need loud incompatibility.
+   (`s3-versioning.md` §2.1) is for revisions that need loud incompatibility, as
+   `"/objectmanifest/1"` did.
 
 ### 4.2 Registry
 

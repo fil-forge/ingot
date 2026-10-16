@@ -53,12 +53,12 @@ func TestSplitBody_Tree(t *testing.T) {
 	ctx := context.Background()
 	for _, n := range []int{0, 1, 1000, 10000, 100_000} {
 		data := makeData(n)
-		body, err := SplitBody(ctx, testSpool(t), bytes.NewReader(data), 4096)
+		body, _, err := SplitBody(ctx, testSpool(t), bytes.NewReader(data), 4096)
 		if err != nil {
 			t.Fatalf("SplitBody(%d): %v", n, err)
 		}
 		assertTree(t, body, data)
-		sized, err := SplitSizedBody(ctx, &sizedRecorder{}, bytes.NewReader(data), int64(n), 4096)
+		sized, _, err := SplitSizedBody(ctx, &sizedRecorder{}, bytes.NewReader(data), int64(n), 4096)
 		if err != nil {
 			t.Fatalf("SplitSizedBody(%d): %v", n, err)
 		}

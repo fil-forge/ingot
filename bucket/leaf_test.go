@@ -131,7 +131,7 @@ func TestObjectValue_RejectsNonUnionBlocks(t *testing.T) {
 	}
 
 	var val ObjectValue
-	err := val.UnmarshalCBOR(bytes.NewReader(encodeUnknown("/objectmanifest/1")))
+	err := val.UnmarshalCBOR(bytes.NewReader(encodeUnknown("/objectmanifest/2")))
 	if err == nil || !strings.Contains(err.Error(), "no known value-union key") {
 		t.Fatalf("future union key: err = %v, want no-known-key rejection", err)
 	}

@@ -397,7 +397,7 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 		ETagMD5:     rec.MD5,
 		Size:        rec.Size,
 		Checksum:    hr.Sum(),
-		BlobDigests: bodyDigests(rec),
+		BlobDigests: spooled.Blobs.DigestList(),
 		State:       registry.PartParked,
 	}
 	var partTree *registry.PartTree
@@ -413,7 +413,7 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 		// fact have landed and only its result been lost, the release waits
 		// on the live part reference and resolves with the session.
 		spooled.unholdAll()
-		released, rerr := b.enqueuePartReleases(ctx, space, bodyDigests(rec), siblings)
+		released, rerr := b.enqueuePartReleases(ctx, space, spooled.Blobs.DigestList(), siblings)
 		if rerr != nil {
 			return nil, fmt.Errorf("s3frontend: record part: %w; record its blobs' releases: %w", err, rerr)
 		}
@@ -460,6 +460,10 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 // replayWaitBudget / replayMaxTries bound how long a Complete that lost the
 // single-winner latch waits for the winner's terminal state before giving up
 // with errCompleteInProgress. Package-level so tests can shrink them.
+// maxBodyBlobs is the most blobs Complete assembles into one object
+// (msbucket.MaxBodyBlobs); a variable so tests can lower it.
+var maxBodyBlobs = msbucket.MaxBodyBlobs
+
 var (
 	replayWaitBudget = 10 * time.Second
 	replayMaxTries   = 64
@@ -642,12 +646,22 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 	// operator knob).
 	var total int64
 	trueOffsets := make([]int64, 0, len(requested))
+	blobCount := 0
 	for i, sp := range requested {
 		if i < len(requested)-1 && sp.Size < backend.MinPartSize {
 			return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrEntityTooSmall)
 		}
 		trueOffsets = append(trueOffsets, total)
 		total += sp.Size
+		blobCount += len(sp.BlobDigests)
+	}
+	// A manifest holds at most maxBodyBlobs blobs. The default blob size never
+	// reaches it; a small max_blob_size can, and the upload is refused here,
+	// before any of its blobs are accepted.
+	if blobCount > maxBodyBlobs {
+		b.logger.Info("multipart completion refused: too many blobs for one object",
+			zap.String("key", key), zap.Int("blobs", blobCount), zap.Int("max", maxBodyBlobs))
+		return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrEntityTooLarge)
 	}
 	if input.MpuObjectSize != nil {
 		if *input.MpuObjectSize < 0 {
@@ -783,7 +797,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 
 	// Assemble the ordered body: each part's byte span (it may span several
 	// blobs) is recorded so a later GET/HEAD ?partNumber=N can address it (§7.2).
-	var blobs []msbucket.BlobRef
+	var blobs msbucket.BlobRefs
 	var partSizes, partOffsets []int64
 	// Per-part checksums are retained only for a COMPOSITE checksummed upload
 	// (and only when every part recorded one). AWS exposes the per-part list and
@@ -791,9 +805,8 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 	// FULL_OBJECT upload reports only the whole-object checksum and part count.
 	var partChecksums []string
 	recordPartChecksums := mpHadChecksum && !missingStored && ckType == types.ChecksumTypeComposite
-	var offset int64
 	for _, sp := range requested {
-		partStart := offset
+		partStart := blobs.Size()
 		for _, d := range sp.BlobDigests {
 			in, err := b.intents.GetIntent(ctx, bucketState.Space, d)
 			if err != nil {
@@ -808,10 +821,9 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 					return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: part blob %x: %w", d, err)
 				}
 			}
-			blobs = append(blobs, msbucket.BlobRef{Digest: d, Start: offset, End: offset + plainLen - 1})
-			offset += plainLen
+			blobs.Append(d, plainLen)
 		}
-		partSizes = append(partSizes, offset-partStart)
+		partSizes = append(partSizes, blobs.Size()-partStart)
 		partOffsets = append(partOffsets, partStart)
 		if recordPartChecksums {
 			partChecksums = append(partChecksums, sp.Checksum)
@@ -829,8 +841,8 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 	// The object's BLAKE3 digest and blocks, assembled from the parts' trees,
 	// re-reading a part only where its record cannot serve (bounded above,
 	// before the parts were accepted).
-	body := msbucket.Body{Size: offset, Blobs: blobs, PartSizes: partSizes, PartChecksums: partChecksums}
-	tree, err := b.multipartTree(ctx, bucketState.Space, sess.Plaintext, requested, trees, partOffsets, body)
+	body := msbucket.Body{Size: blobs.Size(), PartSizes: partSizes, PartChecksums: partChecksums}
+	tree, err := b.multipartTree(ctx, bucketState.Space, sess.Plaintext, requested, trees, partOffsets, blobs)
 	if err != nil {
 		return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: object tree: %w", err)
 	}
@@ -878,7 +890,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 	// reference-index reconcile. The conditional-write preconditions re-check
 	// under the lock so a racing writer can't slip between the pre-check above
 	// and the swap.
-	node, effState, err := b.commitVersion(ctx, bucketState, key, mf, initState, false, func(superseded *msbucket.ObjectManifest) error {
+	node, effState, err := b.commitVersion(ctx, bucketState, key, mf, blobs, initState, false, func(superseded *msbucket.ObjectManifest) error {
 		// The latch is re-checked under the bucket lock, where every
 		// teardown that takes a 'completing' row (DeleteBucket, the
 		// sweeper) latches it: a session taken while its blobs were

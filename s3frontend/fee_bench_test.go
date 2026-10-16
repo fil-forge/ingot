@@ -145,14 +145,14 @@ func BenchmarkIngest_Full(b *testing.B) {
 			b.ReportAllocs()
 			for b.Loop() {
 				enc := newEncryptingBlobWriter(env.spool, env.keys, env.space, []fee.Recipient{env.recipient})
-				body, err := msbucket.SplitBody(context.Background(), enc, bytes.NewReader(data), 0)
+				_, blobs, err := msbucket.SplitBody(context.Background(), enc, bytes.NewReader(data), 0)
 				if err != nil {
 					b.Fatal(err)
 				}
 				// Deleting the blob is not part of ingest; keep it out of the
 				// measurement, and fail rather than let blobs pile up on disk.
 				b.StopTimer()
-				for _, ref := range body.Blobs {
+				for _, ref := range blobs {
 					if _, err := env.spool.Remove(ref.Digest); err != nil {
 						b.Fatal(err)
 					}
@@ -174,7 +174,7 @@ func BenchmarkIngest_NoDisk(b *testing.B) {
 			b.ReportAllocs()
 			for b.Loop() {
 				enc := newEncryptingBlobWriter(hashingDiscardWriter{}, env.keys, env.space, []fee.Recipient{env.recipient})
-				if _, err := msbucket.SplitBody(context.Background(), enc, bytes.NewReader(data), 0); err != nil {
+				if _, _, err := msbucket.SplitBody(context.Background(), enc, bytes.NewReader(data), 0); err != nil {
 					b.Fatal(err)
 				}
 			}
@@ -193,7 +193,7 @@ func BenchmarkIngest_NoSpoolHash(b *testing.B) {
 			b.ReportAllocs()
 			for b.Loop() {
 				enc := newEncryptingBlobWriter(&discardWriter{}, env.keys, env.space, []fee.Recipient{env.recipient})
-				if _, err := msbucket.SplitBody(context.Background(), enc, bytes.NewReader(data), 0); err != nil {
+				if _, _, err := msbucket.SplitBody(context.Background(), enc, bytes.NewReader(data), 0); err != nil {
 					b.Fatal(err)
 				}
 			}
@@ -348,15 +348,15 @@ func BenchmarkFileWrite(b *testing.B) {
 // benchStored writes one body through the production path and returns the
 // state the read path needs: the plaintext, the body and the decrypting
 // opener with its prefetched params, exactly as bodyOpener would build it.
-func benchStored(b *testing.B, env *benchEnc, data []byte) (msbucket.Body, *decryptingOpener) {
+func benchStored(b *testing.B, env *benchEnc, data []byte) (msbucket.BlobRefs, *decryptingOpener) {
 	b.Helper()
 	enc := newEncryptingBlobWriter(env.spool, env.keys, env.space, []fee.Recipient{env.recipient})
-	body, err := msbucket.SplitBody(context.Background(), enc, bytes.NewReader(data), 0)
+	_, body, err := msbucket.SplitBody(context.Background(), enc, bytes.NewReader(data), 0)
 	if err != nil {
 		b.Fatal(err)
 	}
 	encMap := make(map[string]encBlob)
-	for _, ref := range body.Blobs {
+	for _, ref := range body {
 		params, err := enc.params(env.space, ref.Digest)
 		if err != nil {
 			b.Fatal(err)
@@ -487,7 +487,7 @@ func BenchmarkIngest_NoDiskParallel(b *testing.B) {
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
 			enc := newEncryptingBlobWriter(hashingDiscardWriter{}, env.keys, env.space, []fee.Recipient{env.recipient})
-			if _, err := msbucket.SplitBody(context.Background(), enc, bytes.NewReader(data), 0); err != nil {
+			if _, _, err := msbucket.SplitBody(context.Background(), enc, bytes.NewReader(data), 0); err != nil {
 				b.Fatal(err)
 			}
 		}

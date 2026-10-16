@@ -89,8 +89,9 @@ format, with one arm per value kind:
 
 ```ipldsch
 type ObjectValue union {
-  | ObjectManifest "/objectmanifest/0"   # the key's single version (§2.3)
-  | ObjectLeaf     "/objectleaf/0"       # the per-key version group, once superseded (§5.2)
+  | ObjectManifest   "/objectmanifest/1"   # the key's single version (§2.3)
+  | ObjectManifestV0 "/objectmanifest/0"   # decode only: read as an ObjectManifest
+  | ObjectLeaf       "/objectleaf/0"       # the per-key version group, once superseded (§5.2)
 } representation keyed
 ```
 
@@ -105,6 +106,15 @@ zero-filled garbage decode. Either arm's format can be revised: a new leaf takes
 `"/objectleaf/1"`, a new manifest takes `"/objectmanifest/1"`, a new value kind takes a new
 name, and old and new blocks coexist under one reader with no rewrite pass. The union costs
 each block its key string (~19 bytes) and buys the self-description.
+
+`"/objectmanifest/1"` is the first such revision. Its body lists the first 1,024 blobs inline as
+`[digest, offset]` tuples and the rest in extent blocks, each its own catalog block under the
+`"/blobextent/0"` key of a separate union (`BlobExtentUnion`), so an extent decoded as a value
+block fails. The manifest points to each extent by `[offset, CID]`, and a ranged read loads at
+most one. `"/objectmanifest/0"` blocks, whose inline list stored each blob's span, still decode:
+`ObjectValue` converts one into an `ObjectManifest` (its blobs become the inline list), so no
+caller past the decode sees the old form. Writes always use `"/objectmanifest/1"`, and an Ingot
+older than the revision fails on those blocks with the no-known-key error.
 
 cbor-gen generates the union codec directly — a two-arm struct of `omitempty` pointers whose
 map keys are the union keys — but its generated decoder *skips* unknown map keys silently, so
@@ -142,8 +152,9 @@ type ObjectLeaf struct {
 // ValueUnion is the union as cbor-gen encodes it; the strict wrappers above
 // it are what call sites use.
 type ValueUnion struct {
-    Manifest *ObjectManifest `cborgen:"/objectmanifest/0,omitempty"`
-    Leaf     *ObjectLeaf     `cborgen:"/objectleaf/0,omitempty"`
+    ManifestV0 *ObjectManifestV0 `cborgen:"/objectmanifest/0,omitempty"` // decode only
+    Manifest   *ObjectManifest   `cborgen:"/objectmanifest/1,omitempty"`
+    Leaf       *ObjectLeaf       `cborgen:"/objectleaf/0,omitempty"`
 }
 ```
 
@@ -182,7 +193,7 @@ blockstore — its nodes are ordinary catalog-plane blocks):
   Because the MST iterates forward-only (`mst.go:835 WalkLeavesFrom`), the inversion makes
   iteration **newest-first**. Scoped to one object key, the key is *just an integer rendered
   order-preservingly*, valid under `mst.IsValidKey` (hex is UTF-8, NUL-free, short).
-- **value** — the version's manifest CID (its `"/objectmanifest/0"` block, §2.1) and nothing
+- **value** — the version's manifest CID (its manifest-arm block, §2.1) and nothing
   else: a prev entry stores no
   `VersionNode`. For these entries the seq is recoverable from the MST key, and the version id
   lives only in the manifest (§2.3). That costs nothing in practice, because every consumer of
@@ -600,6 +611,10 @@ Buckets written before versioning store manifests as bare blocks with no union k
 `Seq`/`VersionID`, §2.3); the union readers reject them. Per the repo's dev-only data posture
 (CLAUDE.md: "reshape stored formats in place and reset dev data rather than migrating it"), there is **no
 migration**: existing dev buckets are reset rather than taught to read the pre-union form.
+
+Union-keyed blocks are a different case: a revision adds a key and keeps reading the old one, so
+dev and staging data stays readable without a reset. `"/objectmanifest/1"` (§2.1) is the first
+revision made that way.
 
 Out of scope: `ListParts`/`ListMultipartUploads`, `GetObjectAttributes`,
 MFA delete, lifecycle expiration, and multi-instance seq arbitration beyond the existing

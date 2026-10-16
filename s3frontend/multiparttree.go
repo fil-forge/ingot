@@ -145,8 +145,8 @@ func treeRange(t *registry.PartTree, size int64) (blake3tree.Range, error) {
 // the non-final re-read within the budget (rehashNeeded). Parts' trees that
 // fail the assembly's consistency check are an error: the object is
 // committed neither with a digest that might be wrong nor without one.
-func (b *Backend) multipartTree(ctx context.Context, space did.DID, plaintext bool, parts []registry.MultipartPart, trees map[int]*registry.PartTree, offsets []int64, body msbucket.Body) (blake3tree.Object, error) {
-	src := &bodySource{b: b, space: space, body: body, plaintext: plaintext}
+func (b *Backend) multipartTree(ctx context.Context, space did.DID, plaintext bool, parts []registry.MultipartPart, trees map[int]*registry.PartTree, offsets []int64, body msbucket.BlobRefs) (blake3tree.Object, error) {
+	src := &bodySource{b: b, space: space, blobs: body, plaintext: plaintext}
 	ranges := make([]blake3tree.Range, 0, len(parts))
 	for i, p := range parts {
 		if t := trees[p.PartNumber]; t != nil && t.Offset == offsets[i] {
@@ -165,7 +165,7 @@ func (b *Backend) multipartTree(ctx context.Context, space did.DID, plaintext bo
 	}
 	obj, ok := blake3tree.Assemble(ranges)
 	if !ok {
-		return blake3tree.Object{}, fmt.Errorf("the trees of %d parts do not assemble into one %d-byte body", len(parts), body.Size)
+		return blake3tree.Object{}, fmt.Errorf("the trees of %d parts do not assemble into one %d-byte body", len(parts), body.Size())
 	}
 	return obj, nil
 }
@@ -175,7 +175,7 @@ func (b *Backend) multipartTree(ctx context.Context, space did.DID, plaintext bo
 type bodySource struct {
 	b         *Backend
 	space     did.DID
-	body      msbucket.Body
+	blobs     msbucket.BlobIndex
 	plaintext bool
 }
 
@@ -186,11 +186,11 @@ func (s *bodySource) rehash(ctx context.Context, start, end int64) (blake3tree.R
 		return blake3tree.Range{}, err
 	}
 	if end > start {
-		opener, err := s.b.bodyOpener(ctx, s.space, s.body, s.plaintext, start, end-1)
+		opener, err := s.b.bodyOpener(ctx, s.space, s.blobs, s.plaintext, start, end-1)
 		if err != nil {
 			return blake3tree.Range{}, err
 		}
-		rc := msbucket.OpenBodyRange(ctx, opener, s.space, s.body, start, end-1)
+		rc := msbucket.OpenBodyRange(ctx, opener, s.space, s.blobs, start, end-1)
 		defer rc.Close()
 		if _, err := io.Copy(h, rc); err != nil {
 			return blake3tree.Range{}, fmt.Errorf("re-hash object bytes [%d,%d): %w", start, end, err)
