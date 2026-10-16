@@ -949,6 +949,7 @@ erDiagram
         bytea sha256
         bigint shipped_at
         bytea index_digest
+        bigint dead_bytes "dead on arrival; NULL = unmeasured"
         bigint retired_at
     }
     segment_op_roots {

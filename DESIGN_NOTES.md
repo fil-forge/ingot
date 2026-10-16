@@ -454,7 +454,10 @@ draws the chains and the stores.
   intent unchanged for an hour as stalled, for the
   `ingot.local_blobs.stalled_bytes` gauge.
 - **No catalog GC**: `gc_candidates` is write-only; superseded MST nodes
-  accumulate on Forge with mutation volume.
+  accumulate on Forge with mutation volume. Each ship records how much of its
+  segment was already dead (`segments.dead_bytes`), and the
+  `ingot.catalog.*` gauges sum that and the shipped bytes per bucket; what
+  dies after shipping is not measured yet.
 - **Reads carry no bucket context**: `Manager.Get` linear-scans every open
   bucket store; threading the bucket into the read path removes the scan.
 - **The ship authority expires**: the async flush signs with a per-space

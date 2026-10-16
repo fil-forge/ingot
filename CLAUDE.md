@@ -168,6 +168,10 @@ Internal:
   stalled-upload gauges, removals by reason, reads by tier) are created on the global meter
   provider, through `s3frontend.Deps.MeterProvider` and
   `Layered.CountBlobReads`; with no provider installed they are no-ops.
+  So are the catalog gauges (`ingot.catalog.*`: each bucket's shipped
+  catalog bytes and how much was dead on arrival, labeled by space DID,
+  never bucket name), which a `server.go` sweep refreshes from
+  `registry.CatalogUsageStore`.
   versitygw passes
   the backend the bare `*fasthttp.RequestCtx` as its context, so the
   middleware stores the span as a request user value under the trace API's

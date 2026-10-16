@@ -75,6 +75,12 @@ type SegmentMeta struct {
 	// (the CAR + this index) — the registrations DeleteBucket must release.
 	IndexDigest multihash.Multihash
 
+	// DeadBytes is how much of this segment was dead on arrival, recorded
+	// when it shipped: the bytes of its blocks that its last op-root no
+	// longer reached. -1 when it wasn't measured. Meaningful only once
+	// ShippedAt is set.
+	DeadBytes int64
+
 	// RetiredAt is when retention unlinked this segment's files (unix
 	// seconds), or 0 while it is still on disk. A retired segment keeps its
 	// row: its blobs stay registered in the bucket's space until
@@ -108,10 +114,11 @@ type Meta interface {
 		size int64, sha []byte, opRoots []blockstore.OpRoot) error
 
 	// MarkSegmentShipped records that this segment's CAR finished shipping
-	// to Forge, stamping shipped_at, and advances forge_root_cid in
+	// to Forge, stamping shipped_at and the segment's dead-on-arrival bytes
+	// (negative when they weren't measured), and advances forge_root_cid in
 	// ingot.buckets for every op-root recorded against this segment (catalog
 	// roots are the MST roots durable on Forge), all in one transaction.
-	MarkSegmentShipped(ctx context.Context, plane blockstore.Plane, seq uint64, shippedAt int64, indexDigest multihash.Multihash, opRoots []blockstore.OpRoot) error
+	MarkSegmentShipped(ctx context.Context, plane blockstore.Plane, seq uint64, shippedAt int64, indexDigest multihash.Multihash, deadBytes int64, opRoots []blockstore.OpRoot) error
 
 	// DeleteSegment removes a segment row (cascades to op-root rows).
 	DeleteSegment(ctx context.Context, plane blockstore.Plane, seq uint64) error

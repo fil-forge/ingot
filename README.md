@@ -259,6 +259,20 @@ the only copy. Restart `serve` after deleting files by hand: the byte counts
 see such a change at startup, or only at an hourly scan that no write
 overlapped.
 
+### Catalog storage
+
+Nothing collects dead catalog blocks yet: each shipped catalog segment stays
+on Forge until its bucket is deleted. With metrics on, these gauges show how
+much catalog storage each bucket holds there and how much of it was dead
+before it shipped. Each is labeled by the bucket's `space` DID, not its name,
+and refreshed every minute.
+
+| Metric | Meaning |
+| -- | -- |
+| `ingot.catalog.forge_bytes` | Bytes of the bucket's shipped catalog segments (their CARs; their index blobs are not counted) |
+| `ingot.catalog.dead_on_arrival_bytes` | Bytes of those segments' blocks that were already dead when their segment shipped: superseded by later writes in the same segment |
+| `ingot.catalog.unmeasured_bytes` | Bytes of shipped segments whose dead-on-arrival bytes were not measured, such as every segment shipped before the measurement existed |
+
 ## Build & test
 
 ```bash

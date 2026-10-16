@@ -335,13 +335,23 @@ func (pl *PlaneLog) flushOne(seg *Segment) {
 	const maxAttempts = 5
 	backoff := time.Second
 
+	// What the segment holds that is already dead is measured before it
+	// ships, from its local files; a failure only leaves it unmeasured.
+	deadBytes, derr := seg.deadBytes()
+	if derr != nil {
+		pl.logger.Warn("logstore: measure dead bytes",
+			zap.Stringer("plane", pl.plane), zap.Uint64("seq", seg.Seq()), zap.Error(derr))
+		deadBytes = -1
+	}
+	span.SetAttributes(attribute.Int64("ingot.log.dead_bytes", deadBytes))
+
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		span.SetAttributes(attribute.Int("ingot.log.attempts", attempt))
 		indexDigest, err := pl.pc.Flush(ctx, seg)
 		if err == nil {
 			now := time.Now().Unix()
 			seg.markShipped(now)
-			if merr := pl.meta.MarkSegmentShipped(ctx, pl.plane, seg.Seq(), now, indexDigest, seg.OpRoots()); merr != nil {
+			if merr := pl.meta.MarkSegmentShipped(ctx, pl.plane, seg.Seq(), now, indexDigest, deadBytes, seg.OpRoots()); merr != nil {
 				pl.logger.Error("logstore: mark shipped",
 					zap.Stringer("plane", pl.plane), zap.Uint64("seq", seg.Seq()), zap.Error(merr))
 			}

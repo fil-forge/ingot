@@ -123,6 +123,10 @@ type ServerDeps struct {
 	// Meta is the persistence backing for log-segment metadata.
 	// Typically the same instance as Registry.
 	Meta logstore.Meta
+	// CatalogUsage, when set, sums each bucket's shipped catalog segments for
+	// the catalog gauges (ingot.catalog.*). Optional; typically the same
+	// instance as Registry.
+	CatalogUsage registry.CatalogUsageStore
 
 	// Identity is the agent identity (the issuer of every outbound
 	// invocation). The listener serves its DID document at
@@ -254,6 +258,7 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		RehashBudget:        cfg.MultipartRehashBudget,
 		CORS:                cfg.CORSConfig,
 		AllowNoneEncryption: cfg.AllowNoneEncryption,
+		CatalogUsage:        deps.CatalogUsage,
 		Logger:              logger,
 	})
 
@@ -302,6 +307,7 @@ func (s *Server) Start(ctx context.Context) error {
 	s.startLocalBlobSweeper()
 	s.startReleasedPass()
 	s.startRegistrationSweeper()
+	s.startCatalogUsageSweeper()
 	return nil
 }
 
@@ -450,6 +456,38 @@ func (s *Server) startLocalBlobSweeper() {
 				if !removed.Removed() {
 					since = time.Now()
 				}
+			}
+		}
+	})
+}
+
+// catalogUsageInterval is how often the catalog gauges' figures are
+// refreshed from the segment rows.
+const catalogUsageInterval = time.Minute
+
+// startCatalogUsageSweeper refreshes the figures the catalog gauges report
+// (see Backend.RefreshCatalogUsage) at startup and then every
+// catalogUsageInterval, when the backend has a catalog usage store.
+func (s *Server) startCatalogUsageSweeper() {
+	if !s.backend.ReportsCatalogUsage() {
+		return
+	}
+	s.goSweep(func() {
+		ticker := time.NewTicker(catalogUsageInterval)
+		defer ticker.Stop()
+		for {
+			ctx, cancel := context.WithTimeout(s.sweepCtx, catalogUsageInterval)
+			ctx, span := tracing.Start(ctx, "sweep.catalog_usage")
+			n, err := s.backend.RefreshCatalogUsage(ctx)
+			s.endSweepSpan(span, err, attribute.Int("ingot.sweep.count", n))
+			cancel()
+			if err != nil && s.sweepCtx.Err() == nil {
+				s.logger.Warn("catalog usage sweep", zap.Error(err))
+			}
+			select {
+			case <-s.sweepCtx.Done():
+				return
+			case <-ticker.C:
 			}
 		}
 	})

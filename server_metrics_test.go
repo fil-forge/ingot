@@ -7,15 +7,19 @@ import (
 	"testing"
 
 	"github.com/fil-forge/libforge/identity"
+	"github.com/fil-forge/ucantone/did"
+	"github.com/multiformats/go-multihash"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
+	"github.com/fil-forge/ingot/blockstore"
 	"github.com/fil-forge/ingot/config"
 	"github.com/fil-forge/ingot/iam"
 	"github.com/fil-forge/ingot/inmem"
 	"github.com/fil-forge/ingot/regionkey"
+	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/tenantkey"
 )
 
@@ -38,6 +42,74 @@ func TestServerReportsLocalBlobGauges(t *testing.T) {
 	require.Empty(t, metricNames(t, reader), "metrics reported after Stop")
 }
 
+// TestServerReportsCatalogUsageGauges: with a catalog usage store, the
+// catalog gauges report each bucket's shipped catalog segments under its
+// space once refreshed, and Stop unregisters them.
+func TestServerReportsCatalogUsageGauges(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	prev := otel.GetMeterProvider()
+	otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)))
+	t.Cleanup(func() { otel.SetMeterProvider(prev) })
+
+	ctx := t.Context()
+	mem := inmem.NewMemStore()
+	space, err := did.Parse("did:web:catalog-usage.example")
+	require.NoError(t, err)
+	require.NoError(t, mem.Create(ctx, "bk", space, registry.CreateState{}))
+	// Two shipped segments, one measured and one not, and one that shipped
+	// without registering anything, which is not on Forge.
+	index := multihash.Multihash("index-digest")
+	for _, seg := range []struct {
+		size, dead int64
+		index      multihash.Multihash
+	}{{size: 1000, dead: 300, index: index}, {size: 500, dead: -1, index: index}, {size: 59, dead: 0}} {
+		seq, err := mem.NextSegmentSeq(ctx)
+		require.NoError(t, err)
+		require.NoError(t, mem.InsertSegmentOpen(ctx, blockstore.PlaneCatalog, seq, "bk"))
+		require.NoError(t, mem.MarkSegmentSealed(ctx, blockstore.PlaneCatalog, seq, 1, seg.size, nil, nil))
+		require.NoError(t, mem.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seq, 2, seg.index, seg.dead, nil))
+	}
+
+	s := newInmemServer(t, config.ServerConfig{}, func(d *ServerDeps) { d.CatalogUsage = mem })
+	require.Empty(t, gaugeValues(t, reader, "ingot.catalog.forge_bytes"), "reported before the first refresh")
+
+	n, err := s.backend.RefreshCatalogUsage(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 1, n)
+	bySpace := map[string]int64{space.String(): 1500}
+	require.Equal(t, bySpace, gaugeValues(t, reader, "ingot.catalog.forge_bytes"))
+	bySpace[space.String()] = 300
+	require.Equal(t, bySpace, gaugeValues(t, reader, "ingot.catalog.dead_on_arrival_bytes"))
+	bySpace[space.String()] = 500
+	require.Equal(t, bySpace, gaugeValues(t, reader, "ingot.catalog.unmeasured_bytes"))
+
+	require.NoError(t, s.Stop(context.Background()))
+	require.Empty(t, metricNames(t, reader), "metrics reported after Stop")
+}
+
+// gaugeValues returns the int64 gauge name's current values by their space
+// attribute.
+func gaugeValues(t *testing.T, reader *sdkmetric.ManualReader, name string) map[string]int64 {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(t.Context(), &rm))
+	out := map[string]int64{}
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != name {
+				continue
+			}
+			g, ok := m.Data.(metricdata.Gauge[int64])
+			require.True(t, ok, "%s is a %T", name, m.Data)
+			for _, dp := range g.DataPoints {
+				v, _ := dp.Attributes.Value("space")
+				out[v.AsString()] = dp.Value
+			}
+		}
+	}
+	return out
+}
+
 // metricNames returns the names of the metrics reader collects now.
 func metricNames(t *testing.T, reader *sdkmetric.ManualReader) map[string]bool {
 	t.Helper()
@@ -53,8 +125,9 @@ func metricNames(t *testing.T, reader *sdkmetric.ManualReader) map[string]bool {
 }
 
 // newInmemServer builds a Server over the in-memory fakes. cfg's address,
-// data directory, region and connection limits are filled in.
-func newInmemServer(t *testing.T, cfg config.ServerConfig) *Server {
+// data directory, region and connection limits are filled in; each of opts
+// may adjust the dependencies before New.
+func newInmemServer(t *testing.T, cfg config.ServerConfig, opts ...func(*ServerDeps)) *Server {
 	t.Helper()
 	id, err := identity.New("", "did:web:ingot.test")
 	require.NoError(t, err)
@@ -72,7 +145,7 @@ func newInmemServer(t *testing.T, cfg config.ServerConfig) *Server {
 	cfg.Region = "us-east-1"
 	cfg.MaxConnections = 16
 	cfg.MaxRequests = 16
-	s, err := New(t.Context(), cfg, ServerDeps{
+	deps := ServerDeps{
 		BaseBlockReader: inmem.NopBaseReader{},
 		Uploader:        inmem.NopUploader{},
 		BodyUploader:    inmem.NopUploader{},
@@ -95,7 +168,11 @@ func newInmemServer(t *testing.T, cfg config.ServerConfig) *Server {
 		Meta:            mem,
 		Identity:        id,
 		IAM:             svc,
-	})
+	}
+	for _, opt := range opts {
+		opt(&deps)
+	}
+	s, err := New(t.Context(), cfg, deps)
 	require.NoError(t, err)
 	return s
 }
