@@ -477,7 +477,7 @@ func TestWalkRereadsTheBucket(t *testing.T) {
 	require.Equal(t, root2.Cid(), w.Root)
 	require.Equal(t, f.clock.Unix(), w.StartedAt)
 
-	// Listed while the root had moved, walked once it is back.
+	// Listed while the root had moved, left alone once it is back.
 	f.setRoot(root)
 	f.clock = f.clock.Add(2 * time.Minute)
 	f.request()
@@ -489,4 +489,30 @@ func TestWalkRereadsTheBucket(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, walked.Completed, "walked a bucket whose root is back at the walked one")
 	require.Zero(t, walked.Reads)
+}
+
+// TestWalkLeavesAloneWhatIsNoLongerDue: a bucket listed by Due but gone, or
+// without read authority, by its turn is left alone without a failure.
+func TestWalkLeavesAloneWhatIsNoLongerDue(t *testing.T) {
+	f := newFixture(t, Config{})
+	root := node(t, "root")
+	f.reads.put(root)
+	f.setRoot(root)
+	f.request()
+	due, err := f.walker.Due(f.ctx)
+	require.NoError(t, err)
+	require.Len(t, due, 1)
+
+	f.clock = f.clock.Add(borrowTTL)
+	walked, err := f.walker.Walk(f.ctx, due[0])
+	require.NoError(t, err)
+	require.False(t, walked.Completed, "walked without authority")
+	require.Zero(t, f.reads.reads)
+
+	require.NoError(t, f.mem.Delete(f.ctx, "bk"))
+	f.request()
+	walked, err = f.walker.Walk(f.ctx, due[0])
+	require.NoError(t, err)
+	require.False(t, walked.Completed, "walked a deleted bucket")
+	require.Empty(t, f.walker.failedUntil, "a bucket left alone is not held back")
 }

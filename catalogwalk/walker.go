@@ -180,14 +180,20 @@ func lastWalked(u registry.CatalogUsage) int64 {
 // reachable from its root and recording them with its usage. It rereads the
 // bucket's usage first, root and figures in one query, so what it records is
 // of the moment the walk starts, however long ago Due listed the bucket. A
-// bucket that by then has nothing shipped, or whose root is back at the one
-// its last walk reached, is left alone. A walk that fails holds the bucket
-// back for retryAfter.
+// bucket that by then is no longer due, having nothing shipped, its root
+// back at the one its last walk reached, or no read authority held for its
+// space, is left alone. A walk that fails holds the bucket back for
+// retryAfter.
 func (w *Walker) Walk(ctx context.Context, u registry.CatalogUsage) (Walked, error) {
 	cur, err := w.usage.BucketCatalogUsage(ctx, u.Bucket)
 	walked := Walked{Bucket: u.Bucket, Space: u.Space}
 	if err == nil {
-		if cur == nil || (cur.Walk != nil && cur.Walk.Root.Equals(cur.Root)) {
+		switch {
+		case cur == nil:
+			return walked, nil
+		case cur.Walk != nil && cur.Walk.Root.Equals(cur.Root):
+			return walked, nil
+		case cur.Root.Defined() && !w.authority.Holds(cur.Space):
 			return walked, nil
 		}
 		walked, err = w.walk(ctx, *cur)

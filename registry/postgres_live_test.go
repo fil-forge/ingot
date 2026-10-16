@@ -1111,6 +1111,18 @@ func TestPostgresStores_Live(t *testing.T) {
 		if i < 0 || usage[i].Walk == nil || *usage[i].Walk != walk {
 			t.Fatalf("CatalogUsage after the walk = %+v, want walk %+v", usage, walk)
 		}
+		one, err := r.BucketCatalogUsage(ctx, bucket)
+		if err != nil || one == nil || *one.Walk != walk || one.Bucket != bucket || one.Bytes != 1500 {
+			t.Fatalf("BucketCatalogUsage = %+v (err %v), want the bucket's entry with its walk", one, err)
+		}
+		if one, err := r.BucketCatalogUsage(ctx, bucket+"-missing"); err != nil || one != nil {
+			t.Fatalf("BucketCatalogUsage of a missing bucket = %+v (err %v), want nil", one, err)
+		}
+		unshipped := bucket + "-unshipped"
+		seedBucket(t, unshipped)
+		if one, err := r.BucketCatalogUsage(ctx, unshipped); err != nil || one != nil {
+			t.Fatalf("BucketCatalogUsage of a bucket with nothing shipped = %+v (err %v), want nil", one, err)
+		}
 		if _, err := pool.Exec(ctx, `DELETE FROM ingot.buckets WHERE name = $1`, bucket); err != nil {
 			t.Fatalf("delete bucket: %v", err)
 		}

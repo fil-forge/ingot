@@ -131,6 +131,7 @@ func TestServerReportsCatalogUsageGauges(t *testing.T) {
 	require.NoError(t, mem.CASRoot(ctx, "bk", cid.Undef, moved))
 	_, err = s.backend.RefreshCatalogUsage(ctx)
 	require.NoError(t, err)
+	bySpace[space.String()] = 1500
 	require.Equal(t, bySpace, gaugeValues(t, reader, "ingot.catalog.dead_bytes"))
 	bySpace[space.String()] = 1200
 	require.Equal(t, bySpace, gaugeValues(t, reader, "ingot.catalog.dead_after_ship_bytes"))
