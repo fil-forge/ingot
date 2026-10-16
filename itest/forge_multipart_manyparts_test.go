@@ -25,9 +25,10 @@ import (
 // Complete waits only for the last batch: its wall time should stay roughly
 // flat as the part count grows.
 //
-// A Complete that finds parts still queued answers OperationAborted, a
-// retryable 409, as an S3 client would see it; the benchmark retries it and
-// counts the retries into Complete's time.
+// A Complete that finds parts still queued answers OperationAborted, a 409
+// the AWS CLI treats as final. The benchmark retries it anyway, counting the
+// retries into Complete's time, so a run still measures the acceptor's lag;
+// any retry in the summary line is a Complete the AWS CLI would have failed.
 //
 // The number that matters is "complete" in the summary line; the upload
 // phase is reported only so a run can be sanity-checked against the disk and

@@ -479,10 +479,13 @@ var (
 	replayMaxTries   = 64
 )
 
-// errCompleteInProgress is S3's OperationAborted: another Complete of this
-// upload is still running past the loser's wait budget. It is a 409 the
-// client retries; the retry finds the session completed and replays the
-// winner's result. (Not in the versitygw error table, hence built here.)
+// errCompleteInProgress is S3's OperationAborted, a 409: another Complete of
+// this upload is still running past the loser's wait budget, or the upload's
+// acceptor has not finished its parts. The AWS CLI and other botocore-based
+// clients treat it as final (botocore retries neither 409 nor
+// OperationAborted), report the upload failed and abort it. Only a client
+// that retries on its own gets the replay of the winner's result. (Not in the
+// versitygw error table, hence built here.)
 var errCompleteInProgress = s3err.APIError{
 	Code:           "OperationAborted",
 	Description:    "A conflicting conditional operation is currently in progress against this resource. Please try again.",
@@ -717,9 +720,12 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 	// loop needs re-deriving — and the conditional-write precheck must NOT
 	// re-run here: after the winner commits it would newly fail an
 	// If-None-Match loser. The wall-clock and iteration caps bound both a
-	// revert-livelock and the poll's request occupancy (no request deadline
-	// exists to inherit); exhausting them while the winner is still running
-	// is OperationAborted, a retryable conflict, never NoSuchUpload.
+	// revert-livelock and how long the poll holds the connection (no request
+	// deadline exists to inherit); exhausting them while the winner is still
+	// running is OperationAborted, never NoSuchUpload. The budget is not time
+	// for the winner to finish: a loser that waits silently longer than the
+	// client's read timeout is cut off as the winner was, so raising it
+	// cannot help.
 	completeWon := false
 	{
 		backoff := 5 * time.Millisecond
@@ -1427,8 +1433,9 @@ var acceptWaitBudget = 30 * time.Second
 //   - spooled: its request died before its blobs were all parked, which is
 //     Complete's to finish here: parked blobs conclude, and blobs that never
 //     parked are uploaded from their spool copies.
-//   - parked: the acceptor is behind or failing. Complete answers with the
-//     retryable OperationAborted rather than holding the request open; the
+//   - parked: the acceptor is behind or failing. Complete answers
+//     OperationAborted (errCompleteInProgress, final for botocore clients)
+//     rather than hold the request past the client's read timeout; the
 //     revert reopens the upload, and the acceptor carries on meanwhile.
 //
 // With no acceptors running (before the server starts them) Complete accepts
@@ -1531,7 +1538,7 @@ func (b *Backend) concludeBlobs(ctx context.Context, space did.DID, blobs []msbu
 	for i, blob := range blobs {
 		digests[i] = blob.Digest
 	}
-	neverParked, err := b.acceptParked(ctx, space, digests)
+	neverParked, err := b.acceptParked(ctx, space, digests, acceptForCommit)
 	if err != nil {
 		return err
 	}
@@ -1549,20 +1556,44 @@ func (b *Backend) concludeBlobs(ctx context.Context, space did.DID, blobs []msbu
 	return nil
 }
 
+// acceptMode is how acceptParked treats a digest with a release record.
+type acceptMode int
+
+const (
+	// acceptForCommit is Complete's: its commit claims the blobs, so it
+	// settles a release the way every write does (settleRelease), cancelling
+	// one not yet started and waiting out one that is.
+	acceptForCommit acceptMode = iota
+	// acceptInBackground is the acceptor's, which claims nothing and so may
+	// not take a blob over from its release: a digest with any release
+	// record is left to Complete. A record written after the check is the
+	// release's to run, and the release finds whatever this records.
+	acceptInBackground
+)
+
 // acceptParked accepts digests on Forge as far as their parks allow, for
 // Complete and for the upload's acceptor. A digest already located needs
 // nothing; a parked one concludes its deferred /http/put receipt, firing
-// /blob/accept, and its park is swapped for its location. A digest with
-// neither row never parked (a crash between spool and park) and is returned
-// for the caller to upload from its spool copy.
-func (b *Backend) acceptParked(ctx context.Context, space did.DID, digests []mh.Multihash) (neverParked []mh.Multihash, err error) {
+// /blob/accept, and its park is swapped for its location. It returns the
+// digests it left for Complete: one with neither row never parked (a crash
+// between spool and park), to upload from its spool copy, and, for the
+// acceptor, one with a release record.
+func (b *Backend) acceptParked(ctx context.Context, space did.DID, digests []mh.Multihash, mode acceptMode) (left []mh.Multihash, err error) {
 	ctx, span := tracing.Start(ctx, "blobs.conclude", attribute.Int("ingot.blobs.total", len(digests)))
 	defer func() { tracing.End(span, err) }()
+
+	var releasing map[string]bool
+	if mode == acceptInBackground {
+		if releasing, err = b.pendingReleases.ReleasingDigests(ctx, space, digests); err != nil {
+			return nil, fmt.Errorf("lookup releases: %w", err)
+		}
+	}
 
 	// Classify first: a blob is already located (accepted at ingest, usually a
 	// dedup hit), parked (the common case — UploadPart made it durable), or
 	// never parked (a crash between spool and park).
 	var toConclude []uploader.UploadedBlob
+	neverParked := 0
 	// Conclude each digest once: parts stored as received can repeat one.
 	seen := make(map[string]bool, len(digests))
 	for _, digest := range digests {
@@ -1573,9 +1604,14 @@ func (b *Backend) acceptParked(ctx context.Context, space did.DID, digests []mh.
 
 		// Whatever the rows say, no release of this digest may be running
 		// while the blob is concluded, uploaded or reused (see
-		// settleRelease).
-		settled, err := b.settleRelease(ctx, space, digest)
-		if err != nil {
+		// settleRelease). The acceptor leaves such a digest alone instead.
+		settled := true
+		if mode == acceptInBackground {
+			if releasing[string(digest)] {
+				left = append(left, digest)
+				continue
+			}
+		} else if settled, err = b.settleRelease(ctx, space, digest); err != nil {
 			return nil, err
 		}
 		if existing, err := b.locations.GetLocation(ctx, space, digest); err == nil && existing != nil && settled {
@@ -1601,7 +1637,8 @@ func (b *Backend) acceptParked(ctx context.Context, space did.DID, digests []mh.
 			return nil, fmt.Errorf("lookup park: %w", err)
 		}
 		if park == nil {
-			neverParked = append(neverParked, digest)
+			left = append(left, digest)
+			neverParked++
 			continue
 		}
 		addTask, err := cid.Cast(park.AddTask)
@@ -1623,10 +1660,10 @@ func (b *Backend) acceptParked(ctx context.Context, space did.DID, digests []mh.
 
 	span.SetAttributes(
 		attribute.Int("ingot.blobs.concluded", len(toConclude)),
-		attribute.Int("ingot.blobs.uploaded", len(neverParked)),
+		attribute.Int("ingot.blobs.uploaded", neverParked),
 	)
 	if len(toConclude) == 0 {
-		return neverParked, nil
+		return left, nil
 	}
 
 	// Every parked blob goes to the upload service in one exchange (the
@@ -1649,7 +1686,7 @@ func (b *Backend) acceptParked(ctx context.Context, space did.DID, digests []mh.
 		if i >= len(locations) || locations[i] == nil {
 			continue
 		}
-		if rerr := b.recordConcluded(ctx, space, p.Digest, *locations[i]); rerr != nil {
+		if rerr := b.recordConcluded(ctx, space, p, *locations[i]); rerr != nil {
 			// Still parked as far as the tables say; the next attempt
 			// concludes it again.
 			errs = append(errs, rerr)
@@ -1663,22 +1700,26 @@ func (b *Backend) acceptParked(ctx context.Context, space did.DID, digests []mh.
 	if recorded != len(toConclude) {
 		return nil, fmt.Errorf("conclude blobs: %d of %d blobs returned no location", len(toConclude)-recorded, len(toConclude))
 	}
-	return neverParked, nil
+	return left, nil
 }
 
 // recordConcluded records a concluded blob as accepted: its park, with the
 // spent put invocation, is swapped for its location in one step, and only
-// while the park is still there. A release that took the park (a superseded
-// part, an abort or an expired session) has aborted the allocation or
-// removed the accepted blob, and a location written after it would let a
-// later write of the same bytes reuse a blob that is gone. A park already
-// swapped by another conclude of the same blob (two uploads of the space
-// holding the same bytes) leaves its location, and the blob is recorded.
+// while that park, the one concluded, is still there. A release that took
+// the park (a superseded part, an abort or an expired session) has aborted
+// the allocation or removed the accepted blob, and a location written after
+// it would let a later write of the same bytes reuse a blob that is gone. A
+// park of the same bytes recorded since by another write names an
+// allocation this conclude did not accept; it stays, and is concluded on its
+// own. A park already swapped by another conclude of the same blob (two
+// uploads of the space holding the same bytes) leaves its location, and the
+// blob is recorded.
 //
 // It runs under the blob's claim-key lock, so a part upload reusing the
 // park meanwhile (parkBlob) cannot interleave with the swap and the intent
 // update.
-func (b *Backend) recordConcluded(ctx context.Context, space did.DID, digest mh.Multihash, loc uploader.BlobLocation) error {
+func (b *Backend) recordConcluded(ctx context.Context, space did.DID, parked uploader.UploadedBlob, loc uploader.BlobLocation) error {
+	digest := parked.Digest
 	defer b.blobKeys.Lock(blobKey(space, digest))()
 	swapped, err := b.parks.ConcludePark(ctx, registry.BlobLocation{
 		Space:    space,
@@ -1686,7 +1727,7 @@ func (b *Backend) recordConcluded(ctx context.Context, space did.DID, digest mh.
 		Provider: loc.Provider,
 		URL:      loc.URL,
 		Size:     loc.Size,
-	})
+	}, parked.AddTask.Bytes())
 	if err != nil {
 		return fmt.Errorf("record location: %w", err)
 	}

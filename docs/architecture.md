@@ -484,9 +484,11 @@ error. The commit re-checks the latch under the bucket lock, so a teardown that 
 The acceptor is not behind the latch: an abort, a session expiry or a part re-upload can release a
 blob while the acceptor is concluding it. The provider settles the order. A released allocation
 refuses the later accept, and an accepted blob refuses the later abort, so the release removes it
-as accepted. Ingot records an acceptance only while the blob's park row stands, swapping the park
-for the location in one transaction; the release drops the park before anything else, so a
-location is never written for a blob a release has taken.
+as accepted. Ingot records an acceptance only while the park row it concluded stands, matched by
+its `/blob/add` task, swapping the park for the location in one transaction; the release drops the
+park before anything else, so a location is never written for a blob a release has taken, nor
+over a later park of the same bytes. The acceptor never cancels a release: a part holding a blob
+with a release record goes to Complete, whose commit claims the blob.
 
 ### 7.4 Read (`GetObject`)
 
@@ -1094,7 +1096,7 @@ paths below are exercised against the real stack by the smelt-based `itest/` har
   over the `blob_parks` table, the per-upload acceptor in `s3frontend/acceptor.go`, and the
   restart sweep `startAcceptSweeper`.) A parked part holds no local bytes: its spool copy is
   removed once it parks, and the acceptor concludes it from its park row. Complete waits for the
-  acceptor, up to 30 s, and answers a part still queued with a retryable 409. Abort and session
+  acceptor, up to 30 s, and answers a part still queued with a 409 that the AWS CLI treats as final. Abort and session
   expiry unwind parked blobs with `/blob/abort` and accepted ones with `/blob/remove`
   ([§7.2](#72-multipart)–[7.3](#73-the-session-latch-the-abortcomplete-race)).
 - **Crash recovery for the spool is not built.** The `upload_intents` × `blob_refs` reconciliation

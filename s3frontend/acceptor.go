@@ -33,6 +33,14 @@ import (
 // takes at least one part however many blobs it has.
 var acceptBatchBlobs = forgeclient.MaxConcludeReceipts
 
+// acceptPassTimeout bounds one acceptor pass. The Forge client sets no
+// timeout of its own, so without it a conclude whose answer never came would
+// hold the acceptor in one pass for good. A pass that runs out fails like any
+// other and is retried; accepts the upload service ran before the timeout are
+// concluded again on the retry, which it treats as a repeat. A full pass
+// takes well under a minute. Package-level so tests can shrink it.
+var acceptPassTimeout = 2 * time.Minute
+
 // acceptBackoffFirst and acceptBackoffMax bound the wait between an
 // acceptor's failed pass and its retry. Package-level so tests can shrink
 // them.
@@ -191,7 +199,9 @@ func (b *Backend) runAcceptor(ctx context.Context, uploadID string, a *acceptor)
 		a.more = false
 		m.mu.Unlock()
 
-		did, err := b.acceptPass(ctx, uploadID)
+		passCtx, cancel := context.WithTimeout(ctx, acceptPassTimeout)
+		did, err := b.acceptPass(passCtx, uploadID)
+		cancel()
 
 		m.mu.Lock()
 		a.lastErr = err
@@ -257,14 +267,17 @@ func (b *Backend) acceptPass(ctx context.Context, uploadID string) (did bool, er
 	}
 	span.SetAttributes(attribute.Int("ingot.parts", len(batch)), attribute.Int("ingot.blobs.total", len(digests)))
 
-	neverParked, err := b.acceptParked(ctx, sess.Space, digests)
+	left, err := b.acceptParked(ctx, sess.Space, digests, acceptInBackground)
 	if err != nil {
 		return false, err
 	}
-	// A parked part whose blob has neither a park nor a location is not
-	// this acceptor's to finish: uploading from the spool copy is
-	// Complete's fallback, so the part goes back to 'spooled' for it.
-	missing := digestSet(neverParked)
+	// A part holding a blob the acceptor left is not its to finish, and goes
+	// back to 'spooled' for Complete: a blob with neither a park nor a
+	// location is uploaded from its spool copy, and one with a release
+	// record is settled by Complete's commit, which claims it. The move is
+	// guarded by the part's digests, so a part a later upload replaced, or a
+	// session's teardown deleted, is left as it is and its release runs.
+	missing := digestSet(left)
 	var accepted, respooled []registry.MultipartPart
 	for _, p := range batch {
 		whole := true
@@ -281,7 +294,7 @@ func (b *Backend) acceptPass(ctx context.Context, uploadID string) (did bool, er
 		}
 	}
 	if len(respooled) > 0 {
-		b.logger.Warn("multipart accept: parked parts with a blob that has no park; left for Complete",
+		b.logger.Info("multipart accept: parts left for Complete (a blob unparked or being released)",
 			zap.String("upload_id", uploadID), zap.Int("parts", len(respooled)))
 		if _, err := b.multipart.MoveParts(ctx, respooled, registry.PartParked, registry.PartSpooled); err != nil {
 			return false, fmt.Errorf("return parts to spooled: %w", err)

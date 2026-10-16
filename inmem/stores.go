@@ -648,12 +648,12 @@ func (m *MemStore) DeletePark(_ context.Context, space did.DID, digest multihash
 }
 
 // ConcludePark swaps the park for the location under one lock, as Postgres
-// does in one transaction.
-func (m *MemStore) ConcludePark(_ context.Context, loc registry.BlobLocation) (bool, error) {
+// does in one transaction, when the park is the one addTask names.
+func (m *MemStore) ConcludePark(_ context.Context, loc registry.BlobLocation, addTask []byte) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	key := locKey{loc.Space, string(loc.Digest)}
-	if _, ok := m.parks[key]; !ok {
+	if park, ok := m.parks[key]; !ok || !bytes.Equal(park.AddTask, addTask) {
 		return false, nil
 	}
 	delete(m.parks, key)
@@ -1313,6 +1313,18 @@ func (m *MemStore) StartRelease(_ context.Context, space did.DID, digest multiha
 		m.releases[k] = pr
 	}
 	return registry.ReleaseStarted, nil
+}
+
+func (m *MemStore) ReleasingDigests(_ context.Context, space did.DID, digests []multihash.Multihash) (map[string]bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := map[string]bool{}
+	for _, d := range digests {
+		if _, ok := m.releases[locKey{space, string(d)}]; ok {
+			out[string(d)] = true
+		}
+	}
+	return out, nil
 }
 
 func (m *MemStore) CancelRelease(_ context.Context, space did.DID, digest multihash.Multihash) (registry.ReleaseCancel, error) {

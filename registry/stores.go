@@ -434,6 +434,11 @@ type PendingReleaseStore interface {
 	// reuse, or reports one that is started, which the write waits out, or
 	// none.
 	CancelRelease(ctx context.Context, space did.DID, digest multihash.Multihash) (ReleaseCancel, error)
+	// ReleasingDigests returns which of digests have a release record in
+	// space, started or not, keyed by string(digest). It reads and changes
+	// nothing else: for a caller that must leave a blob with a pending
+	// release alone, where CancelRelease is for a write that takes it over.
+	ReleasingDigests(ctx context.Context, space did.DID, digests []multihash.Multihash) (map[string]bool, error)
 	// ListReleasesBySpace returns every intent for space regardless of
 	// not_before — DeleteBucket executes a space's releases immediately (the
 	// bucket is empty and its deletion is explicit, so no reader grace is
@@ -591,10 +596,14 @@ type ParkStore interface {
 	GetPark(ctx context.Context, space did.DID, digest multihash.Multihash) (*BlobPark, error)
 	DeletePark(ctx context.Context, space did.DID, digest multihash.Multihash) error
 	// ConcludePark replaces the space's park of loc.Digest with loc, in one
-	// transaction, and reports whether it did. With the park already gone
-	// nothing is written: another conclude recorded the blob first, or a
-	// release took the park, and with it the blob, while the conclude ran.
-	ConcludePark(ctx context.Context, loc BlobLocation) (bool, error)
+	// transaction, and reports whether it did. addTask is the /blob/add task
+	// (cid bytes) of the park the caller concluded, and only that park is
+	// replaced. With it gone nothing is written: another conclude recorded
+	// the blob first, or a release took the park, and with it the blob,
+	// while the conclude ran. A park of the same digest recorded since by
+	// another write names another allocation, which this conclude did not
+	// accept, and stays for its own.
+	ConcludePark(ctx context.Context, loc BlobLocation, addTask []byte) (bool, error)
 	// HasParkFor reports whether a park row records the /blob/add task
 	// addTask (cid bytes).
 	HasParkFor(ctx context.Context, addTask []byte) (bool, error)

@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -363,10 +364,11 @@ func TestCompleteWaitsForTheAcceptor(t *testing.T) {
 	}
 }
 
-// TestCompleteOverTheWaitBudgetIsRetryable: an acceptor still concluding
-// when the wait budget runs out makes Complete answer OperationAborted and
-// reopen the upload; the retry, once the acceptor is done, commits.
-func TestCompleteOverTheWaitBudgetIsRetryable(t *testing.T) {
+// TestCompleteOverTheWaitBudgetReopensTheUpload: an acceptor still
+// concluding when the wait budget runs out makes Complete answer
+// OperationAborted and reopen the upload, so a client that retries on its
+// own commits once the acceptor is done (botocore clients do not retry it).
+func TestCompleteOverTheWaitBudgetReopensTheUpload(t *testing.T) {
 	saved := acceptWaitBudget
 	acceptWaitBudget = 20 * time.Millisecond
 	t.Cleanup(func() { acceptWaitBudget = saved })
@@ -486,5 +488,52 @@ func TestCompleteFinishesASpooledPart(t *testing.T) {
 	}
 	for _, d := range hygienePartDigests(t, mem, uploadID, 2) {
 		assertAcceptedAndUnparked(t, mem, d)
+	}
+}
+
+// stallingConcluder never answers a conclude while stalled: it waits for its
+// context, as a conclude whose response never comes does.
+type stallingConcluder struct {
+	parkingUploader
+	stalled atomic.Bool
+}
+
+func (s *stallingConcluder) ConcludeBlobs(ctx context.Context, space did.DID, parked []uploader.UploadedBlob) ([]*uploader.BlobLocation, error) {
+	if s.stalled.Load() {
+		<-ctx.Done()
+		return make([]*uploader.BlobLocation, len(parked)), ctx.Err()
+	}
+	return s.parkingUploader.ConcludeBlobs(ctx, space, parked)
+}
+
+// TestAcceptorPassTimesOut: a conclude that never answers ends its pass at
+// acceptPassTimeout, as a failure the acceptor retries, so the upload is not
+// held by one stalled request.
+func TestAcceptorPassTimesOut(t *testing.T) {
+	shrinkAcceptBackoff(t)
+	saved := acceptPassTimeout
+	acceptPassTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { acceptPassTimeout = saved })
+
+	sc := &stallingConcluder{}
+	sc.stalled.Store(true)
+	b, mem := newDeferredBackend(t, sc)
+	ctx := context.Background()
+	key := "accept-pass-timeout"
+	uploadID := mpCreate(t, b, key, "", "")
+	uploadDistinctParts(t, b, key, uploadID, 1)
+
+	startAcceptors(t, b)
+	if err := b.drainAcceptor(ctx, uploadID); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("drainAcceptor against a stalled conclude = %v, want the pass deadline", err)
+	}
+	if states := partStates(t, mem, uploadID); !allIn(states, registry.PartParked) {
+		t.Fatalf("part states after a timed-out pass = %v, want parked", states)
+	}
+
+	sc.stalled.Store(false)
+	drainUntilIdle(t, b, uploadID)
+	if states := partStates(t, mem, uploadID); !allIn(states, registry.PartAccepted) {
+		t.Fatalf("part states after the retry = %v, want accepted", states)
 	}
 }
