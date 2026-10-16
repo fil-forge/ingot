@@ -10,7 +10,8 @@ import (
 // registerCatalogUsageGauges reports each bucket's catalog storage on Forge
 // from the latest snapshot RefreshCatalogUsage took. Each series is labeled by
 // the bucket's space DID rather than its name, which is customer data; a
-// bucket recreated under the same name has a new space, so a new series.
+// bucket recreated under the same name has a new space, so a new series
+// (though see registry.CatalogUsage on rows a failed cleanup left behind).
 func registerCatalogUsageGauges(meter metric.Meter, b *Backend) (metric.Registration, error) {
 	forge, err := meter.Int64ObservableGauge("ingot.catalog.forge_bytes", metric.WithUnit("By"),
 		metric.WithDescription("Bytes of the bucket's catalog segments shipped to Forge and not yet released (their CARs, not their index blobs), by space"))

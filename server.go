@@ -462,8 +462,10 @@ func (s *Server) startLocalBlobSweeper() {
 }
 
 // catalogUsageInterval is how often the catalog gauges' figures are
-// refreshed from the segment rows.
-const catalogUsageInterval = time.Minute
+// refreshed from the segment rows. Each refresh sums every shipped segment
+// row, and a busy bucket adds about 17,000 a day, so it runs rarely; the
+// figures grow slowly.
+const catalogUsageInterval = 5 * time.Minute
 
 // startCatalogUsageSweeper refreshes the figures the catalog gauges report
 // (see Backend.RefreshCatalogUsage) at startup and then every
@@ -566,7 +568,7 @@ func (s *Server) Stop(ctx context.Context) error {
 		}
 	}
 	if err := s.backend.CloseMetrics(); err != nil {
-		errs = append(errs, fmt.Errorf("unregister local blob metrics: %w", err))
+		errs = append(errs, fmt.Errorf("unregister gauges: %w", err))
 	}
 	if err := s.api.ShutDown(); err != nil {
 		errs = append(errs, fmt.Errorf("s3api shutdown: %w", err))

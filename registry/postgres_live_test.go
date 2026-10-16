@@ -1003,7 +1003,7 @@ func TestPostgresStores_Live(t *testing.T) {
 			t.Fatalf("ListRetiredSegments = %+v (err %v), want one row", retired, err)
 		}
 		got := retired[0]
-		if got.Seq != seq || got.RetiredAt != now || got.ShippedAt != now ||
+		if got.Seq != seq || got.RetiredAt != now || got.ShippedAt != now || got.DeadBytes != -1 ||
 			!bytes.Equal(got.SHA256, sha) || !bytes.Equal(got.IndexDigest, indexDigest) {
 			t.Fatalf("retired row = %+v", got)
 		}

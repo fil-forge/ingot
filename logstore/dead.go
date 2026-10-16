@@ -21,7 +21,9 @@ import (
 // reached only through an older segment's block counts as dead although it
 // is live; an older copy of it is then dead instead, so the bucket's dead
 // bytes in total stay right and only the split between dead on arrival and
-// dead later shifts.
+// dead later shifts. The last op-root can also be one the bucket never
+// adopted (its write's root CAS failed after the append); the split is then
+// off by about that write's rewritten path.
 func (s *Segment) deadBytes() (int64, error) {
 	s.stateMu.RLock()
 	defer s.stateMu.RUnlock()

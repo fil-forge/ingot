@@ -45,17 +45,20 @@ func frameSize(blks ...block.Block) int64 {
 	return n
 }
 
-// shippedDeadBytes appends each batch to a fresh store, which seals them
-// into one segment and ships it, and returns the dead bytes the ship
-// recorded.
+// shippedDeadBytes appends each batch to a fresh store, seals them into one
+// segment, which then ships, and returns the dead bytes the ship recorded.
 func shippedDeadBytes(t *testing.T, batches [][]block.Block, roots []cid.Cid) int64 {
 	t.Helper()
-	s, meta, _ := newTestStore(t, 64<<20, 300*time.Millisecond, 6)
+	// Neither seal trigger fires on its own: the seal below is the only one.
+	s, meta, _ := newTestStore(t, 64<<20, time.Hour, 6)
 	ctx := context.Background()
 	for i, blks := range batches {
 		if err := s.AppendBatch(ctx, blks, blockstore.OpRoot{Bucket: "bk", Root: roots[i]}); err != nil {
 			t.Fatalf("append %d: %v", i, err)
 		}
+	}
+	if err := s.catalog.sealOpenIfDue(ctx, true); err != nil {
+		t.Fatalf("seal: %v", err)
 	}
 
 	deadline := time.Now().Add(5 * time.Second)

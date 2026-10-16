@@ -265,7 +265,7 @@ Nothing collects dead catalog blocks yet: each shipped catalog segment stays
 on Forge until its bucket is deleted. With metrics on, these gauges show how
 much catalog storage each bucket holds there and how much of it was dead
 before it shipped. Each is labeled by the bucket's `space` DID, not its name,
-and refreshed every minute.
+and refreshed every five minutes.
 
 | Metric | Meaning |
 | -- | -- |

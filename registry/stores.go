@@ -694,6 +694,8 @@ type GCStore interface {
 // CatalogUsage is one bucket's catalog storage on Forge: the CARs of its
 // shipped catalog segments, which stay registered in its space until
 // DeleteBucket releases them. The segments' index blobs are not counted.
+// Segment rows are matched to the bucket by name: rows a failed DeleteBucket
+// cleanup left behind count toward a later bucket of the same name.
 type CatalogUsage struct {
 	Bucket string
 	Space  did.DID

@@ -191,7 +191,7 @@ func (r *Postgres) ListRetiredSegments(ctx context.Context, plane blockstore.Pla
 func (r *Postgres) listSegments(ctx context.Context, plane blockstore.Plane, bucket string, retired bool) ([]logstore.SegmentMeta, error) {
 	rows, err := r.pool.Query(ctx,
 		`SELECT seq, state, COALESCE(sealed_at, 0), size_bytes, sha256, COALESCE(shipped_at, 0), index_digest,
-		        COALESCE(retired_at, 0)
+		        COALESCE(retired_at, 0), COALESCE(dead_bytes, -1)
 		   FROM ingot.segments
 		  WHERE plane = $1 AND bucket = $2 AND (retired_at IS NOT NULL) = $3
 		  ORDER BY seq ASC`,
@@ -212,8 +212,9 @@ func (r *Postgres) listSegments(ctx context.Context, plane blockstore.Plane, buc
 			shippedAt   int64
 			indexDigest multihash.Multihash
 			retiredAt   int64
+			deadBytes   int64
 		)
-		if err := rows.Scan(&seqInt, &stateS, &sealed, &size, &sha, &shippedAt, &indexDigest, &retiredAt); err != nil {
+		if err := rows.Scan(&seqInt, &stateS, &sealed, &size, &sha, &shippedAt, &indexDigest, &retiredAt, &deadBytes); err != nil {
 			return nil, fmt.Errorf("registry: scan segment: %w", err)
 		}
 		state, ok := logstore.ParseState(stateS)
@@ -230,6 +231,7 @@ func (r *Postgres) listSegments(ctx context.Context, plane blockstore.Plane, buc
 			SHA256:      sha,
 			ShippedAt:   shippedAt,
 			IndexDigest: indexDigest,
+			DeadBytes:   deadBytes,
 			RetiredAt:   retiredAt,
 		})
 	}
