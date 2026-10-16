@@ -135,9 +135,11 @@ type Config struct {
 	// holds, oldest first, down to 90% of the budget; reads of an evicted blob go to the
 	// provider. Usage can exceed the budget by ingest rate × 30 seconds
 	// between sweeps, and by files that must stay (the spool's, and orphans
-	// younger than LocalBlobOrphanAge). 0 → no budget (the default); negative
-	// is an error.
-	LocalBlobMaxBytes int64 `mapstructure:"local_blob_max_bytes" yaml:"local_blob_max_bytes"`
+	// younger than LocalBlobOrphanAge). Required unless CacheWrites is
+	// false, since without a budget the cache grows with every live object's
+	// bodies; 0 → no budget; negative is an error. A pointer, so an explicit
+	// 0 is distinguishable from unset.
+	LocalBlobMaxBytes *int64 `mapstructure:"local_blob_max_bytes" yaml:"local_blob_max_bytes"`
 	// CacheMinResidency is the read-after-write window (Go duration string):
 	// the sweeper leaves alone a cached blob whose upload state changed less
 	// than this long ago (for a committed blob, its commit time) unless usage
@@ -162,8 +164,8 @@ type Config struct {
 	// provider has accepted it, so a read soon after a write is served from
 	// local disk. false drops the copy at once: local disk then holds only
 	// bodies still being written or uploaded, and every read goes to the
-	// provider. A pointer, so an explicit false is distinguishable from unset
-	// (true).
+	// provider, so LocalBlobMaxBytes may then be left unset. A pointer, so an
+	// explicit false is distinguishable from unset (true).
 	CacheWrites *bool `mapstructure:"cache_writes" yaml:"cache_writes"`
 
 	// CatalogPlane overrides the catalog logstore pipeline knobs. Any field
@@ -265,8 +267,16 @@ func (c Config) ServerConfig() (ServerConfig, error) {
 	if localBlobOrphanAge < time.Hour {
 		return ServerConfig{}, fmt.Errorf("ingot: local_blob_orphan_age %q: must be at least 1h, longer than any request body takes to stream", c.LocalBlobOrphanAge)
 	}
-	if c.LocalBlobMaxBytes < 0 {
-		return ServerConfig{}, fmt.Errorf("ingot: local_blob_max_bytes %d: must not be negative (0 means no budget)", c.LocalBlobMaxBytes)
+	dropAcceptedBodies := c.CacheWrites != nil && !*c.CacheWrites
+	var localBlobMaxBytes int64
+	switch {
+	case c.LocalBlobMaxBytes != nil:
+		localBlobMaxBytes = *c.LocalBlobMaxBytes
+	case !dropAcceptedBodies:
+		return ServerConfig{}, errors.New("ingot: local_blob_max_bytes is required unless cache_writes is false: a byte budget for the spool and the cache, or 0 for none")
+	}
+	if localBlobMaxBytes < 0 {
+		return ServerConfig{}, fmt.Errorf("ingot: local_blob_max_bytes %d: must not be negative (0 means no budget)", localBlobMaxBytes)
 	}
 	// Render the CORS configuration here — the single place it is built —
 	// so a typo fails at startup (via Validate) rather than from New.
@@ -295,11 +305,11 @@ func (c Config) ServerConfig() (ServerConfig, error) {
 		MultipartSessionTTL: mpTTL,
 		ReleaseGrace:        releaseGrace,
 
-		LocalBlobMaxBytes:  c.LocalBlobMaxBytes,
+		LocalBlobMaxBytes:  localBlobMaxBytes,
 		CacheMinResidency:  cacheMinResidency,
 		CacheReadRetention: cacheReadRetention,
 		LocalBlobOrphanAge: localBlobOrphanAge,
-		DropAcceptedBodies: c.CacheWrites != nil && !*c.CacheWrites,
+		DropAcceptedBodies: dropAcceptedBodies,
 
 		AllowNoneEncryption: c.Encryption.AllowNone,
 	}, nil

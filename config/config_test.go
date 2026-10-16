@@ -38,6 +38,7 @@ func validConfig(t *testing.T) Config {
 		AuthServiceProofs: encodedProofs(t, mintDelegation(t)),
 		RegionKey:         RegionKeyConfig{Provider: "inprocess"},
 		TenantKey:         TenantKeyConfig{PLCDirectoryURL: "http://plc.example:3000"},
+		LocalBlobMaxBytes: new(int64),
 	}
 }
 
@@ -97,7 +98,15 @@ func TestValidate_RequiredFields(t *testing.T) {
 		{"revocation did without url", func(c *Config) { c.RevocationServiceDID = "did:web:swarf.example" }, "revocation_service_url and revocation_service_did must be set together"},
 		{"bad seal_age", func(c *Config) { c.SealAge = "not-a-duration" }, "parse seal_age"},
 		{"bad release_grace", func(c *Config) { c.ReleaseGrace = "soon" }, "parse release_grace"},
-		{"negative local_blob_max_bytes", func(c *Config) { c.LocalBlobMaxBytes = -1 }, "local_blob_max_bytes -1: must not be negative"},
+		{"local_blob_max_bytes unset", func(c *Config) { c.LocalBlobMaxBytes = nil }, "local_blob_max_bytes is required unless cache_writes is false"},
+		{"local_blob_max_bytes unset, writes cached", func(c *Config) {
+			yes := true
+			c.LocalBlobMaxBytes, c.CacheWrites = nil, &yes
+		}, "local_blob_max_bytes is required unless cache_writes is false"},
+		{"negative local_blob_max_bytes", func(c *Config) {
+			budget := int64(-1)
+			c.LocalBlobMaxBytes = &budget
+		}, "local_blob_max_bytes -1: must not be negative"},
 		{"bad cache_min_residency", func(c *Config) { c.CacheMinResidency = "soon" }, "parse cache_min_residency"},
 		{"negative cache_min_residency", func(c *Config) { c.CacheMinResidency = "-1m" }, `cache_min_residency "-1m": must not be negative`},
 		{"negative cache_read_retention", func(c *Config) { c.CacheReadRetention = "-1m" }, `cache_read_retention "-1m": must not be negative`},
@@ -155,12 +164,21 @@ func TestServerConfig_LocalBlobKnobs(t *testing.T) {
 		{
 			name: "explicit values",
 			mutate: func(c *Config) {
-				c.LocalBlobMaxBytes = 1 << 40
+				budget := int64(1 << 40)
+				c.LocalBlobMaxBytes = &budget
 				c.CacheMinResidency = "0s"
 				c.CacheReadRetention = "15m"
 				c.LocalBlobOrphanAge = "2h"
 			},
 			want: localBlobKnobs{MaxBytes: 1 << 40, MinResidency: 0, ReadRetention: 15 * time.Minute, OrphanAge: 2 * time.Hour},
+		},
+		{
+			name: "budget unset, writes not cached",
+			mutate: func(c *Config) {
+				no := false
+				c.LocalBlobMaxBytes, c.CacheWrites = nil, &no
+			},
+			want: localBlobKnobs{MaxBytes: 0, MinResidency: 10 * time.Minute, ReadRetention: time.Hour, OrphanAge: 24 * time.Hour},
 		},
 	}
 	for _, tc := range cases {
@@ -330,8 +348,8 @@ func TestLoad_EnvWithoutYAMLKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.LocalBlobMaxBytes != 1<<30 {
-		t.Errorf("local_blob_max_bytes = %d, want %d", cfg.LocalBlobMaxBytes, 1<<30)
+	if cfg.LocalBlobMaxBytes == nil || *cfg.LocalBlobMaxBytes != 1<<30 {
+		t.Errorf("local_blob_max_bytes = %v, want %d", cfg.LocalBlobMaxBytes, 1<<30)
 	}
 	if cfg.LocalBlobOrphanAge != "2h" {
 		t.Errorf("local_blob_orphan_age = %q, want 2h", cfg.LocalBlobOrphanAge)
@@ -356,6 +374,43 @@ func TestLoad_EnvWithoutYAMLKey(t *testing.T) {
 	}
 	if cfg.Addr != "0.0.0.0:8080" {
 		t.Errorf("addr = %q, want the default 0.0.0.0:8080", cfg.Addr)
+	}
+}
+
+// TestLoad_LocalBlobMaxBytes: an explicit 0 loads as set, so ServerConfig can
+// tell it from a missing key, and an empty INGOT_LOCAL_BLOB_MAX_BYTES leaves
+// the key as the file has it.
+func TestLoad_LocalBlobMaxBytes(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		yaml     string
+		emptyEnv bool
+		set      bool
+	}{
+		{name: "0 in the file", yaml: "local_blob_max_bytes: 0\n", set: true},
+		{name: "missing from the file", yaml: "addr: \"127.0.0.1:9000\"\n", set: false},
+		{name: "0 in the file, empty variable", yaml: "local_blob_max_bytes: 0\n", emptyEnv: true, set: true},
+		{name: "missing from the file, empty variable", yaml: "addr: \"127.0.0.1:9000\"\n", emptyEnv: true, set: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.emptyEnv {
+				t.Setenv("INGOT_LOCAL_BLOB_MAX_BYTES", "")
+			}
+			cfgFile := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(cfgFile, []byte(tc.yaml), 0o600); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+			cfg, err := Load(cfgFile)
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if set := cfg.LocalBlobMaxBytes != nil; set != tc.set {
+				t.Fatalf("local_blob_max_bytes set = %v, want %v", set, tc.set)
+			}
+			if tc.set && *cfg.LocalBlobMaxBytes != 0 {
+				t.Fatalf("local_blob_max_bytes = %d, want 0", *cfg.LocalBlobMaxBytes)
+			}
+		})
 	}
 }
 

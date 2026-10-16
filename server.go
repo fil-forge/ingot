@@ -290,6 +290,7 @@ func (s *Server) Start(ctx context.Context) error {
 		zap.String("region", s.cfg.Region),
 		zap.String("data_dir", s.cfg.DataDir),
 		zap.Int64("max_blob_size", s.cfg.MaxBlobSize),
+		zap.Int64("local_blob_max_bytes", s.cfg.LocalBlobMaxBytes),
 	)
 	go func() {
 		if err := s.api.ServeMultiPort([]string{s.cfg.Addr}); err != nil {

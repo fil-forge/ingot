@@ -1048,7 +1048,8 @@ paths below are exercised against the real stack by the smelt-based `itest/` har
   read-after-write window (`cache_min_residency`) and a read-recency window (`cache_read_retention`)
   unless usage stays over budget, in which case it evicts inside them, only down to the budget;
   hourly it deletes orphan files. Once at startup, `serve` deletes the copies of committed blobs
-  whose release finished while releases kept them. The budget is off by default. A release frees a
+  whose release finished while releases kept them. `local_blob_max_bytes` is required unless
+  `cache_writes` is false; `0` means no budget. A release frees a
   deleted object's local copies, and a parked part's copy goes once it parks. Local blob storage
   reports its usage by directory, budget, stalled uploads, removals by reason and reads by tier as
   OpenTelemetry metrics (`ingot.local_blobs.*`). With `cache_writes: false`, a body's copy goes as
