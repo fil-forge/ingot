@@ -511,6 +511,10 @@ type IntentStore interface {
 type LocationStore interface {
 	PutLocation(ctx context.Context, loc BlobLocation) error
 	GetLocation(ctx context.Context, space did.DID, digest multihash.Multihash) (*BlobLocation, error)
+	// GetLocations returns the space's locations for digests in one query,
+	// keyed by string(digest). A digest with no location is absent from the
+	// map; that is not an error.
+	GetLocations(ctx context.Context, space did.DID, digests []multihash.Multihash) (map[string]BlobLocation, error)
 	DeleteLocation(ctx context.Context, space did.DID, digest multihash.Multihash) error
 }
 
@@ -531,6 +535,10 @@ type LocationStore interface {
 type EncryptionParamsStore interface {
 	PutEncryptionParams(ctx context.Context, params BlobEncryptionParams) error
 	GetEncryptionParams(ctx context.Context, space did.DID, digest multihash.Multihash) (*BlobEncryptionParams, error)
+	// GetEncryptionParamsBatch returns the space's rows for digests in one
+	// query, keyed by string(digest). A digest with no row is absent from the
+	// map; that is not an error.
+	GetEncryptionParamsBatch(ctx context.Context, space did.DID, digests []multihash.Multihash) (map[string]BlobEncryptionParams, error)
 	DeleteEncryptionParams(ctx context.Context, space did.DID, digest multihash.Multihash) error
 	// RewrapEncryptionParams replaces the wrapped CEK and its key version for an
 	// already-encrypted blob, leaving every other parameter untouched — the write

@@ -137,7 +137,7 @@ func (b *Backend) openCopySource(ctx context.Context, src *resolvedVersion, star
 	if end < start {
 		return io.NopCloser(bytes.NewReader(nil)), nil
 	}
-	opener, err := b.bodyOpener(ctx, src.st.Space, src.mf.Body, src.mf.Plaintext)
+	opener, err := b.bodyOpener(ctx, src.st.Space, src.mf.Body, src.mf.Plaintext, start, end)
 	if err != nil {
 		return nil, err
 	}
