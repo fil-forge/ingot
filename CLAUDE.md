@@ -341,6 +341,16 @@ it. CI checkouts and the Docker build context don't contain the parent `go.work`
 `go.mod`. Only *local* `go`/`goreleaser` runs need it; to release from a
 workspace checkout: `GOWORK=off goreleaser release --clean`.
 
+## Observability
+
+When a change adds or alters something operational, decide how on-call would
+know it had broken, and add what is useful in the same PR: metrics, trace
+spans, and an alert or dashboard panel in fil-forge/infra-central. Skip it for
+changes nothing operational depends on. List each new metric in a metrics
+table in the README: the local blob one, or a new one beside it. "Adding a
+signal" in [`docs/observability.md`](docs/observability.md) says how to do
+each.
+
 ## Conventions & gotchas
 
 - **`GOWORK=off` for every *local* go command** (build/test/vet/run/tidy). The
