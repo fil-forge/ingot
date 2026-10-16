@@ -95,12 +95,15 @@ func TestForgeShipProofsCache(t *testing.T) {
 }
 
 // TestForgeShipProofsOnlyBorrowable: a write captures its store only when the
-// IAM layer marked it borrowable and it can report a revocation's drop; one
-// that may not be borrowed leaves the space's earlier capture in place.
+// IAM layer marked it borrowable and it can report a revocation's drop, and
+// not once dropped; one that may not be borrowed leaves the space's earlier
+// capture in place.
 func TestForgeShipProofsOnlyBorrowable(t *testing.T) {
 	fg := newTestForge(t)
 	ctx := context.Background()
-	space := mustSpace(t)
+	spaceKey, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	space := spaceKey.DID()
 
 	scoped := ucanlib.ProofStore(iam.NewDelegationCache(nil))
 	fg.captureShipProofs(context.WithValue(ctx, reqscope.ProofStoreKey(), scoped), space)
@@ -113,13 +116,22 @@ func TestForgeShipProofsOnlyBorrowable(t *testing.T) {
 		t.Fatal("captured a store that can't report a revocation's drop")
 	}
 
+	keys := iam.NewKeyProofs()
+	dropped, grant := keyStore(t, keys, spaceKey)
+	require.Len(t, keys.InvalidateHolders(grant.Link()), 1)
+
 	held := ucanlib.ProofStore(iam.NewDelegationCache(nil))
 	fg.captureShipProofs(borrowable(held), space)
-	unmarked := context.WithValue(borrowable(scoped), reqscope.BorrowableKey(), false)
-	fg.captureShipProofs(unmarked, space)
-	got, ok := fg.shipProofStore(ctx, space)
-	require.True(t, ok)
-	require.Same(t, held, got, "a store not marked borrowable replaced the capture")
+	for name, ctx := range map[string]context.Context{
+		"a store not marked borrowable":                 context.WithValue(borrowable(scoped), reqscope.BorrowableKey(), false),
+		"a store that can't report a revocation's drop": borrowable(tokenstore.NewMemStore()),
+		"a store a revocation dropped":                  borrowable(dropped),
+	} {
+		fg.captureShipProofs(ctx, space)
+		got, ok := fg.shipProofStore(context.Background(), space)
+		require.True(t, ok)
+		require.Same(t, held, got, "%s replaced the capture", name)
+	}
 }
 
 // TestForgeShipProofsDropsRevoked: once a revocation drops the captured

@@ -69,7 +69,7 @@ type QueuedUpload struct {
 func (u *Forge) CaptureAuthority(ctx context.Context, space did.DID, cmd ucan.Command) ([]byte, error) {
 	store, ok := u.shipProofStore(ctx, space)
 	if !ok {
-		return nil, fmt.Errorf("uploader: no proof store for space %s (no request scope and no captured write authority)", space)
+		return nil, fmt.Errorf("uploader: no proof store for space %s (no request scope; %s)", space, noCapturedAuthority)
 	}
 	proofs, _, err := store.ProofChain(ctx, u.client.Issuer().DID(), cmd, space)
 	if err != nil {

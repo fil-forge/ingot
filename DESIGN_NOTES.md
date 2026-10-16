@@ -468,9 +468,10 @@ draws the chains and the stores.
 - **Reads carry no bucket context**: `Manager.Get` linear-scans every open
   bucket store; threading the bucket into the read path removes the scan.
 - **The ship authority expires**: the async flush signs with a per-space
-  proof store captured at the last in-request write (1h TTL); a bucket idle
-  longer than that, or whose captured store a revocation has dropped, cannot
-  ship a newly sealed segment until its next write.
+  proof store captured at the last in-request body upload (1h TTL); a
+  bucket without one for longer than that, or whose captured store a
+  revocation has dropped, cannot ship a newly sealed segment until a body
+  upload with a borrowable store re-captures it.
 - **The indexer read path is unwired**: `LocalLocator` serves all reads; the
   network index is still published (best-effort) but never consulted.
 - **Carried Forge-client copies**: `forgeclient/`, `tokenstore/`,

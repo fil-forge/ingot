@@ -83,6 +83,10 @@ type Forge struct {
 // segment sealed just after a write still finds its space's store.
 const shipProofsTTL = time.Hour
 
+// noCapturedAuthority says why shipProofStore found nothing outside a
+// request, for the errors of the calls that need it.
+const noCapturedAuthority = "no body upload has left a borrowable store within the last hour, or a revocation dropped it"
+
 // ForgeConfig wires a Forge uploader.
 //
 // Client is the configured edge-client to sprue (it carries the agent
@@ -130,7 +134,7 @@ func (u *Forge) captureShipProofs(ctx context.Context, space did.DID) {
 // shipProofStore resolves the proof store authorizing a ship to space: the
 // request-scoped store if this runs in-request, else the most recent
 // captured store for the space, unless a revocation has dropped it since.
-// ok=false means neither exists.
+// ok=false means neither is usable.
 func (u *Forge) shipProofStore(ctx context.Context, space did.DID) (ucanlib.ProofStore, bool) {
 	if store, ok := reqscope.ProofStore(ctx); ok {
 		return store, true
@@ -149,11 +153,12 @@ func (u *Forge) SubmitShard(ctx context.Context, plane blockstore.Plane, space d
 	}
 
 	// The ship runs async (flush goroutine, no request), so its authority is
-	// the store captured from a recent in-request write to this space. No
-	// store → fail so the flush retries; a later write repopulates it.
+	// the store captured from a recent body upload to this space. No usable
+	// store → fail so the flush retries; a later body upload with a
+	// borrowable store repopulates it.
 	store, ok := u.shipProofStore(ctx, space)
 	if !ok {
-		return BlobLocation{}, nil, fmt.Errorf("uploader: no ship authority for space %s (no captured proof store)", space)
+		return BlobLocation{}, nil, fmt.Errorf("uploader: no ship authority for space %s (%s)", space, noCapturedAuthority)
 	}
 
 	// The index blob's bytes and digest are deterministic from the shard, so
