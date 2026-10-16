@@ -218,7 +218,6 @@ func TestDecryptingRead_MissingParamsRowFailsClosed(t *testing.T) {
 // asked for.
 type countingEncStores struct {
 	registry.EncryptionParamsStore
-	locs         registry.LocationStore
 	singleParams int
 	paramBatches [][]multihash.Multihash
 	singleLocs   int
