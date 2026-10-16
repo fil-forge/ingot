@@ -280,10 +280,27 @@ by the location commitment. The indexing-service query path is implemented
 but unwired. The full trace is the
 [GetObject diagram](./docs/diagrams.md#getobject-version-resolution-local-tiers-network-retrieval).
 
+**The blob list** (`bucket/blobs.go`) keeps a body's first 1,024 blobs in
+the manifest as `[digest, offset]` tuples and the rest in extent blocks of
+1,024, catalog blocks under `"/blobextent/0"` that the manifest points to
+by `[offset, CID]`. A blob ends where the next begins. A ranged GET loads
+the manifest and the extents its range covers, each once: one for any range
+within an extent, which spans about 256 GiB at the default blob size. The write path builds a flat list (`BlobRefs`) and `commitVersion`
+cuts it into extents inside the commit's transaction, so a copy, which
+writes the source's blobs into another bucket's catalog, hands the commit
+the list rather than the source's extent links. One manifest holds at most
+8,389,632 blobs (`bucket.MaxBodyBlobs`, cbor-gen's 8,192-entry cap on the
+extent list); a Complete over it is refused with `EntityTooLarge` before
+the session latches. A PutObject or CopyObject is at most 5 GiB and accepts
+its blobs before the commit, so it is kept under the limit by configuration
+instead: `max_blob_size` may not be below 1 KiB (`config.MinMaxBlobSize`). The 48.8 TiB S3 maximum fits whenever `max_blob_size`
+is at least 6.11 MiB. `PartSizes` and `PartChecksums` hold 10,000 entries,
+S3's part limit.
+
 **Encrypted blobs** (the FilOne encryption design's read side) decrypt inside
 the per-blob open, leaving every other read-path value plaintext: the
-manifest's `BlobRef.Start/End`, `Body.Size`, ETag and Content-Length are
-plaintext coordinates, while `BlobRef.Digest` names the stored FEE envelope.
+manifest's blob offsets, `Body.Size`, ETag and Content-Length are
+plaintext coordinates, while each blob's digest names the stored FEE envelope.
 A `blob_encryption_params` row marks a blob encrypted and carries what its
 decryptor needs; the read unwraps the region-wrapped CEK through
 `regionkey.Provider` (OpenBao transit in production, bound to the blob's
@@ -294,6 +311,13 @@ or piri via `OpenBlobRange`), and decrypts it as it streams
 The encryption-params store and region key provider are required
 dependencies; only the provider implementation (openbao vs inprocess) is
 configuration.
+The opener fetches the params rows and locations of the blobs a read covers
+one extent at a time, two set-based queries per extent, and keeps only the
+current extent's, so a read holds about 1,024 blobs' key material whatever
+the body's size. The extent holding
+the read's first byte is fetched before any response headers, so a missing
+row there fails the request; a later extent of a long read is fetched when
+the read reaches it, and a missing row there ends the response body.
 HEAD never decrypts. See `s3frontend/decrypt.go`.
 
 **Bucket encryption** (`s3frontend/sse.go`) is the S3 bucket-encryption API

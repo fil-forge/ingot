@@ -64,7 +64,7 @@ func TestSplitBody_StreamingRoundTrip(t *testing.T) {
 	const max = int64(4096)
 	data := makeData(10000) // → blobs of 4096, 4096, 1808
 
-	body, err := SplitBody(ctx, sp, bytes.NewReader(data), max)
+	body, blobs, err := SplitBody(ctx, sp, bytes.NewReader(data), max)
 	if err != nil {
 		t.Fatalf("SplitBody: %v", err)
 	}
@@ -78,11 +78,11 @@ func TestSplitBody_StreamingRoundTrip(t *testing.T) {
 	}
 
 	wantBounds := []struct{ start, end int64 }{{0, 4095}, {4096, 8191}, {8192, 9999}}
-	if len(body.Blobs) != len(wantBounds) {
-		t.Fatalf("got %d blobs, want %d", len(body.Blobs), len(wantBounds))
+	if len(blobs) != len(wantBounds) {
+		t.Fatalf("got %d blobs, want %d", len(blobs), len(wantBounds))
 	}
 	for i, w := range wantBounds {
-		b := body.Blobs[i]
+		b := blobs[i]
 		if b.Start != w.start || b.End != w.end {
 			t.Errorf("blob %d = [%d,%d], want [%d,%d]", i, b.Start, b.End, w.start, w.end)
 		}
@@ -93,7 +93,7 @@ func TestSplitBody_StreamingRoundTrip(t *testing.T) {
 		}
 	}
 
-	got, err := io.ReadAll(OpenBody(ctx, NewPlainOpener(sp), did.Undef, body))
+	got, err := io.ReadAll(OpenBody(ctx, NewPlainOpener(sp), did.Undef, blobs))
 	if err != nil {
 		t.Fatalf("OpenBody read: %v", err)
 	}
@@ -109,7 +109,7 @@ func TestOpenBodyRange(t *testing.T) {
 	sp := testSpool(t)
 	const max = int64(4096)
 	data := makeData(10000)
-	body, err := SplitBody(ctx, sp, bytes.NewReader(data), max)
+	_, blobs, err := SplitBody(ctx, sp, bytes.NewReader(data), max)
 	if err != nil {
 		t.Fatalf("SplitBody: %v", err)
 	}
@@ -124,7 +124,7 @@ func TestOpenBodyRange(t *testing.T) {
 		{100, 8500},  // spans all three blobs, mid-blob start
 	}
 	for _, c := range cases {
-		got, err := io.ReadAll(OpenBodyRange(ctx, NewPlainOpener(sp), did.Undef, body, c.start, c.end))
+		got, err := io.ReadAll(OpenBodyRange(ctx, NewPlainOpener(sp), did.Undef, blobs, c.start, c.end))
 		if err != nil {
 			t.Fatalf("range [%d,%d]: %v", c.start, c.end, err)
 		}
@@ -139,12 +139,12 @@ func TestOpenBodyRange(t *testing.T) {
 func TestSplitBody_Empty(t *testing.T) {
 	ctx := context.Background()
 	sp := testSpool(t)
-	body, err := SplitBody(ctx, sp, bytes.NewReader(nil), 4096)
+	body, blobs, err := SplitBody(ctx, sp, bytes.NewReader(nil), 4096)
 	if err != nil {
 		t.Fatalf("SplitBody: %v", err)
 	}
-	if body.Size != 0 || len(body.Blobs) != 0 {
-		t.Fatalf("empty body: Size=%d Blobs=%d, want 0/0", body.Size, len(body.Blobs))
+	if body.Size != 0 || len(blobs) != 0 {
+		t.Fatalf("empty body: Size=%d Blobs=%d, want 0/0", body.Size, len(blobs))
 	}
 	emptyMD5 := md5.Sum(nil)
 	if !bytes.Equal(body.MD5, emptyMD5[:]) {
@@ -206,7 +206,7 @@ func BenchmarkSplitBody(b *testing.B) {
 	b.ReportAllocs()
 
 	for b.Loop() {
-		if _, err := SplitBody(context.Background(), hashingDiscardWriter{}, bytes.NewReader(data), 0); err != nil {
+		if _, _, err := SplitBody(context.Background(), hashingDiscardWriter{}, bytes.NewReader(data), 0); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -224,7 +224,7 @@ func BenchmarkSplitBodyParallel(b *testing.B) {
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			if _, err := SplitBody(context.Background(), hashingDiscardWriter{}, bytes.NewReader(data), 0); err != nil {
+			if _, _, err := SplitBody(context.Background(), hashingDiscardWriter{}, bytes.NewReader(data), 0); err != nil {
 				b.Fatal(err)
 			}
 		}
@@ -236,11 +236,11 @@ func TestSplitBody_WithoutMD5(t *testing.T) {
 	ctx := context.Background()
 	sp := testSpool(t)
 	data := makeData(3*4096 + 100)
-	with, err := SplitBody(ctx, sp, bytes.NewReader(data), 4096)
+	with, withBlobs, err := SplitBody(ctx, sp, bytes.NewReader(data), 4096)
 	if err != nil {
 		t.Fatalf("SplitBody: %v", err)
 	}
-	without, err := SplitBody(ctx, testSpool(t), bytes.NewReader(data), 4096, WithoutMD5())
+	without, withoutBlobs, err := SplitBody(ctx, testSpool(t), bytes.NewReader(data), 4096, WithoutMD5())
 	if err != nil {
 		t.Fatalf("SplitBody without md5: %v", err)
 	}
@@ -251,11 +251,11 @@ func TestSplitBody_WithoutMD5(t *testing.T) {
 	if !bytes.Equal(with.MD5, wantMD5[:]) {
 		t.Errorf("default Body.MD5 mismatch")
 	}
-	if !bytes.Equal(with.BLAKE3, without.BLAKE3) || with.Size != without.Size || len(with.Blobs) != len(without.Blobs) {
+	if !bytes.Equal(with.BLAKE3, without.BLAKE3) || with.Size != without.Size || len(withBlobs) != len(withoutBlobs) {
 		t.Fatalf("split differs without md5: %+v vs %+v", with, without)
 	}
-	for i := range with.Blobs {
-		if !bytes.Equal(with.Blobs[i].Digest, without.Blobs[i].Digest) || with.Blobs[i].Start != without.Blobs[i].Start || with.Blobs[i].End != without.Blobs[i].End {
+	for i := range withBlobs {
+		if !bytes.Equal(withBlobs[i].Digest, withoutBlobs[i].Digest) || withBlobs[i].Start != withoutBlobs[i].Start || withBlobs[i].End != withoutBlobs[i].End {
 			t.Fatalf("blob %d differs without md5", i)
 		}
 	}
@@ -291,7 +291,7 @@ func BenchmarkSplitBodyNoMD5(b *testing.B) {
 	b.ReportAllocs()
 
 	for b.Loop() {
-		if _, err := SplitBody(context.Background(), hashingDiscardWriter{}, bytes.NewReader(data), 0, WithoutMD5()); err != nil {
+		if _, _, err := SplitBody(context.Background(), hashingDiscardWriter{}, bytes.NewReader(data), 0, WithoutMD5()); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -324,11 +324,10 @@ func TestPlainOpenerAsksForTheRange(t *testing.T) {
 	if err != nil {
 		t.Fatalf("multihash: %v", err)
 	}
-	ref := BlobRef{Digest: d, Start: 0, End: int64(len(data)) - 1}
-	body := Body{Size: int64(len(data)), Blobs: []BlobRef{ref}}
+	blobs := BlobRefs{{Digest: d, Start: 0, End: int64(len(data)) - 1}}
 	start, end := int64(len(data))-20, int64(len(data))-1
 
-	got, err := io.ReadAll(OpenBodyRange(context.Background(), NewPlainOpener(rr), did.Undef, body, start, end))
+	got, err := io.ReadAll(OpenBodyRange(context.Background(), NewPlainOpener(rr), did.Undef, blobs, start, end))
 	if err != nil {
 		t.Fatalf("read range: %v", err)
 	}

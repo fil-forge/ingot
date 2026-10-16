@@ -53,29 +53,31 @@ func TestSplitSizedBody(t *testing.T) {
 	t.Run("splits at the blob ceiling and matches SplitBody", func(t *testing.T) {
 		data := makeData(2500)
 		w := &sizedRecorder{}
-		body, err := SplitSizedBody(ctx, w, bytes.NewReader(data), int64(len(data)), max)
+		body, blobs, err := SplitSizedBody(ctx, w, bytes.NewReader(data), int64(len(data)), max)
 		require.NoError(t, err)
 		require.Equal(t, []int64{1000, 1000, 500}, w.declared)
 		require.Equal(t, data, bytes.Join(w.blobs, nil))
 
-		want, err := SplitBody(ctx, hashingDiscardWriter{}, bytes.NewReader(data), max)
+		want, wantBlobs, err := SplitBody(ctx, hashingDiscardWriter{}, bytes.NewReader(data), max)
 		require.NoError(t, err)
 		require.Equal(t, want, body)
+		require.Equal(t, wantBlobs, blobs)
 	})
 
 	t.Run("skips the MD5 as SplitBody does", func(t *testing.T) {
 		data := makeData(2500)
-		body, err := SplitSizedBody(ctx, &sizedRecorder{}, bytes.NewReader(data), int64(len(data)), max, WithoutMD5())
+		body, blobs, err := SplitSizedBody(ctx, &sizedRecorder{}, bytes.NewReader(data), int64(len(data)), max, WithoutMD5())
 		require.NoError(t, err)
 		require.Nil(t, body.MD5)
 
-		want, err := SplitBody(ctx, hashingDiscardWriter{}, bytes.NewReader(data), max, WithoutMD5())
+		want, wantBlobs, err := SplitBody(ctx, hashingDiscardWriter{}, bytes.NewReader(data), max, WithoutMD5())
 		require.NoError(t, err)
 		require.Equal(t, want, body)
+		require.Equal(t, wantBlobs, blobs)
 	})
 
 	t.Run("an empty body has the empty MD5", func(t *testing.T) {
-		body, err := SplitSizedBody(ctx, &sizedRecorder{}, bytes.NewReader(nil), 0, max)
+		body, _, err := SplitSizedBody(ctx, &sizedRecorder{}, bytes.NewReader(nil), 0, max)
 		require.NoError(t, err)
 		empty := md5.Sum(nil)
 		require.Equal(t, empty[:], body.MD5)
@@ -84,50 +86,50 @@ func TestSplitSizedBody(t *testing.T) {
 	t.Run("an exact multiple of the ceiling has no empty blob", func(t *testing.T) {
 		data := makeData(2000)
 		w := &sizedRecorder{}
-		body, err := SplitSizedBody(ctx, w, bytes.NewReader(data), 2000, max)
+		_, blobs, err := SplitSizedBody(ctx, w, bytes.NewReader(data), 2000, max)
 		require.NoError(t, err)
 		require.Equal(t, []int64{1000, 1000}, w.declared)
-		require.Len(t, body.Blobs, 2)
+		require.Len(t, blobs, 2)
 	})
 
 	t.Run("an empty body has no blobs", func(t *testing.T) {
 		w := &sizedRecorder{}
-		body, err := SplitSizedBody(ctx, w, bytes.NewReader(nil), 0, max)
+		_, blobs, err := SplitSizedBody(ctx, w, bytes.NewReader(nil), 0, max)
 		require.NoError(t, err)
-		require.Empty(t, body.Blobs)
+		require.Empty(t, blobs)
 		require.Empty(t, w.declared)
 	})
 
 	t.Run("a short body fails inside the blob that runs out", func(t *testing.T) {
 		w := &sizedRecorder{}
-		_, err := SplitSizedBody(ctx, w, bytes.NewReader(makeData(1500)), 2500, max)
+		_, _, err := SplitSizedBody(ctx, w, bytes.NewReader(makeData(1500)), 2500, max)
 		require.ErrorIs(t, err, ErrBodyShort)
 		require.Equal(t, []int64{1000, 1000}, w.declared)
 	})
 
 	t.Run("a long body fails inside the last blob", func(t *testing.T) {
 		w := &sizedRecorder{}
-		_, err := SplitSizedBody(ctx, w, bytes.NewReader(makeData(1501)), 1500, max)
+		_, _, err := SplitSizedBody(ctx, w, bytes.NewReader(makeData(1501)), 1500, max)
 		require.ErrorIs(t, err, ErrBodyLong)
 		require.Equal(t, []int64{1000, 500}, w.declared)
 		require.Len(t, w.blobs, 1, "the last blob's writer sees the failure")
 	})
 
 	t.Run("a non-empty body declared empty fails", func(t *testing.T) {
-		_, err := SplitSizedBody(ctx, &sizedRecorder{}, bytes.NewReader([]byte{1}), 0, max)
+		_, _, err := SplitSizedBody(ctx, &sizedRecorder{}, bytes.NewReader([]byte{1}), 0, max)
 		require.ErrorIs(t, err, ErrBodyLong)
 	})
 
 	t.Run("an error at the body's end reaches the last blob's writer", func(t *testing.T) {
 		bad := errors.New("checksum mismatch")
 		w := &sizedRecorder{}
-		_, err := SplitSizedBody(ctx, w, &failAtEnd{r: bytes.NewReader(makeData(1500)), err: bad}, 1500, max)
+		_, _, err := SplitSizedBody(ctx, w, &failAtEnd{r: bytes.NewReader(makeData(1500)), err: bad}, 1500, max)
 		require.ErrorIs(t, err, bad)
 		require.Len(t, w.blobs, 1, "the last blob's writer sees the failure")
 	})
 
 	t.Run("a writer that stops early fails", func(t *testing.T) {
-		_, err := SplitSizedBody(ctx, stopEarly{}, bytes.NewReader(makeData(500)), 500, max)
+		_, _, err := SplitSizedBody(ctx, stopEarly{}, bytes.NewReader(makeData(500)), 500, max)
 		require.Error(t, err)
 	})
 }

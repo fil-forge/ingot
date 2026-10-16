@@ -35,21 +35,22 @@ import (
 // inclusive [start, end].
 
 // bodyOpener returns the BlobRangeOpener for one request over the inclusive
-// plaintext range [start, end] of body: the plain opener for a body its
-// manifest marks plaintext (stored as received under a "none" bucket,
-// sse.go), else a decrypting opener carrying the prefetched encryption state
-// of every blob the range covers (the plain opener alone when the range
-// covers no blob). The manifest's mark is the only thing that makes a body
-// plaintext: every encrypted body blob is written with its params row
-// committed before the manifest, so a covered blob without a row is an
-// error — never "stored as plaintext": failing open there would stream raw
-// envelope bytes under a 200. Prefetching here (rather than at first Read)
-// surfaces missing-row/missing-location problems as request errors, before
-// any response headers are written.
+// plaintext range [start, end] of a body's blobs: the plain opener for a body
+// its manifest marks plaintext (stored as received under a "none" bucket,
+// sse.go), else a decrypting opener over the blobs the range covers (the
+// plain opener alone when the range is empty). The manifest's mark is the
+// only thing that makes a body plaintext: every encrypted body blob is
+// written with its params row committed before the manifest, so a covered
+// blob without a row is an error — never "stored as plaintext": failing open
+// there would stream raw envelope bytes under a 200.
 //
-// The prefetch is two queries whatever the number of covered blobs, and a
-// ranged read prefetches only the blobs it reads. The opener refuses a blob
-// outside the range it was built for.
+// The decrypting opener fetches encryption state one stored extent of the
+// blob list at a time, two queries per extent whatever its size, and only
+// for the blobs inside the range. The extent holding start is fetched here,
+// so for a range within one extent (every read of a body of up to 1,024
+// blobs) a missing row or location is a request error, before any response
+// headers are written. A later extent of a long read is fetched when the
+// read reaches it, and its errors end the response body.
 //
 // The encryption-params store and the region key provider are required
 // dependencies (validated at server construction): which implementation
@@ -57,68 +58,28 @@ import (
 // development — is configuration, but bucket encryption itself is not
 // optional. The guard below only turns a mis-built harness into a clear
 // error instead of a nil-pointer panic.
-func (b *Backend) bodyOpener(ctx context.Context, space did.DID, body msbucket.Body, plaintext bool, start, end int64) (msbucket.BlobRangeOpener, error) {
+func (b *Backend) bodyOpener(ctx context.Context, space did.DID, blobs msbucket.BlobIndex, plaintext bool, start, end int64) (msbucket.BlobRangeOpener, error) {
 	if b.regionKeys == nil || b.encParams == nil {
 		return nil, errors.New("s3frontend: encryption dependencies not configured (EncParams, RegionKeys)")
 	}
 	plain := msbucket.NewPlainOpener(b.read)
-	if plaintext {
+	if plaintext || end < start {
 		return plain, nil
 	}
-
-	var covered []multihash.Multihash
-	seen := make(map[string]bool)
-	for _, ref := range body.Blobs {
-		if ref.End < start || ref.Start > end || seen[string(ref.Digest)] {
-			continue
-		}
-		seen[string(ref.Digest)] = true
-		covered = append(covered, ref.Digest)
+	o := &decryptingOpener{
+		read:      b.read,
+		keys:      b.regionKeys,
+		enc:       make(map[string]encBlob),
+		b:         b,
+		space:     space,
+		blobs:     blobs,
+		rangeFrom: start,
+		rangeTo:   end,
 	}
-	if len(covered) == 0 {
-		return plain, nil
+	if err := o.prefetch(ctx, start); err != nil {
+		return nil, err
 	}
-
-	params, err := b.encParams.GetEncryptionParamsBatch(ctx, space, covered)
-	if err != nil {
-		return nil, fmt.Errorf("s3frontend: encryption params: %w", err)
-	}
-	// The stored (ciphertext) size: recorded at accept in blob_locations,
-	// out of reach of whoever can write to the object store. The chunk
-	// geometry is derived from it, so a truncated or padded stored blob
-	// surfaces as a decrypt error rather than as silently wrong bytes.
-	locs, err := b.locations.GetLocations(ctx, space, covered)
-	if err != nil {
-		return nil, fmt.Errorf("s3frontend: encrypted blob locations: %w", err)
-	}
-	enc := make(map[string]encBlob, len(covered))
-	for _, d := range covered {
-		p, ok := params[string(d)]
-		if !ok {
-			// Fail closed: the row is the blob's decryption key material. A
-			// covered blob without one is unreadable (a shredded or lost
-			// row), not plaintext.
-			return nil, fmt.Errorf("s3frontend: blob %x has no encryption-params row; refusing to serve ciphertext", d)
-		}
-		loc, ok := locs[string(d)]
-		if !ok {
-			return nil, fmt.Errorf("s3frontend: encrypted blob %x has no recorded location: %w", d, registry.ErrNotFound)
-		}
-		// The row must describe a FEE body, and an envelope that declares its
-		// plaintext length must agree with the stored size, so a bad row or a
-		// truncated or padded blob fails here, before any response headers
-		// are written.
-		desc := fee.BodyDescriptor{HeaderLen: p.HeaderLen, AAD: p.AAD}
-		if _, err := desc.PlaintextSize(loc.Size); err != nil {
-			return nil, fmt.Errorf("s3frontend: blob %x: %w", d, err)
-		}
-		enc[string(d)] = encBlob{desc: desc, params: p, storedSize: loc.Size}
-	}
-	return &decryptingOpener{
-		read: b.read,
-		keys: b.regionKeys,
-		enc:  enc,
-	}, nil
+	return o, nil
 }
 
 // encBlob is one encrypted blob's prefetched decryption state.
@@ -130,17 +91,89 @@ type encBlob struct {
 
 // decryptingOpener serves each blob's plaintext range: it unwraps the CEK,
 // fetches the covering ciphertext span, and decrypts it in a streaming pass.
-// bodyOpener prefetched state for every blob of the range it was built for,
-// so a digest absent from enc is a bug — fail closed rather than fall
-// through to raw bytes.
+// A blob's state comes from enc, which holds one extent's at a time, fetched
+// by prefetch; a blob outside [rangeFrom, rangeTo] is refused rather than
+// fall through to raw bytes.
 type decryptingOpener struct {
 	read blockstore.BlobReader
 	keys regionkey.Provider
 	enc  map[string]encBlob
+
+	b                  *Backend
+	space              did.DID
+	blobs              msbucket.BlobIndex
+	rangeFrom, rangeTo int64
+}
+
+// prefetch replaces the opener's encryption state with that of the blobs in
+// the extent holding off that its range covers: two queries, the params rows
+// and the locations. A read moves forward, so the state of the extent it
+// leaves is not needed again, and holding at most one extent's keeps a read
+// of a body of any size to a bounded amount of key material.
+func (o *decryptingOpener) prefetch(ctx context.Context, off int64) error {
+	ext, err := o.blobs.Extent(ctx, off)
+	if err != nil {
+		return fmt.Errorf("s3frontend: body blobs: %w", err)
+	}
+	var covered []multihash.Multihash
+	seen := make(map[string]bool)
+	for _, ref := range ext {
+		if ref.End < o.rangeFrom || ref.Start > o.rangeTo || seen[string(ref.Digest)] {
+			continue
+		}
+		seen[string(ref.Digest)] = true
+		covered = append(covered, ref.Digest)
+	}
+	enc := make(map[string]encBlob, len(covered))
+	if len(covered) == 0 {
+		o.enc = enc
+		return nil
+	}
+	params, err := o.b.encParams.GetEncryptionParamsBatch(ctx, o.space, covered)
+	if err != nil {
+		return fmt.Errorf("s3frontend: encryption params: %w", err)
+	}
+	// The stored (ciphertext) size: recorded at accept in blob_locations,
+	// out of reach of whoever can write to the object store. The chunk
+	// geometry is derived from it, so a truncated or padded stored blob
+	// surfaces as a decrypt error rather than as silently wrong bytes.
+	locs, err := o.b.locations.GetLocations(ctx, o.space, covered)
+	if err != nil {
+		return fmt.Errorf("s3frontend: encrypted blob locations: %w", err)
+	}
+	for _, d := range covered {
+		p, ok := params[string(d)]
+		if !ok {
+			// Fail closed: the row is the blob's decryption key material. A
+			// covered blob without one is unreadable (a shredded or lost
+			// row), not plaintext.
+			return fmt.Errorf("s3frontend: blob %x has no encryption-params row; refusing to serve ciphertext", d)
+		}
+		loc, ok := locs[string(d)]
+		if !ok {
+			return fmt.Errorf("s3frontend: encrypted blob %x has no recorded location: %w", d, registry.ErrNotFound)
+		}
+		// The row must describe a FEE body, and an envelope that declares its
+		// plaintext length must agree with the stored size, so a bad row or a
+		// truncated or padded blob fails before any of its bytes are served.
+		desc := fee.BodyDescriptor{HeaderLen: p.HeaderLen, AAD: p.AAD}
+		if _, err := desc.PlaintextSize(loc.Size); err != nil {
+			return fmt.Errorf("s3frontend: blob %x: %w", d, err)
+		}
+		enc[string(d)] = encBlob{desc: desc, params: p, storedSize: loc.Size}
+	}
+	o.enc = enc
+	return nil
 }
 
 func (o *decryptingOpener) OpenBlobRange(ctx context.Context, space did.DID, ref msbucket.BlobRef, start, end int64) (io.ReadCloser, error) {
 	e, ok := o.enc[string(ref.Digest)]
+	if !ok && ref.End >= o.rangeFrom && ref.Start <= o.rangeTo {
+		if err := o.prefetch(ctx, ref.Start); err != nil {
+			return nil, err
+		}
+		e, ok = o.enc[string(ref.Digest)]
+	}
 	if !ok {
 		return nil, fmt.Errorf("s3frontend: blob %x has no prefetched encryption state; refusing to serve ciphertext", ref.Digest)
 	}

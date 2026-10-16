@@ -87,14 +87,22 @@ func (s *VersionState) Empty() bool {
 // ObjectValue (either form), EnvelopedManifest, or EnvelopedLeaf, which turn
 // that into the loud failure the format requires. A format revision adds an
 // arm under a new key ("/objectmanifest/1") and old blocks keep decoding.
+//
+// Manifests are written under "/objectmanifest/1". "/objectmanifest/0"
+// blocks, whose blob list is inline, still decode: ObjectValue converts them,
+// so callers only ever see Manifest.
 type ValueUnion struct {
-	Manifest *ObjectManifest `cborgen:"/objectmanifest/0,omitempty"`
-	Leaf     *ObjectLeaf     `cborgen:"/objectleaf/0,omitempty"`
+	ManifestV0 *ObjectManifestV0 `cborgen:"/objectmanifest/0,omitempty"`
+	Manifest   *ObjectManifest   `cborgen:"/objectmanifest/1,omitempty"`
+	Leaf       *ObjectLeaf       `cborgen:"/objectleaf/0,omitempty"`
 }
 
 // arms counts the set arms; a well-formed block has exactly one.
 func (u *ValueUnion) arms() int {
 	n := 0
+	if u.ManifestV0 != nil {
+		n++
+	}
 	if u.Manifest != nil {
 		n++
 	}
@@ -127,6 +135,9 @@ func (v *ObjectValue) MarshalCBOR(w io.Writer) error {
 	if v.arms() != 1 {
 		return fmt.Errorf("bucket: value block must carry exactly one union arm")
 	}
+	if v.ManifestV0 != nil {
+		return fmt.Errorf("bucket: /objectmanifest/0 is decode-only")
+	}
 	return v.ValueUnion.MarshalCBOR(w)
 }
 
@@ -137,13 +148,16 @@ func (v *ObjectValue) UnmarshalCBOR(r io.Reader) error {
 	if v.arms() != 1 {
 		return fmt.Errorf("bucket: block carries no known value-union key (written by a newer format?)")
 	}
+	if v.ManifestV0 != nil {
+		v.Manifest, v.ManifestV0 = v.ManifestV0.upgrade(), nil
+	}
 	return nil
 }
 
 // EnvelopedManifest reads/writes one manifest block under its
-// "/objectmanifest/0" union key — the form every manifest is stored in
-// (§2.3), as a value block and as a prev-tree entry alike. Decoding a leaf
-// block through it is an error.
+// "/objectmanifest/1" union key (reading "/objectmanifest/0" too) — the form
+// every manifest is stored in (§2.3), as a value block and as a prev-tree
+// entry alike. Decoding a leaf block through it is an error.
 type EnvelopedManifest struct {
 	Manifest *ObjectManifest
 }

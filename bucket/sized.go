@@ -32,15 +32,15 @@ type SizedBlobWriter interface {
 // failure before the send completes; the same goes for an error r itself only
 // reports at its end, such as a failed checksum.
 //
-// The Body it returns is the one SplitBody would return for the same bytes and
-// options.
-func SplitSizedBody(ctx context.Context, w SizedBlobWriter, r io.Reader, size, maxBlobSize int64, opts ...SplitOption) (Body, error) {
+// The Body and blobs it returns are the ones SplitBody would return for the
+// same bytes and options.
+func SplitSizedBody(ctx context.Context, w SizedBlobWriter, r io.Reader, size, maxBlobSize int64, opts ...SplitOption) (Body, BlobRefs, error) {
 	max := maxBlobSize
 	if max <= 0 {
 		max = DefaultMaxBlobSize
 	}
 	if size < 0 {
-		return Body{}, fmt.Errorf("bucket: negative body size %d", size)
+		return Body{}, nil, fmt.Errorf("bucket: negative body size %d", size)
 	}
 	cfg := splitConfig{md5: true, tree: true}
 	for _, o := range opts {
@@ -51,29 +51,31 @@ func SplitSizedBody(ctx context.Context, w SizedBlobWriter, r io.Reader, size, m
 	defer hashes.stop()
 	src := io.TeeReader(r, hashes.writer())
 
-	var blobs []BlobRef
-	var total int64
-	for total < size {
+	var blobs BlobRefs
+	for total := int64(0); total < size; total = blobs.Size() {
 		n := min(max, size-total)
 		br := &exactReader{src: src, remaining: n, last: total+n == size}
 		digest, err := w.WriteSizedBlob(ctx, br, n)
 		if err != nil {
-			return Body{}, fmt.Errorf("put blob: %w", err)
+			return Body{}, nil, fmt.Errorf("put blob: %w", err)
 		}
 		if br.remaining > 0 {
-			return Body{}, fmt.Errorf("put blob: writer stopped %d bytes short of the blob", br.remaining)
+			return Body{}, nil, fmt.Errorf("put blob: writer stopped %d bytes short of the blob", br.remaining)
 		}
-		blobs = append(blobs, BlobRef{Digest: digest, Start: total, End: total + n - 1})
-		total += n
+		blobs.Append(digest, n)
 	}
 	if size == 0 {
 		// No blob carried the end-of-body check.
 		if err := expectEOF(src); err != nil {
-			return Body{}, err
+			return Body{}, nil, err
 		}
 	}
 
-	return hashes.body(total, blobs)
+	body, err := hashes.body(blobs.Size())
+	if err != nil {
+		return Body{}, nil, err
+	}
+	return body, blobs, nil
 }
 
 // exactReader yields exactly remaining bytes of src. The body's last blob also

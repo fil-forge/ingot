@@ -72,10 +72,11 @@ func putSweepObjects(t *testing.T, b *Backend, n int) []multihash.Multihash {
 		if err != nil {
 			t.Fatalf("resolveVersion %s: %v", key, err)
 		}
-		if len(rv.mf.Body.Blobs) != 1 {
-			t.Fatalf("object %s has %d blobs, want 1", key, len(rv.mf.Body.Blobs))
+		blobs := storedBlobs(t, b, rv)
+		if len(blobs) != 1 {
+			t.Fatalf("object %s has %d blobs, want 1", key, len(blobs))
 		}
-		digests = append(digests, rv.mf.Body.Blobs[0].Digest)
+		digests = append(digests, blobs[0].Digest)
 		// Distinct commit times, so eviction order is by age, not by the
 		// digest tiebreak.
 		time.Sleep(2 * time.Millisecond)

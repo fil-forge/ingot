@@ -3,6 +3,7 @@ package s3frontend
 import (
 	"bytes"
 	"context"
+	msbucket "github.com/fil-forge/ingot/bucket"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -53,18 +54,9 @@ func newRefTestBackend(t *testing.T, maxBlob ...int64) (*Backend, *inmem.MemStor
 		mbs = maxBlob[0]
 	}
 	ctx := context.Background()
-	dir := t.TempDir()
 	mem := inmem.NewMemStore()
-	spool, err := blockstore.NewSpool(filepath.Join(dir, "spool"))
-	if err != nil {
-		t.Fatalf("spool: %v", err)
-	}
-	cache, err := blockstore.NewBlobCache(filepath.Join(dir, "cache"))
-	if err != nil {
-		t.Fatalf("spool: %v", err)
-	}
 	log, err := logstore.Open(ctx, logstore.Config{
-		Dir:     filepath.Join(dir, "segments"),
+		Dir:     filepath.Join(t.TempDir(), "segments"),
 		Meta:    mem,
 		Catalog: logstore.PlaneConfig{Ship: false}, // retained locally; no uploader needed
 		Logger:  zaptest.NewLogger(t),
@@ -73,6 +65,22 @@ func newRefTestBackend(t *testing.T, maxBlob ...int64) (*Backend, *inmem.MemStor
 		t.Fatalf("logstore: %v", err)
 	}
 	t.Cleanup(func() { _ = log.Close(ctx) })
+	return newRefTestBackendOver(t, mem, log, mbs)
+}
+
+// newRefTestBackendOver is newRefTestBackend over a given catalog log.
+func newRefTestBackendOver(t *testing.T, mem *inmem.MemStore, log blockstore.Log, mbs int64) (*Backend, *inmem.MemStore, *recordingRemover) {
+	t.Helper()
+	ctx := context.Background()
+	dir := t.TempDir()
+	spool, err := blockstore.NewSpool(filepath.Join(dir, "spool"))
+	if err != nil {
+		t.Fatalf("spool: %v", err)
+	}
+	cache, err := blockstore.NewBlobCache(filepath.Join(dir, "cache"))
+	if err != nil {
+		t.Fatalf("spool: %v", err)
+	}
 
 	rm := &recordingRemover{}
 	b := New(Deps{
@@ -118,11 +126,21 @@ func blobDigestsOf(t *testing.T, b *Backend, key, versionID string) []multihash.
 	if err != nil {
 		t.Fatalf("resolve %s@%q: %v", key, versionID, err)
 	}
-	ds := make([]multihash.Multihash, 0, len(rv.mf.Body.Blobs))
-	for _, ref := range rv.mf.Body.Blobs {
+	ds := make([]multihash.Multihash, 0)
+	for _, ref := range storedBlobs(t, b, rv) {
 		ds = append(ds, ref.Digest)
 	}
 	return ds
+}
+
+// storedBlobs reads a resolved version's blob list, extents included.
+func storedBlobs(t testing.TB, b *Backend, rv *resolvedVersion) msbucket.BlobRefs {
+	t.Helper()
+	refs, err := msbucket.ReadBlobRefs(context.Background(), rv.mf.Body.Index(b.read, rv.st.Space))
+	if err != nil {
+		t.Fatalf("read blobs of %s: %v", rv.mf.Key, err)
+	}
+	return refs
 }
 
 // blobDigestOf is blobDigestsOf for the common single-blob object.

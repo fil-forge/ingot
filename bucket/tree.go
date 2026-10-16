@@ -77,10 +77,10 @@ func (h *bodyHashes) stop() {
 	}
 }
 
-// body assembles the Body for the split blobs once the whole body has been
-// written.
-func (h *bodyHashes) body(total int64, blobs []BlobRef) (Body, error) {
-	body := Body{Size: total, Blobs: blobs}
+// body assembles the Body of total bytes once the whole body has been
+// written. Its blob list is written at commit (see BuildBlobList).
+func (h *bodyHashes) body(total int64) (Body, error) {
+	body := Body{Size: total}
 	if h.tree != nil {
 		if err := body.SetTree(h.tree.FinishObject()); err != nil {
 			return Body{}, err

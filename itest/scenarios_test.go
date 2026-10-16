@@ -187,6 +187,53 @@ func TestForgeScenarios(t *testing.T) {
 		}
 	})
 
+	// BlobListPastInline: an object of more blobs than a manifest lists
+	// inline (1,024) keeps the rest in an extent block. It reads back whole,
+	// in a range across the boundary, and through a copy whose commit writes
+	// extents of its own.
+	t.Run("BlobListPastInline", func(t *testing.T) {
+		const bucket = "blob-extents"
+		// The PUT uploads its 1,031 blobs one at a time, past the upstream
+		// client's per-request timeout.
+		cl := bigObjectClient(t, endpoint, accessKey, secretKey)
+		if _, err := cl.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
+			t.Fatalf("CreateBucket: %v", err)
+		}
+		const size = 1030*maxBlob + 100 // 1,031 blobs
+		data := patternBytes(size)
+		if _, err := cl.PutObject(ctx, &s3.PutObjectInput{
+			Bucket: aws.String(bucket),
+			Key:    aws.String("big"),
+			Body:   bytes.NewReader(data),
+		}); err != nil {
+			t.Fatalf("PutObject: %v", err)
+		}
+		if got := getBody(t, ctx, cl, bucket, "big", ""); !bytes.Equal(got, data) {
+			t.Fatalf("whole GET mismatch: got %d bytes, want %d", len(got), len(data))
+		}
+		const boundary = 1024 * maxBlob
+		for _, rc := range []struct{ start, end int }{
+			{boundary - 100, boundary + 100}, // the last inline blob into the extent
+			{boundary + 5000, boundary + 9000},
+			{size - 1, size - 1},
+		} {
+			hdr := fmt.Sprintf("bytes=%d-%d", rc.start, rc.end)
+			if got := getBody(t, ctx, cl, bucket, "big", hdr); !bytes.Equal(got, data[rc.start:rc.end+1]) {
+				t.Fatalf("range %s mismatch: got %d bytes", hdr, len(got))
+			}
+		}
+		if _, err := cl.CopyObject(ctx, &s3.CopyObjectInput{
+			Bucket:     aws.String(bucket),
+			Key:        aws.String("copy"),
+			CopySource: aws.String(bucket + "/big"),
+		}); err != nil {
+			t.Fatalf("CopyObject: %v", err)
+		}
+		if got := getBody(t, ctx, cl, bucket, "copy", fmt.Sprintf("bytes=%d-%d", boundary-100, boundary+100)); !bytes.Equal(got, data[boundary-100:boundary+101]) {
+			t.Fatalf("copy range across the boundary mismatch: got %d bytes", len(got))
+		}
+	})
+
 	// ZeroByteObject: a 0-byte object stores no blob, round-trips empty,
 	// and carries the well-known empty-content md5 ETag.
 	t.Run("ZeroByteObject", func(t *testing.T) {
