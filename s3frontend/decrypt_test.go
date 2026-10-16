@@ -318,6 +318,67 @@ func TestDecryptingRead_RangePrefetchesCoveredBlobs(t *testing.T) {
 	}
 }
 
+// extentIndex serves a flat list as extents of per blobs each, the shape of
+// a stored list without the catalog.
+type extentIndex struct {
+	msbucket.BlobRefs
+	per int
+}
+
+func (x extentIndex) Extent(ctx context.Context, off int64) ([]msbucket.BlobRef, error) {
+	ref, err := x.Locate(ctx, off)
+	if err != nil {
+		return nil, err
+	}
+	i := 0
+	for x.BlobRefs[i].Start != ref.Start {
+		i++
+	}
+	from := i - i%x.per
+	return x.BlobRefs[from:min(from+x.per, len(x.BlobRefs))], nil
+}
+
+// A read across several extents fetches each extent's state once, as the
+// read reaches it, and holds at most one extent's at a time: a read of any
+// size keeps a bounded amount of key material.
+func TestDecryptingRead_HoldsOneExtentAtATime(t *testing.T) {
+	ctx := context.Background()
+	fx := newEncFixture(t, patterned(40000), 4000) // ten blobs
+	c := countLookups(fx)
+	idx := extentIndex{BlobRefs: fx.body, per: 3} // extents of 3, 3, 3, 1
+
+	opener, err := fx.backend.bodyOpener(ctx, fx.space, idx, false, 0, fx.body.Size()-1)
+	if err != nil {
+		t.Fatalf("bodyOpener: %v", err)
+	}
+	held := &maxHeld{opener: opener.(*decryptingOpener)}
+	got, err := io.ReadAll(msbucket.OpenBody(ctx, held, fx.space, idx))
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !bytes.Equal(got, fx.plaintext) {
+		t.Fatal("decrypt mismatch")
+	}
+	if len(c.paramBatches) != 4 || len(c.locBatches) != 4 {
+		t.Fatalf("batches: %d params, %d locations; want one per extent, 4", len(c.paramBatches), len(c.locBatches))
+	}
+	if held.max != 3 {
+		t.Fatalf("held state for up to %d blobs at once, want 3 (one extent)", held.max)
+	}
+}
+
+// maxHeld records the most blobs the opener held state for after any open.
+type maxHeld struct {
+	opener *decryptingOpener
+	max    int
+}
+
+func (m *maxHeld) OpenBlobRange(ctx context.Context, space did.DID, ref msbucket.BlobRef, start, end int64) (io.ReadCloser, error) {
+	rc, err := m.opener.OpenBlobRange(ctx, space, ref, start, end)
+	m.max = max(m.max, len(m.opener.enc))
+	return rc, err
+}
+
 // A blob outside the range is never read, so its missing row does not fail
 // the read; the same row missing inside the range does.
 func TestDecryptingRead_MissingRowOutsideRangeIsNotRead(t *testing.T) {

@@ -310,7 +310,9 @@ The encryption-params store and region key provider are required
 dependencies; only the provider implementation (openbao vs inprocess) is
 configuration.
 The opener fetches the params rows and locations of the blobs a read covers
-one extent at a time, two set-based queries per extent. The extent holding
+one extent at a time, two set-based queries per extent, and keeps only the
+current extent's, so a read holds about 1,024 blobs' key material whatever
+the body's size. The extent holding
 the read's first byte is fetched before any response headers, so a missing
 row there fails the request; a later extent of a long read is fetched when
 the read reaches it, and a missing row there ends the response body.

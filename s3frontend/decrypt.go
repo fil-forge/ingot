@@ -91,9 +91,9 @@ type encBlob struct {
 
 // decryptingOpener serves each blob's plaintext range: it unwraps the CEK,
 // fetches the covering ciphertext span, and decrypts it in a streaming pass.
-// A blob's state comes from enc, fetched by prefetch for the extent holding
-// it; a blob outside [rangeFrom, rangeTo] is refused rather than fall
-// through to raw bytes.
+// A blob's state comes from enc, which holds one extent's at a time, fetched
+// by prefetch; a blob outside [rangeFrom, rangeTo] is refused rather than
+// fall through to raw bytes.
 type decryptingOpener struct {
 	read blockstore.BlobReader
 	keys regionkey.Provider
@@ -105,9 +105,11 @@ type decryptingOpener struct {
 	rangeFrom, rangeTo int64
 }
 
-// prefetch fetches the encryption state of the blobs in the extent holding
-// off that the opener's range covers: two queries, the params rows and the
-// locations.
+// prefetch replaces the opener's encryption state with that of the blobs in
+// the extent holding off that its range covers: two queries, the params rows
+// and the locations. A read moves forward, so the state of the extent it
+// leaves is not needed again, and holding at most one extent's keeps a read
+// of a body of any size to a bounded amount of key material.
 func (o *decryptingOpener) prefetch(ctx context.Context, off int64) error {
 	ext, err := o.blobs.Extent(ctx, off)
 	if err != nil {
@@ -120,11 +122,11 @@ func (o *decryptingOpener) prefetch(ctx context.Context, off int64) error {
 			continue
 		}
 		seen[string(ref.Digest)] = true
-		if _, ok := o.enc[string(ref.Digest)]; !ok {
-			covered = append(covered, ref.Digest)
-		}
+		covered = append(covered, ref.Digest)
 	}
+	enc := make(map[string]encBlob, len(covered))
 	if len(covered) == 0 {
+		o.enc = enc
 		return nil
 	}
 	params, err := o.b.encParams.GetEncryptionParamsBatch(ctx, o.space, covered)
@@ -158,8 +160,9 @@ func (o *decryptingOpener) prefetch(ctx context.Context, off int64) error {
 		if _, err := desc.PlaintextSize(loc.Size); err != nil {
 			return fmt.Errorf("s3frontend: blob %x: %w", d, err)
 		}
-		o.enc[string(d)] = encBlob{desc: desc, params: p, storedSize: loc.Size}
+		enc[string(d)] = encBlob{desc: desc, params: p, storedSize: loc.Size}
 	}
+	o.enc = enc
 	return nil
 }
 
