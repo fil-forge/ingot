@@ -52,22 +52,34 @@ func (f *fakeMeta) DeleteSegment(_ context.Context, plane blockstore.Plane, seq 
 	delete(f.rows, seq)
 	return nil
 }
+func (f *fakeMeta) RetireSegment(_ context.Context, plane blockstore.Plane, seq uint64, retiredAt int64) error {
+	if r, ok := f.rows[seq]; ok && r.RetiredAt == 0 {
+		r.RetiredAt = retiredAt
+	}
+	return nil
+}
 func (f *fakeMeta) ListSegments(_ context.Context, plane blockstore.Plane, bucket string) ([]logstore.SegmentMeta, error) {
+	return f.listSegments(plane, bucket, false), nil
+}
+func (f *fakeMeta) ListRetiredSegments(_ context.Context, plane blockstore.Plane, bucket string) ([]logstore.SegmentMeta, error) {
+	return f.listSegments(plane, bucket, true), nil
+}
+func (f *fakeMeta) listSegments(plane blockstore.Plane, bucket string, retired bool) []logstore.SegmentMeta {
 	var out []logstore.SegmentMeta
 	for _, r := range f.rows {
-		if r.Plane != plane || r.Bucket != bucket {
+		if r.Plane != plane || r.Bucket != bucket || (r.RetiredAt != 0) != retired {
 			continue
 		}
 		out = append(out, *r)
 	}
-	return out, nil
+	return out
 }
 
 func (f *fakeMeta) ListSegmentBuckets(_ context.Context, plane blockstore.Plane) ([]string, error) {
 	seen := map[string]struct{}{}
 	var out []string
 	for _, r := range f.rows {
-		if r.Plane != plane {
+		if r.Plane != plane || r.RetiredAt != 0 {
 			continue
 		}
 		if _, ok := seen[r.Bucket]; ok {

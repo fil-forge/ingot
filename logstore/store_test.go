@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -99,17 +100,35 @@ func (f *fakeMeta) DeleteSegment(_ context.Context, plane blockstore.Plane, seq 
 	return nil
 }
 
+func (f *fakeMeta) RetireSegment(_ context.Context, plane blockstore.Plane, seq uint64, retiredAt int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if m, ok := f.segments[seq]; ok && m.RetiredAt == 0 {
+		m.RetiredAt = retiredAt
+		m.OpRoots = nil
+	}
+	return nil
+}
+
 func (f *fakeMeta) ListSegments(_ context.Context, plane blockstore.Plane, bucket string) ([]SegmentMeta, error) {
+	return f.listSegments(plane, bucket, false), nil
+}
+
+func (f *fakeMeta) ListRetiredSegments(_ context.Context, plane blockstore.Plane, bucket string) ([]SegmentMeta, error) {
+	return f.listSegments(plane, bucket, true), nil
+}
+
+func (f *fakeMeta) listSegments(plane blockstore.Plane, bucket string, retired bool) []SegmentMeta {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var out []SegmentMeta
 	for _, m := range f.segments {
-		if m.Plane != plane || m.Bucket != bucket {
+		if m.Plane != plane || m.Bucket != bucket || (m.RetiredAt != 0) != retired {
 			continue
 		}
 		out = append(out, *m)
 	}
-	return out, nil
+	return out
 }
 
 func (f *fakeMeta) ListSegmentBuckets(_ context.Context, plane blockstore.Plane) ([]string, error) {
@@ -118,7 +137,7 @@ func (f *fakeMeta) ListSegmentBuckets(_ context.Context, plane blockstore.Plane)
 	seen := map[string]struct{}{}
 	var out []string
 	for _, m := range f.segments {
-		if m.Plane != plane {
+		if m.Plane != plane || m.RetiredAt != 0 {
 			continue
 		}
 		if _, ok := seen[m.Bucket]; ok {
@@ -284,13 +303,20 @@ func TestSealByAge(t *testing.T) {
 	}
 }
 
+// TestRetentionDropsOldFlushed: retention unlinks shipped segments past the
+// Retain window but keeps their rows, stamped retired with their op-roots
+// dropped, as the record of what each ship registered in the space.
 func TestRetentionDropsOldFlushed(t *testing.T) {
-	s, _, _ := newTestStore(t, 64, 50*time.Millisecond, 2)
+	s, meta, _ := newTestStore(t, 64, 50*time.Millisecond, 2)
 	dir := filepath.Dir(s.catalog.dir)
 
 	// Issue 5 PUTs; each one large enough to exceed SealBytes=64 in
-	// a single batch, so each becomes its own segment.
+	// a single batch. The seal it requests is asynchronous, so pause past
+	// SealAge between them to land each in its own segment.
 	for i := 0; i < 5; i++ {
+		if i > 0 {
+			time.Sleep(100 * time.Millisecond)
+		}
 		payload := make([]byte, 80)
 		for j := range payload {
 			payload[j] = byte(i)
@@ -325,6 +351,97 @@ func TestRetentionDropsOldFlushed(t *testing.T) {
 	if len(entries) > 3 {
 		t.Fatalf("retain=2 should leave at most 3 segments (open + retained); got %d (%v)",
 			len(entries), entries)
+	}
+
+	// The retired stamp lands after the unlink; wait for it. newTestStore
+	// opens the store with no bucket, so its rows carry the empty name.
+	var retired []SegmentMeta
+	for deadline := time.Now().Add(3 * time.Second); len(retired) == 0 && time.Now().Before(deadline); {
+		if retired, err = meta.ListRetiredSegments(context.Background(), blockstore.PlaneCatalog, ""); err != nil {
+			t.Fatalf("ListRetiredSegments: %v", err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if len(retired) == 0 {
+		t.Fatalf("expected retired segment rows to survive retention")
+	}
+	if entries, err = readSegmentSeqs(dir, "catalog"); err != nil {
+		t.Fatalf("readDir: %v", err)
+	}
+	onDisk := map[string]bool{}
+	for _, e := range entries {
+		onDisk[e] = true
+	}
+	for _, r := range retired {
+		if r.RetiredAt == 0 || r.ShippedAt == 0 || len(r.SHA256) == 0 || len(r.OpRoots) != 0 {
+			t.Fatalf("retired row %d = %+v, want retired_at, shipped_at and sha256 set and no op-roots", r.Seq, r)
+		}
+		if onDisk[carName(r.Seq)] {
+			t.Fatalf("retired segment %d still has its CAR on disk", r.Seq)
+		}
+	}
+}
+
+// TestRecoveryRetiresSealedRowWithoutCAR: a sealed row whose CAR is gone (a
+// crash between retention's unlink and its retired stamp) is retired, not
+// deleted, so DeleteBucket still releases what it registered; an open row
+// whose CAR is gone never shipped and is deleted.
+func TestRecoveryRetiresSealedRowWithoutCAR(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	meta := newFakeMeta()
+	cfg := Config{
+		Dir:     dir,
+		Bucket:  "bk",
+		Meta:    meta,
+		Catalog: PlaneConfig{SealBytes: 1 << 30, SealAge: time.Hour, Ship: false},
+		Logger:  zaptest.NewLogger(t),
+	}
+	s, err := Open(ctx, cfg)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := s.AppendBatch(ctx, []block.Block{makeBlock(t, []byte("sealed-then-lost"))}, blockstore.OpRoot{
+		Bucket: "bk",
+		Root:   makeRoot(t, "lost"),
+	}); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	catDir := s.catalog.dir
+	if err := s.Close(ctx); err != nil { // seals the open segment
+		t.Fatalf("Close: %v", err)
+	}
+	rows, err := meta.ListSegments(ctx, blockstore.PlaneCatalog, "bk")
+	if err != nil || len(rows) != 1 || rows[0].State != StateSealed {
+		t.Fatalf("want one sealed row before the loss, got %+v (err %v)", rows, err)
+	}
+	sealedSeq := rows[0].Seq
+	if err := os.Remove(filepath.Join(catDir, carName(sealedSeq))); err != nil {
+		t.Fatalf("remove CAR: %v", err)
+	}
+	const openSeq = 1 << 40
+	if err := meta.InsertSegmentOpen(ctx, blockstore.PlaneCatalog, openSeq, "bk"); err != nil {
+		t.Fatalf("InsertSegmentOpen: %v", err)
+	}
+
+	s2, err := Open(ctx, cfg)
+	if err != nil {
+		t.Fatalf("re-Open: %v", err)
+	}
+	t.Cleanup(func() { _ = s2.Close(ctx) })
+
+	retired, err := meta.ListRetiredSegments(ctx, blockstore.PlaneCatalog, "bk")
+	if err != nil || len(retired) != 1 || retired[0].Seq != sealedSeq {
+		t.Fatalf("want sealed seg %d retired, got %+v (err %v)", sealedSeq, retired, err)
+	}
+	live, err := meta.ListSegments(ctx, blockstore.PlaneCatalog, "bk")
+	if err != nil {
+		t.Fatalf("ListSegments: %v", err)
+	}
+	for _, r := range live {
+		if r.Seq == sealedSeq || r.Seq == openSeq {
+			t.Fatalf("seg %d should not be live after recovery: %+v", r.Seq, r)
+		}
 	}
 }
 

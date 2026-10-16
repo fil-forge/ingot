@@ -2,6 +2,7 @@ package logstore
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -250,6 +251,82 @@ func TestManager_QuiesceAndShippedSegmentDigests(t *testing.T) {
 		t.Fatalf("gamma: got %d digests, err %v", len(got), err)
 	}
 	appendFor(t, m, "alpha", "post-quiesce-write")
+}
+
+// TestManager_ShippedSegmentDigestsIncludesRetired: segments retention has
+// already unlinked still registered their CAR and index blobs in the space,
+// so DeleteBucket's release list must name them, and RemoveBucketLog must
+// drop their rows with the rest.
+func TestManager_ShippedSegmentDigestsIncludesRetired(t *testing.T) {
+	ctx := context.Background()
+	meta := newFakeMeta()
+	m := openTestManager(t, t.TempDir(), meta, newRecordingFlush())
+
+	// Each append lands in its own segment (SealAge is 50ms); with Retain 2,
+	// the older ones ship and retire.
+	deadline := time.Now().Add(5 * time.Second)
+	var retired []SegmentMeta
+	for i := 0; len(retired) < 2; i++ {
+		if time.Now().After(deadline) {
+			t.Fatalf("no segments retired in time (have %d)", len(retired))
+		}
+		appendFor(t, m, "alpha", fmt.Sprintf("generation-%d", i))
+		time.Sleep(100 * time.Millisecond)
+		var err error
+		if retired, err = meta.ListRetiredSegments(ctx, blockstore.PlaneCatalog, "alpha"); err != nil {
+			t.Fatalf("ListRetiredSegments: %v", err)
+		}
+	}
+
+	if err := m.QuiesceBucketLog(ctx, "alpha"); err != nil {
+		t.Fatalf("QuiesceBucketLog: %v", err)
+	}
+	digests, err := m.ShippedSegmentDigests(ctx, "alpha")
+	if err != nil {
+		t.Fatalf("ShippedSegmentDigests: %v", err)
+	}
+	listed := map[string]bool{}
+	indexes := 0
+	for _, d := range digests {
+		if string(d) == string(fakeIndexDigest) {
+			indexes++
+			continue
+		}
+		listed[string(d)] = true
+	}
+	retired, err = meta.ListRetiredSegments(ctx, blockstore.PlaneCatalog, "alpha")
+	if err != nil {
+		t.Fatalf("ListRetiredSegments: %v", err)
+	}
+	live, err := meta.ListSegments(ctx, blockstore.PlaneCatalog, "alpha")
+	if err != nil {
+		t.Fatalf("ListSegments: %v", err)
+	}
+	shipped := 0
+	for _, r := range append(live, retired...) {
+		if r.ShippedAt != 0 {
+			shipped++
+		}
+	}
+	for _, r := range retired {
+		car, err := multihash.Encode(r.SHA256, multihash.SHA2_256)
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		if !listed[string(car)] {
+			t.Fatalf("retired segment %d's CAR is missing from the release list", r.Seq)
+		}
+	}
+	if indexes != shipped {
+		t.Fatalf("got %d index digests, want one per shipped segment (%d)", indexes, shipped)
+	}
+
+	if err := m.RemoveBucketLog(ctx, "alpha"); err != nil {
+		t.Fatalf("RemoveBucketLog: %v", err)
+	}
+	if rows, err := meta.ListRetiredSegments(ctx, blockstore.PlaneCatalog, "alpha"); err != nil || len(rows) != 0 {
+		t.Fatalf("expected no retired alpha rows after removal, got %d (err %v)", len(rows), err)
+	}
 }
 
 // TestManager_RejectsUnsafeBucketNames: the bucket→directory mapping must
