@@ -291,7 +291,9 @@ writes the source's blobs into another bucket's catalog, hands the commit
 the list rather than the source's extent links. One manifest holds at most
 8,389,632 blobs (`bucket.MaxBodyBlobs`, cbor-gen's 8,192-entry cap on the
 extent list); a Complete over it is refused with `EntityTooLarge` before
-the session latches. The 48.8 TiB S3 maximum fits whenever `max_blob_size`
+the session latches. A PutObject or CopyObject is at most 5 GiB and accepts
+its blobs before the commit, so it is kept under the limit by configuration
+instead: `max_blob_size` may not be below 1 KiB (`config.MinMaxBlobSize`). The 48.8 TiB S3 maximum fits whenever `max_blob_size`
 is at least 6.11 MiB. `PartSizes` and `PartChecksums` hold 10,000 entries,
 S3's part limit.
 
