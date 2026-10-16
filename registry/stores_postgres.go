@@ -717,7 +717,9 @@ func (r *Postgres) GetLocations(ctx context.Context, space did.DID, digests []mu
 		if err := rows.Scan(&d, &loc.Provider, &loc.URL, &loc.Size); err != nil {
 			return nil, fmt.Errorf("registry: get locations scan: %w", err)
 		}
-		loc.Digest = multihash.Multihash(d)
+		if loc.Digest, err = multihash.Cast(d); err != nil {
+			return nil, fmt.Errorf("registry: get locations: stored digest %x: %w", d, err)
+		}
 		out[string(d)] = loc
 	}
 	if err := rows.Err(); err != nil {
@@ -802,7 +804,9 @@ func (r *Postgres) GetEncryptionParamsBatch(ctx context.Context, space did.DID, 
 		if err := rows.Scan(&d, &params.RegionWrappedCEK, &params.RegionKeyVersion, &params.HeaderLen, &params.AAD); err != nil {
 			return nil, fmt.Errorf("registry: get encryption params batch scan: %w", err)
 		}
-		params.Digest = multihash.Multihash(d)
+		if params.Digest, err = multihash.Cast(d); err != nil {
+			return nil, fmt.Errorf("registry: get encryption params batch: stored digest %x: %w", d, err)
+		}
 		out[string(d)] = params
 	}
 	if err := rows.Err(); err != nil {

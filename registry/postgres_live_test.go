@@ -21,6 +21,16 @@ import (
 	"github.com/fil-forge/ucantone/did"
 )
 
+// liveDigest is the sha256 multihash of s: a digest the batch reads decode.
+func liveDigest(t *testing.T, s string) multihash.Multihash {
+	t.Helper()
+	d, err := multihash.Sum([]byte(s), multihash.SHA2_256, -1)
+	if err != nil {
+		t.Fatalf("multihash: %v", err)
+	}
+	return d
+}
+
 func liveCid(t *testing.T, s string) cid.Cid {
 	t.Helper()
 	mh, err := multihash.Sum([]byte(s), multihash.SHA2_256, -1)
@@ -394,7 +404,7 @@ func TestPostgresStores_Live(t *testing.T) {
 		// Only the space's own rows come back, keyed by digest; a digest
 		// without a row is simply absent.
 		space, other := testutil.RandomDID(t), testutil.RandomDID(t)
-		a, b, missing := []byte{0x00, 0x0a}, []byte{0xff, 0x0b}, []byte{0x0c}
+		a, b, missing := liveDigest(t, "loc a"), liveDigest(t, "loc b"), liveDigest(t, "loc missing")
 		for _, loc := range []registry.BlobLocation{
 			{Space: space, Digest: a, Provider: "did:piri", URL: "http://piri/a", Size: 10},
 			{Space: space, Digest: b, Provider: "did:piri", URL: "http://piri/b", Size: 20},
@@ -414,6 +424,14 @@ func TestPostgresStores_Live(t *testing.T) {
 		}
 		if empty, err := r.GetLocations(ctx, space, nil); err != nil || len(empty) != 0 {
 			t.Fatalf("GetLocations(nil) = %+v, %v", empty, err)
+		}
+		// A stored digest that is not a multihash fails the read.
+		bad := []byte{0x0c}
+		if err := r.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: bad, Provider: "did:piri", URL: "http://piri/x", Size: 1}); err != nil {
+			t.Fatalf("PutLocation: %v", err)
+		}
+		if _, err := r.GetLocations(ctx, space, []multihash.Multihash{a, bad}); err == nil {
+			t.Fatal("GetLocations over a non-multihash digest: want an error")
 		}
 	})
 
@@ -448,7 +466,7 @@ func TestPostgresStores_Live(t *testing.T) {
 
 	t.Run("encryption params batch", func(t *testing.T) {
 		space, other := testutil.RandomDID(t), testutil.RandomDID(t)
-		a, b, missing := []byte{0x00, 0x1a}, []byte{0xff, 0x1b}, []byte{0x1c}
+		a, b, missing := liveDigest(t, "params a"), liveDigest(t, "params b"), liveDigest(t, "params missing")
 		for _, p := range []registry.BlobEncryptionParams{
 			liveFEEParams(space, a), liveFEEParams(space, b), liveFEEParams(other, missing),
 		} {
@@ -463,13 +481,21 @@ func TestPostgresStores_Live(t *testing.T) {
 		if len(got) != 2 {
 			t.Fatalf("GetEncryptionParamsBatch returned %d rows, want 2", len(got))
 		}
-		for _, d := range [][]byte{a, b} {
+		for _, d := range []multihash.Multihash{a, b} {
 			if want := liveFEEParams(space, d); !reflect.DeepEqual(got[string(d)], want) {
 				t.Fatalf("row %x = %+v, want %+v", d, got[string(d)], want)
 			}
 		}
 		if empty, err := r.GetEncryptionParamsBatch(ctx, space, nil); err != nil || len(empty) != 0 {
 			t.Fatalf("GetEncryptionParamsBatch(nil) = %+v, %v", empty, err)
+		}
+		// A stored digest that is not a multihash fails the read.
+		bad := []byte{0x1c}
+		if err := r.PutEncryptionParams(ctx, liveFEEParams(space, bad)); err != nil {
+			t.Fatalf("PutEncryptionParams: %v", err)
+		}
+		if _, err := r.GetEncryptionParamsBatch(ctx, space, []multihash.Multihash{a, bad}); err == nil {
+			t.Fatal("GetEncryptionParamsBatch over a non-multihash digest: want an error")
 		}
 	})
 
