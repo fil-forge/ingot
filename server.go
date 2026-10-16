@@ -235,7 +235,7 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 	// requests make.
 	var walker *catalogwalk.Walker
 	if deps.CatalogUsage != nil && deps.CatalogWalks != nil && cfg.CatalogWalkInterval >= 0 {
-		authority := catalogwalk.NewAuthority()
+		authority := catalogwalk.NewAuthority(deps.Identity.DID())
 		bs.OnRead(authority.Capture)
 		walker = catalogwalk.New(catalogwalk.Config{
 			Interval: cfg.CatalogWalkInterval,
@@ -523,13 +523,13 @@ func (s *Server) startCatalogUsageSweeper() {
 	})
 }
 
-// catalogWalkPoll is how often the catalog walker looks for a due bucket
-// when none was. Each look sums every shipped segment row, as a catalog
-// usage refresh does, so it runs as rarely.
+// catalogWalkPoll is how often the catalog walker looks for due buckets.
+// Each look sums every shipped segment row, as a catalog usage refresh
+// does, so it runs as rarely.
 const catalogWalkPoll = catalogUsageInterval
 
-// startCatalogWalker runs the catalog walker: each poll, it walks due buckets
-// one at a time until none is due (see catalogwalk.Walker.WalkNext), each walk
+// startCatalogWalker runs the catalog walker: each poll, it takes the buckets
+// due a walk (catalogwalk.Walker.Due) and walks them one at a time, each walk
 // a root span of its own. A walk can take hours; Stop cuts it short.
 func (s *Server) startCatalogWalker() {
 	if s.walker == nil {
@@ -544,37 +544,40 @@ func (s *Server) startCatalogWalker() {
 				return
 			case <-ticker.C:
 			}
-			for s.walkNextCatalog() {
+			due, err := s.walker.Due(s.sweepCtx)
+			if err != nil && s.sweepCtx.Err() == nil {
+				s.logger.Warn("catalog walk: list due buckets", zap.Error(err))
+			}
+			for _, u := range due {
+				if s.sweepCtx.Err() != nil {
+					return
+				}
+				s.walkCatalog(u)
 			}
 		}
 	})
 }
 
-// walkNextCatalog runs one catalog walk, reporting whether another should
-// follow at once: one did, and nothing failed.
-func (s *Server) walkNextCatalog() bool {
-	ctx, span := tracing.Start(s.sweepCtx, "sweep.catalog_walk")
-	walked, ok, err := s.walker.WalkNext(ctx)
+// walkCatalog runs one bucket's catalog walk under a root span of its own.
+func (s *Server) walkCatalog(u registry.CatalogUsage) {
+	ctx, span := tracing.Start(s.sweepCtx, "sweep.catalog_walk",
+		attribute.String("ingot.walk.space", u.Space.String()))
+	walked, err := s.walker.Walk(ctx, u)
 	s.endSweepSpan(span, err,
-		attribute.Bool("ingot.walk.due", ok),
-		attribute.String("ingot.walk.space", walked.Space.String()),
 		attribute.Int64("ingot.walk.reads", walked.Reads),
 		attribute.Int64("ingot.walk.reused", walked.Reused),
 		attribute.Bool("ingot.walk.completed", walked.Completed))
 	switch {
 	case s.sweepCtx.Err() != nil:
-		return false
 	case err != nil:
-		s.logger.Warn("catalog walk", zap.Stringer("space", walked.Space), zap.Error(err))
-		return false
-	case walked.Completed:
+		s.logger.Warn("catalog walk", zap.Stringer("space", u.Space), zap.Error(err))
+	default:
 		s.logger.Info("catalog walk completed",
-			zap.Stringer("space", walked.Space),
+			zap.Stringer("space", u.Space),
 			zap.Int64("live_bytes", walked.LiveBytes),
 			zap.Int64("reads", walked.Reads),
 			zap.Int64("reused", walked.Reused))
 	}
-	return ok
 }
 
 // startReleasedPass removes the local copies and intents that releases kept

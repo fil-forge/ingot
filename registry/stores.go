@@ -732,10 +732,13 @@ type CatalogWalk struct {
 // CatalogSubtree is the bytes and blocks reachable from one catalog block,
 // counting a block once per link to it. A CID names the same subtree
 // forever, so a walk can reuse the figures of any subtree it has seen.
+// Children are the nearest remembered subtrees inside it, which a walk that
+// reuses it whole still reaches.
 type CatalogSubtree struct {
-	CID    cid.Cid
-	Bytes  int64
-	Blocks int64
+	CID      cid.Cid
+	Bytes    int64
+	Blocks   int64
+	Children []cid.Cid
 }
 
 // CatalogWalkStore persists the catalog walker's work: each bucket's
@@ -744,14 +747,13 @@ type CatalogSubtree struct {
 type CatalogWalkStore interface {
 	// CatalogSubtrees returns the subtrees remembered for bucket.
 	CatalogSubtrees(ctx context.Context, bucket string) ([]CatalogSubtree, error)
-	// PutCatalogSubtrees remembers subtrees for bucket, computed by a walk
-	// that started at walkedAt. A walk saves them as it goes, so one cut
-	// short still spares the next its work.
-	PutCatalogSubtrees(ctx context.Context, bucket string, walkedAt int64, subtrees []CatalogSubtree) error
-	// CompleteCatalogWalk records w as bucket's last completed walk, marks
-	// the remembered subtrees it used as walked at w.StartedAt, and drops
-	// the bucket's others: those of earlier walks it no longer reaches.
-	CompleteCatalogWalk(ctx context.Context, bucket string, w CatalogWalk, used []cid.Cid) error
+	// PutCatalogSubtrees remembers subtrees for bucket. A walk saves them as
+	// it goes, so one cut short still spares the next its work.
+	PutCatalogSubtrees(ctx context.Context, bucket string, subtrees []CatalogSubtree) error
+	// CompleteCatalogWalk records w as bucket's last completed walk and
+	// forgets the remembered subtrees in drop: those its root no longer
+	// reaches.
+	CompleteCatalogWalk(ctx context.Context, bucket string, w CatalogWalk, drop []cid.Cid) error
 }
 
 // CatalogUsageStore reports how much catalog storage each bucket holds on

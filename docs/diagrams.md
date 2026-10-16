@@ -842,11 +842,13 @@ flowchart TB
   authority; a newly sealed segment then waits for the bucket's next write to
   re-capture it.
 - The catalog walker borrows read authority the same way, from any request's
-  reads in the space (hilt grants `/content/retrieve` with every catalog write
-  as well as every read). It takes only a store the IAM layer marked
-  `reqscope.Borrowable`: the key's own `DelegationCache`, which a revocation
-  clears. A request authorized off a response carrying a revoked delegation
-  spends a store of its own, which is not marked.
+  reads in the space (hilt grants `/content/retrieve` with every catalog
+  write as well as every read and list). It takes only a store the IAM layer
+  marked `reqscope.Borrowable`, the key's own `DelegationCache`, and only one
+  that proves `/content/retrieve` on the space to the agent. A revocation
+  that drops the key's store marks it `Dropped`, and a dropped store is
+  neither taken nor lent. A request authorized off a response carrying a
+  revoked delegation spends a store of its own, which is not marked.
 - Each access key gets its own `DelegationCache`, so a proof chain can never
   assemble across keys.
 - The same store holds the effective S3 action set hilt reported for the key
@@ -1091,7 +1093,7 @@ erDiagram
         text bucket PK, FK
         bytea cid PK "a catalog block with a large subtree"
         bigint bytes "reachable from cid, once per link"
-        bigint walked_at "start of the last walk to compute or use it"
+        bytea children "nearest remembered subtrees inside it"
     }
 
     segments ||--o{ segment_op_roots : "ON DELETE CASCADE"

@@ -8,7 +8,10 @@ import (
 	"testing"
 	"time"
 
+	contentcmds "github.com/fil-forge/libforge/commands/content"
 	"github.com/fil-forge/ucantone/did"
+	"github.com/fil-forge/ucantone/multikey/ed25519"
+	"github.com/fil-forge/ucantone/ucan/delegation"
 	block "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
@@ -88,8 +91,9 @@ func (f *fakeReads) GetBlock(ctx context.Context, _ did.DID, c cid.Cid) (block.B
 	return b, nil
 }
 
-// fixture is a bucket with shipped catalog segments, a walker over it and a
-// clock both read.
+// fixture is a bucket with shipped catalog segments, a walker over it, a
+// clock both read, and an access key whose proof store can retrieve in the
+// bucket's space for the agent.
 type fixture struct {
 	t      *testing.T
 	ctx    context.Context
@@ -99,21 +103,35 @@ type fixture struct {
 	walker *Walker
 	space  did.DID
 	clock  time.Time
+
+	keys  *iam.KeyProofs
+	key   did.DID
+	grant interface{ Link() cid.Cid } // the space→agent retrieve delegation
 }
 
 func newFixture(t *testing.T, cfg Config) *fixture {
 	t.Helper()
+	spaceKey, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	agent, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	accessKey, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	grant, err := contentcmds.Retrieve.Delegate(spaceKey, agent.DID(), spaceKey.DID(), delegation.WithNoExpiration())
+	require.NoError(t, err)
 	f := &fixture{
 		t:     t,
 		ctx:   context.Background(),
 		mem:   inmem.NewMemStore(),
 		reads: &fakeReads{blocks: map[cid.Cid]block.Block{}},
-		auth:  NewAuthority(),
+		auth:  NewAuthority(agent.DID()),
 		clock: time.Unix(1_000_000, 0),
+		space: spaceKey.DID(),
+		keys:  iam.NewKeyProofs(),
+		key:   accessKey.DID(),
+		grant: grant,
 	}
-	var err error
-	f.space, err = did.Parse("did:web:walk.example")
-	require.NoError(t, err)
+	f.keys.Deposit(f.key, grant)
 	require.NoError(t, f.mem.Create(f.ctx, "bk", f.space, registry.CreateState{}))
 	seq, err := f.mem.NextSegmentSeq(f.ctx)
 	require.NoError(t, err)
@@ -136,11 +154,25 @@ func (f *fixture) setRoot(root block.Block) {
 	require.NoError(f.t, f.mem.CASRoot(f.ctx, "bk", st.Root, root.Cid()))
 }
 
-// request captures authority as a request reading in the space would.
+// request captures authority as a request by the access key reading in the
+// space would.
 func (f *fixture) request() {
-	ctx := context.WithValue(f.ctx, reqscope.ProofStoreKey(), iam.NewDelegationCache(nil))
+	ctx := context.WithValue(f.ctx, reqscope.ProofStoreKey(), f.keys.For(f.key))
 	ctx = context.WithValue(ctx, reqscope.BorrowableKey(), true)
 	f.auth.Capture(ctx, f.space)
+}
+
+// walkNext walks the first due bucket, as the server's loop would; ok is
+// false when none is due.
+func (f *fixture) walkNext() (Walked, bool, error) {
+	f.t.Helper()
+	due, err := f.walker.Due(f.ctx)
+	require.NoError(f.t, err)
+	if len(due) == 0 {
+		return Walked{}, false, nil
+	}
+	walked, err := f.walker.Walk(f.ctx, due[0])
+	return walked, true, err
 }
 
 func (f *fixture) lastWalk() *registry.CatalogWalk {
@@ -163,7 +195,7 @@ func TestWalkRecordsLiveBytes(t *testing.T) {
 	f.setRoot(root)
 	f.request()
 
-	walked, ok, err := f.walker.WalkNext(f.ctx)
+	walked, ok, err := f.walkNext()
 	require.NoError(t, err)
 	require.True(t, ok)
 	require.True(t, walked.Completed)
@@ -189,16 +221,16 @@ func TestWalkNextPicksOnlyDueBuckets(t *testing.T) {
 	f.reads.put(leaf, root)
 	f.setRoot(root)
 
-	_, ok, err := f.walker.WalkNext(f.ctx)
+	_, ok, err := f.walkNext()
 	require.NoError(t, err)
 	require.False(t, ok, "walked without authority")
 
 	f.request()
-	_, ok, err = f.walker.WalkNext(f.ctx)
+	_, ok, err = f.walkNext()
 	require.NoError(t, err)
 	require.True(t, ok)
 
-	_, ok, err = f.walker.WalkNext(f.ctx)
+	_, ok, err = f.walkNext()
 	require.NoError(t, err)
 	require.False(t, ok, "walked again with the root unchanged")
 
@@ -207,13 +239,13 @@ func TestWalkNextPicksOnlyDueBuckets(t *testing.T) {
 	f.setRoot(root2)
 	f.clock = f.clock.Add(30 * time.Minute)
 	f.request()
-	_, ok, err = f.walker.WalkNext(f.ctx)
+	_, ok, err = f.walkNext()
 	require.NoError(t, err)
 	require.False(t, ok, "walked again within the interval")
 
 	f.clock = f.clock.Add(31 * time.Minute)
 	f.request()
-	_, ok, err = f.walker.WalkNext(f.ctx)
+	_, ok, err = f.walkNext()
 	require.NoError(t, err)
 	require.True(t, ok)
 	require.Equal(t, root2.Cid(), f.lastWalk().Root)
@@ -223,7 +255,7 @@ func TestWalkNextPicksOnlyDueBuckets(t *testing.T) {
 // needs no authority.
 func TestWalkOfEmptyBucket(t *testing.T) {
 	f := newFixture(t, Config{})
-	walked, ok, err := f.walker.WalkNext(f.ctx)
+	walked, ok, err := f.walkNext()
 	require.NoError(t, err)
 	require.True(t, ok)
 	require.True(t, walked.Completed)
@@ -244,7 +276,7 @@ func TestWalkReusesUnchangedSubtrees(t *testing.T) {
 	f.reads.put(l1, l2, l3, kept, dropped, root)
 	f.setRoot(root)
 	f.request()
-	_, _, err := f.walker.WalkNext(f.ctx)
+	_, _, err := f.walkNext()
 	require.NoError(t, err)
 
 	l4 := node(t, "l4")
@@ -253,7 +285,7 @@ func TestWalkReusesUnchangedSubtrees(t *testing.T) {
 	f.setRoot(root2)
 	f.clock = f.clock.Add(2 * time.Minute)
 	f.request()
-	walked, ok, err := f.walker.WalkNext(f.ctx)
+	walked, ok, err := f.walkNext()
 	require.NoError(t, err)
 	require.True(t, ok)
 	require.EqualValues(t, 2, walked.Reads, "only root2 and l4 are read")
@@ -287,7 +319,7 @@ func TestWalkStopsWhenAuthorityLapses(t *testing.T) {
 		}
 	}
 
-	walked, ok, err := f.walker.WalkNext(f.ctx)
+	walked, ok, err := f.walkNext()
 	require.True(t, ok)
 	require.ErrorIs(t, err, errNoAuthority)
 	require.False(t, walked.Completed)
@@ -299,7 +331,7 @@ func TestWalkStopsWhenAuthorityLapses(t *testing.T) {
 
 	f.reads.onRead = nil
 	f.request()
-	walked, ok, err = f.walker.WalkNext(f.ctx)
+	walked, ok, err = f.walkNext()
 	require.NoError(t, err)
 	require.True(t, ok)
 	require.True(t, walked.Completed)
@@ -317,58 +349,105 @@ func TestFailedWalkWaits(t *testing.T) {
 	f.request()
 	f.reads.fail = errors.New("piri is down")
 
-	_, ok, err := f.walker.WalkNext(f.ctx)
+	_, ok, err := f.walkNext()
 	require.True(t, ok)
 	require.ErrorContains(t, err, "piri is down")
 
 	f.reads.fail = nil
-	_, ok, err = f.walker.WalkNext(f.ctx)
+	_, ok, err = f.walkNext()
 	require.NoError(t, err)
 	require.False(t, ok, "walked again before retryAfter")
 
 	f.clock = f.clock.Add(retryAfter)
 	f.request()
-	walked, ok, err := f.walker.WalkNext(f.ctx)
+	walked, ok, err := f.walkNext()
 	require.NoError(t, err)
 	require.True(t, ok)
 	require.True(t, walked.Completed)
 }
 
-// TestWalkNextOrder: the bucket longest without a completed walk goes first,
-// the larger between two never walked.
-func TestWalkNextOrder(t *testing.T) {
+// TestDueOrder: the bucket longest without a completed walk goes first, the
+// larger between two never walked.
+func TestDueOrder(t *testing.T) {
 	f := newFixture(t, Config{Interval: time.Minute})
+	f.setRoot(node(t, "root"))
 	f.request()
-	w := f.walker
-	root := node(t, "root").Cid()
-	usage := []registry.CatalogUsage{
-		{Bucket: "walked-long-ago", Space: f.space, Root: root, Bytes: 9, Walk: &registry.CatalogWalk{FinishedAt: 100}},
-		{Bucket: "never-small", Bytes: 1},
-		{Bucket: "never-large", Bytes: 5},
+	small, err := did.Parse("did:web:small.example")
+	require.NoError(t, err)
+	large, err := did.Parse("did:web:large.example")
+	require.NoError(t, err)
+	for _, b := range []struct {
+		name  string
+		space did.DID
+		size  int64
+	}{{"never-small", small, 1}, {"never-large", large, 5}} {
+		require.NoError(t, f.mem.Create(f.ctx, b.name, b.space, registry.CreateState{}))
+		seq, err := f.mem.NextSegmentSeq(f.ctx)
+		require.NoError(t, err)
+		require.NoError(t, f.mem.InsertSegmentOpen(f.ctx, blockstore.PlaneCatalog, seq, b.name))
+		require.NoError(t, f.mem.MarkSegmentSealed(f.ctx, blockstore.PlaneCatalog, seq, 1, b.size, nil, nil))
+		require.NoError(t, f.mem.MarkSegmentShipped(f.ctx, blockstore.PlaneCatalog, seq, 2, multihash.Multihash("index"), 0, nil))
 	}
-	for _, want := range []string{"never-large", "never-small", "walked-long-ago"} {
-		u, ok := w.next(usage)
-		require.True(t, ok)
-		require.Equal(t, want, u.Bucket)
-		usage = removeBucket(usage, want)
-	}
-}
+	require.NoError(t, f.mem.CompleteCatalogWalk(f.ctx, "bk", registry.CatalogWalk{FinishedAt: 100}, nil))
 
-func removeBucket(usage []registry.CatalogUsage, name string) []registry.CatalogUsage {
-	var out []registry.CatalogUsage
-	for _, u := range usage {
-		if u.Bucket != name {
-			out = append(out, u)
-		}
+	due, err := f.walker.Due(f.ctx)
+	require.NoError(t, err)
+	var got []string
+	for _, u := range due {
+		got = append(got, u.Bucket)
 	}
-	return out
+	require.Equal(t, []string{"never-large", "never-small", "bk"}, got)
 }
 
 // TestWalkReadsAtTheConfiguredRate: the walker's limiter allows Rate reads a
 // second, one at a time.
 func TestWalkReadsAtTheConfiguredRate(t *testing.T) {
-	w := New(Config{Rate: 7}, Deps{Authority: NewAuthority()})
+	w := New(Config{Rate: 7}, Deps{})
 	require.EqualValues(t, 7, w.limiter.Limit())
 	require.Equal(t, 1, w.limiter.Burst())
 	require.EqualValues(t, DefaultRate, New(Config{}, Deps{}).limiter.Limit())
+}
+
+// TestWalkKeepsReusedSubtreesInside: a remembered subtree reused whole keeps
+// the remembered subtrees inside it, so a later change deep inside reads only
+// the changed path.
+func TestWalkKeepsReusedSubtreesInside(t *testing.T) {
+	f := newFixture(t, Config{Interval: time.Minute, MinSubtreeBlocks: 2})
+	x, y, z, v := node(t, "x"), node(t, "y"), node(t, "z"), node(t, "v")
+	a1, a2 := node(t, "a1", x, y), node(t, "a2", z, v)
+	a := node(t, "a", a1, a2)
+	root := node(t, "root", a, node(t, "b"))
+	f.reads.put(x, y, z, v, a1, a2, a, root)
+	f.reads.put(node(t, "b"))
+	f.setRoot(root)
+	f.request()
+	_, _, err := f.walkNext()
+	require.NoError(t, err)
+
+	// a is reused whole: a1 and a2 stay remembered although the walk never
+	// reaches them itself.
+	b2 := node(t, "b2")
+	root2 := node(t, "root2", a, b2)
+	f.reads.put(b2, root2)
+	f.setRoot(root2)
+	f.clock = f.clock.Add(2 * time.Minute)
+	f.request()
+	_, _, err = f.walkNext()
+	require.NoError(t, err)
+
+	// Change inside a, under a2: only the changed path and its new leaf are
+	// read; a1 is reused.
+	w := node(t, "w")
+	a2b := node(t, "a2b", z, w)
+	ab := node(t, "ab", a1, a2b)
+	root3 := node(t, "root3", ab, b2)
+	f.reads.put(w, a2b, ab, root3)
+	f.setRoot(root3)
+	f.clock = f.clock.Add(2 * time.Minute)
+	f.request()
+	walked, ok, err := f.walkNext()
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.EqualValues(t, 6, walked.Reads, "root3, ab, a2b, z, w and b2 are read; a1 is reused")
+	require.Equal(t, frames(root3, ab, a1, x, y, a2b, z, w, b2), walked.LiveBytes)
 }

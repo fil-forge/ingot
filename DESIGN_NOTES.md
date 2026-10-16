@@ -461,8 +461,8 @@ draws the chains and the stores.
 - **The catalog walker borrows read authority**: like the ship, it has none
   of its own, so it reads a bucket's catalog from Forge with the proof store
   of the latest request in the bucket's space, for up to an hour after that
-  request's reads. A bucket with no request since the walker started is never
-  walked; `ingot.catalog.walk_coverage_bytes` shows how much of the catalog
+  request's reads, and never once a revocation has dropped it. A bucket with
+  no request since the walker started is never walked; `ingot.catalog.walk_coverage_bytes` shows how much of the catalog
   the walked figures cover.
 - **Reads carry no bucket context**: `Manager.Get` linear-scans every open
   bucket store; threading the bucket into the read path removes the scan.

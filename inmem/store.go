@@ -80,13 +80,7 @@ type MemStore struct {
 	// catalogWalks and walkSubtrees are the catalog walker's tables, keyed
 	// by bucket (subtrees then by string(cid)).
 	catalogWalks map[string]registry.CatalogWalk
-	walkSubtrees map[string]map[string]walkSubtree
-}
-
-// walkSubtree is a catalog_walk_subtrees row.
-type walkSubtree struct {
-	registry.CatalogSubtree
-	walkedAt int64
+	walkSubtrees map[string]map[string]registry.CatalogSubtree
 }
 
 // claimKey / locKey are the composite map keys for the blob_refs and the
@@ -123,7 +117,7 @@ func NewMemStore() *MemStore {
 		releases:   map[locKey]registry.PendingRelease{},
 
 		catalogWalks: map[string]registry.CatalogWalk{},
-		walkSubtrees: map[string]map[string]walkSubtree{},
+		walkSubtrees: map[string]map[string]registry.CatalogSubtree{},
 	}
 }
 
@@ -433,14 +427,14 @@ func (m *MemStore) CatalogSubtrees(_ context.Context, bucket string) ([]registry
 	defer m.mu.Unlock()
 	var out []registry.CatalogSubtree
 	for _, st := range m.walkSubtrees[bucket] {
-		out = append(out, st.CatalogSubtree)
+		out = append(out, st)
 	}
 	return out, nil
 }
 
-// PutCatalogSubtrees remembers subtrees for bucket, keeping each row's
-// latest walkedAt, as the Postgres upsert does.
-func (m *MemStore) PutCatalogSubtrees(_ context.Context, bucket string, walkedAt int64, subtrees []registry.CatalogSubtree) error {
+// PutCatalogSubtrees remembers subtrees for bucket, leaving a row already
+// there as it is, as the Postgres insert does.
+func (m *MemStore) PutCatalogSubtrees(_ context.Context, bucket string, subtrees []registry.CatalogSubtree) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, ok := m.buckets[bucket]; !ok {
@@ -448,41 +442,27 @@ func (m *MemStore) PutCatalogSubtrees(_ context.Context, bucket string, walkedAt
 	}
 	rows := m.walkSubtrees[bucket]
 	if rows == nil {
-		rows = map[string]walkSubtree{}
+		rows = map[string]registry.CatalogSubtree{}
 		m.walkSubtrees[bucket] = rows
 	}
 	for _, st := range subtrees {
-		key := string(st.CID.Bytes())
-		at := walkedAt
-		if old, ok := rows[key]; ok && old.walkedAt > at {
-			at = old.walkedAt
+		if _, ok := rows[string(st.CID.Bytes())]; !ok {
+			rows[string(st.CID.Bytes())] = st
 		}
-		rows[key] = walkSubtree{CatalogSubtree: st, walkedAt: at}
 	}
 	return nil
 }
 
-// CompleteCatalogWalk records w and prunes the bucket's subtrees the walk
-// didn't use.
-func (m *MemStore) CompleteCatalogWalk(_ context.Context, bucket string, w registry.CatalogWalk, used []cid.Cid) error {
+// CompleteCatalogWalk records w and drops the listed subtrees.
+func (m *MemStore) CompleteCatalogWalk(_ context.Context, bucket string, w registry.CatalogWalk, drop []cid.Cid) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, ok := m.buckets[bucket]; !ok {
 		return fmt.Errorf("inmem: catalog walk of missing bucket %q", bucket)
 	}
 	m.catalogWalks[bucket] = w
-	rows := m.walkSubtrees[bucket]
-	for _, c := range used {
-		key := string(c.Bytes())
-		if st, ok := rows[key]; ok && st.walkedAt < w.StartedAt {
-			st.walkedAt = w.StartedAt
-			rows[key] = st
-		}
-	}
-	for key, st := range rows {
-		if st.walkedAt < w.StartedAt {
-			delete(rows, key)
-		}
+	for _, c := range drop {
+		delete(m.walkSubtrees[bucket], string(c.Bytes()))
 	}
 	return nil
 }

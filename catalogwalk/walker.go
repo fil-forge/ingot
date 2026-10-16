@@ -71,6 +71,12 @@ type Deps struct {
 
 // Walker walks one bucket's live catalog at a time. Its methods are not safe
 // for concurrent use.
+//
+// A walk counts a block once per link to it, so a block several others link
+// to is counted, and read, once for each. In return, a subtree's figures
+// depend only on its CID: a walk remembers those of large subtrees, and a
+// later walk reads only the blocks whose subtrees changed since, reusing the
+// rest whole.
 type Walker struct {
 	cfg       Config
 	reads     blockstore.BlockReader
@@ -107,12 +113,12 @@ func New(cfg Config, d Deps) *Walker {
 	}
 }
 
-// Walked describes a walk WalkNext ran.
+// Walked describes a walk Walk ran.
 type Walked struct {
 	Bucket string
 	Space  did.DID
-	// Reads is the blocks the walk read; Reused is the remembered subtrees
-	// it reused instead of reading them.
+	// Reads is the blocks the walk read; Reused is how many times it took a
+	// remembered subtree's figures instead of reading the subtree.
 	Reads, Reused int64
 	// LiveBytes is the CAR frame bytes reachable from the bucket's root,
 	// set once the walk completed.
@@ -120,37 +126,20 @@ type Walked struct {
 	Completed bool
 }
 
-// WalkNext walks the due bucket that has gone longest without a completed
-// walk, and reports the walk; ok is false when no bucket is due. A bucket is
-// due when its root differs from the one its last completed walk reached (or
-// it has none), that walk finished at least Interval ago, and Authority holds
+// Due returns the buckets due a walk, the one longest without a completed
+// walk first, the larger first between two equally overdue. A bucket is due
+// when its root differs from the one its last completed walk reached (or it
+// has none), that walk finished at least Interval ago, and Authority holds
 // read authority for its space (an empty bucket needs none). A bucket whose
 // walk failed waits retryAfter; one whose authority lapsed mid-walk is due
-// again once authority is held.
-//
-// A walk counts a block once per link to it, so a block several others link
-// to is counted, and read, once for each. In return, a subtree's figures
-// depend only on its CID, so a walk remembers those of large subtrees and a
-// later walk reads only what changed since.
-func (w *Walker) WalkNext(ctx context.Context) (Walked, bool, error) {
+// again once authority is held. Due also forgets the authority that can no
+// longer be lent.
+func (w *Walker) Due(ctx context.Context) ([]registry.CatalogUsage, error) {
+	w.authority.Prune()
 	usage, err := w.usage.CatalogUsage(ctx)
 	if err != nil {
-		return Walked{}, false, err
+		return nil, err
 	}
-	u, ok := w.next(usage)
-	if !ok {
-		return Walked{}, false, nil
-	}
-	walked, err := w.walk(ctx, u)
-	if err != nil && !errors.Is(err, errNoAuthority) && ctx.Err() == nil {
-		w.failedUntil[u.Bucket] = w.now().Add(retryAfter)
-	}
-	return walked, true, err
-}
-
-// next picks the due bucket that has gone longest without a completed walk,
-// the larger first between two equally overdue.
-func (w *Walker) next(usage []registry.CatalogUsage) (registry.CatalogUsage, bool) {
 	now := w.now()
 	var due []registry.CatalogUsage
 	for _, u := range usage {
@@ -173,12 +162,10 @@ func (w *Walker) next(usage []registry.CatalogUsage) (registry.CatalogUsage, boo
 		}
 		due = append(due, u)
 	}
-	if len(due) == 0 {
-		return registry.CatalogUsage{}, false
-	}
-	return slices.MinFunc(due, func(a, b registry.CatalogUsage) int {
+	slices.SortStableFunc(due, func(a, b registry.CatalogUsage) int {
 		return cmp.Or(cmp.Compare(lastWalked(a), lastWalked(b)), cmp.Compare(b.Bytes, a.Bytes))
-	}), true
+	})
+	return due, nil
 }
 
 // lastWalked is when u's last completed walk finished, 0 if none has.
@@ -189,19 +176,29 @@ func lastWalked(u registry.CatalogUsage) int64 {
 	return u.Walk.FinishedAt
 }
 
-// walk computes the bytes reachable from u's root and records the walk with
-// u's usage, which the same query read alongside the root.
+// Walk computes the bytes reachable from u's root and records the walk with
+// u's usage, which the same query read alongside the root, so the dead bytes
+// they imply are of one moment. u comes from Due. A walk that fails holds
+// the bucket back for retryAfter.
+func (w *Walker) Walk(ctx context.Context, u registry.CatalogUsage) (Walked, error) {
+	walked, err := w.walk(ctx, u)
+	if err != nil && !errors.Is(err, errNoAuthority) && ctx.Err() == nil {
+		w.failedUntil[u.Bucket] = w.now().Add(retryAfter)
+	}
+	return walked, err
+}
+
 func (w *Walker) walk(ctx context.Context, u registry.CatalogUsage) (Walked, error) {
 	started := w.now().Unix()
+	walked := Walked{Bucket: u.Bucket, Space: u.Space}
 	remembered, err := w.walks.CatalogSubtrees(ctx, u.Bucket)
 	if err != nil {
-		return Walked{Bucket: u.Bucket, Space: u.Space}, err
+		return walked, err
 	}
 	b := &bucketWalk{
 		Walker: w,
 		bucket: u.Bucket,
 		space:  u.Space,
-		start:  started,
 		// A walk's reads stay out of its trace: each network read is an
 		// outbound request and a query, and a walk makes thousands.
 		readCtx: tracing.Unsampled(ctx),
@@ -212,13 +209,14 @@ func (w *Walker) walk(ctx context.Context, u registry.CatalogUsage) (Walked, err
 	}
 
 	var live int64
+	var tops []cid.Cid
 	if u.Root.Defined() {
-		live, _, err = b.subtree(ctx, u.Root)
+		live, _, tops, err = b.subtree(ctx, u.Root)
 	}
 	if serr := b.save(ctx); err == nil {
 		err = serr
 	}
-	walked := Walked{Bucket: u.Bucket, Space: u.Space, Reads: b.read, Reused: int64(len(b.used))}
+	walked.Reads, walked.Reused = b.read, b.reused
 	if err != nil {
 		return walked, fmt.Errorf("catalogwalk: walk %s: %w", u.Space, err)
 	}
@@ -232,7 +230,7 @@ func (w *Walker) walk(ctx context.Context, u registry.CatalogUsage) (Walked, err
 		DeadOnArrivalBytes: u.DeadOnArrivalBytes,
 		UnmeasuredBytes:    u.UnmeasuredBytes,
 	}
-	if err := w.walks.CompleteCatalogWalk(ctx, u.Bucket, record, b.used); err != nil {
+	if err := w.walks.CompleteCatalogWalk(ctx, u.Bucket, record, b.unreached(tops)); err != nil {
 		return walked, err
 	}
 	walked.LiveBytes, walked.Completed = live, true
@@ -244,40 +242,39 @@ type bucketWalk struct {
 	*Walker
 	bucket  string
 	space   did.DID
-	start   int64           // when the walk started, unix seconds
 	readCtx context.Context // the context reads borrow authority onto
 
 	// known holds the subtrees remembered before the walk and those it has
-	// computed since; used lists those it reused; pending those it computed
-	// and has not saved yet.
+	// computed since; pending those it computed and has not saved yet.
 	known   map[cid.Cid]registry.CatalogSubtree
-	used    []cid.Cid
 	pending []registry.CatalogSubtree
 	read    int64 // blocks read
+	reused  int64 // remembered subtrees taken whole
 }
 
 // subtree returns the bytes and blocks reachable from c, counting a block
-// once per link to it.
-func (b *bucketWalk) subtree(ctx context.Context, c cid.Cid) (int64, int64, error) {
+// once per link to it, and the nearest remembered subtrees at or below c.
+func (b *bucketWalk) subtree(ctx context.Context, c cid.Cid) (int64, int64, []cid.Cid, error) {
 	if st, ok := b.known[c]; ok {
-		b.used = append(b.used, c)
-		return st.Bytes, st.Blocks, nil
+		b.reused++
+		return st.Bytes, st.Blocks, []cid.Cid{c}, nil
 	}
 	readCtx, ok := b.authority.Borrow(b.readCtx, b.space)
 	if !ok {
-		return 0, 0, errNoAuthority
+		return 0, 0, nil, errNoAuthority
 	}
 	if err := b.limiter.Wait(ctx); err != nil {
-		return 0, 0, err
+		return 0, 0, nil, err
 	}
 	blk, err := b.reads.GetBlock(readCtx, b.space, c)
 	if err != nil {
-		return 0, 0, fmt.Errorf("read %s: %w", c, err)
+		return 0, 0, nil, fmt.Errorf("read %s: %w", c, err)
 	}
 	b.read++
 
 	data := blk.RawData()
 	size, blocks := cars.FrameSize(c, uint64(len(data))), int64(1)
+	var inside []cid.Cid
 	if c.Prefix().Codec == cid.DagCBOR {
 		var links []cid.Cid
 		if err := cbg.ScanForLinks(bytes.NewReader(data), func(link cid.Cid) {
@@ -285,28 +282,54 @@ func (b *bucketWalk) subtree(ctx context.Context, c cid.Cid) (int64, int64, erro
 				links = append(links, link)
 			}
 		}); err != nil {
-			return 0, 0, fmt.Errorf("scan %s: %w", c, err)
+			return 0, 0, nil, fmt.Errorf("scan %s: %w", c, err)
 		}
 		for _, link := range links {
-			n, k, err := b.subtree(ctx, link)
+			n, k, below, err := b.subtree(ctx, link)
 			if err != nil {
-				return 0, 0, err
+				return 0, 0, nil, err
 			}
-			size, blocks = size+n, blocks+k
+			size, blocks, inside = size+n, blocks+k, append(inside, below...)
 		}
 	}
 
-	if blocks >= b.cfg.MinSubtreeBlocks {
-		st := registry.CatalogSubtree{CID: c, Bytes: size, Blocks: blocks}
-		b.known[c] = st
-		b.pending = append(b.pending, st)
-		if len(b.pending) >= subtreeBatch {
-			if err := b.save(ctx); err != nil {
-				return 0, 0, err
-			}
+	if blocks < b.cfg.MinSubtreeBlocks {
+		return size, blocks, inside, nil
+	}
+	st := registry.CatalogSubtree{CID: c, Bytes: size, Blocks: blocks, Children: inside}
+	b.known[c] = st
+	b.pending = append(b.pending, st)
+	if len(b.pending) >= subtreeBatch {
+		if err := b.save(ctx); err != nil {
+			return 0, 0, nil, err
 		}
 	}
-	return size, blocks, nil
+	return size, blocks, []cid.Cid{c}, nil
+}
+
+// unreached lists the known subtrees the remembered subtrees in tops don't
+// reach through their children: those of roots before this walk's, and those
+// computed by walks cut short. Everything the root reaches stays remembered,
+// whether this walk read it or reused it whole.
+func (b *bucketWalk) unreached(tops []cid.Cid) []cid.Cid {
+	reached := make(map[cid.Cid]struct{}, len(b.known))
+	pending := slices.Clone(tops)
+	for len(pending) > 0 {
+		c := pending[len(pending)-1]
+		pending = pending[:len(pending)-1]
+		if _, ok := reached[c]; ok {
+			continue
+		}
+		reached[c] = struct{}{}
+		pending = append(pending, b.known[c].Children...)
+	}
+	var out []cid.Cid
+	for c := range b.known {
+		if _, ok := reached[c]; !ok {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // save stores the subtrees computed since the last save, so a walk cut
@@ -318,7 +341,7 @@ func (b *bucketWalk) save(ctx context.Context) error {
 	}
 	saveCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 	defer cancel()
-	if err := b.walks.PutCatalogSubtrees(saveCtx, b.bucket, b.start, b.pending); err != nil {
+	if err := b.walks.PutCatalogSubtrees(saveCtx, b.bucket, b.pending); err != nil {
 		return err
 	}
 	b.pending = b.pending[:0]

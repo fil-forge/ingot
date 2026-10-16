@@ -372,7 +372,7 @@ func optionalCidBytes(c cid.Cid) []byte {
 // CatalogSubtrees returns the subtrees remembered for bucket.
 func (r *Postgres) CatalogSubtrees(ctx context.Context, bucket string) ([]CatalogSubtree, error) {
 	rows, err := r.pool.Query(ctx,
-		`SELECT cid, bytes, blocks FROM ingot.catalog_walk_subtrees WHERE bucket = $1`, bucket)
+		`SELECT cid, bytes, blocks, children FROM ingot.catalog_walk_subtrees WHERE bucket = $1`, bucket)
 	if err != nil {
 		return nil, fmt.Errorf("registry: catalog subtrees of %q: %w", bucket, err)
 	}
@@ -380,14 +380,17 @@ func (r *Postgres) CatalogSubtrees(ctx context.Context, bucket string) ([]Catalo
 	var out []CatalogSubtree
 	for rows.Next() {
 		var (
-			st CatalogSubtree
-			c  []byte
+			st          CatalogSubtree
+			c, children []byte
 		)
-		if err := rows.Scan(&c, &st.Bytes, &st.Blocks); err != nil {
+		if err := rows.Scan(&c, &st.Bytes, &st.Blocks, &children); err != nil {
 			return nil, fmt.Errorf("registry: scan catalog subtree: %w", err)
 		}
 		if st.CID, err = cid.Cast(c); err != nil {
 			return nil, fmt.Errorf("registry: catalog subtree cid of %q: %w", bucket, err)
+		}
+		if st.Children, err = splitCids(children); err != nil {
+			return nil, fmt.Errorf("registry: catalog subtree children of %q: %w", bucket, err)
 		}
 		out = append(out, st)
 	}
@@ -397,31 +400,55 @@ func (r *Postgres) CatalogSubtrees(ctx context.Context, bucket string) ([]Catalo
 	return out, nil
 }
 
-// PutCatalogSubtrees upserts subtrees for bucket in one statement.
-func (r *Postgres) PutCatalogSubtrees(ctx context.Context, bucket string, walkedAt int64, subtrees []CatalogSubtree) error {
+// PutCatalogSubtrees inserts subtrees for bucket in one statement. A CID's
+// figures never change, so a row already there is left as it is.
+func (r *Postgres) PutCatalogSubtrees(ctx context.Context, bucket string, subtrees []CatalogSubtree) error {
 	if len(subtrees) == 0 {
 		return nil
 	}
 	cids := make([][]byte, len(subtrees))
 	bytes := make([]int64, len(subtrees))
 	blocks := make([]int64, len(subtrees))
+	children := make([][]byte, len(subtrees))
 	for i, st := range subtrees {
-		cids[i], bytes[i], blocks[i] = st.CID.Bytes(), st.Bytes, st.Blocks
+		cids[i], bytes[i], blocks[i], children[i] = st.CID.Bytes(), st.Bytes, st.Blocks, joinCids(st.Children)
 	}
 	if _, err := r.pool.Exec(ctx,
-		`INSERT INTO ingot.catalog_walk_subtrees (bucket, cid, bytes, blocks, walked_at)
-		 SELECT $1, unnest($2::bytea[]), unnest($3::bigint[]), unnest($4::bigint[]), $5
-		 ON CONFLICT (bucket, cid)
-		 DO UPDATE SET walked_at = GREATEST(ingot.catalog_walk_subtrees.walked_at, EXCLUDED.walked_at)`,
-		bucket, cids, bytes, blocks, walkedAt); err != nil {
+		`INSERT INTO ingot.catalog_walk_subtrees (bucket, cid, bytes, blocks, children)
+		 SELECT $1, unnest($2::bytea[]), unnest($3::bigint[]), unnest($4::bigint[]), unnest($5::bytea[])
+		 ON CONFLICT (bucket, cid) DO NOTHING`,
+		bucket, cids, bytes, blocks, children); err != nil {
 		return fmt.Errorf("registry: put catalog subtrees of %q: %w", bucket, err)
 	}
 	return nil
 }
 
-// CompleteCatalogWalk records the walk and prunes the bucket's remembered
-// subtrees in one transaction.
-func (r *Postgres) CompleteCatalogWalk(ctx context.Context, bucket string, w CatalogWalk, used []cid.Cid) error {
+// joinCids concatenates CIDs for a bytea column; splitCids reads them back,
+// a CID's encoding being self-delimiting.
+func joinCids(cids []cid.Cid) []byte {
+	out := []byte{}
+	for _, c := range cids {
+		out = append(out, c.Bytes()...)
+	}
+	return out
+}
+
+func splitCids(b []byte) ([]cid.Cid, error) {
+	var out []cid.Cid
+	for len(b) > 0 {
+		n, c, err := cid.CidFromBytes(b)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+		b = b[n:]
+	}
+	return out, nil
+}
+
+// CompleteCatalogWalk records the walk and drops the listed subtrees in one
+// transaction.
+func (r *Postgres) CompleteCatalogWalk(ctx context.Context, bucket string, w CatalogWalk, drop []cid.Cid) error {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("registry: begin catalog walk of %q: %w", bucket, err)
@@ -440,20 +467,16 @@ func (r *Postgres) CompleteCatalogWalk(ctx context.Context, bucket string, w Cat
 		w.ForgeBytes, w.DeadOnArrivalBytes, w.UnmeasuredBytes); err != nil {
 		return fmt.Errorf("registry: record catalog walk of %q: %w", bucket, err)
 	}
-	usedBytes := make([][]byte, len(used))
-	for i, c := range used {
-		usedBytes[i] = c.Bytes()
-	}
-	if _, err := tx.Exec(ctx,
-		`UPDATE ingot.catalog_walk_subtrees SET walked_at = $2
-		  WHERE bucket = $1 AND cid = ANY($3::bytea[]) AND walked_at < $2`,
-		bucket, w.StartedAt, usedBytes); err != nil {
-		return fmt.Errorf("registry: mark catalog subtrees of %q: %w", bucket, err)
-	}
-	if _, err := tx.Exec(ctx,
-		`DELETE FROM ingot.catalog_walk_subtrees WHERE bucket = $1 AND walked_at < $2`,
-		bucket, w.StartedAt); err != nil {
-		return fmt.Errorf("registry: prune catalog subtrees of %q: %w", bucket, err)
+	if len(drop) > 0 {
+		dropBytes := make([][]byte, len(drop))
+		for i, c := range drop {
+			dropBytes[i] = c.Bytes()
+		}
+		if _, err := tx.Exec(ctx,
+			`DELETE FROM ingot.catalog_walk_subtrees WHERE bucket = $1 AND cid = ANY($2::bytea[])`,
+			bucket, dropBytes); err != nil {
+			return fmt.Errorf("registry: drop catalog subtrees of %q: %w", bucket, err)
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("registry: commit catalog walk of %q: %w", bucket, err)

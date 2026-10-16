@@ -1065,36 +1065,43 @@ func TestPostgresStores_Live(t *testing.T) {
 			t.Fatalf("CatalogUsage = %+v, want an entry %+v", usage, want)
 		}
 
-		// A walk's subtrees and record: the record joins the usage, and a
-		// completed walk keeps the subtrees it used and drops the rest.
+		// A walk's subtrees and record: subtrees round-trip with their
+		// children, a second insert of a CID leaves the first, and a completed
+		// walk drops the subtrees it lists.
 		root := liveCid(t, "cu-root")
-		kept, dropped, recomputed := liveCid(t, "cu-kept"), liveCid(t, "cu-dropped"), liveCid(t, "cu-recomputed")
-		if err := r.PutCatalogSubtrees(ctx, bucket, 100, []registry.CatalogSubtree{
-			{CID: kept, Bytes: 10, Blocks: 2}, {CID: dropped, Bytes: 20, Blocks: 3}, {CID: recomputed, Bytes: 5, Blocks: 1},
+		kept, dropped, child := liveCid(t, "cu-kept"), liveCid(t, "cu-dropped"), liveCid(t, "cu-child")
+		if err := r.PutCatalogSubtrees(ctx, bucket, []registry.CatalogSubtree{
+			{CID: kept, Bytes: 10, Blocks: 2, Children: []cid.Cid{child, dropped}},
+			{CID: dropped, Bytes: 20, Blocks: 3},
+			{CID: child, Bytes: 5, Blocks: 1},
 		}); err != nil {
 			t.Fatalf("PutCatalogSubtrees: %v", err)
 		}
-		if err := r.PutCatalogSubtrees(ctx, bucket, 200, []registry.CatalogSubtree{{CID: recomputed, Bytes: 5, Blocks: 1}}); err != nil {
+		if err := r.PutCatalogSubtrees(ctx, bucket, []registry.CatalogSubtree{{CID: child, Bytes: 99, Blocks: 99}}); err != nil {
 			t.Fatalf("PutCatalogSubtrees again: %v", err)
 		}
 		walk := registry.CatalogWalk{Root: root, StartedAt: 200, FinishedAt: 260, LiveBytes: 700,
 			ForgeBytes: 1500, DeadOnArrivalBytes: 300, UnmeasuredBytes: 500}
-		if err := r.CompleteCatalogWalk(ctx, bucket, walk, []cid.Cid{kept}); err != nil {
+		if err := r.CompleteCatalogWalk(ctx, bucket, walk, []cid.Cid{dropped}); err != nil {
 			t.Fatalf("CompleteCatalogWalk: %v", err)
 		}
 		subtrees, err := r.CatalogSubtrees(ctx, bucket)
 		if err != nil {
 			t.Fatalf("CatalogSubtrees: %v", err)
 		}
-		var got []string
+		byCid := map[string]registry.CatalogSubtree{}
 		for _, st := range subtrees {
-			got = append(got, st.CID.String())
+			byCid[st.CID.String()] = st
 		}
-		slices.Sort(got)
-		wantKept := []string{kept.String(), recomputed.String()}
-		slices.Sort(wantKept)
-		if !slices.Equal(got, wantKept) {
-			t.Fatalf("subtrees after the walk = %v, want %v", got, wantKept)
+		if len(byCid) != 2 {
+			t.Fatalf("subtrees after the walk = %+v, want kept and child", subtrees)
+		}
+		if got := byCid[kept.String()]; got.Bytes != 10 || got.Blocks != 2 ||
+			!slices.EqualFunc(got.Children, []cid.Cid{child, dropped}, cid.Cid.Equals) {
+			t.Fatalf("kept subtree = %+v", got)
+		}
+		if got := byCid[child.String()]; got.Bytes != 5 || len(got.Children) != 0 {
+			t.Fatalf("child subtree = %+v, want the first insert's", got)
 		}
 		usage, err = r.CatalogUsage(ctx)
 		if err != nil {

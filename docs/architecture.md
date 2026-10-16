@@ -926,11 +926,11 @@ CREATE TABLE ingot.catalog_walks (
     unmeasured_bytes      bigint NOT NULL
 );
 CREATE TABLE ingot.catalog_walk_subtrees (
-    bucket    text   NOT NULL REFERENCES ingot.buckets(name) ON DELETE CASCADE,
-    cid       bytea  NOT NULL,
-    bytes     bigint NOT NULL,
-    blocks    bigint NOT NULL,
-    walked_at bigint NOT NULL,
+    bucket   text   NOT NULL REFERENCES ingot.buckets(name) ON DELETE CASCADE,
+    cid      bytea  NOT NULL,
+    bytes    bigint NOT NULL,
+    blocks   bigint NOT NULL,
+    children bytea  NOT NULL,                             -- nearest remembered subtrees inside, concatenated CIDs
     PRIMARY KEY (bucket, cid)
 );
 

@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	contentcmds "github.com/fil-forge/libforge/commands/content"
 	ucanlib "github.com/fil-forge/libforge/ucan"
 	"github.com/fil-forge/ucantone/did"
 
@@ -23,16 +24,32 @@ import (
 const borrowTTL = time.Hour
 
 // recaptureEvery bounds how often reads in a space renew its capture, so
-// most reads cost a lookup rather than a write.
+// most reads cost a lookup rather than a proof check and a write.
 const recaptureEvery = time.Minute
+
+// dropper is a proof store that can report having been dropped for a
+// revocation (iam.DelegationCache).
+type dropper interface {
+	Dropped() bool
+}
+
+// usable reports whether store may be held past its request: one that can
+// report a revocation's drop and hasn't been dropped. A store that can't
+// report it is never held.
+func usable(store ucanlib.ProofStore) bool {
+	d, ok := store.(dropper)
+	return ok && !d.Dropped()
+}
 
 // Authority holds, for each space, the proof store of the latest request that
 // read in it, so a walk can read that space's catalog from Forge for up to
 // borrowTTL afterwards. It takes only a store the IAM service marked
-// borrowable (reqscope.Borrowable): the access key's own cached store. A
-// revocation clears that store's delegations, so a borrowed store loses them
-// too.
+// borrowable (reqscope.Borrowable), the access key's own cached store, and
+// only one that can prove /content/retrieve on the space to the agent. A
+// revocation of any delegation in the store drops it from the IAM caches,
+// and a dropped store is neither taken nor lent.
 type Authority struct {
+	agent  did.DID // the audience of the agent's retrieval chains
 	mu     sync.RWMutex
 	stores map[string]borrowed // by space DID
 	now    func() time.Time
@@ -44,21 +61,22 @@ type borrowed struct {
 	at    time.Time
 }
 
-// NewAuthority returns an Authority holding nothing.
-func NewAuthority() *Authority {
-	return &Authority{stores: map[string]borrowed{}, now: time.Now}
+// NewAuthority returns an Authority holding nothing, for retrieval by agent.
+func NewAuthority(agent did.DID) *Authority {
+	return &Authority{agent: agent, stores: map[string]borrowed{}, now: time.Now}
 }
 
-// Capture records the proof store of ctx's request for space, if it is
-// borrowable. It is a blockstore.Layered OnRead hook, so it sees every read a
-// request makes, whichever tier serves it. A context with no borrowable store
-// (a background job's, a walk's own) is ignored.
+// Capture records the proof store of ctx's request for space. It is a
+// blockstore.Layered OnRead hook, so it sees every read a request makes,
+// whichever tier serves it. A context with no borrowable store (a background
+// job's, a walk's own) is ignored, and so is a store that can't prove
+// retrieval in space.
 func (a *Authority) Capture(ctx context.Context, space did.DID) {
 	if !reqscope.Borrowable(ctx) {
 		return
 	}
 	store, ok := reqscope.ProofStore(ctx)
-	if !ok || store == nil {
+	if !ok || store == nil || !usable(store) {
 		return
 	}
 	key, now := space.String(), a.now()
@@ -68,13 +86,18 @@ func (a *Authority) Capture(ctx context.Context, space did.DID) {
 	if held && now.Sub(b.at) < recaptureEvery {
 		return
 	}
+	chain, _, err := store.ProofChain(ctx, a.agent, contentcmds.Retrieve.Command, space)
+	if err != nil || len(chain) == 0 {
+		return
+	}
 	a.mu.Lock()
 	a.stores[key] = borrowed{store: store, at: now}
 	a.mu.Unlock()
 }
 
 // Borrow returns ctx carrying the store captured for space, if it was
-// captured within borrowTTL; ok is false otherwise.
+// captured within borrowTTL and hasn't been dropped since; ok is false
+// otherwise. The returned context is not borrowable in turn.
 func (a *Authority) Borrow(ctx context.Context, space did.DID) (context.Context, bool) {
 	key := space.String()
 	a.mu.RLock()
@@ -83,7 +106,7 @@ func (a *Authority) Borrow(ctx context.Context, space did.DID) (context.Context,
 	if !held {
 		return ctx, false
 	}
-	if a.now().Sub(b.at) >= borrowTTL {
+	if !a.lendable(b) {
 		a.mu.Lock()
 		if cur, ok := a.stores[key]; ok && cur.at.Equal(b.at) {
 			delete(a.stores, key)
@@ -91,11 +114,30 @@ func (a *Authority) Borrow(ctx context.Context, space did.DID) (context.Context,
 		a.mu.Unlock()
 		return ctx, false
 	}
-	return context.WithValue(ctx, reqscope.ProofStoreKey(), b.store), true
+	ctx = context.WithValue(ctx, reqscope.ProofStoreKey(), b.store)
+	return context.WithValue(ctx, reqscope.BorrowableKey(), false), true
 }
 
-// Holds reports whether a store captured within borrowTTL is held for space.
+// Holds reports whether a lendable store is held for space.
 func (a *Authority) Holds(space did.DID) bool {
 	_, ok := a.Borrow(context.Background(), space)
 	return ok
+}
+
+// Prune forgets every store that can no longer be lent, so a space that
+// stops reading, or whose bucket is never walked, doesn't keep its store.
+func (a *Authority) Prune() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for key, b := range a.stores {
+		if !a.lendable(b) {
+			delete(a.stores, key)
+		}
+	}
+}
+
+// lendable reports whether b was captured within borrowTTL and its store
+// hasn't been dropped since.
+func (a *Authority) lendable(b borrowed) bool {
+	return a.now().Sub(b.at) < borrowTTL && usable(b.store)
 }

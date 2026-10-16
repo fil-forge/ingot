@@ -157,10 +157,12 @@ Internal:
   `ingot.catalog.*` live and dead gauges: `Authority` borrows a recent
   request's read authority per space (captured on every read through
   `Layered.OnRead`, only from stores the IAM layer marked
-  `reqscope.Borrowable`, 1h past the last read); `Walker` picks the due
-  bucket longest unwalked, reads under a rate cap, and remembers large
-  subtrees' totals (`catalog_walk_subtrees`) so a later walk reads only what
-  changed.
+  `reqscope.Borrowable` that prove `/content/retrieve` on the space, 1h past
+  the last read, never once `iam.DelegationCache.Dropped`); `Walker.Due`
+  lists the due buckets longest-unwalked first and `Walker.Walk` reads one
+  under a rate cap, remembering large subtrees' totals and their nearest
+  remembered children (`catalog_walk_subtrees`) so a later walk reads only
+  what changed.
 - **`inmem/`** — in-memory fakes (`MemStore`, `NopBaseReader`, `NopUploader`);
   test-only.
 - **`cars/`**, **`migrations/`**,

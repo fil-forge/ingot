@@ -91,9 +91,11 @@ func TestServerReportsCatalogUsageGauges(t *testing.T) {
 
 	// The bucket has no root, so its walk needs no authority and finds
 	// nothing live: every shipped byte is dead.
-	walked, ok, err := s.walker.WalkNext(ctx)
+	due, err := s.walker.Due(ctx)
 	require.NoError(t, err)
-	require.True(t, ok)
+	require.Len(t, due, 1)
+	walked, err := s.walker.Walk(ctx, due[0])
+	require.NoError(t, err)
 	require.True(t, walked.Completed)
 	_, err = s.backend.RefreshCatalogUsage(ctx)
 	require.NoError(t, err)
@@ -105,6 +107,20 @@ func TestServerReportsCatalogUsageGauges(t *testing.T) {
 	require.Equal(t, bySpace, gaugeValues(t, reader, "ingot.catalog.dead_after_ship_bytes"))
 	require.Contains(t, gaugeValues(t, reader, "ingot.catalog.walked_at"), space.String())
 	require.Equal(t, map[string]int64{"current": 1500, "stale": 0, "never": 0}, coverageValues(t, reader))
+
+	// A segment shipping after the walk, the root unchanged, counts at once:
+	// the walked root's live bytes still hold.
+	seq, err := mem.NextSegmentSeq(ctx)
+	require.NoError(t, err)
+	require.NoError(t, mem.InsertSegmentOpen(ctx, blockstore.PlaneCatalog, seq, "bk"))
+	require.NoError(t, mem.MarkSegmentSealed(ctx, blockstore.PlaneCatalog, seq, 1, 400, nil, nil))
+	require.NoError(t, mem.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seq, 2, index, 100, nil))
+	_, err = s.backend.RefreshCatalogUsage(ctx)
+	require.NoError(t, err)
+	bySpace[space.String()] = 1900
+	require.Equal(t, bySpace, gaugeValues(t, reader, "ingot.catalog.dead_bytes"))
+	bySpace[space.String()] = 1500
+	require.Equal(t, bySpace, gaugeValues(t, reader, "ingot.catalog.dead_after_ship_bytes"))
 
 	require.NoError(t, s.Stop(context.Background()))
 	require.Empty(t, metricNames(t, reader), "metrics reported after Stop")

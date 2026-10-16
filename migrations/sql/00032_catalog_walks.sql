@@ -16,15 +16,16 @@ CREATE TABLE ingot.catalog_walks (
 
 -- catalog_walk_subtrees remembers the bytes and blocks reachable from each
 -- catalog block whose subtree is large enough, so a later walk skips every
--- subtree that hasn't changed: a CID names the same bytes forever. walked_at
--- is the start of the last walk that computed or used the row; a completed
--- walk drops the bucket's rows it didn't use.
+-- subtree that hasn't changed: a CID names the same bytes forever. children
+-- is the concatenated CIDs of the nearest remembered subtrees inside it, so
+-- a completed walk can keep every row its root still reaches, reused whole
+-- or not, and drop the rest.
 CREATE TABLE ingot.catalog_walk_subtrees (
-    bucket    text   NOT NULL REFERENCES ingot.buckets(name) ON DELETE CASCADE,
-    cid       bytea  NOT NULL,
-    bytes     bigint NOT NULL,
-    blocks    bigint NOT NULL,
-    walked_at bigint NOT NULL,
+    bucket   text   NOT NULL REFERENCES ingot.buckets(name) ON DELETE CASCADE,
+    cid      bytea  NOT NULL,
+    bytes    bigint NOT NULL,
+    blocks   bigint NOT NULL,
+    children bytea  NOT NULL,
     PRIMARY KEY (bucket, cid)
 );
 

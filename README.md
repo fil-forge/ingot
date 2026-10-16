@@ -272,8 +272,8 @@ and all are refreshed every five minutes.
 | `ingot.catalog.forge_bytes` | Bytes of the bucket's shipped catalog segments (their CARs; their index blobs are not counted) |
 | `ingot.catalog.dead_on_arrival_bytes` | Bytes of those segments' blocks that were already dead when their segment shipped: superseded by later writes in the same segment |
 | `ingot.catalog.unmeasured_bytes` | Bytes of shipped segments whose dead-on-arrival bytes were not measured, such as every segment shipped before the measurement existed |
-| `ingot.catalog.live_bytes` | Bytes of the catalog blocks the bucket's root reached when its last catalog walk started |
-| `ingot.catalog.dead_bytes` | Shipped bytes that root no longer reached then |
+| `ingot.catalog.live_bytes` | Bytes of the catalog blocks reachable from the root the bucket's last catalog walk reached |
+| `ingot.catalog.dead_bytes` | Shipped bytes the bucket's root doesn't reach: now, while the walked root is still the bucket's root, else as of the walk |
 | `ingot.catalog.dead_after_ship_bytes` | The part of `dead_bytes` not already dead on arrival (it includes the dead blocks of unmeasured segments) |
 | `ingot.catalog.walked_at` | When the bucket's last completed walk started, in Unix seconds |
 | `ingot.catalog.walk_coverage_bytes` | Shipped bytes of all buckets on the node, by `state` of each bucket's last walk: `current`, `stale` (the root has moved since) or `never` |
@@ -289,7 +289,8 @@ its root has changed since its last walk, that walk finished at least
 `catalog_walk_interval` ago (default `6h`; negative turns the walker off), and
 authority is held, one bucket at a time per node, the longest-unwalked first,
 reading at most `catalog_walk_rate` blocks a second (default 100). A walk cut
-short keeps the subtrees it finished. A bucket with no request since the
+short keeps the subtrees it finished. Only a store that can prove retrieval
+in the space is borrowed, and a store a revocation dropped is not lent. A bucket with no request since the
 walker started is never walked, and a large bucket with brief bursts of
 traffic may take several to finish; `walk_coverage_bytes` shows how much of
 the catalog the walked figures speak for.
