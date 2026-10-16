@@ -296,6 +296,51 @@ func runReleaseStartSuite(t *testing.T, st releaseStartStore) {
 			}
 		}
 	})
+
+	t.Run("a generation's claims need every location, publish the intents, and repeat digests", func(t *testing.T) {
+		located := evictDigest(t, "start:batch-located")
+		unlocated := evictDigest(t, "start:batch-unlocated")
+		locate(space, located)
+		for _, d := range []multihash.Multihash{located, unlocated} {
+			if err := st.PutIntent(ctx, registry.UploadIntent{Space: space, Digest: d, LocalPath: "/spool/x", Size: 7, State: registry.IntentAccepted}); err != nil {
+				t.Fatalf("PutIntent: %v", err)
+			}
+		}
+		claim := func(d multihash.Multihash, version string) registry.BlobClaim {
+			return registry.BlobClaim{Digest: d, Bucket: "bk", ObjectKey: "batch", VersionID: version, Space: space}
+		}
+		// A body names a digest once per span, so a generation can repeat it.
+		claims := []registry.BlobClaim{claim(located, "v1"), claim(unlocated, "v1"), claim(located, "v1")}
+		if err := st.AddBlobClaims(ctx, claims); !errors.Is(err, registry.ErrReleaseInProgress) {
+			t.Fatalf("AddBlobClaims with an unlocated digest err = %v, want ErrReleaseInProgress", err)
+		}
+		if n, _ := st.CountClaims(ctx, space, located); n != 0 {
+			t.Fatalf("a refused batch recorded a claim on the located digest: %d", n)
+		}
+		if in, err := st.GetIntent(ctx, space, located); err != nil || in.State != registry.IntentAccepted {
+			t.Fatalf("a refused batch touched the intent: %+v, %v", in, err)
+		}
+
+		locate(space, unlocated)
+		if err := st.AddBlobClaims(ctx, claims); err != nil {
+			t.Fatalf("AddBlobClaims: %v", err)
+		}
+		for _, d := range []multihash.Multihash{located, unlocated} {
+			if n, _ := st.CountClaims(ctx, space, d); n != 1 {
+				t.Fatalf("claims on %x = %d, want 1", d, n)
+			}
+			if in, err := st.GetIntent(ctx, space, d); err != nil || in.State != registry.IntentPublished {
+				t.Fatalf("intent of %x = %+v, %v; want published", d, in, err)
+			}
+		}
+		// Idempotent.
+		if err := st.AddBlobClaims(ctx, claims); err != nil {
+			t.Fatalf("AddBlobClaims again: %v", err)
+		}
+		if n, _ := st.CountClaims(ctx, space, located); n != 1 {
+			t.Fatalf("claims after a repeat = %d, want 1", n)
+		}
+	})
 }
 
 func mustListReleases(t *testing.T, st registry.PendingReleaseStore, space did.DID) []registry.PendingRelease {
