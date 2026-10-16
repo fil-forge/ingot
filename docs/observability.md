@@ -26,5 +26,5 @@ Ingot runs on the appliances, where it pushes traces and metrics over OTLP to Al
   client uses `tracing.NewHTTPClient()`.
 - **Alerts and dashboard panels** live in fil-forge/infra-central, under `terraform/envs/grafana/`:
   the Forge Regions rule groups (the main Forge Regions group holds the two Ingot rules today) and
-  the `forge-regions` dashboard. Its `docs/observability.md` ("Adding an alert or panel") says how to add them. Open a companion PR there,
-  or say in this PR that one is needed.
+  the `forge-regions` dashboard. Its `docs/observability.md` ("Adding an alert or panel") says how
+  to add them. Open a companion PR there, or say in this PR that one is needed.
