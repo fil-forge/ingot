@@ -284,8 +284,8 @@ but unwired. The full trace is the
 the manifest as `[digest, offset]` tuples and the rest in extent blocks of
 1,024, catalog blocks under `"/blobextent/0"` that the manifest points to
 by `[offset, CID]`. A blob ends where the next begins. A ranged GET loads
-the manifest and at most one extent; a sequential read loads each extent
-once. The write path builds a flat list (`BlobRefs`) and `commitVersion`
+the manifest and the extents its range covers, each once: one for any range
+within an extent, which spans about 256 GiB at the default blob size. The write path builds a flat list (`BlobRefs`) and `commitVersion`
 cuts it into extents inside the commit's transaction, so a copy, which
 writes the source's blobs into another bucket's catalog, hands the commit
 the list rather than the source's extent links. One manifest holds at most

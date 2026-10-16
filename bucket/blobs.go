@@ -15,8 +15,8 @@ import (
 
 // BlobList is a stored body's blobs in byte order: the first entries inline,
 // the rest in extent blocks (see BlobExtent) that ExtentRefs point to. A
-// ranged read loads the manifest and at most one extent. Read it through
-// Body.Index; write it with BuildBlobList.
+// ranged read loads the manifest and each extent its range covers, once.
+// Read it through Body.Index; write it with BuildBlobList.
 //
 // A blob ends one byte before the next blob's Offset, or before the next
 // extent's Offset, or at the body's Size-1, so no entry stores an end.

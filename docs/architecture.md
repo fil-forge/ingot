@@ -240,7 +240,7 @@ shape `bucket/manifest.go` implements (`Body.Blobs`, a stored S3 `etag`, an addi
 field, and a reserved nullable `IndexRoot`); a `deleteMarker` field is reserved for versioning, which
 is deferred ([§12](#12-implementation-status--postponed-items)). A body of more than 1,024 blobs keeps
 the rest in extent blocks the manifest points to by offset, so a ranged GET reads the manifest and
-at most one extent (`bucket/blobs.go`). One manifest lists at most 8,389,632 blobs: the 48.8 TiB S3
+only the extents its range covers (`bucket/blobs.go`). One manifest lists at most 8,389,632 blobs: the 48.8 TiB S3
 maximum fits whenever `max_blob_size` is at least 6.11 MiB.*
 
 **The catalog plane.** MST nodes and manifests are dag-cbor blocks. They are batched into CAR

@@ -110,8 +110,8 @@ each block its key string (~19 bytes) and buys the self-description.
 `"/objectmanifest/1"` is the first such revision. Its body lists the first 1,024 blobs inline as
 `[digest, offset]` tuples and the rest in extent blocks, each its own catalog block under the
 `"/blobextent/0"` key of a separate union (`BlobExtentUnion`), so an extent decoded as a value
-block fails. The manifest points to each extent by `[offset, CID]`, and a ranged read loads at
-most one. `"/objectmanifest/0"` blocks, whose inline list stored each blob's span, still decode:
+block fails. The manifest points to each extent by `[offset, CID]`, and a ranged read loads only
+the extents its range covers. `"/objectmanifest/0"` blocks, whose inline list stored each blob's span, still decode:
 `ObjectValue` converts one into an `ObjectManifest` (its blobs become the inline list), so no
 caller past the decode sees the old form. Writes always use `"/objectmanifest/1"`, and an Ingot
 older than the revision fails on those blocks with the no-known-key error.
