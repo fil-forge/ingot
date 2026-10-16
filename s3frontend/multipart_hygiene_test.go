@@ -250,10 +250,11 @@ func TestSweepDropsCompletedSessionKeepingWinners(t *testing.T) {
 	}
 }
 
-// TestCompleteFailsClosedOnMissingParamsRow: a part blob whose enc-params
-// row is gone fails Complete (blobPlaintextLen cannot derive the plaintext
-// span) instead of committing a manifest with an envelope-sized span; the
-// session reverts to open.
+// TestCompleteFailsClosedOnMissingParamsRow: a part recorded before parts
+// kept their blobs' plaintext lengths has them derived at Complete. A part
+// blob whose enc-params row is gone then fails Complete (blobPlaintextLen
+// cannot derive the plaintext span) instead of committing a manifest with an
+// envelope-sized span; the session reverts to open.
 func TestCompleteFailsClosedOnMissingParamsRow(t *testing.T) {
 	b, mem, _ := newRefTestBackend(t)
 	ctx := context.Background()
@@ -267,6 +268,16 @@ func TestCompleteFailsClosedOnMissingParamsRow(t *testing.T) {
 	d := hygienePartDigests(t, mem, uploadID, 1)[0]
 	if err := mem.DeleteEncryptionParams(ctx, did.Undef, d); err != nil {
 		t.Fatalf("DeleteEncryptionParams: %v", err)
+	}
+	// The part as a row from before the lengths were kept.
+	part := partRecord(t, mem, uploadID, 1)
+	part.BlobSizes = nil
+	trees, err := mem.ListPartTrees(ctx, uploadID)
+	if err != nil {
+		t.Fatalf("ListPartTrees: %v", err)
+	}
+	if err := mem.PutPart(ctx, part, trees[1]); err != nil {
+		t.Fatalf("PutPart: %v", err)
 	}
 
 	one := int32(1)
@@ -403,8 +414,8 @@ func TestReCompleteAfterOverwriteReplaysCommittedResult(t *testing.T) {
 }
 
 // TestCompleteWaitBudgetIsOperationAborted: a latch loser whose wait for the
-// winner runs out reports OperationAborted (a retryable 409), not
-// NoSuchUpload — the session exists and is merely slow.
+// winner runs out reports OperationAborted (a 409), not NoSuchUpload — the
+// session exists and is merely slow.
 func TestCompleteWaitBudgetIsOperationAborted(t *testing.T) {
 	b, mem, _ := newRefTestBackend(t)
 	key := "slow-winner"
@@ -694,18 +705,35 @@ func (f *failOncePutLocation) PutLocation(ctx context.Context, loc registry.Blob
 	return f.LocationStore.PutLocation(ctx, loc)
 }
 
+// failOnceConcludePark is a park store whose next ConcludePark fails,
+// remembering which blob it refused; every later swap goes through.
+type failOnceConcludePark struct {
+	registry.ParkStore
+	armed   bool
+	refused multihash.Multihash
+}
+
+func (f *failOnceConcludePark) ConcludePark(ctx context.Context, loc registry.BlobLocation, addTask []byte) (bool, error) {
+	if f.armed {
+		f.armed = false
+		f.refused = loc.Digest
+		return false, errors.New("parks table unavailable")
+	}
+	return f.ParkStore.ConcludePark(ctx, loc, addTask)
+}
+
 // TestCompleteRecordsEveryAcceptanceWhenOneFailsToPersist: the upload
-// service accepts the whole batch, but recording one blob's location fails.
+// service accepts the whole batch, but recording one blob's acceptance fails.
 // Every other accepted blob is still recorded with its park dropped — a
 // persistence failure for one blob must not leave the rest parked, where
 // session expiry would abort them — and the next Complete concludes only the
 // blob whose record did not land.
 func TestCompleteRecordsEveryAcceptanceWhenOneFailsToPersist(t *testing.T) {
 	hc := &haltingConcluder{}
-	locs := &failOncePutLocation{armed: true}
+	locs := &failOnceConcludePark{armed: true}
 	b, mem := newDeferredBackend(t, hc, func(d *Deps) {
-		locs.LocationStore = d.Locations
-		d.Locations = locs
+		locs.ParkStore = d.Parks
+		d.Parks = locs
 	})
 	ctx := context.Background()
 	key := "persist-fail"
@@ -731,7 +759,7 @@ func TestCompleteRecordsEveryAcceptanceWhenOneFailsToPersist(t *testing.T) {
 		t.Fatalf("conclude calls = %v, want one call for two blobs", hc.calls)
 	}
 	if locs.armed || locs.refused == nil {
-		t.Fatal("the location store never refused a write")
+		t.Fatal("the park store never refused a swap")
 	}
 	var recorded multihash.Multihash
 	for _, d := range hc.calls[0] {
@@ -876,42 +904,57 @@ func TestCompleteRetryDropsParkAfterFailedIntentUpdate(t *testing.T) {
 	}
 }
 
-// TestCompleteRetryDropsParkAfterFailedDelete: a Complete that records a
-// blob's acceptance and then fails to drop its park leaves a stale row. The
-// retry takes the dedup path for that blob and drops the row from there.
-func TestCompleteRetryDropsParkAfterFailedDelete(t *testing.T) {
-	hc := &haltingConcluder{}
-	parks := &failDeletePark{fails: 1}
-	b, mem := newDeferredBackend(t, hc, func(d *Deps) {
-		parks.ParkStore = d.Parks
-		d.Parks = parks
-	})
-	key := "park-delete-fail"
-	uploadID, parts := completeTwoParts(t, b, key)
-
-	if _, err := mpComplete(t, b, key, uploadID, parts, nil); err == nil {
-		t.Fatal("Complete succeeded although one park failed to delete")
+// plantStaleAcceptedPark puts uploadID's two part blobs in the state a
+// Complete leaves when it records both acceptances and fails to drop one
+// park: both located and accepted, one park row still standing. Recording
+// now swaps a park for its location in one step, so only rows written before
+// it can be in this state. It returns the digests and the one still parked.
+func plantStaleAcceptedPark(t *testing.T, mem *inmem.MemStore, uploadID string) (digests []multihash.Multihash, stale multihash.Multihash) {
+	t.Helper()
+	ctx := context.Background()
+	sess, err := mem.GetSession(ctx, uploadID)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
 	}
-	if parks.fails > 0 {
-		t.Fatal("the park store never refused a delete")
-	}
-	stale := 0
-	digests := hygienePartDigests(t, mem, uploadID, 1)
+	digests = hygienePartDigests(t, mem, uploadID, 1)
 	digests = append(digests, hygienePartDigests(t, mem, uploadID, 2)...)
-	for _, d := range digests {
-		if _, err := mem.ParkByDigest(context.Background(), d); err == nil {
-			stale++
+	for i, d := range digests {
+		loc := registry.BlobLocation{Space: sess.Space, Digest: d, Provider: "did:key:zNode", URL: "https://node.example/blob", Size: 1}
+		if i == 0 {
+			if err := mem.PutLocation(ctx, loc); err != nil {
+				t.Fatalf("PutLocation: %v", err)
+			}
+		} else {
+			park, err := mem.GetPark(ctx, sess.Space, d)
+			if err != nil {
+				t.Fatalf("GetPark: %v", err)
+			}
+			if swapped, err := mem.ConcludePark(ctx, loc, park.AddTask); err != nil || !swapped {
+				t.Fatalf("ConcludePark = %v, %v", swapped, err)
+			}
+		}
+		if err := mem.SetIntentState(ctx, sess.Space, d, registry.IntentAccepted); err != nil {
+			t.Fatalf("SetIntentState: %v", err)
 		}
 	}
-	if stale != 1 {
-		t.Fatalf("stale park rows after the failed Complete = %d, want 1", stale)
-	}
+	return digests, digests[0]
+}
+
+// TestCompleteDropsStaleParkOfLocatedBlob: a blob recorded as accepted whose
+// park row was never dropped is located, so Complete neither concludes it
+// again nor leaves the park row standing.
+func TestCompleteDropsStaleParkOfLocatedBlob(t *testing.T) {
+	hc := &haltingConcluder{}
+	b, mem := newDeferredBackend(t, hc)
+	key := "stale-park"
+	uploadID, parts := completeTwoParts(t, b, key)
+	digests, _ := plantStaleAcceptedPark(t, mem, uploadID)
 
 	if _, err := mpComplete(t, b, key, uploadID, parts, nil); err != nil {
-		t.Fatalf("retry Complete: %v", err)
+		t.Fatalf("Complete: %v", err)
 	}
-	if len(hc.calls) != 1 {
-		t.Fatalf("conclude calls = %v, want the retry to conclude nothing: every blob is located", hc.calls)
+	if len(hc.calls) != 0 {
+		t.Fatalf("conclude calls = %v, want none: every blob is located", hc.calls)
 	}
 	for _, d := range digests {
 		assertAcceptedAndUnparked(t, mem, d)
@@ -924,20 +967,11 @@ func TestCompleteRetryDropsParkAfterFailedDelete(t *testing.T) {
 // aborted on the provider as if it were parked.
 func TestSweepDropsStaleParkOfAcceptedBlob(t *testing.T) {
 	hc := &haltingConcluder{}
-	parks := &failDeletePark{fails: 1}
-	b, mem := newDeferredBackend(t, hc, func(d *Deps) {
-		parks.ParkStore = d.Parks
-		d.Parks = parks
-	})
+	b, mem := newDeferredBackend(t, hc)
 	ctx := context.Background()
 	key := "sweep-stale-park"
-	uploadID, parts := completeTwoParts(t, b, key)
-
-	if _, err := mpComplete(t, b, key, uploadID, parts, nil); err == nil {
-		t.Fatal("Complete succeeded although one park failed to delete")
-	}
-	digests := hygienePartDigests(t, mem, uploadID, 1)
-	digests = append(digests, hygienePartDigests(t, mem, uploadID, 2)...)
+	uploadID, _ := completeTwoParts(t, b, key)
+	digests, _ := plantStaleAcceptedPark(t, mem, uploadID)
 
 	if n, err := b.SweepStaleMultipartSessions(ctx, -time.Second); err != nil || n == 0 {
 		t.Fatalf("sweep: cleaned=%d err=%v", n, err)
@@ -959,31 +993,17 @@ func TestSweepDropsStaleParkOfAcceptedBlob(t *testing.T) {
 // the sweep enqueued is the durable retry: it stands until the park is gone.
 func TestReleaseSweepDropsParkTheSessionSweepCouldNot(t *testing.T) {
 	hc := &haltingConcluder{}
-	parks := &failDeletePark{fails: 1}
+	parks := &failDeletePark{}
 	b, mem := newDeferredBackend(t, hc, func(d *Deps) {
 		parks.ParkStore = d.Parks
 		d.Parks = parks
 	})
 	ctx := context.Background()
 	key := "release-drops-park"
-	uploadID, parts := completeTwoParts(t, b, key)
+	uploadID, _ := completeTwoParts(t, b, key)
+	_, stale := plantStaleAcceptedPark(t, mem, uploadID)
 
-	if _, err := mpComplete(t, b, key, uploadID, parts, nil); err == nil {
-		t.Fatal("Complete succeeded although one park failed to delete")
-	}
-	digests := hygienePartDigests(t, mem, uploadID, 1)
-	digests = append(digests, hygienePartDigests(t, mem, uploadID, 2)...)
-	var stale multihash.Multihash
-	for _, d := range digests {
-		if _, err := mem.ParkByDigest(ctx, d); err == nil {
-			stale = d
-		}
-	}
-	if stale == nil {
-		t.Fatal("no stale park row after the failed Complete")
-	}
-
-	// The session sweep's delete fails too.
+	// The session sweep's delete fails.
 	parks.fails = 1
 	if n, err := b.SweepStaleMultipartSessions(ctx, -time.Second); err != nil || n == 0 {
 		t.Fatalf("sweep: cleaned=%d err=%v", n, err)
@@ -1970,26 +1990,26 @@ func TestSweepLeavesALiveCompleteOnAnOldSession(t *testing.T) {
 	}
 }
 
-// hookAfterParkDeletes is a park store that runs hook once, right after its
-// n-th DeletePark: Complete drops each concluded blob's park as its last
-// recording step, so with n = the session's blob count the hook lands in the
-// window between the off-lock conclude and the locked commit, where a sweep
-// or DeleteBucket can take the session.
-type hookAfterParkDeletes struct {
+// hookAfterParkConcludes is a park store that runs hook once, right after
+// its n-th ConcludePark: Complete swaps each concluded blob's park for its
+// location as it records it, so with n = the session's blob count the hook
+// lands in the window between the off-lock conclude and the locked commit,
+// where a sweep or DeleteBucket can take the session.
+type hookAfterParkConcludes struct {
 	registry.ParkStore
 	n    int
 	hook func()
 }
 
-func (h *hookAfterParkDeletes) DeletePark(ctx context.Context, space did.DID, digest multihash.Multihash) error {
-	err := h.ParkStore.DeletePark(ctx, space, digest)
+func (h *hookAfterParkConcludes) ConcludePark(ctx context.Context, loc registry.BlobLocation, addTask []byte) (bool, error) {
+	swapped, err := h.ParkStore.ConcludePark(ctx, loc, addTask)
 	h.n--
 	if h.n == 0 && h.hook != nil {
 		hook := h.hook
 		h.hook = nil
 		hook()
 	}
-	return err
+	return swapped, err
 }
 
 // TestCompleteFailsWhenItsSessionIsTakenBeforeCommit: a sweep (DeleteBucket
@@ -1999,7 +2019,7 @@ func (h *hookAfterParkDeletes) DeletePark(ctx context.Context, space did.DID, di
 // committing a manifest over released blobs.
 func TestCompleteFailsWhenItsSessionIsTakenBeforeCommit(t *testing.T) {
 	rm := &recordingRemover{}
-	parks := &hookAfterParkDeletes{n: 2}
+	parks := &hookAfterParkConcludes{n: 2}
 	b, mem := newDeferredBackend(t, &parkingUploader{}, func(d *Deps) {
 		parks.ParkStore = d.Parks
 		d.Parks = parks

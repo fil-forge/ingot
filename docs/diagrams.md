@@ -20,7 +20,8 @@ change to the diagrams to re-check. The maintenance rule lives in
 | `block-routes` | [Two block routes](#two-block-routes-body-blobs-and-catalog-blocks) | how body blobs and catalog blocks travel to Forge by different paths | here |
 | `put` | [PutObject](#putobject-spool-and-upload-off-the-lock-commit-under-it) | the write path: off-lock ingest and upload, locked commit | here |
 | `get` | [GetObject](#getobject-version-resolution-local-tiers-network-retrieval) | version resolution, tier fallthrough, network retrieval | here |
-| `multipart` | [Multipart upload](#multipart-upload-park-on-write-conclude-on-complete) | park at UploadPart, conclude at Complete, abort unwind | here |
+| `multipart` | [Multipart upload](#multipart-upload-park-on-write-accept-in-the-background) | park at UploadPart, accept in the background, Complete's wait, abort unwind | here |
+| `part-states` | [Part states](#part-states-the-acceptance-queue) | the part rows as the acceptor's queue | here |
 | `multipart-states` | [Session states](#session-states-and-the-completeabort-latch) | the session state machine and the single-winner latch | here |
 | `blob-lifecycle` | [Blob lifecycle](#blob-lifecycle-spooled-parked-accepted-released) | intent states and the claim ledger gating deletion | here |
 | `version-tree` | [Per-key version storage](#per-key-version-storage-manifest-arm-leaf-arm-prev-tree) | the value union, the leaf, the prev tree | here |
@@ -227,8 +228,8 @@ flowchart TB
   arrival instead of following it. The spool copy still supplies the digest,
   which the put receipt reports and the node checks at accept.
 - Multipart parts ride the body route with the conclude deferred (parked);
-  `Complete` finishes it
-  (the [multipart diagram](#multipart-upload-park-on-write-conclude-on-complete)).
+  the upload's acceptor finishes it
+  (the [multipart diagram](#multipart-upload-park-on-write-accept-in-the-background)).
 
 Cross-references: [`architecture.md` §4](./architecture.md#4-the-catalog-layer),
 [§5](./architecture.md#5-the-data-layer);
@@ -477,19 +478,19 @@ Sources: `s3frontend/object.go` (GetObject, HeadObject, selectBytes),
 `registry/locallocator.go`, `logstore/manager.go` (Get). Review when these
 change.
 
-## Multipart upload: park on write, conclude on Complete
+## Multipart upload: park on write, accept in the background
 
-Parts upload to the provider at `UploadPart` but stay **parked** (durable,
-unaccepted): the conclude that triggers `/blob/accept` is deferred to
-`Complete`, so an `Abort` only ever unwinds parked blobs. Complete concludes
-every parked part in one request rather than one per part, which is what
-keeps its cost flat as the part count grows.
+Parts upload to the provider at `UploadPart` and park there (durable,
+unaccepted). Each upload's acceptor concludes its parked parts in batches
+while the client is still uploading, so `Complete` waits only for the last
+few and its cost stays flat as the part count grows.
 
 ```mermaid
 sequenceDiagram
     autonumber
     actor C as S3 client
     participant B as s3frontend.Backend
+    participant A as the upload's acceptor<br/>(goroutine)
     participant R as registry<br/>(sessions, parts, parks, intents)
     participant U as sprue
     participant P as piri
@@ -504,11 +505,11 @@ sequenceDiagram
         B->>B: vet the source: copySourceBucket (tenant), resolveVersionIn,<br/>range within the object, copy-source preconditions (412)#59;<br/>the body is the source's plaintext range through the decrypting reader
     end
     B->>B: ingestPart: splitSpool<br/>(resolve the tenant recipient, then encrypt per piece:<br/>fresh CEK → FEE envelope → spool under the ciphertext<br/>digest + params row, as in the PutObject diagram)
-    B->>R: PutPart(parked): open sessions only, the row held FOR SHARE<br/>against a concurrent latch#59; a refused part records its blobs' releases
+    B->>R: PutPart(spooled, blob_sizes): open sessions only, the row held FOR SHARE<br/>against a concurrent latch#59; a refused part records its blobs' releases
     loop each part blob (parkBlobs)
         alt streamed while spooled
             B->>R: PutPark(AddTask, AcceptTask, PutInvocation), intent parked,<br/>DeleteStream: the PUT already went to piri in splitSpool
-            B->>B: removeLocal (the part's local copy#59; Complete concludes from the park)
+            B->>B: removeLocal (the part's local copy#59; the acceptor concludes from the park)
         else blob_locations already has the digest
             B->>R: intent accepted (dedup, no park)
         else already parked (GetPark hit)
@@ -520,19 +521,33 @@ sequenceDiagram
             B->>B: removeLocal (the part's local copy)
         end
     end
+    B->>R: MoveParts(spooled to parked), guarded by the part's digests
+    B->>A: nudge (start the acceptor, or ask for another pass)
     B-->>C: part ETag (part md5#59; for a copy, of the copied bytes)
+    loop while a pass finds parked parts
+        A->>R: GetSession (stop unless open or completing)#59; ListParkedParts
+        A->>U: acceptParked: up to 1000 blobs' put receipts in one /ucan/conclude,<br/>accept receipts read from the response (poll only as fallback)
+        A->>R: per blob, under its write lock: ConcludePark (park swapped for the<br/>location, only while the concluded park, by AddTask, stands) + intent accepted
+        A->>R: MoveParts(parked to accepted)
+    end
+    Note over A,R: a failed pass backs off (1 s to 30 s) and retries#59; the accept sweeper<br/>nudges every live upload with parked parts at start and every 30 s
     C->>B: CompleteMultipartUpload(parts)
     B->>B: validate parts (ascending, ETags, checksums, MinPartSize)
     alt session already completed
         B-->>C: the ETag/version id recorded on the session (idempotent re-Complete)
     else latch won
         B->>R: LatchSession(open to completing), single winner
-        B->>R: manifest spans: per blob, plaintext length derived from<br/>the intent's stored size + FEE geometry (blobPlaintextLen)
-        B->>U: concludeBlobs: every parked blob's put receipt, up to<br/>MaxConcludeReceipts (1000) per /ucan/conclude, accept receipts<br/>read from the response (poll only as fallback)
-        B->>R: PutLocation + intent accepted + DeletePark per blob
-        B->>TX: commitVersion (see the PutObject diagram)
-        B->>R: LatchSession(completing to completed), best-effort
-        B-->>C: 200, ETag = md5-of-part-md5s + "-N"
+        B->>R: manifest spans from each part's blob_sizes<br/>(rows without them: intent size + FEE geometry)
+        B->>A: drainAcceptor, up to acceptWaitBudget (30 s)
+        B->>R: ListParts: the named parts' states
+        alt a named part still parked
+            B-->>C: 409 OperationAborted#59; the deferred revert reopens the session
+        else every part accepted, or spooled
+            B->>U: spooled parts only: concludeBlobs (conclude, or upload a never-parked blob)
+            B->>TX: commitVersion (see the PutObject diagram)#59; AddBlobClaims set-based
+            B->>R: LatchSession(completing to completed), best-effort
+            B-->>C: 200, ETag = md5-of-part-md5s + "-N"
+        end
     end
     C->>B: AbortMultipartUpload
     B->>R: LatchSession(open to aborting)#59; EnqueueReleases for every<br/>unreferenced part blob#59; then DeleteSession (parts cascade)
@@ -547,6 +562,15 @@ sequenceDiagram
   (`CountLivePartRefs`, checked first: a Complete claims before it leaves
   'completing'). `AddBlobClaim` publishes a committed blob's upload intent,
   so the reap of a retained session releases only what was never committed.
+- A release can take a blob while the acceptor concludes it. The provider
+  refuses whichever of accept and abort comes second, and the release drops
+  the park row before anything else, so `ConcludePark` finds no park and the
+  acceptor records nothing for a blob a release took. `ConcludePark`
+  matches the park's `/blob/add` task, so a later park of the same bytes
+  stays for its own conclude.
+- The acceptor never cancels a release record (`ReleasingDigests`, read
+  only); a part holding such a blob goes back to `spooled` for Complete.
+  Each pass runs under `acceptPassTimeout`.
 - A part is written only while its session is open, in the statement that
   checks the state; a teardown that took the session refuses it, and the
   upload records releases for the blobs it had spooled.
@@ -557,11 +581,45 @@ Cross-references: [`architecture.md` §7.2](./architecture.md#72-multipart),
 [§7.3](./architecture.md#73-the-session-latch-the-abortcomplete-race).
 
 Sources: `s3frontend/multipart.go` (all verbs, ingestPart, parkBlobs,
-recordStreamedPark, concludeBlobs, enqueuePartReleases,
-SweepStaleMultipartSessions), `s3frontend/stream.go`,
+recordStreamedPark, acceptRequested, acceptParked, recordConcluded,
+concludeBlobs, enqueuePartReleases, SweepStaleMultipartSessions),
+`s3frontend/acceptor.go`, `s3frontend/stream.go`,
 `s3frontend/object.go` (runRelease, executeRelease),
 `s3frontend/uploadpartcopy.go`, `registry/stores.go`,
-`server.go` (startMultipartSweeper). Review when these change.
+`server.go` (startMultipartSweeper, startAcceptSweeper). Review when these change.
+
+## Part states: the acceptance queue
+
+A part row's `state` is the upload's acceptance queue. Every move is a
+guarded update that also matches the part's `blob_digests`, so a request
+never moves a row a later upload of the same part number replaced.
+
+```mermaid
+stateDiagram-v2
+    [*] --> spooled : PutPart (UploadPart, before its blobs park)
+    spooled --> parked : every blob parked or located (MoveParts, then nudge)
+    parked --> accepted : acceptor pass concludes and records the blobs
+    parked --> spooled : acceptor finds a blob with a release record, or neither park nor location
+    spooled --> accepted : Complete finishes it (conclude, or upload from the spool)
+    parked --> accepted : Complete, when no acceptors run
+    spooled --> [*] : a later UploadPart of the same number replaces the row
+    parked --> [*] : replaced, or the session's teardown cascades
+    accepted --> [*] : replaced, or the session's teardown cascades
+```
+
+- `spooled` is the state of a part whose request is still parking its
+  blobs, or died doing so. The acceptor never takes it; Complete does.
+- Complete requires every part it names to be `accepted` before the commit:
+  it waits for the acceptor, finishes `spooled` parts itself, and answers a
+  part still `parked` with a 409 that botocore clients treat as final.
+- Rows from before migration 00030 are `parked` or `accepted` and have no
+  `blob_sizes`; Complete derives their lengths per blob.
+
+Sources: `registry/stores.go` (Part* consts, MoveParts, ListParkedParts,
+ListUploadsWithParkedParts), `registry/stores_postgres.go`,
+`s3frontend/acceptor.go`, `s3frontend/multipart.go` (ingestPart,
+acceptRequested), `migrations/sql/00030_part_accept_queue.sql`. Review when
+these change.
 
 ## Session states and the Complete/Abort latch
 
@@ -583,8 +641,8 @@ stateDiagram-v2
 - A Complete that loses the latch waits (bounded) for the winner's terminal
   state: `completed` replays the ETag and version id the winner recorded on
   the session; `aborting` or a vanished row is `NoSuchUpload`; a winner still
-  running past the wait budget is `OperationAborted`, which the client
-  retries.
+  running past the wait budget is `OperationAborted`, a 409 the AWS CLI
+  and other botocore clients treat as final.
 - `ListParts` and `Abort` reject any non-`open` session as `NoSuchUpload`;
   `Complete` alone accepts `completed`, for idempotency.
 - The sweeper also reaps rows stuck in `completing` or `aborting` past the
@@ -616,7 +674,7 @@ flowchart TB
     spooled -->|"first network call begins<br/>(uploadBlobs, parkBlobs, concludeBlobs fallback)"| uploading
     uploading -->|"single-shot upload:<br/>/blob/add, PUT, conclude, accept;<br/>file moves to the cache (BlobCache.Take)"| accepted
     uploading -->|"parkBlobs: /blob/add WithConclude(false),<br/>PUT (or already streamed); blob_parks row written;<br/>local copy removed (removeLocal)"| parked
-    parked -->|"concludeBlobs at Complete:<br/>/ucan/conclude; blob_parks row deleted"| accepted
+    parked -->|"acceptParked (the upload's acceptor, or Complete for a spooled part):<br/>/ucan/conclude; ConcludePark swaps the blob_parks row for blob_locations"| accepted
     spooled -->|"release record; executeRelease, local only<br/>(the blob never left this node):<br/>DeleteIntent + removeLocal"| gone([deleted])
     uploading -->|"release record; executeRelease: /blob/remove<br/>(idempotent: the accept may have landed, its location not);<br/>DeleteIntent + removeLocal"| gone
     parked -->|"release record; executeRelease: /blob/abort (cause AddTask),<br/>or /blob/remove if the provider says accepted;<br/>DeleteIntent + removeLocal"| gone
@@ -677,7 +735,8 @@ Sources: `registry/stores.go` (state consts, ListEvictable, ListReleasedPublishe
 (ingestBody, reconcileClaims), `s3frontend/localblob_sweep.go` (SweepLocalBlobs),
 `s3frontend/localblobs.go` (cacheHeld, removeLocal),
 `s3frontend/multipart.go`
-(parkBlobs, concludeBlobs, enqueuePartReleases), `s3frontend/object.go`
+(parkBlobs, acceptParked, recordConcluded, concludeBlobs, enqueuePartReleases),
+`s3frontend/acceptor.go`, `s3frontend/object.go`
 (runRelease, executeRelease), `uploader/blob.go` (UploadBlob,
 AbortBlob, RemoveBlob). Review when these change.
 
@@ -1026,8 +1085,9 @@ erDiagram
         int part_number PK
         bytea etag_md5
         bytea blob_digests "ordered array"
+        bigint blob_sizes "plaintext length per blob; NULL on rows from before 00030"
         text checksum
-        text state "'accepted' never written"
+        text state "spooled, parked, accepted: the acceptor's queue"
     }
     multipart_part_trees {
         text upload_id PK, FK
@@ -1146,7 +1206,8 @@ listed diagrams (each diagram's `Sources:` footer names its exact files).
 | Package / file | Diagrams to review |
 |---|---|
 | `s3frontend/object.go`, `s3frontend/version.go` | put, get, blob-lifecycle, version-tree, gc-candidates |
-| `s3frontend/multipart.go` | multipart, multipart-states, blob-lifecycle |
+| `s3frontend/multipart.go` | multipart, part-states, multipart-states, blob-lifecycle |
+| `s3frontend/acceptor.go` | multipart, part-states, blob-lifecycle |
 | `s3frontend/stream.go` | put, multipart, block-routes, blob-lifecycle |
 | `s3frontend/bucket.go` | context, delete-bucket |
 | `bucketop/` | put, get, delete-bucket, packages |
@@ -1157,5 +1218,5 @@ listed diagrams (each diagram's `Sources:` footer names its exact files).
 | `iam/`, `internal/reqscope/` | principals, authorize, context |
 | `bucket/`, `mst/` | version-tree, put, get |
 | `migrations/sql/` | schema, plus any state diagram naming a changed CHECK |
-| `module.go`, `server.go`, `config/` | packages, context, logstore-pipeline; `server.go` also authorize |
+| `module.go`, `server.go`, `config/` | packages, context, logstore-pipeline; `server.go` also authorize and multipart |
 | `s3frontend/policy.go` | context, authorize |

@@ -57,9 +57,16 @@ const (
 	SessionCompleted = "completed"
 )
 
-// multipart_parts.state values (§7.2).
+// multipart_parts.state values (§7.2). The part rows are the upload's
+// acceptance queue: the acceptor concludes 'parked' parts while the upload is
+// open, and Complete requires every part it names to be 'accepted'.
 const (
-	PartParked   = "parked"
+	// PartSpooled: recorded, its blobs not yet all parked. A part left here
+	// is one whose request died mid-park.
+	PartSpooled = "spooled"
+	// PartParked: every blob has a park (or a location), ready to conclude.
+	PartParked = "parked"
+	// PartAccepted: every blob is accepted on Forge.
 	PartAccepted = "accepted"
 )
 
@@ -253,8 +260,13 @@ type MultipartPart struct {
 	// Complete, and is never echoed by ListParts.
 	Checksum    string
 	BlobDigests []multihash.Multihash
-	State       string
-	CreatedAt   time.Time
+	// BlobSizes is each blob's plaintext length, parallel to BlobDigests.
+	// Nil on a row recorded before the lengths were kept; the reader then
+	// derives them per blob.
+	BlobSizes []int64
+	// State is one of the Part* values; empty records PartSpooled.
+	State     string
+	CreatedAt time.Time
 }
 
 // PartTree is the BLAKE3 tree material UploadPart records for one part: the
@@ -422,6 +434,11 @@ type PendingReleaseStore interface {
 	// reuse, or reports one that is started, which the write waits out, or
 	// none.
 	CancelRelease(ctx context.Context, space did.DID, digest multihash.Multihash) (ReleaseCancel, error)
+	// ReleasingDigests returns which of digests have a release record in
+	// space, started or not, keyed by string(digest). It reads and changes
+	// nothing else: for a caller that must leave a blob with a pending
+	// release alone, where CancelRelease is for a write that takes it over.
+	ReleasingDigests(ctx context.Context, space did.DID, digests []multihash.Multihash) (map[string]bool, error)
 	// ListReleasesBySpace returns every intent for space regardless of
 	// not_before — DeleteBucket executes a space's releases immediately (the
 	// bucket is empty and its deletion is explicit, so no reader grace is
@@ -578,6 +595,15 @@ type ParkStore interface {
 	// GetPark returns ErrNotFound when the space has no park row for digest.
 	GetPark(ctx context.Context, space did.DID, digest multihash.Multihash) (*BlobPark, error)
 	DeletePark(ctx context.Context, space did.DID, digest multihash.Multihash) error
+	// ConcludePark replaces the space's park of loc.Digest with loc, in one
+	// transaction, and reports whether it did. addTask is the /blob/add task
+	// (cid bytes) of the park the caller concluded, and only that park is
+	// replaced. With it gone nothing is written: another conclude recorded
+	// the blob first, or a release took the park, and with it the blob,
+	// while the conclude ran. A park of the same digest recorded since by
+	// another write names another allocation, which this conclude did not
+	// accept, and stays for its own.
+	ConcludePark(ctx context.Context, loc BlobLocation, addTask []byte) (bool, error)
 	// HasParkFor reports whether a park row records the /blob/add task
 	// addTask (cid bytes).
 	HasParkFor(ctx context.Context, addTask []byte) (bool, error)
@@ -648,6 +674,19 @@ type MultipartStore interface {
 	// the session, and a teardown's part listing sees every part that did
 	// land.
 	PutPart(ctx context.Context, p MultipartPart, tree *PartTree) error
+	// MoveParts moves each of parts (as the caller read them) from state
+	// from to state to, and returns how many moved. A part is skipped when
+	// its row is no longer in from or no longer names the BlobDigests it
+	// was read with: a later upload of the same part number replaced it,
+	// and the replacement is not the caller's to move.
+	MoveParts(ctx context.Context, parts []MultipartPart, from, to string) (int, error)
+	// ListParkedParts returns up to limit of uploadID's 'parked' parts in
+	// part-number order: the acceptor's queue.
+	ListParkedParts(ctx context.Context, uploadID string, limit int) ([]MultipartPart, error)
+	// ListUploadsWithParkedParts returns the upload IDs of open and
+	// completing sessions that have a 'parked' part, for the acceptor's
+	// restart sweep.
+	ListUploadsWithParkedParts(ctx context.Context) ([]string, error)
 	// ListParts returns uploadID's parts in part-number order. The trees
 	// are separate (ListPartTrees): a part's tree is up to hundreds of KiB
 	// and only Complete merges them, while UploadPart, ListParts and the
