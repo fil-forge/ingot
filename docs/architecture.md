@@ -1049,14 +1049,13 @@ paths below are exercised against the real stack by the smelt-based `itest/` har
   unless usage stays over budget, in which case it evicts inside them, only down to the budget;
   hourly it deletes orphan files. Once at startup, `serve` deletes the copies of committed blobs
   whose release finished while releases kept them. `local_blob_max_bytes` is required unless
-  `cache_writes` is false; `0` means no budget. A release frees a
-  deleted object's local copies, and a parked part's copy goes once it parks. Local blob storage
-  reports its usage by directory, budget, stalled uploads, removals by reason and reads by tier as
-  OpenTelemetry metrics (`ingot.local_blobs.*`). With `cache_writes: false`, a body's copy goes as
-  soon as the provider accepts it, giving up the read-after-write copy (§4): safe while reads
-  resolve through the local location table (`LocalLocator`); with an indexer-backed locator, §4's
-  race on a digest not yet published would return. Still open under #48: nothing reclaims a failed
-  upload's body.
+  `cache_writes` is false; `0` means no budget. A release frees a deleted object's local copies, and
+  a parked part's copy goes once it parks. Local blob storage reports its usage by directory,
+  budget, stalled uploads, removals by reason and reads by tier as OpenTelemetry metrics
+  (`ingot.local_blobs.*`). With `cache_writes: false`, a body's copy goes as soon as the provider
+  accepts it, giving up the read-after-write copy (§4): safe while reads resolve through the local
+  location table (`LocalLocator`); with an indexer-backed locator, §4's race on a digest not yet
+  published would return. Still open under #48: nothing reclaims a failed upload's body.
 - **Multipart parts park at UploadPart, accept at Complete.** (Built: `parkBlobs`/`concludeBlobs`
   over the `blob_parks` table.) A parked part holds no local bytes: its spool copy is removed once
   it parks, and Complete concludes it from its park row. Abort and session expiry unwind parked

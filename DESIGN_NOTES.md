@@ -227,8 +227,8 @@ Each directory keeps a running byte count of its blob files, and the spool
 also counts writes in progress as their bytes land. `local_blob_max_bytes`
 is required unless `cache_writes` is false, and `0` means no budget. With a
 nonzero budget, a sweeper checks the total every 30 seconds and, when it is
-over the budget, evicts blobs the provider already holds, oldest
-state change first, until usage is at 90% of the budget. A blob qualifies
+over the budget, evicts blobs the provider already holds, oldest state
+change first, until usage is at 90% of the budget. A blob qualifies
 only through a row that proves the provider has it for the intent's space: a
 `blob_locations` row for an `accepted` or `published` intent, a `blob_parks`
 row for a `parked` one. A blob stored as received can have an intent in
