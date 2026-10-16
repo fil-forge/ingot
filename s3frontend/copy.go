@@ -174,6 +174,9 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 	}
 	body, etag := srcMf.Body, srcMf.ETag
 	body.PartSizes, body.PartChecksums = nil, nil
+	// The commit writes the copy's blob list into the destination's catalog,
+	// so a pinned body's blobs are read from the source's.
+	var blobs msbucket.BlobRefs
 	// A source without any checksum (a manifest from before every object
 	// carried one) also takes the pass, so the copy gets the default.
 	if reingest || multipartSrc || ckAlgo == "" || ckAlgo != srcMf.ChecksumAlgorithm {
@@ -202,7 +205,7 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 			if !multipartSrc && len(srcMf.Body.MD5) == md5.Size {
 				copyMD5 = knownMD5(srcMf.Body.MD5)
 			}
-			if body, err = b.ingestBody(ctx, bucketState, hr, srcMf.Body.Size, copyMD5, plaintext); err != nil {
+			if body, blobs, err = b.ingestBody(ctx, bucketState, hr, srcMf.Body.Size, copyMD5, plaintext); err != nil {
 				var apiErr s3err.APIError
 				if errors.As(err, &apiErr) {
 					return s3response.CopyObjectOutput{}, apiErr
@@ -274,7 +277,12 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 	// gain their first. A pinned body's claims are conditional on the
 	// source's: a source deleted since it was resolved, its blobs' release
 	// under way, is a source that no longer exists.
-	node, effState, err := b.commitVersion(ctx, bucketState, dstKey, dstMf, applyTagsIfPresent(initState, dstTags), !reingest, nil)
+	if !reingest {
+		if blobs, err = msbucket.ReadBlobRefs(ctx, srcMf.Body.Index(b.read, srcRv.st.Space)); err != nil {
+			return s3response.CopyObjectOutput{}, fmt.Errorf("s3frontend: copy source blobs: %w", err)
+		}
+	}
+	node, effState, err := b.commitVersion(ctx, bucketState, dstKey, dstMf, blobs, applyTagsIfPresent(initState, dstTags), !reingest, nil)
 	if err != nil {
 		if errors.Is(err, errPinnedBlobReleased) {
 			return s3response.CopyObjectOutput{}, s3err.GetAPIError(s3err.ErrNoSuchKey)

@@ -698,6 +698,45 @@ func (r *Postgres) GetLocation(ctx context.Context, space did.DID, digest multih
 	return loc, nil
 }
 
+func (r *Postgres) GetLocations(ctx context.Context, space did.DID, digests []multihash.Multihash) (map[string]BlobLocation, error) {
+	out := make(map[string]BlobLocation, len(digests))
+	if len(digests) == 0 {
+		return out, nil
+	}
+	rows, err := r.pool.Query(ctx,
+		`SELECT digest, provider, url, size
+		 FROM ingot.blob_locations WHERE space = $1 AND digest = ANY($2::bytea[])`,
+		space, digestArray(digests))
+	if err != nil {
+		return nil, fmt.Errorf("registry: get locations: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		loc := BlobLocation{Space: space}
+		var d []byte
+		if err := rows.Scan(&d, &loc.Provider, &loc.URL, &loc.Size); err != nil {
+			return nil, fmt.Errorf("registry: get locations scan: %w", err)
+		}
+		if loc.Digest, err = multihash.Cast(d); err != nil {
+			return nil, fmt.Errorf("registry: get locations: stored digest %x: %w", d, err)
+		}
+		out[string(d)] = loc
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("registry: get locations rows: %w", err)
+	}
+	return out, nil
+}
+
+// digestArray converts digests to the [][]byte pgx encodes as bytea[].
+func digestArray(digests []multihash.Multihash) [][]byte {
+	raw := make([][]byte, len(digests))
+	for i, d := range digests {
+		raw[i] = d
+	}
+	return raw
+}
+
 func (r *Postgres) DeleteLocation(ctx context.Context, space did.DID, digest multihash.Multihash) error {
 	_, err := r.pool.Exec(ctx,
 		`DELETE FROM ingot.blob_locations WHERE space = $1 AND digest = $2`, space, digest)
@@ -744,6 +783,36 @@ func (r *Postgres) GetEncryptionParams(ctx context.Context, space did.DID, diges
 		return nil, fmt.Errorf("registry: get encryption params: %w", err)
 	}
 	return params, nil
+}
+
+func (r *Postgres) GetEncryptionParamsBatch(ctx context.Context, space did.DID, digests []multihash.Multihash) (map[string]BlobEncryptionParams, error) {
+	out := make(map[string]BlobEncryptionParams, len(digests))
+	if len(digests) == 0 {
+		return out, nil
+	}
+	rows, err := r.pool.Query(ctx,
+		`SELECT digest, region_wrapped_cek, region_key_version, header_len, aad
+		 FROM ingot.blob_encryption_params WHERE space = $1 AND digest = ANY($2::bytea[])`,
+		space, digestArray(digests))
+	if err != nil {
+		return nil, fmt.Errorf("registry: get encryption params batch: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		params := BlobEncryptionParams{Space: space}
+		var d []byte
+		if err := rows.Scan(&d, &params.RegionWrappedCEK, &params.RegionKeyVersion, &params.HeaderLen, &params.AAD); err != nil {
+			return nil, fmt.Errorf("registry: get encryption params batch scan: %w", err)
+		}
+		if params.Digest, err = multihash.Cast(d); err != nil {
+			return nil, fmt.Errorf("registry: get encryption params batch: stored digest %x: %w", d, err)
+		}
+		out[string(d)] = params
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("registry: get encryption params batch rows: %w", err)
+	}
+	return out, nil
 }
 
 func (r *Postgres) DeleteEncryptionParams(ctx context.Context, space did.DID, digest multihash.Multihash) error {

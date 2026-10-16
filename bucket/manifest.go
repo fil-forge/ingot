@@ -2,13 +2,14 @@ package bucket
 
 import (
 	"github.com/ipfs/go-cid"
-	mh "github.com/multiformats/go-multihash"
 )
 
 // ObjectManifest is the per-object metadata record stored as a CBOR
 // block in the IPLD blockstore. The MST leaf for an object key points
 // at this record's CID. Body describes the object's bytes as an
-// ordered list of content-addressed blobs (see Body / BlobRef).
+// ordered list of content-addressed blobs (see Body / BlobList). It is
+// stored under the "/objectmanifest/1" union key; ObjectManifestV0 decodes
+// the "/objectmanifest/0" form.
 type ObjectManifest struct {
 	Key         string `cborgen:"k"`
 	ContentType string `cborgen:"ct"`
@@ -87,15 +88,16 @@ type ObjectManifest struct {
 // is a single blob; an object larger than max_blob_size is a coarse
 // split into N blobs (no fine chunking); a multipart object is the
 // ordered union of its parts' blobs. A zero-byte object has no blobs.
+// Blobs is read through Index and written by BuildBlobList.
 //
 // Size is the total byte count. MD5 is the whole-object md5, the source for
 // a single-part object's S3 ETag. BLAKE3 is the whole-object digest clients
 // verify against (see CID), with TreeChunkLog and TreeBlocks the tree
 // material for verifying ranged reads.
 type Body struct {
-	Size  int64     `cborgen:"s"`
-	MD5   []byte    `cborgen:"m"`
-	Blobs []BlobRef `cborgen:"bl"`
+	Size  int64    `cborgen:"s"`
+	MD5   []byte   `cborgen:"m"`
+	Blobs BlobList `cborgen:"bl"`
 
 	// BLAKE3 is the blake3 multihash of the whole body, the digest the
 	// x-cid header carries as a raw-codec CID. Nil in blocks written before
@@ -118,11 +120,11 @@ type Body struct {
 	// PartSizes records the byte length of each multipart part, in upload order,
 	// segmenting [0, Size) into the parts the client completed. It lets a GET/HEAD
 	// with ?partNumber=N return part N's byte span and the x-amz-mp-parts-count
-	// header (the Blobs list alone cannot, since a part may span several blobs or
+	// header (the blob list alone cannot, since a part may span several blobs or
 	// share a blob boundary). Nil for a single-PUT object, which has no parts — a
 	// ?partNumber=1 there addresses the whole object and omits the parts count.
 	// The sum of PartSizes equals Size. See docs/architecture.md §7.2.
-	PartSizes []int64 `cborgen:"ps"`
+	PartSizes []int64 `cborgen:"ps,maxlen=10000"`
 
 	// PartChecksums records each multipart part's base64 checksum (in the
 	// object's ChecksumAlgorithm), in upload order, parallel to PartSizes. It is
@@ -131,26 +133,11 @@ type Body struct {
 	// return that part's checksum — the two responses AWS populates only for a
 	// checksummed multipart object. Nil for single-PUT and non-checksummed
 	// multipart objects (which expose no per-part checksums).
-	PartChecksums []string `cborgen:"pc"`
+	PartChecksums []string `cborgen:"pc,maxlen=10000"`
 
 	// IndexRoot is reserved (nullable) for a future UnixFS + sharded-dag-index
 	// record that would make a multi-shard object reassemblable without Ingot
-	// ("credible exit"). It is unused this iteration; the flat Blobs list is
-	// the working index. See docs/architecture.md §8.
+	// ("credible exit"). It is unused this iteration; Blobs is the working
+	// index. See docs/architecture.md §8.
 	IndexRoot *cid.Cid `cborgen:"ir"`
 }
-
-// BlobRef names one body blob: the sha256 multihash Piri stores it
-// under (the same multihash as the blob's raw-codec CID), and the
-// inclusive plaintext byte span [Start, End] it covers within the
-// object — HTTP Range semantics, like every range in the read path.
-// The ordered BlobRef list lets a ranged GET map a byte range to the
-// covering blob(s).
-type BlobRef struct {
-	Digest mh.Multihash `cborgen:"d"`
-	Start  int64        `cborgen:"s"`
-	End    int64        `cborgen:"e"`
-}
-
-// Len returns the number of plaintext bytes the blob covers.
-func (b BlobRef) Len() int64 { return b.End - b.Start + 1 }

@@ -524,6 +524,18 @@ func (m *MemStore) GetLocation(_ context.Context, space did.DID, digest multihas
 	return &cp, nil
 }
 
+func (m *MemStore) GetLocations(_ context.Context, space did.DID, digests []multihash.Multihash) (map[string]registry.BlobLocation, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make(map[string]registry.BlobLocation, len(digests))
+	for _, d := range digests {
+		if loc, ok := m.locations[locKey{space, string(d)}]; ok {
+			out[string(d)] = cloneLocation(loc)
+		}
+	}
+	return out, nil
+}
+
 func (m *MemStore) DeleteLocation(_ context.Context, space did.DID, digest multihash.Multihash) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -549,6 +561,18 @@ func (m *MemStore) GetEncryptionParams(_ context.Context, space did.DID, digest 
 	}
 	cp := cloneEncryptionParams(params)
 	return &cp, nil
+}
+
+func (m *MemStore) GetEncryptionParamsBatch(_ context.Context, space did.DID, digests []multihash.Multihash) (map[string]registry.BlobEncryptionParams, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make(map[string]registry.BlobEncryptionParams, len(digests))
+	for _, d := range digests {
+		if params, ok := m.encParams[locKey{space, string(d)}]; ok {
+			out[string(d)] = cloneEncryptionParams(params)
+		}
+	}
+	return out, nil
 }
 
 func (m *MemStore) DeleteEncryptionParams(_ context.Context, space did.DID, digest multihash.Multihash) error {

@@ -97,8 +97,8 @@ gen:
 
 ## gen-check: regenerate, then fail if the committed generated files are stale
 gen-check: gen
-	@git diff --exit-code -- bucket/cbor_gen.go || { \
-		echo "bucket/cbor_gen.go is stale; run 'make gen' and commit the result"; \
+	@git diff --exit-code -- bucket/cbor_gen.go bucket/cbor_gen_tuple.go || { \
+		echo "bucket/cbor_gen*.go is stale; run 'make gen' and commit the result"; \
 		exit 1; \
 	}
 

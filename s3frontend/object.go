@@ -215,7 +215,7 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 	// to local disk → upload each to Forge by digest (allocate→PUT→accept). A
 	// 200 means every body blob is durable and accepted before the manifest
 	// that references it is committed (docs/architecture.md §7.1).
-	bodyRec, err := b.ingestBody(ctx, bucketState, bodyReader, declaredLength(input.ContentLength), clientProvidedBodyMD5(ctx, spec, hr), plaintext)
+	bodyRec, blobs, err := b.ingestBody(ctx, bucketState, bodyReader, declaredLength(input.ContentLength), clientProvidedBodyMD5(ctx, spec, hr), plaintext)
 	if err != nil {
 		// A checksum/digest mismatch surfaces from the HashReader. BadDigestError,
 		// InvalidDigestError, and ContentSHA256MismatchError embed APIError but are
@@ -266,7 +266,7 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 		Metadata:                input.Metadata,
 		Plaintext:               plaintext,
 	}
-	node, effState, err := b.commitVersion(ctx, bucketState, key, mf, initState, false, func(superseded *msbucket.ObjectManifest) error {
+	node, effState, err := b.commitVersion(ctx, bucketState, key, mf, blobs, initState, false, func(superseded *msbucket.ObjectManifest) error {
 		// Race-safe re-check of If-Match / If-None-Match under the lock. A
 		// delete-marker current means "no object" for precondition purposes.
 		oldETag, oldExists := "", false
@@ -298,8 +298,9 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 // ingestBody streams an object body off-lock: it coarse-splits into blobs and
 // spools each to local disk (SplitBody → Spool), records an upload_intents row
 // per blob, uploads each to Forge by digest, and advances the intent to
-// accepted. It returns the Body the manifest will pin. A zero-byte body yields
-// a Body with no blobs and uploads nothing. A non-nil md5Src is where the
+// accepted. It returns the Body the manifest will pin and its blobs, which the
+// commit writes into the manifest. A zero-byte body has no blobs and uploads
+// nothing. A non-nil md5Src is where the
 // body's MD5 comes from instead of ingest's own pass (see bodyMD5Source);
 // ingest reads it after the body and stamps it onto Body.MD5.
 //
@@ -309,17 +310,17 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 //
 // size is the body's declared length (see splitSpool); plaintext stores the
 // body as received (see storesPlaintext).
-func (b *Backend) ingestBody(ctx context.Context, bucket *registry.State, r io.Reader, size int64, md5Src bodyMD5Source, plaintext bool) (msbucket.Body, error) {
+func (b *Backend) ingestBody(ctx context.Context, bucket *registry.State, r io.Reader, size int64, md5Src bodyMD5Source, plaintext bool) (msbucket.Body, msbucket.BlobRefs, error) {
 	body, err := b.splitSpool(ctx, bucket.Name, bucket.Space, r, size, md5Src, plaintext)
 	if err != nil {
-		return msbucket.Body{}, err
+		return msbucket.Body{}, nil, err
 	}
 	defer body.lease.end()
 	defer body.unholdAll()
 	if err := b.uploadBlobs(ctx, bucket.Space, body); err != nil {
-		return msbucket.Body{}, err
+		return msbucket.Body{}, nil, err
 	}
-	return body.Body, nil
+	return body.Body, body.Blobs, nil
 }
 
 // spooledBody is a body split and spooled, with the blobs that already went to
@@ -327,6 +328,9 @@ func (b *Backend) ingestBody(ctx context.Context, bucket *registry.State, r io.R
 // and need only their conclude.
 type spooledBody struct {
 	msbucket.Body
+	// Blobs is the body's blob list as split, which the commit writes into
+	// Body.Blobs (see msbucket.BuildBlobList). It shadows that field here.
+	Blobs    msbucket.BlobRefs
 	streamed map[string]uploader.StreamedBlob
 	// lease renews the streamed blobs' rows until the caller has recorded
 	// their parks or acceptances, and ends it.
@@ -420,6 +424,7 @@ func (b *Backend) splitSpool(ctx context.Context, bucket string, space did.DID, 
 		splitOpts = append(splitOpts, msbucket.WithoutMD5())
 	}
 	var body msbucket.Body
+	var blobs msbucket.BlobRefs
 	if b.streaming != nil {
 		enc.stream, enc.streams, enc.bucket, enc.logger = b.streaming, b.streams, bucket, b.logger
 		enc.lease = newStreamLease(b.streams, b.logger)
@@ -429,7 +434,7 @@ func (b *Backend) splitSpool(ctx context.Context, bucket string, space did.DID, 
 				enc.lease.end()
 			}
 		}()
-		body, err = msbucket.SplitSizedBody(ctx, enc, r, size, b.maxBlobSize, splitOpts...)
+		body, blobs, err = msbucket.SplitSizedBody(ctx, enc, r, size, b.maxBlobSize, splitOpts...)
 		switch {
 		case errors.Is(err, msbucket.ErrBodyShort):
 			return spooledBody{}, s3err.GetAPIError(s3err.ErrIncompleteBody)
@@ -437,7 +442,7 @@ func (b *Backend) splitSpool(ctx context.Context, bucket string, space did.DID, 
 			return spooledBody{}, s3err.GetAPIError(s3err.ErrContentLengthMismatch)
 		}
 	} else {
-		body, err = msbucket.SplitBody(ctx, enc, r, b.maxBlobSize, splitOpts...)
+		body, blobs, err = msbucket.SplitBody(ctx, enc, r, b.maxBlobSize, splitOpts...)
 	}
 	if err != nil {
 		return spooledBody{}, fmt.Errorf("split body: %w", err)
@@ -454,10 +459,10 @@ func (b *Backend) splitSpool(ctx context.Context, bucket string, space did.DID, 
 	streamed := enc.streamed()
 	span.SetAttributes(
 		attribute.Int64("ingot.body.bytes", body.Size),
-		attribute.Int("ingot.body.blobs", len(body.Blobs)),
+		attribute.Int("ingot.body.blobs", len(blobs)),
 		attribute.Int("ingot.body.streamed", len(streamed)),
 	)
-	for _, blob := range body.Blobs {
+	for _, blob := range blobs {
 		storedSize, err := enc.storedSize(blob.Digest)
 		if err != nil {
 			return spooledBody{}, err
@@ -490,7 +495,7 @@ func (b *Backend) splitSpool(ctx context.Context, bucket string, space did.DID, 
 			return spooledBody{}, fmt.Errorf("record encryption params: %w", err)
 		}
 	}
-	return spooledBody{Body: body, streamed: streamed, lease: enc.lease, holds: enc.holds}, nil
+	return spooledBody{Body: body, Blobs: blobs, streamed: streamed, lease: enc.lease, holds: enc.holds}, nil
 }
 
 // uploadBlobs uploads each spooled blob to Forge by digest (allocate→PUT→
@@ -1172,13 +1177,14 @@ func (b *Backend) executeRelease(ctx context.Context, pr registry.PendingRelease
 	return ok
 }
 
-// bodyDigests returns the digests of a body's blobs in order.
-func bodyDigests(body msbucket.Body) []multihash.Multihash {
-	out := make([]multihash.Multihash, 0, len(body.Blobs))
-	for _, blob := range body.Blobs {
-		out = append(out, blob.Digest)
+// bodyDigests returns the digests of a stored body's blobs in order, loading
+// its extents through store.
+func bodyDigests(ctx context.Context, store blockstore.Reader, space did.DID, body msbucket.Body) ([]multihash.Multihash, error) {
+	digests, err := body.Index(store, space).Digests(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("body digests: %w", err)
 	}
-	return out
+	return digests, nil
 }
 
 // digestSet maps each distinct digest (by its bytes) to one representative
@@ -1599,19 +1605,25 @@ func (b *Backend) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.
 		return nil, err
 	}
 
-	// Resolve how each blob's bytes become plaintext — the plain opener for
-	// unencrypted blobs, the decrypting opener where an encryption row
-	// exists. Doing it here (not at first Read) fails a broken encrypted
-	// object as a request error, before response headers are written.
-	opener, err := b.bodyOpener(ctx, st.Space, mf.Body, mf.Plaintext)
+	// Resolve how each blob of the bytes read becomes plaintext — the plain
+	// opener for unencrypted blobs, the decrypting opener where an
+	// encryption row exists. Doing it here (not at first Read) fails a broken
+	// encrypted object as a request error, before response headers are
+	// written.
+	readStart, readEnd := int64(0), objSize-1
+	if isRange {
+		readStart, readEnd = startOffset, startOffset+length-1
+	}
+	blobs := mf.Body.Index(b.read, st.Space)
+	opener, err := b.bodyOpener(ctx, st.Space, blobs, mf.Plaintext, readStart, readEnd)
 	if err != nil {
 		return nil, err
 	}
 
 	var contentRange *string
-	var body = msbucket.OpenBody(ctx, opener, st.Space, mf.Body)
+	var body = msbucket.OpenBody(ctx, opener, st.Space, blobs)
 	if isRange {
-		body = msbucket.OpenBodyRange(ctx, opener, st.Space, mf.Body, startOffset, startOffset+length-1)
+		body = msbucket.OpenBodyRange(ctx, opener, st.Space, blobs, readStart, readEnd)
 		cr := fmt.Sprintf("bytes %d-%d/%d", startOffset, startOffset+length-1, objSize)
 		contentRange = &cr
 	}
@@ -1750,7 +1762,7 @@ func (b *Backend) insertDeleteMarker(ctx context.Context, bucketState *registry.
 		Created:      time.Now().Unix(),
 		DeleteMarker: true,
 	}
-	node, _, err := b.commitVersion(ctx, bucketState, key, mf, nil, false, func(superseded *msbucket.ObjectManifest) error {
+	node, _, err := b.commitVersion(ctx, bucketState, key, mf, nil, nil, false, func(superseded *msbucket.ObjectManifest) error {
 		if preconds == nil || superseded == nil || superseded.DeleteMarker {
 			return nil
 		}
@@ -1828,7 +1840,9 @@ func (b *Backend) deleteObjectKey(ctx context.Context, bucketState *registry.Sta
 		if err := b.gc.AddGCCandidate(ctx, valCid.Bytes(), bucketState.Name); err != nil {
 			return cid.Undef, fmt.Errorf("gc candidate: %w", err)
 		}
-		oldDigests = bodyDigests(oldMf.Body)
+		if oldDigests, err = bodyDigests(ctx, tx, tx.State().Space, oldMf.Body); err != nil {
+			return cid.Undef, err
+		}
 		oldVersionID = oldMf.VersionID
 		oldSeq = oldMf.Seq
 		// The key is gone, so the space stops counting it.

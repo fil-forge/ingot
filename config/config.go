@@ -34,7 +34,7 @@ type Config struct {
 	// default, bucket.DefaultMaxBlobSize: the largest split whose encrypted
 	// envelope fits piri's ~254 MiB piece cap). An object larger than this is
 	// coarsely split into ≤ max blobs. Validate rejects values whose envelope
-	// a default-configured piri would refuse.
+	// a default-configured piri would refuse, and values under MinMaxBlobSize.
 	MaxBlobSize int64 `mapstructure:"max_blob_size" yaml:"max_blob_size"`
 
 	// MultipartRehashBudget bounds the bytes CompleteMultipartUpload re-reads
@@ -525,6 +525,15 @@ func setDefaults(v *viper.Viper) {
 
 // Validate checks the config for the selected mode, aggregating every
 // problem into one error.
+// MinMaxBlobSize is the smallest max_blob_size Validate accepts. A single
+// PutObject or CopyObject carries at most 5 GiB (S3's limit, enforced by
+// versitygw), and its blobs are uploaded and accepted before the commit
+// writes the manifest, so the split must never exceed the most blobs one
+// manifest lists (bucket.MaxBodyBlobs). That takes blobs of about 640 bytes
+// or more; 1 KiB leaves room. Multipart uploads are checked at Complete
+// instead, before any blob is accepted.
+const MinMaxBlobSize = 1 << 10
+
 func (c *Config) Validate() error {
 	var errs error
 
@@ -533,6 +542,9 @@ func (c *Config) Validate() error {
 	}
 	if c.DataDir == "" {
 		errs = multierr.Append(errs, errors.New("data_dir is required"))
+	}
+	if c.MaxBlobSize > 0 && c.MaxBlobSize < MinMaxBlobSize {
+		errs = multierr.Append(errs, fmt.Errorf("max_blob_size %d: below the %d-byte minimum, a single 5 GiB PUT or copy could split into more blobs than one manifest lists", c.MaxBlobSize, MinMaxBlobSize))
 	}
 	if c.MaxBlobSize > 0 {
 		// What ships to piri is the FEE envelope, not the plaintext: per-chunk

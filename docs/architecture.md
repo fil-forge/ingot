@@ -123,7 +123,7 @@ non-obvious parts:
 **Versioned storage (the per-key version tree).** The full design is
 **[`s3-versioning.md`](./s3-versioning.md)**. In brief: the top MST is keyed by the **plain object
 key**, and every value block is a keyed union naming its own format. A single-version key's value
-is its manifest under `"/objectmanifest/0"`; a superseded key's is an `ObjectLeaf`
+is its manifest under `"/objectmanifest/1"`; a superseded key's is an `ObjectLeaf`
 `{current, prev, nullSeq}` under `"/objectleaf/0"`, where `current` is the head version
 (single-seek reads) and `prev` is a per-key sub-MST of noncurrent versions keyed newest-first by
 the inverted per-bucket ordinal (`seq`, from `buckets.next_version_seq`). `seq` (ordering,
@@ -201,7 +201,7 @@ depends on the single- vs multi-shard split in [§8](#8-retrieval-addressing-whe
 MST (bucket)
   leaf key = "photos/cat.jpg"           (plain object key)
      │
-     └──▶ CID ──▶ single version: {"/objectmanifest/0": ObjectManifest} — one block, one fetch
+     └──▶ CID ──▶ single version: {"/objectmanifest/1": ObjectManifest} — one block, one fetch
               ──▶ superseded key:  {"/objectleaf/0": ObjectLeaf}   ← per-key version group
                     │                                                (s3-versioning.md §2)
                     ├ current  { seq, versionId, manifest CID }   (the head version, inline)
@@ -218,14 +218,17 @@ MST (bucket)
                     └ body
                         ├ size     629_145_600          (600 MiB total)
                         ├ blake3   <whole-body digest>  (the x-cid)
-                        └ blobs[] ── ordered, contiguous, covers [0, size) ──┐
-                                                                             │
-          ┌───────────────────────┬───────────────────────┬──────────────────┘
+                        └ blobs ── ordered, contiguous, covers [0, size)
+                            ├ head     [digest, offset] × up to 1,024, inline ──┐
+                            └ extents  [offset, CID] → /blobextent/0 blocks of  │
+                                       1,024 entries each, for the rest (none   │
+                                       here: three blobs fit inline)            │
+          ┌───────────────────────┬───────────────────────┬─────────────────────┘
           ▼                       ▼                       ▼
-       BlobRef #0              BlobRef #1              BlobRef #2
+       blob #0                 blob #1                 blob #2
        digest D0               digest D1               digest D2
        offset 0                offset 256 MiB          offset 512 MiB
-       length 256 MiB          length 256 MiB          length 88 MiB
+       (ends where #1 starts)  (ends where #2 starts)  (ends at size)
           │                       │                       │
    indexer.locate(Dn) ─────▶ Piri node URL ─────▶ ranged HTTP GET (per blob)
           │                       │                       │
@@ -233,9 +236,12 @@ MST (bucket)
 ```
 
 *Example: a 600 MiB object split at the default `max_blob_size` (~254 MiB) into three blobs. This is the manifest
-shape `bucket/manifest.go` now implements (`Body.Blobs[]`, a stored S3 `etag`, an additional-checksum
+shape `bucket/manifest.go` implements (`Body.Blobs`, a stored S3 `etag`, an additional-checksum
 field, and a reserved nullable `IndexRoot`); a `deleteMarker` field is reserved for versioning, which
-is deferred ([§12](#12-implementation-status--postponed-items)).*
+is deferred ([§12](#12-implementation-status--postponed-items)). A body of more than 1,024 blobs keeps
+the rest in extent blocks the manifest points to by offset, so a ranged GET reads the manifest and
+only the extents its range covers (`bucket/blobs.go`). One manifest lists at most 8,389,632 blobs: the 48.8 TiB S3
+maximum fits whenever `max_blob_size` is at least 6.11 MiB.*
 
 **The catalog plane.** MST nodes and manifests are dag-cbor blocks. They are batched into CAR
 segments and shipped to Piri so the catalog is recoverable, following the existing log-structured
@@ -972,7 +978,7 @@ the reductions live here.
 
 The storage / delete / retrieval core is built and tested:
 
-- **Object-aligned blobs + manifest** ([§4](#4-the-catalog-layer)–[§5](#5-the-data-layer)) — `Body.Blobs[{digest,offset,length}]`, coarse split at
+- **Object-aligned blobs + manifest** ([§4](#4-the-catalog-layer)–[§5](#5-the-data-layer)) — `Body.Blobs` (`[digest, offset]` entries, inline then in extent blocks), coarse split at
   `max_blob_size`, the local **spool** (`blockstore.Spool`) + `upload_intents`, stored S3 `etag`.
 - **Synchronous durability write path** ([§7.1](#71-write-single-shot-putobject)) — off-lock ingest → spool → per-blob upload, then a
   short locked commit (manifest + MST splice + guarded root swap); reference-index reconcile runs

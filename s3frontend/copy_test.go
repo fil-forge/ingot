@@ -211,17 +211,18 @@ func TestCopyObject_CrossSpaceReingest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(dstRv.mf.Body.Blobs) < 2 {
-		t.Fatalf("expected a multi-blob body, got %d blobs", len(dstRv.mf.Body.Blobs))
+	dstBlobs := storedBlobs(t, b, dstRv)
+	if len(dstBlobs) < 2 {
+		t.Fatalf("expected a multi-blob body, got %d blobs", len(dstBlobs))
 	}
 	srcDigests := map[string]bool{}
-	for _, ref := range srcRv.mf.Body.Blobs {
+	for _, ref := range storedBlobs(t, b, srcRv) {
 		srcDigests[string(ref.Digest)] = true
 		if n, _ := mem.CountClaims(ctx, srcSt.Space, ref.Digest); n != 1 {
 			t.Fatalf("source blob claims = %d, want 1 (untouched)", n)
 		}
 	}
-	for _, ref := range dstRv.mf.Body.Blobs {
+	for _, ref := range dstBlobs {
 		if srcDigests[string(ref.Digest)] {
 			t.Fatalf("destination pins a source blob %x; a cross-space copy must re-ingest", ref.Digest)
 		}
@@ -292,7 +293,7 @@ func TestCopyObject_PinnedSourceReleasedBeforeCommitIsNoSuchKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	digests := bodyDigests(srcRv.mf.Body)
+	digests := storedBlobs(t, b, srcRv).DigestList()
 
 	reg.hook = func() {
 		if _, err := b.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: &srcBucket, Key: &srcKey}); err != nil {
@@ -335,7 +336,7 @@ func TestCopyObject_PinnedSourceReleasedBeforeCommitIsNoSuchKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, d := range bodyDigests(dstRv.mf.Body) {
+	for _, d := range storedBlobs(t, b, dstRv).DigestList() {
 		if n, _ := mem.CountClaims(ctx, space, d); n != 2 {
 			t.Fatalf("claims on pinned blob %x = %d, want 2 (source and copy)", d, n)
 		}
@@ -438,12 +439,12 @@ func TestCopyObject_SourceWithoutChecksumGetsDefault(t *testing.T) {
 		t.Fatal(err)
 	}
 	data := []byte("legacy object")
-	body, err := b.ingestBody(ctx, st, bytes.NewReader(data), int64(len(data)), nil, false)
+	body, blobs, err := b.ingestBody(ctx, st, bytes.NewReader(data), int64(len(data)), nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	legacy := &msbucket.ObjectManifest{Key: "legacy", Created: time.Now().Unix(), Body: body, ETag: hex.EncodeToString(body.MD5), ContentType: "application/octet-stream"}
-	if _, _, err := b.commitVersion(ctx, st, "legacy", legacy, nil, false, nil); err != nil {
+	if _, _, err := b.commitVersion(ctx, st, "legacy", legacy, blobs, nil, false, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -470,7 +471,8 @@ func TestCopyObject_SourceOverCopyLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 	huge := &msbucket.ObjectManifest{Key: "huge", Created: time.Now().Unix(), Body: msbucket.Body{Size: maxCopySize + 1}, ETag: "00000000000000000000000000000000"}
-	if _, _, err := b.commitVersion(ctx, st, "huge", huge, nil, false, nil); err != nil {
+	// No blobs: an empty list, so the commit has nothing to read or claim.
+	if _, _, err := b.commitVersion(ctx, st, "huge", huge, msbucket.BlobRefs{}, nil, false, nil); err != nil {
 		t.Fatal(err)
 	}
 	bucket, key, source := "bk", "copied", "bk/huge"

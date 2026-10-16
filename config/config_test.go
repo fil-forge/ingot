@@ -233,6 +233,27 @@ func TestValidate_MaxBlobSize(t *testing.T) {
 	}
 }
 
+// TestValidate_MinMaxBlobSize: a max_blob_size small enough that a single
+// 5 GiB request could exceed one manifest's blob list is refused at startup;
+// the minimum itself is accepted, and at the minimum a 5 GiB body fits.
+func TestValidate_MinMaxBlobSize(t *testing.T) {
+	if blobs := (int64(5<<30) + MinMaxBlobSize - 1) / MinMaxBlobSize; blobs > bucket.MaxBodyBlobs {
+		t.Fatalf("a 5 GiB body at the %d-byte minimum splits into %d blobs, over the %d a manifest lists", MinMaxBlobSize, blobs, bucket.MaxBodyBlobs)
+	}
+
+	cfg := validConfig(t)
+	cfg.MaxBlobSize = MinMaxBlobSize
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected the minimum max_blob_size to validate, got: %v", err)
+	}
+
+	cfg = validConfig(t)
+	cfg.MaxBlobSize = MinMaxBlobSize - 1
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "below the") {
+		t.Fatalf("expected a minimum error for max_blob_size %d, got: %v", MinMaxBlobSize-1, err)
+	}
+}
+
 // TestValidate_AuthServiceProofs: the proofs a configured auth service needs
 // are resolved eagerly, so a missing, unreadable, or empty value fails at
 // startup instead of on the first authorized request.

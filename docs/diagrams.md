@@ -422,7 +422,7 @@ sequenceDiagram
         Note over B,LY: Current for the head, otherwise seek the prev tree at<br/>revSeqKey(seq) and confirm the stored VersionID (see version-tree)
     end
     Note over B: delete marker: 404 NoSuchKey (current) or 405 (versioned),<br/>then preconditions and selectBytes (Range, or partNumber via Body.PartSizes)
-    B->>R: bodyOpener: unless the manifest marks the body plaintext,<br/>blob_encryption_params + blob_locations per blob (a missing row fails the read)
+    B->>R: bodyOpener: unless the manifest marks the body plaintext,<br/>blob_encryption_params + blob_locations for the blobs the range covers,<br/>one query each (a missing row fails the read)
     loop each covering blob or catalog block
         opt encrypted blob (FEE)
             B->>K: Unwrap region-wrapped CEK, bound to (space, digest)
@@ -456,10 +456,13 @@ sequenceDiagram
   the `Cached` LRU.
 - The indexer-backed locator (`blockstore/locator`) compiles but is never
   injected; `module.go` always wires `LocalLocator`.
-- Manifest coordinates are plaintext: `BlobRef.Start/End`, `Body.Size`,
-  ETag and Content-Length never change with encryption. `BlobRef.Digest`
-  names the stored — for an encrypted blob, ciphertext — bytes; only the
-  per-blob open translates between the two.
+- Manifest coordinates are plaintext: blob offsets, `Body.Size`, ETag and
+  Content-Length never change with encryption. A blob's digest names the
+  stored — for an encrypted blob, ciphertext — bytes; only the per-blob open
+  translates between the two.
+- The covering blobs come from the manifest's inline list, or from the one
+  extent block whose offset range holds the read position (see the version
+  storage diagram).
 - HEAD needs no decryption at all (every value it reports is a plaintext
   manifest field).
 
@@ -689,13 +692,14 @@ flowchart TB
     root["bucket MST root<br/>(buckets.root_cid)"]
     leafk["MST leaf: plain object key"]
     union["ValueUnion<br/>(exactly one arm)"]
-    mans["arm /objectmanifest/0<br/>single-version key:<br/>the manifest itself, one-block read"]
+    mans["arm /objectmanifest/1<br/>single-version key:<br/>the manifest itself, one-block read<br/>(/objectmanifest/0 decodes into it)"]
     leaf["arm /objectleaf/0<br/>ObjectLeaf"]
     cur["Current: VersionNode<br/>(Seq, VersionID, Manifest CID)"]
     prev["Prev: per-key sub-MST of noncurrent versions<br/>keyed revSeqKey(seq): %016x of bit-inverted seq,<br/>so a forward walk is newest-first"]
     nulls["NullSeq: a noncurrent null<br/>version's seq (0 = none)"]
     em["EnvelopedManifest<br/>one per noncurrent version"]
     mf["ObjectManifest<br/>Seq, VersionID, DeleteMarker, ETag, headers,<br/>Body(Size, BLAKE3, TreeChunkLog, TreeBlocks,<br/>MD5, Blobs, PartSizes)"]
+    ext["BlobExtent (/blobextent/0)<br/>up to 1,024 [digest, offset] tuples<br/>past the manifest's inline 1,024"]
 
     root --> leafk --> union
     union --> mans
@@ -707,6 +711,7 @@ flowchart TB
     prev --> em
     cur --> mf
     em --> mf
+    mf -->|"Blobs.Extents: [offset, CID]"| ext
 ```
 
 - At most one null version exists per key; it may sit anywhere in the stack,
