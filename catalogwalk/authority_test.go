@@ -2,10 +2,13 @@ package catalogwalk
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/fil-forge/ucantone/did"
+	"github.com/fil-forge/ucantone/ucan"
+	"github.com/ipfs/go-cid"
 	"github.com/stretchr/testify/require"
 
 	"github.com/fil-forge/ingot/iam"
@@ -104,4 +107,31 @@ func TestAuthorityPrune(t *testing.T) {
 	f.clock = f.clock.Add(borrowTTL)
 	f.auth.Prune()
 	require.Empty(t, f.auth.stores)
+}
+
+// fadingStore is a proof store whose retrieve chain can lapse, as a hilt
+// chain does at its expiry while the store is held.
+type fadingStore struct {
+	grant  ucan.Delegation
+	lapsed atomic.Bool
+}
+
+func (s *fadingStore) ProofChain(_ context.Context, _ did.DID, _ ucan.Command, _ did.DID) ([]ucan.Delegation, []cid.Cid, error) {
+	if s.lapsed.Load() {
+		return nil, nil, nil
+	}
+	return []ucan.Delegation{s.grant}, []cid.Cid{s.grant.Link()}, nil
+}
+
+func (s *fadingStore) Dropped() bool { return false }
+
+// TestAuthorityRechecksTheChain: a store whose chain lapses while it is held
+// no longer counts as held.
+func TestAuthorityRechecksTheChain(t *testing.T) {
+	f := newFixture(t, Config{})
+	store := &fadingStore{grant: f.grant}
+	f.auth.Capture(borrowable(store), f.space)
+	require.True(t, f.auth.Holds(f.space))
+	store.lapsed.Store(true)
+	require.False(t, f.auth.Holds(f.space))
 }

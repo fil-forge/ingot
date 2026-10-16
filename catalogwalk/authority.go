@@ -86,8 +86,7 @@ func (a *Authority) Capture(ctx context.Context, space did.DID) {
 	if held && now.Sub(b.at) < recaptureEvery {
 		return
 	}
-	chain, _, err := store.ProofChain(ctx, a.agent, contentcmds.Retrieve.Command, space)
-	if err != nil || len(chain) == 0 {
+	if !a.proves(ctx, store, space) {
 		return
 	}
 	a.mu.Lock()
@@ -118,10 +117,23 @@ func (a *Authority) Borrow(ctx context.Context, space did.DID) (context.Context,
 	return context.WithValue(ctx, reqscope.BorrowableKey(), false), true
 }
 
-// Holds reports whether a lendable store is held for space.
+// Holds reports whether a lendable store is held for space that still
+// proves /content/retrieve on it: the chain a store held when captured can
+// expire while it is held.
 func (a *Authority) Holds(space did.DID) bool {
-	_, ok := a.Borrow(context.Background(), space)
-	return ok
+	ctx, ok := a.Borrow(context.Background(), space)
+	if !ok {
+		return false
+	}
+	store, _ := reqscope.ProofStore(ctx)
+	return a.proves(ctx, store, space)
+}
+
+// proves reports whether store holds a /content/retrieve chain from space to
+// the agent, the chain a retrieval in space presents.
+func (a *Authority) proves(ctx context.Context, store ucanlib.ProofStore, space did.DID) bool {
+	chain, _, err := store.ProofChain(ctx, a.agent, contentcmds.Retrieve.Command, space)
+	return err == nil && len(chain) > 0
 }
 
 // Prune forgets every store that can no longer be lent, so a space that

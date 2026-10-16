@@ -421,6 +421,21 @@ func (m *MemStore) MarkSegmentShipped(_ context.Context, plane blockstore.Plane,
 	return nil
 }
 
+// BucketCatalogUsage is CatalogUsage for one bucket: nil when it has no
+// shipped catalog segments.
+func (m *MemStore) BucketCatalogUsage(ctx context.Context, bucket string) (*registry.CatalogUsage, error) {
+	usage, err := m.CatalogUsage(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, u := range usage {
+		if u.Bucket == bucket {
+			return &u, nil
+		}
+	}
+	return nil, nil
+}
+
 // CatalogSubtrees returns the subtrees remembered for bucket.
 func (m *MemStore) CatalogSubtrees(_ context.Context, bucket string) ([]registry.CatalogSubtree, error) {
 	m.mu.Lock()

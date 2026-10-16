@@ -571,7 +571,7 @@ func (s *Server) walkCatalog(u registry.CatalogUsage) {
 	case s.sweepCtx.Err() != nil:
 	case err != nil:
 		s.logger.Warn("catalog walk", zap.Stringer("space", u.Space), zap.Error(err))
-	default:
+	case walked.Completed:
 		s.logger.Info("catalog walk completed",
 			zap.Stringer("space", u.Space),
 			zap.Int64("live_bytes", walked.LiveBytes),

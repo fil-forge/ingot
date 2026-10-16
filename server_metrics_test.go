@@ -8,6 +8,7 @@ import (
 
 	"github.com/fil-forge/libforge/identity"
 	"github.com/fil-forge/ucantone/did"
+	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel"
@@ -121,6 +122,19 @@ func TestServerReportsCatalogUsageGauges(t *testing.T) {
 	require.Equal(t, bySpace, gaugeValues(t, reader, "ingot.catalog.dead_bytes"))
 	bySpace[space.String()] = 1500
 	require.Equal(t, bySpace, gaugeValues(t, reader, "ingot.catalog.dead_after_ship_bytes"))
+
+	// Once the root moves, the walk's live bytes say nothing about the new
+	// one, so the dead figures are the walk's own, and the walk is stale.
+	movedHash, err := multihash.Sum([]byte("moved"), multihash.SHA2_256, -1)
+	require.NoError(t, err)
+	moved := cid.NewCidV1(cid.DagCBOR, movedHash)
+	require.NoError(t, mem.CASRoot(ctx, "bk", cid.Undef, moved))
+	_, err = s.backend.RefreshCatalogUsage(ctx)
+	require.NoError(t, err)
+	require.Equal(t, bySpace, gaugeValues(t, reader, "ingot.catalog.dead_bytes"))
+	bySpace[space.String()] = 1200
+	require.Equal(t, bySpace, gaugeValues(t, reader, "ingot.catalog.dead_after_ship_bytes"))
+	require.Equal(t, map[string]int64{"current": 0, "stale": 1900, "never": 0}, coverageValues(t, reader))
 
 	require.NoError(t, s.Stop(context.Background()))
 	require.Empty(t, metricNames(t, reader), "metrics reported after Stop")

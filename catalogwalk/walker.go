@@ -176,12 +176,22 @@ func lastWalked(u registry.CatalogUsage) int64 {
 	return u.Walk.FinishedAt
 }
 
-// Walk computes the bytes reachable from u's root and records the walk with
-// u's usage, which the same query read alongside the root, so the dead bytes
-// they imply are of one moment. u comes from Due. A walk that fails holds
-// the bucket back for retryAfter.
+// Walk walks the bucket u names (an entry from Due), computing the bytes
+// reachable from its root and recording them with its usage. It rereads the
+// bucket's usage first, root and figures in one query, so what it records is
+// of the moment the walk starts, however long ago Due listed the bucket. A
+// bucket that by then has nothing shipped, or whose root is back at the one
+// its last walk reached, is left alone. A walk that fails holds the bucket
+// back for retryAfter.
 func (w *Walker) Walk(ctx context.Context, u registry.CatalogUsage) (Walked, error) {
-	walked, err := w.walk(ctx, u)
+	cur, err := w.usage.BucketCatalogUsage(ctx, u.Bucket)
+	walked := Walked{Bucket: u.Bucket, Space: u.Space}
+	if err == nil {
+		if cur == nil || (cur.Walk != nil && cur.Walk.Root.Equals(cur.Root)) {
+			return walked, nil
+		}
+		walked, err = w.walk(ctx, *cur)
+	}
 	if err != nil && !errors.Is(err, errNoAuthority) && ctx.Err() == nil {
 		w.failedUntil[u.Bucket] = w.now().Add(retryAfter)
 	}

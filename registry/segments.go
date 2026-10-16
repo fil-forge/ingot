@@ -299,6 +299,22 @@ func (r *Postgres) RehydrateSegment(ctx context.Context, m logstore.SegmentMeta)
 // ship registered blobs in its space (index_digest is set exactly then). Each
 // entry carries the bucket's current root and its last completed walk.
 func (r *Postgres) CatalogUsage(ctx context.Context) ([]CatalogUsage, error) {
+	return r.catalogUsage(ctx, "")
+}
+
+// BucketCatalogUsage is CatalogUsage for one bucket: nil when it has no
+// shipped catalog segments.
+func (r *Postgres) BucketCatalogUsage(ctx context.Context, bucket string) (*CatalogUsage, error) {
+	usage, err := r.catalogUsage(ctx, "AND b.name = $1", bucket)
+	if err != nil || len(usage) == 0 {
+		return nil, err
+	}
+	return &usage[0], nil
+}
+
+// catalogUsage runs the catalog usage query, its WHERE clause extended by
+// and (over the args).
+func (r *Postgres) catalogUsage(ctx context.Context, and string, args ...any) ([]CatalogUsage, error) {
 	rows, err := r.pool.Query(ctx,
 		`SELECT b.name, b.space, b.root_cid,
 		        SUM(s.size_bytes),
@@ -309,9 +325,9 @@ func (r *Postgres) CatalogUsage(ctx context.Context) ([]CatalogUsage, error) {
 		   FROM ingot.segments s
 		   JOIN ingot.buckets b ON b.name = s.bucket
 		   LEFT JOIN ingot.catalog_walks w ON w.bucket = b.name
-		  WHERE s.plane = 'catalog' AND s.index_digest IS NOT NULL
+		  WHERE s.plane = 'catalog' AND s.index_digest IS NOT NULL `+and+`
 		  GROUP BY b.name, w.bucket
-		  ORDER BY b.name`)
+		  ORDER BY b.name`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("registry: catalog usage: %w", err)
 	}

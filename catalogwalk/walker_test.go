@@ -11,6 +11,7 @@ import (
 	contentcmds "github.com/fil-forge/libforge/commands/content"
 	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/ucantone/multikey/ed25519"
+	"github.com/fil-forge/ucantone/ucan"
 	"github.com/fil-forge/ucantone/ucan/delegation"
 	block "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
@@ -106,7 +107,7 @@ type fixture struct {
 
 	keys  *iam.KeyProofs
 	key   did.DID
-	grant interface{ Link() cid.Cid } // the space→agent retrieve delegation
+	grant ucan.Delegation // the space→agent retrieve delegation
 }
 
 func newFixture(t *testing.T, cfg Config) *fixture {
@@ -211,10 +212,10 @@ func TestWalkRecordsLiveBytes(t *testing.T) {
 	}, *w)
 }
 
-// TestWalkNextPicksOnlyDueBuckets: a bucket is not walked without borrowed
+// TestDuePicksOnlyDueBuckets: a bucket is not walked without borrowed
 // authority, nor again while its root is unchanged, nor within Interval of
 // its last walk.
-func TestWalkNextPicksOnlyDueBuckets(t *testing.T) {
+func TestDuePicksOnlyDueBuckets(t *testing.T) {
 	f := newFixture(t, Config{Interval: time.Hour})
 	leaf := node(t, "leaf")
 	root := node(t, "root", leaf)
@@ -450,4 +451,42 @@ func TestWalkKeepsReusedSubtreesInside(t *testing.T) {
 	require.True(t, ok)
 	require.EqualValues(t, 6, walked.Reads, "root3, ab, a2b, z, w and b2 are read; a1 is reused")
 	require.Equal(t, frames(root3, ab, a1, x, y, a2b, z, w, b2), walked.LiveBytes)
+}
+
+// TestWalkRereadsTheBucket: a walk records the root and usage the bucket has
+// when the walk starts, not those Due listed, and leaves alone a bucket
+// whose root is back at the one its last walk reached.
+func TestWalkRereadsTheBucket(t *testing.T) {
+	f := newFixture(t, Config{Interval: time.Minute})
+	leaf := node(t, "leaf")
+	root, root2 := node(t, "root", leaf), node(t, "root2", leaf)
+	f.reads.put(leaf, root, root2)
+	f.setRoot(root)
+	f.request()
+	due, err := f.walker.Due(f.ctx)
+	require.NoError(t, err)
+	require.Len(t, due, 1)
+
+	f.setRoot(root2)
+	f.clock = f.clock.Add(2 * time.Hour)
+	f.request()
+	walked, err := f.walker.Walk(f.ctx, due[0])
+	require.NoError(t, err)
+	require.True(t, walked.Completed)
+	w := f.lastWalk()
+	require.Equal(t, root2.Cid(), w.Root)
+	require.Equal(t, f.clock.Unix(), w.StartedAt)
+
+	// Listed while the root had moved, walked once it is back.
+	f.setRoot(root)
+	f.clock = f.clock.Add(2 * time.Minute)
+	f.request()
+	due, err = f.walker.Due(f.ctx)
+	require.NoError(t, err)
+	require.Len(t, due, 1)
+	f.setRoot(root2)
+	walked, err = f.walker.Walk(f.ctx, due[0])
+	require.NoError(t, err)
+	require.False(t, walked.Completed, "walked a bucket whose root is back at the walked one")
+	require.Zero(t, walked.Reads)
 }

@@ -762,6 +762,9 @@ type CatalogUsageStore interface {
 	// CatalogUsage returns one entry per bucket with shipped catalog
 	// segments, ordered by bucket name.
 	CatalogUsage(ctx context.Context) ([]CatalogUsage, error)
+	// BucketCatalogUsage returns bucket's entry, or nil if it has no shipped
+	// catalog segments.
+	BucketCatalogUsage(ctx context.Context, bucket string) (*CatalogUsage, error)
 }
 
 // RevocationCursor is the single row of ingot.revocation_cursor: the resume

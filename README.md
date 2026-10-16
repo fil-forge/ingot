@@ -290,10 +290,11 @@ its root has changed since its last walk, that walk finished at least
 authority is held, one bucket at a time per node, the longest-unwalked first,
 reading at most `catalog_walk_rate` blocks a second (default 100). A walk cut
 short keeps the subtrees it finished. Only a store that can prove retrieval
-in the space is borrowed, and a store a revocation dropped is not lent. A bucket with no request since the
-walker started is never walked, and a large bucket with brief bursts of
-traffic may take several to finish; `walk_coverage_bytes` shows how much of
-the catalog the walked figures speak for.
+in the space is borrowed, and a store a revocation dropped is not lent. A
+bucket with no request since the walker started is never walked, and a large
+bucket with brief bursts of traffic may take several to finish;
+`walk_coverage_bytes` shows how much of the catalog the walked figures speak
+for.
 
 ## Build & test
 
