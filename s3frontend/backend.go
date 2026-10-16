@@ -101,7 +101,9 @@ type Backend struct {
 	// it, so a second write of the same bytes finds the first's row. The
 	// registry stays the guard between instances (ParkStore.PutPark refuses
 	// to overwrite a park).
-	blobKeys            syncutil.KeyedMutex
+	blobKeys syncutil.KeyedMutex
+	// acceptors runs each multipart upload's acceptor (see acceptor.go).
+	acceptors           acceptors
 	lastOrphanPass      time.Time
 	localBlobSweepBatch int
 	// overBudgetWarned and timeLimitLogged are set once the sweeper has

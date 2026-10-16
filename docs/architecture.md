@@ -425,39 +425,66 @@ durable and accepted in Piri, so a crash never leaves a catalog entry pointing a
 
 ### 7.2 Multipart
 
-Parts upload concurrently; **accept is triggered only at Complete**, so an Abort only ever has to
-clean up parked blobs.
+Parts upload concurrently, and each part's blobs are accepted while the client is still uploading.
+Each upload has an acceptor that concludes its parked parts in batches, so `Complete` waits only for
+the last few parts and then commits.
 
 ```
 CreateMultipartUpload → uploadId, session (state=open)
-UploadPart(n)         → ingest + split + blob/add + PUT → PARKED (no accept); record part
+UploadPart(n)         → ingest + split; record part (spooled)
+                        blob/add + PUT → PARKED; part → parked; nudge the upload's acceptor
                         ETag = hex(part MD5); the part's local copy is removed once parked
+acceptor (one per upload, in the background)
+     each pass: up to 1000 blobs of the upload's parked parts, in part order
+     conclude them (one /ucan/conclude); record each location; part → accepted
+     exits when a pass finds nothing; a sweep restarts it for any upload with parked parts
 CompleteMultipartUpload([parts])
-     latch session open→completing            (§7.3); validate parts (S3 rules)
-     trigger accept for every part's blobs
+     validate parts (S3 rules); latch session open→completing (§7.3)
+     wait for the acceptor, up to 30 s
+     every named part accepted → continue
+     a part still spooled (its request died mid-park) → Complete concludes or uploads it itself
+     a part still parked (acceptor behind or failing) → 409 OperationAborted, session reopened
      COMMIT (short lock): manifest pins ordered [blobs..]+ranges;
         object ETag = hex(md5(concat part MD5s)) + "-N";
         splice; blob_refs += version per digest; guarded root swap
 AbortMultipartUpload
      latch session open→aborting
-     parked blobs → abort;  already-accepted (deduped) blobs → remove (§6)
+     parked blobs → abort;  accepted blobs → remove (§6)
 ```
 
+The part rows are the acceptor's queue (`multipart_parts.state`: `spooled`, `parked`, `accepted`),
+so nothing lives only in memory: a process that stops mid-upload leaves parked parts that the next
+process's sweep picks up. The acceptor runs in the process that holds the upload, and Ingot runs one
+instance; several instances would need a lease on the session row so that one acceptor owns an
+upload at a time.
+
+Accepting during the upload has a cost when an upload is abandoned. Its parts are already
+accepted, so abort and session expiry remove them (`/blob/remove`) instead of aborting an
+allocation, and the storage node has already computed their piece commitments and queued them
+for aggregation. The node releases the space's claim and deletes the bytes once their aggregate
+retires, as for any deleted object.
+
 A completed multipart object is the ordered union of its parts' blobs plus a manifest of byte ranges;
-parts are not restitched. The commit also records each part's byte length (`Body.PartSizes`), so a
-later `GET`/`HEAD ?partNumber=N` can resolve part `N` to its byte span and report
-`x-amz-mp-parts-count` without re-deriving boundaries from the blob list.
+parts are not restitched. Each part row records its blobs' plaintext lengths, so `Complete` lays out
+the byte ranges from the part rows alone. The commit also records each part's byte length
+(`Body.PartSizes`), so a later `GET`/`HEAD ?partNumber=N` can resolve part `N` to its byte span and
+report `x-amz-mp-parts-count` without re-deriving boundaries from the blob list.
 
 ### 7.3 The session latch (the Abort/Complete race)
 
-`Complete` and `Abort` can arrive concurrently for one `uploadId`. Without coordination they collide
-on the parts — `Complete` triggering accept while `Abort` rejects those same parts — leaving the
-object half-built or half-deleted. A **single-winner latch** prevents it: an atomic state transition
-on the session row (`UPDATE … SET state=? WHERE state='open'`). Exactly one of
+`Complete` and `Abort` can arrive concurrently for one `uploadId`. Without coordination one would
+commit an object over parts the other is releasing. A **single-winner latch** prevents it: an atomic
+state transition on the session row (`UPDATE … SET state=? WHERE state='open'`). Exactly one of
 `Complete`→`completing` or `Abort`→`aborting` wins; the loser observes the moved row and returns an
-error. Accept is triggered only after the session is latched `completing`, so accept and reject
-never touch the same part concurrently. A deduped part is already accepted (not parked), so Abort
-removes it via the reference path rather than rejecting it.
+error. The commit re-checks the latch under the bucket lock, so a teardown that takes a
+`completing` session fails the commit with `NoSuchUpload`.
+
+The acceptor is not behind the latch: an abort, a session expiry or a part re-upload can release a
+blob while the acceptor is concluding it. The provider settles the order. A released allocation
+refuses the later accept, and an accepted blob refuses the later abort, so the release removes it
+as accepted. Ingot records an acceptance only while the blob's park row stands, swapping the park
+for the location in one transaction; the release drops the park before anything else, so a
+location is never written for a blob a release has taken.
 
 ### 7.4 Read (`GetObject`)
 
@@ -489,6 +516,7 @@ updates land after the commit, best-effort — not inside the transaction.
 | Concurrent PUT, same key | Distinct versionIds; serialize only on the swap. |
 | Concurrent PUT, same content | One blob; both versions reference it; `blob_refs` counts both. |
 | Abort vs racing Complete | Single-winner latch ([§7.3](#73-the-session-latch-the-abortcomplete-race)). |
+| Abort, expiry or part re-upload during an acceptor's conclude | The provider refuses whichever of accept and abort comes second; Ingot records the location only while the park row stands ([§7.3](#73-the-session-latch-the-abortcomplete-race)). |
 | Delete of a digest still referenced by any space | Claim non-empty → no physical delete; only the version/MST entry removed. |
 | 0-byte object | No blob; manifest-only, empty MD5 ETag. |
 | Conditional request | Backend-evaluated; re-checked at commit for mutations. |
@@ -543,7 +571,7 @@ negotiations).
 | Capability                                                                                     | Service                         | Status       | Notes                                                                                                                                                                                                               |
 |------------------------------------------------------------------------------------------------|---------------------------------|--------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `allocate` / `PUT` / `accept` blob lifecycle                                                   | Piri/Sprue                      | **exists**   | The storage primitive Ingot builds on.                                                                                                                                                                              |
-| Ingot-timed accept (PUT a part, defer the conclude until Complete)                             | Ingot + Sprue                   | **exists**   | `forgeclient.BlobAdd` with `WithConclude(false)` stops at the conclude seam (`BlobConcludeAll` finishes it, delivering a Complete's parked parts as up to 1000 receipts per `/ucan/conclude`); UploadPart parks (durable, unaggregated), Complete concludes — Sprue's conclude handler already ran accept standalone. Ingot still does **not** issue `accept` (Piri requires the upload-service DID). |
+| Ingot-timed accept (PUT a part, conclude it later)                                              | Ingot + Sprue                   | **exists**   | `forgeclient.BlobAdd` with `WithConclude(false)` stops at the conclude seam (`BlobConcludeAll` finishes it, delivering parked parts as up to 1000 receipts per `/ucan/conclude`); UploadPart parks (durable, unaggregated), the upload's acceptor concludes — Sprue's conclude handler already ran accept standalone, and a repeated conclude of the same put receipt is harmless. Ingot still does **not** issue `accept` (Piri requires the upload-service DID). |
 | `abort(digest)` — drop a parked blob                                                           | Piri + Sprue + libforge         | **exists**   | `/blob/abort` on Sprue translates to `/blob/reject` on Piri, which refuses blobs the invoking space has accepted (`BlobAccepted`), deletes the space's allocation, and drops the bytes once no space holds an allocation or acceptance. Sprue recovers the provider from the `cause` receipt chain (a parked blob has no registration). Abort/TTL/supersede unwind through it.  |
 | `remove(digest)` — per-space claim release; physical delete/piece-retire at zero global claims | Piri + Sprue + libforge         | **exists**   | `/blob/remove` on Sprue forwards `/blob/release` to Piri, which deletes the space's allocation/acceptance/claim; at zero claims bytes delete immediately (unaggregated) or via the pending-removal sweep once the whole aggregate root is dead (FIL-623/624). Sprue forwards to primary + replicas (FIL-522). |
 | Configurable, adaptive size policy (`min`/`max`); batch guard for the `extraData` cap          | Piri                            | **partial**  | `MinAggregateSize` is hardcoded 128 MiB; lower to ~8 MiB and make configurable. The `addPieces` batch is no longer contract-capped (FWSS v1.3.0 removed the `extraData` cap); size it to the FVM `PiecesAdded` event-size + per-tx gas — a measured ceiling (default `BatchSize=10` is safely within it) (pdp-sim). No contract change. |
@@ -552,7 +580,7 @@ negotiations).
 | Parked-allocation GC + honor `Expires`                                                         | Piri                            | **to-build** | Bounds leakage when an abort never arrives.                                                                                                                                                                         |
 | Indexer delete by `(space, digest)` / location-claim CID                                       | Indexer + Sprue                 | **to-build** | IPNI removal mechanics are the indexer's.                                                                                                                                                                           |
 | Bare location commitment served by blob digest                                                 | Indexer                         | **exists**   | `accept` publishes it; the indexer caches it. Ingot's locator must learn to consume it ([§8](#8-retrieval-addressing-when-bodies-need-a-sharded-dag-index)).                                                        |
-| Batch `allocate`/`accept`                                                                      | libforge + Sprue + Piri + Ingot | **partial**  | `accept` is batched without new command shapes: a Complete's `/ucan/conclude` carries every part's put receipt, and Sprue issues the accepts to each node in one request, with a receipt per blob. `allocate` is still one RPC per blob.                 |
+| Batch `allocate`/`accept`                                                                      | libforge + Sprue + Piri + Ingot | **partial**  | `accept` is batched without new command shapes: an acceptor pass's `/ucan/conclude` carries up to 1000 blobs' put receipts, and Sprue issues the accepts to each node in one request, with a receipt per blob. `allocate` is still one RPC per blob.                 |
 | Lift the 256 MiB blob ceiling (streaming commP)                                                | Piri                            | **optional** | Reduces large-object splitting; not required for the first cut.                                                                                                                                                     |
 | `allocate-by-size` + bind-digest-after (remove the spool, same-rack)                           | Piri + Sprue + Ingot            | **optional** | [§10](#10-deployment-topology--the-digest-before-upload-cost). Needs a size-bounded, possibly authenticated upload route.                                                                                           |
 
@@ -608,7 +636,7 @@ The MVP this supersedes had six structural problems; each is resolved by a layer
 |-----------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | A per-bucket lock held across the whole write | Ingest and upload run off-lock; only the MST splice + guarded root swap is in the critical section. [§7.1](#71-write-single-shot-putobject)                                                                         |
 | The whole object buffered in memory           | Hash-while-writing to the local store; stream to Piri; nothing held whole in RAM. [§5](#5-the-data-layer), [§7.1](#71-write-single-shot-putobject)                                                                  |
-| No multipart, no abort                        | Parked part-blobs, accept-at-Complete, single-winner latch; abort = `/blob/abort` (parked) / `remove` (deduped). [§7.2](#72-multipart)–7.3, [§9](#9-the-system-contract-piri--sprue--indexer)                        |
+| No multipart, no abort                        | Parked part-blobs accepted during the upload, single-winner latch; abort = `/blob/abort` (parked) / `remove` (deduped). [§7.2](#72-multipart)–7.3, [§9](#9-the-system-contract-piri--sprue--indexer)                        |
 | Objects chunked into CARs to obtain a digest  | Object body = one blob (≤ `max`) or a coarse `≤ max` split; no fine chunking, no CAR. [§5](#5-the-data-layer), [§10](#10-deployment-topology--the-digest-before-upload-cost)                                        |
 | No delete of superseded data                  | Reference index + per-space `remove` + Piri's global claim gate + indexer delete; O(1) for ≥ `min` blobs. [§5](#5-the-data-layer), [§6](#6-the-forgechain-layer), [§9](#9-the-system-contract-piri--sprue--indexer) |
 | Aggregation blocked partial deletes           | A small `min` makes most blobs their own piece (O(1) delete); compaction handles only the sub-`min` tail. [§6](#6-the-forgechain-layer)                                                                             |
@@ -835,12 +863,15 @@ CREATE TABLE ingot.multipart_parts (
     etag_md5      bytea  NOT NULL,                       -- md5 of the part bytes (the part ETag)
     size          bigint NOT NULL,
     blob_digests  bytea[] NOT NULL,                      -- ordered; one entry per ≤ max_blob_size blob
-    state         text   NOT NULL DEFAULT 'parked'
-                      CHECK (state IN ('parked','accepted')),
+    blob_sizes    bigint[],                              -- each blob's plaintext length; NULL on rows from before 00030
+    state         text   NOT NULL DEFAULT 'spooled'      -- the acceptor's queue (§7.2)
+                      CHECK (state IN ('spooled','parked','accepted')),
     created_at    timestamptz NOT NULL DEFAULT now(),
     checksum      text   NOT NULL DEFAULT '',
-    PRIMARY KEY (upload_id, part_number)
+    PRIMARY KEY (upload_id, part_number),
+    CHECK (blob_sizes IS NULL OR cardinality(blob_sizes) = cardinality(blob_digests))
 );
+CREATE INDEX multipart_parts_parked ON ingot.multipart_parts (upload_id) WHERE state = 'parked';
 
 -- The part's BLAKE3 tree, hashed at the object offset UploadPart assumed and
 -- merged into the object's digest at Complete (see blake3tree). Its own
@@ -863,7 +894,8 @@ CREATE TABLE ingot.multipart_part_trees (
 );
 
 -- Deferred-accept multipart (§7.2): the state needed to conclude (or abort) a
--- parked blob later. Keyed by (space, digest), like upload_intents: the
+-- parked blob later. The acceptor's record swaps this row for the blob's
+-- blob_locations row in one transaction. Keyed by (space, digest), like upload_intents: the
 -- allocation is the space's, and dedup shares a park across the space's
 -- sessions and parts.
 CREATE TABLE ingot.blob_parks (
@@ -1056,10 +1088,13 @@ paths below are exercised against the real stack by the smelt-based `itest/` har
   resolve through the local location table (`LocalLocator`); with an indexer-backed locator, §4's
   race on a digest not yet published would return. Still open under #48: nothing reclaims a failed
   upload's body.
-- **Multipart parts park at UploadPart, accept at Complete.** (Built: `parkBlobs`/`concludeBlobs`
-  over the `blob_parks` table.) A parked part holds no local bytes: its spool copy is removed once
-  it parks, and Complete concludes it from its park row. Abort and session expiry unwind parked
-  blobs with `/blob/abort` ([§7.2](#72-multipart)–[7.3](#73-the-session-latch-the-abortcomplete-race)).
+- **Multipart parts park at UploadPart and are accepted during the upload.** (Built: `parkBlobs`
+  over the `blob_parks` table, the per-upload acceptor in `s3frontend/acceptor.go`, and the
+  restart sweep `startAcceptSweeper`.) A parked part holds no local bytes: its spool copy is
+  removed once it parks, and the acceptor concludes it from its park row. Complete waits for the
+  acceptor, up to 30 s, and answers a part still queued with a retryable 409. Abort and session
+  expiry unwind parked blobs with `/blob/abort` and accepted ones with `/blob/remove`
+  ([§7.2](#72-multipart)–[7.3](#73-the-session-latch-the-abortcomplete-race)).
 - **Crash recovery for the spool is not built.** The `upload_intents` × `blob_refs` reconciliation
   the failure-mode table in [§7.5](#75-concurrency-durability-and-failure-modes) describes (resume/`abort` parked, `remove` accepted-but-unreferenced)
   is a later phase; a partial post-commit reference-index write currently relies on retry/idempotency.
