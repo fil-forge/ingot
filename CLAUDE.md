@@ -343,27 +343,13 @@ workspace checkout: `GOWORK=off goreleaser release --clean`.
 
 ## Observability
 
-When a change adds or alters behavior someone depends on, decide how on-call
-would see it working and see it fail, and add that in the same PR where it is
-useful. Skip it for changes nothing operational depends on. Ingot runs on the
-appliances, where it pushes traces and metrics over OTLP to Alloy (compose sets
-`OTEL_EXPORTER_OTLP_ENDPOINT`) and its container logs ship too; infra-central's
-alert rules and `forge-regions` dashboard already read `ingot_local_blobs_*`.
-
-- **Metrics.** Create instruments through an injectable `MeterProvider` that
-  defaults to the global one, as the `ingot.local_blobs.*` instruments do
-  (`s3frontend.Deps.MeterProvider`, `Layered.CountBlobReads`). Prefer a signal
-  that answers "is this working?", such as a failure count or a stalled
-  amount, over one that only measures volume, and keep attributes
-  low-cardinality: no keys, CIDs or bucket names. List each new metric in a
-  metrics table in the README: the local blob one, or a new one beside it.
-- **Traces.** New work runs inside the request's span or a sweep's root span;
-  a new outbound HTTP client uses `tracing.NewHTTPClient()`.
-- **Alerts and dashboard panels** live in fil-forge/infra-central, under
-  `terraform/envs/grafana/`: the Forge Regions rule groups (the main Forge
-  Regions group holds the two Ingot rules today) and the `forge-regions`
-  dashboard. Its `AGENTS.md` says how to add them. Open a companion PR there,
-  or say in this PR that one is needed.
+When a change adds or alters something operational, decide how on-call would
+know it had broken, and add what is useful in the same PR: metrics, trace
+spans, and an alert or dashboard panel in fil-forge/infra-central. Skip it for
+changes nothing operational depends on. List each new metric in a metrics
+table in the README: the local blob one, or a new one beside it. "Adding a
+signal" in [`docs/observability.md`](docs/observability.md) says how to do
+each.
 
 ## Conventions & gotchas
 
