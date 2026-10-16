@@ -224,10 +224,11 @@ the spool, then the cache again (a blob can move between the first two
 lookups), then the network.
 
 Each directory keeps a running byte count of its blob files, and the spool
-also counts writes in progress as their bytes land. With
-`local_blob_max_bytes` set, a sweeper checks the total every 30 seconds and,
-when it is over the budget, evicts blobs the provider already holds, oldest
-state change first, until usage is at 90% of the budget. A blob qualifies
+also counts writes in progress as their bytes land. `local_blob_max_bytes`
+is required unless `cache_writes` is false, and `0` means no budget. With a
+nonzero budget, a sweeper checks the total every 30 seconds and, when it is
+over the budget, evicts blobs the provider already holds, oldest state
+change first, until usage is at 90% of the budget. A blob qualifies
 only through a row that proves the provider has it for the intent's space: a
 `blob_locations` row for an `accepted` or `published` intent, a `blob_parks`
 row for a `parked` one. A blob stored as received can have an intent in
@@ -437,8 +438,8 @@ draws the chains and the stores.
 
 - **No HA.** A bucket is single-writer through an in-process lock; nothing
   coordinates across instances beyond the root CAS.
-- **Local blob storage is bounded only when configured** (#48): with
-  `local_blob_max_bytes` set, the sweeper evicts cached blobs down to the
+- **Local blob storage is bounded only with a budget** (#48): with a
+  nonzero `local_blob_max_bytes`, the sweeper evicts cached blobs down to the
   budget. A delete frees its blobs' local copies once their release runs,
   and a multipart part's copy goes once it parks.
 - **Spool crash recovery is not built**: reconciling `upload_intents`
@@ -447,7 +448,7 @@ draws the chains and the stores.
   intent row at all, and unfinished `.tmp-*` writes, are reclaimed by the
   sweeper's orphan pass.) Nor is a failed upload's spool file reclaimed: its
   intent stays `spooled` or `uploading`, so neither eviction nor the orphan
-  pass may take it, and with `local_blob_max_bytes` set its bytes count
+  pass may take it, and with a nonzero `local_blob_max_bytes` its bytes count
   against the budget until an operator removes it and restarts ingot (the
   counts see a removal outside ingot at startup, or at an hourly scan that
   no write overlapped). The sweeper sums those bodies each run, counting an

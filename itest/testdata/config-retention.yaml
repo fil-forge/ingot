@@ -11,6 +11,9 @@ addr: "0.0.0.0:80"
 region: us-west-1
 data_dir: /data
 
+# Local blob budget in bytes; 0 is none. Required unless cache_writes is false.
+local_blob_max_bytes: 0
+
 # Agent identity: the key, wrapped as did:web:ingot; the listener serves the
 # matching DID document so hilt/sprue/piri can verify ingot's invocations.
 identity:
