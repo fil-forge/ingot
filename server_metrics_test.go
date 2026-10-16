@@ -42,9 +42,10 @@ func TestServerReportsLocalBlobGauges(t *testing.T) {
 	require.Empty(t, metricNames(t, reader), "metrics reported after Stop")
 }
 
-// TestServerReportsCatalogUsageGauges: with a catalog usage store, the
-// catalog gauges report each bucket's shipped catalog segments under its
-// space once refreshed, and Stop unregisters them.
+// TestServerReportsCatalogUsageGauges: with the catalog stores, the catalog
+// gauges report each bucket's shipped catalog segments under its space once
+// refreshed, the live and dead bytes once a walk has completed, and the
+// coverage by walk state; Stop unregisters them.
 func TestServerReportsCatalogUsageGauges(t *testing.T) {
 	reader := sdkmetric.NewManualReader()
 	prev := otel.GetMeterProvider()
@@ -70,7 +71,10 @@ func TestServerReportsCatalogUsageGauges(t *testing.T) {
 		require.NoError(t, mem.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seq, 2, seg.index, seg.dead, nil))
 	}
 
-	s := newInmemServer(t, config.ServerConfig{}, func(d *ServerDeps) { d.CatalogUsage = mem })
+	s := newInmemServer(t, config.ServerConfig{}, func(d *ServerDeps) {
+		d.CatalogUsage = mem
+		d.CatalogWalks = mem
+	})
 	require.Empty(t, gaugeValues(t, reader, "ingot.catalog.forge_bytes"), "reported before the first refresh")
 
 	n, err := s.backend.RefreshCatalogUsage(ctx)
@@ -82,6 +86,25 @@ func TestServerReportsCatalogUsageGauges(t *testing.T) {
 	require.Equal(t, bySpace, gaugeValues(t, reader, "ingot.catalog.dead_on_arrival_bytes"))
 	bySpace[space.String()] = 500
 	require.Equal(t, bySpace, gaugeValues(t, reader, "ingot.catalog.unmeasured_bytes"))
+	require.Empty(t, gaugeValues(t, reader, "ingot.catalog.live_bytes"), "live bytes reported before a walk")
+	require.Equal(t, map[string]int64{"current": 0, "stale": 0, "never": 1500}, coverageValues(t, reader))
+
+	// The bucket has no root, so its walk needs no authority and finds
+	// nothing live: every shipped byte is dead.
+	walked, ok, err := s.walker.WalkNext(ctx)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.True(t, walked.Completed)
+	_, err = s.backend.RefreshCatalogUsage(ctx)
+	require.NoError(t, err)
+	bySpace[space.String()] = 0
+	require.Equal(t, bySpace, gaugeValues(t, reader, "ingot.catalog.live_bytes"))
+	bySpace[space.String()] = 1500
+	require.Equal(t, bySpace, gaugeValues(t, reader, "ingot.catalog.dead_bytes"))
+	bySpace[space.String()] = 1200
+	require.Equal(t, bySpace, gaugeValues(t, reader, "ingot.catalog.dead_after_ship_bytes"))
+	require.Contains(t, gaugeValues(t, reader, "ingot.catalog.walked_at"), space.String())
+	require.Equal(t, map[string]int64{"current": 1500, "stale": 0, "never": 0}, coverageValues(t, reader))
 
 	require.NoError(t, s.Stop(context.Background()))
 	require.Empty(t, metricNames(t, reader), "metrics reported after Stop")
@@ -103,6 +126,26 @@ func gaugeValues(t *testing.T, reader *sdkmetric.ManualReader, name string) map[
 			require.True(t, ok, "%s is a %T", name, m.Data)
 			for _, dp := range g.DataPoints {
 				v, _ := dp.Attributes.Value("space")
+				out[v.AsString()] = dp.Value
+			}
+		}
+	}
+	return out
+}
+
+// coverageValues returns ingot.catalog.walk_coverage_bytes by state.
+func coverageValues(t *testing.T, reader *sdkmetric.ManualReader) map[string]int64 {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(t.Context(), &rm))
+	out := map[string]int64{}
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != "ingot.catalog.walk_coverage_bytes" {
+				continue
+			}
+			for _, dp := range m.Data.(metricdata.Gauge[int64]).DataPoints {
+				v, _ := dp.Attributes.Value("state")
 				out[v.AsString()] = dp.Value
 			}
 		}

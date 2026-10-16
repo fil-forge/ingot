@@ -27,6 +27,7 @@ import (
 	"github.com/fil-forge/ingot/blockstore"
 	msbucket "github.com/fil-forge/ingot/bucket"
 	"github.com/fil-forge/ingot/bucketauthority"
+	"github.com/fil-forge/ingot/catalogwalk"
 	"github.com/fil-forge/ingot/config"
 	"github.com/fil-forge/ingot/internal/fasthttputil"
 	"github.com/fil-forge/ingot/internal/reqscope"
@@ -127,6 +128,10 @@ type ServerDeps struct {
 	// the catalog gauges (ingot.catalog.*). Optional; typically the same
 	// instance as Registry.
 	CatalogUsage registry.CatalogUsageStore
+	// CatalogWalks, when set with CatalogUsage, persists the catalog walker's
+	// work, and the walker runs (unless CatalogWalkInterval is negative).
+	// Optional; typically the same instance as Registry.
+	CatalogWalks registry.CatalogWalkStore
 
 	// Identity is the agent identity (the issuer of every outbound
 	// invocation). The listener serves its DID document at
@@ -156,6 +161,9 @@ type Server struct {
 	log     blockstore.Log
 	backend *s3frontend.Backend
 	api     *s3api.S3ApiServer
+	// walker walks each bucket's live catalog for the catalog gauges; nil
+	// when it is off.
+	walker *catalogwalk.Walker
 	// sweepCtx is cancelled by Stop. Every background sweep derives its
 	// context from it, and sweeps counts the sweeper goroutines, so Stop
 	// can wait for them to exit before the registry closes.
@@ -222,6 +230,24 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 	if err := bs.CountBlobReads(otel.Meter("github.com/fil-forge/ingot/blockstore")); err != nil {
 		logger.Warn("local blob read metric not created", zap.Error(err))
 	}
+	// The catalog walker reads each bucket's catalog with the authority of
+	// a recent request in its space, which it borrows from the reads
+	// requests make.
+	var walker *catalogwalk.Walker
+	if deps.CatalogUsage != nil && deps.CatalogWalks != nil && cfg.CatalogWalkInterval >= 0 {
+		authority := catalogwalk.NewAuthority()
+		bs.OnRead(authority.Capture)
+		walker = catalogwalk.New(catalogwalk.Config{
+			Interval: cfg.CatalogWalkInterval,
+			Rate:     cfg.CatalogWalkRate,
+		}, catalogwalk.Deps{
+			Reads:     bs,
+			Usage:     deps.CatalogUsage,
+			Walks:     deps.CatalogWalks,
+			Authority: authority,
+			Logger:    logger,
+		})
+	}
 	backend := s3frontend.New(s3frontend.Deps{
 		Authority:       deps.Authority,
 		Registry:        deps.Registry,
@@ -277,6 +303,7 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		log:     log,
 		backend: backend,
 		api:     api,
+		walker:  walker,
 	}, nil
 }
 
@@ -308,6 +335,7 @@ func (s *Server) Start(ctx context.Context) error {
 	s.startReleasedPass()
 	s.startRegistrationSweeper()
 	s.startCatalogUsageSweeper()
+	s.startCatalogWalker()
 	return nil
 }
 
@@ -493,6 +521,60 @@ func (s *Server) startCatalogUsageSweeper() {
 			}
 		}
 	})
+}
+
+// catalogWalkPoll is how often the catalog walker looks for a due bucket
+// when none was. Each look sums every shipped segment row, as a catalog
+// usage refresh does, so it runs as rarely.
+const catalogWalkPoll = catalogUsageInterval
+
+// startCatalogWalker runs the catalog walker: each poll, it walks due buckets
+// one at a time until none is due (see catalogwalk.Walker.WalkNext), each walk
+// a root span of its own. A walk can take hours; Stop cuts it short.
+func (s *Server) startCatalogWalker() {
+	if s.walker == nil {
+		return
+	}
+	s.goSweep(func() {
+		ticker := time.NewTicker(catalogWalkPoll)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-s.sweepCtx.Done():
+				return
+			case <-ticker.C:
+			}
+			for s.walkNextCatalog() {
+			}
+		}
+	})
+}
+
+// walkNextCatalog runs one catalog walk, reporting whether another should
+// follow at once: one did, and nothing failed.
+func (s *Server) walkNextCatalog() bool {
+	ctx, span := tracing.Start(s.sweepCtx, "sweep.catalog_walk")
+	walked, ok, err := s.walker.WalkNext(ctx)
+	s.endSweepSpan(span, err,
+		attribute.Bool("ingot.walk.due", ok),
+		attribute.String("ingot.walk.space", walked.Space.String()),
+		attribute.Int64("ingot.walk.reads", walked.Reads),
+		attribute.Int64("ingot.walk.reused", walked.Reused),
+		attribute.Bool("ingot.walk.completed", walked.Completed))
+	switch {
+	case s.sweepCtx.Err() != nil:
+		return false
+	case err != nil:
+		s.logger.Warn("catalog walk", zap.Stringer("space", walked.Space), zap.Error(err))
+		return false
+	case walked.Completed:
+		s.logger.Info("catalog walk completed",
+			zap.Stringer("space", walked.Space),
+			zap.Int64("live_bytes", walked.LiveBytes),
+			zap.Int64("reads", walked.Reads),
+			zap.Int64("reused", walked.Reused))
+	}
+	return ok
 }
 
 // startReleasedPass removes the local copies and intents that releases kept

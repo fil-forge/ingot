@@ -2,9 +2,21 @@ package s3frontend
 
 import (
 	"context"
+	"errors"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
+
+	"github.com/fil-forge/ingot/registry"
+)
+
+// The state of a bucket's last catalog walk, for the coverage gauge: current
+// if it reached the bucket's present root, stale if the root has moved since,
+// never if no walk has completed.
+var (
+	walkCurrent = metric.WithAttributes(attribute.String("state", "current"))
+	walkStale   = metric.WithAttributes(attribute.String("state", "stale"))
+	walkNever   = metric.WithAttributes(attribute.String("state", "never"))
 )
 
 // registerCatalogUsageGauges reports each bucket's catalog storage on Forge
@@ -12,20 +24,34 @@ import (
 // the bucket's space DID rather than its name, which is customer data; a
 // bucket recreated under the same name has a new space, so a new series
 // (though see registry.CatalogUsage on rows a failed cleanup left behind).
+// The live and dead figures come from the bucket's last completed catalog
+// walk and are of the moment it started; the coverage gauge sums the shipped
+// bytes of every bucket by the state of its walk, so a reader can see how
+// much of the catalog the walked figures speak for.
 func registerCatalogUsageGauges(meter metric.Meter, b *Backend) (metric.Registration, error) {
-	forge, err := meter.Int64ObservableGauge("ingot.catalog.forge_bytes", metric.WithUnit("By"),
-		metric.WithDescription("Bytes of the bucket's catalog segments shipped to Forge and not yet released (their CARs, not their index blobs), by space"))
-	if err != nil {
-		return nil, err
+	var errs []error
+	gauge := func(name, unit, desc string) metric.Int64ObservableGauge {
+		g, err := meter.Int64ObservableGauge(name, metric.WithUnit(unit), metric.WithDescription(desc))
+		errs = append(errs, err)
+		return g
 	}
-	dead, err := meter.Int64ObservableGauge("ingot.catalog.dead_on_arrival_bytes", metric.WithUnit("By"),
-		metric.WithDescription("Bytes of those segments' blocks that were already dead when their segment shipped, over the segments measured, by space"))
-	if err != nil {
-		return nil, err
-	}
-	unmeasured, err := meter.Int64ObservableGauge("ingot.catalog.unmeasured_bytes", metric.WithUnit("By"),
-		metric.WithDescription("Bytes of shipped catalog segments whose dead-on-arrival bytes were not measured, by space"))
-	if err != nil {
+	forge := gauge("ingot.catalog.forge_bytes", "By",
+		"Bytes of the bucket's catalog segments shipped to Forge and not yet released (their CARs, not their index blobs), by space")
+	deadOnArrival := gauge("ingot.catalog.dead_on_arrival_bytes", "By",
+		"Bytes of those segments' blocks that were already dead when their segment shipped, over the segments measured, by space")
+	unmeasured := gauge("ingot.catalog.unmeasured_bytes", "By",
+		"Bytes of shipped catalog segments whose dead-on-arrival bytes were not measured, by space")
+	live := gauge("ingot.catalog.live_bytes", "By",
+		"Bytes of the catalog blocks reachable from the bucket's root when its last catalog walk started, by space")
+	dead := gauge("ingot.catalog.dead_bytes", "By",
+		"Shipped catalog bytes the bucket's root no longer reached when its last catalog walk started, by space")
+	deadAfterShip := gauge("ingot.catalog.dead_after_ship_bytes", "By",
+		"The part of dead_bytes not already dead on arrival: blocks that died after their segment shipped (and the dead blocks of unmeasured segments), by space")
+	walkedAt := gauge("ingot.catalog.walked_at", "s",
+		"When the bucket's last completed catalog walk started, in Unix seconds, by space")
+	coverage := gauge("ingot.catalog.walk_coverage_bytes", "By",
+		"Shipped catalog bytes of all buckets, by the state of each bucket's last catalog walk: current, stale (its root has moved since) or never")
+	if err := errors.Join(errs...); err != nil {
 		return nil, err
 	}
 	return meter.RegisterCallback(func(_ context.Context, o metric.Observer) error {
@@ -33,14 +59,39 @@ func registerCatalogUsageGauges(meter metric.Meter, b *Backend) (metric.Registra
 		if snapshot == nil {
 			return nil
 		}
+		var current, stale, never int64
 		for _, u := range *snapshot {
 			space := metric.WithAttributes(attribute.String("space", u.Space.String()))
 			o.ObserveInt64(forge, u.Bytes, space)
-			o.ObserveInt64(dead, u.DeadOnArrivalBytes, space)
+			o.ObserveInt64(deadOnArrival, u.DeadOnArrivalBytes, space)
 			o.ObserveInt64(unmeasured, u.UnmeasuredBytes, space)
+			switch {
+			case u.Walk == nil:
+				never += u.Bytes
+				continue
+			case u.Walk.Root.Equals(u.Root):
+				current += u.Bytes
+			default:
+				stale += u.Bytes
+			}
+			d := walkedDead(*u.Walk)
+			o.ObserveInt64(live, u.Walk.LiveBytes, space)
+			o.ObserveInt64(dead, d, space)
+			o.ObserveInt64(deadAfterShip, max(0, d-u.Walk.DeadOnArrivalBytes), space)
+			o.ObserveInt64(walkedAt, u.Walk.StartedAt, space)
 		}
+		o.ObserveInt64(coverage, current, walkCurrent)
+		o.ObserveInt64(coverage, stale, walkStale)
+		o.ObserveInt64(coverage, never, walkNever)
 		return nil
-	}, forge, dead, unmeasured)
+	}, forge, deadOnArrival, unmeasured, live, dead, deadAfterShip, walkedAt, coverage)
+}
+
+// walkedDead is the shipped catalog bytes w's root did not reach. A block
+// reached only in a segment not yet shipped counts as live without counting
+// as shipped, so the difference can come out below zero; it reads as none.
+func walkedDead(w registry.CatalogWalk) int64 {
+	return max(0, w.ForgeBytes-w.LiveBytes)
 }
 
 // ReportsCatalogUsage reports whether the backend has a catalog usage store

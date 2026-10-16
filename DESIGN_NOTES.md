@@ -455,9 +455,15 @@ draws the chains and the stores.
   `ingot.local_blobs.stalled_bytes` gauge.
 - **No catalog GC**: `gc_candidates` is write-only; superseded MST nodes
   accumulate on Forge with mutation volume. Each ship records how much of its
-  segment was already dead (`segments.dead_bytes`), and the
-  `ingot.catalog.*` gauges sum that and the shipped bytes per bucket; what
-  dies after shipping is not measured yet.
+  segment was already dead (`segments.dead_bytes`), and a background walker
+  (`catalogwalk`) measures each bucket's live catalog bytes; the
+  `ingot.catalog.*` gauges report both per bucket.
+- **The catalog walker borrows read authority**: like the ship, it has none
+  of its own, so it reads a bucket's catalog from Forge with the proof store
+  of the latest request in the bucket's space, for up to an hour after that
+  request's reads. A bucket with no request since the walker started is never
+  walked; `ingot.catalog.walk_coverage_bytes` shows how much of the catalog
+  the walked figures cover.
 - **Reads carry no bucket context**: `Manager.Get` linear-scans every open
   bucket store; threading the bucket into the read path removes the scan.
 - **The ship authority expires**: the async flush signs with a per-space

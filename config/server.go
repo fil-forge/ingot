@@ -84,4 +84,11 @@ type ServerConfig struct {
 	// AllowNoneEncryption lets PutBucketEncryption set a bucket's default
 	// encryption to "none" (Config.Encryption.AllowNone).
 	AllowNoneEncryption bool
+
+	// CatalogWalkInterval is the least time between two walks of a bucket's
+	// live catalog; zero → catalogwalk.DefaultInterval, negative → the
+	// walker is off. CatalogWalkRate caps a walk's block reads per second;
+	// zero → catalogwalk.DefaultRate.
+	CatalogWalkInterval time.Duration
+	CatalogWalkRate     int
 }

@@ -125,3 +125,20 @@ func (b *lazyBody) Read(p []byte) (int, error) {
 	b.data = b.data[n:]
 	return n, nil
 }
+
+// TestUnsampledRecordsNoChildren: a span started under Unsampled's context is
+// not recorded, while the span that context came from still is.
+func TestUnsampledRecordsNoChildren(t *testing.T) {
+	rec := installRecorder(t)
+	ctx, parent := Start(context.Background(), "parent")
+	_, child := Start(Unsampled(ctx), "child")
+	child.End()
+	parent.End()
+
+	var names []string
+	for _, s := range rec.Ended() {
+		names = append(names, s.Name())
+	}
+	require.Equal(t, []string{"parent"}, names)
+	require.Equal(t, context.Background(), Unsampled(context.Background()), "a context without a span is returned as is")
+}

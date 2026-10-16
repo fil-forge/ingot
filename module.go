@@ -175,6 +175,9 @@ type serverParams struct {
 	// CatalogUsage feeds the catalog gauges; without it they are not
 	// reported (see ServerDeps.CatalogUsage).
 	CatalogUsage registry.CatalogUsageStore `optional:"true"`
+	// CatalogWalks lets the catalog walker run; without it the live and
+	// dead gauges are not reported (see ServerDeps.CatalogWalks).
+	CatalogWalks registry.CatalogWalkStore `optional:"true"`
 	// Identity is the agent identity (the host-provided libforge identity, the
 	// issuer of every outbound invocation); the listener serves its DID
 	// document at /.well-known/did.json. Required.
@@ -241,6 +244,7 @@ func registerServerLifecycle(lc fx.Lifecycle, p serverParams) {
 				TenantKeys:      p.TenantKeys,
 				Meta:            p.Meta,
 				CatalogUsage:    p.CatalogUsage,
+				CatalogWalks:    p.CatalogWalks,
 				Identity:        p.Identity,
 				IAM:             p.IAM,
 			})
@@ -504,6 +508,7 @@ type registryResult struct {
 	EncParams         registry.EncryptionParamsStore
 	RevocationCursors registry.RevocationCursorStore
 	CatalogUsage      registry.CatalogUsageStore
+	CatalogWalks      registry.CatalogWalkStore
 	Meta              logstore.Meta
 }
 
@@ -516,7 +521,7 @@ type registryResult struct {
 // needs hilt_url/hilt_did configured.
 func provideRegistry(pool *pgxpool.Pool) registryResult {
 	pg := registry.NewPostgres(pool)
-	return registryResult{Registry: pg, Intents: pg, Locations: pg, Inclusions: pg, BlobRefs: pg, GC: pg, Multipart: pg, Parks: pg, Streams: pg, PendingReleases: pg, UploadRegs: pg, EncParams: pg, RevocationCursors: pg, CatalogUsage: pg, Meta: pg}
+	return registryResult{Registry: pg, Intents: pg, Locations: pg, Inclusions: pg, BlobRefs: pg, GC: pg, Multipart: pg, Parks: pg, Streams: pg, PendingReleases: pg, UploadRegs: pg, EncParams: pg, RevocationCursors: pg, CatalogUsage: pg, CatalogWalks: pg, Meta: pg}
 }
 
 // migrationHookOut feeds the migration PreStartHook into the "ingot_prestart"

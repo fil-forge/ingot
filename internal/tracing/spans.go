@@ -24,6 +24,19 @@ func StartClient(ctx context.Context, name string, attrs ...attribute.KeyValue) 
 	return Tracer().Start(ctx, name, trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(attrs...))
 }
 
+// Unsampled returns ctx carrying its span's trace marked unsampled, so the
+// spans started under it are not recorded while that span still is. For
+// background work that makes many calls on one span's behalf (a catalog walk
+// reads block after block), whose every outbound request and query would
+// otherwise be a span of its own.
+func Unsampled(ctx context.Context) context.Context {
+	sc := trace.SpanContextFromContext(ctx)
+	if !sc.IsValid() {
+		return ctx
+	}
+	return trace.ContextWithSpanContext(ctx, sc.WithTraceFlags(sc.TraceFlags().WithSampled(false)))
+}
+
 // End records err on span and ends it. An [s3err.S3Error] (NoSuchKey and the
 // rest of the S3 error table) is an outcome the response carries, so it does
 // not mark the span as failed.

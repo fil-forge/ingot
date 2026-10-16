@@ -153,6 +153,14 @@ Internal:
   a body of declared length), `cbor_gen.go`.
 - **`mst/`** — the forked MST (deps: go-cid, blockstore, ucantone/did — trees
   carry their bucket's space for network-backed reads).
+- **`catalogwalk/`** — walks each bucket's live catalog for the
+  `ingot.catalog.*` live and dead gauges: `Authority` borrows a recent
+  request's read authority per space (captured on every read through
+  `Layered.OnRead`, only from stores the IAM layer marked
+  `reqscope.Borrowable`, 1h past the last read); `Walker` picks the due
+  bucket longest unwalked, reads under a rate cap, and remembers large
+  subtrees' totals (`catalog_walk_subtrees`) so a later walk reads only what
+  changed.
 - **`inmem/`** — in-memory fakes (`MemStore`, `NopBaseReader`, `NopUploader`);
   test-only.
 - **`cars/`**, **`migrations/`**,
@@ -169,16 +177,18 @@ Internal:
   provider, through `s3frontend.Deps.MeterProvider` and
   `Layered.CountBlobReads`; with no provider installed they are no-ops.
   So are the catalog gauges (`ingot.catalog.*`: each bucket's shipped
-  catalog bytes and how much was dead on arrival, labeled by space DID,
-  never bucket name), which a `server.go` sweep refreshes from
-  `registry.CatalogUsageStore`.
+  catalog bytes, how much was dead on arrival, and the live and dead bytes
+  its last catalog walk found, labeled by space DID, never bucket name),
+  which a `server.go` sweep refreshes from `registry.CatalogUsageStore`.
   versitygw passes
   the backend the bare `*fasthttp.RequestCtx` as its context, so the
   middleware stores the span as a request user value under the trace API's
   own key; `trace.SpanFromContext` on that context then finds it. A new
   outbound HTTP client should use `tracing.NewHTTPClient()`. Manual spans use
   `tracing.Start` / `tracing.End` (an S3 error table outcome does not mark a
-  span failed); reads report their tier with `tracing.CountRead`, which lands
+  span failed); background work that makes many calls on one span's behalf
+  (the catalog walk's block reads) makes them under `tracing.Unsampled`, so
+  they don't each become a span; reads report their tier with `tracing.CountRead`, which lands
   on the server span as `ingot.reads.*`. A streamed response (GetObject) keeps
   its server span open until fasthttp has written the body. Each background
   sweep (`server.go`) starts a root span of its own (`sweep.*`), so its
@@ -238,6 +248,8 @@ validated at startup down to holding at least one delegation),
 `LocalBlobOrphanAge` (24h, ≥ 1h) for the local blob sweeper
 (`s3frontend.SweepLocalBlobs`), `CacheWrites` (unset → true; false drops
 each body's local copy once accepted),
+`CatalogWalkInterval` (empty → 6h, negative → walker off) and
+`CatalogWalkRate` (blocks/s, 0 → 100) for the catalog walker,
 `CORSAllowedOrigins`, `LogLevel`. `Config.ServerConfig()` is the single
 mapping site. The daemon's config (cmd/) adds `postgres_dsn`,
 `identity.key_file` (the agent's PEM key) and `identity.service_id` (optional

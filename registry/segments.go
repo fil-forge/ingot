@@ -296,17 +296,21 @@ func (r *Postgres) RehydrateSegment(ctx context.Context, m logstore.SegmentMeta)
 }
 
 // CatalogUsage sums each bucket's shipped catalog segments: those whose
-// ship registered blobs in its space (index_digest is set exactly then).
+// ship registered blobs in its space (index_digest is set exactly then). Each
+// entry carries the bucket's current root and its last completed walk.
 func (r *Postgres) CatalogUsage(ctx context.Context) ([]CatalogUsage, error) {
 	rows, err := r.pool.Query(ctx,
-		`SELECT b.name, b.space,
+		`SELECT b.name, b.space, b.root_cid,
 		        SUM(s.size_bytes),
 		        COALESCE(SUM(s.dead_bytes), 0),
-		        COALESCE(SUM(s.size_bytes) FILTER (WHERE s.dead_bytes IS NULL), 0)
+		        COALESCE(SUM(s.size_bytes) FILTER (WHERE s.dead_bytes IS NULL), 0),
+		        w.bucket IS NOT NULL, w.root_cid, w.started_at, w.finished_at, w.live_bytes,
+		        w.forge_bytes, w.dead_on_arrival_bytes, w.unmeasured_bytes
 		   FROM ingot.segments s
 		   JOIN ingot.buckets b ON b.name = s.bucket
+		   LEFT JOIN ingot.catalog_walks w ON w.bucket = b.name
 		  WHERE s.plane = 'catalog' AND s.index_digest IS NOT NULL
-		  GROUP BY b.name, b.space
+		  GROUP BY b.name, w.bucket
 		  ORDER BY b.name`)
 	if err != nil {
 		return nil, fmt.Errorf("registry: catalog usage: %w", err)
@@ -316,14 +320,30 @@ func (r *Postgres) CatalogUsage(ctx context.Context) ([]CatalogUsage, error) {
 	var out []CatalogUsage
 	for rows.Next() {
 		var (
-			u        CatalogUsage
-			spaceStr string
+			u                    CatalogUsage
+			spaceStr             string
+			root, walkRoot       []byte
+			walked               bool
+			started, finished    *int64
+			live, forge, doa, um *int64
 		)
-		if err := rows.Scan(&u.Bucket, &spaceStr, &u.Bytes, &u.DeadOnArrivalBytes, &u.UnmeasuredBytes); err != nil {
+		if err := rows.Scan(&u.Bucket, &spaceStr, &root, &u.Bytes, &u.DeadOnArrivalBytes, &u.UnmeasuredBytes,
+			&walked, &walkRoot, &started, &finished, &live, &forge, &doa, &um); err != nil {
 			return nil, fmt.Errorf("registry: scan catalog usage: %w", err)
 		}
 		if u.Space, err = did.Parse(spaceStr); err != nil {
 			return nil, fmt.Errorf("registry: parse space %q of bucket %q: %w", spaceStr, u.Bucket, err)
+		}
+		if u.Root, err = castOptionalCid(root); err != nil {
+			return nil, fmt.Errorf("registry: root of bucket %q: %w", u.Bucket, err)
+		}
+		if walked {
+			w := CatalogWalk{StartedAt: *started, FinishedAt: *finished, LiveBytes: *live,
+				ForgeBytes: *forge, DeadOnArrivalBytes: *doa, UnmeasuredBytes: *um}
+			if w.Root, err = castOptionalCid(walkRoot); err != nil {
+				return nil, fmt.Errorf("registry: walked root of bucket %q: %w", u.Bucket, err)
+			}
+			u.Walk = &w
 		}
 		out = append(out, u)
 	}
@@ -331,6 +351,114 @@ func (r *Postgres) CatalogUsage(ctx context.Context) ([]CatalogUsage, error) {
 		return nil, fmt.Errorf("registry: catalog usage rows: %w", err)
 	}
 	return out, nil
+}
+
+// castOptionalCid decodes a nullable CID column: NULL is cid.Undef.
+func castOptionalCid(b []byte) (cid.Cid, error) {
+	if len(b) == 0 {
+		return cid.Undef, nil
+	}
+	return cid.Cast(b)
+}
+
+// optionalCidBytes encodes a CID for a nullable column: cid.Undef is NULL.
+func optionalCidBytes(c cid.Cid) []byte {
+	if !c.Defined() {
+		return nil
+	}
+	return c.Bytes()
+}
+
+// CatalogSubtrees returns the subtrees remembered for bucket.
+func (r *Postgres) CatalogSubtrees(ctx context.Context, bucket string) ([]CatalogSubtree, error) {
+	rows, err := r.pool.Query(ctx,
+		`SELECT cid, bytes, blocks FROM ingot.catalog_walk_subtrees WHERE bucket = $1`, bucket)
+	if err != nil {
+		return nil, fmt.Errorf("registry: catalog subtrees of %q: %w", bucket, err)
+	}
+	defer rows.Close()
+	var out []CatalogSubtree
+	for rows.Next() {
+		var (
+			st CatalogSubtree
+			c  []byte
+		)
+		if err := rows.Scan(&c, &st.Bytes, &st.Blocks); err != nil {
+			return nil, fmt.Errorf("registry: scan catalog subtree: %w", err)
+		}
+		if st.CID, err = cid.Cast(c); err != nil {
+			return nil, fmt.Errorf("registry: catalog subtree cid of %q: %w", bucket, err)
+		}
+		out = append(out, st)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("registry: catalog subtrees rows: %w", err)
+	}
+	return out, nil
+}
+
+// PutCatalogSubtrees upserts subtrees for bucket in one statement.
+func (r *Postgres) PutCatalogSubtrees(ctx context.Context, bucket string, walkedAt int64, subtrees []CatalogSubtree) error {
+	if len(subtrees) == 0 {
+		return nil
+	}
+	cids := make([][]byte, len(subtrees))
+	bytes := make([]int64, len(subtrees))
+	blocks := make([]int64, len(subtrees))
+	for i, st := range subtrees {
+		cids[i], bytes[i], blocks[i] = st.CID.Bytes(), st.Bytes, st.Blocks
+	}
+	if _, err := r.pool.Exec(ctx,
+		`INSERT INTO ingot.catalog_walk_subtrees (bucket, cid, bytes, blocks, walked_at)
+		 SELECT $1, unnest($2::bytea[]), unnest($3::bigint[]), unnest($4::bigint[]), $5
+		 ON CONFLICT (bucket, cid)
+		 DO UPDATE SET walked_at = GREATEST(ingot.catalog_walk_subtrees.walked_at, EXCLUDED.walked_at)`,
+		bucket, cids, bytes, blocks, walkedAt); err != nil {
+		return fmt.Errorf("registry: put catalog subtrees of %q: %w", bucket, err)
+	}
+	return nil
+}
+
+// CompleteCatalogWalk records the walk and prunes the bucket's remembered
+// subtrees in one transaction.
+func (r *Postgres) CompleteCatalogWalk(ctx context.Context, bucket string, w CatalogWalk, used []cid.Cid) error {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("registry: begin catalog walk of %q: %w", bucket, err)
+	}
+	defer tx.Rollback(ctx)
+
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO ingot.catalog_walks
+		   (bucket, root_cid, started_at, finished_at, live_bytes, forge_bytes, dead_on_arrival_bytes, unmeasured_bytes)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		 ON CONFLICT (bucket) DO UPDATE SET
+		   root_cid = EXCLUDED.root_cid, started_at = EXCLUDED.started_at, finished_at = EXCLUDED.finished_at,
+		   live_bytes = EXCLUDED.live_bytes, forge_bytes = EXCLUDED.forge_bytes,
+		   dead_on_arrival_bytes = EXCLUDED.dead_on_arrival_bytes, unmeasured_bytes = EXCLUDED.unmeasured_bytes`,
+		bucket, optionalCidBytes(w.Root), w.StartedAt, w.FinishedAt, w.LiveBytes,
+		w.ForgeBytes, w.DeadOnArrivalBytes, w.UnmeasuredBytes); err != nil {
+		return fmt.Errorf("registry: record catalog walk of %q: %w", bucket, err)
+	}
+	usedBytes := make([][]byte, len(used))
+	for i, c := range used {
+		usedBytes[i] = c.Bytes()
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE ingot.catalog_walk_subtrees SET walked_at = $2
+		  WHERE bucket = $1 AND cid = ANY($3::bytea[]) AND walked_at < $2`,
+		bucket, w.StartedAt, usedBytes); err != nil {
+		return fmt.Errorf("registry: mark catalog subtrees of %q: %w", bucket, err)
+	}
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM ingot.catalog_walk_subtrees WHERE bucket = $1 AND walked_at < $2`,
+		bucket, w.StartedAt); err != nil {
+		return fmt.Errorf("registry: prune catalog subtrees of %q: %w", bucket, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("registry: commit catalog walk of %q: %w", bucket, err)
+	}
+	return nil
 }
 
 // nullableInt maps a zero timestamp to SQL NULL.

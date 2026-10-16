@@ -192,6 +192,32 @@ func TestGetUserAccountForRequest(t *testing.T) {
 	})
 }
 
+// TestKeyStoreIsBorrowable: a request authorized normally carries the access
+// key's own store, marked as one background work may borrow.
+func TestKeyStoreIsBorrowable(t *testing.T) {
+	access, keyDID := newAccessKey(t)
+	cache := iam.NewKeyProofs()
+	fake := &fakeAuthorizer{res: authorizeOK(t, keyDID, s3.VerificationKey{Kind: s3.KeyKindSigV4, Data: []byte("dk")})}
+	svc := iam.New(fake, cache, iam.NewVerificationKeyCache(), iam.NewTenantCache())
+
+	app := fiber.New()
+	var store ucanlib.ProofStore
+	var borrowable bool
+	app.Use(func(c fiber.Ctx) error {
+		_, err := svc.GetUserAccountForRequest(c, access)
+		require.NoError(t, err)
+		store, _ = c.Locals(reqscope.ProofStoreKey()).(ucanlib.ProofStore)
+		borrowable, _ = c.Locals(reqscope.BorrowableKey()).(bool)
+		return nil
+	})
+	resp, err := app.Test(httptest.NewRequest(http.MethodGet, "http://example.com/bkt/key", nil))
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+
+	require.True(t, borrowable)
+	require.Same(t, cache.For(keyDID), store, "the borrowable store is the key's own")
+}
+
 func TestRevokedResponseIsNotCached(t *testing.T) {
 	access, keyDID := newAccessKey(t)
 	sigv4 := s3.VerificationKey{Kind: s3.KeyKindSigV4, Data: []byte("dk")}
@@ -209,11 +235,13 @@ func TestRevokedResponseIsNotCached(t *testing.T) {
 	var scoped ucanlib.ProofStore
 	var acct auth.Account
 	var calls int
+	borrowable := true
 	app.Use(func(c fiber.Ctx) error {
 		var err error
 		acct, err = svc.GetUserAccountForRequest(c, access)
 		require.NoError(t, err)
 		scoped, _ = c.Locals(reqscope.ProofStoreKey()).(ucanlib.ProofStore)
+		borrowable = c.Locals(reqscope.BorrowableKey()).(bool)
 		calls++
 		return nil
 	})
@@ -238,7 +266,9 @@ func TestRevokedResponseIsNotCached(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, held)
 
-	// The request itself still had a chain for its onward retrieval.
+	// The request itself still had a chain for its onward retrieval, in a
+	// store nothing may borrow past the request.
+	require.False(t, borrowable, "a store holding a revoked delegation is not borrowable")
 	require.NotNil(t, scoped)
 	chain, _, err := scoped.ProofChain(context.Background(), agent.DID(), leaf.Command(), leaf.Subject())
 	require.NoError(t, err)

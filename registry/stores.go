@@ -699,6 +699,8 @@ type GCStore interface {
 type CatalogUsage struct {
 	Bucket string
 	Space  did.DID
+	// Root is the bucket's current root (cid.Undef for an empty bucket).
+	Root cid.Cid
 	// Bytes is the total size of the bucket's shipped catalog CARs.
 	Bytes int64
 	// DeadOnArrivalBytes is how much of Bytes was already dead when its
@@ -707,6 +709,49 @@ type CatalogUsage struct {
 	// UnmeasuredBytes is the part of Bytes in segments shipped without that
 	// measurement.
 	UnmeasuredBytes int64
+	// Walk is the bucket's last completed walk of its live catalog, or nil
+	// if none has completed.
+	Walk *CatalogWalk
+}
+
+// CatalogWalk records a completed walk of a bucket's live catalog: the bytes
+// reachable from Root, which was the bucket's root when the walk started, and
+// the bucket's catalog usage at that moment. Its shipped bytes minus its
+// live bytes are what was dead then.
+type CatalogWalk struct {
+	Root       cid.Cid
+	StartedAt  int64 // unix seconds
+	FinishedAt int64 // unix seconds
+	// LiveBytes is the CAR frame bytes of the blocks reachable from Root.
+	LiveBytes          int64
+	ForgeBytes         int64
+	DeadOnArrivalBytes int64
+	UnmeasuredBytes    int64
+}
+
+// CatalogSubtree is the bytes and blocks reachable from one catalog block,
+// counting a block once per link to it. A CID names the same subtree
+// forever, so a walk can reuse the figures of any subtree it has seen.
+type CatalogSubtree struct {
+	CID    cid.Cid
+	Bytes  int64
+	Blocks int64
+}
+
+// CatalogWalkStore persists the catalog walker's work: each bucket's
+// remembered subtrees, which let a walk skip what hasn't changed, and its last
+// completed walk, which CatalogUsage reports. Both go with the bucket.
+type CatalogWalkStore interface {
+	// CatalogSubtrees returns the subtrees remembered for bucket.
+	CatalogSubtrees(ctx context.Context, bucket string) ([]CatalogSubtree, error)
+	// PutCatalogSubtrees remembers subtrees for bucket, computed by a walk
+	// that started at walkedAt. A walk saves them as it goes, so one cut
+	// short still spares the next its work.
+	PutCatalogSubtrees(ctx context.Context, bucket string, walkedAt int64, subtrees []CatalogSubtree) error
+	// CompleteCatalogWalk records w as bucket's last completed walk, marks
+	// the remembered subtrees it used as walked at w.StartedAt, and drops
+	// the bucket's others: those of earlier walks it no longer reaches.
+	CompleteCatalogWalk(ctx context.Context, bucket string, w CatalogWalk, used []cid.Cid) error
 }
 
 // CatalogUsageStore reports how much catalog storage each bucket holds on

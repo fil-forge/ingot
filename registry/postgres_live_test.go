@@ -1064,6 +1064,52 @@ func TestPostgresStores_Live(t *testing.T) {
 		if i < 0 || usage[i] != want {
 			t.Fatalf("CatalogUsage = %+v, want an entry %+v", usage, want)
 		}
+
+		// A walk's subtrees and record: the record joins the usage, and a
+		// completed walk keeps the subtrees it used and drops the rest.
+		root := liveCid(t, "cu-root")
+		kept, dropped, recomputed := liveCid(t, "cu-kept"), liveCid(t, "cu-dropped"), liveCid(t, "cu-recomputed")
+		if err := r.PutCatalogSubtrees(ctx, bucket, 100, []registry.CatalogSubtree{
+			{CID: kept, Bytes: 10, Blocks: 2}, {CID: dropped, Bytes: 20, Blocks: 3}, {CID: recomputed, Bytes: 5, Blocks: 1},
+		}); err != nil {
+			t.Fatalf("PutCatalogSubtrees: %v", err)
+		}
+		if err := r.PutCatalogSubtrees(ctx, bucket, 200, []registry.CatalogSubtree{{CID: recomputed, Bytes: 5, Blocks: 1}}); err != nil {
+			t.Fatalf("PutCatalogSubtrees again: %v", err)
+		}
+		walk := registry.CatalogWalk{Root: root, StartedAt: 200, FinishedAt: 260, LiveBytes: 700,
+			ForgeBytes: 1500, DeadOnArrivalBytes: 300, UnmeasuredBytes: 500}
+		if err := r.CompleteCatalogWalk(ctx, bucket, walk, []cid.Cid{kept}); err != nil {
+			t.Fatalf("CompleteCatalogWalk: %v", err)
+		}
+		subtrees, err := r.CatalogSubtrees(ctx, bucket)
+		if err != nil {
+			t.Fatalf("CatalogSubtrees: %v", err)
+		}
+		var got []string
+		for _, st := range subtrees {
+			got = append(got, st.CID.String())
+		}
+		slices.Sort(got)
+		wantKept := []string{kept.String(), recomputed.String()}
+		slices.Sort(wantKept)
+		if !slices.Equal(got, wantKept) {
+			t.Fatalf("subtrees after the walk = %v, want %v", got, wantKept)
+		}
+		usage, err = r.CatalogUsage(ctx)
+		if err != nil {
+			t.Fatalf("CatalogUsage: %v", err)
+		}
+		i = slices.IndexFunc(usage, func(u registry.CatalogUsage) bool { return u.Bucket == bucket })
+		if i < 0 || usage[i].Walk == nil || *usage[i].Walk != walk {
+			t.Fatalf("CatalogUsage after the walk = %+v, want walk %+v", usage, walk)
+		}
+		if _, err := pool.Exec(ctx, `DELETE FROM ingot.buckets WHERE name = $1`, bucket); err != nil {
+			t.Fatalf("delete bucket: %v", err)
+		}
+		if subtrees, err := r.CatalogSubtrees(ctx, bucket); err != nil || len(subtrees) != 0 {
+			t.Fatalf("subtrees after the bucket's delete = %v (err %v), want none", subtrees, err)
+		}
 	})
 }
 

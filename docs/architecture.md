@@ -913,6 +913,27 @@ CREATE TABLE ingot.blob_release_intents (
 CREATE INDEX blob_release_intents_due_idx ON ingot.blob_release_intents (not_before);
 CREATE INDEX blob_release_intents_digest_idx ON ingot.blob_release_intents (digest);
 
+-- The catalog walker's last completed walk per bucket, and the subtrees it
+-- remembers so a later walk reads only what changed.
+CREATE TABLE ingot.catalog_walks (
+    bucket                text   PRIMARY KEY REFERENCES ingot.buckets(name) ON DELETE CASCADE,
+    root_cid              bytea,
+    started_at            bigint NOT NULL,
+    finished_at           bigint NOT NULL,
+    live_bytes            bigint NOT NULL,
+    forge_bytes           bigint NOT NULL,
+    dead_on_arrival_bytes bigint NOT NULL,
+    unmeasured_bytes      bigint NOT NULL
+);
+CREATE TABLE ingot.catalog_walk_subtrees (
+    bucket    text   NOT NULL REFERENCES ingot.buckets(name) ON DELETE CASCADE,
+    cid       bytea  NOT NULL,
+    bytes     bigint NOT NULL,
+    blocks    bigint NOT NULL,
+    walked_at bigint NOT NULL,
+    PRIMARY KEY (bucket, cid)
+);
+
 -- Superseded MST node CIDs, recorded on overwrite/delete (§4, §9). Write-only
 -- this iteration — no catalog GC yet; a future collector consumes it.
 CREATE TABLE ingot.gc_candidates (

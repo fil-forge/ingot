@@ -77,6 +77,16 @@ type MemStore struct {
 	// uploadRegSeq numbers the rows the way the Postgres sequence does.
 	uploadRegs   []registry.UploadRegistration
 	uploadRegSeq int64
+	// catalogWalks and walkSubtrees are the catalog walker's tables, keyed
+	// by bucket (subtrees then by string(cid)).
+	catalogWalks map[string]registry.CatalogWalk
+	walkSubtrees map[string]map[string]walkSubtree
+}
+
+// walkSubtree is a catalog_walk_subtrees row.
+type walkSubtree struct {
+	registry.CatalogSubtree
+	walkedAt int64
 }
 
 // claimKey / locKey are the composite map keys for the blob_refs and the
@@ -111,6 +121,9 @@ func NewMemStore() *MemStore {
 		partTrees:  map[string]map[int]*registry.PartTree{},
 		gcCands:    map[string]struct{}{},
 		releases:   map[locKey]registry.PendingRelease{},
+
+		catalogWalks: map[string]registry.CatalogWalk{},
+		walkSubtrees: map[string]map[string]walkSubtree{},
 	}
 }
 
@@ -242,6 +255,9 @@ func (m *MemStore) Delete(_ context.Context, name string) error {
 	}
 	delete(m.buckets, name)
 	delete(m.verSeqs, name)
+	// The catalog walker's rows cascade on the bucket in Postgres too.
+	delete(m.catalogWalks, name)
+	delete(m.walkSubtrees, name)
 	// Postgres cascades upload_registrations on the bucket; do the same here
 	// so a queued change cannot outlive the bucket it belongs to in one
 	// backend and not the other.
@@ -411,6 +427,66 @@ func (m *MemStore) MarkSegmentShipped(_ context.Context, plane blockstore.Plane,
 	return nil
 }
 
+// CatalogSubtrees returns the subtrees remembered for bucket.
+func (m *MemStore) CatalogSubtrees(_ context.Context, bucket string) ([]registry.CatalogSubtree, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []registry.CatalogSubtree
+	for _, st := range m.walkSubtrees[bucket] {
+		out = append(out, st.CatalogSubtree)
+	}
+	return out, nil
+}
+
+// PutCatalogSubtrees remembers subtrees for bucket, keeping each row's
+// latest walkedAt, as the Postgres upsert does.
+func (m *MemStore) PutCatalogSubtrees(_ context.Context, bucket string, walkedAt int64, subtrees []registry.CatalogSubtree) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.buckets[bucket]; !ok {
+		return fmt.Errorf("inmem: catalog subtrees of missing bucket %q", bucket)
+	}
+	rows := m.walkSubtrees[bucket]
+	if rows == nil {
+		rows = map[string]walkSubtree{}
+		m.walkSubtrees[bucket] = rows
+	}
+	for _, st := range subtrees {
+		key := string(st.CID.Bytes())
+		at := walkedAt
+		if old, ok := rows[key]; ok && old.walkedAt > at {
+			at = old.walkedAt
+		}
+		rows[key] = walkSubtree{CatalogSubtree: st, walkedAt: at}
+	}
+	return nil
+}
+
+// CompleteCatalogWalk records w and prunes the bucket's subtrees the walk
+// didn't use.
+func (m *MemStore) CompleteCatalogWalk(_ context.Context, bucket string, w registry.CatalogWalk, used []cid.Cid) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.buckets[bucket]; !ok {
+		return fmt.Errorf("inmem: catalog walk of missing bucket %q", bucket)
+	}
+	m.catalogWalks[bucket] = w
+	rows := m.walkSubtrees[bucket]
+	for _, c := range used {
+		key := string(c.Bytes())
+		if st, ok := rows[key]; ok && st.walkedAt < w.StartedAt {
+			st.walkedAt = w.StartedAt
+			rows[key] = st
+		}
+	}
+	for key, st := range rows {
+		if st.walkedAt < w.StartedAt {
+			delete(rows, key)
+		}
+	}
+	return nil
+}
+
 // CatalogUsage sums each bucket's shipped catalog segments, as the Postgres
 // query does: those whose ship registered blobs (IndexDigest set).
 func (m *MemStore) CatalogUsage(_ context.Context) ([]registry.CatalogUsage, error) {
@@ -427,7 +503,10 @@ func (m *MemStore) CatalogUsage(_ context.Context) ([]registry.CatalogUsage, err
 		}
 		u, ok := byBucket[r.Bucket]
 		if !ok {
-			u = &registry.CatalogUsage{Bucket: r.Bucket, Space: b.Space}
+			u = &registry.CatalogUsage{Bucket: r.Bucket, Space: b.Space, Root: b.Root}
+			if w, ok := m.catalogWalks[r.Bucket]; ok {
+				u.Walk = &w
+			}
 			byBucket[r.Bucket] = u
 		}
 		u.Bytes += r.Size

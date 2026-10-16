@@ -166,6 +166,20 @@ type Config struct {
 	// (true).
 	CacheWrites *bool `mapstructure:"cache_writes" yaml:"cache_writes"`
 
+	// CatalogWalkInterval is the least time between two walks of a bucket's
+	// live catalog (Go duration string). The walk measures how much of the
+	// catalog storage a bucket holds on Forge is still reachable from its
+	// root, for the ingot.catalog.* gauges. A bucket is walked only after its
+	// root has changed, and only within an hour of a request in it: the walk
+	// borrows that request's authority to read the bucket's catalog from
+	// Forge. Empty → default 6h; a negative duration turns the walker off.
+	CatalogWalkInterval string `mapstructure:"catalog_walk_interval" yaml:"catalog_walk_interval"`
+	// CatalogWalkRate is the most catalog blocks a walk reads per second,
+	// locally or from Forge. A walk reads only the parts of a catalog that
+	// changed since the bucket's last walk. 0 → default 100; negative is an
+	// error.
+	CatalogWalkRate int `mapstructure:"catalog_walk_rate" yaml:"catalog_walk_rate"`
+
 	// CatalogPlane overrides the catalog logstore pipeline knobs. Any field
 	// left zero/unset falls back to the top-level SealBytes / SealAge / Retain
 	// (and Ship defaults to true) — e.g. to configure the catalog never to ship.
@@ -268,6 +282,16 @@ func (c Config) ServerConfig() (ServerConfig, error) {
 	if c.LocalBlobMaxBytes < 0 {
 		return ServerConfig{}, fmt.Errorf("ingot: local_blob_max_bytes %d: must not be negative (0 means no budget)", c.LocalBlobMaxBytes)
 	}
+	var walkInterval time.Duration
+	if c.CatalogWalkInterval != "" {
+		walkInterval, err = time.ParseDuration(c.CatalogWalkInterval)
+		if err != nil {
+			return ServerConfig{}, fmt.Errorf("ingot: parse catalog_walk_interval %q: %w", c.CatalogWalkInterval, err)
+		}
+	}
+	if c.CatalogWalkRate < 0 {
+		return ServerConfig{}, fmt.Errorf("ingot: catalog_walk_rate %d: must not be negative (0 means the default)", c.CatalogWalkRate)
+	}
 	// Render the CORS configuration here — the single place it is built —
 	// so a typo fails at startup (via Validate) rather than from New.
 	corsCfg, err := cors.Build(c.CORSAllowedOrigins)
@@ -302,6 +326,9 @@ func (c Config) ServerConfig() (ServerConfig, error) {
 		DropAcceptedBodies: c.CacheWrites != nil && !*c.CacheWrites,
 
 		AllowNoneEncryption: c.Encryption.AllowNone,
+
+		CatalogWalkInterval: walkInterval,
+		CatalogWalkRate:     c.CatalogWalkRate,
 	}, nil
 }
 
