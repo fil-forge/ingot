@@ -204,7 +204,9 @@ park, and the second finds the location.
 new parts, and waits for the upload's acceptor to finish, up to 30 s
 (`acceptWaitBudget`), or less when the acceptor's last pass failed. It then
 reads the parts it was asked to commit. A `spooled` part is concluded, or
-uploaded from its spool copy if it never parked, by Complete itself. A part
+uploaded from its spool copy if it never parked, by Complete itself; before
+uploading, Complete rechecks for a park under the blob's lock, since the
+part's UploadPart may still be parking it. A part
 still `parked` means the acceptor is behind or failing, and Complete answers
 OperationAborted, a 409; the latch reverts to `open` and the acceptor
 carries on. The AWS CLI and other botocore-based clients treat that 409 as

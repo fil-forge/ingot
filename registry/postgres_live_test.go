@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"reflect"
 	"testing"
@@ -1123,5 +1124,71 @@ func TestDeletingABucketCascadesItsUploadRegistrations(t *testing.T) {
 	}
 	if len(left) != 0 {
 		t.Fatalf("%d registrations outlived their bucket", len(left))
+	}
+}
+
+// TestConcurrentAddBlobClaimsLive runs two commits claiming the same
+// thousands of digests at once, many times over, one listing them in reverse.
+// AddBlobClaims takes a claim-key lock per digest, so the two take
+// overlapping lock sets and must take them in one order whatever order their
+// claims arrive in, or Postgres aborts one with a deadlock error.
+//
+//	INGOT_TEST_DSN=postgres://... GOWORK=off go test ./registry/ -run ConcurrentAddBlobClaims -v
+func TestConcurrentAddBlobClaimsLive(t *testing.T) {
+	dsn := os.Getenv("INGOT_TEST_DSN")
+	if dsn == "" {
+		t.Skip("set INGOT_TEST_DSN to run the live Postgres store test")
+	}
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("pool: %v", err)
+	}
+	defer pool.Close()
+	if err := migrations.Up(ctx, pool, zaptest.NewLogger(t)); err != nil {
+		t.Fatalf("migrations: %v", err)
+	}
+	r := registry.NewPostgres(pool)
+	space := testutil.RandomDID(t)
+
+	const n = 2000
+	digests := make([]multihash.Multihash, n)
+	for i := range digests {
+		d, err := multihash.Sum([]byte(fmt.Sprintf("concurrent-claims-%s-%d", space, i)), multihash.SHA2_256, -1)
+		if err != nil {
+			t.Fatalf("multihash: %v", err)
+		}
+		digests[i] = d
+		if err := r.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: d, Provider: "did:key:p", URL: "http://p/blob", Size: 1}); err != nil {
+			t.Fatalf("PutLocation: %v", err)
+		}
+	}
+	claims := func(version string, reversed bool) []registry.BlobClaim {
+		out := make([]registry.BlobClaim, n)
+		for i, d := range digests {
+			j := i
+			if reversed {
+				j = n - 1 - i
+			}
+			out[j] = registry.BlobClaim{Digest: d, Bucket: "bk", ObjectKey: "k", VersionID: version, Space: space}
+		}
+		return out
+	}
+
+	for round := 0; round < 10; round++ {
+		errs := make(chan error, 2)
+		for w := 0; w < 2; w++ {
+			go func(version string, reversed bool) {
+				errs <- r.AddBlobClaims(ctx, claims(version, reversed))
+			}(fmt.Sprintf("r%d-w%d", round, w), w == 1)
+		}
+		for w := 0; w < 2; w++ {
+			if err := <-errs; err != nil {
+				t.Fatalf("round %d: AddBlobClaims: %v", round, err)
+			}
+		}
+	}
+	if c, err := r.CountClaims(ctx, space, digests[0]); err != nil || c != 20 {
+		t.Fatalf("claims on the first digest = %d, %v; want 20", c, err)
 	}
 }

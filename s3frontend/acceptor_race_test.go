@@ -3,9 +3,11 @@ package s3frontend
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -408,4 +410,86 @@ func TestAcceptorRacesASupersedesRelease(t *testing.T) {
 	if got, _ := mem.ReleasingDigests(ctx, did.Undef, []multihash.Multihash{old}); got[string(old)] {
 		t.Fatalf("release record for %s left behind", old)
 	}
+}
+
+// uploadCountingParker is a parking uploader that counts UploadBlob calls:
+// each is one allocation on the provider.
+type uploadCountingParker struct {
+	parkingUploader
+	uploads atomic.Int32
+}
+
+func (u *uploadCountingParker) UploadBlob(ctx context.Context, space did.DID, digest multihash.Multihash, size int64, path string, opts ...uploader.UploadOption) (uploader.UploadedBlob, error) {
+	u.uploads.Add(1)
+	return u.parkingUploader.UploadBlob(ctx, space, digest, size, path, opts...)
+}
+
+// parkNotYetVisible is a park store whose next lookup of digest misses, as
+// when Complete classifies a blob its UploadPart is still parking.
+type parkNotYetVisible struct {
+	registry.ParkStore
+	mu     sync.Mutex
+	digest multihash.Multihash
+}
+
+func (p *parkNotYetVisible) GetPark(ctx context.Context, space did.DID, digest multihash.Multihash) (*registry.BlobPark, error) {
+	p.mu.Lock()
+	miss := p.digest != nil && bytes.Equal(p.digest, digest)
+	if miss {
+		p.digest = nil
+	}
+	p.mu.Unlock()
+	if miss {
+		return nil, registry.ErrNotFound
+	}
+	return p.ParkStore.GetPark(ctx, space, digest)
+}
+
+// TestCompleteConcludesAParkThatLandsMidComplete: Complete finds a spooled
+// part's blob with no park, as when its UploadPart is still parking, and
+// falls back to uploading it. Under the blob's lock the park is there after
+// all, and Complete concludes it rather than allocating a second copy beside
+// it, whose park would then never be concluded or aborted.
+func TestCompleteConcludesAParkThatLandsMidComplete(t *testing.T) {
+	up := &uploadCountingParker{}
+	parts := &failOnceMoveToParked{}
+	parks := &parkNotYetVisible{}
+	b, mem := newDeferredBackend(t, up, func(d *Deps) {
+		parts.MultipartStore = d.Multipart
+		d.Multipart = parts
+		parks.ParkStore = d.Parks
+		d.Parks = parks
+	})
+	key := "park-lands-mid-complete"
+	uploadID := mpCreate(t, b, key, "", "")
+
+	parts.mu.Lock()
+	parts.armed = true
+	parts.mu.Unlock()
+	body := testBody(int(backend.MinPartSize))
+	if _, err := mpUploadPart(t, b, key, uploadID, 1, body, nil); err == nil {
+		t.Fatal("UploadPart succeeded although its part could not be queued")
+	}
+	part := partRecord(t, mem, uploadID, 1)
+	if part.State != registry.PartSpooled {
+		t.Fatalf("part state = %q, want spooled", part.State)
+	}
+	d := part.BlobDigests[0]
+	if _, err := mem.ParkByDigest(context.Background(), d); err != nil {
+		t.Fatalf("the part's park: %v", err)
+	}
+	allocations := up.uploads.Load()
+
+	parks.mu.Lock()
+	parks.digest = d
+	parks.mu.Unlock()
+	etag := `"` + hex.EncodeToString(part.ETagMD5) + `"`
+	one := int32(1)
+	if _, err := mpComplete(t, b, key, uploadID, []types.CompletedPart{{PartNumber: &one, ETag: &etag}}, nil); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if n := up.uploads.Load(); n != allocations {
+		t.Fatalf("Complete allocated %d more copies of a parked blob, want none", n-allocations)
+	}
+	assertAcceptedAndUnparked(t, mem, d)
 }

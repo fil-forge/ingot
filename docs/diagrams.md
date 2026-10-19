@@ -575,7 +575,9 @@ sequenceDiagram
   checks the state; a teardown that took the session refuses it, and the
   upload records releases for the blobs it had spooled.
 - A never-parked blob at Complete falls back to a full synchronous
-  `UploadBlob`.
+  `UploadBlob`, after rechecking for a park under the blob's lock: an
+  UploadPart still parking the blob when Complete classified it holds that
+  lock, and its park is concluded rather than allocated beside.
 
 Cross-references: [`architecture.md` §7.2](./architecture.md#72-multipart),
 [§7.3](./architecture.md#73-the-session-latch-the-abortcomplete-race).

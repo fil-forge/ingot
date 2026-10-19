@@ -1538,23 +1538,41 @@ func (b *Backend) concludeBlobs(ctx context.Context, space did.DID, blobs []msbu
 	for i, blob := range blobs {
 		digests[i] = blob.Digest
 	}
-	neverParked, err := b.acceptParked(ctx, space, digests, acceptForCommit)
-	if err != nil {
-		return err
-	}
-	// Never parked: the spooled copy drives the whole synchronous upload.
-	todo := digestSet(neverParked)
-	for _, blob := range blobs {
-		if _, ok := todo[string(blob.Digest)]; !ok {
-			continue
-		}
-		delete(todo, string(blob.Digest))
-		if err := b.uploadNeverParked(ctx, space, blob); err != nil {
+	// A blob found unparked may be in the middle of being parked by its own
+	// UploadPart, whose part row is written before its park: the upload
+	// below finds such a park once it holds the blob's lock, and hands the
+	// blob back to be concluded instead. Each round needs a park to appear
+	// after classification, which one in-flight write allows once.
+	for round := 0; round < concludeRounds && len(digests) > 0; round++ {
+		neverParked, err := b.acceptParked(ctx, space, digests, acceptForCommit)
+		if err != nil {
 			return err
 		}
+		// Never parked: the spooled copy drives the whole synchronous upload.
+		todo := digestSet(neverParked)
+		digests = nil
+		for _, blob := range blobs {
+			if _, ok := todo[string(blob.Digest)]; !ok {
+				continue
+			}
+			delete(todo, string(blob.Digest))
+			parked, err := b.uploadNeverParked(ctx, space, blob)
+			if err != nil {
+				return err
+			}
+			if parked {
+				digests = append(digests, blob.Digest)
+			}
+		}
+	}
+	if len(digests) > 0 {
+		return fmt.Errorf("conclude blobs: %d blobs still parking after %d rounds", len(digests), concludeRounds)
 	}
 	return nil
 }
+
+// concludeRounds bounds concludeBlobs' rounds of conclude and upload.
+const concludeRounds = 3
 
 // acceptMode is how acceptParked treats a digest with a release record.
 type acceptMode int
@@ -1758,37 +1776,47 @@ func (b *Backend) recordConcluded(ctx context.Context, space did.DID, parked upl
 // uploadNeverParked is Complete's fallback for a part blob that never
 // parked, under the (space, digest) lock that every write of the bytes
 // takes (see Backend.blobKeys), so a part upload of the same bytes meanwhile
-// finds this upload's location rather than allocating beside it.
-func (b *Backend) uploadNeverParked(ctx context.Context, space did.DID, blob msbucket.BlobRef) error {
+// finds this upload's location rather than allocating beside it. A park
+// that appeared while this waited for the lock (its UploadPart was still
+// parking when Complete classified the blob) is reported instead of
+// uploaded beside, for the caller to conclude: a second allocation would
+// leave the park's own never concluded or aborted. Parking holds the same
+// lock throughout, so the park, if any, is visible here.
+func (b *Backend) uploadNeverParked(ctx context.Context, space did.DID, blob msbucket.BlobRef) (parked bool, err error) {
 	defer b.blobKeys.Lock(blobKey(space, blob.Digest))()
 	// Settled under the lock, as uploadBlob does: the settle at
 	// classification ran outside it, and a release can have started since.
 	settled, err := b.settleRelease(ctx, space, blob.Digest)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if existing, err := b.locations.GetLocation(ctx, space, blob.Digest); err == nil && existing != nil && settled {
 		// Located while this waited for the lock.
-		return b.intents.SetIntentState(ctx, space, blob.Digest, registry.IntentAccepted)
+		return false, b.intents.SetIntentState(ctx, space, blob.Digest, registry.IntentAccepted)
 	} else if err != nil && !errors.Is(err, registry.ErrNotFound) {
-		return fmt.Errorf("lookup location: %w", err)
+		return false, fmt.Errorf("lookup location: %w", err)
+	}
+	if park, err := b.parks.GetPark(ctx, space, blob.Digest); err == nil && park != nil {
+		return true, nil
+	} else if err != nil && !errors.Is(err, registry.ErrNotFound) {
+		return false, fmt.Errorf("lookup park: %w", err)
 	}
 	in, err := b.intents.GetIntent(ctx, space, blob.Digest)
 	if err != nil {
-		return fmt.Errorf("lookup intent: %w", err)
+		return false, fmt.Errorf("lookup intent: %w", err)
 	}
 	// The blob may be on the network from here on (see IntentUploading).
 	if err := b.intents.SetIntentState(ctx, space, blob.Digest, registry.IntentUploading); err != nil {
-		return fmt.Errorf("mark uploading: %w", err)
+		return false, fmt.Errorf("mark uploading: %w", err)
 	}
 	res, err := b.uploader.UploadBlob(ctx, space, blob.Digest, in.Size, b.spool.Path(blob.Digest))
 	if err != nil {
-		return fmt.Errorf("upload blob: %w", err)
+		return false, fmt.Errorf("upload blob: %w", err)
 	}
 	if res.Location == nil {
-		return fmt.Errorf("upload blob %x: concluding upload returned no location", blob.Digest)
+		return false, fmt.Errorf("upload blob %x: concluding upload returned no location", blob.Digest)
 	}
-	return b.recordAccepted(ctx, space, blob.Digest, *res.Location, nil)
+	return false, b.recordAccepted(ctx, space, blob.Digest, *res.Location, nil)
 }
 
 // recordAccepted persists an accepted blob's location and marks its intent.

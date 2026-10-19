@@ -59,12 +59,13 @@ func (r *Postgres) AddBlobClaims(ctx context.Context, claims []BlobClaim) error 
 		return fmt.Errorf("registry: begin add blob claims: %w", err)
 	}
 	defer tx.Rollback(ctx)
-	// The claim-key locks, in digest order: a plain unnest yields the rows
-	// in array order, and the arrays are sorted. The key is lockClaimKey's.
-	if _, err := tx.Exec(ctx,
-		`SELECT pg_advisory_xact_lock(hashtextextended(u.s || ':' || encode(u.d, 'hex'), 0))
-		   FROM unnest($1::text[], $2::bytea[]) AS u(s, d)`,
-		spaces, digests); err != nil {
+	// The claim-key locks, in digest order, as every caller taking several
+	// keys takes them (the key is lockClaimKey's). The arrays are sorted, and
+	// the subquery's ORDER BY carries that order to the lock calls: SQL
+	// promises no row order otherwise, and a subquery with an ORDER BY is
+	// not flattened, so the outer scan reads it sorted and takes one lock
+	// per row in turn.
+	if _, err := tx.Exec(ctx, claimKeyLocksSQL, spaces, digests); err != nil {
 		return fmt.Errorf("registry: lock claim keys: %w", err)
 	}
 	// Under the locks: refused while a started release holds any digest, or
@@ -107,6 +108,13 @@ func (r *Postgres) AddBlobClaims(ctx context.Context, claims []BlobClaim) error 
 	}
 	return nil
 }
+
+// claimKeyLocksSQL takes the claim-key lock of each (space, digest) pair in
+// the order of the arrays $1 and $2 (see AddBlobClaims).
+const claimKeyLocksSQL = `SELECT pg_advisory_xact_lock(o.k)
+  FROM (SELECT hashtextextended(u.s || ':' || encode(u.d, 'hex'), 0) AS k
+          FROM unnest($1::text[], $2::bytea[]) WITH ORDINALITY AS u(s, d, i)
+         ORDER BY u.i) AS o`
 
 // lockClaimKey takes a transaction-scoped advisory lock on (space, digest):
 // the mutual exclusion between pinning a claim and dropping the last one,
