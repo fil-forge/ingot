@@ -33,7 +33,10 @@ var allowedMethods = []auth.CORSHTTPMethod{
 // preflight controller doesn't apply versitygw's ensureExposeETag
 // fallback; the x-amz-* set covers request tracing and versioning; x-cid
 // is the object's BLAKE3 CID on GET and HEAD (s3frontend.setCIDHeader),
-// which a browser client can only read when it is exposed here.
+// which a browser client can only read when it is exposed here. The two
+// range headers are what a ranged read is answered with: a browser client
+// verifying blocks against the Blake3 attribute reads Content-Range to
+// learn which bytes it got, and neither is on the CORS safelist.
 var exposeHeaders = []auth.CORSHeader{
 	"ETag",
 	"x-amz-storage-class",
@@ -41,6 +44,8 @@ var exposeHeaders = []auth.CORSHeader{
 	"x-amz-id-2",
 	"x-amz-version-id",
 	"x-cid",
+	"Accept-Ranges",
+	"Content-Range",
 }
 
 // maxAgeSeconds caps how long a browser may cache a preflight result.
