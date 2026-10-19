@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -23,7 +24,10 @@ import (
 //   - no row, CAR present → orphan (crashed before the row, or a row-lost
 //     sealed segment): rebuild as open + insert row; force-sealed by
 //     openPlaneLog.
-//   - row present, no CAR → delete the row.
+//   - row sealed, no CAR → retire the row: a crash between retention's
+//     unlink and its retired stamp, or a lost file. The row stays the
+//     record of what the segment may have registered in the space.
+//   - row open, no CAR → delete the row.
 //   - sidecar (.idx/.ops) with no CAR → stray; unlink.
 func (pl *PlaneLog) recover(ctx context.Context) error {
 	rows, err := pl.meta.ListSegments(ctx, pl.plane, pl.bucket)
@@ -128,9 +132,20 @@ func (pl *PlaneLog) recover(ctx context.Context) error {
 		removeSegmentFiles(pl.dir, seq, pl.plane)
 	}
 
-	// DB rows without an on-disk CAR → converge by deleting the row.
-	for seq := range dbBySeq {
+	// DB rows without an on-disk CAR. A sealed row converges to retired, so
+	// DeleteBucket still releases whatever its ship registered; an open row
+	// never shipped, so it is deleted.
+	now := time.Now().Unix()
+	for seq, row := range dbBySeq {
 		if _, ok := carPresent[seq]; ok {
+			continue
+		}
+		if row.State == StateSealed {
+			pl.logger.Warn("logstore: sealed segment row without on-disk file; retiring row",
+				zap.Stringer("plane", pl.plane), zap.Uint64("seq", seq))
+			if err := pl.meta.RetireSegment(ctx, pl.plane, seq, now); err != nil {
+				return fmt.Errorf("logstore: retire orphan %s row %d: %w", pl.plane, seq, err)
+			}
 			continue
 		}
 		pl.logger.Error("logstore: DB segment row without on-disk file; deleting row",
