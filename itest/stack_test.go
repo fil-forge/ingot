@@ -354,11 +354,35 @@ var hiltPolicyPermissions = []string{
 	"s3:DeleteBucketPolicy",
 }
 
+// hiltEncryptionPermissions guard the bucket encryption configuration. The
+// published hilt image does not know them until fil-forge/hilt#101 merges
+// (it classifies the ?encryption operations as the plain bucket operations,
+// so s3:CreateBucket and s3:DeleteBucket let them through), so the test key
+// carries them only when [encryptionPermissionsEnabled]; fold them into
+// hiltAllPermissions then.
+var hiltEncryptionPermissions = []string{
+	"s3:GetEncryptionConfiguration",
+	"s3:PutEncryptionConfiguration",
+}
+
+// hiltOverridden reports whether the stack's hilt comes from a local override
+// rather than the published image.
+func hiltOverridden() bool {
+	return os.Getenv("INGOT_ITEST_HILT_BINARY") != "" || os.Getenv("INGOT_ITEST_HILT_IMAGE") != ""
+}
+
 // iamScenariosEnabled reports whether the stack's hilt carries the IAM
 // changes: a hilt override is in use, or INGOT_ITEST_IAM=1 says the image
 // has them.
 func iamScenariosEnabled() bool {
-	return os.Getenv("INGOT_ITEST_IAM") == "1" || os.Getenv("INGOT_ITEST_HILT_BINARY") != "" || os.Getenv("INGOT_ITEST_HILT_IMAGE") != ""
+	return os.Getenv("INGOT_ITEST_IAM") == "1" || hiltOverridden()
+}
+
+// encryptionPermissionsEnabled reports whether the stack's hilt knows the
+// bucket encryption permissions: a hilt override is in use, or
+// INGOT_ITEST_ENCRYPTION_PERMS=1 says the image has them.
+func encryptionPermissionsEnabled() bool {
+	return os.Getenv("INGOT_ITEST_ENCRYPTION_PERMS") == "1" || hiltOverridden()
 }
 
 // hiltProvisionTenant provisions tenantID in hilt with an all-permission
@@ -398,9 +422,12 @@ func hiltProvisionTenantErr(ctx context.Context, s *stack.Stack, tenantID string
 		return "", "", fmt.Errorf("hilt provision tenant %q: %w (stdout=%s stderr=%s)", tenantID, err, out, errOut)
 	}
 
-	permissions := hiltAllPermissions
+	permissions := slices.Clone(hiltAllPermissions)
 	if iamScenariosEnabled() {
-		permissions = append(slices.Clone(permissions), hiltPolicyPermissions...)
+		permissions = append(permissions, hiltPolicyPermissions...)
+	}
+	if encryptionPermissionsEnabled() {
+		permissions = append(permissions, hiltEncryptionPermissions...)
 	}
 	keyReq, err := json.Marshal(map[string]any{
 		"name":        "itest",
