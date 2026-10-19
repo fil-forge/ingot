@@ -42,6 +42,9 @@ type Layered struct {
 	// blobReads counts body-blob reads by the tier that served them; nil
 	// until CountBlobReads.
 	blobReads metric.Int64Counter
+	// onRead sees every read's context and space before it is served; nil
+	// until OnRead.
+	onRead func(ctx context.Context, space did.DID)
 }
 
 // NewLayered wires the local blob copies and the log in front of a base
@@ -62,6 +65,21 @@ func (l *Layered) CountBlobReads(meter metric.Meter) error {
 	}
 	l.blobReads = c
 	return nil
+}
+
+// OnRead has fn see the context and space of every read before it is
+// served, whichever tier serves it: block, typed and blob reads alike. The
+// catalog walker borrows a request's read authority for its space this way.
+// Call it before the first read.
+func (l *Layered) OnRead(fn func(ctx context.Context, space did.DID)) {
+	l.onRead = fn
+}
+
+// observeRead hands a read to the OnRead hook, if any.
+func (l *Layered) observeRead(ctx context.Context, space did.DID) {
+	if l.onRead != nil {
+		l.onRead(ctx, space)
+	}
 }
 
 var (
@@ -89,6 +107,7 @@ func (l *Layered) Get(ctx context.Context, space did.DID, c cid.Cid, out any) er
 // GetBlock fetches a raw block: local → log → base. Only the network
 // base consults the space; the local tiers are content-addressed.
 func (l *Layered) GetBlock(ctx context.Context, space did.DID, c cid.Cid) (blk block.Block, retErr error) {
+	l.observeRead(ctx, space)
 	if l.local != nil {
 		b, err := l.local.GetBlock(ctx, space, c)
 		if err == nil {
@@ -118,6 +137,7 @@ func (l *Layered) GetBlock(ctx context.Context, space did.DID, c cid.Cid) (blk b
 // don't implement BlobReader are treated as a miss. Returns ErrNotFound if no
 // tier has the blob.
 func (l *Layered) OpenBlob(ctx context.Context, space did.DID, digest mh.Multihash) (io.ReadCloser, error) {
+	l.observeRead(ctx, space)
 	if br, ok := l.local.(BlobReader); ok {
 		rc, err := br.OpenBlob(ctx, space, digest)
 		if err == nil {
@@ -143,6 +163,7 @@ func (l *Layered) OpenBlob(ctx context.Context, space did.DID, digest mh.Multiha
 // implements only BlobReader is served through OpenBlob with the prefix
 // discarded (OpenBlobRangeOf).
 func (l *Layered) OpenBlobRange(ctx context.Context, space did.DID, digest mh.Multihash, start, end int64) (io.ReadCloser, error) {
+	l.observeRead(ctx, space)
 	if br, ok := l.local.(BlobReader); ok {
 		rc, err := OpenBlobRangeOf(ctx, br, space, digest, start, end)
 		if err == nil {

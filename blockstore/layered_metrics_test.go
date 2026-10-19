@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/fil-forge/ucantone/did"
+	"github.com/ipfs/go-cid"
 	"go.opentelemetry.io/otel/attribute"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
@@ -51,5 +52,44 @@ func TestLayered_CountBlobReadsByTier(t *testing.T) {
 	}
 	if want := map[string]int64{"local": 2, "network": 2}; len(got) != 2 || got["local"] != want["local"] || got["network"] != want["network"] {
 		t.Fatalf("ingot.local_blobs.reads by tier = %v, want %v", got, want)
+	}
+}
+
+// TestLayered_OnReadSeesEveryRead: the OnRead hook sees the space of block,
+// typed and blob reads, before the read is served and whether or not it is.
+func TestLayered_OnReadSeesEveryRead(t *testing.T) {
+	space, err := did.Parse("did:web:onread.example")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	digest := mustDigest(t, []byte("blob"))
+	l := NewLayered(fakeBlobTier{data: []byte("local")}, nil, fakeBlobTier{})
+	var seen []did.DID
+	l.OnRead(func(_ context.Context, s did.DID) { seen = append(seen, s) })
+
+	ctx := context.Background()
+	if _, err := l.GetBlock(ctx, space, cid.NewCidV1(cid.DagCBOR, mustDigest(t, []byte("missing")))); err == nil {
+		t.Fatal("GetBlock of a missing block succeeded")
+	}
+	var out any
+	_ = l.Get(ctx, space, cid.NewCidV1(cid.DagCBOR, mustDigest(t, []byte("missing too"))), &out)
+	rc, err := l.OpenBlob(ctx, space, digest)
+	if err != nil {
+		t.Fatalf("OpenBlob: %v", err)
+	}
+	_ = rc.Close()
+	rc, err = l.OpenBlobRange(ctx, space, digest, 0, 1)
+	if err != nil {
+		t.Fatalf("OpenBlobRange: %v", err)
+	}
+	_ = rc.Close()
+
+	if len(seen) != 4 {
+		t.Fatalf("OnRead saw %d reads, want 4", len(seen))
+	}
+	for _, s := range seen {
+		if s != space {
+			t.Fatalf("OnRead saw space %s, want %s", s, space)
+		}
 	}
 }

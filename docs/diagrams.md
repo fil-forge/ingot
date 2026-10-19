@@ -126,6 +126,8 @@ flowchart TB
         cmd["cmd<br/>serve, whoami, version, blake3"]
     end
 
+    cw["catalogwalk<br/>Walker, Authority"]
+
     vgw -->|"backend.Backend"| s3f
     vgw -->|"auth.IAMService +<br/>RequestIAMService"| iam
     s3f --> bop
@@ -146,6 +148,9 @@ flowchart TB
     cmd --> root
     root --> vgw
     root -->|"BlockReader =<br/>Cached(Forge)"| bs
+    root --> cw
+    cw -->|"BlockReader (Layered)"| bs
+    cw -->|"CatalogUsageStore,<br/>CatalogWalkStore"| reg
 ```
 
 - `registry.Postgres` is one struct satisfying the registry seams
@@ -294,7 +299,7 @@ sequenceDiagram
             B->>B: BlobCache.Take: the file moves from the spool to the cache
         end
     end
-    Note over B,U: UploadBlob also captures the request proof store as the<br/>space's ship authority (captureShipProofs, 1h TTL)
+    Note over B,U: UploadBlob also captures the request proof store, if borrowable,<br/>as the space's ship authority (captureShipProofs, 1h TTL)
     Note over B,L: under the per-bucket lock: commitVersion via Coordinator.WithTx
     B->>TX: Begin (lock, snapshot root)
     TX->>R: AllocVersionSeq
@@ -375,8 +380,9 @@ sequenceDiagram
 - That chain has room to spare — hilt expires its delegation to the gateway at
   the next UTC midnight plus an async overhang, so even a change queued at
   23:59 has hours to be drained in. For the queue that outlasts that, the
-  sweeper renews from the space's live authority, which a recent write leaves
-  behind. A space that has gone quiet has none, and after
+  sweeper renews from the space's live authority, which a recent body upload
+  with a borrowable store leaves behind and a revocation can drop. A space
+  that has gone quiet has none, and after
   `uploadRegistrationDeadLetterAfter` attempts the row is **dead-lettered**:
   out of the sweep, and out of the way of its key's later rows. (Nothing to do
   with a parked blob, which is durable and awaiting its accept.) The count is then short by
@@ -810,14 +816,17 @@ flowchart TB
     subgraph stores["proof stores"]
         kp["iam.KeyProofs: one DelegationCache<br/>per access key, 24h idle eviction;<br/>also the key's effective S3 action set per bucket"]
         ship["uploader.Forge shipProofs:<br/>per-space store, 1h TTL"]
+        walk["catalogwalk.Authority:<br/>per-space store, 1h past the last read"]
         static["AuthServiceProofs:<br/>static container from config"]
         tok["tokenstore (tokens.cbor):<br/>empty; dormant login paths only"]
     end
 
     kp -->|"reqscope.ProofStore<br/>on the request ctx"| writes["uploader:<br/>/blob/add, abort, remove, /index/add<br/>/upload/add, /upload/remove"]
     kp -->|"same store"| reads["blockstore.Forge:<br/>content/retrieve"]
-    kp -->|"captureShipProofs<br/>at UploadBlob"| ship
+    kp -->|"captureShipProofs on body uploads,<br/>borrowable stores only"| ship
     ship --> async["async catalog ship;<br/>sweeper and DeleteBucket aborts"]
+    kp -->|"Capture on every read in a space<br/>(Layered.OnRead), borrowable stores only"| walk
+    walk --> walker["catalog walker:<br/>content/retrieve of the bucket's catalog"]
     static --> hc["hilt client:<br/>every /s3/* invocation"]
 
     classDef external stroke-dasharray: 5 5
@@ -830,9 +839,25 @@ flowchart TB
   account is disabled, so no access-key auth path skips the hilt-backed IAM
   lookup. `/health` and the DID document are outside the S3 auth chain, and a
   rejected access key never receives one.
-- A bucket whose last write is more than an hour old has an expired ship
-  authority; a newly sealed segment then waits for the bucket's next write to
-  re-capture it.
+- The uploader's ship authority and the catalog walker hold a request's
+  store past the request under the same rules
+  (`reqscope.BorrowableProofStore`): only a store the IAM layer marked
+  `reqscope.Borrowable`, the key's own `DelegationCache`, is taken. A
+  revocation that drops the key's store marks it `Dropped`, and a dropped
+  store is neither taken nor used (`reqscope.StillBorrowable`). A request
+  authorized off a response carrying a revoked delegation spends a store of
+  its own, which is not marked.
+- A bucket whose last body upload is more than an hour old, or whose
+  captured store a revocation has dropped, has no ship authority; a newly
+  sealed segment then waits for a body upload with a borrowable store to
+  re-capture it. A delete, a zero-byte put, a put of content already stored
+  or a multipart completion uploads no body. Until then the space's
+  upload-registration renewals and the sweepers' aborts and removals wait
+  too.
+- The catalog walker borrows read authority from any request's reads in the
+  space (hilt grants `/content/retrieve` with every catalog write as well as
+  every read and list), and only a store that proves `/content/retrieve` on
+  the space to the agent.
 - Each access key gets its own `DelegationCache`, so a proof chain can never
   assemble across keys.
 - The same store holds the effective S3 action set hilt reported for the key
@@ -848,7 +873,8 @@ Cross-references: [`architecture.md` §9](./architecture.md#9-the-system-contrac
 
 Sources: `iam/service.go`, `iam/keyproofs.go`, `iam/proofcache.go`,
 `internal/reqscope/reqscope.go`, `uploader/forge.go` (shipProofs,
-captureShipProofs), `module.go`, `config/config.go` (auth_service fields).
+captureShipProofs), `catalogwalk/authority.go`, `blockstore/layered.go`
+(OnRead), `module.go`, `config/config.go` (auth_service fields).
 Review when these change.
 
 ## Request authorization and proof capture
@@ -892,7 +918,7 @@ sequenceDiagram
     end
     I-->>G: auth.Account with SigningKey (RoleAdmin)
     G->>G: re-verify the signature with the derived key<br/>(covers streaming per-chunk signatures hilt never sees)
-    G->>B: handler runs with reqscope.ProofStore on ctx
+    G->>B: handler runs with reqscope.ProofStore on ctx<br/>(marked Borrowable unless hilt's answer carried a revoked delegation)
 ```
 
 - The fast path has three outcomes: authorized, refused, or undecided. It
@@ -949,6 +975,7 @@ erDiagram
         bytea sha256
         bigint shipped_at
         bytea index_digest
+        bigint dead_bytes "dead on arrival; NULL = unmeasured"
         bigint retired_at
     }
     segment_op_roots {
@@ -1065,11 +1092,25 @@ erDiagram
         boolean id PK "single-row latch"
         timestamptz recorded_at "resume point in the revocation stream"
     }
+    catalog_walks {
+        text bucket PK, FK
+        bytea root_cid "the root the last completed walk reached"
+        bigint live_bytes
+        bigint forge_bytes "shipped bytes as of the walk's start"
+    }
+    catalog_walk_subtrees {
+        text bucket PK, FK
+        bytea cid PK "a catalog block with a large subtree"
+        bigint bytes "reachable from cid, once per link"
+        bytea children "nearest remembered subtrees inside it"
+    }
 
     segments ||--o{ segment_op_roots : "ON DELETE CASCADE"
     multipart_sessions ||--o{ multipart_parts : "ON DELETE CASCADE"
     multipart_parts ||--o| multipart_part_trees : "ON DELETE CASCADE; deleted by Complete once the object commits"
     buckets ||--o{ upload_registrations : "ON DELETE CASCADE"
+    buckets ||--o| catalog_walks : "ON DELETE CASCADE"
+    buckets ||--o{ catalog_walk_subtrees : "ON DELETE CASCADE"
     buckets ||..o{ segments : "by bucket name, no FK"
     buckets ||..o{ blob_refs : "by bucket name, no FK"
     blob_locations ||..o{ shard_inclusions : "by shard_digest"
@@ -1078,8 +1119,8 @@ erDiagram
     multipart_parts ||..o{ blob_release_intents : "teardown records, by digest"
 ```
 
-- The four solid relationships are the schema's only real foreign keys;
-  dashed ones are soft joins the code performs. `revocation_cursor` stands
+- The solid relationships are the schema's only real foreign keys; dashed
+  ones are soft joins the code performs. `revocation_cursor` stands
   alone.
 - `gc_candidates` is write-only (no reader exists yet; its entry paths are the
   [catalog GC candidates](#catalog-gc-candidates-what-gets-remembered-for-removal)
@@ -1163,6 +1204,7 @@ listed diagrams (each diagram's `Sources:` footer names its exact files).
 | `logstore/` | logstore-pipeline, segment-states, get, block-routes, delete-bucket |
 | `uploader/`, `forgeclient/` | context, put, multipart, principals, logstore-pipeline, block-routes |
 | `iam/`, `internal/reqscope/` | principals, authorize, context |
+| `catalogwalk/` | principals, packages |
 | `bucket/`, `mst/` | version-tree, put, get |
 | `migrations/sql/` | schema, plus any state diagram naming a changed CHECK |
 | `module.go`, `server.go`, `config/` | packages, context, logstore-pipeline; `server.go` also authorize |

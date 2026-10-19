@@ -691,6 +691,82 @@ type GCStore interface {
 	AddGCCandidate(ctx context.Context, cidBytes []byte, bucket string) error
 }
 
+// CatalogUsage is one bucket's catalog storage on Forge: the CARs of its
+// shipped catalog segments, which stay registered in its space until
+// DeleteBucket releases them. The segments' index blobs are not counted.
+// Segment rows are matched to the bucket by name: rows a failed DeleteBucket
+// cleanup left behind count toward a later bucket of the same name.
+type CatalogUsage struct {
+	Bucket string
+	Space  did.DID
+	// Root is the bucket's current root (cid.Undef for an empty bucket).
+	Root cid.Cid
+	// Bytes is the total size of the bucket's shipped catalog CARs.
+	Bytes int64
+	// DeadOnArrivalBytes is how much of Bytes was already dead when its
+	// segment shipped, summed over the segments that were measured.
+	DeadOnArrivalBytes int64
+	// UnmeasuredBytes is the part of Bytes in segments shipped without that
+	// measurement.
+	UnmeasuredBytes int64
+	// Walk is the bucket's last completed walk of its live catalog, or nil
+	// if none has completed.
+	Walk *CatalogWalk
+}
+
+// CatalogWalk records a completed walk of a bucket's live catalog: the bytes
+// reachable from Root, which was the bucket's root when the walk started, and
+// the bucket's catalog usage at that moment. Its shipped bytes minus its
+// live bytes are what was dead then.
+type CatalogWalk struct {
+	Root       cid.Cid
+	StartedAt  int64 // unix seconds
+	FinishedAt int64 // unix seconds
+	// LiveBytes is the CAR frame bytes of the blocks reachable from Root.
+	LiveBytes          int64
+	ForgeBytes         int64
+	DeadOnArrivalBytes int64
+	UnmeasuredBytes    int64
+}
+
+// CatalogSubtree is the bytes and blocks reachable from one catalog block,
+// counting a block once per link to it. A CID names the same subtree
+// forever, so a walk can reuse the figures of any subtree it has seen.
+// Children are the nearest remembered subtrees inside it, which a walk that
+// reuses it whole still reaches.
+type CatalogSubtree struct {
+	CID      cid.Cid
+	Bytes    int64
+	Blocks   int64
+	Children []cid.Cid
+}
+
+// CatalogWalkStore persists the catalog walker's work: each bucket's
+// remembered subtrees, which let a walk skip what hasn't changed, and its last
+// completed walk, which CatalogUsage reports. Both go with the bucket.
+type CatalogWalkStore interface {
+	// CatalogSubtrees returns the subtrees remembered for bucket.
+	CatalogSubtrees(ctx context.Context, bucket string) ([]CatalogSubtree, error)
+	// PutCatalogSubtrees remembers subtrees for bucket. A walk saves them as
+	// it goes, so one cut short still spares the next its work.
+	PutCatalogSubtrees(ctx context.Context, bucket string, subtrees []CatalogSubtree) error
+	// CompleteCatalogWalk records w as bucket's last completed walk and
+	// forgets the remembered subtrees in drop: those its root no longer
+	// reaches.
+	CompleteCatalogWalk(ctx context.Context, bucket string, w CatalogWalk, drop []cid.Cid) error
+}
+
+// CatalogUsageStore reports how much catalog storage each bucket holds on
+// Forge, from the segment rows.
+type CatalogUsageStore interface {
+	// CatalogUsage returns one entry per bucket with shipped catalog
+	// segments, ordered by bucket name.
+	CatalogUsage(ctx context.Context) ([]CatalogUsage, error)
+	// BucketCatalogUsage returns bucket's entry, or nil if it has no shipped
+	// catalog segments.
+	BucketCatalogUsage(ctx context.Context, bucket string) (*CatalogUsage, error)
+}
+
 // RevocationCursor is the single row of ingot.revocation_cursor: the resume
 // point in the revocation service's firehose. RecordedAt is the recorded_at
 // of the last processed revocation record — the service's own timeline, so a

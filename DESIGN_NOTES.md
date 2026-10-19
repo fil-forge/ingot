@@ -413,7 +413,7 @@ not yet started defers while a write of its space holds the digest.
   the agent, and the per-key `DelegationCache` carries those proofs into the
   request via `internal/reqscope`, where the uploader and the network read
   tier spend them. The uploader also captures a per-space ship authority
-  (1h TTL) for the async catalog flush.
+  (1h TTL) for the async catalog flush, from borrowable stores only.
 - There is **no root account**: versitygw's built-in root user is disabled
   (an empty `RootUserConfig`), so every access key resolves through hilt. A
   key hilt has not issued is rejected as InvalidAccessKeyId.
@@ -454,12 +454,24 @@ draws the chains and the stores.
   intent unchanged for an hour as stalled, for the
   `ingot.local_blobs.stalled_bytes` gauge.
 - **No catalog GC**: `gc_candidates` is write-only; superseded MST nodes
-  accumulate on Forge with mutation volume.
+  accumulate on Forge with mutation volume. Each ship records how much of its
+  segment was already dead (`segments.dead_bytes`), and a background walker
+  (`catalogwalk`) measures each bucket's live catalog bytes; the
+  `ingot.catalog.*` gauges report both per bucket.
+- **The catalog walker borrows read authority**: like the ship, it has none
+  of its own, so it reads a bucket's catalog from Forge with the proof store
+  of the latest request in the bucket's space, for up to an hour after that
+  request's reads, and never once a revocation has dropped it. A bucket with
+  no request since the walker started is never walked;
+  `ingot.catalog.walk_coverage_bytes` shows how much of the catalog the
+  walked figures cover.
 - **Reads carry no bucket context**: `Manager.Get` linear-scans every open
   bucket store; threading the bucket into the read path removes the scan.
 - **The ship authority expires**: the async flush signs with a per-space
-  proof store captured at the last in-request write (1h TTL); a bucket idle
-  longer than that cannot ship a newly sealed segment until its next write.
+  proof store captured at the last in-request body upload (1h TTL); a
+  bucket without one for longer than that, or whose captured store a
+  revocation has dropped, cannot ship a newly sealed segment until a body
+  upload with a borrowable store re-captures it.
 - **The indexer read path is unwired**: `LocalLocator` serves all reads; the
   network index is still published (best-effort) but never consulted.
 - **Carried Forge-client copies**: `forgeclient/`, `tokenstore/`,

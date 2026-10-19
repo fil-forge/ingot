@@ -27,6 +27,7 @@ import (
 	"github.com/fil-forge/ingot/blockstore"
 	msbucket "github.com/fil-forge/ingot/bucket"
 	"github.com/fil-forge/ingot/bucketauthority"
+	"github.com/fil-forge/ingot/catalogwalk"
 	"github.com/fil-forge/ingot/config"
 	"github.com/fil-forge/ingot/internal/fasthttputil"
 	"github.com/fil-forge/ingot/internal/reqscope"
@@ -123,6 +124,14 @@ type ServerDeps struct {
 	// Meta is the persistence backing for log-segment metadata.
 	// Typically the same instance as Registry.
 	Meta logstore.Meta
+	// CatalogUsage, when set, sums each bucket's shipped catalog segments for
+	// the catalog gauges (ingot.catalog.*). Optional; typically the same
+	// instance as Registry.
+	CatalogUsage registry.CatalogUsageStore
+	// CatalogWalks, when set with CatalogUsage, persists the catalog walker's
+	// work, and the walker runs (unless CatalogWalkInterval is negative).
+	// Optional; typically the same instance as Registry.
+	CatalogWalks registry.CatalogWalkStore
 
 	// Identity is the agent identity (the issuer of every outbound
 	// invocation). The listener serves its DID document at
@@ -152,6 +161,9 @@ type Server struct {
 	log     blockstore.Log
 	backend *s3frontend.Backend
 	api     *s3api.S3ApiServer
+	// walker walks each bucket's live catalog for the catalog gauges; nil
+	// when it is off.
+	walker *catalogwalk.Walker
 	// sweepCtx is cancelled by Stop. Every background sweep derives its
 	// context from it, and sweeps counts the sweeper goroutines, so Stop
 	// can wait for them to exit before the registry closes.
@@ -218,6 +230,24 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 	if err := bs.CountBlobReads(otel.Meter("github.com/fil-forge/ingot/blockstore")); err != nil {
 		logger.Warn("local blob read metric not created", zap.Error(err))
 	}
+	// The catalog walker reads each bucket's catalog with the authority of
+	// a recent request in its space, which it borrows from the reads
+	// requests make.
+	var walker *catalogwalk.Walker
+	if deps.CatalogUsage != nil && deps.CatalogWalks != nil && cfg.CatalogWalkInterval >= 0 {
+		authority := catalogwalk.NewAuthority(deps.Identity.DID())
+		bs.OnRead(authority.Capture)
+		walker = catalogwalk.New(catalogwalk.Config{
+			Interval: cfg.CatalogWalkInterval,
+			Rate:     cfg.CatalogWalkRate,
+		}, catalogwalk.Deps{
+			Reads:     bs,
+			Usage:     deps.CatalogUsage,
+			Walks:     deps.CatalogWalks,
+			Authority: authority,
+			Logger:    logger,
+		})
+	}
 	backend := s3frontend.New(s3frontend.Deps{
 		Authority:       deps.Authority,
 		Registry:        deps.Registry,
@@ -254,6 +284,7 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		RehashBudget:        cfg.MultipartRehashBudget,
 		CORS:                cfg.CORSConfig,
 		AllowNoneEncryption: cfg.AllowNoneEncryption,
+		CatalogUsage:        deps.CatalogUsage,
 		Logger:              logger,
 	})
 
@@ -272,6 +303,7 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		log:     log,
 		backend: backend,
 		api:     api,
+		walker:  walker,
 	}, nil
 }
 
@@ -302,6 +334,8 @@ func (s *Server) Start(ctx context.Context) error {
 	s.startLocalBlobSweeper()
 	s.startReleasedPass()
 	s.startRegistrationSweeper()
+	s.startCatalogUsageSweeper()
+	s.startCatalogWalker()
 	return nil
 }
 
@@ -455,6 +489,97 @@ func (s *Server) startLocalBlobSweeper() {
 	})
 }
 
+// catalogUsageInterval is how often the catalog gauges' figures are
+// refreshed from the segment rows. Each refresh sums every shipped segment
+// row, and a busy bucket adds about 17,000 a day, so it runs rarely; the
+// figures grow slowly.
+const catalogUsageInterval = 5 * time.Minute
+
+// startCatalogUsageSweeper refreshes the figures the catalog gauges report
+// (see Backend.RefreshCatalogUsage) at startup and then every
+// catalogUsageInterval, when the backend has a catalog usage store.
+func (s *Server) startCatalogUsageSweeper() {
+	if !s.backend.ReportsCatalogUsage() {
+		return
+	}
+	s.goSweep(func() {
+		ticker := time.NewTicker(catalogUsageInterval)
+		defer ticker.Stop()
+		for {
+			ctx, cancel := context.WithTimeout(s.sweepCtx, catalogUsageInterval)
+			ctx, span := tracing.Start(ctx, "sweep.catalog_usage")
+			n, err := s.backend.RefreshCatalogUsage(ctx)
+			s.endSweepSpan(span, err, attribute.Int("ingot.sweep.count", n))
+			cancel()
+			if err != nil && s.sweepCtx.Err() == nil {
+				s.logger.Warn("catalog usage sweep", zap.Error(err))
+			}
+			select {
+			case <-s.sweepCtx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	})
+}
+
+// catalogWalkPoll is how often the catalog walker looks for due buckets.
+// Each look sums every shipped segment row, as a catalog usage refresh
+// does, so it runs as rarely.
+const catalogWalkPoll = catalogUsageInterval
+
+// startCatalogWalker runs the catalog walker: each poll, it takes the buckets
+// due a walk (catalogwalk.Walker.Due) and walks them one at a time, each walk
+// a root span of its own. A walk can take hours; Stop cuts it short.
+func (s *Server) startCatalogWalker() {
+	if s.walker == nil {
+		return
+	}
+	s.goSweep(func() {
+		ticker := time.NewTicker(catalogWalkPoll)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-s.sweepCtx.Done():
+				return
+			case <-ticker.C:
+			}
+			due, err := s.walker.Due(s.sweepCtx)
+			if err != nil && s.sweepCtx.Err() == nil {
+				s.logger.Warn("catalog walk: list due buckets", zap.Error(err))
+			}
+			for _, u := range due {
+				if s.sweepCtx.Err() != nil {
+					return
+				}
+				s.walkCatalog(u)
+			}
+		}
+	})
+}
+
+// walkCatalog runs one bucket's catalog walk under a root span of its own.
+func (s *Server) walkCatalog(u registry.CatalogUsage) {
+	ctx, span := tracing.Start(s.sweepCtx, "sweep.catalog_walk",
+		attribute.String("ingot.walk.space", u.Space.String()))
+	walked, err := s.walker.Walk(ctx, u)
+	s.endSweepSpan(span, err,
+		attribute.Int64("ingot.walk.reads", walked.Reads),
+		attribute.Int64("ingot.walk.reused", walked.Reused),
+		attribute.Bool("ingot.walk.completed", walked.Completed))
+	switch {
+	case s.sweepCtx.Err() != nil:
+	case err != nil:
+		s.logger.Warn("catalog walk", zap.Stringer("space", u.Space), zap.Error(err))
+	case walked.Completed:
+		s.logger.Info("catalog walk completed",
+			zap.Stringer("space", u.Space),
+			zap.Int64("live_bytes", walked.LiveBytes),
+			zap.Int64("reads", walked.Reads),
+			zap.Int64("reused", walked.Reused))
+	}
+}
+
 // startReleasedPass removes the local copies and intents that releases kept
 // before they freed local disk (see Backend.RemoveReleasedPublished). It runs
 // at every startup, until it has gone through every candidate or Stop
@@ -528,7 +653,7 @@ func (s *Server) Stop(ctx context.Context) error {
 		}
 	}
 	if err := s.backend.CloseMetrics(); err != nil {
-		errs = append(errs, fmt.Errorf("unregister local blob metrics: %w", err))
+		errs = append(errs, fmt.Errorf("unregister gauges: %w", err))
 	}
 	if err := s.api.ShutDown(); err != nil {
 		errs = append(errs, fmt.Errorf("s3api shutdown: %w", err))
