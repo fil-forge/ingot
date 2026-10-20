@@ -521,6 +521,29 @@ func TestPutOnlyKeyIsDeniedOnReads(t *testing.T) {
 		require.Equal(t, 403, s3e.StatusCode())
 		require.Zero(t, s.authorizer.(*refusingAuthorizer).calls, "the cached set is Hilt's answer; do not ask again")
 	})
+
+	t.Run("two subresources are refused before Hilt is consulted", func(t *testing.T) {
+		// S3 refuses the request before authenticating it, naming the
+		// parameters sorted; so does the gateway, from Hilt's own classifier.
+		req := signedRequest(t, http.MethodGet, "s3.example", "/bkt?uploads&encryption", accessKeyID, secret, now)
+		s := service(t, req)
+		app := fiber.New()
+		var authErr error
+		app.Use(func(c fiber.Ctx) error {
+			_, authErr = s.GetUserAccountForRequest(c, accessKeyID)
+			return nil
+		})
+		resp, err := app.Test(httpRequestOf(t, req))
+		require.NoError(t, err)
+		require.NoError(t, resp.Body.Close())
+
+		var s3e s3err.S3Error
+		require.ErrorAs(t, authErr, &s3e)
+		require.Equal(t, "InvalidArgument", s3e.BaseError().Code)
+		require.Equal(t, 400, s3e.StatusCode())
+		require.Equal(t, "Conflicting query string parameters: encryption, uploads", s3e.BaseError().Description)
+		require.Zero(t, s.authorizer.(*refusingAuthorizer).calls)
+	})
 }
 
 // hiltErr reproduces the wrapping depth a real authorize failure arrives with:
@@ -532,6 +555,15 @@ func hiltErr(name string) error {
 	return fmt.Errorf("hilt/iam: authorize request: %w",
 		fmt.Errorf("unpacking result: %w",
 			fmt.Errorf("executing invocation: %w", base)))
+}
+
+func TestConflictingQuery(t *testing.T) {
+	// Hilt's message names the parameters after the colon; without one the
+	// description stays generic.
+	require.Equal(t, "Conflicting query string parameters: encryption, uploads",
+		conflictingQuery("conflicting query string parameters: encryption, uploads").Description)
+	require.Equal(t, "Conflicting query string parameters",
+		conflictingQuery("rejected by hilt").Description)
 }
 
 func TestMapAuthError(t *testing.T) {
@@ -574,6 +606,7 @@ func TestMapAuthError(t *testing.T) {
 		hiltauth.SignatureMismatchErrorName:      {"SignatureDoesNotMatch", 403},
 		hiltauth.SignatureExpiredErrorName:       {"AccessDenied", 403},
 		hiltauth.UnsupportedOperationErrorName:   {"NotImplemented", 501},
+		hiltauth.ConflictingQueryErrorName:       {"InvalidArgument", 400},
 		hiltauth.UnknownBucketErrorName:          {"NoSuchBucket", 404},
 		hiltauth.TenantDisabledErrorName:         {"AccessDenied", 403},
 		hiltauth.IssuerForbiddenErrorName:        {"AccessDenied", 403},
