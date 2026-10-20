@@ -70,9 +70,9 @@ type Forge struct {
 	putClient *nethttp.Client
 	logger    *zap.Logger
 
-	// shipProofs caches, per space, the most recent request-scoped proof
-	// store seen on an in-request write to that space. The catalog segment
-	// ship (SubmitShard) runs asynchronously in the flush goroutine with no
+	// shipProofs caches, per space, the most recent borrowable proof store
+	// seen on an in-request write to that space. The catalog segment ship
+	// (SubmitShard) runs asynchronously in the flush goroutine with no
 	// request context, so it reuses this to authorize its onward
 	// /blob/add + /index/add. See UploadBlob (capture) and SubmitShard (use).
 	shipProofs *gocache.Cache
@@ -82,6 +82,10 @@ type Forge struct {
 // longer than the seal→ship latency (seconds) and flush-retry window, so a
 // segment sealed just after a write still finds its space's store.
 const shipProofsTTL = time.Hour
+
+// noCapturedAuthority says why shipProofStore found nothing outside a
+// request, for the errors of the calls that need it.
+const noCapturedAuthority = "no body upload has left a borrowable store within the last hour, or a revocation dropped it"
 
 // ForgeConfig wires a Forge uploader.
 //
@@ -114,10 +118,14 @@ func NewForge(cfg ForgeConfig) (*Forge, error) {
 	}, nil
 }
 
-// captureShipProofs records store as the ship authority for space (called on
-// in-request writes). Nil store is ignored.
-func (u *Forge) captureShipProofs(space did.DID, store ucanlib.ProofStore) {
-	if store == nil {
+// captureShipProofs records the proof store of ctx's request as the ship
+// authority for space (called on in-request writes), if background work may
+// borrow it (reqscope.BorrowableProofStore). A write authorized by a store
+// only it may use, one holding a delegation known revoked, leaves the
+// space's earlier capture in place.
+func (u *Forge) captureShipProofs(ctx context.Context, space did.DID) {
+	store, ok := reqscope.BorrowableProofStore(ctx)
+	if !ok {
 		return
 	}
 	u.shipProofs.Set(space.String(), store, gocache.DefaultExpiration)
@@ -125,13 +133,16 @@ func (u *Forge) captureShipProofs(space did.DID, store ucanlib.ProofStore) {
 
 // shipProofStore resolves the proof store authorizing a ship to space: the
 // request-scoped store if this runs in-request, else the most recent
-// captured store for the space. ok=false means neither exists.
+// captured store for the space, unless a revocation has dropped it since.
+// ok=false means neither is usable.
 func (u *Forge) shipProofStore(ctx context.Context, space did.DID) (ucanlib.ProofStore, bool) {
 	if store, ok := reqscope.ProofStore(ctx); ok {
 		return store, true
 	}
 	if v, ok := u.shipProofs.Get(space.String()); ok {
-		return v.(ucanlib.ProofStore), true
+		if store := v.(ucanlib.ProofStore); reqscope.StillBorrowable(store) {
+			return store, true
+		}
 	}
 	return nil, false
 }
@@ -142,11 +153,12 @@ func (u *Forge) SubmitShard(ctx context.Context, plane blockstore.Plane, space d
 	}
 
 	// The ship runs async (flush goroutine, no request), so its authority is
-	// the store captured from a recent in-request write to this space. No
-	// store → fail so the flush retries; a later write repopulates it.
+	// the store captured from a recent body upload to this space. No usable
+	// store → fail so the flush retries; a later body upload with a
+	// borrowable store repopulates it.
 	store, ok := u.shipProofStore(ctx, space)
 	if !ok {
-		return BlobLocation{}, nil, fmt.Errorf("uploader: no ship authority for space %s (no captured proof store)", space)
+		return BlobLocation{}, nil, fmt.Errorf("uploader: no ship authority for space %s (%s)", space, noCapturedAuthority)
 	}
 
 	// The index blob's bytes and digest are deterministic from the shard, so

@@ -6,6 +6,7 @@ import (
 	"iter"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	ucanlib "github.com/fil-forge/libforge/ucan"
@@ -54,7 +55,15 @@ type DelegationCache struct {
 	// store; Add refuses a batch naming any of it. Nil for a request-scoped
 	// store, which keeps a response's delegations for its onward retrieval.
 	revoked *gocache.Cache
+
+	// dropped is set once [KeyProofs] drops this store for a revocation.
+	dropped atomic.Bool
 }
+
+// Dropped reports whether [KeyProofs] has dropped this store because a
+// delegation in it was revoked. A request already holding the store may
+// finish with it; nothing should keep it longer.
+func (d *DelegationCache) Dropped() bool { return d.dropped.Load() }
 
 // indexKey is the exact-match probe the delegation matcher uses. Powerline
 // delegations index under sub = did.Undef — precisely the key the matcher

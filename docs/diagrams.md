@@ -294,7 +294,7 @@ sequenceDiagram
             B->>B: BlobCache.Take: the file moves from the spool to the cache
         end
     end
-    Note over B,U: UploadBlob also captures the request proof store as the<br/>space's ship authority (captureShipProofs, 1h TTL)
+    Note over B,U: UploadBlob also captures the request proof store, if borrowable,<br/>as the space's ship authority (captureShipProofs, 1h TTL)
     Note over B,L: under the per-bucket lock: commitVersion via Coordinator.WithTx
     B->>TX: Begin (lock, snapshot root)
     TX->>R: AllocVersionSeq
@@ -375,8 +375,9 @@ sequenceDiagram
 - That chain has room to spare — hilt expires its delegation to the gateway at
   the next UTC midnight plus an async overhang, so even a change queued at
   23:59 has hours to be drained in. For the queue that outlasts that, the
-  sweeper renews from the space's live authority, which a recent write leaves
-  behind. A space that has gone quiet has none, and after
+  sweeper renews from the space's live authority, which a recent body upload
+  with a borrowable store leaves behind and a revocation can drop. A space
+  that has gone quiet has none, and after
   `uploadRegistrationDeadLetterAfter` attempts the row is **dead-lettered**:
   out of the sweep, and out of the way of its key's later rows. (Nothing to do
   with a parked blob, which is durable and awaiting its accept.) The count is then short by
@@ -816,7 +817,7 @@ flowchart TB
 
     kp -->|"reqscope.ProofStore<br/>on the request ctx"| writes["uploader:<br/>/blob/add, abort, remove, /index/add<br/>/upload/add, /upload/remove"]
     kp -->|"same store"| reads["blockstore.Forge:<br/>content/retrieve"]
-    kp -->|"captureShipProofs<br/>at UploadBlob"| ship
+    kp -->|"captureShipProofs on body uploads,<br/>borrowable stores only"| ship
     ship --> async["async catalog ship;<br/>sweeper and DeleteBucket aborts"]
     static --> hc["hilt client:<br/>every /s3/* invocation"]
 
@@ -830,9 +831,20 @@ flowchart TB
   account is disabled, so no access-key auth path skips the hilt-backed IAM
   lookup. `/health` and the DID document are outside the S3 auth chain, and a
   rejected access key never receives one.
-- A bucket whose last write is more than an hour old has an expired ship
-  authority; a newly sealed segment then waits for the bucket's next write to
-  re-capture it.
+- The ship authority holds a request's store past the request only under
+  two rules (`reqscope.BorrowableProofStore`): the IAM layer marked it
+  `reqscope.Borrowable`, which it does for the key's own `DelegationCache`
+  only, and it hasn't been dropped. A revocation that drops the key's store
+  marks it `Dropped`, and a dropped store is neither captured nor used
+  (`reqscope.StillBorrowable`). A request authorized off a response carrying
+  a revoked delegation spends a store of its own, which is not marked.
+- A bucket whose last body upload is more than an hour old, or whose
+  captured store a revocation has dropped, has no ship authority; a newly
+  sealed segment then waits for a body upload with a borrowable store to
+  re-capture it. A delete, a zero-byte put, a put of content already stored
+  or a multipart completion uploads no body. Until then the space's
+  upload-registration renewals and the sweepers' aborts and removals wait
+  too.
 - Each access key gets its own `DelegationCache`, so a proof chain can never
   assemble across keys.
 - The same store holds the effective S3 action set hilt reported for the key
