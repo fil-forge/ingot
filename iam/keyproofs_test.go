@@ -86,11 +86,14 @@ func TestKeyProofsStoreRefusesRevoked(t *testing.T) {
 // TestInvalidatedStoreSkipsRevoked: a holder of the store a revocation drops
 // (an in-flight request, the uploader's ship authority) gets no chain through
 // the revoked delegation, but its chains over other subjects still assemble;
-// the key's next store starts empty.
+// the key's next store starts empty. The chains run space → mid → agent and
+// the revocation names a root, not a leaf, as a per-bucket revocation does.
 func TestInvalidatedStoreSkipsRevoked(t *testing.T) {
 	ctx := context.Background()
 	kp := iam.NewKeyProofs()
 	key, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	mid, err := ed25519.GenerateIssuer()
 	require.NoError(t, err)
 	agent, err := ed25519.GenerateIssuer()
 	require.NoError(t, err)
@@ -98,21 +101,25 @@ func TestInvalidatedStoreSkipsRevoked(t *testing.T) {
 	require.NoError(t, err)
 	spaceB, err := ed25519.GenerateIssuer()
 	require.NoError(t, err)
-	grantA, err := contentcmds.Retrieve.Delegate(spaceA, agent.DID(), spaceA.DID(), delegation.WithNoExpiration())
-	require.NoError(t, err)
-	grantB, err := contentcmds.Retrieve.Delegate(spaceB, agent.DID(), spaceB.DID(), delegation.WithNoExpiration())
-	require.NoError(t, err)
-	kp.Deposit(key.DID(), grantA, grantB)
+	var roots []ucan.Delegation
+	for _, space := range []ucan.Issuer{spaceA, spaceB} {
+		root, err := contentcmds.Retrieve.Delegate(space, mid.DID(), space.DID(), delegation.WithNoExpiration())
+		require.NoError(t, err)
+		leaf, err := contentcmds.Retrieve.Delegate(mid, agent.DID(), space.DID(), delegation.WithNoExpiration())
+		require.NoError(t, err)
+		kp.Deposit(key.DID(), root, leaf)
+		roots = append(roots, root)
+	}
 	held := kp.For(key.DID())
 
-	require.Len(t, kp.InvalidateHolders(grantB.Link()), 1)
+	require.Len(t, kp.InvalidateHolders(roots[1].Link()), 1)
 	chain, _, err := held.ProofChain(ctx, agent.DID(), contentcmds.Retrieve.Command, spaceB.DID())
 	require.NoError(t, err)
 	require.Empty(t, chain, "a chain used the revoked delegation")
 	chain, _, err = held.ProofChain(ctx, agent.DID(), contentcmds.Retrieve.Command, spaceA.DID())
 	require.NoError(t, err)
-	require.NotEmpty(t, chain, "a revocation over one subject cut the chain over another")
-	require.False(t, kp.For(key.DID()).Contains(grantA.Link()))
+	require.Len(t, chain, 2, "a revocation over one subject cut the chain over another")
+	require.False(t, kp.For(key.DID()).Contains(roots[0].Link()))
 }
 
 // TestRequestScopedStoreKeepsRevoked: a request authorized from a response

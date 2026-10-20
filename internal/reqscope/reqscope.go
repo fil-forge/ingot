@@ -44,9 +44,10 @@ var borrowableKey any = borrowableContextKey{}
 
 // BorrowableKey returns the context key under which the IAM service marks a
 // request whose proof store background work may borrow for a while: the
-// access key's own cached store, whose chains never use a delegation a
-// revocation has named. A request authorized off a response carrying a
-// revoked delegation gets a store of its own instead, marked not borrowable.
+// access key's own cached store, whose chains skip any delegation a
+// revocation has named, for as long as the IAM layer remembers that
+// revocation. A request authorized off a response carrying a revoked
+// delegation gets a store of its own instead, marked not borrowable.
 func BorrowableKey() any {
 	return borrowableKey
 }

@@ -251,9 +251,9 @@ func (u *Forge) AbortBlob(ctx context.Context, space did.DID, add cid.Cid) error
 		zap.Stringer("space", space),
 		zap.Stringer("add", add),
 	)
-	store, ok := u.shipProofStore(ctx, space)
-	if !ok {
-		return fmt.Errorf("uploader: no proof store for space %s (no request scope; %s)", space, noCapturedAuthority)
+	store, _, err := u.authorityFor(ctx, space, blobcmds.Abort.Command)
+	if err != nil {
+		return err
 	}
 	if err := u.client.BlobAbort(ctx, space, add, forgeclient.WithProofStore(store)); err != nil {
 		// A BlobAccepted refusal is final, not a fault: the space accepted
@@ -300,9 +300,9 @@ func (u *Forge) RemoveBlob(ctx context.Context, space did.DID, digest multihash.
 		zap.Stringer("space", space),
 		zap.String("digest", digestutil.Format(digest)),
 	)
-	store, ok := u.shipProofStore(ctx, space)
-	if !ok {
-		return fmt.Errorf("uploader: no proof store for space %s (no request scope; %s)", space, noCapturedAuthority)
+	store, _, err := u.authorityFor(ctx, space, blobcmds.Remove.Command)
+	if err != nil {
+		return err
 	}
 	if err := u.client.BlobRemove(ctx, space, digest, forgeclient.WithProofStore(store)); err != nil {
 		// Callers treat removal as best-effort and may discard the error, so

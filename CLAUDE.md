@@ -119,9 +119,9 @@ Internal:
   `ConcludeBlobs`, `AbortBlob`), `StreamingBodyUploader` (`StartBlob`,
   `PutBlob`: allocate by digest code, send while spooling), and
   `BlobRemover`; captures the per-space
-  ship authority (`shipProofs`, 1h TTL) from in-request writes, only from
-  stores `reqscope.BorrowableProofStore` returns; its chains skip revoked
-  delegations.
+  ship authority (`shipProofs`, 1h TTL) from in-request body uploads, only
+  from stores `reqscope.BorrowableProofStore` returns; its chains skip
+  revoked delegations.
 - **`bucketauthority/`** — hilt bucket ops: forwards CreateBucket /
   DeleteBucket / ListBuckets to `/s3/bucket/*`, recovering the signed S3
   request from ctx.

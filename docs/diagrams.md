@@ -377,8 +377,7 @@ sequenceDiagram
   23:59 has hours to be drained in. For the queue that outlasts that, the
   sweeper renews from the space's live authority, which a recent body upload
   with a borrowable store leaves behind, less any delegation a revocation has
-  since named. A space
-  that has gone quiet has none, and after
+  since named. A space that has gone quiet has none, and after
   `uploadRegistrationDeadLetterAfter` attempts the row is **dead-lettered**:
   out of the sweep, and out of the way of its key's later rows. (Nothing to do
   with a parked blob, which is durable and awaiting its accept.) The count is then short by
@@ -842,8 +841,10 @@ flowchart TB
   so the spaces its other grants cover keep shipping.
 - A bucket whose last body upload is more than an hour old, or whose grant in
   the captured store has been revoked, has no ship authority. A newly sealed
-  segment then fails its five ship attempts (about 31s) and stays unshipped
-  until a restart re-enqueues it. A delete, a zero-byte put, a put of content
+  segment then fails its five ship attempts (about 31s) and stays unshipped.
+  Only a restart re-enqueues it, and the capture lives in memory, so even
+  then it ships only if a body upload to the space captures the authority
+  before its attempts run out. A delete, a zero-byte put, a put of content
   already stored or, usually, a multipart completion uploads no body. Until a
   body upload with a borrowable store re-captures the authority, the space's
   upload-registration renewals and the sweepers' aborts and removals wait

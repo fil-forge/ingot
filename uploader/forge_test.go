@@ -12,8 +12,10 @@ import (
 	"github.com/fil-forge/ucantone/multikey/ed25519"
 	"github.com/fil-forge/ucantone/ucan"
 	"github.com/fil-forge/ucantone/ucan/delegation"
+	"github.com/ipfs/go-cid"
 	"github.com/stretchr/testify/require"
 
+	"github.com/fil-forge/ingot/blockstore"
 	"github.com/fil-forge/ingot/forgeclient"
 	"github.com/fil-forge/ingot/iam"
 	"github.com/fil-forge/ingot/internal/reqscope"
@@ -52,20 +54,25 @@ func borrowable(store ucanlib.ProofStore) context.Context {
 	return context.WithValue(ctx, reqscope.BorrowableKey(), true)
 }
 
-// keyStore returns an access key's store in keys holding a /blob/add grant
-// to agent on each of spaces, and the grants in the same order.
+// keyStore returns an access key's store in keys holding a two-hop /blob/add
+// chain to agent on each of spaces (space → an intermediary → agent), and the
+// chains' roots in the same order.
 func keyStore(t *testing.T, keys *iam.KeyProofs, agent did.DID, spaces ...multikey.Issuer) (ucanlib.ProofStore, []ucan.Delegation) {
 	t.Helper()
 	key, err := ed25519.GenerateIssuer()
 	require.NoError(t, err)
-	var grants []ucan.Delegation
+	mid, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	var roots []ucan.Delegation
 	for _, space := range spaces {
-		grant, err := blobcmds.Add.Delegate(space, agent, space.DID(), delegation.WithNoExpiration())
+		root, err := blobcmds.Add.Delegate(space, mid.DID(), space.DID(), delegation.WithNoExpiration())
 		require.NoError(t, err)
-		grants = append(grants, grant)
+		leaf, err := blobcmds.Add.Delegate(mid, agent, space.DID(), delegation.WithNoExpiration())
+		require.NoError(t, err)
+		keys.Deposit(key.DID(), root, leaf)
+		roots = append(roots, root)
 	}
-	keys.Deposit(key.DID(), grants...)
-	return keys.For(key.DID()), grants
+	return keys.For(key.DID()), roots
 }
 
 func TestForgeShipProofsCache(t *testing.T) {
@@ -112,8 +119,8 @@ func TestForgeShipProofsOnlyBorrowable(t *testing.T) {
 
 	held := ucanlib.ProofStore(iam.NewDelegationCache(nil))
 	fg.captureShipProofs(borrowable(held), space)
-	unmarked := context.WithValue(borrowable(scoped), reqscope.BorrowableKey(), false)
-	fg.captureShipProofs(unmarked, space)
+	markedNot := context.WithValue(borrowable(scoped), reqscope.BorrowableKey(), false)
+	fg.captureShipProofs(markedNot, space)
 	got, ok := fg.shipProofStore(ctx, space)
 	require.True(t, ok)
 	require.Same(t, held, got, "a store marked not borrowable replaced the capture")
@@ -122,33 +129,32 @@ func TestForgeShipProofsOnlyBorrowable(t *testing.T) {
 // TestForgeShipProofsSkipRevoked: after a revocation over one space, the
 // store captured from that key builds no chain through the revoked grant,
 // while the chain it builds for another space is untouched, so that space's
-// ships still go out.
+// ships still go out. The revoked space's ship fails locally, naming the
+// missing authority, instead of going out proofless.
 func TestForgeShipProofsSkipRevoked(t *testing.T) {
 	fg := newTestForge(t)
 	ctx := context.Background()
-	agent, err := ed25519.GenerateIssuer()
-	require.NoError(t, err)
+	agent := fg.client.Issuer().DID()
 	spaceA, err := ed25519.GenerateIssuer()
 	require.NoError(t, err)
 	spaceB, err := ed25519.GenerateIssuer()
 	require.NoError(t, err)
 	keys := iam.NewKeyProofs()
-	store, grants := keyStore(t, keys, agent.DID(), spaceA, spaceB)
+	store, roots := keyStore(t, keys, agent, spaceA, spaceB)
 	fg.captureShipProofs(borrowable(store), spaceA.DID())
 	fg.captureShipProofs(borrowable(store), spaceB.DID())
 
-	require.Len(t, keys.InvalidateHolders(grants[1].Link()), 1)
+	require.Len(t, keys.InvalidateHolders(roots[1].Link()), 1)
 
-	shipChain := func(space did.DID) []ucan.Delegation {
-		t.Helper()
-		got, ok := fg.shipProofStore(ctx, space)
-		require.True(t, ok)
-		chain, _, err := got.ProofChain(ctx, agent.DID(), blobcmds.Add.Command, space)
-		require.NoError(t, err)
-		return chain
-	}
-	require.NotEmpty(t, shipChain(spaceA.DID()), "a revocation over one space cut another space's ship authority")
-	require.Empty(t, shipChain(spaceB.DID()), "a ship presented a revoked grant")
+	_, chain, err := fg.authorityFor(ctx, spaceA.DID(), blobcmds.Add.Command)
+	require.NoError(t, err, "a revocation over one space cut another space's ship authority")
+	require.Len(t, chain, 2)
+
+	_, _, err = fg.authorityFor(ctx, spaceB.DID(), blobcmds.Add.Command)
+	require.ErrorContains(t, err, "no /blob/add authority", "a ship presented a revoked grant")
+	shard := CARShard{Size: 1, Positions: map[cid.Cid]blockstore.BlockLoc{cid.Undef: {}}}
+	_, _, err = fg.SubmitShard(ctx, blockstore.PlaneCatalog, spaceB.DID(), shard)
+	require.ErrorContains(t, err, "no /blob/add authority")
 }
 
 func TestForgeShipProofsRequestScopeWins(t *testing.T) {

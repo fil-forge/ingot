@@ -272,8 +272,9 @@ func (s *Service) GetUserAccountForRequest(ctx fiber.Ctx, accessKeyStr string) (
 	if ctr != nil && !s.cacheProofs(spanCtx, store, ctr, req, accessKeyID) {
 		scoped := NewDelegationCache(nil)
 		ctx.Locals(reqscope.ProofStoreKey(), ucanlib.ProofStore(scoped))
-		// The scoped store holds a delegation known revoked: only this
-		// request may use it.
+		// The scoped store holds a delegation known revoked, so nothing
+		// outside this request may borrow it (an upload registration this
+		// request queues still carries the chain it encodes from it).
 		ctx.Locals(reqscope.BorrowableKey(), false)
 		// Refetches bucket info already fetched above; rare (a failed Hilt commit).
 		s.cacheProofs(reqCtx, scoped, ctr, req, accessKeyID)
