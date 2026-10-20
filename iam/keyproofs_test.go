@@ -83,21 +83,36 @@ func TestKeyProofsStoreRefusesRevoked(t *testing.T) {
 	require.True(t, store.Contains(other.Link()))
 }
 
-// TestInvalidatedStoreReportsDropped: the store a revocation drops reports
-// Dropped, so a holder can tell it must not keep it; the key's next store
-// does not.
-func TestInvalidatedStoreReportsDropped(t *testing.T) {
+// TestInvalidatedStoreSkipsRevoked: a holder of the store a revocation drops
+// (an in-flight request, the uploader's ship authority) gets no chain through
+// the revoked delegation, but its chains over other subjects still assemble;
+// the key's next store starts empty.
+func TestInvalidatedStoreSkipsRevoked(t *testing.T) {
+	ctx := context.Background()
 	kp := iam.NewKeyProofs()
 	key, err := ed25519.GenerateIssuer()
 	require.NoError(t, err)
-	dlg, _ := grant(t)
-	kp.Deposit(key.DID(), dlg)
+	agent, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	spaceA, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	spaceB, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	grantA, err := contentcmds.Retrieve.Delegate(spaceA, agent.DID(), spaceA.DID(), delegation.WithNoExpiration())
+	require.NoError(t, err)
+	grantB, err := contentcmds.Retrieve.Delegate(spaceB, agent.DID(), spaceB.DID(), delegation.WithNoExpiration())
+	require.NoError(t, err)
+	kp.Deposit(key.DID(), grantA, grantB)
 	held := kp.For(key.DID())
-	require.False(t, held.Dropped())
 
-	require.Len(t, kp.InvalidateHolders(dlg.Link()), 1)
-	require.True(t, held.Dropped())
-	require.False(t, kp.For(key.DID()).Dropped())
+	require.Len(t, kp.InvalidateHolders(grantB.Link()), 1)
+	chain, _, err := held.ProofChain(ctx, agent.DID(), contentcmds.Retrieve.Command, spaceB.DID())
+	require.NoError(t, err)
+	require.Empty(t, chain, "a chain used the revoked delegation")
+	chain, _, err = held.ProofChain(ctx, agent.DID(), contentcmds.Retrieve.Command, spaceA.DID())
+	require.NoError(t, err)
+	require.NotEmpty(t, chain, "a revocation over one subject cut the chain over another")
+	require.False(t, kp.For(key.DID()).Contains(grantA.Link()))
 }
 
 // TestRequestScopedStoreKeepsRevoked: a request authorized from a response

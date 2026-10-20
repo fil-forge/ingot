@@ -376,7 +376,8 @@ sequenceDiagram
   the next UTC midnight plus an async overhang, so even a change queued at
   23:59 has hours to be drained in. For the queue that outlasts that, the
   sweeper renews from the space's live authority, which a recent body upload
-  with a borrowable store leaves behind and a revocation can drop. A space
+  with a borrowable store leaves behind, less any delegation a revocation has
+  since named. A space
   that has gone quiet has none, and after
   `uploadRegistrationDeadLetterAfter` attempts the row is **dead-lettered**:
   out of the sweep, and out of the way of its key's later rows. (Nothing to do
@@ -831,18 +832,20 @@ flowchart TB
   account is disabled, so no access-key auth path skips the hilt-backed IAM
   lookup. `/health` and the DID document are outside the S3 auth chain, and a
   rejected access key never receives one.
-- The ship authority holds a request's store past the request only under
-  two rules (`reqscope.BorrowableProofStore`): the IAM layer marked it
-  `reqscope.Borrowable`, which it does for the key's own `DelegationCache`
-  only, and it hasn't been dropped. A revocation that drops the key's store
-  marks it `Dropped`, and a dropped store is neither captured nor used
-  (`reqscope.StillBorrowable`). A request authorized off a response carrying
-  a revoked delegation spends a store of its own, which is not marked.
-- A bucket whose last body upload is more than an hour old, or whose
-  captured store a revocation has dropped, has no ship authority; a newly
-  sealed segment then waits for a body upload with a borrowable store to
-  re-capture it. A delete, a zero-byte put, a put of content already stored
-  or a multipart completion uploads no body. Until then the space's
+- The ship authority holds a request's store past the request only when the
+  IAM layer marked it borrowable (`reqscope.BorrowableKey`, read through
+  `reqscope.BorrowableProofStore`), which it does for the key's own
+  `DelegationCache` only. A request authorized off a response carrying a
+  revoked delegation spends a store of its own, marked not borrowable.
+- A revocation drops the key's store from `KeyProofs`, but a captured store
+  stays in use: no chain it assembles uses a delegation the revocation named,
+  so the spaces its other grants cover keep shipping.
+- A bucket whose last body upload is more than an hour old, or whose grant in
+  the captured store has been revoked, has no ship authority. A newly sealed
+  segment then fails its five ship attempts (about 31s) and stays unshipped
+  until a restart re-enqueues it. A delete, a zero-byte put, a put of content
+  already stored or, usually, a multipart completion uploads no body. Until a
+  body upload with a borrowable store re-captures the authority, the space's
   upload-registration renewals and the sweepers' aborts and removals wait
   too.
 - Each access key gets its own `DelegationCache`, so a proof chain can never

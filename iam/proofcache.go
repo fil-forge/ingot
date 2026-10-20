@@ -6,7 +6,6 @@ import (
 	"iter"
 	"slices"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	ucanlib "github.com/fil-forge/libforge/ucan"
@@ -52,18 +51,11 @@ type DelegationCache struct {
 	perms *gocache.Cache // bucket DID string → map[string]struct{} of S3 actions
 
 	// revoked is the revoked-CID set [KeyProofs] shares across every key's
-	// store; Add refuses a batch naming any of it. Nil for a request-scoped
-	// store, which keeps a response's delegations for its onward retrieval.
+	// store; Add refuses a batch naming any of it, and no chain uses a cached
+	// delegation that is in it. Nil for a request-scoped store, which keeps a
+	// response's delegations for its onward retrieval.
 	revoked *gocache.Cache
-
-	// dropped is set once [KeyProofs] drops this store for a revocation.
-	dropped atomic.Bool
 }
-
-// Dropped reports whether [KeyProofs] has dropped this store because a
-// delegation in it was revoked. A request already holding the store may
-// finish with it; nothing should keep it longer.
-func (d *DelegationCache) Dropped() bool { return d.dropped.Load() }
 
 // indexKey is the exact-match probe the delegation matcher uses. Powerline
 // delegations index under sub = did.Undef — precisely the key the matcher
@@ -233,6 +225,11 @@ func (d *DelegationCache) listDelegations(_ context.Context, aud did.DID, cmd uc
 		for _, m := range matches {
 			if _, live := d.data.Get(m.link); !live {
 				continue // expired, janitor hasn't swept yet
+			}
+			if d.revoked != nil {
+				if _, gone := d.revoked.Get(m.link); gone {
+					continue // revoked since it was cached
+				}
 			}
 			if !yield(m.dlg, nil) {
 				return

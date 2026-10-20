@@ -88,9 +88,10 @@ func (k *KeyProofs) Deposit(key did.DID, dlgs ...ucan.Delegation) {
 // path could assemble for that key, so no partial state is worth keeping —
 // the key's next request falls through to Hilt, which re-authorizes (or, for
 // a deleted key, refuses). A caller already holding the dropped
-// *DelegationCache (an in-flight request) can still use it, but it reports
-// Dropped, so nothing borrows it past that request; the next For(key) starts
-// a fresh empty store. A link no store holds is still recorded: the
+// *DelegationCache (an in-flight request, or the uploader's ship authority)
+// can still use it, but no chain it assembles uses the revoked delegation,
+// so its chains over other subjects stay usable; the next For(key) starts a
+// fresh empty store. A link no store holds is still recorded: the
 // revocation may precede the response that would have cached it.
 func (k *KeyProofs) InvalidateHolders(link cid.Cid) []did.DID {
 	k.mu.Lock()
@@ -109,7 +110,6 @@ func (k *KeyProofs) InvalidateHolders(link cid.Cid) []did.DID {
 		if err != nil {
 			continue // unreachable: keys are For(did).String()
 		}
-		dc.dropped.Store(true)
 		k.byKey.Delete(id)
 		affected = append(affected, key)
 	}

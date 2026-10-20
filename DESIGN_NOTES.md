@@ -462,9 +462,12 @@ draws the chains and the stores.
   bucket store; threading the bucket into the read path removes the scan.
 - **The ship authority expires**: the async flush signs with a per-space
   proof store captured at the last in-request body upload (1h TTL); a
-  bucket without one for longer than that, or whose captured store a
-  revocation has dropped, cannot ship a newly sealed segment until a body
-  upload with a borrowable store re-captures it.
+  bucket without one for longer than that, or whose grant in the captured
+  store a revocation has named, cannot ship a newly sealed segment. The
+  flush gives up after five attempts (about 31s of backoff), and the
+  segment stays unshipped until a restart re-enqueues it: a later body
+  upload re-captures the authority for segments sealed after it, not for
+  that one.
 - **The indexer read path is unwired**: `LocalLocator` serves all reads; the
   network index is still published (best-effort) but never consulted.
 - **Carried Forge-client copies**: `forgeclient/`, `tokenstore/`,

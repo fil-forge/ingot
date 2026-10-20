@@ -104,10 +104,10 @@ func (u *Forge) UploadBlob(ctx context.Context, space did.DID, digest multihash.
 	// as the ship authority for space, so the async catalog ship (SubmitShard,
 	// no request ctx) can reuse it. In forge mode the IAM layer populates
 	// reqscope for every write, so absence is a wiring bug, not a fallback
-	// case — proceeding without it issues a proofless /blob/add that sprue rejects with an opaque
-	// "not issued by subject and has no proofs" 500 deep in the flow. Fail here
-	// instead, naming the space, so the missing store is immediately
-	// attributable.
+	// case — proceeding without it issues a proofless /blob/add that sprue
+	// rejects with an opaque "not issued by subject and has no proofs" 500
+	// deep in the flow. Fail here instead, naming the space, so the missing
+	// store is immediately attributable.
 	store, ok := reqscope.ProofStore(ctx)
 	if !ok {
 		return UploadedBlob{}, fmt.Errorf("uploader: no request-scoped proof store for space %s (IAM layer did not attach one)", space)
@@ -240,7 +240,8 @@ var ErrBlobAccepted = errors.New("uploader: blob accepted by the space; release 
 // service: sprue recovers the provider from the receipt chain of the add and
 // the node releases the allocation + parked bytes. add is the parked blob's
 // AddTask. The proof store is request-scoped when present (an S3 Abort) and
-// otherwise the store captured at park time (the session-expiry sweeper).
+// otherwise the space's ship authority (the session-expiry sweeper): the
+// borrowable store its latest body upload left, within the hour.
 // A refusal because the space has accepted the blob is returned wrapping
 // [ErrBlobAccepted], so the caller can release the blob instead. Errors are
 // logged here (callers treat abort cleanup as best-effort and may discard
@@ -291,7 +292,8 @@ type BlobRemover interface {
 // the storage nodes holding it; piri deletes the bytes only once no space
 // claims the digest (and, for aggregated pieces, once the PDP root retires
 // on-chain). The proof store is request-scoped when present (a DeleteObject)
-// and otherwise the store captured from a recent write to the space.
+// and otherwise the space's ship authority: the borrowable store its latest
+// body upload left, within the hour.
 // Idempotent.
 func (u *Forge) RemoveBlob(ctx context.Context, space did.DID, digest multihash.Multihash) error {
 	u.logger.Info("blob remove",

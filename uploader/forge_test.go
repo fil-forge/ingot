@@ -52,18 +52,20 @@ func borrowable(store ucanlib.ProofStore) context.Context {
 	return context.WithValue(ctx, reqscope.BorrowableKey(), true)
 }
 
-// keyStore returns an access key's store in keys, holding one /blob/add
-// grant on space, and the grant.
-func keyStore(t *testing.T, keys *iam.KeyProofs, space multikey.Issuer) (ucanlib.ProofStore, ucan.Delegation) {
+// keyStore returns an access key's store in keys holding a /blob/add grant
+// to agent on each of spaces, and the grants in the same order.
+func keyStore(t *testing.T, keys *iam.KeyProofs, agent did.DID, spaces ...multikey.Issuer) (ucanlib.ProofStore, []ucan.Delegation) {
 	t.Helper()
-	agent, err := ed25519.GenerateIssuer()
-	require.NoError(t, err)
 	key, err := ed25519.GenerateIssuer()
 	require.NoError(t, err)
-	grant, err := blobcmds.Add.Delegate(space, agent.DID(), space.DID(), delegation.WithNoExpiration())
-	require.NoError(t, err)
-	keys.Deposit(key.DID(), grant)
-	return keys.For(key.DID()), grant
+	var grants []ucan.Delegation
+	for _, space := range spaces {
+		grant, err := blobcmds.Add.Delegate(space, agent, space.DID(), delegation.WithNoExpiration())
+		require.NoError(t, err)
+		grants = append(grants, grant)
+	}
+	keys.Deposit(key.DID(), grants...)
+	return keys.For(key.DID()), grants
 }
 
 func TestForgeShipProofsCache(t *testing.T) {
@@ -95,15 +97,12 @@ func TestForgeShipProofsCache(t *testing.T) {
 }
 
 // TestForgeShipProofsOnlyBorrowable: a write captures its store only when the
-// IAM layer marked it borrowable and it can report a revocation's drop, and
-// not once dropped; one that may not be borrowed leaves the space's earlier
-// capture in place.
+// IAM layer marked it borrowable; one that may not be borrowed leaves the
+// space's earlier capture in place.
 func TestForgeShipProofsOnlyBorrowable(t *testing.T) {
 	fg := newTestForge(t)
 	ctx := context.Background()
-	spaceKey, err := ed25519.GenerateIssuer()
-	require.NoError(t, err)
-	space := spaceKey.DID()
+	space := mustSpace(t)
 
 	scoped := ucanlib.ProofStore(iam.NewDelegationCache(nil))
 	fg.captureShipProofs(context.WithValue(ctx, reqscope.ProofStoreKey(), scoped), space)
@@ -111,58 +110,45 @@ func TestForgeShipProofsOnlyBorrowable(t *testing.T) {
 		t.Fatal("captured a store not marked borrowable")
 	}
 
-	fg.captureShipProofs(borrowable(tokenstore.NewMemStore()), space)
-	if _, ok := fg.shipProofStore(ctx, space); ok {
-		t.Fatal("captured a store that can't report a revocation's drop")
-	}
-
-	keys := iam.NewKeyProofs()
-	dropped, grant := keyStore(t, keys, spaceKey)
-	require.Len(t, keys.InvalidateHolders(grant.Link()), 1)
-
 	held := ucanlib.ProofStore(iam.NewDelegationCache(nil))
 	fg.captureShipProofs(borrowable(held), space)
-	for name, ctx := range map[string]context.Context{
-		"a store not marked borrowable":                 context.WithValue(borrowable(scoped), reqscope.BorrowableKey(), false),
-		"a store that can't report a revocation's drop": borrowable(tokenstore.NewMemStore()),
-		"a store a revocation dropped":                  borrowable(dropped),
-	} {
-		fg.captureShipProofs(ctx, space)
-		got, ok := fg.shipProofStore(context.Background(), space)
-		require.True(t, ok)
-		require.Same(t, held, got, "%s replaced the capture", name)
-	}
+	unmarked := context.WithValue(borrowable(scoped), reqscope.BorrowableKey(), false)
+	fg.captureShipProofs(unmarked, space)
+	got, ok := fg.shipProofStore(ctx, space)
+	require.True(t, ok)
+	require.Same(t, held, got, "a store marked not borrowable replaced the capture")
 }
 
-// TestForgeShipProofsDropsRevoked: once a revocation drops the captured
-// store, a ship finds no authority, though it still resolves in-request,
-// and a later write's store is captured afresh.
-func TestForgeShipProofsDropsRevoked(t *testing.T) {
+// TestForgeShipProofsSkipRevoked: after a revocation over one space, the
+// store captured from that key builds no chain through the revoked grant,
+// while the chain it builds for another space is untouched, so that space's
+// ships still go out.
+func TestForgeShipProofsSkipRevoked(t *testing.T) {
 	fg := newTestForge(t)
 	ctx := context.Background()
-	spaceKey, err := ed25519.GenerateIssuer()
+	agent, err := ed25519.GenerateIssuer()
 	require.NoError(t, err)
-	space := spaceKey.DID()
+	spaceA, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	spaceB, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
 	keys := iam.NewKeyProofs()
-	store, grant := keyStore(t, keys, spaceKey)
+	store, grants := keyStore(t, keys, agent.DID(), spaceA, spaceB)
+	fg.captureShipProofs(borrowable(store), spaceA.DID())
+	fg.captureShipProofs(borrowable(store), spaceB.DID())
 
-	fg.captureShipProofs(borrowable(store), space)
-	_, ok := fg.shipProofStore(ctx, space)
-	require.True(t, ok)
+	require.Len(t, keys.InvalidateHolders(grants[1].Link()), 1)
 
-	require.Len(t, keys.InvalidateHolders(grant.Link()), 1)
-	if _, ok := fg.shipProofStore(ctx, space); ok {
-		t.Fatal("a ship borrowed a store a revocation dropped")
+	shipChain := func(space did.DID) []ucan.Delegation {
+		t.Helper()
+		got, ok := fg.shipProofStore(ctx, space)
+		require.True(t, ok)
+		chain, _, err := got.ProofChain(ctx, agent.DID(), blobcmds.Add.Command, space)
+		require.NoError(t, err)
+		return chain
 	}
-	got, ok := fg.shipProofStore(context.WithValue(ctx, reqscope.ProofStoreKey(), store), space)
-	require.True(t, ok)
-	require.Same(t, store, got)
-
-	fresh, _ := keyStore(t, keys, spaceKey)
-	fg.captureShipProofs(borrowable(fresh), space)
-	got, ok = fg.shipProofStore(ctx, space)
-	require.True(t, ok)
-	require.Same(t, fresh, got)
+	require.NotEmpty(t, shipChain(spaceA.DID()), "a revocation over one space cut another space's ship authority")
+	require.Empty(t, shipChain(spaceB.DID()), "a ship presented a revoked grant")
 }
 
 func TestForgeShipProofsRequestScopeWins(t *testing.T) {

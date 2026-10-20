@@ -85,7 +85,7 @@ const shipProofsTTL = time.Hour
 
 // noCapturedAuthority says why shipProofStore found nothing outside a
 // request, for the errors of the calls that need it.
-const noCapturedAuthority = "no body upload has left a borrowable store within the last hour, or a revocation dropped it"
+const noCapturedAuthority = "no body upload has left a borrowable store within the last hour"
 
 // ForgeConfig wires a Forge uploader.
 //
@@ -120,9 +120,10 @@ func NewForge(cfg ForgeConfig) (*Forge, error) {
 
 // captureShipProofs records the proof store of ctx's request as the ship
 // authority for space (called on in-request writes), if background work may
-// borrow it (reqscope.BorrowableProofStore). A write authorized by a store
-// only it may use, one holding a delegation known revoked, leaves the
-// space's earlier capture in place.
+// borrow it (reqscope.BorrowableProofStore): the access key's own store,
+// whose chains skip any delegation revoked since it was captured. A write
+// authorized by a store only it may use, one holding a delegation known
+// revoked, leaves the space's earlier capture in place.
 func (u *Forge) captureShipProofs(ctx context.Context, space did.DID) {
 	store, ok := reqscope.BorrowableProofStore(ctx)
 	if !ok {
@@ -133,16 +134,13 @@ func (u *Forge) captureShipProofs(ctx context.Context, space did.DID) {
 
 // shipProofStore resolves the proof store authorizing a ship to space: the
 // request-scoped store if this runs in-request, else the most recent
-// captured store for the space, unless a revocation has dropped it since.
-// ok=false means neither is usable.
+// captured store for the space. ok=false means neither exists.
 func (u *Forge) shipProofStore(ctx context.Context, space did.DID) (ucanlib.ProofStore, bool) {
 	if store, ok := reqscope.ProofStore(ctx); ok {
 		return store, true
 	}
 	if v, ok := u.shipProofs.Get(space.String()); ok {
-		if store := v.(ucanlib.ProofStore); reqscope.StillBorrowable(store) {
-			return store, true
-		}
+		return v.(ucanlib.ProofStore), true
 	}
 	return nil, false
 }

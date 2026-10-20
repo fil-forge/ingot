@@ -44,9 +44,9 @@ var borrowableKey any = borrowableContextKey{}
 
 // BorrowableKey returns the context key under which the IAM service marks a
 // request whose proof store background work may borrow for a while: the
-// access key's own cached store, which reports being dropped once a
-// delegation in it is revoked. A request authorized off a response carrying
-// a revoked delegation gets a store of its own instead, and is not marked.
+// access key's own cached store, whose chains never use a delegation a
+// revocation has named. A request authorized off a response carrying a
+// revoked delegation gets a store of its own instead, marked not borrowable.
 func BorrowableKey() any {
 	return borrowableKey
 }
@@ -58,32 +58,17 @@ func Borrowable(ctx context.Context) bool {
 	return b
 }
 
-// dropper is a proof store that can report having been dropped because a
-// delegation in it was revoked (iam.DelegationCache).
-type dropper interface {
-	Dropped() bool
-}
-
 // BorrowableProofStore returns the request's proof store if background work
-// may hold it past the request: the request is marked borrowable and its
-// store passes StillBorrowable. ok is false otherwise.
+// may hold it past the request (see BorrowableKey); ok is false otherwise.
 func BorrowableProofStore(ctx context.Context) (ucanlib.ProofStore, bool) {
 	if !Borrowable(ctx) {
 		return nil, false
 	}
 	store, ok := ProofStore(ctx)
-	if !ok || !StillBorrowable(store) {
+	if !ok || store == nil {
 		return nil, false
 	}
 	return store, true
-}
-
-// StillBorrowable reports whether a store borrowed from a request may still
-// be used: it can report being dropped for a revocation and hasn't been. A
-// store that can't report it is never borrowed.
-func StillBorrowable(store ucanlib.ProofStore) bool {
-	d, ok := store.(dropper)
-	return ok && !d.Dropped()
 }
 
 type requestContextKey struct{}
