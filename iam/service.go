@@ -52,6 +52,7 @@ package iam
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"slices"
@@ -187,6 +188,15 @@ func (s *Service) GetUserAccountForRequest(ctx fiber.Ctx, accessKeyStr string) (
 	reqCtx := ctx.RequestCtx()
 	req := fasthttputil.RequestFromHTTPContext(reqCtx)
 	ctx.Locals(reqscope.RequestKey(), req)
+
+	// A query naming two subresources addresses no operation. S3 refuses it
+	// before authenticating the request, and so does the gateway: Hilt's own
+	// classifier names the refusal, so there is nothing to ask Hilt.
+	if _, _, err := hiltauth.RequirementsFor(req); errors.Is(err, hiltauth.ErrConflictingQuery) {
+		path = "local"
+		s.logger.Debug("hilt/iam: request names two subresources", zap.String("access", accessKeyStr), zap.Error(err))
+		return auth.Account{}, conflictingQuery(err.Error())
+	}
 
 	// Scope this key's proof store onto the request so an onward Forge
 	// retrieval (blockstore.Forge, which has only ctx + space) uses THIS
@@ -352,6 +362,8 @@ func mapAuthError(err error) (error, bool) {
 		return s3err.GetAPIError(s3err.ErrExpiredPresignRequest), true
 	case hiltauth.UnsupportedOperationErrorName:
 		return s3err.GetAPIError(s3err.ErrNotImplemented), true
+	case hiltauth.ConflictingQueryErrorName:
+		return conflictingQuery(named.Error()), true
 	case hiltauth.UnknownBucketErrorName:
 		return s3err.GetAPIError(s3err.ErrNoSuchBucket), true
 	case hiltauth.TenantDisabledErrorName,
@@ -663,6 +675,17 @@ func (*Service) Shutdown() error {
 func MapAuthError(err error) (error, bool) { return mapAuthError(err) }
 
 // malformedPolicy is the S3 error for a PutBucketPolicy body Hilt refuses.
+// conflictingQuery is S3's answer to a query naming two subresources: 400
+// InvalidArgument, naming the parameters. message is Hilt's, "conflicting
+// query string parameters: a, b"; the names follow the colon.
+func conflictingQuery(message string) s3err.InvalidArgumentError {
+	description := "Conflicting query string parameters"
+	if _, names, ok := strings.Cut(message, ": "); ok && names != "" {
+		description += ": " + names
+	}
+	return s3err.InvalidArgumentError{Description: description}
+}
+
 func malformedPolicy(description string) s3err.APIError {
 	return s3err.APIError{Code: "MalformedPolicy", Description: description, HTTPStatusCode: http.StatusBadRequest}
 }

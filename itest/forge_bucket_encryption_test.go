@@ -8,7 +8,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"github.com/aws/smithy-go"
+	"github.com/aws/smithy-go/middleware"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"io"
 	"net/http"
 	"net/url"
@@ -257,6 +261,33 @@ func TestForgeBucketEncryption(t *testing.T) {
 			t.Fatalf("GetBucketEncryption = %q, want AES256", algo)
 		}
 	})
+	t.Run("ConflictingSubresources", func(t *testing.T) {
+		// A query naming two subresources is refused as S3 refuses it, before
+		// authentication and without consulting hilt. The SDK never sends one,
+		// so the second parameter is added to the request before it is signed.
+		withUploads := func(o *s3.Options) {
+			o.APIOptions = append(o.APIOptions, func(stack *middleware.Stack) error {
+				return stack.Build.Add(middleware.BuildMiddlewareFunc("AddUploads",
+					func(ctx context.Context, in middleware.BuildInput, next middleware.BuildHandler) (middleware.BuildOutput, middleware.Metadata, error) {
+						req, ok := in.Request.(*smithyhttp.Request)
+						if !ok {
+							return middleware.BuildOutput{}, middleware.Metadata{}, fmt.Errorf("unexpected request type %T", in.Request)
+						}
+						req.URL.RawQuery += "&uploads"
+						return next.HandleBuild(ctx, in)
+					}), middleware.After)
+			})
+		}
+		_, err := cl.GetBucketEncryption(ctx, &s3.GetBucketEncryptionInput{Bucket: aws.String(bucket)}, withUploads)
+		if code, status := apiErrorOf(t, err); code != "InvalidArgument" || status != http.StatusBadRequest {
+			t.Fatalf("GetBucketEncryption with ?uploads = %s/%d, want InvalidArgument/400", code, status)
+		}
+		var apiErr smithy.APIError
+		if !errors.As(err, &apiErr) || !strings.Contains(apiErr.ErrorMessage(), "Conflicting query string parameters: encryption, uploads") {
+			t.Fatalf("error message = %q, want the conflicting parameters named, sorted", err)
+		}
+	})
+
 	t.Run("AWSCLI", func(t *testing.T) {
 		// The commands the PR description shows, run by the AWS CLI itself:
 		// the non-standard SSEAlgorithm "none" has to pass the CLI's own
