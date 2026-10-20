@@ -341,6 +341,28 @@ var hiltAllPermissions = []string{
 	"s3:AbortMultipartUpload",
 	"s3:ListMultipartUploadParts",
 	"s3:ListBucketMultipartUploads",
+	// The bucket encryption configuration (fil-forge/hilt#101); removing it
+	// needs the write permission.
+	"s3:GetEncryptionConfiguration",
+	"s3:PutEncryptionConfiguration",
+	// The operations hilt classifies by the gateway's routes
+	// (fil-forge/hilt#102): bucket location, ACL, CORS, policy status,
+	// tagging, versioning and object lock configuration, and object tagging
+	// and attributes.
+	"s3:GetBucketLocation",
+	"s3:GetBucketAcl",
+	"s3:GetBucketCORS",
+	"s3:GetBucketPolicyStatus",
+	"s3:GetBucketTagging",
+	"s3:PutBucketTagging",
+	"s3:GetBucketVersioning",
+	"s3:PutBucketVersioning",
+	"s3:GetBucketObjectLockConfiguration",
+	"s3:PutBucketObjectLockConfiguration",
+	"s3:GetObjectTagging",
+	"s3:PutObjectTagging",
+	"s3:DeleteObjectTagging",
+	"s3:GetObjectAttributes",
 }
 
 // hiltPolicyPermissions are the bucket policy operations, held by service
@@ -354,17 +376,6 @@ var hiltPolicyPermissions = []string{
 	"s3:DeleteBucketPolicy",
 }
 
-// hiltEncryptionPermissions guard the bucket encryption configuration. The
-// published hilt image does not know them until fil-forge/hilt#101 merges
-// (it classifies the ?encryption operations as the plain bucket operations,
-// so s3:CreateBucket and s3:DeleteBucket let them through), so the test key
-// carries them only when [encryptionPermissionsEnabled]; fold them into
-// hiltAllPermissions then.
-var hiltEncryptionPermissions = []string{
-	"s3:GetEncryptionConfiguration",
-	"s3:PutEncryptionConfiguration",
-}
-
 // hiltOverridden reports whether the stack's hilt comes from a local override
 // rather than the published image.
 func hiltOverridden() bool {
@@ -376,13 +387,6 @@ func hiltOverridden() bool {
 // has them.
 func iamScenariosEnabled() bool {
 	return os.Getenv("INGOT_ITEST_IAM") == "1" || hiltOverridden()
-}
-
-// encryptionPermissionsEnabled reports whether the stack's hilt knows the
-// bucket encryption permissions: a hilt override is in use, or
-// INGOT_ITEST_ENCRYPTION_PERMS=1 says the image has them.
-func encryptionPermissionsEnabled() bool {
-	return os.Getenv("INGOT_ITEST_ENCRYPTION_PERMS") == "1" || hiltOverridden()
 }
 
 // hiltProvisionTenant provisions tenantID in hilt with an all-permission
@@ -425,9 +429,6 @@ func hiltProvisionTenantErr(ctx context.Context, s *stack.Stack, tenantID string
 	permissions := slices.Clone(hiltAllPermissions)
 	if iamScenariosEnabled() {
 		permissions = append(permissions, hiltPolicyPermissions...)
-	}
-	if encryptionPermissionsEnabled() {
-		permissions = append(permissions, hiltEncryptionPermissions...)
 	}
 	keyReq, err := json.Marshal(map[string]any{
 		"name":        "itest",
