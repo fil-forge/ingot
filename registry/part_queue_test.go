@@ -106,6 +106,43 @@ func runPartQueueSuite(t *testing.T, st partQueueStore) {
 		}
 	})
 
+	t.Run("a part recorded without span lengths reads back without them", func(t *testing.T) {
+		// Rows written before span_lengths existed hold NULL there; the
+		// reader derives the lengths per blob instead.
+		legacy := id + "-legacy"
+		if err := st.CreateSession(ctx, registry.MultipartSession{UploadID: legacy, Bucket: "b", ObjectKey: "k", Space: space}); err != nil {
+			t.Fatalf("CreateSession: %v", err)
+		}
+		t.Cleanup(func() { _ = st.DeleteSession(ctx, legacy) })
+		p := registry.MultipartPart{UploadID: legacy, PartNumber: 7, ETagMD5: []byte{7}, Size: 1, BlobDigests: []multihash.Multihash{{0xd7}}, State: registry.PartParked}
+		if err := st.PutPart(ctx, p, nil); err != nil {
+			t.Fatalf("PutPart without span lengths: %v", err)
+		}
+		parts, err := st.ListParts(ctx, legacy)
+		if err != nil {
+			t.Fatalf("ListParts over a row without span lengths: %v", err)
+		}
+		found := false
+		for _, got := range parts {
+			if got.PartNumber == 7 {
+				found = true
+				if got.SpanLengths != nil {
+					t.Fatalf("span lengths = %v, want nil", got.SpanLengths)
+				}
+			}
+		}
+		if !found {
+			t.Fatal("part 7 not listed")
+		}
+		queued, err := st.ListParkedParts(ctx, legacy, 100)
+		if err != nil || len(queued) == 0 {
+			t.Fatalf("ListParkedParts over a row without span lengths = %v, %v", queued, err)
+		}
+		if _, err := st.MoveParts(ctx, []registry.MultipartPart{p}, registry.PartParked, registry.PartAccepted); err != nil {
+			t.Fatalf("MoveParts: %v", err)
+		}
+	})
+
 	t.Run("a move skips a replaced part", func(t *testing.T) {
 		first := part(id, 2, multihash.Multihash{0xd2, 0x01})
 		second := part(id, 2, multihash.Multihash{0xd2, 0x02})
