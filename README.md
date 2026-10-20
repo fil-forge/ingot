@@ -242,6 +242,15 @@ deleted by a version of ingot that kept them.
 | `ingot.local_blobs.removals`, `ingot.local_blobs.removed_bytes` | Files and bytes removed, by `reason`: `released`, `parked`, `accepted` (with `cache_writes: false`), `budget`, `budget_forced` (inside a retention window), `orphan` |
 | `ingot.local_blobs.reads` | Body-blob reads, by `tier`: `local` or `network` (the local hit ratio) |
 
+Multipart uploads' parts are accepted in the background while the client
+uploads them (see DESIGN_NOTES), and report:
+
+| Metric | Meaning |
+| -- | -- |
+| `ingot.multipart.parked_age` | Seconds the oldest parked part of an open or completing upload has waited for acceptance, measured every 30s; 0 when none waits. Parts are accepted within seconds, so growth means the acceptance queue is stuck |
+| `ingot.multipart.accept_passes` | Acceptor passes that concluded parts, by `outcome`: `accepted` or `failed` (retried after a backoff; a timed-out pass included) |
+| `ingot.multipart.complete_deferred` | CompleteMultipartUpload requests answered OperationAborted because a part they name was still queued. Botocore clients (the AWS CLI) treat that as a failed upload |
+
 **Manual cleanup.** Every file in `<data_dir>/cache` is safe to delete: the
 provider holds its body. A file in `<data_dir>/spool` may be the only copy.
 The one kind safe to delete is a body the provider already holds, left in

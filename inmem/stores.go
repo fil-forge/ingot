@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"slices"
 	"sort"
 	"time"
 
@@ -646,6 +647,20 @@ func (m *MemStore) DeletePark(_ context.Context, space did.DID, digest multihash
 	return nil
 }
 
+// ConcludePark swaps the park for the location under one lock, as Postgres
+// does in one transaction, when the park is the one addTask names.
+func (m *MemStore) ConcludePark(_ context.Context, loc registry.BlobLocation, addTask []byte) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := locKey{loc.Space, string(loc.Digest)}
+	if park, ok := m.parks[key]; !ok || !bytes.Equal(park.AddTask, addTask) {
+		return false, nil
+	}
+	delete(m.parks, key)
+	m.locations[key] = cloneLocation(loc)
+	return true, nil
+}
+
 // InclusionStore =============================================================
 
 func (m *MemStore) PutInclusions(_ context.Context, incs []registry.BlobInclusion) error {
@@ -752,7 +767,7 @@ func (m *MemStore) PutPart(_ context.Context, p registry.MultipartPart, tree *re
 		return registry.ErrNotFound // FK to multipart_sessions, and open only
 	}
 	if p.State == "" {
-		p.State = registry.PartParked
+		p.State = registry.PartSpooled
 	}
 	if p.CreatedAt.IsZero() {
 		p.CreatedAt = time.Now()
@@ -775,6 +790,84 @@ func (m *MemStore) PutPart(_ context.Context, p registry.MultipartPart, tree *re
 	}
 	trees[p.PartNumber] = cloneTree(tree)
 	return nil
+}
+
+// MoveParts mirrors Postgres's guarded update: each row must still be in
+// from and still name the digests it was read with.
+func (m *MemStore) MoveParts(_ context.Context, parts []registry.MultipartPart, from, to string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	moved := 0
+	for _, want := range parts {
+		p, ok := m.parts[want.UploadID][want.PartNumber]
+		sameDigests := slices.EqualFunc(p.BlobDigests, want.BlobDigests, func(a, b multihash.Multihash) bool { return bytes.Equal(a, b) })
+		if !ok || p.State != from || !sameDigests {
+			continue
+		}
+		p.State = to
+		m.parts[want.UploadID][want.PartNumber] = p
+		moved++
+	}
+	return moved, nil
+}
+
+// ListParkedParts returns copies of up to limit of uploadID's parked parts,
+// in part-number order.
+func (m *MemStore) ListParkedParts(ctx context.Context, uploadID string, limit int) ([]registry.MultipartPart, error) {
+	parts, err := m.ListParts(ctx, uploadID)
+	if err != nil {
+		return nil, err
+	}
+	var out []registry.MultipartPart
+	for _, p := range parts {
+		if p.State == registry.PartParked && len(out) < limit {
+			out = append(out, p)
+		}
+	}
+	return out, nil
+}
+
+// OldestParkedPart returns when the oldest parked part of an open or
+// completing session was recorded.
+func (m *MemStore) OldestParkedPart(context.Context) (time.Time, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var oldest time.Time
+	found := false
+	for uploadID, byNum := range m.parts {
+		s, ok := m.sessions[uploadID]
+		if !ok || (s.State != registry.SessionOpen && s.State != registry.SessionCompleting) {
+			continue
+		}
+		for _, p := range byNum {
+			if p.State == registry.PartParked && (!found || p.CreatedAt.Before(oldest)) {
+				oldest, found = p.CreatedAt, true
+			}
+		}
+	}
+	return oldest, found, nil
+}
+
+// ListUploadsWithParkedParts returns the open and completing sessions with a
+// parked part.
+func (m *MemStore) ListUploadsWithParkedParts(context.Context) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []string
+	for uploadID, byNum := range m.parts {
+		s, ok := m.sessions[uploadID]
+		if !ok || (s.State != registry.SessionOpen && s.State != registry.SessionCompleting) {
+			continue
+		}
+		for _, p := range byNum {
+			if p.State == registry.PartParked {
+				out = append(out, uploadID)
+				break
+			}
+		}
+	}
+	sort.Strings(out)
+	return out, nil
 }
 
 // ListPartTrees returns copies of the upload's tree rows by part number.
@@ -971,6 +1064,7 @@ func clonePart(p registry.MultipartPart) registry.MultipartPart {
 		}
 		p.BlobDigests = ds
 	}
+	p.SpanLengths = slices.Clone(p.SpanLengths)
 	return p
 }
 
@@ -1240,6 +1334,18 @@ func (m *MemStore) StartRelease(_ context.Context, space did.DID, digest multiha
 		m.releases[k] = pr
 	}
 	return registry.ReleaseStarted, nil
+}
+
+func (m *MemStore) ReleasingDigests(_ context.Context, space did.DID, digests []multihash.Multihash) (map[string]bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := map[string]bool{}
+	for _, d := range digests {
+		if _, ok := m.releases[locKey{space, string(d)}]; ok {
+			out[string(d)] = true
+		}
+	}
+	return out, nil
 }
 
 func (m *MemStore) CancelRelease(_ context.Context, space did.DID, digest multihash.Multihash) (registry.ReleaseCancel, error) {
