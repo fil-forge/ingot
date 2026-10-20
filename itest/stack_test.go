@@ -366,8 +366,8 @@ var hiltEncryptionPermissions = []string{
 }
 
 // hiltRoutePermissions guard the operations hilt classifies by the gateway's
-// routes: bucket location, ACL, CORS, tagging, versioning and object lock
-// configuration, and object tagging and attributes. The published hilt image
+// routes: bucket location, ACL, CORS, policy status, tagging, versioning and
+// object lock configuration, and object tagging and attributes. The published hilt image
 // does not know them until fil-forge/hilt#102 merges (it classifies those
 // requests as the plain bucket and object operations), so the test key
 // carries them only when [routePermissionsEnabled]; fold them into
@@ -376,6 +376,7 @@ var hiltRoutePermissions = []string{
 	"s3:GetBucketLocation",
 	"s3:GetBucketAcl",
 	"s3:GetBucketCORS",
+	"s3:GetBucketPolicyStatus",
 	"s3:GetBucketTagging",
 	"s3:PutBucketTagging",
 	"s3:GetBucketVersioning",
