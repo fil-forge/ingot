@@ -399,7 +399,7 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 		Size:        rec.Size,
 		Checksum:    hr.Sum(),
 		BlobDigests: spooled.Blobs.DigestList(),
-		BlobSizes:   blobSizes(spooled.Blobs),
+		SpanLengths: spanLengths(spooled.Blobs),
 		State:       registry.PartSpooled,
 	}
 	var partTree *registry.PartTree
@@ -825,12 +825,12 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 	recordPartChecksums := mpHadChecksum && !missingStored && ckType == types.ChecksumTypeComposite
 	for _, sp := range requested {
 		partStart := blobs.Size()
-		sizes, err := b.partBlobSizes(ctx, bucketState.Space, sess.Plaintext, sp)
+		lengths, err := b.partSpanLengths(ctx, bucketState.Space, sess.Plaintext, sp)
 		if err != nil {
 			return s3response.CompleteMultipartUploadResult{}, "", err
 		}
 		for i, d := range sp.BlobDigests {
-			blobs.Append(d, sizes[i])
+			blobs.Append(d, lengths[i])
 		}
 		partSizes = append(partSizes, blobs.Size()-partStart)
 		partOffsets = append(partOffsets, partStart)
@@ -1504,14 +1504,14 @@ func (b *Backend) acceptRequested(ctx context.Context, space did.DID, uploadID s
 	return nil
 }
 
-// partBlobSizes returns the plaintext length of each of p's blobs, as
-// recorded with the part. A part recorded before the lengths were kept takes
+// partSpanLengths returns the length of the span each of p's blobs covers
+// in the object, as recorded with the part. A part recorded before the lengths were kept takes
 // them from its blobs' intents: the spooled byte count is the plaintext span
 // itself for a session stored as received, else the envelope's, from which
 // the plaintext span follows by the blob's FEE geometry.
-func (b *Backend) partBlobSizes(ctx context.Context, space did.DID, plaintext bool, p registry.MultipartPart) ([]int64, error) {
-	if p.BlobSizes != nil {
-		return p.BlobSizes, nil
+func (b *Backend) partSpanLengths(ctx context.Context, space did.DID, plaintext bool, p registry.MultipartPart) ([]int64, error) {
+	if p.SpanLengths != nil {
+		return p.SpanLengths, nil
 	}
 	sizes := make([]int64, len(p.BlobDigests))
 	for i, d := range p.BlobDigests {
@@ -2247,8 +2247,8 @@ func etagsEqual(a, b string) bool {
 	return strings.Trim(a, `"`) == strings.Trim(b, `"`)
 }
 
-// blobSizes returns the plaintext length of each of blobs, in order.
-func blobSizes(blobs msbucket.BlobRefs) []int64 {
+// spanLengths returns the length of the span each of blobs covers, in order.
+func spanLengths(blobs msbucket.BlobRefs) []int64 {
 	out := make([]int64, 0, len(blobs))
 	for _, blob := range blobs {
 		out = append(out, blob.Len())

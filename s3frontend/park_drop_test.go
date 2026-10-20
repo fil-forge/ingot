@@ -51,11 +51,11 @@ func TestParkedPartHoldsNoLocalCopy(t *testing.T) {
 		t.Fatalf("part state = %q, want parked", part.State)
 	}
 	var total int64
-	for _, n := range part.BlobSizes {
+	for _, n := range part.SpanLengths {
 		total += n
 	}
-	if len(part.BlobSizes) != len(digests) || total != backend.MinPartSize {
-		t.Fatalf("part blob sizes = %v, want one per blob summing to %d", part.BlobSizes, backend.MinPartSize)
+	if len(part.SpanLengths) != len(digests) || total != backend.MinPartSize {
+		t.Fatalf("part span lengths = %v, want one per blob summing to %d", part.SpanLengths, backend.MinPartSize)
 	}
 	for _, d := range digests {
 		if _, err := os.Stat(localPath(b, d)); !os.IsNotExist(err) {

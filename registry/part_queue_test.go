@@ -70,7 +70,7 @@ func runPartQueueSuite(t *testing.T, st partQueueStore) {
 		for i := range sizes {
 			sizes[i] = int64(i + 1)
 		}
-		p := registry.MultipartPart{UploadID: uploadID, PartNumber: n, ETagMD5: []byte{byte(n)}, Size: 1, BlobDigests: digests, BlobSizes: sizes}
+		p := registry.MultipartPart{UploadID: uploadID, PartNumber: n, ETagMD5: []byte{byte(n)}, Size: 1, BlobDigests: digests, SpanLengths: sizes}
 		if err := st.PutPart(ctx, p, nil); err != nil {
 			t.Fatalf("PutPart %d: %v", n, err)
 		}
@@ -92,13 +92,13 @@ func runPartQueueSuite(t *testing.T, st partQueueStore) {
 	t.Run("a part is recorded spooled with its sizes", func(t *testing.T) {
 		part(id, 1, multihash.Multihash{0xd1, 0x0a}, multihash.Multihash{0xd1, 0x0b})
 		parts, err := st.ListParts(ctx, id)
-		if err != nil || len(parts) != 1 || parts[0].State != registry.PartSpooled || !slices.Equal(parts[0].BlobSizes, []int64{1, 2}) {
+		if err != nil || len(parts) != 1 || parts[0].State != registry.PartSpooled || !slices.Equal(parts[0].SpanLengths, []int64{1, 2}) {
 			t.Fatalf("ListParts = %+v, err %v; want one spooled part with sizes [1 2]", parts, err)
 		}
 		// Sizes must match the digests one for one. The in-memory store
 		// does not check this; the Postgres constraint does.
 		if _, ok := st.(*registry.Postgres); ok {
-			bad := registry.MultipartPart{UploadID: id, PartNumber: 9, ETagMD5: []byte{9}, Size: 1, BlobDigests: []multihash.Multihash{{0xd9}}, BlobSizes: []int64{1, 2}}
+			bad := registry.MultipartPart{UploadID: id, PartNumber: 9, ETagMD5: []byte{9}, Size: 1, BlobDigests: []multihash.Multihash{{0xd9}}, SpanLengths: []int64{1, 2}}
 			if err := st.PutPart(ctx, bad, nil); err == nil {
 				t.Fatal("PutPart with mismatched sizes was accepted")
 			}
@@ -133,7 +133,7 @@ func runPartQueueSuite(t *testing.T, st partQueueStore) {
 		if err != nil || len(queued) != 2 || queued[0].PartNumber != 2 || queued[1].PartNumber != 3 {
 			t.Fatalf("ListParkedParts(limit 2) = %+v, err %v; want parts 2 and 3", queued, err)
 		}
-		if len(queued[0].BlobDigests) != 1 || len(queued[0].BlobSizes) != 1 {
+		if len(queued[0].BlobDigests) != 1 || len(queued[0].SpanLengths) != 1 {
 			t.Fatalf("queued part = %+v, want its digests and sizes", queued[0])
 		}
 		if _, err := st.MoveParts(ctx, queued, registry.PartParked, registry.PartAccepted); err != nil {

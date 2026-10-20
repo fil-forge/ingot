@@ -505,7 +505,7 @@ sequenceDiagram
         B->>B: vet the source: copySourceBucket (tenant), resolveVersionIn,<br/>range within the object, copy-source preconditions (412)#59;<br/>the body is the source's plaintext range through the decrypting reader
     end
     B->>B: ingestPart: splitSpool<br/>(resolve the tenant recipient, then encrypt per piece:<br/>fresh CEK → FEE envelope → spool under the ciphertext<br/>digest + params row, as in the PutObject diagram)
-    B->>R: PutPart(spooled, blob_sizes): open sessions only, the row held FOR SHARE<br/>against a concurrent latch#59; a refused part records its blobs' releases
+    B->>R: PutPart(spooled, span_lengths): open sessions only, the row held FOR SHARE<br/>against a concurrent latch#59; a refused part records its blobs' releases
     loop each part blob (parkBlobs)
         alt streamed while spooled
             B->>R: PutPark(AddTask, AcceptTask, PutInvocation), intent parked,<br/>DeleteStream: the PUT already went to piri in splitSpool
@@ -537,7 +537,7 @@ sequenceDiagram
         B-->>C: the ETag/version id recorded on the session (idempotent re-Complete)
     else latch won
         B->>R: LatchSession(open to completing), single winner
-        B->>R: manifest spans from each part's blob_sizes<br/>(rows without them: intent size + FEE geometry)
+        B->>R: manifest spans from each part's span_lengths<br/>(rows without them: intent size + FEE geometry)
         B->>A: drainAcceptor, up to acceptWaitBudget (30 s)
         B->>R: ListParts: the named parts' states
         alt a named part still parked
@@ -620,7 +620,7 @@ stateDiagram-v2
   it waits for the acceptor, finishes `spooled` parts itself, and answers a
   part still `parked` with a 409 that botocore clients treat as final.
 - Rows from before migration 00030 are `parked` or `accepted` and have no
-  `blob_sizes`; Complete derives their lengths per blob.
+  `span_lengths`; Complete derives their lengths per blob.
 
 Sources: `registry/stores.go` (Part* consts, MoveParts, ListParkedParts,
 ListUploadsWithParkedParts), `registry/stores_postgres.go`,
@@ -1092,7 +1092,7 @@ erDiagram
         int part_number PK
         bytea etag_md5
         bytea blob_digests "ordered array"
-        bigint blob_sizes "plaintext length per blob; NULL on rows from before 00030"
+        bigint span_lengths "each blob's span in the object, bytes before encryption (digests are of the stored blob); NULL before 00030"
         text checksum
         text state "spooled, parked, accepted: the acceptor's queue"
     }

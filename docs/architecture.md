@@ -870,13 +870,13 @@ CREATE TABLE ingot.multipart_parts (
     etag_md5      bytea  NOT NULL,                       -- md5 of the part bytes (the part ETag)
     size          bigint NOT NULL,
     blob_digests  bytea[] NOT NULL,                      -- ordered; one entry per ≤ max_blob_size blob
-    blob_sizes    bigint[],                              -- each blob's plaintext length; NULL on rows from before 00030
+    span_lengths  bigint[],                              -- each blob's span in the object (bytes before encryption); NULL on rows from before 00030
     state         text   NOT NULL DEFAULT 'spooled'      -- the acceptor's queue (§7.2)
                       CHECK (state IN ('spooled','parked','accepted')),
     created_at    timestamptz NOT NULL DEFAULT now(),
     checksum      text   NOT NULL DEFAULT '',
     PRIMARY KEY (upload_id, part_number),
-    CHECK (blob_sizes IS NULL OR cardinality(blob_sizes) = cardinality(blob_digests))
+    CHECK (span_lengths IS NULL OR cardinality(span_lengths) = cardinality(blob_digests))
 );
 CREATE INDEX multipart_parts_parked ON ingot.multipart_parts (upload_id) WHERE state = 'parked';
 

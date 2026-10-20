@@ -1043,7 +1043,7 @@ func clonePart(p registry.MultipartPart) registry.MultipartPart {
 		}
 		p.BlobDigests = ds
 	}
-	p.BlobSizes = slices.Clone(p.BlobSizes)
+	p.SpanLengths = slices.Clone(p.SpanLengths)
 	return p
 }
 

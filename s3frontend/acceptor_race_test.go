@@ -304,7 +304,7 @@ func TestAcceptorsShareAPark(t *testing.T) {
 	if err := mem.CreateSession(ctx, registry.MultipartSession{UploadID: other, Bucket: "bk", ObjectKey: "other"}); err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
-	if err := mem.PutPart(ctx, registry.MultipartPart{UploadID: other, PartNumber: 1, ETagMD5: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{d}, BlobSizes: []int64{1}, State: registry.PartParked}, nil); err != nil {
+	if err := mem.PutPart(ctx, registry.MultipartPart{UploadID: other, PartNumber: 1, ETagMD5: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{d}, SpanLengths: []int64{1}, State: registry.PartParked}, nil); err != nil {
 		t.Fatalf("PutPart: %v", err)
 	}
 

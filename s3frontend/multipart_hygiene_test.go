@@ -271,7 +271,7 @@ func TestCompleteFailsClosedOnMissingParamsRow(t *testing.T) {
 	}
 	// The part as a row from before the lengths were kept.
 	part := partRecord(t, mem, uploadID, 1)
-	part.BlobSizes = nil
+	part.SpanLengths = nil
 	trees, err := mem.ListPartTrees(ctx, uploadID)
 	if err != nil {
 		t.Fatalf("ListPartTrees: %v", err)

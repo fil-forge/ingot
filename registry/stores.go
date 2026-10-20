@@ -245,9 +245,7 @@ type MultipartSession struct {
 	StateChangedAt time.Time
 }
 
-// MultipartPart is one row of ingot.multipart_parts. BlobDigests is the
-// ordered list of blobs the part split into (one entry unless the part
-// exceeded max_blob_size).
+// MultipartPart is one row of ingot.multipart_parts.
 type MultipartPart struct {
 	UploadID   string
 	PartNumber int
@@ -258,12 +256,19 @@ type MultipartPart struct {
 	// server-computed); when the session declares none it is the internal
 	// full-object CRC64NVME used to derive the default final checksum at
 	// Complete, and is never echoed by ListParts.
-	Checksum    string
+	Checksum string
+	// BlobDigests are the blobs the part split into, in order (one unless
+	// the part exceeded max_blob_size). Each is the digest of the blob as
+	// stored: its FEE envelope for an encrypted session, the part's own
+	// bytes for a session stored as received.
 	BlobDigests []multihash.Multihash
-	// BlobSizes is each blob's plaintext length, parallel to BlobDigests.
-	// Nil on a row recorded before the lengths were kept; the reader then
-	// derives them per blob.
-	BlobSizes []int64
+	// SpanLengths, parallel to BlobDigests, is the length of the span each
+	// blob covers in the object: how many of the part's bytes it carries,
+	// before encryption. Complete lays the object out by these. For an
+	// encrypted session the stored blob, the bytes its digest names, is
+	// larger by the envelope. Nil on a row recorded before the lengths
+	// were kept; the reader then derives them per blob.
+	SpanLengths []int64
 	// State is one of the Part* values; empty records PartSpooled.
 	State     string
 	CreatedAt time.Time
