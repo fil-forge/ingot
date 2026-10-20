@@ -127,7 +127,7 @@ func runReleaseStartSuite(t *testing.T, st releaseStartStore) {
 		if err := st.CreateSession(ctx, registry.MultipartSession{UploadID: "rs-retry", Bucket: "bk", ObjectKey: "k", Space: space, State: registry.SessionOpen}); err != nil {
 			t.Fatalf("CreateSession: %v", err)
 		}
-		if err := st.PutPart(ctx, registry.MultipartPart{UploadID: "rs-retry", PartNumber: 1, ETagMD5: make([]byte, 16), Size: 7, BlobDigests: []multihash.Multihash{d}, State: registry.PartParked}, nil); err != nil {
+		if _, err := st.PutPart(ctx, registry.MultipartPart{UploadID: "rs-retry", PartNumber: 1, ETagMD5: make([]byte, 16), Size: 7, BlobDigests: []multihash.Multihash{d}, State: registry.PartParked}, nil); err != nil {
 			t.Fatalf("PutPart: %v", err)
 		}
 		if s, err := st.StartRelease(ctx, space, d); err != nil || s != registry.ReleaseStarted {
@@ -177,7 +177,7 @@ func runReleaseStartSuite(t *testing.T, st releaseStartStore) {
 		if err := st.CreateSession(ctx, registry.MultipartSession{UploadID: "rs-1", Bucket: "bk", ObjectKey: "k", Space: space, State: registry.SessionOpen}); err != nil {
 			t.Fatalf("CreateSession: %v", err)
 		}
-		if err := st.PutPart(ctx, registry.MultipartPart{UploadID: "rs-1", PartNumber: 1, ETagMD5: make([]byte, 16), Size: 7, BlobDigests: []multihash.Multihash{d}, State: registry.PartParked}, nil); err != nil {
+		if _, err := st.PutPart(ctx, registry.MultipartPart{UploadID: "rs-1", PartNumber: 1, ETagMD5: make([]byte, 16), Size: 7, BlobDigests: []multihash.Multihash{d}, State: registry.PartParked}, nil); err != nil {
 			t.Fatalf("PutPart: %v", err)
 		}
 		got, err := st.StartRelease(ctx, space, d)

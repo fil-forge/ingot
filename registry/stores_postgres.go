@@ -1168,16 +1168,33 @@ func (r *Postgres) DeleteSession(ctx context.Context, uploadID string) error {
 	return nil
 }
 
-func (r *Postgres) PutPart(ctx context.Context, p MultipartPart, tree *PartTree) error {
+func (r *Postgres) PutPart(ctx context.Context, p MultipartPart, tree *PartTree) ([]multihash.Multihash, error) {
 	state := p.State
 	if state == "" {
 		state = PartSpooled
 	}
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("registry: put part: begin: %w", err)
+		return nil, fmt.Errorf("registry: put part: begin: %w", err)
 	}
 	defer tx.Rollback(ctx)
+	// Writes of one part number are serialised on a transaction-scoped
+	// advisory lock, so the row read here is the one the upsert below
+	// replaces. Read committed alone does not give that: two writes of the
+	// same part number can both read before either lands, and the second's
+	// upsert then replaces the first's row without reporting it. The lock
+	// is keyed by the upload and the part number, in the two-key lock space,
+	// apart from the claim-key locks; a hash collision serialises two
+	// unrelated writes, nothing worse.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1), $2::int)`, p.UploadID, p.PartNumber); err != nil {
+		return nil, fmt.Errorf("registry: put part: lock: %w", err)
+	}
+	var replaced []multihash.Multihash
+	if err := tx.QueryRow(ctx,
+		`SELECT blob_digests FROM ingot.multipart_parts WHERE upload_id = $1 AND part_number = $2`,
+		p.UploadID, p.PartNumber).Scan(&replaced); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("registry: put part: read replaced: %w", err)
+	}
 	// BlobDigests ([]multihash.Multihash) rides pgx's underlying-type plan into
 	// bytea[]: pgx must try that plan before its Stringer plan, or a Multihash
 	// (whose String() is base58) would land as text — pgx v5.10+ orders them
@@ -1199,10 +1216,10 @@ func (r *Postgres) PutPart(ctx context.Context, p MultipartPart, tree *PartTree)
 		       blob_digests = EXCLUDED.blob_digests, span_lengths = EXCLUDED.span_lengths, state = EXCLUDED.state`,
 		p.UploadID, p.PartNumber, p.ETagMD5, p.Size, p.Checksum, p.BlobDigests, p.SpanLengths, state, SessionOpen)
 	if err != nil {
-		return fmt.Errorf("registry: put part: %w", err)
+		return nil, fmt.Errorf("registry: put part: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
-		return ErrNotFound
+		return nil, ErrNotFound
 	}
 	// The tree row follows the part row: a superseding part without a tree
 	// must not keep its predecessor's.
@@ -1218,12 +1235,12 @@ func (r *Postgres) PutPart(ctx context.Context, p MultipartPart, tree *PartTree)
 		_, err = tx.Exec(ctx, `DELETE FROM ingot.multipart_part_trees WHERE upload_id = $1 AND part_number = $2`, p.UploadID, p.PartNumber)
 	}
 	if err != nil {
-		return fmt.Errorf("registry: put part tree: %w", err)
+		return nil, fmt.Errorf("registry: put part tree: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("registry: put part: commit: %w", err)
+		return nil, fmt.Errorf("registry: put part: commit: %w", err)
 	}
-	return nil
+	return replaced, nil
 }
 
 func (r *Postgres) MoveParts(ctx context.Context, parts []MultipartPart, from, to string) (int, error) {

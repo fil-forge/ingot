@@ -405,7 +405,8 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 	if tree != nil {
 		partTree = partTreeOf(tree.FinishRange())
 	}
-	if err := b.multipart.PutPart(ctx, part, partTree); err != nil {
+	replaced, err := b.multipart.PutPart(ctx, part, partTree)
+	if err != nil {
 		// No part row points at the spooled blobs now, whatever went wrong:
 		// the session was completed, aborted or torn down after this upload
 		// was admitted (ErrNotFound), or the write failed. Their release is
@@ -423,6 +424,21 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 			return nil, s3err.GetAPIError(s3err.ErrNoSuchUpload)
 		}
 		return nil, fmt.Errorf("s3frontend: record part: %w", err)
+	}
+	// The row this write replaced need not be the one listed above: a
+	// concurrent upload of the same part number that wrote its row in
+	// between is superseded too, and only this write learns of it. Its
+	// blobs' releases are recorded here, before anything else can fail, as
+	// the listed part's were before the spool. Complete and Abort derive
+	// releases from the rows that stand, so a blob no row names has only
+	// this record to go by. A digest this part names is its own to keep;
+	// one the listing covered has its record already.
+	if missed := digestsNotIn(replaced, superseded, part.BlobDigests); len(missed) > 0 {
+		records, err := b.enqueuePartReleases(ctx, space, missed, nil)
+		if err != nil {
+			return nil, fmt.Errorf("s3frontend: record overwritten part releases: %w", err)
+		}
+		superseding = append(superseding, records...)
 	}
 	// Park the part's blobs on their providers before returning 200 — the
 	// part is durable on the network as soon as the client sees success.
@@ -1130,6 +1146,26 @@ func (b *Backend) recordSessionReleases(ctx context.Context, space did.DID, uplo
 		}
 	}
 	return b.enqueuePartReleases(ctx, space, digests, keep)
+}
+
+// digestsNotIn returns the digests of in that none of the excluded lists
+// name, each once, in order.
+func digestsNotIn(in []mh.Multihash, excluded ...[]mh.Multihash) []mh.Multihash {
+	skip := map[string]bool{}
+	for _, list := range excluded {
+		for _, d := range list {
+			skip[string(d)] = true
+		}
+	}
+	var out []mh.Multihash
+	for _, d := range in {
+		if skip[string(d)] {
+			continue
+		}
+		skip[string(d)] = true
+		out = append(out, d)
+	}
+	return out
 }
 
 // enqueuePartReleases records a deferred release for each of digests that is

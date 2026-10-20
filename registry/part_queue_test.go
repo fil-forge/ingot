@@ -72,7 +72,7 @@ func runPartQueueSuite(t *testing.T, st partQueueStore) {
 			sizes[i] = int64(i + 1)
 		}
 		p := registry.MultipartPart{UploadID: uploadID, PartNumber: n, ETagMD5: []byte{byte(n)}, Size: 1, BlobDigests: digests, SpanLengths: sizes}
-		if err := st.PutPart(ctx, p, nil); err != nil {
+		if _, err := st.PutPart(ctx, p, nil); err != nil {
 			t.Fatalf("PutPart %d: %v", n, err)
 		}
 		return p
@@ -100,7 +100,7 @@ func runPartQueueSuite(t *testing.T, st partQueueStore) {
 		// does not check this; the Postgres constraint does.
 		if _, ok := st.(*registry.Postgres); ok {
 			bad := registry.MultipartPart{UploadID: id, PartNumber: 9, ETagMD5: []byte{9}, Size: 1, BlobDigests: []multihash.Multihash{{0xd9}}, SpanLengths: []int64{1, 2}}
-			if err := st.PutPart(ctx, bad, nil); err == nil {
+			if _, err := st.PutPart(ctx, bad, nil); err == nil {
 				t.Fatal("PutPart with mismatched sizes was accepted")
 			}
 		}
@@ -115,7 +115,7 @@ func runPartQueueSuite(t *testing.T, st partQueueStore) {
 		}
 		t.Cleanup(func() { _ = st.DeleteSession(ctx, legacy) })
 		p := registry.MultipartPart{UploadID: legacy, PartNumber: 7, ETagMD5: []byte{7}, Size: 1, BlobDigests: []multihash.Multihash{{0xd7}}, State: registry.PartParked}
-		if err := st.PutPart(ctx, p, nil); err != nil {
+		if _, err := st.PutPart(ctx, p, nil); err != nil {
 			t.Fatalf("PutPart without span lengths: %v", err)
 		}
 		parts, err := st.ListParts(ctx, legacy)

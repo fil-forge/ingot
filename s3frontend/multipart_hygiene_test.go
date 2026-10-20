@@ -276,7 +276,7 @@ func TestCompleteFailsClosedOnMissingParamsRow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListPartTrees: %v", err)
 	}
-	if err := mem.PutPart(ctx, part, trees[1]); err != nil {
+	if _, err := mem.PutPart(ctx, part, trees[1]); err != nil {
 		t.Fatalf("PutPart: %v", err)
 	}
 
@@ -1734,7 +1734,7 @@ func TestAbortRecordsBlobAnotherAbortingSessionReferences(t *testing.T) {
 	if err := mem.CreateSession(ctx, registry.MultipartSession{UploadID: other, Bucket: bucket, ObjectKey: "other"}); err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
-	if err := mem.PutPart(ctx, registry.MultipartPart{UploadID: other, PartNumber: 1, ETagMD5: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{d}, State: registry.PartParked}, nil); err != nil {
+	if _, err := mem.PutPart(ctx, registry.MultipartPart{UploadID: other, PartNumber: 1, ETagMD5: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{d}, State: registry.PartParked}, nil); err != nil {
 		t.Fatalf("PutPart: %v", err)
 	}
 	if won, err := mem.LatchSession(ctx, other, registry.SessionOpen, registry.SessionAborting); err != nil || !won {
@@ -1769,7 +1769,7 @@ func TestReleaseWaitsForAnotherOpenSessionSharingTheBlob(t *testing.T) {
 	if err := mem.CreateSession(ctx, registry.MultipartSession{UploadID: other, Bucket: bucket, ObjectKey: "other"}); err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
-	if err := mem.PutPart(ctx, registry.MultipartPart{UploadID: other, PartNumber: 1, ETagMD5: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{d}, State: registry.PartParked}, nil); err != nil {
+	if _, err := mem.PutPart(ctx, registry.MultipartPart{UploadID: other, PartNumber: 1, ETagMD5: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{d}, State: registry.PartParked}, nil); err != nil {
 		t.Fatalf("PutPart: %v", err)
 	}
 
@@ -1949,7 +1949,7 @@ func TestSweepLeavesALiveCompleteOnAnOldSession(t *testing.T) {
 		if err != nil {
 			t.Fatalf("multihash.Sum: %v", err)
 		}
-		if err := mem.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 1, ETagMD5: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{d}, State: registry.PartParked}, nil); err != nil {
+		if _, err := mem.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 1, ETagMD5: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{d}, State: registry.PartParked}, nil); err != nil {
 			t.Fatalf("PutPart %s: %v", id, err)
 		}
 		// The write path spools every part blob before recording the part,
@@ -2065,7 +2065,7 @@ type teardownBeforePutPart struct {
 	hook func()
 }
 
-func (s *teardownBeforePutPart) PutPart(ctx context.Context, p registry.MultipartPart, tree *registry.PartTree) error {
+func (s *teardownBeforePutPart) PutPart(ctx context.Context, p registry.MultipartPart, tree *registry.PartTree) ([]multihash.Multihash, error) {
 	if s.hook != nil {
 		hook := s.hook
 		s.hook = nil
@@ -2122,10 +2122,10 @@ type failPutPart struct {
 	fails int
 }
 
-func (f *failPutPart) PutPart(ctx context.Context, p registry.MultipartPart, tree *registry.PartTree) error {
+func (f *failPutPart) PutPart(ctx context.Context, p registry.MultipartPart, tree *registry.PartTree) ([]multihash.Multihash, error) {
 	if f.fails > 0 {
 		f.fails--
-		return errors.New("parts table unavailable")
+		return nil, errors.New("parts table unavailable")
 	}
 	return f.MultipartStore.PutPart(ctx, p, tree)
 }
@@ -2494,5 +2494,142 @@ func TestSupersedeRecordsReleaseOfSharedBlob(t *testing.T) {
 	}
 	if pending, _ := mem.ListReleasesBySpace(ctx, did.Undef); len(pending) != 0 {
 		t.Fatalf("release records survived the session: %v", pending)
+	}
+}
+
+// gatedPartListing is a multipart store whose first `parties` ListParts calls
+// wait for one another, so that many uploads of one part number all list the
+// parts before any of them writes its row.
+type gatedPartListing struct {
+	registry.MultipartStore
+	mu      sync.Mutex
+	parties int
+	met     sync.WaitGroup
+}
+
+func newGatedPartListing(parties int) *gatedPartListing {
+	g := &gatedPartListing{parties: parties}
+	g.met.Add(parties)
+	return g
+}
+
+func (g *gatedPartListing) ListParts(ctx context.Context, uploadID string) ([]registry.MultipartPart, error) {
+	g.mu.Lock()
+	gated := g.parties > 0
+	if gated {
+		g.parties--
+	}
+	g.mu.Unlock()
+	if gated {
+		g.met.Done()
+		g.met.Wait()
+	}
+	return g.MultipartStore.ListParts(ctx, uploadID)
+}
+
+// uploadRecorder is a parkingUploader that remembers every digest uploaded.
+type uploadRecorder struct {
+	*parkingUploader
+	mu       sync.Mutex
+	uploaded []multihash.Multihash
+}
+
+func (u *uploadRecorder) UploadBlob(ctx context.Context, space did.DID, digest multihash.Multihash, size int64, name string, opts ...uploader.UploadOption) (uploader.UploadedBlob, error) {
+	u.mu.Lock()
+	u.uploaded = append(u.uploaded, digest)
+	u.mu.Unlock()
+	return u.parkingUploader.UploadBlob(ctx, space, digest, size, name, opts...)
+}
+
+// TestConcurrentUploadsOfOnePartReleaseTheOverwrittenBlobs: two uploads of
+// the same part number both list the parts before either writes, so neither
+// sees the other's row. The second write replaces the first's row, and the
+// first's blobs are named by no part. The write that replaced the row learns
+// of them from PutPart and records their releases; once both requests are
+// done every blob no part names is released, and the part's own stay.
+func TestConcurrentUploadsOfOnePartReleaseTheOverwrittenBlobs(t *testing.T) {
+	pu := &uploadRecorder{parkingUploader: &parkingUploader{}}
+	gate := newGatedPartListing(2)
+	b, mem := newDeferredBackend(t, pu, func(d *Deps) {
+		gate.MultipartStore = d.Multipart
+		d.Multipart = gate
+	})
+	ctx := context.Background()
+	key := "concurrent-part"
+	uploadID := mpCreate(t, b, key, "", "")
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		body := testBody(int(backend.MinPartSize) + i)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := mpUploadPart(t, b, key, uploadID, 1, body, nil)
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("UploadPart: %v", err)
+		}
+	}
+
+	named := map[string]bool{}
+	for _, d := range hygienePartDigests(t, mem, uploadID, 1) {
+		named[string(d)] = true
+	}
+	pu.mu.Lock()
+	uploaded := append([]multihash.Multihash(nil), pu.uploaded...)
+	pu.mu.Unlock()
+	var orphans []multihash.Multihash
+	for _, d := range uploaded {
+		if !named[string(d)] {
+			orphans = append(orphans, d)
+		}
+	}
+	if len(orphans) == 0 {
+		t.Fatal("every uploaded blob is named by the part: the writes did not interleave")
+	}
+	// The replacing write recorded the overwritten blobs' releases, and ran
+	// them once its own part was parked; one its sibling still held then
+	// stands recorded for the sweeper.
+	recorded := map[string]bool{}
+	pending, err := mem.ListReleasesBySpace(ctx, did.Undef)
+	if err != nil {
+		t.Fatalf("ListReleasesBySpace: %v", err)
+	}
+	for _, pr := range pending {
+		recorded[string(pr.Digest)] = true
+	}
+	for _, d := range orphans {
+		if _, err := mem.IntentByDigest(ctx, d); errors.Is(err, registry.ErrNotFound) && pu.abortedDigests()[string(d)] {
+			continue // released already
+		}
+		if !recorded[string(d)] {
+			t.Fatalf("blob %x of the overwritten part has no release record", d)
+		}
+	}
+
+	if err := b.drainSpaceReleases(ctx, did.Undef); err != nil {
+		t.Fatalf("drainSpaceReleases: %v", err)
+	}
+	for _, d := range orphans {
+		if !pu.abortedDigests()[string(d)] {
+			t.Fatalf("overwritten blob %x not released on the provider", d)
+		}
+		if _, err := mem.IntentByDigest(ctx, d); !errors.Is(err, registry.ErrNotFound) {
+			t.Fatalf("intent for overwritten blob %x survived (err=%v)", d, err)
+		}
+	}
+	for d := range named {
+		if pu.abortedDigests()[d] {
+			t.Fatalf("the part's own blob %x was released", d)
+		}
+		if _, err := mem.ParkByDigest(ctx, multihash.Multihash(d)); err != nil {
+			t.Fatalf("the part's own blob %x lost its park: %v", d, err)
+		}
 	}
 }

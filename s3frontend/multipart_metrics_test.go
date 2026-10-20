@@ -115,7 +115,7 @@ func TestMultipartMetrics_ParkedAge(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListPartTrees: %v", err)
 	}
-	if err := mem.PutPart(ctx, part, trees[1]); err != nil {
+	if _, err := mem.PutPart(ctx, part, trees[1]); err != nil {
 		t.Fatalf("PutPart: %v", err)
 	}
 	if _, err := b.NudgeParkedUploads(ctx); err != nil {
