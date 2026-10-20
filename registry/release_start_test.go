@@ -20,6 +20,7 @@ import (
 
 // releaseStartStore is what the release start and cancel need of a store.
 type releaseStartStore interface {
+	registry.Registry
 	registry.PendingReleaseStore
 	registry.BlobRefStore
 	registry.MultipartStore
@@ -154,9 +155,7 @@ func runReleaseStartSuite(t *testing.T, st releaseStartStore) {
 	t.Run("a claimed blob is not started", func(t *testing.T) {
 		d := enqueue("claimed")
 		locate(space, d)
-		if err := st.AddBlobClaim(ctx, registry.BlobClaim{Digest: d, Bucket: "bk", ObjectKey: "k", VersionID: "v", Space: space}); err != nil {
-			t.Fatalf("AddBlobClaim: %v", err)
-		}
+		mustClaim(t, st, registry.BlobClaim{Digest: d, Bucket: "bk", ObjectKey: "k", VersionID: "v", Space: space})
 		got, err := st.StartRelease(ctx, space, d)
 		if err != nil || got != registry.ReleaseClaimed {
 			t.Fatalf("StartRelease = %v, %v; want ReleaseClaimed", got, err)
@@ -242,25 +241,23 @@ func runReleaseStartSuite(t *testing.T, st releaseStartStore) {
 		// location is one whose blob a release removed since the write
 		// settled it.
 		d := evictDigest(t, "start:unlocated")
-		claim := registry.BlobClaim{Digest: d, Bucket: "bk", ObjectKey: "k", VersionID: "v", Space: space}
-		if err := st.AddBlobClaim(ctx, claim); !errors.Is(err, registry.ErrReleaseInProgress) {
-			t.Fatalf("AddBlobClaim with no location err = %v, want ErrReleaseInProgress", err)
+		c := registry.BlobClaim{Digest: d, Bucket: "bk", ObjectKey: "k", VersionID: "v", Space: space}
+		if err := claim(t, st, c); !errors.Is(err, registry.ErrReleaseInProgress) {
+			t.Fatalf("claim with no location err = %v, want ErrReleaseInProgress", err)
 		}
 		locate(space, d)
-		if err := st.AddBlobClaim(ctx, claim); err != nil {
-			t.Fatalf("AddBlobClaim once located: %v", err)
-		}
+		mustClaim(t, st, c)
 	})
 
 	t.Run("a claim is refused while a release is started", func(t *testing.T) {
 		d := enqueue("claim-during")
-		claim := registry.BlobClaim{Digest: d, Bucket: "bk", ObjectKey: "k", VersionID: "v", Space: space}
+		c := registry.BlobClaim{Digest: d, Bucket: "bk", ObjectKey: "k", VersionID: "v", Space: space}
 		locate(space, d)
 		if s, err := st.StartRelease(ctx, space, d); err != nil || s != registry.ReleaseStarted {
 			t.Fatalf("StartRelease = %v, %v", s, err)
 		}
-		if err := st.AddBlobClaim(ctx, claim); !errors.Is(err, registry.ErrReleaseInProgress) {
-			t.Fatalf("AddBlobClaim during a started release err = %v, want ErrReleaseInProgress", err)
+		if err := claim(t, st, c); !errors.Is(err, registry.ErrReleaseInProgress) {
+			t.Fatalf("claim during a started release err = %v, want ErrReleaseInProgress", err)
 		}
 		if n, _ := st.CountClaims(ctx, space, d); n != 0 {
 			t.Fatalf("a refused claim was recorded: %d", n)
@@ -268,16 +265,12 @@ func runReleaseStartSuite(t *testing.T, st releaseStartStore) {
 		// Another space's release does not refuse this space's claim.
 		other := registry.BlobClaim{Digest: d, Bucket: "bk2", ObjectKey: "k", VersionID: "v", Space: testutil.RandomDID(t)}
 		locate(other.Space, d)
-		if err := st.AddBlobClaim(ctx, other); err != nil {
-			t.Fatalf("AddBlobClaim in another space: %v", err)
-		}
+		mustClaim(t, st, other)
 		// Once the release has run, the claim lands.
 		if err := st.DeleteRelease(ctx, space, d); err != nil {
 			t.Fatalf("DeleteRelease: %v", err)
 		}
-		if err := st.AddBlobClaim(ctx, claim); err != nil {
-			t.Fatalf("AddBlobClaim after the release: %v", err)
-		}
+		mustClaim(t, st, c)
 	})
 
 	t.Run("a generation's claims land together or not at all", func(t *testing.T) {
@@ -292,24 +285,35 @@ func runReleaseStartSuite(t *testing.T, st releaseStartStore) {
 			{Digest: free, Bucket: "bk", ObjectKey: "k", VersionID: "v", Space: space},
 			{Digest: going, Bucket: "bk", ObjectKey: "k", VersionID: "v", Space: space},
 		}
-		if err := st.AddBlobClaims(ctx, claims); !errors.Is(err, registry.ErrReleaseInProgress) {
-			t.Fatalf("AddBlobClaims with one digest under a started release err = %v, want ErrReleaseInProgress", err)
+		// The refused commit records nothing and leaves the root where it was.
+		mustClaim(t, st, registry.BlobClaim{Digest: free, Bucket: "bk", ObjectKey: "seed", VersionID: "v", Space: space})
+		before, err := st.Get(ctx, "bk")
+		if err != nil {
+			t.Fatalf("Get: %v", err)
 		}
-		for _, d := range []multihash.Multihash{free, going} {
-			if n, _ := st.CountClaims(ctx, space, d); n != 0 {
-				t.Fatalf("a refused batch recorded a claim on %x", d)
-			}
+		if err := commit(t, st, "bk", space, registry.RootCommit{Claims: claims}); !errors.Is(err, registry.ErrReleaseInProgress) {
+			t.Fatalf("commit with one digest under a started release err = %v, want ErrReleaseInProgress", err)
+		}
+		if after, _ := st.Get(ctx, "bk"); !after.Root.Equals(before.Root) {
+			t.Fatalf("a refused commit advanced the root: %v -> %v", before.Root, after.Root)
+		}
+		if n, _ := st.CountClaims(ctx, space, free); n != 1 {
+			t.Fatalf("claims on %x after the refused commit = %d, want the seed's 1", free, n)
+		}
+		if n, _ := st.CountClaims(ctx, space, going); n != 0 {
+			t.Fatalf("a refused commit recorded a claim on %x", going)
 		}
 		if err := st.DeleteRelease(ctx, space, going); err != nil {
 			t.Fatalf("DeleteRelease: %v", err)
 		}
-		if err := st.AddBlobClaims(ctx, claims); err != nil {
-			t.Fatalf("AddBlobClaims after the release: %v", err)
+		if err := commit(t, st, "bk", space, registry.RootCommit{Claims: claims}); err != nil {
+			t.Fatalf("commit after the release: %v", err)
 		}
-		for _, d := range []multihash.Multihash{free, going} {
-			if n, _ := st.CountClaims(ctx, space, d); n != 1 {
-				t.Fatalf("claims on %x after the batch = %d, want 1", d, n)
-			}
+		if n, _ := st.CountClaims(ctx, space, free); n != 2 {
+			t.Fatalf("claims on %x after the batch = %d, want the seed's and the batch's", free, n)
+		}
+		if n, _ := st.CountClaims(ctx, space, going); n != 1 {
+			t.Fatalf("claims on %x after the batch = %d, want 1", going, n)
 		}
 	})
 
@@ -354,8 +358,8 @@ func runReleaseStartSuite(t *testing.T, st releaseStartStore) {
 		}
 		// A body names a digest once per span, so a generation can repeat it.
 		claims := []registry.BlobClaim{claim(located, "v1"), claim(unlocated, "v1"), claim(located, "v1")}
-		if err := st.AddBlobClaims(ctx, claims); !errors.Is(err, registry.ErrReleaseInProgress) {
-			t.Fatalf("AddBlobClaims with an unlocated digest err = %v, want ErrReleaseInProgress", err)
+		if err := commit(t, st, "bk", space, registry.RootCommit{Claims: claims}); !errors.Is(err, registry.ErrReleaseInProgress) {
+			t.Fatalf("commit with an unlocated digest err = %v, want ErrReleaseInProgress", err)
 		}
 		if n, _ := st.CountClaims(ctx, space, located); n != 0 {
 			t.Fatalf("a refused batch recorded a claim on the located digest: %d", n)
@@ -365,8 +369,8 @@ func runReleaseStartSuite(t *testing.T, st releaseStartStore) {
 		}
 
 		locate(space, unlocated)
-		if err := st.AddBlobClaims(ctx, claims); err != nil {
-			t.Fatalf("AddBlobClaims: %v", err)
+		if err := commit(t, st, "bk", space, registry.RootCommit{Claims: claims}); err != nil {
+			t.Fatalf("commit: %v", err)
 		}
 		for _, d := range []multihash.Multihash{located, unlocated} {
 			if n, _ := st.CountClaims(ctx, space, d); n != 1 {
@@ -377,8 +381,8 @@ func runReleaseStartSuite(t *testing.T, st releaseStartStore) {
 			}
 		}
 		// Idempotent.
-		if err := st.AddBlobClaims(ctx, claims); err != nil {
-			t.Fatalf("AddBlobClaims again: %v", err)
+		if err := commit(t, st, "bk", space, registry.RootCommit{Claims: claims}); err != nil {
+			t.Fatalf("commit again: %v", err)
 		}
 		if n, _ := st.CountClaims(ctx, space, located); n != 1 {
 			t.Fatalf("claims after a repeat = %d, want 1", n)

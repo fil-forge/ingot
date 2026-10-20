@@ -84,7 +84,6 @@ func newInmemServer(t *testing.T, cfg config.ServerConfig) *Server {
 		Intents:         mem,
 		Locations:       mem,
 		Inclusions:      mem,
-		BlobRefs:        mem,
 		GC:              mem,
 		Multipart:       mem,
 		Parks:           mem,

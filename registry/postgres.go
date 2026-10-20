@@ -123,12 +123,12 @@ func (r *Postgres) CASRoot(ctx context.Context, name string, expect, next cid.Ci
 	return r.casRoot(ctx, r.pool, name, expect, next)
 }
 
-// CASRootAndEnqueueUploadRegistrations advances the root and records the
-// commit's upload registrations in one transaction, so the outbox row exists
-// exactly when the version it describes committed. A conflict or a missing
-// bucket rolls the rows back with the CAS.
-func (r *Postgres) CASRootAndEnqueueUploadRegistrations(ctx context.Context, name string, expect, next cid.Cid, regs []UploadRegistration) error {
-	if len(regs) == 0 {
+// CommitRoot advances the root and records the commit's upload
+// registrations, blob claims and claim drops in one transaction, so each
+// row exists exactly when the version it describes committed. A conflict, a
+// missing bucket or a refused claim rolls everything back with the CAS.
+func (r *Postgres) CommitRoot(ctx context.Context, name string, expect, next cid.Cid, c RootCommit) error {
+	if c.Empty() {
 		return r.CASRoot(ctx, name, expect, next)
 	}
 
@@ -141,7 +141,7 @@ func (r *Postgres) CASRootAndEnqueueUploadRegistrations(ctx context.Context, nam
 	if err := r.casRoot(ctx, tx, name, expect, next); err != nil {
 		return err
 	}
-	for _, reg := range regs {
+	for _, reg := range c.Registrations {
 		// seq comes from the sequence, so the rows of one bucket are numbered
 		// in the order its lock let them commit.
 		if _, err := tx.Exec(ctx, `
@@ -149,6 +149,25 @@ func (r *Postgres) CASRootAndEnqueueUploadRegistrations(ctx context.Context, nam
 			VALUES ($1, $2, $3, $4, $5, $6)
 		`, reg.Bucket, reg.ObjectKey, reg.Space.String(), reg.Root.Bytes(), string(reg.Op), reg.Proofs); err != nil {
 			return fmt.Errorf("registry: enqueue upload registration for %q: %w", name, err)
+		}
+	}
+	// Every claim key the commit touches is locked up front, once, in one
+	// order for every commit, so two commits sharing digests cannot deadlock
+	// whichever of their claims and drops name them.
+	if err := lockClaimKeys(ctx, tx, c); err != nil {
+		return err
+	}
+	if err := addClaims(ctx, tx, c.Claims); err != nil {
+		return err
+	}
+	for _, p := range c.Pins {
+		if err := pinClaim(ctx, tx, p); err != nil {
+			return err
+		}
+	}
+	for _, d := range c.Drops {
+		if err := dropClaim(ctx, tx, d); err != nil {
+			return err
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {

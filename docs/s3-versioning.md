@@ -545,7 +545,7 @@ Rules, preserving the commit-then-reconcile ordering (reconcile strictly after a
   `RemoveBlob`. The evicted-prev-null case fetches the evicted manifest during
   the commit to learn its digests.
 - **Same-id replacement** (null replacing null — the only case where new and discarded share a
-  `(bucket, key, version_id)` row key) → the existing set-diff `reconcileClaims`
+  `(bucket, key, version_id)` row key) → the existing set-diff (`addClaims` / `dropClaims`, carried by the commit)
   (object.go:327) so unchanged digests are never dropped-then-re-added.
 - **Delete markers** have no digests: no claims in, none out.
 
@@ -632,7 +632,7 @@ MFA delete, lifecycle expiration, and multi-instance seq arbitration beyond the 
 | `bucket/manifest.go` | `Seq`, `VersionID` fields (§2.3) |
 | `registry/registry.go`, `postgres.go`, `inmem/store.go` | `State.Versioning`, `VersioningState`, `SetVersioning`, `AllocVersionSeq` (§4.1) |
 | `s3frontend/version.go` (new) | token mint/parse/classify (§3), `revSeqKey`, the value-union dispatch (§2.1), `resolveVersion` (§6.1), the write rule (§5.2), prev-tree helpers |
-| `s3frontend/object.go` | `PutObject` splice → write rule; reads resolve via `resolveVersion`; `GetObject`/`HeadObject` versionId + marker semantics + output ids; `DeleteObject`/`deleteObjectKey`/`DeleteObjects` (§7); `reconcileClaims` call sites carry real version ids (§8); `listWalk` marker skip (§9.1) |
+| `s3frontend/object.go` | `PutObject` splice → write rule; reads resolve via `resolveVersion`; `GetObject`/`HeadObject` versionId + marker semantics + output ids; `DeleteObject`/`deleteObjectKey`/`DeleteObjects` (§7); `addClaims` / `dropClaims` call sites carry real version ids (§8); `listWalk` marker skip (§9.1) |
 | `s3frontend/copy.go`, `multipart.go`, `uploadpartcopy.go` | `commitManifest` → write rule; source-version resolution for `CopyObject` and `UploadPartCopy`; `CopySourceVersionId` on both; Complete's `versionid` return |
 | `s3frontend/bucket.go` | `PutBucketVersioning` (new), `GetBucketVersioning` (real states), versioned `DeleteBucket` guard (§7) |
 | `s3frontend/listversions.go` (new) | `ListObjectVersions` (§9.2) |

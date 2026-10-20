@@ -301,13 +301,10 @@ sequenceDiagram
     TX->>R: AllocVersionSeq
     TX->>TX: mint versionId ("null" unless versioning Enabled),<br/>manifest into OpStaging, re-check If-Match under the lock,<br/>MST splice (new nodes into staging)
     TX->>L: AppendBatch(catalog blocks, OpRoot) with fsync
-    TX->>R: CASRoot(bucket, snapshot, newRoot), guarded
+    TX->>R: CommitRoot(bucket, snapshot, newRoot), guarded, one transaction:<br/>blob_refs gains this version, superseded version rows removed,<br/>a release record per digest whose claims reached 0;<br/>/upload/add(root = this version's manifest CID)<br/>+ /upload/remove per discarded version queued (upload_registrations)
     TX-->>B: committed, lock released
-    Note over B,R: post-commit, off the lock
-    B->>R: reconcileClaims: blob_refs gains this version,<br/>superseded version rows removed
-    B->>U: /blob/remove per digest whose CountClaims reached 0<br/>(+ crypto-shred: its blob_encryption_params row deleted)
-    B->>R: queue /upload/add(root = this version's manifest CID)<br/>+ /upload/remove per discarded version<br/>(upload_registrations, in the CAS transaction)
     B-->>C: 200 + ETag (+ x-amz-version-id when versioning is configured)
+    Note over B,U: the release sweeper runs each record once its grace passes:<br/>/blob/remove (+ crypto-shred: its blob_encryption_params row deleted)
 ```
 
 - A request that dies after allocating a streamed blob leaves its
@@ -707,7 +704,7 @@ flowchart TB
     accepted -.->|"cache_writes false: at accept,<br/>once the location is recorded;<br/>removeLocal + MarkEvicted"| evicted
     accepted -.->|"SweepLocalBlobs over budget (blob_locations row):<br/>removeLocal + MarkEvicted; state unchanged"| evicted
     published -.->|"SweepLocalBlobs over budget (blob_locations row):<br/>removeLocal + MarkEvicted; state unchanged"| evicted
-    published -->|"commit: reconcileClaims adds this version"| refs["blob_refs rows<br/>(digest, bucket, key, version_id)"]
+    published -->|"commit: the root swap's transaction adds this version's claim"| refs["blob_refs rows<br/>(digest, bucket, key, version_id)"]
     refs -->|"version delete or overwrite removes its row"| zero{"CountClaims == 0<br/>for (space, digest)?"}
     zero -->|yes| rel["release record enqueued, due after release_grace<br/>(the published → deleted edge runs it)"]
     zero -->|no| keep["blob retained<br/>(still referenced)"]
@@ -752,7 +749,7 @@ Cross-references: [`architecture.md` §5](./architecture.md#5-the-data-layer),
 [`s3-versioning.md`](./s3-versioning.md) §8.
 
 Sources: `registry/stores.go` (state consts, ListEvictable, ListReleasedPublished), `s3frontend/object.go`
-(ingestBody, reconcileClaims), `s3frontend/localblob_sweep.go` (SweepLocalBlobs),
+(ingestBody, addClaims, dropClaims), `s3frontend/localblob_sweep.go` (SweepLocalBlobs),
 `s3frontend/localblobs.go` (cacheHeld, removeLocal),
 `s3frontend/multipart.go`
 (parkBlobs, acceptParked, recordConcluded, concludeBlobs, enqueuePartReleases),

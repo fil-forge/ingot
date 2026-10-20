@@ -532,7 +532,6 @@ func newDeferredBackend(t *testing.T, up deferredTestUploader, mods ...func(*Dep
 		Registry:        mem,
 		Intents:         mem,
 		Locations:       mem,
-		BlobRefs:        mem,
 		GC:              mem,
 		Multipart:       mem,
 		Parks:           mem,

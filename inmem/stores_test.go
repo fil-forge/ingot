@@ -3,6 +3,7 @@ package inmem
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"sync"
 	"sync/atomic"
@@ -486,8 +487,29 @@ func mustAdd(t *testing.T, m *MemStore, c registry.BlobClaim) {
 	if err := m.PutLocation(context.Background(), registry.BlobLocation{Space: c.Space, Digest: c.Digest, Provider: "did:key:p", URL: "http://p/blob", Size: 1}); err != nil {
 		t.Fatalf("PutLocation: %v", err)
 	}
-	if err := m.AddBlobClaim(context.Background(), c); err != nil {
-		t.Fatalf("AddBlobClaim: %v", err)
+	mustClaim(t, m, c)
+}
+
+var commitSeq atomic.Int64
+
+// mustClaim records c the way a write does: carried by a commit that
+// advances its bucket's root, created on first use (registry.RootCommit).
+func mustClaim(t *testing.T, m *MemStore, c registry.BlobClaim) {
+	t.Helper()
+	ctx := context.Background()
+	s, err := m.Get(ctx, c.Bucket)
+	if errors.Is(err, registry.ErrNotFound) {
+		if err := m.Create(ctx, c.Bucket, c.Space, registry.CreateState{}); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		s, err = m.Get(ctx, c.Bucket)
+	}
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	next := testCid(t, fmt.Sprintf("commit-%d", commitSeq.Add(1)))
+	if err := m.CommitRoot(ctx, c.Bucket, s.Root, next, registry.RootCommit{Claims: []registry.BlobClaim{c}}); err != nil {
+		t.Fatalf("CommitRoot with a claim: %v", err)
 	}
 }
 
@@ -583,9 +605,7 @@ func TestBlobRefs_ClaimPublishesIntent(t *testing.T) {
 	if err := m.PutLocation(ctx, registry.BlobLocation{Space: did.Undef, Digest: d, Provider: "did:key:p", URL: "http://p/blob", Size: 1}); err != nil {
 		t.Fatalf("PutLocation: %v", err)
 	}
-	if err := m.AddBlobClaim(ctx, claim); err != nil {
-		t.Fatalf("AddBlobClaim: %v", err)
-	}
+	mustClaim(t, m, claim)
 	if in, _ := m.GetIntent(ctx, did.Undef, d); in.State != registry.IntentPublished {
 		t.Fatalf("intent after claim = %q, want published", in.State)
 	}
@@ -600,9 +620,7 @@ func TestBlobRefs_ClaimPublishesIntent(t *testing.T) {
 	if err := m.PutLocation(ctx, registry.BlobLocation{Space: did.Undef, Digest: seg, Provider: "did:key:p", URL: "http://p/blob", Size: 1}); err != nil {
 		t.Fatalf("PutLocation: %v", err)
 	}
-	if err := m.AddBlobClaim(ctx, registry.BlobClaim{Digest: seg, Bucket: "b", ObjectKey: "s", VersionID: registry.NullVersionID}); err != nil {
-		t.Fatalf("AddBlobClaim without intent: %v", err)
-	}
+	mustClaim(t, m, registry.BlobClaim{Digest: seg, Bucket: "b", ObjectKey: "s", VersionID: registry.NullVersionID})
 }
 
 // Staleness counts from the last state change: a latch restarts the clock.

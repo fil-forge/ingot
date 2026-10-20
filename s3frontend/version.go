@@ -259,7 +259,7 @@ func (b *Backend) resolveVersionIn(ctx context.Context, st *registry.State, key,
 }
 
 // discardedVersion records a version permanently removed by a commit, for the
-// post-commit reference-index release (§8). seq disambiguates the claim rows:
+// claim drops the commit carries (§8). seq disambiguates the claim rows:
 // unversioned generations share the "null" version id but never a claim id
 // (claimVersionID).
 type discardedVersion struct {
@@ -276,9 +276,10 @@ type discardedVersion struct {
 // allocates the seq under the per-bucket critical section, stamps mf with
 // Seq/VersionID, supersedes the current version per the bucket's versioning
 // state, splices the rebuilt value (the manifest itself until the key's
-// first retained supersession creates its leaf, §2.1/§5.2), and — after the
-// commit is durable — reconciles the reference index (claims for the new
-// version; releases for discarded ones). preCheck, when non-nil, runs under
+// first retained supersession creates its leaf, §2.1/§5.2), and carries the
+// reference index with the commit: claims for the new version, drops (and
+// releases) for discarded ones, all in the root swap's transaction.
+// preCheck, when non-nil, runs under
 // the lock against the superseded current manifest (nil when the key is new)
 // before anything is written, so conditional mutations are race-safe.
 //
@@ -301,13 +302,12 @@ type discardedVersion struct {
 // pinned says the body's digests belong to another object of the space (a
 // same-space copy) rather than to this write's own ingest: their claims are
 // then taken conditionally (see addClaims), and the commit fails with
-// errPinnedBlobReleased if the source is gone.
+// registry.ErrClaimGone if the source is gone.
 func (b *Backend) commitVersion(ctx context.Context, bucketState *registry.State, key string, mf *msbucket.ObjectManifest, blobs msbucket.BlobRefs, initState *msbucket.VersionState, pinned bool, preCheck func(superseded *msbucket.ObjectManifest) error) (msbucket.VersionNode, registry.VersioningState, error) {
 	var node msbucket.VersionNode
-	var discards []discardedVersion
 	var effState registry.VersioningState
 	err := b.txns.WithTx(ctx, bucketState.Name, func(ctx context.Context, tx *bucketop.Tx) (cid.Cid, error) {
-		discards = nil
+		var discards []discardedVersion
 		st := tx.State()
 		effState = st.Versioning
 
@@ -549,19 +549,20 @@ func (b *Backend) commitVersion(ctx context.Context, bucketState *registry.State
 		}
 		node = newNode
 
-		// Claim the new generation's blobs UNDER the lock, before the root
-		// swap: a racing writer that later supersedes this generation always
-		// finds the rows to drop. A failed commit leaves at most a benign
-		// extra claim — never a wrong release; the release sweeper re-checks
-		// claim counts at drain time.
+		// Reference index (§8): the new generation's claims land and the
+		// discarded generations' claims drop in the root swap's transaction,
+		// each last-claim drop recording a deferred release. A commit that
+		// fails writes none of them; a racing writer that later supersedes
+		// this generation always finds the rows to drop.
 		claimed := blobs.DigestList()
 		if blobs == nil {
 			if claimed, err = bodyDigests(ctx, tx, st.Space, mf.Body); err != nil {
 				return cid.Undef, err
 			}
 		}
-		if err := b.addClaims(ctx, st, key, claimVersionID(vid, seq), claimed, pinned); err != nil {
-			return cid.Undef, err
+		b.addClaims(tx, st, key, claimVersionID(vid, seq), claimed, pinned)
+		for _, d := range discards {
+			b.dropClaims(tx, st, key, claimVersionID(d.versionID, d.seq), d.digests)
 		}
 
 		// Content entries (the space's object count): this version registers,
@@ -579,16 +580,6 @@ func (b *Backend) commitVersion(ctx context.Context, bucketState *registry.State
 	})
 	if err != nil {
 		return node, effState, mapCommitError(err, "commit version")
-	}
-
-	// Reference index (§8): the new generation's claims were added under the
-	// lock; the discarded generations' claims drop here, after the commit is
-	// durable, each drop atomically enqueueing a deferred release when the
-	// space's last claim on a digest goes.
-	for _, d := range discards {
-		if err := b.dropClaims(ctx, bucketState, key, claimVersionID(d.versionID, d.seq), d.digests); err != nil {
-			return node, effState, fmt.Errorf("s3frontend: commit reconcile: %w", err)
-		}
 	}
 	return node, effState, nil
 }
@@ -641,7 +632,7 @@ type scopedDeleteResult struct {
 
 // deleteVersionScoped permanently removes one specific version (§7.2): the
 // current version (promoting the newest prev entry, or dropping the leaf when
-// none remain) or a prev entry. Claims are released after the commit; delete
+// none remain) or a prev entry. Its claims drop with the commit; delete
 // markers have none.
 func (b *Backend) deleteVersionScoped(ctx context.Context, bucketState *registry.State, key, versionID string, preconds *backend.ObjectDeletePreconditions) (scopedDeleteResult, error) {
 	kind, seq := classifyVersionID(versionID)
@@ -651,9 +642,8 @@ func (b *Backend) deleteVersionScoped(ctx context.Context, bucketState *registry
 	}
 
 	var res scopedDeleteResult
-	var removed discardedVersion
 	err := b.txns.WithTx(ctx, bucketState.Name, func(ctx context.Context, tx *bucketop.Tx) (cid.Cid, error) {
-		res, removed = scopedDeleteResult{}, discardedVersion{}
+		res = scopedDeleteResult{}
 		st := tx.State()
 		res.versioning = st.Versioning
 		if !st.Root.Defined() {
@@ -695,7 +685,7 @@ func (b *Backend) deleteVersionScoped(ctx context.Context, bucketState *registry
 			if err != nil {
 				return cid.Undef, err
 			}
-			removed = discardedVersion{versionID: targetVersionID(kind, mf), seq: mf.Seq, digests: digests, manifest: valCid}
+			b.dropClaims(tx, st, key, claimVersionID(targetVersionID(kind, mf), mf.Seq), digests)
 			res.found, res.wasMarker = true, mf.DeleteMarker
 			// The version is gone for good, so the space stops counting it.
 			b.enqueueRegistration(ctx, tx, st, key, valCid, registry.UploadRegistrationRemove)
@@ -774,7 +764,7 @@ func (b *Backend) deleteVersionScoped(ctx context.Context, bucketState *registry
 		if err != nil {
 			return cid.Undef, err
 		}
-		removed = discardedVersion{versionID: targetVersionID(kind, targetMf), seq: targetMf.Seq, digests: digests, manifest: targetCid}
+		b.dropClaims(tx, st, key, claimVersionID(targetVersionID(kind, targetMf), targetMf.Seq), digests)
 		res.found, res.wasMarker = true, targetMf.DeleteMarker
 		// The version is gone for good, so the space stops counting it.
 		b.enqueueRegistration(ctx, tx, st, key, targetCid, registry.UploadRegistrationRemove)
@@ -852,12 +842,6 @@ func (b *Backend) deleteVersionScoped(ctx context.Context, bucketState *registry
 	})
 	if err != nil {
 		return res, mapCommitError(err, "delete version")
-	}
-	if !res.found {
-		return res, nil
-	}
-	if err := b.dropClaims(ctx, bucketState, key, claimVersionID(removed.versionID, removed.seq), removed.digests); err != nil {
-		return res, fmt.Errorf("s3frontend: delete version reconcile: %w", err)
 	}
 	return res, nil
 }

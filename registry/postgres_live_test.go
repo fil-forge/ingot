@@ -135,9 +135,7 @@ func TestPostgresStores_Live(t *testing.T) {
 			if err := r.PutLocation(ctx, registry.BlobLocation{Space: sp, Digest: digest, Provider: "did:key:p", URL: "http://p/blob", Size: 1}); err != nil {
 				t.Fatalf("PutLocation: %v", err)
 			}
-			if err := r.AddBlobClaim(ctx, registry.BlobClaim{Digest: digest, Bucket: bucket, ObjectKey: key, VersionID: registry.NullVersionID, Space: sp}); err != nil {
-				t.Fatalf("AddBlobClaim: %v", err)
-			}
+			mustClaim(t, r, registry.BlobClaim{Digest: digest, Bucket: bucket, ObjectKey: key, VersionID: registry.NullVersionID, Space: sp})
 		}
 		add("b", "k1", space)
 		add("b", "k2", space)
@@ -168,9 +166,7 @@ func TestPostgresStores_Live(t *testing.T) {
 		if err := r.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: pubDigest, Provider: "did:key:p", URL: "http://p/blob", Size: 1}); err != nil {
 			t.Fatalf("PutLocation: %v", err)
 		}
-		if err := r.AddBlobClaim(ctx, registry.BlobClaim{Digest: pubDigest, Bucket: "b", ObjectKey: "kp", VersionID: registry.NullVersionID, Space: space}); err != nil {
-			t.Fatalf("AddBlobClaim (publish): %v", err)
-		}
+		mustClaim(t, r, registry.BlobClaim{Digest: pubDigest, Bucket: "b", ObjectKey: "kp", VersionID: registry.NullVersionID, Space: space})
 		if in, err := r.GetIntent(ctx, space, pubDigest); err != nil || in.State != registry.IntentPublished {
 			t.Fatalf("intent after claim = %+v, err %v (want published)", in, err)
 		}
@@ -184,59 +180,62 @@ func TestPostgresStores_Live(t *testing.T) {
 		if err := r.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: multihash.Multihash([]byte{0x12, 0x20, 0xc1, 0xa2}), Provider: "did:key:p", URL: "http://p/blob", Size: 1}); err != nil {
 			t.Fatalf("PutLocation: %v", err)
 		}
-		if err := r.AddBlobClaim(ctx, registry.BlobClaim{Digest: multihash.Multihash([]byte{0x12, 0x20, 0xc1, 0xa2}), Bucket: "b", ObjectKey: "kn", VersionID: registry.NullVersionID, Space: space}); err != nil {
-			t.Fatalf("AddBlobClaim (no intent): %v", err)
-		}
+		mustClaim(t, r, registry.BlobClaim{Digest: multihash.Multihash([]byte{0x12, 0x20, 0xc1, 0xa2}), Bucket: "b", ObjectKey: "kn", VersionID: registry.NullVersionID, Space: space})
 	})
 
 	t.Run("pin claims require an existing claim, all or nothing", func(t *testing.T) {
 		space := testutil.RandomDID(t)
 		d1 := multihash.Multihash([]byte{0x12, 0x20, 0xb1, 0x01})
 		d2 := multihash.Multihash([]byte{0x12, 0x20, 0xb1, 0x02})
-		pin := func(ds ...multihash.Multihash) []registry.BlobClaim {
+		pins := func(ds ...multihash.Multihash) []registry.BlobClaim {
 			var out []registry.BlobClaim
 			for _, d := range ds {
 				out = append(out, registry.BlobClaim{Digest: d, Bucket: "pb", ObjectKey: "copy", VersionID: "null#7", Space: space})
 			}
 			return out
 		}
-		if ok, err := r.PinBlobClaims(ctx, pin(d1)); err != nil || ok {
-			t.Fatalf("pin with no claim to attach to: ok=%v err=%v, want refused", ok, err)
+		// A refused pin fails the commit, and the root stays where it was.
+		before, _ := r.Get(ctx, "pb")
+		if err := pin(t, r, pins(d1)); !errors.Is(err, registry.ErrClaimGone) {
+			t.Fatalf("pin with no claim to attach to: err=%v, want ErrClaimGone", err)
+		}
+		if after, _ := r.Get(ctx, "pb"); before != nil && !after.Root.Equals(before.Root) {
+			t.Fatalf("a refused pin advanced the root: %v -> %v", before.Root, after.Root)
 		}
 		if err := r.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: d1, Provider: "did:key:p", URL: "http://p/blob", Size: 1}); err != nil {
 			t.Fatalf("PutLocation: %v", err)
 		}
-		if err := r.AddBlobClaim(ctx, registry.BlobClaim{Digest: d1, Bucket: "pb", ObjectKey: "src", VersionID: "null#1", Space: space}); err != nil {
-			t.Fatalf("AddBlobClaim: %v", err)
-		}
+		mustClaim(t, r, registry.BlobClaim{Digest: d1, Bucket: "pb", ObjectKey: "src", VersionID: "null#1", Space: space})
 		// d1 is claimed, d2 is not: nothing is recorded.
-		if ok, err := r.PinBlobClaims(ctx, pin(d1, d2)); err != nil || ok {
-			t.Fatalf("pin with one unclaimed digest: ok=%v err=%v, want refused", ok, err)
+		if err := pin(t, r, pins(d1, d2)); !errors.Is(err, registry.ErrClaimGone) {
+			t.Fatalf("pin with one unclaimed digest: err=%v, want ErrClaimGone", err)
 		}
 		if n, _ := r.CountClaims(ctx, space, d1); n != 1 {
 			t.Fatalf("refused pin left %d claims on d1, want the source's 1", n)
 		}
-		if ok, err := r.PinBlobClaims(ctx, pin(d1)); err != nil || !ok {
-			t.Fatalf("pin beside a live claim: ok=%v err=%v, want recorded", ok, err)
+		if err := pin(t, r, pins(d1)); err != nil {
+			t.Fatalf("pin beside a live claim: %v, want recorded", err)
 		}
-		if ok, err := r.PinBlobClaims(ctx, pin(d1)); err != nil || !ok {
-			t.Fatalf("repeated pin: ok=%v err=%v, want idempotent true", ok, err)
+		if err := pin(t, r, pins(d1)); err != nil {
+			t.Fatalf("repeated pin: %v, want idempotent", err)
 		}
 		if n, _ := r.CountClaims(ctx, space, d1); n != 2 {
 			t.Fatalf("claims after pin = %d, want 2", n)
 		}
 		// A claim in another space does not qualify.
 		other := testutil.RandomDID(t)
-		if ok, err := r.PinBlobClaims(ctx, []registry.BlobClaim{{Digest: d1, Bucket: "pb2", ObjectKey: "copy", VersionID: "null#1", Space: other}}); err != nil || ok {
-			t.Fatalf("pin against another space's claim: ok=%v err=%v, want refused", ok, err)
+		if err := pin(t, r, []registry.BlobClaim{{Digest: d1, Bucket: "pb2", ObjectKey: "copy", VersionID: "null#1", Space: other}}); !errors.Is(err, registry.ErrClaimGone) {
+			t.Fatalf("pin against another space's claim: err=%v, want ErrClaimGone", err)
 		}
-		// Dropping the source's claim beside the pin enqueues nothing; dropping
-		// the pin too does.
-		if enq, err := r.DropClaimEnqueueRelease(ctx, d1, "pb", "src", "null#1", space, time.Now()); err != nil || enq {
-			t.Fatalf("drop source beside pin: enqueued=%v err=%v, want false", enq, err)
+		// Dropping the source's claim beside the pin records no release;
+		// dropping the pin too does.
+		drop(t, r, registry.ClaimDrop{Digest: d1, Bucket: "pb", ObjectKey: "src", VersionID: "null#1", Space: space, NotBefore: time.Now()})
+		if releaseRecorded(t, r, space, d1) {
+			t.Fatalf("drop of the source beside the pin recorded a release")
 		}
-		if enq, err := r.DropClaimEnqueueRelease(ctx, d1, "pb", "copy", "null#7", space, time.Now()); err != nil || !enq {
-			t.Fatalf("drop last claim: enqueued=%v err=%v, want true", enq, err)
+		drop(t, r, registry.ClaimDrop{Digest: d1, Bucket: "pb", ObjectKey: "copy", VersionID: "null#7", Space: space, NotBefore: time.Now()})
+		if !releaseRecorded(t, r, space, d1) {
+			t.Fatalf("drop of the last claim recorded no release")
 		}
 	})
 
@@ -246,27 +245,19 @@ func TestPostgresStores_Live(t *testing.T) {
 			if err := r.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: digest, Provider: "did:key:p", URL: "http://p/blob", Size: 1}); err != nil {
 				t.Fatalf("PutLocation: %v", err)
 			}
-			if err := r.AddBlobClaim(ctx, registry.BlobClaim{Digest: digest, Bucket: "rb", ObjectKey: key, VersionID: "null#1", Space: space}); err != nil {
-				t.Fatalf("AddBlobClaim: %v", err)
-			}
+			mustClaim(t, r, registry.BlobClaim{Digest: digest, Bucket: "rb", ObjectKey: key, VersionID: "null#1", Space: space})
 		}
 		add("k1")
 		add("k2")
 
 		due := time.Now().Add(-time.Second) // already due
-		enq, err := r.DropClaimEnqueueRelease(ctx, digest, "rb", "k1", "null#1", space, due)
-		if err != nil {
-			t.Fatalf("DropClaimEnqueueRelease (first): %v", err)
+		drop(t, r, registry.ClaimDrop{Digest: digest, Bucket: "rb", ObjectKey: "k1", VersionID: "null#1", Space: space, NotBefore: due})
+		if releaseRecorded(t, r, space, digest) {
+			t.Fatalf("first drop recorded a release while a claim remains")
 		}
-		if enq {
-			t.Fatalf("first drop enqueued a release while a claim remains")
-		}
-		enq, err = r.DropClaimEnqueueRelease(ctx, digest, "rb", "k2", "null#1", space, due)
-		if err != nil {
-			t.Fatalf("DropClaimEnqueueRelease (last): %v", err)
-		}
-		if !enq {
-			t.Fatalf("last drop did not enqueue a release")
+		drop(t, r, registry.ClaimDrop{Digest: digest, Bucket: "rb", ObjectKey: "k2", VersionID: "null#1", Space: space, NotBefore: due})
+		if !releaseRecorded(t, r, space, digest) {
+			t.Fatalf("last drop recorded no release")
 		}
 
 		listed, err := r.ListDueReleases(ctx, time.Now(), 10)
@@ -968,7 +959,7 @@ func TestPostgresStores_Live(t *testing.T) {
 	})
 }
 
-// TestCASRootAndEnqueueUploadRegistrationsOnASingleConnection proves the
+// TestCommitRootOnASingleConnection proves the
 // enqueueing CAS never needs two pooled connections at once. Resolving a
 // conflict or a missing bucket by reading through the pool, while the
 // transaction already holds a connection, deadlocks outright on a
@@ -976,7 +967,7 @@ func TestPostgresStores_Live(t *testing.T) {
 // commits exhaust it.
 //
 //	INGOT_TEST_DSN=postgres://... GOWORK=off go test ./registry/ -run SingleConnection -v
-func TestCASRootAndEnqueueUploadRegistrationsOnASingleConnection(t *testing.T) {
+func TestCommitRootOnASingleConnection(t *testing.T) {
 	dsn := os.Getenv("INGOT_TEST_DSN")
 	if dsn == "" {
 		t.Skip("set INGOT_TEST_DSN to run the live Postgres store test")
@@ -1027,7 +1018,7 @@ func TestCASRootAndEnqueueUploadRegistrationsOnASingleConnection(t *testing.T) {
 	// A bucket that does not exist: the conflict path has to say so without
 	// reaching back to the pool.
 	err = bounded("missing bucket", func(c context.Context) error {
-		return reg.CASRootAndEnqueueUploadRegistrations(c, "cas-single-conn", cid.Undef, liveCid(t, "next"), regs)
+		return reg.CommitRoot(c, "cas-single-conn", cid.Undef, liveCid(t, "next"), registry.RootCommit{Registrations: regs})
 	})
 	if !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("missing bucket: got %v, want ErrNotFound", err)
@@ -1042,7 +1033,7 @@ func TestCASRootAndEnqueueUploadRegistrationsOnASingleConnection(t *testing.T) {
 
 	// A root that does not match: the same path, reporting a conflict.
 	err = bounded("stale root", func(c context.Context) error {
-		return reg.CASRootAndEnqueueUploadRegistrations(c, "cas-single-conn", liveCid(t, "stale"), liveCid(t, "next"), regs)
+		return reg.CommitRoot(c, "cas-single-conn", liveCid(t, "stale"), liveCid(t, "next"), registry.RootCommit{Registrations: regs})
 	})
 	if !errors.Is(err, registry.ErrConflict) {
 		t.Fatalf("stale root: got %v, want ErrConflict", err)
@@ -1050,7 +1041,7 @@ func TestCASRootAndEnqueueUploadRegistrationsOnASingleConnection(t *testing.T) {
 
 	// And the happy path still commits both the root and its rows.
 	if err := bounded("commit", func(c context.Context) error {
-		return reg.CASRootAndEnqueueUploadRegistrations(c, "cas-single-conn", cid.Undef, liveCid(t, "next"), regs)
+		return reg.CommitRoot(c, "cas-single-conn", cid.Undef, liveCid(t, "next"), registry.RootCommit{Registrations: regs})
 	}); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
@@ -1093,11 +1084,11 @@ func TestDeletingABucketCascadesItsUploadRegistrations(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = r.Delete(context.Background(), "cascade-bucket") })
 
-	if err := r.CASRootAndEnqueueUploadRegistrations(ctx, "cascade-bucket", cid.Undef, liveCid(t, "root"),
-		[]registry.UploadRegistration{{
+	if err := r.CommitRoot(ctx, "cascade-bucket", cid.Undef, liveCid(t, "root"),
+		registry.RootCommit{Registrations: []registry.UploadRegistration{{
 			Bucket: "cascade-bucket", ObjectKey: "k", Space: space,
 			Root: liveCid(t, "mf"), Op: registry.UploadRegistrationAdd, Proofs: []byte("proofs"),
-		}}); err != nil {
+		}}}); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
 
@@ -1127,14 +1118,15 @@ func TestDeletingABucketCascadesItsUploadRegistrations(t *testing.T) {
 	}
 }
 
-// TestConcurrentAddBlobClaimsLive runs two commits claiming the same
-// thousands of digests at once, many times over, one listing them in reverse.
-// AddBlobClaims takes a claim-key lock per digest, so the two take
-// overlapping lock sets and must take them in one order whatever order their
-// claims arrive in, or Postgres aborts one with a deadlock error.
+// TestConcurrentCommitClaimsLive runs two commits claiming the same thousands
+// of digests at once, many times over, one listing them in reverse. A commit
+// takes a claim-key lock per digest, so the two take overlapping lock sets
+// and must take them in one order whatever order their claims arrive in, or
+// Postgres aborts one with a deadlock error. Each writer commits to a bucket
+// of its own: the root swap serialises the writers of one bucket.
 //
-//	INGOT_TEST_DSN=postgres://... GOWORK=off go test ./registry/ -run ConcurrentAddBlobClaims -v
-func TestConcurrentAddBlobClaimsLive(t *testing.T) {
+//	INGOT_TEST_DSN=postgres://... GOWORK=off go test ./registry/ -run ConcurrentCommitClaims -v
+func TestConcurrentCommitClaimsLive(t *testing.T) {
 	dsn := os.Getenv("INGOT_TEST_DSN")
 	if dsn == "" {
 		t.Skip("set INGOT_TEST_DSN to run the live Postgres store test")
@@ -1151,6 +1143,18 @@ func TestConcurrentAddBlobClaimsLive(t *testing.T) {
 	r := registry.NewPostgres(pool)
 	space := testutil.RandomDID(t)
 
+	buckets := []string{"concurrent-claims-w0-" + space.String()[len(space.String())-8:], "concurrent-claims-w1-" + space.String()[len(space.String())-8:]}
+	for _, name := range buckets {
+		if err := r.Create(ctx, name, space, registry.CreateState{Tenant: testutil.RandomDID(t)}); err != nil {
+			t.Fatalf("create bucket %q: %v", name, err)
+		}
+	}
+	t.Cleanup(func() {
+		for _, name := range buckets {
+			_ = r.Delete(context.Background(), name)
+		}
+	})
+
 	const n = 2000
 	digests := make([]multihash.Multihash, n)
 	for i := range digests {
@@ -1163,14 +1167,14 @@ func TestConcurrentAddBlobClaimsLive(t *testing.T) {
 			t.Fatalf("PutLocation: %v", err)
 		}
 	}
-	claims := func(version string, reversed bool) []registry.BlobClaim {
+	claims := func(bucket, version string, reversed bool) []registry.BlobClaim {
 		out := make([]registry.BlobClaim, n)
 		for i, d := range digests {
 			j := i
 			if reversed {
 				j = n - 1 - i
 			}
-			out[j] = registry.BlobClaim{Digest: d, Bucket: "bk", ObjectKey: "k", VersionID: version, Space: space}
+			out[j] = registry.BlobClaim{Digest: d, Bucket: bucket, ObjectKey: "k", VersionID: version, Space: space}
 		}
 		return out
 	}
@@ -1178,13 +1182,18 @@ func TestConcurrentAddBlobClaimsLive(t *testing.T) {
 	for round := 0; round < 10; round++ {
 		errs := make(chan error, 2)
 		for w := 0; w < 2; w++ {
-			go func(version string, reversed bool) {
-				errs <- r.AddBlobClaims(ctx, claims(version, reversed))
-			}(fmt.Sprintf("r%d-w%d", round, w), w == 1)
+			go func(bucket, version string, reversed bool) {
+				st, err := r.Get(ctx, bucket)
+				if err != nil {
+					errs <- err
+					return
+				}
+				errs <- r.CommitRoot(ctx, bucket, st.Root, liveCid(t, bucket+version), registry.RootCommit{Claims: claims(bucket, version, reversed)})
+			}(buckets[w], fmt.Sprintf("r%d-w%d", round, w), w == 1)
 		}
 		for w := 0; w < 2; w++ {
 			if err := <-errs; err != nil {
-				t.Fatalf("round %d: AddBlobClaims: %v", round, err)
+				t.Fatalf("round %d: commit: %v", round, err)
 			}
 		}
 	}
