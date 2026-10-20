@@ -827,6 +827,27 @@ func (m *MemStore) ListParkedParts(ctx context.Context, uploadID string, limit i
 	return out, nil
 }
 
+// OldestParkedPart returns when the oldest parked part of an open or
+// completing session was recorded.
+func (m *MemStore) OldestParkedPart(context.Context) (time.Time, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var oldest time.Time
+	found := false
+	for uploadID, byNum := range m.parts {
+		s, ok := m.sessions[uploadID]
+		if !ok || (s.State != registry.SessionOpen && s.State != registry.SessionCompleting) {
+			continue
+		}
+		for _, p := range byNum {
+			if p.State == registry.PartParked && (!found || p.CreatedAt.Before(oldest)) {
+				oldest, found = p.CreatedAt, true
+			}
+		}
+	}
+	return oldest, found, nil
+}
+
 // ListUploadsWithParkedParts returns the open and completing sessions with a
 // parked part.
 func (m *MemStore) ListUploadsWithParkedParts(context.Context) ([]string, error) {

@@ -6,6 +6,7 @@ import (
 	"os"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/multiformats/go-multihash"
@@ -165,6 +166,22 @@ func runPartQueueSuite(t *testing.T, st partQueueStore) {
 		}
 		if ids, _ := st.ListUploadsWithParkedParts(ctx); !slices.Contains(ids, id) {
 			t.Fatalf("ListUploadsWithParkedParts = %v; want the completing %s", ids, id)
+		}
+		// The completing upload's parked part 4 is waiting. A shared
+		// database may hold older ones, so only the bounds are checked.
+		parts, err := st.ListParts(ctx, id)
+		if err != nil {
+			t.Fatalf("ListParts: %v", err)
+		}
+		var waiting time.Time
+		for _, p := range parts {
+			if p.State == registry.PartParked {
+				waiting = p.CreatedAt
+			}
+		}
+		oldest, found, err := st.OldestParkedPart(ctx)
+		if err != nil || !found || oldest.After(waiting) {
+			t.Fatalf("OldestParkedPart = %v, %v, %v; want one no later than part 4's %v", oldest, found, err, waiting)
 		}
 	})
 

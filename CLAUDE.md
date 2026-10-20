@@ -165,8 +165,9 @@ Internal:
   with. The daemon's exporter setup is `cmd/telemetry.go` (traces and, under
   the same `OTEL_EXPORTER_OTLP_*` variables, metrics). Local blob storage's
   instruments (`ingot.local_blobs.*`: usage by directory, budget and
-  stalled-upload gauges, removals by reason, reads by tier) are created on the global meter
-  provider, through `s3frontend.Deps.MeterProvider` and
+  stalled-upload gauges, removals by reason, reads by tier) and the multipart
+  acceptor's (`ingot.multipart.*`: parked-part age, passes by outcome,
+  deferred Completes) are created on the global meter provider, through `s3frontend.Deps.MeterProvider` and
   `Layered.CountBlobReads`; with no provider installed they are no-ops.
   versitygw passes
   the backend the bare `*fasthttp.RequestCtx` as its context, so the

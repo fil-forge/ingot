@@ -1275,6 +1275,21 @@ func (r *Postgres) ListParkedParts(ctx context.Context, uploadID string, limit i
 	return scanParts(rows, uploadID)
 }
 
+func (r *Postgres) OldestParkedPart(ctx context.Context) (time.Time, bool, error) {
+	var oldest *time.Time
+	if err := r.pool.QueryRow(ctx,
+		`SELECT min(p.created_at) FROM ingot.multipart_parts p
+		   JOIN ingot.multipart_sessions s ON s.upload_id = p.upload_id
+		  WHERE p.state = $1 AND s.state IN ($2, $3)`,
+		PartParked, SessionOpen, SessionCompleting).Scan(&oldest); err != nil {
+		return time.Time{}, false, fmt.Errorf("registry: oldest parked part: %w", err)
+	}
+	if oldest == nil {
+		return time.Time{}, false, nil
+	}
+	return *oldest, true, nil
+}
+
 func (r *Postgres) ListUploadsWithParkedParts(ctx context.Context) ([]string, error) {
 	rows, err := r.pool.Query(ctx,
 		`SELECT s.upload_id FROM ingot.multipart_sessions s

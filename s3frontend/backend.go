@@ -130,6 +130,15 @@ type Backend struct {
 	// registration of the usage and budget gauges (nil when not registered).
 	localBlobMetrics localBlobMetrics
 	localBlobGauges  metric.Registration
+	// multipartMetrics counts acceptor passes and deferred Completes;
+	// multipartGauges is the registration of the parked-age gauge (nil when
+	// not registered). parkedAgeSeconds is the accept sweeper's latest
+	// measure of the oldest parked part's wait, read by that gauge;
+	// parkedAgeKnown is set once a sweep has measured it.
+	multipartMetrics multipartMetrics
+	multipartGauges  metric.Registration
+	parkedAgeSeconds atomic.Int64
+	parkedAgeKnown   atomic.Bool
 	// regionKeys unwraps region-wrapped CEKs for the decrypting read path.
 	regionKeys regionkey.Provider
 	// tenantKeys yields the tenant wrap key each write encrypts to (the FEE
@@ -348,6 +357,7 @@ func New(d Deps) *Backend {
 		mp = otel.GetMeterProvider()
 	}
 	b.localBlobMetrics, b.localBlobGauges = newLocalBlobMetrics(mp, b, logger)
+	b.multipartMetrics, b.multipartGauges = newMultipartMetrics(mp, b, logger)
 	return b
 }
 

@@ -172,7 +172,10 @@ record (started or not), or one with neither a park nor a location, goes
 back to `spooled`, which is Complete's to finish. At start and every 30 s the
 accept sweeper nudges the acceptor of every open or completing upload with
 parked parts, so work a stopped process left, or a nudge that went missing,
-is picked up.
+is picked up, and measures how long the oldest parked part has waited.
+`ingot.multipart.parked_age`, `ingot.multipart.accept_passes` (by outcome)
+and `ingot.multipart.complete_deferred` report the queue's health; the
+README lists them.
 
 A pass concludes its blobs in one `/ucan/conclude`: one invocation carrying
 up to `MaxConcludeReceipts` (1000) put receipts (`receipts`, the plural

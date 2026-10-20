@@ -1501,6 +1501,7 @@ func (b *Backend) acceptRequested(ctx context.Context, space did.DID, uploadID s
 		}
 	}
 	if queued > 0 {
+		b.multipartMetrics.completeDeferred.Add(ctx, 1)
 		b.logger.Info("multipart completion deferred: parts still queued for acceptance",
 			zap.String("upload_id", uploadID), zap.Int("parts", queued), zap.Error(passErr))
 		return errCompleteInProgress

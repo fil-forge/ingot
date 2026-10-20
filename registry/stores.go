@@ -692,6 +692,10 @@ type MultipartStore interface {
 	// completing sessions that have a 'parked' part, for the acceptor's
 	// restart sweep.
 	ListUploadsWithParkedParts(ctx context.Context) ([]string, error)
+	// OldestParkedPart returns when the oldest 'parked' part of an open or
+	// completing session was recorded, and false when there is none: how
+	// long the acceptance queue's oldest entry has waited.
+	OldestParkedPart(ctx context.Context) (time.Time, bool, error)
 	// ListParts returns uploadID's parts in part-number order. The trees
 	// are separate (ListPartTrees): a part's tree is up to hundreds of KiB
 	// and only Complete merges them, while UploadPart, ListParts and the

@@ -117,8 +117,20 @@ func (b *Backend) WaitAcceptors() {
 // NudgeParkedUploads nudges the acceptor of every open or completing upload
 // with parked parts, and returns how many it nudged. It is the restart sweep:
 // the part rows are the queue, so nothing is lost when a process stops with
-// work outstanding or a nudge goes missing.
+// work outstanding or a nudge goes missing. It also measures how long the
+// oldest parked part has waited, for the ingot.multipart.parked_age gauge.
 func (b *Backend) NudgeParkedUploads(ctx context.Context) (int, error) {
+	oldest, found, err := b.multipart.OldestParkedPart(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("s3frontend: oldest parked part: %w", err)
+	}
+	var age int64
+	if found {
+		age = int64(max(time.Since(oldest), 0) / time.Second)
+	}
+	b.parkedAgeSeconds.Store(age)
+	b.parkedAgeKnown.Store(true)
+
 	ids, err := b.multipart.ListUploadsWithParkedParts(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("s3frontend: list uploads with parked parts: %w", err)
@@ -318,6 +330,10 @@ func (b *Backend) runAcceptor(ctx context.Context, uploadID string, a *acceptor)
 		passCtx, cancel := context.WithTimeout(ctx, acceptPassTimeout)
 		did, err := b.acceptPass(passCtx, uploadID)
 		cancel()
+
+		if did || err != nil {
+			b.multipartMetrics.pass(ctx, err)
+		}
 
 		m.mu.Lock()
 		a.lastErr = err
