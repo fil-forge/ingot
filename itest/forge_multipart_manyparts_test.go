@@ -3,6 +3,7 @@
 package itest
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -14,13 +15,20 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
+	"github.com/fil-forge/smelt/pkg/stack"
 )
 
 // TestForgeMultipartManyParts measures how long CompleteMultipartUpload takes
-// as a function of part count. It is the benchmark for the batched
-// /ucan/conclude work: every part parks one blob at UploadPart, and Complete
-// must accept all of them before it can answer, so its wall time is the
-// protocol cost of N accepts.
+// as a function of part count. Every part parks its blobs at UploadPart and
+// the upload's acceptor accepts them while the upload is still running, so
+// Complete waits only for the last batch: its wall time should stay roughly
+// flat as the part count grows.
+//
+// A Complete that finds parts still queued answers OperationAborted, a 409
+// the AWS CLI treats as final. The benchmark retries it anyway, counting the
+// retries into Complete's time, so a run still measures the acceptor's lag;
+// any retry in the summary line is a Complete the AWS CLI would have failed.
 //
 // The number that matters is "complete" in the summary line; the upload
 // phase is reported only so a run can be sanity-checked against the disk and
@@ -35,6 +43,9 @@ import (
 // sprue with 507 and every UploadPart fails as an opaque 500. Reclaim the
 // previous run's volumes (`docker volume ls -qf dangling=true | grep
 // smeltery-`) between runs, and lower INGOT_ITEST_MP_PARTS to fit.
+//
+// INGOT_ITEST_MP_SMALLBLOB=1 runs the stack with max_blob_size at 64 KiB
+// (withSmallBlobConfig), so each 5 MiB part spans about 80 blobs.
 //
 //	INGOT_ITEST_MP_BENCH=1 INGOT_ITEST_MP_PARTS=1000 \
 //	  GOWORK=off go test -tags itest ./itest -run TestForgeMultipartManyParts -v -timeout 60m
@@ -66,8 +77,13 @@ func TestForgeMultipartManyParts(t *testing.T) {
 	const partSize = int64(5) << 20
 	total := partSize * int64(parts)
 
+	var opts []stack.Option
+	if os.Getenv("INGOT_ITEST_MP_SMALLBLOB") != "" {
+		opts = append(opts, withSmallBlobConfig())
+	}
+
 	ctx := t.Context()
-	s, endpoint := forgeStack(t)
+	s, endpoint := forgeStack(t, opts...)
 	accessKey, secretKey := hiltProvisionTenant(t, ctx, s, "mpbench")
 	// Not sdkClient: the upstream S3Conf pins a 30s per-request timeout, and
 	// Complete over thousands of parts is the thing being measured.
@@ -133,11 +149,22 @@ func TestForgeMultipartManyParts(t *testing.T) {
 		float64(total)/(1<<20)/uploadTook.Seconds())
 
 	completeStart := time.Now()
-	if _, err := cl.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
-		Bucket: aws.String(bucket), Key: aws.String(key), UploadId: aws.String(uploadID),
-		MultipartUpload: &types.CompletedMultipartUpload{Parts: completed},
-	}); err != nil {
-		t.Fatalf("CompleteMultipartUpload after %s: %v", time.Since(completeStart).Round(time.Millisecond), err)
+	retries := 0
+	for {
+		_, err := cl.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+			Bucket: aws.String(bucket), Key: aws.String(key), UploadId: aws.String(uploadID),
+			MultipartUpload: &types.CompletedMultipartUpload{Parts: completed},
+		})
+		var apiErr smithy.APIError
+		if errors.As(err, &apiErr) && apiErr.ErrorCode() == "OperationAborted" && time.Since(completeStart) < 30*time.Minute {
+			retries++
+			time.Sleep(time.Second)
+			continue
+		}
+		if err != nil {
+			t.Fatalf("CompleteMultipartUpload after %s: %v", time.Since(completeStart).Round(time.Millisecond), err)
+		}
+		break
 	}
 	completeTook := time.Since(completeStart)
 
@@ -167,10 +194,10 @@ func TestForgeMultipartManyParts(t *testing.T) {
 		}
 	}
 
-	t.Logf("BENCH parts=%d partSize=%d totalBytes=%d upload=%s complete=%s completePerPart=%s",
+	t.Logf("BENCH parts=%d partSize=%d totalBytes=%d upload=%s complete=%s completePerPart=%s completeRetries=%d",
 		parts, partSize, total, uploadTook.Round(time.Millisecond),
 		completeTook.Round(time.Millisecond),
-		(completeTook / time.Duration(parts)).Round(time.Microsecond))
+		(completeTook / time.Duration(parts)).Round(time.Microsecond), retries)
 }
 
 // mpPartByteAt is the many-parts benchmark's content formula: every part has

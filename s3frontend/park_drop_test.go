@@ -11,13 +11,30 @@ import (
 	"github.com/fil-forge/versitygw/backend"
 	"github.com/multiformats/go-multihash"
 
+	"github.com/fil-forge/ingot/inmem"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/uploader"
 )
 
+// partRecord returns uploadID's part n as recorded.
+func partRecord(t *testing.T, mem *inmem.MemStore, uploadID string, n int) registry.MultipartPart {
+	t.Helper()
+	parts, err := mem.ListParts(context.Background(), uploadID)
+	if err != nil {
+		t.Fatalf("ListParts: %v", err)
+	}
+	for _, p := range parts {
+		if p.PartNumber == n {
+			return p
+		}
+	}
+	t.Fatalf("part %d not recorded for upload %s", n, uploadID)
+	return registry.MultipartPart{}
+}
+
 // TestParkedPartHoldsNoLocalCopy: once UploadPart parks a part's blobs, their
-// spool copies are gone, and Complete concludes them from the park rows
-// alone.
+// spool copies are gone, the part is queued for acceptance with each blob's
+// plaintext length, and Complete concludes them from the park rows alone.
 func TestParkedPartHoldsNoLocalCopy(t *testing.T) {
 	b, mem := newDeferredBackend(t, &parkingUploader{})
 	ctx := context.Background()
@@ -29,6 +46,17 @@ func TestParkedPartHoldsNoLocalCopy(t *testing.T) {
 		t.Fatalf("UploadPart: %v", err)
 	}
 	digests := hygienePartDigests(t, mem, uploadID, 1)
+	part := partRecord(t, mem, uploadID, 1)
+	if part.State != registry.PartParked {
+		t.Fatalf("part state = %q, want parked", part.State)
+	}
+	var total int64
+	for _, n := range part.SpanLengths {
+		total += n
+	}
+	if len(part.SpanLengths) != len(digests) || total != backend.MinPartSize {
+		t.Fatalf("part span lengths = %v, want one per blob summing to %d", part.SpanLengths, backend.MinPartSize)
+	}
 	for _, d := range digests {
 		if _, err := os.Stat(localPath(b, d)); !os.IsNotExist(err) {
 			t.Fatalf("parked blob %s spool copy: stat err=%v, want not-exist", d, err)
@@ -62,8 +90,9 @@ func (*failingParker) UploadBlob(context.Context, did.DID, multihash.Multihash, 
 	return uploader.UploadedBlob{}, errors.New("provider unreachable")
 }
 
-// TestFailedParkKeepsLocalCopy: a part whose park failed keeps its spool copy,
-// the only one, for Complete's never-parked fallback.
+// TestFailedParkKeepsLocalCopy: a part whose park failed stays spooled, out of
+// the acceptance queue, and keeps its spool copy, the only one, for Complete's
+// never-parked fallback.
 func TestFailedParkKeepsLocalCopy(t *testing.T) {
 	b, mem := newDeferredBackend(t, &failingParker{})
 	ctx := context.Background()
@@ -72,6 +101,9 @@ func TestFailedParkKeepsLocalCopy(t *testing.T) {
 	uploadID := mpCreate(t, b, key, "", "")
 	if _, err := mpUploadPart(t, b, key, uploadID, 1, testBody(int(backend.MinPartSize)), nil); err == nil {
 		t.Fatalf("UploadPart succeeded, want the park failure")
+	}
+	if part := partRecord(t, mem, uploadID, 1); part.State != registry.PartSpooled {
+		t.Fatalf("part state after a failed park = %q, want spooled", part.State)
 	}
 	for _, d := range hygienePartDigests(t, mem, uploadID, 1) {
 		if _, err := os.Stat(localPath(b, d)); err != nil {

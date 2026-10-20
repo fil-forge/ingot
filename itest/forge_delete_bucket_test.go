@@ -17,18 +17,20 @@ import (
 // TestForgeDeleteBucketReleases is the regression gate for DeleteBucket's
 // release legs, which sign with the request's own proofs: hilt delegates
 // blob.Abort and blob.Remove with s3:DeleteBucket (fil-forge/hilt#78), and
-// ingot invokes both from the deleting request. The delete arrives with two
-// kinds of blob still registered in the bucket's space, each taking a
-// different leg:
+// ingot invokes them from the deleting request. The delete arrives with two
+// kinds of blob still registered in the bucket's space, each reaching the
+// network by a different path:
 //
-//	a parked part     — an open multipart upload's blob, never accepted:
-//	                    /blob/abort, which piri serves as /blob/reject
-//	a pending release — a deleted object's accepted blob, its release still
-//	                    behind the reader grace: /blob/remove → /blob/release
+//	an open upload's part — accepted while the upload is open, released by
+//	                        the session teardown: /blob/remove → /blob/release
+//	a pending release     — a deleted object's accepted blob, its release still
+//	                        behind the reader grace, run by the drain:
+//	                        /blob/remove → /blob/release
 //
 // Both must traverse the network before hilt will delete the space, so a
 // regression in the grants or in proof propagation fails the DeleteBucket
-// itself. The conformance DeleteBucket cases cannot catch it: their buckets
+// itself. The /blob/abort leg (a part parked and not yet accepted) is not
+// reached here: the upload's acceptor accepts a part within moments. The conformance DeleteBucket cases cannot catch it: their buckets
 // are empty or non-empty, never holding registrations.
 //
 // The delete is signed by a second access key that has never written, and
@@ -58,8 +60,8 @@ func TestForgeDeleteBucketReleases(t *testing.T) {
 		t.Fatalf("CreateBucket: %v", err)
 	}
 
-	// The parked part, set up first because it is the slower half: an open
-	// multipart upload whose part is durable on piri but not accepted.
+	// The open upload's part, set up first because it is the slower half: a
+	// part the upload's acceptor accepts while the upload stays open.
 	create, err := cl.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
 		Bucket: aws.String(bucket), Key: aws.String(mpKey),
 	})
@@ -75,10 +77,7 @@ func TestForgeDeleteBucketReleases(t *testing.T) {
 	// The part rows are the only index to the blob and the teardown destroys
 	// them, so read the digest while the session is still open.
 	partDigest := partBlobDigests(t, ctx, s, aws.ToString(create.UploadId), 1)[0]
-	waitForPiriReceived(t, ctx, s, 30*time.Second, partDigest)
-	if piriLogHasLine(t, ctx, s, "/blob/accept", partDigest) {
-		t.Fatalf("part blob %s was accepted while its upload is open — parking is broken", partDigest)
-	}
+	waitForPiriLogLine(t, ctx, s, 60*time.Second, "/blob/accept", partDigest)
 
 	// The pending release, set up last: an object put and deleted, whose
 	// blob release waits in the deferred queue behind the reader grace (60s
@@ -106,11 +105,8 @@ func TestForgeDeleteBucketReleases(t *testing.T) {
 		t.Fatalf("DeleteBucket: %v", err)
 	}
 
-	// The parked part was abandoned on piri, and never accepted.
-	waitForPiriLogLine(t, ctx, s, 60*time.Second, "/blob/reject", partDigest)
-	if piriLogHasLine(t, ctx, s, "/blob/accept", partDigest) {
-		t.Fatalf("parked part blob %s was accepted by the teardown — abort/accept exclusivity is broken", partDigest)
-	}
+	// The open upload's accepted part was removed from piri.
+	waitForPiriLogLine(t, ctx, s, 60*time.Second, "/blob/release", partDigest)
 
 	// The deleted object's blob was released, record and all.
 	for _, d := range objDigests {
@@ -123,7 +119,7 @@ func TestForgeDeleteBucketReleases(t *testing.T) {
 	if _, err := delCl.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: aws.String(bucket)}); err == nil {
 		t.Fatalf("HeadBucket after DeleteBucket succeeded, want NoSuchBucket")
 	}
-	t.Logf("delete bucket released a parked part (%s) and a queued object blob on the deleting key's own proofs", partDigest)
+	t.Logf("delete bucket released an open upload's part (%s) and a queued object blob on the deleting key's own proofs", partDigest)
 }
 
 // digestB58 renders a hex-encoded stored digest the way piri's handlers log
