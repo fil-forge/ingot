@@ -23,9 +23,12 @@ ALTER TABLE ingot.multipart_parts
     ADD CONSTRAINT multipart_parts_span_lengths_check
         CHECK (span_lengths IS NULL OR cardinality(span_lengths) = cardinality(blob_digests));
 
--- The acceptor lists an upload's parked parts on every pass.
+-- The acceptor lists an upload's parked parts in part order on every pass;
+-- the part number in the key lets it read them in that order, past none of
+-- the parts already accepted. The restart sweep and the oldest-wait query use
+-- the upload_id prefix.
 CREATE INDEX multipart_parts_parked
-    ON ingot.multipart_parts (upload_id) WHERE state = 'parked';
+    ON ingot.multipart_parts (upload_id, part_number) WHERE state = 'parked';
 
 -- +goose Down
 -- A spooled part reads as parked to the earlier code, whose Complete concludes

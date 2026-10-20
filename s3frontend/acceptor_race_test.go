@@ -607,3 +607,97 @@ func TestAcceptorKeepsAParkThatReplacesALocation(t *testing.T) {
 		t.Fatalf("part state = %q, want spooled (left for Complete)", states[1])
 	}
 }
+
+// TestTeardownDoesNotWaitOutABackoff: an upload whose acceptor is backing
+// off after a failed pass is aborted. No pass is in flight, so the abort
+// goes ahead at once rather than wait for the acceptor to wake and exit; the
+// acceptor's next pass finds the session gone and concludes nothing.
+func TestTeardownDoesNotWaitOutABackoff(t *testing.T) {
+	shrinkAcceptBackoff(t)
+	acceptBackoffFirst, acceptBackoffMax = time.Hour, time.Hour
+	cc := &countingConcluder{fails: 1000}
+	b, _ := newDeferredBackend(t, cc)
+	bucket, key := "bk", "teardown-during-backoff"
+	uploadID := mpCreate(t, b, key, "", "")
+	uploadDistinctParts(t, b, key, uploadID, 1)
+
+	startAcceptors(t, b)
+	if err := b.drainAcceptor(context.Background(), uploadID); err == nil {
+		t.Fatal("the acceptor's pass did not fail")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	start := time.Now()
+	if err := b.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{Bucket: &bucket, Key: &key, UploadId: &uploadID}); err != nil {
+		t.Fatalf("Abort during the acceptor's backoff: %v (after %v)", err, time.Since(start))
+	}
+}
+
+// lateRegisteringConcluder is a providerConcluder whose conclude fails as a
+// timed-out one does, after the provider has accepted: the upload service
+// is still working, and registers the blob once it finishes, after the
+// caller has given up.
+type lateRegisteringConcluder struct {
+	providerConcluder
+	delay time.Duration
+}
+
+func (c *lateRegisteringConcluder) ConcludeBlobs(_ context.Context, _ did.DID, parked []uploader.UploadedBlob) ([]*uploader.BlobLocation, error) {
+	c.mu.Lock()
+	if c.acceptedOnProvider == nil {
+		c.acceptedOnProvider = map[string]bool{}
+	}
+	for _, p := range parked {
+		c.acceptedOnProvider[string(p.Digest)] = true
+	}
+	c.mu.Unlock()
+	time.AfterFunc(c.delay, func() {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if c.registered == nil {
+			c.registered = map[string]bool{}
+		}
+		for _, p := range parked {
+			c.registered[string(p.Digest)] = true
+		}
+	})
+	return make([]*uploader.BlobLocation, len(parked)), context.DeadlineExceeded
+}
+
+// TestFailedConcludeHoldsItsBlobsReleases: a conclude times out while the
+// upload service is still accepting, and the upload is then aborted. The
+// abort's release waits while the failed conclude's blobs stay marked, and
+// runs from the release sweeper once the service has registered the blob, so
+// it removes the registration rather than send a remove that the
+// registration would outlive.
+func TestFailedConcludeHoldsItsBlobsReleases(t *testing.T) {
+	shrinkAcceptBackoff(t)
+	acceptBackoffFirst, acceptBackoffMax = time.Hour, time.Hour
+	savedHold := failedConcludeHold
+	failedConcludeHold = 300 * time.Millisecond
+	t.Cleanup(func() { failedConcludeHold = savedHold })
+
+	lc := &lateRegisteringConcluder{delay: 100 * time.Millisecond}
+	b, mem := newDeferredBackend(t, lc, func(d *Deps) { d.Remover = lc })
+	ctx := context.Background()
+	bucket, key := "bk", "failed-conclude-hold"
+	uploadID := mpCreate(t, b, key, "", "")
+	uploadDistinctParts(t, b, key, uploadID, 1)
+	d := hygienePartDigests(t, mem, uploadID, 1)[0]
+
+	startAcceptors(t, b)
+	if err := b.drainAcceptor(ctx, uploadID); err == nil {
+		t.Fatal("the conclude did not fail")
+	}
+	if err := b.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{Bucket: &bucket, Key: &key, UploadId: &uploadID}); err != nil {
+		t.Fatalf("Abort: %v", err)
+	}
+	if got, _ := mem.ReleasingDigests(ctx, did.Undef, []multihash.Multihash{d}); !got[string(d)] {
+		t.Fatal("the release ran while the failed conclude's blob was still held")
+	}
+
+	time.Sleep(failedConcludeHold + 200*time.Millisecond)
+	drainReleases(t, b)
+	assertGone(t, mem, d)
+	lc.assertNoneLeft(t)
+}

@@ -630,3 +630,43 @@ func TestAcceptorPromotesPartsBesideAFailingBlob(t *testing.T) {
 		t.Fatalf("Complete of part 1: %v", err)
 	}
 }
+
+// acceptedWithErrorConcluder accepts every blob and returns its location,
+// and an error beside them, as a conclude whose response failed after the
+// acceptances were read does.
+type acceptedWithErrorConcluder struct {
+	parkingUploader
+}
+
+func (c *acceptedWithErrorConcluder) ConcludeBlobs(ctx context.Context, space did.DID, parked []uploader.UploadedBlob) ([]*uploader.BlobLocation, error) {
+	locations, err := c.parkingUploader.ConcludeBlobs(ctx, space, parked)
+	if err != nil {
+		return locations, err
+	}
+	return locations, errors.New("response ended early")
+}
+
+// TestAcceptorPromotesRecordedPartsOfAFailedConclude: the conclude returns
+// an error, but with every blob accepted and recorded. The pass still fails
+// and backs off, yet its parts are accepted, so a Complete naming them
+// commits at once rather than answer OperationAborted until a retry.
+func TestAcceptorPromotesRecordedPartsOfAFailedConclude(t *testing.T) {
+	shrinkAcceptBackoff(t)
+	acceptBackoffFirst, acceptBackoffMax = time.Hour, time.Hour
+	b, mem := newDeferredBackend(t, &acceptedWithErrorConcluder{})
+	ctx := context.Background()
+	key := "accepted-with-error"
+	uploadID := mpCreate(t, b, key, "", "")
+	parts := uploadDistinctParts(t, b, key, uploadID, 2)
+
+	startAcceptors(t, b)
+	if err := b.drainAcceptor(ctx, uploadID); err == nil {
+		t.Fatal("the pass did not report the conclude's error")
+	}
+	if states := partStates(t, mem, uploadID); !allIn(states, registry.PartAccepted) {
+		t.Fatalf("part states = %v, want all accepted", states)
+	}
+	if _, err := mpComplete(t, b, key, uploadID, parts, nil); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+}

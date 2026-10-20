@@ -1572,10 +1572,11 @@ func (b *Backend) concludeBlobs(ctx context.Context, space did.DID, blobs []msbu
 	// blob back to be concluded instead. Each round needs a park to appear
 	// after classification, which one in-flight write allows once.
 	for round := 0; round < concludeRounds && len(digests) > 0; round++ {
-		neverParked, _, err := b.acceptParked(ctx, space, digests, acceptForCommit)
+		out, err := b.acceptParked(ctx, space, digests, acceptForCommit)
 		if err != nil {
 			return err
 		}
+		neverParked := out.left
 		// Never parked: the spooled copy drives the whole synchronous upload.
 		todo := digestSet(neverParked)
 		digests = nil
@@ -1599,6 +1600,13 @@ func (b *Backend) concludeBlobs(ctx context.Context, space did.DID, blobs []msbu
 	return nil
 }
 
+// failedConcludeHold is how long a conclude that failed or timed out keeps
+// its blobs marked as concluding (see markConcluding): the upload service
+// may still be accepting them, and registers what it accepts only when it
+// finishes. A release of one of them defers meanwhile and runs from the
+// release sweeper after. Package-level so tests can shrink it.
+var failedConcludeHold = 2 * time.Minute
+
 // concludeRounds bounds concludeBlobs' rounds of conclude and upload.
 const concludeRounds = 3
 
@@ -1617,29 +1625,47 @@ const (
 	acceptInBackground
 )
 
+// acceptOutcome is what acceptParked did with its digests.
+type acceptOutcome struct {
+	// left are the digests left for Complete: one with neither a park nor a
+	// location never parked (a crash between spool and park), to upload from
+	// its spool copy, and, for the acceptor, one with a release record.
+	left []mh.Multihash
+	// failed are the digests the conclude did not accept and record.
+	failed []mh.Multihash
+	// settled is set once every digest was classified and the conclude, if
+	// any, has run: every digest in neither left nor failed is then accepted
+	// and recorded, even beside an error. Unset, nothing is known of any.
+	settled bool
+}
+
 // acceptParked accepts digests on Forge as far as their parks allow, for
 // Complete and for the upload's acceptor. A digest already located needs
 // nothing; a parked one concludes its deferred /http/put receipt, firing
-// /blob/accept, and its park is swapped for its location. It returns the
-// digests it left for Complete: one with neither row never parked (a crash
-// between spool and park), to upload from its spool copy, and, for the
-// acceptor, one with a release record. When the conclude or a record fails
-// it also returns the digests that are not accepted and recorded, beside
-// the error; every other digest is.
-func (b *Backend) acceptParked(ctx context.Context, space did.DID, digests []mh.Multihash, mode acceptMode) (left, failed []mh.Multihash, err error) {
+// /blob/accept, and its park is swapped for its location. The outcome says
+// which digests it left for Complete and which the conclude failed; an
+// error before every digest was classified leaves it unsettled.
+func (b *Backend) acceptParked(ctx context.Context, space did.DID, digests []mh.Multihash, mode acceptMode) (out acceptOutcome, err error) {
+	var left, failed []mh.Multihash
 	ctx, span := tracing.Start(ctx, "blobs.conclude", attribute.Int("ingot.blobs.total", len(digests)))
 	defer func() { tracing.End(span, err) }()
 
 	// Marked before the release records are read, and until the conclude
 	// has answered, by which time the upload service has registered what it
-	// accepted (see markConcluding).
+	// accepted (see markConcluding). A conclude that failed or timed out may
+	// still be running at the service, so its mark is held a while longer.
 	unmark := b.markConcluding(space, digests)
-	defer unmark()
+	held := false
+	defer func() {
+		if !held {
+			unmark()
+		}
+	}()
 
 	var releasing map[string]bool
 	if mode == acceptInBackground {
 		if releasing, err = b.pendingReleases.ReleasingDigests(ctx, space, digests); err != nil {
-			return nil, nil, fmt.Errorf("lookup releases: %w", err)
+			return acceptOutcome{}, fmt.Errorf("lookup releases: %w", err)
 		}
 	}
 
@@ -1666,12 +1692,12 @@ func (b *Backend) acceptParked(ctx context.Context, space did.DID, digests []mh.
 				continue
 			}
 		} else if settled, err = b.settleRelease(ctx, space, digest); err != nil {
-			return nil, nil, err
+			return acceptOutcome{}, err
 		}
 		if existing, err := b.locations.GetLocation(ctx, space, digest); err == nil && existing != nil && settled {
 			located, err := b.markLocated(ctx, space, digest)
 			if err != nil {
-				return nil, nil, err
+				return acceptOutcome{}, err
 			}
 			if !located {
 				// Released since the lookup: whatever stands now is for
@@ -1681,7 +1707,7 @@ func (b *Backend) acceptParked(ctx context.Context, space did.DID, digests []mh.
 			}
 			continue
 		} else if err != nil && !errors.Is(err, registry.ErrNotFound) {
-			return nil, nil, fmt.Errorf("lookup location: %w", err)
+			return acceptOutcome{}, fmt.Errorf("lookup location: %w", err)
 		}
 		// Not located, or located by a release that has since run and
 		// taken the blob from the provider, and its park with it: concluded
@@ -1689,7 +1715,7 @@ func (b *Backend) acceptParked(ctx context.Context, space did.DID, digests []mh.
 
 		park, err := b.parks.GetPark(ctx, space, digest)
 		if err != nil && !errors.Is(err, registry.ErrNotFound) {
-			return nil, nil, fmt.Errorf("lookup park: %w", err)
+			return acceptOutcome{}, fmt.Errorf("lookup park: %w", err)
 		}
 		if park == nil {
 			left = append(left, digest)
@@ -1698,11 +1724,11 @@ func (b *Backend) acceptParked(ctx context.Context, space did.DID, digests []mh.
 		}
 		addTask, err := cid.Cast(park.AddTask)
 		if err != nil {
-			return nil, nil, fmt.Errorf("decode park add task: %w", err)
+			return acceptOutcome{}, fmt.Errorf("decode park add task: %w", err)
 		}
 		acceptTask, err := cid.Cast(park.AcceptTask)
 		if err != nil {
-			return nil, nil, fmt.Errorf("decode park accept task: %w", err)
+			return acceptOutcome{}, fmt.Errorf("decode park accept task: %w", err)
 		}
 		toConclude = append(toConclude, uploader.UploadedBlob{
 			Digest:        digest,
@@ -1718,14 +1744,19 @@ func (b *Backend) acceptParked(ctx context.Context, space did.DID, digests []mh.
 		attribute.Int("ingot.blobs.uploaded", neverParked),
 	)
 	if len(toConclude) == 0 {
-		return left, nil, nil
+		return acceptOutcome{left: left, settled: true}, nil
 	}
 
 	// Every parked blob goes to the upload service in one exchange (the
 	// client splits only past its batch cap), so thousands of parts cost a
 	// couple of round trips rather than one per part.
 	locations, err := b.deferred.ConcludeBlobs(ctx, space, toConclude)
-	unmark()
+	if err != nil {
+		held = true
+		time.AfterFunc(failedConcludeHold, unmark)
+	} else {
+		unmark()
+	}
 	// Record every acceptance that came back before acting on any error:
 	// the conclude's own, or one blob's persistence failing. The upload
 	// service has run those accepts whether or not the rest of the batch
@@ -1752,10 +1783,11 @@ func (b *Backend) acceptParked(ctx context.Context, space did.DID, digests []mh.
 	if len(failed) > 0 && len(errs) == 0 {
 		errs = append(errs, fmt.Errorf("conclude blobs: %d of %d blobs returned no location", len(failed), len(toConclude)))
 	}
+	out = acceptOutcome{left: left, failed: failed, settled: true}
 	if len(errs) > 0 {
-		return left, failed, errors.Join(errs...)
+		return out, errors.Join(errs...)
 	}
-	return left, nil, nil
+	return out, nil
 }
 
 // markLocated records a blob found already located as accepted, and drops a

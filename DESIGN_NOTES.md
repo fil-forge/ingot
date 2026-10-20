@@ -209,11 +209,15 @@ conclude, and a `/blob/remove` that arrives before that registration finds
 nothing to remove; the registration then lands with nothing left to remove
 it, and the blob stays stored. So no release runs against a conclude in
 flight. A session teardown (abort, expiry, DeleteBucket), once it has latched
-the session out of `open` and `completing`, waits for the upload's acceptor to
-finish its pass before it records any release (`quiesceAcceptor`). Any other
+the session out of `open` and `completing`, waits for the pass the upload's
+acceptor has in flight, if any, before it records any release
+(`quiesceAcceptor`); an acceptor backing off between passes is not waited
+for, since its next pass sees the latch and concludes nothing. Any other
 release, such as a superseded part's, defers while a conclude of its blob is
 in flight in this process (`markConcluding`) and runs from the release
-sweeper after.
+sweeper after. A conclude that failed or timed out may still be running at
+the upload service, so its blobs stay marked for `failedConcludeHold` (2
+min) after it returns.
 
 `CompleteMultipartUpload` latches the session to `completing`, which stops
 new parts, and waits, up to 30 s (`acceptWaitBudget`), until none of the parts

@@ -983,7 +983,7 @@ func (b *Backend) drainSpaceReleases(ctx context.Context, space did.DID) error {
 		case releaseFailed:
 			return fmt.Errorf("release blob %x", pr.Digest)
 		case releaseDeferred:
-			return fmt.Errorf("release blob %x: a multipart session in flight still references it", pr.Digest)
+			return fmt.Errorf("release blob %x: deferred, as a multipart session in flight still references it or a conclude of it is in flight; retry", pr.Digest)
 		}
 		// Done or stale: the record is gone already (see runRelease).
 	}

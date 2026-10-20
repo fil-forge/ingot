@@ -573,9 +573,10 @@ sequenceDiagram
   Each pass runs under `acceptPassTimeout`.
 - No release runs while its blob's conclude is in flight: sprue registers
   an accepted blob only when it answers, so an earlier remove would miss it.
-  A teardown waits for the upload's acceptor (`quiesceAcceptor`) before it
-  records releases; any other release defers while the blob is marked
-  (`markConcluding`) and runs from the release sweeper.
+  A teardown waits for the acceptor's pass in flight (`quiesceAcceptor`)
+  before it records releases; any other release defers while the blob is
+  marked (`markConcluding`, held 2 min past a failed conclude) and runs from
+  the release sweeper.
 - A part is written only while its session is open, in the statement that
   checks the state; a teardown that took the session refuses it, and the
   upload records releases for the blobs it had spooled.

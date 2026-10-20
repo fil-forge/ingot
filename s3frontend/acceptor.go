@@ -76,8 +76,9 @@ type acceptor struct {
 	// passWaiters are signalled with the outcome of the next pass, whatever
 	// it is, or with nil when the acceptor exits.
 	passWaiters []chan error
-	// done is closed when the acceptor exits.
-	done chan struct{}
+	// inPass is closed when the pass in flight ends; nil between passes,
+	// including while the acceptor backs off after a failure.
+	inPass chan struct{}
 }
 
 // signal hands err to every waiter and forgets them.
@@ -163,7 +164,7 @@ func (b *Backend) nudgeLocked(uploadID string) *acceptor {
 	if m.running == nil {
 		m.running = map[string]*acceptor{}
 	}
-	a := &acceptor{more: true, done: make(chan struct{})}
+	a := &acceptor{more: true}
 	m.running[uploadID] = a
 	m.wg.Add(1)
 	go func(ctx context.Context) {
@@ -285,23 +286,28 @@ func (b *Backend) awaitPass(ctx context.Context, uploadID string) error {
 	}
 }
 
-// quiesceAcceptor waits for uploadID's acceptor, if one is running, to exit.
-// A session teardown calls it once it has latched the session out of 'open'
-// and 'completing', so the acceptor stops at its next pass, and before it
-// records any release. A pass in flight may have concluded a blob the upload
-// service is still accepting, and the service registers the blob before it
-// answers: a release run sooner could remove the blob before that
-// registration lands and leave the blob registered and stored, with nothing
-// left to remove it. The wait is bounded by acceptPassTimeout.
+// quiesceAcceptor waits for the pass uploadID's acceptor has in flight, if
+// any, to end. A session teardown calls it once it has latched the session
+// out of 'open' and 'completing', and before it records any release: the
+// acceptor's next pass sees the latch and concludes nothing, so only the
+// pass in flight matters. It may have concluded a blob the upload service is
+// still accepting, and the service registers the blob before it answers: a
+// release run sooner could remove the blob before that registration lands
+// and leave the blob registered and stored, with nothing left to remove it.
+// An acceptor between passes, backing off after a failure, is not waited
+// for. The wait is bounded by acceptPassTimeout.
 func (b *Backend) quiesceAcceptor(ctx context.Context, uploadID string) error {
 	b.acceptors.mu.Lock()
-	a, ok := b.acceptors.running[uploadID]
+	var inPass chan struct{}
+	if a, ok := b.acceptors.running[uploadID]; ok {
+		inPass = a.inPass
+	}
 	b.acceptors.mu.Unlock()
-	if !ok {
+	if inPass == nil {
 		return nil
 	}
 	select {
-	case <-a.done:
+	case <-inPass:
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
@@ -320,16 +326,21 @@ func (b *Backend) runAcceptor(ctx context.Context, uploadID string, a *acceptor)
 			delete(m.running, uploadID)
 			a.signal(nil)
 			a.signalPass(nil)
-			close(a.done)
 			m.mu.Unlock()
 			return
 		}
 		a.more = false
+		a.inPass = make(chan struct{})
 		m.mu.Unlock()
 
 		passCtx, cancel := context.WithTimeout(ctx, acceptPassTimeout)
 		did, err := b.acceptPass(passCtx, uploadID)
 		cancel()
+
+		m.mu.Lock()
+		close(a.inPass)
+		a.inPass = nil
+		m.mu.Unlock()
 
 		if did || err != nil {
 			b.multipartMetrics.pass(ctx, err)
@@ -400,9 +411,10 @@ func (b *Backend) acceptPass(ctx context.Context, uploadID string) (did bool, er
 	}
 	span.SetAttributes(attribute.Int("ingot.parts", len(batch)), attribute.Int("ingot.blobs.total", len(digests)))
 
-	left, failed, err := b.acceptParked(ctx, sess.Space, digests, acceptInBackground)
-	if err != nil && len(failed) == 0 {
-		// Failed before any conclude: nothing is known to be accepted.
+	out, err := b.acceptParked(ctx, sess.Space, digests, acceptInBackground)
+	if !out.settled {
+		// Failed before every blob was classified: nothing is known to be
+		// accepted.
 		return false, err
 	}
 	// A part holding a blob the acceptor left is not its to finish, and goes
@@ -416,7 +428,7 @@ func (b *Backend) acceptPass(ctx context.Context, uploadID string) (did bool, er
 	// moves are guarded by the part's digests, so a part a later upload
 	// replaced, or a session's teardown deleted, is left as it is and its
 	// release runs.
-	missing, unaccepted := digestSet(left), digestSet(failed)
+	missing, unaccepted := digestSet(out.left), digestSet(out.failed)
 	var accepted, respooled []registry.MultipartPart
 	for _, p := range batch {
 		leftOut, failedOut := false, false

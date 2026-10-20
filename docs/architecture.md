@@ -878,7 +878,7 @@ CREATE TABLE ingot.multipart_parts (
     PRIMARY KEY (upload_id, part_number),
     CHECK (span_lengths IS NULL OR cardinality(span_lengths) = cardinality(blob_digests))
 );
-CREATE INDEX multipart_parts_parked ON ingot.multipart_parts (upload_id) WHERE state = 'parked';
+CREATE INDEX multipart_parts_parked ON ingot.multipart_parts (upload_id, part_number) WHERE state = 'parked';
 
 -- The part's BLAKE3 tree, hashed at the object offset UploadPart assumed and
 -- merged into the object's digest at Complete (see blake3tree). Its own
