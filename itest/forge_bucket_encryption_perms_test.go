@@ -5,6 +5,7 @@ package itest
 import (
 	"bytes"
 	"net/http"
+	"slices"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -22,16 +23,8 @@ import (
 // is then asserted twice: the second request runs against those caches, so
 // the local fast path must refuse what hilt refuses.
 //
-// The published hilt image classifies the ?encryption operations as the
-// plain bucket operations until fil-forge/hilt#101 merges, so the scenario
-// runs only against a hilt override (or when INGOT_ITEST_ENCRYPTION_PERMS=1
-// says the image carries it); drop the guard then.
-//
 //	go test -tags itest ./itest -run TestForgeBucketEncryptionPermissions -v -timeout 900s
 func TestForgeBucketEncryptionPermissions(t *testing.T) {
-	if !encryptionPermissionsEnabled() {
-		t.Skip("the bucket encryption permission scenario needs a hilt override (INGOT_ITEST_HILT_BINARY or INGOT_ITEST_HILT_IMAGE), or INGOT_ITEST_ENCRYPTION_PERMS=1, until the :main image knows the permissions")
-	}
 	ctx := t.Context()
 	s, endpoint := forgeStack(t)
 	const tenant, bucket = "encryption-perms", "guarded"
@@ -75,7 +68,9 @@ func TestForgeBucketEncryptionPermissions(t *testing.T) {
 	// Every permission but the two encryption ones, so the bucket's creator
 	// and deleter is still refused its configuration. The allowed write
 	// first seeds ingot's caches for the key.
-	admin := client("bucket-admin", hiltAllPermissions)
+	admin := client("bucket-admin", slices.DeleteFunc(slices.Clone(hiltAllPermissions), func(p string) bool {
+		return p == "s3:GetEncryptionConfiguration" || p == "s3:PutEncryptionConfiguration"
+	}))
 	if _, err := admin.PutObject(ctx, &s3.PutObjectInput{Bucket: aws.String(bucket), Key: aws.String("seed"), Body: bytes.NewReader(patternBytes(1 << 10))}); err != nil {
 		t.Fatalf("seed write: %v", err)
 	}

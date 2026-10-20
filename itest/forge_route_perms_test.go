@@ -28,16 +28,8 @@ import (
 // denial runs against ingot's caches and the local fast path must refuse
 // what hilt refuses.
 //
-// The published hilt image classifies these requests as the plain bucket and
-// object operations until fil-forge/hilt#102 merges, so the scenario runs only
-// against a hilt override (or when INGOT_ITEST_ROUTE_PERMS=1 says the image
-// carries it); drop the guard then.
-//
 //	go test -tags itest ./itest -run TestForgeRoutePermissions -v -timeout 900s
 func TestForgeRoutePermissions(t *testing.T) {
-	if !routePermissionsEnabled() {
-		t.Skip("the route permission scenario needs a hilt override (INGOT_ITEST_HILT_BINARY or INGOT_ITEST_HILT_IMAGE), or INGOT_ITEST_ROUTE_PERMS=1, until the :main image knows the permissions")
-	}
 	ctx := t.Context()
 	s, endpoint := forgeStack(t)
 	const tenant, bucket = "route-perms", "versioned"
