@@ -365,6 +365,29 @@ var hiltEncryptionPermissions = []string{
 	"s3:PutEncryptionConfiguration",
 }
 
+// hiltRoutePermissions guard the operations hilt classifies by the gateway's
+// routes: bucket location, ACL, CORS, tagging, versioning and object lock
+// configuration, and object tagging and attributes. The published hilt image
+// does not know them until fil-forge/hilt#102 merges (it classifies those
+// requests as the plain bucket and object operations), so the test key
+// carries them only when [routePermissionsEnabled]; fold them into
+// hiltAllPermissions then.
+var hiltRoutePermissions = []string{
+	"s3:GetBucketLocation",
+	"s3:GetBucketAcl",
+	"s3:GetBucketCORS",
+	"s3:GetBucketTagging",
+	"s3:PutBucketTagging",
+	"s3:GetBucketVersioning",
+	"s3:PutBucketVersioning",
+	"s3:GetBucketObjectLockConfiguration",
+	"s3:PutBucketObjectLockConfiguration",
+	"s3:GetObjectTagging",
+	"s3:PutObjectTagging",
+	"s3:DeleteObjectTagging",
+	"s3:GetObjectAttributes",
+}
+
 // hiltOverridden reports whether the stack's hilt comes from a local override
 // rather than the published image.
 func hiltOverridden() bool {
@@ -383,6 +406,13 @@ func iamScenariosEnabled() bool {
 // INGOT_ITEST_ENCRYPTION_PERMS=1 says the image has them.
 func encryptionPermissionsEnabled() bool {
 	return os.Getenv("INGOT_ITEST_ENCRYPTION_PERMS") == "1" || hiltOverridden()
+}
+
+// routePermissionsEnabled reports whether the stack's hilt knows
+// [hiltRoutePermissions]: a hilt override is in use, or
+// INGOT_ITEST_ROUTE_PERMS=1 says the image has them.
+func routePermissionsEnabled() bool {
+	return os.Getenv("INGOT_ITEST_ROUTE_PERMS") == "1" || hiltOverridden()
 }
 
 // hiltProvisionTenant provisions tenantID in hilt with an all-permission
@@ -428,6 +458,9 @@ func hiltProvisionTenantErr(ctx context.Context, s *stack.Stack, tenantID string
 	}
 	if encryptionPermissionsEnabled() {
 		permissions = append(permissions, hiltEncryptionPermissions...)
+	}
+	if routePermissionsEnabled() {
+		permissions = append(permissions, hiltRoutePermissions...)
 	}
 	keyReq, err := json.Marshal(map[string]any{
 		"name":        "itest",

@@ -161,7 +161,9 @@ a 412), require the source bucket to be the destination tenant's, and `CopyObjec
 
 **Multi-object delete.** `DeleteObjects` mixes delete-marker insertions and specific-version deletes
 (each driving the reference path), caps at 1000 keys, supports Quiet mode, and returns a per-entry
-result (not atomic).
+result (not atomic). Hilt authorizes the request on `s3:DeleteObject`; an entry naming a version
+also needs `s3:DeleteObjectVersion`, checked per entry against the key's action set, and fails with
+AccessDenied without it.
 
 **Zero-byte objects.** A 0-byte object stores no blob: Ingot writes a manifest with `size=0`, the
 well-known empty MD5 ETag, and no body digest. (Piri's aggregator has no piece for empty content.)

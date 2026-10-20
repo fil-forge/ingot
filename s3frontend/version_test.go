@@ -5,15 +5,18 @@ import (
 	"context"
 	"errors"
 	"io"
+	"slices"
 	"sort"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/versitygw/s3err"
 	"github.com/fil-forge/versitygw/s3response"
 
 	msbucket "github.com/fil-forge/ingot/bucket"
+	"github.com/fil-forge/ingot/internal/reqscope"
 	"github.com/fil-forge/ingot/mst"
 )
 
@@ -618,7 +621,8 @@ func TestVersioning_DeleteObjectsMixed(t *testing.T) {
 	putObjV(t, b, "b", []byte("bbb"))
 
 	bucket := "bk"
-	res, err := b.DeleteObjects(context.Background(), &s3.DeleteObjectsInput{
+	ctx := withActions(t, b, bucket, "s3:DeleteObject", "s3:DeleteObjectVersion")
+	res, err := b.DeleteObjects(ctx, &s3.DeleteObjectsInput{
 		Bucket: &bucket,
 		Delete: &types.Delete{Objects: []types.ObjectIdentifier{
 			{Key: strPtr("a"), VersionId: &outA.VersionID}, // scoped: permanent
@@ -655,6 +659,80 @@ func TestVersioning_DeleteObjectsMixed(t *testing.T) {
 	if n := len(listVersions(t, b, nil).Versions); n != 1 {
 		t.Fatalf("remaining versions = %d, want 1 (b's data version)", n)
 	}
+}
+
+// TestVersioning_DeleteObjectsNeedsVersionPermission covers the per-entry
+// check: an entry naming a version fails with AccessDenied, and leaves the
+// version in place, unless the key holds s3:DeleteObjectVersion on the
+// bucket. The request's other entries are deleted as usual.
+func TestVersioning_DeleteObjectsNeedsVersionPermission(t *testing.T) {
+	b, _, _ := newRefTestBackend(t)
+	setVersioning(t, b, types.BucketVersioningStatusEnabled)
+	outA := putObjV(t, b, "a", []byte("aaa"))
+	putObjV(t, b, "b", []byte("bbb"))
+
+	bucket := "bk"
+	for name, ctx := range map[string]context.Context{
+		"without the permission": withActions(t, b, bucket, "s3:DeleteObject"),
+		"with no action set":     context.Background(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			res, err := b.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+				Bucket: &bucket,
+				Delete: &types.Delete{Objects: []types.ObjectIdentifier{
+					{Key: strPtr("a"), VersionId: &outA.VersionID},
+				}},
+			})
+			if err != nil {
+				t.Fatalf("DeleteObjects: %v", err)
+			}
+			if len(res.Deleted) != 0 || len(res.Error) != 1 || *res.Error[0].Code != "AccessDenied" || *res.Error[0].Key != "a" {
+				t.Fatalf("result = %+v, want one AccessDenied error for \"a\"", res)
+			}
+			if _, _, err := getObjV(t, b, "a", outA.VersionID); err != nil {
+				t.Fatalf("GET refused version of \"a\": %v", err)
+			}
+		})
+	}
+
+	res, err := b.DeleteObjects(withActions(t, b, bucket, "s3:DeleteObject"), &s3.DeleteObjectsInput{
+		Bucket: &bucket,
+		Delete: &types.Delete{Objects: []types.ObjectIdentifier{
+			{Key: strPtr("a"), VersionId: &outA.VersionID},
+			{Key: strPtr("b")},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("DeleteObjects: %v", err)
+	}
+	if len(res.Error) != 1 || *res.Error[0].Key != "a" || len(res.Deleted) != 1 || *res.Deleted[0].Key != "b" {
+		t.Fatalf("result = %+v, want \"a\" refused and \"b\" deleted", res)
+	}
+}
+
+// actionSet is a reqscope.ActionSet holding one bucket's actions.
+type actionSet struct {
+	space   string
+	actions []string
+}
+
+func (a actionSet) Permits(bucket did.DID, action string) (allowed, known bool) {
+	if bucket.String() != a.space {
+		return false, false
+	}
+	return slices.Contains(a.actions, action), true
+}
+
+// withActions returns a context whose action set grants actions on bucket,
+// as the IAM service's would for a key Hilt authorized there.
+func withActions(t *testing.T, b *Backend, bucket string, actions ...string) context.Context {
+	t.Helper()
+	st, err := b.reg.Get(context.Background(), bucket)
+	if err != nil {
+		t.Fatalf("registry get %q: %v", bucket, err)
+	}
+	return context.WithValue(context.Background(), reqscope.ActionsKey(),
+		reqscope.ActionSet(actionSet{space: st.Space.String(), actions: actions}))
 }
 
 func strPtr(s string) *string { return &s }

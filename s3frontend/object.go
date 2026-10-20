@@ -1868,6 +1868,11 @@ func (b *Backend) deleteObjectKey(ctx context.Context, bucketState *registry.Sta
 // DeleteObjects deletes up to 1000 keys in one request, best-effort (not
 // atomic): each key is deleted independently and reported in the per-key result
 // (Deleted, or Error on failure). Quiet mode omits the successful entries.
+//
+// Hilt authorizes the request on s3:DeleteObject. An entry naming a version
+// permanently removes it, which S3 gives its own permission; the entries are
+// in the body, out of Hilt's sight, so each such entry is checked here against
+// the key's action set and fails with AccessDenied without it.
 func (b *Backend) DeleteObjects(ctx context.Context, input *s3.DeleteObjectsInput) (s3response.DeleteResult, error) {
 	if input.Bucket == nil {
 		return s3response.DeleteResult{}, s3err.GetAPIError(s3err.ErrInvalidBucketName)
@@ -1900,6 +1905,9 @@ func (b *Backend) DeleteObjects(ctx context.Context, input *s3.DeleteObjectsInpu
 		versionID := backend.GetStringFromPtr(obj.VersionId)
 		entry := types.DeletedObject{Key: &key}
 		var derr error
+		if versionID != "" && !reqscope.Permits(ctx, bucketState.Space, deleteObjectVersionAction) {
+			derr = s3err.GetAPIError(s3err.ErrAccessDenied)
+		}
 		// Per-key ETag precondition (conditional delete): the object is removed
 		// only if its current version's ETag matches; otherwise the entry fails
 		// with PreconditionFailed, matching AWS. Applies to the current version.
@@ -1966,6 +1974,10 @@ func (b *Backend) DeleteObjects(ctx context.Context, input *s3.DeleteObjectsInpu
 
 // deleteErrorFields maps a per-key delete failure to an S3 error code +
 // message for the DeleteObjects per-entry result.
+// deleteObjectVersionAction is the S3 permission a DeleteObjects entry naming
+// a version needs, beyond the request's own s3:DeleteObject.
+const deleteObjectVersionAction = "s3:DeleteObjectVersion"
+
 func deleteErrorFields(err error) (code, msg string) {
 	var apiErr s3err.APIError
 	if errors.As(err, &apiErr) {

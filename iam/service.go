@@ -205,6 +205,9 @@ func (s *Service) GetUserAccountForRequest(ctx fiber.Ctx, accessKeyStr string) (
 	// fails, and needed whichever path authorizes.
 	store := s.proofs.For(accessKeyID)
 	ctx.Locals(reqscope.ProofStoreKey(), ucanlib.ProofStore(store))
+	// The same store holds the key's action sets, which the backend consults
+	// for what the URL does not show (a DeleteObjects entry naming a version).
+	ctx.Locals(reqscope.ActionsKey(), reqscope.ActionSet(store))
 
 	// Local fast path: with a cached verification key, a cached action set
 	// permitting the request's S3 action on every bucket it acts on, and
@@ -270,6 +273,12 @@ func (s *Service) GetUserAccountForRequest(ctx fiber.Ctx, accessKeyStr string) (
 		ctx.Locals(reqscope.ProofStoreKey(), ucanlib.ProofStore(scoped))
 		// Refetches bucket info already fetched above; rare (a failed Hilt commit).
 		s.cacheProofs(reqCtx, scoped, ctr, req, accessKeyID)
+		// The action set too, held for this request alone.
+		scopedTTL := untilNextUTCMidnight(time.Now())
+		if ok.Bucket != nil {
+			scoped.PutPermissions(*ok.Bucket, scopedTTL, ok.Permissions.Entries[accessKeyID])
+		}
+		ctx.Locals(reqscope.ActionsKey(), reqscope.ActionSet(scoped))
 		ctx.Locals(reqscope.TenantKey(), ok.Tenant)
 		s.logger.Info("hilt/iam: authorize response carries a revoked delegation, not cached",
 			zap.String("access", accessKeyStr), zap.Stringer("tenant", ok.Tenant))
