@@ -167,10 +167,10 @@ A cached copy is not needed, so it goes:
   provider's copy, so a GET still streaming the old object once the grace
   has passed fails when it reaches a blob it has not yet opened:
   `release_grace` bounds how long such a read may take;
-- with `local_blob_max_bytes` set, when a sweeper, checking every 30 seconds,
-  finds the two directories over the budget and evicts cached bodies, oldest
-  first, down to 90% of the budget. Later reads of an evicted body go to the
-  provider and take provider-read latency.
+- with a nonzero `local_blob_max_bytes`, when a sweeper, checking every 30
+  seconds, finds the two directories over the budget and evicts cached
+  bodies, oldest first, down to 90% of the budget. Later reads of an evicted
+  body go to the provider and take provider-read latency.
 
 Two windows keep cached bodies local while the budget allows:
 `cache_min_residency` (default `10m`) passes over bodies whose upload
@@ -190,21 +190,24 @@ provider, so Complete relies on the provider keeping the parked allocation
 until then; keep `multipart_session_ttl` (default `168h`) well under how
 long the provider keeps parked allocations. The TTL counts from the
 session's last state change, and a failed Complete returns the session to
-open, which restarts it, so a part can outlive the TTL. The budget is off by default
-(`local_blob_max_bytes: 0`): without it the cache grows with every live
-object's bodies. A node that rarely reads back what it just wrote can keep
-no written bodies at all: with `cache_writes: false`, each body's copy goes
-as soon as the provider accepts it instead of moving to the cache, and every
-read goes to the provider. The spool then holds only bodies still being
-written or uploaded and the bodies of failed uploads, apart from a copy
-whose removal failed, which waits for its object's release or the budget;
-bodies cached before the setting was turned off stay until they are
-released or evicted. With or without a
-budget, the sweeper also deletes, at startup and then hourly, unfinished
-`.tmp-*` writes in either directory and spool files with no upload intent,
-once they are older than `local_blob_orphan_age` (default `24h`, at least
-`1h`). Once at each startup, `serve` also deletes the copies of objects
-deleted by a version of ingot that kept them.
+open, which restarts it, so a part can outlive the TTL.
+
+`local_blob_max_bytes` has no default: `serve` refuses to start without it
+unless `cache_writes` is false. `0` means no budget, and without one the
+cache grows with every live object's bodies.
+
+A node that rarely reads back what it just wrote can keep no written bodies
+at all: with `cache_writes: false`, each body's copy goes as soon as the
+provider accepts it instead of moving to the cache, and every read goes to
+the provider. The spool then holds only bodies still being written or
+uploaded and the bodies of failed uploads, apart from a copy whose removal
+failed, which waits for its object's release or the budget; bodies cached
+before the setting was turned off stay until they are released or evicted.
+With or without a budget, the sweeper also deletes, at startup and then
+hourly, unfinished `.tmp-*` writes in either directory and spool files with
+no upload intent, once they are older than `local_blob_orphan_age` (default
+`24h`, at least `1h`). Once at each startup, `serve` also deletes the copies
+of objects deleted by a version of ingot that kept them.
 
 **Sizing.** The filesystem needs room for:
 
