@@ -2432,3 +2432,67 @@ func fileExists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
 }
+
+// TestSupersedeRecordsReleaseOfSharedBlob: in a session storing parts as
+// received, two parts of identical bytes share one blob. Re-uploading one of
+// them records a release for the shared blob all the same; the release waits
+// while the other part still names it, and runs once the session ends.
+// Skipping the record because a sibling names the digest would race a
+// concurrent re-upload of that sibling, leaving the blob with no record.
+func TestSupersedeRecordsReleaseOfSharedBlob(t *testing.T) {
+	b, mem, pu := newParkingBackend(t)
+	setNone(t, b)
+	ctx := context.Background()
+	key := "supersede-shared"
+
+	uploadID := mpCreate(t, b, key, "", "")
+	same := testBody(int(backend.MinPartSize))
+	for n := int32(1); n <= 2; n++ {
+		if _, err := mpUploadPart(t, b, key, uploadID, n, same, nil); err != nil {
+			t.Fatalf("UploadPart %d: %v", n, err)
+		}
+	}
+	shared := hygienePartDigests(t, mem, uploadID, 1)[0]
+	if other := hygienePartDigests(t, mem, uploadID, 2)[0]; string(other) != string(shared) {
+		t.Fatalf("parts of identical bytes stored as received have distinct blobs: %x vs %x", shared, other)
+	}
+
+	if _, err := mpUploadPart(t, b, key, uploadID, 1, testBody(int(backend.MinPartSize)+100), nil); err != nil {
+		t.Fatalf("UploadPart (supersede): %v", err)
+	}
+	pending, err := mem.ListReleasesBySpace(ctx, did.Undef)
+	if err != nil || len(pending) != 1 || string(pending[0].Digest) != string(shared) {
+		t.Fatalf("releases after the supersede = %v (err %v), want one record for the shared blob %x", pending, err, shared)
+	}
+	// Part 2 still names the blob: the record waits and the blob stays.
+	drainReleases(t, b)
+	if _, err := mem.ParkByDigest(ctx, shared); err != nil {
+		t.Fatalf("shared blob's park taken while part 2 names it: %v", err)
+	}
+	if pu.abortedDigests()[string(shared)] {
+		t.Fatalf("shared blob %x aborted on the provider while part 2 names it", shared)
+	}
+	if pending, _ := mem.ListReleasesBySpace(ctx, did.Undef); len(pending) != 1 {
+		t.Fatalf("deferred record did not survive the sweep: %v", pending)
+	}
+
+	// The session ends: nothing names the blob and the release runs (the
+	// deferral pushed the record behind the records due now, so it is
+	// drained regardless of grace, as the sweeper will once it is due).
+	bucket := "bk"
+	if err := b.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{Bucket: &bucket, Key: &key, UploadId: &uploadID}); err != nil {
+		t.Fatalf("Abort: %v", err)
+	}
+	if err := b.drainSpaceReleases(ctx, did.Undef); err != nil {
+		t.Fatalf("drainSpaceReleases: %v", err)
+	}
+	if !pu.abortedDigests()[string(shared)] {
+		t.Fatalf("shared blob %x not released once the session ended", shared)
+	}
+	if _, err := mem.ParkByDigest(ctx, shared); !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("park row for %x survived the session (err=%v)", shared, err)
+	}
+	if pending, _ := mem.ListReleasesBySpace(ctx, did.Undef); len(pending) != 0 {
+		t.Fatalf("release records survived the session: %v", pending)
+	}
+}

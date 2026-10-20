@@ -325,13 +325,10 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 	}
 
 	// Capture the superseded part's blobs (if any) before overwriting, so
-	// last-write-wins doesn't strand them. The session's other parts stay
-	// live; the release still checks for a sibling naming the same digest,
-	// which a session storing parts as received can have. A
-	// listing failure fails the upload: proceeding would silently strand the
-	// replaced part's blobs and key rows.
+	// last-write-wins doesn't strand them. A listing failure fails the
+	// upload: proceeding would silently strand the replaced part's blobs and
+	// key rows.
 	var superseded []mh.Multihash
-	siblings := map[string]bool{}
 	prior, err := b.multipart.ListParts(ctx, uploadID)
 	if err != nil {
 		return nil, fmt.Errorf("s3frontend: list parts before supersede: %w", err)
@@ -339,10 +336,7 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 	for _, p := range prior {
 		if p.PartNumber == partNumber {
 			superseded = p.BlobDigests
-			continue
-		}
-		for _, d := range p.BlobDigests {
-			siblings[string(d)] = true
+			break
 		}
 	}
 
@@ -352,10 +346,15 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 	// lands the old one still references them, which defers the release; a
 	// request that dies in between leaves records that resolve with the
 	// session (a claim at Complete makes them stale, an abort re-records
-	// them).
+	// them). A digest another part of the session also names (parts stored
+	// as received share the blobs of identical bytes) is recorded all the
+	// same: the release defers while that part references it and resolves
+	// with the session. Skipping it here would race a concurrent re-upload
+	// of the sibling, each seeing the other's old part and neither
+	// recording the release.
 	var superseding []registry.PendingRelease
 	if len(superseded) > 0 {
-		superseding, err = b.enqueuePartReleases(ctx, space, superseded, siblings)
+		superseding, err = b.enqueuePartReleases(ctx, space, superseded, nil)
 		if err != nil {
 			return nil, fmt.Errorf("s3frontend: record superseded part releases: %w", err)
 		}
@@ -415,7 +414,7 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 		// fact have landed and only its result been lost, the release waits
 		// on the live part reference and resolves with the session.
 		spooled.unholdAll()
-		released, rerr := b.enqueuePartReleases(ctx, space, spooled.Blobs.DigestList(), siblings)
+		released, rerr := b.enqueuePartReleases(ctx, space, spooled.Blobs.DigestList(), nil)
 		if rerr != nil {
 			return nil, fmt.Errorf("s3frontend: record part: %w; record its blobs' releases: %w", err, rerr)
 		}
@@ -1134,15 +1133,16 @@ func (b *Backend) recordSessionReleases(ctx context.Context, space did.DID, uplo
 }
 
 // enqueuePartReleases records a deferred release for each of digests that is
-// not in keep (the winners at Complete, the sibling parts at supersede, the
-// committed and already-released blobs at a reap), in one statement however many parts the
-// session has. Whether a blob is in fact free to go is the release's
-// question, answered when it runs: runRelease drops a record whose digest is
-// claimed by a committed object and waits on one a part of an in-flight
-// session still references. Deciding that here instead would race another
-// teardown — two aborting sessions sharing a blob could each see the other's
-// part, both skip it, and both cascade their rows away, leaving no record at
-// all. Returns the records as they stand, including any earlier not_before a
+// not in keep (the winners at Complete, the committed and already-released
+// blobs at a reap; a supersede keeps nothing), in one statement however many
+// parts the session has. Whether a blob is in fact free to go is the
+// release's question, answered when it runs: runRelease drops a record whose
+// digest is claimed by a committed object and waits on one a part of an
+// in-flight session still references. Deciding that here instead would race
+// another teardown — two aborting sessions sharing a blob could each see the
+// other's part, both skip it, and both cascade their rows away, leaving no
+// record at all — or another supersede, of a sibling part sharing the blob.
+// Returns the records as they stand, including any earlier not_before a
 // digest already carried.
 func (b *Backend) enqueuePartReleases(ctx context.Context, space did.DID, digests []mh.Multihash, keep map[string]bool) ([]registry.PendingRelease, error) {
 	seen := map[string]bool{}
