@@ -127,11 +127,11 @@ func TestForgeBucketEncryption(t *testing.T) {
 		t.Fatalf("unconfigured bucket: %d key rows for %d blobs", rows, blobs)
 	}
 	// The control for the piri-side check below: an encrypted PUT of these
-	// bytes leaves piri holding an envelope, so once that envelope has
-	// settled, no blob of the plaintext's digest exists. (Checked before the
-	// "none" PUT of the same bytes, which creates exactly that blob.)
-	waitForPiriSettled(t, ctx, s, objectBlobDigestsHex(t, ctx, s, bucket, "default")[0])
-	if piriHoldsBlob(t, ctx, s, sum) {
+	// bytes leaves piri holding an envelope, so once that envelope is on
+	// piri, no blob of the plaintext's digest is. (Checked before the "none"
+	// PUT of the same bytes, which creates exactly that blob.)
+	waitForPiriBlob(t, ctx, s, hexDigest(t, objectBlobDigestsHex(t, ctx, s, bucket, "default")[0]), 30*time.Second)
+	if piriHoldsBlob(t, ctx, s, sha256Digest(t, sum)) {
 		t.Fatalf("unconfigured bucket: piri holds a blob of the plaintext's digest after an encrypted PUT")
 	}
 
@@ -171,7 +171,7 @@ func TestForgeBucketEncryption(t *testing.T) {
 		}
 		// And piri holds it under that digest: the blob on the network is
 		// the uploaded bytes.
-		waitForPiriBlob(t, ctx, s, sum, 30*time.Second)
+		waitForPiriBlob(t, ctx, s, sha256Digest(t, sum), 30*time.Second)
 	})
 	t.Run("PackSizedBlobOnPiri", func(t *testing.T) {
 		// A client-side pack: one PutObject of 128 MiB, identified everywhere
@@ -196,7 +196,7 @@ func TestForgeBucketEncryption(t *testing.T) {
 		if blobs, rows := keyRows(t, "pack"); blobs != 1 || rows != 0 {
 			t.Fatalf("%d blobs with %d key rows, want 1 and 0", blobs, rows)
 		}
-		waitForPiriBlob(t, ctx, s, want, 60*time.Second)
+		waitForPiriBlob(t, ctx, s, sha256Digest(t, want), 60*time.Second)
 	})
 	t.Run("ExplicitAES256EncryptsOneObject", func(t *testing.T) {
 		sse, path := putOne(t, "asked", data, types.ServerSideEncryptionAes256)
