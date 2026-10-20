@@ -488,7 +488,10 @@ as accepted. Ingot records an acceptance only while the park row it concluded st
 its `/blob/add` task, swapping the park for the location in one transaction; the release drops the
 park before anything else, so a location is never written for a blob a release has taken, nor
 over a later park of the same bytes. The acceptor never cancels a release: a part holding a blob
-with a release record goes to Complete, whose commit claims the blob.
+with a release record goes to Complete, whose commit claims the blob. Nor does a release run
+against a conclude in flight, since the upload service registers an accepted blob only when it
+answers, after a remove sent meanwhile: a teardown waits for the upload's acceptor to finish its
+pass, and any other release defers to the release sweeper while its blob is being concluded.
 
 ### 7.4 Read (`GetObject`)
 

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -23,15 +24,23 @@ import (
 	"github.com/fil-forge/ingot/uploader"
 )
 
-// providerConcluder concludes as a provider does: a blob whose allocation
-// was aborted is refused, any other is accepted, and an abort of an accepted
-// blob is then refused as already accepted (parkingUploader.AbortBlob). The
-// before hook runs once ahead of the next conclude, the after hook once
-// between its accepts and its reply: the two orders a release can take
-// against an acceptor's conclude.
+// providerConcluder concludes as the upload service and provider do: a blob
+// whose allocation was aborted is refused, any other is accepted, and an
+// abort of an accepted blob is then refused as already accepted
+// (parkingUploader.AbortBlob). An accepted blob is registered in the space
+// only once the conclude answers, as the upload service does, and
+// RemoveBlob removes only a registered blob: a remove that arrives between
+// the accept and the registration finds nothing, and the registration that
+// follows is left behind. It is the backend's BlobRemover too. The before
+// hook runs once ahead of the next conclude, the after hook once between its
+// accepts and its reply.
 type providerConcluder struct {
 	parkingUploader
 	before, after func()
+	registered    map[string]bool
+	removed       int
+	// concluded is the /blob/add task of every blob a conclude accepted.
+	concluded []cid.Cid
 }
 
 func (c *providerConcluder) ConcludeBlobs(_ context.Context, _ did.DID, parked []uploader.UploadedBlob) ([]*uploader.BlobLocation, error) {
@@ -52,11 +61,44 @@ func (c *providerConcluder) ConcludeBlobs(_ context.Context, _ did.DID, parked [
 			c.acceptedOnProvider = map[string]bool{}
 		}
 		c.acceptedOnProvider[string(p.Digest)] = true
+		c.concluded = append(c.concluded, p.AddTask)
 		locations[i] = &uploader.BlobLocation{Provider: "did:key:zNode", URL: "https://node.example/blob", Size: p.Size}
 	}
 	c.mu.Unlock()
 	c.runOnce(&c.after)
+	c.mu.Lock()
+	if c.registered == nil {
+		c.registered = map[string]bool{}
+	}
+	for i, p := range parked {
+		if locations[i] != nil {
+			c.registered[string(p.Digest)] = true
+		}
+	}
+	c.mu.Unlock()
 	return locations, errors.Join(refused...)
+}
+
+// RemoveBlob removes the space's registration of digest, if there is one.
+func (c *providerConcluder) RemoveBlob(_ context.Context, _ did.DID, digest multihash.Multihash) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.registered[string(digest)] {
+		delete(c.registered, string(digest))
+		c.removed++
+	}
+	return nil
+}
+
+// assertNoneLeft fails if a blob is still registered: accepted and never
+// removed after its registration.
+func (c *providerConcluder) assertNoneLeft(t *testing.T) {
+	t.Helper()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for d := range c.registered {
+		t.Fatalf("blob %x left registered with nothing to remove it", []byte(d))
+	}
 }
 
 // runOnce runs and clears *hook.
@@ -112,12 +154,13 @@ func assertGone(t *testing.T, mem *inmem.MemStore, d multihash.Multihash) {
 	}
 }
 
-// TestAcceptorRacesATeardown: an abort or a session expiry releases a part's
-// blob while the acceptor concludes it. Whichever order the release and the
-// accept take, the blob ends released on the provider exactly as its state
-// requires, and the acceptor records no location for it: a location written
-// after the release would let a later write of the same bytes reuse a blob
-// that is gone.
+// TestAcceptorRacesATeardown: an abort or a session expiry arrives while the
+// acceptor concludes a part's blob, before the provider accepts it or after.
+// The teardown waits for the acceptor's pass to end before it records the
+// release, so the release finds the accept recorded and the registration in
+// place, and removes the blob: a release run during the pass could send its
+// remove before the upload service registers the accept, and the
+// registration would outlive it.
 func TestAcceptorRacesATeardown(t *testing.T) {
 	teardowns := map[string]func(t *testing.T, b *Backend, key, uploadID string){
 		"abort": func(t *testing.T, b *Backend, key, uploadID string) {
@@ -133,65 +176,60 @@ func TestAcceptorRacesATeardown(t *testing.T) {
 		},
 	}
 	for name, teardown := range teardowns {
-		t.Run(name+"/release first", func(t *testing.T) {
-			// The release aborts the allocation; the provider then refuses
-			// the accept, so there is nothing to record.
-			shrinkAcceptBackoff(t)
-			pc := &providerConcluder{}
-			rm := &recordingRemover{}
-			b, mem := newDeferredBackend(t, pc, func(d *Deps) { d.Remover = rm })
-			key := "race-" + name + "-release-first"
-			uploadID := mpCreate(t, b, key, "", "")
-			uploadDistinctParts(t, b, key, uploadID, 1)
-			d := hygienePartDigests(t, mem, uploadID, 1)[0]
-			pc.before = func() { teardown(t, b, key, uploadID) }
+		for _, when := range []string{"before accept", "after accept"} {
+			t.Run(name+"/"+when, func(t *testing.T) {
+				shrinkAcceptBackoff(t)
+				pc := &providerConcluder{}
+				b, mem := newDeferredBackend(t, pc, func(d *Deps) { d.Remover = pc })
+				key := "race-" + name
+				uploadID := mpCreate(t, b, key, "", "")
+				uploadDistinctParts(t, b, key, uploadID, 1)
+				d := hygienePartDigests(t, mem, uploadID, 1)[0]
 
-			startAcceptors(t, b)
-			drainUntilIdle(t, b, uploadID)
+				// The teardown starts inside the conclude and gets a head start;
+				// it may not finish until the pass does.
+				done := make(chan struct{})
+				hook := func() {
+					go func() {
+						defer close(done)
+						teardown(t, b, key, uploadID)
+					}()
+					select {
+					case <-done:
+					case <-time.After(100 * time.Millisecond):
+					}
+				}
+				if when == "before accept" {
+					pc.before = hook
+				} else {
+					pc.after = hook
+				}
 
-			assertGone(t, mem, d)
-			if !pc.abortedDigests()[string(d)] {
-				t.Fatalf("blob %s was not aborted on the provider", d)
-			}
-			if n := rm.removedDigests()[string(d)]; n != 0 {
-				t.Fatalf("blob %s removed %d times; its allocation was aborted before any accept", d, n)
-			}
-		})
-		t.Run(name+"/accept first", func(t *testing.T) {
-			// The provider accepts, then the release finds the park and its
-			// abort is refused as accepted, so it removes the blob instead.
-			// The acceptor's record comes after, finds the park gone, and
-			// writes nothing.
-			shrinkAcceptBackoff(t)
-			pc := &providerConcluder{}
-			rm := &recordingRemover{}
-			b, mem := newDeferredBackend(t, pc, func(d *Deps) { d.Remover = rm })
-			key := "race-" + name + "-accept-first"
-			uploadID := mpCreate(t, b, key, "", "")
-			uploadDistinctParts(t, b, key, uploadID, 1)
-			d := hygienePartDigests(t, mem, uploadID, 1)[0]
-			pc.after = func() { teardown(t, b, key, uploadID) }
+				startAcceptors(t, b)
+				drainUntilIdle(t, b, uploadID)
+				<-done
 
-			startAcceptors(t, b)
-			drainUntilIdle(t, b, uploadID)
-
-			assertGone(t, mem, d)
-			if n := rm.removedDigests()[string(d)]; n != 1 {
-				t.Fatalf("accepted blob %s removed %d times, want once", d, n)
-			}
-		})
+				assertGone(t, mem, d)
+				pc.assertNoneLeft(t)
+				if pc.removed != 1 {
+					t.Fatalf("accepted blob %s removed %d times, want once", d, pc.removed)
+				}
+			})
+		}
 	}
 }
 
 // TestAcceptorRacesASupersede: a part is uploaded again while the acceptor
-// concludes the first upload of it. The first upload's blob is released and
-// gets no location; the acceptor leaves the replacement row to its own pass,
-// which accepts it, and Complete commits the replacement.
+// concludes the first upload of it, after the provider has accepted it. The
+// first upload's release waits while the conclude is in flight, and runs
+// from the release sweep once the accept is registered, so it removes the
+// blob rather than sending a remove the registration would outlive. The
+// acceptor leaves the replacement row to its own pass, which accepts it, and
+// Complete commits the replacement.
 func TestAcceptorRacesASupersede(t *testing.T) {
 	shrinkAcceptBackoff(t)
 	pc := &providerConcluder{}
-	rm := &recordingRemover{}
-	b, mem := newDeferredBackend(t, pc, func(d *Deps) { d.Remover = rm })
+	b, mem := newDeferredBackend(t, pc, func(d *Deps) { d.Remover = pc })
 	key := "race-supersede"
 	uploadID := mpCreate(t, b, key, "", "")
 	uploadDistinctParts(t, b, key, uploadID, 1)
@@ -211,10 +249,15 @@ func TestAcceptorRacesASupersede(t *testing.T) {
 
 	startAcceptors(t, b)
 	drainUntilIdle(t, b, uploadID)
+	// The superseded blob's release, deferred during the conclude.
+	drainReleases(t, b)
 
 	assertGone(t, mem, first)
-	if n := rm.removedDigests()[string(first)]; n != 1 {
-		t.Fatalf("superseded blob %s removed %d times, want once", first, n)
+	pc.mu.Lock()
+	stillRegistered := pc.registered[string(first)]
+	pc.mu.Unlock()
+	if stillRegistered {
+		t.Fatalf("superseded blob %s left registered with nothing to remove it", first)
 	}
 	second := hygienePartDigests(t, mem, uploadID, 1)[0]
 	if states := partStates(t, mem, uploadID); states[1] != registry.PartAccepted {
@@ -283,20 +326,19 @@ func TestAcceptorsShareAPark(t *testing.T) {
 	}
 }
 
-// TestAcceptorLeavesAReplacementPark: the provider accepts a part's blob, an
-// abort removes it, and another write of the same bytes parks them again
-// under its own allocation before the acceptor records the accept. The
-// acceptor's record names the allocation it concluded, so the replacement
-// park stays for its own conclude and no location is written: the
-// replacement's allocation was never accepted, and the bytes the old
-// location would name are being removed.
+// TestAcceptorLeavesAReplacementPark: the provider accepts a part's blob,
+// the park the acceptor concluded is taken from under it (a release run
+// after a pass timed out with its conclude still in flight), and another
+// write of the same bytes parks them again under its own allocation before
+// the acceptor records the accept. The acceptor's record names the
+// allocation it concluded, so it does not take the replacement park; the
+// next pass concludes that park on its own allocation.
 func TestAcceptorLeavesAReplacementPark(t *testing.T) {
 	shrinkAcceptBackoff(t)
 	pc := &providerConcluder{}
-	rm := &recordingRemover{}
-	b, mem := newDeferredBackend(t, pc, func(d *Deps) { d.Remover = rm })
+	b, mem := newDeferredBackend(t, pc, func(d *Deps) { d.Remover = pc })
 	ctx := context.Background()
-	bucket, key := "bk", "race-replacement-park"
+	key := "race-replacement-park"
 	uploadID := mpCreate(t, b, key, "", "")
 	uploadDistinctParts(t, b, key, uploadID, 1)
 	d := hygienePartDigests(t, mem, uploadID, 1)[0]
@@ -307,8 +349,8 @@ func TestAcceptorLeavesAReplacementPark(t *testing.T) {
 	}
 	replacement := cid.NewCidV1(cid.Raw, h)
 	pc.after = func() {
-		if err := b.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{Bucket: &bucket, Key: &key, UploadId: &uploadID}); err != nil {
-			t.Errorf("Abort: %v", err)
+		if err := mem.DeletePark(ctx, did.Undef, d); err != nil {
+			t.Errorf("DeletePark: %v", err)
 		}
 		if ok, err := mem.PutPark(ctx, registry.BlobPark{Space: did.Undef, Digest: d, AddTask: replacement.Bytes(), AcceptTask: replacement.Bytes(), PutInvocation: []byte{1}, Size: 1}); err != nil || !ok {
 			t.Errorf("PutPark (replacement) = %v, %v", ok, err)
@@ -318,19 +360,13 @@ func TestAcceptorLeavesAReplacementPark(t *testing.T) {
 	startAcceptors(t, b)
 	drainUntilIdle(t, b, uploadID)
 
-	park, err := mem.GetPark(ctx, did.Undef, d)
-	if err != nil {
-		t.Fatalf("replacement park consumed by a stale conclude: %v", err)
+	pc.mu.Lock()
+	concluded := slices.Clone(pc.concluded)
+	pc.mu.Unlock()
+	if !slices.Contains(concluded, replacement) {
+		t.Fatalf("concluded add tasks = %v; the replacement park was never concluded on its own allocation", concluded)
 	}
-	if !bytes.Equal(park.AddTask, replacement.Bytes()) {
-		t.Fatalf("park add task = %x, want the replacement's", park.AddTask)
-	}
-	if loc, err := mem.GetLocation(ctx, did.Undef, d); !errors.Is(err, registry.ErrNotFound) {
-		t.Fatalf("stale conclude wrote a location for the replacement's bytes: %+v (err=%v)", loc, err)
-	}
-	if n := rm.removedDigests()[string(d)]; n != 1 {
-		t.Fatalf("accepted blob %s removed %d times, want once", d, n)
-	}
+	assertAcceptedAndUnparked(t, mem, d)
 }
 
 // TestAcceptorLeavesAReleasingBlobForComplete: a parked part whose blob has a
@@ -492,4 +528,82 @@ func TestCompleteConcludesAParkThatLandsMidComplete(t *testing.T) {
 		t.Fatalf("Complete allocated %d more copies of a parked blob, want none", n-allocations)
 	}
 	assertAcceptedAndUnparked(t, mem, d)
+}
+
+// locationThenRelease is a location store whose next lookup of digest finds
+// the location and then runs hook before answering: the window between the
+// acceptor reading a blob as located and acting on it.
+type locationThenRelease struct {
+	registry.LocationStore
+	mu     sync.Mutex
+	digest multihash.Multihash
+	hook   func()
+}
+
+func (l *locationThenRelease) GetLocation(ctx context.Context, space did.DID, digest multihash.Multihash) (*registry.BlobLocation, error) {
+	loc, err := l.LocationStore.GetLocation(ctx, space, digest)
+	l.mu.Lock()
+	var hook func()
+	if l.digest != nil && bytes.Equal(l.digest, digest) && err == nil {
+		hook, l.hook, l.digest = l.hook, nil, nil
+	}
+	l.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	return loc, err
+}
+
+// TestAcceptorKeepsAParkThatReplacesALocation: the acceptor finds a part's
+// blob located, and before it acts a release removes the location (and the
+// park left beside it) and another write of the same bytes parks them again.
+// The acceptor rechecks under the blob's lock, finds no location, and leaves
+// the replacement park alone and the part to Complete; dropping the park
+// would leave the replacement's allocation never concluded or aborted.
+func TestAcceptorKeepsAParkThatReplacesALocation(t *testing.T) {
+	cc := &countingConcluder{}
+	locs := &locationThenRelease{}
+	b, mem := newDeferredBackend(t, cc, func(d *Deps) {
+		locs.LocationStore = d.Locations
+		d.Locations = locs
+	})
+	ctx := context.Background()
+	key := "located-then-released"
+	uploadID := mpCreate(t, b, key, "", "")
+	uploadDistinctParts(t, b, key, uploadID, 1)
+	d := hygienePartDigests(t, mem, uploadID, 1)[0]
+	// Another conclude recorded the blob, its park left beside the location.
+	if err := mem.PutLocation(ctx, registry.BlobLocation{Space: did.Undef, Digest: d, Provider: "did:key:zNode", URL: "https://node.example/blob", Size: 1}); err != nil {
+		t.Fatalf("PutLocation: %v", err)
+	}
+	h, err := multihash.Sum([]byte("replacing allocation"), multihash.SHA2_256, -1)
+	if err != nil {
+		t.Fatalf("multihash: %v", err)
+	}
+	replacement := cid.NewCidV1(cid.Raw, h)
+	locs.mu.Lock()
+	locs.digest = d
+	locs.hook = func() {
+		_ = mem.DeleteLocation(ctx, did.Undef, d)
+		_ = mem.DeletePark(ctx, did.Undef, d)
+		if ok, err := mem.PutPark(ctx, registry.BlobPark{Space: did.Undef, Digest: d, AddTask: replacement.Bytes(), AcceptTask: replacement.Bytes(), PutInvocation: []byte{1}, Size: 1}); err != nil || !ok {
+			t.Errorf("PutPark (replacement) = %v, %v", ok, err)
+		}
+	}
+	locs.mu.Unlock()
+
+	startAcceptors(t, b)
+	if err := b.drainAcceptor(ctx, uploadID); err != nil {
+		t.Fatalf("drainAcceptor: %v", err)
+	}
+	park, err := mem.GetPark(ctx, did.Undef, d)
+	if err != nil {
+		t.Fatalf("replacement park dropped by a stale located path: %v", err)
+	}
+	if !bytes.Equal(park.AddTask, replacement.Bytes()) {
+		t.Fatalf("park add task = %x, want the replacement's", park.AddTask)
+	}
+	if states := partStates(t, mem, uploadID); states[1] != registry.PartSpooled {
+		t.Fatalf("part state = %q, want spooled (left for Complete)", states[1])
+	}
 }

@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/fil-forge/ucantone/did"
 	mh "github.com/multiformats/go-multihash"
 	"go.opentelemetry.io/otel/attribute"
 	"go.uber.org/zap"
@@ -72,6 +73,8 @@ type acceptor struct {
 	// waiters are signalled with the outcome of the next pass that fails,
 	// or with nil when the acceptor exits with nothing left to do.
 	waiters []chan error
+	// done is closed when the acceptor exits.
+	done chan struct{}
 }
 
 // signal hands err to every waiter and forgets them.
@@ -137,7 +140,7 @@ func (b *Backend) nudgeLocked(uploadID string) *acceptor {
 	if m.running == nil {
 		m.running = map[string]*acceptor{}
 	}
-	a := &acceptor{more: true}
+	a := &acceptor{more: true, done: make(chan struct{})}
 	m.running[uploadID] = a
 	m.wg.Add(1)
 	go func(ctx context.Context) {
@@ -145,6 +148,55 @@ func (b *Backend) nudgeLocked(uploadID string) *acceptor {
 		b.runAcceptor(ctx, uploadID, a)
 	}(m.ctx)
 	return a
+}
+
+// concludingSet is the blobs this process is concluding, by blobKey, each
+// with a count of the conclusions in flight.
+type concludingSet struct {
+	mu sync.Mutex
+	n  map[string]int
+}
+
+// markConcluding marks digests as being concluded in space until the
+// returned func is first called. A release that has not started defers while its
+// blob is marked (runRelease): the upload service registers a blob it
+// accepts before it answers the conclude, so a remove sent before that
+// answer finds nothing to remove, and the registration then lands with
+// nothing left to remove it. The mark is taken before the caller checks
+// for release records, and a release checks the mark before it starts, so
+// either the conclude finds the release's record and leaves the blob, or
+// the release finds the mark and waits.
+func (b *Backend) markConcluding(space did.DID, digests []mh.Multihash) func() {
+	c := &b.concluding
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.n == nil {
+		c.n = map[string]int{}
+	}
+	for _, d := range digests {
+		c.n[blobKey(space, d)]++
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			for _, d := range digests {
+				k := blobKey(space, d)
+				if c.n[k]--; c.n[k] <= 0 {
+					delete(c.n, k)
+				}
+			}
+		})
+	}
+}
+
+// isConcluding reports whether a conclusion of digest in space is in flight.
+func (b *Backend) isConcluding(space did.DID, digest mh.Multihash) bool {
+	c := &b.concluding
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.n[blobKey(space, digest)] > 0
 }
 
 // errAcceptorsNotRunning is drainAcceptor's answer before StartAcceptors, or
@@ -182,6 +234,29 @@ func (b *Backend) drainAcceptor(ctx context.Context, uploadID string) error {
 	}
 }
 
+// quiesceAcceptor waits for uploadID's acceptor, if one is running, to exit.
+// A session teardown calls it once it has latched the session out of 'open'
+// and 'completing', so the acceptor stops at its next pass, and before it
+// records any release. A pass in flight may have concluded a blob the upload
+// service is still accepting, and the service registers the blob before it
+// answers: a release run sooner could remove the blob before that
+// registration lands and leave the blob registered and stored, with nothing
+// left to remove it. The wait is bounded by acceptPassTimeout.
+func (b *Backend) quiesceAcceptor(ctx context.Context, uploadID string) error {
+	b.acceptors.mu.Lock()
+	a, ok := b.acceptors.running[uploadID]
+	b.acceptors.mu.Unlock()
+	if !ok {
+		return nil
+	}
+	select {
+	case <-a.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // runAcceptor is uploadID's acceptor: it makes passes while there is work,
 // backs off after a failed pass, and exits once a pass finds nothing to do or
 // ctx is done.
@@ -193,6 +268,7 @@ func (b *Backend) runAcceptor(ctx context.Context, uploadID string, a *acceptor)
 		if !a.more || ctx.Err() != nil {
 			delete(m.running, uploadID)
 			a.signal(nil)
+			close(a.done)
 			m.mu.Unlock()
 			return
 		}

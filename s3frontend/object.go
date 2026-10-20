@@ -870,6 +870,12 @@ func (b *Backend) runRelease(ctx context.Context, pr registry.PendingRelease) re
 		// file is waiting for it to finish.
 		return releaseDeferred
 	}
+	if pr.StartedAt.IsZero() && b.isConcluding(pr.Space, pr.Digest) {
+		// A conclude of the blob is in flight here, and its accept may be
+		// registered after a remove sent now (see markConcluding): the
+		// release waits for the next sweep.
+		return releaseDeferred
+	}
 	start, err := b.pendingReleases.StartRelease(ctx, pr.Space, pr.Digest)
 	if err != nil {
 		b.logger.Warn("release: start failed; retrying next sweep",

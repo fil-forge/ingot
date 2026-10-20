@@ -1093,8 +1093,14 @@ func (b *Backend) abortOpenSession(ctx context.Context, sess registry.MultipartS
 // It is the durable step of a session teardown: the part rows are the only
 // index to the blobs and cascade away with the session, so the caller runs
 // this before DeleteSession and only deletes the session once it has
-// succeeded. Returns the records, for releaseNow.
+// succeeded. Returns the records, for releaseNow. The caller has latched the
+// session out of 'open' and 'completing'; the upload's acceptor is waited
+// out first (see quiesceAcceptor), so no conclude is in flight when the
+// releases run.
 func (b *Backend) recordSessionReleases(ctx context.Context, space did.DID, uploadID string) ([]registry.PendingRelease, error) {
+	if err := b.quiesceAcceptor(ctx, uploadID); err != nil {
+		return nil, fmt.Errorf("wait for the upload's acceptor: %w", err)
+	}
 	parts, err := b.multipart.ListParts(ctx, uploadID)
 	if err != nil {
 		return nil, fmt.Errorf("list parts: %w", err)
@@ -1600,6 +1606,12 @@ func (b *Backend) acceptParked(ctx context.Context, space did.DID, digests []mh.
 	ctx, span := tracing.Start(ctx, "blobs.conclude", attribute.Int("ingot.blobs.total", len(digests)))
 	defer func() { tracing.End(span, err) }()
 
+	// Marked before the release records are read, and until the conclude
+	// has answered, by which time the upload service has registered what it
+	// accepted (see markConcluding).
+	unmark := b.markConcluding(space, digests)
+	defer unmark()
+
 	var releasing map[string]bool
 	if mode == acceptInBackground {
 		if releasing, err = b.pendingReleases.ReleasingDigests(ctx, space, digests); err != nil {
@@ -1633,14 +1645,15 @@ func (b *Backend) acceptParked(ctx context.Context, space did.DID, digests []mh.
 			return nil, err
 		}
 		if existing, err := b.locations.GetLocation(ctx, space, digest); err == nil && existing != nil && settled {
-			if err := b.intents.SetIntentState(ctx, space, digest, registry.IntentAccepted); err != nil {
-				return nil, fmt.Errorf("mark accepted (dedup): %w", err)
+			located, err := b.markLocated(ctx, space, digest)
+			if err != nil {
+				return nil, err
 			}
-			b.cacheHeld(ctx, space, digest)
-			// A located blob has no use for a park; one left beside the
-			// location goes here.
-			if err := b.parks.DeletePark(ctx, space, digest); err != nil {
-				return nil, fmt.Errorf("drop park (dedup): %w", err)
+			if !located {
+				// Released since the lookup: whatever stands now is for
+				// the caller's fallback, which checks again under the lock.
+				left = append(left, digest)
+				neverParked++
 			}
 			continue
 		} else if err != nil && !errors.Is(err, registry.ErrNotFound) {
@@ -1688,6 +1701,7 @@ func (b *Backend) acceptParked(ctx context.Context, space did.DID, digests []mh.
 	// client splits only past its batch cap), so thousands of parts cost a
 	// couple of round trips rather than one per part.
 	locations, err := b.deferred.ConcludeBlobs(ctx, space, toConclude)
+	unmark()
 	// Record every acceptance that came back before acting on any error:
 	// the conclude's own, or one blob's persistence failing. The upload
 	// service has run those accepts whether or not the rest of the batch
@@ -1719,6 +1733,31 @@ func (b *Backend) acceptParked(ctx context.Context, space did.DID, digests []mh.
 		return nil, fmt.Errorf("conclude blobs: %d of %d blobs returned no location", len(toConclude)-recorded, len(toConclude))
 	}
 	return left, nil
+}
+
+// markLocated records a blob found already located as accepted, and drops a
+// park left beside the location, under the blob's write lock. Every park is
+// written under that lock (parkBlob, recordStreamedPark), and a write that
+// finds a location does not park, so a park beside a location the lock
+// still shows is a leftover. Without the lock, a release could remove the
+// location after the lookup and a write of the same bytes park them again,
+// and the drop would take that write's park. It reports false when the
+// location is gone by the time the lock is held.
+func (b *Backend) markLocated(ctx context.Context, space did.DID, digest mh.Multihash) (bool, error) {
+	defer b.blobKeys.Lock(blobKey(space, digest))()
+	if _, err := b.locations.GetLocation(ctx, space, digest); errors.Is(err, registry.ErrNotFound) {
+		return false, nil
+	} else if err != nil {
+		return false, fmt.Errorf("lookup location: %w", err)
+	}
+	if err := b.intents.SetIntentState(ctx, space, digest, registry.IntentAccepted); err != nil {
+		return false, fmt.Errorf("mark accepted (dedup): %w", err)
+	}
+	b.cacheHeld(ctx, space, digest)
+	if err := b.parks.DeletePark(ctx, space, digest); err != nil {
+		return false, fmt.Errorf("drop park (dedup): %w", err)
+	}
+	return true, nil
 }
 
 // recordConcluded records a concluded blob as accepted: its park, with the

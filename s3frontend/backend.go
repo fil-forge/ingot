@@ -103,7 +103,10 @@ type Backend struct {
 	// to overwrite a park).
 	blobKeys syncutil.KeyedMutex
 	// acceptors runs each multipart upload's acceptor (see acceptor.go).
-	acceptors           acceptors
+	acceptors acceptors
+	// concluding counts, by blobKey, the conclusions in flight in this
+	// process (see markConcluding).
+	concluding          concludingSet
 	lastOrphanPass      time.Time
 	localBlobSweepBatch int
 	// overBudgetWarned and timeLimitLogged are set once the sweeper has

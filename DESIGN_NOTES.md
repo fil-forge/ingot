@@ -200,6 +200,17 @@ space holding the same bytes share a park, and both acceptors may conclude
 it: a repeated conclude is harmless upstream, the first record swaps the
 park, and the second finds the location.
 
+The upload service registers a blob it accepts before it answers the
+conclude, and a `/blob/remove` that arrives before that registration finds
+nothing to remove; the registration then lands with nothing left to remove
+it, and the blob stays stored. So no release runs against a conclude in
+flight. A session teardown (abort, expiry, DeleteBucket), once it has latched
+the session out of `open` and `completing`, waits for the upload's acceptor to
+finish its pass before it records any release (`quiesceAcceptor`). Any other
+release, such as a superseded part's, defers while a conclude of its blob is
+in flight in this process (`markConcluding`) and runs from the release
+sweeper after.
+
 `CompleteMultipartUpload` latches the session to `completing`, which stops
 new parts, and waits for the upload's acceptor to finish, up to 30 s
 (`acceptWaitBudget`), or less when the acceptor's last pass failed. It then
