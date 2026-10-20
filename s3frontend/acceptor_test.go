@@ -537,3 +537,96 @@ func TestAcceptorPassTimesOut(t *testing.T) {
 		t.Fatalf("part states after the retry = %v, want accepted", states)
 	}
 }
+
+// selectiveConcluder concludes like the parking uploader, except that a
+// conclude carrying a blocked digest waits for its context, and a failing
+// digest gets no location and an error while the others in the conclude are
+// accepted.
+type selectiveConcluder struct {
+	parkingUploader
+	mu      sync.Mutex
+	blocked map[string]bool
+	failing map[string]bool
+}
+
+func (s *selectiveConcluder) ConcludeBlobs(ctx context.Context, space did.DID, parked []uploader.UploadedBlob) ([]*uploader.BlobLocation, error) {
+	s.mu.Lock()
+	var block bool
+	fail := map[int]bool{}
+	for i, p := range parked {
+		block = block || s.blocked[string(p.Digest)]
+		fail[i] = s.failing[string(p.Digest)]
+	}
+	s.mu.Unlock()
+	if block {
+		<-ctx.Done()
+		return make([]*uploader.BlobLocation, len(parked)), ctx.Err()
+	}
+	locations, err := s.parkingUploader.ConcludeBlobs(ctx, space, parked)
+	if err != nil {
+		return locations, err
+	}
+	var errs []error
+	for i := range parked {
+		if fail[i] {
+			locations[i] = nil
+			errs = append(errs, errors.New("accept refused"))
+		}
+	}
+	return locations, errors.Join(errs...)
+}
+
+// TestCompleteWaitsOnlyForItsParts: Complete names part 1 and omits part 2,
+// whose conclude never answers. Complete waits for part 1 alone and commits
+// as soon as it is accepted, rather than for the upload's whole queue.
+func TestCompleteWaitsOnlyForItsParts(t *testing.T) {
+	savedBatch, savedWait := acceptBatchBlobs, acceptWaitBudget
+	acceptBatchBlobs, acceptWaitBudget = 1, 2*time.Second
+	t.Cleanup(func() { acceptBatchBlobs, acceptWaitBudget = savedBatch, savedWait })
+
+	sc := &selectiveConcluder{}
+	b, mem := newDeferredBackend(t, sc)
+	key := "complete-omits-a-stalled-part"
+	uploadID := mpCreate(t, b, key, "", "")
+	parts := uploadDistinctParts(t, b, key, uploadID, 2)
+	sc.mu.Lock()
+	sc.blocked = map[string]bool{string(hygienePartDigests(t, mem, uploadID, 2)[0]): true}
+	sc.mu.Unlock()
+
+	startAcceptors(t, b)
+	start := time.Now()
+	if _, err := mpComplete(t, b, key, uploadID, parts[:1], nil); err != nil {
+		t.Fatalf("Complete of part 1: %v", err)
+	}
+	if took := time.Since(start); took > acceptWaitBudget/2 {
+		t.Fatalf("Complete took %v; it waited on the omitted part", took)
+	}
+}
+
+// TestAcceptorPromotesPartsBesideAFailingBlob: one pass concludes two parts,
+// and part 2's blob is refused every time. Part 1 is accepted all the same,
+// so a Complete naming only part 1 commits; holding it back with its failing
+// neighbour would keep it parked on every retry.
+func TestAcceptorPromotesPartsBesideAFailingBlob(t *testing.T) {
+	shrinkAcceptBackoff(t)
+	sc := &selectiveConcluder{}
+	b, mem := newDeferredBackend(t, sc)
+	ctx := context.Background()
+	key := "accept-beside-a-failure"
+	uploadID := mpCreate(t, b, key, "", "")
+	parts := uploadDistinctParts(t, b, key, uploadID, 2)
+	sc.mu.Lock()
+	sc.failing = map[string]bool{string(hygienePartDigests(t, mem, uploadID, 2)[0]): true}
+	sc.mu.Unlock()
+
+	startAcceptors(t, b)
+	if err := b.drainAcceptor(ctx, uploadID); err == nil {
+		t.Fatal("the pass did not report part 2's failure")
+	}
+	if got := partStates(t, mem, uploadID); got[1] != registry.PartAccepted || got[2] != registry.PartParked {
+		t.Fatalf("part states = %v, want part 1 accepted and part 2 parked", got)
+	}
+	if _, err := mpComplete(t, b, key, uploadID, parts[:1], nil); err != nil {
+		t.Fatalf("Complete of part 1: %v", err)
+	}
+}

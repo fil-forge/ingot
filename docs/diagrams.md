@@ -538,7 +538,7 @@ sequenceDiagram
     else latch won
         B->>R: LatchSession(open to completing), single winner
         B->>R: manifest spans from each part's span_lengths<br/>(rows without them: intent size + FEE geometry)
-        B->>A: drainAcceptor, up to acceptWaitBudget (30 s)
+        B->>A: awaitPass until no named part is parked, up to acceptWaitBudget (30 s)
         B->>R: ListParts: the named parts' states
         alt a named part still parked
             B-->>C: 409 OperationAborted#59; the deferred revert reopens the session
@@ -617,8 +617,10 @@ stateDiagram-v2
 - `spooled` is the state of a part whose request is still parking its
   blobs, or died doing so. The acceptor never takes it; Complete does.
 - Complete requires every part it names to be `accepted` before the commit:
-  it waits for the acceptor, finishes `spooled` parts itself, and answers a
-  part still `parked` with a 409 that botocore clients treat as final.
+  it waits until none of them is queued (parts it omits are not waited
+  for), finishes `spooled` parts itself, and answers a part still `parked`
+  with a 409 that botocore clients treat as final. A failed pass accepts
+  every part of its batch but those holding a failed blob.
 - Rows from before migration 00030 are `parked` or `accepted` and have no
   `span_lengths`; Complete derives their lengths per blob.
 

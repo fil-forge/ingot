@@ -162,8 +162,9 @@ upload has at most one acceptor, a goroutine that runs while there is work:
 a pass takes the upload's parked parts in part order up to 1000 blobs,
 concludes them, and moves them to `accepted`, and the acceptor exits when a
 pass finds nothing. Parts that land during a pass are taken by the next one.
-A failed pass leaves its parts parked and retries after a backoff (1 s,
-doubling to 30 s); a pass that runs past `acceptPassTimeout` (2 min) fails
+A failed pass leaves the parts holding a failed blob parked and retries
+after a backoff (1 s, doubling to 30 s), and still accepts every other part
+of its batch, so one bad blob cannot hold its neighbours back on every retry; a pass that runs past `acceptPassTimeout` (2 min) fails
 the same way, since the Forge client sets no timeout of its own. The
 acceptor stops for a session that is no longer open or completing. It never
 takes a blob over from its release: a part holding a blob with a release
@@ -212,8 +213,10 @@ in flight in this process (`markConcluding`) and runs from the release
 sweeper after.
 
 `CompleteMultipartUpload` latches the session to `completing`, which stops
-new parts, and waits for the upload's acceptor to finish, up to 30 s
-(`acceptWaitBudget`), or less when the acceptor's last pass failed. It then
+new parts, and waits, up to 30 s (`acceptWaitBudget`), until none of the parts
+it was asked to commit is still queued, re-reading them after each of the
+acceptor's passes. Parts the upload holds and the request omits are not
+waited for; it stops early when the acceptor's last pass failed. It then
 reads the parts it was asked to commit. A `spooled` part is concluded, or
 uploaded from its spool copy if it never parked, by Complete itself; before
 uploading, Complete rechecks for a park under the blob's lock, since the

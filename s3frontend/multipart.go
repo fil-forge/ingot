@@ -1432,8 +1432,11 @@ var acceptWaitBudget = 30 * time.Second
 
 // acceptRequested makes sure every part Complete names has its blobs
 // accepted on Forge. The upload's acceptor has been accepting parts while the
-// client uploaded them, so Complete waits for it to finish the queue, within
-// acceptWaitBudget, and then reads where each part stands:
+// client uploaded them, so Complete waits, within acceptWaitBudget, until
+// none of the parts it names is still queued, re-reading them after each of
+// the acceptor's passes. Parts the upload holds and Complete omits are not
+// waited for: they are orphans of this completion. Then, for each named
+// part:
 //
 //   - accepted: nothing left to do.
 //   - spooled: its request died before its blobs were all parked, which is
@@ -1448,40 +1451,58 @@ var acceptWaitBudget = 30 * time.Second
 // parked parts itself, as it does spooled ones. A part replaced since the
 // request validated it is no longer the part the client named.
 func (b *Backend) acceptRequested(ctx context.Context, space did.DID, uploadID string, requested []registry.MultipartPart) error {
-	waitCtx, cancel := context.WithTimeout(ctx, acceptWaitBudget)
-	drainErr := b.drainAcceptor(waitCtx, uploadID)
-	cancel()
-	running := !errors.Is(drainErr, errAcceptorsNotRunning)
-	if ctx.Err() != nil {
-		return fmt.Errorf("s3frontend: wait for part acceptance: %w", ctx.Err())
-	}
-
-	current, err := b.multipart.ListParts(ctx, uploadID)
-	if err != nil {
-		return fmt.Errorf("s3frontend: list parts: %w", err)
-	}
-	byNum := make(map[int]registry.MultipartPart, len(current))
-	for _, p := range current {
-		byNum[p.PartNumber] = p
-	}
+	deadline := time.Now().Add(acceptWaitBudget)
+	running := true
+	var passErr error
 	var inline []registry.MultipartPart
 	queued := 0
-	for _, rp := range requested {
-		cur, ok := byNum[rp.PartNumber]
-		if !ok || !sameDigests(cur.BlobDigests, rp.BlobDigests) {
-			return s3err.GetAPIError(s3err.ErrInvalidPart)
+	for {
+		current, err := b.multipart.ListParts(ctx, uploadID)
+		if err != nil {
+			return fmt.Errorf("s3frontend: list parts: %w", err)
 		}
+		byNum := make(map[int]registry.MultipartPart, len(current))
+		for _, p := range current {
+			byNum[p.PartNumber] = p
+		}
+		inline, queued = inline[:0], 0
+		for _, rp := range requested {
+			cur, ok := byNum[rp.PartNumber]
+			if !ok || !sameDigests(cur.BlobDigests, rp.BlobDigests) {
+				return s3err.GetAPIError(s3err.ErrInvalidPart)
+			}
+			switch {
+			case cur.State == registry.PartAccepted:
+			case cur.State == registry.PartParked && running:
+				queued++
+			default:
+				inline = append(inline, cur)
+			}
+		}
+		// Stop when nothing named is queued, the budget is spent, or the
+		// last pass failed: a failing acceptor is backing off, and waiting
+		// out its backoff would only hold the request.
+		if queued == 0 || passErr != nil || !time.Now().Before(deadline) {
+			break
+		}
+		waitCtx, cancel := context.WithDeadline(ctx, deadline)
+		err = b.awaitPass(waitCtx, uploadID)
+		expired := waitCtx.Err() != nil
+		cancel()
 		switch {
-		case cur.State == registry.PartAccepted:
-		case cur.State == registry.PartParked && running:
-			queued++
-		default:
-			inline = append(inline, cur)
+		case ctx.Err() != nil:
+			return fmt.Errorf("s3frontend: wait for part acceptance: %w", ctx.Err())
+		case errors.Is(err, errAcceptorsNotRunning):
+			// Nobody to wait for: Complete accepts the parked parts itself.
+			running = false
+		case err != nil && !expired:
+			// The pass's own error, a timed-out pass's included.
+			passErr = err
 		}
 	}
 	if queued > 0 {
 		b.logger.Info("multipart completion deferred: parts still queued for acceptance",
-			zap.String("upload_id", uploadID), zap.Int("parts", queued), zap.Error(drainErr))
+			zap.String("upload_id", uploadID), zap.Int("parts", queued), zap.Error(passErr))
 		return errCompleteInProgress
 	}
 	if len(inline) == 0 {
@@ -1505,10 +1526,10 @@ func (b *Backend) acceptRequested(ctx context.Context, space did.DID, uploadID s
 }
 
 // partSpanLengths returns the length of the span each of p's blobs covers
-// in the object, as recorded with the part. A part recorded before the lengths were kept takes
-// them from its blobs' intents: the spooled byte count is the plaintext span
-// itself for a session stored as received, else the envelope's, from which
-// the plaintext span follows by the blob's FEE geometry.
+// in the object, as recorded with the part. A part recorded before the
+// lengths were kept takes them from its blobs' intents: the spooled byte
+// count is the span itself for a session stored as received, else the
+// envelope's, from which the span follows by the blob's FEE geometry.
 func (b *Backend) partSpanLengths(ctx context.Context, space did.DID, plaintext bool, p registry.MultipartPart) ([]int64, error) {
 	if p.SpanLengths != nil {
 		return p.SpanLengths, nil
@@ -1550,7 +1571,7 @@ func (b *Backend) concludeBlobs(ctx context.Context, space did.DID, blobs []msbu
 	// blob back to be concluded instead. Each round needs a park to appear
 	// after classification, which one in-flight write allows once.
 	for round := 0; round < concludeRounds && len(digests) > 0; round++ {
-		neverParked, err := b.acceptParked(ctx, space, digests, acceptForCommit)
+		neverParked, _, err := b.acceptParked(ctx, space, digests, acceptForCommit)
 		if err != nil {
 			return err
 		}
@@ -1601,8 +1622,10 @@ const (
 // /blob/accept, and its park is swapped for its location. It returns the
 // digests it left for Complete: one with neither row never parked (a crash
 // between spool and park), to upload from its spool copy, and, for the
-// acceptor, one with a release record.
-func (b *Backend) acceptParked(ctx context.Context, space did.DID, digests []mh.Multihash, mode acceptMode) (left []mh.Multihash, err error) {
+// acceptor, one with a release record. When the conclude or a record fails
+// it also returns the digests that are not accepted and recorded, beside
+// the error; every other digest is.
+func (b *Backend) acceptParked(ctx context.Context, space did.DID, digests []mh.Multihash, mode acceptMode) (left, failed []mh.Multihash, err error) {
 	ctx, span := tracing.Start(ctx, "blobs.conclude", attribute.Int("ingot.blobs.total", len(digests)))
 	defer func() { tracing.End(span, err) }()
 
@@ -1615,7 +1638,7 @@ func (b *Backend) acceptParked(ctx context.Context, space did.DID, digests []mh.
 	var releasing map[string]bool
 	if mode == acceptInBackground {
 		if releasing, err = b.pendingReleases.ReleasingDigests(ctx, space, digests); err != nil {
-			return nil, fmt.Errorf("lookup releases: %w", err)
+			return nil, nil, fmt.Errorf("lookup releases: %w", err)
 		}
 	}
 
@@ -1642,12 +1665,12 @@ func (b *Backend) acceptParked(ctx context.Context, space did.DID, digests []mh.
 				continue
 			}
 		} else if settled, err = b.settleRelease(ctx, space, digest); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if existing, err := b.locations.GetLocation(ctx, space, digest); err == nil && existing != nil && settled {
 			located, err := b.markLocated(ctx, space, digest)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			if !located {
 				// Released since the lookup: whatever stands now is for
@@ -1657,7 +1680,7 @@ func (b *Backend) acceptParked(ctx context.Context, space did.DID, digests []mh.
 			}
 			continue
 		} else if err != nil && !errors.Is(err, registry.ErrNotFound) {
-			return nil, fmt.Errorf("lookup location: %w", err)
+			return nil, nil, fmt.Errorf("lookup location: %w", err)
 		}
 		// Not located, or located by a release that has since run and
 		// taken the blob from the provider, and its park with it: concluded
@@ -1665,7 +1688,7 @@ func (b *Backend) acceptParked(ctx context.Context, space did.DID, digests []mh.
 
 		park, err := b.parks.GetPark(ctx, space, digest)
 		if err != nil && !errors.Is(err, registry.ErrNotFound) {
-			return nil, fmt.Errorf("lookup park: %w", err)
+			return nil, nil, fmt.Errorf("lookup park: %w", err)
 		}
 		if park == nil {
 			left = append(left, digest)
@@ -1674,11 +1697,11 @@ func (b *Backend) acceptParked(ctx context.Context, space did.DID, digests []mh.
 		}
 		addTask, err := cid.Cast(park.AddTask)
 		if err != nil {
-			return nil, fmt.Errorf("decode park add task: %w", err)
+			return nil, nil, fmt.Errorf("decode park add task: %w", err)
 		}
 		acceptTask, err := cid.Cast(park.AcceptTask)
 		if err != nil {
-			return nil, fmt.Errorf("decode park accept task: %w", err)
+			return nil, nil, fmt.Errorf("decode park accept task: %w", err)
 		}
 		toConclude = append(toConclude, uploader.UploadedBlob{
 			Digest:        digest,
@@ -1694,7 +1717,7 @@ func (b *Backend) acceptParked(ctx context.Context, space did.DID, digests []mh.
 		attribute.Int("ingot.blobs.uploaded", neverParked),
 	)
 	if len(toConclude) == 0 {
-		return left, nil
+		return left, nil, nil
 	}
 
 	// Every parked blob goes to the upload service in one exchange (the
@@ -1713,26 +1736,25 @@ func (b *Backend) acceptParked(ctx context.Context, space did.DID, digests []mh.
 	if err != nil {
 		errs = append(errs, fmt.Errorf("conclude blobs: %w", err))
 	}
-	recorded := 0
 	for i, p := range toConclude {
 		if i >= len(locations) || locations[i] == nil {
+			failed = append(failed, p.Digest)
 			continue
 		}
 		if rerr := b.recordConcluded(ctx, space, p, *locations[i]); rerr != nil {
 			// Still parked as far as the tables say; the next attempt
 			// concludes it again.
 			errs = append(errs, rerr)
-			continue
+			failed = append(failed, p.Digest)
 		}
-		recorded++
+	}
+	if len(failed) > 0 && len(errs) == 0 {
+		errs = append(errs, fmt.Errorf("conclude blobs: %d of %d blobs returned no location", len(failed), len(toConclude)))
 	}
 	if len(errs) > 0 {
-		return nil, errors.Join(errs...)
+		return left, failed, errors.Join(errs...)
 	}
-	if recorded != len(toConclude) {
-		return nil, fmt.Errorf("conclude blobs: %d of %d blobs returned no location", len(toConclude)-recorded, len(toConclude))
-	}
-	return left, nil
+	return left, nil, nil
 }
 
 // markLocated records a blob found already located as accepted, and drops a

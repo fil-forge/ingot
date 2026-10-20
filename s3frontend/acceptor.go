@@ -73,6 +73,9 @@ type acceptor struct {
 	// waiters are signalled with the outcome of the next pass that fails,
 	// or with nil when the acceptor exits with nothing left to do.
 	waiters []chan error
+	// passWaiters are signalled with the outcome of the next pass, whatever
+	// it is, or with nil when the acceptor exits.
+	passWaiters []chan error
 	// done is closed when the acceptor exits.
 	done chan struct{}
 }
@@ -83,6 +86,14 @@ func (a *acceptor) signal(err error) {
 		w <- err
 	}
 	a.waiters = nil
+}
+
+// signalPass hands a pass's outcome to every pass waiter and forgets them.
+func (a *acceptor) signalPass(err error) {
+	for _, w := range a.passWaiters {
+		w <- err
+	}
+	a.passWaiters = nil
 }
 
 // StartAcceptors lets acceptors run until ctx is done. Before it is called a
@@ -234,6 +245,34 @@ func (b *Backend) drainAcceptor(ctx context.Context, uploadID string) error {
 	}
 }
 
+// awaitPass nudges uploadID's acceptor and waits for its next pass to end,
+// returning that pass's error, or nil when the acceptor exits with nothing
+// left to do. An acceptor backing off after a failure returns that failure
+// at once rather than waiting out the backoff.
+func (b *Backend) awaitPass(ctx context.Context, uploadID string) error {
+	b.acceptors.mu.Lock()
+	a := b.nudgeLocked(uploadID)
+	if a == nil {
+		b.acceptors.mu.Unlock()
+		return errAcceptorsNotRunning
+	}
+	if a.lastErr != nil {
+		err := a.lastErr
+		b.acceptors.mu.Unlock()
+		return err
+	}
+	done := make(chan error, 1)
+	a.passWaiters = append(a.passWaiters, done)
+	b.acceptors.mu.Unlock()
+
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // quiesceAcceptor waits for uploadID's acceptor, if one is running, to exit.
 // A session teardown calls it once it has latched the session out of 'open'
 // and 'completing', so the acceptor stops at its next pass, and before it
@@ -268,6 +307,7 @@ func (b *Backend) runAcceptor(ctx context.Context, uploadID string, a *acceptor)
 		if !a.more || ctx.Err() != nil {
 			delete(m.running, uploadID)
 			a.signal(nil)
+			a.signalPass(nil)
 			close(a.done)
 			m.mu.Unlock()
 			return
@@ -281,6 +321,7 @@ func (b *Backend) runAcceptor(ctx context.Context, uploadID string, a *acceptor)
 
 		m.mu.Lock()
 		a.lastErr = err
+		a.signalPass(err)
 		if err != nil {
 			// Retried after the backoff; the parts stay parked meanwhile.
 			a.more = true
@@ -343,41 +384,50 @@ func (b *Backend) acceptPass(ctx context.Context, uploadID string) (did bool, er
 	}
 	span.SetAttributes(attribute.Int("ingot.parts", len(batch)), attribute.Int("ingot.blobs.total", len(digests)))
 
-	left, err := b.acceptParked(ctx, sess.Space, digests, acceptInBackground)
-	if err != nil {
+	left, failed, err := b.acceptParked(ctx, sess.Space, digests, acceptInBackground)
+	if err != nil && len(failed) == 0 {
+		// Failed before any conclude: nothing is known to be accepted.
 		return false, err
 	}
 	// A part holding a blob the acceptor left is not its to finish, and goes
 	// back to 'spooled' for Complete: a blob with neither a park nor a
 	// location is uploaded from its spool copy, and one with a release
-	// record is settled by Complete's commit, which claims it. The move is
-	// guarded by the part's digests, so a part a later upload replaced, or a
-	// session's teardown deleted, is left as it is and its release runs.
-	missing := digestSet(left)
+	// record is settled by Complete's commit, which claims it. A part
+	// holding a blob whose conclude failed stays parked for the retry. Every
+	// other part is accepted, even in a pass that failed: one blob's failure
+	// says nothing about its neighbours, and holding them back would keep
+	// every part batched with a failing blob parked on every retry. The
+	// moves are guarded by the part's digests, so a part a later upload
+	// replaced, or a session's teardown deleted, is left as it is and its
+	// release runs.
+	missing, unaccepted := digestSet(left), digestSet(failed)
 	var accepted, respooled []registry.MultipartPart
 	for _, p := range batch {
-		whole := true
+		leftOut, failedOut := false, false
 		for _, d := range p.BlobDigests {
 			if _, ok := missing[string(d)]; ok {
-				whole = false
-				break
+				leftOut = true
+			}
+			if _, ok := unaccepted[string(d)]; ok {
+				failedOut = true
 			}
 		}
-		if whole {
-			accepted = append(accepted, p)
-		} else {
+		switch {
+		case leftOut:
 			respooled = append(respooled, p)
+		case !failedOut:
+			accepted = append(accepted, p)
 		}
 	}
 	if len(respooled) > 0 {
 		b.logger.Info("multipart accept: parts left for Complete (a blob unparked or being released)",
 			zap.String("upload_id", uploadID), zap.Int("parts", len(respooled)))
-		if _, err := b.multipart.MoveParts(ctx, respooled, registry.PartParked, registry.PartSpooled); err != nil {
-			return false, fmt.Errorf("return parts to spooled: %w", err)
+		if _, merr := b.multipart.MoveParts(ctx, respooled, registry.PartParked, registry.PartSpooled); merr != nil {
+			return false, errors.Join(err, fmt.Errorf("return parts to spooled: %w", merr))
 		}
 	}
-	if _, err := b.multipart.MoveParts(ctx, accepted, registry.PartParked, registry.PartAccepted); err != nil {
-		return false, fmt.Errorf("mark parts accepted: %w", err)
+	if _, merr := b.multipart.MoveParts(ctx, accepted, registry.PartParked, registry.PartAccepted); merr != nil {
+		return false, errors.Join(err, fmt.Errorf("mark parts accepted: %w", merr))
 	}
-	return true, nil
+	return true, err
 }

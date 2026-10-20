@@ -442,7 +442,7 @@ acceptor (one per upload, in the background)
      exits when a pass finds nothing; a sweep restarts it for any upload with parked parts
 CompleteMultipartUpload([parts])
      validate parts (S3 rules); latch session open→completing (§7.3)
-     wait for the acceptor, up to 30 s
+     wait, up to 30 s, until no named part is queued (omitted parts are not waited for)
      every named part accepted → continue
      a part still spooled (its request died mid-park) → Complete concludes or uploads it itself
      a part still parked (acceptor behind or failing) → 409 OperationAborted, session reopened
