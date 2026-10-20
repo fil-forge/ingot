@@ -30,6 +30,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/fil-forge/versitygw/tests/integration"
+	"github.com/multiformats/go-multibase"
+	mh "github.com/multiformats/go-multihash"
 
 	ingottest "github.com/fil-forge/ingot/testing"
 	"github.com/fil-forge/smelt/pkg/stack"
@@ -577,6 +579,66 @@ func corruptLocalFileTail(t *testing.T, ctx context.Context, s *stack.Stack, pat
 	if out, errOut, err := s.Exec(ctx, "ingot", "sh", "-c", script); err != nil {
 		t.Fatalf("corrupt spool file %s: %v (stdout=%s stderr=%s)", path, err, out, errOut)
 	}
+}
+
+// piriBlobPath is where piri-0 keeps a blob whose sha256 is sum. The stack
+// runs piri on its filesystem backend: the PDP store is a flatfs store under
+// /data/piri/pdp/datastore with NextToLast(2) sharding, keyed by the
+// lowercase base32 multihash without the multibase prefix. Piri verifies (or
+// computes) the digest from the uploaded body and its settle task moves the
+// file to this key — so the file existing means piri holds exactly the bytes
+// that hash to sum.
+func piriBlobPath(t *testing.T, sum [32]byte) string {
+	t.Helper()
+	digest, err := mh.Encode(sum[:], mh.SHA2_256)
+	if err != nil {
+		t.Fatalf("encode multihash: %v", err)
+	}
+	b32, err := multibase.Encode(multibase.Base32, digest)
+	if err != nil {
+		t.Fatalf("encode base32: %v", err)
+	}
+	key := b32[1:]
+	return fmt.Sprintf("/data/piri/pdp/datastore/%s/%s.data", key[len(key)-3:len(key)-1], key)
+}
+
+// piriHoldsBlob reports whether the file at piriBlobPath(sum) exists right
+// now. Settle runs after /blob/accept returns, so a positive check needs
+// waitForPiriBlob; this one-shot form is for asserting absence once the
+// blob that was uploaded has settled.
+func piriHoldsBlob(t *testing.T, ctx context.Context, s *stack.Stack, sum [32]byte) bool {
+	t.Helper()
+	path := piriBlobPath(t, sum)
+	out, errOut, err := s.Exec(ctx, "piri-0", "sh", "-c", fmt.Sprintf(`test -f %q && echo yes || echo no`, path))
+	if err != nil {
+		t.Fatalf("stat piri blob %s: %v (stderr=%s)", path, err, errOut)
+	}
+	return strings.TrimSpace(out) == "yes"
+}
+
+// waitForPiriBlob polls until piri-0 holds a blob whose sha256 is sum, or
+// fails the test after timeout.
+func waitForPiriBlob(t *testing.T, ctx context.Context, s *stack.Stack, sum [32]byte, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if piriHoldsBlob(t, ctx, s, sum) {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("context done waiting for piri blob %x: %v", sum, ctx.Err())
+		case <-time.After(time.Second):
+		}
+	}
+	t.Fatalf("piri-0 never held a blob of digest %x within %s", sum, timeout)
+}
+
+// waitForPiriSettled waits for piri-0 to log that it settled the blob with
+// this hex multihash, i.e. moved it from its staged upload to its digest key.
+func waitForPiriSettled(t *testing.T, ctx context.Context, s *stack.Stack, hexDigest string) {
+	t.Helper()
+	waitForPiriLog(t, ctx, s, "settled staged blob\t{\"blob\": \""+hexDigest+"\"}", 30*time.Second)
 }
 
 // waitForPiriLog polls piri-0's container logs until substr appears.

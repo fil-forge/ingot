@@ -36,8 +36,11 @@ import (
 // authorization, the x-amz-server-side-encryption header on every object
 // response, and the stored form on disk and in Postgres — a "none" bucket's
 // body is the plaintext itself with no key row, an AES256 one an envelope
-// with one. (A GET or HEAD carrying an encryption header is refused; the
-// conformance corpus pins that, sse-0031, with a raw request.)
+// with one. It also looks at the blob piri holds, found by the sha256 of the
+// bytes the client sent: a read back through ingot cannot tell whether the
+// stored blob was transformed, because ingot reverses whatever it applied.
+// (A GET or HEAD carrying an encryption header is refused; the conformance
+// corpus pins that, sse-0031, with a raw request.)
 func TestForgeBucketEncryption(t *testing.T) {
 	ctx := t.Context()
 	s, endpoint := forgeStack(t, withAllowNoneConfig())
@@ -123,6 +126,14 @@ func TestForgeBucketEncryption(t *testing.T) {
 	if blobs, rows := keyRows(t, "default"); rows != blobs {
 		t.Fatalf("unconfigured bucket: %d key rows for %d blobs", rows, blobs)
 	}
+	// The control for the piri-side check below: an encrypted PUT of these
+	// bytes leaves piri holding an envelope, so once that envelope has
+	// settled, no blob of the plaintext's digest exists. (Checked before the
+	// "none" PUT of the same bytes, which creates exactly that blob.)
+	waitForPiriSettled(t, ctx, s, objectBlobDigestsHex(t, ctx, s, bucket, "default")[0])
+	if piriHoldsBlob(t, ctx, s, sum) {
+		t.Fatalf("unconfigured bucket: piri holds a blob of the plaintext's digest after an encrypted PUT")
+	}
 
 	// "none": stored as received.
 	if _, err := cl.PutBucketEncryption(ctx, &s3.PutBucketEncryptionInput{Bucket: aws.String(bucket), ServerSideEncryptionConfiguration: sseConfig("none")}); err != nil {
@@ -158,6 +169,34 @@ func TestForgeBucketEncryption(t *testing.T) {
 		if digests := objectBlobDigestsHex(t, ctx, s, bucket, "plain"); digests[0] != "1220"+plainHex {
 			t.Fatalf("stored digest %s is not the plaintext's multihash 1220%s", digests[0], plainHex)
 		}
+		// And piri holds it under that digest: the blob on the network is
+		// the uploaded bytes.
+		waitForPiriBlob(t, ctx, s, sum, 30*time.Second)
+	})
+	t.Run("PackSizedBlobOnPiri", func(t *testing.T) {
+		// A client-side pack: one PutObject of 128 MiB, identified everywhere
+		// by its sha256. Under max_blob_size, so it is one blob.
+		const size = 128 << 20
+		h := sha256.New()
+		if _, err := io.Copy(h, newPatternReader(size)); err != nil {
+			t.Fatalf("hash pattern: %v", err)
+		}
+		var want [32]byte
+		copy(want[:], h.Sum(nil))
+		big := bigObjectClient(t, endpoint, accessKey, secretKey)
+		out, err := big.PutObject(ctx, &s3.PutObjectInput{
+			Bucket: aws.String(bucket), Key: aws.String("pack"), Body: newPatternReader(size), ContentLength: aws.Int64(size),
+		})
+		if err != nil {
+			t.Fatalf("PutObject pack: %v", err)
+		}
+		if out.ServerSideEncryption != "" {
+			t.Fatalf("PUT reports %q, want no encryption", out.ServerSideEncryption)
+		}
+		if blobs, rows := keyRows(t, "pack"); blobs != 1 || rows != 0 {
+			t.Fatalf("%d blobs with %d key rows, want 1 and 0", blobs, rows)
+		}
+		waitForPiriBlob(t, ctx, s, want, 60*time.Second)
 	})
 	t.Run("ExplicitAES256EncryptsOneObject", func(t *testing.T) {
 		sse, path := putOne(t, "asked", data, types.ServerSideEncryptionAes256)
