@@ -192,7 +192,7 @@ func (s *Service) GetUserAccountForRequest(ctx fiber.Ctx, accessKeyStr string) (
 	// A query naming two subresources addresses no operation. S3 refuses it
 	// before authenticating the request, and so does the gateway: Hilt's own
 	// classifier names the refusal, so there is nothing to ask Hilt.
-	if _, err := hiltauth.RequirementsFor(req); errors.Is(err, hiltauth.ErrConflictingQuery) {
+	if _, _, err := hiltauth.RequirementsFor(req); errors.Is(err, hiltauth.ErrConflictingQuery) {
 		path = "local"
 		s.logger.Debug("hilt/iam: request names two subresources", zap.String("access", accessKeyStr), zap.Error(err))
 		return auth.Account{}, conflictingQuery(err.Error())
@@ -458,11 +458,10 @@ func (s *Service) authorizeLocal(ctx context.Context, req s3.Request, access str
 	// headers, which the signature covers only when listed in SignedHeaders;
 	// Hilt's classifier refuses an unsigned one, as Hilt itself does, and
 	// the fast path then decides nothing: Hilt answers with the refusal.
-	needs, err := hiltauth.RequirementsFor(req)
-	if err != nil || len(needs.Buckets) == 0 {
+	op, reqs, err := hiltauth.RequirementsFor(req)
+	if err != nil || len(reqs) == 0 {
 		return auth.Account{}, false, nil
 	}
-	op := needs.Operation
 
 	// 4. For each bucket: its space is the delegation subject; the key's
 	// cached effective action set for it decides whether the action is
@@ -476,7 +475,7 @@ func (s *Service) authorizeLocal(ctx context.Context, req s3.Request, access str
 	// own grant (Hilt's bucket scoping) and the onward re-delegation.
 	// Cross-key mixing is structurally impossible, so one probe per command
 	// suffices.
-	for _, r := range needs.Buckets {
+	for _, r := range reqs {
 		cmds := s3perm.CommandsFor(r.Permission)
 		if len(cmds) == 0 {
 			return auth.Account{}, false, nil
@@ -587,15 +586,15 @@ func (s *Service) cacheProofs(ctx context.Context, store *DelegationCache, ctr u
 // different bucket. A request Hilt cannot classify falls back to the
 // path-style bucket alone; empty for bucket-less requests (ListBuckets).
 func requestBuckets(req s3.Request) []string {
-	needs, err := hiltauth.RequirementsFor(req)
-	if err != nil || len(needs.Buckets) == 0 {
+	_, reqs, err := hiltauth.RequirementsFor(req)
+	if err != nil || len(reqs) == 0 {
 		if b := bucketFromURL(req.URL); b != "" {
 			return []string{b}
 		}
 		return nil
 	}
 	var names []string
-	for _, r := range needs.Buckets {
+	for _, r := range reqs {
 		if r.Bucket != "" && !slices.Contains(names, r.Bucket) {
 			names = append(names, r.Bucket)
 		}

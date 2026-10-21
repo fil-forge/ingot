@@ -517,9 +517,9 @@ func TestPutOnlyKeyIsDeniedOnReads(t *testing.T) {
 	}
 	for name, req := range denied {
 		t.Run(name+" is refused", func(t *testing.T) {
-			needs, err := hiltauth.RequirementsFor(req)
+			op, _, err := hiltauth.RequirementsFor(req)
 			require.NoError(t, err)
-			require.Equal(t, name, needs.Operation.String())
+			require.Equal(t, name, op.String())
 
 			s := service(t, req)
 			_, ok, err := s.authorizeLocal(context.Background(), req, accessKeyID, s.proofs.For(accessKey.DID()))
@@ -535,9 +535,9 @@ func TestPutOnlyKeyIsDeniedOnReads(t *testing.T) {
 		// fast path refuses as Hilt would, without asking.
 		lock := map[string]string{"X-Amz-Object-Lock-Mode": "GOVERNANCE"}
 		req := signedWrite(t, "s3.example", "/bkt/obj", accessKeyID, secret, lock, true)
-		needs, err := hiltauth.RequirementsFor(req)
+		op, _, err := hiltauth.RequirementsFor(req)
 		require.NoError(t, err)
-		require.Equal(t, hiltauth.OpPutObject, needs.Operation)
+		require.Equal(t, hiltauth.OpPutObject, op)
 
 		s := service(t, req)
 		_, ok, err := s.authorizeLocal(context.Background(), req, accessKeyID, s.proofs.For(accessKey.DID()))
@@ -552,7 +552,7 @@ func TestPutOnlyKeyIsDeniedOnReads(t *testing.T) {
 		// answers the request with the same refusal.
 		lock := map[string]string{"X-Amz-Object-Lock-Mode": "GOVERNANCE"}
 		req := signedWrite(t, "s3.example", "/bkt/obj", accessKeyID, secret, lock, false)
-		_, err := hiltauth.RequirementsFor(req)
+		_, _, err := hiltauth.RequirementsFor(req)
 		require.ErrorIs(t, err, hiltauth.ErrUnsignedHeader)
 		s := service(t, req)
 		_, ok, err := s.authorizeLocal(context.Background(), req, accessKeyID, s.proofs.For(accessKey.DID()))
