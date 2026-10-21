@@ -456,12 +456,10 @@ func (s *Service) authorizeLocal(ctx context.Context, req s3.Request, access str
 	// (create/delete/list-buckets) yield none — they go to Hilt regardless.
 	// The source and the headers that add a permission are decided from
 	// headers, which the signature covers only when listed in SignedHeaders;
-	// Hilt refuses an unsigned one, and the fast path decides nothing from it.
+	// Hilt's classifier refuses an unsigned one, as Hilt itself does, and
+	// the fast path then decides nothing: Hilt answers with the refusal.
 	needs, err := hiltauth.RequirementsFor(req)
 	if err != nil || len(needs.Buckets) == 0 {
-		return auth.Account{}, false, nil
-	}
-	if _, unsigned := needs.Unsigned(sr); unsigned {
 		return auth.Account{}, false, nil
 	}
 	op := needs.Operation

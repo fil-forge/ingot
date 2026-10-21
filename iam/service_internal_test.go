@@ -538,7 +538,6 @@ func TestPutOnlyKeyIsDeniedOnReads(t *testing.T) {
 		needs, err := hiltauth.RequirementsFor(req)
 		require.NoError(t, err)
 		require.Equal(t, hiltauth.OpPutObject, needs.Operation)
-		require.Equal(t, []string{"x-amz-object-lock-mode"}, needs.Headers)
 
 		s := service(t, req)
 		_, ok, err := s.authorizeLocal(context.Background(), req, accessKeyID, s.proofs.For(accessKey.DID()))
@@ -548,10 +547,13 @@ func TestPutOnlyKeyIsDeniedOnReads(t *testing.T) {
 	})
 
 	t.Run("an unsigned lock header is left to Hilt", func(t *testing.T) {
-		// The header is present but outside SignedHeaders, so nothing is
-		// decided from it locally: Hilt refuses the request as unsigned.
+		// The header is present but outside SignedHeaders, so Hilt's
+		// classifier refuses it and nothing is decided locally: Hilt
+		// answers the request with the same refusal.
 		lock := map[string]string{"X-Amz-Object-Lock-Mode": "GOVERNANCE"}
 		req := signedWrite(t, "s3.example", "/bkt/obj", accessKeyID, secret, lock, false)
+		_, err := hiltauth.RequirementsFor(req)
+		require.ErrorIs(t, err, hiltauth.ErrUnsignedHeader)
 		s := service(t, req)
 		_, ok, err := s.authorizeLocal(context.Background(), req, accessKeyID, s.proofs.For(accessKey.DID()))
 		require.False(t, ok)
