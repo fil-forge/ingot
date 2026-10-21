@@ -912,6 +912,11 @@ flowchart TB
   `s3:GetObject`'s, `s3:ListBucket`'s and `s3:AbortMultipartUpload`'s, so a
   chain probe alone would let a put-only key read and abort on the bucket, or
   read a copy's source.
+- A copy's source and the headers that add a permission to a write (a lock
+  or tags on the version it creates) are decided from headers, which hilt's
+  `RequirementsFor` lists with the bucket/permission pairs. The fast path
+  decides nothing from a header the signature does not cover: the request
+  goes to hilt, which refuses it as `UnsignedHeader`.
 
 Cross-references: [`architecture.md` §9](./architecture.md#9-the-system-contract-piri--sprue--indexer).
 

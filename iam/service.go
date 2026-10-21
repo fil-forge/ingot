@@ -192,7 +192,7 @@ func (s *Service) GetUserAccountForRequest(ctx fiber.Ctx, accessKeyStr string) (
 	// A query naming two subresources addresses no operation. S3 refuses it
 	// before authenticating the request, and so does the gateway: Hilt's own
 	// classifier names the refusal, so there is nothing to ask Hilt.
-	if _, _, err := hiltauth.RequirementsFor(req); errors.Is(err, hiltauth.ErrConflictingQuery) {
+	if _, err := hiltauth.RequirementsFor(req); errors.Is(err, hiltauth.ErrConflictingQuery) {
 		path = "local"
 		s.logger.Debug("hilt/iam: request names two subresources", zap.String("access", accessKeyStr), zap.Error(err))
 		return auth.Account{}, conflictingQuery(err.Error())
@@ -385,7 +385,7 @@ func mapAuthError(err error) (error, bool) {
 		hiltauth.ForeignBucketErrorName,
 		// A copy whose source header the signature does not cover cannot be
 		// authorized; the SDKs always sign it.
-		hiltauth.UnsignedCopySourceErrorName:
+		hiltauth.UnsignedHeaderErrorName:
 		return s3err.GetAPIError(s3err.ErrAccessDenied), true
 	case hiltauth.TemporarilyUnavailableErrorName:
 		// An authorize that waited out Hilt's lock timeout behind a policy
@@ -403,10 +403,6 @@ func mapAuthError(err error) (error, bool) {
 		return nil, false
 	}
 }
-
-// copySourceHeader names a copy's source object; it is only trusted when the
-// request signature covers it.
-const copySourceHeader = "x-amz-copy-source"
 
 // authorizeLocal is the fast path, mirroring Hilt's own verification and
 // authorization order over THIS key's proof store: signature, then per
@@ -453,19 +449,22 @@ func (s *Service) authorizeLocal(ctx context.Context, req s3.Request, access str
 		return auth.Account{}, false, nil
 	}
 
-	// 3. Every bucket the request acts on, with the permission it needs there:
-	// the addressed bucket, plus the copy source for CopyObject and
-	// UploadPartCopy. Operations on no existing bucket (create/delete/
-	// list-buckets) yield none — they go to Hilt regardless. A copy's source
-	// is named by a header, which the signature covers only when listed in
-	// SignedHeaders; Hilt refuses an unsigned one, and so does the fast path.
-	op, reqs, err := hiltauth.RequirementsFor(req)
-	if err != nil || len(reqs) == 0 {
+	// 3. Every bucket the request acts on, with the permissions it needs
+	// there: the addressed bucket with each permission the operation and its
+	// headers put on it (a lock or tags set by a write), plus the copy source
+	// for CopyObject and UploadPartCopy. Operations on no existing bucket
+	// (create/delete/list-buckets) yield none — they go to Hilt regardless.
+	// The source and the headers that add a permission are decided from
+	// headers, which the signature covers only when listed in SignedHeaders;
+	// Hilt refuses an unsigned one, and the fast path decides nothing from it.
+	needs, err := hiltauth.RequirementsFor(req)
+	if err != nil || len(needs.Buckets) == 0 {
 		return auth.Account{}, false, nil
 	}
-	if op.CopiesSource() && !sr.HeaderSigned(copySourceHeader) {
+	if _, unsigned := needs.Unsigned(sr); unsigned {
 		return auth.Account{}, false, nil
 	}
+	op := needs.Operation
 
 	// 4. For each bucket: its space is the delegation subject; the key's
 	// cached effective action set for it decides whether the action is
@@ -479,7 +478,7 @@ func (s *Service) authorizeLocal(ctx context.Context, req s3.Request, access str
 	// own grant (Hilt's bucket scoping) and the onward re-delegation.
 	// Cross-key mixing is structurally impossible, so one probe per command
 	// suffices.
-	for _, r := range reqs {
+	for _, r := range needs.Buckets {
 		cmds := s3perm.CommandsFor(r.Permission)
 		if len(cmds) == 0 {
 			return auth.Account{}, false, nil
@@ -590,15 +589,15 @@ func (s *Service) cacheProofs(ctx context.Context, store *DelegationCache, ctr u
 // different bucket. A request Hilt cannot classify falls back to the
 // path-style bucket alone; empty for bucket-less requests (ListBuckets).
 func requestBuckets(req s3.Request) []string {
-	_, reqs, err := hiltauth.RequirementsFor(req)
-	if err != nil || len(reqs) == 0 {
+	needs, err := hiltauth.RequirementsFor(req)
+	if err != nil || len(needs.Buckets) == 0 {
 		if b := bucketFromURL(req.URL); b != "" {
 			return []string{b}
 		}
 		return nil
 	}
 	var names []string
-	for _, r := range reqs {
+	for _, r := range needs.Buckets {
 		if r.Bucket != "" && !slices.Contains(names, r.Bucket) {
 			names = append(names, r.Bucket)
 		}

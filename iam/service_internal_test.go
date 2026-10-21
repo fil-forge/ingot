@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -91,6 +92,40 @@ func signedCopy(t *testing.T, host, dstBucket, srcBucket, accessKeyID, secret st
 		headers["X-Amz-Copy-Source"] = source
 	}
 	return s3.Request{Method: http.MethodPut, Headers: headers, URL: req.URL.RequestURI()}
+}
+
+// signedWrite builds a real SigV4-signed PUT of path carrying headers. With
+// sign set the headers are among the signed headers, as the SDKs sign every
+// x-amz-* header present; without it they are added after signing, the
+// hand-rolled request the fast path must leave to Hilt.
+func signedWrite(t *testing.T, host, path, accessKeyID, secret string, headers map[string]string, sign bool) s3.Request {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPut, "http://"+host+path, nil)
+	require.NoError(t, err)
+	req.Header.Set("X-Amz-Content-Sha256", "UNSIGNED-PAYLOAD")
+	signed := []string{"host", "x-amz-content-sha256", "x-amz-date"}
+	if sign {
+		for k, v := range headers {
+			req.Header.Set(k, v)
+			signed = append(signed, strings.ToLower(k))
+		}
+	}
+	_, err = v4.NewSigner().SignHTTP(context.Background(),
+		awsv4.Credentials{AccessKeyID: accessKeyID, SecretAccessKey: secret},
+		req, "UNSIGNED-PAYLOAD", "s3", "us-east-1", time.Now(), signed,
+		func(o *v4.SignerOptions) { o.DisableURIPathEscaping = true })
+	require.NoError(t, err)
+
+	out := map[string]string{"Host": host}
+	for k := range req.Header {
+		out[k] = req.Header.Get(k)
+	}
+	if !sign {
+		for k, v := range headers {
+			out[k] = v
+		}
+	}
+	return s3.Request{Method: http.MethodPut, Headers: out, URL: req.URL.RequestURI()}
 }
 
 // mapResolver returns the bucket→space mapping for several buckets.
@@ -482,9 +517,9 @@ func TestPutOnlyKeyIsDeniedOnReads(t *testing.T) {
 	}
 	for name, req := range denied {
 		t.Run(name+" is refused", func(t *testing.T) {
-			op, _, err := hiltauth.RequirementsFor(req)
+			needs, err := hiltauth.RequirementsFor(req)
 			require.NoError(t, err)
-			require.Equal(t, name, op.String())
+			require.Equal(t, name, needs.Operation.String())
 
 			s := service(t, req)
 			_, ok, err := s.authorizeLocal(context.Background(), req, accessKeyID, s.proofs.For(accessKey.DID()))
@@ -493,6 +528,35 @@ func TestPutOnlyKeyIsDeniedOnReads(t *testing.T) {
 			require.Zero(t, s.authorizer.(*refusingAuthorizer).calls)
 		})
 	}
+
+	t.Run("a lock header on the put is refused on the cached set", func(t *testing.T) {
+		// Setting a retention period through the header needs
+		// s3:PutObjectRetention beside the put; the set lacks it, so the
+		// fast path refuses as Hilt would, without asking.
+		lock := map[string]string{"X-Amz-Object-Lock-Mode": "GOVERNANCE"}
+		req := signedWrite(t, "s3.example", "/bkt/obj", accessKeyID, secret, lock, true)
+		needs, err := hiltauth.RequirementsFor(req)
+		require.NoError(t, err)
+		require.Equal(t, hiltauth.OpPutObject, needs.Operation)
+		require.Equal(t, []string{"x-amz-object-lock-mode"}, needs.Headers)
+
+		s := service(t, req)
+		_, ok, err := s.authorizeLocal(context.Background(), req, accessKeyID, s.proofs.For(accessKey.DID()))
+		require.False(t, ok)
+		require.Equal(t, s3err.GetAPIError(s3err.ErrAccessDenied), err)
+		require.Zero(t, s.authorizer.(*refusingAuthorizer).calls)
+	})
+
+	t.Run("an unsigned lock header is left to Hilt", func(t *testing.T) {
+		// The header is present but outside SignedHeaders, so nothing is
+		// decided from it locally: Hilt refuses the request as unsigned.
+		lock := map[string]string{"X-Amz-Object-Lock-Mode": "GOVERNANCE"}
+		req := signedWrite(t, "s3.example", "/bkt/obj", accessKeyID, secret, lock, false)
+		s := service(t, req)
+		_, ok, err := s.authorizeLocal(context.Background(), req, accessKeyID, s.proofs.For(accessKey.DID()))
+		require.False(t, ok)
+		require.NoError(t, err)
+	})
 
 	t.Run("PutObject is still authorized", func(t *testing.T) {
 		req := signedRequest(t, http.MethodPut, "s3.example", "/bkt/obj", accessKeyID, secret, now)
@@ -614,7 +678,7 @@ func TestMapAuthError(t *testing.T) {
 		hiltauth.OperationNotPermittedErrorName:  {"AccessDenied", 403},
 		hiltauth.BucketNotPermittedErrorName:     {"AccessDenied", 403},
 		hiltauth.ForeignBucketErrorName:          {"AccessDenied", 403},
-		hiltauth.UnsignedCopySourceErrorName:     {"AccessDenied", 403},
+		hiltauth.UnsignedHeaderErrorName:         {"AccessDenied", 403},
 		hiltauth.TemporarilyUnavailableErrorName: {"ServiceUnavailable", 503},
 		s3bkt.InvalidPolicyErrorName:             {"MalformedPolicy", 400},
 	}
