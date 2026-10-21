@@ -948,7 +948,10 @@ func (b *Backend) settleRelease(ctx context.Context, space did.DID, digest multi
 // says. Cancelled, the obligation would rest on this write alone, which can
 // die before it records the release again. A located blob is reusable
 // beside a pending record, since the record cannot start while the row
-// stands. A started record is waited out as settleRelease waits.
+// stands: the lookup takes the claim-key lock a start holds until it
+// commits, so a record it reports pending is not one about to start, and
+// the start that follows finds the row. A started record is waited out as
+// settleRelease waits.
 func (b *Backend) awaitRelease(ctx context.Context, space did.DID, digest multihash.Multihash) (bool, error) {
 	return b.settle(ctx, space, digest, func() (releaseStanding, error) {
 		pr, err := b.pendingReleases.GetRelease(ctx, space, digest)
