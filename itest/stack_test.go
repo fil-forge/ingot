@@ -343,14 +343,12 @@ var hiltAllPermissions = []string{
 	"s3:AbortMultipartUpload",
 	"s3:ListMultipartUploadParts",
 	"s3:ListBucketMultipartUploads",
-	// The bucket encryption configuration (fil-forge/hilt#101); removing it
-	// needs the write permission.
+	// The bucket encryption configuration; removing it needs the write
+	// permission.
 	"s3:GetEncryptionConfiguration",
 	"s3:PutEncryptionConfiguration",
-	// The operations hilt classifies by the gateway's routes
-	// (fil-forge/hilt#102): bucket location, ACL, CORS, policy status,
-	// tagging, versioning and object lock configuration, and object tagging
-	// and attributes.
+	// The bucket configuration and object tag and attribute operations, each
+	// of which hilt authorizes on its own permission.
 	"s3:GetBucketLocation",
 	"s3:GetBucketAcl",
 	"s3:GetBucketCORS",
