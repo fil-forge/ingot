@@ -7,7 +7,7 @@ name: Go Test
 # stack. The live job exists because the unit job runs the same packages with
 # no INGOT_TEST_* env, silently skipping every *_live_test.go.
 #
-# The Docker-backed work spreads over six runners: five `itest-shards` and
+# The Docker-backed work spreads over seven runners: six `itest-shards` and
 # `s3compat`, which runs the compatibility corpus (the shards leave
 # INGOT_S3COMPAT unset, so TestForgeS3Compat skips itself there). Shard
 # membership lives in the Makefile, target `itest-shard`; job `itest`
@@ -122,6 +122,7 @@ jobs:
             # and move this flag with it, or it silently stops running.
             big: '1'
           - shard: releases
+          - shard: auth
           - shard: rest
 
     name: itest (${{ matrix.shard }})
