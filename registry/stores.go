@@ -677,13 +677,16 @@ type MultipartStore interface {
 	// write and the state check are one statement that holds the session
 	// row, so a part cannot land after a Complete or a teardown has taken
 	// the session, and a teardown's part listing sees every part that did
-	// land. Returns the blob digests of the row this write replaced, nil for
-	// a new part number. Writes of one part number are serialised, so the
-	// digests are exactly those the row carried when this write landed,
-	// which a listing taken before the write may not have seen: a concurrent
-	// write of the same part number lands in between, and only its replacer
-	// learns of it.
-	PutPart(ctx context.Context, p MultipartPart, tree *PartTree) (replaced []multihash.Multihash, err error)
+	// land. In the same transaction it records a release, due now, for each
+	// blob the replaced row named and this part does not, and returns those
+	// records for the caller to run: the replaced row and the releases of
+	// its blobs are one write, so no failure or crash can separate them.
+	// Writes of one part number are serialised, so the replaced row is
+	// exactly the one standing when this write landed, which a listing
+	// taken before the write may not have seen: a concurrent write of the
+	// same part number lands in between, and only its replacer learns of
+	// it.
+	PutPart(ctx context.Context, p MultipartPart, tree *PartTree) (released []PendingRelease, err error)
 	// MoveParts moves each of parts (as the caller read them) from state
 	// from to state to, and returns how many moved. A part is skipped when
 	// its row is no longer in from or no longer names the BlobDigests it

@@ -1168,7 +1168,7 @@ func (r *Postgres) DeleteSession(ctx context.Context, uploadID string) error {
 	return nil
 }
 
-func (r *Postgres) PutPart(ctx context.Context, p MultipartPart, tree *PartTree) ([]multihash.Multihash, error) {
+func (r *Postgres) PutPart(ctx context.Context, p MultipartPart, tree *PartTree) ([]PendingRelease, error) {
 	state := p.State
 	if state == "" {
 		state = PartSpooled
@@ -1237,10 +1237,67 @@ func (r *Postgres) PutPart(ctx context.Context, p MultipartPart, tree *PartTree)
 	if err != nil {
 		return nil, fmt.Errorf("registry: put part tree: %w", err)
 	}
+	// The replaced row's blobs this part does not name lose their last part
+	// reference with this write; their releases are recorded with it, each
+	// digest once (ON CONFLICT DO UPDATE cannot touch one row twice), due
+	// now (a part blob was never readable through the catalog, so no reader
+	// grace is owed). The session's space is the release's.
+	var released []PendingRelease
+	if dropped := digestsDropped(replaced, p.BlobDigests); len(dropped) > 0 {
+		rows, err := tx.Query(ctx,
+			`INSERT INTO ingot.blob_release_intents (space, digest, not_before)
+			 SELECT s.space, unnest($2::bytea[]), now()
+			   FROM ingot.multipart_sessions s
+			  WHERE s.upload_id = $1
+			 ON CONFLICT (space, digest)
+			 DO UPDATE SET not_before = GREATEST(ingot.blob_release_intents.not_before, EXCLUDED.not_before)
+			 RETURNING space, digest, not_before`,
+			p.UploadID, dropped)
+		if err != nil {
+			return nil, fmt.Errorf("registry: put part: record releases: %w", err)
+		}
+		for rows.Next() {
+			var spaceStr string
+			var digest []byte
+			pr := PendingRelease{}
+			if err := rows.Scan(&spaceStr, &digest, &pr.NotBefore); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("registry: put part: scan release: %w", err)
+			}
+			if pr.Space, err = did.Parse(spaceStr); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("registry: put part: release space: %w", err)
+			}
+			pr.Digest = multihash.Multihash(digest)
+			released = append(released, pr)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("registry: put part: record releases: %w", err)
+		}
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("registry: put part: commit: %w", err)
 	}
-	return replaced, nil
+	return released, nil
+}
+
+// digestsDropped returns the digests of replaced that kept does not name,
+// each once, as bytea[] input.
+func digestsDropped(replaced, kept []multihash.Multihash) [][]byte {
+	skip := make(map[string]bool, len(kept))
+	for _, d := range kept {
+		skip[string(d)] = true
+	}
+	var out [][]byte
+	for _, d := range replaced {
+		if skip[string(d)] {
+			continue
+		}
+		skip[string(d)] = true
+		out = append(out, []byte(d))
+	}
+	return out
 }
 
 func (r *Postgres) MoveParts(ctx context.Context, parts []MultipartPart, from, to string) (int, error) {

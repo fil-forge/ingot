@@ -407,16 +407,18 @@ func TestAcceptorLeavesAReleasingBlobForComplete(t *testing.T) {
 }
 
 // TestAcceptorRacesASupersedesRelease: a part is uploaded again, and the
-// acceptor makes a pass after the new upload has recorded the old blob's
-// release and before its part row lands. The acceptor leaves the old blob to
-// that release, which then aborts it: taking the record over would accept a
-// blob no part or object names any more, and nothing would release it.
+// acceptor makes a pass after the new upload has spooled and before its
+// part row lands. The old row still stands, so the acceptor accepts the old
+// blob; the write that replaces the row records the blob's release with it,
+// and the release removes the accepted blob from the provider. Nothing is
+// left registered, and no record is left behind.
 func TestAcceptorRacesASupersedesRelease(t *testing.T) {
 	pc := &providerConcluder{}
 	store := &teardownBeforePutPart{}
 	b, mem := newDeferredBackend(t, pc, func(d *Deps) {
 		store.MultipartStore = d.Multipart
 		d.Multipart = store
+		d.Remover = pc
 	})
 	ctx := context.Background()
 	key := "race-supersede-release"
@@ -440,8 +442,11 @@ func TestAcceptorRacesASupersedesRelease(t *testing.T) {
 	}
 
 	assertGone(t, mem, old)
-	if !pc.abortedDigests()[string(old)] {
-		t.Fatalf("superseded blob %s was not aborted", old)
+	pc.mu.Lock()
+	stillRegistered := pc.registered[string(old)]
+	pc.mu.Unlock()
+	if stillRegistered {
+		t.Fatalf("superseded blob %s left registered with nothing to remove it", old)
 	}
 	if got, _ := mem.ReleasingDigests(ctx, did.Undef, []multihash.Multihash{old}); got[string(old)] {
 		t.Fatalf("release record for %s left behind", old)
