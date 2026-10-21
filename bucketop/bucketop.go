@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	block "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
@@ -268,9 +269,12 @@ func (tx *Tx) PinBlobs(claims []registry.BlobClaim) {
 
 // DropClaims records the claims of a discarded generation for this commit
 // to remove. A drop of the space's last claim on a digest records the
-// blob's release, due at the drop's NotBefore, in the same transaction.
-func (tx *Tx) DropClaims(drops []registry.ClaimDrop) {
+// blob's release in the same transaction, due grace after the commit: the
+// grace is measured when the swap commits, not here, so the fsync and any
+// lock wait between do not eat into it.
+func (tx *Tx) DropClaims(drops []registry.ClaimDrop, grace time.Duration) {
 	tx.commit.Drops = append(tx.commit.Drops, drops...)
+	tx.commit.ReleaseGrace = grace
 }
 
 // Compile-time assertions: Tx is the canonical handle through which

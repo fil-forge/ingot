@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/fil-forge/ucantone/did"
@@ -443,5 +444,47 @@ func TestCommitFailureWritesNoClaim(t *testing.T) {
 	}
 	if pending, _ := mem.ListReleasesBySpace(ctx, did.Undef); len(pending) != 1 || string(pending[0].Digest) != string(old) {
 		t.Fatalf("releases after the retry = %v, want the superseded blob's", pending)
+	}
+}
+
+// stallCommitRoot is a registry whose root commits wait delay before they
+// run, as a slow fsync or lock wait ahead of the swap would.
+type stallCommitRoot struct {
+	registry.Registry
+	delay time.Duration
+}
+
+func (s *stallCommitRoot) CommitRoot(ctx context.Context, name string, expect, next cid.Cid, c registry.RootCommit) error {
+	time.Sleep(s.delay)
+	return s.Registry.CommitRoot(ctx, name, expect, next, c)
+}
+
+// TestReleaseGraceRunsFromTheCommit: a reader that resolved the superseded
+// version just before the swap has the whole release grace to open its
+// blobs, so the grace is measured when the swap commits, not when the
+// drops are staged. With the commit stalled longer than the grace, a grace
+// measured at staging would have the release due before the swap.
+func TestReleaseGraceRunsFromTheCommit(t *testing.T) {
+	const grace, stall = 150 * time.Millisecond, 250 * time.Millisecond
+	reg := &stallCommitRoot{delay: stall}
+	b, mem := newDeferredBackend(t, &parkingUploader{}, func(d *Deps) {
+		d.Uploader = inmem.NopUploader{}
+		d.ReleaseGrace = grace
+		reg.Registry = d.Registry
+		d.Registry = reg
+	})
+	ctx := context.Background()
+	key := "grace"
+	putObj(t, b, key, []byte("first body"))
+	old := blobDigestOf(t, b, key, "")
+
+	start := time.Now()
+	putObj(t, b, key, []byte("second body"))
+	pending, err := mem.ListReleasesBySpace(ctx, did.Undef)
+	if err != nil || len(pending) != 1 || string(pending[0].Digest) != string(old) {
+		t.Fatalf("releases after the overwrite = %v (err %v), want the superseded blob's", pending, err)
+	}
+	if earliest := start.Add(stall + grace); pending[0].NotBefore.Before(earliest) {
+		t.Fatalf("release due %v after the overwrite began, want at least the stall plus the grace (%v): the grace ran from staging, not the commit", pending[0].NotBefore.Sub(start), stall+grace)
 	}
 }

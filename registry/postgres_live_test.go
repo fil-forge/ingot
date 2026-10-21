@@ -147,12 +147,8 @@ func TestPostgresStores_Live(t *testing.T) {
 		if n, _ := r.CountClaims(ctx, space2, digest); n != 1 {
 			t.Fatalf("count space2 = %d, want 1", n)
 		}
-		if err := r.DeleteBlobClaim(ctx, digest, "b", "k1", registry.NullVersionID); err != nil {
-			t.Fatalf("DeleteBlobClaim: %v", err)
-		}
-		if err := r.DeleteBlobClaim(ctx, digest, "b", "k2", registry.NullVersionID); err != nil {
-			t.Fatalf("DeleteBlobClaim: %v", err)
-		}
+		drop(t, r, registry.ClaimDrop{Digest: digest, Bucket: "b", ObjectKey: "k1", VersionID: registry.NullVersionID, Space: space})
+		drop(t, r, registry.ClaimDrop{Digest: digest, Bucket: "b", ObjectKey: "k2", VersionID: registry.NullVersionID, Space: space})
 		if n, _ := r.CountClaims(ctx, space, digest); n != 0 {
 			t.Fatalf("count after release = %d, want 0", n)
 		}
@@ -170,9 +166,7 @@ func TestPostgresStores_Live(t *testing.T) {
 		if in, err := r.GetIntent(ctx, space, pubDigest); err != nil || in.State != registry.IntentPublished {
 			t.Fatalf("intent after claim = %+v, err %v (want published)", in, err)
 		}
-		if err := r.DeleteBlobClaim(ctx, pubDigest, "b", "kp", registry.NullVersionID); err != nil {
-			t.Fatalf("DeleteBlobClaim (publish): %v", err)
-		}
+		drop(t, r, registry.ClaimDrop{Digest: pubDigest, Bucket: "b", ObjectKey: "kp", VersionID: registry.NullVersionID, Space: space})
 		if in, err := r.GetIntent(ctx, space, pubDigest); err != nil || in.State != registry.IntentPublished {
 			t.Fatalf("intent after the claim dropped = %+v, err %v (want still published)", in, err)
 		}
@@ -229,11 +223,11 @@ func TestPostgresStores_Live(t *testing.T) {
 		}
 		// Dropping the source's claim beside the pin records no release;
 		// dropping the pin too does.
-		drop(t, r, registry.ClaimDrop{Digest: d1, Bucket: "pb", ObjectKey: "src", VersionID: "null#1", Space: space, NotBefore: time.Now()})
+		drop(t, r, registry.ClaimDrop{Digest: d1, Bucket: "pb", ObjectKey: "src", VersionID: "null#1", Space: space})
 		if releaseRecorded(t, r, space, d1) {
 			t.Fatalf("drop of the source beside the pin recorded a release")
 		}
-		drop(t, r, registry.ClaimDrop{Digest: d1, Bucket: "pb", ObjectKey: "copy", VersionID: "null#7", Space: space, NotBefore: time.Now()})
+		drop(t, r, registry.ClaimDrop{Digest: d1, Bucket: "pb", ObjectKey: "copy", VersionID: "null#7", Space: space})
 		if !releaseRecorded(t, r, space, d1) {
 			t.Fatalf("drop of the last claim recorded no release")
 		}
@@ -250,12 +244,12 @@ func TestPostgresStores_Live(t *testing.T) {
 		add("k1")
 		add("k2")
 
-		due := time.Now().Add(-time.Second) // already due
-		drop(t, r, registry.ClaimDrop{Digest: digest, Bucket: "rb", ObjectKey: "k1", VersionID: "null#1", Space: space, NotBefore: due})
+		// A zero grace (the commit helper's) makes the record due at once.
+		drop(t, r, registry.ClaimDrop{Digest: digest, Bucket: "rb", ObjectKey: "k1", VersionID: "null#1", Space: space})
 		if releaseRecorded(t, r, space, digest) {
 			t.Fatalf("first drop recorded a release while a claim remains")
 		}
-		drop(t, r, registry.ClaimDrop{Digest: digest, Bucket: "rb", ObjectKey: "k2", VersionID: "null#1", Space: space, NotBefore: due})
+		drop(t, r, registry.ClaimDrop{Digest: digest, Bucket: "rb", ObjectKey: "k2", VersionID: "null#1", Space: space})
 		if !releaseRecorded(t, r, space, digest) {
 			t.Fatalf("last drop recorded no release")
 		}

@@ -318,7 +318,6 @@ type PartTree struct {
 // (Registry.CommitRoot, RootCommit). CountClaims gates remove(digest):
 // physical reclamation when the count reaches zero.
 type BlobRefStore interface {
-	DeleteBlobClaim(ctx context.Context, digest multihash.Multihash, bucket, objectKey, versionID string) error
 	// CountClaims returns how many object versions in space still reference
 	// digest. Zero means the space's claim may be released.
 	CountClaims(ctx context.Context, space did.DID, digest multihash.Multihash) (int, error)

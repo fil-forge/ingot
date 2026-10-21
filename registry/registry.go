@@ -210,9 +210,15 @@ type RootCommit struct {
 	Pins []BlobClaim
 	// Drops are the discarded generations' claims. Each is deleted and, when
 	// it was the space's last claim on the digest, the blob's release is
-	// recorded due at the drop's NotBefore, in the same transaction, so no
-	// crash window separates "last claim gone" from "release recorded".
+	// recorded in the same transaction, so no crash window separates "last
+	// claim gone" from "release recorded".
 	Drops []ClaimDrop
+	// ReleaseGrace is how long after the commit a release the Drops record
+	// is due. It is measured when the swap commits, after the catalog fsync
+	// and any lock wait that precede it, so a reader that resolved the
+	// discarded version just before the swap has the whole grace to open
+	// its blobs.
+	ReleaseGrace time.Duration
 }
 
 // Empty reports whether the commit carries nothing besides the root.
@@ -221,13 +227,11 @@ func (c RootCommit) Empty() bool {
 }
 
 // ClaimDrop is one claim a commit removes: a discarded version's row on a
-// digest, and when the blob's release is due should the row have been the
-// space's last claim on it.
+// digest.
 type ClaimDrop struct {
 	Digest    multihash.Multihash
 	Bucket    string
 	ObjectKey string
 	VersionID string
 	Space     did.DID
-	NotBefore time.Time
 }

@@ -17,7 +17,6 @@ import (
 )
 
 func TestBlobRefs_CountToZero(t *testing.T) {
-	ctx := context.Background()
 	m := NewMemStore()
 	digest := []byte("digest-A")
 	space := testutil.RandomDID(t)
@@ -49,24 +48,18 @@ func TestBlobRefs_CountToZero(t *testing.T) {
 		t.Fatalf("count for space 2 = %d, want 1", n)
 	}
 
-	// Releasing both space-1 versions drops its claim to zero (the remove gate).
-	if err := m.DeleteBlobClaim(ctx, digest, "b", "k1", registry.NullVersionID); err != nil {
-		t.Fatalf("DeleteBlobClaim: %v", err)
-	}
+	// Dropping both space-1 versions takes its claim to zero (the remove gate).
+	mustDrop(t, m, registry.ClaimDrop{Digest: digest, Bucket: "b", ObjectKey: "k1", VersionID: registry.NullVersionID, Space: space})
 	if n := count(t, m, space, digest); n != 1 {
-		t.Fatalf("count after first delete = %d, want 1", n)
+		t.Fatalf("count after first drop = %d, want 1", n)
 	}
-	if err := m.DeleteBlobClaim(ctx, digest, "b", "k2", registry.NullVersionID); err != nil {
-		t.Fatalf("DeleteBlobClaim: %v", err)
-	}
+	mustDrop(t, m, registry.ClaimDrop{Digest: digest, Bucket: "b", ObjectKey: "k2", VersionID: registry.NullVersionID, Space: space})
 	if n := count(t, m, space, digest); n != 0 {
-		t.Fatalf("count after last delete = %d, want 0", n)
+		t.Fatalf("count after last drop = %d, want 0", n)
 	}
 
-	// Idempotent delete of an already-absent claim is not an error.
-	if err := m.DeleteBlobClaim(ctx, digest, "b", "k1", registry.NullVersionID); err != nil {
-		t.Fatalf("idempotent DeleteBlobClaim: %v", err)
-	}
+	// Dropping an already-absent claim commits all the same.
+	mustDrop(t, m, registry.ClaimDrop{Digest: digest, Bucket: "b", ObjectKey: "k1", VersionID: registry.NullVersionID, Space: space})
 }
 
 func TestMultipartLatch_SingleWinner_Sequential(t *testing.T) {
@@ -492,25 +485,36 @@ func mustAdd(t *testing.T, m *MemStore, c registry.BlobClaim) {
 
 var commitSeq atomic.Int64
 
-// mustClaim records c the way a write does: carried by a commit that
-// advances its bucket's root, created on first use (registry.RootCommit).
-func mustClaim(t *testing.T, m *MemStore, c registry.BlobClaim) {
+// mustCommit advances bucket's root by one commit carrying c, creating the
+// bucket for space on first use: the way a write records and drops claims
+// (registry.RootCommit).
+func mustCommit(t *testing.T, m *MemStore, bucket string, space did.DID, c registry.RootCommit) {
 	t.Helper()
 	ctx := context.Background()
-	s, err := m.Get(ctx, c.Bucket)
+	s, err := m.Get(ctx, bucket)
 	if errors.Is(err, registry.ErrNotFound) {
-		if err := m.Create(ctx, c.Bucket, c.Space, registry.CreateState{}); err != nil {
+		if err := m.Create(ctx, bucket, space, registry.CreateState{}); err != nil {
 			t.Fatalf("Create: %v", err)
 		}
-		s, err = m.Get(ctx, c.Bucket)
+		s, err = m.Get(ctx, bucket)
 	}
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
 	next := testCid(t, fmt.Sprintf("commit-%d", commitSeq.Add(1)))
-	if err := m.CommitRoot(ctx, c.Bucket, s.Root, next, registry.RootCommit{Claims: []registry.BlobClaim{c}}); err != nil {
-		t.Fatalf("CommitRoot with a claim: %v", err)
+	if err := m.CommitRoot(ctx, bucket, s.Root, next, c); err != nil {
+		t.Fatalf("CommitRoot: %v", err)
 	}
+}
+
+func mustClaim(t *testing.T, m *MemStore, c registry.BlobClaim) {
+	t.Helper()
+	mustCommit(t, m, c.Bucket, c.Space, registry.RootCommit{Claims: []registry.BlobClaim{c}})
+}
+
+func mustDrop(t *testing.T, m *MemStore, d registry.ClaimDrop) {
+	t.Helper()
+	mustCommit(t, m, d.Bucket, d.Space, registry.RootCommit{Drops: []registry.ClaimDrop{d}})
 }
 
 func count(t *testing.T, m *MemStore, space did.DID, digest []byte) int {
@@ -609,9 +613,7 @@ func TestBlobRefs_ClaimPublishesIntent(t *testing.T) {
 	if in, _ := m.GetIntent(ctx, did.Undef, d); in.State != registry.IntentPublished {
 		t.Fatalf("intent after claim = %q, want published", in.State)
 	}
-	if err := m.DeleteBlobClaim(ctx, d, "b", "k", registry.NullVersionID); err != nil {
-		t.Fatalf("DeleteBlobClaim: %v", err)
-	}
+	mustDrop(t, m, registry.ClaimDrop{Digest: d, Bucket: "b", ObjectKey: "k", VersionID: registry.NullVersionID, Space: did.Undef})
 	if in, _ := m.GetIntent(ctx, did.Undef, d); in.State != registry.IntentPublished {
 		t.Fatalf("intent after the claim dropped = %q, want still published", in.State)
 	}

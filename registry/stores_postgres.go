@@ -194,43 +194,44 @@ func pinClaim(ctx context.Context, tx pgx.Tx, c BlobClaim) error {
 	return nil
 }
 
-// dropClaim deletes one claim of a discarded generation, in the commit's
-// transaction, under the claim key's lock, and records the blob's release
-// when the claim was the space's last on the digest (see RootCommit.Drops).
-func dropClaim(ctx context.Context, tx pgx.Tx, d ClaimDrop) error {
-	if _, err := tx.Exec(ctx,
-		`DELETE FROM ingot.blob_refs
-		 WHERE digest = $1 AND bucket = $2 AND object_key = $3 AND version_id = $4`,
-		d.Digest, d.Bucket, d.ObjectKey, d.VersionID); err != nil {
-		return fmt.Errorf("registry: drop claim: %w", err)
-	}
-	var n int
-	if err := tx.QueryRow(ctx,
-		`SELECT count(*) FROM ingot.blob_refs WHERE space = $1 AND digest = $2`,
-		d.Space, d.Digest).Scan(&n); err != nil {
-		return fmt.Errorf("registry: drop claim count: %w", err)
-	}
-	if n > 0 {
+// dropClaims deletes the discarded generations' claims, in the commit's
+// transaction, under the claim keys' locks (lockClaimKeys), and records a
+// release, due grace from now, for each digest the space holds no claim on
+// afterwards (see RootCommit.Drops). Set-based, as addClaims is: the
+// deletes are one statement and the remaining-claim checks and release
+// records another, however many blobs the discarded versions had, since
+// the bucket lock and the root row are held throughout.
+func dropClaims(ctx context.Context, tx pgx.Tx, drops []ClaimDrop, grace time.Duration) error {
+	if len(drops) == 0 {
 		return nil
 	}
+	n := len(drops)
+	digests := make([][]byte, n)
+	spaces := make([]string, n)
+	buckets := make([]string, n)
+	keys := make([]string, n)
+	versions := make([]string, n)
+	for i, d := range drops {
+		digests[i], spaces[i], buckets[i], keys[i], versions[i] = d.Digest, d.Space.String(), d.Bucket, d.ObjectKey, d.VersionID
+	}
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM ingot.blob_refs r
+		  USING unnest($1::bytea[], $2::text[], $3::text[], $4::text[]) AS u(d, b, k, v)
+		  WHERE r.digest = u.d AND r.bucket = u.b AND r.object_key = u.k AND r.version_id = u.v`,
+		digests, buckets, keys, versions); err != nil {
+		return fmt.Errorf("registry: drop claims: %w", err)
+	}
+	// One record per (space, digest) the space no longer claims; a record
+	// already there keeps the later not_before.
 	if _, err := tx.Exec(ctx,
 		`INSERT INTO ingot.blob_release_intents (space, digest, not_before)
-		 VALUES ($1, $2, $3)
+		 SELECT u.s, u.d, now() + make_interval(secs => $3)
+		   FROM (SELECT DISTINCT s, d FROM unnest($1::text[], $2::bytea[]) AS u(s, d)) u
+		  WHERE NOT EXISTS (SELECT 1 FROM ingot.blob_refs r WHERE r.space = u.s AND r.digest = u.d)
 		 ON CONFLICT (space, digest)
 		 DO UPDATE SET not_before = GREATEST(ingot.blob_release_intents.not_before, EXCLUDED.not_before)`,
-		d.Space, d.Digest, d.NotBefore); err != nil {
-		return fmt.Errorf("registry: enqueue release: %w", err)
-	}
-	return nil
-}
-
-func (r *Postgres) DeleteBlobClaim(ctx context.Context, digest multihash.Multihash, bucket, objectKey, versionID string) error {
-	_, err := r.pool.Exec(ctx,
-		`DELETE FROM ingot.blob_refs
-		 WHERE digest = $1 AND bucket = $2 AND object_key = $3 AND version_id = $4`,
-		digest, bucket, objectKey, versionID)
-	if err != nil {
-		return fmt.Errorf("registry: delete blob claim: %w", err)
+		spaces, digests, grace.Seconds()); err != nil {
+		return fmt.Errorf("registry: enqueue releases: %w", err)
 	}
 	return nil
 }

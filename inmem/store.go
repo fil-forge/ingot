@@ -300,8 +300,10 @@ func (m *MemStore) CommitRoot(_ context.Context, name string, expect, next cid.C
 	for _, p := range c.Pins {
 		m.addClaimLocked(p, false)
 	}
+	// The grace runs from the commit, as in Postgres.
+	due := time.Now().Add(c.ReleaseGrace)
 	for _, d := range c.Drops {
-		m.dropClaimLocked(d)
+		m.dropClaimLocked(d, due)
 	}
 	return nil
 }

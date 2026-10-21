@@ -79,21 +79,15 @@ func (m *MemStore) addClaimLocked(c registry.BlobClaim, publish bool) {
 	}
 }
 
-// dropClaimLocked deletes one claim and records the blob's release when the
-// claim was the space's last on the digest (see registry.RootCommit.Drops).
-func (m *MemStore) dropClaimLocked(d registry.ClaimDrop) {
+// dropClaimLocked deletes one claim and records the blob's release, due at
+// due, when the claim was the space's last on the digest (see
+// registry.RootCommit.Drops).
+func (m *MemStore) dropClaimLocked(d registry.ClaimDrop, due time.Time) {
 	delete(m.blobRefs, claimKey{string(d.Digest), d.Bucket, d.ObjectKey, d.VersionID})
 	if m.countClaimsLocked(d.Space, d.Digest) != 0 {
 		return
 	}
-	m.enqueueReleaseLocked(d.Space, d.Digest, d.NotBefore)
-}
-
-func (m *MemStore) DeleteBlobClaim(_ context.Context, digest multihash.Multihash, bucket, objectKey, versionID string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	delete(m.blobRefs, claimKey{string(digest), bucket, objectKey, versionID})
-	return nil
+	m.enqueueReleaseLocked(d.Space, d.Digest, due)
 }
 
 func (m *MemStore) CountClaims(_ context.Context, space did.DID, digest multihash.Multihash) (int, error) {

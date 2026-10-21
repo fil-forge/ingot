@@ -723,18 +723,17 @@ func (b *Backend) addClaims(tx *bucketop.Tx, st *registry.State, key, claimID st
 
 // dropClaims records a superseded/deleted generation's claims for the commit
 // to drop, in the root swap's transaction; the drop of a space's last claim
-// on a digest records the blob's deferred release, due after the release
-// grace.
+// on a digest records the blob's deferred release, due the release grace
+// after the commit.
 func (b *Backend) dropClaims(tx *bucketop.Tx, st *registry.State, key, claimID string, digests []multihash.Multihash) {
 	if len(digests) == 0 {
 		return
 	}
-	notBefore := time.Now().Add(b.releaseGrace)
 	var drops []registry.ClaimDrop
 	for _, d := range digestSet(digests) {
-		drops = append(drops, registry.ClaimDrop{Digest: d, Bucket: st.Name, ObjectKey: key, VersionID: claimID, Space: st.Space, NotBefore: notBefore})
+		drops = append(drops, registry.ClaimDrop{Digest: d, Bucket: st.Name, ObjectKey: key, VersionID: claimID, Space: st.Space})
 	}
-	tx.DropClaims(drops)
+	tx.DropClaims(drops, b.releaseGrace)
 }
 
 // releaseOutcome is what one attempt at a deferred release produced, and so

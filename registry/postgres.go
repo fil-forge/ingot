@@ -165,10 +165,8 @@ func (r *Postgres) CommitRoot(ctx context.Context, name string, expect, next cid
 			return err
 		}
 	}
-	for _, d := range c.Drops {
-		if err := dropClaim(ctx, tx, d); err != nil {
-			return err
-		}
+	if err := dropClaims(ctx, tx, c.Drops, c.ReleaseGrace); err != nil {
+		return err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("registry: commit cas %q: %w", name, err)
