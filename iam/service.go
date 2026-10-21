@@ -385,7 +385,7 @@ func mapAuthError(err error) (error, bool) {
 		hiltauth.ForeignBucketErrorName,
 		// A copy whose source header the signature does not cover cannot be
 		// authorized; the SDKs always sign it.
-		hiltauth.UnsignedCopySourceErrorName:
+		hiltauth.UnsignedHeaderErrorName:
 		return s3err.GetAPIError(s3err.ErrAccessDenied), true
 	case hiltauth.TemporarilyUnavailableErrorName:
 		// An authorize that waited out Hilt's lock timeout behind a policy
@@ -403,10 +403,6 @@ func mapAuthError(err error) (error, bool) {
 		return nil, false
 	}
 }
-
-// copySourceHeader names a copy's source object; it is only trusted when the
-// request signature covers it.
-const copySourceHeader = "x-amz-copy-source"
 
 // authorizeLocal is the fast path, mirroring Hilt's own verification and
 // authorization order over THIS key's proof store: signature, then per
@@ -453,17 +449,17 @@ func (s *Service) authorizeLocal(ctx context.Context, req s3.Request, access str
 		return auth.Account{}, false, nil
 	}
 
-	// 3. Every bucket the request acts on, with the permission it needs there:
-	// the addressed bucket, plus the copy source for CopyObject and
-	// UploadPartCopy. Operations on no existing bucket (create/delete/
-	// list-buckets) yield none — they go to Hilt regardless. A copy's source
-	// is named by a header, which the signature covers only when listed in
-	// SignedHeaders; Hilt refuses an unsigned one, and so does the fast path.
+	// 3. Every bucket the request acts on, with the permissions it needs
+	// there: the addressed bucket with each permission the operation and its
+	// headers put on it (a lock or tags set by a write), plus the copy source
+	// for CopyObject and UploadPartCopy. Operations on no existing bucket
+	// (create/delete/list-buckets) yield none — they go to Hilt regardless.
+	// The source and the headers that add a permission are decided from
+	// headers, which the signature covers only when listed in SignedHeaders;
+	// Hilt's classifier refuses an unsigned one, as Hilt itself does, and
+	// the fast path then decides nothing: Hilt answers with the refusal.
 	op, reqs, err := hiltauth.RequirementsFor(req)
 	if err != nil || len(reqs) == 0 {
-		return auth.Account{}, false, nil
-	}
-	if op.CopiesSource() && !sr.HeaderSigned(copySourceHeader) {
 		return auth.Account{}, false, nil
 	}
 
