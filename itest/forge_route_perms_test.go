@@ -18,8 +18,8 @@ import (
 //
 //   - a key holding s3:CreateBucket but none of the configuration
 //     permissions is refused PutBucketVersioning and DeleteObjects on an
-//     existing bucket (hilt used to classify both as CreateBucket, which
-//     skips the bucket scope check);
+//     existing bucket, since each is authorized on its own permission and
+//     against that bucket's scope;
 //   - DeleteObjects is authorized on s3:DeleteObject, and an entry naming a
 //     version is refused, and the version kept, unless the key also holds
 //     s3:DeleteObjectVersion.
