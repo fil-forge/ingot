@@ -545,7 +545,7 @@ sequenceDiagram
             B-->>C: 409 OperationAborted#59; the deferred revert reopens the session
         else every part accepted, or spooled
             B->>U: spooled parts only: concludeBlobs (conclude, or upload a never-parked blob)
-            B->>TX: commitVersion (see the PutObject diagram)#59; AddBlobClaims set-based
+            B->>TX: commitVersion (see the PutObject diagram)#59; the claims land<br/>in the root swap's transaction, set-based
             B->>R: LatchSession(completing to completed), best-effort
             B-->>C: 200, ETag = md5-of-part-md5s + "-N"
         end
@@ -561,8 +561,8 @@ sequenceDiagram
   the blob is free to go — a claimed digest drops the record (`CountClaims`),
   and one a part of an in-flight session references waits
   (`CountLivePartRefs`, checked first: a Complete claims before it leaves
-  'completing'). `AddBlobClaim` publishes a committed blob's upload intent,
-  so the reap of a retained session releases only what was never committed.
+  'completing'). A commit's claim publishes the blob's upload intent, so
+  the reap of a retained session releases only what was never committed.
 - A release can take a blob while the acceptor concludes it. The provider
   refuses whichever of accept and abort comes second, and the release drops
   the park row before anything else, so `ConcludePark` finds no park and the
@@ -698,7 +698,7 @@ flowchart TB
     accepted -->|"release record (never committed);<br/>executeRelease: /blob/remove;<br/>DeleteIntent + removeLocal"| gone
     published -->|"release record (committed);<br/>executeRelease: /blob/remove;<br/>DeleteIntent + removeLocal"| gone
 
-    accepted -->|"commit: AddBlobClaim, same transaction"| published
+    accepted -->|"commit: the claim, in the root swap's transaction"| published
 
     parked -.->|"SweepLocalBlobs over budget (blob_parks row):<br/>removeLocal + MarkEvicted; state unchanged"| evicted[["local file evicted<br/>(evicted_at set)"]]
     accepted -.->|"cache_writes false: at accept,<br/>once the location is recorded;<br/>removeLocal + MarkEvicted"| evicted
@@ -736,14 +736,17 @@ flowchart TB
   startup, the released pass does the same for `published` intents nothing
   names any more (no location, claim, pending release or live part), left
   by versions whose releases kept the copy.
-- Digests present in both the old and new version sets never churn: the
-  reconcile computes a set difference.
+- Digests present in both the old and new version sets never churn: the new
+  generation's claim lands before the old one's drops in the same
+  transaction, so the digest keeps a claim throughout and no release is
+  recorded.
 - Parked-blob reclamation is guarded: a digest live in another session, part,
   or committed object is left alone.
-- A same-space copy pins the source's body: its claims are taken with
-  `PinBlobClaims`, which requires an existing claim on the digest in the same
-  statement, so a copy racing the source's delete and release fails with
-  NoSuchKey instead of claiming a blob about to go.
+- A same-space copy pins the source's body: its claims are pins
+  (`registry.RootCommit.Pins`), each written only while the space still
+  holds a claim on the digest, under its lock, so a copy racing the source's
+  delete and release fails with NoSuchKey instead of claiming a blob about
+  to go.
 
 Cross-references: [`architecture.md` §5](./architecture.md#5-the-data-layer),
 [`s3-versioning.md`](./s3-versioning.md) §8.

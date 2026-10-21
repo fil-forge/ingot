@@ -532,26 +532,29 @@ and to version-scoped deletes, evaluated against the target version.
 `blob_refs` rows carry each version's id: the `registry.NullVersionID` sentinel at
 object.go:336/:345 is replaced by each version's `VersionID` (null versions carry the id
 `"null"`, so rows for unversioned buckets keep that id). The interfaces already carry
-`versionID` everywhere (`registry.BlobRefStore`, stores.go:114-120); no schema or interface
-change.
+`versionID` everywhere (`registry.BlobClaim`, `registry.ClaimDrop`); no schema change.
 
-Rules, preserving the commit-then-reconcile ordering (reconcile strictly after a successful
-`WithTx`, object.go:196-202):
+Rules. Every claim and drop is carried by the commit (`bucketop.Tx.ClaimBlobs` /
+`DropClaims`, written by `registry.CommitRoot` in the root swap's transaction), so a version
+is published with its claims and its discards' drops or not at all:
 
-- **New version** → `AddBlobClaim` for each body digest with the new `VersionID`. Retained
+- **New version** → a claim for each body digest with the new `VersionID`. Retained
   superseded versions keep their rows untouched — under Enabled, an overwrite **releases nothing**.
-- **Discarded versions** (§5.2 discards, §7.2 removals, unversioned overwrite/delete) →
-  `DeleteBlobClaim` per digest with the *discarded* version's id; `CountClaims == 0` →
-  `RemoveBlob`. The evicted-prev-null case fetches the evicted manifest during
-  the commit to learn its digests.
+- **Discarded versions** (§5.2 discards, §7.2 removals, unversioned overwrite/delete) → a drop
+  per digest with the *discarded* version's id; a drop of the space's last claim on a digest
+  records the blob's release in the same transaction, due the release grace after the commit.
+  The evicted-prev-null case fetches the evicted manifest during the commit to learn its
+  digests.
 - **Same-id replacement** (null replacing null — the only case where new and discarded share a
-  `(bucket, key, version_id)` row key) → the existing set-diff (`addClaims` / `dropClaims`, carried by the commit)
-  (object.go:327) so unchanged digests are never dropped-then-re-added.
+  `(bucket, key, version_id)` row key): the claim ids differ all the same (`claimVersionID`
+  keys each generation by its seq), so the new generation's claims land and the old one's
+  drop as any other pair; an unchanged digest keeps a claim throughout, so no release is
+  recorded for it.
 - **Delete markers** have no digests: no claims in, none out.
 
 Dedup interactions stay safe by construction: N versions referencing one digest are N rows;
-`RemoveBlob` fires only when the last row for `(space, digest)` goes. `RemoveBlob` itself is
-the *ingot-side* release: it invokes `/blob/remove` (uploader/blob.go:248), which drops this
+the release is recorded only when the last row for `(space, digest)` goes, and runs once
+its grace has passed. The release is the *ingot-side* step: it invokes `/blob/remove`, which drops this
 space's claim on the network. Whether the bytes are physically deleted is then Piri's decision,
 made on its own accounting across every space that claims the blob (`architecture.md` §9) —
 ingot's index answers only "does any version in this bucket still need the digest".

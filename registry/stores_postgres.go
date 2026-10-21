@@ -222,10 +222,14 @@ func dropClaims(ctx context.Context, tx pgx.Tx, drops []ClaimDrop, grace time.Du
 		return fmt.Errorf("registry: drop claims: %w", err)
 	}
 	// One record per (space, digest) the space no longer claims; a record
-	// already there keeps the later not_before.
+	// already there keeps the later not_before. The grace runs from the
+	// statement's clock, not the transaction's start (now()): the swap may
+	// have waited on the bucket row or the claim-key locks since, and a
+	// reader that resolved the discarded version meanwhile is owed the
+	// whole grace from the commit.
 	if _, err := tx.Exec(ctx,
 		`INSERT INTO ingot.blob_release_intents (space, digest, not_before)
-		 SELECT u.s, u.d, now() + make_interval(secs => $3)
+		 SELECT u.s, u.d, clock_timestamp() + make_interval(secs => $3)
 		   FROM (SELECT DISTINCT s, d FROM unnest($1::text[], $2::bytea[]) AS u(s, d)) u
 		  WHERE NOT EXISTS (SELECT 1 FROM ingot.blob_refs r WHERE r.space = u.s AND r.digest = u.d)
 		 ON CONFLICT (space, digest)

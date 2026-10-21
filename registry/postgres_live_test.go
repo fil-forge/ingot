@@ -1270,3 +1270,84 @@ func TestGetReleaseWaitsForTheClaimKeyLockLive(t *testing.T) {
 		t.Fatal("GetRelease did not return once the start committed")
 	}
 }
+
+// TestReleaseGraceRunsFromTheSwapLive: a drop's release is due the grace
+// after the swap commits, not after its transaction began. A swap that
+// waited on a claim-key lock (here held by another transaction) owes a
+// reader that resolved the discarded version meanwhile the whole grace from
+// the commit.
+//
+//	INGOT_TEST_DSN=postgres://... GOWORK=off go test ./registry/ -run GraceRunsFromTheSwap -v
+func TestReleaseGraceRunsFromTheSwapLive(t *testing.T) {
+	dsn := os.Getenv("INGOT_TEST_DSN")
+	if dsn == "" {
+		t.Skip("set INGOT_TEST_DSN to run the live Postgres store test")
+	}
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("pool: %v", err)
+	}
+	defer pool.Close()
+	if err := migrations.Up(ctx, pool, zaptest.NewLogger(t)); err != nil {
+		t.Fatalf("migrations: %v", err)
+	}
+	r := registry.NewPostgres(pool)
+	space := testutil.RandomDID(t)
+	bucket := "grace-swap-" + space.String()[len(space.String())-8:]
+	d := liveDigest(t, "grace-runs-from-the-swap")
+	if err := r.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: d, Provider: "did:key:p", URL: "http://p/blob", Size: 1}); err != nil {
+		t.Fatalf("PutLocation: %v", err)
+	}
+	c := registry.BlobClaim{Digest: d, Bucket: bucket, ObjectKey: "k", VersionID: "v1", Space: space}
+	mustClaim(t, r, c)
+	t.Cleanup(func() {
+		_ = r.DeleteRelease(context.Background(), space, d)
+		_ = r.Delete(context.Background(), bucket)
+	})
+
+	// Another transaction holds the digest's claim-key lock while the drop's
+	// commit begins and waits.
+	holder, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer holder.Rollback(ctx)
+	if _, err := holder.Exec(ctx,
+		`SELECT pg_advisory_xact_lock(hashtextextended($1 || ':' || encode($2, 'hex'), 0))`,
+		space.String(), []byte(d)); err != nil {
+		t.Fatalf("lock claim key: %v", err)
+	}
+	const grace, stall = time.Second, 300 * time.Millisecond
+	st, err := r.Get(ctx, bucket)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	start := time.Now()
+	done := make(chan error, 1)
+	go func() {
+		done <- r.CommitRoot(ctx, bucket, st.Root, liveCid(t, "grace-swap-next"), registry.RootCommit{
+			Drops:        []registry.ClaimDrop{{Digest: d, Bucket: bucket, ObjectKey: "k", VersionID: "v1", Space: space}},
+			ReleaseGrace: grace,
+		})
+	}()
+	time.Sleep(stall)
+	if err := holder.Commit(ctx); err != nil {
+		t.Fatalf("release the lock: %v", err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("CommitRoot: %v", err)
+	}
+	var pr *registry.PendingRelease
+	for _, rec := range mustListReleases(t, r, space) {
+		if string(rec.Digest) == string(d) {
+			pr = &rec
+		}
+	}
+	if pr == nil {
+		t.Fatal("the drop recorded no release")
+	}
+	if earliest := start.Add(stall + grace); pr.NotBefore.Before(earliest) {
+		t.Fatalf("release due %v after the commit began, want at least the lock wait plus the grace (%v): the grace ran from the transaction's start", pr.NotBefore.Sub(start), stall+grace)
+	}
+}

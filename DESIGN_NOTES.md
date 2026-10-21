@@ -234,8 +234,9 @@ OperationAborted, a 409; the latch reverts to `open` and the acceptor
 carries on. The AWS CLI and other botocore-based clients treat that 409 as
 final and abort the upload, so the 30 s wait is the margin before a client
 sees a failed upload. Complete lays out the object's byte ranges from the
-part rows' blob lengths and claims every blob in one transaction of four
-statements, however many blobs there are (`AddBlobClaims`).
+part rows' blob lengths and claims every blob in the root swap's
+transaction, a few statements however many blobs there are
+(`registry.CommitRoot`).
 
 Every session teardown (abort, expiry, the completed-session reap, a
 superseded part, the parts a Complete omitted) records a deferred release
@@ -455,8 +456,9 @@ same rule as the rest: a streamed blob concludes, or a streamed part is
 recorded, under the key lock, after a settle and a look at the rows, and
 a location or park another write recorded meanwhile makes the stream
 surplus, given up and reused. The last guard is the claim itself: a
-committed body blob is located by its commit, so `AddBlobClaims` refuses,
-under the claim-key lock, a digest the space has no location for, which is
+committed body blob is located by its commit, so the root swap refuses,
+under the claim-key lock, a claim on a digest the space has no location
+for (`registry.RootCommit.Claims`), which is
 one whose release ran to completion between the write's settle and its
 commit; the write fails with SlowDown for the client to retry. A release
 not yet started defers while a write of its space holds the digest.
