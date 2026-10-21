@@ -523,7 +523,7 @@ sequenceDiagram
     end
     B->>R: MoveParts(spooled to parked), guarded by the part's digests
     opt no row moved: a later upload of the part number replaced it,<br/>or a teardown took the session, while the blobs were parking
-        B->>R: EnqueueReleases of this part's blobs: the park settled any pending<br/>release of its digests as the write's own, cancelling the replacer's record
+        B->>R: EnqueueReleases of this part's blobs: a no-op beside the replacer's record,<br/>which the park left standing (awaitRelease)#59; they run below rather than on the next sweep
     end
     B->>A: nudge (start the acceptor, or ask for another pass)
     B->>U: releaseNow: the records above, due at once (/blob/abort of the parks#59;<br/>a blob another part or the session still names waits on that reference)
@@ -622,9 +622,11 @@ stateDiagram-v2
 - `spooled` is the state of a part whose request is still parking its
   blobs, or died doing so. The acceptor never takes it; Complete does.
 - A request whose `spooled` row is replaced while it parks moves no row to
-  `parked`. It then records its blobs' releases itself: parking settles a
-  pending release of each digest as the write's own, which cancels the
-  record the replacement wrote.
+  `parked`. The releases the replacement recorded stand: a part's park
+  leaves a pending release of its digest to the part row, which defers it
+  while the row stands and lets it run once the row is replaced, so the
+  blobs go even if the request dies there. The request runs them itself
+  when it can, rather than leave them to the next sweep.
 - Complete requires every part it names to be `accepted` before the commit:
   it waits until none of them is queued (parts it omits are not waited
   for), finishes `spooled` parts itself, and answers a part still `parked`

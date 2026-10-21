@@ -2673,11 +2673,10 @@ func (s *afterPutPart) PutPart(ctx context.Context, p registry.MultipartPart, tr
 
 // TestReplacedWhileParkingReleasesItsBlobs: an upload records its part and,
 // before it parks the blobs, a second upload of the same part number
-// replaces the row and records the first's releases. The first then parks:
-// parking settles the pending release of each of its digests as the write's
-// own, which cancels those records, and its move to 'parked' finds no row of
-// its. It records the releases again, so its blobs, parked and named by no
-// part, go; the replacement's stay.
+// replaces the row and records the first's releases. The first then parks,
+// leaving those records standing, and its move to 'parked' finds no row of
+// its, so it runs them: its blobs, parked and named by no part, go; the
+// replacement's stay.
 func TestReplacedWhileParkingReleasesItsBlobs(t *testing.T) {
 	pu := &parkingUploader{}
 	mp := &afterPutPart{}
@@ -2729,4 +2728,75 @@ func TestReplacedWhileParkingReleasesItsBlobs(t *testing.T) {
 	if pending, _ := mem.ListReleasesBySpace(ctx, did.Undef); len(pending) != 0 {
 		t.Fatalf("release records left behind: %v", pending)
 	}
+}
+
+// TestReplacedWhileParkingKeepsTheRecordWhenTheWriteDies: as above, but the
+// first upload fails after its park, before it could run the releases (its
+// own re-record fails, as a process exit there would). The records the
+// replacement wrote were left standing by the park, so the sweeper releases
+// the first upload's blobs regardless.
+func TestReplacedWhileParkingKeepsTheRecordWhenTheWriteDies(t *testing.T) {
+	pu := &parkingUploader{}
+	mp := &afterPutPart{}
+	rel := &failEnqueueReleases{}
+	b, mem := newDeferredBackend(t, pu, func(d *Deps) {
+		mp.MultipartStore = d.Multipart
+		d.Multipart = mp
+		rel.PendingReleaseStore = d.PendingReleases
+		d.PendingReleases = rel
+	})
+	ctx := context.Background()
+	key := "replaced-while-parking-dies"
+	uploadID := mpCreate(t, b, key, "", "")
+
+	var first []multihash.Multihash
+	mp.hook = func() {
+		first = hygienePartDigests(t, mem, uploadID, 1)
+		if _, err := mpUploadPart(t, b, key, uploadID, 1, testBody(int(backend.MinPartSize)+100), nil); err != nil {
+			t.Errorf("replacing UploadPart: %v", err)
+		}
+		rel.fails = 1 // the first upload's re-record, after its park
+	}
+	if _, err := mpUploadPart(t, b, key, uploadID, 1, testBody(int(backend.MinPartSize)), nil); err == nil {
+		t.Fatal("the replaced upload succeeded although it could not record its releases")
+	}
+	if len(first) == 0 {
+		t.Fatal("the hook did not run after the first part was recorded")
+	}
+
+	// The replacement's records survived the park.
+	recorded := map[string]bool{}
+	for _, pr := range mustPending(t, mem) {
+		recorded[string(pr.Digest)] = true
+	}
+	for _, d := range first {
+		if !recorded[string(d)] {
+			t.Fatalf("no release record for the replaced upload's blob %x after its park", d)
+		}
+		if _, err := mem.ParkByDigest(ctx, d); err != nil {
+			t.Fatalf("the replaced upload's blob %x is not parked: %v", d, err)
+		}
+	}
+	if err := b.drainSpaceReleases(ctx, did.Undef); err != nil {
+		t.Fatalf("drainSpaceReleases: %v", err)
+	}
+	for _, d := range first {
+		if !pu.abortedDigests()[string(d)] {
+			t.Fatalf("replaced upload's blob %x was not released", d)
+		}
+	}
+	for _, d := range hygienePartDigests(t, mem, uploadID, 1) {
+		if pu.abortedDigests()[string(d)] {
+			t.Fatalf("the replacement's blob %x was released", d)
+		}
+	}
+}
+
+func mustPending(t *testing.T, mem *inmem.MemStore) []registry.PendingRelease {
+	t.Helper()
+	pending, err := mem.ListReleasesBySpace(context.Background(), did.Undef)
+	if err != nil {
+		t.Fatalf("ListReleasesBySpace: %v", err)
+	}
+	return pending
 }

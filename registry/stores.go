@@ -439,6 +439,12 @@ type PendingReleaseStore interface {
 	// reuse, or reports one that is started, which the write waits out, or
 	// none.
 	CancelRelease(ctx context.Context, space did.DID, digest multihash.Multihash) (ReleaseCancel, error)
+	// GetRelease returns the record for (space, digest) as it stands, or
+	// ErrNotFound. It reads and changes nothing else: for a part write that
+	// leaves a pending record to its part row (which defers the record,
+	// StartRelease) and waits out a started one, where CancelRelease is for
+	// a write that takes the blob over.
+	GetRelease(ctx context.Context, space did.DID, digest multihash.Multihash) (*PendingRelease, error)
 	// ReleasingDigests returns which of digests have a release record in
 	// space, started or not, keyed by string(digest). It reads and changes
 	// nothing else: for a caller that must leave a blob with a pending

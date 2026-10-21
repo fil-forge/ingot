@@ -926,20 +926,75 @@ func (b *Backend) runRelease(ctx context.Context, pr registry.PendingRelease) re
 // retries. An encrypted blob has a digest of its own and never has a
 // record here.
 func (b *Backend) settleRelease(ctx context.Context, space did.DID, digest multihash.Multihash) (bool, error) {
+	return b.settle(ctx, space, digest, func() (releaseStanding, error) {
+		c, err := b.pendingReleases.CancelRelease(ctx, space, digest)
+		switch {
+		case err != nil:
+			return 0, fmt.Errorf("cancel release: %w", err)
+		case c == registry.ReleaseNone:
+			return releaseAbsent, nil
+		case c == registry.ReleaseCancelledByWrite:
+			return releaseTaken, nil
+		}
+		return releaseStarted, nil
+	})
+}
+
+// awaitRelease is settleRelease for a part blob, whose part row already
+// names the digest. A record not yet started is left standing rather than
+// cancelled: the row defers it for as long as the row stands (StartRelease
+// reads the live part references first), and it runs once a later upload
+// of the part number replaces the row, which is exactly what such a record
+// says. Cancelled, the obligation would rest on this write alone, which can
+// die before it records the release again. A located blob is reusable
+// beside a pending record, since the record cannot start while the row
+// stands. A started record is waited out as settleRelease waits.
+func (b *Backend) awaitRelease(ctx context.Context, space did.DID, digest multihash.Multihash) (bool, error) {
+	return b.settle(ctx, space, digest, func() (releaseStanding, error) {
+		pr, err := b.pendingReleases.GetRelease(ctx, space, digest)
+		switch {
+		case errors.Is(err, registry.ErrNotFound):
+			return releaseAbsent, nil
+		case err != nil:
+			return 0, fmt.Errorf("lookup release: %w", err)
+		case pr.StartedAt.IsZero():
+			return releaseTaken, nil
+		}
+		return releaseStarted, nil
+	})
+}
+
+// releaseStanding is what a write's probe of a release record found.
+type releaseStanding int
+
+const (
+	// releaseAbsent: no record, or the one waited out has run.
+	releaseAbsent releaseStanding = iota
+	// releaseTaken: a pending record the write settled, by cancelling it or
+	// by leaving it to its part row; the blob is the write's.
+	releaseTaken
+	// releaseStarted: the blob is going; the write waits.
+	releaseStarted
+)
+
+// settle is settleRelease's wait: probe reports the record as the write
+// settles it, and a started one is polled until it has run, up to
+// reuseWaitLimit.
+func (b *Backend) settle(ctx context.Context, space did.DID, digest multihash.Multihash, probe func() (releaseStanding, error)) (bool, error) {
 	deadline := time.Now().Add(reuseWaitLimit)
 	backoff := reuseWaitFirst
 	waited := false
 	for {
-		c, err := b.pendingReleases.CancelRelease(ctx, space, digest)
+		standing, err := probe()
 		if err != nil {
-			return false, fmt.Errorf("cancel release: %w", err)
+			return false, err
 		}
-		switch c {
-		case registry.ReleaseNone:
+		switch standing {
+		case releaseAbsent:
 			// No release, or the one waited out has run and the location
 			// went with it.
 			return !waited, nil
-		case registry.ReleaseCancelledByWrite:
+		case releaseTaken:
 			return true, nil
 		}
 		waited = true

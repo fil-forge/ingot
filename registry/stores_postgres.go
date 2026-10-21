@@ -1804,6 +1804,24 @@ func (r *Postgres) StartRelease(ctx context.Context, space did.DID, digest multi
 	return ReleaseStarted, nil
 }
 
+func (r *Postgres) GetRelease(ctx context.Context, space did.DID, digest multihash.Multihash) (*PendingRelease, error) {
+	pr := PendingRelease{Space: space, Digest: multihash.Multihash(bytes.Clone(digest))}
+	var started *time.Time
+	err := r.pool.QueryRow(ctx,
+		`SELECT not_before, started_at FROM ingot.blob_release_intents WHERE space = $1 AND digest = $2`,
+		space, digest).Scan(&pr.NotBefore, &started)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("registry: get release: %w", err)
+	}
+	if started != nil {
+		pr.StartedAt = *started
+	}
+	return &pr, nil
+}
+
 func (r *Postgres) ReleasingDigests(ctx context.Context, space did.DID, digests []multihash.Multihash) (map[string]bool, error) {
 	out := map[string]bool{}
 	if len(digests) == 0 {

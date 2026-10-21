@@ -1355,6 +1355,18 @@ func (m *MemStore) StartRelease(_ context.Context, space did.DID, digest multiha
 	return registry.ReleaseStarted, nil
 }
 
+func (m *MemStore) GetRelease(_ context.Context, space did.DID, digest multihash.Multihash) (*registry.PendingRelease, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	pr, ok := m.releases[locKey{space, string(digest)}]
+	if !ok {
+		return nil, registry.ErrNotFound
+	}
+	cp := pr
+	cp.Digest = multihash.Multihash(bytes.Clone(pr.Digest))
+	return &cp, nil
+}
+
 func (m *MemStore) ReleasingDigests(_ context.Context, space did.DID, digests []multihash.Multihash) (map[string]bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

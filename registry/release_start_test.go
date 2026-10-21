@@ -96,6 +96,22 @@ func runReleaseStartSuite(t *testing.T, st releaseStartStore) {
 		}
 	})
 
+	t.Run("a record reads back as it stands", func(t *testing.T) {
+		if _, err := st.GetRelease(ctx, space, evictDigest(t, "start:unrecorded")); !errors.Is(err, registry.ErrNotFound) {
+			t.Fatalf("GetRelease of no record err = %v, want ErrNotFound", err)
+		}
+		d := enqueue("read-back")
+		if pr, err := st.GetRelease(ctx, space, d); err != nil || !pr.StartedAt.IsZero() || string(pr.Digest) != string(d) {
+			t.Fatalf("GetRelease of a pending record = %+v, %v; want pending", pr, err)
+		}
+		if s, err := st.StartRelease(ctx, space, d); err != nil || s != registry.ReleaseStarted {
+			t.Fatalf("StartRelease = %v, %v", s, err)
+		}
+		if pr, err := st.GetRelease(ctx, space, d); err != nil || pr.StartedAt.IsZero() {
+			t.Fatalf("GetRelease of a started record = %+v, %v; want started", pr, err)
+		}
+	})
+
 	t.Run("a pending record starts, and starts again on retry", func(t *testing.T) {
 		d := enqueue("pending")
 		for range 2 {
