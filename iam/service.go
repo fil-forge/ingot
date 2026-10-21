@@ -51,6 +51,7 @@
 package iam
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -187,6 +188,14 @@ func (s *Service) GetUserAccountForRequest(ctx fiber.Ctx, accessKeyStr string) (
 	// so the Hilt round-trip is bounded by the request's lifetime.
 	reqCtx := ctx.RequestCtx()
 	req := fasthttputil.RequestFromHTTPContext(reqCtx)
+	// The body travels to Hilt only for the operations whose body decides a
+	// permission (a DeleteObjects' entries may name versions), which Hilt's
+	// classifier names; every other request goes without one, so a streaming
+	// write's body is never read here. Hilt binds it to the signature before
+	// reading it, and so does the fast path.
+	if op, err := hiltauth.OperationFor(req); err == nil && op.ReadsBody() {
+		req.Body = bytes.Clone(reqCtx.Request.Body())
+	}
 	ctx.Locals(reqscope.RequestKey(), req)
 
 	// A query naming two subresources addresses no operation. S3 refuses it
@@ -383,9 +392,10 @@ func mapAuthError(err error) (error, bool) {
 		// Another tenant's bucket is AccessDenied, as S3 answers for another
 		// account's bucket: bucket names are global, so existence is no secret.
 		hiltauth.ForeignBucketErrorName,
-		// A copy whose source header the signature does not cover cannot be
-		// authorized; the SDKs always sign it.
-		hiltauth.UnsignedHeaderErrorName:
+		// A header the signature does not cover, or a body it does not bind,
+		// cannot be authorized on; the SDKs sign both.
+		hiltauth.UnsignedHeaderErrorName,
+		hiltauth.UnboundBodyErrorName:
 		return s3err.GetAPIError(s3err.ErrAccessDenied), true
 	case hiltauth.TemporarilyUnavailableErrorName:
 		// An authorize that waited out Hilt's lock timeout behind a policy
