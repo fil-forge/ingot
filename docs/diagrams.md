@@ -505,7 +505,7 @@ sequenceDiagram
         B->>B: vet the source: copySourceBucket (tenant), resolveVersionIn,<br/>range within the object, copy-source preconditions (412)#59;<br/>the body is the source's plaintext range through the decrypting reader
     end
     B->>B: ingestPart: splitSpool<br/>(resolve the tenant recipient, then encrypt per piece:<br/>fresh CEK → FEE envelope → spool under the ciphertext<br/>digest + params row, as in the PutObject diagram)
-    B->>R: PutPart(spooled, span_lengths): open sessions only, the row held FOR SHARE<br/>against a concurrent latch#59; a refused part records its blobs' releases
+    B->>R: PutPart(spooled, span_lengths): open sessions only, the row held FOR SHARE<br/>against a concurrent latch#59; writes of one part number serialised on an advisory lock#59;<br/>a release record, due now, for each blob the replaced row named and this part<br/>does not, in the same transaction, returned to run#59; a refused part records its blobs' releases
     loop each part blob (parkBlobs)
         alt streamed while spooled
             B->>R: PutPark(AddTask, AcceptTask, PutInvocation), intent parked,<br/>DeleteStream: the PUT already went to piri in splitSpool
@@ -522,7 +522,11 @@ sequenceDiagram
         end
     end
     B->>R: MoveParts(spooled to parked), guarded by the part's digests
+    opt no row moved: a later upload of the part number replaced it,<br/>or a teardown took the session, while the blobs were parking
+        B->>R: EnqueueReleases of this part's blobs: the park settled any pending<br/>release of its digests as the write's own, cancelling the replacer's record
+    end
     B->>A: nudge (start the acceptor, or ask for another pass)
+    B->>U: releaseNow: the records above, due at once (/blob/abort of the parks#59;<br/>a blob another part or the session still names waits on that reference)
     B-->>C: part ETag (part md5#59; for a copy, of the copied bytes)
     loop while a pass finds parked parts
         A->>R: GetSession (stop unless open or completing)#59; ListParkedParts
@@ -610,13 +614,17 @@ stateDiagram-v2
     parked --> spooled : acceptor finds a blob with a release record, or neither park nor location
     spooled --> accepted : Complete finishes it (conclude, or upload from the spool)
     parked --> accepted : Complete, when no acceptors run
-    spooled --> [*] : a later UploadPart of the same number replaces the row
-    parked --> [*] : replaced, or the session's teardown cascades
-    accepted --> [*] : replaced, or the session's teardown cascades
+    spooled --> [*] : a later UploadPart of the same number replaces the row#59;<br/>the blobs it drops get release records in the same transaction
+    parked --> [*] : replaced (releases recorded with the replacement),<br/>or the session's teardown cascades
+    accepted --> [*] : replaced (releases recorded with the replacement),<br/>or the session's teardown cascades
 ```
 
 - `spooled` is the state of a part whose request is still parking its
   blobs, or died doing so. The acceptor never takes it; Complete does.
+- A request whose `spooled` row is replaced while it parks moves no row to
+  `parked`. It then records its blobs' releases itself: parking settles a
+  pending release of each digest as the write's own, which cancels the
+  record the replacement wrote.
 - Complete requires every part it names to be `accepted` before the commit:
   it waits until none of them is queued (parts it omits are not waited
   for), finishes `spooled` parts itself, and answers a part still `parked`
@@ -1149,7 +1157,7 @@ erDiagram
     blob_locations ||..o{ shard_inclusions : "by shard_digest"
     blob_locations ||..o| blob_encryption_params : "by (space, digest), deliberately no FK"
     multipart_parts ||..o{ blob_parks : "digests in blob_digests"
-    multipart_parts ||..o{ blob_release_intents : "teardown records, by digest"
+    multipart_parts ||..o{ blob_release_intents : "teardown and supersede records, by digest"
 ```
 
 - The four solid relationships are the schema's only real foreign keys;

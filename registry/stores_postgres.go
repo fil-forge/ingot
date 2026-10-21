@@ -1283,7 +1283,7 @@ func (r *Postgres) PutPart(ctx context.Context, p MultipartPart, tree *PartTree)
 }
 
 // digestsDropped returns the digests of replaced that kept does not name,
-// each once, as bytea[] input.
+// each once, in the form the bytea[] parameter takes.
 func digestsDropped(replaced, kept []multihash.Multihash) [][]byte {
 	skip := make(map[string]bool, len(kept))
 	for _, d := range kept {
