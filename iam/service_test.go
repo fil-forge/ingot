@@ -6,7 +6,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
+	awsv4 "github.com/aws/aws-sdk-go-v2/aws"
 	s3 "github.com/fil-forge/libforge/commands/s3"
 	s3bkt "github.com/fil-forge/libforge/commands/s3/bucket"
 	s3req "github.com/fil-forge/libforge/commands/s3/request"
@@ -16,6 +18,7 @@ import (
 	"github.com/fil-forge/ucantone/ucan"
 	"github.com/fil-forge/ucantone/ucan/container"
 	"github.com/fil-forge/versitygw/auth"
+	v4 "github.com/fil-forge/versitygw/aws/signer/v4"
 	"github.com/fil-forge/versitygw/s3err"
 	"github.com/gofiber/fiber/v3"
 	"github.com/stretchr/testify/require"
@@ -85,6 +88,24 @@ func authorizeOK(t *testing.T, keyDID did.DID, keys ...s3.VerificationKey) *s3re
 
 // resolveForRequest drives req through a fiber app whose handler resolves the
 // account via the service, returning what a real middleware would see.
+// signedCopyRequest builds a SigV4-signed CopyObject of src/key into dst/key
+// with the copy-source header covered, as every SDK signs it. The buckets a
+// request acts on are read from the signed request after hilt accepts it,
+// and a copy source is trusted only when signed.
+func signedCopyRequest(t *testing.T, dst, src string) *http.Request {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPut, "http://example.com/"+dst+"/key", nil)
+	req.Header.Set("X-Amz-Content-Sha256", "UNSIGNED-PAYLOAD")
+	req.Header.Set("X-Amz-Copy-Source", "/"+src+"/key")
+	_, err := v4.NewSigner().SignHTTP(context.Background(),
+		awsv4.Credentials{AccessKeyID: "AKIATEST", SecretAccessKey: "secret"},
+		req, "UNSIGNED-PAYLOAD", "s3", "us-east-1", time.Now(),
+		[]string{"host", "x-amz-content-sha256", "x-amz-copy-source", "x-amz-date"},
+		func(o *v4.SignerOptions) { o.DisableURIPathEscaping = true })
+	require.NoError(t, err)
+	return req
+}
+
 func resolveForRequest(t *testing.T, svc *iam.Service, access string, req *http.Request) (auth.Account, error) {
 	t.Helper()
 	app := fiber.New()
@@ -347,8 +368,7 @@ func TestProofChainCapture(t *testing.T) {
 		}
 		svc := iam.New(fake, cache, iam.NewVerificationKeyCache(), iam.NewTenantCache())
 
-		req := httptest.NewRequest(http.MethodPut, "http://example.com/dst/key", nil)
-		req.Header.Set("X-Amz-Copy-Source", "/src/key")
+		req := signedCopyRequest(t, "dst", "src")
 		_, err := resolveForRequest(t, svc, access, req)
 		require.NoError(t, err)
 		require.Equal(t, []string{"dst", "src"}, fake.infoBuckets,
@@ -388,8 +408,7 @@ func TestProofChainCapture(t *testing.T) {
 		fake := &fakeAuthorizer{res: res, proofs: []ucan.Delegation{leaf}}
 		svc := iam.New(fake, cache, iam.NewVerificationKeyCache(), iam.NewTenantCache())
 
-		req := httptest.NewRequest(http.MethodPut, "http://example.com/dst/key", nil)
-		req.Header.Set("X-Amz-Copy-Source", "/src/key")
+		req := signedCopyRequest(t, "dst", "src")
 		_, err = resolveForRequest(t, svc, access, req)
 		require.NoError(t, err)
 
