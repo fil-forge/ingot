@@ -301,6 +301,53 @@ func TestCatalogJournal_Live(t *testing.T) {
 			t.Fatalf("%d journal rows left for the deleted bucket, want 0", left)
 		}
 	})
+
+	// The same race when the bucket's root has moved on since the segment's
+	// op-root, so the forge-root advance's guard matches nothing and locks no
+	// bucket row: the ship still waits for the deletion before it touches the
+	// journal rows the deletion cascades into.
+	t.Run("a ship with a stale guard still waits for its bucket's deletion", func(t *testing.T) {
+		seg := newBucket(t, "jb-stale")
+		old, next := liveCid(t, "stale-old"), liveCid(t, "stale-next")
+		if err := r.CommitRoot(ctx, "jb-stale", cid.Undef, old, registry.RootCommit{
+			Journal: blockstore.Appended{Segment: seg, Blocks: []block.Block{block.NewBlock([]byte("stale"))}},
+		}); err != nil {
+			t.Fatalf("commit: %v", err)
+		}
+		if err := r.CASRoot(ctx, "jb-stale", old, next); err != nil {
+			t.Fatalf("move the root on: %v", err)
+		}
+		deleter, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin deleter: %v", err)
+		}
+		defer func() { _ = deleter.Rollback(ctx) }()
+		if _, err := deleter.Exec(ctx, `SELECT 1 FROM ingot.buckets WHERE name = 'jb-stale' FOR UPDATE`); err != nil {
+			t.Fatalf("lock bucket row: %v", err)
+		}
+
+		shipDone := make(chan error, 1)
+		go func() {
+			shipDone <- r.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seg, time.Now().Unix(), nil,
+				[]blockstore.OpRoot{{Bucket: "jb-stale", Root: old}})
+		}()
+		waitForLockWaiters(t, pool, 1)
+
+		if _, err := deleter.Exec(ctx, `DELETE FROM ingot.buckets WHERE name = 'jb-stale'`); err != nil {
+			t.Fatalf("delete bucket: %v", err)
+		}
+		if err := deleter.Commit(ctx); err != nil {
+			t.Fatalf("commit deletion: %v", err)
+		}
+		select {
+		case err := <-shipDone:
+			if err != nil {
+				t.Fatalf("ship: %v", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("ship did not finish")
+		}
+	})
 }
 
 // waitForLockWaiters waits until at least n backends are blocked on a lock.

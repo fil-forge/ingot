@@ -28,8 +28,10 @@ type fakeMeta struct {
 	nextSeq  uint64
 	segments map[uint64]*SegmentMeta
 	shipped  []shipEvent // order of MarkSegmentShipped calls
-	// failShips is how many of the next MarkSegmentShipped calls fail.
-	failShips int
+	// failShips is how many of the next MarkSegmentShipped calls fail, and
+	// onShipFail, if set, is called with each failed call's seq.
+	failShips  int
+	onShipFail func(seq uint64)
 }
 
 type shipEvent struct {
@@ -83,6 +85,9 @@ func (f *fakeMeta) MarkSegmentShipped(_ context.Context, plane blockstore.Plane,
 	defer f.mu.Unlock()
 	if f.failShips > 0 {
 		f.failShips--
+		if f.onShipFail != nil {
+			f.onShipFail(seq)
+		}
 		return fmt.Errorf("fake: ship of seq %d failed", seq)
 	}
 	m, ok := f.segments[seq]
@@ -501,19 +506,17 @@ func TestAppendBatchAllDuplicatesStillRecordsOpRoot(t *testing.T) {
 	}
 }
 
-// TestCatalogNeverShips covers the standalone-mode permutation: a catalog
-// plane configured never to ship keeps its CARs on local disk indefinitely
-// (the sole durable copy and the source for every read), and its shipped_at
-// never advances (so forge_root_cid never advances).
 // TestFailedShipStampRetriedWithoutReshipping checks that a segment whose
 // ship succeeded but whose MarkSegmentShipped failed is stamped again
-// without being shipped again, and isn't retired in the meantime: retention
-// would drop its row while its journal rows, which only the stamp deletes,
-// stayed behind.
+// without being shipped again, and doesn't count as shipped until then:
+// retention retires shipped segments, and would drop this one's row while
+// its journal rows, which only the stamp deletes, stayed behind.
 func TestFailedShipStampRetriedWithoutReshipping(t *testing.T) {
 	s, meta, flushes := newTestStore(t, 64, 50*time.Millisecond, 1)
+	stampFailed := make(chan uint64, 1)
 	meta.mu.Lock()
 	meta.failShips = 1
+	meta.onShipFail = func(seq uint64) { stampFailed <- seq }
 	meta.mu.Unlock()
 
 	blk := makeBlock(t, append([]byte("stamp-"), make([]byte, 80)...))
@@ -522,6 +525,25 @@ func TestFailedShipStampRetriedWithoutReshipping(t *testing.T) {
 	if err != nil {
 		t.Fatalf("append: %v", err)
 	}
+
+	// Between the failed stamp and its retry, a backoff away, the segment
+	// must not count as shipped.
+	select {
+	case failed := <-stampFailed:
+		if failed != seq {
+			t.Fatalf("stamp failed for seq %d, want %d", failed, seq)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the stamp never failed")
+	}
+	s.catalog.catMu.RLock()
+	for _, sealed := range s.catalog.sealed {
+		if sealed.Seq() == seq && sealed.IsShipped() {
+			s.catalog.catMu.RUnlock()
+			t.Fatalf("segment %d counts as shipped while its stamp is failing", seq)
+		}
+	}
+	s.catalog.catMu.RUnlock()
 
 	deadline := time.Now().Add(5 * time.Second)
 	for {
@@ -546,6 +568,10 @@ func TestFailedShipStampRetriedWithoutReshipping(t *testing.T) {
 	}
 }
 
+// TestCatalogNeverShips covers the standalone-mode permutation: a catalog
+// plane configured never to ship keeps its CARs on local disk indefinitely
+// (the source for every read), and its shipped_at never advances (so
+// forge_root_cid never advances).
 func TestCatalogNeverShips(t *testing.T) {
 	dir := t.TempDir()
 	meta := newFakeMeta()

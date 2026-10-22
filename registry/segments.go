@@ -112,10 +112,19 @@ func (r *Postgres) MarkSegmentShipped(ctx context.Context, plane blockstore.Plan
 	// took the segment row's lock first, so a commit that was journaling
 	// into this segment (journalBlocks holds a share lock on the row) has
 	// committed, and this statement sees its rows; any later commit sees the
-	// segment shipped and journals nothing. The rows go last, after the
-	// bucket rows: deleting a bucket locks its row and then cascades into
-	// its journal rows, and taking them in the other order could deadlock
-	// with it.
+	// segment shipped and journals nothing.
+	//
+	// Deleting a bucket locks its row and then cascades into its journal
+	// rows, so the rows' bucket is locked first here too: the advances above
+	// lock it only where the guard matched. KEY SHARE conflicts with the
+	// deletion's lock but not with a commit's root swap.
+	if _, err := tx.Exec(ctx, `
+		SELECT 1 FROM ingot.buckets
+		 WHERE name IN (SELECT bucket FROM ingot.catalog_journal WHERE seq = $1)
+		 ORDER BY name
+		   FOR KEY SHARE`, int64(seq)); err != nil {
+		return fmt.Errorf("registry: lock buckets of catalog segment %d's journal: %w", seq, err)
+	}
 	if _, err := tx.Exec(ctx, `DELETE FROM ingot.catalog_journal WHERE seq = $1`, int64(seq)); err != nil {
 		return fmt.Errorf("registry: drop journal of catalog segment %d: %w", seq, err)
 	}

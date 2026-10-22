@@ -354,19 +354,21 @@ func (pl *PlaneLog) flushOne(seg *Segment) {
 				flushed, shippedAt = true, time.Now().Unix()
 			}
 		}
-		if flushed {
-			if err = pl.meta.MarkSegmentShipped(ctx, pl.plane, seg.Seq(), shippedAt, indexDigest, seg.OpRoots()); err != nil {
-				err = fmt.Errorf("mark shipped: %w", err)
+		if err != nil {
+			pl.logger.Warn("logstore: ship attempt failed",
+				zap.Stringer("plane", pl.plane), zap.Uint64("seq", seg.Seq()),
+				zap.Int("attempt", attempt), zap.Error(err))
+		} else {
+			if err = pl.meta.MarkSegmentShipped(ctx, pl.plane, seg.Seq(), shippedAt, indexDigest, seg.OpRoots()); err == nil {
+				seg.markShipped(shippedAt)
+				pl.runRetention(ctx)
+				return
 			}
+			// The segment is on Forge; only its stamp in Meta failed.
+			pl.logger.Warn("logstore: mark shipped",
+				zap.Stringer("plane", pl.plane), zap.Uint64("seq", seg.Seq()),
+				zap.Int("attempt", attempt), zap.Error(err))
 		}
-		if err == nil {
-			seg.markShipped(shippedAt)
-			pl.runRetention(ctx)
-			return
-		}
-		pl.logger.Warn("logstore: ship attempt failed",
-			zap.Stringer("plane", pl.plane), zap.Uint64("seq", seg.Seq()),
-			zap.Int("attempt", attempt), zap.Error(err))
 		span.RecordError(err)
 		select {
 		case <-pl.closing:
@@ -378,7 +380,7 @@ func (pl *PlaneLog) flushOne(seg *Segment) {
 		}
 	}
 	pl.logger.Error("logstore: ship exhausted retries; segment remains unshipped",
-		zap.Stringer("plane", pl.plane), zap.Uint64("seq", seg.Seq()))
+		zap.Stringer("plane", pl.plane), zap.Uint64("seq", seg.Seq()), zap.Bool("flushed", flushed))
 	span.SetStatus(codes.Error, "ship exhausted retries")
 }
 
