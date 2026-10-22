@@ -85,9 +85,11 @@ func (r *Postgres) MarkSegmentShipped(ctx context.Context, plane blockstore.Plan
 		return fmt.Errorf("registry: mark catalog shipped %d: %w", seq, err)
 	}
 	if tag.RowsAffected() > 0 {
-		// Apply forge_root advances in slice order. Segments ship in seq
-		// order, and within a segment the slice order is commit order, so
-		// the last write for each bucket wins.
+		// Apply forge_root advances in slice order: within a segment the
+		// slice order is commit order, so the last write for each bucket
+		// wins. Segments needn't ship in seq order (recovery queues the
+		// newest first); the guard below keeps an older segment's advance
+		// from moving forge_root_cid back.
 		//
 		// The advance is GUARDED on root_cid: forge_root_cid moves to
 		// opr.Root only if the bucket's committed root still equals
