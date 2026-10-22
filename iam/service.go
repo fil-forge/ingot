@@ -51,7 +51,6 @@
 package iam
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -191,10 +190,21 @@ func (s *Service) GetUserAccountForRequest(ctx fiber.Ctx, accessKeyStr string) (
 	// The body travels to Hilt only for the operations whose body decides a
 	// permission (a DeleteObjects' entries may name versions), which Hilt's
 	// classifier names; every other request goes without one, so a streaming
-	// write's body is never read here. Hilt binds it to the signature before
-	// reading it, and so does the fast path.
+	// write's body is never read here. It is captured up to Hilt's limit and
+	// no further, since nothing about the request is verified yet, and left
+	// in place for the handler. Hilt binds it to the signature before reading
+	// it, and so does the fast path.
 	if op, err := hiltauth.OperationFor(req); err == nil && op.ReadsBody() {
-		req.Body = bytes.Clone(reqCtx.Request.Body())
+		body, err := fasthttputil.BoundedBody(reqCtx, hiltauth.MaxBodySize)
+		if errors.Is(err, fasthttputil.ErrBodyTooLarge) {
+			path = "local"
+			s.logger.Debug("hilt/iam: request body over the limit", zap.String("access", accessKeyStr), zap.Stringer("operation", op))
+			return auth.Account{}, s3err.GetAPIError(s3err.ErrEntityTooLarge)
+		}
+		if err != nil {
+			return auth.Account{}, fmt.Errorf("hilt/iam: %w", err)
+		}
+		req.Body = body
 	}
 	ctx.Locals(reqscope.RequestKey(), req)
 
