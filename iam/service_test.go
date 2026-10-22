@@ -1,10 +1,12 @@
 package iam_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -24,6 +26,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	hiltclient "github.com/fil-forge/hilt/pkg/client"
+	hiltauth "github.com/fil-forge/hilt/pkg/rpc/service/auth"
 	"github.com/fil-forge/ingot/iam"
 	"github.com/fil-forge/ingot/internal/reqscope"
 )
@@ -108,17 +111,73 @@ func signedCopyRequest(t *testing.T, dst, src string) *http.Request {
 
 func resolveForRequest(t *testing.T, svc *iam.Service, access string, req *http.Request) (auth.Account, error) {
 	t.Helper()
-	app := fiber.New()
+	acct, _, err := resolveStreamed(t, svc, access, req, false)
+	return acct, err
+}
+
+// resolveStreamed runs the request through the gateway's auth step as
+// resolveForRequest does, streaming the request body as the production
+// server does when streamed is set, and returns the body the handler then
+// reads.
+func resolveStreamed(t *testing.T, svc *iam.Service, access string, req *http.Request, streamed bool) (auth.Account, []byte, error) {
+	t.Helper()
+	app := fiber.New(fiber.Config{StreamRequestBody: streamed})
 	var acct auth.Account
 	var authErr error
+	var seen []byte
 	app.Use(func(c fiber.Ctx) error {
 		acct, authErr = svc.GetUserAccountForRequest(c, access)
+		seen = bytes.Clone(c.Body())
 		return nil
 	})
 	resp, err := app.Test(req)
 	require.NoError(t, err)
 	require.NoError(t, resp.Body.Close())
-	return acct, authErr
+	return acct, seen, authErr
+}
+
+// TestRequestBodyForwarding covers the body hilt decides on, end to end
+// through the gateway's auth step with a streamed request: a DeleteObjects
+// body reaches the authorizer exactly and is left for the handler, any
+// other operation's body is neither forwarded nor consumed, and an
+// oversized DeleteObjects body is refused before the authorizer is asked.
+func TestRequestBodyForwarding(t *testing.T) {
+	access, keyDID := newAccessKey(t)
+	key := s3.VerificationKey{Kind: s3.KeyKindSigV4, Data: []byte("dk")}
+	const body = `<Delete><Object><Key>k</Key><VersionId>v</VersionId></Object></Delete>`
+
+	t.Run("a DeleteObjects body is forwarded and left for the handler", func(t *testing.T) {
+		fake := &fakeAuthorizer{res: authorizeOK(t, keyDID, key)}
+		svc := iam.New(fake, iam.NewKeyProofs(), iam.NewVerificationKeyCache(), iam.NewTenantCache())
+		req := httptest.NewRequest(http.MethodPost, "http://example.com/bkt?delete", strings.NewReader(body))
+		_, seen, err := resolveStreamed(t, svc, access, req, true)
+		require.NoError(t, err)
+		require.Equal(t, 1, fake.calls)
+		require.Equal(t, []byte(body), fake.got.Body, "the authorizer must see the exact body")
+		require.Equal(t, []byte(body), seen, "the handler must read the same body")
+	})
+
+	t.Run("another operation's body is neither forwarded nor consumed", func(t *testing.T) {
+		fake := &fakeAuthorizer{res: authorizeOK(t, keyDID, key)}
+		svc := iam.New(fake, iam.NewKeyProofs(), iam.NewVerificationKeyCache(), iam.NewTenantCache())
+		req := httptest.NewRequest(http.MethodPut, "http://example.com/bkt/k", strings.NewReader("object bytes"))
+		_, seen, err := resolveStreamed(t, svc, access, req, true)
+		require.NoError(t, err)
+		require.Nil(t, fake.got.Body)
+		require.Equal(t, []byte("object bytes"), seen)
+	})
+
+	t.Run("an oversized DeleteObjects body is refused before the authorizer is asked", func(t *testing.T) {
+		fake := &fakeAuthorizer{res: authorizeOK(t, keyDID, key)}
+		svc := iam.New(fake, iam.NewKeyProofs(), iam.NewVerificationKeyCache(), iam.NewTenantCache())
+		huge := strings.Repeat("x", hiltauth.MaxBodySize+1)
+		req := httptest.NewRequest(http.MethodPost, "http://example.com/bkt?delete", strings.NewReader(huge))
+		_, _, err := resolveStreamed(t, svc, access, req, true)
+		var s3e s3err.APIError
+		require.ErrorAs(t, err, &s3e)
+		require.Equal(t, s3err.GetAPIError(s3err.ErrEntityTooLarge).Code, s3e.Code)
+		require.Zero(t, fake.calls)
+	})
 }
 
 func TestGetUserAccountForRequest(t *testing.T) {
