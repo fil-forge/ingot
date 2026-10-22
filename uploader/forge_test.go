@@ -86,20 +86,44 @@ func TestForgeShipProofsRequestScopeWins(t *testing.T) {
 }
 
 // TestForgeCaptureShipAuthority checks the capture a commit makes: the
-// request's store becomes the space's ship authority, found later without a
-// request, and a ctx carrying none leaves an earlier capture in place.
+// request's store becomes the store a ship to the space signs with, found
+// later without a request and ahead of an upload's capture, while the
+// release, abort and renewal paths (shipProofStore) keep the upload's, since
+// a commit's grant need not cover their commands. A ctx carrying no store
+// leaves the capture in place.
 func TestForgeCaptureShipAuthority(t *testing.T) {
 	fg := newTestForge(t)
+	ctx := context.Background()
 	space := mustSpace(t)
-	store := ucanlib.ProofStore(tokenstore.NewMemStore())
+	uploaded := ucanlib.ProofStore(tokenstore.NewMemStore())
+	committed := ucanlib.ProofStore(tokenstore.NewMemStore())
 
-	fg.CaptureShipAuthority(context.WithValue(context.Background(), reqscope.ProofStoreKey(), store), space)
-	got, ok := fg.shipProofStore(context.Background(), space)
+	// With only an upload's capture, the ship falls back to it.
+	fg.captureShipProofs(space, uploaded)
+	got, ok := fg.catalogShipStore(ctx, space)
 	require.True(t, ok)
-	require.Same(t, store, got)
+	require.Same(t, uploaded, got)
 
-	fg.CaptureShipAuthority(context.Background(), space)
-	got, ok = fg.shipProofStore(context.Background(), space)
+	fg.CaptureShipAuthority(context.WithValue(ctx, reqscope.ProofStoreKey(), committed), space)
+	got, ok = fg.catalogShipStore(ctx, space)
 	require.True(t, ok)
-	require.Same(t, store, got, "a ctx without a store must not replace the capture")
+	require.Same(t, committed, got, "the ship signs with the latest commit's store")
+	got, ok = fg.shipProofStore(ctx, space)
+	require.True(t, ok)
+	require.Same(t, uploaded, got, "a commit's store must not replace the upload's for release, abort and renewal")
+
+	fg.CaptureShipAuthority(ctx, space)
+	got, ok = fg.catalogShipStore(ctx, space)
+	require.True(t, ok)
+	require.Same(t, committed, got, "a ctx without a store must not replace the capture")
+
+	// A commit's capture alone is enough to ship.
+	other := mustSpace(t)
+	fg.CaptureShipAuthority(context.WithValue(ctx, reqscope.ProofStoreKey(), committed), other)
+	got, ok = fg.catalogShipStore(ctx, other)
+	require.True(t, ok)
+	require.Same(t, committed, got)
+	if _, ok := fg.shipProofStore(ctx, other); ok {
+		t.Fatal("a commit's capture must not serve release, abort or renewal")
+	}
 }

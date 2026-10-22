@@ -119,8 +119,10 @@ Internal:
   `ConcludeBlobs`, `AbortBlob`), `StreamingBodyUploader` (`StartBlob`,
   `PutBlob`: allocate by digest code, send while spooling), and
   `BlobRemover`; captures the per-space
-  ship authority (`shipProofs`, 1h TTL) from in-request writes: body uploads
-  and every `bucketop` commit (`CaptureShipAuthority`).
+  ship authority (1h TTL) from in-request writes: `shipProofs` from body
+  uploads (also the background releases' and aborts' fallback), and
+  `commitProofs` from every `bucketop` commit (`CaptureShipAuthority`), which
+  the ship prefers.
 - **`bucketauthority/`** — hilt bucket ops: forwards CreateBucket /
   DeleteBucket / ListBuckets to `/s3/bucket/*`, recovering the signed S3
   request from ctx.

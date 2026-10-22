@@ -71,8 +71,9 @@ func newRefTestBackend(t *testing.T, maxBlob ...int64) (*Backend, *inmem.MemStor
 	return newRefTestBackendOver(t, mem, log, mbs)
 }
 
-// newRefTestBackendOver is newRefTestBackend over a given catalog log.
-func newRefTestBackendOver(t *testing.T, mem *inmem.MemStore, log blockstore.Log, mbs int64) (*Backend, *inmem.MemStore, *recordingRemover) {
+// newRefTestBackendOver is newRefTestBackend over a given catalog log. Each
+// opt adjusts the Deps before the Backend is built.
+func newRefTestBackendOver(t *testing.T, mem *inmem.MemStore, log blockstore.Log, mbs int64, opts ...func(*Deps)) (*Backend, *inmem.MemStore, *recordingRemover) {
 	t.Helper()
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -86,7 +87,7 @@ func newRefTestBackendOver(t *testing.T, mem *inmem.MemStore, log blockstore.Log
 	}
 
 	rm := &recordingRemover{}
-	b := New(Deps{
+	deps := Deps{
 		Authority:       mem,
 		Registry:        mem,
 		Intents:         mem,
@@ -109,7 +110,11 @@ func newRefTestBackendOver(t *testing.T, mem *inmem.MemStore, log blockstore.Log
 		// ReleaseGrace stays zero: releases are due immediately, and tests
 		// drain them explicitly with drainReleases.
 		MaxBlobSize: mbs,
-	})
+	}
+	for _, opt := range opts {
+		opt(&deps)
+	}
+	b := New(deps)
 	if err := mem.Create(ctx, "bk", did.Undef, registry.CreateState{}); err != nil {
 		t.Fatalf("create bucket: %v", err)
 	}

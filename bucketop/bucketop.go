@@ -62,8 +62,8 @@ type Deps struct {
 	// on miss during the transaction.
 	Reads blockstore.ReadStore
 
-	// Ships, when set, is handed each commit's request once its blocks are
-	// appended: the segment they went into ships later, outside any
+	// Ships, when set, is handed each commit's request just before its
+	// blocks are appended: the segment they go into ships later, outside any
 	// request, under authority captured from the bucket's writes. Nil
 	// captures nothing.
 	Ships ShipAuthority
@@ -379,14 +379,15 @@ func (tx *Tx) Commit(ctx context.Context, newRoot cid.Cid) (err error) {
 	ctx, span := tracing.Start(ctx, "bucket.commit")
 	defer func() { tracing.End(span, err) }()
 
-	if err := tx.staging.Commit(ctx, newRoot); err != nil {
-		return fmt.Errorf("bucketop: append: %w", err)
-	}
-	// The append is what the segment will ship, whatever the root swap
-	// below does, so its authority is captured now. A write with no body
-	// (a delete, a tag change) captures none anywhere else.
+	// The append below is what the segment will ship, whatever the root
+	// swap does, so its authority is captured first: an append that fills
+	// the segment can seal it and start its ship at once. A write with no
+	// body (a delete, a tag change) captures none anywhere else.
 	if tx.deps.Ships != nil {
 		tx.deps.Ships.CaptureShipAuthority(ctx, tx.state.Space)
+	}
+	if err := tx.staging.Commit(ctx, newRoot); err != nil {
+		return fmt.Errorf("bucketop: append: %w", err)
 	}
 	if err := tx.deps.Reg.CommitRoot(ctx, tx.bucket, tx.state.Root, newRoot, tx.commit); err != nil {
 		return fmt.Errorf("bucketop: advance root: %w", err)

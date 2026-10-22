@@ -135,6 +135,7 @@ flowchart TB
     s3f --> up
     s3f --> ba
     bop -->|"blockstore.Log"| ls
+    bop -.->|"bucketop.ShipAuthority<br/>(uploader.Forge injected)"| up
     bop --> mst
     mst --> bs
     bkt --> bs
@@ -910,14 +911,18 @@ flowchart TB
     subgraph stores["proof stores"]
         kp["iam.KeyProofs: one DelegationCache<br/>per access key, 24h idle eviction;<br/>also the key's effective S3 action set per bucket"]
         ship["uploader.Forge shipProofs:<br/>per-space store, 1h TTL"]
+        commit["uploader.Forge commitProofs:<br/>per-space store, 1h TTL"]
         static["AuthServiceProofs:<br/>static container from config"]
         tok["tokenstore (tokens.cbor):<br/>empty; dormant login paths only"]
     end
 
     kp -->|"reqscope.ProofStore<br/>on the request ctx"| writes["uploader:<br/>/blob/add, abort, remove, /index/add<br/>/upload/add, /upload/remove"]
     kp -->|"same store"| reads["blockstore.Forge:<br/>content/retrieve"]
-    kp -->|"captureShipProofs at UploadBlob,<br/>StartBlob and every bucketop commit"| ship
-    ship --> async["async catalog ship;<br/>sweeper and DeleteBucket aborts"]
+    kp -->|"captureShipProofs<br/>at UploadBlob and StartBlob"| ship
+    kp -->|"CaptureShipAuthority<br/>at every bucketop commit"| commit
+    commit --> catship["async catalog ship"]
+    ship -->|"no commit capture"| catship
+    ship --> async["sweepers' releases, aborts and<br/>registration renewals; DeleteBucket aborts"]
     static --> hc["hilt client:<br/>every /s3/* invocation"]
 
     classDef external stroke-dasharray: 5 5
@@ -931,9 +936,13 @@ flowchart TB
   lookup. `/health` and the DID document are outside the S3 auth chain, and a
   rejected access key never receives one.
 - Every write captures the ship authority when it commits, so a segment,
-  sealed seconds after its writes, ships under a fresh capture. The capture
-  lasts an hour and lives in memory: a segment whose ship keeps failing past
-  that, or across a restart, has no authority until the bucket's next write.
+  sealed seconds after its writes, ships under a fresh capture. That capture
+  is kept apart from the upload's: every catalog-changing grant includes the
+  ship's commands, but a narrower key's (tagging, retention) lacks the
+  release, abort and registration commands the upload's capture also
+  serves. Both last an hour and live in memory: a segment whose ship keeps
+  failing past that, or across a restart, has no authority until the
+  bucket's next write.
 - Each access key gets its own `DelegationCache`, so a proof chain can never
   assemble across keys.
 - The same store holds the effective S3 action set hilt reported for the key

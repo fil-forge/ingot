@@ -80,9 +80,16 @@ type Forge struct {
 	// store seen on an in-request write to that space. The catalog segment
 	// ship (SubmitShard) runs asynchronously in the flush goroutine with no
 	// request context, so it reuses this to authorize its onward
-	// /blob/add + /index/add. See UploadBlob, StartBlob and
-	// CaptureShipAuthority (capture) and SubmitShard (use).
+	// /blob/add + /index/add. See UploadBlob (capture) and SubmitShard (use).
 	shipProofs *gocache.Cache
+
+	// commitProofs caches, per space, the proof store of the most recent
+	// write that committed catalog blocks to it (CaptureShipAuthority). Every
+	// catalog-changing grant includes the ship's commands, but not the
+	// release, abort and registration commands that shipProofs also serves
+	// outside a request (a tagging-only key's does not), so SubmitShard alone
+	// reads it, ahead of shipProofs.
+	commitProofs *gocache.Cache
 }
 
 // shipProofsTTL bounds how long a captured ship store lives. Comfortably
@@ -114,10 +121,11 @@ func NewForge(cfg ForgeConfig) (*Forge, error) {
 		logger = zap.NewNop()
 	}
 	return &Forge{
-		client:     cfg.Client,
-		putClient:  pc,
-		logger:     logger,
-		shipProofs: gocache.New(shipProofsTTL, shipProofsTTL),
+		client:       cfg.Client,
+		putClient:    pc,
+		logger:       logger,
+		shipProofs:   gocache.New(shipProofsTTL, shipProofsTTL),
+		commitProofs: gocache.New(shipProofsTTL, shipProofsTTL),
 	}, nil
 }
 
@@ -131,12 +139,25 @@ func (u *Forge) captureShipProofs(space did.DID, store ucanlib.ProofStore) {
 }
 
 // CaptureShipAuthority records the request's proof store as space's ship
-// authority (Uploader). A ctx without one, such as a background commit's,
-// leaves the capture as it was.
+// authority (Uploader), in commitProofs. A ctx without one, such as a
+// background commit's, leaves the capture as it was.
 func (u *Forge) CaptureShipAuthority(ctx context.Context, space did.DID) {
 	if store, ok := reqscope.ProofStore(ctx); ok {
-		u.captureShipProofs(space, store)
+		u.commitProofs.Set(space.String(), store, gocache.DefaultExpiration)
 	}
+}
+
+// catalogShipStore resolves the proof store a catalog ship to space signs
+// with: the request-scoped store if this runs in-request, else the store of
+// the space's most recent commit, else shipProofStore's.
+func (u *Forge) catalogShipStore(ctx context.Context, space did.DID) (ucanlib.ProofStore, bool) {
+	if store, ok := reqscope.ProofStore(ctx); ok {
+		return store, true
+	}
+	if v, ok := u.commitProofs.Get(space.String()); ok {
+		return v.(ucanlib.ProofStore), true
+	}
+	return u.shipProofStore(ctx, space)
 }
 
 // shipProofStore resolves the proof store authorizing a ship to space: the
@@ -160,7 +181,7 @@ func (u *Forge) SubmitShard(ctx context.Context, plane blockstore.Plane, space d
 	// The ship runs async (flush goroutine, no request), so its authority is
 	// the store captured from a recent in-request write to this space. No
 	// store → fail so the flush retries; a later write repopulates it.
-	store, ok := u.shipProofStore(ctx, space)
+	store, ok := u.catalogShipStore(ctx, space)
 	if !ok {
 		return BlobLocation{}, nil, fmt.Errorf("uploader: no ship authority for space %s (no captured proof store)", space)
 	}

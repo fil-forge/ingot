@@ -487,10 +487,12 @@ not yet started defers while a write of its space holds the digest.
   the agent, and the per-key `DelegationCache` carries those proofs into the
   request via `internal/reqscope`, where the uploader and the network read
   tier spend them. The uploader also captures a per-space ship authority
-  (1h TTL) for the async catalog flush, from every write that commits. The same cache's action sets ride
-  along (`reqscope.Permits`) for the one check hilt cannot make from the
-  URL: a `DeleteObjects` entry naming a version needs
-  `s3:DeleteObjectVersion`, beyond the request's `s3:DeleteObject`.
+  (1h TTL) for the async catalog flush, from every write that commits, and
+  keeps an upload's capture apart for the background releases, aborts and
+  registration renewals, which a narrower key's grant may not cover. The
+  same cache's action sets ride along (`reqscope.Permits`) for the one check
+  hilt cannot make from the URL: a `DeleteObjects` entry naming a version
+  needs `s3:DeleteObjectVersion`, beyond the request's `s3:DeleteObject`.
 - There is **no root account**: versitygw's built-in root user is disabled
   (an empty `RootUserConfig`), so every access key resolves through hilt. A
   key hilt has not issued is rejected as InvalidAccessKeyId.
