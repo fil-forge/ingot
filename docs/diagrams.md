@@ -923,10 +923,13 @@ flowchart TB
   chain probe alone would let a put-only key read and abort on the bucket, or
   read a copy's source.
 - A copy's source and the headers that add a permission to a write (a lock
-  or tags on the version it creates) are decided from headers. Hilt's
-  `RequirementsFor` refuses a header the signature does not cover, as hilt
-  itself does, so the fast path decides nothing from such a request: it
-  goes to hilt, which refuses it as `UnsignedHeader`.
+  or tags on the version it creates) are decided from headers, and a
+  DeleteObjects on its body, which iam attaches for the operations hilt
+  names (`Operation.ReadsBody`) and no other. Hilt's `RequirementsFor`
+  refuses a header the signature does not cover or a body it does not bind,
+  as hilt itself does, so the fast path decides nothing from such a
+  request: it goes to hilt, which refuses it as `UnsignedHeader` or
+  `InvalidBody`.
 
 Cross-references: [`architecture.md` §9](./architecture.md#9-the-system-contract-piri--sprue--indexer).
 
