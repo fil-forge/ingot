@@ -20,9 +20,10 @@ import (
 //     permissions is refused PutBucketVersioning and DeleteObjects on an
 //     existing bucket, since each is authorized on its own permission and
 //     against that bucket's scope;
-//   - DeleteObjects is authorized on s3:DeleteObject, and an entry naming a
-//     version is refused, and the version kept, unless the key also holds
-//     s3:DeleteObjectVersion.
+//   - DeleteObjects is authorized on s3:DeleteObject, and a batch with an
+//     entry naming a version is refused as a whole, nothing in it deleted,
+//     unless the key also holds s3:DeleteObjectVersion: hilt decides the
+//     request on its body, where S3 would refuse the entry alone.
 //
 // Each denied key first makes an allowed request, so the second attempt at a
 // denial runs against ingot's caches and the local fast path must refuse
@@ -127,22 +128,35 @@ func TestForgeRoutePermissions(t *testing.T) {
 		deleter := client("deleter", withoutVersion)
 		v1 := put("kept")
 		put("marked")
+		// An allowed request first, so the key's action set and chains are
+		// cached and the second denial below runs against them.
+		if _, err := deleteObjects(deleter, types.ObjectIdentifier{Key: aws.String("probe")}); err != nil {
+			t.Fatalf("priming DeleteObjects with s3:DeleteObject: %v", err)
+		}
 
-		out, err := deleteObjects(deleter,
-			types.ObjectIdentifier{Key: aws.String("kept"), VersionId: aws.String(v1)},
-			types.ObjectIdentifier{Key: aws.String("marked")},
-		)
+		// The mixed batch is refused as a whole, once through hilt and once
+		// against the caches, with nothing in it deleted.
+		denied(t, "delete-only key naming a version", func() error {
+			_, err := deleteObjects(deleter,
+				types.ObjectIdentifier{Key: aws.String("kept"), VersionId: aws.String(v1)},
+				types.ObjectIdentifier{Key: aws.String("marked")},
+			)
+			return err
+		})
+		if _, err := full.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(bucket), Key: aws.String("kept"), VersionId: aws.String(v1)}); err != nil {
+			t.Fatalf("refused version is gone: %v", err)
+		}
+		if _, err := full.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(bucket), Key: aws.String("marked")}); err != nil {
+			t.Fatalf("\"marked\" was deleted by a refused batch: %v", err)
+		}
+
+		// The plain batch is authorized on s3:DeleteObject alone.
+		out, err := deleteObjects(deleter, types.ObjectIdentifier{Key: aws.String("marked")})
 		if err != nil {
 			t.Fatalf("DeleteObjects with s3:DeleteObject: %v", err)
 		}
-		if len(out.Errors) != 1 || aws.ToString(out.Errors[0].Key) != "kept" || aws.ToString(out.Errors[0].Code) != "AccessDenied" {
-			t.Fatalf("errors = %+v, want AccessDenied for \"kept\" alone", out.Errors)
-		}
-		if len(out.Deleted) != 1 || aws.ToString(out.Deleted[0].Key) != "marked" || !aws.ToBool(out.Deleted[0].DeleteMarker) {
-			t.Fatalf("deleted = %+v, want a delete marker for \"marked\"", out.Deleted)
-		}
-		if _, err := full.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(bucket), Key: aws.String("kept"), VersionId: aws.String(v1)}); err != nil {
-			t.Fatalf("refused version is gone: %v", err)
+		if len(out.Errors) != 0 || len(out.Deleted) != 1 || aws.ToString(out.Deleted[0].Key) != "marked" || !aws.ToBool(out.Deleted[0].DeleteMarker) {
+			t.Fatalf("result = deleted %+v, errors %+v; want a delete marker for \"marked\"", out.Deleted, out.Errors)
 		}
 
 		versionDeleter := client("version-deleter", []string{"s3:DeleteObject", "s3:DeleteObjectVersion"})

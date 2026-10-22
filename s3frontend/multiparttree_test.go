@@ -253,9 +253,9 @@ func TestMultipartTree(t *testing.T) {
 	t.Run("re-hash over budget refuses the completion", func(t *testing.T) {
 		// Variable sizes uploaded in reverse: part 2 (non-final) is assumed
 		// wrongly, and with a budget below its size Complete is refused as
-		// InvalidPartLayout before any part is accepted. The upload stays
-		// open, and the same Complete within the default budget commits the
-		// object with its digest.
+		// InvalidPartLayout before any part is accepted or its version id
+		// reported. The upload stays open, and the same Complete within the
+		// default budget commits the object with its digest.
 		saved := b.rehashBudget
 		b.rehashBudget = 1
 		defer func() { b.rehashBudget = saved }()
@@ -278,10 +278,15 @@ func TestMultipartTree(t *testing.T) {
 			completed = append(completed, types.CompletedPart{PartNumber: &pn, ETag: etags[i]})
 			whole = append(whole, parts[i]...)
 		}
-		_, err := mpComplete(t, b, key, uploadID, completed, nil)
+		reported, _, err := completeReporting(t, b, key, uploadID, completed, func(string) {})
 		var apiErr s3err.APIError
 		if !errors.As(err, &apiErr) || apiErr.Code != "InvalidPartLayout" || apiErr.HTTPStatusCode != http.StatusBadRequest {
 			t.Fatalf("Complete over budget: err = %v, want InvalidPartLayout", err)
+		}
+		// Refused before it reports, so a streamed response is still
+		// uncommitted and the refusal keeps its 400.
+		if len(reported) != 0 {
+			t.Fatalf("Complete over budget reported %q before refusing", reported)
 		}
 		if !strings.Contains(apiErr.Description, strconv.Itoa(minPart)) {
 			t.Fatalf("refusal names %q, want the %d bytes to re-hash", apiErr.Description, minPart)
