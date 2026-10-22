@@ -491,6 +491,27 @@ var errCompleteInProgress = s3err.APIError{
 }
 
 func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.CompleteMultipartUploadInput) (s3response.CompleteMultipartUploadResult, string, error) {
+	return b.CompleteMultipartUploadReportingVersionID(ctx, input, func(string) {})
+}
+
+var _ backend.CompleteMultipartUploadReporter = (*Backend)(nil)
+
+// CompleteMultipartUploadReportingVersionID is CompleteMultipartUpload that
+// reports its version id before accepting the parts, the slow step, for
+// versitygw to send with a streamed response's early headers, as S3 does.
+// An Enabled bucket's winner reports the id it reserved; every other path
+// reports "" before it waits on anything.
+func (b *Backend) CompleteMultipartUploadReportingVersionID(ctx context.Context, input *s3.CompleteMultipartUploadInput, reportVersionID func(versionID string)) (s3response.CompleteMultipartUploadResult, string, error) {
+	// Only the first report counts (versitygw ignores the rest), and an id
+	// reported here is binding, so the reservation below needs to know
+	// whether "" went out first.
+	reported := false
+	report := func(versionID string) {
+		if !reported {
+			reported = true
+			reportVersionID(versionID)
+		}
+	}
 	if input.Bucket == nil || input.Key == nil || input.UploadId == nil {
 		return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrInvalidRequest)
 	}
@@ -751,9 +772,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 				if versionid == registry.NullVersionID {
 					versionid = ""
 				}
-				if versionid != "" {
-					backend.AnnounceVersionID(ctx, versionid)
-				}
+				report(versionid)
 				return res, versionid, nil
 			}
 			if cur.State == registry.SessionOpen {
@@ -772,6 +791,10 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 			if tries >= replayMaxTries || time.Now().After(deadline) {
 				return s3response.CompleteMultipartUploadResult{}, "", errCompleteInProgress
 			}
+			// The winner's id isn't known until it commits, and if it fails
+			// this caller may commit a version of its own. The headers go out
+			// without one rather than wait out the winner.
+			report("")
 			select {
 			case <-ctx.Done():
 				return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: complete wait: %w", ctx.Err())
@@ -804,16 +827,19 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 	// An Enabled bucket's new version id goes out now, before the parts are
 	// accepted: versitygw may commit the response headers while the
 	// completion runs, and S3 sends x-amz-version-id with them. The commit
-	// then installs exactly this id, or fails (errReservationSuperseded).
+	// then installs exactly this id, or fails (errReservationSuperseded). A
+	// caller that already reported "" while it waited on another Complete
+	// commits as any other write does.
 	var reserved *versionReservation
-	if bucketState.Versioning == registry.VersioningEnabled {
+	if bucketState.Versioning == registry.VersioningEnabled && !reported {
 		r, err := b.reserveVersion(ctx, bucket)
 		if err != nil {
 			return s3response.CompleteMultipartUploadResult{}, "", err
 		}
 		reserved = &r
-		backend.AnnounceVersionID(ctx, r.VersionID)
+		report(r.VersionID)
 	}
+	report("")
 
 	// The winner alone needs the parts' trees: the object's digest is
 	// assembled from them, and a non-final part hashed at a wrong assumed
@@ -954,7 +980,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 		return nil
 	})
 	if errors.Is(err, errReservationSuperseded) {
-		b.logger.Info("multipart completion refused: its announced version was superseded during the completion",
+		b.logger.Info("multipart completion refused: its reported version was superseded during the completion",
 			zap.String("key", key), zap.String("uploadID", uploadID), zap.String("versionID", reserved.VersionID))
 	}
 	if err != nil {

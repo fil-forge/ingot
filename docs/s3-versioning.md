@@ -356,18 +356,20 @@ depends on this: a pre-versioning object must list *below* later numbered versio
 commit fails or retries, the seq is a gap; gaps are harmless (`architecture.md` §3).
 
 **Reserved seq.** A multipart Complete in an Enabled bucket allocates its seq and mints its id
-before it accepts the parts, outside the lock, and announces the id to versitygw
-(`backend.AnnounceVersionID`). versitygw may commit a slow Complete's response headers before the
-completion finishes, and S3 sends `x-amz-version-id` with them. The announced id is binding, so
-the commit installs it unchanged, and under the lock refuses it (`errReservationSuperseded`, a
-retryable InternalError that reopens the upload) when:
+before it accepts the parts, outside the lock, and reports the id to versitygw
+(`backend.CompleteMultipartUploadReporter`). A slow Complete's response commits its headers before
+the completion finishes, after waiting for the report, and S3 sends `x-amz-version-id` with them.
+The reported id is binding, so the commit installs it unchanged, and under the lock refuses it
+(`errReservationSuperseded`, a retryable InternalError that reopens the upload) when:
 
 - the key's current version has a larger seq: another write to the key committed during the
   Complete, and the reservation can no longer be the newest version (invariant 2); or
 - the bucket is no longer Enabled, so the version would be null.
 
 The client's retry reserves a fresh seq. Unversioned and suspended buckets send no version id, so
-their Completes allocate under the lock as every other write does.
+their Completes report `""` and allocate under the lock as every other write does. So does a
+Complete that waited on another Complete of its upload: it reports `""` before waiting, and if the
+other one fails and it commits instead, its id was never sent.
 
 ### 5.2 Supersession
 

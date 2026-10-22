@@ -21,11 +21,11 @@ import (
 
 // TestForgeCompleteKeepalive: a CompleteMultipartUpload that runs past the
 // keepalive streams its response as S3 does, with x-amz-version-id in the
-// early 200's headers, newline padding, then the result. The config
-// (testdata/config-mpkeepalive.yaml) sets a 100ms keepalive and 64 KiB blobs,
-// so the Complete announces its version id inside the interval and accepts
-// its parts' blobs past it; the idempotent re-Complete reads a few rows and
-// may finish within it. Both report the version the bucket holds.
+// early 200's headers, newline padding, then the result. The config's 1ms
+// keepalive (testdata/config-mpkeepalive.yaml) passes long before the
+// Complete reports its version id, so the headers carry the id only because
+// they wait for the report. The idempotent re-Complete reads a few rows and
+// may finish within the interval. Both report the version the bucket holds.
 func TestForgeCompleteKeepalive(t *testing.T) {
 	ctx := t.Context()
 	s, endpoint := forgeStack(t, withCompleteKeepaliveConfig())

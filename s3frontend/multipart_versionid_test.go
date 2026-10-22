@@ -8,16 +8,16 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
-	"github.com/fil-forge/versitygw/backend"
 	"github.com/fil-forge/versitygw/s3response"
 
 	"github.com/fil-forge/ingot/inmem"
 	"github.com/fil-forge/ingot/registry"
 )
 
-// A multipart Complete in an Enabled bucket announces its version id before
-// it accepts the parts (backend.AnnounceVersionID), so versitygw can send
-// x-amz-version-id with a streamed response's early 200, as S3 does.
+// A multipart Complete reports its version id before it accepts the parts
+// (backend.CompleteMultipartUploadReporter), so versitygw can send
+// x-amz-version-id with a streamed response's early 200, as S3 does. An
+// Enabled bucket's Complete reports the id it reserved; the others report "".
 
 // hookBeforePartTrees is a multipart store that runs hook once, right
 // before its next ListPartTrees: the point in Complete after the version id
@@ -48,21 +48,31 @@ func newHookedCompleteBackend(t *testing.T) (*Backend, *hookBeforePartTrees) {
 	return b, mp
 }
 
-// completeAnnounced completes an upload under a context that records every
-// announced version id.
+// completeAnnounced completes an upload, recording every version id it
+// reports.
 func completeAnnounced(t *testing.T, b *Backend, key, uploadID string, parts []types.CompletedPart) (announced []string, versionID string, err error) {
 	t.Helper()
-	bucket := "bk"
-	ctx := backend.ContextWithVersionIDAnnouncer(context.Background(), func(id string) {
+	return completeReporting(t, b, key, uploadID, parts, func(id string) {
 		announced = append(announced, id)
 	})
-	_, versionID, err = b.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+}
+
+// completeReporting completes an upload with report as its version id
+// callback.
+func completeReporting(t *testing.T, b *Backend, key, uploadID string, parts []types.CompletedPart, report func(string)) (announced []string, versionID string, err error) {
+	t.Helper()
+	bucket := "bk"
+	var reported []string
+	_, versionID, err = b.CompleteMultipartUploadReportingVersionID(context.Background(), &s3.CompleteMultipartUploadInput{
 		Bucket:          &bucket,
 		Key:             &key,
 		UploadId:        &uploadID,
 		MultipartUpload: &types.CompletedMultipartUpload{Parts: parts},
+	}, func(id string) {
+		reported = append(reported, id)
+		report(id)
 	})
-	return announced, versionID, err
+	return reported, versionID, err
 }
 
 // currentVersionID is the version id HEAD reports for key's current version.
@@ -112,7 +122,7 @@ func TestCompleteAnnouncesTheVersionItCommits(t *testing.T) {
 	}
 }
 
-func TestCompleteAnnouncesNothingOutsideAnEnabledBucket(t *testing.T) {
+func TestCompleteReportsNoVersionOutsideAnEnabledBucket(t *testing.T) {
 	for name, status := range map[string]types.BucketVersioningStatus{
 		"unversioned": "",
 		"suspended":   types.BucketVersioningStatusSuspended,
@@ -129,8 +139,8 @@ func TestCompleteAnnouncesNothingOutsideAnEnabledBucket(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Complete: %v", err)
 			}
-			if len(announced) != 0 || versionID != "" {
-				t.Fatalf("announced %q, returned %q; want neither", announced, versionID)
+			if !slices.Equal(announced, []string{""}) || versionID != "" {
+				t.Fatalf("reported %q, returned %q; want one empty report and no version", announced, versionID)
 			}
 		})
 	}
@@ -191,13 +201,13 @@ func TestCompleteRefusedWhenVersioningIsSuspendedDuringIt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("retried Complete: %v", err)
 	}
-	if len(announced) != 0 || versionID != "" {
-		t.Fatalf("retry in the suspended bucket announced %q and returned %q, want neither", announced, versionID)
+	if !slices.Equal(announced, []string{""}) || versionID != "" {
+		t.Fatalf("retry in the suspended bucket reported %q and returned %q, want one empty report and no version", announced, versionID)
 	}
 }
 
 // An idempotent re-Complete replays the version the first Complete
-// committed: the same id, announced at once, in an Enabled bucket, and no id
+// committed: the same id, reported at once, in an Enabled bucket, and no id
 // in the others, whose first Complete sends none either.
 func TestReCompleteReplaysTheVersionID(t *testing.T) {
 	for name, status := range map[string]types.BucketVersioningStatus{
@@ -227,13 +237,43 @@ func TestReCompleteReplaysTheVersionID(t *testing.T) {
 			if again != first {
 				t.Fatalf("re-Complete returned version %q, want the first Complete's %q", again, first)
 			}
-			var want []string
-			if first != "" {
-				want = []string{first}
-			}
+			want := []string{first}
 			if !slices.Equal(announced, want) {
 				t.Fatalf("re-Complete announced %q, want %q", announced, want)
 			}
 		})
+	}
+}
+
+// A Complete that finds another Complete of its upload in progress reports
+// "" before it waits, since the winner's id isn't known yet. When the winner
+// fails and this caller then wins the latch, it commits a version of its
+// own, under no reservation: its report has already gone out.
+func TestCompleteThatWaitsOnTheWinnerReportsNoVersion(t *testing.T) {
+	b, mp := newHookedCompleteBackend(t)
+	setVersioning(t, b, types.BucketVersioningStatusEnabled)
+	key := "loser"
+	uploadID, parts := completeTwoParts(t, b, key)
+	ctx := context.Background()
+	if won, err := mp.LatchSession(ctx, uploadID, registry.SessionOpen, registry.SessionCompleting); err != nil || !won {
+		t.Fatalf("latch as another Complete: won=%v err=%v", won, err)
+	}
+	// The other Complete fails once this one has reported, reopening the
+	// upload as its revert does.
+	reopen := func(string) {
+		if won, err := mp.LatchSession(ctx, uploadID, registry.SessionCompleting, registry.SessionOpen); err != nil || !won {
+			t.Errorf("reopen as the failed Complete: won=%v err=%v", won, err)
+		}
+	}
+
+	reported, versionID, err := completeReporting(t, b, key, uploadID, parts, reopen)
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if !slices.Equal(reported, []string{""}) {
+		t.Fatalf("reported %q, want one empty report", reported)
+	}
+	if versionID == "" || currentVersionID(t, b, key) != versionID {
+		t.Fatalf("Complete returned version %q, current is %q; want the same non-empty id", versionID, currentVersionID(t, b, key))
 	}
 }

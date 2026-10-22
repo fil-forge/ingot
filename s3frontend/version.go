@@ -308,19 +308,19 @@ func (b *Backend) commitVersion(ctx context.Context, bucketState *registry.State
 }
 
 // versionReservation is a version's seq and id, taken before the commit
-// lock by reserveVersion so that a multipart Complete can announce the id
+// lock by reserveVersion so that a multipart Complete can report the id
 // while it still has parts to accept.
 type versionReservation struct {
 	// Seq is the reserved ordinal.
 	Seq uint64
-	// VersionID is the id minted from Seq, as announced.
+	// VersionID is the id minted from Seq, as reported.
 	VersionID string
 }
 
 // errReservationSuperseded refuses a commit under a reserved version that
 // can no longer be the key's newest: another write to the key committed
 // with a later seq, or the bucket stopped being Enabled so the version would
-// be null. The announced id can't change, so the write fails; it is not an
+// be null. The reported id can't change, so the write fails; it is not an
 // S3 error, so the client sees a retryable InternalError.
 var errReservationSuperseded = errors.New("reserved version superseded")
 
