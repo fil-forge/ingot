@@ -423,13 +423,14 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 	if moved == 0 {
 		// The row is no longer this write's: a later upload of the part
 		// number replaced it, or a teardown took the session, while the
-		// blobs were parking. The replacer recorded their releases, but a
-		// park settles any pending release of its digest as the write's own
-		// (settleRelease), so that record may be gone. The obligation is
-		// recorded again here, now that the park is done and nothing of
-		// this write's holds the files: a blob the replacement or another
-		// part still names waits on that reference, and one the session
-		// has claimed is stale.
+		// blobs were parking. The replacer recorded their releases, and the
+		// park left those records standing (awaitRelease), so the blobs go
+		// whatever happens to this write from here. Recorded again here, a
+		// no-op beside a standing record, they run now rather than on the
+		// sweeper's next pass, the park being done and nothing of this
+		// write's holding the files: a blob the replacement or another part
+		// still names waits on that reference, and one the session has
+		// claimed is stale.
 		lost, err := b.enqueuePartReleases(ctx, space, part.BlobDigests, nil)
 		if err != nil {
 			return nil, fmt.Errorf("s3frontend: record replaced part releases: %w", err)
@@ -1208,8 +1209,9 @@ func (b *Backend) parkBlob(ctx context.Context, space did.DID, blob msbucket.Blo
 
 	digest := blob.Digest
 	// Whatever the rows say, no release of this digest may be running
-	// while the blob is parked or reused (see settleRelease).
-	settled, err := b.settleRelease(ctx, space, blob.Digest)
+	// while the blob is parked or reused; one not yet started is left to
+	// the part row (see awaitRelease).
+	settled, err := b.awaitRelease(ctx, space, blob.Digest)
 	if err != nil {
 		return err
 	}
@@ -1312,10 +1314,10 @@ func (b *Backend) recordStreamedPark(ctx context.Context, space did.DID, blob ms
 	unlock := b.blobKeys.Lock(blobKey(space, blob.Digest))
 	defer unlock()
 	// A release of the same digest that ran while the stream was in flight
-	// may have taken what it parked (see settleRelease): the stream is then
+	// may have taken what it parked (see awaitRelease): the stream is then
 	// given up and the blob parked afresh from its spool file, which the
 	// write still holds.
-	settled, err := b.settleRelease(ctx, space, blob.Digest)
+	settled, err := b.awaitRelease(ctx, space, blob.Digest)
 	if err != nil {
 		return err
 	}

@@ -1192,3 +1192,78 @@ func TestConcurrentAddBlobClaimsLive(t *testing.T) {
 		t.Fatalf("claims on the first digest = %d, %v; want 20", c, err)
 	}
 }
+
+// TestGetReleaseWaitsForTheClaimKeyLockLive: the release lookup a part's
+// park makes is serialised with the start of that release. A start in
+// flight holds the claim-key lock until it commits, so the lookup waits and
+// then reads the record started, rather than read it pending a moment
+// before the start commits and let the part reuse a blob the release then
+// removes.
+//
+//	INGOT_TEST_DSN=postgres://... GOWORK=off go test ./registry/ -run GetReleaseWaits -v
+func TestGetReleaseWaitsForTheClaimKeyLockLive(t *testing.T) {
+	dsn := os.Getenv("INGOT_TEST_DSN")
+	if dsn == "" {
+		t.Skip("set INGOT_TEST_DSN to run the live Postgres store test")
+	}
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("pool: %v", err)
+	}
+	defer pool.Close()
+	if err := migrations.Up(ctx, pool, zaptest.NewLogger(t)); err != nil {
+		t.Fatalf("migrations: %v", err)
+	}
+	r := registry.NewPostgres(pool)
+	space := testutil.RandomDID(t)
+	d := liveDigest(t, "get-release-waits")
+	if err := r.EnqueueRelease(ctx, space, d, time.Now()); err != nil {
+		t.Fatalf("EnqueueRelease: %v", err)
+	}
+	t.Cleanup(func() { _ = r.DeleteRelease(context.Background(), space, d) })
+
+	// A start in flight: the claim-key lock held, the record marked started,
+	// the transaction open.
+	start, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer start.Rollback(ctx)
+	if _, err := start.Exec(ctx,
+		`SELECT pg_advisory_xact_lock(hashtextextended($1 || ':' || encode($2, 'hex'), 0))`,
+		space.String(), []byte(d)); err != nil {
+		t.Fatalf("lock claim key: %v", err)
+	}
+	if _, err := start.Exec(ctx,
+		`UPDATE ingot.blob_release_intents SET started_at = now() WHERE space = $1 AND digest = $2`,
+		space, d); err != nil {
+		t.Fatalf("mark started: %v", err)
+	}
+
+	type lookup struct {
+		pr  *registry.PendingRelease
+		err error
+	}
+	done := make(chan lookup, 1)
+	go func() {
+		pr, err := r.GetRelease(ctx, space, d)
+		done <- lookup{pr, err}
+	}()
+	select {
+	case got := <-done:
+		t.Fatalf("GetRelease returned %+v, %v while a start held the claim-key lock", got.pr, got.err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	if err := start.Commit(ctx); err != nil {
+		t.Fatalf("commit start: %v", err)
+	}
+	select {
+	case got := <-done:
+		if got.err != nil || got.pr.StartedAt.IsZero() {
+			t.Fatalf("GetRelease after the start committed = %+v, %v; want the record started", got.pr, got.err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("GetRelease did not return once the start committed")
+	}
+}

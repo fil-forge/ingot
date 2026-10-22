@@ -1804,6 +1804,37 @@ func (r *Postgres) StartRelease(ctx context.Context, space did.DID, digest multi
 	return ReleaseStarted, nil
 }
 
+func (r *Postgres) GetRelease(ctx context.Context, space did.DID, digest multihash.Multihash) (*PendingRelease, error) {
+	// Read under the claim-key lock, in a transaction of its own that
+	// changes nothing: a StartRelease in flight holds the lock until it
+	// commits, so the record read here is pending only if no release of it
+	// has started. A plain read could see a record a start is about to
+	// commit, and let a write reuse a blob the release then removes.
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("registry: get release: begin: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	if err := lockClaimKey(ctx, tx, space, digest); err != nil {
+		return nil, err
+	}
+	pr := PendingRelease{Space: space, Digest: multihash.Multihash(bytes.Clone(digest))}
+	var started *time.Time
+	err = tx.QueryRow(ctx,
+		`SELECT not_before, started_at FROM ingot.blob_release_intents WHERE space = $1 AND digest = $2`,
+		space, digest).Scan(&pr.NotBefore, &started)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("registry: get release: %w", err)
+	}
+	if started != nil {
+		pr.StartedAt = *started
+	}
+	return &pr, nil
+}
+
 func (r *Postgres) ReleasingDigests(ctx context.Context, space did.DID, digests []multihash.Multihash) (map[string]bool, error) {
 	out := map[string]bool{}
 	if len(digests) == 0 {
