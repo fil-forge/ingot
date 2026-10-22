@@ -304,6 +304,44 @@ type discardedVersion struct {
 // then taken conditionally (see addClaims), and the commit fails with
 // registry.ErrClaimGone if the source is gone.
 func (b *Backend) commitVersion(ctx context.Context, bucketState *registry.State, key string, mf *msbucket.ObjectManifest, blobs msbucket.BlobRefs, initState *msbucket.VersionState, pinned bool, preCheck func(superseded *msbucket.ObjectManifest) error) (msbucket.VersionNode, registry.VersioningState, error) {
+	return b.commitVersionAt(ctx, bucketState, key, mf, blobs, initState, pinned, nil, preCheck)
+}
+
+// versionReservation is a version's seq and id, taken before the commit
+// lock by reserveVersion so that a multipart Complete can announce the id
+// while it still has parts to accept.
+type versionReservation struct {
+	// Seq is the reserved ordinal.
+	Seq uint64
+	// VersionID is the id minted from Seq, as announced.
+	VersionID string
+}
+
+// errReservationSuperseded refuses a commit under a reserved version that
+// can no longer be the key's newest: another write to the key committed
+// with a later seq, or the bucket stopped being Enabled so the version would
+// be null. The announced id can't change, so the write fails; it is not an
+// S3 error, so the client sees a retryable InternalError.
+var errReservationSuperseded = errors.New("reserved version superseded")
+
+// reserveVersion allocates a version seq and mints its id ahead of the
+// commit, for an Enabled bucket. Only commitVersionAt may install it, and it
+// refuses to once the reservation is superseded (errReservationSuperseded).
+// A reservation that never commits leaves a harmless seq gap.
+func (b *Backend) reserveVersion(ctx context.Context, bucket string) (versionReservation, error) {
+	seq, err := b.reg.AllocVersionSeq(ctx, bucket)
+	if err != nil {
+		return versionReservation{}, fmt.Errorf("s3frontend: reserve version seq: %w", err)
+	}
+	return versionReservation{Seq: seq, VersionID: mintVersionID(seq)}, nil
+}
+
+// commitVersionAt is commitVersion under a reserved version (reserveVersion)
+// when reserved is non-nil. Under the lock it re-checks that the
+// reservation is still the key's newest version in an Enabled bucket, which
+// keeps invariant 2 of docs/s3-versioning.md §2.4 although the seq was
+// allocated outside the lock.
+func (b *Backend) commitVersionAt(ctx context.Context, bucketState *registry.State, key string, mf *msbucket.ObjectManifest, blobs msbucket.BlobRefs, initState *msbucket.VersionState, pinned bool, reserved *versionReservation, preCheck func(superseded *msbucket.ObjectManifest) error) (msbucket.VersionNode, registry.VersioningState, error) {
 	var node msbucket.VersionNode
 	var effState registry.VersioningState
 	err := b.txns.WithTx(ctx, bucketState.Name, func(ctx context.Context, tx *bucketop.Tx) (cid.Cid, error) {
@@ -313,13 +351,23 @@ func (b *Backend) commitVersion(ctx context.Context, bucketState *registry.State
 
 		// The ordinal is allocated inside the critical section so seq order
 		// matches commit order per bucket; a failed commit leaves a harmless gap.
-		seq, err := b.reg.AllocVersionSeq(ctx, st.Name)
-		if err != nil {
-			return cid.Undef, fmt.Errorf("alloc version seq: %w", err)
-		}
+		// A reserved ordinal was allocated earlier, and is checked against the
+		// key's current version below.
+		var seq uint64
+		var err error
 		vid := registry.NullVersionID
-		if st.Versioning == registry.VersioningEnabled {
-			vid = mintVersionID(seq)
+		if reserved != nil {
+			if st.Versioning != registry.VersioningEnabled {
+				return cid.Undef, errReservationSuperseded
+			}
+			seq, vid = reserved.Seq, reserved.VersionID
+		} else {
+			if seq, err = b.reg.AllocVersionSeq(ctx, st.Name); err != nil {
+				return cid.Undef, fmt.Errorf("alloc version seq: %w", err)
+			}
+			if st.Versioning == registry.VersioningEnabled {
+				vid = mintVersionID(seq)
+			}
 		}
 		mf.Seq, mf.VersionID = seq, vid
 		// The body's blob list: Head inline, the rest as extent blocks
@@ -366,6 +414,12 @@ func (b *Backend) commitVersion(ctx context.Context, bucketState *registry.State
 			// new key — no supersession
 		default:
 			return cid.Undef, fmt.Errorf("mst get prior: %w", gerr)
+		}
+
+		// A key's current version holds its largest seq (§2.4 invariant 2). A
+		// write that committed during a reservation holds a larger one.
+		if reserved != nil && superseded != nil && superseded.Seq > seq {
+			return cid.Undef, errReservationSuperseded
 		}
 
 		// Race-safe re-check of the caller's preconditions against the current

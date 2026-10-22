@@ -116,6 +116,15 @@ type Config struct {
 	// allocations.
 	MultipartSessionTTL string `mapstructure:"multipart_session_ttl" yaml:"multipart_session_ttl"`
 
+	// CompleteMultipartKeepalive keeps a slow CompleteMultipartUpload's
+	// connection alive, as S3 does (Go duration string): once the completion
+	// has run this long, the response commits to 200 OK and sends whitespace
+	// at this interval until the result ends the body. A client's read
+	// timeout (60 s for the AWS CLI) would otherwise abandon a completion
+	// that goes on to commit. Empty → default 10s; a negative duration turns
+	// it off.
+	CompleteMultipartKeepalive string `mapstructure:"complete_multipart_keepalive" yaml:"complete_multipart_keepalive"`
+
 	// ReleaseGrace delays each blob release (crypto-shred + location delete +
 	// network remove + local-copy removal) this long past the drop of its
 	// last reference claim (Go duration string), so in-flight readers holding
@@ -240,6 +249,16 @@ func (c Config) ServerConfig() (ServerConfig, error) {
 			return ServerConfig{}, fmt.Errorf("ingot: parse multipart_session_ttl %q: %w", c.MultipartSessionTTL, err)
 		}
 	}
+	mpKeepalive := 10 * time.Second
+	if c.CompleteMultipartKeepalive != "" {
+		mpKeepalive, err = time.ParseDuration(c.CompleteMultipartKeepalive)
+		if err != nil {
+			return ServerConfig{}, fmt.Errorf("ingot: parse complete_multipart_keepalive %q: %w", c.CompleteMultipartKeepalive, err)
+		}
+		if mpKeepalive < 0 {
+			mpKeepalive = 0
+		}
+	}
 	releaseGrace := 60 * time.Second
 	if c.ReleaseGrace != "" {
 		releaseGrace, err = time.ParseDuration(c.ReleaseGrace)
@@ -292,8 +311,9 @@ func (c Config) ServerConfig() (ServerConfig, error) {
 		ShipCatalog:      shipDefault(c.CatalogPlane.Ship),
 		RetainCatalog:    firstNonZeroInt(c.CatalogPlane.Retain, c.Retain),
 
-		MultipartSessionTTL: mpTTL,
-		ReleaseGrace:        releaseGrace,
+		MultipartSessionTTL:        mpTTL,
+		CompleteMultipartKeepalive: mpKeepalive,
+		ReleaseGrace:               releaseGrace,
 
 		LocalBlobMaxBytes:  c.LocalBlobMaxBytes,
 		CacheMinResidency:  cacheMinResidency,

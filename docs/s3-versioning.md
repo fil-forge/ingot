@@ -234,11 +234,14 @@ must also register `ObjectLeaf` and `VersionNode`).
 2. **`Current.Seq` is the maximum seq among the key's versions.** Writes always install the newest
    version as `Current`; deleting the current version promotes the largest remaining seq (§7.2).
 3. **`Prev` holds exactly the noncurrent versions**, keyed newest-first.
-4. **`seq` is strictly increasing in commit order per bucket.** Allocation happens inside the
-   per-bucket critical section (§5.1); in-process the `bucketop` mutex serializes it, and the
-   `CASRoot` conflict behavior covers cross-process races.
+4. **`seq` is strictly increasing in commit order per bucket, except for a reserved seq.**
+   Allocation happens inside the per-bucket critical section (§5.1); in-process the `bucketop`
+   mutex serializes it, and the `CASRoot` conflict behavior covers cross-process races. A
+   multipart Complete in an Enabled bucket reserves its seq before it accepts the parts (§5.1),
+   so writes to other keys can commit with later seqs ahead of it. Within a key, invariant 2
+   still holds: the commit refuses a reservation older than the key's current version.
    `seq` starts at 1; 0 is reserved to mean "none" (`NullSeq`).
-5. **A version's identity never changes.** `Seq`/`VersionID` are minted once at commit; promotion
+5. **A version's identity never changes.** `Seq`/`VersionID` are minted once; promotion
    moves a `VersionNode` between `Prev` and `Current` without rewriting its manifest.
 6. **A manifest-arm value holds exactly one version.** The leaf arm appears with the key's
    second version (§5.2) and persists until the key itself is deleted: version-scoped deletes
@@ -351,6 +354,20 @@ Every write allocates a seq — including unversioned/suspended null writes — 
 has a real position if the bucket is later Enabled (`Versioning_PutObject_null_versionId_obj`
 depends on this: a pre-versioning object must list *below* later numbered versions). If the
 commit fails or retries, the seq is a gap; gaps are harmless (`architecture.md` §3).
+
+**Reserved seq.** A multipart Complete in an Enabled bucket allocates its seq and mints its id
+before it accepts the parts, outside the lock, and announces the id to versitygw
+(`backend.AnnounceVersionID`). versitygw may commit a slow Complete's response headers before the
+completion finishes, and S3 sends `x-amz-version-id` with them. The announced id is binding, so
+the commit installs it unchanged, and under the lock refuses it (`errReservationSuperseded`, a
+retryable InternalError that reopens the upload) when:
+
+- the key's current version has a larger seq: another write to the key committed during the
+  Complete, and the reservation can no longer be the newest version (invariant 2); or
+- the bucket is no longer Enabled, so the version would be null.
+
+The client's retry reserves a fresh seq. Unversioned and suspended buckets send no version id, so
+their Completes allocate under the lock as every other write does.
 
 ### 5.2 Supersession
 

@@ -97,6 +97,7 @@ func TestValidate_RequiredFields(t *testing.T) {
 		{"revocation did without url", func(c *Config) { c.RevocationServiceDID = "did:web:swarf.example" }, "revocation_service_url and revocation_service_did must be set together"},
 		{"bad seal_age", func(c *Config) { c.SealAge = "not-a-duration" }, "parse seal_age"},
 		{"bad release_grace", func(c *Config) { c.ReleaseGrace = "soon" }, "parse release_grace"},
+		{"bad complete_multipart_keepalive", func(c *Config) { c.CompleteMultipartKeepalive = "soon" }, "parse complete_multipart_keepalive"},
 		{"negative local_blob_max_bytes", func(c *Config) { c.LocalBlobMaxBytes = -1 }, "local_blob_max_bytes -1: must not be negative"},
 		{"bad cache_min_residency", func(c *Config) { c.CacheMinResidency = "soon" }, "parse cache_min_residency"},
 		{"negative cache_min_residency", func(c *Config) { c.CacheMinResidency = "-1m" }, `cache_min_residency "-1m": must not be negative`},
@@ -444,5 +445,28 @@ func TestServerConfig_AllowNoneEncryption(t *testing.T) {
 		if sc.AllowNoneEncryption != allow {
 			t.Fatalf("AllowNoneEncryption = %v, want %v", sc.AllowNoneEncryption, allow)
 		}
+	}
+}
+
+func TestServerConfig_CompleteMultipartKeepalive(t *testing.T) {
+	for name, tc := range map[string]struct {
+		set  string
+		want time.Duration
+	}{
+		"unset is the default":  {set: "", want: 10 * time.Second},
+		"explicit":              {set: "2s", want: 2 * time.Second},
+		"negative turns it off": {set: "-1s", want: 0},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := validConfig(t)
+			cfg.CompleteMultipartKeepalive = tc.set
+			sc, err := cfg.ServerConfig()
+			if err != nil {
+				t.Fatalf("ServerConfig: %v", err)
+			}
+			if sc.CompleteMultipartKeepalive != tc.want {
+				t.Fatalf("CompleteMultipartKeepalive = %v, want %v", sc.CompleteMultipartKeepalive, tc.want)
+			}
+		})
 	}
 }

@@ -745,7 +745,16 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 				// but no checksum: AWS omits it on the idempotent replay (for both
 				// COMPOSITE and FULL_OBJECT), unlike the first Complete.
 				res := s3response.CompleteMultipartUploadResult{Bucket: &bucket, Key: &key, ETag: &etagQ, ServerSideEncryption: encryptionFor(sess.Plaintext)}
-				return res, cur.CommittedVersionID, nil
+				// A null version is one the first Complete committed outside
+				// an Enabled bucket, and sent no id for.
+				versionid := cur.CommittedVersionID
+				if versionid == registry.NullVersionID {
+					versionid = ""
+				}
+				if versionid != "" {
+					backend.AnnounceVersionID(ctx, versionid)
+				}
+				return res, versionid, nil
 			}
 			if cur.State == registry.SessionOpen {
 				won, err := b.multipart.LatchSession(ctx, uploadID, registry.SessionOpen, registry.SessionCompleting)
@@ -791,6 +800,20 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 			_, _ = b.multipart.LatchSession(ctx, uploadID, registry.SessionCompleting, registry.SessionOpen)
 		}
 	}()
+
+	// An Enabled bucket's new version id goes out now, before the parts are
+	// accepted: versitygw may commit the response headers while the
+	// completion runs, and S3 sends x-amz-version-id with them. The commit
+	// then installs exactly this id, or fails (errReservationSuperseded).
+	var reserved *versionReservation
+	if bucketState.Versioning == registry.VersioningEnabled {
+		r, err := b.reserveVersion(ctx, bucket)
+		if err != nil {
+			return s3response.CompleteMultipartUploadResult{}, "", err
+		}
+		reserved = &r
+		backend.AnnounceVersionID(ctx, r.VersionID)
+	}
 
 	// The winner alone needs the parts' trees: the object's digest is
 	// assembled from them, and a non-final part hashed at a wrong assumed
@@ -894,7 +917,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 	// claims and drops in the swap. The conditional-write preconditions re-check
 	// under the lock so a racing writer can't slip between the pre-check above
 	// and the swap.
-	node, effState, err := b.commitVersion(ctx, bucketState, key, mf, blobs, initState, false, func(superseded *msbucket.ObjectManifest) error {
+	node, effState, err := b.commitVersionAt(ctx, bucketState, key, mf, blobs, initState, false, reserved, func(superseded *msbucket.ObjectManifest) error {
 		// The latch is re-checked under the bucket lock, where every
 		// teardown that takes a 'completing' row (DeleteBucket, the
 		// sweeper) latches it: a session taken while its blobs were
@@ -930,6 +953,10 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 		}
 		return nil
 	})
+	if errors.Is(err, errReservationSuperseded) {
+		b.logger.Info("multipart completion refused: its announced version was superseded during the completion",
+			zap.String("key", key), zap.String("uploadID", uploadID), zap.String("versionID", reserved.VersionID))
+	}
 	if err != nil {
 		return s3response.CompleteMultipartUploadResult{}, "", err
 	}

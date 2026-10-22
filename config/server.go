@@ -53,6 +53,12 @@ type ServerConfig struct {
 	// from under it. Zero → default 7 days; negative → sweeper disabled.
 	MultipartSessionTTL time.Duration
 
+	// CompleteMultipartKeepalive is the interval after which a slow
+	// CompleteMultipartUpload's response commits to 200 OK and streams
+	// whitespace until the result is ready. Config.ServerConfig() applies
+	// the 10s default; zero here turns it off.
+	CompleteMultipartKeepalive time.Duration
+
 	// ReleaseGrace delays each blob release this long past the drop of its
 	// last reference claim, so in-flight readers of the prior catalog root
 	// finish first; a reader still streaming when it ends fails at its next
