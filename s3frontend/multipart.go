@@ -324,41 +324,12 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 		}
 	}
 
-	// Capture the superseded part's blobs (if any) before overwriting, so
-	// last-write-wins doesn't strand them. A listing failure fails the
-	// upload: proceeding would silently strand the replaced part's blobs and
-	// key rows.
-	var superseded []mh.Multihash
+	// The parts so far place this one in the object (assumedPartOffset).
 	prior, err := b.multipart.ListParts(ctx, uploadID)
 	if err != nil {
-		return nil, fmt.Errorf("s3frontend: list parts before supersede: %w", err)
+		return nil, fmt.Errorf("s3frontend: list parts: %w", err)
 	}
-	for _, p := range prior {
-		if p.PartNumber == partNumber {
-			superseded = p.BlobDigests
-			break
-		}
-	}
-
 	space := sess.Space
-	// Record the superseded blobs' releases before anything is written, so
-	// no failure past this point can strand them. Until the new part row
-	// lands the old one still references them, which defers the release; a
-	// request that dies in between leaves records that resolve with the
-	// session (a claim at Complete makes them stale, an abort re-records
-	// them). A digest another part of the session also names (parts stored
-	// as received share the blobs of identical bytes) is recorded all the
-	// same: the release defers while that part references it and resolves
-	// with the session. Skipping it here would race a concurrent re-upload
-	// of the sibling, each seeing the other's old part and neither
-	// recording the release.
-	var superseding []registry.PendingRelease
-	if len(superseded) > 0 {
-		superseding, err = b.enqueuePartReleases(ctx, space, superseded, nil)
-		if err != nil {
-			return nil, fmt.Errorf("s3frontend: record superseded part releases: %w", err)
-		}
-	}
 	// The part's BLAKE3 tree, hashed at the offset the part is assumed to
 	// sit at in the object (see assumedPartOffset), whole chunks only, with
 	// the bytes either side of them kept raw; Complete merges the parts'
@@ -405,7 +376,19 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 	if tree != nil {
 		partTree = partTreeOf(tree.FinishRange())
 	}
-	if err := b.multipart.PutPart(ctx, part, partTree); err != nil {
+	// Recording the part replaces any prior row for the part number, and
+	// records the releases of the blobs that row named and this part does
+	// not, in the same write: nothing can separate the two, and a
+	// concurrent upload of the same part number that wrote its row after
+	// the listing above is replaced and released like any other. A digest
+	// another part of the session also names (parts stored as received
+	// share the blobs of identical bytes) is recorded all the same: the
+	// release defers while that part references it and resolves with the
+	// session (a claim at Complete makes it stale, an abort re-records it).
+	// Skipping it would race a concurrent re-upload of the sibling, each
+	// seeing the other's old part and neither recording the release.
+	superseding, err := b.multipart.PutPart(ctx, part, partTree)
+	if err != nil {
 		// No part row points at the spooled blobs now, whatever went wrong:
 		// the session was completed, aborted or torn down after this upload
 		// was admitted (ErrNotFound), or the write failed. Their release is
@@ -429,14 +412,29 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 	// The part row is recorded first so a crash mid-park leaves re-drivable
 	// spooled intents. Only once every blob is parked does the part become
 	// 'parked', which is what queues it for acceptance; a part left
-	// 'spooled' is Complete's to finish. A later upload of this part number
-	// may have replaced the row meanwhile, in which case it is that upload's
-	// to mark.
+	// 'spooled' is Complete's to finish.
 	if err := b.parkBlobs(ctx, space, spooled); err != nil {
 		return nil, fmt.Errorf("s3frontend: park part blobs: %w", err)
 	}
-	if _, err := b.multipart.MoveParts(ctx, []registry.MultipartPart{part}, registry.PartSpooled, registry.PartParked); err != nil {
+	moved, err := b.multipart.MoveParts(ctx, []registry.MultipartPart{part}, registry.PartSpooled, registry.PartParked)
+	if err != nil {
 		return nil, fmt.Errorf("s3frontend: mark part parked: %w", err)
+	}
+	if moved == 0 {
+		// The row is no longer this write's: a later upload of the part
+		// number replaced it, or a teardown took the session, while the
+		// blobs were parking. The replacer recorded their releases, but a
+		// park settles any pending release of its digest as the write's own
+		// (settleRelease), so that record may be gone. The obligation is
+		// recorded again here, now that the park is done and nothing of
+		// this write's holds the files: a blob the replacement or another
+		// part still names waits on that reference, and one the session
+		// has claimed is stale.
+		lost, err := b.enqueuePartReleases(ctx, space, part.BlobDigests, nil)
+		if err != nil {
+			return nil, fmt.Errorf("s3frontend: record replaced part releases: %w", err)
+		}
+		superseding = append(superseding, lost...)
 	}
 	b.nudgeAcceptor(uploadID)
 	b.releaseNow(ctx, superseding)

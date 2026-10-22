@@ -242,7 +242,7 @@ func TestParts_OrderedAndCascade(t *testing.T) {
 	}
 
 	// PutPart against a missing session is rejected (FK).
-	if err := m.PutPart(ctx, registry.MultipartPart{UploadID: "missing", PartNumber: 1, ETagMD5: []byte("m"), BlobDigests: []multihash.Multihash{[]byte("d")}}, nil); err != registry.ErrNotFound {
+	if _, err := m.PutPart(ctx, registry.MultipartPart{UploadID: "missing", PartNumber: 1, ETagMD5: []byte("m"), BlobDigests: []multihash.Multihash{[]byte("d")}}, nil); err != registry.ErrNotFound {
 		t.Fatalf("PutPart missing session err = %v, want ErrNotFound", err)
 	}
 
@@ -502,7 +502,7 @@ func count(t *testing.T, m *MemStore, space did.DID, digest []byte) int {
 
 func mustPutPart(t *testing.T, m *MemStore, p registry.MultipartPart, tree *registry.PartTree) {
 	t.Helper()
-	if err := m.PutPart(context.Background(), p, tree); err != nil {
+	if _, err := m.PutPart(context.Background(), p, tree); err != nil {
 		t.Fatalf("PutPart: %v", err)
 	}
 }

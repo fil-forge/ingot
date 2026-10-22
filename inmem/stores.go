@@ -760,11 +760,12 @@ func (m *MemStore) DeleteSession(_ context.Context, uploadID string) error {
 	return nil
 }
 
-func (m *MemStore) PutPart(_ context.Context, p registry.MultipartPart, tree *registry.PartTree) error {
+func (m *MemStore) PutPart(_ context.Context, p registry.MultipartPart, tree *registry.PartTree) ([]registry.PendingRelease, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if s, ok := m.sessions[p.UploadID]; !ok || s.State != registry.SessionOpen {
-		return registry.ErrNotFound // FK to multipart_sessions, and open only
+	sess, ok := m.sessions[p.UploadID]
+	if !ok || sess.State != registry.SessionOpen {
+		return nil, registry.ErrNotFound // FK to multipart_sessions, and open only
 	}
 	if p.State == "" {
 		p.State = registry.PartSpooled
@@ -777,19 +778,37 @@ func (m *MemStore) PutPart(_ context.Context, p registry.MultipartPart, tree *re
 		byNum = map[int]registry.MultipartPart{}
 		m.parts[p.UploadID] = byNum
 	}
+	// The mutex serialises writes of one part number, so the row replaced
+	// is the one whose blobs' releases are recorded, as under the advisory
+	// lock in Postgres: one record per digest the replaced row named and
+	// this part does not, due now, with the part.
+	var released []registry.PendingRelease
+	if old, ok := byNum[p.PartNumber]; ok {
+		keep := map[string]bool{}
+		for _, d := range p.BlobDigests {
+			keep[string(d)] = true
+		}
+		for _, d := range old.BlobDigests {
+			if keep[string(d)] {
+				continue
+			}
+			keep[string(d)] = true
+			released = append(released, m.enqueueReleaseLocked(sess.Space, d, time.Now()))
+		}
+	}
 	byNum[p.PartNumber] = clonePart(p)
 	// The tree row follows the part row, as in Postgres.
 	trees := m.partTrees[p.UploadID]
 	if tree == nil {
 		delete(trees, p.PartNumber)
-		return nil
+		return released, nil
 	}
 	if trees == nil {
 		trees = map[int]*registry.PartTree{}
 		m.partTrees[p.UploadID] = trees
 	}
 	trees[p.PartNumber] = cloneTree(tree)
-	return nil
+	return released, nil
 }
 
 // MoveParts mirrors Postgres's guarded update: each row must still be in
