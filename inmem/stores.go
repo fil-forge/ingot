@@ -32,66 +32,62 @@ var (
 )
 
 // BlobRefStore ===============================================================
-func (m *MemStore) AddBlobClaim(_ context.Context, c registry.BlobClaim) error {
-	return m.AddBlobClaims(context.Background(), []registry.BlobClaim{c})
-}
+//
+// The index is written by CommitRoot (store.go) alone; the helpers below are
+// its steps, under the mutex.
 
-func (m *MemStore) AddBlobClaims(_ context.Context, claims []registry.BlobClaim) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	// Every digest is checked before any claim is recorded: a refusal
-	// records nothing.
-	for _, c := range claims {
-		if pr, ok := m.releases[locKey{c.Space, string(c.Digest)}]; ok && !pr.StartedAt.IsZero() {
-			return registry.ErrReleaseInProgress
-		}
-		if _, ok := m.locations[locKey{c.Space, string(c.Digest)}]; !ok {
-			return registry.ErrReleaseInProgress // released to completion since the write settled it
-		}
+// claimRefusedLocked is the check a claim of a new generation passes before
+// a commit records it: ErrReleaseInProgress while a started release holds
+// the digest, or when the space has no location for it (see
+// registry.RootCommit.Claims).
+func (m *MemStore) claimRefusedLocked(c registry.BlobClaim) error {
+	if pr, ok := m.releases[locKey{c.Space, string(c.Digest)}]; ok && !pr.StartedAt.IsZero() {
+		return registry.ErrReleaseInProgress
 	}
-	for _, c := range claims {
-		k := claimKey{string(c.Digest), c.Bucket, c.ObjectKey, c.VersionID}
-		cp := c
-		cp.Digest = bytes.Clone(c.Digest)
-		m.blobRefs[k] = cp
-		// Committed blobs' intents are published, atomically with the claim.
-		ik := locKey{c.Space, string(c.Digest)}
-		if in, ok := m.intents[ik]; ok && in.State != registry.IntentPublished {
-			in.State = registry.IntentPublished
-			in.UpdatedAt = time.Now()
-			m.intents[ik] = in
-		}
+	if _, ok := m.locations[locKey{c.Space, string(c.Digest)}]; !ok {
+		return registry.ErrReleaseInProgress // released to completion since the write settled it
 	}
 	return nil
 }
 
-func (m *MemStore) PinBlobClaims(_ context.Context, claims []registry.BlobClaim) (bool, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	// All or nothing: every digest is checked before any claim is written.
-	for _, c := range claims {
-		k := claimKey{string(c.Digest), c.Bucket, c.ObjectKey, c.VersionID}
-		if _, ok := m.blobRefs[k]; ok {
-			continue
-		}
-		if m.countClaimsLocked(c.Space, c.Digest) == 0 {
-			return false, nil
-		}
+// pinRefusedLocked reports whether a pinned claim finds no claim of the
+// space on its digest to join (see registry.RootCommit.Pins). A pin already
+// recorded is its own claim.
+func (m *MemStore) pinRefusedLocked(c registry.BlobClaim) bool {
+	if _, ok := m.blobRefs[claimKey{string(c.Digest), c.Bucket, c.ObjectKey, c.VersionID}]; ok {
+		return false
 	}
-	for _, c := range claims {
-		k := claimKey{string(c.Digest), c.Bucket, c.ObjectKey, c.VersionID}
-		cp := c
-		cp.Digest = bytes.Clone(c.Digest)
-		m.blobRefs[k] = cp
-	}
-	return true, nil
+	return m.countClaimsLocked(c.Space, c.Digest) == 0
 }
 
-func (m *MemStore) DeleteBlobClaim(_ context.Context, digest multihash.Multihash, bucket, objectKey, versionID string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	delete(m.blobRefs, claimKey{string(digest), bucket, objectKey, versionID})
-	return nil
+// addClaimLocked records one claim. A new generation's claim publishes the
+// digest's upload intent, atomically with the claim; a pin joins a claim
+// that did so already.
+func (m *MemStore) addClaimLocked(c registry.BlobClaim, publish bool) {
+	k := claimKey{string(c.Digest), c.Bucket, c.ObjectKey, c.VersionID}
+	cp := c
+	cp.Digest = bytes.Clone(c.Digest)
+	m.blobRefs[k] = cp
+	if !publish {
+		return
+	}
+	ik := locKey{c.Space, string(c.Digest)}
+	if in, ok := m.intents[ik]; ok && in.State != registry.IntentPublished {
+		in.State = registry.IntentPublished
+		in.UpdatedAt = time.Now()
+		m.intents[ik] = in
+	}
+}
+
+// dropClaimLocked deletes one claim and records the blob's release, due at
+// due, when the claim was the space's last on the digest (see
+// registry.RootCommit.Drops).
+func (m *MemStore) dropClaimLocked(d registry.ClaimDrop, due time.Time) {
+	delete(m.blobRefs, claimKey{string(d.Digest), d.Bucket, d.ObjectKey, d.VersionID})
+	if m.countClaimsLocked(d.Space, d.Digest) != 0 {
+		return
+	}
+	m.enqueueReleaseLocked(d.Space, d.Digest, due)
 }
 
 func (m *MemStore) CountClaims(_ context.Context, space did.DID, digest multihash.Multihash) (int, error) {
@@ -109,17 +105,6 @@ func (m *MemStore) countClaimsLocked(space did.DID, digest multihash.Multihash) 
 		}
 	}
 	return n
-}
-
-func (m *MemStore) DropClaimEnqueueRelease(_ context.Context, digest multihash.Multihash, bucket, objectKey, versionID string, space did.DID, notBefore time.Time) (bool, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	delete(m.blobRefs, claimKey{string(digest), bucket, objectKey, versionID})
-	if m.countClaimsLocked(space, digest) != 0 {
-		return false, nil
-	}
-	m.enqueueReleaseLocked(space, digest, notBefore)
-	return true, nil
 }
 
 // PendingReleaseStore =========================================================

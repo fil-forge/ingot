@@ -10,6 +10,8 @@ import (
 	"github.com/fil-forge/versitygw/backend"
 	"github.com/fil-forge/versitygw/s3err"
 
+	"github.com/fil-forge/ingot/registry"
+
 	"github.com/fil-forge/ingot/bucketop"
 )
 
@@ -89,6 +91,13 @@ func isNoSuchKey(err error) bool {
 func mapCommitError(err error, op string) error {
 	if errors.Is(err, bucketop.ErrBucketNotFound) {
 		return s3err.GetAPIError(s3err.ErrNoSuchBucket)
+	}
+	if errors.Is(err, registry.ErrReleaseInProgress) {
+		// A release of one of the body's digests started after the write
+		// settled it (settleRelease) and is removing the blob: the swap
+		// refused the claim and wrote nothing, and the client retries once
+		// the release has run.
+		return s3err.GetAPIError(s3err.ErrSlowDown)
 	}
 	// PreconditionFailedError, NoSuchVersionError, and InvalidArgumentError
 	// embed APIError but are distinct concrete types, so errors.As against

@@ -890,8 +890,8 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 	initState = applyTagsIfPresent(initState, tags)
 
 	// Commit through the §5 write rule (docs/s3-versioning.md): seq allocation,
-	// supersession per the bucket's versioning state, and the post-commit
-	// reference-index reconcile. The conditional-write preconditions re-check
+	// supersession per the bucket's versioning state, and the reference-index
+	// claims and drops in the swap. The conditional-write preconditions re-check
 	// under the lock so a racing writer can't slip between the pre-check above
 	// and the swap.
 	node, effState, err := b.commitVersion(ctx, bucketState, key, mf, blobs, initState, false, func(superseded *msbucket.ObjectManifest) error {

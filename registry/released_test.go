@@ -19,6 +19,7 @@ import (
 
 // releasedStore is what the released-pass query needs of a store.
 type releasedStore interface {
+	registry.Registry
 	registry.IntentStore
 	registry.LocationStore
 	registry.BlobRefStore
@@ -76,9 +77,7 @@ func runReleasedSuite(t *testing.T, st releasedStore) {
 	if err := st.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: claimed, Provider: "did:web:piri", URL: "https://piri/blob", Size: 7}); err != nil {
 		t.Fatalf("PutLocation: %v", err)
 	}
-	if err := st.AddBlobClaim(ctx, registry.BlobClaim{Digest: claimed, Bucket: "bk", ObjectKey: "k", VersionID: "v", Space: space}); err != nil {
-		t.Fatalf("AddBlobClaim: %v", err)
-	}
+	mustClaim(t, st, registry.BlobClaim{Digest: claimed, Bucket: "bk", ObjectKey: "k", VersionID: "v", Space: space})
 	pending := published("pending")
 	if err := st.EnqueueRelease(ctx, space, pending, time.Now().Add(time.Hour)); err != nil {
 		t.Fatalf("EnqueueRelease: %v", err)
