@@ -651,8 +651,9 @@ func TestRetrySweepOldestFirst(t *testing.T) {
 	s, err := Open(context.Background(), Config{
 		Dir:  t.TempDir(),
 		Meta: meta,
-		// No sweep runs on its own: the test runs them.
-		Catalog: PlaneConfig{SealBytes: 64, SealAge: time.Hour, Ship: true, ShipRetry: time.Hour,
+		// No sweep runs on its own (the first lands at a random point within
+		// ShipRetry): the test runs them.
+		Catalog: PlaneConfig{SealBytes: 64, SealAge: time.Hour, Ship: true, ShipRetry: 1000 * time.Hour,
 			Flush: func(_ context.Context, seg *Segment) (multihash.Multihash, error) {
 				mu.Lock()
 				tried = append(tried, seg.Seq())
@@ -713,14 +714,33 @@ func TestRetrySweepOldestFirst(t *testing.T) {
 	down.Store(false)
 	s.catalog.retryUnshipped()
 	meta.mu.Lock()
-	defer meta.mu.Unlock()
-	if len(meta.shipped) != 3 {
-		t.Fatalf("shipped %d segments, want 3", len(meta.shipped))
-	}
+	shippedSeqs := make([]uint64, len(meta.shipped))
 	for i, ev := range meta.shipped {
-		if ev.seq != seqs[i] {
-			t.Fatalf("shipped seqs %v, want %v in order", meta.shipped, seqs)
-		}
+		shippedSeqs[i] = ev.seq
+	}
+	meta.mu.Unlock()
+	if !slices.Equal(shippedSeqs, seqs) {
+		t.Fatalf("shipped seqs %v, want %v in order", shippedSeqs, seqs)
+	}
+
+	// A segment the sweep has shipped may still be queued: shipping it from
+	// the queue again must not reach Flush.
+	mu.Lock()
+	before := len(tried)
+	mu.Unlock()
+	s.catalog.catMu.RLock()
+	shipped := s.catalog.sealed[0]
+	s.catalog.catMu.RUnlock()
+	if !shipped.IsShipped() {
+		t.Fatalf("segment %d not shipped", shipped.Seq())
+	}
+	if !s.catalog.flushOne(shipped, queuedShipAttempts) {
+		t.Fatalf("flushOne on shipped segment %d reported it unshipped", shipped.Seq())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(tried) != before {
+		t.Fatalf("shipped segment %d went to Flush again", shipped.Seq())
 	}
 }
 

@@ -86,9 +86,9 @@ points only at nodes already materialized in a prior segment, so `AppendBatch`
 is called with the op-root alone. A flush error keeps the segment unshipped
 and retried (5 attempts, backoff 1s doubling to a 30s cap). After that, and for
 a segment a full queue turned away, the **retry sweep** takes over: every
-`ShipRetry` (1 minute by default) the flush worker tries the bucket's unshipped
-sealed segments again, oldest first, one attempt each, stopping at the first
-that fails. So a segment waits out an outage, or its space's missing ship
+`ShipRetry` (1 minute by default; the first sweep lands at a random point within
+it) the flush worker tries the bucket's unshipped sealed segments again, oldest
+first, one attempt each, stopping at the first that fails. So a segment waits out an outage, or its space's missing ship
 authority, without a restart. A bucket deleted
 while segments were queued has nowhere to ship, so the closure returns nil and
 the segment marks shipped and retires.
@@ -192,7 +192,7 @@ builds a `uploader.CARShard` from the `Segment` accessors, calls
 |---|---|
 | `manager.go` | `Manager` (per-bucket log, the production `blockstore.Log`): `ManagerConfig`, `OpenManager`, `AppendBatch`, `Get`, `Close`; `QuiesceBucketLog`, `ShippedSegmentDigests`, `RemoveBucketLog` (DeleteBucket's seams) |
 | `store.go` | `Store` (one bucket's catalog log): `Open`, `AppendBatch`, `Get`, `Close` |
-| `planelog.go` | `PlaneLog` (the pipeline): `openPlaneLog`, `Append`, `Get`, `Close`; `sealOpenIfDue`, `flushLoop`, `flushOne`, `runRetention`, `sealTickerLoop` |
+| `planelog.go` | `PlaneLog` (the pipeline): `openPlaneLog`, `Append`, `Get`, `Close`; `sealOpenIfDue`, `flushLoop`, `flushOne`, `retryUnshipped`, `runRetention`, `sealTickerLoop` |
 | `segment.go` | `Segment`: `createOpenSegment`, `append`, `seal`, `markShipped`, `retire`, `get`; `.idx`/`.ops` codecs |
 | `recovery.go` | `(*PlaneLog).recover` (disk vs `Meta` reconciliation for one bucket store) |
 | `types.go` | `State`, `SegmentMeta`, `Meta` |

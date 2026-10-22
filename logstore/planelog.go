@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"os"
 	"sync"
 	"time"
@@ -222,7 +223,7 @@ func (pl *PlaneLog) enqueueFlush(seg *Segment) {
 	select {
 	case pl.flushQ <- seg:
 	default:
-		pl.logger.Warn("logstore: flush queue full; the retry sweep will ship the segment",
+		pl.logger.Warn("logstore: flush queue full; the retry sweep (or, at close, the next start) will ship the segment",
 			zap.Stringer("plane", pl.plane), zap.Uint64("seq", seg.Seq()))
 	}
 }
@@ -314,11 +315,13 @@ const queuedShipAttempts = 5
 // doubling after each later one to a 30s cap. A var so tests can shorten it.
 var shipBackoff = time.Second
 
-// flushLoop drains the queue, shipping each sealed segment, and every
-// ShipRetry runs the retry sweep. Exits on close.
+// flushLoop drains the queue, shipping each sealed segment, and runs the
+// retry sweep ShipRetry after the previous one ends. The first sweep comes
+// at a random point within ShipRetry, so the buckets a startup opens
+// together don't all sweep at once. Exits on close.
 func (pl *PlaneLog) flushLoop() {
 	defer pl.wg.Done()
-	retry := time.NewTicker(pl.pc.ShipRetry)
+	retry := time.NewTimer(rand.N(pl.pc.ShipRetry))
 	defer retry.Stop()
 	for {
 		select {
@@ -331,6 +334,7 @@ func (pl *PlaneLog) flushLoop() {
 			pl.flushOne(seg, queuedShipAttempts)
 		case <-retry.C:
 			pl.retryUnshipped()
+			retry.Reset(pl.pc.ShipRetry)
 		}
 	}
 }
@@ -408,8 +412,12 @@ func (pl *PlaneLog) flushOne(seg *Segment, maxAttempts int) bool {
 			backoff *= 2
 		}
 	}
-	pl.logger.Error("logstore: ship exhausted retries; the retry sweep will try again",
-		zap.Stringer("plane", pl.plane), zap.Uint64("seq", seg.Seq()), zap.Int("attempts", maxAttempts))
+	// A sweep's single attempt is already logged above; only a queued ship
+	// running out is worth an error.
+	if maxAttempts > 1 {
+		pl.logger.Error("logstore: ship exhausted retries; the retry sweep will try again",
+			zap.Stringer("plane", pl.plane), zap.Uint64("seq", seg.Seq()), zap.Int("attempts", maxAttempts))
+	}
 	span.SetStatus(codes.Error, "ship exhausted retries")
 	return false
 }
