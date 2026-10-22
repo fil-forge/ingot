@@ -213,8 +213,8 @@ func (pl *PlaneLog) requestSeal() {
 }
 
 // enqueueFlush hands a sealed segment to the flush worker. No-op for a
-// non-shipping plane. Non-blocking: a full queue is logged and retried on
-// the next restart.
+// non-shipping plane. Non-blocking: a full queue is logged, and the retry
+// sweep ships the segment instead.
 func (pl *PlaneLog) enqueueFlush(seg *Segment) {
 	if pl.flushQ == nil {
 		return
@@ -222,7 +222,7 @@ func (pl *PlaneLog) enqueueFlush(seg *Segment) {
 	select {
 	case pl.flushQ <- seg:
 	default:
-		pl.logger.Warn("logstore: flush queue full; segment will retry on restart",
+		pl.logger.Warn("logstore: flush queue full; the retry sweep will ship the segment",
 			zap.Stringer("plane", pl.plane), zap.Uint64("seq", seg.Seq()))
 	}
 }
@@ -306,9 +306,20 @@ func (pl *PlaneLog) sealOpenIfDue(ctx context.Context, force bool) error {
 	return nil
 }
 
-// flushLoop drains the queue, shipping each sealed segment. Exits on close.
+// queuedShipAttempts is how many times a queued segment's ship is tried
+// before it is left to the retry sweep.
+const queuedShipAttempts = 5
+
+// shipBackoff is the wait after a queued ship's first failed attempt,
+// doubling after each later one to a 30s cap. A var so tests can shorten it.
+var shipBackoff = time.Second
+
+// flushLoop drains the queue, shipping each sealed segment, and every
+// ShipRetry runs the retry sweep. Exits on close.
 func (pl *PlaneLog) flushLoop() {
 	defer pl.wg.Done()
+	retry := time.NewTicker(pl.pc.ShipRetry)
+	defer retry.Stop()
 	for {
 		select {
 		case <-pl.closing:
@@ -317,23 +328,56 @@ func (pl *PlaneLog) flushLoop() {
 			if !ok {
 				return
 			}
-			pl.flushOne(seg)
+			pl.flushOne(seg, queuedShipAttempts)
+		case <-retry.C:
+			pl.retryUnshipped()
 		}
 	}
 }
 
-// flushOne ships one sealed segment, retrying with backoff. On success it
-// stamps the ship state (in memory + in Meta — which advances
-// forge_root_cid for the catalog plane) and runs the retention sweep.
-func (pl *PlaneLog) flushOne(seg *Segment) {
+// retryUnshipped ships the sealed segments that are still unshipped, oldest
+// first: those whose queued ship ran out of attempts, those a full queue
+// turned away, and those recovery could not queue. Each gets one attempt,
+// and the sweep stops at the first that fails, since whatever failed it (the
+// upload service, the space's ship authority) most likely fails the rest:
+// the next sweep starts again from it.
+func (pl *PlaneLog) retryUnshipped() {
+	pl.catMu.RLock()
+	var pending []*Segment
+	for i := len(pl.sealed) - 1; i >= 0; i-- { // pl.sealed is newest first
+		if seg := pl.sealed[i]; !seg.IsShipped() && !seg.IsRetired() {
+			pending = append(pending, seg)
+		}
+	}
+	pl.catMu.RUnlock()
+	for _, seg := range pending {
+		select {
+		case <-pl.closing:
+			return
+		default:
+		}
+		if !pl.flushOne(seg, 1) {
+			return
+		}
+	}
+}
+
+// flushOne ships one sealed segment, trying up to maxAttempts times with
+// backoff, and reports whether it is shipped. On success it stamps the ship
+// state (in memory + in Meta — which advances forge_root_cid for the catalog
+// plane) and runs the retention sweep. A segment already shipped, as one
+// still queued after the retry sweep shipped it is, is left alone.
+func (pl *PlaneLog) flushOne(seg *Segment, maxAttempts int) bool {
+	if seg.IsShipped() || seg.IsRetired() {
+		return true
+	}
 	// Each ship is its own trace: nothing upstream is waiting on it.
 	ctx, span := tracing.Start(context.Background(), "log.ship",
 		attribute.String("ingot.log.plane", pl.plane.String()),
 		attribute.Int64("ingot.log.segment_bytes", seg.Size()),
 	)
 	defer span.End()
-	const maxAttempts = 5
-	backoff := time.Second
+	backoff := shipBackoff
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		span.SetAttributes(attribute.Int("ingot.log.attempts", attempt))
@@ -346,24 +390,28 @@ func (pl *PlaneLog) flushOne(seg *Segment) {
 					zap.Stringer("plane", pl.plane), zap.Uint64("seq", seg.Seq()), zap.Error(merr))
 			}
 			pl.runRetention(ctx)
-			return
+			return true
 		}
 		pl.logger.Warn("logstore: ship attempt failed",
 			zap.Stringer("plane", pl.plane), zap.Uint64("seq", seg.Seq()),
 			zap.Int("attempt", attempt), zap.Error(err))
 		span.RecordError(err)
+		if attempt == maxAttempts {
+			break
+		}
 		select {
 		case <-pl.closing:
-			return
+			return false
 		case <-time.After(backoff):
 		}
 		if backoff < 30*time.Second {
 			backoff *= 2
 		}
 	}
-	pl.logger.Error("logstore: ship exhausted retries; segment remains unshipped",
-		zap.Stringer("plane", pl.plane), zap.Uint64("seq", seg.Seq()))
+	pl.logger.Error("logstore: ship exhausted retries; the retry sweep will try again",
+		zap.Stringer("plane", pl.plane), zap.Uint64("seq", seg.Seq()), zap.Int("attempts", maxAttempts))
 	span.SetStatus(codes.Error, "ship exhausted retries")
+	return false
 }
 
 // runRetention retires shipped segments beyond the Retain window and drops

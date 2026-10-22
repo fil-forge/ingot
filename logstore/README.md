@@ -71,7 +71,7 @@ sequenceDiagram
     Note over S,FS: seal when size >= SealBytes or age >= SealAge<br/>(also at Close, and recovery force-seals)
     S->>FS: hash CAR, write .idx (tmp, then rename)
     S->>DB: MarkSegmentSealed(size, sha256, op-roots) in one tx
-    S->>F: enqueueFlush (queue cap 64, drop + warn, restart re-enqueues)
+    S->>F: enqueueFlush (queue cap 64; a full queue leaves it to the retry sweep)
 
     F->>F: SubmitShard: /blob/add the CAR to sprue, PUT, conclude, receipt<br/>(index publish is best-effort, space resolved via reg.Get at ship time)
     F->>DB: PutLocation(shard) + PutInclusions(every inner block)
@@ -84,7 +84,12 @@ sequenceDiagram
 A batch may be empty of blocks: an MST mutation can produce a new root that
 points only at nodes already materialized in a prior segment, so `AppendBatch`
 is called with the op-root alone. A flush error keeps the segment unshipped
-and retried (5 attempts, backoff 1s doubling to a 30s cap); a bucket deleted
+and retried (5 attempts, backoff 1s doubling to a 30s cap). After that, and for
+a segment a full queue turned away, the **retry sweep** takes over: every
+`ShipRetry` (1 minute by default) the flush worker tries the bucket's unshipped
+sealed segments again, oldest first, one attempt each, stopping at the first
+that fails. So a segment waits out an outage, or its space's missing ship
+authority, without a restart. A bucket deleted
 while segments were queued has nowhere to ship, so the closure returns nil and
 the segment marks shipped and retires.
 
@@ -150,7 +155,7 @@ before any worker starts. Discovery keys on the CAR file:
 | `Meta` row | On-disk CAR | Action |
 |---|---|---|
 | `open` | present | `rebuildOpenFromDisk` (scan + truncate any torn trailing frame); then force-sealed |
-| `sealed` | present | `loadSealedFromIdx`; re-enqueue when shipping and not yet shipped |
+| `sealed` | present | `loadSealedFromIdx`; re-enqueue when shipping and not yet shipped (newest first; what the queue can't hold, the retry sweep ships) |
 | none | present | orphan (crashed before the row): rebuild as open + `InsertSegmentOpen`, then force-sealed |
 | present | absent | delete the row |
 | — | sidecar only (`.idx`/`.ops`, no CAR) | stray; unlink |
@@ -172,6 +177,7 @@ type PlaneConfig struct {
     Ship      bool          // false -> never ship, retained forever
     Flush     FlushFunc     // ships one sealed CAR; set by the Manager from FlushFor
     Retain    int           // shipped CARs kept locally (0 -> 6); ignored when !Ship
+    ShipRetry time.Duration // how often unshipped sealed segments are retried (0 -> 1m)
 }
 ```
 
