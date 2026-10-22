@@ -824,23 +824,6 @@ func (b *Backend) CompleteMultipartUploadReportingVersionID(ctx context.Context,
 		}
 	}()
 
-	// An Enabled bucket's new version id goes out now, before the parts are
-	// accepted: versitygw may commit the response headers while the
-	// completion runs, and S3 sends x-amz-version-id with them. The commit
-	// then installs exactly this id, or fails (errReservationSuperseded). A
-	// caller that already reported "" while it waited on another Complete
-	// commits as any other write does.
-	var reserved *versionReservation
-	if bucketState.Versioning == registry.VersioningEnabled && !reported {
-		r, err := b.reserveVersion(ctx, bucket)
-		if err != nil {
-			return s3response.CompleteMultipartUploadResult{}, "", err
-		}
-		reserved = &r
-		report(r.VersionID)
-	}
-	report("")
-
 	// The winner alone needs the parts' trees: the object's digest is
 	// assembled from them, and a non-final part hashed at a wrong assumed
 	// offset (variable sizes uploaded out of order) is read back from its
@@ -859,6 +842,24 @@ func (b *Backend) CompleteMultipartUploadReportingVersionID(ctx context.Context,
 			zap.String("key", key), zap.Int("parts", len(requested)), zap.Int64("size", total), zap.Int64("rehash", need), zap.Int64("budget", b.rehashBudget))
 		return s3response.CompleteMultipartUploadResult{}, "", errPartLayoutOverBudget(need, b.rehashBudget)
 	}
+
+	// An Enabled bucket's new version id goes out now, before the parts are
+	// accepted: versitygw commits the response headers at the report, as S3
+	// commits its early 200 with x-amz-version-id, and an error after it can
+	// only go in the 200's body. The re-hash refusal above comes first so
+	// that it keeps its 400. The commit then installs exactly this id, or
+	// fails (errReservationSuperseded). A caller that already reported ""
+	// while it waited on another Complete commits as any other write does.
+	var reserved *versionReservation
+	if bucketState.Versioning == registry.VersioningEnabled && !reported {
+		r, err := b.reserveVersion(ctx, bucket)
+		if err != nil {
+			return s3response.CompleteMultipartUploadResult{}, "", err
+		}
+		reserved = &r
+		report(r.VersionID)
+	}
+	report("")
 
 	// Assemble the ordered body: each part's byte span (it may span several
 	// blobs) is recorded so a later GET/HEAD ?partNumber=N can address it (§7.2).

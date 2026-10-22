@@ -453,7 +453,7 @@ func TestServerConfig_CompleteMultipartKeepalive(t *testing.T) {
 		set  string
 		want time.Duration
 	}{
-		"unset is the default":  {set: "", want: 10 * time.Second},
+		"unset is the default":  {set: "", want: 5 * time.Second},
 		"explicit":              {set: "2s", want: 2 * time.Second},
 		"negative turns it off": {set: "-1s", want: 0},
 	} {

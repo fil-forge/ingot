@@ -19,33 +19,37 @@ import (
 // x-amz-version-id with a streamed response's early 200, as S3 does. An
 // Enabled bucket's Complete reports the id it reserved; the others report "".
 
-// hookBeforePartTrees is a multipart store that runs hook once, right
-// before its next ListPartTrees: the point in Complete after the version id
-// is announced and before the parts are accepted and the version commits.
-type hookBeforePartTrees struct {
-	registry.MultipartStore
+// completeHooks is a registry that runs hook once, right after its next
+// version seq allocation: in an Enabled bucket's Complete, the reservation,
+// before the parts are accepted and the version commits.
+type completeHooks struct {
+	registry.Registry
 	hook func()
+	// multipart is the backend's multipart store.
+	multipart registry.MultipartStore
 }
 
-func (s *hookBeforePartTrees) ListPartTrees(ctx context.Context, uploadID string) (map[int]*registry.PartTree, error) {
-	if s.hook != nil {
-		hook := s.hook
-		s.hook = nil
+func (h *completeHooks) AllocVersionSeq(ctx context.Context, name string) (uint64, error) {
+	seq, err := h.Registry.AllocVersionSeq(ctx, name)
+	if h.hook != nil {
+		hook := h.hook
+		h.hook = nil
 		hook()
 	}
-	return s.MultipartStore.ListPartTrees(ctx, uploadID)
+	return seq, err
 }
 
 // newHookedCompleteBackend is a deferred backend whose Complete runs the
-// returned store's hook between the announcement and the commit.
-func newHookedCompleteBackend(t *testing.T) (*Backend, *hookBeforePartTrees) {
+// returned hook between its reservation and its commit.
+func newHookedCompleteBackend(t *testing.T) (*Backend, *completeHooks) {
 	t.Helper()
-	mp := &hookBeforePartTrees{}
+	h := &completeHooks{}
 	b, _ := newDeferredBackend(t, inmem.NopUploader{}, func(d *Deps) {
-		mp.MultipartStore = d.Multipart
-		d.Multipart = mp
+		h.Registry = d.Registry
+		d.Registry = h
+		h.multipart = d.Multipart
 	})
-	return b, mp
+	return b, h
 }
 
 // completeAnnounced completes an upload, recording every version id it
@@ -165,7 +169,7 @@ func TestCompleteRefusedWhenTheKeyIsWrittenDuringIt(t *testing.T) {
 	if got := currentVersionID(t, b, key); got != put.VersionID {
 		t.Fatalf("current version %q, want the PUT's %q", got, put.VersionID)
 	}
-	if st := sessionState(t, mp, uploadID); st != registry.SessionOpen {
+	if st := sessionState(t, mp.multipart, uploadID); st != registry.SessionOpen {
 		t.Fatalf("session state %q after the refusal, want open", st)
 	}
 
@@ -193,7 +197,7 @@ func TestCompleteRefusedWhenVersioningIsSuspendedDuringIt(t *testing.T) {
 	if _, _, err := completeAnnounced(t, b, key, uploadID, parts); !errors.Is(err, errReservationSuperseded) {
 		t.Fatalf("Complete: err = %v, want errReservationSuperseded", err)
 	}
-	if st := sessionState(t, mp, uploadID); st != registry.SessionOpen {
+	if st := sessionState(t, mp.multipart, uploadID); st != registry.SessionOpen {
 		t.Fatalf("session state %q after the refusal, want open", st)
 	}
 
@@ -255,13 +259,13 @@ func TestCompleteThatWaitsOnTheWinnerReportsNoVersion(t *testing.T) {
 	key := "loser"
 	uploadID, parts := completeTwoParts(t, b, key)
 	ctx := context.Background()
-	if won, err := mp.LatchSession(ctx, uploadID, registry.SessionOpen, registry.SessionCompleting); err != nil || !won {
+	if won, err := mp.multipart.LatchSession(ctx, uploadID, registry.SessionOpen, registry.SessionCompleting); err != nil || !won {
 		t.Fatalf("latch as another Complete: won=%v err=%v", won, err)
 	}
 	// The other Complete fails once this one has reported, reopening the
 	// upload as its revert does.
 	reopen := func(string) {
-		if won, err := mp.LatchSession(ctx, uploadID, registry.SessionCompleting, registry.SessionOpen); err != nil || !won {
+		if won, err := mp.multipart.LatchSession(ctx, uploadID, registry.SessionCompleting, registry.SessionOpen); err != nil || !won {
 			t.Errorf("reopen as the failed Complete: won=%v err=%v", won, err)
 		}
 	}

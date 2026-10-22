@@ -19,13 +19,13 @@ import (
 	"github.com/fil-forge/smelt/pkg/stack"
 )
 
-// TestForgeCompleteKeepalive: a CompleteMultipartUpload that runs past the
-// keepalive streams its response as S3 does, with x-amz-version-id in the
-// early 200's headers, newline padding, then the result. The config's 1ms
-// keepalive (testdata/config-mpkeepalive.yaml) passes long before the
-// Complete reports its version id, so the headers carry the id only because
-// they wait for the report. The idempotent re-Complete reads a few rows and
-// may finish within the interval. Both report the version the bucket holds.
+// TestForgeCompleteKeepalive: a CompleteMultipartUpload streams its response
+// as S3 does, with x-amz-version-id in the headers of a 200 that commits
+// once the request validates, newline padding, then the result. The config's
+// 1ms keepalive (testdata/config-mpkeepalive.yaml) paces the padding fast
+// enough for a Complete of tens of milliseconds to send some. The idempotent
+// re-Complete reads a few rows and may send none. Both report the version
+// the bucket holds.
 func TestForgeCompleteKeepalive(t *testing.T) {
 	ctx := t.Context()
 	s, endpoint := forgeStack(t, withCompleteKeepaliveConfig())

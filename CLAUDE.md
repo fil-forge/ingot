@@ -222,9 +222,9 @@ Viper/yaml-bindable (env prefix `INGOT_`, `.` → `_`). Key fields: `Enabled`,
 `MultipartRehashBudget` (0 → 5 GiB; the re-read Complete allows for non-final
 parts hashed at a wrong assumed offset, past which Complete is refused with
 InvalidPartLayout; the final part is always re-hashed),
-`CompleteMultipartKeepalive` (empty → 10s, negative → off; how long a
-Complete runs before its response commits to 200 and streams newlines until
-the result, as S3 does), top-level
+`CompleteMultipartKeepalive` (empty → 5s, negative → off; a Complete's
+response commits to 200 with the version id once the request validates, as
+S3 does, then sends a newline at this interval until the result), top-level
 `SealBytes`/`SealAge`/`Retain` with a `CatalogPlane` `{SealBytes, SealAge,
 Ship, Retain}` override block (the only plane), `ReadCacheBytes` (0 → 256 MiB,
 <0 → off), `UploadServiceURL`/`UploadServiceDID`/`UploadReceiptsURL` (sprue),

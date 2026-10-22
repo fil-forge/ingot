@@ -117,12 +117,13 @@ type Config struct {
 	MultipartSessionTTL string `mapstructure:"multipart_session_ttl" yaml:"multipart_session_ttl"`
 
 	// CompleteMultipartKeepalive keeps a slow CompleteMultipartUpload's
-	// connection alive, as S3 does (Go duration string): once the completion
-	// has run this long, the response commits to 200 OK and sends whitespace
-	// at this interval until the result ends the body. A client's read
-	// timeout (60 s for the AWS CLI) would otherwise abandon a completion
-	// that goes on to commit. Empty → default 10s; a negative duration turns
-	// it off.
+	// connection alive, as S3 does (Go duration string): the response
+	// commits to 200 OK, with the version id, once the completion has
+	// validated the request, then sends a newline at this interval until the
+	// result ends the body. A client's read timeout (60 s for the AWS CLI)
+	// would otherwise abandon a completion that goes on to commit.
+	// Empty → default 5s; a negative duration turns it off, and a Complete
+	// then answers only when it finishes.
 	CompleteMultipartKeepalive string `mapstructure:"complete_multipart_keepalive" yaml:"complete_multipart_keepalive"`
 
 	// ReleaseGrace delays each blob release (crypto-shred + location delete +
@@ -249,7 +250,7 @@ func (c Config) ServerConfig() (ServerConfig, error) {
 			return ServerConfig{}, fmt.Errorf("ingot: parse multipart_session_ttl %q: %w", c.MultipartSessionTTL, err)
 		}
 	}
-	mpKeepalive := 10 * time.Second
+	mpKeepalive := 5 * time.Second
 	if c.CompleteMultipartKeepalive != "" {
 		mpKeepalive, err = time.ParseDuration(c.CompleteMultipartKeepalive)
 		if err != nil {

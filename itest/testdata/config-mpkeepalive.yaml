@@ -1,9 +1,9 @@
 # Ingot daemon config for the CompleteMultipartUpload keepalive itest —
 # smelt's default forge-mode config (systems/ingot/config/config.yaml) with
-# complete_multipart_keepalive lowered to 1ms, so a Complete's response
-# streams (an early 200, newline padding, then the result) and its headers
-# wait for the version id the Complete reports. Dedicated stack, so the other
-# tests see their Completes answered as they finish.
+# complete_multipart_keepalive lowered to 1ms, so a Complete's streamed
+# response (an early 200 with the version id, newline padding, then the
+# result) pads often enough for the test to see it. Dedicated stack, so the
+# other tests keep the default padding.
 # Mounted over /etc/ingot/config.yaml via stack.WithServiceConfig.
 
 # Port 80 inside the compose network: did:web:ingot resolves to
@@ -33,7 +33,7 @@ auth_service_did: "did:web:hilt"
 # hilt → ingot delegations for /s3/request/authorize and /s3/bucket/*
 auth_service_proofs: "/proofs/hilt-ingot-s3-proof.txt"
 
-# The point of this config: stream every multipart Complete.
+# The point of this config: pad every streamed Complete.
 complete_multipart_keepalive: 1ms
 
 # Region CEK wrap provider (required): the stack's ingot-openbao transit
