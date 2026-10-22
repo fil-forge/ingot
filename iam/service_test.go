@@ -111,7 +111,7 @@ func signedCopyRequest(t *testing.T, dst, src string) *http.Request {
 
 func resolveForRequest(t *testing.T, svc *iam.Service, access string, req *http.Request) (auth.Account, error) {
 	t.Helper()
-	acct, err, _ := resolveStreamed(t, svc, access, req, false)
+	acct, _, err := resolveStreamed(t, svc, access, req, false)
 	return acct, err
 }
 
@@ -119,7 +119,7 @@ func resolveForRequest(t *testing.T, svc *iam.Service, access string, req *http.
 // resolveForRequest does, streaming the request body as the production
 // server does when streamed is set, and returns the body the handler then
 // reads.
-func resolveStreamed(t *testing.T, svc *iam.Service, access string, req *http.Request, streamed bool) (auth.Account, error, []byte) {
+func resolveStreamed(t *testing.T, svc *iam.Service, access string, req *http.Request, streamed bool) (auth.Account, []byte, error) {
 	t.Helper()
 	app := fiber.New(fiber.Config{StreamRequestBody: streamed})
 	var acct auth.Account
@@ -133,7 +133,7 @@ func resolveStreamed(t *testing.T, svc *iam.Service, access string, req *http.Re
 	resp, err := app.Test(req)
 	require.NoError(t, err)
 	require.NoError(t, resp.Body.Close())
-	return acct, authErr, seen
+	return acct, seen, authErr
 }
 
 // TestRequestBodyForwarding covers the body hilt decides on, end to end
@@ -150,7 +150,7 @@ func TestRequestBodyForwarding(t *testing.T) {
 		fake := &fakeAuthorizer{res: authorizeOK(t, keyDID, key)}
 		svc := iam.New(fake, iam.NewKeyProofs(), iam.NewVerificationKeyCache(), iam.NewTenantCache())
 		req := httptest.NewRequest(http.MethodPost, "http://example.com/bkt?delete", strings.NewReader(body))
-		_, err, seen := resolveStreamed(t, svc, access, req, true)
+		_, seen, err := resolveStreamed(t, svc, access, req, true)
 		require.NoError(t, err)
 		require.Equal(t, 1, fake.calls)
 		require.Equal(t, []byte(body), fake.got.Body, "the authorizer must see the exact body")
@@ -161,7 +161,7 @@ func TestRequestBodyForwarding(t *testing.T) {
 		fake := &fakeAuthorizer{res: authorizeOK(t, keyDID, key)}
 		svc := iam.New(fake, iam.NewKeyProofs(), iam.NewVerificationKeyCache(), iam.NewTenantCache())
 		req := httptest.NewRequest(http.MethodPut, "http://example.com/bkt/k", strings.NewReader("object bytes"))
-		_, err, seen := resolveStreamed(t, svc, access, req, true)
+		_, seen, err := resolveStreamed(t, svc, access, req, true)
 		require.NoError(t, err)
 		require.Nil(t, fake.got.Body)
 		require.Equal(t, []byte("object bytes"), seen)
@@ -172,7 +172,7 @@ func TestRequestBodyForwarding(t *testing.T) {
 		svc := iam.New(fake, iam.NewKeyProofs(), iam.NewVerificationKeyCache(), iam.NewTenantCache())
 		huge := strings.Repeat("x", hiltauth.MaxBodySize+1)
 		req := httptest.NewRequest(http.MethodPost, "http://example.com/bkt?delete", strings.NewReader(huge))
-		_, err, _ := resolveStreamed(t, svc, access, req, true)
+		_, _, err := resolveStreamed(t, svc, access, req, true)
 		var s3e s3err.APIError
 		require.ErrorAs(t, err, &s3e)
 		require.Equal(t, s3err.GetAPIError(s3err.ErrEntityTooLarge).Code, s3e.Code)
