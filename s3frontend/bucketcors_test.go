@@ -3,6 +3,7 @@ package s3frontend
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/fil-forge/ucantone/did"
@@ -94,17 +95,59 @@ func TestBucketCors_OwnDocumentReplacesTheDefault(t *testing.T) {
 	}
 }
 
+// corsDocWithRules is a document of n minimal, valid rules.
+func corsDocWithRules(n int) []byte {
+	var buf bytes.Buffer
+	buf.WriteString("<CORSConfiguration>")
+	for i := 0; i < n; i++ {
+		fmt.Fprintf(&buf, "<CORSRule><AllowedOrigin>https://origin-%d.example</AllowedOrigin><AllowedMethod>GET</AllowedMethod></CORSRule>", i)
+	}
+	buf.WriteString("</CORSConfiguration>")
+	return buf.Bytes()
+}
+
+func TestBucketCors_RuleLimit(t *testing.T) {
+	b, _, _ := newRefTestBackend(t)
+	ctx := context.Background()
+
+	// S3's hundred rules is the most a document may hold.
+	hundred := corsDocWithRules(maxCORSRules)
+	if err := b.PutBucketCors(ctx, "bk", hundred); err != nil {
+		t.Fatalf("PutBucketCors with %d rules: %v", maxCORSRules, err)
+	}
+
+	// One more is refused, and the stored document is untouched.
+	if err := b.PutBucketCors(ctx, "bk", corsDocWithRules(maxCORSRules+1)); err == nil {
+		t.Fatalf("PutBucketCors with %d rules: want error", maxCORSRules+1)
+	} else {
+		wantAPIErr(t, err, s3err.ErrMalformedXML)
+	}
+	got, err := b.GetBucketCors(ctx, "bk")
+	if err != nil {
+		t.Fatalf("GetBucketCors: %v", err)
+	}
+	if !bytes.Equal(got, hundred) {
+		t.Fatalf("GetBucketCors = %d bytes, want the %d-rule document still stored", len(got), maxCORSRules)
+	}
+}
+
 func TestBucketCors_SizeCap(t *testing.T) {
 	b, _, _ := newRefTestBackend(t)
 	ctx := context.Background()
 
+	// Over the byte cap, before any parse: EntityTooLarge. Under it, a body
+	// that is not a CORS document is MalformedXML, as the controller would
+	// have said; the backend trusts the controller's validation but not the
+	// shape of whatever it is handed.
 	if err := b.PutBucketCors(ctx, "bk", bytes.Repeat([]byte("x"), maxCORSConfig+1)); err == nil {
 		t.Fatal("PutBucketCors over the cap: want error")
 	} else {
 		wantAPIErr(t, err, s3err.ErrEntityTooLarge)
 	}
-	if err := b.PutBucketCors(ctx, "bk", bytes.Repeat([]byte("x"), maxCORSConfig)); err != nil {
-		t.Fatalf("PutBucketCors at the cap: %v", err)
+	if err := b.PutBucketCors(ctx, "bk", bytes.Repeat([]byte("x"), maxCORSConfig)); err == nil {
+		t.Fatal("PutBucketCors with a body that is not a document: want error")
+	} else {
+		wantAPIErr(t, err, s3err.ErrMalformedXML)
 	}
 }
 

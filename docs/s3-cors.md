@@ -35,7 +35,7 @@ Three methods in `s3frontend/bucketcors.go`, all one registry call:
 | Method | Behaviour |
 | --- | --- |
 | `GetBucketCors` | The bucket's own document, else the gateway's, else `NoSuchCORSConfiguration`. `NoSuchBucket` outranks all three. |
-| `PutBucketCors` | Stores the body verbatim. versitygw's controller has already parsed it and run `CORSConfiguration.Validate`, so the backend trusts its shape; it refuses a body over 64 KiB (`EntityTooLarge`) only to bound the row. |
+| `PutBucketCors` | Stores the body verbatim. versitygw's controller has already parsed it and run `CORSConfiguration.Validate`, which checks each rule but not their number, so the backend parses it again and refuses more than S3's hundred rules (`MalformedXML`, the schema's own refusal); a body over 64 KiB is refused before the parse (`EntityTooLarge`) to bound the row. A refused document leaves the stored one in place. |
 | `DeleteBucketCors` | Clears the document, so the bucket answers with the gateway's again. Idempotent, as on S3. |
 
 The document is the `<CORSConfiguration>` XML the controller validated,

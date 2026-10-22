@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/fil-forge/versitygw/auth"
 	"github.com/fil-forge/versitygw/s3err"
 
 	"github.com/fil-forge/ingot/registry"
@@ -20,10 +21,16 @@ import (
 // the sentinel NoSuchCORSConfiguration makes versitygw's CORS middlewares
 // fall through untouched.
 
-// maxCORSConfig bounds the document PutBucketCors stores. S3 allows a
-// hundred rules; a validated document of that size is a few KiB, so the cap
-// only keeps a registry row from carrying an unbounded body.
-const maxCORSConfig = 64 << 10
+const (
+	// maxCORSRules is S3's limit on the rules one configuration holds.
+	// versitygw's validator checks each rule and never the count, so the
+	// count is checked here.
+	maxCORSRules = 100
+	// maxCORSConfig bounds the document PutBucketCors stores. A hundred
+	// validated rules is a few KiB, so the cap only keeps a registry row
+	// from carrying an unbounded body.
+	maxCORSConfig = 64 << 10
+)
 
 // GetBucketCors returns the CORS document the bucket answers with: its own,
 // else the gateway-wide one, else ErrNoSuchCORSConfiguration. Called on
@@ -48,10 +55,16 @@ func (b *Backend) GetBucketCors(ctx context.Context, bucket string) ([]byte, err
 // PutBucketCors stores the bucket's own CORS document. The controller has
 // already parsed and validated the XML (CORSConfiguration.Validate) and
 // hands us the body to store verbatim, the document GetBucketCors returns
-// and the controller parses back.
+// and the controller parses back. The rule count is the one check the
+// validator leaves out: past S3's hundred the document is refused as
+// MalformedXML, the schema's own refusal, and the stored one stands.
 func (b *Backend) PutBucketCors(ctx context.Context, bucket string, cors []byte) error {
 	if len(cors) > maxCORSConfig {
 		return s3err.GetAPIError(s3err.ErrEntityTooLarge)
+	}
+	cfg, err := auth.ParseCORSOutput(cors)
+	if err != nil || len(cfg.Rules) > maxCORSRules {
+		return s3err.GetAPIError(s3err.ErrMalformedXML)
 	}
 	return b.setCORSConfig(ctx, bucket, cors)
 }
