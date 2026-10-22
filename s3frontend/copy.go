@@ -284,7 +284,7 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 	}
 	node, effState, err := b.commitVersion(ctx, bucketState, dstKey, dstMf, blobs, applyTagsIfPresent(initState, dstTags), !reingest, nil)
 	if err != nil {
-		if errors.Is(err, errPinnedBlobReleased) {
+		if errors.Is(err, registry.ErrClaimGone) {
 			return s3response.CopyObjectOutput{}, s3err.GetAPIError(s3err.ErrNoSuchKey)
 		}
 		return s3response.CopyObjectOutput{}, err

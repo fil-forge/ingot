@@ -301,13 +301,10 @@ sequenceDiagram
     TX->>R: AllocVersionSeq
     TX->>TX: mint versionId ("null" unless versioning Enabled),<br/>manifest into OpStaging, re-check If-Match under the lock,<br/>MST splice (new nodes into staging)
     TX->>L: AppendBatch(catalog blocks, OpRoot) with fsync
-    TX->>R: CASRoot(bucket, snapshot, newRoot), guarded
+    TX->>R: CommitRoot(bucket, snapshot, newRoot), guarded, one transaction:<br/>blob_refs gains this version, superseded version rows removed,<br/>a release record per digest whose claims reached 0;<br/>/upload/add(root = this version's manifest CID)<br/>+ /upload/remove per discarded version queued (upload_registrations)
     TX-->>B: committed, lock released
-    Note over B,R: post-commit, off the lock
-    B->>R: reconcileClaims: blob_refs gains this version,<br/>superseded version rows removed
-    B->>U: /blob/remove per digest whose CountClaims reached 0<br/>(+ crypto-shred: its blob_encryption_params row deleted)
-    B->>R: queue /upload/add(root = this version's manifest CID)<br/>+ /upload/remove per discarded version<br/>(upload_registrations, in the CAS transaction)
     B-->>C: 200 + ETag (+ x-amz-version-id when versioning is configured)
+    Note over B,U: the release sweeper runs each record once its grace passes:<br/>/blob/remove (+ crypto-shred: its blob_encryption_params row deleted)
 ```
 
 - A request that dies after allocating a streamed blob leaves its
@@ -505,7 +502,7 @@ sequenceDiagram
         B->>B: vet the source: copySourceBucket (tenant), resolveVersionIn,<br/>range within the object, copy-source preconditions (412)#59;<br/>the body is the source's plaintext range through the decrypting reader
     end
     B->>B: ingestPart: splitSpool<br/>(resolve the tenant recipient, then encrypt per piece:<br/>fresh CEK → FEE envelope → spool under the ciphertext<br/>digest + params row, as in the PutObject diagram)
-    B->>R: PutPart(spooled, span_lengths): open sessions only, the row held FOR SHARE<br/>against a concurrent latch#59; a refused part records its blobs' releases
+    B->>R: PutPart(spooled, span_lengths): open sessions only, the row held FOR SHARE<br/>against a concurrent latch#59; writes of one part number serialised on an advisory lock#59;<br/>a release record, due now, for each blob the replaced row named and this part<br/>does not, in the same transaction, returned to run#59; a refused part records its blobs' releases
     loop each part blob (parkBlobs)
         alt streamed while spooled
             B->>R: PutPark(AddTask, AcceptTask, PutInvocation), intent parked,<br/>DeleteStream: the PUT already went to piri in splitSpool
@@ -522,7 +519,11 @@ sequenceDiagram
         end
     end
     B->>R: MoveParts(spooled to parked), guarded by the part's digests
+    opt no row moved: a later upload of the part number replaced it,<br/>or a teardown took the session, while the blobs were parking
+        B->>R: EnqueueReleases of this part's blobs: a no-op beside the replacer's record,<br/>which the park left standing (awaitRelease)#59; they run below rather than on the next sweep
+    end
     B->>A: nudge (start the acceptor, or ask for another pass)
+    B->>U: releaseNow: the records above, due at once (/blob/abort of the parks#59;<br/>a blob another part or the session still names waits on that reference)
     B-->>C: part ETag (part md5#59; for a copy, of the copied bytes)
     loop while a pass finds parked parts
         A->>R: GetSession (stop unless open or completing)#59; ListParkedParts
@@ -544,7 +545,7 @@ sequenceDiagram
             B-->>C: 409 OperationAborted#59; the deferred revert reopens the session
         else every part accepted, or spooled
             B->>U: spooled parts only: concludeBlobs (conclude, or upload a never-parked blob)
-            B->>TX: commitVersion (see the PutObject diagram)#59; AddBlobClaims set-based
+            B->>TX: commitVersion (see the PutObject diagram)#59; the claims land<br/>in the root swap's transaction, set-based
             B->>R: LatchSession(completing to completed), best-effort
             B-->>C: 200, ETag = md5-of-part-md5s + "-N"
         end
@@ -560,8 +561,8 @@ sequenceDiagram
   the blob is free to go — a claimed digest drops the record (`CountClaims`),
   and one a part of an in-flight session references waits
   (`CountLivePartRefs`, checked first: a Complete claims before it leaves
-  'completing'). `AddBlobClaim` publishes a committed blob's upload intent,
-  so the reap of a retained session releases only what was never committed.
+  'completing'). A commit's claim publishes the blob's upload intent, so
+  the reap of a retained session releases only what was never committed.
 - A release can take a blob while the acceptor concludes it. The provider
   refuses whichever of accept and abort comes second, and the release drops
   the park row before anything else, so `ConcludePark` finds no park and the
@@ -610,13 +611,19 @@ stateDiagram-v2
     parked --> spooled : acceptor finds a blob with a release record, or neither park nor location
     spooled --> accepted : Complete finishes it (conclude, or upload from the spool)
     parked --> accepted : Complete, when no acceptors run
-    spooled --> [*] : a later UploadPart of the same number replaces the row
-    parked --> [*] : replaced, or the session's teardown cascades
-    accepted --> [*] : replaced, or the session's teardown cascades
+    spooled --> [*] : a later UploadPart of the same number replaces the row#59;<br/>the blobs it drops get release records in the same transaction
+    parked --> [*] : replaced (releases recorded with the replacement),<br/>or the session's teardown cascades
+    accepted --> [*] : replaced (releases recorded with the replacement),<br/>or the session's teardown cascades
 ```
 
 - `spooled` is the state of a part whose request is still parking its
   blobs, or died doing so. The acceptor never takes it; Complete does.
+- A request whose `spooled` row is replaced while it parks moves no row to
+  `parked`. The releases the replacement recorded stand: a part's park
+  leaves a pending release of its digest to the part row, which defers it
+  while the row stands and lets it run once the row is replaced, so the
+  blobs go even if the request dies there. The request runs them itself
+  when it can, rather than leave them to the next sweep.
 - Complete requires every part it names to be `accepted` before the commit:
   it waits until none of them is queued (parts it omits are not waited
   for), finishes `spooled` parts itself, and answers a part still `parked`
@@ -691,13 +698,13 @@ flowchart TB
     accepted -->|"release record (never committed);<br/>executeRelease: /blob/remove;<br/>DeleteIntent + removeLocal"| gone
     published -->|"release record (committed);<br/>executeRelease: /blob/remove;<br/>DeleteIntent + removeLocal"| gone
 
-    accepted -->|"commit: AddBlobClaim, same transaction"| published
+    accepted -->|"commit: the claim, in the root swap's transaction"| published
 
     parked -.->|"SweepLocalBlobs over budget (blob_parks row):<br/>removeLocal + MarkEvicted; state unchanged"| evicted[["local file evicted<br/>(evicted_at set)"]]
     accepted -.->|"cache_writes false: at accept,<br/>once the location is recorded;<br/>removeLocal + MarkEvicted"| evicted
     accepted -.->|"SweepLocalBlobs over budget (blob_locations row):<br/>removeLocal + MarkEvicted; state unchanged"| evicted
     published -.->|"SweepLocalBlobs over budget (blob_locations row):<br/>removeLocal + MarkEvicted; state unchanged"| evicted
-    published -->|"commit: reconcileClaims adds this version"| refs["blob_refs rows<br/>(digest, bucket, key, version_id)"]
+    published -->|"commit: the root swap's transaction adds this version's claim"| refs["blob_refs rows<br/>(digest, bucket, key, version_id)"]
     refs -->|"version delete or overwrite removes its row"| zero{"CountClaims == 0<br/>for (space, digest)?"}
     zero -->|yes| rel["release record enqueued, due after release_grace<br/>(the published → deleted edge runs it)"]
     zero -->|no| keep["blob retained<br/>(still referenced)"]
@@ -729,20 +736,23 @@ flowchart TB
   startup, the released pass does the same for `published` intents nothing
   names any more (no location, claim, pending release or live part), left
   by versions whose releases kept the copy.
-- Digests present in both the old and new version sets never churn: the
-  reconcile computes a set difference.
+- Digests present in both the old and new version sets never churn: the new
+  generation's claim lands before the old one's drops in the same
+  transaction, so the digest keeps a claim throughout and no release is
+  recorded.
 - Parked-blob reclamation is guarded: a digest live in another session, part,
   or committed object is left alone.
-- A same-space copy pins the source's body: its claims are taken with
-  `PinBlobClaims`, which requires an existing claim on the digest in the same
-  statement, so a copy racing the source's delete and release fails with
-  NoSuchKey instead of claiming a blob about to go.
+- A same-space copy pins the source's body: its claims are pins
+  (`registry.RootCommit.Pins`), each written only while the space still
+  holds a claim on the digest, under its lock, so a copy racing the source's
+  delete and release fails with NoSuchKey instead of claiming a blob about
+  to go.
 
 Cross-references: [`architecture.md` §5](./architecture.md#5-the-data-layer),
 [`s3-versioning.md`](./s3-versioning.md) §8.
 
 Sources: `registry/stores.go` (state consts, ListEvictable, ListReleasedPublished), `s3frontend/object.go`
-(ingestBody, reconcileClaims), `s3frontend/localblob_sweep.go` (SweepLocalBlobs),
+(ingestBody, addClaims, dropClaims), `s3frontend/localblob_sweep.go` (SweepLocalBlobs),
 `s3frontend/localblobs.go` (cacheHeld, removeLocal),
 `s3frontend/multipart.go`
 (parkBlobs, acceptParked, recordConcluded, concludeBlobs, enqueuePartReleases),
@@ -1152,7 +1162,7 @@ erDiagram
     blob_locations ||..o{ shard_inclusions : "by shard_digest"
     blob_locations ||..o| blob_encryption_params : "by (space, digest), deliberately no FK"
     multipart_parts ||..o{ blob_parks : "digests in blob_digests"
-    multipart_parts ||..o{ blob_release_intents : "teardown records, by digest"
+    multipart_parts ||..o{ blob_release_intents : "teardown and supersede records, by digest"
 ```
 
 - The four solid relationships are the schema's only real foreign keys;

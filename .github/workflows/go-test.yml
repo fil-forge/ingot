@@ -7,13 +7,13 @@ name: Go Test
 # stack. The live job exists because the unit job runs the same packages with
 # no INGOT_TEST_* env, silently skipping every *_live_test.go.
 #
-# The Docker-backed work spreads over six runners: five `itest-shards` and
-# `s3compat`, which runs the compatibility corpus (the shards leave
-# INGOT_S3COMPAT unset, so TestForgeS3Compat skips itself there). Shard
-# membership lives in the Makefile, target `itest-shard`; job `itest`
-# aggregates the shards into the one check the branch ruleset requires.
+# The Docker-backed work spreads over seven runners: six `itest-groups` and
+# `s3compat`, which runs the compatibility corpus (the groups leave
+# INGOT_S3COMPAT unset, so TestForgeS3Compat skips itself there). Group
+# membership lives in the Makefile, target `itest-group`; job `itest`
+# aggregates the groups into the one check the branch ruleset requires.
 #
-# A runner per shard is what makes the split pay: itest/ is a single Go
+# A runner per group is what makes the split pay: itest/ is a single Go
 # package, so its tests run serially and each one boots its own Forge stack.
 # Two of them also cannot share a Docker host, because itest/'s TestMain
 # sweeps every leaked `smeltery-*` container on startup — which would take
@@ -96,35 +96,36 @@ jobs:
           INGOT_TEST_BAO_TOKEN: root
         run: go test -v -count=1 -run '(Live|GraphValidates)' ./cmd/... ./registry/ ./migrations/ ./regionkey/
 
-  itest-shards:
+  itest-groups:
     needs: unit
     # Pin to 24.04 rather than -latest so the Docker version doesn't drift
     # from under us. The runner's preinstalled Docker is 28.x, well past
     # smelt's 25+ requirement.
     runs-on: ubuntu-24.04
-    # The slowest shard is ~7 minutes of tests on top of ~2 minutes of image
+    # The slowest group is ~7 minutes of tests on top of ~2 minutes of image
     # pulls and the working-tree ingot build. Comfortably above `make
-    # itest-shard`'s own -timeout 20m, so a hung test hits Go's timeout and
+    # itest-group`'s own -timeout 20m, so a hung test hits Go's timeout and
     # dumps goroutine stacks before the runner is cut off.
     timeout-minutes: 25
 
     strategy:
-      # A failing shard must not cancel the others: which shards fail is the
-      # diagnosis, and a rerun of one shard costs a full stack boot.
+      # A failing group must not cancel the others: which groups fail is the
+      # diagnosis, and a rerun of one group costs a full stack boot.
       fail-fast: false
       matrix:
         include:
-          - shard: encryption
-          - shard: conformance
-          - shard: uploads
+          - group: encryption
+          - group: conformance
+          - group: uploads
             # Enables TestForgeMaxSizePart, the 5 GiB max-part test, which
-            # this shard owns. Move that test between shards in the Makefile
+            # this group owns. Move that test between groups in the Makefile
             # and move this flag with it, or it silently stops running.
             big: '1'
-          - shard: releases
-          - shard: rest
+          - group: releases
+          - group: auth
+          - group: rest
 
-    name: itest (${{ matrix.shard }})
+    name: itest (${{ matrix.group }})
 
     steps:
       - name: Check out the repository
@@ -136,7 +137,7 @@ jobs:
           go-version-file: go.mod
 
       - name: Docker and disk info
-        # df because the `uploads` shard's 5 GiB part test churns ~10-15 GiB
+        # df because the `uploads` group's 5 GiB part test churns ~10-15 GiB
         # (spool copy + piri copy): the runner image starts with ~73 GiB free,
         # so this records the margin rather than needing anything freed.
         run: |
@@ -145,13 +146,13 @@ jobs:
           df -h /
 
       - name: Run integration tests
-        # The Makefile owns which tests each shard runs, the -run regex, and
+        # The Makefile owns which tests each group runs, the -run regex, and
         # GOWORK=off; `rest` is the complement, so a newly added test runs
-        # there rather than matching no shard at all. The harness builds the
+        # there rather than matching no group at all. The harness builds the
         # working-tree binary itself (itest/stack_test.go).
         env:
           INGOT_ITEST_BIG: ${{ matrix.big }}
-        run: make itest-shard SHARD=${{ matrix.shard }}
+        run: make itest-group GROUP=${{ matrix.group }}
 
       - name: Dump container state on failure
         if: failure()
@@ -180,28 +181,28 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          # Per shard: upload-artifact rejects a name another job already used.
-          name: container-logs-${{ matrix.shard }}
+          # Per group: upload-artifact rejects a name another job already used.
+          name: container-logs-${{ matrix.group }}
           path: /tmp/container-logs/
           if-no-files-found: ignore
           retention-days: 7
 
   itest:
     # The branch ruleset requires a check named `itest`, and a matrix reports
-    # one check per shard instead. This job keeps the single name and fails
-    # unless every shard passed — `needs.<job>.result` for a matrix is the
-    # aggregate, and !cancelled() means a failed shard reaches here rather
+    # one check per group instead. This job keeps the single name and fails
+    # unless every group passed — `needs.<job>.result` for a matrix is the
+    # aggregate, and !cancelled() means a failed group reaches here rather
     # than skipping the gate into a green PR.
-    needs: itest-shards
+    needs: itest-groups
     if: ${{ !cancelled() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
 
     steps:
-      - name: Require every shard to pass
+      - name: Require every group to pass
         run: |
-          echo "itest shards: ${{ needs.itest-shards.result }}"
-          test "${{ needs.itest-shards.result }}" = success
+          echo "itest groups: ${{ needs.itest-groups.result }}"
+          test "${{ needs.itest-groups.result }}" = success
 
   s3compat:
     needs: unit

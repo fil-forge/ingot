@@ -61,7 +61,6 @@ type Backend struct {
 	reg        registry.Registry
 	intents    registry.IntentStore
 	locations  registry.LocationStore
-	blobRefs   registry.BlobRefStore
 	gc         registry.GCStore
 	multipart  registry.MultipartStore
 	txns       *bucketop.Coordinator
@@ -166,9 +165,7 @@ type Deps struct {
 	Intents   registry.IntentStore
 	Locations registry.LocationStore
 
-	// BlobRefs is the reverse reference index (which versions reference each
-	// blob); GC records superseded MST/manifest CIDs. Same instance as Registry.
-	BlobRefs  registry.BlobRefStore
+	// GC records superseded MST/manifest CIDs. Same instance as Registry.
 	GC        registry.GCStore
 	Multipart registry.MultipartStore
 
@@ -319,7 +316,6 @@ func New(d Deps) *Backend {
 		reg:             d.Registry,
 		intents:         d.Intents,
 		locations:       d.Locations,
-		blobRefs:        d.BlobRefs,
 		gc:              d.GC,
 		multipart:       d.Multipart,
 		txns:            bucketop.NewCoordinator(bucketop.Deps{Reg: d.Registry, Log: d.Log, Reads: d.Reads}),
