@@ -28,6 +28,8 @@ type fakeMeta struct {
 	nextSeq  uint64
 	segments map[uint64]*SegmentMeta
 	shipped  []shipEvent // order of MarkSegmentShipped calls
+	// failShips is how many of the next MarkSegmentShipped calls fail.
+	failShips int
 }
 
 type shipEvent struct {
@@ -79,6 +81,10 @@ func (f *fakeMeta) MarkSegmentSealed(_ context.Context, plane blockstore.Plane, 
 func (f *fakeMeta) MarkSegmentShipped(_ context.Context, plane blockstore.Plane, seq uint64, shippedAt int64, indexDigest multihash.Multihash, opRoots []blockstore.OpRoot) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.failShips > 0 {
+		f.failShips--
+		return fmt.Errorf("fake: ship of seq %d failed", seq)
+	}
 	m, ok := f.segments[seq]
 	if !ok {
 		return fmt.Errorf("fake: ship missing seq %d", seq)
@@ -499,6 +505,47 @@ func TestAppendBatchAllDuplicatesStillRecordsOpRoot(t *testing.T) {
 // plane configured never to ship keeps its CARs on local disk indefinitely
 // (the sole durable copy and the source for every read), and its shipped_at
 // never advances (so forge_root_cid never advances).
+// TestFailedShipStampRetriedWithoutReshipping checks that a segment whose
+// ship succeeded but whose MarkSegmentShipped failed is stamped again
+// without being shipped again, and isn't retired in the meantime: retention
+// would drop its row while its journal rows, which only the stamp deletes,
+// stayed behind.
+func TestFailedShipStampRetriedWithoutReshipping(t *testing.T) {
+	s, meta, flushes := newTestStore(t, 64, 50*time.Millisecond, 1)
+	meta.mu.Lock()
+	meta.failShips = 1
+	meta.mu.Unlock()
+
+	blk := makeBlock(t, append([]byte("stamp-"), make([]byte, 80)...))
+	seq, err := s.AppendBatch(context.Background(), []block.Block{blk},
+		blockstore.OpRoot{Bucket: "bk", Root: makeRoot(t, "stamp")})
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		meta.mu.Lock()
+		shipped := len(meta.shipped)
+		meta.mu.Unlock()
+		if shipped > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("segment %d was never stamped shipped", seq)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if got := flushes.load(); got != 1 {
+		t.Fatalf("segment shipped %d times, want 1", got)
+	}
+	meta.mu.Lock()
+	defer meta.mu.Unlock()
+	if m, ok := meta.segments[seq]; !ok || m.ShippedAt == 0 {
+		t.Fatalf("segment %d row = %+v (present %v), want stamped shipped", seq, m, ok)
+	}
+}
+
 func TestCatalogNeverShips(t *testing.T) {
 	dir := t.TempDir()
 	meta := newFakeMeta()

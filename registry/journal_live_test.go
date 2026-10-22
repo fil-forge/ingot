@@ -217,6 +217,90 @@ func TestCatalogJournal_Live(t *testing.T) {
 			t.Fatalf("root %s, forge root %s; want both %s", after.Root, after.ForgeRoot, next)
 		}
 	})
+
+	// newBucket creates a bucket with a segment open for it.
+	newBucket := func(t *testing.T, name string) uint64 {
+		t.Helper()
+		if err := r.Create(ctx, name, testutil.RandomDID(t), registry.CreateState{Tenant: testutil.RandomDID(t)}); err != nil {
+			t.Fatalf("Create %s: %v", name, err)
+		}
+		seq, err := r.NextSegmentSeq(ctx)
+		if err != nil {
+			t.Fatalf("NextSegmentSeq: %v", err)
+		}
+		if err := r.InsertSegmentOpen(ctx, blockstore.PlaneCatalog, seq, name); err != nil {
+			t.Fatalf("InsertSegmentOpen: %v", err)
+		}
+		return seq
+	}
+
+	// Journaling runs before the CAS, so the journal's foreign key is the
+	// first thing to meet a deleted bucket. The commit still reports it as
+	// one.
+	t.Run("a commit to a deleted bucket is ErrNotFound", func(t *testing.T) {
+		seg := newBucket(t, "jb-gone")
+		if err := r.Delete(ctx, "jb-gone"); err != nil {
+			t.Fatalf("Delete: %v", err)
+		}
+		err := r.CommitRoot(ctx, "jb-gone", cid.Undef, liveCid(t, "gone-root"), registry.RootCommit{
+			Journal: blockstore.Appended{Segment: seg, Blocks: []block.Block{block.NewBlock([]byte("gone"))}},
+		})
+		if !errors.Is(err, registry.ErrNotFound) {
+			t.Fatalf("commit to a deleted bucket = %v, want ErrNotFound", err)
+		}
+	})
+
+	// A bucket's deletion locks its row and then cascades into its journal
+	// rows. A ship of one of its segments, waiting on that row, must not
+	// already hold the journal rows, or the two deadlock. The deleting
+	// transaction takes the bucket row first, so the ship blocks on it, and
+	// only then deletes the bucket.
+	t.Run("a ship racing its bucket's deletion doesn't deadlock", func(t *testing.T) {
+		seg := newBucket(t, "jb-del")
+		root := liveCid(t, "del-root")
+		if err := r.CommitRoot(ctx, "jb-del", cid.Undef, root, registry.RootCommit{
+			Journal: blockstore.Appended{Segment: seg, Blocks: []block.Block{block.NewBlock([]byte("del"))}},
+		}); err != nil {
+			t.Fatalf("commit: %v", err)
+		}
+		deleter, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin deleter: %v", err)
+		}
+		defer func() { _ = deleter.Rollback(ctx) }()
+		if _, err := deleter.Exec(ctx, `SELECT 1 FROM ingot.buckets WHERE name = 'jb-del' FOR UPDATE`); err != nil {
+			t.Fatalf("lock bucket row: %v", err)
+		}
+
+		shipDone := make(chan error, 1)
+		go func() {
+			shipDone <- r.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seg, time.Now().Unix(), nil,
+				[]blockstore.OpRoot{{Bucket: "jb-del", Root: root}})
+		}()
+		waitForLockWaiters(t, pool, 1)
+
+		if _, err := deleter.Exec(ctx, `DELETE FROM ingot.buckets WHERE name = 'jb-del'`); err != nil {
+			t.Fatalf("delete bucket: %v", err)
+		}
+		if err := deleter.Commit(ctx); err != nil {
+			t.Fatalf("commit deletion: %v", err)
+		}
+		select {
+		case err := <-shipDone:
+			if err != nil {
+				t.Fatalf("ship: %v", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("ship did not finish")
+		}
+		var left int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM ingot.catalog_journal WHERE seq = $1`, int64(seg)).Scan(&left); err != nil {
+			t.Fatalf("count journal: %v", err)
+		}
+		if left != 0 {
+			t.Fatalf("%d journal rows left for the deleted bucket, want 0", left)
+		}
+	})
 }
 
 // waitForLockWaiters waits until at least n backends are blocked on a lock.
@@ -226,7 +310,7 @@ func waitForLockWaiters(t *testing.T, pool *pgxpool.Pool, n int) {
 	for time.Now().Before(deadline) {
 		var waiting int
 		if err := pool.QueryRow(context.Background(),
-			`SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock'`).Scan(&waiting); err != nil {
+			`SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND datname = current_database()`).Scan(&waiting); err != nil {
 			t.Fatalf("pg_stat_activity: %v", err)
 		}
 		if waiting >= n {

@@ -10,6 +10,7 @@ import (
 
 	block "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
+	"github.com/multiformats/go-multihash"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.uber.org/zap"
@@ -324,8 +325,12 @@ func (pl *PlaneLog) flushLoop() {
 }
 
 // flushOne ships one sealed segment, retrying with backoff. On success it
-// stamps the ship state (in memory + in Meta — which advances
-// forge_root_cid for the catalog plane) and runs the retention sweep.
+// stamps the ship state in Meta (which advances forge_root_cid for the
+// catalog plane and drops the segment's journaled blocks), then in memory,
+// and runs the retention sweep. A failed stamp is retried without shipping
+// again, and the segment counts as shipped only once it lands: retention
+// retires shipped segments, and a retired segment whose stamp never landed
+// would leave its journal rows behind for good.
 func (pl *PlaneLog) flushOne(seg *Segment) {
 	// Each ship is its own trace: nothing upstream is waiting on it.
 	ctx, span := tracing.Start(context.Background(), "log.ship",
@@ -336,16 +341,26 @@ func (pl *PlaneLog) flushOne(seg *Segment) {
 	const maxAttempts = 5
 	backoff := time.Second
 
+	var (
+		flushed     bool
+		shippedAt   int64
+		indexDigest multihash.Multihash
+	)
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		span.SetAttributes(attribute.Int("ingot.log.attempts", attempt))
-		indexDigest, err := pl.pc.Flush(ctx, seg)
-		if err == nil {
-			now := time.Now().Unix()
-			seg.markShipped(now)
-			if merr := pl.meta.MarkSegmentShipped(ctx, pl.plane, seg.Seq(), now, indexDigest, seg.OpRoots()); merr != nil {
-				pl.logger.Error("logstore: mark shipped",
-					zap.Stringer("plane", pl.plane), zap.Uint64("seq", seg.Seq()), zap.Error(merr))
+		var err error
+		if !flushed {
+			if indexDigest, err = pl.pc.Flush(ctx, seg); err == nil {
+				flushed, shippedAt = true, time.Now().Unix()
 			}
+		}
+		if flushed {
+			if err = pl.meta.MarkSegmentShipped(ctx, pl.plane, seg.Seq(), shippedAt, indexDigest, seg.OpRoots()); err != nil {
+				err = fmt.Errorf("mark shipped: %w", err)
+			}
+		}
+		if err == nil {
+			seg.markShipped(shippedAt)
 			pl.runRetention(ctx)
 			return
 		}

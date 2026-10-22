@@ -84,41 +84,40 @@ func (r *Postgres) MarkSegmentShipped(ctx context.Context, plane blockstore.Plan
 	if err != nil {
 		return fmt.Errorf("registry: mark catalog shipped %d: %w", seq, err)
 	}
-	// The segment's journaled blocks are on Forge now. The UPDATE above took
-	// the segment row's lock first, so a commit that was journaling into this
-	// segment (journalBlocks holds a share lock on the row) has committed,
-	// and this statement sees its rows; any later commit sees the segment
-	// shipped and journals nothing.
+	if tag.RowsAffected() > 0 {
+		// Apply forge_root advances in slice order. Segments ship in seq
+		// order, and within a segment the slice order is commit order, so
+		// the last write for each bucket wins.
+		//
+		// The advance is GUARDED on root_cid: forge_root_cid moves to
+		// opr.Root only if the bucket's committed root still equals
+		// opr.Root. This closes the orphan-root hole — a writer whose
+		// logstore.Commit landed an op-root but whose subsequent CASRoot
+		// failed (cross-process race) leaves a durable op-root the bucket
+		// never adopted; without the guard, shipping that segment would
+		// advance forge_root past the bucket's real root.
+		for _, opr := range opRoots {
+			if !opr.Root.Defined() {
+				continue
+			}
+			if _, err := tx.Exec(ctx,
+				`UPDATE ingot.buckets SET forge_root_cid = $1 WHERE name = $2 AND root_cid = $1`,
+				opr.Root.Bytes(), opr.Bucket); err != nil {
+				return fmt.Errorf("registry: advance forge_root for %q: %w", opr.Bucket, err)
+			}
+		}
+	}
+	// The segment's journaled blocks are on Forge now, so drop them, also
+	// when an earlier stamp already landed (idempotent). The UPDATE above
+	// took the segment row's lock first, so a commit that was journaling
+	// into this segment (journalBlocks holds a share lock on the row) has
+	// committed, and this statement sees its rows; any later commit sees the
+	// segment shipped and journals nothing. The rows go last, after the
+	// bucket rows: deleting a bucket locks its row and then cascades into
+	// its journal rows, and taking them in the other order could deadlock
+	// with it.
 	if _, err := tx.Exec(ctx, `DELETE FROM ingot.catalog_journal WHERE seq = $1`, int64(seq)); err != nil {
 		return fmt.Errorf("registry: drop journal of catalog segment %d: %w", seq, err)
-	}
-	if tag.RowsAffected() == 0 {
-		// Already shipped — idempotent, bar the journal sweep above.
-		if err := tx.Commit(ctx); err != nil {
-			return fmt.Errorf("registry: commit ship catalog %d: %w", seq, err)
-		}
-		return nil
-	}
-
-	// Apply forge_root advances in slice order. Segments ship in seq
-	// order, and within a segment the slice order is commit order, so the
-	// last write for each bucket wins.
-	//
-	// The advance is GUARDED on root_cid: forge_root_cid moves to opr.Root only
-	// if the bucket's committed root still equals opr.Root. This closes the
-	// orphan-root hole — a writer whose logstore.Commit landed an op-root but
-	// whose subsequent CASRoot failed (cross-process race) leaves a durable
-	// op-root the bucket never adopted; without the guard, shipping that
-	// segment would advance forge_root past the bucket's real root.
-	for _, opr := range opRoots {
-		if !opr.Root.Defined() {
-			continue
-		}
-		if _, err := tx.Exec(ctx,
-			`UPDATE ingot.buckets SET forge_root_cid = $1 WHERE name = $2 AND root_cid = $1`,
-			opr.Root.Bytes(), opr.Bucket); err != nil {
-			return fmt.Errorf("registry: advance forge_root for %q: %w", opr.Bucket, err)
-		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("registry: commit ship catalog %d: %w", seq, err)

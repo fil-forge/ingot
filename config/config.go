@@ -169,6 +169,8 @@ type Config struct {
 	// CatalogPlane overrides the catalog logstore pipeline knobs. Any field
 	// left zero/unset falls back to the top-level SealBytes / SealAge / Retain
 	// (and Ship defaults to true) — e.g. to configure the catalog never to ship.
+	// A catalog that never ships also keeps every block in Postgres's catalog
+	// journal for good, which grows with the catalog.
 	CatalogPlane PlaneSettings `mapstructure:"catalog_plane" yaml:"catalog_plane"`
 
 	// RegionKey selects and configures the region CEK wrap provider

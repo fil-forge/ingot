@@ -78,14 +78,18 @@ sequenceDiagram
     F->>DB: PutLocation(shard) + PutInclusions(every inner block)
     Note over F,DB: recorded before the shipped stamp, so retention<br/>can never retire blocks reads cannot resolve
     F-->>S: index digest
-    S->>DB: MarkSegmentShipped: shipped_at + index_digest and, same tx,<br/>the segment's journal rows deleted and forge_root_cid per op-root<br/>(guarded: only while buckets.root_cid still equals the op-root)
+    S->>DB: MarkSegmentShipped: shipped_at + index_digest and, same tx,<br/>forge_root_cid per op-root (guarded: only while buckets.root_cid<br/>still equals the op-root), then the segment's journal rows deleted
+    Note over S: marked shipped in memory only once the stamp lands
     Note over S: runRetention keeps the newest Retain shipped CARs,<br/>older ones retire (files unlinked, row deleted)
 ```
 
 A batch may be empty of blocks: an MST mutation can produce a new root that
 points only at nodes already materialized in a prior segment, so `AppendBatch`
 is called with the op-root alone. A flush error keeps the segment unshipped
-and retried (5 attempts, backoff 1s doubling to a 30s cap); a bucket deleted
+and retried (5 attempts, backoff 1s doubling to a 30s cap). A failed
+`MarkSegmentShipped` after a successful ship takes the same attempts without
+shipping again, and the segment counts as shipped only once the stamp lands,
+so retention never retires a segment whose journal rows remain. A bucket deleted
 while segments were queued has nowhere to ship, so the closure returns nil and
 the segment marks shipped and retires.
 
@@ -96,7 +100,7 @@ stateDiagram-v2
     [*] --> Open : createOpenSegment + InsertSegmentOpen
     Open --> Open : append (fsync, then index commit)
     Open --> Sealed : seal (hash CAR, write .idx, MarkSegmentSealed)
-    Sealed --> Shipped : flush ok (MarkSegmentShipped: journal rows deleted, guarded forge_root advance)
+    Sealed --> Shipped : flush ok (MarkSegmentShipped: guarded forge_root advance, journal rows deleted)
     Shipped --> Retired : retention past Retain (files unlinked)
     Retired --> [*] : DeleteSegment
 ```

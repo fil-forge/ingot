@@ -19,6 +19,9 @@ import (
 // violation (matches the literal used elsewhere in sprue's stores).
 const uniqueViolation = "23505"
 
+// foreignKeyViolation is the Postgres SQLSTATE for a foreign key violation.
+const foreignKeyViolation = "23503"
+
 // pgxQuerier is the surface shared by *pgxpool.Pool and pgx.Tx, so a statement
 // can run standalone or inside a caller's transaction. Everything a statement
 // needs has to be here: reaching back to the pool from inside a transaction
@@ -218,6 +221,12 @@ func journalBlocks(ctx context.Context, tx pgx.Tx, bucket string, j blockstore.A
 		SELECT $1, $2, c, d FROM unnest($3::bytea[], $4::bytea[]) AS u(c, d)
 		ON CONFLICT (seq, cid) DO NOTHING
 	`, int64(j.Segment), bucket, cids, data); err != nil {
+		// The rows reference the bucket, and journaling runs before the CAS
+		// that would otherwise report a deleted bucket.
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == foreignKeyViolation {
+			return ErrNotFound
+		}
 		return fmt.Errorf("registry: journal %d blocks for %q: %w", len(j.Blocks), bucket, err)
 	}
 	return nil
