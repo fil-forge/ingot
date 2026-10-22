@@ -78,13 +78,13 @@ func (r *Postgres) Create(ctx context.Context, name string, space did.DID, init 
 }
 
 func (r *Postgres) Get(ctx context.Context, name string) (*State, error) {
-	var rootBytes, forgeBytes, lockCfg, tagging []byte
+	var rootBytes, forgeBytes, lockCfg, tagging, corsCfg []byte
 	var createdAt time.Time
 	var spaceStr, tenantStr, versioning string
 	var encryption *string
 	err := r.pool.QueryRow(ctx,
-		`SELECT root_cid, forge_root_cid, created_at, space, tenant, versioning, object_lock_config, bucket_tagging, encryption FROM ingot.buckets WHERE name = $1`, name).
-		Scan(&rootBytes, &forgeBytes, &createdAt, &spaceStr, &tenantStr, &versioning, &lockCfg, &tagging, &encryption)
+		`SELECT root_cid, forge_root_cid, created_at, space, tenant, versioning, object_lock_config, bucket_tagging, cors_config, encryption FROM ingot.buckets WHERE name = $1`, name).
+		Scan(&rootBytes, &forgeBytes, &createdAt, &spaceStr, &tenantStr, &versioning, &lockCfg, &tagging, &corsCfg, &encryption)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -99,7 +99,7 @@ func (r *Postgres) Get(ctx context.Context, name string) (*State, error) {
 	if err != nil {
 		return nil, fmt.Errorf("registry: parse tenant %q: %w", tenantStr, err)
 	}
-	st := &State{Name: name, Space: space, Tenant: tenant, Versioning: VersioningState(versioning), ObjectLockConfig: lockCfg, BucketTagging: tagging, CreatedAt: createdAt}
+	st := &State{Name: name, Space: space, Tenant: tenant, Versioning: VersioningState(versioning), ObjectLockConfig: lockCfg, BucketTagging: tagging, CORSConfig: corsCfg, CreatedAt: createdAt}
 	if encryption != nil {
 		st.Encryption = BucketEncryption(*encryption)
 	}
@@ -273,6 +273,19 @@ func (r *Postgres) SetBucketTagging(ctx context.Context, name string, tags []byt
 		tags, name)
 	if err != nil {
 		return fmt.Errorf("registry: set bucket tagging %q: %w", name, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (r *Postgres) SetCORSConfig(ctx context.Context, name string, cfg []byte) error {
+	tag, err := r.pool.Exec(ctx,
+		`UPDATE ingot.buckets SET cors_config = $1 WHERE name = $2`,
+		cfg, name)
+	if err != nil {
+		return fmt.Errorf("registry: set cors config %q: %w", name, err)
 	}
 	if tag.RowsAffected() == 0 {
 		return ErrNotFound
