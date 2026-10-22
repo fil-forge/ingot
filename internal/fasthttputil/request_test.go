@@ -45,16 +45,16 @@ func TestRequestFromHTTPContext_SingleHeader(t *testing.T) {
 	}
 }
 
-// TestBoundedBody covers the capture of a body hilt decides on: a streamed
+// TestLimitedBody covers the capture of a body hilt decides on: a streamed
 // body within the limit is returned and left for the handler, one over it is
 // refused after reading one byte past the limit, and an in-memory body is
 // bounded the same way.
-func TestBoundedBody(t *testing.T) {
+func TestLimitedBody(t *testing.T) {
 	t.Run("streamed within the limit", func(t *testing.T) {
 		var rc fasthttp.RequestCtx
 		rc.Request.Header.SetMethod("POST")
 		rc.Request.SetBodyStream(strings.NewReader("<Delete/>"), -1)
-		got, err := BoundedBody(&rc, 16)
+		got, err := LimitedBody(&rc, 16)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -74,7 +74,7 @@ func TestBoundedBody(t *testing.T) {
 		rc.Request.Header.SetMethod("POST")
 		src := &countingReader{Reader: strings.NewReader(strings.Repeat("x", 100))}
 		rc.Request.SetBodyStream(src, -1)
-		_, err := BoundedBody(&rc, 16)
+		_, err := LimitedBody(&rc, 16)
 		if !errors.Is(err, ErrBodyTooLarge) {
 			t.Fatalf("err = %v, want ErrBodyTooLarge", err)
 		}
@@ -85,12 +85,12 @@ func TestBoundedBody(t *testing.T) {
 	t.Run("in memory", func(t *testing.T) {
 		var rc fasthttp.RequestCtx
 		rc.Request.SetBody([]byte("<Delete/>"))
-		got, err := BoundedBody(&rc, 16)
+		got, err := LimitedBody(&rc, 16)
 		if err != nil || string(got) != "<Delete/>" {
 			t.Fatalf("got %q, %v", got, err)
 		}
 		rc.Request.SetBody([]byte(strings.Repeat("x", 17)))
-		if _, err := BoundedBody(&rc, 16); !errors.Is(err, ErrBodyTooLarge) {
+		if _, err := LimitedBody(&rc, 16); !errors.Is(err, ErrBodyTooLarge) {
 			t.Fatalf("err = %v, want ErrBodyTooLarge", err)
 		}
 	})

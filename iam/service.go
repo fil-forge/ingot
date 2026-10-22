@@ -195,7 +195,7 @@ func (s *Service) GetUserAccountForRequest(ctx fiber.Ctx, accessKeyStr string) (
 	// in place for the handler. Hilt binds it to the signature before reading
 	// it, and so does the fast path.
 	if op, err := hiltauth.OperationFor(req); err == nil && op.ReadsBody() {
-		body, err := fasthttputil.BoundedBody(reqCtx, hiltauth.MaxBodySize)
+		body, err := fasthttputil.LimitedBody(reqCtx, hiltauth.MaxBodySize)
 		if errors.Is(err, fasthttputil.ErrBodyTooLarge) {
 			path = "local"
 			s.logger.Debug("hilt/iam: request body over the limit", zap.String("access", accessKeyStr), zap.Stringer("operation", op))

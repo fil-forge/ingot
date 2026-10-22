@@ -41,17 +41,17 @@ func RequestFromHTTPContext(rc *fasthttp.RequestCtx) s3.Request {
 	}
 }
 
-// ErrBodyTooLarge is returned by BoundedBody for a body over its limit.
+// ErrBodyTooLarge is returned by LimitedBody for a body over its limit.
 var ErrBodyTooLarge = errors.New("request body exceeds the limit")
 
-// BoundedBody captures the request's body, at most limit bytes, as the
+// LimitedBody captures the request's body, at most limit bytes, as the
 // caller's own copy, and leaves it in place for the handler. A streamed body
 // (the gateway streams every request body) is read from the stream only up
 // to one byte past the limit, so an oversized body costs the limit and no
 // more before it is refused; within the limit it is set back on the
 // request, so the handler's Body() serves it. An in-memory body over the
 // limit is refused too.
-func BoundedBody(rc *fasthttp.RequestCtx, limit int) ([]byte, error) {
+func LimitedBody(rc *fasthttp.RequestCtx, limit int) ([]byte, error) {
 	req := &rc.Request
 	if req.IsBodyStream() {
 		buf, err := io.ReadAll(io.LimitReader(req.BodyStream(), int64(limit)+1))
