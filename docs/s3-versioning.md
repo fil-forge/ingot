@@ -368,8 +368,11 @@ The reported id is binding, so the commit installs it unchanged, and under the l
 
 The client's retry reserves a fresh seq. Unversioned and suspended buckets send no version id, so
 their Completes report `""` and allocate under the lock as every other write does. So does a
-Complete that waited on another Complete of its upload: it reports `""` before waiting, and if the
-other one fails and it commits instead, its id was never sent.
+Complete that waited on another Complete of its upload: it reports `""` before waiting, since the
+other one's id isn't known yet. A Complete that reported `""` commits only a null version: if the
+bucket is Enabled at its commit (versioning was enabled meanwhile, or the Complete it waited on
+failed and this one won), the commit is refused the same way, since the client could never learn
+the numbered version's id.
 
 ### 5.2 Supersession
 

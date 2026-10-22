@@ -307,21 +307,24 @@ func (b *Backend) commitVersion(ctx context.Context, bucketState *registry.State
 	return b.commitVersionAt(ctx, bucketState, key, mf, blobs, initState, pinned, nil, preCheck)
 }
 
-// versionReservation is a version's seq and id, taken before the commit
-// lock by reserveVersion so that a multipart Complete can report the id
-// while it still has parts to accept.
+// versionReservation is what a multipart Complete reported of its version
+// while it still had parts to accept: a seq and id taken before the commit
+// lock by reserveVersion, or, with VersionID empty, no id at all, which
+// commits only as a null version.
 type versionReservation struct {
-	// Seq is the reserved ordinal.
+	// Seq is the reserved ordinal, or 0 when VersionID is empty.
 	Seq uint64
-	// VersionID is the id minted from Seq, as reported.
+	// VersionID is the id minted from Seq, as reported, or "" when the
+	// Complete reported none.
 	VersionID string
 }
 
-// errReservationSuperseded refuses a commit under a reserved version that
-// can no longer be the key's newest: another write to the key committed
-// with a later seq, or the bucket stopped being Enabled so the version would
-// be null. The reported id can't change, so the write fails; it is not an
-// S3 error, so the client sees a retryable InternalError.
+// errReservationSuperseded refuses a commit that can no longer be what its
+// Complete reported: another write to the key committed with a later seq
+// than the reserved one, or the bucket's versioning changed so the version
+// would be null under a reported id, or numbered with none reported. The
+// report can't change, so the write fails; it is not an S3 error, so the
+// client sees a retryable InternalError.
 var errReservationSuperseded = errors.New("reserved version superseded")
 
 // reserveVersion allocates a version seq and mints its id ahead of the
@@ -336,11 +339,12 @@ func (b *Backend) reserveVersion(ctx context.Context, bucket string) (versionRes
 	return versionReservation{Seq: seq, VersionID: mintVersionID(seq)}, nil
 }
 
-// commitVersionAt is commitVersion under a reserved version (reserveVersion)
-// when reserved is non-nil. Under the lock it re-checks that the
-// reservation is still the key's newest version in an Enabled bucket, which
-// keeps invariant 2 of docs/s3-versioning.md §2.4 although the seq was
-// allocated outside the lock.
+// commitVersionAt is commitVersion under what a Complete reported
+// (versionReservation) when reserved is non-nil. Under the lock it
+// re-checks that a reserved version is still the key's newest in an Enabled
+// bucket, which keeps invariant 2 of docs/s3-versioning.md §2.4 although
+// the seq was allocated outside the lock, and that a Complete that reported
+// no id commits no numbered version.
 func (b *Backend) commitVersionAt(ctx context.Context, bucketState *registry.State, key string, mf *msbucket.ObjectManifest, blobs msbucket.BlobRefs, initState *msbucket.VersionState, pinned bool, reserved *versionReservation, preCheck func(superseded *msbucket.ObjectManifest) error) (msbucket.VersionNode, registry.VersioningState, error) {
 	var node msbucket.VersionNode
 	var effState registry.VersioningState
@@ -356,12 +360,15 @@ func (b *Backend) commitVersionAt(ctx context.Context, bucketState *registry.Sta
 		var seq uint64
 		var err error
 		vid := registry.NullVersionID
-		if reserved != nil {
+		if reserved != nil && reserved.VersionID != "" {
 			if st.Versioning != registry.VersioningEnabled {
 				return cid.Undef, errReservationSuperseded
 			}
 			seq, vid = reserved.Seq, reserved.VersionID
 		} else {
+			if reserved != nil && st.Versioning == registry.VersioningEnabled {
+				return cid.Undef, errReservationSuperseded
+			}
 			if seq, err = b.reg.AllocVersionSeq(ctx, st.Name); err != nil {
 				return cid.Undef, fmt.Errorf("alloc version seq: %w", err)
 			}
@@ -418,7 +425,7 @@ func (b *Backend) commitVersionAt(ctx context.Context, bucketState *registry.Sta
 
 		// A key's current version holds its largest seq (§2.4 invariant 2). A
 		// write that committed during a reservation holds a larger one.
-		if reserved != nil && superseded != nil && superseded.Seq > seq {
+		if reserved != nil && reserved.VersionID != "" && superseded != nil && superseded.Seq > seq {
 			return cid.Undef, errReservationSuperseded
 		}
 

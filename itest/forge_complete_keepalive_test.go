@@ -25,7 +25,7 @@ import (
 // 1ms keepalive (testdata/config-mpkeepalive.yaml) paces the padding fast
 // enough for a Complete of tens of milliseconds to send some. The idempotent
 // re-Complete reads a few rows and may send none. Both report the version
-// the bucket holds.
+// the bucket holds and the object's encryption.
 func TestForgeCompleteKeepalive(t *testing.T) {
 	ctx := t.Context()
 	s, endpoint := forgeStack(t, withCompleteKeepaliveConfig())
@@ -79,6 +79,10 @@ func TestForgeCompleteKeepalive(t *testing.T) {
 		if resp.versionID == "" || resp.versionID != aws.ToString(out.VersionId) {
 			t.Fatalf("%s: header x-amz-version-id %q, SDK VersionId %q; want the same non-empty id", attempt, resp.versionID, aws.ToString(out.VersionId))
 		}
+		// The bucket encrypts by default, and the early headers say so.
+		if resp.encryption != string(types.ServerSideEncryptionAes256) || out.ServerSideEncryption != types.ServerSideEncryptionAes256 {
+			t.Fatalf("%s: header x-amz-server-side-encryption %q, SDK %q; want AES256", attempt, resp.encryption, out.ServerSideEncryption)
+		}
 		versions, err := cl.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{Bucket: aws.String(bucket)})
 		if err != nil {
 			t.Fatalf("ListObjectVersions: %v", err)
@@ -99,8 +103,9 @@ func withCompleteKeepaliveConfig() stack.Option {
 // recordedComplete is a CompleteMultipartUpload response as it came off the
 // wire, before the SDK decoded it.
 type recordedComplete struct {
-	versionID string
-	body      []byte
+	versionID  string
+	encryption string
+	body       []byte
 }
 
 // streamed reports whether the body is the XML declaration, newline
@@ -127,7 +132,10 @@ func (c *completeRecorder) RoundTrip(req *http.Request) (*http.Response, error) 
 	if err != nil || req.Method != http.MethodPost || !req.URL.Query().Has("uploadId") {
 		return resp, err
 	}
-	r := &recordedComplete{versionID: resp.Header.Get("x-amz-version-id")}
+	r := &recordedComplete{
+		versionID:  resp.Header.Get("x-amz-version-id"),
+		encryption: resp.Header.Get("x-amz-server-side-encryption"),
+	}
 	c.mu.Lock()
 	c.responses = append(c.responses, r)
 	c.mu.Unlock()

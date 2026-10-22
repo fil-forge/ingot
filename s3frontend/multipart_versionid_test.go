@@ -8,6 +8,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/fil-forge/versitygw/backend"
 	"github.com/fil-forge/versitygw/s3response"
 
 	"github.com/fil-forge/ingot/inmem"
@@ -61,21 +62,29 @@ func completeAnnounced(t *testing.T, b *Backend, key, uploadID string, parts []t
 	})
 }
 
-// completeReporting completes an upload with report as its version id
-// callback.
+// completeReporting completes an upload with report seeing each version id
+// it reports, and checks that a successful result carries the encryption
+// it reported.
 func completeReporting(t *testing.T, b *Backend, key, uploadID string, parts []types.CompletedPart, report func(string)) (announced []string, versionID string, err error) {
 	t.Helper()
 	bucket := "bk"
 	var reported []string
-	_, versionID, err = b.CompleteMultipartUploadReportingVersionID(context.Background(), &s3.CompleteMultipartUploadInput{
+	var encryptions []types.ServerSideEncryption
+	res, versionID, err := b.CompleteMultipartUploadReportingHeaders(context.Background(), &s3.CompleteMultipartUploadInput{
 		Bucket:          &bucket,
 		Key:             &key,
 		UploadId:        &uploadID,
 		MultipartUpload: &types.CompletedMultipartUpload{Parts: parts},
-	}, func(id string) {
-		reported = append(reported, id)
-		report(id)
+	}, func(r backend.CompleteMultipartUploadHeaders) {
+		reported = append(reported, r.VersionID)
+		encryptions = append(encryptions, r.ServerSideEncryption)
+		report(r.VersionID)
 	})
+	for _, sse := range encryptions {
+		if err == nil && sse != res.ServerSideEncryption {
+			t.Errorf("reported encryption %q, result has %q", sse, res.ServerSideEncryption)
+		}
+	}
 	return reported, versionID, err
 }
 
@@ -251,8 +260,9 @@ func TestReCompleteReplaysTheVersionID(t *testing.T) {
 
 // A Complete that finds another Complete of its upload in progress reports
 // "" before it waits, since the winner's id isn't known yet. When the winner
-// fails and this caller then wins the latch, it commits a version of its
-// own, under no reservation: its report has already gone out.
+// fails and this caller then wins the latch, its commit would create a
+// numbered version it never reported, so it is refused retryably, and the
+// retry reports the id it commits.
 func TestCompleteThatWaitsOnTheWinnerReportsNoVersion(t *testing.T) {
 	b, mp := newHookedCompleteBackend(t)
 	setVersioning(t, b, types.BucketVersioningStatusEnabled)
@@ -270,14 +280,52 @@ func TestCompleteThatWaitsOnTheWinnerReportsNoVersion(t *testing.T) {
 		}
 	}
 
-	reported, versionID, err := completeReporting(t, b, key, uploadID, parts, reopen)
-	if err != nil {
-		t.Fatalf("Complete: %v", err)
+	reported, _, err := completeReporting(t, b, key, uploadID, parts, reopen)
+	if !errors.Is(err, errReservationSuperseded) {
+		t.Fatalf("Complete: err = %v, want errReservationSuperseded", err)
 	}
 	if !slices.Equal(reported, []string{""}) {
 		t.Fatalf("reported %q, want one empty report", reported)
 	}
-	if versionID == "" || currentVersionID(t, b, key) != versionID {
-		t.Fatalf("Complete returned version %q, current is %q; want the same non-empty id", versionID, currentVersionID(t, b, key))
+	if st := sessionState(t, mp.multipart, uploadID); st != registry.SessionOpen {
+		t.Fatalf("session state %q after the refusal, want open", st)
+	}
+
+	retried, versionID, err := completeAnnounced(t, b, key, uploadID, parts)
+	if err != nil {
+		t.Fatalf("retried Complete: %v", err)
+	}
+	if len(retried) != 1 || retried[0] == "" || retried[0] != versionID || currentVersionID(t, b, key) != versionID {
+		t.Fatalf("retry reported %q and returned %q, current is %q; want the same non-empty id", retried, versionID, currentVersionID(t, b, key))
+	}
+}
+
+// Enabling versioning while a Complete in an unversioned bucket accepts its
+// parts would have it create a numbered version after reporting none, so the
+// commit is refused retryably, and the retry reports the id it commits.
+func TestCompleteRefusedWhenVersioningIsEnabledDuringIt(t *testing.T) {
+	b, mp := newHookedCompleteBackend(t)
+	key := "enabled"
+	uploadID, parts := completeTwoParts(t, b, key)
+
+	reported, _, err := completeReporting(t, b, key, uploadID, parts, func(string) {
+		setVersioning(t, b, types.BucketVersioningStatusEnabled)
+	})
+	if !errors.Is(err, errReservationSuperseded) {
+		t.Fatalf("Complete: err = %v, want errReservationSuperseded", err)
+	}
+	if !slices.Equal(reported, []string{""}) {
+		t.Fatalf("reported %q, want one empty report", reported)
+	}
+	if st := sessionState(t, mp.multipart, uploadID); st != registry.SessionOpen {
+		t.Fatalf("session state %q after the refusal, want open", st)
+	}
+
+	retried, versionID, err := completeAnnounced(t, b, key, uploadID, parts)
+	if err != nil {
+		t.Fatalf("retried Complete: %v", err)
+	}
+	if len(retried) != 1 || retried[0] == "" || retried[0] != versionID {
+		t.Fatalf("retry reported %q and returned %q, want the same non-empty id", retried, versionID)
 	}
 }
