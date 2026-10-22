@@ -92,6 +92,11 @@ func TestForgeRoutePermissions(t *testing.T) {
 		deleter := client("deleter", withoutVersion)
 		v1 := put("kept")
 		put("marked")
+		// An allowed request first, so the key's action set and chains are
+		// cached and the second denial below runs against them.
+		if _, err := deleteObjects(deleter, types.ObjectIdentifier{Key: aws.String("probe")}); err != nil {
+			t.Fatalf("priming DeleteObjects with s3:DeleteObject: %v", err)
+		}
 
 		// The mixed batch is refused as a whole, once through hilt and once
 		// against the caches, with nothing in it deleted.
