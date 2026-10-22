@@ -279,7 +279,7 @@ sequenceDiagram
     loop each streamed blob (uploadBlobs → concludeStreamed)
         B->>U: /ucan/conclude the put receipt, reporting the spooled digest
         U-->>B: accept receipt + /assert/location commitment
-        B->>R: PutLocation, then SetIntentState(accepted); DeleteStream
+        B->>R: PutLocation, then SetIntentState(accepted)#59; DeleteStream
         B->>B: BlobCache.Take: the file moves from the spool to the cache
     end
     loop each spooled-first blob (uploadBlobs)
@@ -298,10 +298,10 @@ sequenceDiagram
     Note over B,U: UploadBlob also captures the request proof store as the<br/>space's ship authority (captureShipProofs, 1h TTL)
     Note over B,L: under the per-bucket lock: commitVersion via Coordinator.WithTx
     B->>TX: Begin (lock, snapshot root)
-    TX->>R: AllocVersionSeq
+    TX->>R: AllocVersionSeq (a multipart Complete in an Enabled bucket<br/>reserved its seq before the lock: see the multipart diagram)
     TX->>TX: mint versionId ("null" unless versioning Enabled),<br/>manifest into OpStaging, re-check If-Match under the lock,<br/>MST splice (new nodes into staging)
     TX->>L: AppendBatch(catalog blocks, OpRoot) with fsync
-    TX->>R: CommitRoot(bucket, snapshot, newRoot), guarded, one transaction:<br/>blob_refs gains this version, superseded version rows removed,<br/>a release record per digest whose claims reached 0;<br/>/upload/add(root = this version's manifest CID)<br/>+ /upload/remove per discarded version queued (upload_registrations)
+    TX->>R: CommitRoot(bucket, snapshot, newRoot), guarded, one transaction:<br/>blob_refs gains this version, superseded version rows removed,<br/>a release record per digest whose claims reached 0#59;<br/>/upload/add(root = this version's manifest CID)<br/>+ /upload/remove per discarded version queued (upload_registrations)
     TX-->>B: committed, lock released
     B-->>C: 200 + ETag (+ x-amz-version-id when versioning is configured)
     Note over B,U: the release sweeper runs each record once its grace passes:<br/>/blob/remove (+ crypto-shred: its blob_encryption_params row deleted)
@@ -533,21 +533,31 @@ sequenceDiagram
     end
     Note over A,R: a failed pass backs off (1 s to 30 s) and retries#59; the accept sweeper<br/>nudges every live upload with parked parts at start and every 30 s
     C->>B: CompleteMultipartUpload(parts)
-    B->>B: validate parts (ascending, ETags, checksums, MinPartSize)
+    B->>B: validate parts (ascending, ETags, checksums, MinPartSize)#59;<br/>an error here is answered with its own status
     alt session already completed
-        B-->>C: the ETag/version id recorded on the session (idempotent re-Complete)
+        B-->>C: report the version id recorded on the session (none for a null version),<br/>then its ETag (idempotent re-Complete)
+    else another Complete holds the latch
+        B-->>C: report no version id (the winner's isn't known yet), then wait (bounded):<br/>replay its result, or take the latch if it failed
     else latch won
         B->>R: LatchSession(open to completing), single winner
+        B->>R: ListPartTrees#59; re-hash over budget: 400 InvalidPartLayout,<br/>the deferred revert reopens the session
+        alt versioning Enabled, nothing reported yet
+            B->>R: reserveVersion: AllocVersionSeq off the lock, mint the versionId
+            B-->>C: report it: versitygw commits the 200 with x-amz-version-id<br/>and x-amz-server-side-encryption
+        else
+            B-->>C: report no version id: the 200 commits with x-amz-server-side-encryption only
+        end
+        Note over B,C: from here the body is padded with a newline every<br/>complete_multipart_keepalive (5 s), and any error goes in the 200's body
         B->>R: manifest spans from each part's span_lengths<br/>(rows without them: intent size + FEE geometry)
         B->>A: awaitPass until no named part is parked, up to acceptWaitBudget (30 s)
         B->>R: ListParts: the named parts' states
         alt a named part still parked
-            B-->>C: 409 OperationAborted#59; the deferred revert reopens the session
+            B-->>C: OperationAborted in the 200's body#59; the deferred revert reopens the session
         else every part accepted, or spooled
             B->>U: spooled parts only: concludeBlobs (conclude, or upload a never-parked blob)
-            B->>TX: commitVersion (see the PutObject diagram)#59; the claims land<br/>in the root swap's transaction, set-based
+            B->>TX: commitVersionAt under what was reported (see the PutObject diagram)#59;<br/>refused (errReservationSuperseded) if the key gained a later seq,<br/>or the versioning no longer fits the report#59; the claims land<br/>in the root swap's transaction, set-based
             B->>R: LatchSession(completing to completed), best-effort
-            B-->>C: 200, ETag = md5-of-part-md5s + "-N"
+            B-->>C: the result ends the body: ETag = md5-of-part-md5s + "-N"
         end
     end
     C->>B: AbortMultipartUpload
@@ -585,6 +595,12 @@ sequenceDiagram
   `UploadBlob`, after rechecking for a park under the blob's lock: an
   UploadPart still parking the blob when Complete classified it holds that
   lock, and its park is concluded rather than allocated beside.
+- Complete reports its response headers through versitygw's
+  `CompleteMultipartUploadReportingHeaders` before it accepts the parts,
+  and the response commits to 200 at the report, as S3's does. A reserved
+  version id is binding, and a Complete that reported none commits only a
+  null version, so the client always learns the version it created
+  ([`s3-versioning.md`](./s3-versioning.md) §5.1).
 
 Cross-references: [`architecture.md` §7.2](./architecture.md#72-multipart),
 [§7.3](./architecture.md#73-the-session-latch-the-abortcomplete-race).
@@ -592,6 +608,7 @@ Cross-references: [`architecture.md` §7.2](./architecture.md#72-multipart),
 Sources: `s3frontend/multipart.go` (all verbs, ingestPart, parkBlobs,
 recordStreamedPark, acceptRequested, acceptParked, recordConcluded,
 concludeBlobs, enqueuePartReleases, SweepStaleMultipartSessions),
+`s3frontend/version.go` (reserveVersion, commitVersionAt),
 `s3frontend/acceptor.go`, `s3frontend/stream.go`,
 `s3frontend/object.go` (runRelease, executeRelease),
 `s3frontend/uploadpartcopy.go`, `registry/stores.go`,
@@ -655,11 +672,14 @@ stateDiagram-v2
     completed --> [*] : sweeper past TTL
 ```
 
-- A Complete that loses the latch waits (bounded) for the winner's terminal
-  state: `completed` replays the ETag and version id the winner recorded on
-  the session; `aborting` or a vanished row is `NoSuchUpload`; a winner still
-  running past the wait budget is `OperationAborted`, a 409 the AWS CLI
-  and other botocore clients treat as final.
+- A Complete that loses the latch reports no version id, then waits
+  (bounded) for the winner's terminal state: `completed` replays the ETag
+  and version id the winner recorded on the session; `aborting` or a
+  vanished row is `NoSuchUpload`; a winner still running past the wait
+  budget is `OperationAborted`, inside the 200's body since the headers
+  have gone out. A winner that fails reopens the session, and the waiting
+  Complete may then take the latch; in an Enabled bucket its commit is
+  refused, since it reported no id, and the client's retry reports one.
 - `ListParts` and `Abort` reject any non-`open` session as `NoSuchUpload`;
   `Complete` alone accepts `completed`, for idempotency.
 - The sweeper also reaps rows stuck in `completing` or `aborting` past the
@@ -1230,7 +1250,8 @@ listed diagrams (each diagram's `Sources:` footer names its exact files).
 
 | Package / file | Diagrams to review |
 |---|---|
-| `s3frontend/object.go`, `s3frontend/version.go` | put, get, blob-lifecycle, version-tree, gc-candidates |
+| `s3frontend/object.go` | put, get, blob-lifecycle, version-tree, gc-candidates |
+| `s3frontend/version.go` | put, get, multipart, blob-lifecycle, version-tree, gc-candidates |
 | `s3frontend/multipart.go` | multipart, part-states, multipart-states, blob-lifecycle |
 | `s3frontend/acceptor.go` | multipart, part-states, blob-lifecycle |
 | `s3frontend/stream.go` | put, multipart, block-routes, blob-lifecycle |
