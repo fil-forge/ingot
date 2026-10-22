@@ -115,15 +115,18 @@ func shippingStore(t *testing.T) *chainStore {
 // request's store becomes the store a ship to the space signs with, found
 // later without a request and ahead of an upload's capture, while the
 // release, abort and renewal paths (shipProofStore) keep the upload's, since
-// a commit's grant need not cover their commands. A commit store with no
-// /blob/add chain gives way to the upload's, and a ctx carrying no store
-// leaves the capture in place.
+// a commit's grant need not cover their commands. A store with no /blob/add
+// chain isn't captured, a captured chain that lapses gives way to the
+// upload's, and a ctx carrying no store leaves the capture in place.
 func TestForgeCaptureShipAuthority(t *testing.T) {
 	fg := newTestForge(t)
 	ctx := context.Background()
 	space := mustSpace(t)
 	uploaded := shippingStore(t)
 	committed := shippingStore(t)
+	withStore := func(store ucanlib.ProofStore) context.Context {
+		return context.WithValue(ctx, reqscope.ProofStoreKey(), store)
+	}
 
 	// With only an upload's capture, the ship falls back to it.
 	fg.captureShipProofs(space, uploaded)
@@ -131,7 +134,7 @@ func TestForgeCaptureShipAuthority(t *testing.T) {
 	require.True(t, ok)
 	require.Same(t, uploaded, got)
 
-	fg.CaptureShipAuthority(context.WithValue(ctx, reqscope.ProofStoreKey(), ucanlib.ProofStore(committed)), space)
+	fg.CaptureShipAuthority(withStore(committed), space)
 	got, ok = fg.catalogShipStore(ctx, space)
 	require.True(t, ok)
 	require.Same(t, committed, got, "the ship signs with the latest commit's store")
@@ -144,22 +147,55 @@ func TestForgeCaptureShipAuthority(t *testing.T) {
 	require.True(t, ok)
 	require.Same(t, committed, got, "a ctx without a store must not replace the capture")
 
-	// A commit store that can't build a /blob/add chain gives way to the
-	// upload's.
-	fg.CaptureShipAuthority(context.WithValue(ctx, reqscope.ProofStoreKey(), ucanlib.ProofStore(&chainStore{})), space)
+	// A commit by a key that can't ship leaves the capture alone.
+	fg.CaptureShipAuthority(withStore(&chainStore{}), space)
 	got, ok = fg.catalogShipStore(ctx, space)
 	require.True(t, ok)
-	require.Same(t, uploaded, got, "a commit store with no chain must not be shipped with")
+	require.Same(t, committed, got, "a store with no chain must not displace one that has it")
+
+	// A captured chain that lapses gives way to the upload's.
+	committed.chain = nil
+	got, ok = fg.catalogShipStore(ctx, space)
+	require.True(t, ok)
+	require.Same(t, uploaded, got, "a commit store whose chain lapsed must not be shipped with")
 
 	// A commit's capture alone is enough to ship.
 	other := mustSpace(t)
-	fg.CaptureShipAuthority(context.WithValue(ctx, reqscope.ProofStoreKey(), ucanlib.ProofStore(committed)), other)
-	got, ok = fg.catalogShipStore(ctx, other)
+	fg.CaptureShipAuthority(withStore(shippingStore(t)), other)
+	_, ok = fg.catalogShipStore(ctx, other)
 	require.True(t, ok)
-	require.Same(t, committed, got)
 	if _, ok := fg.shipProofStore(ctx, other); ok {
 		t.Fatal("a commit's capture must not serve release, abort or renewal")
 	}
+}
+
+// TestForgeShipProbeAsksForBlobAdd checks the probe against real chains: a
+// store is captured for the ship only when it holds a /blob/add delegation
+// from the space to the agent, the chain the ship's own invocation needs.
+func TestForgeShipProbeAsksForBlobAdd(t *testing.T) {
+	fg := newTestForge(t)
+	ctx := context.Background()
+	agent := fg.client.Issuer().DID()
+	storeWith := func(t *testing.T, aud did.DID, cmd string) (did.DID, ucanlib.ProofStore) {
+		t.Helper()
+		space, err := ed25519.GenerateIssuer()
+		require.NoError(t, err)
+		d, err := delegation.Delegate(space, aud, space.DID(), command.MustParse(cmd), delegation.WithNoExpiration())
+		require.NoError(t, err)
+		store := tokenstore.NewMemStore()
+		require.NoError(t, store.AddDelegations(ctx, d))
+		return space.DID(), store
+	}
+	captured := func(space did.DID, store ucanlib.ProofStore) bool {
+		fg.CaptureShipAuthority(context.WithValue(ctx, reqscope.ProofStoreKey(), store), space)
+		_, ok := fg.catalogShipStore(ctx, space)
+		return ok
+	}
+
+	require.True(t, captured(storeWith(t, agent, "/blob/add")), "a /blob/add grant to the agent ships")
+	require.True(t, captured(storeWith(t, agent, "/blob")), "a /blob grant covers /blob/add")
+	require.False(t, captured(storeWith(t, agent, "/blob/remove")), "a /blob/remove grant doesn't")
+	require.False(t, captured(storeWith(t, mustSpace(t), "/blob/add")), "a grant to another audience doesn't")
 }
 
 // TestSubmitShardShipsUnderCommitCapture checks SubmitShard resolves its

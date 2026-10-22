@@ -142,27 +142,33 @@ func (u *Forge) captureShipProofs(space did.DID, store ucanlib.ProofStore) {
 
 // CaptureShipAuthority records the request's proof store as space's ship
 // authority (Uploader), in commitProofs. A ctx without one, such as a
-// background commit's, leaves the capture as it was.
+// background commit's, leaves the capture as it was, and so does a store
+// that can't ship, so a key with no /blob/add chain never displaces one that
+// has it.
 func (u *Forge) CaptureShipAuthority(ctx context.Context, space did.DID) {
-	if store, ok := reqscope.ProofStore(ctx); ok {
+	if store, ok := reqscope.ProofStore(ctx); ok && u.canShip(ctx, store, space) {
 		u.commitProofs.Set(space.String(), store, gocache.DefaultExpiration)
 	}
 }
 
+// canShip reports whether store holds a chain authorizing the agent to
+// /blob/add to space: the question the ship's own invocation asks.
+func (u *Forge) canShip(ctx context.Context, store ucanlib.ProofStore, space did.DID) bool {
+	proofs, _, err := store.ProofChain(ctx, u.client.Issuer().DID(), blobcmds.Add.Command, space)
+	return err == nil && len(proofs) > 0
+}
+
 // catalogShipStore resolves the proof store a catalog ship to space signs
 // with: the request-scoped store if this runs in-request, else the store of
-// the space's most recent commit if it holds a /blob/add chain for the
-// space, else shipProofStore's. A commit's store can hold none (a key whose
-// grant predates the ship's commands, an expired or revoked delegation)
-// while the upload's still ships.
+// the space's most recent commit if it still holds a /blob/add chain for the
+// space, else shipProofStore's. A captured chain can lapse before the ship
+// (an expired or revoked delegation) while the upload's still ships.
 func (u *Forge) catalogShipStore(ctx context.Context, space did.DID) (ucanlib.ProofStore, bool) {
 	if store, ok := reqscope.ProofStore(ctx); ok {
 		return store, true
 	}
 	if v, ok := u.commitProofs.Get(space.String()); ok {
-		store := v.(ucanlib.ProofStore)
-		proofs, _, err := store.ProofChain(ctx, u.client.Issuer().DID(), blobcmds.Add.Command, space)
-		if err == nil && len(proofs) > 0 {
+		if store := v.(ucanlib.ProofStore); u.canShip(ctx, store, space) {
 			return store, true
 		}
 	}
@@ -188,11 +194,12 @@ func (u *Forge) SubmitShard(ctx context.Context, plane blockstore.Plane, space d
 	}
 
 	// The ship runs async (flush goroutine, no request), so its authority is
-	// the store captured from a recent in-request write to this space. No
-	// store → fail so the flush retries; a later write repopulates it.
+	// a store captured from a recent in-request write to this space. None
+	// that can ship → fail so the flush retries; a later write repopulates
+	// it.
 	store, ok := u.catalogShipStore(ctx, space)
 	if !ok {
-		return BlobLocation{}, nil, fmt.Errorf("uploader: no ship authority for space %s (no captured proof store)", space)
+		return BlobLocation{}, nil, fmt.Errorf("uploader: no ship authority for space %s (no captured proof store holds a /blob/add chain)", space)
 	}
 
 	// The index blob's bytes and digest are deterministic from the shard, so

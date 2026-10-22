@@ -921,7 +921,7 @@ flowchart TB
     kp -->|"captureShipProofs<br/>at UploadBlob and StartBlob"| ship
     kp -->|"CaptureShipAuthority<br/>at every bucketop commit"| commit
     commit --> catship["async catalog ship"]
-    ship -->|"no commit capture"| catship
+    ship -->|"no commit capture<br/>holding a chain"| catship
     ship --> async["sweepers' releases, aborts and<br/>registration renewals; DeleteBucket aborts"]
     static --> hc["hilt client:<br/>every /s3/* invocation"]
 
