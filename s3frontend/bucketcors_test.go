@@ -118,3 +118,33 @@ func TestBucketCors_MissingBucket(t *testing.T) {
 	wantAPIErr(t, b.PutBucketCors(ctx, "nope", []byte(corsDoc)), s3err.ErrNoSuchBucket)
 	wantAPIErr(t, b.DeleteBucketCors(ctx, "nope"), s3err.ErrNoSuchBucket)
 }
+
+// A bucket's document goes with its registry row, which DeleteBucket ends by
+// removing: a bucket deleted and created again under the same name answers
+// the default, not the document the earlier bucket stored.
+func TestBucketCors_DoesNotSurviveTheBucket(t *testing.T) {
+	b, mem, _ := newRefTestBackend(t)
+	ctx := context.Background()
+	gateway := []byte(`<CORSConfiguration/>`)
+	b.cors = gateway
+
+	if err := b.PutBucketCors(ctx, "bk", []byte(corsDoc)); err != nil {
+		t.Fatalf("PutBucketCors: %v", err)
+	}
+	if err := mem.Delete(ctx, "bk"); err != nil {
+		t.Fatalf("delete bucket: %v", err)
+	}
+	_, err := b.GetBucketCors(ctx, "bk")
+	wantAPIErr(t, err, s3err.ErrNoSuchBucket)
+
+	if err := mem.Create(ctx, "bk", did.Undef, registry.CreateState{}); err != nil {
+		t.Fatalf("create bucket again: %v", err)
+	}
+	got, err := b.GetBucketCors(ctx, "bk")
+	if err != nil {
+		t.Fatalf("GetBucketCors after re-creation: %v", err)
+	}
+	if !bytes.Equal(got, gateway) {
+		t.Fatalf("GetBucketCors after re-creation = %q, want the gateway document", got)
+	}
+}
