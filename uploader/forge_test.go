@@ -84,3 +84,22 @@ func TestForgeShipProofsRequestScopeWins(t *testing.T) {
 	require.Same(t, scoped, got)
 	require.NotSame(t, captured, got)
 }
+
+// TestForgeCaptureShipAuthority checks the capture a commit makes: the
+// request's store becomes the space's ship authority, found later without a
+// request, and a ctx carrying none leaves an earlier capture in place.
+func TestForgeCaptureShipAuthority(t *testing.T) {
+	fg := newTestForge(t)
+	space := mustSpace(t)
+	store := ucanlib.ProofStore(tokenstore.NewMemStore())
+
+	fg.CaptureShipAuthority(context.WithValue(context.Background(), reqscope.ProofStoreKey(), store), space)
+	got, ok := fg.shipProofStore(context.Background(), space)
+	require.True(t, ok)
+	require.Same(t, store, got)
+
+	fg.CaptureShipAuthority(context.Background(), space)
+	got, ok = fg.shipProofStore(context.Background(), space)
+	require.True(t, ok)
+	require.Same(t, store, got, "a ctx without a store must not replace the capture")
+}

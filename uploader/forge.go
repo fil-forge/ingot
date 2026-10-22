@@ -40,6 +40,12 @@ type Uploader interface {
 	// the ship registers TWO blobs in the space (the CAR and its index), and
 	// deleting the bucket later must release both. Nil when nothing shipped.
 	SubmitShard(ctx context.Context, plane blockstore.Plane, space did.DID, shard CARShard) (BlobLocation, multihash.Multihash, error)
+	// CaptureShipAuthority records the request's proof store on ctx, if it
+	// carries one, as the authority SubmitShard ships space's segments with.
+	// SubmitShard runs outside any request, so every write that appends
+	// catalog blocks hands it its request, not only a write that uploads a
+	// body.
+	CaptureShipAuthority(ctx context.Context, space did.DID)
 }
 
 // CARShard describes one plane's sealed CAR file ready to ship. All
@@ -74,7 +80,8 @@ type Forge struct {
 	// store seen on an in-request write to that space. The catalog segment
 	// ship (SubmitShard) runs asynchronously in the flush goroutine with no
 	// request context, so it reuses this to authorize its onward
-	// /blob/add + /index/add. See UploadBlob (capture) and SubmitShard (use).
+	// /blob/add + /index/add. See UploadBlob, StartBlob and
+	// CaptureShipAuthority (capture) and SubmitShard (use).
 	shipProofs *gocache.Cache
 }
 
@@ -121,6 +128,15 @@ func (u *Forge) captureShipProofs(space did.DID, store ucanlib.ProofStore) {
 		return
 	}
 	u.shipProofs.Set(space.String(), store, gocache.DefaultExpiration)
+}
+
+// CaptureShipAuthority records the request's proof store as space's ship
+// authority (Uploader). A ctx without one, such as a background commit's,
+// leaves the capture as it was.
+func (u *Forge) CaptureShipAuthority(ctx context.Context, space did.DID) {
+	if store, ok := reqscope.ProofStore(ctx); ok {
+		u.captureShipProofs(space, store)
+	}
 }
 
 // shipProofStore resolves the proof store authorizing a ship to space: the

@@ -487,7 +487,7 @@ not yet started defers while a write of its space holds the digest.
   the agent, and the per-key `DelegationCache` carries those proofs into the
   request via `internal/reqscope`, where the uploader and the network read
   tier spend them. The uploader also captures a per-space ship authority
-  (1h TTL) for the async catalog flush. The same cache's action sets ride
+  (1h TTL) for the async catalog flush, from every write that commits. The same cache's action sets ride
   along (`reqscope.Permits`) for the one check hilt cannot make from the
   URL: a `DeleteObjects` entry naming a version needs
   `s3:DeleteObjectVersion`, beyond the request's `s3:DeleteObject`.
@@ -537,8 +537,10 @@ draws the chains and the stores.
 - **Reads carry no bucket context**: `Manager.Get` linear-scans every open
   bucket store; threading the bucket into the read path removes the scan.
 - **The ship authority expires**: the async flush signs with a per-space
-  proof store captured at the last in-request write (1h TTL); a bucket idle
-  longer than that cannot ship a newly sealed segment until its next write.
+  proof store captured, in memory, from the bucket's last write (1h TTL).
+  Every commit captures it, so a segment ships under its own writes'
+  capture, but one whose ship keeps failing past the TTL, or across a
+  restart, has no authority until the bucket's next write.
 - **The indexer read path is unwired**: `LocalLocator` serves all reads; the
   network index is still published (best-effort) but never consulted.
 - **Carried Forge-client copies**: `forgeclient/`, `tokenstore/`,

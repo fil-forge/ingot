@@ -183,6 +183,11 @@ type Deps struct {
 	Spool *blockstore.Spool
 	Cache *blockstore.BlobCache
 
+	// Ships is the catalog log's ship uploader. Each commit hands it its
+	// request's proof store as the bucket space's ship authority
+	// (bucketop.Deps.Ships). Optional.
+	Ships bucketop.ShipAuthority
+
 	// Uploader makes each spooled body blob durable on Forge (allocate→PUT→
 	// accept) synchronously, before the manifest commits. Remover releases a
 	// space's claim on a blob when its last reference is dropped.
@@ -318,7 +323,7 @@ func New(d Deps) *Backend {
 		locations:       d.Locations,
 		gc:              d.GC,
 		multipart:       d.Multipart,
-		txns:            bucketop.NewCoordinator(bucketop.Deps{Reg: d.Registry, Log: d.Log, Reads: d.Reads}),
+		txns:            bucketop.NewCoordinator(bucketop.Deps{Reg: d.Registry, Log: d.Log, Reads: d.Reads, Ships: d.Ships}),
 		log:             d.Log,
 		spool:           d.Spool,
 		cache:           d.Cache,

@@ -301,6 +301,7 @@ sequenceDiagram
     TX->>R: AllocVersionSeq (a multipart Complete in an Enabled bucket<br/>reserved its seq before the lock: see the multipart diagram)
     TX->>TX: mint versionId ("null" unless versioning Enabled),<br/>manifest into OpStaging, re-check If-Match under the lock,<br/>MST splice (new nodes into staging)
     TX->>L: AppendBatch(catalog blocks, OpRoot) with fsync
+    Note over TX: uploader.CaptureShipAuthority: every commit captures the request<br/>proof store as the space's ship authority, so a write with no body<br/>(a delete, a tag change) leaves one for its segment's ship
     TX->>R: CommitRoot(bucket, snapshot, newRoot), guarded, one transaction:<br/>blob_refs gains this version, superseded version rows removed,<br/>a release record per digest whose claims reached 0#59;<br/>/upload/add(root = this version's manifest CID)<br/>+ /upload/remove per discarded version queued (upload_registrations)
     TX-->>B: committed, lock released
     B-->>C: 200 + ETag (+ x-amz-version-id when versioning is configured)
@@ -915,7 +916,7 @@ flowchart TB
 
     kp -->|"reqscope.ProofStore<br/>on the request ctx"| writes["uploader:<br/>/blob/add, abort, remove, /index/add<br/>/upload/add, /upload/remove"]
     kp -->|"same store"| reads["blockstore.Forge:<br/>content/retrieve"]
-    kp -->|"captureShipProofs<br/>at UploadBlob"| ship
+    kp -->|"captureShipProofs at UploadBlob,<br/>StartBlob and every bucketop commit"| ship
     ship --> async["async catalog ship;<br/>sweeper and DeleteBucket aborts"]
     static --> hc["hilt client:<br/>every /s3/* invocation"]
 
@@ -929,9 +930,10 @@ flowchart TB
   account is disabled, so no access-key auth path skips the hilt-backed IAM
   lookup. `/health` and the DID document are outside the S3 auth chain, and a
   rejected access key never receives one.
-- A bucket whose last write is more than an hour old has an expired ship
-  authority; a newly sealed segment then waits for the bucket's next write to
-  re-capture it.
+- Every write captures the ship authority when it commits, so a segment,
+  sealed seconds after its writes, ships under a fresh capture. The capture
+  lasts an hour and lives in memory: a segment whose ship keeps failing past
+  that, or across a restart, has no authority until the bucket's next write.
 - Each access key gets its own `DelegationCache`, so a proof chain can never
   assemble across keys.
 - The same store holds the effective S3 action set hilt reported for the key
@@ -955,7 +957,8 @@ Cross-references: [`architecture.md` §9](./architecture.md#9-the-system-contrac
 
 Sources: `iam/service.go`, `iam/keyproofs.go`, `iam/proofcache.go`,
 `internal/reqscope/reqscope.go`, `uploader/forge.go` (shipProofs,
-captureShipProofs), `module.go`, `config/config.go` (auth_service fields).
+captureShipProofs, CaptureShipAuthority), `bucketop/bucketop.go` (Tx.Commit),
+`module.go`, `config/config.go` (auth_service fields).
 Review when these change.
 
 ## Request authorization and proof capture

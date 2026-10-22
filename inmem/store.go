@@ -507,6 +507,9 @@ func (NopUploader) SubmitShard(_ context.Context, _ blockstore.Plane, _ did.DID,
 	return uploader.BlobLocation{}, nil, nil
 }
 
+// CaptureShipAuthority is a no-op: SubmitShard needs no authority.
+func (NopUploader) CaptureShipAuthority(_ context.Context, _ did.DID) {}
+
 // UploadBlob accepts immediately, even with WithConclude(false) — there is
 // no network to park on, so the deferred flow degenerates to the synchronous
 // one and reads keep coming from local disk.
