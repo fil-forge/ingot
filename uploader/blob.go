@@ -252,7 +252,7 @@ func (u *Forge) AbortBlob(ctx context.Context, space did.DID, add cid.Cid) error
 	)
 	store, ok := u.shipProofStore(ctx, space)
 	if !ok {
-		return fmt.Errorf("uploader: no proof store for space %s (no request scope and no captured write authority)", space)
+		return fmt.Errorf("uploader: no proof store for space %s (no request scope and no captured upload authority)", space)
 	}
 	if err := u.client.BlobAbort(ctx, space, add, forgeclient.WithProofStore(store)); err != nil {
 		// A BlobAccepted refusal is final, not a fault: the space accepted
@@ -291,7 +291,7 @@ type BlobRemover interface {
 // the storage nodes holding it; piri deletes the bytes only once no space
 // claims the digest (and, for aggregated pieces, once the PDP root retires
 // on-chain). The proof store is request-scoped when present (a DeleteObject)
-// and otherwise the store captured from a recent write to the space.
+// and otherwise the store captured from a recent body upload to the space.
 // Idempotent.
 func (u *Forge) RemoveBlob(ctx context.Context, space did.DID, digest multihash.Multihash) error {
 	u.logger.Info("blob remove",
@@ -300,7 +300,7 @@ func (u *Forge) RemoveBlob(ctx context.Context, space did.DID, digest multihash.
 	)
 	store, ok := u.shipProofStore(ctx, space)
 	if !ok {
-		return fmt.Errorf("uploader: no proof store for space %s (no request scope and no captured write authority)", space)
+		return fmt.Errorf("uploader: no proof store for space %s (no request scope and no captured upload authority)", space)
 	}
 	if err := u.client.BlobRemove(ctx, space, digest, forgeclient.WithProofStore(store)); err != nil {
 		// Callers treat removal as best-effort and may discard the error, so

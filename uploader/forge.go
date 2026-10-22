@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/fil-forge/libforge/blobindex"
+	blobcmds "github.com/fil-forge/libforge/commands/blob"
 	ucanlib "github.com/fil-forge/libforge/ucan"
 	"github.com/fil-forge/ucantone/did"
 	"github.com/ipfs/go-cid"
@@ -76,19 +77,20 @@ type Forge struct {
 	putClient *nethttp.Client
 	logger    *zap.Logger
 
-	// shipProofs caches, per space, the most recent request-scoped proof
-	// store seen on an in-request write to that space. The catalog segment
-	// ship (SubmitShard) runs asynchronously in the flush goroutine with no
-	// request context, so it reuses this to authorize its onward
-	// /blob/add + /index/add. See UploadBlob (capture) and SubmitShard (use).
+	// shipProofs caches, per space, the proof store of the most recent body
+	// upload to that space (UploadBlob, StartBlob). Work that runs outside
+	// any request falls back to it: the release sweeper's /blob/remove, the
+	// session-expiry aborts, registration renewals, and the catalog segment
+	// ship (SubmitShard) when commitProofs can't serve it. An upload's grant
+	// covers all of their commands.
 	shipProofs *gocache.Cache
 
 	// commitProofs caches, per space, the proof store of the most recent
-	// write that committed catalog blocks to it (CaptureShipAuthority). Every
-	// catalog-changing grant includes the ship's commands, but not the
-	// release, abort and registration commands that shipProofs also serves
-	// outside a request (a tagging-only key's does not), so SubmitShard alone
-	// reads it, ahead of shipProofs.
+	// write that committed catalog blocks to it (CaptureShipAuthority). Hilt
+	// grants each catalog-changing operation the ship's commands, but not
+	// necessarily the release, abort and registration commands shipProofs
+	// serves (a tagging-only key's grant has none of them), so SubmitShard
+	// alone reads it, ahead of shipProofs.
 	commitProofs *gocache.Cache
 }
 
@@ -149,13 +151,20 @@ func (u *Forge) CaptureShipAuthority(ctx context.Context, space did.DID) {
 
 // catalogShipStore resolves the proof store a catalog ship to space signs
 // with: the request-scoped store if this runs in-request, else the store of
-// the space's most recent commit, else shipProofStore's.
+// the space's most recent commit if it holds a /blob/add chain for the
+// space, else shipProofStore's. A commit's store can hold none (a key whose
+// grant predates the ship's commands, an expired or revoked delegation)
+// while the upload's still ships.
 func (u *Forge) catalogShipStore(ctx context.Context, space did.DID) (ucanlib.ProofStore, bool) {
 	if store, ok := reqscope.ProofStore(ctx); ok {
 		return store, true
 	}
 	if v, ok := u.commitProofs.Get(space.String()); ok {
-		return v.(ucanlib.ProofStore), true
+		store := v.(ucanlib.ProofStore)
+		proofs, _, err := store.ProofChain(ctx, u.client.Issuer().DID(), blobcmds.Add.Command, space)
+		if err == nil && len(proofs) > 0 {
+			return store, true
+		}
 	}
 	return u.shipProofStore(ctx, space)
 }

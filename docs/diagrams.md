@@ -301,8 +301,8 @@ sequenceDiagram
     B->>TX: Begin (lock, snapshot root)
     TX->>R: AllocVersionSeq (a multipart Complete in an Enabled bucket<br/>reserved its seq before the lock: see the multipart diagram)
     TX->>TX: mint versionId ("null" unless versioning Enabled),<br/>manifest into OpStaging, re-check If-Match under the lock,<br/>MST splice (new nodes into staging)
-    TX->>L: AppendBatch(catalog blocks, OpRoot) with fsync
     Note over TX: uploader.CaptureShipAuthority: every commit captures the request<br/>proof store as the space's ship authority, so a write with no body<br/>(a delete, a tag change) leaves one for its segment's ship
+    TX->>L: AppendBatch(catalog blocks, OpRoot) with fsync
     TX->>R: CommitRoot(bucket, snapshot, newRoot), guarded, one transaction:<br/>blob_refs gains this version, superseded version rows removed,<br/>a release record per digest whose claims reached 0#59;<br/>/upload/add(root = this version's manifest CID)<br/>+ /upload/remove per discarded version queued (upload_registrations)
     TX-->>B: committed, lock released
     B-->>C: 200 + ETag (+ x-amz-version-id when versioning is configured)
@@ -937,12 +937,15 @@ flowchart TB
   rejected access key never receives one.
 - Every write captures the ship authority when it commits, so a segment,
   sealed seconds after its writes, ships under a fresh capture. That capture
-  is kept apart from the upload's: every catalog-changing grant includes the
-  ship's commands, but a narrower key's (tagging, retention) lacks the
-  release, abort and registration commands the upload's capture also
-  serves. Both last an hour and live in memory: a segment whose ship keeps
-  failing past that, or across a restart, has no authority until the
-  bucket's next write.
+  is kept apart from the upload's: hilt grants each catalog-changing
+  operation the ship's commands, but a narrower key's grant (tagging,
+  retention) lacks the release, abort and registration commands the
+  upload's capture also serves. The ship uses the commit's capture only when
+  it holds a `/blob/add` chain for the space (an older key's grant, or an
+  expired or revoked delegation, may not), and the upload's otherwise. Both
+  last an hour and live in memory: a segment whose ship keeps failing past
+  that, or across a restart, has no authority until the bucket's next
+  write.
 - Each access key gets its own `DelegationCache`, so a proof chain can never
   assemble across keys.
 - The same store holds the effective S3 action set hilt reported for the key
@@ -1271,7 +1274,7 @@ listed diagrams (each diagram's `Sources:` footer names its exact files).
 | `s3frontend/acceptor.go` | multipart, part-states, blob-lifecycle |
 | `s3frontend/stream.go` | put, multipart, block-routes, blob-lifecycle |
 | `s3frontend/bucket.go` | context, delete-bucket |
-| `bucketop/` | put, get, delete-bucket, packages |
+| `bucketop/` | put, get, delete-bucket, packages, principals |
 | `blockstore/` | get, packages, block-routes; `forge.go` also context, principals |
 | `registry/` | schema, get, blob-lifecycle, logstore-pipeline |
 | `logstore/` | logstore-pipeline, segment-states, get, block-routes, delete-bucket |

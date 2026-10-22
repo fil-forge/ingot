@@ -42,8 +42,9 @@ type UploadRegistrar interface {
 	// change queued at 23:59 has hours to be drained in. Renewal is for the
 	// queue that outlasts that, which is the upload service being away for
 	// longer than a night. It comes from the space's live authority, which a
-	// recent write to that space leaves behind, so it rescues a space still
-	// in use. A space that has gone quiet has none, and the error says so.
+	// recent body upload to that space leaves behind, so it rescues a space
+	// still taking uploads. A space that has had none for an hour has none,
+	// and the error says so.
 	PrepareAuthority(ctx context.Context, space did.DID, cmd ucan.Command, stored []byte) ([]byte, bool, error)
 	// RegisterUploads records each change as a content entry in one round
 	// trip, reporting the outcomes in the order given: a nil entry means the
@@ -65,11 +66,12 @@ type QueuedUpload struct {
 
 // CaptureAuthority resolves the proof chain for cmd on space and encodes it.
 // The store is request-scoped when present (the write committing the version)
-// and otherwise the authority captured from a recent write to the space.
+// and otherwise the authority captured from a recent body upload to the
+// space.
 func (u *Forge) CaptureAuthority(ctx context.Context, space did.DID, cmd ucan.Command) ([]byte, error) {
 	store, ok := u.shipProofStore(ctx, space)
 	if !ok {
-		return nil, fmt.Errorf("uploader: no proof store for space %s (no request scope and no captured write authority)", space)
+		return nil, fmt.Errorf("uploader: no proof store for space %s (no request scope and no captured upload authority)", space)
 	}
 	proofs, _, err := store.ProofChain(ctx, u.client.Issuer().DID(), cmd, space)
 	if err != nil {
