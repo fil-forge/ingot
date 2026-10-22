@@ -42,9 +42,10 @@ HTTP PUT of the bytes to the allocated piri, a concluded receipt, and the
 `/blob/accept` location commitment. Only then does the short per-bucket
 critical section run: allocate the version seq, write the manifest, splice
 the MST, fsync one `AppendBatch` of the new catalog blocks, and
-compare-and-swap the bucket root in Postgres. The reference index
-(`blob_refs`) reconciles after the commit, releasing superseded blobs whose
-claim count reaches zero. The full trace is the
+compare-and-swap the bucket root in Postgres, with the reference index
+(`blob_refs`) written in the swap's transaction: the version's claims land,
+superseded versions' claims drop, and a blob whose claim count reaches zero
+gets its release record. The full trace is the
 [PutObject diagram](./docs/diagrams.md#putobject-spool-and-upload-off-the-lock-commit-under-it).
 
 **Every body blob is encrypted at ingest** (the FilOne encryption design's
@@ -233,8 +234,9 @@ OperationAborted, a 409; the latch reverts to `open` and the acceptor
 carries on. The AWS CLI and other botocore-based clients treat that 409 as
 final and abort the upload, so the 30 s wait is the margin before a client
 sees a failed upload. Complete lays out the object's byte ranges from the
-part rows' blob lengths and claims every blob in one transaction of four
-statements, however many blobs there are (`AddBlobClaims`).
+part rows' blob lengths and claims every blob in the root swap's
+transaction, a few statements however many blobs there are
+(`registry.CommitRoot`).
 
 Every session teardown (abort, expiry, the completed-session reap, a
 superseded part, the parts a Complete omitted) records a deferred release
@@ -454,8 +456,9 @@ same rule as the rest: a streamed blob concludes, or a streamed part is
 recorded, under the key lock, after a settle and a look at the rows, and
 a location or park another write recorded meanwhile makes the stream
 surplus, given up and reused. The last guard is the claim itself: a
-committed body blob is located by its commit, so `AddBlobClaims` refuses,
-under the claim-key lock, a digest the space has no location for, which is
+committed body blob is located by its commit, so the root swap refuses,
+under the claim-key lock, a claim on a digest the space has no location
+for (`registry.RootCommit.Claims`), which is
 one whose release ran to completion between the write's settle and its
 commit; the write fails with SlowDown for the client to retry. A release
 not yet started defers while a write of its space holds the digest.
@@ -518,8 +521,8 @@ draws the chains and the stores.
   budget. A delete frees its blobs' local copies once their release runs,
   and a multipart part's copy goes once it parks.
 - **Spool crash recovery is not built**: reconciling `upload_intents`
-  against `blob_refs` after a crash between commit and reconcile is a later
-  phase; the window leaks rather than loses referenced data. (Files with no
+  against `blob_refs` after a crash between a blob's upload and its commit
+  is a later phase; the window leaks rather than loses referenced data. (Files with no
   intent row at all, and unfinished `.tmp-*` writes, are reclaimed by the
   sweeper's orphan pass.) Nor is a failed upload's spool file reclaimed: its
   intent stays `spooled` or `uploading`, so neither eviction nor the orphan

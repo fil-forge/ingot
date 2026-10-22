@@ -3,14 +3,17 @@ package s3frontend
 import (
 	"bytes"
 	"context"
+	"errors"
 	msbucket "github.com/fil-forge/ingot/bucket"
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/versitygw/s3response"
+	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
 	"go.uber.org/zap/zaptest"
 
@@ -88,7 +91,6 @@ func newRefTestBackendOver(t *testing.T, mem *inmem.MemStore, log blockstore.Log
 		Registry:        mem,
 		Intents:         mem,
 		Locations:       mem,
-		BlobRefs:        mem,
 		GC:              mem,
 		Multipart:       mem,
 		Parks:           mem,
@@ -366,5 +368,123 @@ func TestRefIndex_SharedDigestAcrossKeys(t *testing.T) {
 	}
 	if rm.removedDigests()[string(d)] != 1 {
 		t.Fatalf("expected one RemoveBlob after the last reference dropped; got %v", rm.removedDigests())
+	}
+}
+
+// failCommitRoot is a registry whose next root commits fail, as a Postgres
+// error at the swap would, after the commit's claims were handed to it.
+type failCommitRoot struct {
+	registry.Registry
+	fails int
+}
+
+func (f *failCommitRoot) CommitRoot(ctx context.Context, name string, expect, next cid.Cid, c registry.RootCommit) error {
+	if f.fails > 0 {
+		f.fails--
+		return errors.New("postgres unavailable")
+	}
+	return f.Registry.CommitRoot(ctx, name, expect, next, c)
+}
+
+// TestCommitFailureWritesNoClaim: the reference index is written in the
+// root swap's transaction, so a commit that fails at the swap claims nothing
+// for the version it did not publish, keeps the claim of the version it did
+// not supersede, and records no release. The retry claims as the first
+// attempt would have.
+func TestCommitFailureWritesNoClaim(t *testing.T) {
+	reg := &failCommitRoot{}
+	b, mem := newDeferredBackend(t, &parkingUploader{}, func(d *Deps) {
+		d.Uploader = inmem.NopUploader{}
+		reg.Registry = d.Registry
+		d.Registry = reg
+	})
+	ctx := context.Background()
+	key := "atomic"
+
+	putObj(t, b, key, []byte("first body"))
+	old := blobDigestOf(t, b, key, "")
+	if n := claims(t, mem, old); n != 1 {
+		t.Fatalf("claims on the first version = %d, want 1", n)
+	}
+
+	reg.fails = 1
+	bucket := "bk"
+	if _, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader([]byte("second body"))}); err == nil {
+		t.Fatal("PutObject succeeded although its root swap failed")
+	}
+	// The overwrite published nothing: the first version stands, with its
+	// claim, and no release is recorded.
+	if got := blobDigestOf(t, b, key, ""); string(got) != string(old) {
+		t.Fatalf("current version after the failed overwrite names %x, want the first version's %x", got, old)
+	}
+	if n := claims(t, mem, old); n != 1 {
+		t.Fatalf("claims on the first version after the failed overwrite = %d, want 1", n)
+	}
+	if pending, _ := mem.ListReleasesBySpace(ctx, did.Undef); len(pending) != 0 {
+		t.Fatalf("a failed overwrite recorded releases: %v", pending)
+	}
+	// A claim publishes its blob's intent; the failed write's blob was never
+	// claimed, so the first version's is the only published intent.
+	published, err := mem.ListIntentsByState(ctx, registry.IntentPublished)
+	if err != nil {
+		t.Fatalf("ListIntentsByState: %v", err)
+	}
+	if len(published) != 1 || string(published[0].Digest) != string(old) {
+		t.Fatalf("published intents after the failed overwrite = %v, want the first version's blob only", published)
+	}
+
+	// The retry commits, claims its blob and drops the first version's.
+	putObj(t, b, key, []byte("second body"))
+	next := blobDigestOf(t, b, key, "")
+	if n := claims(t, mem, next); n != 1 {
+		t.Fatalf("claims on the retried version = %d, want 1", n)
+	}
+	if n := claims(t, mem, old); n != 0 {
+		t.Fatalf("claims on the superseded version = %d, want 0", n)
+	}
+	if pending, _ := mem.ListReleasesBySpace(ctx, did.Undef); len(pending) != 1 || string(pending[0].Digest) != string(old) {
+		t.Fatalf("releases after the retry = %v, want the superseded blob's", pending)
+	}
+}
+
+// stallCommitRoot is a registry whose root commits wait delay before they
+// run, as a slow fsync or lock wait ahead of the swap would.
+type stallCommitRoot struct {
+	registry.Registry
+	delay time.Duration
+}
+
+func (s *stallCommitRoot) CommitRoot(ctx context.Context, name string, expect, next cid.Cid, c registry.RootCommit) error {
+	time.Sleep(s.delay)
+	return s.Registry.CommitRoot(ctx, name, expect, next, c)
+}
+
+// TestReleaseGraceRunsFromTheCommit: a reader that resolved the superseded
+// version just before the swap has the whole release grace to open its
+// blobs, so the grace is measured when the swap commits, not when the
+// drops are staged. With the commit stalled longer than the grace, a grace
+// measured at staging would have the release due before the swap.
+func TestReleaseGraceRunsFromTheCommit(t *testing.T) {
+	const grace, stall = 150 * time.Millisecond, 250 * time.Millisecond
+	reg := &stallCommitRoot{delay: stall}
+	b, mem := newDeferredBackend(t, &parkingUploader{}, func(d *Deps) {
+		d.Uploader = inmem.NopUploader{}
+		d.ReleaseGrace = grace
+		reg.Registry = d.Registry
+		d.Registry = reg
+	})
+	ctx := context.Background()
+	key := "grace"
+	putObj(t, b, key, []byte("first body"))
+	old := blobDigestOf(t, b, key, "")
+
+	start := time.Now()
+	putObj(t, b, key, []byte("second body"))
+	pending, err := mem.ListReleasesBySpace(ctx, did.Undef)
+	if err != nil || len(pending) != 1 || string(pending[0].Digest) != string(old) {
+		t.Fatalf("releases after the overwrite = %v (err %v), want the superseded blob's", pending, err)
+	}
+	if earliest := start.Add(stall + grace); pending[0].NotBefore.Before(earliest) {
+		t.Fatalf("release due %v after the overwrite began, want at least the stall plus the grace (%v): the grace ran from staging, not the commit", pending[0].NotBefore.Sub(start), stall+grace)
 	}
 }

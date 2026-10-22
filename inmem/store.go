@@ -256,13 +256,14 @@ func (m *MemStore) Delete(_ context.Context, name string) error {
 }
 
 func (m *MemStore) CASRoot(ctx context.Context, name string, expect, next cid.Cid) error {
-	return m.CASRootAndEnqueueUploadRegistrations(ctx, name, expect, next, nil)
+	return m.CommitRoot(ctx, name, expect, next, registry.RootCommit{})
 }
 
-// CASRootAndEnqueueUploadRegistrations advances the root and records the
-// commit's upload registrations together: under the one mutex here, as one
-// transaction in Postgres. A conflict records nothing.
-func (m *MemStore) CASRootAndEnqueueUploadRegistrations(_ context.Context, name string, expect, next cid.Cid, regs []registry.UploadRegistration) error {
+// CommitRoot advances the root and records the commit's upload
+// registrations, blob claims and claim drops together: under the one mutex
+// here, as one transaction in Postgres. A conflict or a refused claim
+// records nothing.
+func (m *MemStore) CommitRoot(_ context.Context, name string, expect, next cid.Cid, c registry.RootCommit) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	s, ok := m.buckets[name]
@@ -272,14 +273,37 @@ func (m *MemStore) CASRootAndEnqueueUploadRegistrations(_ context.Context, name 
 	if !s.Root.Equals(expect) {
 		return registry.ErrConflict
 	}
+	// Every claim and pin is checked before anything is written: a refused
+	// commit records nothing, as a rolled-back transaction does.
+	for _, cl := range c.Claims {
+		if err := m.claimRefusedLocked(cl); err != nil {
+			return err
+		}
+	}
+	for _, p := range c.Pins {
+		if m.pinRefusedLocked(p) {
+			return registry.ErrClaimGone
+		}
+	}
 	s.Root = next
-	for _, reg := range regs {
+	for _, reg := range c.Registrations {
 		m.uploadRegSeq++
 		reg.Seq = m.uploadRegSeq
 		if reg.NextAt.IsZero() {
 			reg.NextAt = time.Now()
 		}
 		m.uploadRegs = append(m.uploadRegs, reg)
+	}
+	for _, cl := range c.Claims {
+		m.addClaimLocked(cl, true)
+	}
+	for _, p := range c.Pins {
+		m.addClaimLocked(p, false)
+	}
+	// The grace runs from the commit, as in Postgres.
+	due := time.Now().Add(c.ReleaseGrace)
+	for _, d := range c.Drops {
+		m.dropClaimLocked(d, due)
 	}
 	return nil
 }

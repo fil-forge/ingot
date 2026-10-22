@@ -513,7 +513,7 @@ a walk over sub-blocks.
 The only serialized work is the commit critical section, and under versioning two writes to the same
 key produce distinct versionIds — they contend only on the guarded root swap, which retries cheaply.
 Across processes, the swap (a Postgres conditional update) is the cross-instance guard; `blob_refs`
-updates land after the commit, best-effort — not inside the transaction.
+updates land in the swap's transaction.
 
 | Case | Handling |
 |---|---|
@@ -1020,8 +1020,8 @@ The storage / delete / retrieval core is built and tested:
 - **Object-aligned blobs + manifest** ([§4](#4-the-catalog-layer)–[§5](#5-the-data-layer)) — `Body.Blobs` (`[digest, offset]` entries, inline then in extent blocks), coarse split at
   `max_blob_size`, the local **spool** (`blockstore.Spool`) + `upload_intents`, stored S3 `etag`.
 - **Synchronous durability write path** ([§7.1](#71-write-single-shot-putobject)) — off-lock ingest → spool → per-blob upload, then a
-  short locked commit (manifest + MST splice + guarded root swap); reference-index reconcile runs
-  **after** the commit is durable so a commit failure can't diverge `blob_refs`.
+  short locked commit (manifest + MST splice + guarded root swap); the reference-index claims and
+  drops are written in the root swap's transaction, so a commit failure writes none of them.
 - **Single-plane catalog log** — the data plane is gone; `logstore` journals only the catalog
   (manifests + MST nodes) as CAR segments. `forge_root_cid` advances only when the catalog ships, and
   only `WHERE root_cid` still matches the op-root (the orphan-root guard from [§9](#9-the-system-contract-piri--sprue--indexer)).
@@ -1104,7 +1104,7 @@ paths below are exercised against the real stack by the smelt-based `itest/` har
   ([§7.2](#72-multipart)–[7.3](#73-the-session-latch-the-abortcomplete-race)).
 - **Crash recovery for the spool is not built.** The `upload_intents` × `blob_refs` reconciliation
   the failure-mode table in [§7.5](#75-concurrency-durability-and-failure-modes) describes (resume/`abort` parked, `remove` accepted-but-unreferenced)
-  is a later phase; a partial post-commit reference-index write currently relies on retry/idempotency.
+  is a later phase.
 - **Indexer retraction on delete** is unimplemented (no-op). `ListParts` and
   `ListMultipartUploads` are implemented (paginated, prefix/delimiter/marker semantics;
   in-flight sessions only).
@@ -1119,11 +1119,11 @@ paths below are exercised against the real stack by the smelt-based `itest/` har
   `blob.Remove`, so the abort and every other release leg signs with the request's own proofs. The
   network-side `/blob/abort` unwind remains a parking-flow concern (above).
 
-### Known correctness boundary
+### Reference index and root commit
 
-Reference-index mutations (`blob_refs`) and the catalog/root commit are **not yet one atomic
-transaction**: the reconcile runs immediately *after* a successful commit. A commit failure can no
-longer corrupt `blob_refs` (the reconcile is skipped), but a crash *between* the commit and the
-reconcile, or a partial reconcile, can leave `blob_refs` momentarily under/over-counted until the
-deferred crash-recovery reconciliation lands. The safe-side ordering (catalog first, then claims)
-means such a window leaks rather than loses referenced data.
+Reference-index mutations (`blob_refs`) and the catalog/root commit are one transaction: the new
+version's claims, the discarded versions' claim drops, and the release records those drops produce
+are written by the same Postgres transaction as the guarded root swap (`registry.CommitRoot`). A
+commit that fails writes none of them, and no crash can leave a published version unclaimed or a
+discarded one claimed. A claim the swap refuses (a started release holds the digest, or a pinned
+source is gone) fails the commit, and the root stays where it was.
