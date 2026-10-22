@@ -405,7 +405,7 @@ func mapAuthError(err error) (error, bool) {
 		// A header the signature does not cover, or a body it does not bind,
 		// cannot be authorized on; the SDKs sign both.
 		hiltauth.UnsignedHeaderErrorName,
-		hiltauth.UnboundBodyErrorName:
+		hiltauth.InvalidBodyErrorName:
 		return s3err.GetAPIError(s3err.ErrAccessDenied), true
 	case hiltauth.TemporarilyUnavailableErrorName:
 		// An authorize that waited out Hilt's lock timeout behind a policy

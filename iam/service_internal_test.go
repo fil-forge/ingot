@@ -569,7 +569,7 @@ func TestDeleteOnlyKeyIsDeniedOnVersions(t *testing.T) {
 		req := signedBody(t, "s3.example", "/bkt?delete", accessKeyID, secret, plain)
 		req.Body = []byte(versions)
 		_, _, err := hiltauth.RequirementsFor(req)
-		require.ErrorIs(t, err, hiltauth.ErrUnboundBody)
+		require.ErrorIs(t, err, hiltauth.ErrInvalidBody)
 		s := service(t, req, "s3:DeleteObject", "s3:DeleteObjectVersion")
 		_, ok, err := s.authorizeLocal(context.Background(), req, accessKeyID, s.proofs.For(accessKey.DID()))
 		require.False(t, ok)
@@ -782,7 +782,7 @@ func TestMapAuthError(t *testing.T) {
 		hiltauth.BucketNotPermittedErrorName:     {"AccessDenied", 403},
 		hiltauth.ForeignBucketErrorName:          {"AccessDenied", 403},
 		hiltauth.UnsignedHeaderErrorName:         {"AccessDenied", 403},
-		hiltauth.UnboundBodyErrorName:            {"AccessDenied", 403},
+		hiltauth.InvalidBodyErrorName:            {"AccessDenied", 403},
 		hiltauth.TemporarilyUnavailableErrorName: {"ServiceUnavailable", 503},
 		s3bkt.InvalidPolicyErrorName:             {"MalformedPolicy", 400},
 	}

@@ -919,7 +919,7 @@ flowchart TB
   refuses a header the signature does not cover or a body it does not bind,
   as hilt itself does, so the fast path decides nothing from such a
   request: it goes to hilt, which refuses it as `UnsignedHeader` or
-  `UnboundBody`.
+  `InvalidBody`.
 
 Cross-references: [`architecture.md` §9](./architecture.md#9-the-system-contract-piri--sprue--indexer).
 
