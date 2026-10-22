@@ -697,8 +697,9 @@ dag-cbor *blocks* in the catalog plane ([§4](#4-the-catalog-layer)). CIDs and b
 -- One row per bucket: the space its data lives in, the S3 versioning state, the
 -- committed MST root, and the root that is durable on Forge (advanced only when
 -- a catalog segment ships, and only while root_cid still equals the op-root).
--- The bucket-level S3 configuration rides here too: object lock, tagging and
--- default encryption, each NULL until configured.
+-- The bucket-level S3 configuration rides here too: object lock, tagging,
+-- default encryption and the bucket's own CORS document, each NULL until
+-- configured.
 CREATE TABLE ingot.buckets (
     name               text PRIMARY KEY,
     root_cid           bytea,                            -- committed MST root (locally durable)
@@ -711,6 +712,7 @@ CREATE TABLE ingot.buckets (
     next_version_seq   bigint NOT NULL DEFAULT 0,        -- per-bucket version ordinal (§3)
     object_lock_config bytea,                            -- auth.BucketLockConfig JSON; NULL = never configured
     bucket_tagging     bytea,                            -- tag set as a JSON object; NULL = no tag set
+    cors_config        bytea,                            -- the bucket's own CORS XML; NULL = the gateway default (docs/s3-cors.md)
     encryption         text CHECK (encryption IN ('AES256','none'))
                                                          -- default encryption; NULL = unconfigured (encrypts)
 );

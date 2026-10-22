@@ -391,6 +391,8 @@ lives in `docs/architecture.md`.
 - [`docs/diagrams.md`](./docs/diagrams.md) — the as-built diagram set (living).
 - [`docs/s3-versioning.md`](./docs/s3-versioning.md) — the per-key
   version-tree design.
+- [`docs/s3-cors.md`](./docs/s3-cors.md) — the gateway-wide CORS document
+  and the per-bucket one that replaces it.
 - [`docs/aggregation-gate.md`](./docs/aggregation-gate.md) — why this S3
   design is gated on Piri's aggregation.
 - [`docs/IMPLEMENTATION_PLAN.md`](./docs/IMPLEMENTATION_PLAN.md) — the phase
