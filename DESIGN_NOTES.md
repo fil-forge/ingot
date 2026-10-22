@@ -90,8 +90,8 @@ Rotation: Hilt replaces `#wrap` in place and archives the
 old key, so a write inside the cache TTL of a rotation still recovers.
 
 A `200` therefore means the body is durable and accepted on the network and
-the catalog mutation is fsynced locally; the catalog becomes durable on
-Forge through the background ship below.
+the catalog mutation is fsynced locally and journaled in Postgres; the
+catalog becomes durable on Forge through the background ship below.
 
 ## The catalog log
 
@@ -103,6 +103,12 @@ full lifecycle):
 
 - A successful `AppendBatch` (fsynced CAR plus `.ops` record) is what
   licenses the caller's bucket-root CAS.
+- **The unshipped catalog is journaled in Postgres**: the root swap's
+  transaction writes the batch's blocks to `ingot.catalog_journal` under the
+  segment `AppendBatch` reported, and shipping that segment deletes them. A
+  copy of Postgres (a standby, a restore) therefore holds every block its
+  roots need that this host's disk alone would otherwise hold. Rebuilding a
+  lost segment from the journal is not built yet.
 - **`forge_root_cid` advances only when a segment ships, and only guarded**:
   the update lands in the same transaction as the shipped stamp, and only
   where `buckets.root_cid` still equals the op-root.

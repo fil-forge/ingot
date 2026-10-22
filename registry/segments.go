@@ -84,8 +84,19 @@ func (r *Postgres) MarkSegmentShipped(ctx context.Context, plane blockstore.Plan
 	if err != nil {
 		return fmt.Errorf("registry: mark catalog shipped %d: %w", seq, err)
 	}
+	// The segment's journaled blocks are on Forge now. The UPDATE above took
+	// the segment row's lock first, so a commit that was journaling into this
+	// segment (journalBlocks holds a share lock on the row) has committed,
+	// and this statement sees its rows; any later commit sees the segment
+	// shipped and journals nothing.
+	if _, err := tx.Exec(ctx, `DELETE FROM ingot.catalog_journal WHERE seq = $1`, int64(seq)); err != nil {
+		return fmt.Errorf("registry: drop journal of catalog segment %d: %w", seq, err)
+	}
 	if tag.RowsAffected() == 0 {
-		// Already shipped — idempotent.
+		// Already shipped — idempotent, bar the journal sweep above.
+		if err := tx.Commit(ctx); err != nil {
+			return fmt.Errorf("registry: commit ship catalog %d: %w", seq, err)
+		}
 		return nil
 	}
 

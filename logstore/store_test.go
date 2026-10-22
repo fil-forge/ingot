@@ -203,7 +203,7 @@ func TestAppendThenGetSameProcess(t *testing.T) {
 
 	blk := makeBlock(t, []byte("hello world"))
 	root := makeRoot(t, "alpha")
-	if err := s.AppendBatch(context.Background(), []block.Block{blk}, blockstore.OpRoot{Bucket: "bk", Root: root}); err != nil {
+	if _, err := s.AppendBatch(context.Background(), []block.Block{blk}, blockstore.OpRoot{Bucket: "bk", Root: root}); err != nil {
 		t.Fatalf("AppendBatch: %v", err)
 	}
 
@@ -227,7 +227,7 @@ func TestSealBySize(t *testing.T) {
 	}
 	for i := 0; i < 6; i++ {
 		blk := makeBlock(t, append([]byte(fmt.Sprintf("rec-%02d-", i)), payload...))
-		if err := s.AppendBatch(context.Background(), []block.Block{blk}, blockstore.OpRoot{
+		if _, err := s.AppendBatch(context.Background(), []block.Block{blk}, blockstore.OpRoot{
 			Bucket: "bk",
 			Root:   makeRoot(t, fmt.Sprintf("size-%d", i)),
 		}); err != nil {
@@ -265,7 +265,7 @@ func TestSealByAge(t *testing.T) {
 	s, _, flushes := newTestStore(t, 1<<30, 80*time.Millisecond, 6)
 
 	blk := makeBlock(t, []byte("age-trigger"))
-	if err := s.AppendBatch(context.Background(), []block.Block{blk}, blockstore.OpRoot{
+	if _, err := s.AppendBatch(context.Background(), []block.Block{blk}, blockstore.OpRoot{
 		Bucket: "bk",
 		Root:   makeRoot(t, "age"),
 	}); err != nil {
@@ -296,7 +296,7 @@ func TestRetentionDropsOldFlushed(t *testing.T) {
 			payload[j] = byte(i)
 		}
 		blk := makeBlock(t, append([]byte(fmt.Sprintf("retain-%02d-", i)), payload...))
-		if err := s.AppendBatch(context.Background(), []block.Block{blk}, blockstore.OpRoot{
+		if _, err := s.AppendBatch(context.Background(), []block.Block{blk}, blockstore.OpRoot{
 			Bucket: "bk",
 			Root:   makeRoot(t, fmt.Sprintf("ret-%d", i)),
 		}); err != nil {
@@ -349,7 +349,7 @@ func TestForceSealRecoveredOpenOnRestart(t *testing.T) {
 
 	s := openStore()
 	blk := makeBlock(t, []byte("survives-restart"))
-	if err := s.AppendBatch(context.Background(), []block.Block{blk}, blockstore.OpRoot{
+	if _, err := s.AppendBatch(context.Background(), []block.Block{blk}, blockstore.OpRoot{
 		Bucket: "bk",
 		Root:   makeRoot(t, "survive"),
 	}); err != nil {
@@ -380,10 +380,10 @@ func TestForceSealRecoveredOpenOnRestart(t *testing.T) {
 func TestAppendBatchEmptyBlocksAccepted(t *testing.T) {
 	s, _, _ := newTestStore(t, 64<<20, 5*time.Second, 6)
 	root := makeRoot(t, "x")
-	if err := s.AppendBatch(context.Background(), nil, blockstore.OpRoot{Bucket: "bk", Root: root}); err != nil {
+	if _, err := s.AppendBatch(context.Background(), nil, blockstore.OpRoot{Bucket: "bk", Root: root}); err != nil {
 		t.Fatalf("empty blocks with defined root should succeed, got %v", err)
 	}
-	if err := s.AppendBatch(context.Background(), []block.Block{makeBlock(t, []byte("x"))}, blockstore.OpRoot{Bucket: "bk"}); err == nil {
+	if _, err := s.AppendBatch(context.Background(), []block.Block{makeBlock(t, []byte("x"))}, blockstore.OpRoot{Bucket: "bk"}); err == nil {
 		t.Fatalf("expected error on undefined root")
 	}
 }
@@ -410,7 +410,7 @@ func TestAppendBatchDedupesAcrossOps(t *testing.T) {
 	uniqB := makeBlock(t, []byte("unique-B"))
 
 	// First batch: shared + uniqA.
-	if err := s.AppendBatch(context.Background(),
+	if _, err := s.AppendBatch(context.Background(),
 		[]block.Block{shared, uniqA},
 		blockstore.OpRoot{Bucket: "bk", Root: makeRoot(t, "op-a")},
 	); err != nil {
@@ -423,7 +423,7 @@ func TestAppendBatchDedupesAcrossOps(t *testing.T) {
 	s.catalog.catMu.RUnlock()
 
 	// Second batch: shared (duplicate of first batch) + uniqB.
-	if err := s.AppendBatch(context.Background(),
+	if _, err := s.AppendBatch(context.Background(),
 		[]block.Block{shared, uniqB},
 		blockstore.OpRoot{Bucket: "bk", Root: makeRoot(t, "op-b")},
 	); err != nil {
@@ -467,7 +467,7 @@ func TestAppendBatchAllDuplicatesStillRecordsOpRoot(t *testing.T) {
 
 	blk := makeBlock(t, []byte("only-block"))
 
-	if err := s.AppendBatch(context.Background(), []block.Block{blk}, blockstore.OpRoot{
+	if _, err := s.AppendBatch(context.Background(), []block.Block{blk}, blockstore.OpRoot{
 		Bucket: "bk", Root: makeRoot(t, "first"),
 	}); err != nil {
 		t.Fatalf("first append: %v", err)
@@ -477,7 +477,7 @@ func TestAppendBatchAllDuplicatesStillRecordsOpRoot(t *testing.T) {
 	opRootsBefore := len(s.catalog.open.OpRoots())
 	s.catalog.catMu.RUnlock()
 
-	if err := s.AppendBatch(context.Background(), []block.Block{blk}, blockstore.OpRoot{
+	if _, err := s.AppendBatch(context.Background(), []block.Block{blk}, blockstore.OpRoot{
 		Bucket: "bk", Root: makeRoot(t, "second"),
 	}); err != nil {
 		t.Fatalf("dup append: %v", err)
@@ -529,7 +529,7 @@ func TestCatalogNeverShips(t *testing.T) {
 	for i := 0; i < n; i++ {
 		c := makeBlock(t, []byte(fmt.Sprintf("cat-%02d", i)))
 		blocks = append(blocks, c)
-		if err := s.AppendBatch(context.Background(), []block.Block{c},
+		if _, err := s.AppendBatch(context.Background(), []block.Block{c},
 			blockstore.OpRoot{Bucket: "bk", Root: c.Cid()},
 		); err != nil {
 			t.Fatalf("append %d: %v", i, err)

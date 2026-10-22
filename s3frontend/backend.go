@@ -138,6 +138,9 @@ type Backend struct {
 	multipartGauges  metric.Registration
 	parkedAgeSeconds atomic.Int64
 	parkedAgeKnown   atomic.Bool
+	// journalGauges is the registration of the catalog journal gauges (nil
+	// when not registered).
+	journalGauges metric.Registration
 	// regionKeys unwraps region-wrapped CEKs for the decrypting read path.
 	regionKeys regionkey.Provider
 	// tenantKeys yields the tenant wrap key each write encrypts to (the FEE
@@ -354,6 +357,7 @@ func New(d Deps) *Backend {
 	}
 	b.localBlobMetrics, b.localBlobGauges = newLocalBlobMetrics(mp, b, logger)
 	b.multipartMetrics, b.multipartGauges = newMultipartMetrics(mp, b, logger)
+	b.journalGauges = newJournalGauges(mp, b, logger)
 	return b
 }
 

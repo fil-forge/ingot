@@ -83,10 +83,24 @@ func (p Plane) String() string {
 // returning, so a successful append is locally durable before the bucket Root
 // is allowed to advance. Object-body blobs do not flow through the log — they
 // are spooled and uploaded per-blob (see Spool) before the manifest commits.
+// It returns the seq of the segment the batch went into, which the commit
+// journals the blocks under until that segment ships.
 //
 // Implemented by *logstore.Store.
 type Log interface {
-	AppendBatch(ctx context.Context, catalogBlocks []block.Block, opRoot OpRoot) error
+	AppendBatch(ctx context.Context, catalogBlocks []block.Block, opRoot OpRoot) (segment uint64, err error)
 	Get(ctx context.Context, c cid.Cid) (block.Block, error)
 	Close(ctx context.Context) error
+}
+
+// Appended is one committed batch as the log took it: the catalog blocks and
+// the segment they went into. The root swap journals the blocks in Postgres
+// under that segment until it ships (registry.RootCommit.Journal), so a copy
+// of Postgres holds every block the host's disk alone would otherwise hold.
+type Appended struct {
+	// Segment is the seq of the log segment the batch was appended to.
+	Segment uint64
+	// Blocks are the batch's catalog blocks, in append order. Empty when the
+	// new root reuses only blocks an earlier batch wrote.
+	Blocks []block.Block
 }

@@ -102,12 +102,13 @@ func openPlaneLog(ctx context.Context, plane blockstore.Plane, bucket, dir strin
 	return pl, nil
 }
 
-// Append persists one batch's blocks to the open segment. opRoots are the
-// bucket-root advances the batch records. A call with no blocks AND no op-roots is a no-op — it does
-// not even create a segment. The CAR is fsynced before Append returns.
-func (pl *PlaneLog) Append(ctx context.Context, blocks []block.Block, opRoots ...blockstore.OpRoot) (err error) {
+// Append persists one batch's blocks to the open segment and returns that
+// segment's seq. opRoots are the bucket-root advances the batch records. A
+// call with no blocks AND no op-roots is a no-op — it does not even create a
+// segment, and returns seq 0. The CAR is fsynced before Append returns.
+func (pl *PlaneLog) Append(ctx context.Context, blocks []block.Block, opRoots ...blockstore.OpRoot) (seq uint64, err error) {
 	if len(blocks) == 0 && len(opRoots) == 0 {
-		return nil
+		return 0, nil
 	}
 	// The span covers the wait for the append lock and the segment write and
 	// fsync every acked write waits on.
@@ -126,15 +127,15 @@ func (pl *PlaneLog) Append(ctx context.Context, blocks []block.Block, opRoots ..
 
 	open, err := pl.ensureOpenLockedAppMu(ctx)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if err := open.append(blocks, opRoots); err != nil {
-		return err
+		return 0, err
 	}
 	if open.Size() >= pl.pc.SealBytes {
 		pl.requestSeal()
 	}
-	return nil
+	return open.Seq(), nil
 }
 
 // Get returns the block from this plane's local segments (open first,
