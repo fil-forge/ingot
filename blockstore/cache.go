@@ -17,13 +17,14 @@ import (
 // Cached wraps a BlockReader with a bounded, in-memory LRU keyed by CID. Blocks
 // are content-addressed and immutable, so caching them is always safe; this
 // fronts the network-backed reader (blockstore.Forge) so repeated reads of hot
-// objects don't re-hit the indexer + piri on every block. The cache is
-// per-instance and resets on process restart.
+// blocks don't re-fetch from piri every time. The cache is per-instance and
+// resets on process restart.
 //
-// The bound is a byte budget rather than a block count, because body chunks can
-// be up to a megabyte each — a count-based cap would make peak memory depend on
-// chunk size. A single block larger than the whole budget is served through but
-// not cached.
+// Object-body blobs are not cached: OpenBlob and OpenBlobRange stream them
+// straight from the base reader. The bound is a byte budget rather than a
+// block count, because blocks vary in size — a count-based cap would make peak
+// memory depend on block size. A single block larger than the whole budget is
+// served through but not cached.
 type Cached struct {
 	base     BlockReader
 	maxBytes int64
