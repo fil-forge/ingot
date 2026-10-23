@@ -658,3 +658,173 @@ func readSegmentSeqs(dir, plane string) ([]string, error) {
 	}
 	return out, nil
 }
+
+// shortShipBackoff shortens the queued ship's backoff for one test, restoring
+// it after the test's stores have closed.
+func shortShipBackoff(t *testing.T) {
+	t.Helper()
+	prev := shipBackoff
+	shipBackoff = time.Millisecond
+	t.Cleanup(func() { shipBackoff = prev })
+}
+
+// TestExhaustedShipRetriedBySweep checks that a segment whose queued ship ran
+// out of attempts isn't left until a restart: the retry sweep keeps trying
+// it, and it ships once the upload service is back.
+func TestExhaustedShipRetriedBySweep(t *testing.T) {
+	shortShipBackoff(t)
+	var down atomic.Bool
+	down.Store(true)
+	var attempts atomicCounter
+	meta := newFakeMeta()
+	s, err := Open(context.Background(), Config{
+		Dir:  t.TempDir(),
+		Meta: meta,
+		Catalog: PlaneConfig{SealBytes: 64, SealAge: 50 * time.Millisecond, Ship: true, ShipRetry: 50 * time.Millisecond,
+			Flush: func(context.Context, *Segment) (multihash.Multihash, error) {
+				attempts.add(1)
+				if down.Load() {
+					return nil, errors.New("upload service down")
+				}
+				return nil, nil
+			}},
+		Logger: zaptest.NewLogger(t),
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close(context.Background()) })
+
+	blk := makeBlock(t, append([]byte("sweep-"), make([]byte, 80)...))
+	if _, err := s.AppendBatch(context.Background(), []block.Block{blk},
+		blockstore.OpRoot{Bucket: "bk", Root: makeRoot(t, "sweep")}); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	waitFor(t, "the queued ship's attempts and a sweep's", func() bool {
+		return attempts.load() > queuedShipAttempts
+	})
+	down.Store(false)
+	waitFor(t, "the segment to ship", func() bool {
+		meta.mu.Lock()
+		defer meta.mu.Unlock()
+		return len(meta.shipped) == 1
+	})
+}
+
+// TestRetrySweepOldestFirst checks the sweep's order and its stop: it tries
+// the oldest unshipped segment first, stops at the first that fails, and
+// once ships succeed, ships them all in seq order.
+func TestRetrySweepOldestFirst(t *testing.T) {
+	shortShipBackoff(t)
+	var down atomic.Bool
+	down.Store(true)
+	var mu sync.Mutex
+	var tried []uint64
+	meta := newFakeMeta()
+	s, err := Open(context.Background(), Config{
+		Dir:  t.TempDir(),
+		Meta: meta,
+		// No sweep runs on its own (the first lands at a random point within
+		// ShipRetry): the test runs them.
+		Catalog: PlaneConfig{SealBytes: 64, SealAge: time.Hour, Ship: true, ShipRetry: 1000 * time.Hour,
+			Flush: func(_ context.Context, seg *Segment) (multihash.Multihash, error) {
+				mu.Lock()
+				tried = append(tried, seg.Seq())
+				mu.Unlock()
+				if down.Load() {
+					return nil, errors.New("upload service down")
+				}
+				return nil, nil
+			}},
+		Logger: zaptest.NewLogger(t),
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close(context.Background()) })
+
+	// distinct returns the seqs tried so far, in ascending order.
+	distinct := func() []uint64 {
+		mu.Lock()
+		defer mu.Unlock()
+		var out []uint64
+		for _, seq := range tried {
+			if !slices.Contains(out, seq) {
+				out = append(out, seq)
+			}
+		}
+		slices.Sort(out)
+		return out
+	}
+	// Each batch is over SealBytes, so it seals its segment; waiting for
+	// that segment's ship keeps the next batch out of it.
+	for i := 0; i < 3; i++ {
+		blk := makeBlock(t, append([]byte(fmt.Sprintf("order-%d-", i)), make([]byte, 80)...))
+		if _, err := s.AppendBatch(context.Background(), []block.Block{blk},
+			blockstore.OpRoot{Bucket: "bk", Root: makeRoot(t, fmt.Sprintf("order-%d", i))}); err != nil {
+			t.Fatalf("append %d: %v", i, err)
+		}
+		waitFor(t, fmt.Sprintf("segment %d to seal and start shipping", i), func() bool {
+			return len(distinct()) == i+1
+		})
+	}
+	waitFor(t, "every queued ship to run out of attempts", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(tried) == 3*queuedShipAttempts
+	})
+	seqs := distinct()
+
+	s.catalog.retryUnshipped()
+	mu.Lock()
+	if n, last := len(tried), tried[len(tried)-1]; n != 3*queuedShipAttempts+1 || last != seqs[0] {
+		mu.Unlock()
+		t.Fatalf("a failing sweep made %d attempts, the last on seq %d; want one attempt, on the oldest (%d)",
+			n-3*queuedShipAttempts, last, seqs[0])
+	}
+	mu.Unlock()
+
+	down.Store(false)
+	s.catalog.retryUnshipped()
+	meta.mu.Lock()
+	shippedSeqs := make([]uint64, len(meta.shipped))
+	for i, ev := range meta.shipped {
+		shippedSeqs[i] = ev.seq
+	}
+	meta.mu.Unlock()
+	if !slices.Equal(shippedSeqs, seqs) {
+		t.Fatalf("shipped seqs %v, want %v in order", shippedSeqs, seqs)
+	}
+
+	// A segment the sweep has shipped may still be queued: shipping it from
+	// the queue again must not reach Flush.
+	mu.Lock()
+	before := len(tried)
+	mu.Unlock()
+	s.catalog.catMu.RLock()
+	shipped := s.catalog.sealed[0]
+	s.catalog.catMu.RUnlock()
+	if !shipped.IsShipped() {
+		t.Fatalf("segment %d not shipped", shipped.Seq())
+	}
+	if !s.catalog.flushOne(shipped, queuedShipAttempts) {
+		t.Fatalf("flushOne on shipped segment %d reported it unshipped", shipped.Seq())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(tried) != before {
+		t.Fatalf("shipped segment %d went to Flush again", shipped.Seq())
+	}
+}
+
+// waitFor polls cond until it holds, failing the test after a few seconds.
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"os"
 	"sync"
 	"time"
@@ -215,8 +216,8 @@ func (pl *PlaneLog) requestSeal() {
 }
 
 // enqueueFlush hands a sealed segment to the flush worker. No-op for a
-// non-shipping plane. Non-blocking: a full queue is logged and retried on
-// the next restart.
+// non-shipping plane. Non-blocking: a full queue is logged, and the retry
+// sweep ships the segment instead.
 func (pl *PlaneLog) enqueueFlush(seg *Segment) {
 	if pl.flushQ == nil {
 		return
@@ -224,7 +225,7 @@ func (pl *PlaneLog) enqueueFlush(seg *Segment) {
 	select {
 	case pl.flushQ <- seg:
 	default:
-		pl.logger.Warn("logstore: flush queue full; segment will retry on restart",
+		pl.logger.Warn("logstore: flush queue full; the retry sweep (or, at close, the next start) will ship the segment",
 			zap.Stringer("plane", pl.plane), zap.Uint64("seq", seg.Seq()))
 	}
 }
@@ -308,9 +309,22 @@ func (pl *PlaneLog) sealOpenIfDue(ctx context.Context, force bool) error {
 	return nil
 }
 
-// flushLoop drains the queue, shipping each sealed segment. Exits on close.
+// queuedShipAttempts is how many times a queued segment's ship is tried
+// before it is left to the retry sweep.
+const queuedShipAttempts = 5
+
+// shipBackoff is the wait after a queued ship's first failed attempt,
+// doubling after each later one to a 30s cap. A var so tests can shorten it.
+var shipBackoff = time.Second
+
+// flushLoop drains the queue, shipping each sealed segment, and runs the
+// retry sweep ShipRetry after the previous one ends. The first sweep comes
+// at a random point within ShipRetry, so the buckets a startup opens
+// together don't all sweep at once. Exits on close.
 func (pl *PlaneLog) flushLoop() {
 	defer pl.wg.Done()
+	retry := time.NewTimer(rand.N(pl.pc.ShipRetry))
+	defer retry.Stop()
 	for {
 		select {
 		case <-pl.closing:
@@ -319,27 +333,63 @@ func (pl *PlaneLog) flushLoop() {
 			if !ok {
 				return
 			}
-			pl.flushOne(seg)
+			pl.flushOne(seg, queuedShipAttempts)
+		case <-retry.C:
+			pl.retryUnshipped()
+			retry.Reset(pl.pc.ShipRetry)
 		}
 	}
 }
 
-// flushOne ships one sealed segment, retrying with backoff. On success it
-// stamps the ship state in Meta (which advances forge_root_cid for the
-// catalog plane and drops the segment's journaled blocks), then in memory,
-// and runs the retention sweep. A failed stamp is retried without shipping
-// again, and the segment counts as shipped only once it lands: retention
+// retryUnshipped ships the sealed segments that are still unshipped, oldest
+// first: those whose queued ship ran out of attempts, those a full queue
+// turned away, and those recovery could not queue. Each gets one attempt,
+// and the sweep stops at the first that fails, since whatever failed it (the
+// upload service, the space's ship authority, the stamp in Meta) most likely
+// fails the rest: the next sweep starts again from it.
+func (pl *PlaneLog) retryUnshipped() {
+	pl.catMu.RLock()
+	var pending []*Segment
+	for i := len(pl.sealed) - 1; i >= 0; i-- { // pl.sealed is newest first
+		if seg := pl.sealed[i]; !seg.IsShipped() && !seg.IsRetired() {
+			pending = append(pending, seg)
+		}
+	}
+	pl.catMu.RUnlock()
+	for _, seg := range pending {
+		select {
+		case <-pl.closing:
+			return
+		default:
+		}
+		if !pl.flushOne(seg, 1) {
+			return
+		}
+	}
+}
+
+// flushOne ships one sealed segment, trying up to maxAttempts times with
+// backoff, and reports whether it is shipped. On success it stamps the ship
+// state in Meta (which advances forge_root_cid for the catalog plane and
+// drops the segment's journaled blocks), then in memory, and runs the
+// retention sweep. A failed stamp is retried without shipping again within
+// the call, and the segment counts as shipped only once it lands: retention
 // retires shipped segments, and a retired segment whose stamp never landed
-// would leave its journal rows behind for good.
-func (pl *PlaneLog) flushOne(seg *Segment) {
+// would leave its journal rows behind for good. A later call (the retry
+// sweep's, or recovery's at the next start) ships it again. A segment
+// already shipped, as one still queued after the retry sweep shipped it is,
+// is left alone.
+func (pl *PlaneLog) flushOne(seg *Segment, maxAttempts int) bool {
+	if seg.IsShipped() || seg.IsRetired() {
+		return true
+	}
 	// Each ship is its own trace: nothing upstream is waiting on it.
 	ctx, span := tracing.Start(context.Background(), "log.ship",
 		attribute.String("ingot.log.plane", pl.plane.String()),
 		attribute.Int64("ingot.log.segment_bytes", seg.Size()),
 	)
 	defer span.End()
-	const maxAttempts = 5
-	backoff := time.Second
+	backoff := shipBackoff
 
 	var (
 		flushed     bool
@@ -362,7 +412,7 @@ func (pl *PlaneLog) flushOne(seg *Segment) {
 			if err = pl.meta.MarkSegmentShipped(ctx, pl.plane, seg.Seq(), shippedAt, indexDigest, seg.OpRoots()); err == nil {
 				seg.markShipped(shippedAt)
 				pl.runRetention(ctx)
-				return
+				return true
 			}
 			// The segment is on Forge; only its stamp in Meta failed.
 			pl.logger.Warn("logstore: mark shipped",
@@ -370,18 +420,27 @@ func (pl *PlaneLog) flushOne(seg *Segment) {
 				zap.Int("attempt", attempt), zap.Error(err))
 		}
 		span.RecordError(err)
+		if attempt == maxAttempts {
+			break
+		}
 		select {
 		case <-pl.closing:
-			return
+			return false
 		case <-time.After(backoff):
 		}
 		if backoff < 30*time.Second {
 			backoff *= 2
 		}
 	}
-	pl.logger.Error("logstore: ship exhausted retries; segment remains unshipped",
-		zap.Stringer("plane", pl.plane), zap.Uint64("seq", seg.Seq()), zap.Bool("flushed", flushed))
+	// A sweep's single attempt is already logged above; only a queued ship
+	// running out is worth an error.
+	if maxAttempts > 1 {
+		pl.logger.Error("logstore: ship exhausted retries; the retry sweep will try again",
+			zap.Stringer("plane", pl.plane), zap.Uint64("seq", seg.Seq()),
+			zap.Int("attempts", maxAttempts), zap.Bool("flushed", flushed))
+	}
 	span.SetStatus(codes.Error, "ship exhausted retries")
+	return false
 }
 
 // runRetention retires shipped segments beyond the Retain window and drops
