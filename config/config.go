@@ -46,14 +46,17 @@ type Config struct {
 	// budget bounds how long Complete may spend reading parts back.
 	MultipartRehashBudget int64 `mapstructure:"multipart_rehash_budget" yaml:"multipart_rehash_budget"`
 	// CORSAllowedOrigins lists the browser origins the S3 listener answers
-	// CORS for. Each entry is an exact origin ("https://app.example"), a
-	// wildcard origin ("https://*.dev.example" — one '*' standing for any
-	// run of characters, S3's own matching), or the lone "*" (any origin —
-	// avoid outside development). Empty disables CORS (the default).
+	// CORS for by default. Each entry is an exact origin
+	// ("https://app.example"), a wildcard origin ("https://*.dev.example" —
+	// one '*' standing for any run of characters, S3's own matching), or
+	// the lone "*" (any origin — avoid outside development). Empty disables
+	// CORS by default (the default).
 	//
 	// The list is rendered into an S3 CORS configuration document that
-	// every bucket reports, which is what drives versitygw's CORS
-	// middlewares and preflight handler. Two consequences worth knowing:
+	// every bucket reports until PutBucketCors stores one of the bucket's
+	// own, which replaces it for that bucket (docs/s3-cors.md). The
+	// document is what drives versitygw's CORS middlewares and preflight
+	// handler. Two consequences worth knowing:
 	// a matched origin is answered with Access-Control-Allow-Credentials:
 	// true (AWS behaviour — harmless here because ingot authenticates the
 	// Authorization header and presigned URLs, never cookies), and the
@@ -115,6 +118,16 @@ type Config struct {
 	// fails. Keep it well under how long the provider keeps parked
 	// allocations.
 	MultipartSessionTTL string `mapstructure:"multipart_session_ttl" yaml:"multipart_session_ttl"`
+
+	// CompleteMultipartKeepalive keeps a slow CompleteMultipartUpload's
+	// connection alive, as S3 does (Go duration string): the response
+	// commits to 200 OK, with the version id, once the completion has
+	// validated the request, then sends a newline at this interval until the
+	// result ends the body. A client's read timeout (60 s for the AWS CLI)
+	// would otherwise abandon a completion that goes on to commit.
+	// Empty → default 5s; a negative duration turns it off, and a Complete
+	// then answers only when it finishes.
+	CompleteMultipartKeepalive string `mapstructure:"complete_multipart_keepalive" yaml:"complete_multipart_keepalive"`
 
 	// ReleaseGrace delays each blob release (crypto-shred + location delete +
 	// network remove + local-copy removal) this long past the drop of its
@@ -242,6 +255,16 @@ func (c Config) ServerConfig() (ServerConfig, error) {
 			return ServerConfig{}, fmt.Errorf("ingot: parse multipart_session_ttl %q: %w", c.MultipartSessionTTL, err)
 		}
 	}
+	mpKeepalive := 5 * time.Second
+	if c.CompleteMultipartKeepalive != "" {
+		mpKeepalive, err = time.ParseDuration(c.CompleteMultipartKeepalive)
+		if err != nil {
+			return ServerConfig{}, fmt.Errorf("ingot: parse complete_multipart_keepalive %q: %w", c.CompleteMultipartKeepalive, err)
+		}
+		if mpKeepalive < 0 {
+			mpKeepalive = 0
+		}
+	}
 	releaseGrace := 60 * time.Second
 	if c.ReleaseGrace != "" {
 		releaseGrace, err = time.ParseDuration(c.ReleaseGrace)
@@ -294,8 +317,9 @@ func (c Config) ServerConfig() (ServerConfig, error) {
 		ShipCatalog:      shipDefault(c.CatalogPlane.Ship),
 		RetainCatalog:    firstNonZeroInt(c.CatalogPlane.Retain, c.Retain),
 
-		MultipartSessionTTL: mpTTL,
-		ReleaseGrace:        releaseGrace,
+		MultipartSessionTTL:        mpTTL,
+		CompleteMultipartKeepalive: mpKeepalive,
+		ReleaseGrace:               releaseGrace,
 
 		LocalBlobMaxBytes:  c.LocalBlobMaxBytes,
 		CacheMinResidency:  cacheMinResidency,

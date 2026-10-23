@@ -443,6 +443,17 @@ func (m *MemStore) SetBucketTagging(_ context.Context, name string, tags []byte)
 	return nil
 }
 
+func (m *MemStore) SetCORSConfig(_ context.Context, name string, cfg []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.buckets[name]
+	if !ok {
+		return registry.ErrNotFound
+	}
+	s.CORSConfig = cfg
+	return nil
+}
+
 func (m *MemStore) AllocVersionSeq(_ context.Context, name string) (uint64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

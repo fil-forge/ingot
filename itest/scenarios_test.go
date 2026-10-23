@@ -807,7 +807,7 @@ func TestForgeScenarios(t *testing.T) {
 
 		// Preflight. Browsers send these unsigned, so this also pins that
 		// the OPTIONS route sits ahead of SigV4.
-		preflight := func(t *testing.T, origin string) *http.Response {
+		preflightOn := func(t *testing.T, bucket, origin string) *http.Response {
 			t.Helper()
 			req, err := http.NewRequestWithContext(ctx, http.MethodOptions, fmt.Sprintf("%s/%s/%s", endpoint, bucket, key), nil)
 			if err != nil {
@@ -822,6 +822,10 @@ func TestForgeScenarios(t *testing.T) {
 			}
 			t.Cleanup(func() { _ = resp.Body.Close() })
 			return resp
+		}
+		preflight := func(t *testing.T, origin string) *http.Response {
+			t.Helper()
+			return preflightOn(t, bucket, origin)
 		}
 
 		resp := preflight(t, origin)
@@ -870,5 +874,79 @@ func TestForgeScenarios(t *testing.T) {
 		if got := get.Header.Get("Access-Control-Expose-Headers"); !strings.Contains(got, "ETag") {
 			t.Errorf("GET Expose-Headers = %q, want it to include ETag", got)
 		}
+
+		// Per-bucket CORS (docs/s3-cors.md): a bucket's own document
+		// replaces the gateway-wide one for that bucket alone, and deleting
+		// it restores the default. The writes need a hilt that authorizes
+		// PutBucketCors, so this runs only against a hilt override or when
+		// INGOT_ITEST_CORS_WRITES=1 says the image has it.
+		t.Run("per bucket", func(t *testing.T) {
+			if !corsWritesEnabled() {
+				t.Skip("the per-bucket CORS scenario needs a hilt override (INGOT_ITEST_HILT_BINARY or INGOT_ITEST_HILT_IMAGE), or INGOT_ITEST_CORS_WRITES=1, until the :main image authorizes PutBucketCors")
+			}
+			const (
+				own     = "https://app.example" // matches no gateway entry
+				sibling = "cors-sibling"
+			)
+			if _, err := cl.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(sibling)}); err != nil {
+				t.Fatalf("CreateBucket %s: %v", sibling, err)
+			}
+			if _, err := cl.PutObject(ctx, &s3.PutObjectInput{
+				Bucket: aws.String(sibling), Key: aws.String(key), Body: bytes.NewReader(data),
+			}); err != nil {
+				t.Fatalf("PutObject %s: %v", sibling, err)
+			}
+			allowed := func(t *testing.T, bucket, origin string) bool {
+				t.Helper()
+				return preflightOn(t, bucket, origin).Header.Get("Access-Control-Allow-Origin") == origin
+			}
+
+			if _, err := cl.PutBucketCors(ctx, &s3.PutBucketCorsInput{
+				Bucket: aws.String(bucket),
+				CORSConfiguration: &types.CORSConfiguration{CORSRules: []types.CORSRule{{
+					AllowedOrigins: []string{own},
+					AllowedMethods: []string{"GET", "PUT"},
+					AllowedHeaders: []string{"*"},
+					MaxAgeSeconds:  aws.Int32(300),
+				}}},
+			}); err != nil {
+				t.Fatalf("PutBucketCors: %v", err)
+			}
+			got, err := cl.GetBucketCors(ctx, &s3.GetBucketCorsInput{Bucket: aws.String(bucket)})
+			if err != nil {
+				t.Fatalf("GetBucketCors: %v", err)
+			}
+			if len(got.CORSRules) != 1 || len(got.CORSRules[0].AllowedOrigins) != 1 || got.CORSRules[0].AllowedOrigins[0] != own {
+				t.Fatalf("GetBucketCors rules = %+v, want the one stored rule for %s", got.CORSRules, own)
+			}
+			// The bucket's own document replaces the gateway's: its origin is
+			// allowed, the gateway's is not, and the sibling still answers
+			// from the gateway's.
+			if !allowed(t, bucket, own) {
+				t.Errorf("preflight from %s on %s: want allowed by the bucket's own document", own, bucket)
+			}
+			if allowed(t, bucket, origin) {
+				t.Errorf("preflight from %s on %s: want refused, the gateway document no longer applies", origin, bucket)
+			}
+			if !allowed(t, sibling, origin) {
+				t.Errorf("preflight from %s on %s: want allowed by the gateway document", origin, sibling)
+			}
+			if allowed(t, sibling, own) {
+				t.Errorf("preflight from %s on %s: want refused, the document is %s's alone", own, sibling, bucket)
+			}
+
+			// Deleting it restores the default; deleting again is a no-op.
+			for range 2 {
+				if _, err := cl.DeleteBucketCors(ctx, &s3.DeleteBucketCorsInput{Bucket: aws.String(bucket)}); err != nil {
+					t.Fatalf("DeleteBucketCors: %v", err)
+				}
+			}
+			if !allowed(t, bucket, origin) {
+				t.Errorf("preflight from %s on %s after delete: want allowed by the gateway document again", origin, bucket)
+			}
+			if allowed(t, bucket, own) {
+				t.Errorf("preflight from %s on %s after delete: want refused", own, bucket)
+			}
+		})
 	})
 }

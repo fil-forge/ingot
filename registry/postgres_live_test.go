@@ -1351,3 +1351,69 @@ func TestReleaseGraceRunsFromTheSwapLive(t *testing.T) {
 		t.Fatalf("release due %v after the commit began, want at least the lock wait plus the grace (%v): the grace ran from the transaction's start", pr.NotBefore.Sub(start), stall+grace)
 	}
 }
+
+// TestBucketCORSConfigLive round-trips a bucket's own CORS document through
+// the SQL store: the column scans back as the bytes stored, NULL reads as
+// nil, a nil write restores NULL, and a missing bucket is ErrNotFound. The
+// in-memory fake cannot validate the column order of the row scan or the
+// nullable bytea binding. Skipped unless INGOT_TEST_DSN names a reachable
+// database:
+//
+//	INGOT_TEST_DSN=postgres://... GOWORK=off go test ./registry/ -run BucketCORS -v
+func TestBucketCORSConfigLive(t *testing.T) {
+	dsn := os.Getenv("INGOT_TEST_DSN")
+	if dsn == "" {
+		t.Skip("set INGOT_TEST_DSN to run the live Postgres store test")
+	}
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer pool.Close()
+	if err := migrations.Up(ctx, pool, zaptest.NewLogger(t)); err != nil {
+		t.Fatalf("migrations.Up: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `TRUNCATE ingot.buckets CASCADE`); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+	r := registry.NewPostgres(pool)
+	if err := r.Create(ctx, "b", testutil.RandomDID(t), registry.CreateState{Tenant: testutil.RandomDID(t)}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	st, err := r.Get(ctx, "b")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if st.CORSConfig != nil {
+		t.Fatalf("CORSConfig on a new bucket = %q, want nil", st.CORSConfig)
+	}
+
+	// Binary, with a zero byte, to exercise the bytea round trip rather than
+	// a text one.
+	doc := []byte("<CORSConfiguration>\x00</CORSConfiguration>")
+	if err := r.SetCORSConfig(ctx, "b", doc); err != nil {
+		t.Fatalf("SetCORSConfig: %v", err)
+	}
+	if st, err = r.Get(ctx, "b"); err != nil {
+		t.Fatalf("Get after set: %v", err)
+	}
+	if !bytes.Equal(st.CORSConfig, doc) {
+		t.Fatalf("CORSConfig = %q, want %q", st.CORSConfig, doc)
+	}
+
+	if err := r.SetCORSConfig(ctx, "b", nil); err != nil {
+		t.Fatalf("SetCORSConfig(nil): %v", err)
+	}
+	if st, err = r.Get(ctx, "b"); err != nil {
+		t.Fatalf("Get after clear: %v", err)
+	}
+	if st.CORSConfig != nil {
+		t.Fatalf("CORSConfig after clear = %q, want nil", st.CORSConfig)
+	}
+
+	if err := r.SetCORSConfig(ctx, "missing", doc); !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("SetCORSConfig on a missing bucket = %v, want ErrNotFound", err)
+	}
+}

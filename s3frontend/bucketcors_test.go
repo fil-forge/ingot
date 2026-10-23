@@ -1,0 +1,193 @@
+package s3frontend
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"testing"
+
+	"github.com/fil-forge/ucantone/did"
+	"github.com/fil-forge/versitygw/s3err"
+
+	"github.com/fil-forge/ingot/registry"
+)
+
+// Bucket CORS tests over the refindex_test.go harness, covering
+// docs/s3-cors.md: the gateway-wide document as the default, a bucket's own
+// document replacing it for that bucket alone, the delete round-trip, the
+// size cap, and the missing bucket outranking everything.
+
+const corsDoc = `<CORSConfiguration><CORSRule><AllowedOrigin>https://app.example</AllowedOrigin><AllowedMethod>GET</AllowedMethod></CORSRule></CORSConfiguration>`
+
+func TestBucketCors_DisabledWithoutDocument(t *testing.T) {
+	b, _, _ := newRefTestBackend(t)
+	ctx := context.Background()
+
+	// CORS disabled gateway-wide and no document of the bucket's own: the
+	// sentinel versitygw's middlewares fall through on.
+	_, err := b.GetBucketCors(ctx, "bk")
+	wantAPIErr(t, err, s3err.ErrNoSuchCORSConfiguration)
+
+	// Storing a document turns CORS on for this bucket alone.
+	if err := b.PutBucketCors(ctx, "bk", []byte(corsDoc)); err != nil {
+		t.Fatalf("PutBucketCors: %v", err)
+	}
+	got, err := b.GetBucketCors(ctx, "bk")
+	if err != nil {
+		t.Fatalf("GetBucketCors: %v", err)
+	}
+	if !bytes.Equal(got, []byte(corsDoc)) {
+		t.Fatalf("GetBucketCors = %q, want the stored document", got)
+	}
+}
+
+func TestBucketCors_OwnDocumentReplacesTheDefault(t *testing.T) {
+	b, mem, _ := newRefTestBackend(t)
+	ctx := context.Background()
+	gateway := []byte(`<CORSConfiguration><CORSRule><AllowedOrigin>https://console.example</AllowedOrigin><AllowedMethod>GET</AllowedMethod></CORSRule></CORSConfiguration>`)
+	b.cors = gateway
+	if err := mem.Create(ctx, "other", did.Undef, registry.CreateState{}); err != nil {
+		t.Fatalf("create bucket: %v", err)
+	}
+
+	// Without a document of its own, every bucket answers the gateway's.
+	for _, name := range []string{"bk", "other"} {
+		got, err := b.GetBucketCors(ctx, name)
+		if err != nil {
+			t.Fatalf("GetBucketCors %q: %v", name, err)
+		}
+		if !bytes.Equal(got, gateway) {
+			t.Fatalf("GetBucketCors %q = %q, want the gateway document", name, got)
+		}
+	}
+
+	// A document on one bucket replaces the default there and nowhere else.
+	if err := b.PutBucketCors(ctx, "bk", []byte(corsDoc)); err != nil {
+		t.Fatalf("PutBucketCors: %v", err)
+	}
+	got, err := b.GetBucketCors(ctx, "bk")
+	if err != nil {
+		t.Fatalf("GetBucketCors: %v", err)
+	}
+	if !bytes.Equal(got, []byte(corsDoc)) {
+		t.Fatalf("GetBucketCors = %q, want the bucket's own document", got)
+	}
+	got, err = b.GetBucketCors(ctx, "other")
+	if err != nil {
+		t.Fatalf("GetBucketCors other: %v", err)
+	}
+	if !bytes.Equal(got, gateway) {
+		t.Fatalf("GetBucketCors other = %q, want the gateway document still", got)
+	}
+
+	// Deleting it restores the default. Deleting again is a no-op.
+	for range 2 {
+		if err := b.DeleteBucketCors(ctx, "bk"); err != nil {
+			t.Fatalf("DeleteBucketCors: %v", err)
+		}
+	}
+	got, err = b.GetBucketCors(ctx, "bk")
+	if err != nil {
+		t.Fatalf("GetBucketCors after delete: %v", err)
+	}
+	if !bytes.Equal(got, gateway) {
+		t.Fatalf("GetBucketCors after delete = %q, want the gateway document", got)
+	}
+}
+
+// corsDocWithRules is a document of n minimal, valid rules.
+func corsDocWithRules(n int) []byte {
+	var buf bytes.Buffer
+	buf.WriteString("<CORSConfiguration>")
+	for i := 0; i < n; i++ {
+		fmt.Fprintf(&buf, "<CORSRule><AllowedOrigin>https://origin-%d.example</AllowedOrigin><AllowedMethod>GET</AllowedMethod></CORSRule>", i)
+	}
+	buf.WriteString("</CORSConfiguration>")
+	return buf.Bytes()
+}
+
+func TestBucketCors_RuleLimit(t *testing.T) {
+	b, _, _ := newRefTestBackend(t)
+	ctx := context.Background()
+
+	// S3's hundred rules is the most a document may hold.
+	hundred := corsDocWithRules(maxCORSRules)
+	if err := b.PutBucketCors(ctx, "bk", hundred); err != nil {
+		t.Fatalf("PutBucketCors with %d rules: %v", maxCORSRules, err)
+	}
+
+	// One more is refused, and the stored document is untouched.
+	if err := b.PutBucketCors(ctx, "bk", corsDocWithRules(maxCORSRules+1)); err == nil {
+		t.Fatalf("PutBucketCors with %d rules: want error", maxCORSRules+1)
+	} else {
+		wantAPIErr(t, err, s3err.ErrMalformedXML)
+	}
+	got, err := b.GetBucketCors(ctx, "bk")
+	if err != nil {
+		t.Fatalf("GetBucketCors: %v", err)
+	}
+	if !bytes.Equal(got, hundred) {
+		t.Fatalf("GetBucketCors = %d bytes, want the %d-rule document still stored", len(got), maxCORSRules)
+	}
+}
+
+func TestBucketCors_SizeCap(t *testing.T) {
+	b, _, _ := newRefTestBackend(t)
+	ctx := context.Background()
+
+	// Over the byte cap, before any parse: EntityTooLarge. Under it, a body
+	// that is not a CORS document is MalformedXML, as the controller would
+	// have said; the backend trusts the controller's validation but not the
+	// shape of whatever it is handed.
+	if err := b.PutBucketCors(ctx, "bk", bytes.Repeat([]byte("x"), maxCORSConfig+1)); err == nil {
+		t.Fatal("PutBucketCors over the cap: want error")
+	} else {
+		wantAPIErr(t, err, s3err.ErrEntityTooLarge)
+	}
+	if err := b.PutBucketCors(ctx, "bk", bytes.Repeat([]byte("x"), maxCORSConfig)); err == nil {
+		t.Fatal("PutBucketCors with a body that is not a document: want error")
+	} else {
+		wantAPIErr(t, err, s3err.ErrMalformedXML)
+	}
+}
+
+func TestBucketCors_MissingBucket(t *testing.T) {
+	b, _, _ := newRefTestBackend(t)
+	ctx := context.Background()
+	b.cors = []byte(corsDoc)
+
+	_, err := b.GetBucketCors(ctx, "nope")
+	wantAPIErr(t, err, s3err.ErrNoSuchBucket)
+	wantAPIErr(t, b.PutBucketCors(ctx, "nope", []byte(corsDoc)), s3err.ErrNoSuchBucket)
+	wantAPIErr(t, b.DeleteBucketCors(ctx, "nope"), s3err.ErrNoSuchBucket)
+}
+
+// A bucket's document goes with its registry row, which DeleteBucket ends by
+// removing: a bucket deleted and created again under the same name answers
+// the default, not the document the earlier bucket stored.
+func TestBucketCors_DoesNotSurviveTheBucket(t *testing.T) {
+	b, mem, _ := newRefTestBackend(t)
+	ctx := context.Background()
+	gateway := []byte(`<CORSConfiguration/>`)
+	b.cors = gateway
+
+	if err := b.PutBucketCors(ctx, "bk", []byte(corsDoc)); err != nil {
+		t.Fatalf("PutBucketCors: %v", err)
+	}
+	if err := mem.Delete(ctx, "bk"); err != nil {
+		t.Fatalf("delete bucket: %v", err)
+	}
+	_, err := b.GetBucketCors(ctx, "bk")
+	wantAPIErr(t, err, s3err.ErrNoSuchBucket)
+
+	if err := mem.Create(ctx, "bk", did.Undef, registry.CreateState{}); err != nil {
+		t.Fatalf("create bucket again: %v", err)
+	}
+	got, err := b.GetBucketCors(ctx, "bk")
+	if err != nil {
+		t.Fatalf("GetBucketCors after re-creation: %v", err)
+	}
+	if !bytes.Equal(got, gateway) {
+		t.Fatalf("GetBucketCors after re-creation = %q, want the gateway document", got)
+	}
+}

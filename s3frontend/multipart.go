@@ -491,6 +491,29 @@ var errCompleteInProgress = s3err.APIError{
 }
 
 func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.CompleteMultipartUploadInput) (s3response.CompleteMultipartUploadResult, string, error) {
+	return b.CompleteMultipartUploadReportingHeaders(ctx, input, func(backend.CompleteMultipartUploadHeaders) {})
+}
+
+var _ backend.CompleteMultipartUploadReporter = (*Backend)(nil)
+
+// CompleteMultipartUploadReportingHeaders is CompleteMultipartUpload that
+// reports its version id and encryption before accepting the parts, the
+// slow step, for versitygw to send with a streamed response's early
+// headers, as S3 does. An Enabled bucket's winner reports the id it
+// reserved; every other path reports "" before it waits on anything.
+func (b *Backend) CompleteMultipartUploadReportingHeaders(ctx context.Context, input *s3.CompleteMultipartUploadInput, reportHeaders func(backend.CompleteMultipartUploadHeaders)) (s3response.CompleteMultipartUploadResult, string, error) {
+	// Only the first report counts (versitygw ignores the rest), and a
+	// report is binding, so the reservation below needs to know whether ""
+	// went out first. Every report comes after the session has loaded, and
+	// carries its encryption.
+	reported := false
+	var sse types.ServerSideEncryption
+	report := func(versionID string) {
+		if !reported {
+			reported = true
+			reportHeaders(backend.CompleteMultipartUploadHeaders{VersionID: versionID, ServerSideEncryption: sse})
+		}
+	}
 	if input.Bucket == nil || input.Key == nil || input.UploadId == nil {
 		return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrInvalidRequest)
 	}
@@ -521,6 +544,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 	if sess.Space.Defined() && sess.Space != bucketState.Space {
 		return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrNoSuchUpload)
 	}
+	sse = encryptionFor(sess.Plaintext)
 
 	// A Complete naming a checksum type must match the CreateMultipartUpload
 	// declaration (a session without one reports the literal "null").
@@ -745,7 +769,14 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 				// but no checksum: AWS omits it on the idempotent replay (for both
 				// COMPOSITE and FULL_OBJECT), unlike the first Complete.
 				res := s3response.CompleteMultipartUploadResult{Bucket: &bucket, Key: &key, ETag: &etagQ, ServerSideEncryption: encryptionFor(sess.Plaintext)}
-				return res, cur.CommittedVersionID, nil
+				// A null version is one the first Complete committed outside
+				// an Enabled bucket, and sent no id for.
+				versionid := cur.CommittedVersionID
+				if versionid == registry.NullVersionID {
+					versionid = ""
+				}
+				report(versionid)
+				return res, versionid, nil
 			}
 			if cur.State == registry.SessionOpen {
 				won, err := b.multipart.LatchSession(ctx, uploadID, registry.SessionOpen, registry.SessionCompleting)
@@ -763,6 +794,10 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 			if tries >= replayMaxTries || time.Now().After(deadline) {
 				return s3response.CompleteMultipartUploadResult{}, "", errCompleteInProgress
 			}
+			// The winner's id isn't known until it commits, and if it fails
+			// this caller may commit a version of its own. The headers go out
+			// without one rather than wait out the winner.
+			report("")
 			select {
 			case <-ctx.Done():
 				return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: complete wait: %w", ctx.Err())
@@ -810,6 +845,26 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 			zap.String("key", key), zap.Int("parts", len(requested)), zap.Int64("size", total), zap.Int64("rehash", need), zap.Int64("budget", b.rehashBudget))
 		return s3response.CompleteMultipartUploadResult{}, "", errPartLayoutOverBudget(need, b.rehashBudget)
 	}
+
+	// An Enabled bucket's new version id goes out now, before the parts are
+	// accepted: versitygw commits the response headers at the report, as S3
+	// commits its early 200 with x-amz-version-id, and an error after it can
+	// only go in the 200's body. The re-hash refusal above comes first so
+	// that it keeps its 400. The commit then installs exactly this id, or
+	// fails (errReservationSuperseded). Every other Complete reports no id,
+	// including one that already did while it waited on another Complete,
+	// and the commit then refuses to create a numbered version, which the
+	// client could never learn.
+	reserved := &versionReservation{}
+	if bucketState.Versioning == registry.VersioningEnabled && !reported {
+		r, err := b.reserveVersion(ctx, bucket)
+		if err != nil {
+			return s3response.CompleteMultipartUploadResult{}, "", err
+		}
+		reserved = &r
+		report(r.VersionID)
+	}
+	report("")
 
 	// Assemble the ordered body: each part's byte span (it may span several
 	// blobs) is recorded so a later GET/HEAD ?partNumber=N can address it (§7.2).
@@ -894,7 +949,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 	// claims and drops in the swap. The conditional-write preconditions re-check
 	// under the lock so a racing writer can't slip between the pre-check above
 	// and the swap.
-	node, effState, err := b.commitVersion(ctx, bucketState, key, mf, blobs, initState, false, func(superseded *msbucket.ObjectManifest) error {
+	node, effState, err := b.commitVersionAt(ctx, bucketState, key, mf, blobs, initState, false, reserved, func(superseded *msbucket.ObjectManifest) error {
 		// The latch is re-checked under the bucket lock, where every
 		// teardown that takes a 'completing' row (DeleteBucket, the
 		// sweeper) latches it: a session taken while its blobs were
@@ -930,6 +985,10 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 		}
 		return nil
 	})
+	if errors.Is(err, errReservationSuperseded) {
+		b.logger.Info("multipart completion refused: the key or the bucket's versioning changed since it reported its version",
+			zap.String("key", key), zap.String("uploadID", uploadID), zap.String("versionID", reserved.VersionID))
+	}
 	if err != nil {
 		return s3response.CompleteMultipartUploadResult{}, "", err
 	}

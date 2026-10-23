@@ -79,6 +79,11 @@ type State struct {
 	// bucket carries no tag set — never set, or deleted since
 	// (docs/s3-object-tagging.md §9).
 	BucketTagging []byte
+	// CORSConfig is the bucket's own CORS configuration: the controller's
+	// validated <CORSConfiguration> XML, stored verbatim. Nil when the
+	// bucket has none of its own and answers the gateway-wide document
+	// (docs/s3-cors.md).
+	CORSConfig []byte
 	// Encryption is the bucket's default encryption as PutBucketEncryption
 	// stored it; BucketEncryptionUnset when never configured, or deleted
 	// since.
@@ -163,6 +168,11 @@ type Registry interface {
 	// SetBucketTagging stores the bucket's tag set, replacing any previous
 	// one; nil clears it. Returns ErrNotFound if the bucket is absent.
 	SetBucketTagging(ctx context.Context, name string, tags []byte) error
+
+	// SetCORSConfig stores the bucket's own CORS configuration document,
+	// replacing any previous one; nil clears it. Returns ErrNotFound if the
+	// bucket is absent.
+	SetCORSConfig(ctx context.Context, name string, cfg []byte) error
 
 	// SetEncryption stores the bucket's default encryption;
 	// BucketEncryptionUnset clears it. Returns ErrNotFound if the bucket is
