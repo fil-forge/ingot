@@ -228,6 +228,8 @@ func (b *Backend) UploadPart(ctx context.Context, input *s3.UploadPartInput) (*s
 	if src == nil {
 		src = bytes.NewReader(nil)
 	}
+	src, record := b.transferMetrics.countIngress(ctx, src)
+	defer record()
 	var md5Src bodyMD5Source
 	if digest := decodeContentMD5(contentMD5Header(ctx)); digest != nil {
 		md5Src = knownMD5(digest)

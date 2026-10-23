@@ -139,6 +139,8 @@ type Backend struct {
 	multipartGauges  metric.Registration
 	parkedAgeSeconds atomic.Int64
 	parkedAgeKnown   atomic.Bool
+	// transferMetrics counts object body bytes sent and received.
+	transferMetrics transferMetrics
 	// regionKeys unwraps region-wrapped CEKs for the decrypting read path.
 	regionKeys regionkey.Provider
 	// tenantKeys yields the tenant wrap key each write encrypts to (the FEE
@@ -357,6 +359,7 @@ func New(d Deps) *Backend {
 	}
 	b.localBlobMetrics, b.localBlobGauges = newLocalBlobMetrics(mp, b, logger)
 	b.multipartMetrics, b.multipartGauges = newMultipartMetrics(mp, b, logger)
+	b.transferMetrics = newTransferMetrics(mp, logger)
 	return b
 }
 

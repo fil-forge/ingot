@@ -20,7 +20,9 @@ Ingot runs on the appliances, where it pushes traces and metrics over OTLP to Al
   global one, as the `ingot.local_blobs.*` instruments do (`s3frontend.Deps.MeterProvider`,
   `Layered.CountBlobReads`). Prefer a signal that answers "is this working?", such as a failure
   count or a stalled amount, over one that only measures volume, and keep attributes
-  low-cardinality: no keys, CIDs or bucket names. List each new metric in a metrics table in the
+  low-cardinality: no keys, CIDs or bucket names. The one exception is
+  `ingot.s3.bucket_object_egress_bytes`, labelled by space and tenant DID so a tenant over its
+  plan's egress can be found; `ingot.s3.object_egress_bytes` carries the same total without them. List each new metric in a metrics table in the
   README: the local blob one, or a new one beside it.
 - **Traces.** New work runs inside the request's span or a sweep's root span; a new outbound HTTP
   client uses `tracing.NewHTTPClient()`.
