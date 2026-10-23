@@ -1062,10 +1062,11 @@ func (b *Backend) CompleteMultipartUploadReportingHeaders(ctx context.Context, i
 }
 
 // AbortMultipartUpload cancels a multipart upload: it latches the session
-// (single-winner vs Complete), drops it (cascading its parts), and records a
-// release for each of the parts' now-unreferenced blobs (which unallocates any
-// parked on a provider: an upload ends in exactly one of accept or abort). No reference claims were taken (those happen only at
-// Complete).
+// (single-winner vs Complete), records a release for each of the parts'
+// now-unreferenced blobs, drops the session (cascading its parts), and runs
+// the releases for up to abortReleaseBudget. A release unallocates a blob
+// parked on a provider: an upload ends in exactly one of accept or abort. No
+// reference claims were taken (those happen only at Complete).
 func (b *Backend) AbortMultipartUpload(ctx context.Context, input *s3.AbortMultipartUploadInput) error {
 	if input.UploadId == nil {
 		return s3err.GetAPIError(s3err.ErrInvalidRequest)
@@ -1102,9 +1103,19 @@ func (b *Backend) AbortMultipartUpload(ctx context.Context, input *s3.AbortMulti
 	if err := b.multipart.DeleteSession(ctx, uploadID); err != nil {
 		return fmt.Errorf("s3frontend: delete session: %w", err)
 	}
-	b.releaseNow(ctx, released)
+	// The abort is committed: what the budget leaves unreleased, the
+	// deferred-release sweeper runs from the records.
+	rctx, cancel := context.WithTimeout(ctx, abortReleaseBudget)
+	defer cancel()
+	b.releaseNow(rctx, released)
 	return nil
 }
+
+// abortReleaseBudget bounds how long an Abort runs its parts' releases
+// before it answers. Each is a call to the provider, made one at a time, and
+// a client's read timeout (60 s for the AWS CLI) would otherwise fail an
+// abort that has already committed; the retry then finds no such upload.
+var abortReleaseBudget = 30 * time.Second
 
 // abortOpenSession force-aborts an open multipart session exactly like a
 // client Abort: latch (losing gracefully to a concurrent Complete/Abort),
