@@ -60,6 +60,11 @@ type PlaneConfig struct {
 	// keep on local disk as a read tier. Older shipped CARs are unlinked.
 	// 0 → 6. Ignored when Ship is false.
 	Retain int
+
+	// ShipRetry is how often the retry sweep tries the sealed segments
+	// still unshipped: those whose queued ship ran out of attempts, or that
+	// never fit in the queue. 0 → 1m. Ignored when Ship is false.
+	ShipRetry time.Duration
 }
 
 // FlushFunc is the contract for shipping one sealed segment's CAR to
@@ -90,7 +95,8 @@ func (c *Config) defaults() {
 	}
 }
 
-// withDefaults returns pc with zero-valued seal/retain knobs filled in.
+// withDefaults returns pc with zero-valued seal, retain and retry knobs
+// filled in.
 func (pc PlaneConfig) withDefaults() PlaneConfig {
 	if pc.SealBytes <= 0 {
 		pc.SealBytes = 64 << 20
@@ -100,6 +106,9 @@ func (pc PlaneConfig) withDefaults() PlaneConfig {
 	}
 	if pc.Retain <= 0 {
 		pc.Retain = 6
+	}
+	if pc.ShipRetry <= 0 {
+		pc.ShipRetry = time.Minute
 	}
 	return pc
 }
