@@ -42,8 +42,9 @@ type UploadRegistrar interface {
 	// change queued at 23:59 has hours to be drained in. Renewal is for the
 	// queue that outlasts that, which is the upload service being away for
 	// longer than a night. It comes from the space's live authority, which a
-	// recent write to that space leaves behind, so it rescues a space still
-	// in use. A space that has gone quiet has none, and the error says so.
+	// body upload to that space leaves behind for an hour if its store is
+	// borrowable, so it rescues a space still in use. A space that has gone
+	// quiet has none, and the error says so.
 	PrepareAuthority(ctx context.Context, space did.DID, cmd ucan.Command, stored []byte) ([]byte, bool, error)
 	// RegisterUploads records each change as a content entry in one round
 	// trip, reporting the outcomes in the order given: a nil entry means the
@@ -65,24 +66,18 @@ type QueuedUpload struct {
 
 // CaptureAuthority resolves the proof chain for cmd on space and encodes it.
 // The store is request-scoped when present (the write committing the version)
-// and otherwise the authority captured from a recent write to the space.
+// and otherwise the space's ship authority: the borrowable store its latest
+// body upload left, within the hour.
 func (u *Forge) CaptureAuthority(ctx context.Context, space did.DID, cmd ucan.Command) ([]byte, error) {
-	store, ok := u.shipProofStore(ctx, space)
-	if !ok {
-		return nil, fmt.Errorf("uploader: no proof store for space %s (no request scope and no captured write authority)", space)
-	}
-	proofs, _, err := store.ProofChain(ctx, u.client.Issuer().DID(), cmd, space)
+	// An empty chain is not an error to ProofChain, but it is one here
+	// (authorityFor refuses it): the invocation would go out proofless and be
+	// refused, and a queued change carrying it can never be sent by anybody.
+	// Failing now puts the problem where it can be read — the request holds no
+	// chain for this command on this space — instead of queueing a row that
+	// fails forever and takes a bucket delete with it.
+	_, proofs, err := u.authorityFor(ctx, space, cmd)
 	if err != nil {
-		return nil, fmt.Errorf("uploader: building proof chain: %w", err)
-	}
-	// An empty chain is not an error to ProofChain, but it is one here: the
-	// invocation would go out proofless and be refused, and a queued change
-	// carrying it can never be sent by anybody. Failing now puts the problem
-	// where it can be read — the request holds no chain for this command on this
-	// space — instead of queueing a row that fails forever and takes a bucket
-	// delete with it.
-	if len(proofs) == 0 {
-		return nil, fmt.Errorf("uploader: no %s authority for space %s", cmd, space)
+		return nil, err
 	}
 	// Gzipped raw: the chain is stored once per object version and outlives
 	// the request that produced it.

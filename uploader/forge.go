@@ -10,8 +10,10 @@ import (
 	"time"
 
 	"github.com/fil-forge/libforge/blobindex"
+	blobcmds "github.com/fil-forge/libforge/commands/blob"
 	ucanlib "github.com/fil-forge/libforge/ucan"
 	"github.com/fil-forge/ucantone/did"
+	"github.com/fil-forge/ucantone/ucan"
 	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multicodec"
 	"github.com/multiformats/go-multihash"
@@ -70,8 +72,8 @@ type Forge struct {
 	putClient *nethttp.Client
 	logger    *zap.Logger
 
-	// shipProofs caches, per space, the most recent request-scoped proof
-	// store seen on an in-request write to that space. The catalog segment
+	// shipProofs caches, per space, the most recent borrowable proof store
+	// seen on an in-request body upload to that space. The catalog segment
 	// ship (SubmitShard) runs asynchronously in the flush goroutine with no
 	// request context, so it reuses this to authorize its onward
 	// /blob/add + /index/add. See UploadBlob (capture) and SubmitShard (use).
@@ -82,6 +84,10 @@ type Forge struct {
 // longer than the seal→ship latency (seconds) and flush-retry window, so a
 // segment sealed just after a write still finds its space's store.
 const shipProofsTTL = time.Hour
+
+// noCapturedAuthority says why shipProofStore found nothing outside a
+// request, for the errors of the calls that need it.
+const noCapturedAuthority = "no body upload has left a borrowable store within the last hour"
 
 // ForgeConfig wires a Forge uploader.
 //
@@ -114,10 +120,15 @@ func NewForge(cfg ForgeConfig) (*Forge, error) {
 	}, nil
 }
 
-// captureShipProofs records store as the ship authority for space (called on
-// in-request writes). Nil store is ignored.
-func (u *Forge) captureShipProofs(space did.DID, store ucanlib.ProofStore) {
-	if store == nil {
+// captureShipProofs records the proof store of ctx's request as the ship
+// authority for space (called on in-request writes), if background work may
+// borrow it (reqscope.BorrowableProofStore): the access key's own store,
+// whose chains skip any delegation revoked since it was captured. A write
+// authorized by a store only it may use, one holding a delegation known
+// revoked, leaves the space's earlier capture in place.
+func (u *Forge) captureShipProofs(ctx context.Context, space did.DID) {
+	store, ok := reqscope.BorrowableProofStore(ctx)
+	if !ok {
 		return
 	}
 	u.shipProofs.Set(space.String(), store, gocache.DefaultExpiration)
@@ -136,17 +147,39 @@ func (u *Forge) shipProofStore(ctx context.Context, space did.DID) (ucanlib.Proo
 	return nil, false
 }
 
+// authorityFor resolves the proof store authorizing cmd on space, as
+// shipProofStore does, and the chain it holds for cmd. A captured store can
+// outlive its chains: they expire, or a revocation names one of their hops.
+// An invocation sent without a chain goes out proofless, and the service
+// refuses it with an error that says nothing about why, so this fails first,
+// naming the command and the space.
+func (u *Forge) authorityFor(ctx context.Context, space did.DID, cmd ucan.Command) (ucanlib.ProofStore, []ucan.Delegation, error) {
+	store, ok := u.shipProofStore(ctx, space)
+	if !ok {
+		return nil, nil, fmt.Errorf("uploader: no proof store for space %s (no request scope; %s)", space, noCapturedAuthority)
+	}
+	proofs, _, err := store.ProofChain(ctx, u.client.Issuer().DID(), cmd, space)
+	if err != nil {
+		return nil, nil, fmt.Errorf("uploader: building %s proof chain: %w", cmd, err)
+	}
+	if len(proofs) == 0 {
+		return nil, nil, fmt.Errorf("uploader: no %s authority for space %s (the chains it held expired or were revoked)", cmd, space)
+	}
+	return store, proofs, nil
+}
+
 func (u *Forge) SubmitShard(ctx context.Context, plane blockstore.Plane, space did.DID, shard CARShard) (BlobLocation, multihash.Multihash, error) {
 	if shard.Size <= 0 || len(shard.Positions) == 0 {
 		return BlobLocation{}, nil, nil
 	}
 
 	// The ship runs async (flush goroutine, no request), so its authority is
-	// the store captured from a recent in-request write to this space. No
-	// store → fail so the flush retries; a later write repopulates it.
-	store, ok := u.shipProofStore(ctx, space)
-	if !ok {
-		return BlobLocation{}, nil, fmt.Errorf("uploader: no ship authority for space %s (no captured proof store)", space)
+	// the store captured from a recent body upload to this space. No store,
+	// or none holding a /blob/add chain → fail so the flush retries; a later
+	// body upload with a borrowable store repopulates it.
+	store, _, err := u.authorityFor(ctx, space, blobcmds.Add.Command)
+	if err != nil {
+		return BlobLocation{}, nil, err
 	}
 
 	// The index blob's bytes and digest are deterministic from the shard, so

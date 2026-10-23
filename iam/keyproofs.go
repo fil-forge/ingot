@@ -84,12 +84,16 @@ func (k *KeyProofs) Deposit(key did.DID, dlgs ...ucan.Delegation) {
 // InvalidateHolders records link as revoked and drops every per-key proof
 // store holding the delegation with that CID, returning the affected
 // access-key DIDs. Dropping the whole store rather than the one entry is
-// deliberate: a revoked delegation is a hop in every chain the local fast
-// path could assemble for that key, so no partial state is worth keeping —
-// the key's next request falls through to Hilt, which re-authorizes (or, for
-// a deleted key, refuses). A caller already holding the dropped
-// *DelegationCache (an in-flight request) is unaffected; the next For(key)
-// starts a fresh empty store. A link no store holds is still recorded: the
+// deliberate: the store also holds the key's action sets, and a revocation
+// marks a change to what the key may do (a deleted key, or a bucket policy
+// rewrite that rotates the bucket's delegations), so neither its chains nor
+// its sets are worth trusting on the fast path — the key's next request falls
+// through to Hilt, which re-authorizes (or, for a deleted key, refuses). A
+// caller already holding the dropped
+// *DelegationCache (an in-flight request, or the uploader's ship authority)
+// can still use it, but no chain it assembles uses the revoked delegation,
+// so its chains over other subjects stay usable; the next For(key) starts a
+// fresh empty store. A link no store holds is still recorded: the
 // revocation may precede the response that would have cached it.
 func (k *KeyProofs) InvalidateHolders(link cid.Cid) []did.DID {
 	k.mu.Lock()

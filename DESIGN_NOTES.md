@@ -493,10 +493,10 @@ not yet started defers while a write of its space holds the digest.
   the agent, and the per-key `DelegationCache` carries those proofs into the
   request via `internal/reqscope`, where the uploader and the network read
   tier spend them. The uploader also captures a per-space ship authority
-  (1h TTL) for the async catalog flush. The same cache's action sets ride
-  along (`reqscope.Permits`) for the one check hilt cannot make from the
-  URL: a `DeleteObjects` entry naming a version needs
-  `s3:DeleteObjectVersion`, beyond the request's `s3:DeleteObject`.
+  (1h TTL) for the async catalog flush, from borrowable stores only. The
+  same cache's action sets ride along (`reqscope.Permits`) for the one check
+  hilt cannot make from the URL: a `DeleteObjects` entry naming a version
+  needs `s3:DeleteObjectVersion`, beyond the request's `s3:DeleteObject`.
 - There is **no root account**: versitygw's built-in root user is disabled
   (an empty `RootUserConfig`), so every access key resolves through hilt. A
   key hilt has not issued is rejected as InvalidAccessKeyId.
@@ -543,8 +543,14 @@ draws the chains and the stores.
 - **Reads carry no bucket context**: `Manager.Get` linear-scans every open
   bucket store; threading the bucket into the read path removes the scan.
 - **The ship authority expires**: the async flush signs with a per-space
-  proof store captured at the last in-request write (1h TTL); a bucket idle
-  longer than that cannot ship a newly sealed segment until its next write.
+  proof store captured at the last in-request body upload (1h TTL); a
+  bucket without one for longer than that, or whose grant in the captured
+  store a revocation has named, cannot ship a newly sealed segment. The
+  flush gives up after five attempts (about 31s of backoff), and a later
+  body upload re-captures the authority for segments sealed after it, not
+  for that one. Only a restart re-enqueues it, and the capture lives in
+  memory, so even then it ships only if a body upload to the space captures
+  the authority before its attempts run out.
 - **The indexer read path is unwired**: `LocalLocator` serves all reads; the
   network index is still published (best-effort) but never consulted.
 - **Carried Forge-client copies**: `forgeclient/`, `tokenstore/`,
