@@ -11,6 +11,8 @@ import (
 	"github.com/fil-forge/ucantone/did"
 	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
+
+	"github.com/fil-forge/ingot/blockstore"
 )
 
 // VersioningState is a bucket's S3 versioning configuration. Buckets start
@@ -135,14 +137,19 @@ type Registry interface {
 
 	// CommitRoot is CASRoot plus the rows the commit owes, all in one
 	// transaction: the upload registrations, the new generation's blob
-	// claims and the discarded generations' claim drops (RootCommit). They
-	// belong with the swap: a registration or claim without its commit
-	// would describe a version the catalog never published, and a commit
-	// without them would leave the version uncounted and its blobs
-	// unclaimed, with nothing left to say so. A refused claim or pin
-	// (ErrReleaseInProgress, ErrClaimGone) fails the commit, and the root
-	// does not advance. Passing an empty RootCommit is exactly CASRoot.
+	// claims, the discarded generations' claim drops and the journaled
+	// catalog blocks (RootCommit). They belong with the swap: a
+	// registration or claim without its commit would describe a version
+	// the catalog never published, and a commit without them would leave
+	// the version uncounted and its blobs unclaimed, with nothing left to
+	// say so. A refused claim or pin (ErrReleaseInProgress, ErrClaimGone)
+	// fails the commit, and the root does not advance. Passing an empty
+	// RootCommit is exactly CASRoot.
 	CommitRoot(ctx context.Context, name string, expect, next cid.Cid, c RootCommit) error
+
+	// CatalogJournalStats reports how much the catalog journal holds: the
+	// blocks commits journaled whose segments have not shipped yet.
+	CatalogJournalStats(ctx context.Context) (CatalogJournalStats, error)
 
 	// SetForgeRoot records that the DAG reachable from root has been
 	// successfully shipped to Forge. Used as the high-water mark by
@@ -229,11 +236,30 @@ type RootCommit struct {
 	// discarded version just before the swap has the whole grace to open
 	// its blobs.
 	ReleaseGrace time.Duration
+	// Journal is the commit's catalog blocks and the log segment they went
+	// into. They are kept in the catalog journal until that segment ships,
+	// so a copy of the database (a standby, a restore) holds every block
+	// its roots need that exists nowhere but this host's disk. A commit
+	// whose segment has already shipped journals nothing: its blocks are on
+	// Forge.
+	Journal blockstore.Appended
 }
 
 // Empty reports whether the commit carries nothing besides the root.
 func (c RootCommit) Empty() bool {
-	return len(c.Registrations) == 0 && len(c.Claims) == 0 && len(c.Pins) == 0 && len(c.Drops) == 0
+	return len(c.Registrations) == 0 && len(c.Claims) == 0 && len(c.Pins) == 0 && len(c.Drops) == 0 &&
+		len(c.Journal.Blocks) == 0
+}
+
+// CatalogJournalStats is the size of the catalog journal (RootCommit.Journal).
+type CatalogJournalStats struct {
+	// Blocks is the number of journaled blocks.
+	Blocks int64
+	// Bytes is their total size.
+	Bytes int64
+	// Oldest is when the oldest of them was journaled; zero when the
+	// journal is empty.
+	Oldest time.Time
 }
 
 // ClaimDrop is one claim a commit removes: a discarded version's row on a

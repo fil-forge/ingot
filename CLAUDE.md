@@ -109,7 +109,9 @@ Internal:
 - **`logstore/`** — the per-bucket catalog log: `manager.go` (`Manager`, the
   production `blockstore.Log`), `store.go`, `planelog.go`, `segment.go`,
   `recovery.go`. See `logstore/README.md`.
-- **`registry/`** — Postgres metadata: `postgres.go` (`Registry` + `State`),
+- **`registry/`** — Postgres metadata: `postgres.go` (`Registry` + `State`;
+  `CommitRoot` also journals each commit's catalog blocks in
+  `ingot.catalog_journal` until their segment ships),
   `segments.go` (`logstore.Meta`), `stores*.go` (intents, locations,
   inclusions, blob_refs, GC, multipart sessions/parts, parks, streams),
   `locallocator.go` (the read tier's `Locator`). One `*Postgres` satisfies

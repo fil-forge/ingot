@@ -342,7 +342,8 @@ func (tx *Tx) LoadTree() *mst.MerkleSearchTree {
 //  2. registry.CommitRoot advances the bucket Root from State().Root
 //     to newRoot and, in the same transaction, writes the rows the
 //     commit carries: its upload registrations, blob claims and claim
-//     drops.
+//     drops, and its catalog blocks, journaled under the segment step 1
+//     appended them to until that segment ships.
 //  3. The bucket lock is released.
 //
 // Returns registry.ErrConflict if another writer raced ahead of us
@@ -366,9 +367,11 @@ func (tx *Tx) Commit(ctx context.Context, newRoot cid.Cid) (err error) {
 	ctx, span := tracing.Start(ctx, "bucket.commit")
 	defer func() { tracing.End(span, err) }()
 
-	if err := tx.staging.Commit(ctx, newRoot); err != nil {
+	appended, err := tx.staging.Commit(ctx, newRoot)
+	if err != nil {
 		return fmt.Errorf("bucketop: append: %w", err)
 	}
+	tx.commit.Journal = appended
 	if err := tx.deps.Reg.CommitRoot(ctx, tx.bucket, tx.state.Root, newRoot, tx.commit); err != nil {
 		return fmt.Errorf("bucketop: advance root: %w", err)
 	}
