@@ -11,11 +11,16 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/fil-forge/ingot/blockstore"
 )
 
 // uniqueViolation is the Postgres SQLSTATE for a unique constraint
 // violation (matches the literal used elsewhere in sprue's stores).
 const uniqueViolation = "23505"
+
+// foreignKeyViolation is the Postgres SQLSTATE for a foreign key violation.
+const foreignKeyViolation = "23503"
 
 // pgxQuerier is the surface shared by *pgxpool.Pool and pgx.Tx, so a statement
 // can run standalone or inside a caller's transaction. Everything a statement
@@ -78,13 +83,13 @@ func (r *Postgres) Create(ctx context.Context, name string, space did.DID, init 
 }
 
 func (r *Postgres) Get(ctx context.Context, name string) (*State, error) {
-	var rootBytes, forgeBytes, lockCfg, tagging []byte
+	var rootBytes, forgeBytes, lockCfg, tagging, corsCfg []byte
 	var createdAt time.Time
 	var spaceStr, tenantStr, versioning string
 	var encryption *string
 	err := r.pool.QueryRow(ctx,
-		`SELECT root_cid, forge_root_cid, created_at, space, tenant, versioning, object_lock_config, bucket_tagging, encryption FROM ingot.buckets WHERE name = $1`, name).
-		Scan(&rootBytes, &forgeBytes, &createdAt, &spaceStr, &tenantStr, &versioning, &lockCfg, &tagging, &encryption)
+		`SELECT root_cid, forge_root_cid, created_at, space, tenant, versioning, object_lock_config, bucket_tagging, cors_config, encryption FROM ingot.buckets WHERE name = $1`, name).
+		Scan(&rootBytes, &forgeBytes, &createdAt, &spaceStr, &tenantStr, &versioning, &lockCfg, &tagging, &corsCfg, &encryption)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -99,7 +104,7 @@ func (r *Postgres) Get(ctx context.Context, name string) (*State, error) {
 	if err != nil {
 		return nil, fmt.Errorf("registry: parse tenant %q: %w", tenantStr, err)
 	}
-	st := &State{Name: name, Space: space, Tenant: tenant, Versioning: VersioningState(versioning), ObjectLockConfig: lockCfg, BucketTagging: tagging, CreatedAt: createdAt}
+	st := &State{Name: name, Space: space, Tenant: tenant, Versioning: VersioningState(versioning), ObjectLockConfig: lockCfg, BucketTagging: tagging, CORSConfig: corsCfg, CreatedAt: createdAt}
 	if encryption != nil {
 		st.Encryption = BucketEncryption(*encryption)
 	}
@@ -124,9 +129,10 @@ func (r *Postgres) CASRoot(ctx context.Context, name string, expect, next cid.Ci
 }
 
 // CommitRoot advances the root and records the commit's upload
-// registrations, blob claims and claim drops in one transaction, so each
-// row exists exactly when the version it describes committed. A conflict, a
-// missing bucket or a refused claim rolls everything back with the CAS.
+// registrations, blob claims, claim drops and journaled catalog blocks in
+// one transaction, so each row exists exactly when the version it describes
+// committed. A conflict, a missing bucket or a refused claim rolls
+// everything back with the CAS.
 func (r *Postgres) CommitRoot(ctx context.Context, name string, expect, next cid.Cid, c RootCommit) error {
 	if c.Empty() {
 		return r.CASRoot(ctx, name, expect, next)
@@ -138,6 +144,13 @@ func (r *Postgres) CommitRoot(ctx context.Context, name string, expect, next cid
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	// The journal goes first: it locks the segment's row, and
+	// MarkSegmentShipped locks that row before the bucket's, so taking them
+	// in the same order keeps a commit racing its segment's ship from
+	// deadlocking with it.
+	if err := journalBlocks(ctx, tx, name, c.Journal); err != nil {
+		return err
+	}
 	if err := r.casRoot(ctx, tx, name, expect, next); err != nil {
 		return err
 	}
@@ -172,6 +185,66 @@ func (r *Postgres) CommitRoot(ctx context.Context, name string, expect, next cid
 		return fmt.Errorf("registry: commit cas %q: %w", name, err)
 	}
 	return nil
+}
+
+// journalBlocks records a commit's catalog blocks under the log segment they
+// were appended to (RootCommit.Journal). It share-locks the segment's row
+// while it checks that the segment hasn't shipped, so MarkSegmentShipped,
+// which deletes the segment's rows, waits for this transaction to end: the
+// rows are either in place before the ship deletes them or never written,
+// and none outlives its segment. A shipped segment journals nothing, its
+// blocks being on Forge, and neither does one whose row is gone: retention
+// retires shipped segments only, and DeleteBucket removes a bucket's rows
+// under the bucket lock, which no commit to it can be holding.
+func journalBlocks(ctx context.Context, tx pgx.Tx, bucket string, j blockstore.Appended) error {
+	if len(j.Blocks) == 0 {
+		return nil
+	}
+	var shippedAt *int64
+	err := tx.QueryRow(ctx,
+		`SELECT shipped_at FROM ingot.segments WHERE seq = $1 FOR SHARE`, int64(j.Segment),
+	).Scan(&shippedAt)
+	if errors.Is(err, pgx.ErrNoRows) || (err == nil && shippedAt != nil) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("registry: lock segment %d for journal: %w", j.Segment, err)
+	}
+	cids := make([][]byte, len(j.Blocks))
+	data := make([][]byte, len(j.Blocks))
+	for i, b := range j.Blocks {
+		cids[i] = b.Cid().Bytes()
+		data[i] = b.RawData()
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO ingot.catalog_journal (seq, bucket, cid, data)
+		SELECT $1, $2, c, d FROM unnest($3::bytea[], $4::bytea[]) AS u(c, d)
+		ON CONFLICT (seq, cid) DO NOTHING
+	`, int64(j.Segment), bucket, cids, data); err != nil {
+		// The rows reference the bucket, and journaling runs before the CAS
+		// that would otherwise report a deleted bucket.
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == foreignKeyViolation {
+			return ErrNotFound
+		}
+		return fmt.Errorf("registry: journal %d blocks for %q: %w", len(j.Blocks), bucket, err)
+	}
+	return nil
+}
+
+// CatalogJournalStats reports the journal's row count, bytes and oldest row.
+func (r *Postgres) CatalogJournalStats(ctx context.Context) (CatalogJournalStats, error) {
+	var st CatalogJournalStats
+	var oldest *time.Time
+	if err := r.pool.QueryRow(ctx,
+		`SELECT count(*), COALESCE(sum(octet_length(data)), 0), min(created_at) FROM ingot.catalog_journal`,
+	).Scan(&st.Blocks, &st.Bytes, &oldest); err != nil {
+		return CatalogJournalStats{}, fmt.Errorf("registry: catalog journal stats: %w", err)
+	}
+	if oldest != nil {
+		st.Oldest = *oldest
+	}
+	return st, nil
 }
 
 func (r *Postgres) casRoot(ctx context.Context, q pgxQuerier, name string, expect, next cid.Cid) error {
@@ -273,6 +346,19 @@ func (r *Postgres) SetBucketTagging(ctx context.Context, name string, tags []byt
 		tags, name)
 	if err != nil {
 		return fmt.Errorf("registry: set bucket tagging %q: %w", name, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (r *Postgres) SetCORSConfig(ctx context.Context, name string, cfg []byte) error {
+	tag, err := r.pool.Exec(ctx,
+		`UPDATE ingot.buckets SET cors_config = $1 WHERE name = $2`,
+		cfg, name)
+	if err != nil {
+		return fmt.Errorf("registry: set cors config %q: %w", name, err)
 	}
 	if tag.RowsAffected() == 0 {
 		return ErrNotFound

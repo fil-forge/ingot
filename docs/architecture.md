@@ -689,7 +689,8 @@ The MVP this supersedes had six structural problems; each is resolved by a layer
 The relational tables as migrated (`migrations/sql/*.sql`), including the catalog log's
 **segment** metadata and per-operation **op-roots** (owned by the [`logstore`](../logstore)
 package). Object **manifests** and **MST nodes** are not rows here — they are content-addressed
-dag-cbor *blocks* in the catalog plane ([§4](#4-the-catalog-layer)). CIDs and blob digests
+dag-cbor *blocks* in the catalog plane ([§4](#4-the-catalog-layer)) — except that the **catalog
+journal** keeps a copy of each block until the segment it went into ships. CIDs and blob digests
 (sha256 multihashes) are stored as `bytea`. The ER view is in
 [`diagrams.md`](./diagrams.md#postgres-schema-as-migrated).
 
@@ -697,8 +698,9 @@ dag-cbor *blocks* in the catalog plane ([§4](#4-the-catalog-layer)). CIDs and b
 -- One row per bucket: the space its data lives in, the S3 versioning state, the
 -- committed MST root, and the root that is durable on Forge (advanced only when
 -- a catalog segment ships, and only while root_cid still equals the op-root).
--- The bucket-level S3 configuration rides here too: object lock, tagging and
--- default encryption, each NULL until configured.
+-- The bucket-level S3 configuration rides here too: object lock, tagging,
+-- default encryption and the bucket's own CORS document, each NULL until
+-- configured.
 CREATE TABLE ingot.buckets (
     name               text PRIMARY KEY,
     root_cid           bytea,                            -- committed MST root (locally durable)
@@ -711,6 +713,7 @@ CREATE TABLE ingot.buckets (
     next_version_seq   bigint NOT NULL DEFAULT 0,        -- per-bucket version ordinal (§3)
     object_lock_config bytea,                            -- auth.BucketLockConfig JSON; NULL = never configured
     bucket_tagging     bytea,                            -- tag set as a JSON object; NULL = no tag set
+    cors_config        bytea,                            -- the bucket's own CORS XML; NULL = the gateway default (docs/s3-cors.md)
     encryption         text CHECK (encryption IN ('AES256','none'))
                                                          -- default encryption; NULL = unconfigured (encrypts)
 );
@@ -742,6 +745,22 @@ CREATE TABLE ingot.segment_op_roots (
     root_cid   bytea  NOT NULL,
     PRIMARY KEY (seq, seq_within)
 );
+
+-- The catalog journal: a copy of every catalog block a commit appended to the
+-- log, written in the root swap's transaction and deleted in the one that stamps
+-- its segment shipped, so a copy of the database holds the blocks only this
+-- host's disk would otherwise hold. seq has deliberately no foreign key: logstore
+-- recovery deletes the row of a segment whose CAR is missing, and the blocks
+-- must outlive it.
+CREATE TABLE ingot.catalog_journal (
+    seq        bigint      NOT NULL,                     -- the log segment it went into
+    bucket     text        NOT NULL REFERENCES ingot.buckets(name) ON DELETE CASCADE,
+    cid        bytea       NOT NULL,
+    data       bytea       NOT NULL,                     -- the block's bytes
+    created_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (seq, cid)
+);
+CREATE INDEX catalog_journal_bucket_seq_idx ON ingot.catalog_journal (bucket, seq);
 
 -- Reverse index (§5, §6): which object versions reference each blob. One row per
 -- (digest, version). A blob's space-claim is released when no rows remain for
@@ -994,7 +1013,8 @@ CREATE TABLE ingot.revocation_cursor (
 
 Relationships at a glance: `segment_op_roots` cascades from `segments`, `multipart_parts` from
 `multipart_sessions`, `multipart_part_trees` from `multipart_parts`, and `upload_registrations`
-from `buckets` — the schema's only true foreign keys. `blob_refs`, `segments`,
+and `catalog_journal` from `buckets` — the schema's only true foreign keys. `catalog_journal`
+references a `segments.seq` by value, deliberately. `blob_refs`, `segments`,
 `multipart_sessions`, `blob_streams` and `gc_candidates` reference a `buckets.name` by value,
 `shard_inclusions` joins `blob_locations` on `shard_digest`, and `blob_encryption_params` joins
 `blob_locations` on `(space, digest)` with deliberately no FK. `revocation_cursor` stands alone.

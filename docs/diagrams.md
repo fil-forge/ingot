@@ -187,10 +187,10 @@ flowchart TB
     end
 
     subgraph catr["the catalog route (dag-cbor blocks, asynchronous ship)"]
-        commit["commit: manifest + MST splice into OpStaging,<br/>one fsynced AppendBatch into the bucket's log,<br/>guarded root swap, 200 to the client"]
+        commit["commit: manifest + MST splice into OpStaging,<br/>one fsynced AppendBatch into the bucket's log,<br/>guarded root swap journaling the new blocks<br/>in Postgres (catalog_journal), 200 to the client"]
         seal["open segment seals at SealBytes / SealAge<br/>(CAR + .idx + .ops)"]
         ship["background ship: /blob/add the sealed CAR,<br/>PUT, conclude, accept"]
-        incl["blob_locations (the CAR) + shard_inclusions<br/>(inner byte ranges), then the guarded<br/>forge_root_cid advance and retention"]
+        incl["blob_locations (the CAR) + shard_inclusions<br/>(inner byte ranges), then the guarded<br/>forge_root_cid advance, the segment's journal<br/>rows deleted, and retention"]
         commit --> seal --> ship --> incl
     end
 
@@ -206,9 +206,11 @@ flowchart TB
 ```
 
 - The `200` means different things per route: body blobs are durable and
-  accepted on Forge at ack; the catalog is fsynced locally at ack and becomes
-  durable on Forge only when its segment ships (`forge_root_cid` lags
-  `root_cid` until then).
+  accepted on Forge at ack; the catalog is fsynced locally and journaled in
+  Postgres at ack, and becomes durable on Forge only when its segment ships
+  (`forge_root_cid` lags `root_cid` until then). The journal is what puts the
+  unshipped catalog in any copy of Postgres; shipping the segment deletes its
+  rows.
 - The ordering is the crash-safety invariant: the catalog route starts only
   after every body blob is durable, so a crash never leaves a catalog entry
   pointing at non-durable data.
@@ -303,7 +305,7 @@ sequenceDiagram
     TX->>TX: mint versionId ("null" unless versioning Enabled),<br/>manifest into OpStaging, re-check If-Match under the lock,<br/>MST splice (new nodes into staging)
     Note over TX: uploader.CaptureShipAuthority: every commit captures the request<br/>proof store as the space's ship authority, so a write with no body<br/>(a delete, a tag change) leaves one for its segment's ship
     TX->>L: AppendBatch(catalog blocks, OpRoot) with fsync
-    TX->>R: CommitRoot(bucket, snapshot, newRoot), guarded, one transaction:<br/>blob_refs gains this version, superseded version rows removed,<br/>a release record per digest whose claims reached 0#59;<br/>/upload/add(root = this version's manifest CID)<br/>+ /upload/remove per discarded version queued (upload_registrations)
+    TX->>R: CommitRoot(bucket, snapshot, newRoot), guarded, one transaction:<br/>the batch's catalog blocks journaled under its segment (catalog_journal,<br/>skipped once the segment has shipped), blob_refs gains this version,<br/>superseded version rows removed, a release record per digest whose<br/>claims reached 0#59;<br/>/upload/add(root = this version's manifest CID)<br/>+ /upload/remove per discarded version queued (upload_registrations)
     TX-->>B: committed, lock released
     B-->>C: 200 + ETag (+ x-amz-version-id when versioning is configured)
     Note over B,U: the release sweeper runs each record once its grace passes:<br/>/blob/remove (+ crypto-shred: its blob_encryption_params row deleted)
@@ -1047,7 +1049,8 @@ Review when `iam/`, `s3frontend/policy.go` or the hilt client changes.
 ## Postgres schema as migrated
 
 Everything relational lives in the `ingot` schema; manifests and MST nodes
-are content-addressed blocks in the catalog log, not rows. Attributes here
+are content-addressed blocks in the catalog log, not rows, apart from the
+catalog journal's copy of those not yet shipped. Attributes here
 are trimmed to keys, states, and the columns other diagrams reference; the
 full DDL is `migrations/sql/`.
 
@@ -1077,6 +1080,13 @@ erDiagram
         int seq_within PK
         text bucket
         bytea root_cid
+    }
+    catalog_journal {
+        bigint seq PK "segment the block went into"
+        bytea cid PK
+        text bucket FK
+        bytea data "the block, until its segment ships"
+        timestamptz created_at
     }
     blob_refs {
         bytea digest PK
@@ -1192,6 +1202,8 @@ erDiagram
     multipart_sessions ||--o{ multipart_parts : "ON DELETE CASCADE"
     multipart_parts ||--o| multipart_part_trees : "ON DELETE CASCADE; deleted by Complete once the object commits"
     buckets ||--o{ upload_registrations : "ON DELETE CASCADE"
+    buckets ||--o{ catalog_journal : "ON DELETE CASCADE"
+    segments ||..o{ catalog_journal : "by seq, deliberately no FK"
     buckets ||..o{ segments : "by bucket name, no FK"
     buckets ||..o{ blob_refs : "by bucket name, no FK"
     blob_locations ||..o{ shard_inclusions : "by shard_digest"
@@ -1200,9 +1212,12 @@ erDiagram
     multipart_parts ||..o{ blob_release_intents : "teardown and supersede records, by digest"
 ```
 
-- The four solid relationships are the schema's only real foreign keys;
+- The five solid relationships are the schema's only real foreign keys;
   dashed ones are soft joins the code performs. `revocation_cursor` stands
   alone.
+- `catalog_journal` has no foreign key to `segments` on purpose: recovery
+  deletes the row of a segment whose CAR is missing from disk, and after a
+  lost disk the journal rows are what that segment is rebuilt from.
 - `gc_candidates` is write-only (no reader exists yet; its entry paths are the
   [catalog GC candidates](#catalog-gc-candidates-what-gets-remembered-for-removal)
   diagram); `segments.plane`
@@ -1247,7 +1262,7 @@ sequenceDiagram
         B->>U: /blob/remove (release the space's registration)
     end
     B->>H: /s3/bucket/delete (hilt refuses while registrations remain)
-    B->>R: reg.Delete (the local row)
+    B->>R: reg.Delete (the local row, its catalog_journal rows cascading)
     B->>L: RemoveBucketLog, best-effort<br/>(directory + segment rows)
     B-->>C: 204
 ```

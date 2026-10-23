@@ -109,7 +109,9 @@ Internal:
 - **`logstore/`** — the per-bucket catalog log: `manager.go` (`Manager`, the
   production `blockstore.Log`), `store.go`, `planelog.go`, `segment.go`,
   `recovery.go`. See `logstore/README.md`.
-- **`registry/`** — Postgres metadata: `postgres.go` (`Registry` + `State`),
+- **`registry/`** — Postgres metadata: `postgres.go` (`Registry` + `State`;
+  `CommitRoot` also journals each commit's catalog blocks in
+  `ingot.catalog_journal` until their segment ships),
   `segments.go` (`logstore.Meta`), `stores*.go` (intents, locations,
   inclusions, blob_refs, GC, multipart sessions/parts, parks, streams),
   `locallocator.go` (the read tier's `Locator`). One `*Postgres` satisfies
@@ -394,6 +396,8 @@ lives in `docs/architecture.md`.
 - [`docs/diagrams.md`](./docs/diagrams.md) — the as-built diagram set (living).
 - [`docs/s3-versioning.md`](./docs/s3-versioning.md) — the per-key
   version-tree design.
+- [`docs/s3-cors.md`](./docs/s3-cors.md) — the gateway-wide CORS document
+  and the per-bucket one that replaces it.
 - [`docs/aggregation-gate.md`](./docs/aggregation-gate.md) — why this S3
   design is gated on Piri's aggregation.
 - [`docs/IMPLEMENTATION_PLAN.md`](./docs/IMPLEMENTATION_PLAN.md) — the phase

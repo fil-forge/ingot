@@ -46,14 +46,17 @@ type Config struct {
 	// budget bounds how long Complete may spend reading parts back.
 	MultipartRehashBudget int64 `mapstructure:"multipart_rehash_budget" yaml:"multipart_rehash_budget"`
 	// CORSAllowedOrigins lists the browser origins the S3 listener answers
-	// CORS for. Each entry is an exact origin ("https://app.example"), a
-	// wildcard origin ("https://*.dev.example" — one '*' standing for any
-	// run of characters, S3's own matching), or the lone "*" (any origin —
-	// avoid outside development). Empty disables CORS (the default).
+	// CORS for by default. Each entry is an exact origin
+	// ("https://app.example"), a wildcard origin ("https://*.dev.example" —
+	// one '*' standing for any run of characters, S3's own matching), or
+	// the lone "*" (any origin — avoid outside development). Empty disables
+	// CORS by default (the default).
 	//
 	// The list is rendered into an S3 CORS configuration document that
-	// every bucket reports, which is what drives versitygw's CORS
-	// middlewares and preflight handler. Two consequences worth knowing:
+	// every bucket reports until PutBucketCors stores one of the bucket's
+	// own, which replaces it for that bucket (docs/s3-cors.md). The
+	// document is what drives versitygw's CORS middlewares and preflight
+	// handler. Two consequences worth knowing:
 	// a matched origin is answered with Access-Control-Allow-Credentials:
 	// true (AWS behaviour — harmless here because ingot authenticates the
 	// Authorization header and presigned URLs, never cookies), and the
@@ -179,6 +182,8 @@ type Config struct {
 	// CatalogPlane overrides the catalog logstore pipeline knobs. Any field
 	// left zero/unset falls back to the top-level SealBytes / SealAge / Retain
 	// (and Ship defaults to true) — e.g. to configure the catalog never to ship.
+	// A catalog that never ships also keeps every block in Postgres's catalog
+	// journal for good, which grows with the catalog.
 	CatalogPlane PlaneSettings `mapstructure:"catalog_plane" yaml:"catalog_plane"`
 
 	// RegionKey selects and configures the region CEK wrap provider
