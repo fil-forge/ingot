@@ -246,8 +246,8 @@ func (w *bodyWriter) streamed() map[string]uploader.StreamedBlob {
 	return out
 }
 
-// countingReader counts the bytes read through it — the plaintext length of
-// the blob being encrypted.
+// countingReader counts the bytes read through it: the plaintext length of
+// a blob being encrypted, or a request body's length for the ingress metric.
 type countingReader struct {
 	r io.Reader
 	n int64

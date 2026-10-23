@@ -251,6 +251,15 @@ uploads them (see DESIGN_NOTES), and report:
 | `ingot.multipart.accept_passes` | Acceptor passes that concluded parts, by `outcome`: `accepted` or `failed` (retried after a backoff; a timed-out pass included) |
 | `ingot.multipart.complete_deferred` | CompleteMultipartUpload requests answered OperationAborted because a part they name was still queued. Botocore clients (the AWS CLI) treat that as a failed upload |
 
+Object traffic is counted in body bytes. Copies stay inside Ingot and count
+as neither:
+
+| Metric | Meaning |
+| -- | -- |
+| `ingot.s3.object_egress_bytes` | Bytes GetObject sent to clients: those read from the body before it closed, so an abandoned download counts what went out |
+| `ingot.s3.bucket_object_egress_bytes` | The same, by the bucket's `space` and `tenant` DIDs, for finding a tenant whose downloads exceed its plan |
+| `ingot.s3.object_ingress_bytes` | Bytes PutObject and UploadPart received, whether or not the write succeeded |
+
 **Manual cleanup.** Every file in `<data_dir>/cache` is safe to delete: the
 provider holds its body. A file in `<data_dir>/spool` may be the only copy.
 The one kind safe to delete is a body the provider already holds, left in

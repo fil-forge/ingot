@@ -198,9 +198,14 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 		return s3response.PutObjectOutput{}, err
 	}
 	bodyReader := input.Body
+	if bodyReader != nil {
+		var record func()
+		bodyReader, record = b.transferMetrics.countIngress(ctx, bodyReader)
+		defer record()
+	}
 	var hr *utils.HashReader
 	if spec != nil {
-		src := input.Body
+		src := bodyReader
 		if src == nil {
 			src = bytes.NewReader(nil)
 		}
@@ -1683,7 +1688,7 @@ func (b *Backend) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.
 	out := &s3.GetObjectOutput{
 		ServerSideEncryption:      encryptionOf(mf),
 		AcceptRanges:              backend.GetPtrFromString("bytes"),
-		Body:                      body,
+		Body:                      b.transferMetrics.countEgress(ctx, st, body),
 		ContentLength:             &length,
 		ContentType:               &contentType,
 		ContentEncoding:           strPtrOrNil(mf.ContentEncoding),
