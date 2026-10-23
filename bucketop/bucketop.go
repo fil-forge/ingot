@@ -61,6 +61,19 @@ type Deps struct {
 	// Reads is the read tier the staging buffer falls through to
 	// on miss during the transaction.
 	Reads blockstore.ReadStore
+
+	// Ships, when set, is handed each commit's request just before its
+	// blocks are appended: the segment they go into ships later, outside any
+	// request, under authority captured from the bucket's writes. Nil
+	// captures nothing.
+	Ships ShipAuthority
+}
+
+// ShipAuthority records, from a write's request, the authority the catalog
+// log's asynchronous ship to the bucket's space signs with
+// (uploader.Uploader).
+type ShipAuthority interface {
+	CaptureShipAuthority(ctx context.Context, space did.DID)
 }
 
 // Coordinator manages per-bucket transactions. One per ingot backend.
@@ -367,6 +380,13 @@ func (tx *Tx) Commit(ctx context.Context, newRoot cid.Cid) (err error) {
 	ctx, span := tracing.Start(ctx, "bucket.commit")
 	defer func() { tracing.End(span, err) }()
 
+	// The append below is what the segment will ship, whatever the root
+	// swap does, so its authority is captured first: an append that fills
+	// the segment can seal it and start its ship at once. A write with no
+	// body (a delete, a tag change) captures none anywhere else.
+	if tx.deps.Ships != nil {
+		tx.deps.Ships.CaptureShipAuthority(ctx, tx.state.Space)
+	}
 	appended, err := tx.staging.Commit(ctx, newRoot)
 	if err != nil {
 		return fmt.Errorf("bucketop: append: %w", err)

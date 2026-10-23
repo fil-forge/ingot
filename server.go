@@ -229,6 +229,7 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		Log:             log,
 		Spool:           spool,
 		Cache:           cache,
+		Ships:           deps.Uploader,
 		Uploader:        deps.BodyUploader,
 		Deferred:        deps.Deferred,
 		Remover:         deps.Remover,

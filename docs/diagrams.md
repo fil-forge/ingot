@@ -135,6 +135,7 @@ flowchart TB
     s3f --> up
     s3f --> ba
     bop -->|"blockstore.Log"| ls
+    bop -.->|"bucketop.ShipAuthority<br/>(uploader.Forge injected)"| up
     bop --> mst
     mst --> bs
     bkt --> bs
@@ -302,6 +303,7 @@ sequenceDiagram
     B->>TX: Begin (lock, snapshot root)
     TX->>R: AllocVersionSeq (a multipart Complete in an Enabled bucket<br/>reserved its seq before the lock: see the multipart diagram)
     TX->>TX: mint versionId ("null" unless versioning Enabled),<br/>manifest into OpStaging, re-check If-Match under the lock,<br/>MST splice (new nodes into staging)
+    Note over TX: uploader.CaptureShipAuthority: every commit captures the request<br/>proof store as the space's ship authority, so a write with no body<br/>(a delete, a tag change) leaves one for its segment's ship
     TX->>L: AppendBatch(catalog blocks, OpRoot) with fsync
     TX->>R: CommitRoot(bucket, snapshot, newRoot), guarded, one transaction:<br/>the batch's catalog blocks journaled under its segment (catalog_journal,<br/>skipped once the segment has shipped), blob_refs gains this version,<br/>superseded version rows removed, a release record per digest whose<br/>claims reached 0#59;<br/>/upload/add(root = this version's manifest CID)<br/>+ /upload/remove per discarded version queued (upload_registrations)
     TX-->>B: committed, lock released
@@ -911,14 +913,18 @@ flowchart TB
     subgraph stores["proof stores"]
         kp["iam.KeyProofs: one DelegationCache<br/>per access key, 24h idle eviction;<br/>also the key's effective S3 action set per bucket"]
         ship["uploader.Forge shipProofs:<br/>per-space store, 1h TTL"]
+        commit["uploader.Forge commitProofs:<br/>per-space store, 1h TTL"]
         static["AuthServiceProofs:<br/>static container from config"]
         tok["tokenstore (tokens.cbor):<br/>empty; dormant login paths only"]
     end
 
     kp -->|"reqscope.ProofStore<br/>on the request ctx"| writes["uploader:<br/>/blob/add, abort, remove, /index/add<br/>/upload/add, /upload/remove"]
     kp -->|"same store"| reads["blockstore.Forge:<br/>content/retrieve"]
-    kp -->|"captureShipProofs<br/>at UploadBlob"| ship
-    ship --> async["async catalog ship;<br/>sweeper and DeleteBucket aborts"]
+    kp -->|"captureShipProofs<br/>at UploadBlob and StartBlob"| ship
+    kp -->|"CaptureShipAuthority<br/>at every bucketop commit"| commit
+    commit --> catship["async catalog ship"]
+    ship -->|"no commit capture<br/>holding a chain"| catship
+    ship --> async["sweepers' releases, aborts and<br/>registration renewals; DeleteBucket aborts"]
     static --> hc["hilt client:<br/>every /s3/* invocation"]
 
     classDef external stroke-dasharray: 5 5
@@ -931,9 +937,17 @@ flowchart TB
   account is disabled, so no access-key auth path skips the hilt-backed IAM
   lookup. `/health` and the DID document are outside the S3 auth chain, and a
   rejected access key never receives one.
-- A bucket whose last write is more than an hour old has an expired ship
-  authority; a newly sealed segment then waits for the bucket's next write to
-  re-capture it.
+- Every write captures the ship authority when it commits, so a segment,
+  sealed seconds after its writes, ships under a fresh capture. That capture
+  is kept apart from the upload's: hilt grants each catalog-changing
+  operation the ship's commands, but a narrower key's grant (tagging,
+  retention) lacks the release, abort and registration commands the
+  upload's capture also serves. The ship uses the commit's capture only when
+  it holds a `/blob/add` chain for the space (an older key's grant, or an
+  expired or revoked delegation, may not), and the upload's otherwise. Both
+  last an hour and live in memory: a segment whose ship keeps failing past
+  that, or across a restart, has no authority until the bucket's next
+  write.
 - Each access key gets its own `DelegationCache`, so a proof chain can never
   assemble across keys.
 - The same store holds the effective S3 action set hilt reported for the key
@@ -957,7 +971,8 @@ Cross-references: [`architecture.md` §9](./architecture.md#9-the-system-contrac
 
 Sources: `iam/service.go`, `iam/keyproofs.go`, `iam/proofcache.go`,
 `internal/reqscope/reqscope.go`, `uploader/forge.go` (shipProofs,
-captureShipProofs), `module.go`, `config/config.go` (auth_service fields).
+captureShipProofs, CaptureShipAuthority), `bucketop/bucketop.go` (Tx.Commit),
+`module.go`, `config/config.go` (auth_service fields).
 Review when these change.
 
 ## Request authorization and proof capture
@@ -1274,7 +1289,7 @@ listed diagrams (each diagram's `Sources:` footer names its exact files).
 | `s3frontend/acceptor.go` | multipart, part-states, blob-lifecycle |
 | `s3frontend/stream.go` | put, multipart, block-routes, blob-lifecycle |
 | `s3frontend/bucket.go` | context, delete-bucket |
-| `bucketop/` | put, get, delete-bucket, packages |
+| `bucketop/` | put, get, delete-bucket, packages, principals |
 | `blockstore/` | get, packages, block-routes; `forge.go` also context, principals |
 | `registry/` | schema, get, blob-lifecycle, logstore-pipeline |
 | `logstore/` | logstore-pipeline, segment-states, get, block-routes, delete-bucket |
