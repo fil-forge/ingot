@@ -376,6 +376,22 @@ var hiltPolicyPermissions = []string{
 	"s3:DeleteBucketPolicy",
 }
 
+// hiltCORSPermissions are the bucket CORS writes, held by service keys
+// only. The published hilt image does not know the permission until the
+// CORS write operations merge, so the test key carries it only when the
+// CORS write scenarios run (see [corsWritesEnabled]); fold it into
+// hiltAllPermissions then.
+var hiltCORSPermissions = []string{
+	"s3:PutBucketCORS",
+}
+
+// corsWritesEnabled reports whether the stack's hilt authorizes
+// PutBucketCors and DeleteBucketCors: a hilt override is in use, or
+// INGOT_ITEST_CORS_WRITES=1 says the image has them.
+func corsWritesEnabled() bool {
+	return os.Getenv("INGOT_ITEST_CORS_WRITES") == "1" || hiltOverridden()
+}
+
 // hiltOverridden reports whether the stack's hilt comes from a local override
 // rather than the published image.
 func hiltOverridden() bool {
@@ -429,6 +445,9 @@ func hiltProvisionTenantErr(ctx context.Context, s *stack.Stack, tenantID string
 	permissions := slices.Clone(hiltAllPermissions)
 	if iamScenariosEnabled() {
 		permissions = append(permissions, hiltPolicyPermissions...)
+	}
+	if corsWritesEnabled() {
+		permissions = append(permissions, hiltCORSPermissions...)
 	}
 	keyReq, err := json.Marshal(map[string]any{
 		"name":        "itest",

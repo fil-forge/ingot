@@ -83,6 +83,9 @@ func TestBuildS3API_BucketPolicy(t *testing.T) {
 	require.NoError(t, mem.Create(ctx, "photos", did.Undef, registry.CreateState{}))
 	f := &fakeAuthority{}
 	backend := s3frontend.New(s3frontend.Deps{Registry: mem, CORS: corsCfg, Authority: f})
+	// New registers its gauges on the global meter provider; leaving them
+	// registered would leak this backend's into a later test's provider.
+	t.Cleanup(func() { _ = backend.CloseMetrics() })
 
 	id, err := identity.New("", "did:web:ingot.test")
 	require.NoError(t, err)

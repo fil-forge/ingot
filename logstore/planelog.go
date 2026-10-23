@@ -11,6 +11,7 @@ import (
 
 	block "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
+	"github.com/multiformats/go-multihash"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.uber.org/zap"
@@ -103,12 +104,13 @@ func openPlaneLog(ctx context.Context, plane blockstore.Plane, bucket, dir strin
 	return pl, nil
 }
 
-// Append persists one batch's blocks to the open segment. opRoots are the
-// bucket-root advances the batch records. A call with no blocks AND no op-roots is a no-op — it does
-// not even create a segment. The CAR is fsynced before Append returns.
-func (pl *PlaneLog) Append(ctx context.Context, blocks []block.Block, opRoots ...blockstore.OpRoot) (err error) {
+// Append persists one batch's blocks to the open segment and returns that
+// segment's seq. opRoots are the bucket-root advances the batch records. A
+// call with no blocks AND no op-roots is a no-op — it does not even create a
+// segment, and returns seq 0. The CAR is fsynced before Append returns.
+func (pl *PlaneLog) Append(ctx context.Context, blocks []block.Block, opRoots ...blockstore.OpRoot) (seq uint64, err error) {
 	if len(blocks) == 0 && len(opRoots) == 0 {
-		return nil
+		return 0, nil
 	}
 	// The span covers the wait for the append lock and the segment write and
 	// fsync every acked write waits on.
@@ -127,15 +129,15 @@ func (pl *PlaneLog) Append(ctx context.Context, blocks []block.Block, opRoots ..
 
 	open, err := pl.ensureOpenLockedAppMu(ctx)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if err := open.append(blocks, opRoots); err != nil {
-		return err
+		return 0, err
 	}
 	if open.Size() >= pl.pc.SealBytes {
 		pl.requestSeal()
 	}
-	return nil
+	return open.Seq(), nil
 }
 
 // Get returns the block from this plane's local segments (open first,
@@ -343,8 +345,8 @@ func (pl *PlaneLog) flushLoop() {
 // first: those whose queued ship ran out of attempts, those a full queue
 // turned away, and those recovery could not queue. Each gets one attempt,
 // and the sweep stops at the first that fails, since whatever failed it (the
-// upload service, the space's ship authority) most likely fails the rest:
-// the next sweep starts again from it.
+// upload service, the space's ship authority, the stamp in Meta) most likely
+// fails the rest: the next sweep starts again from it.
 func (pl *PlaneLog) retryUnshipped() {
 	pl.catMu.RLock()
 	var pending []*Segment
@@ -368,9 +370,15 @@ func (pl *PlaneLog) retryUnshipped() {
 
 // flushOne ships one sealed segment, trying up to maxAttempts times with
 // backoff, and reports whether it is shipped. On success it stamps the ship
-// state (in memory + in Meta — which advances forge_root_cid for the catalog
-// plane) and runs the retention sweep. A segment already shipped, as one
-// still queued after the retry sweep shipped it is, is left alone.
+// state in Meta (which advances forge_root_cid for the catalog plane and
+// drops the segment's journaled blocks), then in memory, and runs the
+// retention sweep. A failed stamp is retried without shipping again within
+// the call, and the segment counts as shipped only once it lands: retention
+// retires shipped segments, and a retired segment whose stamp never landed
+// would leave its journal rows behind for good. A later call (the retry
+// sweep's, or recovery's at the next start) ships it again. A segment
+// already shipped, as one still queued after the retry sweep shipped it is,
+// is left alone.
 func (pl *PlaneLog) flushOne(seg *Segment, maxAttempts int) bool {
 	if seg.IsShipped() || seg.IsRetired() {
 		return true
@@ -383,22 +391,34 @@ func (pl *PlaneLog) flushOne(seg *Segment, maxAttempts int) bool {
 	defer span.End()
 	backoff := shipBackoff
 
+	var (
+		flushed     bool
+		shippedAt   int64
+		indexDigest multihash.Multihash
+	)
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		span.SetAttributes(attribute.Int("ingot.log.attempts", attempt))
-		indexDigest, err := pl.pc.Flush(ctx, seg)
-		if err == nil {
-			now := time.Now().Unix()
-			seg.markShipped(now)
-			if merr := pl.meta.MarkSegmentShipped(ctx, pl.plane, seg.Seq(), now, indexDigest, seg.OpRoots()); merr != nil {
-				pl.logger.Error("logstore: mark shipped",
-					zap.Stringer("plane", pl.plane), zap.Uint64("seq", seg.Seq()), zap.Error(merr))
+		var err error
+		if !flushed {
+			if indexDigest, err = pl.pc.Flush(ctx, seg); err == nil {
+				flushed, shippedAt = true, time.Now().Unix()
 			}
-			pl.runRetention(ctx)
-			return true
 		}
-		pl.logger.Warn("logstore: ship attempt failed",
-			zap.Stringer("plane", pl.plane), zap.Uint64("seq", seg.Seq()),
-			zap.Int("attempt", attempt), zap.Error(err))
+		if err != nil {
+			pl.logger.Warn("logstore: ship attempt failed",
+				zap.Stringer("plane", pl.plane), zap.Uint64("seq", seg.Seq()),
+				zap.Int("attempt", attempt), zap.Error(err))
+		} else {
+			if err = pl.meta.MarkSegmentShipped(ctx, pl.plane, seg.Seq(), shippedAt, indexDigest, seg.OpRoots()); err == nil {
+				seg.markShipped(shippedAt)
+				pl.runRetention(ctx)
+				return true
+			}
+			// The segment is on Forge; only its stamp in Meta failed.
+			pl.logger.Warn("logstore: mark shipped",
+				zap.Stringer("plane", pl.plane), zap.Uint64("seq", seg.Seq()),
+				zap.Int("attempt", attempt), zap.Error(err))
+		}
 		span.RecordError(err)
 		if attempt == maxAttempts {
 			break
@@ -416,7 +436,8 @@ func (pl *PlaneLog) flushOne(seg *Segment, maxAttempts int) bool {
 	// running out is worth an error.
 	if maxAttempts > 1 {
 		pl.logger.Error("logstore: ship exhausted retries; the retry sweep will try again",
-			zap.Stringer("plane", pl.plane), zap.Uint64("seq", seg.Seq()), zap.Int("attempts", maxAttempts))
+			zap.Stringer("plane", pl.plane), zap.Uint64("seq", seg.Seq()),
+			zap.Int("attempts", maxAttempts), zap.Bool("flushed", flushed))
 	}
 	span.SetStatus(codes.Error, "ship exhausted retries")
 	return false

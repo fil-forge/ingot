@@ -45,9 +45,10 @@ type PlaneConfig struct {
 	SealAge time.Duration
 
 	// Ship enables this plane's upload pipeline. When false the plane's
-	// CARs are never shipped and are retained on local disk indefinitely —
-	// the only durable copy and the sole source for local reads of that
-	// plane.
+	// CARs are never shipped and are retained on local disk indefinitely,
+	// the sole source for local reads of that plane. Their blocks also stay
+	// in the registry's catalog journal indefinitely, since only a ship
+	// drops them.
 	Ship bool
 
 	// Flush ships one sealed segment's CAR of this plane to Forge.
