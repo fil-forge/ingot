@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1340,6 +1341,74 @@ func TestAbortReleasesFromRecordsWhenSessionDeleteFails(t *testing.T) {
 	}
 	if _, err := mem.GetSession(ctx, uploadID); !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("aborting session survived the sweep (err=%v)", err)
+	}
+}
+
+// stallingUploader is a parkingUploader whose aborts, while stall is set,
+// hang until their context is done, as a provider that stops answering does.
+type stallingUploader struct {
+	*parkingUploader
+	stall atomic.Bool
+}
+
+func (s *stallingUploader) AbortBlob(ctx context.Context, space did.DID, add cid.Cid) error {
+	if s.stall.Load() {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	return s.parkingUploader.AbortBlob(ctx, space, add)
+}
+
+// TestAbortAnswersWithinItsReleaseBudget: an Abort whose releases stall
+// answers once its release budget is spent, the session gone and every
+// part's release still recorded, and the release sweep runs them.
+func TestAbortAnswersWithinItsReleaseBudget(t *testing.T) {
+	saved := abortReleaseBudget
+	abortReleaseBudget = 50 * time.Millisecond
+	t.Cleanup(func() { abortReleaseBudget = saved })
+
+	su := &stallingUploader{parkingUploader: &parkingUploader{}}
+	b, mem := newDeferredBackend(t, su)
+	ctx := context.Background()
+	bucket, key := "bk", "abort-stalls"
+
+	uploadID := mpCreate(t, b, key, "", "")
+	body := testBody(int(backend.MinPartSize))
+	for pn := int32(1); pn <= 2; pn++ {
+		body[0] = byte('0' + pn)
+		if _, err := mpUploadPart(t, b, key, uploadID, pn, body, nil); err != nil {
+			t.Fatalf("UploadPart %d: %v", pn, err)
+		}
+	}
+	d1 := hygienePartDigests(t, mem, uploadID, 1)[0]
+	d2 := hygienePartDigests(t, mem, uploadID, 2)[0]
+
+	su.stall.Store(true)
+	start := time.Now()
+	if err := b.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{Bucket: &bucket, Key: &key, UploadId: &uploadID}); err != nil {
+		t.Fatalf("Abort: %v", err)
+	}
+	if took := time.Since(start); took > 5*time.Second {
+		t.Fatalf("Abort took %v with a %v release budget", took, abortReleaseBudget)
+	}
+	if _, err := mem.GetSession(ctx, uploadID); !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("session survived the Abort (err=%v)", err)
+	}
+	pending, err := mem.ListReleasesBySpace(ctx, did.Undef)
+	if err != nil || len(pending) != 2 {
+		t.Fatalf("pending releases = %v/%v, want both parts' records", pending, err)
+	}
+
+	su.stall.Store(false)
+	drainReleases(t, b)
+	aborted := su.abortedDigests()
+	for _, d := range []multihash.Multihash{d1, d2} {
+		if !aborted[string(d)] {
+			t.Fatalf("parked blob %x was not released from its record", d)
+		}
+	}
+	if pending, _ := mem.ListReleasesBySpace(ctx, did.Undef); len(pending) != 0 {
+		t.Fatalf("release records survived the sweep: %v", pending)
 	}
 }
 
