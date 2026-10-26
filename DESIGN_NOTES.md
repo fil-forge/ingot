@@ -549,8 +549,8 @@ draws the chains and the stores.
   proof store captured, in memory, from the bucket's last write (1h TTL).
   Every commit captures it, so a segment ships under its own writes'
   capture, but one whose ship keeps failing past the TTL, or across a
-  restart, or whose grant in the captured store a revocation has named, has
-  no authority until the bucket's next write.
+  restart, or whose grants in both captures a revocation has named, has no
+  authority until the bucket's next write.
 - **The indexer read path is unwired**: `LocalLocator` serves all reads; the
   network index is still published (best-effort) but never consulted.
 - **Carried Forge-client copies**: `forgeclient/`, `tokenstore/`,

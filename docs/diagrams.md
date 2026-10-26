@@ -303,7 +303,7 @@ sequenceDiagram
     B->>TX: Begin (lock, snapshot root)
     TX->>R: AllocVersionSeq (a multipart Complete in an Enabled bucket<br/>reserved its seq before the lock: see the multipart diagram)
     TX->>TX: mint versionId ("null" unless versioning Enabled),<br/>manifest into OpStaging, re-check If-Match under the lock,<br/>MST splice (new nodes into staging)
-    Note over TX: uploader.CaptureShipAuthority: every commit captures the request<br/>proof store as the space's ship authority, so a write with no body<br/>(a delete, a tag change) leaves one for its segment's ship
+    Note over TX: uploader.CaptureShipAuthority: every commit captures the request<br/>proof store, if borrowable and it holds a /blob/add chain, as the<br/>space's ship authority, so a write with no body (a delete, a tag<br/>change) leaves one for its segment's ship
     TX->>L: AppendBatch(catalog blocks, OpRoot) with fsync
     TX->>R: CommitRoot(bucket, snapshot, newRoot), guarded, one transaction:<br/>the batch's catalog blocks journaled under its segment (catalog_journal,<br/>skipped once the segment has shipped), blob_refs gains this version,<br/>superseded version rows removed, a release record per digest whose<br/>claims reached 0#59;<br/>/upload/add(root = this version's manifest CID)<br/>+ /upload/remove per discarded version queued (upload_registrations)
     TX-->>B: committed, lock released

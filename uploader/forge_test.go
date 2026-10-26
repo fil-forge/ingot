@@ -160,6 +160,46 @@ func TestForgeShipProofsSkipRevoked(t *testing.T) {
 	require.ErrorContains(t, err, "no /blob/add authority")
 }
 
+// TestForgeCommitCaptureSkipsRevoked: a revocation naming the commit
+// capture's grant over one space sends that space's ship to the upload
+// capture, leaves the capture's other space shipping under it, and stops the
+// same key's next commit from capturing it there again. With no upload
+// capture to fall back on, the ship reports it has no authority.
+func TestForgeCommitCaptureSkipsRevoked(t *testing.T) {
+	fg := newTestForge(t)
+	ctx := context.Background()
+	agent := fg.client.Issuer().DID()
+	spaceA, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	spaceB, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	keys := iam.NewKeyProofs()
+	committed, roots := keyStore(t, keys, agent, spaceA, spaceB)
+	uploaded, _ := keyStore(t, keys, agent, spaceB)
+	fg.CaptureShipAuthority(borrowable(committed), spaceA.DID())
+	fg.CaptureShipAuthority(borrowable(committed), spaceB.DID())
+	fg.captureShipProofs(borrowable(uploaded), spaceB.DID())
+
+	require.Len(t, keys.InvalidateHolders(roots[1].Link()), 1)
+
+	got, ok := fg.catalogShipStore(ctx, spaceB.DID())
+	require.True(t, ok)
+	require.Same(t, uploaded, got, "a ship to the revoked space signs with the upload capture")
+	got, ok = fg.catalogShipStore(ctx, spaceA.DID())
+	require.True(t, ok)
+	require.Same(t, committed, got, "a revocation over one space cut the commit capture's other space")
+
+	fg.commitProofs.Delete(spaceB.DID().String())
+	fg.CaptureShipAuthority(borrowable(committed), spaceB.DID())
+	_, captured := fg.commitProofs.Get(spaceB.DID().String())
+	require.False(t, captured, "a commit captured a store whose grant over the space is revoked")
+
+	fg.shipProofs.Delete(spaceB.DID().String())
+	shard := CARShard{Size: 1, Positions: map[cid.Cid]blockstore.BlockLoc{cid.Undef: {}}}
+	_, _, err = fg.SubmitShard(ctx, blockstore.PlaneCatalog, spaceB.DID(), shard)
+	require.ErrorContains(t, err, "no ship authority")
+}
+
 func TestForgeShipProofsRequestScopeWins(t *testing.T) {
 	fg := newTestForge(t)
 	space := mustSpace(t)

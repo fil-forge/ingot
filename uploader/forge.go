@@ -43,8 +43,9 @@ type Uploader interface {
 	// deleting the bucket later must release both. Nil when nothing shipped.
 	SubmitShard(ctx context.Context, plane blockstore.Plane, space did.DID, shard CARShard) (BlobLocation, multihash.Multihash, error)
 	// CaptureShipAuthority records the request's proof store on ctx, if it
-	// carries one, as the authority SubmitShard ships space's segments with.
-	// SubmitShard runs outside any request, so every write that appends
+	// carries one that background work may borrow and that holds a /blob/add
+	// chain for space, as the authority SubmitShard ships space's segments
+	// with. SubmitShard runs outside any request, so every write that appends
 	// catalog blocks hands it its request, not only a write that uploads a
 	// body.
 	CaptureShipAuthority(ctx context.Context, space did.DID)
@@ -88,7 +89,8 @@ type Forge struct {
 	shipProofs *gocache.Cache
 
 	// commitProofs caches, per space, the proof store of the most recent
-	// write that committed catalog blocks to it (CaptureShipAuthority). Hilt
+	// write that committed catalog blocks to it (CaptureShipAuthority), if
+	// that store was borrowable and held a /blob/add chain for the space. Hilt
 	// grants each catalog-changing operation the ship's commands, but not
 	// necessarily the release, abort and registration commands shipProofs
 	// serves (a tagging-only key's grant has none of them), so SubmitShard
@@ -226,7 +228,7 @@ func (u *Forge) chainFor(ctx context.Context, store ucanlib.ProofStore, space di
 		return nil, fmt.Errorf("uploader: building %s proof chain: %w", cmd, err)
 	}
 	if len(proofs) == 0 {
-		return nil, fmt.Errorf("uploader: no %s authority for space %s (the chains it held expired or were revoked)", cmd, space)
+		return nil, fmt.Errorf("uploader: no %s authority for space %s (the proof store holds no unexpired, unrevoked chain for it)", cmd, space)
 	}
 	return proofs, nil
 }
@@ -244,8 +246,10 @@ func (u *Forge) SubmitShard(ctx context.Context, plane blockstore.Plane, space d
 	if !ok {
 		return BlobLocation{}, nil, fmt.Errorf("uploader: no ship authority for space %s (no captured proof store holds a /blob/add chain)", space)
 	}
-	// The fallback store can outlive its chains (see authorityFor); fail
-	// here, naming the space, rather than ship proofless.
+	// The request's own store and shipProofStore's capture aren't probed
+	// above, and a captured store can outlive its chains (see authorityFor):
+	// whichever was chosen, fail here, naming the space, rather than ship
+	// proofless.
 	if _, err := u.chainFor(ctx, store, space, blobcmds.Add.Command); err != nil {
 		return BlobLocation{}, nil, err
 	}
