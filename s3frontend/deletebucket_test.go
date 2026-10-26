@@ -137,10 +137,13 @@ func TestDeleteBucket_RefusalLeavesBucketReadable(t *testing.T) {
 	if !log.released.Load() {
 		t.Fatalf("the refused delete never released the catalog segment; the test proves nothing")
 	}
-	if !rm.releasedRetired {
+	rm.mu.Lock()
+	releasedRetired, releasedUnderARoot := rm.releasedRetired, rm.releasedUnderARoot
+	rm.mu.Unlock()
+	if !releasedRetired {
 		t.Fatalf("the refused delete never released the retired catalog segment")
 	}
-	if rm.releasedUnderARoot {
+	if releasedUnderARoot {
 		t.Fatalf("a catalog segment was released while the bucket's root still named catalog blocks")
 	}
 

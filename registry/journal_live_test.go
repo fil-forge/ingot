@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
 	block "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap/zaptest"
 
@@ -402,23 +404,15 @@ func TestCatalogJournal_Live(t *testing.T) {
 
 		emptyDone := make(chan error, 1)
 		go func() { emptyDone <- r.EmptyRoot(ctx, "jb-emptying", cur) }()
-		waitForLockWaiters(t, pool, 1)
+		waitForLockedQuery(t, pool, "DELETE FROM ingot.catalog_journal WHERE bucket%")
 
 		shipDone := make(chan error, 1)
 		go func() {
 			shipDone <- r.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seg, time.Now().Unix(), nil,
 				[]blockstore.OpRoot{{Bucket: "jb-emptying", Root: old}})
 		}()
-		waitForLockWaiters(t, pool, 2)
-		var onBucket bool
-		if err := pool.QueryRow(ctx, `SELECT EXISTS (
-			SELECT 1 FROM pg_stat_activity
-			 WHERE wait_event_type = 'Lock' AND datname = current_database()
-			   AND query LIKE '%FOR KEY SHARE%')`).Scan(&onBucket); err != nil {
-			t.Fatalf("pg_stat_activity: %v", err)
-		}
-		if !onBucket {
-			t.Fatal("the ship reached the journal rows while EmptyRoot was deleting them")
+		if q := waitForLockedQuery(t, pool, "%FOR KEY SHARE%", "DELETE FROM ingot.catalog_journal WHERE seq%"); !strings.Contains(q, "FOR KEY SHARE") {
+			t.Fatalf("the ship reached the journal rows while EmptyRoot was deleting them (waiting on %q)", q)
 		}
 
 		if err := holder.Commit(ctx); err != nil {
@@ -505,6 +499,32 @@ func TestCatalogJournal_Live(t *testing.T) {
 			t.Fatalf("EmptyRoot on a missing bucket = %v, want ErrNotFound", err)
 		}
 	})
+}
+
+// waitForLockedQuery waits until a backend in the database is blocked on a
+// lock running a statement that matches one of the LIKE patterns, and returns
+// that statement. Unlike waitForLockWaiters it can't be satisfied by another
+// package's tests waiting on a lock in the same database.
+func waitForLockedQuery(t *testing.T, pool *pgxpool.Pool, patterns ...string) string {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		var query string
+		err := pool.QueryRow(context.Background(), `
+			SELECT query FROM pg_stat_activity
+			 WHERE wait_event_type = 'Lock' AND datname = current_database()
+			   AND query LIKE ANY ($1)
+			 LIMIT 1`, patterns).Scan(&query)
+		if err == nil {
+			return query
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			t.Fatalf("pg_stat_activity: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("no backend blocked on a lock running %q", patterns)
+	return ""
 }
 
 // waitForLockWaiters waits until at least n backends are blocked on a lock.
