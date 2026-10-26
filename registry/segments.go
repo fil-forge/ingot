@@ -116,10 +116,11 @@ func (r *Postgres) MarkSegmentShipped(ctx context.Context, plane blockstore.Plan
 	// committed, and this statement sees its rows; any later commit sees the
 	// segment shipped and journals nothing.
 	//
-	// Deleting a bucket locks its row and then cascades into its journal
-	// rows, so the rows' bucket is locked first here too: the advances above
-	// lock it only where the guard matched. KEY SHARE conflicts with the
-	// deletion's lock but not with a commit's root swap.
+	// Deleting a bucket, or emptying its root (EmptyRoot), locks its row and
+	// then deletes its journal rows, so the rows' bucket is locked first here
+	// too: the advances above lock it only where the guard matched. KEY SHARE
+	// conflicts with those FOR UPDATE locks but not with a commit's root
+	// swap.
 	if _, err := tx.Exec(ctx, `
 		SELECT 1 FROM ingot.buckets
 		 WHERE name IN (SELECT bucket FROM ingot.catalog_journal WHERE seq = $1)

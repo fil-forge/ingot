@@ -369,6 +369,80 @@ func TestCatalogJournal_Live(t *testing.T) {
 		}
 	})
 
+	// EmptyRoot deletes the bucket's journal rows as a deletion does, so a
+	// ship of one of the bucket's segments waits for it on the bucket row,
+	// also when the ship's guard is stale and its advance locks nothing: the
+	// two deletes would otherwise lock the same journal rows in different
+	// orders and could deadlock. A third transaction holding one journal row
+	// pauses EmptyRoot after it has taken the bucket row; the ship must then
+	// be queued on that row, not on the journal.
+	t.Run("a ship with a stale guard waits for EmptyRoot", func(t *testing.T) {
+		seg := newBucket(t, "jb-emptying")
+		old := liveCid(t, "emptying-old")
+		if err := r.CommitRoot(ctx, "jb-emptying", cid.Undef, old, registry.RootCommit{
+			Journal: blockstore.Appended{Segment: seg, Blocks: []block.Block{block.NewBlock([]byte("emptying-a"))}},
+		}); err != nil {
+			t.Fatalf("commit: %v", err)
+		}
+		cur := liveCid(t, "emptying-cur")
+		if err := r.CommitRoot(ctx, "jb-emptying", old, cur, registry.RootCommit{
+			Journal: blockstore.Appended{Segment: seg, Blocks: []block.Block{block.NewBlock([]byte("emptying-b"))}},
+		}); err != nil {
+			t.Fatalf("second commit: %v", err)
+		}
+		holder, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin holder: %v", err)
+		}
+		defer func() { _ = holder.Rollback(ctx) }()
+		if _, err := holder.Exec(ctx,
+			`SELECT 1 FROM ingot.catalog_journal WHERE seq = $1 LIMIT 1 FOR UPDATE`, int64(seg)); err != nil {
+			t.Fatalf("hold a journal row: %v", err)
+		}
+
+		emptyDone := make(chan error, 1)
+		go func() { emptyDone <- r.EmptyRoot(ctx, "jb-emptying", cur) }()
+		waitForLockWaiters(t, pool, 1)
+
+		shipDone := make(chan error, 1)
+		go func() {
+			shipDone <- r.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seg, time.Now().Unix(), nil,
+				[]blockstore.OpRoot{{Bucket: "jb-emptying", Root: old}})
+		}()
+		waitForLockWaiters(t, pool, 2)
+		var onBucket bool
+		if err := pool.QueryRow(ctx, `SELECT EXISTS (
+			SELECT 1 FROM pg_stat_activity
+			 WHERE wait_event_type = 'Lock' AND datname = current_database()
+			   AND query LIKE '%FOR KEY SHARE%')`).Scan(&onBucket); err != nil {
+			t.Fatalf("pg_stat_activity: %v", err)
+		}
+		if !onBucket {
+			t.Fatal("the ship reached the journal rows while EmptyRoot was deleting them")
+		}
+
+		if err := holder.Commit(ctx); err != nil {
+			t.Fatalf("release the journal row: %v", err)
+		}
+		for name, done := range map[string]chan error{"EmptyRoot": emptyDone, "ship": shipDone} {
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatalf("%s: %v", name, err)
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatalf("%s did not finish", name)
+			}
+		}
+		var shipped bool
+		if err := pool.QueryRow(ctx, `SELECT shipped_at IS NOT NULL FROM ingot.segments WHERE seq = $1`, int64(seg)).Scan(&shipped); err != nil {
+			t.Fatalf("read the segment: %v", err)
+		}
+		if !shipped {
+			t.Fatal("the ship didn't stamp its segment")
+		}
+	})
+
 	// DeleteBucket's first write empties the root, clears the forge root and
 	// drops the bucket's journaled blocks, in one transaction. A stale expect
 	// changes none of it, and another bucket's rows stay.

@@ -24,10 +24,12 @@ import (
 // releasableLog stands in for the production catalog log as DeleteBucket sees
 // it: it lists one shipped segment digest, and once that digest is released
 // every catalog block it served is gone, as it is when the network copy is
-// removed and the quiesced store no longer serves local reads.
+// removed and the quiesced store no longer serves local reads. A retired
+// segment's digest, if set, goes through ReleaseRetiredSegments.
 type releasableLog struct {
 	blockstore.Log
 	segment  multihash.Multihash
+	retired  multihash.Multihash
 	released atomic.Bool
 }
 
@@ -40,34 +42,45 @@ func (l *releasableLog) Get(ctx context.Context, c cid.Cid) (block.Block, error)
 
 func (l *releasableLog) QuiesceBucketLog(context.Context, string) error { return nil }
 
-func (l *releasableLog) ReleaseRetiredSegments(context.Context, string, func(multihash.Multihash) error) error {
-	return nil
+func (l *releasableLog) ReleaseRetiredSegments(_ context.Context, _ string, release func(multihash.Multihash) error) error {
+	if l.retired == nil {
+		return nil
+	}
+	return release(l.retired)
 }
 
 func (l *releasableLog) ShippedSegmentDigests(context.Context, string) ([]multihash.Multihash, error) {
 	return []multihash.Multihash{l.segment}, nil
 }
 
-// catalogRemover releases the log's segment when asked to, and records whether
-// the bucket's root still named catalog blocks at that moment.
+// catalogRemover releases the log's segments when asked to, and records which
+// it released and whether the bucket's root still named catalog blocks at that
+// moment.
 type catalogRemover struct {
 	log *releasableLog
 	reg registry.Registry
 
 	mu                 sync.Mutex
 	releasedUnderARoot bool
+	releasedRetired    bool
 }
 
 func (r *catalogRemover) RemoveBlob(ctx context.Context, _ did.DID, d multihash.Multihash) error {
-	if string(d) != string(r.log.segment) {
+	shipped, retired := string(d) == string(r.log.segment), string(d) == string(r.log.retired)
+	if !shipped && !retired {
 		return nil
 	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if st, err := r.reg.Get(ctx, "bk"); err == nil && st.Root.Defined() {
-		r.mu.Lock()
 		r.releasedUnderARoot = true
-		r.mu.Unlock()
 	}
-	r.log.released.Store(true)
+	if retired {
+		r.releasedRetired = true
+	}
+	if shipped {
+		r.log.released.Store(true)
+	}
 	return nil
 }
 
@@ -96,7 +109,11 @@ func TestDeleteBucket_RefusalLeavesBucketReadable(t *testing.T) {
 		rm   *catalogRemover
 	)
 	b, mem := newDeferredBackend(t, inmem.NopUploader{}, func(d *Deps) {
-		log = &releasableLog{Log: d.Log, segment: digestOf(t, []byte("catalog segment"))}
+		log = &releasableLog{
+			Log:     d.Log,
+			segment: digestOf(t, []byte("catalog segment")),
+			retired: digestOf(t, []byte("retired catalog segment")),
+		}
 		d.Log = log
 		d.Reads = blockstore.NewLayered(blockstore.LocalBlobs{Cache: d.Cache, Spool: d.Spool}, log, inmem.NopBaseReader{})
 		auth = &refusingAuthority{BucketAuthority: d.Authority}
@@ -120,8 +137,11 @@ func TestDeleteBucket_RefusalLeavesBucketReadable(t *testing.T) {
 	if !log.released.Load() {
 		t.Fatalf("the refused delete never released the catalog segment; the test proves nothing")
 	}
+	if !rm.releasedRetired {
+		t.Fatalf("the refused delete never released the retired catalog segment")
+	}
 	if rm.releasedUnderARoot {
-		t.Fatalf("the catalog segment was released while the bucket's root still named catalog blocks")
+		t.Fatalf("a catalog segment was released while the bucket's root still named catalog blocks")
 	}
 
 	res, err := b.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: &bucket})

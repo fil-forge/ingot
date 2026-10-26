@@ -749,8 +749,9 @@ CREATE TABLE ingot.segment_op_roots (
 
 -- The catalog journal: a copy of every catalog block a commit appended to the
 -- log, written in the root swap's transaction and deleted in the one that stamps
--- its segment shipped, so a copy of the database holds the blocks only this
--- host's disk would otherwise hold. seq has deliberately no foreign key: logstore
+-- its segment shipped (or, for the whole bucket, when DeleteBucket empties its
+-- root), so a copy of the database holds the blocks only this host's disk would
+-- otherwise hold. seq has deliberately no foreign key: logstore
 -- recovery deletes the row of an open segment whose CAR is missing, and the
 -- blocks must outlive it.
 CREATE TABLE ingot.catalog_journal (
