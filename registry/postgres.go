@@ -247,6 +247,31 @@ func (r *Postgres) CatalogJournalStats(ctx context.Context) (CatalogJournalStats
 	return st, nil
 }
 
+// EmptyRoot is CASRoot to the empty tree plus the rows an empty catalog no
+// longer needs, in one transaction (Registry).
+func (r *Postgres) EmptyRoot(ctx context.Context, name string, expect cid.Cid) error {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("registry: begin empty root %q: %w", name, err)
+	}
+	defer tx.Rollback(ctx)
+	if err := r.casRoot(ctx, tx, name, expect, cid.Undef); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE ingot.buckets SET forge_root_cid = NULL WHERE name = $1`, name); err != nil {
+		return fmt.Errorf("registry: empty root %q: clear forge root: %w", name, err)
+	}
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM ingot.catalog_journal WHERE bucket = $1`, name); err != nil {
+		return fmt.Errorf("registry: empty root %q: drop journal: %w", name, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("registry: commit empty root %q: %w", name, err)
+	}
+	return nil
+}
+
 func (r *Postgres) casRoot(ctx context.Context, q pgxQuerier, name string, expect, next cid.Cid) error {
 	var (
 		expectBytes []byte

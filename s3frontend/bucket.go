@@ -282,12 +282,14 @@ func (b *Backend) CreateBucket(ctx context.Context, input *s3.CreateBucketInput,
 
 // SegmentDigestLister is the slice of the catalog log DeleteBucket needs to
 // release shipped-segment blob registrations: quiesce the bucket's log, then
-// enumerate every blob its shipped segments registered. It is matched by a
-// runtime type assertion (b.log is a blockstore.Log), which fails SILENTLY on
-// a signature drift — the compile-time assertion in the root package pins
-// *logstore.Manager to this shape so a drift is a build error instead.
+// release every blob its retired segments registered and enumerate the ones
+// its other segments did. It is matched by a runtime type assertion (b.log is
+// a blockstore.Log), which fails SILENTLY on a signature drift — the
+// compile-time assertion in the root package pins *logstore.Manager to this
+// shape so a drift is a build error instead.
 type SegmentDigestLister interface {
 	QuiesceBucketLog(ctx context.Context, bucket string) error
+	ReleaseRetiredSegments(ctx context.Context, bucket string, release func(multihash.Multihash) error) error
 	ShippedSegmentDigests(ctx context.Context, bucket string) ([]multihash.Multihash, error)
 }
 
@@ -328,16 +330,13 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 		// needs, so commit the empty tree first: the bucket then reads no
 		// catalog block, and a delete that fails past this point (hilt
 		// refusing, a release erroring) leaves a bucket that lists empty and
-		// deletes on retry, not one whose root names released blocks.
-		if st.Root.Defined() {
-			if err := b.reg.CASRoot(ctx, name, st.Root, cid.Undef); err != nil {
-				return fmt.Errorf("s3frontend: delete bucket: empty the root: %w", err)
-			}
-		}
-		if st.ForgeRoot.Defined() {
-			if err := b.reg.SetForgeRoot(ctx, name, cid.Undef); err != nil {
-				return fmt.Errorf("s3frontend: delete bucket: empty the forge root: %w", err)
-			}
+		// deletes on retry, not one whose root names released blocks. The
+		// same write clears forge_root_cid, which a ship may have advanced
+		// since st was read, and drops the bucket's journaled blocks: the
+		// quiesce below leaves the last segment unshipped until the bucket's
+		// next write, and its rows would otherwise wait with it.
+		if err := b.reg.EmptyRoot(ctx, name, st.Root); err != nil {
+			return fmt.Errorf("s3frontend: delete bucket: empty the root: %w", err)
 		}
 
 		// In-flight multipart uploads do not block deletion (the upstream
@@ -394,9 +393,16 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 		// segment can't register its blobs after the release pass has already
 		// read the rows (the delete would race the flush goroutine and be
 		// refused). The release is idempotent (removing an unregistered blob
-		// is a no-op), so a retried DeleteBucket is safe.
+		// is a no-op), so a retried DeleteBucket is safe; retired segments,
+		// which accumulate for the bucket's life, drop their rows as they are
+		// released, so a retry doesn't release them again.
 		if log, ok := b.log.(SegmentDigestLister); ok {
 			if err := log.QuiesceBucketLog(ctx, name); err != nil {
+				return fmt.Errorf("s3frontend: delete bucket: %w", err)
+			}
+			if err := log.ReleaseRetiredSegments(ctx, name, func(d multihash.Multihash) error {
+				return b.remover.RemoveBlob(ctx, st.Space, d)
+			}); err != nil {
 				return fmt.Errorf("s3frontend: delete bucket: %w", err)
 			}
 			digests, err := log.ShippedSegmentDigests(ctx, name)

@@ -2,6 +2,7 @@ package logstore
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -253,11 +254,12 @@ func TestManager_QuiesceAndShippedSegmentDigests(t *testing.T) {
 	appendFor(t, m, "alpha", "post-quiesce-write")
 }
 
-// TestManager_ShippedSegmentDigestsIncludesRetired: segments retention has
-// already unlinked still registered their CAR and index blobs in the space,
-// so DeleteBucket's release list must name them, and RemoveBucketLog must
-// drop their rows with the rest.
-func TestManager_ShippedSegmentDigestsIncludesRetired(t *testing.T) {
+// TestManager_ReleaseRetiredSegments: segments retention has already unlinked
+// still registered their CAR and index blobs in the space, so DeleteBucket
+// releases them through ReleaseRetiredSegments, which drops each row once its
+// blobs are released. A release that fails partway keeps the rows it hadn't
+// finished, and the retry releases only those.
+func TestManager_ReleaseRetiredSegments(t *testing.T) {
 	ctx := context.Background()
 	meta := newFakeMeta()
 	m := openTestManager(t, t.TempDir(), meta, newRecordingFlush())
@@ -281,51 +283,69 @@ func TestManager_ShippedSegmentDigestsIncludesRetired(t *testing.T) {
 	if err := m.QuiesceBucketLog(ctx, "alpha"); err != nil {
 		t.Fatalf("QuiesceBucketLog: %v", err)
 	}
-	digests, err := m.ShippedSegmentDigests(ctx, "alpha")
-	if err != nil {
-		t.Fatalf("ShippedSegmentDigests: %v", err)
-	}
-	listed := map[string]bool{}
-	indexes := 0
-	for _, d := range digests {
-		if string(d) == string(fakeIndexDigest) {
-			indexes++
-			continue
-		}
-		listed[string(d)] = true
-	}
-	retired, err = meta.ListRetiredSegments(ctx, blockstore.PlaneCatalog, "alpha")
+	retired, err := meta.ListRetiredSegments(ctx, blockstore.PlaneCatalog, "alpha")
 	if err != nil {
 		t.Fatalf("ListRetiredSegments: %v", err)
 	}
-	live, err := meta.ListSegments(ctx, blockstore.PlaneCatalog, "alpha")
-	if err != nil {
-		t.Fatalf("ListSegments: %v", err)
-	}
-	shipped := 0
-	for _, r := range append(live, retired...) {
-		if r.ShippedAt != 0 {
-			shipped++
-		}
-	}
+	cars := map[string]uint64{}
 	for _, r := range retired {
 		car, err := multihash.Encode(r.SHA256, multihash.SHA2_256)
 		if err != nil {
 			t.Fatalf("encode: %v", err)
 		}
-		if !listed[string(car)] {
-			t.Fatalf("retired segment %d's CAR is missing from the release list", r.Seq)
-		}
-	}
-	if indexes != shipped {
-		t.Fatalf("got %d index digests, want one per shipped segment (%d)", indexes, shipped)
+		cars[string(car)] = r.Seq
 	}
 
-	if err := m.RemoveBucketLog(ctx, "alpha"); err != nil {
-		t.Fatalf("RemoveBucketLog: %v", err)
+	// The unretired listing leaves retired segments to ReleaseRetiredSegments.
+	digests, err := m.ShippedSegmentDigests(ctx, "alpha")
+	if err != nil {
+		t.Fatalf("ShippedSegmentDigests: %v", err)
 	}
-	if rows, err := meta.ListRetiredSegments(ctx, blockstore.PlaneCatalog, "alpha"); err != nil || len(rows) != 0 {
-		t.Fatalf("expected no retired alpha rows after removal, got %d (err %v)", len(rows), err)
+	for _, d := range digests {
+		if seq, ok := cars[string(d)]; ok {
+			t.Fatalf("ShippedSegmentDigests lists retired segment %d", seq)
+		}
+	}
+
+	released := map[string]int{}
+	refused := errors.New("release refused")
+	carCalls := 0
+	err = m.ReleaseRetiredSegments(ctx, "alpha", func(d multihash.Multihash) error {
+		if _, ok := cars[string(d)]; ok {
+			if carCalls++; carCalls == 2 {
+				return refused
+			}
+		}
+		released[string(d)]++
+		return nil
+	})
+	if !errors.Is(err, refused) {
+		t.Fatalf("ReleaseRetiredSegments with a refusing release = %v, want the refusal", err)
+	}
+	left, err := meta.ListRetiredSegments(ctx, blockstore.PlaneCatalog, "alpha")
+	if err != nil {
+		t.Fatalf("ListRetiredSegments: %v", err)
+	}
+	if len(left) != len(retired)-1 {
+		t.Fatalf("%d retired rows left after one segment's release, want %d", len(left), len(retired)-1)
+	}
+
+	if err := m.ReleaseRetiredSegments(ctx, "alpha", func(d multihash.Multihash) error {
+		released[string(d)]++
+		return nil
+	}); err != nil {
+		t.Fatalf("retried ReleaseRetiredSegments: %v", err)
+	}
+	for car, seq := range cars {
+		if released[car] != 1 {
+			t.Fatalf("retired segment %d's CAR released %d times, want once", seq, released[car])
+		}
+	}
+	if got := released[string(fakeIndexDigest)]; got != len(retired) {
+		t.Fatalf("released %d index blobs, want one per retired segment (%d)", got, len(retired))
+	}
+	if left, err := meta.ListRetiredSegments(ctx, blockstore.PlaneCatalog, "alpha"); err != nil || len(left) != 0 {
+		t.Fatalf("retired rows after the release = %d (err %v), want none", len(left), err)
 	}
 }
 

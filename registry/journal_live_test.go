@@ -368,6 +368,69 @@ func TestCatalogJournal_Live(t *testing.T) {
 			t.Fatal("ship did not finish")
 		}
 	})
+
+	// DeleteBucket's first write empties the root, clears the forge root and
+	// drops the bucket's journaled blocks, in one transaction. A stale expect
+	// changes none of it, and another bucket's rows stay.
+	t.Run("emptying the root drops the bucket's journal rows", func(t *testing.T) {
+		seg := newBucket(t, "jb-empty")
+		otherSeg := newBucket(t, "jb-other")
+		root := liveCid(t, "empty-root")
+		if err := r.CommitRoot(ctx, "jb-empty", cid.Undef, root, registry.RootCommit{
+			Journal: blockstore.Appended{Segment: seg, Blocks: []block.Block{block.NewBlock([]byte("emptied"))}},
+		}); err != nil {
+			t.Fatalf("commit: %v", err)
+		}
+		if err := r.CommitRoot(ctx, "jb-other", cid.Undef, liveCid(t, "other-root"), registry.RootCommit{
+			Journal: blockstore.Appended{Segment: otherSeg, Blocks: []block.Block{block.NewBlock([]byte("other"))}},
+		}); err != nil {
+			t.Fatalf("commit other: %v", err)
+		}
+		if err := r.SetForgeRoot(ctx, "jb-empty", root); err != nil {
+			t.Fatalf("SetForgeRoot: %v", err)
+		}
+		count := func(t *testing.T, bucket string) int {
+			t.Helper()
+			var n int
+			if err := pool.QueryRow(ctx, `SELECT count(*) FROM ingot.catalog_journal WHERE bucket = $1`, bucket).Scan(&n); err != nil {
+				t.Fatalf("count journal: %v", err)
+			}
+			return n
+		}
+
+		if err := r.EmptyRoot(ctx, "jb-empty", liveCid(t, "stale")); !errors.Is(err, registry.ErrConflict) {
+			t.Fatalf("EmptyRoot with a stale expect = %v, want ErrConflict", err)
+		}
+		if st, err := r.Get(ctx, "jb-empty"); err != nil || !st.Root.Equals(root) || !st.ForgeRoot.Equals(root) || count(t, "jb-empty") != 1 {
+			t.Fatalf("after a refused EmptyRoot: state %+v (err %v), %d journal rows; want both roots and the row kept",
+				st, err, count(t, "jb-empty"))
+		}
+
+		if err := r.EmptyRoot(ctx, "jb-empty", root); err != nil {
+			t.Fatalf("EmptyRoot: %v", err)
+		}
+		st, err := r.Get(ctx, "jb-empty")
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		if st.Root.Defined() || st.ForgeRoot.Defined() {
+			t.Fatalf("root %s, forge root %s after EmptyRoot; want both empty", st.Root, st.ForgeRoot)
+		}
+		if n := count(t, "jb-empty"); n != 0 {
+			t.Fatalf("%d journal rows left for the emptied bucket, want 0", n)
+		}
+		if n := count(t, "jb-other"); n != 1 {
+			t.Fatalf("%d journal rows for the other bucket, want 1", n)
+		}
+
+		// A retried DeleteBucket empties an empty root again.
+		if err := r.EmptyRoot(ctx, "jb-empty", cid.Undef); err != nil {
+			t.Fatalf("EmptyRoot on an empty root: %v", err)
+		}
+		if err := r.EmptyRoot(ctx, "jb-missing", cid.Undef); !errors.Is(err, registry.ErrNotFound) {
+			t.Fatalf("EmptyRoot on a missing bucket = %v, want ErrNotFound", err)
+		}
+	})
 }
 
 // waitForLockWaiters waits until at least n backends are blocked on a lock.

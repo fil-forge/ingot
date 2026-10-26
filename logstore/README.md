@@ -106,9 +106,11 @@ stateDiagram-v2
     [*] --> Open : createOpenSegment + InsertSegmentOpen
     Open --> Open : append (fsync, then index commit)
     Open --> Sealed : seal (hash CAR, write .idx, MarkSegmentSealed)
+    Open --> [*] : recovery, CAR missing (DeleteSegment; journal rows kept)
     Sealed --> Shipped : flush ok (MarkSegmentShipped: guarded forge_root advance, journal rows deleted)
+    Sealed --> Retired : recovery, CAR missing (RetireSegment; journal rows kept)
     Shipped --> Retired : retention past Retain (files unlinked, RetireSegment)
-    Retired --> [*] : DeleteBucket (RemoveBucketLog)
+    Retired --> [*] : DeleteBucket (ReleaseRetiredSegments, or RemoveBucketLog)
 ```
 
 - The DB `state` column holds only `open` and `sealed`. Shipped is the
@@ -140,7 +142,8 @@ stateDiagram-v2
   its segment. The rows have no foreign key to the segment row. When a
   segment's CAR is gone, recovery deletes its row if it was open and retires
   it if it was sealed, and the journal rows are what the lost segment is
-  rebuilt from.
+  rebuilt from. `DeleteBucket` drops the bucket's rows in the transaction
+  that empties its root, since the empty tree needs none of them.
 - **One bucket per segment.** The log is segregated per bucket; every segment
   ships to its own bucket's Forge space, and `DeleteBucket` can quiesce and
   release exactly one bucket's registrations.
@@ -213,7 +216,7 @@ builds a `uploader.CARShard` from the `Segment` accessors, calls
 
 | Where | Symbols |
 |---|---|
-| `manager.go` | `Manager` (per-bucket log, the production `blockstore.Log`): `ManagerConfig`, `OpenManager`, `AppendBatch`, `Get`, `Close`; `QuiesceBucketLog`, `ShippedSegmentDigests`, `RemoveBucketLog` (DeleteBucket's seams) |
+| `manager.go` | `Manager` (per-bucket log, the production `blockstore.Log`): `ManagerConfig`, `OpenManager`, `AppendBatch`, `Get`, `Close`; `QuiesceBucketLog`, `ReleaseRetiredSegments`, `ShippedSegmentDigests`, `RemoveBucketLog` (DeleteBucket's seams) |
 | `store.go` | `Store` (one bucket's catalog log): `Open`, `AppendBatch`, `Get`, `Close` |
 | `planelog.go` | `PlaneLog` (the pipeline): `openPlaneLog`, `Append`, `Get`, `Close`; `sealOpenIfDue`, `flushLoop`, `flushOne`, `retryUnshipped`, `runRetention`, `sealTickerLoop` |
 | `segment.go` | `Segment`: `createOpenSegment`, `append`, `seal`, `markShipped`, `retire`, `get`; `.idx`/`.ops` codecs |

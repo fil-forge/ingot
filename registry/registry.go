@@ -135,6 +135,12 @@ type Registry interface {
 	// Returns ErrConflict if the current root does not equal expect.
 	CASRoot(ctx context.Context, name string, expect, next cid.Cid) error
 
+	// EmptyRoot swaps the bucket root from expect to the empty tree, as
+	// CASRoot does, and in the same transaction clears forge_root_cid and
+	// drops the bucket's journaled catalog blocks: nothing the empty tree
+	// reaches needs them. DeleteBucket's first write.
+	EmptyRoot(ctx context.Context, name string, expect cid.Cid) error
+
 	// CommitRoot is CASRoot plus the rows the commit owes, all in one
 	// transaction: the upload registrations, the new generation's blob
 	// claims, the discarded generations' claim drops and the journaled

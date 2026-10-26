@@ -263,6 +263,28 @@ func (m *MemStore) Delete(_ context.Context, name string) error {
 	}
 	m.uploadRegs = kept
 	// The journal cascades on the bucket too.
+	m.dropJournalLocked(name)
+	return nil
+}
+
+func (m *MemStore) EmptyRoot(_ context.Context, name string, expect cid.Cid) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.buckets[name]
+	if !ok {
+		return registry.ErrNotFound
+	}
+	if !s.Root.Equals(expect) {
+		return registry.ErrConflict
+	}
+	s.Root = cid.Undef
+	s.ForgeRoot = cid.Undef
+	m.dropJournalLocked(name)
+	return nil
+}
+
+// dropJournalLocked deletes bucket name's journal rows. m.mu must be held.
+func (m *MemStore) dropJournalLocked(name string) {
 	for seq, rows := range m.journal {
 		for k, row := range rows {
 			if row.bucket == name {
@@ -273,7 +295,6 @@ func (m *MemStore) Delete(_ context.Context, name string) error {
 			delete(m.journal, seq)
 		}
 	}
-	return nil
 }
 
 func (m *MemStore) CASRoot(ctx context.Context, name string, expect, next cid.Cid) error {

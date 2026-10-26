@@ -40,6 +40,10 @@ func (l *releasableLog) Get(ctx context.Context, c cid.Cid) (block.Block, error)
 
 func (l *releasableLog) QuiesceBucketLog(context.Context, string) error { return nil }
 
+func (l *releasableLog) ReleaseRetiredSegments(context.Context, string, func(multihash.Multihash) error) error {
+	return nil
+}
+
 func (l *releasableLog) ShippedSegmentDigests(context.Context, string) ([]multihash.Multihash, error) {
 	return []multihash.Multihash{l.segment}, nil
 }
@@ -134,5 +138,30 @@ func TestDeleteBucket_RefusalLeavesBucketReadable(t *testing.T) {
 	}
 	if _, err := mem.Get(ctx, bucket); err == nil {
 		t.Fatalf("bucket row survived the retried delete")
+	}
+}
+
+// TestDeleteBucket_RefusalDropsTheJournal: the write that empties the root
+// also drops the bucket's journaled catalog blocks. A refused delete leaves
+// the bucket's last segment unshipped until its next write, and the journal
+// must not wait with it: nothing the emptied bucket reads needs those blocks.
+func TestDeleteBucket_RefusalDropsTheJournal(t *testing.T) {
+	b, mem, _, _ := newJournalingBackend(t)
+	auth := &refusingAuthority{BucketAuthority: mem}
+	auth.refuse.Store(true)
+	b.authority = auth
+	ctx := context.WithValue(context.Background(), reqscope.RequestKey(), cmds3.Request{})
+
+	// The ship waits on the test, so the PUT's and DELETE's blocks stay
+	// journaled.
+	putObj(t, b, "obj", []byte("written then deleted"))
+	deleteObj(t, b, "obj")
+	if st, err := mem.CatalogJournalStats(ctx); err != nil || st.Blocks == 0 {
+		t.Fatalf("journal before the delete = %+v (err %v), want rows; the test proves nothing", st, err)
+	}
+
+	wantAPIErr(t, b.DeleteBucket(ctx, "bk"), s3err.ErrBucketNotEmpty)
+	if st, err := mem.CatalogJournalStats(ctx); err != nil || st.Blocks != 0 {
+		t.Fatalf("journal after the refused delete = %+v (err %v), want empty", st, err)
 	}
 }

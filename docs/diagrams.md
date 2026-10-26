@@ -1254,14 +1254,18 @@ sequenceDiagram
     Note over B,R: the whole operation runs under the per-bucket lock
     B->>R: reg.Get
     B->>B: MST emptiness walk<br/>(ErrBucketNotEmpty, or the versioned variant)
-    B->>R: CASRoot(root → empty), SetForgeRoot(empty)
+    B->>R: EmptyRoot (one tx: root → empty, forge root cleared,<br/>the bucket's catalog_journal rows dropped)
     Note over B,R: nothing the bucket reads is released below
     loop each open multipart session
         B->>U: abortOpenSession: /blob/abort parked blobs
         Note over B,U: the request's own proofs sign the release legs<br/>(s3:DeleteBucket delegates blob.Abort + blob.Remove)
     end
     B->>L: QuiesceBucketLog (stop flushes, wait for in-flight ship)
-    B->>L: ShippedSegmentDigests (each CAR + its index blob, retired<br/>segments included, sealed-but-unshipped over-listed,<br/>release is idempotent)
+    loop ReleaseRetiredSegments: each retired segment
+        L->>U: /blob/remove its CAR + index blob
+        L->>R: DeleteSegment (its row, once both are released)
+    end
+    B->>L: ShippedSegmentDigests (each unretired CAR + its index blob,<br/>sealed-but-unshipped over-listed, release is idempotent)
     loop each digest
         B->>U: /blob/remove (release the space's registration)
     end
@@ -1273,12 +1277,15 @@ sequenceDiagram
     B-->>C: 204
 ```
 
-- The log seams (`QuiesceBucketLog`, `ShippedSegmentDigests`,
-  `RemoveBucketLog`) are type-asserted on `blockstore.Log`: a plain `Store`
+- The log seams (`QuiesceBucketLog`, `ReleaseRetiredSegments`,
+  `ShippedSegmentDigests`, `RemoveBucketLog`) are type-asserted on `blockstore.Log`: a plain `Store`
   without them silently no-ops, which is the trap this diagram documents.
 - A failure after the root is committed empty (hilt refusing, a release
   erroring) leaves the bucket functional: it lists empty, the closed store
-  reopens lazily on the next write, and a retried delete starts over.
+  reopens lazily on the next write, and a retried delete starts over,
+  except for the retired segments already released, whose rows are gone.
+  The quiesce leaves the last segment sealed and unshipped until that next
+  write; its journal rows went with the root.
 
 Sources: `s3frontend/bucket.go` (DeleteBucket), `s3frontend/multipart.go`
 (abortOpenSession), `s3frontend/object.go` (drainSpaceReleases),
@@ -1292,12 +1299,13 @@ listed diagrams (each diagram's `Sources:` footer names its exact files).
 
 | Package / file | Diagrams to review |
 |---|---|
-| `s3frontend/object.go` | put, get, blob-lifecycle, version-tree, gc-candidates |
+| `s3frontend/object.go` | put, get, blob-lifecycle, version-tree, gc-candidates, delete-bucket |
 | `s3frontend/version.go` | put, get, multipart, blob-lifecycle, version-tree, gc-candidates |
 | `s3frontend/multipart.go` | multipart, part-states, multipart-states, blob-lifecycle |
 | `s3frontend/acceptor.go` | multipart, part-states, blob-lifecycle |
 | `s3frontend/stream.go` | put, multipart, block-routes, blob-lifecycle |
 | `s3frontend/bucket.go` | context, delete-bucket |
+| `s3frontend/uploadsweep.go` | put, delete-bucket |
 | `bucketop/` | put, get, delete-bucket, packages, principals |
 | `blockstore/` | get, packages, block-routes; `forge.go` also context, principals |
 | `registry/` | schema, get, blob-lifecycle, logstore-pipeline |
