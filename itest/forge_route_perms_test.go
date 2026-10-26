@@ -18,11 +18,12 @@ import (
 //
 //   - a key holding s3:CreateBucket but none of the configuration
 //     permissions is refused PutBucketVersioning and DeleteObjects on an
-//     existing bucket (hilt used to classify both as CreateBucket, which
-//     skips the bucket scope check);
-//   - DeleteObjects is authorized on s3:DeleteObject, and an entry naming a
-//     version is refused, and the version kept, unless the key also holds
-//     s3:DeleteObjectVersion.
+//     existing bucket, since each is authorized on its own permission and
+//     against that bucket's scope;
+//   - DeleteObjects is authorized on s3:DeleteObject, and a batch with an
+//     entry naming a version is refused as a whole, nothing in it deleted,
+//     unless the key also holds s3:DeleteObjectVersion: hilt decides the
+//     request on its body, where S3 would refuse the entry alone.
 //
 // Each denied key first makes an allowed request, so the second attempt at a
 // denial runs against ingot's caches and the local fast path must refuse
@@ -86,27 +87,76 @@ func TestForgeRoutePermissions(t *testing.T) {
 		})
 	})
 
+	// The CORS writes are authorized on s3:PutBucketCORS, not on the read or
+	// on CreateBucket. Needs a hilt that knows the operations.
+	t.Run("the CORS writes need the CORS write permission", func(t *testing.T) {
+		if !corsWritesEnabled() {
+			t.Skip("needs a hilt override (INGOT_ITEST_HILT_BINARY or INGOT_ITEST_HILT_IMAGE), or INGOT_ITEST_CORS_WRITES=1, until the :main image authorizes PutBucketCors")
+		}
+		reader := client("cors-reader", []string{"s3:CreateBucket", "s3:GetBucketCORS"})
+		if _, err := reader.GetBucketCors(ctx, &s3.GetBucketCorsInput{Bucket: aws.String(bucket)}); err != nil {
+			// The gateway-wide document, or NoSuchCORSConfiguration when the
+			// stack runs without one: either way the read was authorized.
+			if code, _ := apiErrorOf(t, err); code != "NoSuchCORSConfiguration" {
+				t.Fatalf("GetBucketCors with the read permission: %v", err)
+			}
+		}
+		rule := types.CORSRule{AllowedOrigins: []string{"https://app.example"}, AllowedMethods: []string{"GET"}}
+		denied(t, "read-only key writing CORS", func() error {
+			_, err := reader.PutBucketCors(ctx, &s3.PutBucketCorsInput{
+				Bucket: aws.String(bucket), CORSConfiguration: &types.CORSConfiguration{CORSRules: []types.CORSRule{rule}},
+			})
+			return err
+		})
+		denied(t, "read-only key deleting CORS", func() error {
+			_, err := reader.DeleteBucketCors(ctx, &s3.DeleteBucketCorsInput{Bucket: aws.String(bucket)})
+			return err
+		})
+		writer := client("cors-writer", []string{"s3:PutBucketCORS"})
+		if _, err := writer.PutBucketCors(ctx, &s3.PutBucketCorsInput{
+			Bucket: aws.String(bucket), CORSConfiguration: &types.CORSConfiguration{CORSRules: []types.CORSRule{rule}},
+		}); err != nil {
+			t.Fatalf("PutBucketCors with the write permission: %v", err)
+		}
+		if _, err := writer.DeleteBucketCors(ctx, &s3.DeleteBucketCorsInput{Bucket: aws.String(bucket)}); err != nil {
+			t.Fatalf("DeleteBucketCors with the write permission: %v", err)
+		}
+	})
+
 	t.Run("an entry naming a version needs the version permission", func(t *testing.T) {
 		withoutVersion := slices.DeleteFunc(slices.Clone(hiltAllPermissions), func(p string) bool { return p == "s3:DeleteObjectVersion" })
 		deleter := client("deleter", withoutVersion)
 		v1 := put("kept")
 		put("marked")
+		// An allowed request first, so the key's action set and chains are
+		// cached and the second denial below runs against them.
+		if _, err := deleteObjects(deleter, types.ObjectIdentifier{Key: aws.String("probe")}); err != nil {
+			t.Fatalf("priming DeleteObjects with s3:DeleteObject: %v", err)
+		}
 
-		out, err := deleteObjects(deleter,
-			types.ObjectIdentifier{Key: aws.String("kept"), VersionId: aws.String(v1)},
-			types.ObjectIdentifier{Key: aws.String("marked")},
-		)
+		// The mixed batch is refused as a whole, once through hilt and once
+		// against the caches, with nothing in it deleted.
+		denied(t, "delete-only key naming a version", func() error {
+			_, err := deleteObjects(deleter,
+				types.ObjectIdentifier{Key: aws.String("kept"), VersionId: aws.String(v1)},
+				types.ObjectIdentifier{Key: aws.String("marked")},
+			)
+			return err
+		})
+		if _, err := full.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(bucket), Key: aws.String("kept"), VersionId: aws.String(v1)}); err != nil {
+			t.Fatalf("refused version is gone: %v", err)
+		}
+		if _, err := full.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(bucket), Key: aws.String("marked")}); err != nil {
+			t.Fatalf("\"marked\" was deleted by a refused batch: %v", err)
+		}
+
+		// The plain batch is authorized on s3:DeleteObject alone.
+		out, err := deleteObjects(deleter, types.ObjectIdentifier{Key: aws.String("marked")})
 		if err != nil {
 			t.Fatalf("DeleteObjects with s3:DeleteObject: %v", err)
 		}
-		if len(out.Errors) != 1 || aws.ToString(out.Errors[0].Key) != "kept" || aws.ToString(out.Errors[0].Code) != "AccessDenied" {
-			t.Fatalf("errors = %+v, want AccessDenied for \"kept\" alone", out.Errors)
-		}
-		if len(out.Deleted) != 1 || aws.ToString(out.Deleted[0].Key) != "marked" || !aws.ToBool(out.Deleted[0].DeleteMarker) {
-			t.Fatalf("deleted = %+v, want a delete marker for \"marked\"", out.Deleted)
-		}
-		if _, err := full.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(bucket), Key: aws.String("kept"), VersionId: aws.String(v1)}); err != nil {
-			t.Fatalf("refused version is gone: %v", err)
+		if len(out.Errors) != 0 || len(out.Deleted) != 1 || aws.ToString(out.Deleted[0].Key) != "marked" || !aws.ToBool(out.Deleted[0].DeleteMarker) {
+			t.Fatalf("result = deleted %+v, errors %+v; want a delete marker for \"marked\"", out.Deleted, out.Errors)
 		}
 
 		versionDeleter := client("version-deleter", []string{"s3:DeleteObject", "s3:DeleteObjectVersion"})

@@ -513,7 +513,7 @@ a walk over sub-blocks.
 The only serialized work is the commit critical section, and under versioning two writes to the same
 key produce distinct versionIds — they contend only on the guarded root swap, which retries cheaply.
 Across processes, the swap (a Postgres conditional update) is the cross-instance guard; `blob_refs`
-updates land after the commit, best-effort — not inside the transaction.
+updates land in the swap's transaction.
 
 | Case | Handling |
 |---|---|
@@ -689,7 +689,8 @@ The MVP this supersedes had six structural problems; each is resolved by a layer
 The relational tables as migrated (`migrations/sql/*.sql`), including the catalog log's
 **segment** metadata and per-operation **op-roots** (owned by the [`logstore`](../logstore)
 package). Object **manifests** and **MST nodes** are not rows here — they are content-addressed
-dag-cbor *blocks* in the catalog plane ([§4](#4-the-catalog-layer)). CIDs and blob digests
+dag-cbor *blocks* in the catalog plane ([§4](#4-the-catalog-layer)) — except that the **catalog
+journal** keeps a copy of each block until the segment it went into ships. CIDs and blob digests
 (sha256 multihashes) are stored as `bytea`. The ER view is in
 [`diagrams.md`](./diagrams.md#postgres-schema-as-migrated).
 
@@ -697,8 +698,9 @@ dag-cbor *blocks* in the catalog plane ([§4](#4-the-catalog-layer)). CIDs and b
 -- One row per bucket: the space its data lives in, the S3 versioning state, the
 -- committed MST root, and the root that is durable on Forge (advanced only when
 -- a catalog segment ships, and only while root_cid still equals the op-root).
--- The bucket-level S3 configuration rides here too: object lock, tagging and
--- default encryption, each NULL until configured.
+-- The bucket-level S3 configuration rides here too: object lock, tagging,
+-- default encryption and the bucket's own CORS document, each NULL until
+-- configured.
 CREATE TABLE ingot.buckets (
     name               text PRIMARY KEY,
     root_cid           bytea,                            -- committed MST root (locally durable)
@@ -711,6 +713,7 @@ CREATE TABLE ingot.buckets (
     next_version_seq   bigint NOT NULL DEFAULT 0,        -- per-bucket version ordinal (§3)
     object_lock_config bytea,                            -- auth.BucketLockConfig JSON; NULL = never configured
     bucket_tagging     bytea,                            -- tag set as a JSON object; NULL = no tag set
+    cors_config        bytea,                            -- the bucket's own CORS XML; NULL = the gateway default (docs/s3-cors.md)
     encryption         text CHECK (encryption IN ('AES256','none'))
                                                          -- default encryption; NULL = unconfigured (encrypts)
 );
@@ -742,6 +745,22 @@ CREATE TABLE ingot.segment_op_roots (
     root_cid   bytea  NOT NULL,
     PRIMARY KEY (seq, seq_within)
 );
+
+-- The catalog journal: a copy of every catalog block a commit appended to the
+-- log, written in the root swap's transaction and deleted in the one that stamps
+-- its segment shipped, so a copy of the database holds the blocks only this
+-- host's disk would otherwise hold. seq has deliberately no foreign key: logstore
+-- recovery deletes the row of a segment whose CAR is missing, and the blocks
+-- must outlive it.
+CREATE TABLE ingot.catalog_journal (
+    seq        bigint      NOT NULL,                     -- the log segment it went into
+    bucket     text        NOT NULL REFERENCES ingot.buckets(name) ON DELETE CASCADE,
+    cid        bytea       NOT NULL,
+    data       bytea       NOT NULL,                     -- the block's bytes
+    created_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (seq, cid)
+);
+CREATE INDEX catalog_journal_bucket_seq_idx ON ingot.catalog_journal (bucket, seq);
 
 -- Reverse index (§5, §6): which object versions reference each blob. One row per
 -- (digest, version). A blob's space-claim is released when no rows remain for
@@ -994,7 +1013,8 @@ CREATE TABLE ingot.revocation_cursor (
 
 Relationships at a glance: `segment_op_roots` cascades from `segments`, `multipart_parts` from
 `multipart_sessions`, `multipart_part_trees` from `multipart_parts`, and `upload_registrations`
-from `buckets` — the schema's only true foreign keys. `blob_refs`, `segments`,
+and `catalog_journal` from `buckets` — the schema's only true foreign keys. `catalog_journal`
+references a `segments.seq` by value, deliberately. `blob_refs`, `segments`,
 `multipart_sessions`, `blob_streams` and `gc_candidates` reference a `buckets.name` by value,
 `shard_inclusions` joins `blob_locations` on `shard_digest`, and `blob_encryption_params` joins
 `blob_locations` on `(space, digest)` with deliberately no FK. `revocation_cursor` stands alone.
@@ -1020,8 +1040,8 @@ The storage / delete / retrieval core is built and tested:
 - **Object-aligned blobs + manifest** ([§4](#4-the-catalog-layer)–[§5](#5-the-data-layer)) — `Body.Blobs` (`[digest, offset]` entries, inline then in extent blocks), coarse split at
   `max_blob_size`, the local **spool** (`blockstore.Spool`) + `upload_intents`, stored S3 `etag`.
 - **Synchronous durability write path** ([§7.1](#71-write-single-shot-putobject)) — off-lock ingest → spool → per-blob upload, then a
-  short locked commit (manifest + MST splice + guarded root swap); reference-index reconcile runs
-  **after** the commit is durable so a commit failure can't diverge `blob_refs`.
+  short locked commit (manifest + MST splice + guarded root swap); the reference-index claims and
+  drops are written in the root swap's transaction, so a commit failure writes none of them.
 - **Single-plane catalog log** — the data plane is gone; `logstore` journals only the catalog
   (manifests + MST nodes) as CAR segments. `forge_root_cid` advances only when the catalog ships, and
   only `WHERE root_cid` still matches the op-root (the orphan-root guard from [§9](#9-the-system-contract-piri--sprue--indexer)).
@@ -1104,7 +1124,7 @@ paths below are exercised against the real stack by the smelt-based `itest/` har
   ([§7.2](#72-multipart)–[7.3](#73-the-session-latch-the-abortcomplete-race)).
 - **Crash recovery for the spool is not built.** The `upload_intents` × `blob_refs` reconciliation
   the failure-mode table in [§7.5](#75-concurrency-durability-and-failure-modes) describes (resume/`abort` parked, `remove` accepted-but-unreferenced)
-  is a later phase; a partial post-commit reference-index write currently relies on retry/idempotency.
+  is a later phase.
 - **Indexer retraction on delete** is unimplemented (no-op). `ListParts` and
   `ListMultipartUploads` are implemented (paginated, prefix/delimiter/marker semantics;
   in-flight sessions only).
@@ -1119,11 +1139,11 @@ paths below are exercised against the real stack by the smelt-based `itest/` har
   `blob.Remove`, so the abort and every other release leg signs with the request's own proofs. The
   network-side `/blob/abort` unwind remains a parking-flow concern (above).
 
-### Known correctness boundary
+### Reference index and root commit
 
-Reference-index mutations (`blob_refs`) and the catalog/root commit are **not yet one atomic
-transaction**: the reconcile runs immediately *after* a successful commit. A commit failure can no
-longer corrupt `blob_refs` (the reconcile is skipped), but a crash *between* the commit and the
-reconcile, or a partial reconcile, can leave `blob_refs` momentarily under/over-counted until the
-deferred crash-recovery reconciliation lands. The safe-side ordering (catalog first, then claims)
-means such a window leaks rather than loses referenced data.
+Reference-index mutations (`blob_refs`) and the catalog/root commit are one transaction: the new
+version's claims, the discarded versions' claim drops, and the release records those drops produce
+are written by the same Postgres transaction as the guarded root swap (`registry.CommitRoot`). A
+commit that fails writes none of them, and no crash can leave a published version unclaimed or a
+discarded one claimed. A claim the swap refuses (a started release holds the digest, or a pinned
+source is gone) fails the commit, and the root stays where it was.

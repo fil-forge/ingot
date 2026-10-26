@@ -121,10 +121,10 @@ func (m localBlobMetrics) removedFile(ctx context.Context, reason string, freed 
 	}
 }
 
-// CloseMetrics stops reporting the local blob and multipart gauges. The
-// backend still counts; with no reader those cost nothing. Server.Stop calls
-// it, so a final export the host makes after Stop carries the counters but
-// not the gauges.
+// CloseMetrics stops reporting the local blob, multipart and catalog journal
+// gauges. The backend still counts; with no reader those cost nothing.
+// Server.Stop calls it, so a final export the host makes after Stop carries
+// the counters but not the gauges.
 func (b *Backend) CloseMetrics() error {
 	var errs []error
 	if b.localBlobGauges != nil {
@@ -134,6 +134,10 @@ func (b *Backend) CloseMetrics() error {
 	if b.multipartGauges != nil {
 		errs = append(errs, b.multipartGauges.Unregister())
 		b.multipartGauges = nil
+	}
+	if b.journalGauges != nil {
+		errs = append(errs, b.journalGauges.Unregister())
+		b.journalGauges = nil
 	}
 	return errors.Join(errs...)
 }

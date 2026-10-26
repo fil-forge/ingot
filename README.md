@@ -251,6 +251,15 @@ uploads them (see DESIGN_NOTES), and report:
 | `ingot.multipart.accept_passes` | Acceptor passes that concluded parts, by `outcome`: `accepted` or `failed` (retried after a backoff; a timed-out pass included) |
 | `ingot.multipart.complete_deferred` | CompleteMultipartUpload requests answered OperationAborted because a part they name was still queued. Botocore clients (the AWS CLI) treat that as a failed upload |
 
+Each commit also journals its catalog blocks in Postgres until their segment
+ships (see `logstore/README.md`), so a copy of the database holds the
+catalog only this host's disk would otherwise hold. The journal reports:
+
+| Metric | Meaning |
+| -- | -- |
+| `ingot.catalog_journal.blocks`, `ingot.catalog_journal.bytes` | Catalog blocks, and their bytes, journaled in Postgres whose segment has not shipped yet |
+| `ingot.catalog_journal.oldest_age` | Seconds since the oldest journaled block was written; 0 when the journal is empty. Segments ship within seconds of sealing, so growth means shipping has stalled and the unshipped catalog is building up in Postgres |
+
 **Manual cleanup.** Every file in `<data_dir>/cache` is safe to delete: the
 provider holds its body. A file in `<data_dir>/spool` may be the only copy.
 The one kind safe to delete is a body the provider already holds, left in

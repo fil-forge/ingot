@@ -312,46 +312,15 @@ type PartTree struct {
 	Root []byte
 }
 
-// BlobRefStore is the reverse reference index (§5, §6). A commit adds a
-// claim per body digest; a delete/overwrite removes it; CountClaims gates
-// remove(digest) (physical reclamation when the count reaches zero).
+// BlobRefStore reads the reverse reference index (§5, §6). The index is
+// written by commits alone: a version's claims land and a discarded
+// version's claims drop in the root swap's transaction
+// (Registry.CommitRoot, RootCommit). CountClaims gates remove(digest):
+// physical reclamation when the count reaches zero.
 type BlobRefStore interface {
-	// AddBlobClaim records an object version's claim on a digest and, in the
-	// same transaction, marks the space's upload intent for the digest
-	// published (see IntentPublished). Idempotent. Under the (space, digest)
-	// claim-key lock it refuses with ErrReleaseInProgress while a started
-	// release holds the digest (PendingReleaseStore.StartRelease), or when
-	// the space has no location for the digest: a claim landing then would
-	// name a blob a release is removing, or has removed since the write
-	// settled it. Every committed body blob is located by its commit, so a
-	// claim with no location is one such write's.
-	AddBlobClaim(ctx context.Context, claim BlobClaim) error
-	// AddBlobClaims is AddBlobClaim for every claim of one generation, all
-	// in one transaction, each under its claim-key lock, taken in digest
-	// order: a digest refused for a started release records nothing for
-	// the others, so a commit that fails leaves no claim behind that no
-	// generation will ever drop.
-	AddBlobClaims(ctx context.Context, claims []BlobClaim) error
-	// PinBlobClaims is AddBlobClaim for digests borrowed from another object
-	// of the same space (a same-space copy pins the source's body). Each
-	// claim is recorded only while the space still holds a claim on its
-	// digest, all in one transaction, and the transaction excludes
-	// DropClaimEnqueueRelease on the same (space, digest), so a pin and the
-	// drop of the digest's last claim commit in one order or the other: the
-	// drop counts the pin, or the pin finds no claim. Reports whether every
-	// claim is recorded; false records nothing and means some digest's last
-	// claim is gone and the blob is being released. Idempotent.
-	PinBlobClaims(ctx context.Context, claims []BlobClaim) (bool, error)
-	DeleteBlobClaim(ctx context.Context, digest multihash.Multihash, bucket, objectKey, versionID string) error
 	// CountClaims returns how many object versions in space still reference
 	// digest. Zero means the space's claim may be released.
 	CountClaims(ctx context.Context, space did.DID, digest multihash.Multihash) (int, error)
-	// DropClaimEnqueueRelease deletes one claim row and, when it was the
-	// space's last claim on digest, records a release intent due at
-	// notBefore — atomically, so no crash window separates "last claim
-	// gone" from "release recorded". Reports whether an intent was
-	// enqueued.
-	DropClaimEnqueueRelease(ctx context.Context, digest multihash.Multihash, bucket, objectKey, versionID string, space did.DID, notBefore time.Time) (bool, error)
 }
 
 // PendingRelease is one deferred blob release: executed by the release
@@ -439,6 +408,15 @@ type PendingReleaseStore interface {
 	// reuse, or reports one that is started, which the write waits out, or
 	// none.
 	CancelRelease(ctx context.Context, space did.DID, digest multihash.Multihash) (ReleaseCancel, error)
+	// GetRelease returns the record for (space, digest) as it stands, or
+	// ErrNotFound, read under the claim-key lock and changing nothing: for
+	// a part write that leaves a pending record to its part row (which
+	// defers the record, StartRelease) and waits out a started one, where
+	// CancelRelease is for a write that takes the blob over. The lock
+	// serialises the read with StartRelease, so a record reported pending
+	// is not one a start is about to commit: the start that follows reads
+	// the write's part row and defers.
+	GetRelease(ctx context.Context, space did.DID, digest multihash.Multihash) (*PendingRelease, error)
 	// ReleasingDigests returns which of digests have a release record in
 	// space, started or not, keyed by string(digest). It reads and changes
 	// nothing else: for a caller that must leave a blob with a pending
@@ -677,8 +655,16 @@ type MultipartStore interface {
 	// write and the state check are one statement that holds the session
 	// row, so a part cannot land after a Complete or a teardown has taken
 	// the session, and a teardown's part listing sees every part that did
-	// land.
-	PutPart(ctx context.Context, p MultipartPart, tree *PartTree) error
+	// land. In the same transaction it records a release, due now, for each
+	// blob the replaced row named and this part does not, and returns those
+	// records for the caller to run: the replaced row and the releases of
+	// its blobs are one write, so no failure or crash can separate them.
+	// Writes of one part number are serialised, so the replaced row is
+	// exactly the one standing when this write landed, which a listing
+	// taken before the write may not have seen: a concurrent write of the
+	// same part number lands in between, and only its replacer learns of
+	// it.
+	PutPart(ctx context.Context, p MultipartPart, tree *PartTree) (released []PendingRelease, err error)
 	// MoveParts moves each of parts (as the caller read them) from state
 	// from to state to, and returns how many moved. A part is skipped when
 	// its row is no longer in from or no longer names the BlobDigests it

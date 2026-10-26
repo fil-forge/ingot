@@ -324,42 +324,12 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 		}
 	}
 
-	// Capture the superseded part's blobs (if any) before overwriting, so
-	// last-write-wins doesn't strand them. The session's other parts stay
-	// live; the release still checks for a sibling naming the same digest,
-	// which a session storing parts as received can have. A
-	// listing failure fails the upload: proceeding would silently strand the
-	// replaced part's blobs and key rows.
-	var superseded []mh.Multihash
-	siblings := map[string]bool{}
+	// The parts so far place this one in the object (assumedPartOffset).
 	prior, err := b.multipart.ListParts(ctx, uploadID)
 	if err != nil {
-		return nil, fmt.Errorf("s3frontend: list parts before supersede: %w", err)
+		return nil, fmt.Errorf("s3frontend: list parts: %w", err)
 	}
-	for _, p := range prior {
-		if p.PartNumber == partNumber {
-			superseded = p.BlobDigests
-			continue
-		}
-		for _, d := range p.BlobDigests {
-			siblings[string(d)] = true
-		}
-	}
-
 	space := sess.Space
-	// Record the superseded blobs' releases before anything is written, so
-	// no failure past this point can strand them. Until the new part row
-	// lands the old one still references them, which defers the release; a
-	// request that dies in between leaves records that resolve with the
-	// session (a claim at Complete makes them stale, an abort re-records
-	// them).
-	var superseding []registry.PendingRelease
-	if len(superseded) > 0 {
-		superseding, err = b.enqueuePartReleases(ctx, space, superseded, siblings)
-		if err != nil {
-			return nil, fmt.Errorf("s3frontend: record superseded part releases: %w", err)
-		}
-	}
 	// The part's BLAKE3 tree, hashed at the offset the part is assumed to
 	// sit at in the object (see assumedPartOffset), whole chunks only, with
 	// the bytes either side of them kept raw; Complete merges the parts'
@@ -406,7 +376,19 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 	if tree != nil {
 		partTree = partTreeOf(tree.FinishRange())
 	}
-	if err := b.multipart.PutPart(ctx, part, partTree); err != nil {
+	// Recording the part replaces any prior row for the part number, and
+	// records the releases of the blobs that row named and this part does
+	// not, in the same write: nothing can separate the two, and a
+	// concurrent upload of the same part number that wrote its row after
+	// the listing above is replaced and released like any other. A digest
+	// another part of the session also names (parts stored as received
+	// share the blobs of identical bytes) is recorded all the same: the
+	// release defers while that part references it and resolves with the
+	// session (a claim at Complete makes it stale, an abort re-records it).
+	// Skipping it would race a concurrent re-upload of the sibling, each
+	// seeing the other's old part and neither recording the release.
+	superseding, err := b.multipart.PutPart(ctx, part, partTree)
+	if err != nil {
 		// No part row points at the spooled blobs now, whatever went wrong:
 		// the session was completed, aborted or torn down after this upload
 		// was admitted (ErrNotFound), or the write failed. Their release is
@@ -415,7 +397,7 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 		// fact have landed and only its result been lost, the release waits
 		// on the live part reference and resolves with the session.
 		spooled.unholdAll()
-		released, rerr := b.enqueuePartReleases(ctx, space, spooled.Blobs.DigestList(), siblings)
+		released, rerr := b.enqueuePartReleases(ctx, space, spooled.Blobs.DigestList(), nil)
 		if rerr != nil {
 			return nil, fmt.Errorf("s3frontend: record part: %w; record its blobs' releases: %w", err, rerr)
 		}
@@ -430,14 +412,30 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 	// The part row is recorded first so a crash mid-park leaves re-drivable
 	// spooled intents. Only once every blob is parked does the part become
 	// 'parked', which is what queues it for acceptance; a part left
-	// 'spooled' is Complete's to finish. A later upload of this part number
-	// may have replaced the row meanwhile, in which case it is that upload's
-	// to mark.
+	// 'spooled' is Complete's to finish.
 	if err := b.parkBlobs(ctx, space, spooled); err != nil {
 		return nil, fmt.Errorf("s3frontend: park part blobs: %w", err)
 	}
-	if _, err := b.multipart.MoveParts(ctx, []registry.MultipartPart{part}, registry.PartSpooled, registry.PartParked); err != nil {
+	moved, err := b.multipart.MoveParts(ctx, []registry.MultipartPart{part}, registry.PartSpooled, registry.PartParked)
+	if err != nil {
 		return nil, fmt.Errorf("s3frontend: mark part parked: %w", err)
+	}
+	if moved == 0 {
+		// The row is no longer this write's: a later upload of the part
+		// number replaced it, or a teardown took the session, while the
+		// blobs were parking. The replacer recorded their releases, and the
+		// park left those records standing (awaitRelease), so the blobs go
+		// whatever happens to this write from here. Recorded again here, a
+		// no-op beside a standing record, they run now rather than on the
+		// sweeper's next pass, the park being done and nothing of this
+		// write's holding the files: a blob the replacement or another part
+		// still names waits on that reference, and one the session has
+		// claimed is stale.
+		lost, err := b.enqueuePartReleases(ctx, space, part.BlobDigests, nil)
+		if err != nil {
+			return nil, fmt.Errorf("s3frontend: record replaced part releases: %w", err)
+		}
+		superseding = append(superseding, lost...)
 	}
 	b.nudgeAcceptor(uploadID)
 	b.releaseNow(ctx, superseding)
@@ -493,6 +491,29 @@ var errCompleteInProgress = s3err.APIError{
 }
 
 func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.CompleteMultipartUploadInput) (s3response.CompleteMultipartUploadResult, string, error) {
+	return b.CompleteMultipartUploadReportingHeaders(ctx, input, func(backend.CompleteMultipartUploadHeaders) {})
+}
+
+var _ backend.CompleteMultipartUploadReporter = (*Backend)(nil)
+
+// CompleteMultipartUploadReportingHeaders is CompleteMultipartUpload that
+// reports its version id and encryption before accepting the parts, the
+// slow step, for versitygw to send with a streamed response's early
+// headers, as S3 does. An Enabled bucket's winner reports the id it
+// reserved; every other path reports "" before it waits on anything.
+func (b *Backend) CompleteMultipartUploadReportingHeaders(ctx context.Context, input *s3.CompleteMultipartUploadInput, reportHeaders func(backend.CompleteMultipartUploadHeaders)) (s3response.CompleteMultipartUploadResult, string, error) {
+	// Only the first report counts (versitygw ignores the rest), and a
+	// report is binding, so the reservation below needs to know whether ""
+	// went out first. Every report comes after the session has loaded, and
+	// carries its encryption.
+	reported := false
+	var sse types.ServerSideEncryption
+	report := func(versionID string) {
+		if !reported {
+			reported = true
+			reportHeaders(backend.CompleteMultipartUploadHeaders{VersionID: versionID, ServerSideEncryption: sse})
+		}
+	}
 	if input.Bucket == nil || input.Key == nil || input.UploadId == nil {
 		return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrInvalidRequest)
 	}
@@ -523,6 +544,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 	if sess.Space.Defined() && sess.Space != bucketState.Space {
 		return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrNoSuchUpload)
 	}
+	sse = encryptionFor(sess.Plaintext)
 
 	// A Complete naming a checksum type must match the CreateMultipartUpload
 	// declaration (a session without one reports the literal "null").
@@ -747,7 +769,14 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 				// but no checksum: AWS omits it on the idempotent replay (for both
 				// COMPOSITE and FULL_OBJECT), unlike the first Complete.
 				res := s3response.CompleteMultipartUploadResult{Bucket: &bucket, Key: &key, ETag: &etagQ, ServerSideEncryption: encryptionFor(sess.Plaintext)}
-				return res, cur.CommittedVersionID, nil
+				// A null version is one the first Complete committed outside
+				// an Enabled bucket, and sent no id for.
+				versionid := cur.CommittedVersionID
+				if versionid == registry.NullVersionID {
+					versionid = ""
+				}
+				report(versionid)
+				return res, versionid, nil
 			}
 			if cur.State == registry.SessionOpen {
 				won, err := b.multipart.LatchSession(ctx, uploadID, registry.SessionOpen, registry.SessionCompleting)
@@ -765,6 +794,10 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 			if tries >= replayMaxTries || time.Now().After(deadline) {
 				return s3response.CompleteMultipartUploadResult{}, "", errCompleteInProgress
 			}
+			// The winner's id isn't known until it commits, and if it fails
+			// this caller may commit a version of its own. The headers go out
+			// without one rather than wait out the winner.
+			report("")
 			select {
 			case <-ctx.Done():
 				return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: complete wait: %w", ctx.Err())
@@ -812,6 +845,26 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 			zap.String("key", key), zap.Int("parts", len(requested)), zap.Int64("size", total), zap.Int64("rehash", need), zap.Int64("budget", b.rehashBudget))
 		return s3response.CompleteMultipartUploadResult{}, "", errPartLayoutOverBudget(need, b.rehashBudget)
 	}
+
+	// An Enabled bucket's new version id goes out now, before the parts are
+	// accepted: versitygw commits the response headers at the report, as S3
+	// commits its early 200 with x-amz-version-id, and an error after it can
+	// only go in the 200's body. The re-hash refusal above comes first so
+	// that it keeps its 400. The commit then installs exactly this id, or
+	// fails (errReservationSuperseded). Every other Complete reports no id,
+	// including one that already did while it waited on another Complete,
+	// and the commit then refuses to create a numbered version, which the
+	// client could never learn.
+	reserved := &versionReservation{}
+	if bucketState.Versioning == registry.VersioningEnabled && !reported {
+		r, err := b.reserveVersion(ctx, bucket)
+		if err != nil {
+			return s3response.CompleteMultipartUploadResult{}, "", err
+		}
+		reserved = &r
+		report(r.VersionID)
+	}
+	report("")
 
 	// Assemble the ordered body: each part's byte span (it may span several
 	// blobs) is recorded so a later GET/HEAD ?partNumber=N can address it (§7.2).
@@ -892,11 +945,11 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 	initState = applyTagsIfPresent(initState, tags)
 
 	// Commit through the §5 write rule (docs/s3-versioning.md): seq allocation,
-	// supersession per the bucket's versioning state, and the post-commit
-	// reference-index reconcile. The conditional-write preconditions re-check
+	// supersession per the bucket's versioning state, and the reference-index
+	// claims and drops in the swap. The conditional-write preconditions re-check
 	// under the lock so a racing writer can't slip between the pre-check above
 	// and the swap.
-	node, effState, err := b.commitVersion(ctx, bucketState, key, mf, blobs, initState, false, func(superseded *msbucket.ObjectManifest) error {
+	node, effState, err := b.commitVersionAt(ctx, bucketState, key, mf, blobs, initState, false, reserved, func(superseded *msbucket.ObjectManifest) error {
 		// The latch is re-checked under the bucket lock, where every
 		// teardown that takes a 'completing' row (DeleteBucket, the
 		// sweeper) latches it: a session taken while its blobs were
@@ -932,6 +985,10 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, input *s3.Complet
 		}
 		return nil
 	})
+	if errors.Is(err, errReservationSuperseded) {
+		b.logger.Info("multipart completion refused: the key or the bucket's versioning changed since it reported its version",
+			zap.String("key", key), zap.String("uploadID", uploadID), zap.String("versionID", reserved.VersionID))
+	}
 	if err != nil {
 		return s3response.CompleteMultipartUploadResult{}, "", err
 	}
@@ -1134,15 +1191,16 @@ func (b *Backend) recordSessionReleases(ctx context.Context, space did.DID, uplo
 }
 
 // enqueuePartReleases records a deferred release for each of digests that is
-// not in keep (the winners at Complete, the sibling parts at supersede, the
-// committed and already-released blobs at a reap), in one statement however many parts the
-// session has. Whether a blob is in fact free to go is the release's
-// question, answered when it runs: runRelease drops a record whose digest is
-// claimed by a committed object and waits on one a part of an in-flight
-// session still references. Deciding that here instead would race another
-// teardown — two aborting sessions sharing a blob could each see the other's
-// part, both skip it, and both cascade their rows away, leaving no record at
-// all. Returns the records as they stand, including any earlier not_before a
+// not in keep (the winners at Complete, the committed and already-released
+// blobs at a reap; a supersede keeps nothing), in one statement however many
+// parts the session has. Whether a blob is in fact free to go is the
+// release's question, answered when it runs: runRelease drops a record whose
+// digest is claimed by a committed object and waits on one a part of an
+// in-flight session still references. Deciding that here instead would race
+// another teardown — two aborting sessions sharing a blob could each see the
+// other's part, both skip it, and both cascade their rows away, leaving no
+// record at all — or another supersede, of a sibling part sharing the blob.
+// Returns the records as they stand, including any earlier not_before a
 // digest already carried.
 func (b *Backend) enqueuePartReleases(ctx context.Context, space did.DID, digests []mh.Multihash, keep map[string]bool) ([]registry.PendingRelease, error) {
 	seen := map[string]bool{}
@@ -1210,8 +1268,9 @@ func (b *Backend) parkBlob(ctx context.Context, space did.DID, blob msbucket.Blo
 
 	digest := blob.Digest
 	// Whatever the rows say, no release of this digest may be running
-	// while the blob is parked or reused (see settleRelease).
-	settled, err := b.settleRelease(ctx, space, blob.Digest)
+	// while the blob is parked or reused; one not yet started is left to
+	// the part row (see awaitRelease).
+	settled, err := b.awaitRelease(ctx, space, blob.Digest)
 	if err != nil {
 		return err
 	}
@@ -1314,10 +1373,10 @@ func (b *Backend) recordStreamedPark(ctx context.Context, space did.DID, blob ms
 	unlock := b.blobKeys.Lock(blobKey(space, blob.Digest))
 	defer unlock()
 	// A release of the same digest that ran while the stream was in flight
-	// may have taken what it parked (see settleRelease): the stream is then
+	// may have taken what it parked (see awaitRelease): the stream is then
 	// given up and the blob parked afresh from its spool file, which the
 	// write still holds.
-	settled, err := b.settleRelease(ctx, space, blob.Digest)
+	settled, err := b.awaitRelease(ctx, space, blob.Digest)
 	if err != nil {
 		return err
 	}

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/fil-forge/ucantone/did"
@@ -32,45 +33,29 @@ var (
 
 // BlobRefStore ===============================================================
 
-func (r *Postgres) AddBlobClaim(ctx context.Context, c BlobClaim) error {
-	return r.AddBlobClaims(ctx, []BlobClaim{c})
-}
-
-func (r *Postgres) AddBlobClaims(ctx context.Context, claims []BlobClaim) error {
+// addClaims records a new generation's claims, in the commit's transaction,
+// under the claim keys' locks (lockClaimKeys), and refuses them all with
+// ErrReleaseInProgress while a started release holds any digest or the
+// space has no location for one (see RootCommit.Claims). Set-based: a
+// multipart commit claims up to hundreds of thousands of blobs, so each
+// step is one statement over the whole generation rather than one per
+// claim.
+func addClaims(ctx context.Context, tx pgx.Tx, claims []BlobClaim) error {
 	if len(claims) == 0 {
 		return nil
 	}
-	sorted := slices.Clone(claims)
-	slices.SortFunc(sorted, func(a, b BlobClaim) int { return bytes.Compare(a.Digest, b.Digest) })
-	// Set-based: a multipart commit claims up to hundreds of thousands of
-	// blobs, so each step below is one statement over the whole generation
-	// rather than one per claim.
-	n := len(sorted)
+	n := len(claims)
 	digests := make([][]byte, n)
 	spaces := make([]string, n)
 	buckets := make([]string, n)
 	keys := make([]string, n)
 	versions := make([]string, n)
-	for i, c := range sorted {
+	for i, c := range claims {
 		digests[i], spaces[i], buckets[i], keys[i], versions[i] = c.Digest, c.Space.String(), c.Bucket, c.ObjectKey, c.VersionID
 	}
-	tx, err := r.pool.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("registry: begin add blob claims: %w", err)
-	}
-	defer tx.Rollback(ctx)
-	// The claim-key locks, in digest order, as every caller taking several
-	// keys takes them (the key is lockClaimKey's). The arrays are sorted, and
-	// the subquery's ORDER BY carries that order to the lock calls: SQL
-	// promises no row order otherwise, and a subquery with an ORDER BY is
-	// not flattened, so the outer scan reads it sorted and takes one lock
-	// per row in turn.
-	if _, err := tx.Exec(ctx, claimKeyLocksSQL, spaces, digests); err != nil {
-		return fmt.Errorf("registry: lock claim keys: %w", err)
-	}
-	// Under the locks: refused while a started release holds any digest, or
-	// when the space has no location for one (a release ran to completion
-	// since the write settled it, and the blob is gone from the provider).
+	// Refused while a started release holds any digest, or when the space
+	// has no location for one (a release ran to completion since the write
+	// settled it, and the blob is gone from the provider).
 	var refused bool
 	if err := tx.QueryRow(ctx,
 		`SELECT EXISTS (
@@ -83,7 +68,7 @@ func (r *Postgres) AddBlobClaims(ctx context.Context, claims []BlobClaim) error 
 		return fmt.Errorf("registry: add blob claims: release and location lookup: %w", err)
 	}
 	if refused {
-		return ErrReleaseInProgress // rolled back by the deferred Rollback
+		return ErrReleaseInProgress // the commit rolls back
 	}
 	if _, err := tx.Exec(ctx,
 		`INSERT INTO ingot.blob_refs (digest, bucket, object_key, version_id, space)
@@ -103,24 +88,68 @@ func (r *Postgres) AddBlobClaims(ctx context.Context, claims []BlobClaim) error 
 		spaces, digests, IntentPublished); err != nil {
 		return fmt.Errorf("registry: publish intents: %w", err)
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("registry: commit add blob claims: %w", err)
-	}
 	return nil
 }
 
 // claimKeyLocksSQL takes the claim-key lock of each (space, digest) pair in
-// the order of the arrays $1 and $2 (see AddBlobClaims).
+// the order of the arrays $1 and $2 (see lockClaimKeys).
 const claimKeyLocksSQL = `SELECT pg_advisory_xact_lock(o.k)
   FROM (SELECT hashtextextended(u.s || ':' || encode(u.d, 'hex'), 0) AS k
           FROM unnest($1::text[], $2::bytea[]) WITH ORDINALITY AS u(s, d, i)
          ORDER BY u.i) AS o`
 
-// lockClaimKey takes a transaction-scoped advisory lock on (space, digest):
-// the mutual exclusion between pinning a claim and dropping the last one,
-// which read-committed snapshots alone do not give (a pin could see a claim
-// a concurrent drop is deleting, and the drop count could miss the
-// uncommitted pin). Callers taking several keys take them in digest order.
+// lockClaimKeys takes a transaction-scoped advisory lock on every (space,
+// digest) a commit's claims, pins and drops name, each once, in digest
+// order, in one statement: the mutual exclusion between pinning a claim and
+// dropping the last one, and between claiming a blob and starting its
+// release, which read-committed snapshots alone do not give (a pin could
+// see a claim a concurrent drop is deleting, and the drop count could miss
+// the uncommitted pin). One order for every commit, so two commits sharing
+// digests cannot deadlock on them. The arrays are sorted, and the
+// subquery's ORDER BY carries that order to the lock calls: SQL promises no
+// row order otherwise, and a subquery with an ORDER BY is not flattened, so
+// the outer scan reads it sorted and takes one lock per row in turn.
+func lockClaimKeys(ctx context.Context, tx pgx.Tx, c RootCommit) error {
+	type key struct {
+		space  did.DID
+		digest multihash.Multihash
+	}
+	var keys []key
+	for _, cl := range c.Claims {
+		keys = append(keys, key{cl.Space, cl.Digest})
+	}
+	for _, p := range c.Pins {
+		keys = append(keys, key{p.Space, p.Digest})
+	}
+	for _, d := range c.Drops {
+		keys = append(keys, key{d.Space, d.Digest})
+	}
+	if len(keys) == 0 {
+		return nil
+	}
+	slices.SortFunc(keys, func(a, b key) int {
+		if n := bytes.Compare(a.digest, b.digest); n != 0 {
+			return n
+		}
+		return strings.Compare(a.space.String(), b.space.String())
+	})
+	keys = slices.CompactFunc(keys, func(a, b key) bool {
+		return a.space == b.space && bytes.Equal(a.digest, b.digest)
+	})
+	spaces := make([]string, len(keys))
+	digests := make([][]byte, len(keys))
+	for i, k := range keys {
+		spaces[i], digests[i] = k.space.String(), k.digest
+	}
+	if _, err := tx.Exec(ctx, claimKeyLocksSQL, spaces, digests); err != nil {
+		return fmt.Errorf("registry: lock claim keys: %w", err)
+	}
+	return nil
+}
+
+// lockClaimKey takes a transaction-scoped advisory lock on (space, digest).
+// A commit takes its keys through lockClaimKeys; a release takes the one key
+// it works on (StartRelease, CancelRelease).
 func lockClaimKey(ctx context.Context, tx pgx.Tx, space did.DID, digest multihash.Multihash) error {
 	if _, err := tx.Exec(ctx,
 		`SELECT pg_advisory_xact_lock(hashtextextended($1 || ':' || encode($2, 'hex'), 0))`,
@@ -130,62 +159,83 @@ func lockClaimKey(ctx context.Context, tx pgx.Tx, space did.DID, digest multihas
 	return nil
 }
 
-func (r *Postgres) PinBlobClaims(ctx context.Context, claims []BlobClaim) (bool, error) {
-	if len(claims) == 0 {
-		return true, nil
-	}
-	sorted := slices.Clone(claims)
-	slices.SortFunc(sorted, func(a, b BlobClaim) int { return bytes.Compare(a.Digest, b.Digest) })
-	tx, err := r.pool.Begin(ctx)
+// pinClaim records one claim borrowed from another object of the space, in
+// the commit's transaction, under the claim key's lock, and refuses it with
+// ErrClaimGone when the space holds no claim on the digest (see
+// RootCommit.Pins).
+func pinClaim(ctx context.Context, tx pgx.Tx, c BlobClaim) error {
+	// Under the key's lock, the existence check and the insert see one
+	// state: a claim exists and the pin joins it, or none does and the
+	// whole commit is refused.
+	tag, err := tx.Exec(ctx,
+		`INSERT INTO ingot.blob_refs (digest, bucket, object_key, version_id, space)
+		 SELECT $1, $2, $3, $4, $5
+		 WHERE EXISTS (SELECT 1 FROM ingot.blob_refs WHERE space = $5 AND digest = $1)
+		 ON CONFLICT (digest, bucket, object_key, version_id) DO NOTHING`,
+		c.Digest, c.Bucket, c.ObjectKey, c.VersionID, c.Space)
 	if err != nil {
-		return false, fmt.Errorf("registry: begin pin blob claims: %w", err)
+		return fmt.Errorf("registry: pin blob claim: %w", err)
 	}
-	defer tx.Rollback(ctx)
-	for _, c := range sorted {
-		if err := lockClaimKey(ctx, tx, c.Space, c.Digest); err != nil {
-			return false, err
-		}
-		// Under the key's lock, the existence check and the insert see one
-		// state: a claim exists and the pin joins it, or none does and the
-		// whole pin is refused.
-		tag, err := tx.Exec(ctx,
-			`INSERT INTO ingot.blob_refs (digest, bucket, object_key, version_id, space)
-			 SELECT $1, $2, $3, $4, $5
-			 WHERE EXISTS (SELECT 1 FROM ingot.blob_refs WHERE space = $5 AND digest = $1)
-			 ON CONFLICT (digest, bucket, object_key, version_id) DO NOTHING`,
-			c.Digest, c.Bucket, c.ObjectKey, c.VersionID, c.Space)
-		if err != nil {
-			return false, fmt.Errorf("registry: pin blob claim: %w", err)
-		}
-		if tag.RowsAffected() == 1 {
-			continue
-		}
-		// Nothing inserted: no claim to pin to, or this claim is already
-		// recorded (the conflict arm).
-		var own int
-		if err := tx.QueryRow(ctx,
-			`SELECT count(*) FROM ingot.blob_refs
-			 WHERE digest = $1 AND bucket = $2 AND object_key = $3 AND version_id = $4`,
-			c.Digest, c.Bucket, c.ObjectKey, c.VersionID).Scan(&own); err != nil {
-			return false, fmt.Errorf("registry: pin blob claim lookup: %w", err)
-		}
-		if own == 0 {
-			return false, nil // rolled back by the deferred Rollback
-		}
+	if tag.RowsAffected() == 1 {
+		return nil
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return false, fmt.Errorf("registry: commit pin blob claims: %w", err)
+	// Nothing inserted: no claim to pin to, or this claim is already
+	// recorded (the conflict arm).
+	var own int
+	if err := tx.QueryRow(ctx,
+		`SELECT count(*) FROM ingot.blob_refs
+		 WHERE digest = $1 AND bucket = $2 AND object_key = $3 AND version_id = $4`,
+		c.Digest, c.Bucket, c.ObjectKey, c.VersionID).Scan(&own); err != nil {
+		return fmt.Errorf("registry: pin blob claim lookup: %w", err)
 	}
-	return true, nil
+	if own == 0 {
+		return ErrClaimGone // the commit rolls back
+	}
+	return nil
 }
 
-func (r *Postgres) DeleteBlobClaim(ctx context.Context, digest multihash.Multihash, bucket, objectKey, versionID string) error {
-	_, err := r.pool.Exec(ctx,
-		`DELETE FROM ingot.blob_refs
-		 WHERE digest = $1 AND bucket = $2 AND object_key = $3 AND version_id = $4`,
-		digest, bucket, objectKey, versionID)
-	if err != nil {
-		return fmt.Errorf("registry: delete blob claim: %w", err)
+// dropClaims deletes the discarded generations' claims, in the commit's
+// transaction, under the claim keys' locks (lockClaimKeys), and records a
+// release, due grace from now, for each digest the space holds no claim on
+// afterwards (see RootCommit.Drops). Set-based, as addClaims is: the
+// deletes are one statement and the remaining-claim checks and release
+// records another, however many blobs the discarded versions had, since
+// the bucket lock and the root row are held throughout.
+func dropClaims(ctx context.Context, tx pgx.Tx, drops []ClaimDrop, grace time.Duration) error {
+	if len(drops) == 0 {
+		return nil
+	}
+	n := len(drops)
+	digests := make([][]byte, n)
+	spaces := make([]string, n)
+	buckets := make([]string, n)
+	keys := make([]string, n)
+	versions := make([]string, n)
+	for i, d := range drops {
+		digests[i], spaces[i], buckets[i], keys[i], versions[i] = d.Digest, d.Space.String(), d.Bucket, d.ObjectKey, d.VersionID
+	}
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM ingot.blob_refs r
+		  USING unnest($1::bytea[], $2::text[], $3::text[], $4::text[]) AS u(d, b, k, v)
+		  WHERE r.digest = u.d AND r.bucket = u.b AND r.object_key = u.k AND r.version_id = u.v`,
+		digests, buckets, keys, versions); err != nil {
+		return fmt.Errorf("registry: drop claims: %w", err)
+	}
+	// One record per (space, digest) the space no longer claims; a record
+	// already there keeps the later not_before. The grace runs from the
+	// statement's clock, not the transaction's start (now()): the swap may
+	// have waited on the bucket row or the claim-key locks since, and a
+	// reader that resolved the discarded version meanwhile is owed the
+	// whole grace from the commit.
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO ingot.blob_release_intents (space, digest, not_before)
+		 SELECT u.s, u.d, clock_timestamp() + make_interval(secs => $3)
+		   FROM (SELECT DISTINCT s, d FROM unnest($1::text[], $2::bytea[]) AS u(s, d)) u
+		  WHERE NOT EXISTS (SELECT 1 FROM ingot.blob_refs r WHERE r.space = u.s AND r.digest = u.d)
+		 ON CONFLICT (space, digest)
+		 DO UPDATE SET not_before = GREATEST(ingot.blob_release_intents.not_before, EXCLUDED.not_before)`,
+		spaces, digests, grace.Seconds()); err != nil {
+		return fmt.Errorf("registry: enqueue releases: %w", err)
 	}
 	return nil
 }
@@ -199,48 +249,6 @@ func (r *Postgres) CountClaims(ctx context.Context, space did.DID, digest multih
 		return 0, fmt.Errorf("registry: count claims: %w", err)
 	}
 	return n, nil
-}
-
-func (r *Postgres) DropClaimEnqueueRelease(ctx context.Context, digest multihash.Multihash, bucket, objectKey, versionID string, space did.DID, notBefore time.Time) (bool, error) {
-	tx, err := r.pool.Begin(ctx)
-	if err != nil {
-		return false, fmt.Errorf("registry: begin drop claim: %w", err)
-	}
-	defer tx.Rollback(ctx)
-
-	// Excludes a concurrent pin of the digest (PinBlobClaims): the count
-	// below then sees a committed pin, or the pin finds no claim.
-	if err := lockClaimKey(ctx, tx, space, digest); err != nil {
-		return false, err
-	}
-	if _, err := tx.Exec(ctx,
-		`DELETE FROM ingot.blob_refs
-		 WHERE digest = $1 AND bucket = $2 AND object_key = $3 AND version_id = $4`,
-		digest, bucket, objectKey, versionID); err != nil {
-		return false, fmt.Errorf("registry: drop claim: %w", err)
-	}
-	var n int
-	if err := tx.QueryRow(ctx,
-		`SELECT count(*) FROM ingot.blob_refs WHERE space = $1 AND digest = $2`,
-		space, digest).Scan(&n); err != nil {
-		return false, fmt.Errorf("registry: drop claim count: %w", err)
-	}
-	enqueued := false
-	if n == 0 {
-		if _, err := tx.Exec(ctx,
-			`INSERT INTO ingot.blob_release_intents (space, digest, not_before)
-			 VALUES ($1, $2, $3)
-			 ON CONFLICT (space, digest)
-			 DO UPDATE SET not_before = GREATEST(ingot.blob_release_intents.not_before, EXCLUDED.not_before)`,
-			space, digest, notBefore); err != nil {
-			return false, fmt.Errorf("registry: enqueue release: %w", err)
-		}
-		enqueued = true
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return false, fmt.Errorf("registry: commit drop claim: %w", err)
-	}
-	return enqueued, nil
 }
 
 // PendingReleaseStore =========================================================
@@ -1168,16 +1176,33 @@ func (r *Postgres) DeleteSession(ctx context.Context, uploadID string) error {
 	return nil
 }
 
-func (r *Postgres) PutPart(ctx context.Context, p MultipartPart, tree *PartTree) error {
+func (r *Postgres) PutPart(ctx context.Context, p MultipartPart, tree *PartTree) ([]PendingRelease, error) {
 	state := p.State
 	if state == "" {
 		state = PartSpooled
 	}
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("registry: put part: begin: %w", err)
+		return nil, fmt.Errorf("registry: put part: begin: %w", err)
 	}
 	defer tx.Rollback(ctx)
+	// Writes of one part number are serialised on a transaction-scoped
+	// advisory lock, so the row read here is the one the upsert below
+	// replaces. Read committed alone does not give that: two writes of the
+	// same part number can both read before either lands, and the second's
+	// upsert then replaces the first's row without reporting it. The lock
+	// is keyed by the upload and the part number, in the two-key lock space,
+	// apart from the claim-key locks; a hash collision serialises two
+	// unrelated writes, nothing worse.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1), $2::int)`, p.UploadID, p.PartNumber); err != nil {
+		return nil, fmt.Errorf("registry: put part: lock: %w", err)
+	}
+	var replaced []multihash.Multihash
+	if err := tx.QueryRow(ctx,
+		`SELECT blob_digests FROM ingot.multipart_parts WHERE upload_id = $1 AND part_number = $2`,
+		p.UploadID, p.PartNumber).Scan(&replaced); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("registry: put part: read replaced: %w", err)
+	}
 	// BlobDigests ([]multihash.Multihash) rides pgx's underlying-type plan into
 	// bytea[]: pgx must try that plan before its Stringer plan, or a Multihash
 	// (whose String() is base58) would land as text — pgx v5.10+ orders them
@@ -1199,10 +1224,10 @@ func (r *Postgres) PutPart(ctx context.Context, p MultipartPart, tree *PartTree)
 		       blob_digests = EXCLUDED.blob_digests, span_lengths = EXCLUDED.span_lengths, state = EXCLUDED.state`,
 		p.UploadID, p.PartNumber, p.ETagMD5, p.Size, p.Checksum, p.BlobDigests, p.SpanLengths, state, SessionOpen)
 	if err != nil {
-		return fmt.Errorf("registry: put part: %w", err)
+		return nil, fmt.Errorf("registry: put part: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
-		return ErrNotFound
+		return nil, ErrNotFound
 	}
 	// The tree row follows the part row: a superseding part without a tree
 	// must not keep its predecessor's.
@@ -1218,12 +1243,69 @@ func (r *Postgres) PutPart(ctx context.Context, p MultipartPart, tree *PartTree)
 		_, err = tx.Exec(ctx, `DELETE FROM ingot.multipart_part_trees WHERE upload_id = $1 AND part_number = $2`, p.UploadID, p.PartNumber)
 	}
 	if err != nil {
-		return fmt.Errorf("registry: put part tree: %w", err)
+		return nil, fmt.Errorf("registry: put part tree: %w", err)
+	}
+	// The replaced row's blobs this part does not name lose their last part
+	// reference with this write; their releases are recorded with it, each
+	// digest once (ON CONFLICT DO UPDATE cannot touch one row twice), due
+	// now (a part blob was never readable through the catalog, so no reader
+	// grace is owed). The session's space is the release's.
+	var released []PendingRelease
+	if dropped := digestsDropped(replaced, p.BlobDigests); len(dropped) > 0 {
+		rows, err := tx.Query(ctx,
+			`INSERT INTO ingot.blob_release_intents (space, digest, not_before)
+			 SELECT s.space, unnest($2::bytea[]), now()
+			   FROM ingot.multipart_sessions s
+			  WHERE s.upload_id = $1
+			 ON CONFLICT (space, digest)
+			 DO UPDATE SET not_before = GREATEST(ingot.blob_release_intents.not_before, EXCLUDED.not_before)
+			 RETURNING space, digest, not_before`,
+			p.UploadID, dropped)
+		if err != nil {
+			return nil, fmt.Errorf("registry: put part: record releases: %w", err)
+		}
+		for rows.Next() {
+			var spaceStr string
+			var digest []byte
+			pr := PendingRelease{}
+			if err := rows.Scan(&spaceStr, &digest, &pr.NotBefore); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("registry: put part: scan release: %w", err)
+			}
+			if pr.Space, err = did.Parse(spaceStr); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("registry: put part: release space: %w", err)
+			}
+			pr.Digest = multihash.Multihash(digest)
+			released = append(released, pr)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("registry: put part: record releases: %w", err)
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("registry: put part: commit: %w", err)
+		return nil, fmt.Errorf("registry: put part: commit: %w", err)
 	}
-	return nil
+	return released, nil
+}
+
+// digestsDropped returns the digests of replaced that kept does not name,
+// each once, in the form the bytea[] parameter takes.
+func digestsDropped(replaced, kept []multihash.Multihash) [][]byte {
+	skip := make(map[string]bool, len(kept))
+	for _, d := range kept {
+		skip[string(d)] = true
+	}
+	var out [][]byte
+	for _, d := range replaced {
+		if skip[string(d)] {
+			continue
+		}
+		skip[string(d)] = true
+		out = append(out, []byte(d))
+	}
+	return out
 }
 
 func (r *Postgres) MoveParts(ctx context.Context, parts []MultipartPart, from, to string) (int, error) {
@@ -1728,6 +1810,37 @@ func (r *Postgres) StartRelease(ctx context.Context, space did.DID, digest multi
 		return 0, fmt.Errorf("registry: commit start release: %w", err)
 	}
 	return ReleaseStarted, nil
+}
+
+func (r *Postgres) GetRelease(ctx context.Context, space did.DID, digest multihash.Multihash) (*PendingRelease, error) {
+	// Read under the claim-key lock, in a transaction of its own that
+	// changes nothing: a StartRelease in flight holds the lock until it
+	// commits, so the record read here is pending only if no release of it
+	// has started. A plain read could see a record a start is about to
+	// commit, and let a write reuse a blob the release then removes.
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("registry: get release: begin: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	if err := lockClaimKey(ctx, tx, space, digest); err != nil {
+		return nil, err
+	}
+	pr := PendingRelease{Space: space, Digest: multihash.Multihash(bytes.Clone(digest))}
+	var started *time.Time
+	err = tx.QueryRow(ctx,
+		`SELECT not_before, started_at FROM ingot.blob_release_intents WHERE space = $1 AND digest = $2`,
+		space, digest).Scan(&pr.NotBefore, &started)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("registry: get release: %w", err)
+	}
+	if started != nil {
+		pr.StartedAt = *started
+	}
+	return &pr, nil
 }
 
 func (r *Postgres) ReleasingDigests(ctx context.Context, space did.DID, digests []multihash.Multihash) (map[string]bool, error) {

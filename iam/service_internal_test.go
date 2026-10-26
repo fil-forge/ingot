@@ -2,10 +2,13 @@ package iam
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -91,6 +94,40 @@ func signedCopy(t *testing.T, host, dstBucket, srcBucket, accessKeyID, secret st
 		headers["X-Amz-Copy-Source"] = source
 	}
 	return s3.Request{Method: http.MethodPut, Headers: headers, URL: req.URL.RequestURI()}
+}
+
+// signedWrite builds a real SigV4-signed PUT of path carrying headers. With
+// sign set the headers are among the signed headers, as the SDKs sign every
+// x-amz-* header present; without it they are added after signing, the
+// hand-rolled request the fast path must leave to Hilt.
+func signedWrite(t *testing.T, host, path, accessKeyID, secret string, headers map[string]string, sign bool) s3.Request {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPut, "http://"+host+path, nil)
+	require.NoError(t, err)
+	req.Header.Set("X-Amz-Content-Sha256", "UNSIGNED-PAYLOAD")
+	signed := []string{"host", "x-amz-content-sha256", "x-amz-date"}
+	if sign {
+		for k, v := range headers {
+			req.Header.Set(k, v)
+			signed = append(signed, strings.ToLower(k))
+		}
+	}
+	_, err = v4.NewSigner().SignHTTP(context.Background(),
+		awsv4.Credentials{AccessKeyID: accessKeyID, SecretAccessKey: secret},
+		req, "UNSIGNED-PAYLOAD", "s3", "us-east-1", time.Now(), signed,
+		func(o *v4.SignerOptions) { o.DisableURIPathEscaping = true })
+	require.NoError(t, err)
+
+	out := map[string]string{"Host": host}
+	for k := range req.Header {
+		out[k] = req.Header.Get(k)
+	}
+	if !sign {
+		for k, v := range headers {
+			out[k] = v
+		}
+	}
+	return s3.Request{Method: http.MethodPut, Headers: out, URL: req.URL.RequestURI()}
 }
 
 // mapResolver returns the bucket→space mapping for several buckets.
@@ -441,6 +478,105 @@ func signedRequest(t *testing.T, method, host, rawPath, accessKeyID, secret stri
 	return s3.Request{Method: method, Headers: headers, URL: req.URL.RequestURI()}
 }
 
+// signedBody builds a real SigV4-signed POST of body to path with the payload
+// hash signed, as the SDKs sign a DeleteObjects, and attaches the body.
+func signedBody(t *testing.T, host, path, accessKeyID, secret, body string) s3.Request {
+	t.Helper()
+	sum := sha256.Sum256([]byte(body))
+	payloadHash := hex.EncodeToString(sum[:])
+	req, err := http.NewRequest(http.MethodPost, "http://"+host+path, strings.NewReader(body))
+	require.NoError(t, err)
+	req.Header.Set("X-Amz-Content-Sha256", payloadHash)
+	_, err = v4.NewSigner().SignHTTP(context.Background(),
+		awsv4.Credentials{AccessKeyID: accessKeyID, SecretAccessKey: secret},
+		req, payloadHash, "s3", "us-east-1", time.Now(),
+		[]string{"host", "x-amz-content-sha256", "x-amz-date"},
+		func(o *v4.SignerOptions) { o.DisableURIPathEscaping = true })
+	require.NoError(t, err)
+	headers := map[string]string{"Host": host}
+	for k := range req.Header {
+		headers[k] = req.Header.Get(k)
+	}
+	return s3.Request{Method: http.MethodPost, Headers: headers, URL: req.URL.RequestURI(), Body: []byte(body)}
+}
+
+// TestDeleteOnlyKeyIsDeniedOnVersions covers the body the fast path decides
+// on: a DeleteObjects entry naming a version needs s3:DeleteObjectVersion,
+// which Hilt's classifier reads from the body once the signature binds it.
+// A key whose cached set holds s3:DeleteObject alone is refused locally,
+// and a tampered body is left to Hilt.
+func TestDeleteOnlyKeyIsDeniedOnVersions(t *testing.T) {
+	accessKey, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	spaceIssuer, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	agent, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+
+	accessKeyID := accessKey.DID().Identifier()
+	const secret = "test-secret-access-key"
+	space := spaceIssuer.DID()
+	resolver := fixedResolver{name: "bkt", state: &registry.State{Name: "bkt", Space: space}}
+
+	service := func(t *testing.T, req s3.Request, actions ...string) *Service {
+		t.Helper()
+		sr, err := sigv4.Parse(sigv4.Request{Method: req.Method, Headers: req.Headers, URL: req.URL})
+		require.NoError(t, err)
+		key, err := sigv4.DeriveKey(sr, secret)
+		require.NoError(t, err)
+		s := localService(agent.DID(), resolver)
+		s.keys.Put(accessKeyID, time.Hour, s3.VerificationKey{Kind: s3.KeyKindSigV4, Data: key})
+		s.proofs.For(accessKey.DID()).PutPermissions(space, time.Hour, actions)
+		for _, a := range actions {
+			s.proofs.Deposit(accessKey.DID(), commandChains(t, spaceIssuer, accessKey, agent, s3perm.CommandsFor(a))...)
+		}
+		return s
+	}
+	const versions = `<Delete><Object><Key>a</Key></Object><Object><Key>b</Key><VersionId>v1</VersionId></Object></Delete>`
+	const plain = `<Delete><Object><Key>a</Key></Object></Delete>`
+
+	t.Run("a version entry is refused on the cached set", func(t *testing.T) {
+		req := signedBody(t, "s3.example", "/bkt?delete", accessKeyID, secret, versions)
+		op, reqs, err := hiltauth.RequirementsFor(req)
+		require.NoError(t, err)
+		require.Equal(t, hiltauth.OpDeleteObjects, op)
+		require.Len(t, reqs, 2)
+
+		s := service(t, req, "s3:DeleteObject")
+		_, ok, err := s.authorizeLocal(context.Background(), req, accessKeyID, s.proofs.For(accessKey.DID()))
+		require.False(t, ok)
+		require.Equal(t, s3err.GetAPIError(s3err.ErrAccessDenied), err)
+		require.Zero(t, s.authorizer.(*refusingAuthorizer).calls)
+	})
+
+	t.Run("plain entries are still authorized", func(t *testing.T) {
+		req := signedBody(t, "s3.example", "/bkt?delete", accessKeyID, secret, plain)
+		s := service(t, req, "s3:DeleteObject")
+		_, ok, err := s.authorizeLocal(context.Background(), req, accessKeyID, s.proofs.For(accessKey.DID()))
+		require.NoError(t, err)
+		require.True(t, ok)
+	})
+
+	t.Run("the version permission authorizes the batch", func(t *testing.T) {
+		req := signedBody(t, "s3.example", "/bkt?delete", accessKeyID, secret, versions)
+		s := service(t, req, "s3:DeleteObject", "s3:DeleteObjectVersion")
+		_, ok, err := s.authorizeLocal(context.Background(), req, accessKeyID, s.proofs.For(accessKey.DID()))
+		require.NoError(t, err)
+		require.True(t, ok)
+	})
+
+	t.Run("a body the signature does not bind is left to Hilt", func(t *testing.T) {
+		req := signedBody(t, "s3.example", "/bkt?delete", accessKeyID, secret, plain)
+		req.Body = []byte(versions)
+		_, _, err := hiltauth.RequirementsFor(req)
+		require.ErrorIs(t, err, hiltauth.ErrInvalidBody)
+		s := service(t, req, "s3:DeleteObject", "s3:DeleteObjectVersion")
+		_, ok, err := s.authorizeLocal(context.Background(), req, accessKeyID, s.proofs.For(accessKey.DID()))
+		require.False(t, ok)
+		require.NoError(t, err)
+	})
+}
+
 // TestPutOnlyKeyIsDeniedOnReads pins the defect the action set closes: a key
 // granted only s3:PutObject holds chains for every command a read, a listing
 // or a multipart abort needs (PutObject's command set is a superset of each),
@@ -493,6 +629,37 @@ func TestPutOnlyKeyIsDeniedOnReads(t *testing.T) {
 			require.Zero(t, s.authorizer.(*refusingAuthorizer).calls)
 		})
 	}
+
+	t.Run("a lock header on the put is refused on the cached set", func(t *testing.T) {
+		// Setting a retention period through the header needs
+		// s3:PutObjectRetention beside the put; the set lacks it, so the
+		// fast path refuses as Hilt would, without asking.
+		lock := map[string]string{"X-Amz-Object-Lock-Mode": "GOVERNANCE"}
+		req := signedWrite(t, "s3.example", "/bkt/obj", accessKeyID, secret, lock, true)
+		op, _, err := hiltauth.RequirementsFor(req)
+		require.NoError(t, err)
+		require.Equal(t, hiltauth.OpPutObject, op)
+
+		s := service(t, req)
+		_, ok, err := s.authorizeLocal(context.Background(), req, accessKeyID, s.proofs.For(accessKey.DID()))
+		require.False(t, ok)
+		require.Equal(t, s3err.GetAPIError(s3err.ErrAccessDenied), err)
+		require.Zero(t, s.authorizer.(*refusingAuthorizer).calls)
+	})
+
+	t.Run("an unsigned lock header is left to Hilt", func(t *testing.T) {
+		// The header is present but outside SignedHeaders, so Hilt's
+		// classifier refuses it and nothing is decided locally: Hilt
+		// answers the request with the same refusal.
+		lock := map[string]string{"X-Amz-Object-Lock-Mode": "GOVERNANCE"}
+		req := signedWrite(t, "s3.example", "/bkt/obj", accessKeyID, secret, lock, false)
+		_, _, err := hiltauth.RequirementsFor(req)
+		require.ErrorIs(t, err, hiltauth.ErrUnsignedHeader)
+		s := service(t, req)
+		_, ok, err := s.authorizeLocal(context.Background(), req, accessKeyID, s.proofs.For(accessKey.DID()))
+		require.False(t, ok)
+		require.NoError(t, err)
+	})
 
 	t.Run("PutObject is still authorized", func(t *testing.T) {
 		req := signedRequest(t, http.MethodPut, "s3.example", "/bkt/obj", accessKeyID, secret, now)
@@ -614,7 +781,8 @@ func TestMapAuthError(t *testing.T) {
 		hiltauth.OperationNotPermittedErrorName:  {"AccessDenied", 403},
 		hiltauth.BucketNotPermittedErrorName:     {"AccessDenied", 403},
 		hiltauth.ForeignBucketErrorName:          {"AccessDenied", 403},
-		hiltauth.UnsignedCopySourceErrorName:     {"AccessDenied", 403},
+		hiltauth.UnsignedHeaderErrorName:         {"AccessDenied", 403},
+		hiltauth.InvalidBodyErrorName:            {"AccessDenied", 403},
 		hiltauth.TemporarilyUnavailableErrorName: {"ServiceUnavailable", 503},
 		s3bkt.InvalidPolicyErrorName:             {"MalformedPolicy", 400},
 	}

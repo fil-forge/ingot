@@ -28,6 +28,10 @@ type fakeMeta struct {
 	nextSeq  uint64
 	segments map[uint64]*SegmentMeta
 	shipped  []shipEvent // order of MarkSegmentShipped calls
+	// failShips is how many of the next MarkSegmentShipped calls fail, and
+	// onShipFail, if set, is called with each failed call's seq.
+	failShips  int
+	onShipFail func(seq uint64)
 }
 
 type shipEvent struct {
@@ -79,6 +83,13 @@ func (f *fakeMeta) MarkSegmentSealed(_ context.Context, plane blockstore.Plane, 
 func (f *fakeMeta) MarkSegmentShipped(_ context.Context, plane blockstore.Plane, seq uint64, shippedAt int64, indexDigest multihash.Multihash, opRoots []blockstore.OpRoot) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.failShips > 0 {
+		f.failShips--
+		if f.onShipFail != nil {
+			f.onShipFail(seq)
+		}
+		return fmt.Errorf("fake: ship of seq %d failed", seq)
+	}
 	m, ok := f.segments[seq]
 	if !ok {
 		return fmt.Errorf("fake: ship missing seq %d", seq)
@@ -203,7 +214,7 @@ func TestAppendThenGetSameProcess(t *testing.T) {
 
 	blk := makeBlock(t, []byte("hello world"))
 	root := makeRoot(t, "alpha")
-	if err := s.AppendBatch(context.Background(), []block.Block{blk}, blockstore.OpRoot{Bucket: "bk", Root: root}); err != nil {
+	if _, err := s.AppendBatch(context.Background(), []block.Block{blk}, blockstore.OpRoot{Bucket: "bk", Root: root}); err != nil {
 		t.Fatalf("AppendBatch: %v", err)
 	}
 
@@ -227,7 +238,7 @@ func TestSealBySize(t *testing.T) {
 	}
 	for i := 0; i < 6; i++ {
 		blk := makeBlock(t, append([]byte(fmt.Sprintf("rec-%02d-", i)), payload...))
-		if err := s.AppendBatch(context.Background(), []block.Block{blk}, blockstore.OpRoot{
+		if _, err := s.AppendBatch(context.Background(), []block.Block{blk}, blockstore.OpRoot{
 			Bucket: "bk",
 			Root:   makeRoot(t, fmt.Sprintf("size-%d", i)),
 		}); err != nil {
@@ -265,7 +276,7 @@ func TestSealByAge(t *testing.T) {
 	s, _, flushes := newTestStore(t, 1<<30, 80*time.Millisecond, 6)
 
 	blk := makeBlock(t, []byte("age-trigger"))
-	if err := s.AppendBatch(context.Background(), []block.Block{blk}, blockstore.OpRoot{
+	if _, err := s.AppendBatch(context.Background(), []block.Block{blk}, blockstore.OpRoot{
 		Bucket: "bk",
 		Root:   makeRoot(t, "age"),
 	}); err != nil {
@@ -296,7 +307,7 @@ func TestRetentionDropsOldFlushed(t *testing.T) {
 			payload[j] = byte(i)
 		}
 		blk := makeBlock(t, append([]byte(fmt.Sprintf("retain-%02d-", i)), payload...))
-		if err := s.AppendBatch(context.Background(), []block.Block{blk}, blockstore.OpRoot{
+		if _, err := s.AppendBatch(context.Background(), []block.Block{blk}, blockstore.OpRoot{
 			Bucket: "bk",
 			Root:   makeRoot(t, fmt.Sprintf("ret-%d", i)),
 		}); err != nil {
@@ -349,7 +360,7 @@ func TestForceSealRecoveredOpenOnRestart(t *testing.T) {
 
 	s := openStore()
 	blk := makeBlock(t, []byte("survives-restart"))
-	if err := s.AppendBatch(context.Background(), []block.Block{blk}, blockstore.OpRoot{
+	if _, err := s.AppendBatch(context.Background(), []block.Block{blk}, blockstore.OpRoot{
 		Bucket: "bk",
 		Root:   makeRoot(t, "survive"),
 	}); err != nil {
@@ -380,10 +391,10 @@ func TestForceSealRecoveredOpenOnRestart(t *testing.T) {
 func TestAppendBatchEmptyBlocksAccepted(t *testing.T) {
 	s, _, _ := newTestStore(t, 64<<20, 5*time.Second, 6)
 	root := makeRoot(t, "x")
-	if err := s.AppendBatch(context.Background(), nil, blockstore.OpRoot{Bucket: "bk", Root: root}); err != nil {
+	if _, err := s.AppendBatch(context.Background(), nil, blockstore.OpRoot{Bucket: "bk", Root: root}); err != nil {
 		t.Fatalf("empty blocks with defined root should succeed, got %v", err)
 	}
-	if err := s.AppendBatch(context.Background(), []block.Block{makeBlock(t, []byte("x"))}, blockstore.OpRoot{Bucket: "bk"}); err == nil {
+	if _, err := s.AppendBatch(context.Background(), []block.Block{makeBlock(t, []byte("x"))}, blockstore.OpRoot{Bucket: "bk"}); err == nil {
 		t.Fatalf("expected error on undefined root")
 	}
 }
@@ -410,7 +421,7 @@ func TestAppendBatchDedupesAcrossOps(t *testing.T) {
 	uniqB := makeBlock(t, []byte("unique-B"))
 
 	// First batch: shared + uniqA.
-	if err := s.AppendBatch(context.Background(),
+	if _, err := s.AppendBatch(context.Background(),
 		[]block.Block{shared, uniqA},
 		blockstore.OpRoot{Bucket: "bk", Root: makeRoot(t, "op-a")},
 	); err != nil {
@@ -423,7 +434,7 @@ func TestAppendBatchDedupesAcrossOps(t *testing.T) {
 	s.catalog.catMu.RUnlock()
 
 	// Second batch: shared (duplicate of first batch) + uniqB.
-	if err := s.AppendBatch(context.Background(),
+	if _, err := s.AppendBatch(context.Background(),
 		[]block.Block{shared, uniqB},
 		blockstore.OpRoot{Bucket: "bk", Root: makeRoot(t, "op-b")},
 	); err != nil {
@@ -467,7 +478,7 @@ func TestAppendBatchAllDuplicatesStillRecordsOpRoot(t *testing.T) {
 
 	blk := makeBlock(t, []byte("only-block"))
 
-	if err := s.AppendBatch(context.Background(), []block.Block{blk}, blockstore.OpRoot{
+	if _, err := s.AppendBatch(context.Background(), []block.Block{blk}, blockstore.OpRoot{
 		Bucket: "bk", Root: makeRoot(t, "first"),
 	}); err != nil {
 		t.Fatalf("first append: %v", err)
@@ -477,7 +488,7 @@ func TestAppendBatchAllDuplicatesStillRecordsOpRoot(t *testing.T) {
 	opRootsBefore := len(s.catalog.open.OpRoots())
 	s.catalog.catMu.RUnlock()
 
-	if err := s.AppendBatch(context.Background(), []block.Block{blk}, blockstore.OpRoot{
+	if _, err := s.AppendBatch(context.Background(), []block.Block{blk}, blockstore.OpRoot{
 		Bucket: "bk", Root: makeRoot(t, "second"),
 	}); err != nil {
 		t.Fatalf("dup append: %v", err)
@@ -495,10 +506,72 @@ func TestAppendBatchAllDuplicatesStillRecordsOpRoot(t *testing.T) {
 	}
 }
 
+// TestFailedShipStampRetriedWithoutReshipping checks that a segment whose
+// ship succeeded but whose MarkSegmentShipped failed is stamped again
+// without being shipped again, and doesn't count as shipped until then:
+// retention retires shipped segments, and would drop this one's row while
+// its journal rows, which only the stamp deletes, stayed behind.
+func TestFailedShipStampRetriedWithoutReshipping(t *testing.T) {
+	s, meta, flushes := newTestStore(t, 64, 50*time.Millisecond, 1)
+	stampFailed := make(chan uint64, 1)
+	meta.mu.Lock()
+	meta.failShips = 1
+	meta.onShipFail = func(seq uint64) { stampFailed <- seq }
+	meta.mu.Unlock()
+
+	blk := makeBlock(t, append([]byte("stamp-"), make([]byte, 80)...))
+	seq, err := s.AppendBatch(context.Background(), []block.Block{blk},
+		blockstore.OpRoot{Bucket: "bk", Root: makeRoot(t, "stamp")})
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+
+	// Between the failed stamp and its retry, a backoff away, the segment
+	// must not count as shipped.
+	select {
+	case failed := <-stampFailed:
+		if failed != seq {
+			t.Fatalf("stamp failed for seq %d, want %d", failed, seq)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the stamp never failed")
+	}
+	s.catalog.catMu.RLock()
+	for _, sealed := range s.catalog.sealed {
+		if sealed.Seq() == seq && sealed.IsShipped() {
+			s.catalog.catMu.RUnlock()
+			t.Fatalf("segment %d counts as shipped while its stamp is failing", seq)
+		}
+	}
+	s.catalog.catMu.RUnlock()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		meta.mu.Lock()
+		shipped := len(meta.shipped)
+		meta.mu.Unlock()
+		if shipped > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("segment %d was never stamped shipped", seq)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if got := flushes.load(); got != 1 {
+		t.Fatalf("segment shipped %d times, want 1", got)
+	}
+	meta.mu.Lock()
+	defer meta.mu.Unlock()
+	if m, ok := meta.segments[seq]; !ok || m.ShippedAt == 0 {
+		t.Fatalf("segment %d row = %+v (present %v), want stamped shipped", seq, m, ok)
+	}
+}
+
 // TestCatalogNeverShips covers the standalone-mode permutation: a catalog
 // plane configured never to ship keeps its CARs on local disk indefinitely
-// (the sole durable copy and the source for every read), and its shipped_at
-// never advances (so forge_root_cid never advances).
+// (the source for every read), and its shipped_at never advances (so
+// forge_root_cid never advances).
 func TestCatalogNeverShips(t *testing.T) {
 	dir := t.TempDir()
 	meta := newFakeMeta()
@@ -529,7 +602,7 @@ func TestCatalogNeverShips(t *testing.T) {
 	for i := 0; i < n; i++ {
 		c := makeBlock(t, []byte(fmt.Sprintf("cat-%02d", i)))
 		blocks = append(blocks, c)
-		if err := s.AppendBatch(context.Background(), []block.Block{c},
+		if _, err := s.AppendBatch(context.Background(), []block.Block{c},
 			blockstore.OpRoot{Bucket: "bk", Root: c.Cid()},
 		); err != nil {
 			t.Fatalf("append %d: %v", i, err)
@@ -584,4 +657,174 @@ func readSegmentSeqs(dir, plane string) ([]string, error) {
 		out = append(out, filepath.Base(m))
 	}
 	return out, nil
+}
+
+// shortShipBackoff shortens the queued ship's backoff for one test, restoring
+// it after the test's stores have closed.
+func shortShipBackoff(t *testing.T) {
+	t.Helper()
+	prev := shipBackoff
+	shipBackoff = time.Millisecond
+	t.Cleanup(func() { shipBackoff = prev })
+}
+
+// TestExhaustedShipRetriedBySweep checks that a segment whose queued ship ran
+// out of attempts isn't left until a restart: the retry sweep keeps trying
+// it, and it ships once the upload service is back.
+func TestExhaustedShipRetriedBySweep(t *testing.T) {
+	shortShipBackoff(t)
+	var down atomic.Bool
+	down.Store(true)
+	var attempts atomicCounter
+	meta := newFakeMeta()
+	s, err := Open(context.Background(), Config{
+		Dir:  t.TempDir(),
+		Meta: meta,
+		Catalog: PlaneConfig{SealBytes: 64, SealAge: 50 * time.Millisecond, Ship: true, ShipRetry: 50 * time.Millisecond,
+			Flush: func(context.Context, *Segment) (multihash.Multihash, error) {
+				attempts.add(1)
+				if down.Load() {
+					return nil, errors.New("upload service down")
+				}
+				return nil, nil
+			}},
+		Logger: zaptest.NewLogger(t),
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close(context.Background()) })
+
+	blk := makeBlock(t, append([]byte("sweep-"), make([]byte, 80)...))
+	if _, err := s.AppendBatch(context.Background(), []block.Block{blk},
+		blockstore.OpRoot{Bucket: "bk", Root: makeRoot(t, "sweep")}); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	waitFor(t, "the queued ship's attempts and a sweep's", func() bool {
+		return attempts.load() > queuedShipAttempts
+	})
+	down.Store(false)
+	waitFor(t, "the segment to ship", func() bool {
+		meta.mu.Lock()
+		defer meta.mu.Unlock()
+		return len(meta.shipped) == 1
+	})
+}
+
+// TestRetrySweepOldestFirst checks the sweep's order and its stop: it tries
+// the oldest unshipped segment first, stops at the first that fails, and
+// once ships succeed, ships them all in seq order.
+func TestRetrySweepOldestFirst(t *testing.T) {
+	shortShipBackoff(t)
+	var down atomic.Bool
+	down.Store(true)
+	var mu sync.Mutex
+	var tried []uint64
+	meta := newFakeMeta()
+	s, err := Open(context.Background(), Config{
+		Dir:  t.TempDir(),
+		Meta: meta,
+		// No sweep runs on its own (the first lands at a random point within
+		// ShipRetry): the test runs them.
+		Catalog: PlaneConfig{SealBytes: 64, SealAge: time.Hour, Ship: true, ShipRetry: 1000 * time.Hour,
+			Flush: func(_ context.Context, seg *Segment) (multihash.Multihash, error) {
+				mu.Lock()
+				tried = append(tried, seg.Seq())
+				mu.Unlock()
+				if down.Load() {
+					return nil, errors.New("upload service down")
+				}
+				return nil, nil
+			}},
+		Logger: zaptest.NewLogger(t),
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close(context.Background()) })
+
+	// distinct returns the seqs tried so far, in ascending order.
+	distinct := func() []uint64 {
+		mu.Lock()
+		defer mu.Unlock()
+		var out []uint64
+		for _, seq := range tried {
+			if !slices.Contains(out, seq) {
+				out = append(out, seq)
+			}
+		}
+		slices.Sort(out)
+		return out
+	}
+	// Each batch is over SealBytes, so it seals its segment; waiting for
+	// that segment's ship keeps the next batch out of it.
+	for i := 0; i < 3; i++ {
+		blk := makeBlock(t, append([]byte(fmt.Sprintf("order-%d-", i)), make([]byte, 80)...))
+		if _, err := s.AppendBatch(context.Background(), []block.Block{blk},
+			blockstore.OpRoot{Bucket: "bk", Root: makeRoot(t, fmt.Sprintf("order-%d", i))}); err != nil {
+			t.Fatalf("append %d: %v", i, err)
+		}
+		waitFor(t, fmt.Sprintf("segment %d to seal and start shipping", i), func() bool {
+			return len(distinct()) == i+1
+		})
+	}
+	waitFor(t, "every queued ship to run out of attempts", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(tried) == 3*queuedShipAttempts
+	})
+	seqs := distinct()
+
+	s.catalog.retryUnshipped()
+	mu.Lock()
+	if n, last := len(tried), tried[len(tried)-1]; n != 3*queuedShipAttempts+1 || last != seqs[0] {
+		mu.Unlock()
+		t.Fatalf("a failing sweep made %d attempts, the last on seq %d; want one attempt, on the oldest (%d)",
+			n-3*queuedShipAttempts, last, seqs[0])
+	}
+	mu.Unlock()
+
+	down.Store(false)
+	s.catalog.retryUnshipped()
+	meta.mu.Lock()
+	shippedSeqs := make([]uint64, len(meta.shipped))
+	for i, ev := range meta.shipped {
+		shippedSeqs[i] = ev.seq
+	}
+	meta.mu.Unlock()
+	if !slices.Equal(shippedSeqs, seqs) {
+		t.Fatalf("shipped seqs %v, want %v in order", shippedSeqs, seqs)
+	}
+
+	// A segment the sweep has shipped may still be queued: shipping it from
+	// the queue again must not reach Flush.
+	mu.Lock()
+	before := len(tried)
+	mu.Unlock()
+	s.catalog.catMu.RLock()
+	shipped := s.catalog.sealed[0]
+	s.catalog.catMu.RUnlock()
+	if !shipped.IsShipped() {
+		t.Fatalf("segment %d not shipped", shipped.Seq())
+	}
+	if !s.catalog.flushOne(shipped, queuedShipAttempts) {
+		t.Fatalf("flushOne on shipped segment %d reported it unshipped", shipped.Seq())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(tried) != before {
+		t.Fatalf("shipped segment %d went to Flush again", shipped.Seq())
+	}
+}
+
+// waitFor polls cond until it holds, failing the test after a few seconds.
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }

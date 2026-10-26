@@ -15,8 +15,9 @@
 // Operations not implemented (lifecycle, etc.) inherit
 // ErrNotImplemented from the embedded backend.BackendUnsupported. The
 // few unsupported-by-default methods that versitygw nevertheless calls
-// on every request (GetBucketAcl, GetBucketCors) are stubbed in
-// bucket.go. The bucket policy operations forward to the bucket
+// on every request are answered: GetBucketAcl is stubbed in bucket.go,
+// and GetBucketCors (bucketcors.go) serves a bucket's own document or the
+// gateway-wide one. The bucket policy operations forward to the bucket
 // authority (policy.go), where GetBucketPolicy also answers versitygw's
 // own access checks without it. Object lock is implemented: the bucket configuration in
 // bucket.go, the per-version retention / legal-hold methods in
@@ -61,7 +62,6 @@ type Backend struct {
 	reg        registry.Registry
 	intents    registry.IntentStore
 	locations  registry.LocationStore
-	blobRefs   registry.BlobRefStore
 	gc         registry.GCStore
 	multipart  registry.MultipartStore
 	txns       *bucketop.Coordinator
@@ -139,6 +139,9 @@ type Backend struct {
 	multipartGauges  metric.Registration
 	parkedAgeSeconds atomic.Int64
 	parkedAgeKnown   atomic.Bool
+	// journalGauges is the registration of the catalog journal gauges (nil
+	// when not registered).
+	journalGauges metric.Registration
 	// regionKeys unwraps region-wrapped CEKs for the decrypting read path.
 	regionKeys regionkey.Provider
 	// tenantKeys yields the tenant wrap key each write encrypts to (the FEE
@@ -151,7 +154,8 @@ type Backend struct {
 	rehashBudget        int64
 	// cors is Deps.CORS marshalled once at construction — GetBucketCors
 	// is on the per-request path, so the document is built here rather
-	// than per call. Nil when CORS is disabled.
+	// than per call. It is the default for a bucket without a document of
+	// its own (bucketcors.go). Nil when CORS is disabled gateway-wide.
 	cors []byte
 }
 
@@ -166,9 +170,7 @@ type Deps struct {
 	Intents   registry.IntentStore
 	Locations registry.LocationStore
 
-	// BlobRefs is the reverse reference index (which versions reference each
-	// blob); GC records superseded MST/manifest CIDs. Same instance as Registry.
-	BlobRefs  registry.BlobRefStore
+	// GC records superseded MST/manifest CIDs. Same instance as Registry.
 	GC        registry.GCStore
 	Multipart registry.MultipartStore
 
@@ -185,6 +187,11 @@ type Deps struct {
 	// Both are required.
 	Spool *blockstore.Spool
 	Cache *blockstore.BlobCache
+
+	// Ships is the catalog log's ship uploader. Each commit hands it its
+	// request's proof store as the bucket space's ship authority
+	// (bucketop.Deps.Ships). Optional.
+	Ships bucketop.ShipAuthority
 
 	// Uploader makes each spooled body blob durable on Forge (allocate→PUT→
 	// accept) synchronously, before the manifest commits. Remover releases a
@@ -279,9 +286,10 @@ type Deps struct {
 	// needing more is refused with InvalidPartLayout.
 	RehashBudget int64
 
-	// CORS is the S3 CORS configuration GetBucketCors reports for every
-	// bucket, rendered from config by internal/cors. New marshals it once
-	// into the XML document the S3 API serves. Nil disables CORS.
+	// CORS is the S3 CORS configuration GetBucketCors reports for a bucket
+	// that has stored none of its own, rendered from config by
+	// internal/cors. New marshals it once into the XML document the S3 API
+	// serves. Nil disables CORS for such buckets.
 	CORS *auth.CORSConfiguration
 
 	// Logger is optional; defaults to zap.NewNop().
@@ -319,10 +327,9 @@ func New(d Deps) *Backend {
 		reg:             d.Registry,
 		intents:         d.Intents,
 		locations:       d.Locations,
-		blobRefs:        d.BlobRefs,
 		gc:              d.GC,
 		multipart:       d.Multipart,
-		txns:            bucketop.NewCoordinator(bucketop.Deps{Reg: d.Registry, Log: d.Log, Reads: d.Reads}),
+		txns:            bucketop.NewCoordinator(bucketop.Deps{Reg: d.Registry, Log: d.Log, Reads: d.Reads, Ships: d.Ships}),
 		log:             d.Log,
 		spool:           d.Spool,
 		cache:           d.Cache,
@@ -358,6 +365,7 @@ func New(d Deps) *Backend {
 	}
 	b.localBlobMetrics, b.localBlobGauges = newLocalBlobMetrics(mp, b, logger)
 	b.multipartMetrics, b.multipartGauges = newMultipartMetrics(mp, b, logger)
+	b.journalGauges = newJournalGauges(mp, b, logger)
 	return b
 }
 

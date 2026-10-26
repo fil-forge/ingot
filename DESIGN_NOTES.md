@@ -42,9 +42,10 @@ HTTP PUT of the bytes to the allocated piri, a concluded receipt, and the
 `/blob/accept` location commitment. Only then does the short per-bucket
 critical section run: allocate the version seq, write the manifest, splice
 the MST, fsync one `AppendBatch` of the new catalog blocks, and
-compare-and-swap the bucket root in Postgres. The reference index
-(`blob_refs`) reconciles after the commit, releasing superseded blobs whose
-claim count reaches zero. The full trace is the
+compare-and-swap the bucket root in Postgres, with the reference index
+(`blob_refs`) written in the swap's transaction: the version's claims land,
+superseded versions' claims drop, and a blob whose claim count reaches zero
+gets its release record. The full trace is the
 [PutObject diagram](./docs/diagrams.md#putobject-spool-and-upload-off-the-lock-commit-under-it).
 
 **Every body blob is encrypted at ingest** (the FilOne encryption design's
@@ -89,8 +90,8 @@ Rotation: Hilt replaces `#wrap` in place and archives the
 old key, so a write inside the cache TTL of a rotation still recovers.
 
 A `200` therefore means the body is durable and accepted on the network and
-the catalog mutation is fsynced locally; the catalog becomes durable on
-Forge through the background ship below.
+the catalog mutation is fsynced locally and journaled in Postgres; the
+catalog becomes durable on Forge through the background ship below.
 
 ## The catalog log
 
@@ -102,6 +103,12 @@ full lifecycle):
 
 - A successful `AppendBatch` (fsynced CAR plus `.ops` record) is what
   licenses the caller's bucket-root CAS.
+- **The unshipped catalog is journaled in Postgres**: the root swap's
+  transaction writes the batch's blocks to `ingot.catalog_journal` under the
+  segment `AppendBatch` reported, and shipping that segment deletes them. A
+  copy of Postgres (a standby, a restore) therefore holds every block its
+  roots need that this host's disk alone would otherwise hold. Rebuilding a
+  lost segment from the journal is not built yet.
 - **`forge_root_cid` advances only when a segment ships, and only guarded**:
   the update lands in the same transaction as the shipped stamp, and only
   where `buckets.root_cid` still equals the op-root.
@@ -233,8 +240,9 @@ OperationAborted, a 409; the latch reverts to `open` and the acceptor
 carries on. The AWS CLI and other botocore-based clients treat that 409 as
 final and abort the upload, so the 30 s wait is the margin before a client
 sees a failed upload. Complete lays out the object's byte ranges from the
-part rows' blob lengths and claims every blob in one transaction of four
-statements, however many blobs there are (`AddBlobClaims`).
+part rows' blob lengths and claims every blob in the root swap's
+transaction, a few statements however many blobs there are
+(`registry.CommitRoot`).
 
 Every session teardown (abort, expiry, the completed-session reap, a
 superseded part, the parts a Complete omitted) records a deferred release
@@ -454,8 +462,9 @@ same rule as the rest: a streamed blob concludes, or a streamed part is
 recorded, under the key lock, after a settle and a look at the rows, and
 a location or park another write recorded meanwhile makes the stream
 surplus, given up and reused. The last guard is the claim itself: a
-committed body blob is located by its commit, so `AddBlobClaims` refuses,
-under the claim-key lock, a digest the space has no location for, which is
+committed body blob is located by its commit, so the root swap refuses,
+under the claim-key lock, a claim on a digest the space has no location
+for (`registry.RootCommit.Claims`), which is
 one whose release ran to completion between the write's settle and its
 commit; the write fails with SlowDown for the client to retry. A release
 not yet started defers while a write of its space holds the digest.
@@ -484,7 +493,10 @@ not yet started defers while a write of its space holds the digest.
   the agent, and the per-key `DelegationCache` carries those proofs into the
   request via `internal/reqscope`, where the uploader and the network read
   tier spend them. The uploader also captures a per-space ship authority
-  (1h TTL) for the async catalog flush, from borrowable stores only. The
+  (1h TTL) for the async catalog flush, from every write that commits, and
+  keeps an upload's capture apart for the background releases, aborts and
+  registration renewals, which a narrower key's grant may not cover. Both
+  take only stores the IAM layer marks borrowable. The
   same cache's action sets ride along (`reqscope.Permits`) for the one check
   hilt cannot make from the URL: a `DeleteObjects` entry naming a version
   needs `s3:DeleteObjectVersion`, beyond the request's `s3:DeleteObject`.
@@ -518,8 +530,8 @@ draws the chains and the stores.
   budget. A delete frees its blobs' local copies once their release runs,
   and a multipart part's copy goes once it parks.
 - **Spool crash recovery is not built**: reconciling `upload_intents`
-  against `blob_refs` after a crash between commit and reconcile is a later
-  phase; the window leaks rather than loses referenced data. (Files with no
+  against `blob_refs` after a crash between a blob's upload and its commit
+  is a later phase; the window leaks rather than loses referenced data. (Files with no
   intent row at all, and unfinished `.tmp-*` writes, are reclaimed by the
   sweeper's orphan pass.) Nor is a failed upload's spool file reclaimed: its
   intent stays `spooled` or `uploading`, so neither eviction nor the orphan
@@ -534,14 +546,11 @@ draws the chains and the stores.
 - **Reads carry no bucket context**: `Manager.Get` linear-scans every open
   bucket store; threading the bucket into the read path removes the scan.
 - **The ship authority expires**: the async flush signs with a per-space
-  proof store captured at the last in-request body upload (1h TTL); a
-  bucket without one for longer than that, or whose grant in the captured
-  store a revocation has named, cannot ship a newly sealed segment. The
-  flush gives up after five attempts (about 31s of backoff), and a later
-  body upload re-captures the authority for segments sealed after it, not
-  for that one. Only a restart re-enqueues it, and the capture lives in
-  memory, so even then it ships only if a body upload to the space captures
-  the authority before its attempts run out.
+  proof store captured, in memory, from the bucket's last write (1h TTL).
+  Every commit captures it, so a segment ships under its own writes'
+  capture, but one whose ship keeps failing past the TTL, or across a
+  restart, or whose grant in the captured store a revocation has named, has
+  no authority until the bucket's next write.
 - **The indexer read path is unwired**: `LocalLocator` serves all reads; the
   network index is still published (best-effort) but never consulted.
 - **Carried Forge-client copies**: `forgeclient/`, `tokenstore/`,

@@ -77,6 +77,15 @@ type MemStore struct {
 	// uploadRegSeq numbers the rows the way the Postgres sequence does.
 	uploadRegs   []registry.UploadRegistration
 	uploadRegSeq int64
+	// journal is the catalog journal: segment seq -> string(cid) -> row.
+	journal map[uint64]map[string]journalRow
+}
+
+// journalRow is one catalog_journal row.
+type journalRow struct {
+	bucket string
+	data   []byte
+	at     time.Time
 }
 
 // claimKey / locKey are the composite map keys for the blob_refs and the
@@ -111,6 +120,7 @@ func NewMemStore() *MemStore {
 		partTrees:  map[string]map[int]*registry.PartTree{},
 		gcCands:    map[string]struct{}{},
 		releases:   map[locKey]registry.PendingRelease{},
+		journal:    map[uint64]map[string]journalRow{},
 	}
 }
 
@@ -252,17 +262,29 @@ func (m *MemStore) Delete(_ context.Context, name string) error {
 		}
 	}
 	m.uploadRegs = kept
+	// The journal cascades on the bucket too.
+	for seq, rows := range m.journal {
+		for k, row := range rows {
+			if row.bucket == name {
+				delete(rows, k)
+			}
+		}
+		if len(rows) == 0 {
+			delete(m.journal, seq)
+		}
+	}
 	return nil
 }
 
 func (m *MemStore) CASRoot(ctx context.Context, name string, expect, next cid.Cid) error {
-	return m.CASRootAndEnqueueUploadRegistrations(ctx, name, expect, next, nil)
+	return m.CommitRoot(ctx, name, expect, next, registry.RootCommit{})
 }
 
-// CASRootAndEnqueueUploadRegistrations advances the root and records the
-// commit's upload registrations together: under the one mutex here, as one
-// transaction in Postgres. A conflict records nothing.
-func (m *MemStore) CASRootAndEnqueueUploadRegistrations(_ context.Context, name string, expect, next cid.Cid, regs []registry.UploadRegistration) error {
+// CommitRoot advances the root and records the commit's upload
+// registrations, blob claims and claim drops together: under the one mutex
+// here, as one transaction in Postgres. A conflict or a refused claim
+// records nothing.
+func (m *MemStore) CommitRoot(_ context.Context, name string, expect, next cid.Cid, c registry.RootCommit) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	s, ok := m.buckets[name]
@@ -272,8 +294,21 @@ func (m *MemStore) CASRootAndEnqueueUploadRegistrations(_ context.Context, name 
 	if !s.Root.Equals(expect) {
 		return registry.ErrConflict
 	}
+	// Every claim and pin is checked before anything is written: a refused
+	// commit records nothing, as a rolled-back transaction does.
+	for _, cl := range c.Claims {
+		if err := m.claimRefusedLocked(cl); err != nil {
+			return err
+		}
+	}
+	for _, p := range c.Pins {
+		if m.pinRefusedLocked(p) {
+			return registry.ErrClaimGone
+		}
+	}
 	s.Root = next
-	for _, reg := range regs {
+	m.journalLocked(name, c.Journal)
+	for _, reg := range c.Registrations {
 		m.uploadRegSeq++
 		reg.Seq = m.uploadRegSeq
 		if reg.NextAt.IsZero() {
@@ -281,7 +316,73 @@ func (m *MemStore) CASRootAndEnqueueUploadRegistrations(_ context.Context, name 
 		}
 		m.uploadRegs = append(m.uploadRegs, reg)
 	}
+	for _, cl := range c.Claims {
+		m.addClaimLocked(cl, true)
+	}
+	for _, p := range c.Pins {
+		m.addClaimLocked(p, false)
+	}
+	// The grace runs from the commit, as in Postgres.
+	due := time.Now().Add(c.ReleaseGrace)
+	for _, d := range c.Drops {
+		m.dropClaimLocked(d, due)
+	}
 	return nil
+}
+
+// journalLocked records a commit's catalog blocks under their segment,
+// unless the segment has shipped or its row is gone (the Postgres
+// journalBlocks rule; here the store's mutex does the row lock's work).
+func (m *MemStore) journalLocked(bucket string, j blockstore.Appended) {
+	if len(j.Blocks) == 0 {
+		return
+	}
+	seg, ok := m.segments[j.Segment]
+	if !ok || seg.ShippedAt != 0 {
+		return
+	}
+	rows := m.journal[j.Segment]
+	if rows == nil {
+		rows = map[string]journalRow{}
+		m.journal[j.Segment] = rows
+	}
+	now := time.Now()
+	for _, b := range j.Blocks {
+		k := string(b.Cid().Bytes())
+		if _, dup := rows[k]; dup {
+			continue
+		}
+		rows[k] = journalRow{bucket: bucket, data: slices.Clone(b.RawData()), at: now}
+	}
+}
+
+// CatalogJournalStats reports the journal's row count, bytes and oldest row.
+func (m *MemStore) CatalogJournalStats(context.Context) (registry.CatalogJournalStats, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var st registry.CatalogJournalStats
+	for _, rows := range m.journal {
+		for _, row := range rows {
+			st.Blocks++
+			st.Bytes += int64(len(row.data))
+			if st.Oldest.IsZero() || row.at.Before(st.Oldest) {
+				st.Oldest = row.at
+			}
+		}
+	}
+	return st, nil
+}
+
+// JournaledBlocks returns the catalog blocks journaled under segment, keyed
+// by string(cid.Bytes()); tests read it to check the journal.
+func (m *MemStore) JournaledBlocks(segment uint64) map[string][]byte {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := map[string][]byte{}
+	for k, row := range m.journal[segment] {
+		out[k] = slices.Clone(row.data)
+	}
+	return out
 }
 
 func (m *MemStore) SetForgeRoot(_ context.Context, name string, root cid.Cid) error {
@@ -342,6 +443,17 @@ func (m *MemStore) SetBucketTagging(_ context.Context, name string, tags []byte)
 	return nil
 }
 
+func (m *MemStore) SetCORSConfig(_ context.Context, name string, cfg []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.buckets[name]
+	if !ok {
+		return registry.ErrNotFound
+	}
+	s.CORSConfig = cfg
+	return nil
+}
+
 func (m *MemStore) AllocVersionSeq(_ context.Context, name string) (uint64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -397,6 +509,8 @@ func (m *MemStore) MarkSegmentShipped(_ context.Context, plane blockstore.Plane,
 		r.ShippedAt = shippedAt
 		r.IndexDigest = slices.Clone(indexDigest)
 	}
+	// The segment's journaled blocks are on Forge now.
+	delete(m.journal, seq)
 	if plane == blockstore.PlaneCatalog {
 		for _, opr := range opRoots {
 			// Guard the advance on the bucket's committed root (see the Postgres
@@ -482,6 +596,9 @@ type NopUploader struct{}
 func (NopUploader) SubmitShard(_ context.Context, _ blockstore.Plane, _ did.DID, _ uploader.CARShard) (uploader.BlobLocation, multihash.Multihash, error) {
 	return uploader.BlobLocation{}, nil, nil
 }
+
+// CaptureShipAuthority is a no-op: SubmitShard needs no authority.
+func (NopUploader) CaptureShipAuthority(_ context.Context, _ did.DID) {}
 
 // UploadBlob accepts immediately, even with WithConclude(false) — there is
 // no network to park on, so the deferred flow degenerates to the synchronous

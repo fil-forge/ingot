@@ -135,9 +135,7 @@ func TestPostgresStores_Live(t *testing.T) {
 			if err := r.PutLocation(ctx, registry.BlobLocation{Space: sp, Digest: digest, Provider: "did:key:p", URL: "http://p/blob", Size: 1}); err != nil {
 				t.Fatalf("PutLocation: %v", err)
 			}
-			if err := r.AddBlobClaim(ctx, registry.BlobClaim{Digest: digest, Bucket: bucket, ObjectKey: key, VersionID: registry.NullVersionID, Space: sp}); err != nil {
-				t.Fatalf("AddBlobClaim: %v", err)
-			}
+			mustClaim(t, r, registry.BlobClaim{Digest: digest, Bucket: bucket, ObjectKey: key, VersionID: registry.NullVersionID, Space: sp})
 		}
 		add("b", "k1", space)
 		add("b", "k2", space)
@@ -149,12 +147,8 @@ func TestPostgresStores_Live(t *testing.T) {
 		if n, _ := r.CountClaims(ctx, space2, digest); n != 1 {
 			t.Fatalf("count space2 = %d, want 1", n)
 		}
-		if err := r.DeleteBlobClaim(ctx, digest, "b", "k1", registry.NullVersionID); err != nil {
-			t.Fatalf("DeleteBlobClaim: %v", err)
-		}
-		if err := r.DeleteBlobClaim(ctx, digest, "b", "k2", registry.NullVersionID); err != nil {
-			t.Fatalf("DeleteBlobClaim: %v", err)
-		}
+		drop(t, r, registry.ClaimDrop{Digest: digest, Bucket: "b", ObjectKey: "k1", VersionID: registry.NullVersionID, Space: space})
+		drop(t, r, registry.ClaimDrop{Digest: digest, Bucket: "b", ObjectKey: "k2", VersionID: registry.NullVersionID, Space: space})
 		if n, _ := r.CountClaims(ctx, space, digest); n != 0 {
 			t.Fatalf("count after release = %d, want 0", n)
 		}
@@ -168,15 +162,11 @@ func TestPostgresStores_Live(t *testing.T) {
 		if err := r.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: pubDigest, Provider: "did:key:p", URL: "http://p/blob", Size: 1}); err != nil {
 			t.Fatalf("PutLocation: %v", err)
 		}
-		if err := r.AddBlobClaim(ctx, registry.BlobClaim{Digest: pubDigest, Bucket: "b", ObjectKey: "kp", VersionID: registry.NullVersionID, Space: space}); err != nil {
-			t.Fatalf("AddBlobClaim (publish): %v", err)
-		}
+		mustClaim(t, r, registry.BlobClaim{Digest: pubDigest, Bucket: "b", ObjectKey: "kp", VersionID: registry.NullVersionID, Space: space})
 		if in, err := r.GetIntent(ctx, space, pubDigest); err != nil || in.State != registry.IntentPublished {
 			t.Fatalf("intent after claim = %+v, err %v (want published)", in, err)
 		}
-		if err := r.DeleteBlobClaim(ctx, pubDigest, "b", "kp", registry.NullVersionID); err != nil {
-			t.Fatalf("DeleteBlobClaim (publish): %v", err)
-		}
+		drop(t, r, registry.ClaimDrop{Digest: pubDigest, Bucket: "b", ObjectKey: "kp", VersionID: registry.NullVersionID, Space: space})
 		if in, err := r.GetIntent(ctx, space, pubDigest); err != nil || in.State != registry.IntentPublished {
 			t.Fatalf("intent after the claim dropped = %+v, err %v (want still published)", in, err)
 		}
@@ -184,59 +174,62 @@ func TestPostgresStores_Live(t *testing.T) {
 		if err := r.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: multihash.Multihash([]byte{0x12, 0x20, 0xc1, 0xa2}), Provider: "did:key:p", URL: "http://p/blob", Size: 1}); err != nil {
 			t.Fatalf("PutLocation: %v", err)
 		}
-		if err := r.AddBlobClaim(ctx, registry.BlobClaim{Digest: multihash.Multihash([]byte{0x12, 0x20, 0xc1, 0xa2}), Bucket: "b", ObjectKey: "kn", VersionID: registry.NullVersionID, Space: space}); err != nil {
-			t.Fatalf("AddBlobClaim (no intent): %v", err)
-		}
+		mustClaim(t, r, registry.BlobClaim{Digest: multihash.Multihash([]byte{0x12, 0x20, 0xc1, 0xa2}), Bucket: "b", ObjectKey: "kn", VersionID: registry.NullVersionID, Space: space})
 	})
 
 	t.Run("pin claims require an existing claim, all or nothing", func(t *testing.T) {
 		space := testutil.RandomDID(t)
 		d1 := multihash.Multihash([]byte{0x12, 0x20, 0xb1, 0x01})
 		d2 := multihash.Multihash([]byte{0x12, 0x20, 0xb1, 0x02})
-		pin := func(ds ...multihash.Multihash) []registry.BlobClaim {
+		pins := func(ds ...multihash.Multihash) []registry.BlobClaim {
 			var out []registry.BlobClaim
 			for _, d := range ds {
 				out = append(out, registry.BlobClaim{Digest: d, Bucket: "pb", ObjectKey: "copy", VersionID: "null#7", Space: space})
 			}
 			return out
 		}
-		if ok, err := r.PinBlobClaims(ctx, pin(d1)); err != nil || ok {
-			t.Fatalf("pin with no claim to attach to: ok=%v err=%v, want refused", ok, err)
+		// A refused pin fails the commit, and the root stays where it was.
+		before, _ := r.Get(ctx, "pb")
+		if err := pin(t, r, pins(d1)); !errors.Is(err, registry.ErrClaimGone) {
+			t.Fatalf("pin with no claim to attach to: err=%v, want ErrClaimGone", err)
+		}
+		if after, _ := r.Get(ctx, "pb"); before != nil && !after.Root.Equals(before.Root) {
+			t.Fatalf("a refused pin advanced the root: %v -> %v", before.Root, after.Root)
 		}
 		if err := r.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: d1, Provider: "did:key:p", URL: "http://p/blob", Size: 1}); err != nil {
 			t.Fatalf("PutLocation: %v", err)
 		}
-		if err := r.AddBlobClaim(ctx, registry.BlobClaim{Digest: d1, Bucket: "pb", ObjectKey: "src", VersionID: "null#1", Space: space}); err != nil {
-			t.Fatalf("AddBlobClaim: %v", err)
-		}
+		mustClaim(t, r, registry.BlobClaim{Digest: d1, Bucket: "pb", ObjectKey: "src", VersionID: "null#1", Space: space})
 		// d1 is claimed, d2 is not: nothing is recorded.
-		if ok, err := r.PinBlobClaims(ctx, pin(d1, d2)); err != nil || ok {
-			t.Fatalf("pin with one unclaimed digest: ok=%v err=%v, want refused", ok, err)
+		if err := pin(t, r, pins(d1, d2)); !errors.Is(err, registry.ErrClaimGone) {
+			t.Fatalf("pin with one unclaimed digest: err=%v, want ErrClaimGone", err)
 		}
 		if n, _ := r.CountClaims(ctx, space, d1); n != 1 {
 			t.Fatalf("refused pin left %d claims on d1, want the source's 1", n)
 		}
-		if ok, err := r.PinBlobClaims(ctx, pin(d1)); err != nil || !ok {
-			t.Fatalf("pin beside a live claim: ok=%v err=%v, want recorded", ok, err)
+		if err := pin(t, r, pins(d1)); err != nil {
+			t.Fatalf("pin beside a live claim: %v, want recorded", err)
 		}
-		if ok, err := r.PinBlobClaims(ctx, pin(d1)); err != nil || !ok {
-			t.Fatalf("repeated pin: ok=%v err=%v, want idempotent true", ok, err)
+		if err := pin(t, r, pins(d1)); err != nil {
+			t.Fatalf("repeated pin: %v, want idempotent", err)
 		}
 		if n, _ := r.CountClaims(ctx, space, d1); n != 2 {
 			t.Fatalf("claims after pin = %d, want 2", n)
 		}
 		// A claim in another space does not qualify.
 		other := testutil.RandomDID(t)
-		if ok, err := r.PinBlobClaims(ctx, []registry.BlobClaim{{Digest: d1, Bucket: "pb2", ObjectKey: "copy", VersionID: "null#1", Space: other}}); err != nil || ok {
-			t.Fatalf("pin against another space's claim: ok=%v err=%v, want refused", ok, err)
+		if err := pin(t, r, []registry.BlobClaim{{Digest: d1, Bucket: "pb2", ObjectKey: "copy", VersionID: "null#1", Space: other}}); !errors.Is(err, registry.ErrClaimGone) {
+			t.Fatalf("pin against another space's claim: err=%v, want ErrClaimGone", err)
 		}
-		// Dropping the source's claim beside the pin enqueues nothing; dropping
-		// the pin too does.
-		if enq, err := r.DropClaimEnqueueRelease(ctx, d1, "pb", "src", "null#1", space, time.Now()); err != nil || enq {
-			t.Fatalf("drop source beside pin: enqueued=%v err=%v, want false", enq, err)
+		// Dropping the source's claim beside the pin records no release;
+		// dropping the pin too does.
+		drop(t, r, registry.ClaimDrop{Digest: d1, Bucket: "pb", ObjectKey: "src", VersionID: "null#1", Space: space})
+		if releaseRecorded(t, r, space, d1) {
+			t.Fatalf("drop of the source beside the pin recorded a release")
 		}
-		if enq, err := r.DropClaimEnqueueRelease(ctx, d1, "pb", "copy", "null#7", space, time.Now()); err != nil || !enq {
-			t.Fatalf("drop last claim: enqueued=%v err=%v, want true", enq, err)
+		drop(t, r, registry.ClaimDrop{Digest: d1, Bucket: "pb", ObjectKey: "copy", VersionID: "null#7", Space: space})
+		if !releaseRecorded(t, r, space, d1) {
+			t.Fatalf("drop of the last claim recorded no release")
 		}
 	})
 
@@ -246,27 +239,19 @@ func TestPostgresStores_Live(t *testing.T) {
 			if err := r.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: digest, Provider: "did:key:p", URL: "http://p/blob", Size: 1}); err != nil {
 				t.Fatalf("PutLocation: %v", err)
 			}
-			if err := r.AddBlobClaim(ctx, registry.BlobClaim{Digest: digest, Bucket: "rb", ObjectKey: key, VersionID: "null#1", Space: space}); err != nil {
-				t.Fatalf("AddBlobClaim: %v", err)
-			}
+			mustClaim(t, r, registry.BlobClaim{Digest: digest, Bucket: "rb", ObjectKey: key, VersionID: "null#1", Space: space})
 		}
 		add("k1")
 		add("k2")
 
-		due := time.Now().Add(-time.Second) // already due
-		enq, err := r.DropClaimEnqueueRelease(ctx, digest, "rb", "k1", "null#1", space, due)
-		if err != nil {
-			t.Fatalf("DropClaimEnqueueRelease (first): %v", err)
+		// A zero grace (the commit helper's) makes the record due at once.
+		drop(t, r, registry.ClaimDrop{Digest: digest, Bucket: "rb", ObjectKey: "k1", VersionID: "null#1", Space: space})
+		if releaseRecorded(t, r, space, digest) {
+			t.Fatalf("first drop recorded a release while a claim remains")
 		}
-		if enq {
-			t.Fatalf("first drop enqueued a release while a claim remains")
-		}
-		enq, err = r.DropClaimEnqueueRelease(ctx, digest, "rb", "k2", "null#1", space, due)
-		if err != nil {
-			t.Fatalf("DropClaimEnqueueRelease (last): %v", err)
-		}
-		if !enq {
-			t.Fatalf("last drop did not enqueue a release")
+		drop(t, r, registry.ClaimDrop{Digest: digest, Bucket: "rb", ObjectKey: "k2", VersionID: "null#1", Space: space})
+		if !releaseRecorded(t, r, space, digest) {
+			t.Fatalf("last drop recorded no release")
 		}
 
 		listed, err := r.ListDueReleases(ctx, time.Now(), 10)
@@ -725,10 +710,10 @@ func TestPostgresStores_Live(t *testing.T) {
 		_ = r.DeleteSession(ctx, id+"-space")
 
 		// bytea[] round trip + ordering.
-		if err := r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 2, ETagMD5: []byte{0x02}, Size: 2, BlobDigests: []multihash.Multihash{{0xd2}}}, nil); err != nil {
+		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 2, ETagMD5: []byte{0x02}, Size: 2, BlobDigests: []multihash.Multihash{{0xd2}}}, nil); err != nil {
 			t.Fatalf("PutPart 2: %v", err)
 		}
-		if err := r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 1, ETagMD5: []byte{0x01}, Size: 1, BlobDigests: []multihash.Multihash{{0xd1, 0xa}, {0xd1, 0xb}}},
+		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 1, ETagMD5: []byte{0x01}, Size: 1, BlobDigests: []multihash.Multihash{{0xd1, 0xa}, {0xd1, 0xb}}},
 			&registry.PartTree{Offset: 0, ChunkLog: 4, Nodes: []byte{0x0a}, Blocks: []byte{0x0b, 0x0c}, Head: []byte{0x0d}, Tail: []byte{0x0e}, Root: []byte{0x0f}}); err != nil {
 			t.Fatalf("PutPart 1: %v", err)
 		}
@@ -747,13 +732,13 @@ func TestPostgresStores_Live(t *testing.T) {
 		}
 		// A superseding part without a tree drops its predecessor's row; one
 		// with a tree replaces it.
-		if err := r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 1, ETagMD5: []byte{0x01}, Size: 1, BlobDigests: []multihash.Multihash{{0xd1}}}, nil); err != nil {
+		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 1, ETagMD5: []byte{0x01}, Size: 1, BlobDigests: []multihash.Multihash{{0xd1}}}, nil); err != nil {
 			t.Fatalf("PutPart 1 again: %v", err)
 		}
 		if again, _ := r.ListPartTrees(ctx, id); again[1] != nil {
 			t.Fatalf("superseded part kept its tree: %+v", again[1])
 		}
-		if err := r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 2, ETagMD5: []byte{0x02}, Size: 2, BlobDigests: []multihash.Multihash{{0xd2}}},
+		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 2, ETagMD5: []byte{0x02}, Size: 2, BlobDigests: []multihash.Multihash{{0xd2}}},
 			&registry.PartTree{Offset: 1, ChunkLog: 5, Nodes: []byte{0x1a}, Blocks: []byte{0x1b}}); err != nil {
 			t.Fatalf("PutPart 2 with tree: %v", err)
 		}
@@ -778,10 +763,10 @@ func TestPostgresStores_Live(t *testing.T) {
 		}
 		// A part cannot land once the session has left 'open', nor on a
 		// session that does not exist.
-		if err := r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 3, ETagMD5: []byte{0x03}, Size: 3, BlobDigests: []multihash.Multihash{{0xd3}}}, nil); !errors.Is(err, registry.ErrNotFound) {
+		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 3, ETagMD5: []byte{0x03}, Size: 3, BlobDigests: []multihash.Multihash{{0xd3}}}, nil); !errors.Is(err, registry.ErrNotFound) {
 			t.Fatalf("PutPart on a completing session = %v, want ErrNotFound", err)
 		}
-		if err := r.PutPart(ctx, registry.MultipartPart{UploadID: "no-such-upload", PartNumber: 1, ETagMD5: []byte{0x01}, Size: 1, BlobDigests: []multihash.Multihash{{0xd1}}}, nil); !errors.Is(err, registry.ErrNotFound) {
+		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: "no-such-upload", PartNumber: 1, ETagMD5: []byte{0x01}, Size: 1, BlobDigests: []multihash.Multihash{{0xd1}}}, nil); !errors.Is(err, registry.ErrNotFound) {
 			t.Fatalf("PutPart on a missing session = %v, want ErrNotFound", err)
 		}
 		if parts, _ := r.ListParts(ctx, id); len(parts) != 2 {
@@ -844,10 +829,10 @@ func TestPostgresStores_Live(t *testing.T) {
 
 		// CountPartRefs: bytea[] ANY-match across sessions, excluding one.
 		shared := []byte{0xee, 0x01}
-		if err := r.PutPart(ctx, registry.MultipartPart{UploadID: "ls-1", PartNumber: 1, ETagMD5: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{shared}}, nil); err != nil {
+		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: "ls-1", PartNumber: 1, ETagMD5: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{shared}}, nil); err != nil {
 			t.Fatalf("PutPart ls-1: %v", err)
 		}
-		if err := r.PutPart(ctx, registry.MultipartPart{UploadID: "ls-2", PartNumber: 1, ETagMD5: []byte{2}, Size: 1, BlobDigests: []multihash.Multihash{shared, {0xee, 0x02}}}, nil); err != nil {
+		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: "ls-2", PartNumber: 1, ETagMD5: []byte{2}, Size: 1, BlobDigests: []multihash.Multihash{shared, {0xee, 0x02}}}, nil); err != nil {
 			t.Fatalf("PutPart ls-2: %v", err)
 		}
 		if n, err := r.CountPartRefs(ctx, shared, "ls-1"); err != nil || n != 1 {
@@ -968,7 +953,7 @@ func TestPostgresStores_Live(t *testing.T) {
 	})
 }
 
-// TestCASRootAndEnqueueUploadRegistrationsOnASingleConnection proves the
+// TestCommitRootOnASingleConnection proves the
 // enqueueing CAS never needs two pooled connections at once. Resolving a
 // conflict or a missing bucket by reading through the pool, while the
 // transaction already holds a connection, deadlocks outright on a
@@ -976,7 +961,7 @@ func TestPostgresStores_Live(t *testing.T) {
 // commits exhaust it.
 //
 //	INGOT_TEST_DSN=postgres://... GOWORK=off go test ./registry/ -run SingleConnection -v
-func TestCASRootAndEnqueueUploadRegistrationsOnASingleConnection(t *testing.T) {
+func TestCommitRootOnASingleConnection(t *testing.T) {
 	dsn := os.Getenv("INGOT_TEST_DSN")
 	if dsn == "" {
 		t.Skip("set INGOT_TEST_DSN to run the live Postgres store test")
@@ -1027,7 +1012,7 @@ func TestCASRootAndEnqueueUploadRegistrationsOnASingleConnection(t *testing.T) {
 	// A bucket that does not exist: the conflict path has to say so without
 	// reaching back to the pool.
 	err = bounded("missing bucket", func(c context.Context) error {
-		return reg.CASRootAndEnqueueUploadRegistrations(c, "cas-single-conn", cid.Undef, liveCid(t, "next"), regs)
+		return reg.CommitRoot(c, "cas-single-conn", cid.Undef, liveCid(t, "next"), registry.RootCommit{Registrations: regs})
 	})
 	if !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("missing bucket: got %v, want ErrNotFound", err)
@@ -1042,7 +1027,7 @@ func TestCASRootAndEnqueueUploadRegistrationsOnASingleConnection(t *testing.T) {
 
 	// A root that does not match: the same path, reporting a conflict.
 	err = bounded("stale root", func(c context.Context) error {
-		return reg.CASRootAndEnqueueUploadRegistrations(c, "cas-single-conn", liveCid(t, "stale"), liveCid(t, "next"), regs)
+		return reg.CommitRoot(c, "cas-single-conn", liveCid(t, "stale"), liveCid(t, "next"), registry.RootCommit{Registrations: regs})
 	})
 	if !errors.Is(err, registry.ErrConflict) {
 		t.Fatalf("stale root: got %v, want ErrConflict", err)
@@ -1050,7 +1035,7 @@ func TestCASRootAndEnqueueUploadRegistrationsOnASingleConnection(t *testing.T) {
 
 	// And the happy path still commits both the root and its rows.
 	if err := bounded("commit", func(c context.Context) error {
-		return reg.CASRootAndEnqueueUploadRegistrations(c, "cas-single-conn", cid.Undef, liveCid(t, "next"), regs)
+		return reg.CommitRoot(c, "cas-single-conn", cid.Undef, liveCid(t, "next"), registry.RootCommit{Registrations: regs})
 	}); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
@@ -1093,11 +1078,11 @@ func TestDeletingABucketCascadesItsUploadRegistrations(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = r.Delete(context.Background(), "cascade-bucket") })
 
-	if err := r.CASRootAndEnqueueUploadRegistrations(ctx, "cascade-bucket", cid.Undef, liveCid(t, "root"),
-		[]registry.UploadRegistration{{
+	if err := r.CommitRoot(ctx, "cascade-bucket", cid.Undef, liveCid(t, "root"),
+		registry.RootCommit{Registrations: []registry.UploadRegistration{{
 			Bucket: "cascade-bucket", ObjectKey: "k", Space: space,
 			Root: liveCid(t, "mf"), Op: registry.UploadRegistrationAdd, Proofs: []byte("proofs"),
-		}}); err != nil {
+		}}}); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
 
@@ -1127,14 +1112,15 @@ func TestDeletingABucketCascadesItsUploadRegistrations(t *testing.T) {
 	}
 }
 
-// TestConcurrentAddBlobClaimsLive runs two commits claiming the same
-// thousands of digests at once, many times over, one listing them in reverse.
-// AddBlobClaims takes a claim-key lock per digest, so the two take
-// overlapping lock sets and must take them in one order whatever order their
-// claims arrive in, or Postgres aborts one with a deadlock error.
+// TestConcurrentCommitClaimsLive runs two commits claiming the same thousands
+// of digests at once, many times over, one listing them in reverse. A commit
+// takes a claim-key lock per digest, so the two take overlapping lock sets
+// and must take them in one order whatever order their claims arrive in, or
+// Postgres aborts one with a deadlock error. Each writer commits to a bucket
+// of its own: the root swap serialises the writers of one bucket.
 //
-//	INGOT_TEST_DSN=postgres://... GOWORK=off go test ./registry/ -run ConcurrentAddBlobClaims -v
-func TestConcurrentAddBlobClaimsLive(t *testing.T) {
+//	INGOT_TEST_DSN=postgres://... GOWORK=off go test ./registry/ -run ConcurrentCommitClaims -v
+func TestConcurrentCommitClaimsLive(t *testing.T) {
 	dsn := os.Getenv("INGOT_TEST_DSN")
 	if dsn == "" {
 		t.Skip("set INGOT_TEST_DSN to run the live Postgres store test")
@@ -1151,6 +1137,18 @@ func TestConcurrentAddBlobClaimsLive(t *testing.T) {
 	r := registry.NewPostgres(pool)
 	space := testutil.RandomDID(t)
 
+	buckets := []string{"concurrent-claims-w0-" + space.String()[len(space.String())-8:], "concurrent-claims-w1-" + space.String()[len(space.String())-8:]}
+	for _, name := range buckets {
+		if err := r.Create(ctx, name, space, registry.CreateState{Tenant: testutil.RandomDID(t)}); err != nil {
+			t.Fatalf("create bucket %q: %v", name, err)
+		}
+	}
+	t.Cleanup(func() {
+		for _, name := range buckets {
+			_ = r.Delete(context.Background(), name)
+		}
+	})
+
 	const n = 2000
 	digests := make([]multihash.Multihash, n)
 	for i := range digests {
@@ -1163,14 +1161,14 @@ func TestConcurrentAddBlobClaimsLive(t *testing.T) {
 			t.Fatalf("PutLocation: %v", err)
 		}
 	}
-	claims := func(version string, reversed bool) []registry.BlobClaim {
+	claims := func(bucket, version string, reversed bool) []registry.BlobClaim {
 		out := make([]registry.BlobClaim, n)
 		for i, d := range digests {
 			j := i
 			if reversed {
 				j = n - 1 - i
 			}
-			out[j] = registry.BlobClaim{Digest: d, Bucket: "bk", ObjectKey: "k", VersionID: version, Space: space}
+			out[j] = registry.BlobClaim{Digest: d, Bucket: bucket, ObjectKey: "k", VersionID: version, Space: space}
 		}
 		return out
 	}
@@ -1178,17 +1176,244 @@ func TestConcurrentAddBlobClaimsLive(t *testing.T) {
 	for round := 0; round < 10; round++ {
 		errs := make(chan error, 2)
 		for w := 0; w < 2; w++ {
-			go func(version string, reversed bool) {
-				errs <- r.AddBlobClaims(ctx, claims(version, reversed))
-			}(fmt.Sprintf("r%d-w%d", round, w), w == 1)
+			go func(bucket, version string, reversed bool) {
+				st, err := r.Get(ctx, bucket)
+				if err != nil {
+					errs <- err
+					return
+				}
+				errs <- r.CommitRoot(ctx, bucket, st.Root, liveCid(t, bucket+version), registry.RootCommit{Claims: claims(bucket, version, reversed)})
+			}(buckets[w], fmt.Sprintf("r%d-w%d", round, w), w == 1)
 		}
 		for w := 0; w < 2; w++ {
 			if err := <-errs; err != nil {
-				t.Fatalf("round %d: AddBlobClaims: %v", round, err)
+				t.Fatalf("round %d: commit: %v", round, err)
 			}
 		}
 	}
 	if c, err := r.CountClaims(ctx, space, digests[0]); err != nil || c != 20 {
 		t.Fatalf("claims on the first digest = %d, %v; want 20", c, err)
+	}
+}
+
+// TestGetReleaseWaitsForTheClaimKeyLockLive: the release lookup a part's
+// park makes is serialised with the start of that release. A start in
+// flight holds the claim-key lock until it commits, so the lookup waits and
+// then reads the record started, rather than read it pending a moment
+// before the start commits and let the part reuse a blob the release then
+// removes.
+//
+//	INGOT_TEST_DSN=postgres://... GOWORK=off go test ./registry/ -run GetReleaseWaits -v
+func TestGetReleaseWaitsForTheClaimKeyLockLive(t *testing.T) {
+	dsn := os.Getenv("INGOT_TEST_DSN")
+	if dsn == "" {
+		t.Skip("set INGOT_TEST_DSN to run the live Postgres store test")
+	}
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("pool: %v", err)
+	}
+	defer pool.Close()
+	if err := migrations.Up(ctx, pool, zaptest.NewLogger(t)); err != nil {
+		t.Fatalf("migrations: %v", err)
+	}
+	r := registry.NewPostgres(pool)
+	space := testutil.RandomDID(t)
+	d := liveDigest(t, "get-release-waits")
+	if err := r.EnqueueRelease(ctx, space, d, time.Now()); err != nil {
+		t.Fatalf("EnqueueRelease: %v", err)
+	}
+	t.Cleanup(func() { _ = r.DeleteRelease(context.Background(), space, d) })
+
+	// A start in flight: the claim-key lock held, the record marked started,
+	// the transaction open.
+	start, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer start.Rollback(ctx)
+	if _, err := start.Exec(ctx,
+		`SELECT pg_advisory_xact_lock(hashtextextended($1 || ':' || encode($2, 'hex'), 0))`,
+		space.String(), []byte(d)); err != nil {
+		t.Fatalf("lock claim key: %v", err)
+	}
+	if _, err := start.Exec(ctx,
+		`UPDATE ingot.blob_release_intents SET started_at = now() WHERE space = $1 AND digest = $2`,
+		space, d); err != nil {
+		t.Fatalf("mark started: %v", err)
+	}
+
+	type lookup struct {
+		pr  *registry.PendingRelease
+		err error
+	}
+	done := make(chan lookup, 1)
+	go func() {
+		pr, err := r.GetRelease(ctx, space, d)
+		done <- lookup{pr, err}
+	}()
+	select {
+	case got := <-done:
+		t.Fatalf("GetRelease returned %+v, %v while a start held the claim-key lock", got.pr, got.err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	if err := start.Commit(ctx); err != nil {
+		t.Fatalf("commit start: %v", err)
+	}
+	select {
+	case got := <-done:
+		if got.err != nil || got.pr.StartedAt.IsZero() {
+			t.Fatalf("GetRelease after the start committed = %+v, %v; want the record started", got.pr, got.err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("GetRelease did not return once the start committed")
+	}
+}
+
+// TestReleaseGraceRunsFromTheSwapLive: a drop's release is due the grace
+// after the swap commits, not after its transaction began. A swap that
+// waited on a claim-key lock (here held by another transaction) owes a
+// reader that resolved the discarded version meanwhile the whole grace from
+// the commit.
+//
+//	INGOT_TEST_DSN=postgres://... GOWORK=off go test ./registry/ -run GraceRunsFromTheSwap -v
+func TestReleaseGraceRunsFromTheSwapLive(t *testing.T) {
+	dsn := os.Getenv("INGOT_TEST_DSN")
+	if dsn == "" {
+		t.Skip("set INGOT_TEST_DSN to run the live Postgres store test")
+	}
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("pool: %v", err)
+	}
+	defer pool.Close()
+	if err := migrations.Up(ctx, pool, zaptest.NewLogger(t)); err != nil {
+		t.Fatalf("migrations: %v", err)
+	}
+	r := registry.NewPostgres(pool)
+	space := testutil.RandomDID(t)
+	bucket := "grace-swap-" + space.String()[len(space.String())-8:]
+	d := liveDigest(t, "grace-runs-from-the-swap")
+	if err := r.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: d, Provider: "did:key:p", URL: "http://p/blob", Size: 1}); err != nil {
+		t.Fatalf("PutLocation: %v", err)
+	}
+	c := registry.BlobClaim{Digest: d, Bucket: bucket, ObjectKey: "k", VersionID: "v1", Space: space}
+	mustClaim(t, r, c)
+	t.Cleanup(func() {
+		_ = r.DeleteRelease(context.Background(), space, d)
+		_ = r.Delete(context.Background(), bucket)
+	})
+
+	// Another transaction holds the digest's claim-key lock while the drop's
+	// commit begins and waits.
+	holder, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer holder.Rollback(ctx)
+	if _, err := holder.Exec(ctx,
+		`SELECT pg_advisory_xact_lock(hashtextextended($1 || ':' || encode($2, 'hex'), 0))`,
+		space.String(), []byte(d)); err != nil {
+		t.Fatalf("lock claim key: %v", err)
+	}
+	const grace, stall = time.Second, 300 * time.Millisecond
+	st, err := r.Get(ctx, bucket)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	start := time.Now()
+	done := make(chan error, 1)
+	go func() {
+		done <- r.CommitRoot(ctx, bucket, st.Root, liveCid(t, "grace-swap-next"), registry.RootCommit{
+			Drops:        []registry.ClaimDrop{{Digest: d, Bucket: bucket, ObjectKey: "k", VersionID: "v1", Space: space}},
+			ReleaseGrace: grace,
+		})
+	}()
+	time.Sleep(stall)
+	if err := holder.Commit(ctx); err != nil {
+		t.Fatalf("release the lock: %v", err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("CommitRoot: %v", err)
+	}
+	var pr *registry.PendingRelease
+	for _, rec := range mustListReleases(t, r, space) {
+		if string(rec.Digest) == string(d) {
+			pr = &rec
+		}
+	}
+	if pr == nil {
+		t.Fatal("the drop recorded no release")
+	}
+	if earliest := start.Add(stall + grace); pr.NotBefore.Before(earliest) {
+		t.Fatalf("release due %v after the commit began, want at least the lock wait plus the grace (%v): the grace ran from the transaction's start", pr.NotBefore.Sub(start), stall+grace)
+	}
+}
+
+// TestBucketCORSConfigLive round-trips a bucket's own CORS document through
+// the SQL store: the column scans back as the bytes stored, NULL reads as
+// nil, a nil write restores NULL, and a missing bucket is ErrNotFound. The
+// in-memory fake cannot validate the column order of the row scan or the
+// nullable bytea binding. Skipped unless INGOT_TEST_DSN names a reachable
+// database:
+//
+//	INGOT_TEST_DSN=postgres://... GOWORK=off go test ./registry/ -run BucketCORS -v
+func TestBucketCORSConfigLive(t *testing.T) {
+	dsn := os.Getenv("INGOT_TEST_DSN")
+	if dsn == "" {
+		t.Skip("set INGOT_TEST_DSN to run the live Postgres store test")
+	}
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer pool.Close()
+	if err := migrations.Up(ctx, pool, zaptest.NewLogger(t)); err != nil {
+		t.Fatalf("migrations.Up: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `TRUNCATE ingot.buckets CASCADE`); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+	r := registry.NewPostgres(pool)
+	if err := r.Create(ctx, "b", testutil.RandomDID(t), registry.CreateState{Tenant: testutil.RandomDID(t)}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	st, err := r.Get(ctx, "b")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if st.CORSConfig != nil {
+		t.Fatalf("CORSConfig on a new bucket = %q, want nil", st.CORSConfig)
+	}
+
+	// Binary, with a zero byte, to exercise the bytea round trip rather than
+	// a text one.
+	doc := []byte("<CORSConfiguration>\x00</CORSConfiguration>")
+	if err := r.SetCORSConfig(ctx, "b", doc); err != nil {
+		t.Fatalf("SetCORSConfig: %v", err)
+	}
+	if st, err = r.Get(ctx, "b"); err != nil {
+		t.Fatalf("Get after set: %v", err)
+	}
+	if !bytes.Equal(st.CORSConfig, doc) {
+		t.Fatalf("CORSConfig = %q, want %q", st.CORSConfig, doc)
+	}
+
+	if err := r.SetCORSConfig(ctx, "b", nil); err != nil {
+		t.Fatalf("SetCORSConfig(nil): %v", err)
+	}
+	if st, err = r.Get(ctx, "b"); err != nil {
+		t.Fatalf("Get after clear: %v", err)
+	}
+	if st.CORSConfig != nil {
+		t.Fatalf("CORSConfig after clear = %q, want nil", st.CORSConfig)
+	}
+
+	if err := r.SetCORSConfig(ctx, "missing", doc); !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("SetCORSConfig on a missing bucket = %v, want ErrNotFound", err)
 	}
 }
