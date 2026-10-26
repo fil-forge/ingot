@@ -57,9 +57,16 @@ const (
 	SessionCompleted = "completed"
 )
 
-// multipart_parts.state values (§7.2).
+// multipart_parts.state values (§7.2). The part rows are the upload's
+// acceptance queue: the acceptor concludes 'parked' parts while the upload is
+// open, and Complete requires every part it names to be 'accepted'.
 const (
-	PartParked   = "parked"
+	// PartSpooled: recorded, its blobs not yet all parked. A part left here
+	// is one whose request died mid-park.
+	PartSpooled = "spooled"
+	// PartParked: every blob has a park (or a location), ready to conclude.
+	PartParked = "parked"
+	// PartAccepted: every blob is accepted on Forge.
 	PartAccepted = "accepted"
 )
 
@@ -238,9 +245,7 @@ type MultipartSession struct {
 	StateChangedAt time.Time
 }
 
-// MultipartPart is one row of ingot.multipart_parts. BlobDigests is the
-// ordered list of blobs the part split into (one entry unless the part
-// exceeded max_blob_size).
+// MultipartPart is one row of ingot.multipart_parts.
 type MultipartPart struct {
 	UploadID   string
 	PartNumber int
@@ -251,10 +256,22 @@ type MultipartPart struct {
 	// server-computed); when the session declares none it is the internal
 	// full-object CRC64NVME used to derive the default final checksum at
 	// Complete, and is never echoed by ListParts.
-	Checksum    string
+	Checksum string
+	// BlobDigests are the blobs the part split into, in order (one unless
+	// the part exceeded max_blob_size). Each is the digest of the blob as
+	// stored: its FEE envelope for an encrypted session, the part's own
+	// bytes for a session stored as received.
 	BlobDigests []multihash.Multihash
-	State       string
-	CreatedAt   time.Time
+	// SpanLengths, parallel to BlobDigests, is the length of the span each
+	// blob covers in the object: how many of the part's bytes it carries,
+	// before encryption. Complete lays the object out by these. For an
+	// encrypted session the stored blob, the bytes its digest names, is
+	// larger by the envelope. Nil on a row recorded before the lengths
+	// were kept; the reader then derives them per blob.
+	SpanLengths []int64
+	// State is one of the Part* values; empty records PartSpooled.
+	State     string
+	CreatedAt time.Time
 }
 
 // PartTree is the BLAKE3 tree material UploadPart records for one part: the
@@ -295,46 +312,15 @@ type PartTree struct {
 	Root []byte
 }
 
-// BlobRefStore is the reverse reference index (§5, §6). A commit adds a
-// claim per body digest; a delete/overwrite removes it; CountClaims gates
-// remove(digest) (physical reclamation when the count reaches zero).
+// BlobRefStore reads the reverse reference index (§5, §6). The index is
+// written by commits alone: a version's claims land and a discarded
+// version's claims drop in the root swap's transaction
+// (Registry.CommitRoot, RootCommit). CountClaims gates remove(digest):
+// physical reclamation when the count reaches zero.
 type BlobRefStore interface {
-	// AddBlobClaim records an object version's claim on a digest and, in the
-	// same transaction, marks the space's upload intent for the digest
-	// published (see IntentPublished). Idempotent. Under the (space, digest)
-	// claim-key lock it refuses with ErrReleaseInProgress while a started
-	// release holds the digest (PendingReleaseStore.StartRelease), or when
-	// the space has no location for the digest: a claim landing then would
-	// name a blob a release is removing, or has removed since the write
-	// settled it. Every committed body blob is located by its commit, so a
-	// claim with no location is one such write's.
-	AddBlobClaim(ctx context.Context, claim BlobClaim) error
-	// AddBlobClaims is AddBlobClaim for every claim of one generation, all
-	// in one transaction, each under its claim-key lock, taken in digest
-	// order: a digest refused for a started release records nothing for
-	// the others, so a commit that fails leaves no claim behind that no
-	// generation will ever drop.
-	AddBlobClaims(ctx context.Context, claims []BlobClaim) error
-	// PinBlobClaims is AddBlobClaim for digests borrowed from another object
-	// of the same space (a same-space copy pins the source's body). Each
-	// claim is recorded only while the space still holds a claim on its
-	// digest, all in one transaction, and the transaction excludes
-	// DropClaimEnqueueRelease on the same (space, digest), so a pin and the
-	// drop of the digest's last claim commit in one order or the other: the
-	// drop counts the pin, or the pin finds no claim. Reports whether every
-	// claim is recorded; false records nothing and means some digest's last
-	// claim is gone and the blob is being released. Idempotent.
-	PinBlobClaims(ctx context.Context, claims []BlobClaim) (bool, error)
-	DeleteBlobClaim(ctx context.Context, digest multihash.Multihash, bucket, objectKey, versionID string) error
 	// CountClaims returns how many object versions in space still reference
 	// digest. Zero means the space's claim may be released.
 	CountClaims(ctx context.Context, space did.DID, digest multihash.Multihash) (int, error)
-	// DropClaimEnqueueRelease deletes one claim row and, when it was the
-	// space's last claim on digest, records a release intent due at
-	// notBefore — atomically, so no crash window separates "last claim
-	// gone" from "release recorded". Reports whether an intent was
-	// enqueued.
-	DropClaimEnqueueRelease(ctx context.Context, digest multihash.Multihash, bucket, objectKey, versionID string, space did.DID, notBefore time.Time) (bool, error)
 }
 
 // PendingRelease is one deferred blob release: executed by the release
@@ -422,6 +408,20 @@ type PendingReleaseStore interface {
 	// reuse, or reports one that is started, which the write waits out, or
 	// none.
 	CancelRelease(ctx context.Context, space did.DID, digest multihash.Multihash) (ReleaseCancel, error)
+	// GetRelease returns the record for (space, digest) as it stands, or
+	// ErrNotFound, read under the claim-key lock and changing nothing: for
+	// a part write that leaves a pending record to its part row (which
+	// defers the record, StartRelease) and waits out a started one, where
+	// CancelRelease is for a write that takes the blob over. The lock
+	// serialises the read with StartRelease, so a record reported pending
+	// is not one a start is about to commit: the start that follows reads
+	// the write's part row and defers.
+	GetRelease(ctx context.Context, space did.DID, digest multihash.Multihash) (*PendingRelease, error)
+	// ReleasingDigests returns which of digests have a release record in
+	// space, started or not, keyed by string(digest). It reads and changes
+	// nothing else: for a caller that must leave a blob with a pending
+	// release alone, where CancelRelease is for a write that takes it over.
+	ReleasingDigests(ctx context.Context, space did.DID, digests []multihash.Multihash) (map[string]bool, error)
 	// ListReleasesBySpace returns every intent for space regardless of
 	// not_before — DeleteBucket executes a space's releases immediately (the
 	// bucket is empty and its deletion is explicit, so no reader grace is
@@ -578,6 +578,15 @@ type ParkStore interface {
 	// GetPark returns ErrNotFound when the space has no park row for digest.
 	GetPark(ctx context.Context, space did.DID, digest multihash.Multihash) (*BlobPark, error)
 	DeletePark(ctx context.Context, space did.DID, digest multihash.Multihash) error
+	// ConcludePark replaces the space's park of loc.Digest with loc, in one
+	// transaction, and reports whether it did. addTask is the /blob/add task
+	// (cid bytes) of the park the caller concluded, and only that park is
+	// replaced. With it gone nothing is written: another conclude recorded
+	// the blob first, or a release took the park, and with it the blob,
+	// while the conclude ran. A park of the same digest recorded since by
+	// another write names another allocation, which this conclude did not
+	// accept, and stays for its own.
+	ConcludePark(ctx context.Context, loc BlobLocation, addTask []byte) (bool, error)
 	// HasParkFor reports whether a park row records the /blob/add task
 	// addTask (cid bytes).
 	HasParkFor(ctx context.Context, addTask []byte) (bool, error)
@@ -646,8 +655,33 @@ type MultipartStore interface {
 	// write and the state check are one statement that holds the session
 	// row, so a part cannot land after a Complete or a teardown has taken
 	// the session, and a teardown's part listing sees every part that did
-	// land.
-	PutPart(ctx context.Context, p MultipartPart, tree *PartTree) error
+	// land. In the same transaction it records a release, due now, for each
+	// blob the replaced row named and this part does not, and returns those
+	// records for the caller to run: the replaced row and the releases of
+	// its blobs are one write, so no failure or crash can separate them.
+	// Writes of one part number are serialised, so the replaced row is
+	// exactly the one standing when this write landed, which a listing
+	// taken before the write may not have seen: a concurrent write of the
+	// same part number lands in between, and only its replacer learns of
+	// it.
+	PutPart(ctx context.Context, p MultipartPart, tree *PartTree) (released []PendingRelease, err error)
+	// MoveParts moves each of parts (as the caller read them) from state
+	// from to state to, and returns how many moved. A part is skipped when
+	// its row is no longer in from or no longer names the BlobDigests it
+	// was read with: a later upload of the same part number replaced it,
+	// and the replacement is not the caller's to move.
+	MoveParts(ctx context.Context, parts []MultipartPart, from, to string) (int, error)
+	// ListParkedParts returns up to limit of uploadID's 'parked' parts in
+	// part-number order: the acceptor's queue.
+	ListParkedParts(ctx context.Context, uploadID string, limit int) ([]MultipartPart, error)
+	// ListUploadsWithParkedParts returns the upload IDs of open and
+	// completing sessions that have a 'parked' part, for the acceptor's
+	// restart sweep.
+	ListUploadsWithParkedParts(ctx context.Context) ([]string, error)
+	// OldestParkedPart returns when the oldest 'parked' part of an open or
+	// completing session was recorded, and false when there is none: how
+	// long the acceptance queue's oldest entry has waited.
+	OldestParkedPart(ctx context.Context) (time.Time, bool, error)
 	// ListParts returns uploadID's parts in part-number order. The trees
 	// are separate (ListPartTrees): a part's tree is up to hundreds of KiB
 	// and only Complete merges them, while UploadPart, ListParts and the

@@ -92,13 +92,12 @@ type ServerDeps struct {
 	// Intents tracks each local blob's upload_intents lifecycle; Locations
 	// records where each accepted body blob (and shipped catalog shard) can be
 	// retrieved from; Inclusions records each shipped shard's inner-block byte
-	// ranges so retired catalog blocks stay resolvable; BlobRefs is the reverse
-	// reference index; GC records superseded MST/manifest CIDs. Typically all
+	// ranges so retired catalog blocks stay resolvable; GC records superseded
+	// MST/manifest CIDs. Typically all
 	// the same instance as Registry (*registry.Postgres / *inmem.MemStore).
 	Intents    registry.IntentStore
 	Locations  registry.LocationStore
 	Inclusions registry.InclusionStore
-	BlobRefs   registry.BlobRefStore
 	GC         registry.GCStore
 	Multipart  registry.MultipartStore
 	// Parks persists deferred-accept park state between UploadPart and
@@ -223,7 +222,6 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		Registry:        deps.Registry,
 		Intents:         deps.Intents,
 		Locations:       deps.Locations,
-		BlobRefs:        deps.BlobRefs,
 		GC:              deps.GC,
 		Multipart:       deps.Multipart,
 		Parks:           deps.Parks,
@@ -231,6 +229,7 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		Log:             log,
 		Spool:           spool,
 		Cache:           cache,
+		Ships:           deps.Uploader,
 		Uploader:        deps.BodyUploader,
 		Deferred:        deps.Deferred,
 		Remover:         deps.Remover,
@@ -302,6 +301,7 @@ func (s *Server) Start(ctx context.Context) error {
 	s.startLocalBlobSweeper()
 	s.startReleasedPass()
 	s.startRegistrationSweeper()
+	s.startAcceptSweeper()
 	return nil
 }
 
@@ -350,6 +350,43 @@ func (s *Server) startMultipartSweeper() {
 				} else if n > 0 {
 					s.logger.Info("multipart sweep reaped stale sessions", zap.Int("count", n))
 				}
+			}
+		}
+	})
+}
+
+// acceptSweepInterval is how often the accept sweeper looks for multipart
+// uploads with parked parts and no running acceptor.
+const acceptSweepInterval = 30 * time.Second
+
+// startAcceptSweeper starts the multipart acceptors and their restart sweep:
+// at start, and every acceptSweepInterval after, every open or completing
+// upload with parked parts has its acceptor nudged, which picks up the work
+// a stopped process left and any nudge that went missing. The sweeper's
+// exit waits for the acceptors, so Stop does too.
+func (s *Server) startAcceptSweeper() {
+	s.backend.StartAcceptors(s.sweepCtx)
+	s.goSweep(func() {
+		defer s.backend.WaitAcceptors()
+		sweep := func() {
+			ctx, cancel := context.WithTimeout(s.sweepCtx, time.Minute)
+			defer cancel()
+			ctx, span := tracing.Start(ctx, "sweep.multipart_accept")
+			n, err := s.backend.NudgeParkedUploads(ctx)
+			s.endSweepSpan(span, err, attribute.Int("ingot.sweep.count", n))
+			if err != nil && s.sweepCtx.Err() == nil {
+				s.logger.Warn("multipart accept sweep", zap.Error(err))
+			}
+		}
+		sweep()
+		ticker := time.NewTicker(acceptSweepInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-s.sweepCtx.Done():
+				return
+			case <-ticker.C:
+				sweep()
 			}
 		}
 	})
@@ -697,6 +734,8 @@ func buildS3API(ctx context.Context, backend *s3frontend.Backend, cfg config.Ser
 		// Without this the part-number ceiling defaults to 0 and every
 		// UploadPart is rejected. 10000 is the S3 maximum.
 		s3api.WithMpMaxParts(10000),
+		// Zero leaves a Complete to answer only when it finishes.
+		s3api.WithCompleteMultipartKeepalive(cfg.CompleteMultipartKeepalive),
 		// Ingot stores keys as opaque byte strings in an MST, not as
 		// filesystem paths, so the path-traversal key guard does not apply:
 		// keys like "../file.txt" are legal literal S3 keys and must round-trip.
@@ -811,9 +850,6 @@ func validateServerInputs(cfg config.ServerConfig, deps ServerDeps) error {
 	}
 	if deps.Locations == nil {
 		return errors.New("ingot: ServerDeps.Locations is required")
-	}
-	if deps.BlobRefs == nil {
-		return errors.New("ingot: ServerDeps.BlobRefs is required")
 	}
 	if deps.GC == nil {
 		return errors.New("ingot: ServerDeps.GC is required")

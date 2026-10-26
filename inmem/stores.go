@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"slices"
 	"sort"
 	"time"
 
@@ -31,66 +32,62 @@ var (
 )
 
 // BlobRefStore ===============================================================
-func (m *MemStore) AddBlobClaim(_ context.Context, c registry.BlobClaim) error {
-	return m.AddBlobClaims(context.Background(), []registry.BlobClaim{c})
-}
+//
+// The index is written by CommitRoot (store.go) alone; the helpers below are
+// its steps, under the mutex.
 
-func (m *MemStore) AddBlobClaims(_ context.Context, claims []registry.BlobClaim) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	// Every digest is checked before any claim is recorded: a refusal
-	// records nothing.
-	for _, c := range claims {
-		if pr, ok := m.releases[locKey{c.Space, string(c.Digest)}]; ok && !pr.StartedAt.IsZero() {
-			return registry.ErrReleaseInProgress
-		}
-		if _, ok := m.locations[locKey{c.Space, string(c.Digest)}]; !ok {
-			return registry.ErrReleaseInProgress // released to completion since the write settled it
-		}
+// claimRefusedLocked is the check a claim of a new generation passes before
+// a commit records it: ErrReleaseInProgress while a started release holds
+// the digest, or when the space has no location for it (see
+// registry.RootCommit.Claims).
+func (m *MemStore) claimRefusedLocked(c registry.BlobClaim) error {
+	if pr, ok := m.releases[locKey{c.Space, string(c.Digest)}]; ok && !pr.StartedAt.IsZero() {
+		return registry.ErrReleaseInProgress
 	}
-	for _, c := range claims {
-		k := claimKey{string(c.Digest), c.Bucket, c.ObjectKey, c.VersionID}
-		cp := c
-		cp.Digest = bytes.Clone(c.Digest)
-		m.blobRefs[k] = cp
-		// Committed blobs' intents are published, atomically with the claim.
-		ik := locKey{c.Space, string(c.Digest)}
-		if in, ok := m.intents[ik]; ok && in.State != registry.IntentPublished {
-			in.State = registry.IntentPublished
-			in.UpdatedAt = time.Now()
-			m.intents[ik] = in
-		}
+	if _, ok := m.locations[locKey{c.Space, string(c.Digest)}]; !ok {
+		return registry.ErrReleaseInProgress // released to completion since the write settled it
 	}
 	return nil
 }
 
-func (m *MemStore) PinBlobClaims(_ context.Context, claims []registry.BlobClaim) (bool, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	// All or nothing: every digest is checked before any claim is written.
-	for _, c := range claims {
-		k := claimKey{string(c.Digest), c.Bucket, c.ObjectKey, c.VersionID}
-		if _, ok := m.blobRefs[k]; ok {
-			continue
-		}
-		if m.countClaimsLocked(c.Space, c.Digest) == 0 {
-			return false, nil
-		}
+// pinRefusedLocked reports whether a pinned claim finds no claim of the
+// space on its digest to join (see registry.RootCommit.Pins). A pin already
+// recorded is its own claim.
+func (m *MemStore) pinRefusedLocked(c registry.BlobClaim) bool {
+	if _, ok := m.blobRefs[claimKey{string(c.Digest), c.Bucket, c.ObjectKey, c.VersionID}]; ok {
+		return false
 	}
-	for _, c := range claims {
-		k := claimKey{string(c.Digest), c.Bucket, c.ObjectKey, c.VersionID}
-		cp := c
-		cp.Digest = bytes.Clone(c.Digest)
-		m.blobRefs[k] = cp
-	}
-	return true, nil
+	return m.countClaimsLocked(c.Space, c.Digest) == 0
 }
 
-func (m *MemStore) DeleteBlobClaim(_ context.Context, digest multihash.Multihash, bucket, objectKey, versionID string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	delete(m.blobRefs, claimKey{string(digest), bucket, objectKey, versionID})
-	return nil
+// addClaimLocked records one claim. A new generation's claim publishes the
+// digest's upload intent, atomically with the claim; a pin joins a claim
+// that did so already.
+func (m *MemStore) addClaimLocked(c registry.BlobClaim, publish bool) {
+	k := claimKey{string(c.Digest), c.Bucket, c.ObjectKey, c.VersionID}
+	cp := c
+	cp.Digest = bytes.Clone(c.Digest)
+	m.blobRefs[k] = cp
+	if !publish {
+		return
+	}
+	ik := locKey{c.Space, string(c.Digest)}
+	if in, ok := m.intents[ik]; ok && in.State != registry.IntentPublished {
+		in.State = registry.IntentPublished
+		in.UpdatedAt = time.Now()
+		m.intents[ik] = in
+	}
+}
+
+// dropClaimLocked deletes one claim and records the blob's release, due at
+// due, when the claim was the space's last on the digest (see
+// registry.RootCommit.Drops).
+func (m *MemStore) dropClaimLocked(d registry.ClaimDrop, due time.Time) {
+	delete(m.blobRefs, claimKey{string(d.Digest), d.Bucket, d.ObjectKey, d.VersionID})
+	if m.countClaimsLocked(d.Space, d.Digest) != 0 {
+		return
+	}
+	m.enqueueReleaseLocked(d.Space, d.Digest, due)
 }
 
 func (m *MemStore) CountClaims(_ context.Context, space did.DID, digest multihash.Multihash) (int, error) {
@@ -108,17 +105,6 @@ func (m *MemStore) countClaimsLocked(space did.DID, digest multihash.Multihash) 
 		}
 	}
 	return n
-}
-
-func (m *MemStore) DropClaimEnqueueRelease(_ context.Context, digest multihash.Multihash, bucket, objectKey, versionID string, space did.DID, notBefore time.Time) (bool, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	delete(m.blobRefs, claimKey{string(digest), bucket, objectKey, versionID})
-	if m.countClaimsLocked(space, digest) != 0 {
-		return false, nil
-	}
-	m.enqueueReleaseLocked(space, digest, notBefore)
-	return true, nil
 }
 
 // PendingReleaseStore =========================================================
@@ -646,6 +632,20 @@ func (m *MemStore) DeletePark(_ context.Context, space did.DID, digest multihash
 	return nil
 }
 
+// ConcludePark swaps the park for the location under one lock, as Postgres
+// does in one transaction, when the park is the one addTask names.
+func (m *MemStore) ConcludePark(_ context.Context, loc registry.BlobLocation, addTask []byte) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := locKey{loc.Space, string(loc.Digest)}
+	if park, ok := m.parks[key]; !ok || !bytes.Equal(park.AddTask, addTask) {
+		return false, nil
+	}
+	delete(m.parks, key)
+	m.locations[key] = cloneLocation(loc)
+	return true, nil
+}
+
 // InclusionStore =============================================================
 
 func (m *MemStore) PutInclusions(_ context.Context, incs []registry.BlobInclusion) error {
@@ -745,14 +745,15 @@ func (m *MemStore) DeleteSession(_ context.Context, uploadID string) error {
 	return nil
 }
 
-func (m *MemStore) PutPart(_ context.Context, p registry.MultipartPart, tree *registry.PartTree) error {
+func (m *MemStore) PutPart(_ context.Context, p registry.MultipartPart, tree *registry.PartTree) ([]registry.PendingRelease, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if s, ok := m.sessions[p.UploadID]; !ok || s.State != registry.SessionOpen {
-		return registry.ErrNotFound // FK to multipart_sessions, and open only
+	sess, ok := m.sessions[p.UploadID]
+	if !ok || sess.State != registry.SessionOpen {
+		return nil, registry.ErrNotFound // FK to multipart_sessions, and open only
 	}
 	if p.State == "" {
-		p.State = registry.PartParked
+		p.State = registry.PartSpooled
 	}
 	if p.CreatedAt.IsZero() {
 		p.CreatedAt = time.Now()
@@ -762,19 +763,115 @@ func (m *MemStore) PutPart(_ context.Context, p registry.MultipartPart, tree *re
 		byNum = map[int]registry.MultipartPart{}
 		m.parts[p.UploadID] = byNum
 	}
+	// The mutex serialises writes of one part number, so the row replaced
+	// is the one whose blobs' releases are recorded, as under the advisory
+	// lock in Postgres: one record per digest the replaced row named and
+	// this part does not, due now, with the part.
+	var released []registry.PendingRelease
+	if old, ok := byNum[p.PartNumber]; ok {
+		keep := map[string]bool{}
+		for _, d := range p.BlobDigests {
+			keep[string(d)] = true
+		}
+		for _, d := range old.BlobDigests {
+			if keep[string(d)] {
+				continue
+			}
+			keep[string(d)] = true
+			released = append(released, m.enqueueReleaseLocked(sess.Space, d, time.Now()))
+		}
+	}
 	byNum[p.PartNumber] = clonePart(p)
 	// The tree row follows the part row, as in Postgres.
 	trees := m.partTrees[p.UploadID]
 	if tree == nil {
 		delete(trees, p.PartNumber)
-		return nil
+		return released, nil
 	}
 	if trees == nil {
 		trees = map[int]*registry.PartTree{}
 		m.partTrees[p.UploadID] = trees
 	}
 	trees[p.PartNumber] = cloneTree(tree)
-	return nil
+	return released, nil
+}
+
+// MoveParts mirrors Postgres's guarded update: each row must still be in
+// from and still name the digests it was read with.
+func (m *MemStore) MoveParts(_ context.Context, parts []registry.MultipartPart, from, to string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	moved := 0
+	for _, want := range parts {
+		p, ok := m.parts[want.UploadID][want.PartNumber]
+		sameDigests := slices.EqualFunc(p.BlobDigests, want.BlobDigests, func(a, b multihash.Multihash) bool { return bytes.Equal(a, b) })
+		if !ok || p.State != from || !sameDigests {
+			continue
+		}
+		p.State = to
+		m.parts[want.UploadID][want.PartNumber] = p
+		moved++
+	}
+	return moved, nil
+}
+
+// ListParkedParts returns copies of up to limit of uploadID's parked parts,
+// in part-number order.
+func (m *MemStore) ListParkedParts(ctx context.Context, uploadID string, limit int) ([]registry.MultipartPart, error) {
+	parts, err := m.ListParts(ctx, uploadID)
+	if err != nil {
+		return nil, err
+	}
+	var out []registry.MultipartPart
+	for _, p := range parts {
+		if p.State == registry.PartParked && len(out) < limit {
+			out = append(out, p)
+		}
+	}
+	return out, nil
+}
+
+// OldestParkedPart returns when the oldest parked part of an open or
+// completing session was recorded.
+func (m *MemStore) OldestParkedPart(context.Context) (time.Time, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var oldest time.Time
+	found := false
+	for uploadID, byNum := range m.parts {
+		s, ok := m.sessions[uploadID]
+		if !ok || (s.State != registry.SessionOpen && s.State != registry.SessionCompleting) {
+			continue
+		}
+		for _, p := range byNum {
+			if p.State == registry.PartParked && (!found || p.CreatedAt.Before(oldest)) {
+				oldest, found = p.CreatedAt, true
+			}
+		}
+	}
+	return oldest, found, nil
+}
+
+// ListUploadsWithParkedParts returns the open and completing sessions with a
+// parked part.
+func (m *MemStore) ListUploadsWithParkedParts(context.Context) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []string
+	for uploadID, byNum := range m.parts {
+		s, ok := m.sessions[uploadID]
+		if !ok || (s.State != registry.SessionOpen && s.State != registry.SessionCompleting) {
+			continue
+		}
+		for _, p := range byNum {
+			if p.State == registry.PartParked {
+				out = append(out, uploadID)
+				break
+			}
+		}
+	}
+	sort.Strings(out)
+	return out, nil
 }
 
 // ListPartTrees returns copies of the upload's tree rows by part number.
@@ -971,6 +1068,7 @@ func clonePart(p registry.MultipartPart) registry.MultipartPart {
 		}
 		p.BlobDigests = ds
 	}
+	p.SpanLengths = slices.Clone(p.SpanLengths)
 	return p
 }
 
@@ -1240,6 +1338,30 @@ func (m *MemStore) StartRelease(_ context.Context, space did.DID, digest multiha
 		m.releases[k] = pr
 	}
 	return registry.ReleaseStarted, nil
+}
+
+func (m *MemStore) GetRelease(_ context.Context, space did.DID, digest multihash.Multihash) (*registry.PendingRelease, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	pr, ok := m.releases[locKey{space, string(digest)}]
+	if !ok {
+		return nil, registry.ErrNotFound
+	}
+	cp := pr
+	cp.Digest = multihash.Multihash(bytes.Clone(pr.Digest))
+	return &cp, nil
+}
+
+func (m *MemStore) ReleasingDigests(_ context.Context, space did.DID, digests []multihash.Multihash) (map[string]bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := map[string]bool{}
+	for _, d := range digests {
+		if _, ok := m.releases[locKey{space, string(d)}]; ok {
+			out[string(d)] = true
+		}
+	}
+	return out, nil
 }
 
 func (m *MemStore) CancelRelease(_ context.Context, space did.DID, digest multihash.Multihash) (registry.ReleaseCancel, error) {

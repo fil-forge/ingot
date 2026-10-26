@@ -63,7 +63,7 @@ func openTestManager(t *testing.T, dir string, meta Meta, flush *recordingFlush)
 func appendFor(t *testing.T, m *Manager, bucket, payload string) block.Block {
 	t.Helper()
 	blk := makeBlock(t, []byte(payload))
-	err := m.AppendBatch(context.Background(), []block.Block{blk}, blockstore.OpRoot{
+	_, err := m.AppendBatch(context.Background(), []block.Block{blk}, blockstore.OpRoot{
 		Bucket: bucket,
 		Root:   makeRoot(t, bucket+"/"+payload),
 	})

@@ -15,24 +15,22 @@ import (
 	"github.com/fil-forge/smelt/pkg/stack"
 )
 
-// TestForgeDeferredMultipart is the deferred-accept regression gate (§7.2):
-// UploadPart must make each part blob durable on piri WITHOUT accepting it
-// (parked — outside the PDP pipeline), Complete must conclude (accept) every
-// part, and Abort must unwind parked blobs with /blob/abort → /blob/reject.
+// TestForgeDeferredMultipart is the multipart acceptance gate (§7.2):
+// UploadPart must make each part blob durable on piri as a parked blob, the
+// upload's acceptor must accept it while the upload is still open, and
+// Complete must commit an object whose every blob is accepted. An abort after
+// the parts are accepted removes them (/blob/remove, which sprue forwards to
+// piri as /blob/release); they are never rejected as parked.
 //
-// Runs on the stock smelt-SDK images like every other itest. It needs
-// piri:main ≥ fil-forge/piri#30 (/blob/reject) and sprue:main ≥
-// fil-forge/sprue#33 (/blob/abort forwarding); until piri#30 publishes,
-// point INGOT_ITEST_PIRI_IMAGE at a branch image (the forgeStack escape
-// hatch).
+// Runs on the stock smelt-SDK images like every other itest.
 func TestForgeDeferredMultipart(t *testing.T) {
 	ctx := t.Context()
 	s, endpoint := forgeStack(t)
 	accessKey, secretKey := hiltProvisionTenant(t, ctx, s, "mpdeferred")
 	cl := sdkClient(forgeS3Conf(endpoint, accessKey, secretKey))
 
-	// RoundTrip: parts park at UploadPart (durable on piri, NOT accepted),
-	// Complete concludes them, and the object round-trips.
+	// RoundTrip: parts park at UploadPart, the acceptor accepts them before
+	// Complete is called, and the object round-trips.
 	t.Run("RoundTrip", func(t *testing.T) {
 		const bucket, key = "mp-deferred", "obj"
 		if _, err := cl.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
@@ -76,13 +74,11 @@ func TestForgeDeferredMultipart(t *testing.T) {
 			t.Fatalf("parts stored %d blobs, want one per part (%d)", len(partDigests), len(partData))
 		}
 
-		// The parts are durable on piri (allocated + PUT) but parked: no
-		// /blob/accept for their digests until Complete.
+		// The parts are durable on piri and accepted while the upload is
+		// still open: Complete has nothing left to accept.
 		for _, d := range partDigests {
 			waitForPiriReceived(t, ctx, s, 30*time.Second, d)
-			if piriLogHasLine(t, ctx, s, "/blob/accept", d) {
-				t.Fatalf("part blob %s was accepted before Complete — parking is broken", d)
-			}
+			waitForPiriLogLine(t, ctx, s, 60*time.Second, "/blob/accept", d)
 		}
 
 		comp, err := cl.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
@@ -96,19 +92,14 @@ func TestForgeDeferredMultipart(t *testing.T) {
 			t.Fatalf("complete ETag = %q, want a multipart -2 suffix", et)
 		}
 
-		// Complete concluded every part: accepts landed on piri, and the
-		// object round-trips.
-		for _, d := range partDigests {
-			waitForPiriLogLine(t, ctx, s, 60*time.Second, "/blob/accept", d)
-		}
 		if got := getBody(t, ctx, cl, bucket, key, ""); !bytes.Equal(got, whole) {
 			t.Fatalf("GET mismatch: got %d bytes, want %d", len(got), len(whole))
 		}
 	})
 
-	// AbortRejects: an aborted upload's parked blobs are unwound on piri
-	// via /blob/reject — never accepted, bytes released.
-	t.Run("AbortRejects", func(t *testing.T) {
+	// AbortRemoves: an upload aborted after its part was accepted removes the
+	// part's blob from piri as an accepted one.
+	t.Run("AbortRemoves", func(t *testing.T) {
 		const bucket, key = "mp-abort-unalloc", "obj"
 		if _, err := cl.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
 			t.Fatalf("CreateBucket: %v", err)
@@ -127,7 +118,7 @@ func TestForgeDeferredMultipart(t *testing.T) {
 			t.Fatalf("UploadPart: %v", err)
 		}
 		digest := partBlobDigests(t, ctx, s, aws.ToString(create.UploadId), 1)[0]
-		waitForPiriReceived(t, ctx, s, 30*time.Second, digest)
+		waitForPiriLogLine(t, ctx, s, 60*time.Second, "/blob/accept", digest)
 
 		if _, err := cl.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
 			Bucket: aws.String(bucket), Key: aws.String(key), UploadId: create.UploadId,
@@ -135,13 +126,13 @@ func TestForgeDeferredMultipart(t *testing.T) {
 			t.Fatalf("AbortMultipartUpload: %v", err)
 		}
 
-		// The abort traversed ingot → sprue → piri (as /blob/reject), and the blob was
-		// never accepted.
-		waitForPiriLogLine(t, ctx, s, 60*time.Second, "/blob/reject", digest)
-		if piriLogHasLine(t, ctx, s, "/blob/accept", digest) {
-			t.Fatalf("aborted part blob %s was accepted — abort/accept exclusivity is broken", digest)
+		// The abort traversed ingot → sprue → piri as a removal of an
+		// accepted blob, and never as a reject of a parked one.
+		waitForPiriLogLine(t, ctx, s, 60*time.Second, "/blob/release", digest)
+		if piriLogHasLine(t, ctx, s, "/blob/reject", digest) {
+			t.Fatalf("aborted part blob %s was rejected as parked after it was accepted", digest)
 		}
-		t.Logf("abort unwound parked blob %s via /blob/reject", digest)
+		t.Logf("abort removed accepted part blob %s via /blob/release", digest)
 	})
 }
 

@@ -52,6 +52,7 @@ package iam
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"slices"
@@ -186,7 +187,35 @@ func (s *Service) GetUserAccountForRequest(ctx fiber.Ctx, accessKeyStr string) (
 	// so the Hilt round-trip is bounded by the request's lifetime.
 	reqCtx := ctx.RequestCtx()
 	req := fasthttputil.RequestFromHTTPContext(reqCtx)
+	// The body travels to Hilt only for the operations whose body decides a
+	// permission (a DeleteObjects' entries may name versions), which Hilt's
+	// classifier names; every other request goes without one, so a streaming
+	// write's body is never read here. It is captured up to Hilt's limit and
+	// no further, since nothing about the request is verified yet, and left
+	// in place for the handler. Hilt binds it to the signature before reading
+	// it, and so does the fast path.
+	if op, err := hiltauth.OperationFor(req); err == nil && op.ReadsBody() {
+		body, err := fasthttputil.LimitedBody(reqCtx, hiltauth.MaxBodySize)
+		if errors.Is(err, fasthttputil.ErrBodyTooLarge) {
+			path = "local"
+			s.logger.Debug("hilt/iam: request body over the limit", zap.String("access", accessKeyStr), zap.Stringer("operation", op))
+			return auth.Account{}, s3err.GetAPIError(s3err.ErrEntityTooLarge)
+		}
+		if err != nil {
+			return auth.Account{}, fmt.Errorf("hilt/iam: %w", err)
+		}
+		req.Body = body
+	}
 	ctx.Locals(reqscope.RequestKey(), req)
+
+	// A query naming two subresources addresses no operation. S3 refuses it
+	// before authenticating the request, and so does the gateway: Hilt's own
+	// classifier names the refusal, so there is nothing to ask Hilt.
+	if _, _, err := hiltauth.RequirementsFor(req); errors.Is(err, hiltauth.ErrConflictingQuery) {
+		path = "local"
+		s.logger.Debug("hilt/iam: request names two subresources", zap.String("access", accessKeyStr), zap.Error(err))
+		return auth.Account{}, conflictingQuery(err.Error())
+	}
 
 	// Scope this key's proof store onto the request so an onward Forge
 	// retrieval (blockstore.Forge, which has only ctx + space) uses THIS
@@ -195,6 +224,9 @@ func (s *Service) GetUserAccountForRequest(ctx fiber.Ctx, accessKeyStr string) (
 	// fails, and needed whichever path authorizes.
 	store := s.proofs.For(accessKeyID)
 	ctx.Locals(reqscope.ProofStoreKey(), ucanlib.ProofStore(store))
+	// The same store holds the key's action sets, which the backend consults
+	// for what the URL does not show (a DeleteObjects entry naming a version).
+	ctx.Locals(reqscope.ActionsKey(), reqscope.ActionSet(store))
 
 	// Local fast path: with a cached verification key, a cached action set
 	// permitting the request's S3 action on every bucket it acts on, and
@@ -260,6 +292,12 @@ func (s *Service) GetUserAccountForRequest(ctx fiber.Ctx, accessKeyStr string) (
 		ctx.Locals(reqscope.ProofStoreKey(), ucanlib.ProofStore(scoped))
 		// Refetches bucket info already fetched above; rare (a failed Hilt commit).
 		s.cacheProofs(reqCtx, scoped, ctr, req, accessKeyID)
+		// The action set too, held for this request alone.
+		scopedTTL := untilNextUTCMidnight(time.Now())
+		if ok.Bucket != nil {
+			scoped.PutPermissions(*ok.Bucket, scopedTTL, ok.Permissions.Entries[accessKeyID])
+		}
+		ctx.Locals(reqscope.ActionsKey(), reqscope.ActionSet(scoped))
 		ctx.Locals(reqscope.TenantKey(), ok.Tenant)
 		s.logger.Info("hilt/iam: authorize response carries a revoked delegation, not cached",
 			zap.String("access", accessKeyStr), zap.Stringer("tenant", ok.Tenant))
@@ -352,6 +390,8 @@ func mapAuthError(err error) (error, bool) {
 		return s3err.GetAPIError(s3err.ErrExpiredPresignRequest), true
 	case hiltauth.UnsupportedOperationErrorName:
 		return s3err.GetAPIError(s3err.ErrNotImplemented), true
+	case hiltauth.ConflictingQueryErrorName:
+		return conflictingQuery(named.Error()), true
 	case hiltauth.UnknownBucketErrorName:
 		return s3err.GetAPIError(s3err.ErrNoSuchBucket), true
 	case hiltauth.TenantDisabledErrorName,
@@ -362,9 +402,10 @@ func mapAuthError(err error) (error, bool) {
 		// Another tenant's bucket is AccessDenied, as S3 answers for another
 		// account's bucket: bucket names are global, so existence is no secret.
 		hiltauth.ForeignBucketErrorName,
-		// A copy whose source header the signature does not cover cannot be
-		// authorized; the SDKs always sign it.
-		hiltauth.UnsignedCopySourceErrorName:
+		// A header the signature does not cover, or a body it does not bind,
+		// cannot be authorized on; the SDKs sign both.
+		hiltauth.UnsignedHeaderErrorName,
+		hiltauth.InvalidBodyErrorName:
 		return s3err.GetAPIError(s3err.ErrAccessDenied), true
 	case hiltauth.TemporarilyUnavailableErrorName:
 		// An authorize that waited out Hilt's lock timeout behind a policy
@@ -382,10 +423,6 @@ func mapAuthError(err error) (error, bool) {
 		return nil, false
 	}
 }
-
-// copySourceHeader names a copy's source object; it is only trusted when the
-// request signature covers it.
-const copySourceHeader = "x-amz-copy-source"
 
 // authorizeLocal is the fast path, mirroring Hilt's own verification and
 // authorization order over THIS key's proof store: signature, then per
@@ -432,17 +469,17 @@ func (s *Service) authorizeLocal(ctx context.Context, req s3.Request, access str
 		return auth.Account{}, false, nil
 	}
 
-	// 3. Every bucket the request acts on, with the permission it needs there:
-	// the addressed bucket, plus the copy source for CopyObject and
-	// UploadPartCopy. Operations on no existing bucket (create/delete/
-	// list-buckets) yield none — they go to Hilt regardless. A copy's source
-	// is named by a header, which the signature covers only when listed in
-	// SignedHeaders; Hilt refuses an unsigned one, and so does the fast path.
+	// 3. Every bucket the request acts on, with the permissions it needs
+	// there: the addressed bucket with each permission the operation and its
+	// headers put on it (a lock or tags set by a write), plus the copy source
+	// for CopyObject and UploadPartCopy. Operations on no existing bucket
+	// (create/delete/list-buckets) yield none — they go to Hilt regardless.
+	// The source and the headers that add a permission are decided from
+	// headers, which the signature covers only when listed in SignedHeaders;
+	// Hilt's classifier refuses an unsigned one, as Hilt itself does, and
+	// the fast path then decides nothing: Hilt answers with the refusal.
 	op, reqs, err := hiltauth.RequirementsFor(req)
 	if err != nil || len(reqs) == 0 {
-		return auth.Account{}, false, nil
-	}
-	if op.CopiesSource() && !sr.HeaderSigned(copySourceHeader) {
 		return auth.Account{}, false, nil
 	}
 
@@ -663,6 +700,17 @@ func (*Service) Shutdown() error {
 func MapAuthError(err error) (error, bool) { return mapAuthError(err) }
 
 // malformedPolicy is the S3 error for a PutBucketPolicy body Hilt refuses.
+// conflictingQuery is S3's answer to a query naming two subresources: 400
+// InvalidArgument, naming the parameters. message is Hilt's, "conflicting
+// query string parameters: a, b"; the names follow the colon.
+func conflictingQuery(message string) s3err.InvalidArgumentError {
+	description := "Conflicting query string parameters"
+	if _, names, ok := strings.Cut(message, ": "); ok && names != "" {
+		description += ": " + names
+	}
+	return s3err.InvalidArgumentError{Description: description}
+}
+
 func malformedPolicy(description string) s3err.APIError {
 	return s3err.APIError{Code: "MalformedPolicy", Description: description, HTTPStatusCode: http.StatusBadRequest}
 }

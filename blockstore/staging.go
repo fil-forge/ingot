@@ -85,32 +85,33 @@ func (b *OpStaging) Put(_ context.Context, blk block.Block) error {
 // Commit hands every staged block + (bucket, root) to the log in one
 // AppendBatch. After Commit returns nil, the blocks AND the op-root
 // are durable on disk; the caller may advance the bucket's published
-// Root.
+// Root, journaling the returned batch in the same transaction.
 //
 // An empty blocks slice is legal: an MST mutation can produce a
 // new root that points at a node already materialized in a prior
 // segment (e.g., trimTop after Delete unwraps to an existing
 // subtree). The bucket Root still needs to advance, so AppendBatch
 // is called with an empty payload and the OpRoot record alone.
-func (b *OpStaging) Commit(ctx context.Context, root cid.Cid) error {
+func (b *OpStaging) Commit(ctx context.Context, root cid.Cid) (Appended, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	if !root.Defined() {
-		return errors.New("opstaging: commit with undefined root")
+		return Appended{}, errors.New("opstaging: commit with undefined root")
 	}
 
 	cat := make([]block.Block, len(b.order))
 	for i, c := range b.order {
 		cat[i] = b.blocks[string(c.Bytes())]
 	}
-	if err := b.log.AppendBatch(ctx, cat, OpRoot{Bucket: b.bucket, Root: root}); err != nil {
-		return fmt.Errorf("opstaging: append: %w", err)
+	seg, err := b.log.AppendBatch(ctx, cat, OpRoot{Bucket: b.bucket, Root: root})
+	if err != nil {
+		return Appended{}, fmt.Errorf("opstaging: append: %w", err)
 	}
 
 	b.blocks = map[string]block.Block{}
 	b.order = nil
-	return nil
+	return Appended{Segment: seg, Blocks: cat}, nil
 }
 
 // Discard drops any staged blocks without writing them. Use when the

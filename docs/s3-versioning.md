@@ -234,11 +234,14 @@ must also register `ObjectLeaf` and `VersionNode`).
 2. **`Current.Seq` is the maximum seq among the key's versions.** Writes always install the newest
    version as `Current`; deleting the current version promotes the largest remaining seq (§7.2).
 3. **`Prev` holds exactly the noncurrent versions**, keyed newest-first.
-4. **`seq` is strictly increasing in commit order per bucket.** Allocation happens inside the
-   per-bucket critical section (§5.1); in-process the `bucketop` mutex serializes it, and the
-   `CASRoot` conflict behavior covers cross-process races.
+4. **`seq` is strictly increasing in commit order per bucket, except for a reserved seq.**
+   Allocation happens inside the per-bucket critical section (§5.1); in-process the `bucketop`
+   mutex serializes it, and the `CASRoot` conflict behavior covers cross-process races. A
+   multipart Complete in an Enabled bucket reserves its seq before it accepts the parts (§5.1),
+   so writes to other keys can commit with later seqs ahead of it. Within a key, invariant 2
+   still holds: the commit refuses a reservation older than the key's current version.
    `seq` starts at 1; 0 is reserved to mean "none" (`NullSeq`).
-5. **A version's identity never changes.** `Seq`/`VersionID` are minted once at commit; promotion
+5. **A version's identity never changes.** `Seq`/`VersionID` are minted once; promotion
    moves a `VersionNode` between `Prev` and `Current` without rewriting its manifest.
 6. **A manifest-arm value holds exactly one version.** The leaf arm appears with the key's
    second version (§5.2) and persists until the key itself is deleted: version-scoped deletes
@@ -351,6 +354,25 @@ Every write allocates a seq — including unversioned/suspended null writes — 
 has a real position if the bucket is later Enabled (`Versioning_PutObject_null_versionId_obj`
 depends on this: a pre-versioning object must list *below* later numbered versions). If the
 commit fails or retries, the seq is a gap; gaps are harmless (`architecture.md` §3).
+
+**Reserved seq.** A multipart Complete in an Enabled bucket allocates its seq and mints its id
+before it accepts the parts, outside the lock, and reports the id to versitygw
+(`backend.CompleteMultipartUploadReporter`). A slow Complete's response commits its headers before
+the completion finishes, after waiting for the report, and S3 sends `x-amz-version-id` with them.
+The reported id is binding, so the commit installs it unchanged, and under the lock refuses it
+(`errReservationSuperseded`, a retryable InternalError that reopens the upload) when:
+
+- the key's current version has a larger seq: another write to the key committed during the
+  Complete, and the reservation can no longer be the newest version (invariant 2); or
+- the bucket is no longer Enabled, so the version would be null.
+
+The client's retry reserves a fresh seq. Unversioned and suspended buckets send no version id, so
+their Completes report `""` and allocate under the lock as every other write does. So does a
+Complete that waited on another Complete of its upload: it reports `""` before waiting, since the
+other one's id isn't known yet. A Complete that reported `""` commits only a null version: if the
+bucket is Enabled at its commit (versioning was enabled meanwhile, or the Complete it waited on
+failed and this one won), the commit is refused the same way, since the client could never learn
+the numbered version's id.
 
 ### 5.2 Supersession
 
@@ -532,26 +554,29 @@ and to version-scoped deletes, evaluated against the target version.
 `blob_refs` rows carry each version's id: the `registry.NullVersionID` sentinel at
 object.go:336/:345 is replaced by each version's `VersionID` (null versions carry the id
 `"null"`, so rows for unversioned buckets keep that id). The interfaces already carry
-`versionID` everywhere (`registry.BlobRefStore`, stores.go:114-120); no schema or interface
-change.
+`versionID` everywhere (`registry.BlobClaim`, `registry.ClaimDrop`); no schema change.
 
-Rules, preserving the commit-then-reconcile ordering (reconcile strictly after a successful
-`WithTx`, object.go:196-202):
+Rules. Every claim and drop is carried by the commit (`bucketop.Tx.ClaimBlobs` /
+`DropClaims`, written by `registry.CommitRoot` in the root swap's transaction), so a version
+is published with its claims and its discards' drops or not at all:
 
-- **New version** → `AddBlobClaim` for each body digest with the new `VersionID`. Retained
+- **New version** → a claim for each body digest with the new `VersionID`. Retained
   superseded versions keep their rows untouched — under Enabled, an overwrite **releases nothing**.
-- **Discarded versions** (§5.2 discards, §7.2 removals, unversioned overwrite/delete) →
-  `DeleteBlobClaim` per digest with the *discarded* version's id; `CountClaims == 0` →
-  `RemoveBlob`. The evicted-prev-null case fetches the evicted manifest during
-  the commit to learn its digests.
+- **Discarded versions** (§5.2 discards, §7.2 removals, unversioned overwrite/delete) → a drop
+  per digest with the *discarded* version's id; a drop of the space's last claim on a digest
+  records the blob's release in the same transaction, due the release grace after the commit.
+  The evicted-prev-null case fetches the evicted manifest during the commit to learn its
+  digests.
 - **Same-id replacement** (null replacing null — the only case where new and discarded share a
-  `(bucket, key, version_id)` row key) → the existing set-diff `reconcileClaims`
-  (object.go:327) so unchanged digests are never dropped-then-re-added.
+  `(bucket, key, version_id)` row key): the claim ids differ all the same (`claimVersionID`
+  keys each generation by its seq), so the new generation's claims land and the old one's
+  drop as any other pair; an unchanged digest keeps a claim throughout, so no release is
+  recorded for it.
 - **Delete markers** have no digests: no claims in, none out.
 
 Dedup interactions stay safe by construction: N versions referencing one digest are N rows;
-`RemoveBlob` fires only when the last row for `(space, digest)` goes. `RemoveBlob` itself is
-the *ingot-side* release: it invokes `/blob/remove` (uploader/blob.go:248), which drops this
+the release is recorded only when the last row for `(space, digest)` goes, and runs once
+its grace has passed. The release is the *ingot-side* step: it invokes `/blob/remove`, which drops this
 space's claim on the network. Whether the bytes are physically deleted is then Piri's decision,
 made on its own accounting across every space that claims the blob (`architecture.md` §9) —
 ingot's index answers only "does any version in this bucket still need the digest".
@@ -632,7 +657,7 @@ MFA delete, lifecycle expiration, and multi-instance seq arbitration beyond the 
 | `bucket/manifest.go` | `Seq`, `VersionID` fields (§2.3) |
 | `registry/registry.go`, `postgres.go`, `inmem/store.go` | `State.Versioning`, `VersioningState`, `SetVersioning`, `AllocVersionSeq` (§4.1) |
 | `s3frontend/version.go` (new) | token mint/parse/classify (§3), `revSeqKey`, the value-union dispatch (§2.1), `resolveVersion` (§6.1), the write rule (§5.2), prev-tree helpers |
-| `s3frontend/object.go` | `PutObject` splice → write rule; reads resolve via `resolveVersion`; `GetObject`/`HeadObject` versionId + marker semantics + output ids; `DeleteObject`/`deleteObjectKey`/`DeleteObjects` (§7); `reconcileClaims` call sites carry real version ids (§8); `listWalk` marker skip (§9.1) |
+| `s3frontend/object.go` | `PutObject` splice → write rule; reads resolve via `resolveVersion`; `GetObject`/`HeadObject` versionId + marker semantics + output ids; `DeleteObject`/`deleteObjectKey`/`DeleteObjects` (§7); `addClaims` / `dropClaims` call sites carry real version ids (§8); `listWalk` marker skip (§9.1) |
 | `s3frontend/copy.go`, `multipart.go`, `uploadpartcopy.go` | `commitManifest` → write rule; source-version resolution for `CopyObject` and `UploadPartCopy`; `CopySourceVersionId` on both; Complete's `versionid` return |
 | `s3frontend/bucket.go` | `PutBucketVersioning` (new), `GetBucketVersioning` (real states), versioned `DeleteBucket` guard (§7) |
 | `s3frontend/listversions.go` (new) | `ListObjectVersions` (§9.2) |

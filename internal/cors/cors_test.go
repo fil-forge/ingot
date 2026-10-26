@@ -111,7 +111,7 @@ func TestBuild_AllowanceHeaders(t *testing.T) {
 			t.Errorf("Methods = %q, want it to include %s", allowance.Methods, m)
 		}
 	}
-	for _, h := range []string{"ETag", "x-cid"} {
+	for _, h := range []string{"ETag", "x-cid", "Accept-Ranges", "Content-Range"} {
 		if !strings.Contains(allowance.ExposedHeaders, h) {
 			t.Errorf("ExposedHeaders = %q, want it to include %s", allowance.ExposedHeaders, h)
 		}

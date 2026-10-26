@@ -94,3 +94,37 @@ func SetETag(ctx context.Context, etag string) {
 		*holder = etag
 	}
 }
+
+// ActionSet is the requesting access key's effective S3 actions, per bucket,
+// as Hilt last reported them. known is false when no live set is held for
+// the bucket.
+type ActionSet interface {
+	Permits(bucket did.DID, action string) (allowed, known bool)
+}
+
+type actionsContextKey struct{}
+
+var actionsKey any = actionsContextKey{}
+
+// ActionsKey returns the context key under which the requesting access key's
+// [ActionSet] is stored. The IAM service stores the key's own delegation
+// cache, which holds the set Hilt answered with for every bucket the key has
+// been authorized on.
+func ActionsKey() any {
+	return actionsKey
+}
+
+// Permits reports whether the requesting access key may perform action on
+// the bucket whose space is bucket. It is for the checks the gateway makes
+// inside an authorized request, on what the request's URL does not show (a
+// DeleteObjects entry naming a version). It is false when the set is not
+// known: a context that never went through the Hilt-backed IAM service, or
+// a set that expired or was revoked since the request was authorized.
+func Permits(ctx context.Context, bucket did.DID, action string) bool {
+	set, ok := ctx.Value(actionsKey).(ActionSet)
+	if !ok {
+		return false
+	}
+	allowed, known := set.Permits(bucket, action)
+	return allowed && known
+}

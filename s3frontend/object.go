@@ -246,8 +246,8 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 	}
 
 	// COMMIT (short per-bucket critical section): the §5 write rule — seq
-	// allocation, manifest + rebuilt leaf + MST splice + guarded root swap,
-	// then the post-commit reference-index reconcile (docs/s3-versioning.md).
+	// allocation, manifest + rebuilt leaf + MST splice + guarded root swap
+	// carrying the reference-index claims and drops (docs/s3-versioning.md).
 	mf := &msbucket.ObjectManifest{
 		Key:                     key,
 		ContentType:             contentType,
@@ -663,23 +663,22 @@ func (b *Backend) uploadBlob(ctx context.Context, space did.DID, blob msbucket.B
 	return b.recordAccepted(ctx, space, blob.Digest, *res.Location, func() { body.unhold(blob.Digest) })
 }
 
-// reconcileClaims updates blob_refs for ONE version id under (bucket, key)
-// whose body changes from oldDigests to newDigests, and returns the digests
-// whose (space, digest) claim reached zero so the caller can release them after
-// the commit. The diff is the crux of safe dedup + delete:
+// The reference index (blob_refs) is written by the commit: a version's
+// claims on its body digests land, and the discarded versions' claims drop,
+// in the root swap's transaction (bucketop.Tx.Commit, registry.CommitRoot).
+// The diff is the crux of safe dedup + delete:
 //
 //   - a digest in new but not old gains a claim (newly referenced);
 //   - each generation's claim rows are keyed by a per-generation id
 //     (claimVersionID), so racing writers never touch one shared row;
-//   - the new generation's claims are added UNDER the per-bucket commit lock,
-//     before the root swap — a racing writer that supersedes this generation
-//     always finds the rows to drop, and a failed commit blocks at most a
-//     benign extra claim, never a wrong release;
-//   - the superseded generation's claims drop AFTER the commit is durable,
-//     each drop atomically enqueueing a deferred release when the space's
-//     last claim on the digest goes (blob_release_intents); the release
-//     sweeper re-checks the claim count at drain time, so every remaining
-//     interleave converges.
+//   - the new generation's claims and the superseded generation's drops
+//     commit with the root or not at all: a failed commit leaves no claim
+//     behind and drops none, and a crash can neither leave a version
+//     unclaimed nor a discarded one claimed;
+//   - a drop of the space's last claim on a digest records the blob's
+//     deferred release in the same transaction (blob_release_intents); the
+//     release sweeper re-checks the claim count at drain time, so every
+//     remaining interleave converges.
 
 // claimVersionID names a generation's blob_refs rows: the version's ULID
 // token for versioned buckets, or "null#<seq>" for a null version — unique
@@ -691,71 +690,50 @@ func claimVersionID(versionID string, seq uint64) string {
 	return versionID
 }
 
-// errPinnedBlobReleased is returned by a pinned commit whose source body is
-// no longer claimed anywhere in the space: the source was deleted and its
-// blobs are being released, so the copy has nothing to pin.
-var errPinnedBlobReleased = errors.New("pinned blob has no remaining claim")
-
-// addClaims records one claim per DEDUPLICATED digest for a new generation.
-// Runs inside the bucket commit lock (see the invariant note above).
+// addClaims records one claim per DEDUPLICATED digest for a new generation,
+// for the commit to carry (bucketop.Tx.Commit writes them in the root swap's
+// transaction).
 //
 // A body this node ingested is claimed unconditionally. An encrypted body
 // holds fresh digests, which nothing can release before they are claimed. A
 // body stored as received can repeat a digest the space released or is
 // releasing: the write settled that before reusing the blob (settleRelease),
 // by cancelling the release or waiting it out, so no release is past its
-// claim check by the time the claim lands. A body pinned from another object of the space
-// (a same-space copy) holds digests some other version claims, and a
-// release of them may be under way: its claim check and its network removal
-// are separate steps, so a claim added unconditionally in between would
-// commit a manifest over a blob about to go. Pinned digests are therefore
-// claimed conditionally, all in one transaction that requires an existing
-// claim on each and excludes the drop of a last claim (PinBlobClaims); a
-// refused pin records nothing and fails the commit with
-// errPinnedBlobReleased.
-func (b *Backend) addClaims(ctx context.Context, st *registry.State, key, claimID string, digests []multihash.Multihash, pinned bool) error {
+// claim check by the time the claim lands; one that starts in between is
+// caught at the swap (registry.ErrReleaseInProgress, mapped to SlowDown by
+// mapCommitError). A body pinned from another object of the space (a
+// same-space copy) holds digests some other version claims, and a release
+// of them may be under way: its claim check and its network removal are
+// separate steps, so a claim added unconditionally in between would commit
+// a manifest over a blob about to go. Pinned digests are therefore claimed
+// conditionally, each requiring an existing claim and excluding the drop of
+// a last claim (registry.RootCommit.Pins); a refused pin fails the commit
+// with registry.ErrClaimGone, and nothing is written.
+func (b *Backend) addClaims(tx *bucketop.Tx, st *registry.State, key, claimID string, digests []multihash.Multihash, pinned bool) {
 	var claims []registry.BlobClaim
 	for _, d := range digestSet(digests) {
 		claims = append(claims, registry.BlobClaim{Digest: d, Bucket: st.Name, ObjectKey: key, VersionID: claimID, Space: st.Space})
 	}
-	if !pinned {
-		// All or nothing: a commit that fails here leaves no claim behind,
-		// since no generation would ever drop one.
-		if err := b.blobRefs.AddBlobClaims(ctx, claims); err != nil {
-			if errors.Is(err, registry.ErrReleaseInProgress) {
-				// A release of one of the digests started after the write
-				// settled it (settleRelease) and is removing the blob; the
-				// client retries once it has run.
-				return s3err.GetAPIError(s3err.ErrSlowDown)
-			}
-			return fmt.Errorf("add blob claims: %w", err)
-		}
-		return nil
+	if pinned {
+		tx.PinBlobs(claims)
+		return
 	}
-	ok, err := b.blobRefs.PinBlobClaims(ctx, claims)
-	if err != nil {
-		return fmt.Errorf("pin blob claims: %w", err)
-	}
-	if !ok {
-		return errPinnedBlobReleased
-	}
-	return nil
+	tx.ClaimBlobs(claims)
 }
 
-// dropClaims drops a superseded/deleted generation's claims, atomically
-// enqueueing a deferred release for each digest whose last claim goes. Runs
-// after the commit is durable.
-func (b *Backend) dropClaims(ctx context.Context, bucketState *registry.State, key, claimID string, digests []multihash.Multihash) error {
+// dropClaims records a superseded/deleted generation's claims for the commit
+// to drop, in the root swap's transaction; the drop of a space's last claim
+// on a digest records the blob's deferred release, due the release grace
+// after the commit.
+func (b *Backend) dropClaims(tx *bucketop.Tx, st *registry.State, key, claimID string, digests []multihash.Multihash) {
 	if len(digests) == 0 {
-		return nil
+		return
 	}
-	notBefore := time.Now().Add(b.releaseGrace)
+	var drops []registry.ClaimDrop
 	for _, d := range digestSet(digests) {
-		if _, err := b.blobRefs.DropClaimEnqueueRelease(ctx, d, bucketState.Name, key, claimID, bucketState.Space, notBefore); err != nil {
-			return fmt.Errorf("drop blob claim: %w", err)
-		}
+		drops = append(drops, registry.ClaimDrop{Digest: d, Bucket: st.Name, ObjectKey: key, VersionID: claimID, Space: st.Space})
 	}
-	return nil
+	tx.DropClaims(drops, b.releaseGrace)
 }
 
 // releaseOutcome is what one attempt at a deferred release produced, and so
@@ -864,10 +842,16 @@ func (b *Backend) runRelease(ctx context.Context, pr registry.PendingRelease) re
 	if pr.StartedAt.IsZero() && b.spool.HeldBy(pr.Space, pr.Digest) {
 		// A write of this space is between spooling the same bytes and its
 		// commit: it settles the release before it uploads or reuses, and
-		// its claim is checked against the location (AddBlobClaims), so a
+		// its claim is checked against the location at the swap, so a
 		// release not yet started waits for it rather than start under it.
 		// A started one goes on: it owns the blob, and a write holding the
 		// file is waiting for it to finish.
+		return releaseDeferred
+	}
+	if pr.StartedAt.IsZero() && b.isConcluding(pr.Space, pr.Digest) {
+		// A conclude of the blob is in flight here, and its accept may be
+		// registered after a remove sent now (see markConcluding): the
+		// release waits for the next sweep.
 		return releaseDeferred
 	}
 	start, err := b.pendingReleases.StartRelease(ctx, pr.Space, pr.Digest)
@@ -920,20 +904,78 @@ func (b *Backend) runRelease(ctx context.Context, pr registry.PendingRelease) re
 // retries. An encrypted blob has a digest of its own and never has a
 // record here.
 func (b *Backend) settleRelease(ctx context.Context, space did.DID, digest multihash.Multihash) (bool, error) {
+	return b.settle(ctx, space, digest, func() (releaseStanding, error) {
+		c, err := b.pendingReleases.CancelRelease(ctx, space, digest)
+		switch {
+		case err != nil:
+			return 0, fmt.Errorf("cancel release: %w", err)
+		case c == registry.ReleaseNone:
+			return releaseAbsent, nil
+		case c == registry.ReleaseCancelledByWrite:
+			return releaseTaken, nil
+		}
+		return releaseStarted, nil
+	})
+}
+
+// awaitRelease is settleRelease for a part blob, whose part row already
+// names the digest. A record not yet started is left standing rather than
+// cancelled: the row defers it for as long as the row stands (StartRelease
+// reads the live part references first), and it runs once a later upload
+// of the part number replaces the row, which is exactly what such a record
+// says. Cancelled, the obligation would rest on this write alone, which can
+// die before it records the release again. A located blob is reusable
+// beside a pending record, since the record cannot start while the row
+// stands: the lookup takes the claim-key lock a start holds until it
+// commits, so a record it reports pending is not one about to start, and
+// the start that follows finds the row. A started record is waited out as
+// settleRelease waits.
+func (b *Backend) awaitRelease(ctx context.Context, space did.DID, digest multihash.Multihash) (bool, error) {
+	return b.settle(ctx, space, digest, func() (releaseStanding, error) {
+		pr, err := b.pendingReleases.GetRelease(ctx, space, digest)
+		switch {
+		case errors.Is(err, registry.ErrNotFound):
+			return releaseAbsent, nil
+		case err != nil:
+			return 0, fmt.Errorf("lookup release: %w", err)
+		case pr.StartedAt.IsZero():
+			return releaseTaken, nil
+		}
+		return releaseStarted, nil
+	})
+}
+
+// releaseStanding is what a write's probe of a release record found.
+type releaseStanding int
+
+const (
+	// releaseAbsent: no record, or the one waited out has run.
+	releaseAbsent releaseStanding = iota
+	// releaseTaken: a pending record the write settled, by cancelling it or
+	// by leaving it to its part row; the blob is the write's.
+	releaseTaken
+	// releaseStarted: the blob is going; the write waits.
+	releaseStarted
+)
+
+// settle is settleRelease's wait: probe reports the record as the write
+// settles it, and a started one is polled until it has run, up to
+// reuseWaitLimit.
+func (b *Backend) settle(ctx context.Context, space did.DID, digest multihash.Multihash, probe func() (releaseStanding, error)) (bool, error) {
 	deadline := time.Now().Add(reuseWaitLimit)
 	backoff := reuseWaitFirst
 	waited := false
 	for {
-		c, err := b.pendingReleases.CancelRelease(ctx, space, digest)
+		standing, err := probe()
 		if err != nil {
-			return false, fmt.Errorf("cancel release: %w", err)
+			return false, err
 		}
-		switch c {
-		case registry.ReleaseNone:
+		switch standing {
+		case releaseAbsent:
 			// No release, or the one waited out has run and the location
 			// went with it.
 			return !waited, nil
-		case registry.ReleaseCancelledByWrite:
+		case releaseTaken:
 			return true, nil
 		}
 		waited = true
@@ -977,7 +1019,7 @@ func (b *Backend) drainSpaceReleases(ctx context.Context, space did.DID) error {
 		case releaseFailed:
 			return fmt.Errorf("release blob %x", pr.Digest)
 		case releaseDeferred:
-			return fmt.Errorf("release blob %x: a multipart session in flight still references it", pr.Digest)
+			return fmt.Errorf("release blob %x: deferred, as a multipart session in flight still references it or a conclude of it is in flight; retry", pr.Digest)
 		}
 		// Done or stale: the record is gone already (see runRelease).
 	}
@@ -1779,10 +1821,6 @@ func (b *Backend) insertDeleteMarker(ctx context.Context, bucketState *registry.
 // when non-nil, gates the delete on If-Match / size / mod-time under the
 // lock. Shared by DeleteObject and DeleteObjects.
 func (b *Backend) deleteObjectKey(ctx context.Context, bucketState *registry.State, key string, preconds *backend.ObjectDeletePreconditions) error {
-	var oldDigests []multihash.Multihash
-	var oldVersionID string
-	var oldSeq uint64
-	var oldManifest cid.Cid
 	err := b.txns.WithTx(ctx, bucketState.Name, func(ctx context.Context, tx *bucketop.Tx) (cid.Cid, error) {
 		// Empty bucket: nothing to delete. Returning cid.Undef tells WithTx to
 		// discard with no commit — the equivalent of "no-op success."
@@ -1807,7 +1845,7 @@ func (b *Backend) deleteObjectKey(ctx context.Context, bucketState *registry.Sta
 		oldMf := val.Manifest
 		// A manifest-valued key's block is the manifest itself; a leaf key
 		// names it. Either way this is the root the space counted.
-		oldManifest = valCid
+		oldManifest := valCid
 		if val.Leaf != nil {
 			var em msbucket.EnvelopedManifest
 			if err := tx.Get(ctx, tx.State().Space, val.Leaf.Current.Manifest, &em); err != nil {
@@ -1840,11 +1878,17 @@ func (b *Backend) deleteObjectKey(ctx context.Context, bucketState *registry.Sta
 		if err := b.gc.AddGCCandidate(ctx, valCid.Bytes(), bucketState.Name); err != nil {
 			return cid.Undef, fmt.Errorf("gc candidate: %w", err)
 		}
-		if oldDigests, err = bodyDigests(ctx, tx, tx.State().Space, oldMf.Body); err != nil {
+		oldDigests, err := bodyDigests(ctx, tx, tx.State().Space, oldMf.Body)
+		if err != nil {
 			return cid.Undef, err
 		}
-		oldVersionID = oldMf.VersionID
-		oldSeq = oldMf.Seq
+		// The removed version's claims drop with the commit; each last-claim
+		// drop records a deferred release.
+		oldVersionID := oldMf.VersionID
+		if oldVersionID == "" {
+			oldVersionID = registry.NullVersionID
+		}
+		b.dropClaims(tx, tx.State(), key, claimVersionID(oldVersionID, oldMf.Seq), oldDigests)
 		// The key is gone, so the space stops counting it.
 		b.enqueueRegistration(ctx, tx, tx.State(), key, oldManifest, registry.UploadRegistrationRemove)
 		return t2.GetPointer(ctx, tx)
@@ -1852,22 +1896,17 @@ func (b *Backend) deleteObjectKey(ctx context.Context, bucketState *registry.Sta
 	if err != nil {
 		return mapCommitError(err, "delete")
 	}
-	// Drop the removed version's claims through the reference index AFTER the
-	// commit is durable (so a commit failure can't diverge blob_refs); each
-	// last-claim drop enqueues a deferred release. When the key was absent,
-	// oldDigests is nil and this is a no-op.
-	if oldVersionID == "" {
-		oldVersionID = registry.NullVersionID
-	}
-	if err := b.dropClaims(ctx, bucketState, key, claimVersionID(oldVersionID, oldSeq), oldDigests); err != nil {
-		return fmt.Errorf("s3frontend: delete reconcile: %w", err)
-	}
 	return nil
 }
 
 // DeleteObjects deletes up to 1000 keys in one request, best-effort (not
 // atomic): each key is deleted independently and reported in the per-key result
 // (Deleted, or Error on failure). Quiet mode omits the successful entries.
+//
+// Hilt authorizes the request on s3:DeleteObject. An entry naming a version
+// permanently removes it, which S3 gives its own permission; the entries are
+// in the body, out of Hilt's sight, so each such entry is checked here against
+// the key's action set and fails with AccessDenied without it.
 func (b *Backend) DeleteObjects(ctx context.Context, input *s3.DeleteObjectsInput) (s3response.DeleteResult, error) {
 	if input.Bucket == nil {
 		return s3response.DeleteResult{}, s3err.GetAPIError(s3err.ErrInvalidBucketName)
@@ -1900,6 +1939,9 @@ func (b *Backend) DeleteObjects(ctx context.Context, input *s3.DeleteObjectsInpu
 		versionID := backend.GetStringFromPtr(obj.VersionId)
 		entry := types.DeletedObject{Key: &key}
 		var derr error
+		if versionID != "" && !reqscope.Permits(ctx, bucketState.Space, deleteObjectVersionAction) {
+			derr = s3err.GetAPIError(s3err.ErrAccessDenied)
+		}
 		// Per-key ETag precondition (conditional delete): the object is removed
 		// only if its current version's ETag matches; otherwise the entry fails
 		// with PreconditionFailed, matching AWS. Applies to the current version.
@@ -1966,6 +2008,10 @@ func (b *Backend) DeleteObjects(ctx context.Context, input *s3.DeleteObjectsInpu
 
 // deleteErrorFields maps a per-key delete failure to an S3 error code +
 // message for the DeleteObjects per-entry result.
+// deleteObjectVersionAction is the S3 permission a DeleteObjects entry naming
+// a version needs, beyond the request's own s3:DeleteObject.
+const deleteObjectVersionAction = "s3:DeleteObjectVersion"
+
 func deleteErrorFields(err error) (code, msg string) {
 	var apiErr s3err.APIError
 	if errors.As(err, &apiErr) {

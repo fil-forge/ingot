@@ -30,6 +30,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/fil-forge/versitygw/tests/integration"
+	"github.com/multiformats/go-multibase"
+	mh "github.com/multiformats/go-multihash"
 
 	ingottest "github.com/fil-forge/ingot/testing"
 	"github.com/fil-forge/smelt/pkg/stack"
@@ -341,6 +343,26 @@ var hiltAllPermissions = []string{
 	"s3:AbortMultipartUpload",
 	"s3:ListMultipartUploadParts",
 	"s3:ListBucketMultipartUploads",
+	// The bucket encryption configuration; removing it needs the write
+	// permission.
+	"s3:GetEncryptionConfiguration",
+	"s3:PutEncryptionConfiguration",
+	// The bucket configuration and object tag and attribute operations, each
+	// of which hilt authorizes on its own permission.
+	"s3:GetBucketLocation",
+	"s3:GetBucketAcl",
+	"s3:GetBucketCORS",
+	"s3:GetBucketPolicyStatus",
+	"s3:GetBucketTagging",
+	"s3:PutBucketTagging",
+	"s3:GetBucketVersioning",
+	"s3:PutBucketVersioning",
+	"s3:GetBucketObjectLockConfiguration",
+	"s3:PutBucketObjectLockConfiguration",
+	"s3:GetObjectTagging",
+	"s3:PutObjectTagging",
+	"s3:DeleteObjectTagging",
+	"s3:GetObjectAttributes",
 }
 
 // hiltPolicyPermissions are the bucket policy operations, held by service
@@ -354,11 +376,33 @@ var hiltPolicyPermissions = []string{
 	"s3:DeleteBucketPolicy",
 }
 
+// hiltCORSPermissions are the bucket CORS writes, held by service keys
+// only. The published hilt image does not know the permission until the
+// CORS write operations merge, so the test key carries it only when the
+// CORS write scenarios run (see [corsWritesEnabled]); fold it into
+// hiltAllPermissions then.
+var hiltCORSPermissions = []string{
+	"s3:PutBucketCORS",
+}
+
+// corsWritesEnabled reports whether the stack's hilt authorizes
+// PutBucketCors and DeleteBucketCors: a hilt override is in use, or
+// INGOT_ITEST_CORS_WRITES=1 says the image has them.
+func corsWritesEnabled() bool {
+	return os.Getenv("INGOT_ITEST_CORS_WRITES") == "1" || hiltOverridden()
+}
+
+// hiltOverridden reports whether the stack's hilt comes from a local override
+// rather than the published image.
+func hiltOverridden() bool {
+	return os.Getenv("INGOT_ITEST_HILT_BINARY") != "" || os.Getenv("INGOT_ITEST_HILT_IMAGE") != ""
+}
+
 // iamScenariosEnabled reports whether the stack's hilt carries the IAM
 // changes: a hilt override is in use, or INGOT_ITEST_IAM=1 says the image
 // has them.
 func iamScenariosEnabled() bool {
-	return os.Getenv("INGOT_ITEST_IAM") == "1" || os.Getenv("INGOT_ITEST_HILT_BINARY") != "" || os.Getenv("INGOT_ITEST_HILT_IMAGE") != ""
+	return os.Getenv("INGOT_ITEST_IAM") == "1" || hiltOverridden()
 }
 
 // hiltProvisionTenant provisions tenantID in hilt with an all-permission
@@ -398,9 +442,12 @@ func hiltProvisionTenantErr(ctx context.Context, s *stack.Stack, tenantID string
 		return "", "", fmt.Errorf("hilt provision tenant %q: %w (stdout=%s stderr=%s)", tenantID, err, out, errOut)
 	}
 
-	permissions := hiltAllPermissions
+	permissions := slices.Clone(hiltAllPermissions)
 	if iamScenariosEnabled() {
-		permissions = append(slices.Clone(permissions), hiltPolicyPermissions...)
+		permissions = append(permissions, hiltPolicyPermissions...)
+	}
+	if corsWritesEnabled() {
+		permissions = append(permissions, hiltCORSPermissions...)
 	}
 	keyReq, err := json.Marshal(map[string]any{
 		"name":        "itest",
@@ -549,6 +596,76 @@ func corruptLocalFileTail(t *testing.T, ctx context.Context, s *stack.Stack, pat
 	if out, errOut, err := s.Exec(ctx, "ingot", "sh", "-c", script); err != nil {
 		t.Fatalf("corrupt spool file %s: %v (stdout=%s stderr=%s)", path, err, out, errOut)
 	}
+}
+
+// sha256Digest is the sha2-256 multihash of a sha256 sum.
+func sha256Digest(t *testing.T, sum [32]byte) mh.Multihash {
+	t.Helper()
+	digest, err := mh.Encode(sum[:], mh.SHA2_256)
+	if err != nil {
+		t.Fatalf("encode multihash: %v", err)
+	}
+	return digest
+}
+
+// hexDigest decodes a multihash from the hex form the Postgres helpers
+// return.
+func hexDigest(t *testing.T, hexMH string) mh.Multihash {
+	t.Helper()
+	digest, err := hex.DecodeString(hexMH)
+	if err != nil {
+		t.Fatalf("decode digest %q: %v", hexMH, err)
+	}
+	return digest
+}
+
+// piriBlobPath is where piri-0 keeps the blob with this digest. The stack
+// runs piri on its filesystem backend: the PDP store is a flatfs store under
+// /data/piri/pdp/datastore with NextToLast(2) sharding, keyed by the
+// lowercase base32 multihash without the multibase prefix. Piri verifies (or
+// computes) the digest from the uploaded body and its settle task moves the
+// file to this key — so the file existing means piri holds exactly the bytes
+// that hash to digest.
+func piriBlobPath(t *testing.T, digest mh.Multihash) string {
+	t.Helper()
+	b32, err := multibase.Encode(multibase.Base32, digest)
+	if err != nil {
+		t.Fatalf("encode base32: %v", err)
+	}
+	key := b32[1:]
+	return fmt.Sprintf("/data/piri/pdp/datastore/%s/%s.data", key[len(key)-3:len(key)-1], key)
+}
+
+// piriHoldsBlob reports whether the file at piriBlobPath(digest) exists
+// right now. Settle runs after /blob/accept returns, so a positive check
+// needs waitForPiriBlob; this one-shot form is for asserting absence once
+// the blob that was uploaded has been seen.
+func piriHoldsBlob(t *testing.T, ctx context.Context, s *stack.Stack, digest mh.Multihash) bool {
+	t.Helper()
+	path := piriBlobPath(t, digest)
+	out, errOut, err := s.Exec(ctx, "piri-0", "sh", "-c", fmt.Sprintf(`test -f %q && echo yes || echo no`, path))
+	if err != nil {
+		t.Fatalf("stat piri blob %s: %v (stderr=%s)", path, err, errOut)
+	}
+	return strings.TrimSpace(out) == "yes"
+}
+
+// waitForPiriBlob polls until piri-0 holds the blob with this digest, or
+// fails the test after timeout.
+func waitForPiriBlob(t *testing.T, ctx context.Context, s *stack.Stack, digest mh.Multihash, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if piriHoldsBlob(t, ctx, s, digest) {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("context done waiting for piri blob %s: %v", digest.HexString(), ctx.Err())
+		case <-time.After(time.Second):
+		}
+	}
+	t.Fatalf("piri-0 never held blob %s within %s", digest.HexString(), timeout)
 }
 
 // waitForPiriLog polls piri-0's container logs until substr appears.

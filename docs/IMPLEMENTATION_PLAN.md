@@ -181,7 +181,7 @@ full in-memory smoke suite green.
 
 ### Phase 4 — Reference index / delete — ✅ DONE
 
-- [x] `s3frontend.reconcileClaims` diffs the prior vs new body-digest sets on every commit:
+- [x] every commit diffs the prior vs new body-digest sets (`s3frontend.addClaims` / `dropClaims`, carried by the root swap's transaction):
       a digest newly referenced gains a `blob_refs` claim, one no longer referenced loses its claim
       and (at zero `(space,digest)` claims) is queued for release; a digest in **both** is untouched
       (a re-PUT of identical bytes never churns the row). Wired into `PutObject` (overwrite-in-place

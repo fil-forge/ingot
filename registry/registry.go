@@ -10,6 +10,9 @@ import (
 
 	"github.com/fil-forge/ucantone/did"
 	"github.com/ipfs/go-cid"
+	"github.com/multiformats/go-multihash"
+
+	"github.com/fil-forge/ingot/blockstore"
 )
 
 // VersioningState is a bucket's S3 versioning configuration. Buckets start
@@ -76,6 +79,11 @@ type State struct {
 	// bucket carries no tag set — never set, or deleted since
 	// (docs/s3-object-tagging.md §9).
 	BucketTagging []byte
+	// CORSConfig is the bucket's own CORS configuration: the controller's
+	// validated <CORSConfiguration> XML, stored verbatim. Nil when the
+	// bucket has none of its own and answers the gateway-wide document
+	// (docs/s3-cors.md).
+	CORSConfig []byte
 	// Encryption is the bucket's default encryption as PutBucketEncryption
 	// stored it; BucketEncryptionUnset when never configured, or deleted
 	// since.
@@ -127,13 +135,21 @@ type Registry interface {
 	// Returns ErrConflict if the current root does not equal expect.
 	CASRoot(ctx context.Context, name string, expect, next cid.Cid) error
 
-	// CASRootAndEnqueueUploadRegistrations is CASRoot plus the upload
-	// registrations the commit owes, written in one transaction. The two
-	// belong together: a row without its commit would count a version the
-	// catalog never published, and a commit without its row would leave the
-	// version uncounted with nothing left to say so. Passing no
-	// registrations is exactly CASRoot.
-	CASRootAndEnqueueUploadRegistrations(ctx context.Context, name string, expect, next cid.Cid, regs []UploadRegistration) error
+	// CommitRoot is CASRoot plus the rows the commit owes, all in one
+	// transaction: the upload registrations, the new generation's blob
+	// claims, the discarded generations' claim drops and the journaled
+	// catalog blocks (RootCommit). They belong with the swap: a
+	// registration or claim without its commit would describe a version
+	// the catalog never published, and a commit without them would leave
+	// the version uncounted and its blobs unclaimed, with nothing left to
+	// say so. A refused claim or pin (ErrReleaseInProgress, ErrClaimGone)
+	// fails the commit, and the root does not advance. Passing an empty
+	// RootCommit is exactly CASRoot.
+	CommitRoot(ctx context.Context, name string, expect, next cid.Cid, c RootCommit) error
+
+	// CatalogJournalStats reports how much the catalog journal holds: the
+	// blocks commits journaled whose segments have not shipped yet.
+	CatalogJournalStats(ctx context.Context) (CatalogJournalStats, error)
 
 	// SetForgeRoot records that the DAG reachable from root has been
 	// successfully shipped to Forge. Used as the high-water mark by
@@ -152,6 +168,11 @@ type Registry interface {
 	// SetBucketTagging stores the bucket's tag set, replacing any previous
 	// one; nil clears it. Returns ErrNotFound if the bucket is absent.
 	SetBucketTagging(ctx context.Context, name string, tags []byte) error
+
+	// SetCORSConfig stores the bucket's own CORS configuration document,
+	// replacing any previous one; nil clears it. Returns ErrNotFound if the
+	// bucket is absent.
+	SetCORSConfig(ctx context.Context, name string, cfg []byte) error
 
 	// SetEncryption stores the bucket's default encryption;
 	// BucketEncryptionUnset clears it. Returns ErrNotFound if the bucket is
@@ -172,7 +193,81 @@ var (
 	// removing the blob from its provider (PendingReleaseStore.StartRelease):
 	// the write retries once the release has run and uploads afresh.
 	ErrReleaseInProgress = errors.New("registry: a release of the blob is in progress")
-	ErrNotEmpty          = errors.New("registry: bucket not empty")
-	ErrExists            = errors.New("registry: bucket already exists")
-	ErrConflict          = errors.New("registry: root cas conflict")
+	// ErrClaimGone refuses a pinned claim (RootCommit.Pins) when the space
+	// holds no claim on the digest to pin to: the source object's last claim
+	// is gone and the blob is being released, so the copy has nothing to
+	// pin.
+	ErrClaimGone = errors.New("registry: no claim on the blob to pin to")
+	ErrNotEmpty  = errors.New("registry: bucket not empty")
+	ErrExists    = errors.New("registry: bucket already exists")
+	ErrConflict  = errors.New("registry: root cas conflict")
 )
+
+// RootCommit is what a root swap carries besides the root (Registry.CommitRoot):
+// the rows that must exist exactly when the version does.
+type RootCommit struct {
+	// Registrations are the upload-registration outbox rows the commit
+	// owes: the versions it publishes and retracts from the space's
+	// content-entry list.
+	Registrations []UploadRegistration
+	// Claims are the new generation's claims, one per body digest. Each is
+	// recorded under the (space, digest) claim-key lock and refused with
+	// ErrReleaseInProgress while a started release holds the digest, or
+	// when the space has no location for it: a claim landing then would
+	// name a blob a release is removing, or has removed since the write
+	// settled it. Every committed body blob is located by its commit, so a
+	// claim with no location is one such write's. Recording a claim marks
+	// the space's upload intent for the digest published (IntentPublished).
+	Claims []BlobClaim
+	// Pins are claims borrowed from another object of the same space (a
+	// same-space copy pins the source's body). Each is recorded only while
+	// the space still holds a claim on its digest, under the claim-key
+	// lock, which excludes the drop of that last claim: the drop counts the
+	// pin, or the pin finds no claim and the commit fails with ErrClaimGone.
+	Pins []BlobClaim
+	// Drops are the discarded generations' claims. Each is deleted and, when
+	// it was the space's last claim on the digest, the blob's release is
+	// recorded in the same transaction, so no crash window separates "last
+	// claim gone" from "release recorded".
+	Drops []ClaimDrop
+	// ReleaseGrace is how long after the commit a release the Drops record
+	// is due. It is measured when the swap commits, after the catalog fsync
+	// and any lock wait that precede it, so a reader that resolved the
+	// discarded version just before the swap has the whole grace to open
+	// its blobs.
+	ReleaseGrace time.Duration
+	// Journal is the commit's catalog blocks and the log segment they went
+	// into. They are kept in the catalog journal until that segment ships,
+	// so a copy of the database (a standby, a restore) holds every block
+	// its roots need that exists nowhere but this host's disk. A commit
+	// whose segment has already shipped journals nothing: its blocks are on
+	// Forge.
+	Journal blockstore.Appended
+}
+
+// Empty reports whether the commit carries nothing besides the root.
+func (c RootCommit) Empty() bool {
+	return len(c.Registrations) == 0 && len(c.Claims) == 0 && len(c.Pins) == 0 && len(c.Drops) == 0 &&
+		len(c.Journal.Blocks) == 0
+}
+
+// CatalogJournalStats is the size of the catalog journal (RootCommit.Journal).
+type CatalogJournalStats struct {
+	// Blocks is the number of journaled blocks.
+	Blocks int64
+	// Bytes is their total size.
+	Bytes int64
+	// Oldest is when the oldest of them was journaled; zero when the
+	// journal is empty.
+	Oldest time.Time
+}
+
+// ClaimDrop is one claim a commit removes: a discarded version's row on a
+// digest.
+type ClaimDrop struct {
+	Digest    multihash.Multihash
+	Bucket    string
+	ObjectKey string
+	VersionID string
+	Space     did.DID
+}

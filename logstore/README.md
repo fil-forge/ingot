@@ -66,25 +66,36 @@ sequenceDiagram
     C->>M: AppendBatch(catalogBlocks, OpRoot{bucket, root})
     M->>S: route by OpRoot.Bucket (lazy open + recovery on first use)
     S->>FS: append CAR frames + .ops record, fsync both
-    S-->>C: ok (licenses the caller's bucket-root CAS)
+    S-->>C: the segment's seq (licenses the caller's bucket-root CAS)
+    C->>DB: CommitRoot: share-lock the segment row, journal the batch's blocks<br/>under it (none once it has shipped), CAS the root: one tx
 
     Note over S,FS: seal when size >= SealBytes or age >= SealAge<br/>(also at Close, and recovery force-seals)
     S->>FS: hash CAR, write .idx (tmp, then rename)
     S->>DB: MarkSegmentSealed(size, sha256, op-roots) in one tx
-    S->>F: enqueueFlush (queue cap 64, drop + warn, restart re-enqueues)
+    S->>F: enqueueFlush (queue cap 64; a full queue leaves it to the retry sweep)
 
     F->>F: SubmitShard: /blob/add the CAR to sprue, PUT, conclude, receipt<br/>(index publish is best-effort, space resolved via reg.Get at ship time)
     F->>DB: PutLocation(shard) + PutInclusions(every inner block)
     Note over F,DB: recorded before the shipped stamp, so retention<br/>can never retire blocks reads cannot resolve
     F-->>S: index digest
-    S->>DB: MarkSegmentShipped: shipped_at + index_digest and, same tx,<br/>forge_root_cid per op-root (guarded: only while buckets.root_cid<br/>still equals the op-root)
+    S->>DB: MarkSegmentShipped: shipped_at + index_digest and, same tx,<br/>forge_root_cid per op-root (guarded: only while buckets.root_cid<br/>still equals the op-root), then the segment's journal rows deleted
+    Note over S: marked shipped in memory only once the stamp lands
     Note over S: runRetention keeps the newest Retain shipped CARs,<br/>older ones retire (files unlinked, row stamped retired_at)
 ```
 
 A batch may be empty of blocks: an MST mutation can produce a new root that
 points only at nodes already materialized in a prior segment, so `AppendBatch`
 is called with the op-root alone. A flush error keeps the segment unshipped
-and retried (5 attempts, backoff 1s doubling to a 30s cap); a bucket deleted
+and retried (5 attempts, backoff 1s doubling to a 30s cap). A failed
+`MarkSegmentShipped` after a successful ship takes the same attempts without
+shipping again, and the segment counts as shipped only once the stamp lands,
+so retention never retires a segment whose journal rows remain. After that,
+and for a segment a full queue turned away, the **retry sweep** takes over:
+every `ShipRetry` (1 minute by default; the first sweep lands at a random point
+within it) the flush worker tries the bucket's unshipped sealed segments again,
+oldest first, one attempt each, stopping at the first that fails. So a segment
+waits out an outage, or its space's missing ship authority, without a restart.
+A segment whose ship landed but whose stamp didn't is shipped again by the sweep. A bucket deleted
 while segments were queued has nowhere to ship, so the closure returns nil and
 the segment marks shipped and retires.
 
@@ -95,7 +106,7 @@ stateDiagram-v2
     [*] --> Open : createOpenSegment + InsertSegmentOpen
     Open --> Open : append (fsync, then index commit)
     Open --> Sealed : seal (hash CAR, write .idx, MarkSegmentSealed)
-    Sealed --> Shipped : flush ok (MarkSegmentShipped, guarded forge_root advance)
+    Sealed --> Shipped : flush ok (MarkSegmentShipped: guarded forge_root advance, journal rows deleted)
     Shipped --> Retired : retention past Retain (files unlinked, RetireSegment)
     Retired --> [*] : DeleteBucket (RemoveBucketLog)
 ```
@@ -106,8 +117,9 @@ stateDiagram-v2
   `sha256` and `index_digest`, because those blobs stay registered in the
   bucket's space until `DeleteBucket` releases them; its op-root rows are
   dropped. Recovery and the startup sweep read only unretired rows.
-- With `Ship=false` a segment stays sealed on disk forever: the only durable
-  copy and the sole source for local reads.
+- With `Ship=false` a segment stays sealed on disk forever: the sole source
+  for local reads, with its blocks also journaled in Postgres for good, since
+  nothing ships them.
 - Recovery force-seals any recovered open segment, so each process starts
   with a brand-new open segment per bucket.
 
@@ -118,6 +130,17 @@ stateDiagram-v2
   licenses the caller's bucket-root CAS. Body blobs are already durable and
   accepted on Forge before the commit that references them, so a crash never
   leaves a durable catalog entry pointing at non-durable data.
+- **Journaled until shipped.** The commit that a batch's append licenses also
+  writes the batch's blocks to `ingot.catalog_journal`, under the segment's
+  seq, in the same transaction as the root swap; `MarkSegmentShipped` deletes
+  them. So every block of a committed root that exists nowhere but this
+  host's disk is also in Postgres, and in any copy of it: a standby, a
+  restore. The commit share-locks the segment row and skips a shipped
+  segment, and the ship locks that row before deleting, so no row outlives
+  its segment. The rows have no foreign key to the segment row. When a
+  segment's CAR is gone, recovery deletes its row if it was open and retires
+  it if it was sealed, and the journal rows are what the lost segment is
+  rebuilt from.
 - **One bucket per segment.** The log is segregated per bucket; every segment
   ships to its own bucket's Forge space, and `DeleteBucket` can quiesce and
   release exactly one bucket's registrations.
@@ -154,7 +177,7 @@ before any worker starts. Discovery keys on the CAR file:
 | `Meta` row | On-disk CAR | Action |
 |---|---|---|
 | `open` | present | `rebuildOpenFromDisk` (scan + truncate any torn trailing frame); then force-sealed |
-| `sealed` | present | `loadSealedFromIdx`; re-enqueue when shipping and not yet shipped |
+| `sealed` | present | `loadSealedFromIdx`; re-enqueue when shipping and not yet shipped (newest first; what the queue can't hold, the retry sweep ships) |
 | none | present | orphan (crashed before the row): rebuild as open + `InsertSegmentOpen`, then force-sealed |
 | `sealed` | absent | retire the row (a crash between the unlink and the `retired_at` stamp, or a lost file) |
 | `open` | absent | delete the row |
@@ -177,6 +200,7 @@ type PlaneConfig struct {
     Ship      bool          // false -> never ship, retained forever
     Flush     FlushFunc     // ships one sealed CAR; set by the Manager from FlushFor
     Retain    int           // shipped CARs kept locally (0 -> 6); ignored when !Ship
+    ShipRetry time.Duration // how often unshipped sealed segments are retried (0 -> 1m)
 }
 ```
 
@@ -191,7 +215,7 @@ builds a `uploader.CARShard` from the `Segment` accessors, calls
 |---|---|
 | `manager.go` | `Manager` (per-bucket log, the production `blockstore.Log`): `ManagerConfig`, `OpenManager`, `AppendBatch`, `Get`, `Close`; `QuiesceBucketLog`, `ShippedSegmentDigests`, `RemoveBucketLog` (DeleteBucket's seams) |
 | `store.go` | `Store` (one bucket's catalog log): `Open`, `AppendBatch`, `Get`, `Close` |
-| `planelog.go` | `PlaneLog` (the pipeline): `openPlaneLog`, `Append`, `Get`, `Close`; `sealOpenIfDue`, `flushLoop`, `flushOne`, `runRetention`, `sealTickerLoop` |
+| `planelog.go` | `PlaneLog` (the pipeline): `openPlaneLog`, `Append`, `Get`, `Close`; `sealOpenIfDue`, `flushLoop`, `flushOne`, `retryUnshipped`, `runRetention`, `sealTickerLoop` |
 | `segment.go` | `Segment`: `createOpenSegment`, `append`, `seal`, `markShipped`, `retire`, `get`; `.idx`/`.ops` codecs |
 | `recovery.go` | `(*PlaneLog).recover` (disk vs `Meta` reconciliation for one bucket store) |
 | `types.go` | `State`, `SegmentMeta`, `Meta` |

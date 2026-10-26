@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	block "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
@@ -60,6 +61,19 @@ type Deps struct {
 	// Reads is the read tier the staging buffer falls through to
 	// on miss during the transaction.
 	Reads blockstore.ReadStore
+
+	// Ships, when set, is handed each commit's request just before its
+	// blocks are appended: the segment they go into ships later, outside any
+	// request, under authority captured from the bucket's writes. Nil
+	// captures nothing.
+	Ships ShipAuthority
+}
+
+// ShipAuthority records, from a write's request, the authority the catalog
+// log's asynchronous ship to the bucket's space signs with
+// (uploader.Uploader).
+type ShipAuthority interface {
+	CaptureShipAuthority(ctx context.Context, space did.DID)
 }
 
 // Coordinator manages per-bucket transactions. One per ingot backend.
@@ -145,7 +159,8 @@ func (c *Coordinator) lockTraced(ctx context.Context, bucket string) func() {
 //
 //   - Returning (newRoot, nil) with newRoot.Defined() commits the
 //     transaction: log.AppendBatch fsyncs the staging buffer and
-//     reg.CASRoot advances the bucket Root.
+//     reg.CommitRoot advances the bucket Root, with the rows the
+//     commit carries (claims, drops, registrations).
 //   - Returning (cid.Undef, nil) signals "no-op success": the
 //     staging buffer is discarded with no log append and no Root
 //     advance. Used by S3 DELETE-on-missing-key, which is
@@ -162,7 +177,7 @@ type MutateFn func(ctx context.Context, tx *Tx) (newRoot cid.Cid, err error)
 // Errors mapped to the caller:
 //   - ErrBucketNotFound from Begin propagates verbatim (fn is not
 //     invoked).
-//   - registry.ErrConflict from the inner CASRoot propagates
+//   - registry.ErrConflict from the inner CommitRoot propagates
 //     wrapped (only reachable in cross-process races; the
 //     in-process bucket lock prevents it within one Coordinator).
 //   - Any error fn returns propagates verbatim.
@@ -228,11 +243,12 @@ type Tx struct {
 	staging *blockstore.OpStaging
 	cst     cbor.IpldStore
 
-	// uploadRegs are the upload-registration outbox rows this commit owes.
-	// They are written in the same transaction as the root CAS, so the count
-	// can never describe a version that did not commit — nor miss one that
-	// did.
-	uploadRegs []registry.UploadRegistration
+	// commit is what the root swap carries besides the root: the
+	// upload-registration outbox rows this commit owes and the reference
+	// index rows of the versions it publishes and discards. They are
+	// written in the same transaction as the root CAS, so none can describe
+	// a version that did not commit, nor miss one that did.
+	commit registry.RootCommit
 
 	// release is the bucket-lock release closure. Set by Begin;
 	// nil-ed by finalize() so Commit and Discard mutually agree
@@ -245,7 +261,33 @@ type Tx struct {
 // one bucket are numbered in the order its commits took the lock — which is
 // the order the sweeper has to replay a key's changes in.
 func (tx *Tx) EnqueueUploadRegistration(reg registry.UploadRegistration) {
-	tx.uploadRegs = append(tx.uploadRegs, reg)
+	tx.commit.Registrations = append(tx.commit.Registrations, reg)
+}
+
+// ClaimBlobs records the new generation's claims on its body digests for
+// this commit to carry. A claim refused at the swap (a started release holds
+// the digest, or the space has no location for it) fails the commit with
+// registry.ErrReleaseInProgress, and nothing is written.
+func (tx *Tx) ClaimBlobs(claims []registry.BlobClaim) {
+	tx.commit.Claims = append(tx.commit.Claims, claims...)
+}
+
+// PinBlobs records claims borrowed from another object of the space (a
+// same-space copy) for this commit to carry. Each is written only while the
+// space still holds a claim on its digest; otherwise the commit fails with
+// registry.ErrClaimGone, and nothing is written.
+func (tx *Tx) PinBlobs(claims []registry.BlobClaim) {
+	tx.commit.Pins = append(tx.commit.Pins, claims...)
+}
+
+// DropClaims records the claims of a discarded generation for this commit
+// to remove. A drop of the space's last claim on a digest records the
+// blob's release in the same transaction, due grace after the commit: the
+// grace is measured when the swap commits, not here, so the fsync and any
+// lock wait between do not eat into it.
+func (tx *Tx) DropClaims(drops []registry.ClaimDrop, grace time.Duration) {
+	tx.commit.Drops = append(tx.commit.Drops, drops...)
+	tx.commit.ReleaseGrace = grace
 }
 
 // Compile-time assertions: Tx is the canonical handle through which
@@ -310,8 +352,11 @@ func (tx *Tx) LoadTree() *mst.MerkleSearchTree {
 // Commit finalizes the transaction:
 //  1. log.AppendBatch fsyncs the staging buffer into the open log
 //     segment with an op-root of (bucket, newRoot).
-//  2. registry.CASRoot advances the bucket Root from State().Root
-//     to newRoot.
+//  2. registry.CommitRoot advances the bucket Root from State().Root
+//     to newRoot and, in the same transaction, writes the rows the
+//     commit carries: its upload registrations, blob claims and claim
+//     drops, and its catalog blocks, journaled under the segment step 1
+//     appended them to until that segment ships.
 //  3. The bucket lock is released.
 //
 // Returns registry.ErrConflict if another writer raced ahead of us
@@ -335,10 +380,19 @@ func (tx *Tx) Commit(ctx context.Context, newRoot cid.Cid) (err error) {
 	ctx, span := tracing.Start(ctx, "bucket.commit")
 	defer func() { tracing.End(span, err) }()
 
-	if err := tx.staging.Commit(ctx, newRoot); err != nil {
+	// The append below is what the segment will ship, whatever the root
+	// swap does, so its authority is captured first: an append that fills
+	// the segment can seal it and start its ship at once. A write with no
+	// body (a delete, a tag change) captures none anywhere else.
+	if tx.deps.Ships != nil {
+		tx.deps.Ships.CaptureShipAuthority(ctx, tx.state.Space)
+	}
+	appended, err := tx.staging.Commit(ctx, newRoot)
+	if err != nil {
 		return fmt.Errorf("bucketop: append: %w", err)
 	}
-	if err := tx.deps.Reg.CASRootAndEnqueueUploadRegistrations(ctx, tx.bucket, tx.state.Root, newRoot, tx.uploadRegs); err != nil {
+	tx.commit.Journal = appended
+	if err := tx.deps.Reg.CommitRoot(ctx, tx.bucket, tx.state.Root, newRoot, tx.commit); err != nil {
 		return fmt.Errorf("bucketop: advance root: %w", err)
 	}
 	return nil

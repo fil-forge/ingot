@@ -42,9 +42,10 @@ HTTP PUT of the bytes to the allocated piri, a concluded receipt, and the
 `/blob/accept` location commitment. Only then does the short per-bucket
 critical section run: allocate the version seq, write the manifest, splice
 the MST, fsync one `AppendBatch` of the new catalog blocks, and
-compare-and-swap the bucket root in Postgres. The reference index
-(`blob_refs`) reconciles after the commit, releasing superseded blobs whose
-claim count reaches zero. The full trace is the
+compare-and-swap the bucket root in Postgres, with the reference index
+(`blob_refs`) written in the swap's transaction: the version's claims land,
+superseded versions' claims drop, and a blob whose claim count reaches zero
+gets its release record. The full trace is the
 [PutObject diagram](./docs/diagrams.md#putobject-spool-and-upload-off-the-lock-commit-under-it).
 
 **Every body blob is encrypted at ingest** (the FilOne encryption design's
@@ -89,8 +90,8 @@ Rotation: Hilt replaces `#wrap` in place and archives the
 old key, so a write inside the cache TTL of a rotation still recovers.
 
 A `200` therefore means the body is durable and accepted on the network and
-the catalog mutation is fsynced locally; the catalog becomes durable on
-Forge through the background ship below.
+the catalog mutation is fsynced locally and journaled in Postgres; the
+catalog becomes durable on Forge through the background ship below.
 
 ## The catalog log
 
@@ -102,6 +103,12 @@ full lifecycle):
 
 - A successful `AppendBatch` (fsynced CAR plus `.ops` record) is what
   licenses the caller's bucket-root CAS.
+- **The unshipped catalog is journaled in Postgres**: the root swap's
+  transaction writes the batch's blocks to `ingot.catalog_journal` under the
+  segment `AppendBatch` reported, and shipping that segment deletes them. A
+  copy of Postgres (a standby, a restore) therefore holds every block its
+  roots need that this host's disk alone would otherwise hold. Rebuilding a
+  lost segment from the journal is not built yet.
 - **`forge_root_cid` advances only when a segment ships, and only guarded**:
   the update lands in the same transaction as the shipped stamp, and only
   where `buckets.root_cid` still equals the op-root.
@@ -125,10 +132,12 @@ at PUT time or a sealed catalog CAR from the background flush:
    range are recorded locally (`blob_locations` and `shard_inclusions`)
    before the segment is marked shipped.
 
-Multipart parts stop after step 2 (**parked**: durable, unaccepted) and run
-steps 3 and 4 at `CompleteMultipartUpload`; an abort unwinds a parked blob
-with `/blob/abort`. A parked blob's spool copy is removed once it parks:
-Complete concludes it from its park row and never reads its bytes. A part
+Multipart parts stop after step 2 (**parked**: durable, unaccepted) and the
+upload's acceptor runs steps 3 and 4 in the background while the client is
+still uploading; an abort unwinds a parked blob with `/blob/abort` and an
+accepted one with `/blob/remove`. A parked blob's spool copy is removed once
+it parks: the acceptor concludes it from its park row and never reads its
+bytes. A part
 copied from an existing object (`UploadPartCopy`) is ingested the same way:
 the source's plaintext range streams through the decrypting read path into
 new parked blobs, so the source may be in any bucket of the tenant and
@@ -151,19 +160,89 @@ would be. The tree material lives in its own table (`multipart_part_trees`),
 read only by Complete and deleted once the object commits; every other part
 listing leaves it on disk.
 
-Complete concludes the parked parts a group at a time: each `/ucan/conclude`
-is one invocation carrying up to `MaxConcludeReceipts` (1000) put receipts
-(`receipts`, the plural argument — not a batch of invocations, which is what
-`/upload/add` sends), sprue accepts them one request per storage node, and each blob's
+The part rows are the acceptance queue. `UploadPart` records its part as
+`spooled`, with each blob's plaintext length, moves it to `parked` once every
+blob is parked, and nudges the upload's acceptor (`s3frontend/acceptor.go`).
+The move is guarded by the part's digests, so a request whose part a later
+upload of the same part number replaced cannot queue the replacement. Each
+upload has at most one acceptor, a goroutine that runs while there is work:
+a pass takes the upload's parked parts in part order up to 1000 blobs,
+concludes them, and moves them to `accepted`, and the acceptor exits when a
+pass finds nothing. Parts that land during a pass are taken by the next one.
+A failed pass leaves the parts holding a failed blob parked and retries
+after a backoff (1 s, doubling to 30 s), and still accepts every other part
+of its batch, so one bad blob cannot hold its neighbours back on every retry; a pass that runs past `acceptPassTimeout` (2 min) fails
+the same way, since the Forge client sets no timeout of its own. The
+acceptor stops for a session that is no longer open or completing. It never
+takes a blob over from its release: a part holding a blob with a release
+record (started or not), or one with neither a park nor a location, goes
+back to `spooled`, which is Complete's to finish. At start and every 30 s the
+accept sweeper nudges the acceptor of every open or completing upload with
+parked parts, so work a stopped process left, or a nudge that went missing,
+is picked up, and measures how long the oldest parked part has waited.
+`ingot.multipart.parked_age`, `ingot.multipart.accept_passes` (by outcome)
+and `ingot.multipart.complete_deferred` report the queue's health; the
+README lists them.
+
+A pass concludes its blobs in one `/ucan/conclude`: one invocation carrying
+up to `MaxConcludeReceipts` (1000) put receipts (`receipts`, the plural
+argument — not a batch of invocations, which is what `/upload/add` sends).
+Sprue accepts them one request per storage node, and each blob's
 `/blob/accept` receipt and location commitment come back in the conclude
-response. So a completion costs a few round trips rather than one per part,
-which is what an S3 client splitting a large object into thousands of 5 MiB
-parts produces.
-Step 4's polling remains the fallback for a blob the response did not
-cover. A completion that fails partway still records the blobs the upload
-service accepted before the failure and drops their parks, so the next
-Complete concludes only what is still parked and session expiry never
-aborts a blob that was accepted.
+response, so an upload of thousands of parts costs a few round trips rather
+than one per part. Step 4's polling remains the fallback for a blob the
+response did not cover. A pass that fails partway still records the blobs
+the upload service accepted before the failure, so the next pass concludes
+only what is still parked and session expiry never aborts a blob that was
+accepted.
+
+A blob's acceptance is recorded by swapping its park row for its location
+row in one transaction, and only while the park row the conclude started
+from stands (matched by its `/blob/add` task), under the blob's in-process
+write lock. A park of the same bytes recorded since by another write names
+another allocation, and stays for its own conclude. An abort, a session expiry or a part re-upload
+can release a blob while it is being concluded, and the provider settles the
+order: a released allocation refuses the accept, and an accepted blob
+refuses the abort, so the release removes it instead. The release drops the
+park row before the location row, so a conclude that finishes after it
+finds no park and records nothing; a location written then would let a
+later write of the same bytes reuse a blob that is gone. Two uploads in one
+space holding the same bytes share a park, and both acceptors may conclude
+it: a repeated conclude is harmless upstream, the first record swaps the
+park, and the second finds the location.
+
+The upload service registers a blob it accepts before it answers the
+conclude, and a `/blob/remove` that arrives before that registration finds
+nothing to remove; the registration then lands with nothing left to remove
+it, and the blob stays stored. So no release runs against a conclude in
+flight. A session teardown (abort, expiry, DeleteBucket), once it has latched
+the session out of `open` and `completing`, waits for the pass the upload's
+acceptor has in flight, if any, before it records any release
+(`quiesceAcceptor`); an acceptor backing off between passes is not waited
+for, since its next pass sees the latch and concludes nothing. Any other
+release, such as a superseded part's, defers while a conclude of its blob is
+in flight in this process (`markConcluding`) and runs from the release
+sweeper after. A conclude that failed or timed out may still be running at
+the upload service, so its blobs stay marked for `failedConcludeHold` (2
+min) after it returns.
+
+`CompleteMultipartUpload` latches the session to `completing`, which stops
+new parts, and waits, up to 30 s (`acceptWaitBudget`), until none of the parts
+it was asked to commit is still queued, re-reading them after each of the
+acceptor's passes. Parts the upload holds and the request omits are not
+waited for; it stops early when the acceptor's last pass failed. It then
+reads the parts it was asked to commit. A `spooled` part is concluded, or
+uploaded from its spool copy if it never parked, by Complete itself; before
+uploading, Complete rechecks for a park under the blob's lock, since the
+part's UploadPart may still be parking it. A part
+still `parked` means the acceptor is behind or failing, and Complete answers
+OperationAborted, a 409; the latch reverts to `open` and the acceptor
+carries on. The AWS CLI and other botocore-based clients treat that 409 as
+final and abort the upload, so the 30 s wait is the margin before a client
+sees a failed upload. Complete lays out the object's byte ranges from the
+part rows' blob lengths and claims every blob in the root swap's
+transaction, a few statements however many blobs there are
+(`registry.CommitRoot`).
 
 Every session teardown (abort, expiry, the completed-session reap, a
 superseded part, the parts a Complete omitted) records a deferred release
@@ -383,8 +462,9 @@ same rule as the rest: a streamed blob concludes, or a streamed part is
 recorded, under the key lock, after a settle and a look at the rows, and
 a location or park another write recorded meanwhile makes the stream
 surplus, given up and reused. The last guard is the claim itself: a
-committed body blob is located by its commit, so `AddBlobClaims` refuses,
-under the claim-key lock, a digest the space has no location for, which is
+committed body blob is located by its commit, so the root swap refuses,
+under the claim-key lock, a claim on a digest the space has no location
+for (`registry.RootCommit.Claims`), which is
 one whose release ran to completion between the write's settle and its
 commit; the write fails with SlowDown for the client to retry. A release
 not yet started defers while a write of its space holds the digest.
@@ -413,7 +493,12 @@ not yet started defers while a write of its space holds the digest.
   the agent, and the per-key `DelegationCache` carries those proofs into the
   request via `internal/reqscope`, where the uploader and the network read
   tier spend them. The uploader also captures a per-space ship authority
-  (1h TTL) for the async catalog flush.
+  (1h TTL) for the async catalog flush, from every write that commits, and
+  keeps an upload's capture apart for the background releases, aborts and
+  registration renewals, which a narrower key's grant may not cover. The
+  same cache's action sets ride along (`reqscope.Permits`) for the one check
+  hilt cannot make from the URL: a `DeleteObjects` entry naming a version
+  needs `s3:DeleteObjectVersion`, beyond the request's `s3:DeleteObject`.
 - There is **no root account**: versitygw's built-in root user is disabled
   (an empty `RootUserConfig`), so every access key resolves through hilt. A
   key hilt has not issued is rejected as InvalidAccessKeyId.
@@ -436,14 +521,16 @@ draws the chains and the stores.
 ## Known gaps
 
 - **No HA.** A bucket is single-writer through an in-process lock; nothing
-  coordinates across instances beyond the root CAS.
+  coordinates across instances beyond the root CAS. A multipart upload's
+  acceptor is owned in-process too; several instances would need a lease
+  on the session row.
 - **Local blob storage is bounded only when configured** (#48): with
   `local_blob_max_bytes` set, the sweeper evicts cached blobs down to the
   budget. A delete frees its blobs' local copies once their release runs,
   and a multipart part's copy goes once it parks.
 - **Spool crash recovery is not built**: reconciling `upload_intents`
-  against `blob_refs` after a crash between commit and reconcile is a later
-  phase; the window leaks rather than loses referenced data. (Files with no
+  against `blob_refs` after a crash between a blob's upload and its commit
+  is a later phase; the window leaks rather than loses referenced data. (Files with no
   intent row at all, and unfinished `.tmp-*` writes, are reclaimed by the
   sweeper's orphan pass.) Nor is a failed upload's spool file reclaimed: its
   intent stays `spooled` or `uploading`, so neither eviction nor the orphan
@@ -458,8 +545,10 @@ draws the chains and the stores.
 - **Reads carry no bucket context**: `Manager.Get` linear-scans every open
   bucket store; threading the bucket into the read path removes the scan.
 - **The ship authority expires**: the async flush signs with a per-space
-  proof store captured at the last in-request write (1h TTL); a bucket idle
-  longer than that cannot ship a newly sealed segment until its next write.
+  proof store captured, in memory, from the bucket's last write (1h TTL).
+  Every commit captures it, so a segment ships under its own writes'
+  capture, but one whose ship keeps failing past the TTL, or across a
+  restart, has no authority until the bucket's next write.
 - **The indexer read path is unwired**: `LocalLocator` serves all reads; the
   network index is still published (best-effort) but never consulted.
 - **Carried Forge-client copies**: `forgeclient/`, `tokenstore/`,

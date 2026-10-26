@@ -162,8 +162,16 @@ func TestLayeredAndStagingHappyPath(t *testing.T) {
 			t.Fatalf("stage.Put: %v", err)
 		}
 	}
-	if err := stage.Commit(context.Background(), makeRoot(t, "alpha")); err != nil {
+	appended, err := stage.Commit(context.Background(), makeRoot(t, "alpha"))
+	if err != nil {
 		t.Fatalf("Commit: %v", err)
+	}
+	// The commit journals what the log took, under the segment it went into.
+	if appended.Segment == 0 {
+		t.Fatal("Commit reported no segment")
+	}
+	if len(appended.Blocks) != 2 || !appended.Blocks[0].Cid().Equals(a.Cid()) || !appended.Blocks[1].Cid().Equals(b.Cid()) {
+		t.Fatalf("Commit reported blocks %v, want [%s %s] in put order", appended.Blocks, a.Cid(), b.Cid())
 	}
 
 	for _, blk := range []block.Block{a, b} {

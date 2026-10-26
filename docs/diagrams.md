@@ -20,7 +20,8 @@ change to the diagrams to re-check. The maintenance rule lives in
 | `block-routes` | [Two block routes](#two-block-routes-body-blobs-and-catalog-blocks) | how body blobs and catalog blocks travel to Forge by different paths | here |
 | `put` | [PutObject](#putobject-spool-and-upload-off-the-lock-commit-under-it) | the write path: off-lock ingest and upload, locked commit | here |
 | `get` | [GetObject](#getobject-version-resolution-local-tiers-network-retrieval) | version resolution, tier fallthrough, network retrieval | here |
-| `multipart` | [Multipart upload](#multipart-upload-park-on-write-conclude-on-complete) | park at UploadPart, conclude at Complete, abort unwind | here |
+| `multipart` | [Multipart upload](#multipart-upload-park-on-write-accept-in-the-background) | park at UploadPart, accept in the background, Complete's wait, abort unwind | here |
+| `part-states` | [Part states](#part-states-the-acceptance-queue) | the part rows as the acceptor's queue | here |
 | `multipart-states` | [Session states](#session-states-and-the-completeabort-latch) | the session state machine and the single-winner latch | here |
 | `blob-lifecycle` | [Blob lifecycle](#blob-lifecycle-spooled-parked-accepted-released) | intent states and the claim ledger gating deletion | here |
 | `version-tree` | [Per-key version storage](#per-key-version-storage-manifest-arm-leaf-arm-prev-tree) | the value union, the leaf, the prev tree | here |
@@ -134,6 +135,7 @@ flowchart TB
     s3f --> up
     s3f --> ba
     bop -->|"blockstore.Log"| ls
+    bop -.->|"bucketop.ShipAuthority<br/>(uploader.Forge injected)"| up
     bop --> mst
     mst --> bs
     bkt --> bs
@@ -185,10 +187,10 @@ flowchart TB
     end
 
     subgraph catr["the catalog route (dag-cbor blocks, asynchronous ship)"]
-        commit["commit: manifest + MST splice into OpStaging,<br/>one fsynced AppendBatch into the bucket's log,<br/>guarded root swap, 200 to the client"]
+        commit["commit: manifest + MST splice into OpStaging,<br/>one fsynced AppendBatch into the bucket's log,<br/>guarded root swap journaling the new blocks<br/>in Postgres (catalog_journal), 200 to the client"]
         seal["open segment seals at SealBytes / SealAge<br/>(CAR + .idx + .ops)"]
         ship["background ship: /blob/add the sealed CAR,<br/>PUT, conclude, accept"]
-        incl["blob_locations (the CAR) + shard_inclusions<br/>(inner byte ranges), then the guarded<br/>forge_root_cid advance and retention"]
+        incl["blob_locations (the CAR) + shard_inclusions<br/>(inner byte ranges), then the guarded<br/>forge_root_cid advance, the segment's journal<br/>rows deleted, and retention"]
         commit --> seal --> ship --> incl
     end
 
@@ -204,9 +206,11 @@ flowchart TB
 ```
 
 - The `200` means different things per route: body blobs are durable and
-  accepted on Forge at ack; the catalog is fsynced locally at ack and becomes
-  durable on Forge only when its segment ships (`forge_root_cid` lags
-  `root_cid` until then).
+  accepted on Forge at ack; the catalog is fsynced locally and journaled in
+  Postgres at ack, and becomes durable on Forge only when its segment ships
+  (`forge_root_cid` lags `root_cid` until then). The journal is what puts the
+  unshipped catalog in any copy of Postgres; shipping the segment deletes its
+  rows.
 - The ordering is the crash-safety invariant: the catalog route starts only
   after every body blob is durable, so a crash never leaves a catalog entry
   pointing at non-durable data.
@@ -227,8 +231,8 @@ flowchart TB
   arrival instead of following it. The spool copy still supplies the digest,
   which the put receipt reports and the node checks at accept.
 - Multipart parts ride the body route with the conclude deferred (parked);
-  `Complete` finishes it
-  (the [multipart diagram](#multipart-upload-park-on-write-conclude-on-complete)).
+  the upload's acceptor finishes it
+  (the [multipart diagram](#multipart-upload-park-on-write-accept-in-the-background)).
 
 Cross-references: [`architecture.md` §4](./architecture.md#4-the-catalog-layer),
 [§5](./architecture.md#5-the-data-layer);
@@ -278,7 +282,7 @@ sequenceDiagram
     loop each streamed blob (uploadBlobs → concludeStreamed)
         B->>U: /ucan/conclude the put receipt, reporting the spooled digest
         U-->>B: accept receipt + /assert/location commitment
-        B->>R: PutLocation, then SetIntentState(accepted); DeleteStream
+        B->>R: PutLocation, then SetIntentState(accepted)#59; DeleteStream
         B->>B: BlobCache.Take: the file moves from the spool to the cache
     end
     loop each spooled-first blob (uploadBlobs)
@@ -297,16 +301,14 @@ sequenceDiagram
     Note over B,U: UploadBlob also captures the request proof store as the<br/>space's ship authority (captureShipProofs, 1h TTL)
     Note over B,L: under the per-bucket lock: commitVersion via Coordinator.WithTx
     B->>TX: Begin (lock, snapshot root)
-    TX->>R: AllocVersionSeq
+    TX->>R: AllocVersionSeq (a multipart Complete in an Enabled bucket<br/>reserved its seq before the lock: see the multipart diagram)
     TX->>TX: mint versionId ("null" unless versioning Enabled),<br/>manifest into OpStaging, re-check If-Match under the lock,<br/>MST splice (new nodes into staging)
+    Note over TX: uploader.CaptureShipAuthority: every commit captures the request<br/>proof store as the space's ship authority, so a write with no body<br/>(a delete, a tag change) leaves one for its segment's ship
     TX->>L: AppendBatch(catalog blocks, OpRoot) with fsync
-    TX->>R: CASRoot(bucket, snapshot, newRoot), guarded
+    TX->>R: CommitRoot(bucket, snapshot, newRoot), guarded, one transaction:<br/>the batch's catalog blocks journaled under its segment (catalog_journal,<br/>skipped once the segment has shipped), blob_refs gains this version,<br/>superseded version rows removed, a release record per digest whose<br/>claims reached 0#59;<br/>/upload/add(root = this version's manifest CID)<br/>+ /upload/remove per discarded version queued (upload_registrations)
     TX-->>B: committed, lock released
-    Note over B,R: post-commit, off the lock
-    B->>R: reconcileClaims: blob_refs gains this version,<br/>superseded version rows removed
-    B->>U: /blob/remove per digest whose CountClaims reached 0<br/>(+ crypto-shred: its blob_encryption_params row deleted)
-    B->>R: queue /upload/add(root = this version's manifest CID)<br/>+ /upload/remove per discarded version<br/>(upload_registrations, in the CAS transaction)
     B-->>C: 200 + ETag (+ x-amz-version-id when versioning is configured)
+    Note over B,U: the release sweeper runs each record once its grace passes:<br/>/blob/remove (+ crypto-shred: its blob_encryption_params row deleted)
 ```
 
 - A request that dies after allocating a streamed blob leaves its
@@ -477,19 +479,19 @@ Sources: `s3frontend/object.go` (GetObject, HeadObject, selectBytes),
 `registry/locallocator.go`, `logstore/manager.go` (Get). Review when these
 change.
 
-## Multipart upload: park on write, conclude on Complete
+## Multipart upload: park on write, accept in the background
 
-Parts upload to the provider at `UploadPart` but stay **parked** (durable,
-unaccepted): the conclude that triggers `/blob/accept` is deferred to
-`Complete`, so an `Abort` only ever unwinds parked blobs. Complete concludes
-every parked part in one request rather than one per part, which is what
-keeps its cost flat as the part count grows.
+Parts upload to the provider at `UploadPart` and park there (durable,
+unaccepted). Each upload's acceptor concludes its parked parts in batches
+while the client is still uploading, so `Complete` waits only for the last
+few and its cost stays flat as the part count grows.
 
 ```mermaid
 sequenceDiagram
     autonumber
     actor C as S3 client
     participant B as s3frontend.Backend
+    participant A as the upload's acceptor<br/>(goroutine)
     participant R as registry<br/>(sessions, parts, parks, intents)
     participant U as sprue
     participant P as piri
@@ -504,11 +506,11 @@ sequenceDiagram
         B->>B: vet the source: copySourceBucket (tenant), resolveVersionIn,<br/>range within the object, copy-source preconditions (412)#59;<br/>the body is the source's plaintext range through the decrypting reader
     end
     B->>B: ingestPart: splitSpool<br/>(resolve the tenant recipient, then encrypt per piece:<br/>fresh CEK → FEE envelope → spool under the ciphertext<br/>digest + params row, as in the PutObject diagram)
-    B->>R: PutPart(parked): open sessions only, the row held FOR SHARE<br/>against a concurrent latch#59; a refused part records its blobs' releases
+    B->>R: PutPart(spooled, span_lengths): open sessions only, the row held FOR SHARE<br/>against a concurrent latch#59; writes of one part number serialised on an advisory lock#59;<br/>a release record, due now, for each blob the replaced row named and this part<br/>does not, in the same transaction, returned to run#59; a refused part records its blobs' releases
     loop each part blob (parkBlobs)
         alt streamed while spooled
             B->>R: PutPark(AddTask, AcceptTask, PutInvocation), intent parked,<br/>DeleteStream: the PUT already went to piri in splitSpool
-            B->>B: removeLocal (the part's local copy#59; Complete concludes from the park)
+            B->>B: removeLocal (the part's local copy#59; the acceptor concludes from the park)
         else blob_locations already has the digest
             B->>R: intent accepted (dedup, no park)
         else already parked (GetPark hit)
@@ -520,19 +522,47 @@ sequenceDiagram
             B->>B: removeLocal (the part's local copy)
         end
     end
+    B->>R: MoveParts(spooled to parked), guarded by the part's digests
+    opt no row moved: a later upload of the part number replaced it,<br/>or a teardown took the session, while the blobs were parking
+        B->>R: EnqueueReleases of this part's blobs: a no-op beside the replacer's record,<br/>which the park left standing (awaitRelease)#59; they run below rather than on the next sweep
+    end
+    B->>A: nudge (start the acceptor, or ask for another pass)
+    B->>U: releaseNow: the records above, due at once (/blob/abort of the parks#59;<br/>a blob another part or the session still names waits on that reference)
     B-->>C: part ETag (part md5#59; for a copy, of the copied bytes)
+    loop while a pass finds parked parts
+        A->>R: GetSession (stop unless open or completing)#59; ListParkedParts
+        A->>U: acceptParked: up to 1000 blobs' put receipts in one /ucan/conclude,<br/>accept receipts read from the response (poll only as fallback)
+        A->>R: per blob, under its write lock: ConcludePark (park swapped for the<br/>location, only while the concluded park, by AddTask, stands) + intent accepted
+        A->>R: MoveParts(parked to accepted)
+    end
+    Note over A,R: a failed pass backs off (1 s to 30 s) and retries#59; the accept sweeper<br/>nudges every live upload with parked parts at start and every 30 s
     C->>B: CompleteMultipartUpload(parts)
-    B->>B: validate parts (ascending, ETags, checksums, MinPartSize)
+    B->>B: validate parts (ascending, ETags, checksums, MinPartSize)#59;<br/>an error here is answered with its own status
     alt session already completed
-        B-->>C: the ETag/version id recorded on the session (idempotent re-Complete)
+        B-->>C: report the version id recorded on the session (none for a null version),<br/>then its ETag (idempotent re-Complete)
+    else another Complete holds the latch
+        B-->>C: report no version id (the winner's isn't known yet), then wait (bounded):<br/>replay its result, or take the latch if it failed
     else latch won
         B->>R: LatchSession(open to completing), single winner
-        B->>R: manifest spans: per blob, plaintext length derived from<br/>the intent's stored size + FEE geometry (blobPlaintextLen)
-        B->>U: concludeBlobs: every parked blob's put receipt, up to<br/>MaxConcludeReceipts (1000) per /ucan/conclude, accept receipts<br/>read from the response (poll only as fallback)
-        B->>R: PutLocation + intent accepted + DeletePark per blob
-        B->>TX: commitVersion (see the PutObject diagram)
-        B->>R: LatchSession(completing to completed), best-effort
-        B-->>C: 200, ETag = md5-of-part-md5s + "-N"
+        B->>R: ListPartTrees#59; re-hash over budget: 400 InvalidPartLayout,<br/>the deferred revert reopens the session
+        alt versioning Enabled, nothing reported yet
+            B->>R: reserveVersion: AllocVersionSeq off the lock, mint the versionId
+            B-->>C: report it: versitygw commits the 200 with x-amz-version-id<br/>and x-amz-server-side-encryption
+        else
+            B-->>C: report no version id: the 200 commits with x-amz-server-side-encryption only
+        end
+        Note over B,C: from here the body is padded with a newline every<br/>complete_multipart_keepalive (5 s), and any error goes in the 200's body
+        B->>R: manifest spans from each part's span_lengths<br/>(rows without them: intent size + FEE geometry)
+        B->>A: awaitPass until no named part is parked, up to acceptWaitBudget (30 s)
+        B->>R: ListParts: the named parts' states
+        alt a named part still parked
+            B-->>C: OperationAborted in the 200's body#59; the deferred revert reopens the session
+        else every part accepted, or spooled
+            B->>U: spooled parts only: concludeBlobs (conclude, or upload a never-parked blob)
+            B->>TX: commitVersionAt under what was reported (see the PutObject diagram)#59;<br/>refused (errReservationSuperseded) if the key gained a later seq,<br/>or the versioning no longer fits the report#59; the claims land<br/>in the root swap's transaction, set-based
+            B->>R: LatchSession(completing to completed), best-effort
+            B-->>C: the result ends the body: ETag = md5-of-part-md5s + "-N"
+        end
     end
     C->>B: AbortMultipartUpload
     B->>R: LatchSession(open to aborting)#59; EnqueueReleases for every<br/>unreferenced part blob#59; then DeleteSession (parts cascade)
@@ -545,23 +575,89 @@ sequenceDiagram
   the blob is free to go — a claimed digest drops the record (`CountClaims`),
   and one a part of an in-flight session references waits
   (`CountLivePartRefs`, checked first: a Complete claims before it leaves
-  'completing'). `AddBlobClaim` publishes a committed blob's upload intent,
-  so the reap of a retained session releases only what was never committed.
+  'completing'). A commit's claim publishes the blob's upload intent, so
+  the reap of a retained session releases only what was never committed.
+- A release can take a blob while the acceptor concludes it. The provider
+  refuses whichever of accept and abort comes second, and the release drops
+  the park row before anything else, so `ConcludePark` finds no park and the
+  acceptor records nothing for a blob a release took. `ConcludePark`
+  matches the park's `/blob/add` task, so a later park of the same bytes
+  stays for its own conclude.
+- The acceptor never cancels a release record (`ReleasingDigests`, read
+  only); a part holding such a blob goes back to `spooled` for Complete.
+  Each pass runs under `acceptPassTimeout`.
+- No release runs while its blob's conclude is in flight: sprue registers
+  an accepted blob only when it answers, so an earlier remove would miss it.
+  A teardown waits for the acceptor's pass in flight (`quiesceAcceptor`)
+  before it records releases; any other release defers while the blob is
+  marked (`markConcluding`, held 2 min past a failed conclude) and runs from
+  the release sweeper.
 - A part is written only while its session is open, in the statement that
   checks the state; a teardown that took the session refuses it, and the
   upload records releases for the blobs it had spooled.
 - A never-parked blob at Complete falls back to a full synchronous
-  `UploadBlob`.
+  `UploadBlob`, after rechecking for a park under the blob's lock: an
+  UploadPart still parking the blob when Complete classified it holds that
+  lock, and its park is concluded rather than allocated beside.
+- Complete reports its response headers through versitygw's
+  `CompleteMultipartUploadReportingHeaders` before it accepts the parts,
+  and the response commits to 200 at the report, as S3's does. A reserved
+  version id is binding, and a Complete that reported none commits only a
+  null version, so the client always learns the version it created
+  ([`s3-versioning.md`](./s3-versioning.md) §5.1).
 
 Cross-references: [`architecture.md` §7.2](./architecture.md#72-multipart),
 [§7.3](./architecture.md#73-the-session-latch-the-abortcomplete-race).
 
 Sources: `s3frontend/multipart.go` (all verbs, ingestPart, parkBlobs,
-recordStreamedPark, concludeBlobs, enqueuePartReleases,
-SweepStaleMultipartSessions), `s3frontend/stream.go`,
+recordStreamedPark, acceptRequested, acceptParked, recordConcluded,
+concludeBlobs, enqueuePartReleases, SweepStaleMultipartSessions),
+`s3frontend/version.go` (reserveVersion, commitVersionAt),
+`s3frontend/acceptor.go`, `s3frontend/stream.go`,
 `s3frontend/object.go` (runRelease, executeRelease),
 `s3frontend/uploadpartcopy.go`, `registry/stores.go`,
-`server.go` (startMultipartSweeper). Review when these change.
+`server.go` (startMultipartSweeper, startAcceptSweeper). Review when these change.
+
+## Part states: the acceptance queue
+
+A part row's `state` is the upload's acceptance queue. Every move is a
+guarded update that also matches the part's `blob_digests`, so a request
+never moves a row a later upload of the same part number replaced.
+
+```mermaid
+stateDiagram-v2
+    [*] --> spooled : PutPart (UploadPart, before its blobs park)
+    spooled --> parked : every blob parked or located (MoveParts, then nudge)
+    parked --> accepted : acceptor pass concludes and records the blobs
+    parked --> spooled : acceptor finds a blob with a release record, or neither park nor location
+    spooled --> accepted : Complete finishes it (conclude, or upload from the spool)
+    parked --> accepted : Complete, when no acceptors run
+    spooled --> [*] : a later UploadPart of the same number replaces the row#59;<br/>the blobs it drops get release records in the same transaction
+    parked --> [*] : replaced (releases recorded with the replacement),<br/>or the session's teardown cascades
+    accepted --> [*] : replaced (releases recorded with the replacement),<br/>or the session's teardown cascades
+```
+
+- `spooled` is the state of a part whose request is still parking its
+  blobs, or died doing so. The acceptor never takes it; Complete does.
+- A request whose `spooled` row is replaced while it parks moves no row to
+  `parked`. The releases the replacement recorded stand: a part's park
+  leaves a pending release of its digest to the part row, which defers it
+  while the row stands and lets it run once the row is replaced, so the
+  blobs go even if the request dies there. The request runs them itself
+  when it can, rather than leave them to the next sweep.
+- Complete requires every part it names to be `accepted` before the commit:
+  it waits until none of them is queued (parts it omits are not waited
+  for), finishes `spooled` parts itself, and answers a part still `parked`
+  with a 409 that botocore clients treat as final. A failed pass accepts
+  every part of its batch but those holding a failed blob.
+- Rows from before migration 00030 are `parked` or `accepted` and have no
+  `span_lengths`; Complete derives their lengths per blob.
+
+Sources: `registry/stores.go` (Part* consts, MoveParts, ListParkedParts,
+ListUploadsWithParkedParts), `registry/stores_postgres.go`,
+`s3frontend/acceptor.go`, `s3frontend/multipart.go` (ingestPart,
+acceptRequested), `migrations/sql/00030_part_accept_queue.sql`. Review when
+these change.
 
 ## Session states and the Complete/Abort latch
 
@@ -580,11 +676,14 @@ stateDiagram-v2
     completed --> [*] : sweeper past TTL
 ```
 
-- A Complete that loses the latch waits (bounded) for the winner's terminal
-  state: `completed` replays the ETag and version id the winner recorded on
-  the session; `aborting` or a vanished row is `NoSuchUpload`; a winner still
-  running past the wait budget is `OperationAborted`, which the client
-  retries.
+- A Complete that loses the latch reports no version id, then waits
+  (bounded) for the winner's terminal state: `completed` replays the ETag
+  and version id the winner recorded on the session; `aborting` or a
+  vanished row is `NoSuchUpload`; a winner still running past the wait
+  budget is `OperationAborted`, inside the 200's body since the headers
+  have gone out. A winner that fails reopens the session, and the waiting
+  Complete may then take the latch; in an Enabled bucket its commit is
+  refused, since it reported no id, and the client's retry reports one.
 - `ListParts` and `Abort` reject any non-`open` session as `NoSuchUpload`;
   `Complete` alone accepts `completed`, for idempotency.
 - The sweeper also reaps rows stuck in `completing` or `aborting` past the
@@ -616,20 +715,20 @@ flowchart TB
     spooled -->|"first network call begins<br/>(uploadBlobs, parkBlobs, concludeBlobs fallback)"| uploading
     uploading -->|"single-shot upload:<br/>/blob/add, PUT, conclude, accept;<br/>file moves to the cache (BlobCache.Take)"| accepted
     uploading -->|"parkBlobs: /blob/add WithConclude(false),<br/>PUT (or already streamed); blob_parks row written;<br/>local copy removed (removeLocal)"| parked
-    parked -->|"concludeBlobs at Complete:<br/>/ucan/conclude; blob_parks row deleted"| accepted
+    parked -->|"acceptParked (the upload's acceptor, or Complete for a spooled part):<br/>/ucan/conclude; ConcludePark swaps the blob_parks row for blob_locations"| accepted
     spooled -->|"release record; executeRelease, local only<br/>(the blob never left this node):<br/>DeleteIntent + removeLocal"| gone([deleted])
     uploading -->|"release record; executeRelease: /blob/remove<br/>(idempotent: the accept may have landed, its location not);<br/>DeleteIntent + removeLocal"| gone
     parked -->|"release record; executeRelease: /blob/abort (cause AddTask),<br/>or /blob/remove if the provider says accepted;<br/>DeleteIntent + removeLocal"| gone
     accepted -->|"release record (never committed);<br/>executeRelease: /blob/remove;<br/>DeleteIntent + removeLocal"| gone
     published -->|"release record (committed);<br/>executeRelease: /blob/remove;<br/>DeleteIntent + removeLocal"| gone
 
-    accepted -->|"commit: AddBlobClaim, same transaction"| published
+    accepted -->|"commit: the claim, in the root swap's transaction"| published
 
     parked -.->|"SweepLocalBlobs over budget (blob_parks row):<br/>removeLocal + MarkEvicted; state unchanged"| evicted[["local file evicted<br/>(evicted_at set)"]]
     accepted -.->|"cache_writes false: at accept,<br/>once the location is recorded;<br/>removeLocal + MarkEvicted"| evicted
     accepted -.->|"SweepLocalBlobs over budget (blob_locations row):<br/>removeLocal + MarkEvicted; state unchanged"| evicted
     published -.->|"SweepLocalBlobs over budget (blob_locations row):<br/>removeLocal + MarkEvicted; state unchanged"| evicted
-    published -->|"commit: reconcileClaims adds this version"| refs["blob_refs rows<br/>(digest, bucket, key, version_id)"]
+    published -->|"commit: the root swap's transaction adds this version's claim"| refs["blob_refs rows<br/>(digest, bucket, key, version_id)"]
     refs -->|"version delete or overwrite removes its row"| zero{"CountClaims == 0<br/>for (space, digest)?"}
     zero -->|yes| rel["release record enqueued, due after release_grace<br/>(the published → deleted edge runs it)"]
     zero -->|no| keep["blob retained<br/>(still referenced)"]
@@ -661,23 +760,27 @@ flowchart TB
   startup, the released pass does the same for `published` intents nothing
   names any more (no location, claim, pending release or live part), left
   by versions whose releases kept the copy.
-- Digests present in both the old and new version sets never churn: the
-  reconcile computes a set difference.
+- Digests present in both the old and new version sets never churn: the new
+  generation's claim lands before the old one's drops in the same
+  transaction, so the digest keeps a claim throughout and no release is
+  recorded.
 - Parked-blob reclamation is guarded: a digest live in another session, part,
   or committed object is left alone.
-- A same-space copy pins the source's body: its claims are taken with
-  `PinBlobClaims`, which requires an existing claim on the digest in the same
-  statement, so a copy racing the source's delete and release fails with
-  NoSuchKey instead of claiming a blob about to go.
+- A same-space copy pins the source's body: its claims are pins
+  (`registry.RootCommit.Pins`), each written only while the space still
+  holds a claim on the digest, under its lock, so a copy racing the source's
+  delete and release fails with NoSuchKey instead of claiming a blob about
+  to go.
 
 Cross-references: [`architecture.md` §5](./architecture.md#5-the-data-layer),
 [`s3-versioning.md`](./s3-versioning.md) §8.
 
 Sources: `registry/stores.go` (state consts, ListEvictable, ListReleasedPublished), `s3frontend/object.go`
-(ingestBody, reconcileClaims), `s3frontend/localblob_sweep.go` (SweepLocalBlobs),
+(ingestBody, addClaims, dropClaims), `s3frontend/localblob_sweep.go` (SweepLocalBlobs),
 `s3frontend/localblobs.go` (cacheHeld, removeLocal),
 `s3frontend/multipart.go`
-(parkBlobs, concludeBlobs, enqueuePartReleases), `s3frontend/object.go`
+(parkBlobs, acceptParked, recordConcluded, concludeBlobs, enqueuePartReleases),
+`s3frontend/acceptor.go`, `s3frontend/object.go`
 (runRelease, executeRelease), `uploader/blob.go` (UploadBlob,
 AbortBlob, RemoveBlob). Review when these change.
 
@@ -810,14 +913,18 @@ flowchart TB
     subgraph stores["proof stores"]
         kp["iam.KeyProofs: one DelegationCache<br/>per access key, 24h idle eviction;<br/>also the key's effective S3 action set per bucket"]
         ship["uploader.Forge shipProofs:<br/>per-space store, 1h TTL"]
+        commit["uploader.Forge commitProofs:<br/>per-space store, 1h TTL"]
         static["AuthServiceProofs:<br/>static container from config"]
         tok["tokenstore (tokens.cbor):<br/>empty; dormant login paths only"]
     end
 
     kp -->|"reqscope.ProofStore<br/>on the request ctx"| writes["uploader:<br/>/blob/add, abort, remove, /index/add<br/>/upload/add, /upload/remove"]
     kp -->|"same store"| reads["blockstore.Forge:<br/>content/retrieve"]
-    kp -->|"captureShipProofs<br/>at UploadBlob"| ship
-    ship --> async["async catalog ship;<br/>sweeper and DeleteBucket aborts"]
+    kp -->|"captureShipProofs<br/>at UploadBlob and StartBlob"| ship
+    kp -->|"CaptureShipAuthority<br/>at every bucketop commit"| commit
+    commit --> catship["async catalog ship"]
+    ship -->|"no commit capture<br/>holding a chain"| catship
+    ship --> async["sweepers' releases, aborts and<br/>registration renewals; DeleteBucket aborts"]
     static --> hc["hilt client:<br/>every /s3/* invocation"]
 
     classDef external stroke-dasharray: 5 5
@@ -830,9 +937,17 @@ flowchart TB
   account is disabled, so no access-key auth path skips the hilt-backed IAM
   lookup. `/health` and the DID document are outside the S3 auth chain, and a
   rejected access key never receives one.
-- A bucket whose last write is more than an hour old has an expired ship
-  authority; a newly sealed segment then waits for the bucket's next write to
-  re-capture it.
+- Every write captures the ship authority when it commits, so a segment,
+  sealed seconds after its writes, ships under a fresh capture. That capture
+  is kept apart from the upload's: hilt grants each catalog-changing
+  operation the ship's commands, but a narrower key's grant (tagging,
+  retention) lacks the release, abort and registration commands the
+  upload's capture also serves. The ship uses the commit's capture only when
+  it holds a `/blob/add` chain for the space (an older key's grant, or an
+  expired or revoked delegation, may not), and the upload's otherwise. Both
+  last an hour and live in memory: a segment whose ship keeps failing past
+  that, or across a restart, has no authority until the bucket's next
+  write.
 - Each access key gets its own `DelegationCache`, so a proof chain can never
   assemble across keys.
 - The same store holds the effective S3 action set hilt reported for the key
@@ -843,12 +958,21 @@ flowchart TB
   `s3:GetObject`'s, `s3:ListBucket`'s and `s3:AbortMultipartUpload`'s, so a
   chain probe alone would let a put-only key read and abort on the bucket, or
   read a copy's source.
+- A copy's source and the headers that add a permission to a write (a lock
+  or tags on the version it creates) are decided from headers, and a
+  DeleteObjects on its body, which iam attaches for the operations hilt
+  names (`Operation.ReadsBody`) and no other. Hilt's `RequirementsFor`
+  refuses a header the signature does not cover or a body it does not bind,
+  as hilt itself does, so the fast path decides nothing from such a
+  request: it goes to hilt, which refuses it as `UnsignedHeader` or
+  `InvalidBody`.
 
 Cross-references: [`architecture.md` §9](./architecture.md#9-the-system-contract-piri--sprue--indexer).
 
 Sources: `iam/service.go`, `iam/keyproofs.go`, `iam/proofcache.go`,
 `internal/reqscope/reqscope.go`, `uploader/forge.go` (shipProofs,
-captureShipProofs), `module.go`, `config/config.go` (auth_service fields).
+captureShipProofs, CaptureShipAuthority), `bucketop/bucketop.go` (Tx.Commit),
+`module.go`, `config/config.go` (auth_service fields).
 Review when these change.
 
 ## Request authorization and proof capture
@@ -925,7 +1049,8 @@ Review when `iam/`, `s3frontend/policy.go` or the hilt client changes.
 ## Postgres schema as migrated
 
 Everything relational lives in the `ingot` schema; manifests and MST nodes
-are content-addressed blocks in the catalog log, not rows. Attributes here
+are content-addressed blocks in the catalog log, not rows, apart from the
+catalog journal's copy of those not yet shipped. Attributes here
 are trimmed to keys, states, and the columns other diagrams reference; the
 full DDL is `migrations/sql/`.
 
@@ -956,6 +1081,13 @@ erDiagram
         int seq_within PK
         text bucket
         bytea root_cid
+    }
+    catalog_journal {
+        bigint seq PK "segment the block went into"
+        bytea cid PK
+        text bucket FK
+        bytea data "the block, until its segment ships"
+        timestamptz created_at
     }
     blob_refs {
         bytea digest PK
@@ -1027,8 +1159,9 @@ erDiagram
         int part_number PK
         bytea etag_md5
         bytea blob_digests "ordered array"
+        bigint span_lengths "each blob's span in the object, bytes before encryption (digests are of the stored blob); NULL before 00030"
         text checksum
-        text state "'accepted' never written"
+        text state "spooled, parked, accepted: the acceptor's queue"
     }
     multipart_part_trees {
         text upload_id PK, FK
@@ -1070,17 +1203,23 @@ erDiagram
     multipart_sessions ||--o{ multipart_parts : "ON DELETE CASCADE"
     multipart_parts ||--o| multipart_part_trees : "ON DELETE CASCADE; deleted by Complete once the object commits"
     buckets ||--o{ upload_registrations : "ON DELETE CASCADE"
+    buckets ||--o{ catalog_journal : "ON DELETE CASCADE"
+    segments ||..o{ catalog_journal : "by seq, deliberately no FK"
     buckets ||..o{ segments : "by bucket name, no FK"
     buckets ||..o{ blob_refs : "by bucket name, no FK"
     blob_locations ||..o{ shard_inclusions : "by shard_digest"
     blob_locations ||..o| blob_encryption_params : "by (space, digest), deliberately no FK"
     multipart_parts ||..o{ blob_parks : "digests in blob_digests"
-    multipart_parts ||..o{ blob_release_intents : "teardown records, by digest"
+    multipart_parts ||..o{ blob_release_intents : "teardown and supersede records, by digest"
 ```
 
-- The four solid relationships are the schema's only real foreign keys;
+- The five solid relationships are the schema's only real foreign keys;
   dashed ones are soft joins the code performs. `revocation_cursor` stands
   alone.
+- `catalog_journal` has no foreign key to `segments` on purpose: when a
+  segment's CAR is missing from disk, recovery deletes its row if it was open
+  (and retires it if it was sealed), and after a lost disk the journal rows
+  are what that segment is rebuilt from.
 - `gc_candidates` is write-only (no reader exists yet; its entry paths are the
   [catalog GC candidates](#catalog-gc-candidates-what-gets-remembered-for-removal)
   diagram); `segments.plane`
@@ -1129,7 +1268,7 @@ sequenceDiagram
     B->>U: drainSpaceReleases: /blob/remove each deleted<br/>object's blob still behind the reader grace
     B->>U: DrainSpaceRegistrations: send the space's queued<br/>/upload/add and /upload/remove changes
     B->>H: /s3/bucket/delete (hilt refuses while registrations remain)
-    B->>R: reg.Delete (the local row)
+    B->>R: reg.Delete (the local row, its catalog_journal rows cascading)
     B->>L: RemoveBucketLog, best-effort<br/>(directory + segment rows)
     B-->>C: 204
 ```
@@ -1153,11 +1292,13 @@ listed diagrams (each diagram's `Sources:` footer names its exact files).
 
 | Package / file | Diagrams to review |
 |---|---|
-| `s3frontend/object.go`, `s3frontend/version.go` | put, get, blob-lifecycle, version-tree, gc-candidates |
-| `s3frontend/multipart.go` | multipart, multipart-states, blob-lifecycle |
+| `s3frontend/object.go` | put, get, blob-lifecycle, version-tree, gc-candidates |
+| `s3frontend/version.go` | put, get, multipart, blob-lifecycle, version-tree, gc-candidates |
+| `s3frontend/multipart.go` | multipart, part-states, multipart-states, blob-lifecycle |
+| `s3frontend/acceptor.go` | multipart, part-states, blob-lifecycle |
 | `s3frontend/stream.go` | put, multipart, block-routes, blob-lifecycle |
 | `s3frontend/bucket.go` | context, delete-bucket |
-| `bucketop/` | put, get, delete-bucket, packages |
+| `bucketop/` | put, get, delete-bucket, packages, principals |
 | `blockstore/` | get, packages, block-routes; `forge.go` also context, principals |
 | `registry/` | schema, get, blob-lifecycle, logstore-pipeline |
 | `logstore/` | logstore-pipeline, segment-states, get, block-routes, delete-bucket |
@@ -1165,5 +1306,5 @@ listed diagrams (each diagram's `Sources:` footer names its exact files).
 | `iam/`, `internal/reqscope/` | principals, authorize, context |
 | `bucket/`, `mst/` | version-tree, put, get |
 | `migrations/sql/` | schema, plus any state diagram naming a changed CHECK |
-| `module.go`, `server.go`, `config/` | packages, context, logstore-pipeline; `server.go` also authorize |
+| `module.go`, `server.go`, `config/` | packages, context, logstore-pipeline; `server.go` also authorize and multipart |
 | `s3frontend/policy.go` | context, authorize |
