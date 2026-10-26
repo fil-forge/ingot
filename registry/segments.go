@@ -205,13 +205,19 @@ func (r *Postgres) ListRetiredSegments(ctx context.Context, plane blockstore.Pla
 // listSegments reads bucket's segment rows for plane, either the unretired
 // ones or the retired ones, ordered by seq, without op-roots.
 func (r *Postgres) listSegments(ctx context.Context, plane blockstore.Plane, bucket string, retired bool) ([]logstore.SegmentMeta, error) {
+	// The predicate is spelled out rather than parameterized, so the planner
+	// can use the partial index on unretired rows.
+	which := "retired_at IS NULL"
+	if retired {
+		which = "retired_at IS NOT NULL"
+	}
 	rows, err := r.pool.Query(ctx,
 		`SELECT seq, state, COALESCE(sealed_at, 0), size_bytes, sha256, COALESCE(shipped_at, 0), index_digest,
 		        COALESCE(retired_at, 0)
 		   FROM ingot.segments
-		  WHERE plane = $1 AND bucket = $2 AND (retired_at IS NOT NULL) = $3
+		  WHERE plane = $1 AND bucket = $2 AND `+which+`
 		  ORDER BY seq ASC`,
-		plane.String(), bucket, retired)
+		plane.String(), bucket)
 	if err != nil {
 		return nil, fmt.Errorf("registry: list %s segments for %q: %w", plane, bucket, err)
 	}

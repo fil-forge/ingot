@@ -6,5 +6,11 @@
 -- segment is still on disk.
 ALTER TABLE ingot.segments ADD COLUMN retired_at BIGINT;
 
+-- Retired rows accumulate until DeleteBucket, while opening a bucket's log and
+-- the startup sweep read only the few unretired ones.
+CREATE INDEX segments_unretired_idx ON ingot.segments (plane, bucket, seq)
+    WHERE retired_at IS NULL;
+
 -- +goose Down
+DROP INDEX ingot.segments_unretired_idx;
 ALTER TABLE ingot.segments DROP COLUMN retired_at;
