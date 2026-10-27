@@ -1217,9 +1217,9 @@ erDiagram
   dashed ones are soft joins the code performs. `revocation_cursor` stands
   alone.
 - `catalog_journal` has no foreign key to `segments` on purpose: when a
-  segment's CAR is missing from disk, recovery deletes its row if it was open
-  (and retires it if it was sealed), and after a lost disk the journal rows
-  are what that segment is rebuilt from.
+  segment's CAR is missing from disk, recovery rebuilds its journaled blocks
+  into new segments and moves the rows onto them, then deletes the lost row if
+  it was open (and retires it if it was sealed).
 - `gc_candidates` is write-only (no reader exists yet; its entry paths are the
   [catalog GC candidates](#catalog-gc-candidates-what-gets-remembered-for-removal)
   diagram); `segments.plane`

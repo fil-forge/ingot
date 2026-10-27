@@ -90,6 +90,18 @@ func (f *fakeMeta) ListSegmentBuckets(_ context.Context, plane blockstore.Plane)
 	}
 	return out, nil
 }
+func (f *fakeMeta) EnsureSegmentSeqAbove(_ context.Context, seq uint64) error {
+	f.seq = max(f.seq, seq)
+	return nil
+}
+func (f *fakeMeta) JournalBuckets(context.Context) ([]string, error)          { return nil, nil }
+func (f *fakeMeta) JournalSegments(context.Context, string) ([]uint64, error) { return nil, nil }
+func (f *fakeMeta) ReadJournal(context.Context, uint64, cid.Cid, int) ([]block.Block, error) {
+	return nil, nil
+}
+func (f *fakeMeta) MoveJournal(context.Context, string, uint64, uint64, cid.Cid, cid.Cid) error {
+	return nil
+}
 func (f *fakeMeta) RehydrateSegment(_ context.Context, m logstore.SegmentMeta) error {
 	cp := m
 	f.rows[m.Seq] = &cp

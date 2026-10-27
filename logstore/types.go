@@ -3,6 +3,8 @@ package logstore
 import (
 	"context"
 
+	block "github.com/ipfs/go-block-format"
+	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
 
 	"github.com/fil-forge/ingot/blockstore"
@@ -142,4 +144,28 @@ type Meta interface {
 	// on-disk `.idx` sidecar when the DB row is missing or torn.
 	// Idempotent on (seq) — replaces any existing row for that segment.
 	RehydrateSegment(ctx context.Context, m SegmentMeta) error
+
+	// EnsureSegmentSeqAbove moves the NextSegmentSeq allocator past seq, so
+	// it never hands out a seq a segment on disk already holds. A database
+	// restored behind the disk would otherwise reissue them. Startup calls
+	// it before allocating anything.
+	EnsureSegmentSeqAbove(ctx context.Context, seq uint64) error
+
+	// JournalBuckets returns the buckets that have catalog blocks in the
+	// journal (CommitRoot's copy of every block not yet shipped).
+	JournalBuckets(ctx context.Context) ([]string, error)
+
+	// JournalSegments returns the seqs bucket's journaled blocks are filed
+	// under, ascending.
+	JournalSegments(ctx context.Context, bucket string) ([]uint64, error)
+
+	// ReadJournal returns up to limit of the blocks journaled under seq, in
+	// CID byte order, starting after `after` (cid.Undef for the first page).
+	ReadJournal(ctx context.Context, seq uint64, after cid.Cid, limit int) ([]block.Block, error)
+
+	// MoveJournal re-files bucket's blocks journaled under seq from whose
+	// CIDs fall in [first, last] (byte order) under seq to, in one
+	// transaction. Recovery moves a lost segment's blocks onto the segment
+	// it rebuilt them into, once they are durable there.
+	MoveJournal(ctx context.Context, bucket string, from, to uint64, first, last cid.Cid) error
 }
