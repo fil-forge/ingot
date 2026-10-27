@@ -132,6 +132,40 @@ func TestShipRecordsUnmeasurableSegment(t *testing.T) {
 	}
 }
 
+// TestDeadOnArrivalWithoutOpRoots: a segment with no op-root has no root to
+// walk from. Empty, it has nothing dead; holding blocks (as a segment rebuilt
+// from the catalog journal does), it goes unmeasured rather than all dead.
+func TestDeadOnArrivalWithoutOpRoots(t *testing.T) {
+	ctx := context.Background()
+	meta := newFakeMeta()
+	dir := t.TempDir()
+
+	empty, err := createOpenSegment(ctx, dir, 1, blockstore.PlaneCatalog, "bk", meta, zaptest.NewLogger(t))
+	if err != nil {
+		t.Fatalf("create segment: %v", err)
+	}
+	if err := empty.seal(ctx, meta); err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	if got := empty.deadOnArrival(); got != 0 {
+		t.Fatalf("empty segment: dead bytes = %d, want 0", got)
+	}
+
+	rootless, err := createOpenSegment(ctx, dir, 2, blockstore.PlaneCatalog, "bk", meta, zaptest.NewLogger(t))
+	if err != nil {
+		t.Fatalf("create segment: %v", err)
+	}
+	if err := rootless.append([]block.Block{linkBlock(t, "a"), linkBlock(t, "b")}, nil); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	if err := rootless.seal(ctx, meta); err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	if got := rootless.deadOnArrival(); got != -1 {
+		t.Fatalf("segment with blocks and no op-root: dead bytes = %d, want -1 (unmeasured)", got)
+	}
+}
+
 // TestDeadOnArrivalMeasuredOnce: a segment is measured at its first ship
 // attempt and the figure kept, so a later attempt (the retry sweep's, after
 // the first ones failed) reuses it rather than reading the segment again.

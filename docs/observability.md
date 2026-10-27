@@ -20,8 +20,10 @@ Ingot runs on the appliances, where it pushes traces and metrics over OTLP to Al
   global one, as the `ingot.local_blobs.*` instruments do (`s3frontend.Deps.MeterProvider`,
   `Layered.CountBlobReads`). Prefer a signal that answers "is this working?", such as a failure
   count or a stalled amount, over one that only measures volume, and keep attributes
-  low-cardinality: no keys, CIDs or bucket names. List each new metric in a metrics table in the
-  README: the local blob one, or a new one beside it.
+  low-cardinality: no keys, CIDs or bucket names. The exception is a per-bucket storage gauge,
+  such as `ingot.catalog.*`: it is labeled by the bucket's space DID and refreshed by a sweep
+  every few minutes, so it adds one series per bucket rather than one per request. List each new
+  metric in a metrics table in the README: the local blob one, or a new one beside it.
 - **Traces.** New work runs inside the request's span or a sweep's root span; a new outbound HTTP
   client uses `tracing.NewHTTPClient()`.
 - **Alerts and dashboard panels** live in fil-forge/infra-central, under `terraform/envs/grafana/`:

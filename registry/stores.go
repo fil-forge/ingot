@@ -730,9 +730,10 @@ type GCStore interface {
 // its space until DeleteBucket releases them. The segments' index blobs are
 // not counted. Segment rows are matched to the bucket by name: rows a failed
 // DeleteBucket cleanup left behind count toward a later bucket of the same
-// name. A DeleteBucket that fails partway drops the rows of the retired
-// segments it released, but not those of the unretired ones, which keep
-// counting until the bucket is deleted.
+// name. A DeleteBucket that fails partway, hilt refusing included, drops the
+// rows of the retired segments it released, but not those of the unretired
+// ones: their blobs are already released, yet their rows keep counting until
+// the bucket is deleted.
 type CatalogUsage struct {
 	Bucket string
 	Space  did.DID

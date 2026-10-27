@@ -295,6 +295,11 @@ segment row in Postgres.
 Blocks that die after their segment ships are not measured: that would take a
 walk of the bucket's live catalog, most of which is only on Forge.
 
+`forge_bytes` undercounts a bucket whose segments retired before retired rows
+were kept (migration `00033`): those rows were deleted, so their CARs, still on
+Forge, count nowhere, not even as unmeasured. Read such a bucket's figures as a
+floor, or reset its data.
+
 ## Build & test
 
 ```bash

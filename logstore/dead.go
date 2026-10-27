@@ -55,8 +55,15 @@ func (s *Segment) deadBytes() (int64, error) {
 	for c, loc := range s.index {
 		total += cars.FrameSize(c, loc.Length)
 	}
+	// With no op-root there is no root to walk from. An empty segment has
+	// nothing dead. One holding blocks goes unmeasured rather than all dead:
+	// a segment recovery rebuilt from the catalog journal records no op-roots
+	// although its blocks are committed writes.
 	if len(s.opRoots) == 0 {
-		return total, nil
+		if total == 0 {
+			return 0, nil
+		}
+		return 0, errors.New("logstore: dead bytes of a segment with blocks but no op-root to walk from")
 	}
 
 	var live int64
