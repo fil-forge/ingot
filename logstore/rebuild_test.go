@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -185,6 +186,17 @@ func TestRebuild_WipedVolume(t *testing.T) {
 	if len(rebuilt) < 2 {
 		t.Fatalf("rebuilt into %d segments, want the small SealBytes to split it", len(rebuilt))
 	}
+	rows, err := mem.ListSegments(ctx, blockstore.PlaneCatalog, "bk")
+	if err != nil {
+		t.Fatalf("ListSegments: %v", err)
+	}
+	for _, r := range rows {
+		// SealBytes plus one block: a segment closes once the next block
+		// would take it past SealBytes.
+		if r.Size > 8<<10+256 {
+			t.Fatalf("rebuilt segment %d is %d bytes, past SealBytes (8 KiB) by more than a block", r.Seq, r.Size)
+		}
+	}
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		stats, err := mem.CatalogJournalStats(ctx)
@@ -244,9 +256,10 @@ func (f *failSecondMove) MoveJournal(ctx context.Context, bucket string, from, t
 }
 
 // TestRebuild_ResumesAfterFailure: a rebuild that fails partway leaves the
-// unmoved rows under the lost segment, and the next start rebuilds them,
-// ending with every block readable and every journal row under a segment
-// that is on disk.
+// unmoved rows under the lost segment and an open segment behind. After two
+// such starts, the next one force-seals both open segments and rebuilds the
+// rest, ending with every block readable and every journal row under a
+// segment that is on disk.
 func TestRebuild_ResumesAfterFailure(t *testing.T) {
 	ctx := context.Background()
 	mem := inmem.NewMemStore()
@@ -256,8 +269,11 @@ func TestRebuild_ResumesAfterFailure(t *testing.T) {
 	lost, blocks := journalSegment(t, mem, "bk", 600)
 	dir := t.TempDir()
 
-	if _, err := openRebuildManager(t, dir, &failSecondMove{MemStore: mem}, &shipRecorder{}); err == nil {
-		t.Fatal("OpenManager with a failing move succeeded; the test proves nothing")
+	// Two starts fail partway, each leaving an open segment behind.
+	for range 2 {
+		if _, err := openRebuildManager(t, dir, &failSecondMove{MemStore: mem}, &shipRecorder{}); err == nil {
+			t.Fatal("OpenManager with a failing move succeeded; the test proves nothing")
+		}
 	}
 	if rows := mem.JournaledBlocks(lost); len(rows) == 0 || len(rows) == len(blocks) {
 		t.Fatalf("%d of %d rows under the lost segment after the failure, want some moved and some not", len(rows), len(blocks))
@@ -352,4 +368,157 @@ func TestOpenManager_SeqPastDisk(t *testing.T) {
 	if next <= top {
 		t.Fatalf("NextSegmentSeq = %d after opening over segments up to %d", next, top)
 	}
+}
+
+// sealedSegments writes one block per segment into bucket "bk" under dir,
+// through a manager over mem, and returns the blocks once every segment has
+// sealed and the manager is closed.
+func sealedSegments(t *testing.T, dir string, mem *inmem.MemStore, n int) []block.Block {
+	t.Helper()
+	ctx := context.Background()
+	m, err := openRebuildManager(t, dir, mem, &shipRecorder{})
+	if err != nil {
+		t.Fatalf("OpenManager: %v", err)
+	}
+	var written []block.Block
+	for i := range n {
+		b := block.NewBlock([]byte(fmt.Sprintf("sealed-%d/%s", i, strings.Repeat("z", 9<<10))))
+		if _, err := m.AppendBatch(ctx, []block.Block{b}, blockstore.OpRoot{Bucket: "bk", Root: b.Cid()}); err != nil {
+			t.Fatalf("AppendBatch: %v", err)
+		}
+		written = append(written, b)
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			idx, _ := filepath.Glob(filepath.Join(dir, "bk", blockstore.PlaneCatalog.String(), "seg-*.idx"))
+			if len(idx) > i {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("append %d never sealed", i)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	if err := m.Close(ctx); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	return written
+}
+
+func sortedSeqs(seqs map[uint64]bool) []uint64 {
+	var out []uint64
+	for s := range seqs {
+		out = append(out, s)
+	}
+	slices.Sort(out)
+	return out
+}
+
+// TestRecover_MetaBehindAnOpenRow: Meta restored to when segment A was still
+// open, while on disk A has sealed and B has opened since. A's row comes up to
+// its .idx, B is rebuilt from its CAR and force-sealed, and both read back.
+func TestRecover_MetaBehindAnOpenRow(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	written := sealedSegments(t, dir, inmem.NewMemStore(), 2)
+	seqs := sortedSeqs(onDiskSeqs(t, dir, "bk"))
+	a, b := seqs[0], seqs[1]
+	// B was still open at the crash: no .idx.
+	if err := os.Remove(filepath.Join(dir, "bk", blockstore.PlaneCatalog.String(), fmt.Sprintf("seg-%020d.idx", b))); err != nil {
+		t.Fatalf("remove B's .idx: %v", err)
+	}
+	behind := inmem.NewMemStore()
+	if err := behind.InsertSegmentOpen(ctx, blockstore.PlaneCatalog, a, "bk"); err != nil {
+		t.Fatalf("InsertSegmentOpen: %v", err)
+	}
+
+	m, err := openRebuildManager(t, dir, behind, &shipRecorder{})
+	if err != nil {
+		t.Fatalf("OpenManager over a Meta behind an open row: %v", err)
+	}
+	requireReadable(t, m, written)
+	rows, err := behind.ListSegments(ctx, blockstore.PlaneCatalog, "bk")
+	if err != nil {
+		t.Fatalf("ListSegments: %v", err)
+	}
+	sealed := map[uint64]bool{}
+	for _, r := range rows {
+		if r.State == logstore.StateSealed && len(r.SHA256) > 0 {
+			sealed[r.Seq] = true
+		}
+	}
+	if !sealed[a] || !sealed[b] {
+		t.Fatalf("sealed rows %v, want A (%d) brought up to its .idx and B (%d) force-sealed", sealed, a, b)
+	}
+}
+
+// TestRecover_RetiredFilesReappear: a retire whose unlink never reached the
+// disk leaves a retired segment's files behind. Recovery removes them and
+// keeps the retired row as it was: it is DeleteBucket's record of the blobs
+// the segment registered.
+func TestRecover_RetiredFilesReappear(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	mem := inmem.NewMemStore()
+	sealedSegments(t, dir, mem, 1)
+	seq := sortedSeqs(onDiskSeqs(t, dir, "bk"))[0]
+	index := multihash.Multihash("retired-index")
+	if err := mem.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seq, time.Now().Unix(), index, nil); err != nil {
+		t.Fatalf("MarkSegmentShipped: %v", err)
+	}
+	if err := mem.RetireSegment(ctx, blockstore.PlaneCatalog, seq, time.Now().Unix()); err != nil {
+		t.Fatalf("RetireSegment: %v", err)
+	}
+
+	if _, err := openRebuildManager(t, dir, mem, &shipRecorder{}); err != nil {
+		t.Fatalf("OpenManager: %v", err)
+	}
+	if left := onDiskSeqs(t, dir, "bk"); left[seq] {
+		t.Fatalf("the retired segment's CAR is still on disk")
+	}
+	retired, err := mem.ListRetiredSegments(ctx, blockstore.PlaneCatalog, "bk")
+	if err != nil {
+		t.Fatalf("ListRetiredSegments: %v", err)
+	}
+	if len(retired) != 1 || retired[0].Seq != seq || string(retired[0].IndexDigest) != string(index) {
+		t.Fatalf("retired rows = %+v, want segment %d with its index digest kept", retired, seq)
+	}
+	if live, _ := mem.ListSegments(ctx, blockstore.PlaneCatalog, "bk"); len(live) != 0 {
+		t.Fatalf("live rows = %+v, want none", live)
+	}
+}
+
+// TestRecover_UnreadableIdx: a row-less CAR whose .idx didn't survive (a
+// rename that never reached the disk) is rebuilt from the CAR instead of
+// failing the start.
+func TestRecover_UnreadableIdx(t *testing.T) {
+	dir := t.TempDir()
+	written := sealedSegments(t, dir, inmem.NewMemStore(), 1)
+	seq := sortedSeqs(onDiskSeqs(t, dir, "bk"))[0]
+	if err := os.WriteFile(filepath.Join(dir, "bk", blockstore.PlaneCatalog.String(), fmt.Sprintf("seg-%020d.idx", seq)), nil, 0o644); err != nil {
+		t.Fatalf("truncate .idx: %v", err)
+	}
+	m, err := openRebuildManager(t, dir, inmem.NewMemStore(), &shipRecorder{})
+	if err != nil {
+		t.Fatalf("OpenManager over an unreadable .idx: %v", err)
+	}
+	requireReadable(t, m, written)
+}
+
+// TestRecover_SeveralOpenSegments: two row-less CARs with no .idx, both open
+// at the crash as far as recovery can tell (Meta restored from behind the
+// disk), are both rebuilt and force-sealed rather than failing the start.
+func TestRecover_SeveralOpenSegments(t *testing.T) {
+	dir := t.TempDir()
+	written := sealedSegments(t, dir, inmem.NewMemStore(), 2)
+	for seq := range onDiskSeqs(t, dir, "bk") {
+		if err := os.Remove(filepath.Join(dir, "bk", blockstore.PlaneCatalog.String(), fmt.Sprintf("seg-%020d.idx", seq))); err != nil {
+			t.Fatalf("remove .idx: %v", err)
+		}
+	}
+	m, err := openRebuildManager(t, dir, inmem.NewMemStore(), &shipRecorder{})
+	if err != nil {
+		t.Fatalf("OpenManager over two open segments: %v", err)
+	}
+	requireReadable(t, m, written)
 }

@@ -304,7 +304,12 @@ func (r *Postgres) EnsureSegmentSeqAbove(ctx context.Context, seq uint64) error 
 }
 
 func (r *Postgres) JournalBuckets(ctx context.Context) ([]string, error) {
-	rows, err := r.pool.Query(ctx, `SELECT DISTINCT bucket FROM ingot.catalog_journal ORDER BY bucket`)
+	// One probe of catalog_journal_bucket_seq_idx per bucket, rather than a
+	// DISTINCT over every journaled block.
+	rows, err := r.pool.Query(ctx,
+		`SELECT name FROM ingot.buckets b
+		  WHERE EXISTS (SELECT 1 FROM ingot.catalog_journal j WHERE j.bucket = b.name)
+		  ORDER BY name`)
 	if err != nil {
 		return nil, fmt.Errorf("registry: list journal buckets: %w", err)
 	}
@@ -372,10 +377,14 @@ func (r *Postgres) ReadJournal(ctx context.Context, seq uint64, after cid.Cid, l
 
 // MoveJournal re-files a range of a segment's journaled blocks under another
 // segment (logstore.Meta), keeping each row's created_at so the journal's age
-// gauge still reports how long the block has waited. The locks follow the
-// journal's order: the bucket row first, as a deletion or EmptyRoot takes it,
-// then the target segment's row, as a commit journaling into it does. A
-// target that has shipped since takes no rows, and the source's rows go.
+// gauge still reports how long the block has waited. It takes the bucket row
+// FOR KEY SHARE first, so a deletion or EmptyRoot holding it FOR UPDATE
+// finishes before any journal row is touched, then the target segment's row
+// FOR SHARE, as a commit journaling into it does, so a ship of the target
+// and the move wait for each other. A commit and a ship lock the segment row
+// before the bucket's, the other way round, but that can't deadlock with
+// this order: KEY SHARE conflicts only with FOR UPDATE, which neither takes.
+// A target that has shipped since takes no rows, and the source's rows go.
 func (r *Postgres) MoveJournal(ctx context.Context, bucket string, from, to uint64, first, last cid.Cid) error {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {

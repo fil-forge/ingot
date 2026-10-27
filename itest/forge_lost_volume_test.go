@@ -66,6 +66,10 @@ func TestForgeRebuildAfterLostVolume(t *testing.T) {
 		out, _, err := s.Exec(ctx, "ingot", "sh", "-c", "test -d /data/segments && echo up")
 		return err == nil && bytes.Contains([]byte(out), []byte("up"))
 	})
+	// Test mode publishes Ingot on an ephemeral host port, which a restart
+	// can move: read it again.
+	ingotEndpoint = s.IngotEndpoint()
+	cfg = forgeConfig(ingotEndpoint, accessKey, secretKey)
 	waitHTTPOK(t, ingotEndpoint+"/health", 2*time.Minute)
 
 	for key, want := range objects {

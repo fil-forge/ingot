@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"os"
-	"sort"
 	"sync"
 	"time"
 
@@ -82,20 +81,6 @@ func openPlaneLog(ctx context.Context, plane blockstore.Plane, bucket, dir strin
 
 	if err := pl.recover(ctx); err != nil {
 		return nil, err
-	}
-
-	// Force-seal a recovered open segment so a fresh open is always
-	// brand-new on each process startup.
-	if pl.open != nil {
-		if err := pl.open.seal(ctx, meta); err != nil {
-			return nil, fmt.Errorf("logstore: force-seal recovered open %s segment: %w", plane, err)
-		}
-		pl.sealed = append([]*Segment{pl.open}, pl.sealed...)
-		// Segments rebuilt from the journal are newer than a recovered open
-		// one; retention and the retry sweep rely on newest first.
-		sort.Slice(pl.sealed, func(i, j int) bool { return pl.sealed[i].Seq() > pl.sealed[j].Seq() })
-		pl.enqueueFlush(pl.open)
-		pl.open = nil
 	}
 
 	if pc.Ship {

@@ -57,8 +57,8 @@ GROUP_CLAIMED := $(GROUP_encryption) $(GROUP_conformance) $(GROUP_uploads) $(GRO
 # matching no group and silently never running: LocalBlobBudget (1m21),
 # BucketEncryption (1m16), ReadAfterCatalogRetention (0m56), and
 # ReadAfterEviction, UncachedWrites, NativeProvision and DeferredMultipart at
-# ~0m50 each (~6m50 in total); MultipartManyParts skips unless
-# INGOT_ITEST_MP_BENCH=1.
+# ~0m50 each, and RebuildAfterLostVolume (not yet timed in CI);
+# MultipartManyParts skips unless INGOT_ITEST_MP_BENCH=1.
 GROUP_ALL  = $(filter Test%,$(shell GOWORK=off $(GO) test -tags itest -list '.*' ./itest))
 GROUP_rest = $(filter-out $(GROUP_CLAIMED),$(GROUP_ALL))
 

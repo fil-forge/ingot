@@ -19,8 +19,9 @@ Forge space. A `Store` is a thin wrapper over one `PlaneLog`, the reusable
 pipeline (seal trigger, ship transport, retention window). `AppendBatch`
 routes by the op-root's bucket, lazily opening (and recovering) that bucket's
 store on first write; `OpenManager` re-opens every bucket with leftover
-segments at startup (the union of on-disk directories and segment rows), so
-unshipped sealed segments re-enqueue without waiting for the bucket's next
+segments at startup (the union of on-disk directories, segment rows and
+buckets with journaled blocks), so unshipped sealed segments re-enqueue, and
+lost ones are rebuilt from the journal, without waiting for the bucket's next
 write.
 
 The persistence backend (`Meta`) is `*registry.Postgres` in production and an
@@ -106,6 +107,8 @@ stateDiagram-v2
     [*] --> Open : createOpenSegment + InsertSegmentOpen
     Open --> Open : append (fsync, then index commit)
     Open --> Sealed : seal (hash CAR, write .idx, MarkSegmentSealed)
+    Open --> Sealed : recovery, .idx on disk behind an open row (MarkSegmentSealed)
+    [*] --> Sealed : recovery, row-less CAR with .idx (RehydrateSegment)
     Open --> [*] : recovery, CAR missing (journal rows rebuilt into a new segment, then DeleteSegment)
     Sealed --> Shipped : flush ok (MarkSegmentShipped: guarded forge_root advance, journal rows deleted)
     Sealed --> Retired : recovery, CAR missing (journal rows rebuilt into a new segment, then RetireSegment)
@@ -179,10 +182,16 @@ before any worker starts. Discovery keys on the CAR file:
 
 | `Meta` row | On-disk CAR | Action |
 |---|---|---|
-| `open` | present | `rebuildOpenFromDisk` (scan + truncate any torn trailing frame); then force-sealed |
+| `open` | present, with `.idx` | it sealed after the point `Meta` was restored to: `loadSealedFromIdx` + `MarkSegmentSealed`; re-enqueued |
+| `open` | present, no `.idx` | `rebuildOpenFromDisk` (scan + truncate any torn trailing frame); then force-sealed |
 | `sealed` | present | `loadSealedFromIdx`; re-enqueue when shipping and not yet shipped (newest first; what the queue can't hold, the retry sweep ships) |
 | none | present, with `.idx` | a sealed segment whose row was lost (`Meta` restored from behind the disk): `loadSealedFromIdx` + `RehydrateSegment`; re-enqueued |
-| none | present, no `.idx` | orphan (crashed before the row): rebuild as open + `InsertSegmentOpen`, then force-sealed |
+| none | present, no (readable) `.idx` | orphan (crashed before the row): rebuild as open + `InsertSegmentOpen`, then force-sealed |
+| `retired` | present | files left by a retire whose unlink didn't reach the disk: unlink them, keep the row |
+
+Every recovered open segment is force-sealed, so each start opens a brand-new
+one. There can be several: `Meta` restored from behind the disk, or a rebuild
+from the journal that crashed partway.
 | `sealed` | absent | retire the row (a crash between the unlink and the `retired_at` stamp, or a lost file) |
 | `open` | absent | delete the row |
 | — | sidecar only (`.idx`/`.ops`, no CAR) | stray; unlink |
