@@ -734,7 +734,8 @@ CREATE TABLE ingot.segments (
     shipped_at   bigint,
     bucket       text   NOT NULL,                        -- the log is segregated per bucket
     index_digest bytea,                                  -- shipped sharded-dag-index blob
-    retired_at   bigint                                  -- files unlinked; the row stays until DeleteBucket
+    retired_at   bigint,                                 -- files unlinked; the row stays until DeleteBucket
+    dead_bytes   bigint                                  -- already dead when shipped; NULL = unmeasured
 );
 
 -- Per-segment record of the bucket-root advances that landed in it; shipping

@@ -940,7 +940,7 @@ func TestPostgresStores_Live(t *testing.T) {
 		}
 		// Ship a segment whose op-roots include a stale root the bucket never
 		// adopted; only the committed root may advance forge_root.
-		if err := r.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seq, time.Now().Unix(), nil,
+		if err := r.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seq, time.Now().Unix(), nil, -1,
 			[]blockstore.OpRoot{{Bucket: "fg", Root: stale}, {Bucket: "fg", Root: committed}}); err != nil {
 			t.Fatalf("MarkSegmentShipped: %v", err)
 		}
@@ -970,7 +970,7 @@ func TestPostgresStores_Live(t *testing.T) {
 			[]blockstore.OpRoot{{Bucket: bucket, Root: liveCid(t, "rt-root")}}); err != nil {
 			t.Fatalf("MarkSegmentSealed: %v", err)
 		}
-		if err := r.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seq, now, indexDigest, nil); err != nil {
+		if err := r.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seq, now, indexDigest, 7, nil); err != nil {
 			t.Fatalf("MarkSegmentShipped: %v", err)
 		}
 		for range 2 { // idempotent
@@ -988,7 +988,7 @@ func TestPostgresStores_Live(t *testing.T) {
 			t.Fatalf("ListRetiredSegments = %+v (err %v), want one row", retired, err)
 		}
 		got := retired[0]
-		if got.Seq != seq || got.RetiredAt != now || got.ShippedAt != now ||
+		if got.Seq != seq || got.RetiredAt != now || got.ShippedAt != now || got.DeadBytes != 7 ||
 			!bytes.Equal(got.SHA256, sha) || !bytes.Equal(got.IndexDigest, indexDigest) {
 			t.Fatalf("retired row = %+v", got)
 		}

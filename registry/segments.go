@@ -68,7 +68,7 @@ func (r *Postgres) MarkSegmentSealed(ctx context.Context, plane blockstore.Plane
 	return nil
 }
 
-func (r *Postgres) MarkSegmentShipped(ctx context.Context, plane blockstore.Plane, seq uint64, shippedAt int64, indexDigest multihash.Multihash, opRoots []blockstore.OpRoot) error {
+func (r *Postgres) MarkSegmentShipped(ctx context.Context, plane blockstore.Plane, seq uint64, shippedAt int64, indexDigest multihash.Multihash, deadBytes int64, opRoots []blockstore.OpRoot) error {
 	// Only the catalog plane ships: stamp shipped_at AND advance forge_root_cid
 	// for every op-root in this segment, atomically.
 	tx, err := r.pool.Begin(ctx)
@@ -77,10 +77,15 @@ func (r *Postgres) MarkSegmentShipped(ctx context.Context, plane blockstore.Plan
 	}
 	defer tx.Rollback(ctx)
 
+	// An unmeasured segment's dead_bytes stays NULL.
+	var dead *int64
+	if deadBytes >= 0 {
+		dead = &deadBytes
+	}
 	tag, err := tx.Exec(ctx,
-		`UPDATE ingot.segments SET shipped_at = $2, index_digest = $3
+		`UPDATE ingot.segments SET shipped_at = $2, index_digest = $3, dead_bytes = $4
 		 WHERE seq = $1 AND plane = 'catalog' AND shipped_at IS NULL`,
-		int64(seq), shippedAt, indexDigest)
+		int64(seq), shippedAt, indexDigest, dead)
 	if err != nil {
 		return fmt.Errorf("registry: mark catalog shipped %d: %w", seq, err)
 	}
@@ -214,7 +219,7 @@ func (r *Postgres) listSegments(ctx context.Context, plane blockstore.Plane, buc
 	}
 	rows, err := r.pool.Query(ctx,
 		`SELECT seq, state, COALESCE(sealed_at, 0), size_bytes, sha256, COALESCE(shipped_at, 0), index_digest,
-		        COALESCE(retired_at, 0)
+		        COALESCE(retired_at, 0), COALESCE(dead_bytes, -1)
 		   FROM ingot.segments
 		  WHERE plane = $1 AND bucket = $2 AND `+which+`
 		  ORDER BY seq ASC`,
@@ -235,8 +240,9 @@ func (r *Postgres) listSegments(ctx context.Context, plane blockstore.Plane, buc
 			shippedAt   int64
 			indexDigest multihash.Multihash
 			retiredAt   int64
+			deadBytes   int64
 		)
-		if err := rows.Scan(&seqInt, &stateS, &sealed, &size, &sha, &shippedAt, &indexDigest, &retiredAt); err != nil {
+		if err := rows.Scan(&seqInt, &stateS, &sealed, &size, &sha, &shippedAt, &indexDigest, &retiredAt, &deadBytes); err != nil {
 			return nil, fmt.Errorf("registry: scan segment: %w", err)
 		}
 		state, ok := logstore.ParseState(stateS)
@@ -253,6 +259,7 @@ func (r *Postgres) listSegments(ctx context.Context, plane blockstore.Plane, buc
 			SHA256:      sha,
 			ShippedAt:   shippedAt,
 			IndexDigest: indexDigest,
+			DeadBytes:   deadBytes,
 			RetiredAt:   retiredAt,
 		})
 	}

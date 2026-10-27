@@ -523,12 +523,13 @@ func (m *MemStore) MarkSegmentSealed(_ context.Context, plane blockstore.Plane, 
 	return nil
 }
 
-func (m *MemStore) MarkSegmentShipped(_ context.Context, plane blockstore.Plane, seq uint64, shippedAt int64, indexDigest multihash.Multihash, opRoots []blockstore.OpRoot) error {
+func (m *MemStore) MarkSegmentShipped(_ context.Context, plane blockstore.Plane, seq uint64, shippedAt int64, indexDigest multihash.Multihash, deadBytes int64, opRoots []blockstore.OpRoot) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if r, ok := m.segments[seq]; ok {
 		r.ShippedAt = shippedAt
 		r.IndexDigest = slices.Clone(indexDigest)
+		r.DeadBytes = deadBytes
 	}
 	// The segment's journaled blocks are on Forge now.
 	delete(m.journal, seq)
