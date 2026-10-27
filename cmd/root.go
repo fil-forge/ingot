@@ -1,7 +1,8 @@
 // Package cmd is the ingot daemon's cobra/viper CLI:
 //   - `serve` runs the S3 gateway;
 //   - `whoami` and `version` report the agent and the build;
-//   - `blake3` hashes and verifies object data against ingot's BLAKE3 CIDs.
+//   - `blake3` hashes and verifies object data against ingot's BLAKE3 CIDs;
+//   - `catalog usage` measures each bucket's catalog storage, for benchmarks.
 package cmd
 
 import (
@@ -34,6 +35,7 @@ func newRootCmd() *cobra.Command {
 		newWhoamiCmd(),
 		newVersionCmd(),
 		newBlake3Cmd(),
+		newCatalogCmd(),
 	)
 	return root
 }

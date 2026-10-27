@@ -295,6 +295,13 @@ segment row in Postgres.
 Blocks that die after their segment ships are not measured: that would take a
 walk of the bucket's live catalog, most of which is only on Forge.
 
+A test stack that keeps every catalog segment on disk (a large
+`catalog_plane.retain`) can measure them. `ingot catalog usage` prints, as
+JSON, each bucket's figures above beside its local segment files and the live
+bytes its root reaches through them, so dead after shipping is what's left.
+It reads every local catalog segment into memory, so it is for benchmark
+runs, not production nodes.
+
 `forge_bytes` undercounts a bucket whose segments retired before retired rows
 were kept (migration `00033`): those rows were deleted, so their CARs, still on
 Forge, count nowhere, not even as unmeasured. Read such a bucket's figures as a

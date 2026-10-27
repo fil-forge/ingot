@@ -90,7 +90,9 @@ Internal:
 
 - **`cmd/`** — the daemon (cobra/viper/fx): `serve`, `whoami`, `version`,
   `blake3` (hash / verify / range: client-side checks of `x-cid` and the
-  `Blake3` attribute, over `blake3tree`);
+  `Blake3` attribute, over `blake3tree`), `catalog usage` (each bucket's
+  catalog bytes on Forge, dead on arrival, and live over the local segments
+  via `logstore.MeasureLocalCatalog`, as JSON, for benchmark runs);
   `deps.go` (agent identity from the PEM key + optional did:web, pgx pool).
 - **`s3frontend/`** — versitygw `backend.Backend`: `object.go`
   (Put/Get/Head/Delete/List), `version.go` (resolveVersion / commitVersion,
