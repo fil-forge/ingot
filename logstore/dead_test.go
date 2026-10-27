@@ -133,8 +133,9 @@ func TestShipRecordsUnmeasurableSegment(t *testing.T) {
 }
 
 // TestDeadOnArrivalWithoutOpRoots: a segment with no op-root has no root to
-// walk from. Empty, it has nothing dead; holding blocks (as a segment rebuilt
-// from the catalog journal does), it goes unmeasured rather than all dead.
+// walk from. Empty, it has nothing dead; holding blocks (its .ops sidecar
+// lost, say), it goes unmeasured rather than all dead, since they may be
+// committed writes.
 func TestDeadOnArrivalWithoutOpRoots(t *testing.T) {
 	ctx := context.Background()
 	meta := newFakeMeta()

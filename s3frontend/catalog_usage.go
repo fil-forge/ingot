@@ -32,7 +32,7 @@ func newCatalogUsageGauges(mp metric.MeterProvider, b *Backend, logger *zap.Logg
 // registry.CatalogUsage on rows a failed cleanup left behind).
 func registerCatalogUsageGauges(meter metric.Meter, b *Backend) (metric.Registration, error) {
 	forge, err := meter.Int64ObservableGauge("ingot.catalog.forge_bytes", metric.WithUnit("By"),
-		metric.WithDescription("Bytes of the bucket's catalog segments shipped to Forge and not yet released (their CARs, not their index blobs), by space"))
+		metric.WithDescription("Bytes of the bucket's catalog segments shipped to Forge, retired ones included (their CARs, not their index blobs), by space"))
 	if err != nil {
 		return nil, err
 	}

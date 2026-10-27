@@ -106,8 +106,10 @@ holding blocks the segment's last op-root no longer reaches, following links
 only through the segment's own blocks. These are blocks superseded within the
 segment's lifetime, mostly MST interior nodes that later writes rewrote. A
 sealed segment never changes, so it is measured once and a retried ship reuses
-the figure. The stamp records it as `dead_bytes` (NULL when the walk
-failed), which the catalog usage gauges (`ingot.catalog.*`) sum per bucket.
+the figure. The stamp records it as `dead_bytes`, which the catalog usage
+gauges (`ingot.catalog.*`) sum per bucket. It is NULL when the segment couldn't
+be measured: the walk failed, or the segment holds blocks but no op-root to
+walk from.
 
 ## Segment lifecycle
 
