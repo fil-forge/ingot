@@ -71,7 +71,7 @@ sequenceDiagram
     C->>DB: CommitRoot: share-lock the segment row, journal the batch's blocks<br/>under it (none once it has shipped), CAS the root: one tx
 
     Note over S,FS: seal when size >= SealBytes or age >= SealAge<br/>(also at Close, and recovery force-seals)
-    S->>FS: hash CAR, write .idx (tmp, then rename)
+    S->>FS: hash CAR, write .idx (tmp + fsync, rename, fsync dir)
     S->>DB: MarkSegmentSealed(size, sha256, op-roots) in one tx
     S->>F: enqueueFlush (queue cap 64; a full queue leaves it to the retry sweep)
 
@@ -113,7 +113,7 @@ stateDiagram-v2
     Sealed --> Shipped : flush ok (MarkSegmentShipped: guarded forge_root advance, journal rows deleted)
     Sealed --> Retired : recovery, CAR missing (journal rows rebuilt into a new segment, then RetireSegment)
     Shipped --> Retired : retention past Retain (files unlinked, RetireSegment)
-    Retired --> Sealed : recovery, a never-shipped retired segment's CAR back on disk (RehydrateSegment)
+    Retired --> Sealed : recovery, a never-shipped retired segment's CAR and .idx back on disk (RehydrateSegment)
     Retired --> [*] : DeleteBucket (ReleaseRetiredSegments, or RemoveBucketLog)
 ```
 
@@ -189,7 +189,7 @@ before any worker starts. Discovery keys on the CAR file:
 | none | present, with a readable `.idx` | a sealed segment whose row was lost (`Meta` restored from behind the disk): `loadSealedFromIdx` + `RehydrateSegment`; re-enqueued |
 | none | present, no readable `.idx` | orphan (crashed before the row): rebuild as open + `InsertSegmentOpen`, then force-sealed |
 | `retired`, shipped | present | files left by a retire whose unlink didn't reach the disk: unlink them, keep the row |
-| `retired`, never shipped | present | retired because its file was missing, and the file is back (a volume mounted late, say), possibly the only copy of its blocks: recovered as if it had no row, which replaces the row |
+| `retired`, never shipped | present | retired because its file was missing, and the file is back (a volume mounted late, say), possibly the only copy of its blocks: recovered as if it had no row. With a readable `.idx` that replaces the row; without one the CAR is rebuilt and ships under its retired row, whose files the next start removes |
 | `sealed` | absent | retire the row (a crash between the unlink and the `retired_at` stamp, or a lost file) |
 | `open` | absent | delete the row |
 | — | sidecar only (`.idx`/`.ops`, no CAR) | stray; unlink |

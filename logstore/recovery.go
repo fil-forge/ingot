@@ -34,7 +34,8 @@ import (
 //     interrupted retire; unlink them, keep the row. A retired row that
 //     never shipped was retired because its file was missing; the file is
 //     back and may be the only copy of its blocks, so it is recovered as if
-//     it had no row.
+//     it had no row. Without a readable .idx it ships under its retired
+//     row, whose files the next start then removes.
 //   - row sealed, no CAR → retire the row: a crash between retention's
 //     unlink and its retired stamp, or a lost file. The row stays the
 //     record of what the segment may have registered in the space.
@@ -96,8 +97,11 @@ func (pl *PlaneLog) recover(ctx context.Context) error {
 	// row is the record DeleteBucket needs, so the files go and the row
 	// stays. A retired row that never shipped was retired because its file
 	// was missing (a volume mounted late, say); the file may hold the only
-	// copy of its blocks, so the segment is recovered as if it had no row,
-	// which replaces that row. Only read when some CAR has no unretired row.
+	// copy of its blocks, so the segment is recovered as if it had no row.
+	// With a readable .idx that replaces the row; without one the rebuilt
+	// segment ships under the retired row (InsertSegmentOpen keeps it), and
+	// the next start removes its files. Only read when some CAR has no
+	// unretired row.
 	var retiredShipped map[uint64]bool
 	isRetiredShipped := func(seq uint64) (bool, error) {
 		if retiredShipped == nil {
@@ -388,7 +392,7 @@ func (pl *PlaneLog) rebuildFromJournal(ctx context.Context, onDisk map[uint64]st
 // removeSegmentFiles unlinks every possible file of a segment seq for the
 // given plane.
 func removeSegmentFiles(dir string, seq uint64, plane blockstore.Plane) {
-	names := []string{carName(seq), idxName(seq)}
+	names := []string{carName(seq), idxName(seq), idxName(seq) + ".tmp"}
 	if plane == blockstore.PlaneCatalog {
 		names = append(names, opsName(seq))
 	}

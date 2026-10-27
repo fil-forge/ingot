@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
+	"syscall"
 	"time"
 
 	block "github.com/ipfs/go-block-format"
@@ -550,9 +551,11 @@ func (s *Segment) writeIdx() error {
 	// rename reach the disk first.
 	tmp := s.idxPath + ".tmp"
 	if err := writeFileSync(tmp, data); err != nil {
+		_ = os.Remove(tmp)
 		return err
 	}
 	if err := os.Rename(tmp, s.idxPath); err != nil {
+		_ = os.Remove(tmp)
 		return err
 	}
 	return syncDir(s.dir)
@@ -576,7 +579,8 @@ func writeFileSync(path string, data []byte) error {
 }
 
 // syncDir fsyncs a directory, so a rename into it is durable. Windows doesn't
-// support fsyncing a directory, so there it leaves that to the filesystem.
+// support fsyncing a directory, and some filesystems reject it with EINVAL or
+// EBADF; there it is left to the filesystem, as Postgres does.
 func syncDir(dir string) error {
 	if runtime.GOOS == "windows" {
 		return nil
@@ -586,7 +590,10 @@ func syncDir(dir string) error {
 		return err
 	}
 	defer d.Close()
-	return d.Sync()
+	if err := d.Sync(); err != nil && !errors.Is(err, syscall.EINVAL) && !errors.Is(err, syscall.EBADF) {
+		return err
+	}
+	return nil
 }
 
 // loadSealedFromIdx hydrates a sealed Segment from its .idx sidecar and

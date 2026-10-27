@@ -558,12 +558,75 @@ func TestRecover_UnshippedRetiredFileReappears(t *testing.T) {
 	if retired, _ := mem.ListRetiredSegments(ctx, blockstore.PlaneCatalog, "bk"); len(retired) != 0 {
 		t.Fatalf("retired rows = %+v, want the segment's row restored", retired)
 	}
+	if live, _ := mem.ListSegments(ctx, blockstore.PlaneCatalog, "bk"); len(live) != 1 || live[0].Seq != seq || live[0].State != logstore.StateSealed {
+		t.Fatalf("live rows = %+v, want segment %d restored as sealed", live, seq)
+	}
 	deadline := time.Now().Add(5 * time.Second)
 	for !ship.shipped()[seq] {
 		if time.Now().After(deadline) {
 			t.Fatalf("segment %d never shipped", seq)
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestRecover_UnshippedRetiredCARWithoutIdx: the same, with only the CAR
+// back (recovery removed the sidecars as strays when the CAR went missing).
+// It is rebuilt from the CAR and ships under its retired row; once it has
+// shipped, the next start removes its files like any retired segment's.
+func TestRecover_UnshippedRetiredCARWithoutIdx(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	mem := inmem.NewMemStore()
+	written := sealedSegments(t, dir, mem, 1)
+	seq := sortedSeqs(onDiskSeqs(t, dir, "bk"))[0]
+	rows, err := mem.ListSegments(ctx, blockstore.PlaneCatalog, "bk")
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("ListSegments = %+v, %v; want the one sealed row", rows, err)
+	}
+	row := rows[0]
+	row.ShippedAt, row.IndexDigest = 0, nil
+	if err := mem.RehydrateSegment(ctx, row); err != nil {
+		t.Fatalf("RehydrateSegment: %v", err)
+	}
+	if err := mem.RetireSegment(ctx, blockstore.PlaneCatalog, seq, time.Now().Unix()); err != nil {
+		t.Fatalf("RetireSegment: %v", err)
+	}
+	for _, name := range []string{fmt.Sprintf("seg-%020d.idx", seq), fmt.Sprintf("seg-%020d.ops", seq)} {
+		if err := os.Remove(filepath.Join(dir, "bk", blockstore.PlaneCatalog.String(), name)); err != nil {
+			t.Fatalf("remove %s: %v", name, err)
+		}
+	}
+
+	ship := &shipRecorder{}
+	m, err := openRebuildManager(t, dir, mem, ship)
+	if err != nil {
+		t.Fatalf("OpenManager: %v", err)
+	}
+	requireReadable(t, m, written)
+	deadline := time.Now().Add(5 * time.Second)
+	for !ship.shipped()[seq] {
+		if time.Now().After(deadline) {
+			t.Fatalf("segment %d never shipped", seq)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err := m.Close(ctx); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	if _, err := openRebuildManager(t, dir, mem, &shipRecorder{}); err != nil {
+		t.Fatalf("OpenManager again: %v", err)
+	}
+	if onDiskSeqs(t, dir, "bk")[seq] {
+		t.Fatalf("segment %d's CAR is still on disk after it shipped under its retired row", seq)
+	}
+	retired, err := mem.ListRetiredSegments(ctx, blockstore.PlaneCatalog, "bk")
+	if err != nil {
+		t.Fatalf("ListRetiredSegments: %v", err)
+	}
+	if len(retired) != 1 || retired[0].Seq != seq || retired[0].ShippedAt == 0 {
+		t.Fatalf("retired rows = %+v, want segment %d retired and shipped", retired, seq)
 	}
 }
 
