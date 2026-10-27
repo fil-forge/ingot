@@ -19,8 +19,8 @@ import (
 // blob copies first (LocalBlobs: the cache, then the spool, holding copies of
 // object-body blobs written here, kept until evicted or released; network
 // reads do not fill them), then the local LSM log (catalog blocks: manifests,
-// MST nodes), then a base blockstore (typically *Forge — indexing-service +
-// piri).
+// MST nodes), then a base blockstore (typically *Forge, which resolves
+// locations through its Locator and reads the bytes from piri).
 //
 // It exposes both halves of ReadStore from a single underlying traversal:
 //
