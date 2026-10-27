@@ -115,6 +115,7 @@ ingot blake3 hash --bao --chunk-log 4 < file  # an outboard at iroh's 16 KiB blo
 ingot blake3 verify <cid> < file              # whole-object check against an x-cid
 ingot blake3 range --outboard "$OUTBOARD" --chunk-log 12 5000-200000   # aligned Range to fetch
 ingot blake3 verify --outboard "$OUTBOARD" --chunk-log 12 --offset 0 <cid> < part  # ranged check
+ingot catalog usage                           # each bucket's catalog bytes: on Forge, dead on arrival, live (JSON; benchmarks)
 ```
 
 `blake3 range` and the ranged `verify` take the `Blake3` attribute of
@@ -298,7 +299,10 @@ walk of the bucket's live catalog, most of which is only on Forge.
 A test stack that keeps every catalog segment on disk (a large
 `catalog_plane.retain`) can measure them. `ingot catalog usage` prints, as
 JSON, each bucket's figures above beside its local segment files and the live
-bytes its root reaches through them, so dead after shipping is what's left.
+bytes its root reaches through them. Dead after shipping is then roughly what's
+left: CAR headers count only in the bytes on Forge, blocks of segments not yet
+shipped count as live, and a block can count both as live and as dead on
+arrival in an older segment.
 It reads every local catalog segment into memory, so it is for benchmark
 runs, not production nodes.
 

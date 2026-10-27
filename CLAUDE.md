@@ -282,7 +282,8 @@ forge-mode daemon. Two tiers:
   - **`forge_*_test.go`** — forge-native behaviors on dedicated stacks:
     provisioning (`forge_native`), delete/release (`forge_delete`), deferred
     multipart accept (`forge_multipart_deferred`), catalog retention
-    (`forge_retention`), the read-after-eviction network tier and the
+    (`forge_retention`), `ingot catalog usage` inside the container
+    (`forge_catalog_usage`), the read-after-eviction network tier and the
     local blob budget sweeper (`forge_eviction`), and a real `aws s3 cp`
     multipart round trip from the official CLI image (`forge_awscli`).
 - **Suite-composition-sensitive upstream cases** — a few versitygw cases

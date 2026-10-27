@@ -32,8 +32,9 @@ type LocalCatalog struct {
 	LiveBlocks int64
 	// MissingBlocks counts the DAG-CBOR blocks the root reaches that no
 	// segment on disk holds, such as those of a retired segment. With any
-	// missing, LiveBytes is a lower bound. A link of another codec names an
-	// object body, which the catalog never holds, so it is not counted.
+	// missing, LiveBytes is a lower bound. Every catalog block is DAG-CBOR,
+	// so a missing link of another codec is not a catalog block and is not
+	// counted.
 	MissingBlocks int64
 }
 
@@ -65,13 +66,17 @@ func MeasureLocalCatalog(dir, bucket string, root cid.Cid) (LocalCatalog, error)
 		}
 		res, err := cars.ScanFile(path)
 		switch {
+		case err == nil, errors.Is(err, cars.ErrTorn):
+			// A torn tail is a frame still being appended: the whole frames
+			// before it count. ErrTorn can wrap an unexpected EOF too, so it
+			// is checked first.
 		case errors.Is(err, fs.ErrNotExist):
-			continue
+			continue // retired while we read
 		case errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF):
 			// A segment just created, its header not yet whole: no blocks.
 			lc.FileBytes += info.Size()
 			continue
-		case err != nil && !errors.Is(err, cars.ErrTorn):
+		default:
 			return lc, fmt.Errorf("logstore: read %s: %w", path, err)
 		}
 		lc.FileBytes += info.Size()

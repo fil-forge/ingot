@@ -2,6 +2,7 @@ package logstore
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -34,9 +35,10 @@ func carBytes(t *testing.T, dir, bucket string) int64 {
 }
 
 // TestMeasureLocalCatalog: the walk follows the root's links across
-// segments, counts each reached block once, leaves out blocks later writes
-// superseded, counts a missing catalog block but not a link to an object
-// body, and tolerates a torn trailing frame.
+// segments, counts a block reached by two paths once, leaves out blocks
+// later writes superseded, counts a missing catalog block but not a link of
+// another codec, and tolerates a torn trailing frame and a segment whose
+// header isn't whole yet.
 func TestMeasureLocalCatalog(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -66,7 +68,7 @@ func TestMeasureLocalCatalog(t *testing.T) {
 	if err := s.catalog.sealOpenIfDue(ctx, true); err != nil {
 		t.Fatalf("seal: %v", err)
 	}
-	b := linkBlock(t, "b")
+	b := linkBlock(t, "b", a.Cid()) // r2 reaches a directly and through b
 	r2 := linkBlock(t, "r2", a.Cid(), b.Cid(), absent)
 	if _, err := s.AppendBatch(ctx, []block.Block{b, r2}, blockstore.OpRoot{Bucket: "bk", Root: r2.Cid()}); err != nil {
 		t.Fatalf("append 2: %v", err)
@@ -103,6 +105,19 @@ func TestMeasureLocalCatalog(t *testing.T) {
 	want.FileBytes += 3
 	if got, err = MeasureLocalCatalog(dir, "bk", r2.Cid()); err != nil || got != want {
 		t.Fatalf("with a torn tail: %+v, %v; want %+v", got, err, want)
+	}
+
+	// A segment just created, empty or with half its header written,
+	// counts its size and holds no blocks.
+	planeDir := filepath.Join(dir, "bk", blockstore.PlaneCatalog.String())
+	for i, data := range [][]byte{nil, {0x3a}} {
+		if err := os.WriteFile(filepath.Join(planeDir, fmt.Sprintf("seg-%020d.car", 100+i)), data, 0o644); err != nil {
+			t.Fatalf("write a new segment: %v", err)
+		}
+		want.FileBytes += int64(len(data))
+	}
+	if got, err = MeasureLocalCatalog(dir, "bk", r2.Cid()); err != nil || got != want {
+		t.Fatalf("with segments just created: %+v, %v; want %+v", got, err, want)
 	}
 
 	if got, err := MeasureLocalCatalog(dir, "bk", cid.Undef); err != nil || got.LiveBlocks != 0 || got.FileBytes != want.FileBytes {

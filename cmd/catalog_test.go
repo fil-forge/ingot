@@ -3,6 +3,7 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -84,11 +85,9 @@ func TestCatalogUsage(t *testing.T) {
 	x := cborBlock(t, "x")
 	r1 := cborBlock(t, "r1", x.Cid())
 	r2 := cborBlock(t, "r2", x.Cid())
-	if _, err := s.AppendBatch(ctx, []block.Block{x, r1}, blockstore.OpRoot{Bucket: "bk", Root: r1.Cid()}); err != nil {
-		t.Fatalf("append 1: %v", err)
-	}
-	if _, err := s.AppendBatch(ctx, []block.Block{r2}, blockstore.OpRoot{Bucket: "bk", Root: r2.Cid()}); err != nil {
-		t.Fatalf("append 2: %v", err)
+	// One batch, so one segment, whose last root, r2, leaves r1 dead.
+	if _, err := s.AppendBatch(ctx, []block.Block{x, r1, r2}, blockstore.OpRoot{Bucket: "bk", Root: r2.Cid()}); err != nil {
+		t.Fatalf("append: %v", err)
 	}
 	if err := mem.CASRoot(ctx, "bk", cid.Undef, r2.Cid()); err != nil {
 		t.Fatalf("CASRoot: %v", err)
@@ -142,3 +141,21 @@ func TestCatalogUsage(t *testing.T) {
 }
 
 func frame(b block.Block) int64 { return cars.FrameSize(b.Cid(), uint64(len(b.RawData()))) }
+
+// TestCatalogUsageJSON: the report forge-perf reads keeps its shape with no
+// bucket at all: an empty list and zero totals, every field present.
+func TestCatalogUsageJSON(t *testing.T) {
+	report, err := catalogUsage(context.Background(), inmem.NewMemStore(), filepath.Join(t.TempDir(), "segments"))
+	if err != nil {
+		t.Fatalf("catalogUsage: %v", err)
+	}
+	got, err := json.Marshal(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"buckets":[],"total":{"forge_bytes":0,"dead_on_arrival_bytes":0,"unmeasured_bytes":0,` +
+		`"local_bytes":0,"live_bytes":0,"live_blocks":0,"missing_blocks":0}}`
+	if string(got) != want {
+		t.Fatalf("report = %s, want %s", got, want)
+	}
+}

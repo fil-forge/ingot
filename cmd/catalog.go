@@ -7,11 +7,11 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
-	"path/filepath"
 	"sort"
 
 	"github.com/spf13/cobra"
 
+	"github.com/fil-forge/ingot"
 	"github.com/fil-forge/ingot/config"
 	"github.com/fil-forge/ingot/logstore"
 	"github.com/fil-forge/ingot/registry"
@@ -38,11 +38,15 @@ DID, and the totals over every bucket:
   unmeasured_bytes       shipped segments with no dead-on-arrival figure
   local_bytes            the catalog segment files on this node's disk
   live_bytes             blocks the bucket's root reaches, over local segments
+                         (their CAR frames; the others above count whole files)
   live_blocks            how many such blocks
   missing_blocks         catalog blocks the root reaches that no local
                          segment holds; any makes live_bytes a lower bound
 
-The first three come from Postgres. The rest read every local catalog
+The first three come from Postgres. Dead after shipping is roughly
+forge_bytes - live_bytes - dead_on_arrival_bytes: CAR headers count only in
+forge_bytes, blocks of unshipped segments count as live, and a block can count
+both as live and as dead on arrival in an older segment. The rest read every local catalog
 segment into memory, so the command suits a test stack that keeps all of
 them (a large catalog_plane.retain), such as a benchmark run, rather than a
 production node. It only reads, and can run beside a live daemon.`,
@@ -60,7 +64,7 @@ production node. It only reads, and can run beside a live daemon.`,
 				return err
 			}
 			defer pool.Close()
-			report, err := catalogUsage(cmd.Context(), registry.NewPostgres(pool), filepath.Join(cfg.DataDir, "segments"))
+			report, err := catalogUsage(cmd.Context(), registry.NewPostgres(pool), ingot.SegmentsDir(cfg.DataDir))
 			if err != nil {
 				return err
 			}

@@ -233,6 +233,7 @@ builds a `uploader.CARShard` from the `Segment` accessors, calls
 | `planelog.go` | `PlaneLog` (the pipeline): `openPlaneLog`, `Append`, `Get`, `Close`; `sealOpenIfDue`, `flushLoop`, `flushOne`, `retryUnshipped`, `runRetention`, `sealTickerLoop` |
 | `segment.go` | `Segment`: `createOpenSegment`, `append`, `seal`, `markShipped`, `retire`, `get`; `.idx`/`.ops` codecs |
 | `dead.go` | `(*Segment).deadOnArrival` / `deadBytes` (the dead-on-arrival walk the ship records) |
+| `localcatalog.go` | `MeasureLocalCatalog`, `LocalCatalog` (a bucket's live catalog walked over its segment files, read-only; `ingot catalog usage`) |
 | `recovery.go` | `(*PlaneLog).recover` (disk vs `Meta` reconciliation for one bucket store) |
 | `types.go` | `State`, `SegmentMeta`, `Meta` |
 | `config.go` | `Config`, `PlaneConfig`, `FlushFunc` |
