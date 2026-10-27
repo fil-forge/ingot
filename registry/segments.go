@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/fil-forge/ucantone/did"
 	"github.com/ipfs/go-cid"
 	"github.com/jackc/pgx/v5"
 	"github.com/multiformats/go-multihash"
@@ -321,6 +322,61 @@ func (r *Postgres) RehydrateSegment(ctx context.Context, m logstore.SegmentMeta)
 		return fmt.Errorf("registry: rehydrate commit %d: %w", m.Seq, err)
 	}
 	return nil
+}
+
+// CatalogUsage sums each bucket's shipped catalog segments: those whose
+// ship registered blobs in its space (index_digest is set exactly then),
+// retired ones included, since their CARs stay on Forge until DeleteBucket
+// releases them.
+//
+// Cost: one sequential scan of ingot.segments per call. No index narrows a
+// sum over every shipped row: segments_unretired_idx leaves out the retired
+// rows, which are nearly all of them, and segments_bucket_idx would only
+// trade the scan for a random heap read per row. The scan is hash-aggregated
+// by bucket, and only the per-bucket sums meet ingot.buckets. Postgres reads
+// a table larger than a quarter of shared_buffers through a small ring
+// buffer, so the scan doesn't push the working set out.
+// Rows accumulate until DeleteBucket, one per sealed segment: at most one per
+// bucket per SealAge (17,280 a day for a bucket written without pause at the
+// 5s default), about 175 bytes of heap each. A million rows took about 0.4s
+// on one core of Postgres 16 (0.17s with two parallel workers), so this runs
+// from a five-minute sweep (Server's catalog usage sweeper), never per
+// metrics collection.
+func (r *Postgres) CatalogUsage(ctx context.Context) ([]CatalogUsage, error) {
+	rows, err := r.pool.Query(ctx,
+		`SELECT b.name, b.space, s.bytes, s.dead, s.unmeasured
+		   FROM (SELECT bucket,
+		                SUM(size_bytes)::bigint AS bytes,
+		                COALESCE(SUM(dead_bytes), 0)::bigint AS dead,
+		                COALESCE(SUM(size_bytes) FILTER (WHERE dead_bytes IS NULL), 0)::bigint AS unmeasured
+		           FROM ingot.segments
+		          WHERE plane = 'catalog' AND index_digest IS NOT NULL
+		          GROUP BY bucket) s
+		   JOIN ingot.buckets b ON b.name = s.bucket
+		  ORDER BY b.name`)
+	if err != nil {
+		return nil, fmt.Errorf("registry: catalog usage: %w", err)
+	}
+	defer rows.Close()
+
+	var out []CatalogUsage
+	for rows.Next() {
+		var (
+			u        CatalogUsage
+			spaceStr string
+		)
+		if err := rows.Scan(&u.Bucket, &spaceStr, &u.Bytes, &u.DeadOnArrivalBytes, &u.UnmeasuredBytes); err != nil {
+			return nil, fmt.Errorf("registry: scan catalog usage: %w", err)
+		}
+		if u.Space, err = did.Parse(spaceStr); err != nil {
+			return nil, fmt.Errorf("registry: parse space %q of bucket %q: %w", spaceStr, u.Bucket, err)
+		}
+		out = append(out, u)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("registry: catalog usage rows: %w", err)
+	}
+	return out, nil
 }
 
 // nullableInt maps a zero timestamp to SQL NULL.

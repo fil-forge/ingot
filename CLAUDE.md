@@ -112,7 +112,8 @@ Internal:
 - **`registry/`** — Postgres metadata: `postgres.go` (`Registry` + `State`;
   `CommitRoot` also journals each commit's catalog blocks in
   `ingot.catalog_journal` until their segment ships),
-  `segments.go` (`logstore.Meta`), `stores*.go` (intents, locations,
+  `segments.go` (`logstore.Meta`, and `CatalogUsage`, the per-bucket sums
+  the catalog usage gauges report), `stores*.go` (intents, locations,
   inclusions, blob_refs, GC, multipart sessions/parts, parks, streams),
   `locallocator.go` (the read tier's `Locator`). One `*Postgres` satisfies
   all of them.
@@ -174,6 +175,10 @@ Internal:
   acceptor's (`ingot.multipart.*`: parked-part age, passes by outcome,
   deferred Completes) are created on the global meter provider, through `s3frontend.Deps.MeterProvider` and
   `Layered.CountBlobReads`; with no provider installed they are no-ops.
+  So are the catalog usage gauges (`ingot.catalog.*`: each bucket's shipped
+  catalog bytes and how much was dead on arrival, labeled by space DID,
+  never bucket name), which a `server.go` sweep refreshes every five
+  minutes from `registry.CatalogUsageStore`.
   versitygw passes
   the backend the bare `*fasthttp.RequestCtx` as its context, so the
   middleware stores the span as a request user value under the trace API's
@@ -205,7 +210,8 @@ Internal:
   `*zap.Logger`, and the collaborator seams (`blockstore.BlockReader`; the
   four `uploader` seams; `bucketauthority.BucketAuthority`;
   `registry.Registry` plus the intent/location/inclusion/blob-ref/GC/
-  multipart/park stores; `logstore.Meta`; `auth.IAMService`) +
+  multipart/park stores; `logstore.Meta`; `auth.IAMService`; optionally
+  `registry.CatalogUsageStore`) +
   a `PreStartHook` group; runs pre-start → `New` → `Start` on the fx
   lifecycle.
 - **`Module(cfg)`** (production wrapper) — supplies Postgres as Registry +

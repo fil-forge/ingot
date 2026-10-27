@@ -152,7 +152,7 @@ flowchart TB
 
 - `registry.Postgres` is one struct satisfying the registry seams
   (`Registry` plus the intent, location, inclusion, blob-ref, GC, multipart,
-  and park stores) and `logstore.Meta`.
+  park, and catalog usage stores) and `logstore.Meta`.
 - `uploader.Forge` is one struct behind `Uploader`, `BodyUploader`,
   `DeferredBodyUploader`, and `BlobRemover`.
 - `inmem` (test-only fakes) and `tokenstore` (empty; only the dormant login
