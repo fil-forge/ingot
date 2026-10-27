@@ -19,7 +19,7 @@ import (
 )
 
 // recover scans this plane's subdirectory and the Meta backend, rebuilds
-// the sealed segment list, picks the in-flight open segment (if any), and
+// the sealed segment list, force-seals every segment that was open, and
 // re-enqueues anything still pending ship. Discovery keys on the CAR
 // file. Reconciliation per seq:
 //   - row sealed  → load from .idx; re-enqueue when shipping & not shipped.
@@ -30,8 +30,11 @@ import (
 //   - row open or no row, no (readable) .idx → open at the crash: rebuild
 //     from the CAR, seeding the row if missing, then force-seal. Every such
 //     segment is force-sealed, so each start opens a brand-new one.
-//   - no unretired row, but a retired one → files left by an interrupted
-//     retire; unlink them, keep the row.
+//   - no unretired row, but a retired shipped one → files left by an
+//     interrupted retire; unlink them, keep the row. A retired row that
+//     never shipped was retired because its file was missing; the file is
+//     back and may be the only copy of its blocks, so it is recovered as if
+//     it had no row.
 //   - row sealed, no CAR → retire the row: a crash between retention's
 //     unlink and its retired stamp, or a lost file. The row stays the
 //     record of what the segment may have registered in the space.
@@ -88,23 +91,26 @@ func (pl *PlaneLog) recover(ctx context.Context) error {
 		set[seq] = struct{}{}
 	}
 
-	// A CAR whose seq has a retired row is left over from a retire whose
-	// unlink never reached the disk; the row is the record DeleteBucket
-	// needs, so the files go and the row stays. Only read when some CAR has
-	// no unretired row.
-	var retired map[uint64]bool
-	isRetired := func(seq uint64) (bool, error) {
-		if retired == nil {
+	// A CAR whose seq has a retired, shipped row is left over from a retire
+	// whose unlink never reached the disk: the segment is on Forge, and the
+	// row is the record DeleteBucket needs, so the files go and the row
+	// stays. A retired row that never shipped was retired because its file
+	// was missing (a volume mounted late, say); the file may hold the only
+	// copy of its blocks, so the segment is recovered as if it had no row,
+	// which replaces that row. Only read when some CAR has no unretired row.
+	var retiredShipped map[uint64]bool
+	isRetiredShipped := func(seq uint64) (bool, error) {
+		if retiredShipped == nil {
 			rows, err := pl.meta.ListRetiredSegments(ctx, pl.plane, pl.bucket)
 			if err != nil {
 				return false, fmt.Errorf("logstore: list retired %s segments for %q: %w", pl.plane, pl.bucket, err)
 			}
-			retired = make(map[uint64]bool, len(rows))
+			retiredShipped = make(map[uint64]bool, len(rows))
 			for _, r := range rows {
-				retired[r.Seq] = true
+				retiredShipped[r.Seq] = r.ShippedAt != 0
 			}
 		}
-		return retired[seq], nil
+		return retiredShipped[seq], nil
 	}
 
 	var (
@@ -115,7 +121,7 @@ func (pl *PlaneLog) recover(ctx context.Context) error {
 	for seq := range carPresent {
 		row, hasRow := dbBySeq[seq]
 		if !hasRow {
-			gone, err := isRetired(seq)
+			gone, err := isRetiredShipped(seq)
 			if err != nil {
 				return err
 			}
@@ -124,6 +130,7 @@ func (pl *PlaneLog) recover(ctx context.Context) error {
 					zap.Stringer("plane", pl.plane), zap.Uint64("seq", seq))
 				removeSegmentFiles(pl.dir, seq, pl.plane)
 				delete(carPresent, seq)
+				delete(sidecarSeqs, seq)
 				continue
 			}
 		}
@@ -329,6 +336,14 @@ func (pl *PlaneLog) rebuildFromJournal(ctx context.Context, onDisk map[uint64]st
 					if cur, err = createOpenSegment(ctx, pl.dir, seq, pl.plane, pl.bucket, pl.meta, pl.logger); err != nil {
 						return nil, fmt.Errorf("logstore: create segment to rebuild seg %d: %w", from, err)
 					}
+				}
+				// A segment already holding blocks seals rather than take
+				// one that would carry it past SealBytes.
+				if len(cur.index) > 0 && cur.Size()+frameBound(blocks[0]) > pl.pc.SealBytes {
+					if err := seal(); err != nil {
+						return nil, err
+					}
+					continue
 				}
 				// As many of the page's blocks as fit under SealBytes, at
 				// least one; the rest go to the next segment.

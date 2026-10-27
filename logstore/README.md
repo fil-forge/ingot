@@ -113,6 +113,7 @@ stateDiagram-v2
     Sealed --> Shipped : flush ok (MarkSegmentShipped: guarded forge_root advance, journal rows deleted)
     Sealed --> Retired : recovery, CAR missing (journal rows rebuilt into a new segment, then RetireSegment)
     Shipped --> Retired : retention past Retain (files unlinked, RetireSegment)
+    Retired --> Sealed : recovery, a never-shipped retired segment's CAR back on disk (RehydrateSegment)
     Retired --> [*] : DeleteBucket (ReleaseRetiredSegments, or RemoveBucketLog)
 ```
 
@@ -182,26 +183,28 @@ before any worker starts. Discovery keys on the CAR file:
 
 | `Meta` row | On-disk CAR | Action |
 |---|---|---|
-| `open` | present, with `.idx` | it sealed after the point `Meta` was restored to: `loadSealedFromIdx` + `MarkSegmentSealed`; re-enqueued |
-| `open` | present, no `.idx` | `rebuildOpenFromDisk` (scan + truncate any torn trailing frame); then force-sealed |
+| `open` | present, with a readable `.idx` | it sealed after the point `Meta` was restored to: `loadSealedFromIdx` + `MarkSegmentSealed`; re-enqueued |
+| `open` | present, no readable `.idx` | `rebuildOpenFromDisk` (scan + truncate any torn trailing frame); then force-sealed |
 | `sealed` | present | `loadSealedFromIdx`; re-enqueue when shipping and not yet shipped (newest first; what the queue can't hold, the retry sweep ships) |
-| none | present, with `.idx` | a sealed segment whose row was lost (`Meta` restored from behind the disk): `loadSealedFromIdx` + `RehydrateSegment`; re-enqueued |
-| none | present, no (readable) `.idx` | orphan (crashed before the row): rebuild as open + `InsertSegmentOpen`, then force-sealed |
-| `retired` | present | files left by a retire whose unlink didn't reach the disk: unlink them, keep the row |
-
-Every recovered open segment is force-sealed, so each start opens a brand-new
-one. There can be several: `Meta` restored from behind the disk, or a rebuild
-from the journal that crashed partway.
+| none | present, with a readable `.idx` | a sealed segment whose row was lost (`Meta` restored from behind the disk): `loadSealedFromIdx` + `RehydrateSegment`; re-enqueued |
+| none | present, no readable `.idx` | orphan (crashed before the row): rebuild as open + `InsertSegmentOpen`, then force-sealed |
+| `retired`, shipped | present | files left by a retire whose unlink didn't reach the disk: unlink them, keep the row |
+| `retired`, never shipped | present | retired because its file was missing, and the file is back (a volume mounted late, say), possibly the only copy of its blocks: recovered as if it had no row, which replaces the row |
 | `sealed` | absent | retire the row (a crash between the unlink and the `retired_at` stamp, or a lost file) |
 | `open` | absent | delete the row |
 | — | sidecar only (`.idx`/`.ops`, no CAR) | stray; unlink |
 
+Every recovered open segment is force-sealed, so each start opens a brand-new
+one. There can be several: `Meta` restored from behind the disk, or a rebuild
+from the journal that crashed partway.
+
 Before the fileless rows go, recovery rebuilds any segment the journal still
 files blocks under but whose CAR is gone (`rebuildFromJournal`): a lost or
-replaced data volume, or a deleted file. The blocks are appended, a page at a
-time, to new segments (split at `SealBytes`), and each page's journal rows
+replaced data volume, or a deleted file. The blocks are appended to new
+segments, read from the journal a page at a time; a segment takes blocks until
+the next would carry it past `SealBytes`. Each run of blocks' journal rows
 move onto its new segment (`Meta.MoveJournal`, keeping their `created_at`)
-once the page is fsynced there, so a crash partway leaves the rest for the
+once the run is fsynced there, so a crash partway leaves the rest for the
 next start. The new segments are sealed and enqueued like any other; they
 carry no op-roots, so `forge_root_cid` waits for the bucket's next shipped
 write. A lost segment whose row is already gone is still found: the manager

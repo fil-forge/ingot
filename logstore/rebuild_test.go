@@ -74,6 +74,13 @@ func openRebuildManager(t *testing.T, dir string, meta logstore.Meta, ship *ship
 // segment file: the state a lost data volume leaves behind.
 func journalSegment(t *testing.T, mem *inmem.MemStore, bucket string, n int) (uint64, []block.Block) {
 	t.Helper()
+	return journalSegmentPadded(t, mem, bucket, n, 64)
+}
+
+// journalSegmentPadded is journalSegment with pad bytes of filler in each
+// block.
+func journalSegmentPadded(t *testing.T, mem *inmem.MemStore, bucket string, n, pad int) (uint64, []block.Block) {
+	t.Helper()
 	ctx := context.Background()
 	seq, err := mem.NextSegmentSeq(ctx)
 	if err != nil {
@@ -84,7 +91,7 @@ func journalSegment(t *testing.T, mem *inmem.MemStore, bucket string, n int) (ui
 	}
 	blocks := make([]block.Block, n)
 	for i := range blocks {
-		blocks[i] = block.NewBlock([]byte(fmt.Sprintf("%s/seg-%d/block-%04d/%s", bucket, seq, i, strings.Repeat("x", 64))))
+		blocks[i] = block.NewBlock([]byte(fmt.Sprintf("%s/seg-%d/block-%04d/%s", bucket, seq, i, strings.Repeat("x", pad))))
 	}
 	st, err := mem.Get(ctx, bucket)
 	if err != nil {
@@ -191,10 +198,10 @@ func TestRebuild_WipedVolume(t *testing.T) {
 		t.Fatalf("ListSegments: %v", err)
 	}
 	for _, r := range rows {
-		// SealBytes plus one block: a segment closes once the next block
-		// would take it past SealBytes.
-		if r.Size > 8<<10+256 {
-			t.Fatalf("rebuilt segment %d is %d bytes, past SealBytes (8 KiB) by more than a block", r.Seq, r.Size)
+		// The blocks are small, so no segment needs to pass SealBytes: one
+		// seals once the next block would carry it past.
+		if r.Size > 8<<10 {
+			t.Fatalf("rebuilt segment %d is %d bytes, past SealBytes (8 KiB)", r.Seq, r.Size)
 		}
 	}
 	deadline := time.Now().Add(5 * time.Second)
@@ -215,6 +222,36 @@ func TestRebuild_WipedVolume(t *testing.T) {
 			t.Fatalf("rebuilt segments %v, shipped %v, %d journal rows left", rebuilt, shipped, stats.Blocks)
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestRebuild_SegmentsStayUnderSealBytes: a segment already holding blocks
+// seals rather than take one past SealBytes, here the first block of the
+// next lost segment.
+func TestRebuild_SegmentsStayUnderSealBytes(t *testing.T) {
+	ctx := context.Background()
+	mem := inmem.NewMemStore()
+	if err := mem.Create(ctx, "bk", did.Undef, registry.CreateState{}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	// Each lost segment's blocks fill most of a rebuilt one, so the next
+	// lost segment's first block doesn't fit after them.
+	_, first := journalSegmentPadded(t, mem, "bk", 7, 1000)
+	_, second := journalSegmentPadded(t, mem, "bk", 7, 1000)
+
+	m, err := openRebuildManager(t, t.TempDir(), mem, &shipRecorder{})
+	if err != nil {
+		t.Fatalf("OpenManager: %v", err)
+	}
+	requireReadable(t, m, append(first, second...))
+	rows, err := mem.ListSegments(ctx, blockstore.PlaneCatalog, "bk")
+	if err != nil {
+		t.Fatalf("ListSegments: %v", err)
+	}
+	for _, r := range rows {
+		if r.Size > 8<<10 {
+			t.Fatalf("rebuilt segment %d is %d bytes, past SealBytes (8 KiB)", r.Seq, r.Size)
+		}
 	}
 }
 
@@ -256,10 +293,10 @@ func (f *failSecondMove) MoveJournal(ctx context.Context, bucket string, from, t
 }
 
 // TestRebuild_ResumesAfterFailure: a rebuild that fails partway leaves the
-// unmoved rows under the lost segment and an open segment behind. After two
-// such starts, the next one force-seals both open segments and rebuilds the
-// rest, ending with every block readable and every journal row under a
-// segment that is on disk.
+// unmoved rows under the lost segment and an open segment behind. Each later
+// start force-seals the open segment the one before it left and rebuilds
+// from where it stopped, ending with every block readable and every journal
+// row under a segment that is on disk.
 func TestRebuild_ResumesAfterFailure(t *testing.T) {
 	ctx := context.Background()
 	mem := inmem.NewMemStore()
@@ -485,6 +522,48 @@ func TestRecover_RetiredFilesReappear(t *testing.T) {
 	}
 	if live, _ := mem.ListSegments(ctx, blockstore.PlaneCatalog, "bk"); len(live) != 0 {
 		t.Fatalf("live rows = %+v, want none", live)
+	}
+}
+
+// TestRecover_UnshippedRetiredFileReappears: a segment that never shipped
+// was retired because its file was missing, and the file is back. It may hold
+// the only copy of its blocks, so recovery keeps it, restores its row and
+// ships it.
+func TestRecover_UnshippedRetiredFileReappears(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	mem := inmem.NewMemStore()
+	written := sealedSegments(t, dir, mem, 1)
+	seq := sortedSeqs(onDiskSeqs(t, dir, "bk"))[0]
+	// Sealed but never shipped, whatever the manager above got to.
+	rows, err := mem.ListSegments(ctx, blockstore.PlaneCatalog, "bk")
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("ListSegments = %+v, %v; want the one sealed row", rows, err)
+	}
+	row := rows[0]
+	row.ShippedAt, row.IndexDigest = 0, nil
+	if err := mem.RehydrateSegment(ctx, row); err != nil {
+		t.Fatalf("RehydrateSegment: %v", err)
+	}
+	if err := mem.RetireSegment(ctx, blockstore.PlaneCatalog, seq, time.Now().Unix()); err != nil {
+		t.Fatalf("RetireSegment: %v", err)
+	}
+
+	ship := &shipRecorder{}
+	m, err := openRebuildManager(t, dir, mem, ship)
+	if err != nil {
+		t.Fatalf("OpenManager: %v", err)
+	}
+	requireReadable(t, m, written)
+	if retired, _ := mem.ListRetiredSegments(ctx, blockstore.PlaneCatalog, "bk"); len(retired) != 0 {
+		t.Fatalf("retired rows = %+v, want the segment's row restored", retired)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for !ship.shipped()[seq] {
+		if time.Now().After(deadline) {
+			t.Fatalf("segment %d never shipped", seq)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 

@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"time"
 
@@ -544,11 +545,48 @@ func (s *Segment) writeIdx() error {
 	if err != nil {
 		return err
 	}
+	// Seal records the segment sealed right after this, and recovery fails
+	// on a sealed row whose .idx won't parse, so both the file and its
+	// rename reach the disk first.
 	tmp := s.idxPath + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	if err := writeFileSync(tmp, data); err != nil {
 		return err
 	}
-	return os.Rename(tmp, s.idxPath)
+	if err := os.Rename(tmp, s.idxPath); err != nil {
+		return err
+	}
+	return syncDir(s.dir)
+}
+
+// writeFileSync writes data to a new file at path and fsyncs it.
+func writeFileSync(path string, data []byte) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+// syncDir fsyncs a directory, so a rename into it is durable. Windows doesn't
+// support fsyncing a directory, so there it leaves that to the filesystem.
+func syncDir(dir string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 // loadSealedFromIdx hydrates a sealed Segment from its .idx sidecar and
