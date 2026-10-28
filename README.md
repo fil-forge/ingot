@@ -296,15 +296,20 @@ segment row in Postgres.
 Blocks that die after their segment ships are not measured: that would take a
 walk of the bucket's live catalog, most of which is only on Forge.
 
-A test stack that keeps every catalog segment on disk (a large
-`catalog_plane.retain`) can measure them. `ingot catalog usage` prints, as
-JSON, each bucket's figures above beside its local segment files and the live
-bytes its root reaches through them. Dead after shipping is then roughly what's
-left: CAR headers count only in the bytes on Forge, blocks of segments not yet
-shipped count as live, and a block can count both as live and as dead on
-arrival in an older segment.
-It reads every local catalog segment into memory, so it is for benchmark
-runs, not production nodes.
+A test stack can measure them. `ingot catalog usage` prints, as JSON, each
+bucket's figures above beside its local segment files and the live bytes its
+root reaches. The walk reads a block no local segment holds, such as one of a
+retired segment, with the rest of its segment from Forge, authorized by an
+access key the command takes from `AWS_ACCESS_KEY_ID` and
+`AWS_SECRET_ACCESS_KEY`. Without one such blocks count as missing, and so do
+those of a bucket the key may not list. Dead after shipping is then roughly
+what's left: CAR headers count only in the bytes on Forge, blocks of segments
+not yet shipped count as live, and a block can count both as live and as dead
+on arrival in an older segment.
+The walk holds every segment it reads in memory, so it is for benchmark runs,
+not production nodes. A production node could not run it anyway: it holds no
+tenant's secret, and its authority over a bucket arrives only with that
+tenant's signed requests.
 
 `forge_bytes` undercounts a bucket whose segments retired before retired rows
 were kept (migration `00033`): those rows were deleted, so their CARs, still on

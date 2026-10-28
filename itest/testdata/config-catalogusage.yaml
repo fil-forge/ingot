@@ -1,7 +1,6 @@
 # Ingot daemon config for the catalog usage itest — smelt's default
 # forge-mode config (systems/ingot/config/config.yaml) with the catalog plane
-# tuned to seal fast and keep every segment on disk, as a benchmark run that
-# measures live catalog bytes does.
+# tuned to seal fast, so segments ship and retire within the test.
 # Mounted over /etc/ingot/config.yaml via stack.WithServiceConfig.
 
 # Port 80 inside the compose network: did:web:ingot resolves to
@@ -31,11 +30,11 @@ auth_service_did: "did:web:hilt"
 # hilt → ingot delegations for /s3/request/authorize and /s3/bucket/*
 auth_service_proofs: "/proofs/hilt-ingot-s3-proof.txt"
 
-# The point of this config: several catalog segments ship within the test,
-# and none retires, so the walk over local segments sees the whole catalog.
+# The point of this config: enough catalog segments ship within the test
+# that the default retention retires some, so the walk reads those from
+# Forge.
 catalog_plane:
   seal_age: 2s
-  retain: 1000000
 
 # Region CEK wrap provider (required): the stack's ingot-openbao transit
 # engine, provisioned by ingot-openbao-init; the token arrives via

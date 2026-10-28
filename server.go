@@ -925,7 +925,7 @@ func validateServerInputs(cfg config.ServerConfig, deps ServerDeps) error {
 
 func applyServerDefaults(cfg config.ServerConfig) config.ServerConfig {
 	if cfg.Region == "" {
-		cfg.Region = "us-east-1"
+		cfg.Region = config.DefaultRegion
 	}
 	if cfg.MaxBlobSize <= 0 {
 		cfg.MaxBlobSize = msbucket.DefaultMaxBlobSize

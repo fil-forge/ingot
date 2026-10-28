@@ -909,17 +909,20 @@ flowchart TB
     end
 
     hilt["hilt did:web:hilt"] -->|"/s3/request/authorize and<br/>/s3/bucket/info responses"| kp
+    hilt -->|"the same, for a listing the<br/>command signs with an access key"| walk
 
     subgraph stores["proof stores"]
         kp["iam.KeyProofs: one DelegationCache<br/>per access key, 24h idle eviction;<br/>also the key's effective S3 action set per bucket"]
         ship["uploader.Forge shipProofs:<br/>per-space store, 1h TTL"]
         commit["uploader.Forge commitProofs:<br/>per-space store, 1h TTL"]
         static["AuthServiceProofs:<br/>static container from config"]
+        walk["ingot catalog usage: one store<br/>per bucket walked (AuthorizeSigned)"]
         tok["tokenstore (tokens.cbor):<br/>empty; dormant login paths only"]
     end
 
     kp -->|"reqscope.ProofStore<br/>on the request ctx"| writes["uploader:<br/>/blob/add, abort, remove, /index/add<br/>/upload/add, /upload/remove"]
     kp -->|"same store"| reads["blockstore.Forge:<br/>content/retrieve"]
+    walk -->|"reqscope.ProofStore<br/>on the walk's ctx"| reads
     kp -->|"captureShipProofs<br/>at UploadBlob and StartBlob"| ship
     kp -->|"CaptureShipAuthority<br/>at every bucketop commit"| commit
     commit --> catship["async catalog ship"]
@@ -950,6 +953,12 @@ flowchart TB
   write.
 - Each access key gets its own `DelegationCache`, so a proof chain can never
   assemble across keys.
+- `ingot catalog usage` is a command, not the daemon, and gets its stores
+  another way: with an access key from its environment it signs a
+  ListObjectsV2 of each bucket it must read from Forge, has hilt authorize it
+  as it would a request the gateway serves, and keeps the delegations for that
+  bucket's walk alone. The daemon holds no tenant's secret, so it has no such
+  path.
 - The same store holds the effective S3 action set hilt reported for the key
   on each bucket, expiring with the keys and the tenant (next UTC midnight
   plus clock skew). One invalidation therefore drops the chains and the set
@@ -970,7 +979,8 @@ flowchart TB
 Cross-references: [`architecture.md` §9](./architecture.md#9-the-system-contract-piri--sprue--indexer).
 
 Sources: `iam/service.go`, `iam/keyproofs.go`, `iam/proofcache.go`,
-`internal/reqscope/reqscope.go`, `uploader/forge.go` (shipProofs,
+`internal/reqscope/reqscope.go`, `cmd/catalog.go` (forgeSegments),
+`uploader/forge.go` (shipProofs,
 captureShipProofs, CaptureShipAuthority), `bucketop/bucketop.go` (Tx.Commit),
 `module.go`, `config/config.go` (auth_service fields).
 Review when these change.

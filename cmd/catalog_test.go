@@ -112,7 +112,7 @@ func TestCatalogUsage(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	report, err := catalogUsage(ctx, mem, segments)
+	report, err := catalogUsage(ctx, mem, segments, nil)
 	if err != nil {
 		t.Fatalf("catalogUsage: %v", err)
 	}
@@ -138,6 +138,46 @@ func TestCatalogUsage(t *testing.T) {
 	if report.Total != want {
 		t.Fatalf("total = %+v, want %+v", report.Total, want)
 	}
+
+	// Retire the segment from disk: the walk reads it back through the
+	// bucket's segment source and finds the same live blocks.
+	var shippedBlocks []block.Block
+	for _, p := range files {
+		res, err := cars.ScanFile(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, f := range res.Frames {
+			shippedBlocks = append(shippedBlocks, f.Block)
+		}
+		if err := os.Remove(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var asked []string
+	source := func(bucket string, sp did.DID) logstore.FetchSegment {
+		asked = append(asked, bucket+" "+sp.String())
+		returned := false
+		return func(context.Context, cid.Cid) ([]block.Block, error) {
+			if returned {
+				return nil, nil
+			}
+			returned = true
+			return shippedBlocks, nil
+		}
+	}
+	report, err = catalogUsage(ctx, mem, segments, source)
+	if err != nil {
+		t.Fatalf("catalogUsage over a retired segment: %v", err)
+	}
+	want.LocalBytes = 0
+	want.FetchedSegments = 1
+	if len(report.Buckets) != 1 || report.Buckets[0].catalogFigures != want {
+		t.Fatalf("over a retired segment: buckets = %+v, want one with %+v", report.Buckets, want)
+	}
+	if len(asked) != 1 || asked[0] != "bk "+space.String() {
+		t.Fatalf("segment source asked for %v, want the one bucket and its space", asked)
+	}
 }
 
 func frame(b block.Block) int64 { return cars.FrameSize(b.Cid(), uint64(len(b.RawData()))) }
@@ -145,7 +185,7 @@ func frame(b block.Block) int64 { return cars.FrameSize(b.Cid(), uint64(len(b.Ra
 // TestCatalogUsageJSON: the report forge-perf reads keeps its shape with no
 // bucket at all: an empty list and zero totals, every field present.
 func TestCatalogUsageJSON(t *testing.T) {
-	report, err := catalogUsage(context.Background(), inmem.NewMemStore(), filepath.Join(t.TempDir(), "segments"))
+	report, err := catalogUsage(context.Background(), inmem.NewMemStore(), filepath.Join(t.TempDir(), "segments"), nil)
 	if err != nil {
 		t.Fatalf("catalogUsage: %v", err)
 	}
@@ -154,7 +194,7 @@ func TestCatalogUsageJSON(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := `{"buckets":[],"total":{"forge_bytes":0,"dead_on_arrival_bytes":0,"unmeasured_bytes":0,` +
-		`"local_bytes":0,"live_bytes":0,"live_blocks":0,"missing_blocks":0}}`
+		`"local_bytes":0,"live_bytes":0,"live_blocks":0,"missing_blocks":0,"fetched_segments":0}}`
 	if string(got) != want {
 		t.Fatalf("report = %s, want %s", got, want)
 	}

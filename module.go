@@ -105,7 +105,7 @@ func Module(cfg config.Config) fx.Option {
 			provideForgeReader,
 			provideTokenStore,
 			provideForgeClient,
-			provideAuthServiceClient,
+			NewAuthServiceClient,
 			provideUploader,
 			provideMigrationHook,
 			provideKeyProofs,
@@ -295,13 +295,13 @@ func provideForgeClient(cfg config.Config, id identity.Identity, store tokenstor
 	)
 }
 
-// provideAuthServiceClient builds the UCAN RPC client to the Hilt tenant-
+// NewAuthServiceClient builds the UCAN RPC client to the Hilt tenant-
 // management service (/s3/request/authorize, /s3/bucket/*). The agent identity
 // issues invocations; AuthServiceProofs supplies the Hilt→agent proof chains
 // and is required — Hilt rejects unproven invocations, so a client built
-// without them would fail every S3 request. The provider is lazy, so an
+// without them would fail every S3 request. As a provider it is lazy, so an
 // unconfigured Hilt only errors if a consumer actually needs the client.
-func provideAuthServiceClient(cfg config.Config, id identity.Identity, logger *zap.Logger) (*hiltclient.Client, error) {
+func NewAuthServiceClient(cfg config.Config, id identity.Identity, logger *zap.Logger) (*hiltclient.Client, error) {
 	if cfg.AuthServiceURL == "" || cfg.AuthServiceDID == "" {
 		return nil, fmt.Errorf("ingot: auth_service_url and auth_service_did are required for the auth service client")
 	}

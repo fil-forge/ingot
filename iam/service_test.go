@@ -16,6 +16,7 @@ import (
 	s3req "github.com/fil-forge/libforge/commands/s3/request"
 	ucanlib "github.com/fil-forge/libforge/ucan"
 	"github.com/fil-forge/ucantone/did"
+	ucanerrors "github.com/fil-forge/ucantone/errors"
 	"github.com/fil-forge/ucantone/multikey/ed25519"
 	"github.com/fil-forge/ucantone/ucan"
 	"github.com/fil-forge/ucantone/ucan/container"
@@ -550,4 +551,53 @@ func TestGetUserAccountForRequest_PlainAccessKey(t *testing.T) {
 		require.ErrorIs(t, err, auth.ErrNoSuchUser, "access %q", access)
 	}
 	require.Empty(t, fake.got.Method, "hilt must not be consulted for a malformed access key")
+}
+
+// TestAuthorizeSigned: a signed request's delegations land in a fresh store
+// with their chains completed, leaving the key's own caches untouched; Hilt
+// refusing the key the bucket is ErrBucketNotPermitted, and any other
+// failure is not.
+func TestAuthorizeSigned(t *testing.T) {
+	access, keyDID := newAccessKey(t)
+	ctx := context.Background()
+	req := s3.Request{Method: http.MethodGet, URL: "/bkt?list-type=2", Headers: map[string]string{"Host": "example.com"}}
+
+	root, mid, leaf, agent := mintRetrieveChain(t)
+	cache := iam.NewKeyProofs()
+	fake := &fakeAuthorizer{
+		res:      authorizeOK(t, keyDID),
+		proofs:   []ucan.Delegation{leaf},
+		infoDlgs: []ucan.Delegation{root, mid},
+	}
+	svc := iam.New(fake, cache, iam.NewVerificationKeyCache(), iam.NewTenantCache())
+	store, err := svc.AuthorizeSigned(ctx, req, access)
+	require.NoError(t, err)
+	require.Equal(t, req, fake.got, "the request goes to Hilt as given")
+	require.Equal(t, []string{"bkt"}, fake.infoBuckets)
+	chain, _, err := store.ProofChain(ctx, agent.DID(), leaf.Command(), leaf.Subject())
+	require.NoError(t, err)
+	require.Len(t, chain, 3)
+	chain, _, err = cache.For(keyDID).ProofChain(ctx, agent.DID(), leaf.Command(), leaf.Subject())
+	require.NoError(t, err)
+	require.Empty(t, chain, "the key's cached proofs are untouched")
+
+	for _, name := range []string{
+		hiltauth.UnknownBucketErrorName,
+		hiltauth.ForeignBucketErrorName,
+		hiltauth.BucketNotPermittedErrorName,
+		hiltauth.OperationNotPermittedErrorName,
+	} {
+		fake := &fakeAuthorizer{err: ucanerrors.New(name, "refused by hilt")}
+		_, err := iam.New(fake, cache, iam.NewVerificationKeyCache(), iam.NewTenantCache()).AuthorizeSigned(ctx, req, access)
+		require.ErrorIs(t, err, iam.ErrBucketNotPermitted, name)
+	}
+	for _, refusal := range []error{
+		ucanerrors.New(hiltauth.SignatureMismatchErrorName, "refused by hilt"),
+		errors.New("connection refused"),
+	} {
+		fake := &fakeAuthorizer{err: refusal}
+		_, err := iam.New(fake, cache, iam.NewVerificationKeyCache(), iam.NewTenantCache()).AuthorizeSigned(ctx, req, access)
+		require.Error(t, err)
+		require.NotErrorIs(t, err, iam.ErrBucketNotPermitted, refusal.Error())
+	}
 }

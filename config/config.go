@@ -223,6 +223,9 @@ type PlaneSettings struct {
 	Retain    int    `mapstructure:"retain" yaml:"retain"`
 }
 
+// DefaultRegion is the region the gateway advertises when Region is unset.
+const DefaultRegion = "us-east-1"
+
 // defaultReadCacheBytes is the block cache budget when ReadCacheBytes is 0.
 const defaultReadCacheBytes int64 = 256 << 20
 
