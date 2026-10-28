@@ -354,6 +354,12 @@ func (f *forgeSegments) forBucket(bucket string, space did.DID) logstore.FetchSe
 		if err != nil {
 			return nil, fmt.Errorf("read segment %s: %w", shard.B58String(), err)
 		}
+		// Neither the read tier nor the block constructor checks the bytes,
+		// and a segment cut short at a frame boundary would parse with fewer
+		// blocks, so the segment is checked whole against its digest.
+		if err := matchesDigest(body, shard); err != nil {
+			return nil, err
+		}
 		res, err := cars.Scan(bytes.NewReader(body), int64(len(body)))
 		if err != nil {
 			return nil, fmt.Errorf("parse segment %s: %w", shard.B58String(), err)
@@ -366,23 +372,39 @@ func (f *forgeSegments) forBucket(bucket string, space did.DID) logstore.FetchSe
 	}
 }
 
+// matchesDigest reports whether body hashes to digest.
+func matchesDigest(body []byte, digest mh.Multihash) error {
+	dec, err := mh.Decode(digest)
+	if err != nil {
+		return fmt.Errorf("segment digest %x: %w", []byte(digest), err)
+	}
+	sum, err := mh.Sum(body, dec.Code, dec.Length)
+	if err != nil {
+		return fmt.Errorf("hash segment %s: %w", digest.B58String(), err)
+	}
+	if !bytes.Equal(sum, digest) {
+		return fmt.Errorf("segment %s read from Forge does not match its digest", digest.B58String())
+	}
+	return nil
+}
+
 // listHost is the host the signed ListObjectsV2 names. The request is only
 // shown to Hilt, never sent, so the host need only be one the signature
 // covers; .invalid names nothing (RFC 2606).
 const listHost = "ingot.invalid"
 
-// signedListTTL bounds how long Hilt accepts the signed request: it is
-// authorized as soon as it is signed.
-const signedListTTL = time.Minute
-
 // signedList is a ListObjectsV2 of bucket, presigned with key, in the shape
 // the gateway shows Hilt a request it serves: the request URI and the Host
 // header. s3:ListBucket, the permission it needs, maps to /content/retrieve
 // over the bucket's space, which is what reading its segments takes.
-func signedList(bucket string, key accessKey, region string, at time.Time) (s3.Request, error) {
+//
+// Hilt refuses a presigned request dated after its own clock, with no skew,
+// so the request is dated sigv4.MaxClockSkew before now and valid for twice
+// that: either clock may lead by the skew Hilt allows a header-signed one.
+func signedList(bucket string, key accessKey, region string, now time.Time) (s3.Request, error) {
 	u := url.URL{Scheme: "http", Host: listHost, Path: "/" + bucket, RawQuery: "list-type=2"}
 	signed, err := sigv4.Presign(sigv4.Request{Method: http.MethodGet, URL: u.String()},
-		key.id, key.secret, region, sigv4.SchemeV4, at, signedListTTL)
+		key.id, key.secret, region, sigv4.SchemeV4, now.Add(-sigv4.MaxClockSkew), 2*sigv4.MaxClockSkew)
 	if err != nil {
 		return s3.Request{}, fmt.Errorf("sign a listing of bucket %q: %w", bucket, err)
 	}

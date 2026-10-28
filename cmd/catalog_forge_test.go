@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"strings"
 	"testing"
 	"time"
 
@@ -25,7 +26,8 @@ import (
 )
 
 // TestSignedList: the listing verifies under the key's secret and Hilt's
-// time bounds, and Hilt reads it as needing s3:ListBucket on the bucket.
+// time bounds, with either clock ahead by less than the skew Hilt allows,
+// and Hilt reads it as needing s3:ListBucket on the bucket.
 func TestSignedList(t *testing.T) {
 	key := accessKey{id: "z6MkTestAccessKey", secret: "test-secret"}
 	req, err := signedList("bk", key, "us-west-1", time.Now())
@@ -45,8 +47,10 @@ func TestSignedList(t *testing.T) {
 	if err := sigv4.Verify(sr, "another-secret"); err == nil {
 		t.Fatal("verified under another secret")
 	}
-	if err := sigv4.ValidateTimeBounds(sr, time.Now()); err != nil {
-		t.Fatalf("time bounds: %v", err)
+	for _, offset := range []time.Duration{0, sigv4.MaxClockSkew - time.Minute, -(sigv4.MaxClockSkew - time.Minute)} {
+		if err := sigv4.ValidateTimeBounds(sr, time.Now().Add(offset)); err != nil {
+			t.Fatalf("time bounds with Hilt's clock %v off: %v", offset, err)
+		}
 	}
 	_, reqs, err := hiltauth.RequirementsFor(req)
 	if err != nil {
@@ -117,6 +121,11 @@ func TestForgeSegments(t *testing.T) {
 	a, b, c := cborBlock(t, "a"), cborBlock(t, "b"), cborBlock(t, "c")
 	s1, s2 := shard(a, b), shard(c)
 	unshipped := cborBlock(t, "unshipped")
+	d := cborBlock(t, "d")
+	s3 := shard(d)
+	// The last frame cut off whole: the bytes still parse, minus d.
+	whole := blobs.cars[string(s3)]
+	blobs.cars[string(s3)] = whole[:len(whole)-int(frame(d))]
 
 	authz := &fakeSignedAuthorizer{store: iam.NewDelegationCache(nil)}
 	f := &forgeSegments{authz: authz, blobs: blobs, inclusions: mem,
@@ -165,6 +174,11 @@ func TestForgeSegments(t *testing.T) {
 	}
 	if refused.calls != 1 || len(blobs.opened) != 2 {
 		t.Fatalf("after a refusal: %d authorizations and %d reads, want one and no new read", refused.calls, len(blobs.opened))
+	}
+
+	f.authz = &fakeSignedAuthorizer{store: iam.NewDelegationCache(nil)}
+	if _, err := f.forBucket("bk", space)(ctx, d.Cid()); err == nil || !strings.Contains(err.Error(), "does not match its digest") {
+		t.Fatalf("a segment short of its last frame: %v, want a digest mismatch", err)
 	}
 
 	down := errors.New("hilt is down")

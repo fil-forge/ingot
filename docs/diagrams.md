@@ -1323,6 +1323,7 @@ listed diagrams (each diagram's `Sources:` footer names its exact files).
 | `logstore/` | logstore-pipeline, segment-states, get, block-routes, delete-bucket |
 | `uploader/`, `forgeclient/` | context, put, multipart, principals, logstore-pipeline, block-routes |
 | `iam/`, `internal/reqscope/` | principals, authorize, context |
+| `cmd/catalog.go` | principals |
 | `bucket/`, `mst/` | version-tree, put, get |
 | `migrations/sql/` | schema, plus any state diagram naming a changed CHECK |
 | `module.go`, `server.go`, `config/` | packages, context, logstore-pipeline; `server.go` also authorize and multipart |
