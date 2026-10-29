@@ -1551,15 +1551,19 @@ func (r *Postgres) AddGCCandidate(ctx context.Context, cidBytes []byte, bucket s
 
 func (r *Postgres) GetRevocationCursor(ctx context.Context) (*RevocationCursor, error) {
 	var cur RevocationCursor
+	var token *string
 	var revoke []byte
 	err := r.pool.QueryRow(ctx,
-		`SELECT recorded_at, revoke FROM ingot.revocation_cursor WHERE id`).
-		Scan(&cur.RecordedAt, &revoke)
+		`SELECT token, recorded_at, revoke FROM ingot.revocation_cursor WHERE id`).
+		Scan(&token, &cur.RecordedAt, &revoke)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
 		return nil, fmt.Errorf("registry: get revocation cursor: %w", err)
+	}
+	if token != nil {
+		cur.Token = *token
 	}
 	if cur.Revoke, err = cid.Cast(revoke); err != nil {
 		return nil, fmt.Errorf("registry: get revocation cursor: decode revoke cid: %w", err)
@@ -1569,13 +1573,14 @@ func (r *Postgres) GetRevocationCursor(ctx context.Context) (*RevocationCursor, 
 
 func (r *Postgres) PutRevocationCursor(ctx context.Context, cur RevocationCursor) error {
 	_, err := r.pool.Exec(ctx,
-		`INSERT INTO ingot.revocation_cursor (id, recorded_at, revoke)
-		 VALUES (true, $1, $2)
+		`INSERT INTO ingot.revocation_cursor (id, token, recorded_at, revoke)
+		 VALUES (true, $1, $2, $3)
 		 ON CONFLICT (id) DO UPDATE
-		   SET recorded_at = EXCLUDED.recorded_at,
+		   SET token       = EXCLUDED.token,
+		       recorded_at = EXCLUDED.recorded_at,
 		       revoke      = EXCLUDED.revoke,
 		       updated_at  = now()`,
-		cur.RecordedAt, cur.Revoke.Bytes())
+		nullString(cur.Token), cur.RecordedAt, cur.Revoke.Bytes())
 	if err != nil {
 		return fmt.Errorf("registry: put revocation cursor: %w", err)
 	}
