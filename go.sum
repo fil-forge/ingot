@@ -191,8 +191,8 @@ github.com/fil-forge/libforge v0.0.0-20261022083349-59d8bde5f889 h1:lmjXiMsVFHsl
 github.com/fil-forge/libforge v0.0.0-20261022083349-59d8bde5f889/go.mod h1:ZtPwUgXm7gqQSmjmIcfMy5AwWpFIR02WMZvbgNOwi/4=
 github.com/fil-forge/smelt v0.0.0-20261012172342-6eda2d3266f0 h1:q8V6kT/wfDTvnVK5znv0zWKDXrWrIk91xzcYrEgXv9g=
 github.com/fil-forge/smelt v0.0.0-20261012172342-6eda2d3266f0/go.mod h1:D2ILnC2lBNYav4+y4701sGDClyfsWAfFy19D++6rYP8=
-github.com/fil-forge/swarf v0.0.1-0.20261029161110-63b9496d4e69 h1:sSBC0epCQLgJsxgqbCNExr1zw0G4cgqX2wrk2NHcrRI=
-github.com/fil-forge/swarf v0.0.1-0.20261029161110-63b9496d4e69/go.mod h1:sSe3eJWknrWxnldIpU46aWI2Rvq9PwiA3nUiSFn9Rxk=
+github.com/fil-forge/swarf v0.0.1-0.20261029161951-a9b76f05e2af h1:NFX2vqRzERaNzLN52z6/md49t0cnEr2XC8S+wxkI1vo=
+github.com/fil-forge/swarf v0.0.1-0.20261029161951-a9b76f05e2af/go.mod h1:sSe3eJWknrWxnldIpU46aWI2Rvq9PwiA3nUiSFn9Rxk=
 github.com/fil-forge/ucantone v0.0.0-20260924160040-c31dec73d9b3 h1:Ta5ODMWR9mM4zMfRp/K1unAKvnt7f5dhehRA+YHiv7w=
 github.com/fil-forge/ucantone v0.0.0-20260924160040-c31dec73d9b3/go.mod h1:aX35jlUs3hnWAhigjO8z9kMPiYnkW3XOW8iVoJyz7cg=
 github.com/fil-forge/versitygw v0.0.0-20261022150420-98421668449a h1:fvZ91kHBN7EUbwjjHYLTFMwWj8vQpSYB9ZDJDSYrzFg=

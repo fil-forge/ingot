@@ -44,9 +44,9 @@ func record(t *testing.T, name string, at time.Time) swarfclient.Event {
 }
 
 // streamScript is one stream call's yields: records then an optional error.
-// A nil-error script simply ends, which the swarf client does only on cancel
-// (it reconnects an established stream itself); the consumer reconnects
-// either way.
+// A nil-error script simply ends, which the swarf client never does (it
+// reconnects an established stream itself and yields ctx.Err() on cancel);
+// the consumer reconnects either way.
 type streamScript struct {
 	records []swarfclient.Event
 	err     error
@@ -232,8 +232,8 @@ func TestConsumerFallsBackToTheTimeQueryFromItsStart(t *testing.T) {
 	calls := src.calls()
 	require.Equal(t, streamCall{after: swarfclient.Now}, calls[0])
 	require.Empty(t, calls[1].after)
-	require.False(t, calls[1].from.Before(before), "the time query starts when the consumer did")
-	require.False(t, calls[1].from.After(time.Now()))
+	require.False(t, calls[1].from.After(before), "the time query starts no later than the consumer did")
+	require.WithinDuration(t, before, calls[1].from, 2*time.Minute)
 	require.Equal(t, streamCall{after: rec.Cursor}, calls[2], "the first record's token takes over")
 }
 
@@ -262,6 +262,24 @@ func TestConsumerLogsARefusedCursor(t *testing.T) {
 	refused := logs.FilterMessage("revocation: cursor refused").All()
 	require.NotEmpty(t, refused)
 	require.Equal(t, zap.ErrorLevel, refused[0].Level)
+}
+
+// With no saved token, a refusal of the head's cursor on a reconnect is
+// recovered by the fallback, so it is no operator's error.
+func TestConsumerRecoversARefusalWithNoToken(t *testing.T) {
+	src := &fakeSource{scripts: []streamScript{
+		{err: fmt.Errorf("opening revocation stream: %w", swarfclient.ErrCursorRefused)},
+	}}
+	core, logs := observer.New(zap.WarnLevel)
+	c := revocation.NewConsumer(src, inmem.NewMemStore(), &fakeInvalidator{},
+		revocation.WithLogger(zap.New(core)),
+		revocation.WithBackoff(time.Millisecond, time.Millisecond))
+	stop := run(c)
+	defer stop()
+
+	waitFor(t, func() bool { return len(src.calls()) >= 2 })
+	require.NotZero(t, src.calls()[1].from, "the fallback time query")
+	require.Empty(t, logs.FilterMessage("revocation: cursor refused").All())
 }
 
 func TestConsumerInvalidatesAndPersistsCursor(t *testing.T) {

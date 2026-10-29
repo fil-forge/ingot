@@ -16,9 +16,9 @@
 // every cache a revocation could clear is process memory, so nothing revoked
 // before the process first subscribed can be cached. If that stream ends
 // before its first record (the service unreachable when ingot starts, say),
-// later attempts use the time query from when the consumer started, on
-// ingot's clock, the only earlier position it has: starting at the head again
-// would skip the revocations recorded in between.
+// later attempts use the time query from a little before the consumer
+// started, on ingot's clock, the only earlier position it has: starting at
+// the head again would skip the revocations recorded in between.
 //
 // A cursor saved before the service issued tokens holds only a recorded_at;
 // the consumer resumes it once with the time query from there, then saves
@@ -79,6 +79,12 @@ const (
 // defaultSaveInterval bounds how much a crash re-delivers: at most this much
 // of the firehose, plus records applied since the last save.
 const defaultSaveInterval = time.Second
+
+// fallbackLookback is how far before the consumer's start its fallback time
+// query begins (see Run). Re-delivered revocations are harmless, and the
+// margin covers revocations recorded just before the start that reached the
+// firehose after it, and skew between ingot's clock and the service's.
+const fallbackLookback = time.Minute
 
 // finalSaveTimeout bounds the save made after ctx is canceled, which can no
 // longer use ctx itself.
@@ -149,7 +155,8 @@ func NewConsumer(src Source, cursor registry.RevocationCursorStore, inv Invalida
 // while disconnected are delivered on reconnect (see stream for where it
 // resumes), and duplicates are harmless (Invalidator is idempotent).
 func (c *Consumer) Run(ctx context.Context) {
-	// Every cache a revocation could clear fills from here on.
+	// Caches a revocation could clear start filling about now, as the S3
+	// server starts just before the consumer.
 	started := time.Now()
 	position := c.loadPosition(ctx)
 	var latest atomic.Pointer[registry.RevocationCursor]
@@ -162,7 +169,9 @@ func (c *Consumer) Run(ctx context.Context) {
 	bo.MaxInterval = c.maxBackoff
 	for {
 		for event, err := range c.stream(ctx, position) {
-			if errors.Is(err, swarfclient.ErrCursorRefused) {
+			// Only a saved token needs an operator; with none, the fallback
+			// below recovers.
+			if errors.Is(err, swarfclient.ErrCursorRefused) && position.Token != "" {
 				c.logger.Error("revocation: cursor refused",
 					zap.String("cursor", position.Token),
 					zap.String("fix", "with ingot stopped, clear ingot.revocation_cursor.token and set recorded_at well before the last record"),
@@ -202,8 +211,9 @@ func (c *Consumer) Run(ctx context.Context) {
 		if position.Token == "" && position.RecordedAt.IsZero() {
 			// The stream at the head ended before its first record.
 			// Starting at the head again would skip the revocations
-			// recorded since, so resume from when the consumer started.
-			position.RecordedAt = started
+			// recorded since, so resume from a little before the consumer
+			// started.
+			position.RecordedAt = started.Add(-fallbackLookback)
 		}
 		// The stream ended: wait, then reconnect after the last processed
 		// record.

@@ -145,9 +145,9 @@ Internal:
   revoked CID and clears the affected access key's iam caches via
   `iam.Revoker`; resumes after the Swarf cursor token in the
   `registry.RevocationCursorStore` cursor (no cursor → Swarf's "now", the
-  stream's head on its own database, then the time query from the consumer's
-  start if that stream ends before a record; a cursor from before tokens → the
-  time query from its `recorded_at`, once).
+  stream's head on its own database, then the time query from just before the
+  consumer's start if that stream ends before a record; a cursor from before
+  tokens → the time query from its `recorded_at`, once).
 - **`tokenstore/`** — carried-from-guppy delegation store (`tokens.cbor`);
   empty today, read only by the dormant login paths.
 - **`blake3tree/`** — the BLAKE3 Merkle-tree material of a body: the
