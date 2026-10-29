@@ -455,7 +455,7 @@ func TestRevocationCursor_UpsertRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetRevocationCursor: %v", err)
 	}
-	if !got.RecordedAt.Equal(first.RecordedAt) || !got.Revoke.Equals(first.Revoke) {
+	if got.Token != "" || !got.RecordedAt.Equal(first.RecordedAt) || !got.Revoke.Equals(first.Revoke) {
 		t.Fatalf("cursor = %+v, want %+v", got, first)
 	}
 	// The cursor is a single latch: a second put overwrites, never adds.

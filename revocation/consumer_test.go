@@ -2,6 +2,7 @@ package revocation_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"iter"
 	"sync"
@@ -15,6 +16,8 @@ import (
 	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/fil-forge/ingot/inmem"
 	"github.com/fil-forge/ingot/registry"
@@ -41,7 +44,9 @@ func record(t *testing.T, name string, at time.Time) swarfclient.Event {
 }
 
 // streamScript is one stream call's yields: records then an optional error.
-// A nil-error script simply ends (a server-side close).
+// A nil-error script simply ends, which the swarf client does only on cancel
+// (it reconnects an established stream itself); the consumer reconnects
+// either way.
 type streamScript struct {
 	records []swarfclient.Event
 	err     error
@@ -205,6 +210,58 @@ func TestConsumerResumesACursorFromBeforeTokensOnce(t *testing.T) {
 		cur, err := store.GetRevocationCursor(ctx)
 		return err == nil && cur.Token == string(rec.Cursor)
 	})
+}
+
+// With no cursor, a stream at the head that ends before its first record —
+// the service unreachable when ingot starts, say — must not be retried at a
+// later head, which would skip the revocations recorded in between.
+func TestConsumerFallsBackToTheTimeQueryFromItsStart(t *testing.T) {
+	rec := record(t, "dlg-1", time.Date(2026, 8, 6, 12, 0, 1, 0, time.UTC))
+	src := &fakeSource{scripts: []streamScript{
+		{err: errors.New("connection refused")},
+		{records: []swarfclient.Event{rec}, err: errors.New("connection reset")},
+	}}
+	inv := &fakeInvalidator{}
+	c := revocation.NewConsumer(src, inmem.NewMemStore(), inv,
+		revocation.WithBackoff(time.Millisecond, time.Millisecond))
+	before := time.Now()
+	stop := run(c)
+	defer stop()
+
+	waitFor(t, func() bool { return len(src.calls()) >= 3 })
+	calls := src.calls()
+	require.Equal(t, streamCall{after: swarfclient.Now}, calls[0])
+	require.Empty(t, calls[1].after)
+	require.False(t, calls[1].from.Before(before), "the time query starts when the consumer did")
+	require.False(t, calls[1].from.After(time.Now()))
+	require.Equal(t, streamCall{after: rec.Cursor}, calls[2], "the first record's token takes over")
+}
+
+// A cursor the service refuses is logged as an error naming the fix, and
+// retried: only an operator can tell where to start over.
+func TestConsumerLogsARefusedCursor(t *testing.T) {
+	ctx := context.Background()
+	store := inmem.NewMemStore()
+	require.NoError(t, store.PutRevocationCursor(ctx, registry.RevocationCursor{
+		Token:      "cursor-moved",
+		RecordedAt: time.Date(2026, 8, 1, 9, 0, 0, 0, time.UTC),
+		Revoke:     testCid(t, "earlier"),
+	}))
+	src := &fakeSource{scripts: []streamScript{
+		{err: fmt.Errorf("opening revocation stream: %w", swarfclient.ErrCursorRefused)},
+	}}
+	core, logs := observer.New(zap.WarnLevel)
+	c := revocation.NewConsumer(src, store, &fakeInvalidator{},
+		revocation.WithLogger(zap.New(core)),
+		revocation.WithBackoff(time.Millisecond, time.Millisecond))
+	stop := run(c)
+	defer stop()
+
+	waitFor(t, func() bool { return len(src.calls()) >= 2 })
+	require.Equal(t, streamCall{after: "cursor-moved"}, src.calls()[1])
+	refused := logs.FilterMessage("revocation: cursor refused").All()
+	require.NotEmpty(t, refused)
+	require.Equal(t, zap.ErrorLevel, refused[0].Level)
 }
 
 func TestConsumerInvalidatesAndPersistsCursor(t *testing.T) {
