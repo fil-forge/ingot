@@ -158,7 +158,7 @@ type Server struct {
 	sweepCtx    context.Context
 	sweepCancel context.CancelFunc
 	sweeps      sync.WaitGroup
-	// stopping is set when Stop begins; see serve.
+	// stopping is set just before Stop closes the listener; see serve.
 	stopping atomic.Bool
 }
 
@@ -305,8 +305,9 @@ func (s *Server) Start(ctx context.Context) error {
 }
 
 // serve runs the S3 listener until Stop closes it. versitygw reports that
-// close as an error rather than a clean return, so an error once Stop has
-// begun is the shutdown's own, not a listener failure, and goes unlogged.
+// close as an error rather than a clean return, so an error once Stop is
+// closing the listener is the shutdown's own, not a listener failure, and
+// goes unlogged.
 func (s *Server) serve() {
 	if err := s.api.ServeMultiPort([]string{s.cfg.Addr}); err != nil && !s.stopping.Load() {
 		s.logger.Error("ingot listener error", zap.Error(err))
@@ -564,7 +565,6 @@ func (s *Server) startRegistrationSweeper() {
 // fatal to the others.
 func (s *Server) Stop(ctx context.Context) error {
 	s.logger.Info("shutting down ingot S3 listener")
-	s.stopping.Store(true)
 
 	var errs []error
 	if s.sweepCancel != nil {
@@ -576,6 +576,7 @@ func (s *Server) Stop(ctx context.Context) error {
 	if err := s.backend.CloseMetrics(); err != nil {
 		errs = append(errs, fmt.Errorf("unregister local blob metrics: %w", err))
 	}
+	s.stopping.Store(true)
 	if err := s.api.ShutDown(); err != nil {
 		errs = append(errs, fmt.Errorf("s3api shutdown: %w", err))
 	}

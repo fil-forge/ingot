@@ -157,7 +157,10 @@ func (c *Consumer) Run(ctx context.Context) {
 	for {
 		for rec, err := range c.src.Stream(ctx, since) {
 			if err != nil {
-				c.logger.Warn("revocation: stream error", zap.Error(err))
+				// A stop ends the stream with ctx's own error, not a fault.
+				if ctx.Err() == nil {
+					c.logger.Warn("revocation: stream error", zap.Error(err))
+				}
 				break
 			}
 			// The stream can hold records it read before ctx was canceled.

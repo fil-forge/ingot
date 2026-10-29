@@ -63,6 +63,10 @@ func TestStopLogsNoListenerError(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	require.NoError(t, s.Stop(ctx))
-	<-served
+	select {
+	case <-served:
+	case <-time.After(5 * time.Second):
+		t.Fatal("serve did not return after Stop")
+	}
 	require.Empty(t, logs.All())
 }

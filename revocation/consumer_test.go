@@ -49,7 +49,8 @@ type streamScript struct {
 
 // fakeSource plays one streamScript per Stream call, recording the since
 // cursor each call was made with. When the scripts run out, Stream blocks
-// until ctx cancel (a healthy idle connection).
+// until ctx cancel (a healthy idle connection), then yields ctx's error, as
+// the swarf client does.
 type fakeSource struct {
 	mu      sync.Mutex
 	scripts []streamScript
@@ -68,6 +69,7 @@ func (f *fakeSource) Stream(ctx context.Context, since time.Time) iter.Seq2[api.
 	return func(yield func(api.FirehoseRevocation, error) bool) {
 		if script == nil {
 			<-ctx.Done()
+			yield(api.FirehoseRevocation{}, ctx.Err())
 			return
 		}
 		for _, rec := range script.records {
@@ -429,7 +431,9 @@ func TestConsumerReconnectsFromLastRecord(t *testing.T) {
 
 func TestConsumerStopsOnCancel(t *testing.T) {
 	src := &fakeSource{} // no scripts: Stream blocks until ctx cancel
-	c := revocation.NewConsumer(src, inmem.NewMemStore(), &fakeInvalidator{})
+	core, logs := observer.New(zap.WarnLevel)
+	c := revocation.NewConsumer(src, inmem.NewMemStore(), &fakeInvalidator{},
+		revocation.WithLogger(zap.New(core)))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -442,4 +446,5 @@ func TestConsumerStopsOnCancel(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("Run did not return after ctx cancel")
 	}
+	require.Empty(t, logs.All(), "a stop is not a stream fault")
 }
