@@ -25,9 +25,11 @@
 // tokens. Moving the service's database to another server voids its tokens
 // (Swarf's README, "Moving the database"). The service refuses those it can
 // tell, which the consumer logs as an error on every retry. To start the
-// consumer over, stop ingot, clear the saved token and set recorded_at well
-// before the last record (a time query from that record's own recorded_at can
-// miss records that reached the firehose later), then start it.
+// consumer over, stop ingot before the service serves from the new server,
+// so the saved record is still the old server's; clear the saved token and
+// set recorded_at well before that record (a time query from the record's own
+// recorded_at can miss records that reached the firehose later); then start
+// it.
 //
 // The gateway keeps serving while the service is unreachable (reconnect with
 // capped backoff); in the worst case cache entries age out on their own TTLs,
