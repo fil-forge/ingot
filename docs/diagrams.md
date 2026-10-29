@@ -1195,7 +1195,8 @@ erDiagram
     }
     revocation_cursor {
         boolean id PK "single-row latch"
-        timestamptz recorded_at "resume point in the revocation stream"
+        text token "resume point: the service's cursor for the last record"
+        timestamptz recorded_at "the last record's; the resume point of a row saved before tokens"
     }
 
     segments ||--o{ segment_op_roots : "ON DELETE CASCADE"

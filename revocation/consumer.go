@@ -5,15 +5,20 @@
 // request falls through to Hilt, which refuses.
 //
 // The consumer maintains a persistent resume cursor (registry's
-// revocation_cursor row): the recorded_at of the last processed record, on
-// the service's own timeline. A background saver writes it at most once per
-// save interval and once more on stop, so applying a record never waits on
-// the database. On first ever connect — no cursor stored — it
-// subscribes from "now": every cache a revocation could clear is process
-// memory, so nothing revoked before the process first subscribed can be
-// cached. The gateway keeps serving while the service is unreachable
-// (reconnect with capped backoff); in the worst case cache entries age out
-// on their own TTLs, exactly as they would with no consumer at all.
+// revocation_cursor row): the service's opaque token for the last processed
+// record, which a reconnect or restart resumes after, missing nothing. A
+// background saver writes it at most once per save interval and once more on
+// stop, so applying a record never waits on the database; records applied
+// since the last save are re-delivered after a crash, which is harmless. On
+// first ever connect — no cursor stored — it starts at the head of the
+// firehose as the service's database sees it, not at a time on ingot's clock:
+// every cache a revocation could clear is process memory, so nothing revoked
+// before the process first subscribed can be cached. A cursor saved before the
+// service issued tokens holds only a recorded_at; the consumer resumes it once
+// with the time query from there, then saves tokens. The gateway keeps
+// serving while the service is unreachable (reconnect with capped backoff); in
+// the worst case cache entries age out on their own TTLs, exactly as they
+// would with no consumer at all.
 package revocation
 
 import (
@@ -24,7 +29,6 @@ import (
 	"time"
 
 	"github.com/cenkalti/backoff/v5"
-	"github.com/fil-forge/swarf/pkg/api"
 	swarfclient "github.com/fil-forge/swarf/pkg/client"
 	"github.com/fil-forge/ucantone/did"
 	"github.com/ipfs/go-cid"
@@ -34,10 +38,12 @@ import (
 )
 
 // Source is the slice of the swarf client the consumer reads
-// (swarf/pkg/client.Client satisfies it): the firehose stream from a `since`
-// cursor. A zero since streams every stored record.
+// (swarf/pkg/client.Client satisfies it): the firehose after a cursor, or
+// swarfclient.Now for its head, and the time query, for a cursor saved before
+// the service issued tokens. Both yield each record with its cursor.
 type Source interface {
-	Stream(ctx context.Context, from time.Time) iter.Seq2[api.FirehoseRevocation, error]
+	StreamAfter(ctx context.Context, after swarfclient.Cursor) iter.Seq2[swarfclient.Event, error]
+	StreamEvents(ctx context.Context, from time.Time) iter.Seq2[swarfclient.Event, error]
 }
 
 // Invalidator applies one revocation to local authorization state
@@ -75,7 +81,6 @@ type Consumer struct {
 	minBackoff   time.Duration
 	maxBackoff   time.Duration
 	saveInterval time.Duration
-	now          func() time.Time // clock seam for tests
 }
 
 // Option configures a Consumer.
@@ -106,16 +111,6 @@ func WithSaveInterval(d time.Duration) Option {
 	}
 }
 
-// WithClock overrides the wall clock (test seam for the since-defaults-to-now
-// behavior).
-func WithClock(now func() time.Time) Option {
-	return func(c *Consumer) {
-		if now != nil {
-			c.now = now
-		}
-	}
-}
-
 // NewConsumer returns a Consumer reading revocations from src, clearing
 // caches through inv, and persisting its resume point in cursor.
 func NewConsumer(src Source, cursor registry.RevocationCursorStore, inv Invalidator, opts ...Option) *Consumer {
@@ -127,7 +122,6 @@ func NewConsumer(src Source, cursor registry.RevocationCursorStore, inv Invalida
 		minBackoff:   defaultMinBackoff,
 		maxBackoff:   defaultMaxBackoff,
 		saveInterval: defaultSaveInterval,
-		now:          time.Now,
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -139,10 +133,10 @@ func NewConsumer(src Source, cursor registry.RevocationCursorStore, inv Invalida
 // exponential backoff, while a background saver persists the resume cursor
 // (see saveCursor). It only ever returns on ctx cancellation, after the
 // saver's final save: the firehose is availability-tolerant — records missed
-// while disconnected are re-delivered from the cursor on reconnect, and
+// while disconnected are delivered after the cursor on reconnect, and
 // duplicates are harmless (Invalidator is idempotent).
 func (c *Consumer) Run(ctx context.Context) {
-	since := c.loadFrom(ctx)
+	position := c.loadPosition(ctx)
 	var latest atomic.Pointer[registry.RevocationCursor]
 	saved := make(chan struct{})
 	go c.saveCursor(ctx, &latest, saved)
@@ -152,7 +146,7 @@ func (c *Consumer) Run(ctx context.Context) {
 	bo.InitialInterval = c.minBackoff
 	bo.MaxInterval = c.maxBackoff
 	for {
-		for rec, err := range c.src.Stream(ctx, since) {
+		for event, err := range c.stream(ctx, position) {
 			if err != nil {
 				c.logger.Warn("revocation: stream error", zap.Error(err))
 				break
@@ -163,24 +157,45 @@ func (c *Consumer) Run(ctx context.Context) {
 			}
 			// A live stream means the endpoint is healthy — reset backoff.
 			bo.Reset()
+			rec := event.Revocation
 			keys := c.inv.Revoke(rec.Revoke)
 			c.logger.Info("revocation: record processed",
 				zap.Stringer("revoke", rec.Revoke),
 				zap.Stringer("cause", rec.Cause),
+				zap.String("cursor", string(event.Cursor)),
 				zap.Int("keys_invalidated", len(keys)))
-			since = rec.RecordedAt.Time()
+			cur := registry.RevocationCursor{
+				Token:      string(event.Cursor),
+				RecordedAt: rec.RecordedAt.Time(),
+				Revoke:     rec.Revoke,
+			}
+			position = cur
 			// Published only after Revoke returns, so the saver never saves
 			// past a record that has not been applied.
-			latest.Store(&registry.RevocationCursor{RecordedAt: since, Revoke: rec.Revoke})
+			latest.Store(&cur)
 		}
 		if ctx.Err() != nil {
 			return
 		}
 		// The stream ended (server close yields no error) or errored:
-		// wait, then reconnect from the last processed record.
+		// wait, then reconnect after the last processed record.
 		if !sleepCtx(ctx, bo.NextBackOff()) {
 			return
 		}
+	}
+}
+
+// stream opens the firehose at position: after its token; for a cursor saved
+// before the service issued tokens, with the time query from its recorded_at;
+// and with no cursor at all, at the firehose's head.
+func (c *Consumer) stream(ctx context.Context, position registry.RevocationCursor) iter.Seq2[swarfclient.Event, error] {
+	switch {
+	case position.Token != "":
+		return c.src.StreamAfter(ctx, swarfclient.Cursor(position.Token))
+	case !position.RecordedAt.IsZero():
+		return c.src.StreamEvents(ctx, position.RecordedAt)
+	default:
+		return c.src.StreamAfter(ctx, swarfclient.Now)
 	}
 }
 
@@ -221,20 +236,24 @@ func (c *Consumer) saveCursor(ctx context.Context, latest *atomic.Pointer[regist
 	}
 }
 
-// loadFrom resolves the initial firehose cursor: the stored resume point,
-// or "now" when none exists. Any read failure (not just ErrNotFound)
-// degrades to "now" with a warning rather than blocking startup — the cost
-// is missing revocations recorded while disconnected, bounded by the cache
-// TTLs the firehose exists to undercut.
-func (c *Consumer) loadFrom(ctx context.Context) time.Time {
+// loadPosition resolves where the firehose starts: the stored cursor, or the
+// zero cursor (the firehose's head) when none exists. Any read failure (not
+// just ErrNotFound) degrades to the head with a warning rather than blocking
+// startup — the cost is missing revocations recorded while disconnected,
+// bounded by the cache TTLs the firehose exists to undercut.
+func (c *Consumer) loadPosition(ctx context.Context) registry.RevocationCursor {
 	cur, err := c.cursor.GetRevocationCursor(ctx)
 	if err == nil {
-		return cur.RecordedAt
+		if cur.Token == "" {
+			c.logger.Info("revocation: cursor predates resume tokens, resuming with the time query",
+				zap.Time("recorded_at", cur.RecordedAt))
+		}
+		return *cur
 	}
 	if !errors.Is(err, registry.ErrNotFound) {
-		c.logger.Warn("revocation: load cursor, subscribing from now", zap.Error(err))
+		c.logger.Warn("revocation: load cursor, starting at the firehose head", zap.Error(err))
 	}
-	return c.now()
+	return registry.RevocationCursor{}
 }
 
 // sleepCtx sleeps for d, reporting false if ctx was canceled first.
