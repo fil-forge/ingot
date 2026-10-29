@@ -2,11 +2,14 @@ package ingot
 
 import (
 	"context"
+	"net/http"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/fil-forge/ingot/config"
 )
@@ -32,4 +35,34 @@ func TestStopWaitsForSweepers(t *testing.T) {
 	// Stop's error includes a timeout waiting for the sweepers.
 	require.NoError(t, s.Stop(ctx))
 	require.True(t, exited.Load(), "Stop returned before a sweeper exited")
+}
+
+// TestStopLogsNoListenerError: the listener's close is Stop's own doing, not
+// a listener failure to report.
+func TestStopLogsNoListenerError(t *testing.T) {
+	s := newInmemServer(t, config.ServerConfig{})
+	core, logs := observer.New(zap.ErrorLevel)
+	s.logger = zap.New(core)
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+		s.serve()
+	}()
+	// A response, not just an accepted connection, means the listener is
+	// serving, so Stop has it to close.
+	client := &http.Client{Timeout: time.Second}
+	require.Eventually(t, func() bool {
+		resp, err := client.Get("http://" + s.cfg.Addr + "/health")
+		if err != nil {
+			return false
+		}
+		_ = resp.Body.Close()
+		return true
+	}, 5*time.Second, 10*time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	require.NoError(t, s.Stop(ctx))
+	<-served
+	require.Empty(t, logs.All())
 }
