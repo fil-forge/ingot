@@ -15,7 +15,11 @@
 // every cache a revocation could clear is process memory, so nothing revoked
 // before the process first subscribed can be cached. A cursor saved before the
 // service issued tokens holds only a recorded_at; the consumer resumes it once
-// with the time query from there, then saves tokens. The gateway keeps
+// with the time query from there, then saves tokens. Clearing a saved token
+// makes the consumer start over the same way. That is what moving the
+// service's database to another server calls for, since tokens from before
+// the move are refused or can skip records (Swarf's README, "Moving the
+// database"); a refused token is logged on every retry. The gateway keeps
 // serving while the service is unreachable (reconnect with capped backoff); in
 // the worst case cache entries age out on their own TTLs, exactly as they
 // would with no consumer at all.
