@@ -27,10 +27,10 @@
 // space — authorizes with THIS access key's chain, never another's.
 //
 // A response carrying a delegation the revocation consumer has seen revoked
-// ([KeyProofs.Revoked]) authorizes the one request it answers and is not
-// cached: it stems from a Hilt write whose revocations were published but
-// whose commit failed, and caching it would keep the old access in force
-// while the console's retry republishes revocations Swarf
+// ([KeyProofs.InvalidateHolders] records it) authorizes the one request it
+// answers and is not cached: it stems from a Hilt write whose revocations
+// were published but whose commit failed, and caching it would keep the old
+// access in force while the console's retry republishes revocations Swarf
 // deduplicates. The request still gets a store of its own holding the
 // response's delegations, so its onward retrieval has a chain.
 //
@@ -407,14 +407,6 @@ func mapAuthError(err error) (error, bool) {
 		hiltauth.UnsignedHeaderErrorName,
 		hiltauth.InvalidBodyErrorName:
 		return s3err.GetAPIError(s3err.ErrAccessDenied), true
-	case hiltauth.TemporarilyUnavailableErrorName:
-		// An authorize that waited out Hilt's lock timeout behind a policy
-		// write: the client retries.
-		return s3err.APIError{
-			Code:           "ServiceUnavailable",
-			Description:    "The authorization service is busy. Retry the request.",
-			HTTPStatusCode: http.StatusServiceUnavailable,
-		}, true
 	case s3bkt.InvalidPolicyErrorName:
 		// A policy document Hilt refuses: the code a PutBucketPolicy body gets.
 		return malformedPolicy(named.Error()), true

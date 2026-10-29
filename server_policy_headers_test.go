@@ -23,5 +23,4 @@ func TestPolicyHeaders_LeavesOtherResponsesAlone(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 200, res.StatusCode)
 	require.Equal(t, "text/plain", res.Header.Get("Content-Type"))
-	require.Empty(t, res.Header.Get("ETag"))
 }

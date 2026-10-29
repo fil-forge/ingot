@@ -41,11 +41,12 @@ func (f *policyAuthority) PolicyDocument(_ context.Context, req s3.Request, body
 const signedAuth = "AWS4-HMAC-SHA256 Credential=k/20260928/us/s3/aws4_request, SignedHeaders=host, Signature=abc"
 
 // policyCtx stashes req on the context the way the gateway middleware does,
-// with an ETag holder as the ?policy middleware installs; etag reads it.
-func policyCtx(req s3.Request) (ctx context.Context, etag *string) {
-	etag = new(string)
+// with the policy document holder the ?policy middleware installs;
+// documented reads it.
+func policyCtx(req s3.Request) (ctx context.Context, documented *bool) {
+	documented = new(bool)
 	ctx = context.WithValue(context.Background(), reqscope.RequestKey(), req)
-	return context.WithValue(ctx, reqscope.ETagKey(), etag), etag
+	return context.WithValue(ctx, reqscope.PolicyDocumentKey(), documented), documented
 }
 
 func policyBackend(t *testing.T, authority bucketauthority.BucketAuthority) *s3frontend.Backend {
@@ -66,26 +67,27 @@ func requireS3Error(t *testing.T, err error, code string) {
 }
 
 func TestBucketPolicy(t *testing.T) {
-	t.Run("PutBucketPolicy forwards the signed request and document and answers the document's ETag", func(t *testing.T) {
+	t.Run("PutBucketPolicy forwards the signed request and document and marks no document answer", func(t *testing.T) {
 		f := &policyAuthority{ok: &s3bkt.PolicyOK{}}
-		req := s3.Request{Method: http.MethodPut, URL: "/photos?policy", Headers: map[string]string{"Authorization": signedAuth, "If-Match": `"old"`}}
-		ctx, etag := policyCtx(req)
-		// Two statements, sent in the opposite order of their canonical form:
-		// the tag is the normalized document's, as Hilt stores it.
-		body := `{"Version":"2012-10-17","Statement":[` +
-			`{"Effect":"Allow","Principal":{"AWS":["arn:aws:iam:::user/alice"]},"Action":["s3:PutObject"],"Resource":["arn:aws:s3:::photos/*"]},` +
-			`{"Effect":"Deny","Principal":"*","Action":["s3:DeleteObject"],"Resource":["arn:aws:s3:::photos/*"]}]}`
+		req := s3.Request{Method: http.MethodPut, URL: "/photos?policy", Headers: map[string]string{"Authorization": signedAuth}}
+		ctx, documented := policyCtx(req)
+		body := `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::photos/*"]}]}`
 		require.NoError(t, policyBackend(t, f).PutBucketPolicy(ctx, "photos", []byte(body)))
 		require.Equal(t, req, f.req)
 		require.Equal(t, body, string(f.body))
-		want := s3bkt.PolicyDocument{Version: "2012-10-17", Statements: []s3bkt.Statement{
-			{Effect: s3bkt.Deny, Principal: s3bkt.Everyone(), Actions: s3bkt.NewStringSet("s3:DeleteObject"), Resources: s3bkt.NewStringSet("arn:aws:s3:::photos/*")},
-			{Effect: s3bkt.Allow, Principal: s3bkt.Only("alice"), Actions: s3bkt.NewStringSet("s3:PutObject"), Resources: s3bkt.NewStringSet("arn:aws:s3:::photos/*")},
-		}}
-		require.Equal(t, s3bkt.ETag(want), *etag)
+		require.False(t, *documented)
 	})
 
-	t.Run("GetBucketPolicy forwards a signed GET ?policy and returns the document", func(t *testing.T) {
+	t.Run("PutBucketPolicy forwards an If-Match header untouched and succeeds without checking it", func(t *testing.T) {
+		f := &policyAuthority{ok: &s3bkt.PolicyOK{}}
+		// The tag matches no stored document: the write still succeeds.
+		req := s3.Request{Method: http.MethodPut, URL: "/photos?policy", Headers: map[string]string{"Authorization": signedAuth, "If-Match": `"any-tag"`}}
+		ctx, _ := policyCtx(req)
+		require.NoError(t, policyBackend(t, f).PutBucketPolicy(ctx, "photos", []byte("{}")))
+		require.Equal(t, req, f.req)
+	})
+
+	t.Run("GetBucketPolicy forwards a signed GET ?policy, returns the document and marks a document answer", func(t *testing.T) {
 		for _, req := range []s3.Request{
 			{Method: http.MethodGet, URL: "/photos?policy", Headers: map[string]string{"Authorization": signedAuth}},
 			{Method: http.MethodGet, URL: "/photos?policy&X-Amz-Signature=abc", Headers: map[string]string{}},
@@ -94,13 +96,13 @@ func TestBucketPolicy(t *testing.T) {
 				{Effect: s3bkt.Allow, Principal: s3bkt.Only("alice"), Actions: s3bkt.NewStringSet("s3:GetObject"), Resources: s3bkt.NewStringSet("arn:aws:s3:::photos/*")},
 			}}
 			f := &policyAuthority{ok: &s3bkt.PolicyOK{Policy: policy}}
-			ctx, etag := policyCtx(req)
+			ctx, documented := policyCtx(req)
 			doc, err := policyBackend(t, f).GetBucketPolicy(ctx, "photos")
 			require.NoError(t, err, req.URL)
 			require.Equal(t, `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":["arn:aws:iam:::user/alice"]},"Action":["s3:GetObject"],"Resource":["arn:aws:s3:::photos/*"]}]}`, string(doc))
 			require.Equal(t, req, f.req)
 			require.Nil(t, f.body)
-			require.Equal(t, s3bkt.ETag(*policy), *etag)
+			require.True(t, *documented, req.URL)
 		}
 	})
 
@@ -144,9 +146,6 @@ func TestBucketPolicy(t *testing.T) {
 			{bucketauthority.ErrNotFound, "NoSuchBucket"},
 			{bucketauthority.ErrNoPolicy, "NoSuchBucketPolicy"},
 			{bucketauthority.ErrMalformedPolicy, "MalformedPolicy"},
-			{bucketauthority.ErrPreconditionFailed, "PreconditionFailed"},
-			{bucketauthority.ErrInvalidPrecondition, "InvalidRequest"},
-			{bucketauthority.ErrConcurrentChange, "OperationAborted"},
 			{bucketauthority.ErrUnsupported, "NotImplemented"},
 			{ucanerrors.New(hiltauth.OperationNotPermittedErrorName, "no"), "AccessDenied"},
 			{ucanerrors.New(hiltauth.SignatureMismatchErrorName, "no"), "SignatureDoesNotMatch"},

@@ -75,9 +75,6 @@ func TestBucketPolicy(t *testing.T) {
 			"UnknownBucket":       bucketauthority.ErrNotFound,
 			"PolicyNotFound":      bucketauthority.ErrNoPolicy,
 			"InvalidBucketPolicy": bucketauthority.ErrMalformedPolicy,
-			"PreconditionFailed":  bucketauthority.ErrPreconditionFailed,
-			"InvalidPrecondition": bucketauthority.ErrInvalidPrecondition,
-			"ConcurrentChange":    bucketauthority.ErrConcurrentChange,
 		} {
 			svc := newService(t, func(*s3bkt.PolicyArguments) (*s3bkt.PolicyOK, error) {
 				return nil, ucanerrors.New(name, "refused: "+name)

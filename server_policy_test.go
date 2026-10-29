@@ -63,10 +63,8 @@ func (s secretIAM) GetUserAccountForRequest(_ fiber.Ctx, access string) (auth.Ac
 
 // TestBuildS3API_BucketPolicy drives the bucket policy operations through
 // the real versitygw route table and controllers: a GET answers the stored
-// document as JSON with its ETag, a PUT answers 204 with the new ETag, both
-// headers coming from the ?policy middleware, which reads the ETag the backend
-// computed from the document and the
-// backend left in the request's reqscope holder.
+// document as JSON, its content type set by the ?policy middleware, and a PUT
+// answers 204 whatever conditional header it carries. Neither carries an ETag.
 func TestBuildS3API_BucketPolicy(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -100,11 +98,14 @@ func TestBuildS3API_BucketPolicy(t *testing.T) {
 	t.Cleanup(func() { require.NoError(t, api.ShutDown()) })
 	waitListening(t, addr)
 
-	do := func(t *testing.T, method string, body []byte, sign bool) (*http.Response, string) {
+	do := func(t *testing.T, method string, body []byte, sign bool, headers ...string) (*http.Response, string) {
 		t.Helper()
 		req, err := http.NewRequestWithContext(ctx, method, "http://"+addr+"/photos?policy", bytes.NewReader(body))
 		require.NoError(t, err)
 		req.Header.Set("Origin", origin)
+		for i := 0; i+1 < len(headers); i += 2 {
+			req.Header.Set(headers[i], headers[i+1])
+		}
 		if sign {
 			sum := sha256.Sum256(body)
 			hash := hex.EncodeToString(sum[:])
@@ -129,23 +130,30 @@ func TestBuildS3API_BucketPolicy(t *testing.T) {
 		{Effect: s3bkt.Allow, Principal: s3bkt.Everyone(), Actions: s3bkt.NewStringSet("s3:GetObject"), Resources: s3bkt.NewStringSet("arn:aws:s3:::photos/*")},
 	}}
 
-	t.Run("GET answers the document as JSON with its ETag and the bucket CORS headers", func(t *testing.T) {
+	t.Run("GET answers the document as JSON without an ETag and with the bucket CORS headers", func(t *testing.T) {
 		f.ok, f.err = &s3bkt.PolicyOK{Policy: policy}, nil
 		res, body := do(t, http.MethodGet, nil, true)
 		require.Equal(t, http.StatusOK, res.StatusCode, body)
 		require.Equal(t, doc, body)
-		require.Equal(t, s3bkt.ETag(*policy), res.Header.Get("ETag"))
+		require.Empty(t, res.Header.Get("ETag"))
 		require.Equal(t, "application/json", res.Header.Get("Content-Type"))
 		require.Equal(t, origin, res.Header.Get("Access-Control-Allow-Origin"))
 		require.Equal(t, http.MethodGet, f.req.Method)
 	})
 
-	t.Run("PUT forwards the document and answers 204 with the new ETag", func(t *testing.T) {
+	t.Run("PUT forwards the document and answers 204 without an ETag", func(t *testing.T) {
 		f.ok, f.err = &s3bkt.PolicyOK{}, nil
 		res, body := do(t, http.MethodPut, []byte(doc), true)
 		require.Equal(t, http.StatusNoContent, res.StatusCode, body)
-		require.Equal(t, s3bkt.ETag(*policy), res.Header.Get("ETag"))
+		require.Empty(t, res.Header.Get("ETag"))
 		require.Equal(t, doc, string(f.body))
+	})
+
+	t.Run("PUT carrying If-Match forwards the header and answers 204", func(t *testing.T) {
+		f.ok, f.err = &s3bkt.PolicyOK{}, nil
+		res, body := do(t, http.MethodPut, []byte(doc), true, "If-Match", `"any-tag"`)
+		require.Equal(t, http.StatusNoContent, res.StatusCode, body)
+		require.Equal(t, `"any-tag"`, f.req.Headers["If-Match"])
 	})
 
 	t.Run("DELETE answers 204", func(t *testing.T) {
