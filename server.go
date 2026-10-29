@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/fil-forge/libforge/identity"
@@ -157,6 +158,8 @@ type Server struct {
 	sweepCtx    context.Context
 	sweepCancel context.CancelFunc
 	sweeps      sync.WaitGroup
+	// stopping is set just before Stop closes the listener; see serve.
+	stopping atomic.Bool
 }
 
 // New wires a ServerDeps + ServerConfig into a runnable Server. The
@@ -290,11 +293,7 @@ func (s *Server) Start(ctx context.Context) error {
 		zap.String("data_dir", s.cfg.DataDir),
 		zap.Int64("max_blob_size", s.cfg.MaxBlobSize),
 	)
-	go func() {
-		if err := s.api.ServeMultiPort([]string{s.cfg.Addr}); err != nil {
-			s.logger.Error("ingot listener error", zap.Error(err))
-		}
-	}()
+	go s.serve()
 	s.sweepCtx, s.sweepCancel = context.WithCancel(context.Background())
 	s.startMultipartSweeper()
 	s.startReleaseSweeper()
@@ -303,6 +302,16 @@ func (s *Server) Start(ctx context.Context) error {
 	s.startRegistrationSweeper()
 	s.startAcceptSweeper()
 	return nil
+}
+
+// serve runs the S3 listener until Stop closes it. versitygw reports that
+// close as an error rather than a clean return, so an error once Stop is
+// closing the listener is the shutdown's own, not a listener failure, and
+// goes unlogged.
+func (s *Server) serve() {
+	if err := s.api.ServeMultiPort([]string{s.cfg.Addr}); err != nil && !s.stopping.Load() {
+		s.logger.Error("ingot listener error", zap.Error(err))
+	}
 }
 
 // goSweep runs fn in a sweeper goroutine that Stop waits for. fn must return
@@ -567,6 +576,7 @@ func (s *Server) Stop(ctx context.Context) error {
 	if err := s.backend.CloseMetrics(); err != nil {
 		errs = append(errs, fmt.Errorf("unregister local blob metrics: %w", err))
 	}
+	s.stopping.Store(true)
 	if err := s.api.ShutDown(); err != nil {
 		errs = append(errs, fmt.Errorf("s3api shutdown: %w", err))
 	}

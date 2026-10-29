@@ -91,7 +91,7 @@ func WithLogger(logger *zap.Logger) Option {
 }
 
 // WithBackoff overrides the reconnect backoff's initial interval and cap
-// (defaults 1s..1m).
+// (defaults: defaultMinBackoff, defaultMaxBackoff).
 func WithBackoff(min, max time.Duration) Option {
 	return func(c *Consumer) {
 		c.minBackoff = min
@@ -99,10 +99,13 @@ func WithBackoff(min, max time.Duration) Option {
 	}
 }
 
-// WithSaveInterval overrides how often the resume cursor is saved (default 1s).
+// WithSaveInterval overrides how often the resume cursor is saved (default:
+// defaultSaveInterval). A non-positive d is ignored.
 func WithSaveInterval(d time.Duration) Option {
 	return func(c *Consumer) {
-		c.saveInterval = d
+		if d > 0 {
+			c.saveInterval = d
+		}
 	}
 }
 
@@ -154,7 +157,10 @@ func (c *Consumer) Run(ctx context.Context) {
 	for {
 		for rec, err := range c.src.Stream(ctx, since) {
 			if err != nil {
-				c.logger.Warn("revocation: stream error", zap.Error(err))
+				// A stop ends the stream with ctx's own error, not a fault.
+				if ctx.Err() == nil {
+					c.logger.Warn("revocation: stream error", zap.Error(err))
+				}
 				break
 			}
 			// The stream can hold records it read before ctx was canceled.
@@ -188,33 +194,51 @@ func (c *Consumer) Run(ctx context.Context) {
 // skipping intervals in which it has not moved, and once more when ctx is
 // canceled, then closes done. Saving off the record loop matters on a busy
 // firehose: each save is a durable commit, and on a node whose database sits
-// on slow disks one commit per record capped the loop at about 55 records a
-// second. A failed save is retried at the next interval; until one succeeds,
-// a restart re-delivers from the previous saved cursor.
+// on slow disks, one commit per record bounded how fast the loop could apply
+// records. A failed save is retried at the next interval; until one succeeds,
+// a restart re-delivers from the previous saved cursor. A run of failed
+// interval saves is logged once when it starts and once when it ends.
 func (c *Consumer) saveCursor(ctx context.Context, latest *atomic.Pointer[registry.RevocationCursor], done chan<- struct{}) {
 	defer close(done)
 	var last *registry.RevocationCursor
-	save := func(ctx context.Context) {
+	save := func(ctx context.Context) error {
 		cur := latest.Load()
 		if cur == nil || cur == last {
-			return
+			return nil
 		}
 		if err := c.cursor.PutRevocationCursor(ctx, *cur); err != nil {
-			c.logger.Warn("revocation: persist cursor", zap.Error(err))
-			return
+			return err
 		}
 		last = cur
+		return nil
 	}
 
+	failing := false
 	ticker := time.NewTicker(c.saveInterval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ticker.C:
-			save(ctx)
+			err := save(ctx)
+			if ctx.Err() != nil {
+				// Stopped mid-save: the final save settles it.
+				continue
+			}
+			switch {
+			case err != nil && !failing:
+				c.logger.Warn("revocation: persist cursor failed; retrying each interval", zap.Error(err))
+			case err == nil && failing:
+				c.logger.Info("revocation: persist cursor recovered")
+			}
+			failing = err != nil
 		case <-ctx.Done():
 			final, cancel := context.WithTimeout(context.WithoutCancel(ctx), finalSaveTimeout)
-			save(final)
+			switch err := save(final); {
+			case err != nil:
+				c.logger.Warn("revocation: persist cursor at stop", zap.Error(err))
+			case failing:
+				c.logger.Info("revocation: persist cursor recovered")
+			}
 			cancel()
 			return
 		}
