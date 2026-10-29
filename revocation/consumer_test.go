@@ -2,10 +2,12 @@ package revocation_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"iter"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	jsg "github.com/alanshaw/dag-json-gen"
@@ -14,6 +16,8 @@ import (
 	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/fil-forge/ingot/inmem"
 	"github.com/fil-forge/ingot/registry"
@@ -184,11 +188,13 @@ func TestConsumerInvalidatesAndPersistsCursor(t *testing.T) {
 
 // recordingCursorStore records every cursor it is asked to save. Like the
 // Postgres store, it refuses a save whose ctx is already canceled. With
-// release set, each save waits for release to close first.
+// release set, each save waits for release to close first; with failures
+// set, that many saves fail before any succeeds.
 type recordingCursorStore struct {
-	mu      sync.Mutex
-	saved   []registry.RevocationCursor
-	release chan struct{}
+	mu       sync.Mutex
+	saved    []registry.RevocationCursor
+	release  chan struct{}
+	failures int
 }
 
 func (s *recordingCursorStore) GetRevocationCursor(context.Context) (*registry.RevocationCursor, error) {
@@ -207,6 +213,10 @@ func (s *recordingCursorStore) PutRevocationCursor(ctx context.Context, cur regi
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.failures > 0 {
+		s.failures--
+		return errors.New("database unavailable")
+	}
 	s.saved = append(s.saved, cur)
 	return nil
 }
@@ -259,19 +269,70 @@ func TestConsumerSavesOnlyTheLastPositionWhenStoppedBeforeTheInterval(t *testing
 	}}, store.calls())
 }
 
-func TestConsumerSavesNothingMoreWhileTheFeedIsIdle(t *testing.T) {
-	recs := records(t, 1)
-	store := &recordingCursorStore{}
-	src := &fakeSource{scripts: []streamScript{{records: recs}}}
-	c := revocation.NewConsumer(src, store, &fakeInvalidator{},
-		revocation.WithSaveInterval(time.Millisecond))
-	stop := run(c)
-	defer stop()
+// The tests below run in a synctest bubble: its clock advances only once
+// every goroutine in it is blocked, so after synctest.Wait the consumer has
+// done everything the elapsed intervals call for.
 
-	waitFor(t, func() bool { return len(store.calls()) == 1 })
-	// Twenty intervals with no new record.
-	time.Sleep(20 * time.Millisecond)
-	require.Len(t, store.calls(), 1)
+func TestConsumerSavesNothingMoreWhileTheFeedIsIdle(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		recs := records(t, 1)
+		store := &recordingCursorStore{}
+		src := &fakeSource{scripts: []streamScript{{records: recs}}}
+		c := revocation.NewConsumer(src, store, &fakeInvalidator{},
+			revocation.WithSaveInterval(time.Second))
+		stop := run(c)
+		defer stop()
+
+		// Twenty intervals with no new record.
+		time.Sleep(20 * time.Second)
+		synctest.Wait()
+		require.Len(t, store.calls(), 1)
+	})
+}
+
+func TestConsumerRetriesAFailedSaveUntilItLands(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		recs := records(t, 1)
+		store := &recordingCursorStore{failures: 3}
+		core, logs := observer.New(zap.InfoLevel)
+		src := &fakeSource{scripts: []streamScript{{records: recs}}}
+		c := revocation.NewConsumer(src, store, &fakeInvalidator{},
+			revocation.WithSaveInterval(time.Second),
+			revocation.WithLogger(zap.New(core)))
+		stop := run(c)
+		defer stop()
+
+		// The feed is idle after the record, so only a later interval's
+		// save can land it.
+		time.Sleep(10 * time.Second)
+		synctest.Wait()
+		require.Equal(t, []registry.RevocationCursor{{
+			RecordedAt: recs[0].RecordedAt.Time(),
+			Revoke:     recs[0].Revoke,
+		}}, store.calls())
+		require.Equal(t, 1, logs.FilterMessage("revocation: persist cursor failed; retrying each interval").Len(),
+			"the failures are logged once, when they start")
+		require.Equal(t, 1, logs.FilterMessage("revocation: persist cursor recovered").Len())
+	})
+}
+
+func TestConsumerIgnoresANonPositiveSaveInterval(t *testing.T) {
+	for _, d := range []time.Duration{0, -time.Second} {
+		t.Run(d.String(), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				recs := records(t, 1)
+				store := &recordingCursorStore{}
+				src := &fakeSource{scripts: []streamScript{{records: recs}}}
+				c := revocation.NewConsumer(src, store, &fakeInvalidator{},
+					revocation.WithSaveInterval(d))
+				stop := run(c)
+
+				synctest.Wait()
+				stop()
+				require.Len(t, store.calls(), 1, "the save at stop lands")
+			})
+		})
+	}
 }
 
 // cancelingInvalidator cancels the consumer's context from inside the
