@@ -16,7 +16,7 @@ require (
 	github.com/fil-forge/indexing-service v1.13.5-0.20260820151722-9eb620409a4e
 	github.com/fil-forge/libforge v0.0.0-20261022083349-59d8bde5f889
 	github.com/fil-forge/smelt v0.0.0-20261012172342-6eda2d3266f0
-	github.com/fil-forge/swarf v0.0.1-0.20261029161951-a9b76f05e2af
+	github.com/fil-forge/swarf v0.0.1-0.20261029164121-9fc80cdb818c
 	github.com/fil-forge/ucantone v0.0.0-20260924160040-c31dec73d9b3
 	github.com/fil-forge/versitygw v0.0.0-20261022150420-98421668449a
 	github.com/filecoin-project/go-fee v0.3.0
