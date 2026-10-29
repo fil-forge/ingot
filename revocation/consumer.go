@@ -217,6 +217,10 @@ func (c *Consumer) saveCursor(ctx context.Context, latest *atomic.Pointer[regist
 		select {
 		case <-ticker.C:
 			err := save(ctx)
+			if ctx.Err() != nil {
+				// Stopped mid-save: the final save settles it.
+				continue
+			}
 			switch {
 			case err != nil && !failing:
 				c.logger.Warn("revocation: persist cursor failed; retrying each interval", zap.Error(err))
@@ -226,8 +230,11 @@ func (c *Consumer) saveCursor(ctx context.Context, latest *atomic.Pointer[regist
 			failing = err != nil
 		case <-ctx.Done():
 			final, cancel := context.WithTimeout(context.WithoutCancel(ctx), finalSaveTimeout)
-			if err := save(final); err != nil {
+			switch err := save(final); {
+			case err != nil:
 				c.logger.Warn("revocation: persist cursor at stop", zap.Error(err))
+			case failing:
+				c.logger.Info("revocation: persist cursor recovered")
 			}
 			cancel()
 			return

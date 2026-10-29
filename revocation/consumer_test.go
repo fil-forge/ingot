@@ -269,9 +269,9 @@ func TestConsumerSavesOnlyTheLastPositionWhenStoppedBeforeTheInterval(t *testing
 	}}, store.calls())
 }
 
-// The tests below run in a synctest bubble: its clock advances only once
-// every goroutine in it is blocked, so after synctest.Wait the consumer has
-// done everything the elapsed intervals call for.
+// A synctest.Test bubble's clock advances only once every goroutine in it is
+// blocked, so after synctest.Wait a consumer run in one has done everything
+// the elapsed intervals call for.
 
 func TestConsumerSavesNothingMoreWhileTheFeedIsIdle(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
@@ -313,6 +313,53 @@ func TestConsumerRetriesAFailedSaveUntilItLands(t *testing.T) {
 		require.Equal(t, 1, logs.FilterMessage("revocation: persist cursor failed; retrying each interval").Len(),
 			"the failures are logged once, when they start")
 		require.Equal(t, 1, logs.FilterMessage("revocation: persist cursor recovered").Len())
+	})
+}
+
+func TestConsumerLogsARecoveryAtStop(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		recs := records(t, 1)
+		store := &recordingCursorStore{failures: 1}
+		core, logs := observer.New(zap.InfoLevel)
+		src := &fakeSource{scripts: []streamScript{{records: recs}}}
+		c := revocation.NewConsumer(src, store, &fakeInvalidator{},
+			revocation.WithSaveInterval(time.Second),
+			revocation.WithLogger(zap.New(core)))
+		stop := run(c)
+
+		// The first interval's save fails; the final save is the next one.
+		time.Sleep(time.Second)
+		synctest.Wait()
+		stop()
+
+		require.Len(t, store.calls(), 1, "the final save lands")
+		require.Equal(t, 1, logs.FilterMessage("revocation: persist cursor recovered").Len())
+	})
+}
+
+func TestConsumerLogsNoFailureForASaveCutShortByStop(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		recs := records(t, 1)
+		store := &recordingCursorStore{release: make(chan struct{})}
+		core, logs := observer.New(zap.InfoLevel)
+		src := &fakeSource{scripts: []streamScript{{records: recs}}}
+		c := revocation.NewConsumer(src, store, &fakeInvalidator{},
+			revocation.WithSaveInterval(time.Second),
+			revocation.WithLogger(zap.New(core)))
+		stop := run(c)
+
+		// The first interval's save waits on release, so the stop cuts it
+		// short; the final save then waits on release too.
+		time.Sleep(time.Second)
+		synctest.Wait()
+		stopped := make(chan struct{})
+		go func() { defer close(stopped); stop() }()
+		synctest.Wait()
+		close(store.release)
+		<-stopped
+
+		require.Len(t, store.calls(), 1, "the final save lands")
+		require.Zero(t, logs.FilterLevelExact(zap.WarnLevel).Len(), "a save cut short by the stop is no failure")
 	})
 }
 

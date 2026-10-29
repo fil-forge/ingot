@@ -13,7 +13,7 @@
 //
 //   - *zap.Logger
 //   - *pgxpool.Pool          — ingot owns its schema and runs its own goose
-//     migrations against this pool at startup. Its stop hooks still write
+//     migrations against this pool at startup. ingot's stop hooks also write
 //     through the pool, so a host that closes the pool on stop should append
 //     that hook from the pool's own constructor: fx runs it after the stop
 //     hooks of everything built from the pool.

@@ -62,7 +62,7 @@ func TestApp_GraphValidates(t *testing.T) {
 // applied a record, and checks that the record's cursor was saved. The
 // consumer saves at stop whatever its periodic save has not, which lands
 // only if the pool outlives the consumer: this pins buildApp closing the
-// pool after everything that uses it.
+// pool after the consumer has stopped.
 //
 // The stop beats the consumer's first periodic save by a wide margin, so a
 // pool that closes first fails the test; a slow enough runner would let the
