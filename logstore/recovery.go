@@ -165,7 +165,10 @@ func (pl *PlaneLog) recover(ctx context.Context) error {
 			}
 			if seg == nil {
 				// Damaged and set aside: recovered below like a lost file.
+				// Its sidecars describe the damaged CAR, so they go too.
+				removeSegmentFiles(pl.dir, seq, pl.plane)
 				delete(carPresent, seq)
+				delete(sidecarSeqs, seq)
 				continue
 			}
 			sealedRecovered = append(sealedRecovered, seg)
@@ -274,8 +277,12 @@ func (pl *PlaneLog) recover(ctx context.Context) error {
 // rows with the ship. It is renamed aside and sealedRow returns nil, so the
 // caller treats the CAR as gone: the journal rebuilds an unshipped
 // segment's blocks, and a shipped one's are on Forge. An unshipped segment
-// the journal holds nothing for (one sealed before the journal existed) fails
-// the start instead, leaving the file as it is.
+// the journal holds nothing for fails the start instead, leaving the file as
+// it is. That is one sealed before the journal existed, whose blocks may
+// exist nowhere else, but also one whose blocks are safe or no longer
+// needed: its journal rows moved in full by a rebuild that crashed before
+// retiring it, or dropped by a DeleteBucket that emptied the bucket and then
+// failed. Telling these apart needs a person, so the error says how to go on.
 func (pl *PlaneLog) sealedRow(ctx context.Context, row SegmentMeta, journaled func(seq uint64) (bool, error)) (*Segment, error) {
 	seq := row.Seq
 	seg, err := loadSealedFromIdx(pl.dir, seq, pl.plane, row.ShippedAt, pl.logger)
@@ -294,7 +301,8 @@ func (pl *PlaneLog) sealedRow(ctx context.Context, row SegmentMeta, journaled fu
 				return nil, jerr
 			}
 			if !ok {
-				return nil, fmt.Errorf("logstore: sealed %s seg %d: .idx unreadable (%w) and the CAR doesn't match its row, with nothing journaled to rebuild it from", pl.plane, seq, err)
+				return nil, fmt.Errorf("logstore: sealed %s seg %d: .idx unreadable (%w) and the CAR doesn't match its row, with nothing journaled to rebuild it from; "+
+					"if its blocks are no longer needed, rename %s to %s.damaged and start again", pl.plane, seq, err, carPath, carPath)
 			}
 		}
 		aside := carPath + ".damaged"
@@ -311,8 +319,9 @@ func (pl *PlaneLog) sealedRow(ctx context.Context, row SegmentMeta, journaled fu
 	if seg, err = rebuildOpenFromDisk(pl.dir, seq, pl.plane, pl.logger); err != nil {
 		return nil, fmt.Errorf("logstore: rebuild sealed %s seg %d: %w", pl.plane, seq, err)
 	}
-	if len(seg.opRoots) == 0 {
-		// The .ops sidecar went too; the row kept the op-roots.
+	if len(row.OpRoots) > 0 {
+		// The CAR matches the row, so the row's op-roots are its own, and
+		// they survive a torn or missing .ops.
 		seg.opRoots = row.OpRoots
 	}
 	if err := seg.seal(ctx, pl.meta); err != nil {

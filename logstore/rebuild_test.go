@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
@@ -832,6 +833,9 @@ func TestRecover_SealedRowDamagedCAR(t *testing.T) {
 			}
 			if _, err := os.Stat(car + ".damaged"); err != nil {
 				t.Fatalf("the damaged CAR wasn't set aside: %v", err)
+			}
+			if _, err := os.Stat(filepath.Join(catalog, fmt.Sprintf("seg-%020d.ops", seq))); !errors.Is(err, fs.ErrNotExist) {
+				t.Fatalf("the damaged segment's .ops is still there: %v", err)
 			}
 			retired, err := mem.ListRetiredSegments(ctx, blockstore.PlaneCatalog, "bk")
 			if err != nil || len(retired) != 1 || retired[0].Seq != seq {
