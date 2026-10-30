@@ -55,8 +55,9 @@ DID, and the totals over every bucket:
   dead_on_arrival_bytes  their blocks already dead when they shipped
   unmeasured_bytes       shipped segments with no dead-on-arrival figure
   local_bytes            the catalog segment files on this node's disk
-  live_bytes             blocks the bucket's root reaches (their CAR frames;
-                         the others above count whole files)
+  live_bytes             blocks the bucket's root reaches (their CAR frames,
+                         as dead_on_arrival_bytes counts; forge_bytes,
+                         unmeasured_bytes and local_bytes count whole files)
   live_blocks            how many such blocks
   missing_blocks         catalog blocks the root reaches that the walk could
                          not read; any makes live_bytes a lower bound
@@ -64,8 +65,9 @@ DID, and the totals over every bucket:
 
 The first three come from Postgres. Dead after shipping is roughly
 forge_bytes - live_bytes - dead_on_arrival_bytes: CAR headers count only in
-forge_bytes, blocks of unshipped segments count as live, and a block can count
-both as live and as dead on arrival in an older segment.
+forge_bytes, blocks of unshipped segments count as live, an unmeasured
+segment's dead-on-arrival bytes count as dead after shipping, and a block can
+count both as live and as dead on arrival in an older segment.
 
 The walk from each bucket's root reads the bucket's local catalog segments.
 A block they no longer hold, such as one of a retired segment, is read with

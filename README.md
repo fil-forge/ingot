@@ -304,7 +304,8 @@ access key the command takes from `AWS_ACCESS_KEY_ID` and
 `AWS_SECRET_ACCESS_KEY`. Without one such blocks count as missing, and so do
 those of a bucket the key may not list. Dead after shipping is then roughly
 what's left: CAR headers count only in the bytes on Forge, blocks of segments
-not yet shipped count as live, and a block can count both as live and as dead
+not yet shipped count as live, an unmeasured segment's dead-on-arrival bytes
+count as dead after shipping, and a block can count both as live and as dead
 on arrival in an older segment.
 The walk holds every segment it reads in memory, so it is for benchmark runs,
 not production nodes. A production node could not run it anyway: it holds no
