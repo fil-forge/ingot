@@ -263,6 +263,28 @@ func (m *MemStore) Delete(_ context.Context, name string) error {
 	}
 	m.uploadRegs = kept
 	// The journal cascades on the bucket too.
+	m.dropJournalLocked(name)
+	return nil
+}
+
+func (m *MemStore) EmptyRoot(_ context.Context, name string, expect cid.Cid) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.buckets[name]
+	if !ok {
+		return registry.ErrNotFound
+	}
+	if !s.Root.Equals(expect) {
+		return registry.ErrConflict
+	}
+	s.Root = cid.Undef
+	s.ForgeRoot = cid.Undef
+	m.dropJournalLocked(name)
+	return nil
+}
+
+// dropJournalLocked deletes bucket name's journal rows. m.mu must be held.
+func (m *MemStore) dropJournalLocked(name string) {
 	for seq, rows := range m.journal {
 		for k, row := range rows {
 			if row.bucket == name {
@@ -273,7 +295,6 @@ func (m *MemStore) Delete(_ context.Context, name string) error {
 			delete(m.journal, seq)
 		}
 	}
-	return nil
 }
 
 func (m *MemStore) CASRoot(ctx context.Context, name string, expect, next cid.Cid) error {
@@ -530,7 +551,7 @@ func (m *MemStore) ListSegmentBuckets(_ context.Context, plane blockstore.Plane)
 	seen := map[string]struct{}{}
 	var out []string
 	for _, r := range m.segments {
-		if r.Plane != plane {
+		if r.Plane != plane || r.RetiredAt != 0 {
 			continue
 		}
 		if _, ok := seen[r.Bucket]; ok {
@@ -550,18 +571,38 @@ func (m *MemStore) DeleteSegment(_ context.Context, plane blockstore.Plane, seq 
 	return nil
 }
 
+func (m *MemStore) RetireSegment(_ context.Context, plane blockstore.Plane, seq uint64, retiredAt int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if r, ok := m.segments[seq]; ok && r.Plane == plane && r.RetiredAt == 0 {
+		r.RetiredAt = retiredAt
+		r.OpRoots = nil
+	}
+	return nil
+}
+
 func (m *MemStore) ListSegments(_ context.Context, plane blockstore.Plane, bucket string) ([]logstore.SegmentMeta, error) {
+	return m.listSegments(plane, bucket, false), nil
+}
+
+func (m *MemStore) ListRetiredSegments(_ context.Context, plane blockstore.Plane, bucket string) ([]logstore.SegmentMeta, error) {
+	return m.listSegments(plane, bucket, true), nil
+}
+
+// listSegments returns bucket's segment rows for plane, either the unretired
+// ones or the retired ones, ordered by seq.
+func (m *MemStore) listSegments(plane blockstore.Plane, bucket string, retired bool) []logstore.SegmentMeta {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var out []logstore.SegmentMeta
 	for _, r := range m.segments {
-		if r.Plane != plane || r.Bucket != bucket {
+		if r.Plane != plane || r.Bucket != bucket || (r.RetiredAt != 0) != retired {
 			continue
 		}
 		out = append(out, *r)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Seq < out[j].Seq })
-	return out, nil
+	return out
 }
 
 func (m *MemStore) RehydrateSegment(_ context.Context, sm logstore.SegmentMeta) error {

@@ -80,7 +80,7 @@ sequenceDiagram
     F-->>S: index digest
     S->>DB: MarkSegmentShipped: shipped_at + index_digest and, same tx,<br/>forge_root_cid per op-root (guarded: only while buckets.root_cid<br/>still equals the op-root), then the segment's journal rows deleted
     Note over S: marked shipped in memory only once the stamp lands
-    Note over S: runRetention keeps the newest Retain shipped CARs,<br/>older ones retire (files unlinked, row deleted)
+    Note over S: runRetention keeps the newest Retain shipped CARs,<br/>older ones retire (files unlinked, row stamped retired_at)
 ```
 
 A batch may be empty of blocks: an MST mutation can produce a new root that
@@ -106,13 +106,19 @@ stateDiagram-v2
     [*] --> Open : createOpenSegment + InsertSegmentOpen
     Open --> Open : append (fsync, then index commit)
     Open --> Sealed : seal (hash CAR, write .idx, MarkSegmentSealed)
+    Open --> [*] : recovery, CAR missing (DeleteSegment; journal rows kept)
     Sealed --> Shipped : flush ok (MarkSegmentShipped: guarded forge_root advance, journal rows deleted)
-    Shipped --> Retired : retention past Retain (files unlinked)
-    Retired --> [*] : DeleteSegment
+    Sealed --> Retired : recovery, CAR missing (RetireSegment; journal rows kept)
+    Shipped --> Retired : retention past Retain (files unlinked, RetireSegment)
+    Retired --> [*] : DeleteBucket (ReleaseRetiredSegments, or RemoveBucketLog)
 ```
 
 - The DB `state` column holds only `open` and `sealed`. Shipped is the
-  `shipped_at` stamp (plus `index_digest`); retired is file absence.
+  `shipped_at` stamp (plus `index_digest`); retired is the `retired_at`
+  stamp, set once the files are unlinked. A retired row keeps its CAR
+  `sha256` and `index_digest`, because those blobs stay registered in the
+  bucket's space until `DeleteBucket` releases them; its op-root rows are
+  dropped. Recovery and the startup sweep read only unretired rows.
 - With `Ship=false` a segment stays sealed on disk forever: the sole source
   for local reads, with its blocks also journaled in Postgres for good, since
   nothing ships them.
@@ -133,9 +139,11 @@ stateDiagram-v2
   host's disk is also in Postgres, and in any copy of it: a standby, a
   restore. The commit share-locks the segment row and skips a shipped
   segment, and the ship locks that row before deleting, so no row outlives
-  its segment. The rows have no foreign key to the segment row, which
-  recovery deletes when the CAR is gone: they are what a lost segment is
-  rebuilt from.
+  its segment. The rows have no foreign key to the segment row. When a
+  segment's CAR is gone, recovery deletes its row if it was open and retires
+  it if it was sealed, and the journal rows are what the lost segment is
+  rebuilt from. `DeleteBucket` drops the bucket's rows in the transaction
+  that empties its root, since the empty tree needs none of them.
 - **One bucket per segment.** The log is segregated per bucket; every segment
   ships to its own bucket's Forge space, and `DeleteBucket` can quiesce and
   release exactly one bucket's registrations.
@@ -174,7 +182,8 @@ before any worker starts. Discovery keys on the CAR file:
 | `open` | present | `rebuildOpenFromDisk` (scan + truncate any torn trailing frame); then force-sealed |
 | `sealed` | present | `loadSealedFromIdx`; re-enqueue when shipping and not yet shipped (newest first; what the queue can't hold, the retry sweep ships) |
 | none | present | orphan (crashed before the row): rebuild as open + `InsertSegmentOpen`, then force-sealed |
-| present | absent | delete the row |
+| `sealed` | absent | retire the row (a crash between the unlink and the `retired_at` stamp, or a lost file) |
+| `open` | absent | delete the row |
 | — | sidecar only (`.idx`/`.ops`, no CAR) | stray; unlink |
 
 ## Configuration
@@ -207,7 +216,7 @@ builds a `uploader.CARShard` from the `Segment` accessors, calls
 
 | Where | Symbols |
 |---|---|
-| `manager.go` | `Manager` (per-bucket log, the production `blockstore.Log`): `ManagerConfig`, `OpenManager`, `AppendBatch`, `Get`, `Close`; `QuiesceBucketLog`, `ShippedSegmentDigests`, `RemoveBucketLog` (DeleteBucket's seams) |
+| `manager.go` | `Manager` (per-bucket log, the production `blockstore.Log`): `ManagerConfig`, `OpenManager`, `AppendBatch`, `Get`, `Close`; `QuiesceBucketLog`, `ReleaseRetiredSegments`, `ShippedSegmentDigests`, `RemoveBucketLog` (DeleteBucket's seams) |
 | `store.go` | `Store` (one bucket's catalog log): `Open`, `AppendBatch`, `Get`, `Close` |
 | `planelog.go` | `PlaneLog` (the pipeline): `openPlaneLog`, `Append`, `Get`, `Close`; `sealOpenIfDue`, `flushLoop`, `flushOne`, `retryUnshipped`, `runRetention`, `sealTickerLoop` |
 | `segment.go` | `Segment`: `createOpenSegment`, `append`, `seal`, `markShipped`, `retire`, `get`; `.idx`/`.ops` codecs |
