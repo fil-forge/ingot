@@ -139,9 +139,9 @@ func (pl *PlaneLog) recover(ctx context.Context) error {
 			}
 		}
 		if hasRow && row.State == StateSealed {
-			seg, err := loadSealedFromIdx(pl.dir, seq, pl.plane, row.ShippedAt, pl.logger)
+			seg, err := pl.sealedRow(ctx, seq, row.ShippedAt)
 			if err != nil {
-				return fmt.Errorf("logstore: load sealed %s seg %d: %w", pl.plane, seq, err)
+				return err
 			}
 			sealedRecovered = append(sealedRecovered, seg)
 			continue
@@ -235,6 +235,30 @@ func (pl *PlaneLog) recover(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// sealedRow loads a segment whose row is sealed. Its .idx can still be
+// missing or unreadable: one written before seal fsynced it, a partial
+// restore, a manual cleanup. The CAR holds every frame, so the segment is
+// then rebuilt from it and sealed again, which writes a fresh .idx and
+// leaves the sealed row as it is, rather than failing every bucket's start.
+func (pl *PlaneLog) sealedRow(ctx context.Context, seq uint64, shippedAt int64) (*Segment, error) {
+	seg, err := loadSealedFromIdx(pl.dir, seq, pl.plane, shippedAt, pl.logger)
+	if err == nil {
+		return seg, nil
+	}
+	pl.logger.Warn("logstore: sealed segment's .idx unreadable; rebuilding it from its CAR",
+		zap.Stringer("plane", pl.plane), zap.Uint64("seq", seq), zap.Error(err))
+	if seg, err = rebuildOpenFromDisk(pl.dir, seq, pl.plane, pl.logger); err != nil {
+		return nil, fmt.Errorf("logstore: rebuild sealed %s seg %d: %w", pl.plane, seq, err)
+	}
+	if err := seg.seal(ctx, pl.meta); err != nil {
+		return nil, fmt.Errorf("logstore: reseal %s seg %d: %w", pl.plane, seq, err)
+	}
+	if shippedAt != 0 {
+		seg.markShipped(shippedAt)
+	}
+	return seg, nil
 }
 
 // sealedFromIdx recovers a segment that finished sealing (seal writes its

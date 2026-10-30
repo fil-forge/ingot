@@ -185,7 +185,8 @@ before any worker starts. Discovery keys on the CAR file:
 |---|---|---|
 | `open` | present, with a readable `.idx` | it sealed after the point `Meta` was restored to: `loadSealedFromIdx` + `MarkSegmentSealed`; re-enqueued |
 | `open` | present, no readable `.idx` | `rebuildOpenFromDisk` (scan + truncate any torn trailing frame); then force-sealed |
-| `sealed` | present | `loadSealedFromIdx`; re-enqueue when shipping and not yet shipped (newest first; what the queue can't hold, the retry sweep ships) |
+| `sealed` | present, with a readable `.idx` | `loadSealedFromIdx`; re-enqueue when shipping and not yet shipped (newest first; what the queue can't hold, the retry sweep ships) |
+| `sealed` | present, no readable `.idx` | written before seal fsynced it, or lost to a partial restore: `rebuildOpenFromDisk`, then sealed again, which writes a fresh `.idx` and leaves the row as it is; re-enqueued if not yet shipped |
 | none | present, with a readable `.idx` | a sealed segment whose row was lost (`Meta` restored from behind the disk): `loadSealedFromIdx` + `RehydrateSegment`; re-enqueued |
 | none | present, no readable `.idx` | orphan (crashed before the row): rebuild as open + `InsertSegmentOpen`, then force-sealed |
 | `retired`, shipped | present | files left by a retire whose unlink didn't reach the disk: unlink them, keep the row |

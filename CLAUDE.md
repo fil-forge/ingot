@@ -272,7 +272,9 @@ forge-mode daemon. Two tiers:
     multipart, failed-Complete session recovery), on a small-`max_blob_size`
     config (`testdata/config-smallblob.yaml` via smelt's WithServiceConfig).
   - **`forge_*_test.go`** — forge-native behaviors on dedicated stacks:
-    provisioning (`forge_native`), delete/release (`forge_delete`), deferred
+    provisioning (`forge_native`), delete/release (`forge_delete`), the
+    catalog rebuilt from the journal after a wiped volume
+    (`forge_lost_volume`), deferred
     multipart accept (`forge_multipart_deferred`), catalog retention
     (`forge_retention`), the read-after-eviction network tier and the
     local blob budget sweeper (`forge_eviction`), and a real `aws s3 cp`

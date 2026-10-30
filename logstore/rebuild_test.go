@@ -647,6 +647,74 @@ func TestRecover_UnreadableIdx(t *testing.T) {
 	requireReadable(t, m, written)
 }
 
+// TestRecover_SealedRowWithoutIdx: a sealed row whose .idx is missing or
+// unreadable is rebuilt from its CAR rather than failing the start. A
+// shipped one isn't shipped again; an unshipped one ships.
+func TestRecover_SealedRowWithoutIdx(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		shipped bool
+		idx     []byte // nil removes the .idx
+	}{
+		{"missing, unshipped", false, nil},
+		{"missing, shipped", true, nil},
+		{"empty, unshipped", false, []byte{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			dir := t.TempDir()
+			mem := inmem.NewMemStore()
+			written := sealedSegments(t, dir, mem, 1)
+			seq := sortedSeqs(onDiskSeqs(t, dir, "bk"))[0]
+			rows, err := mem.ListSegments(ctx, blockstore.PlaneCatalog, "bk")
+			if err != nil || len(rows) != 1 || rows[0].State != logstore.StateSealed {
+				t.Fatalf("ListSegments = %+v, %v; want the one sealed row", rows, err)
+			}
+			row := rows[0]
+			row.ShippedAt, row.IndexDigest = 0, nil
+			if tc.shipped {
+				row.ShippedAt = time.Now().Unix()
+			}
+			if err := mem.RehydrateSegment(ctx, row); err != nil {
+				t.Fatalf("RehydrateSegment: %v", err)
+			}
+			idx := filepath.Join(dir, "bk", blockstore.PlaneCatalog.String(), fmt.Sprintf("seg-%020d.idx", seq))
+			if tc.idx == nil {
+				err = os.Remove(idx)
+			} else {
+				err = os.WriteFile(idx, tc.idx, 0o644)
+			}
+			if err != nil {
+				t.Fatalf("break .idx: %v", err)
+			}
+
+			ship := &shipRecorder{}
+			m, err := openRebuildManager(t, dir, mem, ship)
+			if err != nil {
+				t.Fatalf("OpenManager over a sealed row without its .idx: %v", err)
+			}
+			requireReadable(t, m, written)
+			if _, err := os.Stat(idx); err != nil {
+				t.Fatalf("no fresh .idx after the rebuild: %v", err)
+			}
+			if tc.shipped {
+				time.Sleep(200 * time.Millisecond)
+				if ship.shipped()[seq] {
+					t.Fatalf("shipped segment %d was shipped again", seq)
+				}
+				return
+			}
+			deadline := time.Now().Add(5 * time.Second)
+			for !ship.shipped()[seq] {
+				if time.Now().After(deadline) {
+					t.Fatalf("segment %d never shipped", seq)
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+		})
+	}
+}
+
 // TestRecover_SeveralOpenSegments: two row-less CARs with no .idx, both open
 // at the crash as far as recovery can tell (Meta restored from behind the
 // disk), are both rebuilt and force-sealed rather than failing the start.
