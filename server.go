@@ -181,7 +181,7 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 	// segments/<bucket>/ and ship to that bucket's Forge space); the manager
 	// stands in wherever the single global log stood.
 	log, err := logstore.OpenManager(ctx, logstore.ManagerConfig{
-		Dir:  filepath.Join(cfg.DataDir, "segments"),
+		Dir:  SegmentsDir(cfg.DataDir),
 		Meta: deps.Meta,
 		Catalog: logstore.PlaneConfig{
 			SealBytes: cfg.SealBytesCatalog,
@@ -653,6 +653,10 @@ func (s *Server) waitSweeps(ctx context.Context) error {
 	}
 }
 
+// SegmentsDir is where the daemon keeps its catalog log under dataDir: one
+// directory per bucket, as logstore.ManagerConfig.Dir describes.
+func SegmentsDir(dataDir string) string { return filepath.Join(dataDir, "segments") }
+
 // newBucketFlushFunc builds the logstore flush callback for one bucket's
 // log: it ships a sealed catalog CAR to Forge via uploader.SubmitShard,
 // then records the shard's location and every inner block's byte range
@@ -921,7 +925,7 @@ func validateServerInputs(cfg config.ServerConfig, deps ServerDeps) error {
 
 func applyServerDefaults(cfg config.ServerConfig) config.ServerConfig {
 	if cfg.Region == "" {
-		cfg.Region = "us-east-1"
+		cfg.Region = config.DefaultRegion
 	}
 	if cfg.MaxBlobSize <= 0 {
 		cfg.MaxBlobSize = msbucket.DefaultMaxBlobSize

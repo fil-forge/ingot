@@ -60,9 +60,13 @@ func ScanFile(path string) (*ScanResult, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cars: stat %s: %w", path, err)
 	}
-	size := st.Size()
+	return Scan(f, st.Size())
+}
 
-	br := bufio.NewReader(f)
+// Scan reads a CAR v1 of size bytes from r, as ScanFile reads a file: every
+// fully readable block, or those before a torn tail along with ErrTorn.
+func Scan(r io.Reader, size int64) (*ScanResult, error) {
+	br := bufio.NewReader(r)
 	headerLen, err := binary.ReadUvarint(br)
 	if err != nil {
 		return nil, fmt.Errorf("cars: read header len: %w", err)

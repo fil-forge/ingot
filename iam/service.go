@@ -351,6 +351,44 @@ func (s *Service) GetUserAccountForRequest(ctx fiber.Ctx, accessKeyStr string) (
 	return adminAccount(accessKeyStr, key), nil
 }
 
+// ErrBucketNotPermitted is AuthorizeSigned's refusal when Hilt answers that
+// the key may not act on the bucket the request addresses: the bucket is
+// unknown to it or another tenant's, or the key's permissions on it exclude
+// the request's action.
+var ErrBucketNotPermitted = errors.New("hilt/iam: the access key may not act on the bucket")
+
+// AuthorizeSigned authorizes req, an S3 request signed with the secret of
+// accessKey, by Hilt alone, and returns a proof store holding the
+// delegations Hilt issued for it, their chains completed as for a request
+// the gateway serves. It caches nothing. It is for a process other than the
+// serving daemon, such as a command reading a bucket's catalog from Forge
+// with a key its operator holds: the store goes on that work's context under
+// [reqscope.ProofStoreKey]. The store takes no part in the revocations a
+// serving daemon tracks, which such a process doesn't have.
+func (s *Service) AuthorizeSigned(ctx context.Context, req s3.Request, accessKey string) (*DelegationCache, error) {
+	keyDID, err := did.Parse(did.KeyPrefix + accessKey)
+	if err != nil {
+		return nil, fmt.Errorf("hilt/iam: access key is not a did:key identifier: %w", err)
+	}
+	_, ctr, err := s.authorizer.AuthorizeRequest(ctx, req)
+	if err != nil {
+		var named ucanerrors.Named
+		if ucanerrors.As(err, &named) {
+			switch named.Name() {
+			case hiltauth.UnknownBucketErrorName,
+				hiltauth.ForeignBucketErrorName,
+				hiltauth.BucketNotPermittedErrorName,
+				hiltauth.OperationNotPermittedErrorName:
+				return nil, fmt.Errorf("%w: %w", ErrBucketNotPermitted, err)
+			}
+		}
+		return nil, fmt.Errorf("hilt/iam: authorize request: %w", err)
+	}
+	store := NewDelegationCache(nil)
+	s.cacheProofs(ctx, store, ctr, req, keyDID)
+	return store, nil
+}
+
 // adminAccount is the gateway account an authorized request runs as. Admin so the
 // gateway's role/ACL layers defer entirely: authorization is per-request via
 // Hilt (or the local fast path), which enforces the key's permissions and
