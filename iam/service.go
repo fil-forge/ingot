@@ -360,10 +360,11 @@ var ErrBucketNotPermitted = errors.New("hilt/iam: the access key may not act on 
 // AuthorizeSigned authorizes req, an S3 request signed with the secret of
 // accessKey, by Hilt alone, and returns a proof store holding the
 // delegations Hilt issued for it, their chains completed as for a request
-// the gateway serves. It caches nothing. It is for work in the gateway's own
-// process with no request to serve, such as a command reading a bucket's
-// catalog from Forge with a key its operator holds: the store goes on that
-// work's context under [reqscope.ProofStoreKey].
+// the gateway serves. It caches nothing. It is for a process other than the
+// serving daemon, such as a command reading a bucket's catalog from Forge
+// with a key its operator holds: the store goes on that work's context under
+// [reqscope.ProofStoreKey]. The store takes no part in the revocations a
+// serving daemon tracks, which such a process doesn't have.
 func (s *Service) AuthorizeSigned(ctx context.Context, req s3.Request, accessKey string) (*DelegationCache, error) {
 	keyDID, err := did.Parse(did.KeyPrefix + accessKey)
 	if err != nil {

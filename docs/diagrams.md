@@ -124,7 +124,7 @@ flowchart TB
 
     subgraph host["host"]
         root["ingot (root)<br/>Server, Module"]
-        cmd["cmd<br/>serve, whoami, version, blake3"]
+        cmd["cmd<br/>serve, whoami, version, blake3, catalog"]
     end
 
     vgw -->|"backend.Backend"| s3f
@@ -146,6 +146,11 @@ flowchart TB
     iam --> reg
     reg --> mig
     cmd --> root
+    cmd -->|"catalog usage"| ls
+    cmd --> reg
+    cmd --> iam
+    cmd --> bs
+    cmd --> cars
     root --> vgw
     root -->|"BlockReader =<br/>Cached(Forge)"| bs
 ```
@@ -158,6 +163,8 @@ flowchart TB
 - `inmem` (test-only fakes) and `tokenstore` (empty; only the dormant login
   paths would read it) are omitted. `blockstore/locator`'s indexer-backed
   locator compiles but is never injected.
+- `cmd`'s `catalog usage` builds its own logstore walk, registry, Hilt
+  authorization and Forge reader rather than going through the server.
 - `iam` and the network tiers never import each other; they meet at
   `internal/reqscope` (the request-scoped proof store, drawn in
   [principals](#principals-and-proof-stores)).
@@ -1323,7 +1330,7 @@ listed diagrams (each diagram's `Sources:` footer names its exact files).
 | `logstore/` | logstore-pipeline, segment-states, get, block-routes, delete-bucket |
 | `uploader/`, `forgeclient/` | context, put, multipart, principals, logstore-pipeline, block-routes |
 | `iam/`, `internal/reqscope/` | principals, authorize, context |
-| `cmd/catalog.go` | principals |
+| `cmd/catalog.go` | packages, principals |
 | `bucket/`, `mst/` | version-tree, put, get |
 | `migrations/sql/` | schema, plus any state diagram naming a changed CHECK |
 | `module.go`, `server.go`, `config/` | packages, context, logstore-pipeline; `server.go` also authorize and multipart |

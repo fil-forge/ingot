@@ -54,10 +54,10 @@ GROUP_auth        += TestForgeBucketPolicy                # skips unless INGOT_I
 GROUP_CLAIMED := $(GROUP_encryption) $(GROUP_conformance) $(GROUP_uploads) $(GROUP_releases) $(GROUP_auth) TestForgeS3Compat
 
 # `rest` is the complement, so a test added to itest/ runs there rather than
-# matching no group and silently never running: LocalBlobBudget (1m21),
-# BucketEncryption (1m16), ReadAfterCatalogRetention (0m56), and
-# ReadAfterEviction, UncachedWrites, NativeProvision and DeferredMultipart at
-# ~0m50 each (~6m50 in total), and CatalogUsage (not yet timed in CI);
+# matching no group and silently never running: CatalogUsage (1m27),
+# LocalBlobBudget (1m21), BucketEncryption (1m16), ReadAfterCatalogRetention
+# (0m56), and ReadAfterEviction, UncachedWrites, NativeProvision and
+# DeferredMultipart at ~0m50 each (~8m20 in total);
 # MultipartManyParts skips unless INGOT_ITEST_MP_BENCH=1.
 GROUP_ALL  = $(filter Test%,$(shell GOWORK=off $(GO) test -tags itest -list '.*' ./itest))
 GROUP_rest = $(filter-out $(GROUP_CLAIMED),$(GROUP_ALL))

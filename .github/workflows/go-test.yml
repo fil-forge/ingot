@@ -102,7 +102,7 @@ jobs:
     # from under us. The runner's preinstalled Docker is 28.x, well past
     # smelt's 25+ requirement.
     runs-on: ubuntu-24.04
-    # The slowest group is ~7 minutes of tests on top of ~2 minutes of image
+    # The slowest group is ~10 minutes of tests on top of ~2 minutes of image
     # pulls and the working-tree ingot build. Comfortably above `make
     # itest-group`'s own -timeout 20m, so a hung test hits Go's timeout and
     # dumps goroutine stacks before the runner is cut off.
