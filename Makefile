@@ -55,10 +55,10 @@ GROUP_CLAIMED := $(GROUP_encryption) $(GROUP_conformance) $(GROUP_uploads) $(GRO
 
 # `rest` is the complement, so a test added to itest/ runs there rather than
 # matching no group and silently never running: LocalBlobBudget (1m21),
-# BucketEncryption (1m16), ReadAfterCatalogRetention (0m56), and
-# ReadAfterEviction, UncachedWrites, NativeProvision and DeferredMultipart at
-# ~0m50 each (~6m50 in total); MultipartManyParts skips unless
-# INGOT_ITEST_MP_BENCH=1.
+# BucketEncryption (1m16), RebuildAfterLostVolume (0m57),
+# ReadAfterCatalogRetention (0m56), and ReadAfterEviction, UncachedWrites,
+# NativeProvision and DeferredMultipart at ~0m50 each;
+# MultipartManyParts skips unless INGOT_ITEST_MP_BENCH=1.
 GROUP_ALL  = $(filter Test%,$(shell GOWORK=off $(GO) test -tags itest -list '.*' ./itest))
 GROUP_rest = $(filter-out $(GROUP_CLAIMED),$(GROUP_ALL))
 

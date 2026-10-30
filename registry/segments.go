@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 
+	block "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
 	"github.com/jackc/pgx/v5"
 	"github.com/multiformats/go-multihash"
@@ -285,6 +286,141 @@ func (r *Postgres) ListSegmentBuckets(ctx context.Context, plane blockstore.Plan
 		return nil, fmt.Errorf("registry: list segment buckets rows: %w", err)
 	}
 	return out, nil
+}
+
+// EnsureSegmentSeqAbove moves ingot.segment_seq past seq unless it already
+// is (logstore.Meta). Ingot calls it at startup, before its first nextval,
+// and no other process draws from the sequence, so the read and the setval
+// race nothing.
+func (r *Postgres) EnsureSegmentSeqAbove(ctx context.Context, seq uint64) error {
+	if _, err := r.pool.Exec(ctx,
+		`SELECT setval('ingot.segment_seq', $1)
+		   FROM ingot.segment_seq
+		  WHERE last_value < $1 OR (last_value = $1 AND NOT is_called)`,
+		int64(seq)); err != nil {
+		return fmt.Errorf("registry: move segment seq past %d: %w", seq, err)
+	}
+	return nil
+}
+
+func (r *Postgres) JournalBuckets(ctx context.Context) ([]string, error) {
+	// One probe of catalog_journal_bucket_seq_idx per bucket, rather than a
+	// DISTINCT over every journaled block.
+	rows, err := r.pool.Query(ctx,
+		`SELECT name FROM ingot.buckets b
+		  WHERE EXISTS (SELECT 1 FROM ingot.catalog_journal j WHERE j.bucket = b.name)
+		  ORDER BY name`)
+	if err != nil {
+		return nil, fmt.Errorf("registry: list journal buckets: %w", err)
+	}
+	out, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return nil, fmt.Errorf("registry: list journal buckets: %w", err)
+	}
+	return out, nil
+}
+
+func (r *Postgres) JournalSegments(ctx context.Context, bucket string) ([]uint64, error) {
+	rows, err := r.pool.Query(ctx,
+		`SELECT DISTINCT seq FROM ingot.catalog_journal WHERE bucket = $1 ORDER BY seq`, bucket)
+	if err != nil {
+		return nil, fmt.Errorf("registry: list journal segments of %q: %w", bucket, err)
+	}
+	seqs, err := pgx.CollectRows(rows, pgx.RowTo[int64])
+	if err != nil {
+		return nil, fmt.Errorf("registry: list journal segments of %q: %w", bucket, err)
+	}
+	out := make([]uint64, len(seqs))
+	for i, s := range seqs {
+		out[i] = uint64(s)
+	}
+	return out, nil
+}
+
+// ReadJournal pages through one segment's journaled blocks on the primary
+// key, (seq, cid) (logstore.Meta).
+func (r *Postgres) ReadJournal(ctx context.Context, seq uint64, after cid.Cid, limit int) ([]block.Block, error) {
+	afterKey := []byte{} // a nil slice would bind NULL, and cid > NULL matches nothing
+	if after.Defined() {
+		afterKey = after.Bytes()
+	}
+	rows, err := r.pool.Query(ctx,
+		`SELECT cid, data FROM ingot.catalog_journal
+		  WHERE seq = $1 AND cid > $2
+		  ORDER BY cid LIMIT $3`,
+		int64(seq), afterKey, limit)
+	if err != nil {
+		return nil, fmt.Errorf("registry: read journal of segment %d: %w", seq, err)
+	}
+	defer rows.Close()
+	var out []block.Block
+	for rows.Next() {
+		var key, data []byte
+		if err := rows.Scan(&key, &data); err != nil {
+			return nil, fmt.Errorf("registry: scan journal of segment %d: %w", seq, err)
+		}
+		c, err := cid.Cast(key)
+		if err != nil {
+			return nil, fmt.Errorf("registry: journal of segment %d: bad cid: %w", seq, err)
+		}
+		blk, err := block.NewBlockWithCid(data, c)
+		if err != nil {
+			return nil, fmt.Errorf("registry: journal of segment %d: block %s: %w", seq, c, err)
+		}
+		out = append(out, blk)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("registry: read journal of segment %d: %w", seq, err)
+	}
+	return out, nil
+}
+
+// MoveJournal re-files a range of a segment's journaled blocks under another
+// segment (logstore.Meta), keeping each row's created_at so the journal's age
+// gauge still reports how long the block has waited. It takes the bucket row
+// FOR KEY SHARE first, so a deletion or EmptyRoot holding it FOR UPDATE
+// finishes before any journal row is touched, then the target segment's row
+// FOR SHARE, as a commit journaling into it does, so a ship of the target
+// and the move wait for each other. A commit and a ship lock the segment row
+// before the bucket's, the other way round, but that can't deadlock with
+// this order: KEY SHARE conflicts only with FOR UPDATE, which neither takes.
+// A target that has shipped since takes no rows, and the source's rows go.
+func (r *Postgres) MoveJournal(ctx context.Context, bucket string, from, to uint64, first, last cid.Cid) error {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("registry: begin journal move %d→%d: %w", from, to, err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx,
+		`SELECT 1 FROM ingot.buckets WHERE name = $1 FOR KEY SHARE`, bucket); err != nil {
+		return fmt.Errorf("registry: journal move %d→%d: lock bucket: %w", from, to, err)
+	}
+	var shipped bool
+	if err := tx.QueryRow(ctx,
+		`SELECT shipped_at IS NOT NULL FROM ingot.segments WHERE seq = $1 FOR SHARE`,
+		int64(to)).Scan(&shipped); err != nil {
+		return fmt.Errorf("registry: journal move %d→%d: lock target segment: %w", from, to, err)
+	}
+	if !shipped {
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO ingot.catalog_journal (seq, bucket, cid, data, created_at)
+			 SELECT $2, bucket, cid, data, created_at FROM ingot.catalog_journal
+			  WHERE seq = $1 AND bucket = $3 AND cid >= $4 AND cid <= $5
+			 ON CONFLICT (seq, cid) DO NOTHING`,
+			int64(from), int64(to), bucket, first.Bytes(), last.Bytes()); err != nil {
+			return fmt.Errorf("registry: journal move %d→%d: copy: %w", from, to, err)
+		}
+	}
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM ingot.catalog_journal
+		  WHERE seq = $1 AND bucket = $2 AND cid >= $3 AND cid <= $4`,
+		int64(from), bucket, first.Bytes(), last.Bytes()); err != nil {
+		return fmt.Errorf("registry: journal move %d→%d: drop source: %w", from, to, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("registry: commit journal move %d→%d: %w", from, to, err)
+	}
+	return nil
 }
 
 func (r *Postgres) RehydrateSegment(ctx context.Context, m logstore.SegmentMeta) error {

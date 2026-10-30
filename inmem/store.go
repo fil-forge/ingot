@@ -14,6 +14,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"maps"
 	"net/url"
 	"slices"
 	"sort"
@@ -495,6 +496,104 @@ func (m *MemStore) NextSegmentSeq(_ context.Context) (uint64, error) {
 	defer m.mu.Unlock()
 	m.nextSeq++
 	return m.nextSeq, nil
+}
+
+func (m *MemStore) EnsureSegmentSeqAbove(_ context.Context, seq uint64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.nextSeq = max(m.nextSeq, seq)
+	return nil
+}
+
+func (m *MemStore) JournalBuckets(context.Context) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	seen := map[string]struct{}{}
+	for _, rows := range m.journal {
+		for _, row := range rows {
+			seen[row.bucket] = struct{}{}
+		}
+	}
+	return slices.Sorted(maps.Keys(seen)), nil
+}
+
+func (m *MemStore) JournalSegments(_ context.Context, bucket string) ([]uint64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []uint64
+	for seq, rows := range m.journal {
+		for _, row := range rows {
+			if row.bucket == bucket {
+				out = append(out, seq)
+				break
+			}
+		}
+	}
+	slices.Sort(out)
+	return out, nil
+}
+
+// ReadJournal pages a segment's journaled blocks in CID byte order, as the
+// Postgres primary key does (string order over the CID bytes).
+func (m *MemStore) ReadJournal(_ context.Context, seq uint64, after cid.Cid, limit int) ([]block.Block, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	afterKey := ""
+	if after.Defined() {
+		afterKey = string(after.Bytes())
+	}
+	var out []block.Block
+	for _, k := range slices.Sorted(maps.Keys(m.journal[seq])) {
+		if k <= afterKey {
+			continue
+		}
+		if len(out) == limit {
+			break
+		}
+		c, err := cid.Cast([]byte(k))
+		if err != nil {
+			return nil, err
+		}
+		blk, err := block.NewBlockWithCid(slices.Clone(m.journal[seq][k].data), c)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, blk)
+	}
+	return out, nil
+}
+
+// MoveJournal re-files a range of a segment's journaled blocks under
+// another, as the Postgres one does: a target that has shipped takes none.
+func (m *MemStore) MoveJournal(_ context.Context, bucket string, from, to uint64, first, last cid.Cid) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	target, ok := m.segments[to]
+	if !ok {
+		return fmt.Errorf("inmem: journal move %d→%d: no segment %d", from, to, to)
+	}
+	lo, hi := string(first.Bytes()), string(last.Bytes())
+	src := m.journal[from]
+	for k, row := range src {
+		if row.bucket != bucket || k < lo || k > hi {
+			continue
+		}
+		if target.ShippedAt == 0 {
+			dst := m.journal[to]
+			if dst == nil {
+				dst = map[string]journalRow{}
+				m.journal[to] = dst
+			}
+			if _, dup := dst[k]; !dup {
+				dst[k] = row
+			}
+		}
+		delete(src, k)
+	}
+	if len(src) == 0 {
+		delete(m.journal, from)
+	}
+	return nil
 }
 
 func (m *MemStore) InsertSegmentOpen(_ context.Context, plane blockstore.Plane, seq uint64, bucket string) error {

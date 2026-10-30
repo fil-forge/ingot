@@ -10,7 +10,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
+	"syscall"
 	"time"
 
 	block "github.com/ipfs/go-block-format"
@@ -544,11 +546,54 @@ func (s *Segment) writeIdx() error {
 	if err != nil {
 		return err
 	}
+	// Seal records the segment sealed right after this, and recovery fails
+	// on a sealed row whose .idx won't parse, so both the file and its
+	// rename reach the disk first.
 	tmp := s.idxPath + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	if err := writeFileSync(tmp, data); err != nil {
+		_ = os.Remove(tmp)
 		return err
 	}
-	return os.Rename(tmp, s.idxPath)
+	if err := os.Rename(tmp, s.idxPath); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return syncDir(s.dir)
+}
+
+// writeFileSync writes data to a new file at path and fsyncs it.
+func writeFileSync(path string, data []byte) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+// syncDir fsyncs a directory, so a rename into it is durable. Windows doesn't
+// support fsyncing a directory, and some filesystems reject it with EINVAL or
+// EBADF; there it is left to the filesystem, as Postgres does.
+func syncDir(dir string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	if err := d.Sync(); err != nil && !errors.Is(err, syscall.EINVAL) && !errors.Is(err, syscall.EBADF) {
+		return err
+	}
+	return nil
 }
 
 // loadSealedFromIdx hydrates a sealed Segment from its .idx sidecar and

@@ -1,9 +1,13 @@
 package registry_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -15,6 +19,7 @@ import (
 	"go.uber.org/zap/zaptest"
 
 	"github.com/fil-forge/ingot/blockstore"
+	"github.com/fil-forge/ingot/logstore"
 	"github.com/fil-forge/ingot/migrations"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/libforge/testutil"
@@ -241,6 +246,36 @@ func TestCatalogJournal_Live(t *testing.T) {
 	})
 
 	// newBucket creates a bucket with a segment open for it.
+	// openSegmentFor opens a further segment row for an existing bucket.
+	openSegmentFor := func(t *testing.T, bucket string) uint64 {
+		t.Helper()
+		seq, err := r.NextSegmentSeq(ctx)
+		if err != nil {
+			t.Fatalf("NextSegmentSeq: %v", err)
+		}
+		if err := r.InsertSegmentOpen(ctx, blockstore.PlaneCatalog, seq, bucket); err != nil {
+			t.Fatalf("InsertSegmentOpen: %v", err)
+		}
+		return seq
+	}
+	// journaledFor counts the journal rows under seg, whatever their bucket.
+	journaledFor := func(t *testing.T, seg uint64) []string {
+		t.Helper()
+		rows, err := pool.Query(ctx, `SELECT cid FROM ingot.catalog_journal WHERE seq = $1`, int64(seg))
+		if err != nil {
+			t.Fatalf("query journal: %v", err)
+		}
+		out, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (string, error) {
+			var c []byte
+			err := row.Scan(&c)
+			return string(c), err
+		})
+		if err != nil {
+			t.Fatalf("journal rows: %v", err)
+		}
+		return out
+	}
+
 	newBucket := func(t *testing.T, name string) uint64 {
 		t.Helper()
 		if err := r.Create(ctx, name, testutil.RandomDID(t), registry.CreateState{Tenant: testutil.RandomDID(t)}); err != nil {
@@ -497,6 +532,165 @@ func TestCatalogJournal_Live(t *testing.T) {
 		}
 		if err := r.EmptyRoot(ctx, "jb-missing", cid.Undef); !errors.Is(err, registry.ErrNotFound) {
 			t.Fatalf("EmptyRoot on a missing bucket = %v, want ErrNotFound", err)
+		}
+	})
+
+	// What recovery reads and writes to rebuild a lost segment from the
+	// journal: the buckets and segments the journal files blocks under, a
+	// segment's blocks paged in CID order, and a range of them moved onto the
+	// segment they were rebuilt into, keeping each row's age.
+	t.Run("rebuild reads", func(t *testing.T) {
+		seg := newBucket(t, "jb-rebuild")
+		var blocks []block.Block
+		for i := range 5 {
+			blocks = append(blocks, block.NewBlock([]byte(fmt.Sprintf("rebuild-%d", i))))
+		}
+		if err := r.CommitRoot(ctx, "jb-rebuild", cid.Undef, liveCid(t, "rebuild-root"), registry.RootCommit{
+			Journal: blockstore.Appended{Segment: seg, Blocks: blocks},
+		}); err != nil {
+			t.Fatalf("commit: %v", err)
+		}
+		buckets, err := r.JournalBuckets(ctx)
+		if err != nil || !slices.Contains(buckets, "jb-rebuild") {
+			t.Fatalf("JournalBuckets = %v (err %v), want jb-rebuild among them", buckets, err)
+		}
+		if segs, err := r.JournalSegments(ctx, "jb-rebuild"); err != nil || !slices.Equal(segs, []uint64{seg}) {
+			t.Fatalf("JournalSegments = %v (err %v), want [%d]", segs, err, seg)
+		}
+
+		var paged []string
+		for after := cid.Undef; ; {
+			page, err := r.ReadJournal(ctx, seg, after, 2)
+			if err != nil {
+				t.Fatalf("ReadJournal: %v", err)
+			}
+			for _, b := range page {
+				paged = append(paged, string(b.Cid().Bytes()))
+			}
+			if len(page) < 2 {
+				break
+			}
+			after = page[len(page)-1].Cid()
+		}
+		if len(paged) != len(blocks) || !slices.IsSorted(paged) {
+			t.Fatalf("paged %d blocks (sorted %v), want all %d in CID order", len(paged), slices.IsSorted(paged), len(blocks))
+		}
+	})
+
+	t.Run("a journal move re-files a range and keeps its age", func(t *testing.T) {
+		from := newBucket(t, "jb-move")
+		var blocks []block.Block
+		for i := range 5 {
+			blocks = append(blocks, block.NewBlock([]byte(fmt.Sprintf("move-%d", i))))
+		}
+		if err := r.CommitRoot(ctx, "jb-move", cid.Undef, liveCid(t, "move-root"), registry.RootCommit{
+			Journal: blockstore.Appended{Segment: from, Blocks: blocks},
+		}); err != nil {
+			t.Fatalf("commit: %v", err)
+		}
+		slices.SortFunc(blocks, func(a, b block.Block) int { return bytes.Compare(a.Cid().Bytes(), b.Cid().Bytes()) })
+		to := openSegmentFor(t, "jb-move")
+		var before time.Time
+		if err := pool.QueryRow(ctx, `SELECT created_at FROM ingot.catalog_journal WHERE seq = $1 AND cid = $2`,
+			int64(from), blocks[1].Cid().Bytes()).Scan(&before); err != nil {
+			t.Fatalf("read created_at: %v", err)
+		}
+
+		if err := r.MoveJournal(ctx, "jb-move", from, to, blocks[0].Cid(), blocks[2].Cid()); err != nil {
+			t.Fatalf("MoveJournal: %v", err)
+		}
+		if got := journaledFor(t, from); len(got) != 2 {
+			t.Fatalf("%d rows left under the source, want the 2 outside the range", len(got))
+		}
+		if got := journaledFor(t, to); len(got) != 3 {
+			t.Fatalf("%d rows under the target, want the 3 in the range", len(got))
+		}
+		var after time.Time
+		if err := pool.QueryRow(ctx, `SELECT created_at FROM ingot.catalog_journal WHERE seq = $1 AND cid = $2`,
+			int64(to), blocks[1].Cid().Bytes()).Scan(&after); err != nil {
+			t.Fatalf("read moved created_at: %v", err)
+		}
+		if !after.Equal(before) {
+			t.Fatalf("moved row's created_at = %v, want %v", after, before)
+		}
+
+		// A target that has shipped since takes nothing; the source still goes.
+		if err := r.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, to, time.Now().Unix(), nil, nil); err != nil {
+			t.Fatalf("MarkSegmentShipped: %v", err)
+		}
+		if err := r.MoveJournal(ctx, "jb-move", from, to, blocks[3].Cid(), blocks[4].Cid()); err != nil {
+			t.Fatalf("MoveJournal to a shipped segment: %v", err)
+		}
+		if n := len(journaledFor(t, from)) + len(journaledFor(t, to)); n != 0 {
+			t.Fatalf("%d rows left after a move onto a shipped segment, want 0", n)
+		}
+		if err := r.MoveJournal(ctx, "jb-move", from, 1<<62, blocks[0].Cid(), blocks[4].Cid()); err == nil {
+			t.Fatal("MoveJournal onto a segment with no row succeeded")
+		}
+	})
+
+	// Recovery over real Postgres: a manager opened on an empty directory
+	// rebuilds the bucket's journaled blocks into new segments, reads them,
+	// and leaves every journal row under a segment that is on disk. It opens
+	// every bucket in the database, so it runs after the subtests that need
+	// theirs as they left them.
+	t.Run("a manager over a wiped volume rebuilds from the journal", func(t *testing.T) {
+		seg := newBucket(t, "jb-wiped")
+		var blocks []block.Block
+		for i := range 300 {
+			blocks = append(blocks, block.NewBlock([]byte(fmt.Sprintf("wiped-%03d-%s", i, strings.Repeat("w", 64)))))
+		}
+		if err := r.CommitRoot(ctx, "jb-wiped", cid.Undef, liveCid(t, "wiped-root"), registry.RootCommit{
+			Journal: blockstore.Appended{Segment: seg, Blocks: blocks},
+		}); err != nil {
+			t.Fatalf("commit: %v", err)
+		}
+		dir := t.TempDir()
+		m, err := logstore.OpenManager(ctx, logstore.ManagerConfig{
+			Dir:     dir,
+			Meta:    r,
+			Catalog: logstore.PlaneConfig{SealBytes: 8 << 10, SealAge: time.Hour},
+			Logger:  zaptest.NewLogger(t),
+		})
+		if err != nil {
+			t.Fatalf("OpenManager: %v", err)
+		}
+		defer func() { _ = m.Close(ctx) }()
+		for _, b := range blocks {
+			if _, err := m.Get(ctx, b.Cid()); err != nil {
+				t.Fatalf("Get %s after the rebuild: %v", b.Cid(), err)
+			}
+		}
+		if got := journaledFor(t, seg); len(got) != 0 {
+			t.Fatalf("%d journal rows still under the lost segment", len(got))
+		}
+		segs, err := r.JournalSegments(ctx, "jb-wiped")
+		if err != nil || len(segs) < 2 {
+			t.Fatalf("journal segments after the rebuild = %v (err %v), want the rows split across rebuilt segments", segs, err)
+		}
+		for _, s := range segs {
+			if _, err := os.Stat(filepath.Join(dir, "jb-wiped", "catalog", fmt.Sprintf("seg-%020d.car", s))); err != nil {
+				t.Fatalf("journal rows under segment %d, whose CAR isn't on disk: %v", s, err)
+			}
+		}
+	})
+
+	t.Run("the segment seq moves past disk and never back", func(t *testing.T) {
+		start, err := r.NextSegmentSeq(ctx)
+		if err != nil {
+			t.Fatalf("NextSegmentSeq: %v", err)
+		}
+		if err := r.EnsureSegmentSeqAbove(ctx, start+10); err != nil {
+			t.Fatalf("EnsureSegmentSeqAbove: %v", err)
+		}
+		if next, err := r.NextSegmentSeq(ctx); err != nil || next != start+11 {
+			t.Fatalf("NextSegmentSeq after moving past %d = %d (err %v)", start+10, next, err)
+		}
+		if err := r.EnsureSegmentSeqAbove(ctx, start); err != nil {
+			t.Fatalf("EnsureSegmentSeqAbove below: %v", err)
+		}
+		if next, err := r.NextSegmentSeq(ctx); err != nil || next != start+12 {
+			t.Fatalf("NextSegmentSeq after a lower EnsureSegmentSeqAbove = %d (err %v), want %d", next, err, start+12)
 		}
 	})
 }
