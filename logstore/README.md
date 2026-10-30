@@ -74,11 +74,12 @@ sequenceDiagram
     S->>DB: MarkSegmentSealed(size, sha256, op-roots) in one tx
     S->>F: enqueueFlush (queue cap 64; a full queue leaves it to the retry sweep)
 
+    S->>FS: measure dead bytes once: walk from the last op-root through<br/>this segment's own blocks (a failure leaves it unmeasured)
     F->>F: SubmitShard: /blob/add the CAR to sprue, PUT, conclude, receipt<br/>(index publish is best-effort, space resolved via reg.Get at ship time)
     F->>DB: PutLocation(shard) + PutInclusions(every inner block)
     Note over F,DB: recorded before the shipped stamp, so retention<br/>can never retire blocks reads cannot resolve
     F-->>S: index digest
-    S->>DB: MarkSegmentShipped: shipped_at + index_digest and, same tx,<br/>forge_root_cid per op-root (guarded: only while buckets.root_cid<br/>still equals the op-root), then the segment's journal rows deleted
+    S->>DB: MarkSegmentShipped: shipped_at + index_digest + dead_bytes and, same tx,<br/>forge_root_cid per op-root (guarded: only while buckets.root_cid<br/>still equals the op-root), then the segment's journal rows deleted
     Note over S: marked shipped in memory only once the stamp lands
     Note over S: runRetention keeps the newest Retain shipped CARs,<br/>older ones retire (files unlinked, row stamped retired_at)
 ```
@@ -99,6 +100,17 @@ A segment whose ship landed but whose stamp didn't is shipped again by the sweep
 while segments were queued has nowhere to ship, so the closure returns nil and
 the segment marks shipped and retires.
 
+Before a segment's first ship attempt, its flush worker measures how much of
+it is already dead (`Segment.deadOnArrival`): the bytes of the CAR frames
+holding blocks the segment's last op-root no longer reaches, following links
+only through the segment's own blocks. These are blocks superseded within the
+segment's lifetime, mostly MST interior nodes that later writes rewrote. A
+sealed segment never changes, so it is measured once and a retried ship reuses
+the figure. The stamp records it as `dead_bytes`, which the catalog usage
+gauges (`ingot.catalog.*`) sum per bucket. It is NULL when the segment couldn't
+be measured: the walk failed, or the segment holds blocks but no op-root to
+walk from.
+
 ## Segment lifecycle
 
 ```mermaid
@@ -114,11 +126,11 @@ stateDiagram-v2
 ```
 
 - The DB `state` column holds only `open` and `sealed`. Shipped is the
-  `shipped_at` stamp (plus `index_digest`); retired is the `retired_at`
-  stamp, set once the files are unlinked. A retired row keeps its CAR
-  `sha256` and `index_digest`, because those blobs stay registered in the
-  bucket's space until `DeleteBucket` releases them; its op-root rows are
-  dropped. Recovery and the startup sweep read only unretired rows.
+  `shipped_at` stamp (plus `index_digest` and `dead_bytes`); retired is the
+  `retired_at` stamp, set once the files are unlinked. A retired row keeps
+  its CAR `sha256` and `index_digest`, because those blobs stay registered
+  in the bucket's space until `DeleteBucket` releases them; its op-root rows
+  are dropped. Recovery and the startup sweep read only unretired rows.
 - With `Ship=false` a segment stays sealed on disk forever: the sole source
   for local reads, with its blocks also journaled in Postgres for good, since
   nothing ships them.
@@ -220,6 +232,7 @@ builds a `uploader.CARShard` from the `Segment` accessors, calls
 | `store.go` | `Store` (one bucket's catalog log): `Open`, `AppendBatch`, `Get`, `Close` |
 | `planelog.go` | `PlaneLog` (the pipeline): `openPlaneLog`, `Append`, `Get`, `Close`; `sealOpenIfDue`, `flushLoop`, `flushOne`, `retryUnshipped`, `runRetention`, `sealTickerLoop` |
 | `segment.go` | `Segment`: `createOpenSegment`, `append`, `seal`, `markShipped`, `retire`, `get`; `.idx`/`.ops` codecs |
+| `dead.go` | `(*Segment).deadOnArrival` / `deadBytes` (the dead-on-arrival walk the ship records) |
 | `recovery.go` | `(*PlaneLog).recover` (disk vs `Meta` reconciliation for one bucket store) |
 | `types.go` | `State`, `SegmentMeta`, `Meta` |
 | `config.go` | `Config`, `PlaneConfig`, `FlushFunc` |

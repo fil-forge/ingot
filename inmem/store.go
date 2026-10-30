@@ -523,12 +523,13 @@ func (m *MemStore) MarkSegmentSealed(_ context.Context, plane blockstore.Plane, 
 	return nil
 }
 
-func (m *MemStore) MarkSegmentShipped(_ context.Context, plane blockstore.Plane, seq uint64, shippedAt int64, indexDigest multihash.Multihash, opRoots []blockstore.OpRoot) error {
+func (m *MemStore) MarkSegmentShipped(_ context.Context, plane blockstore.Plane, seq uint64, shippedAt int64, indexDigest multihash.Multihash, deadBytes int64, opRoots []blockstore.OpRoot) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if r, ok := m.segments[seq]; ok {
 		r.ShippedAt = shippedAt
 		r.IndexDigest = slices.Clone(indexDigest)
+		r.DeadBytes = deadBytes
 	}
 	// The segment's journaled blocks are on Forge now.
 	delete(m.journal, seq)
@@ -543,6 +544,41 @@ func (m *MemStore) MarkSegmentShipped(_ context.Context, plane blockstore.Plane,
 		}
 	}
 	return nil
+}
+
+// CatalogUsage sums each bucket's shipped catalog segments, retired ones
+// included, as the Postgres query does: those whose ship registered blobs
+// (IndexDigest set), with a negative DeadBytes counting as unmeasured.
+func (m *MemStore) CatalogUsage(_ context.Context) ([]registry.CatalogUsage, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	byBucket := map[string]*registry.CatalogUsage{}
+	for _, r := range m.segments {
+		if r.Plane != blockstore.PlaneCatalog || r.IndexDigest == nil {
+			continue
+		}
+		b, ok := m.buckets[r.Bucket]
+		if !ok {
+			continue
+		}
+		u, ok := byBucket[r.Bucket]
+		if !ok {
+			u = &registry.CatalogUsage{Bucket: r.Bucket, Space: b.Space}
+			byBucket[r.Bucket] = u
+		}
+		u.Bytes += r.Size
+		if r.DeadBytes < 0 {
+			u.UnmeasuredBytes += r.Size
+		} else {
+			u.DeadOnArrivalBytes += r.DeadBytes
+		}
+	}
+	out := make([]registry.CatalogUsage, 0, len(byBucket))
+	for _, u := range byBucket {
+		out = append(out, *u)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Bucket < out[j].Bucket })
+	return out, nil
 }
 
 func (m *MemStore) ListSegmentBuckets(_ context.Context, plane blockstore.Plane) ([]string, error) {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/fil-forge/ucantone/did"
 	"github.com/ipfs/go-cid"
 	"github.com/jackc/pgx/v5"
 	"github.com/multiformats/go-multihash"
@@ -68,7 +69,7 @@ func (r *Postgres) MarkSegmentSealed(ctx context.Context, plane blockstore.Plane
 	return nil
 }
 
-func (r *Postgres) MarkSegmentShipped(ctx context.Context, plane blockstore.Plane, seq uint64, shippedAt int64, indexDigest multihash.Multihash, opRoots []blockstore.OpRoot) error {
+func (r *Postgres) MarkSegmentShipped(ctx context.Context, plane blockstore.Plane, seq uint64, shippedAt int64, indexDigest multihash.Multihash, deadBytes int64, opRoots []blockstore.OpRoot) error {
 	// Only the catalog plane ships: stamp shipped_at AND advance forge_root_cid
 	// for every op-root in this segment, atomically.
 	tx, err := r.pool.Begin(ctx)
@@ -77,10 +78,15 @@ func (r *Postgres) MarkSegmentShipped(ctx context.Context, plane blockstore.Plan
 	}
 	defer tx.Rollback(ctx)
 
+	// An unmeasured segment's dead_bytes stays NULL.
+	var dead *int64
+	if deadBytes >= 0 {
+		dead = &deadBytes
+	}
 	tag, err := tx.Exec(ctx,
-		`UPDATE ingot.segments SET shipped_at = $2, index_digest = $3
+		`UPDATE ingot.segments SET shipped_at = $2, index_digest = $3, dead_bytes = $4
 		 WHERE seq = $1 AND plane = 'catalog' AND shipped_at IS NULL`,
-		int64(seq), shippedAt, indexDigest)
+		int64(seq), shippedAt, indexDigest, dead)
 	if err != nil {
 		return fmt.Errorf("registry: mark catalog shipped %d: %w", seq, err)
 	}
@@ -214,7 +220,7 @@ func (r *Postgres) listSegments(ctx context.Context, plane blockstore.Plane, buc
 	}
 	rows, err := r.pool.Query(ctx,
 		`SELECT seq, state, COALESCE(sealed_at, 0), size_bytes, sha256, COALESCE(shipped_at, 0), index_digest,
-		        COALESCE(retired_at, 0)
+		        COALESCE(retired_at, 0), COALESCE(dead_bytes, -1)
 		   FROM ingot.segments
 		  WHERE plane = $1 AND bucket = $2 AND `+which+`
 		  ORDER BY seq ASC`,
@@ -235,8 +241,9 @@ func (r *Postgres) listSegments(ctx context.Context, plane blockstore.Plane, buc
 			shippedAt   int64
 			indexDigest multihash.Multihash
 			retiredAt   int64
+			deadBytes   int64
 		)
-		if err := rows.Scan(&seqInt, &stateS, &sealed, &size, &sha, &shippedAt, &indexDigest, &retiredAt); err != nil {
+		if err := rows.Scan(&seqInt, &stateS, &sealed, &size, &sha, &shippedAt, &indexDigest, &retiredAt, &deadBytes); err != nil {
 			return nil, fmt.Errorf("registry: scan segment: %w", err)
 		}
 		state, ok := logstore.ParseState(stateS)
@@ -253,6 +260,7 @@ func (r *Postgres) listSegments(ctx context.Context, plane blockstore.Plane, buc
 			SHA256:      sha,
 			ShippedAt:   shippedAt,
 			IndexDigest: indexDigest,
+			DeadBytes:   deadBytes,
 			RetiredAt:   retiredAt,
 		})
 	}
@@ -314,6 +322,61 @@ func (r *Postgres) RehydrateSegment(ctx context.Context, m logstore.SegmentMeta)
 		return fmt.Errorf("registry: rehydrate commit %d: %w", m.Seq, err)
 	}
 	return nil
+}
+
+// CatalogUsage sums each bucket's shipped catalog segments: those whose
+// ship registered blobs in its space (index_digest is set exactly then),
+// retired ones included, since their CARs stay on Forge until DeleteBucket
+// releases them.
+//
+// Cost: one sequential scan of ingot.segments per call. No index narrows a
+// sum over every shipped row: segments_unretired_idx leaves out the retired
+// rows, which are nearly all of them, and segments_bucket_idx would only
+// trade the scan for a random heap read per row. The scan is hash-aggregated
+// by bucket, and only the per-bucket sums meet ingot.buckets. Postgres reads
+// a table larger than a quarter of shared_buffers through a small ring
+// buffer, so the scan doesn't push the working set out.
+// Rows accumulate until DeleteBucket, one per sealed segment: at most one per
+// bucket per SealAge (17,280 a day for a bucket written without pause at the
+// 5s default), about 175 bytes of heap each. A million rows took about 0.4s
+// on one core of Postgres 16 (0.17s with two parallel workers), so this runs
+// from a five-minute sweep (Server's catalog usage sweeper), never per
+// metrics collection.
+func (r *Postgres) CatalogUsage(ctx context.Context) ([]CatalogUsage, error) {
+	rows, err := r.pool.Query(ctx,
+		`SELECT b.name, b.space, s.bytes, s.dead, s.unmeasured
+		   FROM (SELECT bucket,
+		                SUM(size_bytes)::bigint AS bytes,
+		                COALESCE(SUM(dead_bytes), 0)::bigint AS dead,
+		                COALESCE(SUM(size_bytes) FILTER (WHERE dead_bytes IS NULL), 0)::bigint AS unmeasured
+		           FROM ingot.segments
+		          WHERE plane = 'catalog' AND index_digest IS NOT NULL
+		          GROUP BY bucket) s
+		   JOIN ingot.buckets b ON b.name = s.bucket
+		  ORDER BY b.name`)
+	if err != nil {
+		return nil, fmt.Errorf("registry: catalog usage: %w", err)
+	}
+	defer rows.Close()
+
+	var out []CatalogUsage
+	for rows.Next() {
+		var (
+			u        CatalogUsage
+			spaceStr string
+		)
+		if err := rows.Scan(&u.Bucket, &spaceStr, &u.Bytes, &u.DeadOnArrivalBytes, &u.UnmeasuredBytes); err != nil {
+			return nil, fmt.Errorf("registry: scan catalog usage: %w", err)
+		}
+		if u.Space, err = did.Parse(spaceStr); err != nil {
+			return nil, fmt.Errorf("registry: parse space %q of bucket %q: %w", spaceStr, u.Bucket, err)
+		}
+		out = append(out, u)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("registry: catalog usage rows: %w", err)
+	}
+	return out, nil
 }
 
 // nullableInt maps a zero timestamp to SQL NULL.

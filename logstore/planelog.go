@@ -370,15 +370,15 @@ func (pl *PlaneLog) retryUnshipped() {
 
 // flushOne ships one sealed segment, trying up to maxAttempts times with
 // backoff, and reports whether it is shipped. On success it stamps the ship
-// state in Meta (which advances forge_root_cid for the catalog plane and
-// drops the segment's journaled blocks), then in memory, and runs the
-// retention sweep. A failed stamp is retried without shipping again within
-// the call, and the segment counts as shipped only once it lands: retention
-// retires shipped segments, and a retired segment whose stamp never landed
-// would leave its journal rows behind for good. A later call (the retry
-// sweep's, or recovery's at the next start) ships it again. A segment
-// already shipped, as one still queued after the retry sweep shipped it is,
-// is left alone.
+// state in Meta, with the segment's dead-on-arrival bytes (the stamp also
+// advances forge_root_cid for the catalog plane and drops the segment's
+// journaled blocks), then in memory, and runs the retention sweep. A failed
+// stamp is retried without shipping again within the call, and the segment
+// counts as shipped only once it lands: retention retires shipped segments,
+// and a retired segment whose stamp never landed would leave its journal
+// rows behind for good. A later call (the retry sweep's, or recovery's at
+// the next start) ships it again. A segment already shipped, as one still
+// queued after the retry sweep shipped it is, is left alone.
 func (pl *PlaneLog) flushOne(seg *Segment, maxAttempts int) bool {
 	if seg.IsShipped() || seg.IsRetired() {
 		return true
@@ -390,6 +390,12 @@ func (pl *PlaneLog) flushOne(seg *Segment, maxAttempts int) bool {
 	)
 	defer span.End()
 	backoff := shipBackoff
+
+	// What the segment holds that is already dead is measured from its local
+	// files before it ships, and recorded with the stamp; a failure only
+	// leaves it unmeasured.
+	deadBytes := seg.deadOnArrival()
+	span.SetAttributes(attribute.Int64("ingot.log.dead_bytes", deadBytes))
 
 	var (
 		flushed     bool
@@ -409,7 +415,7 @@ func (pl *PlaneLog) flushOne(seg *Segment, maxAttempts int) bool {
 				zap.Stringer("plane", pl.plane), zap.Uint64("seq", seg.Seq()),
 				zap.Int("attempt", attempt), zap.Error(err))
 		} else {
-			if err = pl.meta.MarkSegmentShipped(ctx, pl.plane, seg.Seq(), shippedAt, indexDigest, seg.OpRoots()); err == nil {
+			if err = pl.meta.MarkSegmentShipped(ctx, pl.plane, seg.Seq(), shippedAt, indexDigest, deadBytes, seg.OpRoots()); err == nil {
 				seg.markShipped(shippedAt)
 				pl.runRetention(ctx)
 				return true

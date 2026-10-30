@@ -69,6 +69,11 @@ type Segment struct {
 	// segment only, closed at seal).
 	opRoots []blockstore.OpRoot
 	opsFD   *os.File
+
+	// deadOnce guards dead, the segment's dead-on-arrival bytes as its first
+	// ship attempt measured them (-1: not measurable). See deadOnArrival.
+	deadOnce sync.Once
+	dead     int64
 }
 
 // hasOps reports whether this segment maintains an .ops sidecar (catalog

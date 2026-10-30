@@ -69,7 +69,7 @@ func TestCatalogJournal(t *testing.T) {
 
 	// Shipping the segment drops its rows, and a commit landing in it
 	// afterwards journals nothing: its blocks are on Forge.
-	if err := m.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, 1, 1, nil, nil); err != nil {
+	if err := m.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, 1, 1, nil, -1, nil); err != nil {
 		t.Fatalf("MarkSegmentShipped: %v", err)
 	}
 	if got := m.JournaledBlocks(1); len(got) != 0 {

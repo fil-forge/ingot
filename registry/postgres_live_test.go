@@ -8,6 +8,7 @@ import (
 	"os"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 	"go.uber.org/zap/zaptest"
 
 	"github.com/fil-forge/ingot/blockstore"
+	"github.com/fil-forge/ingot/logstore"
 	"github.com/fil-forge/ingot/migrations"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/libforge/testutil"
@@ -940,7 +942,7 @@ func TestPostgresStores_Live(t *testing.T) {
 		}
 		// Ship a segment whose op-roots include a stale root the bucket never
 		// adopted; only the committed root may advance forge_root.
-		if err := r.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seq, time.Now().Unix(), nil,
+		if err := r.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seq, time.Now().Unix(), nil, -1,
 			[]blockstore.OpRoot{{Bucket: "fg", Root: stale}, {Bucket: "fg", Root: committed}}); err != nil {
 			t.Fatalf("MarkSegmentShipped: %v", err)
 		}
@@ -970,7 +972,7 @@ func TestPostgresStores_Live(t *testing.T) {
 			[]blockstore.OpRoot{{Bucket: bucket, Root: liveCid(t, "rt-root")}}); err != nil {
 			t.Fatalf("MarkSegmentSealed: %v", err)
 		}
-		if err := r.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seq, now, indexDigest, nil); err != nil {
+		if err := r.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seq, now, indexDigest, 7, nil); err != nil {
 			t.Fatalf("MarkSegmentShipped: %v", err)
 		}
 		for range 2 { // idempotent
@@ -988,7 +990,7 @@ func TestPostgresStores_Live(t *testing.T) {
 			t.Fatalf("ListRetiredSegments = %+v (err %v), want one row", retired, err)
 		}
 		got := retired[0]
-		if got.Seq != seq || got.RetiredAt != now || got.ShippedAt != now ||
+		if got.Seq != seq || got.RetiredAt != now || got.ShippedAt != now || got.DeadBytes != 7 ||
 			!bytes.Equal(got.SHA256, sha) || !bytes.Equal(got.IndexDigest, indexDigest) {
 			t.Fatalf("retired row = %+v", got)
 		}
@@ -1010,6 +1012,77 @@ func TestPostgresStores_Live(t *testing.T) {
 		}
 		if retired, err := r.ListRetiredSegments(ctx, blockstore.PlaneCatalog, bucket); err != nil || len(retired) != 0 {
 			t.Fatalf("ListRetiredSegments after delete = %+v (err %v)", retired, err)
+		}
+	})
+
+	t.Run("catalog usage sums shipped segments", func(t *testing.T) {
+		bucket := fmt.Sprintf("cu-%d", time.Now().UnixNano())
+		space := seedBucket(t, bucket)
+		// segment records a sealed segment of bucket b, ships it unless
+		// dead is nil, and retires it if asked; it returns the seq.
+		segment := func(b string, size int64, dead *int64, indexDigest multihash.Multihash, retire bool) uint64 {
+			t.Helper()
+			seq, err := r.NextSegmentSeq(ctx)
+			if err != nil {
+				t.Fatalf("NextSegmentSeq: %v", err)
+			}
+			if err := r.InsertSegmentOpen(ctx, blockstore.PlaneCatalog, seq, b); err != nil {
+				t.Fatalf("InsertSegmentOpen: %v", err)
+			}
+			if err := r.MarkSegmentSealed(ctx, blockstore.PlaneCatalog, seq, 1, size, nil, nil); err != nil {
+				t.Fatalf("MarkSegmentSealed: %v", err)
+			}
+			if dead != nil {
+				if err := r.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seq, 2, indexDigest, *dead, nil); err != nil {
+					t.Fatalf("MarkSegmentShipped: %v", err)
+				}
+			}
+			if retire {
+				if err := r.RetireSegment(ctx, blockstore.PlaneCatalog, seq, 3); err != nil {
+					t.Fatalf("RetireSegment: %v", err)
+				}
+			}
+			return seq
+		}
+		dead := func(n int64) *int64 { return &n }
+		segment(bucket, 1000, dead(300), digest, false)
+		unmeasured := segment(bucket, 500, dead(-1), digest, false)
+		segment(bucket, 2000, dead(900), digest, true) // retired: its CAR is still on Forge
+		segment(bucket, 59, dead(0), nil, false)       // shipped without registering anything
+		segment(bucket, 700, nil, nil, false)          // not shipped
+		// Rows of a bucket with no row of its own are nobody's usage.
+		orphan := bucket + "-orphan"
+		segment(orphan, 4000, dead(0), digest, false)
+
+		usage, err := r.CatalogUsage(ctx)
+		if err != nil {
+			t.Fatalf("CatalogUsage: %v", err)
+		}
+		want := registry.CatalogUsage{Bucket: bucket, Space: space, Bytes: 3500, DeadOnArrivalBytes: 1200, UnmeasuredBytes: 500}
+		i := slices.IndexFunc(usage, func(u registry.CatalogUsage) bool { return u.Bucket == bucket })
+		if i < 0 || usage[i] != want {
+			t.Fatalf("CatalogUsage = %+v, want an entry %+v", usage, want)
+		}
+		if slices.ContainsFunc(usage, func(u registry.CatalogUsage) bool { return u.Bucket == orphan }) {
+			t.Fatalf("CatalogUsage = %+v, lists %q, which has no bucket row", usage, orphan)
+		}
+		if !slices.IsSortedFunc(usage, func(a, b registry.CatalogUsage) int { return strings.Compare(a.Bucket, b.Bucket) }) {
+			t.Fatalf("CatalogUsage = %+v, not ordered by bucket", usage)
+		}
+
+		// An unmeasured segment's dead_bytes is NULL, read back as -1.
+		segs, err := r.ListSegments(ctx, blockstore.PlaneCatalog, bucket)
+		if err != nil {
+			t.Fatalf("ListSegments: %v", err)
+		}
+		j := slices.IndexFunc(segs, func(m logstore.SegmentMeta) bool { return m.Seq == unmeasured })
+		if j < 0 || segs[j].DeadBytes != -1 {
+			t.Fatalf("ListSegments = %+v, want seq %d with DeadBytes -1", segs, unmeasured)
+		}
+		var isNull bool
+		if err := pool.QueryRow(ctx, `SELECT dead_bytes IS NULL FROM ingot.segments WHERE seq = $1`,
+			int64(unmeasured)).Scan(&isNull); err != nil || !isNull {
+			t.Fatalf("unmeasured segment's dead_bytes IS NULL = %v (err %v), want true", isNull, err)
 		}
 	})
 }

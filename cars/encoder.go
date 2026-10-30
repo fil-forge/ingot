@@ -158,6 +158,14 @@ func writeMapKey(cw *cbg.CborWriter, key string) error {
 	return err
 }
 
+// FrameSize returns the bytes the frame for a block of dataLen bytes under c
+// takes in a CAR: its varint length, the CID bytes and the data.
+func FrameSize(c cid.Cid, dataLen uint64) int64 {
+	frameLen := uint64(c.ByteLen()) + dataLen
+	var buf [binary.MaxVarintLen64]byte
+	return int64(binary.PutUvarint(buf[:], frameLen)) + int64(frameLen)
+}
+
 // writeBlock emits one frame and returns the position of the block's
 // payload (post-CID-prefix bytes) within the surrounding CAR.
 func writeBlock(cw *countingWriter, blk block.Block) (BlockPosition, error) {

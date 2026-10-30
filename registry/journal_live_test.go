@@ -124,7 +124,7 @@ func TestCatalogJournal_Live(t *testing.T) {
 			t.Fatalf("journal after a refused commit = %v, want the 2 blocks", got)
 		}
 
-		if err := r.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seg, time.Now().Unix(), nil, nil); err != nil {
+		if err := r.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seg, time.Now().Unix(), nil, -1, nil); err != nil {
 			t.Fatalf("MarkSegmentShipped: %v", err)
 		}
 		if got := journaled(t, seg); len(got) != 0 {
@@ -210,7 +210,7 @@ func TestCatalogJournal_Live(t *testing.T) {
 
 		shipDone := make(chan error, 1)
 		go func() {
-			shipDone <- r.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seg, time.Now().Unix(), nil,
+			shipDone <- r.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seg, time.Now().Unix(), nil, -1,
 				[]blockstore.OpRoot{{Bucket: "jb", Root: st.Root}, {Bucket: "jb", Root: next}})
 		}()
 		waitForLockWaiters(t, pool, 2)
@@ -296,7 +296,7 @@ func TestCatalogJournal_Live(t *testing.T) {
 
 		shipDone := make(chan error, 1)
 		go func() {
-			shipDone <- r.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seg, time.Now().Unix(), nil,
+			shipDone <- r.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seg, time.Now().Unix(), nil, -1,
 				[]blockstore.OpRoot{{Bucket: "jb-del", Root: root}})
 		}()
 		waitForLockWaiters(t, pool, 1)
@@ -350,7 +350,7 @@ func TestCatalogJournal_Live(t *testing.T) {
 
 		shipDone := make(chan error, 1)
 		go func() {
-			shipDone <- r.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seg, time.Now().Unix(), nil,
+			shipDone <- r.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seg, time.Now().Unix(), nil, -1,
 				[]blockstore.OpRoot{{Bucket: "jb-stale", Root: old}})
 		}()
 		waitForLockWaiters(t, pool, 1)
@@ -408,7 +408,7 @@ func TestCatalogJournal_Live(t *testing.T) {
 
 		shipDone := make(chan error, 1)
 		go func() {
-			shipDone <- r.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seg, time.Now().Unix(), nil,
+			shipDone <- r.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seg, time.Now().Unix(), nil, -1,
 				[]blockstore.OpRoot{{Bucket: "jb-emptying", Root: old}})
 		}()
 		if q := waitForLockedQuery(t, pool, "%FOR KEY SHARE%", "DELETE FROM ingot.catalog_journal WHERE seq%"); !strings.Contains(q, "FOR KEY SHARE") {

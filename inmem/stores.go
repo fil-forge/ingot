@@ -27,6 +27,7 @@ var (
 	_ registry.InclusionStore        = (*MemStore)(nil)
 	_ registry.MultipartStore        = (*MemStore)(nil)
 	_ registry.GCStore               = (*MemStore)(nil)
+	_ registry.CatalogUsageStore     = (*MemStore)(nil)
 	_ registry.RevocationCursorStore = (*MemStore)(nil)
 	_ registry.PendingReleaseStore   = (*MemStore)(nil)
 )

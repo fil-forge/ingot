@@ -142,6 +142,12 @@ type Backend struct {
 	// journalGauges is the registration of the catalog journal gauges (nil
 	// when not registered).
 	journalGauges metric.Registration
+	// catalogUsage reports each bucket's catalog storage on Forge (nil: no
+	// catalog usage gauges). catalogSnapshot is its latest report, which the
+	// gauges registered as catalogGauges read.
+	catalogUsage    registry.CatalogUsageStore
+	catalogSnapshot atomic.Pointer[[]registry.CatalogUsage]
+	catalogGauges   metric.Registration
 	// regionKeys unwraps region-wrapped CEKs for the decrypting read path.
 	regionKeys regionkey.Provider
 	// tenantKeys yields the tenant wrap key each write encrypts to (the FEE
@@ -272,6 +278,11 @@ type Deps struct {
 	// until a host installs one.
 	MeterProvider metric.MeterProvider
 
+	// CatalogUsage, when set, is what the catalog usage gauges report each
+	// bucket's catalog storage on Forge from, refreshed by
+	// RefreshCatalogUsage. Typically the same instance as Registry.
+	CatalogUsage registry.CatalogUsageStore
+
 	// MaxBlobSize is the coarse-split blob ceiling (0 → bucket default).
 	MaxBlobSize int64
 
@@ -358,6 +369,7 @@ func New(d Deps) *Backend {
 		allowNoneEncryption: d.AllowNoneEncryption,
 		rehashBudget:        cmp.Or(d.RehashBudget, DefaultRehashBudget),
 		cors:                corsDoc,
+		catalogUsage:        d.CatalogUsage,
 	}
 	mp := d.MeterProvider
 	if mp == nil {
@@ -366,6 +378,7 @@ func New(d Deps) *Backend {
 	b.localBlobMetrics, b.localBlobGauges = newLocalBlobMetrics(mp, b, logger)
 	b.multipartMetrics, b.multipartGauges = newMultipartMetrics(mp, b, logger)
 	b.journalGauges = newJournalGauges(mp, b, logger)
+	b.catalogGauges = newCatalogUsageGauges(mp, b, logger)
 	return b
 }
 
