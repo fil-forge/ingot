@@ -1,6 +1,7 @@
 package logstore
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -23,6 +24,8 @@ import (
 // re-enqueues anything still pending ship. Discovery keys on the CAR
 // file. Reconciliation per seq:
 //   - row sealed  → load from .idx; re-enqueue when shipping & not shipped.
+//     With no readable .idx, rebuild from a CAR that matches the row and
+//     seal again; set aside one that doesn't, and recover it as a lost file.
 //   - row open or no row, .idx present → the segment finished sealing but
 //     Meta was restored from behind the disk: load from .idx, bring the row
 //     up to it (MarkSegmentSealed, or RehydrateSegment when missing),
@@ -117,6 +120,23 @@ func (pl *PlaneLog) recover(ctx context.Context) error {
 		return retiredShipped[seq], nil
 	}
 
+	// Whether the journal still files blocks under a seq; read only when a
+	// sealed segment's CAR turns out damaged.
+	var journaledSeqs map[uint64]bool
+	isJournaled := func(seq uint64) (bool, error) {
+		if journaledSeqs == nil {
+			seqs, err := pl.meta.JournalSegments(ctx, pl.bucket)
+			if err != nil {
+				return false, fmt.Errorf("logstore: list journaled segments for %q: %w", pl.bucket, err)
+			}
+			journaledSeqs = make(map[uint64]bool, len(seqs))
+			for _, s := range seqs {
+				journaledSeqs[s] = true
+			}
+		}
+		return journaledSeqs[seq], nil
+	}
+
 	var (
 		sealedRecovered []*Segment
 		opens           []*Segment
@@ -139,9 +159,14 @@ func (pl *PlaneLog) recover(ctx context.Context) error {
 			}
 		}
 		if hasRow && row.State == StateSealed {
-			seg, err := pl.sealedRow(ctx, seq, row.ShippedAt)
+			seg, err := pl.sealedRow(ctx, row, isJournaled)
 			if err != nil {
 				return err
+			}
+			if seg == nil {
+				// Damaged and set aside: recovered below like a lost file.
+				delete(carPresent, seq)
+				continue
 			}
 			sealedRecovered = append(sealedRecovered, seg)
 			continue
@@ -239,26 +264,81 @@ func (pl *PlaneLog) recover(ctx context.Context) error {
 
 // sealedRow loads a segment whose row is sealed. Its .idx can still be
 // missing or unreadable: one written before seal fsynced it, a partial
-// restore, a manual cleanup. The CAR holds every frame, so the segment is
-// then rebuilt from it and sealed again, which writes a fresh .idx and
-// leaves the sealed row as it is, rather than failing every bucket's start.
-func (pl *PlaneLog) sealedRow(ctx context.Context, seq uint64, shippedAt int64) (*Segment, error) {
-	seg, err := loadSealedFromIdx(pl.dir, seq, pl.plane, shippedAt, pl.logger)
+// restore, a manual cleanup. A CAR that still matches the row's size and
+// sha256 holds every frame, so the segment is then rebuilt from it and sealed
+// again, which writes a fresh .idx and leaves the sealed row as it is.
+//
+// A CAR that doesn't match is damaged: its frames were all fsynced and
+// journaled when it sealed, so a short tail is not a torn append, and
+// rebuilding it would ship a segment missing blocks and drop their journal
+// rows with the ship. It is renamed aside and sealedRow returns nil, so the
+// caller treats the CAR as gone: the journal rebuilds an unshipped
+// segment's blocks, and a shipped one's are on Forge. An unshipped segment
+// the journal holds nothing for (one sealed before the journal existed) fails
+// the start instead, leaving the file as it is.
+func (pl *PlaneLog) sealedRow(ctx context.Context, row SegmentMeta, journaled func(seq uint64) (bool, error)) (*Segment, error) {
+	seq := row.Seq
+	seg, err := loadSealedFromIdx(pl.dir, seq, pl.plane, row.ShippedAt, pl.logger)
 	if err == nil {
 		return seg, nil
+	}
+	carPath := filepath.Join(pl.dir, carName(seq))
+	intact, ierr := carMatchesRow(carPath, row)
+	if ierr != nil {
+		return nil, fmt.Errorf("logstore: check sealed %s seg %d: %w", pl.plane, seq, ierr)
+	}
+	if !intact {
+		if row.ShippedAt == 0 {
+			ok, jerr := journaled(seq)
+			if jerr != nil {
+				return nil, jerr
+			}
+			if !ok {
+				return nil, fmt.Errorf("logstore: sealed %s seg %d: .idx unreadable (%w) and the CAR doesn't match its row, with nothing journaled to rebuild it from", pl.plane, seq, err)
+			}
+		}
+		aside := carPath + ".damaged"
+		if rerr := os.Rename(carPath, aside); rerr != nil {
+			return nil, fmt.Errorf("logstore: set aside damaged %s car %d: %w", pl.plane, seq, rerr)
+		}
+		pl.logger.Error("logstore: sealed segment's CAR doesn't match its row; set aside",
+			zap.Stringer("plane", pl.plane), zap.Uint64("seq", seq),
+			zap.String("path", aside), zap.Bool("shipped", row.ShippedAt != 0), zap.NamedError("idx_error", err))
+		return nil, nil
 	}
 	pl.logger.Warn("logstore: sealed segment's .idx unreadable; rebuilding it from its CAR",
 		zap.Stringer("plane", pl.plane), zap.Uint64("seq", seq), zap.Error(err))
 	if seg, err = rebuildOpenFromDisk(pl.dir, seq, pl.plane, pl.logger); err != nil {
 		return nil, fmt.Errorf("logstore: rebuild sealed %s seg %d: %w", pl.plane, seq, err)
 	}
+	if len(seg.opRoots) == 0 {
+		// The .ops sidecar went too; the row kept the op-roots.
+		seg.opRoots = row.OpRoots
+	}
 	if err := seg.seal(ctx, pl.meta); err != nil {
 		return nil, fmt.Errorf("logstore: reseal %s seg %d: %w", pl.plane, seq, err)
 	}
-	if shippedAt != 0 {
-		seg.markShipped(shippedAt)
+	if row.ShippedAt != 0 {
+		seg.markShipped(row.ShippedAt)
 	}
 	return seg, nil
+}
+
+// carMatchesRow reports whether the CAR at path has the size and sha256 its
+// sealed row recorded.
+func carMatchesRow(path string, row SegmentMeta) (bool, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return false, err
+	}
+	if info.Size() != row.Size || len(row.SHA256) == 0 {
+		return false, nil
+	}
+	sum, err := hashFile(path)
+	if err != nil {
+		return false, err
+	}
+	return bytes.Equal(sum, row.SHA256), nil
 }
 
 // sealedFromIdx recovers a segment that finished sealing (seal writes its

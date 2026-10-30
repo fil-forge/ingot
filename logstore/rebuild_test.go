@@ -2,6 +2,7 @@ package logstore_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -710,6 +711,134 @@ func TestRecover_SealedRowWithoutIdx(t *testing.T) {
 					t.Fatalf("segment %d never shipped", seq)
 				}
 				time.Sleep(20 * time.Millisecond)
+			}
+		})
+	}
+}
+
+// TestRecover_SealedRowWithoutIdxOrOps: with the .ops sidecar gone too, the
+// rebuilt segment takes its op-roots from the row, so the fresh .idx carries
+// them.
+func TestRecover_SealedRowWithoutIdxOrOps(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	mem := inmem.NewMemStore()
+	written := sealedSegments(t, dir, mem, 1)
+	seq := sortedSeqs(onDiskSeqs(t, dir, "bk"))[0]
+	rows, err := mem.ListSegments(ctx, blockstore.PlaneCatalog, "bk")
+	if err != nil || len(rows) != 1 || len(rows[0].OpRoots) == 0 {
+		t.Fatalf("ListSegments = %+v, %v; want one sealed row with op-roots", rows, err)
+	}
+	catalog := filepath.Join(dir, "bk", blockstore.PlaneCatalog.String())
+	for _, name := range []string{fmt.Sprintf("seg-%020d.idx", seq), fmt.Sprintf("seg-%020d.ops", seq)} {
+		if err := os.Remove(filepath.Join(catalog, name)); err != nil {
+			t.Fatalf("remove %s: %v", name, err)
+		}
+	}
+
+	m, err := openRebuildManager(t, dir, mem, &shipRecorder{})
+	if err != nil {
+		t.Fatalf("OpenManager: %v", err)
+	}
+	requireReadable(t, m, written)
+	data, err := os.ReadFile(filepath.Join(catalog, fmt.Sprintf("seg-%020d.idx", seq)))
+	if err != nil {
+		t.Fatalf("read the fresh .idx: %v", err)
+	}
+	var idx struct {
+		OpRoots []json.RawMessage `json:"op_roots"`
+	}
+	if err := json.Unmarshal(data, &idx); err != nil {
+		t.Fatalf("parse the fresh .idx: %v", err)
+	}
+	if len(idx.OpRoots) != len(rows[0].OpRoots) {
+		t.Fatalf("fresh .idx has %d op-roots, want the row's %d", len(idx.OpRoots), len(rows[0].OpRoots))
+	}
+}
+
+// TestRecover_SealedRowDamagedCAR: a sealed row whose .idx is gone and whose
+// CAR is short of the size it sealed at is damaged, not torn. Rebuilding it
+// would ship a segment missing blocks and drop their journal rows, so it is
+// set aside and recovered as a lost file: rebuilt from the journal when it
+// never shipped, left to Forge when it did. With nothing journaled for an
+// unshipped one, the start fails and the file stays.
+func TestRecover_SealedRowDamagedCAR(t *testing.T) {
+	for _, tc := range []struct {
+		name               string
+		shipped, journaled bool
+		wantErr            bool
+	}{
+		{name: "unshipped, journaled", journaled: true},
+		{name: "shipped", shipped: true},
+		{name: "unshipped, nothing journaled", wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			dir := t.TempDir()
+			mem := inmem.NewMemStore()
+			written := sealedSegments(t, dir, mem, 1)
+			seq := sortedSeqs(onDiskSeqs(t, dir, "bk"))[0]
+			rows, err := mem.ListSegments(ctx, blockstore.PlaneCatalog, "bk")
+			if err != nil || len(rows) != 1 || rows[0].State != logstore.StateSealed {
+				t.Fatalf("ListSegments = %+v, %v; want the one sealed row", rows, err)
+			}
+			row := rows[0]
+			row.ShippedAt, row.IndexDigest = 0, nil
+			if tc.shipped {
+				row.ShippedAt = time.Now().Unix()
+			}
+			if err := mem.RehydrateSegment(ctx, row); err != nil {
+				t.Fatalf("RehydrateSegment: %v", err)
+			}
+			if tc.journaled {
+				if err := mem.Create(ctx, "bk", did.Undef, registry.CreateState{}); err != nil {
+					t.Fatalf("Create bk: %v", err)
+				}
+				st, err := mem.Get(ctx, "bk")
+				if err != nil {
+					t.Fatalf("Get bk: %v", err)
+				}
+				if err := mem.CommitRoot(ctx, "bk", st.Root, written[len(written)-1].Cid(), registry.RootCommit{
+					Journal: blockstore.Appended{Segment: seq, Blocks: written},
+				}); err != nil {
+					t.Fatalf("CommitRoot: %v", err)
+				}
+			}
+			catalog := filepath.Join(dir, "bk", blockstore.PlaneCatalog.String())
+			car := filepath.Join(catalog, fmt.Sprintf("seg-%020d.car", seq))
+			if err := os.Remove(filepath.Join(catalog, fmt.Sprintf("seg-%020d.idx", seq))); err != nil {
+				t.Fatalf("remove .idx: %v", err)
+			}
+			if err := os.Truncate(car, row.Size-100); err != nil {
+				t.Fatalf("cut the CAR short: %v", err)
+			}
+
+			ship := &shipRecorder{}
+			m, err := openRebuildManager(t, dir, mem, ship)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("OpenManager over a damaged, unjournaled sealed CAR succeeded")
+				}
+				if info, serr := os.Stat(car); serr != nil || info.Size() != row.Size-100 {
+					t.Fatalf("the damaged CAR was moved or changed: %v", serr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("OpenManager: %v", err)
+			}
+			if onDiskSeqs(t, dir, "bk")[seq] {
+				t.Fatalf("segment %d's damaged CAR is still in place", seq)
+			}
+			if _, err := os.Stat(car + ".damaged"); err != nil {
+				t.Fatalf("the damaged CAR wasn't set aside: %v", err)
+			}
+			retired, err := mem.ListRetiredSegments(ctx, blockstore.PlaneCatalog, "bk")
+			if err != nil || len(retired) != 1 || retired[0].Seq != seq {
+				t.Fatalf("retired rows = %+v, %v; want segment %d retired", retired, err, seq)
+			}
+			if tc.journaled {
+				requireReadable(t, m, written)
 			}
 		})
 	}
