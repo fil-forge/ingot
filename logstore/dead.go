@@ -57,8 +57,8 @@ func (s *Segment) deadBytes() (int64, error) {
 	}
 	// With no op-root there is no root to walk from. An empty segment has
 	// nothing dead. One holding blocks goes unmeasured rather than all dead:
-	// without its op-roots, as when its .ops sidecar was lost, nothing tells
-	// which of its blocks are committed writes.
+	// with no root, nothing tells its live blocks from its dead ones,
+	// whatever left it without op-roots (a lost .ops sidecar, say).
 	if len(s.opRoots) == 0 {
 		if total == 0 {
 			return 0, nil
