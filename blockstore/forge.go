@@ -34,8 +34,8 @@ import (
 // issued to the indexer (see newAuthorizeRetrieval).
 const retrievalAuthTTL = 60 // seconds
 
-// ErrNotFound is returned by GetBlock when the indexing-service has no location
-// commitment for the requested CID.
+// ErrNotFound is returned by GetBlock when the locator has no location for the
+// requested CID.
 var ErrNotFound = errors.New("blockstore: not found")
 
 // Forge is a read-only block reader that resolves CIDs through a locator
