@@ -6,8 +6,10 @@ import (
 	"path/filepath"
 	"testing"
 
+	blobcmds "github.com/fil-forge/libforge/commands/blob"
 	ucanlib "github.com/fil-forge/libforge/ucan"
 	"github.com/fil-forge/ucantone/did"
+	"github.com/fil-forge/ucantone/multikey"
 	"github.com/fil-forge/ucantone/multikey/ed25519"
 	"github.com/fil-forge/ucantone/ucan"
 	"github.com/fil-forge/ucantone/ucan/command"
@@ -18,6 +20,7 @@ import (
 
 	"github.com/fil-forge/ingot/blockstore"
 	"github.com/fil-forge/ingot/forgeclient"
+	"github.com/fil-forge/ingot/iam"
 	"github.com/fil-forge/ingot/internal/reqscope"
 	"github.com/fil-forge/ingot/tokenstore"
 )
@@ -47,12 +50,40 @@ func mustSpace(t *testing.T) did.DID {
 	return iss.DID()
 }
 
+// borrowable returns a context carrying store, marked as the IAM layer marks
+// a request's own key store.
+func borrowable(store ucanlib.ProofStore) context.Context {
+	ctx := context.WithValue(context.Background(), reqscope.ProofStoreKey(), store)
+	return context.WithValue(ctx, reqscope.BorrowableKey(), true)
+}
+
+// keyStore returns an access key's store in keys holding a two-hop /blob/add
+// chain to agent on each of spaces (space → an intermediary → agent), and the
+// chains' roots in the same order.
+func keyStore(t *testing.T, keys *iam.KeyProofs, agent did.DID, spaces ...multikey.Issuer) (ucanlib.ProofStore, []ucan.Delegation) {
+	t.Helper()
+	key, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	mid, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	var roots []ucan.Delegation
+	for _, space := range spaces {
+		root, err := blobcmds.Add.Delegate(space, mid.DID(), space.DID(), delegation.WithNoExpiration())
+		require.NoError(t, err)
+		leaf, err := blobcmds.Add.Delegate(mid, agent, space.DID(), delegation.WithNoExpiration())
+		require.NoError(t, err)
+		keys.Deposit(key.DID(), root, leaf)
+		roots = append(roots, root)
+	}
+	return keys.For(key.DID()), roots
+}
+
 func TestForgeShipProofsCache(t *testing.T) {
 	fg := newTestForge(t)
 	ctx := context.Background()
 	spaceA := mustSpace(t)
 	spaceB := mustSpace(t)
-	storeA := ucanlib.ProofStore(tokenstore.NewMemStore())
+	storeA := ucanlib.ProofStore(iam.NewDelegationCache(nil))
 
 	// Absent before any capture.
 	if _, ok := fg.shipProofStore(ctx, spaceA); ok {
@@ -60,7 +91,7 @@ func TestForgeShipProofsCache(t *testing.T) {
 	}
 
 	// Capture for spaceA; it resolves, but a different space stays absent.
-	fg.captureShipProofs(spaceA, storeA)
+	fg.captureShipProofs(borrowable(storeA), spaceA)
 	got, ok := fg.shipProofStore(ctx, spaceA)
 	require.True(t, ok)
 	require.Same(t, storeA, got)
@@ -68,21 +99,115 @@ func TestForgeShipProofsCache(t *testing.T) {
 		t.Fatal("spaceB should not resolve from spaceA's capture")
 	}
 
-	// Capturing a nil store is a no-op.
-	fg.captureShipProofs(spaceB, nil)
+	// A context with no store captures nothing.
+	fg.captureShipProofs(context.WithValue(ctx, reqscope.BorrowableKey(), true), spaceB)
 	if _, ok := fg.shipProofStore(ctx, spaceB); ok {
-		t.Fatal("nil capture must not populate the cache")
+		t.Fatal("a capture with no store must not populate the cache")
 	}
+}
+
+// TestForgeShipProofsOnlyBorrowable: a write captures its store only when the
+// IAM layer marked it borrowable; one that may not be borrowed leaves the
+// space's earlier capture in place.
+func TestForgeShipProofsOnlyBorrowable(t *testing.T) {
+	fg := newTestForge(t)
+	ctx := context.Background()
+	space := mustSpace(t)
+
+	scoped := ucanlib.ProofStore(iam.NewDelegationCache(nil))
+	fg.captureShipProofs(context.WithValue(ctx, reqscope.ProofStoreKey(), scoped), space)
+	if _, ok := fg.shipProofStore(ctx, space); ok {
+		t.Fatal("captured a store not marked borrowable")
+	}
+
+	held := ucanlib.ProofStore(iam.NewDelegationCache(nil))
+	fg.captureShipProofs(borrowable(held), space)
+	markedNot := context.WithValue(borrowable(scoped), reqscope.BorrowableKey(), false)
+	fg.captureShipProofs(markedNot, space)
+	got, ok := fg.shipProofStore(ctx, space)
+	require.True(t, ok)
+	require.Same(t, held, got, "a store marked not borrowable replaced the capture")
+}
+
+// TestForgeShipProofsSkipRevoked: after a revocation over one space, the
+// store captured from that key builds no chain through the revoked grant,
+// while the chain it builds for another space is untouched, so that space's
+// ships still go out. The revoked space's ship fails locally, naming the
+// missing authority, instead of going out proofless.
+func TestForgeShipProofsSkipRevoked(t *testing.T) {
+	fg := newTestForge(t)
+	ctx := context.Background()
+	agent := fg.client.Issuer().DID()
+	spaceA, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	spaceB, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	keys := iam.NewKeyProofs()
+	store, roots := keyStore(t, keys, agent, spaceA, spaceB)
+	fg.captureShipProofs(borrowable(store), spaceA.DID())
+	fg.captureShipProofs(borrowable(store), spaceB.DID())
+
+	require.Len(t, keys.InvalidateHolders(roots[1].Link()), 1)
+
+	_, chain, err := fg.authorityFor(ctx, spaceA.DID(), blobcmds.Add.Command)
+	require.NoError(t, err, "a revocation over one space cut another space's ship authority")
+	require.Len(t, chain, 2)
+
+	_, _, err = fg.authorityFor(ctx, spaceB.DID(), blobcmds.Add.Command)
+	require.ErrorContains(t, err, "no /blob/add authority", "a ship presented a revoked grant")
+	shard := CARShard{Size: 1, Positions: map[cid.Cid]blockstore.BlockLoc{cid.Undef: {}}}
+	_, _, err = fg.SubmitShard(ctx, blockstore.PlaneCatalog, spaceB.DID(), shard)
+	require.ErrorContains(t, err, "no /blob/add authority")
+}
+
+// TestForgeCommitCaptureSkipsRevoked: a revocation naming the commit
+// capture's grant over one space sends that space's ship to the upload
+// capture, leaves the capture's other space shipping under it, and stops the
+// same key's next commit from capturing it there again. With no upload
+// capture to fall back on, the ship reports it has no authority.
+func TestForgeCommitCaptureSkipsRevoked(t *testing.T) {
+	fg := newTestForge(t)
+	ctx := context.Background()
+	agent := fg.client.Issuer().DID()
+	spaceA, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	spaceB, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	keys := iam.NewKeyProofs()
+	committed, roots := keyStore(t, keys, agent, spaceA, spaceB)
+	uploaded, _ := keyStore(t, keys, agent, spaceB)
+	fg.CaptureShipAuthority(borrowable(committed), spaceA.DID())
+	fg.CaptureShipAuthority(borrowable(committed), spaceB.DID())
+	fg.captureShipProofs(borrowable(uploaded), spaceB.DID())
+
+	require.Len(t, keys.InvalidateHolders(roots[1].Link()), 1)
+
+	got, ok := fg.catalogShipStore(ctx, spaceB.DID())
+	require.True(t, ok)
+	require.Same(t, uploaded, got, "a ship to the revoked space signs with the upload capture")
+	got, ok = fg.catalogShipStore(ctx, spaceA.DID())
+	require.True(t, ok)
+	require.Same(t, committed, got, "a revocation over one space cut the commit capture's other space")
+
+	fg.commitProofs.Delete(spaceB.DID().String())
+	fg.CaptureShipAuthority(borrowable(committed), spaceB.DID())
+	_, captured := fg.commitProofs.Get(spaceB.DID().String())
+	require.False(t, captured, "a commit captured a store whose grant over the space is revoked")
+
+	fg.shipProofs.Delete(spaceB.DID().String())
+	shard := CARShard{Size: 1, Positions: map[cid.Cid]blockstore.BlockLoc{cid.Undef: {}}}
+	_, _, err = fg.SubmitShard(ctx, blockstore.PlaneCatalog, spaceB.DID(), shard)
+	require.ErrorContains(t, err, "no ship authority")
 }
 
 func TestForgeShipProofsRequestScopeWins(t *testing.T) {
 	fg := newTestForge(t)
 	space := mustSpace(t)
-	captured := ucanlib.ProofStore(tokenstore.NewMemStore())
-	fg.captureShipProofs(space, captured)
+	captured := ucanlib.ProofStore(iam.NewDelegationCache(nil))
+	fg.captureShipProofs(borrowable(captured), space)
 
 	// A request-scoped store on the context takes precedence over the
-	// captured fallback (the in-request write path).
+	// captured fallback (the in-request write path), borrowable or not.
 	scoped := ucanlib.ProofStore(tokenstore.NewMemStore())
 	ctx := context.WithValue(context.Background(), reqscope.ProofStoreKey(), scoped)
 
@@ -124,12 +249,10 @@ func TestForgeCaptureShipAuthority(t *testing.T) {
 	space := mustSpace(t)
 	uploaded := shippingStore(t)
 	committed := shippingStore(t)
-	withStore := func(store ucanlib.ProofStore) context.Context {
-		return context.WithValue(ctx, reqscope.ProofStoreKey(), store)
-	}
+	withStore := func(store ucanlib.ProofStore) context.Context { return borrowable(store) }
 
 	// With only an upload's capture, the ship falls back to it.
-	fg.captureShipProofs(space, uploaded)
+	fg.captureShipProofs(borrowable(uploaded), space)
 	got, ok := fg.catalogShipStore(ctx, space)
 	require.True(t, ok)
 	require.Same(t, uploaded, got)
@@ -146,6 +269,13 @@ func TestForgeCaptureShipAuthority(t *testing.T) {
 	got, ok = fg.catalogShipStore(ctx, space)
 	require.True(t, ok)
 	require.Same(t, committed, got, "a ctx without a store must not replace the capture")
+
+	// A store the IAM layer didn't mark borrowable, such as the one-off store
+	// of a response carrying a revoked delegation, isn't captured either.
+	fg.CaptureShipAuthority(context.WithValue(ctx, reqscope.ProofStoreKey(), ucanlib.ProofStore(shippingStore(t))), space)
+	got, ok = fg.catalogShipStore(ctx, space)
+	require.True(t, ok)
+	require.Same(t, committed, got, "a store that may not be borrowed must not replace the capture")
 
 	// A commit by a key that can't ship leaves the capture alone.
 	fg.CaptureShipAuthority(withStore(&chainStore{}), space)
@@ -187,7 +317,7 @@ func TestForgeShipProbeAsksForBlobAdd(t *testing.T) {
 		return space.DID(), store
 	}
 	captured := func(space did.DID, store ucanlib.ProofStore) bool {
-		fg.CaptureShipAuthority(context.WithValue(ctx, reqscope.ProofStoreKey(), store), space)
+		fg.CaptureShipAuthority(borrowable(store), space)
 		_, ok := fg.catalogShipStore(ctx, space)
 		return ok
 	}
@@ -215,12 +345,12 @@ func TestSubmitShardShipsUnderCommitCapture(t *testing.T) {
 	}
 
 	space := mustSpace(t)
-	fg.CaptureShipAuthority(context.WithValue(ctx, reqscope.ProofStoreKey(), ucanlib.ProofStore(shippingStore(t))), space)
+	fg.CaptureShipAuthority(borrowable(shippingStore(t)), space)
 	_, _, err = fg.SubmitShard(ctx, blockstore.PlaneCatalog, space, shard)
 	require.ErrorContains(t, err, "missing.car", "a commit's capture should have authorized the ship")
 
 	chainless := mustSpace(t)
-	fg.CaptureShipAuthority(context.WithValue(ctx, reqscope.ProofStoreKey(), ucanlib.ProofStore(&chainStore{})), chainless)
+	fg.CaptureShipAuthority(borrowable(&chainStore{}), chainless)
 	_, _, err = fg.SubmitShard(ctx, blockstore.PlaneCatalog, chainless, shard)
 	require.ErrorContains(t, err, "no ship authority")
 }

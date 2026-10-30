@@ -298,12 +298,12 @@ sequenceDiagram
             B->>B: BlobCache.Take: the file moves from the spool to the cache
         end
     end
-    Note over B,U: UploadBlob also captures the request proof store as the<br/>space's ship authority (captureShipProofs, 1h TTL)
+    Note over B,U: UploadBlob also captures the request proof store, if borrowable,<br/>as the space's ship authority (captureShipProofs, 1h TTL)
     Note over B,L: under the per-bucket lock: commitVersion via Coordinator.WithTx
     B->>TX: Begin (lock, snapshot root)
     TX->>R: AllocVersionSeq (a multipart Complete in an Enabled bucket<br/>reserved its seq before the lock: see the multipart diagram)
     TX->>TX: mint versionId ("null" unless versioning Enabled),<br/>manifest into OpStaging, re-check If-Match under the lock,<br/>MST splice (new nodes into staging)
-    Note over TX: uploader.CaptureShipAuthority: every commit captures the request<br/>proof store as the space's ship authority, so a write with no body<br/>(a delete, a tag change) leaves one for its segment's ship
+    Note over TX: uploader.CaptureShipAuthority: every commit captures the request<br/>proof store, if borrowable and it holds a /blob/add chain, as the<br/>space's ship authority, so a write with no body (a delete, a tag<br/>change) leaves one for its segment's ship
     TX->>L: AppendBatch(catalog blocks, OpRoot) with fsync
     TX->>R: CommitRoot(bucket, snapshot, newRoot), guarded, one transaction:<br/>the batch's catalog blocks journaled under its segment (catalog_journal,<br/>skipped once the segment has shipped), blob_refs gains this version,<br/>superseded version rows removed, a release record per digest whose<br/>claims reached 0#59;<br/>/upload/add(root = this version's manifest CID)<br/>+ /upload/remove per discarded version queued (upload_registrations)
     TX-->>B: committed, lock released
@@ -377,8 +377,9 @@ sequenceDiagram
 - That chain has room to spare — hilt expires its delegation to the gateway at
   the next UTC midnight plus an async overhang, so even a change queued at
   23:59 has hours to be drained in. For the queue that outlasts that, the
-  sweeper renews from the space's live authority, which a recent write leaves
-  behind. A space that has gone quiet has none, and after
+  sweeper renews from the space's live authority, which a recent body upload
+  with a borrowable store leaves behind, less any delegation a revocation has
+  since named. A space that has gone quiet has none, and after
   `uploadRegistrationDeadLetterAfter` attempts the row is **dead-lettered**:
   out of the sweep, and out of the way of its key's later rows. (Nothing to do
   with a parked blob, which is durable and awaiting its accept.) The count is then short by
@@ -920,8 +921,8 @@ flowchart TB
 
     kp -->|"reqscope.ProofStore<br/>on the request ctx"| writes["uploader:<br/>/blob/add, abort, remove, /index/add<br/>/upload/add, /upload/remove"]
     kp -->|"same store"| reads["blockstore.Forge:<br/>content/retrieve"]
-    kp -->|"captureShipProofs<br/>at UploadBlob and StartBlob"| ship
-    kp -->|"CaptureShipAuthority<br/>at every bucketop commit"| commit
+    kp -->|"captureShipProofs<br/>at UploadBlob and StartBlob,<br/>borrowable stores only"| ship
+    kp -->|"CaptureShipAuthority<br/>at every bucketop commit,<br/>borrowable stores only"| commit
     commit --> catship["async catalog ship"]
     ship -->|"no commit capture<br/>holding a chain"| catship
     ship --> async["sweepers' releases, aborts and<br/>registration renewals; DeleteBucket aborts"]
@@ -937,6 +938,14 @@ flowchart TB
   account is disabled, so no access-key auth path skips the hilt-backed IAM
   lookup. `/health` and the DID document are outside the S3 auth chain, and a
   rejected access key never receives one.
+- The ship authority holds a request's store past the request only when the
+  IAM layer marked it borrowable (`reqscope.BorrowableKey`, read through
+  `reqscope.BorrowableProofStore`), which it does for the key's own
+  `DelegationCache` only. A request authorized off a response carrying a
+  revoked delegation spends a store of its own, marked not borrowable.
+- A revocation drops the key's store from `KeyProofs`, but a captured store
+  stays in use: no chain it assembles uses a delegation the revocation named,
+  so the spaces its other grants cover keep shipping.
 - Every write captures the ship authority when it commits, so a segment,
   sealed seconds after its writes, ships under a fresh capture. That capture
   is kept apart from the upload's: hilt grants each catalog-changing

@@ -38,6 +38,40 @@ func ProofStore(ctx context.Context) (ucanlib.ProofStore, bool) {
 	return ps, ok
 }
 
+type borrowableContextKey struct{}
+
+var borrowableKey any = borrowableContextKey{}
+
+// BorrowableKey returns the context key under which the IAM service marks a
+// request whose proof store background work may borrow for a while: the
+// access key's own cached store, whose chains skip any delegation a
+// revocation has named, for as long as the IAM layer remembers that
+// revocation. A request authorized off a response carrying a revoked
+// delegation gets a store of its own instead, marked not borrowable.
+func BorrowableKey() any {
+	return borrowableKey
+}
+
+// Borrowable reports whether the request's proof store may be borrowed
+// beyond the request (see BorrowableKey).
+func Borrowable(ctx context.Context) bool {
+	b, _ := ctx.Value(borrowableKey).(bool)
+	return b
+}
+
+// BorrowableProofStore returns the request's proof store if background work
+// may hold it past the request (see BorrowableKey); ok is false otherwise.
+func BorrowableProofStore(ctx context.Context) (ucanlib.ProofStore, bool) {
+	if !Borrowable(ctx) {
+		return nil, false
+	}
+	store, ok := ProofStore(ctx)
+	if !ok || store == nil {
+		return nil, false
+	}
+	return store, true
+}
+
 type requestContextKey struct{}
 
 var requestKey any = requestContextKey{}

@@ -124,7 +124,8 @@ Internal:
   ship authority (1h TTL) from in-request writes: `shipProofs` from body
   uploads (also the background releases' and aborts' fallback), and
   `commitProofs` from every `bucketop` commit (`CaptureShipAuthority`), which
-  the ship prefers.
+  the ship prefers. Both take only stores `reqscope.BorrowableProofStore`
+  returns, and their chains skip revoked delegations.
 - **`bucketauthority/`** — hilt bucket ops: forwards CreateBucket /
   DeleteBucket / ListBuckets to `/s3/bucket/*`, recovering the signed S3
   request from ctx.
