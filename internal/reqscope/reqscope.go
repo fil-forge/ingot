@@ -74,24 +74,24 @@ func Tenant(ctx context.Context) (did.DID, bool) {
 	return tenant, ok && tenant.Defined()
 }
 
-type etagContextKey struct{}
+type policyDocumentContextKey struct{}
 
-var etagKey any = etagContextKey{}
+var policyDocumentKey any = policyDocumentContextKey{}
 
-// ETagKey returns the fasthttp/fiber user-value key under which a bucket
-// policy request carries a *string holder for its response ETag. versitygw's
-// backend seam returns no headers, so the gateway middleware installs the
-// holder, the backend fills it from Hilt's answer, and the middleware sets
-// the header from it once the controller has run.
-func ETagKey() any {
-	return etagKey
+// PolicyDocumentKey returns the fasthttp/fiber user-value key under which a
+// ?policy request carries a *bool holder the backend sets when it answers
+// with a policy document. versitygw's backend seam returns no headers, so
+// the gateway middleware installs the holder and, once the controller has
+// run, gives a response the backend marked the JSON content type.
+func PolicyDocumentKey() any {
+	return policyDocumentKey
 }
 
-// SetETag fills the request's ETag holder; a context without one (any
-// request but a bucket policy operation) ignores it.
-func SetETag(ctx context.Context, etag string) {
-	if holder, ok := ctx.Value(etagKey).(*string); ok {
-		*holder = etag
+// MarkPolicyDocument sets the request's policy document holder; a context
+// without one (any request but a ?policy one) ignores it.
+func MarkPolicyDocument(ctx context.Context) {
+	if holder, ok := ctx.Value(policyDocumentKey).(*bool); ok {
+		*holder = true
 	}
 }
 

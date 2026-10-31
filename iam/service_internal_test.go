@@ -769,22 +769,21 @@ func TestMapAuthError(t *testing.T) {
 		code   string
 		status int
 	}{
-		hiltauth.MalformedSignatureErrorName:     {"AuthorizationHeaderMalformed", 400},
-		hiltauth.SignatureMismatchErrorName:      {"SignatureDoesNotMatch", 403},
-		hiltauth.SignatureExpiredErrorName:       {"AccessDenied", 403},
-		hiltauth.UnsupportedOperationErrorName:   {"NotImplemented", 501},
-		hiltauth.ConflictingQueryErrorName:       {"InvalidArgument", 400},
-		hiltauth.UnknownBucketErrorName:          {"NoSuchBucket", 404},
-		hiltauth.TenantDisabledErrorName:         {"AccessDenied", 403},
-		hiltauth.IssuerForbiddenErrorName:        {"AccessDenied", 403},
-		hiltauth.RegionNotServedErrorName:        {"AccessDenied", 403},
-		hiltauth.OperationNotPermittedErrorName:  {"AccessDenied", 403},
-		hiltauth.BucketNotPermittedErrorName:     {"AccessDenied", 403},
-		hiltauth.ForeignBucketErrorName:          {"AccessDenied", 403},
-		hiltauth.UnsignedHeaderErrorName:         {"AccessDenied", 403},
-		hiltauth.InvalidBodyErrorName:            {"AccessDenied", 403},
-		hiltauth.TemporarilyUnavailableErrorName: {"ServiceUnavailable", 503},
-		s3bkt.InvalidPolicyErrorName:             {"MalformedPolicy", 400},
+		hiltauth.MalformedSignatureErrorName:    {"AuthorizationHeaderMalformed", 400},
+		hiltauth.SignatureMismatchErrorName:     {"SignatureDoesNotMatch", 403},
+		hiltauth.SignatureExpiredErrorName:      {"AccessDenied", 403},
+		hiltauth.UnsupportedOperationErrorName:  {"NotImplemented", 501},
+		hiltauth.ConflictingQueryErrorName:      {"InvalidArgument", 400},
+		hiltauth.UnknownBucketErrorName:         {"NoSuchBucket", 404},
+		hiltauth.TenantDisabledErrorName:        {"AccessDenied", 403},
+		hiltauth.IssuerForbiddenErrorName:       {"AccessDenied", 403},
+		hiltauth.RegionNotServedErrorName:       {"AccessDenied", 403},
+		hiltauth.OperationNotPermittedErrorName: {"AccessDenied", 403},
+		hiltauth.BucketNotPermittedErrorName:    {"AccessDenied", 403},
+		hiltauth.ForeignBucketErrorName:         {"AccessDenied", 403},
+		hiltauth.UnsignedHeaderErrorName:        {"AccessDenied", 403},
+		hiltauth.InvalidBodyErrorName:           {"AccessDenied", 403},
+		s3bkt.InvalidPolicyErrorName:            {"MalformedPolicy", 400},
 	}
 	for name, want := range apiCases {
 		t.Run(name, func(t *testing.T) {

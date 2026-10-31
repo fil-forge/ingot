@@ -9,7 +9,6 @@ import (
 	"strings"
 
 	"github.com/fil-forge/libforge/commands/s3"
-	s3bkt "github.com/fil-forge/libforge/commands/s3/bucket"
 	"github.com/fil-forge/versitygw/auth"
 	"github.com/fil-forge/versitygw/s3err"
 	"go.uber.org/zap"
@@ -22,11 +21,10 @@ import (
 
 // The bucket policy operations forward the signed request to the bucket
 // authority (Hilt's /s3/bucket/policy), which authenticates and authorizes
-// it, checks its preconditions and keeps the document. versitygw's
-// controllers have validated a PUT body's AWS shape first. The response ETag
-// is computed here from the document, with the same [s3bkt.ETag] Hilt stores
-// and checks If-Match against, and travels back through the request's
-// reqscope ETag holder, since the backend seam returns no headers.
+// it and keeps the document. versitygw's controllers have validated a PUT
+// body's AWS shape first. Writes are unconditional and the last one wins, as
+// on S3: a conditional header on the request reaches Hilt with the rest of
+// the signed request, and neither side acts on it.
 
 // PutBucketPolicy stores the policy document through the bucket authority.
 func (b *Backend) PutBucketPolicy(ctx context.Context, _ string, policy []byte) error {
@@ -81,25 +79,14 @@ func (b *Backend) bucketPolicy(ctx context.Context, body []byte) ([]byte, error)
 		}
 		return nil, apiErr
 	}
-	switch {
-	case res.Policy != nil: // GET
-		reqscope.SetETag(ctx, s3bkt.ETag(*res.Policy))
-		// The policy types encode as the AWS document Hilt stores; their
-		// encoding cannot fail.
-		doc, _ := json.Marshal(res.Policy)
-		return doc, nil
-	case body != nil: // PUT
-		// Hilt stores the document this body decodes to, normalized, so its tag
-		// is the stored tag. The body passed Hilt's own decoder a moment ago;
-		// a failure here means the two sides run different libforge versions.
-		var doc s3bkt.PolicyDocument
-		if err := json.Unmarshal(body, &doc); err != nil {
-			b.logger.Error("tagging an accepted bucket policy", zap.Error(err))
-			return nil, nil
-		}
-		reqscope.SetETag(ctx, s3bkt.ETag(doc))
+	if res.Policy == nil { // PUT or DELETE
+		return nil, nil
 	}
-	return nil, nil
+	reqscope.MarkPolicyDocument(ctx)
+	// The policy types encode as the AWS document Hilt stores; their
+	// encoding cannot fail.
+	doc, _ := json.Marshal(res.Policy)
+	return doc, nil
 }
 
 // isSignedPolicyGet reports whether req is a GetBucketPolicy request carrying
@@ -139,20 +126,8 @@ func policyError(err error) s3err.APIError {
 		return s3err.GetAPIError(s3err.ErrNoSuchBucketPolicy)
 	case errors.Is(err, bucketauthority.ErrMalformedPolicy):
 		return MalformedPolicy(err.Error())
-	case errors.Is(err, bucketauthority.ErrPreconditionFailed):
-		return s3err.GetAPIError(s3err.ErrPreconditionFailed)
-	case errors.Is(err, bucketauthority.ErrInvalidPrecondition):
-		e := s3err.GetAPIError(s3err.ErrInvalidRequest)
-		e.Description = err.Error()
-		return e
 	case errors.Is(err, bucketauthority.ErrUnsupported):
 		return s3err.GetAPIError(s3err.ErrNotImplemented)
-	case errors.Is(err, bucketauthority.ErrConcurrentChange):
-		return s3err.APIError{
-			Code:           "OperationAborted",
-			Description:    "A conflicting conditional operation is currently in progress against this resource. Try again.",
-			HTTPStatusCode: http.StatusConflict,
-		}
 	}
 	if mapped, ok := iam.MapAuthError(err); ok {
 		var s3e s3err.S3Error

@@ -37,7 +37,7 @@ func NewRevoker(proofs *KeyProofs, keys *VerificationKeyCache, tenants *TenantCa
 // local authorization decision depended on it and there was nothing to
 // clear (Hilt remains authoritative for everything uncached) — but the CID
 // is remembered regardless, so a later authorize response carrying it is
-// served without being cached (see [KeyProofs.Revoked]). Idempotent:
+// served without being cached (see [DelegationCache.Add]). Idempotent:
 // re-delivery of a revocation clears nothing more.
 func (r *Revoker) Revoke(revoked cid.Cid) []did.DID {
 	affected := r.proofs.InvalidateHolders(revoked)

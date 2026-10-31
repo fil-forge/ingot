@@ -777,23 +777,19 @@ func buildS3API(ctx context.Context, backend *s3frontend.Backend, cfg config.Ser
 	return api, nil
 }
 
-// policyHeaders adds what versitygw's bucket policy controllers leave out of
-// a ?policy response, since the backend seam returns only the document: the
-// document's ETag, which the backend computes and leaves in the request's
-// reqscope holder, and the JSON content type of a GetBucketPolicy document.
+// policyHeaders gives a GetBucketPolicy document the JSON content type
+// versitygw's controller leaves out, since the backend seam returns only the
+// document.
 func policyHeaders(c fiber.Ctx) error {
 	if !c.RequestCtx().QueryArgs().Has("policy") {
 		return c.Next()
 	}
-	etag := new(string)
-	c.Locals(reqscope.ETagKey(), etag)
+	answered := new(bool)
+	c.Locals(reqscope.PolicyDocumentKey(), answered)
 	err := c.Next()
-	if *etag != "" {
-		c.Set("ETag", *etag)
-	}
-	// Only a request the policy backend answered fills the holder; an object
+	// Only a request the policy backend answered sets the holder; an object
 	// read whose query happens to carry a policy key keeps its content type.
-	if *etag != "" && c.Method() == http.MethodGet && c.Response().StatusCode() == http.StatusOK {
+	if *answered && c.Method() == http.MethodGet && c.Response().StatusCode() == http.StatusOK {
 		c.Set(fiber.HeaderContentType, fiber.MIMEApplicationJSON)
 	}
 	return err

@@ -1037,9 +1037,11 @@ sequenceDiagram
   answers that validation's principal lookups for any well-formed user ARN.
   GetBucketPolicy forwards only a signed GET ?policy: versitygw's own access
   checks call it too and get the stub answer, so versitygw never evaluates a
-  policy. A hilt rejection renders through the same `mapAuthError` mapping;
-  a gateway middleware (`policyHeaders`) adds the response ETag the backend
-  leaves in a reqscope holder, and a GET's JSON content type.
+  policy. A hilt rejection renders through the same `mapAuthError` mapping.
+  Policy writes are unconditional and last-write-wins, as on S3: no response
+  carries an ETag, and a conditional header reaches hilt unacted on. A
+  gateway middleware (`policyHeaders`) gives a GET's document the JSON
+  content type, on the backend's mark in a reqscope holder.
 
 Sources: `iam/service.go` (GetUserAccountForRequest, authorizeLocal,
 cacheProofs, mapAuthError), `iam/proofcache.go` (PutPermissions, Permits),

@@ -19,8 +19,8 @@ import (
 
 // TestForgeBucketPolicy drives the S3 bucket policy operations end to end: a
 // service key writes an AWS-shaped policy naming a principal by its user ARN
-// with PutBucketPolicy, reads it back canonical with GetBucketPolicy (both
-// answering the document's ETag), replaces it with a wildcard document, is
+// with PutBucketPolicy, reads it back canonical with GetBucketPolicy (neither
+// answering an ETag), replaces it with a wildcard document, is
 // refused a document versitygw rejects (a bare principal name) and one Hilt
 // rejects (no Version) with MalformedPolicy, and removes it with
 // DeleteBucketPolicy. The published hilt image lacks /s3/bucket/policy until
@@ -58,9 +58,8 @@ func TestForgeBucketPolicy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PutBucketPolicy: %v", err)
 	}
-	putETag := responseETag(put.ResultMetadata)
-	if putETag == "" {
-		t.Fatal("PutBucketPolicy answered no ETag")
+	if putETag := responseETag(put.ResultMetadata); putETag != "" {
+		t.Fatalf("PutBucketPolicy ETag = %q, want none", putETag)
 	}
 	got, err := client.GetBucketPolicy(ctx, &s3.GetBucketPolicyInput{Bucket: aws.String(bucket)})
 	if err != nil {
@@ -71,8 +70,8 @@ func TestForgeBucketPolicy(t *testing.T) {
 	if aws.ToString(got.Policy) != want {
 		t.Fatalf("GetBucketPolicy = %s, want %s", aws.ToString(got.Policy), want)
 	}
-	if getETag := responseETag(got.ResultMetadata); getETag != putETag {
-		t.Fatalf("GetBucketPolicy ETag = %q, want the PutBucketPolicy ETag %q", getETag, putETag)
+	if getETag := responseETag(got.ResultMetadata); getETag != "" {
+		t.Fatalf("GetBucketPolicy ETag = %q, want none", getETag)
 	}
 
 	wildcard := fmt.Sprintf(`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":%q}]}`, objects)

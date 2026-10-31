@@ -22,11 +22,8 @@ var (
 	ErrInvalidArgument = errors.New("bucketauthority: invalid argument")
 
 	// The bucket policy operations' rejections, from Hilt's /s3/bucket/policy.
-	ErrNoPolicy            = errors.New("bucketauthority: bucket has no policy")
-	ErrMalformedPolicy     = errors.New("bucketauthority: malformed policy")
-	ErrPreconditionFailed  = errors.New("bucketauthority: precondition failed")
-	ErrInvalidPrecondition = errors.New("bucketauthority: invalid precondition")
-	ErrConcurrentChange    = errors.New("bucketauthority: policy is being changed concurrently")
+	ErrNoPolicy        = errors.New("bucketauthority: bucket has no policy")
+	ErrMalformedPolicy = errors.New("bucketauthority: malformed policy")
 	// ErrUnsupported is a policy write on an authority that keeps no policies.
 	ErrUnsupported = errors.New("bucketauthority: bucket policies are not supported")
 )
@@ -99,12 +96,6 @@ func (s *Service) PolicyDocument(ctx context.Context, req s3.Request, body []byt
 				return nil, ErrNoPolicy
 			case s3bkt.InvalidPolicyErrorName:
 				return nil, fmt.Errorf("%w: %s", ErrMalformedPolicy, namedErr.Error())
-			case bucketpolicysvc.PreconditionFailedErrorName:
-				return nil, ErrPreconditionFailed
-			case bucketpolicysvc.InvalidPreconditionName:
-				return nil, fmt.Errorf("%w: %s", ErrInvalidPrecondition, namedErr.Error())
-			case bucketpolicysvc.ConcurrentChangeErrorName:
-				return nil, ErrConcurrentChange
 			}
 		}
 		return nil, err
