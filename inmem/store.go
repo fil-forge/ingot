@@ -14,6 +14,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"maps"
 	"net/url"
 	"slices"
 	"sort"
@@ -263,6 +264,28 @@ func (m *MemStore) Delete(_ context.Context, name string) error {
 	}
 	m.uploadRegs = kept
 	// The journal cascades on the bucket too.
+	m.dropJournalLocked(name)
+	return nil
+}
+
+func (m *MemStore) EmptyRoot(_ context.Context, name string, expect cid.Cid) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.buckets[name]
+	if !ok {
+		return registry.ErrNotFound
+	}
+	if !s.Root.Equals(expect) {
+		return registry.ErrConflict
+	}
+	s.Root = cid.Undef
+	s.ForgeRoot = cid.Undef
+	m.dropJournalLocked(name)
+	return nil
+}
+
+// dropJournalLocked deletes bucket name's journal rows. m.mu must be held.
+func (m *MemStore) dropJournalLocked(name string) {
 	for seq, rows := range m.journal {
 		for k, row := range rows {
 			if row.bucket == name {
@@ -273,7 +296,6 @@ func (m *MemStore) Delete(_ context.Context, name string) error {
 			delete(m.journal, seq)
 		}
 	}
-	return nil
 }
 
 func (m *MemStore) CASRoot(ctx context.Context, name string, expect, next cid.Cid) error {
@@ -476,6 +498,104 @@ func (m *MemStore) NextSegmentSeq(_ context.Context) (uint64, error) {
 	return m.nextSeq, nil
 }
 
+func (m *MemStore) EnsureSegmentSeqAbove(_ context.Context, seq uint64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.nextSeq = max(m.nextSeq, seq)
+	return nil
+}
+
+func (m *MemStore) JournalBuckets(context.Context) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	seen := map[string]struct{}{}
+	for _, rows := range m.journal {
+		for _, row := range rows {
+			seen[row.bucket] = struct{}{}
+		}
+	}
+	return slices.Sorted(maps.Keys(seen)), nil
+}
+
+func (m *MemStore) JournalSegments(_ context.Context, bucket string) ([]uint64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []uint64
+	for seq, rows := range m.journal {
+		for _, row := range rows {
+			if row.bucket == bucket {
+				out = append(out, seq)
+				break
+			}
+		}
+	}
+	slices.Sort(out)
+	return out, nil
+}
+
+// ReadJournal pages a segment's journaled blocks in CID byte order, as the
+// Postgres primary key does (string order over the CID bytes).
+func (m *MemStore) ReadJournal(_ context.Context, seq uint64, after cid.Cid, limit int) ([]block.Block, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	afterKey := ""
+	if after.Defined() {
+		afterKey = string(after.Bytes())
+	}
+	var out []block.Block
+	for _, k := range slices.Sorted(maps.Keys(m.journal[seq])) {
+		if k <= afterKey {
+			continue
+		}
+		if len(out) == limit {
+			break
+		}
+		c, err := cid.Cast([]byte(k))
+		if err != nil {
+			return nil, err
+		}
+		blk, err := block.NewBlockWithCid(slices.Clone(m.journal[seq][k].data), c)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, blk)
+	}
+	return out, nil
+}
+
+// MoveJournal re-files a range of a segment's journaled blocks under
+// another, as the Postgres one does: a target that has shipped takes none.
+func (m *MemStore) MoveJournal(_ context.Context, bucket string, from, to uint64, first, last cid.Cid) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	target, ok := m.segments[to]
+	if !ok {
+		return fmt.Errorf("inmem: journal move %d→%d: no segment %d", from, to, to)
+	}
+	lo, hi := string(first.Bytes()), string(last.Bytes())
+	src := m.journal[from]
+	for k, row := range src {
+		if row.bucket != bucket || k < lo || k > hi {
+			continue
+		}
+		if target.ShippedAt == 0 {
+			dst := m.journal[to]
+			if dst == nil {
+				dst = map[string]journalRow{}
+				m.journal[to] = dst
+			}
+			if _, dup := dst[k]; !dup {
+				dst[k] = row
+			}
+		}
+		delete(src, k)
+	}
+	if len(src) == 0 {
+		delete(m.journal, from)
+	}
+	return nil
+}
+
 func (m *MemStore) InsertSegmentOpen(_ context.Context, plane blockstore.Plane, seq uint64, bucket string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -502,12 +622,13 @@ func (m *MemStore) MarkSegmentSealed(_ context.Context, plane blockstore.Plane, 
 	return nil
 }
 
-func (m *MemStore) MarkSegmentShipped(_ context.Context, plane blockstore.Plane, seq uint64, shippedAt int64, indexDigest multihash.Multihash, opRoots []blockstore.OpRoot) error {
+func (m *MemStore) MarkSegmentShipped(_ context.Context, plane blockstore.Plane, seq uint64, shippedAt int64, indexDigest multihash.Multihash, deadBytes int64, opRoots []blockstore.OpRoot) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if r, ok := m.segments[seq]; ok {
 		r.ShippedAt = shippedAt
 		r.IndexDigest = slices.Clone(indexDigest)
+		r.DeadBytes = deadBytes
 	}
 	// The segment's journaled blocks are on Forge now.
 	delete(m.journal, seq)
@@ -524,13 +645,48 @@ func (m *MemStore) MarkSegmentShipped(_ context.Context, plane blockstore.Plane,
 	return nil
 }
 
+// CatalogUsage sums each bucket's shipped catalog segments, retired ones
+// included, as the Postgres query does: those whose ship registered blobs
+// (IndexDigest set), with a negative DeadBytes counting as unmeasured.
+func (m *MemStore) CatalogUsage(_ context.Context) ([]registry.CatalogUsage, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	byBucket := map[string]*registry.CatalogUsage{}
+	for _, r := range m.segments {
+		if r.Plane != blockstore.PlaneCatalog || r.IndexDigest == nil {
+			continue
+		}
+		b, ok := m.buckets[r.Bucket]
+		if !ok {
+			continue
+		}
+		u, ok := byBucket[r.Bucket]
+		if !ok {
+			u = &registry.CatalogUsage{Bucket: r.Bucket, Space: b.Space}
+			byBucket[r.Bucket] = u
+		}
+		u.Bytes += r.Size
+		if r.DeadBytes < 0 {
+			u.UnmeasuredBytes += r.Size
+		} else {
+			u.DeadOnArrivalBytes += r.DeadBytes
+		}
+	}
+	out := make([]registry.CatalogUsage, 0, len(byBucket))
+	for _, u := range byBucket {
+		out = append(out, *u)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Bucket < out[j].Bucket })
+	return out, nil
+}
+
 func (m *MemStore) ListSegmentBuckets(_ context.Context, plane blockstore.Plane) ([]string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	seen := map[string]struct{}{}
 	var out []string
 	for _, r := range m.segments {
-		if r.Plane != plane {
+		if r.Plane != plane || r.RetiredAt != 0 {
 			continue
 		}
 		if _, ok := seen[r.Bucket]; ok {
@@ -550,18 +706,38 @@ func (m *MemStore) DeleteSegment(_ context.Context, plane blockstore.Plane, seq 
 	return nil
 }
 
+func (m *MemStore) RetireSegment(_ context.Context, plane blockstore.Plane, seq uint64, retiredAt int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if r, ok := m.segments[seq]; ok && r.Plane == plane && r.RetiredAt == 0 {
+		r.RetiredAt = retiredAt
+		r.OpRoots = nil
+	}
+	return nil
+}
+
 func (m *MemStore) ListSegments(_ context.Context, plane blockstore.Plane, bucket string) ([]logstore.SegmentMeta, error) {
+	return m.listSegments(plane, bucket, false), nil
+}
+
+func (m *MemStore) ListRetiredSegments(_ context.Context, plane blockstore.Plane, bucket string) ([]logstore.SegmentMeta, error) {
+	return m.listSegments(plane, bucket, true), nil
+}
+
+// listSegments returns bucket's segment rows for plane, either the unretired
+// ones or the retired ones, ordered by seq.
+func (m *MemStore) listSegments(plane blockstore.Plane, bucket string, retired bool) []logstore.SegmentMeta {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var out []logstore.SegmentMeta
 	for _, r := range m.segments {
-		if r.Plane != plane || r.Bucket != bucket {
+		if r.Plane != plane || r.Bucket != bucket || (r.RetiredAt != 0) != retired {
 			continue
 		}
 		out = append(out, *r)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Seq < out[j].Seq })
-	return out, nil
+	return out
 }
 
 func (m *MemStore) RehydrateSegment(_ context.Context, sm logstore.SegmentMeta) error {

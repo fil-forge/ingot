@@ -124,7 +124,7 @@ flowchart TB
 
     subgraph host["host"]
         root["ingot (root)<br/>Server, Module"]
-        cmd["cmd<br/>serve, whoami, version, blake3"]
+        cmd["cmd<br/>serve, whoami, version, blake3, catalog"]
     end
 
     vgw -->|"backend.Backend"| s3f
@@ -146,18 +146,25 @@ flowchart TB
     iam --> reg
     reg --> mig
     cmd --> root
+    cmd -->|"catalog usage"| ls
+    cmd --> reg
+    cmd --> iam
+    cmd --> bs
+    cmd --> cars
     root --> vgw
     root -->|"BlockReader =<br/>Cached(Forge)"| bs
 ```
 
 - `registry.Postgres` is one struct satisfying the registry seams
   (`Registry` plus the intent, location, inclusion, blob-ref, GC, multipart,
-  and park stores) and `logstore.Meta`.
+  park, and catalog usage stores) and `logstore.Meta`.
 - `uploader.Forge` is one struct behind `Uploader`, `BodyUploader`,
   `DeferredBodyUploader`, and `BlobRemover`.
 - `inmem` (test-only fakes) and `tokenstore` (empty; only the dormant login
   paths would read it) are omitted. `blockstore/locator`'s indexer-backed
   locator compiles but is never injected.
+- `cmd`'s `catalog usage` builds its own logstore walk, registry, Hilt
+  authorization and Forge reader rather than going through the server.
 - `iam` and the network tiers never import each other; they meet at
   `internal/reqscope` (the request-scoped proof store, drawn in
   [principals](#principals-and-proof-stores)).
@@ -910,17 +917,20 @@ flowchart TB
     end
 
     hilt["hilt did:web:hilt"] -->|"/s3/request/authorize and<br/>/s3/bucket/info responses"| kp
+    hilt -->|"the same, for a listing the<br/>command signs with an access key"| walk
 
     subgraph stores["proof stores"]
         kp["iam.KeyProofs: one DelegationCache<br/>per access key, 24h idle eviction;<br/>also the key's effective S3 action set per bucket"]
         ship["uploader.Forge shipProofs:<br/>per-space store, 1h TTL"]
         commit["uploader.Forge commitProofs:<br/>per-space store, 1h TTL"]
         static["AuthServiceProofs:<br/>static container from config"]
+        walk["ingot catalog usage: one store<br/>per bucket walked (AuthorizeSigned)"]
         tok["tokenstore (tokens.cbor):<br/>empty; dormant login paths only"]
     end
 
     kp -->|"reqscope.ProofStore<br/>on the request ctx"| writes["uploader:<br/>/blob/add, abort, remove, /index/add<br/>/upload/add, /upload/remove"]
     kp -->|"same store"| reads["blockstore.Forge:<br/>content/retrieve"]
+    walk -->|"reqscope.ProofStore<br/>on the walk's ctx"| reads
     kp -->|"captureShipProofs<br/>at UploadBlob and StartBlob,<br/>borrowable stores only"| ship
     kp -->|"CaptureShipAuthority<br/>at every bucketop commit,<br/>borrowable stores only"| commit
     commit --> catship["async catalog ship"]
@@ -959,6 +969,12 @@ flowchart TB
   write.
 - Each access key gets its own `DelegationCache`, so a proof chain can never
   assemble across keys.
+- `ingot catalog usage` is a command, not the daemon, and gets its stores
+  another way: with an access key from its environment it signs a
+  ListObjectsV2 of each bucket it must read from Forge, has hilt authorize it
+  as it would a request the gateway serves, and keeps the delegations for that
+  bucket's walk alone. The daemon holds no tenant's secret, so it has no such
+  path.
 - The same store holds the effective S3 action set hilt reported for the key
   on each bucket, expiring with the keys and the tenant (next UTC midnight
   plus clock skew). One invalidation therefore drops the chains and the set
@@ -979,7 +995,8 @@ flowchart TB
 Cross-references: [`architecture.md` §9](./architecture.md#9-the-system-contract-piri--sprue--indexer).
 
 Sources: `iam/service.go`, `iam/keyproofs.go`, `iam/proofcache.go`,
-`internal/reqscope/reqscope.go`, `uploader/forge.go` (shipProofs,
+`internal/reqscope/reqscope.go`, `cmd/catalog.go` (forgeSegments),
+`uploader/forge.go` (shipProofs,
 captureShipProofs, CaptureShipAuthority), `bucketop/bucketop.go` (Tx.Commit),
 `module.go`, `config/config.go` (auth_service fields).
 Review when these change.
@@ -1083,6 +1100,8 @@ erDiagram
         bytea sha256
         bigint shipped_at
         bytea index_digest
+        bigint dead_bytes "dead on arrival; NULL = unmeasured"
+        bigint retired_at
     }
     segment_op_roots {
         bigint seq PK, FK
@@ -1224,9 +1243,10 @@ erDiagram
 - The five solid relationships are the schema's only real foreign keys;
   dashed ones are soft joins the code performs. `revocation_cursor` stands
   alone.
-- `catalog_journal` has no foreign key to `segments` on purpose: recovery
-  deletes the row of a segment whose CAR is missing from disk, and after a
-  lost disk the journal rows are what that segment is rebuilt from.
+- `catalog_journal` has no foreign key to `segments` on purpose: when a
+  segment's CAR is missing from disk, recovery rebuilds its journaled blocks
+  into new segments and moves the rows onto them, then deletes the lost row if
+  it was open (and retires it if it was sealed).
 - `gc_candidates` is write-only (no reader exists yet; its entry paths are the
   [catalog GC candidates](#catalog-gc-candidates-what-gets-remembered-for-removal)
   diagram); `segments.plane`
@@ -1243,9 +1263,9 @@ Sources: `migrations/sql/*.sql`. Review whenever a migration is added.
 
 ## DeleteBucket teardown order
 
-Teardown crosses every seam in order: prove the bucket empty, unwind
-in-flight multipart, quiesce the log, release every network registration,
-then delete at hilt and locally.
+Teardown crosses every seam in order: prove the bucket empty, commit its
+root empty, unwind in-flight multipart, quiesce the log, release every
+network registration, then delete at hilt and locally.
 
 ```mermaid
 sequenceDiagram
@@ -1261,29 +1281,43 @@ sequenceDiagram
     Note over B,R: the whole operation runs under the per-bucket lock
     B->>R: reg.Get
     B->>B: MST emptiness walk<br/>(ErrBucketNotEmpty, or the versioned variant)
+    B->>R: EmptyRoot (one tx: root → empty, forge root cleared,<br/>the bucket's catalog_journal rows dropped)
+    Note over B,R: nothing the bucket reads is released below
     loop each open multipart session
         B->>U: abortOpenSession: /blob/abort parked blobs
         Note over B,U: the request's own proofs sign the release legs<br/>(s3:DeleteBucket delegates blob.Abort + blob.Remove)
     end
     B->>L: QuiesceBucketLog (stop flushes, wait for in-flight ship)
-    B->>L: ShippedSegmentDigests (each CAR + its index blob,<br/>sealed-but-unshipped over-listed, release is idempotent)
+    loop ReleaseRetiredSegments: each retired segment
+        L->>U: /blob/remove its CAR + index blob
+        L->>R: DeleteSegment (its row, once both are released)
+    end
+    B->>L: ShippedSegmentDigests (each unretired CAR + its index blob,<br/>sealed-but-unshipped over-listed, release is idempotent)
     loop each digest
         B->>U: /blob/remove (release the space's registration)
     end
+    B->>U: drainSpaceReleases: /blob/remove each deleted<br/>object's blob still behind the reader grace
+    B->>U: DrainSpaceRegistrations: send the space's queued<br/>/upload/add and /upload/remove changes
     B->>H: /s3/bucket/delete (hilt refuses while registrations remain)
     B->>R: reg.Delete (the local row, its catalog_journal rows cascading)
     B->>L: RemoveBucketLog, best-effort<br/>(directory + segment rows)
     B-->>C: 204
 ```
 
-- The log seams (`QuiesceBucketLog`, `ShippedSegmentDigests`,
-  `RemoveBucketLog`) are type-asserted on `blockstore.Log`: a plain `Store`
+- The log seams (`QuiesceBucketLog`, `ReleaseRetiredSegments`,
+  `ShippedSegmentDigests`, `RemoveBucketLog`) are type-asserted on `blockstore.Log`: a plain `Store`
   without them silently no-ops, which is the trap this diagram documents.
-- A failure after the quiesce leaves the bucket functional: the closed store
-  reopens lazily on the next use.
+- A failure after the root is committed empty (hilt refusing, a release
+  erroring) leaves the bucket functional: it lists empty, the closed store
+  reopens lazily on the next write, and a retried delete starts over,
+  except for the retired segments already released, whose rows are gone.
+  The quiesce leaves the last segment sealed and unshipped until that next
+  write; its journal rows went with the root.
 
 Sources: `s3frontend/bucket.go` (DeleteBucket), `s3frontend/multipart.go`
-(abortOpenSession), `logstore/manager.go`. Review when these change.
+(abortOpenSession), `s3frontend/object.go` (drainSpaceReleases),
+`s3frontend/uploadsweep.go` (DrainSpaceRegistrations), `logstore/manager.go`.
+Review when these change.
 
 ## Package-to-diagram map
 
@@ -1292,18 +1326,20 @@ listed diagrams (each diagram's `Sources:` footer names its exact files).
 
 | Package / file | Diagrams to review |
 |---|---|
-| `s3frontend/object.go` | put, get, blob-lifecycle, version-tree, gc-candidates |
+| `s3frontend/object.go` | put, get, blob-lifecycle, version-tree, gc-candidates, delete-bucket |
 | `s3frontend/version.go` | put, get, multipart, blob-lifecycle, version-tree, gc-candidates |
 | `s3frontend/multipart.go` | multipart, part-states, multipart-states, blob-lifecycle |
 | `s3frontend/acceptor.go` | multipart, part-states, blob-lifecycle |
 | `s3frontend/stream.go` | put, multipart, block-routes, blob-lifecycle |
 | `s3frontend/bucket.go` | context, delete-bucket |
+| `s3frontend/uploadsweep.go` | put, delete-bucket |
 | `bucketop/` | put, get, delete-bucket, packages, principals |
 | `blockstore/` | get, packages, block-routes; `forge.go` also context, principals |
 | `registry/` | schema, get, blob-lifecycle, logstore-pipeline |
 | `logstore/` | logstore-pipeline, segment-states, get, block-routes, delete-bucket |
 | `uploader/`, `forgeclient/` | context, put, multipart, principals, logstore-pipeline, block-routes |
 | `iam/`, `internal/reqscope/` | principals, authorize, context |
+| `cmd/catalog.go` | packages, principals |
 | `bucket/`, `mst/` | version-tree, put, get |
 | `migrations/sql/` | schema, plus any state diagram naming a changed CHECK |
 | `module.go`, `server.go`, `config/` | packages, context, logstore-pipeline; `server.go` also authorize and multipart |

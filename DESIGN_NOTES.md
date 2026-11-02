@@ -105,10 +105,13 @@ full lifecycle):
   licenses the caller's bucket-root CAS.
 - **The unshipped catalog is journaled in Postgres**: the root swap's
   transaction writes the batch's blocks to `ingot.catalog_journal` under the
-  segment `AppendBatch` reported, and shipping that segment deletes them. A
-  copy of Postgres (a standby, a restore) therefore holds every block its
-  roots need that this host's disk alone would otherwise hold. Rebuilding a
-  lost segment from the journal is not built yet.
+  segment `AppendBatch` reported, and shipping that segment deletes them, as
+  do `DeleteBucket` emptying the bucket's root and the bucket row's deletion.
+  A copy of Postgres (a standby, a restore) therefore holds every block its
+  roots need that this host's disk alone would otherwise hold. Recovery
+  rebuilds a segment whose file is gone from its journaled blocks, so Ingot
+  can start from a recovered Postgres alone (`logstore/README.md`, crash
+  recovery).
 - **`forge_root_cid` advances only when a segment ships, and only guarded**:
   the update lands in the same transaction as the shipped stamp, and only
   where `buckets.root_cid` still equals the op-root.
@@ -542,7 +545,10 @@ draws the chains and the stores.
   intent unchanged for an hour as stalled, for the
   `ingot.local_blobs.stalled_bytes` gauge.
 - **No catalog GC**: `gc_candidates` is write-only; superseded MST nodes
-  accumulate on Forge with mutation volume.
+  accumulate on Forge with mutation volume. Each ship records how much of its
+  segment was already dead (`segments.dead_bytes`), and the
+  `ingot.catalog.*` gauges sum that and the shipped bytes per bucket; what
+  dies after a segment ships is not measured.
 - **Reads carry no bucket context**: `Manager.Get` linear-scans every open
   bucket store; threading the bucket into the read path removes the scan.
 - **The ship authority expires**: the async flush signs with a per-space
