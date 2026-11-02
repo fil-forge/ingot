@@ -36,6 +36,9 @@ type tree struct {
 	// woken are the IDs of the sync children and cancelled tasks, whose
 	// waiters are woken after the commit.
 	woken []TaskID
+	// childRuns are the sync children whose handlers ran, reported to the
+	// metrics once the tree has an outcome.
+	childRuns []childRun
 	// tx is the open transaction under ApplyWritesImmediately; cur is the
 	// savepoint of the sync child now running, or tx itself.
 	tx  pgx.Tx
@@ -187,7 +190,9 @@ func (ex *Exec) run(ctx context.Context, s Spec) ([]byte, error) {
 		tr.cur = sp
 	}
 	a, _ := tr.r.handler(k)
+	start := time.Now()
 	res, err := callHandler(ctx, a.handler, cex, child)
+	defer func() { tr.childRuns = append(tr.childRuns, childRun{child, time.Since(start), err}) }()
 	if err == nil {
 		err = tr.add(ctx, write{
 			sql: `INSERT INTO ` + q.tasks + ` (id, subject, action, expires, args, sync, node, state, result, finished)
@@ -248,6 +253,27 @@ func (tr *tree) releaseChildren(ctx context.Context) {
 	for k, h := range tr.holds {
 		tr.r.release(ctx, h)
 		delete(tr.holds, k)
+	}
+}
+
+// childRun is one sync child's run, and the error it ended with.
+type childRun struct {
+	task Task
+	d    time.Duration
+	err  error
+}
+
+// observeChildren reports the tree's sync children once it has an outcome:
+// all of them succeeded when it committed, and the one that failed it when it
+// failed. A tree that restarts reports none of its run.
+func (tr *tree) observeChildren(ctx context.Context, committed bool) {
+	for _, c := range tr.childRuns {
+		switch {
+		case committed:
+			tr.r.metrics.observeChild(ctx, c.task, outcomeSucceeded, c.d)
+		case c.err != nil:
+			tr.r.metrics.observeChild(ctx, c.task, outcomeFailed, c.d)
+		}
 	}
 }
 
@@ -442,6 +468,7 @@ func (r *Runner) runRoot(ctx context.Context, h *hold, tasks []Task) (res []byte
 			if err := r.failOrRetry(ctx, h, a, live, herr, start); err != nil {
 				return nil, nil, err
 			}
+			tr.observeChildren(ctx, false)
 			return nil, herr, nil
 		}
 		cerr := tr.commit(ctx, results)
@@ -456,6 +483,7 @@ func (r *Runner) runRoot(ctx context.Context, h *hold, tasks []Task) (res []byte
 				r.pokeQueue(q)
 			}
 			r.metrics.observeTasks(ctx, live, outcomeSucceeded, start)
+			tr.observeChildren(ctx, true)
 			return results[0], nil, nil
 		}
 		if ctx.Err() != nil {

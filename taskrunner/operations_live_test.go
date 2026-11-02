@@ -237,3 +237,66 @@ func TestTaskOutcomesAndTakeovers_Live(t *testing.T) {
 		t.Errorf("lease.takeovers = %+v, want 1", takeovers.DataPoints)
 	}
 }
+
+func TestQueueGaugesReadZeroOnceDrained_Live(t *testing.T) {
+	f, reader := metricsFixture(t, 1)
+	f.handle(t, qTop, "put", f.put())
+	f.start(t)
+	ctx := waitCtx(t)
+	id, err := f.r.Submit(ctx, taskrunner.Spec{Queue: qTop, Subject: "a", Action: "put", Args: []byte("1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.r.Wait(ctx, qTop, id); err != nil {
+		t.Fatal(err)
+	}
+
+	got := collect(t, reader)
+	aa := []attribute.KeyValue{attribute.String("queue", qTop), attribute.String("action", "put")}
+	for _, name := range []string{"taskrunner.queue.ready", "taskrunner.queue.delayed"} {
+		if v, ok := gaugeValue[int64](t, got[name], aa...); !ok || v != 0 {
+			t.Errorf("%s = %d (reported %v), want 0 once drained", name, v, ok)
+		}
+	}
+	if v, ok := gaugeValue[float64](t, got["taskrunner.queue.oldest_ready_age"], aa...); !ok || v != 0 {
+		t.Errorf("oldest_ready_age = %v (reported %v), want 0 once drained", v, ok)
+	}
+}
+
+func TestSyncChildOutcomesAreRecorded_Live(t *testing.T) {
+	f, reader := metricsFixture(t, 0)
+	f.handle(t, qBottom, "child", func(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
+		if string(task.Args) == "fail" {
+			return nil, errors.New("child failed")
+		}
+		return nil, nil
+	})
+	f.handle(t, qTop, "parent", func(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
+		_, err := ex.Run(ctx, taskrunner.Spec{Queue: qBottom, Subject: "c", Action: "child", Args: task.Args})
+		return nil, err
+	})
+	f.start(t)
+	ctx := waitCtx(t)
+	if _, err := f.r.Run(ctx, taskrunner.Spec{Queue: qTop, Subject: "p", Action: "parent", Args: []byte("ok")}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.r.Run(ctx, taskrunner.Spec{Queue: qTop, Subject: "p", Action: "parent", Args: []byte("fail")}); err == nil {
+		t.Fatal("parent succeeded")
+	}
+
+	h, ok := collect(t, reader)["taskrunner.task.duration"].(metricdata.Histogram[float64])
+	if !ok {
+		t.Fatal("task.duration not reported")
+	}
+	counts := map[string]uint64{}
+	for _, dp := range h.DataPoints {
+		queue, _ := dp.Attributes.Value("queue")
+		outcome, _ := dp.Attributes.Value("outcome")
+		if queue.AsString() == qBottom {
+			counts[outcome.AsString()] += dp.Count
+		}
+	}
+	if counts["succeeded"] != 1 || counts["failed"] != 1 {
+		t.Errorf("child outcomes %v, want succeeded 1 and failed 1", counts)
+	}
+}

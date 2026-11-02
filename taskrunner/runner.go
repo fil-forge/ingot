@@ -396,13 +396,14 @@ func (r *Runner) Start(ctx context.Context) error {
 func (r *Runner) Stop(ctx context.Context) error {
 	r.mu.Lock()
 	done := r.stopped
+	// The gauge callback takes r.mu, and unregistering waits for a
+	// collection in progress, so the callback is unregistered after r.mu is
+	// released.
+	var collecting metric.Registration
 	if r.running {
 		r.running = false
 		r.cancel()
-		if r.metrics.collecting != nil {
-			_ = r.metrics.collecting.Unregister()
-			r.metrics.collecting = nil
-		}
+		collecting, r.metrics.collecting = r.metrics.collecting, nil
 		done = make(chan struct{})
 		r.stopped = done
 		stopRenew, renewDone := r.stopRenew, r.renewDone
@@ -415,6 +416,9 @@ func (r *Runner) Stop(ctx context.Context) error {
 		}()
 	}
 	r.mu.Unlock()
+	if collecting != nil {
+		_ = collecting.Unregister()
+	}
 	if done == nil {
 		return nil
 	}
