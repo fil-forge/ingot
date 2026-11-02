@@ -93,7 +93,8 @@ type Options struct {
 	// queues later in the list.
 	Queues []QueueOptions
 	// LeaseTTL is how long a subject's lease lasts without renewal. A crashed
-	// process's tasks are resumed once it passes. Defaults to 30 seconds.
+	// process's tasks are resumed once it passes. Defaults to 30 seconds, and
+	// must be at least a millisecond.
 	LeaseTTL time.Duration
 	// PollInterval is how often each queue is checked for due tasks, and the
 	// longest a waiter goes between checks of a task in another process.
@@ -211,8 +212,12 @@ func New(db DB, opts Options) (*Runner, error) {
 	if len(opts.Queues) == 0 {
 		return nil, errors.New("task runner: no queues")
 	}
-	if opts.LeaseTTL <= 0 {
+	if opts.LeaseTTL == 0 {
 		opts.LeaseTTL = 30 * time.Second
+	}
+	// Leases are stored to the millisecond.
+	if opts.LeaseTTL < time.Millisecond {
+		return nil, fmt.Errorf("task runner: lease TTL %v is under a millisecond", opts.LeaseTTL)
 	}
 	if opts.PollInterval <= 0 {
 		opts.PollInterval = time.Second
@@ -510,7 +515,17 @@ func (r *Runner) Run(ctx context.Context, s Spec) ([]byte, error) {
 		if res, err, done := r.outcome(ctx, q, id); done {
 			return res, err
 		}
-		if err := r.waitTask(ctx, id, key, wait.next()); err != nil {
+		// Past its Expires the task can no longer start: whoever takes the
+		// subject next records it as expired, so the caller can stop waiting.
+		d := wait.next()
+		if s.Expires != nil {
+			left := time.Until(*s.Expires)
+			if left <= 0 {
+				return nil, ErrExpired
+			}
+			d = min(d, left)
+		}
+		if err := r.waitTask(ctx, id, key, d); err != nil {
 			return nil, err
 		}
 	}

@@ -114,7 +114,7 @@ SELECT false, tree_created, tree_id FROM `+q.leases+`
 // taken it over.
 func (r *Runner) setAge(ctx context.Context, h *hold, age treeAge) error {
 	tag, err := r.db.Exec(ctx, `UPDATE `+h.q.leases+` SET tree_created = $3, tree_id = $4
-		WHERE subject = $1 AND owner = $2`, h.subject, h.token, age.created, age.id)
+		WHERE subject = $1 AND owner = $2 AND expires >= now()`, h.subject, h.token, age.created, age.id)
 	if err != nil {
 		return fmt.Errorf("record tree on lease %s/%s: %w", h.q.name, h.subject, err)
 	}
@@ -197,7 +197,7 @@ func (r *Runner) awaitFree(ctx context.Context, key subjectKey, d time.Duration)
 	}
 }
 
-// renewLoop extends every lease this process holds, and every sync task's
+// renewLoop extends every lease this process holds and has not let expire, and every sync task's
 // claim that its caller is waiting, three times per TTL. A lease found taken
 // over is marked lost; the tree under it stops before its next attempt and
 // fails its commit.
@@ -235,7 +235,7 @@ func (r *Runner) renewLoop(ctx context.Context) {
 
 func (r *Runner) renew(ctx context.Context, q *queue, tokens []uuid.UUID) {
 	rows, err := r.db.Query(ctx, `UPDATE `+q.leases+` SET expires = now() + $2 * interval '1 millisecond'
-		WHERE owner = ANY($1) RETURNING owner`, tokens, r.opts.LeaseTTL.Milliseconds())
+		WHERE owner = ANY($1) AND expires >= now() RETURNING owner`, tokens, r.opts.LeaseTTL.Milliseconds())
 	if err != nil {
 		if ctx.Err() == nil {
 			r.log.Warn("renew leases", zapQueue(q.name), zapErr(err))
