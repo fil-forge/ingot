@@ -120,6 +120,17 @@ Internal:
   inclusions, blob_refs, GC, multipart sessions/parts, parks, streams),
   `locallocator.go` (the read tier's `Locator`). One `*Postgres` satisfies
   all of them.
+- **`taskrunner/`** — durable task queues in Postgres (one tasks table and
+  one leases table per queue), serialized per (queue, subject) by a lease
+  row. A task's tree (its handler plus sync children in later queues) adds
+  writes to an ordered list that commits in one transaction at the end, with
+  the rows of the tasks it spawned; sibling children taking leases in
+  opposite orders resolve by the younger tree giving way. Imports nothing
+  else from ingot (a test enforces it), so it can ship as a library.
+  `taskrunnertest` makes a fresh schema per test and runs a tree with writes
+  held and applied straight away (`CheckOwnWrites`). Not wired into the
+  server yet. Live tests need `INGOT_TEST_DSN`; each uses its own schema and
+  truncates nothing.
 - **`uploader/`** — `forge.go`/`blob.go`: `Forge` behind `Uploader`
   (`SubmitShard`), `BodyUploader`/`DeferredBodyUploader` (`UploadBlob`,
   `ConcludeBlobs`, `AbortBlob`), `StreamingBodyUploader` (`StartBlob`,
