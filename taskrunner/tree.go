@@ -357,11 +357,11 @@ func (r *Runner) runRoot(ctx context.Context, h *hold, tasks []Task) (res []byte
 	live := tasks
 	a, ok := r.handler(actionKey{first.Queue, first.Action})
 	if !ok {
+		// Only a registered batching action forms a batch, so this is one
+		// task; it is recorded the same way as any failure all the same.
 		msg := fmt.Sprintf("no handler for %s.%s", first.Queue, first.Action)
-		for _, t := range live {
-			if err := r.finish(ctx, h, t, "failed", msg); err != nil {
-				return nil, nil, err
-			}
+		if err := r.failOrRetry(ctx, h, &action{}, live, errors.New(msg)); err != nil {
+			return nil, nil, err
 		}
 		return nil, &HandlerError{Queue: first.Queue, Task: first.ID, Message: msg}, nil
 	}
