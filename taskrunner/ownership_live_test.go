@@ -210,3 +210,121 @@ func TestCheckOwnWritesTreatsAConditionalMissAlike_Live(t *testing.T) {
 		},
 	})
 }
+
+func TestLeaseTakenBetweenDrainedTasksStopsTheDrain_Live(t *testing.T) {
+	f := newFixture(t, 1)
+	var secondAt atomic.Int64
+	f.handle(t, qTop, "first", func(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
+		return nil, nil
+	})
+	f.handle(t, qTop, "second", func(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
+		secondAt.CompareAndSwap(0, time.Now().UnixNano())
+		return nil, nil
+	})
+	ctx := waitCtx(t)
+	if err := f.r.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// Another consumer takes the subject over as the first task commits, so
+	// the takeover lands between the two tasks of one drain.
+	leases, tasks := f.env.Table("queue_top_leases"), f.env.Table("queue_top_tasks")
+	steal := f.env.Table("steal_lease")
+	if _, err := f.env.DB.Exec(ctx, `
+CREATE FUNCTION `+steal+`() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+	UPDATE `+leases+` SET owner = gen_random_uuid(), expires = now() + interval '500 milliseconds'
+		WHERE subject = NEW.subject;
+	RETURN NEW;
+END $$;
+CREATE TRIGGER steal AFTER UPDATE OF state ON `+tasks+` FOR EACH ROW
+	WHEN (NEW.action = 'first' AND NEW.state = 'succeeded') EXECUTE FUNCTION `+steal+`();`); err != nil {
+		t.Fatal(err)
+	}
+	first, err := f.r.Submit(ctx, taskrunner.Spec{Queue: qTop, Subject: "s", Action: "first"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := f.r.Submit(ctx, taskrunner.Spec{Queue: qTop, Subject: "s", Action: "second"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.start(t)
+	if _, err := f.r.Wait(ctx, qTop, second); err != nil {
+		t.Fatal(err)
+	}
+	var stolenAt time.Time
+	if err := f.env.DB.QueryRow(ctx, `SELECT finished FROM `+tasks+` WHERE id = $1`, first).Scan(&stolenAt); err != nil {
+		t.Fatal(err)
+	}
+	if gap := time.Unix(0, secondAt.Load()).Sub(stolenAt); gap < 400*time.Millisecond {
+		t.Errorf("the next task started %v after its subject's lease was taken over", gap)
+	}
+}
+
+func TestChildReusingALostLeaseRestartsTheTree_Live(t *testing.T) {
+	f := newFixture(t, 0)
+	var stole atomic.Bool
+	var secondRuns atomic.Int32
+	f.handle(t, qBottom, "first", func(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
+		if stole.CompareAndSwap(false, true) {
+			f.stealLease(t, qBottom, task.Subject, 300*time.Millisecond)
+		}
+		return nil, nil
+	})
+	f.handle(t, qBottom, "second", func(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
+		secondRuns.Add(1)
+		return nil, nil
+	})
+	f.handle(t, qTop, "parent", func(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
+		if _, err := ex.Run(ctx, taskrunner.Spec{Queue: qBottom, Subject: "c", Action: "first"}); err != nil {
+			return nil, err
+		}
+		// Long enough for renewal to find the child's lease taken over.
+		time.Sleep(500 * time.Millisecond)
+		_, err := ex.Run(ctx, taskrunner.Spec{Queue: qBottom, Subject: "c", Action: "second"})
+		return nil, err
+	})
+	f.start(t)
+
+	if _, err := f.r.Run(waitCtx(t), taskrunner.Spec{Queue: qTop, Subject: "p", Action: "parent"}); err != nil {
+		t.Fatal(err)
+	}
+	if n := secondRuns.Load(); n != 1 {
+		t.Errorf("the second child ran %d times, want once: never under the lost lease", n)
+	}
+}
+
+func TestStopAfterATimedOutStopWaitsForTheShutdown_Live(t *testing.T) {
+	f := newFixture(t, 0)
+	started := make(chan struct{})
+	var handlerDone atomic.Bool
+	f.handle(t, qTop, "block", func(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
+		close(started)
+		<-ctx.Done()
+		time.Sleep(200 * time.Millisecond)
+		handlerDone.Store(true)
+		return nil, ctx.Err()
+	})
+	f.start(t)
+	go func() {
+		_, _ = f.r.Run(context.Background(), taskrunner.Spec{Queue: qTop, Subject: "s", Action: "block"})
+	}()
+	<-started
+
+	expired, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := f.r.Stop(expired); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Stop with an ended ctx: %v, want context.Canceled", err)
+	}
+	if err := f.r.Start(context.Background()); err == nil {
+		t.Error("Start succeeded while the previous shutdown was still running")
+	}
+	if err := f.r.Stop(waitCtx(t)); err != nil {
+		t.Fatal(err)
+	}
+	if !handlerDone.Load() {
+		t.Error("a second Stop returned before the first one's shutdown finished")
+	}
+	if err := f.r.Start(context.Background()); err != nil {
+		t.Errorf("Start after the shutdown finished: %v", err)
+	}
+}

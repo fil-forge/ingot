@@ -180,6 +180,9 @@ type Runner struct {
 	// renewDone closes when the renewer has stopped.
 	renewDone chan struct{}
 	stopRenew context.CancelFunc
+	// stopped closes when the shutdown Stop began has finished. It is nil
+	// before the first Stop.
+	stopped chan struct{}
 }
 
 type queue struct {
@@ -292,6 +295,13 @@ func (r *Runner) Start(ctx context.Context) error {
 	if r.running {
 		return errors.New("task runner: already started")
 	}
+	if r.stopped != nil {
+		select {
+		case <-r.stopped:
+		default:
+			return errors.New("task runner: still stopping")
+		}
+	}
 	base := context.WithoutCancel(ctx)
 	r.ctx, r.cancel = context.WithCancel(base)
 	r.running = true
@@ -311,26 +321,31 @@ func (r *Runner) Start(ctx context.Context) error {
 }
 
 // Stop cancels the workers and the Run calls in progress, and waits for them.
+// A Stop that returns early because ctx ended leaves the shutdown running: a
+// later Stop waits for it, and Start fails until it has finished.
 // A task interrupted by Stop stays pending and is resumed by the next process
 // to take its subject.
 func (r *Runner) Stop(ctx context.Context) error {
 	r.mu.Lock()
-	if !r.running {
-		r.mu.Unlock()
+	done := r.stopped
+	if r.running {
+		r.running = false
+		r.cancel()
+		done = make(chan struct{})
+		r.stopped = done
+		stopRenew, renewDone := r.stopRenew, r.renewDone
+		go func() {
+			r.wg.Wait()
+			r.inline.Wait()
+			stopRenew()
+			<-renewDone
+			close(done)
+		}()
+	}
+	r.mu.Unlock()
+	if done == nil {
 		return nil
 	}
-	r.running = false
-	r.cancel()
-	r.mu.Unlock()
-
-	done := make(chan struct{})
-	go func() {
-		r.wg.Wait()
-		r.inline.Wait()
-		r.stopRenew()
-		<-r.renewDone
-		close(done)
-	}()
 	select {
 	case <-done:
 		return nil

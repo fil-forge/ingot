@@ -213,7 +213,10 @@ func (ex *Exec) run(ctx context.Context, s Spec) ([]byte, error) {
 // younger holder and gives way to an older one (see dieError).
 func (tr *tree) lease(ctx context.Context, q *queue, subject string) error {
 	key := subjectKey{q.name, subject}
-	if _, ok := tr.holds[key]; ok {
+	if h, ok := tr.holds[key]; ok {
+		if h.lost.Load() {
+			return &childLostError{key}
+		}
 		return nil
 	}
 	wait := newBackoff(tr.r.opts.PollInterval)
@@ -241,6 +244,15 @@ func (tr *tree) releaseChildren(ctx context.Context) {
 		tr.r.release(ctx, h)
 		delete(tr.holds, k)
 	}
+}
+
+// childLostError restarts a tree whose earlier child's lease was taken over
+// before a later child on the same subject could start. The tree runs again
+// from scratch with fresh leases.
+type childLostError struct{ key subjectKey }
+
+func (e *childLostError) Error() string {
+	return fmt.Sprintf("lease on %s/%s lost before a child could run under it", e.key.queue, e.key.subject)
 }
 
 // callHandler runs h, turning a panic into an error.
@@ -357,7 +369,8 @@ func (r *Runner) runRoot(ctx context.Context, h *hold, t Task) (res []byte, err 
 		// giving way to an older tree ends the run however the handler
 		// reported it.
 		var die *dieError
-		if tr.failed != nil && (herr == nil || errors.As(tr.failed, &die)) {
+		var lost *childLostError
+		if tr.failed != nil && (herr == nil || errors.As(tr.failed, &die) || errors.As(tr.failed, &lost)) {
 			herr = tr.failed
 		}
 		if herr != nil {
@@ -371,6 +384,13 @@ func (r *Runner) runRoot(ctx context.Context, h *hold, t Task) (res []byte, err 
 			}
 			if ctx.Err() != nil {
 				return nil, nil, ctx.Err()
+			}
+			if errors.As(herr, &lost) {
+				r.log.Warn("task's child lost its lease", zapTask(t), zapInt("attempt", attempt), zapErr(lost))
+				if attempt >= r.opts.CommitAttempts {
+					return nil, nil, errNotCommitted
+				}
+				continue
 			}
 			r.log.Warn("task failed", zapTask(t), zapErr(herr))
 			if err := r.finish(ctx, h, t, "failed", herr.Error()); err != nil {
