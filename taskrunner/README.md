@@ -258,6 +258,41 @@ A task waiting to retry counts as not started, so it can still be cancelled: its
 
 Sync tasks are never retried: the error goes to the caller, which retries the request if it wants to.
 
+## Placement
+
+A task that touches one instance's local state, such as a cached file, is placed on that instance with `Node`. Only the runner whose `Options.Node` matches runs it, and other instances leave the tasks behind it on its subject alone until it has run, so the subject's order holds. A sync task or child placed on another instance is refused with `ErrOtherNode`.
+
+```go
+r, err := taskrunner.New(pool, taskrunner.Options{Schema: "ingot", Queues: queues, Node: hostname})
+
+_, err = ex.Submit(ctx, taskrunner.Spec{
+	Queue:   "queue-shard",
+	Subject: digest,
+	Action:  "cache",
+	Node:    &hostname,
+})
+```
+
+## Metrics
+
+Pass a `MeterProvider` and the runner reports through OpenTelemetry, labelled by queue and, where there is one, action:
+
+| Metric | What it shows |
+|---|---|
+| `taskrunner.queue.ready` | Pending tasks that are due |
+| `taskrunner.queue.delayed` | Pending tasks waiting on their `NotBefore` |
+| `taskrunner.queue.oldest_ready_age` | How long the oldest due task has been due. Growth means the workers are not keeping up, or a subject is stuck |
+| `taskrunner.task.duration` | Time from start to outcome, labelled `succeeded`, `failed`, `retried` or `expired` |
+| `taskrunner.lease.wait` | Time a sync task or child waited for its subject's lease |
+| `taskrunner.lease.takeovers` | Leases taken over after they expired, which means a consumer stopped renewing |
+| `taskrunner.workers.busy`, `taskrunner.workers.limit` | Workers running a queue's tasks in this process, and the most it runs |
+
+```go
+r, err := taskrunner.New(pool, taskrunner.Options{Schema: "ingot", Queues: queues, MeterProvider: otel.GetMeterProvider()})
+```
+
+The queue gauges are read from Postgres each time the exporter collects. Without a provider every instrument is a no-op.
+
 ## Testing handlers
 
 `taskrunnertest.NewEnv` creates a fresh schema in the database named by `INGOT_TEST_DSN` and drops it when the test ends, so tests never touch other data. Without the variable, the test is skipped.
