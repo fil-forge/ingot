@@ -125,7 +125,10 @@ Internal:
   row. A task's tree (its handler plus sync children in later queues) adds
   writes to an ordered list that commits in one transaction at the end, with
   the rows of the tasks it spawned; sibling children taking leases in
-  opposite orders resolve by the younger tree giving way. Imports nothing
+  opposite orders resolve by the younger tree giving way. Async tasks can be
+  replacements (the later `NotBefore` wins), cancelled before they start,
+  batched (`HandleBatch`) and retried (`WithRetry`; `Permanent` stops
+  retries). Imports nothing
   else from ingot (a test enforces it), so it can ship as a library.
   `taskrunnertest` makes a fresh schema per test and runs a tree with writes
   held and applied straight away (`CheckOwnWrites`). Not wired into the

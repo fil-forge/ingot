@@ -39,38 +39,22 @@ func (r *Runner) drain(ctx context.Context, q *queue, h *hold, upTo int64, targe
 		if h.lost.Load() {
 			return drained{stop: errLeaseLost}
 		}
-		t, waited, err := r.nextDue(ctx, q, h.subject, upTo)
+		tasks, err := r.claim(ctx, q, h.subject, upTo, target)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return drained{}
 		}
 		if err != nil {
 			return drained{stop: err}
 		}
-		if waited && t.ID != target {
-			return drained{stop: &yieldError{t.ID}}
-		}
-		res, terr, stop := r.runRoot(ctx, h, t)
+		res, terr, stop := r.runRoot(ctx, h, tasks)
 		if stop != nil {
 			return drained{stop: stop}
 		}
-		if t.ID == target {
+		if tasks[0].ID == target {
 			return drained{ran: true, res: res, err: terr}
 		}
 	}
 	return drained{full: true}
-}
-
-// nextDue returns the subject's oldest due task, and whether a Run caller is
-// waiting to run it.
-func (r *Runner) nextDue(ctx context.Context, q *queue, subject string, upTo int64) (t Task, waited bool, err error) {
-	t = Task{Queue: q.name, Subject: subject}
-	err = r.db.QueryRow(ctx, `SELECT id, action, created, not_before, expires, args,
-		coalesce(waiting_until > now(), false) FROM `+q.tasks+`
-		WHERE subject = $1 AND state = 'pending' AND seq <= $2
-		AND (not_before IS NULL OR not_before <= now())
-		ORDER BY seq LIMIT 1`, subject, upTo,
-	).Scan(&t.ID, &t.Action, &t.Created, &t.NotBefore, &t.Expires, &t.Args, &waited)
-	return t, waited, err
 }
 
 // pollLoop hands due, free subjects to workers, up to the queue's worker

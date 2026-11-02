@@ -43,6 +43,22 @@ CREATE TABLE %[2]s (
 	tree_id      uuid NOT NULL
 );`, q.tasks, q.leases, pgx.Identifier{q.table + "_tasks_pending"}.Sanitize())
 	},
+	// Replacement, cancellation and retries.
+	func(q *queue) string {
+		return fmt.Sprintf(`
+ALTER TABLE %[1]s
+	ADD COLUMN started     timestamptz,
+	ADD COLUMN replaceable boolean NOT NULL DEFAULT false,
+	ADD COLUMN attempts    integer NOT NULL DEFAULT 0,
+	DROP CONSTRAINT %[2]s,
+	ADD CONSTRAINT %[2]s
+		CHECK (state IN ('pending', 'succeeded', 'failed', 'expired', 'cancelled'));
+CREATE UNIQUE INDEX %[3]s ON %[1]s (subject, action)
+	WHERE state = 'pending' AND replaceable AND started IS NULL;`,
+			q.tasks,
+			pgx.Identifier{q.table + "_tasks_state_check"}.Sanitize(),
+			pgx.Identifier{q.table + "_tasks_replaceable"}.Sanitize())
+	},
 }
 
 // dueIndex lets the poll for due tasks read only the pending tasks whose
