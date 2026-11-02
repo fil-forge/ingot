@@ -17,7 +17,7 @@ import (
 // Cached wraps a BlockReader with a bounded, in-memory LRU keyed by CID. Blocks
 // are content-addressed and immutable, so caching them is always safe; this
 // fronts the network-backed reader (blockstore.Forge) so repeated reads of hot
-// objects don't re-hit the indexer + piri on every block. The cache is
+// objects don't re-resolve and re-fetch from piri on every block. The cache is
 // per-instance and resets on process restart.
 //
 // The bound is a byte budget rather than a block count, because body chunks can

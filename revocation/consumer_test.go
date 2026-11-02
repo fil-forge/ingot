@@ -2,6 +2,7 @@ package revocation_test
 
 import (
 	"context"
+	"fmt"
 	"iter"
 	"sync"
 	"testing"
@@ -164,17 +165,137 @@ func TestConsumerInvalidatesAndPersistsCursor(t *testing.T) {
 	inv := &fakeInvalidator{}
 	src := &fakeSource{scripts: []streamScript{{records: []api.FirehoseRevocation{rec1, rec2}}}}
 	c := revocation.NewConsumer(src, store, inv,
-		revocation.WithBackoff(time.Millisecond, time.Millisecond))
+		revocation.WithBackoff(time.Millisecond, time.Millisecond),
+		revocation.WithSaveInterval(time.Millisecond))
 	stop := run(c)
 	defer stop()
 
 	waitFor(t, func() bool { return len(inv.calls()) == 2 })
 	require.Equal(t, []cid.Cid{rec1.Revoke, rec2.Revoke}, inv.calls())
 
+	waitFor(t, func() bool {
+		cur, err := store.GetRevocationCursor(ctx)
+		return err == nil && cur.Revoke.Equals(rec2.Revoke)
+	})
 	cur, err := store.GetRevocationCursor(ctx)
 	require.NoError(t, err)
 	require.True(t, cur.RecordedAt.Equal(at2), "cursor tracks the last record's recorded_at")
-	require.True(t, cur.Revoke.Equals(rec2.Revoke))
+}
+
+// recordingCursorStore records every cursor it is asked to save. Like the
+// Postgres store, it refuses a save whose ctx is already canceled. With
+// release set, each save waits for release to close first.
+type recordingCursorStore struct {
+	mu      sync.Mutex
+	saved   []registry.RevocationCursor
+	release chan struct{}
+}
+
+func (s *recordingCursorStore) GetRevocationCursor(context.Context) (*registry.RevocationCursor, error) {
+	return nil, registry.ErrNotFound
+}
+
+func (s *recordingCursorStore) PutRevocationCursor(ctx context.Context, cur registry.RevocationCursor) error {
+	if s.release != nil {
+		select {
+		case <-s.release:
+		case <-ctx.Done():
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.saved = append(s.saved, cur)
+	return nil
+}
+
+func (s *recordingCursorStore) calls() []registry.RevocationCursor {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]registry.RevocationCursor(nil), s.saved...)
+}
+
+// records returns n records one second apart, named any-dlg-0 onwards.
+func records(t *testing.T, n int) []api.FirehoseRevocation {
+	t.Helper()
+	start := time.Date(2026, 8, 6, 12, 0, 0, 0, time.UTC)
+	recs := make([]api.FirehoseRevocation, n)
+	for i := range recs {
+		recs[i] = record(t, fmt.Sprintf("any-dlg-%d", i), start.Add(time.Duration(i)*time.Second))
+	}
+	return recs
+}
+
+func TestConsumerAppliesEveryRecordWhileACursorSaveIsBlocked(t *testing.T) {
+	recs := records(t, 3)
+	store := &recordingCursorStore{release: make(chan struct{})}
+	inv := &fakeInvalidator{}
+	src := &fakeSource{scripts: []streamScript{{records: recs}}}
+	c := revocation.NewConsumer(src, store, inv, revocation.WithSaveInterval(time.Millisecond))
+	stop := run(c)
+	defer stop()
+	defer close(store.release)
+
+	waitFor(t, func() bool { return len(inv.calls()) == len(recs) })
+}
+
+func TestConsumerSavesOnlyTheLastPositionWhenStoppedBeforeTheInterval(t *testing.T) {
+	recs := records(t, 50)
+	store := &recordingCursorStore{}
+	inv := &fakeInvalidator{}
+	src := &fakeSource{scripts: []streamScript{{records: recs}}}
+	c := revocation.NewConsumer(src, store, inv, revocation.WithSaveInterval(time.Hour))
+	stop := run(c)
+
+	waitFor(t, func() bool { return len(inv.calls()) == len(recs) })
+	stop()
+
+	last := recs[len(recs)-1]
+	require.Equal(t, []registry.RevocationCursor{{
+		RecordedAt: last.RecordedAt.Time(),
+		Revoke:     last.Revoke,
+	}}, store.calls())
+}
+
+func TestConsumerSavesNothingMoreWhileTheFeedIsIdle(t *testing.T) {
+	recs := records(t, 1)
+	store := &recordingCursorStore{}
+	src := &fakeSource{scripts: []streamScript{{records: recs}}}
+	c := revocation.NewConsumer(src, store, &fakeInvalidator{},
+		revocation.WithSaveInterval(time.Millisecond))
+	stop := run(c)
+	defer stop()
+
+	waitFor(t, func() bool { return len(store.calls()) == 1 })
+	// Twenty intervals with no new record.
+	time.Sleep(20 * time.Millisecond)
+	require.Len(t, store.calls(), 1)
+}
+
+// cancelingInvalidator cancels the consumer's context from inside the
+// first Revoke, so the records after it arrive once the consumer is stopped.
+type cancelingInvalidator struct {
+	fakeInvalidator
+	cancel context.CancelFunc
+}
+
+func (c *cancelingInvalidator) Revoke(revoked cid.Cid) []did.DID {
+	c.cancel()
+	return c.fakeInvalidator.Revoke(revoked)
+}
+
+func TestConsumerAppliesNoRecordAfterItIsStopped(t *testing.T) {
+	recs := records(t, 3)
+	ctx, cancel := context.WithCancel(context.Background())
+	inv := &cancelingInvalidator{cancel: cancel}
+	src := &fakeSource{scripts: []streamScript{{records: recs}}}
+	c := revocation.NewConsumer(src, &recordingCursorStore{}, inv)
+
+	c.Run(ctx)
+
+	require.Equal(t, []cid.Cid{recs[0].Revoke}, inv.calls())
 }
 
 func TestConsumerReconnectsFromLastRecord(t *testing.T) {
