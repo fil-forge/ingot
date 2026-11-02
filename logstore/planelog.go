@@ -283,12 +283,16 @@ func (pl *PlaneLog) sealOpenIfDue(ctx context.Context, force bool) error {
 	)
 	err := open.seal(sealCtx, pl.meta)
 	tracing.End(span, err)
-	if err != nil && open.State() == StateOpen {
-		return err // still open: the next tick tries again
+	if err != nil {
+		if open.State() == StateOpen {
+			return err // still open: the next tick tries again
+		}
+		// A segment that froze but whose seal wasn't recorded moves on too,
+		// so writes go to a new segment. Its ship records the seal first.
+		pl.logger.Warn("logstore: seal not recorded; its ship retries it",
+			zap.Stringer("plane", pl.plane), zap.Uint64("seq", open.Seq()), zap.Error(err))
 	}
 
-	// A segment that froze but whose seal wasn't recorded moves on too, so
-	// writes go to a new segment. Its ship records the seal first.
 	pl.catMu.Lock()
 	if pl.open == open {
 		pl.open = nil
@@ -297,7 +301,7 @@ func (pl *PlaneLog) sealOpenIfDue(ctx context.Context, force bool) error {
 	pl.catMu.Unlock()
 
 	pl.enqueueFlush(open)
-	return err
+	return nil
 }
 
 // queuedShipAttempts is how many times a queued segment's ship is tried

@@ -46,9 +46,15 @@ type Segment struct {
 
 	state    State
 	sealedAt int64
-	// sealRecorded is set once seal has written the .idx and stamped the row
-	// sealed in Meta. A sealed segment without it froze, but recording the
-	// seal failed; seal finishes that before it can ship.
+
+	// recordMu serializes recording a seal, which seal does without holding
+	// stateMu, so reads go on while the stamp waits on Postgres. It guards
+	// idxWritten and sealRecorded. sealRecorded is set once seal has
+	// written the .idx and stamped the row sealed in Meta; a sealed segment
+	// without it froze, but recording the seal failed, and seal finishes
+	// that before it can ship.
+	recordMu     sync.Mutex
+	idxWritten   bool
 	sealRecorded bool
 
 	carPath string
@@ -338,20 +344,32 @@ func (s *Segment) append(blocks []block.Block, opRoots []blockstore.OpRoot) erro
 // recording (Postgres failing over, say) leaves the segment frozen and
 // readable, and a later call records it rather than returning early with the
 // row still open. Idempotent once recorded.
+//
+// The record runs without stateMu: what it reads doesn't change once the
+// segment is frozen, and reads must go on while the stamp waits on Postgres,
+// however long a failover takes.
 func (s *Segment) seal(ctx context.Context, meta Meta) error {
-	s.stateMu.Lock()
-	defer s.stateMu.Unlock()
-
-	if s.state == StateOpen {
-		if err := s.freeze(); err != nil {
-			return err
-		}
-	}
+	s.recordMu.Lock()
+	defer s.recordMu.Unlock()
 	if s.sealRecorded {
 		return nil
 	}
-	if err := s.writeIdx(); err != nil {
-		return fmt.Errorf("logstore: write idx %d: %w", s.seq, err)
+
+	s.stateMu.Lock()
+	var err error
+	if s.state == StateOpen {
+		err = s.freeze()
+	}
+	s.stateMu.Unlock()
+	if err != nil {
+		return err
+	}
+
+	if !s.idxWritten {
+		if err := s.writeIdx(); err != nil {
+			return fmt.Errorf("logstore: write idx %d: %w", s.seq, err)
+		}
+		s.idxWritten = true
 	}
 	if err := meta.MarkSegmentSealed(ctx, s.plane, s.seq, s.sealedAt, s.size, s.sha, s.opRoots); err != nil {
 		return fmt.Errorf("logstore: mark sealed %d: %w", s.seq, err)
@@ -648,7 +666,9 @@ func loadSealedFromIdx(dir string, seq uint64, plane blockstore.Plane, shippedAt
 	s.size = raw.SizeByte
 	s.sealedAt = raw.SealedAt
 	s.state = StateSealed
-	s.sealRecorded = true // the .idx exists, and its row is sealed
+	// Loaded from its .idx, so nothing is left to record: the row is sealed,
+	// or the caller (recovery) stamps it so right after.
+	s.idxWritten, s.sealRecorded = true, true
 	s.shippedAt = shippedAt
 
 	for _, o := range raw.OpRoots {

@@ -36,6 +36,11 @@ type fakeMeta struct {
 	// failSeals and onSealFail do the same for MarkSegmentSealed.
 	failSeals  int
 	onSealFail func(seq uint64)
+	// sealGate, if set, holds every MarkSegmentSealed call until it is
+	// closed, after calling onSealWait with the call's seq: a stamp that
+	// hangs, as on a connection lost in a failover.
+	sealGate   chan struct{}
+	onSealWait func(seq uint64)
 }
 
 type shipEvent struct {
@@ -87,6 +92,15 @@ func (f *fakeMeta) InsertSegmentOpen(_ context.Context, plane blockstore.Plane, 
 
 func (f *fakeMeta) MarkSegmentSealed(_ context.Context, plane blockstore.Plane, seq uint64, sealedAt int64,
 	size int64, sha []byte, opRoots []blockstore.OpRoot) error {
+	f.mu.Lock()
+	gate, waiting := f.sealGate, f.onSealWait
+	f.mu.Unlock()
+	if gate != nil {
+		if waiting != nil {
+			waiting(seq)
+		}
+		<-gate
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.failSeals > 0 {
@@ -785,6 +799,58 @@ func TestFailedSealStampRecordedBeforeShip(t *testing.T) {
 	}
 	if got, err := s.Get(ctx, blk.Cid()); err != nil || string(got.RawData()) != string(blk.RawData()) {
 		t.Fatalf("Get after the ship: %v", err)
+	}
+}
+
+// TestReadsGoOnWhileTheSealStampWaits: a seal stamp that hangs, as on a
+// Postgres connection lost in a failover, doesn't hold up reads of the
+// segment being sealed.
+func TestReadsGoOnWhileTheSealStampWaits(t *testing.T) {
+	ctx := context.Background()
+	s, meta, _ := newTestStore(t, 64, 50*time.Millisecond, 6)
+	gate := make(chan struct{})
+	waiting := make(chan uint64, 1)
+	meta.mu.Lock()
+	meta.sealGate = gate
+	meta.onSealWait = func(seq uint64) {
+		select {
+		case waiting <- seq:
+		default:
+		}
+	}
+	meta.mu.Unlock()
+	t.Cleanup(func() { close(gate) }) // before the store's Close, registered earlier
+
+	blk := makeBlock(t, append([]byte("hang-"), make([]byte, 80)...))
+	seq, err := s.AppendBatch(ctx, []block.Block{blk},
+		blockstore.OpRoot{Bucket: "bk", Root: makeRoot(t, "hang")})
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	select {
+	case waited := <-waiting:
+		if waited != seq {
+			t.Fatalf("seal stamp waiting for seq %d, want %d", waited, seq)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the seal never reached its stamp")
+	}
+
+	got := make(chan error, 1)
+	go func() {
+		b, err := s.Get(ctx, blk.Cid())
+		if err == nil && string(b.RawData()) != string(blk.RawData()) {
+			err = fmt.Errorf("read other bytes")
+		}
+		got <- err
+	}()
+	select {
+	case err := <-got:
+		if err != nil {
+			t.Fatalf("Get while the seal stamp waits: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a read waited on the seal's stamp")
 	}
 }
 

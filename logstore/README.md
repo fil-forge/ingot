@@ -148,6 +148,10 @@ stateDiagram-v2
   still `open`. The flush records the seal before every ship attempt, so the
   queued ship and the minute's retry sweep retry it, and no segment ships
   with its row still `open` and no `sha256` for `DeleteBucket` to release.
+  The record holds no lock a read needs, so reads go on while a stamp hangs.
+  Two cases are left to the next start's recovery instead: a plane that
+  doesn't ship has no flush to retry the record, and a record that fails at
+  `Close` isn't retried. Either way nothing has shipped yet.
 
 ## Invariants
 
@@ -203,7 +207,7 @@ before any worker starts. Discovery keys on the CAR file:
 
 | `Meta` row | On-disk CAR | Action |
 |---|---|---|
-| `open` | present, with a readable `.idx` | it sealed after the point `Meta` was restored to: `loadSealedFromIdx` + `MarkSegmentSealed`; re-enqueued |
+| `open` | present, with a readable `.idx` | it sealed after the point `Meta` was restored to, or the stamp of its seal failed before a restart: `loadSealedFromIdx` + `MarkSegmentSealed`; re-enqueued |
 | `open` | present, no readable `.idx` | `rebuildOpenFromDisk` (scan + truncate any torn trailing frame); then force-sealed |
 | `sealed` | present, with a readable `.idx` | `loadSealedFromIdx`; re-enqueue when shipping and not yet shipped (newest first; what the queue can't hold, the retry sweep ships) |
 | `sealed` | present, no readable `.idx`, CAR matches the row's size and sha256 | written before seal fsynced it, or lost to a partial restore: `rebuildOpenFromDisk`, with the row's op-roots (they survive a torn or missing `.ops`), then sealed again, which writes a fresh `.idx` and leaves the row as it is; re-enqueued if not yet shipped |
