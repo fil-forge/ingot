@@ -102,18 +102,19 @@ return tx.Commit(ctx)
 
 ### Sync
 
-`Run` records a task and runs it in the calling goroutine once its subject's lease is free, first running any older due tasks on the same subject. It returns the handler's result or error.
+`Run` records a task and runs it in the calling goroutine once its subject's lease is free, first running any older due tasks on the same subject. It returns once the task has an outcome: its result, the handler's error, or `ErrExpired`. A commit that fails is retried until it lands or the task's `Expires` passes, so `ErrExpired` means nothing was written.
 
 ```go
-res, err := r.Run(ctx, taskrunner.Spec{Queue: "queue-bucket", Subject: bucket, Action: "commit", Args: args})
-if errors.Is(err, taskrunner.ErrNotCommitted) {
-	// The task kept failing to commit. It stays recorded and will be resumed.
+expires := time.Now().Add(30 * time.Second)
+res, err := r.Run(ctx, taskrunner.Spec{Queue: "queue-bucket", Subject: bucket, Action: "commit", Args: args, Expires: &expires})
+if errors.Is(err, taskrunner.ErrExpired) {
+	// Nothing was written: safe to tell the client to retry.
 } else if err != nil {
-	// The handler's own error.
+	// The handler's own error, or ctx ended.
 }
 ```
 
-If `ctx` ends first, `Run` returns the context's error and the task stays recorded for a worker to finish.
+`Expires` defaults to `ctx`'s deadline. If `ctx` ends first, `Run` returns the context's error and the task stays recorded for a worker to finish, unless its `Expires` passes first. Give a sync task an `Expires`, or a `ctx` with a deadline, whenever a caller that has given up must not see the task take effect later.
 
 ### Waiting
 
