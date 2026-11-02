@@ -283,3 +283,118 @@ func TestRetries_Live(t *testing.T) {
 		}
 	}
 }
+
+func TestBatchFailureIsRecordedTogether_Live(t *testing.T) {
+	f := newFixture(t, 1)
+	if err := f.r.HandleBatch(qTop, "register", 3, func(ctx context.Context, ex *taskrunner.Exec, tasks []taskrunner.Task) ([][]byte, error) {
+		return nil, taskrunner.Permanent(errors.New("rejected"))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	f.migrate(t)
+	ctx := waitCtx(t)
+	// Recording the second task's failure errors, as a crash part way would
+	// stop it.
+	tasks := f.env.Table("queue_top_tasks")
+	refuse := f.env.Table("refuse_b")
+	if _, err := f.env.DB.Exec(ctx, `
+CREATE FUNCTION `+refuse+`() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+	RAISE EXCEPTION 'refused';
+END $$;
+CREATE TRIGGER refuse_b BEFORE UPDATE OF state ON `+tasks+` FOR EACH ROW
+	WHEN (NEW.state = 'failed' AND OLD.args = 'b') EXECUTE FUNCTION `+refuse+`();`); err != nil {
+		t.Fatal(err)
+	}
+	var ids []taskrunner.TaskID
+	for _, a := range []string{"a", "b", "c"} {
+		id, err := f.r.Submit(ctx, taskrunner.Spec{Queue: qTop, Subject: "space", Action: "register", Args: []byte(a)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+	f.start(t)
+	time.Sleep(500 * time.Millisecond)
+	for i, id := range ids {
+		if s := f.state(t, qTop, id); s != "pending" {
+			t.Errorf("task %d is %s; a batch's failure must be recorded for all its tasks or none", i, s)
+		}
+	}
+}
+
+func TestRetryThatHoldsTheSubjectKeepsItsOrder_Live(t *testing.T) {
+	for _, holds := range []bool{true, false} {
+		t.Run(map[bool]string{true: "holds", false: "does not hold"}[holds], func(t *testing.T) {
+			f := newFixture(t, 2)
+			var mu sync.Mutex
+			var order []string
+			var failedOnce atomic.Bool
+			policy := taskrunner.WithRetry(taskrunner.RetryPolicy{First: 200 * time.Millisecond, Attempts: 3, HoldsSubject: holds})
+			for _, action := range []string{"add", "remove"} {
+				if err := f.r.Handle(qTop, action, func(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
+					if task.Action == "add" && failedOnce.CompareAndSwap(false, true) {
+						return nil, errors.New("unavailable")
+					}
+					mu.Lock()
+					order = append(order, task.Action)
+					mu.Unlock()
+					return nil, nil
+				}, policy); err != nil {
+					t.Fatal(err)
+				}
+			}
+			f.migrate(t)
+			ctx := waitCtx(t)
+			add, err := f.r.Submit(ctx, taskrunner.Spec{Queue: qTop, Subject: "space", Action: "add"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			remove, err := f.r.Submit(ctx, taskrunner.Spec{Queue: qTop, Subject: "space", Action: "remove"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			f.start(t)
+			for _, id := range []taskrunner.TaskID{add, remove} {
+				if _, err := f.r.Wait(ctx, qTop, id); err != nil {
+					t.Fatal(err)
+				}
+			}
+			want := []string{"add", "remove"}
+			if !holds {
+				want = []string{"remove", "add"}
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if !slices.Equal(order, want) {
+				t.Errorf("ran %v, want %v", order, want)
+			}
+		})
+	}
+}
+
+func TestATaskWaitingToRetryCanBeCancelled_Live(t *testing.T) {
+	f := newFixture(t, 1)
+	var runs atomic.Int32
+	if err := f.r.Handle(qTop, "expire", func(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
+		runs.Add(1)
+		return nil, errors.New("unavailable")
+	}, taskrunner.WithRetry(taskrunner.RetryPolicy{First: time.Hour})); err != nil {
+		t.Fatal(err)
+	}
+	f.start(t)
+	ctx := waitCtx(t)
+	id, err := f.r.Submit(ctx, taskrunner.Spec{Queue: qTop, Subject: "ref", Action: "expire"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for runs.Load() == 0 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if err := f.r.Cancel(ctx, qTop, id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.r.Wait(ctx, qTop, id); !errors.Is(err, taskrunner.ErrCancelled) {
+		t.Errorf("Wait error %v, want ErrCancelled", err)
+	}
+}

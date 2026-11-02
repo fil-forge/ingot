@@ -243,6 +243,19 @@ func release(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]
 }
 ```
 
+By default the due tasks behind a task waiting to retry run during its backoff. Set `HoldsSubject` when the order on the subject must survive a failure, such as a registration followed by its retraction; the subject then waits for the retry, sync tasks on it included.
+
+```go
+err := r.Handle("queue-space-upload", "remove", remove, taskrunner.WithRetry(taskrunner.RetryPolicy{
+	First:        time.Second,
+	Max:          time.Minute,
+	Multiplier:   2,
+	HoldsSubject: true,
+}))
+```
+
+A task waiting to retry counts as not started, so it can still be cancelled: its failed attempt returned before any effect outside Postgres.
+
 Sync tasks are never retried: the error goes to the caller, which retries the request if it wants to.
 
 ## Testing handlers

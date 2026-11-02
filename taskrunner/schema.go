@@ -50,6 +50,7 @@ ALTER TABLE %[1]s
 	ADD COLUMN started     timestamptz,
 	ADD COLUMN replaceable boolean NOT NULL DEFAULT false,
 	ADD COLUMN attempts    integer NOT NULL DEFAULT 0,
+	ADD COLUMN retry_at    timestamptz,
 	DROP CONSTRAINT %[2]s,
 	ADD CONSTRAINT %[2]s
 		CHECK (state IN ('pending', 'succeeded', 'failed', 'expired', 'cancelled'));

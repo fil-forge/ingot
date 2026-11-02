@@ -29,6 +29,13 @@ type RetryPolicy struct {
 	Multiplier float64
 	// Attempts is the most times the task runs. Zero means no limit.
 	Attempts int
+	// HoldsSubject keeps the due tasks behind a task waiting to retry
+	// waiting too, so the subject's order holds across a failure: an add
+	// that fails and retries still runs before a remove submitted after it.
+	// Without it, the tasks behind run during the backoff. Holding the
+	// subject also holds up its sync tasks, so leave it off for an action
+	// sharing a subject with sync tasks that should not wait on its retries.
+	HoldsSubject bool
 }
 
 // delay is the wait after the given number of failed attempts.
@@ -103,7 +110,10 @@ const cancelTask = `UPDATE %s SET state = 'cancelled', finished = now()
 
 // Cancel cancels a pending task that has not started. Cancelling a task that
 // has started, finished or been cancelled does nothing, so a handler whose
-// task can be cancelled must still check its own preconditions.
+// task can be cancelled must still check its own preconditions. A task
+// waiting to retry counts as not started: a handler returns a retryable
+// error only before its first effect outside Postgres, so its failed attempt
+// left nothing a cancel would strand.
 func (r *Runner) Cancel(ctx context.Context, queueName string, id TaskID) error {
 	q, ok := r.byName[queueName]
 	if !ok {
@@ -155,12 +165,17 @@ func scanTask(row pgx.Row, t *Task) error {
 // caller is waiting is left unclaimed, for its caller, with a *yieldError.
 func (r *Runner) claim(ctx context.Context, q *queue, subject string, upTo int64, target TaskID) ([]Task, error) {
 	var next TaskID
-	var waited bool
-	if err := r.db.QueryRow(ctx, `SELECT id, coalesce(waiting_until > now(), false) FROM `+q.tasks+`
+	var waited, backingOff bool
+	if err := r.db.QueryRow(ctx, `SELECT id, coalesce(waiting_until > now(), false),
+		coalesce(retry_at > now(), false) FROM `+q.tasks+`
 		WHERE subject = $1 AND state = 'pending' AND seq <= $2
 		AND (not_before IS NULL OR not_before <= now())
-		ORDER BY seq LIMIT 1`, subject, upTo).Scan(&next, &waited); err != nil {
+		ORDER BY seq LIMIT 1`, subject, upTo).Scan(&next, &waited, &backingOff); err != nil {
 		return nil, err
+	}
+	if backingOff {
+		// The oldest due task waits to retry and holds the subject.
+		return nil, pgx.ErrNoRows
 	}
 	if waited && next != target {
 		return nil, &yieldError{next}
@@ -178,7 +193,7 @@ func (r *Runner) claim(ctx context.Context, q *queue, subject string, upTo int64
 		return tasks, nil
 	}
 
-	rows, err := r.db.Query(ctx, `SELECT id, action, sync FROM `+q.tasks+`
+	rows, err := r.db.Query(ctx, `SELECT id, action, sync OR coalesce(retry_at > now(), false) FROM `+q.tasks+`
 		WHERE subject = $1 AND state = 'pending' AND seq > $2 AND seq <= $3
 		AND (not_before IS NULL OR not_before <= now())
 		ORDER BY seq LIMIT $4`, subject, first.seq, upTo, a.limit-1)
@@ -189,12 +204,14 @@ func (r *Runner) claim(ctx context.Context, q *queue, subject string, upTo int64
 	for rows.Next() {
 		var id TaskID
 		var act string
-		var sync bool
-		if err := rows.Scan(&id, &act, &sync); err != nil {
+		// stop is set for a sync task, which never batches, and for one
+		// waiting to retry, which holds up the rest.
+		var stop bool
+		if err := rows.Scan(&id, &act, &stop); err != nil {
 			rows.Close()
 			return nil, err
 		}
-		if act != first.Action || sync {
+		if act != first.Action || stop {
 			break
 		}
 		ids = append(ids, id)
@@ -230,46 +247,57 @@ func (r *Runner) claim(ctx context.Context, q *queue, subject string, upTo int64
 // async one runs again under the action's retry policy while attempts remain
 // and herr is not permanent, and the rest fail.
 func (r *Runner) failOrRetry(ctx context.Context, h *hold, a *action, tasks []Task, herr error) error {
-	for _, t := range tasks {
-		p := a.retry
-		if t.sync || p == nil || IsPermanent(herr) || (p.Attempts > 0 && t.Attempt+1 >= p.Attempts) {
-			r.log.Warn("task failed", zapTask(t), zapErr(herr))
-			if err := r.finish(ctx, h, t, "failed", herr.Error()); err != nil {
-				return err
-			}
-			continue
-		}
-		r.log.Info("task will be retried", zapTask(t), zapInt("attempt", t.Attempt+1), zapErr(herr))
-		if err := r.scheduleRetry(ctx, h, t, p.delay(t.Attempt+1), herr); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// scheduleRetry delays a failed task for its next attempt, holding its lease
-// row locked while it does, as finish does.
-func (r *Runner) scheduleRetry(ctx context.Context, h *hold, t Task, delay time.Duration, herr error) error {
+	// A batch's outcomes commit together, under its lease, like its success.
 	tx, err := r.db.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("schedule retry of %s/%s: %w", t.Queue, t.ID, err)
+		return fmt.Errorf("record failure of %s.%s: %w", tasks[0].Queue, tasks[0].Action, err)
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
 	if err := lockLease(ctx, tx, h); err != nil {
 		return err
 	}
-	tag, err := tx.Exec(ctx, `UPDATE `+h.q.tasks+`
-		SET attempts = attempts + 1, error = $2, started = NULL, replaceable = false,
-		    not_before = now() + $3 * interval '1 millisecond'
-		WHERE id = $1 AND state = 'pending'`, t.ID, herr.Error(), delay.Milliseconds())
-	if err != nil {
-		return fmt.Errorf("schedule retry of %s/%s: %w", t.Queue, t.ID, err)
-	}
-	if tag.RowsAffected() == 0 {
-		return errNotPending
+	var failed, retried []Task
+	for _, t := range tasks {
+		p := a.retry
+		var sql string
+		args := []any{t.ID, herr.Error()}
+		if t.sync || p == nil || IsPermanent(herr) || (p.Attempts > 0 && t.Attempt+1 >= p.Attempts) {
+			sql = `UPDATE ` + h.q.tasks + ` SET state = 'failed', error = $2, finished = now()
+				WHERE id = $1 AND state = 'pending'`
+			failed = append(failed, t)
+		} else {
+			// A retry that holds its subject waits in retry_at, which keeps
+			// the tasks behind it waiting too; otherwise it waits in
+			// not_before like any delayed task.
+			col := "not_before"
+			if p.HoldsSubject {
+				col = "retry_at"
+			}
+			sql = `UPDATE ` + h.q.tasks + ` SET attempts = attempts + 1, error = $2, started = NULL,
+				replaceable = false, ` + col + ` = now() + $3 * interval '1 millisecond'
+				WHERE id = $1 AND state = 'pending'`
+			args = append(args, p.delay(t.Attempt+1).Milliseconds())
+			retried = append(retried, t)
+		}
+		tag, err := tx.Exec(ctx, sql, args...)
+		if err != nil {
+			return fmt.Errorf("record failure of %s/%s: %w", t.Queue, t.ID, err)
+		}
+		if tag.RowsAffected() == 0 {
+			return errNotPending
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("schedule retry of %s/%s: %w", t.Queue, t.ID, err)
+		return fmt.Errorf("record failure of %s.%s: %w", tasks[0].Queue, tasks[0].Action, err)
 	}
+	ids := make([]TaskID, 0, len(failed))
+	for _, t := range failed {
+		r.log.Warn("task failed", zapTask(t), zapErr(herr))
+		ids = append(ids, t.ID)
+	}
+	for _, t := range retried {
+		r.log.Info("task will be retried", zapTask(t), zapInt("attempt", t.Attempt+1), zapErr(herr))
+	}
+	r.finished(ids...)
 	return nil
 }
