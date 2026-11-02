@@ -410,36 +410,96 @@ func TestAsyncSpawnCommitsWithItsParent_Live(t *testing.T) {
 	}
 }
 
-func TestConditionalWriteMissIsResumed_Live(t *testing.T) {
-	f := newFixture(t, 1)
+// claimFixture has a qTop.claim handler whose conditional write misses until
+// item ref exists, and counts its runs.
+func claimFixture(t *testing.T, workers int) (*fixture, *atomic.Int32) {
+	f := newFixture(t, workers)
 	var runs atomic.Int32
 	f.handle(t, qTop, "claim", func(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
 		runs.Add(1)
 		return nil, ex.WriteConditional(ctx, `UPDATE `+f.env.Table("items")+` SET v = v + 1 WHERE k = 'ref'`)
 	})
 	f.start(t)
+	return f, &runs
+}
+
+func (f *fixture) createRef(t *testing.T) {
+	t.Helper()
+	if _, err := f.env.DB.Exec(context.Background(), `INSERT INTO `+f.env.Table("items")+` (k, v) VALUES ('ref', 0)`); err != nil {
+		t.Error(err)
+	}
+}
+
+func TestRunRetriesACommitUntilItLands_Live(t *testing.T) {
+	f, runs := claimFixture(t, 0)
+	time.AfterFunc(300*time.Millisecond, func() { f.createRef(t) })
+
+	if _, err := f.r.Run(waitCtx(t), taskrunner.Spec{Queue: qTop, Subject: "t", Action: "claim"}); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := f.item(t, "ref"); v != 1 {
+		t.Errorf("item ref = %d, want 1", v)
+	}
+	if n := runs.Load(); n <= 3 {
+		t.Errorf("tree ran %d times, want more than one round of CommitAttempts", n)
+	}
+}
+
+func TestRunEndsExpiredWhenACommitNeverLands_Live(t *testing.T) {
+	f, runs := claimFixture(t, 1)
 	ctx := waitCtx(t)
 
-	if _, err := f.r.Run(ctx, taskrunner.Spec{Queue: qTop, Subject: "t", Action: "claim"}); !errors.Is(err, taskrunner.ErrNotCommitted) {
-		t.Fatalf("Run error %v, want ErrNotCommitted", err)
+	expires := time.Now().Add(300 * time.Millisecond)
+	_, err := f.r.Run(ctx, taskrunner.Spec{Queue: qTop, Subject: "t", Action: "claim", Expires: &expires})
+	if !errors.Is(err, taskrunner.ErrExpired) {
+		t.Fatalf("Run error %v, want ErrExpired", err)
 	}
-	if n := runs.Load(); n != 3 {
-		t.Errorf("tree ran %d times, want CommitAttempts (3)", n)
+	// Nothing runs it again once it has expired.
+	n := runs.Load()
+	f.createRef(t)
+	time.Sleep(2 * time.Second)
+	if v, _ := f.item(t, "ref"); v != 0 || runs.Load() != n {
+		t.Errorf("an expired task ran again: item ref = %d, %d runs after expiry", v, runs.Load()-n)
+	}
+}
+
+func TestRunDefaultsExpiresToTheContextDeadline_Live(t *testing.T) {
+	f, runs := claimFixture(t, 1)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	if _, err := f.r.Run(ctx, taskrunner.Spec{Queue: qTop, Subject: "t", Action: "claim"}); err == nil {
+		t.Fatal("Run succeeded")
+	}
+	// The abandoned task is past its deadline, so a worker records it as
+	// expired instead of resuming it.
+	n := runs.Load()
+	f.createRef(t)
+	time.Sleep(2 * time.Second)
+	if v, _ := f.item(t, "ref"); v != 0 || runs.Load() != n {
+		t.Errorf("a task abandoned at its deadline ran later: item ref = %d", v)
+	}
+}
+
+func TestAsyncCommitMissIsResumed_Live(t *testing.T) {
+	f, runs := claimFixture(t, 1)
+	ctx := waitCtx(t)
+
+	id, err := f.r.Submit(ctx, taskrunner.Spec{Queue: qTop, Subject: "t", Action: "claim"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for runs.Load() < 3 {
+		time.Sleep(10 * time.Millisecond)
 	}
 	// The task stays submitted; once the row exists, a worker resumes it
 	// after the lease expires.
-	if _, err := f.env.DB.Exec(ctx, `INSERT INTO `+f.env.Table("items")+` (k, v) VALUES ('ref', 0)`); err != nil {
+	f.createRef(t)
+	if _, err := f.r.Wait(ctx, qTop, id); err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		if v, _ := f.item(t, "ref"); v == 1 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("the uncommitted task was never resumed")
-		}
-		time.Sleep(50 * time.Millisecond)
+	if v, _ := f.item(t, "ref"); v != 1 {
+		t.Errorf("item ref = %d, want 1", v)
 	}
 }
 

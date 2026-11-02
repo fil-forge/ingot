@@ -296,12 +296,6 @@ func (r *Runner) runRoot(ctx context.Context, h *hold, t Task) (res []byte, err 
 	if err := r.setAge(ctx, h, age); err != nil {
 		return nil, nil, err
 	}
-	if t.Expires != nil && !t.Expires.After(time.Now()) {
-		if err := r.finish(ctx, h, t, "expired", ""); err != nil {
-			return nil, nil, err
-		}
-		return nil, ErrExpired, nil
-	}
 	hd, ok := r.handler(actionKey{t.Queue, t.Action})
 	if !ok {
 		msg := fmt.Sprintf("no handler for %s.%s", t.Queue, t.Action)
@@ -312,6 +306,14 @@ func (r *Runner) runRoot(ctx context.Context, h *hold, t Task) (res []byte, err 
 	}
 
 	for attempt := 1; ; attempt++ {
+		// Each attempt starts the tree afresh, so each checks the task may
+		// still start.
+		if t.Expires != nil && !t.Expires.After(time.Now()) {
+			if err := r.finish(ctx, h, t, "expired", ""); err != nil {
+				return nil, nil, err
+			}
+			return nil, ErrExpired, nil
+		}
 		tr := &tree{r: r, root: t, age: age, holds: map[subjectKey]*hold{}, rootHold: h, spawned: map[*queue]bool{}}
 		if r.opts.ApplyWritesImmediately {
 			tx, err := r.db.Begin(ctx)

@@ -126,9 +126,6 @@ var (
 	ErrRecursion = errors.New("a task may not spawn its own action")
 	// ErrConflict is returned when a conditional write affects no rows.
 	ErrConflict = errors.New("a conditional write affected no rows")
-	// ErrNotCommitted is returned by Run when the task's writes could not be
-	// committed. The task stays submitted and is resumed later.
-	ErrNotCommitted = errors.New("task did not commit and will be resumed")
 	// ErrNotFound is returned by Wait for a task its queue does not hold.
 	ErrNotFound = errors.New("task not found")
 	// ErrNotStarted is returned by Run before Start or after Stop.
@@ -379,11 +376,25 @@ func (r *Runner) submit(ctx context.Context, db execer, s Spec) (TaskID, error) 
 
 // Run submits a sync task and runs it in the caller's goroutine once its
 // subject's lease is free, first running any older due tasks on the subject.
-// It returns the task's result, or the handler's error. If ctx ends first the
-// task stays submitted and a worker runs it later.
+//
+// It returns once the task has an outcome: its result, the handler's error,
+// or ErrExpired. A commit that fails is retried, holding the lease, until it
+// succeeds or the task's Expires passes, so ErrExpired means nothing was
+// written. When s.Expires is nil it defaults to ctx's deadline, if ctx has
+// one.
+//
+// If ctx ends first, Run returns ctx's error and the task stays submitted,
+// for a worker to run later unless its Expires passes first. Give a sync task
+// an Expires, or a ctx with a deadline, whenever a caller that has given up
+// must not see the task take effect later.
 func (r *Runner) Run(ctx context.Context, s Spec) ([]byte, error) {
 	if !r.isRunning() {
 		return nil, ErrNotStarted
+	}
+	if s.Expires == nil {
+		if d, ok := ctx.Deadline(); ok {
+			s.Expires = &d
+		}
 	}
 	if s.NotBefore != nil {
 		return nil, fmt.Errorf("task runner: %s.%s: a sync task cannot be delayed", s.Queue, s.Action)
@@ -412,7 +423,7 @@ func (r *Runner) Run(ctx context.Context, s Spec) ([]byte, error) {
 			return nil, err
 		}
 		if h != nil {
-			d := r.drain(ctx, q, h, seq, id)
+			d := r.drainSync(ctx, q, h, seq, id)
 			r.endHold(ctx, h, d.stop)
 			if d.ran {
 				return d.res, d.err
@@ -424,8 +435,8 @@ func (r *Runner) Run(ctx context.Context, s Spec) ([]byte, error) {
 				// short of it at DrainLimit.
 			case errors.As(d.stop, &die):
 				r.awaitFree(ctx, die.key, r.opts.PollInterval)
-			case errors.Is(d.stop, errNotCommitted):
-				return nil, ErrNotCommitted
+			case ctx.Err() != nil:
+				return nil, ctx.Err()
 			default:
 				return nil, d.stop
 			}
@@ -435,6 +446,27 @@ func (r *Runner) Run(ctx context.Context, s Spec) ([]byte, error) {
 		}
 		if err := r.waitTask(ctx, id, key, wait.next()); err != nil {
 			return nil, err
+		}
+	}
+}
+
+// drainSync is drain for a sync caller: when a commit keeps failing, it keeps
+// the lease and tries again after a backoff, so the caller gets an outcome
+// instead of a task left to be resumed. It stops trying when ctx ends; the
+// task's Expires ends it with ErrExpired.
+func (r *Runner) drainSync(ctx context.Context, q *queue, h *hold, upTo int64, target TaskID) drained {
+	wait := newBackoff(r.opts.PollInterval)
+	for {
+		d := r.drain(ctx, q, h, upTo, target)
+		if !errors.Is(d.stop, errNotCommitted) {
+			return d
+		}
+		t := time.NewTimer(wait.next())
+		select {
+		case <-t.C:
+		case <-ctx.Done():
+			t.Stop()
+			return drained{stop: errNotCommitted}
 		}
 	}
 }
