@@ -132,9 +132,9 @@ if errors.As(err, &failed) {
 }
 ```
 
-## Spawning from a handler
+## Submitting from a handler
 
-`ex.Spawn` adds an async task that commits with the spawning task, so it exists only if the spawner succeeds. `ex.Run` runs a sync child inline. The child's writes join its parent's, its subject stays leased until the parent commits, and if it fails, the parent fails too, even if the parent's handler carries on.
+`ex.Submit` adds an async task that commits with the submitting task, so it exists only if the submitter succeeds. `ex.Run` runs a sync child inline. The child's writes join its parent's, its subject stays leased until the parent commits, and if it fails, the parent fails too, even if the parent's handler carries on.
 
 ```go
 func commit(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
@@ -148,7 +148,7 @@ func commit(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]b
 			return nil, err
 		}
 	}
-	if _, err := ex.Spawn(ctx, taskrunner.Spec{Queue: "queue-space-upload", Subject: space, Action: "add", Args: root}); err != nil {
+	if _, err := ex.Submit(ctx, taskrunner.Spec{Queue: "queue-space-upload", Subject: space, Action: "add", Args: root}); err != nil {
 		return nil, err
 	}
 	return nil, ex.Write(ctx, `UPDATE ingot.buckets SET root = $2 WHERE name = $1`, task.Subject, newRoot)
@@ -164,7 +164,7 @@ Two tasks whose sync children take the same subjects in different orders cannot 
 ```go
 grace := time.Now().Add(60 * time.Second)
 deadline := time.Now().Add(24 * time.Hour)
-_, err := ex.Spawn(ctx, taskrunner.Spec{
+_, err := ex.Submit(ctx, taskrunner.Spec{
 	Queue:     "queue-space-shard",
 	Subject:   key,
 	Action:    "release",
@@ -179,7 +179,7 @@ A task submitted with `Replace` set needs a `NotBefore`. If a replacement with t
 
 ```go
 ttl := time.Now().Add(24 * time.Hour)
-_, err := ex.Spawn(ctx, taskrunner.Spec{
+_, err := ex.Submit(ctx, taskrunner.Spec{
 	Queue:     "queue-shard",
 	Subject:   digest,
 	Action:    "evict",
