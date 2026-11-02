@@ -93,6 +93,13 @@ func (m *metrics) observeTasks(ctx context.Context, tasks []Task, outcome string
 	}
 }
 
+// observeChild records the outcome and duration of a sync child, once its
+// tree has an outcome.
+func (m *metrics) observeChild(ctx context.Context, t Task, outcome string, d time.Duration) {
+	m.duration.Record(ctx, d.Seconds(), metric.WithAttributes(
+		attribute.String("queue", t.Queue), attribute.String("action", t.Action), attribute.String("outcome", outcome)))
+}
+
 func (m *metrics) observeLeaseWait(ctx context.Context, q *queue, start time.Time) {
 	m.leaseWait.Record(ctx, time.Since(start).Seconds(), metric.WithAttributes(attribute.String("queue", q.name)))
 }
@@ -108,6 +115,14 @@ func (r *Runner) startCollecting() error {
 	collecting, err := m.meter.RegisterCallback(func(ctx context.Context, o metric.Observer) error {
 		ctx, cancel := context.WithTimeout(ctx, statsTimeout)
 		defer cancel()
+		// Every registered action reports, at zero when it has no pending
+		// tasks, so a drained queue reads 0 rather than going silent.
+		actions := map[string][]string{}
+		r.handlersMu.RLock()
+		for k := range r.handlers {
+			actions[k.queue] = append(actions[k.queue], k.action)
+		}
+		r.handlersMu.RUnlock()
 		for _, q := range r.order {
 			r.mu.Lock()
 			busy := len(q.inflight)
@@ -125,6 +140,13 @@ func (r *Runner) startCollecting() error {
 			if err != nil {
 				return err
 			}
+			observe := func(action string, ready, delayed int64, oldest float64) {
+				aa := metric.WithAttributes(attribute.String("queue", q.name), attribute.String("action", action))
+				o.ObserveInt64(m.ready, ready, aa)
+				o.ObserveInt64(m.delayed, delayed, aa)
+				o.ObserveFloat64(m.oldest, oldest, aa)
+			}
+			seen := map[string]bool{}
 			for rows.Next() {
 				var action string
 				var ready, delayed int64
@@ -133,14 +155,17 @@ func (r *Runner) startCollecting() error {
 					rows.Close()
 					return err
 				}
-				aa := metric.WithAttributes(attribute.String("queue", q.name), attribute.String("action", action))
-				o.ObserveInt64(m.ready, ready, aa)
-				o.ObserveInt64(m.delayed, delayed, aa)
-				o.ObserveFloat64(m.oldest, oldest, aa)
+				seen[action] = true
+				observe(action, ready, delayed, oldest)
 			}
 			rows.Close()
 			if err := rows.Err(); err != nil {
 				return err
+			}
+			for _, action := range actions[q.name] {
+				if !seen[action] {
+					observe(action, 0, 0, 0)
+				}
 			}
 		}
 		return nil
