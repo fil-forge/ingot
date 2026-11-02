@@ -69,6 +69,10 @@ type Case struct {
 	Setup func(ctx context.Context, env Env, r *taskrunner.Runner) error
 	// Spec is the root task, run sync.
 	Spec taskrunner.Spec
+	// Expires, when set, gives each run's task an Expires this long after the
+	// run starts, so a task whose commit never lands ends the same way in
+	// both runs.
+	Expires time.Duration
 	// State reads what the tree left behind, for comparing the two runs.
 	State func(ctx context.Context, env Env) (any, error)
 }
@@ -129,8 +133,13 @@ func runCase(ctx context.Context, env Env, c Case, immediate bool) (outcome, err
 	}
 	defer func() { _ = r.Stop(ctx) }()
 
+	spec := c.Spec
+	if c.Expires > 0 {
+		e := time.Now().Add(c.Expires)
+		spec.Expires = &e
+	}
 	var o outcome
-	o.Result, err = r.Run(ctx, c.Spec)
+	o.Result, err = r.Run(ctx, spec)
 	if err != nil {
 		o.Err = err.Error()
 	}

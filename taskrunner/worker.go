@@ -3,6 +3,7 @@ package taskrunner
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"time"
 
@@ -25,16 +26,28 @@ type drained struct {
 	stop error
 }
 
+// yieldError stops a drain at a sync task whose caller is waiting to run it.
+type yieldError struct{ id TaskID }
+
+func (e *yieldError) Error() string { return fmt.Sprintf("left task %s to its waiting caller", e.id) }
+
 // drain runs the subject's due tasks under h, oldest first, up to the task
-// with seq upTo. It stops early after running target.
+// with seq upTo. It stops early after running target, and before a sync task
+// other than target whose caller is waiting, which it leaves to the caller.
 func (r *Runner) drain(ctx context.Context, q *queue, h *hold, upTo int64, target TaskID) drained {
 	for n := 0; n < r.opts.DrainLimit; n++ {
-		t, err := r.nextDue(ctx, q, h.subject, upTo)
+		if h.lost.Load() {
+			return drained{stop: errLeaseLost}
+		}
+		t, waited, err := r.nextDue(ctx, q, h.subject, upTo)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return drained{}
 		}
 		if err != nil {
 			return drained{stop: err}
+		}
+		if waited && t.ID != target {
+			return drained{stop: &yieldError{t.ID}}
 		}
 		res, terr, stop := r.runRoot(ctx, h, t)
 		if stop != nil {
@@ -47,14 +60,17 @@ func (r *Runner) drain(ctx context.Context, q *queue, h *hold, upTo int64, targe
 	return drained{full: true}
 }
 
-func (r *Runner) nextDue(ctx context.Context, q *queue, subject string, upTo int64) (Task, error) {
-	t := Task{Queue: q.name, Subject: subject}
-	err := r.db.QueryRow(ctx, `SELECT id, action, created, not_before, expires, args FROM `+q.tasks+`
+// nextDue returns the subject's oldest due task, and whether a Run caller is
+// waiting to run it.
+func (r *Runner) nextDue(ctx context.Context, q *queue, subject string, upTo int64) (t Task, waited bool, err error) {
+	t = Task{Queue: q.name, Subject: subject}
+	err = r.db.QueryRow(ctx, `SELECT id, action, created, not_before, expires, args,
+		coalesce(waiting_until > now(), false) FROM `+q.tasks+`
 		WHERE subject = $1 AND state = 'pending' AND seq <= $2
 		AND (not_before IS NULL OR not_before <= now())
 		ORDER BY seq LIMIT 1`, subject, upTo,
-	).Scan(&t.ID, &t.Action, &t.Created, &t.NotBefore, &t.Expires, &t.Args)
-	return t, err
+	).Scan(&t.ID, &t.Action, &t.Created, &t.NotBefore, &t.Expires, &t.Args, &waited)
+	return t, waited, err
 }
 
 // pollLoop hands due, free subjects to workers, up to the queue's worker
@@ -86,11 +102,17 @@ func (r *Runner) dispatch(ctx context.Context, q *queue) {
 	if free <= 0 {
 		return
 	}
-	rows, err := r.db.Query(ctx, `SELECT t.subject FROM `+q.tasks+` t
-		WHERE t.state = 'pending' AND (t.not_before IS NULL OR t.not_before <= now())
-		AND NOT (t.subject = ANY($1))
-		AND NOT EXISTS (SELECT 1 FROM `+q.leases+` l WHERE l.subject = t.subject AND l.expires >= now())
-		GROUP BY t.subject ORDER BY min(t.seq) LIMIT $2`, busy, free)
+	// A subject whose oldest due task has a waiting Run caller is the
+	// caller's to take.
+	rows, err := r.db.Query(ctx, `SELECT d.subject FROM (
+			SELECT DISTINCT ON (subject) subject, seq, waiting_until FROM `+q.tasks+`
+			WHERE state = 'pending' AND (not_before IS NULL OR not_before <= now())
+			AND NOT (subject = ANY($1))
+			ORDER BY subject, seq
+		) d
+		WHERE (d.waiting_until IS NULL OR d.waiting_until <= now())
+		AND NOT EXISTS (SELECT 1 FROM `+q.leases+` l WHERE l.subject = d.subject AND l.expires >= now())
+		ORDER BY d.seq LIMIT $2`, busy, free)
 	if err != nil {
 		if ctx.Err() == nil {
 			r.log.Warn("poll for due tasks", zapQueue(q.name), zapErr(err))
@@ -138,9 +160,11 @@ func (r *Runner) work(ctx context.Context, q *queue, subject string) {
 	d := r.drain(ctx, q, h, math.MaxInt64, TaskID{})
 	r.endHold(ctx, h, d.stop)
 	var die *dieError
+	var yield *yieldError
 	switch stop := d.stop; {
 	case stop == nil:
 		more = d.full
+	case errors.As(stop, &yield), errors.Is(stop, errLeaseLost), errors.Is(stop, errNotPending):
 	case errors.As(stop, &die):
 		// Keep the subject out of the next poll until the older tree that
 		// held it up lets go.
