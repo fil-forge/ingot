@@ -33,9 +33,9 @@ var placeholderRoot = cid.NewCidV1(cid.Raw, []byte{0x00, 0x00})
 // Open segments accept appends; sealed segments are read-only and
 // ship/retire independently.
 //
-// Concurrency: append is serialized by PlaneLog.appMu. stateMu guards
-// every mutable field below; readers RLock for lookups, writers Lock for
-// append/seal/retire/ship.
+// Concurrency: append is serialized by PlaneLog.appMu. stateMu guards the
+// mutable fields below, except those recordMu guards; readers RLock for
+// lookups, writers Lock for append/freeze/retire/ship.
 type Segment struct {
 	seq    uint64
 	plane  blockstore.Plane
@@ -345,9 +345,12 @@ func (s *Segment) append(blocks []block.Block, opRoots []blockstore.OpRoot) erro
 // readable, and a later call records it rather than returning early with the
 // row still open. Idempotent once recorded.
 //
-// The record runs without stateMu: what it reads doesn't change once the
-// segment is frozen, and reads must go on while the stamp waits on Postgres,
-// however long a failover takes.
+// The record runs without stateMu, so reads go on while the stamp waits on
+// Postgres, however long a failover takes. That is safe because nothing
+// writes what it reads once the segment is frozen, but retire, and retire
+// runs only on a shipped segment, from the flush goroutine, while a segment
+// ships only after that goroutine has recorded its seal. A new caller of
+// retire has to keep that order.
 func (s *Segment) seal(ctx context.Context, meta Meta) error {
 	s.recordMu.Lock()
 	defer s.recordMu.Unlock()
@@ -560,8 +563,8 @@ type idxFileJSON struct {
 	OpRoots  []idxOpRootJSON `json:"op_roots,omitempty"`
 }
 
-// writeIdx persists the segment's .idx sidecar. Caller holds the segment
-// write lock and has populated sha + sealedAt.
+// writeIdx persists the segment's .idx sidecar. seal calls it under
+// recordMu, after freeze has populated sha + sealedAt.
 func (s *Segment) writeIdx() error {
 	blocks := make([]idxBlockJSON, 0, len(s.index))
 	for c, loc := range s.index {

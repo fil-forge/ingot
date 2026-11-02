@@ -259,7 +259,9 @@ func (pl *PlaneLog) ensureOpenLockedAppMu(ctx context.Context) (*Segment, error)
 }
 
 // sealOpenIfDue seals the current open segment if one exists and is due
-// (over SealAge or SealBytes), or force is set, then enqueues it.
+// (over SealAge or SealBytes), or force is set, then enqueues it. A segment
+// that froze but whose seal didn't record is logged and enqueued too, and
+// returns nil: it has moved on, and the flush or the next start records it.
 func (pl *PlaneLog) sealOpenIfDue(ctx context.Context, force bool) error {
 	pl.appMu.Lock()
 	defer pl.appMu.Unlock()
@@ -289,7 +291,7 @@ func (pl *PlaneLog) sealOpenIfDue(ctx context.Context, force bool) error {
 		}
 		// A segment that froze but whose seal wasn't recorded moves on too,
 		// so writes go to a new segment. Its ship records the seal first.
-		pl.logger.Warn("logstore: seal not recorded; its ship retries it",
+		pl.logger.Warn("logstore: seal not recorded; the flush or the next start records it",
 			zap.Stringer("plane", pl.plane), zap.Uint64("seq", open.Seq()), zap.Error(err))
 	}
 
