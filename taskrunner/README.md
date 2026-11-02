@@ -106,10 +106,9 @@ return tx.Commit(ctx)
 
 ```go
 res, err := r.Run(ctx, taskrunner.Spec{Queue: "queue-bucket", Subject: bucket, Action: "commit", Args: args})
-switch {
-case errors.Is(err, taskrunner.ErrNotCommitted):
+if errors.Is(err, taskrunner.ErrNotCommitted) {
 	// The task kept failing to commit. It stays recorded and will be resumed.
-case err != nil:
+} else if err != nil {
 	// The handler's own error.
 }
 ```
@@ -123,12 +122,12 @@ If `ctx` ends first, `Run` returns the context's error and the task stays record
 ```go
 res, err := r.Wait(ctx, "queue-space-upload", id)
 var failed *taskrunner.HandlerError
-switch {
-case errors.As(err, &failed):
+if errors.As(err, &failed) {
 	log.Printf("task failed: %s", failed.Message)
-case errors.Is(err, taskrunner.ErrExpired),
-	errors.Is(err, taskrunner.ErrCancelled),
-	errors.Is(err, taskrunner.ErrNotFound): // never recorded, or dropped by a replacement
+} else if errors.Is(err, taskrunner.ErrNotFound) {
+	// Never recorded, or dropped by a replacement.
+} else if err != nil {
+	// ErrExpired, ErrCancelled, or ctx ended.
 }
 ```
 
