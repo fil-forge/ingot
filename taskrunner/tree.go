@@ -313,10 +313,11 @@ func (tr *tree) commit(ctx context.Context, result []byte) error {
 }
 
 // lockLease locks h's lease row for the rest of tx, or returns errLeaseLost
-// when another consumer owns it now.
+// when another consumer owns it now or it has expired, which leaves it free
+// for one to take.
 func lockLease(ctx context.Context, tx pgx.Tx, h *hold) error {
 	var one int
-	err := tx.QueryRow(ctx, `SELECT 1 FROM `+h.q.leases+` WHERE subject = $1 AND owner = $2 FOR UPDATE`,
+	err := tx.QueryRow(ctx, `SELECT 1 FROM `+h.q.leases+` WHERE subject = $1 AND owner = $2 AND expires >= now() FOR UPDATE`,
 		h.subject, h.token).Scan(&one)
 	if errors.Is(err, pgx.ErrNoRows) {
 		h.lost.Store(true)

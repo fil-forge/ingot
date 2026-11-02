@@ -328,3 +328,125 @@ func TestStopAfterATimedOutStopWaitsForTheShutdown_Live(t *testing.T) {
 		t.Errorf("Start after the shutdown finished: %v", err)
 	}
 }
+
+// expireOwnLease lets the subject's lease lapse without anyone taking it
+// over, as a renewal that missed its deadline would.
+func (f *fixture) expireOwnLease(t *testing.T, queue, subject string) {
+	t.Helper()
+	if _, err := f.env.DB.Exec(context.Background(), `UPDATE `+f.env.Table(queueTable(queue)+"_leases")+`
+		SET expires = now() - interval '1 second' WHERE subject = $1`, subject); err != nil {
+		t.Error(err)
+	}
+}
+
+func TestExpiredLeaseStartsNoFurtherTask_Live(t *testing.T) {
+	f := newFixture(t, 1)
+	leases, tasks := f.env.Table("queue_top_leases"), f.env.Table("queue_top_tasks")
+	var secondOwner uuid.UUID
+	f.handle(t, qTop, "first", func(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
+		return nil, nil
+	})
+	f.handle(t, qTop, "second", func(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
+		return nil, f.env.DB.QueryRow(ctx, `SELECT owner FROM `+leases+` WHERE subject = $1`, task.Subject).Scan(&secondOwner)
+	})
+	ctx := waitCtx(t)
+	if err := f.r.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// The lease lapses, still in this process's name, as the first task
+	// commits; the trigger keeps the owner it had.
+	owners := f.env.Table("owners")
+	lapse := f.env.Table("lapse_lease")
+	if _, err := f.env.DB.Exec(ctx, `
+CREATE TABLE `+owners+` (owner uuid NOT NULL);
+CREATE FUNCTION `+lapse+`() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+	INSERT INTO `+owners+` SELECT owner FROM `+leases+` WHERE subject = NEW.subject;
+	UPDATE `+leases+` SET expires = now() - interval '1 second' WHERE subject = NEW.subject;
+	RETURN NEW;
+END $$;
+CREATE TRIGGER lapse AFTER UPDATE OF state ON `+tasks+` FOR EACH ROW
+	WHEN (NEW.action = 'first' AND NEW.state = 'succeeded') EXECUTE FUNCTION `+lapse+`();`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.r.Submit(ctx, taskrunner.Spec{Queue: qTop, Subject: "s", Action: "first"}); err != nil {
+		t.Fatal(err)
+	}
+	second, err := f.r.Submit(ctx, taskrunner.Spec{Queue: qTop, Subject: "s", Action: "second"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.start(t)
+	if _, err := f.r.Wait(ctx, qTop, second); err != nil {
+		t.Fatal(err)
+	}
+	var lapsed uuid.UUID
+	if err := f.env.DB.QueryRow(ctx, `SELECT owner FROM `+owners).Scan(&lapsed); err != nil {
+		t.Fatal(err)
+	}
+	if secondOwner == lapsed {
+		t.Error("the next task ran under the lease that had expired, instead of a lease taken afresh")
+	}
+}
+
+func TestCommitUnderAnExpiredLeaseIsRetried_Live(t *testing.T) {
+	f := newFixture(t, 0)
+	var runs atomic.Int32
+	f.handle(t, qTop, "put", func(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
+		if runs.Add(1) == 1 {
+			f.expireOwnLease(t, qTop, task.Subject)
+		}
+		return nil, ex.Write(ctx, `INSERT INTO `+f.env.Table("items")+` (k, v) VALUES ('a', 1)
+			ON CONFLICT (k) DO UPDATE SET v = `+f.env.Table("items")+`.v + 1`)
+	})
+	f.start(t)
+
+	if _, err := f.r.Run(waitCtx(t), taskrunner.Spec{Queue: qTop, Subject: "s", Action: "put"}); err != nil {
+		t.Fatal(err)
+	}
+	if n := runs.Load(); n != 2 {
+		t.Errorf("handler ran %d times, want 2: the commit under the expired lease must not land", n)
+	}
+	if v, _ := f.item(t, "a"); v != 1 {
+		t.Errorf("item a = %d, want 1", v)
+	}
+}
+
+func TestLeaseTTLUnderAMillisecondIsRefused(t *testing.T) {
+	_, err := taskrunner.New(nil, taskrunner.Options{Schema: "s", Queues: []taskrunner.QueueOptions{{Name: "q"}}, LeaseTTL: 500 * time.Microsecond})
+	if err == nil {
+		t.Error("a 500µs lease TTL was accepted")
+	}
+}
+
+func TestRunStopsWaitingAtItsExpires_Live(t *testing.T) {
+	f := newFixture(t, 0)
+	var ran atomic.Bool
+	f.handle(t, qTop, "put", func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) {
+		ran.Store(true)
+		return nil, nil
+	})
+	f.start(t)
+	// Another consumer holds the subject well past the task's Expires.
+	if _, err := f.env.DB.Exec(context.Background(), `INSERT INTO `+f.env.Table("queue_top_leases")+` (subject, owner, expires, tree_created, tree_id)
+		VALUES ('s', $1, now() + interval '1 minute', now(), $2)`, uuid.New(), uuid.New()); err != nil {
+		t.Fatal(err)
+	}
+
+	expires := time.Now().Add(300 * time.Millisecond)
+	done := make(chan error, 1)
+	go func() {
+		_, err := f.r.Run(context.Background(), taskrunner.Spec{Queue: qTop, Subject: "s", Action: "put", Expires: &expires})
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, taskrunner.ErrExpired) {
+			t.Errorf("Run error %v, want ErrExpired", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run still waiting 5s after its task's Expires")
+	}
+	if ran.Load() {
+		t.Error("the task ran")
+	}
+}
