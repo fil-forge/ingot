@@ -359,7 +359,7 @@ func TestSpawnRules_Live(t *testing.T) {
 		return nil, err
 	})
 	f.handle(t, qMiddle, "self", func(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
-		_, err := ex.Spawn(ctx, taskrunner.Spec{Queue: qMiddle, Subject: "later", Action: "self"})
+		_, err := ex.Submit(ctx, taskrunner.Spec{Queue: qMiddle, Subject: "later", Action: "self"})
 		return nil, err
 	})
 	noop := func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) { return nil, nil }
@@ -375,12 +375,12 @@ func TestSpawnRules_Live(t *testing.T) {
 	}
 }
 
-func TestAsyncSpawnCommitsWithItsParent_Live(t *testing.T) {
+func TestAsyncSubmitCommitsWithItsParent_Live(t *testing.T) {
 	f := newFixture(t, 2)
 	f.handle(t, qBottom, "put", f.put())
 	var spawned taskrunner.TaskID
 	f.handle(t, qTop, "spawn", func(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
-		id, err := ex.Spawn(ctx, taskrunner.Spec{Queue: qBottom, Subject: "later", Action: "put", Args: []byte("3")})
+		id, err := ex.Submit(ctx, taskrunner.Spec{Queue: qBottom, Subject: "later", Action: "put", Args: []byte("3")})
 		spawned = id
 		if err != nil {
 			return nil, err
