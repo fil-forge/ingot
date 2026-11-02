@@ -42,6 +42,10 @@ type tree struct {
 	// failed is the first error a sync child returned. The tree fails with it
 	// even if a parent handler carries on.
 	failed error
+	// deferred is the first error a write hit under ApplyWritesImmediately.
+	// It fails the commit, as the same write would with writes held, rather
+	// than reaching the handler.
+	deferred error
 }
 
 // Exec is a handler's view of its tree: it records the handler's writes and
@@ -79,14 +83,25 @@ func (tr *tree) add(ctx context.Context, w write) error {
 		tr.writes = append(tr.writes, w)
 		return nil
 	}
-	tag, err := tr.cur.Exec(ctx, w.sql, w.args...)
+	if tr.deferred != nil {
+		return nil
+	}
+	// Each write runs in its own savepoint, so one that fails leaves the
+	// transaction usable for the handler's later reads.
+	sp, err := tr.cur.Begin(ctx)
 	if err != nil {
 		return err
 	}
-	if w.conditional && tag.RowsAffected() == 0 {
-		return ErrConflict
+	tag, err := sp.Exec(ctx, w.sql, w.args...)
+	if err == nil && w.conditional && tag.RowsAffected() == 0 {
+		err = ErrConflict
 	}
-	return nil
+	if err != nil {
+		_ = sp.Rollback(ctx)
+		tr.deferred = err
+		return nil
+	}
+	return sp.Commit(ctx)
 }
 
 // Spawn adds an async task, committed with the tree. It runs once the tree
@@ -145,6 +160,10 @@ func (ex *Exec) run(ctx context.Context, s Spec) ([]byte, error) {
 	}
 	if err := tr.lease(ctx, q, s.Subject); err != nil {
 		return nil, err
+	}
+	// The wait for the lease may have outlasted the child's Expires.
+	if s.Expires != nil && !s.Expires.After(time.Now()) {
+		return nil, ErrExpired
 	}
 
 	id, err := uuid.NewV7()
@@ -247,15 +266,17 @@ func (tr *tree) commit(ctx context.Context, result []byte) error {
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
 
-	fence := append([]*hold{tr.rootHold}, mapValues(tr.holds)...)
-	for _, h := range fence {
-		var one int
-		err := tx.QueryRow(ctx, `SELECT 1 FROM `+h.q.leases+` WHERE subject = $1 AND owner = $2 FOR UPDATE`,
-			h.subject, h.token).Scan(&one)
-		if errors.Is(err, pgx.ErrNoRows) {
+	if tr.deferred != nil {
+		return tr.deferred
+	}
+	if err := lockLease(ctx, tx, tr.rootHold); err != nil {
+		return err
+	}
+	for _, h := range tr.holds {
+		if err := lockLease(ctx, tx, h); errors.Is(err, errLeaseLost) {
+			// A child's subject can be leased afresh when the tree runs again.
 			return fmt.Errorf("lease on %s/%s lost before commit", h.q.name, h.subject)
-		}
-		if err != nil {
+		} else if err != nil {
 			return err
 		}
 	}
@@ -279,12 +300,17 @@ func (tr *tree) commit(ctx context.Context, result []byte) error {
 	return tx.Commit(ctx)
 }
 
-func mapValues[K comparable, V any](m map[K]V) []V {
-	out := make([]V, 0, len(m))
-	for _, v := range m {
-		out = append(out, v)
+// lockLease locks h's lease row for the rest of tx, or returns errLeaseLost
+// when another consumer owns it now.
+func lockLease(ctx context.Context, tx pgx.Tx, h *hold) error {
+	var one int
+	err := tx.QueryRow(ctx, `SELECT 1 FROM `+h.q.leases+` WHERE subject = $1 AND owner = $2 FOR UPDATE`,
+		h.subject, h.token).Scan(&one)
+	if errors.Is(err, pgx.ErrNoRows) {
+		h.lost.Store(true)
+		return errLeaseLost
 	}
-	return out
+	return err
 }
 
 // runRoot runs a due task under h, its subject's lease. It returns the task's
@@ -306,6 +332,9 @@ func (r *Runner) runRoot(ctx context.Context, h *hold, t Task) (res []byte, err 
 	}
 
 	for attempt := 1; ; attempt++ {
+		if h.lost.Load() {
+			return nil, nil, errLeaseLost
+		}
 		// Each attempt starts the tree afresh, so each checks the task may
 		// still start.
 		if t.Expires != nil && !t.Expires.After(time.Now()) {
@@ -361,6 +390,10 @@ func (r *Runner) runRoot(ctx context.Context, h *hold, t Task) (res []byte, err 
 		if ctx.Err() != nil {
 			return nil, nil, ctx.Err()
 		}
+		if errors.Is(cerr, errLeaseLost) {
+			r.log.Warn("task's lease was taken over before its commit", zapTask(t))
+			return nil, nil, errLeaseLost
+		}
 		r.log.Warn("task commit failed", zapTask(t), zapInt("attempt", attempt), zapErr(cerr))
 		if attempt >= r.opts.CommitAttempts {
 			return nil, nil, errNotCommitted
@@ -368,14 +401,28 @@ func (r *Runner) runRoot(ctx context.Context, h *hold, t Task) (res []byte, err 
 	}
 }
 
-// finish records a task's outcome without running its tree, if this process
-// still holds its subject.
+// finish records a task's outcome without running its tree, holding its
+// lease row locked while it does. It returns errLeaseLost when another
+// consumer owns the subject now, and errNotPending when the task already has
+// an outcome; either way it records nothing.
 func (r *Runner) finish(ctx context.Context, h *hold, t Task, state, msg string) error {
-	_, err := r.db.Exec(ctx, `UPDATE `+h.q.tasks+` SET state = $2, error = NULLIF($3, ''), finished = now()
-		WHERE id = $1 AND state = 'pending'
-		AND EXISTS (SELECT 1 FROM `+h.q.leases+` WHERE subject = $4 AND owner = $5)`,
-		t.ID, state, msg, h.subject, h.token)
+	tx, err := r.db.Begin(ctx)
 	if err != nil {
+		return fmt.Errorf("record task %s/%s as %s: %w", t.Queue, t.ID, state, err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if err := lockLease(ctx, tx, h); err != nil {
+		return err
+	}
+	tag, err := tx.Exec(ctx, `UPDATE `+h.q.tasks+` SET state = $2, error = NULLIF($3, ''), finished = now()
+		WHERE id = $1 AND state = 'pending'`, t.ID, state, msg)
+	if err != nil {
+		return fmt.Errorf("record task %s/%s as %s: %w", t.Queue, t.ID, state, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return errNotPending
+	}
+	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("record task %s/%s as %s: %w", t.Queue, t.ID, state, err)
 	}
 	r.finished(t.ID)

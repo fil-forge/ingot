@@ -14,12 +14,13 @@
 // No transaction stays open across a handler's network calls.
 //
 // A task's row commits when it is submitted, so a crash while it runs leaves
-// it pending, and it is resumed once its lease expires. A failed final commit
-// is treated the same way. Only an error a handler returns marks a task
-// failed. Handlers must therefore be idempotent, and must not read rows their
-// own tree has written: those rows reach Postgres only at the commit.
-// taskrunnertest.CheckOwnWrites runs a tree both ways to catch a handler that
-// does.
+// it pending, and it is resumed once its lease expires. An async task whose
+// final commit fails is left the same way; a sync task's caller retries the
+// commit until it lands or the task's Expires passes. Only an error a handler
+// returns marks a task failed. Handlers must therefore be idempotent, and
+// must not read rows their own tree has written: those rows reach Postgres
+// only at the commit. taskrunnertest.CheckOwnWrites runs a tree both ways to
+// catch a handler that does.
 //
 // The runner stores a task's arguments and result as opaque bytes and knows
 // nothing of what its handlers do.

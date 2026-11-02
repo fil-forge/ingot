@@ -28,7 +28,10 @@ CREATE TABLE %[1]s (
 	           CHECK (state IN ('pending', 'succeeded', 'failed', 'expired')),
 	result     bytea,
 	error      text,
-	finished   timestamptz
+	finished   timestamptz,
+	-- waiting_until is set while a sync task's caller waits in Run, which
+	-- keeps workers off it until the claim lapses.
+	waiting_until timestamptz
 );
 CREATE INDEX %[3]s ON %[1]s (subject, seq) WHERE state = 'pending';
 CREATE TABLE %[2]s (

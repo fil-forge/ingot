@@ -77,8 +77,8 @@ type Querier interface {
 
 // QueueOptions configures one queue.
 type QueueOptions struct {
-	// Name names the queue: lowercase letters, digits and hyphens, starting
-	// with a letter.
+	// Name names the queue: up to 40 lowercase letters, digits and hyphens,
+	// starting with a letter.
 	Name string
 	// Workers is the most async tasks of the queue this process runs at once.
 	// Zero runs none, leaving the queue's async tasks to other processes.
@@ -147,7 +147,9 @@ func (e *HandlerError) Error() string {
 	return fmt.Sprintf("task %s/%s failed: %s", e.Queue, e.Task, e.Message)
 }
 
-var queueName = regexp.MustCompile(`^[a-z][a-z0-9-]*$`)
+// queueName bounds names so that every identifier derived from one, such as
+// "<name>_tasks_pending", fits Postgres's 63-byte limit.
+var queueName = regexp.MustCompile(`^[a-z][a-z0-9-]{0,39}$`)
 
 // Runner runs the tasks of a fixed set of queues.
 type Runner struct {
@@ -162,12 +164,22 @@ type Runner struct {
 
 	mu      sync.Mutex
 	running bool
-	cancel  context.CancelFunc
-	holds   map[uuid.UUID]*hold
+	// ctx is cancelled by Stop, ending workers and inline runs alike.
+	ctx    context.Context
+	cancel context.CancelFunc
+	holds  map[uuid.UUID]*hold
+	// waiting maps each sync task whose caller is waiting in Run to its queue,
+	// so the renewer keeps its claim live.
+	waiting map[TaskID]*queue
 	waiters map[TaskID]map[chan struct{}]struct{}
-	freed   map[subjectKey]chan struct{}
+	freed   map[subjectKey]*freeSub
 
-	wg sync.WaitGroup
+	// wg counts pollers and workers, inline the Run calls in progress.
+	wg     sync.WaitGroup
+	inline sync.WaitGroup
+	// renewDone closes when the renewer has stopped.
+	renewDone chan struct{}
+	stopRenew context.CancelFunc
 }
 
 type queue struct {
@@ -219,7 +231,8 @@ func New(db DB, opts Options) (*Runner, error) {
 		handlers: map[actionKey]Handler{},
 		holds:    map[uuid.UUID]*hold{},
 		waiters:  map[TaskID]map[chan struct{}]struct{}{},
-		freed:    map[subjectKey]chan struct{}{},
+		waiting:  map[TaskID]*queue{},
+		freed:    map[subjectKey]*freeSub{},
 	}
 	for i, qo := range opts.Queues {
 		if !queueName.MatchString(qo.Name) {
@@ -279,22 +292,27 @@ func (r *Runner) Start(ctx context.Context) error {
 	if r.running {
 		return errors.New("task runner: already started")
 	}
-	ctx, cancel := context.WithCancel(context.WithoutCancel(ctx))
-	r.cancel = cancel
+	base := context.WithoutCancel(ctx)
+	r.ctx, r.cancel = context.WithCancel(base)
 	r.running = true
-	r.wg.Add(1)
-	go r.renewLoop(ctx)
+	// The renewer outlives the workers and inline runs: Stop ends it only
+	// once they have all returned, so no lease lapses under a running task.
+	renewCtx, stopRenew := context.WithCancel(base)
+	r.renewDone = make(chan struct{})
+	go r.renewLoop(renewCtx)
 	for _, q := range r.order {
 		if q.workers > 0 {
 			r.wg.Add(1)
-			go r.pollLoop(ctx, q)
+			go r.pollLoop(r.ctx, q)
 		}
 	}
+	r.stopRenew = stopRenew
 	return nil
 }
 
-// Stop stops the workers and waits for them. A task interrupted by Stop stays
-// pending and is resumed by the next process to take its subject.
+// Stop cancels the workers and the Run calls in progress, and waits for them.
+// A task interrupted by Stop stays pending and is resumed by the next process
+// to take its subject.
 func (r *Runner) Stop(ctx context.Context) error {
 	r.mu.Lock()
 	if !r.running {
@@ -306,7 +324,13 @@ func (r *Runner) Stop(ctx context.Context) error {
 	r.mu.Unlock()
 
 	done := make(chan struct{})
-	go func() { r.wg.Wait(); close(done) }()
+	go func() {
+		r.wg.Wait()
+		r.inline.Wait()
+		r.stopRenew()
+		<-r.renewDone
+		close(done)
+	}()
 	select {
 	case <-done:
 		return nil
@@ -315,10 +339,22 @@ func (r *Runner) Stop(ctx context.Context) error {
 	}
 }
 
-func (r *Runner) isRunning() bool {
+// enterInline registers a Run call, returning a ctx that Stop also cancels,
+// and the func that ends the registration. It fails once Stop has begun.
+func (r *Runner) enterInline(ctx context.Context) (context.Context, func(), error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.running
+	if !r.running {
+		return nil, nil, ErrNotStarted
+	}
+	r.inline.Add(1)
+	ctx, cancel := context.WithCancel(ctx)
+	unhook := context.AfterFunc(r.ctx, cancel)
+	return ctx, func() {
+		unhook()
+		cancel()
+		r.inline.Done()
+	}, nil
 }
 
 func (r *Runner) checkSpec(s Spec) (*queue, error) {
@@ -388,9 +424,11 @@ func (r *Runner) submit(ctx context.Context, db execer, s Spec) (TaskID, error) 
 // an Expires, or a ctx with a deadline, whenever a caller that has given up
 // must not see the task take effect later.
 func (r *Runner) Run(ctx context.Context, s Spec) ([]byte, error) {
-	if !r.isRunning() {
-		return nil, ErrNotStarted
+	ctx, leave, err := r.enterInline(ctx)
+	if err != nil {
+		return nil, err
 	}
+	defer leave()
 	if s.Expires == nil {
 		if d, ok := ctx.Deadline(); ok {
 			s.Expires = &d
@@ -409,8 +447,15 @@ func (r *Runner) Run(ctx context.Context, s Spec) ([]byte, error) {
 	}
 	var seq int64
 	var created time.Time
-	if err := r.db.QueryRow(ctx, fmt.Sprintf(insertTask+` RETURNING seq, created`, q.tasks),
-		id, s.Subject, s.Action, nil, s.Expires, s.Args, true).Scan(&seq, &created); err != nil {
+	// The row says its caller is waiting, so workers leave it to the caller
+	// until the claim lapses.
+	r.mu.Lock()
+	r.waiting[id] = q
+	r.mu.Unlock()
+	defer r.stopWaiting(q, id)
+	if err := r.db.QueryRow(ctx, `INSERT INTO `+q.tasks+` (id, subject, action, expires, args, sync, waiting_until)
+		VALUES ($1, $2, $3, $4, $5, true, now() + $6 * interval '1 millisecond') RETURNING seq, created`,
+		id, s.Subject, s.Action, s.Expires, s.Args, r.opts.LeaseTTL.Milliseconds()).Scan(&seq, &created); err != nil {
 		return nil, fmt.Errorf("submit %s.%s: %w", s.Queue, s.Action, err)
 	}
 	age := treeAge{created, id}
@@ -429,12 +474,18 @@ func (r *Runner) Run(ctx context.Context, s Spec) ([]byte, error) {
 				return d.res, d.err
 			}
 			var die *dieError
+			var yield *yieldError
 			switch {
-			case d.stop == nil:
-				// Another holder ran the task first, or the drain stopped
-				// short of it at DrainLimit.
+			case d.stop == nil, errors.Is(d.stop, errLeaseLost), errors.Is(d.stop, errNotPending):
+				// Another holder ran the task first or took over the lease,
+				// or the drain stopped short of it at DrainLimit.
 			case errors.As(d.stop, &die):
 				r.awaitFree(ctx, die.key, r.opts.PollInterval)
+			case errors.As(d.stop, &yield):
+				// An older sync task's caller is waiting for the lease.
+				if err := r.waitTask(ctx, yield.id, key, r.opts.PollInterval); err != nil {
+					return nil, err
+				}
 			case ctx.Err() != nil:
 				return nil, ctx.Err()
 			default:
@@ -564,12 +615,26 @@ func (r *Runner) finished(ids ...TaskID) {
 	}
 }
 
+// stopWaiting ends a Run caller's claim on its task, so that if the task is
+// still pending, workers may take it at once.
+func (r *Runner) stopWaiting(q *queue, id TaskID) {
+	r.mu.Lock()
+	delete(r.waiting, id)
+	ctx := context.WithoutCancel(r.ctx)
+	r.mu.Unlock()
+	if _, err := r.db.Exec(ctx, `UPDATE `+q.tasks+` SET waiting_until = NULL
+		WHERE id = $1 AND state = 'pending'`, id); err != nil {
+		r.log.Warn("clear a sync task's waiting caller; it lapses on its own", zapQueue(q.name), zapErr(err))
+	}
+}
+
 // waitTask waits until the task finishes in this process, the subject's lease
 // is released in this process, d passes, or ctx ends.
 func (r *Runner) waitTask(ctx context.Context, id TaskID, key subjectKey, d time.Duration) error {
 	ch := r.addWaiter(id)
 	defer r.removeWaiter(id, ch)
-	free := r.freedChan(key)
+	free, unsubscribe := r.subscribeFree(key)
+	defer unsubscribe()
 	t := time.NewTimer(d)
 	defer t.Stop()
 	select {

@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -17,6 +18,9 @@ type hold struct {
 	subject string
 	token   uuid.UUID
 	age     treeAge
+	// lost is set when renewal finds the lease taken over. Nothing more may
+	// run under it.
+	lost atomic.Bool
 }
 
 func (h *hold) key() subjectKey { return subjectKey{h.q.name, h.subject} }
@@ -48,6 +52,20 @@ func (e *dieError) Error() string {
 // errNotCommitted ends a hold without releasing it: the tree could not commit
 // and its task is left for resumption once the lease expires.
 var errNotCommitted = errors.New("not committed")
+
+// errLeaseLost ends a hold whose lease another consumer has taken over. The
+// task under it gets no outcome from this process: the new owner runs it.
+var errLeaseLost = errors.New("lease lost to another consumer")
+
+// errNotPending stops a run whose task another consumer finished first.
+var errNotPending = errors.New("task no longer pending")
+
+// freeSub is a set of waiters on one subject's lease being released in this
+// process.
+type freeSub struct {
+	ch chan struct{}
+	n  int
+}
 
 // tryLease takes the subject's lease for a tree of the given age, or reports
 // the age of the tree holding it. Both results are nil when the holder's age
@@ -114,8 +132,8 @@ func (r *Runner) release(ctx context.Context, h *hold) {
 			zapSubject(h.q.name, h.subject), zapErr(err))
 	}
 	r.mu.Lock()
-	if ch, ok := r.freed[h.key()]; ok {
-		close(ch)
+	if sub, ok := r.freed[h.key()]; ok {
+		close(sub.ch)
 		delete(r.freed, h.key())
 	}
 	r.mu.Unlock()
@@ -129,30 +147,43 @@ func (r *Runner) forget(h *hold) {
 }
 
 // endHold releases a root hold after a drain, or leaves it to expire when the
-// drain stopped on a tree that could not commit.
+// drain stopped on a tree that could not commit or lost the lease.
 func (r *Runner) endHold(ctx context.Context, h *hold, stop error) {
-	if errors.Is(stop, errNotCommitted) {
+	if errors.Is(stop, errNotCommitted) || errors.Is(stop, errLeaseLost) {
 		r.forget(h)
 		return
 	}
 	r.release(ctx, h)
 }
 
-func (r *Runner) freedChan(key subjectKey) <-chan struct{} {
+// subscribeFree returns a channel closed when this process next releases
+// key's lease, and a func that ends the subscription.
+func (r *Runner) subscribeFree(key subjectKey) (<-chan struct{}, func()) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	ch, ok := r.freed[key]
+	sub, ok := r.freed[key]
 	if !ok {
-		ch = make(chan struct{})
-		r.freed[key] = ch
+		sub = &freeSub{ch: make(chan struct{})}
+		r.freed[key] = sub
 	}
-	return ch
+	sub.n++
+	return sub.ch, func() {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		if r.freed[key] != sub {
+			return // released and removed already
+		}
+		if sub.n--; sub.n == 0 {
+			delete(r.freed, key)
+		}
+	}
 }
 
 // awaitFree waits until this process releases key's lease, d passes or ctx
 // ends.
 func (r *Runner) awaitFree(ctx context.Context, key subjectKey, d time.Duration) {
-	free := r.freedChan(key)
+	free, unsubscribe := r.subscribeFree(key)
+	defer unsubscribe()
 	t := time.NewTimer(d)
 	defer t.Stop()
 	select {
@@ -162,10 +193,12 @@ func (r *Runner) awaitFree(ctx context.Context, key subjectKey, d time.Duration)
 	}
 }
 
-// renewLoop extends every lease this process holds, three times per TTL. A
-// lease found taken over is dropped; the tree under it then fails its commit.
+// renewLoop extends every lease this process holds, and every sync task's
+// claim that its caller is waiting, three times per TTL. A lease found taken
+// over is marked lost; the tree under it stops before its next attempt and
+// fails its commit.
 func (r *Runner) renewLoop(ctx context.Context) {
-	defer r.wg.Done()
+	defer close(r.renewDone)
 	t := time.NewTicker(r.opts.LeaseTTL / 3)
 	defer t.Stop()
 	for {
@@ -179,9 +212,19 @@ func (r *Runner) renewLoop(ctx context.Context) {
 		for token, h := range r.holds {
 			byQueue[h.q] = append(byQueue[h.q], token)
 		}
+		waiting := map[*queue][]TaskID{}
+		for id, q := range r.waiting {
+			waiting[q] = append(waiting[q], id)
+		}
 		r.mu.Unlock()
 		for q, tokens := range byQueue {
 			r.renew(ctx, q, tokens)
+		}
+		for q, ids := range waiting {
+			if _, err := r.db.Exec(ctx, `UPDATE `+q.tasks+` SET waiting_until = now() + $2 * interval '1 millisecond'
+				WHERE id = ANY($1) AND state = 'pending'`, ids, r.opts.LeaseTTL.Milliseconds()); err != nil && ctx.Err() == nil {
+				r.log.Warn("renew waiting sync tasks", zapQueue(q.name), zapErr(err))
+			}
 		}
 	}
 }
@@ -213,6 +256,7 @@ func (r *Runner) renew(ctx context.Context, q *queue, tokens []uuid.UUID) {
 			delete(r.holds, token)
 			r.mu.Unlock()
 			if h != nil {
+				h.lost.Store(true)
 				r.log.Warn("lease lost to another consumer", zapSubject(q.name, h.subject))
 			}
 		}
