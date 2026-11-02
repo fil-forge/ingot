@@ -1,0 +1,285 @@
+package taskrunner_test
+
+import (
+	"context"
+	"errors"
+	"slices"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/fil-forge/ingot/taskrunner"
+)
+
+func (f *fixture) migrate(t *testing.T) {
+	t.Helper()
+	if err := f.r.Migrate(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func (f *fixture) notBefore(t *testing.T, queue string, id taskrunner.TaskID) time.Time {
+	t.Helper()
+	var nb time.Time
+	tbl := f.env.Table(queueTable(queue) + "_tasks")
+	if err := f.env.DB.QueryRow(context.Background(), `SELECT not_before FROM `+tbl+` WHERE id = $1`, id).Scan(&nb); err != nil {
+		t.Fatalf("read not_before of %s: %v", id, err)
+	}
+	return nb
+}
+
+func at(d time.Duration) *time.Time {
+	t := time.Now().Add(d)
+	return &t
+}
+
+func TestReplacementKeepsTheLaterNotBefore_Live(t *testing.T) {
+	f := newFixture(t, 0)
+	f.handle(t, qTop, "evict", f.put())
+	f.migrate(t)
+	ctx := waitCtx(t)
+	submit := func(d time.Duration, replace bool) taskrunner.TaskID {
+		t.Helper()
+		id, err := f.r.Submit(ctx, taskrunner.Spec{Queue: qTop, Subject: "blob", Action: "evict", NotBefore: at(d), Replace: replace})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+
+	first := submit(time.Hour, true)
+	later := submit(2*time.Hour, true)
+	earlier := submit(30*time.Minute, true)
+	plain := submit(time.Minute, false)
+
+	for _, id := range []taskrunner.TaskID{first, earlier} {
+		if _, err := f.r.Wait(ctx, qTop, id); !errors.Is(err, taskrunner.ErrNotFound) {
+			t.Errorf("replaced task %s: Wait error %v, want ErrNotFound", id, err)
+		}
+	}
+	if s := f.state(t, qTop, later); s != "pending" {
+		t.Errorf("kept task is %s, want pending", s)
+	}
+	if nb := f.notBefore(t, qTop, later); time.Until(nb) < 90*time.Minute {
+		t.Errorf("kept task's NotBefore is %v away, want about 2h", time.Until(nb))
+	}
+	if s := f.state(t, qTop, plain); s != "pending" {
+		t.Errorf("a task submitted without Replace was dropped: %s", s)
+	}
+}
+
+func TestReplacementLeavesAStartedTaskAlone_Live(t *testing.T) {
+	f := newFixture(t, 2)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var runs atomic.Int32
+	f.handle(t, qTop, "evict", func(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
+		if runs.Add(1) == 1 {
+			close(started)
+			<-release
+		}
+		return nil, nil
+	})
+	f.start(t)
+	ctx := waitCtx(t)
+
+	running, err := f.r.Submit(ctx, taskrunner.Spec{Queue: qTop, Subject: "blob", Action: "evict", NotBefore: at(-time.Second), Replace: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	next, err := f.r.Submit(ctx, taskrunner.Spec{Queue: qTop, Subject: "blob", Action: "evict", NotBefore: at(50 * time.Millisecond), Replace: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	for _, id := range []taskrunner.TaskID{running, next} {
+		if _, err := f.r.Wait(ctx, qTop, id); err != nil {
+			t.Errorf("Wait %s: %v", id, err)
+		}
+	}
+	if n := runs.Load(); n != 2 {
+		t.Errorf("ran %d times, want 2", n)
+	}
+}
+
+func TestCancel_Live(t *testing.T) {
+	f := newFixture(t, 2)
+	f.handle(t, qBottom, "expire", f.put())
+	f.handle(t, qTop, "claim", func(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
+		id, err := uuid.Parse(string(task.Args))
+		if err != nil {
+			return nil, err
+		}
+		if err := ex.Cancel(ctx, qBottom, id); err != nil {
+			return nil, err
+		}
+		if task.Subject == "fail" {
+			return nil, errors.New("claim failed")
+		}
+		return nil, nil
+	})
+	f.start(t)
+	ctx := waitCtx(t)
+	delayed := func() taskrunner.TaskID {
+		t.Helper()
+		id, err := f.r.Submit(ctx, taskrunner.Spec{Queue: qBottom, Subject: "ref", Action: "expire", Args: []byte("1"), NotBefore: at(time.Hour)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+
+	// A cancel in a failed tree is dropped with the tree's other writes.
+	kept := delayed()
+	if _, err := f.r.Run(ctx, taskrunner.Spec{Queue: qTop, Subject: "fail", Action: "claim", Args: []byte(kept.String())}); err == nil {
+		t.Fatal("claim succeeded")
+	}
+	if s := f.state(t, qBottom, kept); s != "pending" {
+		t.Errorf("task cancelled by a failed tree: %s", s)
+	}
+
+	if _, err := f.r.Run(ctx, taskrunner.Spec{Queue: qTop, Subject: "ok", Action: "claim", Args: []byte(kept.String())}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.r.Wait(ctx, qBottom, kept); !errors.Is(err, taskrunner.ErrCancelled) {
+		t.Errorf("Wait error %v, want ErrCancelled", err)
+	}
+
+	rolledBack := delayed()
+	tx, err := f.env.DB.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.r.CancelTx(ctx, tx, qBottom, rolledBack); err != nil {
+		t.Fatal(err)
+	}
+	_ = tx.Rollback(ctx)
+	if s := f.state(t, qBottom, rolledBack); s != "pending" {
+		t.Errorf("rolled-back cancel took effect: %s", s)
+	}
+
+	// A cancel after the task has run does nothing.
+	done, err := f.r.Submit(ctx, taskrunner.Spec{Queue: qBottom, Subject: "ref", Action: "expire", Args: []byte("2")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.r.Wait(ctx, qBottom, done); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.r.Cancel(ctx, qBottom, done); err != nil {
+		t.Fatal(err)
+	}
+	if s := f.state(t, qBottom, done); s != "succeeded" {
+		t.Errorf("cancel changed a finished task to %s", s)
+	}
+}
+
+func TestBatchStopsAtTheLimitAndAtAnotherAction_Live(t *testing.T) {
+	f := newFixture(t, 1)
+	var mu sync.Mutex
+	var runs [][]string
+	record := func(tasks []taskrunner.Task) {
+		mu.Lock()
+		defer mu.Unlock()
+		var args []string
+		for _, task := range tasks {
+			args = append(args, string(task.Args))
+		}
+		runs = append(runs, args)
+	}
+	if err := f.r.HandleBatch(qTop, "register", 3, func(ctx context.Context, ex *taskrunner.Exec, tasks []taskrunner.Task) ([][]byte, error) {
+		record(tasks)
+		return make([][]byte, len(tasks)), nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	f.handle(t, qTop, "retract", func(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
+		record([]taskrunner.Task{task})
+		return nil, nil
+	})
+	f.migrate(t)
+	ctx := waitCtx(t)
+
+	var last taskrunner.TaskID
+	for _, a := range []string{"r1", "r2", "r3", "r4", "r5", "x", "r6", "r7"} {
+		action := "register"
+		if a == "x" {
+			action = "retract"
+		}
+		id, err := f.r.Submit(ctx, taskrunner.Spec{Queue: qTop, Subject: "space", Action: action, Args: []byte(a)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		last = id
+	}
+	if _, err := f.r.Run(ctx, taskrunner.Spec{Queue: qTop, Subject: "space", Action: "register"}); err == nil {
+		t.Error("a batching action ran sync")
+	}
+	f.start(t)
+	if _, err := f.r.Wait(ctx, qTop, last); err != nil {
+		t.Fatal(err)
+	}
+	want := [][]string{{"r1", "r2", "r3"}, {"r4", "r5"}, {"x"}, {"r6", "r7"}}
+	mu.Lock()
+	defer mu.Unlock()
+	if !slices.EqualFunc(runs, want, slices.Equal) {
+		t.Errorf("batches %v, want %v", runs, want)
+	}
+}
+
+func TestRetries_Live(t *testing.T) {
+	f := newFixture(t, 2)
+	policy := taskrunner.WithRetry(taskrunner.RetryPolicy{First: 10 * time.Millisecond, Max: 40 * time.Millisecond, Multiplier: 2, Attempts: 3})
+	var mu sync.Mutex
+	attempts := map[string][]int{}
+	if err := f.r.Handle(qTop, "flaky", func(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
+		mu.Lock()
+		attempts[task.Subject] = append(attempts[task.Subject], task.Attempt)
+		mu.Unlock()
+		switch {
+		case task.Subject == "permanent":
+			return nil, taskrunner.Permanent(errors.New("proof expired"))
+		case task.Subject == "recovers" && task.Attempt == 2:
+			return []byte("ok"), nil
+		}
+		return nil, errors.New("unavailable")
+	}, policy); err != nil {
+		t.Fatal(err)
+	}
+	f.start(t)
+	ctx := waitCtx(t)
+
+	results := map[string]error{}
+	for _, s := range []string{"recovers", "never", "permanent"} {
+		id, err := f.r.Submit(ctx, taskrunner.Spec{Queue: qTop, Subject: s, Action: "flaky"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, results[s] = f.r.Wait(ctx, qTop, id)
+	}
+	if _, err := f.r.Run(ctx, taskrunner.Spec{Queue: qTop, Subject: "sync", Action: "flaky"}); err == nil {
+		t.Error("sync task succeeded")
+	}
+
+	if results["recovers"] != nil {
+		t.Errorf("recovers: %v", results["recovers"])
+	}
+	var failed *taskrunner.HandlerError
+	if !errors.As(results["never"], &failed) || failed.Message != "unavailable" {
+		t.Errorf("never: %v, want a HandlerError", results["never"])
+	}
+	if !errors.As(results["permanent"], &failed) {
+		t.Errorf("permanent: %v, want a HandlerError", results["permanent"])
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for s, want := range map[string][]int{"recovers": {0, 1, 2}, "never": {0, 1, 2}, "permanent": {0}, "sync": {0}} {
+		if !slices.Equal(attempts[s], want) {
+			t.Errorf("%s ran with attempts %v, want %v", s, attempts[s], want)
+		}
+	}
+}
