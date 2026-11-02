@@ -33,11 +33,17 @@ type fakeMeta struct {
 	// onShipFail, if set, is called with each failed call's seq.
 	failShips  int
 	onShipFail func(seq uint64)
+	// failSeals and onSealFail do the same for MarkSegmentSealed.
+	failSeals  int
+	onSealFail func(seq uint64)
 }
 
 type shipEvent struct {
 	seq   uint64
 	plane blockstore.Plane
+	// rowSealed is whether the row was stamped sealed, with a sha256, when
+	// the ship stamped it.
+	rowSealed bool
 }
 
 func newFakeMeta() *fakeMeta {
@@ -83,6 +89,13 @@ func (f *fakeMeta) MarkSegmentSealed(_ context.Context, plane blockstore.Plane, 
 	size int64, sha []byte, opRoots []blockstore.OpRoot) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.failSeals > 0 {
+		f.failSeals--
+		if f.onSealFail != nil {
+			f.onSealFail(seq)
+		}
+		return fmt.Errorf("fake: seal of seq %d failed", seq)
+	}
 	m, ok := f.segments[seq]
 	if !ok {
 		return fmt.Errorf("fake: seal missing seq %d", seq)
@@ -119,7 +132,7 @@ func (f *fakeMeta) MarkSegmentShipped(_ context.Context, plane blockstore.Plane,
 	m.ShippedAt = shippedAt
 	m.IndexDigest = slices.Clone(indexDigest)
 	m.DeadBytes = deadBytes
-	f.shipped = append(f.shipped, shipEvent{seq: seq, plane: plane})
+	f.shipped = append(f.shipped, shipEvent{seq: seq, plane: plane, rowSealed: m.State == StateSealed && len(m.SHA256) > 0})
 	return nil
 }
 
@@ -701,6 +714,77 @@ func TestFailedShipStampRetriedWithoutReshipping(t *testing.T) {
 	defer meta.mu.Unlock()
 	if m, ok := meta.segments[seq]; !ok || m.ShippedAt == 0 {
 		t.Fatalf("segment %d row = %+v (present %v), want stamped shipped", seq, m, ok)
+	}
+}
+
+// TestFailedSealStampRecordedBeforeShip: a seal whose stamp in Meta fails
+// (Postgres failing over, say) leaves the segment frozen and readable, and
+// writes move on to a new segment. The ship records the seal before it
+// ships, so the row it stamps shipped is sealed, with its sha256 for
+// DeleteBucket's release.
+func TestFailedSealStampRecordedBeforeShip(t *testing.T) {
+	prev := shipBackoff
+	shipBackoff = 20 * time.Millisecond
+	t.Cleanup(func() { shipBackoff = prev })
+	ctx := context.Background()
+	s, meta, flushes := newTestStore(t, 64, 50*time.Millisecond, 6)
+	sealFailed := make(chan uint64, 8)
+	meta.mu.Lock()
+	meta.failSeals = 2 // the seal itself, then the ship's first try
+	meta.onSealFail = func(seq uint64) { sealFailed <- seq }
+	meta.mu.Unlock()
+
+	blk := makeBlock(t, append([]byte("seal-"), make([]byte, 80)...))
+	seq, err := s.AppendBatch(ctx, []block.Block{blk},
+		blockstore.OpRoot{Bucket: "bk", Root: makeRoot(t, "seal")})
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	select {
+	case failed := <-sealFailed:
+		if failed != seq {
+			t.Fatalf("seal stamp failed for seq %d, want %d", failed, seq)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the seal stamp never failed")
+	}
+
+	if got, err := s.Get(ctx, blk.Cid()); err != nil || string(got.RawData()) != string(blk.RawData()) {
+		t.Fatalf("Get after a failed seal stamp: %v", err)
+	}
+	next := makeBlock(t, append([]byte("next-"), make([]byte, 80)...))
+	seq2, err := s.AppendBatch(ctx, []block.Block{next},
+		blockstore.OpRoot{Bucket: "bk", Root: makeRoot(t, "next")})
+	if err != nil {
+		t.Fatalf("append after a failed seal stamp: %v", err)
+	}
+	if seq2 == seq {
+		t.Fatalf("append after a failed seal stamp went to the frozen segment %d", seq)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		meta.mu.Lock()
+		var ship *shipEvent
+		for i := range meta.shipped {
+			if meta.shipped[i].seq == seq {
+				ship = &meta.shipped[i]
+			}
+		}
+		meta.mu.Unlock()
+		if ship != nil {
+			if !ship.rowSealed {
+				t.Fatalf("segment %d shipped while its row wasn't stamped sealed", seq)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("segment %d never shipped (%d flushes)", seq, flushes.load())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got, err := s.Get(ctx, blk.Cid()); err != nil || string(got.RawData()) != string(blk.RawData()) {
+		t.Fatalf("Get after the ship: %v", err)
 	}
 }
 

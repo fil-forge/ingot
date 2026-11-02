@@ -71,9 +71,11 @@ sequenceDiagram
     C->>DB: CommitRoot: share-lock the segment row, journal the batch's blocks<br/>under it (none once it has shipped), CAS the root: one tx
 
     Note over S,FS: seal when size >= SealBytes or age >= SealAge<br/>(also at Close, and recovery force-seals)
-    S->>FS: hash CAR, write .idx (tmp + fsync, rename, fsync dir)
-    S->>DB: MarkSegmentSealed(size, sha256, op-roots) in one tx
+    S->>FS: freeze: fsync, hash CAR, open it read-only, close the write fd
+    S->>FS: record: write .idx (tmp + fsync, rename, fsync dir)
+    S->>DB: record: MarkSegmentSealed(size, sha256, op-roots) in one tx
     S->>F: enqueueFlush (queue cap 64; a full queue leaves it to the retry sweep)
+    Note over S,F: a failed record still moves the frozen segment on,<br/>and the flush records the seal before it ships
 
     S->>FS: measure dead bytes once: walk from the last op-root through<br/>this segment's own blocks (a failure leaves it unmeasured)
     F->>F: SubmitShard: /blob/add the CAR to sprue, PUT, conclude, receipt<br/>(index publish is best-effort, space resolved via reg.Get at ship time)
@@ -118,7 +120,7 @@ walk from.
 stateDiagram-v2
     [*] --> Open : createOpenSegment + InsertSegmentOpen
     Open --> Open : append (fsync, then index commit)
-    Open --> Sealed : seal (hash CAR, write .idx, MarkSegmentSealed)
+    Open --> Sealed : seal (freeze: hash CAR, read-only fd; record: write .idx, MarkSegmentSealed)
     Open --> Sealed : recovery, .idx on disk behind an open row (MarkSegmentSealed)
     [*] --> Sealed : recovery, row-less CAR with .idx (RehydrateSegment)
     Open --> [*] : recovery, CAR missing (journal rows rebuilt into a new segment, then DeleteSegment)
@@ -140,6 +142,12 @@ stateDiagram-v2
   nothing ships them.
 - Recovery force-seals any recovered open segment, so each process starts
   with a brand-new open segment per bucket.
+- A seal freezes the segment before it records the seal. If recording fails
+  (Postgres failing over, say), the segment stays frozen: it is readable
+  through its read-only fd, and writes go on to a new segment. Its row is
+  still `open`. The flush records the seal before every ship attempt, so the
+  queued ship and the minute's retry sweep retry it, and no segment ships
+  with its row still `open` and no `sha256` for `DeleteBucket` to release.
 
 ## Invariants
 

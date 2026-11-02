@@ -283,10 +283,12 @@ func (pl *PlaneLog) sealOpenIfDue(ctx context.Context, force bool) error {
 	)
 	err := open.seal(sealCtx, pl.meta)
 	tracing.End(span, err)
-	if err != nil {
-		return err
+	if err != nil && open.State() == StateOpen {
+		return err // still open: the next tick tries again
 	}
 
+	// A segment that froze but whose seal wasn't recorded moves on too, so
+	// writes go to a new segment. Its ship records the seal first.
 	pl.catMu.Lock()
 	if pl.open == open {
 		pl.open = nil
@@ -295,7 +297,7 @@ func (pl *PlaneLog) sealOpenIfDue(ctx context.Context, force bool) error {
 	pl.catMu.Unlock()
 
 	pl.enqueueFlush(open)
-	return nil
+	return err
 }
 
 // queuedShipAttempts is how many times a queued segment's ship is tried
@@ -395,8 +397,13 @@ func (pl *PlaneLog) flushOne(seg *Segment, maxAttempts int) bool {
 		span.SetAttributes(attribute.Int("ingot.log.attempts", attempt))
 		var err error
 		if !flushed {
-			if indexDigest, err = pl.pc.Flush(ctx, seg); err == nil {
-				flushed, shippedAt = true, time.Now().Unix()
+			// Record a seal that failed to record before shipping: a ship
+			// would stamp a row still open, with no sha256 for a release to
+			// find. A no-op once recorded.
+			if err = seg.seal(ctx, pl.meta); err == nil {
+				if indexDigest, err = pl.pc.Flush(ctx, seg); err == nil {
+					flushed, shippedAt = true, time.Now().Unix()
+				}
 			}
 		}
 		if err != nil {

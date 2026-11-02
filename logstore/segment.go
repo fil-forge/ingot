@@ -46,12 +46,16 @@ type Segment struct {
 
 	state    State
 	sealedAt int64
+	// sealRecorded is set once seal has written the .idx and stamped the row
+	// sealed in Meta. A sealed segment without it froze, but recording the
+	// seal failed; seal finishes that before it can ship.
+	sealRecorded bool
 
 	carPath string
 	idxPath string
 
 	// fdRW is the append/read fd for an open segment (closed at seal).
-	// fdRO is the read-only fd opened at seal time.
+	// fdRO is the read-only fd opened at seal time, before fdRW closes.
 	fdRW *os.File
 	fdRO *os.File
 
@@ -329,18 +333,38 @@ func (s *Segment) append(blocks []block.Block, opRoots []blockstore.OpRoot) erro
 	return nil
 }
 
-// seal closes the open CAR fd (+ ops fd), hashes the CAR, writes the .idx
-// sidecar, and records the sealed state in Meta. After this returns the
-// segment is StateSealed and ready to ship.
+// seal freezes an open segment, then records the seal: the .idx sidecar and
+// the row stamped sealed in Meta. The steps are separate so that a failure in
+// recording (Postgres failing over, say) leaves the segment frozen and
+// readable, and a later call records it rather than returning early with the
+// row still open. Idempotent once recorded.
 func (s *Segment) seal(ctx context.Context, meta Meta) error {
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
 
-	if s.state != StateOpen {
-		// Idempotent: already sealed.
+	if s.state == StateOpen {
+		if err := s.freeze(); err != nil {
+			return err
+		}
+	}
+	if s.sealRecorded {
 		return nil
 	}
+	if err := s.writeIdx(); err != nil {
+		return fmt.Errorf("logstore: write idx %d: %w", s.seq, err)
+	}
+	if err := meta.MarkSegmentSealed(ctx, s.plane, s.seq, s.sealedAt, s.size, s.sha, s.opRoots); err != nil {
+		return fmt.Errorf("logstore: mark sealed %d: %w", s.seq, err)
+	}
+	s.sealRecorded = true
+	return nil
+}
 
+// freeze ends an open segment's appends: it syncs the segment's files,
+// hashes the CAR and swaps the write fd for a read-only one. Every step that
+// can fail runs before the segment changes, so a failure leaves it open, and
+// reads never lose their fd. Called with stateMu held.
+func (s *Segment) freeze() error {
 	syncFiles := []*os.File{s.fdRW}
 	if s.hasOps() {
 		syncFiles = append(syncFiles, s.opsFD)
@@ -348,38 +372,29 @@ func (s *Segment) seal(ctx context.Context, meta Meta) error {
 	if err := syncAll(syncFiles...); err != nil {
 		return fmt.Errorf("logstore: pre-seal fsync %d: %w", s.seq, err)
 	}
-	if err := s.fdRW.Close(); err != nil {
-		return fmt.Errorf("logstore: close %s car %d: %w", s.plane, s.seq, err)
-	}
-	s.fdRW = nil
-	if s.opsFD != nil {
-		if err := s.opsFD.Close(); err != nil {
-			return fmt.Errorf("logstore: close ops %d: %w", s.seq, err)
-		}
-		s.opsFD = nil
-	}
-
 	sum, err := hashFile(s.carPath)
 	if err != nil {
 		return fmt.Errorf("logstore: hash %s %d: %w", s.plane, s.seq, err)
 	}
-	s.sha = sum
-	s.sealedAt = time.Now().Unix()
-	s.state = StateSealed
-
-	if err := s.writeIdx(); err != nil {
-		return fmt.Errorf("logstore: write idx %d: %w", s.seq, err)
-	}
-
-	if err := meta.MarkSegmentSealed(ctx, s.plane, s.seq, s.sealedAt, s.size, s.sha, s.opRoots); err != nil {
-		return fmt.Errorf("logstore: mark sealed %d: %w", s.seq, err)
-	}
-
 	ro, err := os.Open(s.carPath)
 	if err != nil {
 		return fmt.Errorf("logstore: open ro %s car %d: %w", s.plane, s.seq, err)
 	}
+	// Both files are synced, so a failed close loses nothing.
+	if err := s.fdRW.Close(); err != nil {
+		s.logger.Warn("logstore: close car at seal", zap.Stringer("plane", s.plane), zap.Uint64("seq", s.seq), zap.Error(err))
+	}
+	s.fdRW = nil
+	if s.opsFD != nil {
+		if err := s.opsFD.Close(); err != nil {
+			s.logger.Warn("logstore: close ops at seal", zap.Uint64("seq", s.seq), zap.Error(err))
+		}
+		s.opsFD = nil
+	}
 	s.fdRO = ro
+	s.sha = sum
+	s.sealedAt = time.Now().Unix()
+	s.state = StateSealed
 	return nil
 }
 
@@ -633,6 +648,7 @@ func loadSealedFromIdx(dir string, seq uint64, plane blockstore.Plane, shippedAt
 	s.size = raw.SizeByte
 	s.sealedAt = raw.SealedAt
 	s.state = StateSealed
+	s.sealRecorded = true // the .idx exists, and its row is sealed
 	s.shippedAt = shippedAt
 
 	for _, o := range raw.OpRoots {
