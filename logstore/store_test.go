@@ -51,6 +51,24 @@ func (f *fakeMeta) NextSegmentSeq(_ context.Context) (uint64, error) {
 	return f.nextSeq, nil
 }
 
+func (f *fakeMeta) EnsureSegmentSeqAbove(_ context.Context, seq uint64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.nextSeq = max(f.nextSeq, seq)
+	return nil
+}
+
+// The fake keeps no journal; rebuild_test.go drives the journal through
+// inmem.MemStore.
+func (f *fakeMeta) JournalBuckets(context.Context) ([]string, error)          { return nil, nil }
+func (f *fakeMeta) JournalSegments(context.Context, string) ([]uint64, error) { return nil, nil }
+func (f *fakeMeta) ReadJournal(context.Context, uint64, cid.Cid, int) ([]block.Block, error) {
+	return nil, nil
+}
+func (f *fakeMeta) MoveJournal(context.Context, string, uint64, uint64, cid.Cid, cid.Cid) error {
+	return nil
+}
+
 func (f *fakeMeta) InsertSegmentOpen(_ context.Context, plane blockstore.Plane, seq uint64, bucket string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()

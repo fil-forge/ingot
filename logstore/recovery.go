@@ -1,7 +1,9 @@
 package logstore
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,25 +12,42 @@ import (
 	"strings"
 	"time"
 
+	block "github.com/ipfs/go-block-format"
+	"github.com/ipfs/go-cid"
 	"go.uber.org/zap"
 
 	"github.com/fil-forge/ingot/blockstore"
 )
 
 // recover scans this plane's subdirectory and the Meta backend, rebuilds
-// the sealed segment list, picks the in-flight open segment (if any), and
+// the sealed segment list, force-seals every segment that was open, and
 // re-enqueues anything still pending ship. Discovery keys on the CAR
 // file. Reconciliation per seq:
-//   - row open    → rebuild as open; force-sealed by openPlaneLog.
 //   - row sealed  → load from .idx; re-enqueue when shipping & not shipped.
-//   - no row, CAR present → orphan (crashed before the row, or a row-lost
-//     sealed segment): rebuild as open + insert row; force-sealed by
-//     openPlaneLog.
+//     With no readable .idx, rebuild from a CAR that matches the row and
+//     seal again; set aside one that doesn't, and recover it as a lost file.
+//   - row open or no row, .idx present → the segment finished sealing but
+//     Meta was restored from behind the disk: load from .idx, bring the row
+//     up to it (MarkSegmentSealed, or RehydrateSegment when missing),
+//     re-enqueue (a re-ship of what already shipped is a no-op).
+//   - row open or no row, no (readable) .idx → open at the crash: rebuild
+//     from the CAR, seeding the row if missing, then force-seal. Every such
+//     segment is force-sealed, so each start opens a brand-new one.
+//   - no unretired row, but a retired shipped one → files left by an
+//     interrupted retire; unlink them, keep the row. A retired row that
+//     never shipped was retired because its file was missing; the file is
+//     back and may be the only copy of its blocks, so it is recovered as if
+//     it had no row. Without a readable .idx it ships under its retired
+//     row, whose files the next start then removes.
 //   - row sealed, no CAR → retire the row: a crash between retention's
 //     unlink and its retired stamp, or a lost file. The row stays the
 //     record of what the segment may have registered in the space.
 //   - row open, no CAR → delete the row.
 //   - sidecar (.idx/.ops) with no CAR → stray; unlink.
+//
+// Before the fileless rows go, rebuildFromJournal writes the blocks the
+// catalog journal still holds for any segment whose CAR is gone into new
+// segments, which re-enqueue with the rest.
 func (pl *PlaneLog) recover(ctx context.Context) error {
 	rows, err := pl.meta.ListSegments(ctx, pl.plane, pl.bucket)
 	if err != nil {
@@ -76,49 +95,115 @@ func (pl *PlaneLog) recover(ctx context.Context) error {
 		set[seq] = struct{}{}
 	}
 
+	// A CAR whose seq has a retired, shipped row is left over from a retire
+	// whose unlink never reached the disk: the segment is on Forge, and the
+	// row is the record DeleteBucket needs, so the files go and the row
+	// stays. A retired row that never shipped was retired because its file
+	// was missing (a volume mounted late, say); the file may hold the only
+	// copy of its blocks, so the segment is recovered as if it had no row.
+	// With a readable .idx that replaces the row; without one the rebuilt
+	// segment ships under the retired row (InsertSegmentOpen keeps it), and
+	// the next start removes its files. Only read when some CAR has no
+	// unretired row.
+	var retiredShipped map[uint64]bool
+	isRetiredShipped := func(seq uint64) (bool, error) {
+		if retiredShipped == nil {
+			rows, err := pl.meta.ListRetiredSegments(ctx, pl.plane, pl.bucket)
+			if err != nil {
+				return false, fmt.Errorf("logstore: list retired %s segments for %q: %w", pl.plane, pl.bucket, err)
+			}
+			retiredShipped = make(map[uint64]bool, len(rows))
+			for _, r := range rows {
+				retiredShipped[r.Seq] = r.ShippedAt != 0
+			}
+		}
+		return retiredShipped[seq], nil
+	}
+
+	// Whether the journal still files blocks under a seq; read only when a
+	// sealed segment's CAR turns out damaged.
+	var journaledSeqs map[uint64]bool
+	isJournaled := func(seq uint64) (bool, error) {
+		if journaledSeqs == nil {
+			seqs, err := pl.meta.JournalSegments(ctx, pl.bucket)
+			if err != nil {
+				return false, fmt.Errorf("logstore: list journaled segments for %q: %w", pl.bucket, err)
+			}
+			journaledSeqs = make(map[uint64]bool, len(seqs))
+			for _, s := range seqs {
+				journaledSeqs[s] = true
+			}
+		}
+		return journaledSeqs[seq], nil
+	}
+
 	var (
 		sealedRecovered []*Segment
-		recoveredOpen   *Segment
+		opens           []*Segment
 	)
 
 	for seq := range carPresent {
 		row, hasRow := dbBySeq[seq]
-		switch {
-		case hasRow && row.State == StateOpen:
-			seg, err := rebuildOpenFromDisk(pl.dir, seq, pl.plane, pl.logger)
+		if !hasRow {
+			gone, err := isRetiredShipped(seq)
 			if err != nil {
-				return fmt.Errorf("logstore: rebuild open %s seg %d: %w", pl.plane, seq, err)
+				return err
 			}
-			if recoveredOpen != nil {
-				return fmt.Errorf("logstore: more than one open %s segment on disk (seqs %d and %d)",
-					pl.plane, recoveredOpen.seq, seq)
+			if gone {
+				pl.logger.Warn("logstore: removing the files of a retired segment",
+					zap.Stringer("plane", pl.plane), zap.Uint64("seq", seq))
+				removeSegmentFiles(pl.dir, seq, pl.plane)
+				delete(carPresent, seq)
+				delete(sidecarSeqs, seq)
+				continue
 			}
-			recoveredOpen = seg
-
-		case hasRow && row.State == StateSealed:
-			seg, err := loadSealedFromIdx(pl.dir, seq, pl.plane, row.ShippedAt, pl.logger)
+		}
+		if hasRow && row.State == StateSealed {
+			seg, err := pl.sealedRow(ctx, row, isJournaled)
 			if err != nil {
-				return fmt.Errorf("logstore: load sealed %s seg %d: %w", pl.plane, seq, err)
+				return err
+			}
+			if seg == nil {
+				// Damaged and set aside: recovered below like a lost file.
+				// Its sidecars describe the damaged CAR, so they go too.
+				removeSegmentFiles(pl.dir, seq, pl.plane)
+				delete(carPresent, seq)
+				delete(sidecarSeqs, seq)
+				continue
 			}
 			sealedRecovered = append(sealedRecovered, seg)
-
-		default:
-			// No row but a CAR is present: open at crash before its row was
-			// inserted, or a sealed segment whose row was lost. Rebuild as
-			// open and seed the row; openPlaneLog force-seals it.
-			seg, err := rebuildOpenFromDisk(pl.dir, seq, pl.plane, pl.logger)
-			if err != nil {
-				return fmt.Errorf("logstore: rebuild orphan %s seg %d: %w", pl.plane, seq, err)
-			}
+			continue
+		}
+		seg, err := pl.sealedFromIdx(ctx, seq, hasRow)
+		if err != nil {
+			return err
+		}
+		if seg != nil {
+			sealedRecovered = append(sealedRecovered, seg)
+			continue
+		}
+		// Open at the crash, with or without its row: rebuild it from the
+		// CAR, seeding the row if missing.
+		if seg, err = rebuildOpenFromDisk(pl.dir, seq, pl.plane, pl.logger); err != nil {
+			return fmt.Errorf("logstore: rebuild open %s seg %d: %w", pl.plane, seq, err)
+		}
+		if !hasRow {
 			if err := pl.meta.InsertSegmentOpen(ctx, pl.plane, seq, pl.bucket); err != nil {
 				return fmt.Errorf("logstore: insert orphan %s row %d: %w", pl.plane, seq, err)
 			}
-			if recoveredOpen != nil {
-				return fmt.Errorf("logstore: orphan + open conflict (%s seqs %d and %d)",
-					pl.plane, recoveredOpen.seq, seq)
-			}
-			recoveredOpen = seg
 		}
+		opens = append(opens, seg)
+	}
+
+	// Force-seal every recovered open segment, so each process starts with a
+	// brand-new open one. There can be more than one: Meta restored from
+	// behind the disk, or a rebuild from the journal that crashed partway,
+	// leaves an open segment besides the one open at the crash.
+	for _, seg := range opens {
+		if err := seg.seal(ctx, pl.meta); err != nil {
+			return fmt.Errorf("logstore: force-seal recovered open %s seg %d: %w", pl.plane, seg.Seq(), err)
+		}
+		sealedRecovered = append(sealedRecovered, seg)
 	}
 
 	// Sidecars with no CAR are useless strays (a torn createOpenSegment or
@@ -131,6 +216,12 @@ func (pl *PlaneLog) recover(ctx context.Context) error {
 			zap.Stringer("plane", pl.plane), zap.Uint64("seq", seq))
 		removeSegmentFiles(pl.dir, seq, pl.plane)
 	}
+
+	rebuilt, err := pl.rebuildFromJournal(ctx, carPresent)
+	if err != nil {
+		return err
+	}
+	sealedRecovered = append(sealedRecovered, rebuilt...)
 
 	// DB rows without an on-disk CAR. A sealed row converges to retired, so
 	// DeleteBucket still releases whatever its ship registered; an open row
@@ -171,14 +262,250 @@ func (pl *PlaneLog) recover(ctx context.Context) error {
 		}
 	}
 
-	pl.open = recoveredOpen
 	return nil
+}
+
+// sealedRow loads a segment whose row is sealed. Its .idx can still be
+// missing or unreadable: one written before seal fsynced it, a partial
+// restore, a manual cleanup. A CAR that still matches the row's size and
+// sha256 holds every frame, so the segment is then rebuilt from it and sealed
+// again, which writes a fresh .idx and leaves the sealed row as it is.
+//
+// A CAR that doesn't match is damaged: its frames were all fsynced and
+// journaled when it sealed, so a short tail is not a torn append, and
+// rebuilding it would ship a segment missing blocks and drop their journal
+// rows with the ship. It is renamed aside and sealedRow returns nil, so the
+// caller treats the CAR as gone: the journal rebuilds an unshipped
+// segment's blocks, and a shipped one's are on Forge. An unshipped segment
+// the journal holds nothing for fails the start instead, leaving the file as
+// it is. That is one sealed before the journal existed, whose blocks may
+// exist nowhere else, but also one whose blocks are safe or no longer
+// needed: its journal rows moved in full by a rebuild that crashed before
+// retiring it, or dropped by a DeleteBucket that emptied the bucket and then
+// failed. Telling these apart needs a person, so the error says how to go on.
+func (pl *PlaneLog) sealedRow(ctx context.Context, row SegmentMeta, journaled func(seq uint64) (bool, error)) (*Segment, error) {
+	seq := row.Seq
+	seg, err := loadSealedFromIdx(pl.dir, seq, pl.plane, row.ShippedAt, pl.logger)
+	if err == nil {
+		return seg, nil
+	}
+	carPath := filepath.Join(pl.dir, carName(seq))
+	intact, ierr := carMatchesRow(carPath, row)
+	if ierr != nil {
+		return nil, fmt.Errorf("logstore: check sealed %s seg %d: %w", pl.plane, seq, ierr)
+	}
+	if !intact {
+		if row.ShippedAt == 0 {
+			ok, jerr := journaled(seq)
+			if jerr != nil {
+				return nil, jerr
+			}
+			if !ok {
+				return nil, fmt.Errorf("logstore: sealed %s seg %d: .idx unreadable (%w) and the CAR doesn't match its row, with nothing journaled to rebuild it from; "+
+					"if its blocks are no longer needed, rename %s to %s.damaged and start again", pl.plane, seq, err, carPath, carPath)
+			}
+		}
+		aside := carPath + ".damaged"
+		if rerr := os.Rename(carPath, aside); rerr != nil {
+			return nil, fmt.Errorf("logstore: set aside damaged %s car %d: %w", pl.plane, seq, rerr)
+		}
+		pl.logger.Error("logstore: sealed segment's CAR doesn't match its row; set aside",
+			zap.Stringer("plane", pl.plane), zap.Uint64("seq", seq),
+			zap.String("path", aside), zap.Bool("shipped", row.ShippedAt != 0), zap.NamedError("idx_error", err))
+		return nil, nil
+	}
+	pl.logger.Warn("logstore: sealed segment's .idx unreadable; rebuilding it from its CAR",
+		zap.Stringer("plane", pl.plane), zap.Uint64("seq", seq), zap.Error(err))
+	if seg, err = rebuildOpenFromDisk(pl.dir, seq, pl.plane, pl.logger); err != nil {
+		return nil, fmt.Errorf("logstore: rebuild sealed %s seg %d: %w", pl.plane, seq, err)
+	}
+	if len(row.OpRoots) > 0 {
+		// The CAR matches the row, so the row's op-roots are its own, and
+		// they survive a torn or missing .ops.
+		seg.opRoots = row.OpRoots
+	}
+	if err := seg.seal(ctx, pl.meta); err != nil {
+		return nil, fmt.Errorf("logstore: reseal %s seg %d: %w", pl.plane, seq, err)
+	}
+	if row.ShippedAt != 0 {
+		seg.markShipped(row.ShippedAt)
+	}
+	return seg, nil
+}
+
+// carMatchesRow reports whether the CAR at path has the size and sha256 its
+// sealed row recorded.
+func carMatchesRow(path string, row SegmentMeta) (bool, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return false, err
+	}
+	if info.Size() != row.Size || len(row.SHA256) == 0 {
+		return false, nil
+	}
+	sum, err := hashFile(path)
+	if err != nil {
+		return false, err
+	}
+	return bytes.Equal(sum, row.SHA256), nil
+}
+
+// sealedFromIdx recovers a segment that finished sealing (seal writes its
+// .idx by rename) while Meta has its row open or has no row: Meta was
+// restored from a point behind the disk. It brings the row up to the
+// sidecar and returns the sealed segment, or nil when there is no .idx or
+// it won't load (a rename that never reached the disk), in which case the
+// caller rebuilds the segment from its CAR.
+func (pl *PlaneLog) sealedFromIdx(ctx context.Context, seq uint64, hasRow bool) (*Segment, error) {
+	if _, err := os.Stat(filepath.Join(pl.dir, idxName(seq))); err != nil {
+		return nil, nil
+	}
+	seg, err := loadSealedFromIdx(pl.dir, seq, pl.plane, 0, pl.logger)
+	if err != nil {
+		pl.logger.Warn("logstore: unreadable .idx; rebuilding the segment from its CAR",
+			zap.Stringer("plane", pl.plane), zap.Uint64("seq", seq), zap.Error(err))
+		return nil, nil
+	}
+	if hasRow {
+		err = pl.meta.MarkSegmentSealed(ctx, pl.plane, seq, seg.SealedAt(), seg.Size(), seg.SHA256(), seg.OpRoots())
+	} else {
+		err = pl.meta.RehydrateSegment(ctx, SegmentMeta{
+			Seq: seq, Plane: pl.plane, Bucket: pl.bucket, State: StateSealed,
+			SealedAt: seg.SealedAt(), Size: seg.Size(), SHA256: seg.SHA256(), OpRoots: seg.OpRoots(),
+		})
+	}
+	if err != nil {
+		_ = seg.fdRO.Close()
+		return nil, fmt.Errorf("logstore: restore %s row %d from its .idx: %w", pl.plane, seq, err)
+	}
+	return seg, nil
+}
+
+// journalPage bounds how many journaled blocks rebuildFromJournal holds in
+// memory at once.
+const journalPage = 256
+
+// frameBound is an upper bound on the bytes block takes in a segment CAR: its
+// CID and data behind a varint length.
+func frameBound(b block.Block) int64 {
+	return int64(binary.MaxVarintLen64 + len(b.Cid().Bytes()) + len(b.RawData()))
+}
+
+// rebuildFromJournal rebuilds the catalog blocks of this bucket's lost
+// segments from the journal and returns the segments it wrote them into,
+// sealed. A segment is lost when the journal still files blocks under it
+// but its CAR is not on disk: the data volume was lost or replaced, or the
+// file deleted. The journal is then the only copy of those blocks until they
+// ship. They go into new segments split at SealBytes, page by page, and each
+// stretch of a page's journal rows moves onto its new segment once fsynced
+// there, so a crash partway leaves the rest filed under the lost seq for the
+// next recovery.
+// The new segments carry no op-roots: the bucket's forge root then waits for
+// its next shipped write.
+func (pl *PlaneLog) rebuildFromJournal(ctx context.Context, onDisk map[uint64]struct{}) ([]*Segment, error) {
+	if pl.plane != blockstore.PlaneCatalog {
+		return nil, nil
+	}
+	seqs, err := pl.meta.JournalSegments(ctx, pl.bucket)
+	if err != nil {
+		return nil, fmt.Errorf("logstore: list journaled segments for %q: %w", pl.bucket, err)
+	}
+	var lost []uint64
+	for _, seq := range seqs {
+		if _, ok := onDisk[seq]; !ok {
+			lost = append(lost, seq)
+		}
+	}
+	if len(lost) == 0 {
+		return nil, nil
+	}
+
+	var (
+		built []*Segment
+		cur   *Segment
+	)
+	seal := func() error {
+		if err := cur.seal(ctx, pl.meta); err != nil {
+			return fmt.Errorf("logstore: seal rebuilt %s seg %d: %w", pl.plane, cur.Seq(), err)
+		}
+		built = append(built, cur)
+		cur = nil
+		return nil
+	}
+	for _, from := range lost {
+		after := cid.Undef
+		for {
+			blocks, err := pl.meta.ReadJournal(ctx, from, after, journalPage)
+			if err != nil {
+				return nil, fmt.Errorf("logstore: read journal of lost seg %d: %w", from, err)
+			}
+			if len(blocks) == 0 {
+				break
+			}
+			full := len(blocks) == journalPage
+			after = blocks[len(blocks)-1].Cid()
+			for len(blocks) > 0 {
+				if cur == nil {
+					seq, err := pl.meta.NextSegmentSeq(ctx)
+					if err != nil {
+						return nil, fmt.Errorf("logstore: next segment seq: %w", err)
+					}
+					if cur, err = createOpenSegment(ctx, pl.dir, seq, pl.plane, pl.bucket, pl.meta, pl.logger); err != nil {
+						return nil, fmt.Errorf("logstore: create segment to rebuild seg %d: %w", from, err)
+					}
+				}
+				// A segment already holding blocks seals rather than take
+				// one that would carry it past SealBytes.
+				if len(cur.index) > 0 && cur.Size()+frameBound(blocks[0]) > pl.pc.SealBytes {
+					if err := seal(); err != nil {
+						return nil, err
+					}
+					continue
+				}
+				// As many of the page's blocks as fit under SealBytes, at
+				// least one; the rest go to the next segment.
+				n, size := 1, cur.Size()+frameBound(blocks[0])
+				for n < len(blocks) && size+frameBound(blocks[n]) <= pl.pc.SealBytes {
+					size += frameBound(blocks[n])
+					n++
+				}
+				chunk := blocks[:n]
+				blocks = blocks[n:]
+				if err := cur.append(chunk, nil); err != nil {
+					return nil, fmt.Errorf("logstore: rebuild seg %d into seg %d: %w", from, cur.Seq(), err)
+				}
+				if err := pl.meta.MoveJournal(ctx, pl.bucket, from, cur.Seq(), chunk[0].Cid(), chunk[n-1].Cid()); err != nil {
+					return nil, fmt.Errorf("logstore: move journal of seg %d to seg %d: %w", from, cur.Seq(), err)
+				}
+				if len(blocks) > 0 || cur.Size() >= pl.pc.SealBytes {
+					if err := seal(); err != nil {
+						return nil, err
+					}
+				}
+			}
+			if !full {
+				break
+			}
+		}
+	}
+	if cur != nil {
+		if err := seal(); err != nil {
+			return nil, err
+		}
+	}
+	rebuiltSeqs := make([]uint64, len(built))
+	for i, seg := range built {
+		rebuiltSeqs[i] = seg.Seq()
+	}
+	pl.logger.Warn("logstore: rebuilt lost segments from the catalog journal",
+		zap.Stringer("plane", pl.plane), zap.Uint64s("lost", lost), zap.Uint64s("rebuilt", rebuiltSeqs))
+	return built, nil
 }
 
 // removeSegmentFiles unlinks every possible file of a segment seq for the
 // given plane.
 func removeSegmentFiles(dir string, seq uint64, plane blockstore.Plane) {
-	names := []string{carName(seq), idxName(seq)}
+	names := []string{carName(seq), idxName(seq), idxName(seq) + ".tmp"}
 	if plane == blockstore.PlaneCatalog {
 		names = append(names, opsName(seq))
 	}

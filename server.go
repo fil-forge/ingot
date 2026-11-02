@@ -49,7 +49,7 @@ type ServerDeps struct {
 
 	// BaseBlockReader is the bottom tier of the layered read path —
 	// what the log falls through to on misses. In production this is
-	// *blockstore.Forge (network-backed via indexer + piri); in tests
+	// *blockstore.Forge (network-backed: a Locator + piri); in tests
 	// it can be any IpldBlockstore.
 	BaseBlockReader blockstore.BlockReader
 
