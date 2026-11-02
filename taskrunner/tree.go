@@ -104,9 +104,9 @@ func (tr *tree) add(ctx context.Context, w write) error {
 	return sp.Commit(ctx)
 }
 
-// Spawn adds an async task, committed with the tree. It runs once the tree
+// Submit adds an async task, committed with the tree. It runs once the tree
 // has committed, it is due and its subject is free.
-func (ex *Exec) Spawn(ctx context.Context, s Spec) (TaskID, error) {
+func (ex *Exec) Submit(ctx context.Context, s Spec) (TaskID, error) {
 	q, err := ex.tr.r.checkSpec(s)
 	if err != nil {
 		return TaskID{}, err
