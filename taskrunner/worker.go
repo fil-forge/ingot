@@ -90,12 +90,13 @@ func (r *Runner) dispatch(ctx context.Context, q *queue) {
 	// caller's to take. The due-task index (dueIndex) keeps this to the due
 	// rows.
 	rows, err := r.db.Query(ctx, `SELECT d.subject FROM (
-			SELECT DISTINCT ON (subject) subject, seq, waiting_until FROM `+q.tasks+`
+			SELECT DISTINCT ON (subject) subject, seq, waiting_until, retry_at FROM `+q.tasks+`
 			WHERE state = 'pending' AND (not_before IS NULL OR not_before <= now())
 			AND NOT (subject = ANY($1))
 			ORDER BY subject, seq
 		) d
 		WHERE (d.waiting_until IS NULL OR d.waiting_until <= now())
+		AND (d.retry_at IS NULL OR d.retry_at <= now())
 		AND NOT EXISTS (SELECT 1 FROM `+q.leases+` l WHERE l.subject = d.subject AND l.expires >= now())
 		ORDER BY d.seq LIMIT $2`, busy, free)
 	if err != nil {
