@@ -173,7 +173,7 @@ func (ex *Exec) run(ctx context.Context, s Spec) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	child := Task{ID: id, Queue: s.Queue, Subject: s.Subject, Action: s.Action, Created: time.Now(), Expires: s.Expires, Args: s.Args}
+	child := Task{ID: id, Queue: s.Queue, Subject: s.Subject, Action: s.Action, Created: time.Now(), Expires: s.Expires, Args: s.Args, Node: s.Node}
 	cex := &Exec{tr: tr, q: q, task: child, path: append(slices.Clone(ex.path), k)}
 
 	// A failed child's writes are dropped, whatever its parent does next.
@@ -190,9 +190,9 @@ func (ex *Exec) run(ctx context.Context, s Spec) ([]byte, error) {
 	res, err := callHandler(ctx, a.handler, cex, child)
 	if err == nil {
 		err = tr.add(ctx, write{
-			sql: `INSERT INTO ` + q.tasks + ` (id, subject, action, expires, args, sync, state, result, finished)
-				VALUES ($1, $2, $3, $4, $5, true, 'succeeded', $6, now())`,
-			args: []any{id, s.Subject, s.Action, s.Expires, s.Args, res},
+			sql: `INSERT INTO ` + q.tasks + ` (id, subject, action, expires, args, sync, node, state, result, finished)
+				VALUES ($1, $2, $3, $4, $5, true, $6, 'succeeded', $7, now())`,
+			args: []any{id, s.Subject, s.Action, s.Expires, s.Args, s.Node, res},
 		})
 	}
 	if parent != nil {
@@ -222,6 +222,7 @@ func (tr *tree) lease(ctx context.Context, q *queue, subject string) error {
 		}
 		return nil
 	}
+	start := time.Now()
 	wait := newBackoff(tr.r.opts.PollInterval)
 	for {
 		h, holder, err := tr.r.tryLease(ctx, q, subject, tr.age)
@@ -230,6 +231,7 @@ func (tr *tree) lease(ctx context.Context, q *queue, subject string) error {
 		}
 		if h != nil {
 			tr.holds[key] = h
+			tr.r.metrics.observeLeaseWait(ctx, q, start)
 			return nil
 		}
 		if holder != nil && holder.olderThan(tr.age) {
@@ -355,6 +357,7 @@ func (r *Runner) runRoot(ctx context.Context, h *hold, tasks []Task) (res []byte
 		return nil, nil, err
 	}
 	live := tasks
+	start := time.Now()
 	a, ok := r.handler(actionKey{first.Queue, first.Action})
 	if !ok {
 		// Only a registered batching action forms a batch, so this is one
@@ -363,6 +366,7 @@ func (r *Runner) runRoot(ctx context.Context, h *hold, tasks []Task) (res []byte
 		if err := r.failOrRetry(ctx, h, &action{}, live, errors.New(msg)); err != nil {
 			return nil, nil, err
 		}
+		r.metrics.observeTasks(ctx, live, outcomeFailed, start)
 		return nil, &HandlerError{Queue: first.Queue, Task: first.ID, Message: msg}, nil
 	}
 
@@ -383,6 +387,7 @@ func (r *Runner) runRoot(ctx context.Context, h *hold, tasks []Task) (res []byte
 		if err := r.finish(ctx, h, expired, "expired", ""); err != nil {
 			return nil, nil, err
 		}
+		r.metrics.observeTasks(ctx, expired, outcomeExpired, start)
 		if live = next; len(live) == 0 {
 			return nil, ErrExpired, nil
 		}
@@ -435,7 +440,7 @@ func (r *Runner) runRoot(ctx context.Context, h *hold, tasks []Task) (res []byte
 				}
 				continue
 			}
-			if err := r.failOrRetry(ctx, h, a, live, herr); err != nil {
+			if err := r.failOrRetry(ctx, h, a, live, herr, start); err != nil {
 				return nil, nil, err
 			}
 			return nil, herr, nil
@@ -451,6 +456,7 @@ func (r *Runner) runRoot(ctx context.Context, h *hold, tasks []Task) (res []byte
 			for q := range tr.spawned {
 				r.pokeQueue(q)
 			}
+			r.metrics.observeTasks(ctx, live, outcomeSucceeded, start)
 			return results[0], nil, nil
 		}
 		if ctx.Err() != nil {

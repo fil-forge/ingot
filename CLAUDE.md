@@ -128,7 +128,10 @@ Internal:
   opposite orders resolve by the younger tree giving way. Async tasks can be
   replacements (the later `NotBefore` wins), cancelled before they start,
   batched (`HandleBatch`) and retried (`WithRetry`; `Permanent` stops
-  retries). Imports nothing
+  retries). `Spec.Node` places a task on the runner whose `Options.Node`
+  matches. Metrics (`taskrunner.*`: queue depth, oldest ready age, lease
+  waits and takeovers, task duration by outcome, busy workers) go to
+  `Options.MeterProvider`, a no-op when unset. Imports nothing
   else from ingot (a test enforces it), so it can ship as a library.
   `taskrunnertest` makes a fresh schema per test and runs a tree with writes
   held and applied straight away (`CheckOwnWrites`). Not wired into the

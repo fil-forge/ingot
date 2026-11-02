@@ -54,6 +54,10 @@ CREATE TABLE %[2]s (
 			pgx.Identifier{q.table + "_tasks_pending"}.Sanitize(),
 			pgx.Identifier{q.table + "_tasks_replaceable"}.Sanitize())
 	},
+	// Placement.
+	func(q *queue) string {
+		return fmt.Sprintf(`ALTER TABLE %s ADD COLUMN node text;`, q.tasks)
+	},
 }
 
 // dueIndex lets the poll for due tasks read only the pending tasks whose

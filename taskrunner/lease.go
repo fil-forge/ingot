@@ -72,7 +72,7 @@ type freeSub struct {
 // could not be read.
 func (r *Runner) tryLease(ctx context.Context, q *queue, subject string, age treeAge) (*hold, *treeAge, error) {
 	token := uuid.New()
-	var taken bool
+	var taken, tookOver bool
 	var holderCreated *time.Time
 	var holderID *uuid.UUID
 	err := r.db.QueryRow(ctx, `
@@ -83,14 +83,14 @@ WITH taken AS (
 		SET owner = EXCLUDED.owner, expires = EXCLUDED.expires,
 		    tree_created = EXCLUDED.tree_created, tree_id = EXCLUDED.tree_id
 		WHERE l.expires < now()
-	RETURNING 1
+	RETURNING xmax <> 0 AS took_over
 )
-SELECT true, NULL::timestamptz, NULL::uuid FROM taken
+SELECT true, took_over, NULL::timestamptz, NULL::uuid FROM taken
 UNION ALL
-SELECT false, tree_created, tree_id FROM `+q.leases+`
+SELECT false, false, tree_created, tree_id FROM `+q.leases+`
 	WHERE subject = $1 AND NOT EXISTS (SELECT 1 FROM taken)`,
 		subject, token, r.opts.LeaseTTL.Milliseconds(), age.created, age.id,
-	).Scan(&taken, &holderCreated, &holderID)
+	).Scan(&taken, &tookOver, &holderCreated, &holderID)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
 		// The holder committed after this statement's snapshot was taken.
@@ -100,6 +100,10 @@ SELECT false, tree_created, tree_id FROM `+q.leases+`
 	}
 	if !taken {
 		return nil, &treeAge{*holderCreated, *holderID}, nil
+	}
+	if tookOver {
+		// The row existed and had expired: its owner stopped renewing.
+		r.metrics.observeTakeover(ctx, q)
 	}
 	h := &hold{q: q, subject: subject, token: token, age: age}
 	r.mu.Lock()

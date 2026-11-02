@@ -97,16 +97,16 @@ var ErrCancelled = errors.New("task cancelled")
 // replacement waiting to retry counts as unstarted, as it does for Cancel;
 // the one that takes its place starts its attempts afresh and holds nothing.
 func insertSpec(q *queue, id TaskID, s Spec, sync bool) (string, []any) {
-	args := []any{id, s.Subject, s.Action, s.NotBefore, s.Expires, s.Args, sync}
+	args := []any{id, s.Subject, s.Action, s.NotBefore, s.Expires, s.Args, sync, s.Node}
 	if !s.Replace {
 		return fmt.Sprintf(insertTask, q.tasks), args
 	}
-	return `INSERT INTO ` + q.tasks + ` AS t (id, subject, action, not_before, expires, args, sync, replaceable)
-	VALUES ($1, $2, $3, $4, $5, $6, $7, true)
+	return `INSERT INTO ` + q.tasks + ` AS t (id, subject, action, not_before, expires, args, sync, node, replaceable)
+	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true)
 	ON CONFLICT (subject, action) WHERE state = 'pending' AND replaceable AND started IS NULL
 	DO UPDATE SET id = EXCLUDED.id, seq = DEFAULT, created = EXCLUDED.created,
 		not_before = EXCLUDED.not_before, expires = EXCLUDED.expires, args = EXCLUDED.args,
-		attempts = 0, error = NULL, retry_at = NULL
+		node = EXCLUDED.node, attempts = 0, error = NULL, retry_at = NULL
 	WHERE t.not_before < EXCLUDED.not_before`, args
 }
 
@@ -158,10 +158,10 @@ func (ex *Exec) Cancel(ctx context.Context, queueName string, id TaskID) error {
 	return nil
 }
 
-const claimColumns = `seq, id, action, created, not_before, expires, args, sync, attempts`
+const claimColumns = `seq, id, action, created, not_before, expires, args, sync, attempts, node`
 
 func scanTask(row pgx.Row, t *Task) error {
-	return row.Scan(&t.seq, &t.ID, &t.Action, &t.Created, &t.NotBefore, &t.Expires, &t.Args, &t.sync, &t.Attempt)
+	return row.Scan(&t.seq, &t.ID, &t.Action, &t.Created, &t.NotBefore, &t.Expires, &t.Args, &t.sync, &t.Attempt, &t.Node)
 }
 
 // claim marks the subject's next due task started and returns it. When its
@@ -172,15 +172,17 @@ func scanTask(row pgx.Row, t *Task) error {
 func (r *Runner) claim(ctx context.Context, q *queue, subject string, upTo int64, target TaskID) ([]Task, error) {
 	var next TaskID
 	var waited, backingOff bool
+	var node *string
 	if err := r.db.QueryRow(ctx, `SELECT id, coalesce(waiting_until > now(), false),
-		coalesce(retry_at > now(), false) FROM `+q.tasks+`
+		coalesce(retry_at > now(), false), node FROM `+q.tasks+`
 		WHERE subject = $1 AND state = 'pending' AND seq <= $2
 		AND (not_before IS NULL OR not_before <= now())
-		ORDER BY seq LIMIT 1`, subject, upTo).Scan(&next, &waited, &backingOff); err != nil {
+		ORDER BY seq LIMIT 1`, subject, upTo).Scan(&next, &waited, &backingOff, &node); err != nil {
 		return nil, err
 	}
-	if backingOff {
-		// The oldest due task waits to retry and holds the subject.
+	if backingOff || !r.mayRun(node) {
+		// The oldest due task waits to retry, or belongs to another
+		// instance, and holds the subject either way.
 		return nil, pgx.ErrNoRows
 	}
 	if waited && next != target {
@@ -203,10 +205,11 @@ func (r *Runner) claim(ctx context.Context, q *queue, subject string, upTo int64
 		return tasks, nil
 	}
 
-	rows, err := r.db.Query(ctx, `SELECT id, action, sync OR coalesce(retry_at > now(), false) FROM `+q.tasks+`
+	rows, err := r.db.Query(ctx, `SELECT id, action,
+		sync OR coalesce(retry_at > now(), false) OR node IS DISTINCT FROM $5 FROM `+q.tasks+`
 		WHERE subject = $1 AND state = 'pending' AND seq > $2 AND seq <= $3
 		AND (not_before IS NULL OR not_before <= now())
-		ORDER BY seq LIMIT $4`, subject, first.seq, upTo, limit-1)
+		ORDER BY seq LIMIT $4`, subject, first.seq, upTo, limit-1, first.Node)
 	if err != nil {
 		return nil, err
 	}
@@ -214,8 +217,9 @@ func (r *Runner) claim(ctx context.Context, q *queue, subject string, upTo int64
 	for rows.Next() {
 		var id TaskID
 		var act string
-		// stop is set for a sync task, which never batches, and for one
-		// waiting to retry, which holds up the rest.
+		// stop is set for a sync task, which never batches, for one waiting
+		// to retry, which holds up the rest, and for one placed differently
+		// from the batch.
 		var stop bool
 		if err := rows.Scan(&id, &act, &stop); err != nil {
 			rows.Close()
@@ -256,7 +260,7 @@ func (r *Runner) claim(ctx context.Context, q *queue, subject string, upTo int64
 // failOrRetry records the outcome of tasks whose handler returned herr: each
 // async one runs again under the action's retry policy while attempts remain
 // and herr is not permanent, and the rest fail.
-func (r *Runner) failOrRetry(ctx context.Context, h *hold, a *action, tasks []Task, herr error) error {
+func (r *Runner) failOrRetry(ctx context.Context, h *hold, a *action, tasks []Task, herr error, start time.Time) error {
 	// A batch's outcomes commit together, under its lease, like its success.
 	tx, err := r.db.Begin(ctx)
 	if err != nil {
@@ -309,5 +313,7 @@ func (r *Runner) failOrRetry(ctx context.Context, h *hold, a *action, tasks []Ta
 		r.log.Info("task will be retried", zapTask(t), zapInt("attempt", t.Attempt+1), zapErr(herr))
 	}
 	r.finished(ids...)
+	r.metrics.observeTasks(ctx, failed, outcomeFailed, start)
+	r.metrics.observeTasks(ctx, retried, outcomeRetried, start)
 	return nil
 }
