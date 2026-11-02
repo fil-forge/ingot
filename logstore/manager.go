@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -71,9 +73,13 @@ type ManagerConfig struct {
 }
 
 // OpenManager initializes the per-bucket log root and re-opens every bucket
-// that left segments behind — the union of on-disk bucket directories and
-// buckets with segment rows — so unshipped sealed segments re-enqueue at
-// startup instead of waiting for the bucket's next write.
+// that left segments behind — the union of on-disk bucket directories,
+// buckets with segment rows and buckets with journaled catalog blocks — so
+// unshipped sealed segments re-enqueue, and segments whose files are gone
+// are rebuilt from the journal, at startup instead of at the bucket's next
+// write. Before any of that it moves the segment seq allocator past every
+// seq on disk: Meta restored from a point behind the disk would otherwise
+// hand out a seq a segment file already holds.
 func OpenManager(ctx context.Context, cfg ManagerConfig) (*Manager, error) {
 	if cfg.Dir == "" {
 		return nil, errors.New("logstore: manager: Dir is required")
@@ -105,16 +111,32 @@ func OpenManager(ctx context.Context, cfg ManagerConfig) (*Manager, error) {
 	if err != nil {
 		return nil, fmt.Errorf("logstore: manager: scan %s: %w", cfg.Dir, err)
 	}
+	var maxSeq uint64
 	for _, e := range entries {
-		if e.IsDir() {
-			buckets[e.Name()] = struct{}{}
+		if !e.IsDir() {
+			continue
+		}
+		buckets[e.Name()] = struct{}{}
+		seq, err := maxSegmentSeq(filepath.Join(cfg.Dir, e.Name(), blockstore.PlaneCatalog.String()))
+		if err != nil {
+			return nil, err
+		}
+		maxSeq = max(maxSeq, seq)
+	}
+	if maxSeq > 0 {
+		if err := cfg.Meta.EnsureSegmentSeqAbove(ctx, maxSeq); err != nil {
+			return nil, fmt.Errorf("logstore: manager: move segment seq past %d: %w", maxSeq, err)
 		}
 	}
 	fromMeta, err := cfg.Meta.ListSegmentBuckets(ctx, blockstore.PlaneCatalog)
 	if err != nil {
 		return nil, fmt.Errorf("logstore: manager: list segment buckets: %w", err)
 	}
-	for _, b := range fromMeta {
+	fromJournal, err := cfg.Meta.JournalBuckets(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("logstore: manager: list journal buckets: %w", err)
+	}
+	for _, b := range append(fromMeta, fromJournal...) {
 		buckets[b] = struct{}{}
 	}
 
@@ -357,6 +379,30 @@ func (m *Manager) RemoveBucketLog(ctx context.Context, bucket string) error {
 		}
 	}
 	return nil
+}
+
+// maxSegmentSeq returns the highest segment seq any file in a plane's
+// segment directory is named for, or 0 when it holds none or doesn't exist.
+func maxSegmentSeq(dir string) (uint64, error) {
+	entries, err := os.ReadDir(dir)
+	if errors.Is(err, fs.ErrNotExist) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("logstore: manager: scan %s: %w", dir, err)
+	}
+	var top uint64
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasPrefix(name, "seg-") {
+			continue
+		}
+		stem, _, _ := strings.Cut(strings.TrimPrefix(name, "seg-"), ".")
+		if seq, err := strconv.ParseUint(stem, 10, 64); err == nil {
+			top = max(top, seq)
+		}
+	}
+	return top, nil
 }
 
 // validBucketDir guards the bucket-name-as-directory mapping. S3 bucket

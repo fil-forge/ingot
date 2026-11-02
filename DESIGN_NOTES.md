@@ -108,8 +108,10 @@ full lifecycle):
   segment `AppendBatch` reported, and shipping that segment deletes them, as
   do `DeleteBucket` emptying the bucket's root and the bucket row's deletion.
   A copy of Postgres (a standby, a restore) therefore holds every block its
-  roots need that this host's disk alone would otherwise hold. Rebuilding a
-  lost segment from the journal is not built yet.
+  roots need that this host's disk alone would otherwise hold. Recovery
+  rebuilds a segment whose file is gone from its journaled blocks, so Ingot
+  can start from a recovered Postgres alone (`logstore/README.md`, crash
+  recovery).
 - **`forge_root_cid` advances only when a segment ships, and only guarded**:
   the update lands in the same transaction as the shipped stamp, and only
   where `buckets.root_cid` still equals the op-root.

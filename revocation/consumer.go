@@ -6,7 +6,9 @@
 //
 // The consumer maintains a persistent resume cursor (registry's
 // revocation_cursor row): the recorded_at of the last processed record, on
-// the service's own timeline. On first ever connect — no cursor stored — it
+// the service's own timeline. A background saver writes it at most once per
+// save interval and once more on stop, so applying a record never waits on
+// the database. On first ever connect — no cursor stored — it
 // subscribes from "now": every cache a revocation could clear is process
 // memory, so nothing revoked before the process first subscribed can be
 // cached. The gateway keeps serving while the service is unreachable
@@ -18,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"iter"
+	"sync/atomic"
 	"time"
 
 	"github.com/cenkalti/backoff/v5"
@@ -54,6 +57,14 @@ const (
 	defaultMaxBackoff = time.Minute
 )
 
+// defaultSaveInterval bounds how much a crash re-delivers: at most this much
+// of the firehose, plus records applied since the last save.
+const defaultSaveInterval = time.Second
+
+// finalSaveTimeout bounds the save made after ctx is canceled, which can no
+// longer use ctx itself.
+const finalSaveTimeout = 5 * time.Second
+
 // Consumer runs the subscribe → invalidate → persist-cursor loop.
 type Consumer struct {
 	src    Source
@@ -61,9 +72,10 @@ type Consumer struct {
 	inv    Invalidator
 	logger *zap.Logger
 
-	minBackoff time.Duration
-	maxBackoff time.Duration
-	now        func() time.Time // clock seam for tests
+	minBackoff   time.Duration
+	maxBackoff   time.Duration
+	saveInterval time.Duration
+	now          func() time.Time // clock seam for tests
 }
 
 // Option configures a Consumer.
@@ -87,6 +99,13 @@ func WithBackoff(min, max time.Duration) Option {
 	}
 }
 
+// WithSaveInterval overrides how often the resume cursor is saved (default 1s).
+func WithSaveInterval(d time.Duration) Option {
+	return func(c *Consumer) {
+		c.saveInterval = d
+	}
+}
+
 // WithClock overrides the wall clock (test seam for the since-defaults-to-now
 // behavior).
 func WithClock(now func() time.Time) Option {
@@ -101,13 +120,14 @@ func WithClock(now func() time.Time) Option {
 // caches through inv, and persisting its resume point in cursor.
 func NewConsumer(src Source, cursor registry.RevocationCursorStore, inv Invalidator, opts ...Option) *Consumer {
 	c := &Consumer{
-		src:        src,
-		cursor:     cursor,
-		inv:        inv,
-		logger:     zap.NewNop(),
-		minBackoff: defaultMinBackoff,
-		maxBackoff: defaultMaxBackoff,
-		now:        time.Now,
+		src:          src,
+		cursor:       cursor,
+		inv:          inv,
+		logger:       zap.NewNop(),
+		minBackoff:   defaultMinBackoff,
+		maxBackoff:   defaultMaxBackoff,
+		saveInterval: defaultSaveInterval,
+		now:          time.Now,
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -116,13 +136,18 @@ func NewConsumer(src Source, cursor registry.RevocationCursorStore, inv Invalida
 }
 
 // Run streams revocations until ctx is canceled, reconnecting with capped
-// exponential backoff and persisting the resume cursor as records arrive. It
-// only ever returns on ctx cancellation: the firehose is availability-
-// tolerant — records missed while disconnected are re-delivered from the
-// cursor on reconnect, and duplicates are harmless (Invalidator is
-// idempotent).
+// exponential backoff, while a background saver persists the resume cursor
+// (see saveCursor). It only ever returns on ctx cancellation, after the
+// saver's final save: the firehose is availability-tolerant — records missed
+// while disconnected are re-delivered from the cursor on reconnect, and
+// duplicates are harmless (Invalidator is idempotent).
 func (c *Consumer) Run(ctx context.Context) {
 	since := c.loadFrom(ctx)
+	var latest atomic.Pointer[registry.RevocationCursor]
+	saved := make(chan struct{})
+	go c.saveCursor(ctx, &latest, saved)
+	defer func() { <-saved }()
+
 	bo := backoff.NewExponentialBackOff()
 	bo.InitialInterval = c.minBackoff
 	bo.MaxInterval = c.maxBackoff
@@ -130,6 +155,10 @@ func (c *Consumer) Run(ctx context.Context) {
 		for rec, err := range c.src.Stream(ctx, since) {
 			if err != nil {
 				c.logger.Warn("revocation: stream error", zap.Error(err))
+				break
+			}
+			// The stream can hold records it read before ctx was canceled.
+			if ctx.Err() != nil {
 				break
 			}
 			// A live stream means the endpoint is healthy — reset backoff.
@@ -140,17 +169,9 @@ func (c *Consumer) Run(ctx context.Context) {
 				zap.Stringer("cause", rec.Cause),
 				zap.Int("keys_invalidated", len(keys)))
 			since = rec.RecordedAt.Time()
-			// Persist per record: revocations are human-scale events (key
-			// deletions), so a row upsert each is negligible. If the shared
-			// firehose ever becomes high-volume, debounce here — safe, since
-			// reprocessing a window after a crash is idempotent. A failed
-			// write only costs re-delivery from the previous durable cursor.
-			if err := c.cursor.PutRevocationCursor(ctx, registry.RevocationCursor{
-				RecordedAt: since,
-				Revoke:     rec.Revoke,
-			}); err != nil && ctx.Err() == nil {
-				c.logger.Warn("revocation: persist cursor", zap.Error(err))
-			}
+			// Published only after Revoke returns, so the saver never saves
+			// past a record that has not been applied.
+			latest.Store(&registry.RevocationCursor{RecordedAt: since, Revoke: rec.Revoke})
 		}
 		if ctx.Err() != nil {
 			return
@@ -158,6 +179,43 @@ func (c *Consumer) Run(ctx context.Context) {
 		// The stream ended (server close yields no error) or errored:
 		// wait, then reconnect from the last processed record.
 		if !sleepCtx(ctx, bo.NextBackOff()) {
+			return
+		}
+	}
+}
+
+// saveCursor saves the newest position in latest every save interval,
+// skipping intervals in which it has not moved, and once more when ctx is
+// canceled, then closes done. Saving off the record loop matters on a busy
+// firehose: each save is a durable commit, and on a node whose database sits
+// on slow disks one commit per record capped the loop at about 55 records a
+// second. A failed save is retried at the next interval; until one succeeds,
+// a restart re-delivers from the previous saved cursor.
+func (c *Consumer) saveCursor(ctx context.Context, latest *atomic.Pointer[registry.RevocationCursor], done chan<- struct{}) {
+	defer close(done)
+	var last *registry.RevocationCursor
+	save := func(ctx context.Context) {
+		cur := latest.Load()
+		if cur == nil || cur == last {
+			return
+		}
+		if err := c.cursor.PutRevocationCursor(ctx, *cur); err != nil {
+			c.logger.Warn("revocation: persist cursor", zap.Error(err))
+			return
+		}
+		last = cur
+	}
+
+	ticker := time.NewTicker(c.saveInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			save(ctx)
+		case <-ctx.Done():
+			final, cancel := context.WithTimeout(context.WithoutCancel(ctx), finalSaveTimeout)
+			save(final)
+			cancel()
 			return
 		}
 	}
