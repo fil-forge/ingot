@@ -108,15 +108,19 @@ SELECT false, tree_created, tree_id FROM `+q.leases+`
 	return h, nil, nil
 }
 
-// setAge records the tree now running under h, for other trees' wait-or-die
-// decisions.
+// setAge records the tree about to run under h, for other trees' wait-or-die
+// decisions. It is also the check, before each task's handler starts, that h
+// still owns the lease: it returns errLeaseLost when another consumer has
+// taken it over.
 func (r *Runner) setAge(ctx context.Context, h *hold, age treeAge) error {
-	if h.age == age {
-		return nil
-	}
-	if _, err := r.db.Exec(ctx, `UPDATE `+h.q.leases+` SET tree_created = $3, tree_id = $4
-		WHERE subject = $1 AND owner = $2`, h.subject, h.token, age.created, age.id); err != nil {
+	tag, err := r.db.Exec(ctx, `UPDATE `+h.q.leases+` SET tree_created = $3, tree_id = $4
+		WHERE subject = $1 AND owner = $2`, h.subject, h.token, age.created, age.id)
+	if err != nil {
 		return fmt.Errorf("record tree on lease %s/%s: %w", h.q.name, h.subject, err)
+	}
+	if tag.RowsAffected() == 0 {
+		h.lost.Store(true)
+		return errLeaseLost
 	}
 	h.age = age
 	return nil
@@ -222,7 +226,7 @@ func (r *Runner) renewLoop(ctx context.Context) {
 		}
 		for q, ids := range waiting {
 			if _, err := r.db.Exec(ctx, `UPDATE `+q.tasks+` SET waiting_until = now() + $2 * interval '1 millisecond'
-				WHERE id = ANY($1) AND state = 'pending'`, ids, r.opts.LeaseTTL.Milliseconds()); err != nil && ctx.Err() == nil {
+				WHERE id = ANY($1) AND state = 'pending' AND waiting_until IS NOT NULL`, ids, r.opts.LeaseTTL.Milliseconds()); err != nil && ctx.Err() == nil {
 				r.log.Warn("renew waiting sync tasks", zapQueue(q.name), zapErr(err))
 			}
 		}
