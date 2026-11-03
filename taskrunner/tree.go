@@ -372,15 +372,16 @@ func (r *Runner) runRoot(ctx context.Context, h *hold, tasks []Task) (res []byte
 		}
 		// Each attempt starts the tree afresh, so each checks its tasks may
 		// still start.
-		var next []Task
+		var next, expired []Task
 		for _, t := range live {
 			if t.Expires != nil && !t.Expires.After(time.Now()) {
-				if err := r.finish(ctx, h, t, "expired", ""); err != nil {
-					return nil, nil, err
-				}
+				expired = append(expired, t)
 				continue
 			}
 			next = append(next, t)
+		}
+		if err := r.finish(ctx, h, expired, "expired", ""); err != nil {
+			return nil, nil, err
 		}
 		if live = next; len(live) == 0 {
 			return nil, ErrExpired, nil
@@ -466,30 +467,37 @@ func (r *Runner) runRoot(ctx context.Context, h *hold, tasks []Task) (res []byte
 	}
 }
 
-// finish records a task's outcome without running its tree, holding its
-// lease row locked while it does. It returns errLeaseLost when another
-// consumer owns the subject now, and errNotPending when the task already has
-// an outcome; either way it records nothing.
-func (r *Runner) finish(ctx context.Context, h *hold, t Task, state, msg string) error {
+// finish records one outcome for tasks without running them, in one
+// transaction that holds their lease row locked. It returns errLeaseLost when
+// another consumer owns the subject now, and errNotPending when any of the
+// tasks already has an outcome; either way it records nothing.
+func (r *Runner) finish(ctx context.Context, h *hold, tasks []Task, state, msg string) error {
+	if len(tasks) == 0 {
+		return nil
+	}
 	tx, err := r.db.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("record task %s/%s as %s: %w", t.Queue, t.ID, state, err)
+		return fmt.Errorf("record %s.%s as %s: %w", tasks[0].Queue, tasks[0].Action, state, err)
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
 	if err := lockLease(ctx, tx, h); err != nil {
 		return err
 	}
-	tag, err := tx.Exec(ctx, `UPDATE `+h.q.tasks+` SET state = $2, error = NULLIF($3, ''), finished = now()
-		WHERE id = $1 AND state = 'pending'`, t.ID, state, msg)
-	if err != nil {
-		return fmt.Errorf("record task %s/%s as %s: %w", t.Queue, t.ID, state, err)
+	ids := make([]TaskID, len(tasks))
+	for i, t := range tasks {
+		ids[i] = t.ID
 	}
-	if tag.RowsAffected() == 0 {
+	tag, err := tx.Exec(ctx, `UPDATE `+h.q.tasks+` SET state = $2, error = NULLIF($3, ''), finished = now()
+		WHERE id = ANY($1) AND state = 'pending'`, ids, state, msg)
+	if err != nil {
+		return fmt.Errorf("record %s.%s as %s: %w", tasks[0].Queue, tasks[0].Action, state, err)
+	}
+	if tag.RowsAffected() != int64(len(tasks)) {
 		return errNotPending
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("record task %s/%s as %s: %w", t.Queue, t.ID, state, err)
+		return fmt.Errorf("record %s.%s as %s: %w", tasks[0].Queue, tasks[0].Action, state, err)
 	}
-	r.finished(t.ID)
+	r.finished(ids...)
 	return nil
 }
