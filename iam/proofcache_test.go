@@ -188,3 +188,59 @@ func TestDelegationCachePermissions(t *testing.T) {
 		require.False(t, allowed, "a narrowed set must not keep the dropped action")
 	})
 }
+
+func TestDelegationCacheProofChainVia(t *testing.T) {
+	ctx := context.Background()
+	agent, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	// tenantLeaf below stands for the tenant's own delegation to the agent,
+	// as Hilt issues for a request's cleanup commands: it outlives the key's
+	// and skips the key entirely.
+
+	t.Run("prefers the key's chain over a longer-lived one that skips the key", func(t *testing.T) {
+		bucket, err := ed25519.GenerateIssuer()
+		require.NoError(t, err)
+		tenant, err := ed25519.GenerateIssuer()
+		require.NoError(t, err)
+		accessKey, err := ed25519.GenerateIssuer()
+		require.NoError(t, err)
+		root, err := contentcmds.Retrieve.Delegate(bucket, tenant.DID(), bucket.DID(), delegation.WithNoExpiration())
+		require.NoError(t, err)
+		mid, err := contentcmds.Retrieve.Delegate(tenant, accessKey.DID(), bucket.DID(), delegation.WithNoExpiration())
+		require.NoError(t, err)
+		keyLeaf, err := contentcmds.Retrieve.Delegate(accessKey, agent.DID(), bucket.DID(), delegation.WithExpiration(ucan.Now()+3600))
+		require.NoError(t, err)
+		tenantLeaf, err := contentcmds.Retrieve.Delegate(tenant, agent.DID(), bucket.DID(), delegation.WithExpiration(ucan.Now()+8*86400))
+		require.NoError(t, err)
+		c := hiltiam.NewDelegationCache(nil)
+		c.Add(root, mid, keyLeaf, tenantLeaf)
+
+		chain, _, err := c.ProofChain(ctx, agent.DID(), contentcmds.Retrieve.Command, bucket.DID())
+		require.NoError(t, err)
+		require.Equal(t, tenantLeaf.Link(), chain[len(chain)-1].Link(), "the plain lookup takes the longest-lived chain")
+
+		chain, _, err = c.ProofChainVia(ctx, agent.DID(), contentcmds.Retrieve.Command, bucket.DID(), accessKey.DID())
+		require.NoError(t, err)
+		require.Len(t, chain, 3)
+		require.Equal(t, keyLeaf.Link(), chain[2].Link(), "the restricted lookup ends in the key's delegation")
+	})
+
+	t.Run("finds nothing when only a chain that skips the key is cached", func(t *testing.T) {
+		bucket, err := ed25519.GenerateIssuer()
+		require.NoError(t, err)
+		tenant, err := ed25519.GenerateIssuer()
+		require.NoError(t, err)
+		accessKey, err := ed25519.GenerateIssuer()
+		require.NoError(t, err)
+		root, err := contentcmds.Retrieve.Delegate(bucket, tenant.DID(), bucket.DID(), delegation.WithNoExpiration())
+		require.NoError(t, err)
+		tenantLeaf, err := contentcmds.Retrieve.Delegate(tenant, agent.DID(), bucket.DID(), delegation.WithExpiration(ucan.Now()+8*86400))
+		require.NoError(t, err)
+		c := hiltiam.NewDelegationCache(nil)
+		c.Add(root, tenantLeaf)
+
+		chain, _, err := c.ProofChainVia(ctx, agent.DID(), contentcmds.Retrieve.Command, bucket.DID(), accessKey.DID())
+		require.NoError(t, err)
+		require.Empty(t, chain)
+	})
+}
