@@ -398,3 +398,41 @@ func TestATaskWaitingToRetryCanBeCancelled_Live(t *testing.T) {
 		t.Errorf("Wait error %v, want ErrCancelled", err)
 	}
 }
+
+func TestBatchExpiryIsRecordedTogether_Live(t *testing.T) {
+	f := newFixture(t, 1)
+	if err := f.r.HandleBatch(qTop, "register", 3, func(ctx context.Context, ex *taskrunner.Exec, tasks []taskrunner.Task) ([][]byte, error) {
+		return make([][]byte, len(tasks)), nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	f.migrate(t)
+	ctx := waitCtx(t)
+	// Recording the second task's expiry errors, as a crash part way would
+	// stop it.
+	tasks := f.env.Table("queue_top_tasks")
+	refuse := f.env.Table("refuse_b")
+	if _, err := f.env.DB.Exec(ctx, `
+CREATE FUNCTION `+refuse+`() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+	RAISE EXCEPTION 'refused';
+END $$;
+CREATE TRIGGER refuse_b BEFORE UPDATE OF state ON `+tasks+` FOR EACH ROW
+	WHEN (NEW.state = 'expired' AND OLD.args = 'b') EXECUTE FUNCTION `+refuse+`();`); err != nil {
+		t.Fatal(err)
+	}
+	var ids []taskrunner.TaskID
+	for _, a := range []string{"a", "b"} {
+		id, err := f.r.Submit(ctx, taskrunner.Spec{Queue: qTop, Subject: "space", Action: "register", Args: []byte(a), Expires: at(-time.Second)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+	f.start(t)
+	time.Sleep(500 * time.Millisecond)
+	for i, id := range ids {
+		if s := f.state(t, qTop, id); s != "pending" {
+			t.Errorf("task %d is %s; a batch's expiries must be recorded for all its tasks or none", i, s)
+		}
+	}
+}
