@@ -25,7 +25,7 @@ CREATE TABLE %[1]s (
 	args       bytea,
 	sync       boolean NOT NULL,
 	state      text NOT NULL DEFAULT 'pending'
-	           CHECK (state IN ('pending', 'succeeded', 'failed', 'expired', 'cancelled')),
+	           CHECK (state IN ('pending', 'succeeded', 'failed', 'expired', 'cancelled', 'resubmitted')),
 	result     bytea,
 	error      text,
 	finished   timestamptz,
@@ -46,6 +46,8 @@ CREATE INDEX %[3]s ON %[1]s (subject, seq) WHERE state = 'pending';
 `+dueIndex(q)+`
 CREATE UNIQUE INDEX %[4]s ON %[1]s (subject, action)
 	WHERE state = 'pending' AND replaceable AND started IS NULL;
+CREATE INDEX %[5]s ON %[1]s (subject, seq) WHERE state = 'failed';
+CREATE INDEX %[6]s ON %[1]s (finished) WHERE state <> 'pending';
 CREATE TABLE %[2]s (
 	subject      text PRIMARY KEY,
 	owner        uuid NOT NULL,
@@ -54,7 +56,9 @@ CREATE TABLE %[2]s (
 	tree_id      uuid NOT NULL
 );`, q.tasks, q.leases,
 			pgx.Identifier{q.table + "_tasks_pending"}.Sanitize(),
-			pgx.Identifier{q.table + "_tasks_replaceable"}.Sanitize())
+			pgx.Identifier{q.table + "_tasks_replaceable"}.Sanitize(),
+			pgx.Identifier{q.table + "_tasks_failed"}.Sanitize(),
+			pgx.Identifier{q.table + "_tasks_finished"}.Sanitize())
 	},
 }
 

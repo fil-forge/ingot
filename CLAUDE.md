@@ -127,8 +127,10 @@ Internal:
   the rows of the tasks it spawned; sibling children taking leases in
   opposite orders resolve by the younger tree giving way. Async tasks can be
   replacements (the later `NotBefore` wins), cancelled before they start,
-  batched (`HandleBatch`) and retried (`WithRetry`; `Permanent` stops
-  retries). `Spec.Node` places a task on the runner whose `Options.Node`
+  batched (`HandleBatch`, each task with its own outcome) and retried
+  (`WithRetry`; `Permanent` stops retries). Failed tasks stay as the
+  dead-letter queue (`ListFailed`, `Resubmit`); finished ones are deleted
+  past their queue's `Retention`. `Spec.Node` places a task on the runner whose `Options.Node`
   matches. Metrics (`taskrunner.*`: queue depth, oldest ready age, lease
   waits and takeovers, task duration by outcome, busy workers) go to
   `Options.MeterProvider`, or the global provider when unset. Imports nothing

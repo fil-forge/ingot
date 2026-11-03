@@ -192,9 +192,9 @@ func TestBatchStopsAtTheLimitAndAtAnotherAction_Live(t *testing.T) {
 		}
 		runs = append(runs, args)
 	}
-	if err := f.r.HandleBatch(qTop, "register", 3, func(ctx context.Context, ex *taskrunner.Exec, tasks []taskrunner.Task) ([][]byte, error) {
+	if err := f.r.HandleBatch(qTop, "register", 3, func(ctx context.Context, ex *taskrunner.Exec, tasks []taskrunner.Task) ([]taskrunner.Outcome, error) {
 		record(tasks)
-		return make([][]byte, len(tasks)), nil
+		return make([]taskrunner.Outcome, len(tasks)), nil
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -287,7 +287,7 @@ func TestRetries_Live(t *testing.T) {
 
 func TestBatchFailureIsRecordedTogether_Live(t *testing.T) {
 	f := newFixture(t, 1)
-	if err := f.r.HandleBatch(qTop, "register", 3, func(ctx context.Context, ex *taskrunner.Exec, tasks []taskrunner.Task) ([][]byte, error) {
+	if err := f.r.HandleBatch(qTop, "register", 3, func(ctx context.Context, ex *taskrunner.Exec, tasks []taskrunner.Task) ([]taskrunner.Outcome, error) {
 		return nil, taskrunner.Permanent(errors.New("rejected"))
 	}); err != nil {
 		t.Fatal(err)
@@ -457,8 +457,8 @@ func TestAReplacementTakesTheRetrysPlace_Live(t *testing.T) {
 
 func TestBatchExpiryIsRecordedTogether_Live(t *testing.T) {
 	f := newFixture(t, 1)
-	if err := f.r.HandleBatch(qTop, "register", 3, func(ctx context.Context, ex *taskrunner.Exec, tasks []taskrunner.Task) ([][]byte, error) {
-		return make([][]byte, len(tasks)), nil
+	if err := f.r.HandleBatch(qTop, "register", 3, func(ctx context.Context, ex *taskrunner.Exec, tasks []taskrunner.Task) ([]taskrunner.Outcome, error) {
+		return make([]taskrunner.Outcome, len(tasks)), nil
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -497,7 +497,7 @@ func TestBatchLeavesOutAnExpiredTask_Live(t *testing.T) {
 	f := newFixture(t, 1)
 	var mu sync.Mutex
 	var seen [][]string
-	if err := f.r.HandleBatch(qTop, "register", 5, func(ctx context.Context, ex *taskrunner.Exec, tasks []taskrunner.Task) ([][]byte, error) {
+	if err := f.r.HandleBatch(qTop, "register", 5, func(ctx context.Context, ex *taskrunner.Exec, tasks []taskrunner.Task) ([]taskrunner.Outcome, error) {
 		var args []string
 		for _, task := range tasks {
 			args = append(args, string(task.Args))
@@ -505,7 +505,7 @@ func TestBatchLeavesOutAnExpiredTask_Live(t *testing.T) {
 		mu.Lock()
 		seen = append(seen, args)
 		mu.Unlock()
-		return make([][]byte, len(tasks)), nil
+		return make([]taskrunner.Outcome, len(tasks)), nil
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -545,9 +545,9 @@ func TestDrainLimitCountsRuns_Live(t *testing.T) {
 		runs = append(runs, fmt.Sprintf("%s:%s:%d", task.Subject, task.Action, n))
 		mu.Unlock()
 	}
-	if err := f.r.HandleBatch(qTop, "register", 5, func(ctx context.Context, ex *taskrunner.Exec, tasks []taskrunner.Task) ([][]byte, error) {
+	if err := f.r.HandleBatch(qTop, "register", 5, func(ctx context.Context, ex *taskrunner.Exec, tasks []taskrunner.Task) ([]taskrunner.Outcome, error) {
 		record(tasks[0], len(tasks))
-		return make([][]byte, len(tasks)), nil
+		return make([]taskrunner.Outcome, len(tasks)), nil
 	}); err != nil {
 		t.Fatal(err)
 	}

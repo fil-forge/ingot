@@ -293,11 +293,11 @@ func callHandler(ctx context.Context, h Handler, ex *Exec, t Task) (res []byte, 
 }
 
 // callBatch runs a batch handler, turning a panic into an error.
-func callBatch(ctx context.Context, h BatchHandler, ex *Exec, tasks []Task) (res [][]byte, err error) {
+func callBatch(ctx context.Context, h BatchHandler, ex *Exec, tasks []Task) (res []Outcome, err error) {
 	defer recoverHandler(tasks[0], &err)
 	res, err = h(ctx, ex, tasks)
 	if err == nil && len(res) != len(tasks) {
-		err = fmt.Errorf("batch handler %s.%s returned %d results for %d tasks", tasks[0].Queue, tasks[0].Action, len(res), len(tasks))
+		err = fmt.Errorf("batch handler %s.%s returned %d outcomes for %d tasks", tasks[0].Queue, tasks[0].Action, len(res), len(tasks))
 	}
 	return res, err
 }
@@ -309,52 +309,66 @@ func recoverHandler(t Task, err *error) {
 }
 
 // commit runs the tree's write list, its children's rows and the roots'
-// completion in one transaction, after checking the tree still holds every
-// lease it took.
-func (tr *tree) commit(ctx context.Context, results [][]byte) error {
+// outcomes in one transaction, after checking the tree still holds every
+// lease it took. A root whose outcome carries an error is retried or failed
+// there; it returns those, to report once the commit has landed.
+func (tr *tree) commit(ctx context.Context, a *action, outcomes []Outcome) (*failures, error) {
 	tx := tr.tx
 	if tx == nil {
 		var err error
 		if tx, err = tr.r.db.Begin(ctx); err != nil {
-			return err
+			return nil, err
 		}
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
 
 	if tr.deferred != nil {
-		return tr.deferred
+		return nil, tr.deferred
 	}
 	if err := lockLease(ctx, tx, tr.rootHold); err != nil {
-		return err
+		return nil, err
 	}
 	for _, h := range tr.holds {
 		if err := lockLease(ctx, tx, h); errors.Is(err, errLeaseLost) {
 			// A child's subject can be leased afresh when the tree runs again.
-			return fmt.Errorf("lease on %s/%s lost before commit", h.q.name, h.subject)
+			return nil, fmt.Errorf("lease on %s/%s lost before commit", h.q.name, h.subject)
 		} else if err != nil {
-			return err
+			return nil, err
 		}
 	}
 	for _, w := range tr.writes {
 		tag, err := tx.Exec(ctx, w.sql, w.args...)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if w.conditional && tag.RowsAffected() == 0 {
-			return ErrConflict
+			return nil, ErrConflict
 		}
 	}
+	var failedTasks []Task
+	var failedErrs []error
 	for i, t := range tr.roots {
+		if err := outcomes[i].Err; err != nil {
+			failedTasks = append(failedTasks, t)
+			failedErrs = append(failedErrs, err)
+			continue
+		}
 		tag, err := tx.Exec(ctx, `UPDATE `+tr.rootHold.q.tasks+` SET state = 'succeeded', result = $2, finished = now()
-			WHERE id = $1 AND state = 'pending'`, t.ID, results[i])
+			WHERE id = $1 AND state = 'pending'`, t.ID, outcomes[i].Result)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if tag.RowsAffected() == 0 {
-			return fmt.Errorf("task %s/%s is no longer pending", t.Queue, t.ID)
+			return nil, fmt.Errorf("task %s/%s is no longer pending", t.Queue, t.ID)
 		}
 	}
-	return tx.Commit(ctx)
+	rec := &failures{}
+	if len(failedTasks) > 0 {
+		if err := rec.record(ctx, tx, tr.rootHold, a, failedTasks, failedErrs); err != nil {
+			return nil, err
+		}
+	}
+	return rec, tx.Commit(ctx)
 }
 
 // lockLease locks h's lease row for the rest of tx, or returns errLeaseLost
@@ -425,14 +439,14 @@ func (r *Runner) runRoot(ctx context.Context, h *hold, tasks []Task) (res []byte
 			tr.tx, tr.cur = tx, tx
 		}
 		ex := &Exec{tr: tr, q: h.q, task: live[0], path: []actionKey{{first.Queue, first.Action}}}
-		var results [][]byte
+		var outcomes []Outcome
 		var herr error
 		if a.batch != nil {
-			results, herr = callBatch(ctx, a.batch, ex, live)
+			outcomes, herr = callBatch(ctx, a.batch, ex, live)
 		} else {
 			var res []byte
 			res, herr = callHandler(ctx, a.handler, ex, live[0])
-			results = [][]byte{res}
+			outcomes = []Outcome{{Result: res}}
 		}
 		// A failed child fails the tree even if its parent carried on, and
 		// giving way to an older tree ends the run however the handler
@@ -471,20 +485,25 @@ func (r *Runner) runRoot(ctx context.Context, h *hold, tasks []Task) (res []byte
 			tr.observeChildren(ctx, false)
 			return nil, herr, nil
 		}
-		cerr := tr.commit(ctx, results)
+		rec, cerr := tr.commit(ctx, a, outcomes)
 		tr.releaseChildren(ctx)
 		if cerr == nil {
 			woken := tr.woken
-			for _, t := range live {
-				woken = append(woken, t.ID)
+			var succeeded []Task
+			for i, t := range live {
+				if outcomes[i].Err == nil {
+					woken = append(woken, t.ID)
+					succeeded = append(succeeded, t)
+				}
 			}
 			r.finished(woken...)
 			for q := range tr.spawned {
 				r.pokeQueue(q)
 			}
-			r.metrics.observeTasks(ctx, live, outcomeSucceeded, start)
+			r.metrics.observeTasks(ctx, succeeded, outcomeSucceeded, start)
+			rec.report(ctx, r, start)
 			tr.observeChildren(ctx, true)
-			return results[0], nil, nil
+			return outcomes[0].Result, outcomes[0].Err, nil
 		}
 		if ctx.Err() != nil {
 			return nil, nil, ctx.Err()

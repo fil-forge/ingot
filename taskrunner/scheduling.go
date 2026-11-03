@@ -13,11 +13,23 @@ import (
 )
 
 // BatchHandler runs a batch of tasks with the same subject and action, oldest
-// first. It returns one result per task, and the batch commits or fails
-// together. Expiry is decided per task, before the batch runs: a task already
-// past its Expires is recorded as expired and left out, so the handler only
-// sees tasks that may still start.
-type BatchHandler func(ctx context.Context, ex *Exec, tasks []Task) ([][]byte, error)
+// first, and returns one Outcome per task. The batch's writes commit together.
+// A task whose Outcome carries an error is retried or failed on its own, under
+// its own attempts, in the same commit as its batchmates' success; returning an
+// error instead fails or retries the whole batch, writes and all. Expiry is
+// decided per task, before the batch runs: a task already past its Expires is
+// recorded as expired and left out, so the handler only sees tasks that may
+// still start.
+type BatchHandler func(ctx context.Context, ex *Exec, tasks []Task) ([]Outcome, error)
+
+// Outcome is one batched task's outcome.
+type Outcome struct {
+	// Result is the task's result when Err is nil.
+	Result []byte
+	// Err, when set, fails or retries this task alone, as a handler error
+	// would. It does not undo the batch's writes.
+	Err error
+}
 
 // RetryPolicy says when an async task whose handler returned an error runs
 // again. A sync task is never retried: its error goes to its caller.
@@ -270,15 +282,45 @@ func (r *Runner) failOrRetry(ctx context.Context, h *hold, a *action, tasks []Ta
 	if err := lockLease(ctx, tx, h); err != nil {
 		return err
 	}
-	var failed, retried []Task
-	for _, t := range tasks {
+	errs := make([]error, len(tasks))
+	for i := range errs {
+		errs[i] = herr
+	}
+	var rec failures
+	if err := rec.record(ctx, tx, h, a, tasks, errs); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("record failure of %s.%s: %w", tasks[0].Queue, tasks[0].Action, err)
+	}
+	rec.report(ctx, r, start)
+	return nil
+}
+
+// failures collects the tasks a commit or failure record failed or retried,
+// to log and count once it has committed.
+type failures struct {
+	failed, retried []Task
+	errs            map[TaskID]error
+}
+
+// record writes, in tx, each task's failure: a retry when its action's policy
+// allows another attempt, otherwise its final failure. errs holds each task's
+// error, in the order of tasks.
+func (f *failures) record(ctx context.Context, tx pgx.Tx, h *hold, a *action, tasks []Task, errs []error) error {
+	if f.errs == nil {
+		f.errs = map[TaskID]error{}
+	}
+	for i, t := range tasks {
+		herr := errs[i]
+		f.errs[t.ID] = herr
 		p := a.retry
 		var sql string
 		args := []any{t.ID, herr.Error()}
 		if t.sync || p == nil || IsPermanent(herr) || (p.Attempts > 0 && t.Attempt+1 >= p.Attempts) {
 			sql = `UPDATE ` + h.q.tasks + ` SET state = 'failed', error = $2, finished = now()
 				WHERE id = $1 AND state = 'pending'`
-			failed = append(failed, t)
+			f.failed = append(f.failed, t)
 		} else {
 			// A retry that holds its subject waits in retry_at, which keeps
 			// the tasks behind it waiting too; otherwise it waits in
@@ -291,7 +333,7 @@ func (r *Runner) failOrRetry(ctx context.Context, h *hold, a *action, tasks []Ta
 				` + col + ` = now() + $3 * interval '1 millisecond'
 				WHERE id = $1 AND state = 'pending'`
 			args = append(args, p.delay(t.Attempt+1).Milliseconds())
-			retried = append(retried, t)
+			f.retried = append(f.retried, t)
 		}
 		tag, err := tx.Exec(ctx, sql, args...)
 		if err != nil {
@@ -301,19 +343,21 @@ func (r *Runner) failOrRetry(ctx context.Context, h *hold, a *action, tasks []Ta
 			return errNotPending
 		}
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("record failure of %s.%s: %w", tasks[0].Queue, tasks[0].Action, err)
-	}
-	ids := make([]TaskID, 0, len(failed))
-	for _, t := range failed {
-		r.log.Warn("task failed", zapTask(t), zapErr(herr))
+	return nil
+}
+
+// report logs and counts the recorded failures, and wakes the failed tasks'
+// waiters. Call it once the record has committed.
+func (f *failures) report(ctx context.Context, r *Runner, start time.Time) {
+	ids := make([]TaskID, 0, len(f.failed))
+	for _, t := range f.failed {
+		r.log.Warn("task failed", zapTask(t), zapErr(f.errs[t.ID]))
 		ids = append(ids, t.ID)
 	}
-	for _, t := range retried {
-		r.log.Info("task will be retried", zapTask(t), zapInt("attempt", t.Attempt+1), zapErr(herr))
+	for _, t := range f.retried {
+		r.log.Info("task will be retried", zapTask(t), zapInt("attempt", t.Attempt+1), zapErr(f.errs[t.ID]))
 	}
 	r.finished(ids...)
-	r.metrics.observeTasks(ctx, failed, outcomeFailed, start)
-	r.metrics.observeTasks(ctx, retried, outcomeRetried, start)
-	return nil
+	r.metrics.observeTasks(ctx, f.failed, outcomeFailed, start)
+	r.metrics.observeTasks(ctx, f.retried, outcomeRetried, start)
 }
