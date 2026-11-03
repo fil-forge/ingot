@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/metric/noop"
 	"go.uber.org/zap"
 )
 
@@ -64,9 +65,10 @@ type Spec struct {
 	// Expires, when set, is the latest time the task may start.
 	Expires *time.Time
 	// Node, when set, places the task on one instance, the runner whose
-	// Options.Node matches. Other instances never run it, nor the tasks behind
-	// it on its subject until it has run. A task that touches one instance's
-	// local state is placed there.
+	// Options.Node matches. Other instances never run it, and while it is its
+	// subject's oldest due task they run none of the tasks behind it either.
+	// Until its NotBefore passes it holds up nothing, as any delayed task. A
+	// task that touches one instance's local state is placed there.
 	Node *string
 	// Replace submits the task as a replacement, which needs a NotBefore: if a
 	// replacement with the same subject and action is pending and has not
@@ -275,9 +277,14 @@ func New(db DB, opts Options) (*Runner, error) {
 		waiting:  map[TaskID]*queue{},
 		freed:    map[subjectKey]*freeSub{},
 	}
+	// Metrics never stop the runner: instruments the provider refuses leave
+	// it reporting nothing.
 	m, err := newMetrics(opts.MeterProvider)
 	if err != nil {
-		return nil, fmt.Errorf("task runner: metrics: %w", err)
+		r.log.Warn("task runner metrics not created; reporting none", zapErr(err))
+		if m, err = newMetrics(noop.NewMeterProvider()); err != nil {
+			return nil, fmt.Errorf("task runner: no-op metrics: %w", err)
+		}
 	}
 	r.metrics = m
 	for i, qo := range opts.Queues {
