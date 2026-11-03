@@ -725,6 +725,36 @@ type GCStore interface {
 	AddGCCandidate(ctx context.Context, cidBytes []byte, bucket string) error
 }
 
+// CatalogUsage is one bucket's catalog storage on Forge: the CARs of its
+// shipped catalog segments, retired ones included, which stay registered in
+// its space until DeleteBucket releases them. The segments' index blobs are
+// not counted. Segment rows are matched to the bucket by name: rows a failed
+// DeleteBucket cleanup left behind count toward a later bucket of the same
+// name. A DeleteBucket that fails partway drops the rows of the retired
+// segments it released, but not those of the unretired ones, which keep
+// counting until the bucket is deleted. One that fails after releasing the
+// shipped segments (hilt refusing, say) has released those blobs too.
+type CatalogUsage struct {
+	Bucket string
+	Space  did.DID
+	// Bytes is the total size of the bucket's shipped catalog CARs.
+	Bytes int64
+	// DeadOnArrivalBytes is how much of Bytes was already dead when its
+	// segment shipped, summed over the segments that were measured.
+	DeadOnArrivalBytes int64
+	// UnmeasuredBytes is the part of Bytes in segments shipped without that
+	// measurement.
+	UnmeasuredBytes int64
+}
+
+// CatalogUsageStore reports how much catalog storage each bucket holds on
+// Forge, from the segment rows.
+type CatalogUsageStore interface {
+	// CatalogUsage returns one entry per bucket with shipped catalog
+	// segments, ordered by bucket name.
+	CatalogUsage(ctx context.Context) ([]CatalogUsage, error)
+}
+
 // RevocationCursor is the single row of ingot.revocation_cursor: the resume
 // point in the revocation service's firehose. RecordedAt is the recorded_at
 // of the last processed revocation record — the service's own timeline, so a

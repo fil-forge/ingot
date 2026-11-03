@@ -277,6 +277,29 @@ the only copy. Restart `serve` after deleting files by hand: the byte counts
 see such a change at startup, or only at an hourly scan that no write
 overlapped.
 
+### Catalog storage on Forge
+
+Nothing collects dead catalog blocks yet: each shipped catalog segment stays
+on Forge until its bucket is deleted, retired segments included. With metrics
+on, these gauges show how much catalog storage each bucket holds there and how
+much of it was dead before it shipped. Each is labeled by the bucket's `space`
+DID, not its name, and refreshed every five minutes: each refresh reads every
+segment row in Postgres.
+
+| Metric | Meaning |
+| -- | -- |
+| `ingot.catalog.forge_bytes` | Bytes of the bucket's shipped catalog segments, retired ones included (their CARs; their index blobs are not counted) |
+| `ingot.catalog.dead_on_arrival_bytes` | Bytes of those segments' blocks that were already dead when their segment shipped: superseded by later writes in the same segment |
+| `ingot.catalog.unmeasured_bytes` | Bytes of shipped segments whose dead-on-arrival bytes were not measured, such as every segment shipped before the measurement existed |
+
+Blocks that die after their segment ships are not measured: that would take a
+walk of the bucket's live catalog, most of which is only on Forge.
+
+`forge_bytes` undercounts a bucket whose segments retired before retired rows
+were kept (migration `00033`): those rows were deleted, so their CARs, still on
+Forge, count nowhere, not even as unmeasured. Read such a bucket's figures as a
+floor, or reset its data.
+
 ## Build & test
 
 ```bash

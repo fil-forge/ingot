@@ -502,7 +502,7 @@ func TestRecover_RetiredFilesReappear(t *testing.T) {
 	sealedSegments(t, dir, mem, 1)
 	seq := sortedSeqs(onDiskSeqs(t, dir, "bk"))[0]
 	index := multihash.Multihash("retired-index")
-	if err := mem.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seq, time.Now().Unix(), index, nil); err != nil {
+	if err := mem.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seq, time.Now().Unix(), index, -1, nil); err != nil {
 		t.Fatalf("MarkSegmentShipped: %v", err)
 	}
 	if err := mem.RetireSegment(ctx, blockstore.PlaneCatalog, seq, time.Now().Unix()); err != nil {

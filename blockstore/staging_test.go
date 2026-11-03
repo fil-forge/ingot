@@ -42,7 +42,7 @@ func (f *fakeMeta) MarkSegmentSealed(_ context.Context, plane blockstore.Plane, 
 	f.roots = append(f.roots, opRoots...)
 	return nil
 }
-func (f *fakeMeta) MarkSegmentShipped(_ context.Context, plane blockstore.Plane, seq uint64, shippedAt int64, _ multihash.Multihash, _ []blockstore.OpRoot) error {
+func (f *fakeMeta) MarkSegmentShipped(_ context.Context, plane blockstore.Plane, seq uint64, shippedAt int64, _ multihash.Multihash, _ int64, _ []blockstore.OpRoot) error {
 	if r, ok := f.rows[seq]; ok {
 		r.ShippedAt = shippedAt
 	}
