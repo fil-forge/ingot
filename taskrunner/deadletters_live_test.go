@@ -3,6 +3,7 @@ package taskrunner_test
 import (
 	"context"
 	"errors"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -224,5 +225,22 @@ func TestFailedGauge_Live(t *testing.T) {
 	aa := []attribute.KeyValue{attribute.String("queue", qTop), attribute.String("action", "fail")}
 	if v, ok := gaugeValue[int64](t, got["taskrunner.queue.failed"], aa...); !ok || v != 1 {
 		t.Errorf("failed = %d (reported %v), want 1", v, ok)
+	}
+}
+
+func TestQueueTablesAreTunedForChurn_Live(t *testing.T) {
+	f := newFixture(t, 0)
+	f.migrate(t)
+	for _, table := range []string{"queue_top_tasks", "queue_top_leases"} {
+		var opts []string
+		if err := f.env.DB.QueryRow(context.Background(), `SELECT coalesce(reloptions, '{}') FROM pg_class
+			WHERE oid = $1::regclass`, f.env.Table(table)).Scan(&opts); err != nil {
+			t.Fatal(err)
+		}
+		for _, want := range []string{"fillfactor=80", "autovacuum_vacuum_scale_factor=0.01"} {
+			if !slices.Contains(opts, want) {
+				t.Errorf("%s storage options %v lack %s", table, opts, want)
+			}
+		}
 	}
 }
