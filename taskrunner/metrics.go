@@ -4,9 +4,9 @@ import (
 	"context"
 	"time"
 
+	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
-	"go.opentelemetry.io/otel/metric/noop"
 )
 
 // meterName is the instrumentation scope of the runner's metrics.
@@ -43,7 +43,7 @@ type metrics struct {
 
 func newMetrics(mp metric.MeterProvider) (*metrics, error) {
 	if mp == nil {
-		mp = noop.NewMeterProvider()
+		mp = otel.GetMeterProvider()
 	}
 	meter := mp.Meter(meterName)
 	m := &metrics{meter: meter}
