@@ -71,9 +71,11 @@ sequenceDiagram
     C->>DB: CommitRoot: share-lock the segment row, journal the batch's blocks<br/>under it (none once it has shipped), CAS the root: one tx
 
     Note over S,FS: seal when size >= SealBytes or age >= SealAge<br/>(also at Close, and recovery force-seals)
-    S->>FS: hash CAR, write .idx (tmp + fsync, rename, fsync dir)
-    S->>DB: MarkSegmentSealed(size, sha256, op-roots) in one tx
+    S->>FS: freeze: fsync, hash CAR, open it read-only, close the write fd
+    S->>FS: record: write .idx (tmp + fsync, rename, fsync dir)
+    S->>DB: record: MarkSegmentSealed(size, sha256, op-roots) in one tx
     S->>F: enqueueFlush (queue cap 64; a full queue leaves it to the retry sweep)
+    Note over S,F: a failed record still moves the frozen segment on,<br/>and the flush records the seal before it ships
 
     S->>FS: measure dead bytes once: walk from the last op-root through<br/>this segment's own blocks (a failure leaves it unmeasured)
     F->>F: SubmitShard: /blob/add the CAR to sprue, PUT, conclude, receipt<br/>(index publish is best-effort, space resolved via reg.Get at ship time)
@@ -118,7 +120,7 @@ walk from.
 stateDiagram-v2
     [*] --> Open : createOpenSegment + InsertSegmentOpen
     Open --> Open : append (fsync, then index commit)
-    Open --> Sealed : seal (hash CAR, write .idx, MarkSegmentSealed)
+    Open --> Sealed : seal (freeze: hash CAR, read-only fd; record: write .idx, MarkSegmentSealed)
     Open --> Sealed : recovery, .idx on disk behind an open row (MarkSegmentSealed)
     [*] --> Sealed : recovery, row-less CAR with .idx (RehydrateSegment)
     Open --> [*] : recovery, CAR missing (journal rows rebuilt into a new segment, then DeleteSegment)
@@ -140,6 +142,16 @@ stateDiagram-v2
   nothing ships them.
 - Recovery force-seals any recovered open segment, so each process starts
   with a brand-new open segment per bucket.
+- A seal freezes the segment before it records the seal. If recording fails
+  (Postgres failing over, say), the segment stays frozen: it is readable
+  through its read-only fd, and writes go on to a new segment. Its row is
+  still `open`. The flush records the seal before every ship attempt, so the
+  queued ship and the minute's retry sweep retry it, and no segment ships
+  with its row still `open` and no `sha256` for `DeleteBucket` to release.
+  The record holds no lock a read needs, so reads go on while a stamp hangs.
+  Two cases are left to the next start's recovery instead: a plane that
+  doesn't ship has no flush to retry the record, and a record that fails at
+  `Close` isn't retried. Either way nothing has shipped yet.
 
 ## Invariants
 
@@ -195,7 +207,7 @@ before any worker starts. Discovery keys on the CAR file:
 
 | `Meta` row | On-disk CAR | Action |
 |---|---|---|
-| `open` | present, with a readable `.idx` | it sealed after the point `Meta` was restored to: `loadSealedFromIdx` + `MarkSegmentSealed`; re-enqueued |
+| `open` | present, with a readable `.idx` | it sealed after the point `Meta` was restored to, or the stamp of its seal failed before a restart: `loadSealedFromIdx` + `MarkSegmentSealed`; re-enqueued |
 | `open` | present, no readable `.idx` | `rebuildOpenFromDisk` (scan + truncate any torn trailing frame); then force-sealed |
 | `sealed` | present, with a readable `.idx` | `loadSealedFromIdx`; re-enqueue when shipping and not yet shipped (newest first; what the queue can't hold, the retry sweep ships) |
 | `sealed` | present, no readable `.idx`, CAR matches the row's size and sha256 | written before seal fsynced it, or lost to a partial restore: `rebuildOpenFromDisk`, with the row's op-roots (they survive a torn or missing `.ops`), then sealed again, which writes a fresh `.idx` and leaves the row as it is; re-enqueued if not yet shipped |

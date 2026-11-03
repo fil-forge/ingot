@@ -27,7 +27,8 @@ import (
 //     With no readable .idx, rebuild from a CAR that matches the row and
 //     seal again; set aside one that doesn't, and recover it as a lost file.
 //   - row open or no row, .idx present → the segment finished sealing but
-//     Meta was restored from behind the disk: load from .idx, bring the row
+//     Meta was restored from behind the disk, or its seal's stamp failed
+//     before a restart: load from .idx, bring the row
 //     up to it (MarkSegmentSealed, or RehydrateSegment when missing),
 //     re-enqueue (a re-ship of what already shipped is a no-op).
 //   - row open or no row, no (readable) .idx → open at the crash: rebuild
@@ -352,7 +353,8 @@ func carMatchesRow(path string, row SegmentMeta) (bool, error) {
 
 // sealedFromIdx recovers a segment that finished sealing (seal writes its
 // .idx by rename) while Meta has its row open or has no row: Meta was
-// restored from a point behind the disk. It brings the row up to the
+// restored from a point behind the disk, or the seal's stamp failed before
+// a restart. It brings the row up to the
 // sidecar and returns the sealed segment, or nil when there is no .idx or
 // it won't load (a rename that never reached the disk), in which case the
 // caller rebuilds the segment from its CAR.

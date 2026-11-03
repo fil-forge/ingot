@@ -259,7 +259,9 @@ func (pl *PlaneLog) ensureOpenLockedAppMu(ctx context.Context) (*Segment, error)
 }
 
 // sealOpenIfDue seals the current open segment if one exists and is due
-// (over SealAge or SealBytes), or force is set, then enqueues it.
+// (over SealAge or SealBytes), or force is set, then enqueues it. A segment
+// that froze but whose seal didn't record is logged and enqueued too, and
+// returns nil: it has moved on, and the flush or the next start records it.
 func (pl *PlaneLog) sealOpenIfDue(ctx context.Context, force bool) error {
 	pl.appMu.Lock()
 	defer pl.appMu.Unlock()
@@ -284,7 +286,13 @@ func (pl *PlaneLog) sealOpenIfDue(ctx context.Context, force bool) error {
 	err := open.seal(sealCtx, pl.meta)
 	tracing.End(span, err)
 	if err != nil {
-		return err
+		if open.State() == StateOpen {
+			return err // still open: the next tick tries again
+		}
+		// A segment that froze but whose seal wasn't recorded moves on too,
+		// so writes go to a new segment. Its ship records the seal first.
+		pl.logger.Warn("logstore: seal not recorded; the flush or the next start records it",
+			zap.Stringer("plane", pl.plane), zap.Uint64("seq", open.Seq()), zap.Error(err))
 	}
 
 	pl.catMu.Lock()
@@ -395,8 +403,13 @@ func (pl *PlaneLog) flushOne(seg *Segment, maxAttempts int) bool {
 		span.SetAttributes(attribute.Int("ingot.log.attempts", attempt))
 		var err error
 		if !flushed {
-			if indexDigest, err = pl.pc.Flush(ctx, seg); err == nil {
-				flushed, shippedAt = true, time.Now().Unix()
+			// Record a seal that failed to record before shipping: a ship
+			// would stamp a row still open, with no sha256 for a release to
+			// find. A no-op once recorded.
+			if err = seg.seal(ctx, pl.meta); err == nil {
+				if indexDigest, err = pl.pc.Flush(ctx, seg); err == nil {
+					flushed, shippedAt = true, time.Now().Unix()
+				}
 			}
 		}
 		if err != nil {
