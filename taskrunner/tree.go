@@ -165,6 +165,13 @@ func (ex *Exec) run(ctx context.Context, s Spec) ([]byte, error) {
 	if s.Expires != nil && !s.Expires.After(time.Now()) {
 		return nil, ErrExpired
 	}
+	// Nor may a child start once renewal has found the root's lease taken
+	// over: the tree cannot commit, and the child's effects would only be
+	// repeated when another consumer runs it. A loss renewal has not seen
+	// yet is caught by the commit.
+	if tr.rootHold.lost.Load() {
+		return nil, errLeaseLost
+	}
 
 	id, err := uuid.NewV7()
 	if err != nil {
@@ -371,7 +378,7 @@ func (r *Runner) runRoot(ctx context.Context, h *hold, t Task) (res []byte, err 
 		// reported it.
 		var die *dieError
 		var lost *childLostError
-		if tr.failed != nil && (herr == nil || errors.As(tr.failed, &die) || errors.As(tr.failed, &lost)) {
+		if tr.failed != nil && (herr == nil || errors.As(tr.failed, &die) || errors.As(tr.failed, &lost) || errors.Is(tr.failed, errLeaseLost)) {
 			herr = tr.failed
 		}
 		if herr != nil {
@@ -382,6 +389,10 @@ func (r *Runner) runRoot(ctx context.Context, h *hold, t Task) (res []byte, err 
 			if errors.As(herr, &die) {
 				r.log.Debug("task gave way to an older one", zapTask(t), zapErr(die))
 				return nil, nil, die
+			}
+			if errors.Is(herr, errLeaseLost) {
+				r.log.Warn("task's lease was taken over before a child could start", zapTask(t))
+				return nil, nil, errLeaseLost
 			}
 			if ctx.Err() != nil {
 				return nil, nil, ctx.Err()

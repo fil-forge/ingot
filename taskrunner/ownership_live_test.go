@@ -450,3 +450,30 @@ func TestRunStopsWaitingAtItsExpires_Live(t *testing.T) {
 		t.Error("the task ran")
 	}
 }
+
+func TestChildDoesNotStartOnceTheRootLeaseIsLost_Live(t *testing.T) {
+	f := newFixture(t, 0)
+	var stole atomic.Bool
+	var childRuns atomic.Int32
+	f.handle(t, qBottom, "child", func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) {
+		childRuns.Add(1)
+		return nil, nil
+	})
+	f.handle(t, qTop, "parent", func(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
+		if stole.CompareAndSwap(false, true) {
+			f.stealLease(t, qTop, task.Subject, 700*time.Millisecond)
+			// Long enough for renewal to find the root's lease taken over.
+			time.Sleep(500 * time.Millisecond)
+		}
+		_, err := ex.Run(ctx, taskrunner.Spec{Queue: qBottom, Subject: "c", Action: "child"})
+		return nil, err
+	})
+	f.start(t)
+
+	if _, err := f.r.Run(waitCtx(t), taskrunner.Spec{Queue: qTop, Subject: "p", Action: "parent"}); err != nil {
+		t.Fatal(err)
+	}
+	if n := childRuns.Load(); n != 1 {
+		t.Errorf("the child ran %d times, want once: never under the lost root lease", n)
+	}
+}
