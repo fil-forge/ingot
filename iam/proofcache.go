@@ -228,7 +228,7 @@ func (d *DelegationCache) ProofChainVia(ctx context.Context, aud did.DID, cmd uc
 // authorize, so a key that is being used accumulates several for one command
 // and they expire at different times. Whoever takes the first match should get
 // the one with the most life in it: a caller that queues work for later — the
-// upload-registration sweep, a deferred blob release — keeps that authority
+// upload-registration tasks, a deferred blob release — keeps that authority
 // long after the request is gone, and handing it a chain with minutes left
 // when one with hours is sitting beside it strands the work. Ordering also
 // makes the choice deterministic, where ranging the index alone left it to Go's

@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/fil-forge/ucantone/did"
@@ -108,24 +107,29 @@ func (r *recordingRegistrar) count() int {
 	return len(added) - len(retracted)
 }
 
-// newCountingBackend mirrors newRefTestBackend but swaps the no-op registrar
-// for a recording one.
-// drainRegistrations runs the sweeper until the queue stops shrinking, the way
-// the daemon's ticker eventually would. The registrations are queued by the
-// write and applied off the request path, so every assertion below drains
-// first.
+// drainRegistrations applies what the writes queued, as the
+// queue-space-upload tasks would: in commit order, each run of one op in one
+// round trip. The registrations are queued by the write and applied off the
+// request path, so every assertion below drains first.
 func drainRegistrations(t *testing.T, b *Backend) {
 	t.Helper()
-	for range 8 {
-		n, err := b.SweepUploadRegistrations(context.Background())
-		require.NoError(t, err)
-		if n == 0 {
-			return
+	regs := b.reg.(*inmem.MemStore).TakeUploadRegistrations()
+	for len(regs) > 0 {
+		n := 1
+		for n < len(regs) && regs[n].Op == regs[0].Op {
+			n++
 		}
+		errs, err := b.sendRegistrations(context.Background(), regs[0].Op, regs[:n], make([]int, n))
+		require.NoError(t, err)
+		for _, e := range errs {
+			require.NoError(t, e)
+		}
+		regs = regs[n:]
 	}
-	t.Fatal("registration queue did not drain")
 }
 
+// newCountingBackend mirrors newRefTestBackend but swaps the no-op registrar
+// for a recording one.
 func newCountingBackend(t *testing.T) (*Backend, *recordingRegistrar) {
 	t.Helper()
 	ctx := context.Background()
@@ -167,7 +171,6 @@ func newCountingBackend(t *testing.T) (*Backend, *recordingRegistrar) {
 		Deferred:        inmem.NopUploader{},
 		Remover:         &recordingRemover{},
 		Registrar:       reg,
-		UploadRegs:      mem,
 		EncParams:       mem,
 		RegionKeys:      testRegionKeys(t),
 		TenantKeys:      testTenantKeys(),
@@ -400,58 +403,7 @@ func TestWriteDoesNotCallTheUploadService(t *testing.T) {
 
 	drainRegistrations(t, b)
 	added, _ = reg.snapshot()
-	require.Len(t, added, 1, "the sweep applies what the write queued")
-}
-
-// TestRefusedRegistrationIsRetried: a Sprue outage delays the count instead of
-// losing it — the row stays queued and lands once the service recovers.
-func TestRefusedRegistrationIsRetried(t *testing.T) {
-	b, _ := newCountingBackend(t)
-	reg := &failingRegistrar{}
-	b.registrar = reg
-	reg.refuse("add", true)
-
-	putObjV(t, b, "a", []byte("hello"))
-
-	n, err := b.SweepUploadRegistrations(context.Background())
-	require.NoError(t, err)
-	require.Zero(t, n, "a refused registration lands nothing")
-	added, _ := reg.snapshot()
-	require.Empty(t, added)
-
-	// The row is held back with a backoff, so bring it forward the way the
-	// passage of time would.
-	queued, err := b.uploadRegs.ListUploadRegistrationsBySpace(context.Background(), bucketSpaceOf(t, b))
-	require.NoError(t, err)
-	require.Len(t, queued, 1, "the refused row is still queued")
-	require.NoError(t, b.uploadRegs.RescheduleUploadRegistrations(context.Background(), []int64{queued[0].Seq}, time.Now().Add(-time.Second)))
-
-	reg.refuse("add", false)
-	drainRegistrations(t, b)
-	added, _ = reg.snapshot()
-	require.Len(t, added, 1, "the registration lands once the service recovers")
-}
-
-// TestRefusedAddHoldsBackItsKeysRemove: an add that has not landed must not be
-// overtaken by the remove that retires it, or the root stays counted forever.
-func TestRefusedAddHoldsBackItsKeysRemove(t *testing.T) {
-	b, _ := newCountingBackend(t)
-	reg := &failingRegistrar{}
-	b.registrar = reg
-	reg.refuse("add", true)
-
-	// Two versions of one key in an unversioned bucket: the second retires the
-	// first, so the queue holds add(v1), add(v2), remove(v1).
-	putObjV(t, b, "a", []byte("first"))
-	putObjV(t, b, "a", []byte("second"))
-
-	n, err := b.SweepUploadRegistrations(context.Background())
-	require.NoError(t, err)
-	require.Zero(t, n)
-
-	_, retracted := reg.snapshot()
-	require.Empty(t, retracted,
-		"the retraction must wait behind the add it retires, not overtake it")
+	require.Len(t, added, 1, "draining applies what the write queued")
 }
 
 // bucketSpaceOf returns the space backing the test bucket.
@@ -460,235 +412,6 @@ func bucketSpaceOf(t *testing.T, b *Backend) did.DID {
 	st, err := b.reg.Get(context.Background(), "bk")
 	require.NoError(t, err)
 	return st.Space
-}
-
-// TestSweepBatchesChangesByOp: many queued changes cost one round trip per op,
-// not one per change — additions in one call, retractions in another.
-func TestSweepBatchesChangesByOp(t *testing.T) {
-	b, reg := newCountingBackend(t)
-
-	// Six writes over three keys: each key's second write supersedes its
-	// first, so the queue holds six adds and three removes.
-	for _, key := range []string{"a", "b", "c"} {
-		putObjV(t, b, key, []byte("first"))
-		putObjV(t, b, key, []byte("second"))
-	}
-
-	n, err := b.SweepUploadRegistrations(context.Background())
-	require.NoError(t, err)
-	require.Equal(t, 9, n, "six additions and three retractions")
-
-	require.Equal(t, []int{6, 3}, reg.roundTrips(),
-		"one call for the additions, then one for the retractions")
-}
-
-// TestSweepSendsEveryAdditionBeforeAnyRetraction: a container sorts its tokens
-// bytewise, so the service may run a batch in any order. Additions and
-// retractions therefore travel in separate calls, additions first, or a
-// retraction could overtake the addition it retires.
-func TestSweepSendsEveryAdditionBeforeAnyRetraction(t *testing.T) {
-	b, reg := newCountingBackend(t)
-
-	putObjV(t, b, "a", []byte("first"))
-	v1 := currentManifestCID(t, b, "a")
-	putObjV(t, b, "a", []byte("second"))
-	v2 := currentManifestCID(t, b, "a")
-
-	_, err := b.SweepUploadRegistrations(context.Background())
-	require.NoError(t, err)
-
-	added, retracted := reg.snapshot()
-	require.Equal(t, []cid.Cid{v1, v2}, added)
-	require.Equal(t, []cid.Cid{v1}, retracted)
-	require.Equal(t, []int{2, 1}, reg.roundTrips(),
-		"the retraction of v1 must not share a call with the addition of v1")
-}
-
-// TestBackedOffAdditionHoldsLaterRowsForItsKey: a change enqueued after a
-// refused one must not overtake it just because it is due and the refused one
-// is waiting out a backoff. Replaying the key out of order would send the
-// retraction of a version whose addition has not landed — a no-op that leaves
-// the root counted once the addition finally does.
-func TestBackedOffAdditionHoldsLaterRowsForItsKey(t *testing.T) {
-	b, _ := newCountingBackend(t)
-	reg := &failingRegistrar{}
-	b.registrar = reg
-	reg.refuse("add", true)
-
-	// The first version's addition is refused and backed off.
-	putObjV(t, b, "a", []byte("first"))
-	_, err := b.SweepUploadRegistrations(context.Background())
-	require.NoError(t, err)
-	added, _ := reg.snapshot()
-	require.Empty(t, added)
-
-	// A second write now queues an addition and a retraction that are due
-	// immediately, behind an addition that is not.
-	reg.refuse("add", false)
-	putObjV(t, b, "a", []byte("second"))
-
-	n, err := b.SweepUploadRegistrations(context.Background())
-	require.NoError(t, err)
-	require.Zero(t, n, "the key is held behind its backed-off addition")
-
-	added, retracted := reg.snapshot()
-	require.Empty(t, retracted,
-		"a retraction must never be claimed while an earlier change for its key is held")
-	require.Empty(t, added)
-}
-
-// countingRegStore counts the store calls a sweep makes, so a test can assert
-// the batched round trip is not undone by a database call per change.
-type countingRegStore struct {
-	registry.UploadRegistrationStore
-	deletes     int
-	reschedules int
-	refreshes   int
-}
-
-func (c *countingRegStore) RefreshUploadRegistrationProofs(ctx context.Context, seq int64, proofs []byte) error {
-	c.refreshes++
-	return c.UploadRegistrationStore.RefreshUploadRegistrationProofs(ctx, seq, proofs)
-}
-
-func (c *countingRegStore) DeleteUploadRegistrations(ctx context.Context, seqs []int64) error {
-	if len(seqs) > 0 {
-		c.deletes++
-	}
-	return c.UploadRegistrationStore.DeleteUploadRegistrations(ctx, seqs)
-}
-
-func (c *countingRegStore) RescheduleUploadRegistrations(ctx context.Context, seqs []int64, nextAt time.Time) error {
-	if len(seqs) > 0 {
-		c.reschedules++
-	}
-	return c.UploadRegistrationStore.RescheduleUploadRegistrations(ctx, seqs, nextAt)
-}
-
-// TestSweepSettlesRowsInBatches: nine landed changes cost one delete per op,
-// not one per change.
-func TestSweepSettlesRowsInBatches(t *testing.T) {
-	b, _ := newCountingBackend(t)
-	counting := &countingRegStore{UploadRegistrationStore: b.uploadRegs}
-	b.uploadRegs = counting
-
-	for _, key := range []string{"a", "b", "c"} {
-		putObjV(t, b, key, []byte("first"))
-		putObjV(t, b, key, []byte("second"))
-	}
-
-	n, err := b.SweepUploadRegistrations(context.Background())
-	require.NoError(t, err)
-	require.Equal(t, 9, n)
-
-	require.Equal(t, 2, counting.deletes,
-		"one delete for the additions that landed, one for the retractions")
-	require.Zero(t, counting.reschedules)
-}
-
-// TestSweepRescheduleGroupsByEarnedDelay: refused rows are held back in one
-// statement per distinct backoff, not one per row.
-func TestSweepRescheduleGroupsByEarnedDelay(t *testing.T) {
-	b, _ := newCountingBackend(t)
-	reg := &failingRegistrar{}
-	b.registrar = reg
-	reg.refuse("add", true)
-	counting := &countingRegStore{UploadRegistrationStore: b.uploadRegs}
-	b.uploadRegs = counting
-
-	// Three keys, all refused on their first attempt, so all have earned the
-	// same delay and settle together.
-	for _, key := range []string{"a", "b", "c"} {
-		putObjV(t, b, key, []byte("first"))
-	}
-
-	n, err := b.SweepUploadRegistrations(context.Background())
-	require.NoError(t, err)
-	require.Zero(t, n)
-
-	require.Equal(t, 1, counting.reschedules,
-		"three rows owed the same wait settle in one statement")
-	require.Zero(t, counting.deletes)
-}
-
-// sweepUntilSettled runs sweeps until nothing more lands, bringing any backoff
-// forward each time so the test does not wait out real delays.
-func sweepUntilSettled(t *testing.T, b *Backend, reg *countingRegStore) {
-	t.Helper()
-	for range uploadRegistrationDeadLetterAfter + 2 {
-		if _, err := b.SweepUploadRegistrations(context.Background()); err != nil {
-			t.Fatalf("sweep: %v", err)
-		}
-		queued, err := b.uploadRegs.ListUploadRegistrationsBySpace(context.Background(), bucketSpaceOf(t, b))
-		require.NoError(t, err)
-		var live []int64
-		for _, q := range queued {
-			if q.DeadLetteredAt == nil {
-				live = append(live, q.Seq)
-			}
-		}
-		if len(live) == 0 {
-			return
-		}
-		require.NoError(t, b.uploadRegs.RescheduleUploadRegistrations(
-			context.Background(), live, time.Now().Add(-time.Second)))
-	}
-}
-
-// TestSpentAuthorityIsDeadLetteredNotRetriedForever: hilt's delegation to the
-// gateway expires at the next UTC midnight, so a change queued late in the day
-// can outlive its own authority. Once it has and the space has none to lend,
-// the row is dead-lettered rather than retried for good.
-func TestSpentAuthorityIsDeadLetteredNotRetriedForever(t *testing.T) {
-	b, _ := newCountingBackend(t)
-	reg := &recordingRegistrar{}
-	b.registrar = reg
-	counting := &countingRegStore{UploadRegistrationStore: b.uploadRegs}
-	b.uploadRegs = counting
-
-	putObjV(t, b, "a", []byte("hello"))
-	reg.spendAuthority()
-
-	sweepUntilSettled(t, b, counting)
-
-	dead, err := b.uploadRegs.ListDeadLetteredUploadRegistrations(context.Background(), 10)
-	require.NoError(t, err)
-	require.Len(t, dead, 1, "the change is dead-lettered once its authority cannot be renewed")
-	require.Contains(t, dead[0].DeadLetterReason, "authority")
-
-	added, _ := reg.snapshot()
-	require.Empty(t, added, "nothing was ever sent")
-}
-
-// TestDeadLetteredRowDoesNotHoldBackItsKey: the dead letter exists so a change
-// that can never be made stops blocking the ones behind it. The count is short
-// by that change, not frozen at it.
-func TestDeadLetteredRowDoesNotHoldBackItsKey(t *testing.T) {
-	b, _ := newCountingBackend(t)
-	reg := &recordingRegistrar{}
-	b.registrar = reg
-	counting := &countingRegStore{UploadRegistrationStore: b.uploadRegs}
-	b.uploadRegs = counting
-
-	// The first version's change loses its authority and is dead-lettered.
-	putObjV(t, b, "a", []byte("first"))
-	reg.spendAuthority()
-	sweepUntilSettled(t, b, counting)
-	dead, err := b.uploadRegs.ListDeadLetteredUploadRegistrations(context.Background(), 10)
-	require.NoError(t, err)
-	require.Len(t, dead, 1)
-
-	// A later write to the same key must still be counted: the dead-lettered
-	// row is out of the way rather than in front of it.
-	reg.mu.Lock()
-	reg.spent = false
-	reg.mu.Unlock()
-	putObjV(t, b, "a", []byte("second"))
-	drainRegistrations(t, b)
-
-	added, _ := reg.snapshot()
-	require.Len(t, added, 1, "the later version is registered despite the dead-lettered one")
-	require.Equal(t, currentManifestCID(t, b, "a"), added[0])
 }
 
 // renewingRegistrar starts with spent authority and recovers once renew is
@@ -715,179 +438,4 @@ func (r *renewingRegistrar) PrepareAuthority(ctx context.Context, space did.DID,
 		return nil, false, err
 	}
 	return fresh, true, nil
-}
-
-// TestRenewedAuthorityRescuesAQueuedChange: a row whose stored chain has
-// expired is sent on renewed authority rather than dead-lettered, and the renewal is
-// written back so a restart does not have to repeat it.
-func TestRenewedAuthorityRescuesAQueuedChange(t *testing.T) {
-	b, _ := newCountingBackend(t)
-	reg := &renewingRegistrar{}
-	reg.spent = true
-	b.registrar = reg
-	counting := &countingRegStore{UploadRegistrationStore: b.uploadRegs}
-	b.uploadRegs = counting
-
-	putObjV(t, b, "a", []byte("hello"))
-
-	// While the space has no authority to lend, the change waits.
-	_, err := b.SweepUploadRegistrations(context.Background())
-	require.NoError(t, err)
-	added, _ := reg.snapshot()
-	require.Empty(t, added)
-	dead, err := b.uploadRegs.ListDeadLetteredUploadRegistrations(context.Background(), 10)
-	require.NoError(t, err)
-	require.Empty(t, dead, "one failure is not enough to dead-letter")
-
-	// A write to the space leaves fresh authority behind; the queued change
-	// now goes out on it.
-	reg.mu.Lock()
-	reg.spent = false
-	reg.mu.Unlock()
-	queued, err := b.uploadRegs.ListUploadRegistrationsBySpace(context.Background(), bucketSpaceOf(t, b))
-	require.NoError(t, err)
-	require.NoError(t, b.uploadRegs.RescheduleUploadRegistrations(
-		context.Background(), []int64{queued[0].Seq}, time.Now().Add(-time.Second)))
-
-	drainRegistrations(t, b)
-	added, _ = reg.snapshot()
-	require.Len(t, added, 1, "the change lands on renewed authority")
-	require.Positive(t, reg.renewals)
-	require.Positive(t, counting.refreshes, "the renewed chain is written back to the row")
-}
-
-// TestDeadLetteredChangeHoldsItsKeysLaterRowsInTheSameSweep: a key contributes
-// several rows to one batch, and stopping on one of them stops the key. A later
-// row let through because only its predecessor failed would replay the key out
-// of order.
-func TestDeadLetteredChangeHoldsItsKeysLaterRowsInTheSameSweep(t *testing.T) {
-	b, _ := newCountingBackend(t)
-	reg := &recordingRegistrar{}
-	b.registrar = reg
-
-	// Two versions of one key, so the sweep claims two additions for it at
-	// once, and a retraction behind them.
-	putObjV(t, b, "a", []byte("first"))
-	putObjV(t, b, "a", []byte("second"))
-
-	// The space loses its authority before the sweep runs, so the first
-	// addition stops and the rest of the key must stop with it.
-	reg.spendAuthority()
-	n, err := b.SweepUploadRegistrations(context.Background())
-	require.NoError(t, err)
-	require.Zero(t, n)
-
-	added, retracted := reg.snapshot()
-	require.Empty(t, added, "no row for the key goes out once one of them has stopped")
-	require.Empty(t, retracted)
-}
-
-// TestDrainSpaceRegistrationsAppliesWhatEmptyingOwed: a bucket emptied and
-// deleted inside one sweep interval still has its retractions queued. Deleting
-// it cascades them away, and nothing else would retract those roots, so the
-// drain has to apply them first or every object stays counted for good.
-func TestDrainSpaceRegistrationsAppliesWhatEmptyingOwed(t *testing.T) {
-	b, reg := newCountingBackend(t)
-
-	putObjV(t, b, "a", []byte("hello"))
-	drainRegistrations(t, b)
-	added, retracted := reg.snapshot()
-	require.Len(t, added, 1)
-	require.Empty(t, retracted)
-
-	// Empty the bucket. The retraction is queued and no sweep has run.
-	if _, err := deleteObjV(t, b, "a", ""); err != nil {
-		t.Fatalf("delete a: %v", err)
-	}
-	_, retracted = reg.snapshot()
-	require.Empty(t, retracted, "the retraction is queued, not sent")
-
-	require.NoError(t, b.DrainSpaceRegistrations(context.Background(), bucketSpaceOf(t, b)))
-
-	_, retracted = reg.snapshot()
-	require.Len(t, retracted, 1, "the drain applies what emptying the bucket owed")
-	require.Equal(t, added[0], retracted[0])
-
-	// And the queue is empty, so the cascade has nothing left to throw away.
-	queued, err := b.uploadRegs.ListUploadRegistrationsBySpace(context.Background(), bucketSpaceOf(t, b))
-	require.NoError(t, err)
-	require.Empty(t, queued)
-}
-
-// TestDrainSpaceRegistrationsFailsWhenTheServiceRefuses: the drain runs before
-// hilt removes anything, so refusing to delete is the safe answer — the bucket
-// is still whole and the retry is clean.
-func TestDrainSpaceRegistrationsFailsWhenTheServiceRefuses(t *testing.T) {
-	b, _ := newCountingBackend(t)
-	putObjV(t, b, "a", []byte("hello"))
-	if _, err := deleteObjV(t, b, "a", ""); err != nil {
-		t.Fatalf("delete a: %v", err)
-	}
-
-	reg := &failingRegistrar{}
-	reg.refuse("add", true)
-	b.registrar = reg
-
-	err := b.DrainSpaceRegistrations(context.Background(), bucketSpaceOf(t, b))
-	require.Error(t, err, "a change the upload service would not take must fail the delete")
-}
-
-// TestDrainRetriesADeadLetteredRetraction: a dead-lettered retraction can mean
-// the addition reached the upload service and the retraction never did, so the
-// root is still counted. Deleting the bucket destroys the row that says so, and
-// the teardown request carries /upload/remove in its own right, so teardown is
-// both the last chance to send it and the best one.
-func TestDrainRetriesADeadLetteredRetraction(t *testing.T) {
-	b, _ := newCountingBackend(t)
-	reg := &recordingRegistrar{}
-	b.registrar = reg
-	space := bucketSpaceOf(t, b)
-
-	// An object written and deleted: the addition lands, the retraction is
-	// queued.
-	putObjV(t, b, "a", []byte("hello"))
-	drainRegistrations(t, b)
-	if _, err := deleteObjV(t, b, "a", ""); err != nil {
-		t.Fatalf("delete a: %v", err)
-	}
-
-	// The retraction runs out of authority and is dead-lettered, leaving the
-	// root counted in the upload service.
-	reg.spendAuthority()
-	for range uploadRegistrationDeadLetterAfter + 1 {
-		if _, err := b.SweepUploadRegistrations(context.Background()); err != nil {
-			t.Fatalf("sweep: %v", err)
-		}
-		queued, err := b.uploadRegs.ListUploadRegistrationsBySpace(context.Background(), space)
-		require.NoError(t, err)
-		var live []int64
-		for _, q := range queued {
-			if !q.DeadLettered() {
-				live = append(live, q.Seq)
-			}
-		}
-		if len(live) == 0 {
-			break
-		}
-		require.NoError(t, b.uploadRegs.RescheduleUploadRegistrations(
-			context.Background(), live, time.Now().Add(-time.Second)))
-	}
-	dead, err := b.uploadRegs.ListDeadLetteredUploadRegistrations(context.Background(), 10)
-	require.NoError(t, err)
-	require.Len(t, dead, 1, "the retraction is dead-lettered")
-	_, retracted := reg.snapshot()
-	require.Empty(t, retracted)
-
-	// Teardown, with the authority the delete request carries.
-	reg.mu.Lock()
-	reg.spent = false
-	reg.mu.Unlock()
-	require.NoError(t, b.DrainSpaceRegistrations(context.Background(), space))
-
-	_, retracted = reg.snapshot()
-	require.Len(t, retracted, 1, "the dead-lettered retraction is sent at teardown, not skipped")
-
-	left, err := b.uploadRegs.ListUploadRegistrationsBySpace(context.Background(), space)
-	require.NoError(t, err)
-	require.Empty(t, left, "and its row goes, because the change actually landed")
 }

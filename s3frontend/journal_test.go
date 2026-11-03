@@ -74,7 +74,6 @@ func newJournalingBackend(t *testing.T) (*Backend, *inmem.MemStore, *logstore.St
 		Deferred:        inmem.NopUploader{},
 		Remover:         &recordingRemover{},
 		Registrar:       &recordingRegistrar{},
-		UploadRegs:      mem,
 		EncParams:       mem,
 		RegionKeys:      testRegionKeys(t),
 		TenantKeys:      testTenantKeys(),

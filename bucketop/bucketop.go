@@ -243,8 +243,8 @@ type Tx struct {
 	staging *blockstore.OpStaging
 	cst     cbor.IpldStore
 
-	// commit is what the root swap carries besides the root: the
-	// upload-registration outbox rows this commit owes and the reference
+	// commit is what the root swap carries besides the root: the upload
+	// registrations this commit queues and the reference
 	// index rows of the versions it publishes and discards. They are
 	// written in the same transaction as the root CAS, so none can describe
 	// a version that did not commit, nor miss one that did.

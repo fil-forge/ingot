@@ -175,7 +175,6 @@ func newInmemServer(t *testing.T, cfg config.ServerConfig, opts ...func(*ServerD
 		Remover:         inmem.NopUploader{},
 		Registrar:       inmem.NopUploader{},
 		Registry:        mem,
-		UploadRegs:      mem,
 		Intents:         mem,
 		Locations:       mem,
 		Inclusions:      mem,

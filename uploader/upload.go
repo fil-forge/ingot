@@ -24,11 +24,11 @@ import (
 // versions keeps counting them. Delete markers are versions too and count the
 // same way, which is what AWS reports.
 //
-// The calls are made by the registration sweeper, off the request path, from
-// rows the write path queued. Each row carries its own authority — captured
-// with CaptureAuthority while the request that committed the version was still
-// in hand — because the sweeper has no request to borrow from and may be
-// draining a space that will never be written again.
+// The calls are made by the queue-space-upload tasks, off the request path,
+// from changes the write path queued. Each change carries its own authority —
+// captured with CaptureAuthority while the request that committed the version
+// was still in hand — because the task has no request to borrow from and may
+// be sending for a space that will never be written again.
 type UploadRegistrar interface {
 	// CaptureAuthority encodes the delegation chain authorizing cmd on space
 	// into the container a queued registration carries.
