@@ -34,18 +34,22 @@ func (e *yieldError) Error() string { return fmt.Sprintf("left task %s to its wa
 // drain runs the subject's due tasks under h, oldest first, up to the task
 // with seq upTo. It stops early after running target, and before a sync task
 // other than target whose caller is waiting, which it leaves to the caller.
+//
+// A batch counts each of its tasks toward DrainLimit, and is cut short to fit
+// within it.
 func (r *Runner) drain(ctx context.Context, q *queue, h *hold, upTo int64, target TaskID) drained {
-	for n := 0; n < r.opts.DrainLimit; n++ {
+	for n := 0; n < r.opts.DrainLimit; {
 		if h.lost.Load() {
 			return drained{stop: errLeaseLost}
 		}
-		tasks, err := r.claim(ctx, q, h.subject, upTo, target)
+		tasks, err := r.claim(ctx, q, h.subject, upTo, target, r.opts.DrainLimit-n)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return drained{}
 		}
 		if err != nil {
 			return drained{stop: err}
 		}
+		n += len(tasks)
 		res, terr, stop := r.runRoot(ctx, h, tasks)
 		if stop != nil {
 			return drained{stop: stop}

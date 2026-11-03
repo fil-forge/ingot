@@ -288,8 +288,9 @@ func (r *Runner) Handle(queueName, name string, h Handler, opts ...HandleOption)
 // HandleBatch registers a batching handler for an action of a queue. One run
 // takes the subject's oldest due task and the due tasks straight after it
 // with the same action, up to limit, stopping at the first with a different
-// action so the subject's order holds. Only async tasks batch: the action
-// cannot be run sync.
+// action so the subject's order holds. A task already past its Expires is
+// recorded as expired and left out of the batch. Only async tasks batch: the
+// action cannot be run sync.
 func (r *Runner) HandleBatch(queueName, name string, limit int, h BatchHandler, opts ...HandleOption) error {
 	if limit < 1 {
 		return fmt.Errorf("task runner: %s.%s: batch limit %d", queueName, name, limit)
