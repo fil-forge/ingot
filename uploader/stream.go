@@ -73,7 +73,7 @@ func (u *Forge) StartBlob(ctx context.Context, space did.DID, size int64) (Strea
 	if !ok {
 		return StreamedBlob{}, fmt.Errorf("uploader: no request-scoped proof store for space %s (IAM layer did not attach one)", space)
 	}
-	u.captureShipProofs(space, store)
+	u.captureShipProofs(ctx, space)
 
 	add, err := u.client.BlobAddByDigestCode(ctx, space, uint64(size), forgeclient.WithProofStore(store))
 	if err != nil {

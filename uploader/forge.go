@@ -13,6 +13,7 @@ import (
 	blobcmds "github.com/fil-forge/libforge/commands/blob"
 	ucanlib "github.com/fil-forge/libforge/ucan"
 	"github.com/fil-forge/ucantone/did"
+	"github.com/fil-forge/ucantone/ucan"
 	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multicodec"
 	"github.com/multiformats/go-multihash"
@@ -42,8 +43,9 @@ type Uploader interface {
 	// deleting the bucket later must release both. Nil when nothing shipped.
 	SubmitShard(ctx context.Context, plane blockstore.Plane, space did.DID, shard CARShard) (BlobLocation, multihash.Multihash, error)
 	// CaptureShipAuthority records the request's proof store on ctx, if it
-	// carries one, as the authority SubmitShard ships space's segments with.
-	// SubmitShard runs outside any request, so every write that appends
+	// carries one that background work may borrow and that holds a /blob/add
+	// chain for space, as the authority SubmitShard ships space's segments
+	// with. SubmitShard runs outside any request, so every write that appends
 	// catalog blocks hands it its request, not only a write that uploads a
 	// body.
 	CaptureShipAuthority(ctx context.Context, space did.DID)
@@ -77,16 +79,18 @@ type Forge struct {
 	putClient *nethttp.Client
 	logger    *zap.Logger
 
-	// shipProofs caches, per space, the proof store of the most recent body
-	// upload to that space (UploadBlob, StartBlob). Work that runs outside
-	// any request falls back to it: the release sweeper's /blob/remove, the
-	// session-expiry aborts, registration renewals, and the catalog segment
-	// ship (SubmitShard) when commitProofs can't serve it. An upload's grant
-	// covers all of their commands.
+	// shipProofs caches, per space, the most recent borrowable proof store
+	// seen on an in-request body upload to that space (UploadBlob,
+	// StartBlob). Work that runs outside any request falls back to it: the
+	// release sweeper's /blob/remove, the session-expiry aborts,
+	// registration renewals, and the catalog segment ship (SubmitShard) when
+	// commitProofs can't serve it. An upload's grant covers all of their
+	// commands.
 	shipProofs *gocache.Cache
 
 	// commitProofs caches, per space, the proof store of the most recent
-	// write that committed catalog blocks to it (CaptureShipAuthority). Hilt
+	// write that committed catalog blocks to it (CaptureShipAuthority), if
+	// that store was borrowable and held a /blob/add chain for the space. Hilt
 	// grants each catalog-changing operation the ship's commands, but not
 	// necessarily the release, abort and registration commands shipProofs
 	// serves (a tagging-only key's grant has none of them), so SubmitShard
@@ -98,6 +102,10 @@ type Forge struct {
 // longer than the seal→ship latency (seconds) and flush-retry window, so a
 // segment sealed just after a write still finds its space's store.
 const shipProofsTTL = time.Hour
+
+// noCapturedAuthority says why shipProofStore found nothing outside a
+// request, for the errors of the calls that need it.
+const noCapturedAuthority = "no body upload has left a borrowable store within the last hour"
 
 // ForgeConfig wires a Forge uploader.
 //
@@ -131,22 +139,28 @@ func NewForge(cfg ForgeConfig) (*Forge, error) {
 	}, nil
 }
 
-// captureShipProofs records store as the ship authority for space (called on
-// in-request writes). Nil store is ignored.
-func (u *Forge) captureShipProofs(space did.DID, store ucanlib.ProofStore) {
-	if store == nil {
+// captureShipProofs records the proof store of ctx's request as the ship
+// authority for space (called on in-request writes), if background work may
+// borrow it (reqscope.BorrowableProofStore): the access key's own store,
+// whose chains skip any delegation revoked since it was captured. A write
+// authorized by a store only it may use, one holding a delegation known
+// revoked, leaves the space's earlier capture in place.
+func (u *Forge) captureShipProofs(ctx context.Context, space did.DID) {
+	store, ok := reqscope.BorrowableProofStore(ctx)
+	if !ok {
 		return
 	}
 	u.shipProofs.Set(space.String(), store, gocache.DefaultExpiration)
 }
 
 // CaptureShipAuthority records the request's proof store as space's ship
-// authority (Uploader), in commitProofs. A ctx without one, such as a
-// background commit's, leaves the capture as it was, and so does a store
-// that can't ship, so a key with no /blob/add chain never displaces one that
-// has it.
+// authority (Uploader), in commitProofs, if background work may borrow it
+// (reqscope.BorrowableProofStore), as captureShipProofs does. A ctx without
+// one, such as a background commit's, leaves the capture as it was, and so
+// does a store that can't ship, so a key with no /blob/add chain never
+// displaces one that has it.
 func (u *Forge) CaptureShipAuthority(ctx context.Context, space did.DID) {
-	if store, ok := reqscope.ProofStore(ctx); ok && u.canShip(ctx, store, space) {
+	if store, ok := reqscope.BorrowableProofStore(ctx); ok && u.canShip(ctx, store, space) {
 		u.commitProofs.Set(space.String(), store, gocache.DefaultExpiration)
 	}
 }
@@ -188,6 +202,37 @@ func (u *Forge) shipProofStore(ctx context.Context, space did.DID) (ucanlib.Proo
 	return nil, false
 }
 
+// authorityFor resolves the proof store authorizing cmd on space, as
+// shipProofStore does, and the chain it holds for cmd. A captured store can
+// outlive its chains: they expire, or a revocation names one of their hops.
+// An invocation sent without a chain goes out proofless, and the service
+// refuses it with an error that says nothing about why, so this fails first,
+// naming the command and the space.
+func (u *Forge) authorityFor(ctx context.Context, space did.DID, cmd ucan.Command) (ucanlib.ProofStore, []ucan.Delegation, error) {
+	store, ok := u.shipProofStore(ctx, space)
+	if !ok {
+		return nil, nil, fmt.Errorf("uploader: no proof store for space %s (no request scope; %s)", space, noCapturedAuthority)
+	}
+	proofs, err := u.chainFor(ctx, store, space, cmd)
+	if err != nil {
+		return nil, nil, err
+	}
+	return store, proofs, nil
+}
+
+// chainFor returns the chain store holds authorizing the agent to cmd on
+// space, and fails when it holds none.
+func (u *Forge) chainFor(ctx context.Context, store ucanlib.ProofStore, space did.DID, cmd ucan.Command) ([]ucan.Delegation, error) {
+	proofs, _, err := store.ProofChain(ctx, u.client.Issuer().DID(), cmd, space)
+	if err != nil {
+		return nil, fmt.Errorf("uploader: building %s proof chain: %w", cmd, err)
+	}
+	if len(proofs) == 0 {
+		return nil, fmt.Errorf("uploader: no %s authority for space %s (the proof store holds no unexpired, unrevoked chain for it)", cmd, space)
+	}
+	return proofs, nil
+}
+
 func (u *Forge) SubmitShard(ctx context.Context, plane blockstore.Plane, space did.DID, shard CARShard) (BlobLocation, multihash.Multihash, error) {
 	if shard.Size <= 0 || len(shard.Positions) == 0 {
 		return BlobLocation{}, nil, nil
@@ -200,6 +245,13 @@ func (u *Forge) SubmitShard(ctx context.Context, plane blockstore.Plane, space d
 	store, ok := u.catalogShipStore(ctx, space)
 	if !ok {
 		return BlobLocation{}, nil, fmt.Errorf("uploader: no ship authority for space %s (no captured proof store holds a /blob/add chain)", space)
+	}
+	// The request's own store and shipProofStore's capture aren't probed
+	// above, and a captured store can outlive its chains (see authorityFor):
+	// whichever was chosen, fail here, naming the space, rather than ship
+	// proofless.
+	if _, err := u.chainFor(ctx, store, space, blobcmds.Add.Command); err != nil {
+		return BlobLocation{}, nil, err
 	}
 
 	// The index blob's bytes and digest are deterministic from the shard, so
