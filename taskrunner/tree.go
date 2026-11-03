@@ -422,7 +422,7 @@ func (r *Runner) runRoot(ctx context.Context, h *hold, tasks []Task) (res []byte
 				return nil, nil, die
 			}
 			if errors.Is(herr, errLeaseLost) {
-				r.log.Warn("task's lease was taken over before a child could start", zapTask(t))
+				r.log.Warn("task's lease was taken over before a child could start", zapTask(first))
 				return nil, nil, errLeaseLost
 			}
 			if ctx.Err() != nil {
