@@ -65,7 +65,7 @@ func newMetrics(mp metric.MeterProvider) (*metrics, error) {
 		return nil, err
 	}
 	if m.delayed, err = meter.Int64ObservableGauge("taskrunner.queue.delayed", metric.WithUnit("{task}"),
-		metric.WithDescription("Pending tasks waiting on their NotBefore")); err != nil {
+		metric.WithDescription("Pending tasks waiting on their NotBefore, or on a retry that holds their subject")); err != nil {
 		return nil, err
 	}
 	if m.oldest, err = meter.Float64ObservableGauge("taskrunner.queue.oldest_ready_age", metric.WithUnit("s"),
@@ -131,12 +131,19 @@ func (r *Runner) startCollecting() error {
 			o.ObserveInt64(m.busy, int64(busy), qa)
 			o.ObserveInt64(m.workers, int64(q.workers), qa)
 
+			// A task is due once both its NotBefore and any retry that holds
+			// its subject have passed, and has been due since the later of
+			// the two (greatest skips the NULLs).
 			rows, err := r.db.Query(ctx, `SELECT action,
-				count(*) FILTER (WHERE not_before IS NULL OR not_before <= now()),
-				count(*) FILTER (WHERE not_before > now()),
-				coalesce(extract(epoch FROM now() - min(greatest(created, coalesce(not_before, created)))
-					FILTER (WHERE not_before IS NULL OR not_before <= now())), 0)::float8
-				FROM `+q.tasks+` WHERE state = 'pending' GROUP BY action`)
+				count(*) FILTER (WHERE due),
+				count(*) FILTER (WHERE NOT due),
+				coalesce(extract(epoch FROM now() - min(greatest(created, not_before, retry_at))
+					FILTER (WHERE due)), 0)::float8
+				FROM (
+					SELECT action, created, not_before, retry_at,
+						coalesce(not_before <= now(), true) AND coalesce(retry_at <= now(), true) AS due
+					FROM `+q.tasks+` WHERE state = 'pending'
+				) p GROUP BY action`)
 			if err != nil {
 				return err
 			}
