@@ -32,6 +32,7 @@ import (
 	ucanerrors "github.com/fil-forge/ucantone/errors"
 	"github.com/fil-forge/ucantone/multikey/ed25519"
 	"github.com/fil-forge/ucantone/ucan"
+	"github.com/fil-forge/ucantone/ucan/container"
 	"github.com/fil-forge/ucantone/ucan/delegation"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel"
@@ -916,4 +917,102 @@ func TestFastPathTenant(t *testing.T) {
 		require.Equal(t, 1, s.authorizer.(*refusingAuthorizer).calls)
 		require.Equal(t, "hilt", authPath(t, rec))
 	})
+}
+
+// A chain to the agent the tenant issued, as Hilt's cleanup delegations are,
+// never authorizes a request locally: it skips the access key and outlives it.
+func TestAuthorizeLocalRequiresTheKeysChain(t *testing.T) {
+	accessKey, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	spaceIssuer, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	agent, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	tenant, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+
+	accessKeyID := accessKey.DID().Identifier()
+	const secret = "test-secret-access-key"
+	space := spaceIssuer.DID()
+	resolver := fixedResolver{name: "bkt", state: &registry.State{Name: "bkt", Space: space}}
+	req := signedGet(t, "s3.example", "/bkt/obj", accessKeyID, secret, time.Now())
+	sr, err := sigv4.Parse(sigv4.Request{Method: req.Method, Headers: req.Headers, URL: req.URL})
+	require.NoError(t, err)
+	key, err := sigv4.DeriveKey(sr, secret)
+	require.NoError(t, err)
+
+	root, err := contentcmds.Retrieve.Delegate(spaceIssuer, tenant.DID(), space, delegation.WithNoExpiration())
+	require.NoError(t, err)
+	tenantLeaf, err := contentcmds.Retrieve.Delegate(tenant, agent.DID(), space, delegation.WithExpiration(ucan.Now()+8*86400))
+	require.NoError(t, err)
+
+	s := localService(agent.DID(), resolver)
+	s.keys.Put(accessKeyID, time.Hour, s3.VerificationKey{Kind: s3.KeyKindSigV4, Data: key})
+	s.proofs.For(accessKey.DID()).PutPermissions(space, time.Hour, []string{"s3:GetObject"})
+	s.proofs.Deposit(accessKey.DID(), root, tenantLeaf)
+
+	_, ok, err := s.authorizeLocal(context.Background(), req, accessKeyID, s.proofs.For(accessKey.DID()))
+	require.NoError(t, err)
+	require.False(t, ok, "a chain the access key did not issue must not authorize locally")
+
+	// With the key's own chain cached beside it, the request is authorized
+	// locally again.
+	mid, err := contentcmds.Retrieve.Delegate(tenant, accessKey.DID(), space, delegation.WithNoExpiration())
+	require.NoError(t, err)
+	keyLeaf, err := contentcmds.Retrieve.Delegate(accessKey, agent.DID(), space, delegation.WithExpiration(ucan.Now()+3600))
+	require.NoError(t, err)
+	s.proofs.Deposit(accessKey.DID(), mid, keyLeaf)
+	_, ok, err = s.authorizeLocal(context.Background(), req, accessKeyID, s.proofs.For(accessKey.DID()))
+	require.NoError(t, err)
+	require.True(t, ok, "the key's chain authorizes locally even beside a longer-lived tenant one")
+}
+
+// recordingAuthorizer answers BucketInfo with the given container and counts
+// the calls.
+type recordingAuthorizer struct {
+	refusingAuthorizer
+	info  ucan.Container
+	asked int
+}
+
+func (a *recordingAuthorizer) BucketInfo(context.Context, string, did.DID, ...hiltclient.MethodOption) (*s3bkt.InfoOK, ucan.Container, error) {
+	a.asked++
+	return &s3bkt.InfoOK{}, a.info, nil
+}
+
+// A response whose tenant-issued chains are complete must still fetch the
+// links the access key's own chains lack, which the fast path needs.
+func TestCacheProofsFetchesTheKeysChainBesideACompleteTenantOne(t *testing.T) {
+	accessKey, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	spaceIssuer, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	agent, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	tenant, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	space := spaceIssuer.DID()
+
+	root, err := contentcmds.Retrieve.Delegate(spaceIssuer, tenant.DID(), space, delegation.WithNoExpiration())
+	require.NoError(t, err)
+	mid, err := contentcmds.Retrieve.Delegate(tenant, accessKey.DID(), space, delegation.WithNoExpiration())
+	require.NoError(t, err)
+	keyLeaf, err := contentcmds.Retrieve.Delegate(accessKey, agent.DID(), space, delegation.WithExpiration(ucan.Now()+3600))
+	require.NoError(t, err)
+	tenantLeaf, err := contentcmds.Retrieve.Delegate(tenant, agent.DID(), space, delegation.WithExpiration(ucan.Now()+8*86400))
+	require.NoError(t, err)
+
+	// The authorize response: the key's leaf, and the tenant's leaf with the
+	// root it chains through. The tenant-to-key link comes from bucket info.
+	authz := &recordingAuthorizer{info: container.New(container.WithDelegations(root, mid))}
+	s := New(authz, NewKeyProofs(), NewVerificationKeyCache(), NewTenantCache())
+	store := s.proofs.For(accessKey.DID())
+	resp := container.New(container.WithDelegations(keyLeaf, tenantLeaf, root))
+	req := s3.Request{Method: "GET", URL: "/bkt/obj"}
+
+	require.True(t, s.cacheProofs(context.Background(), store, resp, req, accessKey.DID()))
+	require.Equal(t, 1, authz.asked, "the key's chain was incomplete, so bucket info must be fetched")
+	chain, _, err := store.ProofChainVia(context.Background(), agent.DID(), contentcmds.Retrieve.Command, space, accessKey.DID())
+	require.NoError(t, err)
+	require.Len(t, chain, 3, "the key's own chain is complete once bucket info is cached")
 }
