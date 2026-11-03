@@ -14,7 +14,9 @@ import (
 
 // BatchHandler runs a batch of tasks with the same subject and action, oldest
 // first. It returns one result per task, and the batch commits or fails
-// together.
+// together. Expiry is decided per task, before the batch runs: a task already
+// past its Expires is recorded as expired and left out, so the handler only
+// sees tasks that may still start.
 type BatchHandler func(ctx context.Context, ex *Exec, tasks []Task) ([][]byte, error)
 
 // RetryPolicy says when an async task whose handler returned an error runs
@@ -161,9 +163,10 @@ func scanTask(row pgx.Row, t *Task) error {
 
 // claim marks the subject's next due task started and returns it. When its
 // action batches, the due tasks straight after it with the same action join
-// it, up to the action's limit. A next task other than target whose Run
-// caller is waiting is left unclaimed, for its caller, with a *yieldError.
-func (r *Runner) claim(ctx context.Context, q *queue, subject string, upTo int64, target TaskID) ([]Task, error) {
+// it, up to the action's limit or max, whichever is smaller. A next task other
+// than target whose Run caller is waiting is left unclaimed, for its caller,
+// with a *yieldError.
+func (r *Runner) claim(ctx context.Context, q *queue, subject string, upTo int64, target TaskID, max int) ([]Task, error) {
 	var next TaskID
 	var waited, backingOff bool
 	if err := r.db.QueryRow(ctx, `SELECT id, coalesce(waiting_until > now(), false),
@@ -189,14 +192,18 @@ func (r *Runner) claim(ctx context.Context, q *queue, subject string, upTo int64
 	}
 	tasks := []Task{first}
 	a, ok := r.handler(actionKey{q.name, first.Action})
-	if !ok || a.batch == nil || first.sync || a.limit < 2 {
+	limit := 0
+	if ok && a.batch != nil {
+		limit = min(a.limit, max)
+	}
+	if limit < 2 || first.sync {
 		return tasks, nil
 	}
 
 	rows, err := r.db.Query(ctx, `SELECT id, action, sync OR coalesce(retry_at > now(), false) FROM `+q.tasks+`
 		WHERE subject = $1 AND state = 'pending' AND seq > $2 AND seq <= $3
 		AND (not_before IS NULL OR not_before <= now())
-		ORDER BY seq LIMIT $4`, subject, first.seq, upTo, a.limit-1)
+		ORDER BY seq LIMIT $4`, subject, first.seq, upTo, limit-1)
 	if err != nil {
 		return nil, err
 	}

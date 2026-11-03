@@ -436,3 +436,76 @@ CREATE TRIGGER refuse_b BEFORE UPDATE OF state ON `+tasks+` FOR EACH ROW
 		}
 	}
 }
+
+func TestBatchLeavesOutAnExpiredTask_Live(t *testing.T) {
+	f := newFixture(t, 1)
+	var mu sync.Mutex
+	var seen [][]string
+	if err := f.r.HandleBatch(qTop, "register", 5, func(ctx context.Context, ex *taskrunner.Exec, tasks []taskrunner.Task) ([][]byte, error) {
+		var args []string
+		for _, task := range tasks {
+			args = append(args, string(task.Args))
+		}
+		mu.Lock()
+		seen = append(seen, args)
+		mu.Unlock()
+		return make([][]byte, len(tasks)), nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	f.migrate(t)
+	ctx := waitCtx(t)
+	expired, err := f.r.Submit(ctx, taskrunner.Spec{Queue: qTop, Subject: "space", Action: "register", Args: []byte("expired"), Expires: at(-time.Second)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	live, err := f.r.Submit(ctx, taskrunner.Spec{Queue: qTop, Subject: "space", Action: "register", Args: []byte("live")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.start(t)
+	if _, err := f.r.Wait(ctx, qTop, live); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.r.Wait(ctx, qTop, expired); !errors.Is(err, taskrunner.ErrExpired) {
+		t.Errorf("expired task: Wait error %v, want ErrExpired", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !slices.EqualFunc(seen, [][]string{{"live"}}, slices.Equal) {
+		t.Errorf("handler saw %v, want only the live task", seen)
+	}
+}
+
+func TestDrainLimitCountsBatchedTasks_Live(t *testing.T) {
+	f := newFixture(t, 1, func(o *taskrunner.Options) { o.DrainLimit = 2 })
+	var mu sync.Mutex
+	var sizes []int
+	if err := f.r.HandleBatch(qTop, "register", 5, func(ctx context.Context, ex *taskrunner.Exec, tasks []taskrunner.Task) ([][]byte, error) {
+		mu.Lock()
+		sizes = append(sizes, len(tasks))
+		mu.Unlock()
+		return make([][]byte, len(tasks)), nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	f.migrate(t)
+	ctx := waitCtx(t)
+	var last taskrunner.TaskID
+	for range 5 {
+		id, err := f.r.Submit(ctx, taskrunner.Spec{Queue: qTop, Subject: "space", Action: "register"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		last = id
+	}
+	f.start(t)
+	if _, err := f.r.Wait(ctx, qTop, last); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !slices.Equal(sizes, []int{2, 2, 1}) {
+		t.Errorf("batch sizes %v, want [2 2 1]: no more than DrainLimit tasks per lease", sizes)
+	}
+}
