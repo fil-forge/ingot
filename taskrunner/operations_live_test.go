@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
@@ -331,5 +332,39 @@ func TestTaskWaitingOnAHoldingRetryCountsAsDelayed_Live(t *testing.T) {
 	}
 	if v, _ := gaugeValue[float64](t, got["taskrunner.queue.oldest_ready_age"], aa...); v != 0 {
 		t.Errorf("oldest_ready_age = %v, want 0", v)
+	}
+}
+
+func TestEmptyNodeNamesAreRefused_Live(t *testing.T) {
+	f := newFixture(t, 0)
+	f.handle(t, qTop, "put", f.put())
+	f.start(t)
+	ctx := waitCtx(t)
+	spec := taskrunner.Spec{Queue: qTop, Subject: "a", Action: "put", Args: []byte("1"), Node: node("")}
+	if _, err := f.r.Submit(ctx, spec); err == nil {
+		t.Error("Submit accepted an empty node name")
+	}
+	if _, err := f.r.Run(ctx, spec); err == nil {
+		t.Error("Run accepted an empty node name")
+	}
+}
+
+func TestMetricsReachTheGlobalProviderByDefault_Live(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	prev := otel.GetMeterProvider()
+	otel.SetMeterProvider(mp)
+	t.Cleanup(func() {
+		otel.SetMeterProvider(prev)
+		_ = mp.Shutdown(context.Background())
+	})
+	f := newFixture(t, 0)
+	f.handle(t, qTop, "put", f.put())
+	f.start(t)
+	if _, err := f.r.Run(waitCtx(t), taskrunner.Spec{Queue: qTop, Subject: "a", Action: "put", Args: []byte("1")}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := collect(t, reader)["taskrunner.task.duration"]; !ok {
+		t.Error("a runner given no meter provider reported nothing to the global one")
 	}
 }

@@ -137,8 +137,8 @@ type Options struct {
 	// Logger receives task failures and background errors. Defaults to a
 	// no-op logger.
 	Logger *zap.Logger
-	// MeterProvider receives the runner's metrics. Defaults to a no-op
-	// provider.
+	// MeterProvider receives the runner's metrics. Defaults to the global
+	// OpenTelemetry provider, which is a no-op until one is installed.
 	MeterProvider metric.MeterProvider
 }
 
@@ -466,6 +466,11 @@ func (r *Runner) checkSpec(s Spec) (*queue, error) {
 	}
 	if s.Replace && s.NotBefore == nil {
 		return nil, fmt.Errorf("task runner: %s.%s: a replacement needs a NotBefore", s.Queue, s.Action)
+	}
+	// An empty node would match every runner left unnamed, and none once
+	// they are all named.
+	if s.Node != nil && *s.Node == "" {
+		return nil, fmt.Errorf("task runner: %s.%s: empty node name", s.Queue, s.Action)
 	}
 	return q, nil
 }

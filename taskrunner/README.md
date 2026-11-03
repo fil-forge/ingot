@@ -291,7 +291,7 @@ Pass a `MeterProvider` and the runner reports through OpenTelemetry, labelled by
 r, err := taskrunner.New(pool, taskrunner.Options{Schema: "ingot", Queues: queues, MeterProvider: otel.GetMeterProvider()})
 ```
 
-The queue gauges are read from Postgres each time the exporter collects. Without a provider every instrument is a no-op.
+The queue gauges are read from Postgres each time the exporter collects. Without a provider the runner reports to the global OpenTelemetry provider, which is a no-op until one is installed.
 
 ## Testing handlers
 
