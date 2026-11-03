@@ -280,7 +280,7 @@ Pass a `MeterProvider` and the runner reports through OpenTelemetry, labelled by
 | Metric | What it shows |
 |---|---|
 | `taskrunner.queue.ready` | Pending tasks that are due |
-| `taskrunner.queue.delayed` | Pending tasks waiting on their `NotBefore` |
+| `taskrunner.queue.delayed` | Pending tasks waiting on their `NotBefore`, or on a retry that holds their subject |
 | `taskrunner.queue.oldest_ready_age` | How long the oldest due task has been due. Growth means the workers are not keeping up, or a subject is stuck |
 | `taskrunner.task.duration` | Time from start to outcome, labelled `succeeded`, `failed`, `retried` or `expired` |
 | `taskrunner.lease.wait` | Time a sync task or child waited for its subject's lease |

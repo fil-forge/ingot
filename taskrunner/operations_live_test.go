@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -298,5 +299,37 @@ func TestSyncChildOutcomesAreRecorded_Live(t *testing.T) {
 	}
 	if counts["succeeded"] != 1 || counts["failed"] != 1 {
 		t.Errorf("child outcomes %v, want succeeded 1 and failed 1", counts)
+	}
+}
+
+func TestTaskWaitingOnAHoldingRetryCountsAsDelayed_Live(t *testing.T) {
+	f, reader := metricsFixture(t, 1)
+	var runs atomic.Int32
+	if err := f.r.Handle(qTop, "add", func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) {
+		runs.Add(1)
+		return nil, errors.New("unavailable")
+	}, taskrunner.WithRetry(taskrunner.RetryPolicy{First: time.Hour, HoldsSubject: true})); err != nil {
+		t.Fatal(err)
+	}
+	f.start(t)
+	ctx := waitCtx(t)
+	if _, err := f.r.Submit(ctx, taskrunner.Spec{Queue: qTop, Subject: "space", Action: "add"}); err != nil {
+		t.Fatal(err)
+	}
+	for runs.Load() == 0 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	got := collect(t, reader)
+	aa := []attribute.KeyValue{attribute.String("queue", qTop), attribute.String("action", "add")}
+	if v, _ := gaugeValue[int64](t, got["taskrunner.queue.ready"], aa...); v != 0 {
+		t.Errorf("ready = %d, want 0: the task waits on its retry", v)
+	}
+	if v, _ := gaugeValue[int64](t, got["taskrunner.queue.delayed"], aa...); v != 1 {
+		t.Errorf("delayed = %d, want 1", v)
+	}
+	if v, _ := gaugeValue[float64](t, got["taskrunner.queue.oldest_ready_age"], aa...); v != 0 {
+		t.Errorf("oldest_ready_age = %v, want 0", v)
 	}
 }
