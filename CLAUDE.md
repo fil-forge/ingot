@@ -131,7 +131,9 @@ Internal:
 - **`iam/`** — the hilt IAM integration over `fil-forge/hilt/pkg/client`:
   versitygw `IAMService`/`RequestIAMService` authorizing each request via
   `/s3/request/authorize` (derived SigV4 key, with a local fast
-  path over cached delegations), plus `KeyProofs`/`DelegationCache` — per-
+  path over cached delegations, which accepts only chains ending in a
+  delegation the access key issued: Hilt's tenant-issued cleanup delegations
+  outlive the key and must not authorize requests), plus `KeyProofs`/`DelegationCache` — per-
   access-key TTL caches of hilt-issued delegations that the uploader and the
   network read tier consume via `internal/reqscope`. `KeyProofs` also
   remembers every revoked CID for 48h past its last sighting; a response
