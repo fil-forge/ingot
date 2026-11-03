@@ -115,6 +115,7 @@ ingot blake3 hash --bao --chunk-log 4 < file  # an outboard at iroh's 16 KiB blo
 ingot blake3 verify <cid> < file              # whole-object check against an x-cid
 ingot blake3 range --outboard "$OUTBOARD" --chunk-log 12 5000-200000   # aligned Range to fetch
 ingot blake3 verify --outboard "$OUTBOARD" --chunk-log 12 --offset 0 <cid> < part  # ranged check
+ingot catalog usage                           # each bucket's catalog bytes: on Forge, dead on arrival, live (JSON; benchmarks)
 ```
 
 `blake3 range` and the ranged `verify` take the `Blake3` attribute of
@@ -294,6 +295,22 @@ segment row in Postgres.
 
 Blocks that die after their segment ships are not measured: that would take a
 walk of the bucket's live catalog, most of which is only on Forge.
+
+A test stack can measure them. `ingot catalog usage` prints, as JSON, each
+bucket's figures above beside its local segment files and the live bytes its
+root reaches. The walk reads a block no local segment holds, such as one of a
+retired segment, with the rest of its segment from Forge, authorized by an
+access key the command takes from `AWS_ACCESS_KEY_ID` and
+`AWS_SECRET_ACCESS_KEY`. Without one such blocks count as missing, and so do
+those of a bucket the key may not list. Dead after shipping is then roughly
+what's left: CAR headers count only in the bytes on Forge, blocks of segments
+not yet shipped count as live, an unmeasured segment's dead-on-arrival bytes
+count as dead after shipping, and a block can count both as live and as dead
+on arrival in an older segment.
+The walk holds every segment it reads in memory, so it is for benchmark runs,
+not production nodes. A production node could not run it anyway: it holds no
+tenant's secret, and its authority over a bucket arrives only with that
+tenant's signed requests.
 
 `forge_bytes` undercounts a bucket whose segments retired before retired rows
 were kept (migration `00033`): those rows were deleted, so their CARs, still on

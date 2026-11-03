@@ -124,7 +124,7 @@ flowchart TB
 
     subgraph host["host"]
         root["ingot (root)<br/>Server, Module"]
-        cmd["cmd<br/>serve, whoami, version, blake3"]
+        cmd["cmd<br/>serve, whoami, version, blake3, catalog"]
     end
 
     vgw -->|"backend.Backend"| s3f
@@ -146,6 +146,11 @@ flowchart TB
     iam --> reg
     reg --> mig
     cmd --> root
+    cmd -->|"catalog usage"| ls
+    cmd --> reg
+    cmd --> iam
+    cmd --> bs
+    cmd --> cars
     root --> vgw
     root -->|"BlockReader =<br/>Cached(Forge)"| bs
 ```
@@ -158,6 +163,8 @@ flowchart TB
 - `inmem` (test-only fakes) and `tokenstore` (empty; only the dormant login
   paths would read it) are omitted. `blockstore/locator`'s indexer-backed
   locator compiles but is never injected.
+- `cmd`'s `catalog usage` builds its own logstore walk, registry, Hilt
+  authorization and Forge reader rather than going through the server.
 - `iam` and the network tiers never import each other; they meet at
   `internal/reqscope` (the request-scoped proof store, drawn in
   [principals](#principals-and-proof-stores)).
@@ -909,17 +916,20 @@ flowchart TB
     end
 
     hilt["hilt did:web:hilt"] -->|"/s3/request/authorize and<br/>/s3/bucket/info responses"| kp
+    hilt -->|"the same, for a listing the<br/>command signs with an access key"| walk
 
     subgraph stores["proof stores"]
         kp["iam.KeyProofs: one DelegationCache<br/>per access key, 24h idle eviction;<br/>also the key's effective S3 action set per bucket"]
         ship["uploader.Forge shipProofs:<br/>per-space store, 1h TTL"]
         commit["uploader.Forge commitProofs:<br/>per-space store, 1h TTL"]
         static["AuthServiceProofs:<br/>static container from config"]
+        walk["ingot catalog usage: one store<br/>per bucket walked (AuthorizeSigned)"]
         tok["tokenstore (tokens.cbor):<br/>empty; dormant login paths only"]
     end
 
     kp -->|"reqscope.ProofStore<br/>on the request ctx"| writes["uploader:<br/>/blob/add, abort, remove, /index/add<br/>/upload/add, /upload/remove"]
     kp -->|"same store"| reads["blockstore.Forge:<br/>content/retrieve"]
+    walk -->|"reqscope.ProofStore<br/>on the walk's ctx"| reads
     kp -->|"captureShipProofs<br/>at UploadBlob and StartBlob"| ship
     kp -->|"CaptureShipAuthority<br/>at every bucketop commit"| commit
     commit --> catship["async catalog ship"]
@@ -950,6 +960,12 @@ flowchart TB
   write.
 - Each access key gets its own `DelegationCache`, so a proof chain can never
   assemble across keys.
+- `ingot catalog usage` is a command, not the daemon, and gets its stores
+  another way: with an access key from its environment it signs a
+  ListObjectsV2 of each bucket it must read from Forge, has hilt authorize it
+  as it would a request the gateway serves, and keeps the delegations for that
+  bucket's walk alone. The daemon holds no tenant's secret, so it has no such
+  path.
 - The same store holds the effective S3 action set hilt reported for the key
   on each bucket, expiring with the keys and the tenant (next UTC midnight
   plus clock skew). One invalidation therefore drops the chains and the set
@@ -970,7 +986,8 @@ flowchart TB
 Cross-references: [`architecture.md` §9](./architecture.md#9-the-system-contract-piri--sprue--indexer).
 
 Sources: `iam/service.go`, `iam/keyproofs.go`, `iam/proofcache.go`,
-`internal/reqscope/reqscope.go`, `uploader/forge.go` (shipProofs,
+`internal/reqscope/reqscope.go`, `cmd/catalog.go` (forgeSegments),
+`uploader/forge.go` (shipProofs,
 captureShipProofs, CaptureShipAuthority), `bucketop/bucketop.go` (Tx.Commit),
 `module.go`, `config/config.go` (auth_service fields).
 Review when these change.
@@ -1313,6 +1330,7 @@ listed diagrams (each diagram's `Sources:` footer names its exact files).
 | `logstore/` | logstore-pipeline, segment-states, get, block-routes, delete-bucket |
 | `uploader/`, `forgeclient/` | context, put, multipart, principals, logstore-pipeline, block-routes |
 | `iam/`, `internal/reqscope/` | principals, authorize, context |
+| `cmd/catalog.go` | packages, principals |
 | `bucket/`, `mst/` | version-tree, put, get |
 | `migrations/sql/` | schema, plus any state diagram naming a changed CHECK |
 | `module.go`, `server.go`, `config/` | packages, context, logstore-pipeline; `server.go` also authorize and multipart |
