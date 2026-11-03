@@ -162,15 +162,14 @@ func (m *Manager) logFor(ctx context.Context, bucket string) (blockstore.Log, er
 }
 
 // AppendBatch routes the batch to the log of the bucket named by the
-// op-root (every batch belongs to exactly one bucket — OpStaging tags it),
-// and returns the seq of the segment it went into.
-func (m *Manager) AppendBatch(ctx context.Context, catalogBlocks []block.Block, opRoot blockstore.OpRoot) (uint64, error) {
+// op-root (every batch belongs to exactly one bucket — OpStaging tags it).
+func (m *Manager) AppendBatch(ctx context.Context, catalogBlocks []block.Block, opRoot blockstore.OpRoot) error {
 	if opRoot.Bucket == "" {
-		return 0, errors.New("logstore: manager: AppendBatch: opRoot.Bucket must be set")
+		return errors.New("logstore: manager: AppendBatch: opRoot.Bucket must be set")
 	}
 	log, err := m.logFor(ctx, opRoot.Bucket)
 	if err != nil {
-		return 0, err
+		return err
 	}
 	return log.AppendBatch(ctx, catalogBlocks, opRoot)
 }

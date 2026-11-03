@@ -166,6 +166,7 @@ type serverParams struct {
 	Intents         registry.IntentStore
 	Locations       registry.LocationStore
 	Inclusions      registry.InclusionStore
+	BlobRefs        registry.BlobRefStore
 	GC              registry.GCStore
 	Multipart       registry.MultipartStore
 	Parks           registry.ParkStore
@@ -227,6 +228,7 @@ func registerServerLifecycle(lc fx.Lifecycle, p serverParams) {
 				Intents:         p.Intents,
 				Locations:       p.Locations,
 				Inclusions:      p.Inclusions,
+				BlobRefs:        p.BlobRefs,
 				GC:              p.GC,
 				Multipart:       p.Multipart,
 				Parks:           p.Parks,
@@ -488,6 +490,7 @@ type registryResult struct {
 	Intents           registry.IntentStore
 	Locations         registry.LocationStore
 	Inclusions        registry.InclusionStore
+	BlobRefs          registry.BlobRefStore
 	GC                registry.GCStore
 	Multipart         registry.MultipartStore
 	Parks             registry.ParkStore
@@ -508,7 +511,7 @@ type registryResult struct {
 // needs hilt_url/hilt_did configured.
 func provideRegistry(pool *pgxpool.Pool) registryResult {
 	pg := registry.NewPostgres(pool)
-	return registryResult{Registry: pg, Intents: pg, Locations: pg, Inclusions: pg, GC: pg, Multipart: pg, Parks: pg, Streams: pg, PendingReleases: pg, UploadRegs: pg, EncParams: pg, RevocationCursors: pg, Meta: pg}
+	return registryResult{Registry: pg, Intents: pg, Locations: pg, Inclusions: pg, BlobRefs: pg, GC: pg, Multipart: pg, Parks: pg, Streams: pg, PendingReleases: pg, UploadRegs: pg, EncParams: pg, RevocationCursors: pg, Meta: pg}
 }
 
 // migrationHookOut feeds the migration PreStartHook into the "ingot_prestart"

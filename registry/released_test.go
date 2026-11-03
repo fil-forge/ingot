@@ -19,7 +19,6 @@ import (
 
 // releasedStore is what the released-pass query needs of a store.
 type releasedStore interface {
-	registry.Registry
 	registry.IntentStore
 	registry.LocationStore
 	registry.BlobRefStore
@@ -77,7 +76,9 @@ func runReleasedSuite(t *testing.T, st releasedStore) {
 	if err := st.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: claimed, Provider: "did:web:piri", URL: "https://piri/blob", Size: 7}); err != nil {
 		t.Fatalf("PutLocation: %v", err)
 	}
-	mustClaim(t, st, registry.BlobClaim{Digest: claimed, Bucket: "bk", ObjectKey: "k", VersionID: "v", Space: space})
+	if err := st.AddBlobClaim(ctx, registry.BlobClaim{Digest: claimed, Bucket: "bk", ObjectKey: "k", VersionID: "v", Space: space}); err != nil {
+		t.Fatalf("AddBlobClaim: %v", err)
+	}
 	pending := published("pending")
 	if err := st.EnqueueRelease(ctx, space, pending, time.Now().Add(time.Hour)); err != nil {
 		t.Fatalf("EnqueueRelease: %v", err)
@@ -86,7 +87,7 @@ func runReleasedSuite(t *testing.T, st releasedStore) {
 	if err := st.CreateSession(ctx, registry.MultipartSession{UploadID: "u1", Bucket: "bk", ObjectKey: "k", Space: space, State: registry.SessionOpen}); err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
-	if _, err := st.PutPart(ctx, registry.MultipartPart{UploadID: "u1", PartNumber: 1, ETagMD5: make([]byte, 16), Size: 7, BlobDigests: []multihash.Multihash{inPart}, State: registry.PartParked}, nil); err != nil {
+	if err := st.PutPart(ctx, registry.MultipartPart{UploadID: "u1", PartNumber: 1, ETagMD5: make([]byte, 16), Size: 7, BlobDigests: []multihash.Multihash{inPart}, State: registry.PartParked}, nil); err != nil {
 		t.Fatalf("PutPart: %v", err)
 	}
 	// A part only protects its blob while its session is live.
@@ -97,7 +98,7 @@ func runReleasedSuite(t *testing.T, st releasedStore) {
 		if err := st.CreateSession(ctx, registry.MultipartSession{UploadID: id, Bucket: "bk", ObjectKey: "k-" + state, Space: space, State: registry.SessionOpen}); err != nil {
 			t.Fatalf("CreateSession: %v", err)
 		}
-		if _, err := st.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 1, ETagMD5: make([]byte, 16), Size: 7, BlobDigests: []multihash.Multihash{d}, State: registry.PartParked}, nil); err != nil {
+		if err := st.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 1, ETagMD5: make([]byte, 16), Size: 7, BlobDigests: []multihash.Multihash{d}, State: registry.PartParked}, nil); err != nil {
 			t.Fatalf("PutPart: %v", err)
 		}
 		if state == registry.SessionCompleted {
