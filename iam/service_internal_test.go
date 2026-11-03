@@ -917,3 +917,51 @@ func TestFastPathTenant(t *testing.T) {
 		require.Equal(t, "hilt", authPath(t, rec))
 	})
 }
+
+// A chain to the agent the tenant issued, as Hilt's cleanup delegations are,
+// never authorizes a request locally: it skips the access key and outlives it.
+func TestAuthorizeLocalRequiresTheKeysChain(t *testing.T) {
+	accessKey, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	spaceIssuer, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	agent, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	tenant, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+
+	accessKeyID := accessKey.DID().Identifier()
+	const secret = "test-secret-access-key"
+	space := spaceIssuer.DID()
+	resolver := fixedResolver{name: "bkt", state: &registry.State{Name: "bkt", Space: space}}
+	req := signedGet(t, "s3.example", "/bkt/obj", accessKeyID, secret, time.Now())
+	sr, err := sigv4.Parse(sigv4.Request{Method: req.Method, Headers: req.Headers, URL: req.URL})
+	require.NoError(t, err)
+	key, err := sigv4.DeriveKey(sr, secret)
+	require.NoError(t, err)
+
+	root, err := contentcmds.Retrieve.Delegate(spaceIssuer, tenant.DID(), space, delegation.WithNoExpiration())
+	require.NoError(t, err)
+	tenantLeaf, err := contentcmds.Retrieve.Delegate(tenant, agent.DID(), space, delegation.WithExpiration(ucan.Now()+8*86400))
+	require.NoError(t, err)
+
+	s := localService(agent.DID(), resolver)
+	s.keys.Put(accessKeyID, time.Hour, s3.VerificationKey{Kind: s3.KeyKindSigV4, Data: key})
+	s.proofs.For(accessKey.DID()).PutPermissions(space, time.Hour, []string{"s3:GetObject"})
+	s.proofs.Deposit(accessKey.DID(), root, tenantLeaf)
+
+	_, ok, err := s.authorizeLocal(context.Background(), req, accessKeyID, s.proofs.For(accessKey.DID()))
+	require.NoError(t, err)
+	require.False(t, ok, "a chain the access key did not issue must not authorize locally")
+
+	// With the key's own chain cached beside it, the request is authorized
+	// locally again.
+	mid, err := contentcmds.Retrieve.Delegate(tenant, accessKey.DID(), space, delegation.WithNoExpiration())
+	require.NoError(t, err)
+	keyLeaf, err := contentcmds.Retrieve.Delegate(accessKey, agent.DID(), space, delegation.WithExpiration(ucan.Now()+3600))
+	require.NoError(t, err)
+	s.proofs.Deposit(accessKey.DID(), mid, keyLeaf)
+	_, ok, err = s.authorizeLocal(context.Background(), req, accessKeyID, s.proofs.For(accessKey.DID()))
+	require.NoError(t, err)
+	require.True(t, ok, "the key's chain authorizes locally even beside a longer-lived tenant one")
+}
