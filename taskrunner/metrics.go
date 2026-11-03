@@ -38,6 +38,7 @@ type metrics struct {
 	oldest     metric.Float64ObservableGauge
 	busy       metric.Int64ObservableGauge
 	workers    metric.Int64ObservableGauge
+	failed     metric.Int64ObservableGauge
 	collecting metric.Registration
 }
 
@@ -78,6 +79,10 @@ func newMetrics(mp metric.MeterProvider) (*metrics, error) {
 	}
 	if m.workers, err = meter.Int64ObservableGauge("taskrunner.workers.limit", metric.WithUnit("{worker}"),
 		metric.WithDescription("The most workers this process runs for a queue")); err != nil {
+		return nil, err
+	}
+	if m.failed, err = meter.Int64ObservableGauge("taskrunner.queue.failed", metric.WithUnit("{task}"),
+		metric.WithDescription("Tasks that failed for good and await inspection or resubmission. Growth means work that will not finish on its own")); err != nil {
 		return nil, err
 	}
 	return m, nil
@@ -174,9 +179,18 @@ func (r *Runner) startCollecting() error {
 					observe(action, 0, 0, 0)
 				}
 			}
+
+			failed, err := countFailed(ctx, r.db, q)
+			if err != nil {
+				return err
+			}
+			for _, action := range actions[q.name] {
+				aa := metric.WithAttributes(attribute.String("queue", q.name), attribute.String("action", action))
+				o.ObserveInt64(m.failed, failed[action], aa)
+			}
 		}
 		return nil
-	}, m.ready, m.delayed, m.oldest, m.busy, m.workers)
+	}, m.ready, m.delayed, m.oldest, m.busy, m.workers, m.failed)
 	if err != nil {
 		return err
 	}
