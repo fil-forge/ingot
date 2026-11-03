@@ -568,8 +568,11 @@ func (s *Service) cacheProofs(ctx context.Context, store *DelegationCache, ctr u
 	}
 
 	// A leaf is complete when a chain from its audience (this instance)
-	// back to its subject's root exists in the cache. Powerline leaves
-	// (undefined subject) can't anchor a chain lookup; skip them here —
+	// back to its subject's root, through the leaf's own issuer, exists in
+	// the cache. Any chain is not enough: the tenant's longer-lived cleanup
+	// delegations arrive complete, and would leave the access key's chain
+	// for the same command, which the fast path needs, unfetched. Powerline
+	// leaves (undefined subject) can't anchor a chain lookup; skip them here —
 	// the retrieval path resolves them against a concrete space, and the
 	// bucket-info fetch below covers the missing intermediates either way.
 	incomplete := false
@@ -577,7 +580,7 @@ func (s *Service) cacheProofs(ctx context.Context, store *DelegationCache, ctr u
 		if !leaf.Subject().Defined() {
 			continue
 		}
-		chain, _, err := store.ProofChain(ctx, leaf.Audience(), leaf.Command(), leaf.Subject())
+		chain, _, err := store.ProofChainVia(ctx, leaf.Audience(), leaf.Command(), leaf.Subject(), leaf.Issuer())
 		if err != nil || len(chain) == 0 {
 			incomplete = true
 			break
