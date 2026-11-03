@@ -448,6 +448,10 @@ func (s *Service) authorizeLocal(ctx context.Context, req s3.Request, access str
 	if s.buckets == nil || !s.agent.Defined() {
 		return auth.Account{}, false, nil
 	}
+	keyDID, err := did.Parse(did.KeyPrefix + access)
+	if err != nil {
+		return auth.Account{}, false, nil
+	}
 
 	// 1. Parse the signature envelope. Only HMAC SigV4 is fast-pathed: the
 	// gateway re-verifies with the returned key and only speaks HMAC.
@@ -489,12 +493,14 @@ func (s *Service) authorizeLocal(ctx context.Context, req s3.Request, access str
 	// bucket, or the answer expired, or the local registry's space disagrees
 	// with the bucket Hilt named — ask Hilt; a cached set that excludes the
 	// action is a refusal); and every command the action maps to must be
-	// covered by a chain to this instance's agent in THIS key's store.
-	// Because the store holds only keyDID's delegations, a resolving agent
-	// chain is necessarily space→…→keyDID→agent — it carries both keyDID's
-	// own grant (Hilt's bucket scoping) and the onward re-delegation.
-	// Cross-key mixing is structurally impossible, so one probe per command
-	// suffices.
+	// covered by a chain to this instance's agent in THIS key's store, ending
+	// in a delegation keyDID issued: space→…→keyDID→agent, which carries both
+	// keyDID's own grant (Hilt's bucket scoping) and the onward
+	// re-delegation. The store also holds the tenant's longer-lived
+	// delegations of the cleanup commands, which reach the agent without
+	// passing through keyDID and outlive it on purpose, so the probe is
+	// restricted to keyDID's. Cross-key mixing is structurally impossible,
+	// so one probe per command suffices.
 	for _, r := range reqs {
 		cmds := s3perm.CommandsFor(r.Permission)
 		if len(cmds) == 0 {
@@ -516,7 +522,7 @@ func (s *Service) authorizeLocal(ctx context.Context, req s3.Request, access str
 			return auth.Account{}, false, s3err.GetAPIError(s3err.ErrAccessDenied)
 		}
 		for _, cmd := range cmds {
-			if chain, _, err := store.ProofChain(ctx, s.agent, cmd, st.Space); err != nil || len(chain) == 0 {
+			if chain, _, err := store.ProofChainVia(ctx, s.agent, cmd, st.Space, keyDID); err != nil || len(chain) == 0 {
 				return auth.Account{}, false, nil
 			}
 		}
@@ -562,8 +568,11 @@ func (s *Service) cacheProofs(ctx context.Context, store *DelegationCache, ctr u
 	}
 
 	// A leaf is complete when a chain from its audience (this instance)
-	// back to its subject's root exists in the cache. Powerline leaves
-	// (undefined subject) can't anchor a chain lookup; skip them here —
+	// back to its subject's root, through the leaf's own issuer, exists in
+	// the cache. Any chain is not enough: the tenant's longer-lived cleanup
+	// delegations arrive complete, and would leave the access key's chain
+	// for the same command, which the fast path needs, unfetched. Powerline
+	// leaves (undefined subject) can't anchor a chain lookup; skip them here —
 	// the retrieval path resolves them against a concrete space, and the
 	// bucket-info fetch below covers the missing intermediates either way.
 	incomplete := false
@@ -571,7 +580,7 @@ func (s *Service) cacheProofs(ctx context.Context, store *DelegationCache, ctr u
 		if !leaf.Subject().Defined() {
 			continue
 		}
-		chain, _, err := store.ProofChain(ctx, leaf.Audience(), leaf.Command(), leaf.Subject())
+		chain, _, err := store.ProofChainVia(ctx, leaf.Audience(), leaf.Command(), leaf.Subject(), leaf.Issuer())
 		if err != nil || len(chain) == 0 {
 			incomplete = true
 			break
