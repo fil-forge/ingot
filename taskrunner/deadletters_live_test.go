@@ -244,3 +244,23 @@ func TestQueueTablesAreTunedForChurn_Live(t *testing.T) {
 		}
 	}
 }
+
+// A handler removed or renamed in a deploy leaves its tasks failed, and they
+// still show in the gauge though no handler for them is registered.
+func TestFailedGaugeCountsUnregisteredActions_Live(t *testing.T) {
+	f, reader := metricsFixture(t, 0)
+	f.handle(t, qTop, "put", f.put())
+	f.start(t)
+	if _, err := f.env.DB.Exec(context.Background(), `INSERT INTO `+f.env.Table("queue_top_tasks")+`
+		(id, subject, action, sync, state, error, finished) VALUES (gen_random_uuid(), 's', 'renamed', false, 'failed', 'no handler', now())`); err != nil {
+		t.Fatal(err)
+	}
+
+	got := collect(t, reader)
+	if v, ok := gaugeValue[int64](t, got["taskrunner.queue.failed"], attribute.String("queue", qTop), attribute.String("action", "renamed")); !ok || v != 1 {
+		t.Errorf("failed for an unregistered action = %d (reported %v), want 1", v, ok)
+	}
+	if v, ok := gaugeValue[int64](t, got["taskrunner.queue.failed"], attribute.String("queue", qTop), attribute.String("action", "put")); !ok || v != 0 {
+		t.Errorf("failed for a registered action with none = %d (reported %v), want 0", v, ok)
+	}
+}

@@ -184,9 +184,18 @@ func (r *Runner) startCollecting() error {
 			if err != nil {
 				return err
 			}
+			// Every action with failed tasks reports, registered or not: a
+			// handler removed or renamed in a deploy leaves its tasks failing
+			// for want of one, and those are the dead letters most in need of
+			// notice. Registered actions with none report zero.
 			for _, action := range actions[q.name] {
+				if _, ok := failed[action]; !ok {
+					failed[action] = 0
+				}
+			}
+			for action, n := range failed {
 				aa := metric.WithAttributes(attribute.String("queue", q.name), attribute.String("action", action))
-				o.ObserveInt64(m.failed, failed[action], aa)
+				o.ObserveInt64(m.failed, n, aa)
 			}
 		}
 		return nil
