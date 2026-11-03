@@ -448,10 +448,9 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 			return err
 		}
 
-		// Deleting the bucket row takes its queued object-count changes with
-		// it: upload_registrations cascades on the bucket. They share one
-		// fate by construction rather than by a cleanup step placed correctly
-		// relative to the remote delete.
+		// The space's object-count changes went out in the drain above; one
+		// that could not be sent stays in the queue as a failed task, which
+		// outlives the bucket as the record of the count it leaves wrong.
 		if err := b.reg.Delete(ctx, name); err != nil {
 			if errors.Is(err, registry.ErrNotFound) {
 				return s3err.GetAPIError(s3err.ErrNoSuchBucket)

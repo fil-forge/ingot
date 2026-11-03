@@ -8,6 +8,7 @@ package main
 
 import (
 	"github.com/fil-forge/ingot/bucket"
+	"github.com/fil-forge/ingot/registry"
 	cbg "github.com/whyrusleeping/cbor-gen"
 )
 
@@ -26,6 +27,11 @@ func main() {
 		bucket.ValueUnion{},
 		bucket.VersionState{},
 		bucket.StateUnion{},
+	); err != nil {
+		panic(err)
+	}
+	if err := cfg.WriteMapEncodersToFile("../registry/cbor_gen.go", "registry",
+		registry.UploadTask{},
 	); err != nil {
 		panic(err)
 	}

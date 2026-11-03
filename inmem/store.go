@@ -74,10 +74,10 @@ type MemStore struct {
 	gcCands    map[string]struct{}                       // keyed by string(cid)
 	revCursor  *registry.RevocationCursor                // the single revocation_cursor row
 	releases   map[locKey]registry.PendingRelease        // keyed by (space, digest)
-	// uploadRegs is the upload-registration outbox, in commit order;
-	// uploadRegSeq numbers the rows the way the Postgres sequence does.
-	uploadRegs   []registry.UploadRegistration
-	uploadRegSeq int64
+	// uploadRegs are the upload registrations the commits queued, in commit
+	// order, for tests to take (TakeUploadRegistrations); Postgres queues
+	// them as tasks instead.
+	uploadRegs []registry.UploadRegistration
 	// journal is the catalog journal: segment seq -> string(cid) -> row.
 	journal map[uint64]map[string]journalRow
 }
@@ -253,16 +253,6 @@ func (m *MemStore) Delete(_ context.Context, name string) error {
 	}
 	delete(m.buckets, name)
 	delete(m.verSeqs, name)
-	// Postgres cascades upload_registrations on the bucket; do the same here
-	// so a queued change cannot outlive the bucket it belongs to in one
-	// backend and not the other.
-	kept := m.uploadRegs[:0]
-	for _, reg := range m.uploadRegs {
-		if reg.Bucket != name {
-			kept = append(kept, reg)
-		}
-	}
-	m.uploadRegs = kept
 	// The journal cascades on the bucket too.
 	m.dropJournalLocked(name)
 	return nil
@@ -302,6 +292,17 @@ func (m *MemStore) CASRoot(ctx context.Context, name string, expect, next cid.Ci
 	return m.CommitRoot(ctx, name, expect, next, registry.RootCommit{})
 }
 
+// TakeUploadRegistrations returns the upload registrations committed since the
+// last call, in commit order, and forgets them. Tests use it to apply them as
+// the queue-space-upload tasks would.
+func (m *MemStore) TakeUploadRegistrations() []registry.UploadRegistration {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := m.uploadRegs
+	m.uploadRegs = nil
+	return out
+}
+
 // CommitRoot advances the root and records the commit's upload
 // registrations, blob claims and claim drops together: under the one mutex
 // here, as one transaction in Postgres. A conflict or a refused claim
@@ -330,14 +331,7 @@ func (m *MemStore) CommitRoot(_ context.Context, name string, expect, next cid.C
 	}
 	s.Root = next
 	m.journalLocked(name, c.Journal)
-	for _, reg := range c.Registrations {
-		m.uploadRegSeq++
-		reg.Seq = m.uploadRegSeq
-		if reg.NextAt.IsZero() {
-			reg.NextAt = time.Now()
-		}
-		m.uploadRegs = append(m.uploadRegs, reg)
-	}
+	m.uploadRegs = append(m.uploadRegs, c.Registrations...)
 	for _, cl := range c.Claims {
 		m.addClaimLocked(cl, true)
 	}
@@ -821,15 +815,14 @@ func (NopUploader) RetractUploads(_ context.Context, changes []uploader.QueuedUp
 
 // Compile-time guarantees.
 var (
-	_ bucketauthority.BucketAuthority  = (*MemStore)(nil)
-	_ registry.Registry                = (*MemStore)(nil)
-	_ logstore.Meta                    = (*MemStore)(nil)
-	_ blockstore.BlockReader           = NopBaseReader{}
-	_ blockstore.BlobReader            = NopBaseReader{}
-	_ uploader.Uploader                = NopUploader{}
-	_ uploader.BodyUploader            = NopUploader{}
-	_ uploader.DeferredBodyUploader    = NopUploader{}
-	_ uploader.BlobRemover             = NopUploader{}
-	_ uploader.UploadRegistrar         = NopUploader{}
-	_ registry.UploadRegistrationStore = (*MemStore)(nil)
+	_ bucketauthority.BucketAuthority = (*MemStore)(nil)
+	_ registry.Registry               = (*MemStore)(nil)
+	_ logstore.Meta                   = (*MemStore)(nil)
+	_ blockstore.BlockReader          = NopBaseReader{}
+	_ blockstore.BlobReader           = NopBaseReader{}
+	_ uploader.Uploader               = NopUploader{}
+	_ uploader.BodyUploader           = NopUploader{}
+	_ uploader.DeferredBodyUploader   = NopUploader{}
+	_ uploader.BlobRemover            = NopUploader{}
+	_ uploader.UploadRegistrar        = NopUploader{}
 )

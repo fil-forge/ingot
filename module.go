@@ -72,6 +72,7 @@ import (
 	"github.com/fil-forge/ingot/regionkey"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/revocation"
+	"github.com/fil-forge/ingot/taskrunner"
 	"github.com/fil-forge/ingot/tenantkey"
 	"github.com/fil-forge/ingot/tokenstore"
 	"github.com/fil-forge/ingot/uploader"
@@ -102,6 +103,7 @@ func Module(cfg config.Config) fx.Option {
 		fx.Provide(cfg.ServerConfig),
 		fx.Provide(
 			provideRegistry,
+			provideTaskRunner,
 			provideForgeReader,
 			provideTokenStore,
 			provideForgeClient,
@@ -156,7 +158,8 @@ type serverParams struct {
 	Deferred     uploader.DeferredBodyUploader
 	Remover      uploader.BlobRemover
 	Registrar    uploader.UploadRegistrar
-	UploadRegs   registry.UploadRegistrationStore
+	// Tasks is optional: an in-memory registry queues no tasks.
+	Tasks *taskrunner.Runner `optional:"true"`
 	// Streaming and Streams are optional: without them every body blob is
 	// spooled before it is uploaded (see ServerDeps.Streaming).
 	Streaming       uploader.StreamingBodyUploader `optional:"true"`
@@ -224,7 +227,7 @@ func registerServerLifecycle(lc fx.Lifecycle, p serverParams) {
 				Streaming:       p.Streaming,
 				Streams:         p.Streams,
 				Registrar:       p.Registrar,
-				UploadRegs:      p.UploadRegs,
+				Tasks:           p.Tasks,
 				Authority:       p.BucketAuthority,
 				Registry:        p.Registry,
 				Intents:         p.Intents,
@@ -497,7 +500,6 @@ type registryResult struct {
 	Parks             registry.ParkStore
 	Streams           registry.StreamStore
 	PendingReleases   registry.PendingReleaseStore
-	UploadRegs        registry.UploadRegistrationStore
 	EncParams         registry.EncryptionParamsStore
 	RevocationCursors registry.RevocationCursorStore
 	CatalogUsage      registry.CatalogUsageStore
@@ -512,9 +514,30 @@ type registryResult struct {
 // segment metadata (Meta). The hilt client is required: bucket
 // create/delete/list are forwarded to Hilt, so forge mode needs
 // hilt_url/hilt_did configured.
-func provideRegistry(pool *pgxpool.Pool) registryResult {
-	pg := registry.NewPostgres(pool)
-	return registryResult{Registry: pg, Intents: pg, Locations: pg, Inclusions: pg, GC: pg, Multipart: pg, Parks: pg, Streams: pg, PendingReleases: pg, UploadRegs: pg, EncParams: pg, RevocationCursors: pg, CatalogUsage: pg, Meta: pg}
+func provideRegistry(pool *pgxpool.Pool, tasks *taskrunner.Runner) registryResult {
+	pg := registry.NewPostgres(pool, registry.WithTasks(tasks))
+	return registryResult{Registry: pg, Intents: pg, Locations: pg, Inclusions: pg, GC: pg, Multipart: pg, Parks: pg, Streams: pg, PendingReleases: pg, EncParams: pg, RevocationCursors: pg, CatalogUsage: pg, Meta: pg}
+}
+
+// taskSchema is the Postgres schema the task queues' tables live in, beside
+// the rest of ingot's.
+const taskSchema = "ingot"
+
+// uploadRegistrationWorkers is how many spaces' object-count changes one
+// instance sends at once.
+const uploadRegistrationWorkers = 4
+
+// provideTaskRunner builds the runner for ingot's durable task queues, over
+// the host's pool. The backend registers its handlers (Server.New); the
+// migration hook creates its tables and the server starts and stops it.
+func provideTaskRunner(pool *pgxpool.Pool, logger *zap.Logger) (*taskrunner.Runner, error) {
+	return taskrunner.New(pool, taskrunner.Options{
+		Schema: taskSchema,
+		Queues: []taskrunner.QueueOptions{
+			{Name: registry.UploadQueue, Workers: uploadRegistrationWorkers},
+		},
+		Logger: logger.Named("tasks"),
+	})
 }
 
 // migrationHookOut feeds the migration PreStartHook into the "ingot_prestart"
@@ -530,10 +553,13 @@ type migrationHookOut struct {
 // this never collides with the host's own migrations on the same database. It
 // must run before New (whose log recovery queries the registry), which the
 // PreStartHook ordering guarantees.
-func provideMigrationHook(pool *pgxpool.Pool, logger *zap.Logger) migrationHookOut {
+func provideMigrationHook(pool *pgxpool.Pool, tasks *taskrunner.Runner, logger *zap.Logger) migrationHookOut {
 	return migrationHookOut{Hook: func(ctx context.Context) error {
 		if err := migrations.Up(ctx, pool, logger); err != nil {
 			return fmt.Errorf("ingot: migrations: %w", err)
+		}
+		if err := tasks.Migrate(ctx); err != nil {
+			return fmt.Errorf("ingot: task queue migrations: %w", err)
 		}
 		return nil
 	}}
