@@ -169,12 +169,6 @@ type Server struct {
 	sweeps      sync.WaitGroup
 }
 
-// uploadAdopter is a registry holding upload registrations queued before they
-// ran as tasks (*registry.Postgres).
-type uploadAdopter interface {
-	AdoptUploadRegistrations(ctx context.Context, ts registry.TaskSubmitter) (int, error)
-}
-
 // New wires a ServerDeps + ServerConfig into a runnable Server. The
 // caller is responsible for ensuring cfg.DataDir exists before
 // calling.
@@ -277,20 +271,6 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 			_ = backend.CloseMetrics()
 			_ = log.Close(ctx)
 			return nil, fmt.Errorf("ingot: register upload tasks: %w", err)
-		}
-		// Changes queued before registrations ran as tasks move onto the
-		// queue once their handlers are registered, before any request can
-		// queue behind them.
-		if adopter, ok := deps.Registry.(uploadAdopter); ok {
-			n, err := adopter.AdoptUploadRegistrations(ctx, deps.Tasks)
-			if err != nil {
-				_ = backend.CloseMetrics()
-				_ = log.Close(ctx)
-				return nil, fmt.Errorf("ingot: adopt queued upload registrations: %w", err)
-			}
-			if n > 0 {
-				logger.Info("moved queued upload registrations onto the task queue", zap.Int("count", n))
-			}
 		}
 	}
 

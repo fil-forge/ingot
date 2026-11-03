@@ -1310,63 +1310,6 @@ func TestCommitRootWithoutTasksRefusesRegistrationsLive(t *testing.T) {
 	}
 }
 
-// TestAdoptUploadRegistrationsLive: rows queued in the old outbox move onto
-// the task queue in order, and rows the old queue had given up on stay behind
-// as its record.
-//
-//	INGOT_TEST_DSN=postgres://... GOWORK=off go test ./registry/ -run AdoptUploadRegistrations -v
-func TestAdoptUploadRegistrationsLive(t *testing.T) {
-	pool := livePool(t)
-	ctx := context.Background()
-	r := registry.NewPostgres(pool)
-	space := testutil.RandomDID(t)
-	t.Cleanup(func() { clearQueuedUploads(t, pool, space) })
-	if err := r.Create(ctx, "adopt-bucket", space, registry.CreateState{Tenant: testutil.RandomDID(t)}); err != nil {
-		t.Fatalf("create bucket: %v", err)
-	}
-	t.Cleanup(func() { _ = r.Delete(context.Background(), "adopt-bucket") })
-
-	add := registry.UploadRegistration{Bucket: "adopt-bucket", ObjectKey: "a", Space: space, Root: liveCid(t, "a"), Op: registry.UploadRegistrationAdd, Proofs: []byte("a")}
-	remove := registry.UploadRegistration{Bucket: "adopt-bucket", ObjectKey: "b", Space: space, Root: liveCid(t, "b"), Op: registry.UploadRegistrationRemove, Proofs: []byte("b")}
-	dead := registry.UploadRegistration{Bucket: "adopt-bucket", ObjectKey: "c", Space: space, Root: liveCid(t, "c"), Op: registry.UploadRegistrationRemove, Proofs: []byte("c")}
-	for _, reg := range []registry.UploadRegistration{add, remove, dead} {
-		var deadAt *time.Time
-		if reg.ObjectKey == "c" {
-			now := time.Now()
-			deadAt = &now
-		}
-		if _, err := pool.Exec(ctx, `INSERT INTO ingot.upload_registrations (bucket, object_key, space, root, op, proofs, dead_lettered_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7)`, reg.Bucket, reg.ObjectKey, reg.Space.String(), reg.Root.Bytes(), string(reg.Op), reg.Proofs, deadAt); err != nil {
-			t.Fatalf("queue outbox row: %v", err)
-		}
-	}
-
-	n, err := r.AdoptUploadRegistrations(ctx, liveUploadTasks(t, pool))
-	if err != nil {
-		t.Fatalf("adopt: %v", err)
-	}
-	if n < 2 {
-		t.Fatalf("adopted %d rows, want at least this test's 2", n)
-	}
-	if queued := queuedUploads(t, pool, space); !reflect.DeepEqual(queued, []registry.UploadRegistration{add, remove}) {
-		t.Fatalf("queued %+v, want the two live rows in order", queued)
-	}
-	var left []string
-	rows, err := pool.Query(ctx, `SELECT object_key FROM ingot.upload_registrations WHERE space = $1`, space.String())
-	if err != nil {
-		t.Fatalf("list outbox: %v", err)
-	}
-	for rows.Next() {
-		var k string
-		_ = rows.Scan(&k)
-		left = append(left, k)
-	}
-	rows.Close()
-	if !reflect.DeepEqual(left, []string{"c"}) {
-		t.Fatalf("outbox keeps %v, want only the given-up row", left)
-	}
-}
-
 // TestConcurrentCommitClaimsLive runs two commits claiming the same thousands
 // of digests at once, many times over, one listing them in reverse. A commit
 // takes a claim-key lock per digest, so the two take overlapping lock sets
