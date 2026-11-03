@@ -9,6 +9,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+
 	ingottest "github.com/fil-forge/ingot/testing"
 	"github.com/fil-forge/smelt/pkg/stack"
 )
@@ -26,6 +29,11 @@ import (
 // retired; the early object must then still GET (its manifest is only in the
 // retired segment) and the bucket must still list without a delimiter (the
 // walk fetches every leaf's manifest).
+//
+// Finally every object is deleted and the bucket must delete. The retired
+// segments' files are gone, but their CAR and index blobs are still registered
+// in the bucket's space, and hilt refuses to delete a space that holds any:
+// DeleteBucket has to release the retired segments' blobs too.
 //
 //	go test -tags itest ./itest -run TestForgeReadAfterCatalogRetention -v -timeout 900s
 func TestForgeReadAfterCatalogRetention(t *testing.T) {
@@ -111,6 +119,19 @@ func TestForgeReadAfterCatalogRetention(t *testing.T) {
 		t.Fatalf("early-obj missing from listing: %v", keys)
 	}
 	t.Logf("read-after-retention OK: %d bytes via ranged shard retrieval; %d keys listed", len(got), len(keys))
+
+	for _, k := range keys {
+		if err := ingottest.DeleteObject(ctx, cfg, bucket, k); err != nil {
+			t.Fatalf("delete %s: %v", k, err)
+		}
+	}
+	cl := sdkClient(forgeS3Conf(ingotEndpoint, accessKey, secretKey))
+	if _, err := cl.DeleteBucket(ctx, &s3.DeleteBucketInput{Bucket: aws.String(bucket)}); err != nil {
+		t.Fatalf("DeleteBucket after its catalog segments retired: %v", err)
+	}
+	if _, err := cl.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: aws.String(bucket)}); err == nil {
+		t.Fatalf("HeadBucket succeeded after DeleteBucket")
+	}
 }
 
 // catalogSegments lists the catalog-plane CAR files currently on the ingot

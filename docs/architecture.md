@@ -733,7 +733,8 @@ CREATE TABLE ingot.segments (
     sha256       bytea,
     shipped_at   bigint,
     bucket       text   NOT NULL,                        -- the log is segregated per bucket
-    index_digest bytea                                   -- shipped sharded-dag-index blob
+    index_digest bytea,                                  -- shipped sharded-dag-index blob
+    retired_at   bigint                                  -- files unlinked; the row stays until DeleteBucket
 );
 
 -- Per-segment record of the bucket-root advances that landed in it; shipping
@@ -748,10 +749,11 @@ CREATE TABLE ingot.segment_op_roots (
 
 -- The catalog journal: a copy of every catalog block a commit appended to the
 -- log, written in the root swap's transaction and deleted in the one that stamps
--- its segment shipped, so a copy of the database holds the blocks only this
--- host's disk would otherwise hold. seq has deliberately no foreign key: logstore
--- recovery deletes the row of a segment whose CAR is missing, and the blocks
--- must outlive it.
+-- its segment shipped (or, for the whole bucket, when DeleteBucket empties its
+-- root), so a copy of the database holds the blocks only this host's disk would
+-- otherwise hold. seq has deliberately no foreign key: logstore
+-- recovery deletes the row of an open segment whose CAR is missing, and the
+-- blocks must outlive it.
 CREATE TABLE ingot.catalog_journal (
     seq        bigint      NOT NULL,                     -- the log segment it went into
     bucket     text        NOT NULL REFERENCES ingot.buckets(name) ON DELETE CASCADE,

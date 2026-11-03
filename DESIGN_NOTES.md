@@ -105,8 +105,9 @@ full lifecycle):
   licenses the caller's bucket-root CAS.
 - **The unshipped catalog is journaled in Postgres**: the root swap's
   transaction writes the batch's blocks to `ingot.catalog_journal` under the
-  segment `AppendBatch` reported, and shipping that segment deletes them. A
-  copy of Postgres (a standby, a restore) therefore holds every block its
+  segment `AppendBatch` reported, and shipping that segment deletes them, as
+  do `DeleteBucket` emptying the bucket's root and the bucket row's deletion.
+  A copy of Postgres (a standby, a restore) therefore holds every block its
   roots need that this host's disk alone would otherwise hold. Rebuilding a
   lost segment from the journal is not built yet.
 - **`forge_root_cid` advances only when a segment ships, and only guarded**:
