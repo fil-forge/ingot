@@ -1206,16 +1206,6 @@ erDiagram
         bytea cid PK "superseded MST node"
         text bucket
     }
-    upload_registrations {
-        bigint seq PK "commit order"
-        text bucket FK
-        text object_key
-        text space
-        bytea root "the version's manifest CID"
-        text op "add, remove"
-        timestamptz next_at "the sweeper's clock"
-        timestamptz dead_lettered_at "set once retrying stops"
-    }
     revocation_cursor {
         boolean id PK "single-row latch"
         timestamptz recorded_at "resume point in the revocation stream"
@@ -1224,7 +1214,6 @@ erDiagram
     segments ||--o{ segment_op_roots : "ON DELETE CASCADE"
     multipart_sessions ||--o{ multipart_parts : "ON DELETE CASCADE"
     multipart_parts ||--o| multipart_part_trees : "ON DELETE CASCADE; deleted by Complete once the object commits"
-    buckets ||--o{ upload_registrations : "ON DELETE CASCADE"
     buckets ||--o{ catalog_journal : "ON DELETE CASCADE"
     segments ||..o{ catalog_journal : "by seq, deliberately no FK"
     buckets ||..o{ segments : "by bucket name, no FK"
