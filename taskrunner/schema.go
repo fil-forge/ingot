@@ -25,39 +25,33 @@ CREATE TABLE %[1]s (
 	args       bytea,
 	sync       boolean NOT NULL,
 	state      text NOT NULL DEFAULT 'pending'
-	           CHECK (state IN ('pending', 'succeeded', 'failed', 'expired')),
+	           CHECK (state IN ('pending', 'succeeded', 'failed', 'expired', 'cancelled')),
 	result     bytea,
 	error      text,
 	finished   timestamptz,
 	-- waiting_until is set while a sync task's caller waits in Run, which
 	-- keeps workers off it until the claim lapses.
-	waiting_until timestamptz
+	waiting_until timestamptz,
+	-- started is set when the task is first claimed: from then on it can no
+	-- longer be cancelled or replaced.
+	started     timestamptz,
+	replaceable boolean NOT NULL DEFAULT false,
+	attempts    integer NOT NULL DEFAULT 0,
+	-- retry_at holds a retry that holds its subject (RetryPolicy.HoldsSubject).
+	retry_at    timestamptz
 );
 CREATE INDEX %[3]s ON %[1]s (subject, seq) WHERE state = 'pending';
 `+dueIndex(q)+`
+CREATE UNIQUE INDEX %[4]s ON %[1]s (subject, action)
+	WHERE state = 'pending' AND replaceable AND started IS NULL;
 CREATE TABLE %[2]s (
 	subject      text PRIMARY KEY,
 	owner        uuid NOT NULL,
 	expires      timestamptz NOT NULL,
 	tree_created timestamptz NOT NULL,
 	tree_id      uuid NOT NULL
-);`, q.tasks, q.leases, pgx.Identifier{q.table + "_tasks_pending"}.Sanitize())
-	},
-	// Replacement, cancellation and retries.
-	func(q *queue) string {
-		return fmt.Sprintf(`
-ALTER TABLE %[1]s
-	ADD COLUMN started     timestamptz,
-	ADD COLUMN replaceable boolean NOT NULL DEFAULT false,
-	ADD COLUMN attempts    integer NOT NULL DEFAULT 0,
-	ADD COLUMN retry_at    timestamptz,
-	DROP CONSTRAINT %[2]s,
-	ADD CONSTRAINT %[2]s
-		CHECK (state IN ('pending', 'succeeded', 'failed', 'expired', 'cancelled'));
-CREATE UNIQUE INDEX %[3]s ON %[1]s (subject, action)
-	WHERE state = 'pending' AND replaceable AND started IS NULL;`,
-			q.tasks,
-			pgx.Identifier{q.table + "_tasks_state_check"}.Sanitize(),
+);`, q.tasks, q.leases,
+			pgx.Identifier{q.table + "_tasks_pending"}.Sanitize(),
 			pgx.Identifier{q.table + "_tasks_replaceable"}.Sanitize())
 	},
 }
