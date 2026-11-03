@@ -406,14 +406,6 @@ func TestWriteDoesNotCallTheUploadService(t *testing.T) {
 	require.Len(t, added, 1, "draining applies what the write queued")
 }
 
-// bucketSpaceOf returns the space backing the test bucket.
-func bucketSpaceOf(t *testing.T, b *Backend) did.DID {
-	t.Helper()
-	st, err := b.reg.Get(context.Background(), "bk")
-	require.NoError(t, err)
-	return st.Space
-}
-
 // renewingRegistrar starts with spent authority and recovers once renew is
 // called, standing in for a space that is written again while its queued
 // changes are waiting.
