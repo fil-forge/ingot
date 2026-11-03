@@ -260,7 +260,7 @@ Sync tasks are never retried: the error goes to the caller, which retries the re
 
 ## Placement
 
-A task that touches one instance's local state, such as a cached file, is placed on that instance with `Node`. Only the runner whose `Options.Node` matches runs it, and other instances leave the tasks behind it on its subject alone until it has run, so the subject's order holds. A sync task or child placed on another instance is refused with `ErrOtherNode`.
+A task that touches one instance's local state, such as a cached file, is placed on that instance with `Node`. Only the runner whose `Options.Node` matches runs it. While it is the oldest due task on its subject, other instances run none of the tasks behind it either, so the subject's order holds. A placed task still waiting on its `NotBefore` holds up nothing, like any delayed task. A sync task or child placed on another instance is refused with `ErrOtherNode`.
 
 ```go
 r, err := taskrunner.New(pool, taskrunner.Options{Schema: "ingot", Queues: queues, Node: hostname})
