@@ -83,17 +83,6 @@ func openPlaneLog(ctx context.Context, plane blockstore.Plane, bucket, dir strin
 		return nil, err
 	}
 
-	// Force-seal a recovered open segment so a fresh open is always
-	// brand-new on each process startup.
-	if pl.open != nil {
-		if err := pl.open.seal(ctx, meta); err != nil {
-			return nil, fmt.Errorf("logstore: force-seal recovered open %s segment: %w", plane, err)
-		}
-		pl.sealed = append([]*Segment{pl.open}, pl.sealed...)
-		pl.enqueueFlush(pl.open)
-		pl.open = nil
-	}
-
 	if pc.Ship {
 		pl.wg.Add(1)
 		go pl.flushLoop()
