@@ -209,7 +209,7 @@ err = r.Cancel(ctx, "queue-space-shard", expireID)
 
 A batching handler takes the subject's oldest due task and the due tasks straight after it with the same action, up to a limit, and stops at the first task with a different action so the subject's order holds. Batching actions run async only.
 
-It returns one outcome per task, and the batch's writes commit together. A task whose outcome carries an error is retried or failed on its own, under its own attempts, while its batchmates succeed. Returning an error instead fails or retries the whole batch.
+It returns one outcome per task, and the batch's writes commit together. A task whose outcome carries an error is retried or failed on its own, under its own attempts, while its batchmates succeed. Returning an error instead fails or retries the whole batch. An outcome with an error can also carry `Args`, which replace the task's arguments for its next attempt, so something the attempt learned, such as renewed authority, is not lost if the process restarts before the retry.
 
 ```go
 err := r.HandleBatch("queue-space-upload", "add", 100,
@@ -267,13 +267,20 @@ Sync tasks are never retried: the error goes to the caller, which retries the re
 
 ## Failed tasks
 
-A task that fails for good, with a permanent error or out of attempts, stays in its queue with its last error. It no longer holds up its subject, and it is kept until it is resubmitted, so the work it stood for can be inspected and replayed. `ListFailed` lists a queue's failed tasks, for one subject or all of them. `Resubmit` replaces one with a new pending task on the same subject and action, which runs after the tasks already queued there. It can take new arguments, such as fresh authority, and starts its attempts afresh.
+A task that fails for good, with a permanent error or out of attempts, stays in its queue with its last error. It no longer holds up its subject, and it is kept until it is resubmitted, so the work it stood for can be inspected and replayed. `ListFailed` lists a queue's failed tasks, for one subject or all of them, a page at a time: pass the last task's ID of one page to get the next. `Resubmit` replaces one with a new pending task on the same subject and action, which runs after the tasks already queued there. It can take new arguments, such as fresh authority, and starts its attempts afresh.
 
 ```go
-failed, err := r.ListFailed(ctx, "queue-space-upload", space, 100)
-for _, f := range failed {
-	log.Printf("%s.%s failed: %s", f.Task.Queue, f.Task.Action, f.Error)
-	_, err = r.Resubmit(ctx, f.Task.Queue, f.Task.ID, withFreshProofs(f.Task.Args))
+after := uuid.Nil
+for {
+	failed, err := r.ListFailed(ctx, "queue-space-upload", space, after, 100)
+	if err != nil || len(failed) == 0 {
+		break
+	}
+	for _, f := range failed {
+		log.Printf("%s.%s failed: %s", f.Task.Queue, f.Task.Action, f.Error)
+		_, err = r.Resubmit(ctx, f.Task.Queue, f.Task.ID, withFreshProofs(f.Task.Args))
+	}
+	after = failed[len(failed)-1].Task.ID
 }
 ```
 

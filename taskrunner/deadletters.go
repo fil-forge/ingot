@@ -22,31 +22,39 @@ type FailedTask struct {
 }
 
 const listFailed = `SELECT seq, id, subject, action, created, not_before, expires, args, attempts, node,
-	coalesce(error, ''), finished FROM %s
+	coalesce(error, ''), finished FROM %[1]s
 	WHERE state = 'failed' AND ($1 = '' OR subject = $1)
-	ORDER BY seq LIMIT $2`
+	  AND ($2::uuid IS NULL OR seq > (SELECT seq FROM %[1]s WHERE id = $2))
+	ORDER BY seq LIMIT $3`
 
 // ListFailed returns a queue's failed tasks, oldest first, at most limit. An
-// empty subject lists the whole queue's.
-func (r *Runner) ListFailed(ctx context.Context, queueName, subject string, limit int) ([]FailedTask, error) {
+// empty subject lists the whole queue's. after pages through them: the zero
+// TaskID starts at the oldest, and the ID of the last task of one page lists
+// the next. A task that page listed stays a valid cursor until its queue's
+// retention removes it, whether or not it has been resubmitted since.
+func (r *Runner) ListFailed(ctx context.Context, queueName, subject string, after TaskID, limit int) ([]FailedTask, error) {
 	q, ok := r.byName[queueName]
 	if !ok {
 		return nil, fmt.Errorf("task runner: unknown queue %q", queueName)
 	}
-	return listFailedTasks(ctx, r.db, q, subject, limit)
+	return listFailedTasks(ctx, r.db, q, subject, after, limit)
 }
 
 // ListFailed is Runner.ListFailed, read through the handler's DB.
-func (ex *Exec) ListFailed(ctx context.Context, queueName, subject string, limit int) ([]FailedTask, error) {
+func (ex *Exec) ListFailed(ctx context.Context, queueName, subject string, after TaskID, limit int) ([]FailedTask, error) {
 	q, ok := ex.tr.r.byName[queueName]
 	if !ok {
 		return nil, fmt.Errorf("task runner: unknown queue %q", queueName)
 	}
-	return listFailedTasks(ctx, ex.DB(), q, subject, limit)
+	return listFailedTasks(ctx, ex.DB(), q, subject, after, limit)
 }
 
-func listFailedTasks(ctx context.Context, db Querier, q *queue, subject string, limit int) ([]FailedTask, error) {
-	rows, err := db.Query(ctx, fmt.Sprintf(listFailed, q.tasks), subject, limit)
+func listFailedTasks(ctx context.Context, db Querier, q *queue, subject string, after TaskID, limit int) ([]FailedTask, error) {
+	var cursor *TaskID
+	if after != uuid.Nil {
+		cursor = &after
+	}
+	rows, err := db.Query(ctx, fmt.Sprintf(listFailed, q.tasks), subject, cursor, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list failed %s tasks: %w", q.name, err)
 	}
