@@ -90,7 +90,10 @@ Internal:
 
 - **`cmd/`** — the daemon (cobra/viper/fx): `serve`, `whoami`, `version`,
   `blake3` (hash / verify / range: client-side checks of `x-cid` and the
-  `Blake3` attribute, over `blake3tree`);
+  `Blake3` attribute, over `blake3tree`), `catalog usage` (each bucket's
+  catalog bytes on Forge, dead on arrival, and live via
+  `logstore.WalkCatalog`, which reads segments retired from disk from Forge
+  with an access key from the environment, as JSON, for benchmark runs);
   `deps.go` (agent identity from the PEM key + optional did:web, pgx pool).
 - **`s3frontend/`** — versitygw `backend.Backend`: `object.go`
   (Put/Get/Head/Delete/List), `version.go` (resolveVersion / commitVersion,
@@ -112,7 +115,8 @@ Internal:
 - **`registry/`** — Postgres metadata: `postgres.go` (`Registry` + `State`;
   `CommitRoot` also journals each commit's catalog blocks in
   `ingot.catalog_journal` until their segment ships),
-  `segments.go` (`logstore.Meta`), `stores*.go` (intents, locations,
+  `segments.go` (`logstore.Meta`, and `CatalogUsage`, the per-bucket sums
+  the catalog usage gauges report), `stores*.go` (intents, locations,
   inclusions, blob_refs, GC, multipart sessions/parts, parks, streams),
   `locallocator.go` (the read tier's `Locator`). One `*Postgres` satisfies
   all of them.
@@ -124,18 +128,23 @@ Internal:
   ship authority (1h TTL) from in-request writes: `shipProofs` from body
   uploads (also the background releases' and aborts' fallback), and
   `commitProofs` from every `bucketop` commit (`CaptureShipAuthority`), which
-  the ship prefers.
+  the ship prefers. Both take only stores `reqscope.BorrowableProofStore`
+  returns, and their chains skip revoked delegations.
 - **`bucketauthority/`** — hilt bucket ops: forwards CreateBucket /
   DeleteBucket / ListBuckets to `/s3/bucket/*`, recovering the signed S3
   request from ctx.
 - **`iam/`** — the hilt IAM integration over `fil-forge/hilt/pkg/client`:
   versitygw `IAMService`/`RequestIAMService` authorizing each request via
   `/s3/request/authorize` (derived SigV4 key, with a local fast
-  path over cached delegations), plus `KeyProofs`/`DelegationCache` — per-
+  path over cached delegations, which accepts only chains ending in a
+  delegation the access key issued: Hilt's tenant-issued cleanup delegations
+  outlive the key and must not authorize requests), plus `KeyProofs`/`DelegationCache` — per-
   access-key TTL caches of hilt-issued delegations that the uploader and the
   network read tier consume via `internal/reqscope`. `KeyProofs` also
   remembers every revoked CID for 48h past its last sighting; a response
-  carrying one is authorized but not cached.
+  carrying one is authorized but not cached. `AuthorizeSigned` authorizes a
+  request signed in process (the catalog walk's Forge reads) into a store of
+  its own.
 - **`forgeclient/`** — carried-from-guppy sprue edge client: `/blob/add`
   (with a deferrable conclude, or by digest code for a streamed blob), `/ucan/conclude`, `/blob/abort`,
   `/blob/remove`, `/index/add`, receipt polling. The `/access` login and
@@ -177,6 +186,10 @@ Internal:
   acceptor's (`ingot.multipart.*`: parked-part age, passes by outcome,
   deferred Completes) are created on the global meter provider, through `s3frontend.Deps.MeterProvider` and
   `Layered.CountBlobReads`; with no provider installed they are no-ops.
+  So are the catalog usage gauges (`ingot.catalog.*`: each bucket's shipped
+  catalog bytes and how much was dead on arrival, labeled by space DID,
+  never bucket name), which a `server.go` sweep refreshes every five
+  minutes from `registry.CatalogUsageStore`.
   versitygw passes
   the backend the bare `*fasthttp.RequestCtx` as its context, so the
   middleware stores the span as a request user value under the trace API's
@@ -208,7 +221,8 @@ Internal:
   `*zap.Logger`, and the collaborator seams (`blockstore.BlockReader`; the
   four `uploader` seams; `bucketauthority.BucketAuthority`;
   `registry.Registry` plus the intent/location/inclusion/blob-ref/GC/
-  multipart/park stores; `logstore.Meta`; `auth.IAMService`) +
+  multipart/park stores; `logstore.Meta`; `auth.IAMService`; optionally
+  `registry.CatalogUsageStore`) +
   a `PreStartHook` group; runs pre-start → `New` → `Start` on the fx
   lifecycle.
 - **`Module(cfg)`** (production wrapper) — supplies Postgres as Registry +
@@ -275,9 +289,12 @@ forge-mode daemon. Two tiers:
     multipart, failed-Complete session recovery), on a small-`max_blob_size`
     config (`testdata/config-smallblob.yaml` via smelt's WithServiceConfig).
   - **`forge_*_test.go`** — forge-native behaviors on dedicated stacks:
-    provisioning (`forge_native`), delete/release (`forge_delete`), deferred
+    provisioning (`forge_native`), delete/release (`forge_delete`), the
+    catalog rebuilt from the journal after a wiped volume
+    (`forge_lost_volume`), deferred
     multipart accept (`forge_multipart_deferred`), catalog retention
-    (`forge_retention`), the read-after-eviction network tier and the
+    (`forge_retention`), `ingot catalog usage` inside the container
+    (`forge_catalog_usage`), the read-after-eviction network tier and the
     local blob budget sweeper (`forge_eviction`), and a real `aws s3 cp`
     multipart round trip from the official CLI image (`forge_awscli`).
 - **Suite-composition-sensitive upstream cases** — a few versitygw cases

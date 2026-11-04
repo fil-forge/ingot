@@ -1,18 +1,25 @@
 package registry_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
+	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
 	block "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap/zaptest"
 
 	"github.com/fil-forge/ingot/blockstore"
+	"github.com/fil-forge/ingot/logstore"
 	"github.com/fil-forge/ingot/migrations"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/libforge/testutil"
@@ -122,7 +129,7 @@ func TestCatalogJournal_Live(t *testing.T) {
 			t.Fatalf("journal after a refused commit = %v, want the 2 blocks", got)
 		}
 
-		if err := r.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seg, time.Now().Unix(), nil, nil); err != nil {
+		if err := r.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seg, time.Now().Unix(), nil, -1, nil); err != nil {
 			t.Fatalf("MarkSegmentShipped: %v", err)
 		}
 		if got := journaled(t, seg); len(got) != 0 {
@@ -153,6 +160,26 @@ func TestCatalogJournal_Live(t *testing.T) {
 		}
 		if got := journaled(t, seg); len(got) != 1 {
 			t.Fatalf("journal after a commit into a segment with no row = %v, want only the first block", got)
+		}
+	})
+
+	// Recovery retires a sealed segment whose CAR is gone rather than
+	// deleting its row. The segment never shipped, so its journal rows are
+	// the only copy of its blocks and must survive the retirement.
+	t.Run("retiring a sealed, unshipped segment keeps its rows", func(t *testing.T) {
+		seg := openSegment(t)
+		if _, err := commit(t, seg, block.NewBlock([]byte("sealed-lost"))); err != nil {
+			t.Fatalf("commit: %v", err)
+		}
+		now := time.Now().Unix()
+		if err := r.MarkSegmentSealed(ctx, blockstore.PlaneCatalog, seg, now, 10, make([]byte, 32), nil); err != nil {
+			t.Fatalf("MarkSegmentSealed: %v", err)
+		}
+		if err := r.RetireSegment(ctx, blockstore.PlaneCatalog, seg, now); err != nil {
+			t.Fatalf("RetireSegment: %v", err)
+		}
+		if got := journaled(t, seg); len(got) != 1 {
+			t.Fatalf("journal after retiring the unshipped segment = %v, want the block", got)
 		}
 	})
 
@@ -188,7 +215,7 @@ func TestCatalogJournal_Live(t *testing.T) {
 
 		shipDone := make(chan error, 1)
 		go func() {
-			shipDone <- r.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seg, time.Now().Unix(), nil,
+			shipDone <- r.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seg, time.Now().Unix(), nil, -1,
 				[]blockstore.OpRoot{{Bucket: "jb", Root: st.Root}, {Bucket: "jb", Root: next}})
 		}()
 		waitForLockWaiters(t, pool, 2)
@@ -219,6 +246,36 @@ func TestCatalogJournal_Live(t *testing.T) {
 	})
 
 	// newBucket creates a bucket with a segment open for it.
+	// openSegmentFor opens a further segment row for an existing bucket.
+	openSegmentFor := func(t *testing.T, bucket string) uint64 {
+		t.Helper()
+		seq, err := r.NextSegmentSeq(ctx)
+		if err != nil {
+			t.Fatalf("NextSegmentSeq: %v", err)
+		}
+		if err := r.InsertSegmentOpen(ctx, blockstore.PlaneCatalog, seq, bucket); err != nil {
+			t.Fatalf("InsertSegmentOpen: %v", err)
+		}
+		return seq
+	}
+	// journaledFor counts the journal rows under seg, whatever their bucket.
+	journaledFor := func(t *testing.T, seg uint64) []string {
+		t.Helper()
+		rows, err := pool.Query(ctx, `SELECT cid FROM ingot.catalog_journal WHERE seq = $1`, int64(seg))
+		if err != nil {
+			t.Fatalf("query journal: %v", err)
+		}
+		out, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (string, error) {
+			var c []byte
+			err := row.Scan(&c)
+			return string(c), err
+		})
+		if err != nil {
+			t.Fatalf("journal rows: %v", err)
+		}
+		return out
+	}
+
 	newBucket := func(t *testing.T, name string) uint64 {
 		t.Helper()
 		if err := r.Create(ctx, name, testutil.RandomDID(t), registry.CreateState{Tenant: testutil.RandomDID(t)}); err != nil {
@@ -274,7 +331,7 @@ func TestCatalogJournal_Live(t *testing.T) {
 
 		shipDone := make(chan error, 1)
 		go func() {
-			shipDone <- r.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seg, time.Now().Unix(), nil,
+			shipDone <- r.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seg, time.Now().Unix(), nil, -1,
 				[]blockstore.OpRoot{{Bucket: "jb-del", Root: root}})
 		}()
 		waitForLockWaiters(t, pool, 1)
@@ -328,7 +385,7 @@ func TestCatalogJournal_Live(t *testing.T) {
 
 		shipDone := make(chan error, 1)
 		go func() {
-			shipDone <- r.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seg, time.Now().Unix(), nil,
+			shipDone <- r.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seg, time.Now().Unix(), nil, -1,
 				[]blockstore.OpRoot{{Bucket: "jb-stale", Root: old}})
 		}()
 		waitForLockWaiters(t, pool, 1)
@@ -348,6 +405,320 @@ func TestCatalogJournal_Live(t *testing.T) {
 			t.Fatal("ship did not finish")
 		}
 	})
+
+	// EmptyRoot deletes the bucket's journal rows as a deletion does, so a
+	// ship of one of the bucket's segments waits for it on the bucket row,
+	// also when the ship's guard is stale and its advance locks nothing: the
+	// two deletes would otherwise lock the same journal rows in different
+	// orders and could deadlock. A third transaction holding one journal row
+	// pauses EmptyRoot after it has taken the bucket row; the ship must then
+	// be queued on that row, not on the journal.
+	t.Run("a ship with a stale guard waits for EmptyRoot", func(t *testing.T) {
+		seg := newBucket(t, "jb-emptying")
+		old := liveCid(t, "emptying-old")
+		if err := r.CommitRoot(ctx, "jb-emptying", cid.Undef, old, registry.RootCommit{
+			Journal: blockstore.Appended{Segment: seg, Blocks: []block.Block{block.NewBlock([]byte("emptying-a"))}},
+		}); err != nil {
+			t.Fatalf("commit: %v", err)
+		}
+		cur := liveCid(t, "emptying-cur")
+		if err := r.CommitRoot(ctx, "jb-emptying", old, cur, registry.RootCommit{
+			Journal: blockstore.Appended{Segment: seg, Blocks: []block.Block{block.NewBlock([]byte("emptying-b"))}},
+		}); err != nil {
+			t.Fatalf("second commit: %v", err)
+		}
+		holder, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin holder: %v", err)
+		}
+		defer func() { _ = holder.Rollback(ctx) }()
+		if _, err := holder.Exec(ctx,
+			`SELECT 1 FROM ingot.catalog_journal WHERE seq = $1 LIMIT 1 FOR UPDATE`, int64(seg)); err != nil {
+			t.Fatalf("hold a journal row: %v", err)
+		}
+
+		emptyDone := make(chan error, 1)
+		go func() { emptyDone <- r.EmptyRoot(ctx, "jb-emptying", cur) }()
+		waitForLockedQuery(t, pool, "DELETE FROM ingot.catalog_journal WHERE bucket%")
+
+		shipDone := make(chan error, 1)
+		go func() {
+			shipDone <- r.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, seg, time.Now().Unix(), nil, -1,
+				[]blockstore.OpRoot{{Bucket: "jb-emptying", Root: old}})
+		}()
+		if q := waitForLockedQuery(t, pool, "%FOR KEY SHARE%", "DELETE FROM ingot.catalog_journal WHERE seq%"); !strings.Contains(q, "FOR KEY SHARE") {
+			t.Fatalf("the ship reached the journal rows while EmptyRoot was deleting them (waiting on %q)", q)
+		}
+
+		if err := holder.Commit(ctx); err != nil {
+			t.Fatalf("release the journal row: %v", err)
+		}
+		for name, done := range map[string]chan error{"EmptyRoot": emptyDone, "ship": shipDone} {
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatalf("%s: %v", name, err)
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatalf("%s did not finish", name)
+			}
+		}
+		var shipped bool
+		if err := pool.QueryRow(ctx, `SELECT shipped_at IS NOT NULL FROM ingot.segments WHERE seq = $1`, int64(seg)).Scan(&shipped); err != nil {
+			t.Fatalf("read the segment: %v", err)
+		}
+		if !shipped {
+			t.Fatal("the ship didn't stamp its segment")
+		}
+	})
+
+	// DeleteBucket's first write empties the root, clears the forge root and
+	// drops the bucket's journaled blocks, in one transaction. A stale expect
+	// changes none of it, and another bucket's rows stay.
+	t.Run("emptying the root drops the bucket's journal rows", func(t *testing.T) {
+		seg := newBucket(t, "jb-empty")
+		otherSeg := newBucket(t, "jb-other")
+		root := liveCid(t, "empty-root")
+		if err := r.CommitRoot(ctx, "jb-empty", cid.Undef, root, registry.RootCommit{
+			Journal: blockstore.Appended{Segment: seg, Blocks: []block.Block{block.NewBlock([]byte("emptied"))}},
+		}); err != nil {
+			t.Fatalf("commit: %v", err)
+		}
+		if err := r.CommitRoot(ctx, "jb-other", cid.Undef, liveCid(t, "other-root"), registry.RootCommit{
+			Journal: blockstore.Appended{Segment: otherSeg, Blocks: []block.Block{block.NewBlock([]byte("other"))}},
+		}); err != nil {
+			t.Fatalf("commit other: %v", err)
+		}
+		if err := r.SetForgeRoot(ctx, "jb-empty", root); err != nil {
+			t.Fatalf("SetForgeRoot: %v", err)
+		}
+		count := func(t *testing.T, bucket string) int {
+			t.Helper()
+			var n int
+			if err := pool.QueryRow(ctx, `SELECT count(*) FROM ingot.catalog_journal WHERE bucket = $1`, bucket).Scan(&n); err != nil {
+				t.Fatalf("count journal: %v", err)
+			}
+			return n
+		}
+
+		if err := r.EmptyRoot(ctx, "jb-empty", liveCid(t, "stale")); !errors.Is(err, registry.ErrConflict) {
+			t.Fatalf("EmptyRoot with a stale expect = %v, want ErrConflict", err)
+		}
+		if st, err := r.Get(ctx, "jb-empty"); err != nil || !st.Root.Equals(root) || !st.ForgeRoot.Equals(root) || count(t, "jb-empty") != 1 {
+			t.Fatalf("after a refused EmptyRoot: state %+v (err %v), %d journal rows; want both roots and the row kept",
+				st, err, count(t, "jb-empty"))
+		}
+
+		if err := r.EmptyRoot(ctx, "jb-empty", root); err != nil {
+			t.Fatalf("EmptyRoot: %v", err)
+		}
+		st, err := r.Get(ctx, "jb-empty")
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		if st.Root.Defined() || st.ForgeRoot.Defined() {
+			t.Fatalf("root %s, forge root %s after EmptyRoot; want both empty", st.Root, st.ForgeRoot)
+		}
+		if n := count(t, "jb-empty"); n != 0 {
+			t.Fatalf("%d journal rows left for the emptied bucket, want 0", n)
+		}
+		if n := count(t, "jb-other"); n != 1 {
+			t.Fatalf("%d journal rows for the other bucket, want 1", n)
+		}
+
+		// A retried DeleteBucket empties an empty root again.
+		if err := r.EmptyRoot(ctx, "jb-empty", cid.Undef); err != nil {
+			t.Fatalf("EmptyRoot on an empty root: %v", err)
+		}
+		if err := r.EmptyRoot(ctx, "jb-missing", cid.Undef); !errors.Is(err, registry.ErrNotFound) {
+			t.Fatalf("EmptyRoot on a missing bucket = %v, want ErrNotFound", err)
+		}
+	})
+
+	// What recovery reads and writes to rebuild a lost segment from the
+	// journal: the buckets and segments the journal files blocks under, a
+	// segment's blocks paged in CID order, and a range of them moved onto the
+	// segment they were rebuilt into, keeping each row's age.
+	t.Run("rebuild reads", func(t *testing.T) {
+		seg := newBucket(t, "jb-rebuild")
+		var blocks []block.Block
+		for i := range 5 {
+			blocks = append(blocks, block.NewBlock([]byte(fmt.Sprintf("rebuild-%d", i))))
+		}
+		if err := r.CommitRoot(ctx, "jb-rebuild", cid.Undef, liveCid(t, "rebuild-root"), registry.RootCommit{
+			Journal: blockstore.Appended{Segment: seg, Blocks: blocks},
+		}); err != nil {
+			t.Fatalf("commit: %v", err)
+		}
+		buckets, err := r.JournalBuckets(ctx)
+		if err != nil || !slices.Contains(buckets, "jb-rebuild") {
+			t.Fatalf("JournalBuckets = %v (err %v), want jb-rebuild among them", buckets, err)
+		}
+		if segs, err := r.JournalSegments(ctx, "jb-rebuild"); err != nil || !slices.Equal(segs, []uint64{seg}) {
+			t.Fatalf("JournalSegments = %v (err %v), want [%d]", segs, err, seg)
+		}
+
+		var paged []string
+		for after := cid.Undef; ; {
+			page, err := r.ReadJournal(ctx, seg, after, 2)
+			if err != nil {
+				t.Fatalf("ReadJournal: %v", err)
+			}
+			for _, b := range page {
+				paged = append(paged, string(b.Cid().Bytes()))
+			}
+			if len(page) < 2 {
+				break
+			}
+			after = page[len(page)-1].Cid()
+		}
+		if len(paged) != len(blocks) || !slices.IsSorted(paged) {
+			t.Fatalf("paged %d blocks (sorted %v), want all %d in CID order", len(paged), slices.IsSorted(paged), len(blocks))
+		}
+	})
+
+	t.Run("a journal move re-files a range and keeps its age", func(t *testing.T) {
+		from := newBucket(t, "jb-move")
+		var blocks []block.Block
+		for i := range 5 {
+			blocks = append(blocks, block.NewBlock([]byte(fmt.Sprintf("move-%d", i))))
+		}
+		if err := r.CommitRoot(ctx, "jb-move", cid.Undef, liveCid(t, "move-root"), registry.RootCommit{
+			Journal: blockstore.Appended{Segment: from, Blocks: blocks},
+		}); err != nil {
+			t.Fatalf("commit: %v", err)
+		}
+		slices.SortFunc(blocks, func(a, b block.Block) int { return bytes.Compare(a.Cid().Bytes(), b.Cid().Bytes()) })
+		to := openSegmentFor(t, "jb-move")
+		var before time.Time
+		if err := pool.QueryRow(ctx, `SELECT created_at FROM ingot.catalog_journal WHERE seq = $1 AND cid = $2`,
+			int64(from), blocks[1].Cid().Bytes()).Scan(&before); err != nil {
+			t.Fatalf("read created_at: %v", err)
+		}
+
+		if err := r.MoveJournal(ctx, "jb-move", from, to, blocks[0].Cid(), blocks[2].Cid()); err != nil {
+			t.Fatalf("MoveJournal: %v", err)
+		}
+		if got := journaledFor(t, from); len(got) != 2 {
+			t.Fatalf("%d rows left under the source, want the 2 outside the range", len(got))
+		}
+		if got := journaledFor(t, to); len(got) != 3 {
+			t.Fatalf("%d rows under the target, want the 3 in the range", len(got))
+		}
+		var after time.Time
+		if err := pool.QueryRow(ctx, `SELECT created_at FROM ingot.catalog_journal WHERE seq = $1 AND cid = $2`,
+			int64(to), blocks[1].Cid().Bytes()).Scan(&after); err != nil {
+			t.Fatalf("read moved created_at: %v", err)
+		}
+		if !after.Equal(before) {
+			t.Fatalf("moved row's created_at = %v, want %v", after, before)
+		}
+
+		// A target that has shipped since takes nothing; the source still goes.
+		if err := r.MarkSegmentShipped(ctx, blockstore.PlaneCatalog, to, time.Now().Unix(), nil, -1, nil); err != nil {
+			t.Fatalf("MarkSegmentShipped: %v", err)
+		}
+		if err := r.MoveJournal(ctx, "jb-move", from, to, blocks[3].Cid(), blocks[4].Cid()); err != nil {
+			t.Fatalf("MoveJournal to a shipped segment: %v", err)
+		}
+		if n := len(journaledFor(t, from)) + len(journaledFor(t, to)); n != 0 {
+			t.Fatalf("%d rows left after a move onto a shipped segment, want 0", n)
+		}
+		if err := r.MoveJournal(ctx, "jb-move", from, 1<<62, blocks[0].Cid(), blocks[4].Cid()); err == nil {
+			t.Fatal("MoveJournal onto a segment with no row succeeded")
+		}
+	})
+
+	// Recovery over real Postgres: a manager opened on an empty directory
+	// rebuilds the bucket's journaled blocks into new segments, reads them,
+	// and leaves every journal row under a segment that is on disk. It opens
+	// every bucket in the database, so it runs after the subtests that need
+	// theirs as they left them.
+	t.Run("a manager over a wiped volume rebuilds from the journal", func(t *testing.T) {
+		seg := newBucket(t, "jb-wiped")
+		var blocks []block.Block
+		for i := range 300 {
+			blocks = append(blocks, block.NewBlock([]byte(fmt.Sprintf("wiped-%03d-%s", i, strings.Repeat("w", 64)))))
+		}
+		if err := r.CommitRoot(ctx, "jb-wiped", cid.Undef, liveCid(t, "wiped-root"), registry.RootCommit{
+			Journal: blockstore.Appended{Segment: seg, Blocks: blocks},
+		}); err != nil {
+			t.Fatalf("commit: %v", err)
+		}
+		dir := t.TempDir()
+		m, err := logstore.OpenManager(ctx, logstore.ManagerConfig{
+			Dir:     dir,
+			Meta:    r,
+			Catalog: logstore.PlaneConfig{SealBytes: 8 << 10, SealAge: time.Hour},
+			Logger:  zaptest.NewLogger(t),
+		})
+		if err != nil {
+			t.Fatalf("OpenManager: %v", err)
+		}
+		defer func() { _ = m.Close(ctx) }()
+		for _, b := range blocks {
+			if _, err := m.Get(ctx, b.Cid()); err != nil {
+				t.Fatalf("Get %s after the rebuild: %v", b.Cid(), err)
+			}
+		}
+		if got := journaledFor(t, seg); len(got) != 0 {
+			t.Fatalf("%d journal rows still under the lost segment", len(got))
+		}
+		segs, err := r.JournalSegments(ctx, "jb-wiped")
+		if err != nil || len(segs) < 2 {
+			t.Fatalf("journal segments after the rebuild = %v (err %v), want the rows split across rebuilt segments", segs, err)
+		}
+		for _, s := range segs {
+			if _, err := os.Stat(filepath.Join(dir, "jb-wiped", "catalog", fmt.Sprintf("seg-%020d.car", s))); err != nil {
+				t.Fatalf("journal rows under segment %d, whose CAR isn't on disk: %v", s, err)
+			}
+		}
+	})
+
+	t.Run("the segment seq moves past disk and never back", func(t *testing.T) {
+		start, err := r.NextSegmentSeq(ctx)
+		if err != nil {
+			t.Fatalf("NextSegmentSeq: %v", err)
+		}
+		if err := r.EnsureSegmentSeqAbove(ctx, start+10); err != nil {
+			t.Fatalf("EnsureSegmentSeqAbove: %v", err)
+		}
+		if next, err := r.NextSegmentSeq(ctx); err != nil || next != start+11 {
+			t.Fatalf("NextSegmentSeq after moving past %d = %d (err %v)", start+10, next, err)
+		}
+		if err := r.EnsureSegmentSeqAbove(ctx, start); err != nil {
+			t.Fatalf("EnsureSegmentSeqAbove below: %v", err)
+		}
+		if next, err := r.NextSegmentSeq(ctx); err != nil || next != start+12 {
+			t.Fatalf("NextSegmentSeq after a lower EnsureSegmentSeqAbove = %d (err %v), want %d", next, err, start+12)
+		}
+	})
+}
+
+// waitForLockedQuery waits until a backend in the database is blocked on a
+// lock running a statement that matches one of the LIKE patterns, and returns
+// that statement. Unlike waitForLockWaiters it can't be satisfied by another
+// package's tests waiting on a lock in the same database.
+func waitForLockedQuery(t *testing.T, pool *pgxpool.Pool, patterns ...string) string {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		var query string
+		err := pool.QueryRow(context.Background(), `
+			SELECT query FROM pg_stat_activity
+			 WHERE wait_event_type = 'Lock' AND datname = current_database()
+			   AND query LIKE ANY ($1)
+			 LIMIT 1`, patterns).Scan(&query)
+		if err == nil {
+			return query
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			t.Fatalf("pg_stat_activity: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("no backend blocked on a lock running %q", patterns)
+	return ""
 }
 
 // waitForLockWaiters waits until at least n backends are blocked on a lock.

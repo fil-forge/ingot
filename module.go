@@ -105,7 +105,7 @@ func Module(cfg config.Config) fx.Option {
 			provideForgeReader,
 			provideTokenStore,
 			provideForgeClient,
-			provideAuthServiceClient,
+			NewAuthServiceClient,
 			provideUploader,
 			provideMigrationHook,
 			provideKeyProofs,
@@ -171,6 +171,9 @@ type serverParams struct {
 	Parks           registry.ParkStore
 	PendingReleases registry.PendingReleaseStore
 	Meta            logstore.Meta
+	// CatalogUsage feeds the catalog usage gauges; without it they are not
+	// reported (see ServerDeps.CatalogUsage).
+	CatalogUsage registry.CatalogUsageStore `optional:"true"`
 	// Identity is the agent identity (the host-provided libforge identity, the
 	// issuer of every outbound invocation); the listener serves its DID
 	// document at /.well-known/did.json. Required.
@@ -235,6 +238,7 @@ func registerServerLifecycle(lc fx.Lifecycle, p serverParams) {
 				RegionKeys:      p.RegionKeys,
 				TenantKeys:      p.TenantKeys,
 				Meta:            p.Meta,
+				CatalogUsage:    p.CatalogUsage,
 				Identity:        p.Identity,
 				IAM:             p.IAM,
 			})
@@ -291,13 +295,13 @@ func provideForgeClient(cfg config.Config, id identity.Identity, store tokenstor
 	)
 }
 
-// provideAuthServiceClient builds the UCAN RPC client to the Hilt tenant-
+// NewAuthServiceClient builds the UCAN RPC client to the Hilt tenant-
 // management service (/s3/request/authorize, /s3/bucket/*). The agent identity
 // issues invocations; AuthServiceProofs supplies the Hilt→agent proof chains
 // and is required — Hilt rejects unproven invocations, so a client built
-// without them would fail every S3 request. The provider is lazy, so an
+// without them would fail every S3 request. As a provider it is lazy, so an
 // unconfigured Hilt only errors if a consumer actually needs the client.
-func provideAuthServiceClient(cfg config.Config, id identity.Identity, logger *zap.Logger) (*hiltclient.Client, error) {
+func NewAuthServiceClient(cfg config.Config, id identity.Identity, logger *zap.Logger) (*hiltclient.Client, error) {
 	if cfg.AuthServiceURL == "" || cfg.AuthServiceDID == "" {
 		return nil, fmt.Errorf("ingot: auth_service_url and auth_service_did are required for the auth service client")
 	}
@@ -496,6 +500,7 @@ type registryResult struct {
 	UploadRegs        registry.UploadRegistrationStore
 	EncParams         registry.EncryptionParamsStore
 	RevocationCursors registry.RevocationCursorStore
+	CatalogUsage      registry.CatalogUsageStore
 	Meta              logstore.Meta
 }
 
@@ -503,12 +508,13 @@ type registryResult struct {
 // exposes it under every interface ServerModule consumes. One *registry.Postgres
 // satisfies bucket state (Registry), the spool's upload_intents (IntentStore),
 // blob locations (LocationStore), the reference index (BlobRefStore), the GC
-// candidate log (GCStore), and segment metadata (Meta). The hilt client is
-// required: bucket create/delete/list are forwarded to Hilt, so forge mode
-// needs hilt_url/hilt_did configured.
+// candidate log (GCStore), the catalog usage sums (CatalogUsageStore), and
+// segment metadata (Meta). The hilt client is required: bucket
+// create/delete/list are forwarded to Hilt, so forge mode needs
+// hilt_url/hilt_did configured.
 func provideRegistry(pool *pgxpool.Pool) registryResult {
 	pg := registry.NewPostgres(pool)
-	return registryResult{Registry: pg, Intents: pg, Locations: pg, Inclusions: pg, GC: pg, Multipart: pg, Parks: pg, Streams: pg, PendingReleases: pg, UploadRegs: pg, EncParams: pg, RevocationCursors: pg, Meta: pg}
+	return registryResult{Registry: pg, Intents: pg, Locations: pg, Inclusions: pg, GC: pg, Multipart: pg, Parks: pg, Streams: pg, PendingReleases: pg, UploadRegs: pg, EncParams: pg, RevocationCursors: pg, CatalogUsage: pg, Meta: pg}
 }
 
 // migrationHookOut feeds the migration PreStartHook into the "ingot_prestart"

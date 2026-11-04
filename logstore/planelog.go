@@ -83,17 +83,6 @@ func openPlaneLog(ctx context.Context, plane blockstore.Plane, bucket, dir strin
 		return nil, err
 	}
 
-	// Force-seal a recovered open segment so a fresh open is always
-	// brand-new on each process startup.
-	if pl.open != nil {
-		if err := pl.open.seal(ctx, meta); err != nil {
-			return nil, fmt.Errorf("logstore: force-seal recovered open %s segment: %w", plane, err)
-		}
-		pl.sealed = append([]*Segment{pl.open}, pl.sealed...)
-		pl.enqueueFlush(pl.open)
-		pl.open = nil
-	}
-
 	if pc.Ship {
 		pl.wg.Add(1)
 		go pl.flushLoop()
@@ -270,7 +259,9 @@ func (pl *PlaneLog) ensureOpenLockedAppMu(ctx context.Context) (*Segment, error)
 }
 
 // sealOpenIfDue seals the current open segment if one exists and is due
-// (over SealAge or SealBytes), or force is set, then enqueues it.
+// (over SealAge or SealBytes), or force is set, then enqueues it. A segment
+// that froze but whose seal didn't record is logged and enqueued too, and
+// returns nil: it has moved on, and the flush or the next start records it.
 func (pl *PlaneLog) sealOpenIfDue(ctx context.Context, force bool) error {
 	pl.appMu.Lock()
 	defer pl.appMu.Unlock()
@@ -295,7 +286,13 @@ func (pl *PlaneLog) sealOpenIfDue(ctx context.Context, force bool) error {
 	err := open.seal(sealCtx, pl.meta)
 	tracing.End(span, err)
 	if err != nil {
-		return err
+		if open.State() == StateOpen {
+			return err // still open: the next tick tries again
+		}
+		// A segment that froze but whose seal wasn't recorded moves on too,
+		// so writes go to a new segment. Its ship records the seal first.
+		pl.logger.Warn("logstore: seal not recorded; the flush or the next start records it",
+			zap.Stringer("plane", pl.plane), zap.Uint64("seq", open.Seq()), zap.Error(err))
 	}
 
 	pl.catMu.Lock()
@@ -370,15 +367,15 @@ func (pl *PlaneLog) retryUnshipped() {
 
 // flushOne ships one sealed segment, trying up to maxAttempts times with
 // backoff, and reports whether it is shipped. On success it stamps the ship
-// state in Meta (which advances forge_root_cid for the catalog plane and
-// drops the segment's journaled blocks), then in memory, and runs the
-// retention sweep. A failed stamp is retried without shipping again within
-// the call, and the segment counts as shipped only once it lands: retention
-// retires shipped segments, and a retired segment whose stamp never landed
-// would leave its journal rows behind for good. A later call (the retry
-// sweep's, or recovery's at the next start) ships it again. A segment
-// already shipped, as one still queued after the retry sweep shipped it is,
-// is left alone.
+// state in Meta, with the segment's dead-on-arrival bytes (the stamp also
+// advances forge_root_cid for the catalog plane and drops the segment's
+// journaled blocks), then in memory, and runs the retention sweep. A failed
+// stamp is retried without shipping again within the call, and the segment
+// counts as shipped only once it lands: retention retires shipped segments,
+// and a retired segment whose stamp never landed would leave its journal
+// rows behind for good. A later call (the retry sweep's, or recovery's at
+// the next start) ships it again. A segment already shipped, as one still
+// queued after the retry sweep shipped it is, is left alone.
 func (pl *PlaneLog) flushOne(seg *Segment, maxAttempts int) bool {
 	if seg.IsShipped() || seg.IsRetired() {
 		return true
@@ -391,6 +388,12 @@ func (pl *PlaneLog) flushOne(seg *Segment, maxAttempts int) bool {
 	defer span.End()
 	backoff := shipBackoff
 
+	// What the segment holds that is already dead is measured from its local
+	// files before it ships, and recorded with the stamp; a failure only
+	// leaves it unmeasured.
+	deadBytes := seg.deadOnArrival()
+	span.SetAttributes(attribute.Int64("ingot.log.dead_bytes", deadBytes))
+
 	var (
 		flushed     bool
 		shippedAt   int64
@@ -400,8 +403,13 @@ func (pl *PlaneLog) flushOne(seg *Segment, maxAttempts int) bool {
 		span.SetAttributes(attribute.Int("ingot.log.attempts", attempt))
 		var err error
 		if !flushed {
-			if indexDigest, err = pl.pc.Flush(ctx, seg); err == nil {
-				flushed, shippedAt = true, time.Now().Unix()
+			// Record a seal that failed to record before shipping: a ship
+			// would stamp a row still open, with no sha256 for a release to
+			// find. A no-op once recorded.
+			if err = seg.seal(ctx, pl.meta); err == nil {
+				if indexDigest, err = pl.pc.Flush(ctx, seg); err == nil {
+					flushed, shippedAt = true, time.Now().Unix()
+				}
 			}
 		}
 		if err != nil {
@@ -409,7 +417,7 @@ func (pl *PlaneLog) flushOne(seg *Segment, maxAttempts int) bool {
 				zap.Stringer("plane", pl.plane), zap.Uint64("seq", seg.Seq()),
 				zap.Int("attempt", attempt), zap.Error(err))
 		} else {
-			if err = pl.meta.MarkSegmentShipped(ctx, pl.plane, seg.Seq(), shippedAt, indexDigest, seg.OpRoots()); err == nil {
+			if err = pl.meta.MarkSegmentShipped(ctx, pl.plane, seg.Seq(), shippedAt, indexDigest, deadBytes, seg.OpRoots()); err == nil {
 				seg.markShipped(shippedAt)
 				pl.runRetention(ctx)
 				return true
@@ -443,8 +451,10 @@ func (pl *PlaneLog) flushOne(seg *Segment, maxAttempts int) bool {
 	return false
 }
 
-// runRetention retires shipped segments beyond the Retain window and drops
-// them off the read tier + DB. A non-shipping plane is never retired.
+// runRetention retires shipped segments beyond the Retain window: unlinks
+// their files, drops them off the read tier, and stamps their rows retired.
+// The rows stay as the record of what each segment registered in the
+// bucket's space. A non-shipping plane is never retired.
 func (pl *PlaneLog) runRetention(ctx context.Context) {
 	if !pl.pc.Ship {
 		return
@@ -487,9 +497,10 @@ func (pl *PlaneLog) runRetention(ctx context.Context) {
 	pl.sealed = keep
 	pl.catMu.Unlock()
 
+	now := time.Now().Unix()
 	for _, seg := range remove {
-		if err := pl.meta.DeleteSegment(ctx, pl.plane, seg.Seq()); err != nil {
-			pl.logger.Warn("logstore: delete segment row",
+		if err := pl.meta.RetireSegment(ctx, pl.plane, seg.Seq(), now); err != nil {
+			pl.logger.Warn("logstore: retire segment row",
 				zap.Stringer("plane", pl.plane), zap.Uint64("seq", seg.Seq()), zap.Error(err))
 		}
 	}

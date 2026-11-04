@@ -26,6 +26,7 @@ var (
 	_ InclusionStore          = (*Postgres)(nil)
 	_ MultipartStore          = (*Postgres)(nil)
 	_ GCStore                 = (*Postgres)(nil)
+	_ CatalogUsageStore       = (*Postgres)(nil)
 	_ RevocationCursorStore   = (*Postgres)(nil)
 	_ PendingReleaseStore     = (*Postgres)(nil)
 	_ UploadRegistrationStore = (*Postgres)(nil)

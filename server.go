@@ -122,6 +122,10 @@ type ServerDeps struct {
 	// Meta is the persistence backing for log-segment metadata.
 	// Typically the same instance as Registry.
 	Meta logstore.Meta
+	// CatalogUsage, when set, sums each bucket's shipped catalog segments for
+	// the catalog usage gauges (ingot.catalog.*). Optional; typically the
+	// same instance as Registry.
+	CatalogUsage registry.CatalogUsageStore
 
 	// Identity is the agent identity (the issuer of every outbound
 	// invocation). The listener serves its DID document at
@@ -177,7 +181,7 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 	// segments/<bucket>/ and ship to that bucket's Forge space); the manager
 	// stands in wherever the single global log stood.
 	log, err := logstore.OpenManager(ctx, logstore.ManagerConfig{
-		Dir:  filepath.Join(cfg.DataDir, "segments"),
+		Dir:  SegmentsDir(cfg.DataDir),
 		Meta: deps.Meta,
 		Catalog: logstore.PlaneConfig{
 			SealBytes: cfg.SealBytesCatalog,
@@ -253,6 +257,7 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		RehashBudget:        cfg.MultipartRehashBudget,
 		CORS:                cfg.CORSConfig,
 		AllowNoneEncryption: cfg.AllowNoneEncryption,
+		CatalogUsage:        deps.CatalogUsage,
 		Logger:              logger,
 	})
 
@@ -302,6 +307,7 @@ func (s *Server) Start(ctx context.Context) error {
 	s.startReleasedPass()
 	s.startRegistrationSweeper()
 	s.startAcceptSweeper()
+	s.startCatalogUsageSweeper()
 	return nil
 }
 
@@ -550,6 +556,41 @@ func (s *Server) startRegistrationSweeper() {
 	})
 }
 
+// catalogUsageInterval is how often the catalog usage gauges' figures are
+// refreshed from the segment rows. Each refresh scans every segment row,
+// retired ones included, which accumulate until DeleteBucket (see
+// registry.Postgres.CatalogUsage for the cost), so it runs rarely; the
+// figures grow slowly.
+const catalogUsageInterval = 5 * time.Minute
+
+// startCatalogUsageSweeper refreshes the figures the catalog usage gauges
+// report (see Backend.RefreshCatalogUsage) at startup and then every
+// catalogUsageInterval, when the backend has a catalog usage store.
+func (s *Server) startCatalogUsageSweeper() {
+	if !s.backend.ReportsCatalogUsage() {
+		return
+	}
+	s.goSweep(func() {
+		ticker := time.NewTicker(catalogUsageInterval)
+		defer ticker.Stop()
+		for {
+			ctx, cancel := context.WithTimeout(s.sweepCtx, catalogUsageInterval)
+			ctx, span := tracing.Start(ctx, "sweep.catalog_usage")
+			n, err := s.backend.RefreshCatalogUsage(ctx)
+			s.endSweepSpan(span, err, attribute.Int("ingot.sweep.count", n))
+			cancel()
+			if err != nil && s.sweepCtx.Err() == nil {
+				s.logger.Warn("catalog usage sweep", zap.Error(err))
+			}
+			select {
+			case <-s.sweepCtx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	})
+}
+
 // Stop cancels the background sweeps and waits for them to exit (until ctx
 // ends), then shuts the listener down and drains the log. Always returns the
 // combined error of these steps so callers see all failure modes; none is
@@ -565,7 +606,7 @@ func (s *Server) Stop(ctx context.Context) error {
 		}
 	}
 	if err := s.backend.CloseMetrics(); err != nil {
-		errs = append(errs, fmt.Errorf("unregister local blob metrics: %w", err))
+		errs = append(errs, fmt.Errorf("unregister gauges: %w", err))
 	}
 	if err := s.api.ShutDown(); err != nil {
 		errs = append(errs, fmt.Errorf("s3api shutdown: %w", err))
@@ -611,6 +652,10 @@ func (s *Server) waitSweeps(ctx context.Context) error {
 		return fmt.Errorf("waiting for background sweeps: %w", ctx.Err())
 	}
 }
+
+// SegmentsDir is where the daemon keeps its catalog log under dataDir: one
+// directory per bucket, as logstore.ManagerConfig.Dir describes.
+func SegmentsDir(dataDir string) string { return filepath.Join(dataDir, "segments") }
 
 // newBucketFlushFunc builds the logstore flush callback for one bucket's
 // log: it ships a sealed catalog CAR to Forge via uploader.SubmitShard,
@@ -880,7 +925,7 @@ func validateServerInputs(cfg config.ServerConfig, deps ServerDeps) error {
 
 func applyServerDefaults(cfg config.ServerConfig) config.ServerConfig {
 	if cfg.Region == "" {
-		cfg.Region = "us-east-1"
+		cfg.Region = config.DefaultRegion
 	}
 	if cfg.MaxBlobSize <= 0 {
 		cfg.MaxBlobSize = msbucket.DefaultMaxBlobSize

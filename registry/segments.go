@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/fil-forge/ucantone/did"
+	block "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
 	"github.com/jackc/pgx/v5"
 	"github.com/multiformats/go-multihash"
@@ -68,7 +70,7 @@ func (r *Postgres) MarkSegmentSealed(ctx context.Context, plane blockstore.Plane
 	return nil
 }
 
-func (r *Postgres) MarkSegmentShipped(ctx context.Context, plane blockstore.Plane, seq uint64, shippedAt int64, indexDigest multihash.Multihash, opRoots []blockstore.OpRoot) error {
+func (r *Postgres) MarkSegmentShipped(ctx context.Context, plane blockstore.Plane, seq uint64, shippedAt int64, indexDigest multihash.Multihash, deadBytes int64, opRoots []blockstore.OpRoot) error {
 	// Only the catalog plane ships: stamp shipped_at AND advance forge_root_cid
 	// for every op-root in this segment, atomically.
 	tx, err := r.pool.Begin(ctx)
@@ -77,10 +79,15 @@ func (r *Postgres) MarkSegmentShipped(ctx context.Context, plane blockstore.Plan
 	}
 	defer tx.Rollback(ctx)
 
+	// An unmeasured segment's dead_bytes stays NULL.
+	var dead *int64
+	if deadBytes >= 0 {
+		dead = &deadBytes
+	}
 	tag, err := tx.Exec(ctx,
-		`UPDATE ingot.segments SET shipped_at = $2, index_digest = $3
+		`UPDATE ingot.segments SET shipped_at = $2, index_digest = $3, dead_bytes = $4
 		 WHERE seq = $1 AND plane = 'catalog' AND shipped_at IS NULL`,
-		int64(seq), shippedAt, indexDigest)
+		int64(seq), shippedAt, indexDigest, dead)
 	if err != nil {
 		return fmt.Errorf("registry: mark catalog shipped %d: %w", seq, err)
 	}
@@ -116,10 +123,11 @@ func (r *Postgres) MarkSegmentShipped(ctx context.Context, plane blockstore.Plan
 	// committed, and this statement sees its rows; any later commit sees the
 	// segment shipped and journals nothing.
 	//
-	// Deleting a bucket locks its row and then cascades into its journal
-	// rows, so the rows' bucket is locked first here too: the advances above
-	// lock it only where the guard matched. KEY SHARE conflicts with the
-	// deletion's lock but not with a commit's root swap.
+	// Deleting a bucket, or emptying its root (EmptyRoot), locks its row and
+	// then deletes its journal rows, so the rows' bucket is locked first here
+	// too: the advances above lock it only where the guard matched. KEY SHARE
+	// conflicts with those FOR UPDATE locks but not with a commit's root
+	// swap.
 	if _, err := tx.Exec(ctx, `
 		SELECT 1 FROM ingot.buckets
 		 WHERE name IN (SELECT bucket FROM ingot.catalog_journal WHERE seq = $1)
@@ -145,50 +153,42 @@ func (r *Postgres) DeleteSegment(ctx context.Context, plane blockstore.Plane, se
 	return nil
 }
 
-func (r *Postgres) ListSegments(ctx context.Context, plane blockstore.Plane, bucket string) ([]logstore.SegmentMeta, error) {
-	rows, err := r.pool.Query(ctx,
-		`SELECT seq, state, COALESCE(sealed_at, 0), size_bytes, sha256, COALESCE(shipped_at, 0), index_digest
-		   FROM ingot.segments
-		  WHERE plane = $1 AND bucket = $2 AND state IN ('open', 'sealed')
-		  ORDER BY seq ASC`,
-		plane.String(), bucket)
+// RetireSegment stamps retired_at and drops the segment's op-root rows in
+// one transaction. The op-roots were only needed to advance forge_root at
+// ship time and to recover the segment from disk; neither applies once its
+// files are gone.
+func (r *Postgres) RetireSegment(ctx context.Context, plane blockstore.Plane, seq uint64, retiredAt int64) error {
+	tx, err := r.pool.Begin(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("registry: list %s segments for %q: %w", plane, bucket, err)
+		return fmt.Errorf("registry: begin retire segment %d: %w", seq, err)
 	}
-	defer rows.Close()
+	defer tx.Rollback(ctx)
 
-	var out []logstore.SegmentMeta
-	for rows.Next() {
-		var (
-			seqInt      int64
-			stateS      string
-			sealed      int64
-			size        int64
-			sha         []byte
-			shippedAt   int64
-			indexDigest multihash.Multihash
-		)
-		if err := rows.Scan(&seqInt, &stateS, &sealed, &size, &sha, &shippedAt, &indexDigest); err != nil {
-			return nil, fmt.Errorf("registry: scan segment: %w", err)
-		}
-		state, ok := logstore.ParseState(stateS)
-		if !ok {
-			return nil, fmt.Errorf("registry: bad segment state %q for seq %d", stateS, seqInt)
-		}
-		out = append(out, logstore.SegmentMeta{
-			Seq:         uint64(seqInt),
-			Plane:       plane,
-			Bucket:      bucket,
-			State:       state,
-			SealedAt:    sealed,
-			Size:        size,
-			SHA256:      sha,
-			ShippedAt:   shippedAt,
-			IndexDigest: indexDigest,
-		})
+	tag, err := tx.Exec(ctx,
+		`UPDATE ingot.segments SET retired_at = $3
+		 WHERE seq = $1 AND plane = $2 AND retired_at IS NULL`,
+		int64(seq), plane.String(), retiredAt)
+	if err != nil {
+		return fmt.Errorf("registry: retire segment %d: %w", seq, err)
 	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("registry: list segments rows: %w", err)
+	if tag.RowsAffected() == 0 {
+		// Already retired, or no such row — idempotent.
+		return nil
+	}
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM ingot.segment_op_roots WHERE seq = $1`, int64(seq)); err != nil {
+		return fmt.Errorf("registry: drop op-roots of retired segment %d: %w", seq, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("registry: commit retire segment %d: %w", seq, err)
+	}
+	return nil
+}
+
+func (r *Postgres) ListSegments(ctx context.Context, plane blockstore.Plane, bucket string) ([]logstore.SegmentMeta, error) {
+	out, err := r.listSegments(ctx, plane, bucket, false)
+	if err != nil {
+		return nil, err
 	}
 
 	// Hydrate op_roots for sealed segments (open segments have none; data
@@ -206,9 +206,76 @@ func (r *Postgres) ListSegments(ctx context.Context, plane blockstore.Plane, buc
 	return out, nil
 }
 
+func (r *Postgres) ListRetiredSegments(ctx context.Context, plane blockstore.Plane, bucket string) ([]logstore.SegmentMeta, error) {
+	return r.listSegments(ctx, plane, bucket, true)
+}
+
+// listSegments reads bucket's segment rows for plane, either the unretired
+// ones or the retired ones, ordered by seq, without op-roots.
+func (r *Postgres) listSegments(ctx context.Context, plane blockstore.Plane, bucket string, retired bool) ([]logstore.SegmentMeta, error) {
+	// The predicate is spelled out rather than parameterized, so the planner
+	// can use the partial index on unretired rows.
+	which := "retired_at IS NULL"
+	if retired {
+		which = "retired_at IS NOT NULL"
+	}
+	rows, err := r.pool.Query(ctx,
+		`SELECT seq, state, COALESCE(sealed_at, 0), size_bytes, sha256, COALESCE(shipped_at, 0), index_digest,
+		        COALESCE(retired_at, 0), COALESCE(dead_bytes, -1)
+		   FROM ingot.segments
+		  WHERE plane = $1 AND bucket = $2 AND `+which+`
+		  ORDER BY seq ASC`,
+		plane.String(), bucket)
+	if err != nil {
+		return nil, fmt.Errorf("registry: list %s segments for %q: %w", plane, bucket, err)
+	}
+	defer rows.Close()
+
+	var out []logstore.SegmentMeta
+	for rows.Next() {
+		var (
+			seqInt      int64
+			stateS      string
+			sealed      int64
+			size        int64
+			sha         []byte
+			shippedAt   int64
+			indexDigest multihash.Multihash
+			retiredAt   int64
+			deadBytes   int64
+		)
+		if err := rows.Scan(&seqInt, &stateS, &sealed, &size, &sha, &shippedAt, &indexDigest, &retiredAt, &deadBytes); err != nil {
+			return nil, fmt.Errorf("registry: scan segment: %w", err)
+		}
+		state, ok := logstore.ParseState(stateS)
+		if !ok {
+			return nil, fmt.Errorf("registry: bad segment state %q for seq %d", stateS, seqInt)
+		}
+		out = append(out, logstore.SegmentMeta{
+			Seq:         uint64(seqInt),
+			Plane:       plane,
+			Bucket:      bucket,
+			State:       state,
+			SealedAt:    sealed,
+			Size:        size,
+			SHA256:      sha,
+			ShippedAt:   shippedAt,
+			IndexDigest: indexDigest,
+			DeadBytes:   deadBytes,
+			RetiredAt:   retiredAt,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("registry: list segments rows: %w", err)
+	}
+	return out, nil
+}
+
 func (r *Postgres) ListSegmentBuckets(ctx context.Context, plane blockstore.Plane) ([]string, error) {
 	rows, err := r.pool.Query(ctx,
-		`SELECT DISTINCT bucket FROM ingot.segments WHERE plane = $1 ORDER BY bucket ASC`,
+		`SELECT DISTINCT bucket FROM ingot.segments
+		  WHERE plane = $1 AND retired_at IS NULL
+		  ORDER BY bucket ASC`,
 		plane.String())
 	if err != nil {
 		return nil, fmt.Errorf("registry: list %s segment buckets: %w", plane, err)
@@ -227,6 +294,141 @@ func (r *Postgres) ListSegmentBuckets(ctx context.Context, plane blockstore.Plan
 		return nil, fmt.Errorf("registry: list segment buckets rows: %w", err)
 	}
 	return out, nil
+}
+
+// EnsureSegmentSeqAbove moves ingot.segment_seq past seq unless it already
+// is (logstore.Meta). Ingot calls it at startup, before its first nextval,
+// and no other process draws from the sequence, so the read and the setval
+// race nothing.
+func (r *Postgres) EnsureSegmentSeqAbove(ctx context.Context, seq uint64) error {
+	if _, err := r.pool.Exec(ctx,
+		`SELECT setval('ingot.segment_seq', $1)
+		   FROM ingot.segment_seq
+		  WHERE last_value < $1 OR (last_value = $1 AND NOT is_called)`,
+		int64(seq)); err != nil {
+		return fmt.Errorf("registry: move segment seq past %d: %w", seq, err)
+	}
+	return nil
+}
+
+func (r *Postgres) JournalBuckets(ctx context.Context) ([]string, error) {
+	// One probe of catalog_journal_bucket_seq_idx per bucket, rather than a
+	// DISTINCT over every journaled block.
+	rows, err := r.pool.Query(ctx,
+		`SELECT name FROM ingot.buckets b
+		  WHERE EXISTS (SELECT 1 FROM ingot.catalog_journal j WHERE j.bucket = b.name)
+		  ORDER BY name`)
+	if err != nil {
+		return nil, fmt.Errorf("registry: list journal buckets: %w", err)
+	}
+	out, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return nil, fmt.Errorf("registry: list journal buckets: %w", err)
+	}
+	return out, nil
+}
+
+func (r *Postgres) JournalSegments(ctx context.Context, bucket string) ([]uint64, error) {
+	rows, err := r.pool.Query(ctx,
+		`SELECT DISTINCT seq FROM ingot.catalog_journal WHERE bucket = $1 ORDER BY seq`, bucket)
+	if err != nil {
+		return nil, fmt.Errorf("registry: list journal segments of %q: %w", bucket, err)
+	}
+	seqs, err := pgx.CollectRows(rows, pgx.RowTo[int64])
+	if err != nil {
+		return nil, fmt.Errorf("registry: list journal segments of %q: %w", bucket, err)
+	}
+	out := make([]uint64, len(seqs))
+	for i, s := range seqs {
+		out[i] = uint64(s)
+	}
+	return out, nil
+}
+
+// ReadJournal pages through one segment's journaled blocks on the primary
+// key, (seq, cid) (logstore.Meta).
+func (r *Postgres) ReadJournal(ctx context.Context, seq uint64, after cid.Cid, limit int) ([]block.Block, error) {
+	afterKey := []byte{} // a nil slice would bind NULL, and cid > NULL matches nothing
+	if after.Defined() {
+		afterKey = after.Bytes()
+	}
+	rows, err := r.pool.Query(ctx,
+		`SELECT cid, data FROM ingot.catalog_journal
+		  WHERE seq = $1 AND cid > $2
+		  ORDER BY cid LIMIT $3`,
+		int64(seq), afterKey, limit)
+	if err != nil {
+		return nil, fmt.Errorf("registry: read journal of segment %d: %w", seq, err)
+	}
+	defer rows.Close()
+	var out []block.Block
+	for rows.Next() {
+		var key, data []byte
+		if err := rows.Scan(&key, &data); err != nil {
+			return nil, fmt.Errorf("registry: scan journal of segment %d: %w", seq, err)
+		}
+		c, err := cid.Cast(key)
+		if err != nil {
+			return nil, fmt.Errorf("registry: journal of segment %d: bad cid: %w", seq, err)
+		}
+		blk, err := block.NewBlockWithCid(data, c)
+		if err != nil {
+			return nil, fmt.Errorf("registry: journal of segment %d: block %s: %w", seq, c, err)
+		}
+		out = append(out, blk)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("registry: read journal of segment %d: %w", seq, err)
+	}
+	return out, nil
+}
+
+// MoveJournal re-files a range of a segment's journaled blocks under another
+// segment (logstore.Meta), keeping each row's created_at so the journal's age
+// gauge still reports how long the block has waited. It takes the bucket row
+// FOR KEY SHARE first, so a deletion or EmptyRoot holding it FOR UPDATE
+// finishes before any journal row is touched, then the target segment's row
+// FOR SHARE, as a commit journaling into it does, so a ship of the target
+// and the move wait for each other. A commit and a ship lock the segment row
+// before the bucket's, the other way round, but that can't deadlock with
+// this order: KEY SHARE conflicts only with FOR UPDATE, which neither takes.
+// A target that has shipped since takes no rows, and the source's rows go.
+func (r *Postgres) MoveJournal(ctx context.Context, bucket string, from, to uint64, first, last cid.Cid) error {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("registry: begin journal move %d→%d: %w", from, to, err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx,
+		`SELECT 1 FROM ingot.buckets WHERE name = $1 FOR KEY SHARE`, bucket); err != nil {
+		return fmt.Errorf("registry: journal move %d→%d: lock bucket: %w", from, to, err)
+	}
+	var shipped bool
+	if err := tx.QueryRow(ctx,
+		`SELECT shipped_at IS NOT NULL FROM ingot.segments WHERE seq = $1 FOR SHARE`,
+		int64(to)).Scan(&shipped); err != nil {
+		return fmt.Errorf("registry: journal move %d→%d: lock target segment: %w", from, to, err)
+	}
+	if !shipped {
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO ingot.catalog_journal (seq, bucket, cid, data, created_at)
+			 SELECT $2, bucket, cid, data, created_at FROM ingot.catalog_journal
+			  WHERE seq = $1 AND bucket = $3 AND cid >= $4 AND cid <= $5
+			 ON CONFLICT (seq, cid) DO NOTHING`,
+			int64(from), int64(to), bucket, first.Bytes(), last.Bytes()); err != nil {
+			return fmt.Errorf("registry: journal move %d→%d: copy: %w", from, to, err)
+		}
+	}
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM ingot.catalog_journal
+		  WHERE seq = $1 AND bucket = $2 AND cid >= $3 AND cid <= $4`,
+		int64(from), bucket, first.Bytes(), last.Bytes()); err != nil {
+		return fmt.Errorf("registry: journal move %d→%d: drop source: %w", from, to, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("registry: commit journal move %d→%d: %w", from, to, err)
+	}
+	return nil
 }
 
 func (r *Postgres) RehydrateSegment(ctx context.Context, m logstore.SegmentMeta) error {
@@ -256,6 +458,61 @@ func (r *Postgres) RehydrateSegment(ctx context.Context, m logstore.SegmentMeta)
 		return fmt.Errorf("registry: rehydrate commit %d: %w", m.Seq, err)
 	}
 	return nil
+}
+
+// CatalogUsage sums each bucket's shipped catalog segments: those whose
+// ship registered blobs in its space (index_digest is set exactly then),
+// retired ones included, since their CARs stay on Forge until DeleteBucket
+// releases them.
+//
+// Cost: one sequential scan of ingot.segments per call. No index narrows a
+// sum over every shipped row: segments_unretired_idx leaves out the retired
+// rows, which are nearly all of them, and segments_bucket_idx would only
+// trade the scan for a random heap read per row. The scan is hash-aggregated
+// by bucket, and only the per-bucket sums meet ingot.buckets. Postgres reads
+// a table larger than a quarter of shared_buffers through a small ring
+// buffer, so the scan doesn't push the working set out.
+// Rows accumulate until DeleteBucket, one per sealed segment: at most one per
+// bucket per SealAge (17,280 a day for a bucket written without pause at the
+// 5s default), about 175 bytes of heap each. A million rows took about 0.4s
+// on one core of Postgres 16 (0.17s with two parallel workers), so this runs
+// from a five-minute sweep (Server's catalog usage sweeper), never per
+// metrics collection.
+func (r *Postgres) CatalogUsage(ctx context.Context) ([]CatalogUsage, error) {
+	rows, err := r.pool.Query(ctx,
+		`SELECT b.name, b.space, s.bytes, s.dead, s.unmeasured
+		   FROM (SELECT bucket,
+		                SUM(size_bytes)::bigint AS bytes,
+		                COALESCE(SUM(dead_bytes), 0)::bigint AS dead,
+		                COALESCE(SUM(size_bytes) FILTER (WHERE dead_bytes IS NULL), 0)::bigint AS unmeasured
+		           FROM ingot.segments
+		          WHERE plane = 'catalog' AND index_digest IS NOT NULL
+		          GROUP BY bucket) s
+		   JOIN ingot.buckets b ON b.name = s.bucket
+		  ORDER BY b.name`)
+	if err != nil {
+		return nil, fmt.Errorf("registry: catalog usage: %w", err)
+	}
+	defer rows.Close()
+
+	var out []CatalogUsage
+	for rows.Next() {
+		var (
+			u        CatalogUsage
+			spaceStr string
+		)
+		if err := rows.Scan(&u.Bucket, &spaceStr, &u.Bytes, &u.DeadOnArrivalBytes, &u.UnmeasuredBytes); err != nil {
+			return nil, fmt.Errorf("registry: scan catalog usage: %w", err)
+		}
+		if u.Space, err = did.Parse(spaceStr); err != nil {
+			return nil, fmt.Errorf("registry: parse space %q of bucket %q: %w", spaceStr, u.Bucket, err)
+		}
+		out = append(out, u)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("registry: catalog usage rows: %w", err)
+	}
+	return out, nil
 }
 
 // nullableInt maps a zero timestamp to SQL NULL.

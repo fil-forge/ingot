@@ -105,10 +105,13 @@ full lifecycle):
   licenses the caller's bucket-root CAS.
 - **The unshipped catalog is journaled in Postgres**: the root swap's
   transaction writes the batch's blocks to `ingot.catalog_journal` under the
-  segment `AppendBatch` reported, and shipping that segment deletes them. A
-  copy of Postgres (a standby, a restore) therefore holds every block its
-  roots need that this host's disk alone would otherwise hold. Rebuilding a
-  lost segment from the journal is not built yet.
+  segment `AppendBatch` reported, and shipping that segment deletes them, as
+  do `DeleteBucket` emptying the bucket's root and the bucket row's deletion.
+  A copy of Postgres (a standby, a restore) therefore holds every block its
+  roots need that this host's disk alone would otherwise hold. Recovery
+  rebuilds a segment whose file is gone from its journaled blocks, so Ingot
+  can start from a recovered Postgres alone (`logstore/README.md`, crash
+  recovery).
 - **`forge_root_cid` advances only when a segment ships, and only guarded**:
   the update lands in the same transaction as the shipped stamp, and only
   where `buckets.root_cid` still equals the op-root.
@@ -495,7 +498,8 @@ not yet started defers while a write of its space holds the digest.
   tier spend them. The uploader also captures a per-space ship authority
   (1h TTL) for the async catalog flush, from every write that commits, and
   keeps an upload's capture apart for the background releases, aborts and
-  registration renewals, which a narrower key's grant may not cover. The
+  registration renewals, which a narrower key's grant may not cover. Both
+  take only stores the IAM layer marks borrowable. The
   same cache's action sets ride along (`reqscope.Permits`) for the one check
   hilt cannot make from the URL: a `DeleteObjects` entry naming a version
   needs `s3:DeleteObjectVersion`, beyond the request's `s3:DeleteObject`.
@@ -541,14 +545,18 @@ draws the chains and the stores.
   intent unchanged for an hour as stalled, for the
   `ingot.local_blobs.stalled_bytes` gauge.
 - **No catalog GC**: `gc_candidates` is write-only; superseded MST nodes
-  accumulate on Forge with mutation volume.
+  accumulate on Forge with mutation volume. Each ship records how much of its
+  segment was already dead (`segments.dead_bytes`), and the
+  `ingot.catalog.*` gauges sum that and the shipped bytes per bucket; what
+  dies after a segment ships is not measured.
 - **Reads carry no bucket context**: `Manager.Get` linear-scans every open
   bucket store; threading the bucket into the read path removes the scan.
 - **The ship authority expires**: the async flush signs with a per-space
   proof store captured, in memory, from the bucket's last write (1h TTL).
   Every commit captures it, so a segment ships under its own writes'
   capture, but one whose ship keeps failing past the TTL, or across a
-  restart, has no authority until the bucket's next write.
+  restart, or whose grants in both captures a revocation has named, has no
+  authority until the bucket's next write.
 - **The indexer read path is unwired**: `LocalLocator` serves all reads; the
   network index is still published (best-effort) but never consulted.
 - **Carried Forge-client copies**: `forgeclient/`, `tokenstore/`,

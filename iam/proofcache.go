@@ -51,8 +51,9 @@ type DelegationCache struct {
 	perms *gocache.Cache // bucket DID string → map[string]struct{} of S3 actions
 
 	// revoked is the revoked-CID set [KeyProofs] shares across every key's
-	// store; Add refuses a batch naming any of it. Nil for a request-scoped
-	// store, which keeps a response's delegations for its onward retrieval.
+	// store; Add refuses a batch naming any of it, and no chain uses a cached
+	// delegation that is in it. Nil for a request-scoped store, which keeps a
+	// response's delegations for its onward retrieval.
 	revoked *gocache.Cache
 }
 
@@ -192,6 +193,31 @@ func (d *DelegationCache) matchDelegations(ctx context.Context, aud did.DID, cmd
 	return ucanlib.NewDelegationMatcher(d.listDelegations)(ctx, aud, cmd, sub)
 }
 
+// ProofChainVia is ProofChain restricted to chains whose delegation to aud was
+// issued by via. Hilt also delegates a request's cleanup commands from the
+// tenant, for longer than the access key lives, and those outlive the key by
+// design; a chain that must prove the key's own authority, as the local fast
+// path's does, has to end in the key's delegation instead.
+func (d *DelegationCache) ProofChainVia(ctx context.Context, aud did.DID, cmd ucan.Command, sub, via did.DID) ([]ucan.Delegation, []cid.Cid, error) {
+	list := func(ctx context.Context, a did.DID, c ucan.Command, s did.DID) iter.Seq2[ucan.Delegation, error] {
+		all := d.listDelegations(ctx, a, c, s)
+		if a != aud {
+			return all
+		}
+		return func(yield func(ucan.Delegation, error) bool) {
+			for dlg, err := range all {
+				if err == nil && dlg.Issuer() != via {
+					continue
+				}
+				if !yield(dlg, err) {
+					return
+				}
+			}
+		}
+	}
+	return ucanlib.ProofChain(ctx, ucanlib.NewDelegationMatcher(list), aud, cmd, sub)
+}
+
 // listDelegations yields cached, unexpired delegations exactly matching
 // (aud, cmd, sub) — the same exact-match contract as tokenstore.MemStore;
 // command variations and powerline subjects are the matcher's job. The
@@ -224,6 +250,11 @@ func (d *DelegationCache) listDelegations(_ context.Context, aud did.DID, cmd uc
 		for _, m := range matches {
 			if _, live := d.data.Get(m.link); !live {
 				continue // expired, janitor hasn't swept yet
+			}
+			if d.revoked != nil {
+				if _, gone := d.revoked.Get(m.link); gone {
+					continue // revoked since it was cached
+				}
 			}
 			if !yield(m.dlg, nil) {
 				return
