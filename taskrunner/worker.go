@@ -103,7 +103,8 @@ func (r *Runner) dispatch(ctx context.Context, q *queue) {
 		return
 	}
 	// A subject whose oldest due task has a waiting Run caller is the
-	// caller's to take.
+	// caller's to take. The due-task index (dueIndex) keeps this to the due
+	// rows.
 	rows, err := r.db.Query(ctx, `SELECT d.subject FROM (
 			SELECT DISTINCT ON (subject) subject, seq, waiting_until FROM `+q.tasks+`
 			WHERE state = 'pending' AND (not_before IS NULL OR not_before <= now())

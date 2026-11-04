@@ -34,6 +34,7 @@ CREATE TABLE %[1]s (
 	waiting_until timestamptz
 );
 CREATE INDEX %[3]s ON %[1]s (subject, seq) WHERE state = 'pending';
+`+dueIndex(q)+`
 CREATE TABLE %[2]s (
 	subject      text PRIMARY KEY,
 	owner        uuid NOT NULL,
@@ -42,6 +43,15 @@ CREATE TABLE %[2]s (
 	tree_id      uuid NOT NULL
 );`, q.tasks, q.leases, pgx.Identifier{q.table + "_tasks_pending"}.Sanitize())
 	},
+}
+
+// dueIndex lets the poll for due tasks read only the pending tasks whose
+// NotBefore has passed, or that have none, rather than every pending task: a
+// queue can hold many more delayed tasks than due ones, such as an eviction
+// pending for every cached blob.
+func dueIndex(q *queue) string {
+	return fmt.Sprintf(`CREATE INDEX %s ON %s (not_before) WHERE state = 'pending';`,
+		pgx.Identifier{q.table + "_tasks_due"}.Sanitize(), q.tasks)
 }
 
 // Migrate creates or updates the tables of every queue in Options.Queues.
