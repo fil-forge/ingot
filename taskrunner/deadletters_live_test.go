@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"go.opentelemetry.io/otel/attribute"
 
 	"github.com/fil-forge/ingot/taskrunner"
@@ -90,14 +91,14 @@ func TestFailedTasksCanBeListedAndResubmitted_Live(t *testing.T) {
 	if _, err := f.r.Wait(ctx, qTop, id); err == nil {
 		t.Fatal("task succeeded")
 	}
-	failed, err := f.r.ListFailed(ctx, qTop, "space", 10)
+	failed, err := f.r.ListFailed(ctx, qTop, "space", uuid.Nil, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(failed) != 1 || failed[0].Task.ID != id || failed[0].Error != "authority spent" || string(failed[0].Task.Args) != "stale" {
 		t.Fatalf("ListFailed = %+v, want the failed task with its error", failed)
 	}
-	if other, _ := f.r.ListFailed(ctx, qTop, "elsewhere", 10); len(other) != 0 {
+	if other, _ := f.r.ListFailed(ctx, qTop, "elsewhere", uuid.Nil, 10); len(other) != 0 {
 		t.Errorf("ListFailed for another subject = %+v", other)
 	}
 
@@ -111,7 +112,7 @@ func TestFailedTasksCanBeListedAndResubmitted_Live(t *testing.T) {
 	if v, _ := f.item(t, "space"); v != 1 {
 		t.Errorf("item space = %d, want 1 from the resubmitted task", v)
 	}
-	if left, _ := f.r.ListFailed(ctx, qTop, "", 10); len(left) != 0 {
+	if left, _ := f.r.ListFailed(ctx, qTop, "", uuid.Nil, 10); len(left) != 0 {
 		t.Errorf("a resubmitted task is still listed: %+v", left)
 	}
 	if _, err := f.r.Resubmit(ctx, qTop, id, nil); !errors.Is(err, taskrunner.ErrNotFound) {
@@ -134,7 +135,7 @@ func TestAHandlerCanResubmitFailedTasks_Live(t *testing.T) {
 	// The last chance to send a space's removes: resubmit each failed one with
 	// the authority this request carries.
 	f.handle(t, qTop, "drain", func(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
-		failed, err := ex.ListFailed(ctx, qBottom, task.Subject, 100)
+		failed, err := ex.ListFailed(ctx, qBottom, task.Subject, uuid.Nil, 100)
 		if err != nil {
 			return nil, err
 		}
@@ -203,7 +204,7 @@ func TestFinishedTasksAreDeletedPastTheirRetention_Live(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	if left, _ := f.r.ListFailed(ctx, qTop, "", 10); len(left) != 1 {
+	if left, _ := f.r.ListFailed(ctx, qTop, "", uuid.Nil, 10); len(left) != 1 {
 		t.Errorf("failed tasks = %d, want 1: failed tasks stay until resubmitted", len(left))
 	}
 }
@@ -262,5 +263,98 @@ func TestFailedGaugeCountsUnregisteredActions_Live(t *testing.T) {
 	}
 	if v, ok := gaugeValue[int64](t, got["taskrunner.queue.failed"], attribute.String("queue", qTop), attribute.String("action", "put")); !ok || v != 0 {
 		t.Errorf("failed for a registered action with none = %d (reported %v), want 0", v, ok)
+	}
+}
+
+// ListFailed pages through a subject's failed tasks from a cursor, which stays
+// valid after the task it names is resubmitted.
+func TestFailedTasksPageFromACursor_Live(t *testing.T) {
+	f := newFixture(t, 1)
+	f.handle(t, qTop, "put", func(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
+		if string(task.Args) == "ok" {
+			return nil, nil
+		}
+		return nil, taskrunner.Permanent(errors.New("refused"))
+	})
+	f.start(t)
+	ctx := waitCtx(t)
+	var ids []taskrunner.TaskID
+	for range 5 {
+		id, err := f.r.Submit(ctx, taskrunner.Spec{Queue: qTop, Subject: "space", Action: "put"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.r.Wait(ctx, qTop, id); err == nil {
+			t.Fatal("task succeeded")
+		}
+		ids = append(ids, id)
+	}
+
+	var got []taskrunner.TaskID
+	after := uuid.Nil
+	for {
+		page, err := f.r.ListFailed(ctx, qTop, "space", after, 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(page) == 0 {
+			break
+		}
+		for _, ft := range page {
+			got = append(got, ft.Task.ID)
+		}
+		after = page[len(page)-1].Task.ID
+		// Resubmitting the page's tasks leaves the cursor usable.
+		for _, ft := range page {
+			fresh, err := f.r.Resubmit(ctx, qTop, ft.Task.ID, []byte("ok"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.r.Wait(ctx, qTop, fresh); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if !slices.Equal(got, ids) {
+		t.Fatalf("paged %v, want every failed task once, oldest first: %v", got, ids)
+	}
+}
+
+// A batch outcome's Args replace the task's arguments, for its retry and, once
+// it has failed for good, for whoever lists it.
+func TestBatchOutcomeReplacesArgs_Live(t *testing.T) {
+	f := newFixture(t, 1)
+	var mu sync.Mutex
+	var seen []string
+	if err := f.r.HandleBatch(qTop, "send", 5, func(ctx context.Context, ex *taskrunner.Exec, tasks []taskrunner.Task) ([]taskrunner.Outcome, error) {
+		out := make([]taskrunner.Outcome, len(tasks))
+		for i, task := range tasks {
+			mu.Lock()
+			seen = append(seen, string(task.Args))
+			mu.Unlock()
+			out[i] = taskrunner.Outcome{Err: errors.New("refused"), Args: append(task.Args, '+')}
+		}
+		return out, nil
+	}, taskrunner.WithRetry(taskrunner.RetryPolicy{First: 10 * time.Millisecond, Attempts: 2})); err != nil {
+		t.Fatal(err)
+	}
+	f.migrate(t)
+	f.start(t)
+	ctx := waitCtx(t)
+	id, err := f.r.Submit(ctx, taskrunner.Spec{Queue: qTop, Subject: "space", Action: "send", Args: []byte("a")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.r.Wait(ctx, qTop, id); err == nil {
+		t.Fatal("task succeeded")
+	}
+	failed, err := f.r.ListFailed(ctx, qTop, "space", uuid.Nil, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !slices.Equal(seen, []string{"a", "a+"}) || len(failed) != 1 || string(failed[0].Task.Args) != "a++" {
+		t.Fatalf("attempts saw %q, failed task args %+v; want the retry to see the replacement, and the failed task to keep the last", seen, failed)
 	}
 }

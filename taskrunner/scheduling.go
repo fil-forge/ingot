@@ -29,6 +29,10 @@ type Outcome struct {
 	// Err, when set, fails or retries this task alone, as a handler error
 	// would. It does not undo the batch's writes.
 	Err error
+	// Args, when set with Err, replaces the task's arguments, for its next
+	// attempt or for whoever lists it once it has failed: something the
+	// attempt learned that the next one needs, such as renewed authority.
+	Args []byte
 }
 
 // RetryPolicy says when an async task whose handler returned an error runs
@@ -287,7 +291,7 @@ func (r *Runner) failOrRetry(ctx context.Context, h *hold, a *action, tasks []Ta
 		errs[i] = herr
 	}
 	var rec failures
-	if err := rec.record(ctx, tx, h, a, tasks, errs); err != nil {
+	if err := rec.record(ctx, tx, h, a, tasks, errs, nil); err != nil {
 		return err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -306,8 +310,9 @@ type failures struct {
 
 // record writes, in tx, each task's failure: a retry when its action's policy
 // allows another attempt, otherwise its final failure. errs holds each task's
-// error, in the order of tasks.
-func (f *failures) record(ctx context.Context, tx pgx.Tx, h *hold, a *action, tasks []Task, errs []error) error {
+// error, in the order of tasks, and args, when not nil, each task's
+// replacement arguments, nil to keep its own.
+func (f *failures) record(ctx context.Context, tx pgx.Tx, h *hold, a *action, tasks []Task, errs []error, args [][]byte) error {
 	if f.errs == nil {
 		f.errs = map[TaskID]error{}
 	}
@@ -316,9 +321,15 @@ func (f *failures) record(ctx context.Context, tx pgx.Tx, h *hold, a *action, ta
 		f.errs[t.ID] = herr
 		p := a.retry
 		var sql string
-		args := []any{t.ID, herr.Error()}
+		// $3 is the replacement arguments, null to keep the task's own.
+		var newArgs []byte
+		if args != nil {
+			newArgs = args[i]
+		}
+		params := []any{t.ID, herr.Error(), newArgs}
 		if t.sync || p == nil || IsPermanent(herr) || (p.Attempts > 0 && t.Attempt+1 >= p.Attempts) {
-			sql = `UPDATE ` + h.q.tasks + ` SET state = 'failed', error = $2, finished = now()
+			sql = `UPDATE ` + h.q.tasks + ` SET state = 'failed', error = $2, finished = now(),
+				args = coalesce($3, args)
 				WHERE id = $1 AND state = 'pending'`
 			f.failed = append(f.failed, t)
 		} else {
@@ -330,12 +341,13 @@ func (f *failures) record(ctx context.Context, tx pgx.Tx, h *hold, a *action, ta
 				col = "retry_at"
 			}
 			sql = `UPDATE ` + h.q.tasks + ` SET attempts = attempts + 1, error = $2, started = NULL,
-				` + col + ` = now() + $3 * interval '1 millisecond'
+				args = coalesce($3, args),
+				` + col + ` = now() + $4 * interval '1 millisecond'
 				WHERE id = $1 AND state = 'pending'`
-			args = append(args, p.delay(t.Attempt+1).Milliseconds())
+			params = append(params, p.delay(t.Attempt+1).Milliseconds())
 			f.retried = append(f.retried, t)
 		}
-		tag, err := tx.Exec(ctx, sql, args...)
+		tag, err := tx.Exec(ctx, sql, params...)
 		if err != nil {
 			return fmt.Errorf("record failure of %s/%s: %w", t.Queue, t.ID, err)
 		}

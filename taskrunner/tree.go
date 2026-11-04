@@ -347,10 +347,12 @@ func (tr *tree) commit(ctx context.Context, a *action, outcomes []Outcome) (*fai
 	}
 	var failedTasks []Task
 	var failedErrs []error
+	var failedArgs [][]byte
 	for i, t := range tr.roots {
 		if err := outcomes[i].Err; err != nil {
 			failedTasks = append(failedTasks, t)
 			failedErrs = append(failedErrs, err)
+			failedArgs = append(failedArgs, outcomes[i].Args)
 			continue
 		}
 		tag, err := tx.Exec(ctx, `UPDATE `+tr.rootHold.q.tasks+` SET state = 'succeeded', result = $2, finished = now()
@@ -364,7 +366,7 @@ func (tr *tree) commit(ctx context.Context, a *action, outcomes []Outcome) (*fai
 	}
 	rec := &failures{}
 	if len(failedTasks) > 0 {
-		if err := rec.record(ctx, tx, tr.rootHold, a, failedTasks, failedErrs); err != nil {
+		if err := rec.record(ctx, tx, tr.rootHold, a, failedTasks, failedErrs, failedArgs); err != nil {
 			return nil, err
 		}
 	}
