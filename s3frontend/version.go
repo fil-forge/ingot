@@ -612,7 +612,7 @@ func (b *Backend) commitVersionAt(ctx context.Context, bucketState *registry.Sta
 
 		// Reference index (§8): the new generation's claims land and the
 		// discarded generations' claims drop in the root swap's transaction,
-		// each last-claim drop recording a deferred release. A commit that
+		// each last-claim drop queueing a release. A commit that
 		// fails writes none of them; a racing writer that later supersedes
 		// this generation always finds the rows to drop.
 		claimed := blobs.DigestList()
@@ -623,7 +623,7 @@ func (b *Backend) commitVersionAt(ctx context.Context, bucketState *registry.Sta
 		}
 		b.addClaims(tx, st, key, claimVersionID(vid, seq), claimed, pinned)
 		for _, d := range discards {
-			b.dropClaims(tx, st, key, claimVersionID(d.versionID, d.seq), d.digests)
+			b.dropClaims(ctx, tx, st, key, claimVersionID(d.versionID, d.seq), d.digests)
 		}
 
 		// Content entries (the space's object count): this version registers,
@@ -746,7 +746,7 @@ func (b *Backend) deleteVersionScoped(ctx context.Context, bucketState *registry
 			if err != nil {
 				return cid.Undef, err
 			}
-			b.dropClaims(tx, st, key, claimVersionID(targetVersionID(kind, mf), mf.Seq), digests)
+			b.dropClaims(ctx, tx, st, key, claimVersionID(targetVersionID(kind, mf), mf.Seq), digests)
 			res.found, res.wasMarker = true, mf.DeleteMarker
 			// The version is gone for good, so the space stops counting it.
 			b.enqueueRegistration(ctx, tx, st, key, valCid, registry.UploadRegistrationRemove)
@@ -825,7 +825,7 @@ func (b *Backend) deleteVersionScoped(ctx context.Context, bucketState *registry
 		if err != nil {
 			return cid.Undef, err
 		}
-		b.dropClaims(tx, st, key, claimVersionID(targetVersionID(kind, targetMf), targetMf.Seq), digests)
+		b.dropClaims(ctx, tx, st, key, claimVersionID(targetVersionID(kind, targetMf), targetMf.Seq), digests)
 		res.found, res.wasMarker = true, targetMf.DeleteMarker
 		// The version is gone for good, so the space stops counting it.
 		b.enqueueRegistration(ctx, tx, st, key, targetCid, registry.UploadRegistrationRemove)

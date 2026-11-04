@@ -93,11 +93,16 @@ type Backend struct {
 	encParams  registry.EncryptionParamsStore
 	// streaming sends a body blob to its provider while it is spooled.
 	streaming uploader.StreamingBodyUploader
-	// pendingReleases is the deferred-release queue; releaseGrace is how far
-	// past the last-claim drop each release is scheduled (readers holding the
+	// claims counts a blob's claims for a release's recheck; releases runs
+	// the queue-space-shard tasks (RegisterReleaseTasks); releaseGrace is how
+	// far past the last-claim drop each release is due (readers holding the
 	// prior catalog root get at least this long to finish their prefetch).
-	pendingReleases registry.PendingReleaseStore
-	releaseGrace    time.Duration
+	claims       registry.BlobRefStore
+	releases     *taskrunner.Runner
+	releaseGrace time.Duration
+	// releaseRetry is the queue-space-shard.release retry policy; tests
+	// shorten it.
+	releaseRetry taskrunner.RetryPolicy
 	// Local blob sweeper knobs (see Deps). localBlobSweepMu serialises
 	// SweepLocalBlobs; lastOrphanPass is when its orphan pass last ran.
 	// localBlobSweepBatch overrides the rows a pass reads per query, for
@@ -239,13 +244,13 @@ type Deps struct {
 	// Required: a write that cannot obtain it fails.
 	TenantKeys tenantkey.Source
 
-	// PendingReleases is the deferred-release queue (blob_release_intents):
-	// a last-claim drop enqueues here and the release sweeper executes after
-	// ReleaseGrace. Same instance as Registry in production. Required.
-	PendingReleases registry.PendingReleaseStore
+	// Claims counts the claims on a blob, which a release rechecks before it
+	// removes the blob. Same instance as Registry in production. Required.
+	Claims registry.BlobRefStore
 	// ReleaseGrace schedules each release this far past its last-claim drop.
 	// Zero means immediately due (the server applies the production default
-	// before construction; tests use zero so a manual sweep drains).
+	// before construction; tests use zero so releases run as soon as they are
+	// queued).
 	ReleaseGrace time.Duration
 
 	// LocalBlobMaxBytes is the byte budget for the spool and the cache
@@ -329,30 +334,31 @@ func New(d Deps) *Backend {
 		localBlobOrphanAge = DefaultLocalBlobOrphanAge
 	}
 	b := &Backend{
-		authority:       d.Authority,
-		read:            d.Reads,
-		reg:             d.Registry,
-		intents:         d.Intents,
-		locations:       d.Locations,
-		gc:              d.GC,
-		multipart:       d.Multipart,
-		txns:            bucketop.NewCoordinator(bucketop.Deps{Reg: d.Registry, Log: d.Log, Reads: d.Reads, Ships: d.Ships}),
-		log:             d.Log,
-		spool:           d.Spool,
-		cache:           d.Cache,
-		uploader:        d.Uploader,
-		deferred:        d.Deferred,
-		parks:           d.Parks,
-		remover:         d.Remover,
-		streaming:       d.Streaming,
-		registrar:       d.Registrar,
-		uploadRetry:     uploadRegistrationRetry,
-		drainTimeout:    uploadDrainTimeout,
-		encParams:       d.EncParams,
-		regionKeys:      d.RegionKeys,
-		tenantKeys:      d.TenantKeys,
-		pendingReleases: d.PendingReleases,
-		releaseGrace:    d.ReleaseGrace,
+		authority:    d.Authority,
+		read:         d.Reads,
+		reg:          d.Registry,
+		intents:      d.Intents,
+		locations:    d.Locations,
+		gc:           d.GC,
+		multipart:    d.Multipart,
+		txns:         bucketop.NewCoordinator(bucketop.Deps{Reg: d.Registry, Log: d.Log, Reads: d.Reads, Ships: d.Ships}),
+		log:          d.Log,
+		spool:        d.Spool,
+		cache:        d.Cache,
+		uploader:     d.Uploader,
+		deferred:     d.Deferred,
+		parks:        d.Parks,
+		remover:      d.Remover,
+		streaming:    d.Streaming,
+		registrar:    d.Registrar,
+		uploadRetry:  uploadRegistrationRetry,
+		drainTimeout: uploadDrainTimeout,
+		encParams:    d.EncParams,
+		regionKeys:   d.RegionKeys,
+		tenantKeys:   d.TenantKeys,
+		claims:       d.Claims,
+		releaseRetry: releaseRetry,
+		releaseGrace: d.ReleaseGrace,
 
 		localBlobMaxBytes:  d.LocalBlobMaxBytes,
 		cacheTTL:           cmp.Or(d.CacheTTL, DefaultCacheTTL),

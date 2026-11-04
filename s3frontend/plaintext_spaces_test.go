@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/ipfs/go-cid"
 	"os"
 	"sync"
 	"testing"
@@ -295,7 +296,8 @@ func TestPlaintextRelease_WriteCancelsAPendingRelease(t *testing.T) {
 // and intent through it, and then uploads afresh.
 func TestPlaintextRelease_WriteWaitsOutAStartedRelease(t *testing.T) {
 	up := &countingUploader{calls: map[string]int{}}
-	b, mem := newDeferredBackend(t, up)
+	gate := newGatedRemover()
+	b, mem := newDeferredBackend(t, up, withGate(gate))
 	ctx := context.Background()
 	setNone(t, b)
 	data := testBody(8 << 10)
@@ -303,9 +305,7 @@ func TestPlaintextRelease_WriteWaitsOutAStartedRelease(t *testing.T) {
 	putIn(t, b, "bk", "old", data)
 	d := blobDigestOf(t, b, "old", "")
 	deleteFrom(t, b, "bk", "old")
-	if s, err := mem.StartRelease(ctx, mem.bk(), d); err != nil || s != registry.ReleaseStarted {
-		t.Fatalf("StartRelease = %v, %v", s, err)
-	}
+	finish := holdRelease(t, b, gate)
 
 	done := make(chan error, 1)
 	go func() {
@@ -324,9 +324,9 @@ func TestPlaintextRelease_WriteWaitsOutAStartedRelease(t *testing.T) {
 		t.Fatalf("no spool file while the write waits")
 	}
 
-	// The release runs: it removes the blob from the provider and drops its
-	// record, and leaves the waiting write's intent and file alone.
-	drainReleases(t, b)
+	// The release finishes: it removes the blob from the provider, and leaves
+	// the waiting write's intent and file alone.
+	finish()
 	if err := <-done; err != nil {
 		t.Fatalf("PutObject after the release: %v", err)
 	}
@@ -348,21 +348,18 @@ func TestPlaintextRelease_WriteWaitsOutAStartedRelease(t *testing.T) {
 	}
 }
 
-// TestPlaintextRelease_WaitIsBounded: a release that never finishes (it
-// failed after starting and the sweeper has not retried it) holds the write
-// only so long; then the write is refused with SlowDown for the client to
-// retry.
+// TestPlaintextRelease_WaitIsBounded: a release that does not finish holds the
+// write only so long; then the write is refused with SlowDown for the client
+// to retry.
 func TestPlaintextRelease_WaitIsBounded(t *testing.T) {
-	b, mem, _ := newRefTestBackend(t)
+	gate := newGatedRemover()
+	b, _ := newDeferredBackend(t, testfakes.NopUploader{}, withGate(gate))
 	ctx := context.Background()
 	setNone(t, b)
 	data := testBody(8 << 10)
 	putIn(t, b, "bk", "old", data)
-	d := blobDigestOf(t, b, "old", "")
 	deleteFrom(t, b, "bk", "old")
-	if s, err := mem.StartRelease(ctx, mem.bk(), d); err != nil || s != registry.ReleaseStarted {
-		t.Fatalf("StartRelease = %v, %v", s, err)
-	}
+	holdRelease(t, b, gate)
 	limit := reuseWaitLimit
 	reuseWaitLimit = 50 * time.Millisecond
 	t.Cleanup(func() { reuseWaitLimit = limit })
@@ -436,7 +433,8 @@ func TestPlaintextSpaces_CacheMoveWaitsForAnotherWritesHold(t *testing.T) {
 // release cannot remove what the write adds.
 func TestPlaintextRelease_WriteWaitsOutAStartedReleaseWithNoLocation(t *testing.T) {
 	up := &countingUploader{calls: map[string]int{}}
-	b, mem := newDeferredBackend(t, up)
+	gate := newGatedRemover()
+	b, mem := newDeferredBackend(t, up, withGate(gate))
 	ctx := context.Background()
 	setNone(t, b)
 	data := testBody(8 << 10)
@@ -444,10 +442,8 @@ func TestPlaintextRelease_WriteWaitsOutAStartedReleaseWithNoLocation(t *testing.
 	putIn(t, b, "bk", "old", data)
 	d := blobDigestOf(t, b, "old", "")
 	deleteFrom(t, b, "bk", "old")
-	// The release is started and past its location delete.
-	if s, err := mem.StartRelease(ctx, mem.bk(), d); err != nil || s != registry.ReleaseStarted {
-		t.Fatalf("StartRelease = %v, %v", s, err)
-	}
+	// The release is under way, and the blob's location already gone.
+	finish := holdRelease(t, b, gate)
 	if err := mem.DeleteLocation(ctx, mem.bk(), d); err != nil {
 		t.Fatalf("DeleteLocation: %v", err)
 	}
@@ -470,7 +466,7 @@ func TestPlaintextRelease_WriteWaitsOutAStartedReleaseWithNoLocation(t *testing.
 		t.Fatalf("uploads of %x while the release was started = %d, want 1 (the write waited)", d, early)
 	}
 
-	drainReleases(t, b)
+	finish()
 	if err := <-done; err != nil {
 		t.Fatalf("PutObject after the release: %v", err)
 	}
@@ -485,28 +481,21 @@ func TestPlaintextRelease_WriteWaitsOutAStartedReleaseWithNoLocation(t *testing.
 	}
 }
 
-// startAfterSettle is a release store that starts a release of the digest
-// right after a write has settled it, as a sweep that runs between the
-// write's settle and its commit does.
-type startAfterSettle struct {
-	registry.PendingReleaseStore
-	digest multihash.Multihash
-	space  did.DID
-	armed  bool
+// releaseBeforeCommit is a registry that, before the first commit of the
+// write, starts a release of digest and holds it in its network remove, as a
+// release that runs between the write's settle and its commit does.
+type releaseBeforeCommit struct {
+	registry.Registry
+	start func()
 }
 
-func (s *startAfterSettle) CancelRelease(ctx context.Context, space did.DID, digest multihash.Multihash) (registry.ReleaseCancel, error) {
-	c, err := s.PendingReleaseStore.CancelRelease(ctx, space, digest)
-	if err == nil && s.armed && bytes.Equal(digest, s.digest) {
-		s.armed = false
-		if err := s.PendingReleaseStore.EnqueueRelease(ctx, s.space, s.digest, time.Now()); err != nil {
-			return 0, err
-		}
-		if _, err := s.PendingReleaseStore.StartRelease(ctx, s.space, s.digest); err != nil {
-			return 0, err
-		}
+func (r *releaseBeforeCommit) CommitRoot(ctx context.Context, name string, expect, next cid.Cid, c registry.RootCommit) error {
+	if r.start != nil {
+		start := r.start
+		r.start = nil
+		start()
 	}
-	return c, err
+	return r.Registry.CommitRoot(ctx, name, expect, next, c)
 }
 
 // TestPlaintextRelease_ClaimRefusedDuringAStartedRelease: a release that
@@ -516,16 +505,22 @@ func (s *startAfterSettle) CancelRelease(ctx context.Context, space did.DID, dig
 // release is of the second: the first blob's claim does not land either,
 // since no generation would ever drop it.
 func TestPlaintextRelease_ClaimRefusedDuringAStartedRelease(t *testing.T) {
-	rel := &startAfterSettle{}
-	b, mem := newDeferredBackend(t, testfakes.NopUploader{}, func(d *Deps) {
-		rel.PendingReleaseStore = d.PendingReleases
-		d.PendingReleases = rel
+	gate := newGatedRemover()
+	reg := &releaseBeforeCommit{}
+	b, mem := newDeferredBackend(t, testfakes.NopUploader{}, withGate(gate), func(d *Deps) {
+		reg.Registry = d.Registry
+		d.Registry = reg
 		d.MaxBlobSize = 4 << 10
 	})
 	setNone(t, b)
 	data := testBody(8 << 10)
 	first, second := digestOf(t, data[:4<<10]), digestOf(t, data[4<<10:])
-	rel.digest, rel.space, rel.armed = second, mem.bk(), true
+	reg.start = func() {
+		if err := mem.EnqueueRelease(context.Background(), mem.bk(), second, registry.DueNow()); err != nil {
+			t.Fatalf("EnqueueRelease: %v", err)
+		}
+		holdRelease(t, b, gate)
+	}
 
 	bucket, key := "bk", "k"
 	_, err := b.PutObject(context.Background(), s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(data)})
@@ -547,7 +542,8 @@ func TestPlaintextRelease_ClaimRefusedDuringAStartedRelease(t *testing.T) {
 // file the write still holds.
 func TestPlaintextRelease_StreamedWriteWaitsOutAStartedRelease(t *testing.T) {
 	su := newStreamingUploader()
-	b, mem := newStreamingBackend(t, su)
+	gate := newGatedRemover()
+	b, mem := newStreamingBackend(t, su, withGate(gate))
 	ctx := context.Background()
 	setNone(t, b)
 	data := testBody(8 << 10)
@@ -557,9 +553,7 @@ func TestPlaintextRelease_StreamedWriteWaitsOutAStartedRelease(t *testing.T) {
 	}
 	d := blobDigestOf(t, b, "old", "")
 	deleteFrom(t, b, "bk", "old")
-	if s, err := mem.StartRelease(ctx, mem.bk(), d); err != nil || s != registry.ReleaseStarted {
-		t.Fatalf("StartRelease = %v, %v", s, err)
-	}
+	finish := holdRelease(t, b, gate)
 
 	done := make(chan error, 1)
 	go func() { done <- putSized(t, b, "new", data, int64(len(data))) }()
@@ -568,7 +562,7 @@ func TestPlaintextRelease_StreamedWriteWaitsOutAStartedRelease(t *testing.T) {
 		t.Fatalf("PutObject returned %v while the release was started", err)
 	case <-time.After(100 * time.Millisecond):
 	}
-	drainReleases(t, b)
+	finish()
 	if err := <-done; err != nil {
 		t.Fatalf("PutObject after the release: %v", err)
 	}
@@ -671,84 +665,40 @@ func TestPlaintextSpaces_ConcurrentPartsOfTheSameBytesParkOnce(t *testing.T) {
 	}
 }
 
-// staleThenReplaced is a release store that, when a start finds a record
-// stale, enqueues a replacement for the digest right after, as a drop of the
-// new claim that lands between the stale decision and a delete by key would.
-type staleThenReplaced struct {
-	registry.PendingReleaseStore
-	replaced int
-}
-
-func (s *staleThenReplaced) StartRelease(ctx context.Context, space did.DID, digest multihash.Multihash) (registry.ReleaseStart, error) {
-	r, err := s.PendingReleaseStore.StartRelease(ctx, space, digest)
-	if err == nil && r == registry.ReleaseClaimed {
-		s.replaced++
-		if err := s.PendingReleaseStore.EnqueueRelease(ctx, space, digest, time.Now().Add(time.Hour)); err != nil {
-			return 0, err
-		}
-	}
-	return r, err
-}
-
-// TestPlaintextRelease_StaleRecordDoesNotTakeAReplacement: a record found
-// stale is deleted by the start itself, under the lock; a replacement
-// enqueued right after survives the sweep, since nothing deletes by key.
-func TestPlaintextRelease_StaleRecordDoesNotTakeAReplacement(t *testing.T) {
-	rel := &staleThenReplaced{}
-	b, mem := newDeferredBackend(t, testfakes.NopUploader{}, func(d *Deps) {
-		rel.PendingReleaseStore = d.PendingReleases
-		d.PendingReleases = rel
-	})
+// TestPlaintextRelease_StaleReleaseRemovesNothing: a release of a digest
+// claimed again since it was queued finds the claim and does nothing.
+func TestPlaintextRelease_StaleReleaseRemovesNothing(t *testing.T) {
+	rm := &recordingRemover{}
+	b, mem := newDeferredBackend(t, testfakes.NopUploader{}, func(d *Deps) { d.Remover = rm })
 	ctx := context.Background()
 	setNone(t, b)
 	data := testBody(8 << 10)
 	putIn(t, b, "bk", "k", data)
 	d := blobDigestOf(t, b, "k", "")
-	// A record for a claimed digest: stale from the start.
-	if err := mem.EnqueueRelease(ctx, mem.bk(), d, time.Now()); err != nil {
+	if err := mem.EnqueueRelease(ctx, mem.bk(), d, registry.DueNow()); err != nil {
 		t.Fatalf("EnqueueRelease: %v", err)
 	}
 
-	drainReleases(t, b)
-
-	if rel.replaced != 1 {
-		t.Fatalf("stale starts = %d, want 1", rel.replaced)
+	if n, err := b.SweepPendingReleases(ctx); err != nil || n != 0 {
+		t.Fatalf("SweepPendingReleases = %d, %v; want nothing released", n, err)
 	}
-	pending, _ := mem.ListReleasesBySpace(ctx, mem.bk())
-	if len(pending) != 1 {
-		t.Fatalf("records after the sweep = %v, want the replacement alone", pending)
+	if rm.removedDigests()[string(d)] > 0 {
+		t.Fatalf("the stale release removed %x from the network", d)
+	}
+	if pending, _ := mem.ListReleasesBySpace(ctx, mem.bk()); len(pending) != 0 {
+		t.Fatalf("releases after the sweep = %v, want none", pending)
+	}
+	if got := getFrom(t, b, "bk", "k"); !bytes.Equal(got, data) {
+		t.Fatalf("the object does not read back")
 	}
 }
 
-// otherSpaceDeletesFirst is a release store under which, as space A's
-// release deletes its intent, space B's release has just deleted its own:
-// both had seen the other's intent and left the shared file.
-type otherSpaceDeletesFirst struct {
-	registry.PendingReleaseStore
-	first, second did.DID
-	done          bool
-}
-
-func (o *otherSpaceDeletesFirst) DeleteIntentAndRelease(ctx context.Context, space did.DID, digest multihash.Multihash) (int, error) {
-	if space == o.first && !o.done {
-		o.done = true
-		if _, err := o.PendingReleaseStore.DeleteIntentAndRelease(ctx, o.second, digest); err != nil {
-			return 0, err
-		}
-	}
-	return o.PendingReleaseStore.DeleteIntentAndRelease(ctx, space, digest)
-}
-
-// TestPlaintextSpaces_LastReleaseOutRemovesTheSharedFile: two spaces
-// releasing the same digest at once each see the other's intent and leave
-// the file; the one whose delete finds no intent left removes it.
+// TestPlaintextSpaces_LastReleaseOutRemovesTheSharedFile: two spaces release
+// the same digest; the first sees the other's intent and leaves the file, and
+// the last out removes it.
 func TestPlaintextSpaces_LastReleaseOutRemovesTheSharedFile(t *testing.T) {
-	rel := &otherSpaceDeletesFirst{}
 	b, mem, _ := newRefTestBackend(t)
-	rel.PendingReleaseStore = b.pendingReleases
-	b.pendingReleases = rel
 	space2 := secondPlaintextBucket(t, b, mem)
-	rel.first, rel.second = mem.bk(), space2
 	ctx := context.Background()
 	data := testBody(8 << 10)
 
@@ -1054,4 +1004,64 @@ func TestPlaintextRelease_HoldOutlastsTheRecord(t *testing.T) {
 		}
 		h.wantHeld(t, "park of a streamed part")
 	})
+}
+
+// gatedRemover holds each network remove until the test opens it, so a
+// release can be caught under way.
+type gatedRemover struct {
+	recordingRemover
+	waiting chan struct{}
+	open    chan struct{}
+}
+
+func newGatedRemover() *gatedRemover {
+	return &gatedRemover{waiting: make(chan struct{}, 1), open: make(chan struct{})}
+}
+
+func (g *gatedRemover) RemoveBlob(ctx context.Context, space did.DID, d multihash.Multihash) error {
+	select {
+	case g.waiting <- struct{}{}:
+	default:
+	}
+	select {
+	case <-g.open:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return g.recordingRemover.RemoveBlob(ctx, space, d)
+}
+
+// withGate makes the backend's network removes wait on gate.
+func withGate(gate *gatedRemover) func(*Deps) {
+	return func(d *Deps) { d.Remover = gate }
+}
+
+// holdRelease runs b's due releases in the background and returns once one
+// is held in its network remove: a release under way. The returned func lets
+// it finish and waits for it; it is also run when the test ends.
+func holdRelease(t *testing.T, b *Backend, gate *gatedRemover) (finish func()) {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() {
+		_, err := b.SweepPendingReleases(context.Background())
+		done <- err
+	}()
+	select {
+	case <-gate.waiting:
+	case err := <-done:
+		t.Fatalf("the release finished (err %v) before it reached the network", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("no release reached the network")
+	}
+	var once sync.Once
+	finish = func() {
+		once.Do(func() {
+			close(gate.open)
+			if err := <-done; err != nil {
+				t.Errorf("held release: %v", err)
+			}
+		})
+	}
+	t.Cleanup(finish)
+	return finish
 }

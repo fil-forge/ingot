@@ -187,7 +187,7 @@ func newTestServer(t *testing.T, cfg config.ServerConfig, opts ...func(*ServerDe
 		GC:              mem,
 		Multipart:       mem,
 		Parks:           mem,
-		PendingReleases: mem,
+		Claims:          mem,
 		EncParams:       mem,
 		RegionKeys:      regionKeys,
 		TenantKeys:      tenantkey.NewStatic(tenantPriv.PublicKey()),

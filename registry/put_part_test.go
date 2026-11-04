@@ -4,6 +4,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/multiformats/go-multihash"
 
 	"github.com/fil-forge/ingot/internal/pgtest"
@@ -12,19 +13,14 @@ import (
 	"github.com/fil-forge/ucantone/did"
 )
 
-// putPartStore is what the PutPart suite needs of a store.
-type putPartStore interface {
-	registry.MultipartStore
-	registry.PendingReleaseStore
-}
-
 // TestPutPartReplaced runs PutPart's release of the row it replaces
 // against Postgres.
 func TestPutPartReplaced(t *testing.T) {
-	runPutPartReplacedSuite(t, registry.NewPostgres(pgtest.New(t)))
+	pool := pgtest.New(t)
+	runPutPartReplacedSuite(t, pool, registry.NewPostgres(pool, registry.WithTasks(liveUploadTasks(t, pool))))
 }
 
-func runPutPartReplacedSuite(t *testing.T, st putPartStore) {
+func runPutPartReplacedSuite(t *testing.T, pool *pgxpool.Pool, st registry.MultipartStore) {
 	ctx := t.Context()
 	digest := func(b byte) multihash.Multihash {
 		return multihash.Multihash([]byte{0x12, 0x01, b})
@@ -41,10 +37,10 @@ func runPutPartReplacedSuite(t *testing.T, st putPartStore) {
 		return space
 	}
 	key := func(d multihash.Multihash) string { return string(d) }
-	recorded := func(space did.DID) map[string]registry.PendingRelease {
+	recorded := func(space did.DID) map[string]queuedRelease {
 		t.Helper()
-		out := map[string]registry.PendingRelease{}
-		for _, pr := range mustListReleases(t, st, space) {
+		out := map[string]queuedRelease{}
+		for _, pr := range mustListReleases(t, pool, space) {
 			out[key(pr.Digest)] = pr
 		}
 		return out
@@ -52,7 +48,7 @@ func runPutPartReplacedSuite(t *testing.T, st putPartStore) {
 
 	t.Run("a new part number releases nothing", func(t *testing.T) {
 		space := open("pp-new")
-		released, err := st.PutPart(ctx, part("pp-new", 1, digest(1)), nil)
+		released, err := st.PutPart(ctx, part("pp-new", 1, digest(1)), nil, registry.ReleaseTask{})
 		if err != nil || released != nil {
 			t.Fatalf("PutPart = %v, %v; want no releases", released, err)
 		}
@@ -63,20 +59,20 @@ func runPutPartReplacedSuite(t *testing.T, st putPartStore) {
 
 	t.Run("a supersede records a release for each blob the part drops, with the write", func(t *testing.T) {
 		space := open("pp-again")
-		if _, err := st.PutPart(ctx, part("pp-again", 1, digest(1), digest(2), digest(2)), nil); err != nil {
+		if _, err := st.PutPart(ctx, part("pp-again", 1, digest(1), digest(2), digest(2)), nil, registry.ReleaseTask{}); err != nil {
 			t.Fatalf("PutPart: %v", err)
 		}
 		// Digest 2 stays named; digest 1 is dropped and released, once.
-		released, err := st.PutPart(ctx, part("pp-again", 1, digest(3), digest(2)), nil)
-		if err != nil || len(released) != 1 || key(released[0].Digest) != key(digest(1)) || released[0].Space != space {
-			t.Fatalf("PutPart = %v, %v; want one release of the dropped digest in the session's space", released, err)
+		released, err := st.PutPart(ctx, part("pp-again", 1, digest(3), digest(2)), nil, registry.ReleaseTask{})
+		if err != nil || len(released) != 1 || key(released[0]) != key(digest(1)) {
+			t.Fatalf("PutPart = %v, %v; want one release, of the dropped digest", released, err)
 		}
 		rec := recorded(space)
 		if len(rec) != 1 || rec[key(digest(1))].NotBefore.IsZero() {
 			t.Fatalf("releases recorded = %v, want the dropped digest's, due now", rec)
 		}
 		// Another part number of the upload replaces no row.
-		released, err = st.PutPart(ctx, part("pp-again", 2, digest(4)), nil)
+		released, err = st.PutPart(ctx, part("pp-again", 2, digest(4)), nil, registry.ReleaseTask{})
 		if err != nil || released != nil {
 			t.Fatalf("PutPart of part 2 = %v, %v; want no releases", released, err)
 		}
@@ -89,13 +85,13 @@ func runPutPartReplacedSuite(t *testing.T, st putPartStore) {
 		space := open("pp-race")
 		const writers = 8
 		var wg sync.WaitGroup
-		reports := make([][]registry.PendingRelease, writers)
+		reports := make([][]multihash.Multihash, writers)
 		errs := make([]error, writers)
 		for i := 0; i < writers; i++ {
 			wg.Add(1)
 			go func(i int) {
 				defer wg.Done()
-				reports[i], errs[i] = st.PutPart(ctx, part("pp-race", 1, digest(byte(0x10+i))), nil)
+				reports[i], errs[i] = st.PutPart(ctx, part("pp-race", 1, digest(byte(0x10+i))), nil, registry.ReleaseTask{})
 			}(i)
 		}
 		wg.Wait()
@@ -109,8 +105,8 @@ func runPutPartReplacedSuite(t *testing.T, st putPartStore) {
 				fresh++
 				continue
 			}
-			for _, pr := range reports[i] {
-				seen[key(pr.Digest)]++
+			for _, d := range reports[i] {
+				seen[key(d)]++
 			}
 		}
 		if fresh != 1 {

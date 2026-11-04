@@ -123,7 +123,13 @@ func TestLocalBlobMetrics_Release(t *testing.T) {
 		t.Fatalf("release sweep executed %d releases (err=%v), want 1", n, err)
 	}
 
-	got := collectLocalBlobMetrics(t, reader)
+	// A cached copy goes by an eviction the release queues, a moment later.
+	var got map[string]int64
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		if got = collectLocalBlobMetrics(t, reader); got["ingot.local_blobs.removals/released"] > 0 {
+			break
+		}
+	}
 	if got["ingot.local_blobs.removals/released"] != 1 || got["ingot.local_blobs.removed_bytes/released"] != size {
 		t.Fatalf("released removals = %d files, %d bytes; want 1 file, %d bytes (all: %v)",
 			got["ingot.local_blobs.removals/released"], got["ingot.local_blobs.removed_bytes/released"], size, got)

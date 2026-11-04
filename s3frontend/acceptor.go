@@ -187,9 +187,9 @@ type concludingSet struct {
 // accepts before it answers the conclude, so a remove sent before that
 // answer finds nothing to remove, and the registration then lands with
 // nothing left to remove it. The mark is taken before the caller checks
-// for release records, and a release checks the mark before it starts, so
-// either the conclude finds the release's record and leaves the blob, or
-// the release finds the mark and waits.
+// for pending releases, and a release checks the mark before it acts, so
+// either the conclude finds the release and leaves the blob, or the release
+// finds the mark and waits.
 func (b *Backend) markConcluding(space did.DID, digests []mh.Multihash) func() {
 	c := &b.concluding
 	c.mu.Lock()
