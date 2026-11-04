@@ -300,40 +300,35 @@ the provider already holds: once a blob's location and `accepted` state are
 both recorded, its file moves from the spool to the cache by rename, which
 is why the two share a filesystem. A failed move leaves the file in the
 spool. With `cache_writes: false`, the copy is removed at that point
-instead, and its intent marked evicted, so the cache holds nothing written
-after that and every read goes to the provider. Reads try the cache, then
+instead, so the cache holds nothing written after that and every read goes
+to the provider. Reads try the cache, then
 the spool, then the cache again (a blob can move between the first two
 lookups), then the network.
+
+A cached copy has a time to live, `cache_ttl` (an hour), counted from when
+it was cached or last read. The move into the cache is a `queue-shard.cache`
+task, serialized on the digest, which also schedules a `queue-shard.evict`
+for when the time runs out. A read from the cache with less than half the
+time left, by this process's in-memory record of the last renewal, runs
+`queue-shard.cache` again with nothing to move; its eviction is submitted as
+a replacement, so the later one is kept. Each renewal also sets the file's
+modification time, which orders the budget pass. A read on a node that has
+restarted renews on its first read, since the record is lost.
 
 Each directory keeps a running byte count of its blob files, and the spool
 also counts writes in progress as their bytes land. With
 `local_blob_max_bytes` set, a sweeper checks the total every 30 seconds and,
-when it is over the budget, evicts blobs the provider already holds, oldest
-state change first, until usage is at 90% of the budget. A blob qualifies
-only through a row that proves the provider has it for the intent's space: a
-`blob_locations` row for an `accepted` or `published` intent, a `blob_parks`
-row for a `parked` one. A blob stored as received can have an intent in
-several spaces, one file between them; it does not qualify while any of
-them is still `spooled` or `uploading`, since that upload reads the file.
-Eviction removes the blob's local copy, which is in the cache, or still in
-the spool if the process stopped between recording the acceptance and the
-move. Spool files waiting for their upload, and writes in progress, never
-qualify; the budget counts them, so the pass evicts cached blobs to make
-room for them. The sweeper first honours two windows, `cache_min_residency`
-(10 minutes after the last state change, so a client reading back what it
-just wrote reads from disk) and `cache_read_retention` (an hour after a read
-from the cache, tracked in memory for up to 65,536 blobs and lost on
-restart); if usage is still over budget it evicts inside them, since a full
-disk fails every write, but only down to the budget, giving them up in
-stages: first the residency window, still passing over recently read blobs,
-then both (straight to both when the budget pass ran out of candidates). A
-pass that only ran out of time does not count: the next sweep continues
-outside the windows. Eviction removes the file first, then sets
-`upload_intents.evicted_at` on the intents as the listing saw them; the
-rows and their states stay, because a release and Complete read them, and
-an intent a write put since the listing, whose file is on disk again, keeps
-its mark clear. A read of an evicted blob misses locally and goes to
-the network tier. A file the pass cannot remove is logged and skipped.
+when it is over the budget, evicts cached copies, oldest modification time
+first, until usage is at 90% of the budget, however much of their time to
+live is left: a time to live does not bound the disk, and a burst of writes
+can fill it before anything expires. It reads the cache directory to order
+it, and evicts each through `queue-shard.evict` run as a sync task, so the
+removal takes its turn with the digest's other tasks and usage has dropped
+before the pass moves on; the eviction due later finds the file gone. Spool files never qualify, whatever their state; the budget
+counts them, so the pass evicts cached blobs to make room for them. The
+intents keep their rows and states, because a release and Complete read
+them. A read of an evicted blob misses locally and goes to the network tier.
+A file the pass cannot remove is logged and skipped.
 Hourly, with or without a budget, the sweeper also deletes `.tmp-*` files
 older than `local_blob_orphan_age` (24 hours) in both directories, and spool
 blob files that old with no intent row, checked a batch at a time; it

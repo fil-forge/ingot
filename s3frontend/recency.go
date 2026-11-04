@@ -1,4 +1,4 @@
-package blockstore
+package s3frontend
 
 import (
 	"container/list"
@@ -6,15 +6,12 @@ import (
 	"time"
 )
 
-// recencyCapacity caps how many blobs' last-read times the cache remembers.
-// The least recently read entry is dropped first.
-const recencyCapacity = 65536
-
-// recencyMap is a bounded LRU of last-read times, keyed by digest bytes.
+// recencyMap is a bounded LRU of times, keyed by digest bytes: the backend's
+// record of when it last renewed each cached blob.
 type recencyMap struct {
 	mu      sync.Mutex
 	cap     int
-	order   *list.List // front = most recently read; values are *recencyEntry
+	order   *list.List // front = most recently touched; values are *recencyEntry
 	entries map[string]*list.Element
 }
 
@@ -51,14 +48,4 @@ func (m *recencyMap) get(key string) (time.Time, bool) {
 		return time.Time{}, false
 	}
 	return el.Value.(*recencyEntry).at, true
-}
-
-// forget drops key's entry, if any.
-func (m *recencyMap) forget(key string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if el, ok := m.entries[key]; ok {
-		m.order.Remove(el)
-		delete(m.entries, key)
-	}
 }
