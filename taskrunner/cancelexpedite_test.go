@@ -42,8 +42,8 @@ func TestCancelPendingCancelsTheSubjectsUnstartedTasksOfAnAction(t *testing.T) {
 	otherAction := submit("sp/d", "expire", &later)
 	otherSubject := submit("sp/e", "release", &later)
 
-	n, running, err := f.r.CancelPending(ctx, qTop, "sp/d", "release")
-	if err != nil || n != 2 || running {
+	n, running, err := f.r.CancelPending(ctx, qTop, []string{"sp/d"}, "release")
+	if err != nil || n != 2 || len(running) != 0 {
 		t.Fatalf("CancelPending = %d, %v, %v; want 2 cancelled, none running", n, running, err)
 	}
 	for _, id := range []taskrunner.TaskID{retrying, delayed} {
@@ -58,7 +58,8 @@ func TestCancelPendingCancelsTheSubjectsUnstartedTasksOfAnAction(t *testing.T) {
 	}
 }
 
-// CancelPending cannot cancel a task that is running, and says so.
+// CancelPending cannot cancel a task that is running, and says which subjects
+// have one, while it cancels the others' in the same call.
 func TestCancelPendingReportsARunningTask(t *testing.T) {
 	f := newFixture(t, 1)
 	started, release := make(chan struct{}), make(chan struct{})
@@ -74,10 +75,14 @@ func TestCancelPendingReportsARunningTask(t *testing.T) {
 		t.Fatal(err)
 	}
 	<-started
-	n, running, err := f.r.CancelPending(ctx, qTop, "sp/d", "release")
+	later := time.Now().Add(time.Hour)
+	if _, err := f.r.Submit(ctx, taskrunner.Spec{Queue: qTop, Subject: "sp/e", Action: "release", NotBefore: &later}); err != nil {
+		t.Fatal(err)
+	}
+	n, running, err := f.r.CancelPending(ctx, qTop, []string{"sp/e", "sp/d", "sp/f"}, "release")
 	close(release)
-	if err != nil || n != 0 || !running {
-		t.Fatalf("CancelPending = %d, %v, %v; want none cancelled, one running", n, running, err)
+	if err != nil || n != 1 || !slices.Equal(running, []string{"sp/d"}) {
+		t.Fatalf("CancelPending = %d, %v, %v; want sp/e's cancelled and sp/d running", n, running, err)
 	}
 	if _, err := f.r.Wait(ctx, qTop, id); err != nil {
 		t.Fatalf("the running task: %v, want it to finish", err)
@@ -100,7 +105,7 @@ func TestCancelPendingTxRollsBackWithTheTransaction(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		n, _, err := f.r.CancelPendingTx(ctx, tx, qTop, "sp/d", "release")
+		n, _, err := f.r.CancelPendingTx(ctx, tx, qTop, []string{"sp/d"}, "release")
 		if err != nil || n != 1 {
 			t.Fatalf("CancelPendingTx = %d, %v; want 1 cancelled", n, err)
 		}
@@ -250,5 +255,49 @@ func TestPendingReportsSubjectsWithWorkLeft(t *testing.T) {
 	}
 	if _, err := f.r.Wait(ctx, qTop, running); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// SubmitAllTx adds many tasks in one statement, in order, and keeps the later
+// of two replacements for one subject and action, in the batch or already
+// pending.
+func TestSubmitAllTxAddsManyTasksAtOnce(t *testing.T) {
+	f := newFixture(t, 0)
+	f.handle(t, qTop, "release", func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) { return nil, nil })
+	f.migrate(t)
+	ctx := waitCtx(t)
+	at := func(d time.Duration) *time.Time { v := time.Now().Add(d).Truncate(time.Millisecond); return &v }
+	pending, err := f.r.Submit(ctx, taskrunner.Spec{Queue: qTop, Subject: "sp/later", Action: "release", NotBefore: at(2 * time.Hour), Replace: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	specs := []taskrunner.Spec{
+		{Queue: qTop, Subject: "sp/a", Action: "release", NotBefore: at(time.Hour), Replace: true},
+		{Queue: qTop, Subject: "sp/a", Action: "release", NotBefore: at(3 * time.Hour), Replace: true},
+		{Queue: qTop, Subject: "sp/b", Action: "release"},
+		{Queue: qTop, Subject: "sp/later", Action: "release", NotBefore: at(time.Hour), Replace: true},
+	}
+	tx, err := f.env.DB.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids, err := f.r.SubmitAllTx(ctx, tx, specs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) != 4 || ids[0] != ids[1] {
+		t.Fatalf("ids = %v, want four, the two sp/a replacements sharing one", ids)
+	}
+	if got := f.notBefore(t, qTop, ids[0]); !got.Equal(*specs[1].NotBefore) {
+		t.Errorf("sp/a due %v, want the later of the batch's two, %v", got, *specs[1].NotBefore)
+	}
+	if got := f.state(t, qTop, ids[2]); got != "pending" {
+		t.Errorf("sp/b is %s, want pending", got)
+	}
+	if got := f.state(t, qTop, pending); got != "pending" {
+		t.Errorf("the pending sp/later, due later than the batch's, is %s; want it kept", got)
 	}
 }

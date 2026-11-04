@@ -190,6 +190,14 @@ _, err := ex.Submit(ctx, taskrunner.Spec{
 
 A task without `Replace` is never a replacement and leaves pending ones alone. A replacement that is running can no longer be replaced, so a new one is added beside it. One waiting to retry can be: the task that takes its place starts its attempts afresh, and no longer holds its subject (see Retries).
 
+## Submitting many tasks at once
+
+`SubmitAllTx` adds many tasks of one queue inside your transaction in one statement, for a write that queues work for each of thousands of subjects, and returns their IDs in order. Of two replacements in the batch for the same subject and action, the later is kept, as it would be if they were submitted one by one.
+
+```go
+ids, err := r.SubmitAllTx(ctx, tx, specs)
+```
+
 ## Cancelling
 
 A pending task that has not started can be cancelled by queue and ID. Cancelling a task that has started, finished or been cancelled does nothing, so a task that can be cancelled must still check its own preconditions when it runs.
@@ -205,16 +213,16 @@ err = r.CancelTx(ctx, tx, "queue-space-shard", expireID)
 err = r.Cancel(ctx, "queue-space-shard", expireID)
 ```
 
-A caller that knows a task's subject and action but not its ID, such as a write about to reuse a blob whose release is pending, cancels by those instead. `CancelPending` cancels every pending task of the action on the subject that has not started, and says whether one of them is already running, which it cannot cancel and the caller must wait out.
+A caller that knows a task's subject and action but not its ID, such as a write about to reuse a blob whose release is pending, cancels by those instead. `CancelPending` cancels every pending task of the action on the given subjects that has not started, in one statement however many subjects there are, and lists the subjects with one already running, which it cannot cancel and the caller must wait out.
 
 ```go
-n, running, err := r.CancelPending(ctx, "queue-space-shard", subject, "release")
-if err == nil && running {
-	// The release is under way: wait for it, or ask the client to retry.
+n, running, err := r.CancelPending(ctx, "queue-space-shard", subjects, "release")
+if err == nil && len(running) > 0 {
+	// Those releases are under way: wait for them, or ask the client to retry.
 }
 
 // From your own transaction.
-n, running, err = r.CancelPendingTx(ctx, tx, "queue-space-shard", subject, "release")
+n, running, err = r.CancelPendingTx(ctx, tx, "queue-space-shard", subjects, "release")
 ```
 
 A caller that must leave such work alone, or wait for it, rather than take it over, asks the queue what is left. `Pending` returns the pending tasks of the action on each of the given subjects that has any, delayed, due or running, oldest first, and changes nothing.
