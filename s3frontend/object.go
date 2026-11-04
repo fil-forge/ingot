@@ -814,10 +814,13 @@ func (b *Backend) releaseDeferral() time.Duration {
 // had a record keeps its later not_before, and that grace is honoured, so
 // the deferred-release sweeper takes it when the time comes. Best-effort:
 // whatever this pass does not finish, the sweeper retries from the records
-// and unwinds exactly as this pass would.
+// and unwinds exactly as this pass would. A done ctx ends the pass.
 func (b *Backend) releaseNow(ctx context.Context, records []registry.PendingRelease) {
 	now := time.Now()
 	for _, pr := range records {
+		if ctx.Err() != nil {
+			return
+		}
 		if pr.NotBefore.After(now) {
 			continue
 		}
