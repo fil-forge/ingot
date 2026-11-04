@@ -81,11 +81,11 @@ type Forge struct {
 
 	// shipProofs caches, per space, the most recent borrowable proof store
 	// seen on an in-request body upload to that space (UploadBlob,
-	// StartBlob). Work that runs outside any request falls back to it: the
-	// release sweeper's /blob/remove, the session-expiry aborts,
-	// registration renewals, and the catalog segment ship (SubmitShard) when
-	// commitProofs can't serve it. An upload's grant covers all of their
-	// commands.
+	// StartBlob). Work that runs outside any request falls back to it: a
+	// release's /blob/remove, when the release carries no authority of its
+	// own, the session-expiry aborts, registration renewals, and the catalog
+	// segment ship (SubmitShard) when commitProofs can't serve it. An
+	// upload's grant covers all of their commands.
 	shipProofs *gocache.Cache
 
 	// commitProofs caches, per space, the proof store of the most recent

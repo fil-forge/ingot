@@ -20,6 +20,7 @@ import (
 	"github.com/fil-forge/ingot/logstore"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/taskrunner"
+	"github.com/fil-forge/ingot/taskrunner/taskrunnertest"
 	"github.com/fil-forge/libforge/testutil"
 	"github.com/fil-forge/ucantone/did"
 )
@@ -50,7 +51,7 @@ func TestPostgresStores(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.New(t)
 
-	r := registry.NewPostgres(pool)
+	r := registry.NewPostgres(pool, registry.WithTasks(liveUploadTasks(t, pool)))
 	// seedBucket inserts a bucket row directly, bypassing Create, and returns
 	// the space DID it generated. space and tenant have no default — Create
 	// always supplies the DIDs Hilt returns — so the seed supplies them too,
@@ -204,11 +205,11 @@ func TestPostgresStores(t *testing.T) {
 		// Dropping the source's claim beside the pin records no release;
 		// dropping the pin too does.
 		drop(t, r, registry.ClaimDrop{Digest: d1, Bucket: "pb", ObjectKey: "src", VersionID: "null#1", Space: space})
-		if releaseRecorded(t, r, space, d1) {
+		if releaseRecorded(t, pool, space, d1) {
 			t.Fatalf("drop of the source beside the pin recorded a release")
 		}
 		drop(t, r, registry.ClaimDrop{Digest: d1, Bucket: "pb", ObjectKey: "copy", VersionID: "null#7", Space: space})
-		if !releaseRecorded(t, r, space, d1) {
+		if !releaseRecorded(t, pool, space, d1) {
 			t.Fatalf("drop of the last claim recorded no release")
 		}
 	})
@@ -226,96 +227,32 @@ func TestPostgresStores(t *testing.T) {
 
 		// A zero grace (the commit helper's) makes the record due at once.
 		drop(t, r, registry.ClaimDrop{Digest: digest, Bucket: "rb", ObjectKey: "k1", VersionID: "null#1", Space: space})
-		if releaseRecorded(t, r, space, digest) {
+		if releaseRecorded(t, pool, space, digest) {
 			t.Fatalf("first drop recorded a release while a claim remains")
 		}
 		drop(t, r, registry.ClaimDrop{Digest: digest, Bucket: "rb", ObjectKey: "k2", VersionID: "null#1", Space: space})
-		if !releaseRecorded(t, r, space, digest) {
+		if !releaseRecorded(t, pool, space, digest) {
 			t.Fatalf("last drop recorded no release")
 		}
 
-		listed, err := r.ListDueReleases(ctx, time.Now(), 10)
-		if err != nil {
-			t.Fatalf("ListDueReleases: %v", err)
+		// A later queueing of the same release keeps the later time, and a
+		// batch of digests queues each once.
+		later := time.Now().Add(time.Hour).Truncate(time.Millisecond)
+		if err := r.QueueReleases(ctx, space, []multihash.Multihash{digest}, later, registry.ReleaseTask{}); err != nil {
+			t.Fatalf("QueueReleases (later): %v", err)
 		}
-		found := false
-		for _, pr := range listed {
-			if pr.Space == space && string(pr.Digest) == string(digest) {
-				found = true
-			}
-		}
-		if !found {
-			t.Fatalf("enqueued release not listed as due: %v", listed)
-		}
-
-		// Upsert keeps the LATER not_before: re-enqueueing far in the future
-		// pushes the intent out of the due window.
-		if err := r.EnqueueRelease(ctx, space, digest, time.Now().Add(time.Hour)); err != nil {
-			t.Fatalf("EnqueueRelease (extend): %v", err)
-		}
-		listed, err = r.ListDueReleases(ctx, time.Now(), 10)
-		if err != nil {
-			t.Fatalf("ListDueReleases (after extend): %v", err)
-		}
-		for _, pr := range listed {
-			if pr.Space == space && string(pr.Digest) == string(digest) {
-				t.Fatalf("extended intent still listed as due")
-			}
-		}
-
-		if err := r.DeleteRelease(ctx, space, digest); err != nil {
-			t.Fatalf("DeleteRelease: %v", err)
-		}
-
-		// Bulk enqueue: one statement, repeated digests recorded once, the
-		// upsert keeps an existing later not_before, and the records come
-		// back as they stand so the caller sees that later time.
 		d2 := multihash.Multihash([]byte{0xbb, 0x02})
-		if err := r.EnqueueRelease(ctx, space, digest, time.Now().Add(time.Hour)); err != nil {
-			t.Fatalf("EnqueueRelease (future): %v", err)
+		if err := r.QueueReleases(ctx, space, []multihash.Multihash{digest, d2, d2}, registry.DueNow(), registry.ReleaseTask{}); err != nil {
+			t.Fatalf("QueueReleases (batch): %v", err)
 		}
-		recs, err := r.EnqueueReleases(ctx, space, []multihash.Multihash{digest, d2, d2}, time.Now().Add(-time.Second))
-		if err != nil || len(recs) != 2 {
-			t.Fatalf("EnqueueReleases = %d records, err %v (want 2)", len(recs), err)
+		queued := mustListReleases(t, pool, space)
+		if len(queued) != 2 {
+			t.Fatalf("queued releases = %v, want two", queued)
 		}
-		for _, pr := range recs {
-			if string(pr.Digest) == string(digest) && pr.NotBefore.Before(time.Now().Add(30*time.Minute)) {
-				t.Fatalf("bulk enqueue returned an existing record with an earlier not_before: %v", pr.NotBefore)
+		for _, q := range queued {
+			if string(q.Digest) == string(digest) && !q.NotBefore.Equal(later) {
+				t.Fatalf("release of %x due %v, want the later time %v", digest, q.NotBefore, later)
 			}
-			if string(pr.Digest) == string(d2) && pr.NotBefore.After(time.Now()) {
-				t.Fatalf("new record not due: %v", pr.NotBefore)
-			}
-		}
-		all, err := r.ListReleasesBySpace(ctx, space)
-		if err != nil || len(all) != 2 {
-			t.Fatalf("ListReleasesBySpace = %d, err %v (want 2)", len(all), err)
-		}
-		for _, pr := range all {
-			_ = r.DeleteRelease(ctx, space, pr.Digest)
-		}
-	})
-
-	t.Run("delete intent and release record atomically", func(t *testing.T) {
-		space := testutil.RandomDID(t)
-		d := multihash.Multihash([]byte{0x12, 0x20, 0xda, 0x01})
-		if err := r.PutIntent(ctx, registry.UploadIntent{Space: space, Digest: d, LocalPath: "/spool/d", Size: 3, State: registry.IntentSpooled, Bucket: "b"}); err != nil {
-			t.Fatalf("PutIntent: %v", err)
-		}
-		if err := r.EnqueueRelease(ctx, space, d, time.Now()); err != nil {
-			t.Fatalf("EnqueueRelease: %v", err)
-		}
-		if _, err := r.DeleteIntentAndRelease(ctx, space, d); err != nil {
-			t.Fatalf("DeleteIntentAndRelease: %v", err)
-		}
-		if _, err := r.GetIntent(ctx, space, d); err != registry.ErrNotFound {
-			t.Fatalf("intent after the paired delete = %v, want ErrNotFound", err)
-		}
-		if rows, _ := r.ListReleasesBySpace(ctx, space); len(rows) != 0 {
-			t.Fatalf("release records after the paired delete = %v, want none", rows)
-		}
-		// Idempotent: nothing left to delete is not an error.
-		if _, err := r.DeleteIntentAndRelease(ctx, space, d); err != nil {
-			t.Fatalf("repeated DeleteIntentAndRelease: %v", err)
 		}
 	})
 
@@ -624,11 +561,11 @@ func TestPostgresStores(t *testing.T) {
 		_ = r.DeleteSession(ctx, id+"-space")
 
 		// bytea[] round trip + ordering.
-		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 2, ETagMD5: []byte{0x02}, Size: 2, BlobDigests: []multihash.Multihash{{0xd2}}}, nil); err != nil {
+		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 2, ETagMD5: []byte{0x02}, Size: 2, BlobDigests: []multihash.Multihash{{0xd2}}}, nil, registry.ReleaseTask{}); err != nil {
 			t.Fatalf("PutPart 2: %v", err)
 		}
 		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 1, ETagMD5: []byte{0x01}, Size: 1, BlobDigests: []multihash.Multihash{{0xd1, 0xa}, {0xd1, 0xb}}},
-			&registry.PartTree{Offset: 0, ChunkLog: 4, Nodes: []byte{0x0a}, Blocks: []byte{0x0b, 0x0c}, Head: []byte{0x0d}, Tail: []byte{0x0e}, Root: []byte{0x0f}}); err != nil {
+			&registry.PartTree{Offset: 0, ChunkLog: 4, Nodes: []byte{0x0a}, Blocks: []byte{0x0b, 0x0c}, Head: []byte{0x0d}, Tail: []byte{0x0e}, Root: []byte{0x0f}}, registry.ReleaseTask{}); err != nil {
 			t.Fatalf("PutPart 1: %v", err)
 		}
 		parts, err := r.ListParts(ctx, id)
@@ -646,14 +583,14 @@ func TestPostgresStores(t *testing.T) {
 		}
 		// A superseding part without a tree drops its predecessor's row; one
 		// with a tree replaces it.
-		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 1, ETagMD5: []byte{0x01}, Size: 1, BlobDigests: []multihash.Multihash{{0xd1}}}, nil); err != nil {
+		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 1, ETagMD5: []byte{0x01}, Size: 1, BlobDigests: []multihash.Multihash{{0xd1}}}, nil, registry.ReleaseTask{}); err != nil {
 			t.Fatalf("PutPart 1 again: %v", err)
 		}
 		if again, _ := r.ListPartTrees(ctx, id); again[1] != nil {
 			t.Fatalf("superseded part kept its tree: %+v", again[1])
 		}
 		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 2, ETagMD5: []byte{0x02}, Size: 2, BlobDigests: []multihash.Multihash{{0xd2}}},
-			&registry.PartTree{Offset: 1, ChunkLog: 5, Nodes: []byte{0x1a}, Blocks: []byte{0x1b}}); err != nil {
+			&registry.PartTree{Offset: 1, ChunkLog: 5, Nodes: []byte{0x1a}, Blocks: []byte{0x1b}}, registry.ReleaseTask{}); err != nil {
 			t.Fatalf("PutPart 2 with tree: %v", err)
 		}
 		if again, _ := r.ListPartTrees(ctx, id); again[2] == nil || again[2].Offset != 1 || again[2].ChunkLog != 5 || again[2].Head != nil {
@@ -677,10 +614,10 @@ func TestPostgresStores(t *testing.T) {
 		}
 		// A part cannot land once the session has left 'open', nor on a
 		// session that does not exist.
-		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 3, ETagMD5: []byte{0x03}, Size: 3, BlobDigests: []multihash.Multihash{{0xd3}}}, nil); !errors.Is(err, registry.ErrNotFound) {
+		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 3, ETagMD5: []byte{0x03}, Size: 3, BlobDigests: []multihash.Multihash{{0xd3}}}, nil, registry.ReleaseTask{}); !errors.Is(err, registry.ErrNotFound) {
 			t.Fatalf("PutPart on a completing session = %v, want ErrNotFound", err)
 		}
-		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: "no-such-upload", PartNumber: 1, ETagMD5: []byte{0x01}, Size: 1, BlobDigests: []multihash.Multihash{{0xd1}}}, nil); !errors.Is(err, registry.ErrNotFound) {
+		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: "no-such-upload", PartNumber: 1, ETagMD5: []byte{0x01}, Size: 1, BlobDigests: []multihash.Multihash{{0xd1}}}, nil, registry.ReleaseTask{}); !errors.Is(err, registry.ErrNotFound) {
 			t.Fatalf("PutPart on a missing session = %v, want ErrNotFound", err)
 		}
 		if parts, _ := r.ListParts(ctx, id); len(parts) != 2 {
@@ -743,10 +680,10 @@ func TestPostgresStores(t *testing.T) {
 
 		// CountPartRefs: bytea[] ANY-match across sessions, excluding one.
 		shared := []byte{0xee, 0x01}
-		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: "ls-1", PartNumber: 1, ETagMD5: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{shared}}, nil); err != nil {
+		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: "ls-1", PartNumber: 1, ETagMD5: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{shared}}, nil, registry.ReleaseTask{}); err != nil {
 			t.Fatalf("PutPart ls-1: %v", err)
 		}
-		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: "ls-2", PartNumber: 1, ETagMD5: []byte{2}, Size: 1, BlobDigests: []multihash.Multihash{shared, {0xee, 0x02}}}, nil); err != nil {
+		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: "ls-2", PartNumber: 1, ETagMD5: []byte{2}, Size: 1, BlobDigests: []multihash.Multihash{shared, {0xee, 0x02}}}, nil, registry.ReleaseTask{}); err != nil {
 			t.Fatalf("PutPart ls-2: %v", err)
 		}
 		if n, err := r.CountPartRefs(ctx, shared, "ls-1"); err != nil || n != 1 {
@@ -1026,7 +963,6 @@ func TestCommitRootOnASingleConnection(t *testing.T) {
 	setup := registry.NewPostgres(setupPool)
 
 	space := testutil.RandomDID(t)
-	t.Cleanup(func() { clearQueuedUploads(t, setupPool, space) })
 	regs := []registry.UploadRegistration{{
 		Bucket: "cas-single-conn", ObjectKey: "k", Space: space,
 		Root: liveCid(t, "root"), Op: registry.UploadRegistrationAdd, Proofs: []byte("proofs"),
@@ -1082,18 +1018,22 @@ func TestCommitRootOnASingleConnection(t *testing.T) {
 // registry to queue registrations through.
 func liveUploadTasks(t *testing.T, pool *pgxpool.Pool) *taskrunner.Runner {
 	t.Helper()
-	r, err := taskrunner.New(pool, taskrunner.Options{Schema: "ingot", Queues: []taskrunner.QueueOptions{{Name: registry.UploadQueue}}})
+	r, err := taskrunner.New(pool, taskrunner.Options{Schema: "ingot", Queues: []taskrunner.QueueOptions{
+		{Name: registry.UploadQueue}, {Name: registry.ReleaseQueue},
+	}})
 	if err != nil {
 		t.Fatalf("task runner: %v", err)
 	}
 	// Submitting a task needs its handler registered, though these tests
 	// never run one.
+	noop := func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) { return nil, nil }
 	for _, op := range []registry.UploadRegistrationOp{registry.UploadRegistrationAdd, registry.UploadRegistrationRemove} {
-		if err := r.Handle(registry.UploadQueue, string(op), func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) {
-			return nil, nil
-		}); err != nil {
+		if err := r.Handle(registry.UploadQueue, string(op), noop); err != nil {
 			t.Fatalf("register %s: %v", op, err)
 		}
+	}
+	if err := r.Handle(registry.ReleaseQueue, registry.ReleaseAction, noop); err != nil {
+		t.Fatalf("register release: %v", err)
 	}
 	if err := r.Migrate(context.Background()); err != nil {
 		t.Fatalf("task runner migrate: %v", err)
@@ -1102,33 +1042,24 @@ func liveUploadTasks(t *testing.T, pool *pgxpool.Pool) *taskrunner.Runner {
 }
 
 // queuedUploads returns the space's pending registrations, in queue order.
-// Tasks outlive their bucket, so each test clears its space's afterwards.
 func queuedUploads(t *testing.T, pool *pgxpool.Pool, space did.DID) []registry.UploadRegistration {
 	t.Helper()
-	rows, err := pool.Query(context.Background(), `SELECT subject, action, args FROM ingot.queue_space_upload_tasks
-		WHERE subject = $1 AND state = 'pending' ORDER BY seq`, space.String())
+	tasks, err := taskrunnertest.Tasks(context.Background(), pool, "ingot", registry.UploadQueue)
 	if err != nil {
 		t.Fatalf("list queued uploads: %v", err)
 	}
-	defer rows.Close()
 	var out []registry.UploadRegistration
-	for rows.Next() {
-		var task taskrunner.Task
-		if err := rows.Scan(&task.Subject, &task.Action, &task.Args); err != nil {
-			t.Fatalf("scan queued upload: %v", err)
+	for _, q := range tasks {
+		if q.Subject != space.String() || q.State != "pending" {
+			continue
 		}
-		reg, err := registry.UploadRegistrationFromTask(task)
+		reg, err := registry.UploadRegistrationFromTask(taskrunner.Task{Subject: q.Subject, Action: q.Action, Args: q.Args})
 		if err != nil {
 			t.Fatalf("decode queued upload: %v", err)
 		}
 		out = append(out, reg)
 	}
 	return out
-}
-
-func clearQueuedUploads(t *testing.T, pool *pgxpool.Pool, space did.DID) {
-	t.Helper()
-	_, _ = pool.Exec(context.Background(), `DELETE FROM ingot.queue_space_upload_tasks WHERE subject = $1`, space.String())
 }
 
 // livePool returns a pool on a migrated database of the test's own.
@@ -1146,7 +1077,6 @@ func TestCommitRootQueuesUploadRegistrations(t *testing.T) {
 	ctx := context.Background()
 	r := registry.NewPostgres(pool, registry.WithTasks(liveUploadTasks(t, pool)))
 	space := testutil.RandomDID(t)
-	t.Cleanup(func() { clearQueuedUploads(t, pool, space) })
 	if err := r.Create(ctx, "queue-bucket", space, registry.CreateState{Tenant: testutil.RandomDID(t)}); err != nil {
 		t.Fatalf("create bucket: %v", err)
 	}
@@ -1202,7 +1132,7 @@ func TestCommitRootWithoutTasksRefusesRegistrations(t *testing.T) {
 func TestConcurrentCommitClaims(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.New(t)
-	r := registry.NewPostgres(pool)
+	r := registry.NewPostgres(pool, registry.WithTasks(liveUploadTasks(t, pool)))
 	space := testutil.RandomDID(t)
 
 	buckets := []string{"concurrent-claims-w0-" + space.String()[len(space.String())-8:], "concurrent-claims-w1-" + space.String()[len(space.String())-8:]}
@@ -1264,68 +1194,6 @@ func TestConcurrentCommitClaims(t *testing.T) {
 	}
 }
 
-// TestGetReleaseWaitsForTheClaimKeyLock: the release lookup a part's
-// park makes is serialised with the start of that release. A start in
-// flight holds the claim-key lock until it commits, so the lookup waits and
-// then reads the record started, rather than read it pending a moment
-// before the start commits and let the part reuse a blob the release then
-// removes.
-func TestGetReleaseWaitsForTheClaimKeyLock(t *testing.T) {
-	ctx := context.Background()
-	pool := pgtest.New(t)
-	r := registry.NewPostgres(pool)
-	space := testutil.RandomDID(t)
-	d := liveDigest(t, "get-release-waits")
-	if err := r.EnqueueRelease(ctx, space, d, time.Now()); err != nil {
-		t.Fatalf("EnqueueRelease: %v", err)
-	}
-	t.Cleanup(func() { _ = r.DeleteRelease(context.Background(), space, d) })
-
-	// A start in flight: the claim-key lock held, the record marked started,
-	// the transaction open.
-	start, err := pool.Begin(ctx)
-	if err != nil {
-		t.Fatalf("begin: %v", err)
-	}
-	defer start.Rollback(ctx)
-	if _, err := start.Exec(ctx,
-		`SELECT pg_advisory_xact_lock(hashtextextended($1 || ':' || encode($2, 'hex'), 0))`,
-		space.String(), []byte(d)); err != nil {
-		t.Fatalf("lock claim key: %v", err)
-	}
-	if _, err := start.Exec(ctx,
-		`UPDATE ingot.blob_release_intents SET started_at = now() WHERE space = $1 AND digest = $2`,
-		space, d); err != nil {
-		t.Fatalf("mark started: %v", err)
-	}
-
-	type lookup struct {
-		pr  *registry.PendingRelease
-		err error
-	}
-	done := make(chan lookup, 1)
-	go func() {
-		pr, err := r.GetRelease(ctx, space, d)
-		done <- lookup{pr, err}
-	}()
-	select {
-	case got := <-done:
-		t.Fatalf("GetRelease returned %+v, %v while a start held the claim-key lock", got.pr, got.err)
-	case <-time.After(300 * time.Millisecond):
-	}
-	if err := start.Commit(ctx); err != nil {
-		t.Fatalf("commit start: %v", err)
-	}
-	select {
-	case got := <-done:
-		if got.err != nil || got.pr.StartedAt.IsZero() {
-			t.Fatalf("GetRelease after the start committed = %+v, %v; want the record started", got.pr, got.err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("GetRelease did not return once the start committed")
-	}
-}
-
 // TestReleaseGraceRunsFromTheSwap: a drop's release is due the grace
 // after the swap commits, not after its transaction began. A swap that
 // waited on a claim-key lock (here held by another transaction) owes a
@@ -1334,7 +1202,7 @@ func TestGetReleaseWaitsForTheClaimKeyLock(t *testing.T) {
 func TestReleaseGraceRunsFromTheSwap(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.New(t)
-	r := registry.NewPostgres(pool)
+	r := registry.NewPostgres(pool, registry.WithTasks(liveUploadTasks(t, pool)))
 	space := testutil.RandomDID(t)
 	bucket := "grace-swap-" + space.String()[len(space.String())-8:]
 	d := liveDigest(t, "grace-runs-from-the-swap")
@@ -1343,10 +1211,7 @@ func TestReleaseGraceRunsFromTheSwap(t *testing.T) {
 	}
 	c := registry.BlobClaim{Digest: d, Bucket: bucket, ObjectKey: "k", VersionID: "v1", Space: space}
 	mustClaim(t, r, c)
-	t.Cleanup(func() {
-		_ = r.DeleteRelease(context.Background(), space, d)
-		_ = r.Delete(context.Background(), bucket)
-	})
+	t.Cleanup(func() { _ = r.Delete(context.Background(), bucket) })
 
 	// Another transaction holds the digest's claim-key lock while the drop's
 	// commit begins and waits.
@@ -1380,8 +1245,8 @@ func TestReleaseGraceRunsFromTheSwap(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatalf("CommitRoot: %v", err)
 	}
-	var pr *registry.PendingRelease
-	for _, rec := range mustListReleases(t, r, space) {
+	var pr *queuedRelease
+	for _, rec := range mustListReleases(t, pool, space) {
 		if string(rec.Digest) == string(d) {
 			pr = &rec
 		}
@@ -1400,7 +1265,7 @@ func TestReleaseGraceRunsFromTheSwap(t *testing.T) {
 func TestBucketCORSConfig(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.New(t)
-	r := registry.NewPostgres(pool)
+	r := registry.NewPostgres(pool, registry.WithTasks(liveUploadTasks(t, pool)))
 	if err := r.Create(ctx, "b", testutil.RandomDID(t), registry.CreateState{Tenant: testutil.RandomDID(t)}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}

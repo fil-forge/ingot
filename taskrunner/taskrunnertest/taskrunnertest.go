@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -147,4 +148,39 @@ func runCase(ctx context.Context, env Env, c Case, immediate bool) (outcome, err
 		return outcome{}, fmt.Errorf("read state: %w", err)
 	}
 	return o, nil
+}
+
+// QueuedTask is a task as its queue holds it, for a test to inspect.
+type QueuedTask struct {
+	ID        taskrunner.TaskID
+	Subject   string
+	Action    string
+	State     string
+	NotBefore *time.Time
+	Created   time.Time
+	Attempts  int
+	Args      []byte
+	Result    []byte
+	Node      *string
+}
+
+// Tasks lists a queue's tasks in schema, oldest first. It reads and changes
+// nothing else: it is for tests that check what was queued, run or left.
+func Tasks(ctx context.Context, db taskrunner.Querier, schema, queue string) ([]QueuedTask, error) {
+	table := pgx.Identifier{schema, strings.ReplaceAll(queue, "-", "_") + "_tasks"}.Sanitize()
+	rows, err := db.Query(ctx, `SELECT id, subject, action, state, not_before, created, attempts, args, result, node
+		FROM `+table+` ORDER BY seq`)
+	if err != nil {
+		return nil, fmt.Errorf("list %s tasks: %w", queue, err)
+	}
+	defer rows.Close()
+	var out []QueuedTask
+	for rows.Next() {
+		var t QueuedTask
+		if err := rows.Scan(&t.ID, &t.Subject, &t.Action, &t.State, &t.NotBefore, &t.Created, &t.Attempts, &t.Args, &t.Result, &t.Node); err != nil {
+			return nil, fmt.Errorf("list %s tasks: %w", queue, err)
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
 }

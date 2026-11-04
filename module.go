@@ -170,7 +170,7 @@ type serverParams struct {
 	GC              registry.GCStore
 	Multipart       registry.MultipartStore
 	Parks           registry.ParkStore
-	PendingReleases registry.PendingReleaseStore
+	Claims          registry.BlobRefStore
 	Meta            logstore.Meta
 	// CatalogUsage feeds the catalog usage gauges; without it they are not
 	// reported (see ServerDeps.CatalogUsage).
@@ -233,7 +233,7 @@ func registerServerLifecycle(lc fx.Lifecycle, p serverParams) {
 				GC:              p.GC,
 				Multipart:       p.Multipart,
 				Parks:           p.Parks,
-				PendingReleases: p.PendingReleases,
+				Claims:          p.Claims,
 				EncParams:       p.EncParams,
 				RegionKeys:      p.RegionKeys,
 				TenantKeys:      p.TenantKeys,
@@ -495,7 +495,7 @@ type registryResult struct {
 	GC                registry.GCStore
 	Multipart         registry.MultipartStore
 	Parks             registry.ParkStore
-	PendingReleases   registry.PendingReleaseStore
+	Claims            registry.BlobRefStore
 	EncParams         registry.EncryptionParamsStore
 	RevocationCursors registry.RevocationCursorStore
 	CatalogUsage      registry.CatalogUsageStore
@@ -512,7 +512,7 @@ type registryResult struct {
 // hilt_url/hilt_did configured.
 func provideRegistry(pool *pgxpool.Pool, tasks *taskrunner.Runner) registryResult {
 	pg := registry.NewPostgres(pool, registry.WithTasks(tasks))
-	return registryResult{Registry: pg, Intents: pg, Locations: pg, Inclusions: pg, GC: pg, Multipart: pg, Parks: pg, PendingReleases: pg, EncParams: pg, RevocationCursors: pg, CatalogUsage: pg, Meta: pg}
+	return registryResult{Registry: pg, Intents: pg, Locations: pg, Inclusions: pg, GC: pg, Multipart: pg, Parks: pg, Claims: pg, EncParams: pg, RevocationCursors: pg, CatalogUsage: pg, Meta: pg}
 }
 
 // taskSchema is the Postgres schema the task queues' tables live in, beside
@@ -526,6 +526,10 @@ const uploadRegistrationWorkers = 4
 // shardWorkers is how many cached blobs' moves and evictions one instance
 // runs at once. Each is a rename or an unlink.
 const shardWorkers = 4
+
+// releaseWorkers is how many blobs' releases one instance runs at once. Each
+// is a round trip to the upload service.
+const releaseWorkers = 8
 
 // provideTaskRunner builds the runner for ingot's durable task queues, over
 // the host's pool. The backend registers its handlers (Server.New); the
@@ -541,6 +545,7 @@ func provideTaskRunner(pool *pgxpool.Pool, id identity.Identity, logger *zap.Log
 		Node:   id.DID().String(),
 		Queues: []taskrunner.QueueOptions{
 			{Name: registry.UploadQueue, Workers: uploadRegistrationWorkers},
+			{Name: registry.ReleaseQueue, Workers: releaseWorkers},
 			{Name: s3frontend.ShardQueue, Workers: shardWorkers},
 		},
 		Logger: logger.Named("tasks"),

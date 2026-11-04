@@ -174,7 +174,7 @@ func (t *ShardEvictTask) MarshalCBOR(w io.Writer) error {
 
 	cw := cbg.NewCborWriter(w)
 
-	if _, err := cw.Write([]byte{161}); err != nil {
+	if _, err := cw.Write([]byte{162}); err != nil {
 		return err
 	}
 
@@ -191,6 +191,22 @@ func (t *ShardEvictTask) MarshalCBOR(w io.Writer) error {
 	}
 
 	if err := cbg.WriteBool(w, t.Budget); err != nil {
+		return err
+	}
+
+	// t.Released (bool) (bool)
+	if len("Released") > 1000000 {
+		return xerrors.Errorf("Value in field \"Released\" was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("Released"))); err != nil {
+		return err
+	}
+	if _, err := cw.WriteString(string("Released")); err != nil {
+		return err
+	}
+
+	if err := cbg.WriteBool(w, t.Released); err != nil {
 		return err
 	}
 	return nil
@@ -221,7 +237,7 @@ func (t *ShardEvictTask) UnmarshalCBOR(r io.Reader) (err error) {
 
 	n := extra
 
-	nameBuf := make([]byte, 6)
+	nameBuf := make([]byte, 8)
 	for i := uint64(0); i < n; i++ {
 		nameLen, ok, err := cbg.ReadFullStringIntoBuf(cr, nameBuf, 1000000)
 		if err != nil {
@@ -252,6 +268,24 @@ func (t *ShardEvictTask) UnmarshalCBOR(r io.Reader) (err error) {
 				t.Budget = false
 			case 21:
 				t.Budget = true
+			default:
+				return fmt.Errorf("booleans are either major type 7, value 20 or 21 (got %d)", extra)
+			}
+			// t.Released (bool) (bool)
+		case "Released":
+
+			maj, extra, err = cr.ReadHeader()
+			if err != nil {
+				return err
+			}
+			if maj != cbg.MajOther {
+				return fmt.Errorf("booleans must be major type 7")
+			}
+			switch extra {
+			case 20:
+				t.Released = false
+			case 21:
+				t.Released = true
 			default:
 				return fmt.Errorf("booleans are either major type 7, value 20 or 21 (got %d)", extra)
 			}

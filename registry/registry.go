@@ -195,9 +195,9 @@ type Registry interface {
 // Common errors.
 var (
 	ErrNotFound = errors.New("registry: bucket not found")
-	// ErrReleaseInProgress refuses a blob claim while a started release is
-	// removing the blob from its provider (PendingReleaseStore.StartRelease):
-	// the write retries once the release has run and uploads afresh.
+	// ErrReleaseInProgress refuses a blob claim while the blob's release is
+	// running, removing it from its provider: the write retries once the
+	// release has run and uploads afresh.
 	ErrReleaseInProgress = errors.New("registry: a release of the blob is in progress")
 	// ErrClaimGone refuses a pinned claim (RootCommit.Pins) when the space
 	// holds no claim on the digest to pin to: the source object's last claim
@@ -217,11 +217,11 @@ type RootCommit struct {
 	// the space's content-entry list.
 	Registrations []UploadRegistration
 	// Claims are the new generation's claims, one per body digest. Each is
-	// recorded under the (space, digest) claim-key lock and refused with
-	// ErrReleaseInProgress while a started release holds the digest, or
-	// when the space has no location for it: a claim landing then would
-	// name a blob a release is removing, or has removed since the write
-	// settled it. Every committed body blob is located by its commit, so a
+	// recorded under the (space, digest) claim-key lock, and cancels the
+	// digest's pending release in the same transaction. They are refused with
+	// ErrReleaseInProgress while a release of any of them is running, or when
+	// the space has no location for one: a claim landing then would name a
+	// blob a release is removing, or has removed since the write settled it. Every committed body blob is located by its commit, so a
 	// claim with no location is one such write's. Recording a claim marks
 	// the space's upload intent for the digest published (IntentPublished).
 	Claims []BlobClaim
@@ -233,10 +233,13 @@ type RootCommit struct {
 	Pins []BlobClaim
 	// Drops are the discarded generations' claims. Each is deleted and, when
 	// it was the space's last claim on the digest, the blob's release is
-	// recorded in the same transaction, so no crash window separates "last
-	// claim gone" from "release recorded".
+	// queued in the same transaction, so no crash window separates "last
+	// claim gone" from "release queued".
 	Drops []ClaimDrop
-	// ReleaseGrace is how long after the commit a release the Drops record
+	// Release is the authority the releases the Drops queue remove their
+	// blobs with, captured from the request.
+	Release ReleaseTask
+	// ReleaseGrace is how long after the commit a release the Drops queue
 	// is due. It is measured when the swap commits, after the catalog fsync
 	// and any lock wait that precede it, so a reader that resolved the
 	// discarded version just before the swap has the whole grace to open

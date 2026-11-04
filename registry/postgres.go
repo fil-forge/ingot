@@ -170,8 +170,8 @@ func (r *Postgres) CommitRoot(ctx context.Context, name string, expect, next cid
 	if err := r.casRoot(ctx, tx, name, expect, next); err != nil {
 		return err
 	}
-	if len(c.Registrations) > 0 && r.tasks == nil {
-		return fmt.Errorf("registry: commit %q queues upload registrations but the registry has no task runner", name)
+	if (len(c.Registrations) > 0 || len(c.Claims) > 0 || len(c.Drops) > 0) && r.tasks == nil {
+		return fmt.Errorf("registry: commit %q queues tasks but the registry has no task runner", name)
 	}
 	for _, reg := range c.Registrations {
 		// Queued in commit order under the bucket lock, so a space's changes
@@ -190,7 +190,7 @@ func (r *Postgres) CommitRoot(ctx context.Context, name string, expect, next cid
 	if err := lockClaimKeys(ctx, tx, c); err != nil {
 		return err
 	}
-	if err := addClaims(ctx, tx, c.Claims); err != nil {
+	if err := addClaims(ctx, tx, r.tasks, c.Claims); err != nil {
 		return err
 	}
 	for _, p := range c.Pins {
@@ -198,7 +198,7 @@ func (r *Postgres) CommitRoot(ctx context.Context, name string, expect, next cid
 			return err
 		}
 	}
-	if err := dropClaims(ctx, tx, c.Drops, c.ReleaseGrace); err != nil {
+	if err := dropClaims(ctx, tx, r.tasks, c.Drops, c.ReleaseGrace, c.Release); err != nil {
 		return err
 	}
 	if err := tx.Commit(ctx); err != nil {
