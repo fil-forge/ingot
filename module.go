@@ -161,10 +161,9 @@ type serverParams struct {
 	Registrar    uploader.UploadRegistrar
 	// Tasks is optional: an in-memory registry queues no tasks.
 	Tasks *taskrunner.Runner `optional:"true"`
-	// Streaming and Streams are optional: without them every body blob is
-	// spooled before it is uploaded (see ServerDeps.Streaming).
+	// Streaming is optional: without it every body blob is spooled before it
+	// is uploaded (see ServerDeps.Streaming).
 	Streaming       uploader.StreamingBodyUploader `optional:"true"`
-	Streams         registry.StreamStore           `optional:"true"`
 	BucketAuthority bucketauthority.BucketAuthority
 	Registry        registry.Registry
 	Intents         registry.IntentStore
@@ -226,7 +225,6 @@ func registerServerLifecycle(lc fx.Lifecycle, p serverParams) {
 				Deferred:        p.Deferred,
 				Remover:         p.Remover,
 				Streaming:       p.Streaming,
-				Streams:         p.Streams,
 				Registrar:       p.Registrar,
 				Tasks:           p.Tasks,
 				Authority:       p.BucketAuthority,
@@ -499,7 +497,6 @@ type registryResult struct {
 	GC                registry.GCStore
 	Multipart         registry.MultipartStore
 	Parks             registry.ParkStore
-	Streams           registry.StreamStore
 	PendingReleases   registry.PendingReleaseStore
 	EncParams         registry.EncryptionParamsStore
 	RevocationCursors registry.RevocationCursorStore
@@ -517,7 +514,7 @@ type registryResult struct {
 // hilt_url/hilt_did configured.
 func provideRegistry(pool *pgxpool.Pool, tasks *taskrunner.Runner) registryResult {
 	pg := registry.NewPostgres(pool, registry.WithTasks(tasks))
-	return registryResult{Registry: pg, Intents: pg, Locations: pg, Inclusions: pg, GC: pg, Multipart: pg, Parks: pg, Streams: pg, PendingReleases: pg, EncParams: pg, RevocationCursors: pg, CatalogUsage: pg, Meta: pg}
+	return registryResult{Registry: pg, Intents: pg, Locations: pg, Inclusions: pg, GC: pg, Multipart: pg, Parks: pg, PendingReleases: pg, EncParams: pg, RevocationCursors: pg, CatalogUsage: pg, Meta: pg}
 }
 
 // taskSchema is the Postgres schema the task queues' tables live in, beside

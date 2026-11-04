@@ -359,7 +359,6 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 		}
 		return nil, fmt.Errorf("s3frontend: upload part ingest: %w", err)
 	}
-	defer spooled.lease.end()
 	defer spooled.unholdAll()
 	rec := spooled.Body
 	part := registry.MultipartPart{
@@ -1424,8 +1423,6 @@ func (b *Backend) recordStreamedPark(ctx context.Context, space did.DID, blob ms
 		// A write in another instance parked the same bytes for the space
 		// first; its park stands and this stream is given up.
 		b.abandonStream(ctx, space, sb)
-	} else {
-		b.finishStream(ctx, sb)
 	}
 	if err := b.intents.SetIntentState(ctx, space, blob.Digest, registry.IntentParked); err != nil {
 		return fmt.Errorf("mark parked: %w", err)
