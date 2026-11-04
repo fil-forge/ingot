@@ -280,17 +280,23 @@ func (b *Backend) DrainSpaceRegistrations(ctx context.Context, space did.DID) er
 	if err := b.flushSpaceRegistrations(ctx, space); err != nil {
 		return err
 	}
-	// A retraction that failed again stays in the queue as a failed task,
-	// which outlives the bucket, so the count it leaves behind can be
-	// reconciled from it.
-	if left, err := b.failedRetractions(ctx, space); err == nil {
-		for _, f := range left {
-			b.logger.Error("delete bucket: a retraction could not be sent; the upload service keeps this root and its count",
-				zap.Stringer("space", space),
-				zap.Stringer("task", f.Task.ID),
-				zap.String("reason", f.Error),
-			)
-		}
+	// A resent retraction the upload service refuses is retried, which holds
+	// the space, so the flush above runs out of time and the delete is
+	// retried. One can only be failed again here by a permanent error, which
+	// every retry of the delete would meet too, so the delete goes ahead
+	// rather than leave the bucket undeletable. The failed task outlives the
+	// bucket, so the count it leaves behind can be reconciled from it.
+	left, err := b.failedRetractions(ctx, space)
+	if err != nil {
+		b.logger.Warn("delete bucket: could not check for retractions that failed again", zap.Stringer("space", space), zap.Error(err))
+		return nil
+	}
+	for _, f := range left {
+		b.logger.Error("delete bucket: a retraction could not be sent; the upload service keeps this root and its count",
+			zap.Stringer("space", space),
+			zap.Stringer("task", f.Task.ID),
+			zap.String("reason", f.Error),
+		)
 	}
 	return nil
 }
