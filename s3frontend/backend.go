@@ -82,7 +82,10 @@ type Backend struct {
 	// both.
 	uploadRetry  taskrunner.RetryPolicy
 	drainTimeout time.Duration
-	encParams    registry.EncryptionParamsStore
+	// failedPage overrides how many failed tasks a bucket delete's drain
+	// lists per query, for tests; zero takes uploadRegistrationBatch.
+	failedPage int
+	encParams  registry.EncryptionParamsStore
 	// streaming sends a body blob to its provider while it is spooled;
 	// streams records each such upload until its park or acceptance is
 	// recorded.

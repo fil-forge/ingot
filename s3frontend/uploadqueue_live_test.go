@@ -2,12 +2,14 @@ package s3frontend
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/fil-forge/libforge/testutil"
 	"github.com/fil-forge/ucantone/did"
+	"github.com/fil-forge/ucantone/ucan"
 	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
 	"github.com/stretchr/testify/require"
@@ -139,7 +141,7 @@ func TestSpentAuthorityFailsAfterItsAttempts_Live(t *testing.T) {
 	var failed *taskrunner.HandlerError
 	require.ErrorAs(t, err, &failed)
 	require.Contains(t, failed.Message, "authority expired")
-	list, err := f.r.ListFailed(context.Background(), registry.UploadQueue, f.space.String(), 10)
+	list, err := f.r.ListFailed(context.Background(), registry.UploadQueue, f.space.String(), taskrunner.TaskID{}, 10)
 	require.NoError(t, err)
 	require.Len(t, list, 1)
 	require.Equal(t, uploadRegistrationDeadLetterAfter-1, list[0].Task.Attempt, "failed on its last attempt")
@@ -224,7 +226,84 @@ func TestDrainResendsAFailedRetraction_Live(t *testing.T) {
 	require.NoError(t, f.b.DrainSpaceRegistrations(context.Background(), f.space))
 	_, retracted := reg.snapshot()
 	require.Equal(t, []cid.Cid{root}, retracted)
-	left, err := f.r.ListFailed(context.Background(), registry.UploadQueue, f.space.String(), 10)
+	left, err := f.r.ListFailed(context.Background(), registry.UploadQueue, f.space.String(), taskrunner.TaskID{}, 10)
 	require.NoError(t, err)
 	require.Empty(t, left)
+}
+
+// A delete's drain finds every failed retraction, however many failed
+// additions are listed ahead of it.
+func TestDrainResendsARetractionBehindFailedAdditions_Live(t *testing.T) {
+	reg := &recordingRegistrar{}
+	reg.spendAuthority()
+	f := newQueueFixture(t, reg, 1, func(b *Backend) { b.failedPage = 2 })
+	var stuck []taskrunner.TaskID
+	for _, s := range []string{"a", "b", "c"} {
+		stuck = append(stuck, f.queue(t, registry.UploadRegistrationAdd, liveRoot(t, s)))
+	}
+	root := liveRoot(t, "removed")
+	stuck = append(stuck, f.queue(t, registry.UploadRegistrationRemove, root))
+	for _, id := range stuck {
+		_, err := f.r.Wait(context.Background(), registry.UploadQueue, id)
+		require.Error(t, err)
+	}
+
+	reg.mu.Lock()
+	reg.spent = false
+	reg.mu.Unlock()
+	require.NoError(t, f.b.DrainSpaceRegistrations(context.Background(), f.space))
+	_, retracted := reg.snapshot()
+	require.Equal(t, []cid.Cid{root}, retracted, "the retraction on the second page was resent")
+}
+
+// proofCheckingRegistrar renews the chain a change was queued with, and
+// fails its first send, refused or unreachable.
+type proofCheckingRegistrar struct {
+	recordingRegistrar
+	unreachable bool
+	renewals    int
+	sent        []string
+}
+
+func (r *proofCheckingRegistrar) PrepareAuthority(_ context.Context, _ did.DID, _ ucan.Command, stored []byte) ([]byte, bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if string(stored) == "renewed" {
+		return stored, false, nil
+	}
+	r.renewals++
+	return []byte("renewed"), true, nil
+}
+
+func (r *proofCheckingRegistrar) RegisterUploads(_ context.Context, changes []uploader.QueuedUpload) ([]error, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, c := range changes {
+		r.sent = append(r.sent, string(c.Proofs))
+	}
+	if len(r.sent) > 1 {
+		return make([]error, len(changes)), nil
+	}
+	if r.unreachable {
+		return nil, errors.New("connection refused")
+	}
+	return refusals(len(changes)), nil
+}
+
+// A change whose authority was renewed for a send that failed keeps the
+// renewal for its retry, rather than the spent chain it was queued with.
+func TestRenewedAuthorityIsKeptForTheRetry_Live(t *testing.T) {
+	for _, unreachable := range []bool{false, true} {
+		t.Run(map[bool]string{false: "refused", true: "unreachable"}[unreachable], func(t *testing.T) {
+			reg := &proofCheckingRegistrar{unreachable: unreachable}
+			f := newQueueFixture(t, reg, 1)
+			id := f.queue(t, registry.UploadRegistrationAdd, liveRoot(t, "a"))
+			_, err := f.r.Wait(context.Background(), registry.UploadQueue, id)
+			require.NoError(t, err)
+			reg.mu.Lock()
+			defer reg.mu.Unlock()
+			require.Equal(t, []string{"renewed", "renewed"}, reg.sent)
+			require.Equal(t, 1, reg.renewals, "the retry found the renewal in its arguments")
+		})
+	}
 }

@@ -1,6 +1,7 @@
 package s3frontend
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -80,7 +81,9 @@ func (b *Backend) RegisterUploadTasks(r *taskrunner.Runner) error {
 }
 
 // sendUploadTasks sends a batch of one op's queued changes and reports each
-// one's outcome.
+// one's outcome. A change that goes back for another try with authority
+// renewed for it keeps the renewal in its arguments, so a restart before the
+// retry does not leave it with the spent chain it started with.
 func (b *Backend) sendUploadTasks(ctx context.Context, op registry.UploadRegistrationOp, tasks []taskrunner.Task) ([]taskrunner.Outcome, error) {
 	out := make([]taskrunner.Outcome, len(tasks))
 	regs := make([]registry.UploadRegistration, 0, len(tasks))
@@ -98,12 +101,17 @@ func (b *Backend) sendUploadTasks(ctx context.Context, op registry.UploadRegistr
 		attempts = append(attempts, t.Attempt)
 		index = append(index, i)
 	}
-	errs, err := b.sendRegistrations(ctx, op, regs, attempts)
-	if err != nil {
-		return nil, err
-	}
+	errs, renewed := b.sendRegistrations(ctx, op, regs, attempts)
 	for j, i := range index {
 		out[i].Err = errs[j]
+		if errs[j] == nil || renewed[j] == nil {
+			continue
+		}
+		reg := regs[j]
+		reg.Proofs = renewed[j]
+		if spec, err := reg.Spec(); err == nil {
+			out[i].Args = spec.Args
+		}
 	}
 	return out, nil
 }
@@ -112,27 +120,32 @@ func (b *Backend) sendUploadTasks(ctx context.Context, op registry.UploadRegistr
 // sure each carries usable authority, and returns each change's outcome in
 // order: nil when the upload service took it, otherwise the error to retry it
 // on, which is permanent once a change whose authority is spent has used its
-// attempts. attempts holds how many earlier attempts each change failed. The
-// returned error is a transport failure, where nothing was answered and every
-// change waits for another try.
+// attempts. A transport failure, where nothing was answered, is every sent
+// change's error. attempts holds how many earlier attempts each change
+// failed. renewed holds, for each change, the authority renewed for it this
+// time, or nil if its own was still usable or could not be renewed.
 //
 // Within a call the changes are independent: each names the manifest of a
 // distinct version.
-func (b *Backend) sendRegistrations(ctx context.Context, op registry.UploadRegistrationOp, regs []registry.UploadRegistration, attempts []int) ([]error, error) {
-	errs := make([]error, len(regs))
+func (b *Backend) sendRegistrations(ctx context.Context, op registry.UploadRegistrationOp, regs []registry.UploadRegistration, attempts []int) (errs []error, renewed [][]byte) {
+	errs = make([]error, len(regs))
+	renewed = make([][]byte, len(regs))
 	batch := make([]uploader.QueuedUpload, 0, len(regs))
 	sent := make([]int, 0, len(regs))
 	for i, reg := range regs {
-		proofs, _, err := b.registrar.PrepareAuthority(ctx, reg.Space, registrationCommand(op), reg.Proofs)
+		proofs, fresh, err := b.registrar.PrepareAuthority(ctx, reg.Space, registrationCommand(op), reg.Proofs)
 		if err != nil {
 			errs[i] = b.spentAuthority(reg, op, attempts[i], err)
 			continue
+		}
+		if fresh {
+			renewed[i] = proofs
 		}
 		batch = append(batch, uploader.QueuedUpload{Space: reg.Space, Root: reg.Root, Proofs: proofs})
 		sent = append(sent, i)
 	}
 	if len(batch) == 0 {
-		return errs, nil
+		return errs, renewed
 	}
 	send := b.registrar.RegisterUploads
 	if op == registry.UploadRegistrationRemove {
@@ -142,7 +155,11 @@ func (b *Backend) sendRegistrations(ctx context.Context, op registry.UploadRegis
 	if err != nil {
 		b.logger.Warn("upload registrations: upload service unreachable; batch will be retried",
 			zap.String("op", string(op)), zap.Int("changes", len(batch)), zap.Error(err))
-		return nil, fmt.Errorf("s3frontend: send upload registrations: %w", err)
+		err = fmt.Errorf("s3frontend: send upload registrations: %w", err)
+		for _, i := range sent {
+			errs[i] = err
+		}
+		return errs, renewed
 	}
 	for j, i := range sent {
 		if results[j] == nil {
@@ -159,7 +176,7 @@ func (b *Backend) sendRegistrations(ctx context.Context, op registry.UploadRegis
 		)
 		errs[i] = results[j]
 	}
-	return errs, nil
+	return errs, renewed
 }
 
 // spentAuthority is the outcome of a change whose stored authority has run out
@@ -230,15 +247,15 @@ func (b *Backend) DrainSpaceRegistrations(ctx context.Context, space did.DID) er
 		return err
 	}
 
-	failed, err := b.tasks.ListFailed(ctx, registry.UploadQueue, space.String(), uploadRegistrationBatch)
+	// Every failed retraction is listed before any is resent: one that fails
+	// again comes back as a new failed task, which a listing still paging
+	// would reach and resend for as long as the service kept refusing it.
+	failed, err := b.failedRetractions(ctx, space)
 	if err != nil {
 		return fmt.Errorf("s3frontend: list failed upload registrations: %w", err)
 	}
 	var resent int
 	for _, f := range failed {
-		if f.Task.Action != string(registry.UploadRegistrationRemove) {
-			continue
-		}
 		reg, err := registry.UploadRegistrationFromTask(f.Task)
 		if err != nil {
 			continue
@@ -266,11 +283,8 @@ func (b *Backend) DrainSpaceRegistrations(ctx context.Context, space did.DID) er
 	// A retraction that failed again stays in the queue as a failed task,
 	// which outlives the bucket, so the count it leaves behind can be
 	// reconciled from it.
-	if left, err := b.tasks.ListFailed(ctx, registry.UploadQueue, space.String(), uploadRegistrationBatch); err == nil {
+	if left, err := b.failedRetractions(ctx, space); err == nil {
 		for _, f := range left {
-			if f.Task.Action != string(registry.UploadRegistrationRemove) {
-				continue
-			}
 			b.logger.Error("delete bucket: a retraction could not be sent; the upload service keeps this root and its count",
 				zap.Stringer("space", space),
 				zap.Stringer("task", f.Task.ID),
@@ -279,6 +293,29 @@ func (b *Backend) DrainSpaceRegistrations(ctx context.Context, space did.DID) er
 		}
 	}
 	return nil
+}
+
+// failedRetractions lists all of the space's retractions that failed for
+// good, a page at a time, passing over its failed additions.
+func (b *Backend) failedRetractions(ctx context.Context, space did.DID) ([]taskrunner.FailedTask, error) {
+	limit := cmp.Or(b.failedPage, uploadRegistrationBatch)
+	var out []taskrunner.FailedTask
+	var after taskrunner.TaskID
+	for {
+		page, err := b.tasks.ListFailed(ctx, registry.UploadQueue, space.String(), after, limit)
+		if err != nil {
+			return nil, err
+		}
+		for _, f := range page {
+			if f.Task.Action == string(registry.UploadRegistrationRemove) {
+				out = append(out, f)
+			}
+		}
+		if len(page) < limit {
+			return out, nil
+		}
+		after = page[len(page)-1].Task.ID
+	}
 }
 
 // flushSpaceRegistrations runs the space's due changes now, by running the

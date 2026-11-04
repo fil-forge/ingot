@@ -119,8 +119,7 @@ func drainRegistrations(t *testing.T, b *Backend) {
 		for n < len(regs) && regs[n].Op == regs[0].Op {
 			n++
 		}
-		errs, err := b.sendRegistrations(context.Background(), regs[0].Op, regs[:n], make([]int, n))
-		require.NoError(t, err)
+		errs, _ := b.sendRegistrations(context.Background(), regs[0].Op, regs[:n], make([]int, n))
 		for _, e := range errs {
 			require.NoError(t, e)
 		}
