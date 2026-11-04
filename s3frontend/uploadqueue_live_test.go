@@ -307,3 +307,28 @@ func TestRenewedAuthorityIsKeptForTheRetry_Live(t *testing.T) {
 		})
 	}
 }
+
+// A resent retraction the upload service refuses fails the delete, for the
+// client to retry, rather than letting the bucket go with the root counted.
+func TestDrainFailsWhenAResentRetractionIsRefused_Live(t *testing.T) {
+	reg := &failingRegistrar{}
+	reg.spendAuthority()
+	f := newQueueFixture(t, reg, 1)
+	root := liveRoot(t, "a")
+	stuck := f.queue(t, registry.UploadRegistrationRemove, root)
+	_, err := f.r.Wait(context.Background(), registry.UploadQueue, stuck)
+	require.Error(t, err)
+
+	reg.recordingRegistrar.mu.Lock()
+	reg.spent = false
+	reg.recordingRegistrar.mu.Unlock()
+	reg.refuse("remove", true)
+	err = f.b.DrainSpaceRegistrations(context.Background(), f.space)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "retry")
+
+	reg.refuse("remove", false)
+	require.NoError(t, f.b.DrainSpaceRegistrations(context.Background(), f.space))
+	_, retracted := reg.snapshot()
+	require.Equal(t, []cid.Cid{root}, retracted)
+}
