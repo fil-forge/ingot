@@ -34,7 +34,7 @@ func TestServerReportsLocalBlobGauges(t *testing.T) {
 	otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)))
 	t.Cleanup(func() { otel.SetMeterProvider(prev) })
 
-	s := newInmemServer(t, config.ServerConfig{LocalBlobMaxBytes: 1 << 20})
+	s := newTestServer(t, config.ServerConfig{LocalBlobMaxBytes: 1 << 20})
 
 	require.Equal(t, map[string]bool{
 		"ingot.local_blobs.usage":          true,
@@ -81,7 +81,7 @@ func TestServerReportsCatalogUsageGauges(t *testing.T) {
 	segment(2000, 900, index, true)
 	segment(59, 0, nil, false) // shipped without registering anything: not on Forge
 
-	s := newInmemServer(t, config.ServerConfig{}, func(d *ServerDeps) { d.CatalogUsage = mem })
+	s := newTestServer(t, config.ServerConfig{}, func(d *ServerDeps) { d.CatalogUsage = mem })
 	require.Empty(t, gaugeValues(t, reader, "ingot.catalog.forge_bytes"), "reported before the first refresh")
 
 	require.NoError(t, s.Start(ctx))
@@ -148,10 +148,10 @@ func metricNames(t *testing.T, reader *sdkmetric.ManualReader) map[string]bool {
 	return names
 }
 
-// newInmemServer builds a Server over the test fakes and a fresh database. cfg's address,
-// data directory, region and connection limits are filled in; each of opts
-// may adjust the dependencies before New.
-func newInmemServer(t *testing.T, cfg config.ServerConfig, opts ...func(*ServerDeps)) *Server {
+// newTestServer builds a Server over a Postgres registry and fakes of the
+// network. cfg's address, data directory, region and connection limits are
+// filled in; each of opts may adjust the dependencies before New.
+func newTestServer(t *testing.T, cfg config.ServerConfig, opts ...func(*ServerDeps)) *Server {
 	t.Helper()
 	id, err := identity.New("", "did:web:ingot.test")
 	require.NoError(t, err)

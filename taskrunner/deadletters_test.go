@@ -15,7 +15,7 @@ import (
 	"github.com/fil-forge/ingot/taskrunner"
 )
 
-func TestBatchedTasksFailOnTheirOwn_Live(t *testing.T) {
+func TestBatchedTasksFailOnTheirOwn(t *testing.T) {
 	f := newFixture(t, 1)
 	var mu sync.Mutex
 	runs := map[string]int{}
@@ -74,7 +74,7 @@ func TestBatchedTasksFailOnTheirOwn_Live(t *testing.T) {
 	}
 }
 
-func TestFailedTasksCanBeListedAndResubmitted_Live(t *testing.T) {
+func TestFailedTasksCanBeListedAndResubmitted(t *testing.T) {
 	f := newFixture(t, 1)
 	f.handle(t, qTop, "put", func(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
 		if string(task.Args) == "stale" {
@@ -158,7 +158,7 @@ func TestAResubmittedTaskIsKeptFromItsResubmission_Live(t *testing.T) {
 // A sync task that fails is listed with the others, but is not resubmitted:
 // its caller has had the failure, and a replay would run it async, without
 // what the caller held.
-func TestASyncTaskIsNotResubmitted_Live(t *testing.T) {
+func TestASyncTaskIsNotResubmitted(t *testing.T) {
 	f := newFixture(t, 0)
 	f.handle(t, qTop, "put", func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) {
 		return nil, taskrunner.Permanent(errors.New("request gone"))
@@ -184,7 +184,7 @@ func TestASyncTaskIsNotResubmitted_Live(t *testing.T) {
 	}
 }
 
-func TestAHandlerCanResubmitFailedTasks_Live(t *testing.T) {
+func TestAHandlerCanResubmitFailedTasks(t *testing.T) {
 	f := newFixture(t, 1)
 	f.handle(t, qBottom, "remove", func(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
 		if string(task.Args) == "stale" {
@@ -231,7 +231,7 @@ func TestAHandlerCanResubmitFailedTasks_Live(t *testing.T) {
 	}
 }
 
-func TestFinishedTasksAreDeletedPastTheirRetention_Live(t *testing.T) {
+func TestFinishedTasksAreDeletedPastTheirRetention(t *testing.T) {
 	f := newFixture(t, 1, func(o *taskrunner.Options) {
 		o.RetentionInterval = 50 * time.Millisecond
 		o.Queues[0].Retention = 100 * time.Millisecond
@@ -271,7 +271,7 @@ func TestFinishedTasksAreDeletedPastTheirRetention_Live(t *testing.T) {
 
 // A queue's FailedRetention deletes its failed tasks once they are older, and
 // the failed gauge stops counting them.
-func TestFailedTasksAreDeletedPastTheirFailedRetention_Live(t *testing.T) {
+func TestFailedTasksAreDeletedPastTheirFailedRetention(t *testing.T) {
 	reader := sdkmetric.NewManualReader()
 	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
 	t.Cleanup(func() { _ = mp.Shutdown(context.Background()) })
@@ -308,7 +308,7 @@ func TestFailedTasksAreDeletedPastTheirFailedRetention_Live(t *testing.T) {
 	}
 }
 
-func TestFailedGauge_Live(t *testing.T) {
+func TestFailedGauge(t *testing.T) {
 	f, reader := metricsFixture(t, 1)
 	f.handle(t, qTop, "fail", func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) {
 		return nil, errors.New("boom")
@@ -328,7 +328,7 @@ func TestFailedGauge_Live(t *testing.T) {
 	}
 }
 
-func TestQueueTablesAreTunedForChurn_Live(t *testing.T) {
+func TestQueueTablesAreTunedForChurn(t *testing.T) {
 	f := newFixture(t, 0)
 	f.migrate(t)
 	for _, table := range []string{"queue_top_tasks", "queue_top_leases"} {
@@ -347,7 +347,7 @@ func TestQueueTablesAreTunedForChurn_Live(t *testing.T) {
 
 // A handler removed or renamed in a deploy leaves its tasks failed, and they
 // still show in the gauge though no handler for them is registered.
-func TestFailedGaugeCountsUnregisteredActions_Live(t *testing.T) {
+func TestFailedGaugeCountsUnregisteredActions(t *testing.T) {
 	f, reader := metricsFixture(t, 0)
 	f.handle(t, qTop, "put", f.put())
 	f.start(t)
@@ -367,7 +367,7 @@ func TestFailedGaugeCountsUnregisteredActions_Live(t *testing.T) {
 
 // ListFailed pages through a subject's failed tasks from a cursor, which stays
 // valid after the task it names is resubmitted.
-func TestFailedTasksPageFromACursor_Live(t *testing.T) {
+func TestFailedTasksPageFromACursor(t *testing.T) {
 	f := newFixture(t, 1)
 	f.handle(t, qTop, "put", func(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
 		if string(task.Args) == "ok" {
@@ -421,7 +421,7 @@ func TestFailedTasksPageFromACursor_Live(t *testing.T) {
 
 // A batch outcome's Args replace the task's arguments, for its retry and, once
 // it has failed for good, for whoever lists it.
-func TestBatchOutcomeReplacesArgs_Live(t *testing.T) {
+func TestBatchOutcomeReplacesArgs(t *testing.T) {
 	f := newFixture(t, 1)
 	var mu sync.Mutex
 	var seen []string

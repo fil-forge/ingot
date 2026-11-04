@@ -21,8 +21,8 @@ type partQueueStore interface {
 	registry.LocationStore
 }
 
-// TestPartQueueLive runs the acceptance-queue operations against Postgres.
-func TestPartQueueLive(t *testing.T) {
+// TestPartQueue runs the acceptance-queue operations against Postgres.
+func TestPartQueue(t *testing.T) {
 	runPartQueueSuite(t, registry.NewPostgres(pgtest.New(t)))
 }
 
@@ -73,13 +73,11 @@ func runPartQueueSuite(t *testing.T, st partQueueStore) {
 		if err != nil || len(parts) != 1 || parts[0].State != registry.PartSpooled || !slices.Equal(parts[0].SpanLengths, []int64{1, 2}) {
 			t.Fatalf("ListParts = %+v, err %v; want one spooled part with sizes [1 2]", parts, err)
 		}
-		// Sizes must match the digests one for one. The in-memory store
-		// does not check this; the Postgres constraint does.
-		if _, ok := st.(*registry.Postgres); ok {
-			bad := registry.MultipartPart{UploadID: id, PartNumber: 9, ETagMD5: []byte{9}, Size: 1, BlobDigests: []multihash.Multihash{{0xd9}}, SpanLengths: []int64{1, 2}}
-			if _, err := st.PutPart(ctx, bad, nil); err == nil {
-				t.Fatal("PutPart with mismatched sizes was accepted")
-			}
+		// Sizes must match the digests one for one, which a constraint
+		// enforces.
+		bad := registry.MultipartPart{UploadID: id, PartNumber: 9, ETagMD5: []byte{9}, Size: 1, BlobDigests: []multihash.Multihash{{0xd9}}, SpanLengths: []int64{1, 2}}
+		if _, err := st.PutPart(ctx, bad, nil); err == nil {
+			t.Fatal("PutPart with mismatched sizes was accepted")
 		}
 	})
 

@@ -25,12 +25,11 @@ import (
 	"github.com/fil-forge/libforge/testutil"
 )
 
-// TestCatalogJournal_Live checks the catalog journal against a real Postgres:
+// TestCatalogJournal checks the catalog journal against a real Postgres:
 // the rows a commit writes, the rows a ship deletes, and the lock order that
 // keeps a commit racing its segment's ship from deadlocking or leaving rows
-// behind. Skipped unless INGOT_TEST_DSN names a reachable database (see
-// TestPostgresStores_Live).
-func TestCatalogJournal_Live(t *testing.T) {
+// behind.
+func TestCatalogJournal(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.New(t)
 	r := registry.NewPostgres(pool)

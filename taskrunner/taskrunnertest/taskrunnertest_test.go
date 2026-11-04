@@ -52,11 +52,11 @@ func counterCase(readOwnWrite bool) taskrunnertest.Case {
 	}
 }
 
-func TestCheckOwnWritesPassesAHandlerThatReadsFirst_Live(t *testing.T) {
+func TestCheckOwnWritesPassesAHandlerThatReadsFirst(t *testing.T) {
 	taskrunnertest.CheckOwnWrites(t, counterCase(false))
 }
 
-func TestCompareOwnWritesCatchesAHandlerThatReadsItsOwnWrite_Live(t *testing.T) {
+func TestCompareOwnWritesCatchesAHandlerThatReadsItsOwnWrite(t *testing.T) {
 	err := taskrunnertest.CompareOwnWrites(context.Background(),
 		func() taskrunnertest.Env { return taskrunnertest.NewEnv(t) }, counterCase(true))
 	if err == nil || !strings.Contains(err.Error(), "reads its own tree's writes") {
