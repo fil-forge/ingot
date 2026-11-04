@@ -11,7 +11,6 @@ import (
 	"github.com/fil-forge/ucantone/did"
 	"go.uber.org/zap/zaptest"
 
-	"github.com/fil-forge/ingot/inmem"
 	"github.com/fil-forge/ingot/internal/reqscope"
 	"github.com/fil-forge/ingot/logstore"
 	"github.com/fil-forge/ingot/tokenstore"
@@ -35,7 +34,7 @@ func (r *recordingShips) CaptureShipAuthority(ctx context.Context, _ did.DID) {
 // proof store to the ship uploader.
 func TestDeleteCapturesShipAuthority(t *testing.T) {
 	ctx := context.Background()
-	mem := inmem.NewMemStore()
+	mem := newTestStore(t)
 	log, err := logstore.Open(ctx, logstore.Config{
 		Dir:     filepath.Join(t.TempDir(), "segments"),
 		Meta:    mem,

@@ -11,7 +11,7 @@ import (
 	"github.com/fil-forge/versitygw/backend"
 	"github.com/fil-forge/versitygw/s3response"
 
-	"github.com/fil-forge/ingot/inmem"
+	"github.com/fil-forge/ingot/internal/testfakes"
 	"github.com/fil-forge/ingot/registry"
 )
 
@@ -45,7 +45,7 @@ func (h *completeHooks) AllocVersionSeq(ctx context.Context, name string) (uint6
 func newHookedCompleteBackend(t *testing.T) (*Backend, *completeHooks) {
 	t.Helper()
 	h := &completeHooks{}
-	b, _ := newDeferredBackend(t, inmem.NopUploader{}, func(d *Deps) {
+	b, _ := newDeferredBackend(t, testfakes.NopUploader{}, func(d *Deps) {
 		h.Registry = d.Registry
 		d.Registry = h
 		h.multipart = d.Multipart

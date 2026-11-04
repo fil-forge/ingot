@@ -11,13 +11,12 @@ import (
 	"github.com/fil-forge/versitygw/backend"
 	"github.com/multiformats/go-multihash"
 
-	"github.com/fil-forge/ingot/inmem"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/uploader"
 )
 
 // partRecord returns uploadID's part n as recorded.
-func partRecord(t *testing.T, mem *inmem.MemStore, uploadID string, n int) registry.MultipartPart {
+func partRecord(t *testing.T, mem *testStore, uploadID string, n int) registry.MultipartPart {
 	t.Helper()
 	parts, err := mem.ListParts(context.Background(), uploadID)
 	if err != nil {
@@ -74,7 +73,7 @@ func TestParkedPartHoldsNoLocalCopy(t *testing.T) {
 		t.Fatalf("Complete: %v", err)
 	}
 	for _, d := range digests {
-		if loc, err := mem.GetLocation(ctx, did.Undef, d); err != nil || loc == nil {
+		if loc, err := mem.GetLocation(ctx, mem.bk(), d); err != nil || loc == nil {
 			t.Fatalf("blob %s location after Complete = %v/%v, want recorded", d, loc, err)
 		}
 	}

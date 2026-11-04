@@ -18,7 +18,7 @@ import (
 
 	"github.com/fil-forge/ingot/blockstore"
 	msbucket "github.com/fil-forge/ingot/bucket"
-	"github.com/fil-forge/ingot/inmem"
+	"github.com/fil-forge/ingot/internal/testfakes"
 	"github.com/fil-forge/ingot/regionkey"
 	"github.com/fil-forge/ingot/registry"
 )
@@ -32,7 +32,7 @@ type encFixture struct {
 	body      msbucket.BlobRefs
 	plaintext []byte
 	spool     *blockstore.Spool
-	mem       *inmem.MemStore
+	mem       *testStore
 }
 
 // encChunkSize is deliberately the FEE minimum so short test blobs still
@@ -51,7 +51,7 @@ func newEncFixture(t *testing.T, plaintext []byte, blobSize int) *encFixture {
 	if err != nil {
 		t.Fatalf("NewSpool: %v", err)
 	}
-	mem := inmem.NewMemStore()
+	mem := newTestStore(t)
 	provider, err := regionkey.NewInProcessProvider("v1", randBytes(t, regionkey.KEKLen))
 	if err != nil {
 		t.Fatalf("NewInProcessProvider: %v", err)
@@ -101,7 +101,7 @@ func newEncFixture(t *testing.T, plaintext []byte, blobSize int) *encFixture {
 		off = end
 	}
 
-	read := blockstore.NewLayered(spool, nil, inmem.NopBaseReader{})
+	read := blockstore.NewLayered(spool, nil, testfakes.NopBaseReader{})
 	return &encFixture{
 		backend: &Backend{
 			read:       read,

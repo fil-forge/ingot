@@ -15,7 +15,6 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
-	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/versitygw/backend"
 	"github.com/fil-forge/versitygw/s3response"
 	"github.com/filecoin-project/go-fee"
@@ -118,7 +117,7 @@ func TestEncryptedWrite_Opacity(t *testing.T) {
 		t.Fatalf("stored blob contains plaintext bytes")
 	}
 
-	params, err := mem.GetEncryptionParams(ctx, did.Undef, d)
+	params, err := mem.GetEncryptionParams(ctx, mem.bk(), d)
 	if err != nil {
 		t.Fatalf("GetEncryptionParams: %v", err)
 	}
@@ -130,7 +129,7 @@ func TestEncryptedWrite_Opacity(t *testing.T) {
 	}
 	// The registry records the STORED size: what decryption geometry is
 	// derived from, and what gets uploaded.
-	loc, err := mem.GetLocation(ctx, did.Undef, d)
+	loc, err := mem.GetLocation(ctx, mem.bk(), d)
 	if err != nil {
 		t.Fatalf("GetLocation: %v", err)
 	}
@@ -168,13 +167,13 @@ func TestEncryptedWrite_DeleteShredsParams(t *testing.T) {
 
 	putObj(t, b, "k1", data)
 	d := blobDigestOf(t, b, "k1", "")
-	if _, err := mem.GetEncryptionParams(ctx, did.Undef, d); err != nil {
+	if _, err := mem.GetEncryptionParams(ctx, mem.bk(), d); err != nil {
 		t.Fatalf("params row missing before delete: %v", err)
 	}
 
 	deleteObj(t, b, "k1")
 	drainReleases(t, b) // the release is deferred; the sweep executes it
-	if _, err := mem.GetEncryptionParams(ctx, did.Undef, d); err == nil {
+	if _, err := mem.GetEncryptionParams(ctx, mem.bk(), d); err == nil {
 		t.Fatalf("params row survived the last-claim release; want it crypto-shredded")
 	}
 	if rm.removedDigests()[string(d)] != 1 {

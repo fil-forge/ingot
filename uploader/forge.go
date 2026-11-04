@@ -35,7 +35,7 @@ import (
 // it — plus each inner block's byte range — in the local location/inclusion
 // tables before the segment is marked shipped. A zero-value location (no
 // Provider/URL) means the implementation shipped nothing durable (e.g. the
-// in-memory no-op uploader).
+// test fakes' no-op uploader).
 type Uploader interface {
 	// SubmitShard ships one sealed CAR to Forge. Alongside the CAR's
 	// location it returns the digest of the shard's sharded-dag-index blob:

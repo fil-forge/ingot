@@ -311,7 +311,7 @@ floor, or reset its data.
 
 ```bash
 make build   # GOWORK=off go build ./...
-make test    # unit tests (seconds, no Docker)
+make test    # every package's tests (starts Postgres and OpenBao in Docker)
 make itest   # integration tests (boots the Forge stack in Docker, ~6 min)
 make gen     # regenerate CBOR marshalers after changing bucket types
 ```
@@ -349,8 +349,8 @@ must never import `fil-forge/sprue` or `fil-forge/guppy` (guppy embeds ingot
 
 ## Status
 
-The S3 core is exercised two ways: `make test` runs the unit tier in seconds,
-and `make itest` boots the real Forge stack (smelt, in Docker) and runs this
+The S3 core is exercised two ways: `make test` runs every package's tests
+against a real Postgres, and `make itest` boots the real Forge stack (smelt, in Docker) and runs this
 working tree's binary against it, including a curated partition of the
 upstream versitygw S3 conformance suite. Known gaps are tracked in
 [`DESIGN_NOTES.md`](./DESIGN_NOTES.md).

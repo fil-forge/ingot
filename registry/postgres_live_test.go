@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"reflect"
 	"slices"
 	"strings"
@@ -15,11 +14,10 @@ import (
 	"github.com/ipfs/go-cid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/multiformats/go-multihash"
-	"go.uber.org/zap/zaptest"
 
 	"github.com/fil-forge/ingot/blockstore"
+	"github.com/fil-forge/ingot/internal/pgtest"
 	"github.com/fil-forge/ingot/logstore"
-	"github.com/fil-forge/ingot/migrations"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/taskrunner"
 	"github.com/fil-forge/libforge/testutil"
@@ -53,26 +51,8 @@ func liveCid(t *testing.T, s string) cid.Cid {
 //	INGOT_TEST_DSN=postgres://postgres:pw@127.0.0.1:55432/ingot \
 //	  GOWORK=off go test ./registry/ -run Live -v
 func TestPostgresStores_Live(t *testing.T) {
-	dsn := os.Getenv("INGOT_TEST_DSN")
-	if dsn == "" {
-		t.Skip("set INGOT_TEST_DSN to run the live Postgres store test")
-	}
 	ctx := context.Background()
-	pool, err := pgxpool.New(ctx, dsn)
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-	defer pool.Close()
-	if err := migrations.Up(ctx, pool, zaptest.NewLogger(t)); err != nil {
-		t.Fatalf("migrations.Up: %v", err)
-	}
-	if _, err := pool.Exec(ctx,
-		`TRUNCATE ingot.blob_refs, ingot.upload_intents, ingot.blob_locations,
-		 ingot.blob_encryption_params, ingot.multipart_sessions, ingot.multipart_parts,
-		 ingot.gc_candidates, ingot.buckets, ingot.revocation_cursor,
-		 ingot.blob_release_intents CASCADE`); err != nil {
-		t.Fatalf("truncate: %v", err)
-	}
+	pool := pgtest.New(t)
 
 	r := registry.NewPostgres(pool)
 	// seedBucket inserts a bucket row directly, bypassing Create, and returns
@@ -1031,22 +1011,11 @@ func TestPostgresStores_Live(t *testing.T) {
 //
 //	INGOT_TEST_DSN=postgres://... GOWORK=off go test ./registry/ -run SingleConnection -v
 func TestCommitRootOnASingleConnection(t *testing.T) {
-	dsn := os.Getenv("INGOT_TEST_DSN")
-	if dsn == "" {
-		t.Skip("set INGOT_TEST_DSN to run the live Postgres store test")
-	}
 	ctx := context.Background()
 
 	// Migrations and the fixture run on an ordinary pool; only the calls under
 	// test get the single connection, so a hang can only be them.
-	setupPool, err := pgxpool.New(ctx, dsn)
-	if err != nil {
-		t.Fatalf("setup pool: %v", err)
-	}
-	defer setupPool.Close()
-	if err := migrations.Up(ctx, setupPool, zaptest.NewLogger(t)); err != nil {
-		t.Fatalf("migrations: %v", err)
-	}
+	setupPool, dsn := pgtest.NewWithDSN(t)
 
 	cfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
@@ -1172,18 +1141,7 @@ func clearQueuedUploads(t *testing.T, pool *pgxpool.Pool, space did.DID) {
 // applied, skipping the test without INGOT_TEST_DSN.
 func livePool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
-	dsn := os.Getenv("INGOT_TEST_DSN")
-	if dsn == "" {
-		t.Skip("set INGOT_TEST_DSN to run the live Postgres store test")
-	}
-	pool, err := pgxpool.New(context.Background(), dsn)
-	if err != nil {
-		t.Fatalf("pool: %v", err)
-	}
-	t.Cleanup(pool.Close)
-	if err := migrations.Up(context.Background(), pool, zaptest.NewLogger(t)); err != nil {
-		t.Fatalf("migrations: %v", err)
-	}
+	pool := pgtest.New(t)
 	return pool
 }
 
@@ -1253,19 +1211,8 @@ func TestCommitRootWithoutTasksRefusesRegistrationsLive(t *testing.T) {
 //
 //	INGOT_TEST_DSN=postgres://... GOWORK=off go test ./registry/ -run ConcurrentCommitClaims -v
 func TestConcurrentCommitClaimsLive(t *testing.T) {
-	dsn := os.Getenv("INGOT_TEST_DSN")
-	if dsn == "" {
-		t.Skip("set INGOT_TEST_DSN to run the live Postgres store test")
-	}
 	ctx := context.Background()
-	pool, err := pgxpool.New(ctx, dsn)
-	if err != nil {
-		t.Fatalf("pool: %v", err)
-	}
-	defer pool.Close()
-	if err := migrations.Up(ctx, pool, zaptest.NewLogger(t)); err != nil {
-		t.Fatalf("migrations: %v", err)
-	}
+	pool := pgtest.New(t)
 	r := registry.NewPostgres(pool)
 	space := testutil.RandomDID(t)
 
@@ -1337,19 +1284,8 @@ func TestConcurrentCommitClaimsLive(t *testing.T) {
 //
 //	INGOT_TEST_DSN=postgres://... GOWORK=off go test ./registry/ -run GetReleaseWaits -v
 func TestGetReleaseWaitsForTheClaimKeyLockLive(t *testing.T) {
-	dsn := os.Getenv("INGOT_TEST_DSN")
-	if dsn == "" {
-		t.Skip("set INGOT_TEST_DSN to run the live Postgres store test")
-	}
 	ctx := context.Background()
-	pool, err := pgxpool.New(ctx, dsn)
-	if err != nil {
-		t.Fatalf("pool: %v", err)
-	}
-	defer pool.Close()
-	if err := migrations.Up(ctx, pool, zaptest.NewLogger(t)); err != nil {
-		t.Fatalf("migrations: %v", err)
-	}
+	pool := pgtest.New(t)
 	r := registry.NewPostgres(pool)
 	space := testutil.RandomDID(t)
 	d := liveDigest(t, "get-release-waits")
@@ -1411,19 +1347,8 @@ func TestGetReleaseWaitsForTheClaimKeyLockLive(t *testing.T) {
 //
 //	INGOT_TEST_DSN=postgres://... GOWORK=off go test ./registry/ -run GraceRunsFromTheSwap -v
 func TestReleaseGraceRunsFromTheSwapLive(t *testing.T) {
-	dsn := os.Getenv("INGOT_TEST_DSN")
-	if dsn == "" {
-		t.Skip("set INGOT_TEST_DSN to run the live Postgres store test")
-	}
 	ctx := context.Background()
-	pool, err := pgxpool.New(ctx, dsn)
-	if err != nil {
-		t.Fatalf("pool: %v", err)
-	}
-	defer pool.Close()
-	if err := migrations.Up(ctx, pool, zaptest.NewLogger(t)); err != nil {
-		t.Fatalf("migrations: %v", err)
-	}
+	pool := pgtest.New(t)
 	r := registry.NewPostgres(pool)
 	space := testutil.RandomDID(t)
 	bucket := "grace-swap-" + space.String()[len(space.String())-8:]
@@ -1493,22 +1418,8 @@ func TestReleaseGraceRunsFromTheSwapLive(t *testing.T) {
 //
 //	INGOT_TEST_DSN=postgres://... GOWORK=off go test ./registry/ -run BucketCORS -v
 func TestBucketCORSConfigLive(t *testing.T) {
-	dsn := os.Getenv("INGOT_TEST_DSN")
-	if dsn == "" {
-		t.Skip("set INGOT_TEST_DSN to run the live Postgres store test")
-	}
 	ctx := context.Background()
-	pool, err := pgxpool.New(ctx, dsn)
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-	defer pool.Close()
-	if err := migrations.Up(ctx, pool, zaptest.NewLogger(t)); err != nil {
-		t.Fatalf("migrations.Up: %v", err)
-	}
-	if _, err := pool.Exec(ctx, `TRUNCATE ingot.buckets CASCADE`); err != nil {
-		t.Fatalf("truncate: %v", err)
-	}
+	pool := pgtest.New(t)
 	r := registry.NewPostgres(pool)
 	if err := r.Create(ctx, "b", testutil.RandomDID(t), registry.CreateState{Tenant: testutil.RandomDID(t)}); err != nil {
 		t.Fatalf("Create: %v", err)

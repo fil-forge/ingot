@@ -74,13 +74,10 @@ type Backend struct {
 	parks     registry.ParkStore
 	remover   uploader.BlobRemover
 	registrar uploader.UploadRegistrar
-	// tasks runs the queue-space-upload tasks (RegisterUploadTasks); nil
-	// with an in-memory registry, which queues none.
+	// tasks runs the queue-space-upload tasks (RegisterUploadTasks).
 	tasks *taskrunner.Runner
 	// shards runs the queue-shard tasks that keep the cache's copies
-	// (RegisterShardTasks); nil with no task queues, when a held blob moves
-	// into the cache directly and stays until the budget pass evicts it.
-	// renewals is when this process last renewed each cached blob's time in
+	// (RegisterShardTasks). renewals is when this process last renewed each cached blob's time in
 	// the cache, and cacheTTL how long a renewal lasts.
 	shards   *taskrunner.Runner
 	renewals *recencyMap
@@ -180,8 +177,8 @@ type Deps struct {
 	Authority bucketauthority.BucketAuthority
 	// Registry tracks per-bucket roots; IntentStore tracks each local blob's
 	// upload_intents lifecycle; LocationStore records where each accepted body
-	// blob can be retrieved from. Production passes one *registry.Postgres for
-	// all three; the harness one *inmem.MemStore.
+	// blob can be retrieved from. Production and tests pass one
+	// *registry.Postgres for all three.
 	Registry  registry.Registry
 	Intents   registry.IntentStore
 	Locations registry.LocationStore
@@ -254,12 +251,11 @@ type Deps struct {
 	// LocalBlobMaxBytes is the byte budget for the spool and the cache
 	// together, writes in progress included, enforced by SweepLocalBlobs.
 	// Zero turns the budget pass off: eviction needs a network read tier to
-	// serve evicted blobs, which the in-memory fakes do not have.
+	// serve evicted blobs, which the test fakes do not have.
 	LocalBlobMaxBytes int64
 	// CacheTTL is how long a blob stays in the cache after it was cached or
 	// last read, unless the budget pass evicts it first. Zero →
-	// DefaultCacheTTL. It takes effect only with the task queues
-	// (RegisterShardTasks).
+	// DefaultCacheTTL.
 	CacheTTL time.Duration
 	// LocalBlobOrphanAge is the age at which SweepLocalBlobs deletes a .tmp-*
 	// file in either directory, or a spool blob file with no intent row. Zero →
@@ -267,8 +263,8 @@ type Deps struct {
 	LocalBlobOrphanAge time.Duration
 	// DropAcceptedBodies removes each body's local copy as soon as its
 	// location is recorded and its intent accepted, instead of moving it
-	// into the cache for reads. Off in the in-memory harness, whose base
-	// tier cannot serve a body. It gives up the read-after-write copy, which
+	// into the cache for reads. Off in tests whose base tier cannot serve a
+	// body. It gives up the read-after-write copy, which
 	// is safe while reads resolve through the local location table; an
 	// indexer-backed locator could miss a digest not yet published.
 	DropAcceptedBodies bool

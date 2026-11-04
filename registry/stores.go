@@ -16,7 +16,7 @@ import (
 // per-blob FEE encryption parameters (blob_encryption_params), the
 // multipart session/part tables, and the gc_candidates log. The stores
 // are split into focused interfaces so a caller can depend on only what
-// it needs; *Postgres and *inmem.MemStore satisfy all of them.
+// it needs; *Postgres satisfies all of them.
 //
 // NullVersionID is S3's version id for a null version — the version written
 // while a bucket is unversioned or Suspended (docs/s3-versioning.md §3). It

@@ -7,7 +7,6 @@ import (
 
 	"github.com/fil-forge/versitygw/s3response"
 
-	"github.com/fil-forge/ingot/inmem"
 	"github.com/fil-forge/ingot/registry"
 )
 
@@ -27,7 +26,7 @@ func TestUploadBlobRecordsLocationBeforeAccepted(t *testing.T) {
 	}
 	// stalledUploading checks that the intent is uploading and counted as a
 	// stalled upload, and returns it.
-	stalledUploading := func(t *testing.T, mem *inmem.MemStore, digest []byte) *registry.UploadIntent {
+	stalledUploading := func(t *testing.T, mem *testStore, digest []byte) *registry.UploadIntent {
 		t.Helper()
 		in, err := mem.IntentByDigest(t.Context(), digest)
 		if err != nil || in.State != registry.IntentUploading {
