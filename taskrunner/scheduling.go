@@ -261,17 +261,8 @@ func (r *Runner) Pending(ctx context.Context, queueName string, subjects []strin
 	if err != nil {
 		return nil, fmt.Errorf("pending %s.%s: %w", queueName, action, err)
 	}
-	defer rows.Close()
-	out := map[string][]TaskID{}
-	for rows.Next() {
-		var subject string
-		var id TaskID
-		if err := rows.Scan(&subject, &id); err != nil {
-			return nil, fmt.Errorf("pending %s.%s: %w", queueName, action, err)
-		}
-		out[subject] = append(out[subject], id)
-	}
-	if err := rows.Err(); err != nil {
+	out, err := collectBySubject(rows)
+	if err != nil {
 		return nil, fmt.Errorf("pending %s.%s: %w", queueName, action, err)
 	}
 	return out, nil
@@ -286,19 +277,20 @@ const expedite = `WITH due AS (
 		UPDATE %[1]s SET not_before = NULL, replaceable = false
 		WHERE subject LIKE $1 AND action = $2 AND state = 'pending' AND started IS NULL
 		AND not_before > now())
-	SELECT id FROM %[1]s
+	SELECT subject, id FROM %[1]s
 	WHERE subject LIKE $1 AND action = $2 AND state = 'pending'
 	ORDER BY seq`
 
 // Expedite makes the subject's pending tasks of the action due now, whatever
-// their NotBefore, and returns the IDs of all of the action's pending tasks on
-// it, for the caller to Wait on. A subject ending in * stands for every subject
+// their NotBefore, and returns all of the action's pending tasks on it, by
+// subject and oldest first, for the caller to Wait on or to run inline with a
+// sync task on each subject. A subject ending in * stands for every subject
 // that starts with what comes before the *, so a caller can bring forward a
 // group of subjects at once, such as a bucket delete running its space's
 // pending releases. A task it brings forward is no longer a replacement, so a
 // later submission cannot push it back. A task waiting to retry keeps its
 // backoff, and one placed on another instance still runs only there.
-func (r *Runner) Expedite(ctx context.Context, queueName, subject, action string) ([]TaskID, error) {
+func (r *Runner) Expedite(ctx context.Context, queueName, subject, action string) (map[string][]TaskID, error) {
 	q, ok := r.byName[queueName]
 	if !ok {
 		return nil, fmt.Errorf("task runner: unknown queue %q", queueName)
@@ -307,12 +299,28 @@ func (r *Runner) Expedite(ctx context.Context, queueName, subject, action string
 	if err != nil {
 		return nil, fmt.Errorf("expedite %s %s.%s: %w", subject, queueName, action, err)
 	}
-	ids, err := pgx.CollectRows(rows, pgx.RowTo[TaskID])
+	out, err := collectBySubject(rows)
 	if err != nil {
 		return nil, fmt.Errorf("expedite %s %s.%s: %w", subject, queueName, action, err)
 	}
 	r.pokeQueue(q)
-	return ids, nil
+	return out, nil
+}
+
+// collectBySubject reads rows of (subject, id) into IDs by subject, in row
+// order, and closes them.
+func collectBySubject(rows pgx.Rows) (map[string][]TaskID, error) {
+	defer rows.Close()
+	out := map[string][]TaskID{}
+	for rows.Next() {
+		var subject string
+		var id TaskID
+		if err := rows.Scan(&subject, &id); err != nil {
+			return nil, err
+		}
+		out[subject] = append(out[subject], id)
+	}
+	return out, rows.Err()
 }
 
 // subjectPattern returns the LIKE pattern matching subject, or, when it ends in

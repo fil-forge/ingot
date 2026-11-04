@@ -153,13 +153,14 @@ func TestExpediteRunsAGroupOfSubjectsDelayedTasksNow(t *testing.T) {
 	// A wildcard in the prefix is matched literally.
 	otherSpace := submit("spx/a", "release", &later, false)
 
-	ids, err := f.r.Expedite(ctx, qTop, "sp/*", "release")
+	got, err := f.r.Expedite(ctx, qTop, "sp/*", "release")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(ids, []taskrunner.TaskID{a, b}) {
-		t.Fatalf("Expedite = %v, want the group's two releases %v", ids, []taskrunner.TaskID{a, b})
+	if len(got) != 2 || !slices.Equal(got["sp/a"], []taskrunner.TaskID{a}) || !slices.Equal(got["sp/b"], []taskrunner.TaskID{b}) {
+		t.Fatalf("Expedite = %v, want the group's two releases, by subject", got)
 	}
+	ids := []taskrunner.TaskID{a, b}
 	// Brought forward, a replacement can no longer be pushed back.
 	submit("sp/a", "release", &later, true)
 	f.start(t)
@@ -189,9 +190,9 @@ func TestExpediteMatchesTheSubjectOrAPrefix(t *testing.T) {
 		}
 	}
 	for subject, want := range map[string]int{"a": 1, "a_b/*": 1, "a%b/*": 1, "a*": 4, "a_b/1": 1, "a_b": 0} {
-		ids, err := f.r.Expedite(ctx, qTop, subject, "release")
-		if err != nil || len(ids) != want {
-			t.Errorf("Expedite(%q) = %d tasks, %v; want %d", subject, len(ids), err, want)
+		got, err := f.r.Expedite(ctx, qTop, subject, "release")
+		if err != nil || len(got) != want {
+			t.Errorf("Expedite(%q) = %d subjects, %v; want %d", subject, len(got), err, want)
 		}
 	}
 }
