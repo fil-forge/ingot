@@ -18,9 +18,9 @@ type putPartStore interface {
 	registry.PendingReleaseStore
 }
 
-// TestPutPartReplacedLive runs PutPart's release of the row it replaces
+// TestPutPartReplaced runs PutPart's release of the row it replaces
 // against Postgres.
-func TestPutPartReplacedLive(t *testing.T) {
+func TestPutPartReplaced(t *testing.T) {
 	runPutPartReplacedSuite(t, registry.NewPostgres(pgtest.New(t)))
 }
 

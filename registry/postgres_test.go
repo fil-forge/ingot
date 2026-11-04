@@ -43,14 +43,10 @@ func liveCid(t *testing.T, s string) cid.Cid {
 	return cid.NewCidV1(cid.DagCBOR, mh)
 }
 
-// TestPostgresStores_Live exercises the SQL-backed store methods against a
+// TestPostgresStores exercises the SQL-backed store methods against a
 // real Postgres (jsonb, bytea[], ON CONFLICT, the latch's RowsAffected
-// semantics — none of which the in-memory fake can validate). Skipped unless
-// INGOT_TEST_DSN names a reachable database:
-//
-//	INGOT_TEST_DSN=postgres://postgres:pw@127.0.0.1:55432/ingot \
-//	  GOWORK=off go test ./registry/ -run Live -v
-func TestPostgresStores_Live(t *testing.T) {
+// semantics).
+func TestPostgresStores(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.New(t)
 
@@ -1008,8 +1004,6 @@ func TestPostgresStores_Live(t *testing.T) {
 // transaction already holds a connection, deadlocks outright on a
 // single-connection pool and deadlocks any pool once enough concurrent
 // commits exhaust it.
-//
-//	INGOT_TEST_DSN=postgres://... GOWORK=off go test ./registry/ -run SingleConnection -v
 func TestCommitRootOnASingleConnection(t *testing.T) {
 	ctx := context.Background()
 
@@ -1137,20 +1131,17 @@ func clearQueuedUploads(t *testing.T, pool *pgxpool.Pool, space did.DID) {
 	_, _ = pool.Exec(context.Background(), `DELETE FROM ingot.queue_space_upload_tasks WHERE subject = $1`, space.String())
 }
 
-// livePool returns a pool on the test database with ingot's migrations
-// applied, skipping the test without INGOT_TEST_DSN.
+// livePool returns a pool on a migrated database of the test's own.
 func livePool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	pool := pgtest.New(t)
 	return pool
 }
 
-// TestCommitRootQueuesUploadRegistrationsLive: a commit's registrations become
+// TestCommitRootQueuesUploadRegistrations: a commit's registrations become
 // tasks in its own transaction, in commit order, carrying what the worker
 // needs; a commit that fails queues none.
-//
-//	INGOT_TEST_DSN=postgres://... GOWORK=off go test ./registry/ -run QueuesUploadRegistrations -v
-func TestCommitRootQueuesUploadRegistrationsLive(t *testing.T) {
+func TestCommitRootQueuesUploadRegistrations(t *testing.T) {
 	pool := livePool(t)
 	ctx := context.Background()
 	r := registry.NewPostgres(pool, registry.WithTasks(liveUploadTasks(t, pool)))
@@ -1182,7 +1173,7 @@ func TestCommitRootQueuesUploadRegistrationsLive(t *testing.T) {
 // TestCommitRootWithoutTasksRefusesRegistrations: a registry with no runner
 // cannot queue a commit's registrations, so it refuses the commit rather than
 // dropping them.
-func TestCommitRootWithoutTasksRefusesRegistrationsLive(t *testing.T) {
+func TestCommitRootWithoutTasksRefusesRegistrations(t *testing.T) {
 	pool := livePool(t)
 	ctx := context.Background()
 	r := registry.NewPostgres(pool)
@@ -1202,15 +1193,13 @@ func TestCommitRootWithoutTasksRefusesRegistrationsLive(t *testing.T) {
 	}
 }
 
-// TestConcurrentCommitClaimsLive runs two commits claiming the same thousands
+// TestConcurrentCommitClaims runs two commits claiming the same thousands
 // of digests at once, many times over, one listing them in reverse. A commit
 // takes a claim-key lock per digest, so the two take overlapping lock sets
 // and must take them in one order whatever order their claims arrive in, or
 // Postgres aborts one with a deadlock error. Each writer commits to a bucket
 // of its own: the root swap serialises the writers of one bucket.
-//
-//	INGOT_TEST_DSN=postgres://... GOWORK=off go test ./registry/ -run ConcurrentCommitClaims -v
-func TestConcurrentCommitClaimsLive(t *testing.T) {
+func TestConcurrentCommitClaims(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.New(t)
 	r := registry.NewPostgres(pool)
@@ -1275,15 +1264,13 @@ func TestConcurrentCommitClaimsLive(t *testing.T) {
 	}
 }
 
-// TestGetReleaseWaitsForTheClaimKeyLockLive: the release lookup a part's
+// TestGetReleaseWaitsForTheClaimKeyLock: the release lookup a part's
 // park makes is serialised with the start of that release. A start in
 // flight holds the claim-key lock until it commits, so the lookup waits and
 // then reads the record started, rather than read it pending a moment
 // before the start commits and let the part reuse a blob the release then
 // removes.
-//
-//	INGOT_TEST_DSN=postgres://... GOWORK=off go test ./registry/ -run GetReleaseWaits -v
-func TestGetReleaseWaitsForTheClaimKeyLockLive(t *testing.T) {
+func TestGetReleaseWaitsForTheClaimKeyLock(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.New(t)
 	r := registry.NewPostgres(pool)
@@ -1339,14 +1326,12 @@ func TestGetReleaseWaitsForTheClaimKeyLockLive(t *testing.T) {
 	}
 }
 
-// TestReleaseGraceRunsFromTheSwapLive: a drop's release is due the grace
+// TestReleaseGraceRunsFromTheSwap: a drop's release is due the grace
 // after the swap commits, not after its transaction began. A swap that
 // waited on a claim-key lock (here held by another transaction) owes a
 // reader that resolved the discarded version meanwhile the whole grace from
 // the commit.
-//
-//	INGOT_TEST_DSN=postgres://... GOWORK=off go test ./registry/ -run GraceRunsFromTheSwap -v
-func TestReleaseGraceRunsFromTheSwapLive(t *testing.T) {
+func TestReleaseGraceRunsFromTheSwap(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.New(t)
 	r := registry.NewPostgres(pool)
@@ -1409,15 +1394,10 @@ func TestReleaseGraceRunsFromTheSwapLive(t *testing.T) {
 	}
 }
 
-// TestBucketCORSConfigLive round-trips a bucket's own CORS document through
+// TestBucketCORSConfig round-trips a bucket's own CORS document through
 // the SQL store: the column scans back as the bytes stored, NULL reads as
-// nil, a nil write restores NULL, and a missing bucket is ErrNotFound. The
-// in-memory fake cannot validate the column order of the row scan or the
-// nullable bytea binding. Skipped unless INGOT_TEST_DSN names a reachable
-// database:
-//
-//	INGOT_TEST_DSN=postgres://... GOWORK=off go test ./registry/ -run BucketCORS -v
-func TestBucketCORSConfigLive(t *testing.T) {
+// nil, a nil write restores NULL, and a missing bucket is ErrNotFound.
+func TestBucketCORSConfig(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.New(t)
 	r := registry.NewPostgres(pool)

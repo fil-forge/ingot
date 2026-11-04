@@ -20,9 +20,9 @@ type intentStore interface {
 	registry.ParkStore
 }
 
-// TestIntentQueriesLive runs the intent queries against Postgres, each case
+// TestIntentQueries runs the intent queries against Postgres, each case
 // on a database of its own.
-func TestIntentQueriesLive(t *testing.T) {
+func TestIntentQueries(t *testing.T) {
 	runIntentSuite(t, func(t *testing.T) intentStore { return registry.NewPostgres(pgtest.New(t)) })
 }
 

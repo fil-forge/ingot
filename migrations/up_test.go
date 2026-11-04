@@ -11,10 +11,10 @@ import (
 	"github.com/fil-forge/ingot/migrations"
 )
 
-// TestUp_Live applies the embedded migrations to an empty database and
+// TestUp applies the embedded migrations to an empty database and
 // asserts the ingot schema's tables exist, guarding against DDL errors in a
 // new migration breaking startup.
-func TestUp_Live(t *testing.T) {
+func TestUp(t *testing.T) {
 	ctx := context.Background()
 	pool, _ := pgtest.NewEmpty(t)
 
@@ -122,14 +122,14 @@ func TestUp_Live(t *testing.T) {
 	}
 }
 
-// TestUp_Live_Concurrent races several Up calls against a fresh database:
+// TestUp_Concurrent races several Up calls against a fresh database:
 // the pg_advisory_lock in Up must serialize them, or the first-run DDL
 // (goose's version table, the schema) collides — the exact failure mode of
 // parallel test packages migrating the shared CI database, and of multiple
 // ingot instances starting against one Postgres. The race needs a database
 // with no ingot schema yet, which the test gets as an empty database of its
 // own.
-func TestUp_Live_Concurrent(t *testing.T) {
+func TestUp_Concurrent(t *testing.T) {
 	ctx := context.Background()
 	empty, dsn := pgtest.NewEmpty(t)
 	empty.Close()

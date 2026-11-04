@@ -24,8 +24,8 @@ type releaseStartStore interface {
 	registry.LocationStore
 }
 
-// TestReleaseStartLive runs the release start and cancel against Postgres.
-func TestReleaseStartLive(t *testing.T) {
+// TestReleaseStart runs the release start and cancel against Postgres.
+func TestReleaseStart(t *testing.T) {
 	runReleaseStartSuite(t, registry.NewPostgres(pgtest.New(t)))
 }
 

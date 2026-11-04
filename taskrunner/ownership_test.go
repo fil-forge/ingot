@@ -27,7 +27,7 @@ func (f *fixture) stealLease(t *testing.T, queue, subject string, d time.Duratio
 	}
 }
 
-func TestLostLeaseStopsTheTaskUntilItIsRetaken_Live(t *testing.T) {
+func TestLostLeaseStopsTheTaskUntilItIsRetaken(t *testing.T) {
 	f := newFixture(t, 0)
 	var mu sync.Mutex
 	var runs []time.Time
@@ -60,7 +60,7 @@ func TestLostLeaseStopsTheTaskUntilItIsRetaken_Live(t *testing.T) {
 	}
 }
 
-func TestFailureUnderALostLeaseRecordsNothing_Live(t *testing.T) {
+func TestFailureUnderALostLeaseRecordsNothing(t *testing.T) {
 	f := newFixture(t, 0)
 	var runs atomic.Int32
 	f.handle(t, qTop, "fail", func(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
@@ -78,7 +78,7 @@ func TestFailureUnderALostLeaseRecordsNothing_Live(t *testing.T) {
 	}
 }
 
-func TestStopWaitsForInlineRuns_Live(t *testing.T) {
+func TestStopWaitsForInlineRuns(t *testing.T) {
 	f := newFixture(t, 0)
 	started := make(chan struct{})
 	var handlerDone atomic.Bool
@@ -113,7 +113,7 @@ func TestStopWaitsForInlineRuns_Live(t *testing.T) {
 
 type callerKey struct{}
 
-func TestWorkersLeaveSyncTasksToTheirCaller_Live(t *testing.T) {
+func TestWorkersLeaveSyncTasksToTheirCaller(t *testing.T) {
 	f := newFixture(t, 4)
 	var workerRan atomic.Int32
 	f.handle(t, qTop, "slow", func(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
@@ -145,7 +145,7 @@ func TestWorkersLeaveSyncTasksToTheirCaller_Live(t *testing.T) {
 	}
 }
 
-func TestChildExpiringWhileWaitingForItsLeaseDoesNotRun_Live(t *testing.T) {
+func TestChildExpiringWhileWaitingForItsLeaseDoesNotRun(t *testing.T) {
 	f := newFixture(t, 0)
 	var childRan atomic.Bool
 	f.handle(t, qBottom, "child", func(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
@@ -174,7 +174,7 @@ func TestChildExpiringWhileWaitingForItsLeaseDoesNotRun_Live(t *testing.T) {
 	}
 }
 
-func TestQueueNamesFitPostgresIdentifiers_Live(t *testing.T) {
+func TestQueueNamesFitPostgresIdentifiers(t *testing.T) {
 	env := taskrunnertest.NewEnv(t)
 	long := "q" + strings.Repeat("x", 39)
 	r, err := taskrunner.New(env.DB, taskrunner.Options{Schema: env.Schema, Queues: []taskrunner.QueueOptions{{Name: long}}})
@@ -189,7 +189,7 @@ func TestQueueNamesFitPostgresIdentifiers_Live(t *testing.T) {
 	}
 }
 
-func TestCheckOwnWritesTreatsAConditionalMissAlike_Live(t *testing.T) {
+func TestCheckOwnWritesTreatsAConditionalMissAlike(t *testing.T) {
 	taskrunnertest.CheckOwnWrites(t, taskrunnertest.Case{
 		Queues: []taskrunner.QueueOptions{{Name: "queue-claim"}},
 		Setup: func(ctx context.Context, env taskrunnertest.Env, r *taskrunner.Runner) error {
@@ -211,7 +211,7 @@ func TestCheckOwnWritesTreatsAConditionalMissAlike_Live(t *testing.T) {
 	})
 }
 
-func TestLeaseTakenBetweenDrainedTasksStopsTheDrain_Live(t *testing.T) {
+func TestLeaseTakenBetweenDrainedTasksStopsTheDrain(t *testing.T) {
 	f := newFixture(t, 1)
 	var secondAt atomic.Int64
 	f.handle(t, qTop, "first", func(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
@@ -260,7 +260,7 @@ CREATE TRIGGER steal AFTER UPDATE OF state ON `+tasks+` FOR EACH ROW
 	}
 }
 
-func TestChildReusingALostLeaseRestartsTheTree_Live(t *testing.T) {
+func TestChildReusingALostLeaseRestartsTheTree(t *testing.T) {
 	f := newFixture(t, 0)
 	var stole atomic.Bool
 	var secondRuns atomic.Int32
@@ -293,7 +293,7 @@ func TestChildReusingALostLeaseRestartsTheTree_Live(t *testing.T) {
 	}
 }
 
-func TestStopAfterATimedOutStopWaitsForTheShutdown_Live(t *testing.T) {
+func TestStopAfterATimedOutStopWaitsForTheShutdown(t *testing.T) {
 	f := newFixture(t, 0)
 	started := make(chan struct{})
 	var handlerDone atomic.Bool
@@ -339,7 +339,7 @@ func (f *fixture) expireOwnLease(t *testing.T, queue, subject string) {
 	}
 }
 
-func TestExpiredLeaseStartsNoFurtherTask_Live(t *testing.T) {
+func TestExpiredLeaseStartsNoFurtherTask(t *testing.T) {
 	f := newFixture(t, 1)
 	leases, tasks := f.env.Table("queue_top_leases"), f.env.Table("queue_top_tasks")
 	var secondOwner uuid.UUID
@@ -388,7 +388,7 @@ CREATE TRIGGER lapse AFTER UPDATE OF state ON `+tasks+` FOR EACH ROW
 	}
 }
 
-func TestCommitUnderAnExpiredLeaseIsRetried_Live(t *testing.T) {
+func TestCommitUnderAnExpiredLeaseIsRetried(t *testing.T) {
 	f := newFixture(t, 0)
 	var runs atomic.Int32
 	f.handle(t, qTop, "put", func(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
@@ -418,7 +418,7 @@ func TestLeaseTTLUnderAMillisecondIsRefused(t *testing.T) {
 	}
 }
 
-func TestRunStopsWaitingAtItsExpires_Live(t *testing.T) {
+func TestRunStopsWaitingAtItsExpires(t *testing.T) {
 	f := newFixture(t, 0)
 	var ran atomic.Bool
 	f.handle(t, qTop, "put", func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) {
@@ -451,7 +451,7 @@ func TestRunStopsWaitingAtItsExpires_Live(t *testing.T) {
 	}
 }
 
-func TestChildDoesNotStartOnceTheRootLeaseIsLost_Live(t *testing.T) {
+func TestChildDoesNotStartOnceTheRootLeaseIsLost(t *testing.T) {
 	f := newFixture(t, 0)
 	var stole atomic.Bool
 	var childRuns atomic.Int32
