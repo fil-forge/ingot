@@ -425,12 +425,7 @@ func (r *Postgres) DeleteRelease(ctx context.Context, space did.DID, digest mult
 // IntentStore ================================================================
 
 func (r *Postgres) PutIntent(ctx context.Context, in UploadIntent) error {
-	tx, err := r.pool.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("registry: begin put intent: %w", err)
-	}
-	defer tx.Rollback(ctx)
-	if _, err := tx.Exec(ctx,
+	if _, err := r.pool.Exec(ctx,
 		`INSERT INTO ingot.upload_intents (space, digest, local_path, size, state, bucket)
 		 VALUES ($1, $2, $3, $4, $5, $6)
 		 ON CONFLICT (space, digest) DO UPDATE
@@ -441,15 +436,6 @@ func (r *Postgres) PutIntent(ctx context.Context, in UploadIntent) error {
 		       updated_at = now()`,
 		in.Space, in.Digest, in.LocalPath, in.Size, in.State, nullString(in.Bucket)); err != nil {
 		return fmt.Errorf("registry: put intent: %w", err)
-	}
-	// The file is back on disk, for every space's intent.
-	if _, err := tx.Exec(ctx,
-		`UPDATE ingot.upload_intents SET evicted_at = NULL WHERE digest = $1 AND evicted_at IS NOT NULL`,
-		in.Digest); err != nil {
-		return fmt.Errorf("registry: put intent: clear evicted: %w", err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("registry: commit put intent: %w", err)
 	}
 	return nil
 }
@@ -509,108 +495,10 @@ func (r *Postgres) CountOtherIntents(ctx context.Context, space did.DID, digest 
 	return n, nil
 }
 
-func (r *Postgres) ListEvictable(ctx context.Context, after EvictCursor, limit int) ([]UploadIntent, error) {
-	// A zero cursor starts before every row; the empty digest and the empty
-	// space sort first.
-	afterDigest := after.Digest
-	if afterDigest == nil {
-		afterDigest = multihash.Multihash{}
-	}
-	afterSpace := ""
-	if after.Space.Defined() {
-		afterSpace = after.Space.String()
-	}
-	// The state literals match the partial index upload_intents_evictable_idx
-	// (migration 00026); the planner uses it only when the query names the
-	// same constants, not parameters.
-	rows, err := r.pool.Query(ctx,
-		`SELECT `+intentColumns+`
-		   FROM ingot.upload_intents i
-		  WHERE i.evicted_at IS NULL
-		    AND i.state IN ('parked', 'accepted', 'published')
-		    AND (i.updated_at, i.digest, i.space) > ($1::timestamptz, $2::bytea, $3::text)
-		    AND CASE WHEN i.state = 'parked'
-		             THEN EXISTS (SELECT 1 FROM ingot.blob_parks p WHERE p.space = i.space AND p.digest = i.digest)
-		             ELSE EXISTS (SELECT 1 FROM ingot.blob_locations l WHERE l.space = i.space AND l.digest = i.digest)
-		        END
-		    AND NOT EXISTS (SELECT 1 FROM ingot.upload_intents o
-		                     WHERE o.digest = i.digest AND o.state IN ('spooled', 'uploading'))
-		  ORDER BY i.updated_at, i.digest, i.space
-		  LIMIT $4`,
-		after.UpdatedAt, []byte(afterDigest), afterSpace, limit)
-	if err != nil {
-		return nil, fmt.Errorf("registry: list evictable intents: %w", err)
-	}
-	return scanIntents(rows)
-}
-
-func (r *Postgres) MarkEvicted(ctx context.Context, digest multihash.Multihash, notAfter time.Time) error {
-	tag, err := r.pool.Exec(ctx,
-		`UPDATE ingot.upload_intents SET evicted_at = now()
-		  WHERE digest = $1 AND updated_at <= $2`, digest, notAfter)
-	if err != nil {
-		return fmt.Errorf("registry: mark intent evicted: %w", err)
-	}
-	if tag.RowsAffected() > 0 {
-		return nil
-	}
-	// Nothing marked: no intent is left, or every one of them is a newer
-	// write's, whose file is on disk.
-	var exists bool
-	if err := r.pool.QueryRow(ctx,
-		`SELECT EXISTS (SELECT 1 FROM ingot.upload_intents WHERE digest = $1)`, digest).Scan(&exists); err != nil {
-		return fmt.Errorf("registry: mark intent evicted lookup: %w", err)
-	}
-	if !exists {
-		return ErrNotFound
-	}
-	return nil
-}
-
-// releasedPublishedWhere is ListReleasedPublished's condition on intent i,
-// with the intent state as $1 and the live session states as $2 and $3.
-const releasedPublishedWhere = `i.state = $1
-		    AND NOT EXISTS (SELECT 1 FROM ingot.blob_locations l WHERE l.digest = i.digest)
-		    AND NOT EXISTS (SELECT 1 FROM ingot.blob_refs c WHERE c.digest = i.digest)
-		    AND NOT EXISTS (SELECT 1 FROM ingot.blob_release_intents p WHERE p.digest = i.digest)
-		    AND NOT EXISTS (SELECT 1 FROM ingot.multipart_parts mp
-		                      JOIN ingot.multipart_sessions s ON s.upload_id = mp.upload_id
-		                     WHERE mp.blob_digests @> ARRAY[i.digest] AND s.state IN ($2, $3))
-		    AND NOT EXISTS (SELECT 1 FROM ingot.upload_intents o
-		                     WHERE o.digest = i.digest AND o.space <> i.space)`
-
-func (r *Postgres) ListReleasedPublished(ctx context.Context, after multihash.Multihash, limit int) ([]UploadIntent, error) {
-	// The empty digest sorts first, so a nil cursor starts at the beginning.
-	if after == nil {
-		after = multihash.Multihash{}
-	}
-	rows, err := r.pool.Query(ctx,
-		`SELECT `+intentColumns+`
-		   FROM ingot.upload_intents i
-		  WHERE i.digest > $4 AND `+releasedPublishedWhere+`
-		  ORDER BY i.digest
-		  LIMIT $5`,
-		IntentPublished, SessionOpen, SessionCompleting, []byte(after), limit)
-	if err != nil {
-		return nil, fmt.Errorf("registry: list released published intents: %w", err)
-	}
-	return scanIntents(rows)
-}
-
-func (r *Postgres) DeleteReleasedPublished(ctx context.Context, space did.DID, digest multihash.Multihash) (bool, error) {
-	tag, err := r.pool.Exec(ctx,
-		`DELETE FROM ingot.upload_intents i
-		  WHERE i.space = $4 AND i.digest = $5 AND `+releasedPublishedWhere,
-		IntentPublished, SessionOpen, SessionCompleting, space, []byte(digest))
-	if err != nil {
-		return false, fmt.Errorf("registry: delete released published intent: %w", err)
-	}
-	return tag.RowsAffected() > 0, nil
-}
-
 func (r *Postgres) StalledBytes(ctx context.Context, before time.Time) (StalledSizes, error) {
 	// The state literals match the partial index upload_intents_stalled_idx
-	// (migrations 00021 and 00023), as for ListEvictable; the index carries
+	// (migrations 00021 and 00023): the planner uses it only when the query
+	// names the same constants, not parameters. The index carries
 	// size and state, so the sums come from it alone.
 	var s StalledSizes
 	err := r.pool.QueryRow(ctx,

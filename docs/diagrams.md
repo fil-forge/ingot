@@ -716,7 +716,7 @@ flowchart TB
 
     spooled -->|"dedup: blob_locations hit;<br/>file moves to the cache"| accepted
     spooled -->|"first network call begins<br/>(uploadBlobs, parkBlobs, concludeBlobs fallback)"| uploading
-    uploading -->|"single-shot upload:<br/>/blob/add, PUT, conclude, accept;<br/>file moves to the cache (BlobCache.Take)"| accepted
+    uploading -->|"single-shot upload:<br/>/blob/add, PUT, conclude, accept;<br/>queue-shard.cache moves the file to the cache"| accepted
     uploading -->|"parkBlobs: /blob/add WithConclude(false),<br/>PUT (or already streamed); blob_parks row written;<br/>local copy removed (removeLocal)"| parked
     parked -->|"acceptParked (the upload's acceptor, or Complete for a spooled part):<br/>/ucan/conclude; ConcludePark swaps the blob_parks row for blob_locations"| accepted
     spooled -->|"release record; executeRelease, local only<br/>(the blob never left this node):<br/>DeleteIntent + removeLocal"| gone([deleted])
@@ -727,10 +727,9 @@ flowchart TB
 
     accepted -->|"commit: the claim, in the root swap's transaction"| published
 
-    parked -.->|"SweepLocalBlobs over budget (blob_parks row):<br/>removeLocal + MarkEvicted; state unchanged"| evicted[["local file evicted<br/>(evicted_at set)"]]
-    accepted -.->|"cache_writes false: at accept,<br/>once the location is recorded;<br/>removeLocal + MarkEvicted"| evicted
-    accepted -.->|"SweepLocalBlobs over budget (blob_locations row):<br/>removeLocal + MarkEvicted; state unchanged"| evicted
-    published -.->|"SweepLocalBlobs over budget (blob_locations row):<br/>removeLocal + MarkEvicted; state unchanged"| evicted
+    accepted -.->|"cache_writes false: at accept,<br/>once the location is recorded;<br/>removeLocal; state unchanged"| evicted[["local file evicted"]]
+    accepted -.->|"queue-shard.evict at the TTL,<br/>or SweepLocalBlobs over budget;<br/>state unchanged"| evicted
+    published -.->|"queue-shard.evict at the TTL,<br/>or SweepLocalBlobs over budget;<br/>state unchanged"| evicted
     published -->|"commit: the root swap's transaction adds this version's claim"| refs["blob_refs rows<br/>(digest, bucket, key, version_id)"]
     refs -->|"version delete or overwrite removes its row"| zero{"CountClaims == 0<br/>for (space, digest)?"}
     zero -->|yes| rel["release record enqueued, due after release_grace<br/>(the published → deleted edge runs it)"]
@@ -743,26 +742,22 @@ flowchart TB
   presence machine (a row exists while a conclude is owed), not a state
   column.
 - A blob's file lives in the spool until the provider holds it, then moves
-  to the cache: once its location and `accepted` state are both recorded,
-  by rename (`BlobCache.Take`). A failed move leaves it in the spool. With
-  `cache_writes: false` the copy is removed at that point instead, and the
-  intent gains `evicted_at`.
-- Eviction (the dotted edges) is orthogonal to the state: `SweepLocalBlobs`
-  runs every 30s and, when the spool and cache together are over
-  `local_blob_max_bytes`, removes the local files of blobs the provider
-  already holds (a location row for `accepted` and `published`, a park row
-  for `parked`), oldest state change first, down to 90% of the budget,
-  passing over blobs inside `cache_min_residency` or `cache_read_retention`
-  unless usage stays over budget without them (then evicting inside the
-  windows only down to the budget): from
-  the cache, or from the spool for a blob whose move never happened. The
-  intent keeps its row and state and gains `evicted_at`; reads fall through
-  to the network tier. `spooled` and `uploading` files are never evicted.
-  The parked-part drop at UploadPart marks `evicted_at` the same way. A
-  committed blob's release removes its local copy with the intent; once at
-  startup, the released pass does the same for `published` intents nothing
-  names any more (no location, claim, pending release or live part), left
-  by versions whose releases kept the copy.
+  to the cache: once its location and `accepted` state are both recorded, a
+  `queue-shard.cache` task moves it by rename (`BlobCache.Take`) and
+  schedules a `queue-shard.evict` for `cache_ttl` later. A failed move
+  leaves it in the spool. With `cache_writes: false` the copy is removed at
+  that point instead.
+- Eviction (the dotted edges) is orthogonal to the state and touches only
+  the cache. A read from the cache with less than half its `cache_ttl` left
+  runs `queue-shard.cache` again, which replaces the pending eviction with a
+  later one. `SweepLocalBlobs` runs every 30s and, when the spool and cache
+  together are over `local_blob_max_bytes`, evicts cached files through sync
+  `queue-shard.evict` tasks, oldest
+  modification time (last renewal) first, down to 90% of the budget. The
+  intent keeps its row and state; reads fall through to the network tier.
+  Spool files are never evicted. The parked-part drop at UploadPart removes
+  a parked part's spool copy. A committed blob's release removes its local
+  copy with the intent.
 - Digests present in both the old and new version sets never churn: the new
   generation's claim lands before the old one's drops in the same
   transaction, so the digest keeps a claim throughout and no release is
@@ -778,9 +773,10 @@ flowchart TB
 Cross-references: [`architecture.md` §5](./architecture.md#5-the-data-layer),
 [`s3-versioning.md`](./s3-versioning.md) §8.
 
-Sources: `registry/stores.go` (state consts, ListEvictable, ListReleasedPublished), `s3frontend/object.go`
+Sources: `registry/stores.go` (state consts), `s3frontend/object.go`
 (ingestBody, addClaims, dropClaims), `s3frontend/localblob_sweep.go` (SweepLocalBlobs),
-`s3frontend/localblobs.go` (cacheHeld, removeLocal),
+`s3frontend/localblobs.go` (cacheHeld, removeLocal), `s3frontend/shardqueue.go`
+(queue-shard.cache, queue-shard.evict),
 `s3frontend/multipart.go`
 (parkBlobs, acceptParked, recordConcluded, concludeBlobs, enqueuePartReleases),
 `s3frontend/acceptor.go`, `s3frontend/object.go`
@@ -1125,8 +1121,7 @@ erDiagram
         bigint size
         text state "spooled, uploading, parked, accepted, published (claimed by a commit)"
         text bucket
-        timestamptz updated_at "last state change: the budget pass evicts oldest first"
-        timestamptz evicted_at "set once the local copy is removed (sweeper or parked-part drop)"
+        timestamptz updated_at "last state change: dates a stalled upload"
     }
     blob_locations {
         text space PK

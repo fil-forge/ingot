@@ -1,6 +1,8 @@
 package blockstore
 
 import (
+	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -159,7 +161,9 @@ func TestScanKeepsCountsExact(t *testing.T) {
 	}
 }
 
-func TestBlobCacheLastRead(t *testing.T) {
+// TestBlobCacheOnRead: every hit reports its digest to the read hook, and a
+// miss or a move reports nothing.
+func TestBlobCacheOnRead(t *testing.T) {
 	ctx := t.Context()
 	cases := []struct {
 		name string
@@ -209,20 +213,6 @@ func TestBlobCacheLastRead(t *testing.T) {
 			want: true,
 		},
 		{
-			name: "remove forgets the read",
-			read: func(t *testing.T, c *BlobCache, d mh.Multihash) {
-				r, err := c.OpenBlob(ctx, did.Undef, d)
-				if err != nil {
-					t.Fatalf("OpenBlob: %v", err)
-				}
-				_ = r.Close()
-				if _, err := c.Remove(d); err != nil {
-					t.Fatalf("Remove: %v", err)
-				}
-			},
-			want: false,
-		},
-		{
 			name: "miss records nothing",
 			read: func(t *testing.T, c *BlobCache, d mh.Multihash) {
 				if _, err := c.Remove(d); err != nil {
@@ -243,30 +233,41 @@ func TestBlobCacheLastRead(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			s, c := newTestDirs(t)
+			var reads []mh.Multihash
+			c.OnRead(func(_ context.Context, d mh.Multihash) { reads = append(reads, d) })
 			d := writeTestBlob(t, s, "hello")
 			if _, err := c.Take(s, d); err != nil {
 				t.Fatalf("Take: %v", err)
 			}
 			tc.read(t, c, d)
-			if _, ok := c.LastRead(d); ok != tc.want {
-				t.Fatalf("LastRead ok = %v, want %v", ok, tc.want)
+			if got := len(reads) == 1 && bytes.Equal(reads[0], d); got != tc.want {
+				t.Fatalf("reported %v, want the digest reported: %v", reads, tc.want)
 			}
 		})
 	}
 }
 
-func TestRecencyMapDropsLeastRecentlyRead(t *testing.T) {
-	m := newRecencyMap(2)
-	now := time.Now()
-	m.touch("a", now)
-	m.touch("b", now)
-	m.touch("a", now) // a is now the most recent
-	m.touch("c", now) // evicts b
-	_, hasA := m.get("a")
-	_, hasB := m.get("b")
-	_, hasC := m.get("c")
-	if got := [3]bool{hasA, hasB, hasC}; got != [3]bool{true, false, true} {
-		t.Fatalf("remembered [a b c] = %v, want [true false true]", got)
+// TestBlobCacheTouch: Touch dates a cached file, which the budget pass orders
+// by, and reports a blob that is not cached.
+func TestBlobCacheTouch(t *testing.T) {
+	s, c := newTestDirs(t)
+	d := writeTestBlob(t, s, "hello")
+	if ok, err := c.Touch(d, time.Now()); err != nil || ok {
+		t.Fatalf("Touch before Take = %v, %v; want false", ok, err)
+	}
+	if _, err := c.Take(s, d); err != nil {
+		t.Fatalf("Take: %v", err)
+	}
+	at := time.Now().Add(-time.Hour).Truncate(time.Second)
+	if ok, err := c.Touch(d, at); err != nil || !ok {
+		t.Fatalf("Touch = %v, %v; want true", ok, err)
+	}
+	info, err := os.Stat(c.Path(d))
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if !info.ModTime().Equal(at) {
+		t.Fatalf("modification time = %v, want %v", info.ModTime(), at)
 	}
 }
 

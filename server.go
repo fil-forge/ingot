@@ -253,8 +253,7 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		ReleaseGrace:    cfg.ReleaseGrace,
 
 		LocalBlobMaxBytes:  cfg.LocalBlobMaxBytes,
-		CacheMinResidency:  cfg.CacheMinResidency,
-		CacheReadRetention: cfg.CacheReadRetention,
+		CacheTTL:           cfg.CacheTTL,
 		LocalBlobOrphanAge: cfg.LocalBlobOrphanAge,
 		DropAcceptedBodies: cfg.DropAcceptedBodies,
 
@@ -271,6 +270,11 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 			_ = backend.CloseMetrics()
 			_ = log.Close(ctx)
 			return nil, fmt.Errorf("ingot: register upload tasks: %w", err)
+		}
+		if err := backend.RegisterShardTasks(deps.Tasks); err != nil {
+			_ = backend.CloseMetrics()
+			_ = log.Close(ctx)
+			return nil, fmt.Errorf("ingot: register shard tasks: %w", err)
 		}
 	}
 
@@ -324,7 +328,6 @@ func (s *Server) Start(ctx context.Context) error {
 	s.startMultipartSweeper()
 	s.startReleaseSweeper()
 	s.startLocalBlobSweeper()
-	s.startReleasedPass()
 	s.startAcceptSweeper()
 	s.startCatalogUsageSweeper()
 	return nil
@@ -472,8 +475,8 @@ const localBlobSweepInterval = 30 * time.Second
 const localBlobSweepLogInterval = 10 * time.Minute
 
 // startLocalBlobSweeper spawns the local blob sweeper: every
-// localBlobSweepInterval it evicts blobs the provider holds down to
-// LocalBlobMaxBytes (when set), and hourly it deletes orphan files (see
+// localBlobSweepInterval it evicts cached blobs down to LocalBlobMaxBytes
+// (when set), and hourly it deletes orphan files (see
 // Backend.SweepLocalBlobs).
 func (s *Server) startLocalBlobSweeper() {
 	s.goSweep(func() {
@@ -513,28 +516,6 @@ func (s *Server) startLocalBlobSweeper() {
 					since = time.Now()
 				}
 			}
-		}
-	})
-}
-
-// startReleasedPass removes the local copies and intents that releases kept
-// before they freed local disk (see Backend.RemoveReleasedPublished). It runs
-// at every startup, until it has gone through every candidate or Stop
-// cancels it; on a node with none it is one scan.
-func (s *Server) startReleasedPass() {
-	s.goSweep(func() {
-		ctx, span := tracing.Start(s.sweepCtx, "sweep.released_pass")
-		files, bytes, err := s.backend.RemoveReleasedPublished(ctx)
-		s.endSweepSpan(span, err,
-			attribute.Int64("ingot.sweep.files", files),
-			attribute.Int64("ingot.sweep.bytes", bytes))
-		switch {
-		case err != nil && s.sweepCtx.Err() == nil:
-			s.logger.Warn("local blob released pass; the next restart tries again", zap.Error(err),
-				zap.Int64("files", files), zap.Int64("bytes", bytes))
-		case files > 0:
-			s.logger.Info("local blob released pass removed copies earlier releases kept",
-				zap.Int64("files", files), zap.Int64("bytes", bytes))
 		}
 	})
 }

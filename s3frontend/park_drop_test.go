@@ -67,9 +67,6 @@ func TestParkedPartHoldsNoLocalCopy(t *testing.T) {
 		if _, err := mem.ParkByDigest(ctx, d); err != nil {
 			t.Fatalf("parked blob %s park row: %v", d, err)
 		}
-		if !mem.IsEvicted(d) {
-			t.Fatalf("parked blob %s intent not marked evicted", d)
-		}
 	}
 
 	one := int32(1)
