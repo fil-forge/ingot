@@ -560,6 +560,82 @@ func (r *Runner) SubmitTx(ctx context.Context, tx pgx.Tx, s Spec) (TaskID, error
 	return r.submit(ctx, tx, s)
 }
 
+// SubmitAllTx is SubmitTx for many tasks of one queue, in one statement however
+// many there are, and returns their IDs in the order of specs. Of two
+// replacements in specs with the same subject and action, the one with the
+// later NotBefore is kept, as it would be had they been submitted one by one,
+// and both are given its ID.
+func (r *Runner) SubmitAllTx(ctx context.Context, tx pgx.Tx, specs []Spec) ([]TaskID, error) {
+	if len(specs) == 0 {
+		return nil, nil
+	}
+	ids := make([]TaskID, len(specs))
+	// kept is, for each replacement's (subject, action), the index of the
+	// spec that stands for it.
+	type key struct{ subject, action string }
+	kept := map[key]int{}
+	var q *queue
+	for i, s := range specs {
+		sq, err := r.checkSpec(s)
+		if err != nil {
+			return nil, err
+		}
+		if q != nil && sq != q {
+			return nil, fmt.Errorf("task runner: SubmitAllTx: tasks of %s and %s", q.name, sq.name)
+		}
+		q = sq
+		if ids[i], err = uuid.NewV7(); err != nil {
+			return nil, err
+		}
+		if !s.Replace {
+			continue
+		}
+		k := key{s.Subject, s.Action}
+		if j, ok := kept[k]; !ok || specs[j].NotBefore.Before(*s.NotBefore) {
+			kept[k] = i
+		}
+	}
+	var cols struct {
+		ids                []TaskID
+		subjects, actions  []string
+		notBefore, expires []*time.Time
+		args               [][]byte
+		nodes              []*string
+		replaceable        []bool
+	}
+	for i, s := range specs {
+		if s.Replace {
+			j := kept[key{s.Subject, s.Action}]
+			ids[i] = ids[j]
+			if j != i {
+				continue
+			}
+		}
+		cols.ids = append(cols.ids, ids[i])
+		cols.subjects = append(cols.subjects, s.Subject)
+		cols.actions = append(cols.actions, s.Action)
+		cols.notBefore = append(cols.notBefore, s.NotBefore)
+		cols.expires = append(cols.expires, s.Expires)
+		cols.args = append(cols.args, s.Args)
+		cols.nodes = append(cols.nodes, s.Node)
+		cols.replaceable = append(cols.replaceable, s.Replace)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO `+q.tasks+` AS t (id, subject, action, not_before, expires, args, sync, node, replaceable)
+	SELECT u.id, u.subject, u.action, u.not_before, u.expires, u.args, false, u.node, u.replaceable
+	FROM unnest($1::uuid[], $2::text[], $3::text[], $4::timestamptz[], $5::timestamptz[], $6::bytea[], $7::text[], $8::boolean[])
+		WITH ORDINALITY AS u(id, subject, action, not_before, expires, args, node, replaceable, i)
+	ORDER BY u.i
+	ON CONFLICT (subject, action) WHERE state = 'pending' AND replaceable AND started IS NULL
+	DO UPDATE SET id = EXCLUDED.id, seq = DEFAULT, created = EXCLUDED.created,
+		not_before = EXCLUDED.not_before, expires = EXCLUDED.expires, args = EXCLUDED.args,
+		node = EXCLUDED.node
+	WHERE t.not_before < EXCLUDED.not_before`,
+		cols.ids, cols.subjects, cols.actions, cols.notBefore, cols.expires, cols.args, cols.nodes, cols.replaceable); err != nil {
+		return nil, fmt.Errorf("submit %d %s tasks: %w", len(cols.ids), q.name, err)
+	}
+	return ids, nil
+}
+
 type execer interface {
 	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
 }

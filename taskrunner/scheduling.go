@@ -175,31 +175,32 @@ func (ex *Exec) Cancel(ctx context.Context, queueName string, id TaskID) error {
 	return nil
 }
 
-// cancelPending cancels the subject's unstarted pending tasks of an action,
-// returning their IDs, and reports whether one of them has started and is
-// running. Both read the same snapshot, which the update does not change for
-// a running task.
+// cancelPending cancels the unstarted pending tasks of an action on any of
+// the subjects $1, returning their IDs, and the subjects among them with one
+// that has started and is running. Both read the same snapshot, which the
+// update does not change for a running task.
 const cancelPending = `WITH cancelled AS (
 		UPDATE %[1]s SET state = 'cancelled', finished = now()
-		WHERE subject = $1 AND action = $2 AND state = 'pending' AND started IS NULL
+		WHERE subject = ANY($1) AND action = $2 AND state = 'pending' AND started IS NULL
 		RETURNING id)
 	SELECT coalesce((SELECT array_agg(id) FROM cancelled), '{}'),
-		EXISTS (SELECT 1 FROM %[1]s
-			WHERE subject = $1 AND action = $2 AND state = 'pending' AND started IS NOT NULL)`
+		coalesce((SELECT array_agg(DISTINCT subject) FROM %[1]s
+			WHERE subject = ANY($1) AND action = $2 AND state = 'pending' AND started IS NOT NULL), '{}')`
 
-// CancelPending cancels every pending task with the subject and action that
-// has not started, as Cancel does by ID, and returns how many it cancelled.
-// running reports that one with them has started and still runs: it cannot be
-// cancelled, and a caller that needed it not to run must wait for it or try
-// again later.
-func (r *Runner) CancelPending(ctx context.Context, queueName, subject, action string) (cancelled int, running bool, err error) {
+// CancelPending cancels every pending task of the action on the subjects that
+// has not started, as Cancel does by ID, in one statement however many
+// subjects there are, and returns how many it cancelled. running lists, in the
+// order given, the subjects with one that has started and still runs: it
+// cannot be cancelled, and a caller that needed it not to run must wait for it
+// or try again later.
+func (r *Runner) CancelPending(ctx context.Context, queueName string, subjects []string, action string) (cancelled int, running []string, err error) {
 	q, ok := r.byName[queueName]
 	if !ok {
-		return 0, false, fmt.Errorf("task runner: unknown queue %q", queueName)
+		return 0, nil, fmt.Errorf("task runner: unknown queue %q", queueName)
 	}
-	ids, running, err := cancelPendingIn(ctx, r.db, q, subject, action)
+	ids, running, err := cancelPendingIn(ctx, r.db, q, subjects, action)
 	if err != nil {
-		return 0, false, err
+		return 0, nil, err
 	}
 	r.finished(ids...)
 	return len(ids), running, nil
@@ -207,22 +208,41 @@ func (r *Runner) CancelPending(ctx context.Context, queueName, subject, action s
 
 // CancelPendingTx is CancelPending inside tx, so the cancel commits or rolls
 // back with the caller's own writes.
-func (r *Runner) CancelPendingTx(ctx context.Context, tx pgx.Tx, queueName, subject, action string) (cancelled int, running bool, err error) {
+func (r *Runner) CancelPendingTx(ctx context.Context, tx pgx.Tx, queueName string, subjects []string, action string) (cancelled int, running []string, err error) {
 	q, ok := r.byName[queueName]
 	if !ok {
-		return 0, false, fmt.Errorf("task runner: unknown queue %q", queueName)
+		return 0, nil, fmt.Errorf("task runner: unknown queue %q", queueName)
 	}
-	ids, running, err := cancelPendingIn(ctx, tx, q, subject, action)
+	ids, running, err := cancelPendingIn(ctx, tx, q, subjects, action)
 	return len(ids), running, err
 }
 
-func cancelPendingIn(ctx context.Context, db Querier, q *queue, subject, action string) ([]TaskID, bool, error) {
+func cancelPendingIn(ctx context.Context, db Querier, q *queue, subjects []string, action string) ([]TaskID, []string, error) {
 	var ids []TaskID
-	var running bool
-	if err := db.QueryRow(ctx, fmt.Sprintf(cancelPending, q.tasks), subject, action).Scan(&ids, &running); err != nil {
-		return nil, false, fmt.Errorf("cancel %s %s.%s: %w", subject, q.name, action, err)
+	var running []string
+	if err := db.QueryRow(ctx, fmt.Sprintf(cancelPending, q.tasks), subjects, action).Scan(&ids, &running); err != nil {
+		return nil, nil, fmt.Errorf("cancel %s.%s: %w", q.name, action, err)
 	}
-	return ids, running, nil
+	return ids, inOrder(subjects, running), nil
+}
+
+// inOrder returns the members of found in the order they appear in subjects.
+func inOrder(subjects, found []string) []string {
+	if len(found) == 0 {
+		return nil
+	}
+	have := make(map[string]bool, len(found))
+	for _, s := range found {
+		have[s] = true
+	}
+	out := make([]string, 0, len(found))
+	for _, s := range subjects {
+		if have[s] {
+			out = append(out, s)
+			delete(have, s)
+		}
+	}
+	return out
 }
 
 // Pending returns the pending tasks of the action, running or not, on each of
