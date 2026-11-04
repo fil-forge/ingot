@@ -17,7 +17,9 @@ var queueSchema = []func(q *queue) string{
 CREATE TABLE %[1]s (
 	seq        bigint GENERATED ALWAYS AS IDENTITY UNIQUE,
 	id         uuid PRIMARY KEY,
-	subject    text NOT NULL,
+	-- Subjects are identifiers compared byte by byte, so the pending index
+	-- serves Expedite's prefix match.
+	subject    text COLLATE "C" NOT NULL,
 	action     text NOT NULL,
 	created    timestamptz NOT NULL DEFAULT clock_timestamp(),
 	not_before timestamptz,
