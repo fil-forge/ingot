@@ -200,3 +200,55 @@ func TestASubjectEndingInAStarIsRefused(t *testing.T) {
 		t.Fatal("a subject ending in * was accepted")
 	}
 }
+
+// Pending returns each subject's pending tasks of the action, delayed, due or
+// running, oldest first, and changes nothing.
+func TestPendingReportsSubjectsWithWorkLeft(t *testing.T) {
+	// One worker to hold the running task, one to finish the others.
+	f := newFixture(t, 2)
+	started, release := make(chan struct{}), make(chan struct{})
+	f.handle(t, qTop, "release", func(_ context.Context, _ *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
+		if task.Subject == "sp/running" {
+			close(started)
+			<-release
+		}
+		return nil, nil
+	})
+	f.handle(t, qTop, "expire", func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) { return nil, nil })
+	f.start(t)
+	ctx := waitCtx(t)
+	later := time.Now().Add(time.Hour)
+	submit := func(subject, action string, at *time.Time) taskrunner.TaskID {
+		t.Helper()
+		id, err := f.r.Submit(ctx, taskrunner.Spec{Queue: qTop, Subject: subject, Action: action, NotBefore: at})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	running := submit("sp/running", "release", nil)
+	<-started
+	delayed := submit("sp/delayed", "release", &later)
+	alsoDelayed := submit("sp/delayed", "release", &later)
+	done := submit("sp/done", "release", nil)
+	if _, err := f.r.Wait(ctx, qTop, done); err != nil {
+		t.Fatal(err)
+	}
+	submit("sp/other-action", "expire", &later)
+
+	got, err := f.r.Pending(ctx, qTop, []string{"sp/none", "sp/delayed", "sp/done", "sp/running", "sp/other-action"}, "release")
+	close(release)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string][]taskrunner.TaskID{"sp/delayed": {delayed, alsoDelayed}, "sp/running": {running}}
+	if len(got) != len(want) || !slices.Equal(got["sp/delayed"], want["sp/delayed"]) || !slices.Equal(got["sp/running"], want["sp/running"]) {
+		t.Fatalf("Pending = %v, want %v", got, want)
+	}
+	if f.state(t, qTop, delayed) != "pending" {
+		t.Error("Pending changed the delayed task")
+	}
+	if _, err := f.r.Wait(ctx, qTop, running); err != nil {
+		t.Fatal(err)
+	}
+}

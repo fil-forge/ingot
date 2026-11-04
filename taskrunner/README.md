@@ -217,6 +217,16 @@ if err == nil && running {
 n, running, err = r.CancelPendingTx(ctx, tx, "queue-space-shard", subject, "release")
 ```
 
+A caller that must leave such work alone, or wait for it, rather than take it over, asks the queue what is left. `Pending` returns the pending tasks of the action on each of the given subjects that has any, delayed, due or running, oldest first, and changes nothing.
+
+```go
+// Which of these blobs still have a release to come?
+releasing, err := r.Pending(ctx, "queue-space-shard", subjects, "release")
+if len(releasing[subject]) > 0 {
+	// Leave this blob to its release.
+}
+```
+
 ## Running delayed work now
 
 `Expedite` makes a subject's pending tasks of an action due now, whatever their `NotBefore`, and returns them all for the caller to wait on. A subject ending in `*` stands for every subject that starts with what comes before it, which is why a submitted subject may not end in `*`. A bucket delete uses that to run its space's pending releases before the space goes. A task it brings forward can no longer be replaced, so nothing pushes it back again. A task waiting to retry keeps its backoff.

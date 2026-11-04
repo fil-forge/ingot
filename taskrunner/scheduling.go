@@ -225,6 +225,38 @@ func cancelPendingIn(ctx context.Context, db Querier, q *queue, subject, action 
 	return ids, running, nil
 }
 
+// Pending returns the pending tasks of the action, running or not, on each of
+// subjects that has any, oldest first. A subject with none is left out. It
+// reads and changes nothing else: it is for a caller that must leave alone
+// work the queue still has to do, or wait for it, where CancelPending is for
+// one that takes the work over.
+func (r *Runner) Pending(ctx context.Context, queueName string, subjects []string, action string) (map[string][]TaskID, error) {
+	q, ok := r.byName[queueName]
+	if !ok {
+		return nil, fmt.Errorf("task runner: unknown queue %q", queueName)
+	}
+	rows, err := r.db.Query(ctx, `SELECT subject, id FROM `+q.tasks+`
+		WHERE subject = ANY($1) AND action = $2 AND state = 'pending'
+		ORDER BY seq`, subjects, action)
+	if err != nil {
+		return nil, fmt.Errorf("pending %s.%s: %w", queueName, action, err)
+	}
+	defer rows.Close()
+	out := map[string][]TaskID{}
+	for rows.Next() {
+		var subject string
+		var id TaskID
+		if err := rows.Scan(&subject, &id); err != nil {
+			return nil, fmt.Errorf("pending %s.%s: %w", queueName, action, err)
+		}
+		out[subject] = append(out[subject], id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("pending %s.%s: %w", queueName, action, err)
+	}
+	return out, nil
+}
+
 // expedite makes the pending tasks of an action whose subject matches $1 due
 // now, and returns every pending task of the action that matches, oldest first.
 // $1 is a LIKE pattern: the subject itself with its wildcards escaped, or a
