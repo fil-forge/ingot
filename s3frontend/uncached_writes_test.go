@@ -8,7 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 
-	"github.com/fil-forge/ingot/inmem"
+	"github.com/fil-forge/ingot/internal/testfakes"
 )
 
 func dropAccepted(d *Deps) { d.DropAcceptedBodies = true }
@@ -25,7 +25,7 @@ func TestDropAcceptedBodies(t *testing.T) {
 		"not cached":        {mods: []func(*Deps){dropAccepted}},
 	} {
 		t.Run(name, func(t *testing.T) {
-			b, _ := newDeferredBackend(t, inmem.NopUploader{}, tc.mods...)
+			b, _ := newDeferredBackend(t, testfakes.NopUploader{}, tc.mods...)
 			putObj(t, b, "k", testBody(1<<10))
 			d := blobDigestOf(t, b, "k", "")
 
@@ -58,7 +58,7 @@ func TestDropAcceptedBodiesStreamed(t *testing.T) {
 // provider accepts at once (the no-op uploader's parks come back with a
 // location) keeps no local copy from UploadPart on, and Complete leaves none.
 func TestDropAcceptedBodiesMultipart(t *testing.T) {
-	b, mem := newDeferredBackend(t, inmem.NopUploader{}, dropAccepted)
+	b, mem := newDeferredBackend(t, testfakes.NopUploader{}, dropAccepted)
 	key := "mp"
 	uploadID := mpCreate(t, b, key, "", "")
 	out, err := mpUploadPart(t, b, key, uploadID, 1, testBody(int(backend.MinPartSize)), nil)
@@ -80,7 +80,7 @@ func TestDropAcceptedBodiesMultipart(t *testing.T) {
 // "accepted" reason.
 func TestDropAcceptedBodiesCountsRemovals(t *testing.T) {
 	reader := sdkmetric.NewManualReader()
-	b, _ := newDeferredBackend(t, inmem.NopUploader{}, dropAccepted, meteredBackend(reader))
+	b, _ := newDeferredBackend(t, testfakes.NopUploader{}, dropAccepted, meteredBackend(reader))
 	data := testBody(1 << 10)
 	putObj(t, b, "k", data)
 

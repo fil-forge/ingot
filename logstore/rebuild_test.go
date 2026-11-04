@@ -15,26 +15,32 @@ import (
 	"testing"
 	"time"
 
-	"github.com/fil-forge/ucantone/did"
+	"github.com/fil-forge/libforge/testutil"
 	block "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/multiformats/go-multihash"
 	"go.uber.org/zap/zaptest"
 
 	"github.com/fil-forge/ingot/blockstore"
-	"github.com/fil-forge/ingot/inmem"
+	"github.com/fil-forge/ingot/internal/pgtest"
 	"github.com/fil-forge/ingot/logstore"
 	"github.com/fil-forge/ingot/registry"
 )
 
-// shipRecorder is a FlushFunc source that records the seqs it shipped.
+// shipRecorder is a FlushFunc source that records the seqs it shipped. With
+// refuse set every flush fails, so nothing ships.
 type shipRecorder struct {
-	mu   sync.Mutex
-	seqs map[uint64]bool
+	mu     sync.Mutex
+	seqs   map[uint64]bool
+	refuse bool
 }
 
 func (r *shipRecorder) forBucket(string) logstore.FlushFunc {
 	return func(_ context.Context, seg *logstore.Segment) (multihash.Multihash, error) {
+		if r.refuse {
+			return nil, errors.New("flush refused")
+		}
 		r.mu.Lock()
 		defer r.mu.Unlock()
 		if r.seqs == nil {
@@ -71,17 +77,53 @@ func openRebuildManager(t *testing.T, dir string, meta logstore.Meta, ship *ship
 	return m, err
 }
 
+// pgMeta is the segment metadata a rebuild runs against: the Postgres
+// registry on a fresh database, which also serves the journal reads the
+// tests check.
+type pgMeta struct {
+	*registry.Postgres
+	pool *pgxpool.Pool
+}
+
+func newPGMeta(t *testing.T) *pgMeta {
+	t.Helper()
+	pool := pgtest.New(t)
+	return &pgMeta{Postgres: registry.NewPostgres(pool), pool: pool}
+}
+
+// JournaledBlocks returns the journal's blocks under segment, by CID.
+func (m *pgMeta) JournaledBlocks(t *testing.T, segment uint64) map[string][]byte {
+	t.Helper()
+	rows, err := m.pool.Query(context.Background(), `SELECT cid, data FROM ingot.catalog_journal WHERE seq = $1`, int64(segment))
+	if err != nil {
+		t.Fatalf("read journal: %v", err)
+	}
+	defer rows.Close()
+	out := map[string][]byte{}
+	for rows.Next() {
+		var c, data []byte
+		if err := rows.Scan(&c, &data); err != nil {
+			t.Fatalf("read journal: %v", err)
+		}
+		out[string(c)] = data
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("read journal: %v", err)
+	}
+	return out
+}
+
 // journalSegment opens segment rows for bucket in mem and journals n blocks
 // under it through a root commit, as a write does, without writing any
 // segment file: the state a lost data volume leaves behind.
-func journalSegment(t *testing.T, mem *inmem.MemStore, bucket string, n int) (uint64, []block.Block) {
+func journalSegment(t *testing.T, mem *pgMeta, bucket string, n int) (uint64, []block.Block) {
 	t.Helper()
 	return journalSegmentPadded(t, mem, bucket, n, 64)
 }
 
 // journalSegmentPadded is journalSegment with pad bytes of filler in each
 // block.
-func journalSegmentPadded(t *testing.T, mem *inmem.MemStore, bucket string, n, pad int) (uint64, []block.Block) {
+func journalSegmentPadded(t *testing.T, mem *pgMeta, bucket string, n, pad int) (uint64, []block.Block) {
 	t.Helper()
 	ctx := context.Background()
 	seq, err := mem.NextSegmentSeq(ctx)
@@ -150,8 +192,8 @@ func onDiskSeqs(t *testing.T, dir, bucket string) map[uint64]bool {
 // is retired, as recovery treats any fileless row.
 func TestRebuild_WipedVolume(t *testing.T) {
 	ctx := context.Background()
-	mem := inmem.NewMemStore()
-	if err := mem.Create(ctx, "bk", did.Undef, registry.CreateState{}); err != nil {
+	mem := newPGMeta(t)
+	if err := mem.Create(ctx, "bk", testutil.RandomDID(t), registry.CreateState{Tenant: testutil.RandomDID(t)}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	sealedSeq, sealedBlocks := journalSegment(t, mem, "bk", 10)
@@ -170,7 +212,7 @@ func TestRebuild_WipedVolume(t *testing.T) {
 	requireReadable(t, m, append(sealedBlocks, openBlocks...))
 
 	for _, lost := range []uint64{sealedSeq, openSeq} {
-		if rows := mem.JournaledBlocks(lost); len(rows) != 0 {
+		if rows := mem.JournaledBlocks(t, lost); len(rows) != 0 {
 			t.Fatalf("%d journal rows still under lost segment %d", len(rows), lost)
 		}
 	}
@@ -232,8 +274,8 @@ func TestRebuild_WipedVolume(t *testing.T) {
 // next lost segment.
 func TestRebuild_SegmentsStayUnderSealBytes(t *testing.T) {
 	ctx := context.Background()
-	mem := inmem.NewMemStore()
-	if err := mem.Create(ctx, "bk", did.Undef, registry.CreateState{}); err != nil {
+	mem := newPGMeta(t)
+	if err := mem.Create(ctx, "bk", testutil.RandomDID(t), registry.CreateState{Tenant: testutil.RandomDID(t)}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	// Each lost segment's blocks fill most of a rebuilt one, so the next
@@ -261,8 +303,8 @@ func TestRebuild_SegmentsStayUnderSealBytes(t *testing.T) {
 // gone (an older recovery deleted it) is found from the journal alone.
 func TestRebuild_JournalOnlyBucket(t *testing.T) {
 	ctx := context.Background()
-	mem := inmem.NewMemStore()
-	if err := mem.Create(ctx, "bk", did.Undef, registry.CreateState{}); err != nil {
+	mem := newPGMeta(t)
+	if err := mem.Create(ctx, "bk", testutil.RandomDID(t), registry.CreateState{Tenant: testutil.RandomDID(t)}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	seq, blocks := journalSegment(t, mem, "bk", 5)
@@ -283,7 +325,7 @@ func TestRebuild_JournalOnlyBucket(t *testing.T) {
 // failSecondMove fails the second MoveJournal, as a crash between a page's
 // fsync and its journal move would leave things.
 type failSecondMove struct {
-	*inmem.MemStore
+	*pgMeta
 	calls int
 }
 
@@ -291,7 +333,7 @@ func (f *failSecondMove) MoveJournal(ctx context.Context, bucket string, from, t
 	if f.calls++; f.calls == 2 {
 		return errors.New("injected move failure")
 	}
-	return f.MemStore.MoveJournal(ctx, bucket, from, to, first, last)
+	return f.pgMeta.MoveJournal(ctx, bucket, from, to, first, last)
 }
 
 // TestRebuild_ResumesAfterFailure: a rebuild that fails partway leaves the
@@ -301,8 +343,8 @@ func (f *failSecondMove) MoveJournal(ctx context.Context, bucket string, from, t
 // row under a segment that is on disk.
 func TestRebuild_ResumesAfterFailure(t *testing.T) {
 	ctx := context.Background()
-	mem := inmem.NewMemStore()
-	if err := mem.Create(ctx, "bk", did.Undef, registry.CreateState{}); err != nil {
+	mem := newPGMeta(t)
+	if err := mem.Create(ctx, "bk", testutil.RandomDID(t), registry.CreateState{Tenant: testutil.RandomDID(t)}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	lost, blocks := journalSegment(t, mem, "bk", 600)
@@ -310,11 +352,11 @@ func TestRebuild_ResumesAfterFailure(t *testing.T) {
 
 	// Two starts fail partway, each leaving an open segment behind.
 	for range 2 {
-		if _, err := openRebuildManager(t, dir, &failSecondMove{MemStore: mem}, &shipRecorder{}); err == nil {
+		if _, err := openRebuildManager(t, dir, &failSecondMove{pgMeta: mem}, &shipRecorder{}); err == nil {
 			t.Fatal("OpenManager with a failing move succeeded; the test proves nothing")
 		}
 	}
-	if rows := mem.JournaledBlocks(lost); len(rows) == 0 || len(rows) == len(blocks) {
+	if rows := mem.JournaledBlocks(t, lost); len(rows) == 0 || len(rows) == len(blocks) {
 		t.Fatalf("%d of %d rows under the lost segment after the failure, want some moved and some not", len(rows), len(blocks))
 	}
 
@@ -323,7 +365,7 @@ func TestRebuild_ResumesAfterFailure(t *testing.T) {
 		t.Fatalf("OpenManager after the failure: %v", err)
 	}
 	requireReadable(t, m, blocks)
-	if rows := mem.JournaledBlocks(lost); len(rows) != 0 {
+	if rows := mem.JournaledBlocks(t, lost); len(rows) != 0 {
 		t.Fatalf("%d journal rows still under the lost segment", len(rows))
 	}
 	onDisk := onDiskSeqs(t, dir, "bk")
@@ -345,7 +387,7 @@ func TestRebuild_ResumesAfterFailure(t *testing.T) {
 func TestOpenManager_SeqPastDisk(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
-	ahead := inmem.NewMemStore()
+	ahead := newPGMeta(t)
 	m, err := openRebuildManager(t, dir, ahead, &shipRecorder{})
 	if err != nil {
 		t.Fatalf("OpenManager: %v", err)
@@ -382,7 +424,7 @@ func TestOpenManager_SeqPastDisk(t *testing.T) {
 		t.Fatal("no segment on disk; the test proves nothing")
 	}
 
-	behind := inmem.NewMemStore()
+	behind := newPGMeta(t)
 	m2, err := openRebuildManager(t, dir, behind, &shipRecorder{})
 	if err != nil {
 		t.Fatalf("OpenManager over a Meta behind the disk: %v", err)
@@ -411,11 +453,11 @@ func TestOpenManager_SeqPastDisk(t *testing.T) {
 
 // sealedSegments writes one block per segment into bucket "bk" under dir,
 // through a manager over mem, and returns the blocks once every segment has
-// sealed and the manager is closed.
-func sealedSegments(t *testing.T, dir string, mem *inmem.MemStore, n int) []block.Block {
+// sealed, none shipped, and the manager is closed.
+func sealedSegments(t *testing.T, dir string, mem *pgMeta, n int) []block.Block {
 	t.Helper()
 	ctx := context.Background()
-	m, err := openRebuildManager(t, dir, mem, &shipRecorder{})
+	m, err := openRebuildManager(t, dir, mem, &shipRecorder{refuse: true})
 	if err != nil {
 		t.Fatalf("OpenManager: %v", err)
 	}
@@ -459,14 +501,14 @@ func sortedSeqs(seqs map[uint64]bool) []uint64 {
 func TestRecover_MetaBehindAnOpenRow(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
-	written := sealedSegments(t, dir, inmem.NewMemStore(), 2)
+	written := sealedSegments(t, dir, newPGMeta(t), 2)
 	seqs := sortedSeqs(onDiskSeqs(t, dir, "bk"))
 	a, b := seqs[0], seqs[1]
 	// B was still open at the crash: no .idx.
 	if err := os.Remove(filepath.Join(dir, "bk", blockstore.PlaneCatalog.String(), fmt.Sprintf("seg-%020d.idx", b))); err != nil {
 		t.Fatalf("remove B's .idx: %v", err)
 	}
-	behind := inmem.NewMemStore()
+	behind := newPGMeta(t)
 	if err := behind.InsertSegmentOpen(ctx, blockstore.PlaneCatalog, a, "bk"); err != nil {
 		t.Fatalf("InsertSegmentOpen: %v", err)
 	}
@@ -498,7 +540,7 @@ func TestRecover_MetaBehindAnOpenRow(t *testing.T) {
 func TestRecover_RetiredFilesReappear(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
-	mem := inmem.NewMemStore()
+	mem := newPGMeta(t)
 	sealedSegments(t, dir, mem, 1)
 	seq := sortedSeqs(onDiskSeqs(t, dir, "bk"))[0]
 	index := multihash.Multihash("retired-index")
@@ -534,7 +576,7 @@ func TestRecover_RetiredFilesReappear(t *testing.T) {
 func TestRecover_UnshippedRetiredFileReappears(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
-	mem := inmem.NewMemStore()
+	mem := newPGMeta(t)
 	written := sealedSegments(t, dir, mem, 1)
 	seq := sortedSeqs(onDiskSeqs(t, dir, "bk"))[0]
 	// Sealed but never shipped, whatever the manager above got to.
@@ -579,7 +621,7 @@ func TestRecover_UnshippedRetiredFileReappears(t *testing.T) {
 func TestRecover_UnshippedRetiredCARWithoutIdx(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
-	mem := inmem.NewMemStore()
+	mem := newPGMeta(t)
 	written := sealedSegments(t, dir, mem, 1)
 	seq := sortedSeqs(onDiskSeqs(t, dir, "bk"))[0]
 	rows, err := mem.ListSegments(ctx, blockstore.PlaneCatalog, "bk")
@@ -637,12 +679,12 @@ func TestRecover_UnshippedRetiredCARWithoutIdx(t *testing.T) {
 // failing the start.
 func TestRecover_UnreadableIdx(t *testing.T) {
 	dir := t.TempDir()
-	written := sealedSegments(t, dir, inmem.NewMemStore(), 1)
+	written := sealedSegments(t, dir, newPGMeta(t), 1)
 	seq := sortedSeqs(onDiskSeqs(t, dir, "bk"))[0]
 	if err := os.WriteFile(filepath.Join(dir, "bk", blockstore.PlaneCatalog.String(), fmt.Sprintf("seg-%020d.idx", seq)), nil, 0o644); err != nil {
 		t.Fatalf("truncate .idx: %v", err)
 	}
-	m, err := openRebuildManager(t, dir, inmem.NewMemStore(), &shipRecorder{})
+	m, err := openRebuildManager(t, dir, newPGMeta(t), &shipRecorder{})
 	if err != nil {
 		t.Fatalf("OpenManager over an unreadable .idx: %v", err)
 	}
@@ -665,7 +707,7 @@ func TestRecover_SealedRowWithoutIdx(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
 			dir := t.TempDir()
-			mem := inmem.NewMemStore()
+			mem := newPGMeta(t)
 			written := sealedSegments(t, dir, mem, 1)
 			seq := sortedSeqs(onDiskSeqs(t, dir, "bk"))[0]
 			rows, err := mem.ListSegments(ctx, blockstore.PlaneCatalog, "bk")
@@ -723,7 +765,7 @@ func TestRecover_SealedRowWithoutIdx(t *testing.T) {
 func TestRecover_SealedRowWithoutIdxOrOps(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
-	mem := inmem.NewMemStore()
+	mem := newPGMeta(t)
 	written := sealedSegments(t, dir, mem, 1)
 	seq := sortedSeqs(onDiskSeqs(t, dir, "bk"))[0]
 	rows, err := mem.ListSegments(ctx, blockstore.PlaneCatalog, "bk")
@@ -776,7 +818,7 @@ func TestRecover_SealedRowDamagedCAR(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
 			dir := t.TempDir()
-			mem := inmem.NewMemStore()
+			mem := newPGMeta(t)
 			written := sealedSegments(t, dir, mem, 1)
 			seq := sortedSeqs(onDiskSeqs(t, dir, "bk"))[0]
 			rows, err := mem.ListSegments(ctx, blockstore.PlaneCatalog, "bk")
@@ -792,7 +834,7 @@ func TestRecover_SealedRowDamagedCAR(t *testing.T) {
 				t.Fatalf("RehydrateSegment: %v", err)
 			}
 			if tc.journaled {
-				if err := mem.Create(ctx, "bk", did.Undef, registry.CreateState{}); err != nil {
+				if err := mem.Create(ctx, "bk", testutil.RandomDID(t), registry.CreateState{Tenant: testutil.RandomDID(t)}); err != nil {
 					t.Fatalf("Create bk: %v", err)
 				}
 				st, err := mem.Get(ctx, "bk")
@@ -853,13 +895,13 @@ func TestRecover_SealedRowDamagedCAR(t *testing.T) {
 // disk), are both rebuilt and force-sealed rather than failing the start.
 func TestRecover_SeveralOpenSegments(t *testing.T) {
 	dir := t.TempDir()
-	written := sealedSegments(t, dir, inmem.NewMemStore(), 2)
+	written := sealedSegments(t, dir, newPGMeta(t), 2)
 	for seq := range onDiskSeqs(t, dir, "bk") {
 		if err := os.Remove(filepath.Join(dir, "bk", blockstore.PlaneCatalog.String(), fmt.Sprintf("seg-%020d.idx", seq))); err != nil {
 			t.Fatalf("remove .idx: %v", err)
 		}
 	}
-	m, err := openRebuildManager(t, dir, inmem.NewMemStore(), &shipRecorder{})
+	m, err := openRebuildManager(t, dir, newPGMeta(t), &shipRecorder{})
 	if err != nil {
 		t.Fatalf("OpenManager over two open segments: %v", err)
 	}

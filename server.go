@@ -42,8 +42,9 @@ import (
 
 // ServerDeps bundles the runtime collaborators of an ingot Server
 // behind interfaces. Production wiring uses Forge / Internal /
-// Postgres; tests can substitute in-memory equivalents without
-// standing up Postgres, piri, or the indexing-service.
+// Postgres; tests run the registry on Postgres and substitute fakes for the
+// network (internal/testfakes), without standing up piri or the
+// indexing-service.
 type ServerDeps struct {
 	// Logger is optional; defaults to zap.NewNop().
 	Logger *zap.Logger
@@ -78,8 +79,8 @@ type ServerDeps struct {
 	Registrar uploader.UploadRegistrar
 	// Tasks runs ingot's durable task queues: New registers the handlers,
 	// Start starts it and Stop stops it. It must be migrated, and be the
-	// runner the Postgres registry queues through (registry.WithTasks). nil
-	// with an in-memory registry, which queues no tasks.
+	// runner the Postgres registry queues through (registry.WithTasks).
+	// Required.
 	Tasks *taskrunner.Runner
 
 	// Authority is the service that authorizes bucket creation and deletion.
@@ -95,7 +96,7 @@ type ServerDeps struct {
 	// retrieved from; Inclusions records each shipped shard's inner-block byte
 	// ranges so retired catalog blocks stay resolvable; GC records superseded
 	// MST/manifest CIDs. Typically all
-	// the same instance as Registry (*registry.Postgres / *inmem.MemStore).
+	// the same instance as Registry (*registry.Postgres).
 	Intents    registry.IntentStore
 	Locations  registry.LocationStore
 	Inclusions registry.InclusionStore
@@ -261,17 +262,15 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		Logger:              logger,
 	})
 
-	if deps.Tasks != nil {
-		if err := backend.RegisterUploadTasks(deps.Tasks); err != nil {
-			_ = backend.CloseMetrics()
-			_ = log.Close(ctx)
-			return nil, fmt.Errorf("ingot: register upload tasks: %w", err)
-		}
-		if err := backend.RegisterShardTasks(deps.Tasks); err != nil {
-			_ = backend.CloseMetrics()
-			_ = log.Close(ctx)
-			return nil, fmt.Errorf("ingot: register shard tasks: %w", err)
-		}
+	if err := backend.RegisterUploadTasks(deps.Tasks); err != nil {
+		_ = backend.CloseMetrics()
+		_ = log.Close(ctx)
+		return nil, fmt.Errorf("ingot: register upload tasks: %w", err)
+	}
+	if err := backend.RegisterShardTasks(deps.Tasks); err != nil {
+		_ = backend.CloseMetrics()
+		_ = log.Close(ctx)
+		return nil, fmt.Errorf("ingot: register shard tasks: %w", err)
 	}
 
 	api, err := buildS3API(ctx, backend, cfg, deps.IAM, deps.Identity, logger)
@@ -303,11 +302,9 @@ func (s *Server) Start(ctx context.Context) error {
 		_ = s.backend.CloseMetrics()
 		return fmt.Errorf("ingot: recover: %w", err)
 	}
-	if s.tasks != nil {
-		if err := s.tasks.Start(ctx); err != nil {
-			_ = s.backend.CloseMetrics()
-			return fmt.Errorf("ingot: start task runner: %w", err)
-		}
+	if err := s.tasks.Start(ctx); err != nil {
+		_ = s.backend.CloseMetrics()
+		return fmt.Errorf("ingot: start task runner: %w", err)
 	}
 	s.logger.Info("starting ingot S3 listener",
 		zap.String("addr", s.cfg.Addr),
@@ -561,13 +558,11 @@ func (s *Server) Stop(ctx context.Context) error {
 	if err := s.api.ShutDown(); err != nil {
 		errs = append(errs, fmt.Errorf("s3api shutdown: %w", err))
 	}
-	if s.tasks != nil {
-		// After the listener, whose requests run sync tasks, and before the
-		// backend drains: a task interrupted here stays queued and resumes
-		// on the next start.
-		if err := s.tasks.Stop(ctx); err != nil {
-			errs = append(errs, fmt.Errorf("task runner stop: %w", err))
-		}
+	// After the listener, whose requests run sync tasks, and before the
+	// backend drains: a task interrupted here stays queued and resumes on the
+	// next start.
+	if err := s.tasks.Stop(ctx); err != nil {
+		errs = append(errs, fmt.Errorf("task runner stop: %w", err))
 	}
 	if err := s.backend.Drain(ctx); err != nil {
 		errs = append(errs, fmt.Errorf("backend drain: %w", err))
@@ -832,6 +827,9 @@ func validateServerInputs(cfg config.ServerConfig, deps ServerDeps) error {
 	}
 	if deps.Parks == nil {
 		return errors.New("ingot: ServerDeps.Parks is required")
+	}
+	if deps.Tasks == nil {
+		return errors.New("ingot: ServerDeps.Tasks is required")
 	}
 	if deps.EncParams == nil {
 		return errors.New("ingot: ServerDeps.EncParams is required")

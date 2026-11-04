@@ -17,7 +17,7 @@ import (
 	"go.uber.org/zap/zaptest"
 
 	"github.com/fil-forge/ingot/blockstore"
-	"github.com/fil-forge/ingot/inmem"
+	"github.com/fil-forge/ingot/internal/testfakes"
 	"github.com/fil-forge/ingot/logstore"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/uploader"
@@ -107,24 +107,12 @@ func (r *recordingRegistrar) count() int {
 	return len(added) - len(retracted)
 }
 
-// drainRegistrations applies what the writes queued, as the
-// queue-space-upload tasks would: in commit order, each run of one op in one
-// round trip. The registrations are queued by the write and applied off the
-// request path, so every assertion below drains first.
+// drainRegistrations waits until the upload queue has sent what the writes
+// queued. The registrations are queued by the write and sent off the request
+// path, so every assertion below drains first.
 func drainRegistrations(t *testing.T, b *Backend) {
 	t.Helper()
-	regs := b.reg.(*inmem.MemStore).TakeUploadRegistrations()
-	for len(regs) > 0 {
-		n := 1
-		for n < len(regs) && regs[n].Op == regs[0].Op {
-			n++
-		}
-		errs, _ := b.sendRegistrations(context.Background(), regs[0].Op, regs[:n], make([]int, n))
-		for _, e := range errs {
-			require.NoError(t, e)
-		}
-		regs = regs[n:]
-	}
+	b.reg.(*testStore).drainUploads(t)
 }
 
 // newCountingBackend mirrors newRefTestBackend but swaps the no-op registrar
@@ -133,7 +121,7 @@ func newCountingBackend(t *testing.T) (*Backend, *recordingRegistrar) {
 	t.Helper()
 	ctx := context.Background()
 	dir := t.TempDir()
-	mem := inmem.NewMemStore()
+	mem := newTestStore(t)
 	cache, err := blockstore.NewBlobCache(filepath.Join(dir, "cache"))
 	if err != nil {
 		t.Fatalf("cache: %v", err)
@@ -162,12 +150,12 @@ func newCountingBackend(t *testing.T) (*Backend, *recordingRegistrar) {
 		GC:              mem,
 		Multipart:       mem,
 		Parks:           mem,
-		Reads:           blockstore.NewLayered(blockstore.LocalBlobs{Cache: cache, Spool: spool}, log, inmem.NopBaseReader{}),
+		Reads:           blockstore.NewLayered(blockstore.LocalBlobs{Cache: cache, Spool: spool}, log, testfakes.NopBaseReader{}),
 		Log:             log,
 		Spool:           spool,
 		Cache:           cache,
-		Uploader:        inmem.NopUploader{},
-		Deferred:        inmem.NopUploader{},
+		Uploader:        testfakes.NopUploader{},
+		Deferred:        testfakes.NopUploader{},
 		Remover:         &recordingRemover{},
 		Registrar:       reg,
 		EncParams:       mem,
@@ -175,6 +163,7 @@ func newCountingBackend(t *testing.T) (*Backend, *recordingRegistrar) {
 		TenantKeys:      testTenantKeys(),
 		PendingReleases: mem,
 	})
+	mem.start(t, b)
 	if err := mem.Create(ctx, "bk", did.Undef, registry.CreateState{}); err != nil {
 		t.Fatalf("create bucket: %v", err)
 	}

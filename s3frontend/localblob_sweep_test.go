@@ -19,15 +19,15 @@ import (
 	"github.com/fil-forge/libforge/testutil"
 	"github.com/fil-forge/versitygw/s3response"
 
-	"github.com/fil-forge/ingot/inmem"
+	"github.com/fil-forge/ingot/internal/testfakes"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ucantone/did"
 )
 
 // These tests drive SweepLocalBlobs over a real on-disk spool and cache. The
 // backend has no task queues, so a held blob moves into the cache directly.
-// inmem.NopUploader records a location for every blob, and
-// inmem.NopBaseReader cannot serve an evicted body, so they assert which files
+// testfakes.NopUploader records a location for every blob, and
+// testfakes.NopBaseReader cannot serve an evicted body, so they assert which files
 // remain and never read an evicted object back; the network read of an evicted
 // blob is covered by the itest.
 
@@ -35,9 +35,9 @@ const sweepBucket = "sweep"
 
 // newSweepBackend returns a backend over an on-disk spool with a bucket that
 // has a space and a tenant.
-func newSweepBackend(t *testing.T, mods ...func(*Deps)) (*Backend, *inmem.MemStore) {
+func newSweepBackend(t *testing.T, mods ...func(*Deps)) (*Backend, *testStore) {
 	t.Helper()
-	b, mem := newDeferredBackend(t, inmem.NopUploader{}, mods...)
+	b, mem := newDeferredBackend(t, testfakes.NopUploader{}, mods...)
 	if err := mem.Create(t.Context(), sweepBucket, testutil.RandomDID(t), registry.CreateState{Tenant: testutil.RandomDID(t)}); err != nil {
 		t.Fatalf("create bucket: %v", err)
 	}
@@ -45,7 +45,7 @@ func newSweepBackend(t *testing.T, mods ...func(*Deps)) (*Backend, *inmem.MemSto
 }
 
 // sweepSpace is the sweep bucket's space, which its intents and parks carry.
-func sweepSpace(t *testing.T, mem *inmem.MemStore) did.DID {
+func sweepSpace(t *testing.T, mem *testStore) did.DID {
 	t.Helper()
 	st, err := mem.Get(t.Context(), sweepBucket)
 	if err != nil {

@@ -31,9 +31,8 @@
 // -> Stop over the fx lifecycle. Module layers the production providers (the
 // Postgres registry, the Forge reader, the sprue uploader, the hilt
 // client/IAM) and a migration pre-start hook on top. A test harness, by
-// contrast, includes ServerModule directly and supplies in-memory fakes for
-// the same seams — so both paths construct the Server through identical
-// wiring.
+// contrast, includes ServerModule directly and supplies fakes for the same
+// seams — so both paths construct the Server through identical wiring.
 //
 // # Using ingot without fx
 //
@@ -138,7 +137,7 @@ func Module(cfg config.Config) fx.Option {
 // embedded S3 Server from a ServerConfig, a *zap.Logger, the four collaborator
 // interfaces, and any registered PreStartHooks. It is exported so a test
 // harness (or an alternative host) can supply its own implementations of the
-// collaborators — in-memory fakes, say — and still construct the Server through
+// collaborators — fakes of the network, say — and still construct the Server through
 // exactly the wiring production uses. Module supplies the production
 // implementations on top of this.
 var ServerModule = fx.Module("ingot-server",
@@ -147,7 +146,7 @@ var ServerModule = fx.Module("ingot-server",
 
 // serverParams are the inputs ServerModule binds the server's start/stop hooks
 // over. The collaborators are interfaces, so any provider satisfying them
-// (production's Postgres + Forge, or a harness's in-memory fakes) wires in.
+// (production's Postgres + Forge, or a harness's fakes) wires in.
 type serverParams struct {
 	fx.In
 
@@ -159,8 +158,7 @@ type serverParams struct {
 	Deferred     uploader.DeferredBodyUploader
 	Remover      uploader.BlobRemover
 	Registrar    uploader.UploadRegistrar
-	// Tasks is optional: an in-memory registry queues no tasks.
-	Tasks *taskrunner.Runner `optional:"true"`
+	Tasks        *taskrunner.Runner
 	// Streaming is optional: without it every body blob is spooled before it
 	// is uploaded (see ServerDeps.Streaming).
 	Streaming       uploader.StreamingBodyUploader `optional:"true"`

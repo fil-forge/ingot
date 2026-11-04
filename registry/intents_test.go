@@ -2,17 +2,13 @@ package registry_test
 
 import (
 	"errors"
-	"os"
 	"reflect"
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/multiformats/go-multihash"
-	"go.uber.org/zap/zaptest"
 
-	"github.com/fil-forge/ingot/inmem"
-	"github.com/fil-forge/ingot/migrations"
+	"github.com/fil-forge/ingot/internal/pgtest"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/libforge/testutil"
 )
@@ -24,36 +20,10 @@ type intentStore interface {
 	registry.ParkStore
 }
 
-// TestIntentQueriesLive runs the intent queries against the in-memory
-// store and, when INGOT_TEST_DSN is set, against Postgres, so the fake the
-// s3frontend tests use is held to the SQL. The Live suffix puts it in CI's
-// live-Postgres job.
+// TestIntentQueriesLive runs the intent queries against Postgres, each case
+// on a database of its own.
 func TestIntentQueriesLive(t *testing.T) {
-	t.Run("inmem", func(t *testing.T) {
-		runIntentSuite(t, func(t *testing.T) intentStore { return inmem.NewMemStore() })
-	})
-	t.Run("postgres", func(t *testing.T) {
-		dsn := os.Getenv("INGOT_TEST_DSN")
-		if dsn == "" {
-			t.Skip("set INGOT_TEST_DSN to run the intent queries against Postgres")
-		}
-		ctx := t.Context()
-		pool, err := pgxpool.New(ctx, dsn)
-		if err != nil {
-			t.Fatalf("connect: %v", err)
-		}
-		t.Cleanup(pool.Close)
-		if err := migrations.Up(ctx, pool, zaptest.NewLogger(t)); err != nil {
-			t.Fatalf("migrations.Up: %v", err)
-		}
-		runIntentSuite(t, func(t *testing.T) intentStore {
-			if _, err := pool.Exec(ctx,
-				`TRUNCATE ingot.upload_intents, ingot.blob_locations, ingot.blob_parks CASCADE`); err != nil {
-				t.Fatalf("truncate: %v", err)
-			}
-			return registry.NewPostgres(pool)
-		})
-	})
+	runIntentSuite(t, func(t *testing.T) intentStore { return registry.NewPostgres(pgtest.New(t)) })
 }
 
 func intentDigest(t *testing.T, s string) multihash.Multihash {

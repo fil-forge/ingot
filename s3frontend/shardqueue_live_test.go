@@ -19,7 +19,6 @@ import (
 	"go.uber.org/zap/zaptest"
 
 	"github.com/fil-forge/ingot/blockstore"
-	"github.com/fil-forge/ingot/inmem"
 	"github.com/fil-forge/ingot/taskrunner"
 	"github.com/fil-forge/ingot/taskrunner/taskrunnertest"
 )
@@ -48,7 +47,7 @@ func newShardFixture(t *testing.T, ttl time.Duration) *shardFixture {
 	require.NoError(t, err)
 	cache, err := blockstore.NewBlobCache(filepath.Join(dir, "cache"))
 	require.NoError(t, err)
-	b := New(Deps{Spool: spool, Cache: cache, Intents: inmem.NewMemStore(), CacheTTL: ttl, Logger: zaptest.NewLogger(t)})
+	b := New(Deps{Spool: spool, Cache: cache, Intents: newTestStore(t), CacheTTL: ttl, Logger: zaptest.NewLogger(t)})
 	require.NoError(t, b.RegisterShardTasks(r))
 	require.NoError(t, r.Migrate(context.Background()))
 	require.NoError(t, r.Start(context.Background()))

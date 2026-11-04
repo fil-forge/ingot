@@ -27,7 +27,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/fil-forge/ingot/blockstore"
-	"github.com/fil-forge/ingot/inmem"
+	"github.com/fil-forge/ingot/internal/testfakes"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/uploader"
 )
@@ -36,7 +36,7 @@ import (
 // It records every allocation, the bytes each PUT received, and what was
 // concluded, uploaded by digest and aborted.
 type streamingUploader struct {
-	inmem.NopUploader
+	testfakes.NopUploader
 
 	// unsupported refuses every allocation by digest code.
 	unsupported bool
@@ -158,7 +158,7 @@ func mustSum(b []byte) multihash.Multihash {
 
 const streamBlobCeiling = 300 << 10
 
-func newStreamingBackend(t *testing.T, su *streamingUploader, mods ...func(*Deps)) (*Backend, *inmem.MemStore) {
+func newStreamingBackend(t *testing.T, su *streamingUploader, mods ...func(*Deps)) (*Backend, *testStore) {
 	t.Helper()
 	return newDeferredBackend(t, su, append([]func(*Deps){func(d *Deps) {
 		d.Streaming = su

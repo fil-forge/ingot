@@ -10,7 +10,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/fil-forge/versitygw/s3response"
 
-	"github.com/fil-forge/ingot/inmem"
 	"github.com/fil-forge/ingot/logstore"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/libforge/testutil"
@@ -109,7 +108,7 @@ func TestExtents_CopyWritesItsOwnExtents(t *testing.T) {
 	// One log per bucket, as in production, so dropping the source bucket's
 	// catalog drops every block only it holds.
 	ctx := context.Background()
-	mem := inmem.NewMemStore()
+	mem := newTestStore(t)
 	logs, err := logstore.OpenManager(ctx, logstore.ManagerConfig{Dir: t.TempDir(), Meta: mem, Logger: zaptest.NewLogger(t)})
 	if err != nil {
 		t.Fatalf("logstore: %v", err)

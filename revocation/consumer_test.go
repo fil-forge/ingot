@@ -15,7 +15,7 @@ import (
 	"github.com/multiformats/go-multihash"
 	"github.com/stretchr/testify/require"
 
-	"github.com/fil-forge/ingot/inmem"
+	"github.com/fil-forge/ingot/internal/pgtest"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/revocation"
 )
@@ -128,7 +128,7 @@ func waitFor(t *testing.T, cond func() bool) {
 func TestConsumerSinceDefaultsToNow(t *testing.T) {
 	now := time.Date(2026, 8, 6, 12, 0, 0, 0, time.UTC)
 	src := &fakeSource{}
-	c := revocation.NewConsumer(src, inmem.NewMemStore(), &fakeInvalidator{},
+	c := revocation.NewConsumer(src, registry.NewPostgres(pgtest.New(t)), &fakeInvalidator{},
 		revocation.WithClock(func() time.Time { return now }))
 	stop := run(c)
 	defer stop()
@@ -140,7 +140,7 @@ func TestConsumerSinceDefaultsToNow(t *testing.T) {
 func TestConsumerResumesFromStoredCursor(t *testing.T) {
 	ctx := context.Background()
 	stored := time.Date(2026, 8, 1, 9, 0, 0, 0, time.UTC)
-	store := inmem.NewMemStore()
+	store := registry.NewPostgres(pgtest.New(t))
 	require.NoError(t, store.PutRevocationCursor(ctx, registry.RevocationCursor{
 		RecordedAt: stored, Revoke: testCid(t, "earlier"),
 	}))
@@ -151,7 +151,7 @@ func TestConsumerResumesFromStoredCursor(t *testing.T) {
 	defer stop()
 
 	waitFor(t, func() bool { return len(src.calls()) == 1 })
-	require.Equal(t, stored, src.calls()[0], "stored cursor wins over now")
+	require.True(t, stored.Equal(src.calls()[0]), "stored cursor wins over now: got %v, want %v", src.calls()[0], stored)
 }
 
 func TestConsumerInvalidatesAndPersistsCursor(t *testing.T) {
@@ -161,7 +161,7 @@ func TestConsumerInvalidatesAndPersistsCursor(t *testing.T) {
 	rec1 := record(t, "dlg-1", at1)
 	rec2 := record(t, "dlg-2", at2)
 
-	store := inmem.NewMemStore()
+	store := registry.NewPostgres(pgtest.New(t))
 	inv := &fakeInvalidator{}
 	src := &fakeSource{scripts: []streamScript{{records: []api.FirehoseRevocation{rec1, rec2}}}}
 	c := revocation.NewConsumer(src, store, inv,
@@ -308,7 +308,7 @@ func TestConsumerReconnectsFromLastRecord(t *testing.T) {
 		// Second connection ends cleanly (server close), forcing a third.
 		{},
 	}}
-	c := revocation.NewConsumer(src, inmem.NewMemStore(), &fakeInvalidator{},
+	c := revocation.NewConsumer(src, registry.NewPostgres(pgtest.New(t)), &fakeInvalidator{},
 		revocation.WithBackoff(time.Millisecond, time.Millisecond))
 	stop := run(c)
 	defer stop()
@@ -321,7 +321,7 @@ func TestConsumerReconnectsFromLastRecord(t *testing.T) {
 
 func TestConsumerStopsOnCancel(t *testing.T) {
 	src := &fakeSource{} // no scripts: Stream blocks until ctx cancel
-	c := revocation.NewConsumer(src, inmem.NewMemStore(), &fakeInvalidator{})
+	c := revocation.NewConsumer(src, registry.NewPostgres(pgtest.New(t)), &fakeInvalidator{})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})

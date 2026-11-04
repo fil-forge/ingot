@@ -184,12 +184,8 @@ func (b *Backend) runShardCache(ctx context.Context, ex *taskrunner.Exec, t task
 }
 
 // evictCached removes a cached copy for the budget pass and returns the bytes
-// freed, through a sync queue-shard.evict task. With no task queues it removes
-// the copy itself.
+// freed, through a sync queue-shard.evict task.
 func (b *Backend) evictCached(ctx context.Context, digest multihash.Multihash) (int64, error) {
-	if b.shards == nil {
-		return b.cache.Remove(digest)
-	}
 	var buf bytes.Buffer
 	if err := (&ShardEvictTask{Budget: true}).MarshalCBOR(&buf); err != nil {
 		return 0, fmt.Errorf("encode evict task: %w", err)

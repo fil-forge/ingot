@@ -109,15 +109,7 @@ func TestMultipartMetrics_ParkedAge(t *testing.T) {
 	}
 
 	// The part as recorded an hour ago, still parked: no acceptor runs yet.
-	part := partRecord(t, mem, uploadID, 1)
-	part.CreatedAt = time.Now().Add(-time.Hour)
-	trees, err := mem.ListPartTrees(ctx, uploadID)
-	if err != nil {
-		t.Fatalf("ListPartTrees: %v", err)
-	}
-	if _, err := mem.PutPart(ctx, part, trees[1]); err != nil {
-		t.Fatalf("PutPart: %v", err)
-	}
+	mem.AgePart(uploadID, 1, time.Hour)
 	if _, err := b.NudgeParkedUploads(ctx); err != nil {
 		t.Fatalf("NudgeParkedUploads: %v", err)
 	}

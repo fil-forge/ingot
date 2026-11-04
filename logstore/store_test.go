@@ -70,7 +70,7 @@ func (f *fakeMeta) EnsureSegmentSeqAbove(_ context.Context, seq uint64) error {
 }
 
 // The fake keeps no journal; rebuild_test.go drives the journal through
-// inmem.MemStore.
+// the Postgres registry.
 func (f *fakeMeta) JournalBuckets(context.Context) ([]string, error)          { return nil, nil }
 func (f *fakeMeta) JournalSegments(context.Context, string) ([]uint64, error) { return nil, nil }
 func (f *fakeMeta) ReadJournal(context.Context, uint64, cid.Cid, int) ([]block.Block, error) {
