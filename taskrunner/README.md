@@ -205,6 +205,33 @@ err = r.CancelTx(ctx, tx, "queue-space-shard", expireID)
 err = r.Cancel(ctx, "queue-space-shard", expireID)
 ```
 
+A caller that knows a task's subject and action but not its ID, such as a write about to reuse a blob whose release is pending, cancels by those instead. `CancelPending` cancels every pending task of the action on the subject that has not started, and says whether one of them is already running, which it cannot cancel and the caller must wait out.
+
+```go
+n, running, err := r.CancelPending(ctx, "queue-space-shard", subject, "release")
+if err == nil && running {
+	// The release is under way: wait for it, or ask the client to retry.
+}
+
+// From your own transaction.
+n, running, err = r.CancelPendingTx(ctx, tx, "queue-space-shard", subject, "release")
+```
+
+## Running delayed work now
+
+`Expedite` makes a subject's pending tasks of an action due now, whatever their `NotBefore`, and returns them all for the caller to wait on. A subject ending in `*` stands for every subject that starts with what comes before it, which is why a submitted subject may not end in `*`. A bucket delete uses that to run its space's pending releases before the space goes. A task it brings forward can no longer be replaced, so nothing pushes it back again. A task waiting to retry keeps its backoff.
+
+```go
+ids, err := r.Expedite(ctx, "queue-space-shard", space+"/*", "release")
+for _, id := range ids {
+	if _, err := r.Wait(ctx, "queue-space-shard", id); err != nil {
+		return err
+	}
+}
+```
+
+Subjects compare byte by byte, so a prefix reads only the tasks it matches.
+
 ## Batching
 
 A batching handler takes the subject's oldest due task and the due tasks straight after it with the same action, up to a limit, and stops at the first task with a different action so the subject's order holds. Batching actions run async only.

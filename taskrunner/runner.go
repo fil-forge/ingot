@@ -488,6 +488,11 @@ func (r *Runner) checkSpec(s Spec) (*queue, error) {
 	if s.Subject == "" {
 		return nil, fmt.Errorf("task runner: %s.%s: empty subject", s.Queue, s.Action)
 	}
+	// A trailing * marks a prefix in Expedite, so a subject with one could
+	// never be matched exactly.
+	if strings.HasSuffix(s.Subject, "*") {
+		return nil, fmt.Errorf("task runner: %s.%s: subject %q ends in *", s.Queue, s.Action, s.Subject)
+	}
 	if _, ok := r.handler(actionKey{s.Queue, s.Action}); !ok {
 		return nil, fmt.Errorf("task runner: no handler for %s.%s", s.Queue, s.Action)
 	}
