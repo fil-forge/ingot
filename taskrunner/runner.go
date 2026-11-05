@@ -29,7 +29,8 @@ type Task struct {
 	Subject string
 	// Action selects the handler that runs the task.
 	Action string
-	// Created orders a subject's due tasks, oldest first.
+	// Created is when the task was queued. A tree is as old as its first
+	// task, and of two trees contending for the same subjects the older wins.
 	Created time.Time
 	// NotBefore, when set, is the earliest time the task may run.
 	NotBefore *time.Time
