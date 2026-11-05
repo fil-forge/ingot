@@ -197,6 +197,9 @@ type queue struct {
 	// inflight is the set of subjects this process's workers have taken or
 	// are about to take, guarded by Runner.mu.
 	inflight map[string]bool
+	// saturated is set when the last poll found a due subject for every free
+	// worker, so more may be waiting, guarded by Runner.mu.
+	saturated bool
 }
 
 type actionKey struct{ queue, action string }

@@ -74,8 +74,8 @@ func (r *Runner) nextDue(ctx context.Context, q *queue, subject string, upTo int
 }
 
 // pollLoop hands due, free subjects to workers, up to the queue's worker
-// count, every PollInterval and whenever a task is submitted to the queue in
-// this process.
+// count, every PollInterval, whenever a task is submitted to the queue in
+// this process, and whenever a worker frees up with more due (see work).
 func (r *Runner) pollLoop(ctx context.Context, q *queue) {
 	defer r.wg.Done()
 	t := time.NewTicker(r.opts.PollInterval)
@@ -127,6 +127,9 @@ func (r *Runner) dispatch(ctx context.Context, q *queue) {
 		}
 		return
 	}
+	r.mu.Lock()
+	q.saturated = len(subjects) == free
+	r.mu.Unlock()
 	for _, s := range subjects {
 		r.mu.Lock()
 		q.inflight[s] = true
@@ -136,13 +139,17 @@ func (r *Runner) dispatch(ctx context.Context, q *queue) {
 	}
 }
 
-// work takes a subject's lease and drains it.
+// work takes a subject's lease and drains it. It polls again once it frees
+// its worker if the subject has more due, or the last poll had more due
+// subjects than free workers, so a backlog drains as fast as the workers run
+// it rather than a pollful per PollInterval.
 func (r *Runner) work(ctx context.Context, q *queue, subject string) {
 	defer r.wg.Done()
 	more := false
 	defer func() {
 		r.mu.Lock()
 		delete(q.inflight, subject)
+		more = more || q.saturated
 		r.mu.Unlock()
 		if more {
 			r.pokeQueue(q)
