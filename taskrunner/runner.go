@@ -618,7 +618,7 @@ func (r *Runner) SubmitAllTx(ctx context.Context, tx pgx.Tx, specs []Spec) ([]Ta
 	ON CONFLICT (subject, action) WHERE state = 'pending' AND replaceable AND started IS NULL
 	DO UPDATE SET id = EXCLUDED.id, seq = DEFAULT, created = EXCLUDED.created,
 		not_before = EXCLUDED.not_before, expires = EXCLUDED.expires, args = EXCLUDED.args,
-		node = EXCLUDED.node
+		node = EXCLUDED.node, attempts = 0, error = NULL, retry_at = NULL
 	WHERE t.not_before < EXCLUDED.not_before`,
 		cols.ids, cols.subjects, cols.actions, cols.notBefore, cols.expires, cols.args, cols.nodes, cols.replaceable); err != nil {
 		return nil, fmt.Errorf("submit %d %s tasks: %w", len(cols.ids), q.name, err)
