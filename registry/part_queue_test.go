@@ -71,7 +71,7 @@ func runPartQueueSuite(t *testing.T, st partQueueStore) {
 	t.Run("a part is recorded spooled with its sizes", func(t *testing.T) {
 		part(id, 1, multihash.Multihash{0xd1, 0x0a}, multihash.Multihash{0xd1, 0x0b})
 		parts, err := st.ListParts(ctx, id)
-		if err != nil || len(parts) != 1 || parts[0].State != registry.PartSpooled || !slices.Equal(parts[0].SpanLengths, []int64{1, 2}) {
+		if err != nil || len(parts) != 1 || parts[0].State != registry.PartWritten || !slices.Equal(parts[0].SpanLengths, []int64{1, 2}) {
 			t.Fatalf("ListParts = %+v, err %v; want one spooled part with sizes [1 2]", parts, err)
 		}
 		// Sizes must match the digests one for one, which a constraint
@@ -122,14 +122,14 @@ func runPartQueueSuite(t *testing.T, st partQueueStore) {
 	t.Run("a move skips a replaced part", func(t *testing.T) {
 		first := part(id, 2, multihash.Multihash{0xd2, 0x01})
 		second := part(id, 2, multihash.Multihash{0xd2, 0x02})
-		if n, err := st.MoveParts(ctx, []registry.MultipartPart{first}, registry.PartSpooled, registry.PartParked); err != nil || n != 0 {
+		if n, err := st.MoveParts(ctx, []registry.MultipartPart{first}, registry.PartWritten, registry.PartParked); err != nil || n != 0 {
 			t.Fatalf("MoveParts with the replaced digests = %d, %v; want 0", n, err)
 		}
-		if n, err := st.MoveParts(ctx, []registry.MultipartPart{second}, registry.PartSpooled, registry.PartParked); err != nil || n != 1 {
+		if n, err := st.MoveParts(ctx, []registry.MultipartPart{second}, registry.PartWritten, registry.PartParked); err != nil || n != 1 {
 			t.Fatalf("MoveParts = %d, %v; want 1", n, err)
 		}
 		// Only a part in the from state moves.
-		if n, err := st.MoveParts(ctx, []registry.MultipartPart{second}, registry.PartSpooled, registry.PartParked); err != nil || n != 0 {
+		if n, err := st.MoveParts(ctx, []registry.MultipartPart{second}, registry.PartWritten, registry.PartParked); err != nil || n != 0 {
 			t.Fatalf("second MoveParts = %d, %v; want 0", n, err)
 		}
 		if got := states(id)[2]; got != registry.PartParked {
@@ -140,7 +140,7 @@ func runPartQueueSuite(t *testing.T, st partQueueStore) {
 	t.Run("the queue lists parked parts in order", func(t *testing.T) {
 		p3 := part(id, 3, multihash.Multihash{0xd3})
 		p4 := part(id, 4, multihash.Multihash{0xd4})
-		if n, err := st.MoveParts(ctx, []registry.MultipartPart{p4, p3}, registry.PartSpooled, registry.PartParked); err != nil || n != 2 {
+		if n, err := st.MoveParts(ctx, []registry.MultipartPart{p4, p3}, registry.PartWritten, registry.PartParked); err != nil || n != 2 {
 			t.Fatalf("MoveParts = %d, %v; want 2", n, err)
 		}
 		queued, err := st.ListParkedParts(ctx, id, 2)
@@ -153,7 +153,7 @@ func runPartQueueSuite(t *testing.T, st partQueueStore) {
 		if _, err := st.MoveParts(ctx, queued, registry.PartParked, registry.PartAccepted); err != nil {
 			t.Fatalf("MoveParts to accepted: %v", err)
 		}
-		want := map[int]string{1: registry.PartSpooled, 2: registry.PartAccepted, 3: registry.PartAccepted, 4: registry.PartParked}
+		want := map[int]string{1: registry.PartWritten, 2: registry.PartAccepted, 3: registry.PartAccepted, 4: registry.PartParked}
 		if got := states(id); !maps.Equal(got, want) {
 			t.Fatalf("states = %v, want %v", got, want)
 		}
@@ -161,7 +161,7 @@ func runPartQueueSuite(t *testing.T, st partQueueStore) {
 
 	t.Run("the restart sweep lists live uploads with parked parts", func(t *testing.T) {
 		p := part(other, 1, multihash.Multihash{0xe1})
-		if _, err := st.MoveParts(ctx, []registry.MultipartPart{p}, registry.PartSpooled, registry.PartParked); err != nil {
+		if _, err := st.MoveParts(ctx, []registry.MultipartPart{p}, registry.PartWritten, registry.PartParked); err != nil {
 			t.Fatalf("MoveParts: %v", err)
 		}
 		if won, err := st.LatchSession(ctx, other, registry.SessionOpen, registry.SessionAborting); err != nil || !won {

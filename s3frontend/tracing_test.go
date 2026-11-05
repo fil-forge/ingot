@@ -88,7 +88,7 @@ func TestPutObjectSpans(t *testing.T) {
 
 	tree := traceOp(t, func(ctx context.Context) {
 		if _, err := b.PutObject(ctx, s3response.PutObjectInput{
-			Bucket: &bucket, Key: &key, Body: bytes.NewReader(data),
+			Bucket: &bucket, Key: &key, Body: bytes.NewReader(data), ContentLength: byteLen(data),
 		}); err != nil {
 			t.Fatalf("PutObject: %v", err)
 		}
@@ -104,7 +104,7 @@ func TestPutObjectSpans(t *testing.T) {
 		t.Fatalf("expected a body.received event on body.spool, got %v", ev)
 	}
 
-	requireAttr(t, tree.one("blob.upload"), attribute.String("ingot.blob.result", "uploaded"))
+	requireAttr(t, tree.one("blob.upload"), attribute.String("ingot.blob.result", "streamed"))
 
 	tx := tree.one("bucket.tx")
 	tree.requireChild(tx, tree.one("bucket.lock"))
@@ -175,7 +175,7 @@ func TestMultipartSpans(t *testing.T) {
 			n := i
 			body := append(testBody(int(backend.MinPartSize)), byte(i))
 			out, err := b.UploadPart(ctx, &s3.UploadPartInput{
-				Bucket: &bucket, Key: &key, UploadId: &uploadID, PartNumber: &n, Body: bytes.NewReader(body),
+				Bucket: &bucket, Key: &key, UploadId: &uploadID, PartNumber: &n, Body: bytes.NewReader(body), ContentLength: byteLen(body),
 			})
 			if err != nil {
 				t.Fatalf("UploadPart %d: %v", n, err)
@@ -187,7 +187,7 @@ func TestMultipartSpans(t *testing.T) {
 	for _, sp := range parts.spans {
 		if sp.Name() == "blob.park" {
 			parts.requireInTrace(sp)
-			requireAttr(t, sp, attribute.String("ingot.blob.result", "parked"))
+			requireAttr(t, sp, attribute.String("ingot.blob.result", "streamed"))
 			parked++
 		}
 	}
@@ -209,7 +209,7 @@ func TestMultipartSpans(t *testing.T) {
 	}
 	requireAttr(t, conclude, attribute.Int("ingot.blobs.total", 2))
 	requireAttr(t, conclude, attribute.Int("ingot.blobs.concluded", 2))
-	requireAttr(t, conclude, attribute.Int("ingot.blobs.uploaded", 0))
+	requireAttr(t, conclude, attribute.Int("ingot.blobs.unparked", 0))
 }
 
 // TestSweepLocalBlobsSpans: each pass of a local blob sweep records a span

@@ -526,10 +526,12 @@ func (b *Backend) uploadBlobs(ctx context.Context, space did.DID, body spooledBo
 }
 
 // concludeStreamed accepts a blob that went to its provider as it was spooled,
-// traced as a blob.upload span like uploadBlob. A release of the same
-// digest that was running meanwhile may have taken what the stream parked
-// (see settleRelease); the stream is then given up and the blob uploaded
-// afresh from its spool file, which the write still holds.
+// traced as a blob.upload span like uploadBlob. A release of the same digest
+// running meanwhile is waited out, or a pending one cancelled (see
+// settleRelease). The release takes the space's earlier location, not this
+// stream's own allocation, which the space can take once the release's
+// removal has its receipt, so the stream is then concluded as it is rather
+// than reusing the location.
 func (b *Backend) concludeStreamed(ctx context.Context, space did.DID, blob msbucket.BlobRef, sb uploader.StreamedBlob, body spooledBody) (err error) {
 	// One write of these bytes at a time for this space (see Backend.blobKeys):
 	// another write can have accepted the same digest while this stream was
@@ -542,12 +544,7 @@ func (b *Backend) concludeStreamed(ctx context.Context, space did.DID, blob msbu
 	if err != nil {
 		return err
 	}
-	if !settled {
-		b.abandonStream(ctx, space, sb)
-		unlock() // uploadBlob takes the key itself
-		return b.uploadBlob(ctx, space, blob, body)
-	}
-	if existing, err := b.locations.GetLocation(ctx, space, blob.Digest); err == nil && existing != nil {
+	if existing, err := b.locations.GetLocation(ctx, space, blob.Digest); err == nil && existing != nil && settled {
 		// Accepted for the space meanwhile: the stream's allocation is
 		// surplus, and the blob is reused as uploadBlob reuses a located one.
 		b.abandonStream(ctx, space, sb)

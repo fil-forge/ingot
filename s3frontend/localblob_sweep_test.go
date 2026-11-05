@@ -63,7 +63,7 @@ func putSweepObjects(t *testing.T, b *Backend, n int) []multihash.Multihash {
 	for i := range n {
 		bucket, key := sweepBucket, fmt.Sprintf("obj-%d", i)
 		body := bytes.Repeat([]byte{byte('a' + i)}, 1000)
-		if _, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(body)}); err != nil {
+		if _, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(body), ContentLength: byteLen(body)}); err != nil {
 			t.Fatalf("PutObject %s: %v", key, err)
 		}
 		rv, err := b.resolveVersion(ctx, bucket, key, "")

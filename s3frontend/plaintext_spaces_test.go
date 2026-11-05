@@ -51,7 +51,7 @@ func secondPlaintextBucket(t *testing.T, b *Backend, mem *testStore) did.DID {
 
 func putIn(t *testing.T, b *Backend, bucket, key string, data []byte) {
 	t.Helper()
-	if _, err := b.PutObject(context.Background(), s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(data)}); err != nil {
+	if _, err := b.PutObject(context.Background(), s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(data), ContentLength: byteLen(data)}); err != nil {
 		t.Fatalf("PutObject %s/%s: %v", bucket, key, err)
 	}
 }
@@ -87,7 +87,7 @@ func uploadOnePart(t *testing.T, b *Backend, bucket, key string, part []byte) (s
 		t.Fatalf("CreateMultipartUpload %s/%s: %v", bucket, key, err)
 	}
 	n := int32(1)
-	out, err := b.UploadPart(ctx, &s3.UploadPartInput{Bucket: &bucket, Key: &key, UploadId: &res.UploadId, PartNumber: &n, Body: bytes.NewReader(part)})
+	out, err := b.UploadPart(ctx, &s3.UploadPartInput{Bucket: &bucket, Key: &key, UploadId: &res.UploadId, PartNumber: &n, Body: bytes.NewReader(part), ContentLength: byteLen(part)})
 	if err != nil {
 		t.Fatalf("UploadPart %s/%s: %v", bucket, key, err)
 	}
@@ -280,11 +280,8 @@ func TestPlaintextRelease_WriteCancelsAPendingRelease(t *testing.T) {
 	if pending, _ := mem.ListReleasesBySpace(ctx, mem.bk()); len(pending) != 0 {
 		t.Fatalf("the write left the release record in place: %v", pending)
 	}
-	up.mu.Lock()
-	uploads := up.calls[string(d)]
-	up.mu.Unlock()
-	if uploads != 2 {
-		t.Fatalf("uploads of %x = %d, want 2 (uploaded afresh after the cancel)", d, uploads)
+	if sent, accepted, _ := streamCounts(t, b, d); sent != 2 || accepted != 2 {
+		t.Fatalf("streams of %x: %d sent, %d accepted; want 2 and 2 (uploaded afresh after the cancel)", d, sent, accepted)
 	}
 	drainReleases(t, b)
 	if got := getFrom(t, b, "bk", "new"); !bytes.Equal(got, data) {
@@ -311,7 +308,7 @@ func TestPlaintextRelease_WriteWaitsOutAStartedRelease(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		bucket, key := "bk", "new"
-		_, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(data)})
+		_, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(data), ContentLength: byteLen(data)})
 		done <- err
 	}()
 	// The write is waiting: nothing has finished, and its spool file is in
@@ -331,11 +328,8 @@ func TestPlaintextRelease_WriteWaitsOutAStartedRelease(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatalf("PutObject after the release: %v", err)
 	}
-	up.mu.Lock()
-	uploads := up.calls[string(d)]
-	up.mu.Unlock()
-	if uploads != 2 {
-		t.Fatalf("uploads of %x = %d, want 2 (the blob was uploaded again after its release)", d, uploads)
+	if sent, accepted, _ := streamCounts(t, b, d); sent != 2 || accepted != 2 {
+		t.Fatalf("streams of %x: %d sent, %d accepted; want 2 and 2 (the blob was uploaded again after its release)", d, sent, accepted)
 	}
 	if _, err := mem.GetLocation(ctx, mem.bk(), d); err != nil {
 		t.Fatalf("no location after the fresh upload: %v", err)
@@ -366,7 +360,7 @@ func TestPlaintextRelease_WaitIsBounded(t *testing.T) {
 	t.Cleanup(func() { reuseWaitLimit = limit })
 
 	bucket, key := "bk", "new"
-	_, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(data)})
+	_, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(data), ContentLength: byteLen(data)})
 	var apiErr s3err.APIError
 	if !errors.As(err, &apiErr) || apiErr.Code != "SlowDown" {
 		t.Fatalf("PutObject during a release that never finishes: err = %v, want SlowDown", err)
@@ -452,7 +446,7 @@ func TestPlaintextRelease_WriteWaitsOutAStartedReleaseWithNoLocation(t *testing.
 	done := make(chan error, 1)
 	go func() {
 		bucket, key := "bk", "new"
-		_, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(data)})
+		_, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(data), ContentLength: byteLen(data)})
 		done <- err
 	}()
 	select {
@@ -460,22 +454,16 @@ func TestPlaintextRelease_WriteWaitsOutAStartedReleaseWithNoLocation(t *testing.
 		t.Fatalf("PutObject returned %v while the release was started", err)
 	case <-time.After(100 * time.Millisecond):
 	}
-	up.mu.Lock()
-	early := up.calls[string(d)]
-	up.mu.Unlock()
-	if early != 1 {
-		t.Fatalf("uploads of %x while the release was started = %d, want 1 (the write waited)", d, early)
+	if _, accepted, _ := streamCounts(t, b, d); accepted != 1 {
+		t.Fatalf("streams of %x accepted while the release was started = %d, want 1 (the write waited)", d, accepted)
 	}
 
 	finish()
 	if err := <-done; err != nil {
 		t.Fatalf("PutObject after the release: %v", err)
 	}
-	up.mu.Lock()
-	uploads := up.calls[string(d)]
-	up.mu.Unlock()
-	if uploads != 2 {
-		t.Fatalf("uploads of %x = %d, want 2", d, uploads)
+	if sent, accepted, _ := streamCounts(t, b, d); sent != 2 || accepted != 2 {
+		t.Fatalf("streams of %x: %d sent, %d accepted; want 2 and 2", d, sent, accepted)
 	}
 	if got := getFrom(t, b, "bk", "new"); !bytes.Equal(got, data) {
 		t.Fatalf("the rewritten object does not read back")
@@ -524,7 +512,7 @@ func TestPlaintextRelease_ClaimRefusedDuringAStartedRelease(t *testing.T) {
 	}
 
 	bucket, key := "bk", "k"
-	_, err := b.PutObject(context.Background(), s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(data)})
+	_, err := b.PutObject(context.Background(), s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(data), ContentLength: byteLen(data)})
 	var apiErr s3err.APIError
 	if !errors.As(err, &apiErr) || apiErr.Code != "SlowDown" {
 		t.Fatalf("PutObject with a release started before its commit: err = %v, want SlowDown", err)
@@ -569,16 +557,24 @@ func TestPlaintextRelease_StreamedWriteWaitsOutAStartedRelease(t *testing.T) {
 	}
 
 	su.mu.Lock()
-	var uploaded, aborted int
+	var uploaded, concluded int
 	for _, u := range su.uploaded {
 		if bytes.Equal(u, d) {
 			uploaded++
 		}
 	}
-	aborted = len(su.aborted)
+	for _, c := range su.concluded {
+		if bytes.Equal(c.Digest, d) {
+			concluded++
+		}
+	}
+	aborted := len(su.aborted)
 	su.mu.Unlock()
-	if uploaded != 1 || aborted != 1 {
-		t.Fatalf("after the waited-out release: fresh uploads of %x = %d, streams aborted = %d; want 1 and 1", d, uploaded, aborted)
+	// The space takes the digest again once the release's removal has its
+	// receipt, so the waiting write's own stream is concluded, with no
+	// upload from a local copy.
+	if uploaded != 0 || aborted != 0 || concluded != 2 {
+		t.Fatalf("after the waited-out release: fresh uploads of %x = %d, streams aborted = %d, concluded = %d; want 0, 0 and 2", d, uploaded, aborted, concluded)
 	}
 	if _, err := mem.GetLocation(ctx, mem.bk(), d); err != nil {
 		t.Fatalf("no location after the fresh upload: %v", err)
@@ -588,11 +584,11 @@ func TestPlaintextRelease_StreamedWriteWaitsOutAStartedRelease(t *testing.T) {
 	}
 }
 
-// TestPlaintextSpaces_ConcurrentWritesOfTheSameBytesUploadOnce: two writes
-// of the same bytes to one space at the same time take turns at the upload
-// (blobKeyLock): the second finds the first's location and reuses it, so
-// the provider is asked for the bytes once.
-func TestPlaintextSpaces_ConcurrentWritesOfTheSameBytesUploadOnce(t *testing.T) {
+// TestPlaintextSpaces_ConcurrentWritesOfTheSameBytesAcceptOnce: writes of the
+// same bytes to one space at the same time each stream them, then take turns
+// at the conclude (blobKeyLock): the first is accepted, and each later one
+// finds its location, reuses it and gives up its own allocation.
+func TestPlaintextSpaces_ConcurrentWritesOfTheSameBytesAcceptOnce(t *testing.T) {
 	up := &countingUploader{calls: map[string]int{}}
 	b, _ := newDeferredBackend(t, up)
 	setNone(t, b)
@@ -606,7 +602,7 @@ func TestPlaintextSpaces_ConcurrentWritesOfTheSameBytesUploadOnce(t *testing.T) 
 		go func(key string) {
 			defer wg.Done()
 			bucket := "bk"
-			_, err := b.PutObject(context.Background(), s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(data)})
+			_, err := b.PutObject(context.Background(), s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(data), ContentLength: byteLen(data)})
 			errs <- err
 		}(fmt.Sprintf("k%d", i))
 	}
@@ -617,11 +613,8 @@ func TestPlaintextSpaces_ConcurrentWritesOfTheSameBytesUploadOnce(t *testing.T) 
 			t.Fatalf("PutObject: %v", err)
 		}
 	}
-	up.mu.Lock()
-	uploads := up.calls[string(d)]
-	up.mu.Unlock()
-	if uploads != 1 {
-		t.Fatalf("uploads of %x by four concurrent writes = %d, want 1", d, uploads)
+	if sent, accepted, aborted := streamCounts(t, b, d); sent != 4 || accepted != 1 || aborted != 3 {
+		t.Fatalf("streams of %x by four concurrent writes: %d sent, %d accepted, %d aborted; want 4, 1, 3", d, sent, accepted, aborted)
 	}
 	for i := range 4 {
 		if got := getFrom(t, b, "bk", fmt.Sprintf("k%d", i)); !bytes.Equal(got, data) {
@@ -630,10 +623,10 @@ func TestPlaintextSpaces_ConcurrentWritesOfTheSameBytesUploadOnce(t *testing.T) 
 	}
 }
 
-// TestPlaintextSpaces_ConcurrentPartsOfTheSameBytesParkOnce: two part
-// uploads of the same bytes to one space at the same time park once; the
-// second finds the first's park. The parking fake accepts outright, so the
-// count is of uploads.
+// TestPlaintextSpaces_ConcurrentPartsOfTheSameBytesParkOnce: part uploads of
+// the same bytes to one space at the same time each stream them, and park
+// once: each later one finds the first's park and gives up its own
+// allocation.
 func TestPlaintextSpaces_ConcurrentPartsOfTheSameBytesParkOnce(t *testing.T) {
 	up := &countingUploader{calls: map[string]int{}}
 	b, mem := newDeferredBackend(t, up)
@@ -658,11 +651,11 @@ func TestPlaintextSpaces_ConcurrentPartsOfTheSameBytesParkOnce(t *testing.T) {
 			t.Fatalf("part of %s stored under %x, want %x", id, got, d)
 		}
 	}
-	up.mu.Lock()
-	uploads := up.calls[string(d)]
-	up.mu.Unlock()
-	if uploads != 1 {
-		t.Fatalf("uploads of %x by three concurrent part uploads = %d, want 1", d, uploads)
+	if sent, _, aborted := streamCounts(t, b, d); sent != 3 || aborted != 2 {
+		t.Fatalf("streams of %x by three concurrent part uploads: %d sent, %d aborted; want 3 and 2", d, sent, aborted)
+	}
+	if _, err := mem.ParkByDigest(context.Background(), d); err != nil {
+		t.Fatalf("the shared park: %v", err)
 	}
 }
 
@@ -720,49 +713,6 @@ func TestPlaintextSpaces_LastReleaseOutRemovesTheSharedFile(t *testing.T) {
 	}
 }
 
-// TestPlaintextRelease_CompleteFallbackSettlesUnderTheLock: Complete's
-// upload of a part that never parked settles the release under the key
-// lock, like every other upload: a record pending for the digest is
-// cancelled there, and the part uploaded afresh. (A started record cannot
-// meet this path: a part is recorded only once its own park settled the
-// digest, and its live session keeps any later release from starting.)
-func TestPlaintextRelease_CompleteFallbackSettlesUnderTheLock(t *testing.T) {
-	up := &countingUploader{calls: map[string]int{}}
-	b, mem := newDeferredBackend(t, up)
-	ctx := context.Background()
-	setNone(t, b)
-	part := testBody(5 << 20)
-	d := digestOf(t, part)
-
-	id, parts := uploadOnePart(t, b, "bk", "k", part)
-	// Make the part look never parked, with its location gone and a release
-	// of the digest started: as a release that took the blob after the part
-	// was recorded.
-	if err := mem.DeleteLocation(ctx, mem.bk(), d); err != nil {
-		t.Fatalf("DeleteLocation: %v", err)
-	}
-	if err := mem.SetIntentState(ctx, mem.bk(), d, registry.IntentSpooled); err != nil {
-		t.Fatalf("SetIntentState: %v", err)
-	}
-	if err := mem.EnqueueRelease(ctx, mem.bk(), d, time.Now().Add(time.Hour)); err != nil {
-		t.Fatalf("EnqueueRelease: %v", err)
-	}
-
-	completeIn(t, b, "bk", "k", id, parts)
-	if pending, _ := mem.ListReleasesBySpace(ctx, mem.bk()); len(pending) != 0 {
-		t.Fatalf("the fallback upload left the pending record in place: %v", pending)
-	}
-	up.mu.Lock()
-	uploads := up.calls[string(d)]
-	up.mu.Unlock()
-	if uploads != 2 {
-		t.Fatalf("uploads of %x = %d, want 2 (the part was uploaded again by the fallback)", d, uploads)
-	}
-	if got := getFrom(t, b, "bk", "k"); !bytes.Equal(got, part) {
-		t.Fatalf("the completed object does not read back")
-	}
-}
-
 // releaseBetweenReuseAndCommit is an intent store under which a release of
 // the digest runs to completion right after a write has decided to reuse
 // the located blob (the mark it sets then): the location is gone by the
@@ -802,7 +752,7 @@ func TestPlaintextRelease_ClaimRefusedOnceTheLocationIsGone(t *testing.T) {
 	rel.digest, rel.armed = blobDigestOf(t, b, "old", ""), true
 
 	bucket, key := "bk", "new"
-	_, err := b.PutObject(context.Background(), s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(data)})
+	_, err := b.PutObject(context.Background(), s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(data), ContentLength: byteLen(data)})
 	var apiErr s3err.APIError
 	if !errors.As(err, &apiErr) || apiErr.Code != "SlowDown" {
 		t.Fatalf("PutObject whose blob was released before its commit: err = %v, want SlowDown", err)

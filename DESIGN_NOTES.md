@@ -181,7 +181,7 @@ acceptor stops for a session that is no longer open or completing. It never
 takes a blob over from its release: a part holding a blob with a
 `queue-space-shard.release` task pending or running, or one with neither a
 park nor a location, goes
-back to `spooled`, which is Complete's to finish. At start and every 30 s the
+back to `written`, which is Complete's to finish. At start and every 30 s the
 accept sweeper nudges the acceptor of every open or completing upload with
 parked parts, so work a stopped process left, or a nudge that went missing,
 is picked up, and measures how long the oldest parked part has waited.
@@ -236,10 +236,13 @@ new parts, and waits, up to 30 s (`acceptWaitBudget`), until none of the parts
 it was asked to commit is still queued, re-reading them after each of the
 acceptor's passes. Parts the upload holds and the request omits are not
 waited for; it stops early when the acceptor's last pass failed. It then
-reads the parts it was asked to commit. A `spooled` part is concluded, or
-uploaded from its spool copy if it never parked, by Complete itself; before
-uploading, Complete rechecks for a park under the blob's lock, since the
-part's UploadPart may still be parking it. A part
+reads the parts it was asked to commit. A `written` part is concluded by
+Complete itself. A blob of it with neither a park nor a location is looked
+for again under the blob's lock, since the part's UploadPart may still be
+parking it, and otherwise has gone from its provider: nothing keeps a part's
+bytes to upload them again, so Complete answers `InvalidPart` and the client
+uploads the part again. Every part blob streams to its provider as the part
+arrives, and an UploadPart whose blob does not stream fails. A part
 still `parked` means the acceptor is behind or failing, and Complete answers
 OperationAborted, a 409; the latch reverts to `open` and the acceptor
 carries on. The AWS CLI and other botocore-based clients treat that 409 as

@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
-	"os"
 	"strings"
 	"testing"
 
@@ -22,12 +21,9 @@ import (
 func storedEnvelopeSizes(t *testing.T, b *Backend, key string) (sizes []int64, total int64) {
 	t.Helper()
 	for _, d := range blobDigestsOf(t, b, key, "") {
-		fi, err := os.Stat(localPath(b, d))
-		if err != nil {
-			t.Fatalf("stat spooled blob: %v", err)
-		}
-		sizes = append(sizes, fi.Size())
-		total += fi.Size()
+		n := int64(len(storedBytes(t, b, d)))
+		sizes = append(sizes, n)
+		total += n
 	}
 	return sizes, total
 }
