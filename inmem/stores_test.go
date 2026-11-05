@@ -447,7 +447,8 @@ func TestRevocationCursor_UpsertRoundTrip(t *testing.T) {
 	if _, err := m.GetRevocationCursor(ctx); err != registry.ErrNotFound {
 		t.Fatalf("GetRevocationCursor before put err = %v, want ErrNotFound", err)
 	}
-	first := registry.RevocationCursor{RecordedAt: time.Now().UTC(), Revoke: testCid(t, "revoked-1")}
+	// A head saved before the first record has no record to describe.
+	first := registry.RevocationCursor{Token: "1733"}
 	if err := m.PutRevocationCursor(ctx, first); err != nil {
 		t.Fatalf("PutRevocationCursor: %v", err)
 	}
@@ -455,11 +456,11 @@ func TestRevocationCursor_UpsertRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetRevocationCursor: %v", err)
 	}
-	if got.Token != "" || !got.RecordedAt.Equal(first.RecordedAt) || !got.Revoke.Equals(first.Revoke) {
+	if got.Token != first.Token || !got.RecordedAt.IsZero() || got.Revoke.Defined() {
 		t.Fatalf("cursor = %+v, want %+v", got, first)
 	}
 	// The cursor is a single latch: a second put overwrites, never adds.
-	second := registry.RevocationCursor{Token: "1734-revoked-2", RecordedAt: first.RecordedAt.Add(time.Hour), Revoke: testCid(t, "revoked-2")}
+	second := registry.RevocationCursor{Token: "1734", RecordedAt: time.Now().UTC(), Revoke: testCid(t, "revoked-2")}
 	if err := m.PutRevocationCursor(ctx, second); err != nil {
 		t.Fatalf("PutRevocationCursor (upsert): %v", err)
 	}

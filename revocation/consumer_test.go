@@ -52,33 +52,43 @@ type streamScript struct {
 	err     error
 }
 
-// streamCall is how one stream was opened: StreamAfter with after, or
-// StreamEvents with from.
-type streamCall struct {
-	after swarfclient.Cursor
-	from  time.Time
+// testHead is the firehose head a fakeSource reports once its headErrs run
+// out.
+const testHead = swarfclient.Cursor("cursor-head")
+
+// fakeSource plays one streamScript per StreamAfter call, recording the
+// cursor each was opened after. When the scripts run out, a stream blocks
+// until ctx cancel (a healthy idle connection). Head fails with each of
+// headErrs in turn, then reports testHead.
+type fakeSource struct {
+	mu       sync.Mutex
+	scripts  []streamScript
+	opened   []swarfclient.Cursor
+	headErrs []error
+	heads    int
 }
 
-// fakeSource plays one streamScript per stream call, recording how each call
-// was made. When the scripts run out, a stream blocks until ctx cancel (a
-// healthy idle connection).
-type fakeSource struct {
-	mu      sync.Mutex
-	scripts []streamScript
-	opened  []streamCall
+func (f *fakeSource) Head(context.Context) (swarfclient.Cursor, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.heads++
+	if len(f.headErrs) > 0 {
+		err := f.headErrs[0]
+		f.headErrs = f.headErrs[1:]
+		return "", err
+	}
+	return testHead, nil
+}
+
+func (f *fakeSource) headCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.heads
 }
 
 func (f *fakeSource) StreamAfter(ctx context.Context, after swarfclient.Cursor) iter.Seq2[swarfclient.Event, error] {
-	return f.stream(ctx, streamCall{after: after})
-}
-
-func (f *fakeSource) StreamEvents(ctx context.Context, from time.Time) iter.Seq2[swarfclient.Event, error] {
-	return f.stream(ctx, streamCall{from: from})
-}
-
-func (f *fakeSource) stream(ctx context.Context, call streamCall) iter.Seq2[swarfclient.Event, error] {
 	f.mu.Lock()
-	f.opened = append(f.opened, call)
+	f.opened = append(f.opened, after)
 	var script *streamScript
 	if len(f.scripts) > 0 {
 		script = &f.scripts[0]
@@ -101,10 +111,10 @@ func (f *fakeSource) stream(ctx context.Context, call streamCall) iter.Seq2[swar
 	}
 }
 
-func (f *fakeSource) calls() []streamCall {
+func (f *fakeSource) calls() []swarfclient.Cursor {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return append([]streamCall(nil), f.opened...)
+	return append([]swarfclient.Cursor(nil), f.opened...)
 }
 
 // fakeInvalidator records every Revoke call.
@@ -150,14 +160,20 @@ func waitFor(t *testing.T, cond func() bool) {
 }
 
 func TestConsumerStartsAtTheHeadWithNoCursor(t *testing.T) {
+	ctx := context.Background()
+	store := inmem.NewMemStore()
 	src := &fakeSource{}
-	c := revocation.NewConsumer(src, inmem.NewMemStore(), &fakeInvalidator{})
+	c := revocation.NewConsumer(src, store, &fakeInvalidator{})
 	stop := run(c)
 	defer stop()
 
 	waitFor(t, func() bool { return len(src.calls()) == 1 })
-	require.Equal(t, streamCall{after: swarfclient.Now}, src.calls()[0],
-		"no stored cursor: start at the head as the service sees it")
+	require.Equal(t, testHead, src.calls()[0], "no stored cursor: start at the head as the service sees it")
+	// Saved before the stream opened, so a restart before the first record
+	// resumes from it rather than from a later head.
+	cur, err := store.GetRevocationCursor(ctx)
+	require.NoError(t, err)
+	require.Equal(t, registry.RevocationCursor{Token: string(testHead)}, *cur)
 }
 
 func TestConsumerResumesAfterStoredCursor(t *testing.T) {
@@ -175,66 +191,61 @@ func TestConsumerResumesAfterStoredCursor(t *testing.T) {
 	defer stop()
 
 	waitFor(t, func() bool { return len(src.calls()) == 1 })
-	require.Equal(t, streamCall{after: "cursor-earlier"}, src.calls()[0], "stored token wins over the head")
+	require.Equal(t, swarfclient.Cursor("cursor-earlier"), src.calls()[0])
+	require.Zero(t, src.headCalls(), "a stored cursor needs no head")
 }
 
-// A cursor saved before the service issued tokens holds only recorded_at.
-// The consumer resumes it with the time query from there, as it did before
-// tokens, and resumes after a token from the first record on.
-func TestConsumerResumesACursorFromBeforeTokensOnce(t *testing.T) {
-	ctx := context.Background()
-	stored := time.Date(2026, 8, 1, 9, 0, 0, 0, time.UTC)
-	store := inmem.NewMemStore()
-	require.NoError(t, store.PutRevocationCursor(ctx, registry.RevocationCursor{
-		RecordedAt: stored, Revoke: testCid(t, "earlier"),
-	}))
-	rec := record(t, "dlg-1", stored.Add(time.Second))
-
-	inv := &fakeInvalidator{}
-	src := &fakeSource{scripts: []streamScript{
-		// A stream that ends before any record leaves nothing to resume
-		// after but the stored time.
-		{},
-		{records: []swarfclient.Event{rec}},
+// Until the service answers, the consumer keeps asking for the head; it has
+// no earlier position to start from.
+func TestConsumerRetriesTheHeadUntilTheServiceAnswers(t *testing.T) {
+	src := &fakeSource{headErrs: []error{
+		errors.New("connection refused"),
+		errors.New("connection refused"),
 	}}
-	c := revocation.NewConsumer(src, store, inv,
-		revocation.WithBackoff(time.Millisecond, time.Millisecond),
+	core, logs := observer.New(zap.WarnLevel)
+	c := revocation.NewConsumer(src, inmem.NewMemStore(), &fakeInvalidator{},
+		revocation.WithLogger(zap.New(core)),
+		revocation.WithBackoff(time.Millisecond, time.Millisecond))
+	stop := run(c)
+	defer stop()
+
+	waitFor(t, func() bool { return len(src.calls()) == 1 })
+	require.Equal(t, testHead, src.calls()[0])
+	require.Equal(t, 3, src.headCalls())
+	require.Len(t, logs.FilterMessage("revocation: read firehose head").All(), 2)
+}
+
+func TestConsumerStopsWhileWaitingForTheHead(t *testing.T) {
+	src := &fakeSource{headErrs: []error{errors.New("connection refused")}}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	c := revocation.NewConsumer(src, inmem.NewMemStore(), &fakeInvalidator{},
+		revocation.WithBackoff(time.Hour, time.Hour))
+	go func() { defer close(done); c.Run(ctx) }()
+
+	waitFor(t, func() bool { return src.headCalls() == 1 })
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after ctx cancel")
+	}
+	require.Empty(t, src.calls())
+}
+
+// A cursor that can't be read is left alone: the consumer starts at the head
+// without saving it over a position it couldn't see.
+func TestConsumerKeepsACursorItCouldNotRead(t *testing.T) {
+	store := &recordingCursorStore{getErr: errors.New("database unavailable")}
+	src := &fakeSource{}
+	c := revocation.NewConsumer(src, store, &fakeInvalidator{},
 		revocation.WithSaveInterval(time.Millisecond))
 	stop := run(c)
-	defer stop()
 
-	waitFor(t, func() bool { return len(src.calls()) == 3 })
-	require.Equal(t, []streamCall{{from: stored}, {from: stored}, {after: rec.Cursor}}, src.calls())
-	require.Equal(t, []cid.Cid{rec.Revocation.Revoke}, inv.calls())
-	waitFor(t, func() bool {
-		cur, err := store.GetRevocationCursor(ctx)
-		return err == nil && cur.Token == string(rec.Cursor)
-	})
-}
-
-// With no cursor, a stream at the head that ends before its first record —
-// the service unreachable when ingot starts, say — must not be retried at a
-// later head, which would skip the revocations recorded in between.
-func TestConsumerFallsBackToTheTimeQueryFromItsStart(t *testing.T) {
-	rec := record(t, "dlg-1", time.Date(2026, 8, 6, 12, 0, 1, 0, time.UTC))
-	src := &fakeSource{scripts: []streamScript{
-		{err: errors.New("connection refused")},
-		{records: []swarfclient.Event{rec}, err: errors.New("connection reset")},
-	}}
-	inv := &fakeInvalidator{}
-	c := revocation.NewConsumer(src, inmem.NewMemStore(), inv,
-		revocation.WithBackoff(time.Millisecond, time.Millisecond))
-	before := time.Now()
-	stop := run(c)
-	defer stop()
-
-	waitFor(t, func() bool { return len(src.calls()) >= 3 })
-	calls := src.calls()
-	require.Equal(t, streamCall{after: swarfclient.Now}, calls[0])
-	require.Empty(t, calls[1].after)
-	require.False(t, calls[1].from.After(before), "the time query starts no later than the consumer did")
-	require.WithinDuration(t, before, calls[1].from, 2*time.Minute)
-	require.Equal(t, streamCall{after: rec.Cursor}, calls[2], "the first record's token takes over")
+	waitFor(t, func() bool { return len(src.calls()) == 1 })
+	require.Equal(t, testHead, src.calls()[0])
+	stop()
+	require.Empty(t, store.calls())
 }
 
 // A cursor the service refuses is logged as an error naming the fix, and
@@ -258,28 +269,10 @@ func TestConsumerLogsARefusedCursor(t *testing.T) {
 	defer stop()
 
 	waitFor(t, func() bool { return len(src.calls()) >= 2 })
-	require.Equal(t, streamCall{after: "cursor-moved"}, src.calls()[1])
+	require.Equal(t, swarfclient.Cursor("cursor-moved"), src.calls()[1])
 	refused := logs.FilterMessage("revocation: cursor refused").All()
 	require.NotEmpty(t, refused)
 	require.Equal(t, zap.ErrorLevel, refused[0].Level)
-}
-
-// With no saved token, a refusal of the head's cursor on a reconnect is
-// recovered by the fallback, so it is no operator's error.
-func TestConsumerRecoversARefusalWithNoToken(t *testing.T) {
-	src := &fakeSource{scripts: []streamScript{
-		{err: fmt.Errorf("opening revocation stream: %w", swarfclient.ErrCursorRefused)},
-	}}
-	core, logs := observer.New(zap.WarnLevel)
-	c := revocation.NewConsumer(src, inmem.NewMemStore(), &fakeInvalidator{},
-		revocation.WithLogger(zap.New(core)),
-		revocation.WithBackoff(time.Millisecond, time.Millisecond))
-	stop := run(c)
-	defer stop()
-
-	waitFor(t, func() bool { return len(src.calls()) >= 2 })
-	require.NotZero(t, src.calls()[1].from, "the fallback time query")
-	require.Empty(t, logs.FilterMessage("revocation: cursor refused").All())
 }
 
 func TestConsumerInvalidatesAndPersistsCursor(t *testing.T) {
@@ -313,14 +306,24 @@ func TestConsumerInvalidatesAndPersistsCursor(t *testing.T) {
 
 // recordingCursorStore records every cursor it is asked to save. Like the
 // Postgres store, it refuses a save whose ctx is already canceled. With
-// release set, each save waits for release to close first.
+// release set, each save waits for release to close first. It reports stored
+// as the saved cursor, getErr as a read failure, and otherwise no cursor.
 type recordingCursorStore struct {
 	mu      sync.Mutex
 	saved   []registry.RevocationCursor
 	release chan struct{}
+	stored  *registry.RevocationCursor
+	getErr  error
 }
 
 func (s *recordingCursorStore) GetRevocationCursor(context.Context) (*registry.RevocationCursor, error) {
+	if s.getErr != nil {
+		return nil, s.getErr
+	}
+	if s.stored != nil {
+		cur := *s.stored
+		return &cur, nil
+	}
 	return nil, registry.ErrNotFound
 }
 
@@ -359,7 +362,7 @@ func records(t *testing.T, n int) []swarfclient.Event {
 
 func TestConsumerAppliesEveryRecordWhileACursorSaveIsBlocked(t *testing.T) {
 	recs := records(t, 3)
-	store := &recordingCursorStore{release: make(chan struct{})}
+	store := &recordingCursorStore{release: make(chan struct{}), stored: &registry.RevocationCursor{Token: "cursor-stored"}}
 	inv := &fakeInvalidator{}
 	src := &fakeSource{scripts: []streamScript{{records: recs}}}
 	c := revocation.NewConsumer(src, store, inv, revocation.WithSaveInterval(time.Millisecond))
@@ -372,7 +375,7 @@ func TestConsumerAppliesEveryRecordWhileACursorSaveIsBlocked(t *testing.T) {
 
 func TestConsumerSavesOnlyTheLastPositionWhenStoppedBeforeTheInterval(t *testing.T) {
 	recs := records(t, 50)
-	store := &recordingCursorStore{}
+	store := &recordingCursorStore{stored: &registry.RevocationCursor{Token: "cursor-stored"}}
 	inv := &fakeInvalidator{}
 	src := &fakeSource{scripts: []streamScript{{records: recs}}}
 	c := revocation.NewConsumer(src, store, inv, revocation.WithSaveInterval(time.Hour))
@@ -391,7 +394,7 @@ func TestConsumerSavesOnlyTheLastPositionWhenStoppedBeforeTheInterval(t *testing
 
 func TestConsumerSavesNothingMoreWhileTheFeedIsIdle(t *testing.T) {
 	recs := records(t, 1)
-	store := &recordingCursorStore{}
+	store := &recordingCursorStore{stored: &registry.RevocationCursor{Token: "cursor-stored"}}
 	src := &fakeSource{scripts: []streamScript{{records: recs}}}
 	c := revocation.NewConsumer(src, store, &fakeInvalidator{},
 		revocation.WithSaveInterval(time.Millisecond))
@@ -445,8 +448,9 @@ func TestConsumerReconnectsFromLastRecord(t *testing.T) {
 
 	waitFor(t, func() bool { return len(src.calls()) >= 3 })
 	calls := src.calls()
-	require.Equal(t, streamCall{after: rec.Cursor}, calls[1], "reconnect resumes after the last processed record")
-	require.Equal(t, streamCall{after: rec.Cursor}, calls[2], "clean stream end also resumes after the cursor")
+	require.Equal(t, testHead, calls[0])
+	require.Equal(t, rec.Cursor, calls[1], "reconnect resumes after the last processed record")
+	require.Equal(t, rec.Cursor, calls[2], "clean stream end also resumes after the cursor")
 }
 
 func TestConsumerStopsOnCancel(t *testing.T) {
