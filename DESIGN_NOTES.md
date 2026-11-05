@@ -35,11 +35,15 @@ self-provisions.
 
 ## Write path
 
-A PUT streams the body into the local **spool** (the BLAKE3 tree and md5 in
-one pass), splits it into blobs of at most `max_blob_size`, and uploads each
-blob to the network before anything commits: `/blob/add` against sprue, an
-HTTP PUT of the bytes to the allocated piri, a concluded receipt, and the
-`/blob/accept` location commitment. Only then does the short per-bucket
+A PUT splits the body into blobs of at most `max_blob_size` as it arrives
+(the BLAKE3 tree and md5 in the same pass) and streams each blob to the
+network before anything commits: `/blob/add` against sprue by size, an HTTP
+PUT of the bytes to the allocated piri as they arrive, with the sha256
+digest computed on the way, a concluded receipt, and the `/blob/accept`
+location commitment. The upload service must be able to add a blob by
+digest code (the hash function, before the digest is known); a request
+fails otherwise. A failed PUT fails the request, and its allocation is
+aborted, so the client retries. Only then does the short per-bucket
 critical section run: allocate the version seq, write the manifest, splice
 the MST, fsync one `AppendBatch` of the new catalog blocks, and
 compare-and-swap the bucket root in Postgres, with the reference index
@@ -47,14 +51,14 @@ compare-and-swap the bucket root in Postgres, with the reference index
 superseded versions' claims drop, and a blob whose claim count reaches zero
 gets a `queue-space-shard.release` task on the task runner, queued in the
 same transaction and due after the release grace. The full trace is the
-[PutObject diagram](./docs/diagrams.md#putobject-spool-and-upload-off-the-lock-commit-under-it).
+[PutObject diagram](./docs/diagrams.md#putobject-stream-and-upload-off-the-lock-commit-under-it).
 
 **Every body blob is encrypted at ingest** (the FilOne encryption design's
 write side, `s3frontend/encrypt.go`), unless its bucket opted out — see
 "Bucket encryption" below. Each plaintext piece SplitBody cuts
 gets a fresh CEK and streams through FEE into a `COSE_Encrypt` envelope
-(AES-256-GCM STREAM, 256 KiB chunks); the envelope is what the spool stores
-and the network receives, under its **ciphertext** digest. The CEK is wrapped
+(AES-256-GCM STREAM, 256 KiB chunks); the envelope is what the network receives
+and the cache stores, under its **ciphertext** digest. The CEK is wrapped
 twice. The region wrap (`regionkey.Provider`, bound to (space, digest)) goes
 into the blob's `blob_encryption_params` row before any manifest can
 reference the digest; every read uses it. The tenant wrap is the envelope's
@@ -139,9 +143,8 @@ at PUT time or a sealed catalog CAR from the background flush:
 Multipart parts stop after step 2 (**parked**: durable, unaccepted) and the
 upload's acceptor runs steps 3 and 4 in the background while the client is
 still uploading; an abort unwinds a parked blob with `/blob/abort` and an
-accepted one with `/blob/remove`. A parked blob's spool copy is removed once
-it parks: the acceptor concludes it from its park row and never reads its
-bytes. A part
+accepted one with `/blob/remove`. A part keeps no local copy: the acceptor
+concludes each blob from its park row and never reads its bytes. A part
 copied from an existing object (`UploadPartCopy`) is ingested the same way:
 the source's plaintext range streams through the decrypting read path into
 new parked blobs, so the source may be in any bucket of the tenant and
@@ -165,7 +168,7 @@ read only by Complete and deleted once the object commits; every other part
 listing leaves it on disk.
 
 The part rows are the acceptance queue. `UploadPart` records its part as
-`spooled`, with each blob's plaintext length, moves it to `parked` once every
+`written`, with each blob's plaintext length, moves it to `parked` once every
 blob is parked, and nudges the upload's acceptor (`s3frontend/acceptor.go`).
 The move is guarded by the part's digests, so a request whose part a later
 upload of the same part number replaced cannot queue the replacement. Each
@@ -282,87 +285,76 @@ state from its rows rather than its intent. A location row means accepted
 and the space's claim is removed; a park row alone means parked and the
 allocation is aborted, or removed instead when the provider refuses the
 abort because the blob was accepted after all (a conclude ran and ingot
-never learned of it). Neither row is ambiguous on its own: a blob uploaded
-and accepted at Complete whose location then failed to record has none
-either. The intent settles it. Every upload marks the intent `uploading`
-before its first network call, so a blob still `spooled` never left this
-node and is cleaned up locally, while any other state gets a network
-remove, which the upload service treats as success for a blob it never
-registered. The distinction matters for the retry: a blob that never
-uploaded captured no authority a background remove could use, and a remove
-attempted for it would fail on every retry and keep the task retrying
-forever. The crypto-shred goes first and the network step next. After the
-network step nothing can fail but the commit: the location, park and upload
-intent rows are deleted by writes committed with the task's outcome, so a
-retry sees the same state. For a blob that was never committed, the intent
-is the only evidence of how far the blob ever got, and a release outliving
-it would owe a network remove nothing can authorize. The spool copy is
-removed directly and the cached copy through a `queue-shard.evict` task,
-unless another space still holds an intent for the digest.
+never learned of it). A blob with neither row may still be on the network:
+a conclude can be accepted and then fail to record its location. It gets a
+network remove, which the upload service treats as success for a blob it
+never registered. The crypto-shred goes first and the network step next.
+After the network step nothing can fail but the commit: the location, park
+and upload intent rows are deleted by writes committed with the task's
+outcome, so a retry sees the same state. The cached copy is removed through
+a `queue-shard.evict` task, unless another space still holds an intent for
+the digest.
 A release whose digest a part of an in-flight session still references
 waits: that session's Complete turns the reference into a claim, which
 makes the release stale, and its abort queues a release of its own.
 
 ## Local blob storage
 
-Body blobs live on local disk in two directories under `data_dir`, split by
-role. The **spool** (`<data_dir>/spool`, `blockstore.Spool`) holds writes in
-progress (`.tmp-*` files) and finished blobs waiting for their upload. The
-**cache** (`<data_dir>/cache`, `blockstore.BlobCache`) holds copies of blobs
-the provider already holds: once a blob's location and `accepted` state are
-both recorded, its file moves from the spool to the cache by rename, which
-is why the two share a filesystem. A failed move leaves the file in the
-spool. With `cache_writes: false`, the copy is removed at that point
-instead, so the cache holds nothing written after that and every read goes
-to the provider. Reads try the cache, then
-the spool, then the cache again (a blob can move between the first two
-lookups), then the network.
+Body blobs live on local disk in one directory, the **cache**
+(`<data_dir>/cache`, `blockstore.BlobCache`), which holds copies of object
+blobs the provider already holds. As an object's blob streams to its
+provider, the write tees the same bytes into a temporary `.tmp-*` file in
+the cache (`BlobCache.CreateTemp`). Once the blob's location and `accepted`
+state are both recorded, the write adopts the file under its digest by
+rename (`BlobCache.Adopt`) before the PUT answers, so the reads that follow
+are served locally. A file that cannot be created or written costs only the
+cached copy: the upload carries on, and reads go to the provider. A
+multipart part keeps no local copy. With `cache_writes: false`, no write
+keeps a copy, so the cache holds nothing and every read goes to the
+provider. Reads try the cache, then the network.
 
 A cached copy has a time to live, `cache_ttl` (an hour), counted from when
-it was cached or last read. The move into the cache is a `queue-shard.cache`
-task, serialized on the digest, which also schedules a `queue-shard.evict`
-for when the time runs out. A read from the cache with less than half the
-time left, by this process's in-memory record of the last renewal, runs
-`queue-shard.cache` again with nothing to move; its eviction is submitted as
-a replacement, so the later one is kept. Each renewal also sets the file's
-modification time, which orders the budget pass. A read on a node that has
-restarted renews on its first read, since the record is lost.
+it was cached or last read. Once a write has adopted its copy, it queues a
+`queue-shard.cache` task, serialized on the digest, which dates the file and
+schedules a `queue-shard.evict` for when the time runs out. A read from the
+cache with less than half the time left, by this process's in-memory record
+of the last renewal, runs `queue-shard.cache` again; its eviction is
+submitted as a replacement, so the later one is kept. Each renewal also sets
+the file's modification time, which orders the budget pass. A read on a
+node that has restarted renews on its first read, since the record is lost.
 
-Each directory keeps a running byte count of its blob files, and the spool
-also counts writes in progress as their bytes land. With
-`local_blob_max_bytes` set, a sweeper checks the total every 30 seconds and,
-when it is over the budget, evicts cached copies, oldest modification time
-first, until usage is at 90% of the budget, however much of their time to
-live is left: a time to live does not bound the disk, and a burst of writes
-can fill it before anything expires. It reads the cache directory to order
-it, and evicts each through `queue-shard.evict` run as a sync task, so the
-removal takes its turn with the digest's other tasks and usage has dropped
-before the pass moves on; the eviction due later finds the file gone. Spool files never qualify, whatever their state; the budget
-counts them, so the pass evicts cached blobs to make room for them. The
-intents keep their rows and states, because a release and Complete read
-them. A read of an evicted blob misses locally and goes to the network tier.
-A file the pass cannot remove is logged and skipped.
+The cache keeps a running byte count of its blob files, and counts writes
+in progress as their bytes land. With `local_blob_max_bytes` set, a sweeper
+checks the total every 30 seconds and, when it is over the budget, evicts
+cached copies, oldest modification time first, until usage is at 90% of the
+budget, however much of their time to live is left: a time to live does not
+bound the disk, and a burst of writes can fill it before anything expires.
+It reads the cache directory to order it, and evicts each through
+`queue-shard.evict` run as a sync task, so the removal takes its turn with
+the digest's other tasks and usage has dropped before the pass moves on; the
+eviction due later finds the file gone. Writes in progress never qualify;
+the budget counts them, so the pass evicts cached blobs to make room for
+them. The intents keep their rows and states, because a release and
+Complete read them. A read of an evicted blob misses locally and goes to the
+network tier. A file the pass cannot remove is logged and skipped.
 Hourly, with or without a budget, the sweeper also deletes `.tmp-*` files
-older than `local_blob_orphan_age` (24 hours) in both directories, and spool
-blob files that old with no intent row, checked a batch at a time; it
-finishes the spool before scanning the cache. A cache file has always had an
-intent, and every path that deletes an intent removes the file first, so the
-cache is not checked against intents. Its scans take no lock, so writes go
-on meanwhile, and a pass that runs out of time or fails waits for the next
-hour. The byte counts are set when each directory opens, and every write,
-move and removal adjusts its count under the directory's lock. A move holds
-both directories exclusively, so it never overlaps a removal of the same
-blob. The hourly scan also corrects a directory's count when no change
-overlapped it, which catches files added or removed outside ingot; otherwise
-those stay miscounted until the next quiet scan or a restart. The cache must
-be on the spool's filesystem, so a move is a rename; startup checks this.
+older than `local_blob_orphan_age` (24 hours), left by writes that never
+finished; startup deletes every leftover one. A blob file enters the cache
+only once its intent is accepted, so the cache is not checked against
+intents. The scan takes no lock, so writes go on meanwhile, and a pass that
+runs out of time or fails waits for the next hour. The byte count is set
+when the cache opens, and every adoption and removal adjusts it under the
+directory's lock, so an adoption never overlaps a removal of the same
+digest. The hourly scan also corrects the count when no change overlapped
+it, which catches files added or removed outside ingot; otherwise those stay
+miscounted until the next quiet scan or a restart.
 
 ## Read path
 
 A GET resolves the bucket root (registry), walks the MST to the manifest
 (through the per-key version tree when the key is versioned), and serves
-each covering blob from the first tier that has it: local disk (the cache,
-then the spool), the catalog log (catalog blocks only), then the network (`blockstore.Forge`). Network
+each covering blob from the first tier that has it: local disk (the
+cache), the catalog log (catalog blocks only), then the network (`blockstore.Forge`). Network
 resolution uses the **local locator**: a whole-blob hit in `blob_locations`,
 or an inner-block hit in `shard_inclusions` joined to its shard's location;
 the retrieval is a ranged UCAN `content/retrieve` against the provider named
@@ -439,8 +431,8 @@ bodies bring content dedup back: two objects with the same bytes share a
 blob, each holding its own claim, and two buckets of different spaces can
 hold one digest. Every blob table is therefore keyed by `(space, digest)`,
 the upload intent and the park included: each space uploads, parks, claims
-and releases its own copy, and the one spool file between them goes with the
-last intent for it. Within a space, a write of bytes whose previous object
+and releases its own copy, and the one cached file between them goes with
+the last intent for it. Within a space, a write of bytes whose previous object
 was deleted meets that object's `queue-space-shard.release` task. Its
 subject is the space and the digest, and the task's lease serializes it
 with every other task on that subject. A
@@ -453,25 +445,25 @@ as long as the row stands. The write settles the release
 before every upload, park or conclude, located or not, since a release can
 have dropped the location already, or be removing a blob that never had
 one; a streamed blob settles at its conclude and, after a waited-out
-release, is given up and uploaded again from its spool file. A commit
+release, is concluded under its own allocation rather than reusing the
+location. A commit
 claiming the blob cancels a release queued after the settle in the commit's
 own transaction, and refuses the claim while one runs
 (`registry.ErrReleaseInProgress`); the write fails with SlowDown for the
-client to retry. Each spool file is published already held for the write's
-space (`blockstore.Spool.WriteBlobHeld`), under the directory lock, until
-its upload has read it: a release leaves a file held by its own space, and
-the intent with it, for the write waiting on it; a file held only by
-another space it leaves too, while its own intent goes; and the cache move
-waits for a held file as well. A release runs only as a task: Complete
+client to retry. A write marks each blob it has sent, in memory by space
+and digest (`Backend.writing`), until it records the blob as parked or
+accepted. A release of the same space and digest defers while the mark
+stands, since the write's intent would otherwise go with the release's
+rows. A release runs only as a task: Complete
 leaves an orphan whose release it failed to queue to the reap. A release
 that finds a claim on its blob is stale and does nothing. Writes of one
 digest to one space take turns at the
 upload within a process (`Backend.blobKeys`), so the second finds the first's
 location or park; across instances a park already recorded wins, and the
-loser gives up its allocation. A release leaves the file while another
-space still holds an intent for the digest; a file that two spaces'
-releases at once both leave is reclaimed by the cache's time to live or the
-orphan pass. The streamed paths follow the
+loser gives up its allocation. A release leaves the cached file while
+another space still holds an intent for the digest; a file that two
+spaces' releases at once both leave is reclaimed by the cache's time to
+live. The streamed paths follow the
 same rule as the rest: a streamed blob concludes, or a streamed part is
 recorded, under the key lock, after a settle and a look at the rows, and
 a location or park another write recorded meanwhile makes the stream
@@ -480,8 +472,7 @@ committed body blob is located by its commit, so the root swap refuses,
 in its transaction, a claim on a digest the space has no location
 for (`registry.RootCommit.Claims`), which is
 one whose release ran to completion between the write's settle and its
-commit; the write fails with SlowDown for the client to retry. A release
-defers while a write of its space holds the spool file.
+commit; the write fails with SlowDown for the client to retry.
 
 ## Identity & auth
 
@@ -541,19 +532,16 @@ draws the chains and the stores.
   on the session row.
 - **Local blob storage is bounded only when configured** (#48): with
   `local_blob_max_bytes` set, the sweeper evicts cached blobs down to the
-  budget. A delete frees its blobs' local copies once their release runs,
-  and a multipart part's copy goes once it parks.
-- **Spool crash recovery is not built**: reconciling `upload_intents`
+  budget. A delete frees its blobs' cached copies once their release runs,
+  and a multipart part keeps none.
+- **Crash recovery is not built**: reconciling `upload_intents`
   against `blob_refs` after a crash between a blob's upload and its commit
-  is a later phase; the window leaks rather than loses referenced data. (Files with no
-  intent row at all, and unfinished `.tmp-*` writes, are reclaimed by the
-  sweeper's orphan pass.) Nor is a failed upload's spool file reclaimed: its
-  intent stays `spooled` or `uploading`, so neither eviction nor the orphan
-  pass may take it, and with `local_blob_max_bytes` set its bytes count
-  against the budget until an operator removes it and restarts ingot (the
-  counts see a removal outside ingot at startup, or at an hourly scan that
-  no write overlapped). The sweeper sums those bodies each run, counting an
-  intent unchanged for an hour as stalled, for the
+  is a later phase; the window leaks rather than loses referenced data. A
+  failed upload's intent stays `uploading`. It holds no local bytes (a
+  crashed write's unfinished `.tmp-*` file goes at startup or in the
+  sweeper's orphan pass), and the provider expires an allocation that is
+  never concluded. The sweeper sums those intents each run, counting one
+  unchanged for an hour as stalled, for the
   `ingot.local_blobs.stalled_bytes` gauge.
 - **No catalog GC**: `gc_candidates` is write-only; superseded MST nodes
   accumulate on Forge with mutation volume. Each ship records how much of its

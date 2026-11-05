@@ -48,7 +48,7 @@ func (r *recordingRemover) removedDigests() map[string]int {
 }
 
 // newRefTestBackend builds a Backend over real in-process collaborators (a
-// MemStore, an on-disk spool, a catalog log) plus a recording remover, so a
+// MemStore, an on-disk cache, a catalog log) plus a recording remover, so a
 // test can drive PutObject/DeleteObject and inspect blob_refs + releases.
 func newRefTestBackend(t *testing.T, maxBlob ...int64) (*Backend, *testStore, *recordingRemover) {
 	t.Helper()
@@ -77,13 +77,9 @@ func newRefTestBackendOver(t *testing.T, mem *testStore, log blockstore.Log, mbs
 	t.Helper()
 	ctx := context.Background()
 	dir := t.TempDir()
-	spool, err := blockstore.NewSpool(filepath.Join(dir, "spool"))
-	if err != nil {
-		t.Fatalf("spool: %v", err)
-	}
 	cache, err := blockstore.NewBlobCache(filepath.Join(dir, "cache"))
 	if err != nil {
-		t.Fatalf("spool: %v", err)
+		t.Fatalf("cache: %v", err)
 	}
 
 	rm := &recordingRemover{}
@@ -95,11 +91,9 @@ func newRefTestBackendOver(t *testing.T, mem *testStore, log blockstore.Log, mbs
 		GC:         mem,
 		Multipart:  mem,
 		Parks:      mem,
-		Reads:      blockstore.NewLayered(blockstore.LocalBlobs{Cache: cache, Spool: spool}, log, testfakes.NopBaseReader{}),
+		Reads:      blockstore.NewLayered(cache, log, testfakes.NopBaseReader{}),
 		Log:        log,
-		Spool:      spool,
 		Cache:      cache,
-		Uploader:   testfakes.NopUploader{},
 		Deferred:   testfakes.NopUploader{},
 		Remover:    rm,
 		Registrar:  testfakes.NopUploader{},
@@ -401,7 +395,6 @@ func (f *failCommitRoot) CommitRoot(ctx context.Context, name string, expect, ne
 func TestCommitFailureWritesNoClaim(t *testing.T) {
 	reg := &failCommitRoot{}
 	b, mem := newDeferredBackend(t, &parkingUploader{}, func(d *Deps) {
-		d.Uploader = testfakes.NopUploader{}
 		reg.Registry = d.Registry
 		d.Registry = reg
 	})
@@ -475,7 +468,6 @@ func TestReleaseGraceRunsFromTheCommit(t *testing.T) {
 	const grace, stall = 150 * time.Millisecond, 250 * time.Millisecond
 	reg := &stallCommitRoot{delay: stall}
 	b, mem := newDeferredBackend(t, &parkingUploader{}, func(d *Deps) {
-		d.Uploader = testfakes.NopUploader{}
 		d.ReleaseGrace = grace
 		reg.Registry = d.Registry
 		d.Registry = reg

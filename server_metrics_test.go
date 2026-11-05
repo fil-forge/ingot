@@ -176,9 +176,8 @@ func newTestServer(t *testing.T, cfg config.ServerConfig, opts ...func(*ServerDe
 	deps := ServerDeps{
 		BaseBlockReader: testfakes.NopBaseReader{},
 		Uploader:        testfakes.NopUploader{},
-		BodyUploader:    testfakes.NopUploader{},
-		Deferred:        testfakes.NopUploader{},
 		Streaming:       testfakes.NopUploader{},
+		Deferred:        testfakes.NopUploader{},
 		Remover:         testfakes.NopUploader{},
 		Registrar:       testfakes.NopUploader{},
 		Registry:        mem,

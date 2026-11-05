@@ -21,9 +21,8 @@ import (
 )
 
 // streamingAdapter gives a deferred test uploader the streaming seam every
-// part upload needs: StartBlob allocates, and PutBlob hashes the bytes and
-// parks them through the fake's own UploadBlob, as a park from a local copy
-// did. The stream's add task stands in for the fake's until then, so the
+// upload needs: StartBlob allocates, and PutBlob hashes the bytes and parks
+// them through the fake's own UploadBlob. The stream's add task stands in for the fake's until then, so the
 // conclude and abort that follow reach the fake under the names it gave the
 // park, and a fake's records read as they did when it parked directly. It
 // also serves the bytes it was sent as the network tier would, since a
@@ -81,7 +80,7 @@ func (a *streamingAdapter) PutBlob(ctx context.Context, sb uploader.StreamedBlob
 	a.mu.Lock()
 	space := a.spaces[sb.AddTask]
 	a.mu.Unlock()
-	up, err := a.deferredTestUploader.UploadBlob(ctx, space, digest, n, f.Name(), uploader.WithConclude(false))
+	up, err := a.deferredTestUploader.UploadBlob(ctx, space, digest, n, f.Name())
 	if err != nil {
 		return err
 	}
@@ -221,7 +220,7 @@ func withStreaming(t testing.TB, deps *Deps, dir string) {
 	}
 	a := newStreamingAdapter(up, streamingDir(dir))
 	deps.Streaming, deps.Deferred = a, a
-	deps.Reads = blockstore.NewLayered(blockstore.LocalBlobs{Cache: deps.Cache, Spool: deps.Spool}, deps.Log, a)
+	deps.Reads = blockstore.NewLayered(deps.Cache, deps.Log, a)
 }
 
 // storedBytes is a blob's bytes as stored: its local copy, or what its

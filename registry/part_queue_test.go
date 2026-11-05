@@ -68,11 +68,11 @@ func runPartQueueSuite(t *testing.T, st partQueueStore) {
 		return out
 	}
 
-	t.Run("a part is recorded spooled with its sizes", func(t *testing.T) {
+	t.Run("a part is recorded written with its sizes", func(t *testing.T) {
 		part(id, 1, multihash.Multihash{0xd1, 0x0a}, multihash.Multihash{0xd1, 0x0b})
 		parts, err := st.ListParts(ctx, id)
 		if err != nil || len(parts) != 1 || parts[0].State != registry.PartWritten || !slices.Equal(parts[0].SpanLengths, []int64{1, 2}) {
-			t.Fatalf("ListParts = %+v, err %v; want one spooled part with sizes [1 2]", parts, err)
+			t.Fatalf("ListParts = %+v, err %v; want one written part with sizes [1 2]", parts, err)
 		}
 		// Sizes must match the digests one for one, which a constraint
 		// enforces.

@@ -66,12 +66,11 @@ type ServerConfig struct {
 	// means releases are due immediately.
 	ReleaseGrace time.Duration
 
-	// LocalBlobMaxBytes is the byte budget for the spool and the cache
-	// together, writes in progress included, enforced by the local blob
-	// sweeper; zero means no budget. CacheTTL is how long a blob stays
-	// cached after it was cached or last read; zero → 1h. LocalBlobOrphanAge
-	// is the age at which the sweeper deletes files no upload intent names;
-	// zero → 24h. Config.ServerConfig() applies the defaults documented on
+	// LocalBlobMaxBytes is the byte budget for the cache, writes in progress
+	// included, enforced by the local blob sweeper; zero means no budget.
+	// CacheTTL is how long a blob stays cached after it was cached or last
+	// read; zero → 1h. LocalBlobOrphanAge is the age at which the sweeper
+	// deletes a write's unfinished temporary file; zero → 24h. Config.ServerConfig() applies the defaults documented on
 	// Config.
 	LocalBlobMaxBytes  int64
 	CacheTTL           time.Duration

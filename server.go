@@ -58,19 +58,14 @@ type ServerDeps struct {
 	// Uploader is the destination for sealed catalog CAR segments.
 	Uploader uploader.Uploader
 
-	// BodyUploader makes each object-body blob durable on Forge by digest
-	// (allocate→PUT→accept), synchronously during a PUT. Remover releases a
-	// space's claim on a blob when its last reference is dropped. In tests both
-	// are no-ops and reads are served from local disk.
-	BodyUploader uploader.BodyUploader
-	// Deferred extends BodyUploader for multipart's deferred accept:
-	// park at UploadPart (WithConclude(false)), conclude at Complete,
-	// abort at Abort.
-	Deferred uploader.DeferredBodyUploader
-	Remover  uploader.BlobRemover
-	// Streaming uploads each body blob while it is spooled, allocating it
-	// before its digest is known. Required: every multipart part streams.
+	// Streaming uploads each object-body blob as the body arrives,
+	// allocating it before its digest is known. Deferred concludes a parked
+	// blob (at the end of a PUT, or at a multipart Complete) and aborts one
+	// (at Abort). Remover releases a space's claim on a blob when its last
+	// reference is dropped.
 	Streaming uploader.StreamingBodyUploader
+	Deferred  uploader.DeferredBodyUploader
+	Remover   uploader.BlobRemover
 
 	// Registrar keeps the upload service's content-entry list in step with the
 	// catalog: one entry per committed object version, which is what the
@@ -201,24 +196,13 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		return nil, fmt.Errorf("ingot: logstore: %w", err)
 	}
 
-	// The spool and the cache share data_dir's filesystem, so moving a blob
-	// from one to the other is a rename.
-	spool, err := blockstore.NewSpool(filepath.Join(cfg.DataDir, "spool"))
-	if err != nil {
-		_ = log.Close(ctx)
-		return nil, fmt.Errorf("ingot: spool: %w", err)
-	}
 	cache, err := blockstore.NewBlobCache(filepath.Join(cfg.DataDir, "cache"))
 	if err != nil {
 		_ = log.Close(ctx)
 		return nil, fmt.Errorf("ingot: blob cache: %w", err)
 	}
-	if err := cache.CheckTake(spool); err != nil {
-		_ = log.Close(ctx)
-		return nil, fmt.Errorf("ingot: %w", err)
-	}
 
-	bs := blockstore.NewLayered(blockstore.LocalBlobs{Cache: cache, Spool: spool}, log, deps.BaseBlockReader)
+	bs := blockstore.NewLayered(cache, log, deps.BaseBlockReader)
 	// The global meter provider is a no-op until a host (the daemon) installs
 	// one, so counting costs nothing when nobody is listening.
 	if err := bs.CountBlobReads(otel.Meter("github.com/fil-forge/ingot/blockstore")); err != nil {
@@ -234,10 +218,8 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		Parks:        deps.Parks,
 		Reads:        bs,
 		Log:          log,
-		Spool:        spool,
 		Cache:        cache,
 		Ships:        deps.Uploader,
-		Uploader:     deps.BodyUploader,
 		Deferred:     deps.Deferred,
 		Remover:      deps.Remover,
 		Streaming:    deps.Streaming,
@@ -785,9 +767,6 @@ func validateServerInputs(cfg config.ServerConfig, deps ServerDeps) error {
 	}
 	if deps.Uploader == nil {
 		return errors.New("ingot: ServerDeps.Uploader is required")
-	}
-	if deps.BodyUploader == nil {
-		return errors.New("ingot: ServerDeps.BodyUploader is required")
 	}
 	if deps.Streaming == nil {
 		return errors.New("ingot: ServerDeps.Streaming is required")

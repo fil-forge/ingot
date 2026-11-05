@@ -60,15 +60,15 @@ func TestForgeEncryption(t *testing.T) {
 	if _, err := cl.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(tamperBucket)}); err != nil {
 		t.Fatalf("CreateBucket: %v", err)
 	}
-	spoolBefore := localBlobPaths(t, ctx, s)
+	localBefore := localBlobPaths(t, ctx, s)
 	if _, err := cl.PutObject(ctx, &s3.PutObjectInput{
 		Bucket: aws.String(tamperBucket), Key: aws.String(tamperKey), Body: bytes.NewReader(tamperData),
 	}); err != nil {
 		t.Fatalf("PutObject: %v", err)
 	}
-	added := newLocalPaths(spoolBefore, localBlobPaths(t, ctx, s))
+	added := newLocalPaths(localBefore, localBlobPaths(t, ctx, s))
 	if len(added) != 1 {
-		t.Fatalf("PUT spooled %d envelopes, want 1 (a 1 MiB object is a single blob under the default config)", len(added))
+		t.Fatalf("PUT cached %d envelopes, want 1 (a 1 MiB object is a single blob under the default config)", len(added))
 	}
 	corruptLocalFileTail(t, ctx, s, added[0], 100)
 
@@ -165,11 +165,11 @@ func TestForgeEncryption(t *testing.T) {
 		if len(added) != 3 {
 			t.Fatalf("multipart object references %d blobs, want 3 (one per part under the default config)", len(added))
 		}
-		// A part's spool copy goes once it parks, so the pre-delete read must
+		// A part keeps no local copy, so the pre-delete read must
 		// come from piri — proving all three part blobs are durable on the
 		// network before we assert the release traverses it.
-		if spooled := spooledDigests(t, ctx, s, added); len(spooled) != 0 {
-			t.Fatalf("parked part blobs still in the spool: %v", spooled)
+		if local := localDigests(t, ctx, s, added); len(local) != 0 {
+			t.Fatalf("parked part blobs have local copies: %v", local)
 		}
 		if got := getBody(t, ctx, cl, bucket, key, ""); !bytes.Equal(got, whole) {
 			t.Fatalf("read-through from piri before delete mismatched: got %d bytes, want %d", len(got), len(whole))
@@ -238,8 +238,8 @@ func TestForgeEncryption(t *testing.T) {
 	// blob_encryption_params row is the region wrap of the per-blob CEK —
 	// deleting it is the per-blob crypto-shred (migration 00014) — and
 	// DeleteObject removes it, the location row, and the network claim for
-	// every body blob, then frees the blob's spooled envelope. A multipart
-	// part's envelope leaves the spool once it parks, so a single-PUT object,
+	// every body blob, then frees the blob's cached envelope. A multipart
+	// part keeps no local copy, so a single-PUT object,
 	// whose envelope stays until its release, proves the release frees it.
 	// Versioned buckets' delete-marker path deliberately does not shred (S3
 	// semantics); this covers the unversioned path.
@@ -292,8 +292,8 @@ func TestForgeEncryption(t *testing.T) {
 			t.Fatalf("PutObject: %v", err)
 		}
 		putDigests := objectBlobDigestsHex(t, ctx, s, bucket, putKey)
-		if spooled := spooledDigests(t, ctx, s, putDigests); len(spooled) != len(putDigests) {
-			t.Fatalf("pre-delete: %d of the single-PUT object's %d envelopes in the spool, want all", len(spooled), len(putDigests))
+		if local := localDigests(t, ctx, s, putDigests); len(local) != len(putDigests) {
+			t.Fatalf("pre-delete: %d of the single-PUT object's %d envelopes cached, want all", len(local), len(putDigests))
 		}
 		if _, err := cl.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(bucket), Key: aws.String(putKey)}); err != nil {
 			t.Fatalf("DeleteObject %s: %v", putKey, err)
@@ -316,7 +316,7 @@ func TestForgeEncryption(t *testing.T) {
 		}
 
 		// The claims drop synchronously with the delete; the shred (enc-params
-		// + location rows) and the spool cleanup are deferred behind the
+		// + location rows) and the cache cleanup are deferred behind the
 		// release grace (60s default) and executed by the release task —
 		// poll them through.
 		refsQ := fmt.Sprintf(`SELECT count(*) FROM ingot.blob_refs WHERE bucket = '%s' AND object_key = '%s'`, bucket, key)
@@ -327,22 +327,22 @@ func TestForgeEncryption(t *testing.T) {
 		for {
 			enc := countRowsForDigests(t, ctx, s, "ingot.blob_encryption_params", "digest", digests)
 			loc := countRowsForDigests(t, ctx, s, "ingot.blob_locations", "digest", digests)
-			spooled := spooledDigests(t, ctx, s, digests)
-			if enc == 0 && loc == 0 && len(spooled) == 0 {
+			local := localDigests(t, ctx, s, digests)
+			if enc == 0 && loc == 0 && len(local) == 0 {
 				break
 			}
 			if time.Now().After(shredDeadline) {
-				t.Fatalf("deferred shred never executed: %d enc-params + %d location rows survive, spool still holds %v", enc, loc, spooled)
+				t.Fatalf("deferred shred never executed: %d enc-params + %d location rows survive, cache still holds %v", enc, loc, local)
 			}
 			time.Sleep(5 * time.Second)
 		}
-		t.Logf("shred OK: %d region-wrap rows destroyed, the single-PUT envelope freed from the spool", len(digests))
+		t.Logf("shred OK: %d region-wrap rows destroyed, the single-PUT envelope freed from the cache", len(digests))
 	})
 
 	// AbortShredsKeyRows: aborting an upload shreds the orphaned parts' key
 	// rows — the part blobs' releases delete each blob's enc-params row,
-	// upload intent, and park row (the spool and piri unwind are pinned by
-	// MultipartPartKeepsNoSpoolCopy and TestForgeDeferredMultipart/AbortRejects).
+	// upload intent, and park row (the local and piri unwind are pinned by
+	// MultipartPartKeepsNoLocalCopy and TestForgeDeferredMultipart/AbortRejects).
 	// Expiry-sweep shred is TestForgeMultipartExpiryShred (needs a low-TTL
 	// stack).
 	t.Run("AbortShredsKeyRows", func(t *testing.T) {
@@ -600,7 +600,7 @@ func TestForgeEncryption(t *testing.T) {
 // FEE envelope must clear piri's piece cap on the real ship path.
 //
 // Gated behind INGOT_ITEST_BIG=1: it moves ~10-15 GiB through the Docker
-// stack (spool copy + piri copy; nothing reclaims the spool) and takes
+// stack (piri's copy) and takes
 // minutes. CI sets the gate (.github/workflows/go-test.yml); a plain local
 // `make itest` skips it.
 func TestForgeMaxSizePart(t *testing.T) {
@@ -762,16 +762,16 @@ func TestForgeMultipartExpiryShred(t *testing.T) {
 	t.Logf("expiry sweep shredded %d part-blob key rows and the session", len(digests))
 }
 
-// spooledDigests returns the hex digests that still have a local copy in the
-// ingot container, in the spool or the cache. A copy's filename is the hex
-// ciphertext multihash, so a blob_refs digest maps to /data/spool/<hex> or
+// localDigests returns the hex digests that still have a local copy in the
+// ingot container's cache. A copy's filename is the hex ciphertext
+// multihash, so a blob_refs digest maps to
 // /data/cache/<hex>.
-func spooledDigests(t *testing.T, ctx context.Context, s *stack.Stack, digests []string) []string {
+func localDigests(t *testing.T, ctx context.Context, s *stack.Stack, digests []string) []string {
 	t.Helper()
 	out, errOut, err := s.Exec(ctx, "ingot", "sh", "-c",
-		fmt.Sprintf(`for d in %s; do if [ -e "/data/spool/$d" ] || [ -e "/data/cache/$d" ]; then echo "$d"; fi; done`, strings.Join(digests, " ")))
+		fmt.Sprintf(`for d in %s; do if [ -e "/data/cache/$d" ]; then echo "$d"; fi; done`, strings.Join(digests, " ")))
 	if err != nil {
-		t.Fatalf("list spooled blobs: %v (stderr=%s)", err, errOut)
+		t.Fatalf("list cached blobs: %v (stderr=%s)", err, errOut)
 	}
 	return strings.Fields(out)
 }

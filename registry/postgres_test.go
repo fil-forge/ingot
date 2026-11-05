@@ -137,7 +137,7 @@ func TestPostgresStores(t *testing.T) {
 		// A claim publishes the digest's upload intent, and the state stays
 		// once the claims are gone: it is the durable mark of a committed blob.
 		pubDigest := multihash.Multihash([]byte{0x12, 0x20, 0xc1, 0xa1})
-		if err := r.PutIntent(ctx, registry.UploadIntent{Space: space, Digest: pubDigest, LocalPath: "/spool/x", Size: 1, State: registry.IntentAccepted, Bucket: "b"}); err != nil {
+		if err := r.PutIntent(ctx, registry.UploadIntent{Space: space, Digest: pubDigest, Size: 1, State: registry.IntentAccepted, Bucket: "b"}); err != nil {
 			t.Fatalf("PutIntent: %v", err)
 		}
 		if err := r.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: pubDigest, Provider: "did:key:p", URL: "http://p/blob", Size: 1}); err != nil {
@@ -258,7 +258,7 @@ func TestPostgresStores(t *testing.T) {
 
 	t.Run("intent lifecycle", func(t *testing.T) {
 		space := testutil.RandomDID(t)
-		if err := r.PutIntent(ctx, registry.UploadIntent{Space: space, Digest: digest, LocalPath: "/spool/x", Size: 9, State: registry.IntentSpooled, Bucket: "b"}); err != nil {
+		if err := r.PutIntent(ctx, registry.UploadIntent{Space: space, Digest: digest, Size: 9, State: registry.IntentUploading, Bucket: "b"}); err != nil {
 			t.Fatalf("PutIntent: %v", err)
 		}
 		if err := r.SetIntentState(ctx, space, digest, registry.IntentUploading); err != nil {

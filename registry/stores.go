@@ -23,23 +23,17 @@ import (
 // names those versions' blob_refs rows and answers `?versionId=null`.
 const NullVersionID = "null"
 
-// upload_intents.state values (the local-store lifecycle, §5): spooled on
-// ingest (uploading from the start for a blob streamed as it spools),
-// uploading once its upload has started, parked once durable on a provider
-// with the accept deferred, accepted once the provider has accepted it (at
-// once for a blob already stored for the space), and published once a
+// upload_intents.state values (the upload lifecycle, §5): uploading on
+// ingest, the blob having streamed to its provider, parked once durable on a
+// provider with the accept deferred, accepted once the provider has accepted
+// it (at once for a blob already stored for the space), and published once a
 // bucket commit has claimed it. Published is written with the blob's first
 // reference claim, in the same transaction, and never changes: it is the
-// durable record that the blob was committed. Its release removes the local
-// copy (spool or cache) and the intent, as it does for a blob that was never
-// committed.
+// durable record that the blob was committed. Its release removes the intent,
+// as it does for a blob that was never committed.
 const (
-	IntentSpooled = "spooled"
-	// IntentUploading is set before a blob's first network call and stands
-	// until a row records the outcome (a park or a location): the blob may
-	// be on the network. A blob still 'spooled' never left this node, which
-	// a release relies on to skip a network remove it could not authorize
-	// from the background.
+	// IntentUploading stands until a row records the upload's outcome (a
+	// park or a location): the blob may be on the network.
 	IntentUploading = "uploading"
 	IntentParked    = "parked"
 	IntentAccepted  = "accepted"
@@ -84,32 +78,21 @@ type BlobClaim struct {
 	Space     did.DID
 }
 
-// UploadIntent is one row of ingot.upload_intents: a blob Ingot holds on
-// disk, with its lifecycle state for one space. Keyed by (Space, Digest): a
-// blob stored as received has the digest of its bytes, so the same bytes
-// written to two spaces are one spool file and two intents, each tracking
-// its own space's upload. The file is shared, so it may go only when no
-// intent for the digest still needs it (see CountOtherIntents).
+// UploadIntent is one row of ingot.upload_intents: a blob Ingot wrote, with
+// its lifecycle state for one space. Keyed by (Space, Digest): a blob stored
+// as received has the digest of its bytes, so the same bytes written to two
+// spaces are one cached copy and two intents, each tracking its own space's
+// upload. The cached copy is shared, so it may go only when no intent for the
+// digest still needs it (see CountOtherIntents).
 type UploadIntent struct {
 	Space  did.DID
 	Digest multihash.Multihash
-	// LocalPath is where the blob was written: its spool path. Once the
-	// provider holds the blob its copy may move to the cache, so nothing
-	// reads a blob through this path.
-	LocalPath string
-	Size      int64
-	State     string
-	Bucket    string
+	Size   int64
+	State  string
+	Bucket string
 	// UpdatedAt is when State last changed (for a committed blob, its commit
 	// time). Filled on every read; ignored by PutIntent.
 	UpdatedAt time.Time
-}
-
-// StalledSizes is StalledBytes's sum for each state a stalled upload can be
-// left in: Spooled, a body that never left this node; Uploading, one whose
-// upload started and may have reached its provider.
-type StalledSizes struct {
-	Spooled, Uploading int64
 }
 
 // BlobLocation is one row of ingot.blob_locations: where a blob can be
@@ -322,9 +305,8 @@ type BlobRefStore interface {
 	QueueReleases(ctx context.Context, space did.DID, digests []multihash.Multihash, notBefore time.Time, release ReleaseTask) error
 }
 
-// IntentStore is the local-store index (§5): the on-disk blobs Ingot holds
-// and their lifecycle state. Drives read-after-write, cache lookup, spool
-// eviction, and crash recovery.
+// IntentStore is the upload index (§5): the blobs Ingot wrote and their
+// lifecycle state. Drives releases, cache eviction, and crash recovery.
 type IntentStore interface {
 	// PutIntent upserts the (Space, Digest) intent.
 	PutIntent(ctx context.Context, in UploadIntent) error
@@ -336,17 +318,14 @@ type IntentStore interface {
 	ListIntentsByState(ctx context.Context, state string) ([]UploadIntent, error)
 	DeleteIntent(ctx context.Context, space did.DID, digest multihash.Multihash) error
 	// CountOtherIntents returns how many spaces other than space hold an
-	// intent for digest. Zero means the local file is this space's alone to
-	// remove; otherwise another space's upload or read may still use it,
-	// and its removal is left to that space's release.
+	// intent for digest. Zero means the cached copy is this space's alone to
+	// remove; otherwise another space's reads may still use it, and its
+	// removal is left to that space's release.
 	CountOtherIntents(ctx context.Context, space did.DID, digest multihash.Multihash) (int, error)
-	// MissingIntents returns the digests among digests that have no intent
-	// row in any space, for the sweeper's orphan-file pass.
-	MissingIntents(ctx context.Context, digests []multihash.Multihash) ([]multihash.Multihash, error)
-	// StalledBytes sums the sizes of 'spooled' and 'uploading' intents whose
-	// state last changed before before, by state: bodies whose upload has
-	// outlasted any live request, which nothing reclaims.
-	StalledBytes(ctx context.Context, before time.Time) (StalledSizes, error)
+	// StalledBytes sums the sizes of 'uploading' intents whose state last
+	// changed before before: bodies whose upload has outlasted any live
+	// request, which nothing reclaims.
+	StalledBytes(ctx context.Context, before time.Time) (int64, error)
 }
 
 // LocationStore is the local blob-location table (§8, appliance topology):
@@ -518,7 +497,7 @@ type MultipartStore interface {
 	// never left 'open' counts from its creation.
 	ListStaleSessions(ctx context.Context, state string, cutoff time.Time) ([]MultipartSession, error)
 	// CountPartRefs returns how many parts OUTSIDE excludeUploadID reference
-	// digest — the shared-blob guard for abort/supersede spool cleanup
+	// digest — the shared-blob guard for abort/supersede cleanup
 	// (content-addressed part blobs may be deduped across sessions).
 	CountPartRefs(ctx context.Context, digest multihash.Multihash, excludeUploadID string) (int, error)
 	// CountLivePartRefs returns how many parts of space's in-flight sessions

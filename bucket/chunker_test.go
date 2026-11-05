@@ -6,7 +6,6 @@ import (
 	"crypto/md5"
 	"crypto/sha256"
 	"io"
-	"path/filepath"
 	"testing"
 
 	"github.com/fil-forge/ucantone/did"
@@ -38,13 +37,32 @@ func TestDefaultMaxBlobSizeFitsPiri(t *testing.T) {
 	}
 }
 
-func testSpool(t *testing.T) *blockstore.Spool {
-	t.Helper()
-	s, err := blockstore.NewSpool(filepath.Join(t.TempDir(), "spool"))
-	if err != nil {
-		t.Fatalf("spool: %v", err)
+// memBlobs is a blob store in memory: a blockstore.BlobWriter that keys each
+// blob by its sha256 digest, and the BlobReader that reads it back.
+type memBlobs struct{ blobs map[string][]byte }
+
+func testBlobs(*testing.T) *memBlobs { return &memBlobs{blobs: map[string][]byte{}} }
+
+func (m *memBlobs) WriteBlob(_ context.Context, r io.Reader) (mh.Multihash, int64, error) {
+	data, err := io.ReadAll(r)
+	if err != nil || len(data) == 0 {
+		return nil, int64(len(data)), err
 	}
-	return s
+	sum := sha256.Sum256(data)
+	digest, err := mh.Encode(sum[:], mh.SHA2_256)
+	if err != nil {
+		return nil, 0, err
+	}
+	m.blobs[string(digest)] = data
+	return digest, int64(len(data)), nil
+}
+
+func (m *memBlobs) OpenBlob(_ context.Context, _ did.DID, digest mh.Multihash) (io.ReadCloser, error) {
+	data, ok := m.blobs[string(digest)]
+	if !ok {
+		return nil, blockstore.ErrNotFound
+	}
+	return io.NopCloser(bytes.NewReader(data)), nil
 }
 
 func makeData(n int) []byte {
@@ -55,12 +73,12 @@ func makeData(n int) []byte {
 	return d
 }
 
-// TestSplitBody_StreamingRoundTrip splits a multi-blob body through the spool and
+// TestSplitBody_StreamingRoundTrip splits a multi-blob body through a blob store and
 // reads it back, asserting the blob boundaries, the whole-body digests, and a
 // byte-exact round trip — all via the streaming WriteBlob/OpenBlob path.
 func TestSplitBody_StreamingRoundTrip(t *testing.T) {
 	ctx := context.Background()
-	sp := testSpool(t)
+	sp := testBlobs(t)
 	const max = int64(4096)
 	data := makeData(10000) // → blobs of 4096, 4096, 1808
 
@@ -106,7 +124,7 @@ func TestSplitBody_StreamingRoundTrip(t *testing.T) {
 // boundaries — exercising the seek-into-blob path of the streaming reader.
 func TestOpenBodyRange(t *testing.T) {
 	ctx := context.Background()
-	sp := testSpool(t)
+	sp := testBlobs(t)
 	const max = int64(4096)
 	data := makeData(10000)
 	_, blobs, err := SplitBody(ctx, sp, bytes.NewReader(data), max)
@@ -138,7 +156,7 @@ func TestOpenBodyRange(t *testing.T) {
 // TestSplitBody_Empty: a zero-byte body yields no blobs and the empty digests.
 func TestSplitBody_Empty(t *testing.T) {
 	ctx := context.Background()
-	sp := testSpool(t)
+	sp := testBlobs(t)
 	body, blobs, err := SplitBody(ctx, sp, bytes.NewReader(nil), 4096)
 	if err != nil {
 		t.Fatalf("SplitBody: %v", err)
@@ -182,8 +200,8 @@ func TestLazyETagHash(t *testing.T) {
 	}
 }
 
-// hashingDiscardWriter stands in for the spool in benchmarks: it pays the
-// spool's sha256 pass over the bytes and drops them, so the benchmark
+// hashingDiscardWriter stands in for a blob store in benchmarks: it pays the
+// stream's sha256 pass over the bytes and drops them, so the benchmark
 // measures SplitBody's own hashing rather than the disk.
 type hashingDiscardWriter struct{}
 
@@ -198,7 +216,7 @@ func (hashingDiscardWriter) WriteBlob(_ context.Context, r io.Reader) (mh.Multih
 }
 
 // BenchmarkSplitBody measures one stream through SplitBody: the whole-body
-// BLAKE3 tree and md5 plus the spool's sha256 of each blob, with no disk.
+// BLAKE3 tree and md5 plus the stream's sha256 of each blob, with no disk.
 func BenchmarkSplitBody(b *testing.B) {
 	const size = 64 << 20
 	data := makeData(size)
@@ -234,13 +252,13 @@ func BenchmarkSplitBodyParallel(b *testing.B) {
 // WithoutMD5 leaves Body.MD5 nil and changes nothing else about the split.
 func TestSplitBody_WithoutMD5(t *testing.T) {
 	ctx := context.Background()
-	sp := testSpool(t)
+	sp := testBlobs(t)
 	data := makeData(3*4096 + 100)
 	with, withBlobs, err := SplitBody(ctx, sp, bytes.NewReader(data), 4096)
 	if err != nil {
 		t.Fatalf("SplitBody: %v", err)
 	}
-	without, withoutBlobs, err := SplitBody(ctx, testSpool(t), bytes.NewReader(data), 4096, WithoutMD5())
+	without, withoutBlobs, err := SplitBody(ctx, testBlobs(t), bytes.NewReader(data), 4096, WithoutMD5())
 	if err != nil {
 		t.Fatalf("SplitBody without md5: %v", err)
 	}

@@ -3,6 +3,7 @@ package s3frontend
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -15,18 +16,18 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.uber.org/zap"
 
+	"github.com/fil-forge/ingot/blockstore"
 	"github.com/fil-forge/ingot/internal/tracing"
 	"github.com/fil-forge/ingot/uploader"
 	"github.com/fil-forge/ucantone/did"
 )
 
-// This file is the streaming half of the body write path (the trailer-hash
-// RFC). A blob whose plaintext length is known before its first byte has a
-// known envelope length too, so it is allocated by size and hash function
-// alone and its envelope goes to the provider while it is being spooled: the
-// upload no longer waits for the body to land on disk. The spool still gets
-// its copy, which is where the digest comes from and what the read path
-// serves from, and a failed PUT falls back to uploading that copy by digest.
+// This file is the streaming body write path (the trailer-hash RFC). A
+// blob's plaintext length is known before its first byte, so its envelope
+// length is known too, and it is allocated by size and hash function alone:
+// its stored bytes go to the provider as the body arrives, and the digest is
+// computed on the way. A write that keeps a local copy tees the same bytes
+// into the cache (see localCopy).
 //
 // Until the upload is parked or accepted the provider knows it only by its
 // /blob/add task. A stream that fails aborts its allocation there and then.
@@ -35,20 +36,9 @@ import (
 // and is never served, so nothing needs to abort it sooner.
 
 // WriteSizedBlob implements bucket.SizedBlobWriter: r yields exactly n
-// plaintext bytes. Without a streaming uploader, or once the upload service
-// has refused to add by digest code, it spools the blob as WriteBlob does.
+// plaintext bytes, which go to the provider as they are read. A failed send
+// fails the write, and its allocation is aborted.
 func (w *bodyWriter) WriteSizedBlob(ctx context.Context, r io.Reader, n int64) (_ multihash.Multihash, err error) {
-	if w.stream == nil || w.digestFirst {
-		digest, got, err := w.writeBlob(ctx, r, n)
-		if err != nil {
-			return nil, err
-		}
-		if got != n {
-			return nil, fmt.Errorf("s3frontend: blob of %d bytes yielded %d", n, got)
-		}
-		return digest, nil
-	}
-
 	ctx, span := tracing.Start(ctx, "blob.stream", attribute.Int64("ingot.blob.plaintext_bytes", n))
 	defer func() { tracing.End(span, err) }()
 
@@ -63,6 +53,8 @@ func (w *bodyWriter) WriteSizedBlob(ctx context.Context, r io.Reader, n int64) (
 		if _, err := rand.Read(cek); err != nil {
 			return nil, fmt.Errorf("s3frontend: generate CEK: %w", err)
 		}
+		// EncryptWithCEK internalizes the key before returning and the wrap
+		// copies it; wipe our copy on every path out.
 		defer clear(cek)
 		rc, d, err := fee.EncryptWithCEK(r, cek, w.recipients, fee.WithPlaintextLength(n))
 		if err != nil {
@@ -79,28 +71,19 @@ func (w *bodyWriter) WriteSizedBlob(ctx context.Context, r io.Reader, n int64) (
 	span.SetAttributes(attribute.Int64("ingot.blob.bytes", stored))
 
 	sb, err := w.stream.StartBlob(ctx, w.space, stored)
-	if errors.Is(err, uploader.ErrUnsupportedDigestCode) {
-		// The upload service cannot take a blob without its digest: this
-		// body falls back to spooling each blob first, and uploading it by
-		// digest once spooled.
-		span.SetAttributes(attribute.String("ingot.blob.result", "digest_first"))
-		w.logger.Warn("upload service cannot add by digest code; spooling blobs before upload", zap.Error(err))
-		w.digestFirst = true
-		return w.spoolStored(ctx, body, desc, cek, nil)
-	}
 	if err != nil {
 		return nil, fmt.Errorf("s3frontend: start blob: %w", err)
 	}
-	// The stored bytes feed the spool, and every byte the spool reads is also
-	// written to the PUT. A spool failure fails the PUT with it, so the
-	// provider never receives a body that ends early and looks complete. A
-	// PUT failure only detaches the PUT: the spool carries on, and its copy
-	// is uploaded by digest instead.
+	local := w.localCopy()
+	// Every stored byte is written to the PUT, the hash and the local copy.
+	// A failed PUT stops the copy, and a body that fails or ends early fails
+	// the PUT with it, so the provider never receives a body that ends early
+	// and looks complete.
 	pr, pw := io.Pipe()
 	putDone := make(chan error, 1)
 	go func() {
 		err := w.stream.PutBlob(ctx, sb, pr)
-		// Nothing reads the pipe from here on; unblock the spool.
+		// Nothing reads the pipe from here on; unblock the copy.
 		if err != nil {
 			pr.CloseWithError(err)
 		} else {
@@ -108,46 +91,82 @@ func (w *bodyWriter) WriteSizedBlob(ctx context.Context, r io.Reader, n int64) (
 		}
 		putDone <- err
 	}()
-	sink := &detachableWriter{w: pw}
-	digest, err := w.spoolStored(ctx, io.TeeReader(body, sink), desc, cek, &sb)
+	hasher := sha256.New()
+	got, err := io.Copy(io.MultiWriter(pw, hasher, local), body)
 	if err != nil {
 		pw.CloseWithError(err)
 		<-putDone
+		local.discard()
 		// The request may have ended with the body; the abort should not.
 		w.abandon(context.WithoutCancel(ctx), sb)
-		return nil, err
+		return nil, fmt.Errorf("s3frontend: stream blob: %w", err)
 	}
 	pw.Close()
 	if putErr := <-putDone; putErr != nil {
-		// The spooled copy is whole; the allocation that took the failed PUT
-		// is released and the blob uploads by digest like any spooled blob.
-		span.SetAttributes(attribute.String("ingot.blob.result", "put_failed"))
-		w.logger.Warn("streamed put failed; uploading the spooled blob by digest", zap.Error(putErr))
-		res := w.results[string(digest)]
-		res.streamed = nil
-		w.results[string(digest)] = res
-		w.abandon(ctx, sb)
-		return digest, nil
+		local.discard()
+		w.abandon(context.WithoutCancel(ctx), sb)
+		return nil, fmt.Errorf("s3frontend: put blob: %w", putErr)
+	}
+	if got != sb.Size {
+		local.discard()
+		w.abandon(context.WithoutCancel(ctx), sb)
+		return nil, fmt.Errorf("s3frontend: blob of %d bytes was allocated %d", got, sb.Size)
+	}
+	digest, err := multihash.Encode(hasher.Sum(nil), multihash.SHA2_256)
+	if err != nil {
+		local.discard()
+		w.abandon(context.WithoutCancel(ctx), sb)
+		return nil, fmt.Errorf("s3frontend: blob digest: %w", err)
+	}
+	if err := w.record(ctx, digest, cek, encWrite{desc: desc, storedSize: got, streamed: sb, local: local.kept()}); err != nil {
+		return nil, err
 	}
 	span.SetAttributes(attribute.String("ingot.blob.result", "streamed"))
 	return digest, nil
 }
 
-// spoolStored spools a blob's stored bytes (its envelope, or the plaintext
-// itself), checks they are the length promised, and records the blob's
-// state. streamed is the upload the bytes are being sent to, if any.
-func (w *bodyWriter) spoolStored(ctx context.Context, stored io.Reader, desc fee.BodyDescriptor, cek []byte, streamed *uploader.StreamedBlob) (multihash.Multihash, error) {
-	digest, storedSize, err := w.writeSpool(ctx, stored)
+// localCopy starts the blob's copy in the cache, when the write keeps one.
+// The cache is only an optimisation, so a copy that cannot be started, or
+// whose write fails, is dropped and the upload goes on without it.
+func (w *bodyWriter) localCopy() *localCopy {
+	if w.cache == nil {
+		return &localCopy{}
+	}
+	t, err := w.cache.CreateTemp()
 	if err != nil {
-		return nil, fmt.Errorf("s3frontend: spool blob: %w", err)
+		w.logger.Warn("could not start a blob's local copy; it is not cached", zap.Error(err))
+		return &localCopy{}
 	}
-	if streamed != nil && storedSize != streamed.Size {
-		return nil, fmt.Errorf("s3frontend: blob of %d bytes was allocated %d", storedSize, streamed.Size)
+	return &localCopy{t: t, logger: w.logger}
+}
+
+// localCopy writes to a blob's temporary file in the cache until a write
+// fails, then discards the file and what follows. It never fails itself, so
+// the stream it tees from carries on.
+type localCopy struct {
+	t      *blockstore.TempBlob
+	logger *zap.Logger
+}
+
+func (l *localCopy) Write(p []byte) (int, error) {
+	if l.t != nil {
+		if _, err := l.t.Write(p); err != nil {
+			l.logger.Warn("writing a blob's local copy failed; it is not cached", zap.Error(err))
+			l.discard()
+		}
 	}
-	if err := w.record(ctx, digest, cek, encWrite{desc: desc, storedSize: storedSize, streamed: streamed}); err != nil {
-		return nil, err
-	}
-	return digest, nil
+	return len(p), nil
+}
+
+// discard drops the copy.
+func (l *localCopy) discard() {
+	l.t.Discard()
+	l.t = nil
+}
+
+// kept is the finished copy, or nil when there is none.
+func (l *localCopy) kept() *blockstore.TempBlob {
+	return l.t
 }
 
 // abandonTimeLimit bounds how long a request waits for a streamed upload's
@@ -187,23 +206,9 @@ func (w *bodyWriter) abandonStreamed(ctx context.Context) {
 // errPutFinished closes the PUT's end of the pipe once the PUT has returned.
 var errPutFinished = errors.New("s3frontend: put finished")
 
-// detachableWriter writes to w until a write fails, then discards what
-// follows. It never fails itself, so the reader it tees from carries on.
-type detachableWriter struct {
-	w   io.Writer
-	err error
-}
-
-func (d *detachableWriter) Write(p []byte) (int, error) {
-	if d.err == nil {
-		_, d.err = d.w.Write(p)
-	}
-	return len(p), nil
-}
-
-// abandonStream gives up a streamed upload whose parked bytes a release may
-// have taken (see concludeStreamed): the allocation is aborted on its
-// provider, best effort, as bodyWriter.abandon does.
+// abandonStream gives up a streamed upload whose blob the space holds
+// already (see concludeStreamed): the allocation is aborted on its provider,
+// best effort, as bodyWriter.abandon does.
 func (b *Backend) abandonStream(ctx context.Context, space did.DID, sb uploader.StreamedBlob) {
 	ctx, cancel := context.WithTimeout(ctx, abandonTimeLimit)
 	defer cancel()
