@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"iter"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -117,14 +118,19 @@ func (f *fakeSource) calls() []swarfclient.Cursor {
 	return append([]swarfclient.Cursor(nil), f.opened...)
 }
 
-// fakeInvalidator records every Revoke and ClearAll call.
+// fakeInvalidator records every Revoke and ClearAll call, running onClear,
+// when set, on each ClearAll.
 type fakeInvalidator struct {
 	mu      sync.Mutex
 	revoked []cid.Cid
 	cleared int
+	onClear func()
 }
 
 func (f *fakeInvalidator) ClearAll() int {
+	if f.onClear != nil {
+		f.onClear()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.cleared++
@@ -325,7 +331,8 @@ func TestConsumerRetriesTheHeadAfterARefusal(t *testing.T) {
 		scripts:  []streamScript{refusal},
 		headErrs: []error{errors.New("connection refused")},
 	}
-	inv := &fakeInvalidator{}
+	var headsAtClear atomic.Int32
+	inv := &fakeInvalidator{onClear: func() { headsAtClear.Store(int32(src.headCalls())) }}
 	c := revocation.NewConsumer(src, storedCursor(t), inv,
 		revocation.WithBackoff(time.Millisecond, time.Millisecond))
 	stop := run(c)
@@ -335,6 +342,7 @@ func TestConsumerRetriesTheHeadAfterARefusal(t *testing.T) {
 	require.Equal(t, testHead, src.calls()[1])
 	require.Equal(t, 2, src.headCalls())
 	require.Equal(t, 1, inv.clears())
+	require.Equal(t, int32(2), headsAtClear.Load(), "cleared before the head was read")
 }
 
 // A cursor the service refuses is logged as an error, and the consumer clears

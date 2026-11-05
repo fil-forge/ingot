@@ -34,9 +34,11 @@
 // it once new records pass it, skipping every record in between.
 //
 // If new records pass the cursor before the consumer reconnects, the service
-// accepts it and nothing reports the gap. After restoring the service's
-// database from a backup, restart ingot: that empties every cache, so no
-// revocation recorded before the restart can matter.
+// accepts it and nothing reports the gap. So after restoring the service's
+// database from a backup, or restarting a service that keeps its records in
+// memory, restart ingot once the service is serving again. The restart empties
+// every cache, and any record the consumer then skips was recorded before it,
+// so none can matter.
 //
 // The gateway keeps serving while the service is unreachable (reconnect with
 // capped backoff); in the worst case cache entries age out on their own TTLs,
