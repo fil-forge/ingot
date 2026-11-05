@@ -377,9 +377,8 @@ func (b *Backend) SweepPendingReleases(ctx context.Context) (int, error) {
 			}
 		}
 	}
-	expires := time.Now().Add(10 * time.Second)
 	for _, subject := range subjects {
-		if err := b.flushRelease(ctx, subject, expires); err != nil {
+		if err := b.flushRelease(ctx, subject, time.Now().Add(10*time.Second)); err != nil {
 			return 0, err
 		}
 	}
