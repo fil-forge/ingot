@@ -197,6 +197,11 @@ func withDatabase(dsn, name string) (string, error) {
 			return "", fmt.Errorf("parse %s: %w", DSNEnv, err)
 		}
 		u.Path = "/" + name
+		// A dbname parameter would override the path, leaving the test on
+		// the database it was given instead of its own.
+		q := u.Query()
+		q.Del("dbname")
+		u.RawQuery = q.Encode()
 		return u.String(), nil
 	}
 	return dsn + " dbname=" + name, nil
