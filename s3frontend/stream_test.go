@@ -11,6 +11,7 @@ import (
 	"os"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
@@ -52,6 +53,9 @@ type streamingUploader struct {
 	aborted   []cid.Cid
 	// abortErr, when set, is what AbortBlob answers.
 	abortErr error
+	// abortStalls makes AbortBlob wait for its context to end, as a stalled
+	// upload service does.
+	abortStalls bool
 	// concludeErr, when set, is returned by ConcludeBlobs alongside the
 	// locations, as a batch that failed after its accepts ran returns it.
 	concludeErr error
@@ -113,11 +117,16 @@ func (s *streamingUploader) UploadBlob(ctx context.Context, space did.DID, diges
 	return s.NopUploader.UploadBlob(ctx, space, digest, size, path, opts...)
 }
 
-func (s *streamingUploader) AbortBlob(_ context.Context, _ did.DID, cause cid.Cid) error {
+func (s *streamingUploader) AbortBlob(ctx context.Context, _ did.DID, cause cid.Cid) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.aborted = append(s.aborted, cause)
-	return s.abortErr
+	stalls, err := s.abortStalls, s.abortErr
+	s.mu.Unlock()
+	if stalls {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	return err
 }
 
 // GetBlock serves no catalog blocks: those come from the log tier.
@@ -322,6 +331,29 @@ func TestStreamedPutObjectWrongLength(t *testing.T) {
 			require.Contains(t, su.aborted, last.AddTask, "the failed stream's allocation is aborted at once")
 		})
 	}
+}
+
+// TestStreamedPutObjectStalledAbort: a body of the wrong length still gets its
+// error when the upload service stalls the abort, which runs past the request
+// for at most abandonTimeLimit and is then left to the provider's expiry.
+func TestStreamedPutObjectStalledAbort(t *testing.T) {
+	defer func(d time.Duration) { abandonTimeLimit = d }(abandonTimeLimit)
+	abandonTimeLimit = 50 * time.Millisecond
+	su := newStreamingUploader()
+	su.abortStalls = true
+	b, _ := newStreamingBackend(t, su)
+
+	done := make(chan error, 1)
+	go func() { done <- putSized(t, b, "k", testBody(400<<10), 500<<10) }()
+	select {
+	case err := <-done:
+		var apiErr s3err.APIError
+		require.ErrorAs(t, err, &apiErr)
+		require.Equal(t, "IncompleteBody", apiErr.Code)
+	case <-time.After(10 * time.Second):
+		t.Fatal("the request waited on the stalled abort")
+	}
+	require.Len(t, su.aborted, 1, "the abort was tried")
 }
 
 func TestStreamedUploadPart(t *testing.T) {

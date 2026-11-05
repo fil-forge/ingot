@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/filecoin-project/go-fee"
 	"github.com/filecoin-project/go-fee/aesstream"
@@ -148,9 +149,18 @@ func (w *bodyWriter) spoolStored(ctx context.Context, stored io.Reader, desc fee
 	return digest, nil
 }
 
+// abandonTimeLimit bounds how long a request waits for a streamed upload's
+// abort, which may run after the request's own context has ended. An abort cut
+// short is left to the provider's expiry. Package-level so tests can shrink
+// it.
+var abandonTimeLimit = 10 * time.Second
+
 // abandon releases a streamed upload's allocation on its provider. It is best
-// effort: an allocation whose abort fails is expired by the provider.
+// effort, and waits at most abandonTimeLimit: an allocation whose abort fails
+// is expired by the provider.
 func (w *bodyWriter) abandon(ctx context.Context, sb uploader.StreamedBlob) {
+	ctx, cancel := context.WithTimeout(ctx, abandonTimeLimit)
+	defer cancel()
 	if err := w.stream.AbortBlob(ctx, w.space, sb.AddTask); err != nil {
 		w.logger.Warn("abandoning streamed upload failed; the provider expires it", zap.Stringer("add", sb.AddTask), zap.Error(err))
 	}
@@ -177,6 +187,8 @@ func (d *detachableWriter) Write(p []byte) (int, error) {
 // have taken (see concludeStreamed): the allocation is aborted on its
 // provider, best effort, as bodyWriter.abandon does.
 func (b *Backend) abandonStream(ctx context.Context, space did.DID, sb uploader.StreamedBlob) {
+	ctx, cancel := context.WithTimeout(ctx, abandonTimeLimit)
+	defer cancel()
 	if err := b.streaming.AbortBlob(ctx, space, sb.AddTask); err != nil {
 		b.logger.Warn("abandoning streamed upload failed; the provider expires it", zap.Stringer("add", sb.AddTask), zap.Error(err))
 	}
