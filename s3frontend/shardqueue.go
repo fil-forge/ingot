@@ -41,6 +41,10 @@ const (
 // written or read, when Deps.CacheTTL is zero.
 const DefaultCacheTTL = time.Hour
 
+// renewalTimeLimit bounds how long a read waits to queue its blob's renewal,
+// so a stalled database delays a cached GET by this much at most.
+const renewalTimeLimit = 5 * time.Second
+
 // renewalCapacity caps how many blobs' last renewals the backend remembers.
 // The least recently renewed entry is dropped first, and its blob's next read
 // renews it again.
@@ -113,14 +117,20 @@ func (b *Backend) submitShardCache(ctx context.Context, digest multihash.Multiha
 // renewCached extends a cached blob's time in the cache when a read finds it
 // with less than half its time to live left, by this process's record of its
 // last renewal. A blob this process has no record of (since a restart, or
-// once the record is dropped) is renewed on its first read. A failure costs
-// only an earlier eviction, and is logged.
+// once the record is dropped) is renewed on its first read. Of concurrent
+// reads, the one that claims the record renews and the rest go on. A failure
+// costs only an earlier eviction: it is logged, and the record dropped so the
+// next read tries again.
 func (b *Backend) renewCached(ctx context.Context, digest multihash.Multihash) {
-	if at, ok := b.renewals.get(string(digest)); ok && time.Since(at) < b.cacheTTL/2 {
+	if !b.renewals.claim(string(digest), time.Now(), b.cacheTTL/2) {
 		return
 	}
-	// The read may end before the task is queued; the renewal should not.
-	if err := b.submitShardCache(context.WithoutCancel(ctx), digest, false); err != nil {
+	// The read may end before the task is queued; the renewal should not, but
+	// it waits no longer than renewalTimeLimit.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), renewalTimeLimit)
+	defer cancel()
+	if err := b.submitShardCache(ctx, digest, false); err != nil {
+		b.renewals.forget(string(digest))
 		b.logger.Warn("could not extend a cached blob's time in the cache",
 			zap.String("digest", hex.EncodeToString(digest)), zap.Error(err))
 	}

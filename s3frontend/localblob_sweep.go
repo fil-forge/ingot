@@ -40,8 +40,11 @@ const (
 	DefaultLocalBlobOrphanAge = 24 * time.Hour
 )
 
-// budgetPassTimeLimit caps the budget pass so the orphan pass that may follow
-// it still runs within the sweep's time. Package-level so tests can shrink it.
+// budgetPassTimeLimit caps the budget pass's removals, counted from the end of
+// its scan, so the orphan pass that may follow it still runs within the
+// sweep's time. The scan is not counted: one cut short would leave the pass
+// nothing to remove, and the next would scan again. Package-level so tests can
+// shrink it.
 var budgetPassTimeLimit = 30 * time.Second
 
 // LocalBlobSweepStats counts what one SweepLocalBlobs run removed, per pass.
@@ -129,14 +132,12 @@ func (b *Backend) SweepLocalBlobs(ctx context.Context) (LocalBlobSweepStats, err
 	var stats LocalBlobSweepStats
 	var errs []error
 	if b.localBlobMaxBytes > 0 && b.localUsage() > b.localBlobMaxBytes {
-		budgetCtx, cancel := context.WithTimeout(ctx, budgetPassTimeLimit)
-		budgetCtx, span := tracing.Start(budgetCtx, "local_blobs.budget_pass")
-		pass, err := b.evictToBudget(budgetCtx, now.Add(budgetPassTimeLimit))
-		cancel()
+		budgetCtx, span := tracing.Start(ctx, "local_blobs.budget_pass")
+		pass, err := b.evictToBudget(budgetCtx, budgetPassTimeLimit)
 		stats.BudgetFiles, stats.BudgetBytes = pass.files, pass.bytes
 		b.localBlobMetrics.removed(ctx, removedBudget, pass.files, pass.bytes)
-		// A scan cut off by the pass's own time limit is the time limit, not
-		// a failure.
+		// A removal cut off by the pass's own time limit is the time limit,
+		// not a failure.
 		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
 			err, pass.stop = nil, stopDeadline
 		}
@@ -301,12 +302,12 @@ func (f *removeFailures) log(logger *zap.Logger, pass string) {
 }
 
 // evictToBudget evicts cached blobs (evictCached), oldest modification time
-// first, until usage reaches the low watermark, the cache runs out, or the
-// deadline passes. It reads the whole cache directory first, to order it. A
-// file it cannot remove is skipped, and the pass logs the failures once; a
-// file already gone is not counted. Once ctx is done it stops with ctx's
-// error.
-func (b *Backend) evictToBudget(ctx context.Context, deadline time.Time) (pass budgetPass, err error) {
+// first, until usage reaches the low watermark, the cache runs out, or limit
+// has passed since it began removing. It reads the whole cache directory
+// first, to order it. A file it cannot remove is skipped, and the pass logs
+// the failures once; a file already gone is not counted. Once ctx is done it
+// stops with ctx's error.
+func (b *Backend) evictToBudget(ctx context.Context, limit time.Duration) (pass budgetPass, err error) {
 	var failed removeFailures
 	defer failed.log(b.logger, "budget")
 	target := b.localBlobMaxBytes * lowWatermarkPercent / 100
@@ -319,6 +320,9 @@ func (b *Backend) evictToBudget(ctx context.Context, deadline time.Time) (pass b
 		return pass, err
 	}
 	slices.SortFunc(files, func(x, y blockstore.BlobFile) int { return x.ModTime.Compare(y.ModTime) })
+	deadline := time.Now().Add(limit)
+	ctx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
 	for _, f := range files {
 		if b.localUsage() <= target {
 			return pass, nil
