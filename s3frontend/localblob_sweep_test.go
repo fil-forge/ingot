@@ -75,6 +75,7 @@ func putSweepObjects(t *testing.T, b *Backend, n int) []multihash.Multihash {
 			t.Fatalf("object %s has %d blobs, want 1", key, len(blobs))
 		}
 		digests = append(digests, blobs[0].Digest)
+		settleCache(t, b, blobs[0].Digest)
 		// Distinct modification times, so eviction order is by age.
 		time.Sleep(2 * time.Millisecond)
 	}

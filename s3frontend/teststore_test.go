@@ -2,6 +2,7 @@ package s3frontend
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"testing"
 	"time"
@@ -74,11 +75,33 @@ func (s *testStore) start(t testing.TB, b *Backend) {
 	if err := b.RegisterShardTasks(s.tasks); err != nil {
 		t.Fatalf("register shard tasks: %v", err)
 	}
+	if err := s.tasks.Handle(ShardQueue, shardFlush, func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) {
+		return nil, nil
+	}); err != nil {
+		t.Fatalf("register shard flush: %v", err)
+	}
 	if err := s.tasks.Start(context.Background()); err != nil {
 		t.Fatalf("start task queues: %v", err)
 	}
 	s.started = true
 	t.Cleanup(func() { _ = s.tasks.Stop(context.Background()) })
+}
+
+// shardFlush is a queue-shard action that does nothing, which settleCache
+// runs to wait for the tasks queued on a digest before it.
+const shardFlush = "flush"
+
+// settleCache returns once each digest's due queue-shard tasks, such as its
+// move into the cache, have run: a sync task on a subject runs after the due
+// tasks queued there before it. A delayed eviction is not due, and stays
+// queued.
+func settleCache(t testing.TB, b *Backend, digests ...multihash.Multihash) {
+	t.Helper()
+	for _, d := range digests {
+		if _, err := b.shards.Run(t.Context(), taskrunner.Spec{Queue: ShardQueue, Subject: hex.EncodeToString(d), Action: shardFlush}); err != nil {
+			t.Fatalf("settle the cache tasks of %x: %v", d, err)
+		}
+	}
 }
 
 // Create creates the bucket as the registry does, giving it a space and a

@@ -28,6 +28,7 @@ func TestDropAcceptedBodies(t *testing.T) {
 			b, _ := newDeferredBackend(t, testfakes.NopUploader{}, tc.mods...)
 			putObj(t, b, "k", testBody(1<<10))
 			d := blobDigestOf(t, b, "k", "")
+			settleCache(t, b, d)
 
 			require.Equal(t, tc.wantFile, fileExists(b.cache.Path(d)), "cached copy present")
 			require.False(t, fileExists(b.spool.Path(d)), "spool copy present")

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/fil-forge/ucantone/did"
@@ -41,6 +42,8 @@ type recordingRegistrar struct {
 	// spent makes PrepareAuthority fail, standing in for an expired chain the
 	// space cannot renew.
 	spent bool
+	// gate, when set, holds every RegisterUploads call until it is closed.
+	gate chan struct{}
 }
 
 func (r *recordingRegistrar) roundTrips() []int {
@@ -75,6 +78,9 @@ func (r *recordingRegistrar) spendAuthority() {
 }
 
 func (r *recordingRegistrar) RegisterUploads(_ context.Context, changes []uploader.QueuedUpload) ([]error, error) {
+	if r.gate != nil {
+		<-r.gate
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.batches = append(r.batches, len(changes))
@@ -382,15 +388,25 @@ func refusals(n int) []error {
 // commits without waiting on Sprue. The change is queued and applied later.
 func TestWriteDoesNotCallTheUploadService(t *testing.T) {
 	b, reg := newCountingBackend(t)
+	// The upload service answers nothing until the write has returned, so a
+	// write that waited on it would never finish.
+	reg.gate = make(chan struct{})
 
-	putObjV(t, b, "a", []byte("hello"))
-
-	added, retracted := reg.snapshot()
-	require.Empty(t, added, "the write path must not call the upload service")
-	require.Empty(t, retracted)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		putObjV(t, b, "a", []byte("hello"))
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		close(reg.gate)
+		t.Fatal("the write waited on the upload service")
+	}
+	close(reg.gate)
 
 	drainRegistrations(t, b)
-	added, _ = reg.snapshot()
+	added, _ := reg.snapshot()
 	require.Len(t, added, 1, "draining applies what the write queued")
 }
 
