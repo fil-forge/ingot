@@ -115,7 +115,7 @@ func TestDeleteBucket_RefusalLeavesBucketReadable(t *testing.T) {
 			retired: digestOf(t, []byte("retired catalog segment")),
 		}
 		d.Log = log
-		d.Reads = blockstore.NewLayered(blockstore.LocalBlobs{Cache: d.Cache, Spool: d.Spool}, log, testfakes.NopBaseReader{})
+		d.Reads = blockstore.NewLayered(d.Cache, log, testfakes.NopBaseReader{})
 		auth = &refusingAuthority{BucketAuthority: d.Authority}
 		d.Authority = auth
 		rm = &catalogRemover{log: log, reg: d.Registry}

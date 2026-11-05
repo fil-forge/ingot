@@ -1,7 +1,6 @@
 package s3frontend
 
 import (
-	"bytes"
 	"context"
 	"encoding/hex"
 	"io"
@@ -12,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/fil-forge/libforge/testutil"
 	"github.com/fil-forge/ucantone/did"
 	"github.com/multiformats/go-multihash"
 	"github.com/stretchr/testify/require"
@@ -24,7 +22,7 @@ import (
 )
 
 // shardFixture runs the queue-shard handlers over a fresh schema, with a
-// backend holding only a spool and a cache.
+// backend holding only a cache.
 type shardFixture struct {
 	b   *Backend
 	env taskrunnertest.Env
@@ -43,11 +41,9 @@ func newShardFixture(t *testing.T, ttl time.Duration) *shardFixture {
 	})
 	require.NoError(t, err)
 	dir := t.TempDir()
-	spool, err := blockstore.NewSpool(filepath.Join(dir, "spool"))
-	require.NoError(t, err)
 	cache, err := blockstore.NewBlobCache(filepath.Join(dir, "cache"))
 	require.NoError(t, err)
-	b := New(Deps{Spool: spool, Cache: cache, Intents: newTestStore(t), CacheTTL: ttl, Logger: zaptest.NewLogger(t)})
+	b := New(Deps{Cache: cache, Intents: newTestStore(t), CacheTTL: ttl, Logger: zaptest.NewLogger(t)})
 	require.NoError(t, b.RegisterShardTasks(r))
 	require.NoError(t, r.Migrate(context.Background()))
 	require.NoError(t, r.Start(context.Background()))
@@ -55,14 +51,24 @@ func newShardFixture(t *testing.T, ttl time.Duration) *shardFixture {
 	return &shardFixture{b: b, env: env}
 }
 
-// hold spools a blob and hands it to the cache as a held blob, as a PUT does
+// hold writes a blob's local copy and hands it to the cache, as a PUT does
 // once the provider has accepted it.
 func (f *shardFixture) hold(t *testing.T, body string) multihash.Multihash {
 	t.Helper()
-	d, _, err := f.b.spool.WriteBlob(t.Context(), bytes.NewReader([]byte(body)))
-	require.NoError(t, err)
-	f.b.cacheHeld(t.Context(), testutil.RandomDID(t), d)
+	local, d := writeLocalCopy(t, f.b, body)
+	f.b.cacheWritten(t.Context(), d, local)
 	return d
+}
+
+// writeLocalCopy writes body to a temporary file in b's cache, as a stream
+// does, and returns it with the digest of body.
+func writeLocalCopy(t *testing.T, b *Backend, body string) (*blockstore.TempBlob, multihash.Multihash) {
+	t.Helper()
+	local, err := b.cache.CreateTemp()
+	require.NoError(t, err)
+	_, err = local.Write([]byte(body))
+	require.NoError(t, err)
+	return local, mustSum([]byte(body))
 }
 
 func (f *shardFixture) cached(d multihash.Multihash) bool {
@@ -93,14 +99,14 @@ func (f *shardFixture) tasks(t *testing.T, d multihash.Multihash, action, state 
 	return n
 }
 
-// A held blob moves into the cache, and leaves it once its time to live runs
-// out.
-func TestHeldBlobIsCachedUntilItsTTL(t *testing.T) {
+// A written blob's copy is in the cache when the write is done, and leaves it
+// once its time to live runs out.
+func TestWrittenBlobIsCachedUntilItsTTL(t *testing.T) {
 	f := newShardFixture(t, 300*time.Millisecond)
 	d := f.hold(t, "a")
 
-	require.Eventually(t, func() bool { return f.cached(d) }, 5*time.Second, 10*time.Millisecond, "moved into the cache")
-	require.False(t, fileExists(f.b.spool.Path(d)), "no spool copy left")
+	require.True(t, f.cached(d), "in the cache")
+	require.Zero(t, f.b.cache.InFlight(), "no copy left in progress")
 	require.Eventually(t, func() bool { return !f.cached(d) }, 5*time.Second, 10*time.Millisecond, "evicted at its TTL")
 	require.Eventually(t, func() bool { return f.tasks(t, d, shardEvict, "succeeded") == 1 }, 5*time.Second, 10*time.Millisecond)
 
@@ -112,17 +118,16 @@ func TestHeldBlobIsCachedUntilItsTTL(t *testing.T) {
 	}
 }
 
-// A held blob moves into the cache even when the request that held it has
-// ended by the time the move is queued.
-func TestHeldBlobIsCachedAfterItsRequestEnds(t *testing.T) {
+// A written blob is cached, and its eviction queued, even when the request
+// that wrote it has ended by the time the eviction is queued.
+func TestWrittenBlobIsCachedAfterItsRequestEnds(t *testing.T) {
 	f := newShardFixture(t, time.Hour)
-	d, _, err := f.b.spool.WriteBlob(t.Context(), bytes.NewReader([]byte("a")))
-	require.NoError(t, err)
+	local, d := writeLocalCopy(t, f.b, "a")
 	ended, cancel := context.WithCancel(t.Context())
 	cancel()
-	f.b.cacheHeld(ended, testutil.RandomDID(t), d)
+	f.b.cacheWritten(ended, d, local)
 
-	require.Eventually(t, func() bool { return f.cached(d) }, 5*time.Second, 10*time.Millisecond, "moved into the cache")
+	require.True(t, f.cached(d), "in the cache")
 	require.Eventually(t, func() bool { return f.tasks(t, d, shardEvict, "pending") == 1 }, 5*time.Second, 10*time.Millisecond, "its eviction queued")
 }
 
@@ -154,7 +159,7 @@ func TestReadEarlyInTheTTLWritesNothing(t *testing.T) {
 	f.read(t, d)
 	f.read(t, d)
 
-	require.Equal(t, 1, f.tasks(t, d, shardCache, "succeeded")+f.tasks(t, d, shardCache, "pending"), "only the move")
+	require.Equal(t, 1, f.tasks(t, d, shardCache, "succeeded")+f.tasks(t, d, shardCache, "pending"), "only the write's")
 }
 
 // Concurrent reads of a blob due for renewal queue one renewal between them.
@@ -175,22 +180,19 @@ func TestConcurrentReadsRenewOnce(t *testing.T) {
 	}
 	wg.Wait()
 
-	require.Equal(t, 2, f.tasks(t, d, shardCache, "succeeded")+f.tasks(t, d, shardCache, "pending"), "the move and one renewal")
+	require.Equal(t, 2, f.tasks(t, d, shardCache, "succeeded")+f.tasks(t, d, shardCache, "pending"), "the write's and one renewal")
 }
 
-// A blob nothing caches schedules no eviction: a renewal for a copy already
-// gone, or a move that found no spool copy.
+// A blob nothing caches schedules no eviction: a write that kept no copy
+// queues nothing, and a renewal for a copy already gone finds none.
 func TestNothingCachedSchedulesNoEviction(t *testing.T) {
 	f := newShardFixture(t, time.Hour)
-	d, _, err := f.b.spool.WriteBlob(t.Context(), bytes.NewReader([]byte("a")))
-	require.NoError(t, err)
-	_, err = f.b.spool.Remove(d)
-	require.NoError(t, err)
+	d := mustSum([]byte("a"))
 
-	f.b.cacheHeld(t.Context(), testutil.RandomDID(t), d)
-	require.NoError(t, f.b.submitShardCache(t.Context(), d, false))
+	f.b.cacheWritten(t.Context(), d, nil)
+	require.NoError(t, f.b.submitShardCache(t.Context(), d))
 
-	require.Eventually(t, func() bool { return f.tasks(t, d, shardCache, "succeeded") == 2 }, 5*time.Second, 10*time.Millisecond)
+	require.Eventually(t, func() bool { return f.tasks(t, d, shardCache, "succeeded") == 1 }, 5*time.Second, 10*time.Millisecond)
 	require.Zero(t, f.tasks(t, d, shardEvict, "pending"))
 }
 

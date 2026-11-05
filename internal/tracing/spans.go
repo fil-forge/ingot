@@ -40,8 +40,7 @@ func End(span trace.Span, err error) {
 type ReadSource int
 
 const (
-	// BlockLocal is a block read from local blob storage (the spool or the
-	// cache).
+	// BlockLocal is a block read from local blob storage (the cache).
 	BlockLocal ReadSource = iota
 	// BlockLog is a catalog block read from the local log.
 	BlockLog
@@ -49,8 +48,7 @@ const (
 	BlockCache
 	// BlockNetwork is a block fetched from Forge.
 	BlockNetwork
-	// BlobLocal is a body blob streamed from local blob storage (the spool or
-	// the cache).
+	// BlobLocal is a body blob streamed from local blob storage (the cache).
 	BlobLocal
 	// BlobNetwork is a body blob streamed from Forge.
 	BlobNetwork

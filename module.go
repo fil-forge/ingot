@@ -150,18 +150,15 @@ var ServerModule = fx.Module("ingot-server",
 type serverParams struct {
 	fx.In
 
-	Config       config.ServerConfig
-	Logger       *zap.Logger
-	Reader       blockstore.BlockReader
-	Uploader     uploader.Uploader
-	BodyUploader uploader.BodyUploader
-	Deferred     uploader.DeferredBodyUploader
-	Remover      uploader.BlobRemover
-	Registrar    uploader.UploadRegistrar
-	Tasks        *taskrunner.Runner
-	// Streaming is optional: without it every body blob is spooled before it
-	// is uploaded (see ServerDeps.Streaming).
-	Streaming       uploader.StreamingBodyUploader `optional:"true"`
+	Config          config.ServerConfig
+	Logger          *zap.Logger
+	Reader          blockstore.BlockReader
+	Uploader        uploader.Uploader
+	Streaming       uploader.StreamingBodyUploader
+	Deferred        uploader.DeferredBodyUploader
+	Remover         uploader.BlobRemover
+	Registrar       uploader.UploadRegistrar
+	Tasks           *taskrunner.Runner
 	BucketAuthority bucketauthority.BucketAuthority
 	Registry        registry.Registry
 	Intents         registry.IntentStore
@@ -219,7 +216,6 @@ func registerServerLifecycle(lc fx.Lifecycle, p serverParams) {
 				Logger:          logger,
 				BaseBlockReader: p.Reader,
 				Uploader:        p.Uploader,
-				BodyUploader:    p.BodyUploader,
 				Deferred:        p.Deferred,
 				Remover:         p.Remover,
 				Streaming:       p.Streaming,
@@ -504,7 +500,7 @@ type registryResult struct {
 
 // provideRegistry wraps the host's pool in the postgres-backed registry and
 // exposes it under every interface ServerModule consumes. One *registry.Postgres
-// satisfies bucket state (Registry), the spool's upload_intents (IntentStore),
+// satisfies bucket state (Registry), the upload intents (IntentStore),
 // blob locations (LocationStore), the reference index (BlobRefStore), the GC
 // candidate log (GCStore), the catalog usage sums (CatalogUsageStore), and
 // segment metadata (Meta). The hilt client is required: bucket
@@ -600,27 +596,27 @@ func provideForgeReader(cfg config.Config, id identity.Identity, locations regis
 	return blockstore.NewCached(forge, config.ResolveReadCacheBytes(cfg.ReadCacheBytes)), nil
 }
 
-// uploaderResult exposes the one *uploader.Forge under both upload seams:
-// Uploader (catalog CAR segments) and BodyUploader (per-blob body uploads).
+// uploaderResult exposes the one *uploader.Forge under every upload seam:
+// Uploader (catalog CAR segments), Streaming and Deferred (per-blob body
+// uploads), Remover and Registrar.
 type uploaderResult struct {
 	fx.Out
 
-	Uploader     uploader.Uploader
-	BodyUploader uploader.BodyUploader
-	Deferred     uploader.DeferredBodyUploader
-	Streaming    uploader.StreamingBodyUploader
-	Remover      uploader.BlobRemover
-	Registrar    uploader.UploadRegistrar
+	Uploader  uploader.Uploader
+	Deferred  uploader.DeferredBodyUploader
+	Streaming uploader.StreamingBodyUploader
+	Remover   uploader.BlobRemover
+	Registrar uploader.UploadRegistrar
 }
 
 // provideUploader builds the guppy-style edge client that ships to Forge via
 // the upload service (/blob/add → /ucan/conclude → /blob/accept → /index/add).
-// The same client both ships sealed catalog shards (Uploader) and uploads
-// individual body blobs by digest (BodyUploader).
+// The same client both ships sealed catalog shards (Uploader) and streams
+// individual body blobs (Streaming).
 func provideUploader(c *forgeclient.Client, logger *zap.Logger) (uploaderResult, error) {
 	f, err := uploader.NewForge(uploader.ForgeConfig{Client: c, PutClient: tracing.NewHTTPClient(), Logger: logger})
 	if err != nil {
 		return uploaderResult{}, err
 	}
-	return uploaderResult{Uploader: f, BodyUploader: f, Deferred: f, Streaming: f, Remover: f, Registrar: f}, nil
+	return uploaderResult{Uploader: f, Deferred: f, Streaming: f, Remover: f, Registrar: f}, nil
 }

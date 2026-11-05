@@ -266,13 +266,15 @@ an accepted cost until catalog GC exists ([§9](#9-the-system-contract-piri--spr
 The data layer turns an object body into stored blobs and tracks who references them.
 
 **Object → blobs.** A body is hashed (the BLAKE3 tree for the object digest, md5 for the ETag) in a
-single streaming pass and written to the local store, where each blob is hashed again for its content
-address. It becomes an ordered list of content-addressed
+single streaming pass as it splits, and each blob streams to Piri as it arrives, hashed on the way for
+its content address. It becomes an ordered list of content-addressed
 blobs, each `≤ max_blob_size`: one blob for objects within the ceiling, a coarse split (e.g. 256 MiB
-granularity, not fine chunking) for larger ones. Each blob is uploaded to Piri by digest ([§7](#7-cross-cutting-durability-concurrency-retrieval)).
+granularity, not fine chunking) for larger ones. Each blob is allocated on Piri by size and hash
+function, and streamed there ([§7](#7-cross-cutting-durability-concurrency-retrieval)).
+Streaming is required: the upload service must be able to add a blob by digest code.
 
-**The local store (spool + cache).** Each blob is written locally before upload — both because the
-digest must be known before `allocate`, and because that local copy does double duty:
+**The local store (cache).** An object's blob is teed into a local copy as it streams to Piri, and
+the copy is kept once the provider holds the blob. That copy does double duty:
 - **Read-after-write (a latency/availability optimization, not a correctness backstop):** a
   just-written object is served from the local copy until the indexer resolves it network-wide. In the
   indexing-service's **production** config the cache TTLs are generous — a 30-day providers cache, a
@@ -289,21 +291,19 @@ digest must be known before `allocate`, and because that local copy does double 
 - **Read cache (optional, recommended):** beyond that floor, the local store serves hot reads
   directly, skipping the indexer→Piri round-trip. Read-after-write retains *recently written* data;
   a cache retains *recently read* data, so the two may use distinct eviction policies over a shared,
-  bounded, size-configurable store. *(Built as two directories, a spool for writes and bodies
-  awaiting upload and a cache for copies the provider holds, under one byte budget,
-  `local_blob_max_bytes`; each cached copy has a time to live, `cache_ttl`, renewed by reads and
+  bounded, size-configurable store. *(Built as one directory, a cache for copies the provider
+  holds and the writes in progress teed into it, under one byte budget, `local_blob_max_bytes`; each cached copy has a time to live, `cache_ttl`, renewed by reads and
   kept as a `queue-shard.evict` task, and over the budget the least recently renewed copies go
   first; network reads do not fill the cache yet; see §12.)* The
   alternative — a near-stateless Ingot that resolves every read through the indexer — trades
   latency for simpler horizontal scaling; it is a supported mode, but the read-after-write floor
   holds regardless.
 
-The `upload_intents` table records each blob Ingot has spooled, from ingest until its release:
-`(space, digest) → { local_path, size, state: spooled│uploading│parked│accepted│published, owner
-ref }`. It records how far each blob got for each space, which uploads and releases act on; local
+The `upload_intents` table records each blob Ingot has written, from ingest until its release:
+`(space, digest) → { size, state: uploading│parked│accepted│published, owner ref }`. It records how far each blob got for each space, which uploads and releases act on; local
 reads and the cache's eviction go by the files themselves. A blob stored as received has the digest
-of its bytes, so two spaces can hold one digest: one spool file, an intent per space, and the file
-stays while any space's intent may still read it. The Postgres schema for this and every other Ingot table is in **[Appendix C](#appendix-c--postgres-schema-the-ingot-schema)**.
+of its bytes, so two spaces can hold one digest: one cached file, an intent per space, and the file
+stays while any space still holds an intent for it. The Postgres schema for this and every other Ingot table is in **[Appendix C](#appendix-c--postgres-schema-the-ingot-schema)**.
 
 **Dedup and the reference index.** Piri stores identical bytes once (it answers `allocate` with
 "already have it" when the digest exists), so one blob can back many object versions — a re-PUT of
@@ -402,13 +402,16 @@ read at the start of the operation; on mismatch, reload and retry the (cheap) sp
 
 ```
 0. PRECONDITIONS (no lock)   evaluate If-Match / If-None-Match / If-(Un)Modified-Since (§3)
-1. INGEST  (no lock)         stream body → blake3 tree + md5 in one pass → local store;
+1. INGEST  (no lock)         stream body → blake3 tree + md5 in one pass;
                              if size==0 store a manifest only (§3);
                              else split into ceil(size / max_blob_size) blobs
-2. UPLOAD  (no lock, per blob, keyed by digest)
-     blob/add(digest,size) → PUT (unless deduped) → PARKED
+2. UPLOAD  (no lock, per blob, as the body arrives)
+     blob/add(size) → PUT the bytes as they arrive, sha256 on the way (a local copy
+       teed into the cache) → PARKED; a failed PUT aborts the allocation and fails the request
      trigger accept (conclude the PUT receipt) → Sprue issues blob/accept
        → Piri publishes the location commitment; the blob enters aggregation
+       (a blob the space holds already is reused and the new allocation aborted)
+     record location + intent accepted; adopt the local copy into the cache
 3. COMMIT  (short per-bucket critical section)
      load MST at base root; allocate versionId
      write the manifest; splice key+versionId → manifest CID (new MST nodes)
@@ -419,8 +422,8 @@ read at the start of the operation; on mismatch, reload and retry the (cheap) sp
 4. ACK     return 200 + ETag(md5)   — data is durable+accepted in Piri
 ```
 
-Ingest, hashing, and the Piri upload all run **outside any lock** (upload is keyed by digest, not
-bucket). The critical section does no large-body work — a manifest write, an MST splice, a few
+Ingest, hashing, and the Piri upload all run **outside any lock** (a conclude takes a lock on its
+space and digest only). The critical section does no large-body work — a manifest write, an MST splice, a few
 Postgres writes, and the guarded root swap — so it is small and bounded (sub-millisecond order). No
 object is ever held whole in RAM. The catalog manifest is written only after its body blobs are
 durable and accepted in Piri, so a crash never leaves a catalog entry pointing at non-durable data.
@@ -433,9 +436,9 @@ the last few parts and then commits.
 
 ```
 CreateMultipartUpload → uploadId, session (state=open)
-UploadPart(n)         → ingest + split; record part (spooled)
-                        blob/add + PUT → PARKED; part → parked; nudge the upload's acceptor
-                        ETag = hex(part MD5); the part's local copy is removed once parked
+UploadPart(n)         → ingest + split; record part (written)
+                        blob/add + PUT as the body arrives → PARKED; part → parked; nudge the acceptor
+                        ETag = hex(part MD5); a part keeps no local copy
 acceptor (one per upload, in the background)
      each pass: up to 1000 blobs of the upload's parked parts, in part order
      conclude them (one /ucan/conclude); record each location; part → accepted
@@ -444,7 +447,8 @@ CompleteMultipartUpload([parts])
      validate parts (S3 rules); latch session open→completing (§7.3)
      wait, up to 30 s, until no named part is queued (omitted parts are not waited for)
      every named part accepted → continue
-     a part still spooled (its request died mid-park) → Complete concludes or uploads it itself
+     a part still written (its request died mid-park) → Complete concludes its parked blobs;
+        a blob never parked → InvalidPart, and the client uploads the part again
      a part still parked (acceptor behind or failing) → 409 OperationAborted, session reopened
      COMMIT (short lock): manifest pins ordered [blobs..]+ranges;
         object ETag = hex(md5(concat part MD5s)) + "-N";
@@ -454,7 +458,7 @@ AbortMultipartUpload
      parked blobs → abort;  accepted blobs → remove (§6)
 ```
 
-The part rows are the acceptor's queue (`multipart_parts.state`: `spooled`, `parked`, `accepted`),
+The part rows are the acceptor's queue (`multipart_parts.state`: `written`, `parked`, `accepted`),
 so nothing lives only in memory: a process that stops mid-upload leaves parked parts that the next
 process's sweep picks up. The acceptor runs in the process that holds the upload, and Ingot runs one
 instance; several instances would need a lease on the session row so that one acceptor owns an
@@ -590,7 +594,7 @@ negotiations).
 | Bare location commitment served by blob digest                                                 | Indexer                         | **exists**   | `accept` publishes it; the indexer caches it. Ingot's locator must learn to consume it ([§8](#8-retrieval-addressing-when-bodies-need-a-sharded-dag-index)).                                                        |
 | Batch `allocate`/`accept`                                                                      | libforge + Sprue + Piri + Ingot | **partial**  | `accept` is batched without new command shapes: an acceptor pass's `/ucan/conclude` carries up to 1000 blobs' put receipts, and Sprue issues the accepts to each node in one request, with a receipt per blob. `allocate` is still one RPC per blob.                 |
 | Lift the 256 MiB blob ceiling (streaming commP)                                                | Piri                            | **optional** | Reduces large-object splitting; not required for the first cut.                                                                                                                                                     |
-| `allocate-by-size` + bind-digest-after (remove the spool, same-rack)                           | Piri + Sprue + Ingot            | **optional** | [§10](#10-deployment-topology--the-digest-before-upload-cost). Needs a size-bounded, possibly authenticated upload route.                                                                                           |
+| `allocate-by-size` + bind-digest-after (streamed body writes)                                  | Piri + Sprue + Ingot            | **exists**   | [§10](#10-deployment-topology--the-digest-before-upload-cost). Every body blob is added by size and hash function (`/blob/add` by digest code) and its digest computed during the PUT.                              |
 
 **Determinism / idempotency Ingot must preserve.** The `accept` invocation is built deterministically
 (stable CID, today via `WithNoNonce` over `{space, digest, size, put-task}`); re-driving accept must
@@ -602,19 +606,17 @@ swap, so a mismatch can leave the forge root pointing at a bucket root that was 
 
 ## 10. Deployment topology & the digest-before-upload cost
 
-Piri requires the digest before issuing an upload slot, so Ingot writes each blob to the local store
-and hashes it before the first byte reaches Piri (the local write is needed for the cache/read-after-
-write anyway, so it is less pure overhead than it appears, but it does serialize hash-before-upload).
+Ingot adds each blob by size and hash function (`/blob/add` by digest code), streams its bytes to
+Piri as the body arrives, and computes the digest on the way, so hashing runs alongside the upload
+instead of before it. The upload service must support an add by digest code; a write fails
+otherwise.
 
-Whether to remove it is topology-dependent:
+The trade is topology-dependent:
 - **Same-rack (current): Ingot and Piri share a rack, the client is remote.** Pre-hashing buys no
-  trust, so an `allocate-by-size` + bind-digest-after-verify protocol (Piri assigns a slot by size,
-  hashes the stream during the PUT, binds the digest) would let Ingot pipeline hashing with upload —
-  at the cost of a size-bounded, possibly authenticated upload route.
+  trust, so allocating by size and binding the digest after the PUT costs nothing and pipelines
+  hashing with upload.
 - **Client-colocated (future): Ingot in the client's datacenter, Piri the only remote hop.**
-  Pre-hashing buys integrity, so digest-before-upload earns its keep.
-
-The first cut keeps digest-before-upload; `allocate-by-size` is a same-rack fast-follow.
+  Pre-hashing would buy integrity, so digest-before-upload would earn its keep there.
 
 ---
 
@@ -643,7 +645,7 @@ The MVP this supersedes had six structural problems; each is resolved by a layer
 | Problem                                       | Resolved by                                                                                                                                                                                                         |
 |-----------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | A per-bucket lock held across the whole write | Ingest and upload run off-lock; only the MST splice + guarded root swap is in the critical section. [§7.1](#71-write-single-shot-putobject)                                                                         |
-| The whole object buffered in memory           | Hash-while-writing to the local store; stream to Piri; nothing held whole in RAM. [§5](#5-the-data-layer), [§7.1](#71-write-single-shot-putobject)                                                                  |
+| The whole object buffered in memory           | Hash while streaming to Piri; nothing held whole in RAM. [§5](#5-the-data-layer), [§7.1](#71-write-single-shot-putobject)                                                                                           |
 | No multipart, no abort                        | Parked part-blobs accepted during the upload, single-winner latch; abort = `/blob/abort` (parked) / `remove` (deduped). [§7.2](#72-multipart)–7.3, [§9](#9-the-system-contract-piri--sprue--indexer)                        |
 | Objects chunked into CARs to obtain a digest  | Object body = one blob (≤ `max`) or a coarse `≤ max` split; no fine chunking, no CAR. [§5](#5-the-data-layer), [§10](#10-deployment-topology--the-digest-before-upload-cost)                                        |
 | No delete of superseded data                  | Reference index + per-space `remove` + Piri's global claim gate + indexer delete; O(1) for ≥ `min` blobs. [§5](#5-the-data-layer), [§6](#6-the-forgechain-layer), [§9](#9-the-system-contract-piri--sprue--indexer) |
@@ -665,8 +667,8 @@ The MVP this supersedes had six structural problems; each is resolved by a layer
   **catalog** plane is MST nodes + manifests (CAR-batched).
 - **Claim** — a space's reference to a blob; `remove` releases it, and Piri deletes bytes when no
   space holds a claim.
-- **Spool / local store** — Ingot's on-disk copy of a blob; the read-after-write source and the read
-  cache.
+- **Local store** — Ingot's on-disk copy of a blob (the cache); the read-after-write source and the
+  read cache.
 - **Guarded root swap** — advancing the bucket MST root only if it still matches the snapshot read at
   the start of the operation.
 - **Single-winner latch** — the atomic session-state transition that serializes multipart
@@ -781,17 +783,16 @@ CREATE TABLE ingot.blob_refs (
 -- Drives "is (space, digest) still claimed?" — the gate on remove(digest).
 CREATE INDEX blob_refs_claim_idx ON ingot.blob_refs (space, digest);
 
--- The local-store index (§5): every blob Ingot has spooled, per space. state
--- advances spooled → uploading → (parked →) accepted → published; published
+-- The local-store index (§5): every blob Ingot has written, per space. state
+-- advances uploading → (parked →) accepted → published; published
 -- is written with the first reference claim. Evicting the cached copy leaves
 -- the rows and their states.
 CREATE TABLE ingot.upload_intents (
     space       text   NOT NULL,                         -- the upload's space
     digest      bytea  NOT NULL,                         -- sha256 multihash of the blob
-    local_path  text   NOT NULL,
     size        bigint NOT NULL,                         -- stored (envelope) bytes = file size
     state       text   NOT NULL
-                    CHECK (state IN ('spooled','uploading','parked','accepted','published')),
+                    CHECK (state IN ('uploading','parked','accepted','published')),
     bucket      text,                                    -- owner ref (originating op), for cleanup
     created_at  timestamptz NOT NULL DEFAULT now(),
     updated_at  timestamptz NOT NULL DEFAULT now(),      -- last state change
@@ -892,8 +893,8 @@ CREATE TABLE ingot.multipart_parts (
     size          bigint NOT NULL,
     blob_digests  bytea[] NOT NULL,                      -- ordered; one entry per ≤ max_blob_size blob
     span_lengths  bigint[],                              -- each blob's span in the object (bytes before encryption); NULL on rows from before 00030
-    state         text   NOT NULL DEFAULT 'spooled'      -- the acceptor's queue (§7.2)
-                      CHECK (state IN ('spooled','parked','accepted')),
+    state         text   NOT NULL DEFAULT 'written'      -- the acceptor's queue (§7.2)
+                      CHECK (state IN ('written','parked','accepted')),
     created_at    timestamptz NOT NULL DEFAULT now(),
     checksum      text   NOT NULL DEFAULT '',
     PRIMARY KEY (upload_id, part_number),
@@ -967,7 +968,7 @@ reaching zero triggers `remove(digest)` ([§6](#6-the-forgechain-layer)), throug
 `queue-space-shard.release` task on the task runner, subject `<space>/<hex digest>`, queued in the
 same transaction and due after the release grace. `upload_intents` and `blob_parks` are keyed by
 `(space, digest)`, like every other blob table — the disk-side and park-side indexes, shared across whatever objects of the
-space reference the same bytes. The spool file itself is one per digest, shared across spaces, and
+space reference the same bytes. The cached file itself is one per digest, shared across spaces, and
 goes with the last intent for it.
 
 ---
@@ -983,8 +984,8 @@ the reductions live here.
 The storage / delete / retrieval core is built and tested:
 
 - **Object-aligned blobs + manifest** ([§4](#4-the-catalog-layer)–[§5](#5-the-data-layer)) — `Body.Blobs` (`[digest, offset]` entries, inline then in extent blocks), coarse split at
-  `max_blob_size`, the local **spool** (`blockstore.Spool`) + `upload_intents`, stored S3 `etag`.
-- **Synchronous durability write path** ([§7.1](#71-write-single-shot-putobject)) — off-lock ingest → spool → per-blob upload, then a
+  `max_blob_size`, the local **cache** (`blockstore.BlobCache`) + `upload_intents`, stored S3 `etag`.
+- **Synchronous durability write path** ([§7.1](#71-write-single-shot-putobject)) — off-lock ingest streaming each blob to its provider, then a
   short locked commit (manifest + MST splice + guarded root swap); the reference-index claims and
   drops are written in the root swap's transaction, so a commit failure writes none of them.
 - **Single-plane catalog log** — the data plane is gone; `logstore` journals only the catalog
@@ -1009,8 +1010,8 @@ The storage / delete / retrieval core is built and tested:
 
 These are intentional simplifications of the target topology, not bugs:
 
-- **Deployed next to Piri.** The same-rack topology of [§10](#10-deployment-topology--the-digest-before-upload-cost) is assumed; digest-before-upload is
-  kept and `allocate-by-size` is out of scope.
+- **Deployed next to Piri.** The same-rack topology of [§10](#10-deployment-topology--the-digest-before-upload-cost) is assumed; every body blob is
+  allocated by size and streamed, with no digest-before-upload mode.
 - **No Ingot-side aggregation.** Ingot ships each body blob to Piri as-is; `min_aggregate_size`,
   Regime-A/B compaction, and subroots ([§6](#6-the-forgechain-layer)) are Piri-side concerns. From Ingot's side a delete is
   just `remove(digest)`; Piri decides the on-chain regime. `max_blob_size` is the only size knob Ingot
@@ -1045,29 +1046,28 @@ paths below are exercised against the real stack by the smelt-based `itest/` har
   local-copy loss from `blob_locations` + `/content/retrieve` (`TestForgeReadAfterEviction`), and
   retention-retired catalog blocks resolve via `shard_inclusions` (#44) — the read paths of
   [§7.4](#74-read-getobject) / [§8](#8-retrieval-addressing-when-bodies-need-a-sharded-dag-index).
-  **Local blob storage is split by role and bounded by a byte budget.** A body is written to the
-  spool (`<data_dir>/spool`) and moves to the cache (`<data_dir>/cache`) once the provider holds it.
-  A cached copy stays for `cache_ttl` after it was cached or last read: a `queue-shard.cache`
-  task moves it in and schedules a `queue-shard.evict` for when the time runs out, and a read
-  with less than half left schedules a later one in its place. With `local_blob_max_bytes` set
+  **Local blob storage is one cache bounded by a byte budget.** A write tees each object blob
+  into a temporary file in the cache (`<data_dir>/cache`) as it streams to the provider, and
+  adopts it under its digest once the provider holds it, before the PUT answers. A cached copy
+  stays for `cache_ttl` after it was cached or last read: a `queue-shard.cache` task schedules a
+  `queue-shard.evict` for when the time runs out, and a read with less than half left schedules a
+  later one in its place. With `local_blob_max_bytes` set
   (`SweepLocalBlobs`), every 30s the sweeper also evicts cached copies, the least recently
-  renewed first, down to 90% of the budget; hourly it deletes orphan files. The budget is off by
-  default. A release frees a
-  deleted object's local copies, and a parked part's copy goes once it parks. Local blob storage
-  reports its usage by directory, budget, stalled uploads, removals by reason and reads by tier as
-  OpenTelemetry metrics (`ingot.local_blobs.*`). With `cache_writes: false`, a body's copy goes as
-  soon as the provider accepts it, giving up the read-after-write copy (§4): safe while reads
+  renewed first, down to 90% of the budget; hourly it deletes unfinished `.tmp-*` writes. The
+  budget is off by default. A release frees a deleted object's cached copies, and a multipart part
+  keeps none. Local blob storage reports its usage, budget, stalled uploads, removals by reason
+  and reads by tier as OpenTelemetry metrics (`ingot.local_blobs.*`). With `cache_writes: false`,
+  a write keeps no copy, giving up the read-after-write copy (§4): safe while reads
   resolve through the local location table (`LocalLocator`); with an indexer-backed locator, §4's
-  race on a digest not yet published would return. Still open under #48: nothing reclaims a failed
-  upload's body.
+  race on a digest not yet published would return.
 - **Multipart parts park at UploadPart and are accepted during the upload.** (Built: `parkBlobs`
   over the `blob_parks` table, the per-upload acceptor in `s3frontend/acceptor.go`, and the
-  restart sweep `startAcceptSweeper`.) A parked part holds no local bytes: its spool copy is
-  removed once it parks, and the acceptor concludes it from its park row. Complete waits for the
+  restart sweep `startAcceptSweeper`.) A part holds no local bytes: its blobs
+  stream to their providers, and the acceptor concludes each from its park row. Complete waits for the
   acceptor, up to 30 s, and answers a part still queued with a 409 that the AWS CLI treats as final. Abort and session
   expiry unwind parked blobs with `/blob/abort` and accepted ones with `/blob/remove`
   ([§7.2](#72-multipart)–[7.3](#73-the-session-latch-the-abortcomplete-race)).
-- **Crash recovery for the spool is not built.** The `upload_intents` × `blob_refs` reconciliation
+- **Crash recovery is not built.** The `upload_intents` × `blob_refs` reconciliation
   the failure-mode table in [§7.5](#75-concurrency-durability-and-failure-modes) describes (resume/`abort` parked, `remove` accepted-but-unreferenced)
   is a later phase.
 - **Indexer retraction on delete** is unimplemented (no-op). `ListParts` and
@@ -1077,7 +1077,7 @@ paths below are exercised against the real stack by the smelt-based `itest/` har
   a `queue-space-shard.release` task, due at once, for each now-unreferenced part blob (guarded
   against content-addressed sharing with other sessions and committed objects), and run those
   releases inline, for up to 10 s, before answering. The release shreds the blob's key, unwinds it
-  on the network as its state requires, then removes its local copy and intent; the task runner
+  on the network as its state requires, then removes its intent; the task runner
   retries a release that fails, with no attempt limit, backing off from 1 s to 5 min. A background sweeper aborts
   open sessions older than `multipart_session_ttl` (default 7d) and reaps terminal session rows. A
   successful Complete retains its session in state `completed` so a duplicate Complete is idempotent

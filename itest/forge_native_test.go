@@ -64,7 +64,7 @@ func TestForgeNativeProvision(t *testing.T) {
 	// registered for this tenant's active wrap key (its wrap_key row), so the
 	// envelope is recoverable from hilt's custody alone.
 	wantKID := hiltActiveWrapKID(t, ctx, s, "native")
-	env := spooledEnvelope(t, ctx, s)
+	env := localEnvelope(t, ctx, s)
 	if len(env.Recipients) != 1 {
 		t.Fatalf("stored envelope has %d recipients, want 1 (the tenant)", len(env.Recipients))
 	}
@@ -124,18 +124,18 @@ func hiltActiveWrapKID(t *testing.T, ctx context.Context, s *stack.Stack, extern
 	return kid
 }
 
-// spooledEnvelope pulls one body blob out of the ingot container's spool and
+// localEnvelope pulls one body blob out of the ingot container's
 // decodes its COSE envelope header.
-func spooledEnvelope(t *testing.T, ctx context.Context, s *stack.Stack) *cose.Envelope {
+func localEnvelope(t *testing.T, ctx context.Context, s *stack.Stack) *cose.Envelope {
 	t.Helper()
 	out, errOut, err := s.Exec(ctx, "ingot", "sh", "-c",
-		`f=$(find /data/spool /data/cache -maxdepth 1 -type f ! -name '.tmp*' | head -1); [ -n "$f" ] && base64 < "$f"`)
+		`f=$(find /data/cache -maxdepth 1 -type f ! -name '.tmp*' | head -1); [ -n "$f" ] && base64 < "$f"`)
 	if err != nil {
-		t.Fatalf("read a spooled blob: %v (stderr=%s)", err, errOut)
+		t.Fatalf("read a cached blob: %v (stderr=%s)", err, errOut)
 	}
 	raw, err := base64.StdEncoding.DecodeString(strings.Join(strings.Fields(out), ""))
 	if err != nil {
-		t.Fatalf("decode spooled blob: %v", err)
+		t.Fatalf("decode cached blob: %v", err)
 	}
 	env, _, err := cose.Decode(raw)
 	if err != nil {

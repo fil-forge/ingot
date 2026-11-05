@@ -174,11 +174,44 @@ func (b *Backend) nudgeLocked(uploadID string) *acceptor {
 	return a
 }
 
-// concludingSet is the blobs this process is concluding, by blobKey, each
-// with a count of the conclusions in flight.
-type concludingSet struct {
+// blobMarks counts, by blobKey, the operations of one kind this process has
+// in flight on each blob: conclusions (Backend.concluding) or writes
+// (Backend.writing).
+type blobMarks struct {
 	mu sync.Mutex
 	n  map[string]int
+}
+
+// mark marks digests in space until the returned func is first called.
+func (m *blobMarks) mark(space did.DID, digests ...mh.Multihash) func() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.n == nil {
+		m.n = map[string]int{}
+	}
+	for _, d := range digests {
+		m.n[blobKey(space, d)]++
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			m.mu.Lock()
+			defer m.mu.Unlock()
+			for _, d := range digests {
+				k := blobKey(space, d)
+				if m.n[k]--; m.n[k] <= 0 {
+					delete(m.n, k)
+				}
+			}
+		})
+	}
+}
+
+// marked reports whether digest in space is marked.
+func (m *blobMarks) marked(space did.DID, digest mh.Multihash) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.n[blobKey(space, digest)] > 0
 }
 
 // markConcluding marks digests as being concluded in space until the
@@ -191,36 +224,12 @@ type concludingSet struct {
 // either the conclude finds the release and leaves the blob, or the release
 // finds the mark and waits.
 func (b *Backend) markConcluding(space did.DID, digests []mh.Multihash) func() {
-	c := &b.concluding
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.n == nil {
-		c.n = map[string]int{}
-	}
-	for _, d := range digests {
-		c.n[blobKey(space, d)]++
-	}
-	var once sync.Once
-	return func() {
-		once.Do(func() {
-			c.mu.Lock()
-			defer c.mu.Unlock()
-			for _, d := range digests {
-				k := blobKey(space, d)
-				if c.n[k]--; c.n[k] <= 0 {
-					delete(c.n, k)
-				}
-			}
-		})
-	}
+	return b.concluding.mark(space, digests...)
 }
 
 // isConcluding reports whether a conclusion of digest in space is in flight.
 func (b *Backend) isConcluding(space did.DID, digest mh.Multihash) bool {
-	c := &b.concluding
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.n[blobKey(space, digest)] > 0
+	return b.concluding.marked(space, digest)
 }
 
 // errAcceptorsNotRunning is drainAcceptor's answer before StartAcceptors, or

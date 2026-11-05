@@ -15,7 +15,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/multiformats/go-multihash"
 
-	"github.com/fil-forge/ingot/blockstore"
 	"github.com/fil-forge/ingot/internal/testfakes"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/libforge/testutil"
@@ -25,11 +24,11 @@ import (
 )
 
 // A blob stored as received has the digest of its bytes, so the same bytes
-// written to two buckets of different spaces share a digest: one spool
-// file, and an upload, a park, a claim and a release per space. These tests
+// written to two buckets of different spaces share a digest: one cached
+// copy, and an upload, a park, a claim and a release per space. These tests
 // write identical bytes to "bk" (space mem.bk()) and a second bucket of its
 // own space, and check that one space's lifecycle never takes the other's
-// rows or file.
+// rows or copy.
 
 // secondPlaintextBucket creates "bk2" in a space of its own and sets both
 // buckets to store as received. Returns bk2's space.
@@ -103,12 +102,10 @@ func completeIn(t *testing.T, b *Backend, bucket, key, uploadID string, parts []
 	}
 }
 
-// localCopyExists reports whether the blob is on local disk, in the spool or
-// the cache.
+// localCopyExists reports whether the blob is cached.
 func localCopyExists(b *Backend, d multihash.Multihash) bool {
-	_, spoolErr := os.Stat(b.spool.Path(d))
-	_, cacheErr := os.Stat(b.cache.Path(d))
-	return spoolErr == nil || cacheErr == nil
+	_, err := os.Stat(b.cache.Path(d))
+	return err == nil
 }
 
 // TestPlaintextSpaces_EachSpaceParksItsOwnCopy: the same part bytes uploaded
@@ -193,8 +190,7 @@ func TestPlaintextSpaces_ReleaseInOneSpaceKeepsTheOther(t *testing.T) {
 // Complete still concludes its own allocation.
 func TestPlaintextSpaces_ReleaseInOneSpaceKeepsTheOthersPark(t *testing.T) {
 	pu := &parkingUploader{}
-	// Single-shot PUTs upload and accept; only part blobs park.
-	b, mem := newDeferredBackend(t, pu, func(d *Deps) { d.Uploader = testfakes.NopUploader{} })
+	b, mem := newDeferredBackend(t, pu)
 	space2 := secondPlaintextBucket(t, b, mem)
 	ctx := context.Background()
 	data := testBody(5 << 20)
@@ -290,8 +286,8 @@ func TestPlaintextRelease_WriteCancelsAPendingRelease(t *testing.T) {
 }
 
 // TestPlaintextRelease_WriteWaitsOutAStartedRelease: the release has taken
-// the blob, so the write waits until it has run, keeps its own spool file
-// and intent through it, and then uploads afresh.
+// the blob, so the write waits until it has run, keeps its own local copy
+// and intent through it, and then concludes its own stream.
 func TestPlaintextRelease_WriteWaitsOutAStartedRelease(t *testing.T) {
 	up := &countingUploader{calls: map[string]int{}}
 	gate := newGatedRemover()
@@ -311,19 +307,19 @@ func TestPlaintextRelease_WriteWaitsOutAStartedRelease(t *testing.T) {
 		_, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(data), ContentLength: byteLen(data)})
 		done <- err
 	}()
-	// The write is waiting: nothing has finished, and its spool file is in
-	// place for the upload that follows.
+	// The write is waiting: nothing has finished, and its local copy is still
+	// in progress, for the cache once the write is accepted.
 	select {
 	case err := <-done:
 		t.Fatalf("PutObject returned %v while the release was started", err)
 	case <-time.After(100 * time.Millisecond):
 	}
-	if !localCopyExists(b, d) {
-		t.Fatalf("no spool file while the write waits")
+	if b.cache.InFlight() == 0 {
+		t.Fatalf("no local copy in progress while the write waits")
 	}
 
 	// The release finishes: it removes the blob from the provider, and leaves
-	// the waiting write's intent and file alone.
+	// the waiting write's intent alone.
 	finish()
 	if err := <-done; err != nil {
 		t.Fatalf("PutObject after the release: %v", err)
@@ -367,11 +363,11 @@ func TestPlaintextRelease_WaitIsBounded(t *testing.T) {
 	}
 }
 
-// TestPlaintextSpaces_ReleaseIgnoresAnotherSpacesHold: a hold says whose
-// write needs the file. A release in one space meeting the other space's
-// hold deletes its own intent and record and leaves the file; it does not
-// mistake the hold for a write of its own waiting on it.
-func TestPlaintextSpaces_ReleaseIgnoresAnotherSpacesHold(t *testing.T) {
+// TestPlaintextSpaces_ReleaseIgnoresAnotherSpacesWrite: a write in flight
+// defers only its own space's release. A release in one space meeting the
+// other space's write deletes its own intent and record; it does not mistake
+// the other write for one of its own waiting on it.
+func TestPlaintextSpaces_ReleaseIgnoresAnotherSpacesWrite(t *testing.T) {
 	b, mem, _ := newRefTestBackend(t)
 	space2 := secondPlaintextBucket(t, b, mem)
 	ctx := context.Background()
@@ -379,8 +375,8 @@ func TestPlaintextSpaces_ReleaseIgnoresAnotherSpacesHold(t *testing.T) {
 
 	putIn(t, b, "bk", "k", data)
 	d := blobDigestOf(t, b, "k", "")
-	// A write in bk2 is between spooling and uploading the same bytes.
-	unhold := b.spool.Hold(space2, d)
+	// A write in bk2 has sent the same bytes and not yet recorded them.
+	unhold := b.writing.mark(space2, d)
 	defer unhold()
 
 	deleteFrom(t, b, "bk", "k")
@@ -391,34 +387,6 @@ func TestPlaintextSpaces_ReleaseIgnoresAnotherSpacesHold(t *testing.T) {
 	}
 	if pending, _ := mem.ListReleasesBySpace(ctx, mem.bk()); len(pending) != 0 {
 		t.Fatalf("release record survived: %v", pending)
-	}
-	if !localCopyExists(b, d) {
-		t.Fatalf("the release removed the file the other space's write holds")
-	}
-}
-
-// TestPlaintextSpaces_CacheMoveWaitsForAnotherWritesHold: a write that
-// finishes while another write still holds the same bytes leaves the file
-// in the spool, where the other write uploads from; the next write's cache
-// move takes it once the hold has ended.
-func TestPlaintextSpaces_CacheMoveWaitsForAnotherWritesHold(t *testing.T) {
-	b, mem, _ := newRefTestBackend(t)
-	space2 := secondPlaintextBucket(t, b, mem)
-	data := testBody(8 << 10)
-	d := digestOf(t, data)
-
-	// A write in bk2 is between spooling and uploading the same bytes.
-	unhold := b.spool.Hold(space2, d)
-	putIn(t, b, "bk", "one", data)
-	if _, err := os.Stat(b.spool.Path(d)); err != nil {
-		t.Fatalf("the finished write moved the file the other write holds: %v", err)
-	}
-	unhold()
-	putIn(t, b, "bk", "two", data)
-	_, spoolErr := os.Stat(b.spool.Path(d))
-	_, cacheErr := os.Stat(b.cache.Path(d))
-	if spoolErr == nil || cacheErr != nil {
-		t.Fatalf("after the hold ended: spool err=%v cache err=%v, want the file moved to the cache", spoolErr, cacheErr)
 	}
 }
 
@@ -524,11 +492,10 @@ func TestPlaintextRelease_ClaimRefusedDuringAStartedRelease(t *testing.T) {
 	}
 }
 
-// TestPlaintextRelease_StreamedWriteWaitsOutAStartedRelease: a blob sent
-// to its provider as it was spooled settles the release at its conclude.
-// After a waited-out release the stream is given up, since the release may
-// have taken what it parked, and the blob is uploaded again from the spool
-// file the write still holds.
+// TestPlaintextRelease_StreamedWriteWaitsOutAStartedRelease: a streamed blob
+// settles the release at its conclude. The space takes the digest again once
+// the release's removal has its receipt, so after a waited-out release the
+// write concludes its own stream.
 func TestPlaintextRelease_StreamedWriteWaitsOutAStartedRelease(t *testing.T) {
 	su := newStreamingUploader()
 	gate := newGatedRemover()
@@ -557,12 +524,7 @@ func TestPlaintextRelease_StreamedWriteWaitsOutAStartedRelease(t *testing.T) {
 	}
 
 	su.mu.Lock()
-	var uploaded, concluded int
-	for _, u := range su.uploaded {
-		if bytes.Equal(u, d) {
-			uploaded++
-		}
-	}
+	var concluded int
 	for _, c := range su.concluded {
 		if bytes.Equal(c.Digest, d) {
 			concluded++
@@ -570,11 +532,8 @@ func TestPlaintextRelease_StreamedWriteWaitsOutAStartedRelease(t *testing.T) {
 	}
 	aborted := len(su.aborted)
 	su.mu.Unlock()
-	// The space takes the digest again once the release's removal has its
-	// receipt, so the waiting write's own stream is concluded, with no
-	// upload from a local copy.
-	if uploaded != 0 || aborted != 0 || concluded != 2 {
-		t.Fatalf("after the waited-out release: fresh uploads of %x = %d, streams aborted = %d, concluded = %d; want 0, 0 and 2", d, uploaded, aborted, concluded)
+	if aborted != 0 || concluded != 2 {
+		t.Fatalf("after the waited-out release: streams of %x aborted = %d, concluded = %d; want 0 and 2", d, aborted, concluded)
 	}
 	if _, err := mem.GetLocation(ctx, mem.bk(), d); err != nil {
 		t.Fatalf("no location after the fresh upload: %v", err)
@@ -852,13 +811,13 @@ func TestPlaintextRelease_StreamedPartLocatedMeanwhileReuses(t *testing.T) {
 }
 
 // heldWhenRecorded is a location and park store that notes, for one digest,
-// whether the write still held the spool file when its location or park was
-// recorded: the hold must outlast the row that says the provider holds the
+// whether the write was still marked in flight when its location or park was
+// recorded: the mark must outlast the row that says the provider holds the
 // blob, so no release reads an intent still uploading with neither row.
 type heldWhenRecorded struct {
 	registry.LocationStore
 	registry.ParkStore
-	spool  *blockstore.Spool
+	b      *Backend
 	space  did.DID
 	digest multihash.Multihash
 	mu     sync.Mutex
@@ -868,7 +827,7 @@ type heldWhenRecorded struct {
 func (h *heldWhenRecorded) note(digest multihash.Multihash) {
 	if bytes.Equal(digest, h.digest) {
 		h.mu.Lock()
-		h.held = append(h.held, h.spool.HeldBy(h.space, digest))
+		h.held = append(h.held, h.b.writing.marked(h.space, digest))
 		h.mu.Unlock()
 	}
 }
@@ -892,20 +851,20 @@ func (h *heldWhenRecorded) wantHeld(t *testing.T, what string) {
 	}
 	for i, held := range h.held {
 		if !held {
-			t.Fatalf("%s: record %d was written after the write had ended its hold", what, i)
+			t.Fatalf("%s: record %d was written after the write had ended its mark", what, i)
 		}
 	}
 }
 
-// TestPlaintextRelease_HoldOutlastsTheRecord covers the four write paths:
-// the single-shot upload, the part park, and both streamed forms. In each
-// the spool file is still held when the location or park is recorded.
+// TestPlaintextRelease_HoldOutlastsTheRecord covers the write paths, an
+// object and a part, over each test provider. In each the write is still
+// marked in flight when the location or park is recorded.
 func TestPlaintextRelease_HoldOutlastsTheRecord(t *testing.T) {
 	data := testBody(8 << 10)
 	d := digestOf(t, data)
 	wire := func(h *heldWhenRecorded) func(*Deps) {
 		return func(dp *Deps) {
-			h.LocationStore, h.ParkStore, h.spool, h.digest = dp.Locations, dp.Parks, dp.Spool, d
+			h.LocationStore, h.ParkStore, h.digest = dp.Locations, dp.Parks, d
 			dp.Locations, dp.Parks = h, h
 		}
 	}
@@ -913,15 +872,15 @@ func TestPlaintextRelease_HoldOutlastsTheRecord(t *testing.T) {
 	t.Run("upload", func(t *testing.T) {
 		h := &heldWhenRecorded{}
 		b, mem := newDeferredBackend(t, &countingUploader{calls: map[string]int{}}, wire(h))
-		h.space = mem.bk()
+		h.b, h.space = b, mem.bk()
 		setNone(t, b)
 		putIn(t, b, "bk", "k", data)
-		h.wantHeld(t, "location of a single-shot upload")
+		h.wantHeld(t, "location of an object")
 	})
 	t.Run("park", func(t *testing.T) {
 		h := &heldWhenRecorded{}
 		b, mem := newDeferredBackend(t, &parkingUploader{}, wire(h))
-		h.space = mem.bk()
+		h.b, h.space = b, mem.bk()
 		setNone(t, b)
 		uploadOnePart(t, b, "bk", "k", data)
 		h.wantHeld(t, "park of a part")
@@ -930,7 +889,7 @@ func TestPlaintextRelease_HoldOutlastsTheRecord(t *testing.T) {
 		h := &heldWhenRecorded{}
 		su := newStreamingUploader()
 		b, mem := newStreamingBackend(t, su, wire(h))
-		h.space = mem.bk()
+		h.b, h.space = b, mem.bk()
 		setNone(t, b)
 		if err := putSized(t, b, "k", data, int64(len(data))); err != nil {
 			t.Fatalf("PutObject: %v", err)
@@ -941,7 +900,7 @@ func TestPlaintextRelease_HoldOutlastsTheRecord(t *testing.T) {
 		h := &heldWhenRecorded{}
 		su := newStreamingUploader()
 		b, mem := newStreamingBackend(t, su, wire(h))
-		h.space = mem.bk()
+		h.b, h.space = b, mem.bk()
 		setNone(t, b)
 		bucket, key := "bk", "k"
 		ctx := context.Background()

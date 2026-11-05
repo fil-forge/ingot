@@ -2,6 +2,7 @@ package s3frontend
 
 import (
 	"context"
+	"crypto/md5"
 	"encoding/hex"
 	"errors"
 	"os"
@@ -33,8 +34,8 @@ func partRecord(t *testing.T, mem *testStore, uploadID string, n int) registry.M
 	return registry.MultipartPart{}
 }
 
-// TestParkedPartHoldsNoLocalCopy: once UploadPart parks a part's blobs, their
-// spool copies are gone, the part is queued for acceptance with each blob's
+// TestParkedPartHoldsNoLocalCopy: once UploadPart parks a part's blobs, none
+// of them has a local copy, the part is queued for acceptance with each blob's
 // plaintext length, and Complete concludes them from the park rows alone.
 func TestParkedPartHoldsNoLocalCopy(t *testing.T) {
 	b, mem := newDeferredBackend(t, &parkingUploader{})
@@ -60,7 +61,7 @@ func TestParkedPartHoldsNoLocalCopy(t *testing.T) {
 	}
 	for _, d := range digests {
 		if _, err := os.Stat(localPath(b, d)); !os.IsNotExist(err) {
-			t.Fatalf("parked blob %s spool copy: stat err=%v, want not-exist", d, err)
+			t.Fatalf("parked blob %s local copy: stat err=%v, want not-exist", d, err)
 		}
 		if in, err := mem.IntentByDigest(ctx, d); err != nil || in.State != registry.IntentParked {
 			t.Fatalf("parked blob %s intent = %v/%v, want parked", d, in, err)
@@ -84,27 +85,28 @@ func TestParkedPartHoldsNoLocalCopy(t *testing.T) {
 // failingParker fails every upload, as a provider that is down does.
 type failingParker struct{ parkingUploader }
 
-func (*failingParker) UploadBlob(context.Context, did.DID, multihash.Multihash, int64, string, ...uploader.UploadOption) (uploader.UploadedBlob, error) {
+func (*failingParker) UploadBlob(context.Context, did.DID, multihash.Multihash, int64, string) (uploader.UploadedBlob, error) {
 	return uploader.UploadedBlob{}, errors.New("provider unreachable")
 }
 
 // TestFailedParkIsInvalidAtComplete: a part whose stream failed fails its
-// UploadPart and stays written, out of the acceptance queue. Nothing holds its
-// bytes to upload them again, so a Complete naming it answers InvalidPart and
-// the client uploads the part again.
+// UploadPart before its row is recorded. Nothing holds its bytes to upload
+// them again, so a Complete naming it answers InvalidPart and the client
+// uploads the part again.
 func TestFailedParkIsInvalidAtComplete(t *testing.T) {
 	b, mem := newDeferredBackend(t, &failingParker{})
 	key := "park-fails"
+	body := testBody(int(backend.MinPartSize))
 
 	uploadID := mpCreate(t, b, key, "", "")
-	if _, err := mpUploadPart(t, b, key, uploadID, 1, testBody(int(backend.MinPartSize)), nil); err == nil {
+	if _, err := mpUploadPart(t, b, key, uploadID, 1, body, nil); err == nil {
 		t.Fatalf("UploadPart succeeded, want the park failure")
 	}
-	part := partRecord(t, mem, uploadID, 1)
-	if part.State != registry.PartWritten {
-		t.Fatalf("part state after a failed park = %q, want written", part.State)
+	if parts, err := mem.ListParts(context.Background(), uploadID); err != nil || len(parts) != 0 {
+		t.Fatalf("parts after a failed park = %v/%v, want none", parts, err)
 	}
-	etag := `"` + hex.EncodeToString(part.ETagMD5) + `"`
+	sum := md5.Sum(body)
+	etag := `"` + hex.EncodeToString(sum[:]) + `"`
 	one := int32(1)
 	_, err := mpComplete(t, b, key, uploadID, []types.CompletedPart{{PartNumber: &one, ETag: &etag}}, nil)
 	var apiErr s3err.APIError

@@ -460,7 +460,7 @@ type parkingUploader struct {
 	abortFails int
 }
 
-func (p *parkingUploader) UploadBlob(_ context.Context, _ did.DID, digest multihash.Multihash, size int64, _ string, _ ...uploader.UploadOption) (uploader.UploadedBlob, error) {
+func (p *parkingUploader) UploadBlob(_ context.Context, _ did.DID, digest multihash.Multihash, size int64, _ string) (uploader.UploadedBlob, error) {
 	c := cid.NewCidV1(cid.Raw, digest)
 	return uploader.UploadedBlob{Digest: digest, Size: size, AddTask: c, AcceptTask: c, PutInvocation: []byte("put")}, nil
 }
@@ -509,13 +509,9 @@ func newDeferredBackend(t *testing.T, up deferredTestUploader, mods ...func(*Dep
 	ctx := context.Background()
 	dir := t.TempDir()
 	mem := newTestStore(t)
-	spool, err := blockstore.NewSpool(filepath.Join(dir, "spool"))
-	if err != nil {
-		t.Fatalf("spool: %v", err)
-	}
 	cache, err := blockstore.NewBlobCache(filepath.Join(dir, "cache"))
 	if err != nil {
-		t.Fatalf("spool: %v", err)
+		t.Fatalf("cache: %v", err)
 	}
 	log, err := logstore.Open(ctx, logstore.Config{
 		Dir:     filepath.Join(dir, "segments"),
@@ -536,11 +532,9 @@ func newDeferredBackend(t *testing.T, up deferredTestUploader, mods ...func(*Dep
 		GC:         mem,
 		Multipart:  mem,
 		Parks:      mem,
-		Reads:      blockstore.NewLayered(blockstore.LocalBlobs{Cache: cache, Spool: spool}, log, testfakes.NopBaseReader{}),
+		Reads:      blockstore.NewLayered(cache, log, testfakes.NopBaseReader{}),
 		Log:        log,
-		Spool:      spool,
 		Cache:      cache,
-		Uploader:   up,
 		Deferred:   up,
 		Remover:    &recordingRemover{},
 		Registrar:  testfakes.NopUploader{},
@@ -562,10 +556,12 @@ func newDeferredBackend(t *testing.T, up deferredTestUploader, mods ...func(*Dep
 }
 
 // deferredTestUploader is what newDeferredBackend needs of a fake: the
-// uploader seams the multipart path uses.
+// uploader seams the write paths use, and the park the streaming adapter
+// hands each streamed blob to (see streamingAdapter).
 type deferredTestUploader interface {
 	uploader.Uploader
 	uploader.DeferredBodyUploader
+	UploadBlob(ctx context.Context, space did.DID, digest multihash.Multihash, size int64, localPath string) (uploader.UploadedBlob, error)
 }
 
 // TestAbortUnparksParkedBlob: abort of a genuinely parked part blob releases
@@ -1543,9 +1539,9 @@ func TestReleaseKeepsRowsUntilTheNetworkStepSucceeds(t *testing.T) {
 	if pending, _ := mem.ListReleasesBySpace(ctx, mem.bk()); len(pending) != 1 {
 		t.Fatalf("release record after the failed attempt = %v, want it kept", pending)
 	}
-	// The part's spool copy went when it parked; the intent is what the
-	// retry needs. TestReleaseFreesSpoolCopyOfDeletedPutObject covers a
-	// spool copy kept for the retry.
+	// A part keeps no local copy; the intent is what the retry needs.
+	// TestReleaseFreesCachedCopyOfDeletedPutObject covers a cached copy kept
+	// for the retry.
 	if in, err := mem.IntentByDigest(ctx, d); err != nil || in.State != registry.IntentPublished {
 		t.Fatalf("intent after the failed attempt = %v/%v, want published and kept for the retry", in, err)
 	}
@@ -1562,10 +1558,10 @@ func TestReleaseKeepsRowsUntilTheNetworkStepSucceeds(t *testing.T) {
 	assertLocalCopyReleased(t, b, mem, d)
 }
 
-// TestReleaseFreesSpoolCopyOfDeletedPutObject: deleting a single-PUT object
+// TestReleaseFreesCachedCopyOfDeletedPutObject: deleting a single-PUT object
 // frees its local disk once its release finishes. A release whose network
-// remove fails keeps the intent and spool copy for the retry.
-func TestReleaseFreesSpoolCopyOfDeletedPutObject(t *testing.T) {
+// remove fails keeps the intent and cached copy for the retry.
+func TestReleaseFreesCachedCopyOfDeletedPutObject(t *testing.T) {
 	rm := &failRemover{recordingRemover: &recordingRemover{}, fails: 1}
 	b, mem := newDeferredBackend(t, testfakes.NopUploader{}, func(d *Deps) { d.Remover = rm })
 	ctx := context.Background()
@@ -1582,7 +1578,7 @@ func TestReleaseFreesSpoolCopyOfDeletedPutObject(t *testing.T) {
 		t.Fatalf("intent after the failed attempt = %v/%v, want published and kept for the retry", in, err)
 	}
 	if _, err := os.Stat(localPath(b, d)); err != nil {
-		t.Fatalf("spool copy after the failed attempt: %v, want it kept for the retry", err)
+		t.Fatalf("cached copy after the failed attempt: %v, want it kept for the retry", err)
 	}
 
 	if n, err := b.SweepPendingReleases(ctx); err != nil || n != 1 {
@@ -1593,14 +1589,14 @@ func TestReleaseFreesSpoolCopyOfDeletedPutObject(t *testing.T) {
 }
 
 // assertLocalCopyReleased fails the test unless the blob's upload intent and
-// spool copy are both gone, as a finished release leaves them.
+// cached copy are both gone, as a finished release leaves them.
 func assertLocalCopyReleased(t *testing.T, b *Backend, mem *testStore, d multihash.Multihash) {
 	t.Helper()
 	if in, err := mem.IntentByDigest(context.Background(), d); !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("blob %x intent = %v/%v after its release, want it deleted", d, in, err)
 	}
 	if _, err := os.Stat(localPath(b, d)); !os.IsNotExist(err) {
-		t.Fatalf("blob %x spool copy after its release: stat err=%v, want not-exist", d, err)
+		t.Fatalf("blob %x cached copy after its release: stat err=%v, want not-exist", d, err)
 	}
 }
 
@@ -1609,7 +1605,7 @@ func assertLocalCopyReleased(t *testing.T, b *Backend, mem *testStore, d multiha
 // recorded by the delete as ordinary releases; the reap must not re-record
 // them as part blobs. Their intents were published by their claims, so the
 // reap leaves them to the object's own releases, which remove each winner
-// once and then drop its intent and spool copy.
+// once and then drop its intent and cached copy.
 func TestCompletedSessionReapKeepsWinnersOfDeletedObject(t *testing.T) {
 	rm := &recordingRemover{}
 	b, mem := newDeferredBackend(t, &parkingUploader{}, func(d *Deps) { d.Remover = rm })
@@ -1674,7 +1670,7 @@ func TestReapAfterDeletedObjectReleased(t *testing.T) {
 // reaped through the abort path after its object was deleted. Its blobs'
 // intents were published by their claims, so the reap leaves them to the
 // object's own releases, which remove each blob once and then drop its
-// intent and spool copy.
+// intent and cached copy.
 func TestCompletingSessionWhoseLatchFailedKeepsCommittedBlobs(t *testing.T) {
 	rm := &recordingRemover{}
 	mp := &failCompleteSession{}
@@ -1953,9 +1949,9 @@ func TestSweepLeavesALiveCompleteOnAnOldSession(t *testing.T) {
 		if _, err := mem.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 1, ETagMD5: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{d}, State: registry.PartParked}, nil, registry.ReleaseTask{}); err != nil {
 			t.Fatalf("PutPart %s: %v", id, err)
 		}
-		// The write path spools every part blob before recording the part,
-		// so a part row never exists without its blob's intent.
-		if err := mem.PutIntent(ctx, registry.UploadIntent{Space: mem.bk(), Digest: d, LocalPath: "/spool/" + id, Size: 1, State: registry.IntentParked, Bucket: "bk"}); err != nil {
+		// The write path records every part blob's intent before recording
+		// the part, so a part row never exists without its blob's intent.
+		if err := mem.PutIntent(ctx, registry.UploadIntent{Space: mem.bk(), Digest: d, Size: 1, State: registry.IntentParked, Bucket: "bk"}); err != nil {
 			t.Fatalf("PutIntent %s: %v", id, err)
 		}
 		// Parked on a provider, so a release of it is an abort the fake records.
@@ -2060,7 +2056,7 @@ func TestCompleteFailsWhenItsSessionIsTakenBeforeCommit(t *testing.T) {
 
 // teardownBeforePutPart is a multipart store that runs hook once, right
 // before its next PutPart: the window after UploadPart was admitted and
-// spooled its blobs, where a teardown can take the session.
+// streamed its blobs, where a teardown can take the session.
 type teardownBeforePutPart struct {
 	registry.MultipartStore
 	hook func()
@@ -2076,9 +2072,9 @@ func (s *teardownBeforePutPart) PutPart(ctx context.Context, p registry.Multipar
 }
 
 // TestUploadPartRefusedAfterTeardownReleasesItsBlobs: a sweep takes the
-// session after an UploadPart was admitted and spooled its blobs. The part
+// session after an UploadPart was admitted and streamed its blobs. The part
 // row is refused, since the session is no longer open, the upload fails
-// with NoSuchUpload, and the blobs it spooled are released rather than
+// with NoSuchUpload, and the blobs it streamed are released rather than
 // left behind with no row pointing at them.
 func TestUploadPartRefusedAfterTeardownReleasesItsBlobs(t *testing.T) {
 	mp := &teardownBeforePutPart{}
@@ -2104,12 +2100,12 @@ func TestUploadPartRefusedAfterTeardownReleasesItsBlobs(t *testing.T) {
 		t.Fatal("the teardown never ran")
 	}
 	drainReleases(t, b)
-	entries, err := os.ReadDir(b.spool.Path(nil))
+	entries, err := os.ReadDir(b.cache.Path(nil))
 	if err != nil {
-		t.Fatalf("read spool dir: %v", err)
+		t.Fatalf("read cache dir: %v", err)
 	}
 	if len(entries) != 0 {
-		t.Fatalf("spool holds %d blobs after the refused part was released, want 0", len(entries))
+		t.Fatalf("cache holds %d blobs after the refused part was released, want 0", len(entries))
 	}
 	if pending, _ := mem.ListReleasesBySpace(ctx, mem.bk()); len(pending) != 0 {
 		t.Fatalf("pending releases after the refused part = %v, want none", pending)
@@ -2155,12 +2151,12 @@ func TestUploadPartFailedRowWriteReleasesItsBlobs(t *testing.T) {
 		t.Fatal("the part store never refused a write")
 	}
 	drainReleases(t, b)
-	entries, err := os.ReadDir(b.spool.Path(nil))
+	entries, err := os.ReadDir(b.cache.Path(nil))
 	if err != nil {
-		t.Fatalf("read spool dir: %v", err)
+		t.Fatalf("read cache dir: %v", err)
 	}
 	if len(entries) != 0 {
-		t.Fatalf("spool holds %d blobs after the failed row write, want 0", len(entries))
+		t.Fatalf("cache holds %d blobs after the failed row write, want 0", len(entries))
 	}
 	if n := len(rm.removedDigests()); n != 1 {
 		t.Fatalf("RemoveBlob called for %d blobs, want the one that streamed", n)
@@ -2190,8 +2186,8 @@ func (f *failShred) DeleteEncryptionParams(ctx context.Context, space did.DID, d
 }
 
 // TestReleaseKeepsIntentUntilLocalCleanupSucceeds: a release of a streamed
-// blob with no rows fails at its crypto-shred. The intent and spool copy
-// must survive that attempt, or the retry would find neither rows nor
+// blob with no rows fails at its crypto-shred. The intent must survive that
+// attempt, or the retry would find neither rows nor
 // intent and could not tell the blob had left the node; the retry then
 // removes it from the provider and finishes the local cleanup.
 func TestReleaseKeepsIntentUntilLocalCleanupSucceeds(t *testing.T) {
@@ -2224,16 +2220,10 @@ func TestReleaseKeepsIntentUntilLocalCleanupSucceeds(t *testing.T) {
 	if in, err := mem.IntentByDigest(ctx, d); err != nil || in.State != registry.IntentUploading {
 		t.Fatalf("intent after the failed attempt = %v/%v, want kept as uploading", in, err)
 	}
-	if _, err := os.Stat(localPath(b, d)); err != nil {
-		t.Fatalf("spool copy gone after the failed attempt: %v", err)
-	}
 
 	drainReleases(t, b)
 	if _, err := mem.IntentByDigest(ctx, d); !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("intent survived the retry (err=%v)", err)
-	}
-	if _, err := os.Stat(localPath(b, d)); !os.IsNotExist(err) {
-		t.Fatalf("spool copy survived the retry (err=%v)", err)
 	}
 	if n := rm.removedDigests()[string(d)]; n != 1 {
 		t.Fatalf("RemoveBlob called %d times for the streamed blob, want 1", n)
@@ -2302,14 +2292,10 @@ func TestReapDoesNotRecordAReleaseAlreadyRunToCompletion(t *testing.T) {
 	}
 }
 
-// localPath returns where a blob's local copy is: in the cache once the
-// provider holds it, otherwise in the spool. A blob in neither gets its spool
-// path, so a stat of it reports the copy missing.
+// localPath returns where a blob's cached copy is, so a stat of it reports
+// whether the blob is cached.
 func localPath(b *Backend, digest multihash.Multihash) string {
-	if p := b.cache.Path(digest); fileExists(p) {
-		return p
-	}
-	return b.spool.Path(digest)
+	return b.cache.Path(digest)
 }
 
 func fileExists(path string) bool {
@@ -2424,11 +2410,11 @@ type uploadRecorder struct {
 	uploaded []multihash.Multihash
 }
 
-func (u *uploadRecorder) UploadBlob(ctx context.Context, space did.DID, digest multihash.Multihash, size int64, name string, opts ...uploader.UploadOption) (uploader.UploadedBlob, error) {
+func (u *uploadRecorder) UploadBlob(ctx context.Context, space did.DID, digest multihash.Multihash, size int64, name string) (uploader.UploadedBlob, error) {
 	u.mu.Lock()
 	u.uploaded = append(u.uploaded, digest)
 	u.mu.Unlock()
-	return u.parkingUploader.UploadBlob(ctx, space, digest, size, name, opts...)
+	return u.parkingUploader.UploadBlob(ctx, space, digest, size, name)
 }
 
 // TestConcurrentUploadsOfOnePartReleaseTheOverwrittenBlobs: two uploads of

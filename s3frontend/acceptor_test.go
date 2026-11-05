@@ -263,7 +263,7 @@ func TestAcceptorRetriesAfterAFailedPass(t *testing.T) {
 
 // TestAcceptorLeavesAPartWithoutAParkForComplete: a parked part whose blob
 // has neither a park nor a location is not the acceptor's to finish. The part
-// goes back to 'spooled', where Complete uploads it from its spool copy.
+// goes back to 'written', for Complete to settle.
 func TestAcceptorLeavesAPartWithoutAParkForComplete(t *testing.T) {
 	cc := &countingConcluder{}
 	b, mem := newDeferredBackend(t, cc)
@@ -427,9 +427,9 @@ func TestCompleteFailsFastWhileTheAcceptorFails(t *testing.T) {
 	}
 }
 
-// failOnceMoveToParked is a multipart store whose next spooled-to-parked move
+// failOnceMoveToParked is a multipart store whose next written-to-parked move
 // fails: an UploadPart that dies after parking its blobs, leaving its part
-// spooled.
+// written.
 type failOnceMoveToParked struct {
 	registry.MultipartStore
 	mu    sync.Mutex
@@ -449,10 +449,10 @@ func (f *failOnceMoveToParked) MoveParts(ctx context.Context, parts []registry.M
 	return f.MultipartStore.MoveParts(ctx, parts, from, to)
 }
 
-// TestCompleteFinishesASpooledPart: a part left spooled by a request that
+// TestCompleteFinishesAWrittenPart: a part left written by a request that
 // died after parking its blobs is not in the acceptor's queue. Complete
 // concludes it itself.
-func TestCompleteFinishesASpooledPart(t *testing.T) {
+func TestCompleteFinishesAWrittenPart(t *testing.T) {
 	cc := &countingConcluder{}
 	store := &failOnceMoveToParked{}
 	b, mem := newDeferredBackend(t, cc, func(d *Deps) {
@@ -460,7 +460,7 @@ func TestCompleteFinishesASpooledPart(t *testing.T) {
 		d.Multipart = store
 	})
 	startAcceptors(t, b)
-	key := "complete-spooled"
+	key := "complete-written"
 	uploadID := mpCreate(t, b, key, "", "")
 	parts := uploadDistinctParts(t, b, key, uploadID, 1)
 
@@ -476,7 +476,7 @@ func TestCompleteFinishesASpooledPart(t *testing.T) {
 	// The client retries nothing; the part as recorded is complete.
 	p2 := partRecord(t, mem, uploadID, 2)
 	if p2.State != registry.PartWritten {
-		t.Fatalf("part 2 state = %q, want spooled", p2.State)
+		t.Fatalf("part 2 state = %q, want written", p2.State)
 	}
 	etag = `"` + hex.EncodeToString(p2.ETagMD5) + `"`
 	two := int32(2)
