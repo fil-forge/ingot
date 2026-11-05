@@ -93,7 +93,9 @@ var ErrCancelled = errors.New("task cancelled")
 
 // insertSpec returns the statement that adds s's task with the given ID. A
 // replacement keeps whichever of it and a pending, unstarted replacement with
-// the same subject and action has the later NotBefore, and drops the other.
+// the same subject and action has the later NotBefore, and drops the other. A
+// replacement waiting to retry counts as unstarted, as it does for Cancel;
+// the one that takes its place starts its attempts afresh and holds nothing.
 func insertSpec(q *queue, id TaskID, s Spec, sync bool) (string, []any) {
 	args := []any{id, s.Subject, s.Action, s.NotBefore, s.Expires, s.Args, sync}
 	if !s.Replace {
@@ -103,7 +105,8 @@ func insertSpec(q *queue, id TaskID, s Spec, sync bool) (string, []any) {
 	VALUES ($1, $2, $3, $4, $5, $6, $7, true)
 	ON CONFLICT (subject, action) WHERE state = 'pending' AND replaceable AND started IS NULL
 	DO UPDATE SET id = EXCLUDED.id, seq = DEFAULT, created = EXCLUDED.created,
-		not_before = EXCLUDED.not_before, expires = EXCLUDED.expires, args = EXCLUDED.args
+		not_before = EXCLUDED.not_before, expires = EXCLUDED.expires, args = EXCLUDED.args,
+		attempts = 0, error = NULL, retry_at = NULL
 	WHERE t.not_before < EXCLUDED.not_before`, args
 }
 
@@ -281,7 +284,7 @@ func (r *Runner) failOrRetry(ctx context.Context, h *hold, a *action, tasks []Ta
 				col = "retry_at"
 			}
 			sql = `UPDATE ` + h.q.tasks + ` SET attempts = attempts + 1, error = $2, started = NULL,
-				replaceable = false, ` + col + ` = now() + $3 * interval '1 millisecond'
+				` + col + ` = now() + $3 * interval '1 millisecond'
 				WHERE id = $1 AND state = 'pending'`
 			args = append(args, p.delay(t.Attempt+1).Milliseconds())
 			retried = append(retried, t)

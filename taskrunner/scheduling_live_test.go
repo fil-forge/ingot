@@ -399,6 +399,61 @@ func TestATaskWaitingToRetryCanBeCancelled_Live(t *testing.T) {
 	}
 }
 
+// TestAReplacementTakesTheRetrysPlace_Live: a replacement waiting to retry
+// is replaced like any that has not started, so its retry cannot run ahead of
+// the replacement's time, and the replacement starts its attempts afresh.
+func TestAReplacementTakesTheRetrysPlace_Live(t *testing.T) {
+	f := newFixture(t, 1)
+	type run struct {
+		id      taskrunner.TaskID
+		attempt int
+	}
+	var mu sync.Mutex
+	var runs []run
+	if err := f.r.Handle(qTop, "evict", func(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		runs = append(runs, run{task.ID, task.Attempt})
+		if len(runs) == 1 {
+			return nil, errors.New("unavailable")
+		}
+		return nil, nil
+	}, taskrunner.WithRetry(taskrunner.RetryPolicy{First: 200 * time.Millisecond})); err != nil {
+		t.Fatal(err)
+	}
+	f.start(t)
+	ctx := waitCtx(t)
+	failing, err := f.r.Submit(ctx, taskrunner.Spec{Queue: qTop, Subject: "blob", Action: "evict", NotBefore: at(-time.Second), Replace: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for {
+		mu.Lock()
+		n := len(runs)
+		mu.Unlock()
+		if n > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond)
+	next, err := f.r.Submit(ctx, taskrunner.Spec{Queue: qTop, Subject: "blob", Action: "evict", NotBefore: at(time.Second), Replace: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.r.Wait(ctx, qTop, next); err != nil {
+		t.Fatalf("Wait replacement: %v", err)
+	}
+	if _, err := f.r.Wait(ctx, qTop, failing); !errors.Is(err, taskrunner.ErrNotFound) {
+		t.Errorf("replaced retry: Wait error %v, want ErrNotFound", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if want := []run{{failing, 0}, {next, 0}}; !slices.Equal(runs, want) {
+		t.Errorf("runs = %v, want the failed attempt then the replacement's first", runs)
+	}
+}
+
 func TestBatchExpiryIsRecordedTogether_Live(t *testing.T) {
 	f := newFixture(t, 1)
 	if err := f.r.HandleBatch(qTop, "register", 3, func(ctx context.Context, ex *taskrunner.Exec, tasks []taskrunner.Task) ([][]byte, error) {

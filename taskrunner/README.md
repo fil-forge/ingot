@@ -188,7 +188,7 @@ _, err := ex.Submit(ctx, taskrunner.Spec{
 })
 ```
 
-A task without `Replace` is never a replacement and leaves pending ones alone. A replacement that has started can no longer be replaced, so a new one is added beside it.
+A task without `Replace` is never a replacement and leaves pending ones alone. A replacement that is running can no longer be replaced, so a new one is added beside it. One waiting to retry can be: the task that takes its place starts its attempts afresh, and no longer holds its subject (see Retries).
 
 ## Cancelling
 
