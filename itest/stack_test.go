@@ -364,6 +364,10 @@ var hiltAllPermissions = []string{
 	"s3:PutObjectTagging",
 	"s3:DeleteObjectTagging",
 	"s3:GetObjectAttributes",
+	// A delete or retention write carrying x-amz-bypass-governance-retention
+	// is priced on its own permission; the conformance suite clears
+	// governance-locked versions when it tears a bucket down.
+	"s3:BypassGovernanceRetention",
 }
 
 // hiltPolicyPermissions are the bucket policy operations, held by service
