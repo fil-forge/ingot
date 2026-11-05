@@ -23,13 +23,20 @@
 // consumer can't read is retried as well, never replaced by the head.
 //
 // Restoring the service's database from a backup older than the consumer's
-// cursor (Swarf's README, "Moving the database"), or restarting a service that
-// keeps its records in memory, leaves the cursor ahead of the firehose's head.
-// The service refuses such a cursor, and the consumer logs an error and
-// starts over at the head, saving it. The revocations the service recorded after the restore
-// and before the consumer read the head are not delivered. Retrying the
-// refused cursor would lose more: the service accepts it once new records
-// pass it, skipping every record in between.
+// cursor (Swarf's README, "Moving the database"), or restarting a service
+// that keeps its records in memory, leaves the cursor ahead of the firehose's
+// head, and the service refuses it. The consumer logs an error and reads the
+// head. Revocations recorded since the restore and before that head are never
+// delivered, and nothing says which keys they named, so the consumer clears
+// every access key's caches: each key's next request goes to Hilt, which
+// refuses a deleted key. Then it saves the head and streams after it.
+// Retrying the refused cursor instead would skip records: the service accepts
+// it once new records pass it, skipping every record in between.
+//
+// If new records pass the cursor before the consumer reconnects, the service
+// accepts it and nothing reports the gap. After restoring the service's
+// database from a backup, restart ingot: that empties every cache, so no
+// revocation recorded before the restart can matter.
 //
 // The gateway keeps serving while the service is unreachable (reconnect with
 // capped backoff); in the worst case cache entries age out on their own TTLs,
@@ -60,11 +67,14 @@ type Source interface {
 	StreamAfter(ctx context.Context, after swarfclient.Cursor) iter.Seq2[swarfclient.Event, error]
 }
 
-// Invalidator applies one revocation to local authorization state
-// (iam.Revoker satisfies it), returning the access keys whose caches it
-// cleared. Must be idempotent: reconnects may re-deliver records.
+// Invalidator applies revocations to local authorization state (iam.Revoker
+// satisfies it). Revoke applies one, returning the access keys whose caches
+// it cleared, and must be idempotent: reconnects may re-deliver records.
+// ClearAll clears every access key's caches, for when revocations were missed
+// and there is no telling which keys they named.
 type Invalidator interface {
 	Revoke(revoked cid.Cid) []did.DID
+	ClearAll() int
 }
 
 // Compile-time assertion: the real swarf client satisfies Source.
@@ -171,7 +181,7 @@ func (c *Consumer) Run(ctx context.Context) {
 			if errors.Is(err, swarfclient.ErrCursorRefused) {
 				c.logger.Error("revocation: cursor refused",
 					zap.String("cursor", position.Token),
-					zap.String("action", "starting over at the firehose head; revocations recorded since the service's database was restored may be missed"),
+					zap.String("action", "starting over at the firehose head and clearing every access key's caches"),
 					zap.Error(err))
 				refused = true
 				break
@@ -211,6 +221,10 @@ func (c *Consumer) Run(ctx context.Context) {
 			if !ok {
 				return
 			}
+			// Cleared only now: a revocation recorded before the head is never
+			// delivered, so authorization cached before reading it can't be
+			// trusted.
+			c.inv.ClearAll()
 			restart := registry.RevocationCursor{Token: string(head)}
 			position = restart
 			// The saver persists it, so a restart doesn't return to the
@@ -243,7 +257,8 @@ func (c *Consumer) startPosition(ctx context.Context, bo *backoff.ExponentialBac
 		if ctx.Err() != nil {
 			return registry.RevocationCursor{}, false
 		}
-		c.logger.Warn("revocation: load cursor", zap.Error(err))
+		// No revocation is applied until it can be read, so this is an error.
+		c.logger.Error("revocation: load cursor", zap.Error(err))
 		if !sleepCtx(ctx, bo.NextBackOff()) {
 			return registry.RevocationCursor{}, false
 		}

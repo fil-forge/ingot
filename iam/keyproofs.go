@@ -81,6 +81,17 @@ func (k *KeyProofs) Deposit(key did.DID, dlgs ...ucan.Delegation) {
 	k.For(key).Add(dlgs...)
 }
 
+// InvalidateAll drops every per-key proof store, keeping the record of
+// revoked CIDs, and returns how many it dropped. As with InvalidateHolders, a
+// caller already holding a dropped store can still use it.
+func (k *KeyProofs) InvalidateAll() int {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	n := k.byKey.ItemCount()
+	k.byKey.Flush()
+	return n
+}
+
 // InvalidateHolders records link as revoked and drops every per-key proof
 // store holding the delegation with that CID, returning the affected
 // access-key DIDs. Dropping the whole store rather than the one entry is

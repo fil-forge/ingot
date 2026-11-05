@@ -117,10 +117,24 @@ func (f *fakeSource) calls() []swarfclient.Cursor {
 	return append([]swarfclient.Cursor(nil), f.opened...)
 }
 
-// fakeInvalidator records every Revoke call.
+// fakeInvalidator records every Revoke and ClearAll call.
 type fakeInvalidator struct {
 	mu      sync.Mutex
 	revoked []cid.Cid
+	cleared int
+}
+
+func (f *fakeInvalidator) ClearAll() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.cleared++
+	return 0
+}
+
+func (f *fakeInvalidator) clears() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.cleared
 }
 
 func (f *fakeInvalidator) Revoke(revoked cid.Cid) []did.DID {
@@ -251,7 +265,9 @@ func TestConsumerRetriesACursorItCouldNotRead(t *testing.T) {
 	waitFor(t, func() bool { return len(src.calls()) == 1 })
 	require.Equal(t, swarfclient.Cursor("cursor-stored"), src.calls()[0])
 	require.Zero(t, src.headCalls())
-	require.Len(t, logs.FilterMessage("revocation: load cursor").All(), 2)
+	loads := logs.FilterMessage("revocation: load cursor").All()
+	require.Len(t, loads, 2)
+	require.Equal(t, zap.ErrorLevel, loads[0].Level, "no revocation is applied until the cursor can be read")
 	stop()
 	require.Empty(t, store.calls(), "nothing new to save")
 }
@@ -268,25 +284,70 @@ func TestConsumerRetriesAFailedHeadSave(t *testing.T) {
 
 	waitFor(t, func() bool { return len(store.calls()) == 1 })
 	require.Equal(t, []registry.RevocationCursor{{Token: string(testHead)}}, store.calls())
-	require.Equal(t, []swarfclient.Cursor{testHead}, src.calls())
+	waitFor(t, func() bool { return len(src.calls()) == 1 })
+	require.Equal(t, testHead, src.calls()[0])
 }
 
-// A cursor the service refuses is logged as an error, and the consumer starts
-// over at the head and saves it. Retrying the refused cursor would skip every
-// record recorded before new records passed it.
-func TestConsumerStartsOverAtTheHeadWhenItsCursorIsRefused(t *testing.T) {
-	ctx := context.Background()
+// storedCursor returns a store holding a cursor from before a refusal.
+func storedCursor(t *testing.T) *inmem.MemStore {
+	t.Helper()
 	store := inmem.NewMemStore()
-	require.NoError(t, store.PutRevocationCursor(ctx, registry.RevocationCursor{
+	require.NoError(t, store.PutRevocationCursor(context.Background(), registry.RevocationCursor{
 		Token:      "cursor-moved",
 		RecordedAt: time.Date(2026, 8, 1, 9, 0, 0, 0, time.UTC),
 		Revoke:     testCid(t, "earlier"),
 	}))
-	src := &fakeSource{scripts: []streamScript{
-		{err: fmt.Errorf("opening revocation stream: %w", swarfclient.ErrCursorRefused)},
-	}}
+	return store
+}
+
+// refusal is a stream script the service refuses.
+var refusal = streamScript{err: fmt.Errorf("opening revocation stream: %w", swarfclient.ErrCursorRefused)}
+
+// After a refusal the consumer waits out its backoff before it reconnects,
+// so a service that keeps refusing isn't asked again in a tight loop.
+func TestConsumerWaitsBeforeReconnectingAfterARefusal(t *testing.T) {
+	src := &fakeSource{scripts: []streamScript{refusal, refusal}}
+	inv := &fakeInvalidator{}
+	c := revocation.NewConsumer(src, storedCursor(t), inv,
+		revocation.WithBackoff(time.Hour, time.Hour))
+	stop := run(c)
+	defer stop()
+
+	waitFor(t, func() bool { return inv.clears() == 1 })
+	time.Sleep(20 * time.Millisecond)
+	require.Len(t, src.calls(), 1, "reconnected without waiting")
+}
+
+// The head read after a refusal is retried until the service answers, and
+// the caches are cleared only once it has.
+func TestConsumerRetriesTheHeadAfterARefusal(t *testing.T) {
+	src := &fakeSource{
+		scripts:  []streamScript{refusal},
+		headErrs: []error{errors.New("connection refused")},
+	}
+	inv := &fakeInvalidator{}
+	c := revocation.NewConsumer(src, storedCursor(t), inv,
+		revocation.WithBackoff(time.Millisecond, time.Millisecond))
+	stop := run(c)
+	defer stop()
+
+	waitFor(t, func() bool { return len(src.calls()) == 2 })
+	require.Equal(t, testHead, src.calls()[1])
+	require.Equal(t, 2, src.headCalls())
+	require.Equal(t, 1, inv.clears())
+}
+
+// A cursor the service refuses is logged as an error, and the consumer clears
+// every access key's caches, then starts over at the head and saves it.
+// Retrying the refused cursor would skip every record recorded before new
+// records passed it.
+func TestConsumerStartsOverAtTheHeadWhenItsCursorIsRefused(t *testing.T) {
+	ctx := context.Background()
+	store := storedCursor(t)
+	src := &fakeSource{scripts: []streamScript{refusal}}
+	inv := &fakeInvalidator{}
 	core, logs := observer.New(zap.WarnLevel)
-	c := revocation.NewConsumer(src, store, &fakeInvalidator{},
+	c := revocation.NewConsumer(src, store, inv,
 		revocation.WithLogger(zap.New(core)),
 		revocation.WithBackoff(time.Millisecond, time.Millisecond),
 		revocation.WithSaveInterval(time.Millisecond))
@@ -295,6 +356,7 @@ func TestConsumerStartsOverAtTheHeadWhenItsCursorIsRefused(t *testing.T) {
 
 	waitFor(t, func() bool { return len(src.calls()) == 2 })
 	require.Equal(t, []swarfclient.Cursor{"cursor-moved", testHead}, src.calls())
+	require.Equal(t, 1, inv.clears(), "a refusal clears every key's caches once")
 	refused := logs.FilterMessage("revocation: cursor refused").All()
 	require.Len(t, refused, 1)
 	require.Equal(t, zap.ErrorLevel, refused[0].Level)
