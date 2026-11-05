@@ -41,9 +41,10 @@ const (
 // written or read, when Deps.CacheTTL is zero.
 const DefaultCacheTTL = time.Hour
 
-// renewalTimeLimit bounds how long a read waits to queue its blob's renewal,
-// so a stalled database delays a cached GET by this much at most.
-const renewalTimeLimit = 5 * time.Second
+// shardSubmitTimeLimit bounds how long a request waits to queue a cached
+// blob's move or renewal, which goes on after the request itself ends, so a
+// stalled database delays a PUT or a cached GET by this much at most.
+const shardSubmitTimeLimit = 5 * time.Second
 
 // renewalCapacity caps how many blobs' last renewals the backend remembers.
 // The least recently renewed entry is dropped first, and its blob's next read
@@ -53,6 +54,12 @@ const renewalCapacity = 65536
 // shardEvictRetry retries a failed eviction a few times. The budget pass
 // removes whatever is left over budget.
 var shardEvictRetry = taskrunner.RetryPolicy{First: time.Second, Multiplier: 2, Attempts: 3}
+
+// shardCacheRetry retries a failed move or renewal a few times, since a copy
+// left without its eviction stays on disk until the budget pass, or for good
+// in the spool. The task is safe to run again: a copy already moved leaves
+// nothing to move.
+var shardCacheRetry = taskrunner.RetryPolicy{First: time.Second, Multiplier: 2, Attempts: 3}
 
 // ShardCacheTask is a queue-shard.cache task's arguments.
 type ShardCacheTask struct {
@@ -75,7 +82,7 @@ type ShardEvictTask struct {
 // for submitting them. Call it before r starts.
 func (b *Backend) RegisterShardTasks(r *taskrunner.Runner) error {
 	b.shards = r
-	if err := r.Handle(ShardQueue, shardCache, b.runShardCache); err != nil {
+	if err := r.Handle(ShardQueue, shardCache, b.runShardCache, taskrunner.WithRetry(shardCacheRetry)); err != nil {
 		return err
 	}
 	if err := r.Handle(ShardQueue, shardEvict, b.runShardEvict, taskrunner.WithRetry(shardEvictRetry)); err != nil {
@@ -95,8 +102,12 @@ func (b *Backend) shardNode() *string {
 }
 
 // submitShardCache queues a queue-shard.cache task for digest, and records
-// the renewal so the reads that follow do not repeat it.
+// the renewal so the reads that follow do not repeat it. The request may end
+// before the task is queued; the task should not, but it waits no longer than
+// shardSubmitTimeLimit.
 func (b *Backend) submitShardCache(ctx context.Context, digest multihash.Multihash, take bool) error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), shardSubmitTimeLimit)
+	defer cancel()
 	var buf bytes.Buffer
 	if err := (&ShardCacheTask{Take: take, TTL: int64(b.cacheTTL)}).MarshalCBOR(&buf); err != nil {
 		return fmt.Errorf("encode cache task: %w", err)
@@ -125,10 +136,6 @@ func (b *Backend) renewCached(ctx context.Context, digest multihash.Multihash) {
 	if !b.renewals.claim(string(digest), time.Now(), b.cacheTTL/2) {
 		return
 	}
-	// The read may end before the task is queued; the renewal should not, but
-	// it waits no longer than renewalTimeLimit.
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), renewalTimeLimit)
-	defer cancel()
 	if err := b.submitShardCache(ctx, digest, false); err != nil {
 		b.renewals.forget(string(digest))
 		b.logger.Warn("could not extend a cached blob's time in the cache",
@@ -139,9 +146,8 @@ func (b *Backend) renewCached(ctx context.Context, digest multihash.Multihash) {
 // runShardCache is queue-shard.cache: it moves the blob's spool copy into the
 // cache when asked to, then, if the cache holds the blob, dates the file now,
 // which orders the budget pass, and schedules its eviction for when its time
-// to live runs out. A failed move fails the task without retrying: the copy
-// stays in the spool, as it does when the move is refused for a write still
-// holding it, and reads find it there.
+// to live runs out. A failed step retries the task (shardCacheRetry); a copy
+// whose move keeps failing stays in the spool, where reads find it.
 func (b *Backend) runShardCache(ctx context.Context, ex *taskrunner.Exec, t taskrunner.Task) ([]byte, error) {
 	digest, err := hex.DecodeString(t.Subject)
 	if err != nil {

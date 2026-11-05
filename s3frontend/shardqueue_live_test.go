@@ -109,6 +109,20 @@ func TestHeldBlobIsCachedUntilItsTTL_Live(t *testing.T) {
 	require.Zero(t, unplaced)
 }
 
+// A held blob moves into the cache even when the request that held it has
+// ended by the time the move is queued.
+func TestHeldBlobIsCachedAfterItsRequestEnds_Live(t *testing.T) {
+	f := newShardFixture(t, time.Hour)
+	d, _, err := f.b.spool.WriteBlob(t.Context(), bytes.NewReader([]byte("a")))
+	require.NoError(t, err)
+	ended, cancel := context.WithCancel(t.Context())
+	cancel()
+	f.b.cacheHeld(ended, testutil.RandomDID(t), d)
+
+	require.Eventually(t, func() bool { return f.cached(d) }, 5*time.Second, 10*time.Millisecond, "moved into the cache")
+	require.Eventually(t, func() bool { return f.tasks(t, d, shardEvict, "pending") == 1 }, 5*time.Second, 10*time.Millisecond, "its eviction queued")
+}
+
 // A read with less than half the time to live left renews it: the pending
 // eviction is replaced by a later one, so the blob outlives its first TTL.
 func TestReadRenewsTheTTL_Live(t *testing.T) {
