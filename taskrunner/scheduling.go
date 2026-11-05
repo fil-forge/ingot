@@ -177,15 +177,21 @@ func (ex *Exec) Cancel(ctx context.Context, queueName string, id TaskID) error {
 
 // cancelPending cancels the unstarted pending tasks of an action on any of
 // the subjects $1, returning their IDs, and the subjects among them with one
-// that has started and is running. Both read the same snapshot, which the
-// update does not change for a running task.
-const cancelPending = `WITH cancelled AS (
-		UPDATE %[1]s SET state = 'cancelled', finished = now()
-		WHERE subject = ANY($1) AND action = $2 AND state = 'pending' AND started IS NULL
-		RETURNING id)
+// that has started and is running. Both answers come from the locked rows,
+// which are the current ones: a claim that committed after the statement
+// began is seen as started, and one still to come waits for the cancel and
+// then finds nothing to claim. A reading of the statement's snapshot instead
+// could miss a task starting meanwhile in both answers at once.
+const cancelPending = `WITH locked AS (
+		SELECT id, subject, started FROM %[1]s
+		WHERE subject = ANY($1) AND action = $2 AND state = 'pending'
+		FOR UPDATE),
+	cancelled AS (
+		UPDATE %[1]s t SET state = 'cancelled', finished = now()
+		FROM locked WHERE t.id = locked.id AND locked.started IS NULL
+		RETURNING t.id)
 	SELECT coalesce((SELECT array_agg(id) FROM cancelled), '{}'),
-		coalesce((SELECT array_agg(DISTINCT subject) FROM %[1]s
-			WHERE subject = ANY($1) AND action = $2 AND state = 'pending' AND started IS NOT NULL), '{}')`
+		coalesce((SELECT array_agg(DISTINCT subject) FROM locked WHERE started IS NOT NULL), '{}')`
 
 // CancelPending cancels every pending task of the action on the subjects that
 // has not started, as Cancel does by ID, in one statement however many
@@ -273,23 +279,31 @@ func (r *Runner) Pending(ctx context.Context, queueName string, subjects []strin
 // $1 is a LIKE pattern: the subject itself with its wildcards escaped, or a
 // prefix of it followed by %, which the pending index serves since subjects
 // sort byte by byte.
-const expedite = `WITH due AS (
-		UPDATE %[1]s SET not_before = NULL, replaceable = false
-		WHERE subject LIKE $1 AND action = $2 AND state = 'pending' AND started IS NULL
-		AND not_before > now())
-	SELECT subject, id FROM %[1]s
-	WHERE subject LIKE $1 AND action = $2 AND state = 'pending'
-	ORDER BY seq`
+// expedite brings forward the unstarted pending tasks of an action on the
+// subjects matching $1 that wait for a time, whether a NotBefore or a retry's
+// backoff, and returns all of them. It reads the locked rows, which are the
+// current ones, so a replacement that committed after the statement began is
+// returned by its own ID.
+const expedite = `WITH locked AS (
+		SELECT id, subject, seq, started, not_before, retry_at FROM %[1]s
+		WHERE subject LIKE $1 AND action = $2 AND state = 'pending'
+		FOR UPDATE),
+	due AS (
+		UPDATE %[1]s t SET not_before = NULL, retry_at = NULL, replaceable = false
+		FROM locked WHERE t.id = locked.id AND locked.started IS NULL
+		AND (locked.not_before > now() OR locked.retry_at > now()))
+	SELECT subject, id FROM locked ORDER BY seq`
 
 // Expedite makes the subject's pending tasks of the action due now, whatever
-// their NotBefore, and returns all of the action's pending tasks on it, by
-// subject and oldest first, for the caller to Wait on or to run inline with a
-// sync task on each subject. A subject ending in * stands for every subject
+// their NotBefore or retry backoff, and returns all of the action's pending
+// tasks on it, by subject and oldest first, for the caller to Wait on or to
+// run inline with a sync task on each subject. A subject ending in * stands for every subject
 // that starts with what comes before the *, so a caller can bring forward a
 // group of subjects at once, such as a bucket delete running its space's
 // pending releases. A task it brings forward is no longer a replacement, so a
-// later submission cannot push it back. A task waiting to retry keeps its
-// backoff, and one placed on another instance still runs only there.
+// later submission cannot push it back. A task waiting to retry is brought
+// forward too, whether or not it holds its subject. One placed on another
+// instance still runs only there.
 func (r *Runner) Expedite(ctx context.Context, queueName, subject, action string) (map[string][]TaskID, error) {
 	q, ok := r.byName[queueName]
 	if !ok {

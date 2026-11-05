@@ -237,7 +237,7 @@ if len(releasing[subject]) > 0 {
 
 ## Running delayed work now
 
-`Expedite` makes a subject's pending tasks of an action due now, whatever their `NotBefore`, and returns them all by subject, for the caller to wait on or to run inline with a sync task on each subject. A subject ending in `*` stands for every subject that starts with what comes before it, which is why a submitted subject may not end in `*`. A bucket delete uses that to run its space's pending releases before the space goes. A task it brings forward can no longer be replaced, so nothing pushes it back again. A task waiting to retry keeps its backoff.
+`Expedite` makes a subject's pending tasks of an action due now, whatever their `NotBefore`, and returns them all by subject, for the caller to wait on or to run inline with a sync task on each subject. A subject ending in `*` stands for every subject that starts with what comes before it, which is why a submitted subject may not end in `*`. A bucket delete uses that to run its space's pending releases before the space goes. A task it brings forward can no longer be replaced, so nothing pushes it back again. A task waiting to retry is brought forward too, whether or not it holds its subject: the caller asked for now.
 
 ```go
 due, err := r.Expedite(ctx, "queue-space-shard", space+"/*", "release")

@@ -302,3 +302,136 @@ func TestSubmitAllTxAddsManyTasksAtOnce(t *testing.T) {
 		t.Errorf("the pending sp/later, due later than the batch's, is %s; want it kept", got)
 	}
 }
+
+// waitForALockWait returns once a statement on the test database is waiting
+// for a row lock.
+func waitForALockWait(t *testing.T, f *fixture) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		var n int
+		if err := f.env.DB.QueryRow(context.Background(), `SELECT count(*) FROM pg_stat_activity
+			WHERE datname = current_database() AND wait_event_type = 'Lock'`).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n > 0 {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("no statement waited for a lock")
+}
+
+// CancelPending reports a task as running when its claim commits while the
+// cancel is under way, rather than missing it in both answers.
+func TestCancelPendingSeesAClaimCommittedMeanwhile(t *testing.T) {
+	f := newFixture(t, 0)
+	f.handle(t, qTop, "release", f.put())
+	f.migrate(t)
+	ctx := waitCtx(t)
+	id, err := f.r.Submit(ctx, taskrunner.Spec{Queue: qTop, Subject: "sp/d", Action: "release"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A worker's claim, held open until the cancel waits on it.
+	claim, err := f.env.DB.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = claim.Rollback(ctx) }()
+	if _, err := claim.Exec(ctx, `UPDATE `+f.env.Table(queueTable(qTop)+"_tasks")+` SET started = now() WHERE id = $1`, id); err != nil {
+		t.Fatal(err)
+	}
+	type result struct {
+		n       int
+		running []string
+		err     error
+	}
+	done := make(chan result, 1)
+	go func() {
+		n, running, err := f.r.CancelPending(ctx, qTop, []string{"sp/d"}, "release")
+		done <- result{n, running, err}
+	}()
+	waitForALockWait(t, f)
+	if err := claim.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got := <-done
+	if got.err != nil || got.n != 0 || !slices.Equal(got.running, []string{"sp/d"}) {
+		t.Fatalf("CancelPending = %d, %v, %v; want none cancelled and sp/d running", got.n, got.running, got.err)
+	}
+}
+
+// Expedite returns a replacement that commits while it runs by the
+// replacement's own ID, so a caller waits on the task that will run.
+func TestExpediteReturnsAReplacementCommittedMeanwhile(t *testing.T) {
+	f := newFixture(t, 0)
+	f.handle(t, qTop, "release", f.put())
+	f.migrate(t)
+	ctx := waitCtx(t)
+	hour, twoHours := time.Now().Add(time.Hour), time.Now().Add(2*time.Hour)
+	if _, err := f.r.Submit(ctx, taskrunner.Spec{Queue: qTop, Subject: "sp/d", Action: "release", NotBefore: &hour, Replace: true}); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := f.env.DB.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	replacement, err := f.r.SubmitTx(ctx, tx, taskrunner.Spec{Queue: qTop, Subject: "sp/d", Action: "release", NotBefore: &twoHours, Replace: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	type result struct {
+		due map[string][]taskrunner.TaskID
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		due, err := f.r.Expedite(ctx, qTop, "sp/d", "release")
+		done <- result{due, err}
+	}()
+	waitForALockWait(t, f)
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got := <-done
+	if got.err != nil || !slices.Equal(got.due["sp/d"], []taskrunner.TaskID{replacement}) {
+		t.Fatalf("Expedite = %v, %v; want the replacement %s", got.due, got.err, replacement)
+	}
+}
+
+// Expedite brings forward a task waiting to retry, whether or not its retry
+// holds the subject.
+func TestExpediteBringsRetriesForward(t *testing.T) {
+	for name, holds := range map[string]bool{"holding": true, "not holding": false} {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t, 1)
+			var runs atomic.Int32
+			if err := f.r.Handle(qTop, "release", func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) {
+				if runs.Add(1) == 1 {
+					return nil, errors.New("unavailable")
+				}
+				return nil, nil
+			}, taskrunner.WithRetry(taskrunner.RetryPolicy{First: time.Hour, HoldsSubject: holds})); err != nil {
+				t.Fatal(err)
+			}
+			f.start(t)
+			ctx := waitCtx(t)
+			id, err := f.r.Submit(ctx, taskrunner.Spec{Queue: qTop, Subject: "sp/d", Action: "release"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for runs.Load() == 0 {
+				time.Sleep(10 * time.Millisecond)
+			}
+			time.Sleep(100 * time.Millisecond) // the failure is recorded
+			if _, err := f.r.Expedite(ctx, qTop, "sp/d", "release"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.r.Wait(ctx, qTop, id); err != nil {
+				t.Fatalf("Wait: %v, want the retry to run now and succeed", err)
+			}
+		})
+	}
+}
