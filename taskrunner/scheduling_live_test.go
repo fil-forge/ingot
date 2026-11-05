@@ -3,6 +3,7 @@ package taskrunner_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -532,23 +533,39 @@ func TestBatchLeavesOutAnExpiredTask_Live(t *testing.T) {
 	}
 }
 
-func TestDrainLimitCountsBatchedTasks_Live(t *testing.T) {
+// TestDrainLimitCountsRuns_Live: DrainLimit counts handler runs, a batch as
+// one, so a batch goes out whole at its own limit, and a subject gives up its
+// lease after DrainLimit runs, letting another subject's older task go next.
+func TestDrainLimitCountsRuns_Live(t *testing.T) {
 	f := newFixture(t, 1, func(o *taskrunner.Options) { o.DrainLimit = 2 })
 	var mu sync.Mutex
-	var sizes []int
-	if err := f.r.HandleBatch(qTop, "register", 5, func(ctx context.Context, ex *taskrunner.Exec, tasks []taskrunner.Task) ([][]byte, error) {
+	var runs []string
+	record := func(task taskrunner.Task, n int) {
 		mu.Lock()
-		sizes = append(sizes, len(tasks))
+		runs = append(runs, fmt.Sprintf("%s:%s:%d", task.Subject, task.Action, n))
 		mu.Unlock()
+	}
+	if err := f.r.HandleBatch(qTop, "register", 5, func(ctx context.Context, ex *taskrunner.Exec, tasks []taskrunner.Task) ([][]byte, error) {
+		record(tasks[0], len(tasks))
 		return make([][]byte, len(tasks)), nil
 	}); err != nil {
 		t.Fatal(err)
 	}
+	f.handle(t, qTop, "other", func(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
+		record(task, 1)
+		return nil, nil
+	})
 	f.migrate(t)
 	ctx := waitCtx(t)
+	// Subject a: a batch of five, another action, then one more of the
+	// first, which a third run would take. Subject b's task is queued before
+	// that last one.
 	var last taskrunner.TaskID
-	for range 5 {
-		id, err := f.r.Submit(ctx, taskrunner.Spec{Queue: qTop, Subject: "space", Action: "register"})
+	for _, s := range []struct{ subject, action string }{
+		{"a", "register"}, {"a", "register"}, {"a", "register"}, {"a", "register"}, {"a", "register"},
+		{"a", "other"}, {"b", "other"}, {"a", "register"},
+	} {
+		id, err := f.r.Submit(ctx, taskrunner.Spec{Queue: qTop, Subject: s.subject, Action: s.action})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -560,7 +577,7 @@ func TestDrainLimitCountsBatchedTasks_Live(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if !slices.Equal(sizes, []int{2, 2, 1}) {
-		t.Errorf("batch sizes %v, want [2 2 1]: no more than DrainLimit tasks per lease", sizes)
+	if want := []string{"a:register:5", "a:other:1", "b:other:1", "a:register:1"}; !slices.Equal(runs, want) {
+		t.Errorf("runs %v, want %v: the whole batch, then a gives way after two runs", runs, want)
 	}
 }

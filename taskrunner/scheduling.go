@@ -166,10 +166,10 @@ func scanTask(row pgx.Row, t *Task) error {
 
 // claim marks the subject's next due task started and returns it. When its
 // action batches, the due tasks straight after it with the same action join
-// it, up to the action's limit or max, whichever is smaller. A next task other
+// it, up to the action's limit. A next task other
 // than target whose Run caller is waiting is left unclaimed, for its caller,
 // with a *yieldError.
-func (r *Runner) claim(ctx context.Context, q *queue, subject string, upTo int64, target TaskID, max int) ([]Task, error) {
+func (r *Runner) claim(ctx context.Context, q *queue, subject string, upTo int64, target TaskID) ([]Task, error) {
 	var next TaskID
 	var waited, backingOff bool
 	if err := r.db.QueryRow(ctx, `SELECT id, coalesce(waiting_until > now(), false),
@@ -197,7 +197,7 @@ func (r *Runner) claim(ctx context.Context, q *queue, subject string, upTo int64
 	a, ok := r.handler(actionKey{q.name, first.Action})
 	limit := 0
 	if ok && a.batch != nil {
-		limit = min(a.limit, max)
+		limit = a.limit
 	}
 	if limit < 2 || first.sync {
 		return tasks, nil

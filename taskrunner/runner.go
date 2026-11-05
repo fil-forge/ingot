@@ -111,8 +111,9 @@ type Options struct {
 	// longest a waiter goes between checks of a task in another process.
 	// Defaults to 1 second.
 	PollInterval time.Duration
-	// DrainLimit is the most tasks a worker runs on one subject before
-	// releasing its lease. Defaults to 100.
+	// DrainLimit is the most handler runs a worker makes on one subject
+	// before releasing its lease. A batch is one run, whatever its size.
+	// Defaults to 100.
 	DrainLimit int
 	// CommitAttempts is how many times a tree is run when its final commit
 	// fails, before the task is left for resumption. Defaults to 3.
