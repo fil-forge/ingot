@@ -229,10 +229,7 @@ func recipientOf(t *testing.T, stored []byte) *cose.Recipient {
 // recoverability criterion: no region, no database).
 func assertTenantRecipient(t *testing.T, b *Backend, digest []byte, plaintext []byte) {
 	t.Helper()
-	stored, err := os.ReadFile(localPath(b, digest))
-	if err != nil {
-		t.Fatalf("read spooled blob: %v", err)
-	}
+	stored := storedBytes(t, b, digest)
 	kid := tenantkey.EncodePublicKey(testWrapKey.PublicKey())
 	rec := recipientOf(t, stored)
 	if got, ok := rec.Headers.Unprotected.Bytes(cose.HeaderLabelKID); !ok || string(got) != kid {
@@ -319,7 +316,7 @@ func TestEncryptedWrite_FailsClosedWithoutRecipient(t *testing.T) {
 
 	bucket, key := "bk", "k1"
 	if _, err := b.PutObject(context.Background(), s3response.PutObjectInput{
-		Bucket: &bucket, Key: &key, Body: bytes.NewReader(data),
+		Bucket: &bucket, Key: &key, Body: bytes.NewReader(data), ContentLength: byteLen(data),
 	}); !errors.Is(err, tenantkey.ErrNoTenant) {
 		t.Fatalf("PutObject err = %v, want ErrNoTenant", err)
 	}

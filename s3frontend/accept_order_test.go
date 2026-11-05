@@ -20,7 +20,7 @@ func TestUploadBlobRecordsLocationBeforeAccepted(t *testing.T) {
 		t.Helper()
 		bucket, key := sweepBucket, "obj"
 		body := bytes.Repeat([]byte{'a'}, 1000)
-		if _, err := b.PutObject(t.Context(), s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(body)}); err == nil {
+		if _, err := b.PutObject(t.Context(), s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(body), ContentLength: byteLen(body)}); err == nil {
 			t.Fatal("PutObject succeeded although recording the acceptance failed")
 		}
 	}

@@ -2,6 +2,7 @@ package s3frontend
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"os"
 	"testing"
@@ -9,6 +10,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/versitygw/backend"
+	"github.com/fil-forge/versitygw/s3err"
 	"github.com/multiformats/go-multihash"
 
 	"github.com/fil-forge/ingot/registry"
@@ -86,27 +88,27 @@ func (*failingParker) UploadBlob(context.Context, did.DID, multihash.Multihash, 
 	return uploader.UploadedBlob{}, errors.New("provider unreachable")
 }
 
-// TestFailedParkKeepsLocalCopy: a part whose park failed stays spooled, out of
-// the acceptance queue, and keeps its spool copy, the only one, for Complete's
-// never-parked fallback.
-func TestFailedParkKeepsLocalCopy(t *testing.T) {
+// TestFailedParkIsInvalidAtComplete: a part whose stream failed fails its
+// UploadPart and stays written, out of the acceptance queue. Nothing holds its
+// bytes to upload them again, so a Complete naming it answers InvalidPart and
+// the client uploads the part again.
+func TestFailedParkIsInvalidAtComplete(t *testing.T) {
 	b, mem := newDeferredBackend(t, &failingParker{})
-	ctx := context.Background()
 	key := "park-fails"
 
 	uploadID := mpCreate(t, b, key, "", "")
 	if _, err := mpUploadPart(t, b, key, uploadID, 1, testBody(int(backend.MinPartSize)), nil); err == nil {
 		t.Fatalf("UploadPart succeeded, want the park failure")
 	}
-	if part := partRecord(t, mem, uploadID, 1); part.State != registry.PartSpooled {
-		t.Fatalf("part state after a failed park = %q, want spooled", part.State)
+	part := partRecord(t, mem, uploadID, 1)
+	if part.State != registry.PartWritten {
+		t.Fatalf("part state after a failed park = %q, want written", part.State)
 	}
-	for _, d := range hygienePartDigests(t, mem, uploadID, 1) {
-		if _, err := os.Stat(localPath(b, d)); err != nil {
-			t.Fatalf("blob %s spool copy after a failed park: %v, want it kept", d, err)
-		}
-		if in, err := mem.IntentByDigest(ctx, d); err != nil || in.State != registry.IntentUploading {
-			t.Fatalf("blob %s intent = %v/%v, want uploading", d, in, err)
-		}
+	etag := `"` + hex.EncodeToString(part.ETagMD5) + `"`
+	one := int32(1)
+	_, err := mpComplete(t, b, key, uploadID, []types.CompletedPart{{PartNumber: &one, ETag: &etag}}, nil)
+	var apiErr s3err.APIError
+	if !errors.As(err, &apiErr) || apiErr.Code != "InvalidPart" {
+		t.Fatalf("Complete = %v, want InvalidPart", err)
 	}
 }

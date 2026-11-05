@@ -392,7 +392,7 @@ func TestAcceptorLeavesAReleasingBlobForComplete(t *testing.T) {
 	if got, err := mem.ReleasingDigests(ctx, mem.bk(), []multihash.Multihash{d}); err != nil || !got[string(d)] {
 		t.Fatalf("release record after the acceptor's pass = %v, %v; want it kept", got, err)
 	}
-	if states := partStates(t, mem, uploadID); states[1] != registry.PartSpooled {
+	if states := partStates(t, mem, uploadID); states[1] != registry.PartWritten {
 		t.Fatalf("part state = %q, want spooled", states[1])
 	}
 	if got := cc.concluded(); len(got) != 0 {
@@ -511,7 +511,7 @@ func TestCompleteConcludesAParkThatLandsMidComplete(t *testing.T) {
 		t.Fatal("UploadPart succeeded although its part could not be queued")
 	}
 	part := partRecord(t, mem, uploadID, 1)
-	if part.State != registry.PartSpooled {
+	if part.State != registry.PartWritten {
 		t.Fatalf("part state = %q, want spooled", part.State)
 	}
 	d := part.BlobDigests[0]
@@ -607,7 +607,7 @@ func TestAcceptorKeepsAParkThatReplacesALocation(t *testing.T) {
 	if !bytes.Equal(park.AddTask, replacement.Bytes()) {
 		t.Fatalf("park add task = %x, want the replacement's", park.AddTask)
 	}
-	if states := partStates(t, mem, uploadID); states[1] != registry.PartSpooled {
+	if states := partStates(t, mem, uploadID); states[1] != registry.PartWritten {
 		t.Fatalf("part state = %q, want spooled (left for Complete)", states[1])
 	}
 }

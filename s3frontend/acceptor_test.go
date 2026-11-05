@@ -285,7 +285,7 @@ func TestAcceptorLeavesAPartWithoutAParkForComplete(t *testing.T) {
 	if err := b.drainAcceptor(ctx, uploadID); err != nil {
 		t.Fatalf("drainAcceptor: %v", err)
 	}
-	want := map[int]string{1: registry.PartAccepted, 2: registry.PartSpooled}
+	want := map[int]string{1: registry.PartAccepted, 2: registry.PartWritten}
 	if got := partStates(t, mem, uploadID); got[1] != want[1] || got[2] != want[2] {
 		t.Fatalf("part states = %v, want %v", got, want)
 	}
@@ -475,7 +475,7 @@ func TestCompleteFinishesASpooledPart(t *testing.T) {
 	}
 	// The client retries nothing; the part as recorded is complete.
 	p2 := partRecord(t, mem, uploadID, 2)
-	if p2.State != registry.PartSpooled {
+	if p2.State != registry.PartWritten {
 		t.Fatalf("part 2 state = %q, want spooled", p2.State)
 	}
 	etag = `"` + hex.EncodeToString(p2.ETagMD5) + `"`
