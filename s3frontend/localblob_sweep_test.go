@@ -318,7 +318,7 @@ func TestEvictToBudget_ReportsWhyItStopped(t *testing.T) {
 		b, _ := newSweepBackend(t)
 		digests := putSweepObjects(t, b, 2)
 		budgetToEvict(b, 1, blobSize(t, b, digests[0]))
-		pass, err := b.evictToBudget(ctx, time.Now().Add(-time.Second))
+		pass, err := b.evictToBudget(ctx, -time.Second)
 		if err != nil {
 			t.Fatalf("evictToBudget: %v", err)
 		}
@@ -331,7 +331,7 @@ func TestEvictToBudget_ReportsWhyItStopped(t *testing.T) {
 		if _, _, err := b.spool.WriteBlob(ctx, bytes.NewReader([]byte("no intent"))); err != nil {
 			t.Fatalf("WriteBlob: %v", err)
 		}
-		pass, err := b.evictToBudget(ctx, time.Now().Add(time.Minute))
+		pass, err := b.evictToBudget(ctx, time.Minute)
 		if err != nil {
 			t.Fatalf("evictToBudget: %v", err)
 		}
@@ -344,7 +344,7 @@ func TestEvictToBudget_ReportsWhyItStopped(t *testing.T) {
 		digests := putSweepObjects(t, b, 2)
 		size := blobSize(t, b, digests[0])
 		budgetToEvict(b, 1, size)
-		pass, err := b.evictToBudget(ctx, time.Now().Add(time.Minute))
+		pass, err := b.evictToBudget(ctx, time.Minute)
 		if err != nil {
 			t.Fatalf("evictToBudget: %v", err)
 		}

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -137,6 +138,27 @@ func TestReadEarlyInTheTTLWritesNothing_Live(t *testing.T) {
 	f.read(t, d)
 
 	require.Equal(t, 1, f.tasks(t, d, shardCache, "succeeded")+f.tasks(t, d, shardCache, "pending"), "only the move")
+}
+
+// Concurrent reads of a blob due for renewal queue one renewal between them.
+func TestConcurrentReadsRenewOnce_Live(t *testing.T) {
+	f := newShardFixture(t, time.Hour)
+	d := f.hold(t, "a")
+	require.Eventually(t, func() bool { return f.cached(d) }, 5*time.Second, 10*time.Millisecond)
+	// As after a restart: no record of the blob's last renewal.
+	f.b.renewals.forget(string(d))
+
+	var wg sync.WaitGroup
+	for range 16 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			f.read(t, d)
+		}()
+	}
+	wg.Wait()
+
+	require.Equal(t, 2, f.tasks(t, d, shardCache, "succeeded")+f.tasks(t, d, shardCache, "pending"), "the move and one renewal")
 }
 
 // A blob nothing caches schedules no eviction: a renewal for a copy already
