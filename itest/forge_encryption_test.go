@@ -317,7 +317,7 @@ func TestForgeEncryption(t *testing.T) {
 
 		// The claims drop synchronously with the delete; the shred (enc-params
 		// + location rows) and the spool cleanup are deferred behind the
-		// release grace (60s default) and executed by the release sweeper —
+		// release grace (60s default) and executed by the release task —
 		// poll them through.
 		refsQ := fmt.Sprintf(`SELECT count(*) FROM ingot.blob_refs WHERE bucket = '%s' AND object_key = '%s'`, bucket, key)
 		if out := ingotSQL(t, ctx, s, refsQ); out != "0" {

@@ -80,11 +80,11 @@ func TestForgeDeleteBucketReleases(t *testing.T) {
 	waitForPiriLogLine(t, ctx, s, 60*time.Second, "/blob/accept", partDigest)
 
 	// The pending release, set up last: an object put and deleted, whose
-	// blob release waits in the deferred queue behind the reader grace (60s
-	// by default). Nothing slow runs between the delete and DeleteBucket, so
-	// the record is still queued when the drain reaches it — asserted below
-	// rather than assumed, since a release the sweeper already ran would
-	// leave the drain leg untested.
+	// blob release waits behind the reader grace (60s by default). Nothing
+	// slow runs between the delete and DeleteBucket, so the release has not
+	// run when the drain reaches it — asserted below rather than assumed, by
+	// the blob's location rows, which a release deletes when it commits: one
+	// that already ran would leave the drain leg untested.
 	if _, err := cl.PutObject(ctx, &s3.PutObjectInput{
 		Bucket: aws.String(bucket), Key: aws.String(objKey),
 		Body: bytes.NewReader(tagged(patternBytes(512<<10), 0x66)),
@@ -97,8 +97,8 @@ func TestForgeDeleteBucketReleases(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("DeleteObject: %v", err)
 	}
-	if n := countRowsForDigests(t, ctx, s, "ingot.blob_release_intents", "digest", objDigests); n != len(objDigests) {
-		t.Fatalf("queued release records = %d, want %d: the grace elapsed before the delete, leaving the drain leg untested", n, len(objDigests))
+	if n := countRowsForDigests(t, ctx, s, "ingot.blob_locations", "digest", objDigests); n != len(objDigests) {
+		t.Fatalf("located blobs = %d, want %d: the release ran before the delete, leaving the drain leg untested", n, len(objDigests))
 	}
 
 	if _, err := delCl.DeleteBucket(ctx, &s3.DeleteBucketInput{Bucket: aws.String(bucket)}); err != nil {
@@ -108,12 +108,12 @@ func TestForgeDeleteBucketReleases(t *testing.T) {
 	// The open upload's accepted part was removed from piri.
 	waitForPiriLogLine(t, ctx, s, 60*time.Second, "/blob/release", partDigest)
 
-	// The deleted object's blob was released, record and all.
+	// The deleted object's blob was released, locations and all.
 	for _, d := range objDigests {
 		waitForPiriLogLine(t, ctx, s, 60*time.Second, "/blob/release", digestB58(t, d))
 	}
-	if n := countRowsForDigests(t, ctx, s, "ingot.blob_release_intents", "digest", objDigests); n != 0 {
-		t.Fatalf("release records left after DeleteBucket = %d, want 0", n)
+	if n := countRowsForDigests(t, ctx, s, "ingot.blob_locations", "digest", objDigests); n != 0 {
+		t.Fatalf("located blobs left after DeleteBucket = %d, want 0", n)
 	}
 
 	if _, err := delCl.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: aws.String(bucket)}); err == nil {
