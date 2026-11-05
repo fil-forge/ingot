@@ -758,8 +758,8 @@ type CatalogUsageStore interface {
 // RevocationCursor is the single row of ingot.revocation_cursor: the resume
 // point in the revocation service's firehose. Token is the service's opaque
 // cursor, which the consumer resumes after: the last processed revocation
-// record's, or the firehose's head when the consumer saved it before its
-// first record. RecordedAt and Revoke describe that record — its recorded_at
+// record's, or the firehose's head, which the consumer saves before its first
+// record and when the service refuses its cursor. RecordedAt and Revoke describe that record — its recorded_at
 // and the CID of the delegation it revoked — for observability, and are zero
 // for a head.
 type RevocationCursor struct {

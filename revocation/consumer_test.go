@@ -233,24 +233,48 @@ func TestConsumerStopsWhileWaitingForTheHead(t *testing.T) {
 	require.Empty(t, src.calls())
 }
 
-// A cursor that can't be read is left alone: the consumer starts at the head
-// without saving it over a position it couldn't see.
-func TestConsumerKeepsACursorItCouldNotRead(t *testing.T) {
-	store := &recordingCursorStore{getErr: errors.New("database unavailable")}
+// A cursor that can't be read is retried until it can, never replaced by the
+// head: the head would skip what was recorded after the stored cursor.
+func TestConsumerRetriesACursorItCouldNotRead(t *testing.T) {
+	store := &recordingCursorStore{
+		getErrs: []error{errors.New("database unavailable"), errors.New("database unavailable")},
+		stored:  &registry.RevocationCursor{Token: "cursor-stored"},
+	}
 	src := &fakeSource{}
+	core, logs := observer.New(zap.WarnLevel)
 	c := revocation.NewConsumer(src, store, &fakeInvalidator{},
+		revocation.WithLogger(zap.New(core)),
+		revocation.WithBackoff(time.Millisecond, time.Millisecond),
 		revocation.WithSaveInterval(time.Millisecond))
 	stop := run(c)
 
 	waitFor(t, func() bool { return len(src.calls()) == 1 })
-	require.Equal(t, testHead, src.calls()[0])
+	require.Equal(t, swarfclient.Cursor("cursor-stored"), src.calls()[0])
+	require.Zero(t, src.headCalls())
+	require.Len(t, logs.FilterMessage("revocation: load cursor").All(), 2)
 	stop()
-	require.Empty(t, store.calls())
+	require.Empty(t, store.calls(), "nothing new to save")
 }
 
-// A cursor the service refuses is logged as an error naming the fix, and
-// retried: only an operator can tell where to start over.
-func TestConsumerLogsARefusedCursor(t *testing.T) {
+// A head the consumer fails to save is saved by the background saver, so a
+// restart before the first record still resumes from it.
+func TestConsumerRetriesAFailedHeadSave(t *testing.T) {
+	store := &recordingCursorStore{putErrs: []error{errors.New("database unavailable")}}
+	src := &fakeSource{}
+	c := revocation.NewConsumer(src, store, &fakeInvalidator{},
+		revocation.WithSaveInterval(time.Millisecond))
+	stop := run(c)
+	defer stop()
+
+	waitFor(t, func() bool { return len(store.calls()) == 1 })
+	require.Equal(t, []registry.RevocationCursor{{Token: string(testHead)}}, store.calls())
+	require.Equal(t, []swarfclient.Cursor{testHead}, src.calls())
+}
+
+// A cursor the service refuses is logged as an error, and the consumer starts
+// over at the head and saves it. Retrying the refused cursor would skip every
+// record recorded before new records passed it.
+func TestConsumerStartsOverAtTheHeadWhenItsCursorIsRefused(t *testing.T) {
 	ctx := context.Background()
 	store := inmem.NewMemStore()
 	require.NoError(t, store.PutRevocationCursor(ctx, registry.RevocationCursor{
@@ -264,15 +288,27 @@ func TestConsumerLogsARefusedCursor(t *testing.T) {
 	core, logs := observer.New(zap.WarnLevel)
 	c := revocation.NewConsumer(src, store, &fakeInvalidator{},
 		revocation.WithLogger(zap.New(core)),
-		revocation.WithBackoff(time.Millisecond, time.Millisecond))
+		revocation.WithBackoff(time.Millisecond, time.Millisecond),
+		revocation.WithSaveInterval(time.Millisecond))
 	stop := run(c)
 	defer stop()
 
-	waitFor(t, func() bool { return len(src.calls()) >= 2 })
-	require.Equal(t, swarfclient.Cursor("cursor-moved"), src.calls()[1])
+	waitFor(t, func() bool { return len(src.calls()) == 2 })
+	require.Equal(t, []swarfclient.Cursor{"cursor-moved", testHead}, src.calls())
 	refused := logs.FilterMessage("revocation: cursor refused").All()
-	require.NotEmpty(t, refused)
+	require.Len(t, refused, 1)
 	require.Equal(t, zap.ErrorLevel, refused[0].Level)
+	fields := refused[0].ContextMap()
+	require.Equal(t, "cursor-moved", fields["cursor"])
+	require.NotEmpty(t, fields["action"])
+
+	waitFor(t, func() bool {
+		cur, err := store.GetRevocationCursor(ctx)
+		return err == nil && cur.Token == string(testHead)
+	})
+	cur, err := store.GetRevocationCursor(ctx)
+	require.NoError(t, err)
+	require.Equal(t, registry.RevocationCursor{Token: string(testHead)}, *cur)
 }
 
 func TestConsumerInvalidatesAndPersistsCursor(t *testing.T) {
@@ -306,19 +342,25 @@ func TestConsumerInvalidatesAndPersistsCursor(t *testing.T) {
 
 // recordingCursorStore records every cursor it is asked to save. Like the
 // Postgres store, it refuses a save whose ctx is already canceled. With
-// release set, each save waits for release to close first. It reports stored
-// as the saved cursor, getErr as a read failure, and otherwise no cursor.
+// release set, each save waits for release to close first. Reads fail with
+// each of getErrs in turn, then report stored as the saved cursor, or no
+// cursor; saves fail with each of putErrs in turn, recording nothing.
 type recordingCursorStore struct {
 	mu      sync.Mutex
 	saved   []registry.RevocationCursor
 	release chan struct{}
 	stored  *registry.RevocationCursor
-	getErr  error
+	getErrs []error
+	putErrs []error
 }
 
 func (s *recordingCursorStore) GetRevocationCursor(context.Context) (*registry.RevocationCursor, error) {
-	if s.getErr != nil {
-		return nil, s.getErr
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.getErrs) > 0 {
+		err := s.getErrs[0]
+		s.getErrs = s.getErrs[1:]
+		return nil, err
 	}
 	if s.stored != nil {
 		cur := *s.stored
@@ -339,6 +381,11 @@ func (s *recordingCursorStore) PutRevocationCursor(ctx context.Context, cur regi
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if len(s.putErrs) > 0 {
+		err := s.putErrs[0]
+		s.putErrs = s.putErrs[1:]
+		return err
+	}
 	s.saved = append(s.saved, cur)
 	return nil
 }

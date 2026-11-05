@@ -19,13 +19,17 @@
 // head rather than from a later one, which would skip the revocations
 // recorded in between. While the service doesn't answer, the consumer
 // retries; a revocation recorded before its first answer is not delivered,
-// which matters only to a cache filled in that window.
+// which matters only to a cache filled in that window. A stored cursor the
+// consumer can't read is retried as well, never replaced by the head.
 //
-// Moving the service's database to another server can void its cursors
-// (Swarf's README, "Moving the database"). The service refuses those it can
-// tell, which the consumer logs as an error on every retry. To start the
-// consumer over, stop ingot, delete the ingot.revocation_cursor row, and
-// start it again: it starts at the firehose's head.
+// Restoring the service's database from a backup older than the consumer's
+// cursor (Swarf's README, "Moving the database"), or restarting a service that
+// keeps its records in memory, leaves the cursor ahead of the firehose's head.
+// The service refuses such a cursor, and the consumer logs an error and
+// starts over at the head, saving it. The revocations the service recorded after the restore
+// and before the consumer read the head are not delivered. Retrying the
+// refused cursor would lose more: the service accepts it once new records
+// pass it, skipping every record in between.
 //
 // The gateway keeps serving while the service is unreachable (reconnect with
 // capped backoff); in the worst case cache entries age out on their own TTLs,
@@ -151,23 +155,25 @@ func (c *Consumer) Run(ctx context.Context) {
 	bo.InitialInterval = c.minBackoff
 	bo.MaxInterval = c.maxBackoff
 
-	position, ok := c.startPosition(ctx, bo)
+	var latest atomic.Pointer[registry.RevocationCursor]
+	position, ok := c.startPosition(ctx, bo, &latest)
 	if !ok {
 		return
 	}
-	var latest atomic.Pointer[registry.RevocationCursor]
 	saved := make(chan struct{})
 	go c.saveCursor(ctx, &latest, saved)
 	defer func() { <-saved }()
 
 	bo.Reset()
 	for {
+		refused := false
 		for event, err := range c.src.StreamAfter(ctx, swarfclient.Cursor(position.Token)) {
 			if errors.Is(err, swarfclient.ErrCursorRefused) {
 				c.logger.Error("revocation: cursor refused",
 					zap.String("cursor", position.Token),
-					zap.String("fix", "with ingot stopped, delete the ingot.revocation_cursor row; ingot then starts at the firehose's head"),
+					zap.String("action", "starting over at the firehose head; revocations recorded since the service's database was restored may be missed"),
 					zap.Error(err))
+				refused = true
 				break
 			}
 			if err != nil {
@@ -200,8 +206,19 @@ func (c *Consumer) Run(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
+		if refused {
+			head, ok := c.readHead(ctx, bo)
+			if !ok {
+				return
+			}
+			restart := registry.RevocationCursor{Token: string(head)}
+			position = restart
+			// The saver persists it, so a restart doesn't return to the
+			// refused cursor.
+			latest.Store(&restart)
+		}
 		// The stream ended: wait, then reconnect after the last processed
-		// record.
+		// record, or after the head when the service refused the cursor.
 		if !sleepCtx(ctx, bo.NextBackOff()) {
 			return
 		}
@@ -210,36 +227,54 @@ func (c *Consumer) Run(ctx context.Context) {
 
 // startPosition resolves where the firehose starts: after the stored cursor,
 // or, with none stored, at the firehose's head, which it saves first (see the
-// package doc). A cursor that cannot be read is not overwritten: the consumer
-// starts at the head without saving it, rather than replacing a position it
-// could not see. It reads the head with backoff until the service answers,
-// and reports false only when ctx is canceled first.
-func (c *Consumer) startPosition(ctx context.Context, bo *backoff.ExponentialBackOff) (registry.RevocationCursor, bool) {
-	stored, err := c.cursor.GetRevocationCursor(ctx)
-	if err == nil {
-		return *stored, true
-	}
-	save := errors.Is(err, registry.ErrNotFound)
-	if !save {
-		c.logger.Warn("revocation: load cursor, starting at the firehose head without saving it", zap.Error(err))
-	}
+// package doc). It reads the cursor, and then the head, with backoff until
+// each answers; a cursor it can't read is never replaced by the head. A head
+// it fails to save goes to latest, for the saver to retry. It reports false
+// only when ctx is canceled first.
+func (c *Consumer) startPosition(ctx context.Context, bo *backoff.ExponentialBackOff, latest *atomic.Pointer[registry.RevocationCursor]) (registry.RevocationCursor, bool) {
 	for {
-		head, err := c.src.Head(ctx)
+		stored, err := c.cursor.GetRevocationCursor(ctx)
 		if err == nil {
-			position := registry.RevocationCursor{Token: string(head)}
-			if save {
-				if err := c.cursor.PutRevocationCursor(ctx, position); err != nil {
-					c.logger.Warn("revocation: persist cursor", zap.Error(err))
-				}
-			}
-			return position, true
+			return *stored, true
+		}
+		if errors.Is(err, registry.ErrNotFound) {
+			break
 		}
 		if ctx.Err() != nil {
 			return registry.RevocationCursor{}, false
 		}
-		c.logger.Warn("revocation: read firehose head", zap.Error(err))
+		c.logger.Warn("revocation: load cursor", zap.Error(err))
 		if !sleepCtx(ctx, bo.NextBackOff()) {
 			return registry.RevocationCursor{}, false
+		}
+	}
+	head, ok := c.readHead(ctx, bo)
+	if !ok {
+		return registry.RevocationCursor{}, false
+	}
+	position := registry.RevocationCursor{Token: string(head)}
+	if err := c.cursor.PutRevocationCursor(ctx, position); err != nil {
+		c.logger.Warn("revocation: persist cursor", zap.Error(err))
+		saveLater := position
+		latest.Store(&saveLater)
+	}
+	return position, true
+}
+
+// readHead reads the firehose's head with backoff until the service answers,
+// reporting false only when ctx is canceled first.
+func (c *Consumer) readHead(ctx context.Context, bo *backoff.ExponentialBackOff) (swarfclient.Cursor, bool) {
+	for {
+		head, err := c.src.Head(ctx)
+		if err == nil {
+			return head, true
+		}
+		if ctx.Err() != nil {
+			return "", false
+		}
+		c.logger.Warn("revocation: read firehose head", zap.Error(err))
+		if !sleepCtx(ctx, bo.NextBackOff()) {
+			return "", false
 		}
 	}
 }
