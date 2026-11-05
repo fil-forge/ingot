@@ -259,8 +259,9 @@ func TestPlaintextSpaces_SameSpaceRewriteMakesTheReleaseStale(t *testing.T) {
 // that object's release. The write settles who owns the digest before it
 // reuses the located blob (reuseLocated).
 
-// TestPlaintextRelease_WriteCancelsAPendingRelease: the record is not yet
-// started, so the write cancels it and reuses the blob without uploading.
+// TestPlaintextRelease_WriteCancelsAPendingRelease: the release is not yet
+// started, so the write cancels it, and uploads the blob afresh rather than
+// reusing it, since a cancelled release may already have removed it.
 func TestPlaintextRelease_WriteCancelsAPendingRelease(t *testing.T) {
 	up := &countingUploader{calls: map[string]int{}}
 	b, mem := newDeferredBackend(t, up)
@@ -282,8 +283,8 @@ func TestPlaintextRelease_WriteCancelsAPendingRelease(t *testing.T) {
 	up.mu.Lock()
 	uploads := up.calls[string(d)]
 	up.mu.Unlock()
-	if uploads != 1 {
-		t.Fatalf("uploads of %x = %d, want 1 (the located blob was reused)", d, uploads)
+	if uploads != 2 {
+		t.Fatalf("uploads of %x = %d, want 2 (uploaded afresh after the cancel)", d, uploads)
 	}
 	drainReleases(t, b)
 	if got := getFrom(t, b, "bk", "new"); !bytes.Equal(got, data) {
@@ -1064,4 +1065,39 @@ func holdRelease(t *testing.T, b *Backend, gate *gatedRemover) (finish func()) {
 	}
 	t.Cleanup(finish)
 	return finish
+}
+
+// TestPlaintextRelease_StalledRemoveTimesOut: a release whose network remove
+// never answers gives up the attempt at releaseAttemptTimeLimit and stays
+// queued to retry, rather than holding its worker for good.
+func TestPlaintextRelease_StalledRemoveTimesOut(t *testing.T) {
+	defer func(d time.Duration) { releaseAttemptTimeLimit = d }(releaseAttemptTimeLimit)
+	releaseAttemptTimeLimit = 50 * time.Millisecond
+	gate := newGatedRemover() // never opened
+	b, mem := newDeferredBackend(t, testfakes.NopUploader{}, withGate(gate))
+	ctx := context.Background()
+	setNone(t, b)
+
+	putIn(t, b, "bk", "old", testBody(8<<10))
+	deleteFrom(t, b, "bk", "old")
+
+	done := make(chan int, 1)
+	go func() {
+		n, err := b.SweepPendingReleases(ctx)
+		if err != nil {
+			t.Errorf("SweepPendingReleases: %v", err)
+		}
+		done <- n
+	}()
+	select {
+	case n := <-done:
+		if n != 0 {
+			t.Fatalf("%d releases finished, want none: the remove never answered", n)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the release waited on the stalled remove")
+	}
+	if pending, _ := mem.ListReleasesBySpace(ctx, mem.bk()); len(pending) != 1 {
+		t.Fatalf("releases queued after the timed-out attempt = %d, want 1 to retry", len(pending))
+	}
 }

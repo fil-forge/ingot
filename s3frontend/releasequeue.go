@@ -11,6 +11,7 @@ import (
 	blobcmds "github.com/fil-forge/libforge/commands/blob"
 	ucanlib "github.com/fil-forge/libforge/ucan"
 	"github.com/fil-forge/ucantone/did"
+	"github.com/fil-forge/ucantone/ucan"
 	"github.com/fil-forge/ucantone/ucan/container"
 	"github.com/fil-forge/versitygw/s3err"
 	"github.com/ipfs/go-cid"
@@ -34,6 +35,10 @@ import (
 // cancels a pending release (settleRelease) or waits out a running one; a
 // commit claiming it cancels a pending one in its transaction and refuses
 // while one runs (registry.ErrReleaseInProgress).
+
+// releaseAttemptTimeLimit bounds one release attempt's network calls.
+// Package-level so tests can shrink it.
+var releaseAttemptTimeLimit = 2 * time.Minute
 
 // releaseRetry retries a release that could not finish, with no attempt
 // limit: dropping it would leave a blob nothing references on the network.
@@ -85,7 +90,10 @@ func (b *Backend) releaseAuthority(ctx context.Context, space did.DID) registry.
 
 // withReleaseAuthority returns ctx carrying a proof store holding the
 // release's captured chains, which the network calls read before any
-// authority captured since. With none captured, ctx is returned as is.
+// authority captured since. A release run inside a request, as a bucket
+// delete's drain runs them, reads the request's own chains first, which are
+// fresh, and the captured ones only for a command the request holds none for.
+// With none captured, ctx is returned as is.
 func withReleaseAuthority(ctx context.Context, args registry.ReleaseTask) (context.Context, error) {
 	store := tokenstore.NewMemStore()
 	found := false
@@ -107,7 +115,28 @@ func withReleaseAuthority(ctx context.Context, args registry.ReleaseTask) (conte
 	if !found {
 		return ctx, nil
 	}
-	return context.WithValue(ctx, reqscope.ProofStoreKey(), ucanlib.ProofStore(store)), nil
+	var proofs ucanlib.ProofStore = store
+	if live, ok := ctx.Value(reqscope.ProofStoreKey()).(ucanlib.ProofStore); ok && live != nil {
+		proofs = proofStores{live, store}
+	}
+	return context.WithValue(ctx, reqscope.ProofStoreKey(), proofs), nil
+}
+
+// proofStores reads each store in turn, and returns the first chain found.
+type proofStores []ucanlib.ProofStore
+
+func (ps proofStores) ProofChain(ctx context.Context, aud did.DID, cmd ucan.Command, sub did.DID) ([]ucan.Delegation, []cid.Cid, error) {
+	var errs []error
+	for _, p := range ps {
+		dlgs, links, err := p.ProofChain(ctx, aud, cmd, sub)
+		if err == nil && len(dlgs) > 0 {
+			return dlgs, links, nil
+		}
+		if err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return nil, nil, errors.Join(errs...)
 }
 
 // runRelease is queue-space-shard.release: it unwinds one blob for one space,
@@ -183,6 +212,10 @@ func (b *Backend) runRelease(ctx context.Context, ex *taskrunner.Exec, t taskrun
 	if err != nil {
 		return nil, taskrunner.Permanent(err)
 	}
+	// A stalled provider would otherwise hold a release worker for good; a
+	// call cut short fails the attempt, which retries.
+	netCtx, cancel := context.WithTimeout(netCtx, releaseAttemptTimeLimit)
+	defer cancel()
 
 	if err := b.encParams.DeleteEncryptionParams(ctx, space, digest); err != nil {
 		return nil, fmt.Errorf("crypto-shred (delete encryption params): %w", err)
@@ -281,11 +314,10 @@ func (b *Backend) runRelease(ctx context.Context, ex *taskrunner.Exec, t taskrun
 // and reports whether the blob may be reused as located. A blob stored as
 // received has the digest of its bytes, so a write of the same bytes can follow
 // the deletion of the object that stored them, with that object's release
-// pending or running. A pending release is cancelled, and the blob is the
-// write's: the claim its commit adds would have made the release stale anyway.
-// A running one means the blob is going; the write waits for it to finish,
-// then uploads afresh (false). No release at all leaves a located blob reusable
-// (true). A release queued after this and before the commit is cancelled by
+// pending or running. A pending release is cancelled, and the write uploads
+// afresh (false). A running one means the blob is going; the write waits for
+// it to finish, then uploads afresh too. No release at all leaves a located
+// blob reusable (true). A release queued after this and before the commit is cancelled by
 // the claim itself, or refuses it while it runs (registry.ErrReleaseInProgress).
 // The wait is bounded by reuseWaitLimit and then refused with S3's SlowDown,
 // which the client retries. An encrypted blob has a digest of its own and is
@@ -346,8 +378,8 @@ type releaseStanding int
 const (
 	// releaseAbsent: no release, or the one waited out has run.
 	releaseAbsent releaseStanding = iota
-	// releaseTaken: a pending release the write cancelled; the blob is the
-	// write's.
+	// releaseTaken: a pending release the write cancelled; the write uploads
+	// the blob afresh.
 	releaseTaken
 	// releaseStarted: the blob is going; the write waits.
 	releaseStarted
@@ -371,7 +403,12 @@ func (b *Backend) settle(ctx context.Context, probe func() (releaseStanding, err
 			// went with it.
 			return !waited, nil
 		case releaseTaken:
-			return true, nil
+			// Temporary, until queue-space-shard.add takes the reuse over in
+			// the next change and this cancel goes: a cancelled release may
+			// have failed after its remove reached the provider (its answer
+			// lost, or its commit failed), which leaves the blob located but
+			// gone, so the write uploads afresh instead of reusing it.
+			return false, nil
 		}
 		waited = true
 		if time.Now().After(deadline) {
@@ -421,8 +458,11 @@ func (b *Backend) releaseNow(ctx context.Context, space did.DID, digests []multi
 }
 
 // flushRelease runs the queue's no-op on subject, which first runs the due
-// tasks before it, until expires.
+// tasks before it, until expires: the deadline bounds the releases it runs
+// inline as well as when it starts.
 func (b *Backend) flushRelease(ctx context.Context, subject string, expires time.Time) error {
+	ctx, cancel := context.WithDeadline(ctx, expires)
+	defer cancel()
 	_, err := b.releases.Run(ctx, taskrunner.Spec{Queue: registry.ReleaseQueue, Subject: subject, Action: releaseFlush, Expires: &expires})
 	return err
 }
@@ -447,7 +487,7 @@ func (b *Backend) drainSpaceReleases(ctx context.Context, space did.DID) error {
 	for subject := range due {
 		subjects = append(subjects, subject)
 		if err := b.flushRelease(ctx, subject, expires); err != nil {
-			if errors.Is(err, taskrunner.ErrExpired) {
+			if errors.Is(err, taskrunner.ErrExpired) || (errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil) {
 				return fmt.Errorf("the space's releases did not finish in time; retry")
 			}
 			return fmt.Errorf("release the space's blobs: %w", err)
