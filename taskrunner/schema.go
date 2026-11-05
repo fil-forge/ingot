@@ -32,8 +32,8 @@ CREATE TABLE %[1]s (
 	-- waiting_until is set while a sync task's caller waits in Run, which
 	-- keeps workers off it until the claim lapses.
 	waiting_until timestamptz,
-	-- started is set when the task is first claimed: from then on it can no
-	-- longer be cancelled or replaced.
+	-- started is set while the task runs: then it can no longer be cancelled
+	-- or replaced. A retry clears it.
 	started     timestamptz,
 	replaceable boolean NOT NULL DEFAULT false,
 	attempts    integer NOT NULL DEFAULT 0,
