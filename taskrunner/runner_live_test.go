@@ -265,6 +265,37 @@ func TestDelayedTaskDoesNotBlockLaterOnes_Live(t *testing.T) {
 	}
 }
 
+// TestBacklogDrainsWithoutWaitingForThePoll: a worker that frees up while
+// more subjects are due takes the next one at once, so a backlog of short
+// tasks on many subjects drains far faster than a pollful per PollInterval.
+func TestBacklogDrainsWithoutWaitingForThePoll_Live(t *testing.T) {
+	f := newFixture(t, 2, func(o *taskrunner.Options) { o.PollInterval = time.Hour })
+	f.handle(t, qTop, "put", f.put())
+	ctx := waitCtx(t)
+	if err := f.r.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// Queued before the runner starts, so no submission wakes the poll: only
+	// the first poll at start and the freed workers do.
+	var ids []taskrunner.TaskID
+	for i := range 20 {
+		id, err := f.r.Submit(ctx, taskrunner.Spec{Queue: qTop, Subject: "s" + strconv.Itoa(i), Action: "put", Args: []byte("1")})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+	if err := f.r.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = f.r.Stop(context.Background()) })
+	for _, id := range ids {
+		if _, err := f.r.Wait(ctx, qTop, id); err != nil {
+			t.Fatalf("wait for %s: %v", id, err)
+		}
+	}
+}
+
 func TestExpiredTaskDoesNotRun_Live(t *testing.T) {
 	f := newFixture(t, 2)
 	f.handle(t, qTop, "put", f.put())
