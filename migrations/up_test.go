@@ -2,35 +2,21 @@ package migrations_test
 
 import (
 	"context"
-	"os"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap/zaptest"
 
+	"github.com/fil-forge/ingot/internal/pgtest"
 	"github.com/fil-forge/ingot/migrations"
 )
 
-// TestUp_Live applies the embedded migrations against a real Postgres and
-// asserts the ingot schema's tables exist. It is skipped unless INGOT_TEST_DSN
-// names a reachable database (e.g. a throwaway docker postgres):
-//
-//	INGOT_TEST_DSN=postgres://postgres:pw@127.0.0.1:55432/ingot \
-//	  GOWORK=off go test ./migrations/ -run TestUp_Live -v
-//
-// It guards against DDL errors in a new migration breaking forge-mode startup,
-// which the in-memory suite cannot catch.
-func TestUp_Live(t *testing.T) {
-	dsn := os.Getenv("INGOT_TEST_DSN")
-	if dsn == "" {
-		t.Skip("set INGOT_TEST_DSN to run the live migration test")
-	}
+// TestUp applies the embedded migrations to an empty database and
+// asserts the ingot schema's tables exist, guarding against DDL errors in a
+// new migration breaking startup.
+func TestUp(t *testing.T) {
 	ctx := context.Background()
-	pool, err := pgxpool.New(ctx, dsn)
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-	defer pool.Close()
+	pool, _ := pgtest.NewEmpty(t)
 
 	if err := migrations.Up(ctx, pool, zaptest.NewLogger(t)); err != nil {
 		t.Fatalf("migrations.Up: %v", err)
@@ -136,43 +122,21 @@ func TestUp_Live(t *testing.T) {
 	}
 }
 
-// TestUp_Live_Concurrent races several Up calls against a fresh database:
+// TestUp_Concurrent races several Up calls against a fresh database:
 // the pg_advisory_lock in Up must serialize them, or the first-run DDL
 // (goose's version table, the schema) collides — the exact failure mode of
 // parallel test packages migrating the shared CI database, and of multiple
 // ingot instances starting against one Postgres. The race needs a database
-// with no ingot schema yet, so the test creates and drops a scratch database
-// rather than touching the shared one (which other packages' live tests may
-// be using concurrently).
-func TestUp_Live_Concurrent(t *testing.T) {
-	dsn := os.Getenv("INGOT_TEST_DSN")
-	if dsn == "" {
-		t.Skip("set INGOT_TEST_DSN to run the live migration test")
-	}
+// with no ingot schema yet, which the test gets as an empty database of its
+// own.
+func TestUp_Concurrent(t *testing.T) {
 	ctx := context.Background()
-
-	admin, err := pgxpool.New(ctx, dsn)
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-	defer admin.Close()
-
-	const scratchDB = "ingot_migrate_race"
-	if _, err := admin.Exec(ctx, "DROP DATABASE IF EXISTS "+scratchDB+" WITH (FORCE)"); err != nil {
-		t.Fatalf("drop stale scratch database: %v", err)
-	}
-	if _, err := admin.Exec(ctx, "CREATE DATABASE "+scratchDB); err != nil {
-		t.Fatalf("create scratch database: %v", err)
-	}
-	t.Cleanup(func() {
-		_, _ = admin.Exec(ctx, "DROP DATABASE IF EXISTS "+scratchDB+" WITH (FORCE)")
-	})
-
+	empty, dsn := pgtest.NewEmpty(t)
+	empty.Close()
 	scratchCfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
 		t.Fatalf("parse dsn: %v", err)
 	}
-	scratchCfg.ConnConfig.Database = scratchDB
 
 	const racers = 4
 	errs := make(chan error, racers)

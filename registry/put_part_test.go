@@ -1,16 +1,12 @@
 package registry_test
 
 import (
-	"os"
 	"sync"
 	"testing"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/multiformats/go-multihash"
-	"go.uber.org/zap/zaptest"
 
-	"github.com/fil-forge/ingot/inmem"
-	"github.com/fil-forge/ingot/migrations"
+	"github.com/fil-forge/ingot/internal/pgtest"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/libforge/testutil"
 	"github.com/fil-forge/ucantone/did"
@@ -22,32 +18,10 @@ type putPartStore interface {
 	registry.PendingReleaseStore
 }
 
-// TestPutPartReplacedLive runs PutPart's release of the row it replaces
-// against the in-memory store and, when INGOT_TEST_DSN is set, against
-// Postgres (the Live suffix puts it in CI's live-Postgres job).
-func TestPutPartReplacedLive(t *testing.T) {
-	t.Run("inmem", func(t *testing.T) {
-		runPutPartReplacedSuite(t, inmem.NewMemStore())
-	})
-	t.Run("postgres", func(t *testing.T) {
-		dsn := os.Getenv("INGOT_TEST_DSN")
-		if dsn == "" {
-			t.Skip("set INGOT_TEST_DSN to run PutPart against Postgres")
-		}
-		ctx := t.Context()
-		pool, err := pgxpool.New(ctx, dsn)
-		if err != nil {
-			t.Fatalf("connect: %v", err)
-		}
-		t.Cleanup(pool.Close)
-		if err := migrations.Up(ctx, pool, zaptest.NewLogger(t)); err != nil {
-			t.Fatalf("migrations.Up: %v", err)
-		}
-		if _, err := pool.Exec(ctx, `TRUNCATE ingot.multipart_sessions, ingot.multipart_parts, ingot.blob_release_intents CASCADE`); err != nil {
-			t.Fatalf("truncate: %v", err)
-		}
-		runPutPartReplacedSuite(t, registry.NewPostgres(pool))
-	})
+// TestPutPartReplaced runs PutPart's release of the row it replaces
+// against Postgres.
+func TestPutPartReplaced(t *testing.T) {
+	runPutPartReplacedSuite(t, registry.NewPostgres(pgtest.New(t)))
 }
 
 func runPutPartReplacedSuite(t *testing.T, st putPartStore) {

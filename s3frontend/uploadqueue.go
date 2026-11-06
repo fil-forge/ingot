@@ -239,10 +239,6 @@ func registrationCommand(op registry.UploadRegistrationOp) ucan.Command {
 // Failing here fails the delete, which is safe: it runs before hilt has
 // removed anything, so the bucket is still whole and the retry is clean.
 func (b *Backend) DrainSpaceRegistrations(ctx context.Context, space did.DID) error {
-	if b.tasks == nil {
-		// An in-memory registry queues no tasks.
-		return nil
-	}
 	if err := b.flushSpaceRegistrations(ctx, space); err != nil {
 		return err
 	}

@@ -12,18 +12,14 @@ import (
 	"github.com/fil-forge/ingot/regionkey"
 )
 
-// TestOpenBaoProvider_Live exercises OpenBaoProvider against a real OpenBao —
+// TestOpenBaoProvider exercises OpenBaoProvider against a real OpenBao —
 // the derived-context binding, tamper rejection, and version behavior none of
-// the httptest fakes can prove. Skipped unless INGOT_TEST_BAO_ADDR names a
-// reachable dev-mode server (token from INGOT_TEST_BAO_TOKEN, default "root"):
-//
-//	docker run --rm -d -p 8200:8200 -e BAO_DEV_ROOT_TOKEN_ID=root openbao/openbao
-//	INGOT_TEST_BAO_ADDR=http://127.0.0.1:8200 \
-//	  GOWORK=off go test ./regionkey/ -run Live -v
-func TestOpenBaoProvider_Live(t *testing.T) {
+// the httptest fakes can prove. INGOT_TEST_BAO_ADDR names a dev-mode server
+// (token from INGOT_TEST_BAO_TOKEN, default "root"); `make test` starts one.
+func TestOpenBaoProvider(t *testing.T) {
 	addr := os.Getenv("INGOT_TEST_BAO_ADDR")
 	if addr == "" {
-		t.Skip("set INGOT_TEST_BAO_ADDR to run the live OpenBao provider test")
+		t.Fatal("INGOT_TEST_BAO_ADDR is unset; run `make test`, which starts OpenBao, or set it to a dev-mode server")
 	}
 	token := os.Getenv("INGOT_TEST_BAO_TOKEN")
 	if token == "" {

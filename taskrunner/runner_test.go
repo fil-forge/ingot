@@ -121,7 +121,7 @@ func waitCtx(t *testing.T) context.Context {
 	return ctx
 }
 
-func TestMigrate_Live(t *testing.T) {
+func TestMigrate(t *testing.T) {
 	f := newFixture(t, 0)
 	ctx := context.Background()
 	for range 2 {
@@ -138,7 +138,7 @@ func TestMigrate_Live(t *testing.T) {
 	}
 }
 
-func TestRunCommitsWritesAtTheEnd_Live(t *testing.T) {
+func TestRunCommitsWritesAtTheEnd(t *testing.T) {
 	f := newFixture(t, 0)
 	var sawOwnWrite atomic.Bool
 	f.handle(t, qTop, "put", func(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
@@ -167,7 +167,7 @@ func TestRunCommitsWritesAtTheEnd_Live(t *testing.T) {
 	}
 }
 
-func TestHandlerErrorFailsTaskAndDropsWrites_Live(t *testing.T) {
+func TestHandlerErrorFailsTaskAndDropsWrites(t *testing.T) {
 	f := newFixture(t, 0)
 	boom := errors.New("boom")
 	f.handle(t, qTop, "fail", func(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
@@ -200,7 +200,7 @@ func TestHandlerErrorFailsTaskAndDropsWrites_Live(t *testing.T) {
 	}
 }
 
-func TestSubjectRunsOneTaskAtATimeInOrder_Live(t *testing.T) {
+func TestSubjectRunsOneTaskAtATimeInOrder(t *testing.T) {
 	f := newFixture(t, 8)
 	var running, overlap atomic.Int32
 	var mu sync.Mutex
@@ -243,7 +243,7 @@ func TestSubjectRunsOneTaskAtATimeInOrder_Live(t *testing.T) {
 	}
 }
 
-func TestDelayedTaskDoesNotBlockLaterOnes_Live(t *testing.T) {
+func TestDelayedTaskDoesNotBlockLaterOnes(t *testing.T) {
 	f := newFixture(t, 2)
 	f.handle(t, qTop, "put", f.put())
 	f.start(t)
@@ -268,7 +268,7 @@ func TestDelayedTaskDoesNotBlockLaterOnes_Live(t *testing.T) {
 // TestBacklogDrainsWithoutWaitingForThePoll: a worker that frees up while
 // more subjects are due takes the next one at once, so a backlog of short
 // tasks on many subjects drains far faster than a pollful per PollInterval.
-func TestBacklogDrainsWithoutWaitingForThePoll_Live(t *testing.T) {
+func TestBacklogDrainsWithoutWaitingForThePoll(t *testing.T) {
 	f := newFixture(t, 2, func(o *taskrunner.Options) { o.PollInterval = time.Hour })
 	f.handle(t, qTop, "put", f.put())
 	ctx := waitCtx(t)
@@ -296,7 +296,7 @@ func TestBacklogDrainsWithoutWaitingForThePoll_Live(t *testing.T) {
 	}
 }
 
-func TestExpiredTaskDoesNotRun_Live(t *testing.T) {
+func TestExpiredTaskDoesNotRun(t *testing.T) {
 	f := newFixture(t, 2)
 	f.handle(t, qTop, "put", f.put())
 	f.start(t)
@@ -315,7 +315,7 @@ func TestExpiredTaskDoesNotRun_Live(t *testing.T) {
 	}
 }
 
-func TestSyncChildrenCommitWithTheirParent_Live(t *testing.T) {
+func TestSyncChildrenCommitWithTheirParent(t *testing.T) {
 	f := newFixture(t, 0)
 	f.handle(t, qBottom, "put", f.put())
 	f.handle(t, qMiddle, "put-two", func(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
@@ -354,7 +354,7 @@ func TestSyncChildrenCommitWithTheirParent_Live(t *testing.T) {
 	}
 }
 
-func TestFailedChildFailsItsParent_Live(t *testing.T) {
+func TestFailedChildFailsItsParent(t *testing.T) {
 	f := newFixture(t, 0)
 	f.handle(t, qBottom, "put", f.put())
 	f.handle(t, qBottom, "fail", func(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
@@ -379,7 +379,7 @@ func TestFailedChildFailsItsParent_Live(t *testing.T) {
 	}
 }
 
-func TestSpawnRules_Live(t *testing.T) {
+func TestSpawnRules(t *testing.T) {
 	f := newFixture(t, 0)
 	f.handle(t, qMiddle, "up", func(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
 		_, err := ex.Run(ctx, taskrunner.Spec{Queue: qTop, Subject: "t", Action: "noop"})
@@ -406,7 +406,7 @@ func TestSpawnRules_Live(t *testing.T) {
 	}
 }
 
-func TestAsyncSubmitCommitsWithItsParent_Live(t *testing.T) {
+func TestAsyncSubmitCommitsWithItsParent(t *testing.T) {
 	f := newFixture(t, 2)
 	f.handle(t, qBottom, "put", f.put())
 	var spawned taskrunner.TaskID
@@ -461,7 +461,7 @@ func (f *fixture) createRef(t *testing.T) {
 	}
 }
 
-func TestRunRetriesACommitUntilItLands_Live(t *testing.T) {
+func TestRunRetriesACommitUntilItLands(t *testing.T) {
 	f, runs := claimFixture(t, 0)
 	time.AfterFunc(300*time.Millisecond, func() { f.createRef(t) })
 
@@ -476,7 +476,7 @@ func TestRunRetriesACommitUntilItLands_Live(t *testing.T) {
 	}
 }
 
-func TestRunEndsExpiredWhenACommitNeverLands_Live(t *testing.T) {
+func TestRunEndsExpiredWhenACommitNeverLands(t *testing.T) {
 	f, runs := claimFixture(t, 1)
 	ctx := waitCtx(t)
 
@@ -494,7 +494,7 @@ func TestRunEndsExpiredWhenACommitNeverLands_Live(t *testing.T) {
 	}
 }
 
-func TestRunDefaultsExpiresToTheContextDeadline_Live(t *testing.T) {
+func TestRunDefaultsExpiresToTheContextDeadline(t *testing.T) {
 	f, runs := claimFixture(t, 1)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
@@ -512,7 +512,7 @@ func TestRunDefaultsExpiresToTheContextDeadline_Live(t *testing.T) {
 	}
 }
 
-func TestAsyncCommitMissIsResumed_Live(t *testing.T) {
+func TestAsyncCommitMissIsResumed(t *testing.T) {
 	f, runs := claimFixture(t, 1)
 	ctx := waitCtx(t)
 
@@ -534,7 +534,7 @@ func TestAsyncCommitMissIsResumed_Live(t *testing.T) {
 	}
 }
 
-func TestCrashedTaskIsResumed_Live(t *testing.T) {
+func TestCrashedTaskIsResumed(t *testing.T) {
 	f := newFixture(t, 1)
 	f.handle(t, qTop, "put", f.put())
 	ctx := waitCtx(t)
@@ -560,7 +560,7 @@ func TestCrashedTaskIsResumed_Live(t *testing.T) {
 	}
 }
 
-func TestSubmitTxFollowsTheCallersTransaction_Live(t *testing.T) {
+func TestSubmitTxFollowsTheCallersTransaction(t *testing.T) {
 	f := newFixture(t, 2)
 	f.handle(t, qTop, "put", f.put())
 	f.start(t)
@@ -596,7 +596,7 @@ func TestSubmitTxFollowsTheCallersTransaction_Live(t *testing.T) {
 
 // Two trees whose sync children take the same two subjects in opposite
 // orders would deadlock if each waited for the other. The younger gives way.
-func TestSiblingChildrenInOppositeOrderDoNotDeadlock_Live(t *testing.T) {
+func TestSiblingChildrenInOppositeOrderDoNotDeadlock(t *testing.T) {
 	f := newFixture(t, 0)
 	f.handle(t, qBottom, "put", func(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
 		time.Sleep(20 * time.Millisecond)

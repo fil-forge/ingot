@@ -37,7 +37,7 @@ func at(d time.Duration) *time.Time {
 	return &t
 }
 
-func TestReplacementKeepsTheLaterNotBefore_Live(t *testing.T) {
+func TestReplacementKeepsTheLaterNotBefore(t *testing.T) {
 	f := newFixture(t, 0)
 	f.handle(t, qTop, "evict", f.put())
 	f.migrate(t)
@@ -72,7 +72,7 @@ func TestReplacementKeepsTheLaterNotBefore_Live(t *testing.T) {
 	}
 }
 
-func TestReplacementLeavesAStartedTaskAlone_Live(t *testing.T) {
+func TestReplacementLeavesAStartedTaskAlone(t *testing.T) {
 	f := newFixture(t, 2)
 	started := make(chan struct{})
 	release := make(chan struct{})
@@ -107,7 +107,7 @@ func TestReplacementLeavesAStartedTaskAlone_Live(t *testing.T) {
 	}
 }
 
-func TestCancel_Live(t *testing.T) {
+func TestCancel(t *testing.T) {
 	f := newFixture(t, 2)
 	f.handle(t, qBottom, "expire", f.put())
 	f.handle(t, qTop, "claim", func(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
@@ -179,7 +179,7 @@ func TestCancel_Live(t *testing.T) {
 	}
 }
 
-func TestBatchStopsAtTheLimitAndAtAnotherAction_Live(t *testing.T) {
+func TestBatchStopsAtTheLimitAndAtAnotherAction(t *testing.T) {
 	f := newFixture(t, 1)
 	var mu sync.Mutex
 	var runs [][]string
@@ -232,7 +232,7 @@ func TestBatchStopsAtTheLimitAndAtAnotherAction_Live(t *testing.T) {
 	}
 }
 
-func TestRetries_Live(t *testing.T) {
+func TestRetries(t *testing.T) {
 	f := newFixture(t, 2)
 	policy := taskrunner.WithRetry(taskrunner.RetryPolicy{First: 10 * time.Millisecond, Max: 40 * time.Millisecond, Multiplier: 2, Attempts: 3})
 	var mu sync.Mutex
@@ -285,7 +285,7 @@ func TestRetries_Live(t *testing.T) {
 	}
 }
 
-func TestBatchFailureIsRecordedTogether_Live(t *testing.T) {
+func TestBatchFailureIsRecordedTogether(t *testing.T) {
 	f := newFixture(t, 1)
 	if err := f.r.HandleBatch(qTop, "register", 3, func(ctx context.Context, ex *taskrunner.Exec, tasks []taskrunner.Task) ([]taskrunner.Outcome, error) {
 		return nil, taskrunner.Permanent(errors.New("rejected"))
@@ -323,7 +323,7 @@ CREATE TRIGGER refuse_b BEFORE UPDATE OF state ON `+tasks+` FOR EACH ROW
 	}
 }
 
-func TestRetryThatHoldsTheSubjectKeepsItsOrder_Live(t *testing.T) {
+func TestRetryThatHoldsTheSubjectKeepsItsOrder(t *testing.T) {
 	for _, holds := range []bool{true, false} {
 		t.Run(map[bool]string{true: "holds", false: "does not hold"}[holds], func(t *testing.T) {
 			f := newFixture(t, 2)
@@ -373,7 +373,7 @@ func TestRetryThatHoldsTheSubjectKeepsItsOrder_Live(t *testing.T) {
 	}
 }
 
-func TestATaskWaitingToRetryCanBeCancelled_Live(t *testing.T) {
+func TestATaskWaitingToRetryCanBeCancelled(t *testing.T) {
 	f := newFixture(t, 1)
 	var runs atomic.Int32
 	if err := f.r.Handle(qTop, "expire", func(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
@@ -400,10 +400,10 @@ func TestATaskWaitingToRetryCanBeCancelled_Live(t *testing.T) {
 	}
 }
 
-// TestAReplacementTakesTheRetrysPlace_Live: a replacement waiting to retry
+// TestAReplacementTakesTheRetrysPlace: a replacement waiting to retry
 // is replaced like any that has not started, so its retry cannot run ahead of
 // the replacement's time, and the replacement starts its attempts afresh.
-func TestAReplacementTakesTheRetrysPlace_Live(t *testing.T) {
+func TestAReplacementTakesTheRetrysPlace(t *testing.T) {
 	f := newFixture(t, 1)
 	type run struct {
 		id      taskrunner.TaskID
@@ -455,7 +455,7 @@ func TestAReplacementTakesTheRetrysPlace_Live(t *testing.T) {
 	}
 }
 
-func TestBatchExpiryIsRecordedTogether_Live(t *testing.T) {
+func TestBatchExpiryIsRecordedTogether(t *testing.T) {
 	f := newFixture(t, 1)
 	if err := f.r.HandleBatch(qTop, "register", 3, func(ctx context.Context, ex *taskrunner.Exec, tasks []taskrunner.Task) ([]taskrunner.Outcome, error) {
 		return make([]taskrunner.Outcome, len(tasks)), nil
@@ -493,7 +493,7 @@ CREATE TRIGGER refuse_b BEFORE UPDATE OF state ON `+tasks+` FOR EACH ROW
 	}
 }
 
-func TestBatchLeavesOutAnExpiredTask_Live(t *testing.T) {
+func TestBatchLeavesOutAnExpiredTask(t *testing.T) {
 	f := newFixture(t, 1)
 	var mu sync.Mutex
 	var seen [][]string
@@ -533,10 +533,10 @@ func TestBatchLeavesOutAnExpiredTask_Live(t *testing.T) {
 	}
 }
 
-// TestDrainLimitCountsRuns_Live: DrainLimit counts handler runs, a batch as
+// TestDrainLimitCountsRuns: DrainLimit counts handler runs, a batch as
 // one, so a batch goes out whole at its own limit, and a subject gives up its
 // lease after DrainLimit runs, letting another subject's older task go next.
-func TestDrainLimitCountsRuns_Live(t *testing.T) {
+func TestDrainLimitCountsRuns(t *testing.T) {
 	f := newFixture(t, 1, func(o *taskrunner.Options) { o.DrainLimit = 2 })
 	var mu sync.Mutex
 	var runs []string

@@ -42,7 +42,7 @@ func (f *fixture) peer(t *testing.T, nodeName string, workers int) *taskrunner.R
 	return r
 }
 
-func TestPlacedTasksRunOnlyOnTheirNode_Live(t *testing.T) {
+func TestPlacedTasksRunOnlyOnTheirNode(t *testing.T) {
 	f := newFixture(t, 2, func(o *taskrunner.Options) { o.Node = "a" })
 	b := f.peer(t, "b", 2)
 	var mu sync.Mutex
@@ -95,7 +95,7 @@ func TestPlacedTasksRunOnlyOnTheirNode_Live(t *testing.T) {
 	}
 }
 
-func TestSyncTasksPlacedElsewhereAreRefused_Live(t *testing.T) {
+func TestSyncTasksPlacedElsewhereAreRefused(t *testing.T) {
 	f := newFixture(t, 0, func(o *taskrunner.Options) { o.Node = "a" })
 	noop := func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) { return nil, nil }
 	f.handle(t, qBottom, "noop", noop)
@@ -156,7 +156,7 @@ func gaugeValue[N int64 | float64](t *testing.T, data metricdata.Aggregation, at
 	return 0, false
 }
 
-func TestQueueGauges_Live(t *testing.T) {
+func TestQueueGauges(t *testing.T) {
 	f, reader := metricsFixture(t, 0)
 	f.handle(t, qTop, "put", f.put())
 	f.start(t)
@@ -189,7 +189,7 @@ func TestQueueGauges_Live(t *testing.T) {
 	}
 }
 
-func TestTaskOutcomesAndTakeovers_Live(t *testing.T) {
+func TestTaskOutcomesAndTakeovers(t *testing.T) {
 	f, reader := metricsFixture(t, 1)
 	f.handle(t, qTop, "put", f.put())
 	f.handle(t, qTop, "fail", func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) {
@@ -240,7 +240,7 @@ func TestTaskOutcomesAndTakeovers_Live(t *testing.T) {
 	}
 }
 
-func TestQueueGaugesReadZeroOnceDrained_Live(t *testing.T) {
+func TestQueueGaugesReadZeroOnceDrained(t *testing.T) {
 	f, reader := metricsFixture(t, 1)
 	f.handle(t, qTop, "put", f.put())
 	f.start(t)
@@ -265,7 +265,7 @@ func TestQueueGaugesReadZeroOnceDrained_Live(t *testing.T) {
 	}
 }
 
-func TestSyncChildOutcomesAreRecorded_Live(t *testing.T) {
+func TestSyncChildOutcomesAreRecorded(t *testing.T) {
 	f, reader := metricsFixture(t, 0)
 	f.handle(t, qBottom, "child", func(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
 		if string(task.Args) == "fail" {
@@ -303,7 +303,7 @@ func TestSyncChildOutcomesAreRecorded_Live(t *testing.T) {
 	}
 }
 
-func TestTaskWaitingOnAHoldingRetryCountsAsDelayed_Live(t *testing.T) {
+func TestTaskWaitingOnAHoldingRetryCountsAsDelayed(t *testing.T) {
 	f, reader := metricsFixture(t, 1)
 	var runs atomic.Int32
 	if err := f.r.Handle(qTop, "add", func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) {
@@ -335,7 +335,7 @@ func TestTaskWaitingOnAHoldingRetryCountsAsDelayed_Live(t *testing.T) {
 	}
 }
 
-func TestEmptyNodeNamesAreRefused_Live(t *testing.T) {
+func TestEmptyNodeNamesAreRefused(t *testing.T) {
 	f := newFixture(t, 0)
 	f.handle(t, qTop, "put", f.put())
 	f.start(t)
@@ -349,7 +349,7 @@ func TestEmptyNodeNamesAreRefused_Live(t *testing.T) {
 	}
 }
 
-func TestMetricsReachTheGlobalProviderByDefault_Live(t *testing.T) {
+func TestMetricsReachTheGlobalProviderByDefault(t *testing.T) {
 	reader := sdkmetric.NewManualReader()
 	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
 	prev := otel.GetMeterProvider()

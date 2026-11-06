@@ -19,7 +19,6 @@ import (
 	"go.uber.org/zap/zaptest"
 
 	"github.com/fil-forge/ingot/blockstore"
-	"github.com/fil-forge/ingot/inmem"
 	"github.com/fil-forge/ingot/taskrunner"
 	"github.com/fil-forge/ingot/taskrunner/taskrunnertest"
 )
@@ -48,7 +47,7 @@ func newShardFixture(t *testing.T, ttl time.Duration) *shardFixture {
 	require.NoError(t, err)
 	cache, err := blockstore.NewBlobCache(filepath.Join(dir, "cache"))
 	require.NoError(t, err)
-	b := New(Deps{Spool: spool, Cache: cache, Intents: inmem.NewMemStore(), CacheTTL: ttl, Logger: zaptest.NewLogger(t)})
+	b := New(Deps{Spool: spool, Cache: cache, Intents: newTestStore(t), CacheTTL: ttl, Logger: zaptest.NewLogger(t)})
 	require.NoError(t, b.RegisterShardTasks(r))
 	require.NoError(t, r.Migrate(context.Background()))
 	require.NoError(t, r.Start(context.Background()))
@@ -92,7 +91,7 @@ func (f *shardFixture) tasks(t *testing.T, d multihash.Multihash, action, state 
 
 // A held blob moves into the cache, and leaves it once its time to live runs
 // out.
-func TestHeldBlobIsCachedUntilItsTTL_Live(t *testing.T) {
+func TestHeldBlobIsCachedUntilItsTTL(t *testing.T) {
 	f := newShardFixture(t, 300*time.Millisecond)
 	d := f.hold(t, "a")
 
@@ -111,7 +110,7 @@ func TestHeldBlobIsCachedUntilItsTTL_Live(t *testing.T) {
 
 // A held blob moves into the cache even when the request that held it has
 // ended by the time the move is queued.
-func TestHeldBlobIsCachedAfterItsRequestEnds_Live(t *testing.T) {
+func TestHeldBlobIsCachedAfterItsRequestEnds(t *testing.T) {
 	f := newShardFixture(t, time.Hour)
 	d, _, err := f.b.spool.WriteBlob(t.Context(), bytes.NewReader([]byte("a")))
 	require.NoError(t, err)
@@ -125,7 +124,7 @@ func TestHeldBlobIsCachedAfterItsRequestEnds_Live(t *testing.T) {
 
 // A read with less than half the time to live left renews it: the pending
 // eviction is replaced by a later one, so the blob outlives its first TTL.
-func TestReadRenewsTheTTL_Live(t *testing.T) {
+func TestReadRenewsTheTTL(t *testing.T) {
 	const ttl = time.Second
 	f := newShardFixture(t, ttl)
 	d := f.hold(t, "a")
@@ -143,7 +142,7 @@ func TestReadRenewsTheTTL_Live(t *testing.T) {
 }
 
 // A read with more than half the time to live left writes no task.
-func TestReadEarlyInTheTTLWritesNothing_Live(t *testing.T) {
+func TestReadEarlyInTheTTLWritesNothing(t *testing.T) {
 	f := newShardFixture(t, time.Hour)
 	d := f.hold(t, "a")
 	require.Eventually(t, func() bool { return f.cached(d) }, 5*time.Second, 10*time.Millisecond)
@@ -155,7 +154,7 @@ func TestReadEarlyInTheTTLWritesNothing_Live(t *testing.T) {
 }
 
 // Concurrent reads of a blob due for renewal queue one renewal between them.
-func TestConcurrentReadsRenewOnce_Live(t *testing.T) {
+func TestConcurrentReadsRenewOnce(t *testing.T) {
 	f := newShardFixture(t, time.Hour)
 	d := f.hold(t, "a")
 	require.Eventually(t, func() bool { return f.cached(d) }, 5*time.Second, 10*time.Millisecond)
@@ -177,7 +176,7 @@ func TestConcurrentReadsRenewOnce_Live(t *testing.T) {
 
 // A blob nothing caches schedules no eviction: a renewal for a copy already
 // gone, or a move that found no spool copy.
-func TestNothingCachedSchedulesNoEviction_Live(t *testing.T) {
+func TestNothingCachedSchedulesNoEviction(t *testing.T) {
 	f := newShardFixture(t, time.Hour)
 	d, _, err := f.b.spool.WriteBlob(t.Context(), bytes.NewReader([]byte("a")))
 	require.NoError(t, err)
@@ -194,7 +193,7 @@ func TestNothingCachedSchedulesNoEviction_Live(t *testing.T) {
 // The budget pass evicts through queue-shard.evict, run as a sync task, so its
 // removal takes its turn with the digest's other tasks; the eviction pending
 // at the TTL is left to find the file gone.
-func TestBudgetPassEvictsThroughTheQueue_Live(t *testing.T) {
+func TestBudgetPassEvictsThroughTheQueue(t *testing.T) {
 	f := newShardFixture(t, time.Hour)
 	var digests []multihash.Multihash
 	for _, c := range "abc" {

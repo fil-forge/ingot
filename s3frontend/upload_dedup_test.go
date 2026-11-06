@@ -10,7 +10,7 @@ import (
 	"go.uber.org/zap/zaptest"
 
 	"github.com/fil-forge/ingot/blockstore"
-	"github.com/fil-forge/ingot/inmem"
+	"github.com/fil-forge/ingot/internal/testfakes"
 	"github.com/fil-forge/ingot/logstore"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/uploader"
@@ -22,7 +22,7 @@ import (
 // a non-empty location so the backend records it (what uploadBlobs'
 // already-located short-circuit reads back).
 type countingUploader struct {
-	inmem.NopUploader
+	testfakes.NopUploader
 	mu    sync.Mutex
 	calls map[string]int
 }
@@ -47,7 +47,7 @@ func (u *countingUploader) UploadBlob(_ context.Context, _ did.DID, digest multi
 func TestUpload_IdenticalContentUploadsDistinctBlobs(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
-	mem := inmem.NewMemStore()
+	mem := newTestStore(t)
 	spool, err := blockstore.NewSpool(filepath.Join(dir, "spool"))
 	if err != nil {
 		t.Fatalf("spool: %v", err)
@@ -74,18 +74,19 @@ func TestUpload_IdenticalContentUploadsDistinctBlobs(t *testing.T) {
 		Intents:         mem,
 		Locations:       mem,
 		GC:              mem,
-		Reads:           blockstore.NewLayered(blockstore.LocalBlobs{Cache: cache, Spool: spool}, log, inmem.NopBaseReader{}),
+		Reads:           blockstore.NewLayered(blockstore.LocalBlobs{Cache: cache, Spool: spool}, log, testfakes.NopBaseReader{}),
 		Log:             log,
 		Spool:           spool,
 		Cache:           cache,
 		Uploader:        up,
 		Remover:         &recordingRemover{},
 		PendingReleases: mem,
-		Registrar:       inmem.NopUploader{},
+		Registrar:       testfakes.NopUploader{},
 		EncParams:       mem,
 		RegionKeys:      testRegionKeys(t),
 		TenantKeys:      testTenantKeys(),
 	})
+	mem.start(t, b)
 	if err := mem.Create(ctx, "bk", testutil.RandomDID(t), registry.CreateState{}); err != nil {
 		t.Fatalf("create bucket: %v", err)
 	}

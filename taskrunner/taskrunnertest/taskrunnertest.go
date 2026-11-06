@@ -18,7 +18,7 @@ import (
 )
 
 // DSNEnv names the environment variable holding the test database's DSN.
-// Tests that need it are skipped when it is unset.
+// Tests that need it fail when it is unset.
 const DSNEnv = "INGOT_TEST_DSN"
 
 // Env is a fresh schema in the test database, dropped when the test ends.
@@ -34,12 +34,12 @@ func (e Env) Table(name string) string {
 	return pgx.Identifier{e.Schema, name}.Sanitize()
 }
 
-// NewEnv creates an Env, skipping t when DSNEnv is unset.
+// NewEnv creates an Env, failing t when DSNEnv is unset.
 func NewEnv(t testing.TB) Env {
 	t.Helper()
 	dsn := os.Getenv(DSNEnv)
 	if dsn == "" {
-		t.Skipf("set %s to run tests against Postgres", DSNEnv)
+		t.Fatalf("%s is unset: set it to a Postgres the tests may create schemas in", DSNEnv)
 	}
 	ctx := context.Background()
 	pool, err := pgxpool.New(ctx, dsn)

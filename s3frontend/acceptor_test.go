@@ -15,7 +15,6 @@ import (
 	"github.com/fil-forge/versitygw/s3err"
 	"github.com/multiformats/go-multihash"
 
-	"github.com/fil-forge/ingot/inmem"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/uploader"
 )
@@ -94,7 +93,7 @@ func uploadDistinctParts(t *testing.T, b *Backend, key, uploadID string, n int) 
 }
 
 // partStates returns each recorded part's state by part number.
-func partStates(t *testing.T, mem *inmem.MemStore, uploadID string) map[int]string {
+func partStates(t *testing.T, mem *testStore, uploadID string) map[int]string {
 	t.Helper()
 	parts, err := mem.ListParts(context.Background(), uploadID)
 	if err != nil {

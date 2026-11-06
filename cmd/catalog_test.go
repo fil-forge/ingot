@@ -18,7 +18,7 @@ import (
 
 	"github.com/fil-forge/ingot/blockstore"
 	"github.com/fil-forge/ingot/cars"
-	"github.com/fil-forge/ingot/inmem"
+	"github.com/fil-forge/ingot/internal/pgtest"
 	"github.com/fil-forge/ingot/logstore"
 	"github.com/fil-forge/ingot/registry"
 )
@@ -59,12 +59,12 @@ func cborBlock(t *testing.T, name string, links ...cid.Cid) block.Block {
 // directory whose bucket is gone is left out.
 func TestCatalogUsage(t *testing.T) {
 	ctx := context.Background()
-	mem := inmem.NewMemStore()
+	mem := registry.NewPostgres(pgtest.New(t))
 	space, err := did.Parse("did:web:catalog-usage.example")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := mem.Create(ctx, "bk", space, registry.CreateState{}); err != nil {
+	if err := mem.Create(ctx, "bk", space, registry.CreateState{Tenant: space}); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 
@@ -185,7 +185,7 @@ func frame(b block.Block) int64 { return cars.FrameSize(b.Cid(), uint64(len(b.Ra
 // TestCatalogUsageJSON: the report forge-perf reads keeps its shape with no
 // bucket at all: an empty list and zero totals, every field present.
 func TestCatalogUsageJSON(t *testing.T) {
-	report, err := catalogUsage(context.Background(), inmem.NewMemStore(), filepath.Join(t.TempDir(), "segments"), nil)
+	report, err := catalogUsage(context.Background(), registry.NewPostgres(pgtest.New(t)), filepath.Join(t.TempDir(), "segments"), nil)
 	if err != nil {
 		t.Fatalf("catalogUsage: %v", err)
 	}

@@ -21,9 +21,8 @@ func (b *Backend) localUsage() int64 {
 // cacheHeld moves a blob's local copy from the spool into the cache once the
 // provider holds it for space: its location and accepted state are both
 // recorded. It queues the move as a queue-shard.cache task, which also
-// schedules the copy's eviction; with no task queues (the in-memory harness)
-// it moves the copy itself, and the copy stays until the budget pass removes
-// it. A copy already elsewhere, or none at all, moves nothing. A failure is
+// schedules the copy's eviction. A copy already elsewhere, or none at all,
+// moves nothing. A failure is
 // logged and leaves the copy in the spool, where reads still find it, until
 // the blob's release removes it.
 //
@@ -35,13 +34,7 @@ func (b *Backend) cacheHeld(ctx context.Context, space did.DID, digest multihash
 		b.dropLocalCopy(ctx, space, digest, removedAccepted)
 		return
 	}
-	var err error
-	if b.shards != nil {
-		err = b.submitShardCache(ctx, digest, true)
-	} else {
-		_, err = b.cache.Take(b.spool, digest)
-	}
-	if err != nil {
+	if err := b.submitShardCache(ctx, digest, true); err != nil {
 		b.logger.Warn("could not move a held blob's local copy into the cache; it stays in the spool",
 			zap.String("digest", hex.EncodeToString(digest)),
 			zap.Error(err))

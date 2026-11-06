@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/fil-forge/ucantone/did"
@@ -17,7 +18,7 @@ import (
 	"go.uber.org/zap/zaptest"
 
 	"github.com/fil-forge/ingot/blockstore"
-	"github.com/fil-forge/ingot/inmem"
+	"github.com/fil-forge/ingot/internal/testfakes"
 	"github.com/fil-forge/ingot/logstore"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/uploader"
@@ -41,6 +42,8 @@ type recordingRegistrar struct {
 	// spent makes PrepareAuthority fail, standing in for an expired chain the
 	// space cannot renew.
 	spent bool
+	// gate, when set, holds every RegisterUploads call until it is closed.
+	gate chan struct{}
 }
 
 func (r *recordingRegistrar) roundTrips() []int {
@@ -75,6 +78,9 @@ func (r *recordingRegistrar) spendAuthority() {
 }
 
 func (r *recordingRegistrar) RegisterUploads(_ context.Context, changes []uploader.QueuedUpload) ([]error, error) {
+	if r.gate != nil {
+		<-r.gate
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.batches = append(r.batches, len(changes))
@@ -107,24 +113,12 @@ func (r *recordingRegistrar) count() int {
 	return len(added) - len(retracted)
 }
 
-// drainRegistrations applies what the writes queued, as the
-// queue-space-upload tasks would: in commit order, each run of one op in one
-// round trip. The registrations are queued by the write and applied off the
-// request path, so every assertion below drains first.
+// drainRegistrations waits until the upload queue has sent what the writes
+// queued. The registrations are queued by the write and sent off the request
+// path, so every assertion below drains first.
 func drainRegistrations(t *testing.T, b *Backend) {
 	t.Helper()
-	regs := b.reg.(*inmem.MemStore).TakeUploadRegistrations()
-	for len(regs) > 0 {
-		n := 1
-		for n < len(regs) && regs[n].Op == regs[0].Op {
-			n++
-		}
-		errs, _ := b.sendRegistrations(context.Background(), regs[0].Op, regs[:n], make([]int, n))
-		for _, e := range errs {
-			require.NoError(t, e)
-		}
-		regs = regs[n:]
-	}
+	b.reg.(*testStore).drainUploads(t)
 }
 
 // newCountingBackend mirrors newRefTestBackend but swaps the no-op registrar
@@ -133,7 +127,7 @@ func newCountingBackend(t *testing.T) (*Backend, *recordingRegistrar) {
 	t.Helper()
 	ctx := context.Background()
 	dir := t.TempDir()
-	mem := inmem.NewMemStore()
+	mem := newTestStore(t)
 	cache, err := blockstore.NewBlobCache(filepath.Join(dir, "cache"))
 	if err != nil {
 		t.Fatalf("cache: %v", err)
@@ -162,12 +156,12 @@ func newCountingBackend(t *testing.T) (*Backend, *recordingRegistrar) {
 		GC:              mem,
 		Multipart:       mem,
 		Parks:           mem,
-		Reads:           blockstore.NewLayered(blockstore.LocalBlobs{Cache: cache, Spool: spool}, log, inmem.NopBaseReader{}),
+		Reads:           blockstore.NewLayered(blockstore.LocalBlobs{Cache: cache, Spool: spool}, log, testfakes.NopBaseReader{}),
 		Log:             log,
 		Spool:           spool,
 		Cache:           cache,
-		Uploader:        inmem.NopUploader{},
-		Deferred:        inmem.NopUploader{},
+		Uploader:        testfakes.NopUploader{},
+		Deferred:        testfakes.NopUploader{},
 		Remover:         &recordingRemover{},
 		Registrar:       reg,
 		EncParams:       mem,
@@ -175,6 +169,7 @@ func newCountingBackend(t *testing.T) (*Backend, *recordingRegistrar) {
 		TenantKeys:      testTenantKeys(),
 		PendingReleases: mem,
 	})
+	mem.start(t, b)
 	if err := mem.Create(ctx, "bk", did.Undef, registry.CreateState{}); err != nil {
 		t.Fatalf("create bucket: %v", err)
 	}
@@ -393,15 +388,25 @@ func refusals(n int) []error {
 // commits without waiting on Sprue. The change is queued and applied later.
 func TestWriteDoesNotCallTheUploadService(t *testing.T) {
 	b, reg := newCountingBackend(t)
+	// The upload service answers nothing until the write has returned, so a
+	// write that waited on it would never finish.
+	reg.gate = make(chan struct{})
 
-	putObjV(t, b, "a", []byte("hello"))
-
-	added, retracted := reg.snapshot()
-	require.Empty(t, added, "the write path must not call the upload service")
-	require.Empty(t, retracted)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		putObjV(t, b, "a", []byte("hello"))
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		close(reg.gate)
+		t.Fatal("the write waited on the upload service")
+	}
+	close(reg.gate)
 
 	drainRegistrations(t, b)
-	added, _ = reg.snapshot()
+	added, _ := reg.snapshot()
 	require.Len(t, added, 1, "draining applies what the write queued")
 }
 

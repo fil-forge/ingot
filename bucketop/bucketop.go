@@ -43,8 +43,8 @@ import (
 var ErrBucketNotFound = errors.New("bucketop: bucket not found")
 
 // Deps wires the Coordinator to its three dependencies. Every field
-// is an interface so tests can supply in-memory equivalents without
-// standing up Postgres, an on-disk log, or a network blockstore.
+// is an interface so tests can supply fakes without standing up an on-disk
+// log or a network blockstore.
 type Deps struct {
 	// Reg tracks per-bucket Root. Begin reads State; Commit
 	// CAS-advances Root from the snapshot to newRoot.

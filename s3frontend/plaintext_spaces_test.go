@@ -15,7 +15,7 @@ import (
 	"github.com/multiformats/go-multihash"
 
 	"github.com/fil-forge/ingot/blockstore"
-	"github.com/fil-forge/ingot/inmem"
+	"github.com/fil-forge/ingot/internal/testfakes"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/libforge/testutil"
 	"github.com/fil-forge/ucantone/did"
@@ -26,13 +26,13 @@ import (
 // A blob stored as received has the digest of its bytes, so the same bytes
 // written to two buckets of different spaces share a digest: one spool
 // file, and an upload, a park, a claim and a release per space. These tests
-// write identical bytes to "bk" (space did.Undef) and a second bucket of its
+// write identical bytes to "bk" (space mem.bk()) and a second bucket of its
 // own space, and check that one space's lifecycle never takes the other's
 // rows or file.
 
 // secondPlaintextBucket creates "bk2" in a space of its own and sets both
 // buckets to store as received. Returns bk2's space.
-func secondPlaintextBucket(t *testing.T, b *Backend, mem *inmem.MemStore) did.DID {
+func secondPlaintextBucket(t *testing.T, b *Backend, mem *testStore) did.DID {
 	t.Helper()
 	ctx := context.Background()
 	space := testutil.RandomDID(t)
@@ -125,7 +125,7 @@ func TestPlaintextSpaces_EachSpaceParksItsOwnCopy(t *testing.T) {
 	if d2 := hygienePartDigests(t, mem, id2, 1)[0]; !bytes.Equal(d, d2) {
 		t.Fatalf("identical parts parked under different digests")
 	}
-	for _, space := range []did.DID{did.Undef, space2} {
+	for _, space := range []did.DID{mem.bk(), space2} {
 		if _, err := mem.GetPark(ctx, space, d); err != nil {
 			t.Fatalf("park for %x in %s: %v", d, space, err)
 		}
@@ -160,7 +160,7 @@ func TestPlaintextSpaces_ReleaseInOneSpaceKeepsTheOther(t *testing.T) {
 	deleteFrom(t, b, "bk", "k")
 	drainReleases(t, b)
 
-	if _, err := mem.GetIntent(ctx, did.Undef, d); !errors.Is(err, registry.ErrNotFound) {
+	if _, err := mem.GetIntent(ctx, mem.bk(), d); !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("the deleted space's intent survived its release (err=%v)", err)
 	}
 	in, err := mem.GetIntent(ctx, space2, d)
@@ -193,7 +193,7 @@ func TestPlaintextSpaces_ReleaseInOneSpaceKeepsTheOther(t *testing.T) {
 func TestPlaintextSpaces_ReleaseInOneSpaceKeepsTheOthersPark(t *testing.T) {
 	pu := &parkingUploader{}
 	// Single-shot PUTs upload and accept; only part blobs park.
-	b, mem := newDeferredBackend(t, pu, func(d *Deps) { d.Uploader = inmem.NopUploader{} })
+	b, mem := newDeferredBackend(t, pu, func(d *Deps) { d.Uploader = testfakes.NopUploader{} })
 	space2 := secondPlaintextBucket(t, b, mem)
 	ctx := context.Background()
 	data := testBody(5 << 20)
@@ -239,13 +239,13 @@ func TestPlaintextSpaces_SameSpaceRewriteMakesTheReleaseStale(t *testing.T) {
 	putIn(t, b, "bk", "new", data)
 	drainReleases(t, b)
 
-	if pending, _ := mem.ListReleasesBySpace(ctx, did.Undef); len(pending) != 0 {
+	if pending, _ := mem.ListReleasesBySpace(ctx, mem.bk()); len(pending) != 0 {
 		t.Fatalf("release records after the drain = %v, want none (stale, dropped)", pending)
 	}
 	if n := rm.removedDigests()[string(d)]; n != 0 {
 		t.Fatalf("the re-claimed blob was removed from the network %d times", n)
 	}
-	in, err := mem.GetIntent(ctx, did.Undef, d)
+	in, err := mem.GetIntent(ctx, mem.bk(), d)
 	if err != nil || in.State != registry.IntentPublished {
 		t.Fatalf("intent after the rewrite = %+v, %v; want published", in, err)
 	}
@@ -270,12 +270,12 @@ func TestPlaintextRelease_WriteCancelsAPendingRelease(t *testing.T) {
 	putIn(t, b, "bk", "old", data)
 	d := blobDigestOf(t, b, "old", "")
 	deleteFrom(t, b, "bk", "old")
-	if pending, _ := mem.ListReleasesBySpace(ctx, did.Undef); len(pending) != 1 {
+	if pending, _ := mem.ListReleasesBySpace(ctx, mem.bk()); len(pending) != 1 {
 		t.Fatalf("release records after the delete = %d, want 1", len(pending))
 	}
 	putIn(t, b, "bk", "new", data)
 
-	if pending, _ := mem.ListReleasesBySpace(ctx, did.Undef); len(pending) != 0 {
+	if pending, _ := mem.ListReleasesBySpace(ctx, mem.bk()); len(pending) != 0 {
 		t.Fatalf("the write left the release record in place: %v", pending)
 	}
 	up.mu.Lock()
@@ -303,7 +303,7 @@ func TestPlaintextRelease_WriteWaitsOutAStartedRelease(t *testing.T) {
 	putIn(t, b, "bk", "old", data)
 	d := blobDigestOf(t, b, "old", "")
 	deleteFrom(t, b, "bk", "old")
-	if s, err := mem.StartRelease(ctx, did.Undef, d); err != nil || s != registry.ReleaseStarted {
+	if s, err := mem.StartRelease(ctx, mem.bk(), d); err != nil || s != registry.ReleaseStarted {
 		t.Fatalf("StartRelease = %v, %v", s, err)
 	}
 
@@ -336,10 +336,10 @@ func TestPlaintextRelease_WriteWaitsOutAStartedRelease(t *testing.T) {
 	if uploads != 2 {
 		t.Fatalf("uploads of %x = %d, want 2 (the blob was uploaded again after its release)", d, uploads)
 	}
-	if _, err := mem.GetLocation(ctx, did.Undef, d); err != nil {
+	if _, err := mem.GetLocation(ctx, mem.bk(), d); err != nil {
 		t.Fatalf("no location after the fresh upload: %v", err)
 	}
-	in, err := mem.GetIntent(ctx, did.Undef, d)
+	in, err := mem.GetIntent(ctx, mem.bk(), d)
 	if err != nil || in.State != registry.IntentPublished {
 		t.Fatalf("intent after the rewrite = %+v, %v; want published", in, err)
 	}
@@ -360,7 +360,7 @@ func TestPlaintextRelease_WaitIsBounded(t *testing.T) {
 	putIn(t, b, "bk", "old", data)
 	d := blobDigestOf(t, b, "old", "")
 	deleteFrom(t, b, "bk", "old")
-	if s, err := mem.StartRelease(ctx, did.Undef, d); err != nil || s != registry.ReleaseStarted {
+	if s, err := mem.StartRelease(ctx, mem.bk(), d); err != nil || s != registry.ReleaseStarted {
 		t.Fatalf("StartRelease = %v, %v", s, err)
 	}
 	limit := reuseWaitLimit
@@ -394,10 +394,10 @@ func TestPlaintextSpaces_ReleaseIgnoresAnotherSpacesHold(t *testing.T) {
 	deleteFrom(t, b, "bk", "k")
 	drainReleases(t, b)
 
-	if _, err := mem.GetIntent(ctx, did.Undef, d); !errors.Is(err, registry.ErrNotFound) {
+	if _, err := mem.GetIntent(ctx, mem.bk(), d); !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("the releasing space's intent survived behind another space's hold (err=%v)", err)
 	}
-	if pending, _ := mem.ListReleasesBySpace(ctx, did.Undef); len(pending) != 0 {
+	if pending, _ := mem.ListReleasesBySpace(ctx, mem.bk()); len(pending) != 0 {
 		t.Fatalf("release record survived: %v", pending)
 	}
 	if !localCopyExists(b, d) {
@@ -445,10 +445,10 @@ func TestPlaintextRelease_WriteWaitsOutAStartedReleaseWithNoLocation(t *testing.
 	d := blobDigestOf(t, b, "old", "")
 	deleteFrom(t, b, "bk", "old")
 	// The release is started and past its location delete.
-	if s, err := mem.StartRelease(ctx, did.Undef, d); err != nil || s != registry.ReleaseStarted {
+	if s, err := mem.StartRelease(ctx, mem.bk(), d); err != nil || s != registry.ReleaseStarted {
 		t.Fatalf("StartRelease = %v, %v", s, err)
 	}
-	if err := mem.DeleteLocation(ctx, did.Undef, d); err != nil {
+	if err := mem.DeleteLocation(ctx, mem.bk(), d); err != nil {
 		t.Fatalf("DeleteLocation: %v", err)
 	}
 
@@ -517,7 +517,7 @@ func (s *startAfterSettle) CancelRelease(ctx context.Context, space did.DID, dig
 // since no generation would ever drop it.
 func TestPlaintextRelease_ClaimRefusedDuringAStartedRelease(t *testing.T) {
 	rel := &startAfterSettle{}
-	b, mem := newDeferredBackend(t, inmem.NopUploader{}, func(d *Deps) {
+	b, mem := newDeferredBackend(t, testfakes.NopUploader{}, func(d *Deps) {
 		rel.PendingReleaseStore = d.PendingReleases
 		d.PendingReleases = rel
 		d.MaxBlobSize = 4 << 10
@@ -525,7 +525,7 @@ func TestPlaintextRelease_ClaimRefusedDuringAStartedRelease(t *testing.T) {
 	setNone(t, b)
 	data := testBody(8 << 10)
 	first, second := digestOf(t, data[:4<<10]), digestOf(t, data[4<<10:])
-	rel.digest, rel.space, rel.armed = second, did.Undef, true
+	rel.digest, rel.space, rel.armed = second, mem.bk(), true
 
 	bucket, key := "bk", "k"
 	_, err := b.PutObject(context.Background(), s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(data)})
@@ -534,7 +534,7 @@ func TestPlaintextRelease_ClaimRefusedDuringAStartedRelease(t *testing.T) {
 		t.Fatalf("PutObject with a release started before its commit: err = %v, want SlowDown", err)
 	}
 	for _, d := range []multihash.Multihash{first, second} {
-		if n, _ := mem.CountClaims(context.Background(), did.Undef, d); n != 0 {
+		if n, _ := mem.CountClaims(context.Background(), mem.bk(), d); n != 0 {
 			t.Fatalf("a claim on %x landed although the commit was refused: %d", d, n)
 		}
 	}
@@ -557,7 +557,7 @@ func TestPlaintextRelease_StreamedWriteWaitsOutAStartedRelease(t *testing.T) {
 	}
 	d := blobDigestOf(t, b, "old", "")
 	deleteFrom(t, b, "bk", "old")
-	if s, err := mem.StartRelease(ctx, did.Undef, d); err != nil || s != registry.ReleaseStarted {
+	if s, err := mem.StartRelease(ctx, mem.bk(), d); err != nil || s != registry.ReleaseStarted {
 		t.Fatalf("StartRelease = %v, %v", s, err)
 	}
 
@@ -585,7 +585,7 @@ func TestPlaintextRelease_StreamedWriteWaitsOutAStartedRelease(t *testing.T) {
 	if uploaded != 1 || aborted != 1 {
 		t.Fatalf("after the waited-out release: fresh uploads of %x = %d, streams aborted = %d; want 1 and 1", d, uploaded, aborted)
 	}
-	if _, err := mem.GetLocation(ctx, did.Undef, d); err != nil {
+	if _, err := mem.GetLocation(ctx, mem.bk(), d); err != nil {
 		t.Fatalf("no location after the fresh upload: %v", err)
 	}
 	if got := getFrom(t, b, "bk", "new"); !bytes.Equal(got, data) {
@@ -695,7 +695,7 @@ func (s *staleThenReplaced) StartRelease(ctx context.Context, space did.DID, dig
 // enqueued right after survives the sweep, since nothing deletes by key.
 func TestPlaintextRelease_StaleRecordDoesNotTakeAReplacement(t *testing.T) {
 	rel := &staleThenReplaced{}
-	b, mem := newDeferredBackend(t, inmem.NopUploader{}, func(d *Deps) {
+	b, mem := newDeferredBackend(t, testfakes.NopUploader{}, func(d *Deps) {
 		rel.PendingReleaseStore = d.PendingReleases
 		d.PendingReleases = rel
 	})
@@ -705,7 +705,7 @@ func TestPlaintextRelease_StaleRecordDoesNotTakeAReplacement(t *testing.T) {
 	putIn(t, b, "bk", "k", data)
 	d := blobDigestOf(t, b, "k", "")
 	// A record for a claimed digest: stale from the start.
-	if err := mem.EnqueueRelease(ctx, did.Undef, d, time.Now()); err != nil {
+	if err := mem.EnqueueRelease(ctx, mem.bk(), d, time.Now()); err != nil {
 		t.Fatalf("EnqueueRelease: %v", err)
 	}
 
@@ -714,7 +714,7 @@ func TestPlaintextRelease_StaleRecordDoesNotTakeAReplacement(t *testing.T) {
 	if rel.replaced != 1 {
 		t.Fatalf("stale starts = %d, want 1", rel.replaced)
 	}
-	pending, _ := mem.ListReleasesBySpace(ctx, did.Undef)
+	pending, _ := mem.ListReleasesBySpace(ctx, mem.bk())
 	if len(pending) != 1 {
 		t.Fatalf("records after the sweep = %v, want the replacement alone", pending)
 	}
@@ -748,7 +748,7 @@ func TestPlaintextSpaces_LastReleaseOutRemovesTheSharedFile(t *testing.T) {
 	rel.PendingReleaseStore = b.pendingReleases
 	b.pendingReleases = rel
 	space2 := secondPlaintextBucket(t, b, mem)
-	rel.first, rel.second = did.Undef, space2
+	rel.first, rel.second = mem.bk(), space2
 	ctx := context.Background()
 	data := testBody(8 << 10)
 
@@ -759,7 +759,7 @@ func TestPlaintextSpaces_LastReleaseOutRemovesTheSharedFile(t *testing.T) {
 	deleteFrom(t, b, "bk2", "k")
 	drainReleases(t, b)
 
-	for _, sp := range []did.DID{did.Undef, space2} {
+	for _, sp := range []did.DID{mem.bk(), space2} {
 		if _, err := mem.GetIntent(ctx, sp, d); !errors.Is(err, registry.ErrNotFound) {
 			t.Fatalf("intent in %s survived (err=%v)", sp, err)
 		}
@@ -787,18 +787,18 @@ func TestPlaintextRelease_CompleteFallbackSettlesUnderTheLock(t *testing.T) {
 	// Make the part look never parked, with its location gone and a release
 	// of the digest started: as a release that took the blob after the part
 	// was recorded.
-	if err := mem.DeleteLocation(ctx, did.Undef, d); err != nil {
+	if err := mem.DeleteLocation(ctx, mem.bk(), d); err != nil {
 		t.Fatalf("DeleteLocation: %v", err)
 	}
-	if err := mem.SetIntentState(ctx, did.Undef, d, registry.IntentSpooled); err != nil {
+	if err := mem.SetIntentState(ctx, mem.bk(), d, registry.IntentSpooled); err != nil {
 		t.Fatalf("SetIntentState: %v", err)
 	}
-	if err := mem.EnqueueRelease(ctx, did.Undef, d, time.Now().Add(time.Hour)); err != nil {
+	if err := mem.EnqueueRelease(ctx, mem.bk(), d, time.Now().Add(time.Hour)); err != nil {
 		t.Fatalf("EnqueueRelease: %v", err)
 	}
 
 	completeIn(t, b, "bk", "k", id, parts)
-	if pending, _ := mem.ListReleasesBySpace(ctx, did.Undef); len(pending) != 0 {
+	if pending, _ := mem.ListReleasesBySpace(ctx, mem.bk()); len(pending) != 0 {
 		t.Fatalf("the fallback upload left the pending record in place: %v", pending)
 	}
 	up.mu.Lock()
@@ -841,7 +841,7 @@ func (r *releaseBetweenReuseAndCommit) SetIntentState(ctx context.Context, space
 // with SlowDown for the client to retry.
 func TestPlaintextRelease_ClaimRefusedOnceTheLocationIsGone(t *testing.T) {
 	rel := &releaseBetweenReuseAndCommit{}
-	b, mem := newDeferredBackend(t, inmem.NopUploader{}, func(d *Deps) {
+	b, mem := newDeferredBackend(t, testfakes.NopUploader{}, func(d *Deps) {
 		rel.IntentStore, rel.locations = d.Intents, d.Locations
 		d.Intents = rel
 	})
@@ -856,7 +856,7 @@ func TestPlaintextRelease_ClaimRefusedOnceTheLocationIsGone(t *testing.T) {
 	if !errors.As(err, &apiErr) || apiErr.Code != "SlowDown" {
 		t.Fatalf("PutObject whose blob was released before its commit: err = %v, want SlowDown", err)
 	}
-	if n, _ := mem.CountClaims(context.Background(), did.Undef, rel.digest); n != 1 {
+	if n, _ := mem.CountClaims(context.Background(), mem.bk(), rel.digest); n != 1 {
 		t.Fatalf("claims on the digest = %d, want only the old object's", n)
 	}
 }
@@ -931,10 +931,10 @@ func TestPlaintextRelease_StreamedPartLocatedMeanwhileReuses(t *testing.T) {
 	}
 	parts := []types.CompletedPart{{ETag: out.ETag, PartNumber: &n}}
 
-	if _, err := mem.GetPark(ctx, did.Undef, d); !errors.Is(err, registry.ErrNotFound) {
+	if _, err := mem.GetPark(ctx, mem.bk(), d); !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("a park was recorded beside the location (err=%v)", err)
 	}
-	in, err := mem.GetIntent(ctx, did.Undef, d)
+	in, err := mem.GetIntent(ctx, mem.bk(), d)
 	if err != nil || in.State != registry.IntentAccepted {
 		t.Fatalf("the part's intent = %+v, %v; want accepted (reused)", in, err)
 	}
@@ -1004,21 +1004,23 @@ func TestPlaintextRelease_HoldOutlastsTheRecord(t *testing.T) {
 	d := digestOf(t, data)
 	wire := func(h *heldWhenRecorded) func(*Deps) {
 		return func(dp *Deps) {
-			h.LocationStore, h.ParkStore, h.spool, h.space, h.digest = dp.Locations, dp.Parks, dp.Spool, did.Undef, d
+			h.LocationStore, h.ParkStore, h.spool, h.digest = dp.Locations, dp.Parks, dp.Spool, d
 			dp.Locations, dp.Parks = h, h
 		}
 	}
 
 	t.Run("upload", func(t *testing.T) {
 		h := &heldWhenRecorded{}
-		b, _ := newDeferredBackend(t, &countingUploader{calls: map[string]int{}}, wire(h))
+		b, mem := newDeferredBackend(t, &countingUploader{calls: map[string]int{}}, wire(h))
+		h.space = mem.bk()
 		setNone(t, b)
 		putIn(t, b, "bk", "k", data)
 		h.wantHeld(t, "location of a single-shot upload")
 	})
 	t.Run("park", func(t *testing.T) {
 		h := &heldWhenRecorded{}
-		b, _ := newDeferredBackend(t, &parkingUploader{}, wire(h))
+		b, mem := newDeferredBackend(t, &parkingUploader{}, wire(h))
+		h.space = mem.bk()
 		setNone(t, b)
 		uploadOnePart(t, b, "bk", "k", data)
 		h.wantHeld(t, "park of a part")
@@ -1026,7 +1028,8 @@ func TestPlaintextRelease_HoldOutlastsTheRecord(t *testing.T) {
 	t.Run("streamed upload", func(t *testing.T) {
 		h := &heldWhenRecorded{}
 		su := newStreamingUploader()
-		b, _ := newStreamingBackend(t, su, wire(h))
+		b, mem := newStreamingBackend(t, su, wire(h))
+		h.space = mem.bk()
 		setNone(t, b)
 		if err := putSized(t, b, "k", data, int64(len(data))); err != nil {
 			t.Fatalf("PutObject: %v", err)
@@ -1036,7 +1039,8 @@ func TestPlaintextRelease_HoldOutlastsTheRecord(t *testing.T) {
 	t.Run("streamed park", func(t *testing.T) {
 		h := &heldWhenRecorded{}
 		su := newStreamingUploader()
-		b, _ := newStreamingBackend(t, su, wire(h))
+		b, mem := newStreamingBackend(t, su, wire(h))
+		h.space = mem.bk()
 		setNone(t, b)
 		bucket, key := "bk", "k"
 		ctx := context.Background()

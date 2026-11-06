@@ -24,7 +24,7 @@ func TestSweepersRecordRootSpans(t *testing.T) {
 	t.Cleanup(func() { otel.SetTracerProvider(prev) })
 
 	// A 2ms session TTL makes the multipart sweeper tick every millisecond.
-	s := newInmemServer(t, config.ServerConfig{MultipartSessionTTL: 2 * time.Millisecond})
+	s := newTestServer(t, config.ServerConfig{MultipartSessionTTL: 2 * time.Millisecond})
 	require.NoError(t, s.Start(t.Context()))
 	time.Sleep(20 * time.Millisecond)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

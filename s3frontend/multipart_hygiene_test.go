@@ -22,7 +22,7 @@ import (
 	"go.uber.org/zap/zaptest"
 
 	"github.com/fil-forge/ingot/blockstore"
-	"github.com/fil-forge/ingot/inmem"
+	"github.com/fil-forge/ingot/internal/testfakes"
 	"github.com/fil-forge/ingot/logstore"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/uploader"
@@ -37,7 +37,7 @@ import (
 // and the Docker itests.
 
 // hygienePartDigests reads the blob digests recorded for uploadID's part n.
-func hygienePartDigests(t *testing.T, mem *inmem.MemStore, uploadID string, n int) []multihash.Multihash {
+func hygienePartDigests(t *testing.T, mem *testStore, uploadID string, n int) []multihash.Multihash {
 	t.Helper()
 	parts, err := mem.ListParts(context.Background(), uploadID)
 	if err != nil {
@@ -67,11 +67,11 @@ func drainReleases(t *testing.T, b *Backend) {
 // assertReleased drains the deferred-release queue, then asserts a digest's
 // enc-params row and upload intent are gone and (wantRemoved) its network
 // release was invoked.
-func assertReleased(t *testing.T, b *Backend, mem *inmem.MemStore, rm *recordingRemover, d multihash.Multihash, wantRemoved bool) {
+func assertReleased(t *testing.T, b *Backend, mem *testStore, rm *recordingRemover, d multihash.Multihash, wantRemoved bool) {
 	t.Helper()
 	drainReleases(t, b)
 	ctx := context.Background()
-	if _, err := mem.GetEncryptionParams(ctx, did.Undef, d); !errors.Is(err, registry.ErrNotFound) {
+	if _, err := mem.GetEncryptionParams(ctx, mem.bk(), d); !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("enc-params row for %x survived (err=%v) — crypto-shred missing", d, err)
 	}
 	if _, err := mem.IntentByDigest(ctx, d); !errors.Is(err, registry.ErrNotFound) {
@@ -84,9 +84,9 @@ func assertReleased(t *testing.T, b *Backend, mem *inmem.MemStore, rm *recording
 
 // assertRetained asserts a digest's enc-params row survives and no network
 // release was invoked for it.
-func assertRetained(t *testing.T, mem *inmem.MemStore, rm *recordingRemover, d multihash.Multihash) {
+func assertRetained(t *testing.T, mem *testStore, rm *recordingRemover, d multihash.Multihash) {
 	t.Helper()
-	if _, err := mem.GetEncryptionParams(context.Background(), did.Undef, d); err != nil {
+	if _, err := mem.GetEncryptionParams(context.Background(), mem.bk(), d); err != nil {
 		t.Fatalf("enc-params row for retained blob %x: %v", d, err)
 	}
 	if rm.removedDigests()[string(d)] > 0 {
@@ -266,7 +266,7 @@ func TestCompleteFailsClosedOnMissingParamsRow(t *testing.T) {
 		t.Fatalf("UploadPart: %v", err)
 	}
 	d := hygienePartDigests(t, mem, uploadID, 1)[0]
-	if err := mem.DeleteEncryptionParams(ctx, did.Undef, d); err != nil {
+	if err := mem.DeleteEncryptionParams(ctx, mem.bk(), d); err != nil {
 		t.Fatalf("DeleteEncryptionParams: %v", err)
 	}
 	// The part as a row from before the lengths were kept.
@@ -310,17 +310,17 @@ func TestDrainSpaceReleasesIgnoresGrace(t *testing.T) {
 
 	// Simulate a live grace: push the intent's not_before into the future so
 	// the ordinary sweep would not touch it.
-	if err := mem.EnqueueRelease(ctx, did.Undef, d, time.Now().Add(time.Hour)); err != nil {
+	if err := mem.EnqueueRelease(ctx, mem.bk(), d, time.Now().Add(time.Hour)); err != nil {
 		t.Fatalf("EnqueueRelease (extend): %v", err)
 	}
 	if n, err := b.SweepPendingReleases(ctx); err != nil || n != 0 {
 		t.Fatalf("sweep executed %d releases (err=%v), want 0 — intent should not be due", n, err)
 	}
 
-	if err := b.drainSpaceReleases(ctx, did.Undef); err != nil {
+	if err := b.drainSpaceReleases(ctx, mem.bk()); err != nil {
 		t.Fatalf("drainSpaceReleases: %v", err)
 	}
-	if _, err := mem.GetEncryptionParams(ctx, did.Undef, d); !errors.Is(err, registry.ErrNotFound) {
+	if _, err := mem.GetEncryptionParams(ctx, mem.bk(), d); !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("enc-params row survived the space drain (err=%v)", err)
 	}
 	if rm.removedDigests()[string(d)] != 1 {
@@ -450,7 +450,7 @@ func TestCompleteWaitBudgetIsOperationAborted(t *testing.T) {
 // digest in acceptedOnProvider is refused as already accepted, as a provider
 // answers for a blob whose conclude ran without ingot learning of it.
 type parkingUploader struct {
-	inmem.NopUploader
+	testfakes.NopUploader
 	mu                 sync.Mutex
 	aborted            []string
 	acceptedOnProvider map[string]bool
@@ -461,7 +461,7 @@ type parkingUploader struct {
 
 func (p *parkingUploader) UploadBlob(_ context.Context, _ did.DID, digest multihash.Multihash, size int64, _ string, _ ...uploader.UploadOption) (uploader.UploadedBlob, error) {
 	c := cid.NewCidV1(cid.Raw, digest)
-	return uploader.UploadedBlob{Digest: digest, Size: size, AddTask: c, AcceptTask: c}, nil
+	return uploader.UploadedBlob{Digest: digest, Size: size, AddTask: c, AcceptTask: c, PutInvocation: []byte("put")}, nil
 }
 
 // AbortBlob records the aborted blob's digest, which its add task carries.
@@ -492,7 +492,7 @@ func (p *parkingUploader) abortedDigests() map[string]bool {
 
 // newParkingBackend is newRefTestBackend with a parking deferred uploader,
 // so part blobs reach IntentParked and abort exercises the /blob/abort arm.
-func newParkingBackend(t *testing.T) (*Backend, *inmem.MemStore, *parkingUploader) {
+func newParkingBackend(t *testing.T) (*Backend, *testStore, *parkingUploader) {
 	t.Helper()
 	pu := &parkingUploader{}
 	b, mem := newDeferredBackend(t, pu)
@@ -503,11 +503,11 @@ func newParkingBackend(t *testing.T) (*Backend, *inmem.MemStore, *parkingUploade
 // deferred uploader, so a test can observe how the completion path drives it.
 // Each mod edits the wiring before the backend is built, so a test can swap
 // one store for a faulty one.
-func newDeferredBackend(t *testing.T, up deferredTestUploader, mods ...func(*Deps)) (*Backend, *inmem.MemStore) {
+func newDeferredBackend(t *testing.T, up deferredTestUploader, mods ...func(*Deps)) (*Backend, *testStore) {
 	t.Helper()
 	ctx := context.Background()
 	dir := t.TempDir()
-	mem := inmem.NewMemStore()
+	mem := newTestStore(t)
 	spool, err := blockstore.NewSpool(filepath.Join(dir, "spool"))
 	if err != nil {
 		t.Fatalf("spool: %v", err)
@@ -535,14 +535,14 @@ func newDeferredBackend(t *testing.T, up deferredTestUploader, mods ...func(*Dep
 		GC:              mem,
 		Multipart:       mem,
 		Parks:           mem,
-		Reads:           blockstore.NewLayered(blockstore.LocalBlobs{Cache: cache, Spool: spool}, log, inmem.NopBaseReader{}),
+		Reads:           blockstore.NewLayered(blockstore.LocalBlobs{Cache: cache, Spool: spool}, log, testfakes.NopBaseReader{}),
 		Log:             log,
 		Spool:           spool,
 		Cache:           cache,
 		Uploader:        up,
 		Deferred:        up,
 		Remover:         &recordingRemover{},
-		Registrar:       inmem.NopUploader{},
+		Registrar:       testfakes.NopUploader{},
 		EncParams:       mem,
 		RegionKeys:      testRegionKeys(t),
 		TenantKeys:      testTenantKeys(),
@@ -552,6 +552,7 @@ func newDeferredBackend(t *testing.T, up deferredTestUploader, mods ...func(*Dep
 		mod(&deps)
 	}
 	b := New(deps)
+	mem.start(t, b)
 	if err := mem.Create(ctx, "bk", did.Undef, registry.CreateState{}); err != nil {
 		t.Fatalf("create bucket: %v", err)
 	}
@@ -598,7 +599,7 @@ func TestAbortUnparksParkedBlob(t *testing.T) {
 		if _, err := mem.ParkByDigest(ctx, d); !errors.Is(err, registry.ErrNotFound) {
 			t.Fatalf("park row for %x survived (err=%v)", d, err)
 		}
-		if _, err := mem.GetEncryptionParams(ctx, did.Undef, d); !errors.Is(err, registry.ErrNotFound) {
+		if _, err := mem.GetEncryptionParams(ctx, mem.bk(), d); !errors.Is(err, registry.ErrNotFound) {
 			t.Fatalf("enc-params row for %x survived (err=%v)", d, err)
 		}
 	}
@@ -664,7 +665,7 @@ func TestCompleteRecordsAcceptancesWhenConcludeFails(t *testing.T) {
 	if in, err := mem.IntentByDigest(ctx, accepted); err != nil || in.State != registry.IntentAccepted {
 		t.Fatalf("accepted blob intent = %v/%v, want accepted", in, err)
 	}
-	if loc, err := mem.GetLocation(ctx, did.Undef, accepted); err != nil || loc == nil {
+	if loc, err := mem.GetLocation(ctx, mem.bk(), accepted); err != nil || loc == nil {
 		t.Fatalf("accepted blob has no location (err=%v)", err)
 	}
 	if _, err := mem.ParkByDigest(ctx, accepted); !errors.Is(err, registry.ErrNotFound) {
@@ -770,7 +771,7 @@ func TestCompleteRecordsEveryAcceptanceWhenOneFailsToPersist(t *testing.T) {
 	if in, err := mem.IntentByDigest(ctx, recorded); err != nil || in.State != registry.IntentAccepted {
 		t.Fatalf("recorded blob intent = %v/%v, want accepted", in, err)
 	}
-	if loc, err := mem.GetLocation(ctx, did.Undef, recorded); err != nil || loc == nil {
+	if loc, err := mem.GetLocation(ctx, mem.bk(), recorded); err != nil || loc == nil {
 		t.Fatalf("recorded blob has no location (err=%v)", err)
 	}
 	if _, err := mem.ParkByDigest(ctx, recorded); !errors.Is(err, registry.ErrNotFound) {
@@ -848,14 +849,14 @@ func completeTwoParts(t *testing.T, b *Backend, key string) (string, []types.Com
 
 // assertAcceptedAndUnparked checks the tables say a blob is accepted, located,
 // and holds no park row.
-func assertAcceptedAndUnparked(t *testing.T, mem *inmem.MemStore, d multihash.Multihash) {
+func assertAcceptedAndUnparked(t *testing.T, mem *testStore, d multihash.Multihash) {
 	t.Helper()
 	ctx := context.Background()
 	// Accepted, or published once a commit has claimed it.
 	if in, err := mem.IntentByDigest(ctx, d); err != nil || (in.State != registry.IntentAccepted && in.State != registry.IntentPublished) {
 		t.Fatalf("blob %x intent = %v/%v, want accepted or published", d, in, err)
 	}
-	if loc, err := mem.GetLocation(ctx, did.Undef, d); err != nil || loc == nil {
+	if loc, err := mem.GetLocation(ctx, mem.bk(), d); err != nil || loc == nil {
 		t.Fatalf("blob %x has no location (err=%v)", d, err)
 	}
 	if _, err := mem.ParkByDigest(ctx, d); !errors.Is(err, registry.ErrNotFound) {
@@ -887,7 +888,7 @@ func TestCompleteRetryDropsParkAfterFailedIntentUpdate(t *testing.T) {
 	digests = append(digests, hygienePartDigests(t, mem, uploadID, 2)...)
 	// Both acceptances ran and both locations landed; only one intent did.
 	for _, d := range digests {
-		if loc, err := mem.GetLocation(context.Background(), did.Undef, d); err != nil || loc == nil {
+		if loc, err := mem.GetLocation(context.Background(), mem.bk(), d); err != nil || loc == nil {
 			t.Fatalf("blob %x has no location (err=%v)", d, err)
 		}
 	}
@@ -908,7 +909,7 @@ func TestCompleteRetryDropsParkAfterFailedIntentUpdate(t *testing.T) {
 // park: both located and accepted, one park row still standing. Recording
 // now swaps a park for its location in one step, so only rows written before
 // it can be in this state. It returns the digests and the one still parked.
-func plantStaleAcceptedPark(t *testing.T, mem *inmem.MemStore, uploadID string) (digests []multihash.Multihash, stale multihash.Multihash) {
+func plantStaleAcceptedPark(t *testing.T, mem *testStore, uploadID string) (digests []multihash.Multihash, stale multihash.Multihash) {
 	t.Helper()
 	ctx := context.Background()
 	sess, err := mem.GetSession(ctx, uploadID)
@@ -1020,7 +1021,7 @@ func TestReleaseSweepDropsParkTheSessionSweepCouldNot(t *testing.T) {
 	if _, err := mem.ParkByDigest(ctx, stale); !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("park row for %x survived the release sweep (err=%v)", stale, err)
 	}
-	if _, err := mem.GetLocation(ctx, did.Undef, stale); !errors.Is(err, registry.ErrNotFound) {
+	if _, err := mem.GetLocation(ctx, mem.bk(), stale); !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("location for %x survived the release sweep (err=%v)", stale, err)
 	}
 	if _, err := mem.IntentByDigest(ctx, stale); !errors.Is(err, registry.ErrNotFound) {
@@ -1077,13 +1078,13 @@ func TestUploadPartToleratesFailedStaleParkDelete(t *testing.T) {
 		t.Fatalf("dedup part intent = %v/%v, want accepted", in, err)
 	}
 	// The fake answers located; the claim at Complete reads the row itself.
-	if err := mem.PutLocation(ctx, registry.BlobLocation{Space: did.Undef, Digest: d, Provider: "did:key:zNode", URL: "https://node.example/blob", Size: 1}); err != nil {
+	if err := mem.PutLocation(ctx, registry.BlobLocation{Space: mem.bk(), Digest: d, Provider: "did:key:zNode", URL: "https://node.example/blob", Size: 1}); err != nil {
 		t.Fatalf("PutLocation: %v", err)
 	}
 
 	// The stale row such a failure leaves behind, as a Complete that failed
 	// after recording the acceptance would.
-	if _, err := mem.PutPark(ctx, registry.BlobPark{Space: did.Undef, Digest: d, AddTask: []byte{1}, AcceptTask: []byte{1}, Size: 1}); err != nil {
+	if _, err := mem.PutPark(ctx, registry.BlobPark{Space: mem.bk(), Digest: d, AddTask: []byte{1}, AcceptTask: []byte{1}, PutInvocation: []byte{1}, Size: 1}); err != nil {
 		t.Fatalf("PutPark: %v", err)
 	}
 	if _, err := mpComplete(t, b, key, uploadID, []types.CompletedPart{{PartNumber: &one, ETag: out.ETag}}, nil); err != nil {
@@ -1129,7 +1130,7 @@ func TestSweepReleasesLocatedBlobWhoseIntentLagged(t *testing.T) {
 	if lagged == nil {
 		t.Fatal("no blob was left parked with a location")
 	}
-	if loc, err := mem.GetLocation(ctx, did.Undef, lagged); err != nil || loc == nil {
+	if loc, err := mem.GetLocation(ctx, mem.bk(), lagged); err != nil || loc == nil {
 		t.Fatalf("lagged blob has no location (err=%v)", err)
 	}
 
@@ -1143,7 +1144,7 @@ func TestSweepReleasesLocatedBlobWhoseIntentLagged(t *testing.T) {
 		t.Fatalf("park row for located blob %x survived the sweep (err=%v)", lagged, err)
 	}
 	assertReleased(t, b, mem, rm, lagged, true)
-	if _, err := mem.GetLocation(ctx, did.Undef, lagged); !errors.Is(err, registry.ErrNotFound) {
+	if _, err := mem.GetLocation(ctx, mem.bk(), lagged); !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("location for %x survived the release (err=%v)", lagged, err)
 	}
 }
@@ -1320,7 +1321,7 @@ func TestAbortReleasesFromRecordsWhenSessionDeleteFails(t *testing.T) {
 	if err := b.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{Bucket: &bucket, Key: &key, UploadId: &uploadID}); err == nil {
 		t.Fatal("Abort succeeded although the session could not be deleted")
 	}
-	pending, err := mem.ListReleasesBySpace(ctx, did.Undef)
+	pending, err := mem.ListReleasesBySpace(ctx, mem.bk())
 	if err != nil || len(pending) != 1 || string(pending[0].Digest) != string(d) {
 		t.Fatalf("pending releases = %v/%v, want the part blob's record", pending, err)
 	}
@@ -1332,7 +1333,7 @@ func TestAbortReleasesFromRecordsWhenSessionDeleteFails(t *testing.T) {
 	if _, err := mem.ParkByDigest(ctx, d); !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("park row for %x survived (err=%v)", d, err)
 	}
-	if pending, _ := mem.ListReleasesBySpace(ctx, did.Undef); len(pending) != 0 {
+	if pending, _ := mem.ListReleasesBySpace(ctx, mem.bk()); len(pending) != 0 {
 		t.Fatalf("release record survived its execution: %v", pending)
 	}
 	if n, err := b.SweepStaleMultipartSessions(ctx, -time.Second); err != nil || n == 0 {
@@ -1357,7 +1358,7 @@ func TestReleaseDefersWhileAnInFlightPartReferencesTheBlob(t *testing.T) {
 		t.Fatalf("UploadPart: %v", err)
 	}
 	d := hygienePartDigests(t, mem, uploadID, 1)[0]
-	if err := mem.EnqueueRelease(ctx, did.Undef, d, time.Now().Add(-time.Second)); err != nil {
+	if err := mem.EnqueueRelease(ctx, mem.bk(), d, time.Now().Add(-time.Second)); err != nil {
 		t.Fatalf("EnqueueRelease: %v", err)
 	}
 
@@ -1371,7 +1372,7 @@ func TestReleaseDefersWhileAnInFlightPartReferencesTheBlob(t *testing.T) {
 	if pu.abortedDigests()[string(d)] {
 		t.Fatalf("in-flight part blob %x was aborted on the provider", d)
 	}
-	pending, err := mem.ListReleasesBySpace(ctx, did.Undef)
+	pending, err := mem.ListReleasesBySpace(ctx, mem.bk())
 	if err != nil || len(pending) != 1 {
 		t.Fatalf("pending releases = %d/%v, want the deferred record to stand", len(pending), err)
 	}
@@ -1384,13 +1385,13 @@ func TestReleaseDefersWhileAnInFlightPartReferencesTheBlob(t *testing.T) {
 	if _, err := mpComplete(t, b, key, uploadID, []types.CompletedPart{{PartNumber: &one, ETag: out.ETag}}, nil); err != nil {
 		t.Fatalf("Complete: %v", err)
 	}
-	if err := b.drainSpaceReleases(ctx, did.Undef); err != nil {
+	if err := b.drainSpaceReleases(ctx, mem.bk()); err != nil {
 		t.Fatalf("drainSpaceReleases: %v", err)
 	}
-	if pending, _ := mem.ListReleasesBySpace(ctx, did.Undef); len(pending) != 0 {
+	if pending, _ := mem.ListReleasesBySpace(ctx, mem.bk()); len(pending) != 0 {
 		t.Fatalf("stale record survived the claim: %v", pending)
 	}
-	if _, err := mem.GetEncryptionParams(ctx, did.Undef, d); err != nil {
+	if _, err := mem.GetEncryptionParams(ctx, mem.bk(), d); err != nil {
 		t.Fatalf("claimed blob %x lost its enc-params row: %v", d, err)
 	}
 }
@@ -1433,7 +1434,7 @@ func TestCompletedSessionReapReleasesOrphansWhoseRecordingFailed(t *testing.T) {
 			t.Fatalf("orphan %x lost its park with no record and no release: %v", d, err)
 		}
 	}
-	if pending, _ := mem.ListReleasesBySpace(ctx, did.Undef); len(pending) != 0 {
+	if pending, _ := mem.ListReleasesBySpace(ctx, mem.bk()); len(pending) != 0 {
 		t.Fatalf("a release record exists although recording failed: %v", pending)
 	}
 
@@ -1450,7 +1451,7 @@ func TestCompletedSessionReapReleasesOrphansWhoseRecordingFailed(t *testing.T) {
 		if _, err := mem.ParkByDigest(ctx, d); !errors.Is(err, registry.ErrNotFound) {
 			t.Fatalf("park row for orphan %x survived (err=%v)", d, err)
 		}
-		if _, err := mem.GetEncryptionParams(ctx, did.Undef, d); !errors.Is(err, registry.ErrNotFound) {
+		if _, err := mem.GetEncryptionParams(ctx, mem.bk(), d); !errors.Is(err, registry.ErrNotFound) {
 			t.Fatalf("enc-params row for orphan %x survived (err=%v)", d, err)
 		}
 		if _, err := mem.IntentByDigest(ctx, d); !errors.Is(err, registry.ErrNotFound) {
@@ -1543,10 +1544,10 @@ func TestReleaseKeepsRowsUntilTheNetworkStepSucceeds(t *testing.T) {
 	if n, err := b.SweepPendingReleases(ctx); err != nil || n != 0 {
 		t.Fatalf("first sweep executed %d releases (err=%v), want 0: the network remove failed", n, err)
 	}
-	if loc, err := mem.GetLocation(ctx, did.Undef, d); err != nil || loc == nil {
+	if loc, err := mem.GetLocation(ctx, mem.bk(), d); err != nil || loc == nil {
 		t.Fatalf("location row went although the network still holds the blob (err=%v)", err)
 	}
-	if pending, _ := mem.ListReleasesBySpace(ctx, did.Undef); len(pending) != 1 {
+	if pending, _ := mem.ListReleasesBySpace(ctx, mem.bk()); len(pending) != 1 {
 		t.Fatalf("release record after the failed attempt = %v, want it kept", pending)
 	}
 	// The part's spool copy went when it parked; the intent is what the
@@ -1562,7 +1563,7 @@ func TestReleaseKeepsRowsUntilTheNetworkStepSucceeds(t *testing.T) {
 	if rm.removedDigests()[string(d)] != 1 {
 		t.Fatalf("RemoveBlob calls for %x = %d, want 1", d, rm.removedDigests()[string(d)])
 	}
-	if _, err := mem.GetLocation(ctx, did.Undef, d); !errors.Is(err, registry.ErrNotFound) {
+	if _, err := mem.GetLocation(ctx, mem.bk(), d); !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("location row survived the release (err=%v)", err)
 	}
 	assertLocalCopyReleased(t, b, mem, d)
@@ -1573,7 +1574,7 @@ func TestReleaseKeepsRowsUntilTheNetworkStepSucceeds(t *testing.T) {
 // remove fails keeps the intent and spool copy for the retry.
 func TestReleaseFreesSpoolCopyOfDeletedPutObject(t *testing.T) {
 	rm := &failRemover{recordingRemover: &recordingRemover{}, fails: 1}
-	b, mem := newDeferredBackend(t, inmem.NopUploader{}, func(d *Deps) { d.Remover = rm })
+	b, mem := newDeferredBackend(t, testfakes.NopUploader{}, func(d *Deps) { d.Remover = rm })
 	ctx := context.Background()
 	key := "put-delete"
 
@@ -1599,7 +1600,7 @@ func TestReleaseFreesSpoolCopyOfDeletedPutObject(t *testing.T) {
 
 // assertLocalCopyReleased fails the test unless the blob's upload intent and
 // spool copy are both gone, as a finished release leaves them.
-func assertLocalCopyReleased(t *testing.T, b *Backend, mem *inmem.MemStore, d multihash.Multihash) {
+func assertLocalCopyReleased(t *testing.T, b *Backend, mem *testStore, d multihash.Multihash) {
 	t.Helper()
 	if in, err := mem.IntentByDigest(context.Background(), d); !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("blob %x intent = %v/%v after its release, want it deleted", d, in, err)
@@ -1663,7 +1664,7 @@ func TestReapAfterDeletedObjectReleased(t *testing.T) {
 	if n, err := b.SweepStaleMultipartSessions(ctx, -time.Second); err != nil || n == 0 {
 		t.Fatalf("sweep: cleaned=%d err=%v", n, err)
 	}
-	if pending, _ := mem.ListReleasesBySpace(ctx, did.Undef); len(pending) != 0 {
+	if pending, _ := mem.ListReleasesBySpace(ctx, mem.bk()); len(pending) != 0 {
 		t.Fatalf("reap after the release recorded %d releases, want none", len(pending))
 	}
 	drainReleases(t, b)
@@ -1737,7 +1738,7 @@ func TestAbortRecordsBlobAnotherAbortingSessionReferences(t *testing.T) {
 
 	// A second session referencing the same blob, already latched aborting.
 	const other = "other-session"
-	if err := mem.CreateSession(ctx, registry.MultipartSession{UploadID: other, Bucket: bucket, ObjectKey: "other"}); err != nil {
+	if err := mem.CreateSession(ctx, registry.MultipartSession{UploadID: other, Bucket: bucket, Space: mem.bk(), ObjectKey: "other"}); err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
 	if _, err := mem.PutPart(ctx, registry.MultipartPart{UploadID: other, PartNumber: 1, ETagMD5: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{d}, State: registry.PartParked}, nil); err != nil {
@@ -1772,7 +1773,7 @@ func TestReleaseWaitsForAnotherOpenSessionSharingTheBlob(t *testing.T) {
 	}
 	d := hygienePartDigests(t, mem, uploadID, 1)[0]
 	const other = "other-open"
-	if err := mem.CreateSession(ctx, registry.MultipartSession{UploadID: other, Bucket: bucket, ObjectKey: "other"}); err != nil {
+	if err := mem.CreateSession(ctx, registry.MultipartSession{UploadID: other, Bucket: bucket, Space: mem.bk(), ObjectKey: "other"}); err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
 	if _, err := mem.PutPart(ctx, registry.MultipartPart{UploadID: other, PartNumber: 1, ETagMD5: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{d}, State: registry.PartParked}, nil); err != nil {
@@ -1788,7 +1789,7 @@ func TestReleaseWaitsForAnotherOpenSessionSharingTheBlob(t *testing.T) {
 	if _, err := mem.ParkByDigest(ctx, d); err != nil {
 		t.Fatalf("park row for %x went while another open session references it: %v", d, err)
 	}
-	pending, _ := mem.ListReleasesBySpace(ctx, did.Undef)
+	pending, _ := mem.ListReleasesBySpace(ctx, mem.bk())
 	if len(pending) != 1 || string(pending[0].Digest) != string(d) {
 		t.Fatalf("pending releases = %v, want the shared blob's record standing", pending)
 	}
@@ -1946,11 +1947,11 @@ func TestRecreatedBucketDisownsItsPredecessorsUploads(t *testing.T) {
 func TestSweepLeavesALiveCompleteOnAnOldSession(t *testing.T) {
 	b, mem, pu := newParkingBackend(t)
 	ctx := context.Background()
-	old := time.Now().Add(-2 * time.Hour)
 	mk := func(id string) multihash.Multihash {
-		if err := mem.CreateSession(ctx, registry.MultipartSession{UploadID: id, Bucket: "bk", ObjectKey: id, CreatedAt: old}); err != nil {
+		if err := mem.CreateSession(ctx, registry.MultipartSession{UploadID: id, Bucket: "bk", Space: mem.bk(), ObjectKey: id}); err != nil {
 			t.Fatalf("CreateSession %s: %v", id, err)
 		}
+		mem.AgeSession(id, 2*time.Hour)
 		d, err := multihash.Sum([]byte("blob-"+id), multihash.SHA2_256, -1)
 		if err != nil {
 			t.Fatalf("multihash.Sum: %v", err)
@@ -1960,12 +1961,12 @@ func TestSweepLeavesALiveCompleteOnAnOldSession(t *testing.T) {
 		}
 		// The write path spools every part blob before recording the part,
 		// so a part row never exists without its blob's intent.
-		if err := mem.PutIntent(ctx, registry.UploadIntent{Space: did.Undef, Digest: d, LocalPath: "/spool/" + id, Size: 1, State: registry.IntentParked, Bucket: "bk"}); err != nil {
+		if err := mem.PutIntent(ctx, registry.UploadIntent{Space: mem.bk(), Digest: d, LocalPath: "/spool/" + id, Size: 1, State: registry.IntentParked, Bucket: "bk"}); err != nil {
 			t.Fatalf("PutIntent %s: %v", id, err)
 		}
 		// Parked on a provider, so a release of it is an abort the fake records.
 		task := cid.NewCidV1(cid.Raw, d).Bytes()
-		if _, err := mem.PutPark(ctx, registry.BlobPark{Space: did.Undef, Digest: d, AddTask: task, AcceptTask: task, Size: 1}); err != nil {
+		if _, err := mem.PutPark(ctx, registry.BlobPark{Space: mem.bk(), Digest: d, AddTask: task, AcceptTask: task, PutInvocation: []byte{1}, Size: 1}); err != nil {
 			t.Fatalf("PutPark %s: %v", id, err)
 		}
 		return d
@@ -2116,7 +2117,7 @@ func TestUploadPartRefusedAfterTeardownReleasesItsBlobs(t *testing.T) {
 	if len(entries) != 0 {
 		t.Fatalf("spool holds %d blobs after the refused part was released, want 0", len(entries))
 	}
-	if pending, _ := mem.ListReleasesBySpace(ctx, did.Undef); len(pending) != 0 {
+	if pending, _ := mem.ListReleasesBySpace(ctx, mem.bk()); len(pending) != 0 {
 		t.Fatalf("pending releases after the refused part = %v, want none", pending)
 	}
 }
@@ -2222,7 +2223,7 @@ func TestReleaseKeepsIntentUntilLocalCleanupSucceeds(t *testing.T) {
 	if shred.fails > 0 {
 		t.Fatal("the shred was never attempted")
 	}
-	pending, _ := mem.ListReleasesBySpace(ctx, did.Undef)
+	pending, _ := mem.ListReleasesBySpace(ctx, mem.bk())
 	if len(pending) != 1 {
 		t.Fatalf("pending releases after the failed attempt = %d, want 1", len(pending))
 	}
@@ -2286,7 +2287,7 @@ func TestLocalOnlyReleaseDropsIntentWithItsRecord(t *testing.T) {
 	if mp.fails > 0 {
 		t.Fatal("the part store never refused a write")
 	}
-	if pending, _ := mem.ListReleasesBySpace(ctx, did.Undef); len(pending) != 0 {
+	if pending, _ := mem.ListReleasesBySpace(ctx, mem.bk()); len(pending) != 0 {
 		t.Fatalf("release records after the release = %v, want none: the record outlived its intent", pending)
 	}
 	entries, err := os.ReadDir(b.spool.Path(nil))
@@ -2340,7 +2341,7 @@ func TestReapDoesNotRecordAReleaseAlreadyRunToCompletion(t *testing.T) {
 	if mp.fails > 0 {
 		t.Fatal("the session delete never failed")
 	}
-	if pending, _ := mem.ListReleasesBySpace(ctx, did.Undef); len(pending) != 1 {
+	if pending, _ := mem.ListReleasesBySpace(ctx, mem.bk()); len(pending) != 1 {
 		t.Fatalf("pending releases after the first reap = %d, want 1", len(pending))
 	}
 
@@ -2361,7 +2362,7 @@ func TestReapDoesNotRecordAReleaseAlreadyRunToCompletion(t *testing.T) {
 	if _, err := mem.GetSession(ctx, uploadID); !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("session survived the second sweep (err=%v)", err)
 	}
-	if pending, _ := mem.ListReleasesBySpace(ctx, did.Undef); len(pending) != 0 {
+	if pending, _ := mem.ListReleasesBySpace(ctx, mem.bk()); len(pending) != 0 {
 		t.Fatalf("releases re-recorded for a blob already released = %v, want none", pending)
 	}
 	if n := len(rm.removedDigests()); n != 0 {
@@ -2377,7 +2378,7 @@ func TestReapDoesNotRecordAReleaseAlreadyRunToCompletion(t *testing.T) {
 func TestReleaseRemovesBlobAcceptedWithoutRows(t *testing.T) {
 	rm := &recordingRemover{}
 	locs := &failOncePutLocation{}
-	b, mem := newDeferredBackend(t, inmem.NopUploader{}, func(d *Deps) {
+	b, mem := newDeferredBackend(t, testfakes.NopUploader{}, func(d *Deps) {
 		locs.LocationStore = d.Locations
 		d.Locations = locs
 		d.Remover = rm
@@ -2392,10 +2393,10 @@ func TestReleaseRemovesBlobAcceptedWithoutRows(t *testing.T) {
 	}
 	d := hygienePartDigests(t, mem, uploadID, 1)[0]
 	// Make the blob look never parked: no location, intent back to spooled.
-	if err := mem.DeleteLocation(ctx, did.Undef, d); err != nil {
+	if err := mem.DeleteLocation(ctx, mem.bk(), d); err != nil {
 		t.Fatalf("DeleteLocation: %v", err)
 	}
-	if err := mem.SetIntentState(ctx, did.Undef, d, registry.IntentSpooled); err != nil {
+	if err := mem.SetIntentState(ctx, mem.bk(), d, registry.IntentSpooled); err != nil {
 		t.Fatalf("SetIntentState: %v", err)
 	}
 
@@ -2409,7 +2410,7 @@ func TestReleaseRemovesBlobAcceptedWithoutRows(t *testing.T) {
 	if locs.armed {
 		t.Fatal("the location store never refused a write")
 	}
-	if loc, err := mem.GetLocation(ctx, did.Undef, d); err == nil && loc != nil {
+	if loc, err := mem.GetLocation(ctx, mem.bk(), d); err == nil && loc != nil {
 		t.Fatal("location row exists; the scenario needs the blob accepted with no rows")
 	}
 
@@ -2466,7 +2467,7 @@ func TestSupersedeRecordsReleaseOfSharedBlob(t *testing.T) {
 	if _, err := mpUploadPart(t, b, key, uploadID, 1, testBody(int(backend.MinPartSize)+100), nil); err != nil {
 		t.Fatalf("UploadPart (supersede): %v", err)
 	}
-	pending, err := mem.ListReleasesBySpace(ctx, did.Undef)
+	pending, err := mem.ListReleasesBySpace(ctx, mem.bk())
 	if err != nil || len(pending) != 1 || string(pending[0].Digest) != string(shared) {
 		t.Fatalf("releases after the supersede = %v (err %v), want one record for the shared blob %x", pending, err, shared)
 	}
@@ -2478,7 +2479,7 @@ func TestSupersedeRecordsReleaseOfSharedBlob(t *testing.T) {
 	if pu.abortedDigests()[string(shared)] {
 		t.Fatalf("shared blob %x aborted on the provider while part 2 names it", shared)
 	}
-	if pending, _ := mem.ListReleasesBySpace(ctx, did.Undef); len(pending) != 1 {
+	if pending, _ := mem.ListReleasesBySpace(ctx, mem.bk()); len(pending) != 1 {
 		t.Fatalf("deferred record did not survive the sweep: %v", pending)
 	}
 
@@ -2489,7 +2490,7 @@ func TestSupersedeRecordsReleaseOfSharedBlob(t *testing.T) {
 	if err := b.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{Bucket: &bucket, Key: &key, UploadId: &uploadID}); err != nil {
 		t.Fatalf("Abort: %v", err)
 	}
-	if err := b.drainSpaceReleases(ctx, did.Undef); err != nil {
+	if err := b.drainSpaceReleases(ctx, mem.bk()); err != nil {
 		t.Fatalf("drainSpaceReleases: %v", err)
 	}
 	if !pu.abortedDigests()[string(shared)] {
@@ -2498,7 +2499,7 @@ func TestSupersedeRecordsReleaseOfSharedBlob(t *testing.T) {
 	if _, err := mem.ParkByDigest(ctx, shared); !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("park row for %x survived the session (err=%v)", shared, err)
 	}
-	if pending, _ := mem.ListReleasesBySpace(ctx, did.Undef); len(pending) != 0 {
+	if pending, _ := mem.ListReleasesBySpace(ctx, mem.bk()); len(pending) != 0 {
 		t.Fatalf("release records survived the session: %v", pending)
 	}
 }
@@ -2615,7 +2616,7 @@ func TestConcurrentUploadsOfOnePartReleaseTheOverwrittenBlobs(t *testing.T) {
 	// row, and ran them once its own part was parked; one its sibling still
 	// held then stands recorded for the sweeper.
 	recorded := map[string]bool{}
-	pending, err := mem.ListReleasesBySpace(ctx, did.Undef)
+	pending, err := mem.ListReleasesBySpace(ctx, mem.bk())
 	if err != nil {
 		t.Fatalf("ListReleasesBySpace: %v", err)
 	}
@@ -2631,7 +2632,7 @@ func TestConcurrentUploadsOfOnePartReleaseTheOverwrittenBlobs(t *testing.T) {
 		}
 	}
 
-	if err := b.drainSpaceReleases(ctx, did.Undef); err != nil {
+	if err := b.drainSpaceReleases(ctx, mem.bk()); err != nil {
 		t.Fatalf("drainSpaceReleases: %v", err)
 	}
 	for _, d := range orphans {
@@ -2705,7 +2706,7 @@ func TestReplacedWhileParkingReleasesItsBlobs(t *testing.T) {
 		t.Fatalf("part 1 still names the first upload's blob %x", first[0])
 	}
 
-	if err := b.drainSpaceReleases(ctx, did.Undef); err != nil {
+	if err := b.drainSpaceReleases(ctx, mem.bk()); err != nil {
 		t.Fatalf("drainSpaceReleases: %v", err)
 	}
 	for _, d := range first {
@@ -2724,7 +2725,7 @@ func TestReplacedWhileParkingReleasesItsBlobs(t *testing.T) {
 			t.Fatalf("the replacement's blob %x lost its park: %v", d, err)
 		}
 	}
-	if pending, _ := mem.ListReleasesBySpace(ctx, did.Undef); len(pending) != 0 {
+	if pending, _ := mem.ListReleasesBySpace(ctx, mem.bk()); len(pending) != 0 {
 		t.Fatalf("release records left behind: %v", pending)
 	}
 }
@@ -2776,7 +2777,7 @@ func TestReplacedWhileParkingKeepsTheRecordWhenTheWriteDies(t *testing.T) {
 			t.Fatalf("the replaced upload's blob %x is not parked: %v", d, err)
 		}
 	}
-	if err := b.drainSpaceReleases(ctx, did.Undef); err != nil {
+	if err := b.drainSpaceReleases(ctx, mem.bk()); err != nil {
 		t.Fatalf("drainSpaceReleases: %v", err)
 	}
 	for _, d := range first {
@@ -2791,9 +2792,9 @@ func TestReplacedWhileParkingKeepsTheRecordWhenTheWriteDies(t *testing.T) {
 	}
 }
 
-func mustPending(t *testing.T, mem *inmem.MemStore) []registry.PendingRelease {
+func mustPending(t *testing.T, mem *testStore) []registry.PendingRelease {
 	t.Helper()
-	pending, err := mem.ListReleasesBySpace(context.Background(), did.Undef)
+	pending, err := mem.ListReleasesBySpace(context.Background(), mem.bk())
 	if err != nil {
 		t.Fatalf("ListReleasesBySpace: %v", err)
 	}

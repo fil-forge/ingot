@@ -76,7 +76,7 @@ func liveRoot(t *testing.T, s string) cid.Cid {
 	return cid.NewCidV1(cid.Raw, mh)
 }
 
-func TestQueuedRegistrationLands_Live(t *testing.T) {
+func TestQueuedRegistrationLands(t *testing.T) {
 	reg := &recordingRegistrar{}
 	f := newQueueFixture(t, reg, 1)
 	root := liveRoot(t, "a")
@@ -89,7 +89,7 @@ func TestQueuedRegistrationLands_Live(t *testing.T) {
 
 // A refused change is retried until the upload service takes it, and holds
 // back the changes behind it, so a retraction never overtakes its addition.
-func TestRefusedAddIsRetriedAndHoldsBackTheRemove_Live(t *testing.T) {
+func TestRefusedAddIsRetriedAndHoldsBackTheRemove(t *testing.T) {
 	reg := &failingRegistrar{}
 	reg.refuse("add", true)
 	f := newQueueFixture(t, reg, 1)
@@ -111,7 +111,7 @@ func TestRefusedAddIsRetriedAndHoldsBackTheRemove_Live(t *testing.T) {
 
 // Consecutive changes of one op go out in one round trip, and the space's
 // order holds between them.
-func TestChangesBatchByOpInCommitOrder_Live(t *testing.T) {
+func TestChangesBatchByOpInCommitOrder(t *testing.T) {
 	reg := &recordingRegistrar{}
 	f := newQueueFixture(t, reg, 0)
 	a, b, c := liveRoot(t, "a"), liveRoot(t, "b"), liveRoot(t, "c")
@@ -131,7 +131,7 @@ func TestChangesBatchByOpInCommitOrder_Live(t *testing.T) {
 // A change whose authority is spent, with nothing in the space to renew it
 // from, fails for good after its attempts, and stops holding back the changes
 // behind it.
-func TestSpentAuthorityFailsAfterItsAttempts_Live(t *testing.T) {
+func TestSpentAuthorityFailsAfterItsAttempts(t *testing.T) {
 	reg := &recordingRegistrar{}
 	reg.spendAuthority()
 	f := newQueueFixture(t, reg, 1)
@@ -159,7 +159,7 @@ func TestSpentAuthorityFailsAfterItsAttempts_Live(t *testing.T) {
 
 // A change whose stored chain has expired goes out on authority renewed from
 // the space, once the space has some to lend.
-func TestRenewedAuthorityRescuesAQueuedChange_Live(t *testing.T) {
+func TestRenewedAuthorityRescuesAQueuedChange(t *testing.T) {
 	reg := &renewingRegistrar{}
 	reg.spent = true
 	// Slow enough that the change is still retrying when the space recovers.
@@ -184,7 +184,7 @@ func TestRenewedAuthorityRescuesAQueuedChange_Live(t *testing.T) {
 }
 
 // A bucket delete sends its space's queued changes before the space goes.
-func TestDrainSendsTheSpacesQueuedChanges_Live(t *testing.T) {
+func TestDrainSendsTheSpacesQueuedChanges(t *testing.T) {
 	reg := &recordingRegistrar{}
 	f := newQueueFixture(t, reg, 0)
 	root := liveRoot(t, "a")
@@ -197,7 +197,7 @@ func TestDrainSendsTheSpacesQueuedChanges_Live(t *testing.T) {
 
 // A delete whose space's changes the upload service will not take fails, for
 // the client to retry, rather than leaving the objects counted.
-func TestDrainFailsWhenTheServiceRefuses_Live(t *testing.T) {
+func TestDrainFailsWhenTheServiceRefuses(t *testing.T) {
 	reg := &failingRegistrar{}
 	reg.refuse("remove", true)
 	f := newQueueFixture(t, reg, 0)
@@ -210,7 +210,7 @@ func TestDrainFailsWhenTheServiceRefuses_Live(t *testing.T) {
 
 // A retraction that failed for good is resent with the delete request's own
 // authority, since nothing will ever send it after the bucket is gone.
-func TestDrainResendsAFailedRetraction_Live(t *testing.T) {
+func TestDrainResendsAFailedRetraction(t *testing.T) {
 	reg := &recordingRegistrar{}
 	reg.spendAuthority()
 	f := newQueueFixture(t, reg, 1)
@@ -233,7 +233,7 @@ func TestDrainResendsAFailedRetraction_Live(t *testing.T) {
 
 // A delete's drain finds every failed retraction, however many failed
 // additions are listed ahead of it.
-func TestDrainResendsARetractionBehindFailedAdditions_Live(t *testing.T) {
+func TestDrainResendsARetractionBehindFailedAdditions(t *testing.T) {
 	reg := &recordingRegistrar{}
 	reg.spendAuthority()
 	f := newQueueFixture(t, reg, 1, func(b *Backend) { b.failedPage = 2 })
@@ -292,7 +292,7 @@ func (r *proofCheckingRegistrar) RegisterUploads(_ context.Context, changes []up
 
 // A change whose authority was renewed for a send that failed keeps the
 // renewal for its retry, rather than the spent chain it was queued with.
-func TestRenewedAuthorityIsKeptForTheRetry_Live(t *testing.T) {
+func TestRenewedAuthorityIsKeptForTheRetry(t *testing.T) {
 	for _, unreachable := range []bool{false, true} {
 		t.Run(map[bool]string{false: "refused", true: "unreachable"}[unreachable], func(t *testing.T) {
 			reg := &proofCheckingRegistrar{unreachable: unreachable}
@@ -310,7 +310,7 @@ func TestRenewedAuthorityIsKeptForTheRetry_Live(t *testing.T) {
 
 // A resent retraction the upload service refuses fails the delete, for the
 // client to retry, rather than letting the bucket go with the root counted.
-func TestDrainFailsWhenAResentRetractionIsRefused_Live(t *testing.T) {
+func TestDrainFailsWhenAResentRetractionIsRefused(t *testing.T) {
 	reg := &failingRegistrar{}
 	reg.spendAuthority()
 	f := newQueueFixture(t, reg, 1)

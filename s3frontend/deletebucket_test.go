@@ -16,8 +16,8 @@ import (
 
 	"github.com/fil-forge/ingot/blockstore"
 	"github.com/fil-forge/ingot/bucketauthority"
-	"github.com/fil-forge/ingot/inmem"
 	"github.com/fil-forge/ingot/internal/reqscope"
+	"github.com/fil-forge/ingot/internal/testfakes"
 	"github.com/fil-forge/ingot/registry"
 )
 
@@ -108,14 +108,14 @@ func TestDeleteBucket_RefusalLeavesBucketReadable(t *testing.T) {
 		auth *refusingAuthority
 		rm   *catalogRemover
 	)
-	b, mem := newDeferredBackend(t, inmem.NopUploader{}, func(d *Deps) {
+	b, mem := newDeferredBackend(t, testfakes.NopUploader{}, func(d *Deps) {
 		log = &releasableLog{
 			Log:     d.Log,
 			segment: digestOf(t, []byte("catalog segment")),
 			retired: digestOf(t, []byte("retired catalog segment")),
 		}
 		d.Log = log
-		d.Reads = blockstore.NewLayered(blockstore.LocalBlobs{Cache: d.Cache, Spool: d.Spool}, log, inmem.NopBaseReader{})
+		d.Reads = blockstore.NewLayered(blockstore.LocalBlobs{Cache: d.Cache, Spool: d.Spool}, log, testfakes.NopBaseReader{})
 		auth = &refusingAuthority{BucketAuthority: d.Authority}
 		d.Authority = auth
 		rm = &catalogRemover{log: log, reg: d.Registry}

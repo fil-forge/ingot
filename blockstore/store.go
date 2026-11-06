@@ -60,8 +60,8 @@ import (
 // owning bucket's space DID), because the bottom read tier is the network:
 // blob locations are keyed by space and retrieval is authorized per space.
 // Local tiers (spool, log, staging) are content-addressed and ignore it;
-// did.Undef is acceptable where no network fallthrough can occur (harness,
-// standalone reads served locally).
+// did.Undef is acceptable where no network fallthrough can occur, such as a
+// read a test knows is served locally.
 type Reader interface {
 	Get(ctx context.Context, space did.DID, c cid.Cid, out any) error
 }

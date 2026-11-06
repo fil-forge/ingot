@@ -19,7 +19,6 @@ import (
 	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
 
-	"github.com/fil-forge/ingot/inmem"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/uploader"
 )
@@ -140,10 +139,10 @@ func drainUntilIdle(t *testing.T, b *Backend, uploadID string) {
 
 // assertGone checks that nothing records d any more: no location a later
 // write could reuse, no park, no intent.
-func assertGone(t *testing.T, mem *inmem.MemStore, d multihash.Multihash) {
+func assertGone(t *testing.T, mem *testStore, d multihash.Multihash) {
 	t.Helper()
 	ctx := context.Background()
-	if loc, err := mem.GetLocation(ctx, did.Undef, d); !errors.Is(err, registry.ErrNotFound) {
+	if loc, err := mem.GetLocation(ctx, mem.bk(), d); !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("blob %s has a location after its release: %+v (err=%v)", d, loc, err)
 	}
 	if _, err := mem.ParkByDigest(ctx, d); !errors.Is(err, registry.ErrNotFound) {
@@ -301,7 +300,7 @@ func TestAcceptorsShareAPark(t *testing.T) {
 	d := hygienePartDigests(t, mem, uploadID, 1)[0]
 
 	const other = "other-sharing"
-	if err := mem.CreateSession(ctx, registry.MultipartSession{UploadID: other, Bucket: "bk", ObjectKey: "other"}); err != nil {
+	if err := mem.CreateSession(ctx, registry.MultipartSession{UploadID: other, Bucket: "bk", Space: mem.bk(), ObjectKey: "other"}); err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
 	if _, err := mem.PutPart(ctx, registry.MultipartPart{UploadID: other, PartNumber: 1, ETagMD5: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{d}, SpanLengths: []int64{1}, State: registry.PartParked}, nil); err != nil {
@@ -349,10 +348,10 @@ func TestAcceptorLeavesAReplacementPark(t *testing.T) {
 	}
 	replacement := cid.NewCidV1(cid.Raw, h)
 	pc.after = func() {
-		if err := mem.DeletePark(ctx, did.Undef, d); err != nil {
+		if err := mem.DeletePark(ctx, mem.bk(), d); err != nil {
 			t.Errorf("DeletePark: %v", err)
 		}
-		if ok, err := mem.PutPark(ctx, registry.BlobPark{Space: did.Undef, Digest: d, AddTask: replacement.Bytes(), AcceptTask: replacement.Bytes(), PutInvocation: []byte{1}, Size: 1}); err != nil || !ok {
+		if ok, err := mem.PutPark(ctx, registry.BlobPark{Space: mem.bk(), Digest: d, AddTask: replacement.Bytes(), AcceptTask: replacement.Bytes(), PutInvocation: []byte{1}, Size: 1}); err != nil || !ok {
 			t.Errorf("PutPark (replacement) = %v, %v", ok, err)
 		}
 	}
@@ -382,7 +381,7 @@ func TestAcceptorLeavesAReleasingBlobForComplete(t *testing.T) {
 	uploadID := mpCreate(t, b, key, "", "")
 	parts := uploadDistinctParts(t, b, key, uploadID, 1)
 	d := hygienePartDigests(t, mem, uploadID, 1)[0]
-	if err := mem.EnqueueRelease(ctx, did.Undef, d, time.Now().Add(time.Hour)); err != nil {
+	if err := mem.EnqueueRelease(ctx, mem.bk(), d, time.Now().Add(time.Hour)); err != nil {
 		t.Fatalf("EnqueueRelease: %v", err)
 	}
 
@@ -390,7 +389,7 @@ func TestAcceptorLeavesAReleasingBlobForComplete(t *testing.T) {
 	if err := b.drainAcceptor(ctx, uploadID); err != nil {
 		t.Fatalf("drainAcceptor: %v", err)
 	}
-	if got, err := mem.ReleasingDigests(ctx, did.Undef, []multihash.Multihash{d}); err != nil || !got[string(d)] {
+	if got, err := mem.ReleasingDigests(ctx, mem.bk(), []multihash.Multihash{d}); err != nil || !got[string(d)] {
 		t.Fatalf("release record after the acceptor's pass = %v, %v; want it kept", got, err)
 	}
 	if states := partStates(t, mem, uploadID); states[1] != registry.PartSpooled {
@@ -448,7 +447,7 @@ func TestAcceptorRacesASupersedesRelease(t *testing.T) {
 	if stillRegistered {
 		t.Fatalf("superseded blob %s left registered with nothing to remove it", old)
 	}
-	if got, _ := mem.ReleasingDigests(ctx, did.Undef, []multihash.Multihash{old}); got[string(old)] {
+	if got, _ := mem.ReleasingDigests(ctx, mem.bk(), []multihash.Multihash{old}); got[string(old)] {
 		t.Fatalf("release record for %s left behind", old)
 	}
 }
@@ -578,7 +577,7 @@ func TestAcceptorKeepsAParkThatReplacesALocation(t *testing.T) {
 	uploadDistinctParts(t, b, key, uploadID, 1)
 	d := hygienePartDigests(t, mem, uploadID, 1)[0]
 	// Another conclude recorded the blob, its park left beside the location.
-	if err := mem.PutLocation(ctx, registry.BlobLocation{Space: did.Undef, Digest: d, Provider: "did:key:zNode", URL: "https://node.example/blob", Size: 1}); err != nil {
+	if err := mem.PutLocation(ctx, registry.BlobLocation{Space: mem.bk(), Digest: d, Provider: "did:key:zNode", URL: "https://node.example/blob", Size: 1}); err != nil {
 		t.Fatalf("PutLocation: %v", err)
 	}
 	h, err := multihash.Sum([]byte("replacing allocation"), multihash.SHA2_256, -1)
@@ -589,9 +588,9 @@ func TestAcceptorKeepsAParkThatReplacesALocation(t *testing.T) {
 	locs.mu.Lock()
 	locs.digest = d
 	locs.hook = func() {
-		_ = mem.DeleteLocation(ctx, did.Undef, d)
-		_ = mem.DeletePark(ctx, did.Undef, d)
-		if ok, err := mem.PutPark(ctx, registry.BlobPark{Space: did.Undef, Digest: d, AddTask: replacement.Bytes(), AcceptTask: replacement.Bytes(), PutInvocation: []byte{1}, Size: 1}); err != nil || !ok {
+		_ = mem.DeleteLocation(ctx, mem.bk(), d)
+		_ = mem.DeletePark(ctx, mem.bk(), d)
+		if ok, err := mem.PutPark(ctx, registry.BlobPark{Space: mem.bk(), Digest: d, AddTask: replacement.Bytes(), AcceptTask: replacement.Bytes(), PutInvocation: []byte{1}, Size: 1}); err != nil || !ok {
 			t.Errorf("PutPark (replacement) = %v, %v", ok, err)
 		}
 	}
@@ -601,7 +600,7 @@ func TestAcceptorKeepsAParkThatReplacesALocation(t *testing.T) {
 	if err := b.drainAcceptor(ctx, uploadID); err != nil {
 		t.Fatalf("drainAcceptor: %v", err)
 	}
-	park, err := mem.GetPark(ctx, did.Undef, d)
+	park, err := mem.GetPark(ctx, mem.bk(), d)
 	if err != nil {
 		t.Fatalf("replacement park dropped by a stale located path: %v", err)
 	}
@@ -697,7 +696,7 @@ func TestFailedConcludeHoldsItsBlobsReleases(t *testing.T) {
 	if err := b.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{Bucket: &bucket, Key: &key, UploadId: &uploadID}); err != nil {
 		t.Fatalf("Abort: %v", err)
 	}
-	if got, _ := mem.ReleasingDigests(ctx, did.Undef, []multihash.Multihash{d}); !got[string(d)] {
+	if got, _ := mem.ReleasingDigests(ctx, mem.bk(), []multihash.Multihash{d}); !got[string(d)] {
 		t.Fatal("the release ran while the failed conclude's blob was still held")
 	}
 
