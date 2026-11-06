@@ -97,8 +97,10 @@ func UploadRegistrationFromTask(t taskrunner.Task) (UploadRegistration, error) {
 	}, nil
 }
 
-// TaskSubmitter adds tasks inside a caller's transaction. *taskrunner.Runner
-// satisfies it.
+// TaskSubmitter adds and cancels tasks inside a caller's transaction.
+// *taskrunner.Runner satisfies it.
 type TaskSubmitter interface {
 	SubmitTx(ctx context.Context, tx pgx.Tx, s taskrunner.Spec) (taskrunner.TaskID, error)
+	SubmitAllTx(ctx context.Context, tx pgx.Tx, specs []taskrunner.Spec) ([]taskrunner.TaskID, error)
+	CancelPendingTx(ctx context.Context, tx pgx.Tx, queueName string, subjects []string, action string) (int, []string, error)
 }

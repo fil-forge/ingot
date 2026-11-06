@@ -69,22 +69,22 @@ func TestUpload_IdenticalContentUploadsDistinctBlobs(t *testing.T) {
 
 	up := &countingUploader{calls: map[string]int{}}
 	b := New(Deps{
-		Authority:       mem,
-		Registry:        mem,
-		Intents:         mem,
-		Locations:       mem,
-		GC:              mem,
-		Reads:           blockstore.NewLayered(blockstore.LocalBlobs{Cache: cache, Spool: spool}, log, testfakes.NopBaseReader{}),
-		Log:             log,
-		Spool:           spool,
-		Cache:           cache,
-		Uploader:        up,
-		Remover:         &recordingRemover{},
-		PendingReleases: mem,
-		Registrar:       testfakes.NopUploader{},
-		EncParams:       mem,
-		RegionKeys:      testRegionKeys(t),
-		TenantKeys:      testTenantKeys(),
+		Authority:  mem,
+		Registry:   mem,
+		Intents:    mem,
+		Locations:  mem,
+		GC:         mem,
+		Reads:      blockstore.NewLayered(blockstore.LocalBlobs{Cache: cache, Spool: spool}, log, testfakes.NopBaseReader{}),
+		Log:        log,
+		Spool:      spool,
+		Cache:      cache,
+		Uploader:   up,
+		Remover:    &recordingRemover{},
+		Claims:     mem,
+		Registrar:  testfakes.NopUploader{},
+		EncParams:  mem,
+		RegionKeys: testRegionKeys(t),
+		TenantKeys: testTenantKeys(),
 	})
 	mem.start(t, b)
 	if err := mem.Create(ctx, "bk", testutil.RandomDID(t), registry.CreateState{}); err != nil {

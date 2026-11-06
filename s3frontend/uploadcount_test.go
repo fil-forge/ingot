@@ -118,7 +118,7 @@ func (r *recordingRegistrar) count() int {
 // path, so every assertion below drains first.
 func drainRegistrations(t *testing.T, b *Backend) {
 	t.Helper()
-	b.reg.(*testStore).drainUploads(t)
+	storeFor(b).drainUploads(t)
 }
 
 // newCountingBackend mirrors newRefTestBackend but swaps the no-op registrar
@@ -149,25 +149,25 @@ func newCountingBackend(t *testing.T) (*Backend, *recordingRegistrar) {
 
 	reg := &recordingRegistrar{}
 	b := New(Deps{
-		Authority:       mem,
-		Registry:        mem,
-		Intents:         mem,
-		Locations:       mem,
-		GC:              mem,
-		Multipart:       mem,
-		Parks:           mem,
-		Reads:           blockstore.NewLayered(blockstore.LocalBlobs{Cache: cache, Spool: spool}, log, testfakes.NopBaseReader{}),
-		Log:             log,
-		Spool:           spool,
-		Cache:           cache,
-		Uploader:        testfakes.NopUploader{},
-		Deferred:        testfakes.NopUploader{},
-		Remover:         &recordingRemover{},
-		Registrar:       reg,
-		EncParams:       mem,
-		RegionKeys:      testRegionKeys(t),
-		TenantKeys:      testTenantKeys(),
-		PendingReleases: mem,
+		Authority:  mem,
+		Registry:   mem,
+		Intents:    mem,
+		Locations:  mem,
+		GC:         mem,
+		Multipart:  mem,
+		Parks:      mem,
+		Reads:      blockstore.NewLayered(blockstore.LocalBlobs{Cache: cache, Spool: spool}, log, testfakes.NopBaseReader{}),
+		Log:        log,
+		Spool:      spool,
+		Cache:      cache,
+		Uploader:   testfakes.NopUploader{},
+		Deferred:   testfakes.NopUploader{},
+		Remover:    &recordingRemover{},
+		Registrar:  reg,
+		EncParams:  mem,
+		RegionKeys: testRegionKeys(t),
+		TenantKeys: testTenantKeys(),
+		Claims:     mem,
 	})
 	mem.start(t, b)
 	if err := mem.Create(ctx, "bk", did.Undef, registry.CreateState{}); err != nil {

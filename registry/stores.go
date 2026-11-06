@@ -313,125 +313,11 @@ type BlobRefStore interface {
 	// CountClaims returns how many object versions in space still reference
 	// digest. Zero means the space's claim may be released.
 	CountClaims(ctx context.Context, space did.DID, digest multihash.Multihash) (int, error)
-}
-
-// PendingRelease is one deferred blob release: executed by the release
-// sweeper once not_before passes and the digest still has zero claims.
-type PendingRelease struct {
-	Space     did.DID
-	Digest    multihash.Multihash
-	NotBefore time.Time
-	// StartedAt is when a release took the record (StartRelease): the blob
-	// is being removed from its provider, or was and a later step failed.
-	// Zero until then.
-	StartedAt time.Time
-}
-
-// ReleaseStart is StartRelease's answer: whether the release may go ahead,
-// and if not, why.
-type ReleaseStart int
-
-const (
-	// ReleaseStarted: the record is marked started and the blob is this
-	// release's to remove.
-	ReleaseStarted ReleaseStart = iota
-	// ReleaseCancelled: no record; a write reusing the blob cancelled it.
-	ReleaseCancelled
-	// ReleaseClaimed: an object version claims the blob again; the record
-	// is stale.
-	ReleaseClaimed
-	// ReleaseReferenced: a part of one of the space's in-flight multipart
-	// sessions names the blob; the release waits.
-	ReleaseReferenced
-)
-
-// ReleaseCancel is CancelRelease's answer.
-type ReleaseCancel int
-
-const (
-	// ReleaseNone: no record; the blob is not being released.
-	ReleaseNone ReleaseCancel = iota
-	// ReleaseCancelledByWrite: the record was pending and is now deleted;
-	// the blob is the caller's to reuse.
-	ReleaseCancelledByWrite
-	// ReleaseInProgress: the record is started; the blob is going, and the
-	// caller waits for the record to disappear and uploads afresh.
-	ReleaseInProgress
-)
-
-// PendingReleaseStore is the deferred-release queue (blob_release_intents):
-// the durable record between "last claim dropped" and "release executed"
-// (crypto-shred + location delete + network remove). Enqueue upserts,
-// keeping the later not_before.
-type PendingReleaseStore interface {
-	// EnqueueRelease records that (space, digest) is to be released once
-	// notBefore has passed. Upsert: an existing record keeps the later of the
-	// two not_before values.
-	EnqueueRelease(ctx context.Context, space did.DID, digest multihash.Multihash, notBefore time.Time) error
-	// EnqueueReleases is EnqueueRelease for many digests in one statement,
-	// for a session teardown with a blob per part. Repeated digests are
-	// recorded once. Returns the records as they stand afterwards: a digest
-	// that already had a record keeps its later not_before, so the caller
-	// can tell which releases are due now.
-	EnqueueReleases(ctx context.Context, space did.DID, digests []multihash.Multihash, notBefore time.Time) ([]PendingRelease, error)
-	// ListDueReleases returns intents with not_before <= now, oldest first,
-	// at most limit. Started records are listed too: a release that failed
-	// after starting is retried.
-	ListDueReleases(ctx context.Context, now time.Time, limit int) ([]PendingRelease, error)
-	// StartRelease decides, under the (space, digest) claim-key lock, whether
-	// the record's release may go ahead, and marks it started if so. The
-	// checks run in this order on purpose: a Complete adds its claims while
-	// its session is still in flight and only then marks it completed, so a
-	// release that read the claims first could see none, lose the race to
-	// the commit, and then find no live session either; reading the live
-	// part references first closes that window. A record already started
-	// (a retry) starts again without the checks: the release has owned the
-	// blob since it started, no claim can land meanwhile (AddBlobClaim), and
-	// a part recorded since belongs to a write waiting for it to finish. A
-	// record found claimed is stale and is deleted here, under the lock: a
-	// caller deleting it afterwards by key could take a replacement that a
-	// later drop of that claim enqueued in between.
-	// The lock excludes CancelRelease, so a write reusing the blob either
-	// cancels the record before this, and this finds none, or finds it
-	// started and waits.
-	StartRelease(ctx context.Context, space did.DID, digest multihash.Multihash) (ReleaseStart, error)
-	// CancelRelease is a write's side of StartRelease: under the same lock,
-	// it deletes a record not yet started, so the blob is the write's to
-	// reuse, or reports one that is started, which the write waits out, or
-	// none.
-	CancelRelease(ctx context.Context, space did.DID, digest multihash.Multihash) (ReleaseCancel, error)
-	// GetRelease returns the record for (space, digest) as it stands, or
-	// ErrNotFound, read under the claim-key lock and changing nothing: for
-	// a part write that leaves a pending record to its part row (which
-	// defers the record, StartRelease) and waits out a started one, where
-	// CancelRelease is for a write that takes the blob over. The lock
-	// serialises the read with StartRelease, so a record reported pending
-	// is not one a start is about to commit: the start that follows reads
-	// the write's part row and defers.
-	GetRelease(ctx context.Context, space did.DID, digest multihash.Multihash) (*PendingRelease, error)
-	// ReleasingDigests returns which of digests have a release record in
-	// space, started or not, keyed by string(digest). It reads and changes
-	// nothing else: for a caller that must leave a blob with a pending
-	// release alone, where CancelRelease is for a write that takes it over.
-	ReleasingDigests(ctx context.Context, space did.DID, digests []multihash.Multihash) (map[string]bool, error)
-	// ListReleasesBySpace returns every intent for space regardless of
-	// not_before — DeleteBucket executes a space's releases immediately (the
-	// bucket is empty and its deletion is explicit, so no reader grace is
-	// owed) before asking hilt to delete the space.
-	ListReleasesBySpace(ctx context.Context, space did.DID) ([]PendingRelease, error)
-	DeleteRelease(ctx context.Context, space did.DID, digest multihash.Multihash) error
-	// DeleteIntentAndRelease removes the space's upload intent for the blob
-	// and this release's record in one transaction — the last step of
-	// releasing a blob — and returns how many intents for the digest other
-	// spaces still hold, counted under a lock on the digest, so of two
-	// spaces releasing the same digest at once exactly one counts none and
-	// removes the shared file. The two deletes must go together: the intent
-	// is the only evidence of how far the blob ever got, and a record that
-	// outlived it would leave the retry to read a blob with no rows and no
-	// intent, owing a network remove that a never-uploaded blob has no
-	// authority for and that would fail on every attempt. Both deletes are
-	// idempotent.
-	DeleteIntentAndRelease(ctx context.Context, space did.DID, digest multihash.Multihash) (int, error)
+	// QueueReleases queues the release of each of digests in space, due at
+	// notBefore and carrying release's authority, in one transaction. A
+	// digest repeated is released once, and a release already pending keeps
+	// the later time.
+	QueueReleases(ctx context.Context, space did.DID, digests []multihash.Multihash, notBefore time.Time, release ReleaseTask) error
 }
 
 // IntentStore is the local-store index (§5): the on-disk blobs Ingot holds
@@ -578,16 +464,17 @@ type MultipartStore interface {
 	// write and the state check are one statement that holds the session
 	// row, so a part cannot land after a Complete or a teardown has taken
 	// the session, and a teardown's part listing sees every part that did
-	// land. In the same transaction it records a release, due now, for each
-	// blob the replaced row named and this part does not, and returns those
-	// records for the caller to run: the replaced row and the releases of
-	// its blobs are one write, so no failure or crash can separate them.
+	// land. In the same transaction it queues a release, due now and carrying
+	// release's authority, for each blob the replaced row named and this part
+	// does not, and returns those blobs for the caller to run: the
+	// replaced row and the releases of its blobs are one write, so no failure
+	// or crash can separate them.
 	// Writes of one part number are serialised, so the replaced row is
 	// exactly the one standing when this write landed, which a listing
 	// taken before the write may not have seen: a concurrent write of the
 	// same part number lands in between, and only its replacer learns of
 	// it.
-	PutPart(ctx context.Context, p MultipartPart, tree *PartTree) (released []PendingRelease, err error)
+	PutPart(ctx context.Context, p MultipartPart, tree *PartTree, release ReleaseTask) (released []multihash.Multihash, err error)
 	// MoveParts moves each of parts (as the caller read them) from state
 	// from to state to, and returns how many moved. A part is skipped when
 	// its row is no longer in from or no longer names the BlobDigests it
@@ -637,7 +524,7 @@ type MultipartStore interface {
 	// checks before taking a blob a session still means to claim. Parts of
 	// completed and aborting sessions do not count — a completed session's
 	// winners hold claims and its orphans have releases of their own, and an
-	// aborting session is recording releases for its parts. Another space's
+	// aborting session is queueing releases for its parts. Another space's
 	// sessions do not count either: a release is one space's, and the same
 	// bytes in another space are that space's own blob.
 	CountLivePartRefs(ctx context.Context, space did.DID, digest multihash.Multihash) (int, error)

@@ -82,10 +82,14 @@ func (f *shardFixture) read(t *testing.T, d multihash.Multihash) {
 // tasks counts the digest's queue-shard tasks of action in state.
 func (f *shardFixture) tasks(t *testing.T, d multihash.Multihash, action, state string) int {
 	t.Helper()
-	var n int
-	require.NoError(t, f.env.DB.QueryRow(t.Context(),
-		`SELECT count(*) FROM `+f.env.Table("queue_shard_tasks")+` WHERE subject = $1 AND action = $2 AND state = $3`,
-		hex.EncodeToString(d), action, state).Scan(&n))
+	queued, err := taskrunnertest.Tasks(t.Context(), f.env.DB, f.env.Schema, ShardQueue)
+	require.NoError(t, err)
+	n := 0
+	for _, q := range queued {
+		if q.Subject == hex.EncodeToString(d) && q.Action == action && q.State == state {
+			n++
+		}
+	}
 	return n
 }
 
@@ -101,11 +105,11 @@ func TestHeldBlobIsCachedUntilItsTTL(t *testing.T) {
 	require.Eventually(t, func() bool { return f.tasks(t, d, shardEvict, "succeeded") == 1 }, 5*time.Second, 10*time.Millisecond)
 
 	// Both tasks were placed on this instance, whose disk holds the file.
-	var unplaced int
-	require.NoError(t, f.env.DB.QueryRow(t.Context(),
-		`SELECT count(*) FROM `+f.env.Table("queue_shard_tasks")+` WHERE node IS DISTINCT FROM $1`,
-		"did:web:ingot.test").Scan(&unplaced))
-	require.Zero(t, unplaced)
+	queued, err := taskrunnertest.Tasks(t.Context(), f.env.DB, f.env.Schema, ShardQueue)
+	require.NoError(t, err)
+	for _, q := range queued {
+		require.True(t, q.Node != nil && *q.Node == "did:web:ingot.test", "task %s.%s placed on %v", q.Subject, q.Action, q.Node)
+	}
 }
 
 // A held blob moves into the cache even when the request that held it has
