@@ -73,8 +73,18 @@ ALTER TABLE ingot.multipart_sessions
 -- upload gets in while its uploads are aborted.
 ALTER TABLE ingot.buckets ADD COLUMN closing boolean NOT NULL DEFAULT false;
 
+-- Indexes no query reads: every lookup of a blob's location names its space,
+-- no bucket is found by its space, and a segment's op-roots are read by the
+-- segment.
+DROP INDEX ingot.blob_locations_digest_idx;
+DROP INDEX ingot.buckets_space_idx;
+DROP INDEX ingot.segment_op_roots_bucket_seq_idx;
+
 -- +goose Down
 -- In reverse order of the Up statements.
+CREATE INDEX segment_op_roots_bucket_seq_idx ON ingot.segment_op_roots (bucket, seq);
+CREATE INDEX buckets_space_idx ON ingot.buckets (space);
+CREATE INDEX blob_locations_digest_idx ON ingot.blob_locations (digest);
 ALTER TABLE ingot.buckets DROP COLUMN closing;
 ALTER TABLE ingot.multipart_sessions
     DROP CONSTRAINT multipart_sessions_state_check,
