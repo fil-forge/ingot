@@ -141,7 +141,9 @@ Internal:
   tables are migrated in the migration hook, and `Server` starts and stops
   it. Queues so far: `queue-space-upload` (`s3frontend/uploadqueue.go`), the
   object-count changes a commit queues in its own transaction
-  (`registry.WithTasks`). Live tests need `INGOT_TEST_DSN`; each uses its own
+  (`registry.WithTasks`); `queue-shard` (`s3frontend/shardqueue.go`), a
+  cached blob's move into the cache and its eviction at `CacheTTL`, renewed
+  by reads. Live tests need `INGOT_TEST_DSN`; each uses its own
   schema and truncates nothing.
 - **`uploader/`** — `forge.go`/`blob.go`: `Forge` behind `Uploader`
   (`SubmitShard`), `BodyUploader`/`DeferredBodyUploader` (`UploadBlob`,
@@ -276,7 +278,8 @@ validated at startup down to holding at least one delegation),
 `TokenStoreDir` (→
 `DataDir`), `MultipartSessionTTL` (0 → 7d, negative → sweeper off),
 `LocalBlobMaxBytes` (0 → no budget for the spool and cache together) with
-`CacheMinResidency` (10m), `CacheReadRetention` (1h) and
+`CacheTTL` (1h: how long a body stays cached after it was cached or last
+read) and
 `LocalBlobOrphanAge` (24h, ≥ 1h) for the local blob sweeper
 (`s3frontend.SweepLocalBlobs`), `CacheWrites` (unset → true; false drops
 each body's local copy once accepted),

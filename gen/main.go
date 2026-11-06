@@ -9,6 +9,7 @@ package main
 import (
 	"github.com/fil-forge/ingot/bucket"
 	"github.com/fil-forge/ingot/registry"
+	"github.com/fil-forge/ingot/s3frontend"
 	cbg "github.com/whyrusleeping/cbor-gen"
 )
 
@@ -32,6 +33,12 @@ func main() {
 	}
 	if err := cfg.WriteMapEncodersToFile("../registry/cbor_gen.go", "registry",
 		registry.UploadTask{},
+	); err != nil {
+		panic(err)
+	}
+	if err := cfg.WriteMapEncodersToFile("../s3frontend/cbor_gen.go", "s3frontend",
+		s3frontend.ShardCacheTask{},
+		s3frontend.ShardEvictTask{},
 	); err != nil {
 		panic(err)
 	}

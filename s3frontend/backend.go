@@ -77,6 +77,14 @@ type Backend struct {
 	// tasks runs the queue-space-upload tasks (RegisterUploadTasks); nil
 	// with an in-memory registry, which queues none.
 	tasks *taskrunner.Runner
+	// shards runs the queue-shard tasks that keep the cache's copies
+	// (RegisterShardTasks); nil with no task queues, when a held blob moves
+	// into the cache directly and stays until the budget pass evicts it.
+	// renewals is when this process last renewed each cached blob's time in
+	// the cache, and cacheTTL how long a renewal lasts.
+	shards   *taskrunner.Runner
+	renewals *recencyMap
+	cacheTTL time.Duration
 	// uploadRetry is the queue-space-upload retry policy, and drainTimeout
 	// how long a bucket delete waits for its space's changes; tests shorten
 	// both.
@@ -101,8 +109,6 @@ type Backend struct {
 	// localBlobSweepBatch overrides the rows a pass reads per query, for
 	// tests; zero takes the default.
 	localBlobMaxBytes  int64
-	cacheMinResidency  time.Duration
-	cacheReadRetention time.Duration
 	localBlobOrphanAge time.Duration
 	dropAcceptedBodies bool
 	localBlobSweepMu   sync.Mutex
@@ -121,16 +127,12 @@ type Backend struct {
 	lastOrphanPass      time.Time
 	localBlobSweepBatch int
 	// overBudgetWarned and timeLimitLogged are set once the sweeper has
-	// logged that usage is over budget with nothing left to evict, or that an
-	// eviction pass (budget or forced, whichever ran out first) ran out of
-	// time, and cleared when usage falls back to the low watermark, so each
-	// message comes once per episode. lastForcedWarn is when the forced pass
-	// last warned that it evicted inside the retention windows; a forced pass
-	// usually brings usage back under budget, so that warning is limited by
-	// time instead. Guarded by localBlobSweepMu.
+	// logged that usage is over budget with nothing left to evict, or that the
+	// budget pass ran out of time, and cleared when usage falls back to the
+	// low watermark, so each message comes once per episode. Guarded by
+	// localBlobSweepMu.
 	overBudgetWarned bool
 	timeLimitLogged  bool
-	lastForcedWarn   time.Time
 	// stalledSpooled and stalledUploading are the sweeper's latest sums of
 	// stalled uploads by intent state (see SweepLocalBlobs), read by the
 	// stalled_bytes gauge; stalledKnown is set once a sweep has computed them.
@@ -257,19 +259,14 @@ type Deps struct {
 
 	// LocalBlobMaxBytes is the byte budget for the spool and the cache
 	// together, writes in progress included, enforced by SweepLocalBlobs.
-	// Zero turns the budget and forced passes off: eviction needs a network
-	// read tier to serve evicted blobs, which the in-memory fakes do not
-	// have.
+	// Zero turns the budget pass off: eviction needs a network read tier to
+	// serve evicted blobs, which the in-memory fakes do not have.
 	LocalBlobMaxBytes int64
-	// CacheMinResidency is how long after its last state change (for a
-	// committed blob, its commit) the budget pass leaves a blob alone, so a
-	// client reading back what it just wrote reads from local disk. Zero
-	// turns it off.
-	CacheMinResidency time.Duration
-	// CacheReadRetention is how long after a read from the cache the budget
-	// pass leaves a blob alone, so objects read repeatedly stay local. Zero
-	// turns it off.
-	CacheReadRetention time.Duration
+	// CacheTTL is how long a blob stays in the cache after it was cached or
+	// last read, unless the budget pass evicts it first. Zero →
+	// DefaultCacheTTL. It takes effect only with the task queues
+	// (RegisterShardTasks).
+	CacheTTL time.Duration
 	// LocalBlobOrphanAge is the age at which SweepLocalBlobs deletes a .tmp-*
 	// file in either directory, or a spool blob file with no intent row. Zero →
 	// DefaultLocalBlobOrphanAge.
@@ -369,8 +366,8 @@ func New(d Deps) *Backend {
 		releaseGrace:    d.ReleaseGrace,
 
 		localBlobMaxBytes:  d.LocalBlobMaxBytes,
-		cacheMinResidency:  d.CacheMinResidency,
-		cacheReadRetention: d.CacheReadRetention,
+		cacheTTL:           cmp.Or(d.CacheTTL, DefaultCacheTTL),
+		renewals:           newRecencyMap(renewalCapacity),
 		localBlobOrphanAge: localBlobOrphanAge,
 		dropAcceptedBodies: d.DropAcceptedBodies,
 
