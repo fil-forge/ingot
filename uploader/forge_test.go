@@ -158,6 +158,7 @@ func TestForgeShipProofsSkipRevoked(t *testing.T) {
 	shard := CARShard{Size: 1, Positions: map[cid.Cid]blockstore.BlockLoc{cid.Undef: {}}}
 	_, _, err = fg.SubmitShard(ctx, blockstore.PlaneCatalog, spaceB.DID(), shard)
 	require.ErrorContains(t, err, "no /blob/add authority")
+	require.ErrorIs(t, err, ErrNoShipAuthority, "a revoked chain is no ship authority, for good")
 }
 
 // TestForgeCommitCaptureSkipsRevoked: a revocation naming the commit
@@ -197,7 +198,7 @@ func TestForgeCommitCaptureSkipsRevoked(t *testing.T) {
 	fg.shipProofs.Delete(spaceB.DID().String())
 	shard := CARShard{Size: 1, Positions: map[cid.Cid]blockstore.BlockLoc{cid.Undef: {}}}
 	_, _, err = fg.SubmitShard(ctx, blockstore.PlaneCatalog, spaceB.DID(), shard)
-	require.ErrorContains(t, err, "no ship authority")
+	require.ErrorIs(t, err, ErrNoShipAuthority)
 }
 
 func TestForgeShipProofsRequestScopeWins(t *testing.T) {
@@ -352,5 +353,5 @@ func TestSubmitShardShipsUnderCommitCapture(t *testing.T) {
 	chainless := mustSpace(t)
 	fg.CaptureShipAuthority(borrowable(&chainStore{}), chainless)
 	_, _, err = fg.SubmitShard(ctx, blockstore.PlaneCatalog, chainless, shard)
-	require.ErrorContains(t, err, "no ship authority")
+	require.ErrorIs(t, err, ErrNoShipAuthority)
 }

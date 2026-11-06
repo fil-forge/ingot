@@ -5,6 +5,7 @@ import (
 	"context"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -31,6 +32,8 @@ func newJournalingBackend(t *testing.T) (*Backend, *testStore, *logstore.Store, 
 	cache, err := blockstore.NewBlobCache(filepath.Join(dir, "cache"))
 	require.NoError(t, err)
 	gate := make(chan struct{})
+	// The log's seals queue ships on the backend, built after it.
+	var backend atomic.Pointer[Backend]
 	log, err := logstore.Open(ctx, logstore.Config{
 		Dir:    filepath.Join(dir, "segments"),
 		Bucket: "bk",
@@ -43,6 +46,11 @@ func newJournalingBackend(t *testing.T) (*Backend, *testStore, *logstore.Store, 
 					return nil, nil
 				case <-ctx.Done():
 					return nil, ctx.Err()
+				}
+			},
+			OnSealed: func() {
+				if b := backend.Load(); b != nil {
+					b.QueueShip("bk")
 				}
 			},
 		},
@@ -78,6 +86,7 @@ func newJournalingBackend(t *testing.T) (*Backend, *testStore, *logstore.Store, 
 	withStreaming(t, &deps, dir)
 	b := New(deps)
 	mem.start(t, b)
+	backend.Store(b)
 	require.NoError(t, mem.Create(ctx, "bk", did.Undef, registry.CreateState{}))
 	return b, mem, log, release
 }

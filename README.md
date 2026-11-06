@@ -54,14 +54,15 @@ out of ordinary traversal.
 
 Writes are functional: a PUT or DELETE rewrites only the nodes on the path from
 the changed key up to the root (every other node is immutable and shared),
-producing a **new root CID**. ingot journals the changed blocks to the local
-log, then **compare-and-swaps the bucket's root in Postgres** from the old CID
-to the new one. That split is the heart of the design:
+producing a **new root CID**. Each change to a bucket runs as a task on the
+bucket's queue, one at a time: ingot journals the changed blocks to the local
+log, then **advances the bucket's root in Postgres** from the old CID to the
+new one, guarded on the old. That split is the heart of the design:
 
 - **The MST is the data** — immutable, content-addressed, self-verifying, and
   shippable to Forge exactly as it sits on disk.
 - **Postgres is the mutable index** — the authoritative *current* root per
-  bucket (the CAS keeps a bucket single-writer-correct), the segment
+  bucket (the bucket's queue keeps it single-writer), the segment
   lifecycle, and the blob claim ledger, all under the `ingot` schema.
 
 ## Bodies and catalog

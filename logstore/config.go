@@ -53,18 +53,18 @@ type PlaneConfig struct {
 
 	// Flush ships one sealed segment's CAR of this plane to Forge.
 	// Required when Ship is true; ignored otherwise. A non-nil error
-	// keeps the segment unshipped and triggers retry.
+	// keeps the segment unshipped, and fails the Ship that tried it.
 	Flush FlushFunc
+
+	// OnSealed is told when the plane has a sealed segment to ship: after
+	// each seal, and at open when recovery finds one unshipped. The ship
+	// itself runs when its owner calls Ship. Ignored when Ship is false.
+	OnSealed func()
 
 	// Retain is the number of most-recent SHIPPED CARs of this plane to
 	// keep on local disk as a read tier. Older shipped CARs are unlinked.
 	// 0 → 6. Ignored when Ship is false.
 	Retain int
-
-	// ShipRetry is how often the retry sweep tries the sealed segments
-	// still unshipped: those whose queued ship ran out of attempts, or that
-	// never fit in the queue. 0 → 1m. Ignored when Ship is false.
-	ShipRetry time.Duration
 }
 
 // FlushFunc is the contract for shipping one sealed segment's CAR to
@@ -95,7 +95,7 @@ func (c *Config) defaults() {
 	}
 }
 
-// withDefaults returns pc with zero-valued seal, retain and retry knobs
+// withDefaults returns pc with zero-valued seal and retain knobs
 // filled in.
 func (pc PlaneConfig) withDefaults() PlaneConfig {
 	if pc.SealBytes <= 0 {
@@ -106,9 +106,6 @@ func (pc PlaneConfig) withDefaults() PlaneConfig {
 	}
 	if pc.Retain <= 0 {
 		pc.Retain = 6
-	}
-	if pc.ShipRetry <= 0 {
-		pc.ShipRetry = time.Minute
 	}
 	return pc
 }

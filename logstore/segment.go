@@ -17,6 +17,7 @@ import (
 
 	block "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
+	"github.com/multiformats/go-multihash"
 	"go.uber.org/zap"
 
 	"github.com/fil-forge/ingot/blockstore"
@@ -75,6 +76,14 @@ type Segment struct {
 
 	shippedAt int64 // unix seconds when shipped; 0 = not shipped
 	retired   bool  // CAR + idx unlinked off local disk
+
+	// flushed is set once a ship's Flush succeeded, with the index digest
+	// it returned and when, so a ship whose stamp in Meta then failed
+	// stamps it again without shipping it twice. Guarded by the plane log's
+	// shipMu.
+	flushed      bool
+	flushedIndex multihash.Multihash
+	flushedAt    int64
 
 	// opRoots is the ordered per-batch (bucket, root) record; non-nil
 	// only for the catalog plane. opsFD is its append-only sidecar (open

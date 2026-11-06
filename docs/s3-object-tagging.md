@@ -79,7 +79,8 @@ applies unchanged:
 
 - **Merge**: `PutObjectTagging` and `DeleteObjectTagging` own `Tags` and carry `Retention`
   and `LegalHold` verbatim; the lock methods carry `Tags` in return. A replaced set is
-  last-write-wins on the one field.
+  last-write-wins on the one field. Each tag write is a SetAttributes change in a
+  `queue-bucket.commit`, the same change the lock methods send.
 - **Elision**: an empty replacement (`PutObjectTagging` with an empty `TagSet`, or
   `DeleteObjectTagging`) stores nil, and a state block left with every field absent is
   removed from the tree; the emptied tree drops `State` off the leaf.
@@ -100,7 +101,7 @@ answers without another fetch, and one tree seek plus one block fetch serves a t
 - **PutObject** parses `input.Tagging` through `backend.ParseObjectTags` before ingest, so an
   invalid header fails fast and uploads nothing. The parsed set joins the version's initial
   `VersionState` beside any lock headers and stamps in the same commit
-  (`s3-object-lock.md` §7): the version and its tags land in one root swap.
+  (`s3-object-lock.md` §7): the version and its tags land in one root advance.
 - **CopyObject** with directive `COPY` gives the destination version the source *version's*
   tags (the resolved source, current or version-scoped); with `REPLACE` it parses the
   request's own header. Lock state is never inherited on copy; tags are, exactly when the

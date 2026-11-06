@@ -56,8 +56,19 @@ func (s *Store) Get(ctx context.Context, c cid.Cid) (block.Block, error) {
 	return s.catalog.Get(ctx, c)
 }
 
-// Close closes the catalog pipeline (sealing the open segment, draining the
-// flush queue). Safe to call once.
+// Ship ships the catalog's sealed segments still unshipped (PlaneLog.Ship).
+func (s *Store) Ship(ctx context.Context) error {
+	return s.catalog.Ship(ctx)
+}
+
+// ShipBucket is Ship, for a caller that ships by bucket: a Store holds one
+// bucket's log.
+func (s *Store) ShipBucket(ctx context.Context, _ string) error {
+	return s.Ship(ctx)
+}
+
+// Close closes the catalog pipeline (sealing the open segment and stopping
+// its seal ticker). Safe to call once.
 func (s *Store) Close(ctx context.Context) error {
 	return s.catalog.Close(ctx)
 }

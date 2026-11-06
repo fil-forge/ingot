@@ -206,8 +206,14 @@ func TestBudgetPassEvictsThroughTheQueue(t *testing.T) {
 		d := f.hold(t, strings.Repeat(string(c), 1000))
 		require.Eventually(t, func() bool { return f.cached(d) }, 5*time.Second, 10*time.Millisecond)
 		digests = append(digests, d)
-		// Distinct modification times, so the oldest is evicted first.
-		time.Sleep(2 * time.Millisecond)
+	}
+	// The pass evicts by modification time, oldest first. Each file is
+	// cached when the queue runs its task, in no set order, so the test
+	// dates them a minute apart, in upload order.
+	now := time.Now()
+	for i, d := range digests {
+		at := now.Add(time.Duration(i-len(digests)) * time.Minute)
+		require.NoError(t, os.Chtimes(f.b.cache.Path(d), at, at))
 	}
 	budgetToEvict(f.b, 1, 1000)
 

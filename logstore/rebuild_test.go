@@ -58,18 +58,80 @@ func (r *shipRecorder) shipped() map[uint64]bool {
 
 func openRebuildManager(t *testing.T, dir string, meta logstore.Meta, ship *shipRecorder) (*logstore.Manager, error) {
 	t.Helper()
+	return openManagerShipping(t, dir, meta, ship, true)
+}
+
+// openManagerShipping opens a manager as openRebuildManager does, whose seals
+// ship only when shipping is set.
+func openManagerShipping(t *testing.T, dir string, meta logstore.Meta, ship *shipRecorder, shipping bool) (*logstore.Manager, error) {
+	t.Helper()
+	ships := &queueShips{}
+	var onSealed func(string)
+	if shipping {
+		onSealed = ships.sealed
+	}
 	m, err := logstore.OpenManager(context.Background(), logstore.ManagerConfig{
 		Dir:  dir,
 		Meta: meta,
 		// A small SealBytes makes the rebuild split across segments.
 		Catalog:  logstore.PlaneConfig{SealBytes: 8 << 10, SealAge: time.Hour, Ship: true, Retain: 100},
 		FlushFor: ship.forBucket,
+		OnSealed: onSealed,
 		Logger:   zaptest.NewLogger(t),
 	})
 	if err == nil {
 		t.Cleanup(func() { _ = m.Close(context.Background()) })
+		ships.start(t, m)
 	}
 	return m, err
+}
+
+// queueShips stands in for queue-bucket.ship: each seal it hears of ships the
+// bucket's log, retried until it succeeds or the test ends.
+type queueShips struct {
+	mu    sync.Mutex
+	m     *logstore.Manager
+	ctx   context.Context
+	early []string
+	wg    sync.WaitGroup
+}
+
+func (q *queueShips) sealed(bucket string) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.m == nil {
+		q.early = append(q.early, bucket)
+		return
+	}
+	q.ship(bucket)
+}
+
+// start ships the buckets reported while the manager opened, and every one
+// reported from now on. The ships stop before the manager closes.
+func (q *queueShips) start(t *testing.T, m *logstore.Manager) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(func() {
+		cancel()
+		q.wg.Wait()
+	})
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.m, q.ctx = m, ctx
+	for _, bucket := range q.early {
+		q.ship(bucket)
+	}
+	q.early = nil
+}
+
+// ship runs one bucket's ship until it succeeds. q.mu is held.
+func (q *queueShips) ship(bucket string) {
+	q.wg.Add(1)
+	go func() {
+		defer q.wg.Done()
+		for q.m.ShipBucket(q.ctx, bucket) != nil && q.ctx.Err() == nil {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
 }
 
 // pgMeta is the segment metadata a rebuild runs against: the Postgres
@@ -84,6 +146,32 @@ func newPGMeta(t *testing.T) *pgMeta {
 	t.Helper()
 	pool := pgtest.New(t)
 	return &pgMeta{Postgres: registry.NewPostgres(pool), pool: pool}
+}
+
+// commitJournaled records what a commit of blocks under segment leaves: their
+// journal rows, and the bucket's root advanced to the last of them.
+func (m *pgMeta) commitJournaled(t *testing.T, bucket string, segment uint64, blocks []block.Block) {
+	t.Helper()
+	ctx := context.Background()
+	tx, err := m.pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin commit: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	for _, b := range blocks {
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO ingot.catalog_journal (seq, bucket, cid, data) VALUES ($1, $2, $3, $4)`,
+			int64(segment), bucket, b.Cid().Bytes(), b.RawData()); err != nil {
+			t.Fatalf("journal block: %v", err)
+		}
+	}
+	if _, err := tx.Exec(ctx, `UPDATE ingot.buckets SET root_cid = $1 WHERE name = $2`,
+		blocks[len(blocks)-1].Cid().Bytes(), bucket); err != nil {
+		t.Fatalf("advance root: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
 }
 
 // JournaledBlocks returns the journal's blocks under segment, by CID.
@@ -132,15 +220,7 @@ func journalSegmentPadded(t *testing.T, mem *pgMeta, bucket string, n, pad int) 
 	for i := range blocks {
 		blocks[i] = block.NewBlock([]byte(fmt.Sprintf("%s/seg-%d/block-%04d/%s", bucket, seq, i, strings.Repeat("x", pad))))
 	}
-	st, err := mem.Get(ctx, bucket)
-	if err != nil {
-		t.Fatalf("Get %s: %v", bucket, err)
-	}
-	if err := mem.CommitRoot(ctx, bucket, st.Root, blocks[n-1].Cid(), registry.RootCommit{
-		Journal: blockstore.Appended{Segment: seq, Blocks: blocks},
-	}); err != nil {
-		t.Fatalf("CommitRoot: %v", err)
-	}
+	mem.commitJournaled(t, bucket, seq, blocks)
 	return seq, blocks
 }
 
@@ -448,11 +528,11 @@ func TestOpenManager_SeqPastDisk(t *testing.T) {
 
 // sealedSegments writes one block per segment into bucket "bk" under dir,
 // through a manager over mem, and returns the blocks once every segment has
-// sealed and the manager is closed.
+// sealed, none shipped, and the manager is closed.
 func sealedSegments(t *testing.T, dir string, mem *pgMeta, n int) []block.Block {
 	t.Helper()
 	ctx := context.Background()
-	m, err := openRebuildManager(t, dir, mem, &shipRecorder{})
+	m, err := openManagerShipping(t, dir, mem, &shipRecorder{}, false)
 	if err != nil {
 		t.Fatalf("OpenManager: %v", err)
 	}
@@ -832,15 +912,7 @@ func TestRecover_SealedRowDamagedCAR(t *testing.T) {
 				if err := mem.Create(ctx, "bk", testutil.RandomDID(t), registry.CreateState{Tenant: testutil.RandomDID(t)}); err != nil {
 					t.Fatalf("Create bk: %v", err)
 				}
-				st, err := mem.Get(ctx, "bk")
-				if err != nil {
-					t.Fatalf("Get bk: %v", err)
-				}
-				if err := mem.CommitRoot(ctx, "bk", st.Root, written[len(written)-1].Cid(), registry.RootCommit{
-					Journal: blockstore.Appended{Segment: seq, Blocks: written},
-				}); err != nil {
-					t.Fatalf("CommitRoot: %v", err)
-				}
+				mem.commitJournaled(t, "bk", seq, written)
 			}
 			catalog := filepath.Join(dir, "bk", blockstore.PlaneCatalog.String())
 			car := filepath.Join(catalog, fmt.Sprintf("seg-%020d.car", seq))

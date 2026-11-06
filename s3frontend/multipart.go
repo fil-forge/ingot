@@ -434,10 +434,10 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 // commits a manifest whose Body is the ordered union of the parts' blobs. The
 // object ETag is hex(md5(concat of part md5s)) + "-N".
 //
-// The blobs are concluded off the bucket lock, so a teardown (DeleteBucket,
-// the stale-session sweeper) can take the 'completing' row meanwhile; both
-// latch it under the bucket lock, and the commit re-checks the latch there,
-// failing with NoSuchUpload rather than committing over released blobs.
+// The blobs are concluded before the commit, so a teardown (DeleteBucket,
+// the stale-session sweeper) can take the 'completing' row meanwhile. The
+// commit records the session completed only while it is still completing,
+// so it fails with NoSuchUpload rather than committing over released blobs.
 //
 // A successful Complete retains the session in state 'completed' (with its
 // parts), so a duplicate Complete with an identical part list is idempotent
@@ -733,7 +733,7 @@ func (b *Backend) CompleteMultipartUploadReportingHeaders(ctx context.Context, i
 		for tries := 0; ; tries++ {
 			if cur.State == registry.SessionCompleted {
 				// The prior Complete committed and recorded its result on the
-				// session (CompleteSession). The validation above proved the
+				// session with its commit. The validation above proved the
 				// caller's part list against the retained parts; guard against
 				// a divergent list that happens to validate by comparing the
 				// derived ETag with the committed one. The session's copy is
@@ -921,47 +921,22 @@ func (b *Backend) CompleteMultipartUploadReportingHeaders(ctx context.Context, i
 	}
 	initState = applyTagsIfPresent(initState, tags)
 
-	// Commit through the §5 write rule (docs/s3-versioning.md): seq allocation,
-	// supersession per the bucket's versioning state, and the reference-index
-	// claims and drops in the swap. The conditional-write preconditions re-check
-	// under the lock so a racing writer can't slip between the pre-check above
-	// and the swap.
-	node, effState, err := b.commitVersionAt(ctx, bucketState, key, mf, blobs, initState, nil, reserved, func(superseded *msbucket.ObjectManifest) error {
-		// The latch is re-checked under the bucket lock, where every
-		// teardown that takes a 'completing' row (DeleteBucket, the
-		// sweeper) latches it: a session taken while its blobs were
-		// concluding off-lock has had those blobs released, and the
-		// manifest must not commit over them.
-		cur, err := b.multipart.GetSession(ctx, uploadID)
-		switch {
-		case errors.Is(err, registry.ErrNotFound):
-			return s3err.GetAPIError(s3err.ErrNoSuchUpload)
-		case err != nil:
-			return fmt.Errorf("recheck session latch: %w", err)
-		case cur.State != registry.SessionCompleting:
-			return s3err.GetAPIError(s3err.ErrNoSuchUpload)
-		}
-		if ifMatch == nil && ifNoneMatch == nil {
-			return nil
-		}
-		// A delete-marker current means "no object" for precondition purposes.
-		oldETag, oldExists := "", false
-		if superseded != nil && !superseded.DeleteMarker {
-			oldETag, oldExists = etagOf(superseded), true
-		}
-		if ifMatch != nil {
-			if !oldExists {
-				return s3err.GetAPIError(s3err.ErrNoSuchKey)
-			}
-			if !etagsEqual(*ifMatch, oldETag) {
-				return s3err.GetAPIError(s3err.ErrPreconditionFailed)
-			}
-		}
-		if ifNoneMatch != nil && oldExists {
-			return s3err.GetAPIError(s3err.ErrPreconditionFailed)
-		}
-		return nil
-	})
+	// Commit through the §5 write rule (docs/s3-versioning.md): seq
+	// allocation, supersession per the bucket's versioning state, and the
+	// reference-index claims and drops with the root's advance. The commit
+	// re-checks the conditional-write preconditions against the version it
+	// supersedes, and that the upload is still completing: every teardown
+	// that takes a 'completing' row (DeleteBucket, the sweeper) has released
+	// its blobs, and the manifest must not commit over them. The upload is
+	// recorded completed with the commit.
+	put := &PutChange{Manifest: mf, HasBlobs: true, Blobs: blobs, InitState: initState, Reserved: &ReservedVersion{Seq: reserved.Seq, VersionID: reserved.VersionID}, Session: uploadID}
+	if ifMatch != nil {
+		put.HasIfMatch, put.IfMatch = true, *ifMatch
+	}
+	if ifNoneMatch != nil {
+		put.HasIfNoneMatch, put.IfNoneMatch = true, *ifNoneMatch
+	}
+	node, effState, err := b.commitOne(ctx, bucketState, KeyChange{Key: key, Put: put}, "commit version")
 	if errors.Is(err, errReservationSuperseded) {
 		b.logger.Info("multipart completion refused: the key or the bucket's versioning changed since it reported its version",
 			zap.String("key", key), zap.String("uploadID", uploadID), zap.String("versionID", reserved.VersionID))
@@ -969,18 +944,11 @@ func (b *Backend) CompleteMultipartUploadReportingHeaders(ctx context.Context, i
 	if err != nil {
 		return s3response.CompleteMultipartUploadResult{}, "", err
 	}
+	// The object is durable, and the session, recorded completed with the
+	// committed ETag and version id, is retained with its parts so a
+	// duplicate or latch-losing Complete replays this result; the sweeper
+	// reaps it later.
 	committed = true
-	// The object is durable. Retain the session (state 'completed', carrying
-	// the committed ETag and version id) and its parts so a duplicate or
-	// latch-losing Complete replays this result; the sweeper reaps it later.
-	// Best-effort: a failed latch leaves the row in 'completing', which the
-	// sweeper reaps through its abort path after the TTL — harmless here, as
-	// the winners' intents are published by their claims, so that reap
-	// leaves them to the object path whatever has become of the object.
-	if _, err := b.multipart.CompleteSession(ctx, uploadID, etag, node.VersionID); err != nil {
-		b.logger.Warn("latch session to completed failed; sweeper reaps the completing row after the TTL",
-			zap.String("uploadID", uploadID), zap.Error(err))
-	}
 	// The parts' tree material is dead now that the manifest holds the
 	// object's tree, and it is the bulk of a large upload's rows (up to
 	// about 320 KiB per 5 GiB part). Best-effort: rows a failure leaves go
@@ -1619,23 +1587,14 @@ func (b *Backend) SweepStaleMultipartSessions(ctx context.Context, ttl time.Dura
 }
 
 // latchStaleSession moves a stale session into 'aborting'. A 'completing'
-// row is latched under its bucket's lock: the Complete that holds it
-// re-checks the latch there before committing, so the lock orders the two
-// and that Complete fails with NoSuchUpload instead of committing a manifest
-// over blobs the reap then releases. An 'open' row has no such writer to
-// order against; the latch alone decides it against a concurrent Complete
-// or Abort.
+// row's Complete records the session completed with its commit only while it
+// is still completing, so once this latch lands that commit fails with
+// NoSuchUpload instead of installing a manifest over blobs the reap
+// releases; a commit that landed first leaves the row completed, and the
+// latch loses. An 'open' row's latch decides it against a concurrent
+// Complete or Abort the same way.
 func (b *Backend) latchStaleSession(ctx context.Context, s registry.MultipartSession, from string) (bool, error) {
-	if from != registry.SessionCompleting {
-		return b.multipart.LatchSession(ctx, s.UploadID, from, registry.SessionAborting)
-	}
-	var won bool
-	err := b.txns.WithLock(ctx, s.Bucket, func(ctx context.Context) error {
-		var err error
-		won, err = b.multipart.LatchSession(ctx, s.UploadID, from, registry.SessionAborting)
-		return err
-	})
-	return won, err
+	return b.multipart.LatchSession(ctx, s.UploadID, from, registry.SessionAborting)
 }
 
 // reapCompletedSession drops a completed session's row, first recording a

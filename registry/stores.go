@@ -211,7 +211,7 @@ type MultipartSession struct {
 	// applied to every part, and stamped onto the manifest at Complete.
 	Plaintext bool
 	// CommittedETag / CommittedVersionID are the result the winning Complete
-	// returned, recorded by CompleteSession with the move to 'completed'
+	// returned, recorded with its commit by the move to 'completed'
 	// (empty before that). A duplicate or latch-losing Complete replays them
 	// rather than resolving the live key, which a later overwrite may have
 	// replaced. CommittedVersionID is empty for unversioned buckets.
@@ -298,8 +298,8 @@ type PartTree struct {
 
 // BlobRefStore reads the reverse reference index (§5, §6). The index is
 // written by commits alone: a version's claims land and a discarded
-// version's claims drop in the root swap's transaction
-// (Registry.CommitRoot, RootCommit). CountReferences gates a blob's release:
+// version's claims drop with the root's advance
+// (Registry.RootCommitWrites, RootCommit). CountReferences gates a blob's release:
 // physical reclamation when the count reaches zero.
 type BlobRefStore interface {
 	// CountReferences returns how many references space holds to digest:
@@ -441,11 +441,6 @@ type MultipartStore interface {
 	// LatchSession atomically moves uploadID from->to, returning true iff this
 	// caller performed the transition (the session was still in `from`).
 	LatchSession(ctx context.Context, uploadID, from, to string) (bool, error)
-	// CompleteSession is the completing→completed latch that also records the
-	// winner's result (etag; versionID, empty for unversioned buckets) in the
-	// same statement, so a completed row always carries what to replay.
-	// Returns true iff this caller performed the transition.
-	CompleteSession(ctx context.Context, uploadID, etag, versionID string) (bool, error)
 	DeleteSession(ctx context.Context, uploadID string) error
 	// PutPart records a part of an OPEN session and its tree (nil for none),
 	// superseding a prior row for the part number and its tree row, and

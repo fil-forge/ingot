@@ -380,12 +380,12 @@ type failCommitRoot struct {
 	fails int
 }
 
-func (f *failCommitRoot) CommitRoot(ctx context.Context, name string, expect, next cid.Cid, c registry.RootCommit) error {
+func (f *failCommitRoot) RootCommitWrites(ctx context.Context, name string, expect, next cid.Cid, c registry.RootCommit, gc []cid.Cid) (registry.CommitWrites, error) {
 	if f.fails > 0 {
 		f.fails--
-		return errors.New("postgres unavailable")
+		return registry.CommitWrites{}, errors.New("postgres unavailable")
 	}
-	return f.Registry.CommitRoot(ctx, name, expect, next, c)
+	return f.Registry.RootCommitWrites(ctx, name, expect, next, c, gc)
 }
 
 // TestCommitFailureWritesNoClaim: the reference index is written in the
@@ -455,9 +455,9 @@ type stallCommitRoot struct {
 	delay time.Duration
 }
 
-func (s *stallCommitRoot) CommitRoot(ctx context.Context, name string, expect, next cid.Cid, c registry.RootCommit) error {
+func (s *stallCommitRoot) RootCommitWrites(ctx context.Context, name string, expect, next cid.Cid, c registry.RootCommit, gc []cid.Cid) (registry.CommitWrites, error) {
 	time.Sleep(s.delay)
-	return s.Registry.CommitRoot(ctx, name, expect, next, c)
+	return s.Registry.RootCommitWrites(ctx, name, expect, next, c, gc)
 }
 
 // TestReleaseGraceRunsFromTheCommit: a reader that resolved the superseded
