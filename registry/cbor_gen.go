@@ -406,3 +406,156 @@ func (t *ReleaseTask) UnmarshalCBOR(r io.Reader) (err error) {
 
 	return nil
 }
+func (t *AcceptTask) MarshalCBOR(w io.Writer) error {
+	if t == nil {
+		_, err := w.Write(cbg.CborNull)
+		return err
+	}
+
+	cw := cbg.NewCborWriter(w)
+
+	if _, err := cw.Write([]byte{161}); err != nil {
+		return err
+	}
+
+	// t.Parts ([]int64) (slice)
+	if len("Parts") > 1000000 {
+		return xerrors.Errorf("Value in field \"Parts\" was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajTextString, uint64(len("Parts"))); err != nil {
+		return err
+	}
+	if _, err := cw.WriteString(string("Parts")); err != nil {
+		return err
+	}
+
+	if len(t.Parts) > 8192 {
+		return xerrors.Errorf("Slice value in field t.Parts was too long")
+	}
+
+	if err := cw.WriteMajorTypeHeader(cbg.MajArray, uint64(len(t.Parts))); err != nil {
+		return err
+	}
+	for _, v := range t.Parts {
+		if v >= 0 {
+			if err := cw.WriteMajorTypeHeader(cbg.MajUnsignedInt, uint64(v)); err != nil {
+				return err
+			}
+		} else {
+			if err := cw.WriteMajorTypeHeader(cbg.MajNegativeInt, uint64(-v-1)); err != nil {
+				return err
+			}
+		}
+
+	}
+	return nil
+}
+
+func (t *AcceptTask) UnmarshalCBOR(r io.Reader) (err error) {
+	*t = AcceptTask{}
+
+	cr := cbg.NewCborReader(r)
+
+	maj, extra, err := cr.ReadHeader()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err == io.EOF {
+			err = io.ErrUnexpectedEOF
+		}
+	}()
+
+	if maj != cbg.MajMap {
+		return fmt.Errorf("cbor input should be of type map")
+	}
+
+	if extra > cbg.MaxLength {
+		return fmt.Errorf("AcceptTask: map struct too large (%d)", extra)
+	}
+
+	n := extra
+
+	nameBuf := make([]byte, 5)
+	for i := uint64(0); i < n; i++ {
+		nameLen, ok, err := cbg.ReadFullStringIntoBuf(cr, nameBuf, 1000000)
+		if err != nil {
+			return err
+		}
+
+		if !ok {
+			// Field doesn't exist on this type, so ignore it
+			if err := cbg.ScanForLinks(cr, func(cid.Cid) {}); err != nil {
+				return err
+			}
+			continue
+		}
+
+		switch string(nameBuf[:nameLen]) {
+		// t.Parts ([]int64) (slice)
+		case "Parts":
+
+			maj, extra, err = cr.ReadHeader()
+			if err != nil {
+				return err
+			}
+
+			if extra > 8192 {
+				return fmt.Errorf("t.Parts: array too large (%d)", extra)
+			}
+
+			if maj != cbg.MajArray {
+				return fmt.Errorf("expected cbor array")
+			}
+
+			if extra > 0 {
+				t.Parts = make([]int64, extra)
+			}
+
+			for i := 0; i < int(extra); i++ {
+				{
+					var maj byte
+					var extra uint64
+					var err error
+					_ = maj
+					_ = extra
+					_ = err
+					{
+						maj, extra, err := cr.ReadHeader()
+						if err != nil {
+							return err
+						}
+						var extraI int64
+						switch maj {
+						case cbg.MajUnsignedInt:
+							extraI = int64(extra)
+							if extraI < 0 {
+								return fmt.Errorf("int64 positive overflow")
+							}
+						case cbg.MajNegativeInt:
+							extraI = int64(extra)
+							if extraI < 0 {
+								return fmt.Errorf("int64 negative overflow")
+							}
+							extraI = -1 - extraI
+						default:
+							return fmt.Errorf("wrong type for int64 field: %d", maj)
+						}
+
+						t.Parts[i] = int64(extraI)
+					}
+
+				}
+			}
+
+		default:
+			// Field doesn't exist on this type, so ignore it
+			if err := cbg.ScanForLinks(r, func(cid.Cid) {}); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}

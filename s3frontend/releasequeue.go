@@ -59,10 +59,6 @@ const releaseFlush = "flush"
 // release that found it claimed again returns none.
 var releasedResult = []byte("released")
 
-// errReleaseDeferred is a release that must wait and has done nothing. It is
-// retried without holding the subject (taskrunner.Defer).
-var errReleaseDeferred = errors.New("s3frontend: release deferred")
-
 // RegisterReleaseTasks registers the queue-space-shard handlers with r: the
 // release, a write's add and its expiry (shardref.go), and the no-op flush.
 // Call it before r starts.
@@ -178,12 +174,6 @@ func (b *Backend) runRelease(ctx context.Context, ex *taskrunner.Exec, t taskrun
 	} else if n > 0 {
 		return nil, nil // referenced again since it was queued: stale
 	}
-	if b.isConcluding(space, digest) {
-		// Its accept may be registered after a remove sent now (see
-		// markConcluding). The release has done nothing, so its retry
-		// holds up none of the blob's adds meanwhile.
-		return nil, taskrunner.Defer(fmt.Errorf("%w: a conclude of the blob is in flight", errReleaseDeferred))
-	}
 
 	located := false
 	if loc, err := b.locations.GetLocation(ctx, space, digest); err == nil && loc != nil {
@@ -219,10 +209,10 @@ func (b *Backend) runRelease(ctx context.Context, ex *taskrunner.Exec, t taskrun
 		}
 	case park != nil:
 		// Parked: release the allocation on the provider. A refusal because
-		// the space has accepted the blob means a conclude ran and this node
-		// never learned of it (the response was lost, or Complete died
-		// between the accept and recording it); the blob is removed as an
-		// accepted one instead.
+		// the space has accepted the blob means a conclude ran that this
+		// node has not recorded (an upload's accept still running, or one
+		// that failed after the upload service accepted); the blob is
+		// removed as an accepted one instead.
 		cause, err := cid.Cast(park.AddTask)
 		if err != nil {
 			return nil, taskrunner.Permanent(fmt.Errorf("decode park add task: %w", err))

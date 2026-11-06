@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/fil-forge/ingot/taskrunner"
+	"github.com/fil-forge/ingot/taskrunner/internal/testhook"
 )
 
 // DSNEnv names the environment variable holding the test database's DSN.
@@ -114,12 +115,15 @@ func CompareOwnWrites(ctx context.Context, newEnv func() Env, c Case) error {
 }
 
 func runCase(ctx context.Context, env Env, c Case, immediate bool) (outcome, error) {
-	r, err := taskrunner.New(env.DB, taskrunner.Options{
-		Schema:                 env.Schema,
-		Queues:                 c.Queues,
-		PollInterval:           50 * time.Millisecond,
-		ApplyWritesImmediately: immediate,
-	})
+	opts := taskrunner.Options{
+		Schema:       env.Schema,
+		Queues:       c.Queues,
+		PollInterval: 50 * time.Millisecond,
+	}
+	if immediate {
+		testhook.ApplyWritesImmediately(&opts)
+	}
+	r, err := taskrunner.New(env.DB, opts)
 	if err != nil {
 		return outcome{}, err
 	}

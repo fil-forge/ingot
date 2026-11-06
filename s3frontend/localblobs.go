@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/hex"
 
-	"github.com/fil-forge/ucantone/did"
 	"github.com/multiformats/go-multihash"
 	"go.uber.org/zap"
 
@@ -37,10 +36,4 @@ func (b *Backend) cacheWritten(ctx context.Context, digest multihash.Multihash, 
 		b.logger.Warn("could not schedule a cached blob's eviction; the budget pass bounds it",
 			zap.String("digest", hex.EncodeToString(digest)), zap.Error(err))
 	}
-}
-
-// blobKey is the key under which Backend.blobKeys serialises the writes of
-// one digest to one space.
-func blobKey(space did.DID, digest multihash.Multihash) string {
-	return space.String() + "\x00" + string(digest)
 }

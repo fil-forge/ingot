@@ -21,7 +21,7 @@ change to the diagrams to re-check. The maintenance rule lives in
 | `put` | [PutObject](#putobject-stream-and-upload-off-the-lock-commit-under-it) | the write path: off-lock ingest and upload, locked commit | here |
 | `get` | [GetObject](#getobject-version-resolution-local-tiers-network-retrieval) | version resolution, tier fallthrough, network retrieval | here |
 | `multipart` | [Multipart upload](#multipart-upload-park-on-write-accept-in-the-background) | park at UploadPart, accept in the background, Complete's wait, abort unwind | here |
-| `part-states` | [Part states](#part-states-the-acceptance-queue) | the part rows as the acceptor's queue | here |
+| `part-states` | [Part states](#part-states-the-acceptance-queue) | the part rows as the upload's accept queue | here |
 | `multipart-states` | [Session states](#session-states-and-the-completeabort-latch) | the session state machine and the single-winner latch | here |
 | `blob-lifecycle` | [Blob lifecycle](#blob-lifecycle-uploading-parked-accepted-released) | intent states and the claim ledger gating deletion | here |
 | `version-tree` | [Per-key version storage](#per-key-version-storage-manifest-arm-leaf-arm-prev-tree) | the value union, the leaf, the prev tree | here |
@@ -240,7 +240,7 @@ flowchart TB
   receipt reports it and the node checks it at accept. An upload service
   that cannot add by digest code fails the write.
 - Multipart parts ride the body route with the conclude deferred (parked);
-  the upload's acceptor finishes it
+  the upload's `queue-multipart-upload-shard.accept` finishes it
   (the [multipart diagram](#multipart-upload-park-on-write-accept-in-the-background)).
 
 Cross-references: [`architecture.md` §4](./architecture.md#4-the-catalog-layer),
@@ -485,16 +485,17 @@ change.
 ## Multipart upload: park on write, accept in the background
 
 Parts upload to the provider at `UploadPart` and park there (durable,
-unaccepted). Each upload's acceptor concludes its parked parts in batches
-while the client is still uploading, so `Complete` waits only for the last
-few and its cost stays flat as the part count grows.
+unaccepted). Each upload's `queue-multipart-upload-shard.accept` task
+concludes its parked parts in batches while the client is still uploading,
+so `Complete` has only the last few left to accept and its cost stays flat
+as the part count grows.
 
 ```mermaid
 sequenceDiagram
     autonumber
     actor C as S3 client
     participant B as s3frontend.Backend
-    participant A as the upload's acceptor<br/>(goroutine)
+    participant A as queue-multipart-upload-shard.accept<br/>(task, subject = uploadId)
     participant R as registry<br/>(sessions, parts, parks, intents)
     participant U as sprue
     participant P as piri
@@ -522,21 +523,18 @@ sequenceDiagram
             B->>U: /blob/abort the surplus allocation
         end
     end
-    B->>R: PutPart(written, span_lengths, the adds' references): open sessions only, the row held<br/>FOR SHARE against a concurrent latch#59; writes of one part number serialised on an advisory lock#59;<br/>the references taken over (rows deleted, expiries cancelled) and a queue-space-shard.release<br/>task, due now, for each blob the replaced row named and this part does not, in the same<br/>transaction, returned to run#59; a refused part expires its references at once (dropRefsNow)
-    B->>R: MoveParts(written to parked), guarded by the part's digests
-    opt no row moved: a later upload of the part number replaced it,<br/>or a teardown took the session, while the row was recorded
-        B->>R: enqueuePartReleases of this part's blobs: a no-op beside the replacer's<br/>standing releases#59; they run below rather than on a worker
-    end
-    B->>A: nudge (start the acceptor, or ask for another pass)
+    B->>R: PutPart(parked, span_lengths, the adds' references): open sessions only, the row held<br/>FOR SHARE against a concurrent latch#59; writes of one part number serialised on an advisory lock#59;<br/>the references taken over (rows deleted, expiries cancelled) and a queue-space-shard.release<br/>task, due now, for each blob the replaced row named and this part does not, in the same<br/>transaction, returned to run#59; a refused part expires its references at once (dropRefsNow)
+    B->>A: in PutPart's transaction: queue the upload's accept,<br/>a replacement due now (at most one pending per upload)
     B->>U: releaseNow: the tasks above, due at once, run inline (/blob/abort of the parks#59;<br/>a blob another part or the session still names is stale for that reference)
     B-->>C: part ETag (part md5#59; for a copy, of the copied bytes)
-    loop while a pass finds parked parts
-        A->>R: GetSession (stop unless open or completing)#59; ListParkedParts
-        A->>U: acceptParked: up to 1000 blobs' put receipts in one /ucan/conclude,<br/>accept receipts read from the response (poll only as fallback)
-        A->>R: per blob, under its write lock: ConcludePark (park swapped for the<br/>location, only while the concluded park, by AddTask, stands) + intent accepted
-        A->>R: MoveParts(parked to accepted)
+    A->>R: GetSession (nothing to do unless open or completing)
+    loop while a parked part is left after the part-number cursor
+        A->>R: ListParkedParts after the cursor: a batch of up to 1000 blobs, a part never split
+        A->>U: ConcludeBlobs: the batch's put receipts in one /ucan/conclude (2 min timeout),<br/>accept receipts read from the response (poll only as fallback)
+        A->>A: writes for the task's commit: park swapped for the location while the concluded<br/>park (by AddTask) stands#59; intent accepted (published stays)#59; a park beside a standing<br/>location dropped#59; part accepted while its row names the same blobs, all located
     end
-    Note over A,R: a failed pass backs off (1 s to 30 s) and retries#59; the accept sweeper<br/>nudges every live upload with parked parts at start and every 30 s
+    A->>R: commit every batch's writes with the task
+    Note over A,R: a failed batch fails the task and records nothing#59; the retry concludes again<br/>(a repeat to sprue)#59; 5 attempts from 5 s, doubling, up to 1 min
     C->>B: CompleteMultipartUpload(parts)
     B->>B: validate parts (ascending, ETags, checksums, MinPartSize)#59;<br/>an error here is answered with its own status
     alt session already completed
@@ -554,12 +552,14 @@ sequenceDiagram
         end
         Note over B,C: from here the body is padded with a newline every<br/>complete_multipart_keepalive (5 s), and any error goes in the 200's body
         B->>R: manifest spans from each part's span_lengths<br/>(rows without them: intent size + FEE geometry)
-        B->>A: awaitPass until no named part is parked, up to acceptWaitBudget (30 s)
-        B->>R: ListParts: the named parts' states
-        alt a named part still parked
+        B->>A: run the accept as a sync task, limited to the named parts:<br/>after any running or pending accept, to start within acceptWaitBudget (30 s)
+        alt the accept did not start in time
             B-->>C: OperationAborted in the 200's body#59; the deferred revert reopens the session
-        else every part accepted, or written
-            B->>U: written parts only: concludeBlobs (conclude, or InvalidPart for a blob with neither a park nor a location)
+        else the accept failed
+            B-->>C: its error in the 200's body#59; the deferred revert reopens the session
+        else a named part not accepted with the blobs the request validated
+            B-->>C: InvalidPart in the 200's body#59; the deferred revert reopens the session<br/>for the client to upload the part again
+        else every named part accepted
             B->>TX: commitVersionAt under what was reported (see the PutObject diagram)#59;<br/>refused (errReservationSuperseded) if the key gained a later seq,<br/>or the versioning no longer fits the report#59; the claims land<br/>in the root swap's transaction, set-based
             B->>R: LatchSession(completing to completed), best-effort
             B-->>C: the result ends the body: ETag = md5-of-part-md5s + "-N"
@@ -579,30 +579,25 @@ sequenceDiagram
   nothing; the session's teardown queues it again. A commit's claim
   publishes the blob's upload intent, so the reap of a retained session
   releases only what was never committed.
-- A release can take a blob while the acceptor concludes it. The provider
-  refuses whichever of accept and abort comes second, and the release deletes
-  the park and location rows in its commit, so `ConcludePark` finds no park and the
-  acceptor records nothing for a blob a release took. `ConcludePark`
-  matches the park's `/blob/add` task, so a later park of the same bytes
-  stays for its own conclude.
-- The acceptor never cancels a `queue-space-shard.release` task (it reads
-  them with the runner's `Pending`); a part holding such a blob goes back to
-  `written` for Complete.
-  Each pass runs under `acceptPassTimeout`.
-- No release runs while its blob's conclude is in flight: sprue registers
-  an accepted blob only when it answers, so an earlier remove would miss it.
-  A teardown waits for the acceptor's pass in flight (`quiesceAcceptor`)
-  before it queues releases; any other release that finds the blob marked
-  (`markConcluding`, held 2 min past a failed conclude) defers, retrying
-  without holding the blob's subject (`taskrunner.Defer`).
+- A release can take a blob while an accept concludes it, when a part is
+  replaced or dropped mid-conclude. Sprue decides the order: a released
+  allocation refuses the accept, and an accepted blob refuses `/blob/abort`,
+  which the release then follows with `/blob/remove`. The release deletes
+  the park and location rows in its commit, so the accept's swap finds no
+  park and records nothing for a blob a release took. The swap matches the
+  park's `/blob/add` task, so a later park of the same bytes stays for its
+  own conclude, and a part is marked accepted only while its row names the
+  blobs the accept read, all located.
+- Ingot treats a `/blob/remove` receipt as final. If sprue registers an
+  accepted blob only after a remove that arrived earlier, that window is
+  sprue's to fix, and Ingot does not guard it.
 - A part is written only while its session is open, in the statement that
   checks the state; a teardown that took the session refuses it, and the
   upload expires its pending references at once, which releases the blobs
   nothing else references (`dropRefsNow`).
-- A blob with neither a park nor a location at Complete is looked for once
-  more under the blob's lock. A blob still
-  with neither has gone from its provider, and Complete answers
-  `InvalidPart`; nothing keeps a part's bytes to upload them again.
+- A blob with neither a park nor a location when the accept reaches it has
+  gone from its provider. The accept leaves its part `parked`, and Complete
+  answers `InvalidPart`; nothing keeps a part's bytes to upload them again.
 - Complete reports its response headers through versitygw's
   `CompleteMultipartUploadReportingHeaders` before it accepts the parts,
   and the response commits to 200 at the report, as S3's does. A reserved
@@ -614,57 +609,51 @@ Cross-references: [`architecture.md` §7.2](./architecture.md#72-multipart),
 [§7.3](./architecture.md#73-the-session-latch-the-abortcomplete-race).
 
 Sources: `s3frontend/multipart.go` (all verbs, ingestPart, parkBlobs,
-acceptRequested, acceptParked, recordConcluded,
-concludeBlobs, enqueuePartReleases, SweepStaleMultipartSessions),
+acceptRequested, enqueuePartReleases, SweepStaleMultipartSessions),
 `s3frontend/version.go` (reserveVersion, commitVersionAt),
-`s3frontend/acceptor.go`, `s3frontend/stream.go`,
+`s3frontend/acceptor.go` (runAccept, acceptBatch), `registry/accept.go`,
+`s3frontend/stream.go`,
 `s3frontend/shardref.go` (addBlob, runAdd, dropRefsNow),
 `s3frontend/releasequeue.go` (runRelease, releaseNow),
 `s3frontend/uploadpartcopy.go`, `registry/stores.go`,
-`server.go` (startMultipartSweeper, startAcceptSweeper). Review when these change.
+`server.go` (startMultipartSweeper). Review when these change.
 
 ## Part states: the acceptance queue
 
-A part row's `state` is the upload's acceptance queue. Every move is a
-guarded update that also matches the part's `blob_digests`, so a request
-never moves a row a later upload of the same part number replaced.
+A part row's `state` is the upload's acceptance queue. The accept marks a
+part `accepted` only while its row still names the blobs the accept read, so
+it never moves a row a later upload of the same part number replaced.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> written : PutPart (UploadPart, once its blobs are parked)
-    written --> parked : every blob parked or located (MoveParts, then nudge)
-    parked --> accepted : acceptor pass concludes and records the blobs
-    parked --> written : acceptor finds a blob with a release pending or running, or neither park nor location
-    written --> accepted : Complete concludes its parked blobs (InvalidPart for a blob never parked)
-    parked --> accepted : Complete, when no acceptors run
-    written --> [*] : a later UploadPart of the same number replaces the row#59;<br/>the blobs it drops get queue-space-shard.release tasks in the same transaction
+    [*] --> parked : PutPart (UploadPart, once its blobs are parked)#59;<br/>queues the upload's accept in the same transaction
+    parked --> accepted : queue-multipart-upload-shard.accept concludes the blobs,<br/>while the row names the same blobs and all are located
     parked --> [*] : replaced (releases queued with the replacement),<br/>or the session's teardown cascades
     accepted --> [*] : replaced (releases queued with the replacement),<br/>or the session's teardown cascades
 ```
 
-- `written` is the state of a part whose request has recorded the row and
-  not yet moved it, or died in between, or one the acceptor left. The
-  acceptor never takes it; Complete does, and refuses one with a blob that
-  has neither a park nor a location (`InvalidPart`), since nothing keeps a
-  part's bytes to upload them again.
-- A request whose `written` row is replaced before it moves it moves no row
-  to `parked`. The releases the replacement queued stand, so the blobs go
-  even if the request dies there; each is stale while a part, a claim or a
-  pending reference in the space still names its blob. The request runs
-  them itself when it can, rather than leave them to the runner's workers.
-- Complete requires every part it names to be `accepted` before the commit:
-  it waits until none of them is queued (parts it omits are not waited
-  for), finishes `written` parts itself, and answers a part still `parked`
-  with a 409 that botocore clients treat as final. A failed pass accepts
-  every part of its batch but those holding a failed blob.
+- A part with a blob that has neither a park nor a location stays `parked`:
+  its blob has gone from its provider, and Complete refuses the part
+  (`InvalidPart`), since nothing keeps a part's bytes to upload them again.
+- A replacement queues releases for the blobs the replaced row named and the
+  new one does not, in the same transaction. Each is stale while a part, a
+  claim or a pending reference in the space still names its blob. The
+  request runs them itself when it can, rather than leave them to the
+  runner's workers.
+- Complete requires every part it names to be `accepted` before the commit.
+  It runs the accept for those parts as a sync task (parts it omits cannot
+  fail it), answers an accept that cannot start within 30 s with a 409 that
+  botocore clients treat as final, and fails with the accept's error when
+  the accept fails. A failed batch fails the whole accept, which records
+  nothing.
 - Rows from before migration 00030 are `parked` or `accepted` and have no
   `span_lengths`; Complete derives their lengths per blob.
 
-Sources: `registry/stores.go` (Part* consts, MoveParts, ListParkedParts,
-ListUploadsWithParkedParts), `registry/stores_postgres.go`,
-`s3frontend/acceptor.go`, `s3frontend/multipart.go` (ingestPart,
-acceptRequested), `migrations/sql/00030_part_accept_queue.sql`. Review when
-these change.
+Sources: `registry/stores.go` (Part* consts, ListParkedParts,
+OldestParkedPart), `registry/stores_postgres.go` (PutPart),
+`registry/accept.go`, `s3frontend/acceptor.go`, `s3frontend/multipart.go`
+(ingestPart, acceptRequested), `migrations/sql/00030_part_accept_queue.sql`,
+`migrations/sql/00033_task_runner.sql`. Review when these change.
 
 ## Session states and the Complete/Abort latch
 
@@ -718,7 +707,7 @@ flowchart TB
 
     uploading -->|"single-shot write's queue-space-shard.add: conclude, accept,<br/>or a blob_locations hit (dedup, the stream aborted);<br/>an object's local copy is adopted into the cache"| accepted
     uploading -->|"part's queue-space-shard.add (parkBlobs):<br/>the part streamed to its provider;<br/>blob_parks row written"| parked
-    parked -->|"acceptParked (the upload's acceptor, or Complete for a written part):<br/>/ucan/conclude; ConcludePark swaps the blob_parks row for blob_locations"| accepted
+    parked -->|"queue-multipart-upload-shard.accept (in the background, or run by Complete):<br/>/ucan/conclude; its commit swaps the blob_parks row for blob_locations"| accepted
     uploading -->|"queue-space-shard.release: /blob/remove<br/>(idempotent: the accept may have landed, its location not);<br/>rows deleted in the task's commit"| gone([deleted])
     parked -->|"queue-space-shard.release: /blob/abort (cause AddTask),<br/>or /blob/remove if the provider says accepted;<br/>rows deleted in the task's commit"| gone
     accepted -->|"queue-space-shard.release (never committed):<br/>/blob/remove;<br/>rows deleted in the task's commit;<br/>cached copy evicted"| gone
@@ -789,8 +778,8 @@ Sources: `registry/stores.go` (state consts), `s3frontend/object.go`
 `blockstore/blobcache.go` (CreateTemp, Adopt), `s3frontend/shardqueue.go`
 (queue-shard.cache, queue-shard.evict),
 `s3frontend/multipart.go`
-(parkBlobs, acceptParked, recordConcluded, concludeBlobs, enqueuePartReleases),
-`s3frontend/acceptor.go`, `s3frontend/releasequeue.go`
+(parkBlobs, enqueuePartReleases),
+`s3frontend/acceptor.go`, `registry/accept.go`, `s3frontend/releasequeue.go`
 (runRelease), `s3frontend/shardref.go` (runAdd, runExpire),
 `registry/stores_postgres.go` (CountReferences, takePendingRefs),
 `registry/release.go` (ReleasedRows, ReleasedIntent, PendingRef),
@@ -1192,7 +1181,7 @@ erDiagram
         bytea blob_digests "ordered array"
         bigint span_lengths "each blob's span in the object, bytes before encryption (digests are of the stored blob); NULL before 00030"
         text checksum
-        text state "written, parked, accepted: the acceptor's queue"
+        text state "parked, accepted: the upload's accept queue"
     }
     multipart_part_trees {
         text upload_id PK, FK
@@ -1317,7 +1306,7 @@ listed diagrams (each diagram's `Sources:` footer names its exact files).
 | `s3frontend/object.go` | put, get, blob-lifecycle, version-tree, gc-candidates, delete-bucket |
 | `s3frontend/version.go` | put, get, multipart, blob-lifecycle, version-tree, gc-candidates |
 | `s3frontend/multipart.go` | multipart, part-states, multipart-states, blob-lifecycle |
-| `s3frontend/acceptor.go` | multipart, part-states, blob-lifecycle |
+| `s3frontend/acceptor.go`, `registry/accept.go` | multipart, part-states, blob-lifecycle |
 | `s3frontend/releasequeue.go` | put, multipart, part-states, blob-lifecycle, delete-bucket |
 | `s3frontend/shardref.go` | put, multipart, blob-lifecycle |
 | `s3frontend/stream.go` | put, multipart, block-routes, blob-lifecycle |

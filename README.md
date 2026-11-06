@@ -223,9 +223,9 @@ uploads them (see DESIGN_NOTES), and report:
 
 | Metric | Meaning |
 | -- | -- |
-| `ingot.multipart.parked_age` | Seconds the oldest parked part of an open or completing upload has waited for acceptance, measured every 30s; 0 when none waits. Parts are accepted within seconds, so growth means the acceptance queue is stuck |
-| `ingot.multipart.accept_passes` | Acceptor passes that concluded parts, by `outcome`: `accepted` or `failed` (retried after a backoff; a timed-out pass included) |
-| `ingot.multipart.complete_deferred` | CompleteMultipartUpload requests answered OperationAborted because a part they name was still queued. Botocore clients (the AWS CLI) treat that as a failed upload |
+| `ingot.multipart.parked_age` | Seconds the oldest parked part of an open or completing upload has waited for acceptance, read from the part rows when collected; 0 when none waits. Parts are accepted within seconds, so growth means the acceptance queue is stuck |
+| `ingot.multipart.accept_passes` | Accept batches that concluded parts, by `outcome`: `accepted` or `failed` (the accept retries; a timed-out batch included) |
+| `ingot.multipart.complete_deferred` | CompleteMultipartUpload requests answered OperationAborted because the upload's accept did not start in time. Botocore clients (the AWS CLI) treat that as a failed upload |
 
 Each commit also journals its catalog blocks in Postgres until their segment
 ships (see `logstore/README.md`), so a copy of the database holds the

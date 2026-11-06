@@ -38,8 +38,8 @@ const (
 	// the space holds the blob already.
 	addStreamed = "streamed"
 	// addPart is a part blob the write streamed: its park is recorded, for
-	// the acceptor or Complete to conclude, unless the space has the blob
-	// parked or accepted already.
+	// the upload's accept to conclude, unless the space has the blob parked
+	// or accepted already.
 	addPart = "part"
 	// addCopy is a same-space copy of a blob the space holds: there is
 	// nothing to send, and a blob the space no longer holds fails the copy.
@@ -173,10 +173,6 @@ func (b *Backend) runAdd(ctx context.Context, ex *taskrunner.Exec, t taskrunner.
 		// The caller that held the stream has gone.
 		return nil, taskrunner.Permanent(fmt.Errorf("add of %x: no stream", digest))
 	}
-	// One write of these bytes at a time for this space (see Backend.blobKeys):
-	// Complete and the acceptor conclude parks under the same lock.
-	defer b.blobKeys.Lock(blobKey(space, digest))()
-
 	reused, err := b.addUse(ctx, space, digest, args, sb)
 	if err != nil {
 		return nil, err
@@ -216,12 +212,12 @@ func (b *Backend) addUse(ctx context.Context, space did.DID, digest multihash.Mu
 			return false, err
 		}
 		if args.Mode == addPart {
-			// A located blob has no use for a park. One is still here only
-			// when an earlier Complete recorded the location and then failed
-			// before dropping the row; Complete's dedup path drops it
-			// otherwise, so a failure here is logged.
+			// A located blob has no use for a park. One is still here when
+			// another write accepted the same bytes while a part's park
+			// stood; the upload's accept drops it otherwise, so a failure
+			// here is logged.
 			if err := b.parks.DeletePark(ctx, space, digest); err != nil {
-				b.logger.Warn("drop stale park row failed; Complete will retry",
+				b.logger.Warn("drop stale park row failed; the upload's accept will retry",
 					zap.Stringer("space", space), zap.Error(err))
 			}
 		}

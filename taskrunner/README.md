@@ -285,7 +285,7 @@ func release(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]
 }
 ```
 
-By default the due tasks behind a task waiting to retry run during its backoff. Set `HoldsSubject` when the order on the subject must survive a failure, such as a registration followed by its retraction; the subject then waits for the retry, sync tasks on it included. A handler that finds it must wait and has done nothing returns its error wrapped in `Defer`: that retry waits like any delayed task and holds up nothing, whatever the policy.
+By default the due tasks behind a task waiting to retry run during its backoff. Set `HoldsSubject` when the order on the subject must survive a failure, such as a registration followed by its retraction; the subject then waits for the retry, sync tasks on it included.
 
 ```go
 err := r.Handle("queue-space-upload", "remove", remove, taskrunner.WithRetry(taskrunner.RetryPolicy{

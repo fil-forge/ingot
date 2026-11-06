@@ -26,8 +26,9 @@ import (
 	"github.com/fil-forge/ingot/tenantkey"
 )
 
-// TestServerReportsLocalBlobGauges: New registers the local blob and catalog
-// journal gauges on the global meter provider, and Stop unregisters them.
+// TestServerReportsLocalBlobGauges: New registers the local blob, catalog
+// journal and multipart gauges on the global meter provider, and Stop
+// unregisters them.
 func TestServerReportsLocalBlobGauges(t *testing.T) {
 	reader := sdkmetric.NewManualReader()
 	prev := otel.GetMeterProvider()
@@ -42,6 +43,7 @@ func TestServerReportsLocalBlobGauges(t *testing.T) {
 		"ingot.catalog_journal.blocks":     true,
 		"ingot.catalog_journal.bytes":      true,
 		"ingot.catalog_journal.oldest_age": true,
+		"ingot.multipart.parked_age":       true,
 	}, metricNames(t, reader), "metrics reported after New")
 
 	require.NoError(t, s.Stop(context.Background()))

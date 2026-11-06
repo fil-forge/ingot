@@ -362,16 +362,8 @@ CREATE TRIGGER refuse_b BEFORE UPDATE OF state ON `+tasks+` FOR EACH ROW
 }
 
 func TestRetryThatHoldsTheSubjectKeepsItsOrder(t *testing.T) {
-	for _, tc := range []struct {
-		name          string
-		holds, defers bool
-	}{
-		{"holds", true, false},
-		{"does not hold", false, false},
-		{"holds, but the attempt deferred", true, true},
-	} {
-		holds := tc.holds
-		t.Run(tc.name, func(t *testing.T) {
+	for _, holds := range []bool{true, false} {
+		t.Run(map[bool]string{true: "holds", false: "does not hold"}[holds], func(t *testing.T) {
 			f := newFixture(t, 2)
 			var mu sync.Mutex
 			var order []string
@@ -380,9 +372,6 @@ func TestRetryThatHoldsTheSubjectKeepsItsOrder(t *testing.T) {
 			for _, action := range []string{"add", "remove"} {
 				if err := f.r.Handle(qTop, action, func(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
 					if task.Action == "add" && failedOnce.CompareAndSwap(false, true) {
-						if tc.defers {
-							return nil, taskrunner.Defer(errors.New("must wait"))
-						}
 						return nil, errors.New("unavailable")
 					}
 					mu.Lock()
@@ -410,7 +399,7 @@ func TestRetryThatHoldsTheSubjectKeepsItsOrder(t *testing.T) {
 				}
 			}
 			want := []string{"add", "remove"}
-			if !holds || tc.defers {
+			if !holds {
 				want = []string{"remove", "add"}
 			}
 			mu.Lock()

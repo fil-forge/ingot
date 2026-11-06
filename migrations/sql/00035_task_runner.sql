@@ -25,15 +25,15 @@ DROP TABLE ingot.blob_streams;
 -- transaction that drops its last claim, so its record table is gone.
 DROP TABLE ingot.blob_release_intents;
 
--- A part is 'written' until its blobs have all parked. Nothing uploads a part
--- from a local copy, so one whose blobs never all parked is refused at
--- Complete, and the client uploads it again.
+-- A part's blobs are parked before its row is written, so a part starts
+-- 'parked'. A part still spooled has no parked blobs and is dropped; the
+-- client uploads it again.
 ALTER TABLE ingot.multipart_parts DROP CONSTRAINT multipart_parts_state_check;
-UPDATE ingot.multipart_parts SET state = 'written' WHERE state = 'spooled';
+DELETE FROM ingot.multipart_parts WHERE state = 'spooled';
 ALTER TABLE ingot.multipart_parts
     ADD CONSTRAINT multipart_parts_state_check
-        CHECK (state IN ('written','parked','accepted')),
-    ALTER COLUMN state SET DEFAULT 'written';
+        CHECK (state IN ('parked','accepted')),
+    ALTER COLUMN state SET DEFAULT 'parked';
 
 -- Every body blob streams to its provider as the body arrives, so an intent
 -- starts 'uploading', none is 'spooled', and there is no local path for it to
@@ -75,7 +75,6 @@ CREATE INDEX upload_intents_stalled_idx
     ON ingot.upload_intents (updated_at) INCLUDE (size, state)
     WHERE state IN ('spooled', 'uploading');
 ALTER TABLE ingot.multipart_parts DROP CONSTRAINT multipart_parts_state_check;
-UPDATE ingot.multipart_parts SET state = 'spooled' WHERE state = 'written';
 ALTER TABLE ingot.multipart_parts
     ADD CONSTRAINT multipart_parts_state_check
         CHECK (state IN ('spooled','parked','accepted')),
