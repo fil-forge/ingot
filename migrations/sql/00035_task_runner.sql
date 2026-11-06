@@ -49,8 +49,21 @@ CREATE INDEX upload_intents_stalled_idx
     ON ingot.upload_intents (updated_at) INCLUDE (size)
     WHERE state = 'uploading';
 
+-- A write's use of a blob is a pending reference, taken by its
+-- queue-space-shard.add, until the write's commit or part row takes it over or
+-- its queue-space-shard.expire drops it at the deadline.
+CREATE TABLE ingot.blob_pending_refs (
+    add_task    uuid        PRIMARY KEY,
+    expire_task uuid        NOT NULL,
+    space       text        NOT NULL,
+    digest      bytea       NOT NULL,
+    deadline    timestamptz NOT NULL
+);
+CREATE INDEX blob_pending_refs_blob ON ingot.blob_pending_refs (space, digest);
+
 -- +goose Down
 -- In reverse order of the Up statements.
+DROP TABLE ingot.blob_pending_refs;
 DROP INDEX ingot.upload_intents_stalled_idx;
 ALTER TABLE ingot.upload_intents
     ADD COLUMN local_path text NOT NULL DEFAULT '',

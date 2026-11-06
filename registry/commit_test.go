@@ -54,12 +54,6 @@ func mustClaim(t *testing.T, st registry.Registry, c registry.BlobClaim) {
 	}
 }
 
-// pin commits claims borrowed from another object of the space.
-func pin(t *testing.T, st registry.Registry, claims []registry.BlobClaim) error {
-	t.Helper()
-	return commit(t, st, claims[0].Bucket, claims[0].Space, registry.RootCommit{Pins: claims})
-}
-
 // drop commits the removal of one claim.
 func drop(t *testing.T, st registry.Registry, d registry.ClaimDrop) {
 	t.Helper()

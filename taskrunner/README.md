@@ -200,7 +200,7 @@ ids, err := r.SubmitAllTx(ctx, tx, specs)
 
 ## Cancelling
 
-A pending task that has not started can be cancelled by queue and ID. Cancelling a task that has started, finished or been cancelled does nothing, so a task that can be cancelled must still check its own preconditions when it runs.
+A pending task that has not started can be cancelled by queue and ID, and many at once in one statement. Cancelling a task that has started, finished or been cancelled does nothing, so a task that can be cancelled must still check its own preconditions when it runs.
 
 ```go
 // From a handler: the cancel commits with the task's other writes.
@@ -209,23 +209,11 @@ err := ex.Cancel(ctx, "queue-space-shard", expireID)
 // From your own transaction.
 err = r.CancelTx(ctx, tx, "queue-space-shard", expireID)
 
-// On its own.
-err = r.Cancel(ctx, "queue-space-shard", expireID)
+// On its own, or many at once.
+err = r.Cancel(ctx, "queue-space-shard", expireIDs...)
 ```
 
-A caller that knows a task's subject and action but not its ID, such as a write about to reuse a blob whose release is pending, cancels by those instead. `CancelPending` cancels every pending task of the action on the given subjects that has not started, in one statement however many subjects there are, and lists the subjects with one already running, which it cannot cancel and the caller must wait out.
-
-```go
-n, running, err := r.CancelPending(ctx, "queue-space-shard", subjects, "release")
-if err == nil && len(running) > 0 {
-	// Those releases are under way: wait for them, or ask the client to retry.
-}
-
-// From your own transaction.
-n, running, err = r.CancelPendingTx(ctx, tx, "queue-space-shard", subjects, "release")
-```
-
-A caller that must leave such work alone, or wait for it, rather than take it over, asks the queue what is left. `Pending` returns the pending tasks of the action on each of the given subjects that has any, delayed, due or running, oldest first, and changes nothing.
+A caller that knows a task's subject and action but not its ID, and must leave the work alone or wait for it, asks the queue what is left. `Pending` returns the pending tasks of the action on each of the given subjects that has any, delayed, due or running, oldest first, and changes nothing.
 
 ```go
 // Which of these blobs still have a release to come?
@@ -297,7 +285,7 @@ func release(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]
 }
 ```
 
-By default the due tasks behind a task waiting to retry run during its backoff. Set `HoldsSubject` when the order on the subject must survive a failure, such as a registration followed by its retraction; the subject then waits for the retry, sync tasks on it included.
+By default the due tasks behind a task waiting to retry run during its backoff. Set `HoldsSubject` when the order on the subject must survive a failure, such as a registration followed by its retraction; the subject then waits for the retry, sync tasks on it included. A handler that finds it must wait and has done nothing returns its error wrapped in `Defer`: that retry waits like any delayed task and holds up nothing, whatever the policy.
 
 ```go
 err := r.Handle("queue-space-upload", "remove", remove, taskrunner.WithRetry(taskrunner.RetryPolicy{

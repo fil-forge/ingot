@@ -19,7 +19,7 @@ import (
 )
 
 // countingUploader records how many times each digest is uploaded. It returns
-// a non-empty location so the backend records it (what concludeStreamed's
+// a non-empty location so the backend records it (what the add's
 // already-located short-circuit reads back).
 type countingUploader struct {
 	testfakes.NopUploader
@@ -41,7 +41,7 @@ func (u *countingUploader) UploadBlob(_ context.Context, _ did.DID, digest multi
 // TestUpload_IdenticalContentUploadsDistinctBlobs pins the encryption RFC's
 // stated dedup trade-off: every write mints a fresh CEK, so identical
 // plaintext produces a different ciphertext digest each time and each PUT
-// uploads its own blob exactly once. (concludeStreamed still short-circuits on an
+// uploads its own blob exactly once. (The add still short-circuits on an
 // already-recorded location — that guard now only fires for digests shared
 // by same-space copies, where no re-upload is needed.)
 func TestUpload_IdenticalContentUploadsDistinctBlobs(t *testing.T) {

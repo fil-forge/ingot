@@ -184,19 +184,8 @@ func (r *Postgres) CommitRoot(ctx context.Context, name string, expect, next cid
 			return fmt.Errorf("registry: queue upload registration for %q: %w", name, err)
 		}
 	}
-	// Every claim key the commit touches is locked up front, once, in one
-	// order for every commit, so two commits sharing digests cannot deadlock
-	// whichever of their claims and drops name them.
-	if err := lockClaimKeys(ctx, tx, c); err != nil {
-		return err
-	}
 	if err := addClaims(ctx, tx, r.tasks, c.Claims); err != nil {
 		return err
-	}
-	for _, p := range c.Pins {
-		if err := pinClaim(ctx, tx, p); err != nil {
-			return err
-		}
 	}
 	if err := dropClaims(ctx, tx, r.tasks, c.Drops, c.ReleaseGrace, c.Release); err != nil {
 		return err

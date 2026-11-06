@@ -18,6 +18,7 @@ import (
 
 	msbucket "github.com/fil-forge/ingot/bucket"
 	"github.com/fil-forge/ingot/registry"
+	"github.com/fil-forge/ingot/taskrunner"
 )
 
 // CopyObject copies an object. Within one space it is a metadata-only
@@ -177,6 +178,7 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 	// The commit writes the copy's blob list into the destination's catalog,
 	// so a pinned body's blobs are read from the source's.
 	var blobs msbucket.BlobRefs
+	var refs map[string]taskrunner.TaskID
 	// A source without any checksum (a manifest from before every object
 	// carried one) also takes the pass, so the copy gets the default.
 	if reingest || multipartSrc || ckAlgo == "" || ckAlgo != srcMf.ChecksumAlgorithm {
@@ -205,7 +207,7 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 			if !multipartSrc && len(srcMf.Body.MD5) == md5.Size {
 				copyMD5 = knownMD5(srcMf.Body.MD5)
 			}
-			if body, blobs, err = b.ingestBody(ctx, bucketState, hr, srcMf.Body.Size, copyMD5, plaintext); err != nil {
+			if body, blobs, refs, err = b.ingestBody(ctx, bucketState, hr, srcMf.Body.Size, copyMD5, plaintext); err != nil {
 				var apiErr s3err.APIError
 				if errors.As(err, &apiErr) {
 					return s3response.CopyObjectOutput{}, apiErr
@@ -274,19 +276,23 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 	// Commit to the destination via the write rule: splice + reference index.
 	// The claims use the DESTINATION bucket/space: for a pinned body the same
 	// digests gain another reference, for a re-ingested one its new digests
-	// gain their first. A pinned body's claims are conditional on the
-	// source's: a source deleted since it was resolved, its blobs' release
-	// under way, is a source that no longer exists.
+	// gain their first. A pinned body's blobs each take a reference first,
+	// through an add on the blob's subject, so a release of the source's
+	// blobs either runs first, and the copy finds its source gone, or finds
+	// the copy's reference and leaves the blob.
 	if !reingest {
 		if blobs, err = msbucket.ReadBlobRefs(ctx, srcMf.Body.Index(b.read, srcRv.st.Space)); err != nil {
 			return s3response.CopyObjectOutput{}, fmt.Errorf("s3frontend: copy source blobs: %w", err)
 		}
-	}
-	node, effState, err := b.commitVersion(ctx, bucketState, dstKey, dstMf, blobs, applyTagsIfPresent(initState, dstTags), !reingest, nil)
-	if err != nil {
-		if errors.Is(err, registry.ErrClaimGone) {
-			return s3response.CopyObjectOutput{}, s3err.GetAPIError(s3err.ErrNoSuchKey)
+		if refs, err = b.pinBlobs(ctx, bucketState, blobs); err != nil {
+			if errors.Is(err, errBlobGone) {
+				return s3response.CopyObjectOutput{}, s3err.GetAPIError(s3err.ErrNoSuchKey)
+			}
+			return s3response.CopyObjectOutput{}, err
 		}
+	}
+	node, effState, err := b.commitVersion(ctx, bucketState, dstKey, dstMf, blobs, applyTagsIfPresent(initState, dstTags), refs, nil)
+	if err != nil {
 		return s3response.CopyObjectOutput{}, err
 	}
 
@@ -349,4 +355,24 @@ func (b *Backend) copySourceBucket(ctx context.Context, dst *registry.State, src
 		return nil, s3err.GetAPIError(s3err.ErrAccessDenied)
 	}
 	return src, nil
+}
+
+// pinBlobs takes a same-space copy's reference to each of the source's blobs,
+// for the copy's commit to claim, and returns them by string(digest). A blob
+// the space no longer holds fails with errBlobGone.
+func (b *Backend) pinBlobs(ctx context.Context, bucket *registry.State, blobs msbucket.BlobRefs) (map[string]taskrunner.TaskID, error) {
+	release := b.releaseAuthority(ctx, bucket.Space)
+	refs := make(map[string]taskrunner.TaskID, len(blobs))
+	for _, blob := range blobs {
+		k := string(blob.Digest)
+		if _, ok := refs[k]; ok {
+			continue
+		}
+		ref, err := b.addBlob(ctx, bucket.Space, bucket.Name, blob.Digest, 0, addCopy, nil, release)
+		if err != nil {
+			return nil, err
+		}
+		refs[k] = ref
+	}
+	return refs, nil
 }

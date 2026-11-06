@@ -179,6 +179,44 @@ func TestCancel(t *testing.T) {
 	}
 }
 
+// Cancel takes many IDs and cancels them in one statement, in a transaction
+// too, leaving a task already finished alone.
+func TestCancelMany(t *testing.T) {
+	f := newFixture(t, 2)
+	f.handle(t, qBottom, "expire", f.put())
+	f.start(t)
+	ctx := waitCtx(t)
+	var ids []taskrunner.TaskID
+	for i := range 3 {
+		id, err := f.r.Submit(ctx, taskrunner.Spec{Queue: qBottom, Subject: fmt.Sprintf("ref%d", i), Action: "expire", Args: []byte("x"), NotBefore: at(time.Hour)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+	tx, err := f.env.DB.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.r.CancelTx(ctx, tx, qBottom, ids[:2]...); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.r.Cancel(ctx, qBottom, ids[2]); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range ids {
+		if s := f.state(t, qBottom, id); s != "cancelled" {
+			t.Errorf("task %s is %s, want cancelled", id, s)
+		}
+	}
+	if err := f.r.Cancel(ctx, qBottom); err != nil {
+		t.Errorf("Cancel of no tasks: %v", err)
+	}
+}
+
 func TestBatchStopsAtTheLimitAndAtAnotherAction(t *testing.T) {
 	f := newFixture(t, 1)
 	var mu sync.Mutex
@@ -324,8 +362,16 @@ CREATE TRIGGER refuse_b BEFORE UPDATE OF state ON `+tasks+` FOR EACH ROW
 }
 
 func TestRetryThatHoldsTheSubjectKeepsItsOrder(t *testing.T) {
-	for _, holds := range []bool{true, false} {
-		t.Run(map[bool]string{true: "holds", false: "does not hold"}[holds], func(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		holds, defers bool
+	}{
+		{"holds", true, false},
+		{"does not hold", false, false},
+		{"holds, but the attempt deferred", true, true},
+	} {
+		holds := tc.holds
+		t.Run(tc.name, func(t *testing.T) {
 			f := newFixture(t, 2)
 			var mu sync.Mutex
 			var order []string
@@ -334,6 +380,9 @@ func TestRetryThatHoldsTheSubjectKeepsItsOrder(t *testing.T) {
 			for _, action := range []string{"add", "remove"} {
 				if err := f.r.Handle(qTop, action, func(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
 					if task.Action == "add" && failedOnce.CompareAndSwap(false, true) {
+						if tc.defers {
+							return nil, taskrunner.Defer(errors.New("must wait"))
+						}
 						return nil, errors.New("unavailable")
 					}
 					mu.Lock()
@@ -361,7 +410,7 @@ func TestRetryThatHoldsTheSubjectKeepsItsOrder(t *testing.T) {
 				}
 			}
 			want := []string{"add", "remove"}
-			if !holds {
+			if !holds || tc.defers {
 				want = []string{"remove", "add"}
 			}
 			mu.Lock()

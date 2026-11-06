@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	msbucket "github.com/fil-forge/ingot/bucket"
+	"github.com/google/uuid"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -190,9 +191,9 @@ func claims(t *testing.T, mem *testStore, digest []byte) int {
 	// MemStore buckets carry no space (mem.bk()), so claims recorded via
 	// the backend are keyed under mem.bk(); count under the same key.
 	// Space-keyed claim counting is covered by the live Postgres test.
-	n, err := mem.CountClaims(context.Background(), mem.bk(), digest)
+	n, err := mem.CountReferences(context.Background(), mem.bk(), digest, uuid.Nil)
 	if err != nil {
-		t.Fatalf("CountClaims: %v", err)
+		t.Fatalf("CountReferences: %v", err)
 	}
 	return n
 }
