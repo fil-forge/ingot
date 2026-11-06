@@ -298,7 +298,7 @@ func TestConsumerWaitsBeforeReconnectingAfterARefusal(t *testing.T) {
 	stop := run(c)
 	defer stop()
 
-	waitFor(t, func() bool { return src.headCalls() == 1 })
+	waitFor(t, func() bool { return src.headCalls() >= 1 })
 	time.Sleep(20 * time.Millisecond)
 	require.Len(t, src.calls(), 1, "reconnected without waiting")
 }

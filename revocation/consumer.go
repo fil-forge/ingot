@@ -36,10 +36,12 @@
 // If new records pass the cursor before the consumer reconnects, the service
 // accepts it and nothing reports the gap. So after restoring the service's
 // database from a backup, or restarting a service that keeps its records in
-// memory, restart ingot once the service is serving again, and after a refused
-// cursor too. The restart empties every cache, and any record the consumer
-// then skips was recorded before it, so each key such a record named goes to
-// Hilt on its next request.
+// memory, restart ingot once the service is serving again, and restart it
+// again whenever it logs a refused cursor, including right after that first
+// restart: the restarted consumer reads the head only once the gateway is
+// already serving, so it can skip records written after the restart. A
+// restart empties every cache, so each key named by a record skipped before it
+// goes to Hilt on its next request.
 //
 // One case survives a restart: a Hilt write that published its revocations,
 // then failed to commit. Hilt keeps serving the revoked delegations until a
@@ -190,7 +192,7 @@ func (c *Consumer) Run(ctx context.Context) {
 			if errors.Is(err, swarfclient.ErrCursorRefused) {
 				c.logger.Error("revocation: cursor refused",
 					zap.String("cursor", position.Token),
-					zap.String("action", "starting over at the firehose head; restart ingot to drop authorization cached for revocations recorded since the service's database was restored"),
+					zap.String("action", "starting over at the firehose head; restart ingot to drop authorization cached for keys whose revocations were skipped"),
 					zap.Error(err))
 				refused = true
 				break
