@@ -25,7 +25,7 @@ CREATE TABLE %[1]s (
 	args       bytea,
 	sync       boolean NOT NULL,
 	state      text NOT NULL DEFAULT 'pending'
-	           CHECK (state IN ('pending', 'succeeded', 'failed', 'expired', 'cancelled')),
+	           CHECK (state IN ('pending', 'succeeded', 'failed', 'expired', 'cancelled', 'resubmitted')),
 	result     bytea,
 	error      text,
 	finished   timestamptz,
@@ -41,20 +41,25 @@ CREATE TABLE %[1]s (
 	retry_at    timestamptz,
 	-- node, when set, is the only instance that may run the task.
 	node        text
-);
+) WITH (%[7]s);
 CREATE INDEX %[3]s ON %[1]s (subject, seq) WHERE state = 'pending';
 `+dueIndex(q)+`
 CREATE UNIQUE INDEX %[4]s ON %[1]s (subject, action)
 	WHERE state = 'pending' AND replaceable AND started IS NULL;
+CREATE INDEX %[5]s ON %[1]s (subject, seq) WHERE state = 'failed';
+CREATE INDEX %[6]s ON %[1]s (finished) WHERE state <> 'pending';
 CREATE TABLE %[2]s (
 	subject      text PRIMARY KEY,
 	owner        uuid NOT NULL,
 	expires      timestamptz NOT NULL,
 	tree_created timestamptz NOT NULL,
 	tree_id      uuid NOT NULL
-);`, q.tasks, q.leases,
+) WITH (%[7]s);`, q.tasks, q.leases,
 			pgx.Identifier{q.table + "_tasks_pending"}.Sanitize(),
-			pgx.Identifier{q.table + "_tasks_replaceable"}.Sanitize())
+			pgx.Identifier{q.table + "_tasks_replaceable"}.Sanitize(),
+			pgx.Identifier{q.table + "_tasks_failed"}.Sanitize(),
+			pgx.Identifier{q.table + "_tasks_finished"}.Sanitize(),
+			churnStorage)
 	},
 }
 
@@ -66,6 +71,18 @@ func dueIndex(q *queue) string {
 	return fmt.Sprintf(`CREATE INDEX %s ON %s (not_before) WHERE state = 'pending';`,
 		pgx.Identifier{q.table + "_tasks_due"}.Sanitize(), q.tasks)
 }
+
+// churnStorage is the storage settings of both queue tables. They churn: every
+// task's row is rewritten as it starts, finishes, retries and has its waiting
+// caller's claim renewed, then deleted past its retention, and every lease is
+// inserted, renewed and deleted. Postgres leaves a dead row behind for each of
+// those until autovacuum reclaims it, so autovacuum runs once 1% of a table is
+// dead (plus a fixed threshold) rather than the default 20%, and pages keep a
+// fifth of their space free, so an update that touches no indexed column, such
+// as a claim or lease renewal, can stay on its page and leave the indexes be.
+const churnStorage = `fillfactor = 80,
+	autovacuum_vacuum_scale_factor = 0.01, autovacuum_vacuum_threshold = 1000,
+	autovacuum_analyze_scale_factor = 0.02`
 
 // Migrate creates or updates the tables of every queue in Options.Queues.
 // Concurrent calls against one database serialize on a transaction-scoped
