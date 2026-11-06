@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/google/uuid"
 	"github.com/ipfs/go-cid"
 	"os"
 	"sync"
@@ -221,11 +222,15 @@ func TestPlaintextSpaces_ReleaseInOneSpaceKeepsTheOthersPark(t *testing.T) {
 }
 
 // TestPlaintextSpaces_SameSpaceRewriteMakesTheReleaseStale: within one
-// space, identical bytes written again while the deleted twin's release is
-// pending re-claim the digest; the release finds the claim and drops its
-// record, and the new object keeps its blob.
+// space, identical bytes written again while the deleted twin's release
+// waits out its reader grace re-claim the digest; the release finds the
+// claim and does nothing, and the new object keeps its blob.
 func TestPlaintextSpaces_SameSpaceRewriteMakesTheReleaseStale(t *testing.T) {
-	b, mem, rm := newRefTestBackend(t)
+	rm := &recordingRemover{}
+	b, mem := newDeferredBackend(t, testfakes.NopUploader{}, func(d *Deps) {
+		d.Remover = rm
+		d.ReleaseGrace = time.Hour
+	})
 	ctx := context.Background()
 	setNone(t, b)
 	data := testBody(8 << 10)
@@ -234,7 +239,9 @@ func TestPlaintextSpaces_SameSpaceRewriteMakesTheReleaseStale(t *testing.T) {
 	d := blobDigestOf(t, b, "old", "")
 	deleteFrom(t, b, "bk", "old")
 	putIn(t, b, "bk", "new", data)
-	drainReleases(t, b)
+	if err := b.drainSpaceReleases(ctx, mem.bk()); err != nil {
+		t.Fatalf("run the space's releases: %v", err)
+	}
 
 	if pending, _ := mem.ListReleasesBySpace(ctx, mem.bk()); len(pending) != 0 {
 		t.Fatalf("release records after the drain = %v, want none (stale, dropped)", pending)
@@ -351,42 +358,15 @@ func TestPlaintextRelease_WaitIsBounded(t *testing.T) {
 	putIn(t, b, "bk", "old", data)
 	deleteFrom(t, b, "bk", "old")
 	holdRelease(t, b, gate)
-	limit := reuseWaitLimit
-	reuseWaitLimit = 50 * time.Millisecond
-	t.Cleanup(func() { reuseWaitLimit = limit })
+	limit := addWaitLimit
+	addWaitLimit = 50 * time.Millisecond
+	t.Cleanup(func() { addWaitLimit = limit })
 
 	bucket, key := "bk", "new"
 	_, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(data), ContentLength: byteLen(data)})
 	var apiErr s3err.APIError
 	if !errors.As(err, &apiErr) || apiErr.Code != "SlowDown" {
 		t.Fatalf("PutObject during a release that never finishes: err = %v, want SlowDown", err)
-	}
-}
-
-// TestPlaintextSpaces_ReleaseIgnoresAnotherSpacesWrite: a write in flight
-// defers only its own space's release. A release in one space meeting the
-// other space's write deletes its own intent and record; it does not mistake
-// the other write for one of its own waiting on it.
-func TestPlaintextSpaces_ReleaseIgnoresAnotherSpacesWrite(t *testing.T) {
-	b, mem, _ := newRefTestBackend(t)
-	space2 := secondPlaintextBucket(t, b, mem)
-	ctx := context.Background()
-	data := testBody(8 << 10)
-
-	putIn(t, b, "bk", "k", data)
-	d := blobDigestOf(t, b, "k", "")
-	// A write in bk2 has sent the same bytes and not yet recorded them.
-	unhold := b.writing.mark(space2, d)
-	defer unhold()
-
-	deleteFrom(t, b, "bk", "k")
-	drainReleases(t, b)
-
-	if _, err := mem.GetIntent(ctx, mem.bk(), d); !errors.Is(err, registry.ErrNotFound) {
-		t.Fatalf("the releasing space's intent survived behind another space's hold (err=%v)", err)
-	}
-	if pending, _ := mem.ListReleasesBySpace(ctx, mem.bk()); len(pending) != 0 {
-		t.Fatalf("release record survived: %v", pending)
 	}
 }
 
@@ -453,43 +433,6 @@ func (r *releaseBeforeCommit) CommitRoot(ctx context.Context, name string, expec
 		start()
 	}
 	return r.Registry.CommitRoot(ctx, name, expect, next, c)
-}
-
-// TestPlaintextRelease_ClaimRefusedDuringAStartedRelease: a release that
-// starts after the write settled it and before its commit refuses the
-// claim, so the write fails with SlowDown rather than commit a manifest
-// over a blob the release is removing. The body has two blobs and the
-// release is of the second: the first blob's claim does not land either,
-// since no generation would ever drop it.
-func TestPlaintextRelease_ClaimRefusedDuringAStartedRelease(t *testing.T) {
-	gate := newGatedRemover()
-	reg := &releaseBeforeCommit{}
-	b, mem := newDeferredBackend(t, testfakes.NopUploader{}, withGate(gate), func(d *Deps) {
-		reg.Registry = d.Registry
-		d.Registry = reg
-		d.MaxBlobSize = 4 << 10
-	})
-	setNone(t, b)
-	data := testBody(8 << 10)
-	first, second := digestOf(t, data[:4<<10]), digestOf(t, data[4<<10:])
-	reg.start = func() {
-		if err := mem.EnqueueRelease(context.Background(), mem.bk(), second, registry.DueNow()); err != nil {
-			t.Fatalf("EnqueueRelease: %v", err)
-		}
-		holdRelease(t, b, gate)
-	}
-
-	bucket, key := "bk", "k"
-	_, err := b.PutObject(context.Background(), s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(data), ContentLength: byteLen(data)})
-	var apiErr s3err.APIError
-	if !errors.As(err, &apiErr) || apiErr.Code != "SlowDown" {
-		t.Fatalf("PutObject with a release started before its commit: err = %v, want SlowDown", err)
-	}
-	for _, d := range []multihash.Multihash{first, second} {
-		if n, _ := mem.CountClaims(context.Background(), mem.bk(), d); n != 0 {
-			t.Fatalf("a claim on %x landed although the commit was refused: %d", d, n)
-		}
-	}
 }
 
 // TestPlaintextRelease_StreamedWriteWaitsOutAStartedRelease: a streamed blob
@@ -672,52 +615,74 @@ func TestPlaintextSpaces_LastReleaseOutRemovesTheSharedFile(t *testing.T) {
 	}
 }
 
-// releaseBetweenReuseAndCommit is an intent store under which a release of
-// the digest runs to completion right after a write has decided to reuse
-// the located blob (the mark it sets then): the location is gone by the
-// time the write's claim lands.
-type releaseBetweenReuseAndCommit struct {
-	registry.IntentStore
-	locations registry.LocationStore
-	digest    multihash.Multihash
-	armed     bool
-}
-
-func (r *releaseBetweenReuseAndCommit) SetIntentState(ctx context.Context, space did.DID, digest multihash.Multihash, state string) error {
-	err := r.IntentStore.SetIntentState(ctx, space, digest, state)
-	if err == nil && r.armed && state == registry.IntentAccepted && bytes.Equal(digest, r.digest) {
-		r.armed = false
-		if err := r.locations.DeleteLocation(ctx, space, digest); err != nil {
-			return err
-		}
-	}
-	return err
-}
-
-// TestPlaintextRelease_ClaimRefusedOnceTheLocationIsGone: a write that
-// settled with no release in the way and reuses the located blob finds, at
-// its commit, that a release ran to completion meanwhile: the claim is
-// refused, since the blob is gone from the provider, and the write fails
-// with SlowDown for the client to retry.
-func TestPlaintextRelease_ClaimRefusedOnceTheLocationIsGone(t *testing.T) {
-	rel := &releaseBetweenReuseAndCommit{}
+// TestPlaintextRelease_ReleaseBeforeTheCommitIsStale: a release of the
+// write's blob that runs after its add and before its commit finds the
+// write's reference and does nothing, so the write commits over a blob its
+// provider still holds.
+func TestPlaintextRelease_ReleaseBeforeTheCommitIsStale(t *testing.T) {
+	rm := &recordingRemover{}
+	reg := &releaseBeforeCommit{}
 	b, mem := newDeferredBackend(t, testfakes.NopUploader{}, func(d *Deps) {
-		rel.IntentStore, rel.locations = d.Intents, d.Locations
-		d.Intents = rel
+		reg.Registry = d.Registry
+		d.Registry = reg
+		d.Remover = rm
 	})
 	setNone(t, b)
 	data := testBody(8 << 10)
-	putIn(t, b, "bk", "old", data)
-	rel.digest, rel.armed = blobDigestOf(t, b, "old", ""), true
+	d := digestOf(t, data)
+	reg.start = func() {
+		if err := mem.EnqueueRelease(context.Background(), mem.bk(), d, registry.DueNow()); err != nil {
+			t.Fatalf("EnqueueRelease: %v", err)
+		}
+		drainReleases(t, b)
+	}
 
-	bucket, key := "bk", "new"
+	putIn(t, b, "bk", "k", data)
+	if reg.start != nil {
+		t.Fatal("the release never ran")
+	}
+	if n := rm.removedDigests()[string(d)]; n != 0 {
+		t.Fatalf("the referenced blob was removed from the network %d times", n)
+	}
+	if got := getFrom(t, b, "bk", "k"); !bytes.Equal(got, data) {
+		t.Fatalf("the object does not read back")
+	}
+}
+
+// TestPlaintextRelease_ExpiredReferenceRefusesTheCommit: a write whose
+// reference to one of its blobs expired before its commit, its blob released,
+// fails with SlowDown for the client to retry, and none of its claims land.
+func TestPlaintextRelease_ExpiredReferenceRefusesTheCommit(t *testing.T) {
+	rm := &recordingRemover{}
+	reg := &releaseBeforeCommit{}
+	b, mem := newDeferredBackend(t, testfakes.NopUploader{}, func(d *Deps) {
+		reg.Registry = d.Registry
+		d.Registry = reg
+		d.Remover = rm
+		d.MaxBlobSize = 4 << 10
+	})
+	setNone(t, b)
+	data := testBody(8 << 10)
+	first, second := digestOf(t, data[:4<<10]), digestOf(t, data[4<<10:])
+	reg.start = func() {
+		b.dropRefsNow(context.Background(), mem.bk(), []multihash.Multihash{second})
+	}
+
+	bucket, key := "bk", "k"
 	_, err := b.PutObject(context.Background(), s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(data), ContentLength: byteLen(data)})
 	var apiErr s3err.APIError
 	if !errors.As(err, &apiErr) || apiErr.Code != "SlowDown" {
-		t.Fatalf("PutObject whose blob was released before its commit: err = %v, want SlowDown", err)
+		t.Fatalf("PutObject whose reference expired before its commit: err = %v, want SlowDown", err)
 	}
-	if n, _ := mem.CountClaims(context.Background(), mem.bk(), rel.digest); n != 1 {
-		t.Fatalf("claims on the digest = %d, want only the old object's", n)
+	if n := rm.removedDigests()[string(second)]; n != 1 {
+		t.Fatalf("the expired reference's blob was removed %d times, want 1", n)
+	}
+	n, _ := mem.CountReferences(context.Background(), mem.bk(), first, uuid.Nil)
+	if n != 1 {
+		t.Fatalf("references to the first blob = %d, want only the write's pending one", n)
+	}
+	if claims, _ := mem.CountClaimRows(context.Background(), mem.bk(), first); claims != 0 {
+		t.Fatalf("a claim on the first blob landed although the commit was refused: %d", claims)
 	}
 }
 
@@ -808,112 +773,6 @@ func TestPlaintextRelease_StreamedPartLocatedMeanwhileReuses(t *testing.T) {
 	if got := getFrom(t, b, "bk", "k"); !bytes.Equal(got, part) {
 		t.Fatalf("the completed object does not read back")
 	}
-}
-
-// heldWhenRecorded is a location and park store that notes, for one digest,
-// whether the write was still marked in flight when its location or park was
-// recorded: the mark must outlast the row that says the provider holds the
-// blob, so no release reads an intent still uploading with neither row.
-type heldWhenRecorded struct {
-	registry.LocationStore
-	registry.ParkStore
-	b      *Backend
-	space  did.DID
-	digest multihash.Multihash
-	mu     sync.Mutex
-	held   []bool
-}
-
-func (h *heldWhenRecorded) note(digest multihash.Multihash) {
-	if bytes.Equal(digest, h.digest) {
-		h.mu.Lock()
-		h.held = append(h.held, h.b.writing.marked(h.space, digest))
-		h.mu.Unlock()
-	}
-}
-
-func (h *heldWhenRecorded) PutLocation(ctx context.Context, loc registry.BlobLocation) error {
-	h.note(loc.Digest)
-	return h.LocationStore.PutLocation(ctx, loc)
-}
-
-func (h *heldWhenRecorded) PutPark(ctx context.Context, p registry.BlobPark) (bool, error) {
-	h.note(p.Digest)
-	return h.ParkStore.PutPark(ctx, p)
-}
-
-func (h *heldWhenRecorded) wantHeld(t *testing.T, what string) {
-	t.Helper()
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if len(h.held) == 0 {
-		t.Fatalf("%s: nothing was recorded for the digest", what)
-	}
-	for i, held := range h.held {
-		if !held {
-			t.Fatalf("%s: record %d was written after the write had ended its mark", what, i)
-		}
-	}
-}
-
-// TestPlaintextRelease_HoldOutlastsTheRecord covers the write paths, an
-// object and a part, over each test provider. In each the write is still
-// marked in flight when the location or park is recorded.
-func TestPlaintextRelease_HoldOutlastsTheRecord(t *testing.T) {
-	data := testBody(8 << 10)
-	d := digestOf(t, data)
-	wire := func(h *heldWhenRecorded) func(*Deps) {
-		return func(dp *Deps) {
-			h.LocationStore, h.ParkStore, h.digest = dp.Locations, dp.Parks, d
-			dp.Locations, dp.Parks = h, h
-		}
-	}
-
-	t.Run("upload", func(t *testing.T) {
-		h := &heldWhenRecorded{}
-		b, mem := newDeferredBackend(t, &countingUploader{calls: map[string]int{}}, wire(h))
-		h.b, h.space = b, mem.bk()
-		setNone(t, b)
-		putIn(t, b, "bk", "k", data)
-		h.wantHeld(t, "location of an object")
-	})
-	t.Run("park", func(t *testing.T) {
-		h := &heldWhenRecorded{}
-		b, mem := newDeferredBackend(t, &parkingUploader{}, wire(h))
-		h.b, h.space = b, mem.bk()
-		setNone(t, b)
-		uploadOnePart(t, b, "bk", "k", data)
-		h.wantHeld(t, "park of a part")
-	})
-	t.Run("streamed upload", func(t *testing.T) {
-		h := &heldWhenRecorded{}
-		su := newStreamingUploader()
-		b, mem := newStreamingBackend(t, su, wire(h))
-		h.b, h.space = b, mem.bk()
-		setNone(t, b)
-		if err := putSized(t, b, "k", data, int64(len(data))); err != nil {
-			t.Fatalf("PutObject: %v", err)
-		}
-		h.wantHeld(t, "location of a streamed upload")
-	})
-	t.Run("streamed park", func(t *testing.T) {
-		h := &heldWhenRecorded{}
-		su := newStreamingUploader()
-		b, mem := newStreamingBackend(t, su, wire(h))
-		h.b, h.space = b, mem.bk()
-		setNone(t, b)
-		bucket, key := "bk", "k"
-		ctx := context.Background()
-		created, err := b.CreateMultipartUpload(ctx, s3response.CreateMultipartUploadInput{Bucket: &bucket, Key: &key})
-		if err != nil {
-			t.Fatalf("CreateMultipartUpload: %v", err)
-		}
-		id, n, size := created.UploadId, int32(1), int64(len(data))
-		if _, err := b.UploadPart(ctx, &s3.UploadPartInput{Bucket: &bucket, Key: &key, UploadId: &id, PartNumber: &n, Body: bytes.NewReader(data), ContentLength: &size}); err != nil {
-			t.Fatalf("UploadPart: %v", err)
-		}
-		h.wantHeld(t, "park of a streamed part")
-	})
 }
 
 // gatedRemover holds each network remove until the test opens it, so a

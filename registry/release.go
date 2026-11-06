@@ -22,6 +22,15 @@ const ReleaseQueue = "queue-space-shard"
 // space on the network, and its local rows and copy.
 const ReleaseAction = "release"
 
+// The queue-space-shard actions a write's use of a blob goes through. An add
+// takes the write's pending reference to the blob, under the blob's subject,
+// so it never overlaps a release; an expire drops the reference at its
+// deadline if nothing took it over.
+const (
+	AddAction    = "add"
+	ExpireAction = "expire"
+)
+
 // ReleaseSubject is the subject of the release of digest in space.
 func ReleaseSubject(space did.DID, digest multihash.Multihash) string {
 	return space.String() + "/" + hex.EncodeToString(digest)
@@ -121,4 +130,21 @@ func ReleasedRows(space did.DID, digest multihash.Multihash) []Statement {
 // released blob, the last trace of how far it got.
 func ReleasedIntent(space did.DID, digest multihash.Multihash) Statement {
 	return Statement{`DELETE FROM ingot.upload_intents WHERE space = $1 AND digest = $2`, []any{space, []byte(digest)}}
+}
+
+// PendingRef is the write that records a pending reference to digest in
+// space, taken by the queue-space-shard.add add and dropped at deadline by
+// the queue-space-shard.expire expire unless a claim or a part row takes it
+// over first.
+func PendingRef(add, expire taskrunner.TaskID, space did.DID, digest multihash.Multihash, deadline time.Time) Statement {
+	return Statement{
+		`INSERT INTO ingot.blob_pending_refs (add_task, expire_task, space, digest, deadline) VALUES ($1, $2, $3, $4, $5)`,
+		[]any{add, expire, space, []byte(digest), deadline},
+	}
+}
+
+// DroppedPendingRef is the write that drops the pending reference whose
+// expiry is expire.
+func DroppedPendingRef(expire taskrunner.TaskID) Statement {
+	return Statement{`DELETE FROM ingot.blob_pending_refs WHERE expire_task = $1`, []any{expire}}
 }

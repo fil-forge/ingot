@@ -408,22 +408,25 @@ read at the start of the operation; on mismatch, reload and retry the (cheap) sp
 2. UPLOAD  (no lock, per blob, as the body arrives)
      blob/add(size) → PUT the bytes as they arrive, sha256 on the way (a local copy
        teed into the cache) → PARKED; a failed PUT aborts the allocation and fails the request
-     trigger accept (conclude the PUT receipt) → Sprue issues blob/accept
+     queue-space-shard.add on the blob's release subject (waits up to 30 s behind a release):
+       conclude the PUT receipt → Sprue issues blob/accept
        → Piri publishes the location commitment; the blob enters aggregation
        (a blob the space holds already is reused and the new allocation aborted)
-     record location + intent accepted; adopt the local copy into the cache
+       record location + intent accepted; take a pending reference, expiring in 24 h
+     adopt the local copy into the cache
 3. COMMIT  (short per-bucket critical section)
      load MST at base root; allocate versionId
      write the manifest; splice key+versionId → manifest CID (new MST nodes)
-     blob_refs[(space,digest)] += this version
+     blob_refs[(space,digest)] += this version, taking over the pending reference
+       (an expired reference fails the commit with SlowDown)
      if Suspended/Unversioned and a prior null-version existed:
         blob_refs[(space,oldDigest)] -= it; on empty → remove (§6)
      record superseded MST nodes → gc_candidates; guarded root swap
 4. ACK     return 200 + ETag(md5)   — data is durable+accepted in Piri
 ```
 
-Ingest, hashing, and the Piri upload all run **outside any lock** (a conclude takes a lock on its
-space and digest only). The critical section does no large-body work — a manifest write, an MST splice, a few
+Ingest, hashing, and the Piri upload all run **outside any lock** (a conclude runs in the blob's
+`queue-space-shard.add`, under its space and digest only). The critical section does no large-body work — a manifest write, an MST splice, a few
 Postgres writes, and the guarded root swap — so it is small and bounded (sub-millisecond order). No
 object is ever held whole in RAM. The catalog manifest is written only after its body blobs are
 durable and accepted in Piri, so a crash never leaves a catalog entry pointing at non-durable data.
@@ -436,8 +439,10 @@ the last few parts and then commits.
 
 ```
 CreateMultipartUpload → uploadId, session (state=open)
-UploadPart(n)         → ingest + split; record part (written)
-                        blob/add + PUT as the body arrives → PARKED; part → parked; nudge the acceptor
+UploadPart(n)         → ingest + split; blob/add + PUT as the body arrives
+                        queue-space-shard.add per blob → PARKED (park row + pending reference)
+                        record part (written), taking the references over; part → parked
+                        nudge the acceptor
                         ETag = hex(part MD5); a part keeps no local copy
 acceptor (one per upload, in the background)
      each pass: up to 1000 blobs of the upload's parked parts, in part order
@@ -447,7 +452,7 @@ CompleteMultipartUpload([parts])
      validate parts (S3 rules); latch session open→completing (§7.3)
      wait, up to 30 s, until no named part is queued (omitted parts are not waited for)
      every named part accepted → continue
-     a part still written (its request died mid-park) → Complete concludes its parked blobs;
+     a part still written (its request died before moving it) → Complete concludes its parked blobs;
         a blob never parked → InvalidPart, and the client uploads the part again
      a part still parked (acceptor behind or failing) → 409 OperationAborted, session reopened
      COMMIT (short lock): manifest pins ordered [blobs..]+ranges;
@@ -495,8 +500,8 @@ release has taken, nor over a later park of the same bytes. The acceptor never c
 a part holding a blob with a `queue-space-shard.release` task pending or running goes to Complete,
 whose commit claims the blob. Nor does a release run against a conclude in flight, since the
 upload service registers an accepted blob only when it answers, after a remove sent meanwhile: a
-teardown waits for the upload's acceptor to finish its pass, and any other release defers while
-its blob is being concluded and is retried by the task runner after.
+teardown waits for the upload's acceptor to finish its pass, and any other release that finds its
+blob being concluded defers, retrying without holding the blob's subject.
 
 ### 7.4 Read (`GetObject`)
 
@@ -780,8 +785,21 @@ CREATE TABLE ingot.blob_refs (
     space       text  NOT NULL,                          -- = buckets.space (denormalized)
     PRIMARY KEY (digest, bucket, object_key, version_id)
 );
--- Drives "is (space, digest) still claimed?" — the gate on remove(digest).
+-- Drives "is (space, digest) still claimed?", one of the references a release counts.
 CREATE INDEX blob_refs_claim_idx ON ingot.blob_refs (space, digest);
+
+-- A write's use of a blob before its commit or part row records it: taken by
+-- the write's queue-space-shard.add, taken over (deleted, its expiry cancelled)
+-- by the claim or part row, or dropped at the deadline by the
+-- queue-space-shard.expire.
+CREATE TABLE ingot.blob_pending_refs (
+    add_task    uuid        PRIMARY KEY,                 -- the queue-space-shard.add that took it
+    expire_task uuid        NOT NULL,                    -- the queue-space-shard.expire due at deadline
+    space       text        NOT NULL,
+    digest      bytea       NOT NULL,
+    deadline    timestamptz NOT NULL                     -- 24 h after the add
+);
+CREATE INDEX blob_pending_refs_blob ON ingot.blob_pending_refs (space, digest);
 
 -- The local-store index (§5): every blob Ingot has written, per space. state
 -- advances uploading → (parked →) accepted → published; published
@@ -963,10 +981,12 @@ references a `segments.seq` by value, deliberately. `blob_refs`, `segments`,
 `multipart_sessions` and `gc_candidates` reference a `buckets.name` by value,
 `shard_inclusions` joins `blob_locations` on `shard_digest`, and `blob_encryption_params` joins
 `blob_locations` on `(space, digest)` with deliberately no FK. `revocation_cursor` stands alone.
-The reference count for a blob is `count(*) from blob_refs where space = ? and digest = ?`;
-reaching zero triggers `remove(digest)` ([§6](#6-the-forgechain-layer)), through a
-`queue-space-shard.release` task on the task runner, subject `<space>/<hex digest>`, queued in the
-same transaction and due after the release grace. `upload_intents` and `blob_parks` are keyed by
+A space's references to a blob are its `blob_refs` claims, its `blob_pending_refs` rows, and the
+parts of its open or completing multipart sessions, counted in one statement
+(`registry.CountReferences`). The drop of the last claim queues `remove(digest)`
+([§6](#6-the-forgechain-layer)) as a `queue-space-shard.release` task on the task runner, subject
+`<space>/<hex digest>`, in the same transaction and due after the release grace; the release does
+nothing while any reference remains. `upload_intents` and `blob_parks` are keyed by
 `(space, digest)`, like every other blob table — the disk-side and park-side indexes, shared across whatever objects of the
 space reference the same bytes. The cached file itself is one per digest, shared across spaces, and
 goes with the last intent for it.
@@ -992,7 +1012,7 @@ The storage / delete / retrieval core is built and tested:
   (manifests + MST nodes) as CAR segments. `forge_root_cid` advances only when the catalog ships, and
   only `WHERE root_cid` still matches the op-root (the orphan-root guard from [§9](#9-the-system-contract-piri--sprue--indexer)).
 - **Dedup + reference-counted delete** ([§5](#5-the-data-layer)–[§6](#6-the-forgechain-layer)) — `blob_refs`, overwrite-in-place, `DeleteObject`,
-  `remove(digest)` at zero claims, `gc_candidates` (write-only).
+  `remove(digest)` at zero references, `gc_candidates` (write-only).
 - **S3 correctness** ([§3](#3-the-s3-layer)) — conditional requests (`If-Match`/`If-None-Match`/`If-(Un)Modified-Since`,
   re-checked at commit), additional checksums (`x-amz-checksum-*` validate + echo, with a
   server-computed full-object `CRC64NVME` default when the client names none — S3's
@@ -1067,9 +1087,12 @@ paths below are exercised against the real stack by the smelt-based `itest/` har
   acceptor, up to 30 s, and answers a part still queued with a 409 that the AWS CLI treats as final. Abort and session
   expiry unwind parked blobs with `/blob/abort` and accepted ones with `/blob/remove`
   ([§7.2](#72-multipart)–[7.3](#73-the-session-latch-the-abortcomplete-race)).
-- **Crash recovery is not built.** The `upload_intents` × `blob_refs` reconciliation
-  the failure-mode table in [§7.5](#75-concurrency-durability-and-failure-modes) describes (resume/`abort` parked, `remove` accepted-but-unreferenced)
-  is a later phase.
+- **Crash recovery is not built.** A write that dies after its `queue-space-shard.add` tasks commit
+  leaves pending references, which expire after 24 h and release the blobs; one that dies inside an
+  add, after the conclude and before the add's commit, leaves an accepted blob with no reference.
+  The `upload_intents` × references reconciliation the failure-mode table in
+  [§7.5](#75-concurrency-durability-and-failure-modes) describes (resume/`abort` parked, `remove`
+  accepted-but-unreferenced) is a later phase.
 - **Indexer retraction on delete** is unimplemented (no-op). `ListParts` and
   `ListMultipartUploads` are implemented (paginated, prefix/delimiter/marker semantics;
   in-flight sessions only).
@@ -1078,7 +1101,8 @@ paths below are exercised against the real stack by the smelt-based `itest/` har
   against content-addressed sharing with other sessions and committed objects), and run those
   releases inline, for up to 10 s, before answering. The release shreds the blob's key, unwinds it
   on the network as its state requires, then removes its intent; the task runner
-  retries a release that fails, with no attempt limit, backing off from 1 s to 5 min. A background sweeper aborts
+  retries a release that fails, with no attempt limit, backing off from 1 s to 5 min, and the retry
+  holds the blob's subject, so a write's `queue-space-shard.add` of the same blob waits behind it. A background sweeper aborts
   open sessions older than `multipart_session_ttl` (default 7d) and reaps terminal session rows. A
   successful Complete retains its session in state `completed` so a duplicate Complete is idempotent
   per S3. `DeleteBucket` implicitly aborts the bucket's in-flight sessions before the space delete
@@ -1094,6 +1118,9 @@ Reference-index mutations (`blob_refs`) and the catalog/root commit are one tran
 version's claims, the discarded versions' claim drops, and the `queue-space-shard.release` tasks
 those drops queue are written by the same Postgres transaction as the guarded root swap (`registry.CommitRoot`). A
 commit that fails writes none of them, and no crash can leave a published version unclaimed or a
-discarded one claimed. The claims cancel any pending release of their digests in the same
-transaction. A claim the swap refuses (a release of the digest is running, or a pinned
-source is gone) fails the commit, and the root stays where it was.
+discarded one claimed. Each claim of a PutObject or CopyObject takes over the write's pending
+reference to its blob (`blob_pending_refs`) and cancels the reference's `queue-space-shard.expire`
+in the same transaction; a reference that has expired fails the commit with
+`registry.ErrReferenceExpired` (SlowDown to the client), and the root stays where it was.
+Complete's claims take no reference over: the session's parts reference its blobs until its
+teardown.

@@ -34,6 +34,7 @@ import (
 	"github.com/fil-forge/ingot/internal/tracing"
 	"github.com/fil-forge/ingot/mst"
 	"github.com/fil-forge/ingot/registry"
+	"github.com/fil-forge/ingot/taskrunner"
 	"github.com/fil-forge/ingot/uploader"
 )
 
@@ -213,7 +214,7 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 	// INGEST (no lock): stream the body → coarse-split into blobs → stream
 	// each to its provider (allocate→PUT→accept). A 200 means every body blob is durable and accepted before the manifest
 	// that references it is committed (docs/architecture.md §7.1).
-	bodyRec, blobs, err := b.ingestBody(ctx, bucketState, bodyReader, declaredLength(input.ContentLength), clientProvidedBodyMD5(ctx, spec, hr), plaintext)
+	bodyRec, blobs, refs, err := b.ingestBody(ctx, bucketState, bodyReader, declaredLength(input.ContentLength), clientProvidedBodyMD5(ctx, spec, hr), plaintext)
 	if err != nil {
 		// A checksum/digest mismatch surfaces from the HashReader. BadDigestError,
 		// InvalidDigestError, and ContentSHA256MismatchError embed APIError but are
@@ -264,7 +265,7 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 		Metadata:                input.Metadata,
 		Plaintext:               plaintext,
 	}
-	node, effState, err := b.commitVersion(ctx, bucketState, key, mf, blobs, initState, false, func(superseded *msbucket.ObjectManifest) error {
+	node, effState, err := b.commitVersion(ctx, bucketState, key, mf, blobs, initState, refs, func(superseded *msbucket.ObjectManifest) error {
 		// Race-safe re-check of If-Match / If-None-Match under the lock. A
 		// delete-marker current means "no object" for precondition purposes.
 		oldETag, oldExists := "", false
@@ -294,64 +295,51 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 }
 
 // ingestBody streams an object body off-lock: it coarse-splits into blobs,
-// streams each to its provider (SplitSizedBody), records an upload_intents
-// row per blob, concludes each, and advances the intent to accepted. It
-// returns the Body the manifest will pin and its blobs, which the commit
-// writes into the manifest. A zero-byte body has no blobs and uploads
-// nothing. A non-nil md5Src is where the body's MD5 comes from instead of
-// ingest's own pass (see bodyMD5Source); ingest reads it after the body and
-// stamps it onto Body.MD5.
+// streams each to its provider (SplitSizedBody), and runs each blob's
+// queue-space-shard.add, which concludes it, records its location and intent
+// and takes the write's pending reference to it. It returns the Body the
+// manifest will pin, its blobs, which the commit writes into the manifest,
+// and the references, by string(digest), which the commit's claims take
+// over. A zero-byte body has no blobs and uploads nothing. A non-nil md5Src
+// is where the body's MD5 comes from instead of ingest's own pass (see
+// bodyMD5Source); ingest reads it after the body and stamps it onto Body.MD5.
 //
-// On any error the blobs already parked and their intents are left for the
-// provider's expiry and crash recovery; no manifest is written, so no
-// catalog entry ever references a non-durable blob.
+// On any error the blobs already streamed are left for the provider's
+// expiry, and the references already taken for their expiry; no manifest is
+// written, so no catalog entry ever references a non-durable blob.
 //
 // size is the body's declared length (see splitBody); plaintext stores the
 // body as received (see storesPlaintext).
-func (b *Backend) ingestBody(ctx context.Context, bucket *registry.State, r io.Reader, size int64, md5Src bodyMD5Source, plaintext bool) (msbucket.Body, msbucket.BlobRefs, error) {
-	body, err := b.splitBody(ctx, bucket.Name, bucket.Space, r, size, md5Src, plaintext, !b.dropAcceptedBodies)
+func (b *Backend) ingestBody(ctx context.Context, bucket *registry.State, r io.Reader, size int64, md5Src bodyMD5Source, plaintext bool) (msbucket.Body, msbucket.BlobRefs, map[string]taskrunner.TaskID, error) {
+	body, err := b.splitBody(ctx, bucket.Space, r, size, md5Src, plaintext, !b.dropAcceptedBodies)
 	if err != nil {
-		return msbucket.Body{}, nil, err
+		return msbucket.Body{}, nil, nil, err
 	}
 	defer body.done()
-	if err := b.concludeBody(ctx, bucket.Space, body); err != nil {
-		return msbucket.Body{}, nil, err
+	refs, err := b.concludeBody(ctx, bucket.Name, bucket.Space, body)
+	if err != nil {
+		return msbucket.Body{}, nil, nil, err
 	}
-	return body.Body, body.Blobs, nil
+	return body.Body, body.Blobs, refs, nil
 }
 
 // writtenBody is a body split and streamed, with the uploads its blobs went
-// to, keyed by string(digest). They are parked on their providers and need
-// only their conclude.
+// to and their stored sizes, keyed by string(digest). The blobs are parked
+// on their providers and need only their conclude.
 type writtenBody struct {
 	msbucket.Body
 	// Blobs is the body's blob list as split, which the commit writes into
 	// Body.Blobs (see msbucket.BuildBlobList). It shadows that field here.
 	Blobs    msbucket.BlobRefs
 	streamed map[string]uploader.StreamedBlob
+	sizes    map[string]int64
 	// locals are the blobs' copies in the cache, not yet adopted, by
 	// string(digest).
 	locals map[string]*blockstore.TempBlob
-	// holds end the marks of the body's blobs as a write in flight
-	// (Backend.writing), by string(digest): each is ended once its blob is
-	// recorded as parked or accepted (unhold), and all of them when the
-	// write is over (done), whichever comes first.
-	holds map[string]func()
 }
 
-// unhold ends the mark on one blob: the rows say the provider holds it.
-func (wb writtenBody) unhold(digest multihash.Multihash) {
-	if unhold, ok := wb.holds[string(digest)]; ok {
-		unhold()
-	}
-}
-
-// done ends every mark the body still has and discards the copies not
-// adopted.
+// done discards the copies not adopted.
 func (wb writtenBody) done() {
-	for _, unhold := range wb.holds {
-		unhold()
-	}
 	for _, l := range wb.locals {
 		l.Discard()
 	}
@@ -370,15 +358,16 @@ func declaredLength(n *int64) int64 {
 
 // splitBody coarse-splits a body into blobs, encrypts each into a FEE
 // envelope (recipient: the tenant's wrap key) streamed to its provider under
-// its ciphertext digest, and records an uploading upload_intents row plus a
-// blob_encryption_params row per blob — WITHOUT concluding. It is the shared
-// first half of ingest: a single-shot PUT follows it with concludeBody
-// immediately; a multipart UploadPart parks the blobs and defers the
-// conclude to Complete.
+// its ciphertext digest, and records a blob_encryption_params row per blob —
+// WITHOUT concluding. It is the shared first half of ingest: a single-shot
+// PUT follows it with concludeBody immediately; a multipart UploadPart parks
+// the blobs and defers the conclude to Complete. Each blob's add records its
+// upload intent.
 //
 // The Body it returns is entirely plaintext-coordinate (Size, spans,
 // SHA256/MD5 — all computed before encryption); the intents record the
-// stored (ciphertext) byte count, which is what the provider holds. With
+// stored (ciphertext) byte count, which is what the provider holds (see
+// writtenBody.sizes). With
 // plaintext set the body is stored as received, so the two coincide, and no
 // key material is minted or recorded for its blobs. A non-nil md5Src
 // supplies the body's MD5 (a verified Content-MD5, the request's MD5
@@ -389,7 +378,7 @@ func declaredLength(n *int64) int64 {
 // length fails. cache tees each blob into the cache, for the write to adopt
 // once the provider holds it. opts are passed through to the split (a part
 // skips the whole-body tree).
-func (b *Backend) splitBody(ctx context.Context, bucket string, space did.DID, r io.Reader, size int64, md5Src bodyMD5Source, plaintext, cache bool, opts ...msbucket.SplitOption) (_ writtenBody, err error) {
+func (b *Backend) splitBody(ctx context.Context, space did.DID, r io.Reader, size int64, md5Src bodyMD5Source, plaintext, cache bool, opts ...msbucket.SplitOption) (_ writtenBody, err error) {
 	// The span covers receiving the body (it streams in from the client as
 	// SplitSizedBody reads it), encrypting it and sending it to its
 	// providers; the body.received event marks where the client finished
@@ -417,9 +406,7 @@ func (b *Backend) splitBody(ctx context.Context, bucket string, space did.DID, r
 	if cache {
 		enc.cache = b.cache
 	}
-	// Each blob is marked as a write in flight once sent, until it is
-	// recorded; a failed split leaves no caller to end the marks.
-	enc.mark = func(digest multihash.Multihash) func() { return b.writing.mark(space, digest) }
+	// A failed split leaves no caller to discard the local copies.
 	defer func() {
 		if err != nil {
 			enc.drop()
@@ -451,21 +438,13 @@ func (b *Backend) splitBody(ctx context.Context, bucket string, space did.DID, r
 		attribute.Int64("ingot.body.bytes", body.Size),
 		attribute.Int("ingot.body.blobs", len(blobs)),
 	)
+	sizes := make(map[string]int64, len(blobs))
 	for _, blob := range blobs {
 		storedSize, err := enc.storedSize(blob.Digest)
 		if err != nil {
 			return writtenBody{}, err
 		}
-		// The blob is on the network already (see IntentUploading).
-		if err := b.intents.PutIntent(ctx, registry.UploadIntent{
-			Space:  space,
-			Digest: blob.Digest,
-			Size:   storedSize,
-			State:  registry.IntentUploading,
-			Bucket: bucket,
-		}); err != nil {
-			return writtenBody{}, fmt.Errorf("record intent: %w", err)
-		}
+		sizes[string(blob.Digest)] = storedSize
 		if plaintext {
 			continue
 		}
@@ -479,94 +458,36 @@ func (b *Backend) splitBody(ctx context.Context, bucket string, space did.DID, r
 			return writtenBody{}, fmt.Errorf("record encryption params: %w", err)
 		}
 	}
-	return writtenBody{Body: body, Blobs: blobs, streamed: enc.streamed(), locals: enc.locals(), holds: enc.holds}, nil
+	return writtenBody{Body: body, Blobs: blobs, streamed: enc.streamed(), sizes: sizes, locals: enc.locals()}, nil
 }
 
-// concludeBody concludes each blob of a body, records its location, and
-// advances its intent to accepted.
-func (b *Backend) concludeBody(ctx context.Context, space did.DID, body writtenBody) error {
+// concludeBody runs the queue-space-shard.add of each blob of a body written
+// to bucket in space, which concludes it, and returns the references the
+// adds took, by string(digest). A blob the space already holds (the same
+// bytes stored as received, written again) is reused, and its stream's
+// allocation given up: concluding it would make the upload service return an
+// accept receipt with no fresh location commitment, which the edge client
+// (correctly) rejects. Each blob's local copy moves into the cache once the
+// provider holds it.
+func (b *Backend) concludeBody(ctx context.Context, bucket string, space did.DID, body writtenBody) (map[string]taskrunner.TaskID, error) {
+	release := b.releaseAuthority(ctx, space)
+	refs := make(map[string]taskrunner.TaskID, len(body.Blobs))
 	// Each digest once: a body stored as received can hold the same bytes
 	// twice, and the provider needs them once.
-	seen := make(map[string]bool, len(body.Blobs))
 	for _, blob := range body.Blobs {
-		if seen[string(blob.Digest)] {
+		k := string(blob.Digest)
+		if _, ok := refs[k]; ok {
 			continue
 		}
-		seen[string(blob.Digest)] = true
-		if err := b.concludeStreamed(ctx, space, blob, body.streamed[string(blob.Digest)], body); err != nil {
-			return err
+		sb := body.streamed[k]
+		ref, err := b.addBlob(ctx, space, bucket, blob.Digest, body.sizes[k], addStreamed, &sb, release)
+		if err != nil {
+			return nil, err
 		}
+		refs[k] = ref
+		b.cacheWritten(ctx, blob.Digest, body.locals[k])
 	}
-	return nil
-}
-
-// concludeStreamed accepts a blob that went to its provider as the body
-// arrived, traced as a blob.upload span. A release of the same digest
-// running meanwhile is waited out, or a pending one cancelled (see
-// settleRelease). The release takes the space's earlier location, not this
-// stream's own allocation, which the space can take once the release's
-// removal has its receipt, so the stream is then concluded as it is rather
-// than reusing the location.
-//
-// A blob already durably stored for this space (a re-PUT of identical
-// content stored as received, or a blob shared with an earlier object) is
-// reused: its bytes are on the provider already, so the stream's allocation
-// is given up. Concluding it instead would make the upload service return an
-// accept receipt with no fresh location commitment, which the edge client
-// (correctly) rejects.
-func (b *Backend) concludeStreamed(ctx context.Context, space did.DID, blob msbucket.BlobRef, sb uploader.StreamedBlob, body writtenBody) (err error) {
-	// One write of these bytes at a time for this space (see Backend.blobKeys):
-	// another write can have accepted the same digest while this stream was
-	// in flight, and its location is read under the lock before this one
-	// concludes, so two streams of the same bytes never both record a
-	// location.
-	unlock := b.blobKeys.Lock(blobKey(space, blob.Digest))
-	defer unlock()
-	settled, err := b.settleRelease(ctx, space, blob.Digest)
-	if err != nil {
-		return err
-	}
-	if existing, err := b.locations.GetLocation(ctx, space, blob.Digest); err == nil && existing != nil && settled {
-		// Accepted for the space meanwhile: the stream's allocation is
-		// surplus, and the located blob is reused.
-		b.abandonStream(ctx, space, sb)
-		if err := b.intents.SetIntentState(ctx, space, blob.Digest, registry.IntentAccepted); err != nil {
-			return fmt.Errorf("mark accepted (dedup): %w", err)
-		}
-		body.unhold(blob.Digest) // the rows say the provider holds it
-		b.cacheWritten(ctx, blob.Digest, body.locals[string(blob.Digest)])
-		return nil
-	} else if err != nil && !errors.Is(err, registry.ErrNotFound) {
-		return fmt.Errorf("lookup location: %w", err)
-	}
-
-	ctx, span := tracing.Start(ctx, "blob.upload",
-		attribute.String("ingot.blob.result", "streamed"),
-		attribute.Int64("ingot.blob.bytes", sb.Size),
-	)
-	defer func() { tracing.End(span, err) }()
-
-	locations, err := b.streaming.ConcludeBlobs(ctx, space, []uploader.UploadedBlob{sb.Parked(blob.Digest)})
-	// An acceptance that came back is recorded before any error is acted on,
-	// as concludeBlobs does: the upload service ran the accept whether or not
-	// the batch then failed, and recorded as accepted the blob is released
-	// through the ordinary path rather than left unaccounted for.
-	if len(locations) == 1 && locations[0] != nil {
-		// The mark ends once the location and the intent are written (see
-		// recordAccepted): until then a release reading an intent still
-		// uploading with neither row would take the blob's rows.
-		if rerr := b.recordAccepted(ctx, space, blob.Digest, *locations[0], func() { body.unhold(blob.Digest) }); rerr != nil {
-			return errors.Join(err, rerr)
-		}
-		b.cacheWritten(ctx, blob.Digest, body.locals[string(blob.Digest)])
-	}
-	if err != nil {
-		return fmt.Errorf("conclude streamed blob: %w", err)
-	}
-	if len(locations) != 1 || locations[0] == nil {
-		return fmt.Errorf("conclude streamed blob %x: no location", blob.Digest)
-	}
-	return nil
+	return refs, nil
 }
 
 // The reference index (blob_refs) is written by the commit: a version's
@@ -598,31 +519,15 @@ func claimVersionID(versionID string, seq uint64) string {
 
 // addClaims records one claim per DEDUPLICATED digest for a new generation,
 // for the commit to carry (bucketop.Tx.Commit writes them in the root swap's
-// transaction).
-//
-// A body this node ingested is claimed unconditionally. An encrypted body
-// holds fresh digests, which nothing can release before they are claimed. A
-// body stored as received can repeat a digest the space released or is
-// releasing: the write settled that before reusing the blob (settleRelease),
-// by cancelling the release or waiting it out, so no release is past its
-// claim check by the time the claim lands; one that starts in between is
-// caught at the swap (registry.ErrReleaseInProgress, mapped to SlowDown by
-// mapCommitError). A body pinned from another object of the space (a
-// same-space copy) holds digests some other version claims, and a release
-// of them may be under way: its claim check and its network removal are
-// separate steps, so a claim added unconditionally in between would commit
-// a manifest over a blob about to go. Pinned digests are therefore claimed
-// conditionally, each requiring an existing claim and excluding the drop of
-// a last claim (registry.RootCommit.Pins); a refused pin fails the commit
-// with registry.ErrClaimGone, and nothing is written.
-func (b *Backend) addClaims(tx *bucketop.Tx, st *registry.State, key, claimID string, digests []multihash.Multihash, pinned bool) {
+// transaction). Each claim takes over the write's pending reference to its
+// blob, from refs by string(digest), so a release of the blob, which counts
+// the reference or the claim, never finds neither. A digest with no
+// reference is a Complete's, whose session's parts reference it until the
+// teardown that follows the commit.
+func (b *Backend) addClaims(tx *bucketop.Tx, st *registry.State, key, claimID string, digests []multihash.Multihash, refs map[string]taskrunner.TaskID) {
 	var claims []registry.BlobClaim
-	for _, d := range digestSet(digests) {
-		claims = append(claims, registry.BlobClaim{Digest: d, Bucket: st.Name, ObjectKey: key, VersionID: claimID, Space: st.Space})
-	}
-	if pinned {
-		tx.PinBlobs(claims)
-		return
+	for k, d := range digestSet(digests) {
+		claims = append(claims, registry.BlobClaim{Digest: d, Bucket: st.Name, ObjectKey: key, VersionID: claimID, Space: st.Space, Ref: refs[k]})
 	}
 	tx.ClaimBlobs(claims)
 }
@@ -1227,7 +1132,7 @@ func (b *Backend) insertDeleteMarker(ctx context.Context, bucketState *registry.
 		Created:      time.Now().Unix(),
 		DeleteMarker: true,
 	}
-	node, _, err := b.commitVersion(ctx, bucketState, key, mf, nil, nil, false, func(superseded *msbucket.ObjectManifest) error {
+	node, _, err := b.commitVersion(ctx, bucketState, key, mf, nil, nil, nil, func(superseded *msbucket.ObjectManifest) error {
 		if preconds == nil || superseded == nil || superseded.DeleteMarker {
 			return nil
 		}

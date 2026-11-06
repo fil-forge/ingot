@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"github.com/google/uuid"
 	"io"
 	"testing"
 
@@ -88,14 +89,14 @@ func TestExtents_DeleteReleasesEveryBlob(t *testing.T) {
 		t.Fatalf("%d blobs, want 1100", len(digests))
 	}
 	for _, d := range digests {
-		if n, _ := mem.CountClaims(ctx, rv.st.Space, d); n != 1 {
+		if n, _ := mem.CountReferences(ctx, rv.st.Space, d, uuid.Nil); n != 1 {
 			t.Fatalf("blob %x: %d claims before the delete, want 1", d, n)
 		}
 	}
 	deleteFrom(t, b, bucket, key)
 	drainReleases(t, b)
 	for _, d := range digests {
-		if n, _ := mem.CountClaims(ctx, rv.st.Space, d); n != 0 {
+		if n, _ := mem.CountReferences(ctx, rv.st.Space, d, uuid.Nil); n != 0 {
 			t.Fatalf("blob %x: %d claims after the delete, want 0", d, n)
 		}
 	}
@@ -132,7 +133,7 @@ func TestExtents_CopyWritesItsOwnExtents(t *testing.T) {
 	}
 	rv := assertExtentsIn(t, b, dstBucket, dst, 1)
 	for _, d := range storedBlobs(t, b, rv).DigestList() {
-		if n, _ := mem.CountClaims(ctx, rv.st.Space, d); n != 2 {
+		if n, _ := mem.CountReferences(ctx, rv.st.Space, d, uuid.Nil); n != 2 {
 			t.Fatalf("blob %x: %d claims, want 2 (source and copy)", d, n)
 		}
 	}

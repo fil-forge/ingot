@@ -21,6 +21,7 @@ import (
 	"github.com/fil-forge/ingot/internal/tracing"
 	"github.com/fil-forge/ingot/mst"
 	"github.com/fil-forge/ingot/registry"
+	"github.com/fil-forge/ingot/taskrunner"
 )
 
 // This file implements the per-key version-tree design of
@@ -299,12 +300,10 @@ type discardedVersion struct {
 // it, not on the caller's pre-lock snapshot, so a racing PutBucketVersioning
 // can't mint an id the response then omits.
 //
-// pinned says the body's digests belong to another object of the space (a
-// same-space copy) rather than to this write's own ingest: their claims are
-// then taken conditionally (see addClaims), and the commit fails with
-// registry.ErrClaimGone if the source is gone.
-func (b *Backend) commitVersion(ctx context.Context, bucketState *registry.State, key string, mf *msbucket.ObjectManifest, blobs msbucket.BlobRefs, initState *msbucket.VersionState, pinned bool, preCheck func(superseded *msbucket.ObjectManifest) error) (msbucket.VersionNode, registry.VersioningState, error) {
-	return b.commitVersionAt(ctx, bucketState, key, mf, blobs, initState, pinned, nil, preCheck)
+// refs are the write's pending references to the body's blobs, by
+// string(digest), which the commit's claims take over (see addClaims).
+func (b *Backend) commitVersion(ctx context.Context, bucketState *registry.State, key string, mf *msbucket.ObjectManifest, blobs msbucket.BlobRefs, initState *msbucket.VersionState, refs map[string]taskrunner.TaskID, preCheck func(superseded *msbucket.ObjectManifest) error) (msbucket.VersionNode, registry.VersioningState, error) {
+	return b.commitVersionAt(ctx, bucketState, key, mf, blobs, initState, refs, nil, preCheck)
 }
 
 // versionReservation is what a multipart Complete reported of its version
@@ -345,7 +344,7 @@ func (b *Backend) reserveVersion(ctx context.Context, bucket string) (versionRes
 // bucket, which keeps invariant 2 of docs/s3-versioning.md §2.4 although
 // the seq was allocated outside the lock, and that a Complete that reported
 // no id commits no numbered version.
-func (b *Backend) commitVersionAt(ctx context.Context, bucketState *registry.State, key string, mf *msbucket.ObjectManifest, blobs msbucket.BlobRefs, initState *msbucket.VersionState, pinned bool, reserved *versionReservation, preCheck func(superseded *msbucket.ObjectManifest) error) (msbucket.VersionNode, registry.VersioningState, error) {
+func (b *Backend) commitVersionAt(ctx context.Context, bucketState *registry.State, key string, mf *msbucket.ObjectManifest, blobs msbucket.BlobRefs, initState *msbucket.VersionState, refs map[string]taskrunner.TaskID, reserved *versionReservation, preCheck func(superseded *msbucket.ObjectManifest) error) (msbucket.VersionNode, registry.VersioningState, error) {
 	var node msbucket.VersionNode
 	var effState registry.VersioningState
 	err := b.txns.WithTx(ctx, bucketState.Name, func(ctx context.Context, tx *bucketop.Tx) (cid.Cid, error) {
@@ -621,7 +620,7 @@ func (b *Backend) commitVersionAt(ctx context.Context, bucketState *registry.Sta
 				return cid.Undef, err
 			}
 		}
-		b.addClaims(tx, st, key, claimVersionID(vid, seq), claimed, pinned)
+		b.addClaims(tx, st, key, claimVersionID(vid, seq), claimed, refs)
 		for _, d := range discards {
 			b.dropClaims(ctx, tx, st, key, claimVersionID(d.versionID, d.seq), d.digests)
 		}

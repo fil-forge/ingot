@@ -117,10 +117,8 @@ type Backend struct {
 	// acceptors runs each multipart upload's acceptor (see acceptor.go).
 	acceptors acceptors
 	// concluding marks the conclusions in flight in this process (see
-	// markConcluding), and writing the blobs a write in flight has sent and
-	// not yet recorded as parked or accepted (see bodyWriter.hold).
+	// markConcluding).
 	concluding     blobMarks
-	writing        blobMarks
 	lastOrphanPass time.Time
 	// overBudgetWarned and timeLimitLogged are set once the sweeper has
 	// logged that usage is over budget with nothing left to evict, or that the
