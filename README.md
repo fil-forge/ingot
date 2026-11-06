@@ -55,7 +55,7 @@ out of ordinary traversal.
 Writes are functional: a PUT or DELETE rewrites only the nodes on the path from
 the changed key up to the root (every other node is immutable and shared),
 producing a **new root CID**. Each change to a bucket runs as a task on the
-bucket's queue, one at a time: ingot journals the changed blocks to the local
+bucket's `queue-bucket` subject, one at a time: ingot journals the changed blocks to the local
 log, then **advances the bucket's root in Postgres** from the old CID to the
 new one, guarded on the old. That split is the heart of the design:
 
@@ -79,8 +79,8 @@ A write splits into two paths:
   the count reaches zero.
 - **The catalog** (the dag-cbor MST nodes and manifests) journals to a local
   per-bucket log, seals into CAR segments by size or age, and ships to the
-  bucket's Forge space in the background; shipping advances the bucket's
-  `forge_root_cid` under a guard. See
+  bucket's Forge space as a `queue-bucket.ship` task queued on each seal;
+  shipping advances the bucket's `forge_root_cid` under a guard. See
   [`logstore/README.md`](./logstore/README.md).
 
 Reads fall through tiers: the local cache, the local log
@@ -127,10 +127,15 @@ base64 string from the XML (`--outboard`) or from a file holding that string
 or the raw bytes (`--outboard-file`). A mismatch exits 1; any other failure
 exits 2.
 
-`serve` requires Postgres (`postgres_dsn`), the sprue edge client
-(`upload_service_url`/`_did`), and the hilt auth/tenant service
+`serve` requires `addr` (default `0.0.0.0:8080`) and `data_dir`, Postgres
+(`postgres_dsn`), the agent's key (`identity.key_file`), the sprue edge client
+(`upload_service_url`/`_did`), the hilt auth/tenant service
 (`auth_service_url`/`_did` plus the `auth_service_proofs` delegation chains
-hilt issues to this agent). Tenants, access keys, and buckets are owned by
+hilt issues to this agent), a region-key provider (`regionkey.provider`:
+`openbao`, or `inprocess` for development) and the did:plc directory tenant
+wrap keys resolve from (`tenantkey.plc_directory_url`). Every key can also be
+set from the environment as `INGOT_` plus the key, `.` replaced by `_`
+(`INGOT_TENANTKEY_PLC_DIRECTORY_URL`). Tenants, access keys, and buckets are owned by
 [hilt](https://github.com/fil-forge/hilt): it authorizes every S3 request
 signed with a hilt-issued access key, mints each bucket's Forge space, and
 issues the S3 credentials; ingot never self-provisions. The gateway has no
@@ -141,8 +146,8 @@ the S3 facade runs **at the edge**, co-located with a provider's piri or as a
 standalone client — not inside the central upload-service.
 
 `serve` exports OpenTelemetry traces over OTLP/HTTP when
-`OTEL_EXPORTER_OTLP_ENDPOINT` names a collector; with no endpoint, tracing is
-off. Each S3 request is a trace named for its S3 action, with the hilt, sprue,
+`OTEL_EXPORTER_OTLP_ENDPOINT` (or `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`) names a
+collector; with no endpoint, tracing is off. Each S3 request is a trace named for its S3 action, with the hilt, sprue,
 piri and Postgres calls it makes as child spans. The other standard `OTEL_*`
 environment variables apply: `OTEL_EXPORTER_OTLP_HEADERS` authenticates to the
 collector, and `OTEL_TRACES_SAMPLER_ARG` sets the fraction of requests traced
@@ -164,8 +169,8 @@ A cached copy is not needed, so it goes:
 
 - when its time to live runs out: `cache_ttl` (default `1h`) after it was
   cached or last read;
-- when a deleted or overwritten object's release runs (`release_grace`,
-  default 60s, after its last reference drops). The release also removes the
+- when a deleted or overwritten object's `queue-space-shard.release` runs
+  (`release_grace`, default 60s, after its last reference drops). The release also removes the
   provider's copy, so a GET still streaming the old object once the grace
   has passed fails when it reaches a blob it has not yet opened:
   `release_grace` bounds how long such a read may take;
@@ -177,7 +182,7 @@ A cached copy is not needed, so it goes:
 Later reads of an evicted body go to the provider and take provider-read
 latency. A read from the cache extends the body's time to live only once
 less than half of it is left, so most reads cost nothing. Each time to live
-is a task in Postgres, so it survives a restart.
+is a `queue-shard.evict` task in Postgres, so it survives a restart.
 
 A multipart part keeps no local copy, so Complete relies on the provider
 keeping each parked allocation until it runs; keep `multipart_session_ttl`
@@ -218,8 +223,8 @@ every one it finds.
 | `ingot.local_blobs.removals`, `ingot.local_blobs.removed_bytes` | Files and bytes removed, by `reason`: `released`, `expired` (its `cache_ttl` ran out), `budget`, `orphan` (an unfinished write's temporary file) |
 | `ingot.local_blobs.reads` | Body-blob reads, by `tier`: `local` or `network` (the local hit ratio) |
 
-Multipart uploads' parts are accepted in the background while the client
-uploads them (see DESIGN_NOTES), and report:
+Multipart uploads' parts are accepted by a `queue-multipart-upload-shard.accept`
+task while the client uploads them (see DESIGN_NOTES), and report:
 
 | Metric | Meaning |
 | -- | -- |
@@ -235,6 +240,10 @@ catalog only this host's disk would otherwise hold. The journal reports:
 | -- | -- |
 | `ingot.catalog_journal.blocks`, `ingot.catalog_journal.bytes` | Catalog blocks, and their bytes, journaled in Postgres whose segment has not shipped yet |
 | `ingot.catalog_journal.oldest_age` | Seconds since the oldest journaled block was written; 0 when the journal is empty. Segments ship within seconds of sealing, so growth means shipping has stalled and the unshipped catalog is building up in Postgres |
+
+The task queues report queue depth, the oldest ready task's age, lease waits
+and takeovers, task duration and busy workers as `taskrunner.*`, listed in
+[`taskrunner/README.md`](./taskrunner/README.md#metrics).
 
 **Manual cleanup.** Every blob file in `<data_dir>/cache` is safe to
 delete: the provider holds its body. Restart `serve` after deleting files by
@@ -283,16 +292,20 @@ floor, or reset its data.
 ## Build & test
 
 ```bash
-make build   # GOWORK=off go build ./...
-make test    # every package's tests (starts Postgres and OpenBao in Docker)
-make itest   # integration tests (boots the Forge stack in Docker, ~6 min)
-make gen     # regenerate CBOR marshalers after changing bucket types
+make build                 # the daemon binary, ./ingot (GOWORK=off)
+make test                  # every package's tests (starts Postgres and OpenBao in Docker)
+make itest                 # integration tests (boots the Forge stack in Docker, ~20 min)
+make itest-group GROUP=auth  # one of the groups CI runs on its own runner
+make s3compat              # the S3 compatibility corpus, written as an HTML report
+make gen                   # regenerate CBOR marshalers after changing bucket, registry or s3frontend task types
+make gen-check             # fail if the generated bucket marshalers are stale
 ```
 
 The `itest/` package boots the real Forge stack via smelt's Go SDK and runs
 this working tree's binary against it — including the curated S3 conformance
 partition (per-group expected-pass and known-fail tables of versitygw cases).
-CI runs it after unit tests pass. See `itest/README.md`.
+CI runs it, split into `make itest-group` groups, after unit tests pass. See
+`itest/README.md`.
 
 ## Deploying to the dev node
 

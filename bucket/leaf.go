@@ -67,9 +67,8 @@ type VersionState struct {
 	Retention []byte `cborgen:"r"`
 	// LegalHold is tri-valued: LegalHoldUnset, LegalHoldOff, LegalHoldOn.
 	LegalHold uint8 `cborgen:"h"`
-	// Tags is reserved for object tagging (planned follow-up). Declared now
-	// so every rewrite round-trips it under the merge rule; the tagging
-	// feature adds handlers, not format. Nil until it lands.
+	// Tags is the version's object tag set, nil for none. Every rewrite
+	// round-trips it under the merge rule.
 	Tags map[string]string `cborgen:"t"`
 }
 

@@ -636,9 +636,9 @@ func (b *Backend) applyPut(ctx context.Context, sc *commitScope, key string, p *
 
 		// Content entries (the space's object count): this version registers,
 		// the ones it discarded retract. Queued in the commit's own
-		// transaction, so the rows exist exactly when the version does, and
-		// numbered under this lock, so the sweeper replays a key's changes in
-		// commit order. Every write rule runs through here, so a PUT, a
+		// transaction, so the rows exist exactly when the version does, on
+		// queue-space-upload's subject for the space, so a key's changes go out
+		// in commit order. Every write rule runs through here, so a PUT, a
 		// multipart Complete, a CopyObject destination and a delete marker all
 		// count as one object — which is what AWS reports for NumberOfObjects.
 		b.register(sc, st, key, mfCid, registry.UploadRegistrationAdd)
