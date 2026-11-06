@@ -190,6 +190,14 @@ _, err := ex.Submit(ctx, taskrunner.Spec{
 
 A task without `Replace` is never a replacement and leaves pending ones alone. A replacement that is running can no longer be replaced, so a new one is added beside it. One waiting to retry can be: the task that takes its place starts its attempts afresh, and no longer holds its subject (see Retries).
 
+## Submitting many tasks at once
+
+`SubmitAllTx` adds many tasks of one queue inside your transaction in one statement, for a write that queues work for each of thousands of subjects, and returns their IDs in order. Of two replacements in the batch for the same subject and action, the later is kept, as it would be if they were submitted one by one.
+
+```go
+ids, err := r.SubmitAllTx(ctx, tx, specs)
+```
+
 ## Cancelling
 
 A pending task that has not started can be cancelled by queue and ID. Cancelling a task that has started, finished or been cancelled does nothing, so a task that can be cancelled must still check its own preconditions when it runs.
@@ -204,6 +212,45 @@ err = r.CancelTx(ctx, tx, "queue-space-shard", expireID)
 // On its own.
 err = r.Cancel(ctx, "queue-space-shard", expireID)
 ```
+
+A caller that knows a task's subject and action but not its ID, such as a write about to reuse a blob whose release is pending, cancels by those instead. `CancelPending` cancels every pending task of the action on the given subjects that has not started, in one statement however many subjects there are, and lists the subjects with one already running, which it cannot cancel and the caller must wait out.
+
+```go
+n, running, err := r.CancelPending(ctx, "queue-space-shard", subjects, "release")
+if err == nil && len(running) > 0 {
+	// Those releases are under way: wait for them, or ask the client to retry.
+}
+
+// From your own transaction.
+n, running, err = r.CancelPendingTx(ctx, tx, "queue-space-shard", subjects, "release")
+```
+
+A caller that must leave such work alone, or wait for it, rather than take it over, asks the queue what is left. `Pending` returns the pending tasks of the action on each of the given subjects that has any, delayed, due or running, oldest first, and changes nothing.
+
+```go
+// Which of these blobs still have a release to come?
+releasing, err := r.Pending(ctx, "queue-space-shard", subjects, "release")
+if len(releasing[subject]) > 0 {
+	// Leave this blob to its release.
+}
+```
+
+## Running delayed work now
+
+`Expedite` makes a subject's pending tasks of an action due now, whatever their `NotBefore`, and returns them all by subject, for the caller to wait on or to run inline with a sync task on each subject. A subject ending in `*` stands for every subject that starts with what comes before it, which is why a submitted subject may not end in `*`. A bucket delete uses that to run its space's pending releases before the space goes. A task it brings forward can no longer be replaced, so nothing pushes it back again. A task waiting to retry is brought forward too, whether or not it holds its subject: the caller asked for now.
+
+```go
+due, err := r.Expedite(ctx, "queue-space-shard", space+"/*", "release")
+for _, ids := range due {
+	for _, id := range ids {
+		if _, err := r.Wait(ctx, "queue-space-shard", id); err != nil {
+			return err
+		}
+	}
+}
+```
+
+Subjects compare byte by byte, so a prefix reads only the tasks it matches.
 
 ## Batching
 

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -172,6 +173,179 @@ func (ex *Exec) Cancel(ctx context.Context, queueName string, id TaskID) error {
 	}
 	ex.tr.woken = append(ex.tr.woken, id)
 	return nil
+}
+
+// cancelPending cancels the unstarted pending tasks of an action on any of
+// the subjects $1, returning their IDs, and the subjects among them with one
+// that has started and is running. Both answers come from the locked rows,
+// which are the current ones: a claim that committed after the statement
+// began is seen as started, and one still to come waits for the cancel and
+// then finds nothing to claim. A reading of the statement's snapshot instead
+// could miss a task starting meanwhile in both answers at once.
+const cancelPending = `WITH locked AS (
+		SELECT id, subject, started FROM %[1]s
+		WHERE subject = ANY($1) AND action = $2 AND state = 'pending'
+		FOR UPDATE),
+	cancelled AS (
+		UPDATE %[1]s t SET state = 'cancelled', finished = now()
+		FROM locked WHERE t.id = locked.id AND locked.started IS NULL
+		RETURNING t.id)
+	SELECT coalesce((SELECT array_agg(id) FROM cancelled), '{}'),
+		coalesce((SELECT array_agg(DISTINCT subject) FROM locked WHERE started IS NOT NULL), '{}')`
+
+// CancelPending cancels every pending task of the action on the subjects that
+// has not started, as Cancel does by ID, in one statement however many
+// subjects there are, and returns how many it cancelled. running lists, in the
+// order given, the subjects with one that has started and still runs: it
+// cannot be cancelled, and a caller that needed it not to run must wait for it
+// or try again later.
+func (r *Runner) CancelPending(ctx context.Context, queueName string, subjects []string, action string) (cancelled int, running []string, err error) {
+	q, ok := r.byName[queueName]
+	if !ok {
+		return 0, nil, fmt.Errorf("task runner: unknown queue %q", queueName)
+	}
+	ids, running, err := cancelPendingIn(ctx, r.db, q, subjects, action)
+	if err != nil {
+		return 0, nil, err
+	}
+	r.finished(ids...)
+	return len(ids), running, nil
+}
+
+// CancelPendingTx is CancelPending inside tx, so the cancel commits or rolls
+// back with the caller's own writes.
+func (r *Runner) CancelPendingTx(ctx context.Context, tx pgx.Tx, queueName string, subjects []string, action string) (cancelled int, running []string, err error) {
+	q, ok := r.byName[queueName]
+	if !ok {
+		return 0, nil, fmt.Errorf("task runner: unknown queue %q", queueName)
+	}
+	ids, running, err := cancelPendingIn(ctx, tx, q, subjects, action)
+	return len(ids), running, err
+}
+
+func cancelPendingIn(ctx context.Context, db Querier, q *queue, subjects []string, action string) ([]TaskID, []string, error) {
+	var ids []TaskID
+	var running []string
+	if err := db.QueryRow(ctx, fmt.Sprintf(cancelPending, q.tasks), subjects, action).Scan(&ids, &running); err != nil {
+		return nil, nil, fmt.Errorf("cancel %s.%s: %w", q.name, action, err)
+	}
+	return ids, inOrder(subjects, running), nil
+}
+
+// inOrder returns the members of found in the order they appear in subjects.
+func inOrder(subjects, found []string) []string {
+	if len(found) == 0 {
+		return nil
+	}
+	have := make(map[string]bool, len(found))
+	for _, s := range found {
+		have[s] = true
+	}
+	out := make([]string, 0, len(found))
+	for _, s := range subjects {
+		if have[s] {
+			out = append(out, s)
+			delete(have, s)
+		}
+	}
+	return out
+}
+
+// Pending returns the pending tasks of the action, running or not, on each of
+// subjects that has any, oldest first. A subject with none is left out. It
+// reads and changes nothing else: it is for a caller that must leave alone
+// work the queue still has to do, or wait for it, where CancelPending is for
+// one that takes the work over.
+func (r *Runner) Pending(ctx context.Context, queueName string, subjects []string, action string) (map[string][]TaskID, error) {
+	q, ok := r.byName[queueName]
+	if !ok {
+		return nil, fmt.Errorf("task runner: unknown queue %q", queueName)
+	}
+	rows, err := r.db.Query(ctx, `SELECT subject, id FROM `+q.tasks+`
+		WHERE subject = ANY($1) AND action = $2 AND state = 'pending'
+		ORDER BY seq`, subjects, action)
+	if err != nil {
+		return nil, fmt.Errorf("pending %s.%s: %w", queueName, action, err)
+	}
+	out, err := collectBySubject(rows)
+	if err != nil {
+		return nil, fmt.Errorf("pending %s.%s: %w", queueName, action, err)
+	}
+	return out, nil
+}
+
+// expedite makes the pending tasks of an action whose subject matches $1 due
+// now, and returns every pending task of the action that matches, oldest first.
+// $1 is a LIKE pattern: the subject itself with its wildcards escaped, or a
+// prefix of it followed by %, which the pending index serves since subjects
+// sort byte by byte.
+// expedite brings forward the unstarted pending tasks of an action on the
+// subjects matching $1 that wait for a time, whether a NotBefore or a retry's
+// backoff, and returns all of them. It reads the locked rows, which are the
+// current ones, so a replacement that committed after the statement began is
+// returned by its own ID.
+const expedite = `WITH locked AS (
+		SELECT id, subject, seq, started, not_before, retry_at FROM %[1]s
+		WHERE subject LIKE $1 AND action = $2 AND state = 'pending'
+		FOR UPDATE),
+	due AS (
+		UPDATE %[1]s t SET not_before = NULL, retry_at = NULL, replaceable = false
+		FROM locked WHERE t.id = locked.id AND locked.started IS NULL
+		AND (locked.not_before > now() OR locked.retry_at > now()))
+	SELECT subject, id FROM locked ORDER BY seq`
+
+// Expedite makes the subject's pending tasks of the action due now, whatever
+// their NotBefore or retry backoff, and returns all of the action's pending
+// tasks on it, by subject and oldest first, for the caller to Wait on or to
+// run inline with a sync task on each subject. A subject ending in * stands for every subject
+// that starts with what comes before the *, so a caller can bring forward a
+// group of subjects at once, such as a bucket delete running its space's
+// pending releases. A task it brings forward is no longer a replacement, so a
+// later submission cannot push it back. A task waiting to retry is brought
+// forward too, whether or not it holds its subject. One placed on another
+// instance still runs only there.
+func (r *Runner) Expedite(ctx context.Context, queueName, subject, action string) (map[string][]TaskID, error) {
+	q, ok := r.byName[queueName]
+	if !ok {
+		return nil, fmt.Errorf("task runner: unknown queue %q", queueName)
+	}
+	rows, err := r.db.Query(ctx, fmt.Sprintf(expedite, q.tasks), subjectPattern(subject), action)
+	if err != nil {
+		return nil, fmt.Errorf("expedite %s %s.%s: %w", subject, queueName, action, err)
+	}
+	out, err := collectBySubject(rows)
+	if err != nil {
+		return nil, fmt.Errorf("expedite %s %s.%s: %w", subject, queueName, action, err)
+	}
+	r.pokeQueue(q)
+	return out, nil
+}
+
+// collectBySubject reads rows of (subject, id) into IDs by subject, in row
+// order, and closes them.
+func collectBySubject(rows pgx.Rows) (map[string][]TaskID, error) {
+	defer rows.Close()
+	out := map[string][]TaskID{}
+	for rows.Next() {
+		var subject string
+		var id TaskID
+		if err := rows.Scan(&subject, &id); err != nil {
+			return nil, err
+		}
+		out[subject] = append(out[subject], id)
+	}
+	return out, rows.Err()
+}
+
+// subjectPattern returns the LIKE pattern matching subject, or, when it ends in
+// *, every subject starting with what precedes the *.
+func subjectPattern(subject string) string {
+	prefix, isPrefix := strings.CutSuffix(subject, "*")
+	p := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(prefix)
+	if isPrefix {
+		p += "%"
+	}
+	return p
 }
 
 const claimColumns = `seq, id, action, created, not_before, expires, args, sync, attempts, node`
