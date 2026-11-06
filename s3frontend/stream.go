@@ -164,8 +164,17 @@ func (l *localCopy) discard() {
 	l.t = nil
 }
 
-// kept is the finished copy, or nil when there is none.
+// kept closes the finished copy and returns it, or nil when there is none:
+// the copy waits for its object's other blobs without holding a file open.
 func (l *localCopy) kept() *blockstore.TempBlob {
+	if l.t == nil {
+		return nil
+	}
+	if err := l.t.Close(); err != nil {
+		l.logger.Warn("closing a blob's local copy failed; it is not cached", zap.Error(err))
+		l.discard()
+		return nil
+	}
 	return l.t
 }
 

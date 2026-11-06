@@ -140,13 +140,14 @@ func (c *BlobCache) InFlight() int64 {
 }
 
 // TempBlob is a blob being written into the cache, not yet under its digest.
-// Each byte written counts toward the cache's usage as it lands. Adopt or
-// Discard ends it. Not safe for concurrent use.
+// Each byte written counts toward the cache's usage as it lands. Close ends
+// the writes; Adopt or Discard ends it. Not safe for concurrent use.
 type TempBlob struct {
-	c    *BlobCache
-	f    *os.File
-	n    int64
-	done bool
+	c      *BlobCache
+	f      *os.File
+	n      int64
+	closed bool
+	done   bool
 }
 
 // CreateTemp starts a blob write into the cache.
@@ -165,6 +166,25 @@ func (t *TempBlob) Write(p []byte) (int, error) {
 	return n, err
 }
 
+// Ended reports whether the temporary file has been adopted or discarded.
+func (t *TempBlob) Ended() bool {
+	return t.done
+}
+
+// Close ends the writes and closes the file, keeping it for Adopt or Discard,
+// so a finished blob holds no file descriptor while the rest of its object
+// streams. Closing it again does nothing.
+func (t *TempBlob) Close() error {
+	if t.closed {
+		return nil
+	}
+	t.closed = true
+	if err := t.f.Close(); err != nil {
+		return fmt.Errorf("blockstore: cache tempfile close: %w", err)
+	}
+	return nil
+}
+
 // Discard deletes the temporary file and takes its bytes off the count.
 // Discarding it again, once adopted, or a nil TempBlob, does nothing.
 func (t *TempBlob) Discard() {
@@ -172,7 +192,7 @@ func (t *TempBlob) Discard() {
 		return
 	}
 	t.done = true
-	_ = t.f.Close()
+	_ = t.Close()
 	_ = os.Remove(t.f.Name())
 	t.c.inFlight.Add(-t.n)
 }
@@ -192,7 +212,7 @@ func (c *BlobCache) Adopt(t *TempBlob, digest mh.Multihash) (int64, error) {
 		return 0, fmt.Errorf("blockstore: cache adopt: temporary file already ended")
 	}
 	defer t.Discard()
-	if err := t.f.Close(); err != nil {
+	if err := t.Close(); err != nil {
 		return 0, fmt.Errorf("blockstore: cache adopt: %w", err)
 	}
 	c.mu.Lock()

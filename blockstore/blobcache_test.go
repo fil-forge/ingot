@@ -492,3 +492,40 @@ func TestBlobCacheAdoptReplacesACachedCopy(t *testing.T) {
 		t.Fatalf("usage in-flight = %s, want %s", got, want)
 	}
 }
+
+// A closed temporary file holds no descriptor, still counts toward usage, and
+// still adopts or discards.
+func TestBlobCacheTempBlobClosesBeforeItEnds(t *testing.T) {
+	c := newTestCache(t)
+	tb, d := writeTemp(t, c, "hello")
+	if err := tb.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := tb.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+	if _, err := tb.Write([]byte("more")); err == nil {
+		t.Fatal("Write after Close succeeded")
+	}
+	if got := c.InFlight(); got != 5 {
+		t.Fatalf("in flight after Close = %d, want 5", got)
+	}
+	if n, err := c.Adopt(tb, d); err != nil || n != 5 {
+		t.Fatalf("Adopt after Close = %d, %v; want 5", n, err)
+	}
+	if got, want := fmt.Sprint(c.Usage(), c.InFlight()), fmt.Sprint(5, 0); got != want {
+		t.Fatalf("usage in-flight = %s, want %s", got, want)
+	}
+
+	dropped, _ := writeTemp(t, c, "bye")
+	if err := dropped.Close(); err != nil {
+		t.Fatal(err)
+	}
+	dropped.Discard()
+	if _, err := os.Stat(dropped.f.Name()); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("discarded file: %v, want gone", err)
+	}
+	if got := c.InFlight(); got != 0 {
+		t.Fatalf("in flight after Discard = %d, want 0", got)
+	}
+}

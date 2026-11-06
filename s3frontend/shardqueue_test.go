@@ -133,6 +133,35 @@ func TestWrittenBlobIsCachedAfterItsRequestEnds(t *testing.T) {
 	require.Eventually(t, func() bool { return f.tasks(t, d, shardEvict, "pending") == 1 }, 5*time.Second, 10*time.Millisecond, "its eviction queued")
 }
 
+// A blob written again just as its earlier copy's eviction falls due keeps
+// the new copy, with a fresh eviction: the adoption and the new eviction run
+// in one task on the digest's subject, so the earlier eviction runs before
+// both or is replaced by the new one.
+func TestRewriteAtExpiryKeepsTheNewCopy(t *testing.T) {
+	f := newShardFixture(t, time.Hour)
+	d := f.hold(t, "a")
+	require.Equal(t, 1, f.tasks(t, d, shardEvict, "pending"))
+	_, err := f.env.DB.Exec(t.Context(), `UPDATE `+f.env.Table("queue_shard_tasks")+`
+		SET not_before = now() WHERE subject = $1 AND action = $2 AND state = 'pending'`, hex.EncodeToString(d), shardEvict)
+	require.NoError(t, err)
+
+	f.hold(t, "a")
+	time.Sleep(200 * time.Millisecond) // past several polls for due work
+	require.True(t, f.cached(d), "the new copy outlived the earlier eviction")
+	require.Equal(t, 1, f.tasks(t, d, shardEvict, "pending"), "one eviction, a TTL out")
+}
+
+// A written copy that cannot be adopted is discarded and leaves nothing in
+// flight.
+func TestAWrittenCopyNotAdoptedIsDiscarded(t *testing.T) {
+	f := newShardFixture(t, time.Hour)
+	local, d := writeLocalCopy(t, f.b, "a")
+	require.NoError(t, os.RemoveAll(filepath.Dir(f.b.cache.Path(d))))
+	f.b.cacheWritten(t.Context(), d, local)
+	require.True(t, local.Ended(), "the copy was discarded")
+	require.Zero(t, f.b.cache.InFlight(), "no copy left in progress")
+}
+
 // A read with less than half the time to live left renews it: the pending
 // eviction is replaced by a later one, so the blob outlives its first TTL.
 func TestReadRenewsTheTTL(t *testing.T) {
