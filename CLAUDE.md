@@ -99,7 +99,8 @@ Internal:
   (Put/Get/Head/Delete/List), `version.go` (resolveVersion / commitVersion,
   the per-key version tree), `multipart.go`, `bucket.go`, `listversions.go`,
   `backend.go`, `stream.go` (each body blob streams to its
-  provider while spooling it; the stale-stream sweeper).
+  provider while spooling it; a failed stream aborts its allocation, and one
+  a dead request leaves is expired by the provider).
 - **`bucketop/`** — `Coordinator`/`Tx`: per-bucket write transaction (lock,
   snapshot root, staging buffer, CAS commit).
 - **`blockstore/`** — block I/O contracts + impls: `log.go` (`Log`, `Plane`
