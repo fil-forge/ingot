@@ -11,6 +11,7 @@ import (
 
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/taskrunner"
+	"github.com/fil-forge/ingot/uploader"
 )
 
 // A bucket's catalog ships from its log as a queue-bucket.ship on the
@@ -22,8 +23,9 @@ import (
 // bucket's latest write captured (bucketop.ShipAuthority): a seal from the
 // log's age trigger has no request of its own.
 
-// shipRetry retries a ship with no attempt limit: dropping it would leave
-// an idle bucket's catalog only on local disk.
+// shipRetry retries a ship with no attempt limit: dropping one that failed
+// for any reason but its authority would leave an idle bucket's catalog only
+// on local disk.
 var shipRetry = taskrunner.RetryPolicy{First: time.Second, Max: 5 * time.Minute, Multiplier: 2}
 
 // BucketShipper is the slice of the catalog log a ship needs.
@@ -87,9 +89,11 @@ func (b *Backend) queueShip(ctx context.Context, bucket string) error {
 	return err
 }
 
-// runShip is queue-bucket.ship. An expired proof fails it for good: the
-// bucket's next write captures fresh authority and its next seal queues a
-// ship again.
+// runShip is queue-bucket.ship. No authority to ship with
+// (uploader.ErrNoShipAuthority) fails it for good: no retry can find any
+// until the bucket's next write captures fresh authority, and that write's
+// seal queues a ship of every segment left unshipped. Any other failure is
+// retried.
 func (b *Backend) runShip(ctx context.Context, _ *taskrunner.Exec, t taskrunner.Task) ([]byte, error) {
 	var args BucketTask
 	if err := args.UnmarshalCBOR(bytes.NewReader(t.Args)); err != nil {
@@ -100,7 +104,11 @@ func (b *Backend) runShip(ctx context.Context, _ *taskrunner.Exec, t taskrunner.
 		return nil, nil
 	}
 	if err := shipper.ShipBucket(ctx, args.Name); err != nil {
-		return nil, fmt.Errorf("ship catalog of %q: %w", args.Name, err)
+		err = fmt.Errorf("ship catalog of %q: %w", args.Name, err)
+		if errors.Is(err, uploader.ErrNoShipAuthority) {
+			return nil, taskrunner.Permanent(err)
+		}
+		return nil, err
 	}
 	return nil, nil
 }
