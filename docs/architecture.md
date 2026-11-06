@@ -774,7 +774,6 @@ CREATE TABLE ingot.buckets (
                                                          -- default encryption; NULL = unconfigured (encrypts)
     closing            boolean NOT NULL DEFAULT false    -- set by DeleteBucket's queue-bucket.close (§7.3)
 );
-CREATE INDEX buckets_space_idx ON ingot.buckets (space);
 
 -- The catalog log's segment lifecycle (owned by logstore; see logstore/README.md).
 -- seq is drawn from the shared ingot.segment_seq sequence. state holds only
@@ -810,7 +809,6 @@ CREATE TABLE ingot.segment_op_roots (
     root_cid   bytea  NOT NULL,
     PRIMARY KEY (seq, seq_within)
 );
-CREATE INDEX segment_op_roots_bucket_seq_idx ON ingot.segment_op_roots (bucket, seq);
 
 -- The catalog journal: a copy of every catalog block a commit appended to the
 -- log, written in the root advance's transaction and deleted in the one that stamps
@@ -889,7 +887,6 @@ CREATE TABLE ingot.blob_locations (
     created_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (space, digest)
 );
-CREATE INDEX blob_locations_digest_idx ON ingot.blob_locations (digest);
 
 -- FEE encryption parameters of each encrypted body blob: exactly the inputs a
 -- range read's decryptor needs, so it can decrypt any span without fetching the
