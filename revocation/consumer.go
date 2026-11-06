@@ -37,8 +37,11 @@
 // accepts it and nothing reports the gap. So after restoring the service's
 // database from a backup, or restarting a service that keeps its records in
 // memory, restart ingot once the service is serving again. The restart empties
-// every cache, and any record the consumer then skips was recorded before it,
-// so each key such a record named goes to Hilt on its next request.
+// every cache. If the restarted consumer's cursor is then refused, it reads the
+// head only once the gateway is already serving, so it can skip records written
+// after the restart, but the clear after that read empties every cache again.
+// Either way, each key named by a skipped record goes to Hilt on its next
+// request.
 //
 // One case survives a restart: a Hilt write that published its revocations,
 // then failed to commit. Hilt keeps serving the revoked delegations until a
