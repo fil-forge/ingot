@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 	"go.opentelemetry.io/otel/attribute"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 
 	"github.com/fil-forge/ingot/taskrunner"
 )
@@ -124,6 +125,35 @@ func TestFailedTasksCanBeListedAndResubmitted_Live(t *testing.T) {
 	}
 }
 
+// A sync task that fails is listed with the others, but is not resubmitted:
+// its caller has had the failure, and a replay would run it async, without
+// what the caller held.
+func TestASyncTaskIsNotResubmitted_Live(t *testing.T) {
+	f := newFixture(t, 0)
+	f.handle(t, qTop, "put", func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) {
+		return nil, taskrunner.Permanent(errors.New("request gone"))
+	})
+	f.start(t)
+	ctx := waitCtx(t)
+
+	if _, err := f.r.Run(ctx, taskrunner.Spec{Queue: qTop, Subject: "space", Action: "put"}); err == nil {
+		t.Fatal("sync task succeeded")
+	}
+	failed, err := f.r.ListFailed(ctx, qTop, "space", uuid.Nil, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(failed) != 1 || !failed[0].Sync {
+		t.Fatalf("ListFailed = %+v, want the failed sync task, marked sync", failed)
+	}
+	if _, err := f.r.Resubmit(ctx, qTop, failed[0].Task.ID, nil); !errors.Is(err, taskrunner.ErrSyncTask) {
+		t.Fatalf("Resubmit of a sync task: %v, want ErrSyncTask", err)
+	}
+	if left, _ := f.r.ListFailed(ctx, qTop, "space", uuid.Nil, 10); len(left) != 1 {
+		t.Errorf("failed tasks after the refused Resubmit = %+v, want the sync task still listed", left)
+	}
+}
+
 func TestAHandlerCanResubmitFailedTasks_Live(t *testing.T) {
 	f := newFixture(t, 1)
 	f.handle(t, qBottom, "remove", func(ctx context.Context, ex *taskrunner.Exec, task taskrunner.Task) ([]byte, error) {
@@ -206,6 +236,45 @@ func TestFinishedTasksAreDeletedPastTheirRetention_Live(t *testing.T) {
 	}
 	if left, _ := f.r.ListFailed(ctx, qTop, "", uuid.Nil, 10); len(left) != 1 {
 		t.Errorf("failed tasks = %d, want 1: failed tasks stay until resubmitted", len(left))
+	}
+}
+
+// A queue's FailedRetention deletes its failed tasks once they are older, and
+// the failed gauge stops counting them.
+func TestFailedTasksAreDeletedPastTheirFailedRetention_Live(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { _ = mp.Shutdown(context.Background()) })
+	f := newFixture(t, 1, func(o *taskrunner.Options) {
+		o.MeterProvider = mp
+		o.RetentionInterval = 50 * time.Millisecond
+		o.Queues[0].FailedRetention = 100 * time.Millisecond
+	})
+	f.handle(t, qTop, "fail", func(context.Context, *taskrunner.Exec, taskrunner.Task) ([]byte, error) {
+		return nil, taskrunner.Permanent(errors.New("boom"))
+	})
+	f.start(t)
+	ctx := waitCtx(t)
+	id, err := f.r.Submit(ctx, taskrunner.Spec{Queue: qTop, Subject: "a", Action: "fail"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = f.r.Wait(ctx, qTop, id)
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if left, _ := f.r.ListFailed(ctx, qTop, "", uuid.Nil, 10); len(left) == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("a failed task outlived its queue's FailedRetention")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	got := collect(t, reader)
+	aa := []attribute.KeyValue{attribute.String("queue", qTop), attribute.String("action", "fail")}
+	if v, ok := gaugeValue[int64](t, got["taskrunner.queue.failed"], aa...); !ok || v != 0 {
+		t.Errorf("failed = %d (reported %v) after the retention, want 0", v, ok)
 	}
 }
 

@@ -167,6 +167,10 @@ var (
 	ErrConflict = errors.New("a conditional write affected no rows")
 	// ErrNotFound is returned by Wait for a task its queue does not hold.
 	ErrNotFound = errors.New("task not found")
+	// ErrSyncTask is returned by Resubmit for a task that ran sync: its
+	// caller has had its failure, and a handler written for a caller may
+	// depend on what only the caller holds.
+	ErrSyncTask = errors.New("a sync task cannot be resubmitted")
 	// ErrOtherNode is returned when a sync task is placed on another
 	// instance, which is the only one that may run it.
 	ErrOtherNode = errors.New("task is placed on another instance")
