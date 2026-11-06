@@ -34,7 +34,7 @@ if err := r.Start(ctx); err != nil {
 defer r.Stop(ctx)
 ```
 
-`Workers` is how many of a queue's async tasks this process runs at once. A sync task runs in its caller's goroutine, but only once the tasks due ahead of it on its subject have run, and those need workers on some instance.
+`Workers` is how many of a queue's async tasks this process runs at once; zero runs none and leaves them to other processes. A sync task runs in its caller's goroutine, but only once the tasks due ahead of it on its subject have run, and those need workers on some instance. `Migrate` creates or updates every queue's tables, and several processes may call it at once at startup.
 
 ## Handlers
 
@@ -66,7 +66,7 @@ Four rules follow from how the runner works:
 
 ### Conditional writes
 
-A write that only makes sense if an earlier read still holds is conditional. If it affects no rows, the commit fails and the whole task runs again from scratch, up to `Options.CommitAttempts` times. After that the task stays pending and is resumed when its lease expires.
+A write that only makes sense if an earlier read still holds is conditional. If it affects no rows, the commit fails and the whole task runs again from scratch, up to `Options.CommitAttempts` times (3 by default). After that the task stays pending and is resumed when its lease expires.
 
 ```go
 err := ex.WriteConditional(ctx,
@@ -114,7 +114,7 @@ if errors.Is(err, taskrunner.ErrExpired) {
 }
 ```
 
-`Expires` defaults to `ctx`'s deadline. If `ctx` ends first, `Run` returns the context's error and the task stays recorded for a worker to finish, unless its `Expires` passes first. Give a sync task an `Expires`, or a `ctx` with a deadline, whenever a caller that has given up must not see the task take effect later.
+A sync task cannot have a `NotBefore`, and a batching action cannot run sync. `Expires` defaults to `ctx`'s deadline. If `ctx` ends first, `Run` returns the context's error and the task stays recorded for a worker to finish, unless its `Expires` passes first. Give a sync task an `Expires`, or a `ctx` with a deadline, whenever a caller that has given up must not see the task take effect later.
 
 ### Waiting
 
@@ -192,7 +192,7 @@ A task without `Replace` is never a replacement and leaves pending ones alone. A
 
 ## Submitting many tasks at once
 
-`SubmitAllTx` adds many tasks of one queue inside your transaction in one statement, for a write that queues work for each of thousands of subjects, and returns their IDs in order. Of two replacements in the batch for the same subject and action, the later is kept, as it would be if they were submitted one by one.
+`SubmitAllTx` adds many tasks of one queue inside your transaction in one statement, for a write that queues work for each of thousands of subjects, and returns their IDs in order. Of two replacements in the batch for the same subject and action, the one with the later `NotBefore` is kept, as it would be if they were submitted one by one, and both get its ID.
 
 ```go
 ids, err := r.SubmitAllTx(ctx, tx, specs)
@@ -225,7 +225,7 @@ if len(releasing[subject]) > 0 {
 
 ## Running delayed work now
 
-`Expedite` makes a subject's pending tasks of an action due now, whatever their `NotBefore`, and returns them all by subject, for the caller to wait on, or to wait behind with a sync task on each subject. A subject ending in `*` stands for every subject that starts with what comes before it, which is why a submitted subject may not end in `*`. A bucket delete uses that to run its space's pending releases before the space goes. No task it returns can be replaced any more, due already or not, so nothing pushes it back again. A task waiting to retry is brought forward too, whether or not it holds its subject: the caller asked for now. `ExpediteTasks` does the same for given task IDs, so a caller cleaning up after itself brings forward only its own tasks and leaves others' of the same subject and action at their times.
+`Expedite` makes a subject's pending tasks of an action due now, whatever their `NotBefore`, and returns them all by subject, for the caller to wait on, or to wait behind with a sync task on each subject. A subject ending in `*` stands for every subject that starts with what comes before it, which is why a submitted subject may not end in `*`. A bucket delete uses that to run its space's pending releases before the space goes. No task it returns can be replaced any more, due already or not, so nothing pushes it back again. A task waiting to retry is brought forward too, whether or not it holds its subject: the caller asked for now. A placed task brought forward still runs only on its own instance. `ExpediteTasks` does the same for given task IDs, so a caller cleaning up after itself brings forward only its own tasks and leaves others' of the same subject and action at their times.
 
 ```go
 due, err := r.Expedite(ctx, "queue-space-shard", space+"/*", "release")
@@ -302,7 +302,7 @@ Sync tasks are never retried: the error goes to the caller, which retries the re
 
 ## Failed tasks
 
-A task that fails for good, with a permanent error or out of attempts, stays in its queue with its last error. It no longer holds up its subject, and it is kept until it is resubmitted, so the work it stood for can be inspected and replayed. `ListFailed` lists a queue's failed tasks, for one subject or all of them, a page at a time: pass the last task's ID of one page to get the next. `Resubmit` replaces one with a new pending task on the same subject and action, which runs after the tasks already queued there. It can take new arguments, such as fresh authority, and starts its attempts afresh. A task that ran sync is listed but not resubmitted (`ErrSyncTask`): its caller has had the failure, and its handler may depend on what only the caller held.
+A task that fails for good, with a permanent error or out of attempts, stays in its queue with its last error. It no longer holds up its subject, and it is kept until it is resubmitted or its queue's `FailedRetention` passes, so the work it stood for can be inspected and replayed. `ListFailed` lists a queue's failed tasks, for one subject or all of them, a page at a time: pass the last task's ID of one page to get the next. `Resubmit` replaces one with a new pending task on the same subject and action, which runs after the tasks already queued there. It can take new arguments, such as fresh authority, and starts its attempts afresh. A task that ran sync is listed but not resubmitted (`ErrSyncTask`): its caller has had the failure, and its handler may depend on what only the caller held.
 
 ```go
 after := uuid.Nil
@@ -319,11 +319,17 @@ for {
 }
 ```
 
-A handler can do the same through `ex.ListFailed` and `ex.Resubmit`, so the replay commits with its other writes.
+A handler can do the same through `ex.ListFailed` and `ex.Resubmit`, so the replay commits with its other writes. A task whose action has no registered handler fails the same way, so tasks left behind by a handler removed in a deploy can be found and replayed.
+
+## Leases
+
+A worker or sync caller holds its subject's lease while it runs tasks there. The runner renews every lease it holds three times per `Options.LeaseTTL`, 30 seconds by default. A lease left unrenewed past its TTL, because its process crashed, stalled or lost its database connection, is taken over by the next consumer to ask, which runs the interrupted task again. The old holder's commit then fails, so it writes nothing, and it starts no further sync child once renewal has found the lease gone.
+
+A worker makes at most `Options.DrainLimit` handler runs on one subject, 100 by default and a batch counting as one, before it releases the lease. Each queue is checked for due subjects every `Options.PollInterval`, 1 second by default, and at once when this process submits a task to it or a worker frees up with more due.
 
 ## Retention
 
-Finished tasks are deleted once they are older than their queue's `Retention`, 24 hours by default: those that succeeded, expired, were cancelled or were resubmitted. Failed tasks are kept until they are resubmitted, unless the queue sets a `FailedRetention`.
+Finished tasks are deleted once they are older than their queue's `Retention`, 24 hours by default: those that succeeded, expired, were cancelled or were resubmitted. Failed tasks are kept until they are resubmitted, unless the queue sets a `FailedRetention`. Deletion runs every `Options.RetentionInterval`, 1 minute by default.
 
 ```go
 taskrunner.QueueOptions{Name: "queue-space-upload", Workers: 4, Retention: 6 * time.Hour}
@@ -348,24 +354,25 @@ _, err = ex.Submit(ctx, taskrunner.Spec{
 
 ## Metrics
 
-Pass a `MeterProvider` and the runner reports through OpenTelemetry, labelled by queue and, where there is one, action:
+Pass a `MeterProvider` and the runner reports through OpenTelemetry, under the instrumentation scope `github.com/fil-forge/ingot/taskrunner`:
 
-| Metric | What it shows |
-|---|---|
-| `taskrunner.queue.ready` | Pending tasks that are due |
-| `taskrunner.queue.delayed` | Pending tasks waiting on their `NotBefore`, or on a retry that holds their subject |
-| `taskrunner.queue.failed` | Tasks that failed for good and await inspection or resubmission |
-| `taskrunner.queue.oldest_ready_age` | How long the oldest due task has been due. Growth means the workers are not keeping up, or a subject is stuck |
-| `taskrunner.task.duration` | Time from start to outcome, labelled `succeeded`, `failed`, `retried` or `expired` |
-| `taskrunner.lease.wait` | Time a sync task or child waited for its subject's lease |
-| `taskrunner.lease.takeovers` | Leases taken over after they expired, which means a consumer stopped renewing |
-| `taskrunner.workers.busy`, `taskrunner.workers.limit` | Workers running a queue's tasks in this process, and the most it runs |
+| Metric | Unit | Attributes | What it shows |
+|---|---|---|---|
+| `taskrunner.queue.ready` | `{task}` | `queue`, `action` | Pending tasks that are due |
+| `taskrunner.queue.delayed` | `{task}` | `queue`, `action` | Pending tasks waiting on their `NotBefore`, or on a retry that holds their subject |
+| `taskrunner.queue.failed` | `{task}` | `queue`, `action` | Tasks that failed for good and await inspection or resubmission. Actions with no registered handler report too |
+| `taskrunner.queue.oldest_ready_age` | `s` | `queue`, `action` | How long the oldest due task has been due, 0 when none is. Growth means the workers are not keeping up, or a subject is stuck |
+| `taskrunner.task.duration` | `s` | `queue`, `action`, `outcome` | Time from start to outcome, with `outcome` one of `succeeded`, `failed`, `retried` or `expired`. Sync children are recorded too |
+| `taskrunner.lease.wait` | `s` | `queue` | Time a sync task or child waited for its subject's lease |
+| `taskrunner.lease.takeovers` | `{lease}` | `queue` | Leases taken over after they expired, which means a consumer stopped renewing |
+| `taskrunner.workers.busy` | `{worker}` | `queue` | Workers running a queue's tasks in this process |
+| `taskrunner.workers.limit` | `{worker}` | `queue` | The most workers this process runs for a queue |
 
 ```go
 r, err := taskrunner.New(pool, taskrunner.Options{Schema: "ingot", Queues: queues, MeterProvider: otel.GetMeterProvider()})
 ```
 
-The queue gauges are read from Postgres each time the exporter collects. Without a provider the runner reports to the global OpenTelemetry provider, which is a no-op until one is installed.
+The queue gauges are read from Postgres each time the exporter collects, and every registered action reports, at zero when it has no tasks. Without a provider the runner reports to the global OpenTelemetry provider, which is a no-op until one is installed.
 
 ## Testing handlers
 
