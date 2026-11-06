@@ -312,7 +312,7 @@ sequenceDiagram
     TX->>TX: mint versionId ("null" unless versioning Enabled),<br/>manifest into OpStaging, re-check If-Match under the lock,<br/>MST splice (new nodes into staging)
     Note over TX: uploader.CaptureShipAuthority: every commit captures the request<br/>proof store, if borrowable and it holds a /blob/add chain, as the<br/>space's ship authority, so a write with no body (a delete, a tag<br/>change) leaves one for its segment's ship
     TX->>L: AppendBatch(catalog blocks, OpRoot) with fsync
-    TX->>R: CommitRoot(bucket, snapshot, newRoot), guarded, one transaction:<br/>the batch's catalog blocks journaled under its segment (catalog_journal,<br/>skipped once the segment has shipped), blob_refs gains this version,<br/>superseded version rows removed, a release record per digest whose<br/>claims reached 0#59;<br/>/upload/add(root = this version's manifest CID)<br/>+ /upload/remove per discarded version queued (upload_registrations)
+    TX->>R: CommitRoot(bucket, snapshot, newRoot), guarded, one transaction:<br/>the batch's catalog blocks journaled under its segment (catalog_journal,<br/>skipped once the segment has shipped), blob_refs gains this version,<br/>superseded version rows removed, a release record per digest whose<br/>claims reached 0#59;<br/>/upload/add(root = this version's manifest CID)<br/>+ /upload/remove per discarded version queued (queue-space-upload tasks)
     TX-->>B: committed, lock released
     B-->>C: 200 + ETag (+ x-amz-version-id when versioning is configured)
     Note over B,U: the release sweeper runs each record once its grace passes:<br/>/blob/remove (+ crypto-shred: its blob_encryption_params row deleted)
@@ -359,39 +359,34 @@ sequenceDiagram
   `NumberOfObjects`. Best-effort, as the index publication is: the object is
   durable and the response must say so, so a failure logs and the count
   under-reports rather than failing a write that succeeded.
-- The write does **not** call the upload service. It queues the change in
-  `ingot.upload_registrations` in the same transaction as the root CAS, and the
-  registration sweeper (`SweepUploadRegistrations`, every 30s) applies it. The
-  count is reporting data, so a Sprue round trip does not belong in a PUT, and
-  a Sprue outage delays the count instead of failing writes or losing it.
-- The row exists exactly when the version committed, and `seq` replays a key's
-  changes in commit order. A sweep spends **two round trips**, not one per
-  change: every queued addition in one batch of invocations, then every
-  retraction in another. (A batch in ucantone's sense — many invocations, a
-  receipt each. `/ucan/conclude` is the other shape, one invocation carrying
-  many receipts.)
-  Both halves are needed — a container sorts its tokens bytewise, so the
-  service may run a batch in any order, and a retraction sharing a batch with
-  the addition it retires could overtake it and leave the root counted for
-  good. Splitting by op is safe because a root is added by the commit that
-  creates the version and retracted by a later one, so an addition always
-  carries the lower `seq`.
-- A key with a refused change is held whole until it is due again, within the
-  sweep and across sweeps, so a later row can never overtake an earlier one.
-  Each row carries the delegation chain that authorizes it, captured from the
-  request that committed the version, because the sweeper has no request to
-  borrow authority from.
+- The write does **not** call the upload service. It queues the change as a
+  `queue-space-upload` task in the same transaction as the root CAS, and a
+  worker sends it. The count is reporting data, so a Sprue round trip does not
+  belong in a PUT, and a Sprue outage delays the count instead of failing
+  writes or losing it.
+- The task exists exactly when the version committed. The queue's subject is
+  the space, so a space's changes run in commit order, and a batch takes only
+  consecutive changes of one kind: up to 256 additions in one round trip, then
+  the retractions after them in another. (A batch in ucantone's sense — many
+  invocations, a receipt each.) Splitting by kind is needed because a container
+  sorts its tokens bytewise, so the service may run a batch in any order, and a
+  retraction sharing a batch with the addition it retires could overtake it and
+  leave the root counted for good.
+- A refused change is retried with backoff and holds its space, so a later
+  change can never overtake it. Each change carries the delegation chain that
+  authorizes it, captured from the request that committed the version, because
+  the task has no request to borrow authority from.
 - That chain has room to spare — hilt expires its delegation to the gateway at
   the next UTC midnight plus an async overhang, so even a change queued at
-  23:59 has hours to be drained in. For the queue that outlasts that, the
-  sweeper renews from the space's live authority, which a recent body upload
-  with a borrowable store leaves behind, less any delegation a revocation has
-  since named. A space that has gone quiet has none, and after
-  `uploadRegistrationDeadLetterAfter` attempts the row is **dead-lettered**:
-  out of the sweep, and out of the way of its key's later rows. (Nothing to do
-  with a parked blob, which is durable and awaiting its accept.) The count is then short by
-  that one change rather than frozen for that key, and `dead_letter_reason` records
-  why.
+  23:59 has hours to be sent in. For a queue that outlasts that, the handler
+  renews from the space's live authority, which a recent body upload with a
+  borrowable store leaves behind, less any delegation a revocation has since
+  named. A space that has gone quiet has none, and after
+  `uploadRegistrationDeadLetterAfter` attempts the change fails for good: it
+  stays in the queue as a failed task, out of the way of the space's later
+  changes. The count is then short (or high) by that one change rather than
+  frozen for the space. A bucket delete resends the space's failed retractions
+  with its own authority before the space goes.
 
 Cross-references: [`architecture.md` §7.1](./architecture.md#71-write-single-shot-putobject).
 
@@ -400,7 +395,7 @@ concludeStreamed), `s3frontend/stream.go` (WriteSizedBlob,
 SweepStaleStreams), `bucket/sized.go`, `uploader/stream.go`,
 `s3frontend/copy.go` (CopyObject, copySourceBucket),
 `s3frontend/version.go` (commitVersion, enqueueRegistration),
-`s3frontend/uploadsweep.go` (SweepUploadRegistrations), `bucketop/bucketop.go`,
+`s3frontend/uploadqueue.go` (the queue-space-upload handlers), `bucketop/bucketop.go`,
 `blockstore/staging.go`, `uploader/blob.go`, `uploader/forge.go`,
 `uploader/upload.go`. Review when these change.
 
@@ -1211,16 +1206,6 @@ erDiagram
         bytea cid PK "superseded MST node"
         text bucket
     }
-    upload_registrations {
-        bigint seq PK "commit order"
-        text bucket FK
-        text object_key
-        text space
-        bytea root "the version's manifest CID"
-        text op "add, remove"
-        timestamptz next_at "the sweeper's clock"
-        timestamptz dead_lettered_at "set once retrying stops"
-    }
     revocation_cursor {
         boolean id PK "single-row latch"
         timestamptz recorded_at "resume point in the revocation stream"
@@ -1229,7 +1214,6 @@ erDiagram
     segments ||--o{ segment_op_roots : "ON DELETE CASCADE"
     multipart_sessions ||--o{ multipart_parts : "ON DELETE CASCADE"
     multipart_parts ||--o| multipart_part_trees : "ON DELETE CASCADE; deleted by Complete once the object commits"
-    buckets ||--o{ upload_registrations : "ON DELETE CASCADE"
     buckets ||--o{ catalog_journal : "ON DELETE CASCADE"
     segments ||..o{ catalog_journal : "by seq, deliberately no FK"
     buckets ||..o{ segments : "by bucket name, no FK"

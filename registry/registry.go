@@ -212,9 +212,9 @@ var (
 // RootCommit is what a root swap carries besides the root (Registry.CommitRoot):
 // the rows that must exist exactly when the version does.
 type RootCommit struct {
-	// Registrations are the upload-registration outbox rows the commit
-	// owes: the versions it publishes and retracts from the space's
-	// content-entry list.
+	// Registrations are the upload registrations the commit queues, as
+	// tasks in its transaction: the versions it publishes and retracts from
+	// the space's content-entry list.
 	Registrations []UploadRegistration
 	// Claims are the new generation's claims, one per body digest. Each is
 	// recorded under the (space, digest) claim-key lock and refused with

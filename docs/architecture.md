@@ -980,30 +980,6 @@ CREATE TABLE ingot.gc_candidates (
     created_at  timestamptz NOT NULL DEFAULT now()
 );
 
--- The outbox for the upload service's content-entry list: one row per object
--- version committed or retired, written in the same transaction as the
--- bucket-root CAS and drained in commit order per key by the registration
--- sweeper. proofs is the delegation chain authorizing the invocation; a row
--- that cannot be renewed is dead-lettered rather than retried forever.
-CREATE TABLE ingot.upload_registrations (
-    seq                bigserial PRIMARY KEY,
-    bucket             text  NOT NULL REFERENCES ingot.buckets(name) ON DELETE CASCADE,
-    object_key         text  NOT NULL,
-    space              text  NOT NULL,
-    root               bytea NOT NULL,                   -- the version's manifest CID
-    op                 text  NOT NULL CHECK (op IN ('add','remove')),
-    proofs             bytea NOT NULL,                   -- encoded UCAN container
-    attempts           integer NOT NULL DEFAULT 0,
-    next_at            timestamptz NOT NULL DEFAULT now(),
-    created_at         timestamptz NOT NULL DEFAULT now(),
-    dead_lettered_at   timestamptz,
-    dead_letter_reason text
-);
-CREATE INDEX upload_registrations_due_idx ON ingot.upload_registrations (next_at, seq)
-    WHERE dead_lettered_at IS NULL;
-CREATE INDEX upload_registrations_key_idx ON ingot.upload_registrations (bucket, object_key, seq)
-    WHERE dead_lettered_at IS NULL;
-
 -- The revocation-firehose cursor: one row holding the resume point in the
 -- revocation service's stream. No row means "connect from now".
 CREATE TABLE ingot.revocation_cursor (
@@ -1015,8 +991,8 @@ CREATE TABLE ingot.revocation_cursor (
 ```
 
 Relationships at a glance: `segment_op_roots` cascades from `segments`, `multipart_parts` from
-`multipart_sessions`, `multipart_part_trees` from `multipart_parts`, and `upload_registrations`
-and `catalog_journal` from `buckets` — the schema's only true foreign keys. `catalog_journal`
+`multipart_sessions`, `multipart_part_trees` from `multipart_parts`, and `catalog_journal`
+from `buckets` — the schema's only true foreign keys. `catalog_journal`
 references a `segments.seq` by value, deliberately. `blob_refs`, `segments`,
 `multipart_sessions`, `blob_streams` and `gc_candidates` reference a `buckets.name` by value,
 `shard_inclusions` joins `blob_locations` on `shard_digest`, and `blob_encryption_params` joins
