@@ -42,14 +42,14 @@ const (
 	IntentPublished = "published"
 )
 
-// multipart_sessions.state values (the single-winner latch, §7.3).
+// multipart_sessions.state values. Every change to an upload runs on its
+// subject on MultipartQueue, so an upload is open until a Complete commits it
+// or an Abort deletes it.
 const (
-	SessionOpen       = "open"
-	SessionCompleting = "completing"
-	SessionAborting   = "aborting"
+	SessionOpen = "open"
 	// SessionCompleted: the object committed; the session and its parts are
 	// retained so a duplicate CompleteMultipartUpload with identical parts is
-	// idempotent (S3 semantics). Reaped by the abandoned-session sweeper.
+	// idempotent (S3 semantics), until its queue-multipart-upload.reap.
 	SessionCompleted = "completed"
 )
 
@@ -210,18 +210,16 @@ type MultipartSession struct {
 	// encryption and the request's x-amz-server-side-encryption header,
 	// applied to every part, and stamped onto the manifest at Complete.
 	Plaintext bool
-	// CommittedETag / CommittedVersionID are the result the winning Complete
+	// CommittedETag / CommittedVersionID are the result the Complete
 	// returned, recorded with its commit by the move to 'completed'
-	// (empty before that). A duplicate or latch-losing Complete replays them
+	// (empty before that). A repeated Complete replays them
 	// rather than resolving the live key, which a later overwrite may have
 	// replaced. CommittedVersionID is empty for unversioned buckets.
 	CommittedETag      string
 	CommittedVersionID string
 	CreatedAt          time.Time
-	// StateChangedAt is when State last changed (creation, for a session
-	// still open). The sweeper measures staleness from it, so a Complete
-	// that latches an old session to 'completing' holds the row for a TTL
-	// of its own.
+	// StateChangedAt is when State last changed: the creation, or the
+	// Complete.
 	StateChangedAt time.Time
 }
 
@@ -305,11 +303,10 @@ type BlobRefStore interface {
 	// CountReferences returns how many references space holds to digest:
 	// the object versions that claim it, the writes' pending references
 	// other than except's (the add task ID that took one; zero for none),
-	// and the parts of its in-flight (open or completing) multipart
-	// sessions. Parts of completed and aborting sessions do not count: a
-	// completed session's winners hold claims and its orphans have releases
-	// of their own, and an aborting session is queueing releases for its
-	// parts. Zero means the blob may be released.
+	// and the parts of its open multipart sessions. Parts of completed
+	// sessions do not count: the listed parts' blobs hold claims and the
+	// unlisted ones have releases of their own. Zero means the blob may be
+	// released.
 	CountReferences(ctx context.Context, space did.DID, digest multihash.Multihash, except taskrunner.TaskID) (int, error)
 	// PendingRefByExpiry returns the add task ID of the pending reference
 	// whose queue-space-shard.expire is expire, or ErrNotFound once nothing
@@ -432,39 +429,22 @@ type InclusionStore interface {
 	GetInclusion(ctx context.Context, space did.DID, digest multihash.Multihash) (*BlobInclusion, error)
 }
 
-// MultipartStore tracks in-flight multipart uploads (§7.2). LatchSession is
-// the single-winner transition (§7.3): exactly one of Complete/Abort moves
-// the session off 'open'.
+// MultipartStore tracks in-flight multipart uploads (§7.2). The writes of an
+// upload's changes are the queue-multipart-upload tasks' (multipartqueue.go);
+// the store reads them.
 type MultipartStore interface {
+	// CreateSession records an open upload outside any task, for tests and
+	// tools that set one up directly.
 	CreateSession(ctx context.Context, s MultipartSession) error
 	GetSession(ctx context.Context, uploadID string) (*MultipartSession, error)
-	// LatchSession atomically moves uploadID from->to, returning true iff this
-	// caller performed the transition (the session was still in `from`).
-	LatchSession(ctx context.Context, uploadID, from, to string) (bool, error)
 	DeleteSession(ctx context.Context, uploadID string) error
-	// PutPart records a part of an OPEN session and its tree (nil for none),
-	// superseding a prior row for the part number and its tree row, and
-	// returns ErrNotFound when the session is missing or no longer open: the
-	// write and the state check are one statement that holds the session
-	// row, so a part cannot land after a Complete or a teardown has taken
-	// the session, and a teardown's part listing sees every part that did
-	// land. In the same transaction it queues a release, due now and carrying
-	// release's authority, for each blob the replaced row named and this part
-	// does not, and returns those blobs for the caller to run: the
-	// replaced row and the releases of its blobs are one write, so no failure
-	// or crash can separate them. It queues the upload's accept in the same
-	// transaction.
-	// Writes of one part number are serialised, so the replaced row is
-	// exactly the one standing when this write landed, which a listing
-	// taken before the write may not have seen: a concurrent write of the
-	// same part number lands in between, and only its replacer learns of
-	// it.
-	PutPart(ctx context.Context, p MultipartPart, tree *PartTree, release ReleaseTask) (released []multihash.Multihash, err error)
+	// PartWrites returns the writes that record a part (Postgres.PartWrites).
+	PartWrites(ctx context.Context, p MultipartPart, tree *PartTree, release ReleaseTask) (CommitWrites, []multihash.Multihash, error)
 	// ListParkedParts returns up to limit of uploadID's 'parked' parts
 	// numbered above after, in part-number order: the accept's queue.
 	ListParkedParts(ctx context.Context, uploadID string, after, limit int) ([]MultipartPart, error)
-	// OldestParkedPart returns when the oldest 'parked' part of an open or
-	// completing session was recorded, and false when there is none: how
+	// OldestParkedPart returns when the oldest 'parked' part of an open
+	// session was recorded, and false when there is none: how
 	// long the acceptance queue's oldest entry has waited.
 	OldestParkedPart(ctx context.Context) (time.Time, bool, error)
 	// ListParts returns uploadID's parts in part-number order. The trees
@@ -486,10 +466,6 @@ type MultipartStore interface {
 	// (prefix/markers/max) happens in the handler; in-flight session counts are
 	// small.
 	ListSessions(ctx context.Context, bucket string) ([]MultipartSession, error)
-	// ListStaleSessions returns sessions in `state` whose state last changed
-	// before cutoff, for the abandoned-upload sweeper. A session that has
-	// never left 'open' counts from its creation.
-	ListStaleSessions(ctx context.Context, state string, cutoff time.Time) ([]MultipartSession, error)
 	// CountPartRefs returns how many parts OUTSIDE excludeUploadID reference
 	// digest — the shared-blob guard for abort/supersede cleanup
 	// (content-addressed part blobs may be deduped across sessions).

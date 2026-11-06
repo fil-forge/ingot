@@ -58,7 +58,7 @@ const parkedAgeTimeout = 5 * time.Second
 // waited, read from the part rows when the gauge is collected.
 func registerMultipartGauges(meter metric.Meter, b *Backend) (metric.Registration, error) {
 	age, err := meter.Int64ObservableGauge("ingot.multipart.parked_age", metric.WithUnit("s"),
-		metric.WithDescription("Seconds the oldest parked part of an open or completing multipart upload has waited for acceptance; 0 when none waits. Parts are accepted within seconds, so growth means the acceptance queue is stuck"))
+		metric.WithDescription("Seconds the oldest parked part of an open multipart upload has waited for acceptance; 0 when none waits. Parts are accepted within seconds, so growth means the acceptance queue is stuck"))
 	if err != nil {
 		return nil, err
 	}

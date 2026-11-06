@@ -59,11 +59,10 @@ func (b *Backend) RegisterAcceptTasks(r *taskrunner.Runner) error {
 // runAccept is queue-multipart-upload-shard.accept: it concludes the upload's
 // parked parts, or those of them the task names, in part order and in
 // batches, including parts parked while it runs that sort after the batch it
-// is on, and records them accepted with its commit. A session that is gone,
-// or no longer open or completing, has nothing to accept: an aborting
-// session releases its parts instead, and a completed one accepted them all.
-// A failed batch fails the task, which records nothing. Its result is the
-// number of parts it found ready to mark accepted.
+// is on, and records them accepted with its commit. A session that is gone
+// or completed has nothing to accept: an abort released its parts, and a
+// Complete accepted them all. A failed batch fails the task, which records
+// nothing. Its result is the number of parts it marked accepted.
 func (b *Backend) runAccept(ctx context.Context, ex *taskrunner.Exec, t taskrunner.Task) ([]byte, error) {
 	uploadID := t.Subject
 	args, err := registry.AcceptTaskFrom(t)
@@ -84,14 +83,15 @@ func (b *Backend) runAccept(ctx context.Context, ex *taskrunner.Exec, t taskrunn
 	if err != nil {
 		return nil, fmt.Errorf("get session: %w", err)
 	}
-	if sess.State != registry.SessionOpen && sess.State != registry.SessionCompleting {
+	if sess.State != registry.SessionOpen {
 		return nil, nil
 	}
 
 	// Each digest once across the task: parts can share a blob, and the
 	// first batch's writes are not committed when a later one runs.
 	done := map[string]bool{}
-	accepted, after := 0, 0
+	var accepted []int
+	after := 0
 	for {
 		queued, err := b.multipart.ListParkedParts(ctx, uploadID, after, acceptBatchBlobs)
 		if err != nil {
@@ -116,24 +116,24 @@ func (b *Backend) runAccept(ctx context.Context, ex *taskrunner.Exec, t taskrunn
 		if len(batch) == 0 {
 			continue
 		}
-		n, err := b.acceptBatch(ctx, ex, sess.Space, batch, done)
+		marked, err := b.acceptBatch(ctx, ex, sess.Space, batch, done)
 		b.multipartMetrics.pass(ctx, err)
 		if err != nil {
 			return nil, err
 		}
-		accepted += n
+		accepted = append(accepted, marked...)
 	}
-	return []byte(strconv.Itoa(accepted)), nil
+	return []byte(strconv.Itoa(len(accepted))), nil
 }
 
 // acceptBatch concludes the parked blobs of batch, adds the writes that
-// record them and mark the parts accepted, and returns how many parts it
-// found ready to mark. A blob already located needs nothing concluded (a dedup); a parked
+// record them and mark the parts accepted, and returns the numbers of the
+// parts it marks. A blob already located needs nothing concluded (a dedup); a parked
 // one concludes its deferred /http/put receipt, firing /blob/accept. A blob
 // with neither has been released, which only a part replaced or dropped
 // since the listing allows, and its part is left. done holds the digests
 // earlier batches recorded, and gains this batch's.
-func (b *Backend) acceptBatch(ctx context.Context, ex *taskrunner.Exec, space did.DID, batch []registry.MultipartPart, done map[string]bool) (_ int, err error) {
+func (b *Backend) acceptBatch(ctx context.Context, ex *taskrunner.Exec, space did.DID, batch []registry.MultipartPart, done map[string]bool) (_ []int, err error) {
 	total := 0
 	for _, p := range batch {
 		total += len(p.BlobDigests)
@@ -158,7 +158,7 @@ func (b *Backend) acceptBatch(ctx context.Context, ex *taskrunner.Exec, space di
 				writes = append(writes, registry.LocatedBlob(space, digest)...)
 				continue
 			} else if err != nil && !errors.Is(err, registry.ErrNotFound) {
-				return 0, fmt.Errorf("lookup location: %w", err)
+				return nil, fmt.Errorf("lookup location: %w", err)
 			}
 			park, err := b.parks.GetPark(ctx, space, digest)
 			if errors.Is(err, registry.ErrNotFound) {
@@ -166,11 +166,11 @@ func (b *Backend) acceptBatch(ctx context.Context, ex *taskrunner.Exec, space di
 				continue
 			}
 			if err != nil {
-				return 0, fmt.Errorf("lookup park: %w", err)
+				return nil, fmt.Errorf("lookup park: %w", err)
 			}
 			blob, err := parkedBlob(digest, park)
 			if err != nil {
-				return 0, err
+				return nil, err
 			}
 			done[k] = true
 			toConclude = append(toConclude, blob)
@@ -189,11 +189,11 @@ func (b *Backend) acceptBatch(ctx context.Context, ex *taskrunner.Exec, space di
 		locations, err := b.deferred.ConcludeBlobs(cctx, space, toConclude)
 		cancel()
 		if err != nil {
-			return 0, fmt.Errorf("conclude blobs: %w", err)
+			return nil, fmt.Errorf("conclude blobs: %w", err)
 		}
 		for i, blob := range toConclude {
 			if i >= len(locations) || locations[i] == nil {
-				return 0, fmt.Errorf("conclude blobs: blob %x returned no location", blob.Digest)
+				return nil, fmt.Errorf("conclude blobs: blob %x returned no location", blob.Digest)
 			}
 			loc := locations[i]
 			writes = append(writes, registry.ConcludedBlob(space, blob.Digest, blob.AddTask.Bytes(), registry.BlobLocation{
@@ -206,16 +206,16 @@ func (b *Backend) acceptBatch(ctx context.Context, ex *taskrunner.Exec, space di
 
 	// The writes mark a part accepted only once its blobs are located, so a
 	// part whose park was taken while it concluded stays parked.
-	marked := 0
+	var marked []int
 	for _, p := range batch {
 		if !anyIn(p.BlobDigests, gone) {
 			writes = append(writes, registry.AcceptedPart(space, p))
-			marked++
+			marked = append(marked, p.PartNumber)
 		}
 	}
 	for _, st := range writes {
 		if err := ex.Write(ctx, st.SQL, st.Args...); err != nil {
-			return 0, err
+			return nil, err
 		}
 	}
 	return marked, nil

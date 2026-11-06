@@ -219,17 +219,14 @@ func TestAcceptBatchesByBlobCount(t *testing.T) {
 	}
 }
 
-// TestAcceptLeavesASessionNoLongerOpen: an aborting session's parts are its
-// teardown's to release, and its accept concludes nothing.
+// TestAcceptLeavesASessionNoLongerOpen: a completed session's parts are
+// its object's, and its accept concludes nothing.
 func TestAcceptLeavesASessionNoLongerOpen(t *testing.T) {
 	cc := &countingConcluder{}
 	b, mem := newDeferredBackend(t, cc)
-	ctx := context.Background()
-	uploadID := mpCreate(t, b, "aborting", "", "")
-	uploadDistinctParts(t, b, "aborting", uploadID, 1)
-	if won, err := mem.LatchSession(ctx, uploadID, registry.SessionOpen, registry.SessionAborting); err != nil || !won {
-		t.Fatalf("latch aborting: %v %v", won, err)
-	}
+	uploadID := mpCreate(t, b, "completed", "", "")
+	uploadDistinctParts(t, b, "completed", uploadID, 1)
+	mem.setSessionState(t, uploadID, registry.SessionCompleted)
 
 	if err := runAccepts(t, b, uploadID); err != nil {
 		t.Fatalf("accept: %v", err)
@@ -421,11 +418,11 @@ func TestCompleteWaitsForARunningAccept(t *testing.T) {
 	}
 }
 
-// TestCompleteOverTheWaitBudgetReopensTheUpload: an accept still running
+// TestCompleteOverTheWaitBudgetLeavesTheUploadOpen: an accept still running
 // when the wait budget runs out makes Complete answer OperationAborted and
-// reopen the upload, so a client that retries on its own commits once the
-// accept is done (botocore clients do not retry it).
-func TestCompleteOverTheWaitBudgetReopensTheUpload(t *testing.T) {
+// leaves the upload open, so a client that retries on its own commits once
+// the accept is done (botocore clients do not retry it).
+func TestCompleteOverTheWaitBudgetLeavesTheUploadOpen(t *testing.T) {
 	saved := acceptWaitBudget
 	acceptWaitBudget = 20 * time.Millisecond
 	t.Cleanup(func() { acceptWaitBudget = saved })
@@ -452,6 +449,9 @@ func TestCompleteOverTheWaitBudgetReopensTheUpload(t *testing.T) {
 	if err := <-background; err != nil {
 		t.Fatalf("background accept: %v", err)
 	}
+	// The retry's accept starts once the background one's lease is free,
+	// which a loaded machine can take longer than the shrunk budget to see.
+	acceptWaitBudget = saved
 	if _, err := mpComplete(t, b, key, uploadID, parts, nil); err != nil {
 		t.Fatalf("retry Complete: %v", err)
 	}
@@ -688,7 +688,7 @@ func TestAcceptRacesATeardown(t *testing.T) {
 			}
 		},
 		"expiry": func(t *testing.T, b *Backend, _, _ string) {
-			if n, err := b.SweepStaleMultipartSessions(context.Background(), -time.Second); err != nil || n != 1 {
+			if n, err := sweepUploads(context.Background(), b); err != nil || n != 1 {
 				t.Errorf("sweep: cleaned=%d err=%v, want the open session", n, err)
 			}
 		},
@@ -785,8 +785,8 @@ func TestAcceptRacesASupersedesRelease(t *testing.T) {
 	pc := &providerConcluder{}
 	store := &teardownBeforePutPart{}
 	b, mem := newDeferredBackend(t, pc, func(d *Deps) {
-		store.MultipartStore = d.Multipart
-		d.Multipart = store
+		store.UploadRegistrar = d.Registrar
+		d.Registrar = store
 		d.Remover = pc
 	})
 	ctx := context.Background()

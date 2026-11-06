@@ -325,11 +325,11 @@ func (tr *tree) commit(ctx context.Context, a *action, outcomes []Outcome) (*fai
 	if tr.deferred != nil {
 		return nil, tr.deferred
 	}
-	if err := lockLease(ctx, tx, tr.rootHold); err != nil {
+	if err := lockLease(ctx, tx, tr.rootHold, tr.r.opts.LeaseTTL); err != nil {
 		return nil, err
 	}
 	for _, h := range tr.holds {
-		if err := lockLease(ctx, tx, h); errors.Is(err, errLeaseLost) {
+		if err := lockLease(ctx, tx, h, tr.r.opts.LeaseTTL); errors.Is(err, errLeaseLost) {
 			// A child's subject can be leased afresh when the tree runs again.
 			return nil, fmt.Errorf("lease on %s/%s lost before commit", h.q.name, h.subject)
 		} else if err != nil {
@@ -373,13 +373,16 @@ func (tr *tree) commit(ctx context.Context, a *action, outcomes []Outcome) (*fai
 	return rec, tx.Commit(ctx)
 }
 
-// lockLease locks h's lease row for the rest of tx, or returns errLeaseLost
-// when another consumer owns it now or it has expired, which leaves it free
-// for one to take.
-func lockLease(ctx context.Context, tx pgx.Tx, h *hold) error {
+// lockLease locks h's lease row for the rest of tx, and extends it by a
+// lease TTL from now, or returns errLeaseLost when another consumer owns it
+// now or it has expired, which leaves it free for one to take. Renewal skips
+// a row a commit holds locked (renew), so the extension is what keeps a long
+// commit's lease from lapsing under it.
+func lockLease(ctx context.Context, tx pgx.Tx, h *hold, ttl time.Duration) error {
 	var one int
-	err := tx.QueryRow(ctx, `SELECT 1 FROM `+h.q.leases+` WHERE subject = $1 AND owner = $2 AND expires >= now() FOR UPDATE`,
-		h.subject, h.token).Scan(&one)
+	err := tx.QueryRow(ctx, `UPDATE `+h.q.leases+` SET expires = now() + $3 * interval '1 millisecond'
+		WHERE subject = $1 AND owner = $2 AND expires >= now() RETURNING 1`,
+		h.subject, h.token, ttl.Milliseconds()).Scan(&one)
 	if errors.Is(err, pgx.ErrNoRows) {
 		h.lost.Store(true)
 		return errLeaseLost
@@ -534,7 +537,7 @@ func (r *Runner) finish(ctx context.Context, h *hold, tasks []Task, state, msg s
 		return fmt.Errorf("record %s.%s as %s: %w", tasks[0].Queue, tasks[0].Action, state, err)
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
-	if err := lockLease(ctx, tx, h); err != nil {
+	if err := lockLease(ctx, tx, h, r.opts.LeaseTTL); err != nil {
 		return err
 	}
 	ids := make([]TaskID, len(tasks))

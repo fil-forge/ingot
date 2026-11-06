@@ -1,12 +1,10 @@
 package registry
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"slices"
 	"time"
 
 	"github.com/fil-forge/ucantone/did"
@@ -34,38 +32,9 @@ var (
 
 // BlobRefStore ===============================================================
 
-// takePendingRefs deletes the pending references refs, in tx, for the row
-// that takes each over, and cancels their queue-space-shard.expire tasks with
-// them. It fails with ErrReferenceExpired unless every one is still there.
-func takePendingRefs(ctx context.Context, tx pgx.Tx, tasks TaskSubmitter, refs []taskrunner.TaskID) error {
-	refs = slices.Clone(refs)
-	slices.SortFunc(refs, func(a, b taskrunner.TaskID) int { return bytes.Compare(a[:], b[:]) })
-	refs = slices.Compact(refs)
-	if len(refs) == 0 {
-		return nil
-	}
-	if tasks == nil {
-		return fmt.Errorf("take pending references: the registry has no task runner")
-	}
-	var expires []taskrunner.TaskID
-	if err := tx.QueryRow(ctx,
-		`WITH taken AS (DELETE FROM ingot.blob_pending_refs WHERE add_task = ANY($1) RETURNING expire_task)
-		 SELECT coalesce(array_agg(expire_task), '{}') FROM taken`,
-		refs).Scan(&expires); err != nil {
-		return fmt.Errorf("take pending references: %w", err)
-	}
-	if len(expires) != len(refs) {
-		return ErrReferenceExpired // the transaction rolls back
-	}
-	if err := tasks.CancelTx(ctx, tx, ReleaseQueue, expires...); err != nil {
-		return fmt.Errorf("take pending references: cancel expiries: %w", err)
-	}
-	return nil
-}
-
 func (r *Postgres) CountReferences(ctx context.Context, space did.DID, digest multihash.Multihash, except taskrunner.TaskID) (int, error) {
 	var n int
-	err := r.pool.QueryRow(ctx, countReferencesSQL, space, digest, except, SessionOpen, SessionCompleting).Scan(&n)
+	err := r.pool.QueryRow(ctx, countReferencesSQL, space, digest, except, SessionOpen).Scan(&n)
 	if err != nil {
 		return 0, fmt.Errorf("registry: count references: %w", err)
 	}
@@ -93,7 +62,7 @@ const countReferencesSQL = `SELECT
 	+ (SELECT count(*) FROM ingot.blob_pending_refs WHERE space = $1 AND digest = $2 AND add_task <> $3)
 	+ (SELECT count(*) FROM ingot.multipart_parts p
 	     JOIN ingot.multipart_sessions s ON s.upload_id = p.upload_id
-	    WHERE p.blob_digests @> ARRAY[$2::bytea] AND s.space = $1 AND s.state IN ($4, $5))`
+	    WHERE p.blob_digests @> ARRAY[$2::bytea] AND s.space = $1 AND s.state = $4)`
 
 func (r *Postgres) QueueReleases(ctx context.Context, space did.DID, digests []multihash.Multihash, notBefore time.Time, release ReleaseTask) error {
 	if len(digests) == 0 {
@@ -505,31 +474,11 @@ func (r *Postgres) GetInclusion(ctx context.Context, space did.DID, digest multi
 // MultipartStore =============================================================
 
 func (r *Postgres) CreateSession(ctx context.Context, s MultipartSession) error {
-	if !s.Space.Defined() {
-		return errors.New("registry: create session: space is required")
-	}
-	state := s.State
-	if state == "" {
-		state = SessionOpen
-	}
-	meta, err := marshalMetadata(s.Metadata)
+	st, err := CreatedSession(s)
 	if err != nil {
 		return err
 	}
-	_, err = r.pool.Exec(ctx,
-		`INSERT INTO ingot.multipart_sessions
-		   (upload_id, bucket, object_key, state, content_type, metadata,
-		    content_encoding, content_disposition, content_language, cache_control, expires,
-		    website_redirect_location, checksum_algorithm, checksum_type,
-		    lock_mode, lock_retain_until, lock_legal_hold, tagging, space, plaintext)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)`,
-		s.UploadID, s.Bucket, s.ObjectKey, state, nullString(s.ContentType), meta,
-		nullString(s.ContentEncoding), nullString(s.ContentDisposition),
-		nullString(s.ContentLanguage), nullString(s.CacheControl), nullString(s.Expires),
-		nullString(s.WebsiteRedirectLocation), nullString(s.ChecksumAlgorithm), nullString(s.ChecksumType),
-		nullString(s.LockMode), s.LockRetainUntil, nullString(s.LockLegalHold), nullString(s.Tagging),
-		s.Space.String(), s.Plaintext)
-	if err != nil {
+	if _, err := r.pool.Exec(ctx, st.SQL, st.Args...); err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == uniqueViolation {
 			return ErrExists
@@ -603,132 +552,12 @@ func scanSession(row pgx.Row) (*MultipartSession, error) {
 	return s, nil
 }
 
-func (r *Postgres) LatchSession(ctx context.Context, uploadID, from, to string) (bool, error) {
-	tag, err := r.pool.Exec(ctx,
-		`UPDATE ingot.multipart_sessions SET state = $3, state_changed_at = now()
-		 WHERE upload_id = $1 AND state = $2`,
-		uploadID, from, to)
-	if err != nil {
-		return false, fmt.Errorf("registry: latch session: %w", err)
-	}
-	return tag.RowsAffected() == 1, nil
-}
-
 func (r *Postgres) DeleteSession(ctx context.Context, uploadID string) error {
 	_, err := r.pool.Exec(ctx, `DELETE FROM ingot.multipart_sessions WHERE upload_id = $1`, uploadID)
 	if err != nil {
 		return fmt.Errorf("registry: delete session: %w", err)
 	}
 	return nil
-}
-
-func (r *Postgres) PutPart(ctx context.Context, p MultipartPart, tree *PartTree, release ReleaseTask) ([]multihash.Multihash, error) {
-	state := p.State
-	if state == "" {
-		state = PartParked
-	}
-	tx, err := r.pool.Begin(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("registry: put part: begin: %w", err)
-	}
-	defer tx.Rollback(ctx)
-	// Writes of one part number are serialised on a transaction-scoped
-	// advisory lock, so the row read here is the one the upsert below
-	// replaces. Read committed alone does not give that: two writes of the
-	// same part number can both read before either lands, and the second's
-	// upsert then replaces the first's row without reporting it. The lock
-	// is keyed by the upload and the part number, in the two-key lock space;
-	// a hash collision serialises two unrelated writes, nothing worse.
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1), $2::int)`, p.UploadID, p.PartNumber); err != nil {
-		return nil, fmt.Errorf("registry: put part: lock: %w", err)
-	}
-	var replaced []multihash.Multihash
-	if err := tx.QueryRow(ctx,
-		`SELECT blob_digests FROM ingot.multipart_parts WHERE upload_id = $1 AND part_number = $2`,
-		p.UploadID, p.PartNumber).Scan(&replaced); err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return nil, fmt.Errorf("registry: put part: read replaced: %w", err)
-	}
-	// BlobDigests ([]multihash.Multihash) rides pgx's underlying-type plan into
-	// bytea[]: pgx must try that plan before its Stringer plan, or a Multihash
-	// (whose String() is base58) would land as text — pgx v5.10+ orders them
-	// correctly; don't downgrade below that.
-	//
-	// The session row is read FOR SHARE: a latch (UPDATE of its state) in
-	// flight blocks this write until it commits, after which the state
-	// check re-evaluates and refuses the part; a latch arriving while this
-	// statement holds the row waits for the part to commit, so the
-	// teardown's part listing includes it.
-	tag, err := tx.Exec(ctx,
-		`INSERT INTO ingot.multipart_parts (upload_id, part_number, etag_md5, size, checksum, blob_digests, span_lengths, state)
-		 SELECT s.upload_id, $2, $3, $4, $5, $6, $7, $8
-		   FROM ingot.multipart_sessions s
-		  WHERE s.upload_id = $1 AND s.state = $9
-		    FOR SHARE
-		 ON CONFLICT (upload_id, part_number) DO UPDATE
-		   SET etag_md5 = EXCLUDED.etag_md5, size = EXCLUDED.size, checksum = EXCLUDED.checksum,
-		       blob_digests = EXCLUDED.blob_digests, span_lengths = EXCLUDED.span_lengths, state = EXCLUDED.state`,
-		p.UploadID, p.PartNumber, p.ETagMD5, p.Size, p.Checksum, p.BlobDigests, p.SpanLengths, state, SessionOpen)
-	if err != nil {
-		return nil, fmt.Errorf("registry: put part: %w", err)
-	}
-	if tag.RowsAffected() == 0 {
-		return nil, ErrNotFound
-	}
-	// The part row takes its blobs' pending references over.
-	if err := takePendingRefs(ctx, tx, r.tasks, p.Refs); err != nil {
-		return nil, fmt.Errorf("registry: put part: %w", err)
-	}
-	// The tree row follows the part row: a superseding part without a tree
-	// must not keep its predecessor's.
-	if t := tree; t != nil {
-		_, err = tx.Exec(ctx,
-			`INSERT INTO ingot.multipart_part_trees (upload_id, part_number, tree_offset, chunk_log, nodes, blocks, head, tail, root)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-			 ON CONFLICT (upload_id, part_number) DO UPDATE
-			   SET tree_offset = EXCLUDED.tree_offset, chunk_log = EXCLUDED.chunk_log, nodes = EXCLUDED.nodes,
-			       blocks = EXCLUDED.blocks, head = EXCLUDED.head, tail = EXCLUDED.tail, root = EXCLUDED.root`,
-			p.UploadID, p.PartNumber, t.Offset, int16(t.ChunkLog), t.Nodes, t.Blocks, t.Head, t.Tail, t.Root)
-	} else {
-		_, err = tx.Exec(ctx, `DELETE FROM ingot.multipart_part_trees WHERE upload_id = $1 AND part_number = $2`, p.UploadID, p.PartNumber)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("registry: put part tree: %w", err)
-	}
-	// The replaced row's blobs this part does not name lose their last part
-	// reference with this write; their releases are queued with it, due now
-	// (a part blob was never readable through the catalog, so no reader grace
-	// is owed). The session's space is the release's.
-	if r.tasks == nil {
-		return nil, fmt.Errorf("registry: put part: the registry has no task runner")
-	}
-	if _, err := r.tasks.SubmitTx(ctx, tx, AcceptSpec(p.UploadID)); err != nil {
-		return nil, fmt.Errorf("registry: put part: queue accept: %w", err)
-	}
-	var released []multihash.Multihash
-	if dropped := digestsDropped(replaced, p.BlobDigests); len(dropped) > 0 {
-		var spaceStr string
-		if err := tx.QueryRow(ctx, `SELECT space FROM ingot.multipart_sessions WHERE upload_id = $1`, p.UploadID).Scan(&spaceStr); err != nil {
-			return nil, fmt.Errorf("registry: put part: session space: %w", err)
-		}
-		space, err := did.Parse(spaceStr)
-		if err != nil {
-			return nil, fmt.Errorf("registry: put part: session space: %w", err)
-		}
-		specs := make([]taskrunner.Spec, len(dropped))
-		for i, d := range dropped {
-			if specs[i], err = release.Spec(space, d, DueNow()); err != nil {
-				return nil, err
-			}
-			released = append(released, d)
-		}
-		if _, err = r.tasks.SubmitAllTx(ctx, tx, specs); err != nil {
-			return nil, fmt.Errorf("registry: put part: queue releases: %w", err)
-		}
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return nil, fmt.Errorf("registry: put part: commit: %w", err)
-	}
-	return released, nil
 }
 
 // digestsDropped returns the digests of replaced that kept does not name,
@@ -766,8 +595,8 @@ func (r *Postgres) OldestParkedPart(ctx context.Context) (time.Time, bool, error
 	if err := r.pool.QueryRow(ctx,
 		`SELECT min(p.created_at) FROM ingot.multipart_parts p
 		   JOIN ingot.multipart_sessions s ON s.upload_id = p.upload_id
-		  WHERE p.state = $1 AND s.state IN ($2, $3)`,
-		PartParked, SessionOpen, SessionCompleting).Scan(&oldest); err != nil {
+		  WHERE p.state = $1 AND s.state = $2`,
+		PartParked, SessionOpen).Scan(&oldest); err != nil {
 		return time.Time{}, false, fmt.Errorf("registry: oldest parked part: %w", err)
 	}
 	if oldest == nil {
@@ -863,35 +692,6 @@ func (r *Postgres) ListSessions(ctx context.Context, bucket string) ([]Multipart
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("registry: list sessions rows: %w", err)
-	}
-	return out, nil
-}
-
-func (r *Postgres) ListStaleSessions(ctx context.Context, state string, cutoff time.Time) ([]MultipartSession, error) {
-	rows, err := r.pool.Query(ctx,
-		`SELECT upload_id, bucket, object_key, state, content_type, metadata, created_at,
-		        content_encoding, content_disposition, content_language, cache_control, expires,
-		        website_redirect_location, checksum_algorithm, checksum_type,
-		        lock_mode, lock_retain_until, lock_legal_hold, tagging,
-		        committed_etag, committed_version_id, space, state_changed_at, plaintext
-		 FROM ingot.multipart_sessions WHERE state = $1 AND state_changed_at < $2
-		 ORDER BY state_changed_at ASC`,
-		state, cutoff)
-	if err != nil {
-		return nil, fmt.Errorf("registry: list stale sessions: %w", err)
-	}
-	defer rows.Close()
-
-	var out []MultipartSession
-	for rows.Next() {
-		s, err := scanSession(rows)
-		if err != nil {
-			return nil, fmt.Errorf("registry: list stale sessions scan: %w", err)
-		}
-		out = append(out, *s)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("registry: list stale sessions rows: %w", err)
 	}
 	return out, nil
 }

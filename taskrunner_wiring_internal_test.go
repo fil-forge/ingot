@@ -43,6 +43,9 @@ func TestTaskRunnerHasTheBackendsQueues(t *testing.T) {
 	if err := b.RegisterAcceptTasks(r); err != nil {
 		t.Fatalf("RegisterAcceptTasks: %v", err)
 	}
+	if err := b.RegisterMultipartTasks(r); err != nil {
+		t.Fatalf("RegisterMultipartTasks: %v", err)
+	}
 	if err := b.RegisterBucketTasks(r); err != nil {
 		t.Fatalf("RegisterBucketTasks: %v", err)
 	}

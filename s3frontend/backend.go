@@ -101,6 +101,12 @@ type Backend struct {
 	accepts *taskrunner.Runner
 	// buckets runs the queue-bucket tasks (RegisterBucketTasks).
 	buckets *taskrunner.Runner
+	// uploads runs the queue-multipart-upload tasks
+	// (RegisterMultipartTasks).
+	uploads *taskrunner.Runner
+	// multipartTTL is how long an upload stays open before its auto-abort,
+	// and a completed one is kept (Deps.MultipartSessionTTL).
+	multipartTTL time.Duration
 	// shipMu guards shipReady and earlyShips: the ships the catalog log
 	// reported before the ship handler was registered, which registering it
 	// queues.
@@ -234,6 +240,10 @@ type Deps struct {
 	// before construction; tests use zero so releases run as soon as they are
 	// queued).
 	ReleaseGrace time.Duration
+	// MultipartSessionTTL bounds a multipart upload: an open one is aborted
+	// this long after its creation, and a completed one kept this long after
+	// its Complete. Zero means 7 days; negative, never.
+	MultipartSessionTTL time.Duration
 
 	// LocalBlobMaxBytes is the byte budget for the cache, writes in progress
 	// included, enforced by SweepLocalBlobs.
@@ -337,6 +347,7 @@ func New(d Deps) *Backend {
 		claims:       d.Claims,
 		releaseRetry: releaseRetry,
 		releaseGrace: d.ReleaseGrace,
+		multipartTTL: d.MultipartSessionTTL,
 
 		localBlobMaxBytes:  d.LocalBlobMaxBytes,
 		cacheTTL:           cmp.Or(d.CacheTTL, DefaultCacheTTL),

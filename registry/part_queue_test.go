@@ -1,6 +1,7 @@
 package registry_test
 
 import (
+	"context"
 	"errors"
 	"slices"
 	"testing"
@@ -18,6 +19,7 @@ import (
 // partQueueStore is what the multipart acceptance queue needs of a store.
 type partQueueStore interface {
 	registry.MultipartStore
+	PutPart(ctx context.Context, p registry.MultipartPart, tree *registry.PartTree, release registry.ReleaseTask) ([]multihash.Multihash, error)
 	registry.ParkStore
 	registry.LocationStore
 	registry.IntentStore

@@ -88,9 +88,10 @@ func (r *Postgres) Get(ctx context.Context, name string) (*State, error) {
 	var createdAt time.Time
 	var spaceStr, tenantStr, versioning string
 	var encryption *string
+	var closing bool
 	err := r.pool.QueryRow(ctx,
-		`SELECT root_cid, forge_root_cid, created_at, space, tenant, versioning, object_lock_config, bucket_tagging, cors_config, encryption FROM ingot.buckets WHERE name = $1`, name).
-		Scan(&rootBytes, &forgeBytes, &createdAt, &spaceStr, &tenantStr, &versioning, &lockCfg, &tagging, &corsCfg, &encryption)
+		`SELECT root_cid, forge_root_cid, created_at, space, tenant, versioning, object_lock_config, bucket_tagging, cors_config, encryption, closing FROM ingot.buckets WHERE name = $1`, name).
+		Scan(&rootBytes, &forgeBytes, &createdAt, &spaceStr, &tenantStr, &versioning, &lockCfg, &tagging, &corsCfg, &encryption, &closing)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -105,7 +106,7 @@ func (r *Postgres) Get(ctx context.Context, name string) (*State, error) {
 	if err != nil {
 		return nil, fmt.Errorf("registry: parse tenant %q: %w", tenantStr, err)
 	}
-	st := &State{Name: name, Space: space, Tenant: tenant, Versioning: VersioningState(versioning), ObjectLockConfig: lockCfg, BucketTagging: tagging, CORSConfig: corsCfg, CreatedAt: createdAt}
+	st := &State{Name: name, Space: space, Tenant: tenant, Versioning: VersioningState(versioning), ObjectLockConfig: lockCfg, BucketTagging: tagging, CORSConfig: corsCfg, Closing: closing, CreatedAt: createdAt}
 	if encryption != nil {
 		st.Encryption = BucketEncryption(*encryption)
 	}
@@ -196,6 +197,17 @@ func (r *Postgres) SetForgeRoot(ctx context.Context, name string, root cid.Cid) 
 		rootBytes, name)
 	if err != nil {
 		return fmt.Errorf("registry: set forge root %q: %w", name, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (r *Postgres) SetClosing(ctx context.Context, name string, closing bool) error {
+	tag, err := r.pool.Exec(ctx, `UPDATE ingot.buckets SET closing = $2 WHERE name = $1`, name, closing)
+	if err != nil {
+		return fmt.Errorf("registry: set closing %q: %w", name, err)
 	}
 	if tag.RowsAffected() == 0 {
 		return ErrNotFound

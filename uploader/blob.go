@@ -135,7 +135,7 @@ var ErrBlobAccepted = errors.New("uploader: blob accepted by the space; release 
 // service: sprue recovers the provider from the receipt chain of the add and
 // the node releases the allocation + parked bytes. add is the parked blob's
 // AddTask. The proof store is request-scoped when present (an S3 Abort) and
-// otherwise the space's ship authority (the session-expiry sweeper): the
+// otherwise the space's ship authority (an upload's auto-abort): the
 // borrowable store its latest body upload left, within the hour.
 // A refusal because the space has accepted the blob is returned wrapping
 // [ErrBlobAccepted], so the caller can release the blob instead. Errors are

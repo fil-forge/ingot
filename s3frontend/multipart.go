@@ -106,7 +106,9 @@ func (b *Backend) CreateMultipartUpload(ctx context.Context, input s3response.Cr
 	// Whether the object is stored as received is the session's to carry:
 	// decided here, as on S3, and applied to every part (sse.go).
 	plaintext := storesPlaintext(st, sse)
-	if err := b.multipart.CreateSession(ctx, registry.MultipartSession{
+	// The upload's queue-multipart-upload.create records it once its bucket
+	// admits it, and schedules its auto-abort.
+	if err := b.createUpload(ctx, &registry.MultipartSession{
 		UploadID:                uploadID,
 		Bucket:                  bucket,
 		ObjectKey:               key,
@@ -128,6 +130,10 @@ func (b *Backend) CreateMultipartUpload(ctx context.Context, input s3response.Cr
 		Metadata:                input.Metadata,
 		Plaintext:               plaintext,
 	}); err != nil {
+		var apiErr s3err.APIError
+		if errors.As(err, &apiErr) {
+			return s3response.InitiateMultipartUploadResult{}, apiErr
+		}
 		return s3response.InitiateMultipartUploadResult{}, fmt.Errorf("s3frontend: create session: %w", err)
 	}
 	return s3response.InitiateMultipartUploadResult{Bucket: bucket, Key: key, UploadId: uploadID, ServerSideEncryption: encryptionFor(plaintext)}, nil
@@ -168,7 +174,7 @@ func (b *Backend) openSession(ctx context.Context, uploadID string, bucket, key 
 // checkSessionSpace rejects a session whose bucket has since been deleted and
 // recreated under the same name: the parts were parked in the old bucket's
 // space, and the current bucket's space is another. Such an upload is no
-// upload of this bucket's; the sweeper tears it down against its own space.
+// upload of this bucket's; its auto-abort tears it down against its own space.
 func (b *Backend) checkSessionSpace(ctx context.Context, sess *registry.MultipartSession) error {
 	space, err := b.bucketSpace(ctx, sess.Bucket)
 	if err != nil {
@@ -400,18 +406,19 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 	// Skipping it would race a concurrent re-upload of the sibling, each
 	// seeing the other's old part and neither queueing the release. The
 	// same write queues the upload's accept.
-	superseding, err := b.multipart.PutPart(ctx, part, partTree, b.releaseAuthority(ctx, space))
+	superseding, err := b.addPart(ctx, part, partTree, b.releaseAuthority(ctx, space))
 	if err != nil {
 		// No part row points at the written blobs now, whatever went wrong:
-		// the session was completed, aborted or torn down after this upload
-		// was admitted (ErrNotFound), or the write failed. The write's
-		// references to them expire here, before the error, and release
-		// the blobs nothing else references. Should the row in fact have
-		// landed and only its result been lost, it took the references
-		// over, and the session's teardown releases its blobs.
+		// the upload was completed or aborted after this one was admitted
+		// (NoSuchUpload), a reference expired, or the write failed. The
+		// write's references to them expire here, before the error, and
+		// release the blobs nothing else references. Should the row in fact
+		// have landed and only its result been lost, it took the references
+		// over, and the upload's teardown releases its blobs.
 		b.dropRefsNow(ctx, space, written.Blobs.DigestList())
-		if errors.Is(err, registry.ErrNotFound) {
-			return nil, s3err.GetAPIError(s3err.ErrNoSuchUpload)
+		var apiErr s3err.APIError
+		if errors.As(err, &apiErr) {
+			return nil, apiErr
 		}
 		return nil, fmt.Errorf("s3frontend: record part: %w", err)
 	}
@@ -428,31 +435,26 @@ func (b *Backend) ingestPart(ctx context.Context, sess *registry.MultipartSessio
 	return out, nil
 }
 
-// CompleteMultipartUpload assembles the final object from the uploaded parts:
-// it latches the session (single-winner vs Abort), validates the client's part
-// list against the recorded parts, accepts every part's blobs on Forge, and
-// commits a manifest whose Body is the ordered union of the parts' blobs. The
-// object ETag is hex(md5(concat of part md5s)) + "-N".
-//
-// The blobs are concluded before the commit, so a teardown (DeleteBucket,
-// the stale-session sweeper) can take the 'completing' row meanwhile. The
-// commit records the session completed only while it is still completing,
-// so it fails with NoSuchUpload rather than committing over released blobs.
+// CompleteMultipartUpload assembles the final object from the uploaded parts
+// as the upload's queue-multipart-upload.complete: it validates the client's
+// part list against the recorded parts, accepts every part's blobs on Forge,
+// and commits a manifest whose Body is the ordered union of the parts' blobs.
+// The object ETag is hex(md5(concat of part md5s)) + "-N". It runs on the
+// upload's subject, so no part lands and no Abort or teardown takes the
+// upload meanwhile.
 //
 // A successful Complete retains the session in state 'completed' (with its
 // parts), so a duplicate Complete with an identical part list is idempotent
-// per S3; the abandoned-session sweeper reaps the row later.
-// replayWaitBudget / replayMaxTries bound how long a Complete that lost the
-// single-winner latch waits for the winner's terminal state before giving up
-// with errCompleteInProgress. Package-level so tests can shrink them.
+// per S3, until its queue-multipart-upload.reap.
+
 // maxBodyBlobs is the most blobs Complete assembles into one object
 // (msbucket.MaxBodyBlobs); a variable so tests can lower it.
 var maxBodyBlobs = msbucket.MaxBodyBlobs
 
-var (
-	replayWaitBudget = 10 * time.Second
-	replayMaxTries   = 64
-)
+// replayWaitBudget bounds how long a Complete waits for its upload's other
+// changes, another Complete included, before giving up with
+// errCompleteInProgress. Package-level so tests can shrink it.
+var replayWaitBudget = 10 * time.Second
 
 // errCompleteInProgress is S3's OperationAborted, a 409: another Complete of
 // this upload is still running past the loser's wait budget, or the upload's
@@ -479,20 +481,83 @@ var _ backend.CompleteMultipartUploadReporter = (*Backend)(nil)
 // headers, as S3 does. An Enabled bucket's winner reports the id it
 // reserved; every other path reports "" before it waits on anything.
 func (b *Backend) CompleteMultipartUploadReportingHeaders(ctx context.Context, input *s3.CompleteMultipartUploadInput, reportHeaders func(backend.CompleteMultipartUploadHeaders)) (s3response.CompleteMultipartUploadResult, string, error) {
+	if input.Bucket == nil || input.Key == nil || input.UploadId == nil {
+		return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrInvalidRequest)
+	}
+	// A Complete waits for its upload's other changes, a Complete already
+	// running included, within replayWaitBudget: a Complete that lost to
+	// another then replays its result. Past it the answer is
+	// OperationAborted, never NoSuchUpload. The budget is not time for the
+	// other Complete to finish: one that waits silently longer than the
+	// client's read timeout is cut off as the other was, so raising it
+	// cannot help.
+	call := &completeCall{input: input, report: reportHeaders}
+	spec := uploadSpec(*input.UploadId, registry.MultipartCompleteAction, nil)
+	expires := time.Now().Add(replayWaitBudget)
+	spec.Expires = &expires
+	_, err := b.uploads.Run(context.WithValue(ctx, completeKey{}, call), spec)
+	if errors.Is(err, taskrunner.ErrExpired) {
+		return s3response.CompleteMultipartUploadResult{}, "", errCompleteInProgress
+	}
+	if err != nil {
+		return s3response.CompleteMultipartUploadResult{}, "", err
+	}
+	// The parts the Complete left out are released now rather than when a
+	// worker reaches them.
+	b.releaseNow(ctx, call.space, call.orphans)
+	return call.res, call.versionID, nil
+}
+
+// completeCall is a CompleteMultipartUpload's request, for its
+// queue-multipart-upload.complete, and what the Complete tells it back.
+type completeCall struct {
+	input  *s3.CompleteMultipartUploadInput
+	report func(backend.CompleteMultipartUploadHeaders)
+
+	res       s3response.CompleteMultipartUploadResult
+	versionID string
+	// space and orphans are the upload's space and the blobs of the parts the
+	// Complete left out, whose releases it queued.
+	space   did.DID
+	orphans []mh.Multihash
+	// reported is whether the Complete has reported its headers. It outlives
+	// a run of the task's tree, because versitygw keeps only the first report
+	// and a tree whose commit fails runs again from scratch.
+	reported bool
+	// reserved is the version the Complete reserved and reported, kept for
+	// the same reason: a run again installs the id the client already has.
+	reserved *versionReservation
+}
+
+// runComplete is queue-multipart-upload.complete (completeUpload).
+func (b *Backend) runComplete(ctx context.Context, ex *taskrunner.Exec, _ taskrunner.Task) ([]byte, error) {
+	call, _ := ctx.Value(completeKey{}).(*completeCall)
+	if call == nil {
+		return nil, taskrunner.Permanent(errors.New("complete: its request has gone"))
+	}
+	res, versionID, err := b.completeUpload(ctx, ex, call)
+	if err != nil {
+		return nil, err
+	}
+	call.res, call.versionID = res, versionID
+	return nil, nil
+}
+
+// completeUpload assembles the object from the parts the request lists and
+// commits it, on the upload's subject: no part lands and no Abort runs
+// meanwhile. A completed upload replays the Complete that committed it.
+func (b *Backend) completeUpload(ctx context.Context, ex *taskrunner.Exec, call *completeCall) (s3response.CompleteMultipartUploadResult, string, error) {
+	input, reportHeaders := call.input, call.report
 	// Only the first report counts (versitygw ignores the rest), and a
 	// report is binding, so the reservation below needs to know whether ""
 	// went out first. Every report comes after the session has loaded, and
 	// carries its encryption.
-	reported := false
 	var sse types.ServerSideEncryption
 	report := func(versionID string) {
-		if !reported {
-			reported = true
+		if !call.reported {
+			call.reported = true
 			reportHeaders(backend.CompleteMultipartUploadHeaders{VersionID: versionID, ServerSideEncryption: sse})
 		}
-	}
-	if input.Bucket == nil || input.Key == nil || input.UploadId == nil {
-		return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrInvalidRequest)
 	}
 	bucket, key, uploadID := *input.Bucket, *input.Key, *input.UploadId
 	bucketState, err := b.reg.Get(ctx, bucket)
@@ -540,7 +605,9 @@ func (b *Backend) CompleteMultipartUploadReportingHeaders(ctx context.Context, i
 	if ifNoneMatch != nil && (*ifNoneMatch != "*" || ifMatch != nil) {
 		return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrNotImplemented)
 	}
-	if ifMatch != nil || ifNoneMatch != nil {
+	// Not for a completed upload, which replays its result: after its
+	// commit, the precheck would newly fail an If-None-Match repeat.
+	if sess.State != registry.SessionCompleted && (ifMatch != nil || ifNoneMatch != nil) {
 		curETag, exists, lerr := b.currentObjectETag(ctx, bucket, key)
 		if lerr != nil {
 			return s3response.CompleteMultipartUploadResult{}, "", lerr
@@ -563,7 +630,7 @@ func (b *Backend) CompleteMultipartUploadReportingHeaders(ctx context.Context, i
 	}
 	// Without the trees: validation and the replay of a completed upload
 	// need part numbers, sizes, ETags and checksums only, and the trees are
-	// gone once an upload completes. The winner loads them after the latch.
+	// gone once an upload completes. They load once the parts are accepted.
 	stored, err := b.multipart.ListParts(ctx, uploadID)
 	if err != nil {
 		return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: list parts: %w", err)
@@ -709,108 +776,38 @@ func (b *Backend) CompleteMultipartUploadReportingHeaders(ctx context.Context, i
 		}
 	}
 
-	// Idempotent re-Complete + the single-winner latch (§7.3), in one bounded
-	// loop: only the writer that moves the session off 'open' commits; a
-	// caller racing the winner waits for its terminal state and replays its
-	// result instead of failing with NoSuchUpload (concurrent Completes of
-	// one upload must all return the winner's ETag). Session fields are
-	// immutable after create and part rows are retained through completion
-	// (the orphan reap touches blobs, never rows), so nothing above this
-	// loop needs re-deriving — and the conditional-write precheck must NOT
-	// re-run here: after the winner commits it would newly fail an
-	// If-None-Match loser. The wall-clock and iteration caps bound both a
-	// revert-livelock and how long the poll holds the connection (no request
-	// deadline exists to inherit); exhausting them while the winner is still
-	// running is OperationAborted, never NoSuchUpload. The budget is not time
-	// for the winner to finish: a loser that waits silently longer than the
-	// client's read timeout is cut off as the winner was, so raising it
-	// cannot help.
-	completeWon := false
-	{
-		backoff := 5 * time.Millisecond
-		deadline := time.Now().Add(replayWaitBudget)
-		cur := sess
-		for tries := 0; ; tries++ {
-			if cur.State == registry.SessionCompleted {
-				// The prior Complete committed and recorded its result on the
-				// session with its commit. The validation above proved the
-				// caller's part list against the retained parts; guard against
-				// a divergent list that happens to validate by comparing the
-				// derived ETag with the committed one. The session's copy is
-				// authoritative — the live key may since have been overwritten.
-				if !etagsEqual(cur.CommittedETag, etag) {
-					return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrInvalidPart)
-				}
-				etagQ := `"` + cur.CommittedETag + `"`
-				// A re-Complete of an already-completed upload returns the ETag
-				// but no checksum: AWS omits it on the idempotent replay (for both
-				// COMPOSITE and FULL_OBJECT), unlike the first Complete.
-				res := s3response.CompleteMultipartUploadResult{Bucket: &bucket, Key: &key, ETag: &etagQ, ServerSideEncryption: encryptionFor(sess.Plaintext)}
-				// A null version is one the first Complete committed outside
-				// an Enabled bucket, and sent no id for.
-				versionid := cur.CommittedVersionID
-				if versionid == registry.NullVersionID {
-					versionid = ""
-				}
-				report(versionid)
-				return res, versionid, nil
-			}
-			if cur.State == registry.SessionOpen {
-				won, err := b.multipart.LatchSession(ctx, uploadID, registry.SessionOpen, registry.SessionCompleting)
-				if err != nil {
-					return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: latch: %w", err)
-				}
-				if won {
-					completeWon = true
-					break
-				}
-			}
-			if cur.State == registry.SessionAborting {
-				return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrNoSuchUpload)
-			}
-			if tries >= replayMaxTries || time.Now().After(deadline) {
-				return s3response.CompleteMultipartUploadResult{}, "", errCompleteInProgress
-			}
-			// The winner's id isn't known until it commits, and if it fails
-			// this caller may commit a version of its own. The headers go out
-			// without one rather than wait out the winner.
-			report("")
-			select {
-			case <-ctx.Done():
-				return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: complete wait: %w", ctx.Err())
-			case <-time.After(backoff):
-			}
-			if backoff < 200*time.Millisecond {
-				backoff *= 2
-			}
-			cur, err = b.multipart.GetSession(ctx, uploadID)
-			if errors.Is(err, registry.ErrNotFound) {
-				return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrNoSuchUpload)
-			}
-			if err != nil {
-				return s3response.CompleteMultipartUploadResult{}, "", fmt.Errorf("s3frontend: session poll: %w", err)
-			}
+	// Idempotent re-Complete: the Complete that committed the upload
+	// recorded its result on the session with its commit. The validation
+	// above proved the caller's part list against the retained parts; guard
+	// against a divergent list that happens to validate by comparing the
+	// derived ETag with the committed one. The session's copy is
+	// authoritative — the live key may since have been overwritten.
+	if sess.State == registry.SessionCompleted {
+		if !etagsEqual(sess.CommittedETag, etag) {
+			return s3response.CompleteMultipartUploadResult{}, "", s3err.GetAPIError(s3err.ErrInvalidPart)
 		}
+		etagQ := `"` + sess.CommittedETag + `"`
+		// A re-Complete of an already-completed upload returns the ETag
+		// but no checksum: AWS omits it on the idempotent replay (for both
+		// COMPOSITE and FULL_OBJECT), unlike the first Complete.
+		res := s3response.CompleteMultipartUploadResult{Bucket: &bucket, Key: &key, ETag: &etagQ, ServerSideEncryption: encryptionFor(sess.Plaintext)}
+		// A null version is one the first Complete committed outside an
+		// Enabled bucket, and sent no id for.
+		versionid := sess.CommittedVersionID
+		if versionid == registry.NullVersionID {
+			versionid = ""
+		}
+		report(versionid)
+		return res, versionid, nil
 	}
-	_ = completeWon
-	// If anything below fails before the object is committed, revert the session
-	// to 'open' so the upload stays abortable / retriable rather than zombied in
-	// 'completing'. committed is set once the manifest is durable (the point of
-	// no return).
-	committed := false
-	defer func() {
-		if !committed {
-			_, _ = b.multipart.LatchSession(ctx, uploadID, registry.SessionCompleting, registry.SessionOpen)
-		}
-	}()
 
 	// The winner alone needs the parts' trees: the object's digest is
 	// assembled from them, and a non-final part hashed at a wrong assumed
 	// offset (variable sizes uploaded out of order) is read back from its
 	// storage node first, within a budget. Over it the completion is refused
-	// here and the revert above reopens the upload for a retry; parts the
-	// upload's accept has accepted meanwhile stay accepted, and an abort
-	// releases them as such. A replay never gets here, which matters because a
+	// here and the upload stays open for a retry; parts the upload's accept
+	// has accepted meanwhile stay accepted, and an abort releases them as
+	// such. A replay never gets here, which matters because a
 	// completed upload's trees are deleted (below) and would count as
 	// re-hash in full.
 	trees, err := b.multipart.ListPartTrees(ctx, uploadID)
@@ -829,18 +826,21 @@ func (b *Backend) CompleteMultipartUploadReportingHeaders(ctx context.Context, i
 	// only go in the 200's body. The re-hash refusal above comes first so
 	// that it keeps its 400. The commit then installs exactly this id, or
 	// fails (errReservationSuperseded). Every other Complete reports no id,
-	// including one that already did while it waited on another Complete,
 	// and the commit then refuses to create a numbered version, which the
 	// client could never learn.
-	reserved := &versionReservation{}
-	if bucketState.Versioning == registry.VersioningEnabled && !reported {
-		r, err := b.reserveVersion(ctx, bucket)
-		if err != nil {
-			return s3response.CompleteMultipartUploadResult{}, "", err
+	if call.reserved == nil {
+		call.reserved = &versionReservation{}
+		if bucketState.Versioning == registry.VersioningEnabled && !call.reported {
+			r, err := b.reserveVersion(ctx, bucket)
+			if err != nil {
+				call.reserved = nil
+				return s3response.CompleteMultipartUploadResult{}, "", err
+			}
+			call.reserved = &r
+			report(r.VersionID)
 		}
-		reserved = &r
-		report(r.VersionID)
 	}
+	reserved := call.reserved
 	report("")
 
 	// Assemble the ordered body: each part's byte span (it may span several
@@ -921,22 +921,19 @@ func (b *Backend) CompleteMultipartUploadReportingHeaders(ctx context.Context, i
 	}
 	initState = applyTagsIfPresent(initState, tags)
 
-	// Commit through the §5 write rule (docs/s3-versioning.md): seq
-	// allocation, supersession per the bucket's versioning state, and the
-	// reference-index claims and drops with the root's advance. The commit
-	// re-checks the conditional-write preconditions against the version it
-	// supersedes, and that the upload is still completing: every teardown
-	// that takes a 'completing' row (DeleteBucket, the sweeper) has released
-	// its blobs, and the manifest must not commit over them. The upload is
-	// recorded completed with the commit.
-	put := &PutChange{Manifest: mf, HasBlobs: true, Blobs: blobs, InitState: initState, Reserved: &ReservedVersion{Seq: reserved.Seq, VersionID: reserved.VersionID}, Session: uploadID}
+	// Commit through the §5 write rule (docs/s3-versioning.md), as a child:
+	// seq allocation, supersession per the bucket's versioning state, and
+	// the reference-index claims and drops with the root's advance, all
+	// committed with this task. The commit re-checks the conditional-write
+	// preconditions against the version it supersedes.
+	put := &PutChange{Manifest: mf, HasBlobs: true, Blobs: blobs, InitState: initState, Reserved: &ReservedVersion{Seq: reserved.Seq, VersionID: reserved.VersionID}, Completes: true}
 	if ifMatch != nil {
 		put.HasIfMatch, put.IfMatch = true, *ifMatch
 	}
 	if ifNoneMatch != nil {
 		put.HasIfNoneMatch, put.IfNoneMatch = true, *ifNoneMatch
 	}
-	node, effState, err := b.commitOne(ctx, bucketState, KeyChange{Key: key, Put: put}, "commit version")
+	node, effState, err := b.commitOneWith(ctx, ex, bucketState, KeyChange{Key: key, Put: put}, "commit version")
 	if errors.Is(err, errReservationSuperseded) {
 		b.logger.Info("multipart completion refused: the key or the bucket's versioning changed since it reported its version",
 			zap.String("key", key), zap.String("uploadID", uploadID), zap.String("versionID", reserved.VersionID))
@@ -944,53 +941,51 @@ func (b *Backend) CompleteMultipartUploadReportingHeaders(ctx context.Context, i
 	if err != nil {
 		return s3response.CompleteMultipartUploadResult{}, "", err
 	}
-	// The object is durable, and the session, recorded completed with the
-	// committed ETag and version id, is retained with its parts so a
-	// duplicate or latch-losing Complete replays this result; the sweeper
-	// reaps it later.
-	committed = true
-	// The parts' tree material is dead now that the manifest holds the
-	// object's tree, and it is the bulk of a large upload's rows (up to
-	// about 320 KiB per 5 GiB part). Best-effort: rows a failure leaves go
-	// with the session when the sweeper reaps it.
-	if err := b.multipart.DeletePartTrees(ctx, uploadID); err != nil {
-		b.logger.Warn("delete part trees after commit failed; they go with the session row",
-			zap.String("uploadID", uploadID), zap.Error(err))
+
+	// With the object: the session, recorded completed with the committed
+	// ETag and version id, is retained with its parts so a repeated Complete
+	// replays this result, until its reap. The parts' tree material is dead
+	// now that the manifest holds the object's tree, and it is the bulk of a
+	// large upload's rows (up to about 320 KiB per 5 GiB part).
+	done := registry.CompletedSession(uploadID, etag, node.VersionID)
+	if err := ex.WriteConditional(ctx, done.SQL, done.Args...); err != nil {
+		return s3response.CompleteMultipartUploadResult{}, "", err
+	}
+	dropTrees := registry.DeletedPartTrees(uploadID)
+	if err := ex.Write(ctx, dropTrees.SQL, dropTrees.Args...); err != nil {
+		return s3response.CompleteMultipartUploadResult{}, "", err
+	}
+	if ttl := b.sessionTTL(); ttl >= 0 {
+		spec := uploadSpec(uploadID, registry.MultipartReapAction, nil)
+		at := time.Now().Add(ttl)
+		spec.NotBefore = &at
+		if _, err := ex.Submit(ctx, spec); err != nil {
+			return s3response.CompleteMultipartUploadResult{}, "", err
+		}
 	}
 
 	// Release parts uploaded but omitted from the winning list: no claim was
 	// ever added for them. The winners are the live set; the retained part
-	// rows would otherwise mark every digest, orphans included, as live.
-	// Best-effort post-commit, since the object is durable and the response
-	// must say so: the completed-session reap derives the same orphans from
-	// the marked winners and records them before it drops the row, so a
-	// failure here delays a release rather than losing it. The inline pass
-	// runs even when recording failed — the executor is idempotent, and a
-	// release that lands now spares the orphan the wait for the reap.
+	// rows would otherwise mark every digest, orphans included, as live. The
+	// releases are queued with the commit, so none is lost.
 	winners := make(map[string]bool, len(blobs))
 	for _, ref := range blobs {
 		winners[string(ref.Digest)] = true
 	}
 	var orphans []mh.Multihash
+	seen := map[string]bool{}
 	for _, sp := range stored {
 		for _, d := range sp.BlobDigests {
-			if !winners[string(d)] {
+			if k := string(d); !winners[k] && !seen[k] {
+				seen[k] = true
 				orphans = append(orphans, d)
 			}
 		}
 	}
-	if len(orphans) > 0 {
-		released, err := b.enqueuePartReleases(ctx, bucketState.Space, orphans, winners)
-		if err != nil {
-			// Not run unqueued: a release owns its blob only through its
-			// task (runRelease), which a write reusing the blob can see.
-			// The reap derives the orphans again from the retained part
-			// rows, queues them, and releases them late rather than never.
-			b.logger.Warn("queue orphan part releases failed; the completed-session reap queues them",
-				zap.String("uploadID", uploadID), zap.Error(err))
-		}
-		b.releaseNow(ctx, bucketState.Space, released)
+	if err := spawnReleases(ctx, ex, bucketState.Space, orphans, b.releaseAuthority(ctx, bucketState.Space)); err != nil {
+		return s3response.CompleteMultipartUploadResult{}, "", err
 	}
+	call.space, call.orphans = bucketState.Space, orphans
 
 	// The x-amz-version-id of the new version. Only an enabled bucket echoes it;
 	// a suspended bucket stores the object under the "null" version id but omits
@@ -1006,11 +1001,11 @@ func (b *Backend) CompleteMultipartUploadReportingHeaders(ctx context.Context, i
 	return res, versionid, nil
 }
 
-// AbortMultipartUpload cancels a multipart upload: it latches the session
-// (single-winner vs Complete), drops it (cascading its parts), and records a
-// release for each of the parts' now-unreferenced blobs (which unallocates any
-// parked on a provider: an upload ends in exactly one of accept or abort). No reference claims were taken (those happen only at
-// Complete).
+// AbortMultipartUpload cancels a multipart upload through its
+// queue-multipart-upload.abort, which drops it (cascading its parts) and
+// queues a release for each of the parts' blobs (which unallocates any
+// parked on a provider: an upload ends in exactly one of accept or abort).
+// The abort runs on the upload's subject, so it never overlaps a Complete.
 func (b *Backend) AbortMultipartUpload(ctx context.Context, input *s3.AbortMultipartUploadInput) error {
 	if input.UploadId == nil {
 		return s3err.GetAPIError(s3err.ErrInvalidRequest)
@@ -1027,83 +1022,27 @@ func (b *Backend) AbortMultipartUpload(ctx context.Context, input *s3.AbortMulti
 		input.IfMatchInitiatedTime.Truncate(time.Second).Before(sess.CreatedAt.Truncate(time.Second)) {
 		return s3err.GetAPIError(s3err.ErrPreconditionFailed)
 	}
-	won, err := b.multipart.LatchSession(ctx, uploadID, registry.SessionOpen, registry.SessionAborting)
-	if err != nil {
-		return fmt.Errorf("s3frontend: latch: %w", err)
-	}
-	if !won {
-		return s3err.GetAPIError(s3err.ErrNoSuchUpload)
-	}
-	// Queue the parts' releases, then drop the session, then release. The
-	// part rows are the only index to the blobs and cascade away with the
-	// session, so the records must exist before the delete; a failure up to
-	// that point fails the abort and leaves the session latched 'aborting'
-	// for the sweeper to finish.
-	space := sess.Space
-	released, err := b.recordSessionReleases(ctx, space, uploadID)
-	if err != nil {
-		return fmt.Errorf("s3frontend: abort: %w", err)
-	}
-	if err := b.multipart.DeleteSession(ctx, uploadID); err != nil {
-		return fmt.Errorf("s3frontend: delete session: %w", err)
-	}
-	b.releaseNow(ctx, space, released)
-	return nil
+	return b.abortUpload(ctx, *sess)
 }
 
-// abortOpenSession force-aborts an open multipart session exactly like a
-// client Abort: latch (losing gracefully to a concurrent Complete/Abort),
-// queue its parts' releases against the session's own space, drop the
-// session, release. Used by DeleteBucket's implicit abort of in-flight
-// uploads. Reports whether the session's releases are queued and its row
-// gone; false leaves the row for the sweeper, and DeleteBucket must not
-// proceed past it.
-func (b *Backend) abortOpenSession(ctx context.Context, sess registry.MultipartSession) bool {
-	space := sess.Space
-	won, err := b.multipart.LatchSession(ctx, sess.UploadID, registry.SessionOpen, registry.SessionAborting)
-	if err != nil || !won {
-		return false
-	}
-	released, err := b.recordSessionReleases(ctx, space, sess.UploadID)
-	if err != nil {
-		// Leave the session latched 'aborting': deleting it now would
-		// cascade away the part rows — the only index to the blobs. The
-		// sweeper's aborting reap retries.
-		b.logger.Warn("queue part releases before implicit abort failed; leaving the session for the sweeper",
-			zap.String("uploadID", sess.UploadID), zap.Error(err))
-		return false
-	}
-	if err := b.multipart.DeleteSession(ctx, sess.UploadID); err != nil {
-		return false
-	}
-	b.releaseNow(ctx, space, released)
-	return true
-}
-
-// recordSessionReleases queues a release for every blob of uploadID's parts
-// that is still there to release. The blob's upload intent says which those
-// are. A published intent is a committed blob — the state its first
-// reference claim wrote — so a completed session's winners, even after their
-// object is deleted, are left to the object path's own releases. No intent
-// at all is a blob already released in full: every written blob gets an
-// intent, and only a release's commit removes one. Queueing such a blob again
-// would queue a release that then finds neither rows nor intent, takes the
-// network arm and asks to remove a blob that may never have left this node,
-// which nothing authorizes and no retry can complete.
-//
-// It is the durable step of a session teardown: the part rows are the only
-// index to the blobs and cascade away with the session, so the caller runs
-// this before DeleteSession and only deletes the session once it has
-// succeeded. Returns the blobs, for releaseNow. The caller has latched the
-// session out of 'open' and 'completing', so the upload's next accept
-// concludes nothing.
-func (b *Backend) recordSessionReleases(ctx context.Context, space did.DID, uploadID string) ([]mh.Multihash, error) {
+// sessionReleases returns the blobs of uploadID's parts that are still there
+// to release, each once, for a teardown to queue their releases. The blob's
+// upload intent says which those are. A published intent is a committed
+// blob — the state its first reference claim wrote — so a completed
+// session's winners, even after their object is deleted, are left to the
+// object path's own releases. No intent at all is a blob already released in
+// full: every written blob gets an intent, and only a release's commit
+// removes one. Releasing such a blob again would ask to remove a blob that
+// may never have left this node, which nothing authorizes and no retry can
+// complete. Whether a blob is in fact free to go is the release's question,
+// answered when it runs: it does nothing for a digest anything in the space
+// still references.
+func (b *Backend) sessionReleases(ctx context.Context, space did.DID, uploadID string) ([]mh.Multihash, error) {
 	parts, err := b.multipart.ListParts(ctx, uploadID)
 	if err != nil {
 		return nil, fmt.Errorf("list parts: %w", err)
 	}
 	var digests []mh.Multihash
-	keep := map[string]bool{}
 	seen := map[string]bool{}
 	for _, p := range parts {
 		for _, d := range p.BlobDigests {
@@ -1115,48 +1054,17 @@ func (b *Backend) recordSessionReleases(ctx context.Context, space did.DID, uplo
 			switch {
 			case errors.Is(err, registry.ErrNotFound):
 				// Already released in full, intent and all.
-				keep[string(d)] = true
 				continue
 			case err != nil:
 				return nil, fmt.Errorf("lookup intent: %w", err)
 			case in.State == registry.IntentPublished:
 				// Committed: the object path owns its release.
-				keep[string(d)] = true
 				continue
 			}
 			digests = append(digests, d)
 		}
 	}
-	return b.enqueuePartReleases(ctx, space, digests, keep)
-}
-
-// enqueuePartReleases queues a release, due at once, for each of digests that
-// is not in keep (the winners at Complete, the committed and already-released
-// blobs at a reap; a supersede keeps nothing), in one transaction however many
-// parts the session has. Whether a blob is in fact free to go is the release's
-// question, answered when it runs: runRelease does nothing for a digest
-// anything in the space still references, a committed object's claim or a
-// part of an in-flight session. Deciding that here instead would race another teardown —
-// two aborting sessions sharing a blob could each see the other's part, both
-// skip it, and both cascade their rows away, leaving no release at all — or
-// another supersede, of a sibling part sharing the blob. A part blob was never
-// readable through the catalog, so no reader grace is owed; a release already
-// pending keeps its later time.
-func (b *Backend) enqueuePartReleases(ctx context.Context, space did.DID, digests []mh.Multihash, keep map[string]bool) ([]mh.Multihash, error) {
-	seen := map[string]bool{}
-	var release []mh.Multihash
-	for _, d := range digests {
-		k := string(d)
-		if seen[k] || keep[k] {
-			continue
-		}
-		seen[k] = true
-		release = append(release, d)
-	}
-	if err := b.claims.QueueReleases(ctx, space, release, registry.DueNow(), b.releaseAuthority(ctx, space)); err != nil {
-		return nil, fmt.Errorf("queue releases: %w", err)
-	}
-	return release, nil
+	return digests, nil
 }
 
 // parkBlobs runs the queue-space-shard.add of each of a part's blobs, which
@@ -1198,15 +1106,18 @@ var acceptWaitBudget = 30 * time.Second
 // acceptRequested makes sure every part Complete names has its blobs
 // accepted on Forge. The upload's accept has been accepting parts while the
 // client uploaded them; Complete runs it once more for the parts it names,
-// as a sync task, which waits for one already running and runs after any
-// pending. Parts the upload holds and Complete omits are left out: they are
-// orphans of this completion. Then every named part must be accepted. One
-// with a blob released since the request validated it is no longer the part
-// the client named, and Complete answers InvalidPart; the client uploads it
-// again. An accept that cannot start within acceptWaitBudget answers
-// OperationAborted (errCompleteInProgress, final for botocore clients) rather
-// than hold the request past the client's read timeout; the revert reopens
-// the upload.
+// after the response's headers have gone out. It runs as a task of its own,
+// not a child: its writes commit before Complete reads the parts again, and
+// before the object's tree is assembled, which reads accepted blobs back
+// through their locations. It waits for an accept already running and runs
+// after any pending. Parts the upload holds and Complete omits are left out:
+// they are orphans of this completion. Then every named part must be
+// accepted. One with a blob released since the request validated it is no
+// longer the part the client named, and Complete answers InvalidPart; the
+// client uploads it again. An accept that cannot start within
+// acceptWaitBudget answers OperationAborted (errCompleteInProgress, final for
+// botocore clients) rather than hold the request past the client's read
+// timeout.
 func (b *Backend) acceptRequested(ctx context.Context, uploadID string, requested []registry.MultipartPart) error {
 	numbers := make([]int64, len(requested))
 	for i, p := range requested {
@@ -1509,133 +1420,6 @@ func (b *Backend) ListMultipartUploads(ctx context.Context, input *s3.ListMultip
 		res.NextUploadIDMarker = nextUploadIDMarker
 	}
 	return res, nil
-}
-
-// SweepStaleMultipartSessions tears down sessions whose state has not changed
-// for ttl: open sessions are aborted exactly like a client Abort (their
-// parked parts released on their providers), completed
-// leftovers are reaped, and sessions a crash stranded mid-transition — a
-// 'completing' row whose Complete died before the commit, an 'aborting' row
-// whose Abort died before dropping the session — get the abort treatment too,
-// since deleting the row alone would leave their parked allocations to sit
-// until expiry. Staleness counts from the last state change, so a Complete
-// that latches an old session to 'completing' holds the row for a TTL of its
-// own rather than racing a sweep that would abort the parts it is concluding;
-// a session never taken past 'open' counts from its creation. A 'completing'
-// row is latched under its bucket's lock, where Complete re-checks the latch
-// before committing, so a Complete that outlives the TTL fails rather than
-// committing over blobs the sweep released. Returns how many rows were
-// removed. Called periodically by the daemon's sweeper loop. A cancelled
-// sweep stops before its next session; one cancelled between latching a
-// session and reaping it leaves the row 'aborting' until a later sweep finds
-// it stale, one TTL after the latch.
-func (b *Backend) SweepStaleMultipartSessions(ctx context.Context, ttl time.Duration) (int, error) {
-	cutoff := time.Now().Add(-ttl)
-	cleaned := 0
-	// Stale open sessions and crash-stranded 'completing' rows: latch into
-	// 'aborting' (losing gracefully to a concurrent Complete/Abort) and clean
-	// up like an abort. A 'completing' row whose commit actually landed is
-	// safe here: its winners hold reference claims, which the cleanup skips.
-	for _, state := range []string{registry.SessionOpen, registry.SessionCompleting} {
-		stale, err := b.multipart.ListStaleSessions(ctx, state, cutoff)
-		if err != nil {
-			return cleaned, fmt.Errorf("s3frontend: sweep list: %w", err)
-		}
-		for _, s := range stale {
-			if err := ctx.Err(); err != nil {
-				return cleaned, err
-			}
-			won, err := b.latchStaleSession(ctx, s, state)
-			if err != nil || !won {
-				continue
-			}
-			if b.reapAbortingSession(ctx, s) {
-				cleaned++
-			}
-		}
-	}
-	// 'aborting' rows stranded by a crash between the latch and the session
-	// drop: the latch is already held, so just finish the cleanup.
-	stranded, err := b.multipart.ListStaleSessions(ctx, registry.SessionAborting, cutoff)
-	if err != nil {
-		return cleaned, fmt.Errorf("s3frontend: sweep list: %w", err)
-	}
-	for _, s := range stranded {
-		if err := ctx.Err(); err != nil {
-			return cleaned, err
-		}
-		if b.reapAbortingSession(ctx, s) {
-			cleaned++
-		}
-	}
-	// Completed sessions, retained for Complete idempotency: Complete reaped
-	// their orphaned parts, and their winners belong to reference accounting —
-	// drop the row.
-	leftovers, err := b.multipart.ListStaleSessions(ctx, registry.SessionCompleted, cutoff)
-	if err != nil {
-		return cleaned, fmt.Errorf("s3frontend: sweep list: %w", err)
-	}
-	for _, s := range leftovers {
-		if err := ctx.Err(); err != nil {
-			return cleaned, err
-		}
-		if b.reapCompletedSession(ctx, s) {
-			cleaned++
-		}
-	}
-	return cleaned, nil
-}
-
-// latchStaleSession moves a stale session into 'aborting'. A 'completing'
-// row's Complete records the session completed with its commit only while it
-// is still completing, so once this latch lands that commit fails with
-// NoSuchUpload instead of installing a manifest over blobs the reap
-// releases; a commit that landed first leaves the row completed, and the
-// latch loses. An 'open' row's latch decides it against a concurrent
-// Complete or Abort the same way.
-func (b *Backend) latchStaleSession(ctx context.Context, s registry.MultipartSession, from string) (bool, error) {
-	return b.multipart.LatchSession(ctx, s.UploadID, from, registry.SessionAborting)
-}
-
-// reapCompletedSession drops a completed session's row, first recording a
-// release for every part blob without a claim. The winners hold claims and
-// are untouched; the orphans normally went at Complete, and recording them
-// again is what makes that best-effort pass safe to lose. Reports whether
-// the row was removed; a failure leaves it for the next sweep.
-func (b *Backend) reapCompletedSession(ctx context.Context, s registry.MultipartSession) bool {
-	released, err := b.recordSessionReleases(ctx, s.Space, s.UploadID)
-	if err != nil {
-		b.logger.Warn("sweep: record completed session's releases failed; retrying next sweep",
-			zap.String("uploadID", s.UploadID), zap.Error(err))
-		return false
-	}
-	if err := b.multipart.DeleteSession(ctx, s.UploadID); err != nil {
-		return false
-	}
-	b.releaseNow(ctx, s.Space, released)
-	return true
-}
-
-// reapAbortingSession drops a session already latched into 'aborting': it
-// queues a release for each of its parts' blobs nothing else references,
-// deletes the row, and runs the releases (parked blobs are aborted on their
-// providers, accepted-but-unclaimed ones removed). Reports whether the row
-// was removed; a failure before the delete leaves the session latched for
-// the next sweep, since the part rows are the only index to the blobs.
-func (b *Backend) reapAbortingSession(ctx context.Context, s registry.MultipartSession) bool {
-	// Records first, then the row: the part rows are the only index to the
-	// blobs and cascade away with the session.
-	released, err := b.recordSessionReleases(ctx, s.Space, s.UploadID)
-	if err != nil {
-		b.logger.Warn("sweep: queue part releases failed; retrying next sweep",
-			zap.String("uploadID", s.UploadID), zap.Error(err))
-		return false
-	}
-	if err := b.multipart.DeleteSession(ctx, s.UploadID); err != nil {
-		return false
-	}
-	b.releaseNow(ctx, s.Space, released)
-	return true
 }
 
 // etagsEqual compares two ETags ignoring surrounding quotes.

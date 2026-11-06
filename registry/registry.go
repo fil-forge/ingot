@@ -89,7 +89,10 @@ type State struct {
 	// stored it; BucketEncryptionUnset when never configured, or deleted
 	// since.
 	Encryption BucketEncryption
-	CreatedAt  time.Time // set by the implementation at create time
+	// Closing is set once a DeleteBucket has closed the bucket: no commit
+	// or new multipart upload is admitted (queue-bucket.close).
+	Closing   bool
+	CreatedAt time.Time // set by the implementation at create time
 }
 
 // CreateState is the initial bucket state Create installs, so a bucket
@@ -164,6 +167,10 @@ type Registry interface {
 	// the recovery loop: anything reachable from Root but not from
 	// ForgeRoot needs to be re-submitted on startup.
 	SetForgeRoot(ctx context.Context, name string, root cid.Cid) error
+
+	// SetClosing marks the bucket closing, or clears the mark
+	// (State.Closing). Returns ErrNotFound if absent.
+	SetClosing(ctx context.Context, name string, closing bool) error
 
 	// SetVersioning updates the bucket's versioning state. Only Enabled and
 	// Suspended are settable. Returns ErrNotFound if the bucket is absent.
