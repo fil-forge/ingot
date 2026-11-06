@@ -124,7 +124,8 @@ Internal:
   `ingot.catalog_journal` until their segment ships),
   `segments.go` (`logstore.Meta`, and `CatalogUsage`, the per-bucket sums
   the catalog usage gauges report), `stores*.go` (intents, locations,
-  inclusions, blob_refs, GC, multipart sessions/parts, parks, streams),
+  inclusions, blob_refs and pending refs (`CountReferences`), GC,
+  multipart sessions/parts, parks, streams),
   `locallocator.go` (the read tier's `Locator`). One `*Postgres` satisfies
   all of them.
 - **`taskrunner/`** — durable task queues in Postgres (one tasks table and
@@ -150,7 +151,10 @@ Internal:
   object-count changes a commit queues in its own transaction
   (`registry.WithTasks`); `queue-shard` (`s3frontend/shardqueue.go`), a
   cached blob's move into the cache and its eviction at `CacheTTL`, renewed
-  by reads. Its own tests each use a schema of their own
+  by reads; `queue-space-shard` (`s3frontend/releasequeue.go`,
+  `shardref.go`), subject space/hex digest: a blob's release, a write's sync
+  `queue-space-shard.add` (its pending reference, in `blob_pending_refs`)
+  and the reference's `queue-space-shard.expire` at 24 h. Its own tests each use a schema of their own
   (`taskrunnertest`), so the runner tests need no Ingot tables.
 - **`uploader/`** — `forge.go`/`blob.go`: `Forge` behind `Uploader`
   (`SubmitShard`), `DeferredBodyUploader` (`ConcludeBlobs`, `AbortBlob`),

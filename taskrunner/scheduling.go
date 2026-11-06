@@ -104,6 +104,27 @@ func IsPermanent(err error) bool {
 	return errors.As(err, &p)
 }
 
+// Defer marks a handler's error as a deferral: the attempt found it must wait
+// and did nothing, so its retry waits like any delayed task, holding up none
+// of the tasks behind it, even under a policy that holds the subject.
+func Defer(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &deferralError{err}
+}
+
+type deferralError struct{ err error }
+
+func (e *deferralError) Error() string { return e.err.Error() }
+func (e *deferralError) Unwrap() error { return e.err }
+
+// isDeferral reports whether err was marked with Defer.
+func isDeferral(err error) bool {
+	var d *deferralError
+	return errors.As(err, &d)
+}
+
 // ErrCancelled is returned by Wait for a task that was cancelled before it
 // started.
 var ErrCancelled = errors.New("task cancelled")
@@ -127,135 +148,67 @@ func insertSpec(q *queue, id TaskID, s Spec, sync bool) (string, []any) {
 	WHERE t.not_before < EXCLUDED.not_before`, args
 }
 
-const cancelTask = `UPDATE %s SET state = 'cancelled', finished = now()
-	WHERE id = $1 AND state = 'pending' AND started IS NULL`
+const cancelTasks = `UPDATE %s SET state = 'cancelled', finished = now()
+	WHERE id = ANY($1) AND state = 'pending' AND started IS NULL`
 
-// Cancel cancels a pending task that has not started. Cancelling a task that
-// has started, finished or been cancelled does nothing, so a handler whose
-// task can be cancelled must still check its own preconditions. A task
-// waiting to retry counts as not started: a handler returns a retryable
-// error only before its first effect outside Postgres, so its failed attempt
-// left nothing a cancel would strand.
-func (r *Runner) Cancel(ctx context.Context, queueName string, id TaskID) error {
+// Cancel cancels pending tasks that have not started, in one statement however
+// many there are. Cancelling a task that has started, finished or been
+// cancelled does nothing, so a handler whose task can be cancelled must still
+// check its own preconditions. A task waiting to retry counts as not started:
+// a handler returns a retryable error only before its first effect outside
+// Postgres, so its failed attempt left nothing a cancel would strand.
+func (r *Runner) Cancel(ctx context.Context, queueName string, ids ...TaskID) error {
 	q, ok := r.byName[queueName]
 	if !ok {
 		return fmt.Errorf("task runner: unknown queue %q", queueName)
 	}
-	if _, err := r.db.Exec(ctx, fmt.Sprintf(cancelTask, q.tasks), id); err != nil {
-		return fmt.Errorf("cancel %s/%s: %w", queueName, id, err)
+	if len(ids) == 0 {
+		return nil
 	}
-	r.finished(id)
+	if _, err := r.db.Exec(ctx, fmt.Sprintf(cancelTasks, q.tasks), ids); err != nil {
+		return fmt.Errorf("cancel %s: %w", queueName, err)
+	}
+	r.finished(ids...)
 	return nil
 }
 
 // CancelTx is Cancel inside tx, so the cancel commits or rolls back with the
 // caller's own writes.
-func (r *Runner) CancelTx(ctx context.Context, tx pgx.Tx, queueName string, id TaskID) error {
+func (r *Runner) CancelTx(ctx context.Context, tx pgx.Tx, queueName string, ids ...TaskID) error {
 	q, ok := r.byName[queueName]
 	if !ok {
 		return fmt.Errorf("task runner: unknown queue %q", queueName)
 	}
-	if _, err := tx.Exec(ctx, fmt.Sprintf(cancelTask, q.tasks), id); err != nil {
-		return fmt.Errorf("cancel %s/%s: %w", queueName, id, err)
+	if len(ids) == 0 {
+		return nil
+	}
+	if _, err := tx.Exec(ctx, fmt.Sprintf(cancelTasks, q.tasks), ids); err != nil {
+		return fmt.Errorf("cancel %s: %w", queueName, err)
 	}
 	return nil
 }
 
-// Cancel adds the cancel of a pending task to the tree's writes, so it
-// commits with them. See Runner.Cancel.
-func (ex *Exec) Cancel(ctx context.Context, queueName string, id TaskID) error {
+// Cancel adds the cancel of pending tasks to the tree's writes, so it commits
+// with them. See Runner.Cancel.
+func (ex *Exec) Cancel(ctx context.Context, queueName string, ids ...TaskID) error {
 	q, ok := ex.tr.r.byName[queueName]
 	if !ok {
 		return fmt.Errorf("task runner: unknown queue %q", queueName)
 	}
-	if err := ex.tr.add(ctx, write{sql: fmt.Sprintf(cancelTask, q.tasks), args: []any{id}}); err != nil {
-		return err
-	}
-	ex.tr.woken = append(ex.tr.woken, id)
-	return nil
-}
-
-// cancelPending cancels the unstarted pending tasks of an action on any of
-// the subjects $1, returning their IDs, and the subjects among them with one
-// that has started and is running. Both answers come from the locked rows,
-// which are the current ones: a claim that committed after the statement
-// began is seen as started, and one still to come waits for the cancel and
-// then finds nothing to claim. A reading of the statement's snapshot instead
-// could miss a task starting meanwhile in both answers at once.
-const cancelPending = `WITH locked AS (
-		SELECT id, subject, started FROM %[1]s
-		WHERE subject = ANY($1) AND action = $2 AND state = 'pending'
-		FOR UPDATE),
-	cancelled AS (
-		UPDATE %[1]s t SET state = 'cancelled', finished = now()
-		FROM locked WHERE t.id = locked.id AND locked.started IS NULL
-		RETURNING t.id)
-	SELECT coalesce((SELECT array_agg(id) FROM cancelled), '{}'),
-		coalesce((SELECT array_agg(DISTINCT subject) FROM locked WHERE started IS NOT NULL), '{}')`
-
-// CancelPending cancels every pending task of the action on the subjects that
-// has not started, as Cancel does by ID, in one statement however many
-// subjects there are, and returns how many it cancelled. running lists, in the
-// order given, the subjects with one that has started and still runs: it
-// cannot be cancelled, and a caller that needed it not to run must wait for it
-// or try again later.
-func (r *Runner) CancelPending(ctx context.Context, queueName string, subjects []string, action string) (cancelled int, running []string, err error) {
-	q, ok := r.byName[queueName]
-	if !ok {
-		return 0, nil, fmt.Errorf("task runner: unknown queue %q", queueName)
-	}
-	ids, running, err := cancelPendingIn(ctx, r.db, q, subjects, action)
-	if err != nil {
-		return 0, nil, err
-	}
-	r.finished(ids...)
-	return len(ids), running, nil
-}
-
-// CancelPendingTx is CancelPending inside tx, so the cancel commits or rolls
-// back with the caller's own writes.
-func (r *Runner) CancelPendingTx(ctx context.Context, tx pgx.Tx, queueName string, subjects []string, action string) (cancelled int, running []string, err error) {
-	q, ok := r.byName[queueName]
-	if !ok {
-		return 0, nil, fmt.Errorf("task runner: unknown queue %q", queueName)
-	}
-	ids, running, err := cancelPendingIn(ctx, tx, q, subjects, action)
-	return len(ids), running, err
-}
-
-func cancelPendingIn(ctx context.Context, db Querier, q *queue, subjects []string, action string) ([]TaskID, []string, error) {
-	var ids []TaskID
-	var running []string
-	if err := db.QueryRow(ctx, fmt.Sprintf(cancelPending, q.tasks), subjects, action).Scan(&ids, &running); err != nil {
-		return nil, nil, fmt.Errorf("cancel %s.%s: %w", q.name, action, err)
-	}
-	return ids, inOrder(subjects, running), nil
-}
-
-// inOrder returns the members of found in the order they appear in subjects.
-func inOrder(subjects, found []string) []string {
-	if len(found) == 0 {
+	if len(ids) == 0 {
 		return nil
 	}
-	have := make(map[string]bool, len(found))
-	for _, s := range found {
-		have[s] = true
+	if err := ex.tr.add(ctx, write{sql: fmt.Sprintf(cancelTasks, q.tasks), args: []any{ids}}); err != nil {
+		return err
 	}
-	out := make([]string, 0, len(found))
-	for _, s := range subjects {
-		if have[s] {
-			out = append(out, s)
-			delete(have, s)
-		}
-	}
-	return out
+	ex.tr.woken = append(ex.tr.woken, ids...)
+	return nil
 }
 
 // Pending returns the pending tasks of the action, running or not, on each of
 // subjects that has any, oldest first. A subject with none is left out. It
 // reads and changes nothing else: it is for a caller that must leave alone
-// work the queue still has to do, or wait for it, where CancelPending is for
-// one that takes the work over.
+// work the queue still has to do, or wait for it.
 func (r *Runner) Pending(ctx context.Context, queueName string, subjects []string, action string) (map[string][]TaskID, error) {
 	q, ok := r.byName[queueName]
 	if !ok {
@@ -508,10 +461,10 @@ func (f *failures) record(ctx context.Context, tx pgx.Tx, h *hold, a *action, ta
 			f.failed = append(f.failed, t)
 		} else {
 			// A retry that holds its subject waits in retry_at, which keeps
-			// the tasks behind it waiting too; otherwise it waits in
-			// not_before like any delayed task.
+			// the tasks behind it waiting too; otherwise, or after a
+			// deferral, it waits in not_before like any delayed task.
 			col := "not_before"
-			if p.HoldsSubject {
+			if p.HoldsSubject && !isDeferral(herr) {
 				col = "retry_at"
 			}
 			sql = `UPDATE ` + h.q.tasks + ` SET attempts = attempts + 1, error = $2, started = NULL,

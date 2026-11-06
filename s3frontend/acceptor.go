@@ -175,8 +175,7 @@ func (b *Backend) nudgeLocked(uploadID string) *acceptor {
 }
 
 // blobMarks counts, by blobKey, the operations of one kind this process has
-// in flight on each blob: conclusions (Backend.concluding) or writes
-// (Backend.writing).
+// in flight on each blob (Backend.concluding).
 type blobMarks struct {
 	mu sync.Mutex
 	n  map[string]int
@@ -215,8 +214,8 @@ func (m *blobMarks) marked(space did.DID, digest mh.Multihash) bool {
 }
 
 // markConcluding marks digests as being concluded in space until the
-// returned func is first called. A release that has not started defers while its
-// blob is marked (runRelease): the upload service registers a blob it
+// returned func is first called. A release that has not started defers while
+// its blob is marked (runRelease): the upload service registers a blob it
 // accepts before it answers the conclude, so a remove sent before that
 // answer finds nothing to remove, and the registration then lands with
 // nothing left to remove it. The mark is taken before the caller checks

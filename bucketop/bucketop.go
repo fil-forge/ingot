@@ -265,19 +265,10 @@ func (tx *Tx) EnqueueUploadRegistration(reg registry.UploadRegistration) {
 }
 
 // ClaimBlobs records the new generation's claims on its body digests for
-// this commit to carry. A claim refused at the swap (a started release holds
-// the digest, or the space has no location for it) fails the commit with
-// registry.ErrReleaseInProgress, and nothing is written.
+// this commit to carry. A claim whose write's pending reference has expired
+// fails the commit with registry.ErrReferenceExpired, and nothing is written.
 func (tx *Tx) ClaimBlobs(claims []registry.BlobClaim) {
 	tx.commit.Claims = append(tx.commit.Claims, claims...)
-}
-
-// PinBlobs records claims borrowed from another object of the space (a
-// same-space copy) for this commit to carry. Each is written only while the
-// space still holds a claim on its digest; otherwise the commit fails with
-// registry.ErrClaimGone, and nothing is written.
-func (tx *Tx) PinBlobs(claims []registry.BlobClaim) {
-	tx.commit.Pins = append(tx.commit.Pins, claims...)
 }
 
 // DropClaims records the claims of a discarded generation for this commit

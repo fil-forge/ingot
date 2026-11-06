@@ -189,7 +189,7 @@ func (w *bodyWriter) abandon(ctx context.Context, sb uploader.StreamedBlob) {
 var errPutFinished = errors.New("s3frontend: put finished")
 
 // abandonStream gives up a streamed upload whose blob the space holds
-// already (see concludeStreamed): the allocation is aborted on its provider,
+// already (see addBlob): the allocation is aborted on its provider,
 // best effort, as bodyWriter.abandon does.
 func (b *Backend) abandonStream(ctx context.Context, space did.DID, sb uploader.StreamedBlob) {
 	ctx, cancel := context.WithTimeout(ctx, abandonTimeLimit)

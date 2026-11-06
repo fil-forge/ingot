@@ -92,11 +92,10 @@ func mapCommitError(err error, op string) error {
 	if errors.Is(err, bucketop.ErrBucketNotFound) {
 		return s3err.GetAPIError(s3err.ErrNoSuchBucket)
 	}
-	if errors.Is(err, registry.ErrReleaseInProgress) {
-		// A release of one of the body's digests started after the write
-		// settled it (settleRelease) and is removing the blob: the swap
-		// refused the claim and wrote nothing, and the client retries once
-		// the release has run.
+	if errors.Is(err, registry.ErrReferenceExpired) {
+		// The write's reference to one of the body's blobs expired before
+		// the commit, and the blob may be released: the swap wrote nothing,
+		// and the client sends the write again.
 		return s3err.GetAPIError(s3err.ErrSlowDown)
 	}
 	// PreconditionFailedError, NoSuchVersionError, and InvalidArgumentError

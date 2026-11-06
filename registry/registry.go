@@ -148,8 +148,8 @@ type Registry interface {
 	// registration or claim without its commit would describe a version
 	// the catalog never published, and a commit without them would leave
 	// the version uncounted and its blobs unclaimed, with nothing left to
-	// say so. A refused claim or pin (ErrReleaseInProgress, ErrClaimGone)
-	// fails the commit, and the root does not advance. Passing an empty
+	// say so. A claim whose pending reference has expired
+	// (ErrReferenceExpired) fails the commit, and the root does not advance. Passing an empty
 	// RootCommit is exactly CASRoot.
 	CommitRoot(ctx context.Context, name string, expect, next cid.Cid, c RootCommit) error
 
@@ -195,18 +195,13 @@ type Registry interface {
 // Common errors.
 var (
 	ErrNotFound = errors.New("registry: bucket not found")
-	// ErrReleaseInProgress refuses a blob claim while the blob's release is
-	// running, removing it from its provider: the write retries once the
-	// release has run and uploads afresh.
-	ErrReleaseInProgress = errors.New("registry: a release of the blob is in progress")
-	// ErrClaimGone refuses a pinned claim (RootCommit.Pins) when the space
-	// holds no claim on the digest to pin to: the source object's last claim
-	// is gone and the blob is being released, so the copy has nothing to
-	// pin.
-	ErrClaimGone = errors.New("registry: no claim on the blob to pin to")
-	ErrNotEmpty  = errors.New("registry: bucket not empty")
-	ErrExists    = errors.New("registry: bucket already exists")
-	ErrConflict  = errors.New("registry: root cas conflict")
+	// ErrReferenceExpired refuses a claim or a part whose write's pending
+	// reference to a blob has gone, dropped at its deadline: the blob may be
+	// released, so the write starts again.
+	ErrReferenceExpired = errors.New("registry: the write's reference to the blob has expired")
+	ErrNotEmpty         = errors.New("registry: bucket not empty")
+	ErrExists           = errors.New("registry: bucket already exists")
+	ErrConflict         = errors.New("registry: root cas conflict")
 )
 
 // RootCommit is what a root swap carries besides the root (Registry.CommitRoot):
@@ -216,21 +211,14 @@ type RootCommit struct {
 	// tasks in its transaction: the versions it publishes and retracts from
 	// the space's content-entry list.
 	Registrations []UploadRegistration
-	// Claims are the new generation's claims, one per body digest. Each is
-	// recorded under the (space, digest) claim-key lock, and cancels the
-	// digest's pending release in the same transaction. They are refused with
-	// ErrReleaseInProgress while a release of any of them is running, or when
-	// the space has no location for one: a claim landing then would name a
-	// blob a release is removing, or has removed since the write settled it. Every committed body blob is located by its commit, so a
-	// claim with no location is one such write's. Recording a claim marks
-	// the space's upload intent for the digest published (IntentPublished).
+	// Claims are the new generation's claims, one per body digest. A claim
+	// with a Ref takes over the write's pending reference to the blob, and
+	// cancels the reference's expiry, in the same transaction; a reference
+	// that has expired refuses the commit with ErrReferenceExpired. A claim
+	// without one is a Complete's, whose blobs the session's parts reference
+	// until it is torn down. Recording a claim marks the space's upload
+	// intent for the digest published (IntentPublished).
 	Claims []BlobClaim
-	// Pins are claims borrowed from another object of the same space (a
-	// same-space copy pins the source's body). Each is recorded only while
-	// the space still holds a claim on its digest, under the claim-key
-	// lock, which excludes the drop of that last claim: the drop counts the
-	// pin, or the pin finds no claim and the commit fails with ErrClaimGone.
-	Pins []BlobClaim
 	// Drops are the discarded generations' claims. Each is deleted and, when
 	// it was the space's last claim on the digest, the blob's release is
 	// queued in the same transaction, so no crash window separates "last
@@ -256,7 +244,7 @@ type RootCommit struct {
 
 // Empty reports whether the commit carries nothing besides the root.
 func (c RootCommit) Empty() bool {
-	return len(c.Registrations) == 0 && len(c.Claims) == 0 && len(c.Pins) == 0 && len(c.Drops) == 0 &&
+	return len(c.Registrations) == 0 && len(c.Claims) == 0 && len(c.Drops) == 0 &&
 		len(c.Journal.Blocks) == 0
 }
 

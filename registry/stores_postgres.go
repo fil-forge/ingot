@@ -6,16 +6,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/fil-forge/ingot/taskrunner"
 	"slices"
-	"strings"
 	"time"
 
 	"github.com/fil-forge/ucantone/did"
+	"github.com/google/uuid"
 	"github.com/ipfs/go-cid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/multiformats/go-multihash"
+
+	"github.com/fil-forge/ingot/taskrunner"
 )
 
 // Compile-time assertions: *Postgres satisfies every store interface.
@@ -33,14 +34,13 @@ var (
 
 // BlobRefStore ===============================================================
 
-// addClaims records a new generation's claims, in the commit's transaction,
-// under the claim keys' locks (lockClaimKeys), cancelling each digest's
-// pending release, and refuses them all with ErrReleaseInProgress while a
-// release of any digest is running or the space has no location for one
-// (see RootCommit.Claims). Set-based: a
-// multipart commit claims up to hundreds of thousands of blobs, so each
-// step is one statement over the whole generation rather than one per
-// claim.
+// addClaims records a new generation's claims, in the commit's transaction
+// (see RootCommit.Claims). A claim with a Ref takes over the write's pending
+// reference, and the commit fails with ErrReferenceExpired if the reference
+// has gone; a release of the blob counts the reference or the claim, never
+// neither. Set-based: a multipart commit claims up to hundreds of thousands
+// of blobs, so each step is one statement over the whole generation rather
+// than one per claim.
 func addClaims(ctx context.Context, tx pgx.Tx, tasks TaskSubmitter, claims []BlobClaim) error {
 	if len(claims) == 0 {
 		return nil
@@ -51,40 +51,15 @@ func addClaims(ctx context.Context, tx pgx.Tx, tasks TaskSubmitter, claims []Blo
 	buckets := make([]string, n)
 	keys := make([]string, n)
 	versions := make([]string, n)
+	var refs []taskrunner.TaskID
 	for i, c := range claims {
 		digests[i], spaces[i], buckets[i], keys[i], versions[i] = c.Digest, c.Space.String(), c.Bucket, c.ObjectKey, c.VersionID
-	}
-	// A pending release of a digest the commit claims is cancelled with it:
-	// the claim would make it stale. A running one refuses the commit, as
-	// does a digest the space has no location for (a release ran to
-	// completion since the write settled it, and the blob is gone from the
-	// provider).
-	subjects := make([]string, 0, n)
-	seen := make(map[string]bool, n)
-	for _, c := range claims {
-		if s := ReleaseSubject(c.Space, c.Digest); !seen[s] {
-			seen[s] = true
-			subjects = append(subjects, s)
+		if c.Ref != uuid.Nil {
+			refs = append(refs, c.Ref)
 		}
 	}
-	_, running, err := tasks.CancelPendingTx(ctx, tx, ReleaseQueue, subjects, ReleaseAction)
-	if err != nil {
-		return fmt.Errorf("registry: add blob claims: cancel releases: %w", err)
-	}
-	if len(running) > 0 {
-		return ErrReleaseInProgress // the commit rolls back
-	}
-	var unlocated bool
-	if err := tx.QueryRow(ctx,
-		`SELECT EXISTS (
-		    SELECT 1 FROM unnest($1::text[], $2::bytea[]) AS u(s, d)
-		     WHERE NOT EXISTS (SELECT 1 FROM ingot.blob_locations l
-		                        WHERE l.space = u.s AND l.digest = u.d))`,
-		spaces, digests).Scan(&unlocated); err != nil {
-		return fmt.Errorf("registry: add blob claims: location lookup: %w", err)
-	}
-	if unlocated {
-		return ErrReleaseInProgress // the commit rolls back
+	if err := takePendingRefs(ctx, tx, tasks, refs); err != nil {
+		return fmt.Errorf("registry: add blob claims: %w", err)
 	}
 	if _, err := tx.Exec(ctx,
 		`INSERT INTO ingot.blob_refs (digest, bucket, object_key, version_id, space)
@@ -107,99 +82,37 @@ func addClaims(ctx context.Context, tx pgx.Tx, tasks TaskSubmitter, claims []Blo
 	return nil
 }
 
-// claimKeyLocksSQL takes the claim-key lock of each (space, digest) pair in
-// the order of the arrays $1 and $2 (see lockClaimKeys).
-const claimKeyLocksSQL = `SELECT pg_advisory_xact_lock(o.k)
-  FROM (SELECT hashtextextended(u.s || ':' || encode(u.d, 'hex'), 0) AS k
-          FROM unnest($1::text[], $2::bytea[]) WITH ORDINALITY AS u(s, d, i)
-         ORDER BY u.i) AS o`
-
-// lockClaimKeys takes a transaction-scoped advisory lock on every (space,
-// digest) a commit's claims, pins and drops name, each once, in digest
-// order, in one statement: the mutual exclusion between pinning a claim and
-// dropping the last one, which read-committed snapshots alone do not give (a
-// pin could see a claim a concurrent drop is deleting, and the drop count
-// could miss the uncommitted pin). One order for every commit, so two commits sharing
-// digests cannot deadlock on them. The arrays are sorted, and the
-// subquery's ORDER BY carries that order to the lock calls: SQL promises no
-// row order otherwise, and a subquery with an ORDER BY is not flattened, so
-// the outer scan reads it sorted and takes one lock per row in turn.
-func lockClaimKeys(ctx context.Context, tx pgx.Tx, c RootCommit) error {
-	type key struct {
-		space  did.DID
-		digest multihash.Multihash
-	}
-	var keys []key
-	for _, cl := range c.Claims {
-		keys = append(keys, key{cl.Space, cl.Digest})
-	}
-	for _, p := range c.Pins {
-		keys = append(keys, key{p.Space, p.Digest})
-	}
-	for _, d := range c.Drops {
-		keys = append(keys, key{d.Space, d.Digest})
-	}
-	if len(keys) == 0 {
+// takePendingRefs deletes the pending references refs, in tx, for the row
+// that takes each over, and cancels their queue-space-shard.expire tasks with
+// them. It fails with ErrReferenceExpired unless every one is still there.
+func takePendingRefs(ctx context.Context, tx pgx.Tx, tasks TaskSubmitter, refs []taskrunner.TaskID) error {
+	refs = slices.Clone(refs)
+	slices.SortFunc(refs, func(a, b taskrunner.TaskID) int { return bytes.Compare(a[:], b[:]) })
+	refs = slices.Compact(refs)
+	if len(refs) == 0 {
 		return nil
 	}
-	slices.SortFunc(keys, func(a, b key) int {
-		if n := bytes.Compare(a.digest, b.digest); n != 0 {
-			return n
-		}
-		return strings.Compare(a.space.String(), b.space.String())
-	})
-	keys = slices.CompactFunc(keys, func(a, b key) bool {
-		return a.space == b.space && bytes.Equal(a.digest, b.digest)
-	})
-	spaces := make([]string, len(keys))
-	digests := make([][]byte, len(keys))
-	for i, k := range keys {
-		spaces[i], digests[i] = k.space.String(), k.digest
+	if tasks == nil {
+		return fmt.Errorf("take pending references: the registry has no task runner")
 	}
-	if _, err := tx.Exec(ctx, claimKeyLocksSQL, spaces, digests); err != nil {
-		return fmt.Errorf("registry: lock claim keys: %w", err)
-	}
-	return nil
-}
-
-// pinClaim records one claim borrowed from another object of the space, in
-// the commit's transaction, under the claim key's lock, and refuses it with
-// ErrClaimGone when the space holds no claim on the digest (see
-// RootCommit.Pins).
-func pinClaim(ctx context.Context, tx pgx.Tx, c BlobClaim) error {
-	// Under the key's lock, the existence check and the insert see one
-	// state: a claim exists and the pin joins it, or none does and the
-	// whole commit is refused.
-	tag, err := tx.Exec(ctx,
-		`INSERT INTO ingot.blob_refs (digest, bucket, object_key, version_id, space)
-		 SELECT $1, $2, $3, $4, $5
-		 WHERE EXISTS (SELECT 1 FROM ingot.blob_refs WHERE space = $5 AND digest = $1)
-		 ON CONFLICT (digest, bucket, object_key, version_id) DO NOTHING`,
-		c.Digest, c.Bucket, c.ObjectKey, c.VersionID, c.Space)
-	if err != nil {
-		return fmt.Errorf("registry: pin blob claim: %w", err)
-	}
-	if tag.RowsAffected() == 1 {
-		return nil
-	}
-	// Nothing inserted: no claim to pin to, or this claim is already
-	// recorded (the conflict arm).
-	var own int
+	var expires []taskrunner.TaskID
 	if err := tx.QueryRow(ctx,
-		`SELECT count(*) FROM ingot.blob_refs
-		 WHERE digest = $1 AND bucket = $2 AND object_key = $3 AND version_id = $4`,
-		c.Digest, c.Bucket, c.ObjectKey, c.VersionID).Scan(&own); err != nil {
-		return fmt.Errorf("registry: pin blob claim lookup: %w", err)
+		`WITH taken AS (DELETE FROM ingot.blob_pending_refs WHERE add_task = ANY($1) RETURNING expire_task)
+		 SELECT coalesce(array_agg(expire_task), '{}') FROM taken`,
+		refs).Scan(&expires); err != nil {
+		return fmt.Errorf("take pending references: %w", err)
 	}
-	if own == 0 {
-		return ErrClaimGone // the commit rolls back
+	if len(expires) != len(refs) {
+		return ErrReferenceExpired // the transaction rolls back
+	}
+	if err := tasks.CancelTx(ctx, tx, ReleaseQueue, expires...); err != nil {
+		return fmt.Errorf("take pending references: cancel expiries: %w", err)
 	}
 	return nil
 }
 
 // dropClaims deletes the discarded generations' claims, in the commit's
-// transaction, under the claim keys' locks (lockClaimKeys), and queues a
-// release, due grace from now, for each digest the space holds no claim on
+// transaction, and queues a release, due grace from now, for each digest the space holds no claim on
 // afterwards (see RootCommit.Drops). Set-based, as addClaims is: the
 // deletes are one statement, the remaining-claim check another and the
 // releases a third, however many blobs the discarded versions had, since
@@ -254,8 +167,8 @@ func dropClaims(ctx context.Context, tx pgx.Tx, tasks TaskSubmitter, drops []Cla
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("registry: drop claims: remaining claims: %w", err)
 	}
-	// The grace runs from now, after any wait on the bucket row or the
-	// claim-key locks, not from the transaction's start: a reader that
+	// The grace runs from now, after any wait on the bucket row, not from
+	// the transaction's start: a reader that
 	// resolved the discarded version meanwhile is owed the whole grace from
 	// the commit. A release already pending keeps the later time.
 	due := time.Now().Add(grace)
@@ -274,16 +187,37 @@ func dropClaims(ctx context.Context, tx pgx.Tx, tasks TaskSubmitter, drops []Cla
 	return nil
 }
 
-func (r *Postgres) CountClaims(ctx context.Context, space did.DID, digest multihash.Multihash) (int, error) {
+func (r *Postgres) CountReferences(ctx context.Context, space did.DID, digest multihash.Multihash, except taskrunner.TaskID) (int, error) {
 	var n int
-	err := r.pool.QueryRow(ctx,
-		`SELECT count(*) FROM ingot.blob_refs WHERE space = $1 AND digest = $2`,
-		space, digest).Scan(&n)
+	err := r.pool.QueryRow(ctx, countReferencesSQL, space, digest, except, SessionOpen, SessionCompleting).Scan(&n)
 	if err != nil {
-		return 0, fmt.Errorf("registry: count claims: %w", err)
+		return 0, fmt.Errorf("registry: count references: %w", err)
 	}
 	return n, nil
 }
+
+func (r *Postgres) PendingRefByExpiry(ctx context.Context, expire taskrunner.TaskID) (taskrunner.TaskID, error) {
+	var add taskrunner.TaskID
+	err := r.pool.QueryRow(ctx, `SELECT add_task FROM ingot.blob_pending_refs WHERE expire_task = $1`, expire).Scan(&add)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return uuid.Nil, ErrNotFound
+	}
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("registry: pending reference by expiry: %w", err)
+	}
+	return add, nil
+}
+
+// countReferencesSQL counts a space's references to a digest in one
+// statement, so one snapshot reads them all: a row that takes another's
+// reference over in one transaction (a claim or a part row taking a pending
+// reference) is counted before or after, never neither.
+const countReferencesSQL = `SELECT
+	  (SELECT count(*) FROM ingot.blob_refs WHERE space = $1 AND digest = $2)
+	+ (SELECT count(*) FROM ingot.blob_pending_refs WHERE space = $1 AND digest = $2 AND add_task <> $3)
+	+ (SELECT count(*) FROM ingot.multipart_parts p
+	     JOIN ingot.multipart_sessions s ON s.upload_id = p.upload_id
+	    WHERE p.blob_digests @> ARRAY[$2::bytea] AND s.space = $1 AND s.state IN ($4, $5))`
 
 func (r *Postgres) QueueReleases(ctx context.Context, space did.DID, digests []multihash.Multihash, notBefore time.Time, release ReleaseTask) error {
 	if len(digests) == 0 {
@@ -867,9 +801,8 @@ func (r *Postgres) PutPart(ctx context.Context, p MultipartPart, tree *PartTree,
 	// replaces. Read committed alone does not give that: two writes of the
 	// same part number can both read before either lands, and the second's
 	// upsert then replaces the first's row without reporting it. The lock
-	// is keyed by the upload and the part number, in the two-key lock space,
-	// apart from the claim-key locks; a hash collision serialises two
-	// unrelated writes, nothing worse.
+	// is keyed by the upload and the part number, in the two-key lock space;
+	// a hash collision serialises two unrelated writes, nothing worse.
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1), $2::int)`, p.UploadID, p.PartNumber); err != nil {
 		return nil, fmt.Errorf("registry: put part: lock: %w", err)
 	}
@@ -904,6 +837,10 @@ func (r *Postgres) PutPart(ctx context.Context, p MultipartPart, tree *PartTree,
 	}
 	if tag.RowsAffected() == 0 {
 		return nil, ErrNotFound
+	}
+	// The part row takes its blobs' pending references over.
+	if err := takePendingRefs(ctx, tx, r.tasks, p.Refs); err != nil {
+		return nil, fmt.Errorf("registry: put part: %w", err)
 	}
 	// The tree row follows the part row: a superseding part without a tree
 	// must not keep its predecessor's.
@@ -1182,19 +1119,6 @@ func (r *Postgres) CountPartRefs(ctx context.Context, digest multihash.Multihash
 		digest, excludeUploadID).Scan(&n)
 	if err != nil {
 		return 0, fmt.Errorf("registry: count part refs: %w", err)
-	}
-	return n, nil
-}
-
-func (r *Postgres) CountLivePartRefs(ctx context.Context, space did.DID, digest multihash.Multihash) (int, error) {
-	var n int
-	err := r.pool.QueryRow(ctx,
-		`SELECT count(*) FROM ingot.multipart_parts p
-		 JOIN ingot.multipart_sessions s ON s.upload_id = p.upload_id
-		 WHERE p.blob_digests @> ARRAY[$2::bytea] AND s.space = $1 AND s.state IN ($3, $4)`,
-		space, digest, SessionOpen, SessionCompleting).Scan(&n)
-	if err != nil {
-		return 0, fmt.Errorf("registry: count live part refs: %w", err)
 	}
 	return n, nil
 }

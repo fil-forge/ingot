@@ -39,16 +39,18 @@ A PUT splits the body into blobs of at most `max_blob_size` as it arrives
 (the BLAKE3 tree and md5 in the same pass) and streams each blob to the
 network before anything commits: `/blob/add` against sprue by size, an HTTP
 PUT of the bytes to the allocated piri as they arrive, with the sha256
-digest computed on the way, a concluded receipt, and the `/blob/accept`
-location commitment. The upload service must be able to add a blob by
+digest computed on the way, then a `queue-space-shard.add` per blob, which
+concludes the receipt, records the `/blob/accept` location commitment, and
+takes the write's pending reference to the blob (see "References" under
+Bucket encryption). The upload service must be able to add a blob by
 digest code (the hash function, before the digest is known); a request
 fails otherwise. A failed PUT fails the request, and its allocation is
 aborted, so the client retries. Only then does the short per-bucket
 critical section run: allocate the version seq, write the manifest, splice
 the MST, fsync one `AppendBatch` of the new catalog blocks, and
 compare-and-swap the bucket root in Postgres, with the reference index
-(`blob_refs`) written in the swap's transaction: the version's claims land,
-superseded versions' claims drop, and a blob whose claim count reaches zero
+(`blob_refs`) written in the swap's transaction: the version's claims land
+and take over the write's pending references, superseded versions' claims drop, and a blob whose claim count reaches zero
 gets a `queue-space-shard.release` task on the task runner, queued in the
 same transaction and due after the release grace. The full trace is the
 [PutObject diagram](./docs/diagrams.md#putobject-stream-and-upload-off-the-lock-commit-under-it).
@@ -167,9 +169,10 @@ would be. The tree material lives in its own table (`multipart_part_trees`),
 read only by Complete and deleted once the object commits; every other part
 listing leaves it on disk.
 
-The part rows are the acceptance queue. `UploadPart` records its part as
-`written`, with each blob's plaintext length, moves it to `parked` once every
-blob is parked, and nudges the upload's acceptor (`s3frontend/acceptor.go`).
+The part rows are the acceptance queue. `UploadPart` parks every blob of
+the part through its `queue-space-shard.add`, then records the part as
+`written`, with each blob's plaintext length, moves it to `parked`, and
+nudges the upload's acceptor (`s3frontend/acceptor.go`).
 The move is guarded by the part's digests, so a request whose part a later
 upload of the same part number replaced cannot queue the replacement. Each
 upload has at most one acceptor, a goroutine that runs while there is work:
@@ -228,11 +231,13 @@ the session out of `open` and `completing`, waits for the pass the upload's
 acceptor has in flight, if any, before it queues any release
 (`quiesceAcceptor`); an acceptor backing off between passes is not waited
 for, since its next pass sees the latch and concludes nothing. Any other
-release, such as a superseded part's, defers while a conclude of its blob is
-in flight in this process (`markConcluding`), and the task runner retries it
-after. A conclude that failed or timed out may still be running at
-the upload service, so its blobs stay marked for `failedConcludeHold` (2
-min) after it returns.
+release, such as a superseded part's, finds a conclude of its blob in
+flight in this process (`markConcluding`) and defers: it retries as an
+ordinary delayed task (`taskrunner.Defer`), holding up none of the blob's
+other tasks meanwhile. A
+conclude that failed or timed out may still be running at the upload
+service, so its blobs stay marked for `failedConcludeHold` (2 min) after it
+returns.
 
 `CompleteMultipartUpload` latches the session to `completing`, which stops
 new parts, and waits, up to 30 s (`acceptWaitBudget`), until none of the parts
@@ -241,10 +246,9 @@ acceptor's passes. Parts the upload holds and the request omits are not
 waited for; it stops early when the acceptor's last pass failed. It then
 reads the parts it was asked to commit. A `written` part is concluded by
 Complete itself. A blob of it with neither a park nor a location is looked
-for again under the blob's lock, since the part's UploadPart may still be
-parking it, and otherwise has gone from its provider: nothing keeps a part's
-bytes to upload them again, so Complete answers `InvalidPart` and the client
-uploads the part again. Every part blob streams to its provider as the part
+for once more under the blob's lock, and otherwise has gone from its
+provider: nothing keeps a part's bytes to upload them again, so Complete
+answers `InvalidPart` and the client uploads the part again. Every part blob streams to its provider as the part
 arrives, and an UploadPart whose blob does not stream fails. A part
 still `parked` means the acceptor is behind or failing, and Complete answers
 OperationAborted, a 409; the latch reverts to `open` and the acceptor
@@ -260,8 +264,9 @@ superseded part, the parts a Complete omitted) queues a
 `queue-space-shard.release` task, due at once, for each blob of the session
 that is not still live in it *before* it deletes the session row. Whether
 the blob is in fact free to go is decided when the release runs, never at
-teardown: a release of a digest claimed by a committed object does nothing,
-and one a part of an in-flight session still references waits. Deciding at
+teardown: a release of a digest the space still references (a committed
+object's claim, a write's pending reference, a part of an in-flight session)
+does nothing. Deciding at
 teardown would race another teardown sharing the blob. A committed blob is
 recognisable for good: its first reference claim marks its upload intent
 `published` in the same transaction, so the reap of a retained session,
@@ -294,9 +299,9 @@ and upload intent rows are deleted by writes committed with the task's
 outcome, so a retry sees the same state. The cached copy is removed through
 a `queue-shard.evict` task, unless another space still holds an intent for
 the digest.
-A release whose digest a part of an in-flight session still references
-waits: that session's Complete turns the reference into a claim, which
-makes the release stale, and its abort queues a release of its own.
+A release whose digest a part of an in-flight session still references is
+stale: that session's Complete turns the part's reference into a claim, and
+its teardown queues a release of its own.
 
 ## Local blob storage
 
@@ -432,47 +437,76 @@ blob, each holding its own claim, and two buckets of different spaces can
 hold one digest. Every blob table is therefore keyed by `(space, digest)`,
 the upload intent and the park included: each space uploads, parks, claims
 and releases its own copy, and the one cached file between them goes with
-the last intent for it. Within a space, a write of bytes whose previous object
-was deleted meets that object's `queue-space-shard.release` task. Its
-subject is the space and the digest, and the task's lease serializes it
-with every other task on that subject. A
-write about to reuse the blob cancels a pending release (its own commit
-would have made it stale) or waits out a running one, within 30 s, and then
-uploads afresh; past that bound it fails with SlowDown for the client to
-retry. A multipart part write waits out a running release the same way but
-leaves a pending one standing, since its part row defers that release for
-as long as the row stands. The write settles the release
-before every upload, park or conclude, located or not, since a release can
-have dropped the location already, or be removing a blob that never had
-one; a streamed blob settles at its conclude and, after a waited-out
-release, is concluded under its own allocation rather than reusing the
-location. A commit
-claiming the blob cancels a release queued after the settle in the commit's
-own transaction, and refuses the claim while one runs
-(`registry.ErrReleaseInProgress`); the write fails with SlowDown for the
-client to retry. A write marks each blob it has sent, in memory by space
-and digest (`Backend.writing`), until it records the blob as parked or
-accepted. A release of the same space and digest defers while the mark
-stands, since the write's intent would otherwise go with the release's
-rows. A release runs only as a task: Complete
-leaves an orphan whose release it failed to queue to the reap. A release
-that finds a claim on its blob is stale and does nothing. Writes of one
-digest to one space take turns at the
-upload within a process (`Backend.blobKeys`), so the second finds the first's
+the last intent for it.
+
+**References.** Within a space, a write's use of a blob is a pending
+reference (`s3frontend/shardref.go`), taken by a sync
+`queue-space-shard.add` task on the blob's release subject, the space and
+the digest. The subject's lease serializes the add with the blob's
+`queue-space-shard.release`, so the two never overlap. The add also takes
+the in-process write lock on the space and digest (`Backend.blobKeys`),
+under which Complete and the acceptor conclude parks. It runs in one of
+three modes. For an object blob (`streamed`) it concludes the stream's
+allocation (`ConcludeBlobs`) and records the blob's location and upload
+intent, unless the space has the blob located already, in which case the
+allocation is aborted and the blob reused. For a part blob (`part`) it
+records the park, unless the space has the blob parked or located already.
+For a same-space CopyObject (`copy`) it sends nothing, and fails the copy
+with NoSuchKey unless the space has the blob located. The add records the
+blob's upload intent itself. The stream's allocation reaches the add through
+the request context, never the task's stored arguments, since its put
+invocation embeds derived signer keys. The add writes the reference to
+`blob_pending_refs` and submits a `queue-space-shard.expire` due 24 hours
+later (`pendingRefTTL`, about when the provider expires an allocation that
+is never concluded), both in its own commit. An add waits at most 30 s
+(`addWaitLimit`) for a release ahead of it; past that the request fails with
+SlowDown for the client to retry.
+
+The row the write records takes its references over. A PutObject's or
+CopyObject's commit claims each blob with the add's task ID
+(`BlobClaim.Ref`): in the root swap's transaction the pending reference is
+deleted, its expiry cancelled, and the `blob_refs` claim inserted. A
+reference that has expired fails the commit with
+`registry.ErrReferenceExpired`, and the client gets SlowDown. UploadPart
+runs its blobs' adds before it writes the part row, and `PutPart` takes
+their references over in its transaction (`MultipartPart.Refs`); a PutPart
+that fails expires the write's references at once and runs the releases they
+leave (`dropRefsNow`). Complete's claims carry no reference: the session's
+parts reference the blobs until its teardown. Any other write that fails
+before its commit leaves its references to expire. A
+`queue-space-shard.expire` drops its reference if it still stands and, if
+the space then holds no other reference to the digest, queues the blob's
+release due at once: a blob nothing claimed was never readable, so no
+reader grace is owed. It retries without limit, backing off from 1 s to
+5 min.
+
+A space's references to a digest are its claims, its pending references and
+the parts of its open or completing multipart sessions, counted in one
+statement (`registry.CountReferences`), so a row that takes another's
+reference over in one transaction is counted before or after the move, and
+never missed. A release that finds any reference is stale and does nothing.
+Each way a reference goes queues a release again: the drop of the last
+claim, an expiry, a superseded part, a session's teardown. A release that
+fails retries holding the subject (`RetryPolicy.HoldsSubject`), so an add
+queued behind it waits: a failed attempt may already have removed the blob,
+and the add then finds it unlocated and concludes its own stream (a space
+can take a digest again once `/blob/remove` has its receipt). Every reference enters
+through an add on the subject, so a release that may have acted never finds
+one afterwards. A release runs only as a task: Complete leaves an orphan
+whose release it failed to queue to the reap.
+
+In a plaintext bucket, a write of a deleted object's bytes while that
+object's release is still within its reader grace keeps the blob: the
+write's add takes a reference, and the release is stale when it runs. If the
+release is already due when the write arrives, the write's add runs it
+first and then concludes its own stream. A same-space copy whose source is
+deleted and released between its adds and its commit still commits, since
+its references keep the blobs. Writes of one digest to one space take turns
+within a process (`Backend.blobKeys`), so the second finds the first's
 location or park; across instances a park already recorded wins, and the
 loser gives up its allocation. A release leaves the cached file while
-another space still holds an intent for the digest; a file that two
-spaces' releases at once both leave is reclaimed by the cache's time to
-live. The streamed paths follow the
-same rule as the rest: a streamed blob concludes, or a streamed part is
-recorded, under the key lock, after a settle and a look at the rows, and
-a location or park another write recorded meanwhile makes the stream
-surplus, given up and reused. The last guard is the claim itself: a
-committed body blob is located by its commit, so the root swap refuses,
-in its transaction, a claim on a digest the space has no location
-for (`registry.RootCommit.Claims`), which is
-one whose release ran to completion between the write's settle and its
-commit; the write fails with SlowDown for the client to retry.
+another space still holds an intent for the digest; a file that two spaces'
+releases at once both leave is reclaimed by the cache's time to live.
 
 ## Identity & auth
 
@@ -516,7 +550,8 @@ draws the chains and the stores.
 
 - **Postgres (`ingot` schema)** is the mutable index: per-bucket roots,
   versioning state and owning tenant, segment metadata and op-roots, the blob claim ledger
-  (`blob_refs`), locations and inclusions, upload intents, multipart
+  (`blob_refs`), the writes' pending references (`blob_pending_refs`),
+  locations and inclusions, upload intents, multipart
   sessions/parts/parks, and GC candidates. goose tracks its version at
   `ingot.goose_db_version` (never collides with a host's own migrations).
 - **The MST is the data**: immutable, content-addressed, self-verifying,
@@ -534,10 +569,13 @@ draws the chains and the stores.
   `local_blob_max_bytes` set, the sweeper evicts cached blobs down to the
   budget. A delete frees its blobs' cached copies once their release runs,
   and a multipart part keeps none.
-- **Crash recovery is not built**: reconciling `upload_intents`
-  against `blob_refs` after a crash between a blob's upload and its commit
-  is a later phase; the window leaks rather than loses referenced data. A
-  failed upload's intent stays `uploading`. It holds no local bytes (a
+- **Crash recovery is not built**: a write that dies after its
+  `queue-space-shard.add` tasks commit leaves pending references, which
+  expire after 24 hours and release the blobs, but one that dies inside an
+  add, after the conclude and before the add's commit, leaves an accepted
+  blob with no reference. Reconciling `upload_intents` against the
+  references after such a crash is a later phase; the window leaks rather
+  than loses referenced data. A failed upload's intent stays `uploading`. It holds no local bytes (a
   crashed write's unfinished `.tmp-*` file goes at startup or in the
   sweeper's orphan pass), and the provider expires an allocation that is
   never concluded. The sweeper sums those intents each run, counting one
