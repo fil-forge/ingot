@@ -23,8 +23,8 @@ func (b *Backend) resolveTagTarget(ctx context.Context, bucketName, key, version
 
 // mutateVersionTags runs a per-version state write for the tagging methods:
 // mutateVersionState with no bucket gate.
-func (b *Backend) mutateVersionTags(ctx context.Context, bucketName, key, versionID string, mutate func(*msbucket.VersionState)) error {
-	return b.mutateVersionState(ctx, bucketName, key, versionID, false, mutate)
+func (b *Backend) mutateVersionTags(ctx context.Context, bucketName, key, versionID string, tags map[string]string) error {
+	return b.mutateVersionState(ctx, bucketName, key, &SetAttributesChange{VersionID: versionID, SetTags: true, Tags: tags})
 }
 
 // applyTagsIfPresent merges a creation-time tag set into a version's initial
@@ -68,15 +68,11 @@ func (b *Backend) PutObjectTagging(ctx context.Context, bucket, object, versionI
 	if len(tags) == 0 {
 		tags = nil
 	}
-	return b.mutateVersionTags(ctx, bucket, object, versionId, func(vs *msbucket.VersionState) {
-		vs.Tags = tags
-	})
+	return b.mutateVersionTags(ctx, bucket, object, versionId, tags)
 }
 
 // DeleteObjectTagging clears the resolved version's tag set. Idempotent: a
 // version without tags is a success no-op.
 func (b *Backend) DeleteObjectTagging(ctx context.Context, bucket, object, versionId string) error {
-	return b.mutateVersionTags(ctx, bucket, object, versionId, func(vs *msbucket.VersionState) {
-		vs.Tags = nil
-	})
+	return b.mutateVersionTags(ctx, bucket, object, versionId, nil)
 }

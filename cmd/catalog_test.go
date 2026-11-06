@@ -59,7 +59,8 @@ func cborBlock(t *testing.T, name string, links ...cid.Cid) block.Block {
 // directory whose bucket is gone is left out.
 func TestCatalogUsage(t *testing.T) {
 	ctx := context.Background()
-	mem := registry.NewPostgres(pgtest.New(t))
+	pool := pgtest.New(t)
+	mem := registry.NewPostgres(pool)
 	space, err := did.Parse("did:web:catalog-usage.example")
 	if err != nil {
 		t.Fatal(err)
@@ -89,12 +90,15 @@ func TestCatalogUsage(t *testing.T) {
 	if _, err := s.AppendBatch(ctx, []block.Block{x, r1, r2}, blockstore.OpRoot{Bucket: "bk", Root: r2.Cid()}); err != nil {
 		t.Fatalf("append: %v", err)
 	}
-	if err := mem.CASRoot(ctx, "bk", cid.Undef, r2.Cid()); err != nil {
-		t.Fatalf("CASRoot: %v", err)
+	// The bucket's root, as a commit of r2 leaves it.
+	if _, err := pool.Exec(ctx, `UPDATE ingot.buckets SET root_cid = $1 WHERE name = 'bk'`, r2.Cid().Bytes()); err != nil {
+		t.Fatalf("set root: %v", err)
 	}
 	var shipped registry.CatalogUsage
 	deadline := time.Now().Add(5 * time.Second)
 	for {
+		// The segment seals on age; a ship runs it, as queue-bucket.ship would.
+		_ = s.Ship(ctx)
 		usage, err := mem.CatalogUsage(ctx)
 		if err != nil {
 			t.Fatalf("CatalogUsage: %v", err)

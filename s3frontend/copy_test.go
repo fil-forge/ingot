@@ -15,8 +15,10 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 
+	uploadcmds "github.com/fil-forge/libforge/commands/upload"
 	"github.com/fil-forge/libforge/testutil"
 	"github.com/fil-forge/ucantone/did"
+	"github.com/fil-forge/ucantone/ucan"
 	"github.com/fil-forge/versitygw/backend"
 	"github.com/fil-forge/versitygw/s3err"
 	"github.com/fil-forge/versitygw/s3response"
@@ -24,6 +26,7 @@ import (
 	msbucket "github.com/fil-forge/ingot/bucket"
 	"github.com/fil-forge/ingot/internal/testfakes"
 	"github.com/fil-forge/ingot/registry"
+	"github.com/fil-forge/ingot/uploader"
 )
 
 // Every failed copy-source precondition is a 412, including the two the
@@ -246,22 +249,21 @@ func TestCopyObject_CrossSpaceReingest(t *testing.T) {
 	}
 }
 
-// hookAllocSeq is a bucket registry that runs hook once, at the named
-// bucket's next version-seq allocation: the first step of a commit, inside
-// the destination bucket's lock, after the copy has resolved its source.
-type hookAllocSeq struct {
-	registry.Registry
-	bucket string
-	hook   func()
+// hookCommitCapture is an upload registrar that runs hook once, at the next
+// capture of /upload/add authority: the request's last step before it runs
+// its commit, after a copy has resolved its source and taken its references.
+type hookCommitCapture struct {
+	uploader.UploadRegistrar
+	hook func()
 }
 
-func (h *hookAllocSeq) AllocVersionSeq(ctx context.Context, name string) (uint64, error) {
-	if name == h.bucket && h.hook != nil {
+func (h *hookCommitCapture) CaptureAuthority(ctx context.Context, space did.DID, cmd ucan.Command) ([]byte, error) {
+	if cmd == uploadcmds.Add.Command && h.hook != nil {
 		hook := h.hook
 		h.hook = nil
 		hook()
 	}
-	return h.Registry.AllocVersionSeq(ctx, name)
+	return h.UploadRegistrar.CaptureAuthority(ctx, space, cmd)
 }
 
 // TestCopyObject_PinnedSourceDeletedBeforeCommitKeepsItsBlobs: a same-space
@@ -271,11 +273,11 @@ func (h *hookAllocSeq) AllocVersionSeq(ctx context.Context, name string) (uint64
 // copy commits over blobs its provider still holds.
 func TestCopyObject_PinnedSourceDeletedBeforeCommitKeepsItsBlobs(t *testing.T) {
 	rm := &recordingRemover{}
-	reg := &hookAllocSeq{bucket: "dst"}
+	reg := &hookCommitCapture{}
 	var b *Backend
 	b, mem := newDeferredBackend(t, testfakes.NopUploader{}, func(d *Deps) {
-		reg.Registry = d.Registry
-		d.Registry = reg
+		reg.UploadRegistrar = d.Registrar
+		d.Registrar = reg
 		d.Remover = rm
 	})
 	ctx := context.Background()
@@ -440,7 +442,7 @@ func TestCopyObject_SourceWithoutChecksumGetsDefault(t *testing.T) {
 		t.Fatal(err)
 	}
 	legacy := &msbucket.ObjectManifest{Key: "legacy", Created: time.Now().Unix(), Body: body, ETag: hex.EncodeToString(body.MD5), ContentType: "application/octet-stream"}
-	if _, _, err := b.commitVersion(ctx, st, "legacy", legacy, blobs, nil, refs, nil); err != nil {
+	if err := commitPut(ctx, b, st, "legacy", legacy, blobs, refs); err != nil {
 		t.Fatal(err)
 	}
 
@@ -468,7 +470,7 @@ func TestCopyObject_SourceOverCopyLimit(t *testing.T) {
 	}
 	huge := &msbucket.ObjectManifest{Key: "huge", Created: time.Now().Unix(), Body: msbucket.Body{Size: maxCopySize + 1}, ETag: "00000000000000000000000000000000"}
 	// No blobs: an empty list, so the commit has nothing to read or claim.
-	if _, _, err := b.commitVersion(ctx, st, "huge", huge, msbucket.BlobRefs{}, nil, nil, nil); err != nil {
+	if err := commitPut(ctx, b, st, "huge", huge, msbucket.BlobRefs{}, nil); err != nil {
 		t.Fatal(err)
 	}
 	bucket, key, source := "bk", "copied", "bk/huge"

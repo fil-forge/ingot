@@ -150,7 +150,8 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 	}
 
 	// Bucket must exist before we upload, so a PUT to a missing bucket
-	// doesn't waste an upload. WithTx re-checks under the per-bucket lock.
+	// doesn't waste an upload. The commit finds it again on the bucket's
+	// subject.
 	bucketState, err := b.reg.Get(ctx, bucketName)
 	if err != nil {
 		if errors.Is(err, registry.ErrNotFound) {
@@ -177,9 +178,9 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 	// AES256 of (sse.go).
 	plaintext := storesPlaintext(bucketState, sse)
 
-	// PRECONDITIONS (no lock): If-Match / If-None-Match. Evaluated here to fail
-	// fast before ingest, then RE-CHECKED under the per-bucket lock at commit so
-	// a concurrent writer can't slip between this read and the swap (§3).
+	// PRECONDITIONS: If-Match / If-None-Match. Evaluated here to fail fast
+	// before ingest, then RE-CHECKED by the commit on the bucket's subject so
+	// a concurrent writer can't slip between this read and the commit (§3).
 	if input.IfMatch != nil || input.IfNoneMatch != nil {
 		etag, exists, err := b.currentObjectETag(ctx, bucketName, key)
 		if err != nil {
@@ -244,9 +245,11 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 		ckAlgo, ckVal = string(spec.algo), hr.Sum()
 	}
 
-	// COMMIT (short per-bucket critical section): the §5 write rule — seq
-	// allocation, manifest + rebuilt leaf + MST splice + guarded root swap
-	// carrying the reference-index claims and drops (docs/s3-versioning.md).
+	// COMMIT, on the bucket's subject: the §5 write rule — seq allocation,
+	// manifest + rebuilt leaf + MST splice + the root's advance carrying the
+	// reference-index claims and drops (docs/s3-versioning.md). If-Match and
+	// If-None-Match are checked there, against the version the put would
+	// supersede.
 	mf := &msbucket.ObjectManifest{
 		Key:                     key,
 		ContentType:             contentType,
@@ -265,15 +268,14 @@ func (b *Backend) PutObject(ctx context.Context, input s3response.PutObjectInput
 		Metadata:                input.Metadata,
 		Plaintext:               plaintext,
 	}
-	node, effState, err := b.commitVersion(ctx, bucketState, key, mf, blobs, initState, refs, func(superseded *msbucket.ObjectManifest) error {
-		// Race-safe re-check of If-Match / If-None-Match under the lock. A
-		// delete-marker current means "no object" for precondition purposes.
-		oldETag, oldExists := "", false
-		if superseded != nil && !superseded.DeleteMarker {
-			oldETag, oldExists = etagOf(superseded), true
-		}
-		return backend.EvaluateObjectPutPreconditions(oldETag, input.IfMatch, input.IfNoneMatch, oldExists)
-	})
+	put := &PutChange{Manifest: mf, HasBlobs: blobs != nil, Blobs: blobs, Refs: blobRefTasks(refs), InitState: initState}
+	if input.IfMatch != nil {
+		put.HasIfMatch, put.IfMatch = true, *input.IfMatch
+	}
+	if input.IfNoneMatch != nil {
+		put.HasIfNoneMatch, put.IfNoneMatch = true, *input.IfNoneMatch
+	}
+	node, effState, err := b.commitOne(ctx, bucketState, KeyChange{Key: key, Put: put}, "commit version")
 	if err != nil {
 		return s3response.PutObjectOutput{}, err
 	}
@@ -494,7 +496,7 @@ func (b *Backend) concludeBody(ctx context.Context, bucket string, space did.DID
 
 // The reference index (blob_refs) is written by the commit: a version's
 // claims on its body digests land, and the discarded versions' claims drop,
-// in the root swap's transaction (bucketop.Tx.Commit, registry.CommitRoot).
+// with the root's advance (registry.Registry.RootCommitWrites).
 // The diff is the crux of safe dedup + delete:
 //
 //   - a digest in new but not old gains a claim (newly referenced);
@@ -520,8 +522,7 @@ func claimVersionID(versionID string, seq uint64) string {
 }
 
 // addClaims records one claim per DEDUPLICATED digest for a new generation,
-// for the commit to carry (bucketop.Tx.Commit writes them in the root swap's
-// transaction). Each claim takes over the write's pending reference to its
+// for the commit to carry with the root's advance. Each claim takes over the write's pending reference to its
 // blob, from refs by string(digest), so a release of the blob, which counts
 // the reference or the claim, never finds neither. A digest with no
 // reference is a Complete's, whose session's parts reference it until the
@@ -535,10 +536,10 @@ func (b *Backend) addClaims(tx *bucketop.Tx, st *registry.State, key, claimID st
 }
 
 // dropClaims records a superseded/deleted generation's claims for the commit
-// to drop, in the root swap's transaction; the drop of a space's last claim
+// to drop with the root's advance; the drop of a space's last claim
 // on a digest queues the blob's release, due the release grace after the
 // commit.
-func (b *Backend) dropClaims(ctx context.Context, tx *bucketop.Tx, st *registry.State, key, claimID string, digests []multihash.Multihash) {
+func (b *Backend) dropClaims(sc *commitScope, st *registry.State, key, claimID string, digests []multihash.Multihash) {
 	if len(digests) == 0 {
 		return
 	}
@@ -546,7 +547,7 @@ func (b *Backend) dropClaims(ctx context.Context, tx *bucketop.Tx, st *registry.
 	for _, d := range digestSet(digests) {
 		drops = append(drops, registry.ClaimDrop{Digest: d, Bucket: st.Name, ObjectKey: key, VersionID: claimID, Space: st.Space})
 	}
-	tx.DropClaims(drops, b.releaseGrace, b.releaseAuthority(ctx, st.Space))
+	sc.tx.DropClaims(drops, b.releaseGrace, sc.args.Release)
 }
 
 // bodyDigests returns the digests of a stored body's blobs in order, loading
@@ -1080,80 +1081,54 @@ func (b *Backend) DeleteObject(ctx context.Context, input *s3.DeleteObjectInput)
 		return nil, fmt.Errorf("s3frontend: delete object: %w", err)
 	}
 	key := *input.Key
-	preconds := &backend.ObjectDeletePreconditions{
+	pre := deletePreconditions(&backend.ObjectDeletePreconditions{
 		IfMatch:            input.IfMatch,
 		IfMatchLastModTime: input.IfMatchLastModifiedTime,
 		IfMatchSize:        input.IfMatchSize,
+	})
+	versionID := backend.GetStringFromPtr(input.VersionId)
+	res, versioning, err := b.commitOne(ctx, bucketState, KeyChange{Key: key, Delete: &DeleteChange{VersionID: versionID, Pre: pre}}, "delete")
+	if err != nil {
+		return nil, err
 	}
-	versioned := bucketState.Versioning.Configured()
-
-	// Version-scoped: permanently remove that one version.
-	if versionID := backend.GetStringFromPtr(input.VersionId); versionID != "" {
-		res, err := b.deleteVersionScoped(ctx, bucketState, key, versionID, preconds)
-		if err != nil {
-			return nil, err
-		}
-		out := &s3.DeleteObjectOutput{}
-		// Gate on the state read under the commit lock, not the snapshot above.
-		if res.versioning.Configured() {
+	out := &s3.DeleteObjectOutput{}
+	switch {
+	case versionID != "":
+		// Version-scoped: that one version is gone. The response gates on
+		// the versioning state the commit ran under.
+		if versioning.Configured() {
 			vid := versionID
 			out.VersionId = &vid
-			if res.wasMarker {
+			if res.DeleteMarker {
 				marker := true
 				out.DeleteMarker = &marker
 			}
 		}
-		return out, nil
+	case versioning.Configured():
+		// Versioned: the delete added a marker.
+		marker := true
+		out.DeleteMarker, out.VersionId = &marker, &res.VersionID
 	}
-
-	// Unversioned: permanent delete.
-	if !versioned {
-		if err := b.deleteObjectKey(ctx, bucketState, key, preconds); err != nil {
-			return nil, err
-		}
-		return &s3.DeleteObjectOutput{}, nil
-	}
-
-	// Versioned: insert a delete marker via the write rule.
-	node, err := b.insertDeleteMarker(ctx, bucketState, key, preconds)
-	if err != nil {
-		return nil, err
-	}
-	marker := true
-	return &s3.DeleteObjectOutput{DeleteMarker: &marker, VersionId: &node.VersionID}, nil
+	return out, nil
 }
 
-// insertDeleteMarker writes a delete-marker version for key via the §5 write
-// rule: a manifest with DeleteMarker set, a zero Body, and no claims. Under
-// Enabled it is a numbered version; under Suspended it is the null version
-// (replacing any existing null). S3 inserts a marker even when the key does
-// not exist.
-func (b *Backend) insertDeleteMarker(ctx context.Context, bucketState *registry.State, key string, preconds *backend.ObjectDeletePreconditions) (msbucket.VersionNode, error) {
-	mf := &msbucket.ObjectManifest{
-		Key:          key,
-		Created:      time.Now().Unix(),
-		DeleteMarker: true,
-	}
-	node, _, err := b.commitVersion(ctx, bucketState, key, mf, nil, nil, nil, func(superseded *msbucket.ObjectManifest) error {
-		if preconds == nil || superseded == nil || superseded.DeleteMarker {
-			return nil
-		}
-		return backend.EvaluateObjectDeletePreconditions(etagOf(superseded), time.Unix(superseded.Created, 0), superseded.Body.Size, *preconds)
-	})
-	return node, err
-}
-
-// deleteObjectKey permanently removes one key — the unversioned bucket's
+// applyDeleteKey permanently removes one key — the unversioned bucket's
 // delete: it drops the key's value (its manifest; a leaf never occurs
 // on a purely-unversioned bucket, but is handled for completeness) and
 // releases the (single, null) version's body blobs through the reference
 // index. Missing keys (and an empty bucket) are idempotent no-ops. preconds,
 // when non-nil, gates the delete on If-Match / size / mod-time under the
 // lock. Shared by DeleteObject and DeleteObjects.
-func (b *Backend) deleteObjectKey(ctx context.Context, bucketState *registry.State, key string, preconds *backend.ObjectDeletePreconditions) error {
-	err := b.txns.WithTx(ctx, bucketState.Name, func(ctx context.Context, tx *bucketop.Tx) (cid.Cid, error) {
-		// Empty bucket: nothing to delete. Returning cid.Undef tells WithTx to
-		// discard with no commit — the equivalent of "no-op success."
+func (b *Backend) applyDeleteKey(ctx context.Context, sc *commitScope, key string, pre *DeletePreconditions) (cid.Cid, error) {
+	var preconds *backend.ObjectDeletePreconditions
+	if pre != nil {
+		p := pre.preconditions()
+		preconds = &p
+	}
+	tx := sc.tx
+	return func() (cid.Cid, error) {
+		// Empty bucket: nothing to delete. Returning cid.Undef leaves the
+		// root as it is — the equivalent of "no-op success."
 		if !tx.State().Root.Defined() {
 			return cid.Undef, nil
 		}
@@ -1185,8 +1160,8 @@ func (b *Backend) deleteObjectKey(ctx context.Context, bucketState *registry.Sta
 			oldManifest = val.Leaf.Current.Manifest
 		}
 
-		// Preconditions (If-Match / size / mod-time) under the lock against the
-		// version being removed.
+		// Preconditions (If-Match / size / mod-time) against the version
+		// being removed.
 		if preconds != nil {
 			if err := backend.EvaluateObjectDeletePreconditions(etagOf(oldMf), time.Unix(oldMf.Created, 0), oldMf.Body.Size, *preconds); err != nil {
 				return cid.Undef, err
@@ -1201,13 +1176,9 @@ func (b *Backend) deleteObjectKey(ctx context.Context, bucketState *registry.Sta
 		// covers it; a leaf key contributes the leaf block and its current
 		// manifest.
 		if val.Leaf != nil {
-			if err := b.gc.AddGCCandidate(ctx, val.Leaf.Current.Manifest.Bytes(), bucketState.Name); err != nil {
-				return cid.Undef, fmt.Errorf("gc candidate: %w", err)
-			}
+			tx.AddGCCandidate(val.Leaf.Current.Manifest)
 		}
-		if err := b.gc.AddGCCandidate(ctx, valCid.Bytes(), bucketState.Name); err != nil {
-			return cid.Undef, fmt.Errorf("gc candidate: %w", err)
-		}
+		tx.AddGCCandidate(valCid)
 		oldDigests, err := bodyDigests(ctx, tx, tx.State().Space, oldMf.Body)
 		if err != nil {
 			return cid.Undef, err
@@ -1218,15 +1189,11 @@ func (b *Backend) deleteObjectKey(ctx context.Context, bucketState *registry.Sta
 		if oldVersionID == "" {
 			oldVersionID = registry.NullVersionID
 		}
-		b.dropClaims(ctx, tx, tx.State(), key, claimVersionID(oldVersionID, oldMf.Seq), oldDigests)
+		b.dropClaims(sc, tx.State(), key, claimVersionID(oldVersionID, oldMf.Seq), oldDigests)
 		// The key is gone, so the space stops counting it.
-		b.enqueueRegistration(ctx, tx, tx.State(), key, oldManifest, registry.UploadRegistrationRemove)
+		b.register(sc, tx.State(), key, oldManifest, registry.UploadRegistrationRemove)
 		return t2.GetPointer(ctx, tx)
-	})
-	if err != nil {
-		return mapCommitError(err, "delete")
-	}
-	return nil
+	}()
 }
 
 // DeleteObjects deletes up to 1000 keys in one request, best-effort (not
@@ -1258,76 +1225,84 @@ func (b *Backend) DeleteObjects(ctx context.Context, input *s3.DeleteObjectsInpu
 		return s3response.DeleteResult{}, fmt.Errorf("s3frontend: delete objects: %w", err)
 	}
 
-	versioned := bucketState.Versioning.Configured()
 	quiet := input.Delete.Quiet != nil && *input.Delete.Quiet
-	var res s3response.DeleteResult
+	// Every key the request may delete goes into one commit, which decides
+	// each against the bucket's state there: up to 1,000 deletes cost one
+	// fsync and one root advance. A key refused here, or by the commit on its
+	// own terms, fails alone.
+	type entryOf struct {
+		key, versionID string
+		err            error
+		change         int // index into changes, or -1
+	}
+	var entries []entryOf
+	var changes []KeyChange
 	for _, obj := range input.Delete.Objects {
 		if obj.Key == nil {
 			continue
 		}
-		key := *obj.Key
-		versionID := backend.GetStringFromPtr(obj.VersionId)
-		entry := types.DeletedObject{Key: &key}
-		var derr error
-		if versionID != "" && !reqscope.Permits(ctx, bucketState.Space, deleteObjectVersionAction) {
-			derr = s3err.GetAPIError(s3err.ErrAccessDenied)
+		e := entryOf{key: *obj.Key, versionID: backend.GetStringFromPtr(obj.VersionId), change: -1}
+		if e.versionID != "" && !reqscope.Permits(ctx, bucketState.Space, deleteObjectVersionAction) {
+			e.err = s3err.GetAPIError(s3err.ErrAccessDenied)
+		} else {
+			d := &DeleteChange{VersionID: e.versionID}
+			// Per-key ETag precondition (conditional delete): the object is
+			// removed only if its current version's ETag matches; otherwise
+			// the entry fails with PreconditionFailed, matching AWS.
+			if obj.ETag != nil && e.versionID == "" {
+				d.HasETag, d.ETag = true, *obj.ETag
+			}
+			e.change = len(changes)
+			changes = append(changes, KeyChange{Key: e.key, Delete: d})
 		}
-		// Per-key ETag precondition (conditional delete): the object is removed
-		// only if its current version's ETag matches; otherwise the entry fails
-		// with PreconditionFailed, matching AWS. Applies to the current version.
-		if obj.ETag != nil && versionID == "" {
-			etag, exists, cerr := b.currentObjectETag(ctx, bucketName, key)
-			switch {
-			case cerr != nil:
-				derr = cerr
-			case !exists || !etagsEqual(*obj.ETag, etag):
-				derr = s3err.GetAPIError(s3err.ErrPreconditionFailed)
+		entries = append(entries, e)
+	}
+	var outcome commitOutcome
+	if len(changes) > 0 {
+		if outcome, err = b.commit(ctx, bucketState, changes...); err != nil {
+			return s3response.DeleteResult{}, err
+		}
+	}
+	var res s3response.DeleteResult
+	for _, e := range entries {
+		key, versionID := e.key, e.versionID
+		var cr ChangeResult
+		if e.change >= 0 {
+			cr = outcome.results[e.change]
+			if cr.Err != nil {
+				e.err = mapCommitError(cr.Err.err(), "delete")
 			}
 		}
-		if derr != nil {
-			k := key
-			code, msg := deleteErrorFields(derr)
-			res.Error = append(res.Error, types.Error{Key: &k, Code: &code, Message: &msg})
+		if e.err != nil {
+			code, msg := deleteErrorFields(e.err)
+			er := types.Error{Key: &key, Code: &code, Message: &msg}
+			if versionID != "" && e.change >= 0 {
+				vid := versionID
+				er.VersionId = &vid
+			}
+			res.Error = append(res.Error, er)
 			continue
 		}
+		entry := types.DeletedObject{Key: &key}
 		switch {
 		case versionID != "":
-			// Version-scoped: permanently remove that one version. DeleteMarker
+			// Version-scoped: that one version is gone for good. DeleteMarker
 			// is set explicitly either way — upstream conformance expects an
 			// explicit false for a non-marker version delete.
-			var sres scopedDeleteResult
-			sres, derr = b.deleteVersionScoped(ctx, bucketState, key, versionID, nil)
-			if derr == nil && sres.versioning.Configured() {
+			if outcome.versioning.Configured() {
 				vid := versionID
 				entry.VersionId = &vid
-				dm := sres.wasMarker
+				dm := cr.DeleteMarker
 				entry.DeleteMarker = &dm
-				if sres.wasMarker {
+				if cr.DeleteMarker {
 					entry.DeleteMarkerVersionId = &vid
 				}
 			}
-		case versioned:
-			// Insert a delete marker via the write rule.
-			var node msbucket.VersionNode
-			node, derr = b.insertDeleteMarker(ctx, bucketState, key, nil)
-			if derr == nil {
-				marker := true
-				entry.DeleteMarker = &marker
-				entry.DeleteMarkerVersionId = &node.VersionID
-			}
-		default:
-			derr = b.deleteObjectKey(ctx, bucketState, key, nil)
-		}
-		if derr != nil {
-			k := key
-			code, msg := deleteErrorFields(derr)
-			e := types.Error{Key: &k, Code: &code, Message: &msg}
-			if versionID != "" {
-				vid := versionID
-				e.VersionId = &vid
-			}
-			res.Error = append(res.Error, e)
-			continue
+		case outcome.versioning.Configured():
+			marker := true
+			vid := cr.VersionID
+			entry.DeleteMarker = &marker
+			entry.DeleteMarkerVersionId = &vid
 		}
 		if !quiet {
 			res.Deleted = append(res.Deleted, entry)

@@ -106,11 +106,10 @@ func TestPutObjectSpans(t *testing.T) {
 
 	requireAttr(t, tree.one("blob.upload"), attribute.String("ingot.blob.result", "streamed"))
 
-	tx := tree.one("bucket.tx")
-	tree.requireChild(tx, tree.one("bucket.lock"))
 	commit := tree.one("bucket.commit")
-	tree.requireChild(tx, commit)
-	tree.requireChild(commit, tree.one("log.append"))
+	appended := tree.one("bucket.append")
+	tree.requireChild(commit, appended)
+	tree.requireChild(appended, tree.one("log.append"))
 }
 
 func TestReadSpans(t *testing.T) {

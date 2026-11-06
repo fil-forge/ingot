@@ -39,6 +39,7 @@ type Manager struct {
 	meta     Meta
 	catalog  PlaneConfig
 	flushFor func(bucket string) FlushFunc
+	onSealed func(bucket string)
 	logger   *zap.Logger
 
 	mu     sync.Mutex
@@ -68,6 +69,11 @@ type ManagerConfig struct {
 	// Catalog.Ship is true; ignored otherwise.
 	FlushFor func(bucket string) FlushFunc
 
+	// OnSealed is told when a bucket's log has a sealed segment to ship
+	// (PlaneConfig.OnSealed); the owner then calls ShipBucket. Ignored when
+	// Catalog.Ship is false.
+	OnSealed func(bucket string)
+
 	// Logger is optional; defaults to zap.NewNop().
 	Logger *zap.Logger
 }
@@ -75,11 +81,11 @@ type ManagerConfig struct {
 // OpenManager initializes the per-bucket log root and re-opens every bucket
 // that left segments behind — the union of on-disk bucket directories,
 // buckets with segment rows and buckets with journaled catalog blocks — so
-// unshipped sealed segments re-enqueue, and segments whose files are gone
-// are rebuilt from the journal, at startup instead of at the bucket's next
-// write. Before any of that it moves the segment seq allocator past every
-// seq on disk: Meta restored from a point behind the disk would otherwise
-// hand out a seq a segment file already holds.
+// unshipped sealed segments are reported to ship (OnSealed), and segments
+// whose files are gone are rebuilt from the journal, at startup instead of at
+// the bucket's next write. Before any of that it moves the segment seq
+// allocator past every seq on disk: Meta restored from a point behind the
+// disk would otherwise hand out a seq a segment file already holds.
 func OpenManager(ctx context.Context, cfg ManagerConfig) (*Manager, error) {
 	if cfg.Dir == "" {
 		return nil, errors.New("logstore: manager: Dir is required")
@@ -102,6 +108,7 @@ func OpenManager(ctx context.Context, cfg ManagerConfig) (*Manager, error) {
 		meta:     cfg.Meta,
 		catalog:  cfg.Catalog,
 		flushFor: cfg.FlushFor,
+		onSealed: cfg.OnSealed,
 		logger:   cfg.Logger,
 		stores:   map[string]*Store{},
 	}
@@ -165,9 +172,12 @@ func (m *Manager) logFor(ctx context.Context, bucket string) (blockstore.Log, er
 	}
 
 	pc := m.catalog
-	pc.Flush = nil
+	pc.Flush, pc.OnSealed = nil, nil
 	if pc.Ship {
 		pc.Flush = m.flushFor(bucket)
+		if m.onSealed != nil {
+			pc.OnSealed = func() { m.onSealed(bucket) }
+		}
 	}
 	s, err := Open(ctx, Config{
 		Dir:     filepath.Join(m.dir, bucket),
@@ -220,8 +230,18 @@ func (m *Manager) Get(ctx context.Context, c cid.Cid) (block.Block, error) {
 	return nil, blockstore.ErrNotFound
 }
 
-// Close shuts down every bucket store (sealing open segments, draining
-// flush queues). The manager is unusable afterwards.
+// ShipBucket ships bucket's sealed segments still unshipped, oldest first,
+// stopping at the first that fails (PlaneLog.Ship).
+func (m *Manager) ShipBucket(ctx context.Context, bucket string) error {
+	log, err := m.logFor(ctx, bucket)
+	if err != nil {
+		return err
+	}
+	return log.(*Store).Ship(ctx)
+}
+
+// Close shuts down every bucket store (sealing open segments). The manager
+// is unusable afterwards.
 func (m *Manager) Close(ctx context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -243,13 +263,10 @@ func (m *Manager) Close(ctx context.Context) error {
 	return nil
 }
 
-// QuiesceBucketLog stops bucket's flush pipeline and waits for any in-flight
-// ship to finish, so the segment rows ShippedSegmentDigests reads afterwards
-// are final: a ship that was mid-flight has either completed (registered its
-// blobs AND stamped shipped_at + index_digest) or aborted. Without this,
-// DeleteBucket races the flush goroutine — a segment whose CAR just
-// registered but wasn't yet marked shipped would be invisible to the release
-// pass, and the space delete would be refused. The closed store reopens
+// QuiesceBucketLog seals bucket's open segment and closes its store, so no
+// segment seals while ShippedSegmentDigests reads the rows afterwards. A
+// ship runs only when its owner calls ShipBucket, and DeleteBucket's owner
+// runs none meanwhile, so the rows are final. The closed store reopens
 // lazily on the bucket's next use, so a delete that fails downstream leaves
 // the log writable.
 func (m *Manager) QuiesceBucketLog(ctx context.Context, bucket string) error {

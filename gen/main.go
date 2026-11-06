@@ -42,6 +42,21 @@ func main() {
 		s3frontend.ShardCacheTask{},
 		s3frontend.ShardEvictTask{},
 		s3frontend.ShardAddTask{},
+		s3frontend.BucketCommitTask{},
+		s3frontend.KeyChange{},
+		s3frontend.PutChange{},
+		s3frontend.BlobRefTask{},
+		s3frontend.ReservedVersion{},
+		s3frontend.DeleteChange{},
+		s3frontend.DeletePreconditions{},
+		s3frontend.SetAttributesChange{},
+		s3frontend.BucketCommitResult{},
+		s3frontend.ChangeResult{},
+		s3frontend.ChangeError{},
+		s3frontend.BucketTask{},
+		s3frontend.BucketCreateTask{},
+		s3frontend.BucketSetVersioningTask{},
+		s3frontend.BucketSetLockConfigTask{},
 	); err != nil {
 		panic(err)
 	}

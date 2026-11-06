@@ -291,7 +291,8 @@ func (b *Backend) CopyObject(ctx context.Context, input s3response.CopyObjectInp
 			return s3response.CopyObjectOutput{}, err
 		}
 	}
-	node, effState, err := b.commitVersion(ctx, bucketState, dstKey, dstMf, blobs, applyTagsIfPresent(initState, dstTags), refs, nil)
+	put := &PutChange{Manifest: dstMf, HasBlobs: blobs != nil, Blobs: blobs, Refs: blobRefTasks(refs), InitState: applyTagsIfPresent(initState, dstTags)}
+	node, effState, err := b.commitOne(ctx, bucketState, KeyChange{Key: dstKey, Put: put}, "commit version")
 	if err != nil {
 		return s3response.CopyObjectOutput{}, err
 	}

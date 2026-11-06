@@ -141,7 +141,7 @@ alongside the BLAKE3 tree at no extra pass, and stored in the manifest.
 `x-amz-copy-source-if-*` but delegates evaluation to the backend. Ingot evaluates them against the
 resolved version's ETag/Last-Modified (`412`/`304`). A precondition that gates a mutation
 (`If-None-Match: *` create-if-absent, `If-Match` optimistic concurrency) is **re-checked at commit**
-under the MST critical section, not only at read, so it is race-safe.
+in the bucket's `queue-bucket.commit`, which runs one at a time per bucket, so it is race-safe.
 
 **Multipart.** `CreateMultipartUpload` / `UploadPart` / `CompleteMultipartUpload` /
 `AbortMultipartUpload` are first-class. The mechanism lives in [§7](#7-cross-cutting-durability-concurrency-retrieval).
@@ -394,18 +394,21 @@ cannot name what to remove.
 
 ## 7. Cross-cutting: durability, concurrency, retrieval
 
-The layers above are static structure; here is how requests flow through them. The bucket-root
-update is a **guarded root swap**: advance the bucket's MST root only if it still equals the snapshot
-read at the start of the operation; on mismatch, reload and retry the (cheap) splice.
+The layers above are static structure; here is how requests flow through them. Every change to a
+bucket runs as a task on `queue-bucket`, whose subject is the bucket's space, placed on the instance
+that holds the bucket's catalog log, so one change to a bucket runs at a time. An object write is a
+`queue-bucket.commit` run sync for the request. Its root update is a **guarded root advance**: the
+bucket's MST root moves only if it still equals the root the commit started from; on mismatch the
+task runs again from the current root and repeats the (cheap) splice.
 
 ### 7.1 Write (single-shot `PutObject`)
 
 ```
-0. PRECONDITIONS (no lock)   evaluate If-Match / If-None-Match / If-(Un)Modified-Since (§3)
-1. INGEST  (no lock)         stream body → blake3 tree + md5 in one pass;
+0. PRECONDITIONS (request)   evaluate If-Match / If-None-Match / If-(Un)Modified-Since (§3)
+1. INGEST  (request)         stream body → blake3 tree + md5 in one pass;
                              if size==0 store a manifest only (§3);
                              else split into ceil(size / max_blob_size) blobs
-2. UPLOAD  (no lock, per blob, as the body arrives)
+2. UPLOAD  (request, per blob, as the body arrives)
      blob/add(size) → PUT the bytes as they arrive, sha256 on the way (a local copy
        teed into the cache) → PARKED; a failed PUT aborts the allocation and fails the request
      queue-space-shard.add on the blob's release subject (waits up to 30 s behind a release):
@@ -414,21 +417,23 @@ read at the start of the operation; on mismatch, reload and retry the (cheap) sp
        (a blob the space holds already is reused and the new allocation aborted)
        record location + intent accepted; take a pending reference, expiring in 24 h
      adopt the local copy into the cache
-3. COMMIT  (short per-bucket critical section)
-     load MST at base root; allocate versionId
+3. COMMIT  (queue-bucket.commit on the bucket's subject, a Put change)
+     load MST at base root; allocate versionId; re-check the preconditions
      write the manifest; splice key+versionId → manifest CID (new MST nodes)
      blob_refs[(space,digest)] += this version, taking over the pending reference
-       (an expired reference fails the commit with SlowDown)
+       (an expired reference fails the change with SlowDown)
      if Suspended/Unversioned and a prior null-version existed:
         blob_refs[(space,oldDigest)] -= it; on empty → remove (§6)
-     record superseded MST nodes → gc_candidates; guarded root swap
+     record superseded MST nodes → gc_candidates
+     append the catalog blocks to the bucket's log (one fsync);
+     the journal rows, guarded root advance and the rows above commit with the task
 4. ACK     return 200 + ETag(md5)   — data is durable+accepted in Piri
 ```
 
-Ingest, hashing, and the Piri upload all run **outside any lock** (a conclude runs in the blob's
-`queue-space-shard.add`, under its space and digest only). The critical section does no large-body work — a manifest write, an MST splice, a few
-Postgres writes, and the guarded root swap — so it is small and bounded (sub-millisecond order). No
-object is ever held whole in RAM. The catalog manifest is written only after its body blobs are
+Ingest, hashing, and the Piri upload all run **in the request, before the commit** (a conclude
+runs in the blob's `queue-space-shard.add`, under its space and digest only). The commit does no
+large-body work: a manifest write, an MST splice, one fsynced append, a few Postgres writes, and the
+guarded root advance. No object is ever held whole in RAM. The catalog manifest is written only after its body blobs are
 durable and accepted in Piri, so a crash never leaves a catalog entry pointing at non-durable data.
 
 ### 7.2 Multipart
@@ -458,9 +463,10 @@ CompleteMultipartUpload([parts])
      accept not started within 30 s → 409 OperationAborted, session reopened
      accept failed → Complete fails with its error
      a named part not accepted with the same blobs → InvalidPart, and the client uploads it again
-     COMMIT (short lock): manifest pins ordered [blobs..]+ranges;
+     COMMIT (queue-bucket.commit, a Put change): manifest pins ordered [blobs..]+ranges;
         object ETag = hex(md5(concat part MD5s)) + "-N";
-        splice; blob_refs += version per digest; guarded root swap
+        splice; blob_refs += version per digest; guarded root advance;
+        session completing→completed in the same transaction (guarded)
 AbortMultipartUpload
      latch session open→aborting
      parked blobs → abort;  accepted blobs → remove (§6)
@@ -489,8 +495,9 @@ report `x-amz-mp-parts-count` without re-deriving boundaries from the blob list.
 commit an object over parts the other is releasing. A **single-winner latch** prevents it: an atomic
 state transition on the session row (`UPDATE … SET state=? WHERE state='open'`). Exactly one of
 `Complete`→`completing` or `Abort`→`aborting` wins; the loser observes the moved row and returns an
-error. The commit re-checks the latch under the bucket lock, so a teardown that takes a
-`completing` session fails the commit with `NoSuchUpload`.
+error. The Complete's `queue-bucket.commit` records the session completed in the same transaction
+as the version, and only while it is still `completing`. A teardown (DeleteBucket, the stale-session
+sweeper) that latched the session away first makes the commit fail with `NoSuchUpload`.
 
 The accept is not behind the latch: an abort, a session expiry or a part re-upload can release a
 blob while an accept is concluding it. The upload service decides the order. A released allocation
@@ -521,17 +528,19 @@ a walk over sub-blocks.
 
 ### 7.5 Concurrency, durability, and failure modes
 
-The only serialized work is the commit critical section, and under versioning two writes to the same
-key produce distinct versionIds — they contend only on the guarded root swap, which retries cheaply.
-Across processes, the swap (a Postgres conditional update) is the cross-instance guard; `blob_refs`
-updates land in the swap's transaction.
+The only serialized work is the bucket's `queue-bucket` tasks: its commits run one at a time on its
+subject, and under versioning two writes to the same key produce distinct versionIds. The guarded
+root advance (a Postgres conditional update) is the backstop if a commit ever finds a root it did not
+start from; `blob_refs` updates land in its transaction. `DeleteObjects` sends every key in one
+commit, so up to 1,000 deletes cost one fsync and one root advance, and a key refused in the request
+or by the commit fails alone.
 
 | Case | Handling |
 |---|---|
 | Crash after PUT, before accept | Bytes parked; `upload_intents` (parked) drives resume or `abort`. No `200` was sent. |
 | Crash after accept, before commit | Blob durable but unreferenced; `upload_intents` (accepted) drives commit-retry or `remove`. |
-| Guarded-root-swap mismatch | Reload root, re-splice; blobs already durable, never re-uploaded. |
-| Concurrent PUT, same key | Distinct versionIds; serialize only on the swap. |
+| Guarded-root-advance mismatch | The commit task runs again from the current root and re-splices; blobs already durable, never re-uploaded. |
+| Concurrent PUT, same key | Distinct versionIds; the commits run one at a time on the bucket's subject. |
 | Concurrent PUT, same content | One blob; both versions reference it; `blob_refs` counts both. |
 | Abort vs racing Complete | Single-winner latch ([§7.3](#73-the-session-latch-the-abortcomplete-race)). |
 | Abort, expiry or part re-upload during an accept's conclude | The upload service refuses whichever of accept and abort comes second; Ingot records the location only while the park row stands ([§7.3](#73-the-session-latch-the-abortcomplete-race)). |
@@ -605,8 +614,9 @@ negotiations).
 **Determinism / idempotency Ingot must preserve.** The `accept` invocation is built deterministically
 (stable CID, today via `WithNoNonce` over `{space, digest, size, put-task}`); re-driving accept must
 reuse the same put-task link. `remove`/`abort` must be idempotent. The forge-root advance must
-happen only after a successful guarded root swap — the catalog log currently advances it before the
-swap, so a mismatch can leave the forge root pointing at a bucket root that was never adopted.
+happen only after a successful guarded root advance. The catalog log appends before the advance, so
+a commit that fails after its append can leave the forge root pointing at a bucket root that was
+never adopted.
 
 ---
 
@@ -650,7 +660,7 @@ The MVP this supersedes had six structural problems; each is resolved by a layer
 
 | Problem                                       | Resolved by                                                                                                                                                                                                         |
 |-----------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| A per-bucket lock held across the whole write | Ingest and upload run off-lock; only the MST splice + guarded root swap is in the critical section. [§7.1](#71-write-single-shot-putobject)                                                                         |
+| A per-bucket lock held across the whole write | Ingest and upload run in the request; only the MST splice, the append and the guarded root advance run in the bucket's serialized commit. [§7.1](#71-write-single-shot-putobject)                        |
 | The whole object buffered in memory           | Hash while streaming to Piri; nothing held whole in RAM. [§5](#5-the-data-layer), [§7.1](#71-write-single-shot-putobject)                                                                                           |
 | No multipart, no abort                        | Parked part-blobs accepted during the upload, single-winner latch; abort = `/blob/abort` (parked) / `remove` (deduped). [§7.2](#72-multipart)–7.3, [§9](#9-the-system-contract-piri--sprue--indexer)                        |
 | Objects chunked into CARs to obtain a digest  | Object body = one blob (≤ `max`) or a coarse `≤ max` split; no fine chunking, no CAR. [§5](#5-the-data-layer), [§10](#10-deployment-topology--the-digest-before-upload-cost)                                        |
@@ -675,8 +685,8 @@ The MVP this supersedes had six structural problems; each is resolved by a layer
   space holds a claim.
 - **Local store** — Ingot's on-disk copy of a blob (the cache); the read-after-write source and the
   read cache.
-- **Guarded root swap** — advancing the bucket MST root only if it still matches the snapshot read at
-  the start of the operation.
+- **Guarded root advance** — advancing the bucket MST root only if it still matches the root the
+  `queue-bucket.commit` started from.
 - **Single-winner latch** — the atomic session-state transition that serializes multipart
   Complete vs Abort.
 - **Reference index (`blob_refs`)** — `(space, digest) → versions`, the reverse map that gates
@@ -758,7 +768,7 @@ CREATE TABLE ingot.segment_op_roots (
 );
 
 -- The catalog journal: a copy of every catalog block a commit appended to the
--- log, written in the root swap's transaction and deleted in the one that stamps
+-- log, written in the root advance's transaction and deleted in the one that stamps
 -- its segment shipped (or, for the whole bucket, when DeleteBucket empties its
 -- root), so a copy of the database holds the blocks only this host's disk would
 -- otherwise hold. seq has deliberately no foreign key: logstore
@@ -1006,9 +1016,9 @@ The storage / delete / retrieval core is built and tested:
 
 - **Object-aligned blobs + manifest** ([§4](#4-the-catalog-layer)–[§5](#5-the-data-layer)) — `Body.Blobs` (`[digest, offset]` entries, inline then in extent blocks), coarse split at
   `max_blob_size`, the local **cache** (`blockstore.BlobCache`) + `upload_intents`, stored S3 `etag`.
-- **Synchronous durability write path** ([§7.1](#71-write-single-shot-putobject)) — off-lock ingest streaming each blob to its provider, then a
-  short locked commit (manifest + MST splice + guarded root swap); the reference-index claims and
-  drops are written in the root swap's transaction, so a commit failure writes none of them.
+- **Synchronous durability write path** ([§7.1](#71-write-single-shot-putobject)) — ingest in the request, streaming each blob to its provider, then a
+  `queue-bucket.commit` on the bucket's subject (manifest + MST splice + one fsynced append + guarded root advance); the reference-index claims and
+  drops are written in the root advance's transaction, so a commit failure writes none of them.
 - **Single-plane catalog log** — the data plane is gone; `logstore` journals only the catalog
   (manifests + MST nodes) as CAR segments. `forge_root_cid` advances only when the catalog ships, and
   only `WHERE root_cid` still matches the op-root (the orphan-root guard from [§9](#9-the-system-contract-piri--sprue--indexer)).
@@ -1117,11 +1127,12 @@ paths below are exercised against the real stack by the smelt-based `itest/` har
 
 Reference-index mutations (`blob_refs`) and the catalog/root commit are one transaction: the new
 version's claims, the discarded versions' claim drops, and the `queue-space-shard.release` tasks
-those drops queue are written by the same Postgres transaction as the guarded root swap (`registry.CommitRoot`). A
+those drops queue are written by the same Postgres transaction as the guarded root advance, the
+`queue-bucket.commit` task's own (`registry.Postgres.RootCommitWrites`). A
 commit that fails writes none of them, and no crash can leave a published version unclaimed or a
 discarded one claimed. Each claim of a PutObject or CopyObject takes over the write's pending
 reference to its blob (`blob_pending_refs`) and cancels the reference's `queue-space-shard.expire`
-in the same transaction; a reference that has expired fails the commit with
-`registry.ErrReferenceExpired` (SlowDown to the client), and the root stays where it was.
+in the same transaction; a reference that has expired fails that change with
+`registry.ErrReferenceExpired` (SlowDown to the client), and the change writes nothing.
 Complete's claims take no reference over: the session's parts reference its blobs until its
 teardown.

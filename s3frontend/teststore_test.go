@@ -15,6 +15,7 @@ import (
 	"github.com/multiformats/go-multihash"
 	"go.uber.org/zap/zaptest"
 
+	msbucket "github.com/fil-forge/ingot/bucket"
 	"github.com/fil-forge/ingot/internal/pgtest"
 	"github.com/fil-forge/ingot/internal/testfakes"
 	"github.com/fil-forge/ingot/registry"
@@ -63,6 +64,8 @@ func newTestStore(t testing.TB) *testStore {
 			// (runAccepts) or Complete does, which cancels the one UploadPart
 			// queued and runs its own.
 			{Name: registry.AcceptQueue},
+			// Commits run sync, in the request; the workers run ships.
+			{Name: registry.BucketQueue, Workers: 2},
 		},
 		LeaseTTL:     time.Second,
 		PollInterval: 10 * time.Millisecond,
@@ -83,7 +86,7 @@ func newTestStore(t testing.TB) *testStore {
 func (s *testStore) start(t testing.TB, b *Backend) {
 	t.Helper()
 	if s.started {
-		b.tasks, b.shards, b.releases, b.accepts = s.tasks, s.tasks, s.tasks, s.tasks
+		b.tasks, b.shards, b.releases, b.accepts, b.buckets = s.tasks, s.tasks, s.tasks, s.tasks, s.tasks
 		b.cache.OnRead(b.renewCached)
 		return
 	}
@@ -106,6 +109,9 @@ func (s *testStore) start(t testing.TB, b *Backend) {
 	}
 	if err := b.RegisterAcceptTasks(s.tasks); err != nil {
 		t.Fatalf("register accept tasks: %v", err)
+	}
+	if err := b.RegisterBucketTasks(s.tasks); err != nil {
+		t.Fatalf("register bucket tasks: %v", err)
 	}
 	if err := s.tasks.Start(context.Background()); err != nil {
 		t.Fatalf("start task queues: %v", err)
@@ -410,4 +416,12 @@ func (b *Backend) SweepPendingReleases(ctx context.Context) (int, error) {
 		}
 	}
 	return n, nil
+}
+
+// commitPut commits mf as key's new version, with blobs and the write's
+// refs, as a put through the bucket queue: for tests that write a manifest
+// no S3 verb would.
+func commitPut(ctx context.Context, b *Backend, st *registry.State, key string, mf *msbucket.ObjectManifest, blobs msbucket.BlobRefs, refs map[string]taskrunner.TaskID) error {
+	_, _, err := b.commitOne(ctx, st, KeyChange{Key: key, Put: &PutChange{Manifest: mf, HasBlobs: blobs != nil, Blobs: blobs, Refs: blobRefTasks(refs)}}, "commit version")
+	return err
 }

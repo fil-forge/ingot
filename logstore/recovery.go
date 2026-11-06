@@ -252,17 +252,6 @@ func (pl *PlaneLog) recover(ctx context.Context) error {
 		return sealedRecovered[i].Seq() > sealedRecovered[j].Seq()
 	})
 	pl.sealed = sealedRecovered
-
-	// Re-enqueue sealed segments not yet shipped (shipping plane only).
-	if pl.pc.Ship {
-		for _, seg := range pl.sealed {
-			if seg.IsShipped() || seg.IsRetired() {
-				continue
-			}
-			pl.enqueueFlush(seg)
-		}
-	}
-
 	return nil
 }
 

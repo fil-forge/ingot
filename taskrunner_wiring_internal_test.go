@@ -43,6 +43,9 @@ func TestTaskRunnerHasTheBackendsQueues(t *testing.T) {
 	if err := b.RegisterAcceptTasks(r); err != nil {
 		t.Fatalf("RegisterAcceptTasks: %v", err)
 	}
+	if err := b.RegisterBucketTasks(r); err != nil {
+		t.Fatalf("RegisterBucketTasks: %v", err)
+	}
 	if got := r.Node(); got != "did:web:ingot.test" {
 		t.Fatalf("runner node = %q, want the agent's DID", got)
 	}
