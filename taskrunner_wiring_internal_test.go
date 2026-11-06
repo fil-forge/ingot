@@ -28,6 +28,9 @@ func TestTaskRunnerHasTheBackendsQueues(t *testing.T) {
 		t.Fatalf("NewBlobCache: %v", err)
 	}
 	b := s3frontend.New(s3frontend.Deps{Cache: cache})
+	// Its gauges are on the global meter provider, which a later test may
+	// install a reader behind.
+	t.Cleanup(func() { _ = b.CloseMetrics() })
 	if err := b.RegisterUploadTasks(r); err != nil {
 		t.Fatalf("RegisterUploadTasks: %v", err)
 	}

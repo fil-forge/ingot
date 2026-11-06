@@ -16,8 +16,8 @@ import (
 // to the log store in one fsynced AppendBatch call, after which the new bucket
 // Root may be safely advanced via the registry CAS.
 //
-// Only catalog (dag-cbor) blocks reach OpStaging: object-body blobs are spooled
-// and uploaded per-blob before the commit, so they never pass through the
+// Only catalog (dag-cbor) blocks reach OpStaging: object-body blobs are streamed
+// to their providers per-blob before the commit, so they never pass through the
 // per-op staging buffer or the log.
 //
 // Reads check the in-memory buffer first and fall through to the

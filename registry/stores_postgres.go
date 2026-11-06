@@ -317,15 +317,14 @@ func (r *Postgres) QueueReleases(ctx context.Context, space did.DID, digests []m
 
 func (r *Postgres) PutIntent(ctx context.Context, in UploadIntent) error {
 	if _, err := r.pool.Exec(ctx,
-		`INSERT INTO ingot.upload_intents (space, digest, local_path, size, state, bucket)
-		 VALUES ($1, $2, $3, $4, $5, $6)
+		`INSERT INTO ingot.upload_intents (space, digest, size, state, bucket)
+		 VALUES ($1, $2, $3, $4, $5)
 		 ON CONFLICT (space, digest) DO UPDATE
-		   SET local_path = EXCLUDED.local_path,
-		       size       = EXCLUDED.size,
+		   SET size       = EXCLUDED.size,
 		       state      = EXCLUDED.state,
 		       bucket     = EXCLUDED.bucket,
 		       updated_at = now()`,
-		in.Space, in.Digest, in.LocalPath, in.Size, in.State, nullString(in.Bucket)); err != nil {
+		in.Space, in.Digest, in.Size, in.State, nullString(in.Bucket)); err != nil {
 		return fmt.Errorf("registry: put intent: %w", err)
 	}
 	return nil
@@ -350,9 +349,9 @@ func (r *Postgres) GetIntent(ctx context.Context, space did.DID, digest multihas
 	in := &UploadIntent{Space: space, Digest: digest}
 	var bucket *string
 	err := r.pool.QueryRow(ctx,
-		`SELECT local_path, size, state, bucket, updated_at
+		`SELECT size, state, bucket, updated_at
 		   FROM ingot.upload_intents WHERE space = $1 AND digest = $2`,
-		space, digest).Scan(&in.LocalPath, &in.Size, &in.State, &bucket, &in.UpdatedAt)
+		space, digest).Scan(&in.Size, &in.State, &bucket, &in.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -386,58 +385,27 @@ func (r *Postgres) CountOtherIntents(ctx context.Context, space did.DID, digest 
 	return n, nil
 }
 
-func (r *Postgres) StalledBytes(ctx context.Context, before time.Time) (StalledSizes, error) {
-	// The state literals match the partial index upload_intents_stalled_idx
-	// (migrations 00021 and 00023): the planner uses it only when the query
-	// names the same constants, not parameters. The index carries
-	// size and state, so the sums come from it alone.
-	var s StalledSizes
+func (r *Postgres) StalledBytes(ctx context.Context, before time.Time) (int64, error) {
+	// The state literal matches the partial index upload_intents_stalled_idx
+	// (migration 00033): the planner uses it only when the query names the
+	// same constant, not a parameter. The index carries size, so the sum
+	// comes from it alone.
+	var n int64
 	err := r.pool.QueryRow(ctx,
-		`SELECT COALESCE(sum(size) FILTER (WHERE state = 'spooled'), 0)::bigint,
-		        COALESCE(sum(size) FILTER (WHERE state = 'uploading'), 0)::bigint
+		`SELECT COALESCE(sum(size), 0)::bigint
 		   FROM ingot.upload_intents
-		  WHERE state IN ('spooled', 'uploading')
+		  WHERE state = 'uploading'
 		    AND updated_at < $1`,
-		before).Scan(&s.Spooled, &s.Uploading)
+		before).Scan(&n)
 	if err != nil {
-		return StalledSizes{}, fmt.Errorf("registry: sum stalled intents: %w", err)
+		return 0, fmt.Errorf("registry: sum stalled intents: %w", err)
 	}
-	return s, nil
-}
-
-func (r *Postgres) MissingIntents(ctx context.Context, digests []multihash.Multihash) ([]multihash.Multihash, error) {
-	if len(digests) == 0 {
-		return nil, nil
-	}
-	raw := make([][]byte, len(digests))
-	for i, d := range digests {
-		raw[i] = d
-	}
-	rows, err := r.pool.Query(ctx,
-		`SELECT d FROM unnest($1::bytea[]) AS d
-		  WHERE NOT EXISTS (SELECT 1 FROM ingot.upload_intents i WHERE i.digest = d)`,
-		raw)
-	if err != nil {
-		return nil, fmt.Errorf("registry: missing intents: %w", err)
-	}
-	defer rows.Close()
-	var out []multihash.Multihash
-	for rows.Next() {
-		var d []byte
-		if err := rows.Scan(&d); err != nil {
-			return nil, fmt.Errorf("registry: missing intents scan: %w", err)
-		}
-		out = append(out, multihash.Multihash(d))
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("registry: missing intents rows: %w", err)
-	}
-	return out, nil
+	return n, nil
 }
 
 // intentColumns is the column list scanIntents reads, qualified for the
 // alias i (unqualified names resolve against it too).
-const intentColumns = `i.space, i.digest, i.local_path, i.size, i.state, i.bucket, i.updated_at`
+const intentColumns = `i.space, i.digest, i.size, i.state, i.bucket, i.updated_at`
 
 // scanIntents reads rows of intentColumns and closes them.
 func scanIntents(rows pgx.Rows) ([]UploadIntent, error) {
@@ -447,7 +415,7 @@ func scanIntents(rows pgx.Rows) ([]UploadIntent, error) {
 		var in UploadIntent
 		var space string
 		var bucket *string
-		if err := rows.Scan(&space, &in.Digest, &in.LocalPath, &in.Size, &in.State, &bucket, &in.UpdatedAt); err != nil {
+		if err := rows.Scan(&space, &in.Digest, &in.Size, &in.State, &bucket, &in.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("registry: list intents scan: %w", err)
 		}
 		sp, err := did.Parse(space)

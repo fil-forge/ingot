@@ -15,7 +15,7 @@ import (
 // blob copies are wiped, a GET must re-fetch the object's body blobs from piri by
 // resolving their location from the local blob_locations table
 // (registry.LocalLocator) and issuing a /content/retrieve — not from
-// read-after-write. Body blobs live only in the spool and cache; the manifest/MST live
+// read-after-write. Body blobs live only in the cache; the manifest/MST live
 // in the catalog log and survive the wipe, so only the body read exercises
 // the network tier.
 //
@@ -45,9 +45,9 @@ func TestForgeReadAfterEviction(t *testing.T) {
 		t.Fatalf("put object: %v", err)
 	}
 
-	// Wipe the local blob copies (spool and cache) so the next GET cannot
+	// Wipe the local blob copies (the cache) so the next GET cannot
 	// read-after-write — its body blobs must be re-fetched from piri.
-	if out, errOut, err := s.Exec(ctx, "ingot", "sh", "-c", "rm -rf /data/spool /data/cache"); err != nil {
+	if out, errOut, err := s.Exec(ctx, "ingot", "sh", "-c", "rm -rf /data/cache"); err != nil {
 		t.Fatalf("wipe local blob copies: %v (stdout=%s stderr=%s)", err, out, errOut)
 	}
 

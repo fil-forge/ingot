@@ -25,7 +25,7 @@ type batchRecordingUploader struct {
 	calls []int
 }
 
-func (u *batchRecordingUploader) UploadBlob(_ context.Context, _ did.DID, digest multihash.Multihash, size int64, _ string, _ ...uploader.UploadOption) (uploader.UploadedBlob, error) {
+func (u *batchRecordingUploader) UploadBlob(_ context.Context, _ did.DID, digest multihash.Multihash, size int64, _ string) (uploader.UploadedBlob, error) {
 	// No Location: the blob parks, which is what UploadPart does.
 	c := cidOfDigest(digest)
 	return uploader.UploadedBlob{Digest: digest, Size: size, AddTask: c, AcceptTask: c, PutInvocation: []byte("put")}, nil
@@ -54,7 +54,7 @@ func TestCompleteConcludesPartsInOneCall(t *testing.T) {
 	var digests []multihash.Multihash
 	for i := 1; i <= parts; i++ {
 		n := int32(i)
-		// Distinct bodies: identical parts would share one spooled blob and
+		// Distinct bodies: identical parts would share one stored blob and
 		// collapse the batch.
 		body := append(testBody(int(backend.MinPartSize)), byte(i))
 		out, err := mpUploadPart(t, b, key, uploadID, n, body, nil)

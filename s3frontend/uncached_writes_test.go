@@ -6,7 +6,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/fil-forge/versitygw/backend"
 	"github.com/stretchr/testify/require"
-	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 
 	"github.com/fil-forge/ingot/internal/testfakes"
 )
@@ -31,7 +30,6 @@ func TestDropAcceptedBodies(t *testing.T) {
 			settleCache(t, b, d)
 
 			require.Equal(t, tc.wantFile, fileExists(b.cache.Path(d)), "cached copy present")
-			require.False(t, fileExists(b.spool.Path(d)), "spool copy present")
 		})
 	}
 }
@@ -75,17 +73,4 @@ func TestDropAcceptedBodiesMultipart(t *testing.T) {
 	for _, d := range digests {
 		require.False(t, fileExists(localPath(b, d)), "part blob %x has a local copy after Complete", d)
 	}
-}
-
-// TestDropAcceptedBodiesCountsRemovals: each dropped copy counts under the
-// "accepted" reason.
-func TestDropAcceptedBodiesCountsRemovals(t *testing.T) {
-	reader := sdkmetric.NewManualReader()
-	b, _ := newDeferredBackend(t, testfakes.NopUploader{}, dropAccepted, meteredBackend(reader))
-	data := testBody(1 << 10)
-	putObj(t, b, "k", data)
-
-	got := collectLocalBlobMetrics(t, reader)
-	require.Equal(t, int64(1), got["ingot.local_blobs.removals/accepted"], "removals: %v", got)
-	require.Positive(t, got["ingot.local_blobs.removed_bytes/accepted"], "removed bytes: %v", got)
 }

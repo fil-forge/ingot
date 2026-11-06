@@ -30,8 +30,6 @@ func newJournalingBackend(t *testing.T) (*Backend, *testStore, *logstore.Store, 
 	mem := newTestStore(t)
 	cache, err := blockstore.NewBlobCache(filepath.Join(dir, "cache"))
 	require.NoError(t, err)
-	spool, err := blockstore.NewSpool(filepath.Join(dir, "spool"))
-	require.NoError(t, err)
 	gate := make(chan struct{})
 	log, err := logstore.Open(ctx, logstore.Config{
 		Dir:    filepath.Join(dir, "segments"),
@@ -66,11 +64,9 @@ func newJournalingBackend(t *testing.T) (*Backend, *testStore, *logstore.Store, 
 		GC:         mem,
 		Multipart:  mem,
 		Parks:      mem,
-		Reads:      blockstore.NewLayered(blockstore.LocalBlobs{Cache: cache, Spool: spool}, log, testfakes.NopBaseReader{}),
+		Reads:      blockstore.NewLayered(cache, log, testfakes.NopBaseReader{}),
 		Log:        log,
-		Spool:      spool,
 		Cache:      cache,
-		Uploader:   testfakes.NopUploader{},
 		Deferred:   testfakes.NopUploader{},
 		Remover:    &recordingRemover{},
 		Registrar:  &recordingRegistrar{},

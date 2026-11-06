@@ -53,7 +53,7 @@ func TestSplitBody_Tree(t *testing.T) {
 	ctx := context.Background()
 	for _, n := range []int{0, 1, 1000, 10000, 100_000} {
 		data := makeData(n)
-		body, _, err := SplitBody(ctx, testSpool(t), bytes.NewReader(data), 4096)
+		body, _, err := SplitBody(ctx, testBlobs(t), bytes.NewReader(data), 4096)
 		if err != nil {
 			t.Fatalf("SplitBody(%d): %v", n, err)
 		}

@@ -371,7 +371,7 @@ func TestAcceptorLeavesAReplacementPark(t *testing.T) {
 // TestAcceptorLeavesAReleasingBlobForComplete: a parked part whose blob has a
 // release record pending (the same bytes stored as received by an object
 // whose delete is behind its reader grace) is not the acceptor's to take
-// over. The record stays, the part goes back to spooled, and Complete settles
+// over. The record stays, the part goes back to written, and Complete settles
 // it the way every committing write does.
 func TestAcceptorLeavesAReleasingBlobForComplete(t *testing.T) {
 	cc := &countingConcluder{}
@@ -393,7 +393,7 @@ func TestAcceptorLeavesAReleasingBlobForComplete(t *testing.T) {
 		t.Fatalf("release record after the acceptor's pass = %v, %v; want it kept", got, err)
 	}
 	if states := partStates(t, mem, uploadID); states[1] != registry.PartWritten {
-		t.Fatalf("part state = %q, want spooled", states[1])
+		t.Fatalf("part state = %q, want written", states[1])
 	}
 	if got := cc.concluded(); len(got) != 0 {
 		t.Fatalf("conclude calls = %v, want none", got)
@@ -406,7 +406,7 @@ func TestAcceptorLeavesAReleasingBlobForComplete(t *testing.T) {
 }
 
 // TestAcceptorRacesASupersedesRelease: a part is uploaded again, and the
-// acceptor makes a pass after the new upload has spooled and before its
+// acceptor makes a pass after the new upload has streamed and before its
 // part row lands. The old row still stands, so the acceptor accepts the old
 // blob; the write that replaces the row records the blob's release with it,
 // and the release removes the accepted blob from the provider. Nothing is
@@ -459,9 +459,9 @@ type uploadCountingParker struct {
 	uploads atomic.Int32
 }
 
-func (u *uploadCountingParker) UploadBlob(ctx context.Context, space did.DID, digest multihash.Multihash, size int64, path string, opts ...uploader.UploadOption) (uploader.UploadedBlob, error) {
+func (u *uploadCountingParker) UploadBlob(ctx context.Context, space did.DID, digest multihash.Multihash, size int64, path string) (uploader.UploadedBlob, error) {
 	u.uploads.Add(1)
-	return u.parkingUploader.UploadBlob(ctx, space, digest, size, path, opts...)
+	return u.parkingUploader.UploadBlob(ctx, space, digest, size, path)
 }
 
 // parkNotYetVisible is a park store whose next lookup of digest misses, as
@@ -485,7 +485,7 @@ func (p *parkNotYetVisible) GetPark(ctx context.Context, space did.DID, digest m
 	return p.ParkStore.GetPark(ctx, space, digest)
 }
 
-// TestCompleteConcludesAParkThatLandsMidComplete: Complete finds a spooled
+// TestCompleteConcludesAParkThatLandsMidComplete: Complete finds a written
 // part's blob with no park, as when its UploadPart is still parking, and
 // falls back to uploading it. Under the blob's lock the park is there after
 // all, and Complete concludes it rather than allocating a second copy beside
@@ -512,7 +512,7 @@ func TestCompleteConcludesAParkThatLandsMidComplete(t *testing.T) {
 	}
 	part := partRecord(t, mem, uploadID, 1)
 	if part.State != registry.PartWritten {
-		t.Fatalf("part state = %q, want spooled", part.State)
+		t.Fatalf("part state = %q, want written", part.State)
 	}
 	d := part.BlobDigests[0]
 	if _, err := mem.ParkByDigest(context.Background(), d); err != nil {
@@ -608,7 +608,7 @@ func TestAcceptorKeepsAParkThatReplacesALocation(t *testing.T) {
 		t.Fatalf("park add task = %x, want the replacement's", park.AddTask)
 	}
 	if states := partStates(t, mem, uploadID); states[1] != registry.PartWritten {
-		t.Fatalf("part state = %q, want spooled (left for Complete)", states[1])
+		t.Fatalf("part state = %q, want written (left for Complete)", states[1])
 	}
 }
 

@@ -18,7 +18,6 @@ import (
 	"github.com/multiformats/go-multihash"
 	"go.uber.org/zap"
 
-	"github.com/fil-forge/ingot/blockstore"
 	"github.com/fil-forge/ingot/internal/reqscope"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/taskrunner"
@@ -155,8 +154,8 @@ func (ps proofStores) ProofChain(ctx context.Context, aud did.DID, cmd ucan.Comm
 // while its session is still in flight and only then marks it completed, so
 // reading the parts before the claims means a release finds one or the other.
 // A claim means the release is stale and it does nothing. A write of the same
-// bytes in this space holding the spool file, or a conclude of the blob in
-// flight here, defers it too.
+// bytes in this space in flight, or a conclude of the blob in flight here,
+// defers it too.
 func (b *Backend) runRelease(ctx context.Context, ex *taskrunner.Exec, t taskrunner.Task) ([]byte, error) {
 	space, digest, err := registry.ParseReleaseSubject(t.Subject)
 	if err != nil {
@@ -166,7 +165,6 @@ func (b *Backend) runRelease(ctx context.Context, ex *taskrunner.Exec, t taskrun
 	if err != nil {
 		return nil, taskrunner.Permanent(err)
 	}
-	log := b.logger.With(zap.Stringer("space", space), zap.String("digest", hex.EncodeToString(digest)))
 
 	if n, err := b.multipart.CountLivePartRefs(ctx, space, digest); err != nil {
 		return nil, fmt.Errorf("count live part references: %w", err)
@@ -178,8 +176,9 @@ func (b *Backend) runRelease(ctx context.Context, ex *taskrunner.Exec, t taskrun
 	} else if n > 0 {
 		return nil, nil // claimed again since it was queued: stale
 	}
-	if b.spool.HeldBy(space, digest) {
-		return nil, fmt.Errorf("%w: a write of the same bytes holds the spool file", errReleaseDeferred)
+	if b.writing.marked(space, digest) {
+		// Its intent would go with this release's rows.
+		return nil, fmt.Errorf("%w: a write of the same bytes is in flight", errReleaseDeferred)
 	}
 	if b.isConcluding(space, digest) {
 		// Its accept may be registered after a remove sent now (see
@@ -196,13 +195,6 @@ func (b *Backend) runRelease(ctx context.Context, ex *taskrunner.Exec, t taskrun
 	park, err := b.parks.GetPark(ctx, space, digest)
 	if err != nil && !errors.Is(err, registry.ErrNotFound) {
 		return nil, fmt.Errorf("lookup park: %w", err)
-	}
-	in, err := b.intents.GetIntent(ctx, space, digest)
-	if err != nil && !errors.Is(err, registry.ErrNotFound) {
-		return nil, fmt.Errorf("lookup upload intent: %w", err)
-	}
-	if err != nil {
-		in = nil
 	}
 	others, err := b.intents.CountOtherIntents(ctx, space, digest)
 	if err != nil {
@@ -246,16 +238,10 @@ func (b *Backend) runRelease(ctx context.Context, ex *taskrunner.Exec, t taskrun
 		default:
 			return nil, fmt.Errorf("abort parked blob: %w", aerr)
 		}
-	case in != nil && in.State == registry.IntentSpooled:
-		// No row says the blob is on the network, and the intent says it
-		// never went: every upload moves the intent off 'spooled' before its
-		// first network call. Nothing is owed there, which matters for the
-		// retry: a blob that was never uploaded captured no authority a
-		// background remove could use.
 	default:
-		// No row says the blob is on the network, but the intent says it may
-		// be: a never-parked blob can be uploaded and accepted at Complete and
-		// then fail to record its location, leaving neither row. The upload
+		// No row says the blob is on the network, but it may be: a conclude
+		// can be accepted and then fail to record its location, leaving
+		// neither row. The upload
 		// service treats a remove of a blob it never registered as success,
 		// so the remove costs one round trip and closes that leak.
 		if err := b.remover.RemoveBlob(netCtx, space, digest); err != nil {
@@ -270,27 +256,16 @@ func (b *Backend) runRelease(ctx context.Context, ex *taskrunner.Exec, t taskrun
 			return nil, err
 		}
 	}
-	// The local copy is shared with every other space whose intent names the
+	// A write of the same bytes in this space since owns the intent. The
+	// cached copy is shared with every other space whose intent names the
 	// digest (the same bytes stored as received in two buckets), so while
-	// another space holds an intent it stays, for that space's upload or
-	// reads. A write of the same bytes in this space that spooled them again
-	// since owns the intent and the file. A copy both spaces' releases leave
-	// at once is reclaimed by the cache's time to live or the orphan pass.
-	if b.spool.HeldBy(space, digest) {
+	// another space holds an intent it stays, for that space's reads. A copy
+	// both spaces' releases leave at once is reclaimed by the cache's time
+	// to live.
+	if b.writing.marked(space, digest) {
 		return releasedResult, nil
 	}
-	if others == 0 && !b.spool.Held(digest) {
-		freed, err := b.spool.Remove(digest)
-		switch {
-		case errors.Is(err, blockstore.ErrHeld) && b.spool.HeldBy(space, digest):
-			return releasedResult, nil // a write of this space took the file since the check above
-		case errors.Is(err, blockstore.ErrHeld):
-			// Another space's write took the file: it stays.
-		case err != nil:
-			log.Warn("release: remove the spool copy failed; the orphan pass takes it", zap.Error(err))
-		default:
-			b.localBlobMetrics.removedFile(ctx, removedReleased, freed)
-		}
+	if others == 0 {
 		var evict bytes.Buffer
 		if err := (&ShardEvictTask{Released: true}).MarshalCBOR(&evict); err != nil {
 			return nil, err

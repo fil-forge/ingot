@@ -53,7 +53,7 @@ func rawHeader(t *testing.T, meta middleware.Metadata, name string) string {
 // recovery — against a forge-mode stack whose ingot config lowers
 // max_blob_size to 64 KiB (testdata/config-smallblob.yaml) so small objects
 // coarse-split into multiple body blobs. One stack is shared by all
-// subtests; spool assertions are delta-based so subtest order doesn't
+// subtests; local blob assertions are delta-based so subtest order doesn't
 // matter.
 //
 // These were ported from the old in-process suite; assertions that merely
@@ -102,7 +102,7 @@ func TestForgeScenarios(t *testing.T) {
 	// BlobSplitMultiBlobRoundTrip: a PUT several times larger than
 	// max_blob_size is coarsely split into multiple BlobRefs; the
 	// whole-object GET, boundary-spanning ranged GETs, and md5 ETag all
-	// reconstruct the exact bytes, and the bodies land in the spool by
+	// reconstruct the exact bytes, and the bodies land in the cache by
 	// digest (the data-plane inversion) — not journaled into the log.
 	t.Run("BlobSplitMultiBlobRoundTrip", func(t *testing.T) {
 		const bucket = "blob-split"
@@ -114,7 +114,7 @@ func TestForgeScenarios(t *testing.T) {
 		const size = 3*maxBlob + maxBlob/2
 		data := patternBytes(size)
 
-		spoolBefore := localBlobCount(t, ctx, s)
+		localBefore := localBlobCount(t, ctx, s)
 		put, err := cl.PutObject(ctx, &s3.PutObjectInput{
 			Bucket: aws.String(bucket),
 			Key:    aws.String("big"),
@@ -126,8 +126,8 @@ func TestForgeScenarios(t *testing.T) {
 		if want := quotedMD5(data); aws.ToString(put.ETag) != want {
 			t.Fatalf("PUT ETag = %s, want %s", aws.ToString(put.ETag), want)
 		}
-		if got := localBlobCount(t, ctx, s) - spoolBefore; got != 4 {
-			t.Fatalf("PUT added %d spool blobs, want 4 — bodies must be spooled by digest, not logged", got)
+		if got := localBlobCount(t, ctx, s) - localBefore; got != 4 {
+			t.Fatalf("PUT added %d cached blobs, want 4 — bodies must be cached by digest, not logged", got)
 		}
 
 		if got := getBody(t, ctx, cl, bucket, "big", ""); !bytes.Equal(got, data) {
@@ -243,7 +243,7 @@ func TestForgeScenarios(t *testing.T) {
 		}
 
 		const emptyMD5 = `"d41d8cd98f00b204e9800998ecf8427e"`
-		spoolBefore := localBlobCount(t, ctx, s)
+		localBefore := localBlobCount(t, ctx, s)
 		put, err := cl.PutObject(ctx, &s3.PutObjectInput{
 			Bucket: aws.String(bucket),
 			Key:    aws.String("empty"),
@@ -255,8 +255,8 @@ func TestForgeScenarios(t *testing.T) {
 		if aws.ToString(put.ETag) != emptyMD5 {
 			t.Fatalf("PUT ETag = %s, want %s", aws.ToString(put.ETag), emptyMD5)
 		}
-		if got := localBlobCount(t, ctx, s) - spoolBefore; got != 0 {
-			t.Fatalf("zero-byte PUT added %d spool blobs, want 0", got)
+		if got := localBlobCount(t, ctx, s) - localBefore; got != 0 {
+			t.Fatalf("zero-byte PUT added %d cached blobs, want 0", got)
 		}
 
 		if got := getBody(t, ctx, cl, bucket, "empty", ""); len(got) != 0 {
@@ -395,8 +395,8 @@ func TestForgeScenarios(t *testing.T) {
 			}
 		}
 		// envelopeSizes reports the stored envelope sizes of the blobs a write
-		// recorded. They come from upload_intents rather than the spool: a
-		// multipart part's spool copy is gone once it parks.
+		// recorded. They come from upload_intents rather than the cache: a
+		// multipart part keeps no local copy.
 		envelopeSizes := func(t *testing.T, before, after map[string]int64) ([]int64, int64) {
 			t.Helper()
 			added := newIntentDigests(before, after)
@@ -691,13 +691,13 @@ func TestForgeScenarios(t *testing.T) {
 		}
 	})
 
-	// MultipartPartKeepsNoSpoolCopy: a part's blobs leave the spool once they
-	// park on the provider, so none of them is in the spool after UploadPart,
+	// MultipartPartKeepsNoLocalCopy: a part's blobs go only to the provider,
+	// so none of them has a local copy after UploadPart,
 	// nor after the abort (upstream
 	// AbortMultipartUpload_success verifies the registry rows via
 	// ListMultipartUploads).
-	t.Run("MultipartPartKeepsNoSpoolCopy", func(t *testing.T) {
-		const bucket, key = "mpabort-spool", "obj"
+	t.Run("MultipartPartKeepsNoLocalCopy", func(t *testing.T) {
+		const bucket, key = "mpabort-local", "obj"
 		if _, err := cl.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
 			t.Fatalf("CreateBucket: %v", err)
 		}
@@ -721,16 +721,16 @@ func TestForgeScenarios(t *testing.T) {
 		if len(digests) != 3 {
 			t.Fatalf("UploadPart stored %d blobs, want 3", len(digests))
 		}
-		if spooled := spooledDigests(t, ctx, s, digests); len(spooled) != 0 {
-			t.Fatalf("UploadPart left %d of its blobs in the spool, want 0: a parked part keeps no local copy", len(spooled))
+		if local := localDigests(t, ctx, s, digests); len(local) != 0 {
+			t.Fatalf("UploadPart left %d of its blobs on local disk, want 0: a part keeps no local copy", len(local))
 		}
 		if _, err := cl.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
 			Bucket: aws.String(bucket), Key: aws.String(key), UploadId: create.UploadId,
 		}); err != nil {
 			t.Fatalf("AbortMultipartUpload: %v", err)
 		}
-		if spooled := spooledDigests(t, ctx, s, digests); len(spooled) != 0 {
-			t.Fatalf("abort left %d of the part's blobs in the spool, want 0", len(spooled))
+		if local := localDigests(t, ctx, s, digests); len(local) != 0 {
+			t.Fatalf("abort left %d of the part's blobs on local disk, want 0", len(local))
 		}
 	})
 
