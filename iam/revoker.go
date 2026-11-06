@@ -31,6 +31,21 @@ func NewRevoker(proofs *KeyProofs, keys *VerificationKeyCache, tenants *TenantCa
 	return &Revoker{proofs: proofs, keys: keys, tenants: tenants, logger: logger}
 }
 
+// ClearAll clears every access key's caches, for when revocations may have
+// been missed and there is no telling which keys they named: each key's next
+// request falls through to Hilt, which re-authorizes it, or refuses a deleted
+// one. The record of revoked CIDs is kept. Stores already captured, such as
+// the uploader's ship authority, are not reached (see
+// [KeyProofs.InvalidateAll]). It returns how many keys' proof stores it
+// dropped.
+func (r *Revoker) ClearAll() int {
+	n := r.proofs.InvalidateAll()
+	r.keys.Clear()
+	r.tenants.Clear()
+	r.logger.Info("iam: every access key's caches cleared", zap.Int("proof_stores", n))
+	return n
+}
+
 // Revoke records the revoked delegation and clears the caches of every
 // access key whose proof store holds it, returning the affected key DIDs. An
 // empty result means nothing cached referenced the delegation — then no
