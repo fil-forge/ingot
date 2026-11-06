@@ -50,7 +50,7 @@ func TestExtents_PutObjectReadsBack(t *testing.T) {
 	b, _, _ := newRefTestBackend(t, extentBlobSize)
 	data := testBody(1100*extentBlobSize + 300) // 1,101 blobs
 	bucket, key := "bk", "big"
-	if _, err := b.PutObject(context.Background(), s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(data)}); err != nil {
+	if _, err := b.PutObject(context.Background(), s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(data), ContentLength: byteLen(data)}); err != nil {
 		t.Fatalf("PutObject: %v", err)
 	}
 	assertExtents(t, b, key, 1)
@@ -79,7 +79,7 @@ func TestExtents_DeleteReleasesEveryBlob(t *testing.T) {
 	ctx := context.Background()
 	data := testBody(1100 * extentBlobSize)
 	bucket, key := "bk", "big"
-	if _, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(data)}); err != nil {
+	if _, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(data), ContentLength: byteLen(data)}); err != nil {
 		t.Fatalf("PutObject: %v", err)
 	}
 	rv := assertExtents(t, b, key, 1)
@@ -123,7 +123,7 @@ func TestExtents_CopyWritesItsOwnExtents(t *testing.T) {
 	}
 	data := testBody(1100 * extentBlobSize)
 	bucket, key := "src", "big"
-	if _, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(data)}); err != nil {
+	if _, err := b.PutObject(ctx, s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: bytes.NewReader(data), ContentLength: byteLen(data)}); err != nil {
 		t.Fatalf("PutObject: %v", err)
 	}
 	dstBucket, dst, src := "dst", "copy", "src/big"

@@ -66,7 +66,8 @@ func drainReleases(t *testing.T, b *Backend) {
 
 // assertReleased drains the deferred-release queue, then asserts a digest's
 // enc-params row and upload intent are gone and (wantRemoved) its network
-// release was invoked.
+// release was invoked: a remove of an accepted blob or an abort of a parked
+// one.
 func assertReleased(t *testing.T, b *Backend, mem *testStore, rm *recordingRemover, d multihash.Multihash, wantRemoved bool) {
 	t.Helper()
 	drainReleases(t, b)
@@ -77,8 +78,8 @@ func assertReleased(t *testing.T, b *Backend, mem *testStore, rm *recordingRemov
 	if _, err := mem.IntentByDigest(ctx, d); !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("upload intent for %x survived (err=%v)", d, err)
 	}
-	if got := rm.removedDigests()[string(d)] > 0; got != wantRemoved {
-		t.Fatalf("RemoveBlob(%x) invoked = %v, want %v", d, got, wantRemoved)
+	if got := rm.removedDigests()[string(d)] > 0 || abortedOn(b, d); got != wantRemoved {
+		t.Fatalf("network release of %x invoked = %v, want %v", d, got, wantRemoved)
 	}
 }
 
@@ -551,6 +552,7 @@ func newDeferredBackend(t *testing.T, up deferredTestUploader, mods ...func(*Dep
 	for _, mod := range mods {
 		mod(&deps)
 	}
+	withStreaming(t, &deps, dir)
 	b := New(deps)
 	mem.start(t, b)
 	if err := mem.Create(ctx, "bk", did.Undef, registry.CreateState{}); err != nil {
@@ -1586,6 +1588,7 @@ func TestReleaseFreesSpoolCopyOfDeletedPutObject(t *testing.T) {
 	if n, err := b.SweepPendingReleases(ctx); err != nil || n != 1 {
 		t.Fatalf("second sweep executed %d releases (err=%v), want 1", n, err)
 	}
+	settleCache(t, b, d) // the release evicts the cached copy through the queue
 	assertLocalCopyReleased(t, b, mem, d)
 }
 
@@ -1823,7 +1826,7 @@ func TestSweepReleasesSessionThatOutlivedItsBucket(t *testing.T) {
 	}
 	uploadID := res.UploadId
 	one := int32(1)
-	if _, err := b.UploadPart(ctx, &s3.UploadPartInput{Bucket: &bucket, Key: &key, UploadId: &uploadID, PartNumber: &one, Body: bytes.NewReader(testBody(int(backend.MinPartSize)))}); err != nil {
+	if _, err := b.UploadPart(ctx, &s3.UploadPartInput{Bucket: &bucket, Key: &key, UploadId: &uploadID, PartNumber: &one, Body: bytes.NewReader(testBody(int(backend.MinPartSize))), ContentLength: byteLen(testBody(int(backend.MinPartSize)))}); err != nil {
 		t.Fatalf("UploadPart: %v", err)
 	}
 	d := hygienePartDigests(t, mem, uploadID, 1)[0]
@@ -1877,7 +1880,7 @@ func TestRecreatedBucketDisownsItsPredecessorsUploads(t *testing.T) {
 	}
 	uploadID := res.UploadId
 	one := int32(1)
-	out, err := b.UploadPart(ctx, &s3.UploadPartInput{Bucket: &bucket, Key: &key, UploadId: &uploadID, PartNumber: &one, Body: bytes.NewReader(testBody(int(backend.MinPartSize)))})
+	out, err := b.UploadPart(ctx, &s3.UploadPartInput{Bucket: &bucket, Key: &key, UploadId: &uploadID, PartNumber: &one, Body: bytes.NewReader(testBody(int(backend.MinPartSize))), ContentLength: byteLen(testBody(int(backend.MinPartSize)))})
 	if err != nil {
 		t.Fatalf("UploadPart: %v", err)
 	}
@@ -1899,7 +1902,7 @@ func TestRecreatedBucketDisownsItsPredecessorsUploads(t *testing.T) {
 		}
 	}
 	two := int32(2)
-	_, err = b.UploadPart(ctx, &s3.UploadPartInput{Bucket: &bucket, Key: &key, UploadId: &uploadID, PartNumber: &two, Body: bytes.NewReader(testBody(int(backend.MinPartSize)))})
+	_, err = b.UploadPart(ctx, &s3.UploadPartInput{Bucket: &bucket, Key: &key, UploadId: &uploadID, PartNumber: &two, Body: bytes.NewReader(testBody(int(backend.MinPartSize))), ContentLength: byteLen(testBody(int(backend.MinPartSize)))})
 	wantNoSuchUpload("UploadPart", err)
 	_, _, err = b.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{Bucket: &bucket, Key: &key, UploadId: &uploadID,
 		MultipartUpload: &types.CompletedMultipartUpload{Parts: []types.CompletedPart{{PartNumber: &one, ETag: out.ETag}}}})
@@ -2129,11 +2132,10 @@ func (f *failPutPart) PutPart(ctx context.Context, p registry.MultipartPart, tre
 }
 
 // TestUploadPartFailedRowWriteReleasesItsBlobs: the part row write fails for
-// a reason other than the session being gone. No row points at the spooled
-// blobs, so the upload records their releases before failing; the session
-// stays open for the retry. The blobs never left the node (the row is
-// written before the park), so their release is local and asks the network
-// for nothing: a background retry would have no authority for it.
+// a reason other than the session being gone. No row points at the streamed
+// blobs, so the upload records their releases before failing, with the
+// request's authority, and the release removes them from the provider they
+// streamed to; the session stays open for the retry.
 func TestUploadPartFailedRowWriteReleasesItsBlobs(t *testing.T) {
 	rm := &recordingRemover{}
 	mp := &failPutPart{fails: 1}
@@ -2160,8 +2162,8 @@ func TestUploadPartFailedRowWriteReleasesItsBlobs(t *testing.T) {
 	if len(entries) != 0 {
 		t.Fatalf("spool holds %d blobs after the failed row write, want 0", len(entries))
 	}
-	if n := len(rm.removedDigests()); n != 0 {
-		t.Fatalf("RemoveBlob called for %d blobs that never left the node, want 0", n)
+	if n := len(rm.removedDigests()); n != 1 {
+		t.Fatalf("RemoveBlob called for %d blobs, want the one that streamed", n)
 	}
 	if sess, err := mem.GetSession(ctx, uploadID); err != nil || sess.State != registry.SessionOpen {
 		t.Fatalf("session after the failed part = %v/%v, want still open", sess, err)
@@ -2187,11 +2189,11 @@ func (f *failShred) DeleteEncryptionParams(ctx context.Context, space did.DID, d
 	return f.EncryptionParamsStore.DeleteEncryptionParams(ctx, space, digest)
 }
 
-// TestReleaseKeepsIntentUntilLocalCleanupSucceeds: a release of a blob that
-// never left the node fails at its crypto-shred. The intent and spool copy
+// TestReleaseKeepsIntentUntilLocalCleanupSucceeds: a release of a streamed
+// blob with no rows fails at its crypto-shred. The intent and spool copy
 // must survive that attempt, or the retry would find neither rows nor
-// intent and owe a network remove it has no authority for; the retry then
-// finishes the local cleanup without touching the network.
+// intent and could not tell the blob had left the node; the retry then
+// removes it from the provider and finishes the local cleanup.
 func TestReleaseKeepsIntentUntilLocalCleanupSucceeds(t *testing.T) {
 	rm := &recordingRemover{}
 	mp := &failPutPart{fails: 1}
@@ -2219,8 +2221,8 @@ func TestReleaseKeepsIntentUntilLocalCleanupSucceeds(t *testing.T) {
 		t.Fatalf("pending releases after the failed attempt = %d, want 1", len(pending))
 	}
 	d := pending[0].Digest
-	if in, err := mem.IntentByDigest(ctx, d); err != nil || in.State != registry.IntentSpooled {
-		t.Fatalf("intent after the failed attempt = %v/%v, want kept as spooled", in, err)
+	if in, err := mem.IntentByDigest(ctx, d); err != nil || in.State != registry.IntentUploading {
+		t.Fatalf("intent after the failed attempt = %v/%v, want kept as uploading", in, err)
 	}
 	if _, err := os.Stat(localPath(b, d)); err != nil {
 		t.Fatalf("spool copy gone after the failed attempt: %v", err)
@@ -2233,8 +2235,8 @@ func TestReleaseKeepsIntentUntilLocalCleanupSucceeds(t *testing.T) {
 	if _, err := os.Stat(localPath(b, d)); !os.IsNotExist(err) {
 		t.Fatalf("spool copy survived the retry (err=%v)", err)
 	}
-	if n := len(rm.removedDigests()); n != 0 {
-		t.Fatalf("RemoveBlob called %d times for a blob that never left the node, want 0", n)
+	if n := rm.removedDigests()[string(d)]; n != 1 {
+		t.Fatalf("RemoveBlob called %d times for the streamed blob, want 1", n)
 	}
 }
 
@@ -2297,61 +2299,6 @@ func TestReapDoesNotRecordAReleaseAlreadyRunToCompletion(t *testing.T) {
 	}
 	if n := len(rm.removedDigests()); n != 0 {
 		t.Fatalf("RemoveBlob called for %d blobs, want 0: the blob was released as a parked one", n)
-	}
-}
-
-// TestReleaseRemovesBlobAcceptedWithoutRows: at Complete a never-parked blob
-// is uploaded and accepted, then the location fails to record, leaving no
-// park and no location row. If the client aborts instead of retrying, the
-// release must still remove the blob from the network: the rows' absence is
-// not proof it never left the node.
-func TestReleaseRemovesBlobAcceptedWithoutRows(t *testing.T) {
-	rm := &recordingRemover{}
-	locs := &failOncePutLocation{}
-	b, mem := newDeferredBackend(t, testfakes.NopUploader{}, func(d *Deps) {
-		locs.LocationStore = d.Locations
-		d.Locations = locs
-		d.Remover = rm
-	})
-	ctx := context.Background()
-	bucket, key := "bk", "no-rows"
-
-	uploadID := mpCreate(t, b, key, "", "")
-	out, err := mpUploadPart(t, b, key, uploadID, 1, testBody(int(backend.MinPartSize)), nil)
-	if err != nil {
-		t.Fatalf("UploadPart: %v", err)
-	}
-	d := hygienePartDigests(t, mem, uploadID, 1)[0]
-	// Make the blob look never parked: no location, intent back to spooled.
-	if err := mem.DeleteLocation(ctx, mem.bk(), d); err != nil {
-		t.Fatalf("DeleteLocation: %v", err)
-	}
-	if err := mem.SetIntentState(ctx, mem.bk(), d, registry.IntentSpooled); err != nil {
-		t.Fatalf("SetIntentState: %v", err)
-	}
-
-	// Complete uploads it synchronously, the provider accepts, the location
-	// write fails.
-	locs.armed = true
-	one := int32(1)
-	if _, err := mpComplete(t, b, key, uploadID, []types.CompletedPart{{PartNumber: &one, ETag: out.ETag}}, nil); err == nil {
-		t.Fatal("Complete succeeded although the location failed to record")
-	}
-	if locs.armed {
-		t.Fatal("the location store never refused a write")
-	}
-	if loc, err := mem.GetLocation(ctx, mem.bk(), d); err == nil && loc != nil {
-		t.Fatal("location row exists; the scenario needs the blob accepted with no rows")
-	}
-
-	if err := b.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{Bucket: &bucket, Key: &key, UploadId: &uploadID}); err != nil {
-		t.Fatalf("Abort: %v", err)
-	}
-	if rm.removedDigests()[string(d)] != 1 {
-		t.Fatalf("RemoveBlob calls for %x = %d, want 1: the accepted blob must be removed from the network", d, rm.removedDigests()[string(d)])
-	}
-	if _, err := mem.IntentByDigest(ctx, d); !errors.Is(err, registry.ErrNotFound) {
-		t.Fatalf("intent for %x survived the release (err=%v)", d, err)
 	}
 }
 

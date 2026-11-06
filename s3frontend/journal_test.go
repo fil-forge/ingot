@@ -58,7 +58,7 @@ func newJournalingBackend(t *testing.T) (*Backend, *testStore, *logstore.Store, 
 		_ = log.Close(ctx)
 	})
 
-	b := New(Deps{
+	deps := Deps{
 		Authority:  mem,
 		Registry:   mem,
 		Intents:    mem,
@@ -78,7 +78,9 @@ func newJournalingBackend(t *testing.T) (*Backend, *testStore, *logstore.Store, 
 		RegionKeys: testRegionKeys(t),
 		TenantKeys: testTenantKeys(),
 		Claims:     mem,
-	})
+	}
+	withStreaming(t, &deps, dir)
+	b := New(deps)
 	mem.start(t, b)
 	require.NoError(t, mem.Create(ctx, "bk", did.Undef, registry.CreateState{}))
 	return b, mem, log, release

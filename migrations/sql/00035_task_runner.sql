@@ -25,8 +25,24 @@ DROP TABLE ingot.blob_streams;
 -- transaction that drops its last claim, so its record table is gone.
 DROP TABLE ingot.blob_release_intents;
 
+-- A part is 'written' until its blobs have all parked. Nothing uploads a part
+-- from a local copy, so one whose blobs never all parked is refused at
+-- Complete, and the client uploads it again.
+ALTER TABLE ingot.multipart_parts DROP CONSTRAINT multipart_parts_state_check;
+UPDATE ingot.multipart_parts SET state = 'written' WHERE state = 'spooled';
+ALTER TABLE ingot.multipart_parts
+    ADD CONSTRAINT multipart_parts_state_check
+        CHECK (state IN ('written','parked','accepted')),
+    ALTER COLUMN state SET DEFAULT 'written';
+
 -- +goose Down
 -- In reverse order of the Up statements.
+ALTER TABLE ingot.multipart_parts DROP CONSTRAINT multipart_parts_state_check;
+UPDATE ingot.multipart_parts SET state = 'spooled' WHERE state = 'written';
+ALTER TABLE ingot.multipart_parts
+    ADD CONSTRAINT multipart_parts_state_check
+        CHECK (state IN ('spooled','parked','accepted')),
+    ALTER COLUMN state SET DEFAULT 'spooled';
 CREATE TABLE ingot.blob_release_intents (
     space      text        NOT NULL,
     digest     bytea       NOT NULL,
