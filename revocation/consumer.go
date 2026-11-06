@@ -38,7 +38,17 @@
 // database from a backup, or restarting a service that keeps its records in
 // memory, restart ingot once the service is serving again, and after a refused
 // cursor too. The restart empties every cache, and any record the consumer
-// then skips was recorded before it, so none can matter.
+// then skips was recorded before it, so each key such a record named goes to
+// Hilt on its next request.
+//
+// One case survives a restart: a Hilt write that published its revocations,
+// then failed to commit. Hilt keeps serving the revoked delegations until a
+// retry commits. Ingot's record of revoked delegations, which keeps it from
+// caching them (iam.KeyProofs), lives in memory, so a restarted ingot caches
+// them again. The retry republishes a byte-identical revocation, which the
+// service deduplicates, so the firehose never reports it again, and the key
+// keeps working from cache until its cached authorization expires. Every
+// restart has this gap, not only one after a refused cursor.
 //
 // The gateway keeps serving while the service is unreachable (reconnect with
 // capped backoff); in the worst case cache entries age out on their own TTLs,
