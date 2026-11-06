@@ -105,18 +105,15 @@ type Config struct {
 	RevocationServiceURL string `mapstructure:"revocation_service_url" yaml:"revocation_service_url"`
 	RevocationServiceDID string `mapstructure:"revocation_service_did" yaml:"revocation_service_did"`
 
-	// MultipartSessionTTL bounds abandoned multipart uploads (Go duration
-	// string, e.g. "168h"): a session whose state has not changed for this
-	// long is torn down by a background sweeper and its parts released.
-	// Empty → default 7 days; a negative duration disables the sweeper.
-	// A part keeps no local copy once it parks on its provider, so Complete
-	// relies on the provider keeping the parked allocation: a session
-	// completed after the provider has expired it fails, and the client must
-	// upload those parts again. The TTL counts from the session's last state
-	// change, and a Complete that fails returns the session to open, which
-	// restarts it; so it bounds a parked part's age only while no Complete
-	// fails. Keep it well under how long the provider keeps parked
-	// allocations.
+	// MultipartSessionTTL bounds multipart uploads (Go duration string,
+	// e.g. "168h"): an upload still open this long after its creation is
+	// aborted and its parts released, and a completed one is reaped this long
+	// after its Complete. Empty → default 7 days; a negative duration
+	// disables both. A part keeps no local copy once it parks on its
+	// provider, so Complete relies on the provider keeping the parked
+	// allocation: an upload completed after the provider has expired it
+	// fails, and the client must upload those parts again. Keep it well under
+	// how long the provider keeps parked allocations.
 	MultipartSessionTTL string `mapstructure:"multipart_session_ttl" yaml:"multipart_session_ttl"`
 
 	// CompleteMultipartKeepalive keeps a slow CompleteMultipartUpload's

@@ -77,10 +77,9 @@ type PutChange struct {
 	// DeletePre are a delete marker's preconditions against the version it
 	// supersedes; nil for none.
 	DeletePre *DeletePreconditions
-	// Session is the multipart upload the version completes, or "": the
-	// upload must still be completing, and is recorded completed with the
-	// commit.
-	Session string
+	// Completes marks a Complete's put, whose If-Match on a key with no
+	// object is NoSuchKey rather than PreconditionFailed.
+	Completes bool
 }
 
 // BlobRefTask names the pending reference a write holds on one blob: the ID

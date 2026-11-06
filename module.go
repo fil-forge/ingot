@@ -527,6 +527,10 @@ const shardWorkers = 4
 // is a round trip to the upload service.
 const releaseWorkers = 8
 
+// multipartWorkers is how many multipart uploads' auto-aborts and reaps one
+// instance runs at once. Their other changes run in their requests.
+const multipartWorkers = 2
+
 // acceptWorkers is how many multipart uploads' accepts one instance runs at
 // once. Each concludes up to a batch of blobs per round trip.
 const acceptWorkers = 4
@@ -550,6 +554,7 @@ func provideTaskRunner(pool *pgxpool.Pool, id identity.Identity, logger *zap.Log
 		// In the RFC's queue order: a task may run sync children only on
 		// the queues after its own.
 		Queues: []taskrunner.QueueOptions{
+			{Name: registry.MultipartQueue, Workers: multipartWorkers},
 			{Name: registry.AcceptQueue, Workers: acceptWorkers},
 			{Name: registry.BucketQueue, Workers: bucketWorkers},
 			{Name: registry.UploadQueue, Workers: uploadRegistrationWorkers},

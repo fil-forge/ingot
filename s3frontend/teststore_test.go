@@ -1,10 +1,12 @@
 package s3frontend
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -56,16 +58,21 @@ func newTestStore(t testing.TB) *testStore {
 	pool := pgtest.New(t)
 	r, err := taskrunner.New(pool, taskrunner.Options{
 		Schema: "ingot",
+		// In production's order: a task may run sync children only on the
+		// queues after its own.
 		Queues: []taskrunner.QueueOptions{
-			{Name: registry.UploadQueue, Workers: 2},
-			{Name: registry.ReleaseQueue, Workers: 2},
-			{Name: ShardQueue, Workers: 2},
-			// No workers either: an upload's accept runs when a test runs it
+			// Uploads' changes run sync, in their requests; the workers run
+			// the auto-aborts and reaps.
+			{Name: registry.MultipartQueue, Workers: 2},
+			// No workers: an upload's accept runs when a test runs it
 			// (runAccepts) or Complete does, which cancels the one UploadPart
 			// queued and runs its own.
 			{Name: registry.AcceptQueue},
 			// Commits run sync, in the request; the workers run ships.
 			{Name: registry.BucketQueue, Workers: 2},
+			{Name: registry.UploadQueue, Workers: 2},
+			{Name: registry.ReleaseQueue, Workers: 2},
+			{Name: ShardQueue, Workers: 2},
 		},
 		LeaseTTL:     time.Second,
 		PollInterval: 10 * time.Millisecond,
@@ -86,7 +93,7 @@ func newTestStore(t testing.TB) *testStore {
 func (s *testStore) start(t testing.TB, b *Backend) {
 	t.Helper()
 	if s.started {
-		b.tasks, b.shards, b.releases, b.accepts, b.buckets = s.tasks, s.tasks, s.tasks, s.tasks, s.tasks
+		b.tasks, b.shards, b.releases, b.accepts, b.buckets, b.uploads = s.tasks, s.tasks, s.tasks, s.tasks, s.tasks, s.tasks
 		b.cache.OnRead(b.renewCached)
 		return
 	}
@@ -112,6 +119,9 @@ func (s *testStore) start(t testing.TB, b *Backend) {
 	}
 	if err := b.RegisterBucketTasks(s.tasks); err != nil {
 		t.Fatalf("register bucket tasks: %v", err)
+	}
+	if err := b.RegisterMultipartTasks(s.tasks); err != nil {
+		t.Fatalf("register multipart tasks: %v", err)
 	}
 	if err := s.tasks.Start(context.Background()); err != nil {
 		t.Fatalf("start task queues: %v", err)
@@ -424,4 +434,108 @@ func (b *Backend) SweepPendingReleases(ctx context.Context) (int, error) {
 func commitPut(ctx context.Context, b *Backend, st *registry.State, key string, mf *msbucket.ObjectManifest, blobs msbucket.BlobRefs, refs map[string]taskrunner.TaskID) error {
 	_, _, err := b.commitOne(ctx, st, KeyChange{Key: key, Put: &PutChange{Manifest: mf, HasBlobs: blobs != nil, Blobs: blobs, Refs: blobRefTasks(refs)}}, "commit version")
 	return err
+}
+
+// PutPart records p as an add-part's commit does, outside any task, for
+// tests that set up a part directly.
+func (s *testStore) PutPart(ctx context.Context, p registry.MultipartPart, tree *registry.PartTree, release registry.ReleaseTask) ([]multihash.Multihash, error) {
+	w, released, err := s.PartWrites(ctx, p, tree, release)
+	if err != nil {
+		return nil, err
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	for _, st := range append(w.Guards, w.Statements...) {
+		if _, err := tx.Exec(ctx, st.SQL, st.Args...); err != nil {
+			return nil, err
+		}
+	}
+	for _, spec := range w.Spawns {
+		if _, err := s.tasks.SubmitTx(ctx, tx, spec); err != nil {
+			return nil, err
+		}
+	}
+	if err := s.tasks.CancelTx(ctx, tx, registry.ReleaseQueue, w.Expiries...); err != nil {
+		return nil, err
+	}
+	return released, tx.Commit(ctx)
+}
+
+// setSessionState sets uploadID's session state directly, for tests of
+// what a change does to an upload in that state.
+func (s *testStore) setSessionState(t testing.TB, uploadID, state string) {
+	t.Helper()
+	if _, err := s.pool.Exec(context.Background(),
+		`UPDATE ingot.multipart_sessions SET state = $2 WHERE upload_id = $1`, uploadID, state); err != nil {
+		t.Fatalf("set session state: %v", err)
+	}
+}
+
+// sweepUploads runs, at once, what each upload's scheduled tasks do once its
+// TTL is up: the auto-abort of every open upload, and its releases, and the
+// reap of every completed one. It returns how many uploads it removed.
+func sweepUploads(ctx context.Context, b *Backend) (int, error) {
+	s := storeFor(b)
+	rows, err := s.pool.Query(ctx, `SELECT upload_id, state, space FROM ingot.multipart_sessions ORDER BY upload_id`)
+	if err != nil {
+		return 0, err
+	}
+	type upload struct{ id, state, space string }
+	var uploads []upload
+	for rows.Next() {
+		var u upload
+		if err := rows.Scan(&u.id, &u.state, &u.space); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		uploads = append(uploads, u)
+	}
+	rows.Close()
+	n := 0
+	for _, u := range uploads {
+		action, args := registry.MultipartReapAction, []byte(nil)
+		if u.state == registry.SessionOpen {
+			var buf bytes.Buffer
+			if err := (&MultipartAbortTask{Auto: true}).MarshalCBOR(&buf); err != nil {
+				return n, err
+			}
+			action, args = registry.MultipartAbortAction, buf.Bytes()
+		}
+		call := &abortCall{}
+		if _, err := b.uploads.Run(context.WithValue(ctx, abortKey{}, call), uploadSpec(u.id, action, args)); err != nil {
+			return n, err
+		}
+		if space, err := did.Parse(u.space); err == nil {
+			b.releaseNow(ctx, space, call.released)
+		}
+		n++
+	}
+	return n, nil
+}
+
+// releaseSpaces returns the spaces of every release queued so far, run or
+// not, each once.
+func releaseSpaces(t *testing.T, mem *testStore) []did.DID {
+	t.Helper()
+	tasks, err := mem.queued(context.Background(), registry.ReleaseQueue)
+	if err != nil {
+		t.Fatalf("queued releases: %v", err)
+	}
+	var out []did.DID
+	for _, task := range tasks {
+		if task.Action != registry.ReleaseAction {
+			continue
+		}
+		space, _, err := registry.ParseReleaseSubject(task.Subject)
+		if err != nil {
+			t.Fatalf("release subject: %v", err)
+		}
+		if !slices.Contains(out, space) {
+			out = append(out, space)
+		}
+	}
+	return out
 }

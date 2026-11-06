@@ -1,7 +1,6 @@
 package registry_test
 
 import (
-	"sync"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -20,7 +19,7 @@ func TestPutPartReplaced(t *testing.T) {
 	runPutPartReplacedSuite(t, pool, registry.NewPostgres(pool, registry.WithTasks(liveUploadTasks(t, pool))))
 }
 
-func runPutPartReplacedSuite(t *testing.T, pool *pgxpool.Pool, st registry.MultipartStore) {
+func runPutPartReplacedSuite(t *testing.T, pool *pgxpool.Pool, st *registry.Postgres) {
 	ctx := t.Context()
 	digest := func(b byte) multihash.Multihash {
 		return multihash.Multihash([]byte{0x12, 0x01, b})
@@ -75,58 +74,6 @@ func runPutPartReplacedSuite(t *testing.T, pool *pgxpool.Pool, st registry.Multi
 		released, err = st.PutPart(ctx, part("pp-again", 2, digest(4)), nil, registry.ReleaseTask{})
 		if err != nil || released != nil {
 			t.Fatalf("PutPart of part 2 = %v, %v; want no releases", released, err)
-		}
-	})
-
-	t.Run("concurrent writes of one part number release every row they replace", func(t *testing.T) {
-		// Every write of the part number either stands at the end or is
-		// released by the write that replaced it: no row is replaced
-		// unseen, however the writes interleave.
-		space := open("pp-race")
-		const writers = 8
-		var wg sync.WaitGroup
-		reports := make([][]multihash.Multihash, writers)
-		errs := make([]error, writers)
-		for i := 0; i < writers; i++ {
-			wg.Add(1)
-			go func(i int) {
-				defer wg.Done()
-				reports[i], errs[i] = st.PutPart(ctx, part("pp-race", 1, digest(byte(0x10+i))), nil, registry.ReleaseTask{})
-			}(i)
-		}
-		wg.Wait()
-		seen := map[string]int{}
-		fresh := 0
-		for i := 0; i < writers; i++ {
-			if errs[i] != nil {
-				t.Fatalf("writer %d: %v", i, errs[i])
-			}
-			if reports[i] == nil {
-				fresh++
-				continue
-			}
-			for _, d := range reports[i] {
-				seen[key(d)]++
-			}
-		}
-		if fresh != 1 {
-			t.Fatalf("%d writers found no row to replace, want exactly the first", fresh)
-		}
-		parts, err := st.ListParts(ctx, "pp-race")
-		if err != nil || len(parts) != 1 || len(parts[0].BlobDigests) != 1 {
-			t.Fatalf("ListParts = %+v, %v", parts, err)
-		}
-		standing := key(parts[0].BlobDigests[0])
-		seen[standing]++
-		rec := recorded(space)
-		for i := 0; i < writers; i++ {
-			d := key(digest(byte(0x10 + i)))
-			if n := seen[d]; n != 1 {
-				t.Fatalf("writer %d's digest accounted for %d times, want once (released by one write, or standing)", i, n)
-			}
-			if _, ok := rec[d]; ok == (d == standing) {
-				t.Fatalf("writer %d's digest recorded for release = %v, want %v", i, ok, d != standing)
-			}
 		}
 	})
 }

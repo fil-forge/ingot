@@ -284,6 +284,37 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 		}
 		return err
 	}
+	// Closed first, so the bucket stays empty and gains no multipart upload
+	// while the ones in flight are aborted. In-flight uploads do not block
+	// deletion, as on AWS (and versitygw's conformance teardown deletes
+	// buckets without aborting them). The aborts run from here: the
+	// multipart queue is above the bucket queue, so no bucket task may run
+	// them. Each runs on the request's own proofs: hilt delegates blob.Abort
+	// and blob.Remove with s3:DeleteBucket, so a bucket that never saw a
+	// write has the authority to release what it holds.
+	if err := b.runBucket(ctx, st.Space, registry.BucketCloseAction, &BucketTask{Name: name}); err != nil {
+		return err
+	}
+	sessions, err := b.multipart.ListSessions(ctx, name)
+	if err != nil {
+		return fmt.Errorf("s3frontend: delete bucket: list mp sessions: %w", err)
+	}
+	for _, s := range sessions {
+		switch s.State {
+		case registry.SessionOpen:
+			if err := b.abortUpload(ctx, s); err != nil && !errors.Is(err, s3err.GetAPIError(s3err.ErrNoSuchUpload)) {
+				return fmt.Errorf("s3frontend: delete bucket: abort multipart upload %s: %w", s.UploadID, err)
+			}
+		case registry.SessionCompleted:
+			if err := b.reapNow(ctx, s.UploadID); err != nil {
+				return fmt.Errorf("s3frontend: delete bucket: reap multipart upload %s: %w", s.UploadID, err)
+			}
+		}
+	}
+	if len(sessions) > 0 {
+		b.logger.Info("delete bucket: tore down multipart sessions",
+			zap.String("bucket", name), zap.Int("sessions", len(sessions)))
+	}
 	ctx = context.WithValue(ctx, deleteKey{}, name)
 	return b.runBucket(ctx, st.Space, registry.BucketDeleteAction, &BucketTask{Name: name})
 }
@@ -292,8 +323,36 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 // with: the name of the bucket it deletes.
 type deleteKey struct{}
 
-// runDeleteBucket is queue-bucket.delete. It fails on a bucket that holds
-// objects or multipart uploads in flight. Hilt authorizes the delete with the
+// refuseNonEmpty refuses st's bucket when it holds any object. S3 forbids
+// deleting non-empty buckets. It walks the MST until it sees any leaf, then
+// bails. Any leaf counts — a versioned bucket holding only delete markers is
+// still non-empty, and reports the versioned error ("you must delete all
+// versions").
+func (b *Backend) refuseNonEmpty(ctx context.Context, st *registry.State) error {
+	if !st.Root.Defined() {
+		return nil
+	}
+	t := mst.LoadMST(b.read, st.Space, st.Root)
+	var seen bool
+	if err := t.WalkLeavesFromNocache(ctx, "", func(string, cid.Cid) error {
+		seen = true
+		return mst.ErrStopWalk
+	}); err != nil {
+		return err
+	}
+	if !seen {
+		return nil
+	}
+	if st.Versioning.Configured() {
+		return s3err.GetAPIError(s3err.ErrVersionedBucketNotEmpty)
+	}
+	return s3err.GetAPIError(s3err.ErrBucketNotEmpty)
+}
+
+// runDeleteBucket is queue-bucket.delete, the last step of DeleteBucket,
+// after queue-bucket.close and the aborts of the bucket's multipart uploads.
+// It fails on a bucket that holds objects or an upload, which the close
+// makes impossible. Hilt authorizes the delete with the
 // signed S3 request itself, which reaches the task only through its caller's
 // context, marked by the DeleteBucket request for this bucket (deleteKey): a
 // delete run without that mark, resumed by a worker or by another request's
@@ -315,26 +374,15 @@ func (b *Backend) runDeleteBucket(ctx context.Context, _ *taskrunner.Exec, t tas
 			return err
 		}
 
-		// S3 forbids deleting non-empty buckets. Walk the MST until we see any
-		// leaf, then bail. Any leaf counts — a versioned bucket holding only
-		// delete markers is still non-empty, and reports the versioned error
-		// ("you must delete all versions").
-		if st.Root.Defined() {
-			t := mst.LoadMST(b.read, st.Space, st.Root)
-			var seen bool
-			walkErr := t.WalkLeavesFromNocache(ctx, "", func(string, cid.Cid) error {
-				seen = true
-				return mst.ErrStopWalk
-			})
-			if walkErr != nil {
-				return walkErr
-			}
-			if seen {
-				if st.Versioning.Configured() {
-					return s3err.GetAPIError(s3err.ErrVersionedBucketNotEmpty)
-				}
-				return s3err.GetAPIError(s3err.ErrBucketNotEmpty)
-			}
+		if err := b.refuseNonEmpty(ctx, st); err != nil {
+			return err
+		}
+		sessions, err := b.multipart.ListSessions(ctx, name)
+		if err != nil {
+			return fmt.Errorf("s3frontend: delete bucket: list mp sessions: %w", err)
+		}
+		if len(sessions) > 0 {
+			return fmt.Errorf("s3frontend: delete bucket: %d multipart uploads remain after the close: %w", len(sessions), errBucketClosing)
 		}
 
 		// Everything below releases blobs, and the catalog's own segments
@@ -349,51 +397,6 @@ func (b *Backend) runDeleteBucket(ctx context.Context, _ *taskrunner.Exec, t tas
 		// would otherwise wait with it.
 		if err := b.reg.EmptyRoot(ctx, name, st.Root); err != nil {
 			return fmt.Errorf("s3frontend: delete bucket: empty the root: %w", err)
-		}
-
-		// In-flight multipart uploads do not block deletion, as on AWS (and
-		// versitygw's conformance teardown deletes buckets without aborting
-		// them): tear down every session of the bucket — open ones aborted,
-		// stranded and completed ones reaped — recording their part blobs'
-		// releases before asking hilt to delete the space, which refuses
-		// while the space still holds blob registrations. A session whose
-		// releases cannot be queued fails the delete: its part rows are
-		// the only index to its blobs, and with the bucket row gone the
-		// sweeper would have no space to record them against.
-		//
-		// Every leg — the session teardown, the shipped-segment release and
-		// the drain below — runs on the request's own proofs: hilt delegates
-		// blob.Abort and blob.Remove with s3:DeleteBucket, so a bucket that
-		// never saw a write has the authority to release what it holds.
-		sessions, err := b.multipart.ListSessions(ctx, name)
-		if err != nil {
-			return fmt.Errorf("s3frontend: delete bucket: list mp sessions: %w", err)
-		}
-		for _, s := range sessions {
-			var ok bool
-			switch s.State {
-			case registry.SessionOpen:
-				ok = b.abortOpenSession(ctx, s)
-			case registry.SessionCompleted:
-				ok = b.reapCompletedSession(ctx, s)
-			case registry.SessionCompleting:
-				// Crash-stranded, or a live Complete accepting its parts.
-				// A live Complete's commit records the session completed
-				// only while it is still completing, so once this latch
-				// lands that commit fails with NoSuchUpload rather than
-				// install a manifest over the blobs this releases.
-				won, err := b.multipart.LatchSession(ctx, s.UploadID, registry.SessionCompleting, registry.SessionAborting)
-				ok = err == nil && won && b.reapAbortingSession(ctx, s)
-			default:
-				ok = b.reapAbortingSession(ctx, s)
-			}
-			if !ok {
-				return fmt.Errorf("s3frontend: delete bucket: multipart session %s: releases not queued; retry", s.UploadID)
-			}
-		}
-		if len(sessions) > 0 {
-			b.logger.Info("delete bucket: tore down multipart sessions",
-				zap.String("bucket", name), zap.Int("sessions", len(sessions)))
 		}
 
 		// Shipped catalog segments registered blobs in the bucket's space
@@ -456,6 +459,10 @@ func (b *Backend) runDeleteBucket(ctx context.Context, _ *taskrunner.Exec, t tas
 			return errors.New("s3frontend: delete bucket: no request in context")
 		}
 		if err := b.authority.DeleteBucket(ctx, req); err != nil {
+			// Hilt refused: the bucket works again.
+			if cerr := b.reg.SetClosing(ctx, name, false); cerr != nil {
+				b.logger.Warn("delete bucket: clear the closing mark after hilt refused", zap.String("bucket", name), zap.Error(cerr))
+			}
 			if errors.Is(err, bucketauthority.ErrNotFound) {
 				return s3err.GetAPIError(s3err.ErrNoSuchBucket)
 			} else if errors.Is(err, bucketauthority.ErrNotEmpty) {

@@ -61,8 +61,25 @@ CREATE TABLE ingot.blob_pending_refs (
 );
 CREATE INDEX blob_pending_refs_blob ON ingot.blob_pending_refs (space, digest);
 
+-- Every change to a multipart upload runs on its subject on the task queue,
+-- so an upload is open until a Complete commits it or an Abort deletes it.
+-- A session caught mid-transition is aborted with the others the stack drops.
+DELETE FROM ingot.multipart_sessions WHERE state IN ('completing', 'aborting');
+ALTER TABLE ingot.multipart_sessions
+    DROP CONSTRAINT multipart_sessions_state_check,
+    ADD CONSTRAINT multipart_sessions_state_check CHECK (state IN ('open','completed'));
+
+-- A bucket being deleted is closed first, so no commit or new multipart
+-- upload gets in while its uploads are aborted.
+ALTER TABLE ingot.buckets ADD COLUMN closing boolean NOT NULL DEFAULT false;
+
 -- +goose Down
 -- In reverse order of the Up statements.
+ALTER TABLE ingot.buckets DROP COLUMN closing;
+ALTER TABLE ingot.multipart_sessions
+    DROP CONSTRAINT multipart_sessions_state_check,
+    ADD CONSTRAINT multipart_sessions_state_check
+        CHECK (state IN ('open','completing','aborting','completed'));
 DROP TABLE ingot.blob_pending_refs;
 DROP INDEX ingot.upload_intents_stalled_idx;
 ALTER TABLE ingot.upload_intents

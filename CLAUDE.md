@@ -106,8 +106,10 @@ Internal:
   task per bucket change, sync for the request, on the bucket's subject;
   applies an ordered list of key changes, `bucketchanges.go`, to one Tx),
   `bucketadmin.go` (`queue-bucket.create`, `.set-versioning`,
-  `.set-object-lock-config`), `bucketship.go` (`queue-bucket.ship`, queued
-  on each seal), `multipart.go`, `bucket.go` (`queue-bucket.delete`), `listversions.go`,
+  `.set-object-lock-config`, `.close`, `.admit-upload`), `bucketship.go`
+  (`queue-bucket.ship`, queued on each seal), `multipart.go`,
+  `multipartqueue.go` (`queue-multipart-upload`: every change to an upload,
+  on the upload ID's subject), `bucket.go` (`queue-bucket.delete`), `listversions.go`,
   `backend.go`, `stream.go` (each body blob streams to its
   provider as the body arrives, teeing an object's bytes into the cache; a
   failed stream fails the request and aborts its allocation, and an
@@ -156,8 +158,12 @@ Internal:
   held and applied straight away (`CheckOwnWrites`). The daemon runs one
   runner (`provideTaskRunner` in `module.go`) over the `ingot` schema; its
   tables are migrated in the migration hook, and `Server` starts and stops
-  it. Queues in order: `queue-multipart-upload-shard` (accept),
-  `queue-bucket`, `queue-space-upload`, `queue-space-shard`, `queue-shard`.
+  it. Queues in order: `queue-multipart-upload`,
+  `queue-multipart-upload-shard` (accept), `queue-bucket`,
+  `queue-space-upload`, `queue-space-shard`, `queue-shard`.
+  `queue-multipart-upload` (`s3frontend/multipartqueue.go`), subject the
+  upload ID: an upload's create, add-part, complete, abort and reap, one at
+  a time;
   `queue-bucket` (`s3frontend/bucketqueue.go`), subject the bucket's space
   DID: every change to a bucket, placed on the instance holding its catalog
   log; `queue-space-upload` (`s3frontend/uploadqueue.go`), the
@@ -301,7 +307,8 @@ Ship, Retain}` override block (the only plane), `ReadCacheBytes` (0 → 256 MiB,
 path or string-encoded UCAN container, required alongside the URL and
 validated at startup down to holding at least one delegation),
 `TokenStoreDir` (→
-`DataDir`), `MultipartSessionTTL` (0 → 7d, negative → sweeper off),
+`DataDir`), `MultipartSessionTTL` (0 → 7d, negative → never: an open upload's
+auto-abort and a completed one's reap are due this long out),
 `LocalBlobMaxBytes` (0 → no budget for the cache, writes in progress
 included) with
 `CacheTTL` (1h: how long a body stays cached after it was cached or last

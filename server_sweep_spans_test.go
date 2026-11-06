@@ -23,8 +23,8 @@ func TestSweepersRecordRootSpans(t *testing.T) {
 	otel.SetTracerProvider(sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(rec)))
 	t.Cleanup(func() { otel.SetTracerProvider(prev) })
 
-	// A 2ms session TTL makes the multipart sweeper tick every millisecond.
-	s := newTestServer(t, config.ServerConfig{MultipartSessionTTL: 2 * time.Millisecond})
+	shortSweepInterval(t)
+	s := newTestServer(t, config.ServerConfig{})
 	require.NoError(t, s.Start(t.Context()))
 	time.Sleep(20 * time.Millisecond)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -33,14 +33,23 @@ func TestSweepersRecordRootSpans(t *testing.T) {
 
 	var sweeps int
 	for _, sp := range rec.Ended() {
-		if sp.Name() != "sweep.multipart_sessions" {
+		if sp.Name() != "sweep.local_blobs" {
 			continue
 		}
 		sweeps++
 		require.False(t, sp.Parent().IsValid(), "a sweep span is a trace's root")
 		require.NotEqual(t, codes.Error, sp.Status().Code, "sweep span marked failed: %s", sp.Status().Description)
 	}
-	require.NotZero(t, sweeps, "no sweep.multipart_sessions spans")
+	require.NotZero(t, sweeps, "no sweep.local_blobs spans")
+}
+
+// shortSweepInterval makes the local blob sweeper tick every millisecond
+// for the rest of the test.
+func shortSweepInterval(t *testing.T) {
+	t.Helper()
+	saved := localBlobSweepInterval
+	localBlobSweepInterval = time.Millisecond
+	t.Cleanup(func() { localBlobSweepInterval = saved })
 }
 
 // TestEndSweepSpan: a sweep's error marks its span failed while the server

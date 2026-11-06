@@ -650,9 +650,6 @@ func (b *Backend) applyPut(ctx context.Context, sc *commitScope, key string, p *
 	if err != nil {
 		return ChangeResult{}, cid.Undef, err
 	}
-	if p.Session != "" {
-		sc.guards = append(sc.guards, registry.CompletedSession(p.Session, mf.ETag, node.VersionID))
-	}
 	return ChangeResult{VersionID: node.VersionID, Seq: node.Seq}, root, nil
 }
 

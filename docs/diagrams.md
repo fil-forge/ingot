@@ -22,7 +22,7 @@ change to the diagrams to re-check. The maintenance rule lives in
 | `get` | [GetObject](#getobject-version-resolution-local-tiers-network-retrieval) | version resolution, tier fallthrough, network retrieval | here |
 | `multipart` | [Multipart upload](#multipart-upload-park-on-write-accept-in-the-background) | park at UploadPart, accept in the background, Complete's wait, abort unwind | here |
 | `part-states` | [Part states](#part-states-the-acceptance-queue) | the part rows as the upload's accept queue | here |
-| `multipart-states` | [Session states](#session-states-and-the-completeabort-latch) | the session state machine and the single-winner latch | here |
+| `multipart-states` | [Session states](#session-states-open-and-completed) | the session state machine, one change per upload at a time | here |
 | `blob-lifecycle` | [Blob lifecycle](#blob-lifecycle-uploading-parked-accepted-released) | intent states and the claim ledger gating deletion | here |
 | `version-tree` | [Per-key version storage](#per-key-version-storage-manifest-arm-leaf-arm-prev-tree) | the value union, the leaf, the prev tree | here |
 | `gc-candidates` | [Catalog GC candidates](#catalog-gc-candidates-what-gets-remembered-for-removal) | every path that records a superseded catalog block for removal | here |
@@ -499,14 +499,17 @@ sequenceDiagram
     autonumber
     actor C as S3 client
     participant B as s3frontend.Backend
+    participant M as queue-multipart-upload<br/>(task, subject = uploadId)
     participant A as queue-multipart-upload-shard.accept<br/>(task, subject = uploadId)
     participant R as registry<br/>(sessions, parts, parks, intents)
     participant U as sprue
     participant P as piri
-    participant Q as queue-bucket.commit<br/>(the bucket's subject)
+    participant Q as queue-bucket<br/>(the bucket's subject)
 
     C->>B: CreateMultipartUpload
-    B->>R: CreateSession(open) with headers + checksum algorithm
+    B->>M: run sync: queue-multipart-upload.create
+    M->>Q: run sync as a child: queue-bucket.admit-upload<br/>(a closing bucket: OperationAborted)
+    M->>R: with the task's commit: the session row (open) with headers + checksum algorithm#59;<br/>the auto-abort, queue-multipart-upload.abort, due one session TTL out (default 7 d)
     B-->>C: uploadId
     C->>B: UploadPart(n) / UploadPartCopy(n)
     B->>B: openSession (non-open: NoSuchUpload)
@@ -527,11 +530,12 @@ sequenceDiagram
             B->>U: /blob/abort the surplus allocation
         end
     end
-    B->>R: PutPart(parked, span_lengths, the adds' references): open sessions only, the row held<br/>FOR SHARE against a concurrent latch#59; writes of one part number serialised on an advisory lock#59;<br/>the references taken over (rows deleted, expiries cancelled) and a queue-space-shard.release<br/>task, due now, for each blob the replaced row named and this part does not, in the same<br/>transaction, returned to run#59; a refused part expires its references at once (dropRefsNow)
-    B->>A: in PutPart's transaction: queue the upload's accept,<br/>a replacement due now (at most one pending per upload)
+    B->>M: run sync: queue-multipart-upload.add-part, behind the upload's other changes<br/>(waiting past 30 s: SlowDown)
+    M->>R: PartWrites, with the task's commit: the part row (parked, span_lengths), open sessions<br/>only (otherwise NoSuchUpload)#59; the adds' references taken over (rows deleted, expiries<br/>cancelled)#59; a queue-space-shard.release task, due now, for each blob the replaced row<br/>named and this part does not, returned to run#59; a refused part expires its references at once (dropRefsNow)
+    M->>A: in the same commit: queue the upload's accept,<br/>a replacement due now (at most one pending per upload)
     B->>U: releaseNow: the tasks above, due at once, run inline (/blob/abort of the parks#59;<br/>a blob another part or the session still names is stale for that reference)
     B-->>C: part ETag (part md5#59; for a copy, of the copied bytes)
-    A->>R: GetSession (nothing to do unless open or completing)
+    A->>R: GetSession (nothing to do unless open)
     loop while a parked part is left after the part-number cursor
         A->>R: ListParkedParts after the cursor: a batch of up to 1000 blobs, a part never split
         A->>U: ConcludeBlobs: the batch's put receipts in one /ucan/conclude (2 min timeout),<br/>accept receipts read from the response (poll only as fallback)
@@ -540,39 +544,42 @@ sequenceDiagram
     A->>R: commit every batch's writes with the task
     Note over A,R: a failed batch fails the task and records nothing#59; the retry concludes again<br/>(a repeat to sprue)#59; 5 attempts from 5 s, doubling, up to 1 min
     C->>B: CompleteMultipartUpload(parts)
-    B->>B: validate parts (ascending, ETags, checksums, MinPartSize)#59;<br/>an error here is answered with its own status
-    alt session already completed
+    B->>M: run sync: queue-multipart-upload.complete, to start within replayWaitBudget (10 s)<br/>behind the upload's other changes, another Complete included
+    alt it did not start in time
+        B-->>C: 409 OperationAborted
+    else session already completed
+        M->>M: validate parts (the conditional-write precheck is skipped)
         B-->>C: report the version id recorded on the session (none for a null version),<br/>then its ETag (idempotent re-Complete)
-    else another Complete holds the latch
-        B-->>C: report no version id (the winner's isn't known yet), then wait (bounded):<br/>replay its result, or take the latch if it failed
-    else latch won
-        B->>R: LatchSession(open to completing), single winner
-        B->>R: ListPartTrees#59; re-hash over budget: 400 InvalidPartLayout,<br/>the deferred revert reopens the session
-        alt versioning Enabled, nothing reported yet
-            B->>R: reserveVersion: AllocVersionSeq before the commit, mint the versionId
+    else session open
+        M->>M: conditional-write precheck#59; validate parts (ascending, ETags, checksums,<br/>MinPartSize)#59; an error here is answered with its own status
+        M->>R: ListPartTrees#59; re-hash over budget: 400 InvalidPartLayout, the upload stays open
+        alt versioning Enabled
+            M->>R: reserveVersion: AllocVersionSeq before the commit, mint the versionId
             B-->>C: report it: versitygw commits the 200 with x-amz-version-id<br/>and x-amz-server-side-encryption
         else
             B-->>C: report no version id: the 200 commits with x-amz-server-side-encryption only
         end
         Note over B,C: from here the body is padded with a newline every<br/>complete_multipart_keepalive (5 s), and any error goes in the 200's body
-        B->>R: manifest spans from each part's span_lengths<br/>(rows without them: intent size + FEE geometry)
-        B->>A: run the accept as a sync task, limited to the named parts:<br/>after any running or pending accept, to start within acceptWaitBudget (30 s)
+        M->>R: manifest spans from each part's span_lengths<br/>(rows without them: intent size + FEE geometry)
+        M->>A: run the accept as a task of its own, not a child, limited to the named parts:<br/>after any running or pending accept, to start within acceptWaitBudget (30 s)#59;<br/>its writes commit before Complete reads the parts and assembles the tree
         alt the accept did not start in time
-            B-->>C: OperationAborted in the 200's body#59; the deferred revert reopens the session
+            B-->>C: OperationAborted in the 200's body#59; the upload stays open
         else the accept failed
-            B-->>C: its error in the 200's body#59; the deferred revert reopens the session
+            B-->>C: its error in the 200's body#59; the upload stays open
         else a named part not accepted with the blobs the request validated
-            B-->>C: InvalidPart in the 200's body#59; the deferred revert reopens the session<br/>for the client to upload the part again
+            B-->>C: InvalidPart in the 200's body#59; the upload stays open<br/>for the client to upload the part again
         else every named part accepted
-            B->>Q: run sync: Put under what was reported (see the PutObject diagram),<br/>with the session, its reserved version and If-Match/If-None-Match#59;<br/>refused (errReservationSuperseded) if the key gained a later seq,<br/>or the versioning no longer fits the report#59; the claims land<br/>with the root's advance, set-based
-            Q->>R: with the task's commit: the session moves completing to completed<br/>(guarded: a teardown that latched it away first fails the change with NoSuchUpload)
+            M->>Q: run sync as a child: queue-bucket.commit, a Put under what was reported<br/>(see the PutObject diagram), with its reserved version and If-Match/If-None-Match#59;<br/>refused (errReservationSuperseded) if the key gained a later seq,<br/>or the versioning no longer fits the report#59; the claims land<br/>with the root's advance, set-based
+            M->>R: in the same commit: the session moves open to completed (guarded), the part trees<br/>are deleted, a release due now of each unlisted part's blob, and<br/>queue-multipart-upload.reap due one session TTL out
+            B->>U: releaseNow: the unlisted parts' releases, within 10 s
             B-->>C: the result ends the body: ETag = md5-of-part-md5s + "-N"
         end
     end
     C->>B: AbortMultipartUpload
-    B->>R: LatchSession(open to aborting)#59; enqueuePartReleases for every<br/>unreferenced part blob#59; then DeleteSession (parts cascade)
+    B->>M: run sync: queue-multipart-upload.abort (completed or gone: NoSuchUpload)
+    M->>R: with the task's commit: a queue-space-shard.release, due now, for each part blob still<br/>there to release (published or missing intents skipped)#59; the session deleted (parts cascade)
     B->>U: releaseNow, per task, within 10 s: crypto-shred, then /blob/abort a parked blob<br/>(cause = AddTask) or /blob/remove an accepted one#59; local rows deleted<br/>in the task's commit#59; the task runner retries the rest
-    Note over B,R: a background sweeper tears down sessions whose state has not<br/>changed for MultipartSessionTTL (default 7d)#59; a Complete's latch restarts the clock
+    Note over M,R: the auto-abort runs the same task, async, one session TTL after the create: an<br/>open upload only, nothing otherwise, retried without limit (1 s to 5 min)#59; the reap,<br/>one session TTL after a Complete, deletes the completed session and its parts and releases nothing
 ```
 
 - A part re-upload and an abort queue a `queue-space-shard.release` task for
@@ -581,8 +588,8 @@ sequenceDiagram
   (a claim, a write's pending reference, a part of an in-flight session,
   counted in one statement by `CountReferences`) makes it stale and it does
   nothing; the session's teardown queues it again. A commit's claim
-  publishes the blob's upload intent, so the reap of a retained session
-  releases only what was never committed.
+  publishes the blob's upload intent, so an abort releases only what was
+  never committed, and the reap of a completed session releases nothing.
 - A release can take a blob while an accept concludes it, when a part is
   replaced or dropped mid-conclude. Sprue decides the order: a released
   allocation refuses the accept, and an accepted blob refuses `/blob/abort`,
@@ -596,9 +603,11 @@ sequenceDiagram
   accepted blob only after a remove that arrived earlier, that window is
   sprue's to fix, and Ingot does not guard it.
 - A part is written only while its session is open, in the statement that
-  checks the state; a teardown that took the session refuses it, and the
-  upload expires its pending references at once, which releases the blobs
-  nothing else references (`dropRefsNow`).
+  checks the state. The add-part runs on the upload's subject, so no
+  Complete or Abort runs beside it. One that ran first leaves the upload not
+  open, the add-part answers NoSuchUpload, and the upload expires its pending
+  references at once, which releases the blobs nothing else references
+  (`dropRefsNow`).
 - A blob with neither a park nor a location when the accept reaches it has
   gone from its provider. The accept leaves its part `parked`, and Complete
   answers `InvalidPart`; nothing keeps a part's bytes to upload them again.
@@ -610,17 +619,18 @@ sequenceDiagram
   ([`s3-versioning.md`](./s3-versioning.md) §5.1).
 
 Cross-references: [`architecture.md` §7.2](./architecture.md#72-multipart),
-[§7.3](./architecture.md#73-the-session-latch-the-abortcomplete-race).
+[§7.3](./architecture.md#73-one-change-per-upload-the-abortcomplete-race).
 
 Sources: `s3frontend/multipart.go` (all verbs, ingestPart, parkBlobs,
-acceptRequested, enqueuePartReleases, SweepStaleMultipartSessions),
+acceptRequested, sessionReleases), `s3frontend/multipartqueue.go`
+(runCreateUpload, runAddPart, runAbort, runReap), `registry/multipartqueue.go`
+(PartWrites, CompletedSession),
 `s3frontend/version.go` (reserveVersion, applyPut), `s3frontend/bucketqueue.go` (putPreCheck),
 `s3frontend/acceptor.go` (runAccept, acceptBatch), `registry/accept.go`,
 `s3frontend/stream.go`,
 `s3frontend/shardref.go` (addBlob, runAdd, dropRefsNow),
 `s3frontend/releasequeue.go` (runRelease, releaseNow),
-`s3frontend/uploadpartcopy.go`, `registry/stores.go`,
-`server.go` (startMultipartSweeper). Review when these change.
+`s3frontend/uploadpartcopy.go`, `registry/stores.go`. Review when these change.
 
 ## Part states: the acceptance queue
 
@@ -630,7 +640,7 @@ it never moves a row a later upload of the same part number replaced.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> parked : PutPart (UploadPart, once its blobs are parked)#59;<br/>queues the upload's accept in the same transaction
+    [*] --> parked : queue-multipart-upload.add-part (UploadPart, once its blobs are parked)#59;<br/>queues the upload's accept in the same transaction
     parked --> accepted : queue-multipart-upload-shard.accept concludes the blobs,<br/>while the row names the same blobs and all are located
     parked --> [*] : replaced (releases queued with the replacement),<br/>or the session's teardown cascades
     accepted --> [*] : replaced (releases queued with the replacement),<br/>or the session's teardown cascades
@@ -645,8 +655,8 @@ stateDiagram-v2
   request runs them itself when it can, rather than leave them to the
   runner's workers.
 - Complete requires every part it names to be `accepted` before the commit.
-  It runs the accept for those parts as a sync task (parts it omits cannot
-  fail it), answers an accept that cannot start within 30 s with a 409 that
+  It runs the accept for those parts as a task of its own (parts it omits
+  cannot fail it), answers an accept that cannot start within 30 s with a 409 that
   botocore clients treat as final, and fails with the accept's error when
   the accept fails. A failed batch fails the whole accept, which records
   nothing.
@@ -654,50 +664,44 @@ stateDiagram-v2
   `span_lengths`; Complete derives their lengths per blob.
 
 Sources: `registry/stores.go` (Part* consts, ListParkedParts,
-OldestParkedPart), `registry/stores_postgres.go` (PutPart),
+OldestParkedPart), `registry/multipartqueue.go` (PartWrites),
 `registry/accept.go`, `s3frontend/acceptor.go`, `s3frontend/multipart.go`
 (ingestPart, acceptRequested), `migrations/sql/00030_part_accept_queue.sql`,
 `migrations/sql/00033_task_runner.sql`. Review when these change.
 
-## Session states and the Complete/Abort latch
+## Session states: open and completed
 
-The latch is one guarded update: `UPDATE multipart_sessions SET state = $3
-WHERE upload_id = $1 AND state = $2`; exactly one caller sees
-`RowsAffected == 1`.
+Every change to an upload runs as a task on `queue-multipart-upload`, with
+the upload ID as its subject, so a Complete and an Abort never overlap and
+no part lands beside either.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> open : CreateSession
-    open --> completing : Complete wins the latch
-    completing --> open : pre-commit failure (deferred revert)
-    completing --> completed : queue-bucket.commit, in the version's transaction (guarded)
-    open --> aborting : Abort, DeleteBucket implicit abort, or sweeper
-    completing --> aborting : DeleteBucket or sweeper teardown
-    aborting --> [*] : enqueuePartReleases, then DeleteSession (parts cascade)
-    completed --> [*] : sweeper past TTL
+    [*] --> open : queue-multipart-upload.create
+    open --> completed : queue-multipart-upload.complete, in the version's commit (guarded)
+    open --> [*] : queue-multipart-upload.abort (a client, DeleteBucket or the auto-abort)#59;<br/>releases queued, session deleted (parts cascade)
+    completed --> [*] : queue-multipart-upload.reap (one session TTL out, or DeleteBucket)#59;<br/>releases nothing
 ```
 
-- A Complete that loses the latch reports no version id, then waits
-  (bounded) for the winner's terminal state: `completed` replays the ETag
-  and version id the winner recorded on the session; `aborting` or a
-  vanished row is `NoSuchUpload`; a winner still running past the wait
-  budget is `OperationAborted`, inside the 200's body since the headers
-  have gone out. A winner that fails reopens the session, and the waiting
-  Complete may then take the latch; in an Enabled bucket its commit is
-  refused, since it reported no id, and the client's retry reports one.
-- The Complete's `queue-bucket.commit` moves the session from `completing`
-  to `completed` in the same transaction as the version, and only while it
-  is still `completing`. A teardown that latched it to `aborting` first
-  makes the change fail with `NoSuchUpload`, so no manifest commits over
-  blobs the teardown released.
+- A Complete waits up to 10 s (`replayWaitBudget`) for the upload's other
+  changes, another Complete included, before it reports anything; past
+  that it answers `OperationAborted`, a 409. A Complete that runs after
+  another one committed replays the ETag and version id recorded on the
+  session, and skips the conditional-write precheck. A Complete after an
+  Abort finds no session and answers `NoSuchUpload`.
+- A Complete that fails before its commit leaves the upload open for a
+  retry.
+- The Complete's commit moves the session from `open` to `completed` in the
+  same transaction as the version, guarded on it still being open.
 - `ListParts` and `Abort` reject any non-`open` session as `NoSuchUpload`;
-  `Complete` alone accepts `completed`, for idempotency.
-- The sweeper also reaps rows stuck in `completing` or `aborting` past the
-  TTL.
+  `Complete` alone accepts `completed`, for idempotency. The auto-abort
+  leaves a completed or missing upload alone.
+- DeleteBucket aborts each open upload and reaps each completed one from
+  the request, after `queue-bucket.close`.
 
-Sources: `s3frontend/multipart.go`, `s3frontend/bucketqueue.go`
-(putPreCheck), `registry/bucketcommit.go` (CompletedSession),
-`registry/stores_postgres.go` (LatchSession). Review when these change.
+Sources: `s3frontend/multipart.go`, `s3frontend/multipartqueue.go`,
+`s3frontend/bucketqueue.go` (putPreCheck), `registry/multipartqueue.go`
+(CompletedSession, DeletedSession, ReapedSession). Review when these change.
 
 ## Blob lifecycle: uploading, parked, accepted, released
 
@@ -789,7 +793,7 @@ Sources: `registry/stores.go` (state consts), `s3frontend/object.go`
 `blockstore/blobcache.go` (CreateTemp, Adopt), `s3frontend/shardqueue.go`
 (queue-shard.cache, queue-shard.evict),
 `s3frontend/multipart.go`
-(parkBlobs, enqueuePartReleases),
+(parkBlobs, sessionReleases),
 `s3frontend/acceptor.go`, `registry/accept.go`, `s3frontend/releasequeue.go`
 (runRelease), `s3frontend/shardref.go` (runAdd, runExpire),
 `registry/stores_postgres.go` (CountReferences, takePendingRefs),
@@ -1102,6 +1106,7 @@ erDiagram
         text versioning "unversioned, enabled, suspended"
         text encryption "AES256, none; NULL = unconfigured, encrypts"
         bigint next_version_seq
+        boolean closing "set by DeleteBucket's queue-bucket.close"
     }
     segments {
         bigint seq PK "from segment_seq"
@@ -1184,8 +1189,8 @@ erDiagram
         text bucket
         text space "the bucket's space, required: the subject of every release of the session's blobs, never resolved from the bucket name"
         text object_key
-        text state "open, completing, aborting, completed"
-        timestamptz state_changed_at "the sweeper's clock"
+        text state "open, completed"
+        timestamptz state_changed_at "set at create and by Complete"
         boolean plaintext "store parts as received; decided at create"
         text checksum_algorithm
     }
@@ -1255,34 +1260,40 @@ Sources: `migrations/sql/*.sql`. Review whenever a migration is added.
 
 ## DeleteBucket teardown order
 
-Teardown crosses every seam in order: prove the bucket empty, commit its
-root empty, unwind in-flight multipart, quiesce the log, release every
-network registration, then delete at hilt and locally. It runs as a
-`queue-bucket.delete` task on the bucket's subject, sync for the request, so
-no commit or ship of the bucket runs beside it.
+Teardown crosses every seam in order: close the bucket, unwind in-flight
+multipart, prove the bucket empty again, commit its root empty, quiesce the
+log, release every network registration, then delete at hilt and locally.
+The request runs `queue-bucket.close`, then each upload's abort or reap,
+then a `queue-bucket.delete` task, all sync on the bucket's subject except
+the multipart tasks, so no commit or ship of the bucket runs beside the
+delete. The multipart tasks run from the request because
+`queue-multipart-upload` is above `queue-bucket` in the runner's order.
 
 ```mermaid
 sequenceDiagram
     autonumber
     actor C as S3 client
     participant B as s3frontend.Backend
-    participant Q as queue-bucket.delete<br/>(the bucket's subject)
+    participant Q as queue-bucket<br/>(the bucket's subject)
+    participant M as queue-multipart-upload<br/>(subject = uploadId)
     participant R as registry<br/>(Postgres)
     participant L as logstore.Manager
     participant U as sprue
     participant H as hilt
 
     C->>B: DeleteBucket
-    B->>Q: run sync, the signed S3 request in the caller's context (never stored)
-    Note over Q,H: the steps below run in the task#59; a delete resumed without<br/>its caller fails without acting
     B->>R: reg.Get
-    B->>B: MST emptiness walk<br/>(ErrBucketNotEmpty, or the versioned variant)
-    B->>R: EmptyRoot (one tx, ahead of the task's own commit: root → empty,<br/>forge root cleared, the bucket's catalog_journal rows dropped)
-    Note over B,R: nothing the bucket reads is released below
+    B->>Q: run sync: queue-bucket.close
+    Q->>R: MST emptiness walk (ErrBucketNotEmpty, or the versioned variant)#59;<br/>mark the bucket closing: from then on queue-bucket.commit and<br/>queue-bucket.admit-upload refuse it with OperationAborted
     loop each multipart session (in-flight uploads do not block the delete, as on AWS)
-        B->>U: open: abortOpenSession (/blob/abort parked blobs)#59;<br/>completed: reaped#59; completing or aborting: latched, then reaped
+        B->>M: open: run sync queue-multipart-upload.abort, then releaseNow<br/>(/blob/abort parked blobs)#59; completed: run sync queue-multipart-upload.reap
         Note over B,U: the request's own proofs sign the release legs<br/>(s3:DeleteBucket delegates blob.Abort + blob.Remove)
     end
+    B->>Q: run sync: queue-bucket.delete, the signed S3 request in the caller's context (never stored)
+    Note over Q,H: the steps below run in the task#59; a delete resumed without<br/>its caller fails without acting
+    B->>R: reg.Get#59; MST emptiness walk again#59; no multipart session may remain
+    B->>R: EmptyRoot (one tx, ahead of the task's own commit: root → empty,<br/>forge root cleared, the bucket's catalog_journal rows dropped)
+    Note over B,R: nothing the bucket reads is released below
     B->>L: QuiesceBucketLog (seal the open segment, close the store)#59;<br/>no ship is in flight, since ships share the subject
     loop ReleaseRetiredSegments: each retired segment
         L->>U: /blob/remove its CAR + index blob
@@ -1294,7 +1305,7 @@ sequenceDiagram
     end
     B->>R: drainSpaceReleases: Expedite the space's pending queue-space-shard.release<br/>tasks (subject space/*), run them inline (/blob/remove each)#59;<br/>a release still waiting fails the delete for the client to retry
     B->>U: DrainSpaceRegistrations: send the space's pending queue-space-upload changes
-    B->>H: /s3/bucket/delete with the signed S3 request (hilt refuses while registrations remain)
+    B->>H: /s3/bucket/delete with the signed S3 request (hilt refuses while registrations remain)#59;<br/>a refusal clears the closing mark
     B->>R: reg.Delete (the local row, its catalog_journal rows cascading)
     B->>L: RemoveBucketLog, best-effort<br/>(directory + segment rows)
     B-->>C: 204
@@ -1311,8 +1322,9 @@ sequenceDiagram
   write; its journal rows went with the root.
 
 Sources: `s3frontend/bucket.go` (DeleteBucket, runDeleteBucket),
-`s3frontend/bucketqueue.go` (bucketSpec), `s3frontend/multipart.go`
-(abortOpenSession, reapCompletedSession, reapAbortingSession),
+`s3frontend/bucketadmin.go` (runCloseBucket, runAdmitUpload),
+`s3frontend/bucketqueue.go` (bucketSpec), `s3frontend/multipartqueue.go`
+(abortUpload, runAbort, reapNow, runReap),
 `s3frontend/releasequeue.go` (drainSpaceReleases),
 `s3frontend/uploadqueue.go` (DrainSpaceRegistrations),
 `logstore/manager.go`. Review when these change.
@@ -1326,7 +1338,7 @@ listed diagrams (each diagram's `Sources:` footer names its exact files).
 |---|---|
 | `s3frontend/object.go` | put, get, blob-lifecycle, version-tree, gc-candidates, delete-bucket |
 | `s3frontend/version.go` | put, get, multipart, blob-lifecycle, version-tree, gc-candidates |
-| `s3frontend/multipart.go` | multipart, part-states, multipart-states, blob-lifecycle |
+| `s3frontend/multipart.go`, `multipartqueue.go`, `registry/multipartqueue.go` | multipart, part-states, multipart-states, blob-lifecycle, delete-bucket |
 | `s3frontend/acceptor.go`, `registry/accept.go` | multipart, part-states, blob-lifecycle |
 | `s3frontend/releasequeue.go` | put, multipart, part-states, blob-lifecycle, delete-bucket |
 | `s3frontend/shardref.go` | put, multipart, blob-lifecycle |
