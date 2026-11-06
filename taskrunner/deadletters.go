@@ -2,10 +2,12 @@ package taskrunner
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 )
 
 // FailedTask is a task that failed for good: its handler returned a permanent
@@ -19,10 +21,13 @@ type FailedTask struct {
 	Error string
 	// Failed is when it failed for good.
 	Failed time.Time
+	// Sync is whether it ran inline for a caller. Such a task is listed but
+	// cannot be resubmitted (ErrSyncTask).
+	Sync bool
 }
 
 const listFailed = `SELECT seq, id, subject, action, created, not_before, expires, args, attempts, node,
-	coalesce(error, ''), finished FROM %[1]s
+	coalesce(error, ''), finished, sync FROM %[1]s
 	WHERE state = 'failed' AND ($1 = '' OR subject = $1)
 	  AND ($2::uuid IS NULL OR seq > (SELECT seq FROM %[1]s WHERE id = $2))
 	ORDER BY seq LIMIT $3`
@@ -64,7 +69,7 @@ func listFailedTasks(ctx context.Context, db Querier, q *queue, subject string, 
 		f := FailedTask{Task: Task{Queue: q.name}}
 		t := &f.Task
 		if err := rows.Scan(&t.seq, &t.ID, &t.Subject, &t.Action, &t.Created, &t.NotBefore, &t.Expires,
-			&t.Args, &t.Attempt, &t.Node, &f.Error, &f.Failed); err != nil {
+			&t.Args, &t.Attempt, &t.Node, &f.Error, &f.Failed, &f.Sync); err != nil {
 			return nil, err
 		}
 		out = append(out, f)
@@ -72,16 +77,16 @@ func listFailedTasks(ctx context.Context, db Querier, q *queue, subject string, 
 	return out, rows.Err()
 }
 
-// resubmitStatements return the writes that replace a failed task with a new
-// pending one on the same subject and action: with args when they are not
-// nil, its own otherwise, and none of its delay, expiry or attempts. The old
-// row is marked resubmitted, so it is not listed or resubmitted again.
+// resubmitStatements return the writes that replace a failed async task with
+// a new pending one on the same subject and action: with args when they are
+// not nil, its own otherwise, and none of its delay, expiry or attempts. The
+// old row is marked resubmitted, so it is not listed or resubmitted again.
 func resubmitStatements(q *queue, old, fresh TaskID, args []byte) []write {
 	return []write{
 		{
 			sql: `INSERT INTO ` + q.tasks + ` (id, subject, action, args, sync, node)
 				SELECT $2, subject, action, coalesce($3, args), false, node FROM ` + q.tasks + `
-				WHERE id = $1 AND state = 'failed'`,
+				WHERE id = $1 AND state = 'failed' AND NOT sync`,
 			args:        []any{old, fresh, args},
 			conditional: true,
 		},
@@ -98,8 +103,8 @@ func resubmitStatements(q *queue, old, fresh TaskID, args []byte) []write {
 // takes args when they are not nil, so a replay can carry what the failure
 // lacked, such as fresh authority; otherwise it keeps the failed task's. The
 // new task has no delay or expiry and starts its attempts afresh. It returns
-// the new task's ID, or ErrNotFound when the queue holds no failed task with
-// that ID.
+// the new task's ID, ErrNotFound when the queue holds no failed task with
+// that ID, or ErrSyncTask when the task ran sync.
 func (r *Runner) Resubmit(ctx context.Context, queueName string, id TaskID, args []byte) (TaskID, error) {
 	q, ok := r.byName[queueName]
 	if !ok {
@@ -114,6 +119,9 @@ func (r *Runner) Resubmit(ctx context.Context, queueName string, id TaskID, args
 		return TaskID{}, err
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if err := checkResubmittable(ctx, tx, q, id); err != nil {
+		return TaskID{}, err
+	}
 	for _, w := range resubmitStatements(q, id, fresh, args) {
 		tag, err := tx.Exec(ctx, w.sql, w.args...)
 		if err != nil {
@@ -138,6 +146,9 @@ func (ex *Exec) Resubmit(ctx context.Context, queueName string, id TaskID, args 
 	if !ok {
 		return TaskID{}, fmt.Errorf("task runner: unknown queue %q", queueName)
 	}
+	if err := checkResubmittable(ctx, ex.DB(), q, id); err != nil {
+		return TaskID{}, err
+	}
 	fresh, err := uuid.NewV7()
 	if err != nil {
 		return TaskID{}, err
@@ -149,6 +160,22 @@ func (ex *Exec) Resubmit(ctx context.Context, queueName string, id TaskID, args 
 	}
 	ex.tr.spawned[q] = true
 	return fresh, nil
+}
+
+// checkResubmittable fails with ErrNotFound unless q holds a failed task id,
+// and with ErrSyncTask when that task ran sync.
+func checkResubmittable(ctx context.Context, db Querier, q *queue, id TaskID) error {
+	var sync bool
+	err := db.QueryRow(ctx, `SELECT sync FROM `+q.tasks+` WHERE id = $1 AND state = 'failed'`, id).Scan(&sync)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return ErrNotFound
+	case err != nil:
+		return fmt.Errorf("resubmit %s/%s: %w", q.name, id, err)
+	case sync:
+		return ErrSyncTask
+	}
+	return nil
 }
 
 // retentionBatch is the most finished tasks one statement deletes, so a large
