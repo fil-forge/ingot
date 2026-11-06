@@ -39,6 +39,11 @@ type Task struct {
 	Expires *time.Time
 	// Args are the action's arguments, which the runner never interprets.
 	Args []byte
+	// Attempt is how many earlier runs of the task failed and were retried.
+	Attempt int
+
+	seq  int64
+	sync bool
 }
 
 // Spec describes a task to submit or spawn.
@@ -55,6 +60,11 @@ type Spec struct {
 	NotBefore *time.Time
 	// Expires, when set, is the latest time the task may start.
 	Expires *time.Time
+	// Replace submits the task as a replacement, which needs a NotBefore: if a
+	// replacement with the same subject and action is pending and has not
+	// started, whichever has the later NotBefore is kept and the other is
+	// dropped.
+	Replace bool
 }
 
 // Handler runs one task. ex records the task's writes and spawns, and runs
@@ -101,8 +111,9 @@ type Options struct {
 	// longest a waiter goes between checks of a task in another process.
 	// Defaults to 1 second.
 	PollInterval time.Duration
-	// DrainLimit is the most tasks a worker runs on one subject before
-	// releasing its lease. Defaults to 100.
+	// DrainLimit is the most handler runs a worker makes on one subject
+	// before releasing its lease. A batch is one run, whatever its size.
+	// Defaults to 100.
 	DrainLimit int
 	// CommitAttempts is how many times a tree is run when its final commit
 	// fails, before the task is left for resumption. Defaults to 3.
@@ -162,7 +173,7 @@ type Runner struct {
 	byName map[string]*queue
 
 	handlersMu sync.RWMutex
-	handlers   map[actionKey]Handler
+	handlers   map[actionKey]*action
 
 	mu      sync.Mutex
 	running bool
@@ -240,7 +251,7 @@ func New(db DB, opts Options) (*Runner, error) {
 		opts:     opts,
 		log:      opts.Logger,
 		byName:   map[string]*queue{},
-		handlers: map[actionKey]Handler{},
+		handlers: map[actionKey]*action{},
 		holds:    map[uuid.UUID]*hold{},
 		waiters:  map[TaskID]map[chan struct{}]struct{}{},
 		waiting:  map[TaskID]*queue{},
@@ -271,24 +282,44 @@ func New(db DB, opts Options) (*Runner, error) {
 }
 
 // Handle registers the handler for an action of a queue.
-func (r *Runner) Handle(queueName, action string, h Handler) error {
+func (r *Runner) Handle(queueName, name string, h Handler, opts ...HandleOption) error {
+	return r.register(queueName, name, &action{handler: h}, opts)
+}
+
+// HandleBatch registers a batching handler for an action of a queue. One run
+// takes the subject's oldest due task and the due tasks straight after it
+// with the same action, up to limit, stopping at the first with a different
+// action so the subject's order holds. A task already past its Expires is
+// recorded as expired and left out of the batch. Only async tasks batch: the
+// action cannot be run sync.
+func (r *Runner) HandleBatch(queueName, name string, limit int, h BatchHandler, opts ...HandleOption) error {
+	if limit < 1 {
+		return fmt.Errorf("task runner: %s.%s: batch limit %d", queueName, name, limit)
+	}
+	return r.register(queueName, name, &action{batch: h, limit: limit}, opts)
+}
+
+func (r *Runner) register(queueName, name string, a *action, opts []HandleOption) error {
 	if _, ok := r.byName[queueName]; !ok {
 		return fmt.Errorf("task runner: unknown queue %q", queueName)
 	}
-	if action == "" {
+	if name == "" {
 		return errors.New("task runner: empty action")
+	}
+	for _, o := range opts {
+		o(a)
 	}
 	r.handlersMu.Lock()
 	defer r.handlersMu.Unlock()
-	k := actionKey{queueName, action}
+	k := actionKey{queueName, name}
 	if _, dup := r.handlers[k]; dup {
-		return fmt.Errorf("task runner: %s.%s registered twice", queueName, action)
+		return fmt.Errorf("task runner: %s.%s registered twice", queueName, name)
 	}
-	r.handlers[k] = h
+	r.handlers[k] = a
 	return nil
 }
 
-func (r *Runner) handler(k actionKey) (Handler, bool) {
+func (r *Runner) handler(k actionKey) (*action, bool) {
 	r.handlersMu.RLock()
 	defer r.handlersMu.RUnlock()
 	h, ok := r.handlers[k]
@@ -392,6 +423,24 @@ func (r *Runner) checkSpec(s Spec) (*queue, error) {
 	if _, ok := r.handler(actionKey{s.Queue, s.Action}); !ok {
 		return nil, fmt.Errorf("task runner: no handler for %s.%s", s.Queue, s.Action)
 	}
+	if s.Replace && s.NotBefore == nil {
+		return nil, fmt.Errorf("task runner: %s.%s: a replacement needs a NotBefore", s.Queue, s.Action)
+	}
+	return q, nil
+}
+
+// checkSync checks s can run as a sync task.
+func (r *Runner) checkSync(s Spec) (*queue, error) {
+	q, err := r.checkSpec(s)
+	if err != nil {
+		return nil, err
+	}
+	if s.NotBefore != nil {
+		return nil, fmt.Errorf("task runner: %s.%s: a sync task cannot be delayed", s.Queue, s.Action)
+	}
+	if a, _ := r.handler(actionKey{s.Queue, s.Action}); a.batch != nil {
+		return nil, fmt.Errorf("task runner: %s.%s batches, so it cannot run sync", s.Queue, s.Action)
+	}
 	return q, nil
 }
 
@@ -427,8 +476,8 @@ func (r *Runner) submit(ctx context.Context, db execer, s Spec) (TaskID, error) 
 	if err != nil {
 		return TaskID{}, err
 	}
-	if _, err := db.Exec(ctx, fmt.Sprintf(insertTask, q.tasks),
-		id, s.Subject, s.Action, s.NotBefore, s.Expires, s.Args, false); err != nil {
+	sql, args := insertSpec(q, id, s, false)
+	if _, err := db.Exec(ctx, sql, args...); err != nil {
 		return TaskID{}, fmt.Errorf("submit %s.%s: %w", s.Queue, s.Action, err)
 	}
 	return id, nil
@@ -458,10 +507,7 @@ func (r *Runner) Run(ctx context.Context, s Spec) ([]byte, error) {
 			s.Expires = &d
 		}
 	}
-	if s.NotBefore != nil {
-		return nil, fmt.Errorf("task runner: %s.%s: a sync task cannot be delayed", s.Queue, s.Action)
-	}
-	q, err := r.checkSpec(s)
+	q, err := r.checkSync(s)
 	if err != nil {
 		return nil, err
 	}
@@ -557,7 +603,8 @@ func (r *Runner) drainSync(ctx context.Context, q *queue, h *hold, upTo int64, t
 }
 
 // Wait waits for a task to finish and returns its result. A failed task
-// returns a *HandlerError, an expired one ErrExpired.
+// returns a *HandlerError, an expired one ErrExpired and a cancelled one
+// ErrCancelled. A task dropped by a replacement is not found.
 func (r *Runner) Wait(ctx context.Context, queueName string, id TaskID) ([]byte, error) {
 	q, ok := r.byName[queueName]
 	if !ok {
@@ -611,6 +658,8 @@ func (r *Runner) outcome(ctx context.Context, q *queue, id TaskID) (res []byte, 
 		return nil, &HandlerError{Queue: q.name, Task: id, Message: m}, true
 	case "expired":
 		return nil, ErrExpired, true
+	case "cancelled":
+		return nil, ErrCancelled, true
 	}
 	return nil, nil, false
 }

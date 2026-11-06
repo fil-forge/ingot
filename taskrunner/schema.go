@@ -25,23 +25,34 @@ CREATE TABLE %[1]s (
 	args       bytea,
 	sync       boolean NOT NULL,
 	state      text NOT NULL DEFAULT 'pending'
-	           CHECK (state IN ('pending', 'succeeded', 'failed', 'expired')),
+	           CHECK (state IN ('pending', 'succeeded', 'failed', 'expired', 'cancelled')),
 	result     bytea,
 	error      text,
 	finished   timestamptz,
 	-- waiting_until is set while a sync task's caller waits in Run, which
 	-- keeps workers off it until the claim lapses.
-	waiting_until timestamptz
+	waiting_until timestamptz,
+	-- started is set while the task runs: then it can no longer be cancelled
+	-- or replaced. A retry clears it.
+	started     timestamptz,
+	replaceable boolean NOT NULL DEFAULT false,
+	attempts    integer NOT NULL DEFAULT 0,
+	-- retry_at holds a retry that holds its subject (RetryPolicy.HoldsSubject).
+	retry_at    timestamptz
 );
 CREATE INDEX %[3]s ON %[1]s (subject, seq) WHERE state = 'pending';
 `+dueIndex(q)+`
+CREATE UNIQUE INDEX %[4]s ON %[1]s (subject, action)
+	WHERE state = 'pending' AND replaceable AND started IS NULL;
 CREATE TABLE %[2]s (
 	subject      text PRIMARY KEY,
 	owner        uuid NOT NULL,
 	expires      timestamptz NOT NULL,
 	tree_created timestamptz NOT NULL,
 	tree_id      uuid NOT NULL
-);`, q.tasks, q.leases, pgx.Identifier{q.table + "_tasks_pending"}.Sanitize())
+);`, q.tasks, q.leases,
+			pgx.Identifier{q.table + "_tasks_pending"}.Sanitize(),
+			pgx.Identifier{q.table + "_tasks_replaceable"}.Sanitize())
 	},
 }
 
