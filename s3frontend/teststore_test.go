@@ -61,6 +61,10 @@ func newTestStore(t testing.TB) *testStore {
 			// or an S3 verb runs it inline, as the tests expect.
 			{Name: registry.ReleaseQueue},
 			{Name: ShardQueue, Workers: 2},
+			// No workers either: an upload's accept runs when a test runs it
+			// (runAccepts) or Complete does, which drains the one UploadPart
+			// queued.
+			{Name: registry.AcceptQueue},
 		},
 		LeaseTTL:     time.Second,
 		PollInterval: 10 * time.Millisecond,
@@ -81,7 +85,7 @@ func newTestStore(t testing.TB) *testStore {
 func (s *testStore) start(t testing.TB, b *Backend) {
 	t.Helper()
 	if s.started {
-		b.tasks, b.shards, b.releases = s.tasks, s.tasks, s.tasks
+		b.tasks, b.shards, b.releases, b.accepts = s.tasks, s.tasks, s.tasks, s.tasks
 		b.cache.OnRead(b.renewCached)
 		return
 	}
@@ -101,6 +105,9 @@ func (s *testStore) start(t testing.TB, b *Backend) {
 	b.releaseRetry = taskrunner.RetryPolicy{First: time.Hour, Max: time.Hour, HoldsSubject: true}
 	if err := b.RegisterReleaseTasks(s.tasks); err != nil {
 		t.Fatalf("register release tasks: %v", err)
+	}
+	if err := b.RegisterAcceptTasks(s.tasks); err != nil {
+		t.Fatalf("register accept tasks: %v", err)
 	}
 	if err := s.tasks.Start(context.Background()); err != nil {
 		t.Fatalf("start task queues: %v", err)

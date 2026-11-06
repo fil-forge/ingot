@@ -39,14 +39,14 @@ type tree struct {
 	// childRuns are the sync children whose handlers ran, reported to the
 	// metrics once the tree has an outcome.
 	childRuns []childRun
-	// tx is the open transaction under ApplyWritesImmediately; cur is the
+	// tx is the open transaction under applyWritesImmediately; cur is the
 	// savepoint of the sync child now running, or tx itself.
 	tx  pgx.Tx
 	cur pgx.Tx
 	// failed is the first error a sync child returned. The tree fails with it
 	// even if a parent handler carries on.
 	failed error
-	// deferred is the first error a write hit under ApplyWritesImmediately.
+	// deferred is the first error a write hit under applyWritesImmediately.
 	// It fails the commit, as the same write would with writes held, rather
 	// than reaching the handler.
 	deferred error
@@ -433,7 +433,7 @@ func (r *Runner) runRoot(ctx context.Context, h *hold, tasks []Task) (res []byte
 			return nil, ErrExpired, nil
 		}
 		tr := &tree{r: r, roots: live, age: age, holds: map[subjectKey]*hold{}, rootHold: h, spawned: map[*queue]bool{}}
-		if r.opts.ApplyWritesImmediately {
+		if r.opts.applyWritesImmediately {
 			tx, err := r.db.Begin(ctx)
 			if err != nil {
 				return nil, nil, err

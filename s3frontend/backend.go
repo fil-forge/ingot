@@ -48,7 +48,6 @@ import (
 	"github.com/fil-forge/ingot/taskrunner"
 	"github.com/fil-forge/ingot/tenantkey"
 	"github.com/fil-forge/ingot/uploader"
-	"github.com/fil-forge/libforge/syncutil"
 )
 
 // Backend implements versitygw's backend.Backend directly over the
@@ -95,8 +94,11 @@ type Backend struct {
 	// the queue-space-shard tasks (RegisterReleaseTasks); releaseGrace is how
 	// far past the last-claim drop each release is due (readers holding the
 	// prior catalog root get at least this long to finish their prefetch).
-	claims       registry.BlobRefStore
-	releases     *taskrunner.Runner
+	claims   registry.BlobRefStore
+	releases *taskrunner.Runner
+	// accepts runs the queue-multipart-upload-shard tasks
+	// (RegisterAcceptTasks).
+	accepts      *taskrunner.Runner
 	releaseGrace time.Duration
 	// releaseRetry is the queue-space-shard.release retry policy; tests
 	// shorten it.
@@ -107,19 +109,7 @@ type Backend struct {
 	localBlobOrphanAge time.Duration
 	dropAcceptedBodies bool
 	localBlobSweepMu   sync.Mutex
-	// blobKeys serialises, within this process, the writes that make one
-	// (space, digest) durable on its provider, keyed by blobKey: the check
-	// for a location or a park, the upload or park, and the row that records
-	// it, so a second write of the same bytes finds the first's row. The
-	// registry stays the guard between instances (ParkStore.PutPark refuses
-	// to overwrite a park).
-	blobKeys syncutil.KeyedMutex
-	// acceptors runs each multipart upload's acceptor (see acceptor.go).
-	acceptors acceptors
-	// concluding marks the conclusions in flight in this process (see
-	// markConcluding).
-	concluding     blobMarks
-	lastOrphanPass time.Time
+	lastOrphanPass     time.Time
 	// overBudgetWarned and timeLimitLogged are set once the sweeper has
 	// logged that usage is over budget with nothing left to evict, or that the
 	// budget pass ran out of time, and cleared when usage falls back to the
@@ -136,15 +126,11 @@ type Backend struct {
 	// registration of the usage and budget gauges (nil when not registered).
 	localBlobMetrics localBlobMetrics
 	localBlobGauges  metric.Registration
-	// multipartMetrics counts acceptor passes and deferred Completes;
+	// multipartMetrics counts accept batches and deferred Completes;
 	// multipartGauges is the registration of the parked-age gauge (nil when
-	// not registered). parkedAgeSeconds is the accept sweeper's latest
-	// measure of the oldest parked part's wait, read by that gauge;
-	// parkedAgeKnown is set once a sweep has measured it.
+	// not registered).
 	multipartMetrics multipartMetrics
 	multipartGauges  metric.Registration
-	parkedAgeSeconds atomic.Int64
-	parkedAgeKnown   atomic.Bool
 	// journalGauges is the registration of the catalog journal gauges (nil
 	// when not registered).
 	journalGauges metric.Registration

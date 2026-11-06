@@ -34,6 +34,7 @@ func main() {
 	if err := cfg.WriteMapEncodersToFile("../registry/cbor_gen.go", "registry",
 		registry.UploadTask{},
 		registry.ReleaseTask{},
+		registry.AcceptTask{},
 	); err != nil {
 		panic(err)
 	}

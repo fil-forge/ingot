@@ -527,6 +527,10 @@ const shardWorkers = 4
 // is a round trip to the upload service.
 const releaseWorkers = 8
 
+// acceptWorkers is how many multipart uploads' accepts one instance runs at
+// once. Each concludes up to a batch of blobs per round trip.
+const acceptWorkers = 4
+
 // provideTaskRunner builds the runner for ingot's durable task queues, over
 // the host's pool. The backend registers its handlers (Server.New); the
 // migration hook creates its tables and the server starts and stops it.
@@ -542,6 +546,7 @@ func provideTaskRunner(pool *pgxpool.Pool, id identity.Identity, logger *zap.Log
 		Queues: []taskrunner.QueueOptions{
 			{Name: registry.UploadQueue, Workers: uploadRegistrationWorkers},
 			{Name: registry.ReleaseQueue, Workers: releaseWorkers},
+			{Name: registry.AcceptQueue, Workers: acceptWorkers},
 			{Name: s3frontend.ShardQueue, Workers: shardWorkers},
 		},
 		Logger: logger.Named("tasks"),

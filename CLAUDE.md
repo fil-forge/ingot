@@ -217,7 +217,7 @@ Internal:
   the same `OTEL_EXPORTER_OTLP_*` variables, metrics). Local blob storage's
   instruments (`ingot.local_blobs.*`: usage by directory, budget and
   stalled-upload gauges, removals by reason, reads by tier) and the multipart
-  acceptor's (`ingot.multipart.*`: parked-part age, passes by outcome,
+  accept's (`ingot.multipart.*`: parked-part age, batches by outcome,
   deferred Completes) are created on the global meter provider, through `s3frontend.Deps.MeterProvider` and
   `Layered.CountBlobReads`; with no provider installed they are no-ops.
   So are the catalog usage gauges (`ingot.catalog.*`: each bucket's shipped
