@@ -101,14 +101,21 @@ Internal:
   with an access key from the environment, as JSON, for benchmark runs);
   `deps.go` (agent identity from the PEM key + optional did:web, pgx pool).
 - **`s3frontend/`** — versitygw `backend.Backend`: `object.go`
-  (Put/Get/Head/Delete/List), `version.go` (resolveVersion / commitVersion,
-  the per-key version tree), `multipart.go`, `bucket.go`, `listversions.go`,
+  (Put/Get/Head/Delete/List), `version.go` (resolveVersion / applyPut,
+  the per-key version tree), `bucketqueue.go` (`queue-bucket.commit`: one
+  task per bucket change, sync for the request, on the bucket's subject;
+  applies an ordered list of key changes, `bucketchanges.go`, to one Tx),
+  `bucketadmin.go` (`queue-bucket.create`, `.set-versioning`,
+  `.set-object-lock-config`), `bucketship.go` (`queue-bucket.ship`, queued
+  on each seal), `multipart.go`, `bucket.go` (`queue-bucket.delete`), `listversions.go`,
   `backend.go`, `stream.go` (each body blob streams to its
   provider as the body arrives, teeing an object's bytes into the cache; a
   failed stream fails the request and aborts its allocation, and one a dead
   request leaves is expired by the provider).
-- **`bucketop/`** — `Coordinator`/`Tx`: per-bucket write transaction (lock,
-  snapshot root, staging buffer, CAS commit).
+- **`bucketop/`** — `Coordinator`/`Tx`: per-bucket write transaction
+  (snapshot root, staging buffer, `Mark`/`Restore` per change, `Append`:
+  one fsynced batch to the log). It takes no lock: the bucket's
+  `queue-bucket` subject serializes its commits.
 - **`blockstore/`** — block I/O contracts + impls: `log.go` (`Log`, `Plane`
   [catalog-only], `OpRoot`), `staging.go` (`OpStaging`), `blobcache.go`
   (`BlobCache`: copies the provider holds, and writes in progress as
@@ -120,10 +127,12 @@ Internal:
   production `blockstore.Log`), `store.go`, `planelog.go`, `segment.go`,
   `recovery.go`. See `logstore/README.md`.
 - **`registry/`** — Postgres metadata: `postgres.go` (`Registry` + `State`;
-  `CommitRoot` also journals each commit's catalog blocks in
-  `ingot.catalog_journal` until their segment ships),
-  `segments.go` (`logstore.Meta`, and `CatalogUsage`, the per-bucket sums
-  the catalog usage gauges report), `stores*.go` (intents, locations,
+  `EmptyRoot`, DeleteBucket's first write), `bucketcommit.go` (`queue-bucket`
+  names, `RootCommitWrites`: the guarded root advance, claims, drops, GC
+  candidates and the journal rows of each commit's catalog blocks in
+  `ingot.catalog_journal` until their segment ships, written with the commit
+  task), `segments.go` (`logstore.Meta`, and `CatalogUsage`, the per-bucket
+  sums the catalog usage gauges report), `stores*.go` (intents, locations,
   inclusions, blob_refs and pending refs (`CountReferences`), GC,
   multipart sessions/parts, parks, streams),
   `locallocator.go` (the read tier's `Locator`). One `*Postgres` satisfies
@@ -147,9 +156,13 @@ Internal:
   held and applied straight away (`CheckOwnWrites`). The daemon runs one
   runner (`provideTaskRunner` in `module.go`) over the `ingot` schema; its
   tables are migrated in the migration hook, and `Server` starts and stops
-  it. Queues so far: `queue-space-upload` (`s3frontend/uploadqueue.go`), the
-  object-count changes a commit queues in its own transaction
-  (`registry.WithTasks`); `queue-shard` (`s3frontend/shardqueue.go`), a
+  it. Queues in order: `queue-multipart-upload-shard` (accept),
+  `queue-bucket`, `queue-space-upload`, `queue-space-shard`, `queue-shard`.
+  `queue-bucket` (`s3frontend/bucketqueue.go`), subject the bucket's space
+  DID: every change to a bucket, placed on the instance holding its catalog
+  log; `queue-space-upload` (`s3frontend/uploadqueue.go`), the
+  object-count changes a `queue-bucket.commit` spawns with its own
+  commit; `queue-shard` (`s3frontend/shardqueue.go`), a
   cached blob's move into the cache and its eviction at `CacheTTL`, renewed
   by reads; `queue-space-shard` (`s3frontend/releasequeue.go`,
   `shardref.go`), subject space/hex digest: a blob's release, a write's sync
@@ -163,7 +176,7 @@ Internal:
   `BlobRemover`; captures the per-space
   ship authority (1h TTL) from in-request writes: `shipProofs` from body
   uploads (also the background releases' and aborts' fallback), and
-  `commitProofs` from every `bucketop` commit (`CaptureShipAuthority`), which
+  `commitProofs` from every `queue-bucket.commit` append (`CaptureShipAuthority`), which
   the ship prefers. Both take only stores `reqscope.BorrowableProofStore`
   returns, and their chains skip revoked delegations.
 - **`bucketauthority/`** — hilt bucket ops: forwards CreateBucket /

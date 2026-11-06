@@ -38,7 +38,7 @@ func commit(t *testing.T, st registry.Registry, bucket string, space did.DID, c 
 	if err != nil {
 		t.Fatalf("Get %q: %v", bucket, err)
 	}
-	return st.CommitRoot(ctx, bucket, s.Root, liveCid(t, fmt.Sprintf("commit-%d", commitSeq.Add(1))), c)
+	return st.(*registry.Postgres).CommitRoot(ctx, bucket, s.Root, liveCid(t, fmt.Sprintf("commit-%d", commitSeq.Add(1))), c)
 }
 
 // claim commits one claim of a new generation.

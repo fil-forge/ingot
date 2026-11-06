@@ -1196,69 +1196,6 @@ func TestConcurrentCommitClaims(t *testing.T) {
 	}
 }
 
-// TestReleaseGraceRunsFromTheSwap: a drop's release is due the grace
-// after the swap commits, not after its transaction began. A swap that
-// waited on the bucket row (here held by another transaction) owes a reader
-// that resolved the discarded version meanwhile the whole grace from the
-// commit.
-func TestReleaseGraceRunsFromTheSwap(t *testing.T) {
-	ctx := context.Background()
-	pool := pgtest.New(t)
-	r := registry.NewPostgres(pool, registry.WithTasks(liveUploadTasks(t, pool)))
-	space := testutil.RandomDID(t)
-	bucket := "grace-swap-" + space.String()[len(space.String())-8:]
-	d := liveDigest(t, "grace-runs-from-the-swap")
-	if err := r.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: d, Provider: "did:key:p", URL: "http://p/blob", Size: 1}); err != nil {
-		t.Fatalf("PutLocation: %v", err)
-	}
-	c := registry.BlobClaim{Digest: d, Bucket: bucket, ObjectKey: "k", VersionID: "v1", Space: space}
-	mustClaim(t, r, c)
-	t.Cleanup(func() { _ = r.Delete(context.Background(), bucket) })
-
-	const grace, stall = time.Second, 300 * time.Millisecond
-	st, err := r.Get(ctx, bucket)
-	if err != nil {
-		t.Fatalf("Get: %v", err)
-	}
-	// Another transaction holds the bucket row while the drop's commit
-	// begins and waits.
-	holder, err := pool.Begin(ctx)
-	if err != nil {
-		t.Fatalf("begin: %v", err)
-	}
-	defer holder.Rollback(ctx)
-	if _, err := holder.Exec(ctx, `SELECT 1 FROM ingot.buckets WHERE name = $1 FOR UPDATE`, bucket); err != nil {
-		t.Fatalf("lock bucket row: %v", err)
-	}
-	start := time.Now()
-	done := make(chan error, 1)
-	go func() {
-		done <- r.CommitRoot(ctx, bucket, st.Root, liveCid(t, "grace-swap-next"), registry.RootCommit{
-			Drops:        []registry.ClaimDrop{{Digest: d, Bucket: bucket, ObjectKey: "k", VersionID: "v1", Space: space}},
-			ReleaseGrace: grace,
-		})
-	}()
-	time.Sleep(stall)
-	if err := holder.Commit(ctx); err != nil {
-		t.Fatalf("release the lock: %v", err)
-	}
-	if err := <-done; err != nil {
-		t.Fatalf("CommitRoot: %v", err)
-	}
-	var pr *queuedRelease
-	for _, rec := range mustListReleases(t, pool, space) {
-		if string(rec.Digest) == string(d) {
-			pr = &rec
-		}
-	}
-	if pr == nil {
-		t.Fatal("the drop recorded no release")
-	}
-	if earliest := start.Add(stall + grace); pr.NotBefore.Before(earliest) {
-		t.Fatalf("release due %v after the commit began, want at least the lock wait plus the grace (%v): the grace ran from the transaction's start", pr.NotBefore.Sub(start), stall+grace)
-	}
-}
-
 // TestBucketCORSConfig round-trips a bucket's own CORS document through
 // the SQL store: the column scans back as the bytes stored, NULL reads as
 // nil, a nil write restores NULL, and a missing bucket is ErrNotFound.

@@ -45,15 +45,36 @@ takes the write's pending reference to the blob (see "References" under
 Bucket encryption). The upload service must be able to add a blob by
 digest code (the hash function, before the digest is known); a request
 fails otherwise. A failed PUT fails the request, and its allocation is
-aborted, so the client retries. Only then does the short per-bucket
-critical section run: allocate the version seq, write the manifest, splice
-the MST, fsync one `AppendBatch` of the new catalog blocks, and
-compare-and-swap the bucket root in Postgres, with the reference index
-(`blob_refs`) written in the swap's transaction: the version's claims land
-and take over the write's pending references, superseded versions' claims drop, and a blob whose claim count reaches zero
-gets a `queue-space-shard.release` task on the task runner, queued in the
-same transaction and due after the release grace. The full trace is the
-[PutObject diagram](./docs/diagrams.md#putobject-stream-and-upload-off-the-lock-commit-under-it).
+aborted, so the client retries. Only then does the commit run, as a
+`queue-bucket.commit` task on the bucket's subject (its space DID), run sync
+for the request and placed on the instance that holds the bucket's catalog
+log, so one change to a bucket runs at a time: allocate the version seq,
+write the manifest, splice the MST, fsync one `AppendBatch` of the new
+catalog blocks, and advance the bucket root in Postgres, guarded on the root
+the commit started from, with the reference index (`blob_refs`) written in
+the task's own transaction: the version's claims land and take over the
+write's pending references, superseded versions' claims drop, and a blob
+whose claim count reaches zero gets a `queue-space-shard.release` task,
+queued in the same transaction and due after the release grace. The full
+trace is the
+[PutObject diagram](./docs/diagrams.md#putobject-stream-and-upload-in-the-request-commit-on-the-bucket-queue).
+
+A commit's arguments are declarative: the bucket and an ordered list of key
+changes (Put, Delete, SetAttributes), plus the authority the tasks it spawns
+need (the release proofs and the `/upload/add` and `/upload/remove`
+proofs). A Put covers PutObject, CopyObject, CompleteMultipartUpload and
+delete markers; a Delete removes a version, or the current one, which the
+commit turns into a marker or a removal of the key from the bucket's
+versioning state; SetAttributes sets retention, legal hold and tags. A
+within-bucket CopyObject reads its source and takes its references in the
+request, so the commit sees an ordinary Put. The changes apply in order to
+one `bucketop.Tx`, each advancing a working root. A change that fails on
+its own terms (a precondition, a missing version, a version under lock, an
+expired reference, a superseded reservation) fails only itself: the Tx
+returns to its mark and the rest still apply. `DeleteObjects` sends every
+key in one commit, so up to 1,000 deletes cost one fsync and one root
+advance, and a key refused in the request (AccessDenied) or by the commit
+fails alone.
 
 **Every body blob is encrypted at ingest** (the FilOne encryption design's
 write side, `s3frontend/encrypt.go`), unless its bucket opted out — see
@@ -109,8 +130,8 @@ load-bearing rules ([`logstore/README.md`](./logstore/README.md) has the
 full lifecycle):
 
 - A successful `AppendBatch` (fsynced CAR plus `.ops` record) is what
-  licenses the caller's bucket-root CAS.
-- **The unshipped catalog is journaled in Postgres**: the root swap's
+  licenses the commit's guarded root advance.
+- **The unshipped catalog is journaled in Postgres**: the root advance's
   transaction writes the batch's blocks to `ingot.catalog_journal` under the
   segment `AppendBatch` reported, and shipping that segment deletes them, as
   do `DeleteBucket` emptying the bucket's root and the bucket row's deletion.
@@ -122,6 +143,13 @@ full lifecycle):
 - **`forge_root_cid` advances only when a segment ships, and only guarded**:
   the update lands in the same transaction as the shipped stamp, and only
   where `buckets.root_cid` still equals the op-root.
+- **Shipping is a task**: the log seals on its own trigger (size or age) and
+  reports each seal, and at open any sealed segment left unshipped, which
+  queues a `queue-bucket.ship` on the bucket's subject. The ship sends the
+  bucket's unshipped sealed segments oldest first, stops at the first
+  failure and fails the task, which retries with no attempt limit (1 s
+  doubling to 5 minutes). A ship and the bucket's commits share the subject,
+  so the journal rows of a segment need no lock between them.
 - **The catalog is location-free**: manifests and MST nodes reference
   content by CID only; byte location resolves at read time through the
   locator, never embedded in the DAG.
@@ -129,7 +157,7 @@ full lifecycle):
 ## Shipping: the edge-client flow
 
 `uploader.Forge` ships every blob the same way, whether an object-body blob
-at PUT time or a sealed catalog CAR from the background flush:
+at PUT time or a sealed catalog CAR from a `queue-bucket.ship`:
 
 1. `/blob/add` against **sprue** (which allocates against a piri).
 2. HTTP **PUT** the bytes to the allocated piri (skipped on dedup).
@@ -244,8 +272,12 @@ keeps a part's bytes to upload them again, so Complete answers `InvalidPart`
 and the client uploads the part again. Every part blob streams to its
 provider as the part arrives, and an UploadPart whose blob does not stream
 fails. Complete lays out the object's byte ranges from the part rows' blob
-lengths and claims every blob in the root swap's transaction, a few
-statements however many blobs there are (`registry.CommitRoot`).
+lengths and claims every blob in the root advance's transaction, a few
+statements however many blobs there are (`registry.Postgres.RootCommitWrites`).
+The commit records the session completed in that same transaction, and only
+while it is still completing: a teardown (DeleteBucket, the stale-session
+sweeper) that latched it away first makes the commit fail with
+`NoSuchUpload`.
 
 Every session teardown (abort, expiry, the completed-session reap, a
 superseded part, the parts a Complete omitted) queues a
@@ -360,8 +392,8 @@ the manifest as `[digest, offset]` tuples and the rest in extent blocks of
 1,024, catalog blocks under `"/blobextent/0"` that the manifest points to
 by `[offset, CID]`. A blob ends where the next begins. A ranged GET loads
 the manifest and the extents its range covers, each once: one for any range
-within an extent, which spans about 256 GiB at the default blob size. The write path builds a flat list (`BlobRefs`) and `commitVersion`
-cuts it into extents inside the commit's transaction, so a copy, which
+within an extent, which spans about 256 GiB at the default blob size. The write path builds a flat list (`BlobRefs`) and the commit's Put
+(`applyPut`) cuts it into extents inside the commit's transaction, so a copy, which
 writes the source's blobs into another bucket's catalog, hands the commit
 the list rather than the source's extent links. One manifest holds at most
 8,389,632 blobs (`bucket.MaxBodyBlobs`, cbor-gen's 8,192-entry cap on the
@@ -450,9 +482,9 @@ SlowDown for the client to retry.
 
 The row the write records takes its references over. A PutObject's or
 CopyObject's commit claims each blob with the add's task ID
-(`BlobClaim.Ref`): in the root swap's transaction the pending reference is
+(`BlobClaim.Ref`): in the root advance's transaction the pending reference is
 deleted, its expiry cancelled, and the `blob_refs` claim inserted. A
-reference that has expired fails the commit with
+reference that has expired fails that change with
 `registry.ErrReferenceExpired`, and the client gets SlowDown. UploadPart
 runs its blobs' adds before it writes the part row, and `PutPart` takes
 their references over in its transaction (`MultipartPart.Refs`); a PutPart
@@ -518,7 +550,7 @@ releases at once both leave is reclaimed by the cache's time to live.
   the agent, and the per-key `DelegationCache` carries those proofs into the
   request via `internal/reqscope`, where the uploader and the network read
   tier spend them. The uploader also captures a per-space ship authority
-  (1h TTL) for the async catalog flush, from every write that commits, and
+  (1h TTL) for the catalog's `queue-bucket.ship`, from every write that commits, and
   keeps an upload's capture apart for the background releases, aborts and
   registration renewals, which a narrower key's grant may not cover. Both
   take only stores the IAM layer marks borrowable. The
@@ -542,13 +574,18 @@ draws the chains and the stores.
   `ingot.goose_db_version` (never collides with a host's own migrations).
 - **The MST is the data**: immutable, content-addressed, self-verifying,
   shipped to Forge as-is.
-- A bucket is single-writer-correct via the per-bucket in-process lock plus
-  the Postgres root CAS.
+- A bucket is single-writer: every change to it (`queue-bucket.commit`,
+  `.create`, `.set-versioning`, `.set-object-lock-config`, `.delete`,
+  `.ship`) runs as a task on its `queue-bucket` subject, one at a time, and
+  the root's advance is guarded on the root the commit started from. The
+  versioning state and the lock configuration change on the same subject, so
+  set-versioning's refusal of Suspended under a lock configuration and
+  set-object-lock-config's demand for Enabled cannot race.
 
 ## Known gaps
 
-- **No HA.** A bucket is single-writer through an in-process lock; nothing
-  coordinates across instances beyond the root CAS.
+- **No HA.** A bucket's `queue-bucket` tasks are placed on the instance
+  that holds its catalog log, and no other instance runs them.
 - **Local blob storage is bounded only when configured** (#48): with
   `local_blob_max_bytes` set, the sweeper evicts cached blobs down to the
   budget. A delete frees its blobs' cached copies once their release runs,
@@ -572,7 +609,7 @@ draws the chains and the stores.
   dies after a segment ships is not measured.
 - **Reads carry no bucket context**: `Manager.Get` linear-scans every open
   bucket store; threading the bucket into the read path removes the scan.
-- **The ship authority expires**: the async flush signs with a per-space
+- **The ship authority expires**: `queue-bucket.ship` signs with a per-space
   proof store captured, in memory, from the bucket's last write (1h TTL).
   Every commit captures it, so a segment ships under its own writes'
   capture, but one whose ship keeps failing past the TTL, or across a

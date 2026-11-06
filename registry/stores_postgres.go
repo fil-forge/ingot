@@ -34,54 +34,6 @@ var (
 
 // BlobRefStore ===============================================================
 
-// addClaims records a new generation's claims, in the commit's transaction
-// (see RootCommit.Claims). A claim with a Ref takes over the write's pending
-// reference, and the commit fails with ErrReferenceExpired if the reference
-// has gone; a release of the blob counts the reference or the claim, never
-// neither. Set-based: a multipart commit claims up to hundreds of thousands
-// of blobs, so each step is one statement over the whole generation rather
-// than one per claim.
-func addClaims(ctx context.Context, tx pgx.Tx, tasks TaskSubmitter, claims []BlobClaim) error {
-	if len(claims) == 0 {
-		return nil
-	}
-	n := len(claims)
-	digests := make([][]byte, n)
-	spaces := make([]string, n)
-	buckets := make([]string, n)
-	keys := make([]string, n)
-	versions := make([]string, n)
-	var refs []taskrunner.TaskID
-	for i, c := range claims {
-		digests[i], spaces[i], buckets[i], keys[i], versions[i] = c.Digest, c.Space.String(), c.Bucket, c.ObjectKey, c.VersionID
-		if c.Ref != uuid.Nil {
-			refs = append(refs, c.Ref)
-		}
-	}
-	if err := takePendingRefs(ctx, tx, tasks, refs); err != nil {
-		return fmt.Errorf("registry: add blob claims: %w", err)
-	}
-	if _, err := tx.Exec(ctx,
-		`INSERT INTO ingot.blob_refs (digest, bucket, object_key, version_id, space)
-		 SELECT * FROM unnest($1::bytea[], $2::text[], $3::text[], $4::text[], $5::text[])
-		 ON CONFLICT (digest, bucket, object_key, version_id) DO NOTHING`,
-		digests, buckets, keys, versions, spaces); err != nil {
-		return fmt.Errorf("registry: add blob claims: %w", err)
-	}
-	// The claim is the commit's durable trace on the blob; the intent's
-	// published state is how a multipart session's teardown recognises a
-	// committed blob and leaves it to its object's own release. A blob
-	// without an intent row (a shipped catalog segment) has nothing to mark.
-	if _, err := tx.Exec(ctx,
-		`UPDATE ingot.upload_intents i SET state = $3, updated_at = now()
-		   FROM (SELECT DISTINCT s, d FROM unnest($1::text[], $2::bytea[]) AS u(s, d)) u
-		  WHERE i.space = u.s AND i.digest = u.d AND i.state <> $3`,
-		spaces, digests, IntentPublished); err != nil {
-		return fmt.Errorf("registry: publish intents: %w", err)
-	}
-	return nil
-}
-
 // takePendingRefs deletes the pending references refs, in tx, for the row
 // that takes each over, and cancels their queue-space-shard.expire tasks with
 // them. It fails with ErrReferenceExpired unless every one is still there.
@@ -107,82 +59,6 @@ func takePendingRefs(ctx context.Context, tx pgx.Tx, tasks TaskSubmitter, refs [
 	}
 	if err := tasks.CancelTx(ctx, tx, ReleaseQueue, expires...); err != nil {
 		return fmt.Errorf("take pending references: cancel expiries: %w", err)
-	}
-	return nil
-}
-
-// dropClaims deletes the discarded generations' claims, in the commit's
-// transaction, and queues a release, due grace from now, for each digest the space holds no claim on
-// afterwards (see RootCommit.Drops). Set-based, as addClaims is: the
-// deletes are one statement, the remaining-claim check another and the
-// releases a third, however many blobs the discarded versions had, since
-// the bucket lock and the root row are held throughout.
-func dropClaims(ctx context.Context, tx pgx.Tx, tasks TaskSubmitter, drops []ClaimDrop, grace time.Duration, release ReleaseTask) error {
-	if len(drops) == 0 {
-		return nil
-	}
-	n := len(drops)
-	digests := make([][]byte, n)
-	spaces := make([]string, n)
-	buckets := make([]string, n)
-	keys := make([]string, n)
-	versions := make([]string, n)
-	for i, d := range drops {
-		digests[i], spaces[i], buckets[i], keys[i], versions[i] = d.Digest, d.Space.String(), d.Bucket, d.ObjectKey, d.VersionID
-	}
-	if _, err := tx.Exec(ctx,
-		`DELETE FROM ingot.blob_refs r
-		  USING unnest($1::bytea[], $2::text[], $3::text[], $4::text[]) AS u(d, b, k, v)
-		  WHERE r.digest = u.d AND r.bucket = u.b AND r.object_key = u.k AND r.version_id = u.v`,
-		digests, buckets, keys, versions); err != nil {
-		return fmt.Errorf("registry: drop claims: %w", err)
-	}
-	rows, err := tx.Query(ctx,
-		`SELECT DISTINCT u.s, u.d FROM unnest($1::text[], $2::bytea[]) AS u(s, d)
-		  WHERE NOT EXISTS (SELECT 1 FROM ingot.blob_refs r WHERE r.space = u.s AND r.digest = u.d)`,
-		spaces, digests)
-	if err != nil {
-		return fmt.Errorf("registry: drop claims: remaining claims: %w", err)
-	}
-	type key struct {
-		space  did.DID
-		digest multihash.Multihash
-	}
-	var unclaimed []key
-	for rows.Next() {
-		var s string
-		var d []byte
-		if err := rows.Scan(&s, &d); err != nil {
-			rows.Close()
-			return fmt.Errorf("registry: drop claims: remaining claims: %w", err)
-		}
-		space, err := did.Parse(s)
-		if err != nil {
-			rows.Close()
-			return fmt.Errorf("registry: drop claims: space %q: %w", s, err)
-		}
-		unclaimed = append(unclaimed, key{space, d})
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("registry: drop claims: remaining claims: %w", err)
-	}
-	// The grace runs from now, after any wait on the bucket row, not from
-	// the transaction's start: a reader that
-	// resolved the discarded version meanwhile is owed the whole grace from
-	// the commit. A release already pending keeps the later time.
-	due := time.Now().Add(grace)
-	if grace <= 0 {
-		due = DueNow()
-	}
-	specs := make([]taskrunner.Spec, len(unclaimed))
-	for i, k := range unclaimed {
-		if specs[i], err = release.Spec(k.space, k.digest, due); err != nil {
-			return err
-		}
-	}
-	if _, err := tasks.SubmitAllTx(ctx, tx, specs); err != nil {
-		return fmt.Errorf("registry: queue releases: %w", err)
 	}
 	return nil
 }
@@ -734,18 +610,6 @@ func (r *Postgres) LatchSession(ctx context.Context, uploadID, from, to string) 
 		uploadID, from, to)
 	if err != nil {
 		return false, fmt.Errorf("registry: latch session: %w", err)
-	}
-	return tag.RowsAffected() == 1, nil
-}
-
-func (r *Postgres) CompleteSession(ctx context.Context, uploadID, etag, versionID string) (bool, error) {
-	tag, err := r.pool.Exec(ctx,
-		`UPDATE ingot.multipart_sessions
-		 SET state = $2, committed_etag = $3, committed_version_id = $4, state_changed_at = now()
-		 WHERE upload_id = $1 AND state = $5`,
-		uploadID, SessionCompleted, etag, nullString(versionID), SessionCompleting)
-	if err != nil {
-		return false, fmt.Errorf("registry: complete session: %w", err)
 	}
 	return tag.RowsAffected() == 1, nil
 }
