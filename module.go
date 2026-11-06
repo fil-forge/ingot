@@ -150,18 +150,16 @@ var ServerModule = fx.Module("ingot-server",
 type serverParams struct {
 	fx.In
 
-	Config       config.ServerConfig
-	Logger       *zap.Logger
-	Reader       blockstore.BlockReader
-	Uploader     uploader.Uploader
-	BodyUploader uploader.BodyUploader
-	Deferred     uploader.DeferredBodyUploader
-	Remover      uploader.BlobRemover
-	Registrar    uploader.UploadRegistrar
-	Tasks        *taskrunner.Runner
-	// Streaming is optional: without it every body blob is spooled before it
-	// is uploaded (see ServerDeps.Streaming).
-	Streaming       uploader.StreamingBodyUploader `optional:"true"`
+	Config          config.ServerConfig
+	Logger          *zap.Logger
+	Reader          blockstore.BlockReader
+	Uploader        uploader.Uploader
+	BodyUploader    uploader.BodyUploader
+	Deferred        uploader.DeferredBodyUploader
+	Remover         uploader.BlobRemover
+	Registrar       uploader.UploadRegistrar
+	Tasks           *taskrunner.Runner
+	Streaming       uploader.StreamingBodyUploader
 	BucketAuthority bucketauthority.BucketAuthority
 	Registry        registry.Registry
 	Intents         registry.IntentStore

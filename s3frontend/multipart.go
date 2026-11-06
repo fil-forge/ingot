@@ -1648,6 +1648,20 @@ func (b *Backend) acceptParked(ctx context.Context, space did.DID, digests []mh.
 			return acceptOutcome{}, fmt.Errorf("lookup park: %w", err)
 		}
 		if park == nil {
+			// A park is swapped for its location in one transaction, so a
+			// park gone since the location was read above has its location
+			// now: the upload's accept took it meanwhile.
+			if existing, err := b.locations.GetLocation(ctx, space, digest); err == nil && existing != nil && settled {
+				located, err := b.markLocated(ctx, space, digest)
+				if err != nil {
+					return acceptOutcome{}, err
+				}
+				if located {
+					continue
+				}
+			} else if err != nil && !errors.Is(err, registry.ErrNotFound) {
+				return acceptOutcome{}, fmt.Errorf("lookup location: %w", err)
+			}
 			left = append(left, digest)
 			unparked++
 			continue
