@@ -1005,11 +1005,12 @@ CREATE INDEX upload_registrations_key_idx ON ingot.upload_registrations (bucket,
     WHERE dead_lettered_at IS NULL;
 
 -- The revocation-firehose cursor: one row holding the resume point in the
--- revocation service's stream. No row means "connect from now".
+-- revocation service's stream. No row means "start at the stream's head".
 CREATE TABLE ingot.revocation_cursor (
     id          boolean PRIMARY KEY DEFAULT true CHECK (id), -- single-row latch
-    recorded_at timestamptz NOT NULL,                    -- the {since} of the next reconnect
-    revoke      bytea NOT NULL,                          -- revoked delegation CID, for observability
+    token       text NOT NULL,                           -- the service's cursor the next reconnect resumes after
+    recorded_at timestamptz,                             -- the last record's; NULL for a head saved before the first record
+    revoke      bytea,                                   -- the last record's revoked delegation CID, for observability
     updated_at  timestamptz NOT NULL DEFAULT now()
 );
 ```

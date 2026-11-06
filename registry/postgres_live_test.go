@@ -895,10 +895,8 @@ func TestPostgresStores_Live(t *testing.T) {
 		if _, err := r.GetRevocationCursor(ctx); err != registry.ErrNotFound {
 			t.Fatalf("GetRevocationCursor before put err = %v, want ErrNotFound", err)
 		}
-		first := registry.RevocationCursor{
-			RecordedAt: time.Now().UTC().Truncate(time.Microsecond), // timestamptz is µs-precision
-			Revoke:     liveCid(t, "revoked-1"),
-		}
+		// A head saved before the first record has no record to describe.
+		first := registry.RevocationCursor{Token: "1733"}
 		if err := r.PutRevocationCursor(ctx, first); err != nil {
 			t.Fatalf("PutRevocationCursor: %v", err)
 		}
@@ -906,12 +904,13 @@ func TestPostgresStores_Live(t *testing.T) {
 		if err != nil {
 			t.Fatalf("GetRevocationCursor: %v", err)
 		}
-		if !got.RecordedAt.Equal(first.RecordedAt) || !got.Revoke.Equals(first.Revoke) {
+		if got.Token != first.Token || !got.RecordedAt.IsZero() || got.Revoke.Defined() {
 			t.Fatalf("cursor = %+v, want %+v", got, first)
 		}
 		// The row is a single latch: a second put overwrites, never adds.
 		second := registry.RevocationCursor{
-			RecordedAt: first.RecordedAt.Add(time.Hour),
+			Token:      "1734",
+			RecordedAt: time.Now().UTC().Truncate(time.Microsecond), // timestamptz is µs-precision
 			Revoke:     liveCid(t, "revoked-2"),
 		}
 		if err := r.PutRevocationCursor(ctx, second); err != nil {
@@ -921,7 +920,7 @@ func TestPostgresStores_Live(t *testing.T) {
 		if err != nil {
 			t.Fatalf("GetRevocationCursor after upsert: %v", err)
 		}
-		if !got.RecordedAt.Equal(second.RecordedAt) || !got.Revoke.Equals(second.Revoke) {
+		if got.Token != second.Token || !got.RecordedAt.Equal(second.RecordedAt) || !got.Revoke.Equals(second.Revoke) {
 			t.Fatalf("cursor after upsert = %+v, want %+v", got, second)
 		}
 	})

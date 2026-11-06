@@ -1552,31 +1552,47 @@ func (r *Postgres) AddGCCandidate(ctx context.Context, cidBytes []byte, bucket s
 
 func (r *Postgres) GetRevocationCursor(ctx context.Context) (*RevocationCursor, error) {
 	var cur RevocationCursor
+	var recordedAt *time.Time
 	var revoke []byte
 	err := r.pool.QueryRow(ctx,
-		`SELECT recorded_at, revoke FROM ingot.revocation_cursor WHERE id`).
-		Scan(&cur.RecordedAt, &revoke)
+		`SELECT token, recorded_at, revoke FROM ingot.revocation_cursor WHERE id`).
+		Scan(&cur.Token, &recordedAt, &revoke)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
 		return nil, fmt.Errorf("registry: get revocation cursor: %w", err)
 	}
-	if cur.Revoke, err = cid.Cast(revoke); err != nil {
-		return nil, fmt.Errorf("registry: get revocation cursor: decode revoke cid: %w", err)
+	// A head saved before the first record has neither.
+	if recordedAt != nil {
+		cur.RecordedAt = *recordedAt
+	}
+	if revoke != nil {
+		if cur.Revoke, err = cid.Cast(revoke); err != nil {
+			return nil, fmt.Errorf("registry: get revocation cursor: decode revoke cid: %w", err)
+		}
 	}
 	return &cur, nil
 }
 
 func (r *Postgres) PutRevocationCursor(ctx context.Context, cur RevocationCursor) error {
+	var recordedAt *time.Time
+	if !cur.RecordedAt.IsZero() {
+		recordedAt = &cur.RecordedAt
+	}
+	var revoke []byte
+	if cur.Revoke.Defined() {
+		revoke = cur.Revoke.Bytes()
+	}
 	_, err := r.pool.Exec(ctx,
-		`INSERT INTO ingot.revocation_cursor (id, recorded_at, revoke)
-		 VALUES (true, $1, $2)
+		`INSERT INTO ingot.revocation_cursor (id, token, recorded_at, revoke)
+		 VALUES (true, $1, $2, $3)
 		 ON CONFLICT (id) DO UPDATE
-		   SET recorded_at = EXCLUDED.recorded_at,
+		   SET token       = EXCLUDED.token,
+		       recorded_at = EXCLUDED.recorded_at,
 		       revoke      = EXCLUDED.revoke,
 		       updated_at  = now()`,
-		cur.RecordedAt, cur.Revoke.Bytes())
+		cur.Token, recordedAt, revoke)
 	if err != nil {
 		return fmt.Errorf("registry: put revocation cursor: %w", err)
 	}
