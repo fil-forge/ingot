@@ -2,8 +2,8 @@
 
 How Ingot stores S3 objects on the Forge network: the layers it is built from, the data it keeps,
 and the flows that move bytes through it. This is the target architecture. Its storage/delete/
-retrieval core is now **implemented in the tree** (it superseded the bootstrap MVP); the parts that
-remain deferred or stubbed are enumerated in [§12 — Implementation status](#12-implementation-status--postponed-items).
+retrieval core is **implemented in the tree**; the parts that remain deferred or stubbed are
+enumerated in [§12 — Implementation status](#12-implementation-status--postponed-items).
 
 Companion docs: [`diagrams.md`](./diagrams.md) — the as-built diagram set;
 [`aggregation-gate.md`](./aggregation-gate.md) — why this S3 design is gated on
@@ -239,8 +239,7 @@ MST (bucket)
 
 *Example: a 600 MiB object split at the default `max_blob_size` (~254 MiB) into three blobs. This is the manifest
 shape `bucket/manifest.go` implements (`Body.Blobs`, a stored S3 `etag`, an additional-checksum
-field, and a reserved nullable `IndexRoot`); a `deleteMarker` field is reserved for versioning, which
-is deferred ([§12](#12-implementation-status--postponed-items)). A body of more than 1,024 blobs keeps
+field, the `deleteMarker` flag, and a reserved nullable `IndexRoot`). A body of more than 1,024 blobs keeps
 the rest in extent blocks the manifest points to by offset, so a ranged GET reads the manifest and
 only the extents its range covers (`bucket/blobs.go`). One manifest lists at most 8,389,632 blobs: the 48.8 TiB S3
 maximum fits whenever `max_blob_size` is at least 6.11 MiB.*
@@ -249,7 +248,10 @@ maximum fits whenever `max_blob_size` is at least 6.11 MiB.*
 segments and shipped to Piri so the catalog is recoverable, following the existing log-structured
 plane model (`logstore`). A mutating operation ships **only the blocks it newly created** — the new
 manifest and the MST nodes added by the splice — never MST nodes that already exist and are already
-durable. The catalog plane is the per-operation delta.
+durable. The catalog plane is the per-operation delta. A commit also copies its blocks into
+`catalog_journal` in its own transaction; when a segment seals, a `queue-bucket.ship` on the
+bucket's subject ships every sealed, unshipped segment, oldest first, and drops their journal rows.
+A ship that fails retries with no attempt limit, backing off from 1 s to 5 min, unless it has no authority to ship with: no retry can find any before the bucket's next write captures some, and that write's seal queues a ship of every segment left unshipped, so it fails for good.
 
 Because many tiny blocks share a CAR, catalog retrieval uses the indexer's **index-claim /
 sharded-dag-index path** (block CID → byte range within its CAR shard). This two-level lookup is
@@ -282,7 +284,7 @@ the copy is kept once the provider holds the blob. That copy does double duty:
   the ~1 h values are the local/staging block) — and the SP publishes to IPNI itself, so a location
   cached at `accept` has ample time for the IPNI advertisement to propagate. There is therefore no
   realistic expire-before-IPNI window in production, which is why this is an optimization rather than
-  the mandatory backstop an earlier draft described. The one genuine residual race is a *never-published*
+  a mandatory backstop. The one genuine residual race is a *never-published*
   digest queried in the gap between the accept-time cache write and the SP's first IPNI advertisement,
   which 24 h negative caching could pin; serving from the local copy until **published** (or wiring the
   IPNI-sync notifier, `go-libstoracha/ipnipublisher/notifier`) closes it. *(In the R0/R1 appliance
@@ -300,7 +302,7 @@ the copy is kept once the provider holds the blob. That copy does double duty:
   holds regardless.
 
 The `upload_intents` table records each blob Ingot has written, from ingest until its release:
-`(space, digest) → { size, state: uploading│parked│accepted│published, owner ref }`. It records how far each blob got for each space, which uploads and releases act on; local
+`(space, digest) → { size, state: uploading│parked│accepted│published, bucket }`. It records how far each blob got for each space, which uploads and releases act on; local
 reads and the cache's eviction go by the files themselves. A blob stored as received has the digest
 of its bytes, so two spaces can hold one digest: one cached file, an intent per space, and the file
 stays while any space still holds an intent for it. The Postgres schema for this and every other Ingot table is in **[Appendix C](#appendix-c--postgres-schema-the-ingot-schema)**.
@@ -336,7 +338,7 @@ per-blob by digest; the chain layer below never moves bytes.
 **Aggregation and the size knobs.** Two parameters, shared by Ingot and Piri, govern on-chain piece
 composition (not storage — every blob is stored whole regardless):
 
-- **`min_aggregate_size`** — the deletion-granularity knob (today a hardcoded 128 MiB). A blob
+- **`min_aggregate_size`** — the deletion-granularity knob (Piri's `min_aggregate_size`, 128 MiB by default). A blob
   **≥ min** becomes its **own** on-chain piece. A blob **< min** is folded with other small blobs
   into a shared aggregate piece (built up to ~min).
 - **`max_blob_size`** — bounded by the largest blob Piri accepts (266338304 raw bytes ≈ 254 MiB —
@@ -349,10 +351,10 @@ small `min` means most objects are their own piece, so most deletes are O(1) (be
 more pieces — more `addPieces` transactions, a one-time registration tax, and an O(log) proving
 ratchet under churn — all bounded, none a per-live-piece cost. The proposed knee is **8 MiB**
 (with 16–32 MiB as a fallback if transaction count or base-fee spikes bite). The aggregator keeps
-aggregates `≤ max`, and the batch submitter sizes each `addPieces` to the per-tx limit — which, as of
-FWSS v1.3.0 / PDPVerifier v3.4.0, is **no longer a contract `extraData` cap** (that constant was removed)
-but the FVM `PiecesAdded` event-size + per-tx gas; the production batch size is a measured value, not a
-fixed constant (pdp-sim).
+aggregates `≤ max`, and the batch submitter sizes each `addPieces` to the per-tx limit. As of
+FWSS v1.3.0 / PDPVerifier v3.4.0 the contract sets no `extraData` cap; the limit is the FVM
+`PiecesAdded` event size plus per-tx gas, and the production batch size is a measured value
+(pdp-sim).
 
 > **Design decision (for review).** `min`/`max` are the central knobs: `min` trades on-chain piece
 > count (transactions, the one-time registration tax, the proving ratchet) against deletion
@@ -423,7 +425,10 @@ task runs again from the current root and repeats the (cheap) splice.
      blob_refs[(space,digest)] += this version, taking over the pending reference
        (an expired reference fails the change with SlowDown)
      if Suspended/Unversioned and a prior null-version existed:
-        blob_refs[(space,oldDigest)] -= it; on empty → remove (§6)
+        blob_refs[(space,oldDigest)] -= it; on empty → queue its
+        queue-space-shard.release, due after release_grace (default 60 s) → remove (§6)
+     queue the version's queue-space-upload.add (and a queue-space-upload.remove
+        for a version it retires) on the space's subject
      record superseded MST nodes → gc_candidates
      append the catalog blocks to the bucket's log (one fsync);
      the journal rows, guarded root advance and the rows above commit with the task
@@ -461,7 +466,8 @@ queue-multipart-upload-shard.accept (subject = uploadId; one runs per upload at 
         park → location while the concluded park stands; intent → accepted;
         part → accepted while its row names the same blobs, all located
      continues until no parked part is left after the cursor
-     a failed batch fails the task, which records nothing; retried 5 times from 5 s, up to 1 min
+     a failed batch fails the task, which records nothing; it runs at most 5 times,
+        retrying from 5 s, up to 1 min apart
 CompleteMultipartUpload([parts]) → queue-multipart-upload.complete
      waiting > 10 s behind the upload's other changes → 409 OperationAborted
      upload already completed → replay its ETag and version id
@@ -561,8 +567,8 @@ or by the commit fails alone.
 
 | Case | Handling |
 |---|---|
-| Crash after PUT, before accept | Bytes parked; `upload_intents` (parked) drives resume or `abort`. No `200` was sent. |
-| Crash after accept, before commit | Blob durable but unreferenced; `upload_intents` (accepted) drives commit-retry or `remove`. |
+| Crash after PUT, before accept | Bytes parked, with no reference taken; the provider's expiry of the unconcluded allocation is the backstop ([§9](#9-the-system-contract-piri--sprue--indexer)). No `200` was sent. |
+| Crash after accept, before commit | Blob durable, held by the pending reference its `queue-space-shard.add` committed; the reference's `queue-space-shard.expire` drops it after 24 h and releases the blob. A crash inside the add, after the conclude, leaves the blob accepted with no reference ([§12](#12-implementation-status--postponed-items)). |
 | Guarded-root-advance mismatch | The commit task runs again from the current root and re-splices; blobs already durable, never re-uploaded. |
 | Concurrent PUT, same key | Distinct versionIds; the commits run one at a time on the bucket's subject. |
 | Concurrent PUT, same content | One blob; both versions reference it; `blob_refs` counts both. |
@@ -625,10 +631,10 @@ negotiations).
 | Ingot-timed accept (PUT a part, conclude it later)                                              | Ingot + Sprue                   | **exists**   | `forgeclient.BlobAdd` with `WithConclude(false)` stops at the conclude seam (`BlobConcludeAll` finishes it, delivering parked parts as up to 1000 receipts per `/ucan/conclude`); UploadPart parks (durable, unaggregated), the upload's `queue-multipart-upload-shard.accept` concludes; Sprue's conclude handler already ran accept standalone, and a repeated conclude of the same put receipt is harmless. Ingot still does **not** issue `accept` (Piri requires the upload-service DID). |
 | `abort(digest)` — drop a parked blob                                                           | Piri + Sprue + libforge         | **exists**   | `/blob/abort` on Sprue translates to `/blob/reject` on Piri, which refuses blobs the invoking space has accepted (`BlobAccepted`), deletes the space's allocation, and drops the bytes once no space holds an allocation or acceptance. Sprue recovers the provider from the `cause` receipt chain (a parked blob has no registration). Abort/TTL/supersede unwind through it.  |
 | `remove(digest)` — per-space claim release; physical delete/piece-retire at zero global claims | Piri + Sprue + libforge         | **exists**   | `/blob/remove` on Sprue forwards `/blob/release` to Piri, which deletes the space's allocation/acceptance/claim; at zero claims bytes delete immediately (unaggregated) or via the pending-removal sweep once the whole aggregate root is dead (FIL-623/624). Sprue forwards to primary + replicas (FIL-522). |
-| Configurable, adaptive size policy (`min`/`max`); batch guard for the `extraData` cap          | Piri                            | **partial**  | `MinAggregateSize` is hardcoded 128 MiB; lower to ~8 MiB and make configurable. The `addPieces` batch is no longer contract-capped (FWSS v1.3.0 removed the `extraData` cap); size it to the FVM `PiecesAdded` event-size + per-tx gas — a measured ceiling (default `BatchSize=10` is safely within it) (pdp-sim). No contract change. |
+| Configurable, adaptive size policy (`min`/`max`); batch guard for the `extraData` cap          | Piri                            | **partial**  | `MinAggregateSize` is configurable (`min_aggregate_size`, 128 MiB by default); lower it to ~8 MiB. The contract sets no cap on the `addPieces` batch (FWSS v1.3.0); size it to the FVM `PiecesAdded` event-size + per-tx gas — a measured ceiling (default `BatchSize=10` is safely within it) (pdp-sim). No contract change. |
 | Compaction (Regime B) + complete the on-chain delete signature                                 | Piri                            | **partial**  | Whole-root delete is signed and wired (`schedulePieceDeletions` with `SignSchedulePieceRemovals` extraData); compaction (remove + re-hash survivors + re-add) is new.                                               |
 | De-dup at accept (don't re-aggregate a digest already a live piece)                            | Piri                            | **to-build** | Backstops one-piece-per-content once accept timing is Ingot-driven.                                                                                                                                                 |
-| Parked-allocation GC + honor `Expires`                                                         | Piri                            | **to-build** | Bounds leakage when an abort never arrives.                                                                                                                                                                         |
+| Parked-allocation GC + honor `Expires`                                                         | Piri                            | **exists**   | The provider expires an allocation never concluded, which bounds leakage when an abort never arrives.                                                                                                               |
 | Indexer delete by `(space, digest)` / location-claim CID                                       | Indexer + Sprue                 | **to-build** | IPNI removal mechanics are the indexer's.                                                                                                                                                                           |
 | Bare location commitment served by blob digest                                                 | Indexer                         | **exists**   | `accept` publishes it; the indexer caches it. Ingot's locator must learn to consume it ([§8](#8-retrieval-addressing-when-bodies-need-a-sharded-dag-index)).                                                        |
 | Batch `allocate`/`accept`                                                                      | libforge + Sprue + Piri + Ingot | **partial**  | `accept` is batched without new command shapes: an accept batch's `/ucan/conclude` carries up to 1000 blobs' put receipts, and Sprue issues the accepts to each node in one request, with a receipt per blob. `allocate` is still one RPC per blob.                 |
@@ -639,8 +645,8 @@ negotiations).
 (stable CID, today via `WithNoNonce` over `{space, digest, size, put-task}`); re-driving accept must
 reuse the same put-task link. `remove`/`abort` must be idempotent. The forge-root advance must
 happen only after a successful guarded root advance. The catalog log appends before the advance, so
-a commit that fails after its append can leave the forge root pointing at a bucket root that was
-never adopted.
+a commit that fails after its append leaves an op-root the bucket never adopted in the segment; the
+ship advances `forge_root_cid` to an op-root only while the bucket's `root_cid` still equals it.
 
 ---
 
@@ -700,9 +706,10 @@ The MVP this supersedes had six structural problems; each is resolved by a layer
 - **Piece** — the on-chain proof unit (a CommP Merkle root). A blob ≥ `min` is its own piece; smaller
   blobs share an **aggregate** piece as **subroots**.
 - **Parked** — a blob that has been PUT but not yet accepted: durable in MinIO, not yet proven.
-- **Manifest** — the dag-cbor record for one object version: ordered blob list + size/sha256 +
-  etag/metadata.
-- **MST** — the per-bucket Merkle Search Tree mapping composite keys to manifests.
+- **Manifest** — the dag-cbor record for one object version: ordered list of sha256-addressed
+  blobs + size + whole-object BLAKE3 digest + etag/metadata.
+- **MST** — the per-bucket Merkle Search Tree mapping plain object keys to their value blocks (a
+  manifest, or an `ObjectLeaf` once a key is superseded).
 - **Plane** — a shipping pipeline. The **data** plane is object blobs (direct to Piri); the
   **catalog** plane is MST nodes + manifests (CAR-batched).
 - **Claim** — a space's reference to a blob; `remove` releases it, and Piri deletes bytes when no
@@ -781,6 +788,12 @@ CREATE TABLE ingot.segments (
     retired_at   bigint,                                 -- files unlinked; the row stays until DeleteBucket
     dead_bytes   bigint                                  -- already dead when shipped; NULL = unmeasured
 );
+CREATE INDEX segments_bucket_idx ON ingot.segments (bucket);
+CREATE INDEX segments_plane_seq_idx ON ingot.segments (plane, seq);
+-- Retired rows accumulate until DeleteBucket; opening a bucket's log and the
+-- startup sweep read only the unretired ones.
+CREATE INDEX segments_unretired_idx ON ingot.segments (plane, bucket, seq)
+    WHERE retired_at IS NULL;
 
 -- Per-segment record of the bucket-root advances that landed in it; shipping
 -- replays these into buckets.forge_root_cid under the guard above.
@@ -791,6 +804,7 @@ CREATE TABLE ingot.segment_op_roots (
     root_cid   bytea  NOT NULL,
     PRIMARY KEY (seq, seq_within)
 );
+CREATE INDEX segment_op_roots_bucket_seq_idx ON ingot.segment_op_roots (bucket, seq);
 
 -- The catalog journal: a copy of every catalog block a commit appended to the
 -- log, written in the root advance's transaction and deleted in the one that stamps
@@ -852,6 +866,11 @@ CREATE TABLE ingot.upload_intents (
     updated_at  timestamptz NOT NULL DEFAULT now(),      -- last state change
     PRIMARY KEY (space, digest)
 );
+-- A digest's intents in every space (the cached file is one per digest).
+CREATE INDEX upload_intents_digest_idx ON ingot.upload_intents (digest);
+-- The bytes of uploads left 'uploading' past a deadline (the stalled-upload sum).
+CREATE INDEX upload_intents_stalled_idx ON ingot.upload_intents (updated_at) INCLUDE (size)
+    WHERE state = 'uploading';
 
 -- Local blob location table (§8, appliance topology): (space, digest) →
 -- provider/URL, captured at accept, in place of the indexing-service.
@@ -864,6 +883,7 @@ CREATE TABLE ingot.blob_locations (
     created_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (space, digest)
 );
+CREATE INDEX blob_locations_digest_idx ON ingot.blob_locations (digest);
 
 -- FEE encryption parameters of each encrypted body blob: exactly the inputs a
 -- range read's decryptor needs, so it can decrypt any span without fetching the
@@ -955,6 +975,8 @@ CREATE TABLE ingot.multipart_parts (
     CHECK (span_lengths IS NULL OR cardinality(span_lengths) = cardinality(blob_digests))
 );
 CREATE INDEX multipart_parts_parked ON ingot.multipart_parts (upload_id, part_number) WHERE state = 'parked';
+-- The parts that name a blob (blob_digests @> ARRAY[digest]): reference counts and releases.
+CREATE INDEX multipart_parts_blob_digests_gin ON ingot.multipart_parts USING gin (blob_digests);
 
 -- The part's BLAKE3 tree, hashed at the object offset UploadPart assumed and
 -- merged into the object's digest at Complete (see blake3tree). Its own
@@ -1027,15 +1049,64 @@ nothing while any reference remains. `upload_intents` and `blob_parks` are keyed
 space reference the same bytes. The cached file itself is one per digest, shared across spaces, and
 goes with the last intent for it.
 
+### Task queue tables
+
+The task runner ([`taskrunner`](../taskrunner/README.md)) creates its own tables in the `ingot` schema
+at startup (`Runner.Migrate`, run after the goose migrations), two per queue. `<q>` is the queue's
+name with `-` as `_`: `queue_multipart_upload`, `queue_multipart_upload_shard`, `queue_bucket`,
+`queue_space_upload`, `queue_space_shard` and `queue_shard`. `ingot.taskrunner_versions (queue text
+PRIMARY KEY, version integer NOT NULL)` records how many of `taskrunner/schema.go`'s steps each
+queue's tables have had. Both tables churn, so they are stored with `fillfactor = 80` and an
+autovacuum that runs once 1% of rows are dead.
+
+```sql
+CREATE TABLE ingot.<q>_tasks (
+    seq           bigint GENERATED ALWAYS AS IDENTITY UNIQUE, -- submission order
+    id            uuid PRIMARY KEY,
+    subject       text COLLATE "C" NOT NULL,               -- byte order, for prefix matches
+    action        text NOT NULL,
+    created       timestamptz NOT NULL DEFAULT clock_timestamp(),
+    not_before    timestamptz,                             -- not run before this
+    expires       timestamptz,                             -- not started after this: 'expired'
+    args          bytea,
+    sync          boolean NOT NULL,                        -- run inline by its caller
+    state         text NOT NULL DEFAULT 'pending'
+        CHECK (state IN ('pending','succeeded','failed','expired','cancelled','resubmitted')),
+    result        bytea,
+    error         text,
+    finished      timestamptz,                             -- drives the retention purge
+    waiting_until timestamptz,                             -- a sync caller's claim; workers keep off until it lapses
+    started       timestamptz,                             -- set while running: no cancel or replace
+    replaceable   boolean NOT NULL DEFAULT false,
+    attempts      integer NOT NULL DEFAULT 0,
+    retry_at      timestamptz,                             -- a retry that holds its subject
+    node          text                                     -- when set, the only instance that may run it
+);
+CREATE INDEX <q>_tasks_pending ON ingot.<q>_tasks (subject, seq) WHERE state = 'pending';
+CREATE INDEX <q>_tasks_due ON ingot.<q>_tasks (not_before) WHERE state = 'pending';
+CREATE UNIQUE INDEX <q>_tasks_replaceable ON ingot.<q>_tasks (subject, action)
+    WHERE state = 'pending' AND replaceable AND started IS NULL;
+CREATE INDEX <q>_tasks_failed ON ingot.<q>_tasks (subject, seq) WHERE state = 'failed';
+CREATE INDEX <q>_tasks_finished ON ingot.<q>_tasks (finished) WHERE state <> 'pending';
+
+-- One row per subject a task tree holds.
+CREATE TABLE ingot.<q>_leases (
+    subject      text PRIMARY KEY,
+    owner        uuid NOT NULL,                            -- a token minted for this hold
+    expires      timestamptz NOT NULL,                     -- renewed while held, and at commit
+    tree_created timestamptz NOT NULL,                     -- the holding tree's age: its root task's
+    tree_id      uuid NOT NULL                             -- creation, then ID (deadlock avoidance)
+);
+```
+
 ---
 
 ## 12. Implementation status & postponed items
 
 The body of this document is the **north-star target**. This section records what is **built today**
-versus what is deliberately **deferred** — the body above is unchanged so the target stays legible;
-the reductions live here.
+versus what is deliberately **deferred**.
 
-### What is implemented (in-process, exercised by the `testing/` harness)
+### What is implemented
 
 The storage / delete / retrieval core is built and tested:
 
@@ -1044,8 +1115,8 @@ The storage / delete / retrieval core is built and tested:
 - **Synchronous durability write path** ([§7.1](#71-write-single-shot-putobject)) — ingest in the request, streaming each blob to its provider, then a
   `queue-bucket.commit` on the bucket's subject (manifest + MST splice + one fsynced append + guarded root advance); the reference-index claims and
   drops are written in the root advance's transaction, so a commit failure writes none of them.
-- **Single-plane catalog log** — the data plane is gone; `logstore` journals only the catalog
-  (manifests + MST nodes) as CAR segments. `forge_root_cid` advances only when the catalog ships, and
+- **Single-plane catalog log** — `logstore` journals only the catalog (manifests + MST nodes) as
+  CAR segments, shipped by `queue-bucket.ship`. `forge_root_cid` advances only when the catalog ships, and
   only `WHERE root_cid` still matches the op-root (the orphan-root guard from [§9](#9-the-system-contract-piri--sprue--indexer)).
 - **Dedup + reference-counted delete** ([§5](#5-the-data-layer)–[§6](#6-the-forgechain-layer)) — `blob_refs`, overwrite-in-place, `DeleteObject`,
   `remove(digest)` at zero references, `gc_candidates` (write-only).
@@ -1085,19 +1156,19 @@ The `Expires` HTTP header *is* implemented — it is a passthrough caching heade
 the manifest and replayed on GET/HEAD, not a lifecycle control. True S3 **Lifecycle** management
 (`PutBucketLifecycleConfiguration` expiration/transition rules that actually delete or tier objects
 after N days, surfaced via the `x-amz-expiration` response header) is a separate, unimplemented
-feature. It would be its own subsystem — a per-bucket rule store plus a background sweeper driving the
-reference index — and is out of scope for this iteration.
+feature. It would be its own subsystem — a per-bucket rule store plus scheduled expirations driving
+the reference index — and is out of scope for this iteration.
 
-### Deferred as forge-mode glue (validated live in smelt, not the in-process harness)
+### Forge-network paths (validated live in smelt)
 
-The in-memory harness uses a no-op uploader and serves reads from local disk; the forge-network
-paths below are exercised against the real stack by the smelt-based `itest/` harness in CI:
+The forge-network paths below are exercised against the real stack by the smelt-based `itest/`
+harness (`make itest`); unit tests cover libraries and pure logic only:
 
 - **`remove(digest)` and `abort(digest)` are live.** `RemoveBlob` invokes `/blob/remove` on
   sprue, which forwards `/blob/release` to the storage nodes ([§9](#9-the-system-contract-piri--sprue--indexer)); delete finality means claim-release-now,
   bytes-at-root-death. `AbortBlob` retires parked part-blobs via `/blob/abort` — sprue translates
   it into `/blob/reject` on the node (provider recovered from the `cause` receipt chain);
-  allocation-expiry GC (FIL-625) remains the backstop when an abort never arrives.
+  the provider's expiry of an allocation never concluded is the backstop when an abort never arrives.
 - **The local-table `Locator` read tier is wired and validated.** Body blobs re-resolve after
   local-copy loss from `blob_locations` + `/content/retrieve` (`TestForgeReadAfterEviction`), and
   retention-retired catalog blocks resolve via `shard_inclusions` (#44) — the read paths of
@@ -1109,12 +1180,12 @@ paths below are exercised against the real stack by the smelt-based `itest/` har
   `queue-shard.evict` for when the time runs out, and a read with less than half left schedules a
   later one in its place. With `local_blob_max_bytes` set
   (`SweepLocalBlobs`), every 30s the sweeper also evicts cached copies, the least recently
-  renewed first, down to 90% of the budget; hourly it deletes unfinished `.tmp-*` writes. The
-  budget is off by default. A release frees a deleted object's cached copies, and a multipart part
+  renewed first, down to 90% of the budget; hourly it deletes unfinished `.tmp-*` writes older
+  than `local_blob_orphan_age` (default 24 h). The budget is off by default. A release frees a deleted object's cached copies, and a multipart part
   keeps none. Local blob storage reports its usage, budget, stalled uploads, removals by reason
   and reads by tier as OpenTelemetry metrics (`ingot.local_blobs.*`). With `cache_writes: false`,
-  a write keeps no copy, giving up the read-after-write copy (§4): safe while reads
-  resolve through the local location table (`LocalLocator`); with an indexer-backed locator, §4's
+  a write keeps no copy, giving up the read-after-write copy ([§5](#5-the-data-layer)): safe while reads
+  resolve through the local location table (`LocalLocator`); with an indexer-backed locator, §5's
   race on a digest not yet published would return.
 - **Multipart parts park at UploadPart and are accepted during the upload.** (Built: `parkBlobs`
   over the `blob_parks` table, and the `queue-multipart-upload-shard.accept` task in
@@ -1126,9 +1197,10 @@ paths below are exercised against the real stack by the smelt-based `itest/` har
 - **Crash recovery is not built.** A write that dies after its `queue-space-shard.add` tasks commit
   leaves pending references, which expire after 24 h and release the blobs; one that dies inside an
   add, after the conclude and before the add's commit, leaves an accepted blob with no reference.
-  The `upload_intents` × references reconciliation the failure-mode table in
-  [§7.5](#75-concurrency-durability-and-failure-modes) describes (resume/`abort` parked, `remove`
-  accepted-but-unreferenced) is a later phase.
+  One that dies before its add commits leaves a parked allocation with no reference, for the
+  provider to expire ([§7.5](#75-concurrency-durability-and-failure-modes)). A reconciliation of
+  `upload_intents` against references (abort a parked blob nothing references, remove an accepted
+  one) is a later phase.
 - **Indexer retraction on delete** is unimplemented (no-op). `ListParts` and
   `ListMultipartUploads` are implemented (paginated, prefix/delimiter/marker semantics;
   in-flight sessions only).

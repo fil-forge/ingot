@@ -149,7 +149,7 @@ full lifecycle):
   bucket's unshipped sealed segments oldest first, stops at the first
   failure and fails the task, which retries with no attempt limit (1 s
   doubling to 5 minutes). A ship and the bucket's commits share the subject,
-  so the journal rows of a segment need no lock between them.
+  so no commit journals blocks under a segment while that segment ships.
 - **The catalog is location-free**: manifests and MST nodes reference
   content by CID only; byte location resolves at read time through the
   locator, never embedded in the DAG.
@@ -607,8 +607,9 @@ draws the chains and the stores.
 - **The MST is the data**: immutable, content-addressed, self-verifying,
   shipped to Forge as-is.
 - A bucket is single-writer: every change to it (`queue-bucket.commit`,
-  `.create`, `.set-versioning`, `.set-object-lock-config`, `.delete`,
-  `.ship`) runs as a task on its `queue-bucket` subject, one at a time, and
+  `.create`, `.set-versioning`, `.set-object-lock-config`, `.close`,
+  `.admit-upload`, `.delete`, `.ship`) runs as a task on its `queue-bucket`
+  subject, one at a time, and
   the root's advance is guarded on the root the commit started from. The
   versioning state and the lock configuration change on the same subject, so
   set-versioning's refusal of Suspended under a lock configuration and
