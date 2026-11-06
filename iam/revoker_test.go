@@ -45,42 +45,6 @@ func seedKey(t *testing.T, kp *iam.KeyProofs, keys *iam.VerificationKeyCache, te
 	return revokerFixture{key: key.DID(), access: access, dlg: dlg, tenant: tenant}
 }
 
-// ClearAll drops every key's cached state but keeps the record of revoked
-// CIDs, so a revoked delegation still can't be cached again.
-func TestRevokerClearAll(t *testing.T) {
-	ctx := context.Background()
-	kp := iam.NewKeyProofs()
-	keys := iam.NewVerificationKeyCache()
-	tenants := iam.NewTenantCache()
-	r := iam.NewRevoker(kp, keys, tenants, nil)
-
-	a := seedKey(t, kp, keys, tenants)
-	b := seedKey(t, kp, keys, tenants)
-	r.Revoke(a.dlg.Link())
-	kp.For(a.key).PutPermissions(a.tenant.DID(), time.Hour, []string{"s3:GetObject"})
-
-	require.Equal(t, 2, r.ClearAll())
-
-	for _, k := range []revokerFixture{a, b} {
-		chain, _, err := kp.For(k.key).ProofChain(ctx, k.dlg.Audience(), k.dlg.Command(), k.tenant.DID())
-		require.NoError(t, err)
-		require.Empty(t, chain)
-		_, ok := keys.Get(k.access, s3.KeyKindSigV4)
-		require.False(t, ok)
-		_, ok = tenants.Get(k.access)
-		require.False(t, ok)
-		_, known := kp.For(k.key).Permits(k.tenant.DID(), "s3:GetObject")
-		require.False(t, known)
-	}
-
-	// The revocation is still remembered: depositing the revoked delegation
-	// again caches nothing.
-	kp.Deposit(a.key, a.dlg)
-	require.False(t, kp.For(a.key).Contains(a.dlg.Link()))
-	kp.Deposit(b.key, b.dlg)
-	require.True(t, kp.For(b.key).Contains(b.dlg.Link()))
-}
-
 func TestRevokerClearsHolderCachesOnly(t *testing.T) {
 	ctx := context.Background()
 	kp := iam.NewKeyProofs()

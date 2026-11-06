@@ -24,11 +24,6 @@ func NewTenantCache() *TenantCache {
 	return &TenantCache{data: gocache.New(gocache.NoExpiration, cacheJanitorInterval)}
 }
 
-// Clear drops every cached tenant.
-func (c *TenantCache) Clear() {
-	c.data.Flush()
-}
-
 // Put caches tenant under access for ttl. Undefined tenants and non-positive
 // TTLs are skipped.
 func (c *TenantCache) Put(access string, ttl time.Duration, tenant did.DID) {
