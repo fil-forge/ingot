@@ -178,6 +178,7 @@ func newTestServer(t *testing.T, cfg config.ServerConfig, opts ...func(*ServerDe
 		Uploader:        testfakes.NopUploader{},
 		BodyUploader:    testfakes.NopUploader{},
 		Deferred:        testfakes.NopUploader{},
+		Streaming:       testfakes.NopUploader{},
 		Remover:         testfakes.NopUploader{},
 		Registrar:       testfakes.NopUploader{},
 		Registry:        mem,

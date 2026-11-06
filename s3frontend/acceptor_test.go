@@ -1,6 +1,7 @@
 package s3frontend
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"errors"
@@ -667,5 +668,60 @@ func TestAcceptorPromotesRecordedPartsOfAFailedConclude(t *testing.T) {
 	}
 	if _, err := mpComplete(t, b, key, uploadID, parts, nil); err != nil {
 		t.Fatalf("Complete: %v", err)
+	}
+}
+
+// acceptedMeanwhile is a park store whose first lookup of an armed digest
+// finds the upload's accept has just swapped its park for its location.
+type acceptedMeanwhile struct {
+	registry.ParkStore
+	locations registry.LocationStore
+	armed     multihash.Multihash
+}
+
+func (a *acceptedMeanwhile) GetPark(ctx context.Context, space did.DID, digest multihash.Multihash) (*registry.BlobPark, error) {
+	if a.armed == nil || !bytes.Equal(digest, a.armed) {
+		return a.ParkStore.GetPark(ctx, space, digest)
+	}
+	a.armed = nil
+	park, err := a.ParkStore.GetPark(ctx, space, digest)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := a.ParkStore.ConcludePark(ctx, registry.BlobLocation{Space: space, Digest: digest, Provider: "did:key:provider", URL: "https://provider.example/blob", Size: park.Size}, park.AddTask); err != nil {
+		return nil, err
+	}
+	return a.ParkStore.GetPark(ctx, space, digest)
+}
+
+// TestAcceptParkedSeesAPartAcceptedBetweenItsReads: a part whose park the
+// upload's accept swaps for its location between acceptParked's location and
+// park reads is found accepted, not left for Complete to refuse.
+func TestAcceptParkedSeesAPartAcceptedBetweenItsReads(t *testing.T) {
+	parks := &acceptedMeanwhile{}
+	b, mem := newDeferredBackend(t, &parkingUploader{}, func(d *Deps) {
+		parks.ParkStore, parks.locations = d.Parks, d.Locations
+		d.Parks = parks
+	})
+	ctx := context.Background()
+	key := "accepted-meanwhile"
+	uploadID := mpCreate(t, b, key, "", "")
+	uploadDistinctParts(t, b, key, uploadID, 1)
+	sess, err := mem.GetSession(ctx, uploadID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := hygienePartDigests(t, mem, uploadID, 1)[0]
+	parks.armed = d
+
+	out, err := b.acceptParked(ctx, sess.Space, []multihash.Multihash{d}, acceptForCommit)
+	if err != nil {
+		t.Fatalf("acceptParked: %v", err)
+	}
+	if parks.armed != nil {
+		t.Fatal("the hook never ran: the test proves nothing")
+	}
+	if len(out.left) != 0 || len(out.failed) != 0 || !out.settled {
+		t.Fatalf("outcome %+v, want the part accepted", out)
 	}
 }
