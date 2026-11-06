@@ -363,19 +363,19 @@ before it accepts the parts, before the commit, and reports the id to versitygw
 (`backend.CompleteMultipartUploadReporter`). A slow Complete's response commits its headers before
 the completion finishes, after waiting for the report, and S3 sends `x-amz-version-id` with them.
 The reported id is binding, so the commit installs it unchanged, and refuses it
-(`errReservationSuperseded`, a retryable InternalError that reopens the upload) when:
+(`errReservationSuperseded`, a retryable InternalError that leaves the upload open) when:
 
 - the key's current version has a larger seq: another write to the key committed during the
   Complete, and the reservation can no longer be the newest version (invariant 2); or
 - the bucket is no longer Enabled, so the version would be null.
 
 The client's retry reserves a fresh seq. Unversioned and suspended buckets send no version id, so
-their Completes report `""` and allocate in the commit as every other write does. So does a
-Complete that waited on another Complete of its upload: it reports `""` before waiting, since the
-other one's id isn't known yet. A Complete that reported `""` commits only a null version: if the
-bucket is Enabled at its commit (versioning was enabled meanwhile, or the Complete it waited on
-failed and this one won), the commit is refused the same way, since the client could never learn
-the numbered version's id.
+their Completes report `""` and allocate in the commit as every other write does. A Complete
+that waits behind another Complete of its upload (`queue-multipart-upload.complete`) reports
+nothing until it runs, and then replays the other one's result if it committed, or reserves its own id. A Complete
+that reported `""` commits only a null version: if the bucket is Enabled at its commit (versioning
+was enabled meanwhile), the commit is refused the same way, since the client could never learn the
+numbered version's id.
 
 ### 5.2 Supersession
 

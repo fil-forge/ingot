@@ -52,11 +52,23 @@ type commitOutcome struct {
 	results    []ChangeResult
 }
 
+// syncRunner runs a sync task: the runner, for a request, or a task's Exec,
+// for a child.
+type syncRunner interface {
+	Run(ctx context.Context, s taskrunner.Spec) ([]byte, error)
+}
+
 // commit runs a queue-bucket.commit of changes to st's bucket and waits for
 // it. The request's authority for the tasks the commit spawns goes with it:
 // the releases of the claims it drops and the upload registrations it
 // queues.
 func (b *Backend) commit(ctx context.Context, st *registry.State, changes ...KeyChange) (commitOutcome, error) {
+	return b.commitWith(ctx, b.buckets, st, changes...)
+}
+
+// commitWith is commit run through run: a Complete runs its commit as a
+// child, so the commit's writes land with its own.
+func (b *Backend) commitWith(ctx context.Context, run syncRunner, st *registry.State, changes ...KeyChange) (commitOutcome, error) {
 	args := BucketCommitTask{Bucket: st.Name, Changes: changes, Release: b.releaseAuthority(ctx, st.Space)}
 	var err error
 	if args.RegisterAdd, err = b.registrar.CaptureAuthority(ctx, st.Space, uploadcmds.Add.Command); err != nil {
@@ -69,7 +81,7 @@ func (b *Backend) commit(ctx context.Context, st *registry.State, changes ...Key
 	if err := args.MarshalCBOR(&buf); err != nil {
 		return commitOutcome{}, fmt.Errorf("s3frontend: encode commit: %w", err)
 	}
-	out, err := b.buckets.Run(ctx, b.bucketSpec(st.Space, registry.BucketCommitAction, buf.Bytes()))
+	out, err := run.Run(ctx, b.bucketSpec(st.Space, registry.BucketCommitAction, buf.Bytes()))
 	if err != nil {
 		return commitOutcome{}, mapCommitError(err, "commit")
 	}
@@ -83,7 +95,12 @@ func (b *Backend) commit(ctx context.Context, st *registry.State, changes ...Key
 // commitOne is commit of one change, returning its result or the error it
 // failed with.
 func (b *Backend) commitOne(ctx context.Context, st *registry.State, change KeyChange, op string) (ChangeResult, registry.VersioningState, error) {
-	out, err := b.commit(ctx, st, change)
+	return b.commitOneWith(ctx, b.buckets, st, change, op)
+}
+
+// commitOneWith is commitOne run through run (commitWith).
+func (b *Backend) commitOneWith(ctx context.Context, run syncRunner, st *registry.State, change KeyChange, op string) (ChangeResult, registry.VersioningState, error) {
+	out, err := b.commitWith(ctx, run, st, change)
 	if err != nil {
 		return ChangeResult{}, "", err
 	}
@@ -113,9 +130,6 @@ func (b *Backend) bucketSpec(space did.DID, action string, args []byte) taskrunn
 type commitScope struct {
 	tx   *bucketop.Tx
 	args *BucketCommitTask
-	// guards are writes the changes owe besides the root's (a completed
-	// multipart session), which fail the commit when they affect no row.
-	guards []registry.Statement
 }
 
 // runCommit is queue-bucket.commit.
@@ -135,10 +149,13 @@ func (b *Backend) runCommit(ctx context.Context, ex *taskrunner.Exec, t taskrunn
 		return nil, err
 	}
 	defer tx.Discard()
+	if tx.State().Closing {
+		return nil, errBucketClosing
+	}
 	sc := &commitScope{tx: tx, args: &args}
 	res := BucketCommitResult{Versioning: string(tx.State().Versioning), Results: make([]ChangeResult, len(args.Changes))}
 	for i, ch := range args.Changes {
-		mark, guards := tx.Mark(), len(sc.guards)
+		mark := tx.Mark()
 		r, root, err := b.applyChange(ctx, sc, ch)
 		if err != nil {
 			ce, ok := changeError(err)
@@ -146,7 +163,6 @@ func (b *Backend) runCommit(ctx context.Context, ex *taskrunner.Exec, t taskrunn
 				return nil, err
 			}
 			tx.Restore(mark)
-			sc.guards = sc.guards[:guards]
 			res.Results[i] = ChangeResult{Err: ce}
 			continue
 		}
@@ -165,22 +181,7 @@ func (b *Backend) runCommit(ctx context.Context, ex *taskrunner.Exec, t taskrunn
 		if err != nil {
 			return nil, err
 		}
-		for _, st := range w.Statements {
-			if err := ex.Write(ctx, st.SQL, st.Args...); err != nil {
-				return nil, err
-			}
-		}
-		for _, st := range append(w.Guards, sc.guards...) {
-			if err := ex.WriteConditional(ctx, st.SQL, st.Args...); err != nil {
-				return nil, err
-			}
-		}
-		for _, spec := range w.Spawns {
-			if _, err := ex.Submit(ctx, spec); err != nil {
-				return nil, err
-			}
-		}
-		if err := ex.Cancel(ctx, registry.ReleaseQueue, w.Expiries...); err != nil {
+		if err := applyCommitWrites(ctx, ex, w); err != nil {
 			return nil, err
 		}
 	}
@@ -271,20 +272,7 @@ func (b *Backend) register(sc *commitScope, st *registry.State, key string, root
 // putPreCheck returns the check a put runs against the version it would
 // supersede (nil when the key is new): a delete marker's delete
 // preconditions, a Complete's If-Match and If-None-Match, or a PutObject's.
-// A put that completes a multipart upload first checks the upload is still
-// completing; a teardown that took it has released its blobs.
-func (b *Backend) putPreCheck(ctx context.Context, p *PutChange) (func(superseded *msbucket.ObjectManifest) error, error) {
-	if p.Session != "" {
-		sess, err := b.multipart.GetSession(ctx, p.Session)
-		switch {
-		case errors.Is(err, registry.ErrNotFound):
-			return nil, s3err.GetAPIError(s3err.ErrNoSuchUpload)
-		case err != nil:
-			return nil, fmt.Errorf("recheck session latch: %w", err)
-		case sess.State != registry.SessionCompleting:
-			return nil, s3err.GetAPIError(s3err.ErrNoSuchUpload)
-		}
-	}
+func (b *Backend) putPreCheck(_ context.Context, p *PutChange) (func(superseded *msbucket.ObjectManifest) error, error) {
 	return func(superseded *msbucket.ObjectManifest) error {
 		// A delete-marker current means "no object" for precondition
 		// purposes.
@@ -298,7 +286,7 @@ func (b *Backend) putPreCheck(ctx context.Context, p *PutChange) (func(supersede
 				return nil
 			}
 			return backend.EvaluateObjectDeletePreconditions(oldETag, time.Unix(superseded.Created, 0), superseded.Body.Size, p.DeletePre.preconditions())
-		case p.Session != "":
+		case p.Completes:
 			if p.HasIfMatch {
 				if !oldExists {
 					return s3err.GetAPIError(s3err.ErrNoSuchKey)

@@ -608,15 +608,15 @@ func TestPostgresStores(t *testing.T) {
 			t.Fatalf("after DeletePartTrees = %+v, want two part records", after)
 		}
 
-		// single-winner latch
-		won, err := r.LatchSession(ctx, id, registry.SessionOpen, registry.SessionCompleting)
-		if err != nil || !won {
-			t.Fatalf("Complete latch won=%v err=%v", won, err)
+		// A Complete records the session completed, once.
+		completed := registry.CompletedSession(id, "etag", "v1")
+		if tag, err := pool.Exec(ctx, completed.SQL, completed.Args...); err != nil || tag.RowsAffected() != 1 {
+			t.Fatalf("complete the session: %v rows, err %v", tag.RowsAffected(), err)
 		}
 		// A part cannot land once the session has left 'open', nor on a
 		// session that does not exist.
 		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: id, PartNumber: 3, ETagMD5: []byte{0x03}, Size: 3, BlobDigests: []multihash.Multihash{{0xd3}}}, nil, registry.ReleaseTask{}); !errors.Is(err, registry.ErrNotFound) {
-			t.Fatalf("PutPart on a completing session = %v, want ErrNotFound", err)
+			t.Fatalf("PutPart on a completed session = %v, want ErrNotFound", err)
 		}
 		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: "no-such-upload", PartNumber: 1, ETagMD5: []byte{0x01}, Size: 1, BlobDigests: []multihash.Multihash{{0xd1}}}, nil, registry.ReleaseTask{}); !errors.Is(err, registry.ErrNotFound) {
 			t.Fatalf("PutPart on a missing session = %v, want ErrNotFound", err)
@@ -624,9 +624,8 @@ func TestPostgresStores(t *testing.T) {
 		if parts, _ := r.ListParts(ctx, id); len(parts) != 2 {
 			t.Fatalf("parts after the refused writes = %d, want 2", len(parts))
 		}
-		won, err = r.LatchSession(ctx, id, registry.SessionOpen, registry.SessionAborting)
-		if err != nil || won {
-			t.Fatalf("Abort latch after Complete won=%v err=%v, want won=false", won, err)
+		if tag, err := pool.Exec(ctx, completed.SQL, completed.Args...); err != nil || tag.RowsAffected() != 0 {
+			t.Fatalf("complete the completed session again: %v rows, err %v; want none", tag.RowsAffected(), err)
 		}
 
 		// delete cascades parts
@@ -638,7 +637,7 @@ func TestPostgresStores(t *testing.T) {
 		}
 	})
 
-	t.Run("multipart listing sweeper and part refs", func(t *testing.T) {
+	t.Run("multipart listing and part refs", func(t *testing.T) {
 		lsSpace := testutil.RandomDID(t)
 		mk := func(id, key string) {
 			t.Helper()
@@ -671,14 +670,6 @@ func TestPostgresStores(t *testing.T) {
 			t.Fatalf("ListSessions order = %v, err %v (want [ls-1 ls-3 ls-2])", ids, err)
 		}
 
-		// ListStaleSessions: cutoff in the past excludes them, future includes.
-		if stale, err := r.ListStaleSessions(ctx, registry.SessionOpen, time.Now().Add(-time.Hour)); err != nil || len(stale) != 0 {
-			t.Fatalf("ListStaleSessions past cutoff = %d, err %v (want 0)", len(stale), err)
-		}
-		if stale, err := r.ListStaleSessions(ctx, registry.SessionOpen, time.Now().Add(time.Hour)); err != nil || len(stale) != 3 {
-			t.Fatalf("ListStaleSessions future cutoff = %d, err %v (want 3)", len(stale), err)
-		}
-
 		// CountPartRefs: bytea[] ANY-match across sessions, excluding one.
 		shared := []byte{0xee, 0x01}
 		if _, err := r.PutPart(ctx, registry.MultipartPart{UploadID: "ls-1", PartNumber: 1, ETagMD5: []byte{1}, Size: 1, BlobDigests: []multihash.Multihash{shared}}, nil, registry.ReleaseTask{}); err != nil {
@@ -699,31 +690,17 @@ func TestPostgresStores(t *testing.T) {
 			t.Fatalf("CountReferences(shared) = %d, err %v (want 2)", n, err)
 		}
 
-		// 'completed' passes the widened state CHECK constraint, and the
-		// latch restarts the sweeper's clock: the row is not stale by a
-		// past cutoff although it was created before it.
-		if won, err := r.LatchSession(ctx, "ls-1", registry.SessionOpen, registry.SessionCompleted); err != nil || !won {
-			t.Fatalf("latch to completed won=%v err=%v", won, err)
+		// A completed session's parts are no longer live, and the
+		// completion stamps the state's change.
+		completed := registry.CompletedSession("ls-1", "etag", "")
+		if _, err := pool.Exec(ctx, completed.SQL, completed.Args...); err != nil {
+			t.Fatalf("complete ls-1: %v", err)
 		}
 		if s, err := r.GetSession(ctx, "ls-1"); err != nil || s.StateChangedAt.Before(s.CreatedAt) || s.StateChangedAt.IsZero() {
-			t.Fatalf("StateChangedAt after latch = %v (created %v), err %v", s.StateChangedAt, s.CreatedAt, err)
+			t.Fatalf("StateChangedAt after the completion = %v (created %v), err %v", s.StateChangedAt, s.CreatedAt, err)
 		}
-		if stale, err := r.ListStaleSessions(ctx, registry.SessionCompleted, time.Now().Add(-time.Minute)); err != nil || len(stale) != 0 {
-			t.Fatalf("ListStaleSessions completed, past cutoff = %d, err %v (want 0: just latched)", len(stale), err)
-		}
-		if stale, err := r.ListStaleSessions(ctx, registry.SessionCompleted, time.Now().Add(time.Hour)); err != nil || len(stale) != 1 {
-			t.Fatalf("ListStaleSessions completed, future cutoff = %d, err %v (want 1)", len(stale), err)
-		}
-		// A completed session's parts are no longer live; an aborting one's
-		// are not either.
 		if n, err := r.CountReferences(ctx, lsSpace, shared, uuid.Nil); err != nil || n != 1 {
 			t.Fatalf("CountReferences(shared) after ls-1 completed = %d, err %v (want 1)", n, err)
-		}
-		if won, err := r.LatchSession(ctx, "ls-2", registry.SessionOpen, registry.SessionAborting); err != nil || !won {
-			t.Fatalf("latch ls-2 to aborting won=%v err=%v", won, err)
-		}
-		if n, err := r.CountReferences(ctx, lsSpace, shared, uuid.Nil); err != nil || n != 0 {
-			t.Fatalf("CountReferences(shared) after ls-2 aborting = %d, err %v (want 0)", n, err)
 		}
 
 		for _, id := range []string{"ls-1", "ls-2", "ls-3"} {

@@ -234,6 +234,8 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		Claims:       deps.Claims,
 		ReleaseGrace: cfg.ReleaseGrace,
 
+		MultipartSessionTTL: cfg.MultipartSessionTTL,
+
 		LocalBlobMaxBytes:  cfg.LocalBlobMaxBytes,
 		CacheTTL:           cfg.CacheTTL,
 		LocalBlobOrphanAge: cfg.LocalBlobOrphanAge,
@@ -256,6 +258,11 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		_ = backend.CloseMetrics()
 		_ = log.Close(ctx)
 		return nil, fmt.Errorf("ingot: register shard tasks: %w", err)
+	}
+	if err := backend.RegisterMultipartTasks(deps.Tasks); err != nil {
+		_ = backend.CloseMetrics()
+		_ = log.Close(ctx)
+		return nil, fmt.Errorf("ingot: register multipart tasks: %w", err)
 	}
 	if err := backend.RegisterBucketTasks(deps.Tasks); err != nil {
 		_ = backend.CloseMetrics()
@@ -319,7 +326,6 @@ func (s *Server) Start(ctx context.Context) error {
 		}
 	}()
 	s.sweepCtx, s.sweepCancel = context.WithCancel(context.Background())
-	s.startMultipartSweeper()
 	s.startLocalBlobSweeper()
 	s.startCatalogUsageSweeper()
 	return nil
@@ -336,48 +342,10 @@ func (s *Server) goSweep(fn func()) {
 	}()
 }
 
-// startMultipartSweeper spawns the abandoned-multipart-session sweeper: open
-// sessions older than MultipartSessionTTL are aborted (their parts, parked on
-// their providers, released there) and terminal session rows reaped. Zero TTL → 7-day default;
-// negative → disabled.
-func (s *Server) startMultipartSweeper() {
-	ttl := s.cfg.MultipartSessionTTL
-	if ttl == 0 {
-		ttl = 7 * 24 * time.Hour
-	}
-	if ttl < 0 {
-		return
-	}
-	interval := ttl / 2
-	if interval > 10*time.Minute {
-		interval = 10 * time.Minute
-	}
-	s.goSweep(func() {
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-s.sweepCtx.Done():
-				return
-			case <-ticker.C:
-				ctx, cancel := context.WithTimeout(s.sweepCtx, time.Minute)
-				ctx, span := tracing.Start(ctx, "sweep.multipart_sessions")
-				n, err := s.backend.SweepStaleMultipartSessions(ctx, ttl)
-				s.endSweepSpan(span, err, attribute.Int("ingot.sweep.count", n))
-				cancel()
-				if err != nil && s.sweepCtx.Err() == nil {
-					s.logger.Warn("multipart sweep", zap.Error(err))
-				} else if n > 0 {
-					s.logger.Info("multipart sweep reaped stale sessions", zap.Int("count", n))
-				}
-			}
-		}
-	})
-}
-
 // localBlobSweepInterval is how often the local blob sweeper runs. The
 // budget's 10% headroom must exceed ingest rate × this interval.
-const localBlobSweepInterval = 30 * time.Second
+// Package-level so tests can shorten it.
+var localBlobSweepInterval = 30 * time.Second
 
 // localBlobSweepLogInterval is the least time between the local blob
 // sweeper's Info lines totalling its removals.
