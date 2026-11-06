@@ -54,15 +54,12 @@ const (
 )
 
 // multipart_parts.state values (§7.2). The part rows are the upload's
-// acceptance queue: the acceptor concludes 'parked' parts while the upload is
-// open, and Complete requires every part it names to be 'accepted'.
+// acceptance queue: queue-multipart-upload-shard.accept concludes 'parked'
+// parts while the upload is open, and Complete requires every part it names
+// to be 'accepted'.
 const (
-	// PartWritten: recorded, its blobs not yet all parked. A part left here
-	// is one whose request died mid-park, or one with a blob the acceptor
-	// found gone from its provider; Complete refuses it (InvalidPart) and the
-	// client uploads it again.
-	PartWritten = "written"
 	// PartParked: every blob has a park (or a location), ready to conclude.
+	// A part is recorded parked: its blobs were parked before its row.
 	PartParked = "parked"
 	// PartAccepted: every blob is accepted on Forge.
 	PartAccepted = "accepted"
@@ -252,7 +249,7 @@ type MultipartPart struct {
 	// larger by the envelope. Nil on a row recorded before the lengths
 	// were kept; the reader then derives them per blob.
 	SpanLengths []int64
-	// State is one of the Part* values; empty records PartWritten.
+	// State is one of the Part* values; PutPart records PartParked.
 	State     string
 	CreatedAt time.Time
 	// Refs are the write's pending references to the part's blobs, which
@@ -424,15 +421,6 @@ type ParkStore interface {
 	// GetPark returns ErrNotFound when the space has no park row for digest.
 	GetPark(ctx context.Context, space did.DID, digest multihash.Multihash) (*BlobPark, error)
 	DeletePark(ctx context.Context, space did.DID, digest multihash.Multihash) error
-	// ConcludePark replaces the space's park of loc.Digest with loc, in one
-	// transaction, and reports whether it did. addTask is the /blob/add task
-	// (cid bytes) of the park the caller concluded, and only that park is
-	// replaced. With it gone nothing is written: another conclude recorded
-	// the blob first, or a release took the park, and with it the blob,
-	// while the conclude ran. A park of the same digest recorded since by
-	// another write names another allocation, which this conclude did not
-	// accept, and stays for its own.
-	ConcludePark(ctx context.Context, loc BlobLocation, addTask []byte) (bool, error)
 }
 
 // InclusionStore is the local shard-inclusion table (§8): block digest →
@@ -472,26 +460,17 @@ type MultipartStore interface {
 	// release's authority, for each blob the replaced row named and this part
 	// does not, and returns those blobs for the caller to run: the
 	// replaced row and the releases of its blobs are one write, so no failure
-	// or crash can separate them.
+	// or crash can separate them. It queues the upload's accept in the same
+	// transaction.
 	// Writes of one part number are serialised, so the replaced row is
 	// exactly the one standing when this write landed, which a listing
 	// taken before the write may not have seen: a concurrent write of the
 	// same part number lands in between, and only its replacer learns of
 	// it.
 	PutPart(ctx context.Context, p MultipartPart, tree *PartTree, release ReleaseTask) (released []multihash.Multihash, err error)
-	// MoveParts moves each of parts (as the caller read them) from state
-	// from to state to, and returns how many moved. A part is skipped when
-	// its row is no longer in from or no longer names the BlobDigests it
-	// was read with: a later upload of the same part number replaced it,
-	// and the replacement is not the caller's to move.
-	MoveParts(ctx context.Context, parts []MultipartPart, from, to string) (int, error)
-	// ListParkedParts returns up to limit of uploadID's 'parked' parts in
-	// part-number order: the acceptor's queue.
-	ListParkedParts(ctx context.Context, uploadID string, limit int) ([]MultipartPart, error)
-	// ListUploadsWithParkedParts returns the upload IDs of open and
-	// completing sessions that have a 'parked' part, for the acceptor's
-	// restart sweep.
-	ListUploadsWithParkedParts(ctx context.Context) ([]string, error)
+	// ListParkedParts returns up to limit of uploadID's 'parked' parts
+	// numbered above after, in part-number order: the accept's queue.
+	ListParkedParts(ctx context.Context, uploadID string, after, limit int) ([]MultipartPart, error)
 	// OldestParkedPart returns when the oldest 'parked' part of an open or
 	// completing session was recorded, and false when there is none: how
 	// long the acceptance queue's oldest entry has waited.

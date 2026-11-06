@@ -16,7 +16,13 @@ import (
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/noop"
 	"go.uber.org/zap"
+
+	"github.com/fil-forge/ingot/taskrunner/internal/testhook"
 )
+
+func init() {
+	testhook.ApplyWritesImmediately = func(o any) { o.(*Options).applyWritesImmediately = true }
+}
 
 // TaskID identifies a task within its queue.
 type TaskID = uuid.UUID
@@ -140,11 +146,11 @@ type Options struct {
 	// CommitAttempts is how many times a tree is run when its final commit
 	// fails, before the task is left for resumption. Defaults to 3.
 	CommitAttempts int
-	// ApplyWritesImmediately runs each write as a handler makes it, in a
+	// applyWritesImmediately runs each write as a handler makes it, in a
 	// transaction held open for the whole tree, and routes the handlers'
-	// reads through it. It exists for taskrunnertest.CheckOwnWrites and must
-	// not be set in production.
-	ApplyWritesImmediately bool
+	// reads through it. Only taskrunnertest.CheckOwnWrites sets it, through
+	// testhook.
+	applyWritesImmediately bool
 	// Node names this instance for placement: the runner runs tasks placed
 	// on it and tasks placed nowhere. Empty runs only tasks placed nowhere.
 	Node string

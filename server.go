@@ -258,6 +258,11 @@ func New(ctx context.Context, cfg config.ServerConfig, deps ServerDeps) (*Server
 		_ = log.Close(ctx)
 		return nil, fmt.Errorf("ingot: register release tasks: %w", err)
 	}
+	if err := backend.RegisterAcceptTasks(deps.Tasks); err != nil {
+		_ = backend.CloseMetrics()
+		_ = log.Close(ctx)
+		return nil, fmt.Errorf("ingot: register accept tasks: %w", err)
+	}
 
 	api, err := buildS3API(ctx, backend, cfg, deps.IAM, deps.Identity, logger)
 	if err != nil {
@@ -306,7 +311,6 @@ func (s *Server) Start(ctx context.Context) error {
 	s.sweepCtx, s.sweepCancel = context.WithCancel(context.Background())
 	s.startMultipartSweeper()
 	s.startLocalBlobSweeper()
-	s.startAcceptSweeper()
 	s.startCatalogUsageSweeper()
 	return nil
 }
@@ -356,43 +360,6 @@ func (s *Server) startMultipartSweeper() {
 				} else if n > 0 {
 					s.logger.Info("multipart sweep reaped stale sessions", zap.Int("count", n))
 				}
-			}
-		}
-	})
-}
-
-// acceptSweepInterval is how often the accept sweeper looks for multipart
-// uploads with parked parts and no running acceptor.
-const acceptSweepInterval = 30 * time.Second
-
-// startAcceptSweeper starts the multipart acceptors and their restart sweep:
-// at start, and every acceptSweepInterval after, every open or completing
-// upload with parked parts has its acceptor nudged, which picks up the work
-// a stopped process left and any nudge that went missing. The sweeper's
-// exit waits for the acceptors, so Stop does too.
-func (s *Server) startAcceptSweeper() {
-	s.backend.StartAcceptors(s.sweepCtx)
-	s.goSweep(func() {
-		defer s.backend.WaitAcceptors()
-		sweep := func() {
-			ctx, cancel := context.WithTimeout(s.sweepCtx, time.Minute)
-			defer cancel()
-			ctx, span := tracing.Start(ctx, "sweep.multipart_accept")
-			n, err := s.backend.NudgeParkedUploads(ctx)
-			s.endSweepSpan(span, err, attribute.Int("ingot.sweep.count", n))
-			if err != nil && s.sweepCtx.Err() == nil {
-				s.logger.Warn("multipart accept sweep", zap.Error(err))
-			}
-		}
-		sweep()
-		ticker := time.NewTicker(acceptSweepInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-s.sweepCtx.Done():
-				return
-			case <-ticker.C:
-				sweep()
 			}
 		}
 	})

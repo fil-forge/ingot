@@ -2,15 +2,16 @@ package registry_test
 
 import (
 	"errors"
-	"maps"
 	"slices"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/multiformats/go-multihash"
 
 	"github.com/fil-forge/ingot/internal/pgtest"
 	"github.com/fil-forge/ingot/registry"
+	"github.com/fil-forge/ingot/taskrunner/taskrunnertest"
 	"github.com/fil-forge/libforge/testutil"
 )
 
@@ -19,24 +20,40 @@ type partQueueStore interface {
 	registry.MultipartStore
 	registry.ParkStore
 	registry.LocationStore
+	registry.IntentStore
 }
 
 // TestPartQueue runs the acceptance-queue operations against Postgres.
 func TestPartQueue(t *testing.T) {
 	pool := pgtest.New(t)
-	runPartQueueSuite(t, registry.NewPostgres(pool, registry.WithTasks(liveUploadTasks(t, pool))))
+	runPartQueueSuite(t, pool, registry.NewPostgres(pool, registry.WithTasks(liveUploadTasks(t, pool))))
 }
 
-func runPartQueueSuite(t *testing.T, st partQueueStore) {
+func runPartQueueSuite(t *testing.T, pool *pgxpool.Pool, st partQueueStore) {
 	ctx := t.Context()
+	// exec commits an accept's writes, as its task's commit does.
+	exec := func(sts ...registry.Statement) {
+		t.Helper()
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin: %v", err)
+		}
+		defer tx.Rollback(ctx)
+		for _, st := range sts {
+			if _, err := tx.Exec(ctx, st.SQL, st.Args...); err != nil {
+				t.Fatalf("exec %q: %v", st.SQL, err)
+			}
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatalf("commit: %v", err)
+		}
+	}
 	space := testutil.RandomDID(t)
 	// Upload IDs unique to this run, so a shared database's other rows do
 	// not show up in the listings.
 	id := "pq-" + space.String()
-	other := id + "-aborting"
 	for _, s := range []registry.MultipartSession{
 		{UploadID: id, Bucket: "b", ObjectKey: "k", Space: space},
-		{UploadID: other, Bucket: "b", ObjectKey: "k", Space: space},
 	} {
 		if err := st.CreateSession(ctx, s); err != nil {
 			t.Fatalf("CreateSession: %v", err)
@@ -68,11 +85,20 @@ func runPartQueueSuite(t *testing.T, st partQueueStore) {
 		return out
 	}
 
-	t.Run("a part is recorded written with its sizes", func(t *testing.T) {
+	t.Run("a part is recorded parked with its sizes, and queues the accept", func(t *testing.T) {
 		part(id, 1, multihash.Multihash{0xd1, 0x0a}, multihash.Multihash{0xd1, 0x0b})
 		parts, err := st.ListParts(ctx, id)
-		if err != nil || len(parts) != 1 || parts[0].State != registry.PartWritten || !slices.Equal(parts[0].SpanLengths, []int64{1, 2}) {
-			t.Fatalf("ListParts = %+v, err %v; want one written part with sizes [1 2]", parts, err)
+		if err != nil || len(parts) != 1 || parts[0].State != registry.PartParked || !slices.Equal(parts[0].SpanLengths, []int64{1, 2}) {
+			t.Fatalf("ListParts = %+v, err %v; want one parked part with sizes [1 2]", parts, err)
+		}
+		tasks, err := taskrunnertest.Tasks(ctx, pool, "ingot", registry.AcceptQueue)
+		if err != nil {
+			t.Fatalf("accept tasks: %v", err)
+		}
+		if !slices.ContainsFunc(tasks, func(q taskrunnertest.QueuedTask) bool {
+			return q.Subject == id && q.Action == registry.AcceptAction && q.State == "pending"
+		}) {
+			t.Fatalf("accept tasks = %+v; want one pending for %s", tasks, id)
 		}
 		// Sizes must match the digests one for one, which a constraint
 		// enforces.
@@ -90,122 +116,46 @@ func runPartQueueSuite(t *testing.T, st partQueueStore) {
 			t.Fatalf("CreateSession: %v", err)
 		}
 		t.Cleanup(func() { _ = st.DeleteSession(ctx, legacy) })
-		p := registry.MultipartPart{UploadID: legacy, PartNumber: 7, ETagMD5: []byte{7}, Size: 1, BlobDigests: []multihash.Multihash{{0xd7}}, State: registry.PartParked}
+		p := registry.MultipartPart{UploadID: legacy, PartNumber: 7, ETagMD5: []byte{7}, Size: 1, BlobDigests: []multihash.Multihash{{0xd7}}}
 		if _, err := st.PutPart(ctx, p, nil, registry.ReleaseTask{}); err != nil {
 			t.Fatalf("PutPart without span lengths: %v", err)
 		}
 		parts, err := st.ListParts(ctx, legacy)
-		if err != nil {
-			t.Fatalf("ListParts over a row without span lengths: %v", err)
+		if err != nil || len(parts) != 1 || parts[0].SpanLengths != nil {
+			t.Fatalf("ListParts over a row without span lengths = %+v, %v; want part 7 without lengths", parts, err)
 		}
-		found := false
-		for _, got := range parts {
-			if got.PartNumber == 7 {
-				found = true
-				if got.SpanLengths != nil {
-					t.Fatalf("span lengths = %v, want nil", got.SpanLengths)
-				}
-			}
-		}
-		if !found {
-			t.Fatal("part 7 not listed")
-		}
-		queued, err := st.ListParkedParts(ctx, legacy, 100)
+		queued, err := st.ListParkedParts(ctx, legacy, 0, 100)
 		if err != nil || len(queued) == 0 {
 			t.Fatalf("ListParkedParts over a row without span lengths = %v, %v", queued, err)
 		}
-		if _, err := st.MoveParts(ctx, []registry.MultipartPart{p}, registry.PartParked, registry.PartAccepted); err != nil {
-			t.Fatalf("MoveParts: %v", err)
-		}
 	})
 
-	t.Run("a move skips a replaced part", func(t *testing.T) {
-		first := part(id, 2, multihash.Multihash{0xd2, 0x01})
-		second := part(id, 2, multihash.Multihash{0xd2, 0x02})
-		if n, err := st.MoveParts(ctx, []registry.MultipartPart{first}, registry.PartWritten, registry.PartParked); err != nil || n != 0 {
-			t.Fatalf("MoveParts with the replaced digests = %d, %v; want 0", n, err)
+	t.Run("the queue lists parked parts in order after a part number", func(t *testing.T) {
+		part(id, 2, multihash.Multihash{0xd2})
+		part(id, 3, multihash.Multihash{0xd3})
+		part(id, 4, multihash.Multihash{0xd4})
+		queued, err := st.ListParkedParts(ctx, id, 0, 2)
+		if err != nil || len(queued) != 2 || queued[0].PartNumber != 1 || queued[1].PartNumber != 2 {
+			t.Fatalf("ListParkedParts(after 0, limit 2) = %+v, err %v; want parts 1 and 2", queued, err)
 		}
-		if n, err := st.MoveParts(ctx, []registry.MultipartPart{second}, registry.PartWritten, registry.PartParked); err != nil || n != 1 {
-			t.Fatalf("MoveParts = %d, %v; want 1", n, err)
+		if len(queued[1].BlobDigests) != 1 || len(queued[1].SpanLengths) != 1 {
+			t.Fatalf("queued part = %+v, want its digests and sizes", queued[1])
 		}
-		// Only a part in the from state moves.
-		if n, err := st.MoveParts(ctx, []registry.MultipartPart{second}, registry.PartWritten, registry.PartParked); err != nil || n != 0 {
-			t.Fatalf("second MoveParts = %d, %v; want 0", n, err)
-		}
-		if got := states(id)[2]; got != registry.PartParked {
-			t.Fatalf("part 2 = %q, want parked", got)
-		}
-	})
-
-	t.Run("the queue lists parked parts in order", func(t *testing.T) {
-		p3 := part(id, 3, multihash.Multihash{0xd3})
-		p4 := part(id, 4, multihash.Multihash{0xd4})
-		if n, err := st.MoveParts(ctx, []registry.MultipartPart{p4, p3}, registry.PartWritten, registry.PartParked); err != nil || n != 2 {
-			t.Fatalf("MoveParts = %d, %v; want 2", n, err)
-		}
-		queued, err := st.ListParkedParts(ctx, id, 2)
-		if err != nil || len(queued) != 2 || queued[0].PartNumber != 2 || queued[1].PartNumber != 3 {
-			t.Fatalf("ListParkedParts(limit 2) = %+v, err %v; want parts 2 and 3", queued, err)
-		}
-		if len(queued[0].BlobDigests) != 1 || len(queued[0].SpanLengths) != 1 {
-			t.Fatalf("queued part = %+v, want its digests and sizes", queued[0])
-		}
-		if _, err := st.MoveParts(ctx, queued, registry.PartParked, registry.PartAccepted); err != nil {
-			t.Fatalf("MoveParts to accepted: %v", err)
-		}
-		want := map[int]string{1: registry.PartWritten, 2: registry.PartAccepted, 3: registry.PartAccepted, 4: registry.PartParked}
-		if got := states(id); !maps.Equal(got, want) {
-			t.Fatalf("states = %v, want %v", got, want)
-		}
-	})
-
-	t.Run("the restart sweep lists live uploads with parked parts", func(t *testing.T) {
-		p := part(other, 1, multihash.Multihash{0xe1})
-		if _, err := st.MoveParts(ctx, []registry.MultipartPart{p}, registry.PartWritten, registry.PartParked); err != nil {
-			t.Fatalf("MoveParts: %v", err)
-		}
-		if won, err := st.LatchSession(ctx, other, registry.SessionOpen, registry.SessionAborting); err != nil || !won {
-			t.Fatalf("LatchSession = %v, %v", won, err)
-		}
-		ids, err := st.ListUploadsWithParkedParts(ctx)
-		if err != nil {
-			t.Fatalf("ListUploadsWithParkedParts: %v", err)
-		}
-		if !slices.Contains(ids, id) || slices.Contains(ids, other) {
-			t.Fatalf("ListUploadsWithParkedParts = %v; want %s and not the aborting %s", ids, id, other)
-		}
-		if won, err := st.LatchSession(ctx, id, registry.SessionOpen, registry.SessionCompleting); err != nil || !won {
-			t.Fatalf("LatchSession = %v, %v", won, err)
-		}
-		if ids, _ := st.ListUploadsWithParkedParts(ctx); !slices.Contains(ids, id) {
-			t.Fatalf("ListUploadsWithParkedParts = %v; want the completing %s", ids, id)
-		}
-		// The completing upload's parked part 4 is waiting. A shared
-		// database may hold older ones, so only the bounds are checked.
-		parts, err := st.ListParts(ctx, id)
-		if err != nil {
-			t.Fatalf("ListParts: %v", err)
-		}
-		var waiting time.Time
-		for _, p := range parts {
-			if p.State == registry.PartParked {
-				waiting = p.CreatedAt
-			}
-		}
-		oldest, found, err := st.OldestParkedPart(ctx)
-		if err != nil || !found || oldest.After(waiting) {
-			t.Fatalf("OldestParkedPart = %v, %v, %v; want one no later than part 4's %v", oldest, found, err, waiting)
+		queued, err = st.ListParkedParts(ctx, id, 2, 10)
+		if err != nil || len(queued) != 2 || queued[0].PartNumber != 3 || queued[1].PartNumber != 4 {
+			t.Fatalf("ListParkedParts(after 2) = %+v, err %v; want parts 3 and 4", queued, err)
 		}
 	})
 
 	t.Run("a park is swapped for its location only while it stands", func(t *testing.T) {
 		digest := multihash.Multihash{0xf1, 0x01}
-		loc := registry.BlobLocation{Space: space, Digest: digest, Provider: "did:web:piri", URL: "https://piri/blob", Size: 7}
-		if swapped, err := st.ConcludePark(ctx, loc, []byte{1}); err != nil || swapped {
-			t.Fatalf("ConcludePark without a park = %v, %v; want false", swapped, err)
-		}
+		loc := registry.BlobLocation{Provider: "did:web:piri", URL: "https://piri/blob", Size: 7}
+		exec(registry.ConcludedBlob(space, digest, []byte{1}, loc)...)
 		if _, err := st.GetLocation(ctx, space, digest); !errors.Is(err, registry.ErrNotFound) {
 			t.Fatalf("location written without a park: %v", err)
+		}
+		if err := st.PutIntent(ctx, registry.UploadIntent{Space: space, Digest: digest, Size: 7, State: registry.IntentParked}); err != nil {
+			t.Fatalf("PutIntent: %v", err)
 		}
 		park := registry.BlobPark{Space: space, Digest: digest, AddTask: []byte{1}, AcceptTask: []byte{2}, PutInvocation: []byte{3}, Size: 7}
 		if ok, err := st.PutPark(ctx, park); err != nil || !ok {
@@ -213,24 +163,90 @@ func runPartQueueSuite(t *testing.T, st partQueueStore) {
 		}
 		// A conclude of another allocation of the same bytes leaves the
 		// park, which is not the one it accepted.
-		if swapped, err := st.ConcludePark(ctx, loc, []byte{9}); err != nil || swapped {
-			t.Fatalf("ConcludePark of another add task = %v, %v; want false", swapped, err)
-		}
+		exec(registry.ConcludedBlob(space, digest, []byte{9}, loc)...)
 		if _, err := st.GetLocation(ctx, space, digest); !errors.Is(err, registry.ErrNotFound) {
 			t.Fatalf("location written for another add task's conclude: %v", err)
 		}
-		if swapped, err := st.ConcludePark(ctx, loc, []byte{1}); err != nil || !swapped {
-			t.Fatalf("ConcludePark = %v, %v; want true", swapped, err)
+		if in, err := st.GetIntent(ctx, space, digest); err != nil || in.State != registry.IntentParked {
+			t.Fatalf("intent = %+v, %v; want still parked", in, err)
 		}
+		exec(registry.ConcludedBlob(space, digest, []byte{1}, loc)...)
 		if _, err := st.GetPark(ctx, space, digest); !errors.Is(err, registry.ErrNotFound) {
 			t.Fatalf("park after the swap: %v, want ErrNotFound", err)
 		}
 		if got, err := st.GetLocation(ctx, space, digest); err != nil || got.URL != loc.URL {
 			t.Fatalf("location after the swap = %+v, %v", got, err)
 		}
-		if swapped, err := st.ConcludePark(ctx, loc, []byte{1}); err != nil || swapped {
-			t.Fatalf("second ConcludePark = %v, %v; want false", swapped, err)
+		if in, err := st.GetIntent(ctx, space, digest); err != nil || in.State != registry.IntentAccepted {
+			t.Fatalf("intent after the swap = %+v, %v; want accepted", in, err)
 		}
 		_ = st.DeleteLocation(ctx, space, digest)
+	})
+
+	t.Run("a park beside a location is dropped only while the location stands", func(t *testing.T) {
+		digest := multihash.Multihash{0xf2, 0x01}
+		park := registry.BlobPark{Space: space, Digest: digest, AddTask: []byte{1}, AcceptTask: []byte{2}, PutInvocation: []byte{3}, Size: 7}
+		if ok, err := st.PutPark(ctx, park); err != nil || !ok {
+			t.Fatalf("PutPark = %v, %v", ok, err)
+		}
+		exec(registry.LocatedBlob(space, digest)...)
+		if _, err := st.GetPark(ctx, space, digest); err != nil {
+			t.Fatalf("park without a location dropped: %v", err)
+		}
+		if err := st.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: digest, Provider: "did:web:piri", URL: "https://piri/blob", Size: 7}); err != nil {
+			t.Fatalf("PutLocation: %v", err)
+		}
+		exec(registry.LocatedBlob(space, digest)...)
+		if _, err := st.GetPark(ctx, space, digest); !errors.Is(err, registry.ErrNotFound) {
+			t.Fatalf("park beside a location survived: %v", err)
+		}
+		_ = st.DeleteLocation(ctx, space, digest)
+	})
+
+	t.Run("a part is accepted once every blob is located and its row is unchanged", func(t *testing.T) {
+		a, b := multihash.Multihash{0xf3, 0x0a}, multihash.Multihash{0xf3, 0x0b}
+		first := part(id, 5, a, b)
+		if err := st.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: a, Provider: "did:web:piri", URL: "https://piri/a", Size: 1}); err != nil {
+			t.Fatalf("PutLocation: %v", err)
+		}
+		exec(registry.AcceptedPart(space, first))
+		if got := states(id)[5]; got != registry.PartParked {
+			t.Fatalf("part 5 with one blob located = %q, want parked", got)
+		}
+		if err := st.PutLocation(ctx, registry.BlobLocation{Space: space, Digest: b, Provider: "did:web:piri", URL: "https://piri/b", Size: 2}); err != nil {
+			t.Fatalf("PutLocation: %v", err)
+		}
+		// Replaced since it was read: the old row's digests no longer match.
+		part(id, 5, a)
+		exec(registry.AcceptedPart(space, first))
+		if got := states(id)[5]; got != registry.PartParked {
+			t.Fatalf("replaced part 5 = %q, want parked", got)
+		}
+		second := part(id, 5, a, b)
+		exec(registry.AcceptedPart(space, second))
+		if got := states(id)[5]; got != registry.PartAccepted {
+			t.Fatalf("part 5 = %q, want accepted", got)
+		}
+		_ = st.DeleteLocation(ctx, space, a)
+		_ = st.DeleteLocation(ctx, space, b)
+	})
+
+	t.Run("the oldest parked part of a live upload is reported", func(t *testing.T) {
+		parts, err := st.ListParts(ctx, id)
+		if err != nil {
+			t.Fatalf("ListParts: %v", err)
+		}
+		var waiting time.Time
+		for _, p := range parts {
+			if p.State == registry.PartParked && (waiting.IsZero() || p.CreatedAt.Before(waiting)) {
+				waiting = p.CreatedAt
+			}
+		}
+		// A shared database may hold older ones, so only the bound is
+		// checked.
+		oldest, found, err := st.OldestParkedPart(ctx)
+		if err != nil || !found || oldest.After(waiting) {
+			t.Fatalf("OldestParkedPart = %v, %v, %v; want one no later than %v", oldest, found, err, waiting)
+		}
 	})
 }

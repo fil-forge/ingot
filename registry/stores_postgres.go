@@ -601,34 +601,6 @@ func (r *Postgres) DeletePark(ctx context.Context, space did.DID, digest multiha
 	return nil
 }
 
-func (r *Postgres) ConcludePark(ctx context.Context, loc BlobLocation, addTask []byte) (bool, error) {
-	tx, err := r.pool.Begin(ctx)
-	if err != nil {
-		return false, fmt.Errorf("registry: conclude park: begin: %w", err)
-	}
-	defer tx.Rollback(ctx)
-	tag, err := tx.Exec(ctx,
-		`DELETE FROM ingot.blob_parks WHERE space = $1 AND digest = $2 AND add_task = $3`, loc.Space, loc.Digest, addTask)
-	if err != nil {
-		return false, fmt.Errorf("registry: conclude park: delete park: %w", err)
-	}
-	if tag.RowsAffected() == 0 {
-		return false, nil
-	}
-	if _, err := tx.Exec(ctx,
-		`INSERT INTO ingot.blob_locations (space, digest, provider, url, size)
-		 VALUES ($1, $2, $3, $4, $5)
-		 ON CONFLICT (space, digest) DO UPDATE
-		   SET provider = EXCLUDED.provider, url = EXCLUDED.url, size = EXCLUDED.size`,
-		loc.Space, loc.Digest, loc.Provider, loc.URL, loc.Size); err != nil {
-		return false, fmt.Errorf("registry: conclude park: put location: %w", err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return false, fmt.Errorf("registry: conclude park: commit: %w", err)
-	}
-	return true, nil
-}
-
 // InclusionStore =============================================================
 
 func (r *Postgres) PutInclusions(ctx context.Context, incs []BlobInclusion) error {
@@ -802,7 +774,7 @@ func (r *Postgres) DeleteSession(ctx context.Context, uploadID string) error {
 func (r *Postgres) PutPart(ctx context.Context, p MultipartPart, tree *PartTree, release ReleaseTask) ([]multihash.Multihash, error) {
 	state := p.State
 	if state == "" {
-		state = PartWritten
+		state = PartParked
 	}
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
@@ -875,11 +847,14 @@ func (r *Postgres) PutPart(ctx context.Context, p MultipartPart, tree *PartTree,
 	// reference with this write; their releases are queued with it, due now
 	// (a part blob was never readable through the catalog, so no reader grace
 	// is owed). The session's space is the release's.
+	if r.tasks == nil {
+		return nil, fmt.Errorf("registry: put part: the registry has no task runner")
+	}
+	if _, err := r.tasks.SubmitTx(ctx, tx, AcceptSpec(p.UploadID)); err != nil {
+		return nil, fmt.Errorf("registry: put part: queue accept: %w", err)
+	}
 	var released []multihash.Multihash
 	if dropped := digestsDropped(replaced, p.BlobDigests); len(dropped) > 0 {
-		if r.tasks == nil {
-			return nil, fmt.Errorf("registry: put part: releases to queue but the registry has no task runner")
-		}
 		var spaceStr string
 		if err := tx.QueryRow(ctx, `SELECT space FROM ingot.multipart_sessions WHERE upload_id = $1`, p.UploadID).Scan(&spaceStr); err != nil {
 			return nil, fmt.Errorf("registry: put part: session space: %w", err)
@@ -923,49 +898,12 @@ func digestsDropped(replaced, kept []multihash.Multihash) [][]byte {
 	return out
 }
 
-func (r *Postgres) MoveParts(ctx context.Context, parts []MultipartPart, from, to string) (int, error) {
-	if len(parts) == 0 {
-		return 0, nil
-	}
-	tx, err := r.pool.Begin(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("registry: move parts: begin: %w", err)
-	}
-	defer tx.Rollback(ctx)
-	// One statement per part: each is guarded by its own digest list, which
-	// a single array-valued statement cannot carry.
-	batch := &pgx.Batch{}
-	for _, p := range parts {
-		batch.Queue(
-			`UPDATE ingot.multipart_parts SET state = $4
-			 WHERE upload_id = $1 AND part_number = $2 AND blob_digests = $3 AND state = $5`,
-			p.UploadID, p.PartNumber, p.BlobDigests, to, from)
-	}
-	results := tx.SendBatch(ctx, batch)
-	moved := 0
-	for range parts {
-		tag, err := results.Exec()
-		if err != nil {
-			results.Close()
-			return 0, fmt.Errorf("registry: move parts: %w", err)
-		}
-		moved += int(tag.RowsAffected())
-	}
-	if err := results.Close(); err != nil {
-		return 0, fmt.Errorf("registry: move parts: %w", err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return 0, fmt.Errorf("registry: move parts: commit: %w", err)
-	}
-	return moved, nil
-}
-
-func (r *Postgres) ListParkedParts(ctx context.Context, uploadID string, limit int) ([]MultipartPart, error) {
+func (r *Postgres) ListParkedParts(ctx context.Context, uploadID string, after, limit int) ([]MultipartPart, error) {
 	rows, err := r.pool.Query(ctx,
 		`SELECT part_number, etag_md5, size, checksum, blob_digests, span_lengths, state, created_at
-		 FROM ingot.multipart_parts WHERE upload_id = $1 AND state = $2
-		 ORDER BY part_number ASC LIMIT $3`,
-		uploadID, PartParked, limit)
+		 FROM ingot.multipart_parts WHERE upload_id = $1 AND state = $2 AND part_number > $3
+		 ORDER BY part_number ASC LIMIT $4`,
+		uploadID, PartParked, after, limit)
 	if err != nil {
 		return nil, fmt.Errorf("registry: list parked parts: %w", err)
 	}
@@ -985,23 +923,6 @@ func (r *Postgres) OldestParkedPart(ctx context.Context) (time.Time, bool, error
 		return time.Time{}, false, nil
 	}
 	return *oldest, true, nil
-}
-
-func (r *Postgres) ListUploadsWithParkedParts(ctx context.Context) ([]string, error) {
-	rows, err := r.pool.Query(ctx,
-		`SELECT s.upload_id FROM ingot.multipart_sessions s
-		 WHERE s.state IN ($1, $2)
-		   AND EXISTS (SELECT 1 FROM ingot.multipart_parts p
-		                WHERE p.upload_id = s.upload_id AND p.state = $3)`,
-		SessionOpen, SessionCompleting, PartParked)
-	if err != nil {
-		return nil, fmt.Errorf("registry: list uploads with parked parts: %w", err)
-	}
-	ids, err := pgx.CollectRows(rows, pgx.RowTo[string])
-	if err != nil {
-		return nil, fmt.Errorf("registry: list uploads with parked parts: %w", err)
-	}
-	return ids, nil
 }
 
 func (r *Postgres) DeletePartTrees(ctx context.Context, uploadID string) error {
