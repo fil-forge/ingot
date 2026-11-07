@@ -69,13 +69,10 @@ type bodyWriter struct {
 	results    map[string]encWrite
 
 	// stream, when set, sends each sized blob to its provider while it is
-	// spooled (see WriteSizedBlob); streams records each such upload until
-	// its park or acceptance is recorded. digestFirst latches once the upload
+	// spooled (see WriteSizedBlob). digestFirst latches once the upload
 	// service refuses to add by digest code, so the rest of the body spools
 	// first.
 	stream      uploader.StreamingBodyUploader
-	streams     registry.StreamStore
-	lease       *streamLease
 	bucket      string
 	digestFirst bool
 	logger      *zap.Logger
@@ -191,7 +188,7 @@ func (w *bodyWriter) record(ctx context.Context, digest multihash.Multihash, cek
 		// The same bytes twice in one body, which a body stored as received
 		// can hold: the first record stands, and the provider needs the
 		// bytes once. A second allocation streamed for them is given up
-		// now, or it would wait for the stale-stream sweeper.
+		// now rather than left for the provider to expire.
 		if res.streamed != nil {
 			w.abandon(ctx, *res.streamed)
 		}

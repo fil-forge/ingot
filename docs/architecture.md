@@ -936,22 +936,6 @@ CREATE TABLE ingot.blob_parks (
     PRIMARY KEY (space, digest)
 );
 
--- Body blobs allocated by digest code and streamed to the provider before their
--- digest is known. The /blob/add task is the provider's only name for such an
--- upload until it is parked or accepted. The owning request renews touched_at;
--- the stream sweeper aborts a row whose lease has lapsed, unless its blob was
--- parked.
-CREATE TABLE ingot.blob_streams (
-    add_task   bytea PRIMARY KEY,                        -- /blob/add task CID (the abort cause)
-    space      text   NOT NULL,
-    bucket     text   NOT NULL,
-    size       bigint NOT NULL,                          -- envelope bytes allocated
-    created_at timestamptz NOT NULL DEFAULT now(),
-    touched_at timestamptz NOT NULL DEFAULT now()        -- the owning request's lease
-);
-CREATE INDEX blob_streams_touched_at ON ingot.blob_streams (touched_at);
-CREATE INDEX blob_parks_add_task ON ingot.blob_parks (add_task);
-
 -- Deferred blob release (§6): written in the same transaction as the claim drop
 -- that leaves a blob unreferenced, and executed by a sweeper after not_before.
 -- Executing it deletes the blob_encryption_params row (the crypto-shred) and the
@@ -992,7 +976,7 @@ Relationships at a glance: `segment_op_roots` cascades from `segments`, `multipa
 `multipart_sessions`, `multipart_part_trees` from `multipart_parts`, and `catalog_journal`
 from `buckets` — the schema's only true foreign keys. `catalog_journal`
 references a `segments.seq` by value, deliberately. `blob_refs`, `segments`,
-`multipart_sessions`, `blob_streams` and `gc_candidates` reference a `buckets.name` by value,
+`multipart_sessions` and `gc_candidates` reference a `buckets.name` by value,
 `shard_inclusions` joins `blob_locations` on `shard_digest`, and `blob_encryption_params` joins
 `blob_locations` on `(space, digest)` with deliberately no FK. `revocation_cursor` stands alone.
 The reference count for a blob is `count(*) from blob_refs where space = ? and digest = ?`;

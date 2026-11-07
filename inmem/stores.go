@@ -444,17 +444,6 @@ func (m *MemStore) GetPark(_ context.Context, space did.DID, digest multihash.Mu
 	return &cp, nil
 }
 
-func (m *MemStore) HasParkFor(_ context.Context, addTask []byte) (bool, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	for _, park := range m.parks {
-		if bytes.Equal(park.AddTask, addTask) {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
 func (m *MemStore) DeletePark(_ context.Context, space did.DID, digest multihash.Multihash) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -910,61 +899,6 @@ func cloneTree(t *registry.PartTree) *registry.PartTree {
 	c.Tail = bytes.Clone(t.Tail)
 	c.Root = bytes.Clone(t.Root)
 	return &c
-}
-
-// StreamStore ================================================================
-
-func (m *MemStore) PutStream(_ context.Context, s registry.BlobStream) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	cp := s
-	cp.AddTask = bytes.Clone(s.AddTask)
-	if cp.CreatedAt.IsZero() {
-		cp.CreatedAt = time.Now()
-	}
-	if cp.TouchedAt.IsZero() {
-		cp.TouchedAt = cp.CreatedAt
-	}
-	m.streams[string(s.AddTask)] = cp
-	return nil
-}
-
-func (m *MemStore) TouchStreams(_ context.Context, addTasks [][]byte) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	now := time.Now()
-	for _, addTask := range addTasks {
-		if s, ok := m.streams[string(addTask)]; ok {
-			s.TouchedAt = now
-			m.streams[string(addTask)] = s
-		}
-	}
-	return nil
-}
-
-func (m *MemStore) DeleteStream(_ context.Context, addTask []byte) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	delete(m.streams, string(addTask))
-	return nil
-}
-
-func (m *MemStore) ListStaleStreams(_ context.Context, olderThan time.Time, limit int) ([]registry.BlobStream, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	var out []registry.BlobStream
-	for _, s := range m.streams {
-		if s.TouchedAt.Before(olderThan) {
-			cp := s
-			cp.AddTask = bytes.Clone(s.AddTask)
-			out = append(out, cp)
-		}
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].TouchedAt.Before(out[j].TouchedAt) })
-	if len(out) > limit {
-		out = out[:limit]
-	}
-	return out, nil
 }
 
 // IntentByDigest returns the one intent for digest, in whichever space holds

@@ -15,8 +15,25 @@ DROP TABLE ingot.upload_registrations;
 DROP INDEX ingot.upload_intents_evictable_idx;
 ALTER TABLE ingot.upload_intents DROP COLUMN evicted_at;
 
+-- A streamed upload is no longer recorded from allocation to acceptance. One
+-- that fails aborts its allocation at once, and one a dead request abandons
+-- is expired by the provider, so the table and the stream sweeper are gone.
+DROP INDEX ingot.blob_parks_add_task;
+DROP TABLE ingot.blob_streams;
+
 -- +goose Down
 -- In reverse order of the Up statements.
+CREATE TABLE ingot.blob_streams (
+    add_task   bytea PRIMARY KEY,
+    space      text        NOT NULL,
+    bucket     text        NOT NULL,
+    size       bigint      NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    touched_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX blob_streams_touched_at ON ingot.blob_streams (touched_at);
+CREATE INDEX blob_parks_add_task ON ingot.blob_parks (add_task);
+
 ALTER TABLE ingot.upload_intents ADD COLUMN evicted_at timestamptz;
 CREATE INDEX upload_intents_evictable_idx
     ON ingot.upload_intents (updated_at, digest, space)
