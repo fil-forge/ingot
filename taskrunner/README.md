@@ -207,19 +207,26 @@ err = r.Cancel(ctx, "queue-space-shard", expireID)
 
 ## Batching
 
-A batching handler takes the subject's oldest due task and the due tasks straight after it with the same action, up to a limit, and stops at the first task with a different action so the subject's order holds. It returns one result per task, and the batch commits or fails together. Batching actions run async only.
+A batching handler takes the subject's oldest due task and the due tasks straight after it with the same action, up to a limit, and stops at the first task with a different action so the subject's order holds. Batching actions run async only.
+
+It returns one outcome per task, and the batch's writes commit together. A task whose outcome carries an error is retried or failed on its own, under its own attempts, while its batchmates succeed. Returning an error instead fails or retries the whole batch. An outcome with an error can also carry `Args`, which replace the task's arguments for its next attempt, so something the attempt learned, such as renewed authority, is not lost if the process restarts before the retry.
 
 ```go
 err := r.HandleBatch("queue-space-upload", "add", 100,
-	func(ctx context.Context, ex *taskrunner.Exec, tasks []taskrunner.Task) ([][]byte, error) {
+	func(ctx context.Context, ex *taskrunner.Exec, tasks []taskrunner.Task) ([]taskrunner.Outcome, error) {
 		roots := make([][]byte, len(tasks))
 		for i, t := range tasks {
 			roots[i] = t.Args
 		}
-		if err := registerRoots(ctx, tasks[0].Subject, roots); err != nil {
-			return nil, err
+		refused, err := registerRoots(ctx, tasks[0].Subject, roots)
+		if err != nil {
+			return nil, err // nothing was answered: retry the batch
 		}
-		return make([][]byte, len(tasks)), nil
+		out := make([]taskrunner.Outcome, len(tasks))
+		for i := range tasks {
+			out[i].Err = refused[i] // nil for each root the service took
+		}
+		return out, nil
 	})
 ```
 
@@ -258,6 +265,37 @@ A task waiting to retry counts as not started, so it can still be cancelled: its
 
 Sync tasks are never retried: the error goes to the caller, which retries the request if it wants to.
 
+## Failed tasks
+
+A task that fails for good, with a permanent error or out of attempts, stays in its queue with its last error. It no longer holds up its subject, and it is kept until it is resubmitted, so the work it stood for can be inspected and replayed. `ListFailed` lists a queue's failed tasks, for one subject or all of them, a page at a time: pass the last task's ID of one page to get the next. `Resubmit` replaces one with a new pending task on the same subject and action, which runs after the tasks already queued there. It can take new arguments, such as fresh authority, and starts its attempts afresh. A task that ran sync is listed but not resubmitted (`ErrSyncTask`): its caller has had the failure, and its handler may depend on what only the caller held.
+
+```go
+after := uuid.Nil
+for {
+	failed, err := r.ListFailed(ctx, "queue-space-upload", space, after, 100)
+	if err != nil || len(failed) == 0 {
+		break
+	}
+	for _, f := range failed {
+		log.Printf("%s.%s failed: %s", f.Task.Queue, f.Task.Action, f.Error)
+		_, err = r.Resubmit(ctx, f.Task.Queue, f.Task.ID, withFreshProofs(f.Task.Args))
+	}
+	after = failed[len(failed)-1].Task.ID
+}
+```
+
+A handler can do the same through `ex.ListFailed` and `ex.Resubmit`, so the replay commits with its other writes.
+
+## Retention
+
+Finished tasks are deleted once they are older than their queue's `Retention`, 24 hours by default: those that succeeded, expired, were cancelled or were resubmitted. Failed tasks are kept until they are resubmitted, unless the queue sets a `FailedRetention`.
+
+```go
+taskrunner.QueueOptions{Name: "queue-space-upload", Workers: 4, Retention: 6 * time.Hour}
+```
+
+Waiting on a task deleted past its retention returns `ErrNotFound`.
+
 ## Placement
 
 A task that touches one instance's local state, such as a cached file, is placed on that instance with `Node`. Only the runner whose `Options.Node` matches runs it. While it is the oldest due task on its subject, other instances run none of the tasks behind it either, so the subject's order holds. A placed task still waiting on its `NotBefore` holds up nothing, like any delayed task. A sync task or child placed on another instance is refused with `ErrOtherNode`.
@@ -281,6 +319,7 @@ Pass a `MeterProvider` and the runner reports through OpenTelemetry, labelled by
 |---|---|
 | `taskrunner.queue.ready` | Pending tasks that are due |
 | `taskrunner.queue.delayed` | Pending tasks waiting on their `NotBefore`, or on a retry that holds their subject |
+| `taskrunner.queue.failed` | Tasks that failed for good and await inspection or resubmission |
 | `taskrunner.queue.oldest_ready_age` | How long the oldest due task has been due. Growth means the workers are not keeping up, or a subject is stuck |
 | `taskrunner.task.duration` | Time from start to outcome, labelled `succeeded`, `failed`, `retried` or `expired` |
 | `taskrunner.lease.wait` | Time a sync task or child waited for its subject's lease |
