@@ -136,9 +136,13 @@ Internal:
   `Options.MeterProvider`, or the global provider when unset. Imports nothing
   else from ingot (a test enforces it), so it can ship as a library.
   `taskrunnertest` makes a fresh schema per test and runs a tree with writes
-  held and applied straight away (`CheckOwnWrites`). Not wired into the
-  server yet. Live tests need `INGOT_TEST_DSN`; each uses its own schema and
-  truncates nothing.
+  held and applied straight away (`CheckOwnWrites`). The daemon runs one
+  runner (`provideTaskRunner` in `module.go`) over the `ingot` schema; its
+  tables are migrated in the migration hook, and `Server` starts and stops
+  it. Queues so far: `queue-space-upload` (`s3frontend/uploadqueue.go`), the
+  object-count changes a commit queues in its own transaction
+  (`registry.WithTasks`). Live tests need `INGOT_TEST_DSN`; each uses its own
+  schema and truncates nothing.
 - **`uploader/`** — `forge.go`/`blob.go`: `Forge` behind `Uploader`
   (`SubmitShard`), `BodyUploader`/`DeferredBodyUploader` (`UploadBlob`,
   `ConcludeBlobs`, `AbortBlob`), `StreamingBodyUploader` (`StartBlob`,
