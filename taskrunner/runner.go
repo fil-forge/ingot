@@ -12,6 +12,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/metric/noop"
 	"go.uber.org/zap"
 )
 
@@ -41,6 +43,8 @@ type Task struct {
 	Args []byte
 	// Attempt is how many earlier runs of the task failed and were retried.
 	Attempt int
+	// Node, when set, is the only instance that may run the task.
+	Node *string
 
 	seq  int64
 	sync bool
@@ -60,6 +64,12 @@ type Spec struct {
 	NotBefore *time.Time
 	// Expires, when set, is the latest time the task may start.
 	Expires *time.Time
+	// Node, when set, places the task on one instance, the runner whose
+	// Options.Node matches. Other instances never run it, and while it is its
+	// subject's oldest due task they run none of the tasks behind it either.
+	// Until its NotBefore passes it holds up nothing, as any delayed task. A
+	// task that touches one instance's local state is placed there.
+	Node *string
 	// Replace submits the task as a replacement, which needs a NotBefore: if a
 	// replacement with the same subject and action is pending and has not
 	// started, whichever has the later NotBefore is kept and the other is
@@ -123,9 +133,15 @@ type Options struct {
 	// reads through it. It exists for taskrunnertest.CheckOwnWrites and must
 	// not be set in production.
 	ApplyWritesImmediately bool
+	// Node names this instance for placement: the runner runs tasks placed
+	// on it and tasks placed nowhere. Empty runs only tasks placed nowhere.
+	Node string
 	// Logger receives task failures and background errors. Defaults to a
 	// no-op logger.
 	Logger *zap.Logger
+	// MeterProvider receives the runner's metrics. Defaults to the global
+	// OpenTelemetry provider, which is a no-op until one is installed.
+	MeterProvider metric.MeterProvider
 }
 
 var (
@@ -141,6 +157,9 @@ var (
 	ErrConflict = errors.New("a conditional write affected no rows")
 	// ErrNotFound is returned by Wait for a task its queue does not hold.
 	ErrNotFound = errors.New("task not found")
+	// ErrOtherNode is returned when a sync task is placed on another
+	// instance, which is the only one that may run it.
+	ErrOtherNode = errors.New("task is placed on another instance")
 	// ErrNotStarted is returned by Run before Start or after Stop.
 	ErrNotStarted = errors.New("task runner is not running")
 )
@@ -166,11 +185,12 @@ var queueName = regexp.MustCompile(`^[a-z][a-z0-9-]{0,39}$`)
 
 // Runner runs the tasks of a fixed set of queues.
 type Runner struct {
-	db     DB
-	opts   Options
-	log    *zap.Logger
-	order  []*queue
-	byName map[string]*queue
+	db      DB
+	opts    Options
+	log     *zap.Logger
+	metrics *metrics
+	order   []*queue
+	byName  map[string]*queue
 
 	handlersMu sync.RWMutex
 	handlers   map[actionKey]*action
@@ -257,6 +277,16 @@ func New(db DB, opts Options) (*Runner, error) {
 		waiting:  map[TaskID]*queue{},
 		freed:    map[subjectKey]*freeSub{},
 	}
+	// Metrics never stop the runner: instruments the provider refuses leave
+	// it reporting nothing.
+	m, err := newMetrics(opts.MeterProvider)
+	if err != nil {
+		r.log.Warn("task runner metrics not created; reporting none", zapErr(err))
+		if m, err = newMetrics(noop.NewMeterProvider()); err != nil {
+			return nil, fmt.Errorf("task runner: no-op metrics: %w", err)
+		}
+	}
+	r.metrics = m
 	for i, qo := range opts.Queues {
 		if !queueName.MatchString(qo.Name) {
 			return nil, fmt.Errorf("task runner: invalid queue name %q", qo.Name)
@@ -357,6 +387,11 @@ func (r *Runner) Start(ctx context.Context) error {
 		}
 	}
 	r.stopRenew = stopRenew
+	// Metrics never stop the runner: a failure to register leaves the
+	// gauges unreported.
+	if err := r.startCollecting(); err != nil {
+		r.log.Warn("task queue gauges not registered", zapErr(err))
+	}
 	return nil
 }
 
@@ -368,9 +403,14 @@ func (r *Runner) Start(ctx context.Context) error {
 func (r *Runner) Stop(ctx context.Context) error {
 	r.mu.Lock()
 	done := r.stopped
+	// The gauge callback takes r.mu, and unregistering waits for a
+	// collection in progress, so the callback is unregistered after r.mu is
+	// released.
+	var collecting metric.Registration
 	if r.running {
 		r.running = false
 		r.cancel()
+		collecting, r.metrics.collecting = r.metrics.collecting, nil
 		done = make(chan struct{})
 		r.stopped = done
 		stopRenew, renewDone := r.stopRenew, r.renewDone
@@ -383,6 +423,9 @@ func (r *Runner) Stop(ctx context.Context) error {
 		}()
 	}
 	r.mu.Unlock()
+	if collecting != nil {
+		_ = collecting.Unregister()
+	}
 	if done == nil {
 		return nil
 	}
@@ -412,6 +455,11 @@ func (r *Runner) enterInline(ctx context.Context) (context.Context, func(), erro
 	}, nil
 }
 
+// mayRun reports whether this instance may run a task placed on node.
+func (r *Runner) mayRun(node *string) bool {
+	return node == nil || *node == r.opts.Node
+}
+
 func (r *Runner) checkSpec(s Spec) (*queue, error) {
 	q, ok := r.byName[s.Queue]
 	if !ok {
@@ -425,6 +473,11 @@ func (r *Runner) checkSpec(s Spec) (*queue, error) {
 	}
 	if s.Replace && s.NotBefore == nil {
 		return nil, fmt.Errorf("task runner: %s.%s: a replacement needs a NotBefore", s.Queue, s.Action)
+	}
+	// An empty node would match every runner left unnamed, and none once
+	// they are all named.
+	if s.Node != nil && *s.Node == "" {
+		return nil, fmt.Errorf("task runner: %s.%s: empty node name", s.Queue, s.Action)
 	}
 	return q, nil
 }
@@ -441,11 +494,14 @@ func (r *Runner) checkSync(s Spec) (*queue, error) {
 	if a, _ := r.handler(actionKey{s.Queue, s.Action}); a.batch != nil {
 		return nil, fmt.Errorf("task runner: %s.%s batches, so it cannot run sync", s.Queue, s.Action)
 	}
+	if !r.mayRun(s.Node) {
+		return nil, fmt.Errorf("task runner: %s.%s on node %q: %w", s.Queue, s.Action, *s.Node, ErrOtherNode)
+	}
 	return q, nil
 }
 
-const insertTask = `INSERT INTO %s (id, subject, action, not_before, expires, args, sync)
-	VALUES ($1, $2, $3, $4, $5, $6, $7)`
+const insertTask = `INSERT INTO %s (id, subject, action, not_before, expires, args, sync, node)
+	VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`
 
 // Submit adds an async task and commits it straight away. A worker runs it
 // once it is due and its subject is free.
@@ -523,23 +579,26 @@ func (r *Runner) Run(ctx context.Context, s Spec) ([]byte, error) {
 	r.waiting[id] = q
 	r.mu.Unlock()
 	defer r.stopWaiting(q, id)
-	if err := r.db.QueryRow(ctx, `INSERT INTO `+q.tasks+` (id, subject, action, expires, args, sync, waiting_until)
-		VALUES ($1, $2, $3, $4, $5, true, now() + $6 * interval '1 millisecond') RETURNING seq, created`,
-		id, s.Subject, s.Action, s.Expires, s.Args, r.opts.LeaseTTL.Milliseconds()).Scan(&seq, &created); err != nil {
+	if err := r.db.QueryRow(ctx, `INSERT INTO `+q.tasks+` (id, subject, action, expires, args, sync, node, waiting_until)
+		VALUES ($1, $2, $3, $4, $5, true, $6, now() + $7 * interval '1 millisecond') RETURNING seq, created`,
+		id, s.Subject, s.Action, s.Expires, s.Args, s.Node, r.opts.LeaseTTL.Milliseconds()).Scan(&seq, &created); err != nil {
 		return nil, fmt.Errorf("submit %s.%s: %w", s.Queue, s.Action, err)
 	}
 	age := treeAge{created, id}
 	key := subjectKey{q.name, s.Subject}
 
 	wait := newBackoff(r.opts.PollInterval)
+	start := time.Now()
 	for {
 		h, _, err := r.tryLease(ctx, q, s.Subject, age)
 		if err != nil {
 			return nil, err
 		}
 		if h != nil {
+			r.metrics.observeLeaseWait(ctx, q, start)
 			d := r.drainSync(ctx, q, h, seq, id)
 			r.endHold(ctx, h, d.stop)
+			start = time.Now()
 			if d.ran {
 				return d.res, d.err
 			}
