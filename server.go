@@ -42,7 +42,7 @@ import (
 // ServerDeps bundles the runtime collaborators of an ingot Server
 // behind interfaces. Production wiring uses Forge / Internal /
 // Postgres; tests can substitute in-memory equivalents without
-// standing up Postgres, piri, or the indexing-service.
+// standing up Postgres or piri.
 type ServerDeps struct {
 	// Logger is optional; defaults to zap.NewNop().
 	Logger *zap.Logger

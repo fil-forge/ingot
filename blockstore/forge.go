@@ -77,8 +77,8 @@ type ForgeConfig struct {
 	IndexerDID string
 	// Signer is the upload-service identity; issuer of /content/retrieve invocations.
 	Signer ucan.Issuer
-	// HTTPClient is used for indexer queries and piri retrievals. Optional;
-	// defaults to http.DefaultClient.
+	// HTTPClient is used for piri retrievals and, when no Locator is injected,
+	// for indexer queries. Optional; defaults to http.DefaultClient.
 	HTTPClient *http.Client
 	// Logger is optional.
 	Logger *zap.Logger
