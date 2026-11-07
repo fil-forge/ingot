@@ -34,43 +34,29 @@ func (e *yieldError) Error() string { return fmt.Sprintf("left task %s to its wa
 // drain runs the subject's due tasks under h, oldest first, up to the task
 // with seq upTo. It stops early after running target, and before a sync task
 // other than target whose caller is waiting, which it leaves to the caller.
+//
+// It makes at most DrainLimit handler runs, counting a batch as one.
 func (r *Runner) drain(ctx context.Context, q *queue, h *hold, upTo int64, target TaskID) drained {
-	for n := 0; n < r.opts.DrainLimit; n++ {
+	for range r.opts.DrainLimit {
 		if h.lost.Load() {
 			return drained{stop: errLeaseLost}
 		}
-		t, waited, err := r.nextDue(ctx, q, h.subject, upTo)
+		tasks, err := r.claim(ctx, q, h.subject, upTo, target)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return drained{}
 		}
 		if err != nil {
 			return drained{stop: err}
 		}
-		if waited && t.ID != target {
-			return drained{stop: &yieldError{t.ID}}
-		}
-		res, terr, stop := r.runRoot(ctx, h, t)
+		res, terr, stop := r.runRoot(ctx, h, tasks)
 		if stop != nil {
 			return drained{stop: stop}
 		}
-		if t.ID == target {
+		if tasks[0].ID == target {
 			return drained{ran: true, res: res, err: terr}
 		}
 	}
 	return drained{full: true}
-}
-
-// nextDue returns the subject's oldest due task, and whether a Run caller is
-// waiting to run it.
-func (r *Runner) nextDue(ctx context.Context, q *queue, subject string, upTo int64) (t Task, waited bool, err error) {
-	t = Task{Queue: q.name, Subject: subject}
-	err = r.db.QueryRow(ctx, `SELECT id, action, created, not_before, expires, args,
-		coalesce(waiting_until > now(), false) FROM `+q.tasks+`
-		WHERE subject = $1 AND state = 'pending' AND seq <= $2
-		AND (not_before IS NULL OR not_before <= now())
-		ORDER BY seq LIMIT 1`, subject, upTo,
-	).Scan(&t.ID, &t.Action, &t.Created, &t.NotBefore, &t.Expires, &t.Args, &waited)
-	return t, waited, err
 }
 
 // pollLoop hands due, free subjects to workers, up to the queue's worker
@@ -106,12 +92,13 @@ func (r *Runner) dispatch(ctx context.Context, q *queue) {
 	// caller's to take. The due-task index (dueIndex) keeps this to the due
 	// rows.
 	rows, err := r.db.Query(ctx, `SELECT d.subject FROM (
-			SELECT DISTINCT ON (subject) subject, seq, waiting_until FROM `+q.tasks+`
+			SELECT DISTINCT ON (subject) subject, seq, waiting_until, retry_at FROM `+q.tasks+`
 			WHERE state = 'pending' AND (not_before IS NULL OR not_before <= now())
 			AND NOT (subject = ANY($1))
 			ORDER BY subject, seq
 		) d
 		WHERE (d.waiting_until IS NULL OR d.waiting_until <= now())
+		AND (d.retry_at IS NULL OR d.retry_at <= now())
 		AND NOT EXISTS (SELECT 1 FROM `+q.leases+` l WHERE l.subject = d.subject AND l.expires >= now())
 		ORDER BY d.seq LIMIT $2`, busy, free)
 	if err != nil {
