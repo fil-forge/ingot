@@ -1475,11 +1475,9 @@ func (b *Backend) reuseParkedPart(ctx context.Context, space did.DID, blob msbuc
 // part, session or object of the same space naming the same digest shares
 // the park. Another space holding an intent for the digest keeps the file
 // (see dropLocalCopy). The blob is durable on the provider, so a failed
-// remove costs only disk: it is logged, and the file waits for the spool
-// sweeper to evict it, if a budget is set, or for a release of the blob: the
-// session's if the part is aborted, superseded or expires, its object's once
-// Complete commits it. A failure to mark the intent evicted only leaves the
-// sweeper to find the file gone and mark it.
+// remove costs only disk: it is logged, and the file waits for a release of
+// the blob: the session's if the part is aborted, superseded or expires, its
+// object's once Complete commits it.
 func (b *Backend) dropParkedCopy(ctx context.Context, space did.DID, digest mh.Multihash) {
 	b.dropLocalCopy(ctx, space, digest, removedParked)
 }

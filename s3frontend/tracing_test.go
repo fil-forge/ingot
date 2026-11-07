@@ -5,7 +5,6 @@ import (
 	"context"
 	"io"
 	"testing"
-	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
@@ -216,7 +215,7 @@ func TestMultipartSpans(t *testing.T) {
 // TestSweepLocalBlobsSpans: each pass of a local blob sweep records a span
 // under the caller's, carrying what it removed and why it stopped.
 func TestSweepLocalBlobsSpans(t *testing.T) {
-	b, _ := newSweepBackend(t, func(d *Deps) { d.CacheMinResidency = time.Hour })
+	b, _ := newSweepBackend(t)
 	digests := putSweepObjects(t, b, 4)
 	size := blobSize(t, b, digests[0])
 	budgetToEvict(b, 2, size)
@@ -229,12 +228,9 @@ func TestSweepLocalBlobsSpans(t *testing.T) {
 
 	budget := tree.one("local_blobs.budget_pass")
 	tree.requireInTrace(budget)
-	requireAttr(t, budget, attribute.Int64("ingot.sweep.files", 0))
-	requireAttr(t, budget, attribute.String("ingot.sweep.stop", "residency"))
-	forced := tree.one("local_blobs.forced_pass")
-	tree.requireInTrace(forced)
-	requireAttr(t, forced, attribute.Int64("ingot.sweep.files", 2))
-	requireAttr(t, forced, attribute.Int64("ingot.sweep.bytes", 2*size))
+	requireAttr(t, budget, attribute.Int64("ingot.sweep.files", 2))
+	requireAttr(t, budget, attribute.Int64("ingot.sweep.bytes", 2*size))
+	requireAttr(t, budget, attribute.String("ingot.sweep.stop", "watermark"))
 	tree.requireInTrace(tree.one("local_blobs.orphan_pass"))
 }
 

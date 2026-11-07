@@ -527,6 +527,12 @@ func (r *Runner) checkSync(s Spec) (*queue, error) {
 const insertTask = `INSERT INTO %s (id, subject, action, not_before, expires, args, sync, node)
 	VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`
 
+// Node returns the name this runner places its instance's tasks under
+// (Options.Node), or empty if it has none.
+func (r *Runner) Node() string {
+	return r.opts.Node
+}
+
 // Submit adds an async task and commits it straight away. A worker runs it
 // once it is due and its subject is free.
 func (r *Runner) Submit(ctx context.Context, s Spec) (TaskID, error) {

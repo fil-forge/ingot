@@ -5,7 +5,6 @@ package itest
 import (
 	"bytes"
 	"fmt"
-	"strconv"
 	"testing"
 	"time"
 
@@ -63,11 +62,10 @@ func TestForgeReadAfterEviction(t *testing.T) {
 }
 
 // TestForgeLocalBlobBudget proves the local blob sweeper: with a 4 MiB
-// local_blob_max_bytes and both retention windows off
-// (testdata/config-localblobbudget.yaml), 16 MiB of objects are evicted down
-// to the budget within a few sweeps, at least 12 of their blobs are marked
-// evicted (so their reads must go to piri), and every object then reads back
-// byte-exact.
+// local_blob_max_bytes (testdata/config-localblobbudget.yaml), 16 MiB of
+// objects are evicted down to the budget within a few sweeps, well inside
+// their time to live, at least 12 of their blobs leave local disk (so their
+// reads must go to piri), and every object then reads back byte-exact.
 //
 //	go test -tags itest ./itest -run TestForgeLocalBlobBudget -v -timeout 900s
 func TestForgeLocalBlobBudget(t *testing.T) {
@@ -109,9 +107,8 @@ func TestForgeLocalBlobBudget(t *testing.T) {
 	}
 	// 16 MiB down to at most 4 MiB leaves room for at most four of the
 	// 1 MiB blobs; the rest are read back from piri below.
-	evicted := ingotSQL(t, ctx, s, `SELECT count(*) FROM ingot.upload_intents WHERE evicted_at IS NOT NULL`)
-	if n, err := strconv.Atoi(evicted); err != nil || n < 12 {
-		t.Fatalf("evicted intents = %q, want at least 12", evicted)
+	if n := localBlobCount(t, ctx, s); n > 4 {
+		t.Fatalf("local blobs after eviction = %d, want at most 4", n)
 	}
 
 	for key, want := range objects {
@@ -151,11 +148,6 @@ func TestForgeUncachedWrites(t *testing.T) {
 	}
 	if got := localBlobCount(t, ctx, s) - before; got != 0 {
 		t.Fatalf("PUT left %d local blobs, want 0 with cache_writes off", got)
-	}
-	// Every blob the PUT accepted is marked evicted: nothing on this stack
-	// keeps a written body, so no accepted intent should be unmarked.
-	if unmarked := ingotSQL(t, ctx, s, `SELECT count(*) FROM ingot.upload_intents WHERE state IN ('accepted', 'published') AND evicted_at IS NULL`); unmarked != "0" {
-		t.Fatalf("accepted intents not marked evicted = %s, want 0", unmarked)
 	}
 	got, err := ingottest.GetBytes(ctx, cfg, bucket, key)
 	if err != nil {

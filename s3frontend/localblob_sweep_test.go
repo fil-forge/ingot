@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -13,7 +12,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/multiformats/go-multihash"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest/observer"
@@ -21,22 +19,22 @@ import (
 	"github.com/fil-forge/libforge/testutil"
 	"github.com/fil-forge/versitygw/s3response"
 
-	"github.com/fil-forge/ingot/blockstore"
 	"github.com/fil-forge/ingot/inmem"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ucantone/did"
 )
 
-// These tests drive SweepLocalBlobs over a real on-disk spool. inmem.NopUploader
-// records a location for every blob, and inmem.NopBaseReader cannot serve an
-// evicted body, so they assert which files remain and never read an evicted
-// object back; the network read of an evicted blob is covered by the itest.
+// These tests drive SweepLocalBlobs over a real on-disk spool and cache. The
+// backend has no task queues, so a held blob moves into the cache directly.
+// inmem.NopUploader records a location for every blob, and
+// inmem.NopBaseReader cannot serve an evicted body, so they assert which files
+// remain and never read an evicted object back; the network read of an evicted
+// blob is covered by the itest.
 
 const sweepBucket = "sweep"
 
 // newSweepBackend returns a backend over an on-disk spool with a bucket that
-// has a space and a tenant, and no residency or read-retention window unless
-// a mod sets one.
+// has a space and a tenant.
 func newSweepBackend(t *testing.T, mods ...func(*Deps)) (*Backend, *inmem.MemStore) {
 	t.Helper()
 	b, mem := newDeferredBackend(t, inmem.NopUploader{}, mods...)
@@ -77,8 +75,7 @@ func putSweepObjects(t *testing.T, b *Backend, n int) []multihash.Multihash {
 			t.Fatalf("object %s has %d blobs, want 1", key, len(blobs))
 		}
 		digests = append(digests, blobs[0].Digest)
-		// Distinct commit times, so eviction order is by age, not by the
-		// digest tiebreak.
+		// Distinct modification times, so eviction order is by age.
 		time.Sleep(2 * time.Millisecond)
 	}
 	return digests
@@ -91,21 +88,16 @@ func budgetToEvict(b *Backend, n int, blobSize int64) {
 	b.localBlobMaxBytes = (target/lowWatermarkPercent + 1) * 100
 }
 
-// blobState is what a test observes of one blob after a sweep.
-type blobState struct {
-	OnDisk  bool
-	Evicted bool
-}
-
-func blobStates(t *testing.T, b *Backend, mem *inmem.MemStore, digests []multihash.Multihash) []blobState {
+// onDisk reports, for each digest, whether its blob has a local copy.
+func onDisk(t *testing.T, b *Backend, digests []multihash.Multihash) []bool {
 	t.Helper()
-	var out []blobState
+	var out []bool
 	for _, d := range digests {
 		_, err := os.Stat(localPath(b, d))
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("stat %x: %v", d, err)
 		}
-		out = append(out, blobState{OnDisk: err == nil, Evicted: mem.IsEvicted(d)})
+		out = append(out, err == nil)
 	}
 	return out
 }
@@ -129,15 +121,34 @@ func blobSize(t *testing.T, b *Backend, d multihash.Multihash) int64 {
 }
 
 func TestSweepLocalBlobs_EvictsOldestFirstToTheLowWatermark(t *testing.T) {
-	b, mem := newSweepBackend(t)
+	b, _ := newSweepBackend(t)
 	digests := putSweepObjects(t, b, 4)
 	budgetToEvict(b, 2, blobSize(t, b, digests[0]))
 
 	sweepLocalBlobs(t, b)
 
-	want := []blobState{{false, true}, {false, true}, {true, false}, {true, false}}
-	if got := blobStates(t, b, mem, digests); !reflect.DeepEqual(got, want) {
-		t.Fatalf("blobs after the sweep = %+v, want %+v", got, want)
+	want := []bool{false, false, true, true}
+	if got := onDisk(t, b, digests); !reflect.DeepEqual(got, want) {
+		t.Fatalf("blobs on disk after the sweep = %v, want %v", got, want)
+	}
+}
+
+// TestSweepLocalBlobs_EvictsInOrderOfRenewal: a blob whose time in the cache
+// was renewed since (a read, or another write of the same bytes) goes after
+// the ones that were not.
+func TestSweepLocalBlobs_EvictsInOrderOfRenewal(t *testing.T) {
+	b, _ := newSweepBackend(t)
+	digests := putSweepObjects(t, b, 3)
+	if ok, err := b.cache.Touch(digests[0], time.Now().Add(time.Minute)); err != nil || !ok {
+		t.Fatalf("Touch = %v, %v", ok, err)
+	}
+	budgetToEvict(b, 1, blobSize(t, b, digests[0]))
+
+	sweepLocalBlobs(t, b)
+
+	want := []bool{true, false, true}
+	if got := onDisk(t, b, digests); !reflect.DeepEqual(got, want) {
+		t.Fatalf("blobs on disk after the sweep = %v, want %v", got, want)
 	}
 }
 
@@ -153,74 +164,10 @@ func TestSweepLocalBlobs_UsageEndsAtOrBelowTheLowWatermark(t *testing.T) {
 	}
 }
 
-// TestSweepLocalBlobs_ResidencyHoldsUntilTheForcedPass: with every blob inside
-// the residency window the budget pass evicts nothing, and the forced pass
-// then evicts down to the budget anyway.
-func TestSweepLocalBlobs_ResidencyHoldsUntilTheForcedPass(t *testing.T) {
-	b, _ := newSweepBackend(t, func(d *Deps) { d.CacheMinResidency = time.Hour })
-	digests := putSweepObjects(t, b, 4)
-	size := blobSize(t, b, digests[0])
-	budgetToEvict(b, 2, size)
-
-	stats := sweepLocalBlobs(t, b)
-
-	want := LocalBlobSweepStats{ForcedFiles: 2, ForcedBytes: 2 * size}
-	if stats != want {
-		t.Fatalf("sweep stats = %+v, want %+v", stats, want)
-	}
-}
-
-// TestSweepLocalBlobs_SkipsRecentlyReadBlobs: the oldest blob was just read
-// from the cache, so the budget pass passes over it and evicts the next one.
-func TestSweepLocalBlobs_SkipsRecentlyReadBlobs(t *testing.T) {
-	b, mem := newSweepBackend(t, func(d *Deps) { d.CacheReadRetention = time.Hour })
-	digests := putSweepObjects(t, b, 4)
-	bucket, key := sweepBucket, "obj-0"
-	got, err := b.GetObject(t.Context(), &s3.GetObjectInput{Bucket: &bucket, Key: &key})
-	if err != nil {
-		t.Fatalf("GetObject: %v", err)
-	}
-	_, _ = io.Copy(io.Discard, got.Body)
-	got.Body.Close()
-	budgetToEvict(b, 1, blobSize(t, b, digests[0]))
-
-	sweepLocalBlobs(t, b)
-
-	want := []blobState{{true, false}, {false, true}, {true, false}, {true, false}}
-	if states := blobStates(t, b, mem, digests); !reflect.DeepEqual(states, want) {
-		t.Fatalf("blobs after the sweep = %+v, want %+v", states, want)
-	}
-}
-
-// TestSweepLocalBlobs_KeepsBlobsTheProviderMayNotHold: no pass removes the file of
-// a spooled or uploading intent (the only copy), or of an accepted intent
-// TestSweepLocalBlobs_KeepsAPublishedBlobWithNoLocation: a release that
-// deleted a committed blob's location row and then failed leaves the intent
-// published with nothing proving the provider holds the blob, so no pass
-// evicts its local copy; the next blob goes instead.
-func TestSweepLocalBlobs_KeepsAPublishedBlobWithNoLocation(t *testing.T) {
-	ctx := t.Context()
-	b, mem := newSweepBackend(t)
-	digests := putSweepObjects(t, b, 2)
-	st, err := mem.Get(ctx, sweepBucket)
-	if err != nil {
-		t.Fatalf("get bucket: %v", err)
-	}
-	if err := mem.DeleteLocation(ctx, st.Space, digests[0]); err != nil {
-		t.Fatalf("DeleteLocation: %v", err)
-	}
-	budgetToEvict(b, 1, blobSize(t, b, digests[0]))
-
-	sweepLocalBlobs(t, b)
-
-	want := []blobState{{true, false}, {false, true}}
-	if got := blobStates(t, b, mem, digests); !reflect.DeepEqual(got, want) {
-		t.Fatalf("blobs after the sweep = %+v, want %+v", got, want)
-	}
-}
-
-// whose location was never recorded, however far over budget the spool is.
-func TestSweepLocalBlobs_KeepsBlobsTheProviderMayNotHold(t *testing.T) {
+// TestSweepLocalBlobs_KeepsTheSpool: the budget pass removes no spool file,
+// however far over budget the spool is: a body being uploaded, whose only copy
+// it is, or one the provider holds that has yet to move into the cache.
+func TestSweepLocalBlobs_KeepsTheSpool(t *testing.T) {
 	ctx := t.Context()
 	b, mem := newSweepBackend(t, func(d *Deps) { d.LocalBlobMaxBytes = 1 })
 	var digests []multihash.Multihash
@@ -237,9 +184,9 @@ func TestSweepLocalBlobs_KeepsBlobsTheProviderMayNotHold(t *testing.T) {
 
 	sweepLocalBlobs(t, b)
 
-	want := []blobState{{true, false}, {true, false}, {true, false}}
-	if got := blobStates(t, b, mem, digests); !reflect.DeepEqual(got, want) {
-		t.Fatalf("blobs after the sweep = %+v, want %+v", got, want)
+	want := []bool{true, true, true}
+	if got := onDisk(t, b, digests); !reflect.DeepEqual(got, want) {
+		t.Fatalf("blobs on disk after the sweep = %v, want %v", got, want)
 	}
 }
 
@@ -251,33 +198,6 @@ func TestSweepLocalBlobs_NoBudgetEvictsNothing(t *testing.T) {
 
 	if stats != (LocalBlobSweepStats{}) {
 		t.Fatalf("sweep stats = %+v, want nothing removed", stats)
-	}
-}
-
-// TestSweepLocalBlobs_FileAlreadyGoneIsMarkedEvicted: a crash between the unlink
-// and the mark leaves a row describing a missing file; the next pass marks it.
-func TestSweepLocalBlobs_FileAlreadyGoneIsMarkedEvicted(t *testing.T) {
-	b, mem := newSweepBackend(t)
-	digests := putSweepObjects(t, b, 2)
-	budgetToEvict(b, 1, blobSize(t, b, digests[0]))
-	if err := os.Remove(localPath(b, digests[0])); err != nil {
-		t.Fatal(err)
-	}
-
-	stats := sweepLocalBlobs(t, b)
-
-	// The missing file is marked but not counted as evicted; the count still
-	// held its bytes, so the pass went on to evict the next blob too.
-	got := struct {
-		Blob  []blobState
-		Files int64
-	}{blobStates(t, b, mem, digests[:1]), stats.BudgetFiles}
-	want := struct {
-		Blob  []blobState
-		Files int64
-	}{[]blobState{{false, true}}, 1}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("after the sweep = %+v, want %+v", got, want)
 	}
 }
 
@@ -368,222 +288,37 @@ func TestSweepLocalBlobs_OrphanPass(t *testing.T) {
 	}
 }
 
-// TestRemoveReleasedPublished: a committed blob whose release finished while
-// releases still kept the local copy (published, nothing naming it) loses its
-// intent and its copy, wherever the copy is; one
-// whose copy is already gone loses its intent; a live object's blob keeps
-// both.
-func TestRemoveReleasedPublished(t *testing.T) {
-	ctx := t.Context()
-	b, mem := newSweepBackend(t)
-	live := putSweepObjects(t, b, 1)[0]
-	released := func(body string, where string) (multihash.Multihash, int64) {
-		t.Helper()
-		d, n, err := b.spool.WriteBlob(ctx, bytes.NewReader([]byte(body)))
-		if err != nil {
-			t.Fatalf("WriteBlob: %v", err)
-		}
-		switch where {
-		case "cache":
-			if _, err := b.cache.Take(b.spool, d); err != nil {
-				t.Fatalf("Take: %v", err)
-			}
-		case "gone":
-			if _, err := b.spool.Remove(d); err != nil {
-				t.Fatalf("Remove: %v", err)
-			}
-		}
-		if err := mem.PutIntent(ctx, registry.UploadIntent{Space: sweepSpace(t, mem), Digest: d, LocalPath: localPath(b, d), Size: n, State: registry.IntentPublished}); err != nil {
-			t.Fatalf("PutIntent: %v", err)
-		}
-		return d, n
-	}
-	inCache, cacheBytes := released("a deleted object's cached envelope", "cache")
-	inSpool, spoolBytes := released("a deleted object's spooled envelope", "spool")
-	gone, _ := released("a deleted object's evicted envelope", "gone")
-
-	files, freed, err := b.RemoveReleasedPublished(ctx)
-	if err != nil {
-		t.Fatalf("RemoveReleasedPublished: %v", err)
-	}
-
-	if files != 2 || freed != cacheBytes+spoolBytes {
-		t.Fatalf("released pass removed %d files, %d bytes; want 2 files, %d bytes", files, freed, cacheBytes+spoolBytes)
-	}
-	for _, d := range []multihash.Multihash{inCache, inSpool, gone} {
-		if fileExists(localPath(b, d)) {
-			t.Fatalf("released blob %x's file survived the sweep", d)
-		}
-		if _, err := mem.IntentByDigest(ctx, d); !errors.Is(err, registry.ErrNotFound) {
-			t.Fatalf("released blob %x's intent: err=%v, want ErrNotFound", d, err)
-		}
-	}
-	if !fileExists(localPath(b, live)) {
-		t.Fatal("live blob's file was removed, want it kept")
-	}
-	if in, err := mem.IntentByDigest(ctx, live); err != nil || in.State != registry.IntentPublished {
-		t.Fatalf("live blob's intent = %v/%v, want published", in, err)
-	}
-}
-
-// TestSweepLocalBlobs_LeavesReleasedBlobsToTheStartupPass: the sweeper does
-// not remove a released blob's copy; only RemoveReleasedPublished does.
-func TestSweepLocalBlobs_LeavesReleasedBlobsToTheStartupPass(t *testing.T) {
-	ctx := t.Context()
-	b, mem := newSweepBackend(t)
-	d, n, err := b.spool.WriteBlob(ctx, bytes.NewReader([]byte("a deleted object's envelope")))
-	if err != nil {
-		t.Fatalf("WriteBlob: %v", err)
-	}
-	if err := mem.PutIntent(ctx, registry.UploadIntent{Space: sweepSpace(t, mem), Digest: d, LocalPath: localPath(b, d), Size: n, State: registry.IntentPublished}); err != nil {
-		t.Fatalf("PutIntent: %v", err)
-	}
-
-	sweepLocalBlobs(t, b)
-
-	if !fileExists(localPath(b, d)) {
-		t.Fatal("the sweeper removed a released blob's copy, want it left to the startup pass")
-	}
-}
-
-// TestRemoveReleasedPublishedRetriesACopyItCannotRemove: a cached copy that
-// cannot be removed keeps its intent, so the next run finds it again, and the
-// pass pages on past it to the rest; once the copy can go, a rerun removes it.
-func TestRemoveReleasedPublishedRetriesACopyItCannotRemove(t *testing.T) {
-	ctx := t.Context()
-	b, mem := newSweepBackend(t)
-	b.localBlobSweepBatch = 1
-	var digests []multihash.Multihash
-	for i := range 3 {
-		d, n, err := b.spool.WriteBlob(ctx, bytes.NewReader(fmt.Appendf(nil, "released %d", i)))
-		if err != nil {
-			t.Fatalf("WriteBlob: %v", err)
-		}
-		if err := mem.PutIntent(ctx, registry.UploadIntent{Space: sweepSpace(t, mem), Digest: d, LocalPath: localPath(b, d), Size: n, State: registry.IntentPublished}); err != nil {
-			t.Fatalf("PutIntent: %v", err)
-		}
-		digests = append(digests, d)
-	}
-	// A non-empty directory at the first blob's cache path cannot be removed.
-	if _, err := b.cache.Take(b.spool, digests[0]); err != nil {
-		t.Fatalf("Take: %v", err)
-	}
-	stuck := b.cache.Path(digests[0])
-	if err := os.Remove(stuck); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(filepath.Join(stuck, "x"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	run := func() {
-		t.Helper()
-		if _, _, err := b.RemoveReleasedPublished(ctx); err != nil {
-			t.Fatalf("RemoveReleasedPublished: %v", err)
-		}
-	}
-	intentKept := func(d multihash.Multihash) bool {
-		t.Helper()
-		_, err := mem.IntentByDigest(ctx, d)
-		if err != nil && !errors.Is(err, registry.ErrNotFound) {
-			t.Fatalf("GetIntent %x: %v", d, err)
-		}
-		return err == nil
-	}
-
-	run()
-
-	type state struct{ Kept, OnDisk bool }
-	var got []state
-	for _, d := range digests {
-		got = append(got, state{intentKept(d), fileExists(localPath(b, d))})
-	}
-	if want := []state{{true, true}, {false, false}, {false, false}}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("after the first run = %+v, want %+v", got, want)
-	}
-
-	if err := os.RemoveAll(filepath.Join(stuck, "x")); err != nil {
-		t.Fatal(err)
-	}
-	run()
-
-	if intentKept(digests[0]) || fileExists(stuck) {
-		t.Fatalf("after the rerun: intent kept %v, copy on disk %v; want neither", intentKept(digests[0]), fileExists(stuck))
-	}
-}
-
-// TestSweepLocalBlobs_PagesThroughEvictableRows: a budget pass that needs more
-// rows than one query returns pages on, oldest first.
-func TestSweepLocalBlobs_PagesThroughEvictableRows(t *testing.T) {
-	b, mem := newSweepBackend(t)
-	b.localBlobSweepBatch = 2
-	digests := putSweepObjects(t, b, 5)
-	budgetToEvict(b, 4, blobSize(t, b, digests[0]))
-
-	sweepLocalBlobs(t, b)
-
-	want := []blobState{{false, true}, {false, true}, {false, true}, {false, true}, {true, false}}
-	if got := blobStates(t, b, mem, digests); !reflect.DeepEqual(got, want) {
-		t.Fatalf("blobs after the sweep = %+v, want %+v", got, want)
-	}
-}
-
-// TestSweepLocalBlobs_SkipsAFileItCannotRemove: a file whose removal fails is left
-// unmarked, and the pass goes on to the next one instead of stopping there on
-// every sweep.
+// TestSweepLocalBlobs_SkipsAFileItCannotRemove: a file whose removal fails is
+// left in place and the pass goes on to the next one, logging the failures
+// once.
 func TestSweepLocalBlobs_SkipsAFileItCannotRemove(t *testing.T) {
-	b, mem := newSweepBackend(t)
+	core, logs := observer.New(zap.InfoLevel)
+	b, _ := newSweepBackend(t, func(d *Deps) { d.Logger = zap.New(core) })
 	digests := putSweepObjects(t, b, 3)
 	budgetToEvict(b, 1, blobSize(t, b, digests[0]))
-	// A non-empty directory at the blob's path makes its removal fail.
-	path := localPath(b, digests[0])
-	if err := os.Remove(path); err != nil {
+	// A read-only cache directory makes every removal fail.
+	dir := filepath.Dir(b.cache.Path(digests[0]))
+	if err := os.Chmod(dir, 0o555); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.MkdirAll(filepath.Join(path, "stuck"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
 
-	sweepLocalBlobs(t, b)
+	stats := sweepLocalBlobs(t, b)
 
-	want := []blobState{{true, false}, {false, true}, {true, false}}
-	if got := blobStates(t, b, mem, digests); !reflect.DeepEqual(got, want) {
-		t.Fatalf("blobs after the sweep = %+v, want %+v", got, want)
+	got := fmt.Sprint(onDisk(t, b, digests), stats.BudgetFiles, logs.FilterMessageSnippet("could not remove some files").Len())
+	if want := fmt.Sprint([]bool{true, true, true}, 0, 1); got != want {
+		t.Fatalf("[on disk] [evicted] [failure logs] = %s, want %s", got, want)
 	}
 }
 
-// TestSweepLocalBlobs_EvictsAParkedBlob: a parked intent's file goes on its park
-// row, as an accepted one's does on its location.
-func TestSweepLocalBlobs_EvictsAParkedBlob(t *testing.T) {
-	ctx := t.Context()
-	b, mem := newSweepBackend(t, func(d *Deps) { d.LocalBlobMaxBytes = 1 })
-	d, n, err := b.spool.WriteBlob(ctx, bytes.NewReader([]byte("parked part")))
-	if err != nil {
-		t.Fatalf("WriteBlob: %v", err)
-	}
-	if err := mem.PutIntent(ctx, registry.UploadIntent{Space: sweepSpace(t, mem), Digest: d, LocalPath: localPath(b, d), Size: n, State: registry.IntentParked}); err != nil {
-		t.Fatalf("PutIntent: %v", err)
-	}
-	if _, err := mem.PutPark(ctx, registry.BlobPark{Space: sweepSpace(t, mem), Digest: d, Size: n}); err != nil {
-		t.Fatalf("PutPark: %v", err)
-	}
-
-	sweepLocalBlobs(t, b)
-
-	want := []blobState{{false, true}}
-	if got := blobStates(t, b, mem, []multihash.Multihash{d}); !reflect.DeepEqual(got, want) {
-		t.Fatalf("blob after the sweep = %+v, want %+v", got, want)
-	}
-}
-
-// TestEvictToBudget_ReportsWhyItStopped: each way a pass ends is reported, and
-// the residency stop leaves the young rows alone after evicting the old ones.
+// TestEvictToBudget_ReportsWhyItStopped: each way a pass ends is reported.
 func TestEvictToBudget_ReportsWhyItStopped(t *testing.T) {
 	ctx := t.Context()
 	t.Run("deadline", func(t *testing.T) {
 		b, _ := newSweepBackend(t)
 		digests := putSweepObjects(t, b, 2)
 		budgetToEvict(b, 1, blobSize(t, b, digests[0]))
-		pass, err := b.evictToBudget(ctx, time.Now().Add(-time.Second), honorBothWindows)
+		pass, err := b.evictToBudget(ctx, -time.Second)
 		if err != nil {
 			t.Fatalf("evictToBudget: %v", err)
 		}
@@ -591,12 +326,12 @@ func TestEvictToBudget_ReportsWhyItStopped(t *testing.T) {
 			t.Fatalf("pass = %+v, want nothing evicted, stopped at the deadline", pass)
 		}
 	})
-	t.Run("no evictable rows", func(t *testing.T) {
+	t.Run("no cached blobs", func(t *testing.T) {
 		b, _ := newSweepBackend(t, func(d *Deps) { d.LocalBlobMaxBytes = 1 })
 		if _, _, err := b.spool.WriteBlob(ctx, bytes.NewReader([]byte("no intent"))); err != nil {
 			t.Fatalf("WriteBlob: %v", err)
 		}
-		pass, err := b.evictToBudget(ctx, time.Now().Add(time.Minute), honorBothWindows)
+		pass, err := b.evictToBudget(ctx, time.Minute)
 		if err != nil {
 			t.Fatalf("evictToBudget: %v", err)
 		}
@@ -609,7 +344,7 @@ func TestEvictToBudget_ReportsWhyItStopped(t *testing.T) {
 		digests := putSweepObjects(t, b, 2)
 		size := blobSize(t, b, digests[0])
 		budgetToEvict(b, 1, size)
-		pass, err := b.evictToBudget(ctx, time.Now().Add(time.Minute), honorBothWindows)
+		pass, err := b.evictToBudget(ctx, time.Minute)
 		if err != nil {
 			t.Fatalf("evictToBudget: %v", err)
 		}
@@ -617,52 +352,6 @@ func TestEvictToBudget_ReportsWhyItStopped(t *testing.T) {
 			t.Fatalf("pass = %+v, want one eviction, stopped at the watermark", pass)
 		}
 	})
-	t.Run("residency", func(t *testing.T) {
-		const residency = time.Hour
-		b, mem := newSweepBackend(t, func(d *Deps) { d.CacheMinResidency = residency })
-		digests := putSweepObjects(t, b, 2)
-		old, young := digests[:1], digests[1:]
-		mem.AgeIntent(old[0], 2*residency)
-		size := blobSize(t, b, old[0])
-		budgetToEvict(b, 2, size)
-		pass, err := b.evictToBudget(ctx, time.Now().Add(time.Minute), honorBothWindows)
-		if err != nil {
-			t.Fatalf("evictToBudget: %v", err)
-		}
-		if pass != (budgetPass{files: 1, bytes: size, stop: stopResidency}) {
-			t.Fatalf("pass = %+v, want the old blob evicted, stopped at the residency window", pass)
-		}
-		want := []blobState{{false, true}, {true, false}}
-		if got := blobStates(t, b, mem, append(old, young...)); !reflect.DeepEqual(got, want) {
-			t.Fatalf("blobs = %+v, want %+v", got, want)
-		}
-	})
-}
-
-// TestSweepLocalBlobs_ForcedPassKeepsRecentlyReadBlobsLongest: inside the
-// residency window, the forced pass evicts the oldest blob nobody has read,
-// keeping the one just read although it is older.
-func TestSweepLocalBlobs_ForcedPassKeepsRecentlyReadBlobsLongest(t *testing.T) {
-	b, mem := newSweepBackend(t, func(d *Deps) {
-		d.CacheMinResidency = time.Hour
-		d.CacheReadRetention = time.Hour
-	})
-	digests := putSweepObjects(t, b, 4)
-	bucket, key := sweepBucket, "obj-0"
-	got, err := b.GetObject(t.Context(), &s3.GetObjectInput{Bucket: &bucket, Key: &key})
-	if err != nil {
-		t.Fatalf("GetObject: %v", err)
-	}
-	_, _ = io.Copy(io.Discard, got.Body)
-	got.Body.Close()
-	budgetToEvict(b, 1, blobSize(t, b, digests[0]))
-
-	stats := sweepLocalBlobs(t, b)
-
-	want := []blobState{{true, false}, {false, true}, {true, false}, {true, false}}
-	if states := blobStates(t, b, mem, digests); !reflect.DeepEqual(states, want) || stats.ForcedFiles != 1 {
-		t.Fatalf("blobs after the sweep = %+v (forced %d), want %+v (forced 1)", states, stats.ForcedFiles, want)
-	}
 }
 
 // TestSweepLocalBlobs_OrphanPassRunsHourly: a sweep within the hour after an
@@ -840,31 +529,6 @@ func TestHeldBlobMovesToTheCache(t *testing.T) {
 	}
 }
 
-// TestSweepLocalBlobs_EvictsAHeldBlobLeftInTheSpool: a blob the registry shows the
-// provider holds, but whose copy never moved to the cache (the process stopped
-// in between), is still evicted.
-func TestSweepLocalBlobs_EvictsAHeldBlobLeftInTheSpool(t *testing.T) {
-	ctx := t.Context()
-	b, mem := newSweepBackend(t, func(d *Deps) { d.LocalBlobMaxBytes = 1 })
-	d, n, err := b.spool.WriteBlob(ctx, bytes.NewReader([]byte("held, never moved")))
-	if err != nil {
-		t.Fatalf("WriteBlob: %v", err)
-	}
-	if err := mem.PutIntent(ctx, registry.UploadIntent{Space: sweepSpace(t, mem), Digest: d, LocalPath: b.spool.Path(d), Size: n, State: registry.IntentAccepted}); err != nil {
-		t.Fatalf("PutIntent: %v", err)
-	}
-	if err := mem.PutLocation(ctx, registry.BlobLocation{Space: sweepSpace(t, mem), Digest: d, Provider: "did:key:p", URL: "http://p/blob", Size: n}); err != nil {
-		t.Fatalf("PutLocation: %v", err)
-	}
-
-	sweepLocalBlobs(t, b)
-
-	want := []blobState{{false, true}}
-	if got := blobStates(t, b, mem, []multihash.Multihash{d}); !reflect.DeepEqual(got, want) {
-		t.Fatalf("blob after the sweep = %+v, want %+v", got, want)
-	}
-}
-
 // TestSweepLocalBlobs_WarnsOncePerOverBudgetEpisode: the warning that nothing is
 // left to evict is armed until usage falls back to the low watermark.
 func TestSweepLocalBlobs_WarnsOncePerOverBudgetEpisode(t *testing.T) {
@@ -888,7 +552,7 @@ func TestSweepLocalBlobs_WarnsOncePerOverBudgetEpisode(t *testing.T) {
 
 // TestSweepLocalBlobs_LatchesResetAtTheLowWatermark: the once-per-episode
 // latches stay set while usage is under the budget but over the low
-// watermark, where a forced pass leaves it, and reset at the low watermark.
+// watermark, and reset at the low watermark.
 func TestSweepLocalBlobs_LatchesResetAtTheLowWatermark(t *testing.T) {
 	b, _ := newSweepBackend(t, func(d *Deps) { d.LocalBlobMaxBytes = 1 })
 	if _, _, err := b.spool.WriteBlob(t.Context(), bytes.NewReader(bytes.Repeat([]byte("u"), 1000))); err != nil {
@@ -911,119 +575,22 @@ func TestSweepLocalBlobs_LatchesResetAtTheLowWatermark(t *testing.T) {
 	}
 }
 
-// TestSweepLocalBlobs_ForcedPassWarnsWhenNothingIsLeft: the forced pass
-// runs out of rows with usage still over budget, having evicted nothing (the
-// one row's file was already gone): it warns that nothing is left to evict,
-// but not that it evicted inside the windows.
-func TestSweepLocalBlobs_ForcedPassWarnsWhenNothingIsLeft(t *testing.T) {
-	core, logs := observer.New(zap.WarnLevel)
-	b, _ := newSweepBackend(t, func(d *Deps) {
-		d.CacheMinResidency = time.Hour
-		d.Logger = zap.New(core)
-	})
+// TestSweepLocalBlobs_TimeLimit: a scan cut off by the budget pass's own time
+// limit is the time limit, not a failure: the pass says so once and leaves the
+// rest to the next sweep.
+func TestSweepLocalBlobs_TimeLimit(t *testing.T) {
+	core, logs := observer.New(zap.InfoLevel)
+	b, _ := newSweepBackend(t, func(d *Deps) { d.Logger = zap.New(core) })
 	digests := putSweepObjects(t, b, 1)
-	if err := os.Remove(localPath(b, digests[0])); err != nil {
-		t.Fatal(err)
-	}
 	b.localBlobMaxBytes = 1
-	var calls int
-	b.intents = countingEvictable{IntentStore: b.intents, calls: &calls}
+	defer func(d time.Duration) { budgetPassTimeLimit = d }(budgetPassTimeLimit)
+	budgetPassTimeLimit = 0
 
-	stats := sweepLocalBlobs(t, b)
+	sweepLocalBlobs(t, b)
 
-	type sweep struct {
-		Calls               int
-		Forced              int64
-		Warned              bool
-		NothingLeft, Inside int
-	}
-	got := sweep{calls, stats.ForcedFiles, b.overBudgetWarned, logs.FilterMessageSnippet("nothing left to evict").Len(), logs.FilterMessageSnippet("inside the retention windows").Len()}
-	// The budget pass stops at the young row; the forced pass marks it and
-	// reads an empty page.
-	if want := (sweep{3, 0, true, 1, 0}); got != want {
-		t.Fatalf("sweep = %+v, want %+v", got, want)
-	}
-}
-
-// TestSweepLocalBlobs_TimeLimitLeavesTheWindowsAlone: a query cut off by a
-// pass's own time limit is the time limit, not a failure. A budget pass that
-// only ran out of time does not hand over to the forced pass; the next sweep
-// continues outside the windows. A forced pass that runs out of time says so.
-func TestSweepLocalBlobs_TimeLimitLeavesTheWindowsAlone(t *testing.T) {
-	cases := []struct {
-		name     string
-		failCall int
-		wantLog  string
-		calls    int
-	}{
-		{"budget pass", 1, "budget pass reached its time limit", 1},
-		{"forced pass", 2, "forced pass reached its time limit", 2},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			core, logs := observer.New(zap.InfoLevel)
-			b, mem := newSweepBackend(t, func(d *Deps) {
-				d.CacheMinResidency = time.Hour
-				d.Logger = zap.New(core)
-			})
-			digests := putSweepObjects(t, b, 1)
-			b.localBlobMaxBytes = 1
-			var calls int
-			b.intents = timingOutEvictable{IntentStore: b.intents, calls: &calls, failCall: tc.failCall}
-
-			stats := sweepLocalBlobs(t, b)
-
-			type sweep struct {
-				Calls, Logged int
-				Forced        int64
-				Latched       bool
-				Blobs         []blobState
-			}
-			got := sweep{calls, logs.FilterMessageSnippet(tc.wantLog).Len(), stats.ForcedFiles, b.timeLimitLogged, blobStates(t, b, mem, digests)}
-			want := sweep{tc.calls, 1, 0, true, []blobState{{true, false}}}
-			if !reflect.DeepEqual(got, want) {
-				t.Fatalf("sweep = %+v, want %+v", got, want)
-			}
-		})
-	}
-}
-
-// timingOutEvictable fails the failCall'th ListEvictable call as a pass's
-// own time limit would.
-type timingOutEvictable struct {
-	registry.IntentStore
-	calls    *int
-	failCall int
-}
-
-func (f timingOutEvictable) ListEvictable(ctx context.Context, cursor registry.EvictCursor, limit int) ([]registry.UploadIntent, error) {
-	*f.calls++
-	if *f.calls == f.failCall {
-		return nil, context.DeadlineExceeded
-	}
-	return f.IntentStore.ListEvictable(ctx, cursor, limit)
-}
-
-// TestSweepLocalBlobs_ForcedPassRunsOneStageWithoutAReadWindow: with no read
-// window, the forced pass's stages are the same, so after the residency stop
-// it runs only the first.
-func TestSweepLocalBlobs_ForcedPassRunsOneStageWithoutAReadWindow(t *testing.T) {
-	b, mem := newSweepBackend(t, func(d *Deps) { d.CacheMinResidency = time.Hour })
-	digests := putSweepObjects(t, b, 1)
-	if _, _, err := b.spool.WriteBlob(t.Context(), bytes.NewReader([]byte("unevictable"))); err != nil {
-		t.Fatalf("WriteBlob: %v", err)
-	}
-	b.localBlobMaxBytes = 1
-	var calls int
-	b.intents = countingEvictable{IntentStore: b.intents, calls: &calls}
-
-	stats := sweepLocalBlobs(t, b)
-
-	// The budget pass stops at the young row on its first page; the forced
-	// pass's first stage evicts it and reads one empty page.
-	want := []blobState{{false, true}}
-	if states := blobStates(t, b, mem, digests); calls != 3 || stats.ForcedFiles != 1 || !reflect.DeepEqual(states, want) {
-		t.Fatalf("ListEvictable calls = %d, forced %d, blobs %+v; want 3, 1, %+v", calls, stats.ForcedFiles, states, want)
+	got := fmt.Sprint(onDisk(t, b, digests), logs.FilterMessageSnippet("budget pass reached its time limit").Len(), b.timeLimitLogged)
+	if want := fmt.Sprint([]bool{true}, 1, true); got != want {
+		t.Fatalf("[on disk] [logs] [latched] = %s, want %s", got, want)
 	}
 }
 
@@ -1186,226 +753,5 @@ func TestSweepLocalBlobs_OrphanPassChecksInBatches(t *testing.T) {
 				t.Fatalf("orphans removed = %d (stats %d), want %d", removed, stats.OrphanFiles, want)
 			}
 		})
-	}
-}
-
-// TestSweepLocalBlobs_ForcedPassEvictsReadBlobsLast: with every blob read
-// recently and nothing in the residency window, the budget pass runs out of
-// candidates, and the forced pass goes straight to its last stage, evicting
-// the oldest.
-func TestSweepLocalBlobs_ForcedPassEvictsReadBlobsLast(t *testing.T) {
-	b, mem := newSweepBackend(t, func(d *Deps) { d.CacheReadRetention = time.Hour })
-	digests := putSweepObjects(t, b, 4)
-	for i := range digests {
-		bucket, key := sweepBucket, fmt.Sprintf("obj-%d", i)
-		got, err := b.GetObject(t.Context(), &s3.GetObjectInput{Bucket: &bucket, Key: &key})
-		if err != nil {
-			t.Fatalf("GetObject %s: %v", key, err)
-		}
-		_, _ = io.Copy(io.Discard, got.Body)
-		got.Body.Close()
-	}
-	budgetToEvict(b, 1, blobSize(t, b, digests[0]))
-	var calls int
-	b.intents = countingEvictable{IntentStore: b.intents, calls: &calls}
-
-	stats := sweepLocalBlobs(t, b)
-
-	// The budget pass reads a page of skipped rows and an empty one; the
-	// last stage, run directly, one page.
-	if calls != 3 {
-		t.Fatalf("ListEvictable calls = %d, want 3: the forced pass should skip its first stage", calls)
-	}
-
-	want := []blobState{{false, true}, {true, false}, {true, false}, {true, false}}
-	if states := blobStates(t, b, mem, digests); !reflect.DeepEqual(states, want) || stats.BudgetFiles != 0 || stats.ForcedFiles != 1 {
-		t.Fatalf("blobs after the sweep = %+v (budget %d, forced %d), want %+v (budget 0, forced 1)", states, stats.BudgetFiles, stats.ForcedFiles, want)
-	}
-}
-
-// TestSweepLocalBlobs_ForcedPassWarnsAtMostHourly: consecutive sweeps that
-// each evict inside the windows warn once.
-func TestSweepLocalBlobs_ForcedPassWarnsAtMostHourly(t *testing.T) {
-	core, logs := observer.New(zap.WarnLevel)
-	b, _ := newSweepBackend(t, func(d *Deps) {
-		d.CacheMinResidency = time.Hour
-		d.Logger = zap.New(core)
-	})
-	digests := putSweepObjects(t, b, 4)
-	size := blobSize(t, b, digests[0])
-	var forced int64
-	for range 2 {
-		budgetToEvict(b, 1, size)
-		forced += sweepLocalBlobs(t, b).ForcedFiles
-	}
-	warnings := logs.FilterMessageSnippet("inside the retention windows").Len()
-	if forced != 2 || warnings != 1 {
-		t.Fatalf("over two forced sweeps: %d forced removals, %d warnings; want 2 and 1", forced, warnings)
-	}
-}
-
-// TestSweepLocalBlobs_ForcedPassEscalates: every blob is young and recently
-// read, so the budget pass stops at the residency window, the forced pass's
-// first stage passes over every blob as recently read, and its last stage
-// evicts the oldest.
-func TestSweepLocalBlobs_ForcedPassEscalates(t *testing.T) {
-	b, mem := newSweepBackend(t, func(d *Deps) {
-		d.CacheMinResidency = time.Hour
-		d.CacheReadRetention = time.Hour
-	})
-	digests := putSweepObjects(t, b, 4)
-	for i := range digests {
-		bucket, key := sweepBucket, fmt.Sprintf("obj-%d", i)
-		got, err := b.GetObject(t.Context(), &s3.GetObjectInput{Bucket: &bucket, Key: &key})
-		if err != nil {
-			t.Fatalf("GetObject %s: %v", key, err)
-		}
-		_, _ = io.Copy(io.Discard, got.Body)
-		got.Body.Close()
-	}
-	budgetToEvict(b, 1, blobSize(t, b, digests[0]))
-
-	stats := sweepLocalBlobs(t, b)
-
-	want := []blobState{{false, true}, {true, false}, {true, false}, {true, false}}
-	if states := blobStates(t, b, mem, digests); !reflect.DeepEqual(states, want) || stats.BudgetFiles != 0 || stats.ForcedFiles != 1 {
-		t.Fatalf("blobs after the sweep = %+v (budget %d, forced %d), want %+v (budget 0, forced 1)", states, stats.BudgetFiles, stats.ForcedFiles, want)
-	}
-}
-
-// TestSweepLocalBlobs_ForcedPassStopsAtTheBudget: forced eviction goes only
-// down to the budget, not to the low watermark the budget pass aims for.
-func TestSweepLocalBlobs_ForcedPassStopsAtTheBudget(t *testing.T) {
-	b, _ := newSweepBackend(t, func(d *Deps) { d.CacheMinResidency = time.Hour })
-	digests := putSweepObjects(t, b, 20)
-	size := blobSize(t, b, digests[0])
-	// 3.5 blobs over: 4 evictions reach the budget; the low watermark, at
-	// 90% of it, would need 6.
-	b.localBlobMaxBytes = b.localUsage() - 7*size/2
-
-	stats := sweepLocalBlobs(t, b)
-
-	if stats.ForcedFiles != 4 || b.localUsage() > b.localBlobMaxBytes {
-		t.Fatalf("forced pass evicted %d blobs, usage %d against a budget of %d; want 4 and at most the budget", stats.ForcedFiles, b.localUsage(), b.localBlobMaxBytes)
-	}
-}
-
-// TestSweepLocalBlobs_NoForcedPassWhenNothingWasSkipped: a budget pass that
-// ran out of rows without passing over any recently read one is not followed
-// by a forced pass, which would only repeat it.
-func TestSweepLocalBlobs_NoForcedPassWhenNothingWasSkipped(t *testing.T) {
-	ctx := t.Context()
-	b, _ := newSweepBackend(t, func(d *Deps) {
-		d.LocalBlobMaxBytes = 1
-		d.CacheReadRetention = time.Hour
-	})
-	if _, _, err := b.spool.WriteBlob(ctx, bytes.NewReader([]byte("unevictable"))); err != nil {
-		t.Fatalf("WriteBlob: %v", err)
-	}
-	var calls int
-	b.intents = countingEvictable{IntentStore: b.intents, calls: &calls}
-
-	sweepLocalBlobs(t, b)
-
-	if calls != 1 || !b.overBudgetWarned {
-		t.Fatalf("ListEvictable calls = %d, warned %v; want 1 (the budget pass only) and a warning", calls, b.overBudgetWarned)
-	}
-}
-
-// countingEvictable counts ListEvictable calls.
-type countingEvictable struct {
-	registry.IntentStore
-	calls *int
-}
-
-func (c countingEvictable) ListEvictable(ctx context.Context, cursor registry.EvictCursor, limit int) ([]registry.UploadIntent, error) {
-	*c.calls++
-	return c.IntentStore.ListEvictable(ctx, cursor, limit)
-}
-
-// holdingEvictable takes a write's hold on every blob it lists, as a write
-// of the same bytes that spools them between the listing and the removal.
-type holdingEvictable struct {
-	registry.IntentStore
-	spool   *blockstore.Spool
-	unholds []func()
-}
-
-func (h *holdingEvictable) ListEvictable(ctx context.Context, cursor registry.EvictCursor, limit int) ([]registry.UploadIntent, error) {
-	page, err := h.IntentStore.ListEvictable(ctx, cursor, limit)
-	for _, in := range page {
-		h.unholds = append(h.unholds, h.spool.Hold(in.Space, in.Digest))
-	}
-	return page, err
-}
-
-// TestSweepLocalBlobs_LeavesAHeldBlobUnmarked: a write of the same bytes
-// that takes the file between the listing and the removal keeps it, and the
-// row is not marked evicted, since the file is not gone; the pass counts it
-// as skipped and moves on.
-func TestSweepLocalBlobs_LeavesAHeldBlobUnmarked(t *testing.T) {
-	var held *holdingEvictable
-	b, mem := newSweepBackend(t, func(d *Deps) {
-		held = &holdingEvictable{IntentStore: d.Intents, spool: d.Spool}
-		d.Intents = held
-	})
-	digests := putSweepObjects(t, b, 1)
-	budgetToEvict(b, 1, blobSize(t, b, digests[0]))
-
-	stats := sweepLocalBlobs(t, b)
-	for _, unhold := range held.unholds {
-		unhold()
-	}
-
-	want := []blobState{{true, false}}
-	if got := blobStates(t, b, mem, digests); !reflect.DeepEqual(got, want) {
-		t.Fatalf("held blob after the sweep = %+v, want %+v", got, want)
-	}
-	if stats.BudgetFiles != 0 {
-		t.Fatalf("the sweep counted %d files removed, want 0", stats.BudgetFiles)
-	}
-}
-
-// respoolingEvictable puts a second space's intent for each digest it is
-// asked to mark, right before marking, as a write of the same bytes that
-// spools and commits them between the sweep's removal and its mark.
-type respoolingEvictable struct {
-	registry.IntentStore
-	mem   *inmem.MemStore
-	space did.DID
-}
-
-func (r *respoolingEvictable) MarkEvicted(ctx context.Context, digest multihash.Multihash, notAfter time.Time) error {
-	if err := r.mem.PutIntent(ctx, registry.UploadIntent{Space: r.space, Digest: digest, LocalPath: "/spool/again", Size: 1, State: registry.IntentAccepted}); err != nil {
-		return err
-	}
-	if err := r.mem.PutLocation(ctx, registry.BlobLocation{Space: r.space, Digest: digest, Provider: "did:key:p", URL: "http://p/blob", Size: 1}); err != nil {
-		return err
-	}
-	return r.IntentStore.MarkEvicted(ctx, digest, notAfter)
-}
-
-// TestSweepLocalBlobs_MarkLeavesAnIntentPutSinceTheListing: a write that
-// spools the same bytes again and commits its intent between the sweep's
-// removal and its mark keeps its mark clear, so its file is still the
-// sweep's to evict later.
-func TestSweepLocalBlobs_MarkLeavesAnIntentPutSinceTheListing(t *testing.T) {
-	ctx := t.Context()
-	var again *respoolingEvictable
-	b, mem := newSweepBackend(t, func(d *Deps) {
-		again = &respoolingEvictable{IntentStore: d.Intents, mem: d.Intents.(*inmem.MemStore), space: testutil.RandomDID(t)}
-		d.Intents = again
-	})
-	digests := putSweepObjects(t, b, 1)
-	budgetToEvict(b, 1, blobSize(t, b, digests[0]))
-
-	sweepLocalBlobs(t, b)
-
-	rows, err := mem.ListEvictable(ctx, registry.EvictCursor{}, 10)
-	if err != nil {
-		t.Fatalf("ListEvictable: %v", err)
-	}
-	if len(rows) != 1 || rows[0].Space != again.space {
-		t.Fatalf("evictable after the sweep = %+v, want only the intent put since the listing", rows)
 	}
 }

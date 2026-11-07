@@ -16,12 +16,12 @@ const meterName = "github.com/fil-forge/ingot/s3frontend"
 // Why a local blob file was removed: the reason attribute on the removal
 // counters.
 const (
-	removedReleased     = "released"      // its object was deleted or its upload abandoned
-	removedParked       = "parked"        // a multipart part parked on its provider
-	removedAccepted     = "accepted"      // its provider accepted it, with written bodies not cached
-	removedBudget       = "budget"        // the budget pass evicted it
-	removedBudgetForced = "budget_forced" // the forced pass evicted it inside a retention window
-	removedOrphan       = "orphan"        // the orphan pass found no intent for it
+	removedReleased = "released" // its object was deleted or its upload abandoned
+	removedParked   = "parked"   // a multipart part parked on its provider
+	removedAccepted = "accepted" // its provider accepted it, with written bodies not cached
+	removedBudget   = "budget"   // the budget pass evicted it
+	removedExpired  = "expired"  // its time in the cache ran out
+	removedOrphan   = "orphan"   // the orphan pass found no intent for it
 )
 
 // localBlobMetrics counts the files removed from local blob storage (the

@@ -9,8 +9,19 @@
 -- transaction, so the outbox they went through before is gone.
 DROP TABLE ingot.upload_registrations;
 
+-- A cached blob's lifetime is a pending queue-shard.evict task, and the budget
+-- pass evicts from the cache directory itself, so intents no longer record
+-- eviction.
+DROP INDEX ingot.upload_intents_evictable_idx;
+ALTER TABLE ingot.upload_intents DROP COLUMN evicted_at;
+
 -- +goose Down
 -- In reverse order of the Up statements.
+ALTER TABLE ingot.upload_intents ADD COLUMN evicted_at timestamptz;
+CREATE INDEX upload_intents_evictable_idx
+    ON ingot.upload_intents (updated_at, digest, space)
+    WHERE evicted_at IS NULL AND state IN ('parked', 'accepted', 'published');
+
 CREATE TABLE ingot.upload_registrations (
     seq         bigserial PRIMARY KEY,
     bucket      text        NOT NULL,

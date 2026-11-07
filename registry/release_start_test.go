@@ -69,7 +69,7 @@ func runReleaseStartSuite(t *testing.T, st releaseStartStore) {
 	}
 	enqueue := func(name string) multihash.Multihash {
 		t.Helper()
-		d := evictDigest(t, "start:"+name)
+		d := intentDigest(t, "start:"+name)
 		if err := st.EnqueueRelease(ctx, space, d, time.Now()); err != nil {
 			t.Fatalf("EnqueueRelease: %v", err)
 		}
@@ -91,14 +91,14 @@ func runReleaseStartSuite(t *testing.T, st releaseStartStore) {
 	}
 
 	t.Run("no record is cancelled", func(t *testing.T) {
-		got, err := st.StartRelease(ctx, space, evictDigest(t, "start:none"))
+		got, err := st.StartRelease(ctx, space, intentDigest(t, "start:none"))
 		if err != nil || got != registry.ReleaseCancelled {
 			t.Fatalf("StartRelease = %v, %v; want ReleaseCancelled", got, err)
 		}
 	})
 
 	t.Run("a record reads back as it stands", func(t *testing.T) {
-		if _, err := st.GetRelease(ctx, space, evictDigest(t, "start:unrecorded")); !errors.Is(err, registry.ErrNotFound) {
+		if _, err := st.GetRelease(ctx, space, intentDigest(t, "start:unrecorded")); !errors.Is(err, registry.ErrNotFound) {
 			t.Fatalf("GetRelease of no record err = %v, want ErrNotFound", err)
 		}
 		d := enqueue("read-back")
@@ -211,7 +211,7 @@ func runReleaseStartSuite(t *testing.T, st releaseStartStore) {
 	})
 
 	t.Run("a write cancels a pending record and waits out a started one", func(t *testing.T) {
-		got, err := st.CancelRelease(ctx, space, evictDigest(t, "start:absent"))
+		got, err := st.CancelRelease(ctx, space, intentDigest(t, "start:absent"))
 		if err != nil || got != registry.ReleaseNone {
 			t.Fatalf("CancelRelease(absent) = %v, %v; want ReleaseNone", got, err)
 		}
@@ -240,7 +240,7 @@ func runReleaseStartSuite(t *testing.T, st releaseStartStore) {
 		// A committed body blob is located by its commit; a claim with no
 		// location is one whose blob a release removed since the write
 		// settled it.
-		d := evictDigest(t, "start:unlocated")
+		d := intentDigest(t, "start:unlocated")
 		c := registry.BlobClaim{Digest: d, Bucket: "bk", ObjectKey: "k", VersionID: "v", Space: space}
 		if err := claim(t, st, c); !errors.Is(err, registry.ErrReleaseInProgress) {
 			t.Fatalf("claim with no location err = %v, want ErrReleaseInProgress", err)
@@ -274,7 +274,7 @@ func runReleaseStartSuite(t *testing.T, st releaseStartStore) {
 	})
 
 	t.Run("a generation's claims land together or not at all", func(t *testing.T) {
-		free := evictDigest(t, "start:free")
+		free := intentDigest(t, "start:free")
 		going := enqueue("claims-going")
 		locate(space, free)
 		locate(space, going)
@@ -323,7 +323,7 @@ func runReleaseStartSuite(t *testing.T, st releaseStartStore) {
 		if s, err := st.StartRelease(ctx, space, running); err != nil || s != registry.ReleaseStarted {
 			t.Fatalf("StartRelease = %v, %v", s, err)
 		}
-		none := evictDigest(t, "start:releasing-none")
+		none := intentDigest(t, "start:releasing-none")
 		got, err := st.ReleasingDigests(ctx, space, []multihash.Multihash{pending, running, none})
 		if err != nil {
 			t.Fatalf("ReleasingDigests: %v", err)
@@ -345,8 +345,8 @@ func runReleaseStartSuite(t *testing.T, st releaseStartStore) {
 	})
 
 	t.Run("a generation's claims need every location, publish the intents, and repeat digests", func(t *testing.T) {
-		located := evictDigest(t, "start:batch-located")
-		unlocated := evictDigest(t, "start:batch-unlocated")
+		located := intentDigest(t, "start:batch-located")
+		unlocated := intentDigest(t, "start:batch-unlocated")
 		locate(space, located)
 		for _, d := range []multihash.Multihash{located, unlocated} {
 			if err := st.PutIntent(ctx, registry.UploadIntent{Space: space, Digest: d, LocalPath: "/spool/x", Size: 7, State: registry.IntentAccepted}); err != nil {

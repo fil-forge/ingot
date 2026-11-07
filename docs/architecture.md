@@ -291,17 +291,17 @@ digest must be known before `allocate`, and because that local copy does double 
   a cache retains *recently read* data, so the two may use distinct eviction policies over a shared,
   bounded, size-configurable store. *(Built as two directories, a spool for writes and bodies
   awaiting upload and a cache for copies the provider holds, under one byte budget,
-  `local_blob_max_bytes`, evicting blobs the provider holds, oldest first, with a read-after-write
-  window, `cache_min_residency`, and a read-recency window, `cache_read_retention`; network reads
-  do not fill the cache yet; see §12.)* The
+  `local_blob_max_bytes`; each cached copy has a time to live, `cache_ttl`, renewed by reads and
+  kept as a `queue-shard.evict` task, and over the budget the least recently renewed copies go
+  first; network reads do not fill the cache yet; see §12.)* The
   alternative — a near-stateless Ingot that resolves every read through the indexer — trades
   latency for simpler horizontal scaling; it is a supported mode, but the read-after-write floor
   holds regardless.
 
 The `upload_intents` table records each blob Ingot has spooled, from ingest until its release:
 `(space, digest) → { local_path, size, state: spooled│uploading│parked│accepted│published, owner
-ref, evicted_at }`. It records how far each blob got for each space, which uploads, releases and
-eviction act on; local reads go by the files themselves. A blob stored as received has the digest
+ref }`. It records how far each blob got for each space, which uploads and releases act on; local
+reads and the cache's eviction go by the files themselves. A blob stored as received has the digest
 of its bytes, so two spaces can hold one digest: one spool file, an intent per space, and the file
 stays while any space's intent may still read it. The Postgres schema for this and every other Ingot table is in **[Appendix C](#appendix-c--postgres-schema-the-ingot-schema)**.
 
@@ -782,9 +782,8 @@ CREATE INDEX blob_refs_claim_idx ON ingot.blob_refs (space, digest);
 
 -- The local-store index (§5): every blob Ingot has spooled, per space. state
 -- advances spooled → uploading → (parked →) accepted → published; published
--- is written with the first reference claim. Eviction removes the local copy
--- and sets evicted_at on every intent for the digest, leaving the rows and
--- their states.
+-- is written with the first reference claim. Evicting the cached copy leaves
+-- the rows and their states.
 CREATE TABLE ingot.upload_intents (
     space       text   NOT NULL,                         -- the upload's space
     digest      bytea  NOT NULL,                         -- sha256 multihash of the blob
@@ -795,7 +794,6 @@ CREATE TABLE ingot.upload_intents (
     bucket      text,                                    -- owner ref (originating op), for cleanup
     created_at  timestamptz NOT NULL DEFAULT now(),
     updated_at  timestamptz NOT NULL DEFAULT now(),      -- last state change
-    evicted_at  timestamptz,                             -- NULL: file on disk
     PRIMARY KEY (space, digest)
 );
 
@@ -1081,12 +1079,12 @@ paths below are exercised against the real stack by the smelt-based `itest/` har
   [§7.4](#74-read-getobject) / [§8](#8-retrieval-addressing-when-bodies-need-a-sharded-dag-index).
   **Local blob storage is split by role and bounded by a byte budget.** A body is written to the
   spool (`<data_dir>/spool`) and moves to the cache (`<data_dir>/cache`) once the provider holds it.
-  With `local_blob_max_bytes` set (`SweepLocalBlobs`), every 30s the sweeper evicts blobs the
-  provider holds (a location or park row), oldest first, down to 90% of the budget, honouring a
-  read-after-write window (`cache_min_residency`) and a read-recency window (`cache_read_retention`)
-  unless usage stays over budget, in which case it evicts inside them, only down to the budget;
-  hourly it deletes orphan files. Once at startup, `serve` deletes the copies of committed blobs
-  whose release finished while releases kept them. The budget is off by default. A release frees a
+  A cached copy stays for `cache_ttl` after it was cached or last read: a `queue-shard.cache`
+  task moves it in and schedules a `queue-shard.evict` for when the time runs out, and a read
+  with less than half left schedules a later one in its place. With `local_blob_max_bytes` set
+  (`SweepLocalBlobs`), every 30s the sweeper also evicts cached copies, the least recently
+  renewed first, down to 90% of the budget; hourly it deletes orphan files. The budget is off by
+  default. A release frees a
   deleted object's local copies, and a parked part's copy goes once it parks. Local blob storage
   reports its usage by directory, budget, stalled uploads, removals by reason and reads by tier as
   OpenTelemetry metrics (`ingot.local_blobs.*`). With `cache_writes: false`, a body's copy goes as

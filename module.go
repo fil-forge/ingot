@@ -72,6 +72,7 @@ import (
 	"github.com/fil-forge/ingot/regionkey"
 	"github.com/fil-forge/ingot/registry"
 	"github.com/fil-forge/ingot/revocation"
+	"github.com/fil-forge/ingot/s3frontend"
 	"github.com/fil-forge/ingot/taskrunner"
 	"github.com/fil-forge/ingot/tenantkey"
 	"github.com/fil-forge/ingot/tokenstore"
@@ -527,14 +528,25 @@ const taskSchema = "ingot"
 // instance sends at once.
 const uploadRegistrationWorkers = 4
 
+// shardWorkers is how many cached blobs' moves and evictions one instance
+// runs at once. Each is a rename or an unlink.
+const shardWorkers = 4
+
 // provideTaskRunner builds the runner for ingot's durable task queues, over
 // the host's pool. The backend registers its handlers (Server.New); the
 // migration hook creates its tables and the server starts and stops it.
-func provideTaskRunner(pool *pgxpool.Pool, logger *zap.Logger) (*taskrunner.Runner, error) {
+//
+// The runner's node, which tasks on this instance's local disk are placed on,
+// is the agent's DID. That names the S3 endpoint rather than the instance, and
+// each endpoint has one instance today; a second instance behind the same
+// endpoint needs a name of its own.
+func provideTaskRunner(pool *pgxpool.Pool, id identity.Identity, logger *zap.Logger) (*taskrunner.Runner, error) {
 	return taskrunner.New(pool, taskrunner.Options{
 		Schema: taskSchema,
+		Node:   id.DID().String(),
 		Queues: []taskrunner.QueueOptions{
 			{Name: registry.UploadQueue, Workers: uploadRegistrationWorkers},
+			{Name: s3frontend.ShardQueue, Workers: shardWorkers},
 		},
 		Logger: logger.Named("tasks"),
 	})
