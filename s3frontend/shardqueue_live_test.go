@@ -80,13 +80,14 @@ func (f *shardFixture) read(t *testing.T, d multihash.Multihash) {
 	require.NoError(t, rc.Close())
 }
 
-// tasks counts the digest's queue-shard tasks of action in state.
-func (f *shardFixture) tasks(t *testing.T, d multihash.Multihash, action, state string) int {
+// tasks counts the digest's queue-shard tasks of action in any of states, in
+// one query, so a task that finishes meanwhile is counted once either way.
+func (f *shardFixture) tasks(t *testing.T, d multihash.Multihash, action string, states ...string) int {
 	t.Helper()
 	var n int
 	require.NoError(t, f.env.DB.QueryRow(t.Context(),
-		`SELECT count(*) FROM `+f.env.Table("queue_shard_tasks")+` WHERE subject = $1 AND action = $2 AND state = $3`,
-		hex.EncodeToString(d), action, state).Scan(&n))
+		`SELECT count(*) FROM `+f.env.Table("queue_shard_tasks")+` WHERE subject = $1 AND action = $2 AND state = ANY($3)`,
+		hex.EncodeToString(d), action, states).Scan(&n))
 	return n
 }
 
@@ -151,7 +152,7 @@ func TestReadEarlyInTheTTLWritesNothing_Live(t *testing.T) {
 	f.read(t, d)
 	f.read(t, d)
 
-	require.Equal(t, 1, f.tasks(t, d, shardCache, "succeeded")+f.tasks(t, d, shardCache, "pending"), "only the move")
+	require.Equal(t, 1, f.tasks(t, d, shardCache, "succeeded", "pending"), "only the move")
 }
 
 // Concurrent reads of a blob due for renewal queue one renewal between them.
@@ -172,7 +173,7 @@ func TestConcurrentReadsRenewOnce_Live(t *testing.T) {
 	}
 	wg.Wait()
 
-	require.Equal(t, 2, f.tasks(t, d, shardCache, "succeeded")+f.tasks(t, d, shardCache, "pending"), "the move and one renewal")
+	require.Equal(t, 2, f.tasks(t, d, shardCache, "succeeded", "pending"), "the move and one renewal")
 }
 
 // A blob nothing caches schedules no eviction: a renewal for a copy already
