@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/fil-forge/ingot/taskrunner"
 	"slices"
 	"strings"
 	"time"
@@ -16,6 +15,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/multiformats/go-multihash"
+
+	"github.com/fil-forge/ingot/taskrunner"
 )
 
 // Compile-time assertions: *Postgres satisfies every store interface.
