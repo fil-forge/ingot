@@ -762,7 +762,7 @@ CREATE TABLE ingot.buckets (
     root_cid           bytea,                            -- committed MST root (locally durable)
     forge_root_cid     bytea,                            -- MST root durable on Forge (lags root_cid)
     created_at         timestamptz NOT NULL DEFAULT now(),
-    space              text NOT NULL,                    -- Forge space DID (minted by Hilt)
+    space              text NOT NULL,                    -- Forge space DID (minted by Hilt, one per bucket)
     tenant             text NOT NULL CHECK (tenant <> ''), -- owning tenant DID; copy paths refuse a foreign source
     versioning         text NOT NULL DEFAULT 'unversioned'
                            CHECK (versioning IN ('unversioned','enabled','suspended')),
@@ -774,6 +774,10 @@ CREATE TABLE ingot.buckets (
                                                          -- default encryption; NULL = unconfigured (encrypts)
     closing            boolean NOT NULL DEFAULT false    -- set by DeleteBucket's queue-bucket.close (§7.3)
 );
+-- A bucket is its own space: the commits that drop a space's claims are one
+-- bucket's, which run one at a time, so a release queued only once no claim
+-- is left misses none.
+CREATE UNIQUE INDEX buckets_space_key ON ingot.buckets (space);
 
 -- The catalog log's segment lifecycle (owned by logstore; see logstore/README.md).
 -- seq is drawn from the shared ingot.segment_seq sequence. state holds only

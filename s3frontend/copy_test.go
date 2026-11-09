@@ -266,8 +266,9 @@ func (h *hookCommitCapture) CaptureAuthority(ctx context.Context, space did.DID,
 	return h.UploadRegistrar.CaptureAuthority(ctx, space, cmd)
 }
 
-// TestCopyObject_PinnedSourceDeletedBeforeCommitKeepsItsBlobs: a same-space
-// copy takes a reference to each of the source's blobs before its commit. If
+// TestCopyObject_PinnedSourceDeletedBeforeCommitKeepsItsBlobs: a copy within
+// its bucket, so its space, takes a reference to each of the source's blobs
+// before its commit. If
 // the source is deleted and its blobs' release runs after that and before the
 // commit, the release finds the copy's references and does nothing, and the
 // copy commits over blobs its provider still holds.
@@ -282,10 +283,8 @@ func TestCopyObject_PinnedSourceDeletedBeforeCommitKeepsItsBlobs(t *testing.T) {
 	})
 	ctx := context.Background()
 	space, tenant := testutil.RandomDID(t), testutil.RandomDID(t)
-	for _, name := range []string{"src", "dst"} {
-		if err := mem.Create(ctx, name, space, registry.CreateState{Tenant: tenant}); err != nil {
-			t.Fatal(err)
-		}
+	if err := mem.Create(ctx, "src", space, registry.CreateState{Tenant: tenant}); err != nil {
+		t.Fatal(err)
 	}
 	srcBucket, srcKey := "src", "obj"
 	body := []byte("pin me")
@@ -304,7 +303,7 @@ func TestCopyObject_PinnedSourceDeletedBeforeCommitKeepsItsBlobs(t *testing.T) {
 		}
 		drainReleases(t, b)
 	}
-	dstBucket, dstKey, source := "dst", "copied", "src/obj"
+	dstBucket, dstKey, source := "src", "copied", "src/obj"
 	if _, err := b.CopyObject(ctx, s3response.CopyObjectInput{Bucket: &dstBucket, Key: &dstKey, CopySource: &source}); err != nil {
 		t.Fatalf("copy whose source was deleted before its commit: %v", err)
 	}
@@ -319,7 +318,7 @@ func TestCopyObject_PinnedSourceDeletedBeforeCommitKeepsItsBlobs(t *testing.T) {
 			t.Fatalf("claims on blob %x = %d, want the copy's", d, n)
 		}
 	}
-	if got := getFrom(t, b, "dst", "copied"); !bytes.Equal(got, body) {
+	if got := getFrom(t, b, "src", "copied"); !bytes.Equal(got, body) {
 		t.Fatalf("the copy does not read back")
 	}
 }
