@@ -20,7 +20,7 @@ build:
 ## test: run the test suite, starting Postgres and OpenBao in Docker unless
 ## INGOT_TEST_DSN and INGOT_TEST_BAO_ADDR name running ones. ARGS go to go test.
 test:
-	scripts/test.sh $(ARGS)
+	GO="$(GO)" scripts/test.sh $(ARGS)
 
 ## itest: run the integration test suite (boots the Forge stack in Docker; ~20 min)
 itest:

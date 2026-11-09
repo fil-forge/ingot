@@ -18,11 +18,30 @@ trap cleanup EXIT
 # port prints the host port Docker mapped to the container's port $2.
 port() { docker port "$1" "$2/tcp" | head -n1 | sed 's/.*://'; }
 
+# await runs the command after $1 until it succeeds, failing if container $1
+# stops running or a minute passes first.
+await() {
+	local name=$1 deadline=$((SECONDS + 60))
+	shift
+	until "$@" >/dev/null 2>&1; do
+		if [[ "$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null)" != true ]]; then
+			echo "test: $name stopped before it was ready" >&2
+			docker logs "$name" >&2 2>&1 || true
+			exit 1
+		fi
+		if ((SECONDS >= deadline)); then
+			echo "test: $name was not ready within a minute" >&2
+			exit 1
+		fi
+		sleep 0.2
+	done
+}
+
 if [[ -z "${INGOT_TEST_DSN:-}" ]]; then
 	pg="ingot-test-pg-$$"
 	docker run -d --rm --name "$pg" -e POSTGRES_PASSWORD=pw -p 127.0.0.1::5432 postgres:17 >/dev/null
 	started+=("$pg")
-	until docker exec "$pg" pg_isready -U postgres -h 127.0.0.1 >/dev/null 2>&1; do sleep 0.2; done
+	await "$pg" docker exec "$pg" pg_isready -U postgres -h 127.0.0.1
 	export INGOT_TEST_DSN="postgres://postgres:pw@127.0.0.1:$(port "$pg" 5432)/postgres?sslmode=disable"
 fi
 
@@ -32,7 +51,7 @@ if [[ -z "${INGOT_TEST_BAO_ADDR:-}" ]]; then
 	started+=("$bao")
 	export INGOT_TEST_BAO_ADDR="http://127.0.0.1:$(port "$bao" 8200)"
 	export INGOT_TEST_BAO_TOKEN=root
-	until curl -fs "$INGOT_TEST_BAO_ADDR/v1/sys/health" >/dev/null 2>&1; do sleep 0.2; done
+	await "$bao" curl -fs "$INGOT_TEST_BAO_ADDR/v1/sys/health"
 fi
 
 if (($# == 0)); then
