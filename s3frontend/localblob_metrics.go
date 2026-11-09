@@ -76,7 +76,7 @@ func registerLocalBlobGauges(meter metric.Meter, b *Backend) (metric.Registratio
 		return nil, err
 	}
 	stalled, err := meter.Int64ObservableGauge("ingot.local_blobs.stalled_bytes", metric.WithUnit("By"),
-		metric.WithDescription("Bytes of bodies whose upload has stalled, by state: uploading (may have reached its provider) for over an hour; its provider expires the allocation within a day"))
+		metric.WithDescription("Bytes of bodies whose upload has stalled, by state: uploading (may have reached its provider) for over an hour; a provider expires an allocation never concluded within a day, and one accepted before a crash stays until reconciled"))
 	if err != nil {
 		return nil, err
 	}
