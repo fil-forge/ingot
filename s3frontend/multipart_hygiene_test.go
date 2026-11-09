@@ -2595,3 +2595,29 @@ func TestReplacedWhileParkingReleasesItsBlobs(t *testing.T) {
 		t.Fatalf("release records left behind: %v", pending)
 	}
 }
+
+// expiringPutPart is a multipart store whose PutPart finds a reference of the
+// part's already expired, as one past its deadline before the row lands does.
+type expiringPutPart struct {
+	registry.MultipartStore
+}
+
+func (expiringPutPart) PutPart(context.Context, registry.MultipartPart, *registry.PartTree, registry.ReleaseTask) ([]multihash.Multihash, error) {
+	return nil, registry.ErrReferenceExpired
+}
+
+// TestUploadPartWithAnExpiredReferenceIsSlowDown: a part whose reference
+// expired before its row was recorded is refused with SlowDown, which the
+// client retries, as an object write in the same case is.
+func TestUploadPartWithAnExpiredReferenceIsSlowDown(t *testing.T) {
+	b, _ := newDeferredBackend(t, &parkingUploader{}, func(d *Deps) {
+		d.Multipart = expiringPutPart{d.Multipart}
+	})
+	key := "expired-ref"
+	uploadID := mpCreate(t, b, key, "", "")
+	_, err := mpUploadPart(t, b, key, uploadID, 1, testBody(int(backend.MinPartSize)), nil)
+	var apiErr s3err.APIError
+	if !errors.As(err, &apiErr) || apiErr.Code != "SlowDown" {
+		t.Fatalf("UploadPart with an expired reference: %v, want SlowDown", err)
+	}
+}
