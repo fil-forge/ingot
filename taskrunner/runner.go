@@ -106,10 +106,12 @@ type QueueOptions struct {
 	// Zero runs none, leaving the queue's async tasks to other processes.
 	Workers int
 	// Retention is how long a task that succeeded, expired, was cancelled or
-	// was resubmitted is kept after it finished. Defaults to 24 hours.
+	// was resubmitted is kept after it finished. Defaults to 24 hours, and
+	// must not be negative.
 	Retention time.Duration
 	// FailedRetention is how long a failed task is kept after it failed, for
-	// inspection and replay. Zero keeps it until it is resubmitted.
+	// inspection and replay. Zero keeps it until it is resubmitted, and it
+	// must not be negative.
 	FailedRetention time.Duration
 }
 
@@ -313,6 +315,10 @@ func New(db DB, opts Options) (*Runner, error) {
 		}
 		if _, dup := r.byName[qo.Name]; dup {
 			return nil, fmt.Errorf("task runner: queue %q listed twice", qo.Name)
+		}
+		// A negative age would put the prune's cutoff in the future.
+		if qo.Retention < 0 || qo.FailedRetention < 0 {
+			return nil, fmt.Errorf("task runner: queue %q has a negative retention", qo.Name)
 		}
 		table := strings.ReplaceAll(qo.Name, "-", "_")
 		q := &queue{
