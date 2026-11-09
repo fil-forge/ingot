@@ -62,8 +62,8 @@ const (
 // open, and Complete requires every part it names to be 'accepted'.
 const (
 	// PartWritten: recorded, its blobs not yet all parked. A part left here
-	// is one whose request died mid-park, or one the acceptor found a blob
-	// of gone from its provider; Complete refuses it (InvalidPart) and the
+	// is one whose request died mid-park, or one with a blob the acceptor
+	// found gone from its provider; Complete refuses it (InvalidPart) and the
 	// client uploads it again.
 	PartWritten = "written"
 	// PartParked: every blob has a park (or a location), ready to conclude.
