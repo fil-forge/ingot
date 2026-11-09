@@ -60,8 +60,8 @@ func newTestStore(t testing.TB) *testStore {
 			{Name: registry.ReleaseQueue, Workers: 2},
 			{Name: ShardQueue, Workers: 2},
 			// No workers either: an upload's accept runs when a test runs it
-			// (runAccepts) or Complete does, which drains the one UploadPart
-			// queued.
+			// (runAccepts) or Complete does, which cancels the one UploadPart
+			// queued and runs its own.
 			{Name: registry.AcceptQueue},
 		},
 		LeaseTTL:     time.Second,

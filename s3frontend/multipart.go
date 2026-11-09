@@ -1251,8 +1251,10 @@ var acceptWaitBudget = 30 * time.Second
 // acceptRequested makes sure every part Complete names has its blobs
 // accepted on Forge. The upload's accept has been accepting parts while the
 // client uploaded them; Complete runs it once more for the parts it names,
-// as a sync task, which waits for one already running and runs after any
-// pending. Parts the upload holds and Complete omits are left out: they are
+// as a sync task. An accept the upload queued and that has not started is
+// cancelled first, since Complete's own concludes every part it names, so
+// Complete waits only for one already running. Parts the upload holds and
+// Complete omits are left out: they are
 // orphans of this completion. Then every named part must be accepted. One
 // with a blob released since the request validated it is no longer the part
 // the client named, and Complete answers InvalidPart; the client uploads it
@@ -1268,6 +1270,14 @@ func (b *Backend) acceptRequested(ctx context.Context, uploadID string, requeste
 	spec, err := registry.CompleteAcceptSpec(uploadID, numbers, time.Now().Add(acceptWaitBudget))
 	if err != nil {
 		return err
+	}
+	queued, err := b.accepts.Pending(ctx, registry.AcceptQueue, []string{uploadID}, registry.AcceptAction)
+	if err != nil {
+		return fmt.Errorf("s3frontend: find the upload's queued accept: %w", err)
+	}
+	// Cancel leaves one that has started, which Complete then waits for.
+	if err := b.accepts.Cancel(ctx, registry.AcceptQueue, queued[uploadID]...); err != nil {
+		return fmt.Errorf("s3frontend: cancel the upload's queued accept: %w", err)
 	}
 	if _, err := b.accepts.Run(ctx, spec); errors.Is(err, taskrunner.ErrExpired) {
 		b.multipartMetrics.completeDeferred.Add(ctx, 1)
