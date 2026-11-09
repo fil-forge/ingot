@@ -95,6 +95,19 @@ func (b *Backend) runBucket(ctx context.Context, space did.DID, action string, a
 	return err
 }
 
+// bucketOn returns bucket name's state when it still lives in the space
+// subject, the bucket task's subject. A bucket deleted and recreated under the
+// same name lives in another space, and is not the bucket a task queued for
+// the first was meant for: that is NoSuchBucket, so the task acts on no
+// bucket but its own while it holds its own space's lease.
+func (b *Backend) bucketOn(ctx context.Context, name, subject string) (*registry.State, error) {
+	st, err := b.reg.Get(ctx, name)
+	if errors.Is(err, registry.ErrNotFound) || (err == nil && st.Space.String() != subject) {
+		return nil, s3err.GetAPIError(s3err.ErrNoSuchBucket)
+	}
+	return st, err
+}
+
 // runCreateBucket is queue-bucket.create: it records the bucket, whose space
 // Hilt created for the request beforehand, with its empty root.
 func (b *Backend) runCreateBucket(ctx context.Context, _ *taskrunner.Exec, t taskrunner.Task) ([]byte, error) {
@@ -130,11 +143,8 @@ func (b *Backend) runSetVersioning(ctx context.Context, ex *taskrunner.Exec, t t
 	if err := args.UnmarshalCBOR(bytes.NewReader(t.Args)); err != nil {
 		return nil, taskrunner.Permanent(fmt.Errorf("decode set-versioning: %w", err))
 	}
-	st, err := b.reg.Get(ctx, args.Name)
+	st, err := b.bucketOn(ctx, args.Name, t.Subject)
 	if err != nil {
-		if errors.Is(err, registry.ErrNotFound) {
-			return nil, s3err.GetAPIError(s3err.ErrNoSuchBucket)
-		}
 		return nil, err
 	}
 	v := registry.VersioningState(args.State)
@@ -159,11 +169,8 @@ func (b *Backend) runSetLockConfig(ctx context.Context, ex *taskrunner.Exec, t t
 	if err := args.UnmarshalCBOR(bytes.NewReader(t.Args)); err != nil {
 		return nil, taskrunner.Permanent(fmt.Errorf("decode set-object-lock-config: %w", err))
 	}
-	st, err := b.reg.Get(ctx, args.Name)
+	st, err := b.bucketOn(ctx, args.Name, t.Subject)
 	if err != nil {
-		if errors.Is(err, registry.ErrNotFound) {
-			return nil, s3err.GetAPIError(s3err.ErrNoSuchBucket)
-		}
 		return nil, err
 	}
 	if st.Versioning != registry.VersioningEnabled {

@@ -310,11 +310,8 @@ func (b *Backend) runDeleteBucket(ctx context.Context, _ *taskrunner.Exec, t tas
 		return nil, taskrunner.Permanent(errors.New("s3frontend: delete bucket: its request has gone"))
 	}
 	return nil, func() error {
-		st, err := b.reg.Get(ctx, name)
+		st, err := b.bucketOn(ctx, name, t.Subject)
 		if err != nil {
-			if errors.Is(err, registry.ErrNotFound) {
-				return s3err.GetAPIError(s3err.ErrNoSuchBucket)
-			}
 			return err
 		}
 
