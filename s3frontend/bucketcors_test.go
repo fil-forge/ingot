@@ -174,7 +174,7 @@ func TestBucketCors_DoesNotSurviveTheBucket(t *testing.T) {
 	if err := b.PutBucketCors(ctx, "bk", []byte(corsDoc)); err != nil {
 		t.Fatalf("PutBucketCors: %v", err)
 	}
-	if err := mem.Delete(ctx, "bk"); err != nil {
+	if err := mem.Delete(ctx, "bk", mem.bk()); err != nil {
 		t.Fatalf("delete bucket: %v", err)
 	}
 	_, err := b.GetBucketCors(ctx, "bk")

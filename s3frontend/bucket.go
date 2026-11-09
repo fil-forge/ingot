@@ -467,7 +467,7 @@ func (b *Backend) runDeleteBucket(ctx context.Context, _ *taskrunner.Exec, t tas
 		// The space's object-count changes went out in the drain above; one
 		// that could not be sent stays in the queue as a failed task, which
 		// outlives the bucket as the record of the count it leaves wrong.
-		if err := b.reg.Delete(ctx, name); err != nil {
+		if err := b.reg.Delete(ctx, name, st.Space); err != nil {
 			if errors.Is(err, registry.ErrNotFound) {
 				return s3err.GetAPIError(s3err.ErrNoSuchBucket)
 			} else if errors.Is(err, registry.ErrNotEmpty) {
@@ -479,9 +479,7 @@ func (b *Backend) runDeleteBucket(ctx context.Context, _ *taskrunner.Exec, t tas
 		// The bucket's segment history dies with it. Best-effort: the
 		// bucket is already deleted, so a cleanup failure must not fail
 		// the API call.
-		if remover, ok := b.log.(interface {
-			RemoveBucketLog(ctx context.Context, bucket string) error
-		}); ok {
+		if remover, ok := b.log.(bucketLogRemover); ok {
 			if rerr := remover.RemoveBucketLog(ctx, name); rerr != nil {
 				b.logger.Warn("bucket log cleanup failed",
 					zap.String("bucket", name), zap.Error(rerr))

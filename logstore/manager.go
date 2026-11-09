@@ -363,7 +363,8 @@ func registeredDigests(r SegmentMeta) ([]multihash.Multihash, error) {
 // RemoveBucketLog deletes bucket's log entirely: closes its store (dropping
 // queued-but-unshipped segments — a deleted bucket's history has nowhere to
 // ship), unlinks its directory, and removes its segment rows, retired ones
-// included. Used by DeleteBucket after the registry row is gone.
+// included. Used by DeleteBucket after the registry row is gone, and by a
+// create, ahead of its row, to clear what a deleted bucket of the name left.
 func (m *Manager) RemoveBucketLog(ctx context.Context, bucket string) error {
 	if err := validBucketDir(bucket); err != nil {
 		return err

@@ -221,7 +221,11 @@ func TestCatalogJournal(t *testing.T) {
 	// one.
 	t.Run("a commit to a deleted bucket is ErrNotFound", func(t *testing.T) {
 		seg := newBucket(t, "jb-gone")
-		if err := r.Delete(ctx, "jb-gone"); err != nil {
+		st, gerr := r.Get(ctx, "jb-gone")
+		if gerr != nil {
+			t.Fatal(gerr)
+		}
+		if err := r.Delete(ctx, "jb-gone", st.Space); err != nil {
 			t.Fatalf("Delete: %v", err)
 		}
 		err := r.CommitRoot(ctx, "jb-gone", cid.Undef, liveCid(t, "gone-root"), registry.RootCommit{

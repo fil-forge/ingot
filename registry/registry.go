@@ -129,8 +129,10 @@ type Registry interface {
 	// Get returns the state of a bucket, or ErrNotFound.
 	Get(ctx context.Context, name string) (*State, error)
 
-	// Delete removes a bucket. Returns ErrNotFound if absent.
-	Delete(ctx context.Context, name string) error
+	// Delete removes bucket name while it lives in space, so a delete never
+	// removes another bucket recreated under the name. Returns ErrNotFound
+	// if absent.
+	Delete(ctx context.Context, name string, space did.DID) error
 
 	// RootCommitWrites returns the writes that advance the bucket root
 	// from expect to next with the rows the commit owes: its upload

@@ -118,9 +118,13 @@ func (r *Postgres) Get(ctx context.Context, name string) (*State, error) {
 	return st, nil
 }
 
-func (r *Postgres) Delete(ctx context.Context, name string) error {
-	if _, err := r.pool.Exec(ctx, `DELETE FROM ingot.buckets WHERE name = $1`, name); err != nil {
+func (r *Postgres) Delete(ctx context.Context, name string, space did.DID) error {
+	tag, err := r.pool.Exec(ctx, `DELETE FROM ingot.buckets WHERE name = $1 AND space = $2`, name, space.String())
+	if err != nil {
 		return fmt.Errorf("registry: delete %q: %w", name, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
 	}
 	return nil
 }

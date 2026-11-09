@@ -108,6 +108,11 @@ func (b *Backend) bucketOn(ctx context.Context, name, subject string) (*registry
 	return st, err
 }
 
+// bucketLogRemover is a catalog log that can remove a bucket's log entirely.
+type bucketLogRemover interface {
+	RemoveBucketLog(ctx context.Context, bucket string) error
+}
+
 // runCreateBucket is queue-bucket.create: it records the bucket, whose space
 // Hilt created for the request beforehand, with its empty root. It is safe to
 // run again: a bucket already recorded in the task's space is this one.
@@ -125,6 +130,19 @@ func (b *Backend) runCreateBucket(ctx context.Context, _ *taskrunner.Exec, t tas
 		return nil, taskrunner.Permanent(fmt.Errorf("create tenant: %w", err))
 	}
 	init := registry.CreateState{Tenant: tenant, Versioning: registry.VersioningState(args.Versioning), ObjectLockConfig: args.LockConfig}
+	// A bucket deleted under this name may have left its log behind, since
+	// the delete removes it best-effort, and a new bucket must not ship the
+	// old one's catalog. A run of this task that recorded the bucket already
+	// finds its row below and leaves the log alone.
+	if _, err := b.reg.Get(ctx, args.Name); errors.Is(err, registry.ErrNotFound) {
+		if remover, ok := b.log.(bucketLogRemover); ok {
+			if err := remover.RemoveBucketLog(ctx, args.Name); err != nil {
+				return nil, fmt.Errorf("remove a deleted bucket's log: %w", err)
+			}
+		}
+	} else if err != nil {
+		return nil, err
+	}
 	if err := b.reg.Create(ctx, args.Name, space, init); err != nil {
 		if !errors.Is(err, registry.ErrExists) {
 			return nil, err

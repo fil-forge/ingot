@@ -992,7 +992,7 @@ func TestCommitRootOnASingleConnection(t *testing.T) {
 	if err := setup.Create(ctx, "cas-single-conn", space, registry.CreateState{Tenant: testutil.RandomDID(t)}); err != nil {
 		t.Fatalf("create bucket: %v", err)
 	}
-	t.Cleanup(func() { _ = setup.Delete(context.Background(), "cas-single-conn") })
+	t.Cleanup(func() { _ = setup.Delete(context.Background(), "cas-single-conn", space) })
 
 	// A root that does not match: the same path, reporting a conflict.
 	err = bounded("stale root", func(c context.Context) error {
@@ -1084,7 +1084,7 @@ func TestCommitRootQueuesUploadRegistrations(t *testing.T) {
 	if err := r.Create(ctx, "queue-bucket", space, registry.CreateState{Tenant: testutil.RandomDID(t)}); err != nil {
 		t.Fatalf("create bucket: %v", err)
 	}
-	t.Cleanup(func() { _ = r.Delete(context.Background(), "queue-bucket") })
+	t.Cleanup(func() { _ = r.Delete(context.Background(), "queue-bucket", space) })
 
 	regs := []registry.UploadRegistration{
 		{Bucket: "queue-bucket", ObjectKey: "k", Space: space, Root: liveCid(t, "new"), Op: registry.UploadRegistrationAdd, Proofs: []byte("add proofs")},
@@ -1115,7 +1115,7 @@ func TestCommitRootWithoutTasksRefusesRegistrations(t *testing.T) {
 	if err := r.Create(ctx, "no-tasks-bucket", space, registry.CreateState{Tenant: testutil.RandomDID(t)}); err != nil {
 		t.Fatalf("create bucket: %v", err)
 	}
-	t.Cleanup(func() { _ = r.Delete(context.Background(), "no-tasks-bucket") })
+	t.Cleanup(func() { _ = r.Delete(context.Background(), "no-tasks-bucket", space) })
 	err := r.CommitRoot(ctx, "no-tasks-bucket", cid.Undef, liveCid(t, "root"), registry.RootCommit{
 		Registrations: []registry.UploadRegistration{{Bucket: "no-tasks-bucket", ObjectKey: "k", Space: space, Root: liveCid(t, "mf"), Op: registry.UploadRegistrationAdd}},
 	})
@@ -1145,7 +1145,7 @@ func TestConcurrentCommitClaims(t *testing.T) {
 	}
 	t.Cleanup(func() {
 		for _, name := range buckets {
-			_ = r.Delete(context.Background(), name)
+			_ = r.Delete(context.Background(), name, space)
 		}
 	})
 

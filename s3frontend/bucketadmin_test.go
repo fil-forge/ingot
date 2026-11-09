@@ -3,12 +3,14 @@ package s3frontend
 import (
 	"context"
 	"errors"
+	"slices"
 	"testing"
 
 	cmds3 "github.com/fil-forge/libforge/commands/s3"
 	"github.com/fil-forge/libforge/testutil"
 	"github.com/fil-forge/versitygw/s3err"
 
+	"github.com/fil-forge/ingot/blockstore"
 	"github.com/fil-forge/ingot/bucketop"
 	"github.com/fil-forge/ingot/internal/reqscope"
 	"github.com/fil-forge/ingot/registry"
@@ -103,5 +105,54 @@ func wantNoSuchBucket(t *testing.T, what string, err error) {
 	var apiErr s3err.APIError
 	if !errors.As(err, &apiErr) || apiErr.Code != "NoSuchBucket" {
 		t.Fatalf("%s for another space: %v, want NoSuchBucket", what, err)
+	}
+}
+
+// The registry deletes a bucket only in the space given, so a delete for a
+// bucket's old space leaves the bucket recreated under its name.
+func TestARegistryDeleteForAnotherSpaceLeavesTheBucket(t *testing.T) {
+	_, mem := newDeferredBackend(t, &parkingUploader{})
+	ctx := context.Background()
+	if err := mem.Delete(ctx, "bk", testutil.RandomDID(t)); !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("delete for another space: %v, want ErrNotFound", err)
+	}
+	if _, err := mem.Get(ctx, "bk"); err != nil {
+		t.Fatalf("the bucket after a delete for another space: %v", err)
+	}
+}
+
+// logRemovals is a catalog log that records the bucket logs it removes.
+type logRemovals struct {
+	blockstore.Log
+	removed []string
+}
+
+func (l *logRemovals) RemoveBucketLog(_ context.Context, bucket string) error {
+	l.removed = append(l.removed, bucket)
+	return nil
+}
+
+// A create recording a new bucket first removes any log a deleted bucket of
+// the name left behind; one run again after recording it leaves the log alone.
+func TestACreateRemovesALeftoverLogOnce(t *testing.T) {
+	log := &logRemovals{}
+	b, mem := newDeferredBackend(t, &parkingUploader{}, func(d *Deps) {
+		log.Log = d.Log
+		d.Log = log
+	})
+	ctx := context.Background()
+	st, err := mem.Get(ctx, "bk")
+	if err != nil {
+		t.Fatal(err)
+	}
+	space := testutil.RandomDID(t)
+	create := &BucketCreateTask{Name: "again", Tenant: st.Tenant.String()}
+	for range 2 {
+		if err := b.runBucket(ctx, space, registry.BucketCreateAction, create); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+	}
+	if !slices.Equal(log.removed, []string{"again"}) {
+		t.Fatalf("removed logs = %v, want the name's once", log.removed)
 	}
 }

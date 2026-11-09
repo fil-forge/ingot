@@ -1512,7 +1512,7 @@ func TestSweepReleasesSessionThatOutlivedItsBucket(t *testing.T) {
 	}
 
 	// The bucket row goes while the session stands.
-	if err := mem.Delete(ctx, bucket); err != nil {
+	if err := mem.Delete(ctx, bucket, space); err != nil {
 		t.Fatalf("delete bucket row: %v", err)
 	}
 	if n, err := b.SweepStaleMultipartSessions(ctx, -time.Second); err != nil || n == 0 {
@@ -1564,7 +1564,7 @@ func TestRecreatedBucketDisownsItsPredecessorsUploads(t *testing.T) {
 	d := hygienePartDigests(t, mem, uploadID, 1)[0]
 
 	// Same name, new space.
-	if err := mem.Delete(ctx, bucket); err != nil {
+	if err := mem.Delete(ctx, bucket, oldSpace); err != nil {
 		t.Fatalf("delete bucket row: %v", err)
 	}
 	if err := mem.Create(ctx, bucket, newSpace, registry.CreateState{}); err != nil {
