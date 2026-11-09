@@ -284,22 +284,29 @@ func (b *Backend) DeleteBucket(ctx context.Context, name string) error {
 		}
 		return err
 	}
+	ctx = context.WithValue(ctx, deleteKey{}, name)
 	return b.runBucket(ctx, st.Space, registry.BucketDeleteAction, &BucketTask{Name: name})
 }
+
+// deleteKey is the context key a DeleteBucket request marks its context
+// with: the name of the bucket it deletes.
+type deleteKey struct{}
 
 // runDeleteBucket is queue-bucket.delete. It fails on a bucket that holds
 // objects or multipart uploads in flight. Hilt authorizes the delete with the
 // signed S3 request itself, which reaches the task only through its caller's
-// context: a delete resumed without its caller fails without acting, and
-// the client, whose request failed with it, retries with a freshly signed
-// one. Every step before the Hilt call is safe to repeat.
+// context, marked by the DeleteBucket request for this bucket (deleteKey): a
+// delete run without that mark, resumed by a worker or by another request's
+// task, fails without acting, and the client, whose request failed with it,
+// retries with a freshly signed one. Every step before the Hilt call is safe
+// to repeat.
 func (b *Backend) runDeleteBucket(ctx context.Context, _ *taskrunner.Exec, t taskrunner.Task) ([]byte, error) {
 	var args BucketTask
 	if err := args.UnmarshalCBOR(bytes.NewReader(t.Args)); err != nil {
 		return nil, taskrunner.Permanent(fmt.Errorf("decode delete: %w", err))
 	}
 	name := args.Name
-	if _, ok := reqscope.Request(ctx); !ok {
+	if _, ok := reqscope.Request(ctx); !ok || ctx.Value(deleteKey{}) != name {
 		return nil, taskrunner.Permanent(errors.New("s3frontend: delete bucket: its request has gone"))
 	}
 	return nil, func() error {

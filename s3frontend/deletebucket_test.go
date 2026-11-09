@@ -13,12 +13,14 @@ import (
 	block "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
+	"github.com/stretchr/testify/require"
 
 	"github.com/fil-forge/ingot/blockstore"
 	"github.com/fil-forge/ingot/bucketauthority"
 	"github.com/fil-forge/ingot/internal/reqscope"
 	"github.com/fil-forge/ingot/internal/testfakes"
 	"github.com/fil-forge/ingot/registry"
+	"github.com/fil-forge/ingot/taskrunner"
 )
 
 // releasableLog stands in for the production catalog log as DeleteBucket sees
@@ -186,5 +188,26 @@ func TestDeleteBucket_RefusalDropsTheJournal(t *testing.T) {
 	wantAPIErr(t, b.DeleteBucket(ctx, "bk"), s3err.ErrBucketNotEmpty)
 	if st, err := mem.CatalogJournalStats(ctx); err != nil || st.Blocks != 0 {
 		t.Fatalf("journal after the refused delete = %+v (err %v), want empty", st, err)
+	}
+}
+
+// An abandoned delete, left queued by a DeleteBucket whose caller went away,
+// never acts on another request's authority: run with a later PUT's context,
+// which carries that PUT's signed request, as a drain of the bucket's tasks
+// would, it finds no mark of its own DeleteBucket and fails without touching
+// the bucket.
+func TestAnAbandonedDeleteNeverActs(t *testing.T) {
+	b, mem := newDeferredBackend(t, &parkingUploader{})
+	ctx := context.Background()
+	args, err := encodeBucketTask(&BucketTask{Name: "bk"})
+	require.NoError(t, err)
+
+	put := context.WithValue(ctx, reqscope.RequestKey(), cmds3.Request{})
+	_, err = b.runDeleteBucket(put, nil, taskrunner.Task{Queue: registry.BucketQueue, Action: registry.BucketDeleteAction, Args: args})
+	if err == nil || !taskrunner.IsPermanent(err) {
+		t.Fatalf("delete run with another request's context: %v, want a permanent refusal", err)
+	}
+	if _, err := mem.Get(ctx, "bk"); err != nil {
+		t.Fatalf("the bucket after the refused delete: %v", err)
 	}
 }
